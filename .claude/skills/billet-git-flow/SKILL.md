@@ -86,8 +86,10 @@ the PR which findings were accepted and which were rejected, with the reason.
 make check
 ```
 
-Build, vet, gofmt, lint, and `go test -race`. All clean, every time. CI runs the same thing, so a
-green local run is a green CI run — that equivalence is the only reason a gate is worth having.
+Build, vet, gofmt, lint, and `go test -race`. All clean, every time. CI runs all of it, so a red
+`make check` is a red CI run — that is the point of the gate. CI does more besides (`go mod tidy`
+diff, coverage upload, `govulncheck`, cross-builds), so green locally is necessary rather than
+sufficient.
 
 If the linter objects, fix the code. An exception is `//nolint:linter-name // reason` with a real
 reason; `nolintlint` rejects a bare directive, so "0 issues" means "0 unexplained issues".

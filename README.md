@@ -44,15 +44,36 @@ curl -fsSL https://billet.sh/install | sh     # not live yet — build from sour
 git clone https://github.com/junioryono/billet && cd billet && go build ./cmd/billet
 ```
 
+## Status
+
+billet is pre-alpha and most of it is unbuilt. What works **today**:
+
+| | |
+|---|---|
+| `billet github-app create` | Creates and installs the GitHub App via the manifest flow |
+| `billet check` | Validates the config, the App private key, and the state database |
+| `internal/alloc` | The capacity ledger and lease state machine, with placement enforcement |
+
+Everything else — the scale-set listeners, every compute provider, the cache,
+sticky disks, trust classes, observability — is **not implemented**. `billet server` and `billet
+node` deliberately exit non-zero rather than idling, so a half-built control plane is never mistaken
+for a running one.
+
+Everything below describes the intended design. Where a thing is not built, it says so.
+
 ## Quickstart
 
+> **This is the intended flow, not a working one.** Only the first and third commands do anything
+> today. Nothing here runs a job yet.
+
 ```bash
-billet github-app create --org myorg   # creates + installs the GitHub App
-billet init                            # pick a provider, define runner tiers
-billet server --dev                    # control plane + node on one box
+billet github-app create --org myorg   # works
+cp billet.example.yaml billet.yaml     # `billet init` is not built yet
+billet check                           # works
+billet server --dev                    # NOT YET — returns "not implemented"
 ```
 
-Then in a workflow:
+Then, once the runner plane exists, in a workflow:
 
 ```yaml
 jobs:
@@ -108,10 +129,11 @@ untrusted code on your own machine safe. Private repos with trusted contributors
 use case.
 
 **Caches are a deliberate cross-job channel.** A job that writes a secret into a cached directory
-persists it for later jobs to read. Trust classes control *who may publish* a cache — only jobs from
-`push`/`schedule`/`workflow_dispatch` on the default branch — but nothing prevents a trusted job from
-leaking into its own cache. The rule is the same as with GitHub's and every other cache: **don't
-cache secrets.**
+persists it for later jobs to read. Trust classes are *designed* to control who may publish a cache —
+only jobs from `push`/`schedule`/`workflow_dispatch` on the default branch — but **they are not
+implemented** (P3 below), and neither is the cache. Even once they are, nothing prevents a trusted job
+from leaking into its own cache. The rule is the same as with GitHub's and every other cache:
+**don't cache secrets.**
 
 **GitHub App permissions.** `billet` requests exactly two:
 
@@ -124,9 +146,9 @@ No repository *Contents* permission — `billet` cannot read your code. (It is n
 access to anything", and any project claiming that is overselling; the App can manage runners on your
 org, which is a real capability.)
 
-**The cache intercepts TLS.** To serve `actions/cache` locally without workflow changes, guest images
-trust a CA generated for your deployment. That CA's private key is a real secret living on each node
-— treat it like a signing key.
+**The cache intercepts TLS.** *(Design; the cache is not implemented — P4 below.)* To serve
+`actions/cache` locally without workflow changes, guest images will trust a CA generated for your
+deployment. That CA's private key is a real secret living on each node — treat it like a signing key.
 
 Interception is **opt-in per tier** (`intercept: true`) and defaults to off. It is a static tier
 property, not a per-job decision: billet cannot tell from the label whether a given job will publish
@@ -140,9 +162,10 @@ in your release path. Per-org and per-repo controls do not exist yet.
 **The Actions Cache v2 protocol is reverse-engineered.** GitHub has never published the `.proto`
 files ([actions/toolkit#1931](https://github.com/actions/toolkit/discussions/1890) has been open
 since January 2025), so every implementation — including this one — is derived from the generated
-TypeScript client and wire captures. **GitHub can change it without notice.** `billet` runs a
-conformance suite against live GitHub on every image build to catch drift early, and **fails open to
-a cache miss** on any error rather than failing your job. A cache miss is always better than a stall.
+TypeScript client and wire captures. **GitHub can change it without notice.** The plan is a
+conformance suite run against live GitHub on every image build to catch drift early, plus **failing
+open to a cache miss** on any error rather than failing your job — a cache miss is always better than
+a stall. Neither exists yet; the cache itself is unimplemented.
 
 **Apple Silicon support requires [Tart](https://tart.run), which is not open source.** Tart is
 licensed FSL-1.1-ALv2; each release converts to Apache-2.0 after two years, and competing commercial
