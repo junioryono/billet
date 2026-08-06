@@ -81,13 +81,19 @@ func parseRSAPrivateKey(pemBytes []byte) (*rsa.PrivateKey, error) {
 		return nil, fmt.Errorf("github: private key is not PEM-encoded")
 	}
 
-	if key, err := x509.ParsePKCS1PrivateKey(block.Bytes); err == nil {
+	key, pkcs1Err := x509.ParsePKCS1PrivateKey(block.Bytes)
+	if pkcs1Err == nil {
 		return key, nil
 	}
 
-	parsed, err := x509.ParsePKCS8PrivateKey(block.Bytes)
-	if err != nil {
-		return nil, fmt.Errorf("github: parse private key (tried PKCS#1 and PKCS#8): %w", err)
+	parsed, pkcs8Err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if pkcs8Err != nil {
+		// Report BOTH failures. A corrupted key produces two different complaints
+		// depending on which format it was meant to be, and showing only the
+		// second sends the reader looking at the wrong one.
+		return nil, fmt.Errorf(
+			"github: parse private key (PEM block %q): as PKCS#1: %w; as PKCS#8: %w",
+			block.Type, pkcs1Err, pkcs8Err)
 	}
 
 	key, ok := parsed.(*rsa.PrivateKey)

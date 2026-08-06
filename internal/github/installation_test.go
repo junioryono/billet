@@ -8,32 +8,49 @@ import (
 // An operator can remove a permission between creating the app and installing
 // it. Without this check, a scale set that cannot register runners fails at job
 // time with an error that never mentions permissions.
-func TestMissingPermissions(t *testing.T) {
+// Assert the EXACT diagnostics, not their count. A count passes just as happily
+// when the messages name the wrong permission or the wrong direction.
+func TestPermissionMismatches(t *testing.T) {
 	tests := map[string]struct {
 		granted map[string]string
-		want    int
+		want    []string
 	}{
 		"exactly what we asked for": {
 			granted: map[string]string{"metadata": "read", "organization_self_hosted_runners": "write"},
-			want:    0,
+			want:    nil,
 		},
-		"more than we asked for is fine": {
-			granted: map[string]string{
-				"metadata": "write", "organization_self_hosted_runners": "write", "issues": "write",
-			},
-			want: 0,
+		"write satisfies a read requirement": {
+			granted: map[string]string{"metadata": "write", "organization_self_hosted_runners": "write"},
+			want:    nil,
 		},
 		"runners downgraded to read": {
 			granted: map[string]string{"metadata": "read", "organization_self_hosted_runners": "read"},
-			want:    1,
+			want:    []string{"organization_self_hosted_runners: want write, granted read"},
 		},
 		"runners removed entirely": {
 			granted: map[string]string{"metadata": "read"},
-			want:    1,
+			want:    []string{"organization_self_hosted_runners: want write, not granted"},
 		},
 		"nothing granted": {
 			granted: map[string]string{},
-			want:    2,
+			want: []string{
+				"metadata: want read, not granted",
+				"organization_self_hosted_runners: want write, not granted",
+			},
+		},
+		// The case that makes the README's claim false. An app edited to add
+		// `contents` before installation must fail, not be waved through.
+		"an unrequested permission was added": {
+			granted: map[string]string{
+				"metadata": "read", "organization_self_hosted_runners": "write", "contents": "read",
+			},
+			want: []string{"contents: granted read, but billet never requested it"},
+		},
+		"actions was added": {
+			granted: map[string]string{
+				"metadata": "read", "organization_self_hosted_runners": "write", "actions": "read",
+			},
+			want: []string{"actions: granted read, but billet never requested it"},
 		},
 	}
 
@@ -41,22 +58,40 @@ func TestMissingPermissions(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			inst := &Installation{Permissions: tt.granted}
 
-			if got := inst.MissingPermissions(); len(got) != tt.want {
-				t.Errorf("MissingPermissions() = %v (%d), want %d", got, len(got), tt.want)
+			got := inst.PermissionMismatches()
+			if len(got) != len(tt.want) {
+				t.Fatalf("PermissionMismatches() = %v, want %v", got, tt.want)
+			}
+
+			for i := range tt.want {
+				if got[i] != tt.want[i] {
+					t.Errorf("mismatch[%d] = %q, want %q", i, got[i], tt.want[i])
+				}
 			}
 		})
 	}
 }
 
-// write implies read, so a stronger grant must not be reported as missing.
-func TestMissingPermissionsTreatsWriteAsSufficientForRead(t *testing.T) {
+// Go randomizes map iteration, so an unsorted diagnostic reorders itself between
+// runs and cannot be diffed.
+func TestPermissionMismatchesAreStable(t *testing.T) {
 	inst := &Installation{Permissions: map[string]string{
-		"metadata":                         "write",
-		"organization_self_hosted_runners": "write",
+		"contents": "read", "actions": "read", "issues": "write",
 	}}
 
-	if got := inst.MissingPermissions(); len(got) != 0 {
-		t.Errorf("write should satisfy a read requirement, got %v", got)
+	first := inst.PermissionMismatches()
+
+	for range 20 {
+		next := inst.PermissionMismatches()
+		if len(next) != len(first) {
+			t.Fatalf("unstable length: %v vs %v", next, first)
+		}
+
+		for i := range first {
+			if next[i] != first[i] {
+				t.Fatalf("unstable order at %d: %q vs %q", i, next[i], first[i])
+			}
+		}
 	}
 }
 

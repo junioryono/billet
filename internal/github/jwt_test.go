@@ -94,13 +94,37 @@ func TestSignAppJWTBackdatesIssuedAt(t *testing.T) {
 	iat := int64(claims["iat"].(float64))
 	exp := int64(claims["exp"].(float64))
 
-	if iat >= now.Unix() {
-		t.Errorf("iat = %d, want strictly before %d so a fast clock still verifies", iat, now.Unix())
+	// EXACT values, not inequalities. "iat is in the past" stays true if the
+	// backdate shrinks to one second, which would no longer absorb the clock skew
+	// this exists for; "exp is under ten minutes" stays true at ten seconds.
+	if want := now.Add(-appJWTBackdate).Unix(); iat != want {
+		t.Errorf("iat = %d, want exactly %d (now - %s)", iat, want, appJWTBackdate)
 	}
 
-	// GitHub's hard limit is 10 minutes; exceeding it is rejected outright.
-	if lifetime := time.Duration(exp-now.Unix()) * time.Second; lifetime > 10*time.Minute {
-		t.Errorf("token lives %s, want <= 10m", lifetime)
+	if want := now.Add(appJWTLifetime).Unix(); exp != want {
+		t.Errorf("exp = %d, want exactly %d (now + %s)", exp, want, appJWTLifetime)
+	}
+
+	// The values themselves must stay inside GitHub's rules.
+	if appJWTBackdate < 30*time.Second {
+		t.Errorf("backdate %s is too small to absorb ordinary clock skew", appJWTBackdate)
+	}
+
+	if appJWTLifetime+appJWTBackdate > 10*time.Minute {
+		t.Errorf("iat..exp spans %s; GitHub rejects anything over 10m",
+			appJWTLifetime+appJWTBackdate)
+	}
+
+	// The claim set is exactly what GitHub expects — an extra claim is a
+	// compatibility risk nobody would notice.
+	for _, want := range []string{"iat", "exp", "iss"} {
+		if _, ok := claims[want]; !ok {
+			t.Errorf("claims missing %q", want)
+		}
+	}
+
+	if len(claims) != 3 {
+		t.Errorf("claims = %v, want exactly iat/exp/iss", claims)
 	}
 }
 

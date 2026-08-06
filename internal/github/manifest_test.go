@@ -17,22 +17,59 @@ func TestPermissionsAreMinimal(t *testing.T) {
 		"organization_self_hosted_runners": "write",
 	}
 
-	if len(Permissions) != len(want) {
-		t.Fatalf("Permissions has %d entries, want %d: %v", len(Permissions), len(want), Permissions)
+	got := Permissions()
+
+	if len(got) != len(want) {
+		t.Fatalf("Permissions has %d entries, want %d: %v", len(got), len(want), got)
 	}
 
 	for k, v := range want {
-		if got := Permissions[k]; got != v {
-			t.Errorf("Permissions[%q] = %q, want %q", k, got, v)
+		if got[k] != v {
+			t.Errorf("Permissions[%q] = %q, want %q", k, got[k], v)
 		}
 	}
 
 	// Named explicitly: actions:read would expose workflow runs, logs and
 	// artifacts, which is what makes "billet cannot read your code" false.
 	for _, forbidden := range []string{"actions", "contents", "administration", "secrets"} {
-		if _, ok := Permissions[forbidden]; ok {
+		if _, ok := got[forbidden]; ok {
 			t.Errorf("Permissions must not include %q", forbidden)
 		}
+	}
+}
+
+// Permissions must hand back a copy: it is a security claim, and a caller that
+// can mutate it changes the manifest, the CLI's disclosure and the post-install
+// validation in one go.
+func TestPermissionsReturnsACopy(t *testing.T) {
+	Permissions()["contents"] = "write"
+
+	if _, leaked := Permissions()["contents"]; leaked {
+		t.Fatal("mutating the returned map changed the canonical permission set")
+	}
+}
+
+// GitHub marks hook_attributes.url required whenever the object is present, so
+// an inactive hook still needs one. Omitting it rejects the whole registration.
+func TestManifestCarriesAWebhookURLEvenThoughItIsInactive(t *testing.T) {
+	m := NewManifest("billet", "http://127.0.0.1:1/callback", "http://127.0.0.1:1/installed")
+
+	if m.HookAttributes.URL == "" {
+		t.Error("hook_attributes.url is required by GitHub even when active is false")
+	}
+
+	if !strings.HasPrefix(m.HookAttributes.URL, "https://") {
+		t.Errorf("hook url should be a stable https URL, got %q", m.HookAttributes.URL)
+	}
+}
+
+// setup_on_update would send a later repository-access change to a loopback port
+// that stopped existing when onboarding finished.
+func TestManifestDoesNotAskForUpdateRedirects(t *testing.T) {
+	m := NewManifest("billet", "http://127.0.0.1:1/callback", "http://127.0.0.1:1/installed")
+
+	if m.SetupOnUpdate {
+		t.Error("setup_on_update must be off: the setup URL is an ephemeral loopback listener")
 	}
 }
 

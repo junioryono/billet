@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"time"
 )
 
@@ -99,6 +100,12 @@ func WaitForOrgInstallation(ctx context.Context, client *http.Client, appID int6
 }
 
 func waitForOrgInstallationAt(ctx context.Context, client *http.Client, base string, appID int64, privateKeyPEM []byte, org string, every time.Duration) (*Installation, error) {
+	// time.NewTicker panics on a non-positive interval, and this is an exported
+	// entry point — a caller's zero value should be a diagnostic, not a crash.
+	if every <= 0 {
+		return nil, fmt.Errorf("github: poll interval must be positive, got %s", every)
+	}
+
 	ticker := time.NewTicker(every)
 	defer ticker.Stop()
 
@@ -126,27 +133,44 @@ func waitForOrgInstallationAt(ctx context.Context, client *http.Client, base str
 	}
 }
 
-// MissingPermissions reports any permission billet requires that the
-// installation does not grant.
+// PermissionMismatches reports every way the installation's effective
+// permissions differ from what billet requested, in BOTH directions.
 //
-// An operator can edit permissions between creating the app and installing it,
-// and a scale set that cannot register runners fails at job time with an error
-// that says nothing about permissions.
-func (i *Installation) MissingPermissions() []string {
-	var missing []string
+// An operator can edit an app's permissions between creating it and installing
+// it, and each direction fails differently:
+//
+//   - Missing or downgraded: runner registration fails later, with an error that
+//     never mentions permissions.
+//   - Unexpected: billet holds access it publicly claims not to have. An app
+//     edited to add `contents` or `actions` is exactly the case that would make
+//     "billet cannot read your code" false while onboarding reported success.
+//
+// Results are sorted so the diagnostic is stable across runs — Go randomizes map
+// iteration, and an error message that reorders itself is one nobody can diff.
+func (i *Installation) PermissionMismatches() []string {
+	var problems []string
 
-	for name, want := range Permissions {
+	for name, want := range permissions {
 		got, ok := i.Permissions[name]
 		if !ok {
-			missing = append(missing, fmt.Sprintf("%s (want %s, not granted)", name, want))
+			problems = append(problems, fmt.Sprintf("%s: want %s, not granted", name, want))
 			continue
 		}
 
 		// write implies read; read does not imply write.
 		if want == "write" && got != "write" {
-			missing = append(missing, fmt.Sprintf("%s (want write, granted %s)", name, got))
+			problems = append(problems, fmt.Sprintf("%s: want write, granted %s", name, got))
 		}
 	}
 
-	return missing
+	for name, got := range i.Permissions {
+		if _, expected := permissions[name]; !expected {
+			problems = append(problems,
+				fmt.Sprintf("%s: granted %s, but billet never requested it", name, got))
+		}
+	}
+
+	sort.Strings(problems)
+
+	return problems
 }

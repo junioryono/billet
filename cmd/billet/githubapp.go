@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 
 	"github.com/junioryono/billet/internal/github"
 )
@@ -34,6 +35,7 @@ func githubAppCreate(ctx context.Context, args []string) error {
 	name := fs.String("name", "", "suggested App name (GitHub App names are globally unique; you can edit it there)")
 	keyPath := fs.String("key-path", "", "where to write the App private key (default: alongside billet.yaml)")
 	noBrowser := fs.Bool("no-browser", false, "print URLs instead of opening a browser")
+	port := fs.Int("port", 0, "fixed loopback callback port (needed for `ssh -L` when onboarding a remote host)")
 
 	if err := parse(fs, args); err != nil {
 		return err
@@ -47,12 +49,27 @@ func githubAppCreate(ctx context.Context, args []string) error {
 		*keyPath = filepath.Join(filepath.Dir(defaultConfigPath()), "app-private-key.pem")
 	}
 
-	// Refuse before the browser dance rather than after: discovering the
-	// destination is unwritable only once GitHub has already created an app
-	// leaves a real app registered with credentials nobody captured.
-	if err := checkWritable(*keyPath); err != nil {
+	// RESERVE the real destination now, before the browser flow. A probe would be
+	// TOCTOU-racy and, worse, would only tell us the directory was writable at
+	// some earlier moment: if the create failed later, GitHub would already hold
+	// a registered app whose one-time private key we had thrown away. Creating
+	// the actual file with O_EXCL means the only remaining failure is a write
+	// error on a descriptor we already own.
+	keyFile, err := reserveKeyFile(*keyPath)
+	if err != nil {
 		return err
 	}
+
+	// Removed only on a path where nothing was ever written into it.
+	keyWritten := false
+
+	defer func() {
+		keyFile.Close()
+
+		if !keyWritten {
+			_ = os.Remove(*keyPath)
+		}
+	}()
 
 	open := openBrowser
 	if *noBrowser {
@@ -61,8 +78,17 @@ func githubAppCreate(ctx context.Context, args []string) error {
 
 	fmt.Printf("billet requests exactly these permissions:\n")
 
-	for perm, level := range github.Permissions {
-		fmt.Printf("  %-32s %s\n", perm, level)
+	perms := github.Permissions()
+
+	names := make([]string, 0, len(perms))
+	for name := range perms {
+		names = append(names, name)
+	}
+
+	sort.Strings(names)
+
+	for _, name := range names {
+		fmt.Printf("  %-32s %s\n", name, perms[name])
 	}
 
 	fmt.Printf("\nNo repository Contents permission — billet cannot read your code.\n")
@@ -71,14 +97,34 @@ func githubAppCreate(ctx context.Context, args []string) error {
 	result, err := github.Onboard(ctx, github.OnboardOptions{
 		Org:         *org,
 		Name:        *name,
+		Port:        *port,
 		OpenBrowser: open,
 		Log:         func(format string, a ...any) { fmt.Printf(format+"\n", a...) },
+		// Called the instant the credentials exist, before installation. See the
+		// OnAppCreated doc comment: this ordering is what stops a failed install
+		// from orphaning a real app whose key GitHub will never re-issue.
+		OnAppCreated: func(app *github.App) error {
+			if err := writeAndSync(keyFile, []byte(app.PEM)); err != nil {
+				return err
+			}
+
+			keyWritten = true
+
+			fmt.Printf("Saved the private key to %s\n", *keyPath)
+
+			return nil
+		},
 	})
 	if err != nil {
-		return err
-	}
+		if keyWritten {
+			// The app exists and its key is on disk, so this is recoverable rather
+			// than a dead end — say so, and say how.
+			fmt.Fprintf(os.Stderr,
+				"\nThe App was created and its key saved to %s.\n"+
+					"Fix the problem above, then finish by installing it on %s and running `billet check`.\n",
+				*keyPath, *org)
+		}
 
-	if err := writePrivateKey(*keyPath, []byte(result.App.PEM)); err != nil {
 		return err
 	}
 
@@ -95,57 +141,47 @@ func githubAppCreate(ctx context.Context, args []string) error {
 	return nil
 }
 
-// writePrivateKey writes the App key 0600, refusing to clobber an existing one.
+// reserveKeyFile creates the App key file 0600, refusing to clobber an existing
+// one, and hands back the open descriptor.
 //
-// This key can register runners on the organization. Overwriting a key already
-// in use would silently break a running deployment, and the operator would have
-// no copy of what was lost — GitHub does not re-issue it.
-func writePrivateKey(path string, pem []byte) error {
+// Creating the real file rather than probing is deliberate. A probe answers "was
+// this directory writable a moment ago", which is both racy and useless at the
+// point it matters: by the time the key exists, GitHub has already registered
+// the app, and a create that fails then has thrown away a credential that cannot
+// be re-issued. Holding the descriptor reduces the later failure surface to a
+// write on a file we already own.
+func reserveKeyFile(path string) (*os.File, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return fmt.Errorf("create key directory: %w", err)
+		return nil, fmt.Errorf("create key directory: %w", err)
 	}
 
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		if errors.Is(err, os.ErrExist) {
-			return fmt.Errorf(
+			return nil, fmt.Errorf(
 				"%s already exists; move it aside first — billet will not overwrite an App key, "+
 					"and GitHub cannot re-issue one that is lost", path)
 		}
 
-		return fmt.Errorf("create %s: %w", path, err)
+		return nil, fmt.Errorf("create %s: %w", path, err)
 	}
-	defer f.Close()
 
+	return f, nil
+}
+
+// writeAndSync writes the key and forces it to durable storage before reporting
+// success. Without the Sync, a crash between here and the next boot loses a
+// credential the operator believes they have.
+func writeAndSync(f *os.File, pem []byte) error {
 	if _, err := f.Write(pem); err != nil {
-		return fmt.Errorf("write %s: %w", path, err)
+		return fmt.Errorf("write %s: %w", f.Name(), err)
+	}
+
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("sync %s: %w", f.Name(), err)
 	}
 
 	return nil
-}
-
-// checkWritable verifies the destination before anything irreversible happens.
-func checkWritable(path string) error {
-	if _, err := os.Stat(path); err == nil {
-		return fmt.Errorf(
-			"%s already exists; move it aside first — billet will not overwrite an App key", path)
-	}
-
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("create %s: %w", dir, err)
-	}
-
-	probe := filepath.Join(dir, ".billet-write-probe")
-
-	f, err := os.OpenFile(probe, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
-		return fmt.Errorf("cannot write to %s: %w", dir, err)
-	}
-
-	_ = f.Close()
-
-	return os.Remove(probe)
 }
 
 // openBrowser is best-effort. A machine being onboarded over SSH has no browser,

@@ -31,17 +31,29 @@ const (
 // rather than letting an operator wander off mid-flow.
 const ManifestTTL = time.Hour
 
-// Permissions is the complete set billet requests. It is a package-level var so
-// there is exactly one answer to "what access does billet have", and so the test
-// that pins it has something to pin.
+// permissions is the complete set billet requests.
+//
+// Unexported and copied on the way out: it is a security claim, and an exported
+// map is one an importing package could rewrite at runtime — changing the
+// manifest, the CLI's own disclosure, and the post-install validation together.
 //
 // Deliberately absent: `actions: read`. It would expose workflow runs, logs and
 // artifacts, and billet needs none of them — it is handed jobs by the scale-set
 // API rather than discovering them. Its absence is what makes "billet cannot
 // read your code" true rather than merely reassuring.
-var Permissions = map[string]string{
+var permissions = map[string]string{
 	"metadata":                         "read",
 	"organization_self_hosted_runners": "write",
+}
+
+// Permissions returns a copy of the permission set billet requests.
+func Permissions() map[string]string {
+	out := make(map[string]string, len(permissions))
+	for k, v := range permissions {
+		out[k] = v
+	}
+
+	return out
 }
 
 // Manifest is the app registration billet asks GitHub to create.
@@ -83,13 +95,29 @@ func NewManifest(name, redirectURL, setupURL string) Manifest {
 		Public: false,
 		// billet receives work by long-polling the Runner Scale Set API, so it
 		// needs no inbound webhook at all. That is what lets a deployment run with
-		// no public ingress, and turning the webhook off here keeps the
-		// registration honest about it.
-		HookAttributes: &HookAttributes{Active: false},
-		Permissions:    Permissions,
-		SetupOnUpdate:  true,
+		// no public ingress, and Active:false keeps the registration honest.
+		//
+		// The URL is still required: GitHub marks hook_attributes.url mandatory
+		// whenever the object is present, and omitting it rejects the whole
+		// registration. It is a placeholder that is never called — nothing is
+		// delivered to it while Active is false.
+		HookAttributes: &HookAttributes{
+			URL:    webhookPlaceholderURL,
+			Active: false,
+		},
+		Permissions: Permissions(),
+		// Deliberately NOT setting SetupOnUpdate. It would redirect a future
+		// repository-access change back to setup_url — a loopback port that
+		// stopped existing the moment onboarding finished, so the operator would
+		// land on a connection error with no explanation.
+		SetupOnUpdate: false,
 	}
 }
+
+// webhookPlaceholderURL satisfies GitHub's requirement that hook_attributes
+// carry a URL. Nothing is ever delivered to it: the hook is registered inactive,
+// and billet has no webhook receiver by design.
+const webhookPlaceholderURL = "https://github.com/junioryono/billet#billet-uses-no-webhooks"
 
 // RegistrationURL is where the browser POSTs the manifest form.
 //
