@@ -1366,6 +1366,18 @@ func TestUnverifiableLegacyLeaseFailsClosed(t *testing.T) {
 	if err := a.Bind(ctx, lease.ID, lease.Epoch, "epyc-1"); !errors.Is(err, ErrNotPlaceable) {
 		t.Errorf("bind of a lease with no recorded provider = %v, want ErrNotPlaceable", err)
 	}
+
+	// Failing closed is only acceptable if the lease can still be cleaned up —
+	// otherwise it holds capacity forever and the error tells the operator to do
+	// something they cannot do. Release takes only terminal phases and Reap
+	// archives directly, so neither consults the placement checks.
+	if err := a.Release(ctx, lease.ID, lease.Epoch, PhaseFailed); err != nil {
+		t.Errorf("releasing an unplaceable lease = %v, want nil; its capacity would be stranded", err)
+	}
+
+	if u, _ := a.Usage(ctx); u.Leases != 0 {
+		t.Errorf("usage after release = %+v, want no open leases", u)
+	}
 }
 
 // New must refuse a catalog whose leases could not be placed. A blank provider

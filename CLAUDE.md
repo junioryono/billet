@@ -139,13 +139,38 @@ OS is a load-time error rather than a job that queues forever with nothing sayin
 `macos_vm_limit > 0` together with a `guest_os` allowlist excluding macOS is rejected instead of
 silently resolving — a config that reads as "two macOS guests" must not schedule none.
 
-**The allowlist is enforced at `Bind`, not only at load.** Config validation cannot see every
-placement: an *unpinned* tier names no host, so nothing ties it to the allowlist, and a scheduler
-that simply picked a node with free capacity would put a Linux guest on a macOS-only Mac. `Bind` is
-the first point at which the host is known, so that is where the check has to live. The load-time
-guard covers what it can prove — a pinned tier, or an unpinned one against a host declaring the
-*same provider*, since a Firecracker tier can never land on a Tart host and comparing guest OS alone
-would make one macOS-only Mac an error for every x64 Linux tier in the deployment.
+**Placement is checked where the host is known, and again at the launch boundary.** Config
+validation cannot see every placement: an *unpinned* tier names no host, so nothing ties it to the
+allowlist, and a scheduler that simply picked a node with free capacity would put a Linux guest on a
+macOS-only Mac. `Bind` is the first point at which the host is known. The load-time guard covers what
+it can prove — a pinned tier, or an unpinned one against a host declaring the *same provider*, since
+a Firecracker tier can never land on a Tart host and comparing guest OS alone would make one
+macOS-only Mac an error for every x64 Linux tier in the deployment.
+
+`Bind` alone is not enough, for two reasons that each looked fine in isolation:
+
+- **Nothing required it.** `assigned → launching` succeeded on an unbound lease, so a caller could
+  pick a host outside the allocator and every check inside `Bind` would never run. Every phase that
+  presumes a running host — `launching`, `online`, `busy` — now requires a bound node. Gating only
+  the `launching` edge is not sufficient either: a row left in `launching` by an older binary would
+  walk on to `online` untouched.
+- **Binding is not launching.** A lease can be bound while still in `capacity`, so a policy tightened
+  in between would let the instance start on a host that no longer permits it. Placement is
+  re-checked on entry to those phases against policy in force *then*, making the guarantee "legal
+  now" rather than "was legal once". Only a repeated `Bind` is grandfathered, because it changes
+  nothing.
+
+**A lease whose placement facts are unverifiable fails closed.** A row predating the `provider`
+column records `""`, and tolerating that would be a bypass rather than a compatibility courtesy —
+such a lease may still be *unbound*, so it is not old work already placed but unplaced work whose
+backend nothing can check. `Reap` and `Release` deliberately do not consult these checks, so a lease
+refused this way can always be cleaned up; failing closed on something unrecoverable would just
+strand capacity.
+
+That rule is also what protects rows that no migration can classify. `macos_slot` only became
+truthful at migration 5, which added it defaulting to `0` without a backfill, so a macOS lease older
+than that is indistinguishable from a Linux one. Migration 7 repairs what it can and the rest are
+refused rather than guessed at.
 
 The lease's `guest_os` is recorded at reserve time for the same reason as `target_node` and
 `macos_slot`: a tier redefined underneath an in-flight lease must not reclassify what that lease is
