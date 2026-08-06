@@ -670,8 +670,23 @@ func repeatPlaceholders(n int) string {
 	return string(out)
 }
 
+// timestampFormat is FIXED-WIDTH, and that is the entire point.
+//
+// The obvious choice, time.RFC3339Nano, uses ".999999999" — which STRIPS
+// trailing zeros. A timestamp with zero nanoseconds therefore renders with no
+// fraction at all ("...30Z"), and expiry is compared as a SQL string, where 'Z'
+// (0x5A) sorts after '.' (0x2E). So "12:00:30Z" > "12:00:30.5Z", and an expired
+// lease is silently NOT reaped when now falls in the same second with nonzero
+// nanoseconds — its capacity stays held for up to a second longer than the TTL
+// says, with nothing anywhere reporting it.
+//
+// ".000000000" always emits nine digits, so lexical order matches chronological
+// order for every value this produces. Anything comparing these columns as
+// strings depends on that; do not swap it back for a stdlib constant.
+const timestampFormat = "2006-01-02T15:04:05.000000000Z07:00"
+
 // ts renders a timestamp so string comparison matches chronological order.
-func ts(t time.Time) string { return t.UTC().Format(time.RFC3339Nano) }
+func ts(t time.Time) string { return t.UTC().Format(timestampFormat) }
 
 func newLeaseID() (string, error) {
 	buf := make([]byte, 16)

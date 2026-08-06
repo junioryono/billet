@@ -428,6 +428,77 @@ func TestReapFencesTheOldHolder(t *testing.T) {
 	}
 }
 
+// Expiry is compared as a SQL string, so the timestamp format has to make
+// lexical order match chronological order for EVERY value.
+//
+// time.RFC3339Nano does not: it strips trailing zeros, so a zero-nanosecond
+// timestamp renders "12:00:30Z" while a fractional one renders "12:00:30.5Z",
+// and 'Z' (0x5A) sorts after '.' (0x2E). An expired lease then survives its TTL
+// with nothing reporting it. The existing reap tests all used whole seconds on
+// both sides, which is exactly why they could not see this.
+func TestExpiryOrderingSurvivesFractionalSeconds(t *testing.T) {
+	// A lease created on a whole second expires on a whole second...
+	now := time.Date(2026, time.August, 6, 12, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+
+	a := newAllocator(t,
+		Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB},
+		[]config.Tier{tier("small", 4, 16*config.GiB)},
+		WithClock(func() time.Time { return clock() }),
+		WithLeaseTTL(30*time.Second))
+
+	ctx := t.Context()
+
+	if _, err := a.Reserve(ctx, "small"); err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	// ...and we reap half a second past it, which is where the stripped-zero
+	// format compares backwards.
+	now = now.Add(30*time.Second + 500*time.Millisecond)
+
+	n, err := a.Reap(ctx)
+	if err != nil {
+		t.Fatalf("Reap: %v", err)
+	}
+
+	if n != 1 {
+		t.Fatalf("reaped %d leases, want 1 — expiry compared as a string is mis-ordering "+
+			"fractional seconds, so capacity is held past its TTL", n)
+	}
+}
+
+// Guard the format directly too, so a future edit back to a stdlib constant
+// fails here rather than as a mysterious capacity leak.
+func TestTimestampFormatIsFixedWidth(t *testing.T) {
+	base := time.Date(2026, time.August, 6, 12, 0, 30, 0, time.UTC)
+
+	whole := ts(base)
+	frac := ts(base.Add(500 * time.Millisecond))
+
+	if len(whole) != len(frac) {
+		t.Fatalf("timestamps are not fixed width: %q (%d) vs %q (%d)",
+			whole, len(whole), frac, len(frac))
+	}
+
+	if whole >= frac {
+		t.Errorf("%q should sort before %q", whole, frac)
+	}
+
+	// Ordering must hold across a range of nanosecond values, including the ones
+	// a stripped-zero format renders shortest.
+	prev := ts(base)
+
+	for _, ns := range []int{1, 999, 1_000_000, 100_000_000, 500_000_000, 999_999_999} {
+		cur := ts(base.Add(time.Duration(ns)))
+		if cur <= prev {
+			t.Errorf("ns=%d: %q should sort after %q", ns, cur, prev)
+		}
+
+		prev = cur
+	}
+}
+
 // A heartbeat is what proves a holder is alive; it must actually push expiry out.
 func TestHeartbeatExtendsTheLease(t *testing.T) {
 	now := time.Date(2026, time.August, 6, 12, 0, 0, 0, time.UTC)
