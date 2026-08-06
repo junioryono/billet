@@ -6,12 +6,13 @@ A *billet* is a bar of metal prepared for forging — raw material shaped into s
 is roughly what CI does to source code.
 
 > **Status: pre-alpha.** Nothing here is production-ready yet. Do not point release or deploy
-> pipelines at it. See [Roadmap](#roadmap) for what actually works today.
+> pipelines at it. See [Status](#status) for what actually works today.
 
 ## What it is
 
-`billet` runs your GitHub Actions jobs on machines you control — a server under your desk, a Mac
-mini, or EC2 — with the accelerations that make self-hosting worth the trouble:
+`billet` is **being built** to run your GitHub Actions jobs on machines you control — a server under
+your desk, a Mac mini, or EC2 — with the accelerations that make self-hosting worth the trouble.
+None of the following works yet; see [Status](#status) for what does.
 
 - **Ephemeral microVM per job.** Firecracker on bare metal, one job per VM, destroyed after. Stronger
   isolation than container-based runners.
@@ -67,11 +68,17 @@ Everything below describes the intended design. Where a thing is not built, it s
 > today. Nothing here runs a job yet.
 
 ```bash
-billet github-app create --org myorg   # works
-cp billet.example.yaml billet.yaml     # `billet init` is not built yet
-billet check                           # works
-billet server --dev                    # NOT YET — returns "not implemented"
+billet github-app create --org myorg          # works
+cp billet.example.yaml ./billet.yaml          # `billet init` is not built yet
+billet check --config ./billet.yaml           # works
+billet server --dev --config ./billet.yaml    # NOT YET — returns "not implemented"
 ```
+
+`--config` is not optional here. billet deliberately does **not** read a
+`billet.yaml` from the working directory — a server started from a directory
+someone else can write to would otherwise adopt their config, which chooses the
+state directory, the App key path and every tier's resources. Without the flag
+it reads your user config directory (`billet check -h` prints the path).
 
 Then, once the runner plane exists, in a workflow:
 
@@ -161,7 +168,7 @@ in your release path. Per-org and per-repo controls do not exist yet.
 
 **The Actions Cache v2 protocol is reverse-engineered.** GitHub has never published the `.proto`
 files ([actions/toolkit#1931](https://github.com/actions/toolkit/discussions/1890) has been open
-since January 2025), so every implementation — including this one — is derived from the generated
+since January 2025), so every implementation — including the one billet will have — is derived from the generated
 TypeScript client and wire captures. **GitHub can change it without notice.** The plan is a
 conformance suite run against live GitHub on every image build to catch drift early, plus **failing
 open to a cache miss** on any error rather than failing your job — a cache miss is always better than

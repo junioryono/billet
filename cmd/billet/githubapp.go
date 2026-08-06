@@ -104,13 +104,18 @@ func githubAppCreate(ctx context.Context, args []string) error {
 		// OnAppCreated doc comment: this ordering is what stops a failed install
 		// from orphaning a real app whose key GitHub will never re-issue.
 		OnAppCreated: func(app *github.App) error {
-			if err := writeKeyAtomically(keyFile, *keyPath, []byte(app.PEM)); err != nil {
+			// keyWritten is set from inside, the moment the key reaches its
+			// final path — not after this returns. A durability error AFTER a
+			// successful rename must not make the deferred cleanup delete an
+			// installed credential.
+			err := writeKeyAtomically(keyFile, *keyPath, []byte(app.PEM), func() {
+				keyWritten = true
+
+				fmt.Printf("Saved the private key to %s\n", *keyPath)
+			})
+			if err != nil {
 				return err
 			}
-
-			keyWritten = true
-
-			fmt.Printf("Saved the private key to %s\n", *keyPath)
 
 			return nil
 		},
@@ -164,26 +169,29 @@ func reserveKeyFile(path string) (*os.File, error) {
 		return nil, fmt.Errorf("create %s: %w", path, err)
 	}
 
-	// An EMPTY file here is billet's own reservation from a run that died before
-	// writing anything — a SIGKILL or a power cut between reserving and
-	// receiving the key. It cannot contain a credential, so adopting it loses
-	// nothing; refusing it would leave the operator permanently unable to re-run
-	// without knowing to delete a file they never created.
+	// Deliberately NOT adopted, however empty it looks.
 	//
-	// Anything non-empty is refused: it may be a real key, and GitHub cannot
-	// re-issue one that is lost.
-	info, statErr := os.Stat(path)
+	// An earlier version reused a zero-length file on the theory that it must be
+	// billet's own reservation from a crashed run and so could not hold a
+	// credential. Zero length does not prove that: a CONCURRENT
+	// `billet github-app create` against the same path has a reservation that is
+	// also empty, and adopting it puts two processes on one destination, where
+	// each can rename its own App key over the other's and either one's cleanup
+	// can unlink the installed key. Deciding from a Stat and then opening is
+	// racy in its own right, and Stat follows symlinks.
+	//
+	// So: refuse, and say which case this is. Removing a file is a step the
+	// operator can take safely; distinguishing two live processes is not.
+	info, statErr := os.Lstat(path)
 	if statErr != nil {
 		return nil, fmt.Errorf("inspect %s: %w", path, statErr)
 	}
 
 	if info.Mode().IsRegular() && info.Size() == 0 {
-		reused, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o600)
-		if err != nil {
-			return nil, fmt.Errorf("reuse the empty reservation at %s: %w", path, err)
-		}
-
-		return reused, nil
+		return nil, fmt.Errorf(
+			"%s exists but is empty, which is what an interrupted `billet github-app create` leaves "+
+				"behind. If no other billet run is in progress, delete it and re-run:\n    rm %s",
+			path, path)
 	}
 
 	return nil, fmt.Errorf(
@@ -204,7 +212,11 @@ func reserveKeyFile(path string) (*os.File, error) {
 // So: write a sibling temp file, fsync it, rename it over the reservation —
 // rename is atomic on POSIX — then fsync the directory. The destination only
 // ever holds the empty reservation or the complete key.
-func writeKeyAtomically(reserved *os.File, path string, pem []byte) error {
+// onInstalled is called the instant the key is at its final path, BEFORE
+// durability is confirmed. Everything after that point is best-effort reporting:
+// once the credential is installed it must never be deleted, whatever else
+// fails, because GitHub consumed the one-time code to produce it.
+func writeKeyAtomically(reserved *os.File, path string, pem []byte, onInstalled func()) error {
 	dir := filepath.Dir(path)
 
 	tmp, err := os.CreateTemp(dir, ".billet-key-*")
@@ -213,10 +225,19 @@ func writeKeyAtomically(reserved *os.File, path string, pem []byte) error {
 	}
 
 	tmpName := tmp.Name()
+	installed := false
 
 	defer func() {
 		_ = tmp.Close()
-		// A no-op once the rename has succeeded: the name no longer exists.
+
+		// The temp file is removed ONLY while it is still scratch. Once the
+		// rename has succeeded this name no longer exists, and if the rename
+		// FAILED the temp file is the only copy of the key — deleting it there
+		// would throw away a credential that cannot be re-issued.
+		if !installed {
+			return
+		}
+
 		_ = os.Remove(tmpName)
 	}()
 
@@ -241,10 +262,32 @@ func writeKeyAtomically(reserved *os.File, path string, pem []byte) error {
 	_ = reserved.Close()
 
 	if err := os.Rename(tmpName, path); err != nil {
-		return fmt.Errorf("install the key at %s: %w", path, err)
+		// The temp file survives and holds the only copy. Name it, or the
+		// operator is left with a registered App and no way to find its key.
+		return fmt.Errorf(
+			"install the key at %s: %w\nThe key IS saved at %s — move it to %s by hand; "+
+				"GitHub cannot re-issue it",
+			path, err, tmpName, path)
 	}
 
-	return syncDir(dir)
+	installed = true
+
+	// Announced BEFORE the directory fsync. The credential is at its final path
+	// and must never be unlinked from here on: a directory sync can fail on a
+	// filesystem that does not support it (some FUSE and SMB mounts return
+	// ENOTSUP), and treating that as "the write failed" made the caller delete
+	// a key that was successfully installed.
+	onInstalled()
+
+	if err := syncDir(dir); err != nil {
+		return fmt.Errorf(
+			"the key is installed at %s but its directory entry could not be flushed: %w\n"+
+				"It is present now; a power loss before the filesystem flushes could still lose it, "+
+				"so verify with `billet check` after a reboot",
+			path, err)
+	}
+
+	return nil
 }
 
 // syncDir forces a directory entry to durable storage. Syncing a file does not
