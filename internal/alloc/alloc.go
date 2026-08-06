@@ -972,13 +972,23 @@ func (a *Allocator) transition(ctx context.Context, leaseID string, epoch int64,
 		// phase='launching' and node=NULL free to walk on to online.
 		if requiresPlacement(to) {
 			if lease.Node == "" {
-				// Not "bind it first": Bind refuses a first binding once a lease
-				// is running, so that advice would send the operator into a second
-				// refusal. An orphan at this point is recoverable only by ending
-				// it.
-				return fmt.Errorf(
-					"%w: lease %s is %s with no bound node; release it, or stop its holder and let it expire",
-					ErrNotPlaced, leaseID, lease.Phase)
+				// The advice depends on the phase the lease is in NOW, not on the
+				// one it is trying to reach.
+				//
+				// From `assigned` this is the ordinary "you forgot to bind"
+				// case, and Bind still accepts it. From a phase that already
+				// requires placement the lease is an orphan — its node row went
+				// away — and Bind refuses to adopt it, so recommending a bind
+				// would send the operator into a second refusal. Only ending the
+				// lease works there, and saying so for BOTH cases would tell
+				// someone to destroy work that just needed binding.
+				fix := "bind it to a node first"
+				if requiresPlacement(lease.Phase) {
+					fix = "release it, or stop its holder and let it expire"
+				}
+
+				return fmt.Errorf("%w: lease %s is %s with no bound node; %s",
+					ErrNotPlaced, leaseID, lease.Phase, fix)
 			}
 
 			// Re-checked against CURRENT policy rather than trusted from bind

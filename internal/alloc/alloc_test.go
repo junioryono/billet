@@ -3,6 +3,7 @@ package alloc
 import (
 	"database/sql"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1591,6 +1592,53 @@ func TestEveryRunningPhaseRejectsAnUnboundLease(t *testing.T) {
 
 			if err := a.Advance(ctx, lease.ID, lease.Epoch, phase); !errors.Is(err, ErrNotPlaced) {
 				t.Errorf("entering %s unbound = %v, want ErrNotPlaced", phase, err)
+			}
+		})
+	}
+}
+
+// The recovery advice depends on the phase the lease is in NOW. From `assigned`
+// a bind is exactly what is missing and Bind accepts it; from a running phase
+// the lease is an orphan that Bind refuses to adopt, so identical advice would
+// send the operator into a second refusal. Telling both cases to release would
+// destroy work that only needed binding.
+func TestOrphanAdviceDependsOnTheCurrentPhase(t *testing.T) {
+	for name, tc := range map[string]struct {
+		seed, to Phase
+		want     string
+	}{
+		"assigned needs a bind":  {PhaseAssigned, PhaseLaunching, "bind it to a node first"},
+		"launching is an orphan": {PhaseLaunching, PhaseOnline, "release it"},
+		"online is an orphan":    {PhaseOnline, PhaseBusy, "release it"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			a := newAllocator(t,
+				Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB},
+				[]config.Tier{tier("small", 4, 16*config.GiB)})
+
+			ctx := t.Context()
+
+			lease, err := a.Reserve(ctx, "small")
+			if err != nil {
+				t.Fatalf("Reserve: %v", err)
+			}
+
+			if err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+				_, err := tx.ExecContext(ctx,
+					`UPDATE leases SET phase = ?, node = NULL WHERE id = ?`, string(tc.seed), lease.ID)
+
+				return err
+			}); err != nil {
+				t.Fatalf("seed %s: %v", tc.seed, err)
+			}
+
+			err = a.Advance(ctx, lease.ID, lease.Epoch, tc.to)
+			if !errors.Is(err, ErrNotPlaced) {
+				t.Fatalf("Advance = %v, want ErrNotPlaced", err)
+			}
+
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("advice for a %s lease = %v, want it to recommend %q", tc.seed, err, tc.want)
 			}
 		})
 	}
