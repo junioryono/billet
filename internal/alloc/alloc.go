@@ -608,6 +608,21 @@ func (a *Allocator) Bind(ctx context.Context, leaseID string, epoch int64, node 
 				ErrWrongNode, leaseID, lease.TargetNode, node)
 		}
 
+		// Answered BEFORE the allowlist, because a repeat changes nothing. If the
+		// host's policy tightened after this lease was placed, refusing the retry
+		// un-binds nothing — the guest is running either way — and turns a
+		// harmless no-op into a hard error that a node retrying past a transient
+		// failure would read as "tear this job down". The policy gates NEW
+		// placements; an existing one is the reaper's problem, not Bind's.
+		if lease.Node == node {
+			return nil // idempotent repeat
+		}
+
+		if lease.Node != "" {
+			return fmt.Errorf("%w: lease %s is already bound to node %q, cannot rebind to %q",
+				ErrWrongNode, leaseID, lease.Node, node)
+		}
+
 		// The host's guest-OS allowlist is enforced HERE because this is the
 		// first point at which the host is known. A lease with no target_node
 		// names no host at reserve time, so config validation cannot rule out a
@@ -619,15 +634,6 @@ func (a *Allocator) Bind(ctx context.Context, leaseID string, epoch int64, node 
 		if !a.allowsGuestOS(node, lease.GuestOS) {
 			return fmt.Errorf("%w: lease %s is a %s guest and node %q does not permit that guest OS",
 				ErrGuestOSNotAllowed, leaseID, lease.GuestOS, node)
-		}
-
-		if lease.Node != "" && lease.Node != node {
-			return fmt.Errorf("%w: lease %s is already bound to node %q, cannot rebind to %q",
-				ErrWrongNode, leaseID, lease.Node, node)
-		}
-
-		if lease.Node == node {
-			return nil // idempotent repeat
 		}
 
 		if _, err := tx.ExecContext(ctx,
