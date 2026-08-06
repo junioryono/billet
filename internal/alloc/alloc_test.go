@@ -23,6 +23,23 @@ func tier(label string, vcpu int, mem config.ByteSize) config.Tier {
 	}
 }
 
+// headroom asserts the query succeeded before returning the number.
+//
+// `n, _ := a.Headroom(...)` reads harmlessly and is not: Headroom returns 0
+// alongside an error, so every assertion of the form `n != 0` passes when the
+// query FAILS. That is the same defect that made two Usage assertions vacuous,
+// and errcheck cannot catch it here because it is excluded for test files.
+func headroom(t *testing.T, a *Allocator, tier string) int {
+	t.Helper()
+
+	n, err := a.Headroom(t.Context(), tier)
+	if err != nil {
+		t.Fatalf("Headroom(%s): %v", tier, err)
+	}
+
+	return n
+}
+
 func newAllocator(t *testing.T, limits Limits, tiers []config.Tier, opts ...Option) *Allocator {
 	t.Helper()
 
@@ -48,8 +65,8 @@ func TestReserveHoldsCapacity(t *testing.T) {
 
 	ctx := t.Context()
 
-	if n, err := a.Headroom(ctx, "small"); err != nil || n != 4 {
-		t.Fatalf("Headroom = %d, %v; want 4", n, err)
+	if n := headroom(t, a, "small"); n != 4 {
+		t.Fatalf("Headroom = %d, want 4", n)
 	}
 
 	lease, err := a.Reserve(ctx, "small")
@@ -59,7 +76,7 @@ func TestReserveHoldsCapacity(t *testing.T) {
 
 	// The point of escrowing: what a listener may advertise drops immediately,
 	// before any job is assigned or any VM booted.
-	if n, err := a.Headroom(ctx, "small"); err != nil || n != 3 {
+	if n := headroom(t, a, "small"); n != 3 {
 		t.Fatalf("after Reserve, Headroom = %d, %v; want 3", n, err)
 	}
 
@@ -76,7 +93,7 @@ func TestReserveHoldsCapacity(t *testing.T) {
 		t.Fatalf("Release: %v", err)
 	}
 
-	if n, err := a.Headroom(ctx, "small"); err != nil || n != 4 {
+	if n := headroom(t, a, "small"); n != 4 {
 		t.Fatalf("after Release, Headroom = %d, %v; want 4", n, err)
 	}
 }
@@ -91,8 +108,8 @@ func TestMemoryCanBindBeforeVCPU(t *testing.T) {
 
 	ctx := t.Context()
 
-	if n, err := a.Headroom(ctx, "fat"); err != nil || n != 2 {
-		t.Fatalf("Headroom = %d, %v; want 2 (memory-bound, not core-bound)", n, err)
+	if n := headroom(t, a, "fat"); n != 2 {
+		t.Fatalf("Headroom = %d, want 2 (memory-bound, not core-bound)", n)
 	}
 
 	for i := range 2 {
@@ -118,7 +135,7 @@ func TestTiersShareOneGlobalCeiling(t *testing.T) {
 
 	ctx := t.Context()
 
-	if n, _ := a.Headroom(ctx, "large"); n != 2 {
+	if n := headroom(t, a, "large"); n != 2 {
 		t.Fatalf("large Headroom = %d, want 2", n)
 	}
 
@@ -127,7 +144,7 @@ func TestTiersShareOneGlobalCeiling(t *testing.T) {
 	}
 
 	// 12 vCPU and 48GiB remain, so only one large fits.
-	if n, _ := a.Headroom(ctx, "large"); n != 1 {
+	if n := headroom(t, a, "large"); n != 1 {
 		t.Errorf("after reserving small, large Headroom = %d, want 1", n)
 	}
 }
@@ -203,7 +220,7 @@ func TestPerTierConcurrencyCap(t *testing.T) {
 
 	ctx := t.Context()
 
-	if n, _ := a.Headroom(ctx, "capped"); n != 2 {
+	if n := headroom(t, a, "capped"); n != 2 {
 		t.Fatalf("Headroom = %d, want 2 (the per-tier cap, not the machine)", n)
 	}
 
@@ -237,7 +254,7 @@ func TestMacOSLimitIsPerHostAcrossTiers(t *testing.T) {
 
 	ctx := t.Context()
 
-	if n, _ := a.Headroom(ctx, "mac-6"); n != config.DefaultMacOSVMLimit {
+	if n := headroom(t, a, "mac-6"); n != config.DefaultMacOSVMLimit {
 		t.Fatalf("mac-6 Headroom = %d, want %d", n, config.DefaultMacOSVMLimit)
 	}
 
@@ -250,7 +267,7 @@ func TestMacOSLimitIsPerHostAcrossTiers(t *testing.T) {
 		t.Fatalf("Reserve mac-12: %v", err)
 	}
 
-	if n, _ := a.Headroom(ctx, "mac-6"); n != 0 {
+	if n := headroom(t, a, "mac-6"); n != 0 {
 		t.Errorf("mac-6 Headroom = %d after two guests on the host, want 0", n)
 	}
 
@@ -283,7 +300,7 @@ func TestLinuxGuestsOnAMacAreNotCapped(t *testing.T) {
 	}
 
 	// Five Linux guests must not have consumed any macOS licence slot.
-	if n, _ := a.Headroom(ctx, "mac-6"); n != config.DefaultMacOSVMLimit {
+	if n := headroom(t, a, "mac-6"); n != config.DefaultMacOSVMLimit {
 		t.Errorf("mac-6 Headroom = %d after 5 Linux guests, want %d", n, config.DefaultMacOSVMLimit)
 	}
 }
@@ -430,7 +447,7 @@ func TestReapFencesTheOldHolder(t *testing.T) {
 	}
 
 	// Capacity came back.
-	if got, _ := a.Headroom(ctx, "small"); got != 4 {
+	if got := headroom(t, a, "small"); got != 4 {
 		t.Errorf("Headroom after reap = %d, want 4", got)
 	}
 
@@ -612,7 +629,7 @@ func TestMacOSAccountingSurvivesCatalogChange(t *testing.T) {
 		t.Fatalf("New after rename: %v", err)
 	}
 
-	if n, _ := second.Headroom(ctx, "mac-6-renamed"); n != 0 {
+	if n := headroom(t, second, "mac-6-renamed"); n != 0 {
 		t.Errorf("Headroom = %d after a rename, want 0 — in-flight guests were reclassified", n)
 	}
 }
@@ -1047,7 +1064,7 @@ func TestMacOSLimitHonoursPerHostOverride(t *testing.T) {
 
 	ctx := t.Context()
 
-	if n, _ := a.Headroom(ctx, "mac-6"); n != 1 {
+	if n := headroom(t, a, "mac-6"); n != 1 {
 		t.Fatalf("Headroom = %d, want 1 from the host's lowered limit", n)
 	}
 
@@ -1073,7 +1090,7 @@ func TestMacOSLimitZeroSchedulesNoGuests(t *testing.T) {
 
 	ctx := t.Context()
 
-	if n, _ := a.Headroom(ctx, "mac-6"); n != 0 {
+	if n := headroom(t, a, "mac-6"); n != 0 {
 		t.Errorf("Headroom = %d on a host that permits no macOS guests, want 0", n)
 	}
 
@@ -1106,7 +1123,7 @@ func TestNodePolicyIsCopiedAtConstruction(t *testing.T) {
 	limits.Nodes["mac-mini-1"] = config.NodePolicy{Name: "mac-mini-1"}
 	raised = 5
 
-	if n, _ := a.Headroom(t.Context(), "mac-6"); n != 1 {
+	if n := headroom(t, a, "mac-6"); n != 1 {
 		t.Errorf("Headroom = %d after the caller mutated its map, want the value captured at New (1)", n)
 	}
 }
