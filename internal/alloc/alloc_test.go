@@ -1709,7 +1709,7 @@ func TestNewRejectsMalformedNodePolicy(t *testing.T) {
 
 	defer db.Close()
 
-	negative := -1
+	negative, two := -1, 2
 
 	for name, policy := range map[string]config.NodePolicy{
 		"unknown guest_os":   {Name: "n", GuestOS: []config.GuestOS{"plan9"}},
@@ -1720,6 +1720,12 @@ func TestNewRejectsMalformedNodePolicy(t *testing.T) {
 			GuestOS:      []config.GuestOS{config.GuestLinux},
 			MacOSVMLimit: &negative,
 		},
+		"macos limit contradicting the allowlist": {
+			Name:         "n",
+			GuestOS:      []config.GuestOS{config.GuestLinux},
+			MacOSVMLimit: &two,
+		},
+		"unusable name": {Name: "not a node name"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			limits := Limits{
@@ -1729,6 +1735,39 @@ func TestNewRejectsMalformedNodePolicy(t *testing.T) {
 
 			if _, err := New(db, limits, []config.Tier{tier("small", 4, 16*config.GiB)}); err == nil {
 				t.Errorf("New accepted a node policy with %s", name)
+			}
+		})
+	}
+}
+
+// The map KEY is how every lookup finds a policy. A key that is not the
+// canonical node name detaches the policy from its host: Tier.Node is
+// normalized, the key is not, the lookup misses, and an explicit macos_vm_limit
+// of 0 is silently replaced by Apple's default of 2. The policy looks enforced
+// and is not.
+func TestNewRejectsPolicyKeysThatCannotBeFound(t *testing.T) {
+	db, err := state.Open(t.Context(), t.TempDir())
+	if err != nil {
+		t.Fatalf("state.Open: %v", err)
+	}
+
+	defer db.Close()
+
+	zero := 0
+
+	for name, nodes := range map[string]map[string]config.NodePolicy{
+		"key has trailing whitespace": {
+			"mac-mini-1 ": {Name: "mac-mini-1 ", MacOSVMLimit: &zero},
+		},
+		"key disagrees with the policy name": {
+			"mac-mini-1": {Name: "mac-mini-2", MacOSVMLimit: &zero},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			limits := Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB, Nodes: nodes}
+
+			if _, err := New(db, limits, []config.Tier{tier("small", 4, 16*config.GiB)}); err == nil {
+				t.Errorf("New accepted a catalog where %s", name)
 			}
 		})
 	}

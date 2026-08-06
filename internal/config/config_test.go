@@ -717,6 +717,19 @@ func TestNodeNamesAreValidatedConsistently(t *testing.T) {
     memory: 24GiB
     image: macos-26
 `,
+		// A LINUX tier, deliberately. The macOS case above would fail anyway on
+		// the separate "macOS must pin a node" rule, so it could not tell
+		// whether the pin was being validated at all.
+		"blank linux tier pin": validConfig + `
+  - label: billet-4vcpu-blank-pin
+    provider: firecracker
+    guest_os: linux
+    node: "   "
+    vcpu: 4
+    memory: 12GiB
+    image: ubuntu-2404-x64
+`,
+		"blank node name":     strings.Replace(validConfig, "name: epyc-1", `name: "   "`, 1),
 		"spaces in node name": strings.Replace(validConfig, "name: epyc-1", `name: "epyc 1"`, 1),
 		"spaces in tier pin": validConfig + `
   - label: billet-4vcpu-arm
