@@ -205,18 +205,28 @@ func (b *browser) validateManifest(raw string) {
 		return
 	}
 
-	if s, _ := m["url"].(string); s == "" {
-		b.t.Error("manifest.url is required by GitHub and is missing")
+	if s, ok := m["url"].(string); !ok || s == "" {
+		b.t.Errorf("manifest.url is required by GitHub and is missing or not a string: %v", m["url"])
 	}
 
 	// The one that bit us: GitHub marks hook_attributes.url required whenever
 	// the object is present, so an inactive hook still needs a URL.
 	if hook, ok := m["hook_attributes"].(map[string]any); ok {
-		if s, _ := hook["url"].(string); s == "" {
+		if s, ok := hook["url"].(string); !ok || s == "" {
 			b.t.Error("manifest.hook_attributes is present but carries no url; GitHub rejects that")
 		}
 
-		if active, _ := hook["active"].(bool); active {
+		// PRESENCE is asserted, not merely the value. `active, _ := ...(bool)`
+		// yields false when the key is absent or the wrong type — which is the
+		// expected value — so it passed without ever proving the manifest
+		// disables the webhook. Dropping the field entirely would have gone
+		// unnoticed, and billet's claim to need no inbound ingress rests on it.
+		active, ok := hook["active"].(bool)
+
+		switch {
+		case !ok:
+			b.t.Errorf("manifest.hook_attributes.active must be present and boolean, got %v", hook["active"])
+		case active:
 			b.t.Error("the webhook must be inactive: billet needs no inbound ingress")
 		}
 	}
@@ -231,15 +241,20 @@ func (b *browser) validateManifest(raw string) {
 	}
 
 	for name, want := range permissions {
-		if got, _ := perms[name].(string); got != want {
-			b.t.Errorf("manifest permission %q = %q, want %q", name, got, want)
+		if got, ok := perms[name].(string); !ok || got != want {
+			b.t.Errorf("manifest permission %q = %v, want %q", name, perms[name], want)
 		}
 	}
 
 	// setup_on_update would point a future repository-access change at a loopback
-	// port that stopped existing when onboarding finished.
-	if v, _ := m["setup_on_update"].(bool); v {
-		b.t.Error("setup_on_update should be off: the callback listener is ephemeral")
+	// port that stopped existing when onboarding finished. Absence is the
+	// intended encoding; a present value must still be an explicit false rather
+	// than any non-boolean that happens to read as one.
+	if v, present := m["setup_on_update"]; present {
+		off, ok := v.(bool)
+		if !ok || off {
+			b.t.Errorf("setup_on_update must be absent or explicitly false, got %v", v)
+		}
 	}
 }
 
@@ -262,7 +277,12 @@ func (b *browser) get(ctx context.Context, target string) string {
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		b.t.Errorf("read %s: %v", target, err)
+
+		return ""
+	}
 
 	return string(body)
 }
@@ -573,8 +593,16 @@ func TestOnboardRejectsStateMismatch(t *testing.T) {
 
 	attacker := func(ctx context.Context, target string) error {
 		go func() {
-			req, _ := http.NewRequestWithContext(ctx, http.MethodGet,
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet,
 				strings.TrimSuffix(target, "/")+"/callback?code=evil&state=wrong", http.NoBody)
+			if err != nil {
+				// Not t.Fatalf: this runs on a goroutine, where Fatalf only
+				// stops that goroutine and lets the test report a later,
+				// unrelated failure instead of this one.
+				t.Errorf("build attacker request: %v", err)
+
+				return
+			}
 
 			resp, err := srv.Client().Do(req)
 			if err == nil {

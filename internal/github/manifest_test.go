@@ -151,6 +151,7 @@ func TestConvertManifestSuccess(t *testing.T) {
 		}
 
 		w.WriteHeader(http.StatusCreated)
+		//nolint:errcheck // httptest.ResponseWriter writes to an in-process buffer; a failure here cannot occur and would not be actionable.
 		_, _ = w.Write([]byte(`{"id":42,"slug":"billet-acme","name":"billet","html_url":"https://github.com/apps/billet-acme","pem":"-----BEGIN RSA PRIVATE KEY-----\nx\n-----END RSA PRIVATE KEY-----\n"}`))
 	}))
 	defer srv.Close()
@@ -179,6 +180,7 @@ func TestConvertManifestRejectsIncompleteResponse(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				w.WriteHeader(http.StatusCreated)
+				//nolint:errcheck // httptest.ResponseWriter writes to an in-process buffer; a failure here cannot occur and would not be actionable.
 				_, _ = w.Write([]byte(body))
 			}))
 			defer srv.Close()
@@ -195,6 +197,7 @@ func TestConvertManifestRejectsIncompleteResponse(t *testing.T) {
 func TestConvertManifestSurfacesGitHubMessage(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusUnprocessableEntity)
+		//nolint:errcheck // httptest.ResponseWriter writes to an in-process buffer; a failure here cannot occur and would not be actionable.
 		_, _ = w.Write([]byte(`{"message":"The code passed is incorrect or expired."}`))
 	}))
 	defer srv.Close()
