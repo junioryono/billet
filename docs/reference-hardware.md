@@ -16,15 +16,18 @@ billet deployment; so is a single EC2 spot instance.
 | Board | Supermicro H12SSL-CT (single socket SP3) |
 | Memory | 512 GB DDR4-3200 ECC RDIMM (8× Samsung M393A8G40BB4-CWE, 64 GB 2Rx4) |
 | Network | 2× 10GBase-T (Broadcom BCM57416) + dedicated IPMI (ASPEED AST2500) |
-| Storage HBA | LSI/Broadcom SAS 3008, 8 SAS3 ports + 8 SATA |
+| Storage | 8× SATA3, Broadcom 3008 SAS3 controller, 2× M.2 PCIe 4.0 ×4 |
 
 Verified against [AMD's 7763 product
 page](https://www.amd.com/en/products/processors/server/epyc/7003-series/amd-epyc-7763.html)
 and the [H12SSL-i/C/CT/NT
 manual](https://www.supermicro.com/manuals/motherboard/EPYC7000/MNL-2314.pdf)
-rather than from memory — the H12SSL variants differ in exactly the ways that
-matter here (`-i`/`-C` carry 1 GbE, `-CT`/`-NT` carry 10 GbE; only `-C`/`-CT`
-carry the SAS3008).
+and the [H12SSL-CT product
+page](https://www.supermicro.com/en/products/motherboard/h12ssl-ct) rather than
+from memory — the H12SSL variants differ in exactly the ways that matter here
+(`-i`/`-C` carry 1 GbE, `-CT`/`-NT` carry 10 GbE; only `-C`/`-CT` carry the
+SAS3008), and the family manual and the per-model page do not agree on
+everything. See the storage note below.
 
 ### CPU topology, and why it decides tier shapes
 
@@ -98,13 +101,25 @@ a high-clock node and pinning that tier to it — not a larger server CPU.
 
 ## Storage note
 
-The `-CT` variant carries 8 SATA ports and 8 SAS3 ports behind an LSI 3008. The
-family feature list also advertises 2× M.2 (PCIe 4.0 x4, M-key, 2280/22110),
-while the per-model drive table lists 0 dedicated NVMe for `-CT`; confirm what is
-physically present before planning a layout that assumes NVMe.
+Per Supermicro's [H12SSL-CT product
+page](https://www.supermicro.com/en/products/motherboard/h12ssl-ct), the board
+carries **8× SATA3**, **2× M.2** (PCIe 4.0 ×4, M-key, 2280/22110), and a
+**Broadcom 3008 SAS3** controller. The two M.2 sockets are real and confirmed —
+useful, because a mirrored pair of NVMe drives is the natural home for the
+control-plane database and golden images.
 
-The SAS3008 is a plain HBA rather than a RAID controller, which is what ZFS
-wants — no card-level abstraction between ZFS and the disks.
+Two details worth knowing before planning a layout:
+
+- **The SAS3 port count is documented inconsistently.** The product page's I/O
+  section lists **2 SAS3 ports**, and its key-features summary describes the
+  3008 as serving "2 SAS3 ports, 2 M.2" — implying its lanes are shared with the
+  M.2 sockets. The family manual's variant table instead says 8. Count the
+  physical connectors before committing to a drive plan.
+- **The 3008 advertises RAID 0/1/10**, so it is not unconditionally a plain HBA.
+  ZFS wants direct, unabstracted access to each disk: confirm the controller is
+  presenting drives individually (IT/JBOD-style) rather than through a RAID
+  volume. Handing ZFS a RAID volume hides exactly the per-disk errors it exists
+  to detect and repair.
 
 Golden images and control-plane state should be **mirrored**. A single SSD lets
 ZFS detect corruption but not repair it, and the control-plane database is the

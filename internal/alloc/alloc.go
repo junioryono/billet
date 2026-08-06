@@ -14,7 +14,8 @@
 //
 // Capacity is a VECTOR — vCPU, memory, per-tier concurrency, and per-node macOS
 // licence slots — never a single integer. A host runs out of memory long before
-// it runs out of cores, and Apple's two-guest limit is not expressible in either.
+// it runs out of cores, and a host's macOS guest limit is not expressible in
+// either.
 package alloc
 
 import (
@@ -101,6 +102,10 @@ var (
 	// ErrConflict means a retry contradicts what was already recorded — the same
 	// lease assigned to a different job, or released with a different outcome.
 	ErrConflict = errors.New("alloc: retry contradicts the recorded operation")
+	// ErrGuestOSNotAllowed means the host does not permit the lease's guest OS.
+	// Distinct from ErrWrongNode: the lease is not pinned anywhere, the chosen
+	// host simply may not run that kind of guest.
+	ErrGuestOSNotAllowed = errors.New("alloc: node does not permit that guest OS")
 )
 
 // Limits is the global ceiling the allocator escrows against.
@@ -108,15 +113,16 @@ type Limits struct {
 	MaxVCPU   int
 	MaxMemory config.ByteSize
 
-	// MacOSPerNode caps concurrent macOS guests per host, keyed by node name.
-	// Build it with config.Config.MacOSLimits so the runtime cap and the
-	// load-time guard read the same number.
+	// Nodes is per-host policy keyed by node name. Build it with
+	// config.Config.NodePolicies so the runtime checks and the load-time guard
+	// read the same rules rather than two copies that can drift.
 	//
-	// A node absent from the map falls back to config.DefaultMacOSVMLimit. An
-	// unconfigured Apple host is still bound by Apple's licence, so the absent
-	// case must be the licence rather than "unlimited" — a mistyped node name
-	// then costs a scheduling constraint, not a licence violation.
-	MacOSPerNode map[string]int
+	// A node absent from the map is unconstrained in guest OS and falls back to
+	// config.DefaultMacOSVMLimit. An unconfigured Apple host is still bound by
+	// Apple's licence, so the absent case must be the licence rather than
+	// "unlimited" — a mistyped node name then costs a scheduling constraint, not
+	// a licence violation.
+	Nodes map[string]config.NodePolicy
 }
 
 // Lease is a capacity reservation. The Epoch is the fencing token: every write
@@ -130,15 +136,19 @@ type Lease struct {
 	// TargetNode is the node the lease is CONSTRAINED to by its tier's config.
 	// Recorded at reserve time so placement survives a catalog change.
 	TargetNode string
-	// MacOSSlot records whether this lease consumes one of Apple's two per-host
+	// MacOSSlot records whether this lease consumes one of its host's macOS
 	// guest licences. Stored rather than re-derived for the same reason.
 	MacOSSlot bool
-	Phase     Phase
-	VCPU      int
-	Memory    config.ByteSize
-	Epoch     int64
-	RunID     int64
-	JobID     int64
+	// GuestOS is what this lease boots, recorded at reserve time so a tier
+	// redefined underneath an in-flight lease cannot reclassify it. Bind checks
+	// it against the target host's allowlist.
+	GuestOS config.GuestOS
+	Phase   Phase
+	VCPU    int
+	Memory  config.ByteSize
+	Epoch   int64
+	RunID   int64
+	JobID   int64
 }
 
 // Usage is the vector of what is currently held.
@@ -204,21 +214,23 @@ func New(db *state.DB, limits Limits, tiers []config.Tier, opts ...Option) (*All
 			limits.MaxVCPU, limits.MaxMemory)
 	}
 
-	// The map is copied rather than aliased: Limits is a value type, and a caller
-	// that kept a reference could otherwise raise a host's macOS cap after
-	// construction, moving a licence limit out from under leases already counted
-	// against it.
-	perNode := make(map[string]int, len(limits.MacOSPerNode))
+	// Deep-copied rather than aliased: Limits is a value type, but the map, the
+	// GuestOS slices and the MacOSVMLimit pointers inside it are all shared with
+	// the caller. Copying only the map would still let a caller widen a host's
+	// allowlist or raise its cap after construction, moving a licence limit out
+	// from under leases already counted against it. NodePolicy.Clone owns that
+	// knowledge so it lives in one place.
+	perNode := make(map[string]config.NodePolicy, len(limits.Nodes))
 
-	for node, n := range limits.MacOSPerNode {
-		if n < 0 {
+	for node, p := range limits.Nodes {
+		if n := p.MacOSLimit(); n < 0 {
 			return nil, fmt.Errorf("alloc: node %q has negative macOS limit %d", node, n)
 		}
 
-		perNode[node] = n
+		perNode[node] = p.Clone()
 	}
 
-	limits.MacOSPerNode = perNode
+	limits.Nodes = perNode
 
 	a := &Allocator{
 		db:       db,
@@ -354,15 +366,26 @@ func (a *Allocator) Escrow(ctx context.Context, tier string, want int) ([]*Lease
 	return leases, nil
 }
 
-// macOSLimit is the cap on concurrent macOS guests for a host. See
-// Limits.MacOSPerNode for why an unlisted node gets Apple's default rather than
-// no limit at all.
+// macOSLimit is the cap on concurrent macOS guests for a host. See Limits.Nodes
+// for why an unlisted node gets Apple's default rather than no limit at all.
 func (a *Allocator) macOSLimit(node string) int {
-	if n, ok := a.limits.MacOSPerNode[node]; ok {
-		return n
+	if p, ok := a.limits.Nodes[node]; ok {
+		return p.MacOSLimit()
 	}
 
 	return config.DefaultMacOSVMLimit
+}
+
+// allowsGuestOS reports whether a host may run a guest OS. An undeclared host is
+// unconstrained, which is what a deployment that never wrote a nodes section
+// relies on.
+func (a *Allocator) allowsGuestOS(node string, os config.GuestOS) bool {
+	p, ok := a.limits.Nodes[node]
+	if !ok {
+		return true
+	}
+
+	return p.AllowsGuestOS(os)
 }
 
 // headroom computes how many more of a tier fit. Every limit is applied, and the
@@ -471,10 +494,10 @@ func (a *Allocator) insertLease(ctx context.Context, tx *sql.Tx, t config.Tier) 
 
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO leases
-		   (id, tier, node, target_node, macos_slot, phase, vcpu, memory, epoch,
+		   (id, tier, node, target_node, macos_slot, guest_os, phase, vcpu, memory, epoch,
 		    created_at, heartbeat_at, expires_at)
-		 VALUES (?, ?, NULL, ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
-		id, t.Label, targetNode, macSlot, string(PhaseCapacity), t.VCPU, int64(t.Memory),
+		 VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
+		id, t.Label, targetNode, macSlot, string(t.GuestOS), string(PhaseCapacity), t.VCPU, int64(t.Memory),
 		ts(now), ts(now), ts(now.Add(a.leaseTTL))); err != nil {
 		return nil, fmt.Errorf("alloc: insert lease: %w", err)
 	}
@@ -484,6 +507,7 @@ func (a *Allocator) insertLease(ctx context.Context, tx *sql.Tx, t config.Tier) 
 		Tier:       t.Label,
 		TargetNode: t.Node,
 		MacOSSlot:  macSlot == 1,
+		GuestOS:    t.GuestOS,
 		Phase:      PhaseCapacity,
 		VCPU:       t.VCPU,
 		Memory:     t.Memory,
@@ -582,6 +606,19 @@ func (a *Allocator) Bind(ctx context.Context, leaseID string, epoch int64, node 
 		if lease.TargetNode != "" && lease.TargetNode != node {
 			return fmt.Errorf("%w: lease %s is pinned to node %q, cannot bind to %q",
 				ErrWrongNode, leaseID, lease.TargetNode, node)
+		}
+
+		// The host's guest-OS allowlist is enforced HERE because this is the
+		// first point at which the host is known. A lease with no target_node
+		// names no host at reserve time, so config validation cannot rule out a
+		// placement it never sees — a scheduler that simply picked a node with
+		// free capacity would otherwise put a Linux guest on a macOS-only Mac.
+		//
+		// The guest OS comes from the lease's own column, not the live catalog,
+		// so a tier redefined underneath an in-flight lease cannot reclassify it.
+		if !a.allowsGuestOS(node, lease.GuestOS) {
+			return fmt.Errorf("%w: lease %s is a %s guest and node %q does not permit that guest OS",
+				ErrGuestOSNotAllowed, leaseID, lease.GuestOS, node)
 		}
 
 		if lease.Node != "" && lease.Node != node {
@@ -841,6 +878,7 @@ func (a *Allocator) loadAny(ctx context.Context, tx *sql.Tx, leaseID string, epo
 		node       sql.NullString
 		targetNode sql.NullString
 		macSlot    int
+		guestOS    string
 		mem        int64
 		ph         string
 		runID      sql.NullInt64
@@ -849,9 +887,9 @@ func (a *Allocator) loadAny(ctx context.Context, tx *sql.Tx, leaseID string, epo
 	)
 
 	err := tx.QueryRowContext(ctx,
-		`SELECT id, tier, node, target_node, macos_slot, phase, vcpu, memory, epoch, run_id, job_id
+		`SELECT id, tier, node, target_node, macos_slot, guest_os, phase, vcpu, memory, epoch, run_id, job_id
 		   FROM leases WHERE id = ?`, leaseID).
-		Scan(&l.ID, &l.Tier, &node, &targetNode, &macSlot, &ph, &l.VCPU, &mem, &curEpoch, &runID, &jobID)
+		Scan(&l.ID, &l.Tier, &node, &targetNode, &macSlot, &guestOS, &ph, &l.VCPU, &mem, &curEpoch, &runID, &jobID)
 
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
@@ -868,6 +906,7 @@ func (a *Allocator) loadAny(ctx context.Context, tx *sql.Tx, leaseID string, epo
 
 	l.Node, l.TargetNode = node.String, targetNode.String
 	l.MacOSSlot, l.Phase, l.Memory = macSlot == 1, Phase(ph), config.ByteSize(mem)
+	l.GuestOS = config.GuestOS(guestOS)
 	l.Epoch, l.RunID, l.JobID = curEpoch, runID.Int64, jobID.Int64
 
 	return &l, nil

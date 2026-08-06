@@ -389,10 +389,10 @@ var placementMigration = migration{
 		// no foreign key because it may name a host that has not registered yet,
 		// while `node` keeps its FK because binding proves the node exists.
 		//
-		// macos_slot records whether the lease consumes one of Apple's two
-		// per-host guest licences. Counting that by walking the current tier map
-		// meant renaming a tier, changing its guest_os, or restarting with a
-		// different catalog silently reclassified leases already in flight.
+		// macos_slot records whether the lease consumes one of its host's macOS
+		// guest licences. Counting that by walking the current tier map meant
+		// renaming a tier, changing its guest_os, or restarting with a different
+		// catalog silently reclassified leases already in flight.
 		`ALTER TABLE leases ADD COLUMN target_node TEXT`,
 		`ALTER TABLE leases ADD COLUMN macos_slot INTEGER NOT NULL DEFAULT 0 CHECK (macos_slot IN (0, 1))`,
 		// Reap scans by expiry; without this it is a full table scan holding the
@@ -404,7 +404,24 @@ var placementMigration = migration{
 	},
 }
 
-func init() { migrations = append(migrations, placementMigration) }
+// guestOSMigration records what a lease actually boots, for the same reason
+// placement is recorded: a host may be restricted to a subset of guest
+// operating systems, and the check happens at bind time — long after the tier
+// catalog that produced the lease may have changed underneath it.
+//
+// The default is 'linux' because every lease predating this column was created
+// when a macOS tier was required to pin a node, and the overwhelming majority
+// of guests are Linux. A wrong default here is not silent: it would refuse a
+// bind on a restricted host rather than permit one.
+var guestOSMigration = migration{
+	Version: 6,
+	Name:    "lease_guest_os",
+	Stmts: []string{
+		`ALTER TABLE leases ADD COLUMN guest_os TEXT NOT NULL DEFAULT 'linux'`,
+	},
+}
+
+func init() { migrations = append(migrations, placementMigration, guestOSMigration) }
 
 const bootstrapSchemaMigrations = `CREATE TABLE IF NOT EXISTS schema_migrations (
 	version    INTEGER PRIMARY KEY,
