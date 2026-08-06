@@ -424,8 +424,12 @@ func (a *Allocator) checkPlacement(ctx context.Context, tx *sql.Tx, lease *Lease
 	// reliably classify by guest OS either, since macos_slot only became truthful
 	// at migration 5.
 	if lease.Provider == "" {
+		// "Release it" rather than "reap it": Reap only collects leases whose TTL
+		// has expired, so while a holder keeps heartbeating it returns zero
+		// forever and the advice would be unfollowable.
 		return fmt.Errorf(
-			"%w: lease %s predates provider recording and cannot be placed safely; reap it",
+			"%w: lease %s predates provider recording and cannot be placed safely; "+
+				"release it, or stop its holder and let it expire",
 			ErrNotPlaceable, lease.ID)
 	}
 
@@ -709,6 +713,26 @@ func (a *Allocator) Bind(ctx context.Context, leaseID string, epoch int64, node 
 				ErrWrongNode, leaseID, lease.Node, node)
 		}
 
+		// A FIRST binding for a lease already in a running phase means its node
+		// went missing rather than that it was never placed, and adopting it onto
+		// a new host would create a second owner of one slot.
+		//
+		// `leases.node` is ON DELETE SET NULL, so deleting a node silently blanks
+		// the column for every lease it was running. The lease then LOOKS unbound
+		// while the original host is still executing the job and still holds a
+		// valid epoch, so its heartbeats keep succeeding — bind it elsewhere and
+		// two hosts own the same lease. Reap cannot resolve that while either one
+		// keeps heartbeating.
+		//
+		// Refusing here closes the takeover route. Fencing the leases at node
+		// deletion is the other half and belongs with node lifecycle, which does
+		// not exist yet; there is deliberately no delete path in this package.
+		if requiresPlacement(lease.Phase) {
+			return fmt.Errorf(
+				"%w: lease %s is already %s; a first binding now would make node %q a second owner",
+				ErrWrongNode, leaseID, lease.Phase, node)
+		}
+
 		// The host's guest-OS allowlist is enforced HERE because this is the
 		// first point at which the host is known. A lease with no target_node
 		// names no host at reserve time, so config validation cannot rule out a
@@ -912,23 +936,31 @@ func (a *Allocator) transition(ctx context.Context, leaseID string, epoch int64,
 			return err
 		}
 
-		if lease.Phase == to {
-			// Idempotent: a retried transition is not an error.
-			return nil
-		}
-
-		if !lease.Phase.canMoveTo(to) {
+		// State-machine legality first, so an illegal transition reports itself as
+		// one. capacity -> online is refused whatever the placement is, and
+		// answering it with "bind it to a node first" sends the caller off to do
+		// something that would not help.
+		//
+		// Skipped when the phase is unchanged, because a repeat is not a move and
+		// validTransitions deliberately lists no self-edges.
+		if lease.Phase != to && !lease.Phase.canMoveTo(to) {
 			return fmt.Errorf("%w: %s -> %s", ErrBadTransition, lease.Phase, to)
 		}
 
-		// Every phase from launching onwards presumes a host is running the
-		// instance, so each requires a bound node — not just launching. Covering
-		// only the launching edge would leave a row written by an older binary
-		// with phase='launching' and node=NULL free to walk on to online.
+		// Placement is validated BEFORE the idempotent return, unlike Bind.
 		//
-		// A lease that reaches these phases unbound was placed by something that
-		// never told the allocator where, which makes Bind — and every placement
-		// check inside it — optional rather than an unavoidable gate.
+		// The two look symmetrical and are not. A repeated Bind records nothing
+		// new, so answering it with nil is genuinely a no-op. A repeated
+		// Advance(launching) is read by its caller as "you may launch" — that
+		// nil is an AUTHORIZATION, not an acknowledgement. Returning it without
+		// checking lets a recovery loop re-ask about a row already sitting in
+		// launching and get permission for a placement that is no longer legal,
+		// or was never verifiable.
+		//
+		// Every phase from launching onwards presumes a host is running the
+		// instance, so each requires a bound node — not just the launching edge,
+		// which would leave a row written by an older binary with
+		// phase='launching' and node=NULL free to walk on to online.
 		if requiresPlacement(to) {
 			if lease.Node == "" {
 				return fmt.Errorf("%w: lease %s cannot enter %s; bind it to a node first",
@@ -942,6 +974,11 @@ func (a *Allocator) transition(ctx context.Context, leaseID string, epoch int64,
 			if err := a.checkPlacement(ctx, tx, lease, lease.Node); err != nil {
 				return err
 			}
+		}
+
+		if lease.Phase == to {
+			// Idempotent: a retried transition is not an error.
+			return nil
 		}
 
 		now := a.now().UTC()
