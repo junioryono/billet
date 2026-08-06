@@ -42,6 +42,38 @@ func TestConvertManifestDoesNotLeakTheCodeOnTransportFailure(t *testing.T) {
 	}
 }
 
+// Redacting only the OUTER *url.Error was not enough. http.Client.Do wraps
+// whatever a RoundTripper returns, so a transport that itself produces a
+// *url.Error leaves the inner one — carrying the live code — inside the
+// retained Err.
+func TestConvertManifestRedactsANestedURLError(t *testing.T) {
+	const code = "super-secret-one-time-code"
+
+	client := &http.Client{Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		// Exactly the shape an instrumented transport produces.
+		return nil, &url.Error{Op: "dial", URL: r.URL.String(), Err: errors.New("inner boom")}
+	})}
+
+	_, err := convertManifestAt(t.Context(), client, "https://example.invalid", code)
+	if err == nil {
+		t.Fatal("expected an error from the failing transport")
+	}
+
+	if strings.Contains(err.Error(), code) {
+		t.Errorf("a nested url.Error leaked the one-time code:\n%v", err)
+	}
+
+	// The transport's own message must survive, or the operator loses the only
+	// clue about what actually failed.
+	if !strings.Contains(err.Error(), "inner boom") {
+		t.Errorf("redaction discarded the transport's message: %v", err)
+	}
+}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
 // The permission set is a security claim billet makes in its README and in the
 // CLI's own output. Pin it, so widening it is a deliberate edit to a test rather
 // than a quiet change to a map.
@@ -224,11 +256,15 @@ func TestAppFormattingRedactsCredentials(t *testing.T) {
 	// is the whole risk: somebody prints an App without thinking about it.
 	render := func(format string, v any) string { return fmt.Sprintf(format, v) }
 
-	// Every verb a caller might reach for, including the pointer forms: a
-	// value-receiver method is also in *App's method set.
+	// Every verb a caller might reach for, including the pointer forms (a
+	// value-receiver method is also in *App's method set) and verbs that make no
+	// sense for a struct. %d is the important one: fmt consults Stringer only
+	// for %v/%s/%q/%x/%X, and any other verb formats the fields recursively —
+	// printing the private key inside its own bad-verb diagnostic.
 	for _, rendered := range []string{
-		render("%v", app), render("%s", app), render("%#v", app),
-		render("%v", &app), render("%s", &app), render("%#v", &app),
+		render("%v", app), render("%s", app), render("%#v", app), render("%q", app),
+		render("%d", app), render("%x", app), render("%t", app), render("%+v", app),
+		render("%v", &app), render("%s", &app), render("%#v", &app), render("%d", &app),
 	} {
 		for _, secret := range secrets {
 			if strings.Contains(rendered, secret) {

@@ -1,8 +1,9 @@
 # billet — development commands.
 #
-# `make check` is the pre-commit gate and is exactly what CI runs. If it passes
-# locally it passes in CI, which is the only property that makes a gate worth
-# having.
+# `make check` is the pre-commit gate. CI runs all of it, so a red check is a red
+# CI run — that is what makes the gate worth having. CI does MORE besides:
+# `go mod tidy` diff, coverage upload, govulncheck, and cross-builds. So a green
+# check is necessary rather than sufficient.
 
 GOLANGCI_VERSION := v2.12.2
 BIN              := bin/billet
@@ -11,7 +12,7 @@ COVERPROFILE     := coverage.out
 .DEFAULT_GOAL := check
 
 .PHONY: check
-check: build vet fmt-check lint test ## Everything CI runs
+check: build vet fmt-check lint test ## The pre-commit gate (CI runs this and more)
 
 .PHONY: build
 build: ## Build ./bin/billet

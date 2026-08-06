@@ -17,6 +17,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -165,6 +166,29 @@ func (a App) String() string {
 // GoString covers %#v, which does not consult String.
 func (a App) GoString() string { return a.String() }
 
+// Format makes EVERY verb safe, not just the ones fmt.Stringer covers.
+//
+// fmt consults Stringer only for %v, %s, %q, %x and %X. A verb it does not
+// recognise for a struct — %d is the easy one to reach for — falls back to
+// formatting the fields recursively, and prints the private key inside its own
+// bad-verb diagnostic. Implementing fmt.Formatter takes precedence over
+// Stringer for all verbs, so there is no verb left that renders the raw struct.
+//
+// This does NOT cover an App reached through an unexported field of another
+// struct: fmt uses reflection there and cannot call methods on a value it may
+// not interface. That limitation is intrinsic to fmt, so the claim here is
+// "every direct formatting of an App is safe", not "an App can never be
+// printed".
+func (a App) Format(s fmt.State, verb rune) {
+	// verb is deliberately ignored: the whole point is that NO verb renders the
+	// struct's fields. fmt.State swallows write errors for every other
+	// Formatter too, and there is nowhere to report one from here.
+	//nolint:errcheck // fmt.State has no error channel; a failed write to it is the caller's output problem.
+	io.WriteString(s, a.String())
+
+	_ = verb
+}
+
 // Forget blanks the credentials billet does not keep.
 //
 // Onboard returns this struct after the key is on disk, and only the App ID and
@@ -216,7 +240,7 @@ func convertManifestAt(ctx context.Context, client *http.Client, base, code stri
 	if err != nil {
 		// Redacted: the URL carries the one-time manifest code, and a transport
 		// failure would otherwise print it to stderr.
-		return nil, fmt.Errorf("github: convert manifest: %w", redactCodeFromURLError(err))
+		return nil, fmt.Errorf("github: convert manifest: %w", redactCodeFromURLError(err, code))
 	}
 	defer resp.Body.Close()
 
@@ -259,16 +283,50 @@ func convertManifestAt(ctx context.Context, client *http.Client, base, code stri
 // The underlying network error is preserved and still unwrappable; only the URL
 // is replaced, since the operator already knows which operation failed from the
 // message wrapping this one.
-func redactCodeFromURLError(err error) error {
+func redactCodeFromURLError(err error, code string) error {
+	// Scrubbed by VALUE rather than by walking the error tree.
+	//
+	// Redacting only the outer *url.Error was not enough: http.Client.Do wraps
+	// whatever a RoundTripper returns, so an instrumented or custom transport
+	// that itself produces a *url.Error leaves the inner one — with the live
+	// code — inside the retained Err. And nothing says the code can only ever
+	// appear in a URL field; an HTTP error body that echoes the request path
+	// reaches the same operator terminal through apiError.
+	//
+	// Matching the literal code and its path-escaped form covers every path it
+	// could have taken into the text, and needs no assumption about which error
+	// types a transport composes.
 	var urlErr *url.Error
-	if !errors.As(err, &urlErr) {
-		return err
+	if errors.As(err, &urlErr) {
+		// Op is kept so the operator still knows which operation failed, and the
+		// scrubbed Err keeps the transport's own message. Timeout() and
+		// Temporary() are lost with the concrete type; the message they would
+		// have explained is retained, which is what a human reads.
+		clean := *urlErr
+		clean.URL = redactedCode
+		clean.Err = errors.New(redactString(urlErr.Err.Error(), code))
+
+		return &clean
 	}
 
-	redacted := *urlErr
-	redacted.URL = "[redacted: contains the one-time manifest code]"
+	return errors.New(redactString(err.Error(), code))
+}
 
-	return &redacted
+const redactedCode = "[redacted: contains the one-time manifest code]"
+
+// redactString removes a secret and its URL-escaped form from a message.
+func redactString(s, secret string) string {
+	if secret == "" {
+		return s
+	}
+
+	s = strings.ReplaceAll(s, secret, redactedCode)
+
+	if escaped := url.PathEscape(secret); escaped != secret {
+		s = strings.ReplaceAll(s, escaped, redactedCode)
+	}
+
+	return s
 }
 
 func setAPIHeaders(req *http.Request) {

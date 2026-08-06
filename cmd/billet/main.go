@@ -12,6 +12,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -288,7 +289,18 @@ const maxKeySize = 64 << 10
 // App private key is a local credential exposure that `billet check` existed to
 // catch and did not.
 func checkPrivateKey(path string) error {
-	info, err := os.Stat(path)
+	// Opened ONCE and inspected through the descriptor. Stat-then-read is two
+	// lookups of the same name: the file can be swapped in between, so the size,
+	// type and mode may describe a different inode than the bytes that get
+	// parsed — and os.ReadFile on a FIFO blocks forever rather than returning.
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("github.private_key_path %s: %w", path, err)
+	}
+
+	defer f.Close()
+
+	info, err := f.Stat()
 	if err != nil {
 		return fmt.Errorf("github.private_key_path %s: %w", path, err)
 	}
@@ -319,9 +331,17 @@ func checkPrivateKey(path string) error {
 		}
 	}
 
-	pemBytes, err := os.ReadFile(path)
+	// Read from the descriptor already inspected, and bounded for real: the
+	// size check above describes the inode at that moment, while this limit
+	// holds regardless.
+	pemBytes, err := io.ReadAll(io.LimitReader(f, maxKeySize+1))
 	if err != nil {
 		return fmt.Errorf("read github.private_key_path %s: %w", path, err)
+	}
+
+	if len(pemBytes) > maxKeySize {
+		return fmt.Errorf("github.private_key_path %s is larger than %d bytes; that is not an App key",
+			path, maxKeySize)
 	}
 
 	// Parsed, not merely read: a truncated PEM is exactly what an interrupted
