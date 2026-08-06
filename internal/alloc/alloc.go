@@ -244,33 +244,26 @@ func New(db *state.DB, limits Limits, tiers []config.Tier, opts ...Option) (*All
 	perNode := make(map[string]config.NodePolicy, len(limits.Nodes))
 
 	for node, p := range limits.Nodes {
-		// The RAW fields, not just the effective limit. MacOSLimit() returns 0
-		// when the allowlist excludes macOS, so a negative macos_vm_limit slipped
-		// past a check that only looked at the effective value — the guard
-		// defeated by the very normalization it was reading through.
-		if p.MacOSVMLimit != nil && *p.MacOSVMLimit < 0 {
-			return nil, fmt.Errorf("alloc: node %q has negative macos_vm_limit %d", node, *p.MacOSVMLimit)
+		// The SAME rules config applies, not a second hand-written copy that can
+		// drift into disagreeing about which hosts are legal. This covers the
+		// raw fields rather than the effective limit — a negative
+		// macos_vm_limit slipped past a check reading MacOSLimit(), which
+		// normalizes it to zero whenever the allowlist excludes macOS.
+		if errs := p.Validate(fmt.Sprintf("alloc: node %q", node)); len(errs) > 0 {
+			return nil, errors.Join(errs...)
 		}
 
-		if p.Provider != "" && !p.Provider.Valid() {
-			return nil, fmt.Errorf("alloc: node %q has provider %q, which is not a known backend", node, p.Provider)
+		// The map KEY is how every lookup finds this policy, so a key that is
+		// not the canonical node name silently detaches the policy from its
+		// host: the tier's node is normalized, the key is not, the lookup misses,
+		// and an explicit macos_vm_limit of 0 is replaced by Apple's default of
+		// 2. The policy appears to be enforced and is not.
+		if node != strings.TrimSpace(node) {
+			return nil, fmt.Errorf("alloc: node key %q is not canonical; it has surrounding whitespace", node)
 		}
 
-		// An unknown guest OS in an allowlist is worse than a typo: it matches
-		// nothing, so every lease bound to that host is refused with a message
-		// about the LEASE rather than about the policy that is actually wrong.
-		seenGuest := make(map[config.GuestOS]struct{}, len(p.GuestOS))
-
-		for _, g := range p.GuestOS {
-			if !g.Valid() {
-				return nil, fmt.Errorf("alloc: node %q allows guest_os %q, which is not a known guest OS", node, g)
-			}
-
-			if _, dup := seenGuest[g]; dup {
-				return nil, fmt.Errorf("alloc: node %q lists guest_os %q twice", node, g)
-			}
-
-			seenGuest[g] = struct{}{}
+		if p.Name != node {
+			return nil, fmt.Errorf("alloc: node key %q does not match its policy name %q", node, p.Name)
 		}
 
 		perNode[node] = p.Clone()

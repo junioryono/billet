@@ -389,12 +389,83 @@ var labelRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$`)
 // concurrency default from it — while the allocator trimmed it to empty and
 // rejected the same tier. On a Linux tier the trim silently turned a pin into
 // no pin at all, which is a placement decision changed by whitespace.
-func validateNodeName(where, name string) error {
+func ValidateNodeName(where, name string) error {
 	if !labelRe.MatchString(name) {
 		return fmt.Errorf("%s: node name %q must match %s", where, name, labelRe)
 	}
 
 	return nil
+}
+
+// trimNodeName strips surrounding whitespace ONLY when something is left.
+//
+// Trimming unconditionally destroyed the difference between "absent" and
+// "present but unusable", and both directions were wrong. A `node.name` of
+// "   " became empty and was replaced by the machine's hostname, silently
+// adopting a different identity than the one written. A tier's `node: "   "`
+// became unpinned, and the `if t.Node != ""` guard then skipped validation
+// entirely — removing the operator's placement constraint, which is precisely
+// what validating names was meant to prevent.
+//
+// Leaving a whitespace-only value intact lets it reach the pattern check and be
+// rejected, which is the honest outcome.
+func trimNodeName(name string) string {
+	if trimmed := strings.TrimSpace(name); trimmed != "" {
+		return trimmed
+	}
+
+	return name
+}
+
+// Validate reports every way this policy is malformed on its own terms.
+//
+// Exported because internal/alloc must apply the SAME rules: its constructor
+// accepts a catalog it cannot prove came through Load, and a second
+// hand-written copy of these checks is how the two drift into disagreeing about
+// which hosts are legal.
+func (p NodePolicy) Validate(where string) []error {
+	var errs []error
+
+	if err := ValidateNodeName(where, p.Name); err != nil {
+		errs = append(errs, err)
+	}
+
+	if p.Provider != "" && !p.Provider.Valid() {
+		errs = append(errs, fmt.Errorf("%s: provider %q is not one of %v", where, p.Provider, allProviders))
+	}
+
+	seen := make(map[GuestOS]struct{}, len(p.GuestOS))
+
+	for _, g := range p.GuestOS {
+		if !g.Valid() {
+			errs = append(errs, fmt.Errorf("%s: guest_os %q is not one of %v", where, g, allGuestOS))
+		}
+
+		if _, dup := seen[g]; dup {
+			errs = append(errs, fmt.Errorf("%s: duplicate guest_os %q", where, g))
+		}
+
+		seen[g] = struct{}{}
+	}
+
+	if p.MacOSVMLimit == nil {
+		return errs
+	}
+
+	switch {
+	case *p.MacOSVMLimit < 0:
+		errs = append(errs, fmt.Errorf("%s: macos_vm_limit must not be negative", where))
+	case *p.MacOSVMLimit > 0 && !p.AllowsGuestOS(GuestMacOS):
+		// Both fields decide whether macOS runs here. Silently letting the
+		// allowlist win would mean a config that reads as "two macOS guests"
+		// schedules none.
+		errs = append(errs, fmt.Errorf(
+			"%s: macos_vm_limit is %d but guest_os %v excludes macos; "+
+				"add macos to guest_os or set macos_vm_limit to 0",
+			where, *p.MacOSVMLimit, p.GuestOS))
+	}
+
+	return errs
 }
 
 // Load reads and validates a config file.
@@ -439,15 +510,15 @@ func (c *Config) applyDefaults() {
 	// otherwise fail to match it, and the tier would silently inherit fleet-wide
 	// defaults instead of that host's policy.
 	for i := range c.Nodes {
-		c.Nodes[i].Name = strings.TrimSpace(c.Nodes[i].Name)
+		c.Nodes[i].Name = trimNodeName(c.Nodes[i].Name)
 	}
 
 	for i := range c.Tiers {
-		c.Tiers[i].Node = strings.TrimSpace(c.Tiers[i].Node)
+		c.Tiers[i].Node = trimNodeName(c.Tiers[i].Node)
 	}
 
 	if c.Node != nil {
-		c.Node.Name = strings.TrimSpace(c.Node.Name)
+		c.Node.Name = trimNodeName(c.Node.Name)
 
 		if c.Node.Name == "" {
 			lookup := c.hostname
@@ -494,7 +565,10 @@ func (c *Config) applyDefaults() {
 			}
 		}
 
-		if t.Provider == "" && c.Node != nil {
+		// The local provider is inherited only when it is itself valid, for the
+		// same reason: an invalid one copied here becomes a second diagnostic
+		// against a field the operator never wrote.
+		if t.Provider == "" && c.Node != nil && c.Node.Provider.Valid() {
 			t.Provider = c.Node.Provider
 		}
 		if t.GuestOS == "" {
@@ -599,7 +673,7 @@ func (c *Config) validateNode() []error {
 	if !c.Node.Provider.Valid() {
 		errs = append(errs, fmt.Errorf("node.provider %q is not one of %v", c.Node.Provider, allProviders))
 	}
-	if err := validateNodeName("node.name", c.Node.Name); err != nil {
+	if err := ValidateNodeName("node.name", c.Node.Name); err != nil {
 		// Say where the name came from when billet supplied it. A hostname is not
 		// guaranteed to be a legal node name — a long FQDN exceeds the length
 		// limit — and "node.name is invalid" sends an operator who never typed
@@ -692,7 +766,7 @@ func (c *Config) validateTiers() []error {
 
 		// A pin names a host, so it obeys the same rule as any other node name.
 		if t.Node != "" {
-			if err := validateNodeName(where, t.Node); err != nil {
+			if err := ValidateNodeName(where, t.Node); err != nil {
 				errs = append(errs, err)
 			}
 		}
@@ -848,30 +922,16 @@ func (c *Config) validateNodes() []error {
 			where = fmt.Sprintf("node %q", p.Name)
 		}
 
-		if err := validateNodeName(where, p.Name); err != nil {
-			errs = append(errs, err)
-		}
+		// Each entry on its own terms, through the shared rules the allocator
+		// also applies.
+		errs = append(errs, p.Validate(where)...)
+
 		if _, dup := seen[p.Name]; dup {
 			// Two entries for one host means one of them is silently ignored,
 			// and which one wins depends on ordering.
 			errs = append(errs, fmt.Errorf("%s: duplicate node name", where))
 		}
 		seen[p.Name] = struct{}{}
-
-		if p.Provider != "" && !p.Provider.Valid() {
-			errs = append(errs, fmt.Errorf("%s: provider %q is not one of %v", where, p.Provider, allProviders))
-		}
-
-		guests := make(map[GuestOS]struct{}, len(p.GuestOS))
-		for _, g := range p.GuestOS {
-			if !g.Valid() {
-				errs = append(errs, fmt.Errorf("%s: guest_os %q is not one of %v", where, g, allGuestOS))
-			}
-			if _, dup := guests[g]; dup {
-				errs = append(errs, fmt.Errorf("%s: duplicate guest_os %q", where, g))
-			}
-			guests[g] = struct{}{}
-		}
 
 		// The local node section and a fleet entry for the SAME host describe one
 		// machine. Letting them disagree means the unpinned-tier check compares
@@ -883,23 +943,6 @@ func (c *Config) validateNodes() []error {
 			errs = append(errs, fmt.Errorf(
 				"%s: provider %s contradicts node.provider %s for the same host",
 				where, p.Provider, c.Node.Provider))
-		}
-
-		if p.MacOSVMLimit == nil {
-			continue
-		}
-
-		switch {
-		case *p.MacOSVMLimit < 0:
-			errs = append(errs, fmt.Errorf("%s: macos_vm_limit must not be negative", where))
-		case *p.MacOSVMLimit > 0 && !p.AllowsGuestOS(GuestMacOS):
-			// Both fields decide whether macOS runs here. Silently letting the
-			// allowlist win would mean a config that reads as "two macOS guests"
-			// schedules none, so the contradiction is rejected instead.
-			errs = append(errs, fmt.Errorf(
-				"%s: macos_vm_limit is %d but guest_os %v excludes macos; "+
-					"add macos to guest_os or set macos_vm_limit to 0",
-				where, *p.MacOSVMLimit, p.GuestOS))
 		}
 	}
 	return errs

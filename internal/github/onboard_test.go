@@ -190,7 +190,16 @@ func (b *browser) driveRegistration(ctx context.Context, startURL string) {
 	b.get(ctx, base+"/callback?code=testcode&state="+url.QueryEscape(state))
 }
 
-// validateManifest enforces what GitHub's parameter table documents as required.
+// validateManifest enforces billet's manifest invariants.
+//
+// Only `url` and — when hook_attributes is present — `hook_attributes.url` are
+// documented by GitHub as REQUIRED. Everything else here is billet's own
+// requirement, held to deliberately: the callback URLs because onboarding
+// depends on them, `public: false` and the OAuth fields because of what billet
+// is for, and the whole hook_attributes object because GitHub documents
+// `active` as defaulting to TRUE, so omitting the object is inferred to leave
+// the webhook enabled. That inference is the conservative reading, not a
+// promise from the parameter table.
 //
 // base is the loopback origin the onboarding server is listening on. It is
 // passed in so the callback URLs can be asserted against what billet ACTUALLY
@@ -239,6 +248,23 @@ func (b *browser) validateManifest(raw, base string) {
 	if events, present := m["default_events"]; present {
 		if list, ok := events.([]any); !ok || len(list) > 0 {
 			b.t.Errorf("manifest.default_events must be absent or empty, got %v", events)
+		}
+	}
+
+	// request_oauth_on_install asks the installer to authorize the app as a
+	// user, which billet has no OAuth flow for — and GitHub documents that
+	// enabling it makes setup_url unavailable, which would quietly disable the
+	// installation callback this same validator pins above. callback_urls
+	// belongs to that flow too and must stay absent for the same reason.
+	if v, present := m["request_oauth_on_install"]; present {
+		if on, ok := v.(bool); !ok || on {
+			b.t.Errorf("manifest.request_oauth_on_install must be absent or false, got %v", v)
+		}
+	}
+
+	if urls, present := m["callback_urls"]; present {
+		if list, ok := urls.([]any); !ok || len(list) > 0 {
+			b.t.Errorf("manifest.callback_urls must be absent or empty; billet has no user OAuth flow, got %v", urls)
 		}
 	}
 
