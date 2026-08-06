@@ -237,8 +237,8 @@ func TestMacOSLimitIsPerHostAcrossTiers(t *testing.T) {
 
 	ctx := t.Context()
 
-	if n, _ := a.Headroom(ctx, "mac-6"); n != config.MacOSVMLimit {
-		t.Fatalf("mac-6 Headroom = %d, want %d", n, config.MacOSVMLimit)
+	if n, _ := a.Headroom(ctx, "mac-6"); n != config.DefaultMacOSVMLimit {
+		t.Fatalf("mac-6 Headroom = %d, want %d", n, config.DefaultMacOSVMLimit)
 	}
 
 	// One guest from each tier fills the host's two slots.
@@ -283,8 +283,8 @@ func TestLinuxGuestsOnAMacAreNotCapped(t *testing.T) {
 	}
 
 	// Five Linux guests must not have consumed any macOS licence slot.
-	if n, _ := a.Headroom(ctx, "mac-6"); n != config.MacOSVMLimit {
-		t.Errorf("mac-6 Headroom = %d after 5 Linux guests, want %d", n, config.MacOSVMLimit)
+	if n, _ := a.Headroom(ctx, "mac-6"); n != config.DefaultMacOSVMLimit {
+		t.Errorf("mac-6 Headroom = %d after 5 Linux guests, want %d", n, config.DefaultMacOSVMLimit)
 	}
 }
 
@@ -581,7 +581,7 @@ func TestMacOSAccountingSurvivesCatalogChange(t *testing.T) {
 
 	ctx := t.Context()
 
-	for range config.MacOSVMLimit {
+	for range config.DefaultMacOSVMLimit {
 		if _, err := first.Reserve(ctx, "mac-6"); err != nil {
 			t.Fatalf("Reserve: %v", err)
 		}
@@ -990,5 +990,104 @@ func TestReleaseArchivesToHistory(t *testing.T) {
 
 	if tierName != "small" || runID != 777 || conclusion != string(PhaseDone) {
 		t.Errorf("history = (%s, %d, %s), want (small, 777, done)", tierName, runID, conclusion)
+	}
+}
+
+// --- Per-host macOS limits ------------------------------------------------
+//
+// How many macOS guests a host may run is a deployment decision: an operator
+// may keep a slot free for interactive use, or run a Mac purely as an arm64
+// Linux builder. The tests above cover the default; these cover the override.
+
+func macTier(label string, vcpu int, mem config.ByteSize) config.Tier {
+	return config.Tier{
+		Label:    label,
+		Provider: config.ProviderTart,
+		GuestOS:  config.GuestMacOS,
+		Node:     "mac-mini-1",
+		VCPU:     vcpu,
+		Memory:   mem,
+		Image:    "macos-26",
+	}
+}
+
+func TestMacOSLimitHonoursPerHostOverride(t *testing.T) {
+	a := newAllocator(t,
+		Limits{
+			MaxVCPU: 256, MaxMemory: 512 * config.GiB,
+			MacOSPerNode: map[string]int{"mac-mini-1": 1},
+		},
+		[]config.Tier{macTier("mac-6", 6, 24*config.GiB)})
+
+	ctx := t.Context()
+
+	if n, _ := a.Headroom(ctx, "mac-6"); n != 1 {
+		t.Fatalf("Headroom = %d, want 1 from the host's lowered limit", n)
+	}
+
+	if _, err := a.Reserve(ctx, "mac-6"); err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	if _, err := a.Reserve(ctx, "mac-6"); !errors.Is(err, ErrNoCapacity) {
+		t.Errorf("a second macOS guest was allowed on a host limited to 1: %v", err)
+	}
+}
+
+// A host set to zero schedules nothing, even though the machine has ample cores
+// and memory. config.Load rejects this pairing, but New is exported and cannot
+// prove its catalog came through that path.
+func TestMacOSLimitZeroSchedulesNoGuests(t *testing.T) {
+	a := newAllocator(t,
+		Limits{
+			MaxVCPU: 256, MaxMemory: 512 * config.GiB,
+			MacOSPerNode: map[string]int{"mac-mini-1": 0},
+		},
+		[]config.Tier{macTier("mac-6", 6, 24*config.GiB)})
+
+	ctx := t.Context()
+
+	if n, _ := a.Headroom(ctx, "mac-6"); n != 0 {
+		t.Errorf("Headroom = %d on a host that permits no macOS guests, want 0", n)
+	}
+
+	if _, err := a.Reserve(ctx, "mac-6"); !errors.Is(err, ErrNoCapacity) {
+		t.Errorf("Reserve = %v on a zero-limit host, want ErrNoCapacity", err)
+	}
+}
+
+// Limits is a value type but carries a map. A caller keeping a reference could
+// otherwise raise a host's cap after construction, moving a licence limit out
+// from under leases already counted against it.
+func TestMacOSLimitsAreCopiedAtConstruction(t *testing.T) {
+	limits := Limits{
+		MaxVCPU: 256, MaxMemory: 512 * config.GiB,
+		MacOSPerNode: map[string]int{"mac-mini-1": 1},
+	}
+
+	a := newAllocator(t, limits, []config.Tier{macTier("mac-6", 6, 24*config.GiB)})
+
+	limits.MacOSPerNode["mac-mini-1"] = 5
+
+	if n, _ := a.Headroom(t.Context(), "mac-6"); n != 1 {
+		t.Errorf("Headroom = %d after the caller mutated its map, want the value captured at New (1)", n)
+	}
+}
+
+func TestNewRejectsNegativeMacOSLimit(t *testing.T) {
+	db, err := state.Open(t.Context(), t.TempDir())
+	if err != nil {
+		t.Fatalf("state.Open: %v", err)
+	}
+
+	defer db.Close()
+
+	limits := Limits{
+		MaxVCPU: 16, MaxMemory: 64 * config.GiB,
+		MacOSPerNode: map[string]int{"mac-mini-1": -1},
+	}
+
+	if _, err := New(db, limits, nil); err == nil {
+		t.Error("New accepted a negative per-host macOS limit")
 	}
 }
