@@ -1375,7 +1375,14 @@ func TestUnverifiableLegacyLeaseFailsClosed(t *testing.T) {
 		t.Errorf("releasing an unplaceable lease = %v, want nil; its capacity would be stranded", err)
 	}
 
-	if u, _ := a.Usage(ctx); u.Leases != 0 {
+	// The error is checked: a failed query yields a zero-valued Usage, which
+	// would satisfy this assertion for entirely the wrong reason.
+	u, err := a.Usage(ctx)
+	if err != nil {
+		t.Fatalf("Usage: %v", err)
+	}
+
+	if u.Leases != 0 {
 		t.Errorf("usage after release = %+v, want no open leases", u)
 	}
 }
@@ -1497,20 +1504,140 @@ func TestOnlineRequiresABoundNode(t *testing.T) {
 	}
 }
 
+// runningPhases is spelled out rather than derived from requiresPlacement,
+// which is the production predicate these tests exist to guard. Deriving it
+// meant dropping PhaseBusy from requiresPlacement made the tests skip every
+// edge into busy and stay green — the mutation silencing its own detector.
+var runningPhases = []Phase{PhaseLaunching, PhaseOnline, PhaseBusy}
+
 // The launch gate is only unavoidable while launching is the ONLY way into the
 // running phases. Asserting that here means adding an assigned -> online edge
 // breaks this test rather than silently opening a route around the gate.
 func TestRunningPhasesAreReachableOnlyThroughLaunching(t *testing.T) {
-	for from, allowed := range validTransitions {
-		for _, to := range allowed {
-			if !requiresPlacement(to) || from == PhaseLaunching || requiresPlacement(from) {
-				continue
-			}
+	running := make(map[Phase]bool, len(runningPhases))
+	for _, p := range runningPhases {
+		running[p] = true
+	}
 
-			if to != PhaseLaunching {
+	for from, allowed := range validTransitions {
+		if running[from] {
+			continue // movement WITHIN the running phases is expected
+		}
+
+		for _, to := range allowed {
+			if running[to] && to != PhaseLaunching {
 				t.Errorf("%s -> %s enters a running phase without passing through launching", from, to)
 			}
 		}
+	}
+}
+
+// Each running phase must reject an unbound lease independently. A single test
+// covering only the launching edge would leave online and busy unguarded, which
+// is the route a legacy row or a deleted node opens.
+func TestEveryRunningPhaseRejectsAnUnboundLease(t *testing.T) {
+	for _, phase := range runningPhases {
+		t.Run(string(phase), func(t *testing.T) {
+			a := newAllocator(t,
+				Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB},
+				[]config.Tier{tier("small", 4, 16*config.GiB)})
+
+			ctx := t.Context()
+
+			lease, err := a.Reserve(ctx, "small")
+			if err != nil {
+				t.Fatalf("Reserve: %v", err)
+			}
+
+			// Seed the phase this transition would arrive from, with no node —
+			// the shape an older binary or a deleted node leaves behind.
+			from := map[Phase]string{
+				PhaseLaunching: "assigned",
+				PhaseOnline:    "launching",
+				PhaseBusy:      "online",
+			}[phase]
+
+			if err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+				_, err := tx.ExecContext(ctx,
+					`UPDATE leases SET phase = ?, node = NULL WHERE id = ?`, from, lease.ID)
+
+				return err
+			}); err != nil {
+				t.Fatalf("seed %s: %v", from, err)
+			}
+
+			if err := a.Advance(ctx, lease.ID, lease.Epoch, phase); !errors.Is(err, ErrNotPlaced) {
+				t.Errorf("entering %s unbound = %v, want ErrNotPlaced", phase, err)
+			}
+		})
+	}
+}
+
+// A repeated Advance into a running phase is an AUTHORIZATION, not an
+// acknowledgement: its caller reads nil as "you may launch". Answering it
+// without checking lets a recovery loop get permission for a placement that is
+// no longer legal — or, for a pre-v7 row, was never verifiable.
+func TestSamePhaseAdvanceStillChecksPlacement(t *testing.T) {
+	a := newAllocator(t,
+		Limits{MaxVCPU: 64, MaxMemory: 128 * config.GiB},
+		[]config.Tier{tier("small", 4, 16*config.GiB)})
+
+	ctx := t.Context()
+
+	registerNode(t, a, "epyc-1", config.ProviderFirecracker)
+
+	lease, err := a.Reserve(ctx, "small")
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	// A bound pre-v7 row already sitting in launching: no recorded provider, so
+	// its placement cannot be verified.
+	if err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx,
+			`UPDATE leases SET phase = 'launching', node = 'epyc-1', provider = '' WHERE id = ?`,
+			lease.ID)
+
+		return err
+	}); err != nil {
+		t.Fatalf("seed legacy launching row: %v", err)
+	}
+
+	if err := a.Advance(ctx, lease.ID, lease.Epoch, PhaseLaunching); !errors.Is(err, ErrNotPlaceable) {
+		t.Errorf("re-advancing an unverifiable launching lease = %v, want ErrNotPlaceable", err)
+	}
+}
+
+// Deleting a node sets leases.node to NULL, so a lease still running on it LOOKS
+// unbound while its original host keeps a valid epoch and keeps heartbeating.
+// Binding it elsewhere would make two hosts owners of one slot.
+func TestBindRefusesToAdoptAnAlreadyRunningLease(t *testing.T) {
+	a := newAllocator(t,
+		Limits{MaxVCPU: 64, MaxMemory: 128 * config.GiB},
+		[]config.Tier{tier("small", 4, 16*config.GiB)})
+
+	ctx := t.Context()
+
+	registerNode(t, a, "epyc-1", config.ProviderFirecracker)
+	registerNode(t, a, "epyc-2", config.ProviderFirecracker)
+
+	lease, err := a.Reserve(ctx, "small")
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	// Running, then its node row is deleted: ON DELETE SET NULL blanks the column.
+	if err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx,
+			`UPDATE leases SET phase = 'online', node = NULL WHERE id = ?`, lease.ID)
+
+		return err
+	}); err != nil {
+		t.Fatalf("seed orphaned running lease: %v", err)
+	}
+
+	if err := a.Bind(ctx, lease.ID, lease.Epoch, "epyc-2"); !errors.Is(err, ErrWrongNode) {
+		t.Errorf("adopting a running lease onto a new host = %v, want ErrWrongNode", err)
 	}
 }
 
