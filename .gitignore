@@ -1,0 +1,37 @@
+# Build output. These are root-anchored on purpose: an unanchored `billet`
+# pattern also matches the cmd/billet package directory and silently drops the
+# whole program from the repository.
+/bin/
+/dist/
+/billet
+/billet-agent
+
+# Local state and secrets — never commit these.
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.lock
+/.billet/
+billet.yaml
+*.pem
+*.key
+!testdata/**/*.pem
+!testdata/**/*.key
+
+# Guest images and rootfs artifacts (large, rebuildable)
+/images/**/out/
+*.ext4
+*.img
+*.qcow2
+vmlinux*
+
+# Go
+*.test
+*.out
+/vendor/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/

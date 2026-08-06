@@ -1,0 +1,333 @@
+# billet — strict golangci-lint v2 config
+#
+# Why each non-stdlib rule exists is documented inline next to that rule. The
+# conventions themselves live in CLAUDE.md.
+#
+# Do NOT silence a rule with a bare //nolint — nolintlint rejects that. Use
+# `//nolint:linter-name // reason` when an exception is genuinely justified.
+#
+# Run: golangci-lint run --timeout=5m
+#
+# PINNED VERSION: v2.12.2, matching .github/workflows/ci.yml. Install the same
+# version locally so your runs agree with CI:
+#   go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+# Bump both together, deliberately.
+
+version: "2"
+
+run:
+  go: "1.26"
+  timeout: 5m
+  modules-download-mode: readonly
+
+linters:
+  default: none
+  enable:
+    # ----- correctness / error handling -----
+    - errcheck
+    - errorlint # %w wrapping, errors.Is/As, no err == sentinel
+    - nilerr # if err != nil { return nil }
+    - nilnil # never return (nil, nil) from (*T, error)
+    - nonamedreturns
+    - staticcheck
+    - govet
+    - gocheckcompilerdirectives # typo'd //go:build tags — billet has real build tags
+    - predeclared
+    - ineffassign
+    - wastedassign
+    - unconvert
+    - unparam
+    - unused
+    - copyloopvar
+    - intrange
+
+    # ----- database / process correctness -----
+    # billet's control plane is a capacity ledger over SQLite; a leaked rows
+    # handle or an unchecked rows.Err() silently truncates a scheduling decision.
+    - rowserrcheck
+    - sqlclosecheck
+    - bodyclose
+    - noctx
+    - contextcheck
+    - containedctx
+
+    # ----- security -----
+    # This process holds a GitHub App private key and a TLS CA key.
+    - gosec
+    - bidichk
+
+    # ----- style / dead code -----
+    - revive
+    - gocritic
+    - nakedret
+    - prealloc
+    - misspell
+    - whitespace
+    - usestdlibvars
+    - usetesting
+    - tparallel
+    - thelper
+    - dogsled
+
+    # ----- type safety -----
+    - errchkjson
+    - recvcheck # one receiver style per type
+    - canonicalheader
+    - sloglint # structured-logging consistency
+    - fatcontext # no context derivation inside loops
+    - makezero # make([]T, n) followed by append
+    - reassign
+    - mirror
+
+    # ----- custom rule infrastructure -----
+    - depguard
+    - forbidigo
+    - nolintlint
+
+  # Explicitly NOT enabled, so nobody proposes them again:
+  #   wrapcheck       — billet's packages are its own; the error text at a
+  #                     boundary is already contextual and double-wrapping reads
+  #                     "open state db: open state db: ...". Revisit if a public
+  #                     API package appears.
+  #   exhaustive      — the string enums (ProviderKind, GuestOS, lease phase)
+  #                     are validated at parse time, not switched exhaustively.
+  #   gochecknoglobals — `var ErrXxx = errors.New(...)` is the project pattern.
+  #   gocyclo/cyclop/funlen/nestif — validation functions naturally branch.
+  #   varnamelen/nlreturn/lll — style noise.
+  #   gofumpt         — opinions beyond gofmt that fight AI training data.
+  #   paralleltest    — billet's tests open real SQLite files; t.Parallel() on
+  #                     every one buys nothing and invites flakes.
+
+  settings:
+    # errcheck by default ignores `_ = f()`. check-blank flags that too, which is
+    # the form reached for when silencing the linter rather than handling the error.
+    errcheck:
+      check-blank: true
+      check-type-assertions: true
+      exclude-functions:
+        # Deferred cleanup on an error path we are already returning from; the
+        # close error would replace the real one.
+        - (*database/sql.Rows).Close
+
+    staticcheck:
+      checks:
+        - all
+        - -ST1003 # initialisms — noisy against SQL/JSON identifiers
+
+    errorlint:
+      errorf: true
+      errorf-multi: true
+      asserts: true
+      comparison: true # catches err == sql.ErrNoRows
+
+    gosec:
+      excludes:
+        - G104 # errcheck handles dropped errors better
+        - G115 # int conversion noise
+      severity: medium
+      confidence: medium
+
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - experimental
+        - opinionated
+        - performance
+        - style
+      disabled-checks:
+        - unnamedResult # conflicts with nonamedreturns
+        - hugeParam
+        - paramTypeCombine
+        - unnecessaryBlock
+        - commentedOutCode
+
+    # ===== depguard — package bans + layering =====
+    depguard:
+      rules:
+        global:
+          list-mode: lax
+          deny:
+            - pkg: "github.com/pkg/errors"
+              desc: 'Use fmt.Errorf("...: %w", err) or errors.Join.'
+            - pkg: "io/ioutil"
+              desc: "Deprecated. Use io and os."
+            - pkg: "github.com/sirupsen/logrus"
+              desc: "billet standardizes on log/slog."
+            - pkg: "go.uber.org/zap"
+              desc: "billet standardizes on log/slog."
+            - pkg: "github.com/rs/zerolog"
+              desc: "billet standardizes on log/slog."
+            - pkg: "math/rand$"
+              desc: "Use math/rand/v2, or crypto/rand for anything security-relevant."
+            - pkg: "github.com/mattn/go-sqlite3"
+              desc: "cgo breaks the single-static-binary guarantee and the cross-build matrix. Use modernc.org/sqlite."
+
+        # One SQLite driver, imported in one place. A second import site is how a
+        # connection gets opened without the durability pragmas the state package
+        # verifies at startup.
+        sqlitedriver:
+          list-mode: lax
+          files:
+            - "$all"
+            - "!**/internal/state/**"
+          deny:
+            - pkg: "modernc.org/sqlite"
+              desc: "Open the control-plane database through internal/state, which verifies WAL + synchronous=FULL and takes the process lock."
+
+        # Layering: a compute backend is a leaf. It must not reach up into the
+        # scheduler, or the provider abstraction stops being substitutable.
+        provider:
+          list-mode: lax
+          files:
+            - "**/internal/provider/**"
+          deny:
+            - pkg: "github.com/junioryono/billet/internal/server"
+              desc: "A provider is a lower layer than the scheduler; invert the dependency."
+            - pkg: "github.com/junioryono/billet/internal/node"
+              desc: "A provider must not import the node runtime that drives it."
+            - pkg: "github.com/junioryono/billet/cmd"
+              desc: "Providers must not import cmd/."
+
+        # The storage layer is a leaf too.
+        store:
+          list-mode: lax
+          files:
+            - "**/internal/store/**"
+          deny:
+            - pkg: "github.com/junioryono/billet/internal/server"
+              desc: "The store is a lower layer than the scheduler."
+            - pkg: "github.com/junioryono/billet/internal/provider"
+              desc: "Storage and compute are siblings; neither imports the other."
+            - pkg: "github.com/junioryono/billet/cmd"
+              desc: "The store must not import cmd/."
+
+        # config is the leaf everything reads; it must import nothing of ours.
+        config:
+          list-mode: lax
+          files:
+            - "**/internal/config/**"
+          deny:
+            - pkg: "github.com/junioryono/billet/internal"
+              desc: "config is a leaf package — it must not import other billet packages."
+
+    # ===== forbidigo — identifier bans =====
+    forbidigo:
+      analyze-types: true
+      exclude-godoc-examples: true
+      forbid:
+        - pattern: '^fmt\.Print(ln|f)?$'
+          msg: "Use log/slog in library code. cmd/billet is allow-listed for operator output."
+        - pattern: "^panic$"
+          msg: "Return errors instead of panicking. A control plane that panics drops every in-flight lease."
+        - pattern: '^os\.Exit$'
+          msg: "Return errors and let main decide; don't os.Exit from library code."
+        - pattern: '^http\.(Get|Post|PostForm|Head)$'
+          msg: "Use http.NewRequestWithContext so the context propagates and the call is cancellable."
+        - pattern: '^context\.(Background|TODO)$'
+          msg: "Thread the context through. Long-lived roots belong in cmd/billet, which is allow-listed."
+        - pattern: '^time\.After$'
+          msg: "time.After leaks its timer until it fires. Use a context deadline or an explicit time.NewTimer with Stop."
+
+    revive:
+      severity: warning
+      confidence: 0.8
+      enable-all-rules: false
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: dot-imports
+        - name: error-return
+        - name: error-strings
+        - name: error-naming
+        - name: errorf
+        - name: if-return
+        - name: increment-decrement
+        - name: indent-error-flow
+        - name: range
+        - name: receiver-naming
+        - name: redefines-builtin-id
+        - name: superfluous-else
+        - name: time-naming
+        - name: unconditional-recursion
+        - name: unexported-return
+        - name: unreachable-code
+        - name: var-declaration
+        - name: var-naming
+        - name: waitgroup-by-value
+        - name: atomic
+        - name: modifies-value-receiver
+        - name: constant-logical-expr
+        - name: identical-branches
+        - name: duplicated-imports
+        - name: defer
+        - name: empty-block
+        - name: exported
+        - name: package-comments
+        - name: unused-parameter
+          arguments:
+            - allow-regex: "^_"
+
+    usetesting:
+      os-setenv: true
+      context-background: true
+      context-todo: true
+
+    usestdlibvars:
+      http-method: true
+      http-status-code: true
+      time-weekday: true
+      time-month: true
+      time-layout: true
+      crypto-hash: true
+
+    nolintlint:
+      allow-unused: false
+      require-explanation: true
+      require-specific: true
+
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      # ----- tests: relax noise-heavy rules -----
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gosec
+          - contextcheck
+          - containedctx
+          - nilnil
+          - nonamedreturns
+          - forbidigo # tests legitimately use context.Background and fmt.Print
+          - revive
+          - dogsled
+          - prealloc
+
+      # ----- cmd/billet is the operator-facing boundary -----
+      # It prints to stdout by design, creates the root context, and decides the
+      # process exit code. Those are exactly the things forbidigo bans elsewhere.
+      - path: ^cmd/billet/
+        linters:
+          - forbidigo
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  # Keep the baseline clean — fix everything rather than grandfathering it.
+  new: false
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/junioryono/billet
+  exclusions:
+    generated: lax

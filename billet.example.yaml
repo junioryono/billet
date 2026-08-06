@@ -1,0 +1,125 @@
+# billet configuration — copy to billet.yaml and edit.
+#
+# This example is the single-machine deployment: control plane and compute host
+# in one process, started with `billet server --dev`. Split them by running
+# `billet server` here and `billet node` on each additional machine, with the
+# node's server_addr pointing back at this listen address.
+
+server:
+  # Nodes dial the server; the server never dials out except to GitHub. On a
+  # single box this stays on loopback, so billet exposes nothing to the network.
+  listen: 127.0.0.1:7717
+
+  # MUST be local storage. SQLite's WAL is not safe on NFS, and this directory
+  # holds the capacity ledger.
+  state_dir: /var/lib/billet/server
+
+  # Hard ceiling on what the allocator will hand out across every tier combined.
+  # Capacity is escrowed before each scale-set listener advertises to GitHub, so
+  # this is what stops concurrent tiers from collectively overcommitting the box.
+  #
+  # Sizing: leave headroom for the host. On a 64-core/128-thread, 512 GB machine,
+  # 120 vCPU and 480GiB reserves 8 threads and 32 GB for the OS, ZFS ARC, and
+  # billet itself. Note that 128 SMT threads are not 128 core-equivalents —
+  # measure real per-job-class throughput before raising this.
+  max_vcpu: 120
+  max_memory: 480GiB
+
+github:
+  org: your-org
+
+  # Populated by `billet github-app create --org your-org`.
+  #
+  # billet requests exactly two permissions: metadata read, and organization
+  # self-hosted runners read+write. It does not request actions:read, which
+  # would expose workflow runs, logs, and artifacts.
+  #
+  # Creating the App does not install it — the CLI walks you through both steps,
+  # and installation is where installation_id comes from.
+  app_id: 0
+  installation_id: 0
+  private_key_path: /etc/billet/app-private-key.pem
+
+node:
+  name: epyc-1
+  server_addr: 127.0.0.1:7717
+  provider: firecracker
+  state_dir: /var/lib/billet/node
+
+  firecracker:
+    # The guest kernel must include everything Docker needs, or service
+    # containers fail in ways that are hard to read. Validate with moby's
+    # contrib/check-config.sh rather than a hand-written list.
+    kernel_image: /var/lib/billet/images/vmlinux
+    # Backs golden images, per-job root clones, and cache volumes via CoW.
+    zfs_pool: tank
+    bridge: br0
+
+# Tiers are yours to define — this is not a fixed catalog. The label is what
+# users put in `runs-on`.
+tiers:
+  - label: billet-2vcpu-ubuntu-2404
+    provider: firecracker
+    vcpu: 2
+    memory: 8GiB
+    disk: 80GiB
+    image: ubuntu-2404-x64
+
+  - label: billet-4vcpu-ubuntu-2404
+    provider: firecracker
+    vcpu: 4
+    memory: 16GiB
+    disk: 80GiB
+    image: ubuntu-2404-x64
+    # Serve actions/cache from this machine instead of over the internet.
+    # Off by default, and it should stay off for any tier that publishes release
+    # artifacts or holds deployment secrets: interception terminates TLS in front
+    # of the GitHub service that also carries artifact metadata.
+    intercept: true
+
+  - label: billet-8vcpu-ubuntu-2404
+    provider: firecracker
+    vcpu: 8
+    memory: 32GiB
+    disk: 160GiB
+    image: ubuntu-2404-x64
+    # Chromium and Postgres both misbehave on the default /dev/shm.
+    shm: 1GiB
+    intercept: true
+    # Pre-boot idle VMs to hide cold start. Start small: Firecracker boots in
+    # ~125 ms, so a large warm pool may be spending memory on a non-problem.
+    warm_pool: 2
+
+  # A tier that produces release artifacts. Interception is deliberately absent.
+  - label: billet-4vcpu-ubuntu-2404-release
+    provider: firecracker
+    vcpu: 4
+    memory: 16GiB
+    disk: 80GiB
+    image: ubuntu-2404-x64
+
+# Apple Silicon, once a Mac mini joins the fleet. One host serves both macOS
+# guests and native Linux arm64 guests; Apple's 2-VM licensing limit applies to
+# the macOS guests only, and billet enforces it.
+#
+# guest_os is what the licence check keys off — not the label — so a macOS tier
+# named anything at all is still capped, and a Linux tier with "macos" in its
+# name is not.
+#
+#  - label: billet-6vcpu-macos-26
+#    provider: tart
+#    guest_os: macos
+#    node: mac-mini-1      # required for macOS: the cap is per physical host
+#    vcpu: 6
+#    memory: 24GiB
+#    image: macos-26
+#    # max_concurrent defaults to 2 and may not exceed it. If you add a second
+#    # macOS tier on the same node, their totals must still sum to <= 2.
+#
+#  - label: billet-4vcpu-ubuntu-2404-arm
+#    provider: tart
+#    guest_os: linux
+#    node: mac-mini-1
+#    vcpu: 4
+#    memory: 12GiB
+#    image: ubuntu-2404-arm64

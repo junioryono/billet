@@ -1,0 +1,38 @@
+# Coverage is a signal, not a goal. A test that executes a line without asserting
+# anything raises this number and catches nothing, so treat a drop as a prompt to
+# look rather than as a failure to route around.
+coverage:
+  range: 70..95
+  round: down
+  precision: 2
+
+  status:
+    project:
+      default:
+        # `auto` means "do not regress from the base commit", not an absolute
+        # number. Deliberate: internal/config and internal/state sit at ~80% and
+        # ~79%, so a hard 85% would fail every PR from day one and train everyone
+        # to ignore the check. Ratcheting from where we actually are is a signal;
+        # an aspirational constant is noise.
+        target: auto
+        # Loose enough that adding an untestable syscall wrapper does not fail a
+        # PR; tight enough that quietly deleting tests does.
+        threshold: 1%
+        if_not_found: success
+        if_ci_failed: error
+    patch:
+      default:
+        # New code should be tested even while the overall figure ratchets up.
+        target: 80%
+        threshold: 5%
+        if_not_found: success
+
+ignore:
+  # Role dispatch and operator output. Exercised end to end by hand and (later)
+  # by the conformance suite; unit-testing flag parsing measures nothing.
+  - "cmd/billet/main.go"
+
+comment:
+  layout: "reach, diff, files"
+  behavior: default
+  require_changes: true

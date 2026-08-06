@@ -1,0 +1,5 @@
+# Codex reads this repo-level config.
+#
+# AGENTS.md symlinks to CLAUDE.md, and the 32 KiB default project_doc_max_bytes
+# would truncate the instruction chain as that file grows.
+project_doc_max_bytes = 262144
