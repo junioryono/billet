@@ -447,7 +447,11 @@ const linuxARMTier = `
 `
 
 func nodesSection(body string) string {
-	return "nodes:\n  - name: mac-mini-1\n" + body
+	return nodesSectionFor("mac-mini-1", body)
+}
+
+func nodesSectionFor(name, body string) string {
+	return "nodes:\n  - name: " + name + "\n" + body
 }
 
 // Dedicating a Mac to macOS means Linux tiers pinned to it are a configuration
@@ -588,7 +592,7 @@ func TestNodeMacOSLimitMayExceedTheDefault(t *testing.T) {
 func TestNodePolicyRejectsBadInput(t *testing.T) {
 	for name, tc := range map[string]struct{ body, want string }{
 		"duplicate name":   {"nodes:\n  - name: mac-mini-1\n  - name: mac-mini-1\n", "duplicate node name"},
-		"blank name":       {"nodes:\n  - name: \"\"\n", "name must match"},
+		"blank name":       {"nodes:\n  - name: \"\"\n", "node name \"\" must match"},
 		"unknown guest_os": {nodesSection("    guest_os: [plan9]\n"), "is not one of"},
 		"duplicate guest":  {nodesSection("    guest_os: [linux, linux]\n"), "duplicate guest_os"},
 		"negative limit":   {nodesSection("    macos_vm_limit: -1\n"), "must not be negative"},
@@ -692,6 +696,108 @@ func lastLine(err error) string {
 	}
 
 	return msg
+}
+
+// Node identifiers are one namespace and must be validated the same way
+// everywhere. They were not: nodes[].name matched labelRe, node.name only had
+// to be non-blank, and tiers[].node was never checked at all.
+//
+// A whitespace-only pin is the case that shows why it matters. config treats it
+// as pinned — a macOS tier passes the "must name a node" rule and inherits a
+// concurrency default — while alloc trims it to empty and rejects the same
+// tier. For a Linux tier the trim silently converts a pin into no pin at all.
+func TestNodeNamesAreValidatedConsistently(t *testing.T) {
+	for name, body := range map[string]string{
+		"blank tier pin": validConfig + `
+  - label: billet-6vcpu-macos-26
+    provider: tart
+    guest_os: macos
+    node: "   "
+    vcpu: 6
+    memory: 24GiB
+    image: macos-26
+`,
+		"spaces in node name": strings.Replace(validConfig, "name: epyc-1", `name: "epyc 1"`, 1),
+		"spaces in tier pin": validConfig + `
+  - label: billet-4vcpu-arm
+    provider: tart
+    guest_os: linux
+    node: "mac mini"
+    vcpu: 4
+    memory: 12GiB
+    image: ubuntu-2404-arm64
+`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Load(writeConfig(t, body)); err == nil {
+				t.Errorf("Load accepted %s", name)
+			}
+		})
+	}
+}
+
+// Surrounding whitespace is normalized rather than rejected, so a pin and the
+// fleet entry it names still match.
+func TestNodeNamesAreTrimmed(t *testing.T) {
+	body := strings.Replace(validConfig, "name: epyc-1", `name: "  epyc-1  "`, 1)
+
+	cfg, err := Load(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Node.Name != "epyc-1" {
+		t.Errorf("node.name = %q, want it trimmed", cfg.Node.Name)
+	}
+}
+
+// The local node section and a fleet entry naming the SAME host must not
+// disagree. Believing the fleet entry means the unpinned-tier check compares
+// against a provider the machine does not run, so it skips a host that is in
+// single-box mode the only host there is.
+func TestLocalNodeAndFleetEntryMustAgreeOnProvider(t *testing.T) {
+	body := validConfig + nodesSectionFor("epyc-1", "    provider: tart\n    guest_os: [macos]\n")
+
+	_, err := Load(writeConfig(t, body))
+	if err == nil {
+		t.Fatal("Load accepted a fleet entry contradicting the local node's provider")
+	}
+	if !strings.Contains(err.Error(), "epyc-1") {
+		t.Errorf("error should name the host, got: %v", err)
+	}
+}
+
+// A fleet entry that omits its provider inherits the local node's, so the
+// unpinned-tier check has the real provider to compare against.
+func TestFleetEntryInheritsTheLocalProvider(t *testing.T) {
+	body := validConfig + nodesSectionFor("epyc-1", "    guest_os: [macos]\n")
+
+	_, err := Load(writeConfig(t, body))
+	if err == nil {
+		t.Fatal("validConfig's unpinned firecracker tiers should conflict with a macos-only local host")
+	}
+	if !strings.Contains(err.Error(), "allowlist") {
+		t.Errorf("error should name the allowlist, got: %v", err)
+	}
+}
+
+// An invalid provider on a node policy must not be copied into a tier, or one
+// typo produces a second diagnostic blaming a field nobody wrote.
+func TestInvalidNodeProviderIsNotInherited(t *testing.T) {
+	body := validConfig + `
+  - label: billet-4vcpu-inherit
+    guest_os: linux
+    node: mac-mini-1
+    vcpu: 4
+    memory: 12GiB
+    image: ubuntu-2404-arm64
+` + nodesSection("    provider: nonsense\n")
+	_, err := Load(writeConfig(t, body))
+	if err == nil {
+		t.Fatal("Load accepted an unknown provider on a node policy")
+	}
+	if strings.Count(err.Error(), "is not one of") > 1 {
+		t.Errorf("one bad provider produced more than one diagnostic:\n%v", err)
+	}
 }
 
 // A tier with no provider inherits the PINNED host's, not the local node's.

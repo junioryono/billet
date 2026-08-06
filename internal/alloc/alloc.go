@@ -244,8 +244,33 @@ func New(db *state.DB, limits Limits, tiers []config.Tier, opts ...Option) (*All
 	perNode := make(map[string]config.NodePolicy, len(limits.Nodes))
 
 	for node, p := range limits.Nodes {
-		if n := p.MacOSLimit(); n < 0 {
-			return nil, fmt.Errorf("alloc: node %q has negative macOS limit %d", node, n)
+		// The RAW fields, not just the effective limit. MacOSLimit() returns 0
+		// when the allowlist excludes macOS, so a negative macos_vm_limit slipped
+		// past a check that only looked at the effective value — the guard
+		// defeated by the very normalization it was reading through.
+		if p.MacOSVMLimit != nil && *p.MacOSVMLimit < 0 {
+			return nil, fmt.Errorf("alloc: node %q has negative macos_vm_limit %d", node, *p.MacOSVMLimit)
+		}
+
+		if p.Provider != "" && !p.Provider.Valid() {
+			return nil, fmt.Errorf("alloc: node %q has provider %q, which is not a known backend", node, p.Provider)
+		}
+
+		// An unknown guest OS in an allowlist is worse than a typo: it matches
+		// nothing, so every lease bound to that host is refused with a message
+		// about the LEASE rather than about the policy that is actually wrong.
+		seenGuest := make(map[config.GuestOS]struct{}, len(p.GuestOS))
+
+		for _, g := range p.GuestOS {
+			if !g.Valid() {
+				return nil, fmt.Errorf("alloc: node %q allows guest_os %q, which is not a known guest OS", node, g)
+			}
+
+			if _, dup := seenGuest[g]; dup {
+				return nil, fmt.Errorf("alloc: node %q lists guest_os %q twice", node, g)
+			}
+
+			seenGuest[g] = struct{}{}
 		}
 
 		perNode[node] = p.Clone()
