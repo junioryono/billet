@@ -32,6 +32,16 @@ type Config struct {
 	// Tiers is the runner catalog. Each tier becomes one GitHub scale set, and
 	// its Label is what users put in `runs-on`.
 	Tiers []Tier `yaml:"tiers,omitempty"`
+	// hostname is injectable so the node-name default can be tested against a
+	// machine whose hostname is not a legal node name. Nil means os.Hostname.
+	hostname func() (string, error)
+
+	// nameFromHostname records that node.name was DEFAULTED rather than written.
+	// The diagnostic differs: an operator who never typed a name needs to be
+	// told where the bad one came from, or they go looking for a field that is
+	// not in their file.
+	nameFromHostname string
+
 	// Nodes describes per-host policy to the server. It is optional and separate
 	// from the Node section on purpose: Node is how a host describes ITSELF,
 	// while Nodes is how the control plane describes the FLEET. Host policy has
@@ -440,8 +450,14 @@ func (c *Config) applyDefaults() {
 		c.Node.Name = strings.TrimSpace(c.Node.Name)
 
 		if c.Node.Name == "" {
-			if h, err := os.Hostname(); err == nil {
+			lookup := c.hostname
+			if lookup == nil {
+				lookup = os.Hostname
+			}
+
+			if h, err := lookup(); err == nil {
 				c.Node.Name = strings.TrimSpace(h)
+				c.nameFromHostname = c.Node.Name
 			}
 		}
 		if c.Node.StateDir == "" {
@@ -584,6 +600,21 @@ func (c *Config) validateNode() []error {
 		errs = append(errs, fmt.Errorf("node.provider %q is not one of %v", c.Node.Provider, allProviders))
 	}
 	if err := validateNodeName("node.name", c.Node.Name); err != nil {
+		// Say where the name came from when billet supplied it. A hostname is not
+		// guaranteed to be a legal node name — a long FQDN exceeds the length
+		// limit — and "node.name is invalid" sends an operator who never typed
+		// one looking for a field that is not in their file.
+		// Say where the name came from when billet supplied it. A hostname is not
+		// guaranteed to be a legal node name — a long FQDN exceeds the length
+		// limit — and "node.name is invalid" sends an operator who never typed
+		// one looking for a field that is not in their file.
+		if c.nameFromHostname != "" {
+			err = fmt.Errorf(
+				"node.name defaulted to this machine's hostname %q, which is not a usable node name "+
+					"(must match %s); set node.name explicitly",
+				c.nameFromHostname, labelRe)
+		}
+
 		errs = append(errs, err)
 	}
 	if c.Node.StateDir == "" {
