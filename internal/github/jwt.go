@@ -71,6 +71,18 @@ func SignAppJWT(appID int64, privateKeyPEM []byte, now time.Time) (string, error
 	return signingInput + "." + enc.EncodeToString(signature), nil
 }
 
+// ValidatePrivateKey reports whether a PEM is a usable App key.
+//
+// Exported so `billet check` can prove the configured key WORKS rather than
+// merely exists. A truncated PEM — what an interrupted write leaves behind — is
+// otherwise not discovered until the first API call, long after the operator has
+// been told the deployment is healthy.
+func ValidatePrivateKey(pemBytes []byte) error {
+	_, err := parseRSAPrivateKey(pemBytes)
+
+	return err
+}
+
 // parseRSAPrivateKey accepts both PEM encodings GitHub has produced: PKCS#1
 // ("RSA PRIVATE KEY", what the manifest conversion returns today) and PKCS#8
 // ("PRIVATE KEY", which a key downloaded from the web UI can be). Accepting only

@@ -133,6 +133,8 @@ func RegistrationURL(org, state string) string {
 
 // App is what GitHub hands back once the manifest is converted. It carries
 // credentials, so it must never be logged.
+//
+//nolint:recvcheck // String/GoString MUST take a value receiver: a pointer-receiver String is not consulted when a VALUE is formatted, so %v on an App would print the private key. Forget mutates and therefore needs a pointer. The mix is deliberate and the safety property is the reason.
 type App struct {
 	ID            int64  `json:"id"`
 	Slug          string `json:"slug"`
@@ -147,6 +149,33 @@ type App struct {
 	Owner struct {
 		Login string `json:"login"`
 	} `json:"owner"`
+}
+
+// String redacts every credential this struct carries.
+//
+// App is exactly the kind of value that ends up in a debug print, a wrapped
+// error or a log line during a bad afternoon, and a plain %v would otherwise
+// emit the App's private key. Implementing String and GoString makes the default
+// formatting verbs safe; code that deliberately wants a field still reads it.
+func (a App) String() string {
+	return fmt.Sprintf("github.App{ID:%d Slug:%q Owner:%q credentials:[redacted]}",
+		a.ID, a.Slug, a.Owner.Login)
+}
+
+// GoString covers %#v, which does not consult String.
+func (a App) GoString() string { return a.String() }
+
+// Forget blanks the credentials billet does not keep.
+//
+// Onboard returns this struct after the key is on disk, and only the App ID and
+// installation ID are ever stored. The webhook secret and client secret have no
+// consumer at all — billet registers an INACTIVE webhook and implements no OAuth
+// flow — so carrying them further is holding secrets for no reason. The PEM goes
+// with them: its one job is finished by the time this is called.
+func (a *App) Forget() {
+	a.PEM = ""
+	a.WebhookSecret = ""
+	a.ClientSecret = ""
 }
 
 // InstallURL is where the operator installs the freshly created app. Creating an

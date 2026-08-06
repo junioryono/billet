@@ -159,6 +159,11 @@ func Onboard(ctx context.Context, opts OnboardOptions) (*Onboarding, error) {
 		return nil, err
 	}
 
+	// The key is on disk and the installation is resolved, so nothing downstream
+	// needs a credential. Blanking them here means a caller that logs the result
+	// — the obvious thing to do with a returned struct — cannot leak one.
+	app.Forget()
+
 	return &Onboarding{App: app, Installation: inst}, nil
 }
 
@@ -314,9 +319,13 @@ func (f *onboardFlow) verify(inst *Installation) (*Installation, error) {
 		f.opts.Log("  - %s", p)
 	}
 
+	// %s/%d, not %s/installations/%d: orgSettingsURL already ends in
+	// /installations, so the old form produced
+	// .../settings/installations/installations/<id> — a 404 handed to an
+	// operator who is already stuck.
 	return nil, fmt.Errorf(
 		"github: installation %d has %d permission mismatch(es); "+
-			"correct them at %s/installations/%d and re-run `billet check`",
+			"correct them at %s/%d and re-run `billet check`",
 		inst.ID, len(problems), f.orgSettingsURL(), inst.ID)
 }
 

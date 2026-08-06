@@ -104,7 +104,7 @@ func githubAppCreate(ctx context.Context, args []string) error {
 		// OnAppCreated doc comment: this ordering is what stops a failed install
 		// from orphaning a real app whose key GitHub will never re-issue.
 		OnAppCreated: func(app *github.App) error {
-			if err := writeAndSync(keyFile, []byte(app.PEM)); err != nil {
+			if err := writeKeyAtomically(keyFile, *keyPath, []byte(app.PEM)); err != nil {
 				return err
 			}
 
@@ -156,29 +156,109 @@ func reserveKeyFile(path string) (*os.File, error) {
 	}
 
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
-		if errors.Is(err, os.ErrExist) {
-			return nil, fmt.Errorf(
-				"%s already exists; move it aside first — billet will not overwrite an App key, "+
-					"and GitHub cannot re-issue one that is lost", path)
-		}
+	if err == nil {
+		return f, nil
+	}
 
+	if !errors.Is(err, os.ErrExist) {
 		return nil, fmt.Errorf("create %s: %w", path, err)
 	}
 
-	return f, nil
-}
-
-// writeAndSync writes the key and forces it to durable storage before reporting
-// success. Without the Sync, a crash between here and the next boot loses a
-// credential the operator believes they have.
-func writeAndSync(f *os.File, pem []byte) error {
-	if _, err := f.Write(pem); err != nil {
-		return fmt.Errorf("write %s: %w", f.Name(), err)
+	// An EMPTY file here is billet's own reservation from a run that died before
+	// writing anything — a SIGKILL or a power cut between reserving and
+	// receiving the key. It cannot contain a credential, so adopting it loses
+	// nothing; refusing it would leave the operator permanently unable to re-run
+	// without knowing to delete a file they never created.
+	//
+	// Anything non-empty is refused: it may be a real key, and GitHub cannot
+	// re-issue one that is lost.
+	info, statErr := os.Stat(path)
+	if statErr != nil {
+		return nil, fmt.Errorf("inspect %s: %w", path, statErr)
 	}
 
-	if err := f.Sync(); err != nil {
-		return fmt.Errorf("sync %s: %w", f.Name(), err)
+	if info.Mode().IsRegular() && info.Size() == 0 {
+		reused, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o600)
+		if err != nil {
+			return nil, fmt.Errorf("reuse the empty reservation at %s: %w", path, err)
+		}
+
+		return reused, nil
+	}
+
+	return nil, fmt.Errorf(
+		"%s already exists; move it aside first — billet will not overwrite an App key, "+
+			"and GitHub cannot re-issue one that is lost", path)
+}
+
+// writeKeyAtomically installs the key so no crash can leave a partial one at the
+// destination.
+//
+// Writing straight into the reserved file was not crash-safe: a SIGKILL or power
+// loss mid-write leaves a truncated PEM at the final path, which the next run
+// then refuses because the file exists — wedging the deployment on a credential
+// that looks present and is not. Syncing only the file was not durable either:
+// without syncing the DIRECTORY, the entry can be lost after billet has printed
+// "Saved".
+//
+// So: write a sibling temp file, fsync it, rename it over the reservation —
+// rename is atomic on POSIX — then fsync the directory. The destination only
+// ever holds the empty reservation or the complete key.
+func writeKeyAtomically(reserved *os.File, path string, pem []byte) error {
+	dir := filepath.Dir(path)
+
+	tmp, err := os.CreateTemp(dir, ".billet-key-*")
+	if err != nil {
+		return fmt.Errorf("create a temporary file next to %s: %w", path, err)
+	}
+
+	tmpName := tmp.Name()
+
+	defer func() {
+		_ = tmp.Close()
+		// A no-op once the rename has succeeded: the name no longer exists.
+		_ = os.Remove(tmpName)
+	}()
+
+	if err := tmp.Chmod(0o600); err != nil {
+		return fmt.Errorf("restrict %s: %w", tmpName, err)
+	}
+
+	if _, err := tmp.Write(pem); err != nil {
+		return fmt.Errorf("write %s: %w", tmpName, err)
+	}
+
+	if err := tmp.Sync(); err != nil {
+		return fmt.Errorf("sync %s: %w", tmpName, err)
+	}
+
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close %s: %w", tmpName, err)
+	}
+
+	// The reservation descriptor is released first: on Windows an open handle
+	// blocks the rename, and it buys nothing once the content is durable.
+	_ = reserved.Close()
+
+	if err := os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("install the key at %s: %w", path, err)
+	}
+
+	return syncDir(dir)
+}
+
+// syncDir forces a directory entry to durable storage. Syncing a file does not
+// guarantee its NAME survives a power cut.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("open %s to sync it: %w", dir, err)
+	}
+
+	defer d.Close()
+
+	if err := d.Sync(); err != nil {
+		return fmt.Errorf("sync %s: %w", dir, err)
 	}
 
 	return nil
@@ -204,9 +284,18 @@ func openBrowser(ctx context.Context, target string) error {
 
 	args = append(args, target)
 
-	if err := exec.CommandContext(ctx, cmd, args...).Start(); err != nil {
+	proc := exec.CommandContext(ctx, cmd, args...)
+
+	if err := proc.Start(); err != nil {
 		return fmt.Errorf("open browser: %w", err)
 	}
+
+	// Reaped in the background. Without a Wait the child stays a zombie for the
+	// life of the CLI — which for this command can be the full hour GitHub
+	// allows — and onboarding starts two of them. Not waiting inline because
+	// `open`/`xdg-open` may not exit until the browser does.
+	//nolint:errcheck // The browser's exit status is not billet's business; this Wait exists only to reap the child.
+	go func() { proc.Wait() }()
 
 	return nil
 }

@@ -608,6 +608,15 @@ func TestOnboardFailsOnUnexpectedPermission(t *testing.T) {
 		t.Errorf("expected a permission-mismatch error, got: %v", err)
 	}
 
+	// The recovery URL has to WORK. Nothing pinned it, and it had been built by
+	// appending "/installations/<id>" to a base already ending in
+	// /installations — handing a 404 to an operator who is by definition
+	// already stuck.
+	want := "https://github.com/organizations/acme/settings/installations/909090"
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("recovery URL is wrong.\n got: %v\nwant it to contain: %s", err, want)
+	}
+
 	// The key must still have been saved, or the failure is unrecoverable.
 	if !saved {
 		t.Error("the app key was not persisted before the failure; the app is now orphaned")

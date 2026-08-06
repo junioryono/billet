@@ -3,6 +3,7 @@ package github
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -201,6 +202,77 @@ func TestConvertManifestSuccess(t *testing.T) {
 
 	if got := app.InstallURL(); got != "https://github.com/apps/billet-acme/installations/new" {
 		t.Errorf("InstallURL = %q", got)
+	}
+}
+
+// App is exactly the sort of value that ends up in a debug print or a wrapped
+// error, and a plain %v would otherwise emit the App's private key.
+func TestAppFormattingRedactsCredentials(t *testing.T) {
+	app := App{
+		ID:            42,
+		Slug:          "billet-acme",
+		PEM:           "-----BEGIN RSA PRIVATE KEY-----\nSECRETKEYMATERIAL\n",
+		WebhookSecret: "SECRETWEBHOOK",
+		ClientSecret:  "SECRETCLIENT",
+	}
+
+	secrets := []string{"SECRETKEYMATERIAL", "SECRETWEBHOOK", "SECRETCLIENT"}
+
+	// Routed through `any` deliberately. Calling fmt.Sprintf on the concrete
+	// type makes staticcheck and gocritic suggest app.String() instead — which
+	// would test the method and not the FORMATTING PATH, and the formatting path
+	// is the whole risk: somebody prints an App without thinking about it.
+	render := func(format string, v any) string { return fmt.Sprintf(format, v) }
+
+	// Every verb a caller might reach for, including the pointer forms: a
+	// value-receiver method is also in *App's method set.
+	for _, rendered := range []string{
+		render("%v", app), render("%s", app), render("%#v", app),
+		render("%v", &app), render("%s", &app), render("%#v", &app),
+	} {
+		for _, secret := range secrets {
+			if strings.Contains(rendered, secret) {
+				t.Errorf("formatting leaked %q:\n%s", secret, rendered)
+			}
+		}
+	}
+
+	// Still useful for diagnosis.
+	if !strings.Contains(render("%v", app), "billet-acme") {
+		t.Error("redaction removed the identifying fields too")
+	}
+}
+
+// Onboard hands this struct back after the key is on disk. Nothing downstream
+// needs a credential, and billet never persists the webhook or client secret —
+// it registers an inactive webhook and implements no OAuth flow.
+func TestForgetClearsEverySecret(t *testing.T) {
+	app := &App{
+		ID:            42,
+		PEM:           "key",
+		WebhookSecret: "hook",
+		ClientID:      "Iv1.public",
+		ClientSecret:  "secret",
+	}
+
+	app.Forget()
+
+	switch {
+	case app.PEM != "":
+		t.Error("Forget left the private key")
+	case app.WebhookSecret != "":
+		t.Error("Forget left the webhook secret")
+	case app.ClientSecret != "":
+		t.Error("Forget left the client secret")
+	}
+
+	// ClientID is not a secret and is the value billet may later persist.
+	if app.ClientID != "Iv1.public" {
+		t.Errorf("Forget discarded the non-secret client id: %q", app.ClientID)
+	}
+
+	if app.ID != 42 {
+		t.Errorf("Forget discarded the app id: %d", app.ID)
 	}
 }
 
