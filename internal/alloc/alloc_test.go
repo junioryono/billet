@@ -1,6 +1,7 @@
 package alloc
 
 import (
+	"database/sql"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -47,8 +48,8 @@ func TestReserveHoldsCapacity(t *testing.T) {
 
 	ctx := t.Context()
 
-	if n, err := a.Advertisable(ctx, "small"); err != nil || n != 4 {
-		t.Fatalf("Advertisable = %d, %v; want 4", n, err)
+	if n, err := a.Headroom(ctx, "small"); err != nil || n != 4 {
+		t.Fatalf("Headroom = %d, %v; want 4", n, err)
 	}
 
 	lease, err := a.Reserve(ctx, "small")
@@ -58,8 +59,8 @@ func TestReserveHoldsCapacity(t *testing.T) {
 
 	// The point of escrowing: what a listener may advertise drops immediately,
 	// before any job is assigned or any VM booted.
-	if n, err := a.Advertisable(ctx, "small"); err != nil || n != 3 {
-		t.Fatalf("after Reserve, Advertisable = %d, %v; want 3", n, err)
+	if n, err := a.Headroom(ctx, "small"); err != nil || n != 3 {
+		t.Fatalf("after Reserve, Headroom = %d, %v; want 3", n, err)
 	}
 
 	usage, err := a.Usage(ctx)
@@ -75,8 +76,8 @@ func TestReserveHoldsCapacity(t *testing.T) {
 		t.Fatalf("Release: %v", err)
 	}
 
-	if n, err := a.Advertisable(ctx, "small"); err != nil || n != 4 {
-		t.Fatalf("after Release, Advertisable = %d, %v; want 4", n, err)
+	if n, err := a.Headroom(ctx, "small"); err != nil || n != 4 {
+		t.Fatalf("after Release, Headroom = %d, %v; want 4", n, err)
 	}
 }
 
@@ -90,8 +91,8 @@ func TestMemoryCanBindBeforeVCPU(t *testing.T) {
 
 	ctx := t.Context()
 
-	if n, err := a.Advertisable(ctx, "fat"); err != nil || n != 2 {
-		t.Fatalf("Advertisable = %d, %v; want 2 (memory-bound, not core-bound)", n, err)
+	if n, err := a.Headroom(ctx, "fat"); err != nil || n != 2 {
+		t.Fatalf("Headroom = %d, %v; want 2 (memory-bound, not core-bound)", n, err)
 	}
 
 	for i := range 2 {
@@ -117,8 +118,8 @@ func TestTiersShareOneGlobalCeiling(t *testing.T) {
 
 	ctx := t.Context()
 
-	if n, _ := a.Advertisable(ctx, "large"); n != 2 {
-		t.Fatalf("large Advertisable = %d, want 2", n)
+	if n, _ := a.Headroom(ctx, "large"); n != 2 {
+		t.Fatalf("large Headroom = %d, want 2", n)
 	}
 
 	if _, err := a.Reserve(ctx, "small"); err != nil {
@@ -126,8 +127,8 @@ func TestTiersShareOneGlobalCeiling(t *testing.T) {
 	}
 
 	// 12 vCPU and 48GiB remain, so only one large fits.
-	if n, _ := a.Advertisable(ctx, "large"); n != 1 {
-		t.Errorf("after reserving small, large Advertisable = %d, want 1", n)
+	if n, _ := a.Headroom(ctx, "large"); n != 1 {
+		t.Errorf("after reserving small, large Headroom = %d, want 1", n)
 	}
 }
 
@@ -202,8 +203,8 @@ func TestPerTierConcurrencyCap(t *testing.T) {
 
 	ctx := t.Context()
 
-	if n, _ := a.Advertisable(ctx, "capped"); n != 2 {
-		t.Fatalf("Advertisable = %d, want 2 (the per-tier cap, not the machine)", n)
+	if n, _ := a.Headroom(ctx, "capped"); n != 2 {
+		t.Fatalf("Headroom = %d, want 2 (the per-tier cap, not the machine)", n)
 	}
 
 	for range 2 {
@@ -236,8 +237,8 @@ func TestMacOSLimitIsPerHostAcrossTiers(t *testing.T) {
 
 	ctx := t.Context()
 
-	if n, _ := a.Advertisable(ctx, "mac-6"); n != config.MacOSVMLimit {
-		t.Fatalf("mac-6 Advertisable = %d, want %d", n, config.MacOSVMLimit)
+	if n, _ := a.Headroom(ctx, "mac-6"); n != config.MacOSVMLimit {
+		t.Fatalf("mac-6 Headroom = %d, want %d", n, config.MacOSVMLimit)
 	}
 
 	// One guest from each tier fills the host's two slots.
@@ -249,8 +250,8 @@ func TestMacOSLimitIsPerHostAcrossTiers(t *testing.T) {
 		t.Fatalf("Reserve mac-12: %v", err)
 	}
 
-	if n, _ := a.Advertisable(ctx, "mac-6"); n != 0 {
-		t.Errorf("mac-6 Advertisable = %d after two guests on the host, want 0", n)
+	if n, _ := a.Headroom(ctx, "mac-6"); n != 0 {
+		t.Errorf("mac-6 Headroom = %d after two guests on the host, want 0", n)
 	}
 
 	if _, err := a.Reserve(ctx, "mac-6"); !errors.Is(err, ErrNoCapacity) {
@@ -282,8 +283,8 @@ func TestLinuxGuestsOnAMacAreNotCapped(t *testing.T) {
 	}
 
 	// Five Linux guests must not have consumed any macOS licence slot.
-	if n, _ := a.Advertisable(ctx, "mac-6"); n != config.MacOSVMLimit {
-		t.Errorf("mac-6 Advertisable = %d after 5 Linux guests, want %d", n, config.MacOSVMLimit)
+	if n, _ := a.Headroom(ctx, "mac-6"); n != config.MacOSVMLimit {
+		t.Errorf("mac-6 Headroom = %d after 5 Linux guests, want %d", n, config.MacOSVMLimit)
 	}
 }
 
@@ -414,17 +415,384 @@ func TestReapFencesTheOldHolder(t *testing.T) {
 	}
 
 	// Capacity came back.
-	if got, _ := a.Advertisable(ctx, "small"); got != 4 {
-		t.Errorf("Advertisable after reap = %d, want 4", got)
+	if got, _ := a.Headroom(ctx, "small"); got != 4 {
+		t.Errorf("Headroom after reap = %d, want 4", got)
 	}
 
-	// And the old holder is fenced out — every write refused.
-	if err := a.Heartbeat(ctx, lease.ID, lease.Epoch); err == nil {
-		t.Error("the reclaimed holder's heartbeat succeeded; the fence is not working")
+	// The old holder must be FENCED, specifically — not merely refused.
+	//
+	// Asserting "some error" is not enough, and this test used to do exactly
+	// that: reaping also makes the phase terminal, which produces
+	// ErrLeaseNotFound on its own. Deleting `epoch = epoch + 1` from Reap left
+	// the test green while the fence was gone entirely. Requiring ErrFenced is
+	// what makes the epoch bump observable.
+	if err := a.Heartbeat(ctx, lease.ID, lease.Epoch); !errors.Is(err, ErrFenced) {
+		t.Errorf("reclaimed holder's heartbeat = %v, want ErrFenced", err)
 	}
 
-	if err := a.Advance(ctx, lease.ID, lease.Epoch, PhaseLaunching); err == nil {
-		t.Error("the reclaimed holder advanced a lease it no longer owns")
+	if err := a.Advance(ctx, lease.ID, lease.Epoch, PhaseLaunching); !errors.Is(err, ErrFenced) {
+		t.Errorf("reclaimed holder's advance = %v, want ErrFenced", err)
+	}
+
+	// And directly: the stored epoch advanced.
+	var stored int64
+	if err := a.db.Reader().QueryRowContext(ctx,
+		`SELECT epoch FROM leases WHERE id = ?`, lease.ID).Scan(&stored); err != nil {
+		t.Fatalf("read epoch: %v", err)
+	}
+
+	if stored <= lease.Epoch {
+		t.Errorf("stored epoch = %d, want greater than the holder's %d", stored, lease.Epoch)
+	}
+}
+
+// Escrow is what a listener advertises, because reading headroom and then
+// advertising it leaves a gap where two listeners promise the same slots.
+func TestEscrowReservesWhatItReports(t *testing.T) {
+	a := newAllocator(t,
+		Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB},
+		[]config.Tier{tier("small", 4, 16*config.GiB)})
+
+	ctx := t.Context()
+
+	// Asking for more than fits takes what fits — an ordinary outcome.
+	leases, err := a.Escrow(ctx, "small", 10)
+	if err != nil {
+		t.Fatalf("Escrow: %v", err)
+	}
+
+	if len(leases) != 4 {
+		t.Fatalf("escrowed %d leases, want 4", len(leases))
+	}
+
+	// Everything returned is already held, so a second listener sees nothing.
+	more, err := a.Escrow(ctx, "small", 4)
+	if err != nil {
+		t.Fatalf("second Escrow: %v", err)
+	}
+
+	if len(more) != 0 {
+		t.Errorf("second Escrow took %d leases; the first advertisement was not reserved", len(more))
+	}
+}
+
+// Two listeners escrowing concurrently must not collectively advertise more than
+// the machine holds. This is the failure Headroom cannot prevent on its own.
+func TestConcurrentEscrowsCannotOveradvertise(t *testing.T) {
+	a := newAllocator(t,
+		Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB},
+		[]config.Tier{
+			tier("small", 4, 16*config.GiB),
+			tier("also-small", 4, 16*config.GiB),
+		})
+
+	ctx := t.Context()
+
+	var (
+		wg    sync.WaitGroup
+		total atomic.Int32
+	)
+
+	for _, label := range []string{"small", "also-small"} {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			leases, err := a.Escrow(ctx, label, 4)
+			if err != nil {
+				t.Errorf("Escrow %s: %v", label, err)
+				return
+			}
+
+			total.Add(int32(len(leases)))
+		}()
+	}
+
+	wg.Wait()
+
+	// Four slots exist. Two listeners each advertising four would be eight.
+	if n := total.Load(); n != 4 {
+		t.Errorf("two listeners advertised %d slots in total, want 4", n)
+	}
+}
+
+// A lease pinned to one Mac must not bind to another: its licence slot stays
+// charged to the first host, so the second would accept guests past Apple's
+// limit while every individual decision looked correct.
+func TestBindRefusesTheWrongNode(t *testing.T) {
+	mac := config.Tier{
+		Label: "mac-6", Provider: config.ProviderTart, GuestOS: config.GuestMacOS,
+		Node: "mac-mini-1", VCPU: 6, Memory: 24 * config.GiB, Image: "macos-26",
+	}
+
+	a := newAllocator(t,
+		Limits{MaxVCPU: 256, MaxMemory: 512 * config.GiB},
+		[]config.Tier{mac})
+
+	ctx := t.Context()
+
+	registerNode(t, a, "mac-mini-1")
+	registerNode(t, a, "mac-mini-2")
+
+	lease, err := a.Reserve(ctx, "mac-6")
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	if err := a.Bind(ctx, lease.ID, lease.Epoch, "mac-mini-2"); !errors.Is(err, ErrWrongNode) {
+		t.Errorf("bind to the wrong host = %v, want ErrWrongNode", err)
+	}
+
+	if err := a.Bind(ctx, lease.ID, lease.Epoch, "mac-mini-1"); err != nil {
+		t.Fatalf("bind to the pinned host: %v", err)
+	}
+
+	// Repeating the same bind is a retry, not a conflict.
+	if err := a.Bind(ctx, lease.ID, lease.Epoch, "mac-mini-1"); err != nil {
+		t.Errorf("repeated bind = %v, want nil", err)
+	}
+
+	// Rebinding elsewhere afterwards is still refused.
+	if err := a.Bind(ctx, lease.ID, lease.Epoch, "mac-mini-2"); !errors.Is(err, ErrWrongNode) {
+		t.Errorf("rebind = %v, want ErrWrongNode", err)
+	}
+}
+
+// Placement is read from the lease's own columns, so changing the catalog
+// underneath in-flight leases cannot reclassify them.
+func TestMacOSAccountingSurvivesCatalogChange(t *testing.T) {
+	mac := config.Tier{
+		Label: "mac-6", Provider: config.ProviderTart, GuestOS: config.GuestMacOS,
+		Node: "mac-mini-1", VCPU: 6, Memory: 24 * config.GiB, Image: "macos-26",
+	}
+
+	db, err := state.Open(t.Context(), t.TempDir())
+	if err != nil {
+		t.Fatalf("state.Open: %v", err)
+	}
+
+	defer db.Close()
+
+	first, err := New(db, Limits{MaxVCPU: 256, MaxMemory: 512 * config.GiB}, []config.Tier{mac})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ctx := t.Context()
+
+	for range config.MacOSVMLimit {
+		if _, err := first.Reserve(ctx, "mac-6"); err != nil {
+			t.Fatalf("Reserve: %v", err)
+		}
+	}
+
+	// A restart with the tier RENAMED. The old leases are still running on that
+	// Mac and must still count against its licence.
+	renamed := mac
+	renamed.Label = "mac-6-renamed"
+
+	second, err := New(db, Limits{MaxVCPU: 256, MaxMemory: 512 * config.GiB}, []config.Tier{renamed})
+	if err != nil {
+		t.Fatalf("New after rename: %v", err)
+	}
+
+	if n, _ := second.Headroom(ctx, "mac-6-renamed"); n != 0 {
+		t.Errorf("Headroom = %d after a rename, want 0 — in-flight guests were reclassified", n)
+	}
+}
+
+// registerNode inserts a node row so leases can satisfy the foreign key on bind.
+func registerNode(t *testing.T, a *Allocator, name string) {
+	t.Helper()
+
+	if err := a.db.Tx(t.Context(), func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(t.Context(),
+			`INSERT INTO nodes (name, provider, last_seen_at) VALUES (?, 'tart', ?)`,
+			name, ts(time.Now()))
+
+		return err
+	}); err != nil {
+		t.Fatalf("register node %s: %v", name, err)
+	}
+}
+
+// A retry that contradicts what was recorded is a conflict, not a success:
+// returning nil while keeping the original assignment leaves the caller
+// believing a job is scheduled that nothing will ever run.
+func TestAssignRejectsAContradictoryRetry(t *testing.T) {
+	a := newAllocator(t,
+		Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB},
+		[]config.Tier{tier("small", 4, 16*config.GiB)})
+
+	ctx := t.Context()
+
+	lease, _ := a.Reserve(ctx, "small")
+
+	if err := a.Assign(ctx, lease.ID, lease.Epoch, 1, 2); err != nil {
+		t.Fatalf("Assign: %v", err)
+	}
+
+	if err := a.Assign(ctx, lease.ID, lease.Epoch, 1, 2); err != nil {
+		t.Errorf("identical retry = %v, want nil", err)
+	}
+
+	if err := a.Assign(ctx, lease.ID, lease.Epoch, 99, 98); !errors.Is(err, ErrConflict) {
+		t.Errorf("reassignment to a different job = %v, want ErrConflict", err)
+	}
+}
+
+func TestReleaseDistinguishesMissingFromFinished(t *testing.T) {
+	a := newAllocator(t,
+		Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB},
+		[]config.Tier{tier("small", 4, 16*config.GiB)})
+
+	ctx := t.Context()
+
+	// A lease that never existed is not a completed cleanup.
+	if err := a.Release(ctx, "no-such-lease", 0, PhaseDone); !errors.Is(err, ErrLeaseNotFound) {
+		t.Errorf("release of an unknown id = %v, want ErrLeaseNotFound", err)
+	}
+
+	lease, _ := a.Reserve(ctx, "small")
+
+	if err := a.Release(ctx, lease.ID, lease.Epoch, PhaseDone); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+
+	if err := a.Release(ctx, lease.ID, lease.Epoch, PhaseDone); err != nil {
+		t.Errorf("identical re-release = %v, want nil", err)
+	}
+
+	// Re-finishing with a DIFFERENT outcome contradicts recorded history.
+	if err := a.Release(ctx, lease.ID, lease.Epoch, PhaseFailed); !errors.Is(err, ErrConflict) {
+		t.Errorf("re-release as failed = %v, want ErrConflict", err)
+	}
+}
+
+// A reaped lease is the one most worth investigating, so it must not lose its
+// job attribution on the way into history.
+func TestReapedLeaseKeepsItsAttribution(t *testing.T) {
+	now := time.Date(2026, time.August, 6, 12, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+
+	a := newAllocator(t,
+		Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB},
+		[]config.Tier{tier("small", 4, 16*config.GiB)},
+		WithClock(func() time.Time { return clock() }),
+		WithLeaseTTL(30*time.Second))
+
+	ctx := t.Context()
+
+	lease, _ := a.Reserve(ctx, "small")
+
+	if err := a.Assign(ctx, lease.ID, lease.Epoch, 555, 666); err != nil {
+		t.Fatalf("Assign: %v", err)
+	}
+
+	now = now.Add(90 * time.Second)
+
+	if n, err := a.Reap(ctx); err != nil || n != 1 {
+		t.Fatalf("Reap = %d, %v; want 1", n, err)
+	}
+
+	var (
+		runID      sql.NullInt64
+		jobID      sql.NullInt64
+		conclusion string
+		assignedAt sql.NullString
+	)
+
+	if err := a.db.Reader().QueryRowContext(ctx,
+		`SELECT run_id, job_id, conclusion, assigned_at FROM job_history WHERE lease_id = ?`, lease.ID).
+		Scan(&runID, &jobID, &conclusion, &assignedAt); err != nil {
+		t.Fatalf("read job_history: %v", err)
+	}
+
+	if runID.Int64 != 555 || jobID.Int64 != 666 {
+		t.Errorf("history lost attribution: run=%v job=%v", runID, jobID)
+	}
+
+	if conclusion != string(PhaseFailed) {
+		t.Errorf("conclusion = %q, want failed", conclusion)
+	}
+
+	// The assignment time must be when the job was assigned, not when it was
+	// reaped — otherwise queue duration is fabricated rather than measured.
+	if !assignedAt.Valid {
+		t.Fatal("assigned_at was never recorded")
+	}
+
+	if assignedAt.String >= ts(now) {
+		t.Errorf("assigned_at %q is not before the reap time %q", assignedAt.String, ts(now))
+	}
+}
+
+// New is exported and cannot prove its catalog came through config.Load, so it
+// validates every precondition its own arithmetic depends on.
+func TestNewRejectsCatalogsThatBreakInvariants(t *testing.T) {
+	db, err := state.Open(t.Context(), t.TempDir())
+	if err != nil {
+		t.Fatalf("state.Open: %v", err)
+	}
+
+	defer db.Close()
+
+	limits := Limits{MaxVCPU: 64, MaxMemory: 64 * config.GiB}
+
+	cases := map[string][]config.Tier{
+		"zero vcpu divides by zero":   {tier("t", 0, config.GiB)},
+		"zero memory divides by zero": {{Label: "t", VCPU: 1, Memory: 0, GuestOS: config.GuestLinux}},
+		"negative max_concurrent": {func() config.Tier {
+			x := tier("t", 1, config.GiB)
+			x.MaxConcurrent = -1
+
+			return x
+		}()},
+		"macOS tier with no node": {{
+			Label: "mac", GuestOS: config.GuestMacOS, Provider: config.ProviderTart,
+			VCPU: 6, Memory: config.GiB,
+		}},
+		"macOS tier with a whitespace node": {{
+			Label: "mac", GuestOS: config.GuestMacOS, Provider: config.ProviderTart,
+			Node: "   ", VCPU: 6, Memory: config.GiB,
+		}},
+		"duplicate labels": {tier("t", 1, config.GiB), tier("t", 2, config.GiB)},
+		"no label":         {tier("", 1, config.GiB)},
+	}
+
+	for name, tiers := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := New(db, limits, tiers); err == nil {
+				t.Error("New accepted a catalog that breaks an allocator invariant")
+			}
+		})
+	}
+}
+
+// A non-positive TTL creates leases that are already expired, so Reap recycles
+// live capacity immediately; a nil clock panics on first use.
+func TestNewValidatesOptions(t *testing.T) {
+	db, err := state.Open(t.Context(), t.TempDir())
+	if err != nil {
+		t.Fatalf("state.Open: %v", err)
+	}
+
+	defer db.Close()
+
+	limits := Limits{MaxVCPU: 64, MaxMemory: 64 * config.GiB}
+	tiers := []config.Tier{tier("t", 1, config.GiB)}
+
+	if _, err := New(db, limits, tiers, WithLeaseTTL(0)); err == nil {
+		t.Error("New accepted a zero lease TTL")
+	}
+
+	if _, err := New(db, limits, tiers, WithLeaseTTL(-time.Second)); err == nil {
+		t.Error("New accepted a negative lease TTL")
+	}
+
+	if _, err := New(db, limits, tiers, WithClock(nil)); err == nil {
+		t.Error("New accepted a nil clock")
 	}
 }
 
@@ -560,7 +928,7 @@ func TestUnknownTierIsRejected(t *testing.T) {
 		t.Errorf("Reserve unknown tier = %v, want ErrUnknownTier", err)
 	}
 
-	if _, err := a.Advertisable(ctx, "nope"); !errors.Is(err, ErrUnknownTier) {
+	if _, err := a.Headroom(ctx, "nope"); !errors.Is(err, ErrUnknownTier) {
 		t.Errorf("Advertisable unknown tier = %v, want ErrUnknownTier", err)
 	}
 }

@@ -24,6 +24,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/junioryono/billet/internal/config"
@@ -94,6 +95,12 @@ var (
 	ErrBadTransition = errors.New("alloc: invalid phase transition")
 	// ErrUnknownTier means the tier is not in the configured catalog.
 	ErrUnknownTier = errors.New("alloc: unknown tier")
+	// ErrWrongNode means a bind would place a lease on a node other than the one
+	// it is pinned to, or rebind one that is already placed.
+	ErrWrongNode = errors.New("alloc: lease cannot be bound to that node")
+	// ErrConflict means a retry contradicts what was already recorded — the same
+	// lease assigned to a different job, or released with a different outcome.
+	ErrConflict = errors.New("alloc: retry contradicts the recorded operation")
 )
 
 // Limits is the global ceiling the allocator escrows against.
@@ -106,15 +113,22 @@ type Limits struct {
 // must present it, and a reclaim bumps it so the previous holder's writes stop
 // matching.
 type Lease struct {
-	ID     string
-	Tier   string
-	Node   string
-	Phase  Phase
-	VCPU   int
-	Memory config.ByteSize
-	Epoch  int64
-	RunID  int64
-	JobID  int64
+	ID   string
+	Tier string
+	// Node is the node that actually bound this lease; empty until Bind.
+	Node string
+	// TargetNode is the node the lease is CONSTRAINED to by its tier's config.
+	// Recorded at reserve time so placement survives a catalog change.
+	TargetNode string
+	// MacOSSlot records whether this lease consumes one of Apple's two per-host
+	// guest licences. Stored rather than re-derived for the same reason.
+	MacOSSlot bool
+	Phase     Phase
+	VCPU      int
+	Memory    config.ByteSize
+	Epoch     int64
+	RunID     int64
+	JobID     int64
 }
 
 // Usage is the vector of what is currently held.
@@ -159,6 +173,15 @@ func WithLeaseTTL(d time.Duration) Option {
 // a little longer: it hands a live job's slot to someone else.
 const DefaultLeaseTTL = 90 * time.Second
 
+// reapBatchSize bounds one Reap transaction.
+//
+// Reap holds the store's single writer connection for the whole batch, so an
+// unbounded scan of a large expired backlog would block every reservation and
+// heartbeat behind it — turning a backlog into more expiries, which is a
+// feedback loop rather than a slowdown. Callers reap on a timer; a batch that
+// fills is simply drained by the next tick.
+const reapBatchSize = 256
+
 // New builds an allocator over the given tier catalog.
 func New(db *state.DB, limits Limits, tiers []config.Tier, opts ...Option) (*Allocator, error) {
 	if db == nil {
@@ -179,25 +202,64 @@ func New(db *state.DB, limits Limits, tiers []config.Tier, opts ...Option) (*All
 		now:      time.Now,
 	}
 
+	// Validate every precondition the allocator's arithmetic and limits depend
+	// on. config.Load enforces most of these, but this constructor is exported
+	// and cannot prove its catalog came through that path — and the failure modes
+	// are bad: VCPU or Memory of zero is a division by zero in headroom, a macOS
+	// tier with no node skips the licence cap entirely, a negative MaxConcurrent
+	// reads as unlimited, and a duplicate label silently shadows a tier.
 	for i := range tiers {
 		t := &tiers[i]
-		a.tiers[t.Label] = *t
+
+		switch {
+		case t.Label == "":
+			return nil, fmt.Errorf("alloc: tiers[%d] has no label", i)
+		case t.VCPU <= 0:
+			return nil, fmt.Errorf("alloc: tier %q has vcpu %d; headroom divides by it", t.Label, t.VCPU)
+		case t.Memory <= 0:
+			return nil, fmt.Errorf("alloc: tier %q has memory %s; headroom divides by it", t.Label, t.Memory)
+		case t.MaxConcurrent < 0:
+			return nil, fmt.Errorf("alloc: tier %q has negative max_concurrent %d", t.Label, t.MaxConcurrent)
+		case t.GuestOS == config.GuestMacOS && strings.TrimSpace(t.Node) == "":
+			return nil, fmt.Errorf(
+				"alloc: macOS tier %q names no node; Apple's per-host guest limit cannot be enforced without one",
+				t.Label)
+		}
+
+		if _, dup := a.tiers[t.Label]; dup {
+			return nil, fmt.Errorf("alloc: duplicate tier label %q", t.Label)
+		}
+
+		normalized := *t
+		normalized.Node = strings.TrimSpace(t.Node)
+		a.tiers[t.Label] = normalized
 	}
 
 	for _, opt := range opts {
 		opt(a)
 	}
 
+	// Options are validated AFTER they are applied: a zero TTL creates leases
+	// that are already expired, so Reap recycles live capacity immediately, and a
+	// nil clock panics on first use rather than at construction.
+	if a.leaseTTL <= 0 {
+		return nil, fmt.Errorf("alloc: lease TTL must be positive, got %s", a.leaseTTL)
+	}
+
+	if a.now == nil {
+		return nil, errors.New("alloc: clock must not be nil")
+	}
+
 	return a, nil
 }
 
-// Advertisable reports how many more instances of a tier billet could accept
-// right now, given everything already escrowed.
+// Headroom reports how many more instances of a tier would fit right now.
 //
-// This is what a scale-set listener advertises to GitHub as maxCapacity. It is
-// computed from the SAME ledger that Reserve writes to, which is what stops two
-// tier listeners from each promising the whole machine.
-func (a *Allocator) Advertisable(ctx context.Context, tier string) (int, error) {
+// DIAGNOSTIC ONLY — never advertise this number to GitHub. It reserves nothing,
+// so two tier listeners can each read four free slots and each advertise four,
+// and the atomicity of Reserve cannot retract a promise GitHub has already
+// received. Advertise what Escrow returns, which is capacity actually set aside.
+func (a *Allocator) Headroom(ctx context.Context, tier string) (int, error) {
 	t, ok := a.tiers[tier]
 	if !ok {
 		return 0, fmt.Errorf("%w: %q", ErrUnknownTier, tier)
@@ -213,6 +275,57 @@ func (a *Allocator) Advertisable(ctx context.Context, tier string) (int, error) 
 	})
 
 	return n, err
+}
+
+// Escrow reserves up to want instances of a tier and returns the leases it
+// actually took. len(result) is what a scale-set listener may advertise.
+//
+// Reading headroom and then advertising it are two steps with a gap between
+// them, and the gap is where two listeners promise the same slots. Escrow closes
+// it by making the promise and the reservation one act: whatever comes back is
+// already held, so a listener asking immediately afterwards sees a smaller
+// machine. Taking fewer than requested is the ordinary case, not an error.
+func (a *Allocator) Escrow(ctx context.Context, tier string, want int) ([]*Lease, error) {
+	if want < 0 {
+		return nil, fmt.Errorf("alloc: want must not be negative, got %d", want)
+	}
+
+	t, ok := a.tiers[tier]
+	if !ok {
+		return nil, fmt.Errorf("%w: %q", ErrUnknownTier, tier)
+	}
+
+	if want == 0 {
+		return nil, nil
+	}
+
+	var leases []*Lease
+
+	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+		room, err := a.headroom(ctx, tx, t)
+		if err != nil {
+			return err
+		}
+
+		take := min(want, room)
+		leases = make([]*Lease, 0, take)
+
+		for range take {
+			lease, err := a.insertLease(ctx, tx, t)
+			if err != nil {
+				return err
+			}
+
+			leases = append(leases, lease)
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return leases, nil
 }
 
 // headroom computes how many more of a tier fit. Every limit is applied, and the
@@ -264,22 +377,9 @@ func (a *Allocator) Reserve(ctx context.Context, tier string) (*Lease, error) {
 		return nil, fmt.Errorf("%w: %q", ErrUnknownTier, tier)
 	}
 
-	id, err := newLeaseID()
-	if err != nil {
-		return nil, err
-	}
+	var lease *Lease
 
-	lease := &Lease{
-		ID:     id,
-		Tier:   t.Label,
-		Node:   t.Node,
-		Phase:  PhaseCapacity,
-		VCPU:   t.VCPU,
-		Memory: t.Memory,
-		Epoch:  0,
-	}
-
-	err = a.db.Tx(ctx, func(tx *sql.Tx) error {
+	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
 		// Headroom and insert in ONE transaction. Checking outside it would be a
 		// read followed by a hopeful write — measured at a 7x overcommit under
 		// concurrency, which is exactly the race this package exists to prevent.
@@ -292,19 +392,7 @@ func (a *Allocator) Reserve(ctx context.Context, tier string) (*Lease, error) {
 			return fmt.Errorf("%w for tier %q", ErrNoCapacity, t.Label)
 		}
 
-		now := a.now().UTC()
-
-		// node stays NULL until Bind. A reservation is CONSTRAINED to a node by
-		// its tier's configuration, not yet BOUND to one — and the column has a
-		// foreign key to nodes(name), which at reserve time may name a host that
-		// has not registered yet (or ever). Writing the constraint here would make
-		// escrow fail on a perfectly valid configuration.
-		_, err = tx.ExecContext(ctx,
-			`INSERT INTO leases
-			   (id, tier, node, phase, vcpu, memory, epoch, created_at, heartbeat_at, expires_at)
-			 VALUES (?, ?, NULL, ?, ?, ?, 0, ?, ?, ?)`,
-			lease.ID, lease.Tier, string(PhaseCapacity), lease.VCPU, int64(lease.Memory),
-			ts(now), ts(now), ts(now.Add(a.leaseTTL)))
+		lease, err = a.insertLease(ctx, tx, t)
 
 		return err
 	})
@@ -315,14 +403,116 @@ func (a *Allocator) Reserve(ctx context.Context, tier string) (*Lease, error) {
 	return lease, nil
 }
 
-// Assign binds a reserved lease to a GitHub job.
-func (a *Allocator) Assign(ctx context.Context, leaseID string, epoch, runID, jobID int64) error {
-	return a.transition(ctx, leaseID, epoch, PhaseAssigned, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx,
-			`UPDATE leases SET run_id = ?, job_id = ? WHERE id = ?`, runID, jobID, leaseID)
+// insertLease writes one escrowed lease. Callers must already hold a transaction
+// in which they have confirmed headroom.
+func (a *Allocator) insertLease(ctx context.Context, tx *sql.Tx, t config.Tier) (*Lease, error) {
+	id, err := newLeaseID()
+	if err != nil {
+		return nil, err
+	}
 
-		return err
+	now := a.now().UTC()
+
+	// `node` stays NULL until Bind, while `target_node` records the constraint.
+	// They answer different questions: a reservation is CONSTRAINED to a node by
+	// its tier's config, and only later BOUND to one. `node` keeps its foreign
+	// key because binding proves the node registered; `target_node` cannot have
+	// one, because at reserve time it may name a host that has not started yet.
+	//
+	// macos_slot is stored rather than re-derived, so renaming a tier, changing
+	// its guest_os, or restarting against a different catalog cannot silently
+	// reclassify leases that are already in flight.
+	var targetNode any
+	if t.Node != "" {
+		targetNode = t.Node
+	}
+
+	macSlot := 0
+	if t.GuestOS == config.GuestMacOS {
+		macSlot = 1
+	}
+
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO leases
+		   (id, tier, node, target_node, macos_slot, phase, vcpu, memory, epoch,
+		    created_at, heartbeat_at, expires_at)
+		 VALUES (?, ?, NULL, ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
+		id, t.Label, targetNode, macSlot, string(PhaseCapacity), t.VCPU, int64(t.Memory),
+		ts(now), ts(now), ts(now.Add(a.leaseTTL))); err != nil {
+		return nil, fmt.Errorf("alloc: insert lease: %w", err)
+	}
+
+	return &Lease{
+		ID:         id,
+		Tier:       t.Label,
+		TargetNode: t.Node,
+		MacOSSlot:  macSlot == 1,
+		Phase:      PhaseCapacity,
+		VCPU:       t.VCPU,
+		Memory:     t.Memory,
+		Epoch:      0,
+	}, nil
+}
+
+// Assign binds a reserved lease to a GitHub job.
+//
+// Retrying with the SAME job is idempotent. Retrying with a DIFFERENT job is
+// ErrConflict, not success: an escrowed slot holds one job, and quietly
+// returning nil while keeping the original assignment would leave the caller
+// believing a job is scheduled that nothing will ever run.
+func (a *Allocator) Assign(ctx context.Context, leaseID string, epoch, runID, jobID int64) error {
+	return a.db.Tx(ctx, func(tx *sql.Tx) error {
+		lease, err := a.load(ctx, tx, leaseID, epoch)
+		if err != nil {
+			return err
+		}
+
+		if lease.Phase == PhaseAssigned {
+			if lease.RunID != runID || lease.JobID != jobID {
+				return fmt.Errorf("%w: lease %s already holds run %d job %d, cannot reassign to run %d job %d",
+					ErrConflict, leaseID, lease.RunID, lease.JobID, runID, jobID)
+			}
+
+			return nil
+		}
+
+		if !lease.Phase.canMoveTo(PhaseAssigned) {
+			return fmt.Errorf("%w: %s -> %s", ErrBadTransition, lease.Phase, PhaseAssigned)
+		}
+
+		now := a.now().UTC()
+
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE leases SET phase = ?, run_id = ?, job_id = ?, heartbeat_at = ?, expires_at = ?
+			  WHERE id = ? AND epoch = ?`,
+			string(PhaseAssigned), runID, jobID, ts(now), ts(now.Add(a.leaseTTL)), leaseID, epoch); err != nil {
+			return fmt.Errorf("alloc: assign lease %s: %w", leaseID, err)
+		}
+
+		// Record the queue entry now, so job_history carries a real assignment
+		// time rather than one fabricated at terminalization.
+		return a.recordAssignment(ctx, tx, lease, runID, jobID, now)
 	})
+}
+
+// recordAssignment opens the history row at assignment time.
+func (a *Allocator) recordAssignment(ctx context.Context, tx *sql.Tx, l *Lease, runID, jobID int64, now time.Time) error {
+	var node any
+	if l.Node != "" {
+		node = l.Node
+	}
+
+	_, err := tx.ExecContext(ctx,
+		`INSERT INTO job_history (lease_id, tier, node, run_id, job_id, queued_at, assigned_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT (lease_id) DO UPDATE SET
+		   run_id = excluded.run_id, job_id = excluded.job_id, assigned_at = excluded.assigned_at`,
+		l.ID, l.Tier, node, runID, jobID, ts(now), ts(now))
+	if err != nil {
+		return fmt.Errorf("alloc: record assignment for %s: %w", l.ID, err)
+	}
+
+	return nil
 }
 
 // Advance moves a lease to the next phase, refusing anything the state machine
@@ -332,16 +522,46 @@ func (a *Allocator) Advance(ctx context.Context, leaseID string, epoch int64, to
 }
 
 // Bind records which node is running a lease.
+//
+// A lease pinned to a node may only bind to THAT node. Without the check, a
+// macOS lease pinned to one Mac could be bound to another while its licence slot
+// stayed charged to the first — and the second host would then accept guests
+// beyond Apple's limit with every individual decision looking correct.
+//
+// Rebinding to a different node is refused rather than silently overwritten;
+// repeating the same bind is idempotent, because a node retrying after a lost
+// response must not be told its own success was a conflict.
 func (a *Allocator) Bind(ctx context.Context, leaseID string, epoch int64, node string) error {
+	if node == "" {
+		return errors.New("alloc: node must not be empty")
+	}
+
 	return a.db.Tx(ctx, func(tx *sql.Tx) error {
-		if _, err := a.load(ctx, tx, leaseID, epoch); err != nil {
+		lease, err := a.load(ctx, tx, leaseID, epoch)
+		if err != nil {
 			return err
 		}
 
-		_, err := tx.ExecContext(ctx,
-			`UPDATE leases SET node = ? WHERE id = ? AND epoch = ?`, node, leaseID, epoch)
+		if lease.TargetNode != "" && lease.TargetNode != node {
+			return fmt.Errorf("%w: lease %s is pinned to node %q, cannot bind to %q",
+				ErrWrongNode, leaseID, lease.TargetNode, node)
+		}
 
-		return err
+		if lease.Node != "" && lease.Node != node {
+			return fmt.Errorf("%w: lease %s is already bound to node %q, cannot rebind to %q",
+				ErrWrongNode, leaseID, lease.Node, node)
+		}
+
+		if lease.Node == node {
+			return nil // idempotent repeat
+		}
+
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE leases SET node = ? WHERE id = ? AND epoch = ?`, node, leaseID, epoch); err != nil {
+			return fmt.Errorf("alloc: bind lease %s: %w", leaseID, err)
+		}
+
+		return nil
 	})
 }
 
@@ -373,20 +593,28 @@ func (a *Allocator) Release(ctx context.Context, leaseID string, epoch int64, ou
 	}
 
 	return a.db.Tx(ctx, func(tx *sql.Tx) error {
-		lease, err := a.load(ctx, tx, leaseID, epoch)
+		// loadAny, not load: an idempotency decision needs to SEE the terminal row.
+		// Treating every not-found as success meant releasing an id that never
+		// existed returned nil, and re-releasing a `done` lease as `failed` also
+		// returned nil while history kept saying `done`.
+		lease, err := a.loadAny(ctx, tx, leaseID, epoch)
 		if err != nil {
-			if errors.Is(err, ErrLeaseNotFound) {
-				// Already terminal or reaped. Cleanup is complete either way.
-				return nil
+			return err
+		}
+
+		if lease.Phase.Terminal() {
+			if lease.Phase != outcome {
+				return fmt.Errorf("%w: lease %s already finished as %s, cannot re-finish as %s",
+					ErrConflict, leaseID, lease.Phase, outcome)
 			}
 
-			return err
+			return nil // idempotent repeat of the same outcome
 		}
 
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE leases SET phase = ? WHERE id = ? AND epoch = ?`,
 			string(outcome), leaseID, epoch); err != nil {
-			return err
+			return fmt.Errorf("alloc: release lease %s: %w", leaseID, err)
 		}
 
 		return a.archive(ctx, tx, lease, outcome)
@@ -403,9 +631,14 @@ func (a *Allocator) Reap(ctx context.Context) (int, error) {
 	var reaped int
 
 	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+		// Reset inside the transaction: a retry, or a rollback, must not leave a
+		// count from a previous attempt. Reap previously reported leases it had
+		// reclaimed even when the transaction rolled back and reclaimed none.
+		reaped = 0
+
 		now := a.now().UTC()
 
-		expired, err := readExpiredLeases(ctx, tx, ts(now))
+		expired, err := readExpiredLeases(ctx, tx, ts(now), reapBatchSize)
 		if err != nil {
 			return err
 		}
@@ -428,17 +661,33 @@ func (a *Allocator) Reap(ctx context.Context) (int, error) {
 		return nil
 	})
 
-	return reaped, err
+	if err != nil {
+		// The transaction rolled back, so nothing was reclaimed. Reporting a
+		// nonzero count alongside an error invites a caller to believe progress
+		// was made and stop retrying.
+		return 0, err
+	}
+
+	return reaped, nil
 }
 
 // readExpiredLeases is its own function so `defer rows.Close()` is usable: the
 // caller runs inside a transaction and issues further statements, so the cursor
 // must be closed before it continues.
-func readExpiredLeases(ctx context.Context, tx *sql.Tx, cutoff string) ([]Lease, error) {
+func readExpiredLeases(ctx context.Context, tx *sql.Tx, cutoff string, limit int) ([]Lease, error) {
+	// run_id and job_id are selected because archive needs them: without them a
+	// reaped lease lands in job_history with NULL attribution, so the very jobs
+	// worth investigating are the ones that lose their identity.
+	//
+	// Ordered and LIMITed so one transaction cannot hold the single writer
+	// connection while it drains an arbitrarily large backlog, blocking every
+	// reservation and heartbeat behind it.
 	rows, err := tx.QueryContext(ctx,
-		`SELECT id, tier, node, phase, vcpu, memory, epoch
+		`SELECT id, tier, node, target_node, macos_slot, phase, vcpu, memory, epoch, run_id, job_id
 		   FROM leases
-		  WHERE phase NOT IN ('done','failed') AND expires_at <= ?`, cutoff)
+		  WHERE phase NOT IN ('done','failed') AND expires_at <= ?
+		  ORDER BY expires_at
+		  LIMIT ?`, cutoff, limit)
 	if err != nil {
 		return nil, fmt.Errorf("alloc: find expired leases: %w", err)
 	}
@@ -448,17 +697,24 @@ func readExpiredLeases(ctx context.Context, tx *sql.Tx, cutoff string) ([]Lease,
 
 	for rows.Next() {
 		var (
-			l    Lease
-			node sql.NullString
-			mem  int64
-			ph   string
+			l          Lease
+			node       sql.NullString
+			targetNode sql.NullString
+			macSlot    int
+			mem        int64
+			ph         string
+			runID      sql.NullInt64
+			jobID      sql.NullInt64
 		)
 
-		if err := rows.Scan(&l.ID, &l.Tier, &node, &ph, &l.VCPU, &mem, &l.Epoch); err != nil {
+		if err := rows.Scan(&l.ID, &l.Tier, &node, &targetNode, &macSlot, &ph,
+			&l.VCPU, &mem, &l.Epoch, &runID, &jobID); err != nil {
 			return nil, fmt.Errorf("alloc: scan expired lease: %w", err)
 		}
 
-		l.Node, l.Phase, l.Memory = node.String, Phase(ph), config.ByteSize(mem)
+		l.Node, l.TargetNode = node.String, targetNode.String
+		l.MacOSSlot, l.Phase, l.Memory = macSlot == 1, Phase(ph), config.ByteSize(mem)
+		l.RunID, l.JobID = runID.Int64, jobID.Int64
 		expired = append(expired, l)
 	}
 
@@ -528,20 +784,37 @@ func (a *Allocator) transition(ctx context.Context, leaseID string, epoch int64,
 // declared dead and replaced would keep writing to a lease another process now
 // owns — an orderly takeover becoming two concurrent owners of one slot.
 func (a *Allocator) load(ctx context.Context, tx *sql.Tx, leaseID string, epoch int64) (*Lease, error) {
+	l, err := a.loadAny(ctx, tx, leaseID, epoch)
+	if err != nil {
+		return nil, err
+	}
+
+	if l.Phase.Terminal() {
+		return nil, fmt.Errorf("%w: %s is already %s", ErrLeaseNotFound, leaseID, l.Phase)
+	}
+
+	return l, nil
+}
+
+// loadAny is load without the terminal-phase filter, for callers deciding
+// idempotency — they must be able to see that a lease already finished, and how.
+func (a *Allocator) loadAny(ctx context.Context, tx *sql.Tx, leaseID string, epoch int64) (*Lease, error) {
 	var (
-		l       Lease
-		node    sql.NullString
-		mem     int64
-		ph      string
-		runID   sql.NullInt64
-		jobID   sql.NullInt64
-		curEpoc int64
+		l          Lease
+		node       sql.NullString
+		targetNode sql.NullString
+		macSlot    int
+		mem        int64
+		ph         string
+		runID      sql.NullInt64
+		jobID      sql.NullInt64
+		curEpoch   int64
 	)
 
 	err := tx.QueryRowContext(ctx,
-		`SELECT id, tier, node, phase, vcpu, memory, epoch, run_id, job_id
+		`SELECT id, tier, node, target_node, macos_slot, phase, vcpu, memory, epoch, run_id, job_id
 		   FROM leases WHERE id = ?`, leaseID).
-		Scan(&l.ID, &l.Tier, &node, &ph, &l.VCPU, &mem, &curEpoc, &runID, &jobID)
+		Scan(&l.ID, &l.Tier, &node, &targetNode, &macSlot, &ph, &l.VCPU, &mem, &curEpoch, &runID, &jobID)
 
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
@@ -550,17 +823,15 @@ func (a *Allocator) load(ctx context.Context, tx *sql.Tx, leaseID string, epoch 
 		return nil, fmt.Errorf("alloc: load lease %s: %w", leaseID, err)
 	}
 
-	if curEpoc != epoch {
+	// The fence is checked before anything else is believed about the row.
+	if curEpoch != epoch {
 		return nil, fmt.Errorf("%w: lease %s is at epoch %d, caller holds %d",
-			ErrFenced, leaseID, curEpoc, epoch)
+			ErrFenced, leaseID, curEpoch, epoch)
 	}
 
-	l.Node, l.Phase, l.Memory = node.String, Phase(ph), config.ByteSize(mem)
-	l.Epoch, l.RunID, l.JobID = curEpoc, runID.Int64, jobID.Int64
-
-	if l.Phase.Terminal() {
-		return nil, fmt.Errorf("%w: %s is already %s", ErrLeaseNotFound, leaseID, l.Phase)
-	}
+	l.Node, l.TargetNode = node.String, targetNode.String
+	l.MacOSSlot, l.Phase, l.Memory = macSlot == 1, Phase(ph), config.ByteSize(mem)
+	l.Epoch, l.RunID, l.JobID = curEpoch, runID.Int64, jobID.Int64
 
 	return &l, nil
 }
@@ -601,30 +872,22 @@ func (a *Allocator) countOpenByTier(ctx context.Context, tx *sql.Tx, tier string
 // countOpenMacOSByNode counts macOS guests destined for a node across ALL tiers,
 // because Apple's limit belongs to the physical Mac rather than to any one tier.
 //
-// It counts by TIER SET rather than by leases.node, and that is deliberate: a
-// reservation's node column is NULL until a node binds it, so a node-keyed count
-// would see zero and let the third guest through during exactly the window the
-// limit exists to cover. Config already guarantees every macOS tier declares its
-// node, so the set of tiers pinned to a host IS the set of guests headed there.
+// It reads the DURABLE columns written at reserve time, not the live tier map.
+// Deriving placement from the catalog meant renaming a tier, flipping its
+// guest_os, or restarting against a different config silently reclassified
+// leases already in flight — and a lease bound to a different node than its tier
+// named would be charged to the wrong host entirely.
 func (a *Allocator) countOpenMacOSByNode(ctx context.Context, tx *sql.Tx, node string) (int, error) {
-	macTiers := make([]any, 0, len(a.tiers))
-
-	for label := range a.tiers {
-		t := a.tiers[label]
-		if t.GuestOS == config.GuestMacOS && t.Node == node {
-			macTiers = append(macTiers, label)
-		}
-	}
-
-	if len(macTiers) == 0 {
-		return 0, nil
-	}
-
-	query := `SELECT COUNT(*) FROM leases WHERE phase NOT IN ('done','failed') AND tier IN (?` +
-		repeatPlaceholders(len(macTiers)-1) + `)`
-
 	var n int
-	if err := tx.QueryRowContext(ctx, query, macTiers...).Scan(&n); err != nil {
+
+	// COALESCE(node, target_node): once a lease is bound, the node it actually
+	// landed on is the one whose licence it consumes.
+	err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM leases
+		  WHERE phase NOT IN ('done','failed')
+		    AND macos_slot = 1
+		    AND COALESCE(node, target_node) = ?`, node).Scan(&n)
+	if err != nil {
 		return 0, fmt.Errorf("alloc: count macOS guests for %s: %w", node, err)
 	}
 
@@ -641,10 +904,18 @@ func (a *Allocator) archive(ctx context.Context, tx *sql.Tx, l *Lease, outcome P
 		node = l.Node
 	}
 
+	// COALESCE on update, so terminalizing never erases what assignment recorded.
+	// Reap in particular used to arrive with NULL ids because it did not select
+	// them, overwriting real attribution on the very leases worth investigating.
 	_, err := tx.ExecContext(ctx,
 		`INSERT INTO job_history (lease_id, tier, node, run_id, job_id, conclusion, queued_at, finished_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-		 ON CONFLICT (lease_id) DO UPDATE SET conclusion = excluded.conclusion, finished_at = excluded.finished_at`,
+		 ON CONFLICT (lease_id) DO UPDATE SET
+		   conclusion  = excluded.conclusion,
+		   finished_at = excluded.finished_at,
+		   node        = COALESCE(excluded.node, job_history.node),
+		   run_id      = COALESCE(excluded.run_id, job_history.run_id),
+		   job_id      = COALESCE(excluded.job_id, job_history.job_id)`,
 		l.ID, l.Tier, node, nullableID(l.RunID), nullableID(l.JobID), string(outcome), ts(now), ts(now))
 	if err != nil {
 		return fmt.Errorf("alloc: archive lease %s: %w", l.ID, err)
@@ -659,15 +930,6 @@ func nullableID(v int64) any {
 	}
 
 	return v
-}
-
-func repeatPlaceholders(n int) string {
-	out := make([]byte, 0, n*2)
-	for range n {
-		out = append(out, ',', '?')
-	}
-
-	return string(out)
 }
 
 // timestampFormat is FIXED-WIDTH, and that is the entire point.
