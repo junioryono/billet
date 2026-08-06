@@ -1696,6 +1696,44 @@ func TestBindRefusesANodeRunningAnotherProvider(t *testing.T) {
 	}
 }
 
+// New defends against a catalog that did not come through config.Load, so it
+// has to check the policy's RAW fields. Checking only the effective macOS limit
+// let a negative macos_vm_limit through whenever the allowlist excluded macOS,
+// because MacOSLimit() normalizes that to zero before the guard sees it — the
+// check defeated by the normalization it was reading through.
+func TestNewRejectsMalformedNodePolicy(t *testing.T) {
+	db, err := state.Open(t.Context(), t.TempDir())
+	if err != nil {
+		t.Fatalf("state.Open: %v", err)
+	}
+
+	defer db.Close()
+
+	negative := -1
+
+	for name, policy := range map[string]config.NodePolicy{
+		"unknown guest_os":   {Name: "n", GuestOS: []config.GuestOS{"plan9"}},
+		"duplicate guest_os": {Name: "n", GuestOS: []config.GuestOS{config.GuestLinux, config.GuestLinux}},
+		"unknown provider":   {Name: "n", Provider: config.ProviderKind("bogus")},
+		"negative limit hidden by a linux-only allowlist": {
+			Name:         "n",
+			GuestOS:      []config.GuestOS{config.GuestLinux},
+			MacOSVMLimit: &negative,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			limits := Limits{
+				MaxVCPU: 16, MaxMemory: 64 * config.GiB,
+				Nodes: map[string]config.NodePolicy{"n": policy},
+			}
+
+			if _, err := New(db, limits, []config.Tier{tier("small", 4, 16*config.GiB)}); err == nil {
+				t.Errorf("New accepted a node policy with %s", name)
+			}
+		})
+	}
+}
+
 func TestNewRejectsNegativeMacOSLimit(t *testing.T) {
 	db, err := state.Open(t.Context(), t.TempDir())
 	if err != nil {

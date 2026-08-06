@@ -40,11 +40,17 @@ for this than Zen 2 was. On Zen 2 a CCD held two 4-core CCXs with separate L3;
 on Zen 3 **the CCX and the CCD are the same thing** — 8 cores sharing one 32 MB
 L3. So:
 
-- An **8-vCPU tier maps exactly onto one CCD** using 8 physical cores, with a
-  private 32 MB L3 and no cross-CCD traffic. This is the shape to prefer.
+**billet does not implement any of this yet** — there is no provider, no
+topology discovery and no CPU affinity, so nothing below is a guarantee the
+software currently makes. It is why the 8-vCPU shape is the one to design
+toward when the Firecracker provider lands.
+
+- An **8-vCPU tier can fit exactly within one CCD**, if its vCPUs are pinned
+  one-to-one to that CCD's 8 physical cores: a private 32 MB L3 and no
+  cross-CCD traffic. Unpinned, the scheduler is free to spread it anywhere.
 - A **4-vCPU tier** fits inside a CCD with room to spare, but two of them on one
   CCD share that L3.
-- A **16-vCPU tier does not fit in a CCD.** It either spans two (crossing
+- A **16-vCPU tier cannot fit in a CCD.** It either spans two (crossing
   Infinity Fabric for L3 misses) or uses 8 cores plus their 8 SMT siblings
   within one, which is not the same thing as 16 cores. Which is better is a
   measurement, not a derivation.

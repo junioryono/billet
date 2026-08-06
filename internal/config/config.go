@@ -369,6 +369,24 @@ func (c *Config) NodePolicies() map[string]NodePolicy {
 
 var labelRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$`)
 
+// validateNodeName is the ONE rule for a node identifier, wherever it appears:
+// node.name, nodes[].name, and tiers[].node all name hosts in a single
+// namespace, so validating them differently lets the same string be a legal
+// host here and an illegal one there.
+//
+// A whitespace-only pin is what made that concrete. This package treated it as
+// "pinned" — a macOS tier satisfied the must-name-a-node rule and inherited a
+// concurrency default from it — while the allocator trimmed it to empty and
+// rejected the same tier. On a Linux tier the trim silently turned a pin into
+// no pin at all, which is a placement decision changed by whitespace.
+func validateNodeName(where, name string) error {
+	if !labelRe.MatchString(name) {
+		return fmt.Errorf("%s: node name %q must match %s", where, name, labelRe)
+	}
+
+	return nil
+}
+
 // Load reads and validates a config file.
 func Load(path string) (*Config, error) {
 	f, err := os.Open(path)
@@ -406,10 +424,24 @@ func (c *Config) applyDefaults() {
 			c.Server.StateDir = defaultStateDir("server")
 		}
 	}
+	// Node names are normalized FIRST, before anything looks one up. A pin that
+	// differs from its fleet entry only by surrounding whitespace would
+	// otherwise fail to match it, and the tier would silently inherit fleet-wide
+	// defaults instead of that host's policy.
+	for i := range c.Nodes {
+		c.Nodes[i].Name = strings.TrimSpace(c.Nodes[i].Name)
+	}
+
+	for i := range c.Tiers {
+		c.Tiers[i].Node = strings.TrimSpace(c.Tiers[i].Node)
+	}
+
 	if c.Node != nil {
+		c.Node.Name = strings.TrimSpace(c.Node.Name)
+
 		if c.Node.Name == "" {
 			if h, err := os.Hostname(); err == nil {
-				c.Node.Name = h
+				c.Node.Name = strings.TrimSpace(h)
 			}
 		}
 		if c.Node.StateDir == "" {
@@ -417,6 +449,16 @@ func (c *Config) applyDefaults() {
 		}
 		if c.Node.ServerAddr == "" && c.Server != nil {
 			c.Node.ServerAddr = c.Server.Listen
+		}
+
+		// A fleet entry for THIS host that omits its provider takes the local
+		// one. Without it the unpinned-tier check compares against an empty
+		// provider and skips the host entirely — and in single-box mode that is
+		// the only host there is.
+		for i := range c.Nodes {
+			if p := &c.Nodes[i]; p.Name == c.Node.Name && p.Provider == "" {
+				p.Provider = c.Node.Provider
+			}
 		}
 	}
 	for i := range c.Tiers {
@@ -427,8 +469,11 @@ func (c *Config) applyDefaults() {
 		// otherwise stamp `firecracker` onto a tier pinned to a Mac, producing a
 		// contradiction the operator never wrote. Pinning names a host, and that
 		// host's declared provider is the more specific answer.
+		// Only a VALID provider is inherited. Copying an unknown one produces a
+		// second diagnostic blaming a field the operator never supplied, for a
+		// typo they made once somewhere else.
 		if t.Provider == "" && t.Node != "" {
-			if p, declared := c.NodePolicyFor(t.Node); declared {
+			if p, declared := c.NodePolicyFor(t.Node); declared && p.Provider.Valid() {
 				t.Provider = p.Provider
 			}
 		}
@@ -538,8 +583,8 @@ func (c *Config) validateNode() []error {
 	if !c.Node.Provider.Valid() {
 		errs = append(errs, fmt.Errorf("node.provider %q is not one of %v", c.Node.Provider, allProviders))
 	}
-	if strings.TrimSpace(c.Node.Name) == "" {
-		errs = append(errs, errors.New("node.name is required and must not be blank"))
+	if err := validateNodeName("node.name", c.Node.Name); err != nil {
+		errs = append(errs, err)
 	}
 	if c.Node.StateDir == "" {
 		errs = append(errs, errors.New("node.state_dir is required"))
@@ -612,6 +657,13 @@ func (c *Config) validateTiers() []error {
 			errs = append(errs, fmt.Errorf(
 				"%s: warm_pool %d exceeds max_concurrent %d; warm instances count against the cap",
 				where, t.WarmPool, t.MaxConcurrent))
+		}
+
+		// A pin names a host, so it obeys the same rule as any other node name.
+		if t.Node != "" {
+			if err := validateNodeName(where, t.Node); err != nil {
+				errs = append(errs, err)
+			}
 		}
 
 		errs = append(errs, c.validateGuestOSRules(where, t)...)
@@ -765,8 +817,8 @@ func (c *Config) validateNodes() []error {
 			where = fmt.Sprintf("node %q", p.Name)
 		}
 
-		if !labelRe.MatchString(p.Name) {
-			errs = append(errs, fmt.Errorf("%s: name must match %s", where, labelRe))
+		if err := validateNodeName(where, p.Name); err != nil {
+			errs = append(errs, err)
 		}
 		if _, dup := seen[p.Name]; dup {
 			// Two entries for one host means one of them is silently ignored,
@@ -788,6 +840,18 @@ func (c *Config) validateNodes() []error {
 				errs = append(errs, fmt.Errorf("%s: duplicate guest_os %q", where, g))
 			}
 			guests[g] = struct{}{}
+		}
+
+		// The local node section and a fleet entry for the SAME host describe one
+		// machine. Letting them disagree means the unpinned-tier check compares
+		// against a provider the machine does not run and skips it — and in
+		// single-box mode that is the only host there is, so every tier looks
+		// placeable and none is.
+		if c.Node != nil && p.Name == c.Node.Name &&
+			p.Provider != "" && c.Node.Provider != "" && p.Provider != c.Node.Provider {
+			errs = append(errs, fmt.Errorf(
+				"%s: provider %s contradicts node.provider %s for the same host",
+				where, p.Provider, c.Node.Provider))
 		}
 
 		if p.MacOSVMLimit == nil {

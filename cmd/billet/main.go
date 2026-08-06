@@ -225,18 +225,28 @@ func cmdCheck(ctx context.Context, args []string) error {
 	for i := range cfg.Nodes {
 		p := &cfg.Nodes[i]
 
-		guests := "any guest_os"
+		provider := "provider unset"
+		if p.Provider != "" {
+			provider = string(p.Provider)
+		}
+
+		guests := "no guest_os allowlist"
 		if len(p.GuestOS) > 0 {
 			guests = fmt.Sprintf("guest_os %v", p.GuestOS)
 		}
 
-		// Say WHERE the number came from. A host whose allowlist excludes macOS
-		// has an effective limit of zero, and reporting that as "0 (default)"
-		// reads as though billet's default were zero — sending an operator to
-		// the wrong field when they wonder why nothing schedules.
+		// Say WHERE the number came from, and do not report a macOS capability
+		// the host cannot have. A Firecracker host printed "max 2 macOS (Apple
+		// default)", which is true of the config field and false of the machine:
+		// macOS guests need Apple hardware, so only the Tart provider can run
+		// them. And a host whose allowlist excludes macOS has an effective limit
+		// of zero — reporting that as "0 (default)" reads as though billet's
+		// default were zero, sending the operator to the wrong field entirely.
 		var macOS string
 
 		switch {
+		case p.Provider != "" && p.Provider != config.ProviderTart:
+			macOS = fmt.Sprintf("macOS n/a (%s cannot run macOS guests)", p.Provider)
 		case !p.AllowsGuestOS(config.GuestMacOS):
 			macOS = "no macOS (excluded by guest_os)"
 		case p.MacOSVMLimit == nil:
@@ -245,7 +255,7 @@ func cmdCheck(ctx context.Context, args []string) error {
 			macOS = fmt.Sprintf("max %d macOS", p.MacOSLimit())
 		}
 
-		fmt.Printf("  policy %-20s %-24s %s\n", p.Name, guests, macOS)
+		fmt.Printf("  policy %-14s %-12s %-24s %s\n", p.Name, provider, guests, macOS)
 	}
 
 	fmt.Printf("tiers    %d\n", len(cfg.Tiers))
