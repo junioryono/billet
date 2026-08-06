@@ -242,30 +242,6 @@ func cmdInit(_ context.Context, args []string) error {
 	return fmt.Errorf("%w: writes a billet.yaml after asking for a provider and tier shapes", errNotImplemented)
 }
 
-func cmdGitHubApp(_ context.Context, args []string) error {
-	if len(args) == 0 {
-		return errors.New("usage: billet github-app create --org <org>")
-	}
-	switch args[0] {
-	case "create":
-		fs := newFlagSet("billet github-app create")
-		org := fs.String("org", "", "GitHub organization to create the App for (required)")
-		if err := parse(fs, args[1:]); err != nil {
-			return err
-		}
-		if *org == "" {
-			return errors.New("--org is required")
-		}
-		return fmt.Errorf("%w: App Manifest flow for %s, then the separate install step "+
-			"that yields the installation ID", errNotImplemented, *org)
-	case "-h", "--help":
-		fmt.Println("usage: billet github-app create --org <org>")
-		return nil
-	default:
-		return fmt.Errorf("unknown github-app subcommand %q", args[0])
-	}
-}
-
 func cmdStatus(_ context.Context, args []string) error {
 	fs := newFlagSet("billet status")
 	if err := parse(fs, args); err != nil {

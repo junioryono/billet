@@ -35,6 +35,16 @@ and never edit `AGENTS.md` (you would be editing the `CLAUDE.md` it points to).
 `make check` is the gate. It runs build, vet, gofmt, lint, and `go test -race`. All of it must be
 clean before a commit. There is no "the linter is being annoying" — see the lint section below.
 
+### Every commit gets an independent review before it is pushed
+
+`make check` proves the code compiles and its own tests pass. It cannot tell you the design is wrong.
+**Every commit is reviewed by Codex before being pushed** — before, because publishing unreviewed
+code is the wrong order and billet holds credentials that make a quiet mistake expensive.
+
+The exact invocation, the flags that are load-bearing, and the rule that every finding must be
+validated by hand before acting on it are in the `billet-git-flow` skill. Read it rather than
+improvising the command; several of its details each cost a debugging session to learn.
+
 ---
 
 ## Architecture
