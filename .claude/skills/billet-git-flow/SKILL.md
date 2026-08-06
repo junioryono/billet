@@ -36,6 +36,50 @@ git checkout <branch> && git merge main
 
 History stays append-only, which keeps shared branches safe.
 
+## Every commit gets a Codex review, before it is pushed
+
+This is a standing requirement, not a suggestion for large changes. Publishing
+unreviewed code is the wrong order: a second reader is cheapest before the commit
+is public, and billet holds credentials that make a quiet mistake expensive.
+
+Run it from the repo root, as a **background task** (~3–6 min), and wait for the
+completion notification rather than polling:
+
+```bash
+codex exec -m gpt-5.6-sol -c model_reasoning_effort="high" \
+  --sandbox read-only \
+  -o /tmp/codex-billet-<topic>.md \
+  -C /path/to/billet \
+  "ADVERSARIAL COMMIT REVIEW. HARD RULES: do NOT build, do NOT run tests, do NOT
+   run go build / go test / go vet / gofmt / golangci-lint — read code only.
+   Review the HEAD commit (git show HEAD) and the full files it touches.
+   <state the design intent the change must satisfy>
+   Grade P0 (security hole / data loss / will fail in production) through P3,
+   each with what breaks, why, and a concrete fix. Cite file:line." < /dev/null
+```
+
+Details that each cost a debugging session to learn:
+
+- **The trailing `< /dev/null` is mandatory.** With an open non-TTY stdin — every
+  background shell — `codex exec` prints "Reading additional input from stdin..."
+  and hangs forever. Harmless in the foreground, so always include it.
+- **`--sandbox read-only`, and say "do not build or test" in the prompt.** A
+  `go build` inside a long reasoning run recompiles the tree and is the most
+  common way one of these dies mid-flight. You run every gate yourself anyway.
+- **Pass the model and reasoning effort explicitly.** Never rely on
+  `~/.codex/config.toml` defaults; they vary per machine.
+- **State the design intent in the prompt.** A reviewer that does not know the
+  App key must never be overwritten cannot tell you that it can be.
+- **Write output to a deterministic path** keyed to the topic, so a fresh shell
+  can re-derive it after the notification.
+
+**Validate every finding yourself before acting on it.** Codex grades severity
+and is not always right — across this project's reviews it was correct on
+`zfs promote` semantics, the BuildKit trust boundary and Tart's license, and
+overstated an argument about token validation that did not apply. Open the cited
+`file:line`, decide Confirmed / False positive, and fix what is confirmed. Say in
+the PR which findings were accepted and which were rejected, with the reason.
+
 ## The gate runs before the commit, not after the push
 
 ```bash
