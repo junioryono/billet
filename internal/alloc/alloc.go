@@ -72,6 +72,13 @@ var validTransitions = map[Phase][]Phase{
 // Terminal reports whether a phase releases capacity.
 func (p Phase) Terminal() bool { return p == PhaseDone || p == PhaseFailed }
 
+// requiresPlacement reports whether a phase presumes a host is running the
+// instance. Entering one without a bound, still-legal placement means something
+// launched work the allocator never authorised.
+func requiresPlacement(p Phase) bool {
+	return p == PhaseLaunching || p == PhaseOnline || p == PhaseBusy
+}
+
 func (p Phase) canMoveTo(next Phase) bool {
 	for _, allowed := range validTransitions[p] {
 		if allowed == next {
@@ -112,6 +119,10 @@ var (
 	// ErrNotPlaced means a lease reached a phase that presumes a host without
 	// ever being bound to one.
 	ErrNotPlaced = errors.New("alloc: lease has no bound node")
+	// ErrNotPlaceable means a lease carries too little recorded placement
+	// information to verify a host is legal for it — a row predating the
+	// columns the checks read. It fails closed rather than skipping the checks.
+	ErrNotPlaceable = errors.New("alloc: lease cannot be placed safely")
 )
 
 // Limits is the global ceiling the allocator escrows against.
@@ -268,18 +279,20 @@ func New(db *state.DB, limits Limits, tiers []config.Tier, opts ...Option) (*All
 			return nil, fmt.Errorf("alloc: tier %q has memory %s; headroom divides by it", t.Label, t.Memory)
 		case t.MaxConcurrent < 0:
 			return nil, fmt.Errorf("alloc: tier %q has negative max_concurrent %d", t.Label, t.MaxConcurrent)
-		case t.Provider == "":
-			// Bind skips its provider comparison for leases recording no
-			// provider, which is right for rows predating the column. A tier that
-			// produces NEW such leases would make that check skippable by
-			// construction, so the catalog is refused instead.
+		case !t.Provider.Valid():
+			// A blank provider makes a lease unplaceable; a NONBLANK invalid one
+			// is worse, because it compares unequal to every registered provider
+			// and so strands the lease at bind time with a confusing message.
+			// Both are refused here rather than discovered later.
 			return nil, fmt.Errorf(
-				"alloc: tier %q has no provider; its leases would skip the placement check at bind time",
-				t.Label)
-		case t.GuestOS == "":
-			// Same reasoning: an unset guest OS matches no allowlist, so it would
-			// either strand the lease or, worse, read as a value the host permits.
-			return nil, fmt.Errorf("alloc: tier %q has no guest_os", t.Label)
+				"alloc: tier %q has provider %q, which is not a known backend; its leases could not be placed",
+				t.Label, t.Provider)
+		case !t.GuestOS.Valid():
+			// Same reasoning from the other side: an unknown guest OS matches no
+			// allowlist, so it either strands the lease or reads as a value some
+			// host happens to permit.
+			return nil, fmt.Errorf(
+				"alloc: tier %q has guest_os %q, which is not a known guest OS", t.Label, t.GuestOS)
 		case t.GuestOS == config.GuestMacOS && strings.TrimSpace(t.Node) == "":
 			return nil, fmt.Errorf(
 				"alloc: macOS tier %q names no node; Apple's per-host guest limit cannot be enforced without one",
@@ -386,6 +399,55 @@ func (a *Allocator) Escrow(ctx context.Context, tier string, want int) ([]*Lease
 	}
 
 	return leases, nil
+}
+
+// checkPlacement reports whether a lease may run on a node, under the policy in
+// force RIGHT NOW.
+//
+// Called from Bind and again on entry to launching, deliberately. Binding is not
+// launching: a lease can be bound while still in `capacity`, so a policy that
+// tightens in between would otherwise let an instance start on a host that no
+// longer permits it — the check having passed at a moment that has since become
+// irrelevant. Re-checking at the launch boundary is what makes the guarantee
+// "this placement is legal now" rather than "was legal once".
+func (a *Allocator) checkPlacement(ctx context.Context, tx *sql.Tx, lease *Lease, node string) error {
+	if !a.allowsGuestOS(node, lease.GuestOS) {
+		return fmt.Errorf("%w: lease %s is a %s guest and node %q does not permit that guest OS",
+			ErrGuestOSNotAllowed, lease.ID, lease.GuestOS, node)
+	}
+
+	// A lease predating the provider column records "", so there is nothing to
+	// compare and it FAILS CLOSED. Tolerating it would be a bypass rather than a
+	// courtesy: such a lease may still be unbound, so it is not old work already
+	// placed — it is unplaced work whose backend nothing can verify, free to bind
+	// to a host running anything. The same rows are the ones migration 7 cannot
+	// reliably classify by guest OS either, since macos_slot only became truthful
+	// at migration 5.
+	if lease.Provider == "" {
+		return fmt.Errorf(
+			"%w: lease %s predates provider recording and cannot be placed safely; reap it",
+			ErrNotPlaceable, lease.ID)
+	}
+
+	// The node's REGISTERED provider, not one from config: a Firecracker lease
+	// cannot run on a Tart host, and the registration is what the host itself
+	// reported rather than what a catalog claims about it.
+	var registered string
+
+	switch err := tx.QueryRowContext(ctx,
+		`SELECT provider FROM nodes WHERE name = ?`, node).Scan(&registered); {
+	case errors.Is(err, sql.ErrNoRows):
+		return fmt.Errorf("%w: node %q is not registered", ErrWrongNode, node)
+	case err != nil:
+		return fmt.Errorf("alloc: read node %s: %w", node, err)
+	}
+
+	if registered != string(lease.Provider) {
+		return fmt.Errorf("%w: lease %s needs provider %q but node %q runs %q",
+			ErrWrongProvider, lease.ID, lease.Provider, node, registered)
+	}
+
+	return nil
 }
 
 // macOSLimit is the cap on concurrent macOS guests for a host. See Limits.Nodes
@@ -655,33 +717,8 @@ func (a *Allocator) Bind(ctx context.Context, leaseID string, epoch int64, node 
 		//
 		// The guest OS comes from the lease's own column, not the live catalog,
 		// so a tier redefined underneath an in-flight lease cannot reclassify it.
-		if !a.allowsGuestOS(node, lease.GuestOS) {
-			return fmt.Errorf("%w: lease %s is a %s guest and node %q does not permit that guest OS",
-				ErrGuestOSNotAllowed, leaseID, lease.GuestOS, node)
-		}
-
-		// The node's REGISTERED provider, not one from config: a Firecracker
-		// lease cannot run on a Tart host, and the registration is what the host
-		// itself reported rather than what a catalog claims about it.
-		//
-		// Leases predating the provider column carry "" and are not checked;
-		// there is nothing recorded to compare, and refusing them would strand
-		// work that was already legitimately placed.
-		if lease.Provider != "" {
-			var registered string
-
-			switch err := tx.QueryRowContext(ctx,
-				`SELECT provider FROM nodes WHERE name = ?`, node).Scan(&registered); {
-			case errors.Is(err, sql.ErrNoRows):
-				return fmt.Errorf("%w: node %q is not registered", ErrWrongNode, node)
-			case err != nil:
-				return fmt.Errorf("alloc: read node %s: %w", node, err)
-			}
-
-			if registered != string(lease.Provider) {
-				return fmt.Errorf("%w: lease %s needs provider %q but node %q runs %q",
-					ErrWrongProvider, leaseID, lease.Provider, node, registered)
-			}
+		if err := a.checkPlacement(ctx, tx, lease, node); err != nil {
+			return err
 		}
 
 		if _, err := tx.ExecContext(ctx,
@@ -884,15 +921,27 @@ func (a *Allocator) transition(ctx context.Context, leaseID string, epoch int64,
 			return fmt.Errorf("%w: %s -> %s", ErrBadTransition, lease.Phase, to)
 		}
 
-		// Launching means a host is already bringing the instance up, so a lease
-		// that reaches it without a bound node was placed by something that never
-		// told the allocator where. That makes Bind — and therefore every
-		// placement check it performs, the guest-OS allowlist included — optional
-		// rather than an unavoidable gate. Requiring the node here is what makes
-		// those checks impossible to route around.
-		if to == PhaseLaunching && lease.Node == "" {
-			return fmt.Errorf("%w: lease %s cannot enter %s; bind it to a node first",
-				ErrNotPlaced, leaseID, to)
+		// Every phase from launching onwards presumes a host is running the
+		// instance, so each requires a bound node — not just launching. Covering
+		// only the launching edge would leave a row written by an older binary
+		// with phase='launching' and node=NULL free to walk on to online.
+		//
+		// A lease that reaches these phases unbound was placed by something that
+		// never told the allocator where, which makes Bind — and every placement
+		// check inside it — optional rather than an unavoidable gate.
+		if requiresPlacement(to) {
+			if lease.Node == "" {
+				return fmt.Errorf("%w: lease %s cannot enter %s; bind it to a node first",
+					ErrNotPlaced, leaseID, to)
+			}
+
+			// Re-checked against CURRENT policy rather than trusted from bind
+			// time. Binding is not launching: a lease may be bound while still in
+			// `capacity`, and a policy tightened in between would otherwise let
+			// the instance start on a host that no longer permits it.
+			if err := a.checkPlacement(ctx, tx, lease, lease.Node); err != nil {
+				return err
+			}
 		}
 
 		now := a.now().UTC()

@@ -129,20 +129,58 @@ func TestLeaseGuestOSDefaultsToLinux(t *testing.T) {
 	}
 }
 
+// openAt opens a database migrated only as far as a given version, so an upgrade
+// can be tested as an upgrade.
+//
+// Swapping the package-level list is what makes this faithful: the real migrate
+// runner does the work, in one transaction, with its real bookkeeping. Replaying
+// a migration's SQL by hand against an already-current database tests the string
+// rather than the runner, and would stay green if the runner mishandled the
+// upgrade entirely.
+func openAt(t *testing.T, dir string, version int) *DB {
+	t.Helper()
+
+	full := migrations
+
+	t.Cleanup(func() { migrations = full })
+
+	var truncated []migration
+
+	for _, m := range full {
+		if m.Version <= version {
+			truncated = append(truncated, m)
+		}
+	}
+
+	migrations = truncated
+
+	db, err := Open(t.Context(), dir)
+	if err != nil {
+		t.Fatalf("Open at version %d: %v", version, err)
+	}
+
+	migrations = full
+
+	return db
+}
+
 // Migration 6 backfilled EVERY pre-existing lease to 'linux', macOS ones
 // included. That direction is dangerous rather than merely wrong: an unbound
 // macOS lease relabelled Linux would be PERMITTED onto a Linux-only host, even
 // though its durable macos_slot proves what it is. Migration 7 corrects it from
-// macos_slot, which is the authoritative record.
+// macos_slot.
+//
+// Driven as a real v6 -> v7 upgrade rather than by replaying the UPDATE.
 func TestMacOSLeasesAreBackfilledFromTheirSlot(t *testing.T) {
-	db := open(t)
+	dir := t.TempDir()
 	ctx := t.Context()
 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 
-	// Reproduce the post-migration-6 state a version-5 database would land in:
-	// a macOS lease carrying macos_slot=1 but labelled linux.
-	if err := db.Tx(ctx, func(tx *sql.Tx) error {
+	// A version-6 database holding a macOS lease that migration 6 mislabelled.
+	old := openAt(t, dir, 6)
+
+	if err := old.Tx(ctx, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx,
 			`INSERT INTO leases (id, tier, phase, vcpu, memory, epoch, macos_slot, guest_os,
 			                     created_at, heartbeat_at, expires_at)
@@ -153,26 +191,17 @@ func TestMacOSLeasesAreBackfilledFromTheirSlot(t *testing.T) {
 		t.Fatalf("insert mislabelled macOS lease: %v", err)
 	}
 
-	// Apply migration 7's backfill exactly as recorded.
-	var backfill string
-
-	for _, m := range migrations {
-		if m.Version == 7 {
-			backfill = m.Stmts[0]
-		}
+	if err := old.Close(); err != nil {
+		t.Fatalf("close v6 database: %v", err)
 	}
 
-	if backfill == "" {
-		t.Fatal("migration 7 not found")
+	// Reopening with the full list runs migration 7 for real.
+	db, err := Open(ctx, dir)
+	if err != nil {
+		t.Fatalf("upgrade to current: %v", err)
 	}
 
-	if err := db.Tx(ctx, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, backfill)
-
-		return err
-	}); err != nil {
-		t.Fatalf("apply backfill: %v", err)
-	}
+	t.Cleanup(func() { _ = db.Close() })
 
 	var guestOS string
 	if err := db.Reader().QueryRowContext(ctx,
@@ -182,6 +211,25 @@ func TestMacOSLeasesAreBackfilledFromTheirSlot(t *testing.T) {
 
 	if guestOS != "macos" {
 		t.Errorf("guest_os = %q for a lease holding a macOS slot, want %q", guestOS, "macos")
+	}
+}
+
+// The upgrade helper is only meaningful if it really stops short. If openAt
+// silently applied everything, the test above would be checking a fresh database
+// and would pass no matter what migration 7 did.
+func TestOpenAtStopsAtTheRequestedVersion(t *testing.T) {
+	db := openAt(t, t.TempDir(), 6)
+
+	t.Cleanup(func() { _ = db.Close() })
+
+	var version int
+	if err := db.Reader().QueryRowContext(t.Context(),
+		`SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil {
+		t.Fatalf("read applied versions: %v", err)
+	}
+
+	if version != 6 {
+		t.Errorf("openAt(6) migrated to %d, want 6", version)
 	}
 }
 

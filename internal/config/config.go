@@ -88,12 +88,12 @@ type NodePolicy struct {
 // against the field that holds it, rather than a second one phrased as an
 // allowlist mismatch.
 func (p NodePolicy) policyEnumsValid() bool {
-	if p.Provider != "" && !p.Provider.valid() {
+	if p.Provider != "" && !p.Provider.Valid() {
 		return false
 	}
 
 	for _, g := range p.GuestOS {
-		if !g.valid() {
+		if !g.Valid() {
 			return false
 		}
 	}
@@ -211,7 +211,9 @@ const (
 
 var allProviders = []ProviderKind{ProviderFirecracker, ProviderTart, ProviderEC2, ProviderDocker}
 
-func (p ProviderKind) valid() bool {
+// Valid reports whether this is a known provider. Exported because alloc.New
+// must reject a catalog it cannot prove came through Load.
+func (p ProviderKind) Valid() bool {
 	for _, k := range allProviders {
 		if p == k {
 			return true
@@ -234,7 +236,8 @@ const (
 
 var allGuestOS = []GuestOS{GuestLinux, GuestMacOS, GuestWindows}
 
-func (g GuestOS) valid() bool {
+// Valid reports whether this is a known guest OS.
+func (g GuestOS) Valid() bool {
 	for _, k := range allGuestOS {
 		if g == k {
 			return true
@@ -520,7 +523,7 @@ func (c *Config) validateNode() []error {
 		return nil
 	}
 	var errs []error
-	if !c.Node.Provider.valid() {
+	if !c.Node.Provider.Valid() {
 		errs = append(errs, fmt.Errorf("node.provider %q is not one of %v", c.Node.Provider, allProviders))
 	}
 	if strings.TrimSpace(c.Node.Name) == "" {
@@ -564,10 +567,10 @@ func (c *Config) validateTiers() []error {
 		}
 		seen[t.Label] = struct{}{}
 
-		if !t.Provider.valid() {
+		if !t.Provider.Valid() {
 			errs = append(errs, fmt.Errorf("%s: provider %q is not one of %v", where, t.Provider, allProviders))
 		}
-		if !t.GuestOS.valid() {
+		if !t.GuestOS.Valid() {
 			errs = append(errs, fmt.Errorf("%s: guest_os %q is not one of %v", where, t.GuestOS, allGuestOS))
 		}
 		if t.VCPU <= 0 {
@@ -611,7 +614,7 @@ func (c *Config) validateGuestOSRules(where string, t *Tier) []error {
 	// value: the value itself is already reported, and comparing a typo against
 	// an allowlist produces a second diagnostic describing the same mistake in
 	// terms that send the reader to the wrong field.
-	if !t.GuestOS.valid() {
+	if !t.GuestOS.Valid() || !t.Provider.Valid() {
 		return errs
 	}
 
@@ -760,13 +763,13 @@ func (c *Config) validateNodes() []error {
 		}
 		seen[p.Name] = struct{}{}
 
-		if p.Provider != "" && !p.Provider.valid() {
+		if p.Provider != "" && !p.Provider.Valid() {
 			errs = append(errs, fmt.Errorf("%s: provider %q is not one of %v", where, p.Provider, allProviders))
 		}
 
 		guests := make(map[GuestOS]struct{}, len(p.GuestOS))
 		for _, g := range p.GuestOS {
-			if !g.valid() {
+			if !g.Valid() {
 				errs = append(errs, fmt.Errorf("%s: guest_os %q is not one of %v", where, g, allGuestOS))
 			}
 			if _, dup := guests[g]; dup {

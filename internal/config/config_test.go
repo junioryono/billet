@@ -670,9 +670,28 @@ func TestNegativeNodeLimitDoesNotCascade(t *testing.T) {
 	// appear stays green when a NEW second diagnostic arrives with different
 	// wording, which is exactly the cascade this guards against.
 	const want = `node "mac-mini-1": macos_vm_limit must not be negative`
-	if got := strings.TrimPrefix(err.Error(), "invalid config "); !strings.HasSuffix(got, want) {
-		t.Errorf("want exactly one diagnostic ending %q, got:\n%v", want, err)
+	// Exact, not a suffix: a suffix match permits arbitrary diagnostics BEFORE
+	// the expected one, which is precisely the cascade this test exists to
+	// detect.
+	if got := lastLine(err); got != want {
+		t.Errorf("want exactly one diagnostic %q, got:\n%v", want, err)
 	}
+}
+
+// lastLine strips the "invalid config <path>: " prefix errors.Join composes and
+// returns what remains, so a test can assert one whole diagnostic.
+func lastLine(err error) string {
+	lines := strings.Split(err.Error(), "\n")
+	if len(lines) != 1 {
+		return err.Error() // more than one diagnostic; return it all so the failure shows them
+	}
+
+	_, msg, found := strings.Cut(lines[0], ".yaml: ")
+	if !found {
+		return lines[0]
+	}
+
+	return msg
 }
 
 // A pinned tier whose provider differs from its host's loads cleanly and can
@@ -729,8 +748,39 @@ func TestInvalidNodeGuestOSDoesNotCascadeIntoTierErrors(t *testing.T) {
 	if err == nil {
 		t.Fatal("Load accepted an unknown guest_os in a node allowlist")
 	}
+	// Both halves matter: the required diagnostic must be present, AND the
+	// cascade must be absent. Asserting only the absence passes when validation
+	// reports nothing useful at all.
+	if !strings.Contains(err.Error(), "is not one of") {
+		t.Errorf("error should report the unknown value, got: %v", err)
+	}
 	if strings.Contains(err.Error(), "allowlist") {
 		t.Errorf("an unknown node guest_os cascaded into a tier diagnostic, got: %v", err)
+	}
+}
+
+// The same short-circuit must cover an invalid PROVIDER, not just guest_os: a
+// pinned tier with a nonsense provider otherwise gets both the primary
+// diagnostic and a relational "runs tart" one describing the same typo.
+func TestInvalidTierProviderDoesNotCascade(t *testing.T) {
+	body := validConfig + `
+  - label: billet-4vcpu-bad-provider
+    provider: nonsense
+    guest_os: linux
+    node: mac-mini-1
+    vcpu: 4
+    memory: 12GiB
+    image: ubuntu-2404-arm64
+` + nodesSection("    provider: tart\n    guest_os: [linux]\n")
+	_, err := Load(writeConfig(t, body))
+	if err == nil {
+		t.Fatal("Load accepted an unknown provider")
+	}
+	if !strings.Contains(err.Error(), "is not one of") {
+		t.Errorf("error should report the unknown provider, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "which runs") {
+		t.Errorf("an unknown provider cascaded into a pinning diagnostic, got: %v", err)
 	}
 }
 

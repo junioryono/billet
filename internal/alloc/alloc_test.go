@@ -1336,11 +1336,42 @@ func TestLaunchingRequiresABoundNode(t *testing.T) {
 	}
 }
 
-// Bind skips the provider comparison when a lease records no provider, which is
-// correct for rows predating the column but would be a hole if a NEW lease could
-// be written that way — the check would be skippable by construction. New must
-// therefore refuse a catalog that would produce one.
-func TestNewRejectsATierWithNoProvider(t *testing.T) {
+// A lease whose placement facts cannot be verified must fail closed. Tolerating
+// a blank provider would be a bypass rather than a courtesy: such a lease may
+// still be UNBOUND, so it is not old work already placed — it is unplaced work
+// whose backend nothing can check, free to bind to a host running anything.
+func TestUnverifiableLegacyLeaseFailsClosed(t *testing.T) {
+	a := newAllocator(t,
+		Limits{MaxVCPU: 64, MaxMemory: 128 * config.GiB},
+		[]config.Tier{tier("small", 4, 16*config.GiB)})
+
+	ctx := t.Context()
+
+	registerNode(t, a, "epyc-1", config.ProviderFirecracker)
+
+	lease, err := a.Reserve(ctx, "small")
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	// Reproduce a row written before the provider column existed.
+	if err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE leases SET provider = '' WHERE id = ?`, lease.ID)
+
+		return err
+	}); err != nil {
+		t.Fatalf("blank the provider: %v", err)
+	}
+
+	if err := a.Bind(ctx, lease.ID, lease.Epoch, "epyc-1"); !errors.Is(err, ErrNotPlaceable) {
+		t.Errorf("bind of a lease with no recorded provider = %v, want ErrNotPlaceable", err)
+	}
+}
+
+// New must refuse a catalog whose leases could not be placed. A blank provider
+// makes them unverifiable; a NONBLANK invalid one is worse, comparing unequal to
+// every registered provider and stranding the lease at bind time.
+func TestNewRejectsUnplaceableTiers(t *testing.T) {
 	db, err := state.Open(t.Context(), t.TempDir())
 	if err != nil {
 		t.Fatalf("state.Open: %v", err)
@@ -1348,12 +1379,126 @@ func TestNewRejectsATierWithNoProvider(t *testing.T) {
 
 	defer db.Close()
 
-	blank := tier("small", 4, 16*config.GiB)
-	blank.Provider = ""
+	for name, mutate := range map[string]func(*config.Tier){
+		"blank provider":   func(t *config.Tier) { t.Provider = "" },
+		"unknown provider": func(t *config.Tier) { t.Provider = config.ProviderKind("bogus") },
+		"blank guest_os":   func(t *config.Tier) { t.GuestOS = "" },
+		"unknown guest_os": func(t *config.Tier) { t.GuestOS = config.GuestOS("plan9") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			bad := tier("small", 4, 16*config.GiB)
+			mutate(&bad)
 
-	if _, err := New(db, Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB},
-		[]config.Tier{blank}); err == nil {
-		t.Error("New accepted a tier with no provider; its leases would skip the Bind provider check")
+			if _, err := New(db, Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB},
+				[]config.Tier{bad}); err == nil {
+				t.Errorf("New accepted a tier with %s", name)
+			}
+		})
+	}
+}
+
+// Binding is NOT launching: a lease can be bound while still in `capacity`, so a
+// policy tightened in between must not let the instance start anyway. The check
+// has to run against policy in force at the launch boundary, not be trusted from
+// whenever the bind happened.
+func TestLaunchingRevalidatesCurrentPolicy(t *testing.T) {
+	linux := config.Tier{
+		Label: "linux-arm", Provider: config.ProviderTart, GuestOS: config.GuestLinux,
+		VCPU: 4, Memory: 12 * config.GiB, Image: "ubuntu-2404-arm64",
+	}
+
+	db, err := state.Open(t.Context(), t.TempDir())
+	if err != nil {
+		t.Fatalf("state.Open: %v", err)
+	}
+
+	defer db.Close()
+
+	open := Limits{MaxVCPU: 256, MaxMemory: 512 * config.GiB}
+
+	before, err := New(db, open, []config.Tier{linux})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ctx := t.Context()
+
+	registerNode(t, before, "mac-mini-1", config.ProviderTart)
+
+	lease, err := before.Reserve(ctx, "linux-arm")
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	// Bound while still in `capacity` — nothing is running yet.
+	if err := before.Bind(ctx, lease.ID, lease.Epoch, "mac-mini-1"); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	tightened := Limits{
+		MaxVCPU: 256, MaxMemory: 512 * config.GiB,
+		Nodes: map[string]config.NodePolicy{
+			"mac-mini-1": {Name: "mac-mini-1", GuestOS: []config.GuestOS{config.GuestMacOS}},
+		},
+	}
+
+	after, err := New(db, tightened, []config.Tier{linux})
+	if err != nil {
+		t.Fatalf("New after tightening: %v", err)
+	}
+
+	if err := after.Assign(ctx, lease.ID, lease.Epoch, 1, 2); err != nil {
+		t.Fatalf("Assign: %v", err)
+	}
+
+	if err := after.Advance(ctx, lease.ID, lease.Epoch, PhaseLaunching); !errors.Is(err, ErrGuestOSNotAllowed) {
+		t.Errorf("launching onto a now-forbidden host = %v, want ErrGuestOSNotAllowed", err)
+	}
+}
+
+// A row written by an older binary can sit in `launching` with no bound node.
+// Gating only the launching EDGE would let it walk on to online untouched.
+func TestOnlineRequiresABoundNode(t *testing.T) {
+	a := newAllocator(t,
+		Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB},
+		[]config.Tier{tier("small", 4, 16*config.GiB)})
+
+	ctx := t.Context()
+
+	lease, err := a.Reserve(ctx, "small")
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	// Reproduce the legacy row directly: launching, never bound.
+	if err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx,
+			`UPDATE leases SET phase = 'launching', node = NULL WHERE id = ?`, lease.ID)
+
+		return err
+	}); err != nil {
+		t.Fatalf("seed legacy row: %v", err)
+	}
+
+	if err := a.Advance(ctx, lease.ID, lease.Epoch, PhaseOnline); !errors.Is(err, ErrNotPlaced) {
+		t.Errorf("online from an unbound launching row = %v, want ErrNotPlaced", err)
+	}
+}
+
+// The launch gate is only unavoidable while launching is the ONLY way into the
+// running phases. Asserting that here means adding an assigned -> online edge
+// breaks this test rather than silently opening a route around the gate.
+func TestRunningPhasesAreReachableOnlyThroughLaunching(t *testing.T) {
+	for from, allowed := range validTransitions {
+		for _, to := range allowed {
+			if !requiresPlacement(to) || from == PhaseLaunching || requiresPlacement(from) {
+				continue
+			}
+
+			if to != PhaseLaunching {
+				t.Errorf("%s -> %s enters a running phase without passing through launching", from, to)
+			}
+		}
 	}
 }
 
