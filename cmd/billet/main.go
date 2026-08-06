@@ -219,6 +219,35 @@ func cmdCheck(ctx context.Context, args []string) error {
 		fmt.Printf("node     %s via %s -> %s\n", cfg.Node.Name, cfg.Node.Provider, cfg.Node.ServerAddr)
 	}
 
+	// Per-host policy decides what each machine may run and how many macOS
+	// guests it may hold. Validating it without showing it means an operator who
+	// restricted a host has no way to confirm billet read what they meant.
+	for i := range cfg.Nodes {
+		p := &cfg.Nodes[i]
+
+		guests := "any guest_os"
+		if len(p.GuestOS) > 0 {
+			guests = fmt.Sprintf("guest_os %v", p.GuestOS)
+		}
+
+		// Say WHERE the number came from. A host whose allowlist excludes macOS
+		// has an effective limit of zero, and reporting that as "0 (default)"
+		// reads as though billet's default were zero — sending an operator to
+		// the wrong field when they wonder why nothing schedules.
+		var macOS string
+
+		switch {
+		case !p.AllowsGuestOS(config.GuestMacOS):
+			macOS = "no macOS (excluded by guest_os)"
+		case p.MacOSVMLimit == nil:
+			macOS = fmt.Sprintf("max %d macOS (Apple default)", p.MacOSLimit())
+		default:
+			macOS = fmt.Sprintf("max %d macOS", p.MacOSLimit())
+		}
+
+		fmt.Printf("  policy %-20s %-24s %s\n", p.Name, guests, macOS)
+	}
+
 	fmt.Printf("tiers    %d\n", len(cfg.Tiers))
 
 	for i := range cfg.Tiers {

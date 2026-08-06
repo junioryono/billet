@@ -304,6 +304,15 @@ func TestLifecycleTransitions(t *testing.T) {
 		t.Fatalf("Assign: %v", err)
 	}
 
+	// Binding is part of the lifecycle, not an optional extra: launching means a
+	// host is already bringing the instance up. This test previously skipped it,
+	// which is what made Bind's placement checks routable-around.
+	registerNode(t, a, "epyc-1", config.ProviderFirecracker)
+
+	if err := a.Bind(ctx, lease.ID, lease.Epoch, "epyc-1"); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
 	for _, next := range []Phase{PhaseLaunching, PhaseOnline, PhaseBusy} {
 		if err := a.Advance(ctx, lease.ID, lease.Epoch, next); err != nil {
 			t.Fatalf("Advance to %s: %v", next, err)
@@ -532,8 +541,8 @@ func TestBindRefusesTheWrongNode(t *testing.T) {
 
 	ctx := t.Context()
 
-	registerNode(t, a, "mac-mini-1")
-	registerNode(t, a, "mac-mini-2")
+	registerNode(t, a, "mac-mini-1", config.ProviderTart)
+	registerNode(t, a, "mac-mini-2", config.ProviderTart)
 
 	lease, err := a.Reserve(ctx, "mac-6")
 	if err != nil {
@@ -603,13 +612,17 @@ func TestMacOSAccountingSurvivesCatalogChange(t *testing.T) {
 }
 
 // registerNode inserts a node row so leases can satisfy the foreign key on bind.
-func registerNode(t *testing.T, a *Allocator, name string) {
+//
+// The provider is explicit because Bind compares a lease's recorded provider
+// against what the host REGISTERED: a helper that always claimed one backend
+// would make every test agree with itself by construction.
+func registerNode(t *testing.T, a *Allocator, name string, provider config.ProviderKind) {
 	t.Helper()
 
 	if err := a.db.Tx(t.Context(), func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(t.Context(),
-			`INSERT INTO nodes (name, provider, last_seen_at) VALUES (?, 'tart', ?)`,
-			name, ts(time.Now()))
+			`INSERT INTO nodes (name, provider, last_seen_at) VALUES (?, ?, ?)`,
+			name, string(provider), ts(time.Now()))
 
 		return err
 	}); err != nil {
@@ -1114,7 +1127,7 @@ func TestNodePolicyGuestOSSliceIsCopied(t *testing.T) {
 
 	ctx := t.Context()
 
-	registerNode(t, a, "mac-mini-1")
+	registerNode(t, a, "mac-mini-1", config.ProviderTart)
 
 	lease, err := a.Reserve(ctx, "linux-arm")
 	if err != nil {
@@ -1148,7 +1161,7 @@ func TestBindRefusesAGuestOSTheHostDisallows(t *testing.T) {
 
 	ctx := t.Context()
 
-	registerNode(t, a, "mac-mini-1")
+	registerNode(t, a, "mac-mini-1", config.ProviderTart)
 
 	lease, err := a.Reserve(ctx, "linux-arm")
 	if err != nil {
@@ -1188,7 +1201,7 @@ func TestBindRetryStaysIdempotentAfterPolicyTightens(t *testing.T) {
 
 	ctx := t.Context()
 
-	registerNode(t, before, "mac-mini-1")
+	registerNode(t, before, "mac-mini-1", config.ProviderTart)
 
 	lease, err := before.Reserve(ctx, "linux-arm")
 	if err != nil {
@@ -1229,7 +1242,7 @@ func TestBindAllowsAnUndeclaredHost(t *testing.T) {
 
 	ctx := t.Context()
 
-	registerNode(t, a, "mac-mini-1")
+	registerNode(t, a, "mac-mini-1", config.ProviderTart)
 
 	lease, err := a.Reserve(ctx, "linux-arm")
 	if err != nil {
@@ -1245,10 +1258,15 @@ func TestBindAllowsAnUndeclaredHost(t *testing.T) {
 // underneath an in-flight lease cannot reclassify what it is allowed to bind
 // to — the same reason target_node and macos_slot are stored rather than
 // re-derived.
+//
+// Deliberately reserves a macOS lease rather than a Linux one. 'linux' is the
+// schema's DEFAULT for the column, so a Linux lease would still read back as
+// Linux even if insertLease stopped writing guest_os at all — the test would
+// stay green with the persistence gone.
 func TestBindReadsGuestOSFromTheLeaseNotTheCatalog(t *testing.T) {
-	linux := config.Tier{
-		Label: "arm", Provider: config.ProviderTart, GuestOS: config.GuestLinux,
-		VCPU: 4, Memory: 12 * config.GiB, Image: "ubuntu-2404-arm64",
+	mac := config.Tier{
+		Label: "shared-label", Provider: config.ProviderTart, GuestOS: config.GuestMacOS,
+		Node: "mac-mini-1", VCPU: 6, Memory: 24 * config.GiB, Image: "macos-26",
 	}
 
 	db, err := state.Open(t.Context(), t.TempDir())
@@ -1259,29 +1277,29 @@ func TestBindReadsGuestOSFromTheLeaseNotTheCatalog(t *testing.T) {
 	defer db.Close()
 
 	policy := map[string]config.NodePolicy{
-		"mac-mini-1": {Name: "mac-mini-1", GuestOS: []config.GuestOS{config.GuestLinux}},
+		"mac-mini-1": {Name: "mac-mini-1", GuestOS: []config.GuestOS{config.GuestMacOS}},
 	}
 	limits := Limits{MaxVCPU: 256, MaxMemory: 512 * config.GiB, Nodes: policy}
 
-	first, err := New(db, limits, []config.Tier{linux})
+	first, err := New(db, limits, []config.Tier{mac})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 
 	ctx := t.Context()
 
-	registerNode(t, first, "mac-mini-1")
+	registerNode(t, first, "mac-mini-1", config.ProviderTart)
 
-	lease, err := first.Reserve(ctx, "arm")
+	lease, err := first.Reserve(ctx, "shared-label")
 	if err != nil {
 		t.Fatalf("Reserve: %v", err)
 	}
 
-	// The same label now describes a macOS tier. The in-flight lease is still a
-	// Linux guest and must still be bindable to a Linux-only host.
-	repurposed := linux
-	repurposed.GuestOS = config.GuestMacOS
-	repurposed.Node = "mac-mini-1"
+	// The same label now describes a LINUX tier. The in-flight lease is still a
+	// macOS guest, and the host permits only macOS — so a bind that consulted the
+	// catalog instead of the lease would be refused.
+	repurposed := mac
+	repurposed.GuestOS = config.GuestLinux
 
 	second, err := New(db, limits, []config.Tier{repurposed})
 	if err != nil {
@@ -1290,6 +1308,52 @@ func TestBindReadsGuestOSFromTheLeaseNotTheCatalog(t *testing.T) {
 
 	if err := second.Bind(ctx, lease.ID, lease.Epoch, "mac-mini-1"); err != nil {
 		t.Errorf("bind = %v; the lease was reclassified by a catalog change", err)
+	}
+}
+
+// Launching means a host is already bringing the instance up. A lease that
+// reaches it unbound was placed by something that never told the allocator
+// where — which makes Bind, and every placement check inside it, optional
+// rather than an unavoidable gate.
+func TestLaunchingRequiresABoundNode(t *testing.T) {
+	a := newAllocator(t,
+		Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB},
+		[]config.Tier{tier("small", 4, 16*config.GiB)})
+
+	ctx := t.Context()
+
+	lease, err := a.Reserve(ctx, "small")
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	if err := a.Assign(ctx, lease.ID, lease.Epoch, 111, 222); err != nil {
+		t.Fatalf("Assign: %v", err)
+	}
+
+	if err := a.Advance(ctx, lease.ID, lease.Epoch, PhaseLaunching); !errors.Is(err, ErrNotPlaced) {
+		t.Errorf("launching an unbound lease = %v, want ErrNotPlaced", err)
+	}
+}
+
+// A Firecracker lease cannot run on a Tart host. The comparison is against the
+// provider the node REGISTERED, not one a catalog claims about it.
+func TestBindRefusesANodeRunningAnotherProvider(t *testing.T) {
+	a := newAllocator(t,
+		Limits{MaxVCPU: 64, MaxMemory: 128 * config.GiB},
+		[]config.Tier{tier("small", 4, 16*config.GiB)}) // firecracker
+
+	ctx := t.Context()
+
+	registerNode(t, a, "mac-mini-1", config.ProviderTart)
+
+	lease, err := a.Reserve(ctx, "small")
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	if err := a.Bind(ctx, lease.ID, lease.Epoch, "mac-mini-1"); !errors.Is(err, ErrWrongProvider) {
+		t.Errorf("bind of a firecracker lease to a tart host = %v, want ErrWrongProvider", err)
 	}
 }
 

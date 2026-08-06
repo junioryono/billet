@@ -106,6 +106,12 @@ var (
 	// Distinct from ErrWrongNode: the lease is not pinned anywhere, the chosen
 	// host simply may not run that kind of guest.
 	ErrGuestOSNotAllowed = errors.New("alloc: node does not permit that guest OS")
+	// ErrWrongProvider means the node runs a different compute backend than the
+	// lease requires — a Firecracker lease cannot run on a Tart host.
+	ErrWrongProvider = errors.New("alloc: node runs a different provider")
+	// ErrNotPlaced means a lease reached a phase that presumes a host without
+	// ever being bound to one.
+	ErrNotPlaced = errors.New("alloc: lease has no bound node")
 )
 
 // Limits is the global ceiling the allocator escrows against.
@@ -143,12 +149,16 @@ type Lease struct {
 	// redefined underneath an in-flight lease cannot reclassify it. Bind checks
 	// it against the target host's allowlist.
 	GuestOS config.GuestOS
-	Phase   Phase
-	VCPU    int
-	Memory  config.ByteSize
-	Epoch   int64
-	RunID   int64
-	JobID   int64
+	// Provider is the backend this lease needs, recorded for the same reason.
+	// Bind compares it against the node's REGISTERED provider: a Firecracker
+	// lease cannot run on a Tart host.
+	Provider config.ProviderKind
+	Phase    Phase
+	VCPU     int
+	Memory   config.ByteSize
+	Epoch    int64
+	RunID    int64
+	JobID    int64
 }
 
 // Usage is the vector of what is currently held.
@@ -494,10 +504,11 @@ func (a *Allocator) insertLease(ctx context.Context, tx *sql.Tx, t config.Tier) 
 
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO leases
-		   (id, tier, node, target_node, macos_slot, guest_os, phase, vcpu, memory, epoch,
+		   (id, tier, node, target_node, macos_slot, guest_os, provider, phase, vcpu, memory, epoch,
 		    created_at, heartbeat_at, expires_at)
-		 VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
-		id, t.Label, targetNode, macSlot, string(t.GuestOS), string(PhaseCapacity), t.VCPU, int64(t.Memory),
+		 VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
+		id, t.Label, targetNode, macSlot, string(t.GuestOS), string(t.Provider),
+		string(PhaseCapacity), t.VCPU, int64(t.Memory),
 		ts(now), ts(now), ts(now.Add(a.leaseTTL))); err != nil {
 		return nil, fmt.Errorf("alloc: insert lease: %w", err)
 	}
@@ -508,6 +519,7 @@ func (a *Allocator) insertLease(ctx context.Context, tx *sql.Tx, t config.Tier) 
 		TargetNode: t.Node,
 		MacOSSlot:  macSlot == 1,
 		GuestOS:    t.GuestOS,
+		Provider:   t.Provider,
 		Phase:      PhaseCapacity,
 		VCPU:       t.VCPU,
 		Memory:     t.Memory,
@@ -634,6 +646,30 @@ func (a *Allocator) Bind(ctx context.Context, leaseID string, epoch int64, node 
 		if !a.allowsGuestOS(node, lease.GuestOS) {
 			return fmt.Errorf("%w: lease %s is a %s guest and node %q does not permit that guest OS",
 				ErrGuestOSNotAllowed, leaseID, lease.GuestOS, node)
+		}
+
+		// The node's REGISTERED provider, not one from config: a Firecracker
+		// lease cannot run on a Tart host, and the registration is what the host
+		// itself reported rather than what a catalog claims about it.
+		//
+		// Leases predating the provider column carry "" and are not checked;
+		// there is nothing recorded to compare, and refusing them would strand
+		// work that was already legitimately placed.
+		if lease.Provider != "" {
+			var registered string
+
+			switch err := tx.QueryRowContext(ctx,
+				`SELECT provider FROM nodes WHERE name = ?`, node).Scan(&registered); {
+			case errors.Is(err, sql.ErrNoRows):
+				return fmt.Errorf("%w: node %q is not registered", ErrWrongNode, node)
+			case err != nil:
+				return fmt.Errorf("alloc: read node %s: %w", node, err)
+			}
+
+			if registered != string(lease.Provider) {
+				return fmt.Errorf("%w: lease %s needs provider %q but node %q runs %q",
+					ErrWrongProvider, leaseID, lease.Provider, node, registered)
+			}
 		}
 
 		if _, err := tx.ExecContext(ctx,
@@ -836,6 +872,17 @@ func (a *Allocator) transition(ctx context.Context, leaseID string, epoch int64,
 			return fmt.Errorf("%w: %s -> %s", ErrBadTransition, lease.Phase, to)
 		}
 
+		// Launching means a host is already bringing the instance up, so a lease
+		// that reaches it without a bound node was placed by something that never
+		// told the allocator where. That makes Bind — and therefore every
+		// placement check it performs, the guest-OS allowlist included — optional
+		// rather than an unavoidable gate. Requiring the node here is what makes
+		// those checks impossible to route around.
+		if to == PhaseLaunching && lease.Node == "" {
+			return fmt.Errorf("%w: lease %s cannot enter %s; bind it to a node first",
+				ErrNotPlaced, leaseID, to)
+		}
+
 		now := a.now().UTC()
 
 		if _, err := tx.ExecContext(ctx,
@@ -885,6 +932,7 @@ func (a *Allocator) loadAny(ctx context.Context, tx *sql.Tx, leaseID string, epo
 		targetNode sql.NullString
 		macSlot    int
 		guestOS    string
+		provider   string
 		mem        int64
 		ph         string
 		runID      sql.NullInt64
@@ -893,9 +941,11 @@ func (a *Allocator) loadAny(ctx context.Context, tx *sql.Tx, leaseID string, epo
 	)
 
 	err := tx.QueryRowContext(ctx,
-		`SELECT id, tier, node, target_node, macos_slot, guest_os, phase, vcpu, memory, epoch, run_id, job_id
+		`SELECT id, tier, node, target_node, macos_slot, guest_os, provider, phase, vcpu, memory,
+		        epoch, run_id, job_id
 		   FROM leases WHERE id = ?`, leaseID).
-		Scan(&l.ID, &l.Tier, &node, &targetNode, &macSlot, &guestOS, &ph, &l.VCPU, &mem, &curEpoch, &runID, &jobID)
+		Scan(&l.ID, &l.Tier, &node, &targetNode, &macSlot, &guestOS, &provider, &ph, &l.VCPU, &mem,
+			&curEpoch, &runID, &jobID)
 
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
@@ -912,7 +962,7 @@ func (a *Allocator) loadAny(ctx context.Context, tx *sql.Tx, leaseID string, epo
 
 	l.Node, l.TargetNode = node.String, targetNode.String
 	l.MacOSSlot, l.Phase, l.Memory = macSlot == 1, Phase(ph), config.ByteSize(mem)
-	l.GuestOS = config.GuestOS(guestOS)
+	l.GuestOS, l.Provider = config.GuestOS(guestOS), config.ProviderKind(provider)
 	l.Epoch, l.RunID, l.JobID = curEpoch, runID.Int64, jobID.Int64
 
 	return &l, nil

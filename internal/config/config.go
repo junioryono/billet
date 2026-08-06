@@ -83,6 +83,24 @@ type NodePolicy struct {
 	MacOSVMLimit *int `yaml:"macos_vm_limit,omitempty"`
 }
 
+// policyEnumsValid reports whether every enum this policy carries is a known
+// value. Relational checks consult it so one typo produces one diagnostic
+// against the field that holds it, rather than a second one phrased as an
+// allowlist mismatch.
+func (p NodePolicy) policyEnumsValid() bool {
+	if p.Provider != "" && !p.Provider.valid() {
+		return false
+	}
+
+	for _, g := range p.GuestOS {
+		if !g.valid() {
+			return false
+		}
+	}
+
+	return true
+}
+
 // Clone returns a deep copy, sharing nothing mutable with the receiver.
 //
 // A shallow struct copy is not enough and the difference is silent: GuestOS is a
@@ -589,14 +607,35 @@ func (c *Config) validateTiers() []error {
 func (c *Config) validateGuestOSRules(where string, t *Tier) []error {
 	var errs []error
 
+	// Relational checks are skipped when either side carries an invalid enum
+	// value: the value itself is already reported, and comparing a typo against
+	// an allowlist produces a second diagnostic describing the same mistake in
+	// terms that send the reader to the wrong field.
+	if !t.GuestOS.valid() {
+		return errs
+	}
+
 	// A host may be restricted to a subset of guest operating systems, and a
 	// tier pinned to a host that does not permit its guest OS would queue
 	// forever with nothing saying why.
 	if t.Node != "" {
-		if p, declared := c.NodePolicyFor(t.Node); declared && !p.AllowsGuestOS(t.GuestOS) {
+		p, declared := c.NodePolicyFor(t.Node)
+
+		switch {
+		case !declared:
+		case !p.policyEnumsValid():
+			// Reported against the node itself.
+		case !p.AllowsGuestOS(t.GuestOS):
 			errs = append(errs, fmt.Errorf(
 				"%s: guest_os %s is not in node %q's guest_os allowlist %v",
 				where, t.GuestOS, t.Node, p.GuestOS))
+		case p.Provider != "" && t.Provider != "" && p.Provider != t.Provider:
+			// A tier pinned to a host running a different backend loads cleanly
+			// and can never be placed: the host cannot run it. Silent at load
+			// time, this is a job that queues forever.
+			errs = append(errs, fmt.Errorf(
+				"%s: provider %s is pinned to node %q, which runs %s",
+				where, t.Provider, t.Node, p.Provider))
 		}
 	} else {
 		// An UNPINNED tier may be placed on any host, so a restrictive allowlist
@@ -620,6 +659,10 @@ func (c *Config) validateGuestOSRules(where string, t *Tier) []error {
 		// five restrictive hosts is one mistake, not five.
 		for i := range c.Nodes {
 			p := &c.Nodes[i]
+			if !p.policyEnumsValid() {
+				continue
+			}
+
 			if p.Provider == t.Provider && len(p.GuestOS) > 0 && !p.AllowsGuestOS(t.GuestOS) {
 				errs = append(errs, fmt.Errorf(
 					"%s: guest_os %s is unpinned, but node %q runs the same provider and its "+
