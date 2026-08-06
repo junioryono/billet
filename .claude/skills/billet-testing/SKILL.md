@@ -40,19 +40,23 @@ App does not install it` exists because the failure is otherwise baffling — so
 
 ## A discarded error is a vacuous assertion waiting to happen
 
-`if n, _ := a.Headroom(ctx, "x"); n != 0 { t.Error(...) }` reads harmlessly and is not. Go returns
-the **zero value alongside an error**, so every assertion that a result *is* zero — no headroom, no
-open leases, no rows — passes when the call FAILS. The test proves nothing and looks green.
+`if n, _ := a.Headroom(ctx, "x"); n != 0 { t.Error(...) }` reads harmlessly and is not. These APIs
+return the **zero value alongside an error**, so an assertion that a result *is* zero — no headroom,
+no open leases, no rows — passes when the call FAILS. The test proves nothing and looks green.
 
-This bit five times in `internal/alloc`: two `Usage` assertions and three `Headroom` ones. **errcheck
-cannot catch it**, because `.golangci.yml` excludes errcheck from `_test.go` — deliberately, since
-tests are full of `defer db.Close()` where the error genuinely is noise, and a linter firing on forty
-of those is one people learn to ignore.
+It bit seven times: five in `internal/alloc` (`Usage` and `Headroom`), and twice in
+`internal/github`, where `active, _ := hook["active"].(bool)` yielded `false` for an **absent** key —
+the expected value — so the test never proved the App manifest disables its webhook. Adding
+`omitempty` to that field, a realistic mistake, kept the suite green.
 
-So this is a judgment rule, not a mechanical one. Two ways to satisfy it:
+**errcheck catches this mechanically, and is enabled on tests.** It was excluded, on the assumption
+that `defer db.Close()` noise would swamp it. Measured, that assumption was wrong: 19 sites, two of
+them real bugs. Where an error genuinely cannot matter — writing to an `httptest` buffer — use
+`//nolint:errcheck // reason`.
+
+Prefer a checked helper when the call appears many times, so the shape stops being writable:
 
 ```go
-// A checked helper, when the call appears many times.
 func headroom(t *testing.T, a *Allocator, tier string) int {
 	t.Helper()
 	n, err := a.Headroom(t.Context(), tier)
@@ -61,17 +65,30 @@ func headroom(t *testing.T, a *Allocator, tier string) int {
 	}
 	return n
 }
-
-// Or check inline, when it appears once.
-u, err := a.Usage(ctx)
-if err != nil {
-	t.Fatalf("Usage: %v", err)
-}
 ```
 
-The check to apply: **if this call errored, would my assertion still pass?** If yes, the error has to
-be checked. Confirm it the same way as any other invariant — make the call fail and watch the test
-fail too.
+Note the helper uses `t.Context()`. If a test needs a **cancelled** context to exercise cancellation,
+call the API directly — the helper would bypass the very context the test is about.
+
+The question to ask, for anything the linter cannot see: **if this call errored, would my assertion
+still pass?** Confirm it the way you would any invariant — make the call fail and watch the test fail
+too.
+
+## Comma-ok is the same trap
+
+`v, _ := m["k"].(T)` yields the zero value when the key is absent *or* the wrong type. Asserting the
+zero value therefore proves nothing about presence. When presence is the point — a manifest field
+that must be explicitly `false` — assert `ok` separately from the value:
+
+```go
+active, ok := hook["active"].(bool)
+switch {
+case !ok:
+	t.Errorf("active must be present and boolean, got %v", hook["active"])
+case active:
+	t.Error("the webhook must be inactive")
+}
+```
 
 ## Package conventions
 

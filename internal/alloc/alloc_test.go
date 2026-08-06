@@ -28,8 +28,7 @@ func tier(label string, vcpu int, mem config.ByteSize) config.Tier {
 //
 // `n, _ := a.Headroom(...)` reads harmlessly and is not: Headroom returns 0
 // alongside an error, so every assertion of the form `n != 0` passes when the
-// query FAILS. That is the same defect that made two Usage assertions vacuous,
-// and errcheck cannot catch it here because it is excluded for test files.
+// query FAILS. That is the same defect that made two Usage assertions vacuous.
 func headroom(t *testing.T, a *Allocator, tier string) int {
 	t.Helper()
 
@@ -39,6 +38,21 @@ func headroom(t *testing.T, a *Allocator, tier string) int {
 	}
 
 	return n
+}
+
+// reserve asserts the reservation succeeded before returning the lease.
+//
+// `lease, _ := a.Reserve(...)` leaves lease nil on failure, so the test dies on
+// a nil dereference lines later, reporting a stack trace instead of the reason.
+func reserve(t *testing.T, a *Allocator, tier string) *Lease {
+	t.Helper()
+
+	lease, err := a.Reserve(t.Context(), tier)
+	if err != nil {
+		t.Fatalf("Reserve(%s): %v", tier, err)
+	}
+
+	return lease
 }
 
 func newAllocator(t *testing.T, limits Limits, tiers []config.Tier, opts ...Option) *Allocator {
@@ -70,15 +84,12 @@ func TestReserveHoldsCapacity(t *testing.T) {
 		t.Fatalf("Headroom = %d, want 4", n)
 	}
 
-	lease, err := a.Reserve(ctx, "small")
-	if err != nil {
-		t.Fatalf("Reserve: %v", err)
-	}
+	lease := reserve(t, a, "small")
 
 	// The point of escrowing: what a listener may advertise drops immediately,
 	// before any job is assigned or any VM booted.
 	if n := headroom(t, a, "small"); n != 3 {
-		t.Fatalf("after Reserve, Headroom = %d, %v; want 3", n, err)
+		t.Fatalf("after Reserve, Headroom = %d, want 3", n)
 	}
 
 	usage, err := a.Usage(ctx)
@@ -95,7 +106,7 @@ func TestReserveHoldsCapacity(t *testing.T) {
 	}
 
 	if n := headroom(t, a, "small"); n != 4 {
-		t.Fatalf("after Release, Headroom = %d, %v; want 4", n, err)
+		t.Fatalf("after Release, Headroom = %d, want 4", n)
 	}
 }
 
@@ -313,10 +324,7 @@ func TestLifecycleTransitions(t *testing.T) {
 
 	ctx := t.Context()
 
-	lease, err := a.Reserve(ctx, "small")
-	if err != nil {
-		t.Fatalf("Reserve: %v", err)
-	}
+	lease := reserve(t, a, "small")
 
 	if err := a.Assign(ctx, lease.ID, lease.Epoch, 111, 222); err != nil {
 		t.Fatalf("Assign: %v", err)
@@ -362,10 +370,7 @@ func TestInvalidTransitionsAreRefused(t *testing.T) {
 
 	ctx := t.Context()
 
-	lease, err := a.Reserve(ctx, "small")
-	if err != nil {
-		t.Fatalf("Reserve: %v", err)
-	}
+	lease := reserve(t, a, "small")
 
 	// capacity -> online skips assignment and launch.
 	if err := a.Advance(ctx, lease.ID, lease.Epoch, PhaseOnline); !errors.Is(err, ErrBadTransition) {
@@ -391,7 +396,7 @@ func TestTransitionsAreIdempotent(t *testing.T) {
 
 	ctx := t.Context()
 
-	lease, _ := a.Reserve(ctx, "small")
+	lease := reserve(t, a, "small")
 
 	if err := a.Assign(ctx, lease.ID, lease.Epoch, 1, 2); err != nil {
 		t.Fatalf("Assign: %v", err)
@@ -426,10 +431,7 @@ func TestReapFencesTheOldHolder(t *testing.T) {
 
 	ctx := t.Context()
 
-	lease, err := a.Reserve(ctx, "small")
-	if err != nil {
-		t.Fatalf("Reserve: %v", err)
-	}
+	lease := reserve(t, a, "small")
 
 	// Nothing expires while the holder is heartbeating.
 	if n, err := a.Reap(ctx); err != nil || n != 0 {
@@ -568,10 +570,7 @@ func TestBindRefusesTheWrongNode(t *testing.T) {
 	registerNode(t, a, "mac-mini-1", config.ProviderTart)
 	registerNode(t, a, "mac-mini-2", config.ProviderTart)
 
-	lease, err := a.Reserve(ctx, "mac-6")
-	if err != nil {
-		t.Fatalf("Reserve: %v", err)
-	}
+	lease := reserve(t, a, "mac-6")
 
 	if err := a.Bind(ctx, lease.ID, lease.Epoch, "mac-mini-2"); !errors.Is(err, ErrWrongNode) {
 		t.Errorf("bind to the wrong host = %v, want ErrWrongNode", err)
@@ -664,7 +663,7 @@ func TestAssignRejectsAContradictoryRetry(t *testing.T) {
 
 	ctx := t.Context()
 
-	lease, _ := a.Reserve(ctx, "small")
+	lease := reserve(t, a, "small")
 
 	if err := a.Assign(ctx, lease.ID, lease.Epoch, 1, 2); err != nil {
 		t.Fatalf("Assign: %v", err)
@@ -691,7 +690,7 @@ func TestReleaseDistinguishesMissingFromFinished(t *testing.T) {
 		t.Errorf("release of an unknown id = %v, want ErrLeaseNotFound", err)
 	}
 
-	lease, _ := a.Reserve(ctx, "small")
+	lease := reserve(t, a, "small")
 
 	if err := a.Release(ctx, lease.ID, lease.Epoch, PhaseDone); err != nil {
 		t.Fatalf("Release: %v", err)
@@ -721,7 +720,7 @@ func TestReapedLeaseKeepsItsAttribution(t *testing.T) {
 
 	ctx := t.Context()
 
-	lease, _ := a.Reserve(ctx, "small")
+	lease := reserve(t, a, "small")
 
 	if err := a.Assign(ctx, lease.ID, lease.Epoch, 555, 666); err != nil {
 		t.Fatalf("Assign: %v", err)
@@ -917,7 +916,7 @@ func TestHeartbeatExtendsTheLease(t *testing.T) {
 
 	ctx := t.Context()
 
-	lease, _ := a.Reserve(ctx, "small")
+	lease := reserve(t, a, "small")
 
 	now = now.Add(20 * time.Second)
 
@@ -943,7 +942,7 @@ func TestStaleEpochIsRefused(t *testing.T) {
 
 	ctx := t.Context()
 
-	lease, _ := a.Reserve(ctx, "small")
+	lease := reserve(t, a, "small")
 
 	if err := a.Heartbeat(ctx, lease.ID, lease.Epoch+1); !errors.Is(err, ErrFenced) {
 		t.Errorf("future epoch = %v, want ErrFenced", err)
@@ -1002,7 +1001,7 @@ func TestReleaseArchivesToHistory(t *testing.T) {
 
 	ctx := t.Context()
 
-	lease, _ := a.Reserve(ctx, "small")
+	lease := reserve(t, a, "small")
 
 	if err := a.Assign(ctx, lease.ID, lease.Epoch, 777, 888); err != nil {
 		t.Fatalf("Assign: %v", err)
@@ -1153,10 +1152,7 @@ func TestNodePolicyGuestOSSliceIsCopied(t *testing.T) {
 
 	registerNode(t, a, "mac-mini-1", config.ProviderTart)
 
-	lease, err := a.Reserve(ctx, "linux-arm")
-	if err != nil {
-		t.Fatalf("Reserve: %v", err)
-	}
+	lease := reserve(t, a, "linux-arm")
 
 	if err := a.Bind(ctx, lease.ID, lease.Epoch, "mac-mini-1"); !errors.Is(err, ErrGuestOSNotAllowed) {
 		t.Errorf("bind = %v; the caller widened the allowlist after New", err)
@@ -1187,10 +1183,7 @@ func TestBindRefusesAGuestOSTheHostDisallows(t *testing.T) {
 
 	registerNode(t, a, "mac-mini-1", config.ProviderTart)
 
-	lease, err := a.Reserve(ctx, "linux-arm")
-	if err != nil {
-		t.Fatalf("Reserve: %v", err)
-	}
+	lease := reserve(t, a, "linux-arm")
 
 	if err := a.Bind(ctx, lease.ID, lease.Epoch, "mac-mini-1"); !errors.Is(err, ErrGuestOSNotAllowed) {
 		t.Errorf("bind of a linux guest to a macos-only host = %v, want ErrGuestOSNotAllowed", err)
@@ -1227,10 +1220,7 @@ func TestBindRetryStaysIdempotentAfterPolicyTightens(t *testing.T) {
 
 	registerNode(t, before, "mac-mini-1", config.ProviderTart)
 
-	lease, err := before.Reserve(ctx, "linux-arm")
-	if err != nil {
-		t.Fatalf("Reserve: %v", err)
-	}
+	lease := reserve(t, before, "linux-arm")
 
 	if err := before.Bind(ctx, lease.ID, lease.Epoch, "mac-mini-1"); err != nil {
 		t.Fatalf("Bind: %v", err)
@@ -1268,10 +1258,7 @@ func TestBindAllowsAnUndeclaredHost(t *testing.T) {
 
 	registerNode(t, a, "mac-mini-1", config.ProviderTart)
 
-	lease, err := a.Reserve(ctx, "linux-arm")
-	if err != nil {
-		t.Fatalf("Reserve: %v", err)
-	}
+	lease := reserve(t, a, "linux-arm")
 
 	if err := a.Bind(ctx, lease.ID, lease.Epoch, "mac-mini-1"); err != nil {
 		t.Errorf("bind to an undeclared host = %v, want nil", err)
@@ -1314,10 +1301,7 @@ func TestBindReadsGuestOSFromTheLeaseNotTheCatalog(t *testing.T) {
 
 	registerNode(t, first, "mac-mini-1", config.ProviderTart)
 
-	lease, err := first.Reserve(ctx, "shared-label")
-	if err != nil {
-		t.Fatalf("Reserve: %v", err)
-	}
+	lease := reserve(t, first, "shared-label")
 
 	// The same label now describes a LINUX tier. The in-flight lease is still a
 	// macOS guest, and the host permits only macOS — so a bind that consulted the
@@ -1346,10 +1330,7 @@ func TestLaunchingRequiresABoundNode(t *testing.T) {
 
 	ctx := t.Context()
 
-	lease, err := a.Reserve(ctx, "small")
-	if err != nil {
-		t.Fatalf("Reserve: %v", err)
-	}
+	lease := reserve(t, a, "small")
 
 	if err := a.Assign(ctx, lease.ID, lease.Epoch, 111, 222); err != nil {
 		t.Fatalf("Assign: %v", err)
@@ -1373,10 +1354,7 @@ func TestUnverifiableLegacyLeaseFailsClosed(t *testing.T) {
 
 	registerNode(t, a, "epyc-1", config.ProviderFirecracker)
 
-	lease, err := a.Reserve(ctx, "small")
-	if err != nil {
-		t.Fatalf("Reserve: %v", err)
-	}
+	lease := reserve(t, a, "small")
 
 	// Reproduce a row written before the provider column existed.
 	if err := a.db.Tx(ctx, func(tx *sql.Tx) error {
@@ -1468,10 +1446,7 @@ func TestLaunchingRevalidatesCurrentPolicy(t *testing.T) {
 
 	registerNode(t, before, "mac-mini-1", config.ProviderTart)
 
-	lease, err := before.Reserve(ctx, "linux-arm")
-	if err != nil {
-		t.Fatalf("Reserve: %v", err)
-	}
+	lease := reserve(t, before, "linux-arm")
 
 	// Bound while still in `capacity` — nothing is running yet.
 	if err := before.Bind(ctx, lease.ID, lease.Epoch, "mac-mini-1"); err != nil {
@@ -1508,10 +1483,7 @@ func TestOnlineRequiresABoundNode(t *testing.T) {
 
 	ctx := t.Context()
 
-	lease, err := a.Reserve(ctx, "small")
-	if err != nil {
-		t.Fatalf("Reserve: %v", err)
-	}
+	lease := reserve(t, a, "small")
 
 	// Reproduce the legacy row directly: launching, never bound.
 	if err := a.db.Tx(ctx, func(tx *sql.Tx) error {
@@ -1657,10 +1629,7 @@ func TestSamePhaseAdvanceStillChecksPlacement(t *testing.T) {
 
 	registerNode(t, a, "epyc-1", config.ProviderFirecracker)
 
-	lease, err := a.Reserve(ctx, "small")
-	if err != nil {
-		t.Fatalf("Reserve: %v", err)
-	}
+	lease := reserve(t, a, "small")
 
 	// A bound pre-v7 row already sitting in launching: no recorded provider, so
 	// its placement cannot be verified.
@@ -1692,10 +1661,7 @@ func TestBindRefusesToAdoptAnAlreadyRunningLease(t *testing.T) {
 	registerNode(t, a, "epyc-1", config.ProviderFirecracker)
 	registerNode(t, a, "epyc-2", config.ProviderFirecracker)
 
-	lease, err := a.Reserve(ctx, "small")
-	if err != nil {
-		t.Fatalf("Reserve: %v", err)
-	}
+	lease := reserve(t, a, "small")
 
 	// Running, then its node row is deleted: ON DELETE SET NULL blanks the column.
 	if err := a.db.Tx(ctx, func(tx *sql.Tx) error {
@@ -1723,10 +1689,7 @@ func TestBindRefusesANodeRunningAnotherProvider(t *testing.T) {
 
 	registerNode(t, a, "mac-mini-1", config.ProviderTart)
 
-	lease, err := a.Reserve(ctx, "small")
-	if err != nil {
-		t.Fatalf("Reserve: %v", err)
-	}
+	lease := reserve(t, a, "small")
 
 	if err := a.Bind(ctx, lease.ID, lease.Epoch, "mac-mini-1"); !errors.Is(err, ErrWrongProvider) {
 		t.Errorf("bind of a firecracker lease to a tart host = %v, want ErrWrongProvider", err)
