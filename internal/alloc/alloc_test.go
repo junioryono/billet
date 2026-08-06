@@ -1011,11 +1011,18 @@ func macTier(label string, vcpu int, mem config.ByteSize) config.Tier {
 	}
 }
 
+// macPolicy is a declared host with an explicit macOS guest limit.
+func macPolicy(name string, limit int) map[string]config.NodePolicy {
+	return map[string]config.NodePolicy{
+		name: {Name: name, MacOSVMLimit: &limit},
+	}
+}
+
 func TestMacOSLimitHonoursPerHostOverride(t *testing.T) {
 	a := newAllocator(t,
 		Limits{
 			MaxVCPU: 256, MaxMemory: 512 * config.GiB,
-			MacOSPerNode: map[string]int{"mac-mini-1": 1},
+			Nodes: macPolicy("mac-mini-1", 1),
 		},
 		[]config.Tier{macTier("mac-6", 6, 24*config.GiB)})
 
@@ -1041,7 +1048,7 @@ func TestMacOSLimitZeroSchedulesNoGuests(t *testing.T) {
 	a := newAllocator(t,
 		Limits{
 			MaxVCPU: 256, MaxMemory: 512 * config.GiB,
-			MacOSPerNode: map[string]int{"mac-mini-1": 0},
+			Nodes: macPolicy("mac-mini-1", 0),
 		},
 		[]config.Tier{macTier("mac-6", 6, 24*config.GiB)})
 
@@ -1056,21 +1063,176 @@ func TestMacOSLimitZeroSchedulesNoGuests(t *testing.T) {
 	}
 }
 
-// Limits is a value type but carries a map. A caller keeping a reference could
-// otherwise raise a host's cap after construction, moving a licence limit out
-// from under leases already counted against it.
-func TestMacOSLimitsAreCopiedAtConstruction(t *testing.T) {
+// Limits is a value type but carries a map of policies that themselves carry
+// slices. A caller keeping a reference could otherwise raise a host's cap, or
+// widen its allowlist, after construction — moving the rules out from under
+// leases already counted against them. Copying the map alone is not enough,
+// because the GuestOS backing arrays would still be shared.
+func TestNodePolicyIsCopiedAtConstruction(t *testing.T) {
+	raised := 1
 	limits := Limits{
 		MaxVCPU: 256, MaxMemory: 512 * config.GiB,
-		MacOSPerNode: map[string]int{"mac-mini-1": 1},
+		Nodes: map[string]config.NodePolicy{
+			"mac-mini-1": {
+				Name:         "mac-mini-1",
+				GuestOS:      []config.GuestOS{config.GuestMacOS},
+				MacOSVMLimit: &raised,
+			},
+		},
 	}
 
 	a := newAllocator(t, limits, []config.Tier{macTier("mac-6", 6, 24*config.GiB)})
 
-	limits.MacOSPerNode["mac-mini-1"] = 5
+	// Mutate every reachable path: the map entry, and the slice inside it.
+	limits.Nodes["mac-mini-1"] = config.NodePolicy{Name: "mac-mini-1"}
+	raised = 5
 
 	if n, _ := a.Headroom(t.Context(), "mac-6"); n != 1 {
 		t.Errorf("Headroom = %d after the caller mutated its map, want the value captured at New (1)", n)
+	}
+}
+
+// The allowlist slice must be copied too, not just the map that holds it.
+func TestNodePolicyGuestOSSliceIsCopied(t *testing.T) {
+	allowlist := []config.GuestOS{config.GuestMacOS}
+	limits := Limits{
+		MaxVCPU: 256, MaxMemory: 512 * config.GiB,
+		Nodes: map[string]config.NodePolicy{
+			"mac-mini-1": {Name: "mac-mini-1", GuestOS: allowlist},
+		},
+	}
+
+	linux := config.Tier{
+		Label: "linux-arm", Provider: config.ProviderTart, GuestOS: config.GuestLinux,
+		VCPU: 4, Memory: 12 * config.GiB, Image: "ubuntu-2404-arm64",
+	}
+
+	a := newAllocator(t, limits, []config.Tier{linux})
+
+	// Widening the caller's slice in place must not widen the allocator's rules.
+	allowlist[0] = config.GuestLinux
+
+	ctx := t.Context()
+
+	registerNode(t, a, "mac-mini-1")
+
+	lease, err := a.Reserve(ctx, "linux-arm")
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	if err := a.Bind(ctx, lease.ID, lease.Epoch, "mac-mini-1"); !errors.Is(err, ErrGuestOSNotAllowed) {
+		t.Errorf("bind = %v; the caller widened the allowlist after New", err)
+	}
+}
+
+// The config guard cannot see every placement: an UNPINNED tier names no host,
+// and a node that declares no provider cannot be reasoned about at load time.
+// Bind is where the host is actually known, so it is the enforcement point —
+// without it a macOS-only Mac could be handed a Linux guest by any scheduler
+// that simply picked a node with free capacity.
+func TestBindRefusesAGuestOSTheHostDisallows(t *testing.T) {
+	linux := config.Tier{
+		Label: "linux-arm", Provider: config.ProviderTart, GuestOS: config.GuestLinux,
+		VCPU: 4, Memory: 12 * config.GiB, Image: "ubuntu-2404-arm64",
+	}
+
+	a := newAllocator(t,
+		Limits{
+			MaxVCPU: 256, MaxMemory: 512 * config.GiB,
+			Nodes: map[string]config.NodePolicy{
+				"mac-mini-1": {Name: "mac-mini-1", GuestOS: []config.GuestOS{config.GuestMacOS}},
+			},
+		},
+		[]config.Tier{linux})
+
+	ctx := t.Context()
+
+	registerNode(t, a, "mac-mini-1")
+
+	lease, err := a.Reserve(ctx, "linux-arm")
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	if err := a.Bind(ctx, lease.ID, lease.Epoch, "mac-mini-1"); !errors.Is(err, ErrGuestOSNotAllowed) {
+		t.Errorf("bind of a linux guest to a macos-only host = %v, want ErrGuestOSNotAllowed", err)
+	}
+}
+
+// A host with no declared policy is unconstrained, which is what an existing
+// deployment that never wrote a nodes section relies on.
+func TestBindAllowsAnUndeclaredHost(t *testing.T) {
+	linux := config.Tier{
+		Label: "linux-arm", Provider: config.ProviderTart, GuestOS: config.GuestLinux,
+		VCPU: 4, Memory: 12 * config.GiB, Image: "ubuntu-2404-arm64",
+	}
+
+	a := newAllocator(t, Limits{MaxVCPU: 256, MaxMemory: 512 * config.GiB}, []config.Tier{linux})
+
+	ctx := t.Context()
+
+	registerNode(t, a, "mac-mini-1")
+
+	lease, err := a.Reserve(ctx, "linux-arm")
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	if err := a.Bind(ctx, lease.ID, lease.Epoch, "mac-mini-1"); err != nil {
+		t.Errorf("bind to an undeclared host = %v, want nil", err)
+	}
+}
+
+// The guest OS is read from the lease's own column, so a catalog that changes
+// underneath an in-flight lease cannot reclassify what it is allowed to bind
+// to — the same reason target_node and macos_slot are stored rather than
+// re-derived.
+func TestBindReadsGuestOSFromTheLeaseNotTheCatalog(t *testing.T) {
+	linux := config.Tier{
+		Label: "arm", Provider: config.ProviderTart, GuestOS: config.GuestLinux,
+		VCPU: 4, Memory: 12 * config.GiB, Image: "ubuntu-2404-arm64",
+	}
+
+	db, err := state.Open(t.Context(), t.TempDir())
+	if err != nil {
+		t.Fatalf("state.Open: %v", err)
+	}
+
+	defer db.Close()
+
+	policy := map[string]config.NodePolicy{
+		"mac-mini-1": {Name: "mac-mini-1", GuestOS: []config.GuestOS{config.GuestLinux}},
+	}
+	limits := Limits{MaxVCPU: 256, MaxMemory: 512 * config.GiB, Nodes: policy}
+
+	first, err := New(db, limits, []config.Tier{linux})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ctx := t.Context()
+
+	registerNode(t, first, "mac-mini-1")
+
+	lease, err := first.Reserve(ctx, "arm")
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	// The same label now describes a macOS tier. The in-flight lease is still a
+	// Linux guest and must still be bindable to a Linux-only host.
+	repurposed := linux
+	repurposed.GuestOS = config.GuestMacOS
+	repurposed.Node = "mac-mini-1"
+
+	second, err := New(db, limits, []config.Tier{repurposed})
+	if err != nil {
+		t.Fatalf("New after repurpose: %v", err)
+	}
+
+	if err := second.Bind(ctx, lease.ID, lease.Epoch, "mac-mini-1"); err != nil {
+		t.Errorf("bind = %v; the lease was reclassified by a catalog change", err)
 	}
 }
 
@@ -1084,7 +1246,7 @@ func TestNewRejectsNegativeMacOSLimit(t *testing.T) {
 
 	limits := Limits{
 		MaxVCPU: 16, MaxMemory: 64 * config.GiB,
-		MacOSPerNode: map[string]int{"mac-mini-1": -1},
+		Nodes: macPolicy("mac-mini-1", -1),
 	}
 
 	if _, err := New(db, limits, nil); err == nil {

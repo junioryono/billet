@@ -139,6 +139,23 @@ OS is a load-time error rather than a job that queues forever with nothing sayin
 `macos_vm_limit > 0` together with a `guest_os` allowlist excluding macOS is rejected instead of
 silently resolving — a config that reads as "two macOS guests" must not schedule none.
 
+**The allowlist is enforced at `Bind`, not only at load.** Config validation cannot see every
+placement: an *unpinned* tier names no host, so nothing ties it to the allowlist, and a scheduler
+that simply picked a node with free capacity would put a Linux guest on a macOS-only Mac. `Bind` is
+the first point at which the host is known, so that is where the check has to live. The load-time
+guard covers what it can prove — a pinned tier, or an unpinned one against a host declaring the
+*same provider*, since a Firecracker tier can never land on a Tart host and comparing guest OS alone
+would make one macOS-only Mac an error for every x64 Linux tier in the deployment.
+
+The lease's `guest_os` is recorded at reserve time for the same reason as `target_node` and
+`macos_slot`: a tier redefined underneath an in-flight lease must not reclassify what that lease is
+allowed to bind to.
+
+**`NodePolicy` is deep-copied when the allocator is built.** `GuestOS` is a slice and
+`MacOSVMLimit` is a pointer, so copying the map alone still shares both — letting a caller widen an
+allowlist or raise a cap after construction, moving a licence limit out from under leases already
+counted against it. `NodePolicy.Clone` owns that, so there is one place to get it right.
+
 ### Capacity is escrowed BEFORE a listener advertises
 
 Each tier is its own GitHub scale set with its own `maxCapacity`. If listeners advertise

@@ -411,6 +411,14 @@ func TestExampleConfigIsValid(t *testing.T) {
 		t.Fatalf("billet.example.yaml does not parse against the current schema: %v", err)
 	}
 
+	// Load rejects a second YAML document, because a config that assigns capacity
+	// must not have half of itself silently ignored. Decoding once here would
+	// pass an example that real Load refuses.
+	var extra yaml.Node
+	if err := dec.Decode(&extra); err == nil {
+		t.Fatal("billet.example.yaml contains more than one YAML document; Load would reject it")
+	}
+
 	c.GitHub.AppID, c.GitHub.InstallationID = 1, 1
 
 	c.applyDefaults()
@@ -597,16 +605,122 @@ func TestNodePolicyRejectsBadInput(t *testing.T) {
 	}
 }
 
-// MacOSLimits is what the allocator is built from, so the runtime cap and this
-// package's load-time guard cannot disagree about a host.
-func TestMacOSLimitsMapsEveryPinnedHost(t *testing.T) {
-	body := validConfig + macOSTier + linuxARMTier + nodesSection("    macos_vm_limit: 1\n")
+// An UNPINNED tier can be placed on any host, so a restrictive allowlist
+// anywhere in the fleet is a constraint on it. Checking the allowlist only for
+// pinned tiers left the door open: a macos-only Mac could still be handed a
+// Linux guest, because nothing tied the tier to a host at all.
+func TestUnpinnedTierMustBePinnedWhenAHostExcludesIt(t *testing.T) {
+	unpinned := `
+  - label: billet-4vcpu-ubuntu-2404-arm
+    provider: tart
+    guest_os: linux
+    vcpu: 4
+    memory: 12GiB
+    image: ubuntu-2404-arm64
+`
+	body := validConfig + unpinned + nodesSection("    provider: tart\n    guest_os: [macos]\n")
+	_, err := Load(writeConfig(t, body))
+	if err == nil {
+		t.Fatal("an unpinned linux tier was accepted alongside a macos-only host")
+	}
+	if !strings.Contains(err.Error(), "mac-mini-1") {
+		t.Errorf("error should name the host that excludes it, got: %v", err)
+	}
+}
+
+// ...but only for hosts that could actually serve it. A firecracker tier can
+// never land on a Tart host, so declaring one macOS-only Mac must not turn
+// every ordinary x64 Linux tier in the deployment into an error. validConfig's
+// two unpinned firecracker tiers are the guard here.
+func TestUnpinnedTierIgnoresHostsRunningAnotherProvider(t *testing.T) {
+	body := validConfig + nodesSection("    provider: tart\n    guest_os: [macos]\n")
+	if _, err := Load(writeConfig(t, body)); err != nil {
+		t.Fatalf("a macos-only Tart host must not conflict with unpinned firecracker tiers: %v", err)
+	}
+}
+
+// Pinning it elsewhere resolves the problem, so the guard has an exit that is
+// not "delete the node policy".
+func TestPinningResolvesTheUnpinnedConflict(t *testing.T) {
+	pinned := `
+  - label: billet-4vcpu-ubuntu-2404-arm
+    provider: firecracker
+    guest_os: linux
+    node: epyc-1
+    vcpu: 4
+    memory: 12GiB
+    image: ubuntu-2404-x64
+`
+	body := validConfig + pinned + nodesSection("    guest_os: [macos]\n")
+	if _, err := Load(writeConfig(t, body)); err != nil {
+		t.Fatalf("pinning the tier elsewhere should resolve it: %v", err)
+	}
+}
+
+// One bad field must produce one diagnostic. Defaulting a tier's max_concurrent
+// from a negative node limit previously cascaded into three, including the
+// self-evidently broken "must be between 1 and -1".
+func TestNegativeNodeLimitDoesNotCascade(t *testing.T) {
+	body := validConfig + macOSTier + nodesSection("    macos_vm_limit: -1\n")
+	_, err := Load(writeConfig(t, body))
+	if err == nil {
+		t.Fatal("Load accepted a negative macos_vm_limit")
+	}
+	if !strings.Contains(err.Error(), "must not be negative") {
+		t.Errorf("error should report the negative limit, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "between 1 and -1") {
+		t.Errorf("a negative limit produced a nonsensical derived range, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "exceeding") {
+		t.Errorf("a negative limit produced a derived aggregate error, got: %v", err)
+	}
+}
+
+// A host that excludes macOS has an effective limit of zero, and zero is not
+// Apple's number. Reporting "1 concurrent guest exceeds Apple's limit of 2" is
+// arithmetically false and sends the operator looking at the wrong field.
+func TestExcludedMacOSHostDoesNotCiteAppleArithmetic(t *testing.T) {
+	body := validConfig +
+		strings.Replace(macOSTier, "    image: macos-26\n", "    image: macos-26\n    max_concurrent: 1\n", 1) +
+		nodesSection("    guest_os: [linux]\n")
+	_, err := Load(writeConfig(t, body))
+	if err == nil {
+		t.Fatal("Load accepted a macOS tier on a linux-only host")
+	}
+	if !strings.Contains(err.Error(), "allowlist") {
+		t.Errorf("error should name the allowlist, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "Apple's licence limit") {
+		t.Errorf("a host that excludes macOS must not be described via Apple's limit, got: %v", err)
+	}
+}
+
+// NodePolicies is what the allocator is built from, so the runtime checks and
+// this package's load-time guard cannot disagree about a host.
+func TestNodePoliciesCarriesTheDeclaredPolicy(t *testing.T) {
+	body := validConfig + macOSTier + linuxARMTier +
+		nodesSection("    guest_os: [macos, linux]\n    macos_vm_limit: 1\n")
 	cfg, err := Load(writeConfig(t, body))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	limits := cfg.MacOSLimits()
-	if len(limits) != 1 || limits["mac-mini-1"] != 1 {
-		t.Errorf("MacOSLimits() = %v, want {mac-mini-1:1}", limits)
+	policies := cfg.NodePolicies()
+	if len(policies) != 1 {
+		t.Fatalf("NodePolicies() = %v, want one entry", policies)
+	}
+	p := policies["mac-mini-1"]
+	if p.MacOSLimit() != 1 {
+		t.Errorf("MacOSLimit() = %d, want 1", p.MacOSLimit())
+	}
+	if !p.AllowsGuestOS(GuestLinux) || !p.AllowsGuestOS(GuestMacOS) {
+		t.Errorf("allowlist %v should permit both declared guest types", p.GuestOS)
+	}
+
+	// The returned slices must not alias the config, or a caller mutating one
+	// changes the rules the allocator was built with.
+	p.GuestOS[0] = GuestWindows
+	if cfg.Nodes[0].GuestOS[0] == GuestWindows {
+		t.Error("NodePolicies() aliased the config's guest_os slice")
 	}
 }

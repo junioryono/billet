@@ -132,26 +132,36 @@ tiers:
 # which is how a single host describes ITSELF. Host policy has to live here
 # because it is enforced across tiers that an individual host never sees.
 #
+# Declaring `provider` lets billet tell whether an UNPINNED tier could ever land
+# on a host. Without it a macOS-only Mac cannot be distinguished from a host that
+# might receive your x64 Linux tiers, so that check stays silent — the allocator
+# still enforces the allowlist when a node is actually chosen.
+#
 # nodes:
 #   # The default arrangement: one Mac serving both guest types.
 #   - name: mac-mini-1
+#     provider: tart
 #     guest_os: [macos, linux]
 #
-#   # Dedicate a Mac to macOS. Linux tiers pinned here are now a config error
-#   # rather than something that quietly queues forever.
+#   # Dedicate a Mac to macOS. Linux Tart tiers are now a config error rather
+#   # than something that quietly queues forever.
 #   - name: mac-mini-2
+#     provider: tart
 #     guest_os: [macos]
 #
 #   # Or run one purely as an arm64 Linux builder and never boot macOS on it.
 #   # Either form works; they are equivalent.
 #   - name: mac-mini-3
+#     provider: tart
 #     guest_os: [linux]
 #   - name: mac-mini-4
+#     provider: tart
 #     macos_vm_limit: 0
 #
 #   # Keep one licensed slot free for interactive use. Lowering the limit also
 #   # lowers the default max_concurrent of every macOS tier pinned here.
 #   - name: mac-mini-5
+#     provider: tart
 #     macos_vm_limit: 1
 #
 # macos_vm_limit defaults to 2 because that is what Apple's standard licence

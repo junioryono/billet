@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -54,6 +55,13 @@ type NodePolicy struct {
 	// Name matches Tier.Node and NodeConfig.Name.
 	Name string `yaml:"name"`
 
+	// Provider is the compute backend this host runs, matching NodeConfig.
+	// Provider. Optional, and used only to decide whether an unpinned tier could
+	// ever land here: a firecracker tier is not a placement candidate for a Tart
+	// host, so without it a macOS-only Mac would appear to conflict with every
+	// x64 Linux tier in the deployment.
+	Provider ProviderKind `yaml:"provider,omitempty"`
+
 	// GuestOS is an allowlist of what may be scheduled here. Empty means
 	// unconstrained, which is the default and preserves the behaviour of a
 	// config that never mentions the node.
@@ -73,6 +81,24 @@ type NodePolicy struct {
 	// allow at most DefaultMacOSVMLimit macOS guests per Apple-branded host —
 	// exceeding that is an assertion about YOUR licence, not a tuning knob.
 	MacOSVMLimit *int `yaml:"macos_vm_limit,omitempty"`
+}
+
+// Clone returns a deep copy, sharing nothing mutable with the receiver.
+//
+// A shallow struct copy is not enough and the difference is silent: GuestOS is a
+// slice and MacOSVMLimit is a POINTER, so a caller holding the original can
+// widen a host's allowlist or raise its macOS cap after the allocator has been
+// built from it — moving a licence limit out from under leases already counted
+// against it, with nothing to indicate the rules changed.
+func (p NodePolicy) Clone() NodePolicy {
+	p.GuestOS = slices.Clone(p.GuestOS)
+
+	if p.MacOSVMLimit != nil {
+		limit := *p.MacOSVMLimit
+		p.MacOSVMLimit = &limit
+	}
+
+	return p
 }
 
 // AllowsGuestOS reports whether this host may run a given guest OS. An empty
@@ -303,19 +329,21 @@ func (c *Config) MacOSLimitForNode(name string) int {
 	return p.MacOSLimit()
 }
 
-// MacOSLimits maps every node named by a macOS tier to its effective limit. It
-// is what the allocator is built from, so runtime enforcement and the load-time
-// guard cannot disagree about a host's capacity.
-func (c *Config) MacOSLimits() map[string]int {
-	limits := make(map[string]int)
+// NodePolicies is the declared fleet policy keyed by node name. It is what the
+// allocator is built from, so runtime enforcement and this package's load-time
+// guard read the same rules rather than two copies that can drift.
+//
+// Only DECLARED hosts appear. An absent host is unconstrained in guest OS and
+// carries Apple's default macOS limit — the same thing the allocator assumes
+// for a name it does not recognise.
+func (c *Config) NodePolicies() map[string]NodePolicy {
+	policies := make(map[string]NodePolicy, len(c.Nodes))
 
-	for i := range c.Tiers {
-		if t := &c.Tiers[i]; t.GuestOS == GuestMacOS && t.Node != "" {
-			limits[t.Node] = c.MacOSLimitForNode(t.Node)
-		}
+	for i := range c.Nodes {
+		policies[c.Nodes[i].Name] = c.Nodes[i].Clone()
 	}
 
-	return limits
+	return policies
 }
 
 var labelRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$`)
@@ -383,8 +411,14 @@ func (c *Config) applyDefaults() {
 		// node policy means lowering a Mac's limit tightens every macOS tier
 		// pinned to it, instead of leaving tiers at a default the host no longer
 		// permits.
+		// Only from a usable limit. A negative one is a config error reported by
+		// validateNodes, and copying it here would turn one bad field into three
+		// diagnostics, two of them naming max_concurrent — which the operator
+		// never set.
 		if t.GuestOS == GuestMacOS && t.MaxConcurrent == 0 {
-			t.MaxConcurrent = c.MacOSLimitForNode(t.Node)
+			if limit := c.MacOSLimitForNode(t.Node); limit > 0 {
+				t.MaxConcurrent = limit
+			}
 		}
 	}
 }
@@ -564,6 +598,38 @@ func (c *Config) validateGuestOSRules(where string, t *Tier) []error {
 				"%s: guest_os %s is not in node %q's guest_os allowlist %v",
 				where, t.GuestOS, t.Node, p.GuestOS))
 		}
+	} else {
+		// An UNPINNED tier may be placed on any host, so a restrictive allowlist
+		// constrains it even though it names no host. Checking only pinned tiers
+		// left the allowlist bypassable: a macOS-only Mac could still be handed a
+		// Linux guest, because nothing tied the tier to a host for the check to
+		// fire on.
+		//
+		// The predicate is "could this tier actually land here", not guest OS
+		// alone. A firecracker tier can never run on a Tart host, so a bare
+		// guest-OS comparison would make declaring one macOS-only Mac an error
+		// for every ordinary x64 Linux tier in the deployment. Only a host that
+		// declares the SAME provider can be a placement candidate, which is why
+		// this fires on provider match and stays silent otherwise.
+		//
+		// Silence is not safety: a node that declares no provider cannot be
+		// reasoned about here, and the allocator enforces the allowlist again at
+		// Bind, where the host is actually known.
+		//
+		// Only the first offending host is reported — one unpinned tier against
+		// five restrictive hosts is one mistake, not five.
+		for i := range c.Nodes {
+			p := &c.Nodes[i]
+			if p.Provider == t.Provider && len(p.GuestOS) > 0 && !p.AllowsGuestOS(t.GuestOS) {
+				errs = append(errs, fmt.Errorf(
+					"%s: guest_os %s is unpinned, but node %q runs the same provider and its "+
+						"guest_os allowlist %v excludes it; pin this tier to a host that permits "+
+						"it, or widen that allowlist",
+					where, t.GuestOS, p.Name, p.GuestOS))
+
+				break
+			}
+		}
 	}
 
 	switch t.GuestOS {
@@ -586,6 +652,11 @@ func (c *Config) validateGuestOSRules(where string, t *Tier) []error {
 		p, declared := c.NodePolicyFor(t.Node)
 
 		switch {
+		case limit < 0:
+			// The node policy is itself invalid and validateNodes already says
+			// so. Deriving a tier bound from a broken number would report the
+			// same mistake again, pointing at the wrong field and with
+			// arithmetic ("between 1 and -1") that reads as a billet bug.
 		case limit == 0 && (!declared || p.AllowsGuestOS(GuestMacOS)):
 			// A host explicitly set to zero macOS guests. The allowlist branch
 			// above already covers the case where macos is absent from guest_os,
@@ -646,6 +717,10 @@ func (c *Config) validateNodes() []error {
 		}
 		seen[p.Name] = struct{}{}
 
+		if p.Provider != "" && !p.Provider.valid() {
+			errs = append(errs, fmt.Errorf("%s: provider %q is not one of %v", where, p.Provider, allProviders))
+		}
+
 		guests := make(map[GuestOS]struct{}, len(p.GuestOS))
 		for _, g := range p.GuestOS {
 			if !g.valid() {
@@ -702,8 +777,20 @@ func (c *Config) validateMacOSHostLimits() []error {
 	}
 	var errs []error
 	for _, node := range order {
-		total := perNode[node]
-		if limit := c.MacOSLimitForNode(node); total > limit {
+		p, declared := c.NodePolicyFor(node)
+		limit := p.MacOSLimit()
+
+		// Both of these are already reported — against the node policy itself,
+		// or against each offending tier. Repeating them as an aggregate
+		// describes one mistake twice, and does it with false arithmetic: a host
+		// whose allowlist excludes macOS has an effective limit of zero, so
+		// rendering it through macOSLimitReason claims "1 guest exceeds Apple's
+		// limit of 2", which is both wrong and points at the wrong field.
+		if limit < 0 || (declared && !p.AllowsGuestOS(GuestMacOS)) {
+			continue
+		}
+
+		if total := perNode[node]; total > limit {
 			errs = append(errs, fmt.Errorf(
 				"node %q: macOS tiers allow %d concurrent guests in total, exceeding %s",
 				node, total, c.macOSLimitReason(node)))
