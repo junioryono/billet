@@ -323,8 +323,14 @@ func TestLifecycleTransitions(t *testing.T) {
 		t.Fatalf("Release: %v", err)
 	}
 
-	// Terminal releases capacity.
-	if u, _ := a.Usage(ctx); u.Leases != 0 {
+	// Terminal releases capacity. The error is checked: a failed query returns a
+	// zero-valued Usage, which would satisfy this for the wrong reason.
+	u, err := a.Usage(ctx)
+	if err != nil {
+		t.Fatalf("Usage: %v", err)
+	}
+
+	if u.Leases != 0 {
 		t.Errorf("usage after release = %+v, want no open leases", u)
 	}
 }
