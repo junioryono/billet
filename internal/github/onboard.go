@@ -389,10 +389,21 @@ func (f *onboardFlow) handleStart(w http.ResponseWriter, _ *http.Request) {
 func (f *onboardFlow) handleCallback(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 
-	// Constant-time, and checked before anything else is read from the request.
+	// A bad request is REFUSED; it does not end the flow.
+	//
+	// This listens on loopback, so any unprivileged process on the machine can
+	// reach it — and with --port, at an address it can guess. Treating a wrong
+	// state or a missing code as a fatal error handed that process a kill
+	// switch: one request ended onboarding, and if it landed after GitHub had
+	// created the App but before billet exchanged the one-time code, the App and
+	// its private key were orphaned with no way to recover them. A local denial
+	// of service became credential loss.
+	//
+	// Continuing to wait costs nothing. The legitimate redirect still arrives,
+	// and the caller's deadline still bounds the flow.
 	if subtle.ConstantTimeCompare([]byte(q.Get("state")), []byte(f.state)) != 1 {
-		http.Error(w, "state mismatch — restart `billet github-app create`", http.StatusBadRequest)
-		f.fail(fmt.Errorf("github: state mismatch on callback (possible CSRF)"))
+		// Constant-time, and checked before anything else is read.
+		http.Error(w, "state mismatch", http.StatusBadRequest)
 
 		return
 	}
@@ -400,7 +411,6 @@ func (f *onboardFlow) handleCallback(w http.ResponseWriter, r *http.Request) {
 	code := q.Get("code")
 	if code == "" {
 		http.Error(w, "no code in callback", http.StatusBadRequest)
-		f.fail(fmt.Errorf("github: callback carried no code"))
 
 		return
 	}

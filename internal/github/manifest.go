@@ -12,9 +12,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"time"
 )
 
@@ -172,9 +174,9 @@ func convertManifestAt(ctx context.Context, client *http.Client, base, code stri
 		return nil, fmt.Errorf("github: empty manifest code")
 	}
 
-	url := fmt.Sprintf("%s/app-manifests/%s/conversions", base, urlPathEscape(code))
+	endpoint := fmt.Sprintf("%s/app-manifests/%s/conversions", base, urlPathEscape(code))
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, http.NoBody)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, http.NoBody)
 	if err != nil {
 		return nil, fmt.Errorf("github: build conversion request: %w", err)
 	}
@@ -183,7 +185,9 @@ func convertManifestAt(ctx context.Context, client *http.Client, base, code stri
 
 	resp, err := doWithTimeout(client, req)
 	if err != nil {
-		return nil, fmt.Errorf("github: convert manifest: %w", err)
+		// Redacted: the URL carries the one-time manifest code, and a transport
+		// failure would otherwise print it to stderr.
+		return nil, fmt.Errorf("github: convert manifest: %w", redactCodeFromURLError(err))
 	}
 	defer resp.Body.Close()
 
@@ -212,6 +216,30 @@ func convertManifestAt(ctx context.Context, client *http.Client, base, code stri
 	}
 
 	return &app, nil
+}
+
+// redactCodeFromURLError strips the URL from a transport error.
+//
+// net/http reports failures as *url.Error, whose Error() embeds the full URL.
+// For the manifest exchange that URL contains the ONE-TIME CODE, and the code is
+// still live when the POST fails — a proxy misconfiguration, a DNS failure, a
+// TLS error. billet prints that to stderr, so anyone who can read a terminal
+// scrollback, a systemd journal or a CI log could race to redeem it and receive
+// the App's private key, webhook secret and client secret.
+//
+// The underlying network error is preserved and still unwrappable; only the URL
+// is replaced, since the operator already knows which operation failed from the
+// message wrapping this one.
+func redactCodeFromURLError(err error) error {
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) {
+		return err
+	}
+
+	redacted := *urlErr
+	redacted.URL = "[redacted: contains the one-time manifest code]"
+
+	return &redacted
 }
 
 func setAPIHeaders(req *http.Request) {

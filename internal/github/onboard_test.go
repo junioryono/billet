@@ -666,51 +666,63 @@ func TestOnboardRejectsStateMismatch(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 
-	attacker := func(ctx context.Context, target string) error {
-		go func() {
+	// A hostile local process races the browser with a wrong state, then the
+	// real registration proceeds. The forged request must be refused WITHOUT
+	// ending the flow: this listens on loopback, so any unprivileged process can
+	// reach it, and killing onboarding after GitHub has created the App but
+	// before billet exchanges the one-time code orphans the App and its private
+	// key. A local denial of service would become credential loss.
+	browser := &browser{t: t, fake: fake, client: srv.Client()}
+
+	var forged atomic.Int32
+
+	attacked := func(ctx context.Context, target string) error {
+		// Only the FIRST call is the loopback start page; the second is
+		// GitHub's install URL, where /callback does not exist.
+		if forged.Add(1) == 1 {
 			req, err := http.NewRequestWithContext(ctx, http.MethodGet,
 				strings.TrimSuffix(target, "/")+"/callback?code=evil&state=wrong", http.NoBody)
 			if err != nil {
-				// Not t.Fatalf: this runs on a goroutine, where Fatalf only
-				// stops that goroutine and lets the test report a later,
-				// unrelated failure instead of this one.
-				t.Errorf("build attacker request: %v", err)
-
-				return
+				return err
 			}
 
 			resp, err := srv.Client().Do(req)
-			if err == nil {
-				defer resp.Body.Close()
-
-				if resp.StatusCode != http.StatusBadRequest {
-					t.Errorf("state mismatch answered %d, want 400", resp.StatusCode)
-				}
+			if err != nil {
+				return err
 			}
-		}()
 
-		return nil
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Errorf("forged state answered %d, want 400", resp.StatusCode)
+			}
+		}
+
+		// The legitimate browser runs only after the forgery was refused.
+		return browser.open(ctx, target)
 	}
 
-	_, err := Onboard(ctx, OnboardOptions{
+	app, err := Onboard(ctx, OnboardOptions{
 		Org:          "acme",
-		OpenBrowser:  attacker,
+		OpenBrowser:  attacked,
 		Log:          func(string, ...any) {},
 		Client:       srv.Client(),
 		InstallPoll:  20 * time.Millisecond,
 		apiBase:      srv.URL,
 		OnAppCreated: func(*App) error { return nil },
 	})
-	if err == nil {
-		t.Fatal("Onboard accepted a callback with a mismatched state")
+
+	if err != nil {
+		t.Fatalf("a forged callback ended the flow: %v", err)
 	}
 
-	if !strings.Contains(err.Error(), "state mismatch") {
-		t.Errorf("expected a state-mismatch error, got: %v", err)
+	if app == nil || app.App == nil || app.App.ID == 0 {
+		t.Fatal("onboarding produced no app despite the legitimate callback succeeding")
 	}
 
-	if n := fake.conversions.Load(); n != 0 {
-		t.Errorf("the code was exchanged %d times despite the state mismatch", n)
+	// Exactly one exchange: the forged code must never have been redeemed.
+	if n := fake.conversions.Load(); n != 1 {
+		t.Errorf("conversions = %d, want exactly 1 (the legitimate one)", n)
 	}
 }
 
