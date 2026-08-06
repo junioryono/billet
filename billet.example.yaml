@@ -22,6 +22,7 @@ server:
   # 120 vCPU and 480GiB reserves 8 threads and 32 GB for the OS, ZFS ARC, and
   # billet itself. Note that 128 SMT threads are not 128 core-equivalents —
   # measure real per-job-class throughput before raising this.
+  # See docs/reference-hardware.md for how tier shapes map onto a real topology.
   max_vcpu: 120
   max_memory: 480GiB
 
@@ -98,9 +99,9 @@ tiers:
     disk: 80GiB
     image: ubuntu-2404-x64
 
-# Apple Silicon, once a Mac mini joins the fleet. One host serves both macOS
-# guests and native Linux arm64 guests; Apple's 2-VM licensing limit applies to
-# the macOS guests only, and billet enforces it.
+# Apple Silicon, once a Mac mini joins the fleet. Such a host CAN serve both
+# macOS guests and native Linux arm64 guests, but whether it does is your
+# decision — see the nodes section below.
 #
 # guest_os is what the licence check keys off — not the label — so a macOS tier
 # named anything at all is still capped, and a Linux tier with "macos" in its
@@ -113,8 +114,8 @@ tiers:
 #    vcpu: 6
 #    memory: 24GiB
 #    image: macos-26
-#    # max_concurrent defaults to 2 and may not exceed it. If you add a second
-#    # macOS tier on the same node, their totals must still sum to <= 2.
+#    # Defaults to the host's macOS limit, and may not exceed it. Two macOS
+#    # tiers on one node must still sum to that limit or less.
 #
 #  - label: billet-4vcpu-ubuntu-2404-arm
 #    provider: tart
@@ -123,3 +124,37 @@ tiers:
 #    vcpu: 4
 #    memory: 12GiB
 #    image: ubuntu-2404-arm64
+
+# Per-host policy, read by the control plane. Optional: omit a host entirely and
+# it is unconstrained, with Apple's standard limit of 2 macOS guests.
+#
+# Note this is the FLEET description, distinct from the `node:` section above,
+# which is how a single host describes ITSELF. Host policy has to live here
+# because it is enforced across tiers that an individual host never sees.
+#
+# nodes:
+#   # The default arrangement: one Mac serving both guest types.
+#   - name: mac-mini-1
+#     guest_os: [macos, linux]
+#
+#   # Dedicate a Mac to macOS. Linux tiers pinned here are now a config error
+#   # rather than something that quietly queues forever.
+#   - name: mac-mini-2
+#     guest_os: [macos]
+#
+#   # Or run one purely as an arm64 Linux builder and never boot macOS on it.
+#   # Either form works; they are equivalent.
+#   - name: mac-mini-3
+#     guest_os: [linux]
+#   - name: mac-mini-4
+#     macos_vm_limit: 0
+#
+#   # Keep one licensed slot free for interactive use. Lowering the limit also
+#   # lowers the default max_concurrent of every macOS tier pinned here.
+#   - name: mac-mini-5
+#     macos_vm_limit: 1
+#
+# macos_vm_limit defaults to 2 because that is what Apple's standard licence
+# permits per Apple-branded host. billet does not know what agreement you have,
+# so raising it is allowed — but doing so is an assertion about YOUR licence,
+# not a tuning knob.

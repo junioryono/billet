@@ -65,6 +65,7 @@ internal/node/       node runtime: provider driver, capacity reporting, mTLS    
 internal/provider/   firecracker | tart | ec2 | docker                            (P1+)
 internal/store/      zfs | ebs | apfs — CoW clone, generations, atomic publish   (P3)
 internal/cachev2/    GitHub Actions Cache v2 Twirp + conformance suite           (P4)
+docs/                reference-hardware.md — the bare-metal host billet is measured against
 ```
 
 Layering is enforced by `depguard` in `.golangci.yml`, not by convention: `provider` and `store` are
@@ -113,16 +114,30 @@ The protocol is reverse-engineered — GitHub has never published the `.proto` f
 must **fail open to a miss** on any error, never fail a job, and a conformance suite runs the real
 `actions/cache`, `upload-artifact` and `download-artifact` against live GitHub to catch drift.
 
-### Apple's 2-VM limit is enforced against `guest_os`, never a label
+### The macOS guest limit is enforced against `guest_os`, never a label
 
-Apple's licence permits at most two macOS guests per Apple-branded host. Keying that off a label
-matching `macos` means a tier named `sonoma-arm64` escapes it entirely, and a Linux tier named
-`builds-macos-artifacts` gets capped for no reason. `Tier.GuestOS` is the explicit field, macOS
-tiers must pin a `node`, and per-node totals are summed at load. Warm instances count.
+Keying the limit off a label matching `macos` means a tier named `sonoma-arm64` escapes it entirely,
+and a Linux tier named `builds-macos-artifacts` gets capped for no reason. `Tier.GuestOS` is the
+explicit field, macOS tiers must pin a `node`, and per-node totals are summed at load. Warm
+instances count.
 
-The config check is a **guard, not the enforcement point**: the allocator must hold a single
-host-wide count of running plus warm macOS guests at runtime, because two individually-valid tiers
-still share one physical Mac.
+The config check is a **guard, not the enforcement point**: the allocator holds a single host-wide
+count of running plus warm macOS guests at runtime, because two individually-valid tiers still share
+one physical Mac. Both read the effective limit from the same `NodePolicy`, so there is one number
+rather than two that drift.
+
+**The limit is per host and configurable; `DefaultMacOSVMLimit` is a default, not a ceiling.** Apple's
+standard licence permits two macOS guests per Apple-branded host, which is what a config that says
+nothing gets. But what a host may run is a deployment decision, not a fact about the hardware — an
+Apple Silicon machine can serve macOS guests, Linux arm64 guests, or both — so `nodes:` carries a
+per-host `guest_os` allowlist and `macos_vm_limit`. Raising the limit is permitted because billet
+cannot know what licence or hardware agreement an operator has; it is an assertion about their
+licence, which is why the diagnostic names Apple only when the limit came from the default.
+
+Two rules keep that from becoming a footgun. A tier pinned to a host that does not permit its guest
+OS is a load-time error rather than a job that queues forever with nothing saying why. And
+`macos_vm_limit > 0` together with a `guest_os` allowlist excluding macOS is rejected instead of
+silently resolving — a config that reads as "two macOS guests" must not schedule none.
 
 ### Capacity is escrowed BEFORE a listener advertises
 
