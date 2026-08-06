@@ -736,6 +736,57 @@ func TestNodeNamesAreValidatedConsistently(t *testing.T) {
 	}
 }
 
+// node.name defaults to the machine's hostname, and a hostname is not
+// guaranteed to be a legal node name — a long FQDN exceeds the length limit and
+// some contain characters the pattern rejects. Tightening node.name to labelRe
+// means such a machine now fails to load a config where the operator never
+// wrote a name at all, so the diagnostic has to say where the name came from.
+// "node.name is invalid" sends them looking for a field they never typed.
+func TestHostnameDefaultExplainsItself(t *testing.T) {
+	body := strings.Replace(validConfig, "  name: epyc-1\n", "", 1)
+
+	cfg := &Config{}
+	if err := yaml.Unmarshal([]byte(body), cfg); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	// Simulate a machine whose hostname cannot be a node name.
+	cfg.hostname = func() (string, error) { return "an invalid host name!", nil }
+	cfg.applyDefaults()
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate accepted an unusable hostname-derived node name")
+	}
+	if !strings.Contains(err.Error(), "hostname") {
+		t.Errorf("error should say the name came from the hostname, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "an invalid host name!") {
+		t.Errorf("error should quote the offending hostname, got: %v", err)
+	}
+}
+
+// A usable hostname is still adopted silently, which is the whole point of the
+// default on a single-box deployment.
+func TestUsableHostnameIsAdopted(t *testing.T) {
+	body := strings.Replace(validConfig, "  name: epyc-1\n", "", 1)
+
+	cfg := &Config{}
+	if err := yaml.Unmarshal([]byte(body), cfg); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	cfg.hostname = func() (string, error) { return "build-box-01", nil }
+	cfg.applyDefaults()
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if cfg.Node.Name != "build-box-01" {
+		t.Errorf("node.name = %q, want the hostname", cfg.Node.Name)
+	}
+}
+
 // Surrounding whitespace is normalized rather than rejected, so a pin and the
 // fleet entry it names still match.
 func TestNodeNamesAreTrimmed(t *testing.T) {
