@@ -172,7 +172,7 @@ func (b *browser) driveRegistration(ctx context.Context, startURL string) {
 		return
 	}
 
-	b.validateManifest(extractManifest(b.t, body))
+	b.validateManifest(extractManifest(b.t, body), strings.TrimSuffix(startURL, "/"))
 
 	parsed, err := url.Parse(action)
 	if err != nil {
@@ -191,7 +191,13 @@ func (b *browser) driveRegistration(ctx context.Context, startURL string) {
 }
 
 // validateManifest enforces what GitHub's parameter table documents as required.
-func (b *browser) validateManifest(raw string) {
+//
+// base is the loopback origin the onboarding server is listening on. It is
+// passed in so the callback URLs can be asserted against what billet ACTUALLY
+// serialized: this test drives /callback and /installed by constructing them
+// from the same base, so tagging either field `json:"-"` left the suite green
+// while GitHub would have had nowhere to redirect to.
+func (b *browser) validateManifest(raw, base string) {
 	b.t.Helper()
 
 	if raw == "" {
@@ -209,31 +215,74 @@ func (b *browser) validateManifest(raw string) {
 		b.t.Errorf("manifest.url is required by GitHub and is missing or not a string: %v", m["url"])
 	}
 
-	// The one that bit us: GitHub marks hook_attributes.url required whenever
-	// the object is present, so an inactive hook still needs a URL.
-	if hook, ok := m["hook_attributes"].(map[string]any); ok {
-		if s, ok := hook["url"].(string); !ok || s == "" {
-			b.t.Error("manifest.hook_attributes is present but carries no url; GitHub rejects that")
+	// Asserted against what billet serialized, not reconstructed from the same
+	// base this test drives. Without these, tagging either field `json:"-"`
+	// leaves the suite green while GitHub has nowhere to send the operator:
+	// no redirect_url stalls Onboard until the manifest's one-hour deadline,
+	// and no setup_url silently drops the fast installation path.
+	for field, want := range map[string]string{
+		"redirect_url": base + "/callback",
+		"setup_url":    base + "/installed",
+	} {
+		if got, ok := m[field].(string); !ok || got != want {
+			b.t.Errorf("manifest.%s = %v, want %q", field, m[field], want)
 		}
+	}
 
-		// PRESENCE is asserted, not merely the value. `active, _ := ...(bool)`
-		// yields false when the key is absent or the wrong type — which is the
-		// expected value — so it passed without ever proving the manifest
-		// disables the webhook. Dropping the field entirely would have gone
-		// unnoticed, and billet's claim to need no inbound ingress rests on it.
-		active, ok := hook["active"].(bool)
+	// Registered for one organization's runners; installable by strangers is not
+	// a thing billet should offer. `public` has no omitempty, so it must appear.
+	if public, ok := m["public"].(bool); !ok || public {
+		b.t.Errorf("manifest.public must be present and false, got %v", m["public"])
+	}
 
-		switch {
-		case !ok:
-			b.t.Errorf("manifest.hook_attributes.active must be present and boolean, got %v", hook["active"])
-		case active:
-			b.t.Error("the webhook must be inactive: billet needs no inbound ingress")
+	// Subscribing to events would contradict the no-webhook design.
+	if events, present := m["default_events"]; present {
+		if list, ok := events.([]any); !ok || len(list) > 0 {
+			b.t.Errorf("manifest.default_events must be absent or empty, got %v", events)
 		}
+	}
+
+	// PRESENCE of the whole object is asserted, not just its contents. GitHub
+	// documents hook_attributes.active as defaulting to TRUE, so a manifest that
+	// omits the object entirely registers an ACTIVE webhook — and the previous
+	// `if hook, ok := ...; ok` simply skipped the block, accepting exactly that.
+	// billet's claim to need no inbound ingress rests on this.
+	hook, ok := m["hook_attributes"].(map[string]any)
+	if !ok {
+		// Errorf and return, never Fatalf: this runs on the goroutine started by
+		// driveRegistration, where FailNow would stop only that goroutine and let
+		// the test go on to report some later, unrelated failure instead.
+		b.t.Errorf("manifest.hook_attributes must be present and an object, got %v", m["hook_attributes"])
+
+		return
+	}
+
+	// GitHub marks hook_attributes.url required whenever the object is present,
+	// so an inactive hook still needs a URL.
+	if s, ok := hook["url"].(string); !ok || s == "" {
+		b.t.Error("manifest.hook_attributes is present but carries no url; GitHub rejects that")
+	}
+
+	// PRESENCE is asserted, not merely the value. `active, _ := ...(bool)` yields
+	// false when the key is absent or the wrong type — which is the expected
+	// value — so it passed without ever proving the manifest disables the
+	// webhook.
+	active, ok := hook["active"].(bool)
+
+	switch {
+	case !ok:
+		b.t.Errorf("manifest.hook_attributes.active must be present and boolean, got %v", hook["active"])
+	case active:
+		b.t.Error("the webhook must be inactive: billet needs no inbound ingress")
 	}
 
 	perms, ok := m["default_permissions"].(map[string]any)
 	if !ok {
-		b.t.Fatalf("manifest carried no default_permissions: %s", raw)
+		// Errorf, not Fatalf — see the hook_attributes note above: this runs on
+		// driveRegistration's goroutine.
+		b.t.Errorf("manifest carried no default_permissions: %s", raw)
+
+		return
 	}
 
 	if len(perms) != len(permissions) {

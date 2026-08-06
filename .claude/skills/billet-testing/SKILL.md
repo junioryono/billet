@@ -156,6 +156,11 @@ a fake; the real backends are validated by the conformance suite on a machine th
 make cover
 ```
 
-85% project target, 80% patch. Treat a drop as a prompt to look, not a number to satisfy —
-`cmd/billet/main.go` is excluded in `.codecov.yml` because unit-testing flag parsing measures nothing
-while raising the figure.
+The project target is **`auto`** — do not regress from the base commit — with an 80% patch target.
+Not an absolute number, and deliberately so: a hard 85% on a project sitting at 79% fails every PR
+from day one, and a check that always fails is a check everyone learns to ignore. New code carries
+the patch target, so the overall figure ratchets up as the project grows rather than being declared
+true in advance.
+
+Treat a drop as a prompt to look, not a number to satisfy — `cmd/billet/main.go` is excluded in
+`.codecov.yml` because unit-testing flag parsing measures nothing while raising the figure.
