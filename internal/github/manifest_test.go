@@ -2,11 +2,44 @@ package github
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 )
+
+// The manifest code buys the App's private key, and it is still live when the
+// POST fails. net/http reports transport failures as *url.Error, whose Error()
+// embeds the full URL — so a proxy misconfiguration or a DNS failure would print
+// the code to stderr, where anyone reading a terminal scrollback, a systemd
+// journal or a CI log could redeem it first.
+func TestConvertManifestDoesNotLeakTheCodeOnTransportFailure(t *testing.T) {
+	const code = "super-secret-one-time-code"
+
+	// Accepting then closing gives a transport error rather than an HTTP status.
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {}))
+	base, client := srv.URL, srv.Client()
+
+	srv.Close()
+
+	_, err := convertManifestAt(t.Context(), client, base, code)
+	if err == nil {
+		t.Fatal("expected a transport error against a closed server")
+	}
+
+	if strings.Contains(err.Error(), code) {
+		t.Errorf("the one-time code appears in the error:\n%v", err)
+	}
+
+	// The underlying network error must survive, or an operator cannot tell a
+	// proxy failure from a DNS one.
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) {
+		t.Errorf("the transport error was discarded rather than redacted: %v", err)
+	}
+}
 
 // The permission set is a security claim billet makes in its README and in the
 // CLI's own output. Pin it, so widening it is a deliberate edit to a test rather
