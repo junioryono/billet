@@ -1336,6 +1336,27 @@ func TestLaunchingRequiresABoundNode(t *testing.T) {
 	}
 }
 
+// Bind skips the provider comparison when a lease records no provider, which is
+// correct for rows predating the column but would be a hole if a NEW lease could
+// be written that way — the check would be skippable by construction. New must
+// therefore refuse a catalog that would produce one.
+func TestNewRejectsATierWithNoProvider(t *testing.T) {
+	db, err := state.Open(t.Context(), t.TempDir())
+	if err != nil {
+		t.Fatalf("state.Open: %v", err)
+	}
+
+	defer db.Close()
+
+	blank := tier("small", 4, 16*config.GiB)
+	blank.Provider = ""
+
+	if _, err := New(db, Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB},
+		[]config.Tier{blank}); err == nil {
+		t.Error("New accepted a tier with no provider; its leases would skip the Bind provider check")
+	}
+}
+
 // A Firecracker lease cannot run on a Tart host. The comparison is against the
 // provider the node REGISTERED, not one a catalog claims about it.
 func TestBindRefusesANodeRunningAnotherProvider(t *testing.T) {
