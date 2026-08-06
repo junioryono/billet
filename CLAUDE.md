@@ -58,7 +58,9 @@ process — the single-machine deployment.
 cmd/billet/          the binary: server | node | dev roles, plus the whole operator CLI
 internal/config/     billet.yaml schema + validation (a leaf package — imports nothing of ours)
 internal/state/      SQLite control-plane store: capacity ledger, job history, process lock
-internal/server/     scale-set listeners, global capacity allocator, scheduler   (P1)
+internal/github/     App Manifest onboarding, App JWT, installation resolution
+internal/alloc/      global capacity allocator + lease state machine
+internal/server/     scale-set listeners, scheduler                              (P1)
 internal/node/       node runtime: provider driver, capacity reporting, mTLS     (P2)
 internal/provider/   firecracker | tart | ec2 | docker                            (P1+)
 internal/store/      zfs | ebs | apfs — CoW clone, generations, atomic publish   (P3)
@@ -128,6 +130,24 @@ Each tier is its own GitHub scale set with its own `maxCapacity`. If listeners a
 independently, GitHub can fill all of them at once and the host is overcommitted with nothing to
 stop it. Reserve against the global ledger first, advertise second. Capacity is a **vector** — CPU,
 memory, macOS licence slots, disk — never one integer.
+
+`internal/alloc` owns this, and three details are load-bearing:
+
+- **The headroom check and the insert are ONE transaction.** Checking outside it is a read followed
+  by a hopeful write. Measured: moving the check out produced **28 grants against a ceiling of 4**
+  under concurrency. `TestConcurrentReservationsNeverOvercommit` is the guard.
+- **A lease's `node` stays NULL until a node binds it.** A reservation is *constrained* to a node by
+  its tier's config, not *bound* to one — and the column has a foreign key to `nodes(name)`, which at
+  reserve time may name a host that has not registered yet. So Apple's per-host limit counts by the
+  set of macOS tiers pinned to that node, not by `leases.node`, which would read zero during exactly
+  the window the limit exists to cover.
+- **The epoch is a fence, and a reclaim bumps it.** Without that, a holder declared dead and replaced
+  keeps writing to a lease someone else now owns — an orderly takeover becoming two concurrent owners
+  of one slot. Every write presents its epoch; a stale one is refused.
+
+The state machine is written down in `validTransitions` rather than implied by scattered UPDATEs, and
+terminal phases have no successors: a lease that released its capacity must never move backwards and
+re-acquire it, which is what a double-admit looks like from the inside.
 
 ### Never guess at a byte size
 
