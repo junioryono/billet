@@ -724,9 +724,18 @@ func (a *Allocator) Bind(ctx context.Context, leaseID string, epoch int64, node 
 		// two hosts own the same lease. Reap cannot resolve that while either one
 		// keeps heartbeating.
 		//
-		// Refusing here closes the takeover route. Fencing the leases at node
-		// deletion is the other half and belongs with node lifecycle, which does
-		// not exist yet; there is deliberately no delete path in this package.
+		// This refusal narrows the route; it does NOT close it, and the difference
+		// matters before node removal is built. A lease still in `assigned` when
+		// its node is deleted is not yet running, so it binds to a new host
+		// perfectly legally — and the stale original still holds the same epoch,
+		// so its own Advance is authorized against whatever node the row now
+		// names rather than against the caller. Ownership is recorded, not
+		// proven: nothing here identifies WHO is asking.
+		//
+		// Closing that needs fencing at deletion, or a durable holder identity
+		// checked on every authorization. Both belong with node lifecycle, which
+		// does not exist yet — there is deliberately no delete path in this
+		// package, so the residual hole is not reachable through this binary.
 		if requiresPlacement(lease.Phase) {
 			return fmt.Errorf(
 				"%w: lease %s is already %s; a first binding now would make node %q a second owner",
@@ -963,8 +972,13 @@ func (a *Allocator) transition(ctx context.Context, leaseID string, epoch int64,
 		// phase='launching' and node=NULL free to walk on to online.
 		if requiresPlacement(to) {
 			if lease.Node == "" {
-				return fmt.Errorf("%w: lease %s cannot enter %s; bind it to a node first",
-					ErrNotPlaced, leaseID, to)
+				// Not "bind it first": Bind refuses a first binding once a lease
+				// is running, so that advice would send the operator into a second
+				// refusal. An orphan at this point is recoverable only by ending
+				// it.
+				return fmt.Errorf(
+					"%w: lease %s is %s with no bound node; release it, or stop its holder and let it expire",
+					ErrNotPlaced, leaseID, lease.Phase)
 			}
 
 			// Re-checked against CURRENT policy rather than trusted from bind
