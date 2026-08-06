@@ -694,6 +694,57 @@ func lastLine(err error) string {
 	return msg
 }
 
+// A tier with no provider inherits the PINNED host's, not the local node's.
+//
+// Defaulting from the local node is right for an unpinned tier and wrong for a
+// pinned one: on a multi-host deployment the file that describes the EPYC box
+// would silently stamp `firecracker` onto a tier pinned to a Mac. Pinning names
+// a host, and that host's declared provider is the more specific answer.
+func TestPinnedTierInheritsItsHostProvider(t *testing.T) {
+	body := validConfig + `
+  - label: billet-4vcpu-ubuntu-2404-arm
+    guest_os: linux
+    node: mac-mini-1
+    vcpu: 4
+    memory: 12GiB
+    image: ubuntu-2404-arm64
+` + nodesSection("    provider: tart\n    guest_os: [linux]\n")
+	cfg, err := Load(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	tier, ok := cfg.TierByLabel("billet-4vcpu-ubuntu-2404-arm")
+	if !ok {
+		t.Fatal("tier missing")
+	}
+	// validConfig's node section declares firecracker; the pinned host is tart.
+	if tier.Provider != ProviderTart {
+		t.Errorf("provider = %q, want %q from the pinned host", tier.Provider, ProviderTart)
+	}
+}
+
+// An UNPINNED tier still inherits the local node's provider, which is the
+// single-box case the default exists for.
+func TestUnpinnedTierInheritsTheLocalProvider(t *testing.T) {
+	body := validConfig + `
+  - label: billet-2vcpu-plain
+    vcpu: 2
+    memory: 8GiB
+    image: ubuntu-2404-x64
+`
+	cfg, err := Load(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	tier, ok := cfg.TierByLabel("billet-2vcpu-plain")
+	if !ok {
+		t.Fatal("tier missing")
+	}
+	if tier.Provider != ProviderFirecracker {
+		t.Errorf("provider = %q, want %q from the local node", tier.Provider, ProviderFirecracker)
+	}
+}
+
 // A pinned tier whose provider differs from its host's loads cleanly and can
 // never be placed — the host cannot run it. Silent at load time, that is a job
 // that queues forever.

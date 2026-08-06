@@ -421,6 +421,18 @@ func (c *Config) applyDefaults() {
 	}
 	for i := range c.Tiers {
 		t := &c.Tiers[i]
+		// The PINNED host's provider wins over the local node's. Defaulting from
+		// the local node is right for an unpinned tier and wrong for a pinned
+		// one: on a multi-host deployment, the file describing the EPYC box would
+		// otherwise stamp `firecracker` onto a tier pinned to a Mac, producing a
+		// contradiction the operator never wrote. Pinning names a host, and that
+		// host's declared provider is the more specific answer.
+		if t.Provider == "" && t.Node != "" {
+			if p, declared := c.NodePolicyFor(t.Node); declared {
+				t.Provider = p.Provider
+			}
+		}
+
 		if t.Provider == "" && c.Node != nil {
 			t.Provider = c.Node.Provider
 		}
