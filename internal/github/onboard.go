@@ -109,12 +109,28 @@ func Onboard(ctx context.Context, opts OnboardOptions) (*Onboarding, error) {
 	}
 	defer listener.Close()
 
-	base := "http://" + listener.Addr().String()
-
 	state, err := randomState()
 	if err != nil {
 		return nil, err
 	}
+
+	// Every route sits under an unguessable prefix.
+	//
+	// The start page carries the state in its form, and it was served from "/"
+	// on loopback — so any local process could fetch it, learn the state, and
+	// then present a valid-looking callback with a bogus code. Refusing invalid
+	// callbacks does not help there: the state IS valid, billet accepts the code,
+	// the exchange fails, and the flow dies with GitHub's App already created.
+	//
+	// A 256-bit path is the same secret the state is, applied one step earlier:
+	// a process that cannot guess it cannot reach any handler. The operator never
+	// types this — the browser is handed the whole URL.
+	secretPath, err := randomState()
+	if err != nil {
+		return nil, err
+	}
+
+	base := "http://" + listener.Addr().String() + "/" + secretPath
 
 	tcpAddr, ok := listener.Addr().(*net.TCPAddr)
 	if !ok {
@@ -125,6 +141,7 @@ func Onboard(ctx context.Context, opts OnboardOptions) (*Onboarding, error) {
 		opts:     opts,
 		state:    state,
 		base:     base,
+		prefix:   secretPath,
 		port:     tcpAddr.Port,
 		codeCh:   make(chan string, 1),
 		installC: make(chan struct{}, 1),
@@ -168,9 +185,13 @@ func Onboard(ctx context.Context, opts OnboardOptions) (*Onboarding, error) {
 }
 
 type onboardFlow struct {
-	opts     OnboardOptions
-	state    string
-	base     string
+	opts  OnboardOptions
+	state string
+	// base already includes the unguessable path prefix, so every URL derived
+	// from it inherits the guard.
+	base string
+	// prefix is that path alone, for registering routes on the mux.
+	prefix   string
 	port     int
 	codeCh   chan string
 	installC chan struct{}
@@ -181,9 +202,13 @@ type onboardFlow struct {
 
 func (f *onboardFlow) routes() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", f.handleStart)
-	mux.HandleFunc("/callback", f.handleCallback)
-	mux.HandleFunc("/installed", f.handleInstalled)
+
+	// Nothing is registered at "/", so a process that has not guessed the prefix
+	// gets 404 from every path — including the start page that carries the state.
+	root := "/" + f.prefix
+	mux.HandleFunc(root+"/", f.handleStart)
+	mux.HandleFunc(root+"/callback", f.handleCallback)
+	mux.HandleFunc(root+"/installed", f.handleInstalled)
 
 	return mux
 }

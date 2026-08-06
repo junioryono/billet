@@ -676,7 +676,10 @@ func TestOnboardRejectsStateMismatch(t *testing.T) {
 	defer cancel()
 
 	// A hostile local process races the browser with a wrong state, then the
-	// real registration proceeds. The forged request must be refused WITHOUT
+	// real registration proceeds. It also probes the guessable paths first —
+	// the start page carries the state in its form, so serving it from "/" let
+	// a local process read the state and then present a VALID-looking callback
+	// with a bogus code, which refusing invalid callbacks does not stop. The forged request must be refused WITHOUT
 	// ending the flow: this listens on loopback, so any unprivileged process can
 	// reach it, and killing onboarding after GitHub has created the App but
 	// before billet exchanges the one-time code orphans the App and its private
@@ -689,6 +692,44 @@ func TestOnboardRejectsStateMismatch(t *testing.T) {
 		// Only the FIRST call is the loopback start page; the second is
 		// GitHub's install URL, where /callback does not exist.
 		if forged.Add(1) == 1 {
+			// The guessable paths must not exist. Derived from the real target's
+			// origin, which is what a local process can trivially discover by
+			// scanning loopback ports.
+			origin, err := url.Parse(target)
+			if err != nil {
+				return err
+			}
+
+			for _, guess := range []string{"/", "/callback", "/installed"} {
+				probe, err := http.NewRequestWithContext(ctx, http.MethodGet,
+					"http://"+origin.Host+guess, http.NoBody)
+				if err != nil {
+					return err
+				}
+
+				resp, err := srv.Client().Do(probe)
+				if err != nil {
+					return err
+				}
+
+				body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+				resp.Body.Close()
+
+				if err != nil {
+					return err
+				}
+
+				if resp.StatusCode != http.StatusNotFound {
+					t.Errorf("%s answered %d; every route must sit under the unguessable prefix",
+						guess, resp.StatusCode)
+				}
+
+				// Belt and braces: even a non-404 must not hand over the state.
+				if strings.Contains(string(body), "state=") {
+					t.Errorf("%s leaked the registration state to an unauthenticated caller", guess)
+				}
+			}
+
 			req, err := http.NewRequestWithContext(ctx, http.MethodGet,
 				strings.TrimSuffix(target, "/")+"/callback?code=evil&state=wrong", http.NoBody)
 			if err != nil {
