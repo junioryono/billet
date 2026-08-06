@@ -426,8 +426,15 @@ var guestOSMigration = migration{
 // Migration 6 defaulted EVERY pre-existing lease to 'linux', including macOS
 // ones. That is not a safe default in the direction its own comment claimed:
 // an unbound macOS lease relabelled Linux would be PERMITTED onto a Linux-only
-// host, even though its durable macos_slot proves what it is. macos_slot is the
-// authoritative record, so it is what the backfill reads.
+// host, even though its durable macos_slot proves what it is.
+//
+// The backfill reads macos_slot, which is authoritative only for leases written
+// after migration 5 — that migration added the column defaulting to 0 and did
+// not backfill it either, so a macOS lease predating it is indistinguishable
+// from a Linux one and this UPDATE cannot repair it. Nothing here can: the
+// information was never recorded. What protects those rows is the allocator
+// refusing to place any lease with no recorded provider, which every pre-v7
+// lease is; they fail closed rather than being guessed at.
 //
 // Corrected by appending rather than by editing migration 6: the checksum guard
 // exists precisely to stop an applied migration changing underneath a database,
