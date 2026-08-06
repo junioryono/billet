@@ -107,6 +107,16 @@ var (
 type Limits struct {
 	MaxVCPU   int
 	MaxMemory config.ByteSize
+
+	// MacOSPerNode caps concurrent macOS guests per host, keyed by node name.
+	// Build it with config.Config.MacOSLimits so the runtime cap and the
+	// load-time guard read the same number.
+	//
+	// A node absent from the map falls back to config.DefaultMacOSVMLimit. An
+	// unconfigured Apple host is still bound by Apple's licence, so the absent
+	// case must be the licence rather than "unlimited" — a mistyped node name
+	// then costs a scheduling constraint, not a licence violation.
+	MacOSPerNode map[string]int
 }
 
 // Lease is a capacity reservation. The Epoch is the fencing token: every write
@@ -193,6 +203,22 @@ func New(db *state.DB, limits Limits, tiers []config.Tier, opts ...Option) (*All
 			"alloc: limits must be positive (got %d vCPU, %s); without a ceiling there is nothing to escrow against",
 			limits.MaxVCPU, limits.MaxMemory)
 	}
+
+	// The map is copied rather than aliased: Limits is a value type, and a caller
+	// that kept a reference could otherwise raise a host's macOS cap after
+	// construction, moving a licence limit out from under leases already counted
+	// against it.
+	perNode := make(map[string]int, len(limits.MacOSPerNode))
+
+	for node, n := range limits.MacOSPerNode {
+		if n < 0 {
+			return nil, fmt.Errorf("alloc: node %q has negative macOS limit %d", node, n)
+		}
+
+		perNode[node] = n
+	}
+
+	limits.MacOSPerNode = perNode
 
 	a := &Allocator{
 		db:       db,
@@ -328,9 +354,20 @@ func (a *Allocator) Escrow(ctx context.Context, tier string, want int) ([]*Lease
 	return leases, nil
 }
 
+// macOSLimit is the cap on concurrent macOS guests for a host. See
+// Limits.MacOSPerNode for why an unlisted node gets Apple's default rather than
+// no limit at all.
+func (a *Allocator) macOSLimit(node string) int {
+	if n, ok := a.limits.MacOSPerNode[node]; ok {
+		return n
+	}
+
+	return config.DefaultMacOSVMLimit
+}
+
 // headroom computes how many more of a tier fit. Every limit is applied, and the
 // smallest wins — capacity is a vector, so "enough cores" says nothing about
-// memory or about Apple's per-host guest limit.
+// memory or about the per-host macOS guest limit.
 func (a *Allocator) headroom(ctx context.Context, tx *sql.Tx, t config.Tier) (int, error) {
 	used, err := a.usage(ctx, tx)
 	if err != nil {
@@ -351,17 +388,17 @@ func (a *Allocator) headroom(ctx context.Context, tx *sql.Tx, t config.Tier) (in
 		n = min(n, t.MaxConcurrent-tierUsed)
 	}
 
-	// Apple permits at most two macOS guests per Apple-branded host, counting
-	// every running one regardless of which tier asked for it. Two individually
-	// legal macOS tiers on one Mac still share one machine, so the limit is
-	// enforced per NODE across tiers rather than per tier.
+	// A host caps concurrent macOS guests, counting every running one regardless
+	// of which tier asked for it. Two individually legal macOS tiers on one Mac
+	// still share one machine, so the limit is enforced per NODE across tiers
+	// rather than per tier.
 	if t.GuestOS == config.GuestMacOS && t.Node != "" {
 		hostUsed, err := a.countOpenMacOSByNode(ctx, tx, t.Node)
 		if err != nil {
 			return 0, err
 		}
 
-		n = min(n, config.MacOSVMLimit-hostUsed)
+		n = min(n, a.macOSLimit(t.Node)-hostUsed)
 	}
 
 	return max(n, 0), nil
