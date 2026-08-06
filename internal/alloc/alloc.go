@@ -268,6 +268,18 @@ func New(db *state.DB, limits Limits, tiers []config.Tier, opts ...Option) (*All
 			return nil, fmt.Errorf("alloc: tier %q has memory %s; headroom divides by it", t.Label, t.Memory)
 		case t.MaxConcurrent < 0:
 			return nil, fmt.Errorf("alloc: tier %q has negative max_concurrent %d", t.Label, t.MaxConcurrent)
+		case t.Provider == "":
+			// Bind skips its provider comparison for leases recording no
+			// provider, which is right for rows predating the column. A tier that
+			// produces NEW such leases would make that check skippable by
+			// construction, so the catalog is refused instead.
+			return nil, fmt.Errorf(
+				"alloc: tier %q has no provider; its leases would skip the placement check at bind time",
+				t.Label)
+		case t.GuestOS == "":
+			// Same reasoning: an unset guest OS matches no allowlist, so it would
+			// either strand the lease or, worse, read as a value the host permits.
+			return nil, fmt.Errorf("alloc: tier %q has no guest_os", t.Label)
 		case t.GuestOS == config.GuestMacOS && strings.TrimSpace(t.Node) == "":
 			return nil, fmt.Errorf(
 				"alloc: macOS tier %q names no node; Apple's per-host guest limit cannot be enforced without one",
