@@ -20,8 +20,10 @@ static file.
 make check
 ```
 
-This is exactly what CI runs. A green local run is a green CI run; that equivalence is the whole
-point of the gate, so please do not push work that has not passed it.
+CI runs all of this, so a red `make check` is a red CI run. It is not the *whole* of CI, which also
+verifies `go mod tidy` leaves no diff, uploads coverage, runs `govulncheck`, and cross-builds every
+target a node can run on. A green `make check` is therefore necessary rather than sufficient — please
+do not push work that has not passed it, and expect CI to catch the rest.
 
 `make cross` additionally builds for `linux/amd64`, `linux/arm64` and `darwin/arm64`. Run it if you
 touch build tags or anything platform-specific — the state lock is `//go:build unix`, and a mistake

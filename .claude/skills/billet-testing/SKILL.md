@@ -148,7 +148,10 @@ correct. That belongs in the conformance suite: real `actions/cache`, `upload-ar
 changing the protocol, which is the only failure that matters.
 
 **Anything needing `/dev/kvm` or a hypervisor.** Provider tests assert the lifecycle contract against
-a fake; the real backends are validated by the conformance suite on a machine that has one.
+a fake; the real backends will be validated by the conformance suite on a machine that has one.
+
+Neither suite exists yet — nor do the cache and the providers they would cover. Both are described
+here as the rule to follow when those land, not as something currently running.
 
 ## Coverage
 

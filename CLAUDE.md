@@ -111,8 +111,9 @@ artifacts or hold deployment secrets must not enable it. A mistake here does not
 breaks a deploy.
 
 The protocol is reverse-engineered — GitHub has never published the `.proto` files — so the cache
-must **fail open to a miss** on any error, never fail a job, and a conformance suite runs the real
-`actions/cache`, `upload-artifact` and `download-artifact` against live GitHub to catch drift.
+must **fail open to a miss** on any error, never fail a job, and a conformance suite must run the real
+`actions/cache`, `upload-artifact` and `download-artifact` against live GitHub to catch drift. Both
+are requirements on the cache when it is built (P4); neither exists yet, and nor does the cache.
 
 ### The macOS guest limit is enforced against `guest_os`, never a label
 
