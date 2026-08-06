@@ -67,6 +67,68 @@ func TestOpenAppliesMigrations(t *testing.T) {
 	}
 }
 
+// The migration list is assembled from a slice literal PLUS appends in init, so
+// nothing about the source layout guarantees the versions are sane. A duplicate
+// version means one migration's SQL silently never runs while the other's
+// checksum is recorded under it; a descending one means the apply loop and the
+// ORDER BY version read disagree about which migration is which.
+//
+// Both failures surface later as a checksum mismatch on an unrelated reopen,
+// which is a miserable thing to debug from that symptom.
+func TestMigrationVersionsAreUniqueAndAscending(t *testing.T) {
+	seen := make(map[int]string, len(migrations))
+
+	for i, m := range migrations {
+		if m.Version <= 0 {
+			t.Errorf("migrations[%d] (%s) has non-positive version %d", i, m.Name, m.Version)
+		}
+		if prev, dup := seen[m.Version]; dup {
+			t.Errorf("migrations[%d] (%s) reuses version %d, already held by %s", i, m.Name, m.Version, prev)
+		}
+		seen[m.Version] = m.Name
+
+		if i > 0 && m.Version <= migrations[i-1].Version {
+			t.Errorf("migrations[%d] (%s) has version %d, not greater than the preceding %d",
+				i, m.Name, m.Version, migrations[i-1].Version)
+		}
+		if len(m.Stmts) == 0 {
+			t.Errorf("migrations[%d] (%s) has no statements", i, m.Name)
+		}
+	}
+}
+
+// Migration 6 backfills guest_os for rows written before the column existed.
+// The default has to be a real guest OS rather than empty: Bind compares it
+// against a host's allowlist, and an empty value would match nothing and strand
+// every pre-existing lease. 'linux' is right because a macOS tier has always
+// been required to pin a node.
+func TestLeaseGuestOSDefaultsToLinux(t *testing.T) {
+	db := open(t)
+	ctx := t.Context()
+
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+
+	if err := db.Tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx,
+			`INSERT INTO leases (id, tier, phase, vcpu, memory, epoch, created_at, heartbeat_at, expires_at)
+			 VALUES ('l1', 't', 'capacity', 1, 1, 0, ?, ?, ?)`, now, now, now)
+
+		return err
+	}); err != nil {
+		t.Fatalf("insert lease without guest_os: %v", err)
+	}
+
+	var guestOS string
+	if err := db.Reader().QueryRowContext(ctx,
+		`SELECT guest_os FROM leases WHERE id = 'l1'`).Scan(&guestOS); err != nil {
+		t.Fatalf("read guest_os: %v", err)
+	}
+
+	if guestOS != "linux" {
+		t.Errorf("guest_os = %q for a row that did not set it, want %q", guestOS, "linux")
+	}
+}
+
 func TestOpenIsIdempotent(t *testing.T) {
 	dir := t.TempDir()
 	first, err := Open(t.Context(), dir)
