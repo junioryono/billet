@@ -295,6 +295,13 @@ linters:
       - std-error-handling
     rules:
       # ----- tests: relax noise-heavy rules -----
+      #
+      # errcheck is off here because tests are full of `defer db.Close()` where
+      # the error genuinely is noise, and a linter firing on forty of those is
+      # one people learn to ignore. The cost is real and worth stating: nothing
+      # then catches `n, _ := f()` followed by an assertion that n is zero, which
+      # passes when the call FAILS. That is a judgment rule instead — see the
+      # billet-testing skill.
       - path: _test\.go
         linters:
           - errcheck
