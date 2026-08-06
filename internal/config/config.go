@@ -191,14 +191,19 @@ type Tier struct {
 	MaxConcurrent int `yaml:"max_concurrent,omitempty"`
 }
 
-// macOSVMLimit is Apple's licensing cap on macOS guests per Apple-branded host.
+// MacOSVMLimit is Apple's licensing cap on macOS guests per Apple-branded host.
 // Linux guests on the same machine are not subject to it.
 //
 // This package enforces the limit statically, per node, across all macOS tiers.
-// That is a guard, not the enforcement point: the allocator must additionally
-// hold a single host-wide count of running plus warm macOS guests at runtime,
-// because two separately-valid tiers on one node still share one physical Mac.
-const macOSVMLimit = 2
+// That is a guard, not the enforcement point: the allocator additionally holds a
+// single host-wide count of running plus warm macOS guests at runtime, because
+// two separately-valid tiers on one node still share one physical Mac. It is
+// exported so there is one number, not two that can drift apart.
+const MacOSVMLimit = 2
+
+// macOSVMLimit is retained as the unexported spelling used throughout this
+// package's validation.
+const macOSVMLimit = MacOSVMLimit
 
 var labelRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$`)
 
