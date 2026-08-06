@@ -1160,6 +1160,63 @@ func TestBindRefusesAGuestOSTheHostDisallows(t *testing.T) {
 	}
 }
 
+// Tightening a host's allowlist must not turn an ALREADY-COMPLETED bind's retry
+// into an error. The guest is running either way — refusing the repeat un-binds
+// nothing, it just converts a harmless no-op into a hard failure that a node
+// retrying after a transient error would read as "tear this job down".
+//
+// The policy gates NEW placements, so the idempotent repeat is answered first.
+func TestBindRetryStaysIdempotentAfterPolicyTightens(t *testing.T) {
+	linux := config.Tier{
+		Label: "linux-arm", Provider: config.ProviderTart, GuestOS: config.GuestLinux,
+		VCPU: 4, Memory: 12 * config.GiB, Image: "ubuntu-2404-arm64",
+	}
+
+	db, err := state.Open(t.Context(), t.TempDir())
+	if err != nil {
+		t.Fatalf("state.Open: %v", err)
+	}
+
+	defer db.Close()
+
+	open := Limits{MaxVCPU: 256, MaxMemory: 512 * config.GiB}
+
+	before, err := New(db, open, []config.Tier{linux})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ctx := t.Context()
+
+	registerNode(t, before, "mac-mini-1")
+
+	lease, err := before.Reserve(ctx, "linux-arm")
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	if err := before.Bind(ctx, lease.ID, lease.Epoch, "mac-mini-1"); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	// The operator now restricts that Mac to macOS and restarts.
+	tightened := Limits{
+		MaxVCPU: 256, MaxMemory: 512 * config.GiB,
+		Nodes: map[string]config.NodePolicy{
+			"mac-mini-1": {Name: "mac-mini-1", GuestOS: []config.GuestOS{config.GuestMacOS}},
+		},
+	}
+
+	after, err := New(db, tightened, []config.Tier{linux})
+	if err != nil {
+		t.Fatalf("New after tightening: %v", err)
+	}
+
+	if err := after.Bind(ctx, lease.ID, lease.Epoch, "mac-mini-1"); err != nil {
+		t.Errorf("retry of a completed bind = %v, want nil", err)
+	}
+}
+
 // A host with no declared policy is unconstrained, which is what an existing
 // deployment that never wrote a nodes section relies on.
 func TestBindAllowsAnUndeclaredHost(t *testing.T) {
