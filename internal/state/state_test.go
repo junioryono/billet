@@ -129,6 +129,62 @@ func TestLeaseGuestOSDefaultsToLinux(t *testing.T) {
 	}
 }
 
+// Migration 6 backfilled EVERY pre-existing lease to 'linux', macOS ones
+// included. That direction is dangerous rather than merely wrong: an unbound
+// macOS lease relabelled Linux would be PERMITTED onto a Linux-only host, even
+// though its durable macos_slot proves what it is. Migration 7 corrects it from
+// macos_slot, which is the authoritative record.
+func TestMacOSLeasesAreBackfilledFromTheirSlot(t *testing.T) {
+	db := open(t)
+	ctx := t.Context()
+
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+
+	// Reproduce the post-migration-6 state a version-5 database would land in:
+	// a macOS lease carrying macos_slot=1 but labelled linux.
+	if err := db.Tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx,
+			`INSERT INTO leases (id, tier, phase, vcpu, memory, epoch, macos_slot, guest_os,
+			                     created_at, heartbeat_at, expires_at)
+			 VALUES ('mac', 't', 'capacity', 1, 1, 0, 1, 'linux', ?, ?, ?)`, now, now, now)
+
+		return err
+	}); err != nil {
+		t.Fatalf("insert mislabelled macOS lease: %v", err)
+	}
+
+	// Apply migration 7's backfill exactly as recorded.
+	var backfill string
+
+	for _, m := range migrations {
+		if m.Version == 7 {
+			backfill = m.Stmts[0]
+		}
+	}
+
+	if backfill == "" {
+		t.Fatal("migration 7 not found")
+	}
+
+	if err := db.Tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, backfill)
+
+		return err
+	}); err != nil {
+		t.Fatalf("apply backfill: %v", err)
+	}
+
+	var guestOS string
+	if err := db.Reader().QueryRowContext(ctx,
+		`SELECT guest_os FROM leases WHERE id = 'mac'`).Scan(&guestOS); err != nil {
+		t.Fatalf("read guest_os: %v", err)
+	}
+
+	if guestOS != "macos" {
+		t.Errorf("guest_os = %q for a lease holding a macOS slot, want %q", guestOS, "macos")
+	}
+}
+
 func TestOpenIsIdempotent(t *testing.T) {
 	dir := t.TempDir()
 	first, err := Open(t.Context(), dir)

@@ -409,10 +409,9 @@ var placementMigration = migration{
 // operating systems, and the check happens at bind time — long after the tier
 // catalog that produced the lease may have changed underneath it.
 //
-// The default is 'linux' because every lease predating this column was created
-// when a macOS tier was required to pin a node, and the overwhelming majority
-// of guests are Linux. A wrong default here is not silent: it would refuse a
-// bind on a restricted host rather than permit one.
+// 'linux' is the column default because it is the overwhelming majority case
+// and a real guest OS: an empty default would match no allowlist and strand
+// every lease written before the column existed.
 var guestOSMigration = migration{
 	Version: 6,
 	Name:    "lease_guest_os",
@@ -421,7 +420,35 @@ var guestOSMigration = migration{
 	},
 }
 
-func init() { migrations = append(migrations, placementMigration, guestOSMigration) }
+// placementFactsMigration corrects migration 6's backfill and records the
+// remaining placement fact.
+//
+// Migration 6 defaulted EVERY pre-existing lease to 'linux', including macOS
+// ones. That is not a safe default in the direction its own comment claimed:
+// an unbound macOS lease relabelled Linux would be PERMITTED onto a Linux-only
+// host, even though its durable macos_slot proves what it is. macos_slot is the
+// authoritative record, so it is what the backfill reads.
+//
+// Corrected by appending rather than by editing migration 6: the checksum guard
+// exists precisely to stop an applied migration changing underneath a database,
+// and "nobody has run it yet" is the argument that erodes that discipline.
+//
+// provider joins target_node, macos_slot and guest_os as a placement fact
+// recorded on the row. A Firecracker lease cannot run on a Tart host, so Bind
+// has to be able to compare — and re-deriving it from the live catalog is what
+// lets a tier redefined mid-flight reclassify a lease that is already running.
+var placementFactsMigration = migration{
+	Version: 7,
+	Name:    "lease_placement_facts",
+	Stmts: []string{
+		`UPDATE leases SET guest_os = 'macos' WHERE macos_slot = 1`,
+		`ALTER TABLE leases ADD COLUMN provider TEXT NOT NULL DEFAULT ''`,
+	},
+}
+
+func init() {
+	migrations = append(migrations, placementMigration, guestOSMigration, placementFactsMigration)
+}
 
 const bootstrapSchemaMigrations = `CREATE TABLE IF NOT EXISTS schema_migrations (
 	version    INTEGER PRIMARY KEY,

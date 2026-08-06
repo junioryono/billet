@@ -666,14 +666,71 @@ func TestNegativeNodeLimitDoesNotCascade(t *testing.T) {
 	if err == nil {
 		t.Fatal("Load accepted a negative macos_vm_limit")
 	}
-	if !strings.Contains(err.Error(), "must not be negative") {
-		t.Errorf("error should report the negative limit, got: %v", err)
+	// Asserted whole rather than by exclusion: listing phrases that must NOT
+	// appear stays green when a NEW second diagnostic arrives with different
+	// wording, which is exactly the cascade this guards against.
+	const want = `node "mac-mini-1": macos_vm_limit must not be negative`
+	if got := strings.TrimPrefix(err.Error(), "invalid config "); !strings.HasSuffix(got, want) {
+		t.Errorf("want exactly one diagnostic ending %q, got:\n%v", want, err)
 	}
-	if strings.Contains(err.Error(), "between 1 and -1") {
-		t.Errorf("a negative limit produced a nonsensical derived range, got: %v", err)
+}
+
+// A pinned tier whose provider differs from its host's loads cleanly and can
+// never be placed — the host cannot run it. Silent at load time, that is a job
+// that queues forever.
+func TestPinnedTierMustMatchItsHostProvider(t *testing.T) {
+	body := validConfig + `
+  - label: billet-4vcpu-mismatched
+    provider: firecracker
+    guest_os: linux
+    node: mac-mini-1
+    vcpu: 4
+    memory: 12GiB
+    image: ubuntu-2404-x64
+` + nodesSection("    provider: tart\n    guest_os: [linux]\n")
+	_, err := Load(writeConfig(t, body))
+	if err == nil {
+		t.Fatal("a firecracker tier pinned to a tart host was accepted")
 	}
-	if strings.Contains(err.Error(), "exceeding") {
-		t.Errorf("a negative limit produced a derived aggregate error, got: %v", err)
+	if !strings.Contains(err.Error(), "which runs tart") {
+		t.Errorf("error should name the host's actual provider, got: %v", err)
+	}
+}
+
+// One invalid enum must produce one diagnostic. Feeding a typo into the
+// relational allowlist check produced a second describing the same mistake in
+// terms that send the reader to the wrong field.
+func TestInvalidGuestOSDoesNotCascadeIntoAllowlistErrors(t *testing.T) {
+	body := validConfig + `
+  - label: billet-4vcpu-bad-guest
+    provider: tart
+    guest_os: plan9
+    vcpu: 4
+    memory: 12GiB
+    image: ubuntu-2404-arm64
+` + nodesSection("    provider: tart\n    guest_os: [linux]\n")
+	_, err := Load(writeConfig(t, body))
+	if err == nil {
+		t.Fatal("Load accepted an unknown guest_os")
+	}
+	if !strings.Contains(err.Error(), "is not one of") {
+		t.Errorf("error should report the unknown value, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "allowlist") {
+		t.Errorf("an unknown guest_os cascaded into an allowlist diagnostic, got: %v", err)
+	}
+}
+
+// The same in the other direction: a typo in a NODE's allowlist must not be
+// reported again as a tier mismatch.
+func TestInvalidNodeGuestOSDoesNotCascadeIntoTierErrors(t *testing.T) {
+	body := validConfig + macOSTier + nodesSection("    provider: tart\n    guest_os: [plan9]\n")
+	_, err := Load(writeConfig(t, body))
+	if err == nil {
+		t.Fatal("Load accepted an unknown guest_os in a node allowlist")
+	}
+	if strings.Contains(err.Error(), "allowlist") {
+		t.Errorf("an unknown node guest_os cascaded into a tier diagnostic, got: %v", err)
 	}
 }
 

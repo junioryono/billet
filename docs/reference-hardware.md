@@ -16,7 +16,7 @@ billet deployment; so is a single EC2 spot instance.
 | Board | Supermicro H12SSL-CT (single socket SP3) |
 | Memory | 512 GB DDR4-3200 ECC RDIMM (8× Samsung M393A8G40BB4-CWE, 64 GB 2Rx4) |
 | Network | 2× 10GBase-T (Broadcom BCM57416) + dedicated IPMI (ASPEED AST2500) |
-| Storage | 8× SATA3, Broadcom 3008 SAS3 controller, 2× M.2 PCIe 4.0 ×4 |
+| Storage | 8× SATA3, 8 SAS3 device ports (Broadcom 3008), 2× M.2 PCIe 4.0 ×4 |
 
 Verified against [AMD's 7763 product
 page](https://www.amd.com/en/products/processors/server/epyc/7003-series/amd-epyc-7763.html)
@@ -26,8 +26,7 @@ and the [H12SSL-CT product
 page](https://www.supermicro.com/en/products/motherboard/h12ssl-ct) rather than
 from memory — the H12SSL variants differ in exactly the ways that matter here
 (`-i`/`-C` carry 1 GbE, `-CT`/`-NT` carry 10 GbE; only `-C`/`-CT` carry the
-SAS3008), and the family manual and the per-model page do not agree on
-everything. See the storage note below.
+SAS3008).
 
 ### CPU topology, and why it decides tier shapes
 
@@ -108,13 +107,16 @@ carries **8× SATA3**, **2× M.2** (PCIe 4.0 ×4, M-key, 2280/22110), and a
 useful, because a mirrored pair of NVMe drives is the natural home for the
 control-plane database and golden images.
 
-Two details worth knowing before planning a layout:
+The SAS3008 provides **eight SAS device ports through two Mini-SAS HD
+connectors** — each connector breaks out to four drives. The product page counts
+the two physical connectors while the manual counts the eight device ports it
+labels `L-SAS 0-3` and `L-SAS 4-7`; those groupings are the same hardware
+described at different granularity, not a contradiction. (The retail pack ships
+two Mini-SAS HD cables, consistent with that.) The M.2 links are separate and
+are not shared with the SAS lanes.
 
-- **The SAS3 port count is documented inconsistently.** The product page's I/O
-  section lists **2 SAS3 ports**, and its key-features summary describes the
-  3008 as serving "2 SAS3 ports, 2 M.2" — implying its lanes are shared with the
-  M.2 sockets. The family manual's variant table instead says 8. Count the
-  physical connectors before committing to a drive plan.
+One detail worth knowing before planning a layout:
+
 - **The 3008 advertises RAID 0/1/10**, so it is not unconditionally a plain HBA.
   ZFS wants direct, unabstracted access to each disk: confirm the controller is
   presenting drives individually (IT/JBOD-style) rather than through a RAID
