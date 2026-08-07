@@ -74,6 +74,23 @@ billet package.
 
 ---
 
+## Upstream references
+
+`docs/upstream-references.md` records what billet takes from other people's code and what it
+deliberately does not. Read it before reimplementing anything that touches the scale-set protocol.
+
+Two things from it that come up constantly:
+
+- **`github.com/actions/scaleset` is the answer to most protocol questions**, and usually the only
+  answer — the API is not documented elsewhere. `actions-runner-controller` depends on the same
+  module at the same version, so the `listener` package inside it is ARC's, not a generic vendor's.
+- **billet is not actions-runner-controller without Kubernetes.** ARC does not track individual jobs
+  at all; its whole scaling decision is `min(MinRunners+TotalAssignedJobs, MaxRunners)` and
+  Kubernetes absorbs scheduling, queueing and placement. Billet has fixed hardware, one global budget
+  across tiers, and placement constraints (CCD locality, the macOS licence cap, guest-OS allowlists)
+  that need a lease bound to a specific host. ARC has no cache, no sticky disks, no microVM
+  isolation — everything that makes this project worth building.
+
 ## Invariants
 
 These are the rules that a change can silently break. Each one exists because the alternative was a

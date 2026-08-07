@@ -1271,6 +1271,56 @@ func TestAnAcquisitionOutsideItsRequestStopsTheListener(t *testing.T) {
 	}
 }
 
+// The message cursor must not move past a message that was never acknowledged.
+//
+// lastMessageID is a SERVER-SIDE cursor, not a local note of what was seen: the
+// client sends it as ?lastMessageId= and the queue returns messages AFTER it.
+// Advancing it before the work means any handling failure that does not end the
+// session skips the message, and every job in it, with no trace.
+//
+// Driven through handle() directly, and that is the whole difficulty. Through
+// Run() the bug is INVISIBLE: every failure in handle is currently fatal, so the
+// listener stops before it can poll again and the bad cursor is never sent. A
+// test at that level passes with the fix reverted — confirmed by mutation. The
+// cursor is therefore only correct today as a side effect of an unrelated
+// decision about error severity, which is exactly why it needs pinning here:
+// the first non-fatal error path anyone adds would start dropping messages.
+func TestTheCursorDoesNotAdvancePastAnUnacknowledgedMessage(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+
+	session := &fakeSession{}
+	session.onDelete = func(int64) error { return errors.New("acknowledgement lost in transit") }
+
+	l := NewListener(a, tiers[0].Label, session)
+
+	msg := &Message{MessageID: 42, Available: []Job{{RequestID: 11, RunID: 101}}}
+
+	if err := l.handle(t.Context(), msg); err == nil {
+		t.Fatal("handle reported success despite the acknowledgement failing")
+	}
+
+	if l.lastMessageID != 0 {
+		t.Errorf("the cursor advanced to %d after a failed acknowledgement; the next poll "+
+			"would ask github for messages after %d, skipping message 42 and every job it "+
+			"carried", l.lastMessageID, l.lastMessageID)
+	}
+
+	// And it DOES advance once the acknowledgement lands, or the listener would
+	// re-handle the same message forever.
+	session.onDelete = nil
+
+	if err := l.handle(t.Context(), msg); err != nil {
+		t.Fatalf("handle: %v", err)
+	}
+
+	if l.lastMessageID != 42 {
+		t.Errorf("the cursor is %d after a successful acknowledgement; the listener would "+
+			"be redelivered message 42 forever", l.lastMessageID)
+	}
+}
+
 // fakeSession stands in for a scale-set message session. It never returns work,
 // so the listener does nothing but escrow, advertise, and release — which is the
 // whole of what this test is about.

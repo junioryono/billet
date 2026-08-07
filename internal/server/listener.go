@@ -605,12 +605,28 @@ func (l *Listener) refillEscrow(ctx context.Context) error {
 }
 
 // handle processes one message and acknowledges it.
+//
+// lastMessageID is advanced at the END, and only once the acknowledgement lands.
+//
+// It is sent to the SERVICE as ?lastMessageId= (session_client.go getMessage),
+// so it is a claim about what billet is done with rather than a local note. What
+// the source actually proves is narrower than it is tempting to state: the
+// client only shows that the parameter is SENT. The service's own contract, per
+// the client's doc comment, is that an undeleted message is returned again. How
+// the queue treats the parameter is not established by anything billet can read,
+// and this comment previously asserted it did.
+//
+// Advancing it after the acknowledgement is the conservative order under either
+// reading. If the parameter does filter, advancing early skips a message whose
+// work never happened; if it does not, advancing late costs one redelivery of a
+// message that is safe to re-handle. The asymmetry is the whole argument.
+//
+// Nothing exercises it yet, because every failure here is currently fatal — the
+// session ends and a fresh one starts the cursor at zero. That is the fragile
+// part: the cursor was only correct as a side effect of an unrelated decision
+// about error severity, so the first non-fatal error path anyone adds inherits
+// the question.
 func (l *Listener) handle(ctx context.Context, msg *Message) error {
-	// Recorded BEFORE the work, so a crash mid-handling redelivers rather than
-	// skips. Everything derived from a message must be idempotent for the same
-	// reason: an unacknowledged message comes back.
-	l.lastMessageID = msg.MessageID
-
 	// A zero advertisement is not the same as refusing work, and this is where
 	// the difference is enforced.
 	//
@@ -625,7 +641,16 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 				"tier", l.tier, "available", len(msg.Available), "assigned", len(msg.Assigned))
 		}
 
-		return l.acknowledge(ctx, msg)
+		if err := l.acknowledge(ctx, msg); err != nil {
+			return err
+		}
+
+		// Advanced here too. The invariant is "a successful acknowledgement
+		// advances the cursor", and an early return that acknowledges without
+		// advancing is the same class of inconsistency the reordering fixed.
+		l.lastMessageID = msg.MessageID
+
+		return nil
 	}
 
 	// COMPLETED IS PROCESSED FIRST, and the order is the fix.
@@ -695,7 +720,26 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 		l.observed = msg.Statistics
 	}
 
-	return l.acknowledge(ctx, msg)
+	if err := l.acknowledge(ctx, msg); err != nil {
+		return err
+	}
+
+	// Only now. An unacknowledged message is redelivered, and re-handling one is
+	// safe once the acquisition outcome is KNOWN: completions rebuild their own
+	// tombstone set, offers already promised are skipped by reserve, and
+	// assignments are idempotent by request id. Skipping a message is not
+	// recoverable, so late beats early.
+	//
+	// That safety does NOT extend to an ambiguous acquisition. If AcquireJobs
+	// commits at GitHub and the response is lost, billet sees an error, unreserves
+	// every id, and has no way to learn it now owes runners for them — AcquireJobs
+	// being one-way means there is nothing to ask. Today that cannot bite, because
+	// an acquisition error ends the session and the whole control plane; anyone
+	// making it non-fatal has to solve the unknown-outcome case first, and the
+	// answer is not "retry".
+	l.lastMessageID = msg.MessageID
+
+	return nil
 }
 
 // acknowledge tells GitHub the message was handled. An unacknowledged message is
