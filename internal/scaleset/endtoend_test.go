@@ -11,8 +11,6 @@ import (
 	"testing"
 	"time"
 
-	gh "github.com/actions/scaleset"
-
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/server"
@@ -139,9 +137,17 @@ func TestAnAvailableJobIsAcquiredByItsOwnRequestID(t *testing.T) {
 	}()
 
 	l := server.NewListener(a, "billet-4vcpu", sess)
-	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) &&
-		!errors.Is(err, context.DeadlineExceeded) {
+	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run: %v", err)
+	}
+
+	// The OUTER deadline is a failure, not an ending. A listener that wedges after
+	// one acquisition would satisfy every assertion below and then sit until the
+	// timeout, so accepting DeadlineExceeded let a broken run pass.
+	if delivered.Load() < 2 {
+		t.Fatalf("only %d polls completed; the run never got past the first batch, so the "+
+			"assertions below describe a listener that stopped rather than one that worked",
+			delivered.Load())
 	}
 
 	acquisitions := fake.calls("/acquirejobs")
@@ -207,7 +213,11 @@ func TestAdvertisedCapacityReachesTheWireAsAHeader(t *testing.T) {
 			w.WriteHeader(http.StatusNoContent)
 
 		case strings.HasPrefix(r.URL.Path, "/messages"):
-			if n, err := strconv.ParseInt(r.Header.Get(gh.HeaderScaleSetMaxCapacity), 10, 64); err == nil {
+			// The LITERAL name, deliberately, not the dependency constant that
+			// also writes it. Reading through the same constant means a rename
+			// upstream moves both sides together and the test keeps passing while
+			// the wire contract has changed underneath it.
+			if n, err := strconv.ParseInt(r.Header.Get("X-Scalesetmaxcapacity"), 10, 64); err == nil {
 				advertised.Store(n)
 			}
 
@@ -263,9 +273,13 @@ func TestAdvertisedCapacityReachesTheWireAsAHeader(t *testing.T) {
 	}()
 
 	l := server.NewListener(a, "billet-4vcpu", sess)
-	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) &&
-		!errors.Is(err, context.DeadlineExceeded) {
+	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run: %v", err)
+	}
+
+	if polls.Load() < 2 {
+		t.Fatalf("only %d polls completed; the listener wedged rather than advertising "+
+			"repeatedly", polls.Load())
 	}
 
 	if got := advertised.Load(); got != 2 {

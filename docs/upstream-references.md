@@ -22,7 +22,7 @@ documentation:
 | Question | Where |
 |---|---|
 | What does the message queue consider acknowledged? | `session_client.go` `getMessage` / `DeleteMessage` |
-| Is `lastMessageId` a cursor or a note? | `session_client.go` `getMessage` — it is a **server-side cursor** |
+| Is `lastMessageId` a cursor or a note? | `session_client.go` `getMessage` — the source proves only that it is SENT; the doc comment promises an undeleted message returns again. How the queue filters on it is NOT established by anything readable. |
 | What shape is a batched job message? | `client.go` `parseRunnerScaleSetMessageResponse` — the batch is a JSON **string** in `body` |
 | Is there a way to decline an acquired job? | `session_client.go` — **there is not**; `AcquireJobs` is one-way |
 | What is `maxCapacity`? | `listener/listener.go` — the scale set's TOTAL, sent unchanged as jobs are assigned |
