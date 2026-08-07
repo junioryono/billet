@@ -61,13 +61,26 @@ func githubAppCreate(ctx context.Context, args []string) error {
 		return err
 	}
 
-	// Removed only on a path where nothing was ever written into it.
+	// Removed ONLY if GitHub never issued a credential.
+	//
+	// Keying this on "did the write succeed" was wrong in a way that shows up
+	// only on unusual filesystems: a rename can commit and still report an error
+	// — a FUSE or network mount that loses the reply — leaving the complete key
+	// at the destination while the code below believed nothing was written and
+	// unlinked it by pathname.
+	//
+	// Once OnAppCreated has been entered, GitHub has consumed the one-time code
+	// and the credential exists. From that moment nothing here may delete the
+	// destination. An empty reservation left behind after a genuine write failure
+	// costs one `rm`; deleting a real key costs a credential GitHub will not
+	// re-issue.
+	credentialIssued := false
 	keyWritten := false
 
 	defer func() {
 		keyFile.Close()
 
-		if !keyWritten {
+		if !credentialIssued {
 			_ = os.Remove(*keyPath)
 		}
 	}()
@@ -105,10 +118,14 @@ func githubAppCreate(ctx context.Context, args []string) error {
 		// OnAppCreated doc comment: this ordering is what stops a failed install
 		// from orphaning a real app whose key GitHub will never re-issue.
 		OnAppCreated: func(app *github.App) error {
+			// Set FIRST. Reaching this callback means GitHub has registered the
+			// App and consumed the one-time code, so the destination stops being
+			// billet's to delete whatever happens next.
+			credentialIssued = true
+
 			// keyWritten is set from inside, the moment the key reaches its
 			// final path — not after this returns. A durability error AFTER a
-			// successful rename must not make the deferred cleanup delete an
-			// installed credential.
+			// successful rename must not report the write as having failed.
 			err := writeKeyAtomically(keyFile, *keyPath, []byte(app.PEM), func() {
 				keyWritten = true
 
@@ -361,7 +378,7 @@ func checkPrivateKey(path string) error {
 	// lookups of the same name: the file can be swapped in between, so the size,
 	// type and mode may describe a different inode than the bytes that get
 	// parsed — and os.ReadFile on a FIFO blocks forever rather than returning.
-	f, err := os.Open(path)
+	f, err := openForInspection(path)
 	if err != nil {
 		return fmt.Errorf("github.private_key_path %s: %w", path, err)
 	}

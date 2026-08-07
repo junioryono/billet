@@ -12,9 +12,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -189,6 +189,53 @@ func (a App) Format(s fmt.State, verb rune) {
 	_ = verb
 }
 
+// MarshalJSON keeps credentials out of anything that serializes this struct.
+//
+// fmt.Formatter covers direct formatting and nothing else. billet standardizes
+// on log/slog, and slog's JSON handler uses encoding/json — which reads the
+// exported fields and their tags, emitting `pem`, `webhook_secret` and
+// `client_secret` verbatim. `logger.Info("created", "app", app)` was therefore a
+// full private-key disclosure into whatever the logs go to.
+//
+// Only MARSHALING is redirected. Decoding GitHub's conversion response uses the
+// default unmarshaler and still populates every field, which is what the
+// onboarding flow needs.
+func (a App) MarshalJSON() ([]byte, error) {
+	// A distinct type, not App, or this method recurses forever.
+	type redacted struct {
+		ID          int64  `json:"id"`
+		Slug        string `json:"slug"`
+		Name        string `json:"name"`
+		HTMLURL     string `json:"html_url"`
+		ClientID    string `json:"client_id"`
+		Credentials string `json:"credentials"`
+	}
+
+	out, err := json.Marshal(redacted{
+		ID:          a.ID,
+		Slug:        a.Slug,
+		Name:        a.Name,
+		HTMLURL:     a.HTMLURL,
+		ClientID:    a.ClientID,
+		Credentials: "[redacted]",
+	})
+	if err != nil {
+		return nil, fmt.Errorf("github: marshal redacted app: %w", err)
+	}
+
+	return out, nil
+}
+
+// LogValue is what slog asks for before falling back to reflection, so a
+// text handler redacts for the same reason the JSON one does.
+func (a App) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.Int64("id", a.ID),
+		slog.String("slug", a.Slug),
+		slog.String("credentials", "[redacted]"),
+	)
+}
+
 // Forget blanks the credentials billet does not keep.
 //
 // Onboard returns this struct after the key is on disk, and only the App ID and
@@ -222,7 +269,23 @@ func ConvertManifest(ctx context.Context, client *http.Client, code string) (*Ap
 
 // convertManifestAt is ConvertManifest with an injectable base URL, so the
 // exchange can be tested against httptest without reaching GitHub.
+//
+// EVERY error leaving this function is redacted, not just the transport one.
+// Redacting at individual call sites missed the response path entirely: a
+// non-201 body is rendered by apiError, and a body that echoes the request route
+// — which an intermediary proxy readily produces — carries the still-live code
+// straight to the operator's terminal. Wrapping the whole boundary means a
+// future return statement cannot forget.
 func convertManifestAt(ctx context.Context, client *http.Client, base, code string) (*App, error) {
+	app, err := convertManifest(ctx, client, base, code)
+	if err != nil {
+		return nil, redactCode(err, code)
+	}
+
+	return app, nil
+}
+
+func convertManifest(ctx context.Context, client *http.Client, base, code string) (*App, error) {
 	if code == "" {
 		return nil, fmt.Errorf("github: empty manifest code")
 	}
@@ -240,7 +303,7 @@ func convertManifestAt(ctx context.Context, client *http.Client, base, code stri
 	if err != nil {
 		// Redacted: the URL carries the one-time manifest code, and a transport
 		// failure would otherwise print it to stderr.
-		return nil, fmt.Errorf("github: convert manifest: %w", redactCodeFromURLError(err, code))
+		return nil, fmt.Errorf("github: convert manifest: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -271,50 +334,48 @@ func convertManifestAt(ctx context.Context, client *http.Client, base, code stri
 	return &app, nil
 }
 
-// redactCodeFromURLError strips the URL from a transport error.
+// redactedError hides a secret in its message while keeping the original error
+// reachable.
 //
-// net/http reports failures as *url.Error, whose Error() embeds the full URL.
-// For the manifest exchange that URL contains the ONE-TIME CODE, and the code is
-// still live when the POST fails — a proxy misconfiguration, a DNS failure, a
-// TLS error. billet prints that to stderr, so anyone who can read a terminal
-// scrollback, a systemd journal or a CI log could race to redeem it and receive
-// the App's private key, webhook secret and client secret.
-//
-// The underlying network error is preserved and still unwrappable; only the URL
-// is replaced, since the operator already knows which operation failed from the
-// message wrapping this one.
-func redactCodeFromURLError(err error, code string) error {
-	// Scrubbed by VALUE rather than by walking the error tree.
-	//
-	// Redacting only the outer *url.Error was not enough: http.Client.Do wraps
-	// whatever a RoundTripper returns, so an instrumented or custom transport
-	// that itself produces a *url.Error leaves the inner one — with the live
-	// code — inside the retained Err. And nothing says the code can only ever
-	// appear in a URL field; an HTTP error body that echoes the request path
-	// reaches the same operator terminal through apiError.
-	//
-	// Matching the literal code and its path-escaped form covers every path it
-	// could have taken into the text, and needs no assumption about which error
-	// types a transport composes.
-	var urlErr *url.Error
-	if errors.As(err, &urlErr) {
-		// Op is kept so the operator still knows which operation failed, and the
-		// scrubbed Err keeps the transport's own message. Timeout() and
-		// Temporary() are lost with the concrete type; the message they would
-		// have explained is retained, which is what a human reads.
-		clean := *urlErr
-		clean.URL = redactedCode
-		clean.Err = errors.New(redactString(urlErr.Err.Error(), code))
+// Replacing the wrapped error with errors.New destroyed the chain:
+// errors.Is(err, context.DeadlineExceeded) and errors.As to *net.OpError both
+// stopped working, so the caller could no longer classify a timeout — while a
+// comment claimed the underlying error was still unwrappable. Error() is
+// sanitized; Unwrap returns the real thing, so inspection works and only the
+// rendered text is scrubbed.
+type redactedError struct {
+	msg string
+	err error
+}
 
-		return &clean
+func (e *redactedError) Error() string { return e.msg }
+func (e *redactedError) Unwrap() error { return e.err }
+
+// redactCode removes the one-time manifest code from an error's message.
+//
+// The code redeems for the App's private key, webhook secret and client secret,
+// and it is still LIVE when the exchange fails. net/http reports transport
+// failures as *url.Error, whose Error() embeds the full URL; a non-201 response
+// is rendered by apiError from a body that an intermediary may well echo the
+// request route into. Either way it reaches the operator's terminal, where
+// anyone reading a scrollback, a journal or a CI log could redeem it first.
+//
+// Scrubbing the rendered TEXT rather than walking the error tree is deliberate:
+// http.Client.Do wraps whatever a RoundTripper returns, so a transport that
+// itself produces a *url.Error hides another copy inside. Matching the value
+// needs no assumption about how errors are composed.
+func redactCode(err error, code string) error {
+	msg := redactString(err.Error(), code)
+	if msg == err.Error() {
+		return err
 	}
 
-	return errors.New(redactString(err.Error(), code))
+	return &redactedError{msg: msg, err: err}
 }
 
 const redactedCode = "[redacted: contains the one-time manifest code]"
 
-// redactString removes a secret and its URL-escaped form from a message.
+// redactString removes a secret and its percent-encoded spellings.
 func redactString(s, secret string) string {
 	if secret == "" {
 		return s
@@ -322,11 +383,46 @@ func redactString(s, secret string) string {
 
 	s = strings.ReplaceAll(s, secret, redactedCode)
 
-	if escaped := url.PathEscape(secret); escaped != secret {
-		s = strings.ReplaceAll(s, escaped, redactedCode)
+	// Percent-encoding is case-insensitive in its hex digits, so a value escaped
+	// elsewhere can arrive as %2f where url.PathEscape produces %2F. Matching
+	// one spelling let the other through.
+	//
+	// Matched case-insensitively rather than by generating variants: uppercasing
+	// the escaped string would also fold the literal characters, so a mixed-case
+	// code produced a variant matching nothing. Folding over-redacts slightly —
+	// a differently-cased copy of the code is also removed — which is the right
+	// direction for a scrub.
+	for _, escaped := range []string{url.PathEscape(secret), url.QueryEscape(secret)} {
+		if escaped != secret {
+			s = replaceFold(s, escaped, redactedCode)
+		}
 	}
 
 	return s
+}
+
+// replaceFold is strings.ReplaceAll with case-insensitive matching.
+func replaceFold(s, old, replacement string) string {
+	if old == "" {
+		return s
+	}
+
+	var b strings.Builder
+
+	for i := 0; i < len(s); {
+		if i+len(old) <= len(s) && strings.EqualFold(s[i:i+len(old)], old) {
+			b.WriteString(replacement)
+
+			i += len(old)
+
+			continue
+		}
+
+		b.WriteByte(s[i])
+		i++
+	}
+
+	return b.String()
 }
 
 func setAPIHeaders(req *http.Request) {
