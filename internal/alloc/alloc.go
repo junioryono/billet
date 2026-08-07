@@ -119,13 +119,6 @@ var (
 	// ErrNotPlaced means a lease reached a phase that presumes a host without
 	// ever being bound to one.
 	ErrNotPlaced = errors.New("alloc: lease has no bound node")
-	// ErrNodeNotFound means the node is not registered. Draining one that was
-	// never there is a typo worth hearing about, not a no-op.
-	ErrNodeNotFound = errors.New("alloc: node not found")
-	// ErrNodeDrained means the host is being emptied and must not take new work.
-	// Distinct from ErrWrongNode: the host is registered and suitable, it is just
-	// on its way out.
-	ErrNodeDrained = errors.New("alloc: node is draining")
 	// ErrNotPlaceable means a lease carries too little recorded placement
 	// information to verify a host is legal for it — a row predating the
 	// columns the checks read. It fails closed rather than skipping the checks.
@@ -511,59 +504,6 @@ func (a *Allocator) checkPlacement(ctx context.Context, tx *sql.Tx, lease *Lease
 	return nil
 }
 
-// SetDrained marks a host as taking no new work, or lets it take work again.
-//
-// Draining is the ONLY safe way to empty a host, and it is deliberately
-// non-destructive: nothing already placed is touched. Existing leases run to
-// completion while headroom for anything pinned here reports zero, so the
-// listener advertises nothing and the host empties on its own. That is what
-// makes removal safe later, and it is why removal cannot simply fence what it
-// finds — see the reverted RemoveNode.
-func (a *Allocator) SetDrained(ctx context.Context, node string, drained bool) error {
-	return a.db.Tx(ctx, func(tx *sql.Tx) error {
-		flag := 0
-		if drained {
-			flag = 1
-		}
-
-		res, err := tx.ExecContext(ctx,
-			`UPDATE nodes SET drained = ? WHERE name = ?`, flag, node)
-		if err != nil {
-			return fmt.Errorf("alloc: set drained on node %s: %w", node, err)
-		}
-
-		// Rows affected, not a prior COUNT: one statement, and no window between
-		// deciding the node exists and acting on it.
-		n, err := res.RowsAffected()
-		if err != nil {
-			return fmt.Errorf("alloc: set drained on node %s: %w", node, err)
-		}
-
-		if n == 0 {
-			return fmt.Errorf("%w: %s", ErrNodeNotFound, node)
-		}
-
-		return nil
-	})
-}
-
-// nodeDrained reports whether a host is refusing new work. An unregistered node
-// is not draining — it is absent, which the placement checks report separately
-// and with a better message.
-func nodeDrained(ctx context.Context, tx *sql.Tx, node string) (bool, error) {
-	var drained int
-
-	switch err := tx.QueryRowContext(ctx,
-		`SELECT drained FROM nodes WHERE name = ?`, node).Scan(&drained); {
-	case errors.Is(err, sql.ErrNoRows):
-		return false, nil
-	case err != nil:
-		return false, fmt.Errorf("alloc: read drain state of node %s: %w", node, err)
-	}
-
-	return drained == 1, nil
-}
-
 // macOSLimit is the cap on concurrent macOS guests for a host. See Limits.Nodes
 // for why an unlisted node gets Apple's default rather than no limit at all.
 func (a *Allocator) macOSLimit(node string) int {
@@ -590,22 +530,6 @@ func (a *Allocator) allowsGuestOS(node string, os config.GuestOS) bool {
 // smallest wins — capacity is a vector, so "enough cores" says nothing about
 // memory or about the per-host macOS guest limit.
 func (a *Allocator) headroom(ctx context.Context, tx *sql.Tx, t config.Tier) (int, error) {
-	// A tier pinned to a draining host has nowhere to run, so it has no headroom
-	// — checked FIRST, because every other limit below would otherwise report
-	// capacity that cannot be placed. This is what actually empties a host: the
-	// listener advertises zero, GitHub sends no work, and what is already running
-	// finishes on its own.
-	if t.Node != "" {
-		draining, err := nodeDrained(ctx, tx, t.Node)
-		if err != nil {
-			return 0, err
-		}
-
-		if draining {
-			return 0, nil
-		}
-	}
-
 	used, err := a.usage(ctx, tx)
 	if err != nil {
 		return 0, err
@@ -837,26 +761,6 @@ func (a *Allocator) Bind(ctx context.Context, leaseID string, epoch int64, node 
 		if lease.Node != "" {
 			return fmt.Errorf("%w: lease %s is already bound to node %q, cannot rebind to %q",
 				ErrWrongNode, leaseID, lease.Node, node)
-		}
-
-		// DRAIN IS CHECKED HERE, not in checkPlacement, and the difference matters.
-		// Advance re-runs the placement checks on entry to launching, online and
-		// busy, deliberately, so a guest-OS policy that tightens after a lease was
-		// placed is still enforced. Draining is the opposite kind of rule: it
-		// stops NEW work and must never disturb what is already on the host, so
-		// putting it in the shared check made a drain tear down the very jobs it
-		// was waiting to finish. A test caught that.
-		//
-		// It is also why draining is safe where fencing is not. Refusing a binding
-		// cannot revoke escrow a listener has already promised to GitHub, because
-		// a promised lease has not been bound yet.
-		draining, err := nodeDrained(ctx, tx, node)
-		if err != nil {
-			return err
-		}
-
-		if draining {
-			return fmt.Errorf("%w: node %q will not take lease %s", ErrNodeDrained, node, leaseID)
 		}
 
 		// A FIRST binding for a lease already in a running phase means its node
