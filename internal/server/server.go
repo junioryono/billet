@@ -47,6 +47,10 @@ type Server struct {
 	maxCapacity *int
 	// reapEvery is how often abandoned capacity is reclaimed.
 	reapEvery time.Duration
+	// runner is handed to every listener, so an assigned lease becomes compute.
+	// nil means none is attached and the listeners fail closed.
+	runner Runner
+
 	// onReap, when set, is called with the number of leases each reap pass
 	// reclaimed. Tests only, and it exists because a test of what the reaper must
 	// NOT reclaim passes trivially against a reaper that was never started.
@@ -65,6 +69,14 @@ type ControlPlaneOption func(*Server)
 // goroutine runs.
 func WithReapInterval(d time.Duration) ControlPlaneOption {
 	return func(s *Server) { s.reapEvery = d }
+}
+
+// WithNodeRunner attaches the compute every listener launches onto.
+//
+// Without it the listeners fail closed: they account for capacity and decline
+// the work, rather than accepting jobs nothing can run.
+func WithNodeRunner(r Runner) ControlPlaneOption {
+	return func(s *Server) { s.runner = r }
 }
 
 // AdvertiseNothing makes every listener advertise zero capacity.
@@ -216,6 +228,10 @@ func (s *Server) runTier(ctx context.Context, t *config.Tier, set *ScaleSet) err
 	opts := []Option{WithLogger(s.log)}
 	if s.maxCapacity != nil {
 		opts = append(opts, WithMaxCapacity(*s.maxCapacity))
+	}
+
+	if s.runner != nil {
+		opts = append(opts, WithRunner(s.runner))
 	}
 
 	return NewListener(s.alloc, t.Label, session, opts...).Run(ctx)

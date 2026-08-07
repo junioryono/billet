@@ -302,6 +302,14 @@ type JITRunner struct {
 // find, and so no reflection-based encoder reaches it by accident.
 func (j *JITRunner) Config() string { return j.encodedConfig }
 
+// RunnerName is the name GitHub registered.
+//
+// Read back from the registration rather than reused from the request, because
+// the two can differ — GitHub owns the name it actually registered, and teardown
+// has to remove THAT one. Using the requested name would work right up until it
+// did not, and the symptom would be a runner nobody can deregister.
+func (j *JITRunner) RunnerName() string { return j.Name }
+
 // String redacts. See the type comment.
 func (j JITRunner) String() string {
 	return fmt.Sprintf("scaleset.JITRunner{RunnerID:%d Name:%q config:[redacted]}", j.RunnerID, j.Name)

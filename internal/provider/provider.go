@@ -51,6 +51,43 @@ func (t TrustClass) String() string {
 	}
 }
 
+// Classify decides how much a workload is trusted from the event that queued it.
+//
+// DELIBERATELY CONSERVATIVE, and the reason is a limitation of the protocol
+// rather than caution for its own sake. A scale-set message carries an event
+// name and the repository it came from; it does NOT say whether a pull request
+// came from a fork. So billet cannot tell "a teammate opened a PR" from "a
+// stranger opened a PR against a public repo" — and those differ by whether
+// arbitrary outside code is about to run on your hardware.
+//
+// Given it cannot tell, it assumes the worse one. EVERY pull request is
+// untrusted. That is stricter than necessary for a private repository with two
+// members, and it is the only safe default for a tool other people will point at
+// public ones. A deployment that knows better can widen it deliberately; nothing
+// widens by accident.
+//
+// An unrecognised event is unknown, not trusted, for the same reason: GitHub adds
+// events, and a new one must not inherit permission from a switch statement
+// written before it existed.
+func Classify(event string) TrustClass {
+	switch event {
+	case "pull_request", "pull_request_target":
+		return TrustUntrusted
+
+	case "push", "schedule", "workflow_dispatch", "release", "merge_group",
+		"workflow_call", "workflow_run", "create", "delete", "deployment",
+		"deployment_status", "repository_dispatch":
+		return TrustTrusted
+
+	case "":
+		// No event at all. Nothing has been established, so nothing is assumed.
+		return TrustUnknown
+
+	default:
+		return TrustUnknown
+	}
+}
+
 // Spec is one instance to launch.
 type Spec struct {
 	// Name identifies the instance to the operator and to GitHub. It is the
