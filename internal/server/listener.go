@@ -129,13 +129,16 @@ type Listener struct {
 	// Reserving the lease under the mutex BEFORE the network call is also what
 	// closes the race with the heartbeat: a lease promised to an acquisition is no
 	// longer in held, so nothing else can spend it while AcquireJobs is in flight.
-	acquiring map[int64]*alloc.Lease
+	acquiring map[int64]*promise
 
 	lastMessageID int64
 
 	// maxCapacity, when set, caps what this listener advertises. nil means the
 	// escrow decides, which is the ordinary case.
 	maxCapacity *int
+
+	// promiseTTL is how long escrow waits for an assignment it was promised to.
+	promiseTTL time.Duration
 
 	// observed is the last statistics GitHub reported. TotalAssignedJobs is the
 	// documented scaling signal — counting messages is not, because a response
@@ -146,12 +149,13 @@ type Listener struct {
 // NewListener builds a listener for one tier.
 func NewListener(a *alloc.Allocator, tier string, session Session, opts ...Option) *Listener {
 	l := &Listener{
-		alloc:     a,
-		tier:      tier,
-		session:   session,
-		log:       slog.Default(),
-		running:   make(map[int64]*alloc.Lease),
-		acquiring: make(map[int64]*alloc.Lease),
+		alloc:      a,
+		tier:       tier,
+		session:    session,
+		log:        slog.Default(),
+		running:    make(map[int64]*alloc.Lease),
+		acquiring:  make(map[int64]*promise),
+		promiseTTL: defaultPromiseTTL,
 	}
 
 	for _, opt := range opts {
@@ -161,8 +165,38 @@ func NewListener(a *alloc.Allocator, tier string, session Session, opts ...Optio
 	return l
 }
 
+// promise is escrow set aside for a request GitHub has been told billet will
+// run, and the moment that undertaking was made.
+//
+// The time is what makes it releasable. Every other exit from this state needs
+// GitHub to say something — an assignment, a completion, a cancellation — and a
+// promise nobody ever follows up on would otherwise be renewed by the heartbeat
+// for the life of the process. held is reusable and running would be finished by
+// a node; this is the one state with no way back on its own.
+type promise struct {
+	lease *alloc.Lease
+	at    time.Time
+}
+
+// defaultPromiseTTL is how long escrow waits for the assignment it was promised
+// to.
+//
+// GitHub assigns an acquired job within roughly a minute and reassigns it a few
+// times if no runner takes it, so a promise still unclaimed after five minutes
+// is not going to be. Both of those are OBSERVED behaviour rather than a
+// documented contract, which is why this is generous and configurable rather
+// than tuned: being slow to reclaim a slot costs throughput, and reclaiming one
+// GitHub is about to use costs a job.
+const defaultPromiseTTL = 5 * time.Minute
+
 // Option configures a Listener.
 type Option func(*Listener)
+
+// WithPromiseTTL sets how long escrow waits for an assignment it was promised
+// to before being reclaimed.
+func WithPromiseTTL(d time.Duration) Option {
+	return func(l *Listener) { l.promiseTTL = d }
+}
 
 // WithLogger sets the logger. The default is slog.Default().
 func WithLogger(log *slog.Logger) Option {
@@ -459,8 +493,25 @@ func (l *Listener) heartbeatHeld(ctx context.Context) {
 		}
 	}
 
-	for id, lease := range l.acquiring {
-		if !l.renew(ctx, lease) {
+	for id, p := range l.acquiring {
+		// Expired promises are handed back rather than renewed. This is the only
+		// path that reclaims one: an acquisition GitHub never follows up on holds
+		// its lease against every other tier until the process ends.
+		if time.Since(p.at) > l.promiseTTL {
+			l.log.Warn("no assignment arrived for an acquired job; releasing its escrow",
+				"tier", l.tier, "request", id, "waited", time.Since(p.at).Round(time.Second))
+
+			if err := l.alloc.Release(ctx, p.lease.ID, p.lease.Epoch, alloc.PhaseDone); err != nil {
+				l.log.Warn("could not release an expired promise",
+					"tier", l.tier, "lease", p.lease.ID, "error", err)
+			}
+
+			delete(l.acquiring, id)
+
+			continue
+		}
+
+		if !l.renew(ctx, p.lease) {
 			delete(l.acquiring, id)
 		}
 	}
@@ -710,7 +761,7 @@ func (l *Listener) reserve(available []Job) []int64 {
 			continue
 		}
 
-		l.acquiring[job.RequestID] = l.held[0]
+		l.acquiring[job.RequestID] = &promise{lease: l.held[0], at: time.Now()}
 		l.held = l.held[1:]
 
 		ids = append(ids, job.RequestID)
@@ -729,9 +780,9 @@ func (l *Listener) unreserve(ids []int64) {
 	defer l.mu.Unlock()
 
 	for _, id := range ids {
-		if lease, ok := l.acquiring[id]; ok {
+		if p, ok := l.acquiring[id]; ok {
 			delete(l.acquiring, id)
-			l.held = append(l.held, lease)
+			l.held = append(l.held, p.lease)
 		}
 	}
 }
@@ -782,7 +833,12 @@ func (l *Listener) assign(ctx context.Context, job Job) error {
 	// The lease this assignment was PROMISED, if billet acquired the offer. This
 	// is the ordinary path: acquire reserved a lease against this exact request id
 	// and nothing else can have spent it in the meantime.
-	lease, promised := l.acquiring[job.RequestID]
+	var lease *alloc.Lease
+
+	p, promised := l.acquiring[job.RequestID]
+	if promised {
+		lease = p.lease
+	}
 
 	if !promised {
 		// No promise on file. GitHub can legitimately assign work this listener
@@ -846,7 +902,11 @@ func (l *Listener) complete(ctx context.Context, job Job) error {
 		// an assignment no runner picks up in time, and that cancellation arrives
 		// as a completion. The reserved escrow has to come back, or it is held for
 		// an assignment that will never arrive.
-		lease, ok = l.acquiring[job.RequestID]
+		var p *promise
+
+		if p, ok = l.acquiring[job.RequestID]; ok {
+			lease = p.lease
+		}
 	}
 
 	if !ok {
@@ -898,11 +958,11 @@ func (l *Listener) releaseAll(ctx context.Context) {
 	// Promised escrow too. The acquisition was made to GitHub, but nothing has
 	// been assigned yet and nothing can be launched, so holding it past shutdown
 	// would strand it until the reaper.
-	for _, lease := range l.acquiring {
-		release(lease)
+	for _, p := range l.acquiring {
+		release(p.lease)
 	}
 
 	l.held = nil
 	l.running = make(map[int64]*alloc.Lease)
-	l.acquiring = make(map[int64]*alloc.Lease)
+	l.acquiring = make(map[int64]*promise)
 }

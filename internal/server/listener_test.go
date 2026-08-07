@@ -415,12 +415,14 @@ func openState(t *testing.T) *state.DB {
 	return db
 }
 
-func newAllocator(t *testing.T, limits alloc.Limits, tiers []config.Tier) *alloc.Allocator {
+func newAllocator(t *testing.T, limits alloc.Limits, tiers []config.Tier,
+	opts ...alloc.Option,
+) *alloc.Allocator {
 	t.Helper()
 
 	db := openState(t)
 
-	a, err := alloc.New(db, limits, tiers)
+	a, err := alloc.New(db, limits, tiers, opts...)
 	if err != nil {
 		t.Fatalf("alloc.New: %v", err)
 	}
@@ -1033,6 +1035,62 @@ func TestACancelledOfferReturnsItsPromisedEscrow(t *testing.T) {
 	if peak > 1 {
 		t.Errorf("advertised %d runners against a one-runner budget; the cancelled request's "+
 			"promise was released in the ledger but never dropped from the escrow", peak)
+	}
+}
+
+// Escrow promised to an assignment that never arrives has to come back on its
+// own.
+//
+// Every other way out of the promised state needs GitHub to say something: an
+// assignment, a completion, a cancellation, or a refused acquisition. If it says
+// none of them — a message lost, a scale set reconfigured underneath the session
+// — the heartbeat renews that lease for the life of the process and the slot is
+// held against every other tier forever. `held` is reusable and `running` would
+// be finished by a node; this is the one state with no way back on its own.
+func TestAPromiseThatIsNeverClaimedReleasesItsEscrow(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 4, MaxMemory: 16 * config.GiB}, tiers,
+		alloc.WithLeaseTTL(150*time.Millisecond))
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	var (
+		delivered atomic.Int32
+		expired   atomic.Bool
+	)
+
+	// Declared ahead of the session so the poll hook can read the listener state.
+	var l *Listener
+
+	session := &fakeSession{}
+	session.onGet = func() (*Message, error) {
+		if delivered.Add(1) == 1 {
+			// Acquired, and then GitHub never mentions it again.
+			return &Message{MessageID: 1, Available: []Job{{RequestID: 11, RunID: 101}}}, nil
+		}
+
+		if l.Acquiring() == 0 {
+			expired.Store(true)
+
+			cancel()
+		}
+
+		return nil, ErrNoMessage
+	}
+
+	// Shorter than the test, so the promise actually ages out inside it. The
+	// production default is five minutes, which no test can wait for.
+	l = NewListener(a, tiers[0].Label, session, WithPromiseTTL(200*time.Millisecond))
+
+	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if !expired.Load() {
+		t.Fatal("the promise was still held when the test gave up; an acquisition GitHub " +
+			"never followed up on keeps its lease for the life of the process")
 	}
 }
 
