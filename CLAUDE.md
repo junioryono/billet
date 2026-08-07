@@ -271,6 +271,21 @@ When a local record mirrors a commitment held by someone else, only they can rel
 timer can report, and that is all. So a stale promise is reported and kept — it is capacity billet
 genuinely still owes — and the real remedy is to invalidate the session so GitHub itself redelivers.
 
+**The second attempt is the instructive one, because it looked like it had escaped this.** Instead of
+a timer it released a promise when GitHub's own statistics reported the scale set had no job
+outstanding of any kind — apparently authorised by the party holding the commitment, with a staleness
+check only to avoid racing an in-flight acquisition. It was the same bug. The staleness check bounds
+how old *billet's promise* is; it says nothing about how old the *statistics* are, and the response
+carries no observation time, generation, or request identity to pin them to. Elapsed local time was
+still doing the authorising, now paired with a snapshot of unbounded freshness — plus a quiet
+assumption that those counters are exhaustive, atomically maintained, and scoped as expected.
+
+So: **a freshness check on your own record is not a causal fence on someone else's snapshot.** To act
+on remote state you need something that provably postdates your own action — a version, an
+observation time, a per-request status. Absent that, more samples and longer thresholds are the same
+guess with more decimal places. When the API does not offer one, the honest answer is to leave the
+gap open, report it, and go and measure the real system.
+
 The same distinction decides how loudly to fail. An assignment with no escrow behind it **declines
 and carries on**, because that is reachable by ordinary races and stopping the control plane strands
 every tier's capacity over one job. A scale-set response that is not a subset of its request
