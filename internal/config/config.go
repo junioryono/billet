@@ -315,6 +315,16 @@ type Tier struct {
 	// Node optionally pins this tier to a named node. Required when only one
 	// node can serve it — macOS tiers, for example.
 	Node string `yaml:"node,omitempty"`
+	// RunnerGroup is the GitHub runner group this tier's scale set belongs to.
+	// Empty means GitHub's "default" group.
+	//
+	// It matters for access control rather than for scheduling: a runner group is
+	// how an organization decides which repositories may use these runners, and
+	// putting every tier in the default group hands them to every repository in
+	// the org. billet does not enforce that policy — GitHub does — but it must be
+	// expressible, or an operator has to go and move the scale set by hand after
+	// every reconcile.
+	RunnerGroup string `yaml:"runner_group,omitempty"`
 
 	VCPU   int      `yaml:"vcpu"`
 	Memory ByteSize `yaml:"memory"`

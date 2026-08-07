@@ -118,6 +118,11 @@ func TestAdvertisedCapacityNeverExceedsTheBudget(t *testing.T) {
 	}
 }
 
+// tier builds a catalog entry. Every tier here is 4 vCPU so the arithmetic in
+// the capacity assertions stays legible; the parameter exists so a test that
+// needs an uneven catalog does not have to rewrite this.
+//
+//nolint:unparam // See above: kept for the tests that will need it, not dead.
 func tier(label string, vcpu int) config.Tier {
 	return config.Tier{
 		Label:    label,
