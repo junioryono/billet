@@ -123,6 +123,11 @@ type Message struct {
 type Job struct {
 	RequestID int64
 	RunID     int64
+	// Event is the GitHub event that queued this job — "push", "pull_request",
+	// "schedule". It is carried because it is the ONLY thing in a scale-set
+	// message that says anything about how much the workload can be trusted, and
+	// that decides which backends may run it.
+	Event string
 }
 
 // Statistics is GitHub's own view of the scale set.

@@ -23,6 +23,9 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/node"
+	"github.com/junioryono/billet/internal/provider"
+	"github.com/junioryono/billet/internal/provider/docker"
 	"github.com/junioryono/billet/internal/scaleset"
 	"github.com/junioryono/billet/internal/server"
 	"github.com/junioryono/billet/internal/state"
@@ -165,10 +168,6 @@ func cmdServer(ctx context.Context, args []string) error {
 		return fmt.Errorf("%s has no github section; run `billet github-app create` first", *cfgPath)
 	}
 
-	if *dev {
-		return fmt.Errorf("%w: --dev needs the node runtime, which P2 brings", errNotImplemented)
-	}
-
 	// FAIL CLOSED while nothing can launch a job.
 	//
 	// The listener plane is complete: it reconciles scale sets, advertises
@@ -182,20 +181,20 @@ func cmdServer(ctx context.Context, args []string) error {
 	// provable against a real organization before P2 lands. --dry-run does that:
 	// the same App auth, reconciliation, session and long poll, advertising zero.
 	// Everything except accepting a job.
-	if !*dryRun {
+	if !*dryRun && !*dev {
 		return fmt.Errorf(
-			"%w: the control plane is built but nothing can launch a job yet, so it will not accept one.\n"+
-				"Run `billet server --dry-run` to exercise the whole path against GitHub while advertising "+
-				"zero capacity. Accepting work would strand it: GitHub marks the job assigned and nothing "+
-				"here can run it",
+			"%w: without --dev nothing in this process can launch a job, so it will not accept one.\n"+
+				"Run `billet server --dev` to run a node here too, or `billet server --dry-run` to "+
+				"exercise the whole path against GitHub while advertising zero capacity. Accepting work "+
+				"with no node would strand it: GitHub marks the job assigned and nothing runs it",
 			errNotImplemented)
 	}
 
-	return runServer(ctx, cfg, *dryRun)
+	return runServer(ctx, cfg, *dryRun, *dev)
 }
 
 // runServer starts the control plane and blocks until it is told to stop.
-func runServer(ctx context.Context, cfg *config.Config, dryRun bool) error {
+func runServer(ctx context.Context, cfg *config.Config, dryRun, dev bool) error {
 	// Built by the SHARED constructor, so the server and teardown authenticate
 	// identically. Two near-identical constructions is how one of them ends up
 	// pointed at a different organization than the other.
@@ -245,6 +244,24 @@ func runServer(ctx context.Context, cfg *config.Config, dryRun bool) error {
 		owner = "billet"
 	}
 
+	if dev {
+		p, err := newProvider(cfg)
+		if err != nil {
+			return err
+		}
+
+		// REGISTERED BEFORE ANYTHING IS PLACED ON IT. A node exists in the ledger
+		// because it said so, and placement compares a lease against the provider
+		// the host REGISTERED rather than one a catalog claims — so Bind refuses
+		// every lease until this row is here.
+		if err := allocator.RegisterNode(ctx, cfg.Node.Name, cfg.Node.Provider); err != nil {
+			return err
+		}
+
+		opts = append(opts, server.WithNodeRunner(
+			node.New(allocator, cfg.Node.Name, jitSource{c: client}, p, cfg.Tiers, slog.Default())))
+	}
+
 	plane := server.New(allocator, &provisioner{client}, cfg.Tiers, owner, slog.Default(), opts...)
 	if err := plane.Run(ctx); err != nil {
 		return err
@@ -261,6 +278,49 @@ func runServer(ctx context.Context, cfg *config.Config, dryRun bool) error {
 // alternative is that package importing internal/server purely to name a
 // two-field struct, which points the dependency the wrong way for a package
 // whose job is to keep a preview API at arm's length.
+// newProvider builds the compute backend this host runs.
+//
+// Only docker exists today. firecracker needs Linux and /dev/kvm, tart needs
+// Apple Silicon, ec2 needs an account — each is a separate implementation of the
+// same interface, and each is refused explicitly rather than falling through to
+// something that happens to compile.
+func newProvider(cfg *config.Config) (provider.Provider, error) {
+	switch cfg.Node.Provider {
+	case config.ProviderDocker:
+		return docker.New(cfg.Node.Name, docker.WithLogger(slog.Default())), nil
+
+	case config.ProviderFirecracker, config.ProviderTart, config.ProviderEC2:
+		return nil, fmt.Errorf("%w: the %s provider is not built yet; --dev currently runs the "+
+			"docker backend, which shares the host kernel and is for trials rather than for "+
+			"untrusted work", errNotImplemented, cfg.Node.Provider)
+
+	default:
+		return nil, fmt.Errorf("billet: unknown provider %q", cfg.Node.Provider)
+	}
+}
+
+// jitSource adapts the scale-set client to what the node package needs.
+//
+// The adapter exists so internal/node does not import the preview scale-set API
+// at all: the node's contract is "mint me a registration", and which vendor
+// answers that is not its business.
+type jitSource struct{ c *scaleset.Client }
+
+func (j jitSource) Describe(ctx context.Context, name, group string) (*node.Set, []string, error) {
+	set, labels, err := j.c.Describe(ctx, name, group)
+	if err != nil || set == nil {
+		return nil, labels, err
+	}
+
+	return &node.Set{ID: set.ID, Name: set.Name}, labels, nil
+}
+
+func (j jitSource) JITConfig(
+	ctx context.Context, scaleSetID int, runnerName, workFolder string,
+) (node.Registration, error) {
+	return j.c.JITConfig(ctx, scaleSetID, runnerName, workFolder)
+}
+
 type provisioner struct{ c *scaleset.Client }
 
 func (p *provisioner) EnsureScaleSet(
@@ -566,9 +626,9 @@ func cmdCheck(ctx context.Context, args []string) error {
 	for i := range cfg.Nodes {
 		p := &cfg.Nodes[i]
 
-		provider := "provider unset"
+		backend := "provider unset"
 		if p.Provider != "" {
-			provider = string(p.Provider)
+			backend = string(p.Provider)
 		}
 
 		guests := "no guest_os allowlist"
@@ -596,7 +656,7 @@ func cmdCheck(ctx context.Context, args []string) error {
 			macOS = fmt.Sprintf("max %d macOS", p.MacOSLimit())
 		}
 
-		fmt.Printf("  policy %-14s %-12s %-24s %s\n", p.Name, provider, guests, macOS)
+		fmt.Printf("  policy %-14s %-12s %-24s %s\n", p.Name, backend, guests, macOS)
 	}
 
 	fmt.Printf("tiers    %d\n", len(cfg.Tiers))

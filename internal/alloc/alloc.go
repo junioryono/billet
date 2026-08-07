@@ -869,6 +869,46 @@ func (a *Allocator) Release(ctx context.Context, leaseID string, epoch int64, ou
 	})
 }
 
+// RegisterNode records a host and what it runs, so leases can be placed on it.
+//
+// A node exists in this table because it TOLD billet it exists, not because
+// somebody wrote it in a config file. That is the whole reason placement
+// compares a lease against the REGISTERED provider rather than a catalog entry:
+// a host that says it runs Firecracker is the authority on that, and a catalog
+// claiming otherwise is the thing that should lose.
+//
+// Upsert, because a host re-registers every time it starts. The epoch is bumped
+// on re-registration so a previous instance of the same host — a process that
+// was killed and came back, or one that hung and returned — finds its writes
+// refused rather than operating on leases the new instance now owns.
+func (a *Allocator) RegisterNode(ctx context.Context, name string, kind config.ProviderKind) error {
+	if name == "" {
+		return errors.New("alloc: a node must have a name")
+	}
+
+	if kind == "" {
+		return fmt.Errorf("alloc: node %s registered no provider, so nothing could be placed "+
+			"on it safely", name)
+	}
+
+	return a.db.Tx(ctx, func(tx *sql.Tx) error {
+		now := ts(a.now().UTC())
+
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO nodes (name, provider, last_seen_at)
+			 VALUES (?, ?, ?)
+			 ON CONFLICT (name) DO UPDATE SET
+			   provider     = excluded.provider,
+			   last_seen_at = excluded.last_seen_at,
+			   epoch        = nodes.epoch + 1`,
+			name, string(kind), now); err != nil {
+			return fmt.Errorf("alloc: register node %s: %w", name, err)
+		}
+
+		return nil
+	})
+}
+
 // Reap terminalizes leases whose holders stopped heartbeating, and returns how
 // many it reclaimed.
 //

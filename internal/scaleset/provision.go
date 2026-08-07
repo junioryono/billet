@@ -302,6 +302,13 @@ type JITRunner struct {
 // find, and so no reflection-based encoder reaches it by accident.
 func (j *JITRunner) Config() string { return j.encodedConfig }
 
+// RunnerName is the name GitHub registered, falling back to the requested one
+// when GitHub does not send it back.
+//
+// The distinction matters because the encoded registration identifies GitHub's
+// runner, and teardown has to remove THAT one.
+func (j *JITRunner) RunnerName() string { return j.Name }
+
 // String redacts. See the type comment.
 func (j JITRunner) String() string {
 	return fmt.Sprintf("scaleset.JITRunner{RunnerID:%d Name:%q config:[redacted]}", j.RunnerID, j.Name)
@@ -414,6 +421,15 @@ func (c *Client) JITConfig(ctx context.Context, scaleSetID int, runnerName, work
 
 	out := &JITRunner{Name: runnerName, encodedConfig: cfg.EncodedJITConfig}
 	if cfg.Runner != nil {
+		// GitHub's name wins when it sends one. The encoded registration
+		// identifies the runner GitHub created, so anything that later has to
+		// find or deregister it has to use that name — carrying the requested one
+		// forward would work right up until the two differed, and the symptom
+		// would be a runner nobody can remove.
+		if cfg.Runner.Name != "" {
+			out.Name = cfg.Runner.Name
+		}
+
 		// int64 because that is what RemoveRunner takes, and removing an orphaned
 		// registration is the operation that has to work when something has gone
 		// wrong. Upstream is inconsistent with itself here — RunnerReference.ID and
