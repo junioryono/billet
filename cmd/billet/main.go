@@ -12,17 +12,14 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
-	"runtime"
 	"runtime/debug"
 	"syscall"
 	"text/tabwriter"
 
 	"github.com/junioryono/billet/internal/config"
-	"github.com/junioryono/billet/internal/github"
 	"github.com/junioryono/billet/internal/state"
 )
 
@@ -273,83 +270,6 @@ func cmdCheck(ctx context.Context, args []string) error {
 		fmt.Printf("  %-34s %2d vCPU  %8s  %s/%s%s\n",
 			t.Label, t.VCPU, t.Memory, t.Provider, t.GuestOS, intercept)
 	}
-	return nil
-}
-
-// maxKeySize bounds what is read from the key path. A real App key is a couple
-// of kilobytes; anything larger is a misconfiguration, and reading it whole
-// would be the misconfiguration's problem to solve rather than billet's.
-const maxKeySize = 64 << 10
-
-// checkPrivateKey proves the App key is usable, not merely present.
-//
-// os.Stat alone accepted a directory, an empty file left behind by an
-// interrupted onboarding, a truncated PEM, and a world-readable one. Each of
-// those is a deployment that looks configured and is not — and mode 0644 on an
-// App private key is a local credential exposure that `billet check` existed to
-// catch and did not.
-func checkPrivateKey(path string) error {
-	// Opened ONCE and inspected through the descriptor. Stat-then-read is two
-	// lookups of the same name: the file can be swapped in between, so the size,
-	// type and mode may describe a different inode than the bytes that get
-	// parsed — and os.ReadFile on a FIFO blocks forever rather than returning.
-	f, err := os.Open(path)
-	if err != nil {
-		return fmt.Errorf("github.private_key_path %s: %w", path, err)
-	}
-
-	defer f.Close()
-
-	info, err := f.Stat()
-	if err != nil {
-		return fmt.Errorf("github.private_key_path %s: %w", path, err)
-	}
-
-	if !info.Mode().IsRegular() {
-		return fmt.Errorf("github.private_key_path %s is not a regular file", path)
-	}
-
-	if info.Size() == 0 {
-		return fmt.Errorf(
-			"github.private_key_path %s is empty; an interrupted `billet github-app create` leaves "+
-				"a placeholder there. Remove it and re-run that command", path)
-	}
-
-	if info.Size() > maxKeySize {
-		return fmt.Errorf("github.private_key_path %s is %d bytes; that is not an App key",
-			path, info.Size())
-	}
-
-	// Group and other bits on a private key are a local exposure. Checked on
-	// unix only: Windows permissions are ACL-based and these bits are meaningless
-	// there, so testing them would produce a false alarm on every Windows host.
-	if runtime.GOOS != "windows" {
-		if perm := info.Mode().Perm(); perm&0o077 != 0 {
-			return fmt.Errorf(
-				"github.private_key_path %s is mode %04o; it is readable beyond its owner. "+
-					"Run: chmod 600 %s", path, perm, path)
-		}
-	}
-
-	// Read from the descriptor already inspected, and bounded for real: the
-	// size check above describes the inode at that moment, while this limit
-	// holds regardless.
-	pemBytes, err := io.ReadAll(io.LimitReader(f, maxKeySize+1))
-	if err != nil {
-		return fmt.Errorf("read github.private_key_path %s: %w", path, err)
-	}
-
-	if len(pemBytes) > maxKeySize {
-		return fmt.Errorf("github.private_key_path %s is larger than %d bytes; that is not an App key",
-			path, maxKeySize)
-	}
-
-	// Parsed, not merely read: a truncated PEM is exactly what an interrupted
-	// write leaves, and it fails at the first API call rather than here.
-	if err := github.ValidatePrivateKey(pemBytes); err != nil {
-		return fmt.Errorf("github.private_key_path %s: %w", path, err)
-	}
-
 	return nil
 }
 

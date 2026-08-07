@@ -28,8 +28,13 @@ coverage:
         if_not_found: success
 
 ignore:
-  # Role dispatch and operator output. Exercised end to end by hand and (later)
-  # by the conformance suite; unit-testing flag parsing measures nothing.
+  # Role dispatch, flag parsing and operator output ONLY. Exercised end to end by
+  # hand; unit-testing flag parsing measures nothing.
+  #
+  # Anything carrying real semantics must not live in this file, precisely
+  # because the exclusion hides it. The App key handling — reserving it, writing
+  # it atomically, validating what `billet check` will accept — sits in
+  # githubapp.go for that reason, where its coverage counts.
   - "cmd/billet/main.go"
 
 comment:
