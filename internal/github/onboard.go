@@ -37,6 +37,11 @@ var ErrCredentialPreserved = errors.New("the App key was preserved")
 // exchange and the honest redirect would be dropped on arrival.
 const codeQueueDepth = 32
 
+// maxManifestCodeLen bounds what the callback will accept as a manifest code.
+// GitHub's are short; this is generous enough to survive a format change and
+// small enough that no request built from one can draw a 414.
+const maxManifestCodeLen = 512
+
 // Onboarding result. Credentials live here only long enough to be written to
 // disk by the caller.
 type Onboarding struct {
@@ -533,6 +538,17 @@ func (f *onboardFlow) handleCallback(w http.ResponseWriter, r *http.Request) {
 	code := q.Get("code")
 	if code == "" {
 		http.Error(w, "no code in callback", http.StatusBadRequest)
+
+		return
+	}
+
+	// Bounded before it is queued. An absurdly long code costs a round trip and
+	// draws a 414 rather than GitHub's own rejection, which is a different
+	// failure classification for what is obviously not a real code — cheaper to
+	// refuse it here than to reason about every status a proxy might invent.
+	// GitHub's codes are far shorter than this.
+	if len(code) > maxManifestCodeLen {
+		http.Error(w, "code is too long to be a GitHub manifest code", http.StatusBadRequest)
 
 		return
 	}

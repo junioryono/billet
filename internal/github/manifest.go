@@ -382,10 +382,12 @@ func (s scrubber) clean(text string) string {
 	return redactString(redactString(text, s.endpoint), s.code)
 }
 
-// maxErrorDepth bounds the walk. An error whose Unwrap returns itself — or a
-// joined tree containing a cycle — would otherwise recurse until the stack is
-// exhausted, and the transport that produces it is caller-supplied.
-const maxErrorDepth = 32
+// maxErrorDepth is the backstop for a chain that is merely absurd rather than
+// cyclic. Cycles are caught by identity (see sanitize), which is what keeps a
+// legitimately deep chain inspectable: a bare depth cut truncated the tail into
+// an unwrappable node, so errors.Is against a sentinel below it stopped working
+// even when nothing down there held a secret.
+const maxErrorDepth = 512
 
 // sanitize rebuilds an error chain so that NO error reachable from the result
 // renders the one-time code — not merely the outermost one.
@@ -404,15 +406,31 @@ const maxErrorDepth = 32
 // that renders the code is replaced even though that costs its type, because a
 // reachable error holding a live credential is the thing this exists to prevent.
 func (s scrubber) sanitize(err error, depth int) error {
+	return s.sanitizeSeen(err, depth, nil)
+}
+
+// sanitizeSeen carries the ancestors of the current node so a cycle is cut at
+// the point it closes rather than by running out of stack.
+func (s scrubber) sanitizeSeen(err error, depth int, seen []error) error {
 	if err == nil {
 		return nil
 	}
 
-	// Fails closed: past the depth bound nothing below is inspected, so nothing
-	// below may remain reachable either.
+	// Both cuts fail CLOSED: nothing below an unexplored node may stay
+	// reachable, so the node is replaced by a scrubbed leaf rather than returned
+	// as-is.
+	for _, ancestor := range seen {
+		//nolint:errorlint // Cycle detection by object identity. errors.Is asks whether a chain CONTAINS a target, which is both the wrong question and itself a walk of the cycle being detected.
+		if ancestor == err {
+			return &redactedError{msg: s.clean(err.Error())}
+		}
+	}
+
 	if depth >= maxErrorDepth {
 		return &redactedError{msg: s.clean(err.Error())}
 	}
+
+	seen = append(seen, err)
 
 	// Rendered ONCE. Error() is not required to be deterministic, and calling it
 	// twice let a stateful error return clean text to the comparison and dirty
@@ -426,10 +444,15 @@ func (s scrubber) sanitize(err error, depth int) error {
 	// diagnostic value anyway.
 	//nolint:errorlint // Deliberately the DIRECT type, not errors.As. This walks the chain one level at a time; errors.As searches it, so a nested *url.Error would be rebuilt at the wrong level and the wrappers between them dropped.
 	if urlErr, ok := err.(*url.Error); ok {
+		// EVERY string field is scrubbed, not just URL. Op is caller-controlled —
+		// a transport composing url.Error{Op: r.URL.String()} put the live
+		// endpoint in a field the rebuild copied verbatim — and the rebuilt URL
+		// keeps the parsed scheme and host, which is another place a hostile or
+		// merely odd URL can carry it.
 		return &url.Error{
-			Op:  urlErr.Op,
-			URL: redactedConversionURL(urlErr.URL),
-			Err: s.sanitize(urlErr.Err, depth+1),
+			Op:  s.clean(urlErr.Op),
+			URL: s.clean(redactedConversionURL(urlErr.URL)),
+			Err: s.sanitizeSeen(urlErr.Err, depth+1, seen),
 		}
 	}
 
@@ -442,14 +465,30 @@ func (s scrubber) sanitize(err error, depth int) error {
 
 		sanitizedBranches := make([]error, 0, len(branches))
 		for _, branch := range branches {
-			sanitizedBranches = append(sanitizedBranches, s.sanitize(branch, depth+1))
+			sanitizedBranches = append(sanitizedBranches, s.sanitizeSeen(branch, depth+1, seen))
 		}
 
 		return errors.Join(sanitizedBranches...)
 	}
 
 	inner := errors.Unwrap(err)
-	sanitized := s.sanitize(inner, depth+1)
+
+	// The child's renderings are captured ONCE each and reused below. Calling
+	// inner.Error() again to test and then again to substitute gave a stateful
+	// error three chances to show different text, which is exactly the hole the
+	// single snapshot was meant to close.
+	innerRendered := ""
+	if inner != nil {
+		innerRendered = inner.Error()
+	}
+
+	sanitized := s.sanitizeSeen(inner, depth+1, seen)
+
+	sanitizedRendered := ""
+	if sanitized != nil {
+		sanitizedRendered = sanitized.Error()
+	}
+
 	cleaned := s.clean(rendered)
 
 	//nolint:errorlint // An identity comparison, not error matching: it asks whether the recursion produced a new object. errors.Is answers a different question entirely.
@@ -467,8 +506,8 @@ func (s scrubber) sanitize(err error, depth int) error {
 	// that TRANSFORMS rather than embeds — the scrubbed text is all that is left,
 	// and the scrub is what keeps it safe.
 	msg := cleaned
-	if inner != nil && strings.Contains(rendered, inner.Error()) {
-		msg = s.clean(strings.Replace(rendered, inner.Error(), sanitized.Error(), 1))
+	if innerRendered != "" && strings.Contains(rendered, innerRendered) {
+		msg = s.clean(strings.Replace(rendered, innerRendered, sanitizedRendered, 1))
 	}
 
 	return &redactedError{msg: msg, err: sanitized}
@@ -527,11 +566,18 @@ func conversionError(status int, _ []byte) error {
 				"so billet never renders it)", status)
 	}
 
-	// A code GitHub does not recognise is reported as 404, and one it will not
-	// accept as 422. Marked so onboarding can tell "this particular code is
-	// worthless" apart from "the exchange could not be attempted", which are
-	// recovered from in completely different ways.
-	if status == http.StatusNotFound || status == http.StatusUnprocessableEntity {
+	// EVERY 4xx marks the code rejected, not just 404 and 422.
+	//
+	// Narrowing it to those two left a kill switch open: an injected code long
+	// enough to draw a 414, or malformed enough for a proxy to answer 400, was
+	// classified as "the exchange could not be attempted" and aborted the flow —
+	// discarding an honest code already sitting in the queue behind it. This
+	// endpoint has no authentication beyond the code itself, so a 4xx IS a
+	// statement about the code, and the right response is to try the next one.
+	//
+	// 5xx stays fatal: it says nothing about the code, and no further redirect
+	// is coming to improve matters.
+	if status >= 400 && status < 500 {
 		return fmt.Errorf("%w: %w", errCodeRejected, rendered)
 	}
 

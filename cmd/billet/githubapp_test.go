@@ -12,6 +12,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/junioryono/billet/internal/github"
 )
 
 // testKey returns a valid PEM-encoded App private key.
@@ -375,10 +377,43 @@ func TestACompleteStagingWriteIsReportedAsPreserved(t *testing.T) {
 	}
 }
 
-// A staging file that never received the complete key is REMOVED, so the next
-// run does not mistake a fragment for a preserved credential and tell the
-// operator to install it.
-func TestAnIncompleteStagingWriteLeavesNothingBehind(t *testing.T) {
+// A staged key must be found even when the DESTINATION IS ABSENT.
+//
+// This was the silent one. The install clears the reservation before it links,
+// so a process killed in that window leaves the key at the staging path and the
+// destination name free. Looking for the staged key only after O_EXCL failed
+// meant the next run reserved cleanly, said nothing, and went on to create a
+// SECOND App — while the first App's unrepeatable private key sat in the same
+// directory, unmentioned.
+func TestReserveKeyFileFindsAStagedKeyWithNoReservation(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.pem")
+	staging := filepath.Join(dir, ".app.pem.billet-partial")
+
+	if err := os.WriteFile(staging, testKey(t), 0o600); err != nil {
+		t.Fatalf("seed staged key: %v", err)
+	}
+
+	f, err := reserveKeyFile(path)
+	if err == nil {
+		f.Close()
+		t.Fatal("reserveKeyFile reserved over an orphaned key without mentioning it")
+	}
+
+	if !strings.Contains(err.Error(), staging) {
+		t.Errorf("the error does not name the orphaned key at %s: %v", staging, err)
+	}
+
+	// Following the advice must not mean starting again with a new App.
+	if !strings.Contains(err.Error(), "do not create another App") {
+		t.Errorf("the error does not warn against creating a second App: %v", err)
+	}
+}
+
+// A FRAGMENT is not a key, and must not be reported as one — the advice for a
+// real staged key is "keep the App and install this file", which is destructive
+// when the file is a truncated PEM.
+func TestReserveKeyFileDoesNotReportAFragmentAsAKey(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "app.pem")
 	staging := filepath.Join(dir, ".app.pem.billet-partial")
@@ -387,7 +422,6 @@ func TestAnIncompleteStagingWriteLeavesNothingBehind(t *testing.T) {
 		t.Fatalf("seed empty reservation: %v", err)
 	}
 
-	// A fragment, exactly what an interrupted write leaves.
 	if err := os.WriteFile(staging, testKey(t)[:60], 0o600); err != nil {
 		t.Fatalf("seed fragment: %v", err)
 	}
@@ -400,6 +434,52 @@ func TestAnIncompleteStagingWriteLeavesNothingBehind(t *testing.T) {
 	// The empty-reservation guidance is correct here: there is no key to save.
 	if !strings.Contains(err.Error(), "rm "+path) {
 		t.Errorf("a fragment was reported as a recoverable key: %v", err)
+	}
+}
+
+// A write that fails AFTER producing something parsable has still produced a
+// credential, and the file is what decides that — not the return value.
+//
+// GitHub's PEM ends in a newline. Stopping one byte short of it yields a key
+// pem.Decode reads perfectly, so "the write errored" and "there is nothing here"
+// are different facts. Treating them as one deleted a working key.
+func TestAParsableShortWriteIsKeptAndReported(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.pem")
+	staging := filepath.Join(dir, ".app.pem.billet-partial")
+
+	reserved, err := reserveKeyFile(path)
+	if err != nil {
+		t.Fatalf("reserveKeyFile: %v", err)
+	}
+
+	defer reserved.Close()
+
+	// Exactly the shape described: everything but the trailing newline.
+	full := testKey(t)
+
+	truncated := full[:len(full)-1]
+	if github.ValidatePrivateKey(truncated) != nil {
+		t.Skip("this PEM does not parse without its trailing newline; the premise does not hold here")
+	}
+
+	if err := os.WriteFile(staging, truncated, 0o600); err != nil {
+		t.Fatalf("seed a parsable partial write: %v", err)
+	}
+
+	// reserveKeyFile refuses to start while that file is there, which is the
+	// behaviour protecting it.
+	_, err = reserveKeyFile(path)
+	if err == nil {
+		t.Fatal("a parsable staged key did not stop a fresh reservation")
+	}
+
+	if !strings.Contains(err.Error(), staging) {
+		t.Errorf("the parsable partial write was not reported: %v", err)
+	}
+
+	if _, statErr := os.Stat(staging); statErr != nil {
+		t.Errorf("the parsable key was removed: %v", statErr)
 	}
 }
 
