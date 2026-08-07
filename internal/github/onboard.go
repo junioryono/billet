@@ -53,6 +53,14 @@ const codeQueueDepth = 32
 // small enough that no request built from one can draw a 414.
 const maxManifestCodeLen = 512
 
+// Backoff for retrying an ambiguous exchange. Short at first because the common
+// ambiguous cause is a transient rate limit that clears in seconds, capped so a
+// long window is not spent asleep.
+const (
+	initialExchangeBackoff = 2 * time.Second
+	maxExchangeBackoff     = 30 * time.Second
+)
+
 // Onboarding result. Credentials live here only long enough to be written to
 // disk by the caller.
 type Onboarding struct {
@@ -316,7 +324,7 @@ func (f *onboardFlow) register(ctx context.Context) (*App, error) {
 
 		f.opts.Log("Registration received. Exchanging it for credentials...")
 
-		app, err := convertManifestAt(ctx, f.opts.Client, f.opts.api(), code)
+		app, err := f.exchange(ctx, code)
 		if err == nil {
 			return f.persist(app)
 		}
@@ -328,6 +336,52 @@ func (f *onboardFlow) register(ctx context.Context) (*App, error) {
 		lastRejection = err
 
 		f.opts.Log("GitHub rejected that registration (%v). Still waiting for the redirect.", err)
+	}
+}
+
+// exchange redeems one code, retrying it while GitHub's answer says nothing
+// about the code itself.
+//
+// Only THREE outcomes leave this function: the credentials, a definitive
+// rejection of this code, or a failure the caller must not paper over. An
+// ambiguous answer is none of those, and the previous version treated it as the
+// third — which was credential loss with extra steps. The code lives in a local
+// variable and the loopback server exits with the flow, so "run the command
+// again" builds a SECOND App rather than recovering the first one's key. GitHub
+// documents 422 as validation failure OR the endpoint having been spammed, so an
+// attacker who trips abuse protection could make the honest code look invalid.
+//
+// Bounded by the caller's context, which is already GitHub's one-hour window.
+func (f *onboardFlow) exchange(ctx context.Context, code string) (*App, error) {
+	backoff := initialExchangeBackoff
+
+	for attempt := 1; ; attempt++ {
+		app, err := convertManifestAt(ctx, f.opts.Client, f.opts.api(), code)
+		if err == nil || !errors.Is(err, errCodeAmbiguous) {
+			return app, err
+		}
+
+		f.opts.Log("GitHub did not resolve that registration (%v).", err)
+		f.opts.Log("It did not say the code was invalid, so billet is keeping it and retrying in %s "+
+			"(attempt %d).", backoff, attempt)
+
+		// An explicit timer, stopped on every path: time.After leaks its timer
+		// until it fires, and this loop can run for the whole manifest window.
+		timer := time.NewTimer(backoff)
+
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+
+			return nil, fmt.Errorf(
+				"github: the registration could not be redeemed before GitHub's window closed, and its "+
+					"last answer did not say the code was invalid (%w)", err)
+		}
+
+		if backoff < maxExchangeBackoff {
+			backoff *= 2
+		}
 	}
 }
 

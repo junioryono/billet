@@ -169,8 +169,23 @@ func reserveKeyFile(path string) (*os.File, error) {
 	// for the staged key only after O_EXCL failed meant that run's key was never
 	// mentioned: this call succeeded, onboarding went on to create a SECOND App,
 	// and the first one's unrepeatable key sat there unreported.
-	if staged := stagingPath(path); holdsUsableKey(staged) {
-		return nil, stagedKeyFoundError(path, staged)
+	staging := stagingPath(path)
+
+	switch inspectKey(staging) {
+	case keyPresent:
+		return nil, stagedKeyFoundError(path, staging)
+	case keyUnverifiable:
+		// NOT the "delete it and re-run" branch. A file billet cannot read may be
+		// a perfectly good key whose mode or mount is temporarily wrong, and the
+		// operator can unlink it regardless — unlink permission comes from the
+		// directory, not the file. Saying "it holds no usable key" there is a
+		// destructive claim billet has not earned.
+		return nil, fmt.Errorf(
+			"%s exists but billet cannot read it, so it cannot tell whether an interrupted run left an "+
+				"App private key there. Do NOT delete it blind: check that file yourself. If it holds a "+
+				"PEM private key, move it to %s and run `billet check`",
+			staging, path)
+	case keyAbsent:
 	}
 
 	// The destination is refused if anything occupies it, and then LEFT ALONE.
@@ -197,8 +212,6 @@ func reserveKeyFile(path string) (*os.File, error) {
 	// exactly once, by a link that fails rather than replaces. It also collapses
 	// two files into one: this descriptor is both the proof that the directory is
 	// writable and the file the key is written to.
-	staging := stagingPath(path)
-
 	f, err := os.OpenFile(staging, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err == nil {
 		return f, nil
@@ -208,6 +221,22 @@ func reserveKeyFile(path string) (*os.File, error) {
 		return nil, fmt.Errorf("create %s: %w", staging, err)
 	}
 
+	// Inspected AGAIN, because the earlier answer is stale by now.
+	//
+	// Between that inspection and this O_EXCL, a concurrent run's empty
+	// reservation can have become a complete key. Reusing the first answer to
+	// print "it holds no usable key" alongside an exact `rm` handed the operator
+	// a command that destroys a credential that arrived in between.
+	switch inspectKey(staging) {
+	case keyPresent:
+		return nil, stagedKeyFoundError(path, staging)
+	case keyUnverifiable:
+		return nil, fmt.Errorf(
+			"%s exists and billet cannot read it, so it cannot tell whether it holds an App private "+
+				"key. Do NOT delete it blind: check that file yourself first", staging)
+	case keyAbsent:
+	}
+
 	// Never adopted, however empty it looks. A zero-length file here is equally a
 	// crashed run's leftover and a CONCURRENT run's live reservation, and
 	// adopting it puts two processes on one file where either can destroy the
@@ -215,8 +244,8 @@ func reserveKeyFile(path string) (*os.File, error) {
 	// right, and Stat follows symlinks.
 	return nil, fmt.Errorf(
 		"%s already exists, which is what an interrupted `billet github-app create` leaves behind. "+
-			"It holds no usable key — if no other billet run is in progress, delete it and re-run:\n"+
-			"    rm %s",
+			"It held no usable key a moment ago — if no other billet run is in progress, delete it "+
+			"and re-run:\n    rm %s",
 		staging, staging)
 }
 
@@ -325,6 +354,19 @@ func writeKeyAtomically(reserved *os.File, path string, pem []byte, onInstalled 
 				"\nWarning: the key is installed at %s, but %s is a second copy of it that could not be "+
 					"removed (%v). Delete it once `billet check` passes.\n",
 				path, staging, err)
+
+			return
+		}
+
+		// The REMOVAL is made durable too. The directory was synced while both
+		// names existed, so a power loss after this function returns could
+		// otherwise resurrect the staging entry — leaving two durable names for
+		// one private key, with the process that would have warned about it gone.
+		if err := syncDir(dir); err != nil {
+			fmt.Fprintf(os.Stderr,
+				"\nWarning: the key is installed at %s and the extra copy at %s was removed, but that "+
+					"removal could not be flushed (%v). Check after a reboot that %s is gone.\n",
+				path, staging, err, staging)
 		}
 	}()
 
@@ -353,7 +395,7 @@ func writeKeyAtomically(reserved *os.File, path string, pem []byte, onInstalled 
 			// NOT "preserved": that sentinel promises the key is readable, and here
 			// billet does not know. Its own sentinel keeps the App alive and the
 			// file untouched without asserting something it cannot see.
-			return uncertainAt(staging, failure)
+			return uncertainAt(staging, path, failure)
 		case keyAbsent:
 			return failure
 		}
@@ -368,6 +410,19 @@ func writeKeyAtomically(reserved *os.File, path string, pem []byte, onInstalled 
 	// entry the filesystem has not committed — losing not just the location but
 	// the file. Best-effort: linking anyway beats stopping here.
 	_ = syncDir(dir) //nolint:errcheck // Durability in a window the link closes; not worth failing over.
+
+	// os.Link takes a NAME, and what this run owns is a descriptor.
+	//
+	// If the staging name was removed during the browser flow — an operator
+	// following a concurrent run's "rm" advice does exactly that — the key went
+	// into an inode with no directory entry, and it dies when this process exits.
+	// If the name was REPLACED, linking it installs somebody else's file at the
+	// destination and reports success. Neither is detectable after the fact, so
+	// both are checked for before, and the result is verified after.
+	if err := destinationIsStillReserved(reserved, staging); err != nil {
+		return lostAt(staging, fmt.Errorf(
+			"the key was written, but %s no longer refers to the file it was written to: %w", staging, err))
+	}
 
 	// The one step that creates the destination, and it cannot replace.
 	if err := os.Link(staging, path); err != nil {
@@ -384,6 +439,17 @@ func writeKeyAtomically(reserved *os.File, path string, pem []byte, onInstalled 
 			"%s could not be hard-linked to %s (%w), and billet will not fall back to a rename "+
 				"because a rename cannot refuse to replace a file another run may have just installed",
 			staging, path, err))
+	}
+
+	// The check above is check-then-act and cannot be made atomic with the link.
+	// This is what catches the window: if the destination is not the inode this
+	// run wrote, the link picked up a file that was swapped in, and the real key
+	// is in an unlinked descriptor. Saying "Saved" there would be a lie about a
+	// credential — and the file now at the destination is not billet's to remove.
+	if err := destinationIsStillReserved(reserved, path); err != nil {
+		return lostAt(path, fmt.Errorf(
+			"%s was linked, but it is not the file this run wrote — the staging name was replaced "+
+				"mid-install: %w", path, err))
 	}
 
 	installed = true
@@ -405,6 +471,23 @@ func writeKeyAtomically(reserved *os.File, path string, pem []byte, onInstalled 
 	return nil
 }
 
+// lostAt reports that the key GitHub issued is gone and says so plainly.
+//
+// This is the one outcome where "delete the App and start again" is the RIGHT
+// advice, so it must be distinguishable from preserved and from uncertain. It
+// happens when the key was written into a descriptor whose name was removed
+// underneath it: the bytes are in an inode with no directory entry, they vanish
+// when this process exits, and no portable call can give them a name again.
+//
+// Deliberately not softened. An operator told "your key may be at X" will go
+// looking, find nothing, and be left with an App they are afraid to delete.
+func lostAt(where string, err error) error {
+	return fmt.Errorf(
+		"%w\nThe key GitHub issued cannot be recovered (%s). Delete the App on GitHub and run this "+
+			"command again — GitHub will issue a new key for the new App",
+		err, where)
+}
+
 // uncertainAt marks an error where billet could not determine whether the
 // credential survived.
 //
@@ -416,12 +499,12 @@ func writeKeyAtomically(reserved *os.File, path string, pem []byte, onInstalled 
 //
 // What it shares with preserved is the part that matters: nothing is deleted,
 // and onboarding does not tell the operator to delete the App.
-func uncertainAt(where string, err error) error {
+func uncertainAt(where, destination string, err error) error {
 	return fmt.Errorf(
 		"%w: %w\nbillet could not read %s to find out whether the key reached it. Do NOT delete the App "+
 			"yet: inspect that file, and if it holds a PEM private key, move it to %s and run "+
 			"`billet check`",
-		github.ErrCredentialUncertain, err, where, where)
+		github.ErrCredentialUncertain, err, where, destination)
 }
 
 // preservedAt marks an error as one that left the credential readable on disk,
@@ -540,19 +623,6 @@ func inspectKey(path string) keyState {
 
 	return keyPresent
 }
-
-// mayHoldKey reports whether path might hold a credential — present OR
-// unverifiable. It is the predicate for every destructive decision, because the
-// safe answer to "should I delete this" is yes only when the file is known not
-// to be a key.
-func mayHoldKey(path string) bool { return inspectKey(path) != keyAbsent }
-
-// holdsUsableKey reports whether path is KNOWN to hold a parsable private key.
-//
-// Use it only where a false answer is safe. Anywhere a false answer leads to a
-// deletion or to telling the operator their credential is gone, use mayHoldKey,
-// which treats "could not tell" as "assume it is a key".
-func holdsUsableKey(path string) bool { return inspectKey(path) == keyPresent }
 
 // syncDir forces a directory entry to durable storage. Syncing a file does not
 // guarantee its NAME survives a power cut.
