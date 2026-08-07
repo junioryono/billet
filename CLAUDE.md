@@ -74,6 +74,19 @@ billet package.
 
 ---
 
+## Decisions written down
+
+`docs/adr-001-control-plane-hosting.md` — where the control plane runs and what stores its state.
+Short version: a single small EC2 with SQLite on EBS in an ASG of one, ~$13/mo, no code change.
+DynamoDB was considered seriously and rejected FOR NOW — it is feasible, it saves nothing, and it
+costs a rewrite of the two most invariant-dense packages. Revisit it when more than one controller is
+genuinely wanted, which is the only thing SQLite cannot do at any price.
+
+The fact that resized that decision, and which is easy to forget: **GitHub queues a job for 24 hours
+when no matching runner is available.** A dead controller delays CI rather than failing it, so the
+requirement is "recovers in minutes", not HA. Do not buy availability machinery the failure mode does
+not require.
+
 ## Upstream references
 
 `docs/upstream-references.md` records what billet takes from other people's code and what it
