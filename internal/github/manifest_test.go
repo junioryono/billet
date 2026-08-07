@@ -123,6 +123,205 @@ func TestRedactionKeepsTheErrorChainInspectable(t *testing.T) {
 	}
 }
 
+// Sanitizing Error() alone was not enough, and the test above proves why by
+// accident: it performs the errors.As and never looks at what it extracted.
+//
+// The extracted *url.Error is the ORIGINAL, whose URL field still carries the
+// live code — so `errors.As(err, &urlErr); log("cause", urlErr)` prints it, as
+// does any error reporter that walks causes and serializes them. Redaction has
+// to hold for every error reachable from the one returned, not just the outermost.
+func TestRedactionSanitizesEveryErrorInTheChain(t *testing.T) {
+	const code = "super-secret-one-time-code"
+
+	client := &http.Client{Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		return nil, &url.Error{Op: "Post", URL: r.URL.String(), Err: errors.New("inner boom")}
+	})}
+
+	_, err := convertManifestAt(t.Context(), client, "https://example.invalid", code)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+
+	for at := err; at != nil; at = errors.Unwrap(at) {
+		if strings.Contains(at.Error(), code) {
+			t.Errorf("error of type %T renders the one-time code: %v", at, at)
+		}
+	}
+
+	// The field, not just the rendering: a caller that logs urlErr.URL directly
+	// bypasses Error() entirely.
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) && strings.Contains(urlErr.URL, code) {
+		t.Errorf("url.Error.URL still carries the one-time code: %s", urlErr.URL)
+	}
+}
+
+// Every redaction test used a code made entirely of URL-unreserved characters,
+// so PathEscape(code) == code and the escaping branch never ran at all. The
+// encoded spellings are exactly the case the helper exists for.
+func TestRedactionCoversCodesThatNeedEscaping(t *testing.T) {
+	for name, code := range map[string]string{
+		"slash":      "abc/def",
+		"space":      "abc def",
+		"percent":    "abc%def",
+		"mixed case": "AbC/dEf",
+		"plus":       "abc+def",
+		"ampersand":  "abc&def=ghi",
+	} {
+		t.Run(name, func(t *testing.T) {
+			client := &http.Client{Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+				return nil, &url.Error{Op: "Post", URL: r.URL.String(), Err: errors.New("boom")}
+			})}
+
+			_, err := convertManifestAt(t.Context(), client, "https://example.invalid", code)
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+
+			// Every spelling the value can reach a string in: raw, path-escaped,
+			// query-escaped, and each of those escaped again by an intermediary
+			// that embeds the URL in another URL.
+			for _, spelling := range []string{
+				code,
+				url.PathEscape(code),
+				url.QueryEscape(code),
+				url.PathEscape(url.PathEscape(code)),
+				url.QueryEscape(url.QueryEscape(code)),
+			} {
+				for at := err; at != nil; at = errors.Unwrap(at) {
+					if strings.Contains(at.Error(), spelling) {
+						t.Errorf("spelling %q of the code survived in %T: %v", spelling, at, at)
+					}
+				}
+			}
+		})
+	}
+}
+
+// The conversion endpoint is the one place GitHub ever hands over the private
+// key, so its error body is the one body that must never be rendered.
+//
+// apiError prints the JSON message, or 200 raw bytes when there is none. An
+// intermediary that receives the credential-bearing 201 and forwards it with a
+// rewritten status — a proxy translating an upstream hiccup into a 502 — would
+// put the only copy of the private key on the operator's terminal, while also
+// reporting the conversion as failed.
+func TestConversionErrorNeverRendersCredentials(t *testing.T) {
+	const code = "super-secret-one-time-code"
+
+	body := `{"id":1,"pem":"-----BEGIN RSA PRIVATE KEY-----\nMIIsecretkeymaterial\n-----END RSA PRIVATE KEY-----",` +
+		`"webhook_secret":"whsec-do-not-print","client_secret":"cs-do-not-print"}`
+
+	for name, respond := range map[string]func(w http.ResponseWriter) error{
+		"json body": func(w http.ResponseWriter) error {
+			w.WriteHeader(http.StatusBadGateway)
+			_, err := w.Write([]byte(body))
+
+			return err
+		},
+		"non-json body": func(w http.ResponseWriter) error {
+			w.WriteHeader(http.StatusBadGateway)
+			_, err := w.Write([]byte("upstream error, original response: " + body))
+
+			return err
+		},
+		// GitHub's `message` is the one field passed through, so a proxy that
+		// quotes the upstream response INTO that field would smuggle the key out
+		// through the only opening left.
+		"credentials inside the message field": func(w http.ResponseWriter) error {
+			w.WriteHeader(http.StatusBadGateway)
+
+			quoted, err := json.Marshal(struct {
+				Message string `json:"message"`
+			}{Message: "upstream returned: " + body})
+			if err != nil {
+				return err
+			}
+
+			_, err = w.Write(quoted)
+
+			return err
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if err := respond(w); err != nil {
+					t.Errorf("write test response: %v", err)
+				}
+			}))
+			defer srv.Close()
+
+			_, err := convertManifestAt(t.Context(), srv.Client(), srv.URL, code)
+			if err == nil {
+				t.Fatal("expected an error from a 502")
+			}
+
+			for at := err; at != nil; at = errors.Unwrap(at) {
+				for _, secret := range []string{"MIIsecretkeymaterial", "whsec-do-not-print", "cs-do-not-print"} {
+					if strings.Contains(at.Error(), secret) {
+						t.Errorf("a conversion error body leaked %q:\n%v", secret, at)
+					}
+				}
+			}
+
+			// The status still has to reach the operator, or the error says nothing.
+			if !strings.Contains(err.Error(), "502") {
+				t.Errorf("the error dropped the status code: %v", err)
+			}
+		})
+	}
+}
+
+// errors.Join builds a TREE, and errors.Unwrap returns nil for one — so a walk
+// that knows only the single-error form stops dead at the join and leaves every
+// branch below it unredacted. The transport is caller-supplied, so the shape of
+// what it returns is not billet's to assume.
+func TestRedactionWalksJoinedErrors(t *testing.T) {
+	const code = "super-secret-one-time-code"
+
+	client := &http.Client{Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		return nil, errors.Join(
+			errors.New("primary transport failure"),
+			&url.Error{Op: "Post", URL: r.URL.String(), Err: errors.New("secondary")},
+		)
+	})}
+
+	_, err := convertManifestAt(t.Context(), client, "https://example.invalid", code)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+
+	if strings.Contains(err.Error(), code) {
+		t.Errorf("a joined error leaked the one-time code:\n%v", err)
+	}
+
+	// The branch that carried the code is the one to check, so walk the tree
+	// rather than trusting the top-level rendering.
+	var walk func(error)
+
+	walk = func(at error) {
+		if at == nil {
+			return
+		}
+
+		if strings.Contains(at.Error(), code) {
+			t.Errorf("error of type %T in the joined tree renders the code: %v", at, at)
+		}
+
+		if joined, ok := at.(interface{ Unwrap() []error }); ok {
+			for _, branch := range joined.Unwrap() {
+				walk(branch)
+			}
+
+			return
+		}
+
+		walk(errors.Unwrap(at))
+	}
+
+	walk(err)
+}
+
 type roundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }

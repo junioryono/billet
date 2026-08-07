@@ -1756,6 +1756,10 @@ func TestNewRejectsPolicyKeysThatCannotBeFound(t *testing.T) {
 	zero := 0
 
 	for name, nodes := range map[string]map[string]config.NodePolicy{
+		// Whitespace on BOTH, because that is what a config produces: one name
+		// becomes the key and the policy's Name. Caught by the name validation,
+		// not by any key-specific rule — an explicit key-canonicalization check
+		// was removed after mutation showed it could never fire.
 		"key has trailing whitespace": {
 			"mac-mini-1 ": {Name: "mac-mini-1 ", MacOSVMLimit: &zero},
 		},

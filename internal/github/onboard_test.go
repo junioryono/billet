@@ -35,6 +35,10 @@ type fakeGitHub struct {
 	installed atomic.Bool
 
 	conversions atomic.Int32
+
+	// rejectCode makes the conversion endpoint answer 404 for one code, which is
+	// what GitHub returns for a code it never issued. Set before serving.
+	rejectCode string
 }
 
 func newFakeGitHub(t *testing.T) *fakeGitHub {
@@ -67,6 +71,14 @@ func (g *fakeGitHub) handler() http.Handler {
 
 		if !strings.HasSuffix(r.URL.Path, "/conversions") {
 			http.Error(w, "bad path", http.StatusNotFound)
+			return
+		}
+
+		presented := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/app-manifests/"), "/conversions")
+		if g.rejectCode != "" && presented == g.rejectCode {
+			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprint(w, `{"message":"Not Found"}`)
+
 			return
 		}
 
@@ -773,6 +785,87 @@ func TestOnboardRejectsStateMismatch(t *testing.T) {
 	// Exactly one exchange: the forged code must never have been redeemed.
 	if n := fake.conversions.Load(); n != 1 {
 		t.Errorf("conversions = %d, want exactly 1 (the legitimate one)", n)
+	}
+}
+
+// A callback whose STATE is correct but whose code is worthless must not end
+// the flow either.
+//
+// The unguessable path stops a process that has to guess it — but billet hands
+// that path to `open`/`xdg-open` as a command-line argument, and argv is
+// readable by other processes on the machine. So the prefix and the state must
+// both be assumed known, and the remaining question is what a caller can do
+// with them. Injecting a bogus code was a kill switch: it was accepted, redeemed
+// once, and its failure ended onboarding — orphaning an App whose one-time key
+// GitHub had already issued and will not issue again.
+//
+// A code that does not redeem is now treated the same way a bad state is: it is
+// discarded, and the flow keeps waiting for the redirect that does redeem.
+func TestOnboardSurvivesAnInjectedCode(t *testing.T) {
+	fake := newFakeGitHub(t)
+	fake.rejectCode = "injected-by-a-local-process"
+
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	browser := &browser{t: t, fake: fake, client: srv.Client()}
+
+	var calls atomic.Int32
+
+	attacked := func(ctx context.Context, target string) error {
+		// Only the first call is the loopback start page.
+		if calls.Add(1) == 1 {
+			// The attacker knows the secret path — it read the browser command
+			// line — so it can also read the state out of the start page, exactly
+			// as the legitimate browser does.
+			state := extractAttr(browser.get(ctx, target), "state=")
+			if state == "" {
+				t.Error("could not read the state from the start page")
+			}
+
+			forged := strings.TrimSuffix(target, "/") + "/callback?code=" + fake.rejectCode + "&state=" + state
+
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, forged, http.NoBody)
+			if err != nil {
+				return err
+			}
+
+			resp, err := srv.Client().Do(req)
+			if err != nil {
+				return err
+			}
+
+			resp.Body.Close()
+		}
+
+		return browser.open(ctx, target)
+	}
+
+	result, err := Onboard(ctx, OnboardOptions{
+		Org:          "acme",
+		OpenBrowser:  attacked,
+		Log:          func(string, ...any) {},
+		Client:       srv.Client(),
+		InstallPoll:  20 * time.Millisecond,
+		apiBase:      srv.URL,
+		OnAppCreated: func(*App) error { return nil },
+	})
+
+	if err != nil {
+		t.Fatalf("an injected code ended the flow and orphaned the App: %v", err)
+	}
+
+	if result == nil || result.App == nil || result.App.ID == 0 {
+		t.Fatal("onboarding produced no app despite the legitimate redirect succeeding")
+	}
+
+	// Two exchanges: the rejected injection, then the real one. Fewer would mean
+	// the injection never landed and this test proves nothing.
+	if n := fake.conversions.Load(); n != 2 {
+		t.Errorf("conversions = %d, want 2 (the rejected injection, then the real code)", n)
 	}
 }
 

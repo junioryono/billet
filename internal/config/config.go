@@ -36,10 +36,16 @@ type Config struct {
 	// machine whose hostname is not a legal node name. Nil means os.Hostname.
 	hostname func() (string, error)
 
-	// nameFromHostname records that node.name was DEFAULTED rather than written.
-	// The diagnostic differs: an operator who never typed a name needs to be
-	// told where the bad one came from, or they go looking for a field that is
-	// not in their file.
+	// nameDefaulted records THAT node.name was defaulted from the hostname;
+	// nameFromHostname records what that hostname was.
+	//
+	// Two fields, because a non-empty value is not the same fact as "billet
+	// supplied this". A machine whose hostname is blank or all whitespace
+	// defaults to an empty name — still defaulted, still the case where the
+	// operator needs to be told where it came from — and a single string field
+	// reported that one with the generic wording, which sends someone who never
+	// typed a name looking for a field that is not in their file.
+	nameDefaulted    bool
 	nameFromHostname string
 
 	// Nodes describes per-host policy to the server. It is optional and separate
@@ -528,7 +534,8 @@ func (c *Config) applyDefaults() {
 
 			if h, err := lookup(); err == nil {
 				c.Node.Name = strings.TrimSpace(h)
-				c.nameFromHostname = c.Node.Name
+				c.nameDefaulted = true
+				c.nameFromHostname = h
 			}
 		}
 		if c.Node.StateDir == "" {
@@ -678,11 +685,7 @@ func (c *Config) validateNode() []error {
 		// guaranteed to be a legal node name — a long FQDN exceeds the length
 		// limit — and "node.name is invalid" sends an operator who never typed
 		// one looking for a field that is not in their file.
-		// Say where the name came from when billet supplied it. A hostname is not
-		// guaranteed to be a legal node name — a long FQDN exceeds the length
-		// limit — and "node.name is invalid" sends an operator who never typed
-		// one looking for a field that is not in their file.
-		if c.nameFromHostname != "" {
+		if c.nameDefaulted {
 			err = fmt.Errorf(
 				"node.name defaulted to this machine's hostname %q, which is not a usable node name "+
 					"(must match %s); set node.name explicitly",

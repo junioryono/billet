@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"net"
@@ -13,6 +14,20 @@ import (
 	"net/url"
 	"time"
 )
+
+// ErrCredentialPreserved marks a failure in which the App's private key was NOT
+// lost: it exists on disk, and the error that carries this sentinel says where.
+//
+// It exists because the correct recovery advice is the opposite in the two
+// cases. A key that was never stored means the App is unusable and should be
+// deleted on GitHub; a key that was stored somewhere unexpected means the App
+// must be KEPT and the file moved into place. Onboarding cannot tell the two
+// apart from the error text, and the wrong instruction destroys a credential
+// GitHub will not re-issue.
+//
+// Callers that persist the credential wrap their errors with this whenever the
+// key reached durable storage.
+var ErrCredentialPreserved = errors.New("the App key was preserved")
 
 // Onboarding result. Credentials live here only long enough to be written to
 // disk by the caller.
@@ -122,9 +137,17 @@ func Onboard(ctx context.Context, opts OnboardOptions) (*Onboarding, error) {
 	// callbacks does not help there: the state IS valid, billet accepts the code,
 	// the exchange fails, and the flow dies with GitHub's App already created.
 	//
-	// A 256-bit path is the same secret the state is, applied one step earlier:
-	// a process that cannot guess it cannot reach any handler. The operator never
-	// types this — the browser is handed the whole URL.
+	// A 256-bit path is the same secret the state is, applied one step earlier.
+	//
+	// Its guarantee is narrower than it looks, and worth stating exactly: it
+	// defeats a process that must GUESS the path — port scanning, or walking
+	// loopback for a known route. It does NOT defeat a process that can observe
+	// this one, and on a shared host that is not a high bar: the URL is handed to
+	// `open`/`xdg-open` as a command-line argument, and argv is readable through
+	// /proc or ps. So the path and the state are both treated as knowable, and
+	// what a caller can DO with them is bounded separately — a forged callback
+	// cannot end the flow (handleCallback) and an injected code cannot either
+	// (register).
 	secretPath, err := randomState()
 	if err != nil {
 		return nil, err
@@ -229,29 +252,76 @@ func (f *onboardFlow) register(ctx context.Context) (*App, error) {
 	f.opts.Log("")
 	f.openOrPrint(ctx, startURL)
 
-	var code string
+	// A code that does not redeem is DISCARDED, and the flow keeps waiting.
+	//
+	// The state stops a process that has to guess it, but billet passes the
+	// callback URL to `open`/`xdg-open` as a command-line argument, and argv is
+	// readable by other processes on this machine — so both the path and the
+	// state have to be assumed known. Treating the first code to arrive as final
+	// then handed any local process a kill switch: inject a worthless code, watch
+	// the exchange fail, and onboarding ends with GitHub's App already created
+	// and its one-time private key unrecoverable.
+	//
+	// Only GitHub's own rejection of a code is retried. A request that could not
+	// be completed at all is reported immediately, because no second redirect is
+	// coming to fix it.
+	var lastRejection error
 
-	select {
-	case code = <-f.codeCh:
-	case err := <-f.errCh:
-		return nil, err
-	case <-ctx.Done():
-		return nil, fmt.Errorf("github: timed out waiting for app registration: %w", ctx.Err())
+	for {
+		var code string
+
+		select {
+		case code = <-f.codeCh:
+		case err := <-f.errCh:
+			return nil, err
+		case <-ctx.Done():
+			if lastRejection != nil {
+				// The honest failure — an operator who took longer than GitHub's
+				// window — must not be reported as a bare timeout, or the one
+				// message that explains it is the one that gets dropped.
+				return nil, fmt.Errorf("github: no usable registration arrived: %w", lastRejection)
+			}
+
+			return nil, fmt.Errorf("github: timed out waiting for app registration: %w", ctx.Err())
+		}
+
+		f.opts.Log("Registration received. Exchanging it for credentials...")
+
+		app, err := convertManifestAt(ctx, f.opts.Client, f.opts.api(), code)
+		if err == nil {
+			return f.persist(app)
+		}
+
+		if !errors.Is(err, errCodeRejected) {
+			return nil, err
+		}
+
+		lastRejection = err
+
+		f.opts.Log("GitHub rejected that registration (%v). Still waiting for the redirect.", err)
 	}
+}
 
-	f.opts.Log("Registration received. Exchanging it for credentials...")
-
-	app, err := convertManifestAt(ctx, f.opts.Client, f.opts.api(), code)
-	if err != nil {
-		return nil, err
-	}
-
+// persist hands the credentials to the caller before the installation step.
+func (f *onboardFlow) persist(app *App) (*App, error) {
 	f.app = app
 	f.opts.Log("Created app %q (id %d).", app.Name, app.ID)
 
 	// Persist BEFORE the installation step. See OnAppCreated: from here on the
 	// app is real on GitHub, and its key cannot be re-issued.
 	if err := f.opts.OnAppCreated(app); err != nil {
+		// The advice depends on whether the key survived, and getting it wrong
+		// destroys things. Wrapping EVERY failure with "delete it and try again"
+		// contradicted the callback's own message — which names the path the key
+		// was preserved at — and an operator who followed the outer advice would
+		// delete the App that preserved key belongs to.
+		if errors.Is(err, ErrCredentialPreserved) {
+			return nil, fmt.Errorf(
+				"github: app %d was created on GitHub and its key was preserved, but onboarding "+
+					"could not finish (%w). Do NOT delete the app: follow the instruction above, "+
+					"then run `billet check`", app.ID, err)
+		}
+
 		return nil, fmt.Errorf(
 			"github: app %d was created on GitHub but its credentials could not be saved (%w); "+
 				"delete it at %s and try again", app.ID, err, app.HTMLURL)
@@ -368,8 +438,13 @@ func (f *onboardFlow) openOrPrint(ctx context.Context, target string) {
 	}
 
 	if opened {
-		f.opts.Log("Opened your browser. If nothing happened, visit:")
-		f.opts.Log("  %s", target)
+		// The URL is deliberately NOT repeated here. It carries the unguessable
+		// path, and printing it again puts that in the terminal scrollback and in
+		// any journal or CI log capturing this output — for no benefit, since the
+		// browser already has it. An operator whose browser did not appear gets a
+		// route that does not widen the exposure.
+		f.opts.Log("Opened your browser.")
+		f.opts.Log("If nothing appeared, press Ctrl-C and re-run with --no-browser to get the URL.")
 		f.opts.Log("")
 
 		return
