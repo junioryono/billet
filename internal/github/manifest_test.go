@@ -563,6 +563,8 @@ func TestOnlyCodeSpecificStatusesDiscardTheCode(t *testing.T) {
 // gives up has orphaned an App whose key GitHub will not re-issue. "Run the
 // command again" builds a SECOND App; it does not recover the first one's key.
 func TestAnAmbiguousRejectionRetriesTheSameCode(t *testing.T) {
+	shortenBackoff(t)
+
 	fake := newFakeGitHub(t)
 	fake.rejectStatus = http.StatusUnprocessableEntity
 	fake.ambiguousFirst = 2

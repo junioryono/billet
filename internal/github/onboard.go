@@ -69,7 +69,10 @@ const maxManifestCodeLen = 512
 // Backoff for retrying an ambiguous exchange. Short at first because the common
 // ambiguous cause is a transient rate limit that clears in seconds, capped so a
 // long window is not spent asleep.
-const (
+// Variables rather than constants ONLY so tests can shorten them. The retry loop
+// is the most behaviour-dense part of onboarding, and a suite that takes minutes
+// to exercise it is a suite people stop running.
+var (
 	initialExchangeBackoff = 2 * time.Second
 	maxExchangeBackoff     = 30 * time.Second
 )
@@ -312,9 +315,8 @@ func (f *onboardFlow) register(ctx context.Context) (*App, error) {
 	// the exchange fail, and onboarding ends with GitHub's App already created
 	// and its one-time private key unrecoverable.
 	//
-	// Only a 404 DROPS a code — everything else keeps it. A request that could
-	// not be completed at all is still reported immediately, because there is no
-	// answer to interpret and no second redirect coming to fix it.
+	// Only a 404 DROPS a code. Everything else — every other status, and a
+	// request that could not be completed at all — keeps it and tries again.
 	//
 	// Codes are tried ROUND-ROBIN, and a code that stays ambiguous never blocks
 	// another one.
@@ -328,7 +330,7 @@ func (f *onboardFlow) register(ctx context.Context) (*App, error) {
 	seen := make(map[string]bool)
 	backoff := initialExchangeBackoff
 
-	var lastRejection, fatal error
+	var lastRejection error
 
 	for {
 		// Take everything queued before spending time on any of it, so a code that
@@ -352,7 +354,7 @@ func (f *onboardFlow) register(ctx context.Context) (*App, error) {
 			case err := <-f.errCh:
 				return nil, err
 			case <-ctx.Done():
-				return nil, f.registrationTimeout(ctx, errors.Join(fatal, lastRejection))
+				return nil, f.registrationTimeout(ctx, lastRejection)
 			}
 
 			continue
@@ -403,15 +405,21 @@ func (f *onboardFlow) register(ctx context.Context) (*App, error) {
 				lastRejection = err
 				keep = append(keep, code)
 			default:
-				// A request that could not be completed at all. It is NOT returned
-				// straight away: an honest code already acknowledged may be sitting
-				// behind this one, and returning here closes the listener with that
-				// code unredeemed. Remembered, and reported only if nothing else
-				// resolves.
+				// A request that could not be completed at all is AMBIGUOUS too,
+				// and reaching that conclusion took an invariant test rather than
+				// a review. The old reasoning — "no answer to interpret, and no
+				// second redirect coming to fix it" — is wrong twice over: a
+				// transport can recover, and the honest redirect may simply not
+				// have arrived yet. GitHub created the App when the browser POSTed
+				// the manifest, so the code is a receipt for something that already
+				// exists, and abandoning it orphans that App.
+				//
+				// Deferring it was not enough either: the deferral only helped when
+				// something else was already queued. The code has to be KEPT.
 				lastRejection = err
-				fatal = err
+				keep = append(keep, code)
 
-				f.opts.Log("A registration could not be exchanged at all (%v).", err)
+				f.opts.Log("A registration could not be exchanged (%v). Keeping it and retrying.", err)
 			}
 		}
 
@@ -423,12 +431,6 @@ func (f *onboardFlow) register(ctx context.Context) (*App, error) {
 		pending = addCodes(keep, seen, f.drainCodes())
 
 		if len(pending) == 0 {
-			// Nothing left to retry, and nothing arrived while trying. A request
-			// that could not be completed is terminal once there is nothing else.
-			if fatal != nil {
-				return nil, fatal
-			}
-
 			continue
 		}
 
