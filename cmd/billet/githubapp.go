@@ -195,7 +195,11 @@ func reserveKeyFile(path string) (*os.File, error) {
 	// actually protects the destination is that nothing here ever creates,
 	// removes or renames it — the only thing that puts a file at that name is the
 	// os.Link at install time, which refuses atomically when the name is taken.
-	if fileExists(path) {
+	//
+	// pathPresent, not "not absent": an unstattable destination must not block
+	// onboarding, because the link is what guarantees safety and it does not need
+	// this answer. Only a destination KNOWN to be occupied is worth stopping for.
+	if lookupPath(path) == pathPresent {
 		return nil, destinationOccupiedError(path)
 	}
 
@@ -270,12 +274,12 @@ func stagedKeyFoundError(path, staged string) error {
 	// command that destroys a second App's key whenever one already sits at the
 	// destination — the precise outcome every other rule here exists to prevent,
 	// arrived at by following billet's own instructions.
-	// fileExists, NOT "does it hold a key". `mv` replaces whatever is there, so
-	// the question is whether the destination is OCCUPIED — and several states
-	// that are not a usable billet key still hold something worth keeping: a PEM
-	// with trailing junk, a key in a format this build cannot parse, a file a
-	// live writer has not finished. "Not currently a valid key" was never proof
-	// that clobbering it is safe.
+	// The question is whether the destination is OCCUPIED, not whether it holds
+	// something billet recognises. Several states that are not a usable billet key
+	// still hold something worth keeping: a PEM with trailing junk, a key in a
+	// format this build cannot parse, a file a live writer has not finished.
+	// "Not currently a valid key" was never proof that clobbering it is safe —
+	// and neither is "could not tell", which is why this is `!= pathAbsent`.
 	if lookupPath(path) != pathAbsent {
 		return fmt.Errorf(
 			"two files are present and billet cannot tell which key you want:\n"+
@@ -885,13 +889,6 @@ var errCredentialPreserved = github.ErrCredentialPreserved
 // destination keeps two runs onto different key paths out of each other's way.
 func stagingPath(path string) string {
 	return filepath.Join(filepath.Dir(path), "."+filepath.Base(path)+".billet-partial")
-}
-
-// fileExists reports whether anything at all occupies path, symlinks included.
-func fileExists(path string) bool {
-	_, err := os.Lstat(path)
-
-	return err == nil
 }
 
 // keyState is what inspecting a path concluded. The third value is the point:

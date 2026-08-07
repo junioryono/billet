@@ -345,12 +345,38 @@ answers 404, and the case that actually needed handling is the one that is unamb
 The callback queue is deep, and a callback that does **not** fit is refused rather than dropped — a
 silent drop plus an "App created" page meant the honest redirect could be discarded while its browser
 was told it had worked. What remains is a local process being able to *delay* onboarding up to
-`ManifestTTL` — not fixable while argv is readable. It stays a delay rather than a lost credential only
-because injected codes are retried alongside the honest one rather than ahead of it, and because
-**every acknowledged callback is exchanged at least once**. The bound is on what is carried into the
-NEXT round, never on admission — bounding admission was strictly worse than having no bound at all,
-since permanently-ambiguous injected codes would then displace an honest redirect the HTTP handler had
-already answered "App created".
+`ManifestTTL` — not fixable while argv is readable. **No cap on which codes are kept can be correct, and three attempts established that.** Unbounded let
+an attacker accumulate work; bounding admission discarded an honest redirect the handler had already
+answered "App created"; bounding retention discarded it one ambiguous response later. billet cannot
+distinguish an injected code from an honest one — only GitHub can, and only a 404 is it saying so — so
+the bound is on **work per round**, and codes not reached rotate to the front of the next round.
+Nothing is ever discarded. A transport failure on one code is remembered rather than returned, because
+returning closes the listener with an acknowledged code unredeemed.
+
+### The residual: argv, and why billet stops here
+
+Everything in the paragraph above exists because of one fact: **the callback URL is passed to
+`open`/`xdg-open` as a command-line argument, and argv is readable by other local processes** (via
+`/proc` on Linux, `ps` generally). That is how a local process learns the unguessable path, reads the
+`state` from the start page, and injects callbacks at all.
+
+This is **documented and accepted, not fixed.** What an attacker with that access can do is bounded:
+
+- **They cannot obtain the key.** The conversion response never passes through anything they control,
+  and the code is redacted from every error.
+- **They cannot destroy it.** Every path above either installs the key, preserves it somewhere named,
+  or says honestly that it could not tell — and nothing is deleted that this run did not create.
+- **They can delay onboarding**, up to `ManifestTTL`, by injecting codes that stay ambiguous.
+
+The structural fix is to keep the URL out of argv — write it to a 0600 file with a meta-refresh and
+open that, so the path is protected exactly as the key file is. It is not done because it trades a
+real risk on the primary happy path (not every browser follows `file://` → `http://`) against a threat
+that only exists on a multi-user host. **If billet ever targets shared CI hosts as a first-class case,
+do that first** — it collapses this entire class rather than scheduling around it.
+
+Four review rounds went into scheduling around this before anyone noticed it was downstream of argv.
+That is the lesson worth keeping: when fixes keep producing adjacent bugs, look for the premise they
+all share.
 
 **`App` is redacted on every rendering path billet can reach.** `String`/`GoString` on a **value**
 receiver (a pointer receiver is not consulted when a value is formatted), `Format` so no verb falls
