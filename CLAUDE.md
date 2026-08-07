@@ -216,9 +216,15 @@ introduced by the fix for the previous one.
 **Nothing deletes the key path after GitHub has issued a credential.** The cleanup for the
 reservation keys off *did GitHub issue anything*, not *did the write report success*. A rename can
 commit and still return an error on a FUSE or network mount, and the difference is a deleted key. An
-empty reservation left behind costs one `rm`. Cleanup and install also verify, via `os.SameFile`
-against the still-open descriptor, that the path is **still this run's reservation** — the pathname is
-not proof of ownership, and a second run may have installed its own key there.
+empty reservation left behind costs one `rm`.
+
+**Install never REPLACES.** The pathname is not proof of ownership — a second run can reserve the
+same path once the first run's placeholder is deleted, which is exactly what the "delete it and
+re-run" diagnostic tells operators to do. `os.SameFile` against the open descriptor is a pre-check and
+**cannot** be atomic with the mutation that follows, so the install itself is `os.Link`, which refuses
+when the destination exists; on EEXIST the key stays at the staging path and is reported rather than
+overwriting whatever got there first. Cleanup additionally requires the file to still be *empty*, so
+the residual race can only cost another run's placeholder, never its key.
 
 **The reservation is never adopted, and it is a real fallback rather than a probe.** An empty file at
 the key path looks like a crashed run's leftover and is equally a *concurrent* run's live reservation;
@@ -228,17 +234,25 @@ can fail on its own — a directory that turned read-only during the browser flo
 table. Reserving without ever writing to it left that case returning an error with the only copy of
 an unrepeatable key in memory.
 
-**The write is atomic where it can be**: staging file → fsync → fsync the directory → rename → fsync
-the directory, with the credential marked installed the instant the rename returns. The staging name
-is *derived from the destination*, not random, so a crash in the rename window leaves the key
-somewhere the next run reports by name instead of under an unpredictable hidden file. When staging is
-impossible the fallback writes through the reservation, trading crash-atomicity for not losing the
-key; a torn PEM there is what `billet check` catches.
+**The write is atomic where it can be**: staging file → fsync → fsync the directory → link → fsync the
+directory, with the credential marked installed the instant the link returns. The staging name is
+*derived from the destination*, not random, so a crash in that window leaves the key somewhere the
+next run reports by name instead of under an unpredictable hidden file — and the next run only reports
+it if the bytes actually **parse as a key**, because telling an operator to install a fragment is
+worse than saying nothing. When staging is impossible the fallback writes through the reservation,
+trading crash-atomicity for not losing the key; a torn PEM there is what `billet check` catches.
 
-**An error that preserved the credential says so with `github.ErrCredentialPreserved`.** Recovery
-advice is opposite in the two cases — delete the App and retry, versus keep the App and move the file
-— and onboarding cannot tell them apart from the error text. Wrapping every failure with "delete it
-and try again" contradicted the message directly beneath it.
+**The credential is never written twice.** Once the staging file holds a complete key, every later
+failure reports it as preserved and the fallback does **not** run. Keying that on "did staging report
+success" instead put two copies of an unrepeatable private key on disk — one at a path nothing cleans
+up and the operator is never told about.
+
+**Every error that left the key readable carries `github.ErrCredentialPreserved`, and no other error
+does.** Recovery advice is opposite in the two cases — delete the App and retry, versus keep the App
+and move the file — and onboarding cannot tell them apart from the error text. Both directions are
+destructive: wrapping every failure with "delete it and try again" contradicted the message directly
+beneath it, and marking a fallback whose write went to an unlinked descriptor would tell the operator
+to keep an App whose key is unreachable.
 
 **`billet check` proves the key WORKS**, not that it exists — regular file, no group/other permission
 bits, bounded read, and actually parsed, all from one descriptor opened `O_NONBLOCK` so a FIFO cannot
@@ -251,25 +265,37 @@ Two rules, learned separately:
 - **Sanitize where the error is created, not at the boundary.** Every wrapper renders the message of
   the error beneath it, so cleaning the innermost one means no wrapper can carry the code and no later
   stage has to recognise the encoding it arrived in. A `*url.Error` is *rebuilt* with a fixed path
-  rather than pattern-matched — double-encoding and over-encoding both defeat matching. String
-  scrubbing (`redactString`) survives only as defence in depth.
-- **Redaction has to hold for the whole chain.** Sanitizing `Error()` while `Unwrap` returned the
-  original meant `errors.As(err, &urlErr)` handed back the live URL, and any reporter that walks
-  causes serialized it. The walk must handle `errors.Join` trees too — `errors.Unwrap` returns nil for
-  one, so a chain-only walk stops dead at the join. Leaf identity is preserved, or callers lose
-  `errors.Is` against `context.DeadlineExceeded`.
+  rather than pattern-matched — double-encoding and over-encoding both defeat matching.
+- **Redaction has to hold for the whole chain, including nodes with no structure.** Sanitizing
+  `Error()` while `Unwrap` returned the original meant `errors.As(err, &urlErr)` handed back the live
+  URL, and any reporter that walks causes serialized it. The walk handles `errors.Join` trees
+  (`errors.Unwrap` returns nil for one, so a chain-only walk stops dead at the join) and is depth-bounded
+  (a caller-supplied error can `Unwrap` to itself). Identity is preserved wherever it can be, because
+  `errors.Is` against `context.DeadlineExceeded` depends on it — but **not** at a node whose own text
+  carries the secret. An opaque leaf that built its message from the request URL has nothing to rebuild,
+  so it is replaced; safety beats identity there.
+- **Match the endpoint, not just the code.** A caller-supplied `RoundTripper` composes its own text.
+  The endpoint string is an exact literal billet constructed, so matching it needs none of the encoding
+  guesswork that matching the bare code does. `Error()` is read **once** per node — reading it twice let
+  a non-deterministic error return clean text to the check and dirty text to whatever printed it next.
 
-**The conversion response body is never rendered.** This is the one endpoint in GitHub's API that
-returns a private key, so an intermediary that forwards the credential-bearing 201 under a rewritten
-status would otherwise put it on the terminal. Only GitHub's own `message` passes through, and only
-after it is checked for credential markers. Other endpoints keep `apiError`.
+**Nothing derived from the conversion response body is ever rendered.** This is the one endpoint in
+GitHub's API whose success carries a private key, so an intermediary forwarding that body under a
+rewritten status would otherwise put the key on the terminal. Filtering the body does not work — a
+secret out of its field is an opaque string, and `{"message":"whsec-…"}` carries no marker to catch.
+The status is mapped to text billet writes itself. False positives cost GitHub's explanation; false
+negatives cost the credential, and that asymmetry decides it. Other endpoints keep `apiError`.
 
 **A code that does not redeem is discarded, not fatal.** The unguessable callback path is handed to
 `open`/`xdg-open` as a command-line argument, and argv is readable by other local processes — so both
 the path and the `state` must be assumed known, and only what a caller can *do* with them is bounded.
 Treating the first code to arrive as final was a kill switch: inject a worthless one, and onboarding
 ended with the App created and its key unrecoverable. Only GitHub's own rejection retries; a request
-that could not complete still fails immediately, because no second redirect is coming.
+that could not complete still fails immediately, because no second redirect is coming. The callback
+queue is deep, and a callback that does **not** fit is refused rather than dropped — a silent drop plus
+an "App created" page meant the honest redirect could be discarded while its browser was told it had
+worked. What remains is a local process being able to *delay* onboarding up to `ManifestTTL`; that is
+not fixable while argv is readable, and it is a delay rather than a lost credential.
 
 **`App` is redacted on every rendering path billet can reach.** `String`/`GoString` on a **value**
 receiver (a pointer receiver is not consulted when a value is formatted), `Format` so no verb falls

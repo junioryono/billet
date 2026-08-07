@@ -29,6 +29,14 @@ import (
 // key reached durable storage.
 var ErrCredentialPreserved = errors.New("the App key was preserved")
 
+// codeQueueDepth is how many pending registration callbacks the loopback
+// listener will hold.
+//
+// GitHub sends exactly one. The depth exists for the injected ones: with a
+// single slot, a local process could keep the queue full across an in-flight
+// exchange and the honest redirect would be dropped on arrival.
+const codeQueueDepth = 32
+
 // Onboarding result. Credentials live here only long enough to be written to
 // disk by the caller.
 type Onboarding struct {
@@ -161,12 +169,17 @@ func Onboard(ctx context.Context, opts OnboardOptions) (*Onboarding, error) {
 	}
 
 	flow := &onboardFlow{
-		opts:     opts,
-		state:    state,
-		base:     base,
-		prefix:   secretPath,
-		port:     tcpAddr.Port,
-		codeCh:   make(chan string, 1),
+		opts:   opts,
+		state:  state,
+		base:   base,
+		prefix: secretPath,
+		port:   tcpAddr.Port,
+		// Deep enough that a legitimate redirect is never turned away while an
+		// exchange is in flight. It does not stop a local process from filling it
+		// — nothing can, since argv hands out the path — but the flow now
+		// survives that as a delay bounded by ManifestTTL rather than as a lost
+		// credential.
+		codeCh:   make(chan string, codeQueueDepth),
 		installC: make(chan struct{}, 1),
 		errCh:    make(chan error, 1),
 	}
@@ -524,9 +537,21 @@ func (f *onboardFlow) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A dropped code must not be acknowledged as accepted.
+	//
+	// The channel held one element and a full one was silently discarded, so two
+	// injected codes timed around an in-flight exchange could crowd out GitHub's
+	// honest redirect — which was then told "App created" while its code had
+	// been thrown away, leaving onboarding waiting for a redirect that had
+	// already come and gone. The queue is deep enough that ordinary use never
+	// reaches it, and a caller that does not fit is told so rather than lied to.
 	select {
 	case f.codeCh <- code:
 	default:
+		http.Error(w, "billet is still working through earlier registrations; retry in a moment",
+			http.StatusServiceUnavailable)
+
+		return
 	}
 
 	writePage(w, "App created", "Now install it on your organization. You can close this tab when the CLI says it is done.")
