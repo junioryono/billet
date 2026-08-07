@@ -218,13 +218,20 @@ reservation keys off *did GitHub issue anything*, not *did the write report succ
 commit and still return an error on a FUSE or network mount, and the difference is a deleted key. An
 empty reservation left behind costs one `rm`.
 
-**Install never REPLACES.** The pathname is not proof of ownership — a second run can reserve the
-same path once the first run's placeholder is deleted, which is exactly what the "delete it and
-re-run" diagnostic tells operators to do. `os.SameFile` against the open descriptor is a pre-check and
-**cannot** be atomic with the mutation that follows, so the install itself is `os.Link`, which refuses
-when the destination exists; on EEXIST the key stays at the staging path and is reported rather than
-overwriting whatever got there first. Cleanup additionally requires the file to still be *empty*, so
-the residual race can only cost another run's placeholder, never its key.
+**Install never REPLACES, and neither does anything on the way to it.** The pathname is not proof of
+ownership — a second run can reserve the same path once the first run's placeholder is deleted, which
+is exactly what the "delete it and re-run" diagnostic tells operators to do. `os.SameFile` against the
+open descriptor is a pre-check and **cannot** be atomic with the mutation that follows, so:
+
+- The install is `os.Link`, which refuses when the destination exists. On `EEXIST` the key stays at the
+  staging path and is reported rather than overwriting whatever got there first.
+- **Every step that removes the destination first checks it is empty.** This is the one that was missed:
+  linking cannot replace, but the `os.Remove` clearing the reservation for it replaces just as
+  thoroughly, so the first version deleted a key that arrived after the ownership check and then
+  reported success. Emptiness is the bound that survives without atomicity — a reservation is empty and
+  an installed key never is, so the residual race can only cost another run's placeholder.
+
+The same rule governs the pre-issuance cleanup, for the same reason.
 
 **The reservation is never adopted, and it is a real fallback rather than a probe.** An empty file at
 the key path looks like a crashed run's leftover and is equally a *concurrent* run's live reservation;
