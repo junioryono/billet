@@ -302,68 +302,73 @@ func (f *onboardFlow) register(ctx context.Context) (*App, error) {
 	// Only GitHub's own rejection of a code is retried. A request that could not
 	// be completed at all is reported immediately, because no second redirect is
 	// coming to fix it.
+	// Codes are tried ROUND-ROBIN, and a code that stays ambiguous never blocks
+	// another one.
+	//
+	// Retrying a single code inside a blocking loop reopened the kill switch in
+	// slow motion: a local process submits a malformed code that consistently
+	// draws 422, the retry loop sits on it, and the honest redirect waits in the
+	// queue until GitHub's window closes with the App created and its key
+	// unrecoverable. Nothing is discarded and nothing is allowed to monopolise.
+	pending := make([]string, 0, 1)
+	backoff := initialExchangeBackoff
+
 	var lastRejection error
 
 	for {
-		var code string
+		// Take everything queued before spending time on any of it, so a code that
+		// arrived during the last round is tried in this one.
+		pending = append(pending, f.drainCodes()...)
 
-		select {
-		case code = <-f.codeCh:
-		case err := <-f.errCh:
-			return nil, err
-		case <-ctx.Done():
-			if lastRejection != nil {
-				// The honest failure — an operator who took longer than GitHub's
-				// window — must not be reported as a bare timeout, or the one
-				// message that explains it is the one that gets dropped.
-				return nil, fmt.Errorf("github: no usable registration arrived: %w", lastRejection)
+		if len(pending) == 0 {
+			select {
+			case code := <-f.codeCh:
+				pending = append(pending, code)
+			case err := <-f.errCh:
+				return nil, err
+			case <-ctx.Done():
+				return nil, f.registrationTimeout(ctx, lastRejection)
 			}
 
-			return nil, fmt.Errorf("github: timed out waiting for app registration: %w", ctx.Err())
+			continue
 		}
 
-		f.opts.Log("Registration received. Exchanging it for credentials...")
+		f.opts.Log("Exchanging %d registration(s) for credentials...", len(pending))
 
-		app, err := f.exchange(ctx, code)
-		if err == nil {
-			return f.persist(app)
+		keep := pending[:0]
+
+		for _, code := range pending {
+			app, err := convertManifestAt(ctx, f.opts.Client, f.opts.api(), code)
+			if err == nil {
+				return f.persist(app)
+			}
+
+			switch {
+			case errors.Is(err, errCodeRejected):
+				// GitHub says this specific code is not one it issued. Dropping it
+				// is the only case where dropping is safe.
+				lastRejection = err
+
+				f.opts.Log("GitHub did not recognise one of the registrations (%v).", err)
+			case errors.Is(err, errCodeAmbiguous):
+				// Nothing was established about the code, so it is kept and tried
+				// again next round.
+				lastRejection = err
+				keep = append(keep, code)
+			default:
+				// A request that could not be completed at all — no answer to
+				// interpret, and no second redirect coming to fix it.
+				return nil, err
+			}
 		}
 
-		if !errors.Is(err, errCodeRejected) {
-			return nil, err
+		pending = keep
+
+		if len(pending) == 0 {
+			continue
 		}
 
-		lastRejection = err
-
-		f.opts.Log("GitHub rejected that registration (%v). Still waiting for the redirect.", err)
-	}
-}
-
-// exchange redeems one code, retrying it while GitHub's answer says nothing
-// about the code itself.
-//
-// Only THREE outcomes leave this function: the credentials, a definitive
-// rejection of this code, or a failure the caller must not paper over. An
-// ambiguous answer is none of those, and the previous version treated it as the
-// third — which was credential loss with extra steps. The code lives in a local
-// variable and the loopback server exits with the flow, so "run the command
-// again" builds a SECOND App rather than recovering the first one's key. GitHub
-// documents 422 as validation failure OR the endpoint having been spammed, so an
-// attacker who trips abuse protection could make the honest code look invalid.
-//
-// Bounded by the caller's context, which is already GitHub's one-hour window.
-func (f *onboardFlow) exchange(ctx context.Context, code string) (*App, error) {
-	backoff := initialExchangeBackoff
-
-	for attempt := 1; ; attempt++ {
-		app, err := convertManifestAt(ctx, f.opts.Client, f.opts.api(), code)
-		if err == nil || !errors.Is(err, errCodeAmbiguous) {
-			return app, err
-		}
-
-		f.opts.Log("GitHub did not resolve that registration (%v).", err)
-		f.opts.Log("It did not say the code was invalid, so billet is keeping it and retrying in %s "+
-			"(attempt %d).", backoff, attempt)
+		f.opts.Log("No registration resolved yet, and none was rejected outright. Retrying in %s.", backoff)
 
 		// An explicit timer, stopped on every path: time.After leaks its timer
 		// until it fires, and this loop can run for the whole manifest window.
@@ -371,18 +376,48 @@ func (f *onboardFlow) exchange(ctx context.Context, code string) (*App, error) {
 
 		select {
 		case <-timer.C:
+		case code := <-f.codeCh:
+			// A new callback beats the backoff — it may be the honest one, and it
+			// should not wait behind an injected code's retry schedule.
+			timer.Stop()
+
+			pending = append(pending, code)
 		case <-ctx.Done():
 			timer.Stop()
 
-			return nil, fmt.Errorf(
-				"github: the registration could not be redeemed before GitHub's window closed, and its "+
-					"last answer did not say the code was invalid (%w)", err)
+			return nil, f.registrationTimeout(ctx, lastRejection)
 		}
 
 		if backoff < maxExchangeBackoff {
-			backoff *= 2
+			backoff = min(backoff*2, maxExchangeBackoff)
 		}
 	}
+}
+
+// drainCodes takes every queued callback without blocking.
+func (f *onboardFlow) drainCodes() []string {
+	var codes []string
+
+	for {
+		select {
+		case code := <-f.codeCh:
+			codes = append(codes, code)
+		default:
+			return codes
+		}
+	}
+}
+
+// registrationTimeout explains a deadline that expired with codes outstanding.
+func (f *onboardFlow) registrationTimeout(ctx context.Context, last error) error {
+	if last != nil {
+		// The honest failure — an operator who took longer than GitHub's window,
+		// or an endpoint that stayed unavailable — must not be reported as a bare
+		// timeout, or the one message that explains it is the one that is dropped.
+		return fmt.Errorf("github: no registration could be redeemed: %w", last)
+	}
+
+	return fmt.Errorf("github: timed out waiting for app registration: %w", ctx.Err())
 }
 
 // persist hands the credentials to the caller before the installation step.
@@ -398,11 +433,22 @@ func (f *onboardFlow) persist(app *App) (*App, error) {
 		// contradicted the callback's own message — which names the path the key
 		// was preserved at — and an operator who followed the outer advice would
 		// delete the App that preserved key belongs to.
-		if errors.Is(err, ErrCredentialPreserved) || errors.Is(err, ErrCredentialUncertain) {
+		// The wording differs by sentinel, because one of them is a PROMISE.
+		// "Its key was preserved" is the exact claim ErrCredentialUncertain exists
+		// to avoid making, and wrapping both in it put the false assertion back on
+		// the outside of an error that had carefully avoided it.
+		if errors.Is(err, ErrCredentialPreserved) {
 			return nil, fmt.Errorf(
 				"github: app %d was created on GitHub and its key was preserved, but onboarding "+
 					"could not finish (%w). Do NOT delete the app: follow the instruction above, "+
 					"then run `billet check`", app.ID, err)
+		}
+
+		if errors.Is(err, ErrCredentialUncertain) {
+			return nil, fmt.Errorf(
+				"github: app %d was created on GitHub, but billet could not confirm what became of "+
+					"its key (%w). Do NOT delete the app until you have checked yourself — its key "+
+					"cannot be re-issued", app.ID, err)
 		}
 
 		return nil, fmt.Errorf(
