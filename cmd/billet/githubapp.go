@@ -226,6 +226,23 @@ func reserveKeyFile(path string) (*os.File, error) {
 // re-run", and following that abandons both this key and the App on GitHub it
 // belongs to.
 func stagedKeyFoundError(path, staged string) error {
+	// The `mv` is only offered when the destination is free.
+	//
+	// Unix mv REPLACES, so recommending it unconditionally handed the operator a
+	// command that destroys a second App's key whenever one already sits at the
+	// destination — the precise outcome every other rule here exists to prevent,
+	// arrived at by following billet's own instructions.
+	if mayHoldKey(path) {
+		return fmt.Errorf(
+			"two App private keys are present and billet cannot tell which one you want:\n"+
+				"    %s   (from an interrupted run)\n"+
+				"    %s   (at the configured key path)\n"+
+				"Neither can be re-issued by GitHub, so nothing here will be moved automatically. "+
+				"Identify which App each belongs to, move the other one somewhere safe, and re-run "+
+				"`billet check`",
+			staged, path)
+	}
+
 	return fmt.Errorf(
 		"%s holds an App private key from an interrupted run — do NOT delete it, and do not create "+
 			"another App. GitHub cannot re-issue this key. Move it into place and check it:\n"+
@@ -313,14 +330,28 @@ func installViaStagingFile(reserved *os.File, path string, pem []byte, onInstall
 	defer func() {
 		_ = tmp.Close()
 
-		// Removed once the key is at its destination (where the name is already
-		// gone, so this is a no-op), and removed when it never held a complete
-		// key. A FRAGMENT is not a credential, and leaving one behind makes the
-		// next run report it as a preserved key and tell the operator to install
-		// it. The only case that keeps the file is the one where it holds the
-		// whole key and the destination does not.
-		if reachedDestination || !staged {
+		// Removed when it never held a complete key: a FRAGMENT is not a
+		// credential, and leaving one behind makes the next run report it as a
+		// preserved key and tell the operator to install it. mayHoldKey guards it,
+		// so a failed inspection keeps the file rather than betting a credential
+		// on a transient error.
+		if !staged && !mayHoldKey(staging) {
 			_ = os.Remove(staging)
+
+			return
+		}
+
+		// Once the key is installed, the staging name is a SECOND path to the same
+		// private key — os.Link leaves both. Removing it is not optional, and a
+		// failure to remove it is not silent: an unreported extra copy of an App
+		// key is exactly the kind of thing nobody finds until it matters.
+		if reachedDestination {
+			if err := os.Remove(staging); err != nil && !errors.Is(err, os.ErrNotExist) {
+				fmt.Fprintf(os.Stderr,
+					"\nWarning: the key is installed at %s, but %s is a second copy that could not be "+
+						"removed (%v). Delete it once you have verified the key with `billet check`.\n",
+					path, staging, err)
+			}
 		}
 	}()
 
@@ -342,7 +373,11 @@ func installViaStagingFile(reserved *os.File, path string, pem []byte, onInstall
 		syncErr := tmp.Sync()
 		closeErr := tmp.Close()
 
-		if holdsUsableKey(staging) {
+		// mayHoldKey, not holdsUsableKey: an inspection that FAILS must not be read
+		// as "there is no credential here", because the next thing that happens is
+		// the deferred cleanup deleting this file. Unverifiable is treated exactly
+		// like present.
+		if mayHoldKey(staging) {
 			staged = true
 
 			return preservedAt(staging,
@@ -389,18 +424,6 @@ func installViaStagingFile(reserved *os.File, path string, pem []byte, onInstall
 	_ = reserved.Close()
 
 	if err := installByLink(staging, path); err != nil {
-		// A commit that reported an error still installed the key. Treated as
-		// success for cleanup and for the callback, and reported with the
-		// destination named — anything else sends the operator to a staging path
-		// the rename already consumed.
-		if errors.Is(err, errInstallCommitted) {
-			reachedDestination = true
-
-			onInstalled()
-
-			return preservedAt(path, err)
-		}
-
 		// The staging file survives and holds the only copy. Name it, or the
 		// operator is left with a registered App and no way to find its key.
 		return preservedAt(staging, fmt.Errorf("install the key at %s: %w", path, err))
@@ -472,40 +495,26 @@ func installByLink(staging, path string) error {
 		return fmt.Errorf("%s was claimed by another run: %w", path, err)
 	}
 
-	// Anything else is the filesystem declining to hard-link at all: FAT, and
-	// some FUSE and SMB mounts. Rename is the fallback — but it REPLACES, so the
-	// destination is re-checked first. "The remove above succeeded" is not enough
-	// on its own: another run can claim the name between the failed link and
-	// this call, and renaming over it destroys that run's key.
-	if fileExists(path) {
-		return fmt.Errorf(
-			"%s could not be hard-linked (%w) and something else now occupies the destination, "+
-				"so it will not be renamed over", path, err)
-	}
-
-	if renameErr := os.Rename(staging, path); renameErr != nil {
-		// A rename can COMMIT and still report an error on FUSE and network
-		// mounts, so the destination decides what happened, not the return value.
-		// Reporting the key as being at the staging path when it is actually at
-		// the destination sends the operator to a file that no longer exists.
-		if fileExists(path) && !fileExists(staging) {
-			return fmt.Errorf(
-				"%w: rename reported an error (%w) but the key IS at %s — verify it with `billet check`",
-				errInstallCommitted, renameErr, path)
-		}
-
-		return fmt.Errorf("link failed (%w) and so did rename: %w", err, renameErr)
-	}
-
-	return nil
+	// There is deliberately NO rename fallback.
+	//
+	// One existed, for filesystems that cannot hard-link (FAT, some FUSE and SMB
+	// mounts). It could not be made safe: os.Rename REPLACES, Go exposes no
+	// no-clobber form of it, and every guard in front of it is check-then-act —
+	// another run can claim the destination between the check and the rename and
+	// have its key silently overwritten. Guarding it also produced a second
+	// hazard, an "it committed anyway" branch that inferred success from
+	// "destination exists and staging does not" and could certify an unrelated
+	// file as this App's key.
+	//
+	// So the failure is reported instead. The key is at the staging path, intact,
+	// and the operator moves it by hand — on a filesystem where billet cannot
+	// install it atomically, a human doing one `mv` with their eyes open is the
+	// better actor.
+	return fmt.Errorf(
+		"%s could not be hard-linked to %s (%w), and billet will not fall back to a rename because "+
+			"a rename cannot refuse to replace a file another run may have just installed",
+		staging, path, err)
 }
-
-// errInstallCommitted means the key reached its DESTINATION despite the install
-// step reporting failure — the FUSE and network-mount case where a rename
-// commits and loses its reply. The caller must treat it as installed, because
-// the alternative is telling the operator to look for the key somewhere it is
-// not.
-var errInstallCommitted = errors.New("the key reached its destination despite the error")
 
 // installIntoReservation writes the key through the descriptor reserved before
 // the browser flow, for when no second file can be created at all.
@@ -520,7 +529,9 @@ func installIntoReservation(reserved *os.File, path string, pem []byte, onInstal
 	if n, writeErr := reserved.Write(pem); writeErr != nil || n != len(pem) {
 		syncErr := reserved.Sync()
 
-		if holdsUsableKey(path) {
+		// mayHoldKey again: the alternative branch tells the operator to delete the
+		// App, which is destructive, so an inspection failure must not reach it.
+		if mayHoldKey(path) {
 			onInstalled()
 
 			return preservedAt(path,
@@ -636,33 +647,70 @@ func isEmptyFile(path string) bool {
 // — instructing them to move it into place and keep the App — is worse advice
 // than saying nothing, because they act on it and only find out later. Parsing
 // is the same standard `billet check` applies.
-func holdsUsableKey(path string) bool {
-	// One descriptor, inspected and read through — the same discipline
-	// checkPrivateKey uses, and for the same reasons. Lstat-then-ReadFile is two
-	// lookups of one name: the file can be swapped in between, so ReadFile would
-	// follow a symlink planted after the check, block forever on a FIFO, or read
-	// past maxKeySize — and could validate an entirely different file than the
-	// one inspected, which here decides what the operator is told about their
-	// credential.
+// keyState is what inspecting a path concluded. The third value is the point:
+// "I could not tell" is not the same answer as "there is nothing here", and
+// collapsing them meant a transient open or read failure was read as proof that
+// no credential existed — after which the file holding it was deleted.
+type keyState int
+
+const (
+	// keyAbsent means the path was inspected and holds no usable key.
+	keyAbsent keyState = iota
+	// keyPresent means it holds a private key that parses.
+	keyPresent
+	// keyUnverifiable means inspection itself failed. Every caller must treat it
+	// as if a key were present: refuse to delete, and refuse to tell the operator
+	// their credential is gone.
+	keyUnverifiable
+)
+
+// inspectKey reports whether path holds a usable private key, or says that it
+// could not find out.
+func inspectKey(path string) keyState {
 	f, err := openForInspection(path)
 	if err != nil {
-		return false
+		if errors.Is(err, os.ErrNotExist) {
+			return keyAbsent
+		}
+
+		return keyUnverifiable
 	}
 
 	defer f.Close()
 
 	info, err := f.Stat()
-	if err != nil || !info.Mode().IsRegular() || info.Size() == 0 || info.Size() > maxKeySize {
-		return false
+	if err != nil {
+		return keyUnverifiable
+	}
+
+	if !info.Mode().IsRegular() || info.Size() == 0 || info.Size() > maxKeySize {
+		return keyAbsent
 	}
 
 	contents, err := io.ReadAll(io.LimitReader(f, maxKeySize+1))
-	if err != nil || len(contents) > maxKeySize {
-		return false
+	if err != nil {
+		return keyUnverifiable
 	}
 
-	return github.ValidatePrivateKey(contents) == nil
+	if len(contents) > maxKeySize || github.ValidatePrivateKey(contents) != nil {
+		return keyAbsent
+	}
+
+	return keyPresent
 }
+
+// mayHoldKey reports whether path might hold a credential — present OR
+// unverifiable. It is the predicate for every destructive decision, because the
+// safe answer to "should I delete this" is yes only when the file is known not
+// to be a key.
+func mayHoldKey(path string) bool { return inspectKey(path) != keyAbsent }
+
+// holdsUsableKey reports whether path is KNOWN to hold a parsable private key.
+//
+// Use it only where a false answer is safe. Anywhere a false answer leads to a
+// deletion or to telling the operator their credential is gone, use mayHoldKey,
+// which treats "could not tell" as "assume it is a key".
+func holdsUsableKey(path string) bool { return inspectKey(path) == keyPresent }
 
 // syncDir forces a directory entry to durable storage. Syncing a file does not
 // guarantee its NAME survives a power cut.
