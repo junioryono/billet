@@ -207,6 +207,43 @@ The state machine is written down in `validTransitions` rather than implied by s
 terminal phases have no successors: a lease that released its capacity must never move backwards and
 re-acquire it, which is what a double-admit looks like from the inside.
 
+### A credential GitHub issued once is never deleted, and never rendered
+
+GitHub returns the App private key **exactly once**, from the manifest conversion. There is no
+re-issue. Every rule here exists because a review found a way to lose or leak it, and several were
+introduced by the fix for the previous one.
+
+**Nothing deletes the key path after GitHub has issued a credential.** `billet github-app create`
+reserves the destination *before* the browser flow, so a registered App can never outlive the ability
+to store its key — but the cleanup for that reservation must key off *did GitHub issue anything*, not
+*did the write report success*. A rename can commit and still return an error on a FUSE or network
+mount, and the difference is a deleted key. An empty reservation left behind costs one `rm`.
+
+**The reservation is never adopted.** An empty file at the key path looks like a crashed run's
+leftover and is equally a *concurrent* run's live reservation; adopting it puts two processes on one
+destination. Refuse, and say which case it is.
+
+**The write is atomic**: sibling temp file → fsync → rename → fsync the directory, with the
+credential marked installed the instant the rename returns. The destination only ever holds the empty
+reservation or the complete key.
+
+**`billet check` proves the key WORKS**, not that it exists — regular file, no group/other permission
+bits, bounded read, and actually parsed, all from one descriptor opened `O_NONBLOCK` so a FIFO cannot
+hang it. `os.Stat` alone accepted a directory, an empty file, a truncated PEM and mode 0644.
+
+**The one-time manifest code is redacted from every error leaving the conversion**, not at chosen
+call sites. It is still live when the exchange fails, and it reaches the operator's terminal through
+both `*url.Error` (which embeds the URL) and `apiError` (which renders a response body an
+intermediary may have echoed the route into). Redaction preserves `Unwrap`, or callers lose
+`errors.Is` against `context.DeadlineExceeded`.
+
+**`App` cannot be rendered.** `String`/`GoString` on a **value** receiver (a pointer receiver is not
+consulted when a value is formatted), `Format` so no verb falls back to the raw fields — `%d` printed
+the key before it existed — and `MarshalJSON` plus `LogValue`, because billet standardizes on
+`log/slog` and its JSON handler ignores `fmt` entirely. Only marshaling is redirected; decoding
+GitHub's response still populates every field. The one gap `fmt` makes impossible to close is an
+`App` reached through an unexported field of another struct.
+
 ### Never guess at a byte size
 
 `config.ByteSize` parses with exact integer arithmetic on a restricted grammar. It used
