@@ -51,7 +51,13 @@ type Registration interface {
 type Runner struct {
 	jit      JITSource
 	provider provider.Provider
+	alloc    *alloc.Allocator
 	log      *slog.Logger
+
+	// node is this host's name, which is what leases are bound to. Placement is
+	// enforced against the node REGISTERED under this name, so it has to match a
+	// row in the nodes table rather than being decorative.
+	node string
 
 	// tiers is the catalog, so a lease's tier can be turned into a machine shape.
 	tiers map[string]config.Tier
@@ -67,7 +73,10 @@ type Runner struct {
 }
 
 // New builds a runner over a provider.
-func New(jit JITSource, p provider.Provider, tiers []config.Tier, log *slog.Logger) *Runner {
+func New(
+	a *alloc.Allocator, node string, jit JITSource, p provider.Provider,
+	tiers []config.Tier, log *slog.Logger,
+) *Runner {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -80,6 +89,8 @@ func New(jit JITSource, p provider.Provider, tiers []config.Tier, log *slog.Logg
 	return &Runner{
 		jit:      jit,
 		provider: p,
+		alloc:    a,
+		node:     node,
 		log:      log,
 		tiers:    byLabel,
 		running:  make(map[int64]*provider.Instance),
@@ -104,6 +115,33 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job Job) error 
 			lease.Tier, tier.Provider, r.provider.Kind())
 	}
 
+	// ASKED BEFORE ANYTHING IRREVERSIBLE HAPPENS.
+	//
+	// Minting the registration first and being refused afterwards leaves a runner
+	// registered on GitHub with nothing to consume it — and since every pull
+	// request is refused by a container backend, that is one orphan per PR,
+	// accumulating quietly until somebody notices the runner list.
+	trust := provider.Classify(job.Event)
+
+	if err := r.provider.Accepts(trust); err != nil {
+		return fmt.Errorf("node: %w", err)
+	}
+
+	// BOUND TO THIS HOST BEFORE IT RUNS ANYWHERE.
+	//
+	// Bind is where the allocator enforces placement: the node's guest-OS
+	// allowlist, its registered provider, the macOS licence cap, and the tier's
+	// own pin. Launching without it meant `leases.node` stayed NULL and every one
+	// of those checks was skipped — a tier pinned to another host would have run
+	// here purely because the provider kinds happened to match.
+	if err := r.alloc.Bind(ctx, lease.ID, lease.Epoch, r.node); err != nil {
+		return fmt.Errorf("node: place lease %s on %s: %w", lease.ID, r.node, err)
+	}
+
+	if err := r.alloc.Advance(ctx, lease.ID, lease.Epoch, alloc.PhaseLaunching); err != nil {
+		return fmt.Errorf("node: mark lease %s launching: %w", lease.ID, err)
+	}
+
 	setID, err := r.scaleSetID(ctx, tier)
 	if err != nil {
 		return err
@@ -120,6 +158,14 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job Job) error 
 
 	reg, err := r.jit.JITConfig(ctx, setID, name, "_work")
 	if err != nil {
+		// The cached scale-set id is dropped, not reused. If the set was deleted
+		// and recreated — a teardown plus another control plane — every later
+		// launch would keep targeting the id that no longer exists. Clearing it
+		// makes the NEXT job re-resolve; this one is not retried, because JIT
+		// creation has an ambiguous-success case and a blind retry is how one job
+		// becomes two runners.
+		r.forgetScaleSet(tier.Label)
+
 		return fmt.Errorf("node: mint a registration for %s: %w", name, err)
 	}
 
@@ -135,7 +181,7 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job Job) error 
 		// Classified from the event that queued the job. The zero value is
 		// unknown and backends refuse it, so a job whose event billet does not
 		// recognise cannot run anywhere weak by default.
-		Trust: provider.Classify(job.Event),
+		Trust: trust,
 
 		JITConfig: reg.Config(),
 	})
@@ -149,7 +195,7 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job Job) error 
 
 	r.log.Info("started a runner",
 		"tier", lease.Tier, "request", job.RequestID, "runner", inst.Name,
-		"instance", inst.ID, "trust", provider.Classify(job.Event))
+		"instance", inst.ID, "trust", trust)
 
 	return nil
 }
@@ -178,6 +224,13 @@ func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
 	r.mu.Unlock()
 
 	return nil
+}
+
+// forgetScaleSet drops a cached id so the next launch re-resolves it.
+func (r *Runner) forgetScaleSet(tier string) {
+	r.mu.Lock()
+	delete(r.sets, tier)
+	r.mu.Unlock()
 }
 
 // scaleSetID resolves a tier's scale set, once.

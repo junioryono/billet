@@ -74,16 +74,41 @@ func Classify(event string) TrustClass {
 	case "pull_request", "pull_request_target":
 		return TrustUntrusted
 
-	case "push", "schedule", "workflow_dispatch", "release", "merge_group",
-		"workflow_call", "workflow_run", "create", "delete", "deployment",
-		"deployment_status", "repository_dispatch":
-		return TrustTrusted
-
-	case "":
-		// No event at all. Nothing has been established, so nothing is assumed.
+	// EVENTS THAT CARRY PULL-REQUEST CODE WITHOUT SAYING SO. Each of these was
+	// on the trusted list and each is a way for outside code to arrive under a
+	// name that sounds internal:
+	//
+	//   merge_group     runs the candidate MERGE COMMIT, which contains the pull
+	//                   request's code, fork-authored included.
+	//   workflow_run    is triggered BY another workflow — commonly a fork's PR
+	//                   run — and the standard pattern is to download that run's
+	//                   artifacts. This is the well-known artifact-poisoning
+	//                   vector, and it was the worst thing on the old list.
+	//   workflow_call   is a reusable workflow, which a pull-request workflow can
+	//                   call. Whether the scale set reports the caller's event or
+	//                   this one is not established, and an unverified assumption
+	//                   is not a basis for granting trust.
+	//   deployment      can name a PR preview ref. The event says nothing about
+	//   deployment_status  whose code is at that ref.
+	//
+	// They are UNKNOWN rather than untrusted: billet is not asserting they are
+	// hostile, only that the event name does not establish provenance. Unknown
+	// fails closed, which is the same practical outcome and the honest label.
+	case "merge_group", "workflow_run", "workflow_call",
+		"deployment", "deployment_status":
 		return TrustUnknown
 
+	// What is left is code that reached the repository through someone with
+	// write access, which is the only provenance an event name can actually
+	// establish. repository_dispatch needs an authorised credential to fire, so
+	// it belongs here — with the caveat that whoever holds that credential is
+	// inside the trust boundary.
+	case "push", "schedule", "workflow_dispatch", "release", "repository_dispatch":
+		return TrustTrusted
+
 	default:
+		// Includes the empty string. GitHub adds events, and a new one must not
+		// inherit permission from a switch written before it existed.
 		return TrustUnknown
 	}
 }
@@ -132,6 +157,14 @@ type Instance struct {
 
 // Provider launches and destroys the compute for one job at a time.
 type Provider interface {
+	// Accepts reports whether this backend may run work of that trust class.
+	//
+	// Separate from Launch so a caller can ask BEFORE doing anything expensive or
+	// irreversible. Minting a runner registration and then being refused leaves
+	// that registration on GitHub with nothing to consume it — one orphan per
+	// pull request, accumulating quietly.
+	Accepts(trust TrustClass) error
+
 	// Kind reports which backend this is. Placement compares it against what a
 	// lease requires, so a Firecracker lease cannot land on a Tart host.
 	Kind() config.ProviderKind

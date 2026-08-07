@@ -80,6 +80,23 @@ func New(owner string, opts ...Option) *Provider {
 // Kind reports the backend this is.
 func (p *Provider) Kind() config.ProviderKind { return config.ProviderDocker }
 
+// Accepts refuses anything that is not established as trusted.
+//
+// A container shares the host kernel, so this backend is for trials and
+// development rather than for code billet cannot vouch for. UNKNOWN is refused
+// alongside untrusted: a caller who has not classified a job has not established
+// it is safe to run here, and treating the zero value as probably-fine is how a
+// refusal gets bypassed by omission rather than by decision.
+func (p *Provider) Accepts(trust provider.TrustClass) error {
+	if trust == provider.TrustTrusted {
+		return nil
+	}
+
+	return fmt.Errorf(
+		"docker: refusing to run %s work in a container: this backend shares the host kernel "+
+			"and is for trials and development, not for code billet cannot vouch for", trust)
+}
+
 // Launch starts one container running the job its JIT config names.
 func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*provider.Instance, error) {
 	if spec.Name == "" {
@@ -90,22 +107,11 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*provider.In
 		return nil, fmt.Errorf("docker: %s has no JIT config, so nothing would register", spec.Name)
 	}
 
-	// TRUST IS CHECKED HERE, and unknown is refused.
-	//
-	// The package comment has always said this backend must refuse untrusted work
-	// rather than warn about it, and until now nothing enforced that — the claim
-	// was documentation rather than behaviour. A container shares the host kernel,
-	// so fork-pull-request code running here has a materially weaker boundary than
-	// the microVM the rest of the design assumes.
-	//
-	// Unknown is refused too, not just untrusted. A caller that has not classified
-	// a job has not established it is safe to run somewhere weak, and defaulting
-	// that to "probably fine" is how the refusal gets bypassed by omission.
-	if spec.Trust != provider.TrustTrusted {
-		return nil, fmt.Errorf(
-			"docker: refusing to run %s work in a container: this backend shares the host "+
-				"kernel and is for trials and development, not for code billet cannot vouch "+
-				"for (job %s)", spec.Trust, spec.Name)
+	// Checked again here, not only via Accepts. A caller is expected to ask first
+	// so a refusal costs no runner registration, but a backend that only refuses
+	// when asked politely is not a boundary.
+	if err := p.Accepts(spec.Trust); err != nil {
+		return nil, fmt.Errorf("%w (job %s)", err, spec.Name)
 	}
 
 	// THE CREDENTIAL GOES IN A FILE, NOT IN ARGV.

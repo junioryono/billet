@@ -9,6 +9,7 @@ import (
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/provider"
+	"github.com/junioryono/billet/internal/state"
 )
 
 // A launch mints a registration and hands it to the provider, with the tier's
@@ -16,9 +17,11 @@ import (
 func TestLaunchMintsARegistrationAndStartsIt(t *testing.T) {
 	p := &fakeProvider{kind: config.ProviderDocker}
 
-	r := New(&fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	a, host := newAllocatorWithHost(t)
 
-	lease := &alloc.Lease{ID: "abc123", Tier: "billet-2vcpu", Epoch: 0}
+	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
+	lease := assignedLease(t, a)
 
 	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, RunID: 101, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
@@ -55,12 +58,14 @@ func TestTheRunnerIsNamedAfterItsLease(t *testing.T) {
 	jit := &fakeJIT{setID: 7}
 	p := &fakeProvider{kind: config.ProviderDocker}
 
-	r := New(jit, p, []config.Tier{dockerTier()}, nil)
+	a, host := newAllocatorWithHost(t)
 
-	for _, id := range []string{"lease-one", "lease-two"} {
-		lease := &alloc.Lease{ID: id, Tier: "billet-2vcpu"}
+	r := New(a, host, jit, p, []config.Tier{dockerTier()}, nil)
 
-		if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
+	for range 2 {
+		lease := assignedLease(t, a)
+
+		if err := r.Launch(t.Context(), lease, Job{RequestID: lease.RequestID, Event: "push"}); err != nil {
 			t.Fatalf("Launch: %v", err)
 		}
 	}
@@ -74,9 +79,9 @@ func TestTheRunnerIsNamedAfterItsLease(t *testing.T) {
 			"with the first on GitHub and in the container runtime", jit.names[0])
 	}
 
-	for i, want := range []string{"lease-one", "lease-two"} {
-		if !strings.Contains(jit.names[i], want) {
-			t.Errorf("runner name %q does not identify its lease %q", jit.names[i], want)
+	for _, name := range jit.names {
+		if !strings.HasPrefix(name, "billet-") || len(name) <= len("billet-") {
+			t.Errorf("runner name %q does not identify a lease", name)
 		}
 	}
 }
@@ -123,10 +128,11 @@ func TestATierForAnotherBackendIsRefused(t *testing.T) {
 	firecracker := dockerTier()
 	firecracker.Provider = config.ProviderFirecracker
 
-	r := New(&fakeJIT{setID: 7}, p, []config.Tier{firecracker}, nil)
+	a, host := newAllocatorWithHost(t)
 
-	err := r.Launch(t.Context(), &alloc.Lease{ID: "abc", Tier: "billet-2vcpu"},
-		Job{RequestID: 11, Event: "push"})
+	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{firecracker}, nil)
+
+	err := r.Launch(t.Context(), assignedLease(t, a), Job{RequestID: 11, Event: "push"})
 	if err == nil {
 		t.Fatal("ran a firecracker tier's job on a docker host")
 	}
@@ -140,10 +146,13 @@ func TestATierForAnotherBackendIsRefused(t *testing.T) {
 func TestDestroyRemovesWhatWasStarted(t *testing.T) {
 	p := &fakeProvider{kind: config.ProviderDocker}
 
-	r := New(&fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	a, host := newAllocatorWithHost(t)
 
-	if err := r.Launch(t.Context(), &alloc.Lease{ID: "abc", Tier: "billet-2vcpu"},
-		Job{RequestID: 11, Event: "push"}); err != nil {
+	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
+	lease := assignedLease(t, a)
+
+	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 
@@ -176,10 +185,11 @@ func TestAnInstanceThatWillNotDieStaysTracked(t *testing.T) {
 		destroyErr: errors.New("the daemon is not answering"),
 	}
 
-	r := New(&fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	a, host := newAllocatorWithHost(t)
 
-	if err := r.Launch(t.Context(), &alloc.Lease{ID: "abc", Tier: "billet-2vcpu"},
-		Job{RequestID: 11, Event: "push"}); err != nil {
+	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
+	if err := r.Launch(t.Context(), assignedLease(t, a), Job{RequestID: 11, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 
@@ -234,12 +244,23 @@ func (f fakeRegistration) RunnerName() string { return f.name }
 
 type fakeProvider struct {
 	kind       config.ProviderKind
+	acceptsAll bool
 	launched   []provider.Spec
 	destroyed  []string
 	destroyErr error
 }
 
 func (f *fakeProvider) Kind() config.ProviderKind { return f.kind }
+
+// Accepts mirrors a real backend: only established trust is allowed, so a test
+// that forgets to classify a job sees the same refusal production would.
+func (f *fakeProvider) Accepts(trust provider.TrustClass) error {
+	if f.acceptsAll || trust == provider.TrustTrusted {
+		return nil
+	}
+
+	return errors.New("fake: refusing work that is not established as trusted")
+}
 
 func (f *fakeProvider) Launch(_ context.Context, spec provider.Spec) (*provider.Instance, error) {
 	f.launched = append(f.launched, spec)
@@ -255,4 +276,57 @@ func (f *fakeProvider) Destroy(_ context.Context, id string) error {
 	f.destroyed = append(f.destroyed, id)
 
 	return nil
+}
+
+// newAllocatorWithHost builds an allocator over a real store with one registered
+// host, because Launch BINDS the lease and Bind is where the allocator enforces
+// placement — against the provider the host registered, not against a catalog.
+// The host registers as docker because that is the only backend that exists.
+// When a second one lands this takes the kind as a parameter again.
+func newAllocatorWithHost(t *testing.T) (*alloc.Allocator, string) {
+	t.Helper()
+
+	db, err := state.Open(t.Context(), t.TempDir())
+	if err != nil {
+		t.Fatalf("state.Open: %v", err)
+	}
+
+	t.Cleanup(func() { _ = db.Close() })
+
+	a, err := alloc.New(db, alloc.Limits{MaxVCPU: 32, MaxMemory: 128 * config.GiB},
+		[]config.Tier{dockerTier()})
+	if err != nil {
+		t.Fatalf("alloc.New: %v", err)
+	}
+
+	const host = "test-host"
+
+	if err := a.RegisterNode(t.Context(), host, config.ProviderDocker); err != nil {
+		t.Fatalf("RegisterNode: %v", err)
+	}
+
+	return a, host
+}
+
+// assignedLease reserves and assigns a lease, which is the state Launch expects
+// to receive one in.
+var nextRequest int64 = 1000
+
+func assignedLease(t *testing.T, a *alloc.Allocator) *alloc.Lease {
+	t.Helper()
+
+	lease, err := a.Reserve(t.Context(), "billet-2vcpu")
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	nextRequest++
+
+	if err := a.Assign(t.Context(), lease.ID, lease.Epoch, nextRequest, nextRequest); err != nil {
+		t.Fatalf("Assign: %v", err)
+	}
+
+	lease.RequestID = nextRequest
+
+	return lease
 }

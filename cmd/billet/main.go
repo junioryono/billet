@@ -210,20 +210,6 @@ func runServer(ctx context.Context, cfg *config.Config, dryRun, dev bool) error 
 
 	defer db.Close()
 
-	// The node half, in this process. --dev is the single-machine deployment and
-	// the only shape that exists today; the remote node implements the same two
-	// methods behind the same interface when it lands.
-	var runner server.Runner
-
-	if dev {
-		p, err := newProvider(cfg)
-		if err != nil {
-			return err
-		}
-
-		runner = node.New(jitSource{c: client}, p, cfg.Tiers, slog.Default())
-	}
-
 	allocator, err := alloc.New(db, alloc.Limits{
 		MaxVCPU:   cfg.Server.MaxVCPU,
 		MaxMemory: cfg.Server.MaxMemory,
@@ -258,8 +244,22 @@ func runServer(ctx context.Context, cfg *config.Config, dryRun, dev bool) error 
 		owner = "billet"
 	}
 
-	if runner != nil {
-		opts = append(opts, server.WithNodeRunner(runner))
+	if dev {
+		p, err := newProvider(cfg)
+		if err != nil {
+			return err
+		}
+
+		// REGISTERED BEFORE ANYTHING IS PLACED ON IT. A node exists in the ledger
+		// because it said so, and placement compares a lease against the provider
+		// the host REGISTERED rather than one a catalog claims — so Bind refuses
+		// every lease until this row is here.
+		if err := allocator.RegisterNode(ctx, cfg.Node.Name, cfg.Node.Provider); err != nil {
+			return err
+		}
+
+		opts = append(opts, server.WithNodeRunner(
+			node.New(allocator, cfg.Node.Name, jitSource{c: client}, p, cfg.Tiers, slog.Default())))
 	}
 
 	plane := server.New(allocator, &provisioner{client}, cfg.Tiers, owner, slog.Default(), opts...)
