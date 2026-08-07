@@ -227,6 +227,7 @@ func (l *Listener) Run(ctx context.Context) error {
 	// messages for work already assigned, so a listener that waits to be told
 	// about a backlog sits idle in front of one.
 	l.observed = l.session.Statistics()
+	l.reportOrphanedBacklog()
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -308,6 +309,33 @@ func (l *Listener) Backlog() int {
 	}
 
 	return l.observed.TotalAssignedJobs
+}
+
+// reportOrphanedBacklog says out loud when GitHub believes this scale set is
+// already running work that billet has no lease for.
+//
+// This is what the session statistics are FOR, and until a node runtime exists
+// it is the only honest thing to do with them. A fresh listener holds nothing,
+// so a non-zero TotalAssignedJobs means jobs were assigned to this scale set
+// before the process restarted: GitHub is waiting on runners that died with it.
+// Those jobs sit until GitHub's pickup deadline and are then reassigned, which
+// looks from the outside like billet silently dropping work.
+//
+// Deliberately NOT a failure. The jobs are already lost by the time this runs
+// and refusing to start would strand the tier's remaining capacity too. Nor is
+// it a reconciliation — recovering them needs a node runtime that can adopt a
+// running instance, which does not exist yet. Saying it plainly is what makes
+// the gap visible instead of mysterious.
+func (l *Listener) reportOrphanedBacklog() {
+	backlog := l.Backlog()
+	if backlog == 0 {
+		return
+	}
+
+	l.log.Warn("github reports jobs already assigned to this scale set that billet has no lease "+
+		"for; they were assigned before this process started and will be reassigned when "+
+		"github's pickup deadline passes",
+		"tier", l.tier, "assigned", backlog)
 }
 
 // stopping reports a shutdown as a shutdown.

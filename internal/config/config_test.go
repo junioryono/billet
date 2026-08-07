@@ -1,6 +1,9 @@
 package config
 
 import (
+	"fmt"
+	"maps"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -69,27 +72,100 @@ func TestClientIDIsOptionalAndRoundTrips(t *testing.T) {
 func TestRunnerGroupMustBeQueryable(t *testing.T) {
 	for name, group := range map[string]string{
 		"ampersand": "Platform & Security",
-		"equals":    "team=platform",
-		"question":  "who?",
-		"percent":   "fifty%",
 		"hash":      "team#1",
+		"semicolon": "build;test",
+		"percent":   "fifty%",
+		"plus":      "a+b",
+		"newline":   "team\nname",
 	} {
 		t.Run(name, func(t *testing.T) {
-			body := strings.Replace(validConfig,
-				"    provider: firecracker\n", "    provider: firecracker\n    runner_group: "+group+"\n", 1)
-
-			if _, err := Load(writeConfig(t, body)); err == nil {
-				t.Errorf("Load accepted runner_group %q, which the client cannot query for", group)
+			if err := checkRunnerGroup(group); err == nil {
+				t.Errorf("accepted runner_group %q, which the client cannot query for", group)
 			}
 		})
 	}
 
-	// Spaces alone are fine, and common: GitHub allows them and people use them.
-	body := strings.Replace(validConfig,
-		"    provider: firecracker\n", "    provider: firecracker\n    runner_group: Build Farm\n", 1)
+	// Accepted, and every one of these was rejected by the ASCII allowlist this
+	// replaced. = and ? survive the client's parse-and-re-encode untouched, and
+	// non-ASCII names are entirely ordinary outside English-speaking orgs.
+	for name, group := range map[string]string{
+		"space":       "Build Farm",
+		"equals":      "team=platform",
+		"question":    "who?",
+		"slash":       "eng/platform",
+		"colon":       "eng:platform",
+		"accented":    "Grupo-Ñ",
+		"non-latin":   "研发",
+		"parenthesis": "Build (x64)",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := checkRunnerGroup(group); err != nil {
+				t.Errorf("rejected runner_group %q, which the client handles correctly: %v", group, err)
+			}
+		})
+	}
 
-	if _, err := Load(writeConfig(t, body)); err != nil {
-		t.Errorf("Load rejected an ordinary group name with a space: %v", err)
+	// And it is wired into Load, not merely unit-tested in isolation.
+	body := strings.Replace(validConfig,
+		"    provider: firecracker\n", "    provider: firecracker\n    runner_group: A & B\n", 1)
+
+	if _, err := Load(writeConfig(t, body)); err == nil {
+		t.Error("Load accepted a runner_group containing &")
+	}
+}
+
+// The rule above is only correct if it matches what the client actually does, so
+// this asserts the PROPERTY rather than the list: every name checkRunnerGroup
+// accepts must arrive at GitHub unchanged.
+//
+// It reproduces actions/scaleset v0.4.0's handling — client.go:351 interpolates
+// the name unescaped into a path, and newActionsServiceRequest then parses that
+// path, copies its query, and re-encodes it. The first version of this rule was
+// derived by reasoning about which characters are "URL-safe" and was wrong in
+// both directions: it rejected = ? and every non-ASCII name, and it would have
+// missed ; entirely.
+func TestAcceptedRunnerGroupsSurviveTheClientsURLHandling(t *testing.T) {
+	roundTrip := func(t *testing.T, group string) string {
+		t.Helper()
+
+		parsedPath, err := url.Parse(fmt.Sprintf("/_apis/runtime/runnergroups/?groupName=%s", group))
+		if err != nil {
+			t.Fatalf("the client's url.Parse of the interpolated path failed: %v", err)
+		}
+
+		u, err := url.Parse("https://example.com/_apis/runtime/runnergroups/")
+		if err != nil {
+			t.Fatalf("url.Parse: %v", err)
+		}
+
+		q := u.Query()
+		maps.Copy(q, parsedPath.Query())
+		q.Set("api-version", "6.0-preview")
+		u.RawQuery = q.Encode()
+
+		// What the Actions service decodes on the other end.
+		final, err := url.Parse(u.String())
+		if err != nil {
+			t.Fatalf("url.Parse of the encoded request URL: %v", err)
+		}
+
+		return final.Query().Get("groupName")
+	}
+
+	for _, group := range []string{
+		"Build Farm", "team=platform", "who?", "eng/platform", "eng:platform",
+		"Grupo-Ñ", "研发", "Build (x64)", "plain", "a,b", "a'b", `a"b`,
+	} {
+		t.Run(group, func(t *testing.T) {
+			if err := checkRunnerGroup(group); err != nil {
+				t.Fatalf("checkRunnerGroup rejected %q: %v", group, err)
+			}
+
+			if got := roundTrip(t, group); got != group {
+				t.Errorf("the client turns %q into %q on the wire; checkRunnerGroup should "+
+					"have rejected it", group, got)
+			}
+		})
 	}
 }
 

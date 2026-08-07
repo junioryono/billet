@@ -47,6 +47,10 @@ type Server struct {
 	maxCapacity *int
 	// reapEvery is how often abandoned capacity is reclaimed.
 	reapEvery time.Duration
+	// onReap, when set, is called with the number of leases each reap pass
+	// reclaimed. Tests only, and it exists because a test of what the reaper must
+	// NOT reclaim passes trivially against a reaper that was never started.
+	onReap func(int)
 }
 
 // ControlPlaneOption configures a Server.
@@ -245,6 +249,10 @@ func (s *Server) reapPeriodically(ctx context.Context) {
 
 			if n > 0 {
 				s.log.Info("reclaimed capacity from leases with no live holder", "leases", n)
+			}
+
+			if s.onReap != nil {
+				s.onReap(n)
 			}
 		}
 	}

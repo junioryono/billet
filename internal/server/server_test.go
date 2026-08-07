@@ -263,9 +263,23 @@ func TestReaperDoesNotReclaimCapacityStillAdvertised(t *testing.T) {
 
 	// The reaper must actually FIRE inside this test, or it proves nothing about
 	// the interaction it is named for.
-	srv := New(a, prov, tiers, "test-owner", nil, WithReapInterval(30*time.Millisecond))
+	var reaps atomic.Int32
+
+	observeReaps := ControlPlaneOption(func(s *Server) {
+		s.onReap = func(int) { reaps.Add(1) }
+	})
+
+	srv := New(a, prov, tiers, "test-owner", nil,
+		WithReapInterval(30*time.Millisecond), observeReaps)
 	if err := srv.Run(ctx); err != nil {
 		t.Fatalf("Run: %v", err)
+	}
+
+	// Deleting the periodic reaper entirely used to pass every assertion below —
+	// nothing reclaims, so nothing is over-advertised. A test named for what the
+	// reaper must not do has to first establish that a reaper ran.
+	if reaps.Load() == 0 {
+		t.Fatal("the reaper never ran; this proves nothing about what it does or does not reclaim")
 	}
 
 	mu.Lock()

@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"gopkg.in/yaml.v3"
 )
@@ -415,14 +416,68 @@ func (c *Config) NodePolicies() map[string]NodePolicy {
 
 var labelRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$`)
 
-// runnerGroupRe is what a runner group name may contain for the scale-set client
-// to look it up.
+// runnerGroupUnsafe are the characters that do not survive the scale-set
+// client's handling of a group name.
 //
-// Wider than labelRe because GitHub genuinely allows spaces in group names and
-// people use them. Narrower than GitHub's own rules because the client does not
-// escape the name before putting it in a query: & = ? # and % would each change
-// the shape of the request rather than the value being asked for.
-var runnerGroupRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9 ._-]{0,99}$`)
+// This started as an allowlist and the allowlist was wrong in both directions.
+// The client interpolates the name unescaped into a path (client.go:351), then
+// url.Parse's it, reads Query(), and re-Encode's it — so the question is not
+// "is this character legal in a URL" but "does this character survive one
+// parse-and-re-encode round trip". Measured against v0.4.0, rather than
+// reasoned about:
+//
+//	&   splits the value into another parameter    "Platform & Security" -> "Platform "
+//	#   starts a fragment and truncates it         "a#b"                 -> "a"
+//	;   ParseQuery has rejected it as a separator
+//	    since Go 1.17 and drops the whole pair     "a;b"                 -> ""
+//	%   is decoded and re-encoded, so a literal
+//	    one is either destroyed or transformed     "100%" -> ""   "%41" -> "A"
+//	+   is decoded to a space                      "a+b"                 -> "a b"
+//
+// Everything else survives, INCLUDING = and ? and / and : and quotes — and
+// including non-ASCII, so the old rule rejected "Grupo-Ñ" and "研发" for no
+// reason. Control characters are excluded separately: url.Parse refuses them
+// outright, which is a clean failure but a much later and stranger one.
+const runnerGroupUnsafe = "&#;%+"
+
+// maxRunnerGroupLen bounds the name so a mistyped config cannot build a URL the
+// Actions service rejects wholesale.
+const maxRunnerGroupLen = 100
+
+// checkRunnerGroup reports why a runner group name cannot be looked up, or nil.
+//
+// An empty name is fine and means GitHub's default group.
+func checkRunnerGroup(group string) error {
+	if group == "" {
+		return nil
+	}
+
+	if strings.TrimSpace(group) == "" {
+		return fmt.Errorf("runner_group %q is only whitespace; leave it unset to use GitHub's "+
+			"default group", group)
+	}
+
+	if len(group) > maxRunnerGroupLen {
+		return fmt.Errorf("runner_group is %d bytes, over the %d byte limit",
+			len(group), maxRunnerGroupLen)
+	}
+
+	for _, r := range group {
+		switch {
+		case unicode.IsControl(r):
+			return fmt.Errorf("runner_group %q contains a control character (%U); the scale-set "+
+				"client builds a URL from this name and url.Parse refuses control characters",
+				group, r)
+		case strings.ContainsRune(runnerGroupUnsafe, r):
+			return fmt.Errorf("runner_group %q contains %q, which does not survive the scale-set "+
+				"client's URL handling — the name that reaches GitHub would not be the one you "+
+				"wrote, and the lookup comes back as \"group not found\". Rename the group, or "+
+				"leave this unset to use GitHub's default group", group, r)
+		}
+	}
+
+	return nil
+}
 
 // validateNodeName is the ONE rule for a node identifier, wherever it appears:
 // node.name, nodes[].name, and tiers[].node all name hosts in a single
@@ -772,16 +827,12 @@ func (c *Config) validateTiers() []error {
 
 		// Rejected HERE rather than left for GitHub to answer confusingly. The
 		// scale-set client interpolates this name into a query string without
-		// escaping it, so an ordinary group name containing & or = or a space —
-		// "Platform & Security" is a realistic one — is parsed as several
-		// parameters and comes back as "group not found". That reads as a
-		// permissions problem and sends an operator to the wrong page entirely.
-		if t.RunnerGroup != "" && !runnerGroupRe.MatchString(t.RunnerGroup) {
-			errs = append(errs, fmt.Errorf(
-				"%s: runner_group %q cannot be looked up safely — the scale-set client puts it in a "+
-					"URL query unescaped, so it must match %s. Rename the group, or leave this unset "+
-					"to use GitHub's default group",
-				where, t.RunnerGroup, runnerGroupRe))
+		// escaping it, so a group name containing & — "Platform & Security" is a
+		// realistic one — is parsed as several parameters and comes back as
+		// "group not found". That reads as a permissions problem and sends an
+		// operator to the wrong page entirely.
+		if err := checkRunnerGroup(t.RunnerGroup); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", where, err))
 		}
 		seen[t.Label] = struct{}{}
 

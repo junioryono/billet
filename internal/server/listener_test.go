@@ -1,10 +1,13 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -530,6 +533,46 @@ func TestEscrowSurvivesAPollLongerThanTheLeaseTTL(t *testing.T) {
 	for _, err := range failures {
 		t.Errorf("could not renew an escrowed lease after a poll longer than the TTL (%v); "+
 			"it was reaped mid-poll, so heartbeats are still bounded by the poll cadence", err)
+	}
+}
+
+// A backlog GitHub already assigned has to be SAID, not merely stored.
+//
+// The session's statistics were being copied into a field that nothing read,
+// which is indistinguishable from not collecting them. On a restart, GitHub goes
+// on believing this scale set is running jobs whose runners died with the
+// process; they sit until the pickup deadline and are then reassigned, and from
+// the outside billet looks like it silently dropped them.
+//
+// Recovering them needs a node runtime that can adopt a running instance, which
+// does not exist. Reporting them is what makes the gap visible rather than
+// mysterious, so that is what is tested.
+func TestAnAlreadyAssignedBacklogIsReported(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	var logged bytes.Buffer
+
+	l := NewListener(a, "billet-4vcpu-a", nil,
+		WithLogger(slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelWarn}))))
+
+	l.session = &fakeSession{
+		// Seven jobs GitHub thinks are running, and no lease for any of them.
+		stats:  &Statistics{TotalAssignedJobs: 7},
+		onPoll: func(int) { cancel() },
+	}
+
+	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run: %v", err)
+	}
+
+	out := logged.String()
+	if !strings.Contains(out, "assigned=7") {
+		t.Errorf("a backlog of 7 already-assigned jobs was not reported; logs were:\n%s", out)
 	}
 }
 
