@@ -36,9 +36,11 @@ type fakeGitHub struct {
 
 	conversions atomic.Int32
 
-	// rejectCode makes the conversion endpoint answer 404 for one code, which is
-	// what GitHub returns for a code it never issued. Set before serving.
-	rejectCode string
+	// rejectCode makes the conversion endpoint reject one code, and rejectStatus
+	// says how. The default is 404, which is what GitHub returns for a code it
+	// never issued. Set before serving.
+	rejectCode   string
+	rejectStatus int
 }
 
 func newFakeGitHub(t *testing.T) *fakeGitHub {
@@ -76,7 +78,12 @@ func (g *fakeGitHub) handler() http.Handler {
 
 		presented := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/app-manifests/"), "/conversions")
 		if g.rejectCode != "" && presented == g.rejectCode {
-			w.WriteHeader(http.StatusNotFound)
+			status := g.rejectStatus
+			if status == 0 {
+				status = http.StatusNotFound
+			}
+
+			w.WriteHeader(status)
 			fmt.Fprint(w, `{"message":"Not Found"}`)
 
 			return

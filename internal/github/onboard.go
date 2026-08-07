@@ -29,6 +29,17 @@ import (
 // key reached durable storage.
 var ErrCredentialPreserved = errors.New("the App key was preserved")
 
+// ErrCredentialUncertain marks a failure where billet could not determine
+// whether the key survived — an inspection that itself failed, rather than one
+// that found nothing.
+//
+// It suppresses the same destructive advice ErrCredentialPreserved does, and
+// promises less. Reporting an unverifiable file as preserved would send the
+// operator to a path that may be empty; reporting it as lost would have them
+// delete an App whose key may be sitting right there. Neither is honest, so
+// there are three outcomes rather than two.
+var ErrCredentialUncertain = errors.New("billet could not verify whether the App key was saved")
+
 // codeQueueDepth is how many pending registration callbacks the loopback
 // listener will hold.
 //
@@ -333,7 +344,7 @@ func (f *onboardFlow) persist(app *App) (*App, error) {
 		// contradicted the callback's own message — which names the path the key
 		// was preserved at — and an operator who followed the outer advice would
 		// delete the App that preserved key belongs to.
-		if errors.Is(err, ErrCredentialPreserved) {
+		if errors.Is(err, ErrCredentialPreserved) || errors.Is(err, ErrCredentialUncertain) {
 			return nil, fmt.Errorf(
 				"github: app %d was created on GitHub and its key was preserved, but onboarding "+
 					"could not finish (%w). Do NOT delete the app: follow the instruction above, "+

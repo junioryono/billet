@@ -606,11 +606,20 @@ func conversionError(status int, _ []byte) error {
 	var rendered error
 
 	switch status {
-	case http.StatusNotFound, http.StatusUnprocessableEntity:
+	case http.StatusNotFound:
 		rendered = fmt.Errorf(
-			"HTTP %d: GitHub rejected the registration. The one-time code is valid for %s and can be "+
-				"redeemed once, so this usually means it expired or was already used — run the command again",
+			"HTTP %d: GitHub does not recognise that registration. The one-time code is valid for %s "+
+				"and can be redeemed once, so this usually means it expired or was already used",
 			status, ManifestTTL)
+	case http.StatusUnprocessableEntity:
+		// Not treated as a rejected code — see codeRejectionStatuses — so say why
+		// the operator might be seeing it, because the two causes need different
+		// responses from them.
+		rendered = fmt.Errorf(
+			"HTTP %d: GitHub would not accept that registration. It documents this status as either a "+
+				"validation failure or the endpoint having been spammed, so if nothing about the App is "+
+				"unusual, wait a few minutes and run the command again",
+			status)
 	case http.StatusUnauthorized, http.StatusForbidden:
 		rendered = fmt.Errorf("HTTP %d: GitHub refused the conversion request", status)
 	default:
@@ -641,13 +650,26 @@ func conversionError(status int, _ []byte) error {
 }
 
 // codeRejectionStatuses are the responses that mean the presented code itself
-// is unusable, so the next queued callback is worth trying.
+// is unusable, so moving on to the next queued callback is safe.
+//
+// The list is short because the bar is high: discarding a code is irreversible,
+// and discarding the HONEST one costs a key GitHub will not re-issue. Two wider
+// versions shipped and both were wrong.
+//
+// GitHub documents exactly three outcomes for this endpoint — 201, 404 and 422 —
+// and only 404 is unambiguous. **422 is documented as "Validation failed, or the
+// endpoint has been spammed"**, so an attacker feeding forged codes can trip
+// abuse protection and make the honest code's 422 look like a rejection. 400 is
+// not code-specific either: a proxy returns it for header, policy and protocol
+// reasons that have nothing to do with what billet sent.
+//
+// A forged code is a random string, so GitHub answers 404 and the flow moves on
+// — which is the case that actually needed handling. 414 stays because the
+// callback bounds code length before queueing, making it unreachable from a
+// queued code and therefore harmless to list.
 var codeRejectionStatuses = map[int]bool{
-	http.StatusBadRequest:          true, // malformed code
-	http.StatusNotFound:            true, // GitHub does not know this code
-	http.StatusGone:                true, // it expired
-	http.StatusRequestURITooLong:   true, // it cannot be a real code
-	http.StatusUnprocessableEntity: true, // GitHub will not accept it
+	http.StatusNotFound:          true, // GitHub does not know this code
+	http.StatusRequestURITooLong: true, // it cannot be a real code
 }
 
 // errCodeRejected marks a conversion that failed because GitHub refused the
