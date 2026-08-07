@@ -270,10 +270,11 @@ func TestWriteKeyAtomicallyRefusesToOverwriteAnotherRunsKey(t *testing.T) {
 	}
 
 	installed := false
+	ours := testKey(t)
 
 	// Named apart from every other err in this test: reassigning it with a later
 	// os.ReadFile silently moved the assertions below onto the wrong error.
-	writeErr := writeKeyAtomically(reserved, path, testKey(t), func() { installed = true })
+	writeErr := writeKeyAtomically(reserved, path, ours, func() { installed = true })
 	if writeErr == nil {
 		t.Fatal("writeKeyAtomically overwrote a key it did not reserve")
 	}
@@ -298,13 +299,107 @@ func TestWriteKeyAtomicallyRefusesToOverwriteAnotherRunsKey(t *testing.T) {
 		t.Errorf("the error does not mark the credential as preserved: %v", writeErr)
 	}
 
+	// The CONTENTS, not merely the path. installViaStagingFile creates the
+	// staging file before it writes, so asserting existence alone passes even if
+	// the key was never written into it — and "your key is preserved at X" is
+	// destructive advice when X is empty.
 	recovery := filepath.Join(dir, ".app.pem.billet-partial")
-	if _, statErr := os.Stat(recovery); statErr != nil {
+
+	preserved, statErr := os.ReadFile(recovery)
+	if statErr != nil {
 		t.Errorf("this run's credential was not preserved at %s: %v", recovery, statErr)
+	} else if !bytes.Equal(preserved, ours) {
+		t.Errorf("the preserved file does not hold this run's key")
 	}
 
 	if !strings.Contains(writeErr.Error(), recovery) {
 		t.Errorf("the error does not name where the key was preserved, got: %v", writeErr)
+	}
+}
+
+// A staging file that already holds the complete key must stop the fallback.
+//
+// Falling back after a staging failure was keyed on "did staging report
+// success", not on "does staging hold the key" — and those diverge the moment
+// the write lands and a later step fails. The result was the key written a
+// SECOND time to the destination, leaving two copies of an unrepeatable private
+// key on disk, one of them at a path nothing ever cleans up and the operator is
+// never told about.
+//
+// Driven through installViaStagingFile directly, because provoking a Sync
+// failure from writeKeyAtomically is not portable — but this IS the branch
+// writeKeyAtomically decides on.
+func TestACompleteStagingWriteIsReportedAsPreserved(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.pem")
+	staging := filepath.Join(dir, ".app.pem.billet-partial")
+
+	reserved, err := reserveKeyFile(path)
+	if err != nil {
+		t.Fatalf("reserveKeyFile: %v", err)
+	}
+
+	defer reserved.Close()
+
+	key := testKey(t)
+
+	// Removing the reservation makes the install step fail AFTER the staging
+	// write has completed, which is the shape every "staged but not installed"
+	// failure has.
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("remove reservation: %v", err)
+	}
+
+	if err := os.WriteFile(path, []byte("another run's key"), 0o600); err != nil {
+		t.Fatalf("seed the other run's file: %v", err)
+	}
+
+	err = installViaStagingFile(reserved, path, key, func() {})
+	if err == nil {
+		t.Fatal("installViaStagingFile reported success without installing")
+	}
+
+	if !errors.Is(err, errCredentialPreserved) {
+		t.Fatalf("a completed staging write was not reported as preserved: %v", err)
+	}
+
+	// The complete key must still be there — this is the file the error tells
+	// the operator to move into place.
+	got, err := os.ReadFile(staging)
+	if err != nil {
+		t.Fatalf("the staged key was discarded: %v", err)
+	}
+
+	if !bytes.Equal(got, key) {
+		t.Error("the staged file does not hold the key that was passed in")
+	}
+}
+
+// A staging file that never received the complete key is REMOVED, so the next
+// run does not mistake a fragment for a preserved credential and tell the
+// operator to install it.
+func TestAnIncompleteStagingWriteLeavesNothingBehind(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.pem")
+	staging := filepath.Join(dir, ".app.pem.billet-partial")
+
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatalf("seed empty reservation: %v", err)
+	}
+
+	// A fragment, exactly what an interrupted write leaves.
+	if err := os.WriteFile(staging, testKey(t)[:60], 0o600); err != nil {
+		t.Fatalf("seed fragment: %v", err)
+	}
+
+	_, err := reserveKeyFile(path)
+	if err == nil {
+		t.Fatal("reserveKeyFile adopted an empty reservation")
+	}
+
+	// The empty-reservation guidance is correct here: there is no key to save.
+	if !strings.Contains(err.Error(), "rm "+path) {
+		t.Errorf("a fragment was reported as a recoverable key: %v", err)
 	}
 }
 

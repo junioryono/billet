@@ -84,12 +84,19 @@ func githubAppCreate(ctx context.Context, args []string) error {
 			return
 		}
 
-		// Verified to still be OUR reservation before unlinking. The name is not
-		// proof of ownership: if this run's placeholder was removed and a second
-		// run installed its key at the same path, removing by pathname deletes
-		// that run's credential. Checked while the descriptor is still open, so
-		// there is something to compare against.
-		if err := destinationIsStillReserved(keyFile, *keyPath); err == nil {
+		// Verified to still be OUR reservation, AND still empty, before unlinking.
+		//
+		// The name is not proof of ownership: if this run's placeholder was
+		// removed — which is exactly what the "delete it and re-run" diagnostic
+		// tells an operator to do — a second run can reserve the same path, and
+		// removing by pathname would delete that run's credential.
+		//
+		// Neither condition closes the window completely, because os.Remove takes
+		// a pathname and the check cannot be atomic with it. What the pair does is
+		// bound the damage: the only file that can be removed in the residual
+		// window is one that was empty a moment earlier, so what is lost is
+		// another run's placeholder rather than another run's key.
+		if err := destinationIsStillReserved(keyFile, *keyPath); err == nil && isEmptyFile(*keyPath) {
 			_ = os.Remove(*keyPath)
 		}
 
@@ -222,7 +229,7 @@ func reserveKeyFile(path string) (*os.File, error) {
 		// reported HERE, because the advice for a bare empty reservation is "rm
 		// it and re-run" — followed literally, that abandons the key and the App
 		// it belongs to.
-		if staged := stagingPath(path); isNonEmptyFile(staged) {
+		if staged := stagingPath(path); holdsUsableKey(staged) {
 			return nil, fmt.Errorf(
 				"%s is an empty placeholder, but %s holds an App private key from an interrupted run — "+
 					"do NOT delete it. Move it into place and check it:\n    mv %s %s\n    billet check",
@@ -309,30 +316,45 @@ func installViaStagingFile(reserved *os.File, path string, pem []byte, onInstall
 		return fmt.Errorf("create %s: %w", staging, err)
 	}
 
+	// staged flips the moment the staging file holds the COMPLETE key, which is
+	// well before it reaches the destination. Every failure from that point on
+	// is a preserved credential, not a lost one — and the caller must not write
+	// a second copy anywhere, because two files holding one private key is an
+	// exposure nothing cleans up and the operator never hears about.
+	staged := false
 	reachedDestination := false
 
 	defer func() {
 		_ = tmp.Close()
 
-		// Removed ONLY once the key is at its destination. If it is not, this
-		// file is the only copy — deleting it would throw away a credential that
-		// cannot be re-issued. (After a successful rename the name is already
-		// gone, so this is a no-op there.)
-		if reachedDestination {
+		// Removed once the key is at its destination (where the name is already
+		// gone, so this is a no-op), and removed when it never held a complete
+		// key. A FRAGMENT is not a credential, and leaving one behind makes the
+		// next run report it as a preserved key and tell the operator to install
+		// it. The only case that keeps the file is the one where it holds the
+		// whole key and the destination does not.
+		if reachedDestination || !staged {
 			_ = os.Remove(staging)
 		}
 	}()
 
-	if _, err := tmp.Write(pem); err != nil {
+	// The short-write case is checked explicitly: io.Writer may return n <
+	// len(p) with a nil error, and treating that as success would mark a
+	// truncated PEM as a preserved credential.
+	if n, err := tmp.Write(pem); err != nil {
 		return fmt.Errorf("write %s: %w", staging, err)
+	} else if n != len(pem) {
+		return fmt.Errorf("write %s: wrote %d of %d bytes", staging, n, len(pem))
 	}
 
+	staged = true
+
 	if err := tmp.Sync(); err != nil {
-		return fmt.Errorf("sync %s: %w", staging, err)
+		return preservedAt(staging, fmt.Errorf("sync %s: %w", staging, err))
 	}
 
 	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close %s: %w", staging, err)
+		return preservedAt(staging, fmt.Errorf("close %s: %w", staging, err))
 	}
 
 	// The staging NAME is made durable before the rename. A crash in the window
@@ -351,21 +373,17 @@ func installViaStagingFile(reserved *os.File, path string, pem []byte, onInstall
 	// and a second run installs its key at the same path, renaming over it
 	// destroys a credential that is not ours to replace.
 	if err := destinationIsStillReserved(reserved, path); err != nil {
-		return fmt.Errorf("%w: %w\nThis run's key is preserved at %s — GitHub cannot re-issue it",
-			errCredentialPreserved, err, staging)
+		return preservedAt(staging, err)
 	}
 
 	// The reservation descriptor is released first: on Windows an open handle
-	// blocks the rename, and it buys nothing once the content is durable.
+	// blocks the install, and it buys nothing once the content is durable.
 	_ = reserved.Close()
 
-	if err := os.Rename(staging, path); err != nil {
+	if err := installByLink(staging, path); err != nil {
 		// The staging file survives and holds the only copy. Name it, or the
 		// operator is left with a registered App and no way to find its key.
-		return fmt.Errorf(
-			"%w: installing it at %s failed (%w).\nThe key IS saved at %s — move it to %s by hand; "+
-				"GitHub cannot re-issue it",
-			errCredentialPreserved, path, err, staging, path)
+		return preservedAt(staging, fmt.Errorf("install the key at %s: %w", path, err))
 	}
 
 	reachedDestination = true
@@ -388,6 +406,46 @@ func installViaStagingFile(reserved *os.File, path string, pem []byte, onInstall
 	return nil
 }
 
+// installByLink puts the staging file at path without ever REPLACING what is
+// there.
+//
+// os.Rename replaces unconditionally, so the only thing standing between a
+// racing second run and a destroyed key was a SameFile check taken moments
+// earlier — check-then-act, with the mutation not atomic against it. os.Link
+// refuses when the destination exists, and refusing is the outcome that cannot
+// destroy a credential.
+//
+// The reservation is cleared first because it occupies the name. That opens a
+// window in which the path does not exist; a second run creating its own
+// reservation there makes the link fail with EEXIST, which is exactly the
+// answer wanted — this run's key stays at the staging path and is reported.
+func installByLink(staging, path string) error {
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("clear the reservation at %s: %w", path, err)
+	}
+
+	err := os.Link(staging, path)
+	if err == nil {
+		return nil
+	}
+
+	// EEXIST means another run got there first. Never fall back — a rename here
+	// would replace the key that run just installed.
+	if errors.Is(err, os.ErrExist) {
+		return fmt.Errorf("%s was claimed by another run: %w", path, err)
+	}
+
+	// Anything else is the filesystem declining to hard-link at all: FAT, and
+	// some FUSE and SMB mounts. Rename is the fallback, and it is safe here
+	// precisely because the destination is known not to exist — the remove
+	// above succeeded and the link failed for an unrelated reason.
+	if renameErr := os.Rename(staging, path); renameErr != nil {
+		return fmt.Errorf("link failed (%w) and so did rename: %w", err, renameErr)
+	}
+
+	return nil
+}
+
 // installIntoReservation writes the key through the descriptor reserved before
 // the browser flow, for when no second file can be created at all.
 func installIntoReservation(reserved *os.File, path string, pem []byte, onInstalled func()) error {
@@ -395,23 +453,53 @@ func installIntoReservation(reserved *os.File, path string, pem []byte, onInstal
 		return err
 	}
 
-	if _, err := reserved.Write(pem); err != nil {
+	if n, err := reserved.Write(pem); err != nil {
 		return fmt.Errorf("write %s: %w", path, err)
+	} else if n != len(pem) {
+		return fmt.Errorf("write %s: wrote %d of %d bytes", path, n, len(pem))
 	}
 
-	if err := reserved.Sync(); err != nil {
-		return fmt.Errorf("sync %s: %w", path, err)
+	syncErr := reserved.Sync()
+
+	// Re-verified AFTER the write, not only before it. The check before is
+	// check-then-act: the reservation can be unlinked in between, and a write
+	// through the descriptor then lands in a file with no name — gone the moment
+	// this process exits, while the CLI reports it saved. There is no way to
+	// recover the key at that point, so this must NOT be reported as preserved.
+	if err := destinationIsStillReserved(reserved, path); err != nil {
+		return fmt.Errorf(
+			"the key was written but %s no longer names this run's file, so it is not retrievable there: %w",
+			path, err)
 	}
 
 	// The key is at its destination. Everything from here is best-effort, for
-	// the same reason as in the staged path.
+	// the same reason as in the staged path — and it is announced BEFORE the
+	// sync result is considered, because the bytes are readable at the final
+	// path either way.
 	onInstalled()
+
+	if syncErr != nil {
+		// Only durability is unconfirmed. Preserved, with the caveat stated.
+		return preservedAt(path, fmt.Errorf("sync %s: %w", path, syncErr))
+	}
 
 	// Not reported: Sync above already forced the bytes out, so a close failure
 	// cannot un-write a key that is now on disk.
 	_ = reserved.Close()
 
 	return nil
+}
+
+// preservedAt marks an error as one that left the credential readable on disk,
+// and says where.
+//
+// The distinction is the whole reason ErrCredentialPreserved exists: onboarding
+// tells the operator to delete the App and retry when the key is gone, and that
+// instruction destroys an App whose key is merely somewhere unexpected.
+func preservedAt(where string, err error) error {
+	return fmt.Errorf(
+		"%w: %w\nThe key IS saved at %s — GitHub cannot re-issue it, so do not delete it",
+		errCredentialPreserved, err, where)
 }
 
 // destinationIsStillReserved reports whether path still names the file this run
@@ -453,12 +541,34 @@ func stagingPath(path string) string {
 	return filepath.Join(filepath.Dir(path), "."+filepath.Base(path)+".billet-partial")
 }
 
-// isNonEmptyFile reports whether path is a regular file with content. Lstat, so
-// a symlink is not followed into something else.
-func isNonEmptyFile(path string) bool {
+// isEmptyFile reports whether path is a zero-length regular file. Lstat, so a
+// symlink is not followed into something else.
+func isEmptyFile(path string) bool {
 	info, err := os.Lstat(path)
 
-	return err == nil && info.Mode().IsRegular() && info.Size() > 0
+	return err == nil && info.Mode().IsRegular() && info.Size() == 0
+}
+
+// holdsUsableKey reports whether path contains a private key that actually
+// parses.
+//
+// "Non-empty" was not enough. An interrupted write can leave a FRAGMENT at the
+// staging path, and telling the operator that a truncated PEM is their App key
+// — instructing them to move it into place and keep the App — is worse advice
+// than saying nothing, because they act on it and only find out later. Parsing
+// is the same standard `billet check` applies.
+func holdsUsableKey(path string) bool {
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Size() == 0 || info.Size() > maxKeySize {
+		return false
+	}
+
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+
+	return github.ValidatePrivateKey(contents) == nil
 }
 
 // syncDir forces a directory entry to durable storage. Syncing a file does not

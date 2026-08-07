@@ -150,8 +150,16 @@ func TestRedactionSanitizesEveryErrorInTheChain(t *testing.T) {
 
 	// The field, not just the rendering: a caller that logs urlErr.URL directly
 	// bypasses Error() entirely.
+	//
+	// errors.As is REQUIRED to succeed first. Guarding the field check on it
+	// meant an implementation that dropped every *url.Error from the chain
+	// passed — which is the opposite of the inspectability this is here to keep.
 	var urlErr *url.Error
-	if errors.As(err, &urlErr) && strings.Contains(urlErr.URL, code) {
+	if !errors.As(err, &urlErr) {
+		t.Fatal("the transport error was discarded rather than sanitized; callers cannot classify the failure")
+	}
+
+	if strings.Contains(urlErr.URL, code) {
 		t.Errorf("url.Error.URL still carries the one-time code: %s", urlErr.URL)
 	}
 }
@@ -321,6 +329,71 @@ func TestRedactionWalksJoinedErrors(t *testing.T) {
 
 	walk(err)
 }
+
+// An OPAQUE leaf — no Unwrap, no structure — that builds its own message from
+// the request URL.
+//
+// The structural rebuild only reaches a *url.Error. A leaf like this has nothing
+// to rebuild, so leaving it untouched to preserve its identity left the live
+// code reachable through it. Identity is worth keeping; it is not worth keeping
+// at the cost of a credential.
+func TestRedactionScrubsAnOpaqueLeafThatEmbedsTheURL(t *testing.T) {
+	const code = "super-secret-one-time-code"
+
+	client := &http.Client{Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		// No wrapping, no Unwrap: an instrumented transport reporting what it
+		// could not reach.
+		return nil, errors.New("proxy could not reach " + r.URL.String())
+	})}
+
+	_, err := convertManifestAt(t.Context(), client, "https://example.invalid", code)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+
+	for at := err; at != nil; at = errors.Unwrap(at) {
+		if strings.Contains(at.Error(), code) {
+			t.Errorf("an opaque leaf of type %T renders the one-time code: %v", at, at)
+		}
+	}
+}
+
+// An error whose Unwrap returns itself must not recurse until the stack dies.
+// The transport is caller-supplied, so the shape is not billet's to assume.
+func TestRedactionTerminatesOnACyclicChain(t *testing.T) {
+	const code = "super-secret-one-time-code"
+
+	client := &http.Client{Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		return nil, &selfWrappingError{msg: "cycle at " + r.URL.String()}
+	})}
+
+	// A stack overflow is not recoverable, so this failing looks like the whole
+	// test binary dying rather than one red test.
+	_, err := convertManifestAt(t.Context(), client, "https://example.invalid", code)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+
+	depth := 0
+	for at := err; at != nil && depth < 1000; at = errors.Unwrap(at) {
+		if strings.Contains(at.Error(), code) {
+			t.Errorf("a cyclic chain leaked the code at depth %d: %v", depth, at)
+		}
+
+		depth++
+	}
+
+	if depth >= 1000 {
+		t.Error("the sanitized chain is still effectively unbounded")
+	}
+}
+
+// selfWrappingError unwraps to itself, which is the cheapest way to build a
+// cycle an error walker can fall into.
+type selfWrappingError struct{ msg string }
+
+func (e *selfWrappingError) Error() string { return e.msg }
+func (e *selfWrappingError) Unwrap() error { return e }
 
 type roundTripperFunc func(*http.Request) (*http.Response, error)
 
@@ -642,9 +715,15 @@ func TestConvertManifestRejectsIncompleteResponse(t *testing.T) {
 	}
 }
 
-// GitHub's error body explains the failure far better than the status alone —
-// notably the expired-code case, which is the one an operator actually hits.
-func TestConvertManifestSurfacesGitHubMessage(t *testing.T) {
+// The expired code is the failure an operator actually hits, so it has to be
+// explained — but the explanation is billet's own, not GitHub's.
+//
+// This test used to assert that GitHub's `message` reached the operator. That
+// contract was wrong: this endpoint's 201 carries the App private key, and a
+// filter that decides whether a `message` is safe to print cannot work, because
+// a secret out of its field is just an opaque string. So nothing derived from
+// the body is rendered, and the diagnostic is written from the status.
+func TestConvertManifestExplainsAnExpiredCodeWithoutTheBody(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusUnprocessableEntity)
 		if _, err := w.Write([]byte(`{"message":"The code passed is incorrect or expired."}`)); err != nil {
@@ -658,8 +737,17 @@ func TestConvertManifestSurfacesGitHubMessage(t *testing.T) {
 		t.Fatal("expected an error")
 	}
 
-	if !strings.Contains(err.Error(), "incorrect or expired") {
-		t.Errorf("error should carry GitHub's message, got: %v", err)
+	// The operator needs to know it expired and that re-running is the fix.
+	for _, want := range []string{"422", "expired", "run the command again"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error should mention %q, got: %v", want, err)
+		}
+	}
+
+	// And it must not be GitHub's text, however harmless this particular body is
+	// — the rule is that the body is not read, not that it is filtered.
+	if strings.Contains(err.Error(), "The code passed is incorrect") {
+		t.Errorf("the response body was rendered: %v", err)
 	}
 }
 

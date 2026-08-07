@@ -280,7 +280,7 @@ func ConvertManifest(ctx context.Context, client *http.Client, code string) (*Ap
 func convertManifestAt(ctx context.Context, client *http.Client, base, code string) (*App, error) {
 	app, err := convertManifest(ctx, client, base, code)
 	if err != nil {
-		return nil, redactCode(err, code)
+		return nil, redactCode(err, base, code)
 	}
 
 	return app, nil
@@ -291,7 +291,7 @@ func convertManifest(ctx context.Context, client *http.Client, base, code string
 		return nil, fmt.Errorf("github: empty manifest code")
 	}
 
-	endpoint := fmt.Sprintf("%s/app-manifests/%s/conversions", base, urlPathEscape(code))
+	endpoint := conversionEndpoint(base, code)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, http.NoBody)
 	if err != nil {
@@ -307,7 +307,7 @@ func convertManifest(ctx context.Context, client *http.Client, base, code string
 		// added above this line renders the message of the error below it — so
 		// cleaning the innermost one means no wrapper can carry the code, and no
 		// later stage has to recognise the encoding it arrived in.
-		return nil, fmt.Errorf("github: convert manifest: %w", sanitizeConversionChain(err))
+		return nil, fmt.Errorf("github: convert manifest: %w", scrubberFor(base, code).sanitize(err, 0))
 	}
 	defer resp.Body.Close()
 
@@ -355,8 +355,40 @@ type redactedError struct {
 func (e *redactedError) Error() string { return e.msg }
 func (e *redactedError) Unwrap() error { return e.err }
 
-// sanitizeConversionChain rebuilds an error chain so that NO error reachable
-// from the result renders the one-time code — not merely the outermost one.
+// conversionEndpoint is the URL the code is redeemed at. Built in one place so
+// the scrubber can match the exact string a transport would have captured.
+func conversionEndpoint(base, code string) string {
+	return fmt.Sprintf("%s/app-manifests/%s/conversions", base, urlPathEscape(code))
+}
+
+// scrubber removes a conversion's secrets from error text.
+//
+// It carries the endpoint as well as the code because a caller-supplied
+// RoundTripper composes its own messages: an opaque error whose Error() embeds
+// r.URL.String() has no Unwrap and no structure to rebuild, so the only thing
+// that can be done with it is to match text — and the ENDPOINT is an exact
+// literal, immune to the encoding games that defeat matching the code alone.
+type scrubber struct {
+	code     string
+	endpoint string
+}
+
+func scrubberFor(base, code string) scrubber {
+	return scrubber{code: code, endpoint: conversionEndpoint(base, code)}
+}
+
+// clean removes both the endpoint and the bare code from a rendered message.
+func (s scrubber) clean(text string) string {
+	return redactString(redactString(text, s.endpoint), s.code)
+}
+
+// maxErrorDepth bounds the walk. An error whose Unwrap returns itself — or a
+// joined tree containing a cycle — would otherwise recurse until the stack is
+// exhausted, and the transport that produces it is caller-supplied.
+const maxErrorDepth = 32
+
+// sanitize rebuilds an error chain so that NO error reachable from the result
+// renders the one-time code — not merely the outermost one.
 //
 // Sanitizing only the outer message was a boundary that leaked through its own
 // back door: Unwrap handed back the original, so
@@ -367,24 +399,37 @@ func (e *redactedError) Unwrap() error { return e.err }
 // serializes them. The test that guarded this performed exactly that errors.As
 // and never looked at what it extracted.
 //
-// Sentinel identity is preserved at the leaves, which is what errors.Is and
-// errors.As need: only the levels that actually carry the code are replaced.
-func sanitizeConversionChain(err error) error {
+// Identity is preserved wherever it can be, because errors.Is and errors.As
+// depend on it — but NOT at a node whose own text carries the secret. A leaf
+// that renders the code is replaced even though that costs its type, because a
+// reachable error holding a live credential is the thing this exists to prevent.
+func (s scrubber) sanitize(err error, depth int) error {
 	if err == nil {
 		return nil
 	}
 
-	// *url.Error is the carrier — net/http stores the whole request URL, and the
-	// code is one of its path segments. REBUILT rather than pattern-matched: a
-	// fixed path cannot be defeated by an encoding the matcher does not know
-	// about (double-encoding and over-encoding both defeat matching), and the
-	// scheme and host are the parts that carry the diagnostic value anyway.
+	// Fails closed: past the depth bound nothing below is inspected, so nothing
+	// below may remain reachable either.
+	if depth >= maxErrorDepth {
+		return &redactedError{msg: s.clean(err.Error())}
+	}
+
+	// Rendered ONCE. Error() is not required to be deterministic, and calling it
+	// twice let a stateful error return clean text to the comparison and dirty
+	// text to whatever printed it afterwards.
+	rendered := err.Error()
+
+	// *url.Error is the structured carrier — net/http stores the whole request
+	// URL, and the code is one of its path segments. REBUILT rather than
+	// pattern-matched: a fixed path cannot be defeated by an encoding the matcher
+	// does not know about, and the scheme and host are the parts that carry the
+	// diagnostic value anyway.
 	//nolint:errorlint // Deliberately the DIRECT type, not errors.As. This walks the chain one level at a time; errors.As searches it, so a nested *url.Error would be rebuilt at the wrong level and the wrappers between them dropped.
 	if urlErr, ok := err.(*url.Error); ok {
 		return &url.Error{
 			Op:  urlErr.Op,
 			URL: redactedConversionURL(urlErr.URL),
-			Err: sanitizeConversionChain(urlErr.Err),
+			Err: s.sanitize(urlErr.Err, depth+1),
 		}
 	}
 
@@ -397,32 +442,36 @@ func sanitizeConversionChain(err error) error {
 
 		sanitizedBranches := make([]error, 0, len(branches))
 		for _, branch := range branches {
-			sanitizedBranches = append(sanitizedBranches, sanitizeConversionChain(branch))
+			sanitizedBranches = append(sanitizedBranches, s.sanitize(branch, depth+1))
 		}
 
 		return errors.Join(sanitizedBranches...)
 	}
 
 	inner := errors.Unwrap(err)
-
-	sanitized := sanitizeConversionChain(inner)
+	sanitized := s.sanitize(inner, depth+1)
+	cleaned := s.clean(rendered)
 
 	//nolint:errorlint // An identity comparison, not error matching: it asks whether the recursion produced a new object. errors.Is answers a different question entirely.
-	if sanitized == inner {
-		// Nothing below this level changed, so this level's rendering — which is
-		// derived from it — cannot be carrying the code either. Returned as-is so
-		// a sentinel keeps its identity.
+	unchanged := sanitized == inner
+
+	if unchanged && cleaned == rendered {
+		// Neither this level's own text nor anything below it carries the secret,
+		// so the error is returned untouched and keeps its identity.
 		return err
 	}
 
-	// An arbitrary wrapper cannot be reconstructed (its format string is gone),
-	// so its message is rebuilt from the parts that are known: the text it added,
-	// and the sanitized error beneath it. errors.As to this wrapper's own
-	// concrete type is lost; errors.Is and errors.As to anything below it survive.
-	return &redactedError{
-		msg: strings.Replace(err.Error(), inner.Error(), sanitized.Error(), 1),
-		err: sanitized,
+	// An arbitrary wrapper cannot be reconstructed (its format string is gone).
+	// Where its rendering does contain the child's, the child's replacement is
+	// substituted so the added context survives; where it does not — a wrapper
+	// that TRANSFORMS rather than embeds — the scrubbed text is all that is left,
+	// and the scrub is what keeps it safe.
+	msg := cleaned
+	if inner != nil && strings.Contains(rendered, inner.Error()) {
+		msg = s.clean(strings.Replace(rendered, inner.Error(), sanitized.Error(), 1))
 	}
+
+	return &redactedError{msg: msg, err: sanitized}
 }
 
 // redactedConversionURL keeps a conversion URL's scheme and host and replaces
@@ -448,19 +497,34 @@ func redactedConversionURL(raw string) string {
 // So nothing here is rendered verbatim. GitHub's own `message` is passed through
 // because it is what explains an expired code, and only after it is checked for
 // credential material; anything else is withheld and the status stands alone.
-func conversionError(status int, body []byte) error {
+func conversionError(status int, _ []byte) error {
+	// NOTHING derived from the body, not even a filtered `message`.
+	//
+	// The first attempt passed `message` through after checking it for markers
+	// like "PRIVATE KEY" and "client_secret". That cannot work: a secret is an
+	// opaque string, and once it is out of its field there is nothing left to
+	// recognise it by. A body of {"message":"whsec-<the actual secret>"} carries
+	// no marker at all and would have been printed verbatim.
+	//
+	// The asymmetry decides it. A false positive costs GitHub's explanation and
+	// keeps the status; a false negative puts an unrepeatable private key on the
+	// operator's terminal. So the status is mapped to text billet writes itself,
+	// and the body is never read. Every other endpoint still uses apiError —
+	// this is the only one whose 201 carries a credential.
 	var rendered error
 
-	var parsed struct {
-		Message string `json:"message"`
-	}
-
-	if err := json.Unmarshal(body, &parsed); err == nil && parsed.Message != "" && !carriesCredential(parsed.Message) {
-		rendered = fmt.Errorf("HTTP %d: %s", status, parsed.Message)
-	} else {
+	switch status {
+	case http.StatusNotFound, http.StatusUnprocessableEntity:
 		rendered = fmt.Errorf(
-			"HTTP %d (response body withheld: this endpoint returns the App private key, "+
-				"so its body is never rendered)", status)
+			"HTTP %d: GitHub rejected the registration. The one-time code is valid for %s and can be "+
+				"redeemed once, so this usually means it expired or was already used — run the command again",
+			status, ManifestTTL)
+	case http.StatusUnauthorized, http.StatusForbidden:
+		rendered = fmt.Errorf("HTTP %d: GitHub refused the conversion request", status)
+	default:
+		rendered = fmt.Errorf(
+			"HTTP %d (the response body is not shown: this endpoint returns the App private key, "+
+				"so billet never renders it)", status)
 	}
 
 	// A code GitHub does not recognise is reported as 404, and one it will not
@@ -478,46 +542,20 @@ func conversionError(status int, body []byte) error {
 // code itself, rather than because the request could not be completed.
 var errCodeRejected = errors.New("github: the manifest code was rejected")
 
-// carriesCredential reports whether a string looks like it contains credential
-// material from a conversion response.
-//
-// Deliberately crude and deliberately over-eager: the cost of a false positive
-// is a status code without GitHub's explanation, and the cost of a false
-// negative is a private key on a terminal.
-func carriesCredential(s string) bool {
-	for _, marker := range []string{"PRIVATE KEY", "webhook_secret", "client_secret", `"pem"`} {
-		if strings.Contains(s, marker) {
-			return true
-		}
-	}
-
-	return false
-}
-
-// redactCode removes the one-time manifest code from an error's message.
+// redactCode is the boundary guard: it re-runs the sanitizer over whatever
+// comes back from the conversion, whichever path produced it.
 //
 // The code redeems for the App's private key, webhook secret and client secret,
-// and it is still LIVE when the exchange fails. net/http reports transport
-// failures as *url.Error, whose Error() embeds the full URL; a non-201 response
-// is rendered by apiError from a body that an intermediary may well echo the
-// request route into. Either way it reaches the operator's terminal, where
-// anyone reading a scrollback, a journal or a CI log could redeem it first.
+// and it is still LIVE when the exchange fails, so it must not reach a terminal
+// scrollback, a journal, or a CI log where someone could redeem it first.
 //
-// Scrubbing the rendered TEXT rather than walking the error tree is deliberate:
-// http.Client.Do wraps whatever a RoundTripper returns, so a transport that
-// itself produces a *url.Error hides another copy inside. Matching the value
-// needs no assumption about how errors are composed.
-func redactCode(err error, code string) error {
-	msg := redactString(err.Error(), code)
-	if msg == err.Error() {
-		return err
-	}
-
-	// The chain is sanitized too, not just this level's text. Redacting only the
-	// message left the original reachable through Unwrap, so anything that walked
-	// causes — errors.As to *url.Error, an error reporter serializing a cause
-	// chain — read the live code straight out of the error this call "redacted".
-	return &redactedError{msg: msg, err: sanitizeConversionChain(err)}
+// The real work happens where each error is CREATED — a wrapper renders the
+// message beneath it, so cleaning the innermost error means no wrapper can
+// carry the secret and no later stage has to recognise the encoding it arrived
+// in. This exists so that a future return path added inside convertManifest
+// cannot bypass that by forgetting.
+func redactCode(err error, base, code string) error {
+	return scrubberFor(base, code).sanitize(err, 0)
 }
 
 const redactedCode = "[redacted: contains the one-time manifest code]"
