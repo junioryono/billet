@@ -143,6 +143,8 @@ func cmdServer(ctx context.Context, args []string) error {
 	fs := newFlagSet("billet server")
 	cfgPath := addConfigFlag(fs)
 	dev := fs.Bool("dev", false, "also run a node in this process (single-machine deployment)")
+	dryRun := fs.Bool("dry-run", false,
+		"connect to GitHub and advertise ZERO capacity: proves the whole path without accepting a job")
 	if err := parse(fs, args); err != nil {
 		return err
 	}
@@ -163,19 +165,36 @@ func cmdServer(ctx context.Context, args []string) error {
 	}
 
 	if *dev {
-		// The node runtime is what actually launches an acquired job. Without it
-		// the control plane advertises capacity, accepts work, and then holds
-		// leases nothing can fulfil — so say that rather than appearing to work.
-		return fmt.Errorf("%w: --dev needs the node runtime, which P2 brings. "+
-			"The control plane runs without it, but nothing will launch the jobs it accepts",
+		return fmt.Errorf("%w: --dev needs the node runtime, which P2 brings", errNotImplemented)
+	}
+
+	// FAIL CLOSED while nothing can launch a job.
+	//
+	// The listener plane is complete: it reconciles scale sets, advertises
+	// capacity, acquires offers and binds leases. What does not exist yet is the
+	// node runtime that turns a lease into a running VM. A control plane that
+	// accepts work it cannot run does not fail visibly — GitHub marks the jobs
+	// assigned, billet holds leases nothing fulfils, and somebody's CI queues
+	// until it times out while this command reports itself healthy.
+	//
+	// Refusing is not the whole answer either, because the path still has to be
+	// provable against a real organization before P2 lands. --dry-run does that:
+	// the same App auth, reconciliation, session and long poll, advertising zero.
+	// Everything except accepting a job.
+	if !*dryRun {
+		return fmt.Errorf(
+			"%w: the control plane is built but nothing can launch a job yet, so it will not accept one.\n"+
+				"Run `billet server --dry-run` to exercise the whole path against GitHub while advertising "+
+				"zero capacity. Accepting work would strand it: GitHub marks the job assigned and nothing "+
+				"here can run it",
 			errNotImplemented)
 	}
 
-	return runServer(ctx, cfg)
+	return runServer(ctx, cfg, *dryRun)
 }
 
 // runServer starts the control plane and blocks until it is told to stop.
-func runServer(ctx context.Context, cfg *config.Config) error {
+func runServer(ctx context.Context, cfg *config.Config, dryRun bool) error {
 	// The SAME hardened reader `billet check` uses — type, mode, size and parse.
 	// Validated before anything else is built: a bad key otherwise fails at the
 	// first API call, by which time a scale set may already exist against a
@@ -225,8 +244,17 @@ func runServer(ctx context.Context, cfg *config.Config) error {
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	fmt.Printf("billet server: %d tiers, ceiling %d vCPU / %s\n",
-		len(cfg.Tiers), cfg.Server.MaxVCPU, cfg.Server.MaxMemory)
+	var opts []server.ControlPlaneOption
+
+	if dryRun {
+		opts = append(opts, server.AdvertiseNothing())
+
+		fmt.Printf("billet server (DRY RUN): %d tiers, advertising ZERO capacity.\n", len(cfg.Tiers))
+		fmt.Printf("Scale sets are created and polled; no job will be accepted.\n")
+	} else {
+		fmt.Printf("billet server: %d tiers, ceiling %d vCPU / %s\n",
+			len(cfg.Tiers), cfg.Server.MaxVCPU, cfg.Server.MaxMemory)
+	}
 
 	// The owner identifies this process to GitHub's message queue so a session
 	// left by a crashed run is distinguishable from a live one.
@@ -235,7 +263,8 @@ func runServer(ctx context.Context, cfg *config.Config) error {
 		owner = "billet"
 	}
 
-	if err := server.New(allocator, &provisioner{client}, cfg.Tiers, owner, slog.Default()).Run(ctx); err != nil {
+	plane := server.New(allocator, &provisioner{client}, cfg.Tiers, owner, slog.Default(), opts...)
+	if err := plane.Run(ctx); err != nil {
 		return err
 	}
 
