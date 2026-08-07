@@ -335,8 +335,8 @@ round-robin** — never one at a time. An enumerated ambiguous list left every u
 through as fatal, which is how removing 414 from the rejection set preserved the exact failure it was
 removed to fix. And retrying a single code in a blocking loop reopened the kill switch in slow motion:
 an injected code that always draws 422 monopolised the exchange while the honest redirect sat in the
-queue until the window closed. Each round tries every pending code once, a new callback interrupts the
-backoff, and only a 404 drops a code. Making it *fatal* was still credential loss with
+queue until the window closed. A bounded number of exchanges happen per round, unreached codes rotate to the
+front of the next one, a new callback interrupts the backoff, and only a 404 drops a code. Making it *fatal* was still credential loss with
 extra steps — the code lives in a local variable and the loopback listener dies with the flow, so
 "run the command again" builds a SECOND App rather than recovering the first one's key. Nothing is
 discarded on a response that never said the code was bad. A forged code is a random string, so GitHub
