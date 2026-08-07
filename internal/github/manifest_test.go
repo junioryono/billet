@@ -395,6 +395,50 @@ type selfWrappingError struct{ msg string }
 func (e *selfWrappingError) Error() string { return e.msg }
 func (e *selfWrappingError) Unwrap() error { return e }
 
+// An error whose dynamic type is NOT COMPARABLE must not crash the sanitizer.
+//
+// The cycle guard compared two error interfaces with ==, which panics at runtime
+// when the dynamic type contains a slice or a map — an entirely ordinary thing
+// for an error type to hold. The guard added to protect the process could take
+// it down instead, and a panic mid-onboarding loses the one-time key.
+func TestRedactionSurvivesNonComparableErrors(t *testing.T) {
+	const code = "super-secret-one-time-code"
+
+	client := &http.Client{Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		// VALUES, not pointers, and that distinction is the whole test: comparing
+		// two interfaces holding pointers never panics however uncomparable the
+		// pointee is. It is the non-pointer dynamic type that blows up. Two of
+		// them, because == is only reached when a node is compared against an
+		// ancestor.
+		return nil, uncomparableError{
+			msg:    "outer at " + r.URL.String(),
+			detail: []string{"a", "b"},
+			inner:  uncomparableError{msg: "inner", detail: []string{"c"}},
+		}
+	})}
+
+	_, err := convertManifestAt(t.Context(), client, "https://example.invalid", code)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+
+	for at := err; at != nil; at = errors.Unwrap(at) {
+		if strings.Contains(at.Error(), code) {
+			t.Errorf("%T renders the one-time code: %v", at, at)
+		}
+	}
+}
+
+// uncomparableError holds a slice, so `==` on two of these panics.
+type uncomparableError struct {
+	msg    string
+	detail []string
+	inner  error
+}
+
+func (e uncomparableError) Error() string { return e.msg }
+func (e uncomparableError) Unwrap() error { return e.inner }
+
 // url.Error has three fields and only one of them was being cleaned.
 //
 // The rebuild replaced URL and copied Op verbatim, and it kept the parsed scheme
@@ -428,49 +472,64 @@ func TestRedactionCleansEveryURLErrorField(t *testing.T) {
 				}
 			}
 
+			// errors.As must SUCCEED. Guarding the field checks on it meant an
+			// implementation that dropped every *url.Error passed this test while
+			// destroying the inspectability it exists to preserve.
 			var urlErr *url.Error
-			if errors.As(err, &urlErr) {
-				if strings.Contains(urlErr.Op, code) {
-					t.Errorf("url.Error.Op carries the code: %q", urlErr.Op)
-				}
+			if !errors.As(err, &urlErr) {
+				t.Fatal("the transport error was discarded rather than cleaned")
+			}
 
-				if strings.Contains(urlErr.URL, code) {
-					t.Errorf("url.Error.URL carries the code: %q", urlErr.URL)
-				}
+			if strings.Contains(urlErr.Op, code) {
+				t.Errorf("url.Error.Op carries the code: %q", urlErr.Op)
+			}
+
+			if strings.Contains(urlErr.URL, code) {
+				t.Errorf("url.Error.URL carries the code: %q", urlErr.URL)
 			}
 		})
 	}
 }
 
-// A forged code is only harmless if EVERY way GitHub can reject it is treated
-// as a rejection.
+// Only a status meaning THIS CODE is unusable may discard the code.
 //
-// Classifying only 404 and 422 left the kill switch open: an injected code that
-// draws a 400 or a 414 was read as "the exchange could not be attempted", which
-// aborts — discarding an honest code already queued behind it.
-func TestEveryClientErrorMarksTheCodeRejected(t *testing.T) {
+// Both ends of this were wrong before. Classifying just 404 and 422 left a kill
+// switch open — an injected code drawing a 400 or 414 aborted the flow and threw
+// away an honest code queued behind it. Then widening it to every 4xx swallowed
+// 429, which is the more expensive mistake: a rate limit says nothing about the
+// code, so a VALID code was discarded, the App stayed created, and the loop
+// waited out ManifestTTL for a redirect that had already arrived.
+func TestOnlyCodeSpecificStatusesDiscardTheCode(t *testing.T) {
+	// GitHub is saying the presented code is no good. Try the next one.
 	for _, status := range []int{
 		http.StatusBadRequest,
-		http.StatusUnauthorized,
-		http.StatusForbidden,
 		http.StatusNotFound,
+		http.StatusGone,
 		http.StatusRequestURITooLong,
 		http.StatusUnprocessableEntity,
-		http.StatusTooManyRequests,
 	} {
-		t.Run(http.StatusText(status), func(t *testing.T) {
+		t.Run("rejects/"+http.StatusText(status), func(t *testing.T) {
 			if err := conversionError(status, nil); !errors.Is(err, errCodeRejected) {
 				t.Errorf("HTTP %d was not classified as a rejected code: %v", status, err)
 			}
 		})
 	}
 
-	// A server-side failure says nothing about the code, and no further redirect
-	// is coming to improve matters, so it stays fatal.
-	for _, status := range []int{http.StatusInternalServerError, http.StatusBadGateway} {
-		t.Run(http.StatusText(status), func(t *testing.T) {
+	// None of these are about the code, so discarding it would throw away a
+	// credential over a condition a different code cannot fix.
+	for _, status := range []int{
+		http.StatusTooManyRequests, // the rate limit, not the code
+		http.StatusRequestTimeout,
+		http.StatusUnauthorized,
+		http.StatusForbidden, // GitHub also uses this for abuse detection
+		http.StatusUpgradeRequired,
+		http.StatusRequestHeaderFieldsTooLarge,
+		http.StatusInternalServerError,
+		http.StatusBadGateway,
+	} {
+		t.Run("keeps/"+http.StatusText(status), func(t *testing.T) {
 			if err := conversionError(status, nil); errors.Is(err, errCodeRejected) {
-				t.Errorf("HTTP %d was treated as a rejected code", status)
+				t.Errorf("HTTP %d discarded the code; it says nothing about the code's validity", status)
 			}
 		})
 	}

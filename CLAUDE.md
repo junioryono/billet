@@ -213,25 +213,28 @@ GitHub returns the App private key **exactly once**, from the manifest conversio
 re-issue. Every rule here exists because a review found a way to lose or leak it, and several were
 introduced by the fix for the previous one.
 
-**Nothing deletes the key path after GitHub has issued a credential.** The cleanup for the
-reservation keys off *did GitHub issue anything*, not *did the write report success*. A rename can
-commit and still return an error on a FUSE or network mount, and the difference is a deleted key. An
-empty reservation left behind costs one `rm`.
+**Nothing is deleted by pathname unless it is known not to be a key.** Go unlinks by name while this
+process owns a *descriptor*, and there is no unlink-this-inode to reach for — so every deletion is
+check-then-act and none of the checks can be made atomic. Three versions of an automatic cleanup were
+tried before that was accepted:
 
-**Install never REPLACES, and neither does anything on the way to it.** The pathname is not proof of
-ownership — a second run can reserve the same path once the first run's placeholder is deleted, which
-is exactly what the "delete it and re-run" diagnostic tells operators to do. `os.SameFile` against the
-open descriptor is a pre-check and **cannot** be atomic with the mutation that follows, so:
+- The **reservation cleanup is gone entirely.** `os.SameFile` narrowed the window; adding "and it is
+  still empty" narrowed it further; neither closed it, because a second run can pass both checks with
+  its placeholder and write its key before the `os.Remove` lands. An aborted run now leaves the empty
+  placeholder, and `reserveKeyFile` prints the exact `rm` that clears it.
+- The **staging cleanup** only deletes when the file is *known* to hold no key, and it reports rather
+  than swallows a failure once the key is installed — after `os.Link` both names refer to the same
+  private key, so a silent failure leaves a second unreported copy.
+- **"Could not tell" is never treated as "no key here."** Inspection returns present / absent /
+  unverifiable, and only *absent* permits a deletion or the "your credential is gone" message. A
+  transient open or read error previously read as proof that no credential existed.
 
-- The install is `os.Link`, which refuses when the destination exists. On `EEXIST` the key stays at the
-  staging path and is reported rather than overwriting whatever got there first.
-- **Every step that removes the destination first checks it is empty.** This is the one that was missed:
-  linking cannot replace, but the `os.Remove` clearing the reservation for it replaces just as
-  thoroughly, so the first version deleted a key that arrived after the ownership check and then
-  reported success. Emptiness is the bound that survives without atomicity — a reservation is empty and
-  an installed key never is, so the residual race can only cost another run's placeholder.
-
-The same rule governs the pre-issuance cleanup, for the same reason.
+**Install refuses rather than replaces, and there is no rename fallback.** `os.Link` fails when the
+destination exists, and that refusal is atomic. `os.Rename` has no no-clobber form in Go, so the
+fallback for filesystems that cannot hard-link was **removed**: every guard in front of it was
+check-then-act, and the "it committed anyway" branch that guarding produced could certify an unrelated
+file as this App's key. On such a filesystem billet reports the staged key and the operator moves it
+by hand — one `mv` with their eyes open beats a race they never see.
 
 **The reservation is never adopted, and it is a real fallback rather than a probe.** An empty file at
 the key path looks like a crashed run's leftover and is equally a *concurrent* run's live reservation;
@@ -244,10 +247,18 @@ an unrepeatable key in memory.
 **The write is atomic where it can be**: staging file → fsync → fsync the directory → link → fsync the
 directory, with the credential marked installed the instant the link returns. The staging name is
 *derived from the destination*, not random, so a crash in that window leaves the key somewhere the
-next run reports by name instead of under an unpredictable hidden file — and the next run only reports
-it if the bytes actually **parse as a key**, because telling an operator to install a fragment is
-worse than saying nothing. When staging is impossible the fallback writes through the reservation,
-trading crash-atomicity for not losing the key; a torn PEM there is what `billet check` catches.
+next run reports by name instead of under an unpredictable hidden file — and it is looked for
+**before** the reservation attempt, not only when the destination is occupied, because the install
+clears the destination before it links and a crash there leaves the name free. Missing that meant the
+next run reserved cleanly, said nothing, and created a *second* App beside an orphaned key. The next
+run also only reports it if the bytes **parse as a key**, and only offers `mv` when the destination is
+free — Unix `mv` replaces, so that advice destroys a second key whenever one is already there.
+
+When staging is impossible the fallback writes through the reservation, trading crash-atomicity for
+not losing the key; a torn PEM there is what `billet check` catches. And **what is on disk decides,
+not the return value**: GitHub's PEM ends in a newline, so a write that stops one byte short of it
+still produces a key `pem.Decode` reads perfectly. "The write errored" and "there is no credential
+here" are different facts.
 
 **The credential is never written twice.** Once the staging file holds a complete key, every later
 failure reports it as preserved and the fallback does **not** run. Keying that on "did staging report
@@ -276,15 +287,25 @@ Two rules, learned separately:
 - **Redaction has to hold for the whole chain, including nodes with no structure.** Sanitizing
   `Error()` while `Unwrap` returned the original meant `errors.As(err, &urlErr)` handed back the live
   URL, and any reporter that walks causes serialized it. The walk handles `errors.Join` trees
-  (`errors.Unwrap` returns nil for one, so a chain-only walk stops dead at the join) and is depth-bounded
-  (a caller-supplied error can `Unwrap` to itself). Identity is preserved wherever it can be, because
-  `errors.Is` against `context.DeadlineExceeded` depends on it — but **not** at a node whose own text
-  carries the secret. An opaque leaf that built its message from the request URL has nothing to rebuild,
-  so it is replaced; safety beats identity there.
+  (`errors.Unwrap` returns nil for one, so a chain-only walk stops dead at the join), cuts cycles, and
+  keeps a depth backstop. Identity is preserved wherever it can be, because `errors.Is` against
+  `context.DeadlineExceeded` depends on it — but **not** at a node whose own text carries the secret.
+  An opaque leaf that built its message from the request URL has nothing to rebuild, so it is replaced;
+  safety beats identity there. **Clean every field**, not just the obvious one: `url.Error` has three,
+  and copying `Op` verbatim let a transport put the endpoint straight through the one path that is
+  supposed to be structurally safe.
+- **Never compare two `error` values with `==`.** It panics when the dynamic type is not comparable —
+  an error struct holding a slice is ordinary — so both the cycle guard and the did-this-change check
+  go through `sameError`, which compares pointer identity where identity exists and answers "different"
+  otherwise. That direction is the safe one: it rebuilds a node that did not need it, rather than
+  crashing mid-onboarding and losing the key. A test written for the *first* instance is what found the
+  second.
 - **Match the endpoint, not just the code.** A caller-supplied `RoundTripper` composes its own text.
   The endpoint string is an exact literal billet constructed, so matching it needs none of the encoding
-  guesswork that matching the bare code does. `Error()` is read **once** per node — reading it twice let
-  a non-deterministic error return clean text to the check and dirty text to whatever printed it next.
+  guesswork that matching the bare code does. Renderings are captured once per node and reused, rather
+  than calling `Error()` again to test and again to substitute. This narrows the stateful-error hole
+  without closing it — a parent's `Error()` inherently invokes its children's — and billet supplies the
+  transport, so a deliberately non-deterministic error is not in the threat model.
 
 **Nothing derived from the conversion response body is ever rendered.** This is the one endpoint in
 GitHub's API whose success carries a private key, so an intermediary forwarding that body under a
@@ -297,12 +318,20 @@ negatives cost the credential, and that asymmetry decides it. Other endpoints ke
 `open`/`xdg-open` as a command-line argument, and argv is readable by other local processes — so both
 the path and the `state` must be assumed known, and only what a caller can *do* with them is bounded.
 Treating the first code to arrive as final was a kill switch: inject a worthless one, and onboarding
-ended with the App created and its key unrecoverable. Only GitHub's own rejection retries; a request
-that could not complete still fails immediately, because no second redirect is coming. The callback
-queue is deep, and a callback that does **not** fit is refused rather than dropped — a silent drop plus
-an "App created" page meant the honest redirect could be discarded while its browser was told it had
-worked. What remains is a local process being able to *delay* onboarding up to `ManifestTTL`; that is
-not fixable while argv is readable, and it is a delay rather than a lost credential.
+ended with the App created and its key unrecoverable.
+
+**Only a status that means THIS CODE is unusable may discard it** — an explicit list (400, 404, 410,
+414, 422), not "404 and 422" and not "every 4xx". Both wrong versions shipped. Too narrow left the
+kill switch open for an injected code drawing a 414. Too wide swallowed **429**, which is the more
+expensive error: a rate limit says nothing about the code, so a *valid* code was thrown away while the
+App stayed created and the loop waited out `ManifestTTL` for a redirect that had already arrived.
+Callback codes are length-bounded before they are queued, so no queued code can provoke a 414 anyway.
+
+The callback queue is deep, and a callback that does **not** fit is refused rather than dropped — a
+silent drop plus an "App created" page meant the honest redirect could be discarded while its browser
+was told it had worked. What remains is a local process being able to *delay* onboarding up to
+`ManifestTTL`; that is not fixable while argv is readable, and it is a delay rather than a lost
+credential.
 
 **`App` is redacted on every rendering path billet can reach.** `String`/`GoString` on a **value**
 receiver (a pointer receiver is not consulted when a value is formatted), `Format` so no verb falls

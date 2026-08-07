@@ -18,6 +18,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strings"
 	"time"
 )
@@ -382,6 +383,43 @@ func (s scrubber) clean(text string) string {
 	return redactString(redactString(text, s.endpoint), s.code)
 }
 
+// errorIdentity returns a comparable identity for err, and reports whether it
+// has one.
+//
+// Only pointer-shaped dynamic types do. Comparing the interfaces directly would
+// be simpler and can PANIC: an error struct holding a slice or a map is not
+// comparable, and `a == b` on two such values is a runtime error rather than a
+// false. Reflection answers the question without ever comparing the values.
+func errorIdentity(err error) (uintptr, bool) {
+	v := reflect.ValueOf(err)
+
+	switch v.Kind() { //nolint:exhaustive // Only the reference kinds carry an identity; everything else is correctly "no identity".
+	case reflect.Pointer, reflect.UnsafePointer, reflect.Chan, reflect.Map, reflect.Func:
+		return v.Pointer(), true
+	default:
+		return 0, false
+	}
+}
+
+// sameError reports whether two errors are the same object, without ever
+// comparing two error values directly.
+//
+// `a == b` on error interfaces panics when the dynamic type is not comparable,
+// so every place that wants object identity has to go through here.
+func sameError(a, b error) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+
+	aPtr, aOK := errorIdentity(a)
+	bPtr, bOK := errorIdentity(b)
+
+	// No identity to compare means the answer is "assume different". That is the
+	// safe direction: the caller rebuilds a node it did not have to, which costs
+	// a concrete type and never a credential.
+	return aOK && bOK && aPtr == bPtr && reflect.TypeOf(a) == reflect.TypeOf(b)
+}
+
 // maxErrorDepth is the backstop for a chain that is merely absurd rather than
 // cyclic. Cycles are caught by identity (see sanitize), which is what keeps a
 // legitimately deep chain inspectable: a bare depth cut truncated the tail into
@@ -411,7 +449,7 @@ func (s scrubber) sanitize(err error, depth int) error {
 
 // sanitizeSeen carries the ancestors of the current node so a cycle is cut at
 // the point it closes rather than by running out of stack.
-func (s scrubber) sanitizeSeen(err error, depth int, seen []error) error {
+func (s scrubber) sanitizeSeen(err error, depth int, seen []uintptr) error {
 	if err == nil {
 		return nil
 	}
@@ -419,18 +457,30 @@ func (s scrubber) sanitizeSeen(err error, depth int, seen []error) error {
 	// Both cuts fail CLOSED: nothing below an unexplored node may stay
 	// reachable, so the node is replaced by a scrubbed leaf rather than returned
 	// as-is.
-	for _, ancestor := range seen {
-		//nolint:errorlint // Cycle detection by object identity. errors.Is asks whether a chain CONTAINS a target, which is both the wrong question and itself a walk of the cycle being detected.
-		if ancestor == err {
-			return &redactedError{msg: s.clean(err.Error())}
+	// Cycles are tracked by POINTER, never by comparing error values.
+	//
+	// `ancestor == err` on two interfaces panics at runtime when the dynamic type
+	// is not comparable — an error struct containing a slice or a map, which is
+	// an ordinary thing to write — so the cycle guard could crash the process it
+	// was added to protect. It also conflated two separately-constructed equal
+	// values with one node.
+	//
+	// Only pointer-shaped errors are tracked, which is no loss: a cycle requires
+	// a node that can refer back to itself, and a non-pointer value cannot. Those
+	// still have the depth bound behind them.
+	if ptr, ok := errorIdentity(err); ok {
+		for _, ancestor := range seen {
+			if ancestor == ptr {
+				return &redactedError{msg: s.clean(err.Error())}
+			}
 		}
+
+		seen = append(seen, ptr)
 	}
 
 	if depth >= maxErrorDepth {
 		return &redactedError{msg: s.clean(err.Error())}
 	}
-
-	seen = append(seen, err)
 
 	// Rendered ONCE. Error() is not required to be deterministic, and calling it
 	// twice let a stateful error return clean text to the comparison and dirty
@@ -491,10 +541,13 @@ func (s scrubber) sanitizeSeen(err error, depth int, seen []error) error {
 
 	cleaned := s.clean(rendered)
 
-	//nolint:errorlint // An identity comparison, not error matching: it asks whether the recursion produced a new object. errors.Is answers a different question entirely.
-	unchanged := sanitized == inner
-
-	if unchanged && cleaned == rendered {
+	// Same hazard as the cycle guard, and it took a panicking test to notice the
+	// second instance: `sanitized == inner` compares two error INTERFACES, which
+	// is a runtime panic when the dynamic type is not comparable. sameError does
+	// it through identity where identity exists and answers "not the same"
+	// otherwise, which is the conservative direction — it rebuilds a node that
+	// did not need rebuilding rather than crashing.
+	if sameError(sanitized, inner) && cleaned == rendered {
 		// Neither this level's own text nor anything below it carries the secret,
 		// so the error is returned untouched and keeps its identity.
 		return err
@@ -566,22 +619,35 @@ func conversionError(status int, _ []byte) error {
 				"so billet never renders it)", status)
 	}
 
-	// EVERY 4xx marks the code rejected, not just 404 and 422.
+	// An explicit list, and it is neither {404, 422} nor "every 4xx".
 	//
-	// Narrowing it to those two left a kill switch open: an injected code long
-	// enough to draw a 414, or malformed enough for a proxy to answer 400, was
-	// classified as "the exchange could not be attempted" and aborted the flow —
-	// discarding an honest code already sitting in the queue behind it. This
-	// endpoint has no authentication beyond the code itself, so a 4xx IS a
-	// statement about the code, and the right response is to try the next one.
+	// {404, 422} was too narrow: an injected code long enough to draw a 414, or
+	// malformed enough for a proxy to answer 400, was read as "the exchange could
+	// not be attempted" and aborted the flow, discarding an honest code queued
+	// behind it. Widening to all of 4xx then went too far in the other direction
+	// and swallowed 429 — which says nothing about the code, only that billet
+	// asked too often. Discarding a VALID code on a rate limit is credential
+	// loss: the App exists, its key is gone, and the loop waits out ManifestTTL
+	// for a redirect that already arrived.
 	//
-	// 5xx stays fatal: it says nothing about the code, and no further redirect
-	// is coming to improve matters.
-	if status >= 400 && status < 500 {
+	// So: only statuses that mean THIS CODE is unusable. Everything else — 429,
+	// 408, 425, 426, 431, and all of 5xx — is fatal, because retrying with a
+	// different code cannot help and no second redirect is coming.
+	if codeRejectionStatuses[status] {
 		return fmt.Errorf("%w: %w", errCodeRejected, rendered)
 	}
 
 	return rendered
+}
+
+// codeRejectionStatuses are the responses that mean the presented code itself
+// is unusable, so the next queued callback is worth trying.
+var codeRejectionStatuses = map[int]bool{
+	http.StatusBadRequest:          true, // malformed code
+	http.StatusNotFound:            true, // GitHub does not know this code
+	http.StatusGone:                true, // it expired
+	http.StatusRequestURITooLong:   true, // it cannot be a real code
+	http.StatusUnprocessableEntity: true, // GitHub will not accept it
 }
 
 // errCodeRejected marks a conversion that failed because GitHub refused the
