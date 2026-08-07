@@ -1338,24 +1338,9 @@ type fakeSession struct {
 	// test can assert WHICH class of message drove the acquisition.
 	acquiredMu sync.Mutex
 	acquired   []int64
-	// cursors records the lastMessageID each poll was made with, which is what
-	// GitHub uses to decide which messages are still outstanding.
-	cursors []int64
 }
 
-// polledCursors returns the lastMessageID of every poll, in order.
-func (f *fakeSession) polledCursors() []int64 {
-	f.acquiredMu.Lock()
-	defer f.acquiredMu.Unlock()
-
-	return append([]int64(nil), f.cursors...)
-}
-
-func (f *fakeSession) GetMessage(ctx context.Context, lastMessageID int64, maxCapacity int) (*Message, error) {
-	f.acquiredMu.Lock()
-	f.cursors = append(f.cursors, lastMessageID)
-	f.acquiredMu.Unlock()
-
+func (f *fakeSession) GetMessage(ctx context.Context, _ int64, maxCapacity int) (*Message, error) {
 	if f.onPoll != nil {
 		f.onPoll(maxCapacity)
 	}
