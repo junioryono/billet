@@ -869,6 +869,62 @@ func TestOnboardSurvivesAnInjectedCode(t *testing.T) {
 	}
 }
 
+// A registration callback billet cannot queue is REFUSED, never acknowledged.
+//
+// The queue silently discarded a code it had no room for and served the "App
+// created" page anyway. GitHub's honest redirect could be the discarded one —
+// its browser was told onboarding had worked while the code was thrown away,
+// leaving the CLI waiting for a redirect that had already been and gone.
+func TestFullCallbackQueueRefusesRatherThanDropping(t *testing.T) {
+	flow := &onboardFlow{
+		state:    "the-state",
+		prefix:   "prefix",
+		codeCh:   make(chan string, codeQueueDepth),
+		installC: make(chan struct{}, 1),
+		errCh:    make(chan error, 1),
+	}
+
+	srv := httptest.NewServer(flow.routes())
+	defer srv.Close()
+
+	callback := srv.URL + "/prefix/callback?state=" + flow.state + "&code="
+
+	get := func(t *testing.T, code string) int {
+		t.Helper()
+
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, callback+code, http.NoBody)
+		if err != nil {
+			t.Fatalf("build request: %v", err)
+		}
+
+		resp, err := srv.Client().Do(req)
+		if err != nil {
+			t.Fatalf("callback: %v", err)
+		}
+
+		defer resp.Body.Close()
+
+		return resp.StatusCode
+	}
+
+	// Fill it exactly, the way a local process racing the browser would.
+	for i := range codeQueueDepth {
+		if status := get(t, fmt.Sprintf("injected-%d", i)); status != http.StatusOK {
+			t.Fatalf("callback %d answered %d, want 200 while the queue has room", i, status)
+		}
+	}
+
+	if status := get(t, "the-honest-one"); status == http.StatusOK {
+		t.Error("a callback that could not be queued was told the App was created")
+	}
+
+	// Every accepted code must still be there — refusing the overflow must not
+	// have cost one that was already taken.
+	if got := len(flow.codeCh); got != codeQueueDepth {
+		t.Errorf("queue holds %d codes, want %d", got, codeQueueDepth)
+	}
+}
+
 func TestOnboardRequiresOrgAndLog(t *testing.T) {
 	if _, err := Onboard(t.Context(), OnboardOptions{Log: func(string, ...any) {}}); err == nil {
 		t.Error("an empty org should be rejected")

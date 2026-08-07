@@ -403,6 +403,136 @@ func TestAnIncompleteStagingWriteLeavesNothingBehind(t *testing.T) {
 	}
 }
 
+// installByLink must not destroy a key that is at the destination, whatever
+// the caller believed when it decided to call.
+//
+// The point of linking instead of renaming is that install can never REPLACE.
+// That only holds if the step which clears the destination is bounded too — a
+// key sitting at the path is not something to remove on the way to installing
+// another one.
+func TestInstallByLinkRefusesANonEmptyDestination(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.pem")
+	staging := filepath.Join(dir, ".app.pem.billet-partial")
+
+	theirs := testKey(t)
+	if err := os.WriteFile(path, theirs, 0o600); err != nil {
+		t.Fatalf("seed the other run's key: %v", err)
+	}
+
+	ours := testKey(t)
+	if err := os.WriteFile(staging, ours, 0o600); err != nil {
+		t.Fatalf("seed staging: %v", err)
+	}
+
+	if err := installByLink(staging, path); err == nil {
+		t.Error("installByLink installed over an occupied destination")
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("the destination is gone: %v", err)
+	}
+
+	if !bytes.Equal(got, theirs) {
+		t.Error("installByLink destroyed a key it did not put there")
+	}
+
+	// And ours must survive, or refusing has cost a credential instead of saving
+	// one.
+	if kept, err := os.ReadFile(staging); err != nil || !bytes.Equal(kept, ours) {
+		t.Errorf("this run's staged key did not survive the refusal: %v", err)
+	}
+}
+
+// destinationIsStillReserved is what both install paths and the cleanup rely on
+// to decide whether the pathname still refers to this run's file.
+//
+// Tested directly because the interleaving it guards — the reservation being
+// replaced BETWEEN the check and the act — cannot be produced deterministically
+// from the outside. What can be pinned is that the predicate itself answers
+// correctly, which is what every caller's correctness rests on.
+func TestDestinationIsStillReservedDetectsAReplacedFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.pem")
+
+	reserved, err := reserveKeyFile(path)
+	if err != nil {
+		t.Fatalf("reserveKeyFile: %v", err)
+	}
+
+	defer reserved.Close()
+
+	if err := destinationIsStillReserved(reserved, path); err != nil {
+		t.Fatalf("an untouched reservation was reported as replaced: %v", err)
+	}
+
+	// Same pathname, different inode — the case a pathname cannot distinguish.
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+
+	if err := os.WriteFile(path, testKey(t), 0o600); err != nil {
+		t.Fatalf("replace: %v", err)
+	}
+
+	if err := destinationIsStillReserved(reserved, path); err == nil {
+		t.Error("a replaced destination was accepted as this run's reservation")
+	}
+
+	// And an absent one is not silently treated as ours.
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+
+	if err := destinationIsStillReserved(reserved, path); err == nil {
+		t.Error("a missing destination was accepted as this run's reservation")
+	}
+}
+
+// A key written through a descriptor whose name is gone is NOT preserved.
+//
+// The distinction matters more than it looks: ErrCredentialPreserved tells the
+// operator to keep the App and go find the file. Attaching it here would send
+// them looking for a key that no longer has a path — the write went to an inode
+// with no directory entry, so it disappears when the process exits.
+func TestFallbackWriteToALostReservationIsNotReportedAsPreserved(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.pem")
+
+	reserved, err := reserveKeyFile(path)
+	if err != nil {
+		t.Fatalf("reserveKeyFile: %v", err)
+	}
+
+	defer reserved.Close()
+
+	// The reservation is replaced before the fallback runs, which is the state
+	// the post-write re-check exists to notice.
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("remove reservation: %v", err)
+	}
+
+	if err := os.WriteFile(path, []byte("another run's file"), 0o600); err != nil {
+		t.Fatalf("replace: %v", err)
+	}
+
+	installed := false
+
+	err = installIntoReservation(reserved, path, testKey(t), func() { installed = true })
+	if err == nil {
+		t.Fatal("installIntoReservation reported success writing to a path it does not own")
+	}
+
+	if installed {
+		t.Error("onInstalled fired for a key that is not at the destination")
+	}
+
+	if errors.Is(err, errCredentialPreserved) {
+		t.Errorf("an unreachable key was reported as preserved, which tells the operator to keep the App: %v", err)
+	}
+}
+
 // A crash between the synced staging file and the rename leaves the only copy
 // of the key under a name nothing reports. The next run has to find it and say
 // so, because the guidance for an empty reservation is "delete it and re-run" —

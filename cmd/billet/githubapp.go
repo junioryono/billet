@@ -420,6 +420,23 @@ func installViaStagingFile(reserved *os.File, path string, pem []byte, onInstall
 // reservation there makes the link fail with EEXIST, which is exactly the
 // answer wanted — this run's key stays at the staging path and is reported.
 func installByLink(staging, path string) error {
+	// The destination is cleared only while it is EMPTY.
+	//
+	// This was an unconditional remove, which made the whole design pointless:
+	// linking cannot replace, but removing first replaces just as thoroughly, so
+	// a key that arrived at the path after the caller's ownership check was
+	// deleted on the way to installing this one. The link then succeeded and
+	// reported success.
+	//
+	// Emptiness is the bound that holds without atomicity. A reservation is
+	// empty and an installed key never is, so the worst the remaining race can
+	// cost is another run's placeholder.
+	if exists := fileExists(path); exists && !isEmptyFile(path) {
+		return fmt.Errorf(
+			"%s is not this run's empty reservation — something else is there, and "+
+				"billet will not remove a file it did not create to install over it", path)
+	}
+
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("clear the reservation at %s: %w", path, err)
 	}
@@ -539,6 +556,13 @@ var errCredentialPreserved = github.ErrCredentialPreserved
 // destination keeps two runs onto different key paths out of each other's way.
 func stagingPath(path string) string {
 	return filepath.Join(filepath.Dir(path), "."+filepath.Base(path)+".billet-partial")
+}
+
+// fileExists reports whether anything at all occupies path, symlinks included.
+func fileExists(path string) bool {
+	_, err := os.Lstat(path)
+
+	return err == nil
 }
 
 // isEmptyFile reports whether path is a zero-length regular file. Lstat, so a
