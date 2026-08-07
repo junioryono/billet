@@ -74,6 +74,20 @@ billet package.
 
 ---
 
+## Decisions written down
+
+`docs/adr-001-control-plane-hosting.md` — where the control plane runs and what stores its state.
+Short version: a single small EC2 with SQLite on EBS, recovered by EC2 auto-recovery (NOT an ASG —
+an ASG launches a fresh instance that does not reattach the data volume), ~$7-13/mo, no code change.
+DynamoDB was considered seriously and rejected FOR NOW — it is feasible, it saves nothing, and it
+costs a rewrite of the two most invariant-dense packages. Revisit it when more than one controller is
+genuinely wanted, which is the only thing SQLite cannot do at any price.
+
+The fact that resized that decision, and which is easy to forget: **GitHub queues a job for 24 hours
+when no matching runner is available.** A dead controller delays CI rather than failing it, so the
+requirement is "recovers in minutes", not HA. Do not buy availability machinery the failure mode does
+not require.
+
 ## Upstream references
 
 `docs/upstream-references.md` records what billet takes from other people's code and what it
@@ -243,10 +257,11 @@ of another, and let the heartbeat spend it out from under a claim already on the
 under the mutex *before* the network call fixes all three at once, which is the tell that they were
 one bug rather than three.
 
-**Heartbeats must not be bounded by the poll.** A long poll is nominally 50 seconds against a 90
-second TTL, which reads like ample margin and is not — the vendor's HTTP client permits a request to
-run for minutes once slow responses and retries are counted, and renewal that happens only *between*
-polls stops for as long as one poll lasts. The reaper then terminalises the leases, another tier
+**Heartbeats must not be bounded by the poll.** A long poll was assumed to be about 50 seconds
+against a 90 second TTL, which reads like ample margin. **Measured against a real organization on the
+first poll billet ever made, it ran ~88 seconds** — two seconds inside the TTL — and the vendor's HTTP
+client permits far longer once slow responses and retries are counted. Renewal that happens only
+*between* polls stops for as long as one poll lasts. The reaper then terminalises the leases, another tier
 escrows the capacity, and the poll returns an assignment backed by a lease this listener no longer
 holds. Tying renewal to the poll makes the safety of the whole escrow depend on a timeout billet does
 not control.

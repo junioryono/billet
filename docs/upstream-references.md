@@ -27,6 +27,7 @@ documentation:
 | Is there a way to decline an acquired job? | `session_client.go` — **there is not**; `AcquireJobs` is one-way |
 | What is `maxCapacity`? | `listener/listener.go` — the scale set's TOTAL, sent unchanged as jobs are assigned |
 | Which status means "no message"? | `getMessage` — `202`, while `200` carries a batch |
+| How long does a long poll actually take? | **Measured, not read**: ~88s against a real org, not the ~50s widely assumed. Against a 90s lease TTL that is two seconds of margin. |
 
 ## `actions/actions-runner-controller` — a reference, not a dependency
 
