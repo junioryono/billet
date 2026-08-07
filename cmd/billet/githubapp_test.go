@@ -146,9 +146,15 @@ func TestReserveKeyFileReportsAStagedKey(t *testing.T) {
 		t.Errorf("the error does not warn against creating a second App: %v", err)
 	}
 
-	// With the destination free, `mv` is the correct instruction.
-	if !strings.Contains(err.Error(), "mv "+staging) {
+	// With the destination free, a recovery command is offered — and it must be
+	// one that REFUSES to overwrite. The operator types it some time after billet
+	// composed it, and `mv` would replace a key another run installed in between.
+	if !strings.Contains(err.Error(), "ln "+staging) {
 		t.Errorf("the error does not tell the operator how to recover it: %v", err)
+	}
+
+	if strings.Contains(err.Error(), "mv ") {
+		t.Errorf("billet suggested a command that silently replaces the destination: %v", err)
 	}
 }
 
@@ -172,8 +178,10 @@ func TestReserveKeyFileWillNotRecommendClobberingASecondKey(t *testing.T) {
 		t.Fatal("reserveKeyFile proceeded with two keys present")
 	}
 
-	if strings.Contains(err.Error(), "mv ") {
-		t.Errorf("billet recommended a command that would destroy one of two keys: %v", err)
+	for _, forbidden := range []string{"mv ", "ln "} {
+		if strings.Contains(err.Error(), forbidden) {
+			t.Errorf("billet recommended %q with two keys present: %v", forbidden, err)
+		}
 	}
 
 	for _, want := range []string{staging, path} {
@@ -199,8 +207,10 @@ func TestReserveKeyFileDoesNotReportAFragmentAsAKey(t *testing.T) {
 		t.Fatal("reserveKeyFile adopted a fragment")
 	}
 
-	if strings.Contains(err.Error(), "mv ") {
-		t.Errorf("a fragment was reported as a recoverable key: %v", err)
+	for _, forbidden := range []string{"mv ", "ln "} {
+		if strings.Contains(err.Error(), forbidden) {
+			t.Errorf("a fragment was reported as a recoverable key (%q): %v", forbidden, err)
+		}
 	}
 }
 
