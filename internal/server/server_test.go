@@ -30,17 +30,38 @@ func TestShutdownReleasesEveryEscrowedLease(t *testing.T) {
 
 	a := newAllocator(t, alloc.Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB}, tiers)
 
-	var polls atomic.Int32
-
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	defer cancel()
 
+	// Counting POLLS proved nothing: deleting refillEscrow entirely still yields
+	// six zero-capacity polls and a final usage of zero, so the test passed
+	// against an implementation that never escrowed anything to release. What has
+	// to be observed is a POSITIVE advertisement from every tier.
+	var (
+		mu         sync.Mutex
+		advertised = map[string]bool{}
+	)
+
+	// At least ONE tier, not every tier. Escrow is first-come and the budget is
+	// shared, so a tier that polls first can legitimately take all of it and leave
+	// the others advertising zero — see TestAGreedyTierCanTakeTheWholeBudget.
+	// Requiring every tier here asserts a fairness property the allocator does not
+	// currently have, which is how this test failed once it was made strict.
+	sawCapacity := func(label string, capacity int) bool {
+		mu.Lock()
+		defer mu.Unlock()
+
+		if capacity > 0 {
+			advertised[label] = true
+		}
+
+		return len(advertised) > 0
+	}
+
 	prov := &fakeProvisioner{
-		newSession: func(string) Session {
-			return &fakeSession{onPoll: func(int) {
-				// Stop once both tiers have actually escrowed something, or the
-				// test proves nothing about releasing.
-				if polls.Add(1) >= 6 {
+		newSession: func(label string) Session {
+			return &fakeSession{onPoll: func(capacity int) {
+				if sawCapacity(label, capacity) {
 					cancel()
 				}
 			}}
@@ -49,6 +70,14 @@ func TestShutdownReleasesEveryEscrowedLease(t *testing.T) {
 
 	if err := New(a, prov, tiers, "test-owner", nil).Run(ctx); err != nil {
 		t.Fatalf("Run: %v", err)
+	}
+
+	mu.Lock()
+	held := len(advertised)
+	mu.Unlock()
+
+	if held == 0 {
+		t.Fatal("no tier ever advertised capacity; nothing was escrowed, so nothing was released")
 	}
 
 	usage, err := a.Usage(t.Context())
@@ -263,13 +292,49 @@ func TestReaperDoesNotReclaimCapacityStillAdvertised(t *testing.T) {
 	}
 }
 
+// Escrow is FIRST-COME, so one tier can take the entire budget.
+//
+// Not a bug today, and not obviously right either — so it is written down as a
+// test rather than left to be rediscovered. With a shared ceiling and no per-tier
+// reservation, whichever listener polls first escrows everything it can use and
+// the others advertise zero until it releases. A busy 4-vCPU tier can starve a
+// 16-vCPU one indefinitely.
+//
+// Fixing it means per-tier floors or a fairer escrow, which is a scheduling
+// decision rather than a correctness one. The invariant that matters — never
+// advertising more than the budget — holds either way.
+func TestAGreedyTierCanTakeTheWholeBudget(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a"), tier("billet-4vcpu-b")}
+
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+
+	leases, err := a.Escrow(t.Context(), "billet-4vcpu-a", 2)
+	if err != nil {
+		t.Fatalf("Escrow: %v", err)
+	}
+
+	if len(leases) != 2 {
+		t.Fatalf("escrowed %d leases, want 2 (the whole budget)", len(leases))
+	}
+
+	room, err := a.Headroom(t.Context(), "billet-4vcpu-b")
+	if err != nil {
+		t.Fatalf("Headroom: %v", err)
+	}
+
+	if room != 0 {
+		t.Errorf("the second tier has headroom %d while the first holds the whole budget", room)
+	}
+}
+
 // fakeProvisioner stands in for GitHub's scale-set API.
 type fakeProvisioner struct {
 	onEnsure   func(label string) error
 	newSession func(label string) Session
 
-	mu   sync.Mutex
-	next int
+	mu     sync.Mutex
+	next   int
+	labels map[int]string
 }
 
 func (f *fakeProvisioner) EnsureScaleSet(_ context.Context, name, group string, _ []string) (*ScaleSet, error) {
@@ -284,13 +349,24 @@ func (f *fakeProvisioner) EnsureScaleSet(_ context.Context, name, group string, 
 
 	f.next++
 
+	if f.labels == nil {
+		f.labels = map[int]string{}
+	}
+
+	f.labels[f.next] = name
+
 	return &ScaleSet{ID: f.next, Name: name, Group: group}, nil
 }
 
-func (f *fakeProvisioner) Session(_ context.Context, _ int, _ string) (Session, error) {
+func (f *fakeProvisioner) Session(_ context.Context, scaleSetID int, _ string) (Session, error) {
 	if f.newSession == nil {
 		return &fakeSession{}, nil
 	}
 
-	return f.newSession(""), nil
+	// The label the set was created under, so a test can tell the tiers apart.
+	f.mu.Lock()
+	label := f.labels[scaleSetID]
+	f.mu.Unlock()
+
+	return f.newSession(label), nil
 }

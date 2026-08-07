@@ -326,6 +326,13 @@ type Tier struct {
 	// every reconcile.
 	RunnerGroup string `yaml:"runner_group,omitempty"`
 
+	// NOTE on what is accepted: the scale-set client interpolates this name into
+	// a query string WITHOUT escaping it, so a perfectly ordinary group name like
+	// "Platform & Security" is parsed as two parameters and comes back as "group
+	// not found" — a confusing first-contact failure that looks like a
+	// permissions problem. Validation therefore rejects what the client cannot
+	// carry, rather than letting GitHub answer confusingly. See validateTier.
+
 	VCPU   int      `yaml:"vcpu"`
 	Memory ByteSize `yaml:"memory"`
 	Disk   ByteSize `yaml:"disk,omitempty"`
@@ -407,6 +414,15 @@ func (c *Config) NodePolicies() map[string]NodePolicy {
 }
 
 var labelRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$`)
+
+// runnerGroupRe is what a runner group name may contain for the scale-set client
+// to look it up.
+//
+// Wider than labelRe because GitHub genuinely allows spaces in group names and
+// people use them. Narrower than GitHub's own rules because the client does not
+// escape the name before putting it in a query: & = ? # and % would each change
+// the shape of the request rather than the value being asked for.
+var runnerGroupRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9 ._-]{0,99}$`)
 
 // validateNodeName is the ONE rule for a node identifier, wherever it appears:
 // node.name, nodes[].name, and tiers[].node all name hosts in a single
@@ -752,6 +768,20 @@ func (c *Config) validateTiers() []error {
 		}
 		if _, dup := seen[t.Label]; dup {
 			errs = append(errs, fmt.Errorf("%s: duplicate label", where))
+		}
+
+		// Rejected HERE rather than left for GitHub to answer confusingly. The
+		// scale-set client interpolates this name into a query string without
+		// escaping it, so an ordinary group name containing & or = or a space —
+		// "Platform & Security" is a realistic one — is parsed as several
+		// parameters and comes back as "group not found". That reads as a
+		// permissions problem and sends an operator to the wrong page entirely.
+		if t.RunnerGroup != "" && !runnerGroupRe.MatchString(t.RunnerGroup) {
+			errs = append(errs, fmt.Errorf(
+				"%s: runner_group %q cannot be looked up safely — the scale-set client puts it in a "+
+					"URL query unescaped, so it must match %s. Rename the group, or leave this unset "+
+					"to use GitHub's default group",
+				where, t.RunnerGroup, runnerGroupRe))
 		}
 		seen[t.Label] = struct{}{}
 

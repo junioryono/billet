@@ -59,6 +59,40 @@ func TestClientIDIsOptionalAndRoundTrips(t *testing.T) {
 	}
 }
 
+// A runner group name billet cannot look up safely is refused at load, not left
+// for GitHub to answer confusingly.
+//
+// The scale-set client interpolates the name into a query string unescaped, so
+// "Platform & Security" — an entirely ordinary group name — is parsed as two
+// parameters and returns "group not found". That reads as a permissions problem
+// and sends the operator to the wrong page.
+func TestRunnerGroupMustBeQueryable(t *testing.T) {
+	for name, group := range map[string]string{
+		"ampersand": "Platform & Security",
+		"equals":    "team=platform",
+		"question":  "who?",
+		"percent":   "fifty%",
+		"hash":      "team#1",
+	} {
+		t.Run(name, func(t *testing.T) {
+			body := strings.Replace(validConfig,
+				"    provider: firecracker\n", "    provider: firecracker\n    runner_group: "+group+"\n", 1)
+
+			if _, err := Load(writeConfig(t, body)); err == nil {
+				t.Errorf("Load accepted runner_group %q, which the client cannot query for", group)
+			}
+		})
+	}
+
+	// Spaces alone are fine, and common: GitHub allows them and people use them.
+	body := strings.Replace(validConfig,
+		"    provider: firecracker\n", "    provider: firecracker\n    runner_group: Build Farm\n", 1)
+
+	if _, err := Load(writeConfig(t, body)); err != nil {
+		t.Errorf("Load rejected an ordinary group name with a space: %v", err)
+	}
+}
+
 const validConfig = `
 server:
   listen: 127.0.0.1:7717

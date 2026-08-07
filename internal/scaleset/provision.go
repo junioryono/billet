@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"sort"
 
 	gh "github.com/actions/scaleset"
 )
@@ -51,6 +52,18 @@ func (c *Client) EnsureScaleSet(ctx context.Context, name, group string, labels 
 	}
 
 	if existing != nil {
+		// Adopted only if it is actually the scale set billet asked for.
+		//
+		// Name and group identify it, but LABELS decide which `runs-on` values
+		// route here. A set someone created by hand with the same name and an
+		// extra label silently pulls work into this tier that billet never
+		// advertised for — and the tier's capacity accounting is sized for its own
+		// labels, so the overflow lands as jobs that queue behind capacity that
+		// was never meant for them.
+		if err := checkLabels(name, existing, labels); err != nil {
+			return nil, err
+		}
+
 		return &ScaleSet{ID: existing.ID, Name: existing.Name, Group: group}, nil
 	}
 
@@ -78,6 +91,51 @@ func (c *Client) EnsureScaleSet(ctx context.Context, name, group string, labels 
 	}
 
 	return &ScaleSet{ID: created.ID, Name: created.Name, Group: group}, nil
+}
+
+// checkLabels refuses a scale set whose labels are not the ones requested.
+//
+// It reports rather than patches. Rewriting somebody else's labels is a
+// destructive act on an object billet did not create, and the operator who set
+// them may have had a reason — so the answer is to say exactly what differs and
+// let them decide.
+func checkLabels(name string, existing *gh.RunnerScaleSet, want []string) error {
+	have := make(map[string]bool, len(existing.Labels))
+	for _, l := range existing.Labels {
+		have[l.Name] = true
+	}
+
+	wanted := make(map[string]bool, len(want))
+	for _, l := range want {
+		wanted[l] = true
+	}
+
+	var missing, extra []string
+
+	for l := range wanted {
+		if !have[l] {
+			missing = append(missing, l)
+		}
+	}
+
+	for l := range have {
+		if !wanted[l] {
+			extra = append(extra, l)
+		}
+	}
+
+	if len(missing) == 0 && len(extra) == 0 {
+		return nil
+	}
+
+	sort.Strings(missing)
+	sort.Strings(extra)
+
+	return fmt.Errorf(
+		"scaleset: a scale set named %q already exists with different labels "+
+			"(missing %v, unexpected %v). billet will not rewrite labels it did not set — "+
+			"fix them in GitHub, or point this tier at a different name",
+		name, missing, extra)
 }
 
 // toLabels turns billet's plain label strings into GitHub's typed ones.
