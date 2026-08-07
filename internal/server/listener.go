@@ -248,10 +248,12 @@ func WithMaxCapacity(ceiling int) Option {
 func (l *Listener) Run(ctx context.Context) error {
 	// Heartbeats run on their OWN clock, not between polls.
 	//
-	// A long poll is nominally 50 seconds against a 90 second lease TTL, which
-	// looks like enough margin and is not: the vendor's HTTP client allows a
-	// request to take minutes once slow responses and retries are counted. A poll
-	// that outlives the TTL leaves its leases unrenewed, the reaper terminalises
+	// A long poll was assumed to be about 50 seconds against a 90 second lease
+	// TTL, which looks like comfortable margin. MEASURED against a real
+	// organization it ran ~88 seconds — two seconds inside the TTL, on the first
+	// poll ever made. The vendor's HTTP client also permits far longer once slow
+	// responses and retries are counted. A poll that outlives the TTL leaves its
+	// leases unrenewed, the reaper terminalises
 	// them, another tier escrows the capacity — and the poll then returns an
 	// assignment backed by a lease that is no longer this listener's.
 	//
@@ -306,7 +308,7 @@ func (l *Listener) Run(ctx context.Context) error {
 		msg, err := l.session.GetMessage(ctx, l.lastMessageID, l.capacity())
 
 		// A timed-out long poll is the ordinary case. Poll again immediately —
-		// the escrow is KEPT, because releasing and retaking it every 50 seconds
+		// the escrow is KEPT, because releasing and retaking it every poll
 		// would hand the gap to another tier and produce exactly the flapping the
 		// escrow exists to avoid.
 		if errors.Is(err, ErrNoMessage) {

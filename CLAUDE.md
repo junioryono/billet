@@ -243,10 +243,11 @@ of another, and let the heartbeat spend it out from under a claim already on the
 under the mutex *before* the network call fixes all three at once, which is the tell that they were
 one bug rather than three.
 
-**Heartbeats must not be bounded by the poll.** A long poll is nominally 50 seconds against a 90
-second TTL, which reads like ample margin and is not — the vendor's HTTP client permits a request to
-run for minutes once slow responses and retries are counted, and renewal that happens only *between*
-polls stops for as long as one poll lasts. The reaper then terminalises the leases, another tier
+**Heartbeats must not be bounded by the poll.** A long poll was assumed to be about 50 seconds
+against a 90 second TTL, which reads like ample margin. **Measured against a real organization on the
+first poll billet ever made, it ran ~88 seconds** — two seconds inside the TTL — and the vendor's HTTP
+client permits far longer once slow responses and retries are counted. Renewal that happens only
+*between* polls stops for as long as one poll lasts. The reaper then terminalises the leases, another tier
 escrows the capacity, and the poll returns an assignment backed by a lease this listener no longer
 holds. Tying renewal to the poll makes the safety of the whole escrow depend on a timeout billet does
 not control.
