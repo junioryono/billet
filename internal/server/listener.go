@@ -100,6 +100,10 @@ type Listener struct {
 
 	lastMessageID int64
 
+	// maxCapacity, when set, caps what this listener advertises. nil means the
+	// escrow decides, which is the ordinary case.
+	maxCapacity *int
+
 	// observed is the last statistics GitHub reported. TotalAssignedJobs is the
 	// documented scaling signal — counting messages is not, because a response
 	// carries at most 50 and a large backlog is truncated.
@@ -130,6 +134,19 @@ func WithLogger(log *slog.Logger) Option {
 	return func(l *Listener) { l.log = log }
 }
 
+// WithMaxCapacity caps what this listener will ever advertise.
+//
+// Zero means advertise nothing: connect, reconcile, poll, and tell GitHub there
+// is no room. That is what makes a first run against a real organization safe
+// while no node runtime exists to launch anything — the whole path is exercised
+// and no job is ever accepted.
+//
+// A negative value is rejected rather than clamped, because "advertise -1" means
+// the caller computed something wrong and quietly turning that into 0 hides it.
+func WithMaxCapacity(ceiling int) Option {
+	return func(l *Listener) { l.maxCapacity = &ceiling }
+}
+
 // Run polls until the context is done.
 //
 // The order of operations here is the design, and it is not the obvious one:
@@ -146,7 +163,31 @@ func WithLogger(log *slog.Logger) Option {
 // The vendor's own listener package computes a desired runner count itself,
 // which is why billet does not use it.
 func (l *Listener) Run(ctx context.Context) error {
-	defer l.releaseAll(context.WithoutCancel(ctx))
+	// CLOSE THEN RELEASE, in that order, and the listener owns both so the order
+	// cannot be split across two functions again.
+	//
+	// The last maxCapacity GitHub saw stays live until the session ends. Releasing
+	// escrow first therefore leaves a positive advertisement standing with nothing
+	// backing it: a restart re-escrows that capacity while GitHub may still act on
+	// the old promise, which breaks the central invariant during a clean shutdown
+	// of all things. It was split across Run and its caller, and Go's defer order
+	// put them the wrong way round.
+	defer func() {
+		stopCtx := context.WithoutCancel(ctx)
+
+		if err := l.session.Close(stopCtx); err != nil {
+			l.log.Warn("could not close message session; capacity is held until it expires",
+				"tier", l.tier, "error", err)
+
+			// NOT released. A session billet could not close may still be handing
+			// this scale set work, and handing the capacity back would let another
+			// tier escrow it while GitHub believes this one still has room. The
+			// reaper expiring the lease is the safe way out.
+			return
+		}
+
+		l.releaseAll(stopCtx)
+	}()
 
 	// Seeded from the session before the first poll. A restart does not replay
 	// messages for work already assigned, so a listener that waits to be told
@@ -157,6 +198,10 @@ func (l *Listener) Run(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+
+		// Heartbeat BEFORE topping up, so the count advertised below reflects what
+		// this listener still actually owns.
+		l.heartbeatHeld(ctx)
 
 		if err := l.refillEscrow(ctx); err != nil {
 			return stopping(ctx, err)
@@ -214,6 +259,50 @@ func stopping(ctx context.Context, err error) error {
 	return err
 }
 
+// heartbeatHeld renews the leases this listener is advertising, and drops any it
+// has lost.
+//
+// This is what makes the reaper safe to run at all. A lease expires after
+// alloc.DefaultLeaseTTL without a heartbeat — 90 seconds — while a long poll
+// blocks for about 50, so escrow held across two polls would be reclaimed
+// underneath a listener that is still advertising it. Another tier could then
+// escrow the same capacity, which is precisely the double-admission the escrow
+// exists to prevent. Turning the reaper on without this would have broken the
+// central invariant rather than protected it.
+//
+// A lease that cannot be renewed is DROPPED rather than retried. Failure here
+// means the allocator no longer agrees this listener owns it — reaped, or fenced
+// by a new holder — and continuing to advertise it would be advertising capacity
+// somebody else now has.
+func (l *Listener) heartbeatHeld(ctx context.Context) {
+	if len(l.held) == 0 {
+		return
+	}
+
+	kept := l.held[:0]
+
+	for _, lease := range l.held {
+		if err := l.alloc.Heartbeat(ctx, lease.ID, lease.Epoch); err != nil {
+			if ctx.Err() != nil {
+				// Shutting down. Keep it: the release path is about to hand it
+				// back, and dropping it here would leak it instead.
+				kept = append(kept, lease)
+
+				continue
+			}
+
+			l.log.Warn("lost an escrowed lease; no longer advertising it",
+				"tier", l.tier, "lease", lease.ID, "error", err)
+
+			continue
+		}
+
+		kept = append(kept, lease)
+	}
+
+	l.held = kept
+}
+
 // refillEscrow tops the escrow up to what this tier could use.
 //
 // Escrow returns what it could actually give, which may be nothing when another
@@ -223,6 +312,15 @@ func (l *Listener) refillEscrow(ctx context.Context) error {
 	room, err := l.alloc.Headroom(ctx, l.tier)
 	if err != nil {
 		return fmt.Errorf("server: headroom for %s: %w", l.tier, err)
+	}
+
+	if l.maxCapacity != nil {
+		// Capped BEFORE the escrow, not after. Escrowing capacity this listener
+		// has promised not to advertise would hold it away from every other tier
+		// for nothing.
+		if room > *l.maxCapacity {
+			room = *l.maxCapacity
+		}
 	}
 
 	if room <= 0 {

@@ -182,6 +182,87 @@ func TestReconciliationFailureStopsStartup(t *testing.T) {
 	}
 }
 
+// The reaper must never reclaim capacity a live listener is still advertising.
+//
+// This pair nearly shipped broken in BOTH directions. Without a reaper, a hard
+// kill leaves escrowed leases in the database forever and every restart
+// advertises less than the host can do. With a reaper and no heartbeats, escrow
+// held across two long polls — 100 seconds against a 90 second TTL — is
+// reclaimed underneath a listener that is still advertising it, and another tier
+// escrows the same capacity. Enabling one without the other converts a leak into
+// a double-admission, which is worse.
+//
+// Driven with a TTL far shorter than the poll cadence so the race is certain
+// rather than occasional.
+func TestReaperDoesNotReclaimCapacityStillAdvertised(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+
+	db := openState(t)
+
+	a, err := alloc.New(db, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
+		alloc.WithLeaseTTL(150*time.Millisecond))
+	if err != nil {
+		t.Fatalf("alloc.New: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	var (
+		mu         sync.Mutex
+		advertised []int
+	)
+
+	prov := &fakeProvisioner{
+		newSession: func(string) Session {
+			return &fakeSession{onPoll: func(capacity int) {
+				mu.Lock()
+				advertised = append(advertised, capacity)
+				mu.Unlock()
+
+				// Slower than the TTL, so a listener that does not heartbeat loses
+				// its escrow between polls.
+				time.Sleep(80 * time.Millisecond)
+			}}
+		},
+	}
+
+	go func() {
+		time.Sleep(1200 * time.Millisecond)
+		cancel()
+	}()
+
+	// The reaper must actually FIRE inside this test, or it proves nothing about
+	// the interaction it is named for.
+	srv := New(a, prov, tiers, "test-owner", nil, WithReapInterval(30*time.Millisecond))
+	if err := srv.Run(ctx); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(advertised) < 4 {
+		t.Fatalf("only %d polls; not enough to outlive the TTL and prove anything", len(advertised))
+	}
+
+	// Every advertisement after the first must still be backed. A listener whose
+	// escrow was reaped re-escrows and the number climbs above what the budget
+	// allows, or collapses to zero because the capacity went elsewhere.
+	for i, capacity := range advertised {
+		if capacity*tierVCPU > 8 {
+			t.Errorf("poll %d advertised %d runners (%d vCPU) against an 8 vCPU budget",
+				i, capacity, capacity*tierVCPU)
+		}
+	}
+
+	// And the steady state is nonzero: escrow that is being renewed stays held,
+	// so this listener keeps advertising rather than flapping to nothing.
+	if advertised[len(advertised)-1] == 0 {
+		t.Errorf("the listener ended up advertising nothing; escrow was not renewed: %v", advertised)
+	}
+}
+
 // fakeProvisioner stands in for GitHub's scale-set API.
 type fakeProvisioner struct {
 	onEnsure   func(label string) error

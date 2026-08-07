@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
@@ -42,15 +43,58 @@ type Server struct {
 	// owner identifies this process to GitHub's message queue, so a session left
 	// by a crashed run can be told apart from a live one.
 	owner string
+	// maxCapacity, when set, caps every listener. See WithMaxCapacity.
+	maxCapacity *int
+	// reapEvery is how often abandoned capacity is reclaimed.
+	reapEvery time.Duration
+}
+
+// ControlPlaneOption configures a Server.
+type ControlPlaneOption func(*Server)
+
+// WithReapInterval sets how often abandoned capacity is reclaimed.
+//
+// Exposed so a test can make the reaper actually fire. The default is slow
+// relative to any test, which meant the first version of the reaper/heartbeat
+// interaction test never reached the reaper at all — it passed and proved
+// nothing, which is the same trap as an instant fake finishing before a
+// goroutine runs.
+func WithReapInterval(d time.Duration) ControlPlaneOption {
+	return func(s *Server) { s.reapEvery = d }
+}
+
+// AdvertiseNothing makes every listener advertise zero capacity.
+//
+// It exists so the whole path — App auth, scale-set reconciliation, session,
+// long poll — can be exercised against a REAL organization without accepting a
+// job that nothing in this repository can yet launch. Accepting one would strand
+// somebody's CI, which is a worse first contact than not connecting at all.
+func AdvertiseNothing() ControlPlaneOption {
+	return func(s *Server) {
+		zero := 0
+		s.maxCapacity = &zero
+	}
 }
 
 // New builds a control plane over a configured tier catalog.
-func New(a *alloc.Allocator, prov Provisioner, tiers []config.Tier, owner string, log *slog.Logger) *Server {
+func New(
+	a *alloc.Allocator, prov Provisioner, tiers []config.Tier,
+	owner string, log *slog.Logger, opts ...ControlPlaneOption,
+) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
 
-	return &Server{alloc: a, prov: prov, tiers: tiers, log: log, owner: owner}
+	s := &Server{
+		alloc: a, prov: prov, tiers: tiers, log: log, owner: owner,
+		reapEvery: defaultReapInterval,
+	}
+
+	for _, opt := range opts {
+		opt(s)
+	}
+
+	return s
 }
 
 // Run reconciles a scale set per tier and listens on all of them until the
@@ -85,6 +129,22 @@ func (s *Server) Run(ctx context.Context) error {
 		s.log.Info("scale set ready", "tier", t.Label, "scale_set", set.ID, "group", set.Group)
 	}
 
+	// Reaped ONCE before anything is escrowed, and then on a timer.
+	//
+	// A hard kill leaves escrowed leases in SQLite with no process behind them.
+	// Nothing else ever removes those: every restart counts them against headroom,
+	// so a host that was SIGKILLed while holding capacity comes back advertising
+	// less, and eventually advertises nothing at all. The failure is permanent and
+	// silent, which is the worst pair.
+	//
+	// The startup pass is what makes a restart recover rather than accumulate. The
+	// timer is for a lease whose holder dies mid-run.
+	if n, err := s.alloc.Reap(ctx); err != nil {
+		return fmt.Errorf("server: reclaim abandoned capacity: %w", err)
+	} else if n > 0 {
+		s.log.Info("reclaimed capacity from leases with no live holder", "leases", n)
+	}
+
 	// Cancelled together. One listener failing takes the others down rather than
 	// leaving a control plane that is advertising for some tiers and silent for
 	// others — a state whose only symptom is jobs queueing forever on the tiers
@@ -97,6 +157,14 @@ func (s *Server) Run(ctx context.Context) error {
 		mu   sync.Mutex
 		errs []error
 	)
+
+	wg.Add(1)
+
+	go func() {
+		defer wg.Done()
+
+		s.reapPeriodically(runCtx)
+	}()
 
 	for i := range s.tiers {
 		t := &s.tiers[i]
@@ -136,17 +204,56 @@ func (s *Server) runTier(ctx context.Context, t *config.Tier, set *ScaleSet) err
 		return fmt.Errorf("server: open session for tier %s: %w", t.Label, err)
 	}
 
-	// Closed with a context that outlives cancellation: the ordinary way here is
-	// the context being cancelled, and a session left open on GitHub's side is
-	// one a restart has to wait out.
-	defer func() {
-		if err := session.Close(context.WithoutCancel(ctx)); err != nil {
-			s.log.Warn("could not close message session", "tier", t.Label, "error", err)
-		}
-	}()
+	// The LISTENER closes the session, not this function. Closing has to happen
+	// before the escrow is released, and splitting the two across functions is
+	// what put them in the wrong order: Go runs Run's defer first, so the escrow
+	// went back while the advertisement was still live.
 
-	return NewListener(s.alloc, t.Label, session, WithLogger(s.log)).Run(ctx)
+	opts := []Option{WithLogger(s.log)}
+	if s.maxCapacity != nil {
+		opts = append(opts, WithMaxCapacity(*s.maxCapacity))
+	}
+
+	return NewListener(s.alloc, t.Label, session, opts...).Run(ctx)
 }
+
+// reapPeriodically reclaims capacity from leases whose holder stopped
+// heartbeating, until the context is done.
+//
+// It is deliberately a WARNING and not a failure: a reap that cannot run leaves
+// capacity stranded, which is bad, but stopping the control plane over it strands
+// all of the capacity rather than some.
+func (s *Server) reapPeriodically(ctx context.Context) {
+	ticker := time.NewTicker(s.reapEvery)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			n, err := s.alloc.Reap(ctx)
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+
+				s.log.Warn("could not reclaim abandoned capacity", "error", err)
+
+				continue
+			}
+
+			if n > 0 {
+				s.log.Info("reclaimed capacity from leases with no live holder", "leases", n)
+			}
+		}
+	}
+}
+
+// defaultReapInterval is how often abandoned capacity is reclaimed. Frequent
+// enough that a crashed holder does not strand capacity for long, rare enough
+// that it is not a meaningful load on the one authoritative writer.
+const defaultReapInterval = 30 * time.Second
 
 // onlyCancellation reports whether every error is the shutdown itself.
 func onlyCancellation(errs []error) bool {

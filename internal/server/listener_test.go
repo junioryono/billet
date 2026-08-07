@@ -239,7 +239,8 @@ func tier(label string) config.Tier {
 	}
 }
 
-func newAllocator(t *testing.T, limits alloc.Limits, tiers []config.Tier) *alloc.Allocator {
+// openState opens a throwaway control-plane database for one test.
+func openState(t *testing.T) *state.DB {
 	t.Helper()
 
 	db, err := state.Open(t.Context(), t.TempDir())
@@ -248,6 +249,14 @@ func newAllocator(t *testing.T, limits alloc.Limits, tiers []config.Tier) *alloc
 	}
 
 	t.Cleanup(func() { _ = db.Close() })
+
+	return db
+}
+
+func newAllocator(t *testing.T, limits alloc.Limits, tiers []config.Tier) *alloc.Allocator {
+	t.Helper()
+
+	db := openState(t)
 
 	a, err := alloc.New(db, limits, tiers)
 	if err != nil {
