@@ -168,11 +168,18 @@ func NewListener(a *alloc.Allocator, tier string, session Session, opts ...Optio
 // promise is escrow set aside for a request GitHub has been told billet will
 // run, and the moment that undertaking was made.
 //
-// The time is what makes it releasable. Every other exit from this state needs
-// GitHub to say something — an assignment, a completion, a cancellation — and a
-// promise nobody ever follows up on would otherwise be renewed by the heartbeat
-// for the life of the process. held is reusable and running would be finished by
-// a node; this is the one state with no way back on its own.
+// `at` IS DIAGNOSTIC ONLY. It drives one stale-promise warning and nothing else,
+// and this paragraph is load-bearing because the obvious reading of a timestamp
+// on a stuck resource is that it should time out. It must not: an acquisition is
+// a commitment to GitHub, AcquireJobs is one-way, and no local clock can revoke
+// it. A timed release hands nothing back — it only means billet has forgotten it
+// owes a runner, and the freed slot goes to another tier while the assignment is
+// still coming. That version was written, reviewed, and reverted; see
+// defaultStalePromise.
+//
+// A promise ends in exactly four ways, none of them local to this struct: the
+// assignment arrives, a completion or cancellation arrives, the heartbeat finds
+// the lease fenced, or the session ends and releaseAll hands it back.
 type promise struct {
 	lease *alloc.Lease
 	at    time.Time
@@ -735,17 +742,35 @@ func (l *Listener) acquire(ctx context.Context, available []Job) error {
 	// for — another scale set can win the same offer. Escrow reserved for an
 	// offer billet did not get goes back immediately; holding it would strand
 	// capacity waiting for an assignment that is never coming.
-	l.unreserve(missing(reserved, acquired))
-
-	// A response is only meaningful as a subset of the request. An id billet did
-	// not ask for cannot be reconciled — there is no reservation to match it to,
-	// so its assignment would arrive unbacked — and silently ignoring it would
-	// make a malformed response look like a clean one. The dependency is a public
-	// preview, so this is worth noticing rather than assuming.
+	// A response is only meaningful as a subset of the request, and a response
+	// that is not one is not merely noteworthy — it means billet cannot tell what
+	// it has committed to. An id nobody offered for has no reservation to match
+	// it to, and if the response body is wrong about that id it may be wrong
+	// about the others, so the reserved ids cannot be trusted either.
+	//
+	// This STOPS the listener, unlike an unbacked assignment, which declines and
+	// carries on. The difference is what each condition means. An unbacked
+	// assignment is reachable by ordinary races — the heartbeat drops a fenced
+	// lease, a restart loses a promise — so killing the control plane over one is
+	// disproportionate. A response outside its own contract is not reachable by
+	// any race; it means the API broke, and continuing means acting on state that
+	// cannot be reasoned about. Stopping is also the remedy: the session is
+	// recreated, and GitHub redelivers or reassigns whatever was unacknowledged.
 	if extra := missing(acquired, reserved); len(extra) > 0 {
-		l.log.Error("github acquired job requests billet did not offer for; ignoring them",
-			"tier", l.tier, "unrequested", extra, "requested", reserved)
+		// Everything, not just the unmatched ids. Which commitments are real is
+		// exactly what is no longer known.
+		l.unreserve(reserved)
+
+		return fmt.Errorf("server: %s acquired job requests it did not offer for "+
+			"(unrequested %v, requested %v); refusing to continue against a scale-set "+
+			"response that is not a subset of its request", l.tier, extra, reserved)
 	}
+
+	// GitHub returns what it ACTUALLY gave, which can be fewer than were asked
+	// for — another scale set can win the same offer. Escrow reserved for an
+	// offer billet did not get goes back immediately; holding it would strand
+	// capacity waiting for an assignment that is never coming.
+	l.unreserve(missing(reserved, acquired))
 
 	return nil
 }

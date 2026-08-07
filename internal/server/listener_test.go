@@ -1216,6 +1216,61 @@ func (s *syncWriter) Write(p []byte) (int, error) {
 	return s.w.Write(p)
 }
 
+// A scale-set response that is not a subset of its request stops the listener,
+// and the reserved escrow is not left where the next offer can spend it.
+//
+// Logging and carrying on was not enough. Once a response contains an id nobody
+// offered for, billet cannot tell which remote commitments are real: the
+// unmatched id has no reservation, and a body wrong about that id may be wrong
+// about the others. Continuing means spending reserved leases on later offers
+// while GitHub may believe the original jobs are billet's.
+//
+// Deliberately harsher than an unbacked assignment, which declines and carries
+// on. That one is reachable by ordinary races, so stopping the control plane
+// over it is disproportionate. This one is not reachable by any race — it means
+// the API broke — and stopping is itself the remedy, because the session is
+// recreated and GitHub redelivers whatever was unacknowledged.
+func TestAnAcquisitionOutsideItsRequestStopsTheListener(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	session := &fakeSession{}
+
+	// An id that was never offered for.
+	session.onAcquire = func([]int64) ([]int64, error) { return []int64{99}, nil }
+
+	session.onGet = func() (*Message, error) {
+		return &Message{MessageID: 1, Available: []Job{{RequestID: 11, RunID: 101}}}, nil
+	}
+
+	l := NewListener(a, tiers[0].Label, session)
+
+	err := l.Run(ctx)
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("the listener carried on after a response outside its own contract: %v", err)
+	}
+
+	if !strings.Contains(err.Error(), "did not offer for") {
+		t.Errorf("the error does not say what went wrong: %v", err)
+	}
+
+	// And the escrow went back rather than being left promised to a request whose
+	// status is unknown. Shutdown releases it either way, so this reads the ledger
+	// after Run returned.
+	usage, err := a.Usage(t.Context())
+	if err != nil {
+		t.Fatalf("Usage: %v", err)
+	}
+
+	if usage.Leases != 0 {
+		t.Errorf("%d leases still open after the listener stopped", usage.Leases)
+	}
+}
+
 // fakeSession stands in for a scale-set message session. It never returns work,
 // so the listener does nothing but escrow, advertise, and release — which is the
 // whole of what this test is about.
