@@ -209,13 +209,22 @@ re-acquire it, which is what a double-admit looks like from the inside.
 
 ### What is advertised is TOTAL escrowed capacity, and it is renewed on its own clock
 
-The listener holds the escrow in two halves — `held` (escrowed, no job yet) and `running` (escrowed
-and assigned, keyed by GitHub's request id). Both are escrowed and **both are advertised**, because
+The listener holds the escrow in three states — `held` (free), `acquiring` (promised to a request
+billet has claimed from GitHub but has not yet been given, keyed by request id), and `running`
+(assigned). All three are escrowed and **all three are advertised**, because
 `maxCapacity` is the scale set's *total* capacity, not its spare. The vendor's own listener sends a
 configured maximum that does not move as jobs are assigned. Sending only the free half shrinks the
 advertisement on every assignment, so a tier with room for two tells GitHub "1" the moment the first
-job lands and the second slot goes unused. The invariant above is untouched: every lease in either
-half came from the allocator, so the sum across listeners is still bounded by the budget.
+job lands and the second slot goes unused. The invariant above is untouched: every lease in all three
+came from the allocator, so the sum across listeners is still bounded by the budget.
+
+**`acquiring` exists because a promise is not a count.** Capping acquisitions at "how many free
+leases are there right now" is an instantaneous measure, and an acquisition is an obligation that
+lasts until the assignment arrives. Leaving the lease in `held` while the claim is in flight let one
+lease back two consecutive offers, let a lease promised to one request be consumed by the assignment
+of another, and let the heartbeat spend it out from under a claim already on the wire. Reserving it
+under the mutex *before* the network call fixes all three at once, which is the tell that they were
+one bug rather than three.
 
 **Heartbeats must not be bounded by the poll.** A long poll is nominally 50 seconds against a 90
 second TTL, which reads like ample margin and is not — the vendor's HTTP client permits a request to
@@ -242,6 +251,32 @@ The message lifecycle closes: `Available` → acquire, `Assigned` → consume es
 request id, because an unacknowledged message is redelivered), `Completed` → release. Acknowledging
 `Completed` without releasing leaves the lease open until the reaper expires it, withholding capacity
 and recording the wrong conclusion against it.
+
+### A commitment made to a remote service cannot be revoked by a local timer
+
+`acquiring` is the one escrow state with no way back on its own: every exit needs GitHub to say
+something. That reads exactly like a leak — a lease renewed forever because a message went missing —
+and the obvious fix is to age it out. **That fix was written, reviewed, and reverted, and the reason
+generalises well beyond this listener.**
+
+`AcquireJobs` is one-way. There is no decline or release endpoint on the session client, and
+`DeleteMessage` acknowledges a *notification* rather than refusing a job. So releasing the escrow on
+a timer hands nothing back to GitHub. It only means billet has forgotten it owes a runner while
+GitHub still expects one — the freed slot goes to another tier, and the assignment, when it arrives,
+has nothing behind it. A fix for a capacity leak had created a way to drop live work.
+
+The reasoning that produced it was sound and the premise was not. The question asked was *can this
+state end on its own?* The question that mattered was **are we entitled to end it unilaterally?**
+When a local record mirrors a commitment held by someone else, only they can release it; the local
+timer can report, and that is all. So a stale promise is reported and kept — it is capacity billet
+genuinely still owes — and the real remedy is to invalidate the session so GitHub itself redelivers.
+
+The same distinction decides how loudly to fail. An assignment with no escrow behind it **declines
+and carries on**, because that is reachable by ordinary races and stopping the control plane strands
+every tier's capacity over one job. A scale-set response that is not a subset of its request
+**stops the listener**, because no race can produce it: it means the API broke, billet can no longer
+tell which remote commitments are real, and stopping is itself the remedy since a fresh session makes
+GitHub redeliver. Match the blast radius to whether the condition is a race or a broken contract.
 
 ### A rule about someone else's API is pinned to measured behaviour, not to reasoning
 
