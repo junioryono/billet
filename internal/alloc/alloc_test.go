@@ -3,6 +3,7 @@ package alloc
 import (
 	"database/sql"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -21,6 +22,37 @@ func tier(label string, vcpu int, mem config.ByteSize) config.Tier {
 		Memory:   mem,
 		Image:    "ubuntu-2404-x64",
 	}
+}
+
+// headroom asserts the query succeeded before returning the number.
+//
+// `n, _ := a.Headroom(...)` reads harmlessly and is not: Headroom returns 0
+// alongside an error, so every assertion of the form `n != 0` passes when the
+// query FAILS. That is the same defect that made two Usage assertions vacuous.
+func headroom(t *testing.T, a *Allocator, tier string) int {
+	t.Helper()
+
+	n, err := a.Headroom(t.Context(), tier)
+	if err != nil {
+		t.Fatalf("Headroom(%s): %v", tier, err)
+	}
+
+	return n
+}
+
+// reserve asserts the reservation succeeded before returning the lease.
+//
+// `lease, _ := a.Reserve(...)` leaves lease nil on failure, so the test dies on
+// a nil dereference lines later, reporting a stack trace instead of the reason.
+func reserve(t *testing.T, a *Allocator, tier string) *Lease {
+	t.Helper()
+
+	lease, err := a.Reserve(t.Context(), tier)
+	if err != nil {
+		t.Fatalf("Reserve(%s): %v", tier, err)
+	}
+
+	return lease
 }
 
 func newAllocator(t *testing.T, limits Limits, tiers []config.Tier, opts ...Option) *Allocator {
@@ -48,19 +80,16 @@ func TestReserveHoldsCapacity(t *testing.T) {
 
 	ctx := t.Context()
 
-	if n, err := a.Headroom(ctx, "small"); err != nil || n != 4 {
-		t.Fatalf("Headroom = %d, %v; want 4", n, err)
+	if n := headroom(t, a, "small"); n != 4 {
+		t.Fatalf("Headroom = %d, want 4", n)
 	}
 
-	lease, err := a.Reserve(ctx, "small")
-	if err != nil {
-		t.Fatalf("Reserve: %v", err)
-	}
+	lease := reserve(t, a, "small")
 
 	// The point of escrowing: what a listener may advertise drops immediately,
 	// before any job is assigned or any VM booted.
-	if n, err := a.Headroom(ctx, "small"); err != nil || n != 3 {
-		t.Fatalf("after Reserve, Headroom = %d, %v; want 3", n, err)
+	if n := headroom(t, a, "small"); n != 3 {
+		t.Fatalf("after Reserve, Headroom = %d, want 3", n)
 	}
 
 	usage, err := a.Usage(ctx)
@@ -76,8 +105,8 @@ func TestReserveHoldsCapacity(t *testing.T) {
 		t.Fatalf("Release: %v", err)
 	}
 
-	if n, err := a.Headroom(ctx, "small"); err != nil || n != 4 {
-		t.Fatalf("after Release, Headroom = %d, %v; want 4", n, err)
+	if n := headroom(t, a, "small"); n != 4 {
+		t.Fatalf("after Release, Headroom = %d, want 4", n)
 	}
 }
 
@@ -91,8 +120,8 @@ func TestMemoryCanBindBeforeVCPU(t *testing.T) {
 
 	ctx := t.Context()
 
-	if n, err := a.Headroom(ctx, "fat"); err != nil || n != 2 {
-		t.Fatalf("Headroom = %d, %v; want 2 (memory-bound, not core-bound)", n, err)
+	if n := headroom(t, a, "fat"); n != 2 {
+		t.Fatalf("Headroom = %d, want 2 (memory-bound, not core-bound)", n)
 	}
 
 	for i := range 2 {
@@ -118,7 +147,7 @@ func TestTiersShareOneGlobalCeiling(t *testing.T) {
 
 	ctx := t.Context()
 
-	if n, _ := a.Headroom(ctx, "large"); n != 2 {
+	if n := headroom(t, a, "large"); n != 2 {
 		t.Fatalf("large Headroom = %d, want 2", n)
 	}
 
@@ -127,7 +156,7 @@ func TestTiersShareOneGlobalCeiling(t *testing.T) {
 	}
 
 	// 12 vCPU and 48GiB remain, so only one large fits.
-	if n, _ := a.Headroom(ctx, "large"); n != 1 {
+	if n := headroom(t, a, "large"); n != 1 {
 		t.Errorf("after reserving small, large Headroom = %d, want 1", n)
 	}
 }
@@ -203,7 +232,7 @@ func TestPerTierConcurrencyCap(t *testing.T) {
 
 	ctx := t.Context()
 
-	if n, _ := a.Headroom(ctx, "capped"); n != 2 {
+	if n := headroom(t, a, "capped"); n != 2 {
 		t.Fatalf("Headroom = %d, want 2 (the per-tier cap, not the machine)", n)
 	}
 
@@ -237,8 +266,8 @@ func TestMacOSLimitIsPerHostAcrossTiers(t *testing.T) {
 
 	ctx := t.Context()
 
-	if n, _ := a.Headroom(ctx, "mac-6"); n != config.MacOSVMLimit {
-		t.Fatalf("mac-6 Headroom = %d, want %d", n, config.MacOSVMLimit)
+	if n := headroom(t, a, "mac-6"); n != config.DefaultMacOSVMLimit {
+		t.Fatalf("mac-6 Headroom = %d, want %d", n, config.DefaultMacOSVMLimit)
 	}
 
 	// One guest from each tier fills the host's two slots.
@@ -250,7 +279,7 @@ func TestMacOSLimitIsPerHostAcrossTiers(t *testing.T) {
 		t.Fatalf("Reserve mac-12: %v", err)
 	}
 
-	if n, _ := a.Headroom(ctx, "mac-6"); n != 0 {
+	if n := headroom(t, a, "mac-6"); n != 0 {
 		t.Errorf("mac-6 Headroom = %d after two guests on the host, want 0", n)
 	}
 
@@ -283,8 +312,8 @@ func TestLinuxGuestsOnAMacAreNotCapped(t *testing.T) {
 	}
 
 	// Five Linux guests must not have consumed any macOS licence slot.
-	if n, _ := a.Headroom(ctx, "mac-6"); n != config.MacOSVMLimit {
-		t.Errorf("mac-6 Headroom = %d after 5 Linux guests, want %d", n, config.MacOSVMLimit)
+	if n := headroom(t, a, "mac-6"); n != config.DefaultMacOSVMLimit {
+		t.Errorf("mac-6 Headroom = %d after 5 Linux guests, want %d", n, config.DefaultMacOSVMLimit)
 	}
 }
 
@@ -295,13 +324,19 @@ func TestLifecycleTransitions(t *testing.T) {
 
 	ctx := t.Context()
 
-	lease, err := a.Reserve(ctx, "small")
-	if err != nil {
-		t.Fatalf("Reserve: %v", err)
-	}
+	lease := reserve(t, a, "small")
 
 	if err := a.Assign(ctx, lease.ID, lease.Epoch, 111, 222); err != nil {
 		t.Fatalf("Assign: %v", err)
+	}
+
+	// Binding is part of the lifecycle, not an optional extra: launching means a
+	// host is already bringing the instance up. This test previously skipped it,
+	// which is what made Bind's placement checks routable-around.
+	registerNode(t, a, "epyc-1", config.ProviderFirecracker)
+
+	if err := a.Bind(ctx, lease.ID, lease.Epoch, "epyc-1"); err != nil {
+		t.Fatalf("Bind: %v", err)
 	}
 
 	for _, next := range []Phase{PhaseLaunching, PhaseOnline, PhaseBusy} {
@@ -314,8 +349,14 @@ func TestLifecycleTransitions(t *testing.T) {
 		t.Fatalf("Release: %v", err)
 	}
 
-	// Terminal releases capacity.
-	if u, _ := a.Usage(ctx); u.Leases != 0 {
+	// Terminal releases capacity. The error is checked: a failed query returns a
+	// zero-valued Usage, which would satisfy this for the wrong reason.
+	u, err := a.Usage(ctx)
+	if err != nil {
+		t.Fatalf("Usage: %v", err)
+	}
+
+	if u.Leases != 0 {
 		t.Errorf("usage after release = %+v, want no open leases", u)
 	}
 }
@@ -329,10 +370,7 @@ func TestInvalidTransitionsAreRefused(t *testing.T) {
 
 	ctx := t.Context()
 
-	lease, err := a.Reserve(ctx, "small")
-	if err != nil {
-		t.Fatalf("Reserve: %v", err)
-	}
+	lease := reserve(t, a, "small")
 
 	// capacity -> online skips assignment and launch.
 	if err := a.Advance(ctx, lease.ID, lease.Epoch, PhaseOnline); !errors.Is(err, ErrBadTransition) {
@@ -358,7 +396,7 @@ func TestTransitionsAreIdempotent(t *testing.T) {
 
 	ctx := t.Context()
 
-	lease, _ := a.Reserve(ctx, "small")
+	lease := reserve(t, a, "small")
 
 	if err := a.Assign(ctx, lease.ID, lease.Epoch, 1, 2); err != nil {
 		t.Fatalf("Assign: %v", err)
@@ -393,10 +431,7 @@ func TestReapFencesTheOldHolder(t *testing.T) {
 
 	ctx := t.Context()
 
-	lease, err := a.Reserve(ctx, "small")
-	if err != nil {
-		t.Fatalf("Reserve: %v", err)
-	}
+	lease := reserve(t, a, "small")
 
 	// Nothing expires while the holder is heartbeating.
 	if n, err := a.Reap(ctx); err != nil || n != 0 {
@@ -415,7 +450,7 @@ func TestReapFencesTheOldHolder(t *testing.T) {
 	}
 
 	// Capacity came back.
-	if got, _ := a.Headroom(ctx, "small"); got != 4 {
+	if got := headroom(t, a, "small"); got != 4 {
 		t.Errorf("Headroom after reap = %d, want 4", got)
 	}
 
@@ -532,13 +567,10 @@ func TestBindRefusesTheWrongNode(t *testing.T) {
 
 	ctx := t.Context()
 
-	registerNode(t, a, "mac-mini-1")
-	registerNode(t, a, "mac-mini-2")
+	registerNode(t, a, "mac-mini-1", config.ProviderTart)
+	registerNode(t, a, "mac-mini-2", config.ProviderTart)
 
-	lease, err := a.Reserve(ctx, "mac-6")
-	if err != nil {
-		t.Fatalf("Reserve: %v", err)
-	}
+	lease := reserve(t, a, "mac-6")
 
 	if err := a.Bind(ctx, lease.ID, lease.Epoch, "mac-mini-2"); !errors.Is(err, ErrWrongNode) {
 		t.Errorf("bind to the wrong host = %v, want ErrWrongNode", err)
@@ -581,7 +613,7 @@ func TestMacOSAccountingSurvivesCatalogChange(t *testing.T) {
 
 	ctx := t.Context()
 
-	for range config.MacOSVMLimit {
+	for range config.DefaultMacOSVMLimit {
 		if _, err := first.Reserve(ctx, "mac-6"); err != nil {
 			t.Fatalf("Reserve: %v", err)
 		}
@@ -597,19 +629,23 @@ func TestMacOSAccountingSurvivesCatalogChange(t *testing.T) {
 		t.Fatalf("New after rename: %v", err)
 	}
 
-	if n, _ := second.Headroom(ctx, "mac-6-renamed"); n != 0 {
+	if n := headroom(t, second, "mac-6-renamed"); n != 0 {
 		t.Errorf("Headroom = %d after a rename, want 0 — in-flight guests were reclassified", n)
 	}
 }
 
 // registerNode inserts a node row so leases can satisfy the foreign key on bind.
-func registerNode(t *testing.T, a *Allocator, name string) {
+//
+// The provider is explicit because Bind compares a lease's recorded provider
+// against what the host REGISTERED: a helper that always claimed one backend
+// would make every test agree with itself by construction.
+func registerNode(t *testing.T, a *Allocator, name string, provider config.ProviderKind) {
 	t.Helper()
 
 	if err := a.db.Tx(t.Context(), func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(t.Context(),
-			`INSERT INTO nodes (name, provider, last_seen_at) VALUES (?, 'tart', ?)`,
-			name, ts(time.Now()))
+			`INSERT INTO nodes (name, provider, last_seen_at) VALUES (?, ?, ?)`,
+			name, string(provider), ts(time.Now()))
 
 		return err
 	}); err != nil {
@@ -627,7 +663,7 @@ func TestAssignRejectsAContradictoryRetry(t *testing.T) {
 
 	ctx := t.Context()
 
-	lease, _ := a.Reserve(ctx, "small")
+	lease := reserve(t, a, "small")
 
 	if err := a.Assign(ctx, lease.ID, lease.Epoch, 1, 2); err != nil {
 		t.Fatalf("Assign: %v", err)
@@ -654,7 +690,7 @@ func TestReleaseDistinguishesMissingFromFinished(t *testing.T) {
 		t.Errorf("release of an unknown id = %v, want ErrLeaseNotFound", err)
 	}
 
-	lease, _ := a.Reserve(ctx, "small")
+	lease := reserve(t, a, "small")
 
 	if err := a.Release(ctx, lease.ID, lease.Epoch, PhaseDone); err != nil {
 		t.Fatalf("Release: %v", err)
@@ -684,7 +720,7 @@ func TestReapedLeaseKeepsItsAttribution(t *testing.T) {
 
 	ctx := t.Context()
 
-	lease, _ := a.Reserve(ctx, "small")
+	lease := reserve(t, a, "small")
 
 	if err := a.Assign(ctx, lease.ID, lease.Epoch, 555, 666); err != nil {
 		t.Fatalf("Assign: %v", err)
@@ -880,7 +916,7 @@ func TestHeartbeatExtendsTheLease(t *testing.T) {
 
 	ctx := t.Context()
 
-	lease, _ := a.Reserve(ctx, "small")
+	lease := reserve(t, a, "small")
 
 	now = now.Add(20 * time.Second)
 
@@ -906,7 +942,7 @@ func TestStaleEpochIsRefused(t *testing.T) {
 
 	ctx := t.Context()
 
-	lease, _ := a.Reserve(ctx, "small")
+	lease := reserve(t, a, "small")
 
 	if err := a.Heartbeat(ctx, lease.ID, lease.Epoch+1); !errors.Is(err, ErrFenced) {
 		t.Errorf("future epoch = %v, want ErrFenced", err)
@@ -965,7 +1001,7 @@ func TestReleaseArchivesToHistory(t *testing.T) {
 
 	ctx := t.Context()
 
-	lease, _ := a.Reserve(ctx, "small")
+	lease := reserve(t, a, "small")
 
 	if err := a.Assign(ctx, lease.ID, lease.Epoch, 777, 888); err != nil {
 		t.Fatalf("Assign: %v", err)
@@ -990,5 +1026,771 @@ func TestReleaseArchivesToHistory(t *testing.T) {
 
 	if tierName != "small" || runID != 777 || conclusion != string(PhaseDone) {
 		t.Errorf("history = (%s, %d, %s), want (small, 777, done)", tierName, runID, conclusion)
+	}
+}
+
+// --- Per-host macOS limits ------------------------------------------------
+//
+// How many macOS guests a host may run is a deployment decision: an operator
+// may keep a slot free for interactive use, or run a Mac purely as an arm64
+// Linux builder. The tests above cover the default; these cover the override.
+
+func macTier(label string, vcpu int, mem config.ByteSize) config.Tier {
+	return config.Tier{
+		Label:    label,
+		Provider: config.ProviderTart,
+		GuestOS:  config.GuestMacOS,
+		Node:     "mac-mini-1",
+		VCPU:     vcpu,
+		Memory:   mem,
+		Image:    "macos-26",
+	}
+}
+
+// macPolicy is a declared host with an explicit macOS guest limit.
+func macPolicy(name string, limit int) map[string]config.NodePolicy {
+	return map[string]config.NodePolicy{
+		name: {Name: name, MacOSVMLimit: &limit},
+	}
+}
+
+func TestMacOSLimitHonoursPerHostOverride(t *testing.T) {
+	a := newAllocator(t,
+		Limits{
+			MaxVCPU: 256, MaxMemory: 512 * config.GiB,
+			Nodes: macPolicy("mac-mini-1", 1),
+		},
+		[]config.Tier{macTier("mac-6", 6, 24*config.GiB)})
+
+	ctx := t.Context()
+
+	if n := headroom(t, a, "mac-6"); n != 1 {
+		t.Fatalf("Headroom = %d, want 1 from the host's lowered limit", n)
+	}
+
+	if _, err := a.Reserve(ctx, "mac-6"); err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	if _, err := a.Reserve(ctx, "mac-6"); !errors.Is(err, ErrNoCapacity) {
+		t.Errorf("a second macOS guest was allowed on a host limited to 1: %v", err)
+	}
+}
+
+// A host set to zero schedules nothing, even though the machine has ample cores
+// and memory. config.Load rejects this pairing, but New is exported and cannot
+// prove its catalog came through that path.
+func TestMacOSLimitZeroSchedulesNoGuests(t *testing.T) {
+	a := newAllocator(t,
+		Limits{
+			MaxVCPU: 256, MaxMemory: 512 * config.GiB,
+			Nodes: macPolicy("mac-mini-1", 0),
+		},
+		[]config.Tier{macTier("mac-6", 6, 24*config.GiB)})
+
+	ctx := t.Context()
+
+	if n := headroom(t, a, "mac-6"); n != 0 {
+		t.Errorf("Headroom = %d on a host that permits no macOS guests, want 0", n)
+	}
+
+	if _, err := a.Reserve(ctx, "mac-6"); !errors.Is(err, ErrNoCapacity) {
+		t.Errorf("Reserve = %v on a zero-limit host, want ErrNoCapacity", err)
+	}
+}
+
+// Limits is a value type but carries a map of policies that themselves carry
+// slices. A caller keeping a reference could otherwise raise a host's cap, or
+// widen its allowlist, after construction — moving the rules out from under
+// leases already counted against them. Copying the map alone is not enough,
+// because the GuestOS backing arrays would still be shared.
+func TestNodePolicyIsCopiedAtConstruction(t *testing.T) {
+	raised := 1
+	limits := Limits{
+		MaxVCPU: 256, MaxMemory: 512 * config.GiB,
+		Nodes: map[string]config.NodePolicy{
+			"mac-mini-1": {
+				Name:         "mac-mini-1",
+				GuestOS:      []config.GuestOS{config.GuestMacOS},
+				MacOSVMLimit: &raised,
+			},
+		},
+	}
+
+	a := newAllocator(t, limits, []config.Tier{macTier("mac-6", 6, 24*config.GiB)})
+
+	// Mutate every reachable path: the map entry, and the slice inside it.
+	limits.Nodes["mac-mini-1"] = config.NodePolicy{Name: "mac-mini-1"}
+	raised = 5
+
+	if n := headroom(t, a, "mac-6"); n != 1 {
+		t.Errorf("Headroom = %d after the caller mutated its map, want the value captured at New (1)", n)
+	}
+}
+
+// The allowlist slice must be copied too, not just the map that holds it.
+func TestNodePolicyGuestOSSliceIsCopied(t *testing.T) {
+	allowlist := []config.GuestOS{config.GuestMacOS}
+	limits := Limits{
+		MaxVCPU: 256, MaxMemory: 512 * config.GiB,
+		Nodes: map[string]config.NodePolicy{
+			"mac-mini-1": {Name: "mac-mini-1", GuestOS: allowlist},
+		},
+	}
+
+	linux := config.Tier{
+		Label: "linux-arm", Provider: config.ProviderTart, GuestOS: config.GuestLinux,
+		VCPU: 4, Memory: 12 * config.GiB, Image: "ubuntu-2404-arm64",
+	}
+
+	a := newAllocator(t, limits, []config.Tier{linux})
+
+	// Widening the caller's slice in place must not widen the allocator's rules.
+	allowlist[0] = config.GuestLinux
+
+	ctx := t.Context()
+
+	registerNode(t, a, "mac-mini-1", config.ProviderTart)
+
+	lease := reserve(t, a, "linux-arm")
+
+	if err := a.Bind(ctx, lease.ID, lease.Epoch, "mac-mini-1"); !errors.Is(err, ErrGuestOSNotAllowed) {
+		t.Errorf("bind = %v; the caller widened the allowlist after New", err)
+	}
+}
+
+// The config guard cannot see every placement: an UNPINNED tier names no host,
+// and a node that declares no provider cannot be reasoned about at load time.
+// Bind is where the host is actually known, so it is the enforcement point —
+// without it a macOS-only Mac could be handed a Linux guest by any scheduler
+// that simply picked a node with free capacity.
+func TestBindRefusesAGuestOSTheHostDisallows(t *testing.T) {
+	linux := config.Tier{
+		Label: "linux-arm", Provider: config.ProviderTart, GuestOS: config.GuestLinux,
+		VCPU: 4, Memory: 12 * config.GiB, Image: "ubuntu-2404-arm64",
+	}
+
+	a := newAllocator(t,
+		Limits{
+			MaxVCPU: 256, MaxMemory: 512 * config.GiB,
+			Nodes: map[string]config.NodePolicy{
+				"mac-mini-1": {Name: "mac-mini-1", GuestOS: []config.GuestOS{config.GuestMacOS}},
+			},
+		},
+		[]config.Tier{linux})
+
+	ctx := t.Context()
+
+	registerNode(t, a, "mac-mini-1", config.ProviderTart)
+
+	lease := reserve(t, a, "linux-arm")
+
+	if err := a.Bind(ctx, lease.ID, lease.Epoch, "mac-mini-1"); !errors.Is(err, ErrGuestOSNotAllowed) {
+		t.Errorf("bind of a linux guest to a macos-only host = %v, want ErrGuestOSNotAllowed", err)
+	}
+}
+
+// Tightening a host's allowlist must not turn an ALREADY-COMPLETED bind's retry
+// into an error. The guest is running either way — refusing the repeat un-binds
+// nothing, it just converts a harmless no-op into a hard failure that a node
+// retrying after a transient error would read as "tear this job down".
+//
+// The policy gates NEW placements, so the idempotent repeat is answered first.
+func TestBindRetryStaysIdempotentAfterPolicyTightens(t *testing.T) {
+	linux := config.Tier{
+		Label: "linux-arm", Provider: config.ProviderTart, GuestOS: config.GuestLinux,
+		VCPU: 4, Memory: 12 * config.GiB, Image: "ubuntu-2404-arm64",
+	}
+
+	db, err := state.Open(t.Context(), t.TempDir())
+	if err != nil {
+		t.Fatalf("state.Open: %v", err)
+	}
+
+	defer db.Close()
+
+	open := Limits{MaxVCPU: 256, MaxMemory: 512 * config.GiB}
+
+	before, err := New(db, open, []config.Tier{linux})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ctx := t.Context()
+
+	registerNode(t, before, "mac-mini-1", config.ProviderTart)
+
+	lease := reserve(t, before, "linux-arm")
+
+	if err := before.Bind(ctx, lease.ID, lease.Epoch, "mac-mini-1"); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	// The operator now restricts that Mac to macOS and restarts.
+	tightened := Limits{
+		MaxVCPU: 256, MaxMemory: 512 * config.GiB,
+		Nodes: map[string]config.NodePolicy{
+			"mac-mini-1": {Name: "mac-mini-1", GuestOS: []config.GuestOS{config.GuestMacOS}},
+		},
+	}
+
+	after, err := New(db, tightened, []config.Tier{linux})
+	if err != nil {
+		t.Fatalf("New after tightening: %v", err)
+	}
+
+	if err := after.Bind(ctx, lease.ID, lease.Epoch, "mac-mini-1"); err != nil {
+		t.Errorf("retry of a completed bind = %v, want nil", err)
+	}
+}
+
+// A host with no declared policy is unconstrained, which is what an existing
+// deployment that never wrote a nodes section relies on.
+func TestBindAllowsAnUndeclaredHost(t *testing.T) {
+	linux := config.Tier{
+		Label: "linux-arm", Provider: config.ProviderTart, GuestOS: config.GuestLinux,
+		VCPU: 4, Memory: 12 * config.GiB, Image: "ubuntu-2404-arm64",
+	}
+
+	a := newAllocator(t, Limits{MaxVCPU: 256, MaxMemory: 512 * config.GiB}, []config.Tier{linux})
+
+	ctx := t.Context()
+
+	registerNode(t, a, "mac-mini-1", config.ProviderTart)
+
+	lease := reserve(t, a, "linux-arm")
+
+	if err := a.Bind(ctx, lease.ID, lease.Epoch, "mac-mini-1"); err != nil {
+		t.Errorf("bind to an undeclared host = %v, want nil", err)
+	}
+}
+
+// The guest OS is read from the lease's own column, so a catalog that changes
+// underneath an in-flight lease cannot reclassify what it is allowed to bind
+// to — the same reason target_node and macos_slot are stored rather than
+// re-derived.
+//
+// Deliberately reserves a macOS lease rather than a Linux one. 'linux' is the
+// schema's DEFAULT for the column, so a Linux lease would still read back as
+// Linux even if insertLease stopped writing guest_os at all — the test would
+// stay green with the persistence gone.
+func TestBindReadsGuestOSFromTheLeaseNotTheCatalog(t *testing.T) {
+	mac := config.Tier{
+		Label: "shared-label", Provider: config.ProviderTart, GuestOS: config.GuestMacOS,
+		Node: "mac-mini-1", VCPU: 6, Memory: 24 * config.GiB, Image: "macos-26",
+	}
+
+	db, err := state.Open(t.Context(), t.TempDir())
+	if err != nil {
+		t.Fatalf("state.Open: %v", err)
+	}
+
+	defer db.Close()
+
+	policy := map[string]config.NodePolicy{
+		"mac-mini-1": {Name: "mac-mini-1", GuestOS: []config.GuestOS{config.GuestMacOS}},
+	}
+	limits := Limits{MaxVCPU: 256, MaxMemory: 512 * config.GiB, Nodes: policy}
+
+	first, err := New(db, limits, []config.Tier{mac})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ctx := t.Context()
+
+	registerNode(t, first, "mac-mini-1", config.ProviderTart)
+
+	lease := reserve(t, first, "shared-label")
+
+	// The same label now describes a LINUX tier. The in-flight lease is still a
+	// macOS guest, and the host permits only macOS — so a bind that consulted the
+	// catalog instead of the lease would be refused.
+	repurposed := mac
+	repurposed.GuestOS = config.GuestLinux
+
+	second, err := New(db, limits, []config.Tier{repurposed})
+	if err != nil {
+		t.Fatalf("New after repurpose: %v", err)
+	}
+
+	if err := second.Bind(ctx, lease.ID, lease.Epoch, "mac-mini-1"); err != nil {
+		t.Errorf("bind = %v; the lease was reclassified by a catalog change", err)
+	}
+}
+
+// Launching means a host is already bringing the instance up. A lease that
+// reaches it unbound was placed by something that never told the allocator
+// where — which makes Bind, and every placement check inside it, optional
+// rather than an unavoidable gate.
+func TestLaunchingRequiresABoundNode(t *testing.T) {
+	a := newAllocator(t,
+		Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB},
+		[]config.Tier{tier("small", 4, 16*config.GiB)})
+
+	ctx := t.Context()
+
+	lease := reserve(t, a, "small")
+
+	if err := a.Assign(ctx, lease.ID, lease.Epoch, 111, 222); err != nil {
+		t.Fatalf("Assign: %v", err)
+	}
+
+	if err := a.Advance(ctx, lease.ID, lease.Epoch, PhaseLaunching); !errors.Is(err, ErrNotPlaced) {
+		t.Errorf("launching an unbound lease = %v, want ErrNotPlaced", err)
+	}
+}
+
+// A lease whose placement facts cannot be verified must fail closed. Tolerating
+// a blank provider would be a bypass rather than a courtesy: such a lease may
+// still be UNBOUND, so it is not old work already placed — it is unplaced work
+// whose backend nothing can check, free to bind to a host running anything.
+func TestUnverifiableLegacyLeaseFailsClosed(t *testing.T) {
+	a := newAllocator(t,
+		Limits{MaxVCPU: 64, MaxMemory: 128 * config.GiB},
+		[]config.Tier{tier("small", 4, 16*config.GiB)})
+
+	ctx := t.Context()
+
+	registerNode(t, a, "epyc-1", config.ProviderFirecracker)
+
+	lease := reserve(t, a, "small")
+
+	// Reproduce a row written before the provider column existed.
+	if err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE leases SET provider = '' WHERE id = ?`, lease.ID)
+
+		return err
+	}); err != nil {
+		t.Fatalf("blank the provider: %v", err)
+	}
+
+	if err := a.Bind(ctx, lease.ID, lease.Epoch, "epyc-1"); !errors.Is(err, ErrNotPlaceable) {
+		t.Errorf("bind of a lease with no recorded provider = %v, want ErrNotPlaceable", err)
+	}
+
+	// Failing closed is only acceptable if the lease can still be cleaned up —
+	// otherwise it holds capacity forever and the error tells the operator to do
+	// something they cannot do. Release takes only terminal phases and Reap
+	// archives directly, so neither consults the placement checks.
+	if err := a.Release(ctx, lease.ID, lease.Epoch, PhaseFailed); err != nil {
+		t.Errorf("releasing an unplaceable lease = %v, want nil; its capacity would be stranded", err)
+	}
+
+	// The error is checked: a failed query yields a zero-valued Usage, which
+	// would satisfy this assertion for entirely the wrong reason.
+	u, err := a.Usage(ctx)
+	if err != nil {
+		t.Fatalf("Usage: %v", err)
+	}
+
+	if u.Leases != 0 {
+		t.Errorf("usage after release = %+v, want no open leases", u)
+	}
+}
+
+// New must refuse a catalog whose leases could not be placed. A blank provider
+// makes them unverifiable; a NONBLANK invalid one is worse, comparing unequal to
+// every registered provider and stranding the lease at bind time.
+func TestNewRejectsUnplaceableTiers(t *testing.T) {
+	db, err := state.Open(t.Context(), t.TempDir())
+	if err != nil {
+		t.Fatalf("state.Open: %v", err)
+	}
+
+	defer db.Close()
+
+	for name, mutate := range map[string]func(*config.Tier){
+		"blank provider":   func(t *config.Tier) { t.Provider = "" },
+		"unknown provider": func(t *config.Tier) { t.Provider = config.ProviderKind("bogus") },
+		"blank guest_os":   func(t *config.Tier) { t.GuestOS = "" },
+		"unknown guest_os": func(t *config.Tier) { t.GuestOS = config.GuestOS("plan9") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			bad := tier("small", 4, 16*config.GiB)
+			mutate(&bad)
+
+			if _, err := New(db, Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB},
+				[]config.Tier{bad}); err == nil {
+				t.Errorf("New accepted a tier with %s", name)
+			}
+		})
+	}
+}
+
+// Binding is NOT launching: a lease can be bound while still in `capacity`, so a
+// policy tightened in between must not let the instance start anyway. The check
+// has to run against policy in force at the launch boundary, not be trusted from
+// whenever the bind happened.
+func TestLaunchingRevalidatesCurrentPolicy(t *testing.T) {
+	linux := config.Tier{
+		Label: "linux-arm", Provider: config.ProviderTart, GuestOS: config.GuestLinux,
+		VCPU: 4, Memory: 12 * config.GiB, Image: "ubuntu-2404-arm64",
+	}
+
+	db, err := state.Open(t.Context(), t.TempDir())
+	if err != nil {
+		t.Fatalf("state.Open: %v", err)
+	}
+
+	defer db.Close()
+
+	open := Limits{MaxVCPU: 256, MaxMemory: 512 * config.GiB}
+
+	before, err := New(db, open, []config.Tier{linux})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ctx := t.Context()
+
+	registerNode(t, before, "mac-mini-1", config.ProviderTart)
+
+	lease := reserve(t, before, "linux-arm")
+
+	// Bound while still in `capacity` — nothing is running yet.
+	if err := before.Bind(ctx, lease.ID, lease.Epoch, "mac-mini-1"); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	tightened := Limits{
+		MaxVCPU: 256, MaxMemory: 512 * config.GiB,
+		Nodes: map[string]config.NodePolicy{
+			"mac-mini-1": {Name: "mac-mini-1", GuestOS: []config.GuestOS{config.GuestMacOS}},
+		},
+	}
+
+	after, err := New(db, tightened, []config.Tier{linux})
+	if err != nil {
+		t.Fatalf("New after tightening: %v", err)
+	}
+
+	if err := after.Assign(ctx, lease.ID, lease.Epoch, 1, 2); err != nil {
+		t.Fatalf("Assign: %v", err)
+	}
+
+	if err := after.Advance(ctx, lease.ID, lease.Epoch, PhaseLaunching); !errors.Is(err, ErrGuestOSNotAllowed) {
+		t.Errorf("launching onto a now-forbidden host = %v, want ErrGuestOSNotAllowed", err)
+	}
+}
+
+// A row written by an older binary can sit in `launching` with no bound node.
+// Gating only the launching EDGE would let it walk on to online untouched.
+func TestOnlineRequiresABoundNode(t *testing.T) {
+	a := newAllocator(t,
+		Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB},
+		[]config.Tier{tier("small", 4, 16*config.GiB)})
+
+	ctx := t.Context()
+
+	lease := reserve(t, a, "small")
+
+	// Reproduce the legacy row directly: launching, never bound.
+	if err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx,
+			`UPDATE leases SET phase = 'launching', node = NULL WHERE id = ?`, lease.ID)
+
+		return err
+	}); err != nil {
+		t.Fatalf("seed legacy row: %v", err)
+	}
+
+	if err := a.Advance(ctx, lease.ID, lease.Epoch, PhaseOnline); !errors.Is(err, ErrNotPlaced) {
+		t.Errorf("online from an unbound launching row = %v, want ErrNotPlaced", err)
+	}
+}
+
+// runningPhases is spelled out rather than derived from requiresPlacement,
+// which is the production predicate these tests exist to guard. Deriving it
+// meant dropping PhaseBusy from requiresPlacement made the tests skip every
+// edge into busy and stay green — the mutation silencing its own detector.
+var runningPhases = []Phase{PhaseLaunching, PhaseOnline, PhaseBusy}
+
+// The launch gate is only unavoidable while launching is the ONLY way into the
+// running phases. Asserting that here means adding an assigned -> online edge
+// breaks this test rather than silently opening a route around the gate.
+func TestRunningPhasesAreReachableOnlyThroughLaunching(t *testing.T) {
+	running := make(map[Phase]bool, len(runningPhases))
+	for _, p := range runningPhases {
+		running[p] = true
+	}
+
+	for from, allowed := range validTransitions {
+		if running[from] {
+			continue // movement WITHIN the running phases is expected
+		}
+
+		for _, to := range allowed {
+			if running[to] && to != PhaseLaunching {
+				t.Errorf("%s -> %s enters a running phase without passing through launching", from, to)
+			}
+		}
+	}
+}
+
+// Each running phase must reject an unbound lease independently. A single test
+// covering only the launching edge would leave online and busy unguarded, which
+// is the route a legacy row or a deleted node opens.
+func TestEveryRunningPhaseRejectsAnUnboundLease(t *testing.T) {
+	for _, phase := range runningPhases {
+		t.Run(string(phase), func(t *testing.T) {
+			a := newAllocator(t,
+				Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB},
+				[]config.Tier{tier("small", 4, 16*config.GiB)})
+
+			ctx := t.Context()
+
+			lease, err := a.Reserve(ctx, "small")
+			if err != nil {
+				t.Fatalf("Reserve: %v", err)
+			}
+
+			// Seed the phase this transition would arrive from, with no node —
+			// the shape an older binary or a deleted node leaves behind.
+			from := map[Phase]string{
+				PhaseLaunching: "assigned",
+				PhaseOnline:    "launching",
+				PhaseBusy:      "online",
+			}[phase]
+
+			if err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+				_, err := tx.ExecContext(ctx,
+					`UPDATE leases SET phase = ?, node = NULL WHERE id = ?`, from, lease.ID)
+
+				return err
+			}); err != nil {
+				t.Fatalf("seed %s: %v", from, err)
+			}
+
+			if err := a.Advance(ctx, lease.ID, lease.Epoch, phase); !errors.Is(err, ErrNotPlaced) {
+				t.Errorf("entering %s unbound = %v, want ErrNotPlaced", phase, err)
+			}
+		})
+	}
+}
+
+// The recovery advice depends on the phase the lease is in NOW. From `assigned`
+// a bind is exactly what is missing and Bind accepts it; from a running phase
+// the lease is an orphan that Bind refuses to adopt, so identical advice would
+// send the operator into a second refusal. Telling both cases to release would
+// destroy work that only needed binding.
+func TestOrphanAdviceDependsOnTheCurrentPhase(t *testing.T) {
+	for name, tc := range map[string]struct {
+		seed, to Phase
+		want     string
+	}{
+		"assigned needs a bind":  {PhaseAssigned, PhaseLaunching, "bind it to a node first"},
+		"launching is an orphan": {PhaseLaunching, PhaseOnline, "release it"},
+		"online is an orphan":    {PhaseOnline, PhaseBusy, "release it"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			a := newAllocator(t,
+				Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB},
+				[]config.Tier{tier("small", 4, 16*config.GiB)})
+
+			ctx := t.Context()
+
+			lease, err := a.Reserve(ctx, "small")
+			if err != nil {
+				t.Fatalf("Reserve: %v", err)
+			}
+
+			if err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+				_, err := tx.ExecContext(ctx,
+					`UPDATE leases SET phase = ?, node = NULL WHERE id = ?`, string(tc.seed), lease.ID)
+
+				return err
+			}); err != nil {
+				t.Fatalf("seed %s: %v", tc.seed, err)
+			}
+
+			err = a.Advance(ctx, lease.ID, lease.Epoch, tc.to)
+			if !errors.Is(err, ErrNotPlaced) {
+				t.Fatalf("Advance = %v, want ErrNotPlaced", err)
+			}
+
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("advice for a %s lease = %v, want it to recommend %q", tc.seed, err, tc.want)
+			}
+		})
+	}
+}
+
+// A repeated Advance into a running phase is an AUTHORIZATION, not an
+// acknowledgement: its caller reads nil as "you may launch". Answering it
+// without checking lets a recovery loop get permission for a placement that is
+// no longer legal — or, for a pre-v7 row, was never verifiable.
+func TestSamePhaseAdvanceStillChecksPlacement(t *testing.T) {
+	a := newAllocator(t,
+		Limits{MaxVCPU: 64, MaxMemory: 128 * config.GiB},
+		[]config.Tier{tier("small", 4, 16*config.GiB)})
+
+	ctx := t.Context()
+
+	registerNode(t, a, "epyc-1", config.ProviderFirecracker)
+
+	lease := reserve(t, a, "small")
+
+	// A bound pre-v7 row already sitting in launching: no recorded provider, so
+	// its placement cannot be verified.
+	if err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx,
+			`UPDATE leases SET phase = 'launching', node = 'epyc-1', provider = '' WHERE id = ?`,
+			lease.ID)
+
+		return err
+	}); err != nil {
+		t.Fatalf("seed legacy launching row: %v", err)
+	}
+
+	if err := a.Advance(ctx, lease.ID, lease.Epoch, PhaseLaunching); !errors.Is(err, ErrNotPlaceable) {
+		t.Errorf("re-advancing an unverifiable launching lease = %v, want ErrNotPlaceable", err)
+	}
+}
+
+// Deleting a node sets leases.node to NULL, so a lease still running on it LOOKS
+// unbound while its original host keeps a valid epoch and keeps heartbeating.
+// Binding it elsewhere would make two hosts owners of one slot.
+func TestBindRefusesToAdoptAnAlreadyRunningLease(t *testing.T) {
+	a := newAllocator(t,
+		Limits{MaxVCPU: 64, MaxMemory: 128 * config.GiB},
+		[]config.Tier{tier("small", 4, 16*config.GiB)})
+
+	ctx := t.Context()
+
+	registerNode(t, a, "epyc-1", config.ProviderFirecracker)
+	registerNode(t, a, "epyc-2", config.ProviderFirecracker)
+
+	lease := reserve(t, a, "small")
+
+	// Running, then its node row is deleted: ON DELETE SET NULL blanks the column.
+	if err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx,
+			`UPDATE leases SET phase = 'online', node = NULL WHERE id = ?`, lease.ID)
+
+		return err
+	}); err != nil {
+		t.Fatalf("seed orphaned running lease: %v", err)
+	}
+
+	if err := a.Bind(ctx, lease.ID, lease.Epoch, "epyc-2"); !errors.Is(err, ErrWrongNode) {
+		t.Errorf("adopting a running lease onto a new host = %v, want ErrWrongNode", err)
+	}
+}
+
+// A Firecracker lease cannot run on a Tart host. The comparison is against the
+// provider the node REGISTERED, not one a catalog claims about it.
+func TestBindRefusesANodeRunningAnotherProvider(t *testing.T) {
+	a := newAllocator(t,
+		Limits{MaxVCPU: 64, MaxMemory: 128 * config.GiB},
+		[]config.Tier{tier("small", 4, 16*config.GiB)}) // firecracker
+
+	ctx := t.Context()
+
+	registerNode(t, a, "mac-mini-1", config.ProviderTart)
+
+	lease := reserve(t, a, "small")
+
+	if err := a.Bind(ctx, lease.ID, lease.Epoch, "mac-mini-1"); !errors.Is(err, ErrWrongProvider) {
+		t.Errorf("bind of a firecracker lease to a tart host = %v, want ErrWrongProvider", err)
+	}
+}
+
+// New defends against a catalog that did not come through config.Load, so it
+// has to check the policy's RAW fields. Checking only the effective macOS limit
+// let a negative macos_vm_limit through whenever the allowlist excluded macOS,
+// because MacOSLimit() normalizes that to zero before the guard sees it — the
+// check defeated by the normalization it was reading through.
+func TestNewRejectsMalformedNodePolicy(t *testing.T) {
+	db, err := state.Open(t.Context(), t.TempDir())
+	if err != nil {
+		t.Fatalf("state.Open: %v", err)
+	}
+
+	defer db.Close()
+
+	negative, two := -1, 2
+
+	for name, policy := range map[string]config.NodePolicy{
+		"unknown guest_os":   {Name: "n", GuestOS: []config.GuestOS{"plan9"}},
+		"duplicate guest_os": {Name: "n", GuestOS: []config.GuestOS{config.GuestLinux, config.GuestLinux}},
+		"unknown provider":   {Name: "n", Provider: config.ProviderKind("bogus")},
+		"negative limit hidden by a linux-only allowlist": {
+			Name:         "n",
+			GuestOS:      []config.GuestOS{config.GuestLinux},
+			MacOSVMLimit: &negative,
+		},
+		"macos limit contradicting the allowlist": {
+			Name:         "n",
+			GuestOS:      []config.GuestOS{config.GuestLinux},
+			MacOSVMLimit: &two,
+		},
+		"unusable name": {Name: "not a node name"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			limits := Limits{
+				MaxVCPU: 16, MaxMemory: 64 * config.GiB,
+				Nodes: map[string]config.NodePolicy{"n": policy},
+			}
+
+			if _, err := New(db, limits, []config.Tier{tier("small", 4, 16*config.GiB)}); err == nil {
+				t.Errorf("New accepted a node policy with %s", name)
+			}
+		})
+	}
+}
+
+// The map KEY is how every lookup finds a policy. A key that is not the
+// canonical node name detaches the policy from its host: Tier.Node is
+// normalized, the key is not, the lookup misses, and an explicit macos_vm_limit
+// of 0 is silently replaced by Apple's default of 2. The policy looks enforced
+// and is not.
+func TestNewRejectsPolicyKeysThatCannotBeFound(t *testing.T) {
+	db, err := state.Open(t.Context(), t.TempDir())
+	if err != nil {
+		t.Fatalf("state.Open: %v", err)
+	}
+
+	defer db.Close()
+
+	zero := 0
+
+	for name, nodes := range map[string]map[string]config.NodePolicy{
+		// Whitespace on BOTH, because that is what a config produces: one name
+		// becomes the key and the policy's Name. Caught by the name validation,
+		// not by any key-specific rule — an explicit key-canonicalization check
+		// was removed after mutation showed it could never fire.
+		"key has trailing whitespace": {
+			"mac-mini-1 ": {Name: "mac-mini-1 ", MacOSVMLimit: &zero},
+		},
+		"key disagrees with the policy name": {
+			"mac-mini-1": {Name: "mac-mini-2", MacOSVMLimit: &zero},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			limits := Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB, Nodes: nodes}
+
+			if _, err := New(db, limits, []config.Tier{tier("small", 4, 16*config.GiB)}); err == nil {
+				t.Errorf("New accepted a catalog where %s", name)
+			}
+		})
+	}
+}
+
+func TestNewRejectsNegativeMacOSLimit(t *testing.T) {
+	db, err := state.Open(t.Context(), t.TempDir())
+	if err != nil {
+		t.Fatalf("state.Open: %v", err)
+	}
+
+	defer db.Close()
+
+	limits := Limits{
+		MaxVCPU: 16, MaxMemory: 64 * config.GiB,
+		Nodes: macPolicy("mac-mini-1", -1),
+	}
+
+	if _, err := New(db, limits, nil); err == nil {
+		t.Error("New accepted a negative per-host macOS limit")
 	}
 }

@@ -389,10 +389,10 @@ var placementMigration = migration{
 		// no foreign key because it may name a host that has not registered yet,
 		// while `node` keeps its FK because binding proves the node exists.
 		//
-		// macos_slot records whether the lease consumes one of Apple's two
-		// per-host guest licences. Counting that by walking the current tier map
-		// meant renaming a tier, changing its guest_os, or restarting with a
-		// different catalog silently reclassified leases already in flight.
+		// macos_slot records whether the lease consumes one of its host's macOS
+		// guest licences. Counting that by walking the current tier map meant
+		// renaming a tier, changing its guest_os, or restarting with a different
+		// catalog silently reclassified leases already in flight.
 		`ALTER TABLE leases ADD COLUMN target_node TEXT`,
 		`ALTER TABLE leases ADD COLUMN macos_slot INTEGER NOT NULL DEFAULT 0 CHECK (macos_slot IN (0, 1))`,
 		// Reap scans by expiry; without this it is a full table scan holding the
@@ -404,7 +404,58 @@ var placementMigration = migration{
 	},
 }
 
-func init() { migrations = append(migrations, placementMigration) }
+// guestOSMigration records what a lease actually boots, for the same reason
+// placement is recorded: a host may be restricted to a subset of guest
+// operating systems, and the check happens at bind time — long after the tier
+// catalog that produced the lease may have changed underneath it.
+//
+// 'linux' is the column default because it is the overwhelming majority case
+// and a real guest OS: an empty default would match no allowlist and strand
+// every lease written before the column existed.
+var guestOSMigration = migration{
+	Version: 6,
+	Name:    "lease_guest_os",
+	Stmts: []string{
+		`ALTER TABLE leases ADD COLUMN guest_os TEXT NOT NULL DEFAULT 'linux'`,
+	},
+}
+
+// placementFactsMigration corrects migration 6's backfill and records the
+// remaining placement fact.
+//
+// Migration 6 defaulted EVERY pre-existing lease to 'linux', including macOS
+// ones. That is not a safe default in the direction its own comment claimed:
+// an unbound macOS lease relabelled Linux would be PERMITTED onto a Linux-only
+// host, even though its durable macos_slot proves what it is.
+//
+// The backfill reads macos_slot, which is authoritative only for leases written
+// after migration 5 — that migration added the column defaulting to 0 and did
+// not backfill it either, so a macOS lease predating it is indistinguishable
+// from a Linux one and this UPDATE cannot repair it. Nothing here can: the
+// information was never recorded. What protects those rows is the allocator
+// refusing to place any lease with no recorded provider, which every pre-v7
+// lease is; they fail closed rather than being guessed at.
+//
+// Corrected by appending rather than by editing migration 6: the checksum guard
+// exists precisely to stop an applied migration changing underneath a database,
+// and "nobody has run it yet" is the argument that erodes that discipline.
+//
+// provider joins target_node, macos_slot and guest_os as a placement fact
+// recorded on the row. A Firecracker lease cannot run on a Tart host, so Bind
+// has to be able to compare — and re-deriving it from the live catalog is what
+// lets a tier redefined mid-flight reclassify a lease that is already running.
+var placementFactsMigration = migration{
+	Version: 7,
+	Name:    "lease_placement_facts",
+	Stmts: []string{
+		`UPDATE leases SET guest_os = 'macos' WHERE macos_slot = 1`,
+		`ALTER TABLE leases ADD COLUMN provider TEXT NOT NULL DEFAULT ''`,
+	},
+}
+
+func init() {
+	migrations = append(migrations, placementMigration, guestOSMigration, placementFactsMigration)
+}
 
 const bootstrapSchemaMigrations = `CREATE TABLE IF NOT EXISTS schema_migrations (
 	version    INTEGER PRIMARY KEY,

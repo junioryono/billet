@@ -65,6 +65,7 @@ internal/node/       node runtime: provider driver, capacity reporting, mTLS    
 internal/provider/   firecracker | tart | ec2 | docker                            (P1+)
 internal/store/      zfs | ebs | apfs — CoW clone, generations, atomic publish   (P3)
 internal/cachev2/    GitHub Actions Cache v2 Twirp + conformance suite           (P4)
+docs/                reference-hardware.md — the bare-metal host billet is measured against
 ```
 
 Layering is enforced by `depguard` in `.golangci.yml`, not by convention: `provider` and `store` are
@@ -110,19 +111,76 @@ artifacts or hold deployment secrets must not enable it. A mistake here does not
 breaks a deploy.
 
 The protocol is reverse-engineered — GitHub has never published the `.proto` files — so the cache
-must **fail open to a miss** on any error, never fail a job, and a conformance suite runs the real
-`actions/cache`, `upload-artifact` and `download-artifact` against live GitHub to catch drift.
+must **fail open to a miss** on any error, never fail a job, and a conformance suite must run the real
+`actions/cache`, `upload-artifact` and `download-artifact` against live GitHub to catch drift. Both
+are requirements on the cache when it is built (P4); neither exists yet, and nor does the cache.
 
-### Apple's 2-VM limit is enforced against `guest_os`, never a label
+### The macOS guest limit is enforced against `guest_os`, never a label
 
-Apple's licence permits at most two macOS guests per Apple-branded host. Keying that off a label
-matching `macos` means a tier named `sonoma-arm64` escapes it entirely, and a Linux tier named
-`builds-macos-artifacts` gets capped for no reason. `Tier.GuestOS` is the explicit field, macOS
-tiers must pin a `node`, and per-node totals are summed at load. Warm instances count.
+Keying the limit off a label matching `macos` means a tier named `sonoma-arm64` escapes it entirely,
+and a Linux tier named `builds-macos-artifacts` gets capped for no reason. `Tier.GuestOS` is the
+explicit field, macOS tiers must pin a `node`, and per-node totals are summed at load. Warm
+instances count.
 
-The config check is a **guard, not the enforcement point**: the allocator must hold a single
-host-wide count of running plus warm macOS guests at runtime, because two individually-valid tiers
-still share one physical Mac.
+The config check is a **guard, not the enforcement point**: the allocator holds a single host-wide
+count of running plus warm macOS guests at runtime, because two individually-valid tiers still share
+one physical Mac. Both read the effective limit from the same `NodePolicy`, so there is one number
+rather than two that drift.
+
+**The limit is per host and configurable; `DefaultMacOSVMLimit` is a default, not a ceiling.** Apple's
+standard licence permits two macOS guests per Apple-branded host, which is what a config that says
+nothing gets. But what a host may run is a deployment decision, not a fact about the hardware — an
+Apple Silicon machine can serve macOS guests, Linux arm64 guests, or both — so `nodes:` carries a
+per-host `guest_os` allowlist and `macos_vm_limit`. Raising the limit is permitted because billet
+cannot know what licence or hardware agreement an operator has; it is an assertion about their
+licence, which is why the diagnostic names Apple only when the limit came from the default.
+
+Two rules keep that from becoming a footgun. A tier pinned to a host that does not permit its guest
+OS is a load-time error rather than a job that queues forever with nothing saying why. And
+`macos_vm_limit > 0` together with a `guest_os` allowlist excluding macOS is rejected instead of
+silently resolving — a config that reads as "two macOS guests" must not schedule none.
+
+**Placement is checked where the host is known, and again at the launch boundary.** Config
+validation cannot see every placement: an *unpinned* tier names no host, so nothing ties it to the
+allowlist, and a scheduler that simply picked a node with free capacity would put a Linux guest on a
+macOS-only Mac. `Bind` is the first point at which the host is known. The load-time guard covers what
+it can prove — a pinned tier, or an unpinned one against a host declaring the *same provider*, since
+a Firecracker tier can never land on a Tart host and comparing guest OS alone would make one
+macOS-only Mac an error for every x64 Linux tier in the deployment.
+
+`Bind` alone is not enough, for two reasons that each looked fine in isolation:
+
+- **Nothing required it.** `assigned → launching` succeeded on an unbound lease, so a caller could
+  pick a host outside the allocator and every check inside `Bind` would never run. Every phase that
+  presumes a running host — `launching`, `online`, `busy` — now requires a bound node. Gating only
+  the `launching` edge is not sufficient either: a row left in `launching` by an older binary would
+  walk on to `online` untouched.
+- **Binding is not launching.** A lease can be bound while still in `capacity`, so a policy tightened
+  in between would let the instance start on a host that no longer permits it. Placement is
+  re-checked on entry to those phases against policy in force *then*, making the guarantee "legal
+  now" rather than "was legal once". Only a repeated `Bind` is grandfathered, because it changes
+  nothing.
+
+**A lease whose placement facts are unverifiable fails closed.** A row predating the `provider`
+column records `""`, and tolerating that would be a bypass rather than a compatibility courtesy —
+such a lease may still be *unbound*, so it is not old work already placed but unplaced work whose
+backend nothing can check. `Reap` and `Release` deliberately do not consult these checks, so a lease
+refused this way can always be cleaned up; failing closed on something unrecoverable would just
+strand capacity.
+
+That rule is also what protects rows that no migration can classify. `macos_slot` only became
+truthful at migration 5, which added it defaulting to `0` without a backfill, so a macOS lease older
+than that is indistinguishable from a Linux one. Migration 7 repairs what it can and the rest are
+refused rather than guessed at.
+
+The lease's `guest_os` is recorded at reserve time for the same reason as `target_node` and
+`macos_slot`: a tier redefined underneath an in-flight lease must not reclassify what that lease is
+allowed to bind to.
+
+**`NodePolicy` is deep-copied when the allocator is built.** `GuestOS` is a slice and
+`MacOSVMLimit` is a pointer, so copying the map alone still shares both — letting a caller widen an
+allowlist or raise a cap after construction, moving a licence limit out from under leases already
+counted against it. `NodePolicy.Clone` owns that, so there is one place to get it right.
 
 ### Capacity is escrowed BEFORE a listener advertises
 
@@ -148,6 +206,185 @@ memory, macOS licence slots, disk — never one integer.
 The state machine is written down in `validTransitions` rather than implied by scattered UPDATEs, and
 terminal phases have no successors: a lease that released its capacity must never move backwards and
 re-acquire it, which is what a double-admit looks like from the inside.
+
+### A credential GitHub issued once is never deleted, and never rendered
+
+GitHub returns the App private key **exactly once**, from the manifest conversion. There is no
+re-issue. Every rule here exists because a review found a way to lose or leak it, and several were
+introduced by the fix for the previous one.
+
+**The reservation never occupies the destination.** This is the shape everything else rests on, and it
+took four rounds to reach. While the reservation *was* the key path, installing meant unlinking that
+path first — and a pathname unlink cannot be made safe by any check preceding it, because the check is
+never atomic with it. Every guard tried (`os.SameFile`, then "and it is still empty") still had an
+ordering where another run's key was deleted on the way to installing this one.
+
+Reserving a sibling file removes the unlink entirely, and collapses two files into one: the reservation
+*is* the staging file. The destination is created exactly once, by an `os.Link` that **fails rather
+than replaces**. There is no rename fallback — `os.Rename` has no no-clobber form in Go, so on a
+filesystem that cannot hard-link billet reports the staged key and the operator moves it by hand.
+
+**Nothing is deleted by pathname unless it is known not to be a key.**
+
+- The **reservation cleanup is gone.** An aborted run leaves its staging file, and `reserveKeyFile`
+  prints the exact `rm` after inspecting whether it is a leftover or a credential.
+- The **staging file is removed only after a successful install** — `os.Link` leaves two names for one
+  private key, so that removal is mandatory — and only after `os.SameFile` confirms the name still
+  refers to this run's file, with the directory synced afterwards so a crash cannot resurrect the entry.
+  A failure to remove it is reported, never swallowed: an unmentioned second copy of an App key is what
+  nobody finds until it matters. **The `SameFile` check narrows this race; it does not close it.** Go
+  unlinks by name, the check cannot be atomic with it, and a file swapped in between the two would be
+  deleted. That residual is accepted and stated rather than claimed away.
+- **"Could not tell" is never "no key here."** `inspectKey` returns present / absent / unverifiable, and
+  only *absent* permits a deletion or a "your credential is gone" message. A stat that FAILS is not a
+  mismatch either, so identity answers matches / differs / unknown and path lookups answer present /
+  absent / unknown. **Three-valued types get collapsed back at the call site if you let them** — a
+  `!= identityMatches` undid one of these a line after it was introduced, and a `fileExists` that
+  returned false on EACCES made billet recommend `mv` onto an occupied destination. Callers use `inspectKey`
+  directly — the boolean wrappers over both were deleted, because every one of them collapsed the third state at
+  exactly the call site that needed it. Note that unlink permission comes from the DIRECTORY, so an
+  operator can act on a bad `rm` suggestion for a file billet could not itself read.
+- **The staging name is re-inspected after `O_EXCL` fails.** The answer from before the attempt is
+  stale by then: a concurrent run's empty reservation can have become a complete key in between, and
+  printing "it holds no usable key" beside an exact `rm` handed the operator a command that destroys it.
+- **"Not a valid key" is not "safe to clobber."** Whether to recommend `mv` asks `lookupPath`, not
+  `inspectKey` — a PEM with trailing junk, a format this build cannot parse, or a file a live writer
+  has not finished are all worth keeping, and `mv` replaces. Every `mv` suggestion in this file checks
+  the destination first, because the operator is following *billet's* advice.
+
+**A pathname is only spoken about once it is tied to a descriptor.** `inspectKey(name)` answers "is
+there a usable key at that name", which is NOT "this run's key is there" — conflating them let a
+replaced recovery file be reported as this App's key while the real one sat at a moved path nobody was
+told about. Identity is established first, everywhere, and an unknown identity yields uncertainty
+rather than either claim.
+
+**A credential is never declared lost while its bytes are still in memory.** `os.Link` takes a NAME
+while the run owns a DESCRIPTOR, so the staging name is verified against the descriptor before the link
+and the destination is verified after it — the second catches the window the first cannot. But what
+follows a failed check is **not** "your key is gone": `writeKeyAtomically` still holds the complete PEM
+at every one of those points, so it writes the key to a fresh `O_EXCL` file and reports where it
+landed — verified against the descriptor and directory-synced before that promise is made. An earlier
+version reasoned that an unlinked inode cannot be given a name again: true, and irrelevant, because the
+bytes never depended on that inode. Declaring a credential unrecoverable while it sits in a live
+variable is the worst mistake available here, because the advice that follows is "delete the App".
+
+The same reasoning applies one level down, and the first version missed it there: a recovery write that
+REPORTS an error may still have left a usable key, so the file is inspected rather than assumed empty.
+**Loss is what remains after looking, never what is inferred from a return value.** A recovery that
+fails also says only what it knows — this directory could not hold it, which is not proof that none
+could.
+
+**`billet check` proves the key WORKS**, not that it exists — regular file, no group/other permission
+bits, bounded read, and actually parsed, all from one descriptor opened `O_NONBLOCK` so a FIFO cannot
+hang it. `os.Stat` alone accepted a directory, an empty file, a truncated PEM and mode 0644.
+
+**The one-time code is removed STRUCTURALLY, and from every error in the chain.** It is still live
+when the exchange fails, and it reaches a terminal through `*url.Error`, which embeds the whole URL.
+Two rules, learned separately:
+
+- **Sanitize where the error is created, not at the boundary.** Every wrapper renders the message of
+  the error beneath it, so cleaning the innermost one means no wrapper can carry the code and no later
+  stage has to recognise the encoding it arrived in. A `*url.Error` is *rebuilt* with a fixed path
+  rather than pattern-matched — double-encoding and over-encoding both defeat matching.
+- **Redaction has to hold for the whole chain, including nodes with no structure.** Sanitizing
+  `Error()` while `Unwrap` returned the original meant `errors.As(err, &urlErr)` handed back the live
+  URL, and any reporter that walks causes serialized it. The walk handles `errors.Join` trees
+  (`errors.Unwrap` returns nil for one, so a chain-only walk stops dead at the join), cuts cycles, and
+  keeps a depth backstop. Identity is preserved wherever it can be, because `errors.Is` against
+  `context.DeadlineExceeded` depends on it — but **not** at a node whose own text carries the secret.
+  An opaque leaf that built its message from the request URL has nothing to rebuild, so it is replaced;
+  safety beats identity there. **Clean every field**, not just the obvious one: `url.Error` has three,
+  and copying `Op` verbatim let a transport put the endpoint straight through the one path that is
+  supposed to be structurally safe.
+- **Never compare two `error` values with `==`.** It panics when the dynamic type is not comparable —
+  an error struct holding a slice is ordinary — so both the cycle guard and the did-this-change check
+  go through `sameError`, which compares pointer identity where identity exists and answers "different"
+  otherwise. That direction is the safe one: it rebuilds a node that did not need it, rather than
+  crashing mid-onboarding and losing the key. A test written for the *first* instance is what found the
+  second.
+- **Match the endpoint, not just the code.** A caller-supplied `RoundTripper` composes its own text.
+  The endpoint string is an exact literal billet constructed, so matching it needs none of the encoding
+  guesswork that matching the bare code does. Renderings are captured once per node and reused, rather
+  than calling `Error()` again to test and again to substitute. This narrows the stateful-error hole
+  without closing it — a parent's `Error()` inherently invokes its children's — and billet supplies the
+  transport, so a deliberately non-deterministic error is not in the threat model.
+
+**Nothing derived from the conversion response body is ever rendered.** This is the one endpoint in
+GitHub's API whose success carries a private key, so an intermediary forwarding that body under a
+rewritten status would otherwise put the key on the terminal. Filtering the body does not work — a
+secret out of its field is an opaque string, and `{"message":"whsec-…"}` carries no marker to catch.
+The status is mapped to text billet writes itself. False positives cost GitHub's explanation; false
+negatives cost the credential, and that asymmetry decides it. Other endpoints keep `apiError`.
+
+**A code that does not redeem is discarded, not fatal.** The unguessable callback path is handed to
+`open`/`xdg-open` as a command-line argument, and argv is readable by other local processes — so both
+the path and the `state` must be assumed known, and only what a caller can *do* with them is bounded.
+Treating the first code to arrive as final was a kill switch: inject a worthless one, and onboarding
+ended with the App created and its key unrecoverable.
+
+**Only a status that ESTABLISHES the code is unusable may discard it**, which is a much shorter list
+than it looks: **404**, and nothing else. Four versions shipped before that. `{404, 422}` left the kill switch open
+for an injected code drawing a 414. "Every 4xx" swallowed **429** — a rate limit says nothing about
+the code, so a *valid* code was discarded while the App stayed created. And 422 is the subtle one:
+GitHub documents it as *"Validation failed, **or the endpoint has been spammed**"*, so an attacker
+feeding forged codes can trip abuse protection and make the honest code's 422 look like a rejection.
+400 is not code-specific either — a proxy returns it for header and policy reasons.
+
+**Everything that is not a definitive rejection is ambiguous**, and ambiguous codes are **retried
+round-robin** — never one at a time. An enumerated ambiguous list left every unlisted status falling
+through as fatal, which is how removing 414 from the rejection set preserved the exact failure it was
+removed to fix. And retrying a single code in a blocking loop reopened the kill switch in slow motion:
+an injected code that always draws 422 monopolised the exchange while the honest redirect sat in the
+queue until the window closed. A bounded number of exchanges happen per round, unreached codes rotate to the
+front of the next one, a new callback interrupts the backoff, and only a 404 drops a code. Making it *fatal* was still credential loss with
+extra steps — the code lives in a local variable and the loopback listener dies with the flow, so
+"run the command again" builds a SECOND App rather than recovering the first one's key. Nothing is
+discarded on a response that never said the code was bad. A forged code is a random string, so GitHub
+answers 404, and the case that actually needed handling is the one that is unambiguous.
+
+The callback queue is deep, and a callback that does **not** fit is refused rather than dropped — a
+silent drop plus an "App created" page meant the honest redirect could be discarded while its browser
+was told it had worked. What remains is a local process being able to *delay* onboarding up to
+`ManifestTTL` — not fixable while argv is readable. **No cap on which codes are kept can be correct, and three attempts established that.** Unbounded let
+an attacker accumulate work; bounding admission discarded an honest redirect the handler had already
+answered "App created"; bounding retention discarded it one ambiguous response later. billet cannot
+distinguish an injected code from an honest one — only GitHub can, and only a 404 is it saying so — so
+the bound is on **work per round**, and codes not reached rotate to the front of the next round.
+Nothing is ever discarded. A transport failure on one code is remembered rather than returned, because
+returning closes the listener with an acknowledged code unredeemed.
+
+### The residual: argv, and why billet stops here
+
+Everything in the paragraph above exists because of one fact: **the callback URL is passed to
+`open`/`xdg-open` as a command-line argument, and argv is readable by other local processes** (via
+`/proc` on Linux, `ps` generally). That is how a local process learns the unguessable path, reads the
+`state` from the start page, and injects callbacks at all.
+
+This is **documented and accepted, not fixed.** What an attacker with that access can do is bounded:
+
+- **They cannot obtain the key.** The conversion response never passes through anything they control,
+  and the code is redacted from every error.
+- **They cannot destroy it.** Every path above either installs the key, preserves it somewhere named,
+  or says honestly that it could not tell — and nothing is deleted that this run did not create.
+- **They can delay onboarding**, up to `ManifestTTL`, by injecting codes that stay ambiguous.
+
+The structural fix is to keep the URL out of argv — write it to a 0600 file with a meta-refresh and
+open that, so the path is protected exactly as the key file is. It is not done because it trades a
+real risk on the primary happy path (not every browser follows `file://` → `http://`) against a threat
+that only exists on a multi-user host. **If billet ever targets shared CI hosts as a first-class case,
+do that first** — it collapses this entire class rather than scheduling around it.
+
+Four review rounds went into scheduling around this before anyone noticed it was downstream of argv.
+That is the lesson worth keeping: when fixes keep producing adjacent bugs, look for the premise they
+all share.
+
+**`App` is redacted on every rendering path billet can reach.** `String`/`GoString` on a **value**
+receiver (a pointer receiver is not consulted when a value is formatted), `Format` so no verb falls
+back to the raw fields — `%d` printed the key before it existed — and `MarshalJSON` plus `LogValue`,
+because billet standardizes on `log/slog` and its JSON handler ignores `fmt` entirely. Only marshaling
+is redirected; decoding GitHub's response still populates every field. Not absolute, and the gaps are
+known: an `App` reached through an unexported field of another struct, and any serializer that is
+neither `fmt` nor `encoding/json` nor `slog` — reflection-based dumpers read the fields directly.
 
 ### Never guess at a byte size
 

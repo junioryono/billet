@@ -6,12 +6,75 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"net"
 	"net/http"
 	"net/url"
 	"time"
+)
+
+// ErrCredentialPreserved marks a failure in which the App's private key was NOT
+// lost: it exists on disk, and the error that carries this sentinel says where.
+//
+// It exists because the correct recovery advice is the opposite in the two
+// cases. A key that was never stored means the App is unusable and should be
+// deleted on GitHub; a key that was stored somewhere unexpected means the App
+// must be KEPT and the file moved into place. Onboarding cannot tell the two
+// apart from the error text, and the wrong instruction destroys a credential
+// GitHub will not re-issue.
+//
+// Callers that persist the credential wrap their errors with this whenever the
+// key reached durable storage.
+var ErrCredentialPreserved = errors.New("the App key was preserved")
+
+// ErrCredentialUncertain marks a failure where billet could not determine
+// whether the key survived — an inspection that itself failed, rather than one
+// that found nothing.
+//
+// It suppresses the same destructive advice ErrCredentialPreserved does, and
+// promises less. Reporting an unverifiable file as preserved would send the
+// operator to a path that may be empty; reporting it as lost would have them
+// delete an App whose key may be sitting right there. Neither is honest, so
+// there are three outcomes rather than two.
+var ErrCredentialUncertain = errors.New("billet could not verify whether the App key was saved")
+
+// codeQueueDepth is how many pending registration callbacks the loopback
+// listener will hold.
+//
+// GitHub sends exactly one. The depth exists for the injected ones: with a
+// single slot, a local process could keep the queue full across an in-flight
+// exchange and the honest redirect would be dropped on arrival.
+const codeQueueDepth = 32
+
+// maxAttemptsPerRound bounds the WORK a round does, not how many codes are kept.
+//
+// Nothing is ever discarded — codes not reached rotate to the front of the next
+// round. That is the only safe shape: billet cannot distinguish an injected code
+// from an honest one, so any cap on how many are RETAINED eventually throws away
+// a credential, which is what both previous versions did.
+const maxAttemptsPerRound = 8
+
+// maxSeenCodes bounds the deduplication set. Deduplication is an optimisation —
+// it stops one injected code being retried repeatedly — so running out of room
+// for it costs work, never a code.
+const maxSeenCodes = 1024
+
+// maxManifestCodeLen bounds what the callback will accept as a manifest code.
+// GitHub's are short; this is generous enough to survive a format change and
+// small enough that no request built from one can draw a 414.
+const maxManifestCodeLen = 512
+
+// Backoff for retrying an ambiguous exchange. Short at first because the common
+// ambiguous cause is a transient rate limit that clears in seconds, capped so a
+// long window is not spent asleep.
+// Variables rather than constants ONLY so tests can shorten them. The retry loop
+// is the most behaviour-dense part of onboarding, and a suite that takes minutes
+// to exercise it is a suite people stop running.
+var (
+	initialExchangeBackoff = 2 * time.Second
+	maxExchangeBackoff     = 30 * time.Second
 )
 
 // Onboarding result. Credentials live here only long enough to be written to
@@ -109,12 +172,36 @@ func Onboard(ctx context.Context, opts OnboardOptions) (*Onboarding, error) {
 	}
 	defer listener.Close()
 
-	base := "http://" + listener.Addr().String()
-
 	state, err := randomState()
 	if err != nil {
 		return nil, err
 	}
+
+	// Every route sits under an unguessable prefix.
+	//
+	// The start page carries the state in its form, and it was served from "/"
+	// on loopback — so any local process could fetch it, learn the state, and
+	// then present a valid-looking callback with a bogus code. Refusing invalid
+	// callbacks does not help there: the state IS valid, billet accepts the code,
+	// the exchange fails, and the flow dies with GitHub's App already created.
+	//
+	// A 256-bit path is the same secret the state is, applied one step earlier.
+	//
+	// Its guarantee is narrower than it looks, and worth stating exactly: it
+	// defeats a process that must GUESS the path — port scanning, or walking
+	// loopback for a known route. It does NOT defeat a process that can observe
+	// this one, and on a shared host that is not a high bar: the URL is handed to
+	// `open`/`xdg-open` as a command-line argument, and argv is readable through
+	// /proc or ps. So the path and the state are both treated as knowable, and
+	// what a caller can DO with them is bounded separately — a forged callback
+	// cannot end the flow (handleCallback) and an injected code cannot either
+	// (register).
+	secretPath, err := randomState()
+	if err != nil {
+		return nil, err
+	}
+
+	base := "http://" + listener.Addr().String() + "/" + secretPath
 
 	tcpAddr, ok := listener.Addr().(*net.TCPAddr)
 	if !ok {
@@ -122,11 +209,17 @@ func Onboard(ctx context.Context, opts OnboardOptions) (*Onboarding, error) {
 	}
 
 	flow := &onboardFlow{
-		opts:     opts,
-		state:    state,
-		base:     base,
-		port:     tcpAddr.Port,
-		codeCh:   make(chan string, 1),
+		opts:   opts,
+		state:  state,
+		base:   base,
+		prefix: secretPath,
+		port:   tcpAddr.Port,
+		// Deep enough that a legitimate redirect is never turned away while an
+		// exchange is in flight. It does not stop a local process from filling it
+		// — nothing can, since argv hands out the path — but the flow now
+		// survives that as a delay bounded by ManifestTTL rather than as a lost
+		// credential.
+		codeCh:   make(chan string, codeQueueDepth),
 		installC: make(chan struct{}, 1),
 		errCh:    make(chan error, 1),
 	}
@@ -159,13 +252,22 @@ func Onboard(ctx context.Context, opts OnboardOptions) (*Onboarding, error) {
 		return nil, err
 	}
 
+	// The key is on disk and the installation is resolved, so nothing downstream
+	// needs a credential. Blanking them here means a caller that logs the result
+	// — the obvious thing to do with a returned struct — cannot leak one.
+	app.Forget()
+
 	return &Onboarding{App: app, Installation: inst}, nil
 }
 
 type onboardFlow struct {
-	opts     OnboardOptions
-	state    string
-	base     string
+	opts  OnboardOptions
+	state string
+	// base already includes the unguessable path prefix, so every URL derived
+	// from it inherits the guard.
+	base string
+	// prefix is that path alone, for registering routes on the mux.
+	prefix   string
 	port     int
 	codeCh   chan string
 	installC chan struct{}
@@ -176,9 +278,13 @@ type onboardFlow struct {
 
 func (f *onboardFlow) routes() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", f.handleStart)
-	mux.HandleFunc("/callback", f.handleCallback)
-	mux.HandleFunc("/installed", f.handleInstalled)
+
+	// Nothing is registered at "/", so a process that has not guessed the prefix
+	// gets 404 from every path — including the start page that carries the state.
+	root := "/" + f.prefix
+	mux.HandleFunc(root+"/", f.handleStart)
+	mux.HandleFunc(root+"/callback", f.handleCallback)
+	mux.HandleFunc(root+"/installed", f.handleInstalled)
 
 	return mux
 }
@@ -199,29 +305,255 @@ func (f *onboardFlow) register(ctx context.Context) (*App, error) {
 	f.opts.Log("")
 	f.openOrPrint(ctx, startURL)
 
-	var code string
+	// A code that does not redeem is DISCARDED, and the flow keeps waiting.
+	//
+	// The state stops a process that has to guess it, but billet passes the
+	// callback URL to `open`/`xdg-open` as a command-line argument, and argv is
+	// readable by other processes on this machine — so both the path and the
+	// state have to be assumed known. Treating the first code to arrive as final
+	// then handed any local process a kill switch: inject a worthless code, watch
+	// the exchange fail, and onboarding ends with GitHub's App already created
+	// and its one-time private key unrecoverable.
+	//
+	// Only a 404 DROPS a code. Everything else — every other status, and a
+	// request that could not be completed at all — keeps it and tries again.
+	//
+	// Codes are tried ROUND-ROBIN, and a code that stays ambiguous never blocks
+	// another one.
+	//
+	// Retrying a single code inside a blocking loop reopened the kill switch in
+	// slow motion: a local process submits a malformed code that consistently
+	// draws 422, the retry loop sits on it, and the honest redirect waits in the
+	// queue until GitHub's window closes with the App created and its key
+	// unrecoverable. Nothing is discarded and nothing is allowed to monopolise.
+	pending := make([]string, 0, 1)
+	seen := make(map[string]bool)
+	backoff := initialExchangeBackoff
 
-	select {
-	case code = <-f.codeCh:
-	case err := <-f.errCh:
-		return nil, err
-	case <-ctx.Done():
-		return nil, fmt.Errorf("github: timed out waiting for app registration: %w", ctx.Err())
+	var lastRejection error
+
+	for {
+		// Take everything queued before spending time on any of it, so a code that
+		// arrived during the last round is tried in this one.
+		//
+		// Every drained code is admitted. The bound applies to RETRIES, further
+		// down, and that distinction is the whole correctness of this loop.
+		//
+		// Bounding admission instead was strictly worse than not bounding it at
+		// all: eight injected codes that stay ambiguous fill the set permanently,
+		// and the honest redirect — already answered "App created" by the HTTP
+		// handler — is then dropped before it is ever tried. The unbounded version
+		// at least got to it eventually. A callback that was acknowledged must get
+		// at least one exchange attempt.
+		pending = addCodes(pending, seen, f.drainCodes())
+
+		if len(pending) == 0 {
+			select {
+			case code := <-f.codeCh:
+				pending = addCodes(pending, seen, []string{code})
+			case err := <-f.errCh:
+				return nil, err
+			case <-ctx.Done():
+				return nil, f.registrationTimeout(ctx, lastRejection)
+			}
+
+			continue
+		}
+
+		f.opts.Log("Exchanging %d registration(s) for credentials...", len(pending))
+
+		// At most maxAttemptsPerRound exchanges happen per round, and the codes not
+		// reached ROTATE to the front of the next one. Nothing is discarded.
+		//
+		// Both earlier versions dropped a code, and dropping is the one thing this
+		// loop must never do: bounding admission discarded an honest redirect the
+		// handler had already answered "App created", and bounding retention
+		// discarded it one ambiguous response later. There is no cap that is safe,
+		// because billet cannot tell an injected code from an honest one — only
+		// GitHub can, and only 404 is it saying so. So the bound is on WORK per
+		// round, which delays an attack without ever throwing away a credential.
+		attempts := 0
+
+		var keep []string
+
+		for i, code := range pending {
+			if attempts >= maxAttemptsPerRound {
+				// Everything not reached goes to the FRONT next time, so a long
+				// queue cannot starve its tail.
+				keep = append(pending[i:], keep...)
+
+				break
+			}
+
+			attempts++
+
+			app, err := convertManifestAt(ctx, f.opts.Client, f.opts.api(), code)
+			if err == nil {
+				return f.persist(app)
+			}
+
+			switch {
+			case errors.Is(err, errCodeRejected):
+				// GitHub says this specific code is not one it issued. Dropping it
+				// is the only case where dropping is safe.
+				lastRejection = err
+
+				f.opts.Log("GitHub did not recognise one of the registrations (%v).", err)
+			case errors.Is(err, errCodeAmbiguous):
+				// Nothing was established about the code, so it is kept and tried
+				// again next round.
+				lastRejection = err
+				keep = append(keep, code)
+			default:
+				// A request that could not be completed at all is AMBIGUOUS too,
+				// and reaching that conclusion took an invariant test rather than
+				// a review. The old reasoning — "no answer to interpret, and no
+				// second redirect coming to fix it" — is wrong twice over: a
+				// transport can recover, and the honest redirect may simply not
+				// have arrived yet. GitHub created the App when the browser POSTed
+				// the manifest, so the code is a receipt for something that already
+				// exists, and abandoning it orphans that App.
+				//
+				// Deferring it was not enough either: the deferral only helped when
+				// something else was already queued. The code has to be KEPT.
+				lastRejection = err
+				keep = append(keep, code)
+
+				f.opts.Log("A registration could not be exchanged (%v). Keeping it and retrying.", err)
+			}
+		}
+
+		// Drained BEFORE the fatal check, not after. A callback can be accepted
+		// while this round's requests are in flight, and returning without looking
+		// closes the listener on a code the handler already answered "App
+		// created" — which is the same abandonment this fatal-deferral exists to
+		// prevent, one step further out.
+		pending = addCodes(keep, seen, f.drainCodes())
+
+		if len(pending) == 0 {
+			continue
+		}
+
+		f.opts.Log("No registration resolved yet, and none was rejected outright. Retrying in %s.", backoff)
+
+		// An explicit timer, stopped on every path: time.After leaks its timer
+		// until it fires, and this loop can run for the whole manifest window.
+		timer := time.NewTimer(backoff)
+
+		select {
+		case <-timer.C:
+		case code := <-f.codeCh:
+			// A new callback beats the backoff — it may be the honest one, and it
+			// should not wait behind an injected code's retry schedule.
+			timer.Stop()
+
+			pending = addCodes(pending, seen, []string{code})
+		case <-ctx.Done():
+			timer.Stop()
+
+			return nil, f.registrationTimeout(ctx, lastRejection)
+		}
+
+		if backoff < maxExchangeBackoff {
+			backoff = min(backoff*2, maxExchangeBackoff)
+		}
+	}
+}
+
+// addCodes appends codes that are new and there is still room for.
+//
+// Two bounds, and they answer different attacks. Deduplication stops the same
+// injected code being retried N times per round; maxPendingCodes stops distinct
+// ones accumulating until a round takes longer than the window that is left.
+// Both are silent by design — a caller that is flooding does not need feedback,
+// and the honest redirect only needs ONE slot, which it has because a rejected
+// code frees one.
+func addCodes(pending []string, seen map[string]bool, codes []string) []string {
+	for _, code := range codes {
+		if seen[code] {
+			continue
+		}
+
+		// seen is capped rather than allowed to grow with everything a local
+		// process submits over an hour. Past the cap, deduplication stops and the
+		// per-round work bound is what limits the cost — the reverse trade to
+		// dropping a code, which is the one thing this must never do.
+		if len(seen) < maxSeenCodes {
+			seen[code] = true
+		}
+
+		pending = append(pending, code)
 	}
 
-	f.opts.Log("Registration received. Exchanging it for credentials...")
+	return pending
+}
 
-	app, err := convertManifestAt(ctx, f.opts.Client, f.opts.api(), code)
-	if err != nil {
-		return nil, err
+// drainCodes takes every queued callback without blocking.
+func (f *onboardFlow) drainCodes() []string {
+	var codes []string
+
+	for {
+		select {
+		case code := <-f.codeCh:
+			codes = append(codes, code)
+		default:
+			return codes
+		}
+	}
+}
+
+// registrationTimeout explains a deadline that expired with codes outstanding.
+func (f *onboardFlow) registrationTimeout(ctx context.Context, last error) error {
+	if last != nil {
+		// The honest failure — an operator who took longer than GitHub's window,
+		// or an endpoint that stayed unavailable — must not be reported as a bare
+		// timeout, or the one message that explains it is the one that is dropped.
+		//
+		// And it must say what to DO. Reaching here means an App may already exist
+		// on GitHub with no key anyone can now obtain, so the wrapped advice to
+		// "run the command again" is incomplete on its own: running it again
+		// creates a second App and leaves the first one orphaned.
+		return fmt.Errorf(
+			"github: no registration could be redeemed inside GitHub's %s window: %w\n"+
+				"An App may have been created without billet ever receiving its key. Check "+
+				"https://github.com/settings/apps for an App from this attempt and delete it before "+
+				"running this command again", ManifestTTL, last)
 	}
 
+	return fmt.Errorf("github: timed out waiting for app registration: %w", ctx.Err())
+}
+
+// persist hands the credentials to the caller before the installation step.
+func (f *onboardFlow) persist(app *App) (*App, error) {
 	f.app = app
 	f.opts.Log("Created app %q (id %d).", app.Name, app.ID)
 
 	// Persist BEFORE the installation step. See OnAppCreated: from here on the
 	// app is real on GitHub, and its key cannot be re-issued.
 	if err := f.opts.OnAppCreated(app); err != nil {
+		// The advice depends on whether the key survived, and getting it wrong
+		// destroys things. Wrapping EVERY failure with "delete it and try again"
+		// contradicted the callback's own message — which names the path the key
+		// was preserved at — and an operator who followed the outer advice would
+		// delete the App that preserved key belongs to.
+		// The wording differs by sentinel, because one of them is a PROMISE.
+		// "Its key was preserved" is the exact claim ErrCredentialUncertain exists
+		// to avoid making, and wrapping both in it put the false assertion back on
+		// the outside of an error that had carefully avoided it.
+		if errors.Is(err, ErrCredentialPreserved) {
+			return nil, fmt.Errorf(
+				"github: app %d was created on GitHub and its key was preserved, but onboarding "+
+					"could not finish (%w). Do NOT delete the app: follow the instruction above, "+
+					"then run `billet check`", app.ID, err)
+		}
+
+		if errors.Is(err, ErrCredentialUncertain) {
+			return nil, fmt.Errorf(
+				"github: app %d was created on GitHub, but billet could not confirm what became of "+
+					"its key (%w). Do NOT delete the app until you have checked yourself — its key "+
+					"cannot be re-issued", app.ID, err)
+		}
+
 		return nil, fmt.Errorf(
 			"github: app %d was created on GitHub but its credentials could not be saved (%w); "+
 				"delete it at %s and try again", app.ID, err, app.HTMLURL)
@@ -314,9 +646,13 @@ func (f *onboardFlow) verify(inst *Installation) (*Installation, error) {
 		f.opts.Log("  - %s", p)
 	}
 
+	// %s/%d, not %s/installations/%d: orgSettingsURL already ends in
+	// /installations, so the old form produced
+	// .../settings/installations/installations/<id> — a 404 handed to an
+	// operator who is already stuck.
 	return nil, fmt.Errorf(
 		"github: installation %d has %d permission mismatch(es); "+
-			"correct them at %s/installations/%d and re-run `billet check`",
+			"correct them at %s/%d and re-run `billet check`",
 		inst.ID, len(problems), f.orgSettingsURL(), inst.ID)
 }
 
@@ -334,8 +670,13 @@ func (f *onboardFlow) openOrPrint(ctx context.Context, target string) {
 	}
 
 	if opened {
-		f.opts.Log("Opened your browser. If nothing happened, visit:")
-		f.opts.Log("  %s", target)
+		// The URL is deliberately NOT repeated here. It carries the unguessable
+		// path, and printing it again puts that in the terminal scrollback and in
+		// any journal or CI log capturing this output — for no benefit, since the
+		// browser already has it. An operator whose browser did not appear gets a
+		// route that does not widen the exposure.
+		f.opts.Log("Opened your browser.")
+		f.opts.Log("If nothing appeared, press Ctrl-C and re-run with --no-browser to get the URL.")
 		f.opts.Log("")
 
 		return
@@ -389,10 +730,21 @@ func (f *onboardFlow) handleStart(w http.ResponseWriter, _ *http.Request) {
 func (f *onboardFlow) handleCallback(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 
-	// Constant-time, and checked before anything else is read from the request.
+	// A bad request is REFUSED; it does not end the flow.
+	//
+	// This listens on loopback, so any unprivileged process on the machine can
+	// reach it — and with --port, at an address it can guess. Treating a wrong
+	// state or a missing code as a fatal error handed that process a kill
+	// switch: one request ended onboarding, and if it landed after GitHub had
+	// created the App but before billet exchanged the one-time code, the App and
+	// its private key were orphaned with no way to recover them. A local denial
+	// of service became credential loss.
+	//
+	// Continuing to wait costs nothing. The legitimate redirect still arrives,
+	// and the caller's deadline still bounds the flow.
 	if subtle.ConstantTimeCompare([]byte(q.Get("state")), []byte(f.state)) != 1 {
-		http.Error(w, "state mismatch — restart `billet github-app create`", http.StatusBadRequest)
-		f.fail(fmt.Errorf("github: state mismatch on callback (possible CSRF)"))
+		// Constant-time, and checked before anything else is read.
+		http.Error(w, "state mismatch", http.StatusBadRequest)
 
 		return
 	}
@@ -400,14 +752,36 @@ func (f *onboardFlow) handleCallback(w http.ResponseWriter, r *http.Request) {
 	code := q.Get("code")
 	if code == "" {
 		http.Error(w, "no code in callback", http.StatusBadRequest)
-		f.fail(fmt.Errorf("github: callback carried no code"))
 
 		return
 	}
 
+	// Bounded before it is queued. An absurdly long code costs a round trip and
+	// draws a 414 rather than GitHub's own rejection, which is a different
+	// failure classification for what is obviously not a real code — cheaper to
+	// refuse it here than to reason about every status a proxy might invent.
+	// GitHub's codes are far shorter than this.
+	if len(code) > maxManifestCodeLen {
+		http.Error(w, "code is too long to be a GitHub manifest code", http.StatusBadRequest)
+
+		return
+	}
+
+	// A dropped code must not be acknowledged as accepted.
+	//
+	// The channel held one element and a full one was silently discarded, so two
+	// injected codes timed around an in-flight exchange could crowd out GitHub's
+	// honest redirect — which was then told "App created" while its code had
+	// been thrown away, leaving onboarding waiting for a redirect that had
+	// already come and gone. The queue is deep enough that ordinary use never
+	// reaches it, and a caller that does not fit is told so rather than lied to.
 	select {
 	case f.codeCh <- code:
 	default:
+		http.Error(w, "billet is still working through earlier registrations; retry in a moment",
+			http.StatusServiceUnavailable)
+
+		return
 	}
 
 	writePage(w, "App created", "Now install it on your organization. You can close this tab when the CLI says it is done.")

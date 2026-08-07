@@ -67,6 +67,172 @@ func TestOpenAppliesMigrations(t *testing.T) {
 	}
 }
 
+// The migration list is assembled from a slice literal PLUS appends in init, so
+// nothing about the source layout guarantees the versions are sane. A duplicate
+// version means one migration's SQL silently never runs while the other's
+// checksum is recorded under it; a descending one means the apply loop and the
+// ORDER BY version read disagree about which migration is which.
+//
+// Both failures surface later as a checksum mismatch on an unrelated reopen,
+// which is a miserable thing to debug from that symptom.
+func TestMigrationVersionsAreUniqueAndAscending(t *testing.T) {
+	seen := make(map[int]string, len(migrations))
+
+	for i, m := range migrations {
+		if m.Version <= 0 {
+			t.Errorf("migrations[%d] (%s) has non-positive version %d", i, m.Name, m.Version)
+		}
+		if prev, dup := seen[m.Version]; dup {
+			t.Errorf("migrations[%d] (%s) reuses version %d, already held by %s", i, m.Name, m.Version, prev)
+		}
+		seen[m.Version] = m.Name
+
+		if i > 0 && m.Version <= migrations[i-1].Version {
+			t.Errorf("migrations[%d] (%s) has version %d, not greater than the preceding %d",
+				i, m.Name, m.Version, migrations[i-1].Version)
+		}
+		if len(m.Stmts) == 0 {
+			t.Errorf("migrations[%d] (%s) has no statements", i, m.Name)
+		}
+	}
+}
+
+// Migration 6 backfills guest_os for rows written before the column existed.
+// The default has to be a real guest OS rather than empty: Bind compares it
+// against a host's allowlist, and an empty value would match nothing and strand
+// every pre-existing lease. 'linux' is right because a macOS tier has always
+// been required to pin a node.
+func TestLeaseGuestOSDefaultsToLinux(t *testing.T) {
+	db := open(t)
+	ctx := t.Context()
+
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+
+	if err := db.Tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx,
+			`INSERT INTO leases (id, tier, phase, vcpu, memory, epoch, created_at, heartbeat_at, expires_at)
+			 VALUES ('l1', 't', 'capacity', 1, 1, 0, ?, ?, ?)`, now, now, now)
+
+		return err
+	}); err != nil {
+		t.Fatalf("insert lease without guest_os: %v", err)
+	}
+
+	var guestOS string
+	if err := db.Reader().QueryRowContext(ctx,
+		`SELECT guest_os FROM leases WHERE id = 'l1'`).Scan(&guestOS); err != nil {
+		t.Fatalf("read guest_os: %v", err)
+	}
+
+	if guestOS != "linux" {
+		t.Errorf("guest_os = %q for a row that did not set it, want %q", guestOS, "linux")
+	}
+}
+
+// openAt opens a database migrated only as far as a given version, so an upgrade
+// can be tested as an upgrade.
+//
+// Swapping the package-level list is what makes this faithful: the real migrate
+// runner does the work, in one transaction, with its real bookkeeping. Replaying
+// a migration's SQL by hand against an already-current database tests the string
+// rather than the runner, and would stay green if the runner mishandled the
+// upgrade entirely.
+func openAt(t *testing.T, dir string, version int) *DB {
+	t.Helper()
+
+	full := migrations
+
+	t.Cleanup(func() { migrations = full })
+
+	var truncated []migration
+
+	for _, m := range full {
+		if m.Version <= version {
+			truncated = append(truncated, m)
+		}
+	}
+
+	migrations = truncated
+
+	db, err := Open(t.Context(), dir)
+	if err != nil {
+		t.Fatalf("Open at version %d: %v", version, err)
+	}
+
+	migrations = full
+
+	return db
+}
+
+// Migration 6 backfilled EVERY pre-existing lease to 'linux', macOS ones
+// included. That direction is dangerous rather than merely wrong: an unbound
+// macOS lease relabelled Linux would be PERMITTED onto a Linux-only host, even
+// though its durable macos_slot proves what it is. Migration 7 corrects it from
+// macos_slot.
+//
+// Driven as a real v6 -> v7 upgrade rather than by replaying the UPDATE.
+func TestMacOSLeasesAreBackfilledFromTheirSlot(t *testing.T) {
+	dir := t.TempDir()
+	ctx := t.Context()
+
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+
+	// A version-6 database holding a macOS lease that migration 6 mislabelled.
+	old := openAt(t, dir, 6)
+
+	if err := old.Tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx,
+			`INSERT INTO leases (id, tier, phase, vcpu, memory, epoch, macos_slot, guest_os,
+			                     created_at, heartbeat_at, expires_at)
+			 VALUES ('mac', 't', 'capacity', 1, 1, 0, 1, 'linux', ?, ?, ?)`, now, now, now)
+
+		return err
+	}); err != nil {
+		t.Fatalf("insert mislabelled macOS lease: %v", err)
+	}
+
+	if err := old.Close(); err != nil {
+		t.Fatalf("close v6 database: %v", err)
+	}
+
+	// Reopening with the full list runs migration 7 for real.
+	db, err := Open(ctx, dir)
+	if err != nil {
+		t.Fatalf("upgrade to current: %v", err)
+	}
+
+	t.Cleanup(func() { _ = db.Close() })
+
+	var guestOS string
+	if err := db.Reader().QueryRowContext(ctx,
+		`SELECT guest_os FROM leases WHERE id = 'mac'`).Scan(&guestOS); err != nil {
+		t.Fatalf("read guest_os: %v", err)
+	}
+
+	if guestOS != "macos" {
+		t.Errorf("guest_os = %q for a lease holding a macOS slot, want %q", guestOS, "macos")
+	}
+}
+
+// The upgrade helper is only meaningful if it really stops short. If openAt
+// silently applied everything, the test above would be checking a fresh database
+// and would pass no matter what migration 7 did.
+func TestOpenAtStopsAtTheRequestedVersion(t *testing.T) {
+	db := openAt(t, t.TempDir(), 6)
+
+	t.Cleanup(func() { _ = db.Close() })
+
+	var version int
+	if err := db.Reader().QueryRowContext(t.Context(),
+		`SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil {
+		t.Fatalf("read applied versions: %v", err)
+	}
+
+	if version != 6 {
+		t.Errorf("openAt(6) migrated to %d, want 6", version)
+	}
+}
+
 func TestOpenIsIdempotent(t *testing.T) {
 	dir := t.TempDir()
 	first, err := Open(t.Context(), dir)
