@@ -454,86 +454,6 @@ func (l *Listener) heartbeatLoop(ctx context.Context) {
 	}
 }
 
-// reconcileAgainst releases promises GitHub says it has no record of.
-//
-// This is the ONLY thing that recovers escrow promised to a job that is never
-// assigned. Every other exit needs GitHub to send an assignment, a completion or
-// a cancellation, and a message that goes missing sends none of them — so the
-// lease is renewed for the life of the session while the slot is held against
-// every other tier.
-//
-// The reclaim that was tried first was a timer, and it was wrong: an acquisition
-// is a commitment to GitHub, and no local clock can revoke one. What makes this
-// different is that billet is not deciding anything. GitHub is reporting, in the
-// statistics it already sends, that this scale set has no job outstanding of any
-// kind — and a promise cannot be outstanding against a scale set with nothing
-// outstanding. The commitment is being released by the party that holds it.
-//
-// TWO conditions, deliberately, because either alone is unsafe:
-//
-//   - EVERY job counter is zero. Not just TotalAcquiredJobs: whether "acquired"
-//     includes "assigned" is not documented, and a rule resting on how those
-//     categories nest would be a guess about someone else's API. Requiring all
-//     of them to be zero is true under every nesting.
-//   - The promise is already STALE. Statistics describe the moment the message
-//     was generated, which can predate an acquisition billet made a round trip
-//     ago, so a fresh promise may legitimately be missing from them. Age removes
-//     that race.
-//
-// Both together make a false positive require GitHub to report an empty scale
-// set for minutes while an assignment is genuinely in flight.
-func (l *Listener) reconcileAgainst(ctx context.Context, stats *Statistics) {
-	if stats.TotalAvailableJobs != 0 || stats.TotalAcquiredJobs != 0 ||
-		stats.TotalAssignedJobs != 0 || stats.TotalRunningJobs != 0 {
-		return
-	}
-
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	for id, p := range l.acquiring {
-		if time.Since(p.at) <= l.stalePromise {
-			continue
-		}
-
-		l.log.Warn("github reports no outstanding jobs for this scale set; releasing escrow "+
-			"promised to a request it has no record of",
-			"tier", l.tier, "request", id, "waited", time.Since(p.at).Round(time.Second))
-
-		// The same distinction the heartbeat draws, and for the same reason.
-		// FENCED or NOT FOUND means the lease is already terminal: there is
-		// nothing left to release, and keeping the entry would advertise capacity
-		// belonging to someone else forever, because every retry fails the same
-		// way. Anything else is operational — the lease is probably still live,
-		// and dropping it would take it off the release path too, leaving the
-		// ledger counting capacity nothing references. Release is idempotent, so
-		// the next reconciliation retries it.
-		err := l.alloc.Release(ctx, p.lease.ID, p.lease.Epoch, alloc.PhaseDone)
-		if err != nil && !finished(err) {
-			l.log.Warn("could not release an abandoned promise; keeping it",
-				"tier", l.tier, "lease", p.lease.ID, "error", err)
-
-			continue
-		}
-
-		delete(l.acquiring, id)
-	}
-}
-
-// finished reports whether an allocator error means the lease is already over
-// rather than that the write failed.
-//
-// FENCED is someone else's now, NOT FOUND never existed or is terminal, and
-// CONFLICT means it finished as a different outcome — the reaper marks an
-// abandoned lease `failed`, and releasing that as `done` contradicts the record.
-// All three are final: retrying fails identically forever, so the entry has to
-// go. Everything else is operational and the lease is probably still live.
-func finished(err error) bool {
-	return errors.Is(err, alloc.ErrFenced) ||
-		errors.Is(err, alloc.ErrLeaseNotFound) ||
-		errors.Is(err, alloc.ErrConflict)
-}
-
 // heartbeatInterval is how often held capacity is renewed: a third of the
 // allocator's ACTUAL TTL, so two consecutive failures are survivable.
 //
@@ -706,13 +626,6 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 		}
 
 		return l.acknowledge(ctx, msg)
-	}
-
-	// Reconciled against GitHub's own counters BEFORE anything in this batch is
-	// acquired, so a promise made by this message is not judged by statistics that
-	// predate it.
-	if msg.Statistics != nil {
-		l.reconcileAgainst(ctx, msg.Statistics)
 	}
 
 	// COMPLETED IS PROCESSED FIRST, and the order is the fix.
