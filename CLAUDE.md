@@ -213,64 +213,31 @@ GitHub returns the App private key **exactly once**, from the manifest conversio
 re-issue. Every rule here exists because a review found a way to lose or leak it, and several were
 introduced by the fix for the previous one.
 
-**Nothing is deleted by pathname unless it is known not to be a key.** Go unlinks by name while this
-process owns a *descriptor*, and there is no unlink-this-inode to reach for — so every deletion is
-check-then-act and none of the checks can be made atomic. Three versions of an automatic cleanup were
-tried before that was accepted:
+**The reservation never occupies the destination.** This is the shape everything else rests on, and it
+took four rounds to reach. While the reservation *was* the key path, installing meant unlinking that
+path first — and a pathname unlink cannot be made safe by any check preceding it, because the check is
+never atomic with it. Every guard tried (`os.SameFile`, then "and it is still empty") still had an
+ordering where another run's key was deleted on the way to installing this one.
 
-- The **reservation cleanup is gone entirely.** `os.SameFile` narrowed the window; adding "and it is
-  still empty" narrowed it further; neither closed it, because a second run can pass both checks with
-  its placeholder and write its key before the `os.Remove` lands. An aborted run now leaves the empty
-  placeholder, and `reserveKeyFile` prints the exact `rm` that clears it.
-- The **staging cleanup** only deletes when the file is *known* to hold no key, and it reports rather
-  than swallows a failure once the key is installed — after `os.Link` both names refer to the same
-  private key, so a silent failure leaves a second unreported copy.
-- **"Could not tell" is never treated as "no key here."** Inspection returns present / absent /
-  unverifiable, and only *absent* permits a deletion or the "your credential is gone" message. A
-  transient open or read error previously read as proof that no credential existed.
+Reserving a sibling file removes the unlink entirely, and collapses two files into one: the reservation
+*is* the staging file. The destination is created exactly once, by an `os.Link` that **fails rather
+than replaces**. There is no rename fallback — `os.Rename` has no no-clobber form in Go, so on a
+filesystem that cannot hard-link billet reports the staged key and the operator moves it by hand.
 
-**Install refuses rather than replaces, and there is no rename fallback.** `os.Link` fails when the
-destination exists, and that refusal is atomic. `os.Rename` has no no-clobber form in Go, so the
-fallback for filesystems that cannot hard-link was **removed**: every guard in front of it was
-check-then-act, and the "it committed anyway" branch that guarding produced could certify an unrelated
-file as this App's key. On such a filesystem billet reports the staged key and the operator moves it
-by hand — one `mv` with their eyes open beats a race they never see.
+**Nothing is deleted by pathname unless it is known not to be a key.**
 
-**The reservation is never adopted, and it is a real fallback rather than a probe.** An empty file at
-the key path looks like a crashed run's leftover and is equally a *concurrent* run's live reservation;
-adopting it puts two processes on one destination. Refuse, and say which case it is. The descriptor is
-held open because the staged write below has to create a *second* file **after** issuance, and that
-can fail on its own — a directory that turned read-only during the browser flow, an exhausted inode
-table. Reserving without ever writing to it left that case returning an error with the only copy of
-an unrepeatable key in memory.
-
-**The write is atomic where it can be**: staging file → fsync → fsync the directory → link → fsync the
-directory, with the credential marked installed the instant the link returns. The staging name is
-*derived from the destination*, not random, so a crash in that window leaves the key somewhere the
-next run reports by name instead of under an unpredictable hidden file — and it is looked for
-**before** the reservation attempt, not only when the destination is occupied, because the install
-clears the destination before it links and a crash there leaves the name free. Missing that meant the
-next run reserved cleanly, said nothing, and created a *second* App beside an orphaned key. The next
-run also only reports it if the bytes **parse as a key**, and only offers `mv` when the destination is
-free — Unix `mv` replaces, so that advice destroys a second key whenever one is already there.
-
-When staging is impossible the fallback writes through the reservation, trading crash-atomicity for
-not losing the key; a torn PEM there is what `billet check` catches. And **what is on disk decides,
-not the return value**: GitHub's PEM ends in a newline, so a write that stops one byte short of it
-still produces a key `pem.Decode` reads perfectly. "The write errored" and "there is no credential
-here" are different facts.
-
-**The credential is never written twice.** Once the staging file holds a complete key, every later
-failure reports it as preserved and the fallback does **not** run. Keying that on "did staging report
-success" instead put two copies of an unrepeatable private key on disk — one at a path nothing cleans
-up and the operator is never told about.
-
-**Every error that left the key readable carries `github.ErrCredentialPreserved`, and no other error
-does.** Recovery advice is opposite in the two cases — delete the App and retry, versus keep the App
-and move the file — and onboarding cannot tell them apart from the error text. Both directions are
-destructive: wrapping every failure with "delete it and try again" contradicted the message directly
-beneath it, and marking a fallback whose write went to an unlinked descriptor would tell the operator
-to keep an App whose key is unreachable.
+- The **reservation cleanup is gone.** An aborted run leaves its staging file, and `reserveKeyFile`
+  prints the exact `rm` after inspecting whether it is a leftover or a credential.
+- The **staging file is removed only after a successful install** — `os.Link` leaves two names for one
+  private key, so that removal is mandatory — and only after `os.SameFile` confirms the name still
+  refers to this run's file. A failure to remove it is reported, never swallowed: an unmentioned second
+  copy of an App key is what nobody finds until it matters.
+- **"Could not tell" is never "no key here."** `inspectKey` returns present / absent / unverifiable, and
+  only *absent* permits a deletion or a "your credential is gone" message. A transient open or read
+  error previously read as proof that no credential existed.
+- **"Not a valid key" is not "safe to clobber."** Whether to recommend `mv` asks `fileExists`, not
+  `inspectKey` — a PEM with trailing junk, a format this build cannot parse, or a file a live writer
+  has not finished are all worth keeping, and `mv` replaces.
 
 **`billet check` proves the key WORKS**, not that it exists — regular file, no group/other permission
 bits, bounded read, and actually parsed, all from one descriptor opened `O_NONBLOCK` so a FIFO cannot
@@ -320,12 +287,18 @@ the path and the `state` must be assumed known, and only what a caller can *do* 
 Treating the first code to arrive as final was a kill switch: inject a worthless one, and onboarding
 ended with the App created and its key unrecoverable.
 
-**Only a status that means THIS CODE is unusable may discard it** — an explicit list (400, 404, 410,
-414, 422), not "404 and 422" and not "every 4xx". Both wrong versions shipped. Too narrow left the
-kill switch open for an injected code drawing a 414. Too wide swallowed **429**, which is the more
-expensive error: a rate limit says nothing about the code, so a *valid* code was thrown away while the
-App stayed created and the loop waited out `ManifestTTL` for a redirect that had already arrived.
-Callback codes are length-bounded before they are queued, so no queued code can provoke a 414 anyway.
+**Only a status that ESTABLISHES the code is unusable may discard it**, which is a much shorter list
+than it looks: **404** (GitHub does not know this code) plus 414, which the callback's length bound
+makes unreachable anyway. Three versions shipped before that. `{404, 422}` left the kill switch open
+for an injected code drawing a 414. "Every 4xx" swallowed **429** — a rate limit says nothing about
+the code, so a *valid* code was discarded while the App stayed created. And 422 is the subtle one:
+GitHub documents it as *"Validation failed, **or the endpoint has been spammed**"*, so an attacker
+feeding forged codes can trip abuse protection and make the honest code's 422 look like a rejection.
+400 is not code-specific either — a proxy returns it for header and policy reasons.
+
+An ambiguous status is therefore **fatal rather than skipped**, and says why: aborting costs a re-run,
+while advancing past a code that may have been good costs the key. A forged code is a random string,
+so GitHub answers 404 — the case that actually needed handling is the one that is unambiguous.
 
 The callback queue is deep, and a callback that does **not** fit is refused rather than dropped — a
 silent drop plus an "App created" page meant the honest redirect could be discarded while its browser

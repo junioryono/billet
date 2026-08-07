@@ -2,6 +2,7 @@ package github
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 )
 
 // The manifest code buys the App's private key, and it is still live when the
@@ -500,25 +502,28 @@ func TestRedactionCleansEveryURLErrorField(t *testing.T) {
 // code, so a VALID code was discarded, the App stayed created, and the loop
 // waited out ManifestTTL for a redirect that had already arrived.
 func TestOnlyCodeSpecificStatusesDiscardTheCode(t *testing.T) {
-	// GitHub is saying the presented code is no good. Try the next one.
-	for _, status := range []int{
-		http.StatusBadRequest,
-		http.StatusNotFound,
-		http.StatusGone,
-		http.StatusRequestURITooLong,
-		http.StatusUnprocessableEntity,
-	} {
-		t.Run("rejects/"+http.StatusText(status), func(t *testing.T) {
+	// 404 is the one unambiguous answer: GitHub does not know this code. A forged
+	// code is a random string, so this is the status a forged one draws — which
+	// is exactly the case that needed handling.
+	for _, status := range []int{http.StatusNotFound, http.StatusRequestURITooLong} {
+		t.Run("discards/"+http.StatusText(status), func(t *testing.T) {
 			if err := conversionError(status, nil); !errors.Is(err, errCodeRejected) {
 				t.Errorf("HTTP %d was not classified as a rejected code: %v", status, err)
 			}
 		})
 	}
 
-	// None of these are about the code, so discarding it would throw away a
-	// credential over a condition a different code cannot fix.
+	// None of these establish that the presented code is bad, so discarding it
+	// would throw away a credential over a condition the next code cannot fix.
+	//
+	// 422 is the one worth naming: GitHub documents it as "Validation failed, OR
+	// the endpoint has been spammed". An attacker feeding forged codes can trip
+	// abuse protection and make the honest code's 422 look like a rejection, so a
+	// status that can mean "you asked too often" must never discard a code.
 	for _, status := range []int{
-		http.StatusTooManyRequests, // the rate limit, not the code
+		http.StatusUnprocessableEntity,
+		http.StatusTooManyRequests,
+		http.StatusBadRequest, // a proxy returns this for header and policy reasons
 		http.StatusRequestTimeout,
 		http.StatusUnauthorized,
 		http.StatusForbidden, // GitHub also uses this for abuse detection
@@ -529,9 +534,76 @@ func TestOnlyCodeSpecificStatusesDiscardTheCode(t *testing.T) {
 	} {
 		t.Run("keeps/"+http.StatusText(status), func(t *testing.T) {
 			if err := conversionError(status, nil); errors.Is(err, errCodeRejected) {
-				t.Errorf("HTTP %d discarded the code; it says nothing about the code's validity", status)
+				t.Errorf("HTTP %d discarded the code; it does not establish that the code is bad", status)
 			}
 		})
+	}
+}
+
+// The classification has to hold through the REAL flow, not just as a table.
+//
+// Asserting the status map on its own only proves it was copied into the test.
+// This drives onboarding: a forged code that GitHub answers 422 to must not end
+// the flow, because 422 can mean "the endpoint has been spammed" — which is
+// precisely what an attacker injecting codes causes.
+func TestAnAmbiguousRejectionDoesNotEndOnboarding(t *testing.T) {
+	fake := newFakeGitHub(t)
+	fake.rejectCode = "injected-by-a-local-process"
+	fake.rejectStatus = http.StatusUnprocessableEntity
+
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	browser := &browser{t: t, fake: fake, client: srv.Client()}
+
+	// Only the attacker acts. The legitimate browser is deliberately never
+	// driven: the flow is expected to end on the ambiguous rejection, and a
+	// second actor racing that shutdown would only add noise.
+	attacked := func(ctx context.Context, target string) error {
+		state := extractAttr(browser.get(ctx, target), "state=")
+		if state == "" {
+			return errors.New("could not read the state from the start page")
+		}
+
+		forged := strings.TrimSuffix(target, "/") + "/callback?code=" + fake.rejectCode + "&state=" + state
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, forged, http.NoBody)
+		if err != nil {
+			return err
+		}
+
+		resp, err := srv.Client().Do(req)
+		if err != nil {
+			return err
+		}
+
+		resp.Body.Close()
+
+		return nil
+	}
+
+	_, err := Onboard(ctx, OnboardOptions{
+		Org:          "acme",
+		OpenBrowser:  attacked,
+		Log:          func(string, ...any) {},
+		Client:       srv.Client(),
+		InstallPoll:  20 * time.Millisecond,
+		apiBase:      srv.URL,
+		OnAppCreated: func(*App) error { return nil },
+	})
+
+	// An ambiguous rejection is fatal BY DESIGN — the alternative is discarding a
+	// code that may have been perfectly good. What must not happen is billet
+	// treating it as "that code was worthless" and silently moving on.
+	if err == nil {
+		t.Fatal("an ambiguous 422 was treated as a rejected code and the flow continued")
+	}
+
+	if !strings.Contains(err.Error(), "spammed") {
+		t.Errorf("the error does not explain the ambiguity an operator has to act on: %v", err)
 	}
 }
 
@@ -865,7 +937,9 @@ func TestConvertManifestRejectsIncompleteResponse(t *testing.T) {
 // the body is rendered, and the diagnostic is written from the status.
 func TestConvertManifestExplainsAnExpiredCodeWithoutTheBody(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusUnprocessableEntity)
+		// 404 is what GitHub returns for a code it does not know, which is the
+		// expired-and-already-used case an operator actually hits.
+		w.WriteHeader(http.StatusNotFound)
 		if _, err := w.Write([]byte(`{"message":"The code passed is incorrect or expired."}`)); err != nil {
 			t.Errorf("write test response: %v", err)
 		}
@@ -877,8 +951,8 @@ func TestConvertManifestExplainsAnExpiredCodeWithoutTheBody(t *testing.T) {
 		t.Fatal("expected an error")
 	}
 
-	// The operator needs to know it expired and that re-running is the fix.
-	for _, want := range []string{"422", "expired", "run the command again"} {
+	// The operator needs to know it expired and how long the window is.
+	for _, want := range []string{"404", "expired", "1h0m0s"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error should mention %q, got: %v", want, err)
 		}
