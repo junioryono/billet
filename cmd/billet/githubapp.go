@@ -140,6 +140,13 @@ func githubAppCreate(ctx context.Context, args []string) error {
 	fmt.Printf("github:\n")
 	fmt.Printf("  org: %s\n", *org)
 	fmt.Printf("  app_id: %d\n", result.App.ID)
+
+	// Printed when GitHub returned one, because the operator cannot recover it
+	// from anywhere else without going back through the browser.
+	if result.App.ClientID != "" {
+		fmt.Printf("  client_id: %s\n", result.App.ClientID)
+	}
+
 	fmt.Printf("  installation_id: %d\n", result.Installation.ID)
 	fmt.Printf("  private_key_path: %s\n", *keyPath)
 	fmt.Printf("\nThen run: billet check\n")

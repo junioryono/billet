@@ -18,6 +18,47 @@ func writeConfig(t *testing.T, body string) string {
 	return path
 }
 
+// The client_id GitHub hands back at conversion is OPTIONAL and must stay so.
+//
+// scaleset's GitHubAppAuth documents ClientID as "the Client ID of the
+// application (app id also works)", so every existing config keeps working —
+// which is why this cannot become required. It is captured because GitHub's
+// newer guidance prefers it as the JWT issuer, and because onboarding already
+// fetches it: discarding a value billet was handed is how a config ends up
+// needing a second trip through the browser to reconstruct.
+func TestClientIDIsOptionalAndRoundTrips(t *testing.T) {
+	withID := strings.Replace(validConfig,
+		"  app_id: 12345\n", "  app_id: 12345\n  client_id: Iv1.a1b2c3d4e5f6\n", 1)
+
+	cfg := &Config{}
+	if err := yaml.Unmarshal([]byte(withID), cfg); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	cfg.applyDefaults()
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("a config carrying client_id was rejected: %v", err)
+	}
+
+	if cfg.GitHub.ClientID != "Iv1.a1b2c3d4e5f6" {
+		t.Errorf("github.client_id = %q, want it preserved", cfg.GitHub.ClientID)
+	}
+
+	// And its absence must stay valid — app_id is still accepted by scaleset, so
+	// requiring this would break every config written before it existed.
+	plain := &Config{}
+	if err := yaml.Unmarshal([]byte(validConfig), plain); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	plain.applyDefaults()
+
+	if err := plain.Validate(); err != nil {
+		t.Fatalf("a config without client_id was rejected: %v", err)
+	}
+}
+
 const validConfig = `
 server:
   listen: 127.0.0.1:7717

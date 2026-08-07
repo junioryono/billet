@@ -283,8 +283,21 @@ type FirecrackerConfig struct {
 // organization_self_hosted_runners:read+write. It deliberately does not request
 // actions:read, which would expose workflow runs, logs, and artifacts.
 type GitHubConfig struct {
-	Org            string `yaml:"org"`
-	AppID          int64  `yaml:"app_id"`
+	Org   string `yaml:"org"`
+	AppID int64  `yaml:"app_id"`
+	// ClientID is the App's OAuth client identifier, and it is OPTIONAL.
+	//
+	// GitHub's newer guidance prefers it over the numeric app id as the JWT
+	// issuer, and the scale-set client accepts either — its GitHubAppAuth
+	// documents ClientID as "the Client ID of the application (app id also
+	// works)". So this must never become required: every config written before
+	// the field existed keeps working.
+	//
+	// It is recorded because the manifest conversion already returns it, and
+	// throwing away a value GitHub handed over means a second trip through the
+	// browser to get it back. It is an identifier, not a secret — App.Forget
+	// deliberately keeps it while blanking the client SECRET beside it.
+	ClientID       string `yaml:"client_id,omitempty"`
 	InstallationID int64  `yaml:"installation_id"`
 	// PrivateKeyPath points at the App private key PEM. This file is the single
 	// most sensitive thing in a billet deployment: it lives only on the control
