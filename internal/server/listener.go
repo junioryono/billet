@@ -114,6 +114,26 @@ type Listener struct {
 	// unacknowledged message comes back, and assigning it twice would consume a
 	// second lease for one job.
 	running map[int64]*alloc.Lease
+	// finished remembers request ids this listener has already completed, so a
+	// redelivered message cannot consume a second lease for a job that is over.
+	//
+	// Needed because billet acknowledges a message AFTER handling it, unlike the
+	// vendor's own listener, which deletes the message first (listener.go:210) and
+	// so handles everything at most once. Acking last is the safer choice for
+	// capacity — a crash mid-handling redelivers rather than silently drops a job
+	// — but it is only safe if everything derived from a message is idempotent,
+	// and `running` alone is not: complete() removes the entry, so a redelivery of
+	// the same batch no longer recognises the request.
+	//
+	// In memory and bounded, deliberately. Making it durable would mean deciding
+	// that GitHub never re-offers a request id it once reported completed, and
+	// nothing in the vendor's types or docs says that — assigned-then-cancelled is
+	// a documented lifecycle. A permanent tombstone built on an assumption billet
+	// cannot check is the same mistake as the runner-group allowlist. This covers
+	// the redelivery window, which is what the defect actually is, and a restart
+	// loses it exactly as it loses `running`.
+	finished     map[int64]struct{}
+	finishedRing []int64
 
 	lastMessageID int64
 
@@ -130,11 +150,12 @@ type Listener struct {
 // NewListener builds a listener for one tier.
 func NewListener(a *alloc.Allocator, tier string, session Session, opts ...Option) *Listener {
 	l := &Listener{
-		alloc:   a,
-		tier:    tier,
-		session: session,
-		log:     slog.Default(),
-		running: make(map[int64]*alloc.Lease),
+		alloc:    a,
+		tier:     tier,
+		session:  session,
+		log:      slog.Default(),
+		running:  make(map[int64]*alloc.Lease),
+		finished: make(map[int64]struct{}),
 	}
 
 	for _, opt := range opts {
@@ -526,11 +547,44 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 		return l.acknowledge(ctx, msg)
 	}
 
+	// COMPLETED IS PROCESSED FIRST, and the order is the fix.
+	//
+	// Without this the cycle never closes: the lease stays open until the reaper
+	// expires it, holding capacity for a job that finished and recording the wrong
+	// conclusion against it. But it has to come FIRST, because GitHub batches the
+	// completion of one job with the offer of its replacement — it considers the
+	// slot free the moment the job ends. Acquiring before releasing meant billet
+	// claimed the replacement while still holding the finished job's lease, then
+	// released it, and had nothing left to back the claim.
+	for _, job := range msg.Completed {
+		if err := l.complete(ctx, job); err != nil {
+			return err
+		}
+	}
+
+	// Topped up between the release and the acquisition, so the slot just freed is
+	// available to back the offer that arrived with it. It may lose the race to
+	// another tier — escrow is first-come — and that is a fairness question, not a
+	// correctness one: what matters is that billet does not claim work it cannot
+	// back. See TestAGreedyTierCanTakeTheWholeBudget.
+	if len(msg.Available) > 0 {
+		if err := l.refillEscrow(ctx); err != nil {
+			return err
+		}
+	}
+
 	// AVAILABLE is what gets acquired. Available is the offer; Assigned is the
 	// confirmation that an offer was claimed. Acquiring from Assigned asks GitHub
 	// to claim work it has already handed over, and drops every offer.
-	if len(msg.Available) > 0 {
-		if _, err := l.session.AcquireJobs(ctx, requestIDs(msg.Available)); err != nil {
+	//
+	// Acquisition is capped at FREE escrow, which advertising is not. maxCapacity
+	// is the scale set's total, and GitHub subtracts what it already has assigned
+	// — but a batch can still offer more than billet can currently back, and an
+	// acquisition is a promise to run the job. Claiming beyond the free escrow
+	// strands whatever cannot be backed, and the assignment that follows kills the
+	// listener. Advertise total; acquire only what is held.
+	if offers := l.acquirable(msg.Available); len(offers) > 0 {
+		if _, err := l.session.AcquireJobs(ctx, offers); err != nil {
 			return fmt.Errorf("server: acquire jobs for %s: %w", l.tier, err)
 		}
 	}
@@ -539,17 +593,6 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 	// the point at which the work is definitely billet's to run.
 	for _, job := range msg.Assigned {
 		if err := l.assign(ctx, job); err != nil {
-			return err
-		}
-	}
-
-	// COMPLETED is what gives it back. Without this the cycle never closes: the
-	// lease stays open until the reaper expires it, holding capacity for a job
-	// that finished and recording the wrong conclusion against it. It also covers
-	// assigned-then-cancelled, which GitHub can do up to three times for a job
-	// that is not acquired in time.
-	for _, job := range msg.Completed {
-		if err := l.complete(ctx, job); err != nil {
 			return err
 		}
 	}
@@ -569,6 +612,28 @@ func (l *Listener) acknowledge(ctx context.Context, msg *Message) error {
 	}
 
 	return nil
+}
+
+// acquirable returns the offers this listener has free escrow to back.
+//
+// Fewer than offered is normal and not a loss: an unacquired offer goes to
+// another scale set or is re-offered, whereas an acquisition billet cannot back
+// is a job that goes nowhere.
+func (l *Listener) acquirable(available []Job) []int64 {
+	l.mu.Lock()
+	room := len(l.held)
+	l.mu.Unlock()
+
+	if room > len(available) {
+		room = len(available)
+	}
+
+	if room < len(available) {
+		l.log.Warn("declining offers with no escrow to back them",
+			"tier", l.tier, "offered", len(available), "acquiring", room)
+	}
+
+	return requestIDs(available[:room])
 }
 
 // requestIDs pulls the ids AcquireJobs claims work by.
@@ -599,6 +664,15 @@ func (l *Listener) assign(ctx context.Context, job Job) error {
 	// ordinary event rather than a fault — and consuming a second lease for one
 	// job would leak capacity that nothing ever gives back.
 	if _, ok := l.running[job.RequestID]; ok {
+		return nil
+	}
+
+	// Already OVER. `running` cannot answer this: complete() removes the entry, so
+	// a redelivered batch — or one carrying Assigned and Completed for the same
+	// request, which is what an assigned-then-cancelled job looks like — would
+	// consume a fresh lease for a job that has finished, and record a second
+	// history entry against it.
+	if _, ok := l.finished[job.RequestID]; ok {
 		return nil
 	}
 
@@ -637,6 +711,15 @@ func (l *Listener) complete(ctx context.Context, job Job) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
+	// Recorded BEFORE the lookup, and unconditionally.
+	//
+	// A completion for a request this listener has no lease for still has to be
+	// remembered: the same batch may carry the Assigned for it — GitHub can assign
+	// and then cancel a job that is not picked up in time — and processing
+	// completions first would otherwise let that assignment consume a lease for a
+	// job already known to be over.
+	l.markFinished(job.RequestID)
+
 	lease, ok := l.running[job.RequestID]
 	if !ok {
 		// Not ours, or already released. Both are ordinary: GitHub can report a
@@ -653,6 +736,28 @@ func (l *Listener) complete(ctx context.Context, job Job) error {
 	delete(l.running, job.RequestID)
 
 	return nil
+}
+
+// maxFinished bounds the completed-request memory.
+//
+// It only has to outlive a redelivery, which is one message, so this is generous
+// by orders of magnitude. Bounded regardless, because the alternative is a map
+// that grows for the life of the process — one entry per job this tier ever ran.
+const maxFinished = 4096
+
+// markFinished remembers a completed request id, evicting the oldest.
+func (l *Listener) markFinished(requestID int64) {
+	if _, ok := l.finished[requestID]; ok {
+		return
+	}
+
+	l.finished[requestID] = struct{}{}
+	l.finishedRing = append(l.finishedRing, requestID)
+
+	if len(l.finishedRing) > maxFinished {
+		delete(l.finished, l.finishedRing[0])
+		l.finishedRing = l.finishedRing[1:]
+	}
 }
 
 // releaseAll hands back capacity that was escrowed and never used.

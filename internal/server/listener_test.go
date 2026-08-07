@@ -576,13 +576,237 @@ func TestAnAlreadyAssignedBacklogIsReported(t *testing.T) {
 	}
 }
 
+// An acquisition is a PROMISE, and billet must not make one it cannot back.
+//
+// Advertising and acquiring answer different questions. maxCapacity is the scale
+// set's total, so it counts assigned jobs too — but an offer can still arrive for
+// more than this listener currently has free, and acquiring it tells GitHub the
+// job will run here. Whatever cannot be backed is then stranded: the Assigned
+// message arrives, there is no escrow, and the listener stops the control plane
+// over a promise it should never have made.
+func TestOffersAreAcquiredOnlyUpToFreeEscrow(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+
+	// Room for exactly one runner, and it is already running a job.
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 4, MaxMemory: 16 * config.GiB}, tiers)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	var delivered atomic.Int32
+
+	session := &fakeSession{}
+	session.onGet = func() (*Message, error) {
+		switch delivered.Add(1) {
+		case 1:
+			// Consume the only slot.
+			return &Message{
+				MessageID: 1,
+				Available: []Job{{RequestID: 11, RunID: 101}},
+				Assigned:  []Job{{RequestID: 11, RunID: 101}},
+			}, nil
+		case 2:
+			// Two more offers with nothing free to back either.
+			return &Message{
+				MessageID: 2,
+				Available: []Job{{RequestID: 12, RunID: 102}, {RequestID: 13, RunID: 103}},
+			}, nil
+		}
+
+		cancel()
+
+		return nil, ErrNoMessage
+	}
+
+	l := NewListener(a, tiers[0].Label, session)
+
+	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// Only the first offer, which the one free lease backed. Acquiring 12 or 13
+	// would be promising GitHub a job with no capacity set aside for it.
+	if got := session.acquiredIDs(); !slices.Equal(got, []int64{11}) {
+		t.Errorf("acquired %v; only request 11 had escrow behind it", got)
+	}
+}
+
+// GitHub batches a job's completion with the offer of its replacement, because
+// it considers the slot free the moment the job ends. Billet has to release
+// before it acquires, or it claims the replacement while still holding the
+// finished job's lease and then has nothing left to back the claim.
+//
+// The failure is not visible at acquisition time. It surfaces one message later,
+// when the Assigned for the replacement arrives, finds no escrow, and stops the
+// control plane — so this drives the sequence all the way through that message.
+func TestACompletionFreesTheSlotItsReplacementNeeds(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+
+	// One runner's worth of budget, so the replacement can only run on the slot
+	// the completion gives back.
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 4, MaxMemory: 16 * config.GiB}, tiers)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	var delivered atomic.Int32
+
+	session := &fakeSession{}
+	session.onGet = func() (*Message, error) {
+		switch delivered.Add(1) {
+		case 1:
+			return &Message{
+				MessageID: 1,
+				Available: []Job{{RequestID: 11, RunID: 101}},
+				Assigned:  []Job{{RequestID: 11, RunID: 101}},
+			}, nil
+		case 2:
+			// The completion of 11 and the offer of 12, together.
+			return &Message{
+				MessageID: 2,
+				Available: []Job{{RequestID: 12, RunID: 102}},
+				Completed: []Job{{RequestID: 11, RunID: 101}},
+			}, nil
+		case 3:
+			// And the confirmation that the claim on 12 stuck.
+			return &Message{
+				MessageID: 3,
+				Assigned:  []Job{{RequestID: 12, RunID: 102}},
+			}, nil
+		}
+
+		cancel()
+
+		return nil, ErrNoMessage
+	}
+
+	l := NewListener(a, tiers[0].Label, session)
+
+	// Acquiring before releasing leaves nothing to back request 12, and this call
+	// returns "assigned request 12 with no escrowed capacity".
+	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if got := session.acquiredIDs(); !slices.Equal(got, []int64{11, 12}) {
+		t.Errorf("acquired %v, want both offers claimed in turn", got)
+	}
+}
+
+// A redelivered batch must not consume a second lease for a job that is over.
+//
+// Billet acknowledges a message AFTER handling it — unlike the vendor's listener,
+// which deletes first and so handles everything at most once. Acking last means a
+// crash mid-handling redelivers rather than silently dropping a job, which is the
+// safer trade for capacity, but it only holds if every handler is idempotent.
+//
+// `running` alone is not enough: complete() removes the entry, so on redelivery
+// the request looks brand new. That is not a contrived case — a batch carrying
+// Assigned and Completed for the SAME request is what an assigned-then-cancelled
+// job looks like, which GitHub does to a job no runner picks up in time.
+func TestARedeliveredCompletionDoesNotConsumeASecondLease(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+
+	// One runner. A second lease for the same job cannot be quietly absorbed.
+	db := openState(t)
+
+	a, err := alloc.New(db, alloc.Limits{MaxVCPU: 4, MaxMemory: 16 * config.GiB}, tiers)
+	if err != nil {
+		t.Fatalf("alloc.New: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	var (
+		delivered atomic.Int32
+		acked     atomic.Int32
+	)
+
+	session := &fakeSession{}
+
+	// The first acknowledgement fails, which is exactly what makes GitHub send the
+	// batch again.
+	session.onDelete = func(int64) error {
+		if acked.Add(1) == 1 {
+			return errors.New("acknowledgement lost in transit")
+		}
+
+		return nil
+	}
+
+	batch := func(id int64) *Message {
+		return &Message{
+			MessageID: id,
+			Assigned:  []Job{{RequestID: 11, RunID: 101}},
+			Completed: []Job{{RequestID: 11, RunID: 101}},
+		}
+	}
+
+	session.onGet = func() (*Message, error) {
+		switch delivered.Add(1) {
+		case 1:
+			return batch(1), nil
+		case 2:
+			// Redelivered, because the acknowledgement did not land.
+			return batch(1), nil
+		}
+
+		cancel()
+
+		return nil, ErrNoMessage
+	}
+
+	l := NewListener(a, tiers[0].Label, session)
+
+	// A failed acknowledgement is an error, so Run returns on the first batch.
+	// ASSERTED rather than discarded: if this run ever stops failing, the message
+	// is acknowledged, GitHub never redelivers it, and everything below is testing
+	// a redelivery that did not happen.
+	if err := l.Run(ctx); err == nil || errors.Is(err, context.Canceled) {
+		t.Fatalf("the first run was expected to fail on the lost acknowledgement, got %v; "+
+			"without that failure there is no redelivery to be idempotent against", err)
+	}
+
+	// Restarted the way the control plane would restart it.
+
+	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run after redelivery: %v", err)
+	}
+
+	// Counted in job_history, NOT in open leases.
+	//
+	// Asserting that no lease is left open proves nothing here: shutdown releases
+	// running leases too, so a redelivery that consumed a second lease still ends
+	// at zero and the test passes against the bug it exists to catch. Confirmed by
+	// mutation — that is exactly what the first version of this test did.
+	//
+	// Every assignment writes a job_history row keyed by lease id, so a second
+	// lease for one request leaves a second row carrying the same request id.
+	// That evidence outlives the release.
+	var leases int
+
+	if err := db.Reader().QueryRowContext(t.Context(),
+		`SELECT COUNT(*) FROM job_history WHERE request_id = ?`, 11).Scan(&leases); err != nil {
+		t.Fatalf("count job_history rows: %v", err)
+	}
+
+	if leases > 1 {
+		t.Errorf("request 11 was assigned %d separate leases; the redelivered batch consumed "+
+			"another one for a job that was already over", leases)
+	}
+}
+
 // fakeSession stands in for a scale-set message session. It never returns work,
 // so the listener does nothing but escrow, advertise, and release — which is the
 // whole of what this test is about.
 type fakeSession struct {
 	onPoll func(maxCapacity int)
 	onGet  func() (*Message, error)
-	stats  *Statistics
+	// onDelete fails an acknowledgement, which is what makes GitHub redeliver the
+	// message — the case every handler has to be idempotent against.
+	onDelete func(id int64) error
+	stats    *Statistics
 	// acquired records every request id the listener asked GitHub to claim, so a
 	// test can assert WHICH class of message drove the acquisition.
 	acquiredMu sync.Mutex
@@ -610,7 +834,13 @@ func (f *fakeSession) GetMessage(ctx context.Context, _ int64, maxCapacity int) 
 
 func (f *fakeSession) Statistics() *Statistics { return f.stats }
 
-func (f *fakeSession) DeleteMessage(context.Context, int64) error { return nil }
+func (f *fakeSession) DeleteMessage(_ context.Context, id int64) error {
+	if f.onDelete != nil {
+		return f.onDelete(id)
+	}
+
+	return nil
+}
 
 func (f *fakeSession) AcquireJobs(_ context.Context, ids []int64) ([]int64, error) {
 	f.acquiredMu.Lock()
