@@ -1,9 +1,11 @@
 package github
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -67,6 +69,57 @@ func TestConvertManifestRedactsANestedURLError(t *testing.T) {
 	// clue about what actually failed.
 	if !strings.Contains(err.Error(), "inner boom") {
 		t.Errorf("redaction discarded the transport's message: %v", err)
+	}
+}
+
+// A non-201 response never went through redaction: apiError renders the body,
+// and an intermediary that echoes the request route into its error message puts
+// the still-live code straight on the operator's terminal.
+func TestConvertManifestRedactsTheCodeFromAnErrorBody(t *testing.T) {
+	const code = "super-secret-one-time-code"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		// A proxy echoing the path it could not reach.
+		if _, err := fmt.Fprintf(w, `{"message":"upstream failed for %s"}`, r.URL.Path); err != nil {
+			t.Errorf("write test response: %v", err)
+		}
+	}))
+	defer srv.Close()
+
+	_, err := convertManifestAt(t.Context(), srv.Client(), srv.URL, code)
+	if err == nil {
+		t.Fatal("expected an error from a 502")
+	}
+
+	if strings.Contains(err.Error(), code) {
+		t.Errorf("an error body leaked the one-time code:\n%v", err)
+	}
+}
+
+// Redaction must not destroy the error chain: replacing the wrapped error with
+// errors.New broke errors.Is against context.DeadlineExceeded and every other
+// classification a caller might make.
+func TestRedactionKeepsTheErrorChainInspectable(t *testing.T) {
+	const code = "super-secret-one-time-code"
+
+	sentinel := errors.New("sentinel transport failure")
+
+	client := &http.Client{Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		return nil, &url.Error{Op: "Post", URL: r.URL.String(), Err: sentinel}
+	})}
+
+	_, err := convertManifestAt(t.Context(), client, "https://example.invalid", code)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+
+	if strings.Contains(err.Error(), code) {
+		t.Errorf("the code survived redaction:\n%v", err)
+	}
+
+	if !errors.Is(err, sentinel) {
+		t.Errorf("redaction broke the error chain; errors.Is could not find the transport error: %v", err)
 	}
 }
 
@@ -276,6 +329,61 @@ func TestAppFormattingRedactsCredentials(t *testing.T) {
 	// Still useful for diagnosis.
 	if !strings.Contains(render("%v", app), "billet-acme") {
 		t.Error("redaction removed the identifying fields too")
+	}
+}
+
+// fmt.Formatter covers direct formatting and nothing else. billet standardizes
+// on log/slog, whose JSON handler uses encoding/json — which reads the exported
+// fields and their tags. `logger.Info("created", "app", app)` was a full
+// private-key disclosure into wherever the logs go.
+func TestAppDoesNotLeakThroughStructuredLogging(t *testing.T) {
+	app := App{
+		ID:            42,
+		Slug:          "billet-acme",
+		PEM:           "-----BEGIN RSA PRIVATE KEY-----\nSECRETKEYMATERIAL\n",
+		WebhookSecret: "SECRETWEBHOOK",
+		ClientSecret:  "SECRETCLIENT",
+	}
+
+	secrets := []string{"SECRETKEYMATERIAL", "SECRETWEBHOOK", "SECRETCLIENT"}
+
+	for name, newHandler := range map[string]func(*bytes.Buffer) slog.Handler{
+		"json": func(b *bytes.Buffer) slog.Handler { return slog.NewJSONHandler(b, nil) },
+		"text": func(b *bytes.Buffer) slog.Handler { return slog.NewTextHandler(b, nil) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			var buf bytes.Buffer
+
+			slog.New(newHandler(&buf)).Info("created", "app", app, "ptr", &app)
+
+			for _, secret := range secrets {
+				if strings.Contains(buf.String(), secret) {
+					t.Errorf("the %s handler leaked %q:\n%s", name, secret, buf.String())
+				}
+			}
+		})
+	}
+
+	// Plain encoding/json too — anything that serializes the struct.
+	encoded, err := json.Marshal(app)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	for _, secret := range secrets {
+		if strings.Contains(string(encoded), secret) {
+			t.Errorf("json.Marshal leaked %q:\n%s", secret, encoded)
+		}
+	}
+
+	// Decoding must still populate everything, or onboarding cannot work.
+	var decoded App
+	if err := json.Unmarshal([]byte(`{"id":7,"pem":"KEY"}`), &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if decoded.PEM != "KEY" {
+		t.Errorf("redacting MarshalJSON broke decoding; PEM = %q", decoded.PEM)
 	}
 }
 

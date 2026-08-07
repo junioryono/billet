@@ -321,8 +321,28 @@ func New(db *state.DB, limits Limits, tiers []config.Tier, opts ...Option) (*All
 			return nil, fmt.Errorf("alloc: duplicate tier label %q", t.Label)
 		}
 
+		// A pin is validated, not silently normalized away. Trimming
+		// unconditionally turned `node: "   "` into an unpinned tier here — the
+		// same silent loss of a placement constraint that config.Load was fixed
+		// to reject, still reachable through this constructor. And a name like
+		// "mac mini" matches no node that could ever register, so the lease would
+		// escrow capacity and never bind.
 		normalized := *t
-		normalized.Node = strings.TrimSpace(t.Node)
+
+		if t.Node != "" {
+			normalized.Node = strings.TrimSpace(t.Node)
+
+			if normalized.Node == "" {
+				return nil, fmt.Errorf(
+					"alloc: tier %q pins node %q, which is blank; a pin that normalizes away silently "+
+						"unpins the tier", t.Label, t.Node)
+			}
+
+			if err := config.ValidateNodeName(fmt.Sprintf("alloc: tier %q", t.Label), normalized.Node); err != nil {
+				return nil, err
+			}
+		}
+
 		a.tiers[t.Label] = normalized
 	}
 
