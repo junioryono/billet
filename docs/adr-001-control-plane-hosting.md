@@ -1,7 +1,7 @@
 # ADR-001: Where the control plane runs, and what stores its state
 
 **Status:** accepted, Aug 2026
-**Decision:** a single small EC2 instance with SQLite on EBS, recovered by an ASG of one.
+**Decision:** a single small EC2 instance with SQLite on EBS, recovered by **EC2 auto-recovery**.
 **Rejected for now:** DynamoDB, Fargate, Aurora, Lambda.
 
 ## The requirement, and how it changed
@@ -43,8 +43,13 @@ All us-east-1, Linux, on-demand, checked Aug 2026. Rates move; re-check before a
 Inputs: `t4g.nano` $0.0042/hr (~$3.07/mo), `t4g.micro` $0.0084/hr, `t4g.small` ~$0.0168/hr; gp3 EBS
 $0.08/GB-month; Fargate ARM $0.03238/vCPU-hr and $0.00356/GB-hr, minimum task 0.25 vCPU / 0.5 GB.
 
-**Fargate is not cheaper than a small EC2 for an always-on process.** The minimum task size lands at
-roughly a `t4g.small`, and it cannot amortise idle the way a burstable instance does.
+**Fargate at minimum size is ~$7.21/month** — `(0.25 × $0.03238 + 0.5 × $0.00356) × 730` — which is
+cheaper than a `t4g.small` and about the same as a `t4g.micro`. An earlier draft claimed Fargate was
+not cheaper than a small EC2; that contradicted this very table and is corrected here.
+
+The defensible claim is narrower: **Fargate plus the state rewrite it forces saves nothing** against a
+correctly-sized `t4g.micro`, and a burstable instance amortises idle in a way a fixed task size does
+not. The rewrite, not the compute, is what decides this.
 
 ## Why not DynamoDB
 
@@ -55,7 +60,11 @@ It was considered seriously, and it is **technically feasible** — this is not 
   — moving the check outside it measured **28 grants against a ceiling of 4** under concurrency. That
   maps onto `TransactWriteItems`: a conditional update of a usage-counter item plus the lease `Put`,
   atomically. The counter is a hot item, which at tens of writes per minute does not matter.
-- The reaper's expiry scan wants a GSI on `expires_at`.
+- The reaper's expiry scan is the awkward one, and "a GSI on `expires_at`" — which an earlier draft
+  said — **is not sufficient**. DynamoDB queries require partition-key equality, so `expires_at` as a
+  GSI key does not answer "every lease expiring before now". It needs a constant or sharded partition
+  key with `expires_at` as the sort key, or a low-volume scan. Worth stating so an implementation
+  does not start from a range query DynamoDB cannot express.
 
 Three reasons it is not worth doing yet:
 
@@ -81,12 +90,24 @@ Two DynamoDB facts worth keeping regardless:
 
 ## The decision
 
-**A single `t4g.small` running `billet server`, SQLite on a gp3 EBS volume, in an ASG of one** (or
-EC2 auto-recovery). The instance dies, a replacement starts, the volume reattaches, SQLite continues.
-Roughly $13/month, no code change, and combined with the 24-hour queue grace an outage costs minutes
-of queueing and no jobs.
+**A single `t4g.micro` or `t4g.small` running `billet server`, SQLite on a gp3 EBS volume, recovered
+by EC2 auto-recovery.** Combined with the 24-hour queue grace, an outage costs minutes of queueing
+and no jobs.
 
-`t4g.micro` at ~$7 is probably sufficient — the controller should idle in tens of MB. Size down after
+**EC2 auto-recovery, NOT an Auto Scaling group.** This distinction is the whole recovery story and an
+earlier draft of this ADR got it wrong. Auto-recovery restarts *the same instance*, on new underlying
+hardware, keeping its instance id, its EBS volumes and their attachments — SQLite comes back to the
+data it left. An ASG does not do that: replacement launches a *new* instance from a launch template,
+which has no knowledge of the terminated instance's data volume, so the controller would come up with
+an empty or missing disk. "The volume reattaches" is true of auto-recovery and false of an ASG.
+
+If an ASG is wanted anyway (for the health-check behaviour), the volume has to be handled explicitly:
+an AZ-pinned volume with deletion disabled, plus lifecycle-hook or EventBridge automation that
+detaches, attaches and mounts it, and **fails closed** rather than starting on an empty disk. That is
+real machinery and should not be hand-waved. Auto-recovery covers less (it handles host failure, not
+a wedged process) but needs none of it.
+
+`t4g.micro` at ~$7 is probably sufficient — the controller should idle in tens of MB. Size after
 measuring rather than before.
 
 ### What this does NOT give you, stated plainly
@@ -102,9 +123,15 @@ this document exists partly so nobody later reads "it's on AWS now" as though it
 
 ## Consequences
 
-- Nodes dial **out** to the controller, so it needs no inbound. The scale-set API is outbound
-  long-poll, so hosting on AWS **does not require webhook mode** — those two questions got conflated
-  early and are unrelated.
+- **No inbound FROM GITHUB.** The scale-set API is outbound long-poll, so hosting on AWS does not
+  require webhook mode — those two questions got conflated early and are unrelated.
+
+  This is NOT "no inbound at all", and an earlier draft said so carelessly. Nodes dial out to the
+  controller, which means the controller *accepts* those connections: it needs a reachable listen
+  address and a path for node-originated mTLS — restricted security-group ingress, a VPN or overlay
+  (Tailscale/Headscale/WireGuard), or a reverse tunnel. Taken literally, "no inbound" would mean the
+  EPYC box could never connect and nothing would ever run. The listen address also cannot stay on
+  loopback as it is in the dev config.
 - mTLS bootstrap for nodes now matters more: they are no longer on the same LAN. Enrollment,
   authorization, rotation, revocation and CA-key backup move onto the critical path (task #16).
 - Backups: SQLite's backup API to S3, with a **rehearsed** restore. An untested backup is not one.

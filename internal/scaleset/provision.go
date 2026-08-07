@@ -115,48 +115,108 @@ func (c *Client) EnsureScaleSet(ctx context.Context, name, group string, labels 
 // internal handle and the name is what an operator has: it is the tier label
 // from their own billet.yaml.
 //
-// Refuses to delete a scale set whose labels are not the ones this tier asked
-// for, exactly as adoption does. Deleting somebody else's scale set because it
-// happened to share a name is far worse than refusing to.
-func (c *Client) DeleteScaleSet(ctx context.Context, name, group string, labels []string) error {
+// By default it refuses a scale set whose labels are not this tier's, exactly as
+// adoption does. FORCE exists because that refusal would otherwise be a trap:
+// labels drift — somebody edits them in the UI, or an older billet created the
+// set with a different set — and then billet will not delete it and the UI
+// cannot, which is precisely the stuck state this function exists to prevent.
+// Force is per-invocation and single-tier by construction at the CLI, and the
+// mismatch error names it.
+//
+// Returns whether something was actually deleted, so the caller can tell
+// "removed it" from "there was nothing there". Those look identical to an
+// operator otherwise, and they are not: absence is scoped to the runner group
+// being asked about, so a tier that was created under a DIFFERENT group reports
+// absent here while the original survives untouched.
+func (c *Client) DeleteScaleSet(
+	ctx context.Context, name, group string, labels []string, force bool,
+) (bool, error) {
 	if group == "" {
 		group = DefaultRunnerGroup
 	}
 
 	rg, err := c.gh.GetRunnerGroupByName(ctx, group)
 	if err != nil {
-		return fmt.Errorf("scaleset: find runner group %q: %w", group, err)
+		return false, fmt.Errorf("scaleset: find runner group %q: %w", group, err)
 	}
 
 	if rg == nil {
-		return fmt.Errorf("scaleset: runner group %q does not exist", group)
+		return false, fmt.Errorf("scaleset: runner group %q does not exist", group)
 	}
 
 	existing, err := c.gh.GetRunnerScaleSet(ctx, rg.ID, name)
 	if err != nil {
-		return fmt.Errorf("scaleset: look up scale set %q: %w", name, err)
+		return false, fmt.Errorf("scaleset: look up scale set %q: %w", name, err)
 	}
 
 	if existing == nil {
-		// Already gone. Idempotent on purpose: teardown is the operation most
-		// likely to be re-run after a partial failure, and an error here would
-		// make a second attempt look like a new problem.
-		c.log.Info("scale set does not exist; nothing to delete", "name", name, "group", group)
-
-		return nil
+		// Idempotent on purpose: teardown is the operation most likely to be
+		// re-run after a partial failure, so this is not an error. It IS reported
+		// as distinct from a deletion, because "nothing here" only means nothing
+		// in THIS runner group.
+		return false, nil
 	}
 
 	if err := checkLabels(name, existing, labels); err != nil {
-		return err
+		if !force {
+			return false, fmt.Errorf("%w\n\nIf the labels drifted and this scale set is genuinely "+
+				"billet's, delete it with --force --tier %s; GitHub's UI cannot remove it either, "+
+				"so refusing without an escape hatch would leave it unremovable", err, name)
+		}
+
+		c.log.Warn("deleting a scale set whose labels do not match the tier, because --force",
+			"name", name, "group", group, "id", existing.ID,
+			"labels", labelNames(existing), "tier_labels", labels)
 	}
 
 	if err := c.gh.DeleteRunnerScaleSet(ctx, existing.ID); err != nil {
-		return fmt.Errorf("scaleset: delete scale set %q: %w", name, err)
+		return false, fmt.Errorf("scaleset: delete scale set %q: %w", name, err)
 	}
 
 	c.log.Info("deleted scale set", "name", name, "group", group, "id", existing.ID)
 
-	return nil
+	return true, nil
+}
+
+// Describe reports what a scale set of this name looks like on GitHub, so a
+// destructive command can show the operator the actual object rather than the
+// name they typed. Returns nil when there is nothing by that name.
+func (c *Client) Describe(ctx context.Context, name, group string) (*ScaleSet, []string, error) {
+	if group == "" {
+		group = DefaultRunnerGroup
+	}
+
+	rg, err := c.gh.GetRunnerGroupByName(ctx, group)
+	if err != nil {
+		return nil, nil, fmt.Errorf("scaleset: find runner group %q: %w", group, err)
+	}
+
+	if rg == nil {
+		return nil, nil, fmt.Errorf("scaleset: runner group %q does not exist", group)
+	}
+
+	existing, err := c.gh.GetRunnerScaleSet(ctx, rg.ID, name)
+	if err != nil {
+		return nil, nil, fmt.Errorf("scaleset: look up scale set %q: %w", name, err)
+	}
+
+	if existing == nil {
+		return nil, nil, nil
+	}
+
+	return &ScaleSet{ID: existing.ID, Name: existing.Name, Group: group}, labelNames(existing), nil
+}
+
+// labelNames pulls the plain names off a scale set's typed labels.
+func labelNames(set *gh.RunnerScaleSet) []string {
+	out := make([]string, 0, len(set.Labels))
+	for _, l := range set.Labels {
+		out = append(out, l.Name)
+	}
+
+	sort.Strings(out)
+
+	return out
 }
 
 // checkLabels refuses a scale set whose labels are not the ones requested.

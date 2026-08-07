@@ -196,29 +196,10 @@ func cmdServer(ctx context.Context, args []string) error {
 
 // runServer starts the control plane and blocks until it is told to stop.
 func runServer(ctx context.Context, cfg *config.Config, dryRun bool) error {
-	// The SAME hardened reader `billet check` uses — type, mode, size and parse.
-	// Validated before anything else is built: a bad key otherwise fails at the
-	// first API call, by which time a scale set may already exist against a
-	// half-configured deployment, and GitHub keeps that.
-	key, err := readPrivateKey(cfg.GitHub.PrivateKeyPath)
-	if err != nil {
-		return err
-	}
-
-	// client_id when it is recorded, app id otherwise. GitHubAppAuth documents
-	// ClientID as "the Client ID of the application (app id also works)", which
-	// is why client_id stayed optional.
-	appIdentity := cfg.GitHub.ClientID
-	if appIdentity == "" {
-		appIdentity = strconv.FormatInt(cfg.GitHub.AppID, 10)
-	}
-
-	client, err := scaleset.New(scaleset.Config{
-		ConfigURL:      "https://github.com/" + cfg.GitHub.Org,
-		ClientID:       appIdentity,
-		InstallationID: cfg.GitHub.InstallationID,
-		PrivateKey:     string(key),
-	}, slog.Default())
+	// Built by the SHARED constructor, so the server and teardown authenticate
+	// identically. Two near-identical constructions is how one of them ends up
+	// pointed at a different organization than the other.
+	client, err := newScaleSetClient(cfg)
 	if err != nil {
 		return err
 	}
@@ -326,7 +307,7 @@ func cmdNode(_ context.Context, args []string) error {
 // different organization than the other.
 func newScaleSetClient(cfg *config.Config) (*scaleset.Client, error) {
 	if cfg.GitHub == nil {
-		return nil, errors.New("billet: no github section in the config")
+		return nil, errors.New("no github section in the config")
 	}
 
 	key, err := readPrivateKey(cfg.GitHub.PrivateKeyPath)
@@ -362,7 +343,10 @@ func newScaleSetClient(cfg *config.Config) (*scaleset.Client, error) {
 func cmdTeardown(ctx context.Context, args []string) error {
 	fs := newFlagSet("billet teardown")
 	cfgPath := addConfigFlag(fs)
-	tier := fs.String("tier", "", "delete only this tier's scale set (default: every tier in the config)")
+	tier := fs.String("tier", "", "delete this tier's scale set")
+	all := fs.Bool("all", false, "delete every tier's scale set")
+	force := fs.Bool("force", false,
+		"delete even if the scale set's labels are not this tier's (requires --tier)")
 	yes := fs.Bool("yes", false, "skip the confirmation prompt")
 
 	if err := parse(fs, args); err != nil {
@@ -374,7 +358,32 @@ func cmdTeardown(ctx context.Context, args []string) error {
 		return err
 	}
 
+	// Checked HERE rather than inside the client. config.Load accepts a node-only
+	// config with no github section, and everything below reads cfg.GitHub.Org —
+	// so without this a node config panics instead of explaining itself.
+	if cfg.GitHub == nil {
+		return fmt.Errorf("%s has no github section, so it names no organization to "+
+			"delete anything from", *cfgPath)
+	}
+
+	// "Delete everything" is NEVER the default for a destructive command.
+	//
+	// It used to be: an omitted --tier selected every tier, which is
+	// indistinguishable from `--tier "$TIER"` with TIER unset. A script with an
+	// empty variable would have deleted every scale set in the org while looking
+	// like it asked for one.
+	switch {
+	case *all && *tier != "":
+		return errors.New("pass either --tier or --all, not both")
+	case *all && *force:
+		return errors.New("--force applies to one scale set at a time, so it needs --tier")
+	case !*all && *tier == "":
+		return errors.New("name a tier with --tier, or pass --all to delete every tier's " +
+			"scale set")
+	}
+
 	wanted := cfg.Tiers
+
 	if *tier != "" {
 		wanted = nil
 
@@ -385,36 +394,12 @@ func cmdTeardown(ctx context.Context, args []string) error {
 		}
 
 		if len(wanted) == 0 {
-			return fmt.Errorf("billet: no tier named %q in %s", *tier, *cfgPath)
+			return fmt.Errorf("no tier named %q in %s", *tier, *cfgPath)
 		}
 	}
 
 	if len(wanted) == 0 {
-		return errors.New("billet: the config declares no tiers, so there is nothing to delete")
-	}
-
-	fmt.Printf("This deletes the following scale sets from %s:\n", cfg.GitHub.Org)
-
-	for i := range wanted {
-		fmt.Printf("  %s\n", wanted[i].Label)
-	}
-
-	fmt.Println("\nRunners already registered to them are removed by GitHub.")
-
-	if !*yes {
-		// Typed confirmation rather than y/N. This is a destructive act against
-		// somebody's organization, and the cost of a stray keystroke is a tier
-		// that stops accepting work with no obvious cause.
-		fmt.Print("\nType the organization name to confirm: ")
-
-		var typed string
-		if _, err := fmt.Scanln(&typed); err != nil {
-			return fmt.Errorf("billet: teardown cancelled: %w", err)
-		}
-
-		if typed != cfg.GitHub.Org {
-			return errors.New("billet: teardown cancelled")
-		}
+		return errors.New("the config declares no tiers, so there is nothing to delete")
 	}
 
 	client, err := newScaleSetClient(cfg)
@@ -422,16 +407,119 @@ func cmdTeardown(ctx context.Context, args []string) error {
 		return err
 	}
 
+	// The ACTUAL objects, fetched before anything is destroyed. An operator
+	// confirming a destructive act should be shown what is on GitHub, not the
+	// names they typed into their own config.
+	fmt.Printf("This deletes the following from %s:\n\n", cfg.GitHub.Org)
+
+	var found int
+
 	for i := range wanted {
 		t := &wanted[i]
-		if err := client.DeleteScaleSet(ctx, t.Label, t.RunnerGroup, []string{t.Label}); err != nil {
+
+		set, labels, err := client.Describe(ctx, t.Label, t.RunnerGroup)
+		if err != nil {
 			return err
+		}
+
+		if set == nil {
+			fmt.Printf("  %-32s not present\n", t.Label)
+
+			continue
+		}
+
+		found++
+
+		fmt.Printf("  %-32s id %d, group %s, labels %v\n", t.Label, set.ID, set.Group, labels)
+	}
+
+	if found == 0 {
+		fmt.Println("\nNothing to do.")
+
+		return nil
+	}
+
+	fmt.Println("\nRunners already registered to them are removed by GitHub.")
+
+	if !*yes {
+		if err := confirmOrganization(ctx, cfg.GitHub.Org); err != nil {
+			return err
+		}
+	}
+
+	for i := range wanted {
+		t := &wanted[i]
+
+		deleted, err := client.DeleteScaleSet(ctx, t.Label, t.RunnerGroup, []string{t.Label}, *force)
+		if err != nil {
+			return err
+		}
+
+		// Reported distinctly. Absence is scoped to the runner group being asked
+		// about, so a tier created under a different group reports "not present"
+		// here while the original survives — and an operator who reads that as
+		// "deleted" walks away from an object that is still there.
+		if !deleted {
+			fmt.Printf("%s: nothing in runner group %q; if it was created under a different "+
+				"group it is still there\n", t.Label, groupOrDefault(t.RunnerGroup))
 		}
 	}
 
 	fmt.Println("Done.")
 
 	return nil
+}
+
+// groupOrDefault names the runner group a tier resolves to, for messages.
+func groupOrDefault(group string) string {
+	if group == "" {
+		return scaleset.DefaultRunnerGroup
+	}
+
+	return group
+}
+
+// confirmOrganization makes the operator type the organization name.
+//
+// Typed confirmation rather than y/N: this is destructive against somebody's
+// organization, and the cost of a stray keystroke is a tier that silently stops
+// accepting work.
+//
+// Read on a goroutine so the context still wins. fmt.Scanln does not observe
+// cancellation, so a Ctrl-C at the prompt would otherwise cancel ctx and leave
+// the process blocked on stdin.
+func confirmOrganization(ctx context.Context, org string) error {
+	fmt.Printf("\nType the organization name to confirm: ")
+
+	typed := make(chan string, 1)
+	failed := make(chan error, 1)
+
+	go func() {
+		var answer string
+
+		if _, err := fmt.Scanln(&answer); err != nil {
+			failed <- err
+
+			return
+		}
+
+		typed <- answer
+	}()
+
+	select {
+	case <-ctx.Done():
+		fmt.Println()
+
+		return ctx.Err()
+	case err := <-failed:
+		return fmt.Errorf("teardown cancelled: %w", err)
+	case answer := <-typed:
+		if answer != org {
+			return errors.New("teardown cancelled")
+		}
+
+		return nil
+	}
 }
 
 func cmdCheck(ctx context.Context, args []string) error {

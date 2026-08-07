@@ -77,7 +77,8 @@ billet package.
 ## Decisions written down
 
 `docs/adr-001-control-plane-hosting.md` — where the control plane runs and what stores its state.
-Short version: a single small EC2 with SQLite on EBS in an ASG of one, ~$13/mo, no code change.
+Short version: a single small EC2 with SQLite on EBS, recovered by EC2 auto-recovery (NOT an ASG —
+an ASG launches a fresh instance that does not reattach the data volume), ~$7-13/mo, no code change.
 DynamoDB was considered seriously and rejected FOR NOW — it is feasible, it saves nothing, and it
 costs a rewrite of the two most invariant-dense packages. Revisit it when more than one controller is
 genuinely wanted, which is the only thing SQLite cannot do at any price.
