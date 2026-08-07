@@ -78,11 +78,22 @@ func githubAppCreate(ctx context.Context, args []string) error {
 	keyWritten := false
 
 	defer func() {
-		keyFile.Close()
+		if credentialIssued {
+			keyFile.Close()
 
-		if !credentialIssued {
+			return
+		}
+
+		// Verified to still be OUR reservation before unlinking. The name is not
+		// proof of ownership: if this run's placeholder was removed and a second
+		// run installed its key at the same path, removing by pathname deletes
+		// that run's credential. Checked while the descriptor is still open, so
+		// there is something to compare against.
+		if err := destinationIsStillReserved(keyFile, *keyPath); err == nil {
 			_ = os.Remove(*keyPath)
 		}
+
+		keyFile.Close()
 	}()
 
 	open := openBrowser
@@ -206,6 +217,18 @@ func reserveKeyFile(path string) (*os.File, error) {
 	}
 
 	if info.Mode().IsRegular() && info.Size() == 0 {
+		// A staging file beside an empty reservation is a real key: the previous
+		// run was killed after the write and before the rename. It has to be
+		// reported HERE, because the advice for a bare empty reservation is "rm
+		// it and re-run" — followed literally, that abandons the key and the App
+		// it belongs to.
+		if staged := stagingPath(path); isNonEmptyFile(staged) {
+			return nil, fmt.Errorf(
+				"%s is an empty placeholder, but %s holds an App private key from an interrupted run — "+
+					"do NOT delete it. Move it into place and check it:\n    mv %s %s\n    billet check",
+				path, staged, staged, path)
+		}
+
 		return nil, fmt.Errorf(
 			"%s exists but is empty, which is what an interrupted `billet github-app create` leaves "+
 				"behind. If no other billet run is in progress, delete it and re-run:\n    rm %s",
@@ -217,78 +240,135 @@ func reserveKeyFile(path string) (*os.File, error) {
 			"and GitHub cannot re-issue one that is lost", path)
 }
 
-// writeKeyAtomically installs the key so no crash can leave a partial one at the
-// destination.
+// writeKeyAtomically installs the key GitHub has just issued, preferring a
+// crash-safe staged write and falling back to the reserved descriptor.
 //
-// Writing straight into the reserved file was not crash-safe: a SIGKILL or power
-// loss mid-write leaves a truncated PEM at the final path, which the next run
-// then refuses because the file exists — wedging the deployment on a credential
-// that looks present and is not. Syncing only the file was not durable either:
-// without syncing the DIRECTORY, the entry can be lost after billet has printed
-// "Saved".
-//
-// So: write a sibling temp file, fsync it, rename it over the reservation —
-// rename is atomic on POSIX — then fsync the directory. The destination only
-// ever holds the empty reservation or the complete key.
-// onInstalled is called the instant the key is at its final path, BEFORE
-// durability is confirmed. Everything after that point is best-effort reporting:
-// once the credential is installed it must never be deleted, whatever else
-// fails, because GitHub consumed the one-time code to produce it.
+// The fallback is the point. The staged path is better in every way EXCEPT that
+// it needs to create a second file after issuance, and a directory that turned
+// read-only during the browser flow, an exhausted inode table or a full disk all
+// make that impossible — at which point the previous version returned an error
+// and exited with the only copy of an unrepeatable private key in memory. The
+// reservation was opened before the flow precisely so there is always somewhere
+// to put it.
 func writeKeyAtomically(reserved *os.File, path string, pem []byte, onInstalled func()) error {
-	dir := filepath.Dir(path)
-
-	tmp, err := os.CreateTemp(dir, ".billet-key-*")
-	if err != nil {
-		return fmt.Errorf("create a temporary file next to %s: %w", path, err)
+	stageErr := installViaStagingFile(reserved, path, pem, onInstalled)
+	if stageErr == nil {
+		return nil
 	}
 
-	tmpName := tmp.Name()
-	installed := false
+	// The credential exists somewhere and the error says where, so there is
+	// nothing left to attempt — retrying would risk writing a second copy.
+	if errors.Is(stageErr, errCredentialPreserved) {
+		return stageErr
+	}
+
+	// Staging never reached the destination, so the key GitHub issued is still
+	// only in memory. Fall back to the descriptor reserved before the browser
+	// flow — the whole reason it is held open.
+	//
+	// This gives up crash-atomicity: a power cut mid-write leaves a truncated
+	// PEM at the final path, which `billet check` reports and an operator fixes
+	// by deleting it and re-running. That is a strictly better outcome than the
+	// alternative here, which is a registered App whose one and only private key
+	// was discarded because a temporary file could not be created.
+	if err := installIntoReservation(reserved, path, pem, onInstalled); err != nil {
+		return fmt.Errorf(
+			"the App key could not be stored (%w) and the fallback write also failed (%w). "+
+				"GitHub cannot re-issue this key: delete the App on GitHub and run this command again",
+			stageErr, err)
+	}
+
+	return nil
+}
+
+// installViaStagingFile is the crash-safe path: write a sibling file, make it
+// durable, then rename it over the reservation.
+//
+// Writing straight into the reserved file was not crash-safe: a SIGKILL or
+// power loss mid-write leaves a truncated PEM at the final path, which the next
+// run then refuses because the file exists — wedging the deployment on a
+// credential that looks present and is not. Syncing only the file was not
+// durable either: without syncing the DIRECTORY, the entry can be lost after
+// billet has printed "Saved".
+//
+// onInstalled is called the instant the key is at its final path, BEFORE
+// durability is confirmed. Everything after that point is best-effort
+// reporting: once the credential is installed it must never be deleted,
+// whatever else fails, because GitHub consumed the one-time code to produce it.
+func installViaStagingFile(reserved *os.File, path string, pem []byte, onInstalled func()) error {
+	dir := filepath.Dir(path)
+	staging := stagingPath(path)
+
+	// O_EXCL, and never adopting what is already there: a file at this name is
+	// either a concurrent run's staging file or a previous run's preserved key,
+	// and truncating either one destroys a credential. reserveKeyFile reports it
+	// before the browser flow starts, so reaching this branch means it appeared
+	// during the flow.
+	tmp, err := os.OpenFile(staging, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return fmt.Errorf("create %s: %w", staging, err)
+	}
+
+	reachedDestination := false
 
 	defer func() {
 		_ = tmp.Close()
 
-		// The temp file is removed ONLY while it is still scratch. Once the
-		// rename has succeeded this name no longer exists, and if the rename
-		// FAILED the temp file is the only copy of the key — deleting it there
-		// would throw away a credential that cannot be re-issued.
-		if !installed {
-			return
+		// Removed ONLY once the key is at its destination. If it is not, this
+		// file is the only copy — deleting it would throw away a credential that
+		// cannot be re-issued. (After a successful rename the name is already
+		// gone, so this is a no-op there.)
+		if reachedDestination {
+			_ = os.Remove(staging)
 		}
-
-		_ = os.Remove(tmpName)
 	}()
 
-	if err := tmp.Chmod(0o600); err != nil {
-		return fmt.Errorf("restrict %s: %w", tmpName, err)
-	}
-
 	if _, err := tmp.Write(pem); err != nil {
-		return fmt.Errorf("write %s: %w", tmpName, err)
+		return fmt.Errorf("write %s: %w", staging, err)
 	}
 
 	if err := tmp.Sync(); err != nil {
-		return fmt.Errorf("sync %s: %w", tmpName, err)
+		return fmt.Errorf("sync %s: %w", staging, err)
 	}
 
 	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close %s: %w", tmpName, err)
+		return fmt.Errorf("close %s: %w", staging, err)
+	}
+
+	// The staging NAME is made durable before the rename. A crash in the window
+	// between the two otherwise leaves the only copy of the key behind an entry
+	// the filesystem has not committed — losing not just the location but the
+	// file. Best-effort: if the directory cannot be synced, renaming anyway is
+	// strictly better than stopping here.
+	//
+	//nolint:errcheck // A failure here costs durability in a window the rename closes; it is not worth failing over.
+	_ = syncDir(dir)
+
+	// The destination is verified to still be THIS run's reservation.
+	//
+	// Both the rename below and the caller's cleanup act on a pathname, while
+	// what this run owns is a descriptor. If the empty reservation is removed
+	// and a second run installs its key at the same path, renaming over it
+	// destroys a credential that is not ours to replace.
+	if err := destinationIsStillReserved(reserved, path); err != nil {
+		return fmt.Errorf("%w: %w\nThis run's key is preserved at %s — GitHub cannot re-issue it",
+			errCredentialPreserved, err, staging)
 	}
 
 	// The reservation descriptor is released first: on Windows an open handle
 	// blocks the rename, and it buys nothing once the content is durable.
 	_ = reserved.Close()
 
-	if err := os.Rename(tmpName, path); err != nil {
-		// The temp file survives and holds the only copy. Name it, or the
+	if err := os.Rename(staging, path); err != nil {
+		// The staging file survives and holds the only copy. Name it, or the
 		// operator is left with a registered App and no way to find its key.
 		return fmt.Errorf(
-			"install the key at %s: %w\nThe key IS saved at %s — move it to %s by hand; "+
+			"%w: installing it at %s failed (%w).\nThe key IS saved at %s — move it to %s by hand; "+
 				"GitHub cannot re-issue it",
-			path, err, tmpName, path)
+			errCredentialPreserved, path, err, staging, path)
 	}
 
-	installed = true
+	reachedDestination = true
 
 	// Announced BEFORE the directory fsync. The credential is at its final path
 	// and must never be unlinked from here on: a directory sync can fail on a
@@ -299,13 +379,86 @@ func writeKeyAtomically(reserved *os.File, path string, pem []byte, onInstalled 
 
 	if err := syncDir(dir); err != nil {
 		return fmt.Errorf(
-			"the key is installed at %s but its directory entry could not be flushed: %w\n"+
+			"%w: the key is installed at %s but its directory entry could not be flushed: %w\n"+
 				"It is present now; a power loss before the filesystem flushes could still lose it, "+
 				"so verify with `billet check` after a reboot",
-			path, err)
+			errCredentialPreserved, path, err)
 	}
 
 	return nil
+}
+
+// installIntoReservation writes the key through the descriptor reserved before
+// the browser flow, for when no second file can be created at all.
+func installIntoReservation(reserved *os.File, path string, pem []byte, onInstalled func()) error {
+	if err := destinationIsStillReserved(reserved, path); err != nil {
+		return err
+	}
+
+	if _, err := reserved.Write(pem); err != nil {
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+
+	if err := reserved.Sync(); err != nil {
+		return fmt.Errorf("sync %s: %w", path, err)
+	}
+
+	// The key is at its destination. Everything from here is best-effort, for
+	// the same reason as in the staged path.
+	onInstalled()
+
+	// Not reported: Sync above already forced the bytes out, so a close failure
+	// cannot un-write a key that is now on disk.
+	_ = reserved.Close()
+
+	return nil
+}
+
+// destinationIsStillReserved reports whether path still names the file this run
+// reserved, rather than one another process created in its place.
+func destinationIsStillReserved(reserved *os.File, path string) error {
+	ours, err := reserved.Stat()
+	if err != nil {
+		return fmt.Errorf("inspect the reserved key file: %w", err)
+	}
+
+	current, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("inspect %s: %w", path, err)
+	}
+
+	if !os.SameFile(ours, current) {
+		return fmt.Errorf(
+			"%s is no longer the file this run reserved — another `billet github-app create` "+
+				"has claimed it, and overwriting it would destroy that App's key", path)
+	}
+
+	return nil
+}
+
+// errCredentialPreserved is the sentinel onboarding checks to decide whether
+// its "delete the App and try again" advice applies. It lives in the github
+// package because that is the layer that renders the advice.
+var errCredentialPreserved = github.ErrCredentialPreserved
+
+// stagingPath names the staging file deterministically, derived from the
+// destination.
+//
+// os.CreateTemp's random suffix meant a crash between the synced staging file
+// and the rename left the only copy of the key under a hidden name nothing
+// reported and nothing could predict. A derived name is one the next run can
+// look for and the operator can be told about, and deriving it from the
+// destination keeps two runs onto different key paths out of each other's way.
+func stagingPath(path string) string {
+	return filepath.Join(filepath.Dir(path), "."+filepath.Base(path)+".billet-partial")
+}
+
+// isNonEmptyFile reports whether path is a regular file with content. Lstat, so
+// a symlink is not followed into something else.
+func isNonEmptyFile(path string) bool {
+	info, err := os.Lstat(path)
+
+	return err == nil && info.Mode().IsRegular() && info.Size() > 0
 }
 
 // syncDir forces a directory entry to durable storage. Syncing a file does not

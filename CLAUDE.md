@@ -213,36 +213,71 @@ GitHub returns the App private key **exactly once**, from the manifest conversio
 re-issue. Every rule here exists because a review found a way to lose or leak it, and several were
 introduced by the fix for the previous one.
 
-**Nothing deletes the key path after GitHub has issued a credential.** `billet github-app create`
-reserves the destination *before* the browser flow, so a registered App can never outlive the ability
-to store its key — but the cleanup for that reservation must key off *did GitHub issue anything*, not
-*did the write report success*. A rename can commit and still return an error on a FUSE or network
-mount, and the difference is a deleted key. An empty reservation left behind costs one `rm`.
+**Nothing deletes the key path after GitHub has issued a credential.** The cleanup for the
+reservation keys off *did GitHub issue anything*, not *did the write report success*. A rename can
+commit and still return an error on a FUSE or network mount, and the difference is a deleted key. An
+empty reservation left behind costs one `rm`. Cleanup and install also verify, via `os.SameFile`
+against the still-open descriptor, that the path is **still this run's reservation** — the pathname is
+not proof of ownership, and a second run may have installed its own key there.
 
-**The reservation is never adopted.** An empty file at the key path looks like a crashed run's
-leftover and is equally a *concurrent* run's live reservation; adopting it puts two processes on one
-destination. Refuse, and say which case it is.
+**The reservation is never adopted, and it is a real fallback rather than a probe.** An empty file at
+the key path looks like a crashed run's leftover and is equally a *concurrent* run's live reservation;
+adopting it puts two processes on one destination. Refuse, and say which case it is. The descriptor is
+held open because the staged write below has to create a *second* file **after** issuance, and that
+can fail on its own — a directory that turned read-only during the browser flow, an exhausted inode
+table. Reserving without ever writing to it left that case returning an error with the only copy of
+an unrepeatable key in memory.
 
-**The write is atomic**: sibling temp file → fsync → rename → fsync the directory, with the
-credential marked installed the instant the rename returns. The destination only ever holds the empty
-reservation or the complete key.
+**The write is atomic where it can be**: staging file → fsync → fsync the directory → rename → fsync
+the directory, with the credential marked installed the instant the rename returns. The staging name
+is *derived from the destination*, not random, so a crash in the rename window leaves the key
+somewhere the next run reports by name instead of under an unpredictable hidden file. When staging is
+impossible the fallback writes through the reservation, trading crash-atomicity for not losing the
+key; a torn PEM there is what `billet check` catches.
+
+**An error that preserved the credential says so with `github.ErrCredentialPreserved`.** Recovery
+advice is opposite in the two cases — delete the App and retry, versus keep the App and move the file
+— and onboarding cannot tell them apart from the error text. Wrapping every failure with "delete it
+and try again" contradicted the message directly beneath it.
 
 **`billet check` proves the key WORKS**, not that it exists — regular file, no group/other permission
 bits, bounded read, and actually parsed, all from one descriptor opened `O_NONBLOCK` so a FIFO cannot
 hang it. `os.Stat` alone accepted a directory, an empty file, a truncated PEM and mode 0644.
 
-**The one-time manifest code is redacted from every error leaving the conversion**, not at chosen
-call sites. It is still live when the exchange fails, and it reaches the operator's terminal through
-both `*url.Error` (which embeds the URL) and `apiError` (which renders a response body an
-intermediary may have echoed the route into). Redaction preserves `Unwrap`, or callers lose
-`errors.Is` against `context.DeadlineExceeded`.
+**The one-time code is removed STRUCTURALLY, and from every error in the chain.** It is still live
+when the exchange fails, and it reaches a terminal through `*url.Error`, which embeds the whole URL.
+Two rules, learned separately:
 
-**`App` cannot be rendered.** `String`/`GoString` on a **value** receiver (a pointer receiver is not
-consulted when a value is formatted), `Format` so no verb falls back to the raw fields — `%d` printed
-the key before it existed — and `MarshalJSON` plus `LogValue`, because billet standardizes on
-`log/slog` and its JSON handler ignores `fmt` entirely. Only marshaling is redirected; decoding
-GitHub's response still populates every field. The one gap `fmt` makes impossible to close is an
-`App` reached through an unexported field of another struct.
+- **Sanitize where the error is created, not at the boundary.** Every wrapper renders the message of
+  the error beneath it, so cleaning the innermost one means no wrapper can carry the code and no later
+  stage has to recognise the encoding it arrived in. A `*url.Error` is *rebuilt* with a fixed path
+  rather than pattern-matched — double-encoding and over-encoding both defeat matching. String
+  scrubbing (`redactString`) survives only as defence in depth.
+- **Redaction has to hold for the whole chain.** Sanitizing `Error()` while `Unwrap` returned the
+  original meant `errors.As(err, &urlErr)` handed back the live URL, and any reporter that walks
+  causes serialized it. The walk must handle `errors.Join` trees too — `errors.Unwrap` returns nil for
+  one, so a chain-only walk stops dead at the join. Leaf identity is preserved, or callers lose
+  `errors.Is` against `context.DeadlineExceeded`.
+
+**The conversion response body is never rendered.** This is the one endpoint in GitHub's API that
+returns a private key, so an intermediary that forwards the credential-bearing 201 under a rewritten
+status would otherwise put it on the terminal. Only GitHub's own `message` passes through, and only
+after it is checked for credential markers. Other endpoints keep `apiError`.
+
+**A code that does not redeem is discarded, not fatal.** The unguessable callback path is handed to
+`open`/`xdg-open` as a command-line argument, and argv is readable by other local processes — so both
+the path and the `state` must be assumed known, and only what a caller can *do* with them is bounded.
+Treating the first code to arrive as final was a kill switch: inject a worthless one, and onboarding
+ended with the App created and its key unrecoverable. Only GitHub's own rejection retries; a request
+that could not complete still fails immediately, because no second redirect is coming.
+
+**`App` is redacted on every rendering path billet can reach.** `String`/`GoString` on a **value**
+receiver (a pointer receiver is not consulted when a value is formatted), `Format` so no verb falls
+back to the raw fields — `%d` printed the key before it existed — and `MarshalJSON` plus `LogValue`,
+because billet standardizes on `log/slog` and its JSON handler ignores `fmt` entirely. Only marshaling
+is redirected; decoding GitHub's response still populates every field. Not absolute, and the gaps are
+known: an `App` reached through an unexported field of another struct, and any serializer that is
+neither `fmt` nor `encoding/json` nor `slog` — reflection-based dumpers read the fields directly.
 
 ### Never guess at a byte size
 

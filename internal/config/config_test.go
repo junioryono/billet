@@ -779,6 +779,35 @@ func TestHostnameDefaultExplainsItself(t *testing.T) {
 	}
 }
 
+// An EMPTY hostname is still a defaulted name, and the operator still never
+// typed one.
+//
+// Tracking provenance in the derived string conflated "billet supplied this"
+// with "the result was non-empty", so a machine reporting no hostname at all —
+// which happens in containers — fell back to the generic "node.name is invalid".
+// That is the exact wording the hostname branch exists to avoid, in the case
+// where it is least obvious what happened.
+func TestBlankHostnameStillExplainsItself(t *testing.T) {
+	body := strings.Replace(validConfig, "  name: epyc-1\n", "", 1)
+
+	cfg := &Config{}
+	if err := yaml.Unmarshal([]byte(body), cfg); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	cfg.hostname = func() (string, error) { return "", nil }
+	cfg.applyDefaults()
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate accepted an empty hostname-derived node name")
+	}
+
+	if !strings.Contains(err.Error(), "hostname") {
+		t.Errorf("error should say the name came from the hostname, got: %v", err)
+	}
+}
+
 // A usable hostname is still adopted silently, which is the whole point of the
 // default on a single-box deployment.
 func TestUsableHostnameIsAdopted(t *testing.T) {

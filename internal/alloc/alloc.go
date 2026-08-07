@@ -249,17 +249,21 @@ func New(db *state.DB, limits Limits, tiers []config.Tier, opts ...Option) (*All
 		// raw fields rather than the effective limit — a negative
 		// macos_vm_limit slipped past a check reading MacOSLimit(), which
 		// normalizes it to zero whenever the allowlist excludes macOS.
+		// The map KEY is how every lookup finds this policy, so a key that is not
+		// the canonical node name silently detaches the policy from its host: the
+		// tier's node is normalized, the key is not, the lookup misses, and an
+		// explicit macos_vm_limit of 0 is replaced by Apple's default of 2. The
+		// policy appears to be enforced and is not.
+		//
+		// Two checks compose to prevent that, and there is deliberately no third.
+		// An explicit "the key has no surrounding whitespace" test used to sit
+		// here and could never fire in either order: Validate rejects a padded
+		// NAME outright (the label pattern is anchored, so the padding is part of
+		// what must match), and a key that differs from a valid name is caught
+		// below. Two mutation runs were what established that — the case written
+		// to cover it stayed green with the check deleted.
 		if errs := p.Validate(fmt.Sprintf("alloc: node %q", node)); len(errs) > 0 {
 			return nil, errors.Join(errs...)
-		}
-
-		// The map KEY is how every lookup finds this policy, so a key that is
-		// not the canonical node name silently detaches the policy from its
-		// host: the tier's node is normalized, the key is not, the lookup misses,
-		// and an explicit macos_vm_limit of 0 is replaced by Apple's default of
-		// 2. The policy appears to be enforced and is not.
-		if node != strings.TrimSpace(node) {
-			return nil, fmt.Errorf("alloc: node key %q is not canonical; it has surrounding whitespace", node)
 		}
 
 		if p.Name != node {
