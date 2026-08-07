@@ -337,14 +337,29 @@ func writeKeyAtomically(reserved *os.File, path string, pem []byte, onInstalled 
 		// descriptor is the only proof that the name still refers to the file this
 		// run created, and a Stat on a closed one fails, which read as "not ours"
 		// and left the second copy behind on every successful install.
-		stillOurs := destinationIsStillReserved(reserved, staging)
+		stillOurs := verifyInstalled(reserved, staging)
 
 		_ = reserved.Close()
 
-		if stillOurs != nil {
+		switch stillOurs {
+		case identityMatches:
+		case identityDiffers:
+			// Absence is the ORDINARY outcome when something moved staging to the
+			// destination — the install succeeded through that very path — so it
+			// is not worth alarming about. Anything else at that name is not
+			// billet's to remove, and worth saying.
+			if lookupPath(staging) == pathAbsent {
+				return
+			}
+
 			fmt.Fprintf(os.Stderr,
-				"\nWarning: %s is no longer this run's file, so it was left in place (%v).\n",
-				staging, stillOurs)
+				"\nWarning: %s is not this run's file, so it was left in place.\n", staging)
+
+			return
+		case identityUnknown:
+			fmt.Fprintf(os.Stderr,
+				"\nWarning: the key is installed at %s, but billet could not confirm what %s is, so it "+
+					"was left alone. Check whether it is a second copy of the key.\n", path, staging)
 
 			return
 		}
@@ -447,14 +462,22 @@ func writeKeyAtomically(reserved *os.File, path string, pem []byte, onInstalled 
 	// If the name was REPLACED, linking it installs somebody else's file at the
 	// destination and reports success. Neither is detectable after the fact, so
 	// both are checked for before, and the result is verified after.
-	if err := destinationIsStillReserved(reserved, staging); err != nil {
+	switch verifyInstalled(reserved, staging) {
+	case identityMatches:
+	case identityDiffers:
 		// The key is still in memory, so this is RECOVERABLE — writing it
 		// somewhere new costs nothing and the alternative is a credential GitHub
 		// will not re-issue. Reporting it lost here was a plain logic error:
 		// "the inode has no name and no portable call can give it one" is true
 		// and irrelevant, because the bytes never depended on that inode.
 		return recoverKey(dir, path, pem, fmt.Errorf(
-			"the key was written, but %s no longer refers to the file it was written to: %w", staging, err))
+			"the key was written, but %s no longer refers to the file it was written to", staging))
+	case identityUnknown:
+		// A stat that failed has not established that staging is gone, and
+		// recovering here would write a second copy of the key while reporting
+		// only one of them.
+		return uncertainAt(staging, path, fmt.Errorf(
+			"the key was written, but billet could not confirm %s still refers to it", staging))
 	}
 
 	// The one step that creates the destination, and it cannot replace.
@@ -479,12 +502,27 @@ func writeKeyAtomically(reserved *os.File, path string, pem []byte, onInstalled 
 		// something else — in which case the key is already exactly where it
 		// belongs, and writing a recovery copy would scatter a second one for no
 		// reason. Checked before anything else is concluded.
-		if verifyInstalled(reserved, path) == identityMatches {
+		switch verifyInstalled(reserved, path) {
+		case identityMatches:
 			installed = true
 
 			onInstalled()
 
+			// Routed through the same durability step as the ordinary install: the
+			// earlier sync made the STAGING name durable, and it is the rename to
+			// the destination that now has to survive a crash.
+			if err := syncDir(dir); err != nil {
+				return preservedAt(path, fmt.Errorf(
+					"the key is at %s but its directory entry could not be flushed: %w\n"+
+						"It is present now; verify with `billet check` after a reboot", path, err))
+			}
+
 			return nil
+		case identityUnknown:
+			// Not knowing whether the key already landed is not grounds for
+			// writing another copy of it.
+			return uncertainAt(path, path, cause)
+		case identityDiffers:
 		}
 
 		// Re-checked, because the pre-link check is stale by the time the link
@@ -516,8 +554,16 @@ func writeKeyAtomically(reserved *os.File, path string, pem []byte, onInstalled 
 	case identityMatches:
 	case identityDiffers:
 		// The link picked up a file swapped in behind the pre-check. What is at
-		// the destination is not billet's to remove, and this run's key is still
-		// in memory — so write it somewhere new rather than declaring it lost.
+		// the destination is not billet's to remove — but STAGING usually still
+		// holds this run's key, and writing a third copy while naming only the
+		// newest is worse than pointing at the one that is already there.
+		if verifyInstalled(reserved, staging) == identityMatches {
+			return preservedAt(staging, fmt.Errorf(
+				"%s was linked, but it is not the file this run wrote — something replaced the staging "+
+					"name mid-install. %s is not billet's to remove", path, path))
+		}
+
+		// Staging is gone too, and the key is still in memory.
 		return recoverKey(dir, path, pem, fmt.Errorf(
 			"%s was linked, but it is not the file this run wrote — the staging name was replaced "+
 				"mid-install", path))
@@ -617,7 +663,21 @@ func recoverKey(dir, destination string, pem []byte, cause error) error {
 
 	_ = f.Close()
 
-	if writeErr == nil && held == identityMatches {
+	// IDENTITY decides whether the pathname may be spoken about at all.
+	//
+	// Inspecting `name` answers "is there a usable key at that name", which is a
+	// different question from "is this run's key there" — and conflating them let
+	// a replaced recovery file be reported as this App's key while the real one
+	// sat at a moved path nobody was told about. The pathname is only attributed
+	// to this descriptor when they are known to be the same file.
+	if held != identityMatches {
+		return uncertainAt(name, destination, fmt.Errorf(
+			"%w\nThe key was written to a recovery file, but %s can no longer be tied to it (write: %w). "+
+				"Look for a recently written PEM private key in %s before doing anything else",
+			cause, name, writeErr, dir))
+	}
+
+	if writeErr == nil {
 		// The NAME is made durable too. f.Sync persists contents, not the new
 		// directory entry, so a crash could otherwise lose a path billet has
 		// already told the operator to go to.
@@ -632,8 +692,8 @@ func recoverKey(dir, destination string, pem []byte, cause error) error {
 				"before moving it there", cause, name, destination))
 	}
 
-	// The write reported a failure, or the name can no longer be tied to it. What
-	// is actually in that file decides, not either of those.
+	// The write reported a failure and the name IS this descriptor's file, so
+	// what is in it decides — not the return value.
 	switch inspectKey(name) {
 	case keyPresent:
 		return preservedAt(name, fmt.Errorf(

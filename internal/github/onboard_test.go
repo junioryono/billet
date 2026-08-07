@@ -41,6 +41,9 @@ type fakeGitHub struct {
 	// never issued. Set before serving.
 	rejectCode   string
 	rejectStatus int
+	// rejectPrefix rejects every code with this prefix, for driving the
+	// many-injected-codes case.
+	rejectPrefix string
 
 	// ambiguousFirst makes the conversion answer rejectStatus for the first N
 	// attempts at ANY code, then behave normally. It exists to drive the
@@ -91,7 +94,13 @@ func (g *fakeGitHub) handler() http.Handler {
 		}
 
 		presented := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/app-manifests/"), "/conversions")
-		if g.rejectCode != "" && presented == g.rejectCode {
+
+		rejected := g.rejectCode != "" && presented == g.rejectCode
+		if g.rejectPrefix != "" && strings.HasPrefix(presented, g.rejectPrefix) {
+			rejected = true
+		}
+
+		if rejected {
 			status := g.rejectStatus
 			if status == 0 {
 				status = http.StatusNotFound
@@ -1004,6 +1013,78 @@ func TestAPersistentlyAmbiguousCodeDoesNotBlockTheHonestOne(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("an injected code that never resolves blocked the honest one: %v", err)
+	}
+
+	if result == nil || result.App == nil || result.App.ID == 0 {
+		t.Fatal("onboarding produced no app")
+	}
+}
+
+// A callback billet ACKNOWLEDGED must be exchanged at least once.
+//
+// Bounding admission rather than retries made this strictly worse than having no
+// bound at all: injected codes that stay ambiguous fill the retry set
+// permanently, and the honest redirect — already answered "App created" by the
+// handler — was then dropped before it was ever tried. The unbounded version at
+// least reached it eventually.
+func TestTheHonestCodeIsTriedEvenBehindAFullRetrySet(t *testing.T) {
+	fake := newFakeGitHub(t)
+	fake.rejectStatus = http.StatusUnprocessableEntity
+
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	defer cancel()
+
+	browser := &browser{t: t, fake: fake, client: srv.Client()}
+
+	var calls atomic.Int32
+
+	attacked := func(ctx context.Context, target string) error {
+		if calls.Add(1) == 1 {
+			state := extractAttr(browser.get(ctx, target), "state=")
+			if state == "" {
+				return errors.New("could not read the state from the start page")
+			}
+
+			// Comfortably more than maxPendingCodes, all of them permanently
+			// ambiguous, all queued BEFORE the honest redirect.
+			for i := range maxPendingCodes * 2 {
+				forged := fmt.Sprintf("%s/callback?code=injected-%d&state=%s",
+					strings.TrimSuffix(target, "/"), i, state)
+
+				req, err := http.NewRequestWithContext(ctx, http.MethodGet, forged, http.NoBody)
+				if err != nil {
+					return err
+				}
+
+				resp, err := srv.Client().Do(req)
+				if err != nil {
+					return err
+				}
+
+				resp.Body.Close()
+			}
+		}
+
+		return browser.open(ctx, target)
+	}
+
+	// Every injected code is ambiguous forever; only the real one redeems.
+	fake.rejectPrefix = "injected-"
+
+	result, err := Onboard(ctx, OnboardOptions{
+		Org:          "acme",
+		OpenBrowser:  attacked,
+		Log:          func(string, ...any) {},
+		Client:       srv.Client(),
+		InstallPoll:  20 * time.Millisecond,
+		apiBase:      srv.URL,
+		OnAppCreated: func(*App) error { return nil },
+	})
+	if err != nil {
+		t.Fatalf("the honest code was dropped behind a full retry set: %v", err)
 	}
 
 	if result == nil || result.App == nil || result.App.ID == 0 {
