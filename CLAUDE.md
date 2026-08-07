@@ -277,7 +277,7 @@ outstanding of any kind — apparently authorised by the party holding the commi
 check only to avoid racing an in-flight acquisition. It was the same bug. The staleness check bounds
 how old *billet's promise* is; it says nothing about how old the *statistics* are, and the response
 carries no observation time, generation, or request identity to pin them to. Elapsed local time was
-still doing the authorising, now paired with a snapshot of unbounded freshness — plus a quiet
+still doing the authorising, now paired with a snapshot of unknown freshness — plus a quiet
 assumption that those counters are exhaustive, atomically maintained, and scoped as expected.
 
 So: **a freshness check on your own record is not a causal fence on someone else's snapshot.** To act
