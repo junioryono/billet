@@ -646,7 +646,36 @@ func conversionError(status int, _ []byte) error {
 		return fmt.Errorf("%w: %w", errCodeRejected, rendered)
 	}
 
+	// An AMBIGUOUS status keeps the code and tries it again.
+	//
+	// Making 422 fatal was still credential loss with extra steps: the code lives
+	// in a local variable, the loopback server exits with the function, and
+	// "wait and run the command again" creates a SECOND App rather than
+	// recovering the first one's key. If the honest code drew a 422 because an
+	// attacker tripped abuse protection, the App exists and its key is gone.
+	//
+	// So the same code is retried with backoff until it redeems, is definitively
+	// rejected, or the manifest deadline expires. Nothing is discarded on a
+	// response that never said the code was bad.
+	if ambiguousStatuses[status] || status >= 500 {
+		return fmt.Errorf("%w: %w", errCodeAmbiguous, rendered)
+	}
+
 	return rendered
+}
+
+// errCodeAmbiguous marks a response that did not establish anything about the
+// code, so the same code is worth presenting again.
+var errCodeAmbiguous = errors.New("github: the conversion did not resolve the code")
+
+// ambiguousStatuses are responses that say nothing about the presented code.
+// 5xx is treated the same way without being enumerated.
+var ambiguousStatuses = map[int]bool{
+	http.StatusUnprocessableEntity: true, // "Validation failed, OR the endpoint has been spammed"
+	http.StatusTooManyRequests:     true, // the rate limit, not the code
+	http.StatusRequestTimeout:      true,
+	http.StatusForbidden:           true, // GitHub also uses this for abuse detection
+	http.StatusBadRequest:          true, // a proxy returns this for header and policy reasons
 }
 
 // codeRejectionStatuses are the responses that mean the presented code itself
@@ -667,9 +696,14 @@ func conversionError(status int, _ []byte) error {
 // — which is the case that actually needed handling. 414 stays because the
 // callback bounds code length before queueing, making it unreachable from a
 // queued code and therefore harmless to list.
+// 414 is deliberately NOT here. The callback bounds code length before
+// queueing, so a 414 for a code billet accepted cannot be about the code — it is
+// an intermediary's own limit, and discarding the honest code on it would orphan
+// an App that already exists. "Unreachable, therefore harmless to list" had the
+// reasoning backwards: if it is ever observed, that is evidence the response is
+// NOT classifying this code.
 var codeRejectionStatuses = map[int]bool{
-	http.StatusNotFound:          true, // GitHub does not know this code
-	http.StatusRequestURITooLong: true, // it cannot be a real code
+	http.StatusNotFound: true, // GitHub does not know this code
 }
 
 // errCodeRejected marks a conversion that failed because GitHub refused the

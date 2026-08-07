@@ -41,6 +41,13 @@ type fakeGitHub struct {
 	// never issued. Set before serving.
 	rejectCode   string
 	rejectStatus int
+
+	// ambiguousFirst makes the conversion answer rejectStatus for the first N
+	// attempts at ANY code, then behave normally. It exists to drive the
+	// retry-the-same-code path, which is the only way to tell "billet kept the
+	// code" apart from "billet skipped it".
+	ambiguousFirst int32
+	attempts       atomic.Int32
 }
 
 func newFakeGitHub(t *testing.T) *fakeGitHub {
@@ -73,6 +80,13 @@ func (g *fakeGitHub) handler() http.Handler {
 
 		if !strings.HasSuffix(r.URL.Path, "/conversions") {
 			http.Error(w, "bad path", http.StatusNotFound)
+			return
+		}
+
+		if g.attempts.Add(1) <= g.ambiguousFirst {
+			w.WriteHeader(g.rejectStatus)
+			fmt.Fprint(w, `{"message":"try again"}`)
+
 			return
 		}
 

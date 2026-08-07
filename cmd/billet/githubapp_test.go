@@ -433,10 +433,49 @@ func TestInspectKeyDistinguishesAbsentFromUnverifiable(t *testing.T) {
 		if got := inspectKey(unreadable); got != keyUnverifiable {
 			t.Errorf("an unreadable file: inspectKey = %v, want keyUnverifiable", got)
 		}
+	}
+}
 
-		if !mayHoldKey(unreadable) {
-			t.Error("mayHoldKey said an unreadable file is safe to delete")
+// The third state only matters if the CALLER acts on it.
+//
+// Asserting a helper left the destructive path unproven: reserveKeyFile is what
+// prints `rm`, and it was reaching that branch for a file it had merely failed
+// to read. Unlink permission comes from the DIRECTORY, not the file, so an
+// operator can follow that advice and destroy a key billet simply could not open.
+func TestReserveKeyFileWillNotOfferToDeleteAFileItCannotRead(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("unix permission bits do not gate reads here")
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.pem")
+	staging := filepath.Join(dir, ".app.pem.billet-partial")
+
+	if err := os.WriteFile(staging, testKey(t), 0o600); err != nil {
+		t.Fatalf("seed staged key: %v", err)
+	}
+
+	if err := os.Chmod(staging, 0o000); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+
+	t.Cleanup(func() {
+		if err := os.Chmod(staging, 0o600); err != nil {
+			t.Errorf("restore mode: %v", err)
 		}
+	})
+
+	_, err := reserveKeyFile(path)
+	if err == nil {
+		t.Fatal("reserveKeyFile proceeded past a file it could not read")
+	}
+
+	if strings.Contains(err.Error(), "rm ") {
+		t.Errorf("billet offered to delete a file it could not read: %v", err)
+	}
+
+	if !strings.Contains(err.Error(), "cannot read it") {
+		t.Errorf("the error does not say why billet stopped: %v", err)
 	}
 }
 

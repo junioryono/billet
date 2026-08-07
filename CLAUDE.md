@@ -230,11 +230,19 @@ filesystem that cannot hard-link billet reports the staged key and the operator 
   prints the exact `rm` after inspecting whether it is a leftover or a credential.
 - The **staging file is removed only after a successful install** — `os.Link` leaves two names for one
   private key, so that removal is mandatory — and only after `os.SameFile` confirms the name still
-  refers to this run's file. A failure to remove it is reported, never swallowed: an unmentioned second
-  copy of an App key is what nobody finds until it matters.
+  refers to this run's file, with the directory synced afterwards so a crash cannot resurrect the entry.
+  A failure to remove it is reported, never swallowed: an unmentioned second copy of an App key is what
+  nobody finds until it matters. **The `SameFile` check narrows this race; it does not close it.** Go
+  unlinks by name, the check cannot be atomic with it, and a file swapped in between the two would be
+  deleted. That residual is accepted and stated rather than claimed away.
 - **"Could not tell" is never "no key here."** `inspectKey` returns present / absent / unverifiable, and
-  only *absent* permits a deletion or a "your credential is gone" message. A transient open or read
-  error previously read as proof that no credential existed.
+  only *absent* permits a deletion or a "your credential is gone" message. Callers use `inspectKey`
+  directly — the boolean wrappers were deleted, because every one of them collapsed the third state at
+  exactly the call site that needed it. Note that unlink permission comes from the DIRECTORY, so an
+  operator can act on a bad `rm` suggestion for a file billet could not itself read.
+- **The staging name is re-inspected after `O_EXCL` fails.** The answer from before the attempt is
+  stale by then: a concurrent run's empty reservation can have become a complete key in between, and
+  printing "it holds no usable key" beside an exact `rm` handed the operator a command that destroys it.
 - **"Not a valid key" is not "safe to clobber."** Whether to recommend `mv` asks `fileExists`, not
   `inspectKey` — a PEM with trailing junk, a format this build cannot parse, or a file a live writer
   has not finished are all worth keeping, and `mv` replaces.
@@ -296,9 +304,12 @@ GitHub documents it as *"Validation failed, **or the endpoint has been spammed**
 feeding forged codes can trip abuse protection and make the honest code's 422 look like a rejection.
 400 is not code-specific either — a proxy returns it for header and policy reasons.
 
-An ambiguous status is therefore **fatal rather than skipped**, and says why: aborting costs a re-run,
-while advancing past a code that may have been good costs the key. A forged code is a random string,
-so GitHub answers 404 — the case that actually needed handling is the one that is unambiguous.
+An ambiguous status is therefore **retried with the same code**, backing off until it redeems, is
+definitively rejected, or GitHub's window closes. Making it *fatal* was still credential loss with
+extra steps — the code lives in a local variable and the loopback listener dies with the flow, so
+"run the command again" builds a SECOND App rather than recovering the first one's key. Nothing is
+discarded on a response that never said the code was bad. A forged code is a random string, so GitHub
+answers 404, and the case that actually needed handling is the one that is unambiguous.
 
 The callback queue is deep, and a callback that does **not** fit is refused rather than dropped — a
 silent drop plus an "App created" page meant the honest redirect could be discarded while its browser

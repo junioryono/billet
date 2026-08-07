@@ -505,36 +505,48 @@ func TestOnlyCodeSpecificStatusesDiscardTheCode(t *testing.T) {
 	// 404 is the one unambiguous answer: GitHub does not know this code. A forged
 	// code is a random string, so this is the status a forged one draws — which
 	// is exactly the case that needed handling.
-	for _, status := range []int{http.StatusNotFound, http.StatusRequestURITooLong} {
-		t.Run("discards/"+http.StatusText(status), func(t *testing.T) {
-			if err := conversionError(status, nil); !errors.Is(err, errCodeRejected) {
-				t.Errorf("HTTP %d was not classified as a rejected code: %v", status, err)
-			}
-		})
+	if err := conversionError(http.StatusNotFound, nil); !errors.Is(err, errCodeRejected) {
+		t.Errorf("HTTP 404 was not classified as a rejected code: %v", err)
 	}
 
 	// None of these establish that the presented code is bad, so discarding it
 	// would throw away a credential over a condition the next code cannot fix.
+	// They are AMBIGUOUS — the same code is retried rather than skipped.
 	//
 	// 422 is the one worth naming: GitHub documents it as "Validation failed, OR
 	// the endpoint has been spammed". An attacker feeding forged codes can trip
-	// abuse protection and make the honest code's 422 look like a rejection, so a
-	// status that can mean "you asked too often" must never discard a code.
+	// abuse protection and make the honest code's 422 look like a rejection.
+	//
+	// 414 is here because the callback bounds code length before queueing: a 414
+	// for a code billet accepted is an intermediary's own limit, not a statement
+	// about the code, so discarding on it would orphan an App that exists.
 	for _, status := range []int{
 		http.StatusUnprocessableEntity,
 		http.StatusTooManyRequests,
-		http.StatusBadRequest, // a proxy returns this for header and policy reasons
+		http.StatusBadRequest,
 		http.StatusRequestTimeout,
-		http.StatusUnauthorized,
-		http.StatusForbidden, // GitHub also uses this for abuse detection
-		http.StatusUpgradeRequired,
-		http.StatusRequestHeaderFieldsTooLarge,
+		http.StatusForbidden,
 		http.StatusInternalServerError,
 		http.StatusBadGateway,
 	} {
-		t.Run("keeps/"+http.StatusText(status), func(t *testing.T) {
-			if err := conversionError(status, nil); errors.Is(err, errCodeRejected) {
+		t.Run("retries/"+http.StatusText(status), func(t *testing.T) {
+			err := conversionError(status, nil)
+
+			if errors.Is(err, errCodeRejected) {
 				t.Errorf("HTTP %d discarded the code; it does not establish that the code is bad", status)
+			}
+
+			if !errors.Is(err, errCodeAmbiguous) {
+				t.Errorf("HTTP %d is neither a rejection nor retryable, so the code is silently lost: %v",
+					status, err)
+			}
+		})
+	}
+
+	for _, status := range []int{http.StatusRequestURITooLong, http.StatusUpgradeRequired} {
+		t.Run("never discards/"+http.StatusText(status), func(t *testing.T) {
+			if err := conversionError(status, nil); errors.Is(err, errCodeRejected) {
+				t.Errorf("HTTP %d discarded the code", status)
 			}
 		})
 	}
@@ -543,67 +555,48 @@ func TestOnlyCodeSpecificStatusesDiscardTheCode(t *testing.T) {
 // The classification has to hold through the REAL flow, not just as a table.
 //
 // Asserting the status map on its own only proves it was copied into the test.
-// This drives onboarding: a forged code that GitHub answers 422 to must not end
-// the flow, because 422 can mean "the endpoint has been spammed" — which is
-// precisely what an attacker injecting codes causes.
-func TestAnAmbiguousRejectionDoesNotEndOnboarding(t *testing.T) {
+// This drives onboarding end to end against a server that answers 422 twice
+// before succeeding — the shape abuse protection produces.
+//
+// Getting this wrong is credential loss, not a delay. The code exists only in a
+// local variable and the loopback listener dies with the flow, so a run that
+// gives up has orphaned an App whose key GitHub will not re-issue. "Run the
+// command again" builds a SECOND App; it does not recover the first one's key.
+func TestAnAmbiguousRejectionRetriesTheSameCode(t *testing.T) {
 	fake := newFakeGitHub(t)
-	fake.rejectCode = "injected-by-a-local-process"
 	fake.rejectStatus = http.StatusUnprocessableEntity
+	fake.ambiguousFirst = 2
 
 	srv := httptest.NewServer(fake.handler())
 	defer srv.Close()
 
-	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
 	defer cancel()
 
 	browser := &browser{t: t, fake: fake, client: srv.Client()}
 
-	// Only the attacker acts. The legitimate browser is deliberately never
-	// driven: the flow is expected to end on the ambiguous rejection, and a
-	// second actor racing that shutdown would only add noise.
-	attacked := func(ctx context.Context, target string) error {
-		state := extractAttr(browser.get(ctx, target), "state=")
-		if state == "" {
-			return errors.New("could not read the state from the start page")
-		}
-
-		forged := strings.TrimSuffix(target, "/") + "/callback?code=" + fake.rejectCode + "&state=" + state
-
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, forged, http.NoBody)
-		if err != nil {
-			return err
-		}
-
-		resp, err := srv.Client().Do(req)
-		if err != nil {
-			return err
-		}
-
-		resp.Body.Close()
-
-		return nil
-	}
-
-	_, err := Onboard(ctx, OnboardOptions{
+	result, err := Onboard(ctx, OnboardOptions{
 		Org:          "acme",
-		OpenBrowser:  attacked,
+		OpenBrowser:  browser.open,
 		Log:          func(string, ...any) {},
 		Client:       srv.Client(),
 		InstallPoll:  20 * time.Millisecond,
 		apiBase:      srv.URL,
 		OnAppCreated: func(*App) error { return nil },
 	})
-
-	// An ambiguous rejection is fatal BY DESIGN — the alternative is discarding a
-	// code that may have been perfectly good. What must not happen is billet
-	// treating it as "that code was worthless" and silently moving on.
-	if err == nil {
-		t.Fatal("an ambiguous 422 was treated as a rejected code and the flow continued")
+	if err != nil {
+		t.Fatalf("an ambiguous rejection ended the flow and orphaned the App: %v", err)
 	}
 
-	if !strings.Contains(err.Error(), "spammed") {
-		t.Errorf("the error does not explain the ambiguity an operator has to act on: %v", err)
+	if result == nil || result.App == nil || result.App.ID == 0 {
+		t.Fatal("onboarding produced no app")
+	}
+
+	// Three conversions: two ambiguous answers, then the one that redeemed. Fewer
+	// would mean the retries never happened and this proves nothing; the count is
+	// what distinguishes "kept the code" from "was handed a second one".
+	if n := fake.conversions.Load(); n != 3 {
+		t.Errorf("conversions = %d, want 3 (two ambiguous, then success)", n)
 	}
 }
 
