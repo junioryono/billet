@@ -90,6 +90,24 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*provider.In
 		return nil, fmt.Errorf("docker: %s has no JIT config, so nothing would register", spec.Name)
 	}
 
+	// TRUST IS CHECKED HERE, and unknown is refused.
+	//
+	// The package comment has always said this backend must refuse untrusted work
+	// rather than warn about it, and until now nothing enforced that — the claim
+	// was documentation rather than behaviour. A container shares the host kernel,
+	// so fork-pull-request code running here has a materially weaker boundary than
+	// the microVM the rest of the design assumes.
+	//
+	// Unknown is refused too, not just untrusted. A caller that has not classified
+	// a job has not established it is safe to run somewhere weak, and defaulting
+	// that to "probably fine" is how the refusal gets bypassed by omission.
+	if spec.Trust != provider.TrustTrusted {
+		return nil, fmt.Errorf(
+			"docker: refusing to run %s work in a container: this backend shares the host "+
+				"kernel and is for trials and development, not for code billet cannot vouch "+
+				"for (job %s)", spec.Trust, spec.Name)
+	}
+
 	// THE CREDENTIAL GOES IN A FILE, NOT IN ARGV.
 	//
 	// `docker run -e VAR=value` puts the value in this process's command line,
@@ -170,11 +188,17 @@ func (p *Provider) Destroy(ctx context.Context, id string) error {
 		return nil
 	}
 
-	// "No such container" is the idempotent case and docker reports it as a
-	// failure. Matched on the ERROR, which carries stderr — where docker puts
-	// that message. Narrow on purpose, so anything else falls through to a real
-	// error rather than being swallowed.
-	if strings.Contains(strings.ToLower(err.Error()), "no such container") {
+	// "Already gone" is the idempotent case and the CLI reports it as a failure,
+	// so it has to be recognised from the message. That is fragile, and it is
+	// narrow on purpose: anything unrecognised falls through to a real error
+	// rather than being swallowed as success.
+	//
+	// Both docker's and podman's phrasings are matched, because podman is an
+	// explicitly supported binary and phrases it differently. A locale or version
+	// that phrases it a third way fails LOUDLY, which is the right direction to
+	// be wrong in — a swallowed teardown failure is a container nobody knows is
+	// running.
+	if isAlreadyGone(err) {
 		return nil
 	}
 
@@ -238,6 +262,31 @@ func (p *Provider) run(ctx context.Context, args ...string) (string, error) {
 	}
 
 	return stdout.String(), nil
+}
+
+// isAlreadyGone reports whether a removal failed because there was nothing to
+// remove.
+//
+// Message matching, because neither docker nor podman distinguishes this by exit
+// code. Kept to the exact phrasings each is known to use rather than something
+// permissive: matching loosely would swallow real failures, and a teardown
+// failure that reads as success leaves a container running that nothing is
+// tracking.
+func isAlreadyGone(err error) bool {
+	msg := strings.ToLower(err.Error())
+
+	for _, phrase := range []string{
+		"no such container",            // docker
+		"no such object",               // docker, some versions
+		"not find container",           // podman
+		"no container with name or id", // podman
+	} {
+		if strings.Contains(msg, phrase) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // short trims a container id for logs. The full id is never interesting and the

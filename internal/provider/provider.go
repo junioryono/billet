@@ -22,6 +22,35 @@ import (
 	"github.com/junioryono/billet/internal/config"
 )
 
+// TrustClass says how much the workload is trusted, which decides what may run
+// it. The zero value is UNKNOWN and every backend must treat it as untrusted.
+type TrustClass int
+
+const (
+	// TrustUnknown is the zero value, and it fails closed. A caller that has not
+	// classified a job has not established it is safe to run anywhere weak.
+	TrustUnknown TrustClass = iota
+	// TrustUntrusted is fork-pull-request work: arbitrary code from someone
+	// outside the organization. It requires a real isolation boundary.
+	TrustUntrusted
+	// TrustTrusted is work from the repository itself — a push, a schedule, a
+	// dispatch, or a same-repo pull request.
+	TrustTrusted
+)
+
+func (t TrustClass) String() string {
+	switch t {
+	case TrustUntrusted:
+		return "untrusted"
+	case TrustTrusted:
+		return "trusted"
+	case TrustUnknown:
+		return "unknown"
+	default:
+		return "unknown"
+	}
+}
+
 // Spec is one instance to launch.
 type Spec struct {
 	// Name identifies the instance to the operator and to GitHub. It is the
@@ -38,6 +67,11 @@ type Spec struct {
 	// Postgres service containers and Chromium both fail on the default 64MB in
 	// ways that look like unrelated crashes.
 	SHM config.ByteSize
+
+	// Trust is how much this workload is trusted. The zero value is UNKNOWN and
+	// backends refuse it, which is what makes an unclassified job impossible to
+	// route somewhere weak by omission rather than by decision.
+	Trust TrustClass
 
 	// JITConfig is the single-use runner registration.
 	//

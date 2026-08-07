@@ -225,7 +225,11 @@ func TestAvailableIsAcquiredAndAssignedConsumesEscrow(t *testing.T) {
 		}, nil
 	}
 
-	l := NewListener(a, tiers[0].Label, session)
+	l := NewListener(a, tiers[0].Label, session,
+		// A runner that starts things, because these assertions are about escrow
+		// rather than launching. The default fails closed, which correctly hands
+		// the capacity back and would empty every count below.
+		WithRunner(&fakeRunner{}))
 
 	// Observed DURING the run. Shutdown releases running leases as well as held
 	// ones — correctly, since nothing can be executing them yet — so anything
@@ -294,7 +298,11 @@ func TestRedeliveredAssignmentDoesNotConsumeASecondLease(t *testing.T) {
 		return nil, ErrNoMessage
 	}
 
-	l := NewListener(a, tiers[0].Label, session)
+	l := NewListener(a, tiers[0].Label, session,
+		// A runner that starts things, because these assertions are about escrow
+		// rather than launching. The default fails closed, which correctly hands
+		// the capacity back and would empty every count below.
+		WithRunner(&fakeRunner{}))
 
 	var running atomic.Int32
 
@@ -621,7 +629,11 @@ func TestOffersAreAcquiredOnlyUpToFreeEscrow(t *testing.T) {
 		return nil, ErrNoMessage
 	}
 
-	l := NewListener(a, tiers[0].Label, session)
+	l := NewListener(a, tiers[0].Label, session,
+		// A runner that starts things, because these assertions are about escrow
+		// rather than launching. The default fails closed, which correctly hands
+		// the capacity back and would empty every count below.
+		WithRunner(&fakeRunner{}))
 
 	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run: %v", err)
@@ -1190,7 +1202,11 @@ func TestAReofferedRequestKeepsItsExistingPromise(t *testing.T) {
 		return nil, ErrNoMessage
 	}
 
-	l = NewListener(a, tiers[0].Label, session)
+	l = NewListener(a, tiers[0].Label, session,
+		// A runner that starts things, because these assertions are about escrow
+		// rather than launching. The default fails closed, which correctly hands
+		// the capacity back and would empty every count below.
+		WithRunner(&fakeRunner{}))
 
 	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run: %v", err)
@@ -1449,10 +1465,13 @@ func TestCapacityIsHeldWhenTheComputeWillNotDie(t *testing.T) {
 
 	l := NewListener(a, tiers[0].Label, session, WithRunner(runner))
 
-	// The failure stops this listener, which is correct: it cannot account for a
-	// machine it can no longer reach.
-	if err := l.Run(ctx); err == nil || errors.Is(err, context.Canceled) {
-		t.Fatalf("a job whose compute would not die did not stop the listener, got %v", err)
+	// NOT fatal, and that is a deliberate separation of two questions. A listener
+	// error cancels every other listener, and their shutdowns then destroy every
+	// running job on the host — so one docker daemon hiccup while cleaning up a
+	// single finished job would take down the fleet. The capacity is held; the
+	// control plane keeps running.
+	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("a failed teardown of one job stopped the listener: %v", err)
 	}
 
 	usage, err := a.Usage(t.Context())

@@ -35,6 +35,7 @@ func TestTheJITConfigNeverAppearsInArgv(t *testing.T) {
 		Image:     "ghcr.io/actions/actions-runner:latest",
 		VCPU:      2,
 		Memory:    2 * config.GiB,
+		Trust:     provider.TrustTrusted,
 		JITConfig: secret,
 	})
 	if err != nil {
@@ -135,6 +136,7 @@ func TestLaunchRefusesASpecWithNoRegistration(t *testing.T) {
 	_, err := p.Launch(t.Context(), provider.Spec{
 		Name:  "billet-runner-1",
 		Image: "ghcr.io/actions/actions-runner:latest",
+		Trust: provider.TrustTrusted,
 	})
 	if err == nil {
 		t.Fatal("launched a runner with no JIT config; it would register nothing and take no job")
@@ -163,4 +165,48 @@ func stubDocker(t *testing.T) (script, argvFile string) {
 	}
 
 	return script, argvFile
+}
+
+// Untrusted and UNCLASSIFIED work are both refused.
+//
+// The package comment always said this backend must refuse untrusted work rather
+// than warn about it, and for a while nothing enforced that — the claim was
+// documentation rather than behaviour. A container shares the host kernel, so
+// fork-pull-request code here has a materially weaker boundary than the microVM
+// the rest of the design assumes.
+//
+// Unknown is refused alongside untrusted, and that is the part that matters. A
+// caller who has not classified a job has not established it is safe to run
+// somewhere weak, and treating the zero value as "probably fine" is how the
+// refusal gets bypassed by omission rather than by decision.
+func TestUntrustedAndUnclassifiedWorkIsRefused(t *testing.T) {
+	stub, argvFile := stubDocker(t)
+
+	for name, trust := range map[string]provider.TrustClass{
+		"unclassified": provider.TrustUnknown,
+		"untrusted":    provider.TrustUntrusted,
+	} {
+		t.Run(name, func(t *testing.T) {
+			p := New("billet-test", WithBinary(stub))
+
+			_, err := p.Launch(t.Context(), provider.Spec{
+				Name:      "billet-runner-1",
+				Image:     "ghcr.io/actions/actions-runner:latest",
+				Trust:     trust,
+				JITConfig: "a-registration",
+			})
+			if err == nil {
+				t.Fatalf("ran %s work in a container, which shares the host kernel", name)
+			}
+
+			if !strings.Contains(err.Error(), "shares the host kernel") {
+				t.Errorf("the refusal does not say why: %v", err)
+			}
+		})
+	}
+
+	// And nothing was started. A refusal that still launches is not a refusal.
+	if body, err := os.ReadFile(argvFile); err == nil && strings.Contains(string(body), "run") {
+		t.Errorf("a container was launched despite the refusal:\n%s", body)
+	}
 }

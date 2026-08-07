@@ -43,6 +43,7 @@ func TestRealDockerLaunchAndDestroy(t *testing.T) {
 		Image:     "busybox:latest",
 		VCPU:      1,
 		Memory:    256 * config.MiB,
+		Trust:     provider.TrustTrusted,
 		JITConfig: "not-a-real-registration",
 	})
 	if err != nil {
