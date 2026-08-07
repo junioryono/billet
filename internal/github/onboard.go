@@ -48,6 +48,11 @@ var ErrCredentialUncertain = errors.New("billet could not verify whether the App
 // exchange and the honest redirect would be dropped on arrival.
 const codeQueueDepth = 32
 
+// maxPendingCodes bounds the codes held for retry. GitHub sends one; the rest of
+// the room is for a local process that is injecting them, and it exists so a
+// round stays short enough that the honest code is still tried promptly.
+const maxPendingCodes = 8
+
 // maxManifestCodeLen bounds what the callback will accept as a manifest code.
 // GitHub's are short; this is generous enough to survive a format change and
 // small enough that no request built from one can draw a 414.
@@ -299,9 +304,10 @@ func (f *onboardFlow) register(ctx context.Context) (*App, error) {
 	// the exchange fail, and onboarding ends with GitHub's App already created
 	// and its one-time private key unrecoverable.
 	//
-	// Only GitHub's own rejection of a code is retried. A request that could not
-	// be completed at all is reported immediately, because no second redirect is
-	// coming to fix it.
+	// Only a 404 DROPS a code — everything else keeps it. A request that could
+	// not be completed at all is still reported immediately, because there is no
+	// answer to interpret and no second redirect coming to fix it.
+	//
 	// Codes are tried ROUND-ROBIN, and a code that stays ambiguous never blocks
 	// another one.
 	//
@@ -311,6 +317,7 @@ func (f *onboardFlow) register(ctx context.Context) (*App, error) {
 	// queue until GitHub's window closes with the App created and its key
 	// unrecoverable. Nothing is discarded and nothing is allowed to monopolise.
 	pending := make([]string, 0, 1)
+	seen := make(map[string]bool)
 	backoff := initialExchangeBackoff
 
 	var lastRejection error
@@ -318,12 +325,18 @@ func (f *onboardFlow) register(ctx context.Context) (*App, error) {
 	for {
 		// Take everything queued before spending time on any of it, so a code that
 		// arrived during the last round is tried in this one.
-		pending = append(pending, f.drainCodes()...)
+		//
+		// BOUNDED and deduplicated. The channel caps what is in flight, but moving
+		// each ambiguous code into an unbounded retry set freed that capacity
+		// again: a local process could accumulate work indefinitely, and every
+		// round would then make one request per accumulated code — starving the
+		// honest code through the deadline rather than merely delaying it.
+		pending = addCodes(pending, seen, f.drainCodes())
 
 		if len(pending) == 0 {
 			select {
 			case code := <-f.codeCh:
-				pending = append(pending, code)
+				pending = addCodes(pending, seen, []string{code})
 			case err := <-f.errCh:
 				return nil, err
 			case <-ctx.Done():
@@ -381,7 +394,7 @@ func (f *onboardFlow) register(ctx context.Context) (*App, error) {
 			// should not wait behind an injected code's retry schedule.
 			timer.Stop()
 
-			pending = append(pending, code)
+			pending = addCodes(pending, seen, []string{code})
 		case <-ctx.Done():
 			timer.Stop()
 
@@ -392,6 +405,27 @@ func (f *onboardFlow) register(ctx context.Context) (*App, error) {
 			backoff = min(backoff*2, maxExchangeBackoff)
 		}
 	}
+}
+
+// addCodes appends codes that are new and there is still room for.
+//
+// Two bounds, and they answer different attacks. Deduplication stops the same
+// injected code being retried N times per round; maxPendingCodes stops distinct
+// ones accumulating until a round takes longer than the window that is left.
+// Both are silent by design — a caller that is flooding does not need feedback,
+// and the honest redirect only needs ONE slot, which it has because a rejected
+// code frees one.
+func addCodes(pending []string, seen map[string]bool, codes []string) []string {
+	for _, code := range codes {
+		if seen[code] || len(pending) >= maxPendingCodes {
+			continue
+		}
+
+		seen[code] = true
+		pending = append(pending, code)
+	}
+
+	return pending
 }
 
 // drainCodes takes every queued callback without blocking.
@@ -414,7 +448,16 @@ func (f *onboardFlow) registrationTimeout(ctx context.Context, last error) error
 		// The honest failure — an operator who took longer than GitHub's window,
 		// or an endpoint that stayed unavailable — must not be reported as a bare
 		// timeout, or the one message that explains it is the one that is dropped.
-		return fmt.Errorf("github: no registration could be redeemed: %w", last)
+		//
+		// And it must say what to DO. Reaching here means an App may already exist
+		// on GitHub with no key anyone can now obtain, so the wrapped advice to
+		// "run the command again" is incomplete on its own: running it again
+		// creates a second App and leaves the first one orphaned.
+		return fmt.Errorf(
+			"github: no registration could be redeemed inside GitHub's %s window: %w\n"+
+				"An App may have been created without billet ever receiving its key. Check "+
+				"https://github.com/settings/apps for an App from this attempt and delete it before "+
+				"running this command again", ManifestTTL, last)
 	}
 
 	return fmt.Errorf("github: timed out waiting for app registration: %w", ctx.Err())
