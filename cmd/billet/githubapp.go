@@ -140,6 +140,13 @@ func githubAppCreate(ctx context.Context, args []string) error {
 	fmt.Printf("github:\n")
 	fmt.Printf("  org: %s\n", *org)
 	fmt.Printf("  app_id: %d\n", result.App.ID)
+
+	// Printed when GitHub returned one, because the operator cannot recover it
+	// from anywhere else without going back through the browser.
+	if result.App.ClientID != "" {
+		fmt.Printf("  client_id: %s\n", result.App.ClientID)
+	}
+
 	fmt.Printf("  installation_id: %d\n", result.Installation.ID)
 	fmt.Printf("  private_key_path: %s\n", *keyPath)
 	fmt.Printf("\nThen run: billet check\n")
@@ -1023,34 +1030,49 @@ const maxKeySize = 64 << 10
 // App private key is a local credential exposure that `billet check` existed to
 // catch and did not.
 func checkPrivateKey(path string) error {
+	_, err := readPrivateKey(path)
+
+	return err
+}
+
+// readPrivateKey validates the App key and returns its bytes.
+//
+// ONE implementation, used by both `billet check` and `billet server`. They had
+// diverged: check rejected a non-regular file, bounded the read, worked from a
+// single descriptor, opened with O_NONBLOCK so a FIFO could not hang it, and
+// refused group- or world-readable modes — while the server did os.ReadFile and
+// parsed the result. So `billet check` refused a mode-0644 organization
+// credential that `billet server` would happily start with, which is the wrong
+// way round for the command that runs unattended.
+func readPrivateKey(path string) ([]byte, error) {
 	// Opened ONCE and inspected through the descriptor. Stat-then-read is two
 	// lookups of the same name: the file can be swapped in between, so the size,
 	// type and mode may describe a different inode than the bytes that get
 	// parsed — and os.ReadFile on a FIFO blocks forever rather than returning.
 	f, err := openForInspection(path)
 	if err != nil {
-		return fmt.Errorf("github.private_key_path %s: %w", path, err)
+		return nil, fmt.Errorf("github.private_key_path %s: %w", path, err)
 	}
 
 	defer f.Close()
 
 	info, err := f.Stat()
 	if err != nil {
-		return fmt.Errorf("github.private_key_path %s: %w", path, err)
+		return nil, fmt.Errorf("github.private_key_path %s: %w", path, err)
 	}
 
 	if !info.Mode().IsRegular() {
-		return fmt.Errorf("github.private_key_path %s is not a regular file", path)
+		return nil, fmt.Errorf("github.private_key_path %s is not a regular file", path)
 	}
 
 	if info.Size() == 0 {
-		return fmt.Errorf(
+		return nil, fmt.Errorf(
 			"github.private_key_path %s is empty; an interrupted `billet github-app create` leaves "+
 				"a placeholder there. Remove it and re-run that command", path)
 	}
 
 	if info.Size() > maxKeySize {
-		return fmt.Errorf("github.private_key_path %s is %d bytes; that is not an App key",
+		return nil, fmt.Errorf("github.private_key_path %s is %d bytes; that is not an App key",
 			path, info.Size())
 	}
 
@@ -1059,7 +1081,7 @@ func checkPrivateKey(path string) error {
 	// there, so testing them would produce a false alarm on every Windows host.
 	if runtime.GOOS != "windows" {
 		if perm := info.Mode().Perm(); perm&0o077 != 0 {
-			return fmt.Errorf(
+			return nil, fmt.Errorf(
 				"github.private_key_path %s is mode %04o; it is readable beyond its owner. "+
 					"Run: chmod 600 %s", path, perm, path)
 		}
@@ -1070,19 +1092,19 @@ func checkPrivateKey(path string) error {
 	// holds regardless.
 	pemBytes, err := io.ReadAll(io.LimitReader(f, maxKeySize+1))
 	if err != nil {
-		return fmt.Errorf("read github.private_key_path %s: %w", path, err)
+		return nil, fmt.Errorf("read github.private_key_path %s: %w", path, err)
 	}
 
 	if len(pemBytes) > maxKeySize {
-		return fmt.Errorf("github.private_key_path %s is larger than %d bytes; that is not an App key",
+		return nil, fmt.Errorf("github.private_key_path %s is larger than %d bytes; that is not an App key",
 			path, maxKeySize)
 	}
 
 	// Parsed, not merely read: a truncated PEM is exactly what an interrupted
 	// write leaves, and it fails at the first API call rather than here.
 	if err := github.ValidatePrivateKey(pemBytes); err != nil {
-		return fmt.Errorf("github.private_key_path %s: %w", path, err)
+		return nil, fmt.Errorf("github.private_key_path %s: %w", path, err)
 	}
 
-	return nil
+	return pemBytes, nil
 }

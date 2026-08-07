@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"gopkg.in/yaml.v3"
 )
@@ -283,8 +284,21 @@ type FirecrackerConfig struct {
 // organization_self_hosted_runners:read+write. It deliberately does not request
 // actions:read, which would expose workflow runs, logs, and artifacts.
 type GitHubConfig struct {
-	Org            string `yaml:"org"`
-	AppID          int64  `yaml:"app_id"`
+	Org   string `yaml:"org"`
+	AppID int64  `yaml:"app_id"`
+	// ClientID is the App's OAuth client identifier, and it is OPTIONAL.
+	//
+	// GitHub's newer guidance prefers it over the numeric app id as the JWT
+	// issuer, and the scale-set client accepts either — its GitHubAppAuth
+	// documents ClientID as "the Client ID of the application (app id also
+	// works)". So this must never become required: every config written before
+	// the field existed keeps working.
+	//
+	// It is recorded because the manifest conversion already returns it, and
+	// throwing away a value GitHub handed over means a second trip through the
+	// browser to get it back. It is an identifier, not a secret — App.Forget
+	// deliberately keeps it while blanking the client SECRET beside it.
+	ClientID       string `yaml:"client_id,omitempty"`
 	InstallationID int64  `yaml:"installation_id"`
 	// PrivateKeyPath points at the App private key PEM. This file is the single
 	// most sensitive thing in a billet deployment: it lives only on the control
@@ -302,6 +316,23 @@ type Tier struct {
 	// Node optionally pins this tier to a named node. Required when only one
 	// node can serve it — macOS tiers, for example.
 	Node string `yaml:"node,omitempty"`
+	// RunnerGroup is the GitHub runner group this tier's scale set belongs to.
+	// Empty means GitHub's "default" group.
+	//
+	// It matters for access control rather than for scheduling: a runner group is
+	// how an organization decides which repositories may use these runners, and
+	// putting every tier in the default group hands them to every repository in
+	// the org. billet does not enforce that policy — GitHub does — but it must be
+	// expressible, or an operator has to go and move the scale set by hand after
+	// every reconcile.
+	RunnerGroup string `yaml:"runner_group,omitempty"`
+
+	// NOTE on what is accepted: the scale-set client interpolates this name into
+	// a query string WITHOUT escaping it, so a perfectly ordinary group name like
+	// "Platform & Security" is parsed as two parameters and comes back as "group
+	// not found" — a confusing first-contact failure that looks like a
+	// permissions problem. Validation therefore rejects what the client cannot
+	// carry, rather than letting GitHub answer confusingly. See validateTier.
 
 	VCPU   int      `yaml:"vcpu"`
 	Memory ByteSize `yaml:"memory"`
@@ -384,6 +415,82 @@ func (c *Config) NodePolicies() map[string]NodePolicy {
 }
 
 var labelRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$`)
+
+// runnerGroupUnsafe are the characters that do not survive the scale-set
+// client's handling of a group name.
+//
+// This started as an allowlist and the allowlist was wrong in both directions.
+// The client interpolates the name unescaped into a path (client.go:351), then
+// url.Parse's it, reads Query(), and re-Encode's it — so the question is not
+// "is this character legal in a URL" but "does this character survive one
+// parse-and-re-encode round trip". Measured against v0.4.0, rather than
+// reasoned about:
+//
+//	&   splits the value into another parameter    "Platform & Security" -> "Platform "
+//	#   starts a fragment and truncates it         "a#b"                 -> "a"
+//	;   ParseQuery has rejected it as a separator
+//	    since Go 1.17 and drops the whole pair     "a;b"                 -> ""
+//	%   is decoded and re-encoded, so a literal
+//	    one is either destroyed or transformed     "100%" -> ""   "%41" -> "A"
+//	+   is decoded to a space                      "a+b"                 -> "a b"
+//
+// Everything else survives, INCLUDING = and ? and / and : and quotes — and
+// including non-ASCII, so the old rule rejected "Grupo-Ñ" and "研发" for no
+// reason. Control characters are excluded separately: url.Parse refuses them
+// outright, which is a clean failure but a much later and stranger one.
+const runnerGroupUnsafe = "&#;%+"
+
+// maxRunnerGroupLen is BILLET's sanity bound, not GitHub's rule.
+//
+// The 100 it replaces was carried over from the regex this check replaced, where
+// it was equally invented — and stating an invented number as though it were
+// GitHub's is the same mistake as the allowlist: a rule about someone else's API
+// that is not pinned to that API's behaviour. GitHub does not document a runner
+// group name length, so billet does not claim to know one.
+//
+// What is genuinely billet's concern is that a runaway config value cannot build
+// a URL the Actions service rejects wholesale, and 512 bytes is far above any
+// plausible group name while still catching a field that was pasted into by
+// accident. It counts BYTES because the thing being bounded is a URL, and it is
+// generous enough that the bytes-versus-runes distinction cannot reject a real
+// name: 512 bytes is 170 characters even in the worst case for CJK text.
+const maxRunnerGroupLen = 512
+
+// checkRunnerGroup reports why a runner group name cannot be looked up, or nil.
+//
+// An empty name is fine and means GitHub's default group.
+func checkRunnerGroup(group string) error {
+	if group == "" {
+		return nil
+	}
+
+	if strings.TrimSpace(group) == "" {
+		return fmt.Errorf("runner_group %q is only whitespace; leave it unset to use GitHub's "+
+			"default group", group)
+	}
+
+	if len(group) > maxRunnerGroupLen {
+		return fmt.Errorf("runner_group is %d bytes, over billet's %d byte sanity limit; this is "+
+			"not GitHub's rule, it is a guard against a config value that ran away",
+			len(group), maxRunnerGroupLen)
+	}
+
+	for _, r := range group {
+		switch {
+		case unicode.IsControl(r):
+			return fmt.Errorf("runner_group %q contains a control character (%U); the scale-set "+
+				"client builds a URL from this name and url.Parse refuses control characters",
+				group, r)
+		case strings.ContainsRune(runnerGroupUnsafe, r):
+			return fmt.Errorf("runner_group %q contains %q, which does not survive the scale-set "+
+				"client's URL handling — the name that reaches GitHub would not be the one you "+
+				"wrote, and the lookup comes back as \"group not found\". Rename the group, or "+
+				"leave this unset to use GitHub's default group", group, r)
+		}
+	}
+
+	return nil
+}
 
 // validateNodeName is the ONE rule for a node identifier, wherever it appears:
 // node.name, nodes[].name, and tiers[].node all name hosts in a single
@@ -729,6 +836,16 @@ func (c *Config) validateTiers() []error {
 		}
 		if _, dup := seen[t.Label]; dup {
 			errs = append(errs, fmt.Errorf("%s: duplicate label", where))
+		}
+
+		// Rejected HERE rather than left for GitHub to answer confusingly. The
+		// scale-set client interpolates this name into a query string without
+		// escaping it, so a group name containing & — "Platform & Security" is a
+		// realistic one — is parsed as several parameters and comes back as
+		// "group not found". That reads as a permissions problem and sends an
+		// operator to the wrong page entirely.
+		if err := checkRunnerGroup(t.RunnerGroup); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", where, err))
 		}
 		seen[t.Label] = struct{}{}
 

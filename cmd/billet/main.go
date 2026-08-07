@@ -12,14 +12,19 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"runtime/debug"
+	"strconv"
 	"syscall"
 	"text/tabwriter"
 
+	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/scaleset"
+	"github.com/junioryono/billet/internal/server"
 	"github.com/junioryono/billet/internal/state"
 )
 
@@ -134,10 +139,12 @@ func addConfigFlag(fs *flag.FlagSet) *string {
 	return fs.String("config", defaultConfigPath(), "path to billet.yaml")
 }
 
-func cmdServer(_ context.Context, args []string) error {
+func cmdServer(ctx context.Context, args []string) error {
 	fs := newFlagSet("billet server")
 	cfgPath := addConfigFlag(fs)
 	dev := fs.Bool("dev", false, "also run a node in this process (single-machine deployment)")
+	dryRun := fs.Bool("dry-run", false,
+		"connect to GitHub and advertise ZERO capacity: proves the whole path without accepting a job")
 	if err := parse(fs, args); err != nil {
 		return err
 	}
@@ -153,11 +160,140 @@ func cmdServer(_ context.Context, args []string) error {
 		return fmt.Errorf("--dev needs a node section in %s", *cfgPath)
 	}
 
-	// Deliberately no state.Open here. Opening migrates the database, and a
-	// command that cannot serve should not mutate durable state as a side effect
-	// of being run. `billet check` does that explicitly.
-	return fmt.Errorf("%w: P1 brings the scale-set listeners and the capacity allocator; "+
-		"run `billet check` to validate configuration and state in the meantime", errNotImplemented)
+	if cfg.GitHub == nil {
+		return fmt.Errorf("%s has no github section; run `billet github-app create` first", *cfgPath)
+	}
+
+	if *dev {
+		return fmt.Errorf("%w: --dev needs the node runtime, which P2 brings", errNotImplemented)
+	}
+
+	// FAIL CLOSED while nothing can launch a job.
+	//
+	// The listener plane is complete: it reconciles scale sets, advertises
+	// capacity, acquires offers and binds leases. What does not exist yet is the
+	// node runtime that turns a lease into a running VM. A control plane that
+	// accepts work it cannot run does not fail visibly — GitHub marks the jobs
+	// assigned, billet holds leases nothing fulfils, and somebody's CI queues
+	// until it times out while this command reports itself healthy.
+	//
+	// Refusing is not the whole answer either, because the path still has to be
+	// provable against a real organization before P2 lands. --dry-run does that:
+	// the same App auth, reconciliation, session and long poll, advertising zero.
+	// Everything except accepting a job.
+	if !*dryRun {
+		return fmt.Errorf(
+			"%w: the control plane is built but nothing can launch a job yet, so it will not accept one.\n"+
+				"Run `billet server --dry-run` to exercise the whole path against GitHub while advertising "+
+				"zero capacity. Accepting work would strand it: GitHub marks the job assigned and nothing "+
+				"here can run it",
+			errNotImplemented)
+	}
+
+	return runServer(ctx, cfg, *dryRun)
+}
+
+// runServer starts the control plane and blocks until it is told to stop.
+func runServer(ctx context.Context, cfg *config.Config, dryRun bool) error {
+	// The SAME hardened reader `billet check` uses — type, mode, size and parse.
+	// Validated before anything else is built: a bad key otherwise fails at the
+	// first API call, by which time a scale set may already exist against a
+	// half-configured deployment, and GitHub keeps that.
+	key, err := readPrivateKey(cfg.GitHub.PrivateKeyPath)
+	if err != nil {
+		return err
+	}
+
+	// client_id when it is recorded, app id otherwise. GitHubAppAuth documents
+	// ClientID as "the Client ID of the application (app id also works)", which
+	// is why client_id stayed optional.
+	appIdentity := cfg.GitHub.ClientID
+	if appIdentity == "" {
+		appIdentity = strconv.FormatInt(cfg.GitHub.AppID, 10)
+	}
+
+	client, err := scaleset.New(scaleset.Config{
+		ConfigURL:      "https://github.com/" + cfg.GitHub.Org,
+		ClientID:       appIdentity,
+		InstallationID: cfg.GitHub.InstallationID,
+		PrivateKey:     string(key),
+	}, slog.Default())
+	if err != nil {
+		return err
+	}
+
+	db, err := state.Open(ctx, cfg.Server.StateDir)
+	if err != nil {
+		return fmt.Errorf("server state: %w", err)
+	}
+
+	defer db.Close()
+
+	allocator, err := alloc.New(db, alloc.Limits{
+		MaxVCPU:   cfg.Server.MaxVCPU,
+		MaxMemory: cfg.Server.MaxMemory,
+		Nodes:     cfg.NodePolicies(),
+	}, cfg.Tiers)
+	if err != nil {
+		return fmt.Errorf("capacity allocator: %w", err)
+	}
+
+	// Ctrl-C and SIGTERM stop the listeners through the context, which is what
+	// releases escrowed capacity — see the listener's deferred release. A hard
+	// kill skips that and leaves the reaper to expire it.
+	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	var opts []server.ControlPlaneOption
+
+	if dryRun {
+		opts = append(opts, server.AdvertiseNothing())
+
+		fmt.Printf("billet server (DRY RUN): %d tiers, advertising ZERO capacity.\n", len(cfg.Tiers))
+		fmt.Printf("Scale sets are created and polled; no job will be accepted.\n")
+	} else {
+		fmt.Printf("billet server: %d tiers, ceiling %d vCPU / %s\n",
+			len(cfg.Tiers), cfg.Server.MaxVCPU, cfg.Server.MaxMemory)
+	}
+
+	// The owner identifies this process to GitHub's message queue so a session
+	// left by a crashed run is distinguishable from a live one.
+	owner, err := os.Hostname()
+	if err != nil || owner == "" {
+		owner = "billet"
+	}
+
+	plane := server.New(allocator, &provisioner{client}, cfg.Tiers, owner, slog.Default(), opts...)
+	if err := plane.Run(ctx); err != nil {
+		return err
+	}
+
+	fmt.Println("billet server: stopped")
+
+	return nil
+}
+
+// provisioner adapts the scale-set client to what the control plane consumes.
+//
+// It exists because internal/scaleset returns its OWN ScaleSet type: the
+// alternative is that package importing internal/server purely to name a
+// two-field struct, which points the dependency the wrong way for a package
+// whose job is to keep a preview API at arm's length.
+type provisioner struct{ c *scaleset.Client }
+
+func (p *provisioner) EnsureScaleSet(
+	ctx context.Context, name, group string, labels []string,
+) (*server.ScaleSet, error) {
+	set, err := p.c.EnsureScaleSet(ctx, name, group, labels)
+	if err != nil {
+		return nil, err
+	}
+
+	return &server.ScaleSet{ID: set.ID, Name: set.Name, Group: set.Group}, nil
+}
+
+func (p *provisioner) Session(ctx context.Context, scaleSetID int, owner string) (server.Session, error) {
+	return p.c.Session(ctx, scaleSetID, owner)
 }
 
 func cmdNode(_ context.Context, args []string) error {
