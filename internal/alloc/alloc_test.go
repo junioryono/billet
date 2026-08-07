@@ -734,19 +734,19 @@ func TestReapedLeaseKeepsItsAttribution(t *testing.T) {
 
 	var (
 		runID      sql.NullInt64
-		jobID      sql.NullInt64
+		requestID  sql.NullInt64
 		conclusion string
 		assignedAt sql.NullString
 	)
 
 	if err := a.db.Reader().QueryRowContext(ctx,
-		`SELECT run_id, job_id, conclusion, assigned_at FROM job_history WHERE lease_id = ?`, lease.ID).
-		Scan(&runID, &jobID, &conclusion, &assignedAt); err != nil {
+		`SELECT run_id, request_id, conclusion, assigned_at FROM job_history WHERE lease_id = ?`, lease.ID).
+		Scan(&runID, &requestID, &conclusion, &assignedAt); err != nil {
 		t.Fatalf("read job_history: %v", err)
 	}
 
-	if runID.Int64 != 555 || jobID.Int64 != 666 {
-		t.Errorf("history lost attribution: run=%v job=%v", runID, jobID)
+	if runID.Int64 != 555 || requestID.Int64 != 666 {
+		t.Errorf("history lost attribution: run=%v job=%v", runID, requestID)
 	}
 
 	if conclusion != string(PhaseFailed) {
