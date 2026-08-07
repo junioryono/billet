@@ -207,6 +207,57 @@ The state machine is written down in `validTransitions` rather than implied by s
 terminal phases have no successors: a lease that released its capacity must never move backwards and
 re-acquire it, which is what a double-admit looks like from the inside.
 
+### What is advertised is TOTAL escrowed capacity, and it is renewed on its own clock
+
+The listener holds the escrow in two halves — `held` (escrowed, no job yet) and `running` (escrowed
+and assigned, keyed by GitHub's request id). Both are escrowed and **both are advertised**, because
+`maxCapacity` is the scale set's *total* capacity, not its spare. The vendor's own listener sends a
+configured maximum that does not move as jobs are assigned. Sending only the free half shrinks the
+advertisement on every assignment, so a tier with room for two tells GitHub "1" the moment the first
+job lands and the second slot goes unused. The invariant above is untouched: every lease in either
+half came from the allocator, so the sum across listeners is still bounded by the budget.
+
+**Heartbeats must not be bounded by the poll.** A long poll is nominally 50 seconds against a 90
+second TTL, which reads like ample margin and is not — the vendor's HTTP client permits a request to
+run for minutes once slow responses and retries are counted, and renewal that happens only *between*
+polls stops for as long as one poll lasts. The reaper then terminalises the leases, another tier
+escrows the capacity, and the poll returns an assignment backed by a lease this listener no longer
+holds. Tying renewal to the poll makes the safety of the whole escrow depend on a timeout billet does
+not control.
+
+**Derive the cadence from the allocator's actual TTL, never from `DefaultLeaseTTL`.** A cadence
+computed from the default is correct only for a default-configured allocator; under a shorter TTL
+every lease expires between beats and advertised capacity climbs — measured at six times the budget
+before a test caught it. Nothing in the type system will catch this.
+
+That makes heartbeat the only writer concurrent with the poll loop, so the escrow takes a mutex, and
+`assign` holds it **across** the allocator write. Releasing it around the write to keep heartbeats
+snappy looks obviously right and is not: it opens a window where the write succeeds but a concurrent
+heartbeat has already dropped the lease, leaving the assignment durable in the ledger and tracked
+nowhere in memory. A transient heartbeat error **keeps** the lease — only `ErrFenced` and
+`ErrLeaseNotFound` mean it is genuinely someone else's. Dropping on a busy database removes the lease
+from the release path too, so the ledger keeps counting it until the reaper expires it.
+
+The message lifecycle closes: `Available` → acquire, `Assigned` → consume escrow (idempotent by
+request id, because an unacknowledged message is redelivered), `Completed` → release. Acknowledging
+`Completed` without releasing leaves the lease open until the reaper expires it, withholding capacity
+and recording the wrong conclusion against it.
+
+### A rule about someone else's API is pinned to measured behaviour, not to reasoning
+
+The runner-group validator began as an allowlist of "URL-safe" characters and was wrong in both
+directions: it rejected `team=platform`, `who?`, and every non-ASCII name — `Grupo-Ñ`, `研发` — while
+missing `;` entirely. The client interpolates the name unescaped into a path, then `url.Parse`s it,
+reads `Query()`, and re-`Encode`s it, so the only question that matters is whether a character
+survives that round trip. Running it settled it in a minute: `&` `#` `;` `%` `+` do not, everything
+else does. `;` is the one no amount of reasoning would have produced (Go's `ParseQuery` has rejected
+it as a separator since 1.17).
+
+The test asserts the **property**, not the list: every name the validator accepts is put through the
+client's exact transformation and must come out unchanged. When a rule encodes an assumption about
+code you do not own, pin it to what that code does — a probe costs a minute, and a plausible-sounding
+character list is exactly the kind of thing that is confidently wrong.
+
 ### A credential GitHub issued once is never deleted, and never rendered
 
 GitHub returns the App private key **exactly once**, from the manifest conversion. There is no
