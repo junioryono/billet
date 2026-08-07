@@ -165,8 +165,8 @@ func (f *fakeSession) GetMessage(ctx context.Context, _ int64, maxCapacity int) 
 	default:
 	}
 
-	// A real long poll returns (nil, nil) on timeout; the listener polls again.
-	return nil, nil
+	// A real long poll reports a timeout; the listener polls again.
+	return nil, ErrNoMessage
 }
 
 func (f *fakeSession) DeleteMessage(context.Context, int64) error { return nil }

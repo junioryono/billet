@@ -4,6 +4,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 
@@ -20,8 +21,8 @@ import (
 // organization to point at.
 type Session interface {
 	// GetMessage long-polls for work, advertising maxCapacity as the number of
-	// runners this scale set can accept right now. It returns (nil, nil) when the
-	// poll times out with nothing to report, which is the ordinary case.
+	// runners this scale set can accept right now. It returns ErrNoMessage when
+	// the poll times out with nothing to report, which is the ordinary case.
 	GetMessage(ctx context.Context, lastMessageID int64, maxCapacity int) (*Message, error)
 	// DeleteMessage acknowledges a message. An unacknowledged message is
 	// redelivered, so everything derived from one must be idempotent.
@@ -31,6 +32,15 @@ type Session interface {
 	AcquireJobs(ctx context.Context, requestIDs []int64) ([]int64, error)
 	Close(ctx context.Context) error
 }
+
+// ErrNoMessage means a long poll timed out with nothing to report. It is the
+// ordinary outcome, not a failure — the caller polls again.
+//
+// A sentinel rather than (nil, nil), which the upstream client returns and this
+// package deliberately does not propagate: a nil message with a nil error is
+// indistinguishable from "something went wrong and nobody said so", and every
+// caller has to remember which of the two it is looking at.
+var ErrNoMessage = errors.New("server: no message")
 
 // Message is one batch of scale-set news.
 type Message struct {
@@ -135,16 +145,17 @@ func (l *Listener) Run(ctx context.Context) error {
 		}
 
 		msg, err := l.session.GetMessage(ctx, l.lastMessageID, len(l.held))
-		if err != nil {
-			return stopping(ctx, fmt.Errorf("server: poll %s: %w", l.tier, err))
+
+		// A timed-out long poll is the ordinary case. Poll again immediately —
+		// the escrow is KEPT, because releasing and retaking it every 50 seconds
+		// would hand the gap to another tier and produce exactly the flapping the
+		// escrow exists to avoid.
+		if errors.Is(err, ErrNoMessage) {
+			continue
 		}
 
-		// A timed-out long poll is the ordinary case, not an error. Poll again
-		// immediately — the escrow is kept, because releasing and re-taking it
-		// every 50 seconds would hand the gap to another tier and produce exactly
-		// the flapping the escrow exists to avoid.
-		if msg == nil {
-			continue
+		if err != nil {
+			return stopping(ctx, fmt.Errorf("server: poll %s: %w", l.tier, err))
 		}
 
 		if err := l.handle(ctx, msg); err != nil {
