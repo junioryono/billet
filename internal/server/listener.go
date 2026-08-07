@@ -4,7 +4,6 @@ package server
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 
@@ -42,10 +41,16 @@ type Message struct {
 }
 
 // Job identifies one workflow job.
+//
+// RequestID is the identity that matters. It is what AcquireJobs claims work by,
+// and it is what makes a redelivered message idempotent — GitHub's own JobID is
+// a separate string field, so a schema that stored an int64 under the name
+// job_id was recording the request id under a name that would look correct to
+// anyone later trying to correlate a lease with GitHub's API. Migration 8
+// renamed the column to say what it holds.
 type Job struct {
 	RequestID int64
 	RunID     int64
-	JobID     int64
 }
 
 // Statistics is GitHub's own view of the scale set.
@@ -126,16 +131,12 @@ func (l *Listener) Run(ctx context.Context) error {
 		}
 
 		if err := l.refillEscrow(ctx); err != nil {
-			return err
+			return stopping(ctx, err)
 		}
 
 		msg, err := l.session.GetMessage(ctx, l.lastMessageID, len(l.held))
 		if err != nil {
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return err
-			}
-
-			return fmt.Errorf("server: poll %s: %w", l.tier, err)
+			return stopping(ctx, fmt.Errorf("server: poll %s: %w", l.tier, err))
 		}
 
 		// A timed-out long poll is the ordinary case, not an error. Poll again
@@ -147,9 +148,27 @@ func (l *Listener) Run(ctx context.Context) error {
 		}
 
 		if err := l.handle(ctx, msg); err != nil {
-			return err
+			return stopping(ctx, err)
 		}
 	}
+}
+
+// stopping reports a shutdown as a shutdown.
+//
+// Cancelling the context does not produce a context error from everything it
+// interrupts: SQLite surfaces an in-flight statement as "interrupted (9)", and
+// an HTTP client can report a closed connection. Wrapping those and returning
+// them makes an ordinary stop look like a fault — the operator reads a driver
+// code where the truth is "you asked it to stop".
+//
+// The context is the authority. If it is done, that is the reason, whatever the
+// layer underneath happened to say on its way out.
+func stopping(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+
+	return err
 }
 
 // refillEscrow tops the escrow up to what this tier could use.
@@ -239,13 +258,14 @@ func (l *Listener) assign(ctx context.Context, job Job) error {
 		// rather than a race billet can absorb: admitting it would put work on a
 		// host with no capacity set aside for it, which is the whole failure the
 		// escrow exists to prevent.
-		return fmt.Errorf("server: %s was assigned job %d with no escrowed capacity", l.tier, job.JobID)
+		return fmt.Errorf("server: %s was assigned request %d with no escrowed capacity",
+			l.tier, job.RequestID)
 	}
 
 	lease := l.held[0]
 	l.held = l.held[1:]
 
-	if err := l.alloc.Assign(ctx, lease.ID, lease.Epoch, job.RunID, job.JobID); err != nil {
+	if err := l.alloc.Assign(ctx, lease.ID, lease.Epoch, job.RunID, job.RequestID); err != nil {
 		return fmt.Errorf("server: assign lease %s: %w", lease.ID, err)
 	}
 

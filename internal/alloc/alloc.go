@@ -163,13 +163,13 @@ type Lease struct {
 	// Provider is the backend this lease needs, recorded for the same reason.
 	// Bind compares it against the node's REGISTERED provider: a Firecracker
 	// lease cannot run on a Tart host.
-	Provider config.ProviderKind
-	Phase    Phase
-	VCPU     int
-	Memory   config.ByteSize
-	Epoch    int64
-	RunID    int64
-	JobID    int64
+	Provider  config.ProviderKind
+	Phase     Phase
+	VCPU      int
+	Memory    config.ByteSize
+	Epoch     int64
+	RunID     int64
+	RequestID int64
 }
 
 // Usage is the vector of what is currently held.
@@ -653,7 +653,7 @@ func (a *Allocator) insertLease(ctx context.Context, tx *sql.Tx, t config.Tier) 
 // ErrConflict, not success: an escrowed slot holds one job, and quietly
 // returning nil while keeping the original assignment would leave the caller
 // believing a job is scheduled that nothing will ever run.
-func (a *Allocator) Assign(ctx context.Context, leaseID string, epoch, runID, jobID int64) error {
+func (a *Allocator) Assign(ctx context.Context, leaseID string, epoch, runID, requestID int64) error {
 	return a.db.Tx(ctx, func(tx *sql.Tx) error {
 		lease, err := a.load(ctx, tx, leaseID, epoch)
 		if err != nil {
@@ -661,9 +661,9 @@ func (a *Allocator) Assign(ctx context.Context, leaseID string, epoch, runID, jo
 		}
 
 		if lease.Phase == PhaseAssigned {
-			if lease.RunID != runID || lease.JobID != jobID {
+			if lease.RunID != runID || lease.RequestID != requestID {
 				return fmt.Errorf("%w: lease %s already holds run %d job %d, cannot reassign to run %d job %d",
-					ErrConflict, leaseID, lease.RunID, lease.JobID, runID, jobID)
+					ErrConflict, leaseID, lease.RunID, lease.RequestID, runID, requestID)
 			}
 
 			return nil
@@ -676,31 +676,31 @@ func (a *Allocator) Assign(ctx context.Context, leaseID string, epoch, runID, jo
 		now := a.now().UTC()
 
 		if _, err := tx.ExecContext(ctx,
-			`UPDATE leases SET phase = ?, run_id = ?, job_id = ?, heartbeat_at = ?, expires_at = ?
+			`UPDATE leases SET phase = ?, run_id = ?, request_id = ?, heartbeat_at = ?, expires_at = ?
 			  WHERE id = ? AND epoch = ?`,
-			string(PhaseAssigned), runID, jobID, ts(now), ts(now.Add(a.leaseTTL)), leaseID, epoch); err != nil {
+			string(PhaseAssigned), runID, requestID, ts(now), ts(now.Add(a.leaseTTL)), leaseID, epoch); err != nil {
 			return fmt.Errorf("alloc: assign lease %s: %w", leaseID, err)
 		}
 
 		// Record the queue entry now, so job_history carries a real assignment
 		// time rather than one fabricated at terminalization.
-		return a.recordAssignment(ctx, tx, lease, runID, jobID, now)
+		return a.recordAssignment(ctx, tx, lease, runID, requestID, now)
 	})
 }
 
 // recordAssignment opens the history row at assignment time.
-func (a *Allocator) recordAssignment(ctx context.Context, tx *sql.Tx, l *Lease, runID, jobID int64, now time.Time) error {
+func (a *Allocator) recordAssignment(ctx context.Context, tx *sql.Tx, l *Lease, runID, requestID int64, now time.Time) error {
 	var node any
 	if l.Node != "" {
 		node = l.Node
 	}
 
 	_, err := tx.ExecContext(ctx,
-		`INSERT INTO job_history (lease_id, tier, node, run_id, job_id, queued_at, assigned_at)
+		`INSERT INTO job_history (lease_id, tier, node, run_id, request_id, queued_at, assigned_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT (lease_id) DO UPDATE SET
-		   run_id = excluded.run_id, job_id = excluded.job_id, assigned_at = excluded.assigned_at`,
-		l.ID, l.Tier, node, runID, jobID, ts(now), ts(now))
+		   run_id = excluded.run_id, request_id = excluded.request_id, assigned_at = excluded.assigned_at`,
+		l.ID, l.Tier, node, runID, requestID, ts(now), ts(now))
 	if err != nil {
 		return fmt.Errorf("alloc: record assignment for %s: %w", l.ID, err)
 	}
@@ -915,7 +915,7 @@ func (a *Allocator) Reap(ctx context.Context) (int, error) {
 // caller runs inside a transaction and issues further statements, so the cursor
 // must be closed before it continues.
 func readExpiredLeases(ctx context.Context, tx *sql.Tx, cutoff string, limit int) ([]Lease, error) {
-	// run_id and job_id are selected because archive needs them: without them a
+	// run_id and request_id are selected because archive needs them: without them a
 	// reaped lease lands in job_history with NULL attribution, so the very jobs
 	// worth investigating are the ones that lose their identity.
 	//
@@ -923,7 +923,7 @@ func readExpiredLeases(ctx context.Context, tx *sql.Tx, cutoff string, limit int
 	// connection while it drains an arbitrarily large backlog, blocking every
 	// reservation and heartbeat behind it.
 	rows, err := tx.QueryContext(ctx,
-		`SELECT id, tier, node, target_node, macos_slot, phase, vcpu, memory, epoch, run_id, job_id
+		`SELECT id, tier, node, target_node, macos_slot, phase, vcpu, memory, epoch, run_id, request_id
 		   FROM leases
 		  WHERE phase NOT IN ('done','failed') AND expires_at <= ?
 		  ORDER BY expires_at
@@ -944,17 +944,17 @@ func readExpiredLeases(ctx context.Context, tx *sql.Tx, cutoff string, limit int
 			mem        int64
 			ph         string
 			runID      sql.NullInt64
-			jobID      sql.NullInt64
+			requestID  sql.NullInt64
 		)
 
 		if err := rows.Scan(&l.ID, &l.Tier, &node, &targetNode, &macSlot, &ph,
-			&l.VCPU, &mem, &l.Epoch, &runID, &jobID); err != nil {
+			&l.VCPU, &mem, &l.Epoch, &runID, &requestID); err != nil {
 			return nil, fmt.Errorf("alloc: scan expired lease: %w", err)
 		}
 
 		l.Node, l.TargetNode = node.String, targetNode.String
 		l.MacOSSlot, l.Phase, l.Memory = macSlot == 1, Phase(ph), config.ByteSize(mem)
-		l.RunID, l.JobID = runID.Int64, jobID.Int64
+		l.RunID, l.RequestID = runID.Int64, requestID.Int64
 		expired = append(expired, l)
 	}
 
@@ -1100,16 +1100,16 @@ func (a *Allocator) loadAny(ctx context.Context, tx *sql.Tx, leaseID string, epo
 		mem        int64
 		ph         string
 		runID      sql.NullInt64
-		jobID      sql.NullInt64
+		requestID  sql.NullInt64
 		curEpoch   int64
 	)
 
 	err := tx.QueryRowContext(ctx,
 		`SELECT id, tier, node, target_node, macos_slot, guest_os, provider, phase, vcpu, memory,
-		        epoch, run_id, job_id
+		        epoch, run_id, request_id
 		   FROM leases WHERE id = ?`, leaseID).
 		Scan(&l.ID, &l.Tier, &node, &targetNode, &macSlot, &guestOS, &provider, &ph, &l.VCPU, &mem,
-			&curEpoch, &runID, &jobID)
+			&curEpoch, &runID, &requestID)
 
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
@@ -1127,7 +1127,7 @@ func (a *Allocator) loadAny(ctx context.Context, tx *sql.Tx, leaseID string, epo
 	l.Node, l.TargetNode = node.String, targetNode.String
 	l.MacOSSlot, l.Phase, l.Memory = macSlot == 1, Phase(ph), config.ByteSize(mem)
 	l.GuestOS, l.Provider = config.GuestOS(guestOS), config.ProviderKind(provider)
-	l.Epoch, l.RunID, l.JobID = curEpoch, runID.Int64, jobID.Int64
+	l.Epoch, l.RunID, l.RequestID = curEpoch, runID.Int64, requestID.Int64
 
 	return &l, nil
 }
@@ -1204,15 +1204,15 @@ func (a *Allocator) archive(ctx context.Context, tx *sql.Tx, l *Lease, outcome P
 	// Reap in particular used to arrive with NULL ids because it did not select
 	// them, overwriting real attribution on the very leases worth investigating.
 	_, err := tx.ExecContext(ctx,
-		`INSERT INTO job_history (lease_id, tier, node, run_id, job_id, conclusion, queued_at, finished_at)
+		`INSERT INTO job_history (lease_id, tier, node, run_id, request_id, conclusion, queued_at, finished_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT (lease_id) DO UPDATE SET
 		   conclusion  = excluded.conclusion,
 		   finished_at = excluded.finished_at,
 		   node        = COALESCE(excluded.node, job_history.node),
 		   run_id      = COALESCE(excluded.run_id, job_history.run_id),
-		   job_id      = COALESCE(excluded.job_id, job_history.job_id)`,
-		l.ID, l.Tier, node, nullableID(l.RunID), nullableID(l.JobID), string(outcome), ts(now), ts(now))
+		   request_id      = COALESCE(excluded.request_id, job_history.request_id)`,
+		l.ID, l.Tier, node, nullableID(l.RunID), nullableID(l.RequestID), string(outcome), ts(now), ts(now))
 	if err != nil {
 		return fmt.Errorf("alloc: archive lease %s: %w", l.ID, err)
 	}
