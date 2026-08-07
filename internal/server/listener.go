@@ -137,8 +137,8 @@ type Listener struct {
 	// escrow decides, which is the ordinary case.
 	maxCapacity *int
 
-	// promiseTTL is how long escrow waits for an assignment it was promised to.
-	promiseTTL time.Duration
+	// stalePromise is how long a promise may go unclaimed before it is reported.
+	stalePromise time.Duration
 
 	// observed is the last statistics GitHub reported. TotalAssignedJobs is the
 	// documented scaling signal — counting messages is not, because a response
@@ -149,13 +149,13 @@ type Listener struct {
 // NewListener builds a listener for one tier.
 func NewListener(a *alloc.Allocator, tier string, session Session, opts ...Option) *Listener {
 	l := &Listener{
-		alloc:      a,
-		tier:       tier,
-		session:    session,
-		log:        slog.Default(),
-		running:    make(map[int64]*alloc.Lease),
-		acquiring:  make(map[int64]*promise),
-		promiseTTL: defaultPromiseTTL,
+		alloc:        a,
+		tier:         tier,
+		session:      session,
+		log:          slog.Default(),
+		running:      make(map[int64]*alloc.Lease),
+		acquiring:    make(map[int64]*promise),
+		stalePromise: defaultStalePromise,
 	}
 
 	for _, opt := range opts {
@@ -176,26 +176,33 @@ func NewListener(a *alloc.Allocator, tier string, session Session, opts ...Optio
 type promise struct {
 	lease *alloc.Lease
 	at    time.Time
+	// reported keeps a stale promise from logging on every heartbeat.
+	reported bool
 }
 
-// defaultPromiseTTL is how long escrow waits for the assignment it was promised
-// to.
+// defaultStalePromise is how long a promise may go unclaimed before billet says
+// so. It is a DIAGNOSTIC threshold, not a deadline.
 //
-// GitHub assigns an acquired job within roughly a minute and reassigns it a few
-// times if no runner takes it, so a promise still unclaimed after five minutes
-// is not going to be. Both of those are OBSERVED behaviour rather than a
-// documented contract, which is why this is generous and configurable rather
-// than tuned: being slow to reclaim a slot costs throughput, and reclaiming one
-// GitHub is about to use costs a job.
-const defaultPromiseTTL = 5 * time.Minute
+// The first version of this released the escrow when the threshold passed, and
+// that was wrong in a way worth writing down: an acquisition is a commitment
+// made to GitHub, and no local timer can revoke it. AcquireJobs is one-way —
+// there is no decline or release endpoint on the session client — and
+// DeleteMessage acknowledges a NOTIFICATION rather than refusing a job. So a
+// timed release does not hand the work back; it only means billet has forgotten
+// it owes a runner, while GitHub still expects one. The reclaimed slot then goes
+// to another tier and the assignment, when it arrives, has nothing behind it.
+//
+// Holding the lease is the lesser evil, and the honest one: it is capacity billet
+// genuinely still owes. See TestAStalePromiseIsReportedAndKept.
+const defaultStalePromise = 5 * time.Minute
 
 // Option configures a Listener.
 type Option func(*Listener)
 
-// WithPromiseTTL sets how long escrow waits for an assignment it was promised
-// to before being reclaimed.
-func WithPromiseTTL(d time.Duration) Option {
-	return func(l *Listener) { l.promiseTTL = d }
+// WithStalePromiseAfter sets how long an acquired job may go unassigned before
+// billet reports it. It does not reclaim anything — see defaultStalePromise.
+func WithStalePromiseAfter(d time.Duration) Option {
+	return func(l *Listener) { l.stalePromise = d }
 }
 
 // WithLogger sets the logger. The default is slog.Default().
@@ -494,21 +501,21 @@ func (l *Listener) heartbeatHeld(ctx context.Context) {
 	}
 
 	for id, p := range l.acquiring {
-		// Expired promises are handed back rather than renewed. This is the only
-		// path that reclaims one: an acquisition GitHub never follows up on holds
-		// its lease against every other tier until the process ends.
-		if time.Since(p.at) > l.promiseTTL {
-			l.log.Warn("no assignment arrived for an acquired job; releasing its escrow",
+		// REPORTED, not reclaimed. Billet acquired this job and owes GitHub a
+		// runner for it; releasing the escrow on a timer would not hand the work
+		// back, because there is no way to hand it back. What it would do is let
+		// another tier take the slot and leave the eventual assignment with
+		// nothing behind it.
+		//
+		// So the lease is renewed like any other and the operator is told. The
+		// capacity is genuinely still owed; the thing that resolves it is the
+		// session ending, which releases every promise with it.
+		if !p.reported && time.Since(p.at) > l.stalePromise {
+			p.reported = true
+
+			l.log.Warn("an acquired job has gone unassigned for a long time; its escrow is "+
+				"still held because billet owes github a runner for it",
 				"tier", l.tier, "request", id, "waited", time.Since(p.at).Round(time.Second))
-
-			if err := l.alloc.Release(ctx, p.lease.ID, p.lease.Epoch, alloc.PhaseDone); err != nil {
-				l.log.Warn("could not release an expired promise",
-					"tier", l.tier, "lease", p.lease.ID, "error", err)
-			}
-
-			delete(l.acquiring, id)
-
-			continue
 		}
 
 		if !l.renew(ctx, p.lease) {
@@ -730,6 +737,16 @@ func (l *Listener) acquire(ctx context.Context, available []Job) error {
 	// capacity waiting for an assignment that is never coming.
 	l.unreserve(missing(reserved, acquired))
 
+	// A response is only meaningful as a subset of the request. An id billet did
+	// not ask for cannot be reconciled — there is no reservation to match it to,
+	// so its assignment would arrive unbacked — and silently ignoring it would
+	// make a malformed response look like a clean one. The dependency is a public
+	// preview, so this is worth noticing rather than assuming.
+	if extra := missing(acquired, reserved); len(extra) > 0 {
+		l.log.Error("github acquired job requests billet did not offer for; ignoring them",
+			"tier", l.tier, "unrequested", extra, "requested", reserved)
+	}
+
 	return nil
 }
 
@@ -742,11 +759,15 @@ func (l *Listener) reserve(available []Job) []int64 {
 	ids := make([]int64, 0, len(available))
 
 	for _, job := range available {
-		// Already promised or already ours. A redelivered offer must not consume
-		// a second lease, for the same reason a redelivered assignment must not.
+		// Already promised, and therefore NOT returned to the caller.
+		//
+		// Returning it looked harmless and was not: the caller unreserves whatever
+		// GitHub does not grant, so a re-offer of a request billet had already
+		// acquired would tear down the earlier, successful promise the moment the
+		// second acquisition came back partial. The lease then backed the next
+		// offer instead, and the assignment for the original request found
+		// nothing. unreserve may only undo reservations THIS call created.
 		if _, ok := l.acquiring[job.RequestID]; ok {
-			ids = append(ids, job.RequestID)
-
 			continue
 		}
 

@@ -1038,31 +1038,45 @@ func TestACancelledOfferReturnsItsPromisedEscrow(t *testing.T) {
 	}
 }
 
-// Escrow promised to an assignment that never arrives has to come back on its
-// own.
+// A promise that goes unclaimed is REPORTED and KEPT, never reclaimed.
 //
-// Every other way out of the promised state needs GitHub to say something: an
-// assignment, a completion, a cancellation, or a refused acquisition. If it says
-// none of them — a message lost, a scale set reconfigured underneath the session
-// — the heartbeat renews that lease for the life of the process and the slot is
-// held against every other tier forever. `held` is reusable and `running` would
-// be finished by a node; this is the one state with no way back on its own.
-func TestAPromiseThatIsNeverClaimedReleasesItsEscrow(t *testing.T) {
+// This asserts the reverse of what it originally did, and the reversal is the
+// point. Releasing the escrow when a promise aged out looked like the obvious
+// fix for a lease nothing else could reclaim — and it was wrong, because an
+// acquisition is a commitment made to GitHub that no local timer can revoke.
+// AcquireJobs is one-way: the session client has no decline or release endpoint,
+// and DeleteMessage acknowledges a notification rather than refusing a job. A
+// timed release therefore hands nothing back. It only means billet has forgotten
+// it owes a runner while GitHub still expects one, so the freed slot goes to
+// another tier and the assignment, when it comes, has nothing behind it.
+//
+// Holding the lease is the lesser evil and the honest one: it is capacity billet
+// genuinely still owes. What resolves it is the session ending.
+func TestAStalePromiseIsReportedAndKept(t *testing.T) {
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
 
 	a := newAllocator(t, alloc.Limits{MaxVCPU: 4, MaxMemory: 16 * config.GiB}, tiers,
-		alloc.WithLeaseTTL(150*time.Millisecond))
+		alloc.WithLeaseTTL(300*time.Millisecond))
 
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 
 	var (
 		delivered atomic.Int32
-		expired   atomic.Bool
+		stillHeld atomic.Bool
+		reported  atomic.Bool
+		logged    bytes.Buffer
+		logMu     sync.Mutex
 	)
 
-	// Declared ahead of the session so the poll hook can read the listener state.
 	var l *Listener
+
+	said := func() bool {
+		logMu.Lock()
+		defer logMu.Unlock()
+
+		return strings.Contains(logged.String(), "gone unassigned")
+	}
 
 	session := &fakeSession{}
 	session.onGet = func() (*Message, error) {
@@ -1071,8 +1085,15 @@ func TestAPromiseThatIsNeverClaimedReleasesItsEscrow(t *testing.T) {
 			return &Message{MessageID: 1, Available: []Job{{RequestID: 11, RunID: 101}}}, nil
 		}
 
-		if l.Acquiring() == 0 {
-			expired.Store(true)
+		// Paced, so the heartbeat goroutine actually gets to run between polls —
+		// counting polls raced it, because an idle poll returns immediately and a
+		// dozen of them elapse well inside one heartbeat interval.
+		time.Sleep(20 * time.Millisecond)
+
+		if said() {
+			// Sampled at the moment it is reported: the promise must still be held.
+			stillHeld.Store(l.Acquiring() == 1)
+			reported.Store(true)
 
 			cancel()
 		}
@@ -1080,18 +1101,119 @@ func TestAPromiseThatIsNeverClaimedReleasesItsEscrow(t *testing.T) {
 		return nil, ErrNoMessage
 	}
 
-	// Shorter than the test, so the promise actually ages out inside it. The
-	// production default is five minutes, which no test can wait for.
-	l = NewListener(a, tiers[0].Label, session, WithPromiseTTL(200*time.Millisecond))
+	l = NewListener(a, tiers[0].Label, session,
+		WithStalePromiseAfter(100*time.Millisecond),
+		WithLogger(slog.New(slog.NewTextHandler(&syncWriter{mu: &logMu, w: &logged},
+			&slog.HandlerOptions{Level: slog.LevelWarn}))))
 
 	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run: %v", err)
 	}
 
-	if !expired.Load() {
-		t.Fatal("the promise was still held when the test gave up; an acquisition GitHub " +
-			"never followed up on keeps its lease for the life of the process")
+	if !reported.Load() {
+		logMu.Lock()
+		defer logMu.Unlock()
+
+		t.Fatalf("a promise sat unclaimed and nothing was reported; logs were:\n%s", logged.String())
 	}
+
+	if !stillHeld.Load() {
+		t.Error("the stale promise was reclaimed; billet still owes GitHub a runner for that " +
+			"job, and the slot must not be given to another tier")
+	}
+}
+
+// A re-offered request must not tear down the promise it already has.
+//
+// reserve() used to return an id that was already being acquired, and acquire()
+// unreserves whatever GitHub does not grant. So a second Available for a request
+// billet had already acquired would, on a partial grant, delete the earlier
+// successful promise — handing its lease to the next offer and leaving the
+// original assignment with nothing. unreserve may only undo reservations the
+// same call created.
+func TestAReofferedRequestKeepsItsExistingPromise(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+
+	// One runner, so the promise for 11 and any reservation for 12 compete for
+	// the same lease.
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 4, MaxMemory: 16 * config.GiB}, tiers)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	var (
+		delivered atomic.Int32
+		running   atomic.Int32
+	)
+
+	var l *Listener
+
+	session := &fakeSession{}
+
+	// The SECOND acquisition grants nothing, which the interface explicitly
+	// permits ("may be fewer than asked for") and which is what turns the bad
+	// unreserve into a lost promise.
+	var grants atomic.Int32
+
+	session.onAcquire = func(ids []int64) ([]int64, error) {
+		if grants.Add(1) == 2 {
+			return nil, nil
+		}
+
+		return ids, nil
+	}
+
+	session.onGet = func() (*Message, error) {
+		switch delivered.Add(1) {
+		case 1:
+			return &Message{MessageID: 1, Available: []Job{{RequestID: 11, RunID: 101}}}, nil
+		case 2:
+			// The same offer again, which GitHub may redeliver.
+			return &Message{MessageID: 2, Available: []Job{{RequestID: 11, RunID: 101}}}, nil
+		case 3:
+			// A DIFFERENT request, and this is what makes the bug bite. Without it
+			// the wrongly-freed lease is still sitting in held when the assignment
+			// arrives, and assign's fallback picks it straight back up — so the
+			// test passes against the bug. Something else has to take the lease
+			// first. Confirmed by mutation.
+			return &Message{MessageID: 3, Available: []Job{{RequestID: 12, RunID: 102}}}, nil
+		case 4:
+			// And the assignment billet was promised all along.
+			return &Message{MessageID: 4, Assigned: []Job{{RequestID: 11, RunID: 101}}}, nil
+		case 5:
+			running.Store(int32(l.Running()))
+
+			cancel()
+		}
+
+		return nil, ErrNoMessage
+	}
+
+	l = NewListener(a, tiers[0].Label, session)
+
+	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if running.Load() != 1 {
+		t.Errorf("request 11 is not running; the re-offer destroyed the promise its original "+
+			"acquisition made, so the assignment had no lease behind it (running=%d)",
+			running.Load())
+	}
+}
+
+// syncWriter serialises writes from the heartbeat goroutine and the poll loop,
+// which both log.
+type syncWriter struct {
+	mu *sync.Mutex
+	w  *bytes.Buffer
+}
+
+func (s *syncWriter) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.w.Write(p)
 }
 
 // fakeSession stands in for a scale-set message session. It never returns work,
