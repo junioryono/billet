@@ -395,6 +395,87 @@ type selfWrappingError struct{ msg string }
 func (e *selfWrappingError) Error() string { return e.msg }
 func (e *selfWrappingError) Unwrap() error { return e }
 
+// url.Error has three fields and only one of them was being cleaned.
+//
+// The rebuild replaced URL and copied Op verbatim, and it kept the parsed scheme
+// and host — so a transport that put the request URL in Op, or a URL whose HOST
+// carried the code, walked straight through the one path that is supposed to be
+// structurally safe.
+func TestRedactionCleansEveryURLErrorField(t *testing.T) {
+	const code = "super-secret-one-time-code"
+
+	for name, build := range map[string]func(r *http.Request) error{
+		"code in Op": func(r *http.Request) error {
+			return &url.Error{Op: "POST " + r.URL.String(), URL: r.URL.String(), Err: errors.New("boom")}
+		},
+		"code in host": func(_ *http.Request) error {
+			return &url.Error{Op: "Post", URL: "https://" + code + ".example.invalid/x", Err: errors.New("boom")}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			client := &http.Client{Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+				return nil, build(r)
+			})}
+
+			_, err := convertManifestAt(t.Context(), client, "https://example.invalid", code)
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+
+			for at := err; at != nil; at = errors.Unwrap(at) {
+				if strings.Contains(at.Error(), code) {
+					t.Errorf("%T still renders the one-time code: %v", at, at)
+				}
+			}
+
+			var urlErr *url.Error
+			if errors.As(err, &urlErr) {
+				if strings.Contains(urlErr.Op, code) {
+					t.Errorf("url.Error.Op carries the code: %q", urlErr.Op)
+				}
+
+				if strings.Contains(urlErr.URL, code) {
+					t.Errorf("url.Error.URL carries the code: %q", urlErr.URL)
+				}
+			}
+		})
+	}
+}
+
+// A forged code is only harmless if EVERY way GitHub can reject it is treated
+// as a rejection.
+//
+// Classifying only 404 and 422 left the kill switch open: an injected code that
+// draws a 400 or a 414 was read as "the exchange could not be attempted", which
+// aborts — discarding an honest code already queued behind it.
+func TestEveryClientErrorMarksTheCodeRejected(t *testing.T) {
+	for _, status := range []int{
+		http.StatusBadRequest,
+		http.StatusUnauthorized,
+		http.StatusForbidden,
+		http.StatusNotFound,
+		http.StatusRequestURITooLong,
+		http.StatusUnprocessableEntity,
+		http.StatusTooManyRequests,
+	} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			if err := conversionError(status, nil); !errors.Is(err, errCodeRejected) {
+				t.Errorf("HTTP %d was not classified as a rejected code: %v", status, err)
+			}
+		})
+	}
+
+	// A server-side failure says nothing about the code, and no further redirect
+	// is coming to improve matters, so it stays fatal.
+	for _, status := range []int{http.StatusInternalServerError, http.StatusBadGateway} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			if err := conversionError(status, nil); errors.Is(err, errCodeRejected) {
+				t.Errorf("HTTP %d was treated as a rejected code", status)
+			}
+		})
+	}
+}
+
 type roundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
