@@ -434,7 +434,8 @@ func newAllocator(t *testing.T, limits alloc.Limits, tiers []config.Tier,
 // escrow.
 //
 // This is the failure that made heartbeats independent. A long poll is nominally
-// 50 seconds against a 90 second TTL, which reads like ample margin — but the
+// ~50 seconds against a 90 second TTL, which reads like ample margin. Measured
+// against a real organization, the first poll ever made ran ~88 seconds — but the
 // vendor's HTTP client permits a request to run for minutes once slow responses
 // and retries are counted, and heartbeats that happen only BETWEEN polls stop for
 // as long as one poll lasts. The reaper then terminalises the leases, another
