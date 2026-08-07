@@ -797,6 +797,245 @@ func TestARedeliveredCompletionDoesNotConsumeASecondLease(t *testing.T) {
 	}
 }
 
+// One lease cannot back two promises.
+//
+// An acquisition is an obligation that lasts until the Assigned message arrives,
+// and capping acquisitions at an instantaneous count of free leases does not
+// model that. The lease stayed in `held` while the claim was in flight, so the
+// next batch's offer counted the very same lease as available and billet
+// promised GitHub two jobs it had capacity for one of.
+//
+// Consecutive offers are the clearest form: nothing about the second batch tells
+// the listener the first lease is already spoken for, unless the reservation is
+// recorded when the promise is made.
+func TestOneLeaseCannotBackTwoAcquisitions(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+
+	// Room for exactly one runner.
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 4, MaxMemory: 16 * config.GiB}, tiers)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	var delivered atomic.Int32
+
+	session := &fakeSession{}
+	session.onGet = func() (*Message, error) {
+		switch delivered.Add(1) {
+		case 1:
+			return &Message{MessageID: 1, Available: []Job{{RequestID: 11, RunID: 101}}}, nil
+		case 2:
+			// A second offer, with the only lease already promised to the first.
+			return &Message{MessageID: 2, Available: []Job{{RequestID: 12, RunID: 102}}}, nil
+		}
+
+		cancel()
+
+		return nil, ErrNoMessage
+	}
+
+	l := NewListener(a, tiers[0].Label, session)
+
+	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if got := session.acquiredIDs(); !slices.Equal(got, []int64{11}) {
+		t.Errorf("acquired %v; the single lease was promised to 11, so 12 had nothing behind it", got)
+	}
+}
+
+// Escrow promised to an offer GitHub did not grant has to come back.
+//
+// AcquireJobs returns what it ACTUALLY gave, which can be fewer ids than were
+// asked for, because another scale set can win the same offer. A reservation
+// left standing for an assignment that is never coming strands the lease until
+// the reaper takes it.
+func TestEscrowIsReturnedWhenAnOfferIsNotGranted(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	var (
+		delivered atomic.Int32
+		acquiring atomic.Int32
+	)
+
+	// Declared ahead of the session so the poll hook can read the listener's own
+	// state while it is running.
+	var l *Listener
+
+	session := &fakeSession{}
+
+	// Two offers, one granted.
+	session.onAcquire = func(ids []int64) ([]int64, error) { return ids[:1], nil }
+
+	session.onGet = func() (*Message, error) {
+		switch delivered.Add(1) {
+		case 1:
+			return &Message{MessageID: 1, Available: []Job{
+				{RequestID: 11, RunID: 101},
+				{RequestID: 12, RunID: 102},
+			}}, nil
+		case 2:
+			// Sampled after the acquisition settled, before shutdown releases it.
+			acquiring.Store(int32(l.Acquiring()))
+
+			cancel()
+		}
+
+		return nil, ErrNoMessage
+	}
+
+	l = NewListener(a, tiers[0].Label, session)
+
+	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if got := acquiring.Load(); got != 1 {
+		t.Errorf("%d leases still promised; only one offer was granted, so the other "+
+			"reservation should have gone back to the free escrow", got)
+	}
+}
+
+// An assignment with nothing behind it is declined, not fatal.
+//
+// This used to return an error, on the grounds that being assigned more than was
+// advertised is a protocol violation rather than a race billet can absorb. That
+// held when GitHub over-assigning was the only way to reach it. It is not any
+// more: billet's own escrow can vanish underneath an acquisition — the heartbeat
+// drops a fenced lease, a restart loses the promise — and a listener error takes
+// the whole control plane down, stranding every tier's capacity over one job.
+//
+// The invariant that matters is preserved either way: nothing runs without
+// escrow. What changes is the blast radius.
+func TestAnUnbackedAssignmentIsDeclinedRatherThanFatal(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a"), tier("billet-4vcpu-b")}
+
+	// The whole budget is escrowed by the OTHER tier, so tier a can hold nothing.
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 4, MaxMemory: 16 * config.GiB}, tiers)
+
+	if _, err := a.Escrow(t.Context(), "billet-4vcpu-b", 1); err != nil {
+		t.Fatalf("Escrow: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	var delivered atomic.Int32
+
+	session := &fakeSession{}
+	session.onGet = func() (*Message, error) {
+		if delivered.Add(1) == 1 {
+			// Assigned with no offer, no promise, and no free escrow.
+			return &Message{MessageID: 1, Assigned: []Job{{RequestID: 11, RunID: 101}}}, nil
+		}
+
+		cancel()
+
+		return nil, ErrNoMessage
+	}
+
+	l := NewListener(a, "billet-4vcpu-a", session)
+
+	// Cancellation, not a protocol error. A listener that returns an error here
+	// cancels every other listener with it.
+	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("an unbacked assignment stopped the listener: %v", err)
+	}
+
+	usage, err := a.Usage(t.Context())
+	if err != nil {
+		t.Fatalf("Usage: %v", err)
+	}
+
+	// And it stayed declined: the other tier's lease is the only one open.
+	if usage.Leases != 1 {
+		t.Errorf("%d leases open; declining must not have consumed capacity", usage.Leases)
+	}
+}
+
+// A job cancelled before it was ever assigned still has to give its escrow back.
+//
+// GitHub cancels an assignment no runner picks up in time, and that cancellation
+// arrives as a completion — for a request billet acquired but was never given.
+// The lease sits in the promised state, which is neither free nor running, so a
+// completion path that only looks at running leaves it reserved for an
+// assignment that is never coming, until the reaper takes it.
+//
+// The discriminating assertion is the NEXT offer: escrow that did not come back
+// is escrow the following request cannot use.
+func TestACancelledOfferReturnsItsPromisedEscrow(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+
+	// One runner, so request 12 can only be acquired if 11 gave its lease back.
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 4, MaxMemory: 16 * config.GiB}, tiers)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	var (
+		delivered atomic.Int32
+		mu        sync.Mutex
+		peak      int
+	)
+
+	session := &fakeSession{}
+
+	// The advertisement is what actually catches this. Simply releasing the lease
+	// in the ledger without dropping the promise leaves a phantom in the escrow:
+	// the next refill escrows a REPLACEMENT, and the tier then advertises the
+	// phantom and the replacement together — two runners against a one-runner
+	// budget. Whether the following offer can be acquired does not discriminate,
+	// because the replacement backs it either way. Confirmed by mutation.
+	session.onPoll = func(capacity int) {
+		mu.Lock()
+		if capacity > peak {
+			peak = capacity
+		}
+		mu.Unlock()
+	}
+
+	session.onGet = func() (*Message, error) {
+		switch delivered.Add(1) {
+		case 1:
+			return &Message{MessageID: 1, Available: []Job{{RequestID: 11, RunID: 101}}}, nil
+		case 2:
+			// Cancelled before any assignment arrived.
+			return &Message{MessageID: 2, Completed: []Job{{RequestID: 11, RunID: 101}}}, nil
+		case 3:
+			return &Message{MessageID: 3, Available: []Job{{RequestID: 12, RunID: 102}}}, nil
+		}
+
+		cancel()
+
+		return nil, ErrNoMessage
+	}
+
+	l := NewListener(a, tiers[0].Label, session)
+
+	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if got := session.acquiredIDs(); !slices.Equal(got, []int64{11, 12}) {
+		t.Errorf("acquired %v; request 11 was cancelled, so its lease should have been free "+
+			"for request 12", got)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if peak > 1 {
+		t.Errorf("advertised %d runners against a one-runner budget; the cancelled request's "+
+			"promise was released in the ledger but never dropped from the escrow", peak)
+	}
+}
+
 // fakeSession stands in for a scale-set message session. It never returns work,
 // so the listener does nothing but escrow, advertise, and release — which is the
 // whole of what this test is about.
@@ -806,7 +1045,10 @@ type fakeSession struct {
 	// onDelete fails an acknowledgement, which is what makes GitHub redeliver the
 	// message — the case every handler has to be idempotent against.
 	onDelete func(id int64) error
-	stats    *Statistics
+	// onAcquire grants fewer ids than were asked for, which GitHub does when
+	// another scale set wins the same offer.
+	onAcquire func(ids []int64) ([]int64, error)
+	stats     *Statistics
 	// acquired records every request id the listener asked GitHub to claim, so a
 	// test can assert WHICH class of message drove the acquisition.
 	acquiredMu sync.Mutex
@@ -846,6 +1088,10 @@ func (f *fakeSession) AcquireJobs(_ context.Context, ids []int64) ([]int64, erro
 	f.acquiredMu.Lock()
 	f.acquired = append(f.acquired, ids...)
 	f.acquiredMu.Unlock()
+
+	if f.onAcquire != nil {
+		return f.onAcquire(ids)
+	}
 
 	return ids, nil
 }

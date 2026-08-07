@@ -114,26 +114,22 @@ type Listener struct {
 	// unacknowledged message comes back, and assigning it twice would consume a
 	// second lease for one job.
 	running map[int64]*alloc.Lease
-	// finished remembers request ids this listener has already completed, so a
-	// redelivered message cannot consume a second lease for a job that is over.
+	// acquiring is escrow PROMISED to a request billet has claimed from GitHub but
+	// has not yet been given, keyed by the request id it was promised to.
 	//
-	// Needed because billet acknowledges a message AFTER handling it, unlike the
-	// vendor's own listener, which deletes the message first (listener.go:210) and
-	// so handles everything at most once. Acking last is the safer choice for
-	// capacity — a crash mid-handling redelivers rather than silently drops a job
-	// — but it is only safe if everything derived from a message is idempotent,
-	// and `running` alone is not: complete() removes the entry, so a redelivery of
-	// the same batch no longer recognises the request.
+	// This is the state the escrow was missing, and its absence was one bug wearing
+	// two faces. Capping acquisitions at len(held) is an instantaneous count, and
+	// an acquisition is not instantaneous: it is an obligation that lasts until the
+	// Assigned message arrives. So one lease could be promised to request B by an
+	// acquisition and then consumed by the assignment of request A — the lease is
+	// still sitting in held, because nothing had claimed it — and B's assignment
+	// arrived to find nothing left. The same lease also backed two consecutive
+	// Available batches for the same reason.
 	//
-	// In memory and bounded, deliberately. Making it durable would mean deciding
-	// that GitHub never re-offers a request id it once reported completed, and
-	// nothing in the vendor's types or docs says that — assigned-then-cancelled is
-	// a documented lifecycle. A permanent tombstone built on an assumption billet
-	// cannot check is the same mistake as the runner-group allowlist. This covers
-	// the redelivery window, which is what the defect actually is, and a restart
-	// loses it exactly as it loses `running`.
-	finished     map[int64]struct{}
-	finishedRing []int64
+	// Reserving the lease under the mutex BEFORE the network call is also what
+	// closes the race with the heartbeat: a lease promised to an acquisition is no
+	// longer in held, so nothing else can spend it while AcquireJobs is in flight.
+	acquiring map[int64]*alloc.Lease
 
 	lastMessageID int64
 
@@ -150,12 +146,12 @@ type Listener struct {
 // NewListener builds a listener for one tier.
 func NewListener(a *alloc.Allocator, tier string, session Session, opts ...Option) *Listener {
 	l := &Listener{
-		alloc:    a,
-		tier:     tier,
-		session:  session,
-		log:      slog.Default(),
-		running:  make(map[int64]*alloc.Lease),
-		finished: make(map[int64]struct{}),
+		alloc:     a,
+		tier:      tier,
+		session:   session,
+		log:       slog.Default(),
+		running:   make(map[int64]*alloc.Lease),
+		acquiring: make(map[int64]*alloc.Lease),
 	}
 
 	for _, opt := range opts {
@@ -281,6 +277,9 @@ func (l *Listener) Run(ctx context.Context) error {
 
 // capacity is what this listener advertises: TOTAL escrowed, not free.
 //
+// All three collections count. Every lease in each of them was taken from the
+// allocator, so the sum across listeners is still bounded by the budget.
+//
 // maxCapacity is the scale set's total capacity, not its spare — the vendor's own
 // listener sends a configured maximum that does not move as jobs are assigned.
 // Sending only the free half shrank the advertisement every time a job started,
@@ -294,7 +293,7 @@ func (l *Listener) capacity() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	return len(l.held) + len(l.running)
+	return len(l.held) + len(l.acquiring) + len(l.running)
 }
 
 // Held returns the leases this listener has escrowed and not yet handed to a job.
@@ -307,6 +306,16 @@ func (l *Listener) Held() []*alloc.Lease {
 	defer l.mu.Unlock()
 
 	return append([]*alloc.Lease(nil), l.held...)
+}
+
+// Acquiring reports how many offers this listener has escrow promised to and has
+// not yet been assigned. Exported for tests, which cannot read the guarded field
+// safely.
+func (l *Listener) Acquiring() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	return len(l.acquiring)
 }
 
 // Running reports how many jobs this listener currently has leases for. Exported
@@ -439,13 +448,20 @@ func (l *Listener) heartbeatHeld(ctx context.Context) {
 
 	l.held = kept
 
-	// RUNNING leases are renewed too. They are open in the ledger exactly like
-	// held ones, so a lease whose job is in flight expires just as readily — and
-	// its capacity would then be escrowed by another tier while GitHub still
-	// believes this scale set is running the job.
+	// RUNNING and ACQUIRING leases are renewed too. They are open in the ledger
+	// exactly like held ones, so a lease whose job is in flight — or whose job
+	// billet has promised to run — expires just as readily, and its capacity would
+	// then be escrowed by another tier while GitHub still believes this scale set
+	// has the job.
 	for id, lease := range l.running {
 		if !l.renew(ctx, lease) {
 			delete(l.running, id)
+		}
+	}
+
+	for id, lease := range l.acquiring {
+		if !l.renew(ctx, lease) {
+			delete(l.acquiring, id)
 		}
 	}
 }
@@ -556,7 +572,25 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 	// slot free the moment the job ends. Acquiring before releasing meant billet
 	// claimed the replacement while still holding the finished job's lease, then
 	// released it, and had nothing left to back the claim.
+	//
+	// finished is scoped to THIS MESSAGE and nothing longer, which is the whole
+	// lifetime the problem has. A batch can carry Assigned and Completed for the
+	// same request — that is an assigned-then-cancelled job, which GitHub does to
+	// one no runner picks up in time — and processing completions first would
+	// otherwise let that assignment take a lease for a job already over.
+	//
+	// It does not need to survive the call. A message is immutable, so a
+	// redelivery carries the same completions and rebuilds this set before the
+	// assignments are read. The previous version kept a 4096-entry map on the
+	// listener, which bought nothing and cost something real: a request id GitHub
+	// requeued after cancelling it would be silently skipped, and billet would sit
+	// on the assignment until it timed out. A fixed count was never the semantic
+	// lifetime of the fact.
+	finished := make(map[int64]struct{}, len(msg.Completed))
+
 	for _, job := range msg.Completed {
+		finished[job.RequestID] = struct{}{}
+
 		if err := l.complete(ctx, job); err != nil {
 			return err
 		}
@@ -576,22 +610,17 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 	// AVAILABLE is what gets acquired. Available is the offer; Assigned is the
 	// confirmation that an offer was claimed. Acquiring from Assigned asks GitHub
 	// to claim work it has already handed over, and drops every offer.
-	//
-	// Acquisition is capped at FREE escrow, which advertising is not. maxCapacity
-	// is the scale set's total, and GitHub subtracts what it already has assigned
-	// — but a batch can still offer more than billet can currently back, and an
-	// acquisition is a promise to run the job. Claiming beyond the free escrow
-	// strands whatever cannot be backed, and the assignment that follows kills the
-	// listener. Advertise total; acquire only what is held.
-	if offers := l.acquirable(msg.Available); len(offers) > 0 {
-		if _, err := l.session.AcquireJobs(ctx, offers); err != nil {
-			return fmt.Errorf("server: acquire jobs for %s: %w", l.tier, err)
-		}
+	if err := l.acquire(ctx, msg.Available); err != nil {
+		return err
 	}
 
 	// ASSIGNED is what consumes escrow. The lease is bound here because this is
 	// the point at which the work is definitely billet's to run.
 	for _, job := range msg.Assigned {
+		if _, over := finished[job.RequestID]; over {
+			continue
+		}
+
 		if err := l.assign(ctx, job); err != nil {
 			return err
 		}
@@ -614,36 +643,119 @@ func (l *Listener) acknowledge(ctx context.Context, msg *Message) error {
 	return nil
 }
 
-// acquirable returns the offers this listener has free escrow to back.
+// acquire claims the offers this listener has escrow to back, reserving that
+// escrow first.
 //
-// Fewer than offered is normal and not a loss: an unacquired offer goes to
-// another scale set or is re-offered, whereas an acquisition billet cannot back
-// is a job that goes nowhere.
-func (l *Listener) acquirable(available []Job) []int64 {
-	l.mu.Lock()
-	room := len(l.held)
-	l.mu.Unlock()
-
-	if room > len(available) {
-		room = len(available)
+// An acquisition is a PROMISE to run the job, so the lease is moved out of held
+// and bound to the request id BEFORE the network call. Checking a count and
+// leaving the leases where they were is what allowed one lease to back two
+// promises, and what let the heartbeat spend a lease out from under an
+// acquisition already in flight.
+//
+// Claiming fewer offers than were made is normal and not a loss: an unacquired
+// offer goes to another scale set or is re-offered, whereas an acquisition
+// billet cannot back is a job that goes nowhere at all.
+func (l *Listener) acquire(ctx context.Context, available []Job) error {
+	if len(available) == 0 {
+		return nil
 	}
 
-	if room < len(available) {
-		l.log.Warn("declining offers with no escrow to back them",
-			"tier", l.tier, "offered", len(available), "acquiring", room)
+	reserved := l.reserve(available)
+	if len(reserved) == 0 {
+		return nil
 	}
 
-	return requestIDs(available[:room])
+	acquired, err := l.session.AcquireJobs(ctx, reserved)
+	if err != nil {
+		// Nothing was promised, so nothing stays reserved.
+		l.unreserve(reserved)
+
+		return fmt.Errorf("server: acquire jobs for %s: %w", l.tier, err)
+	}
+
+	// GitHub returns what it ACTUALLY gave, which can be fewer than were asked
+	// for — another scale set can win the same offer. Escrow reserved for an
+	// offer billet did not get goes back immediately; holding it would strand
+	// capacity waiting for an assignment that is never coming.
+	l.unreserve(missing(reserved, acquired))
+
+	return nil
 }
 
-// requestIDs pulls the ids AcquireJobs claims work by.
-func requestIDs(jobs []Job) []int64 {
-	ids := make([]int64, 0, len(jobs))
-	for _, j := range jobs {
-		ids = append(ids, j.RequestID)
+// reserve moves escrow from held into acquiring, one lease per offer, and
+// returns the request ids it could back.
+func (l *Listener) reserve(available []Job) []int64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	ids := make([]int64, 0, len(available))
+
+	for _, job := range available {
+		// Already promised or already ours. A redelivered offer must not consume
+		// a second lease, for the same reason a redelivered assignment must not.
+		if _, ok := l.acquiring[job.RequestID]; ok {
+			ids = append(ids, job.RequestID)
+
+			continue
+		}
+
+		if _, ok := l.running[job.RequestID]; ok {
+			continue
+		}
+
+		if len(l.held) == 0 {
+			l.log.Warn("declining an offer with no escrow to back it",
+				"tier", l.tier, "request", job.RequestID)
+
+			continue
+		}
+
+		l.acquiring[job.RequestID] = l.held[0]
+		l.held = l.held[1:]
+
+		ids = append(ids, job.RequestID)
 	}
 
 	return ids
+}
+
+// unreserve returns promised escrow to held.
+func (l *Listener) unreserve(ids []int64) {
+	if len(ids) == 0 {
+		return
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	for _, id := range ids {
+		if lease, ok := l.acquiring[id]; ok {
+			delete(l.acquiring, id)
+			l.held = append(l.held, lease)
+		}
+	}
+}
+
+// missing returns the ids that were asked for and not granted.
+func missing(asked, granted []int64) []int64 {
+	if len(granted) == 0 {
+		return asked
+	}
+
+	got := make(map[int64]struct{}, len(granted))
+	for _, id := range granted {
+		got[id] = struct{}{}
+	}
+
+	var lost []int64
+
+	for _, id := range asked {
+		if _, ok := got[id]; !ok {
+			lost = append(lost, id)
+		}
+	}
+
+	return lost
 }
 
 // assign moves one escrowed lease to the job GitHub gave it.
@@ -667,35 +779,51 @@ func (l *Listener) assign(ctx context.Context, job Job) error {
 		return nil
 	}
 
-	// Already OVER. `running` cannot answer this: complete() removes the entry, so
-	// a redelivered batch — or one carrying Assigned and Completed for the same
-	// request, which is what an assigned-then-cancelled job looks like — would
-	// consume a fresh lease for a job that has finished, and record a second
-	// history entry against it.
-	if _, ok := l.finished[job.RequestID]; ok {
-		return nil
-	}
+	// The lease this assignment was PROMISED, if billet acquired the offer. This
+	// is the ordinary path: acquire reserved a lease against this exact request id
+	// and nothing else can have spent it in the meantime.
+	lease, promised := l.acquiring[job.RequestID]
 
-	if len(l.held) == 0 {
-		// GitHub assigned more than was advertised. That is a protocol violation
-		// rather than a race billet can absorb: admitting it would put work on a
-		// host with no capacity set aside for it, which is the whole failure the
-		// escrow exists to prevent.
-		return fmt.Errorf("server: %s was assigned request %d with no escrowed capacity",
-			l.tier, job.RequestID)
-	}
+	if !promised {
+		// No promise on file. GitHub can legitimately assign work this listener
+		// never saw an offer for — after a restart, or when the offer was handled
+		// by a process that is gone — so a free lease is used if there is one.
+		if len(l.held) == 0 {
+			// DECLINED, not fatal. This used to return an error, on the grounds
+			// that being assigned more than was advertised is a protocol violation
+			// rather than a race billet can absorb. That was right when GitHub
+			// over-assigning was the only way to get here; it is not any more.
+			// Billet's own escrow can vanish underneath an acquisition — the
+			// heartbeat drops a fenced lease, a restart loses the promise — and
+			// killing the listener takes the whole control plane down with it,
+			// stranding every tier's capacity over one job.
+			//
+			// Declining keeps the invariant that matters: nothing runs without
+			// escrow. The job is not acquired, GitHub reassigns it, and the
+			// operator gets a loud line rather than an outage.
+			l.log.Error("assigned a request with no escrow to back it; declining it",
+				"tier", l.tier, "request", job.RequestID, "run", job.RunID)
 
-	lease := l.held[0]
+			return nil
+		}
+
+		lease = l.held[0]
+	}
 
 	if err := l.alloc.Assign(ctx, lease.ID, lease.Epoch, job.RunID, job.RequestID); err != nil {
 		return fmt.Errorf("server: assign lease %s: %w", lease.ID, err)
 	}
 
-	// Moved from held to running only AFTER the assignment is durable. Shortening
-	// the slice first meant a failed Assign left the lease open in the database
-	// and absent from the release list — capacity that nothing hands back and
-	// nothing reports, until the reaper's TTL expires it.
-	l.held = l.held[1:]
+	// Moved into running only AFTER the assignment is durable. Consuming it first
+	// meant a failed Assign left the lease open in the database and absent from
+	// the release path — capacity that nothing hands back and nothing reports,
+	// until the reaper's TTL expires it.
+	if promised {
+		delete(l.acquiring, job.RequestID)
+	} else {
+		l.held = l.held[1:]
+	}
+
 	l.running[job.RequestID] = lease
 
 	return nil
@@ -711,16 +839,16 @@ func (l *Listener) complete(ctx context.Context, job Job) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	// Recorded BEFORE the lookup, and unconditionally.
-	//
-	// A completion for a request this listener has no lease for still has to be
-	// remembered: the same batch may carry the Assigned for it — GitHub can assign
-	// and then cancel a job that is not picked up in time — and processing
-	// completions first would otherwise let that assignment consume a lease for a
-	// job already known to be over.
-	l.markFinished(job.RequestID)
-
 	lease, ok := l.running[job.RequestID]
+
+	if !ok {
+		// A job can also complete while it is still only PROMISED — GitHub cancels
+		// an assignment no runner picks up in time, and that cancellation arrives
+		// as a completion. The reserved escrow has to come back, or it is held for
+		// an assignment that will never arrive.
+		lease, ok = l.acquiring[job.RequestID]
+	}
+
 	if !ok {
 		// Not ours, or already released. Both are ordinary: GitHub can report a
 		// job completed that this listener never assigned, if a restart lost the
@@ -734,30 +862,9 @@ func (l *Listener) complete(ctx context.Context, job Job) error {
 	}
 
 	delete(l.running, job.RequestID)
+	delete(l.acquiring, job.RequestID)
 
 	return nil
-}
-
-// maxFinished bounds the completed-request memory.
-//
-// It only has to outlive a redelivery, which is one message, so this is generous
-// by orders of magnitude. Bounded regardless, because the alternative is a map
-// that grows for the life of the process — one entry per job this tier ever ran.
-const maxFinished = 4096
-
-// markFinished remembers a completed request id, evicting the oldest.
-func (l *Listener) markFinished(requestID int64) {
-	if _, ok := l.finished[requestID]; ok {
-		return
-	}
-
-	l.finished[requestID] = struct{}{}
-	l.finishedRing = append(l.finishedRing, requestID)
-
-	if len(l.finishedRing) > maxFinished {
-		delete(l.finished, l.finishedRing[0])
-		l.finishedRing = l.finishedRing[1:]
-	}
 }
 
 // releaseAll hands back capacity that was escrowed and never used.
@@ -788,6 +895,14 @@ func (l *Listener) releaseAll(ctx context.Context) {
 		release(lease)
 	}
 
+	// Promised escrow too. The acquisition was made to GitHub, but nothing has
+	// been assigned yet and nothing can be launched, so holding it past shutdown
+	// would strand it until the reaper.
+	for _, lease := range l.acquiring {
+		release(lease)
+	}
+
 	l.held = nil
 	l.running = make(map[int64]*alloc.Lease)
+	l.acquiring = make(map[int64]*alloc.Lease)
 }
