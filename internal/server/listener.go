@@ -38,6 +38,50 @@ type Session interface {
 	Close(ctx context.Context) error
 }
 
+// Runner turns an assigned lease into running compute, and tears it down again.
+//
+// The seam between the control plane and a host. Today the only implementation
+// runs in this process (`billet server --dev`); the node split puts a remote one
+// behind the same two methods, which is the point of naming it now rather than
+// calling a provider directly from the listener.
+//
+// Both methods are called OUTSIDE the escrow mutex, deliberately. Launching
+// pulls images and talks to a hypervisor; holding the mutex across that would
+// stall every heartbeat behind it, and heartbeats are what keep the escrow
+// alive.
+type Runner interface {
+	// Launch starts the compute for a lease that has just been assigned.
+	//
+	// The lease is already durable and already counted against the budget by the
+	// time this is called, so a failure here means capacity is held for something
+	// that is not running — the caller releases it rather than leaving it.
+	Launch(ctx context.Context, lease *alloc.Lease, job Job) error
+
+	// Destroy removes whatever Launch started for a request.
+	//
+	// MUST be idempotent: it runs on redelivered completions, on shutdown, and on
+	// paths that have already failed once.
+	Destroy(ctx context.Context, requestID int64) error
+}
+
+// noRunner accepts work and runs nothing.
+//
+// The default, and it is what makes a control plane with no compute attached a
+// coherent thing rather than a crash: billet can advertise, acquire and account
+// for capacity before any provider exists. `--dry-run` never gets here because
+// it declines the work first.
+type noRunner struct{ log *slog.Logger }
+
+func (n noRunner) Launch(_ context.Context, lease *alloc.Lease, job Job) error {
+	n.log.Warn("no runner is configured, so this job will not run; github will reassign it "+
+		"when its pickup deadline passes",
+		"request", job.RequestID, "run", job.RunID, "lease", lease.ID)
+
+	return nil
+}
+
+func (noRunner) Destroy(context.Context, int64) error { return nil }
+
 // ErrNoMessage means a long poll timed out with nothing to report. It is the
 // ordinary outcome, not a failure — the caller polls again.
 //
@@ -140,6 +184,9 @@ type Listener struct {
 	// stalePromise is how long a promise may go unclaimed before it is reported.
 	stalePromise time.Duration
 
+	// runner turns assigned leases into compute. Never nil; see noRunner.
+	runner Runner
+
 	// observed is the last statistics GitHub reported. TotalAssignedJobs is the
 	// documented scaling signal — counting messages is not, because a response
 	// carries at most 50 and a large backlog is truncated.
@@ -162,10 +209,20 @@ func NewListener(a *alloc.Allocator, tier string, session Session, opts ...Optio
 		opt(l)
 	}
 
+	if l.runner == nil {
+		l.runner = noRunner{log: l.log}
+	}
+
 	return l
 }
 
-// promise is escrow set aside for a request GitHub has been told billet will
+// WithRunner sets what turns assigned leases into running compute. The default
+// accounts for capacity and launches nothing.
+func WithRunner(r Runner) Option {
+	return func(l *Listener) { l.runner = r }
+}
+
+// Option configures a Listener. for a request GitHub has been told billet will
 // run, and the moment that undertaking was made.
 //
 // `at` IS DIAGNOSTIC ONLY. It drives one stale-promise warning and nothing else,
@@ -708,12 +765,28 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 
 	// ASSIGNED is what consumes escrow. The lease is bound here because this is
 	// the point at which the work is definitely billet's to run.
+	//
+	// LAUNCHING HAPPENS AFTER, outside the escrow mutex that assign holds. A
+	// launch pulls images and talks to a hypervisor; doing it under the mutex
+	// would stall every heartbeat behind it, and heartbeats are what keep the
+	// escrow alive. So assign returns what it bound and the launches follow.
 	for _, job := range msg.Assigned {
 		if _, over := finished[job.RequestID]; over {
 			continue
 		}
 
-		if err := l.assign(ctx, job); err != nil {
+		lease, needsCompute, err := l.assign(ctx, job)
+		if err != nil {
+			return err
+		}
+
+		if !needsCompute {
+			// Declined, or a redelivery of something already running. Either way
+			// there is nothing new to start.
+			continue
+		}
+
+		if err := l.launch(ctx, lease, job); err != nil {
 			return err
 		}
 	}
@@ -901,8 +974,15 @@ func missing(asked, granted []int64) []int64 {
 	return lost
 }
 
-// assign moves one escrowed lease to the job GitHub gave it.
-func (l *Listener) assign(ctx context.Context, job Job) error {
+// assign moves one escrowed lease to the job GitHub gave it, and reports which
+// lease that was.
+//
+// Returning the lease is what lets the caller launch OUTSIDE this function's
+// mutex. The bool says whether there is anything to launch at all — a request
+// already running, or one declined for want of escrow, needs nothing started.
+// Explicit rather than a nil lease, because "no value and no error" is exactly
+// the shape a caller mishandles without noticing.
+func (l *Listener) assign(ctx context.Context, job Job) (*alloc.Lease, bool, error) {
 	// Held for the whole function, INCLUDING the allocator write.
 	//
 	// Releasing it around the write to keep heartbeats snappy looks obviously
@@ -919,7 +999,7 @@ func (l *Listener) assign(ctx context.Context, job Job) error {
 	// ordinary event rather than a fault — and consuming a second lease for one
 	// job would leak capacity that nothing ever gives back.
 	if _, ok := l.running[job.RequestID]; ok {
-		return nil
+		return nil, false, nil
 	}
 
 	// The lease this assignment was PROMISED, if billet acquired the offer. This
@@ -952,14 +1032,14 @@ func (l *Listener) assign(ctx context.Context, job Job) error {
 			l.log.Error("assigned a request with no escrow to back it; declining it",
 				"tier", l.tier, "request", job.RequestID, "run", job.RunID)
 
-			return nil
+			return nil, false, nil
 		}
 
 		lease = l.held[0]
 	}
 
 	if err := l.alloc.Assign(ctx, lease.ID, lease.Epoch, job.RunID, job.RequestID); err != nil {
-		return fmt.Errorf("server: assign lease %s: %w", lease.ID, err)
+		return nil, false, fmt.Errorf("server: assign lease %s: %w", lease.ID, err)
 	}
 
 	// Moved into running only AFTER the assignment is durable. Consuming it first
@@ -974,6 +1054,42 @@ func (l *Listener) assign(ctx context.Context, job Job) error {
 
 	l.running[job.RequestID] = lease
 
+	return lease, true, nil
+}
+
+// launch starts the compute for a lease, and hands the capacity back if it will
+// not start.
+//
+// Called with the mutex NOT held. A launch pulls images and talks to a
+// hypervisor, and holding the escrow mutex across that stalls every heartbeat.
+//
+// A failed launch RELEASES the lease rather than keeping it. That is the
+// opposite of the rule for a failed session close, and the difference is whether
+// anything is running: a lease whose compute never started is backing nothing, so
+// holding it withholds capacity from every other tier for no reason. GitHub
+// reassigns the job when its pickup deadline passes.
+func (l *Listener) launch(ctx context.Context, lease *alloc.Lease, job Job) error {
+	err := l.runner.Launch(ctx, lease, job)
+	if err == nil {
+		return nil
+	}
+
+	l.log.Error("could not start the compute for an assigned job; handing the capacity back",
+		"tier", l.tier, "request", job.RequestID, "run", job.RunID,
+		"lease", lease.ID, "error", err)
+
+	// Best effort, and deliberately not fatal. The launch already failed; failing
+	// the listener as well would take every tier down over one job that GitHub
+	// will simply reassign.
+	if relErr := l.alloc.Release(ctx, lease.ID, lease.Epoch, alloc.PhaseFailed); relErr != nil {
+		l.log.Warn("could not release the lease of a job that failed to start",
+			"tier", l.tier, "lease", lease.ID, "error", relErr)
+	}
+
+	l.mu.Lock()
+	delete(l.running, job.RequestID)
+	l.mu.Unlock()
+
 	return nil
 }
 
@@ -984,6 +1100,25 @@ func (l *Listener) assign(ctx context.Context, job Job) error {
 // than inspecting a conclusion — the lease's job is finished either way, and the
 // outcome belongs to job history rather than to the capacity ledger.
 func (l *Listener) complete(ctx context.Context, job Job) error {
+	// DESTROYED BEFORE RELEASED, and outside the mutex.
+	//
+	// Releasing first would hand the capacity to another tier while this job's
+	// container or microVM is still running on the host — the budget would be
+	// satisfied on paper and overcommitted in fact. Same shape as closing the
+	// session before releasing the escrow.
+	//
+	// Idempotent by contract, so a redelivered completion, a request this
+	// listener never launched, and a second attempt after a failure all reach
+	// this safely.
+	if err := l.runner.Destroy(ctx, job.RequestID); err != nil {
+		// NOT released. The compute may still be running, and freeing the
+		// capacity now is exactly the overcommit this ordering exists to prevent.
+		// The reaper is the way out: the lease stops being heartbeated when this
+		// listener stops, and expires.
+		return fmt.Errorf("server: destroy the compute for finished request %d: %w",
+			job.RequestID, err)
+	}
+
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -1039,11 +1174,31 @@ func (l *Listener) releaseAll(ctx context.Context) {
 		release(lease)
 	}
 
-	// RUNNING leases are released too, and that is right only while nothing can
-	// actually run a job. Once the node runtime exists these must be handed to
-	// it rather than released — a job in flight whose lease is freed lets another
-	// tier escrow capacity the host is still using.
-	for _, lease := range l.running {
+	// RUNNING leases are DESTROYED before they are released, and the comment that
+	// used to sit here predicted this: releasing them was only right while nothing
+	// could actually run a job. Now that something can, freeing the capacity while
+	// a container or microVM is still on the host lets another tier escrow it and
+	// overcommits the machine.
+	//
+	// A lease whose compute will not die is NOT released. Capacity that the reaper
+	// reclaims late is recoverable; capacity handed out twice is not.
+	//
+	// This does kill work in flight, which is honest rather than good: billet is
+	// stopping and can no longer manage those jobs, so tearing them down and
+	// letting GitHub reassign beats leaving containers nobody is tracking. A
+	// graceful drain — stop taking new work, wait for the running jobs, then exit
+	// — is the thing that makes a restart free, and it is filed rather than
+	// smuggled in here.
+	for requestID, lease := range l.running {
+		if err := l.runner.Destroy(ctx, requestID); err != nil {
+			l.log.Error("could not destroy the compute for a running job; its capacity stays "+
+				"held until the reaper takes it, because releasing it now would let another "+
+				"tier use a machine this job is still on",
+				"tier", l.tier, "request", requestID, "lease", lease.ID, "error", err)
+
+			continue
+		}
+
 		release(lease)
 	}
 
