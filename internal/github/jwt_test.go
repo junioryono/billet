@@ -75,6 +75,20 @@ func TestSignAppJWTProducesAVerifiableSignature(t *testing.T) {
 	}
 }
 
+// numericClaim reads a JSON number claim, naming the claim when it is missing
+// or the wrong type. A bare `claims["iat"].(float64)` panics instead, reporting
+// a stack trace rather than which claim the signer failed to emit.
+func numericClaim(t *testing.T, claims map[string]any, name string) int64 {
+	t.Helper()
+
+	v, ok := claims[name].(float64)
+	if !ok {
+		t.Fatalf("claim %q is missing or not a number: %v", name, claims[name])
+	}
+
+	return int64(v)
+}
+
 // GitHub rejects a token whose iat is in the future, and a minute of fast clock
 // is common on a host whose NTP has not settled. The resulting error reads like
 // a credential problem, which sends people down entirely the wrong path.
@@ -91,8 +105,8 @@ func TestSignAppJWTBackdatesIssuedAt(t *testing.T) {
 	var claims map[string]any
 	decodeSegment(t, strings.Split(token, ".")[1], &claims)
 
-	iat := int64(claims["iat"].(float64))
-	exp := int64(claims["exp"].(float64))
+	iat := numericClaim(t, claims, "iat")
+	exp := numericClaim(t, claims, "exp")
 
 	// EXACT values, not inequalities. "iat is in the past" stays true if the
 	// backdate shrinks to one second, which would no longer absorb the clock skew

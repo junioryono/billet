@@ -14,7 +14,8 @@
 //
 // Capacity is a VECTOR — vCPU, memory, per-tier concurrency, and per-node macOS
 // licence slots — never a single integer. A host runs out of memory long before
-// it runs out of cores, and Apple's two-guest limit is not expressible in either.
+// it runs out of cores, and a host's macOS guest limit is not expressible in
+// either.
 package alloc
 
 import (
@@ -71,6 +72,13 @@ var validTransitions = map[Phase][]Phase{
 // Terminal reports whether a phase releases capacity.
 func (p Phase) Terminal() bool { return p == PhaseDone || p == PhaseFailed }
 
+// requiresPlacement reports whether a phase presumes a host is running the
+// instance. Entering one without a bound, still-legal placement means something
+// launched work the allocator never authorised.
+func requiresPlacement(p Phase) bool {
+	return p == PhaseLaunching || p == PhaseOnline || p == PhaseBusy
+}
+
 func (p Phase) canMoveTo(next Phase) bool {
 	for _, allowed := range validTransitions[p] {
 		if allowed == next {
@@ -101,12 +109,37 @@ var (
 	// ErrConflict means a retry contradicts what was already recorded — the same
 	// lease assigned to a different job, or released with a different outcome.
 	ErrConflict = errors.New("alloc: retry contradicts the recorded operation")
+	// ErrGuestOSNotAllowed means the host does not permit the lease's guest OS.
+	// Distinct from ErrWrongNode: the lease is not pinned anywhere, the chosen
+	// host simply may not run that kind of guest.
+	ErrGuestOSNotAllowed = errors.New("alloc: node does not permit that guest OS")
+	// ErrWrongProvider means the node runs a different compute backend than the
+	// lease requires — a Firecracker lease cannot run on a Tart host.
+	ErrWrongProvider = errors.New("alloc: node runs a different provider")
+	// ErrNotPlaced means a lease reached a phase that presumes a host without
+	// ever being bound to one.
+	ErrNotPlaced = errors.New("alloc: lease has no bound node")
+	// ErrNotPlaceable means a lease carries too little recorded placement
+	// information to verify a host is legal for it — a row predating the
+	// columns the checks read. It fails closed rather than skipping the checks.
+	ErrNotPlaceable = errors.New("alloc: lease cannot be placed safely")
 )
 
 // Limits is the global ceiling the allocator escrows against.
 type Limits struct {
 	MaxVCPU   int
 	MaxMemory config.ByteSize
+
+	// Nodes is per-host policy keyed by node name. Build it with
+	// config.Config.NodePolicies so the runtime checks and the load-time guard
+	// read the same rules rather than two copies that can drift.
+	//
+	// A node absent from the map is unconstrained in guest OS and falls back to
+	// config.DefaultMacOSVMLimit. An unconfigured Apple host is still bound by
+	// Apple's licence, so the absent case must be the licence rather than
+	// "unlimited" — a mistyped node name then costs a scheduling constraint, not
+	// a licence violation.
+	Nodes map[string]config.NodePolicy
 }
 
 // Lease is a capacity reservation. The Epoch is the fencing token: every write
@@ -120,15 +153,23 @@ type Lease struct {
 	// TargetNode is the node the lease is CONSTRAINED to by its tier's config.
 	// Recorded at reserve time so placement survives a catalog change.
 	TargetNode string
-	// MacOSSlot records whether this lease consumes one of Apple's two per-host
+	// MacOSSlot records whether this lease consumes one of its host's macOS
 	// guest licences. Stored rather than re-derived for the same reason.
 	MacOSSlot bool
-	Phase     Phase
-	VCPU      int
-	Memory    config.ByteSize
-	Epoch     int64
-	RunID     int64
-	JobID     int64
+	// GuestOS is what this lease boots, recorded at reserve time so a tier
+	// redefined underneath an in-flight lease cannot reclassify it. Bind checks
+	// it against the target host's allowlist.
+	GuestOS config.GuestOS
+	// Provider is the backend this lease needs, recorded for the same reason.
+	// Bind compares it against the node's REGISTERED provider: a Firecracker
+	// lease cannot run on a Tart host.
+	Provider config.ProviderKind
+	Phase    Phase
+	VCPU     int
+	Memory   config.ByteSize
+	Epoch    int64
+	RunID    int64
+	JobID    int64
 }
 
 // Usage is the vector of what is currently held.
@@ -194,6 +235,46 @@ func New(db *state.DB, limits Limits, tiers []config.Tier, opts ...Option) (*All
 			limits.MaxVCPU, limits.MaxMemory)
 	}
 
+	// Deep-copied rather than aliased: Limits is a value type, but the map, the
+	// GuestOS slices and the MacOSVMLimit pointers inside it are all shared with
+	// the caller. Copying only the map would still let a caller widen a host's
+	// allowlist or raise its cap after construction, moving a licence limit out
+	// from under leases already counted against it. NodePolicy.Clone owns that
+	// knowledge so it lives in one place.
+	perNode := make(map[string]config.NodePolicy, len(limits.Nodes))
+
+	for node, p := range limits.Nodes {
+		// The SAME rules config applies, not a second hand-written copy that can
+		// drift into disagreeing about which hosts are legal. This covers the
+		// raw fields rather than the effective limit — a negative
+		// macos_vm_limit slipped past a check reading MacOSLimit(), which
+		// normalizes it to zero whenever the allowlist excludes macOS.
+		// The map KEY is how every lookup finds this policy, so a key that is not
+		// the canonical node name silently detaches the policy from its host: the
+		// tier's node is normalized, the key is not, the lookup misses, and an
+		// explicit macos_vm_limit of 0 is replaced by Apple's default of 2. The
+		// policy appears to be enforced and is not.
+		//
+		// Two checks compose to prevent that, and there is deliberately no third.
+		// An explicit "the key has no surrounding whitespace" test used to sit
+		// here and could never fire in either order: Validate rejects a padded
+		// NAME outright (the label pattern is anchored, so the padding is part of
+		// what must match), and a key that differs from a valid name is caught
+		// below. Two mutation runs were what established that — the case written
+		// to cover it stayed green with the check deleted.
+		if errs := p.Validate(fmt.Sprintf("alloc: node %q", node)); len(errs) > 0 {
+			return nil, errors.Join(errs...)
+		}
+
+		if p.Name != node {
+			return nil, fmt.Errorf("alloc: node key %q does not match its policy name %q", node, p.Name)
+		}
+
+		perNode[node] = p.Clone()
+	}
+
+	limits.Nodes = perNode
+
 	a := &Allocator{
 		db:       db,
 		limits:   limits,
@@ -220,6 +301,20 @@ func New(db *state.DB, limits Limits, tiers []config.Tier, opts ...Option) (*All
 			return nil, fmt.Errorf("alloc: tier %q has memory %s; headroom divides by it", t.Label, t.Memory)
 		case t.MaxConcurrent < 0:
 			return nil, fmt.Errorf("alloc: tier %q has negative max_concurrent %d", t.Label, t.MaxConcurrent)
+		case !t.Provider.Valid():
+			// A blank provider makes a lease unplaceable; a NONBLANK invalid one
+			// is worse, because it compares unequal to every registered provider
+			// and so strands the lease at bind time with a confusing message.
+			// Both are refused here rather than discovered later.
+			return nil, fmt.Errorf(
+				"alloc: tier %q has provider %q, which is not a known backend; its leases could not be placed",
+				t.Label, t.Provider)
+		case !t.GuestOS.Valid():
+			// Same reasoning from the other side: an unknown guest OS matches no
+			// allowlist, so it either strands the lease or reads as a value some
+			// host happens to permit.
+			return nil, fmt.Errorf(
+				"alloc: tier %q has guest_os %q, which is not a known guest OS", t.Label, t.GuestOS)
 		case t.GuestOS == config.GuestMacOS && strings.TrimSpace(t.Node) == "":
 			return nil, fmt.Errorf(
 				"alloc: macOS tier %q names no node; Apple's per-host guest limit cannot be enforced without one",
@@ -230,8 +325,28 @@ func New(db *state.DB, limits Limits, tiers []config.Tier, opts ...Option) (*All
 			return nil, fmt.Errorf("alloc: duplicate tier label %q", t.Label)
 		}
 
+		// A pin is validated, not silently normalized away. Trimming
+		// unconditionally turned `node: "   "` into an unpinned tier here — the
+		// same silent loss of a placement constraint that config.Load was fixed
+		// to reject, still reachable through this constructor. And a name like
+		// "mac mini" matches no node that could ever register, so the lease would
+		// escrow capacity and never bind.
 		normalized := *t
-		normalized.Node = strings.TrimSpace(t.Node)
+
+		if t.Node != "" {
+			normalized.Node = strings.TrimSpace(t.Node)
+
+			if normalized.Node == "" {
+				return nil, fmt.Errorf(
+					"alloc: tier %q pins node %q, which is blank; a pin that normalizes away silently "+
+						"unpins the tier", t.Label, t.Node)
+			}
+
+			if err := config.ValidateNodeName(fmt.Sprintf("alloc: tier %q", t.Label), normalized.Node); err != nil {
+				return nil, err
+			}
+		}
+
 		a.tiers[t.Label] = normalized
 	}
 
@@ -328,9 +443,84 @@ func (a *Allocator) Escrow(ctx context.Context, tier string, want int) ([]*Lease
 	return leases, nil
 }
 
+// checkPlacement reports whether a lease may run on a node, under the policy in
+// force RIGHT NOW.
+//
+// Called from Bind and again on entry to launching, deliberately. Binding is not
+// launching: a lease can be bound while still in `capacity`, so a policy that
+// tightens in between would otherwise let an instance start on a host that no
+// longer permits it — the check having passed at a moment that has since become
+// irrelevant. Re-checking at the launch boundary is what makes the guarantee
+// "this placement is legal now" rather than "was legal once".
+func (a *Allocator) checkPlacement(ctx context.Context, tx *sql.Tx, lease *Lease, node string) error {
+	if !a.allowsGuestOS(node, lease.GuestOS) {
+		return fmt.Errorf("%w: lease %s is a %s guest and node %q does not permit that guest OS",
+			ErrGuestOSNotAllowed, lease.ID, lease.GuestOS, node)
+	}
+
+	// A lease predating the provider column records "", so there is nothing to
+	// compare and it FAILS CLOSED. Tolerating it would be a bypass rather than a
+	// courtesy: such a lease may still be unbound, so it is not old work already
+	// placed — it is unplaced work whose backend nothing can verify, free to bind
+	// to a host running anything. The same rows are the ones migration 7 cannot
+	// reliably classify by guest OS either, since macos_slot only became truthful
+	// at migration 5.
+	if lease.Provider == "" {
+		// "Release it" rather than "reap it": Reap only collects leases whose TTL
+		// has expired, so while a holder keeps heartbeating it returns zero
+		// forever and the advice would be unfollowable.
+		return fmt.Errorf(
+			"%w: lease %s predates provider recording and cannot be placed safely; "+
+				"release it, or stop its holder and let it expire",
+			ErrNotPlaceable, lease.ID)
+	}
+
+	// The node's REGISTERED provider, not one from config: a Firecracker lease
+	// cannot run on a Tart host, and the registration is what the host itself
+	// reported rather than what a catalog claims about it.
+	var registered string
+
+	switch err := tx.QueryRowContext(ctx,
+		`SELECT provider FROM nodes WHERE name = ?`, node).Scan(&registered); {
+	case errors.Is(err, sql.ErrNoRows):
+		return fmt.Errorf("%w: node %q is not registered", ErrWrongNode, node)
+	case err != nil:
+		return fmt.Errorf("alloc: read node %s: %w", node, err)
+	}
+
+	if registered != string(lease.Provider) {
+		return fmt.Errorf("%w: lease %s needs provider %q but node %q runs %q",
+			ErrWrongProvider, lease.ID, lease.Provider, node, registered)
+	}
+
+	return nil
+}
+
+// macOSLimit is the cap on concurrent macOS guests for a host. See Limits.Nodes
+// for why an unlisted node gets Apple's default rather than no limit at all.
+func (a *Allocator) macOSLimit(node string) int {
+	if p, ok := a.limits.Nodes[node]; ok {
+		return p.MacOSLimit()
+	}
+
+	return config.DefaultMacOSVMLimit
+}
+
+// allowsGuestOS reports whether a host may run a guest OS. An undeclared host is
+// unconstrained, which is what a deployment that never wrote a nodes section
+// relies on.
+func (a *Allocator) allowsGuestOS(node string, os config.GuestOS) bool {
+	p, ok := a.limits.Nodes[node]
+	if !ok {
+		return true
+	}
+
+	return p.AllowsGuestOS(os)
+}
+
 // headroom computes how many more of a tier fit. Every limit is applied, and the
 // smallest wins — capacity is a vector, so "enough cores" says nothing about
-// memory or about Apple's per-host guest limit.
+// memory or about the per-host macOS guest limit.
 func (a *Allocator) headroom(ctx context.Context, tx *sql.Tx, t config.Tier) (int, error) {
 	used, err := a.usage(ctx, tx)
 	if err != nil {
@@ -351,17 +541,17 @@ func (a *Allocator) headroom(ctx context.Context, tx *sql.Tx, t config.Tier) (in
 		n = min(n, t.MaxConcurrent-tierUsed)
 	}
 
-	// Apple permits at most two macOS guests per Apple-branded host, counting
-	// every running one regardless of which tier asked for it. Two individually
-	// legal macOS tiers on one Mac still share one machine, so the limit is
-	// enforced per NODE across tiers rather than per tier.
+	// A host caps concurrent macOS guests, counting every running one regardless
+	// of which tier asked for it. Two individually legal macOS tiers on one Mac
+	// still share one machine, so the limit is enforced per NODE across tiers
+	// rather than per tier.
 	if t.GuestOS == config.GuestMacOS && t.Node != "" {
 		hostUsed, err := a.countOpenMacOSByNode(ctx, tx, t.Node)
 		if err != nil {
 			return 0, err
 		}
 
-		n = min(n, config.MacOSVMLimit-hostUsed)
+		n = min(n, a.macOSLimit(t.Node)-hostUsed)
 	}
 
 	return max(n, 0), nil
@@ -434,10 +624,11 @@ func (a *Allocator) insertLease(ctx context.Context, tx *sql.Tx, t config.Tier) 
 
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO leases
-		   (id, tier, node, target_node, macos_slot, phase, vcpu, memory, epoch,
+		   (id, tier, node, target_node, macos_slot, guest_os, provider, phase, vcpu, memory, epoch,
 		    created_at, heartbeat_at, expires_at)
-		 VALUES (?, ?, NULL, ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
-		id, t.Label, targetNode, macSlot, string(PhaseCapacity), t.VCPU, int64(t.Memory),
+		 VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
+		id, t.Label, targetNode, macSlot, string(t.GuestOS), string(t.Provider),
+		string(PhaseCapacity), t.VCPU, int64(t.Memory),
 		ts(now), ts(now), ts(now.Add(a.leaseTTL))); err != nil {
 		return nil, fmt.Errorf("alloc: insert lease: %w", err)
 	}
@@ -447,6 +638,8 @@ func (a *Allocator) insertLease(ctx context.Context, tx *sql.Tx, t config.Tier) 
 		Tier:       t.Label,
 		TargetNode: t.Node,
 		MacOSSlot:  macSlot == 1,
+		GuestOS:    t.GuestOS,
+		Provider:   t.Provider,
 		Phase:      PhaseCapacity,
 		VCPU:       t.VCPU,
 		Memory:     t.Memory,
@@ -547,13 +740,60 @@ func (a *Allocator) Bind(ctx context.Context, leaseID string, epoch int64, node 
 				ErrWrongNode, leaseID, lease.TargetNode, node)
 		}
 
-		if lease.Node != "" && lease.Node != node {
+		// Answered BEFORE the allowlist, because a repeat changes nothing. If the
+		// host's policy tightened after this lease was placed, refusing the retry
+		// un-binds nothing — the guest is running either way — and turns a
+		// harmless no-op into a hard error that a node retrying past a transient
+		// failure would read as "tear this job down". The policy gates NEW
+		// placements; an existing one is the reaper's problem, not Bind's.
+		if lease.Node == node {
+			return nil // idempotent repeat
+		}
+
+		if lease.Node != "" {
 			return fmt.Errorf("%w: lease %s is already bound to node %q, cannot rebind to %q",
 				ErrWrongNode, leaseID, lease.Node, node)
 		}
 
-		if lease.Node == node {
-			return nil // idempotent repeat
+		// A FIRST binding for a lease already in a running phase means its node
+		// went missing rather than that it was never placed, and adopting it onto
+		// a new host would create a second owner of one slot.
+		//
+		// `leases.node` is ON DELETE SET NULL, so deleting a node silently blanks
+		// the column for every lease it was running. The lease then LOOKS unbound
+		// while the original host is still executing the job and still holds a
+		// valid epoch, so its heartbeats keep succeeding — bind it elsewhere and
+		// two hosts own the same lease. Reap cannot resolve that while either one
+		// keeps heartbeating.
+		//
+		// This refusal narrows the route; it does NOT close it, and the difference
+		// matters before node removal is built. A lease still in `assigned` when
+		// its node is deleted is not yet running, so it binds to a new host
+		// perfectly legally — and the stale original still holds the same epoch,
+		// so its own Advance is authorized against whatever node the row now
+		// names rather than against the caller. Ownership is recorded, not
+		// proven: nothing here identifies WHO is asking.
+		//
+		// Closing that needs fencing at deletion, or a durable holder identity
+		// checked on every authorization. Both belong with node lifecycle, which
+		// does not exist yet — there is deliberately no delete path in this
+		// package, so the residual hole is not reachable through this binary.
+		if requiresPlacement(lease.Phase) {
+			return fmt.Errorf(
+				"%w: lease %s is already %s; a first binding now would make node %q a second owner",
+				ErrWrongNode, leaseID, lease.Phase, node)
+		}
+
+		// The host's guest-OS allowlist is enforced HERE because this is the
+		// first point at which the host is known. A lease with no target_node
+		// names no host at reserve time, so config validation cannot rule out a
+		// placement it never sees — a scheduler that simply picked a node with
+		// free capacity would otherwise put a Linux guest on a macOS-only Mac.
+		//
+		// The guest OS comes from the lease's own column, not the live catalog,
+		// so a tier redefined underneath an in-flight lease cannot reclassify it.
+		if err := a.checkPlacement(ctx, tx, lease, node); err != nil {
+			return err
 		}
 
 		if _, err := tx.ExecContext(ctx,
@@ -747,13 +987,64 @@ func (a *Allocator) transition(ctx context.Context, leaseID string, epoch int64,
 			return err
 		}
 
+		// State-machine legality first, so an illegal transition reports itself as
+		// one. capacity -> online is refused whatever the placement is, and
+		// answering it with "bind it to a node first" sends the caller off to do
+		// something that would not help.
+		//
+		// Skipped when the phase is unchanged, because a repeat is not a move and
+		// validTransitions deliberately lists no self-edges.
+		if lease.Phase != to && !lease.Phase.canMoveTo(to) {
+			return fmt.Errorf("%w: %s -> %s", ErrBadTransition, lease.Phase, to)
+		}
+
+		// Placement is validated BEFORE the idempotent return, unlike Bind.
+		//
+		// The two look symmetrical and are not. A repeated Bind records nothing
+		// new, so answering it with nil is genuinely a no-op. A repeated
+		// Advance(launching) is read by its caller as "you may launch" — that
+		// nil is an AUTHORIZATION, not an acknowledgement. Returning it without
+		// checking lets a recovery loop re-ask about a row already sitting in
+		// launching and get permission for a placement that is no longer legal,
+		// or was never verifiable.
+		//
+		// Every phase from launching onwards presumes a host is running the
+		// instance, so each requires a bound node — not just the launching edge,
+		// which would leave a row written by an older binary with
+		// phase='launching' and node=NULL free to walk on to online.
+		if requiresPlacement(to) {
+			if lease.Node == "" {
+				// The advice depends on the phase the lease is in NOW, not on the
+				// one it is trying to reach.
+				//
+				// From `assigned` this is the ordinary "you forgot to bind"
+				// case, and Bind still accepts it. From a phase that already
+				// requires placement the lease is an orphan — its node row went
+				// away — and Bind refuses to adopt it, so recommending a bind
+				// would send the operator into a second refusal. Only ending the
+				// lease works there, and saying so for BOTH cases would tell
+				// someone to destroy work that just needed binding.
+				fix := "bind it to a node first"
+				if requiresPlacement(lease.Phase) {
+					fix = "release it, or stop its holder and let it expire"
+				}
+
+				return fmt.Errorf("%w: lease %s is %s with no bound node; %s",
+					ErrNotPlaced, leaseID, lease.Phase, fix)
+			}
+
+			// Re-checked against CURRENT policy rather than trusted from bind
+			// time. Binding is not launching: a lease may be bound while still in
+			// `capacity`, and a policy tightened in between would otherwise let
+			// the instance start on a host that no longer permits it.
+			if err := a.checkPlacement(ctx, tx, lease, lease.Node); err != nil {
+				return err
+			}
+		}
+
 		if lease.Phase == to {
 			// Idempotent: a retried transition is not an error.
 			return nil
-		}
-
-		if !lease.Phase.canMoveTo(to) {
-			return fmt.Errorf("%w: %s -> %s", ErrBadTransition, lease.Phase, to)
 		}
 
 		now := a.now().UTC()
@@ -804,6 +1095,8 @@ func (a *Allocator) loadAny(ctx context.Context, tx *sql.Tx, leaseID string, epo
 		node       sql.NullString
 		targetNode sql.NullString
 		macSlot    int
+		guestOS    string
+		provider   string
 		mem        int64
 		ph         string
 		runID      sql.NullInt64
@@ -812,9 +1105,11 @@ func (a *Allocator) loadAny(ctx context.Context, tx *sql.Tx, leaseID string, epo
 	)
 
 	err := tx.QueryRowContext(ctx,
-		`SELECT id, tier, node, target_node, macos_slot, phase, vcpu, memory, epoch, run_id, job_id
+		`SELECT id, tier, node, target_node, macos_slot, guest_os, provider, phase, vcpu, memory,
+		        epoch, run_id, job_id
 		   FROM leases WHERE id = ?`, leaseID).
-		Scan(&l.ID, &l.Tier, &node, &targetNode, &macSlot, &ph, &l.VCPU, &mem, &curEpoch, &runID, &jobID)
+		Scan(&l.ID, &l.Tier, &node, &targetNode, &macSlot, &guestOS, &provider, &ph, &l.VCPU, &mem,
+			&curEpoch, &runID, &jobID)
 
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
@@ -831,6 +1126,7 @@ func (a *Allocator) loadAny(ctx context.Context, tx *sql.Tx, leaseID string, epo
 
 	l.Node, l.TargetNode = node.String, targetNode.String
 	l.MacOSSlot, l.Phase, l.Memory = macSlot == 1, Phase(ph), config.ByteSize(mem)
+	l.GuestOS, l.Provider = config.GuestOS(guestOS), config.ProviderKind(provider)
 	l.Epoch, l.RunID, l.JobID = curEpoch, runID.Int64, jobID.Int64
 
 	return &l, nil

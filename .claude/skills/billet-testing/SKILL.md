@@ -38,6 +38,58 @@ The same applies to messages that carry operator guidance. `installation_id is r
 App does not install it` exists because the failure is otherwise baffling — so the test asserts the
 `does not install it` clause, not merely that an error occurred.
 
+## A discarded error is a vacuous assertion waiting to happen
+
+`if n, _ := a.Headroom(ctx, "x"); n != 0 { t.Error(...) }` reads harmlessly and is not. These APIs
+return the **zero value alongside an error**, so an assertion that a result *is* zero — no headroom,
+no open leases, no rows — passes when the call FAILS. The test proves nothing and looks green.
+
+It bit seven times: five in `internal/alloc` (`Usage` and `Headroom`), and twice in
+`internal/github`, where `active, _ := hook["active"].(bool)` yielded `false` for an **absent** key —
+the expected value — so the test never proved the App manifest disables its webhook. Adding
+`omitempty` to that field, a realistic mistake, kept the suite green.
+
+**errcheck catches this mechanically, and is enabled on tests.** It was excluded, on the assumption
+that `defer db.Close()` noise would swamp it. Measured, that assumption was wrong: 19 sites, two of
+them real bugs. Where an error genuinely cannot matter — writing to an `httptest` buffer — use
+`//nolint:errcheck // reason`.
+
+Prefer a checked helper when the call appears many times, so the shape stops being writable:
+
+```go
+func headroom(t *testing.T, a *Allocator, tier string) int {
+	t.Helper()
+	n, err := a.Headroom(t.Context(), tier)
+	if err != nil {
+		t.Fatalf("Headroom(%s): %v", tier, err)
+	}
+	return n
+}
+```
+
+Note the helper uses `t.Context()`. If a test needs a **cancelled** context to exercise cancellation,
+call the API directly — the helper would bypass the very context the test is about.
+
+The question to ask, for anything the linter cannot see: **if this call errored, would my assertion
+still pass?** Confirm it the way you would any invariant — make the call fail and watch the test fail
+too.
+
+## Comma-ok is the same trap
+
+`v, _ := m["k"].(T)` yields the zero value when the key is absent *or* the wrong type. Asserting the
+zero value therefore proves nothing about presence. When presence is the point — a manifest field
+that must be explicitly `false` — assert `ok` separately from the value:
+
+```go
+active, ok := hook["active"].(bool)
+switch {
+case !ok:
+	t.Errorf("active must be present and boolean, got %v", hook["active"])
+case active:
+	t.Error("the webhook must be inactive")
+}
+```
+
 ## Package conventions
 
 - `t.Context()` and `t.TempDir()`, never `context.Background()` or a hand-made temp dir. Enforced by
@@ -96,7 +148,10 @@ correct. That belongs in the conformance suite: real `actions/cache`, `upload-ar
 changing the protocol, which is the only failure that matters.
 
 **Anything needing `/dev/kvm` or a hypervisor.** Provider tests assert the lifecycle contract against
-a fake; the real backends are validated by the conformance suite on a machine that has one.
+a fake; the real backends will be validated by the conformance suite on a machine that has one.
+
+Neither suite exists yet — nor do the cache and the providers they would cover. Both are described
+here as the rule to follow when those land, not as something currently running.
 
 ## Coverage
 
@@ -104,6 +159,11 @@ a fake; the real backends are validated by the conformance suite on a machine th
 make cover
 ```
 
-85% project target, 80% patch. Treat a drop as a prompt to look, not a number to satisfy —
-`cmd/billet/main.go` is excluded in `.codecov.yml` because unit-testing flag parsing measures nothing
-while raising the figure.
+The project target is **`auto`** — do not regress from the base commit — with an 80% patch target.
+Not an absolute number, and deliberately so: a hard 85% on a project sitting at 79% fails every PR
+from day one, and a check that always fails is a check everyone learns to ignore. New code carries
+the patch target, so the overall figure ratchets up as the project grows rather than being declared
+true in advance.
+
+Treat a drop as a prompt to look, not a number to satisfy — `cmd/billet/main.go` is excluded in
+`.codecov.yml` because unit-testing flag parsing measures nothing while raising the figure.

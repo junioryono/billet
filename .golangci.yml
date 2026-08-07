@@ -295,9 +295,16 @@ linters:
       - std-error-handling
     rules:
       # ----- tests: relax noise-heavy rules -----
+      #
+      # errcheck is deliberately NOT in this list. It was, on the assumption that
+      # tests are full of `defer db.Close()` and enabling it would bury everyone
+      # in noise. Measured, it was 19 sites — and two of them were real bugs that
+      # had been passing for the wrong reason. `n, _ := f()` followed by an
+      # assertion that n is zero passes precisely when the call FAILS, and this
+      # catches it mechanically rather than relying on anyone remembering to
+      # look. Genuinely irrelevant errors get `//nolint:errcheck // reason`.
       - path: _test\.go
         linters:
-          - errcheck
           - gosec
           - contextcheck
           - containedctx

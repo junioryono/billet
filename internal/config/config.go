@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -31,6 +32,141 @@ type Config struct {
 	// Tiers is the runner catalog. Each tier becomes one GitHub scale set, and
 	// its Label is what users put in `runs-on`.
 	Tiers []Tier `yaml:"tiers,omitempty"`
+	// hostname is injectable so the node-name default can be tested against a
+	// machine whose hostname is not a legal node name. Nil means os.Hostname.
+	hostname func() (string, error)
+
+	// nameDefaulted records THAT node.name was defaulted from the hostname;
+	// nameFromHostname records what that hostname was.
+	//
+	// Two fields, because a non-empty value is not the same fact as "billet
+	// supplied this". A machine whose hostname is blank or all whitespace
+	// defaults to an empty name — still defaulted, still the case where the
+	// operator needs to be told where it came from — and a single string field
+	// reported that one with the generic wording, which sends someone who never
+	// typed a name looking for a field that is not in their file.
+	nameDefaulted    bool
+	nameFromHostname string
+
+	// Nodes describes per-host policy to the server. It is optional and separate
+	// from the Node section on purpose: Node is how a host describes ITSELF,
+	// while Nodes is how the control plane describes the FLEET. Host policy has
+	// to live on the server side, because the limits it expresses are enforced
+	// across tiers the individual host never sees.
+	//
+	// Every field defaults, so a deployment that wants the standard behaviour
+	// omits the section entirely.
+	Nodes []NodePolicy `yaml:"nodes,omitempty"`
+}
+
+// NodePolicy is what one compute host is permitted to run.
+//
+// It exists because a host's capabilities are not implied by its provider. An
+// Apple Silicon machine can serve macOS guests, Linux arm64 guests, or both,
+// and which of those an operator wants is a deployment decision rather than a
+// property of the hardware — someone may keep a Mac exclusively for macOS so
+// the licensed guests never contend with Linux builds, or run it purely as an
+// arm64 Linux builder and never boot macOS on it at all.
+type NodePolicy struct {
+	// Name matches Tier.Node and NodeConfig.Name.
+	Name string `yaml:"name"`
+
+	// Provider is the compute backend this host runs, matching NodeConfig.
+	// Provider. Optional, and used only to decide whether an unpinned tier could
+	// ever land here: a firecracker tier is not a placement candidate for a Tart
+	// host, so without it a macOS-only Mac would appear to conflict with every
+	// x64 Linux tier in the deployment.
+	Provider ProviderKind `yaml:"provider,omitempty"`
+
+	// GuestOS is an allowlist of what may be scheduled here. Empty means
+	// unconstrained, which is the default and preserves the behaviour of a
+	// config that never mentions the node.
+	//
+	// Note the shape difference from Tier.GuestOS, which is a single value: a
+	// tier boots exactly one guest OS, while a host may permit several.
+	GuestOS []GuestOS `yaml:"guest_os,omitempty"`
+
+	// MacOSVMLimit caps concurrent macOS guests on this host, counting warm
+	// ones. Nil means DefaultMacOSVMLimit — an unconfigured Apple host is still
+	// bound by Apple's licence, so the default is the licence, not "unlimited".
+	//
+	// Lowering it is the common case: reserve one slot for interactive use, or
+	// set 0 to keep a Mac for Linux arm64 work only. Raising it above
+	// DefaultMacOSVMLimit is permitted because billet cannot know what licence
+	// or hardware agreement a given operator has, but Apple's standard terms
+	// allow at most DefaultMacOSVMLimit macOS guests per Apple-branded host —
+	// exceeding that is an assertion about YOUR licence, not a tuning knob.
+	MacOSVMLimit *int `yaml:"macos_vm_limit,omitempty"`
+}
+
+// policyEnumsValid reports whether every enum this policy carries is a known
+// value. Relational checks consult it so one typo produces one diagnostic
+// against the field that holds it, rather than a second one phrased as an
+// allowlist mismatch.
+func (p NodePolicy) policyEnumsValid() bool {
+	if p.Provider != "" && !p.Provider.Valid() {
+		return false
+	}
+
+	for _, g := range p.GuestOS {
+		if !g.Valid() {
+			return false
+		}
+	}
+
+	return true
+}
+
+// Clone returns a deep copy, sharing nothing mutable with the receiver.
+//
+// A shallow struct copy is not enough and the difference is silent: GuestOS is a
+// slice and MacOSVMLimit is a POINTER, so a caller holding the original can
+// widen a host's allowlist or raise its macOS cap after the allocator has been
+// built from it — moving a licence limit out from under leases already counted
+// against it, with nothing to indicate the rules changed.
+func (p NodePolicy) Clone() NodePolicy {
+	p.GuestOS = slices.Clone(p.GuestOS)
+
+	if p.MacOSVMLimit != nil {
+		limit := *p.MacOSVMLimit
+		p.MacOSVMLimit = &limit
+	}
+
+	return p
+}
+
+// AllowsGuestOS reports whether this host may run a given guest OS. An empty
+// allowlist permits everything.
+func (p NodePolicy) AllowsGuestOS(g GuestOS) bool {
+	if len(p.GuestOS) == 0 {
+		return true
+	}
+
+	for _, allowed := range p.GuestOS {
+		if allowed == g {
+			return true
+		}
+	}
+
+	return false
+}
+
+// MacOSLimit is the effective cap on concurrent macOS guests for this host.
+//
+// An allowlist that excludes macOS yields 0 whatever MacOSVMLimit says, so the
+// two fields cannot disagree about whether macOS runs here. Validation rejects
+// the contradictory config that would make this matter; this method makes the
+// answer well-defined regardless of how it was constructed.
+func (p NodePolicy) MacOSLimit() int {
+	if !p.AllowsGuestOS(GuestMacOS) {
+		return 0
+	}
+
+	if p.MacOSVMLimit == nil {
+		return DefaultMacOSVMLimit
+	}
+
+	return *p.MacOSVMLimit
 }
 
 // ServerConfig configures the control plane.
@@ -91,7 +227,9 @@ const (
 
 var allProviders = []ProviderKind{ProviderFirecracker, ProviderTart, ProviderEC2, ProviderDocker}
 
-func (p ProviderKind) valid() bool {
+// Valid reports whether this is a known provider. Exported because alloc.New
+// must reject a catalog it cannot prove came through Load.
+func (p ProviderKind) Valid() bool {
 	for _, k := range allProviders {
 		if p == k {
 			return true
@@ -114,7 +252,8 @@ const (
 
 var allGuestOS = []GuestOS{GuestLinux, GuestMacOS, GuestWindows}
 
-func (g GuestOS) valid() bool {
+// Valid reports whether this is a known guest OS.
+func (g GuestOS) Valid() bool {
 	for _, k := range allGuestOS {
 		if g == k {
 			return true
@@ -191,21 +330,149 @@ type Tier struct {
 	MaxConcurrent int `yaml:"max_concurrent,omitempty"`
 }
 
-// MacOSVMLimit is Apple's licensing cap on macOS guests per Apple-branded host.
-// Linux guests on the same machine are not subject to it.
+// DefaultMacOSVMLimit is Apple's licensing cap on macOS guests per
+// Apple-branded host. Linux guests on the same machine are not subject to it.
 //
-// This package enforces the limit statically, per node, across all macOS tiers.
-// That is a guard, not the enforcement point: the allocator additionally holds a
-// single host-wide count of running plus warm macOS guests at runtime, because
-// two separately-valid tiers on one node still share one physical Mac. It is
-// exported so there is one number, not two that can drift apart.
-const MacOSVMLimit = 2
+// This is the DEFAULT, not a hard ceiling: a deployment sets its own per-host
+// number via NodePolicy.MacOSVMLimit, because billet cannot know what hardware
+// or licence agreement an operator has. What the default guarantees is that a
+// config which says nothing gets Apple's standard terms rather than "unlimited".
+//
+// The static check here is a guard, not the enforcement point: the allocator
+// additionally holds a single host-wide count of running plus warm macOS guests
+// at runtime, because two separately-valid tiers on one node still share one
+// physical Mac. Both read the effective limit from the same NodePolicy, so there
+// is one number rather than two that can drift apart.
+const DefaultMacOSVMLimit = 2
 
-// macOSVMLimit is retained as the unexported spelling used throughout this
-// package's validation.
-const macOSVMLimit = MacOSVMLimit
+// NodePolicyFor returns the policy for a named host, and whether one was
+// declared. The zero NodePolicy is the documented default — unconstrained guest
+// OS, Apple's standard macOS limit — so the returned value is usable either way
+// and callers only need the boolean when they care about the distinction.
+func (c *Config) NodePolicyFor(name string) (NodePolicy, bool) {
+	for i := range c.Nodes {
+		if c.Nodes[i].Name == name {
+			return c.Nodes[i], true
+		}
+	}
+
+	return NodePolicy{Name: name}, false
+}
+
+// MacOSLimitForNode is the effective cap on concurrent macOS guests for a host.
+func (c *Config) MacOSLimitForNode(name string) int {
+	p, _ := c.NodePolicyFor(name)
+
+	return p.MacOSLimit()
+}
+
+// NodePolicies is the declared fleet policy keyed by node name. It is what the
+// allocator is built from, so runtime enforcement and this package's load-time
+// guard read the same rules rather than two copies that can drift.
+//
+// Only DECLARED hosts appear. An absent host is unconstrained in guest OS and
+// carries Apple's default macOS limit — the same thing the allocator assumes
+// for a name it does not recognise.
+func (c *Config) NodePolicies() map[string]NodePolicy {
+	policies := make(map[string]NodePolicy, len(c.Nodes))
+
+	for i := range c.Nodes {
+		policies[c.Nodes[i].Name] = c.Nodes[i].Clone()
+	}
+
+	return policies
+}
 
 var labelRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$`)
+
+// validateNodeName is the ONE rule for a node identifier, wherever it appears:
+// node.name, nodes[].name, and tiers[].node all name hosts in a single
+// namespace, so validating them differently lets the same string be a legal
+// host here and an illegal one there.
+//
+// A whitespace-only pin is what made that concrete. This package treated it as
+// "pinned" — a macOS tier satisfied the must-name-a-node rule and inherited a
+// concurrency default from it — while the allocator trimmed it to empty and
+// rejected the same tier. On a Linux tier the trim silently turned a pin into
+// no pin at all, which is a placement decision changed by whitespace.
+func ValidateNodeName(where, name string) error {
+	if !labelRe.MatchString(name) {
+		return fmt.Errorf("%s: node name %q must match %s", where, name, labelRe)
+	}
+
+	return nil
+}
+
+// trimNodeName strips surrounding whitespace ONLY when something is left.
+//
+// Trimming unconditionally destroyed the difference between "absent" and
+// "present but unusable", and both directions were wrong. A `node.name` of
+// "   " became empty and was replaced by the machine's hostname, silently
+// adopting a different identity than the one written. A tier's `node: "   "`
+// became unpinned, and the `if t.Node != ""` guard then skipped validation
+// entirely — removing the operator's placement constraint, which is precisely
+// what validating names was meant to prevent.
+//
+// Leaving a whitespace-only value intact lets it reach the pattern check and be
+// rejected, which is the honest outcome.
+func trimNodeName(name string) string {
+	if trimmed := strings.TrimSpace(name); trimmed != "" {
+		return trimmed
+	}
+
+	return name
+}
+
+// Validate reports every way this policy is malformed on its own terms.
+//
+// Exported because internal/alloc must apply the SAME rules: its constructor
+// accepts a catalog it cannot prove came through Load, and a second
+// hand-written copy of these checks is how the two drift into disagreeing about
+// which hosts are legal.
+func (p NodePolicy) Validate(where string) []error {
+	var errs []error
+
+	if err := ValidateNodeName(where, p.Name); err != nil {
+		errs = append(errs, err)
+	}
+
+	if p.Provider != "" && !p.Provider.Valid() {
+		errs = append(errs, fmt.Errorf("%s: provider %q is not one of %v", where, p.Provider, allProviders))
+	}
+
+	seen := make(map[GuestOS]struct{}, len(p.GuestOS))
+
+	for _, g := range p.GuestOS {
+		if !g.Valid() {
+			errs = append(errs, fmt.Errorf("%s: guest_os %q is not one of %v", where, g, allGuestOS))
+		}
+
+		if _, dup := seen[g]; dup {
+			errs = append(errs, fmt.Errorf("%s: duplicate guest_os %q", where, g))
+		}
+
+		seen[g] = struct{}{}
+	}
+
+	if p.MacOSVMLimit == nil {
+		return errs
+	}
+
+	switch {
+	case *p.MacOSVMLimit < 0:
+		errs = append(errs, fmt.Errorf("%s: macos_vm_limit must not be negative", where))
+	case *p.MacOSVMLimit > 0 && !p.AllowsGuestOS(GuestMacOS):
+		// Both fields decide whether macOS runs here. Silently letting the
+		// allowlist win would mean a config that reads as "two macOS guests"
+		// schedules none.
+		errs = append(errs, fmt.Errorf(
+			"%s: macos_vm_limit is %d but guest_os %v excludes macos; "+
+				"add macos to guest_os or set macos_vm_limit to 0",
+			where, *p.MacOSVMLimit, p.GuestOS))
+	}
+
+	return errs
+}
 
 // Load reads and validates a config file.
 func Load(path string) (*Config, error) {
@@ -244,10 +511,31 @@ func (c *Config) applyDefaults() {
 			c.Server.StateDir = defaultStateDir("server")
 		}
 	}
+	// Node names are normalized FIRST, before anything looks one up. A pin that
+	// differs from its fleet entry only by surrounding whitespace would
+	// otherwise fail to match it, and the tier would silently inherit fleet-wide
+	// defaults instead of that host's policy.
+	for i := range c.Nodes {
+		c.Nodes[i].Name = trimNodeName(c.Nodes[i].Name)
+	}
+
+	for i := range c.Tiers {
+		c.Tiers[i].Node = trimNodeName(c.Tiers[i].Node)
+	}
+
 	if c.Node != nil {
+		c.Node.Name = trimNodeName(c.Node.Name)
+
 		if c.Node.Name == "" {
-			if h, err := os.Hostname(); err == nil {
-				c.Node.Name = h
+			lookup := c.hostname
+			if lookup == nil {
+				lookup = os.Hostname
+			}
+
+			if h, err := lookup(); err == nil {
+				c.Node.Name = strings.TrimSpace(h)
+				c.nameDefaulted = true
+				c.nameFromHostname = h
 			}
 		}
 		if c.Node.StateDir == "" {
@@ -256,19 +544,56 @@ func (c *Config) applyDefaults() {
 		if c.Node.ServerAddr == "" && c.Server != nil {
 			c.Node.ServerAddr = c.Server.Listen
 		}
+
+		// A fleet entry for THIS host that omits its provider takes the local
+		// one. Without it the unpinned-tier check compares against an empty
+		// provider and skips the host entirely — and in single-box mode that is
+		// the only host there is.
+		for i := range c.Nodes {
+			if p := &c.Nodes[i]; p.Name == c.Node.Name && p.Provider == "" {
+				p.Provider = c.Node.Provider
+			}
+		}
 	}
 	for i := range c.Tiers {
 		t := &c.Tiers[i]
-		if t.Provider == "" && c.Node != nil {
+		// The PINNED host's provider wins over the local node's. Defaulting from
+		// the local node is right for an unpinned tier and wrong for a pinned
+		// one: on a multi-host deployment, the file describing the EPYC box would
+		// otherwise stamp `firecracker` onto a tier pinned to a Mac, producing a
+		// contradiction the operator never wrote. Pinning names a host, and that
+		// host's declared provider is the more specific answer.
+		// Only a VALID provider is inherited. Copying an unknown one produces a
+		// second diagnostic blaming a field the operator never supplied, for a
+		// typo they made once somewhere else.
+		if t.Provider == "" && t.Node != "" {
+			if p, declared := c.NodePolicyFor(t.Node); declared && p.Provider.Valid() {
+				t.Provider = p.Provider
+			}
+		}
+
+		// The local provider is inherited only when it is itself valid, for the
+		// same reason: an invalid one copied here becomes a second diagnostic
+		// against a field the operator never wrote.
+		if t.Provider == "" && c.Node != nil && c.Node.Provider.Valid() {
 			t.Provider = c.Node.Provider
 		}
 		if t.GuestOS == "" {
 			t.GuestOS = GuestLinux
 		}
-		// A macOS tier with no explicit cap gets Apple's limit rather than
-		// "unlimited", so forgetting the field fails safe.
+		// A macOS tier with no explicit cap inherits its host's limit rather than
+		// "unlimited", so forgetting the field fails safe. Reading it from the
+		// node policy means lowering a Mac's limit tightens every macOS tier
+		// pinned to it, instead of leaving tiers at a default the host no longer
+		// permits.
+		// Only from a usable limit. A negative one is a config error reported by
+		// validateNodes, and copying it here would turn one bad field into three
+		// diagnostics, two of them naming max_concurrent — which the operator
+		// never set.
 		if t.GuestOS == GuestMacOS && t.MaxConcurrent == 0 {
-			t.MaxConcurrent = macOSVMLimit
+			if limit := c.MacOSLimitForNode(t.Node); limit > 0 {
+				t.MaxConcurrent = limit
+			}
 		}
 	}
 }
@@ -292,6 +617,7 @@ func (c *Config) Validate() error {
 	errs = append(errs, c.validateServer()...)
 	errs = append(errs, c.validateGitHub()...)
 	errs = append(errs, c.validateNode()...)
+	errs = append(errs, c.validateNodes()...)
 	errs = append(errs, c.validateTiers()...)
 	errs = append(errs, c.validateCapacity()...)
 	errs = append(errs, c.validateMacOSHostLimits()...)
@@ -351,11 +677,22 @@ func (c *Config) validateNode() []error {
 		return nil
 	}
 	var errs []error
-	if !c.Node.Provider.valid() {
+	if !c.Node.Provider.Valid() {
 		errs = append(errs, fmt.Errorf("node.provider %q is not one of %v", c.Node.Provider, allProviders))
 	}
-	if strings.TrimSpace(c.Node.Name) == "" {
-		errs = append(errs, errors.New("node.name is required and must not be blank"))
+	if err := ValidateNodeName("node.name", c.Node.Name); err != nil {
+		// Say where the name came from when billet supplied it. A hostname is not
+		// guaranteed to be a legal node name — a long FQDN exceeds the length
+		// limit — and "node.name is invalid" sends an operator who never typed
+		// one looking for a field that is not in their file.
+		if c.nameDefaulted {
+			err = fmt.Errorf(
+				"node.name defaulted to this machine's hostname %q, which is not a usable node name "+
+					"(must match %s); set node.name explicitly",
+				c.nameFromHostname, labelRe)
+		}
+
+		errs = append(errs, err)
 	}
 	if c.Node.StateDir == "" {
 		errs = append(errs, errors.New("node.state_dir is required"))
@@ -395,10 +732,10 @@ func (c *Config) validateTiers() []error {
 		}
 		seen[t.Label] = struct{}{}
 
-		if !t.Provider.valid() {
+		if !t.Provider.Valid() {
 			errs = append(errs, fmt.Errorf("%s: provider %q is not one of %v", where, t.Provider, allProviders))
 		}
-		if !t.GuestOS.valid() {
+		if !t.GuestOS.Valid() {
 			errs = append(errs, fmt.Errorf("%s: guest_os %q is not one of %v", where, t.GuestOS, allGuestOS))
 		}
 		if t.VCPU <= 0 {
@@ -430,13 +767,89 @@ func (c *Config) validateTiers() []error {
 				where, t.WarmPool, t.MaxConcurrent))
 		}
 
-		errs = append(errs, validateGuestOSRules(where, t)...)
+		// A pin names a host, so it obeys the same rule as any other node name.
+		if t.Node != "" {
+			if err := ValidateNodeName(where, t.Node); err != nil {
+				errs = append(errs, err)
+			}
+		}
+
+		errs = append(errs, c.validateGuestOSRules(where, t)...)
 	}
 	return errs
 }
 
-func validateGuestOSRules(where string, t *Tier) []error {
+func (c *Config) validateGuestOSRules(where string, t *Tier) []error {
 	var errs []error
+
+	// Relational checks are skipped when either side carries an invalid enum
+	// value: the value itself is already reported, and comparing a typo against
+	// an allowlist produces a second diagnostic describing the same mistake in
+	// terms that send the reader to the wrong field.
+	if !t.GuestOS.Valid() || !t.Provider.Valid() {
+		return errs
+	}
+
+	// A host may be restricted to a subset of guest operating systems, and a
+	// tier pinned to a host that does not permit its guest OS would queue
+	// forever with nothing saying why.
+	if t.Node != "" {
+		p, declared := c.NodePolicyFor(t.Node)
+
+		switch {
+		case !declared:
+		case !p.policyEnumsValid():
+			// Reported against the node itself.
+		case !p.AllowsGuestOS(t.GuestOS):
+			errs = append(errs, fmt.Errorf(
+				"%s: guest_os %s is not in node %q's guest_os allowlist %v",
+				where, t.GuestOS, t.Node, p.GuestOS))
+		case p.Provider != "" && t.Provider != "" && p.Provider != t.Provider:
+			// A tier pinned to a host running a different backend loads cleanly
+			// and can never be placed: the host cannot run it. Silent at load
+			// time, this is a job that queues forever.
+			errs = append(errs, fmt.Errorf(
+				"%s: provider %s is pinned to node %q, which runs %s",
+				where, t.Provider, t.Node, p.Provider))
+		}
+	} else {
+		// An UNPINNED tier may be placed on any host, so a restrictive allowlist
+		// constrains it even though it names no host. Checking only pinned tiers
+		// left the allowlist bypassable: a macOS-only Mac could still be handed a
+		// Linux guest, because nothing tied the tier to a host for the check to
+		// fire on.
+		//
+		// The predicate is "could this tier actually land here", not guest OS
+		// alone. A firecracker tier can never run on a Tart host, so a bare
+		// guest-OS comparison would make declaring one macOS-only Mac an error
+		// for every ordinary x64 Linux tier in the deployment. Only a host that
+		// declares the SAME provider can be a placement candidate, which is why
+		// this fires on provider match and stays silent otherwise.
+		//
+		// Silence is not safety: a node that declares no provider cannot be
+		// reasoned about here, and the allocator enforces the allowlist again at
+		// Bind, where the host is actually known.
+		//
+		// Only the first offending host is reported — one unpinned tier against
+		// five restrictive hosts is one mistake, not five.
+		for i := range c.Nodes {
+			p := &c.Nodes[i]
+			if !p.policyEnumsValid() {
+				continue
+			}
+
+			if p.Provider == t.Provider && len(p.GuestOS) > 0 && !p.AllowsGuestOS(t.GuestOS) {
+				errs = append(errs, fmt.Errorf(
+					"%s: guest_os %s is unpinned, but node %q runs the same provider and its "+
+						"guest_os allowlist %v excludes it; pin this tier to a host that permits "+
+						"it, or widen that allowlist",
+					where, t.GuestOS, p.Name, p.GuestOS))
+
+				break
+			}
+		}
+	}
+
 	switch t.GuestOS {
 	case GuestMacOS:
 		// Apple's licence permits macOS guests only on Apple-branded hardware,
@@ -445,14 +858,35 @@ func validateGuestOSRules(where string, t *Tier) []error {
 			errs = append(errs, fmt.Errorf(
 				"%s: guest_os macos requires the tart provider (Apple hardware)", where))
 		}
-		if t.MaxConcurrent <= 0 || t.MaxConcurrent > macOSVMLimit {
-			errs = append(errs, fmt.Errorf(
-				"%s: max_concurrent must be between 1 and %d; Apple's licence permits at most %d "+
-					"macOS guests per host", where, macOSVMLimit, macOSVMLimit))
-		}
 		if t.Node == "" {
 			errs = append(errs, fmt.Errorf(
 				"%s: guest_os macos requires an explicit node, so the per-host licence limit can be enforced", where))
+			break
+		}
+
+		// The bound is the HOST's limit, not the package default, so lowering a
+		// Mac's limit actually constrains the tiers pinned to it.
+		limit := c.MacOSLimitForNode(t.Node)
+		p, declared := c.NodePolicyFor(t.Node)
+
+		switch {
+		case limit < 0:
+			// The node policy is itself invalid and validateNodes already says
+			// so. Deriving a tier bound from a broken number would report the
+			// same mistake again, pointing at the wrong field and with
+			// arithmetic ("between 1 and -1") that reads as a billet bug.
+		case limit == 0 && (!declared || p.AllowsGuestOS(GuestMacOS)):
+			// A host explicitly set to zero macOS guests. The allowlist branch
+			// above already covers the case where macos is absent from guest_os,
+			// so reporting both would name one mistake twice.
+			errs = append(errs, fmt.Errorf(
+				"%s: node %q sets macos_vm_limit to 0, so it runs no macOS guests", where, t.Node))
+		case limit == 0:
+			// Reported by the allowlist check above.
+		case t.MaxConcurrent <= 0 || t.MaxConcurrent > limit:
+			errs = append(errs, fmt.Errorf(
+				"%s: max_concurrent must be between 1 and %d, %s",
+				where, limit, c.macOSLimitReason(t.Node)))
 		}
 	case GuestWindows:
 		if t.Provider == ProviderTart {
@@ -462,24 +896,103 @@ func validateGuestOSRules(where string, t *Tier) []error {
 	return errs
 }
 
+// macOSLimitReason explains where a host's macOS limit came from, so a
+// diagnostic says why the number is what it is. An operator who has not touched
+// the setting needs to know the constraint is Apple's licence rather than a
+// billet default they can simply raise; an operator who set it themselves needs
+// to be pointed at their own field, not at Apple.
+func (c *Config) macOSLimitReason(node string) string {
+	if p, declared := c.NodePolicyFor(node); declared && p.MacOSVMLimit != nil {
+		return fmt.Sprintf("the macos_vm_limit set for node %q", node)
+	}
+
+	return fmt.Sprintf(
+		"Apple's licence limit of %d macOS guests per Apple-branded host (node %q does not override it)",
+		DefaultMacOSVMLimit, node)
+}
+
+// validateNodes checks the fleet catalog on its own terms, before any tier
+// refers to it.
+func (c *Config) validateNodes() []error {
+	var errs []error
+	seen := make(map[string]struct{}, len(c.Nodes))
+
+	for i := range c.Nodes {
+		p := &c.Nodes[i]
+
+		where := fmt.Sprintf("nodes[%d]", i)
+		if p.Name != "" {
+			where = fmt.Sprintf("node %q", p.Name)
+		}
+
+		// Each entry on its own terms, through the shared rules the allocator
+		// also applies.
+		errs = append(errs, p.Validate(where)...)
+
+		if _, dup := seen[p.Name]; dup {
+			// Two entries for one host means one of them is silently ignored,
+			// and which one wins depends on ordering.
+			errs = append(errs, fmt.Errorf("%s: duplicate node name", where))
+		}
+		seen[p.Name] = struct{}{}
+
+		// The local node section and a fleet entry for the SAME host describe one
+		// machine. Letting them disagree means the unpinned-tier check compares
+		// against a provider the machine does not run and skips it — and in
+		// single-box mode that is the only host there is, so every tier looks
+		// placeable and none is.
+		if c.Node != nil && p.Name == c.Node.Name &&
+			p.Provider != "" && c.Node.Provider != "" && p.Provider != c.Node.Provider {
+			errs = append(errs, fmt.Errorf(
+				"%s: provider %s contradicts node.provider %s for the same host",
+				where, p.Provider, c.Node.Provider))
+		}
+	}
+	return errs
+}
+
 // validateMacOSHostLimits catches the case two individually-valid macOS tiers
-// pinned to the same Mac collectively exceed Apple's per-host limit. The
-// allocator still has to count at runtime; this only stops the obvious mistake
-// at load time.
+// pinned to the same Mac collectively exceed its per-host limit. The allocator
+// still has to count at runtime; this only stops the obvious mistake at load
+// time.
 func (c *Config) validateMacOSHostLimits() []error {
 	perNode := make(map[string]int)
 
+	// Node order follows the tier catalog rather than map iteration, so a config
+	// with two bad hosts reports them the same way every run.
+	var order []string
+
 	for i := range c.Tiers {
-		if t := &c.Tiers[i]; t.GuestOS == GuestMacOS && t.Node != "" {
-			perNode[t.Node] += t.MaxConcurrent
+		t := &c.Tiers[i]
+		if t.GuestOS != GuestMacOS || t.Node == "" {
+			continue
 		}
+
+		if _, seen := perNode[t.Node]; !seen {
+			order = append(order, t.Node)
+		}
+
+		perNode[t.Node] += t.MaxConcurrent
 	}
 	var errs []error
-	for node, total := range perNode {
-		if total > macOSVMLimit {
+	for _, node := range order {
+		p, declared := c.NodePolicyFor(node)
+		limit := p.MacOSLimit()
+
+		// Both of these are already reported — against the node policy itself,
+		// or against each offending tier. Repeating them as an aggregate
+		// describes one mistake twice, and does it with false arithmetic: a host
+		// whose allowlist excludes macOS has an effective limit of zero, so
+		// rendering it through macOSLimitReason claims "1 guest exceeds Apple's
+		// limit of 2", which is both wrong and points at the wrong field.
+		if limit < 0 || (declared && !p.AllowsGuestOS(GuestMacOS)) {
+			continue
+		}
+
+		if total := perNode[node]; total > limit {
 			errs = append(errs, fmt.Errorf(
-				"node %q: macOS tiers allow %d concurrent guests in total, but Apple's licence "+
-					"permits at most %d per host", node, total, macOSVMLimit))
+				"node %q: macOS tiers allow %d concurrent guests in total, exceeding %s",
+				node, total, c.macOSLimitReason(node)))
 		}
 	}
 	return errs
