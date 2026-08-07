@@ -204,6 +204,14 @@ func WithClock(now func() time.Time) Option {
 	return func(a *Allocator) { a.now = now }
 }
 
+// LeaseTTL reports how long a lease survives without a heartbeat.
+//
+// Exported because a holder has to renew FASTER than this, and a holder that
+// derives its cadence from DefaultLeaseTTL instead is correct only when the
+// default is in use — a configured shorter TTL then expires every lease it
+// holds, silently, while it waits for a beat that comes too late.
+func (a *Allocator) LeaseTTL() time.Duration { return a.leaseTTL }
+
 // WithLeaseTTL sets how long a lease survives without a heartbeat.
 func WithLeaseTTL(d time.Duration) Option {
 	return func(a *Allocator) { a.leaseTTL = d }

@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -123,6 +124,62 @@ func TestAdvertisedCapacityNeverExceedsTheBudget(t *testing.T) {
 	}
 }
 
+// Advertising zero is not the same as refusing work, and both are required.
+//
+// AdvertiseNothing stops billet asking for jobs. It does not stop GitHub
+// delivering one that was already queued, or redelivering one never acknowledged
+// — so a dry run that only sets the header would still acquire a job nothing can
+// launch, which is the exact outcome it exists to prevent.
+func TestAdvertisingNothingAlsoRefusesWork(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	var delivered atomic.Bool
+
+	session := &fakeSession{}
+	session.onGet = func() (*Message, error) {
+		if delivered.Swap(true) {
+			return nil, ErrNoMessage
+		}
+
+		// Queued before the dry run started, which GitHub can legitimately do.
+		return &Message{
+			MessageID: 1,
+			Available: []Job{{RequestID: 11, RunID: 101}},
+			Assigned:  []Job{{RequestID: 11, RunID: 101}},
+		}, nil
+	}
+
+	l := NewListener(a, tiers[0].Label, session, WithMaxCapacity(0))
+
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		cancel()
+	}()
+
+	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) &&
+		!errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if got := session.acquiredIDs(); len(got) != 0 {
+		t.Errorf("a run advertising zero capacity acquired %v", got)
+	}
+
+	usage, err := a.Usage(t.Context())
+	if err != nil {
+		t.Fatalf("Usage: %v", err)
+	}
+
+	if usage.Leases != 0 {
+		t.Errorf("%d leases escrowed while advertising nothing", usage.Leases)
+	}
+}
+
 // tier builds a catalog entry. Every tier here is 4 vCPU so the arithmetic in
 // the capacity assertions stays legible; the parameter exists so a test that
 // needs an uneven catalog does not have to rewrite this.
@@ -165,12 +222,22 @@ func TestAvailableIsAcquiredAndAssignedConsumesEscrow(t *testing.T) {
 		}, nil
 	}
 
+	l := NewListener(a, tiers[0].Label, session)
+
+	// Observed DURING the run. Shutdown releases running leases as well as held
+	// ones — correctly, since nothing can be executing them yet — so anything
+	// asserted after Run returns would see zero either way and prove nothing.
+	var running atomic.Int32
+
+	session.onPoll = func(int) {
+		running.Store(int32(l.Running()))
+	}
+
 	go func() {
 		time.Sleep(150 * time.Millisecond)
 		cancel()
 	}()
 
-	l := NewListener(a, tiers[0].Label, session)
 	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) &&
 		!errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Run: %v", err)
@@ -188,15 +255,107 @@ func TestAvailableIsAcquiredAndAssignedConsumesEscrow(t *testing.T) {
 		}
 	}
 
-	// Exactly one lease left escrow, for the one job that was ASSIGNED — not two
-	// for the two that were merely offered.
-	usage, err := a.Usage(t.Context())
-	if err != nil {
-		t.Fatalf("Usage: %v", err)
+	// Exactly one lease moved to running, for the one job that was ASSIGNED — not
+	// two for the two that were merely offered.
+	if got := running.Load(); got != 1 {
+		t.Errorf("%d leases running after one assignment, want 1", got)
+	}
+}
+
+// A redelivered Assigned message must not consume a second lease.
+//
+// DeleteMessage is the acknowledgement and an unacknowledged message comes back,
+// so this is an ordinary event rather than a fault. Assigning the same request
+// twice takes a second lease for one job — capacity nothing ever gives back,
+// because only one completion will arrive for it.
+func TestRedeliveredAssignmentDoesNotConsumeASecondLease(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	var deliveries atomic.Int32
+
+	session := &fakeSession{}
+	session.onGet = func() (*Message, error) {
+		// The SAME assignment twice, as a redelivery looks.
+		if deliveries.Add(1) <= 2 {
+			return &Message{
+				MessageID: 1,
+				Assigned:  []Job{{RequestID: 11, RunID: 101}},
+			}, nil
+		}
+
+		return nil, ErrNoMessage
 	}
 
-	if usage.Leases != 1 {
-		t.Errorf("%d leases open after one assignment, want 1 (the assigned job)", usage.Leases)
+	l := NewListener(a, tiers[0].Label, session)
+
+	var running atomic.Int32
+
+	session.onPoll = func(int) { running.Store(int32(l.Running())) }
+
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		cancel()
+	}()
+
+	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) &&
+		!errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if got := running.Load(); got != 1 {
+		t.Errorf("%d leases running after the same assignment twice, want 1", got)
+	}
+}
+
+// A completed job gives its capacity back.
+//
+// Without this the cycle never closes: the lease stays open until the reaper
+// expires it, holding capacity for a job that has finished.
+func TestCompletionReleasesTheLease(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	var stage atomic.Int32
+
+	session := &fakeSession{}
+	session.onGet = func() (*Message, error) {
+		switch stage.Add(1) {
+		case 1:
+			return &Message{MessageID: 1, Assigned: []Job{{RequestID: 11, RunID: 101}}}, nil
+		case 2:
+			return &Message{MessageID: 2, Completed: []Job{{RequestID: 11, RunID: 101}}}, nil
+		default:
+			return nil, ErrNoMessage
+		}
+	}
+
+	l := NewListener(a, tiers[0].Label, session)
+
+	var running atomic.Int32
+
+	session.onPoll = func(int) { running.Store(int32(l.Running())) }
+
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		cancel()
+	}()
+
+	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) &&
+		!errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if got := running.Load(); got != 0 {
+		t.Errorf("%d leases still running after the job completed, want 0", got)
 	}
 }
 
@@ -264,6 +423,114 @@ func newAllocator(t *testing.T, limits alloc.Limits, tiers []config.Tier) *alloc
 	}
 
 	return a
+}
+
+// A poll that lasts longer than the lease TTL must not cost the listener its
+// escrow.
+//
+// This is the failure that made heartbeats independent. A long poll is nominally
+// 50 seconds against a 90 second TTL, which reads like ample margin — but the
+// vendor's HTTP client permits a request to run for minutes once slow responses
+// and retries are counted, and heartbeats that happen only BETWEEN polls stop for
+// as long as one poll lasts. The reaper then terminalises the leases, another
+// tier escrows the capacity, and the poll returns an assignment backed by a lease
+// this listener no longer holds.
+func TestEscrowSurvivesAPollLongerThanTheLeaseTTL(t *testing.T) {
+	const ttl = 150 * time.Millisecond
+
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+
+	a, err := alloc.New(openState(t), alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
+		alloc.WithLeaseTTL(ttl))
+	if err != nil {
+		t.Fatalf("alloc.New: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+
+	// The reaper has to be running, or nothing punishes a missed heartbeat and
+	// this passes against an implementation with no heartbeats at all.
+	go func() {
+		tick := time.NewTicker(ttl / 5)
+		defer tick.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+				if _, err := a.Reap(ctx); err != nil && ctx.Err() == nil {
+					t.Errorf("Reap: %v", err)
+				}
+			}
+		}
+	}()
+
+	var (
+		polls    atomic.Int32
+		resultMu sync.Mutex
+		checked  []*alloc.Lease
+		failures []error
+	)
+
+	l := NewListener(a, "billet-4vcpu-a", nil)
+
+	l.session = &fakeSession{onPoll: func(int) {
+		switch polls.Add(1) {
+		case 1:
+			// The escrow happens before the poll, so what is held now is what has
+			// to survive the stall — FIVE TIMES the TTL inside a single
+			// GetMessage. Every one of these leases expires during this call
+			// unless something renews them on a clock of its own.
+			held := l.Held()
+
+			time.Sleep(5 * ttl)
+
+			// Checked HERE, not after Run returns: shutdown releases the escrow,
+			// so by then every lease is legitimately terminal and the assertion
+			// would fire against correct behaviour. This is the only moment that
+			// distinguishes "renewed through the long poll" from "reaped during
+			// it" — one poll later, and refillEscrow has already replaced them.
+			//
+			// Identity, not count: a listener that loses its escrow re-escrows and
+			// ends up holding the same NUMBER of leases. Renewability of these
+			// specific leases is the property, and it is exactly what the listener
+			// needs to be true — a reaped lease is terminal, so heartbeating one
+			// reports ErrFenced or ErrLeaseNotFound.
+			var errs []error
+
+			for _, lease := range held {
+				if err := a.Heartbeat(ctx, lease.ID, lease.Epoch); err != nil {
+					errs = append(errs, fmt.Errorf("lease %s: %w", lease.ID, err))
+				}
+			}
+
+			resultMu.Lock()
+			checked, failures = held, errs
+			resultMu.Unlock()
+		case 3:
+			cancel()
+		}
+	}}
+
+	// Cancellation is how this listener is stopped, and Run reports the context
+	// error rather than nil — Server.Run is what turns that into a clean exit.
+	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run: %v", err)
+	}
+
+	resultMu.Lock()
+	defer resultMu.Unlock()
+
+	if len(checked) == 0 {
+		t.Fatal("the listener escrowed nothing before the long poll; the test proves nothing")
+	}
+
+	for _, err := range failures {
+		t.Errorf("could not renew an escrowed lease after a poll longer than the TTL (%v); "+
+			"it was reaped mid-poll, so heartbeats are still bounded by the poll cadence", err)
+	}
 }
 
 // fakeSession stands in for a scale-set message session. It never returns work,

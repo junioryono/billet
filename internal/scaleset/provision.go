@@ -82,6 +82,15 @@ func (c *Client) EnsureScaleSet(ctx context.Context, name, group string, labels 
 		// Lost the race, most likely. Ask again before reporting a failure: an
 		// operator who created it in the UI a moment ago is not an error.
 		if again, getErr := c.gh.GetRunnerScaleSet(ctx, rg.ID, name); getErr == nil && again != nil {
+			// The SAME label check as the ordinary adoption path. Losing a create
+			// race and inheriting whatever the winner configured is the exact
+			// routing bug that check exists to prevent, reached by a different
+			// door — and this door is the more likely one, because the thing
+			// billet raced with is usually a human in the UI.
+			if err := checkLabels(name, again, labels); err != nil {
+				return nil, err
+			}
+
 			c.log.Info("scale set already existed; adopting it", "name", name, "group", group)
 
 			return &ScaleSet{ID: again.ID, Name: again.Name, Group: group}, nil
@@ -232,14 +241,28 @@ func (j JITRunner) LogValue() slog.Value {
 // and errors.As still classify it.
 func redactBody(err error) error { return &redactedError{err: err} }
 
-// redactedError keeps an error classifiable while refusing to render it.
+// redactedError refuses to render an error, and refuses to hand it over.
 type redactedError struct{ err error }
 
 func (e *redactedError) Error() string {
 	return "[redacted: this endpoint's response body carries the JIT credential]"
 }
 
-func (e *redactedError) Unwrap() error { return e.err }
+// Unwrap deliberately returns NOTHING.
+//
+// This is the same bug as the App manifest conversion, remade three weeks after
+// it was fixed there: sanitising Error() while Unwrap hands back the original
+// leaves the credential one errors.As away. Any reporter that walks causes and
+// serialises them — which is what a structured logger does — renders the vendor
+// error and its response body.
+//
+// There the fix was to rebuild the chain, because the code was a known string
+// that could be found and removed. Here it cannot be: the JIT config is base64
+// with no marker, so there is nothing to scrub and the only safe chain is no
+// chain. What is lost is errors.Is/errors.As against the vendor's error, and
+// nothing in billet classifies on it — the status is already in the message, and
+// this endpoint's failures are all handled the same way.
+func (e *redactedError) Unwrap() error { return nil }
 
 // JITConfig generates a single-use runner registration for one job.
 //

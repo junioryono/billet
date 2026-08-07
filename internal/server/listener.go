@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
+	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
 )
@@ -93,10 +95,25 @@ type Listener struct {
 	session Session
 	log     *slog.Logger
 
-	// held is the capacity this listener has escrowed and is therefore entitled
-	// to advertise. It is the whole of the safety property: the number sent to
-	// GitHub is len(held), never a number computed from headroom.
+	// mu guards the escrow below.
+	//
+	// Needed only since heartbeats moved onto their own clock: renewal and the
+	// poll loop now touch held and running concurrently, where before every
+	// change happened on one goroutine. That is the cost of not tying lease
+	// renewal to a poll whose duration billet does not control.
+	mu sync.Mutex
+	// held is escrowed capacity not yet given to a job.
 	held []*alloc.Lease
+	// running is escrowed capacity that HAS been given to a job, keyed by the
+	// request id GitHub identifies it by.
+	//
+	// Both halves are escrowed, and both are advertised — see capacity(). The
+	// safety property is that the number sent to GitHub is only ever capacity
+	// this listener took from the allocator, never a number computed from
+	// headroom. Keyed by request id so a redelivered message is recognised: an
+	// unacknowledged message comes back, and assigning it twice would consume a
+	// second lease for one job.
+	running map[int64]*alloc.Lease
 
 	lastMessageID int64
 
@@ -117,6 +134,7 @@ func NewListener(a *alloc.Allocator, tier string, session Session, opts ...Optio
 		tier:    tier,
 		session: session,
 		log:     slog.Default(),
+		running: make(map[int64]*alloc.Lease),
 	}
 
 	for _, opt := range opts {
@@ -163,6 +181,22 @@ func WithMaxCapacity(ceiling int) Option {
 // The vendor's own listener package computes a desired runner count itself,
 // which is why billet does not use it.
 func (l *Listener) Run(ctx context.Context) error {
+	// Heartbeats run on their OWN clock, not between polls.
+	//
+	// A long poll is nominally 50 seconds against a 90 second lease TTL, which
+	// looks like enough margin and is not: the vendor's HTTP client allows a
+	// request to take minutes once slow responses and retries are counted. A poll
+	// that outlives the TTL leaves its leases unrenewed, the reaper terminalises
+	// them, another tier escrows the capacity — and the poll then returns an
+	// assignment backed by a lease that is no longer this listener's.
+	//
+	// Tying renewal to the poll cadence made the safety of the whole escrow
+	// depend on a timeout billet does not control.
+	beat, stopBeating := context.WithCancel(ctx)
+	defer stopBeating()
+
+	go l.heartbeatLoop(beat)
+
 	// CLOSE THEN RELEASE, in that order, and the listener owns both so the order
 	// cannot be split across two functions again.
 	//
@@ -199,15 +233,11 @@ func (l *Listener) Run(ctx context.Context) error {
 			return err
 		}
 
-		// Heartbeat BEFORE topping up, so the count advertised below reflects what
-		// this listener still actually owns.
-		l.heartbeatHeld(ctx)
-
 		if err := l.refillEscrow(ctx); err != nil {
 			return stopping(ctx, err)
 		}
 
-		msg, err := l.session.GetMessage(ctx, l.lastMessageID, len(l.held))
+		msg, err := l.session.GetMessage(ctx, l.lastMessageID, l.capacity())
 
 		// A timed-out long poll is the ordinary case. Poll again immediately —
 		// the escrow is KEPT, because releasing and retaking it every 50 seconds
@@ -225,6 +255,45 @@ func (l *Listener) Run(ctx context.Context) error {
 			return stopping(ctx, err)
 		}
 	}
+}
+
+// capacity is what this listener advertises: TOTAL escrowed, not free.
+//
+// maxCapacity is the scale set's total capacity, not its spare — the vendor's own
+// listener sends a configured maximum that does not move as jobs are assigned.
+// Sending only the free half shrank the advertisement every time a job started,
+// so a tier with room for two runners told GitHub "1" the moment the first job
+// landed and the second slot went unused.
+//
+// The invariant still holds, and this is why the two halves are counted
+// together: every lease in either was taken from the allocator, so the sum
+// across listeners is still bounded by the budget.
+func (l *Listener) capacity() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	return len(l.held) + len(l.running)
+}
+
+// Held returns the leases this listener has escrowed and not yet handed to a job.
+//
+// Exported for tests, which cannot read the guarded field safely, and which need
+// lease IDENTITY rather than a count: an escrow that was lost and rebuilt has the
+// same size and different ids.
+func (l *Listener) Held() []*alloc.Lease {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	return append([]*alloc.Lease(nil), l.held...)
+}
+
+// Running reports how many jobs this listener currently has leases for. Exported
+// for tests, which cannot read the guarded field safely.
+func (l *Listener) Running() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	return len(l.running)
 }
 
 // Backlog is what GitHub last said was assigned to this scale set and not yet
@@ -259,6 +328,42 @@ func stopping(ctx context.Context, err error) error {
 	return err
 }
 
+// heartbeatLoop renews this listener's leases until the context ends.
+//
+// The interval is a fraction of the TTL so a single missed beat — a busy
+// database, a slow write — does not expire anything.
+func (l *Listener) heartbeatLoop(ctx context.Context) {
+	ticker := time.NewTicker(l.heartbeatInterval())
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			l.mu.Lock()
+			l.heartbeatHeld(ctx)
+			l.mu.Unlock()
+		}
+	}
+}
+
+// heartbeatInterval is how often held capacity is renewed: a third of the
+// allocator's ACTUAL TTL, so two consecutive failures are survivable.
+//
+// Read from the allocator rather than from DefaultLeaseTTL. Deriving it from the
+// default made the cadence right only for a default-configured allocator: with a
+// shorter TTL every lease expired between beats, the reaper collected it, the
+// listener re-escrowed, and advertised capacity climbed to six times the budget.
+// A test caught it; nothing in the type system would have.
+func (l *Listener) heartbeatInterval() time.Duration {
+	if ttl := l.alloc.LeaseTTL(); ttl > 0 {
+		return ttl / 3
+	}
+
+	return alloc.DefaultLeaseTTL / 3
+}
+
 // heartbeatHeld renews the leases this listener is advertising, and drops any it
 // has lost.
 //
@@ -275,32 +380,59 @@ func stopping(ctx context.Context, err error) error {
 // by a new holder — and continuing to advertise it would be advertising capacity
 // somebody else now has.
 func (l *Listener) heartbeatHeld(ctx context.Context) {
-	if len(l.held) == 0 {
-		return
-	}
-
 	kept := l.held[:0]
 
 	for _, lease := range l.held {
-		if err := l.alloc.Heartbeat(ctx, lease.ID, lease.Epoch); err != nil {
-			if ctx.Err() != nil {
-				// Shutting down. Keep it: the release path is about to hand it
-				// back, and dropping it here would leak it instead.
-				kept = append(kept, lease)
-
-				continue
-			}
-
-			l.log.Warn("lost an escrowed lease; no longer advertising it",
-				"tier", l.tier, "lease", lease.ID, "error", err)
-
-			continue
+		if l.renew(ctx, lease) {
+			kept = append(kept, lease)
 		}
-
-		kept = append(kept, lease)
 	}
 
 	l.held = kept
+
+	// RUNNING leases are renewed too. They are open in the ledger exactly like
+	// held ones, so a lease whose job is in flight expires just as readily — and
+	// its capacity would then be escrowed by another tier while GitHub still
+	// believes this scale set is running the job.
+	for id, lease := range l.running {
+		if !l.renew(ctx, lease) {
+			delete(l.running, id)
+		}
+	}
+}
+
+// renew heartbeats one lease and reports whether it is still this listener's.
+func (l *Listener) renew(ctx context.Context, lease *alloc.Lease) bool {
+	err := l.alloc.Heartbeat(ctx, lease.ID, lease.Epoch)
+	if err == nil {
+		return true
+	}
+
+	if ctx.Err() != nil {
+		// Shutting down. Keep it: the release path is about to hand it back, and
+		// dropping it here would leak it instead.
+		return true
+	}
+
+	// FENCED means the allocator has given this lease to someone else, so it is
+	// genuinely no longer ours and continuing to advertise it would be
+	// advertising capacity somebody else now holds.
+	//
+	// Anything else is an operational failure — a busy database, a cancelled
+	// statement — and the lease is probably still fine. It is kept, because
+	// dropping it removes it from the release path too: the ledger keeps counting
+	// it and only the reaper ever gets it back.
+	if !errors.Is(err, alloc.ErrFenced) && !errors.Is(err, alloc.ErrLeaseNotFound) {
+		l.log.Warn("could not renew an escrowed lease; keeping it",
+			"tier", l.tier, "lease", lease.ID, "error", err)
+
+		return true
+	}
+
+	l.log.Warn("lost an escrowed lease; no longer advertising it",
+		"tier", l.tier, "lease", lease.ID, "error", err)
+
+	return false
 }
 
 // refillEscrow tops the escrow up to what this tier could use.
@@ -314,12 +446,15 @@ func (l *Listener) refillEscrow(ctx context.Context) error {
 		return fmt.Errorf("server: headroom for %s: %w", l.tier, err)
 	}
 
+	// Headroom already excludes what this listener holds — those leases are open
+	// in the ledger — so this tops the total up rather than doubling it.
+
 	if l.maxCapacity != nil {
 		// Capped BEFORE the escrow, not after. Escrowing capacity this listener
 		// has promised not to advertise would hold it away from every other tier
 		// for nothing.
-		if room > *l.maxCapacity {
-			room = *l.maxCapacity
+		if ceiling := *l.maxCapacity - l.capacity(); room > ceiling {
+			room = ceiling
 		}
 	}
 
@@ -332,7 +467,9 @@ func (l *Listener) refillEscrow(ctx context.Context) error {
 		return fmt.Errorf("server: escrow for %s: %w", l.tier, err)
 	}
 
+	l.mu.Lock()
 	l.held = append(l.held, leases...)
+	l.mu.Unlock()
 
 	return nil
 }
@@ -343,6 +480,23 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 	// skips. Everything derived from a message must be idempotent for the same
 	// reason: an unacknowledged message comes back.
 	l.lastMessageID = msg.MessageID
+
+	// A zero advertisement is not the same as refusing work, and this is where
+	// the difference is enforced.
+	//
+	// AdvertiseNothing stops billet asking for jobs; it does not stop GitHub
+	// delivering a message that was already queued, or redelivering one that was
+	// never acknowledged. Acquiring from that would claim a job nothing can run —
+	// the precise outcome the dry run exists to avoid — so the refusal is local
+	// as well as advertised.
+	if l.maxCapacity != nil && *l.maxCapacity == 0 {
+		if len(msg.Available) > 0 || len(msg.Assigned) > 0 {
+			l.log.Warn("declining work while advertising no capacity",
+				"tier", l.tier, "available", len(msg.Available), "assigned", len(msg.Assigned))
+		}
+
+		return l.acknowledge(ctx, msg)
+	}
 
 	// AVAILABLE is what gets acquired. Available is the offer; Assigned is the
 	// confirmation that an offer was claimed. Acquiring from Assigned asks GitHub
@@ -361,10 +515,27 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 		}
 	}
 
+	// COMPLETED is what gives it back. Without this the cycle never closes: the
+	// lease stays open until the reaper expires it, holding capacity for a job
+	// that finished and recording the wrong conclusion against it. It also covers
+	// assigned-then-cancelled, which GitHub can do up to three times for a job
+	// that is not acquired in time.
+	for _, job := range msg.Completed {
+		if err := l.complete(ctx, job); err != nil {
+			return err
+		}
+	}
+
 	if msg.Statistics != nil {
 		l.observed = msg.Statistics
 	}
 
+	return l.acknowledge(ctx, msg)
+}
+
+// acknowledge tells GitHub the message was handled. An unacknowledged message is
+// redelivered, which is why everything above it has to be idempotent.
+func (l *Listener) acknowledge(ctx context.Context, msg *Message) error {
 	if err := l.session.DeleteMessage(ctx, msg.MessageID); err != nil {
 		return fmt.Errorf("server: acknowledge message %d: %w", msg.MessageID, err)
 	}
@@ -384,6 +555,25 @@ func requestIDs(jobs []Job) []int64 {
 
 // assign moves one escrowed lease to the job GitHub gave it.
 func (l *Listener) assign(ctx context.Context, job Job) error {
+	// Held for the whole function, INCLUDING the allocator write.
+	//
+	// Releasing it around the write to keep heartbeats snappy looks obviously
+	// right and is not: it opens a window where the write succeeds but a
+	// concurrent heartbeat has already dropped the lease, so the assignment is
+	// durable in the ledger and tracked nowhere in memory — capacity leaked until
+	// the reaper expires it. The window is worth nothing anyway. handle() runs
+	// only on the poll goroutine, so heartbeat is the sole concurrent writer, and
+	// what it waits for is one local SQLite transaction against a 30-second beat.
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	// Already ours. An unacknowledged message is redelivered, so this is an
+	// ordinary event rather than a fault — and consuming a second lease for one
+	// job would leak capacity that nothing ever gives back.
+	if _, ok := l.running[job.RequestID]; ok {
+		return nil
+	}
+
 	if len(l.held) == 0 {
 		// GitHub assigned more than was advertised. That is a protocol violation
 		// rather than a race billet can absorb: admitting it would put work on a
@@ -399,11 +589,40 @@ func (l *Listener) assign(ctx context.Context, job Job) error {
 		return fmt.Errorf("server: assign lease %s: %w", lease.ID, err)
 	}
 
-	// Dropped from held only AFTER the assignment is durable. Shortening the
-	// slice first meant a failed Assign left the lease open in the database and
-	// absent from the release list — capacity that nothing hands back and nothing
-	// reports, until the reaper's TTL expires it.
+	// Moved from held to running only AFTER the assignment is durable. Shortening
+	// the slice first meant a failed Assign left the lease open in the database
+	// and absent from the release list — capacity that nothing hands back and
+	// nothing reports, until the reaper's TTL expires it.
 	l.held = l.held[1:]
+	l.running[job.RequestID] = lease
+
+	return nil
+}
+
+// complete releases the lease a finished job was running on.
+//
+// Idempotent, because a redelivered Completed message must not fail: a job billet
+// has already released is simply not in the map. Release with PhaseDone rather
+// than inspecting a conclusion — the lease's job is finished either way, and the
+// outcome belongs to job history rather than to the capacity ledger.
+func (l *Listener) complete(ctx context.Context, job Job) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	lease, ok := l.running[job.RequestID]
+	if !ok {
+		// Not ours, or already released. Both are ordinary: GitHub can report a
+		// job completed that this listener never assigned, if a restart lost the
+		// in-memory map while the lease lives on in the ledger for the reaper.
+		return nil
+	}
+
+	if err := l.alloc.Release(ctx, lease.ID, lease.Epoch, alloc.PhaseDone); err != nil {
+		return fmt.Errorf("server: release lease %s for finished request %d: %w",
+			lease.ID, job.RequestID, err)
+	}
+
+	delete(l.running, job.RequestID)
 
 	return nil
 }
@@ -414,12 +633,28 @@ func (l *Listener) assign(ctx context.Context, job Job) error {
 // getting here is that the context was cancelled — and escrowed capacity that is
 // never released is capacity no tier can use until the reaper expires it.
 func (l *Listener) releaseAll(ctx context.Context) {
-	for _, lease := range l.held {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	release := func(lease *alloc.Lease) {
 		if err := l.alloc.Release(ctx, lease.ID, lease.Epoch, alloc.PhaseDone); err != nil {
 			l.log.Warn("could not release escrowed capacity",
 				"tier", l.tier, "lease", lease.ID, "error", err)
 		}
 	}
 
+	for _, lease := range l.held {
+		release(lease)
+	}
+
+	// RUNNING leases are released too, and that is right only while nothing can
+	// actually run a job. Once the node runtime exists these must be handed to
+	// it rather than released — a job in flight whose lease is freed lets another
+	// tier escrow capacity the host is still using.
+	for _, lease := range l.running {
+		release(lease)
+	}
+
 	l.held = nil
+	l.running = make(map[int64]*alloc.Lease)
 }
