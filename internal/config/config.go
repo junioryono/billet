@@ -440,9 +440,21 @@ var labelRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$`)
 // outright, which is a clean failure but a much later and stranger one.
 const runnerGroupUnsafe = "&#;%+"
 
-// maxRunnerGroupLen bounds the name so a mistyped config cannot build a URL the
-// Actions service rejects wholesale.
-const maxRunnerGroupLen = 100
+// maxRunnerGroupLen is BILLET's sanity bound, not GitHub's rule.
+//
+// The 100 it replaces was carried over from the regex this check replaced, where
+// it was equally invented — and stating an invented number as though it were
+// GitHub's is the same mistake as the allowlist: a rule about someone else's API
+// that is not pinned to that API's behaviour. GitHub does not document a runner
+// group name length, so billet does not claim to know one.
+//
+// What is genuinely billet's concern is that a runaway config value cannot build
+// a URL the Actions service rejects wholesale, and 512 bytes is far above any
+// plausible group name while still catching a field that was pasted into by
+// accident. It counts BYTES because the thing being bounded is a URL, and it is
+// generous enough that the bytes-versus-runes distinction cannot reject a real
+// name: 512 bytes is 170 characters even in the worst case for CJK text.
+const maxRunnerGroupLen = 512
 
 // checkRunnerGroup reports why a runner group name cannot be looked up, or nil.
 //
@@ -458,7 +470,8 @@ func checkRunnerGroup(group string) error {
 	}
 
 	if len(group) > maxRunnerGroupLen {
-		return fmt.Errorf("runner_group is %d bytes, over the %d byte limit",
+		return fmt.Errorf("runner_group is %d bytes, over billet's %d byte sanity limit; this is "+
+			"not GitHub's rule, it is a guard against a config value that ran away",
 			len(group), maxRunnerGroupLen)
 	}
 
