@@ -30,6 +30,9 @@ type Session interface {
 	// AcquireJobs claims assigned jobs and returns the ids actually acquired,
 	// which may be fewer than asked for.
 	AcquireJobs(ctx context.Context, requestIDs []int64) ([]int64, error)
+	// Statistics reports what GitHub said when the session opened, or nil if it
+	// said nothing. It is the only view of a backlog that predates the session.
+	Statistics() *Statistics
 	Close(ctx context.Context) error
 }
 
@@ -46,8 +49,13 @@ var ErrNoMessage = errors.New("server: no message")
 type Message struct {
 	MessageID  int64
 	Statistics *Statistics
-	Assigned   []Job
-	Completed  []Job
+	// Available is work GitHub is OFFERING. Acquiring one of these is how a
+	// scale set claims it.
+	Available []Job
+	// Assigned is work this scale set has been given, which is the confirmation
+	// that an acquisition succeeded.
+	Assigned  []Job
+	Completed []Job
 }
 
 // Job identifies one workflow job.
@@ -91,6 +99,11 @@ type Listener struct {
 	held []*alloc.Lease
 
 	lastMessageID int64
+
+	// observed is the last statistics GitHub reported. TotalAssignedJobs is the
+	// documented scaling signal — counting messages is not, because a response
+	// carries at most 50 and a large backlog is truncated.
+	observed *Statistics
 }
 
 // NewListener builds a listener for one tier.
@@ -135,6 +148,11 @@ func WithLogger(log *slog.Logger) Option {
 func (l *Listener) Run(ctx context.Context) error {
 	defer l.releaseAll(context.WithoutCancel(ctx))
 
+	// Seeded from the session before the first poll. A restart does not replay
+	// messages for work already assigned, so a listener that waits to be told
+	// about a backlog sits idle in front of one.
+	l.observed = l.session.Statistics()
+
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -162,6 +180,20 @@ func (l *Listener) Run(ctx context.Context) error {
 			return stopping(ctx, err)
 		}
 	}
+}
+
+// Backlog is what GitHub last said was assigned to this scale set and not yet
+// finished.
+//
+// TotalAssignedJobs is the documented scaling signal, and counting messages is
+// explicitly not: a response carries at most 50 job entries and a large backlog
+// is truncated, so the count is wrong exactly when it matters most.
+func (l *Listener) Backlog() int {
+	if l.observed == nil {
+		return 0
+	}
+
+	return l.observed.TotalAssignedJobs
 }
 
 // stopping reports a shutdown as a shutdown.
@@ -214,10 +246,25 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 	// reason: an unacknowledged message comes back.
 	l.lastMessageID = msg.MessageID
 
-	if len(msg.Assigned) > 0 {
-		if err := l.acquire(ctx, msg.Assigned); err != nil {
+	// AVAILABLE is what gets acquired. Available is the offer; Assigned is the
+	// confirmation that an offer was claimed. Acquiring from Assigned asks GitHub
+	// to claim work it has already handed over, and drops every offer.
+	if len(msg.Available) > 0 {
+		if _, err := l.session.AcquireJobs(ctx, requestIDs(msg.Available)); err != nil {
+			return fmt.Errorf("server: acquire jobs for %s: %w", l.tier, err)
+		}
+	}
+
+	// ASSIGNED is what consumes escrow. The lease is bound here because this is
+	// the point at which the work is definitely billet's to run.
+	for _, job := range msg.Assigned {
+		if err := l.assign(ctx, job); err != nil {
 			return err
 		}
+	}
+
+	if msg.Statistics != nil {
+		l.observed = msg.Statistics
 	}
 
 	if err := l.session.DeleteMessage(ctx, msg.MessageID); err != nil {
@@ -227,39 +274,14 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 	return nil
 }
 
-// acquire claims assigned jobs and binds them to escrowed leases.
-func (l *Listener) acquire(ctx context.Context, jobs []Job) error {
+// requestIDs pulls the ids AcquireJobs claims work by.
+func requestIDs(jobs []Job) []int64 {
 	ids := make([]int64, 0, len(jobs))
 	for _, j := range jobs {
 		ids = append(ids, j.RequestID)
 	}
 
-	acquired, err := l.session.AcquireJobs(ctx, ids)
-	if err != nil {
-		return fmt.Errorf("server: acquire jobs for %s: %w", l.tier, err)
-	}
-
-	// FEWER than asked for is ordinary, not a failure. A job can be assigned and
-	// then withdrawn — GitHub reassigns it elsewhere when it is not acquired in
-	// time, and the same job may appear assigned and then completed-as-cancelled
-	// up to three times.
-	wanted := make(map[int64]Job, len(jobs))
-	for _, j := range jobs {
-		wanted[j.RequestID] = j
-	}
-
-	for _, id := range acquired {
-		job, ok := wanted[id]
-		if !ok {
-			continue
-		}
-
-		if err := l.assign(ctx, job); err != nil {
-			return err
-		}
-	}
-
-	return nil
+	return ids
 }
 
 // assign moves one escrowed lease to the job GitHub gave it.
@@ -274,11 +296,16 @@ func (l *Listener) assign(ctx context.Context, job Job) error {
 	}
 
 	lease := l.held[0]
-	l.held = l.held[1:]
 
 	if err := l.alloc.Assign(ctx, lease.ID, lease.Epoch, job.RunID, job.RequestID); err != nil {
 		return fmt.Errorf("server: assign lease %s: %w", lease.ID, err)
 	}
+
+	// Dropped from held only AFTER the assignment is durable. Shortening the
+	// slice first meant a failed Assign left the lease open in the database and
+	// absent from the release list — capacity that nothing hands back and nothing
+	// reports, until the reaper's TTL expires it.
+	l.held = l.held[1:]
 
 	return nil
 }

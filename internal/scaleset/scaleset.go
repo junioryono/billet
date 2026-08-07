@@ -74,6 +74,11 @@ func New(cfg Config, log *slog.Logger) (*Client, error) {
 	return &Client{gh: c, log: log}, nil
 }
 
+// session adapts *gh.MessageSessionClient to server.Session.
+type session struct {
+	gh *gh.MessageSessionClient
+}
+
 // Session opens a message session for one scale set and adapts it to the
 // interface internal/server consumes.
 func (c *Client) Session(ctx context.Context, scaleSetID int, owner string) (server.Session, error) {
@@ -85,9 +90,28 @@ func (c *Client) Session(ctx context.Context, scaleSetID int, owner string) (ser
 	return &session{gh: s}, nil
 }
 
-// session adapts *gh.MessageSessionClient to server.Session.
-type session struct {
-	gh *gh.MessageSessionClient
+// Statistics reports what GitHub said about the scale set when the session
+// opened.
+//
+// This is the ONLY view of a backlog that predates the session. A restart does
+// not replay individual messages for work already assigned, so a listener that
+// waits for messages to tell it what is outstanding will sit idle in front of a
+// queue.
+func (s *session) Statistics() *server.Statistics {
+	stats := s.gh.Session().Statistics
+	if stats == nil {
+		return nil
+	}
+
+	return &server.Statistics{
+		TotalAvailableJobs:     stats.TotalAvailableJobs,
+		TotalAcquiredJobs:      stats.TotalAcquiredJobs,
+		TotalAssignedJobs:      stats.TotalAssignedJobs,
+		TotalRunningJobs:       stats.TotalRunningJobs,
+		TotalRegisteredRunners: stats.TotalRegisteredRunners,
+		TotalBusyRunners:       stats.TotalBusyRunners,
+		TotalIdleRunners:       stats.TotalIdleRunners,
+	}
 }
 
 // GetMessage long-polls, advertising maxCapacity.
@@ -139,10 +163,14 @@ func (s *session) Close(ctx context.Context) error {
 
 // translate converts one vendor message into billet's own.
 //
-// JobAvailable and JobStarted are deliberately dropped. Available is pre-
-// assignment noise — billet advertises capacity and GitHub decides — and Started
-// duplicates a transition the allocator already owns. Carrying them would invite
-// a scheduler that reacts to messages instead of to statistics.
+// JobStarted is dropped: it duplicates a transition the allocator already owns.
+//
+// JobAvailable is NOT dropped, and an earlier version of this comment confidently
+// explained why it should be. That was a misreading of the protocol. Available is
+// the offer — it is the message whose RunnerRequestID goes to AcquireJobs, which
+// is how a scale set claims work. Assigned is the later confirmation that a claim
+// succeeded. Acquiring from Assigned asks GitHub to claim work it has already
+// handed over, and drops every offer on the floor.
 func translate(msg *gh.RunnerScaleSetMessage) *server.Message {
 	out := &server.Message{MessageID: int64(msg.MessageID)}
 
@@ -156,6 +184,17 @@ func translate(msg *gh.RunnerScaleSetMessage) *server.Message {
 			TotalBusyRunners:       msg.Statistics.TotalBusyRunners,
 			TotalIdleRunners:       msg.Statistics.TotalIdleRunners,
 		}
+	}
+
+	for _, j := range msg.JobAvailableMessages {
+		if j == nil {
+			continue
+		}
+
+		out.Available = append(out.Available, server.Job{
+			RequestID: j.RunnerRequestID,
+			RunID:     j.WorkflowRunID,
+		})
 	}
 
 	for _, j := range msg.JobAssignedMessages {

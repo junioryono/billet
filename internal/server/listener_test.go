@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -12,6 +13,10 @@ import (
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/state"
 )
+
+// tierVCPU is the size of every tier in these tests. One number, so the capacity
+// arithmetic in the assertions can be read without cross-referencing.
+const tierVCPU = 4
 
 // THE invariant of the listener plane, and the reason the allocator exists.
 //
@@ -33,14 +38,14 @@ import (
 // is about billet's arithmetic, not about the wire protocol.
 func TestAdvertisedCapacityNeverExceedsTheBudget(t *testing.T) {
 	const (
-		budget  = 12 // vCPU
-		perTier = 4  // so at most 3 runners exist across all tiers at once
+		budget  = 12       // vCPU
+		perTier = tierVCPU // so at most 3 runners exist across all tiers at once
 	)
 
 	tiers := []config.Tier{
-		tier("billet-4vcpu-a", perTier),
-		tier("billet-4vcpu-b", perTier),
-		tier("billet-4vcpu-c", perTier),
+		tier("billet-4vcpu-a"),
+		tier("billet-4vcpu-b"),
+		tier("billet-4vcpu-c"),
 	}
 
 	a := newAllocator(t, alloc.Limits{MaxVCPU: budget, MaxMemory: 64 * config.GiB}, tiers)
@@ -122,8 +127,108 @@ func TestAdvertisedCapacityNeverExceedsTheBudget(t *testing.T) {
 // the capacity assertions stays legible; the parameter exists so a test that
 // needs an uneven catalog does not have to rewrite this.
 //
-//nolint:unparam // See above: kept for the tests that will need it, not dead.
-func tier(label string, vcpu int) config.Tier {
+// AVAILABLE is what gets acquired; ASSIGNED is what consumes escrow.
+//
+// This was wrong, and the comment explaining why it was right was wrong too:
+// JobAvailable was dropped in translation as "pre-assignment noise" and
+// AcquireJobs was called with the ids from JobAssigned. Available is the OFFER —
+// it is the message whose RunnerRequestID claims work. Assigned is the later
+// confirmation that a claim succeeded. Acquiring from Assigned asks GitHub to
+// claim work it has already handed over, while every actual offer goes on the
+// floor, so the scale set advertises capacity and never takes a job.
+//
+// It compiled, the tests passed, and it would have failed on first contact with
+// a real organization in a way that looks like "GitHub never sends us work".
+func TestAvailableIsAcquiredAndAssignedConsumesEscrow(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	var delivered atomic.Bool
+
+	session := &fakeSession{}
+	session.onGet = func() (*Message, error) {
+		if delivered.Swap(true) {
+			// One batch, then idle until the test cancels.
+			return nil, ErrNoMessage
+		}
+
+		return &Message{
+			MessageID: 1,
+			// Different id spaces on purpose: an implementation that acquires the
+			// wrong class acquires the wrong NUMBER, which is what this asserts on.
+			Available: []Job{{RequestID: 11, RunID: 101}, {RequestID: 12, RunID: 102}},
+			Assigned:  []Job{{RequestID: 11, RunID: 101}},
+		}, nil
+	}
+
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		cancel()
+	}()
+
+	l := NewListener(a, tiers[0].Label, session)
+	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) &&
+		!errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Run: %v", err)
+	}
+
+	got := session.acquiredIDs()
+
+	if len(got) != 2 {
+		t.Fatalf("acquired %v, want both AVAILABLE ids (11, 12)", got)
+	}
+
+	for _, want := range []int64{11, 12} {
+		if !slices.Contains(got, want) {
+			t.Errorf("available id %d was never acquired; acquired %v", want, got)
+		}
+	}
+
+	// Exactly one lease left escrow, for the one job that was ASSIGNED — not two
+	// for the two that were merely offered.
+	usage, err := a.Usage(t.Context())
+	if err != nil {
+		t.Fatalf("Usage: %v", err)
+	}
+
+	if usage.Leases != 1 {
+		t.Errorf("%d leases open after one assignment, want 1 (the assigned job)", usage.Leases)
+	}
+}
+
+// A backlog that predates the session is only visible in the session's own
+// statistics: a restart does not replay messages for work already assigned.
+func TestSessionStatisticsAreObserved(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	session := &fakeSession{
+		stats:  &Statistics{TotalAssignedJobs: 7},
+		onPoll: func(int) { cancel() },
+	}
+
+	l := NewListener(a, tiers[0].Label, session)
+	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) &&
+		!errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if l.Backlog() != 7 {
+		t.Errorf("Backlog() = %d, want 7 from the session statistics", l.Backlog())
+	}
+}
+
+func tier(label string) config.Tier {
+	const vcpu = tierVCPU
+
 	return config.Tier{
 		Label:    label,
 		Provider: config.ProviderFirecracker,
@@ -157,6 +262,12 @@ func newAllocator(t *testing.T, limits alloc.Limits, tiers []config.Tier) *alloc
 // whole of what this test is about.
 type fakeSession struct {
 	onPoll func(maxCapacity int)
+	onGet  func() (*Message, error)
+	stats  *Statistics
+	// acquired records every request id the listener asked GitHub to claim, so a
+	// test can assert WHICH class of message drove the acquisition.
+	acquiredMu sync.Mutex
+	acquired   []int64
 }
 
 func (f *fakeSession) GetMessage(ctx context.Context, _ int64, maxCapacity int) (*Message, error) {
@@ -170,12 +281,32 @@ func (f *fakeSession) GetMessage(ctx context.Context, _ int64, maxCapacity int) 
 	default:
 	}
 
+	if f.onGet != nil {
+		return f.onGet()
+	}
+
 	// A real long poll reports a timeout; the listener polls again.
 	return nil, ErrNoMessage
 }
 
+func (f *fakeSession) Statistics() *Statistics { return f.stats }
+
 func (f *fakeSession) DeleteMessage(context.Context, int64) error { return nil }
 
-func (f *fakeSession) AcquireJobs(_ context.Context, ids []int64) ([]int64, error) { return ids, nil }
+func (f *fakeSession) AcquireJobs(_ context.Context, ids []int64) ([]int64, error) {
+	f.acquiredMu.Lock()
+	f.acquired = append(f.acquired, ids...)
+	f.acquiredMu.Unlock()
+
+	return ids, nil
+}
+
+// acquiredIDs returns what the listener asked to claim.
+func (f *fakeSession) acquiredIDs() []int64 {
+	f.acquiredMu.Lock()
+	defer f.acquiredMu.Unlock()
+
+	return append([]int64(nil), f.acquired...)
+}
 
 func (f *fakeSession) Close(context.Context) error { return nil }

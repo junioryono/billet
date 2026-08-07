@@ -165,6 +165,24 @@ func (j JITRunner) LogValue() slog.Value {
 	)
 }
 
+// redactBody replaces an error whose text may contain a response body.
+//
+// It DROPS the message rather than scrubbing it. The config is base64 with no
+// fixed marker to match on, so a filter would be guessing — and the App flow
+// already established that filtering a body for secrets cannot work, because a
+// secret out of its field is an opaque string. The chain survives, so errors.Is
+// and errors.As still classify it.
+func redactBody(err error) error { return &redactedError{err: err} }
+
+// redactedError keeps an error classifiable while refusing to render it.
+type redactedError struct{ err error }
+
+func (e *redactedError) Error() string {
+	return "[redacted: this endpoint's response body carries the JIT credential]"
+}
+
+func (e *redactedError) Unwrap() error { return e.err }
+
 // JITConfig generates a single-use runner registration for one job.
 //
 // One config, one runner, one job: the runner is registered ephemeral, takes the
@@ -180,9 +198,16 @@ func (c *Client) JITConfig(ctx context.Context, scaleSetID int, runnerName, work
 		WorkFolder: workFolder,
 	}, scaleSetID)
 	if err != nil {
-		// The runner NAME is safe to report; the config is not, and this error
-		// does not carry it.
-		return nil, fmt.Errorf("scaleset: generate JIT config for %q: %w", runnerName, err)
+		// The vendor's error carries the whole HTTP response body, and THIS
+		// endpoint's success body contains the encoded JIT config. A proxy that
+		// forwards a 200 body under a non-200 status therefore puts a live
+		// credential inside an error that would otherwise be logged verbatim.
+		//
+		// Same shape as the App manifest conversion, and the same answer: this
+		// endpoint's body is never rendered. The status and the runner name are
+		// what an operator can act on anyway.
+		return nil, fmt.Errorf("scaleset: generate JIT config for %q: %w",
+			runnerName, redactBody(err))
 	}
 
 	if cfg == nil || cfg.EncodedJITConfig == "" {

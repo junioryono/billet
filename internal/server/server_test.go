@@ -24,8 +24,8 @@ import (
 // exactly the sort of line that gets moved during a refactor. Hence a test.
 func TestShutdownReleasesEveryEscrowedLease(t *testing.T) {
 	tiers := []config.Tier{
-		tier("billet-4vcpu-a", 4),
-		tier("billet-4vcpu-b", 4),
+		tier("billet-4vcpu-a"),
+		tier("billet-4vcpu-b"),
 	}
 
 	a := newAllocator(t, alloc.Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB}, tiers)
@@ -70,9 +70,9 @@ func TestShutdownReleasesEveryEscrowedLease(t *testing.T) {
 // sees a half-configured control plane reported as healthy.
 func TestNoListenerStartsUntilEveryScaleSetExists(t *testing.T) {
 	tiers := []config.Tier{
-		tier("billet-4vcpu-a", 4),
-		tier("billet-4vcpu-b", 4),
-		tier("billet-4vcpu-c", 4),
+		tier("billet-4vcpu-a"),
+		tier("billet-4vcpu-b"),
+		tier("billet-4vcpu-c"),
 	}
 
 	a := newAllocator(t, alloc.Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB}, tiers)
@@ -142,7 +142,7 @@ func TestNoListenerStartsUntilEveryScaleSetExists(t *testing.T) {
 
 // A tier that cannot be reconciled stops the whole start-up, and says which one.
 func TestReconciliationFailureStopsStartup(t *testing.T) {
-	tiers := []config.Tier{tier("billet-4vcpu-a", 4), tier("billet-4vcpu-b", 4)}
+	tiers := []config.Tier{tier("billet-4vcpu-a"), tier("billet-4vcpu-b")}
 
 	a := newAllocator(t, alloc.Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB}, tiers)
 

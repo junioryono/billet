@@ -23,7 +23,6 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
-	"github.com/junioryono/billet/internal/github"
 	"github.com/junioryono/billet/internal/scaleset"
 	"github.com/junioryono/billet/internal/server"
 	"github.com/junioryono/billet/internal/state"
@@ -177,16 +176,13 @@ func cmdServer(ctx context.Context, args []string) error {
 
 // runServer starts the control plane and blocks until it is told to stop.
 func runServer(ctx context.Context, cfg *config.Config) error {
-	key, err := os.ReadFile(cfg.GitHub.PrivateKeyPath)
+	// The SAME hardened reader `billet check` uses — type, mode, size and parse.
+	// Validated before anything else is built: a bad key otherwise fails at the
+	// first API call, by which time a scale set may already exist against a
+	// half-configured deployment, and GitHub keeps that.
+	key, err := readPrivateKey(cfg.GitHub.PrivateKeyPath)
 	if err != nil {
-		return fmt.Errorf("read the App private key: %w", err)
-	}
-
-	// Validated before anything else is built. A malformed key fails at the first
-	// API call otherwise, by which time a scale set may already have been created
-	// against a half-configured deployment.
-	if err := github.ValidatePrivateKey(key); err != nil {
-		return fmt.Errorf("github.private_key_path %s: %w", cfg.GitHub.PrivateKeyPath, err)
+		return err
 	}
 
 	// client_id when it is recorded, app id otherwise. GitHubAppAuth documents
