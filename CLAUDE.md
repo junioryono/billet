@@ -236,7 +236,8 @@ filesystem that cannot hard-link billet reports the staged key and the operator 
   unlinks by name, the check cannot be atomic with it, and a file swapped in between the two would be
   deleted. That residual is accepted and stated rather than claimed away.
 - **"Could not tell" is never "no key here."** `inspectKey` returns present / absent / unverifiable, and
-  only *absent* permits a deletion or a "your credential is gone" message. Callers use `inspectKey`
+  only *absent* permits a deletion or a "your credential is gone" message — and a stat that FAILS is
+  not a mismatch either, so identity checks answer matches / differs / unknown for the same reason. Callers use `inspectKey`
   directly — the boolean wrappers were deleted, because every one of them collapsed the third state at
   exactly the call site that needed it. Note that unlink permission comes from the DIRECTORY, so an
   operator can act on a bad `rm` suggestion for a file billet could not itself read.
@@ -245,7 +246,18 @@ filesystem that cannot hard-link billet reports the staged key and the operator 
   printing "it holds no usable key" beside an exact `rm` handed the operator a command that destroys it.
 - **"Not a valid key" is not "safe to clobber."** Whether to recommend `mv` asks `fileExists`, not
   `inspectKey` — a PEM with trailing junk, a format this build cannot parse, or a file a live writer
-  has not finished are all worth keeping, and `mv` replaces.
+  has not finished are all worth keeping, and `mv` replaces. Every `mv` suggestion in this file checks
+  the destination first, because the operator is following *billet's* advice.
+
+**A credential is never declared lost while its bytes are still in memory.** `os.Link` takes a NAME
+while the run owns a DESCRIPTOR, so the staging name is verified against the descriptor before the link
+and the destination is verified after it — the second catches the window the first cannot. But what
+follows a failed check is **not** "your key is gone": `writeKeyAtomically` still holds the complete PEM
+at every one of those points, so it writes the key to a fresh `O_EXCL` file and reports where it
+landed. An earlier version reasoned that an unlinked inode cannot be given a name again — true, and
+irrelevant, because the bytes never depended on that inode. Declaring a credential unrecoverable while
+it sits in a live variable is the worst mistake available here, because the advice that follows is
+"delete the App". Only a recovery write that ALSO fails is loss.
 
 **`billet check` proves the key WORKS**, not that it exists — regular file, no group/other permission
 bits, bounded read, and actually parsed, all from one descriptor opened `O_NONBLOCK` so a FIFO cannot
@@ -296,16 +308,20 @@ Treating the first code to arrive as final was a kill switch: inject a worthless
 ended with the App created and its key unrecoverable.
 
 **Only a status that ESTABLISHES the code is unusable may discard it**, which is a much shorter list
-than it looks: **404** (GitHub does not know this code) plus 414, which the callback's length bound
-makes unreachable anyway. Three versions shipped before that. `{404, 422}` left the kill switch open
+than it looks: **404**, and nothing else. Four versions shipped before that. `{404, 422}` left the kill switch open
 for an injected code drawing a 414. "Every 4xx" swallowed **429** — a rate limit says nothing about
 the code, so a *valid* code was discarded while the App stayed created. And 422 is the subtle one:
 GitHub documents it as *"Validation failed, **or the endpoint has been spammed**"*, so an attacker
 feeding forged codes can trip abuse protection and make the honest code's 422 look like a rejection.
 400 is not code-specific either — a proxy returns it for header and policy reasons.
 
-An ambiguous status is therefore **retried with the same code**, backing off until it redeems, is
-definitively rejected, or GitHub's window closes. Making it *fatal* was still credential loss with
+**Everything that is not a definitive rejection is ambiguous**, and ambiguous codes are **retried
+round-robin** — never one at a time. An enumerated ambiguous list left every unlisted status falling
+through as fatal, which is how removing 414 from the rejection set preserved the exact failure it was
+removed to fix. And retrying a single code in a blocking loop reopened the kill switch in slow motion:
+an injected code that always draws 422 monopolised the exchange while the honest redirect sat in the
+queue until the window closed. Each round tries every pending code once, a new callback interrupts the
+backoff, and only a 404 drops a code. Making it *fatal* was still credential loss with
 extra steps — the code lives in a local variable and the loopback listener dies with the flow, so
 "run the command again" builds a SECOND App rather than recovering the first one's key. Nothing is
 discarded on a response that never said the code was bad. A forged code is a random string, so GitHub
@@ -314,8 +330,8 @@ answers 404, and the case that actually needed handling is the one that is unamb
 The callback queue is deep, and a callback that does **not** fit is refused rather than dropped — a
 silent drop plus an "App created" page meant the honest redirect could be discarded while its browser
 was told it had worked. What remains is a local process being able to *delay* onboarding up to
-`ManifestTTL`; that is not fixable while argv is readable, and it is a delay rather than a lost
-credential.
+`ManifestTTL` — not fixable while argv is readable, and a delay rather than a lost credential only
+because injected codes are retried alongside the honest one rather than ahead of it.
 
 **`App` is redacted on every rendering path billet can reach.** `String`/`GoString` on a **value**
 receiver (a pointer receiver is not consulted when a value is formatted), `Format` so no verb falls

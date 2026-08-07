@@ -946,6 +946,71 @@ func TestFullCallbackQueueRefusesRatherThanDropping(t *testing.T) {
 	}
 }
 
+// A code that is ALWAYS ambiguous must not monopolize the exchange.
+//
+// Retrying one code inside a blocking loop reopened the kill switch in slow
+// motion: a local process submits a malformed code that consistently draws 422,
+// the loop sits on it, and the honest redirect waits in the queue until GitHub's
+// window closes — App created, key unrecoverable. Round-robin is what makes the
+// injected code cost time instead of the credential.
+func TestAPersistentlyAmbiguousCodeDoesNotBlockTheHonestOne(t *testing.T) {
+	fake := newFakeGitHub(t)
+	fake.rejectCode = "injected-by-a-local-process"
+	fake.rejectStatus = http.StatusUnprocessableEntity
+
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	defer cancel()
+
+	browser := &browser{t: t, fake: fake, client: srv.Client()}
+
+	var calls atomic.Int32
+
+	attacked := func(ctx context.Context, target string) error {
+		if calls.Add(1) == 1 {
+			state := extractAttr(browser.get(ctx, target), "state=")
+			if state == "" {
+				return errors.New("could not read the state from the start page")
+			}
+
+			forged := strings.TrimSuffix(target, "/") + "/callback?code=" + fake.rejectCode + "&state=" + state
+
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, forged, http.NoBody)
+			if err != nil {
+				return err
+			}
+
+			resp, err := srv.Client().Do(req)
+			if err != nil {
+				return err
+			}
+
+			resp.Body.Close()
+		}
+
+		return browser.open(ctx, target)
+	}
+
+	result, err := Onboard(ctx, OnboardOptions{
+		Org:          "acme",
+		OpenBrowser:  attacked,
+		Log:          func(string, ...any) {},
+		Client:       srv.Client(),
+		InstallPoll:  20 * time.Millisecond,
+		apiBase:      srv.URL,
+		OnAppCreated: func(*App) error { return nil },
+	})
+	if err != nil {
+		t.Fatalf("an injected code that never resolves blocked the honest one: %v", err)
+	}
+
+	if result == nil || result.App == nil || result.App.ID == 0 {
+		t.Fatal("onboarding produced no app")
+	}
+}
+
 func TestOnboardRequiresOrgAndLog(t *testing.T) {
 	if _, err := Onboard(t.Context(), OnboardOptions{Log: func(string, ...any) {}}); err == nil {
 		t.Error("an empty org should be rejected")

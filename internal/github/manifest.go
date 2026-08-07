@@ -657,26 +657,24 @@ func conversionError(status int, _ []byte) error {
 	// So the same code is retried with backoff until it redeems, is definitively
 	// rejected, or the manifest deadline expires. Nothing is discarded on a
 	// response that never said the code was bad.
-	if ambiguousStatuses[status] || status >= 500 {
-		return fmt.Errorf("%w: %w", errCodeAmbiguous, rendered)
-	}
-
-	return rendered
+	// EVERYTHING that is not a definitive rejection is ambiguous.
+	//
+	// An enumerated list of ambiguous statuses left every status in NEITHER set
+	// falling through as fatal — which is how removing 414 from the rejection set
+	// preserved the exact failure it was removed to fix: an intermediary answers
+	// 414, the exchange aborts, and the App's key is orphaned. The same held for
+	// 401, 425, 426 and 431.
+	//
+	// The default has to be "keep the code", because the two mistakes are not
+	// symmetric. Retrying a status that really did mean the code was bad costs a
+	// wait bounded by GitHub's own window. Discarding one that did not costs a
+	// key that cannot be re-issued.
+	return fmt.Errorf("%w: %w", errCodeAmbiguous, rendered)
 }
 
 // errCodeAmbiguous marks a response that did not establish anything about the
 // code, so the same code is worth presenting again.
 var errCodeAmbiguous = errors.New("github: the conversion did not resolve the code")
-
-// ambiguousStatuses are responses that say nothing about the presented code.
-// 5xx is treated the same way without being enumerated.
-var ambiguousStatuses = map[int]bool{
-	http.StatusUnprocessableEntity: true, // "Validation failed, OR the endpoint has been spammed"
-	http.StatusTooManyRequests:     true, // the rate limit, not the code
-	http.StatusRequestTimeout:      true,
-	http.StatusForbidden:           true, // GitHub also uses this for abuse detection
-	http.StatusBadRequest:          true, // a proxy returns this for header and policy reasons
-}
 
 // codeRejectionStatuses are the responses that mean the presented code itself
 // is unusable, so moving on to the next queued callback is safe.
