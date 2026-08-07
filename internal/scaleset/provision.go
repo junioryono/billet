@@ -102,6 +102,63 @@ func (c *Client) EnsureScaleSet(ctx context.Context, name, group string, labels 
 	return &ScaleSet{ID: created.ID, Name: created.Name, Group: group}, nil
 }
 
+// DeleteScaleSet removes a tier's scale set from GitHub.
+//
+// This exists because THERE IS NO OTHER WAY. A scale set created through the API
+// has no delete control in GitHub's UI — the org's runner list shows it with no
+// options menu, and its detail page offers statistics and nothing else. So a
+// tool that creates scale sets and cannot remove them leaves the operator with
+// orphans they are not able to clean up by hand. Verified against a real
+// organization, not inferred.
+//
+// Looked up by NAME rather than taking an id, because the id is billet's
+// internal handle and the name is what an operator has: it is the tier label
+// from their own billet.yaml.
+//
+// Refuses to delete a scale set whose labels are not the ones this tier asked
+// for, exactly as adoption does. Deleting somebody else's scale set because it
+// happened to share a name is far worse than refusing to.
+func (c *Client) DeleteScaleSet(ctx context.Context, name, group string, labels []string) error {
+	if group == "" {
+		group = DefaultRunnerGroup
+	}
+
+	rg, err := c.gh.GetRunnerGroupByName(ctx, group)
+	if err != nil {
+		return fmt.Errorf("scaleset: find runner group %q: %w", group, err)
+	}
+
+	if rg == nil {
+		return fmt.Errorf("scaleset: runner group %q does not exist", group)
+	}
+
+	existing, err := c.gh.GetRunnerScaleSet(ctx, rg.ID, name)
+	if err != nil {
+		return fmt.Errorf("scaleset: look up scale set %q: %w", name, err)
+	}
+
+	if existing == nil {
+		// Already gone. Idempotent on purpose: teardown is the operation most
+		// likely to be re-run after a partial failure, and an error here would
+		// make a second attempt look like a new problem.
+		c.log.Info("scale set does not exist; nothing to delete", "name", name, "group", group)
+
+		return nil
+	}
+
+	if err := checkLabels(name, existing, labels); err != nil {
+		return err
+	}
+
+	if err := c.gh.DeleteRunnerScaleSet(ctx, existing.ID); err != nil {
+		return fmt.Errorf("scaleset: delete scale set %q: %w", name, err)
+	}
+
+	c.log.Info("deleted scale set", "name", name, "group", group, "id", existing.ID)
+
+	return nil
+}
+
 // checkLabels refuses a scale set whose labels are not the ones requested.
 //
 // It reports rather than patches. Rewriting somebody else's labels is a

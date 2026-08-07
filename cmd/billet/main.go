@@ -60,6 +60,7 @@ func commands() []command {
 		{"check", "validate the config and state directory, then exit", cmdCheck},
 		{"init", "generate a billet.yaml interactively", cmdInit},
 		{"github-app", "create and install the GitHub App billet uses", cmdGitHubApp},
+		{"teardown", "delete the scale sets billet created on GitHub", cmdTeardown},
 		{"status", "show cluster status", cmdStatus},
 		{"version", "print version information", cmdVersion},
 	}
@@ -317,6 +318,122 @@ func cmdNode(_ context.Context, args []string) error {
 // cmdCheck is the explicit "is this deployment sane" command. It is the only
 // path that opens — and therefore migrates — the state database, so that
 // mutating durable state is always something the operator asked for.
+// newScaleSetClient builds the GitHub client from config, reading the key with
+// the same hardened reader `billet check` uses.
+//
+// Shared so teardown and the server authenticate identically. A second,
+// slightly-different construction is how one of them ends up talking to a
+// different organization than the other.
+func newScaleSetClient(cfg *config.Config) (*scaleset.Client, error) {
+	if cfg.GitHub == nil {
+		return nil, errors.New("billet: no github section in the config")
+	}
+
+	key, err := readPrivateKey(cfg.GitHub.PrivateKeyPath)
+	if err != nil {
+		return nil, err
+	}
+
+	appIdentity := cfg.GitHub.ClientID
+	if appIdentity == "" {
+		appIdentity = strconv.FormatInt(cfg.GitHub.AppID, 10)
+	}
+
+	return scaleset.New(scaleset.Config{
+		ConfigURL:      "https://github.com/" + cfg.GitHub.Org,
+		ClientID:       appIdentity,
+		InstallationID: cfg.GitHub.InstallationID,
+		PrivateKey:     string(key),
+	}, slog.Default())
+}
+
+// cmdTeardown removes the scale sets billet created.
+//
+// It exists because there is no other way to remove them. A scale set created
+// through the API has no delete control in GitHub's UI — the org's runner list
+// shows it with no options menu, and its detail page offers statistics and
+// nothing else. Without this command, billet creates objects on somebody's
+// organization that they cannot clean up by hand.
+//
+// Deliberately NOT part of any automatic path. Nothing about stopping the server
+// should delete a scale set: an operator restarting billet, or running it on a
+// second host, would find their tiers dismantled underneath them. Teardown is a
+// thing an operator asks for, once, on purpose.
+func cmdTeardown(ctx context.Context, args []string) error {
+	fs := newFlagSet("billet teardown")
+	cfgPath := addConfigFlag(fs)
+	tier := fs.String("tier", "", "delete only this tier's scale set (default: every tier in the config)")
+	yes := fs.Bool("yes", false, "skip the confirmation prompt")
+
+	if err := parse(fs, args); err != nil {
+		return err
+	}
+
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		return err
+	}
+
+	wanted := cfg.Tiers
+	if *tier != "" {
+		wanted = nil
+
+		for i := range cfg.Tiers {
+			if cfg.Tiers[i].Label == *tier {
+				wanted = append(wanted, cfg.Tiers[i])
+			}
+		}
+
+		if len(wanted) == 0 {
+			return fmt.Errorf("billet: no tier named %q in %s", *tier, *cfgPath)
+		}
+	}
+
+	if len(wanted) == 0 {
+		return errors.New("billet: the config declares no tiers, so there is nothing to delete")
+	}
+
+	fmt.Printf("This deletes the following scale sets from %s:\n", cfg.GitHub.Org)
+
+	for i := range wanted {
+		fmt.Printf("  %s\n", wanted[i].Label)
+	}
+
+	fmt.Println("\nRunners already registered to them are removed by GitHub.")
+
+	if !*yes {
+		// Typed confirmation rather than y/N. This is a destructive act against
+		// somebody's organization, and the cost of a stray keystroke is a tier
+		// that stops accepting work with no obvious cause.
+		fmt.Print("\nType the organization name to confirm: ")
+
+		var typed string
+		if _, err := fmt.Scanln(&typed); err != nil {
+			return fmt.Errorf("billet: teardown cancelled: %w", err)
+		}
+
+		if typed != cfg.GitHub.Org {
+			return errors.New("billet: teardown cancelled")
+		}
+	}
+
+	client, err := newScaleSetClient(cfg)
+	if err != nil {
+		return err
+	}
+
+	for i := range wanted {
+		t := &wanted[i]
+		if err := client.DeleteScaleSet(ctx, t.Label, t.RunnerGroup, []string{t.Label}); err != nil {
+			return err
+		}
+	}
+
+	fmt.Println("Done.")
+
+	return nil
+}
+
 func cmdCheck(ctx context.Context, args []string) error {
 	fs := newFlagSet("billet check")
 	cfgPath := addConfigFlag(fs)
