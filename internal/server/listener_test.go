@@ -225,7 +225,11 @@ func TestAvailableIsAcquiredAndAssignedConsumesEscrow(t *testing.T) {
 		}, nil
 	}
 
-	l := NewListener(a, tiers[0].Label, session)
+	l := NewListener(a, tiers[0].Label, session,
+		// A runner that starts things, because these assertions are about escrow
+		// rather than launching. The default fails closed, which correctly hands
+		// the capacity back and would empty every count below.
+		WithRunner(&fakeRunner{}))
 
 	// Observed DURING the run. Shutdown releases running leases as well as held
 	// ones — correctly, since nothing can be executing them yet — so anything
@@ -294,7 +298,11 @@ func TestRedeliveredAssignmentDoesNotConsumeASecondLease(t *testing.T) {
 		return nil, ErrNoMessage
 	}
 
-	l := NewListener(a, tiers[0].Label, session)
+	l := NewListener(a, tiers[0].Label, session,
+		// A runner that starts things, because these assertions are about escrow
+		// rather than launching. The default fails closed, which correctly hands
+		// the capacity back and would empty every count below.
+		WithRunner(&fakeRunner{}))
 
 	var running atomic.Int32
 
@@ -621,7 +629,11 @@ func TestOffersAreAcquiredOnlyUpToFreeEscrow(t *testing.T) {
 		return nil, ErrNoMessage
 	}
 
-	l := NewListener(a, tiers[0].Label, session)
+	l := NewListener(a, tiers[0].Label, session,
+		// A runner that starts things, because these assertions are about escrow
+		// rather than launching. The default fails closed, which correctly hands
+		// the capacity back and would empty every count below.
+		WithRunner(&fakeRunner{}))
 
 	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run: %v", err)
@@ -1190,7 +1202,11 @@ func TestAReofferedRequestKeepsItsExistingPromise(t *testing.T) {
 		return nil, ErrNoMessage
 	}
 
-	l = NewListener(a, tiers[0].Label, session)
+	l = NewListener(a, tiers[0].Label, session,
+		// A runner that starts things, because these assertions are about escrow
+		// rather than launching. The default fails closed, which correctly hands
+		// the capacity back and would empty every count below.
+		WithRunner(&fakeRunner{}))
 
 	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run: %v", err)
@@ -1320,6 +1336,235 @@ func TestTheCursorDoesNotAdvancePastAnUnacknowledgedMessage(t *testing.T) {
 		t.Errorf("the cursor is %d after a successful acknowledgement; the listener would "+
 			"be redelivered message 42 forever", l.lastMessageID)
 	}
+}
+
+// An assigned job is launched, and the compute is destroyed BEFORE its capacity
+// is handed back.
+//
+// The ordering is the whole point. Releasing first frees the slot to another
+// tier while this job's container is still on the host: the budget is satisfied
+// on paper and overcommitted in fact. Same shape as closing the session before
+// releasing the escrow, and the same reason.
+func TestComputeIsDestroyedBeforeItsCapacityIsReleased(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	// events records what happened in the order it happened, which is the only
+	// thing that can catch an ordering bug.
+	var (
+		mu     sync.Mutex
+		events []string
+	)
+
+	record := func(what string) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		events = append(events, what)
+	}
+
+	runner := &fakeRunner{
+		onLaunch:  func(int64) error { record("launch"); return nil },
+		onDestroy: func(int64) error { record("destroy"); return nil },
+	}
+
+	// Release is observed through the allocator by watching usage drop, so the
+	// listener is given a hook rather than the test guessing at timing.
+	var delivered atomic.Int32
+
+	session := &fakeSession{}
+	session.onGet = func() (*Message, error) {
+		switch delivered.Add(1) {
+		case 1:
+			return &Message{
+				MessageID: 1,
+				Available: []Job{{RequestID: 11, RunID: 101}},
+				Assigned:  []Job{{RequestID: 11, RunID: 101}},
+			}, nil
+		case 2:
+			return &Message{MessageID: 2, Completed: []Job{{RequestID: 11, RunID: 101}}}, nil
+		case 3:
+			cancel()
+		}
+
+		return nil, ErrNoMessage
+	}
+
+	l := NewListener(a, tiers[0].Label, session, WithRunner(runner))
+
+	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(events) < 2 {
+		t.Fatalf("expected a launch and a destroy, got %v", events)
+	}
+
+	if events[0] != "launch" {
+		t.Errorf("the job was not launched first: %v", events)
+	}
+
+	if events[1] != "destroy" {
+		t.Errorf("the compute was not destroyed on completion: %v", events)
+	}
+
+	usage, err := a.Usage(t.Context())
+	if err != nil {
+		t.Fatalf("Usage: %v", err)
+	}
+
+	if usage.Leases != 0 {
+		t.Errorf("%d leases still open after the job finished", usage.Leases)
+	}
+}
+
+// Capacity that could not be torn down is NOT handed back.
+//
+// A destroy failure means the container may still be running. Releasing the
+// lease then lets another tier escrow a machine this job is still using, which
+// is the overcommit the whole escrow exists to prevent. Capacity the reaper
+// reclaims late is recoverable; capacity handed out twice is not.
+func TestCapacityIsHeldWhenTheComputeWillNotDie(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	runner := &fakeRunner{
+		onDestroy: func(int64) error { return errors.New("the host is not answering") },
+	}
+
+	var delivered atomic.Int32
+
+	session := &fakeSession{}
+	session.onGet = func() (*Message, error) {
+		switch delivered.Add(1) {
+		case 1:
+			return &Message{
+				MessageID: 1,
+				Available: []Job{{RequestID: 11, RunID: 101}},
+				Assigned:  []Job{{RequestID: 11, RunID: 101}},
+			}, nil
+		case 2:
+			return &Message{MessageID: 2, Completed: []Job{{RequestID: 11, RunID: 101}}}, nil
+		}
+
+		cancel()
+
+		return nil, ErrNoMessage
+	}
+
+	l := NewListener(a, tiers[0].Label, session, WithRunner(runner))
+
+	// NOT fatal, and that is a deliberate separation of two questions. A listener
+	// error cancels every other listener, and their shutdowns then destroy every
+	// running job on the host — so one docker daemon hiccup while cleaning up a
+	// single finished job would take down the fleet. The capacity is held; the
+	// control plane keeps running.
+	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("a failed teardown of one job stopped the listener: %v", err)
+	}
+
+	usage, err := a.Usage(t.Context())
+	if err != nil {
+		t.Fatalf("Usage: %v", err)
+	}
+
+	if usage.Leases == 0 {
+		t.Error("the capacity was handed back while the compute may still be running; another " +
+			"tier can now escrow a machine this job is still on")
+	}
+}
+
+// A job that cannot be started gives its capacity straight back.
+//
+// The opposite rule to the one above, and the difference is whether anything is
+// running. A lease whose compute never started is backing nothing, so holding it
+// withholds capacity from every other tier for no reason. GitHub reassigns the
+// job when its pickup deadline passes.
+func TestCapacityIsReturnedWhenTheComputeWillNotStart(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 4, MaxMemory: 16 * config.GiB}, tiers)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	runner := &fakeRunner{
+		onLaunch: func(int64) error { return errors.New("no space left on device") },
+	}
+
+	var (
+		delivered atomic.Int32
+		afterward atomic.Int32
+	)
+
+	var l *Listener
+
+	session := &fakeSession{}
+	session.onGet = func() (*Message, error) {
+		switch delivered.Add(1) {
+		case 1:
+			return &Message{
+				MessageID: 1,
+				Available: []Job{{RequestID: 11, RunID: 101}},
+				Assigned:  []Job{{RequestID: 11, RunID: 101}},
+			}, nil
+		case 2:
+			// Sampled during the run: shutdown releases everything, so anything
+			// asserted afterwards would look correct either way.
+			afterward.Store(int32(l.Running()))
+
+			cancel()
+		}
+
+		return nil, ErrNoMessage
+	}
+
+	l = NewListener(a, tiers[0].Label, session, WithRunner(runner))
+
+	// NOT fatal. Failing the listener would take every tier down over one job
+	// that GitHub will simply reassign.
+	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("a job that failed to start stopped the listener: %v", err)
+	}
+
+	if afterward.Load() != 0 {
+		t.Errorf("%d jobs still counted as running after their launch failed; that capacity "+
+			"backs nothing and no other tier can use it", afterward.Load())
+	}
+}
+
+// fakeRunner stands in for a host. Both hooks default to succeeding, so a test
+// only says what it cares about.
+type fakeRunner struct {
+	onLaunch  func(requestID int64) error
+	onDestroy func(requestID int64) error
+}
+
+func (f *fakeRunner) Launch(_ context.Context, _ *alloc.Lease, job Job) error {
+	if f.onLaunch != nil {
+		return f.onLaunch(job.RequestID)
+	}
+
+	return nil
+}
+
+func (f *fakeRunner) Destroy(_ context.Context, requestID int64) error {
+	if f.onDestroy != nil {
+		return f.onDestroy(requestID)
+	}
+
+	return nil
 }
 
 // fakeSession stands in for a scale-set message session. It never returns work,
