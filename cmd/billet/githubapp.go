@@ -276,7 +276,7 @@ func stagedKeyFoundError(path, staged string) error {
 	// with trailing junk, a key in a format this build cannot parse, a file a
 	// live writer has not finished. "Not currently a valid key" was never proof
 	// that clobbering it is safe.
-	if fileExists(path) {
+	if lookupPath(path) != pathAbsent {
 		return fmt.Errorf(
 			"two files are present and billet cannot tell which key you want:\n"+
 				"    %s   (from an interrupted run)\n"+
@@ -393,8 +393,17 @@ func writeKeyAtomically(reserved *os.File, path string, pem []byte, onInstalled 
 		// another run's key at the staging name would have been reported as this
 		// one's, and a staging name that was unlinked during the flow would have
 		// been reported as holding a key it no longer has.
-		if verifyInstalled(reserved, staging) != identityMatches {
+		//
+		// `!= identityMatches` is NOT good enough here, and writing it that way
+		// undid the three-valued type one line after introducing it: a failed stat
+		// is not a proven mismatch, and treating it as one writes a second copy of
+		// the key for no reason and reports only the copy.
+		switch verifyInstalled(reserved, staging) {
+		case identityMatches:
+		case identityDiffers:
 			return recoverKey(dir, path, pem, failure)
+		case identityUnknown:
+			return uncertainAt(staging, path, failure)
 		}
 
 		switch inspectKey(staging) {
@@ -412,11 +421,16 @@ func writeKeyAtomically(reserved *os.File, path string, pem []byte, onInstalled 
 	}
 
 	if err := reserved.Sync(); err != nil {
-		if verifyInstalled(reserved, staging) != identityMatches {
-			return recoverKey(dir, path, pem, fmt.Errorf("sync %s: %w", staging, err))
-		}
+		failure := fmt.Errorf("sync %s: %w", staging, err)
 
-		return preservedAt(staging, fmt.Errorf("sync %s: %w", staging, err))
+		switch verifyInstalled(reserved, staging) {
+		case identityMatches:
+			return preservedAt(staging, failure)
+		case identityDiffers:
+			return recoverKey(dir, path, pem, failure)
+		case identityUnknown:
+			return uncertainAt(staging, path, failure)
+		}
 	}
 
 	// The staging NAME is made durable before the link. A crash in the window
@@ -461,15 +475,32 @@ func writeKeyAtomically(reserved *os.File, path string, pem []byte, onInstalled 
 				staging, path, err)
 		}
 
+		// The link can fail because staging was MOVED to the destination by
+		// something else — in which case the key is already exactly where it
+		// belongs, and writing a recovery copy would scatter a second one for no
+		// reason. Checked before anything else is concluded.
+		if verifyInstalled(reserved, path) == identityMatches {
+			installed = true
+
+			onInstalled()
+
+			return nil
+		}
+
 		// Re-checked, because the pre-link check is stale by the time the link
 		// has failed: the staging name can have been swapped in between, and
 		// naming it as where the key is preserved would point the operator at
 		// somebody else's file.
-		if verifyInstalled(reserved, staging) != identityMatches {
+		switch verifyInstalled(reserved, staging) {
+		case identityMatches:
+			return preservedAt(staging, cause)
+		case identityDiffers:
 			return recoverKey(dir, path, pem, cause)
+		case identityUnknown:
+			return uncertainAt(staging, path, cause)
 		}
 
-		return preservedAt(staging, cause)
+		return cause
 	}
 
 	// The check above is check-then-act and cannot be made atomic with the link.
@@ -551,49 +582,80 @@ func verifyInstalled(reserved *os.File, path string) identity {
 // recoverKey writes the key somewhere new when the ordinary install could not
 // place it, and reports where it landed.
 //
-// This function exists because the previous version did not. It concluded that
-// a key written into an unlinked inode was unrecoverable — true of that inode,
-// and beside the point: writeKeyAtomically still holds the complete PEM in
+// This function exists because the previous version did not: it concluded that a
+// key written into an unlinked inode was unrecoverable — true of that inode, and
+// beside the point, because writeKeyAtomically still holds the complete PEM in
 // memory at every call site that reaches here. Declaring a credential lost while
-// the bytes are in a live variable is the worst outcome in this file, because
-// the advice that follows is "delete the App".
+// the bytes are in a live variable is the worst outcome in this file, since the
+// advice that follows is "delete the App".
 //
-// Only if this write ALSO fails is the key genuinely gone.
+// The same reasoning applies one level down, which is what the first version got
+// wrong: a recovery write that reports an error may STILL have left a usable key,
+// so the file is inspected rather than assumed empty. Loss is what remains after
+// looking, never what is inferred from a return value.
 func recoverKey(dir, destination string, pem []byte, cause error) error {
 	f, err := os.CreateTemp(dir, ".billet-key-recovered-*")
 	if err != nil {
+		// This directory failed; that is not proof no directory would work. Say
+		// which claim is being made.
 		return fmt.Errorf(
-			"%w\nThe key could not be re-written anywhere (%w), so it is gone. Delete the App on "+
-				"GitHub and run this command again — GitHub will issue a new key for the new App",
-			cause, err)
+			"%w\nThe key could not be written to a recovery file in %s (%w). It is not recoverable "+
+				"from this run: delete the App on GitHub and run this command again",
+			cause, dir, err)
 	}
 
+	// CreateTemp already creates 0600 atomically — there is no window where the
+	// key is world-readable, and an extra Chmod would only add a failure path.
 	name := f.Name()
 
-	if err := writeAndSync(f, pem); err != nil {
-		return fmt.Errorf(
-			"%w\nThe key could not be re-written anywhere (%w), so it is gone. Delete the App on "+
-				"GitHub and run this command again — GitHub will issue a new key for the new App",
-			cause, err)
+	writeErr := writeKey(f, pem)
+
+	// Verified against the DESCRIPTOR before any promise is made about the name.
+	// A random name is unlikely to be disturbed, but "unlikely" is not the
+	// standard this file holds anywhere else, and preservedAt is a promise.
+	held := verifyInstalled(f, name)
+
+	_ = f.Close()
+
+	if writeErr == nil && held == identityMatches {
+		// The NAME is made durable too. f.Sync persists contents, not the new
+		// directory entry, so a crash could otherwise lose a path billet has
+		// already told the operator to go to.
+		if err := syncDir(dir); err != nil {
+			return uncertainAt(name, destination, fmt.Errorf(
+				"%w\nThe key was written to %s, but that name could not be flushed (%w) — confirm it "+
+					"exists after a reboot", cause, name, err))
+		}
+
+		return preservedAt(name, fmt.Errorf(
+			"%w\nThe key was re-written to %s. Check whether %s already holds a different App's key "+
+				"before moving it there", cause, name, destination))
 	}
 
-	// Deliberately not moved into place: the destination may be occupied by
-	// another run's key, and this path has already demonstrated that the
-	// directory is being changed underneath it.
-	return preservedAt(name, fmt.Errorf(
-		"%w\nThe key was re-written to %s. Check whether %s already holds a different App's key "+
-			"before moving it there", cause, name, destination))
+	// The write reported a failure, or the name can no longer be tied to it. What
+	// is actually in that file decides, not either of those.
+	switch inspectKey(name) {
+	case keyPresent:
+		return preservedAt(name, fmt.Errorf(
+			"%w\nThe recovery write reported an error (%w) but %s holds a usable key. Check whether "+
+				"%s already holds a different App's key before moving it there",
+			cause, writeErr, name, destination))
+	case keyUnverifiable:
+		return uncertainAt(name, destination, fmt.Errorf(
+			"%w\nThe recovery write reported an error (%w) and %s cannot be read", cause, writeErr, name))
+	case keyAbsent:
+		return fmt.Errorf(
+			"%w\nThe key could not be written to a recovery file (%w), and %s holds nothing usable. "+
+				"The key is gone: delete the App on GitHub and run this command again",
+			cause, writeErr, name)
+	}
+
+	return cause
 }
 
-// writeAndSync writes the whole of b and forces it to disk, restricting the
-// file first so the key is never briefly world-readable.
-func writeAndSync(f *os.File, b []byte) error {
-	defer f.Close()
-
-	if err := f.Chmod(0o600); err != nil {
-		return fmt.Errorf("restrict %s: %w", f.Name(), err)
-	}
-
+// writeKey writes the whole of b and forces it to disk. The descriptor is left
+// OPEN so the caller can still ask what it refers to.
+func writeKey(f *os.File, b []byte) error {
 	if n, err := f.Write(b); err != nil {
 		return fmt.Errorf("write %s: %w", f.Name(), err)
 	} else if n != len(b) {
@@ -605,6 +667,34 @@ func writeAndSync(f *os.File, b []byte) error {
 	}
 
 	return nil
+}
+
+// pathState is what a pathname lookup concluded, with the same third value as
+// everywhere else here: a stat that FAILED has not established absence.
+type pathState int
+
+const (
+	pathUnknown pathState = iota
+	pathAbsent
+	pathPresent
+)
+
+// lookupPath reports whether anything occupies path.
+//
+// fileExists collapsed every error into "nothing there", which is fine for a
+// diagnostic and wrong for a decision: on EACCES or ESTALE it made billet
+// recommend `mv onto-the-destination`, and Unix mv replaces. Only a confirmed
+// ErrNotExist may unlock that advice.
+func lookupPath(path string) pathState {
+	if _, err := os.Lstat(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return pathAbsent
+		}
+
+		return pathUnknown
+	}
+
+	return pathPresent
 }
 
 // uncertainAt marks an error where billet could not determine whether the
@@ -623,11 +713,12 @@ func uncertainAt(where, destination string, err error) error {
 	// HERE rather than assumed, because another run can claim it during the
 	// browser flow. Unix mv replaces, so the unconditional version handed the
 	// operator a command that destroys a second App's key.
-	move := fmt.Sprintf("if it holds a PEM private key, move it to %s and run `billet check`", destination)
-	if where == destination || fileExists(destination) {
-		move = fmt.Sprintf(
-			"%s also exists, so do not move anything on top of it — work out which App each file "+
-				"belongs to first", destination)
+	move := fmt.Sprintf(
+		"%s cannot be confirmed empty, so do not move anything on top of it — work out which App "+
+			"each file belongs to first", destination)
+
+	if where != destination && lookupPath(destination) == pathAbsent {
+		move = fmt.Sprintf("if it holds a PEM private key, move it to %s and run `billet check`", destination)
 	}
 
 	return fmt.Errorf(

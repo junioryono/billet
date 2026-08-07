@@ -479,6 +479,153 @@ func TestReserveKeyFileWillNotOfferToDeleteAFileItCannotRead(t *testing.T) {
 	}
 }
 
+// recoverKey is the difference between "your key is gone, delete the App" and a
+// file the operator can move into place. It had no test at all.
+func TestRecoverKeyWritesTheKeyAndSaysWhere(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.pem")
+	key := testKey(t)
+
+	err := recoverKey(dir, path, key, errors.New("the install failed"))
+	if err == nil {
+		t.Fatal("recoverKey returned no error; it always reports the failure it recovered from")
+	}
+
+	if !errors.Is(err, errCredentialPreserved) {
+		t.Fatalf("a successful recovery was not reported as preserved: %v", err)
+	}
+
+	// The named path must actually hold the key — an error that names a file the
+	// operator then cannot use is worse than no advice.
+	var recovered string
+
+	entries, readErr := os.ReadDir(dir)
+	if readErr != nil {
+		t.Fatalf("read dir: %v", readErr)
+	}
+
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".billet-key-recovered-") {
+			recovered = filepath.Join(dir, e.Name())
+		}
+	}
+
+	if recovered == "" {
+		t.Fatal("no recovery file was created")
+	}
+
+	if !strings.Contains(err.Error(), recovered) {
+		t.Errorf("the error does not name the recovery file %s: %v", recovered, err)
+	}
+
+	got, readErr := os.ReadFile(recovered)
+	if readErr != nil {
+		t.Fatalf("read recovery file: %v", readErr)
+	}
+
+	if !bytes.Equal(got, key) {
+		t.Error("the recovery file does not hold the key it was given")
+	}
+
+	if runtime.GOOS != "windows" {
+		info, statErr := os.Stat(recovered)
+		if statErr != nil {
+			t.Fatalf("stat: %v", statErr)
+		}
+
+		if perm := info.Mode().Perm(); perm != 0o600 {
+			t.Errorf("recovery file mode = %04o, want 0600", perm)
+		}
+	}
+}
+
+// A recovery into a directory that cannot hold it is the only genuine loss, and
+// only then may billet say the key is gone.
+func TestRecoverKeyReportsLossOnlyWhenNothingLanded(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("directory permission bits do not gate creation here")
+	}
+
+	dir := t.TempDir()
+
+	sub := filepath.Join(dir, "keys")
+	if err := os.Mkdir(sub, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	if err := os.Chmod(sub, 0o500); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+
+	t.Cleanup(func() {
+		if err := os.Chmod(sub, 0o700); err != nil {
+			t.Errorf("restore mode: %v", err)
+		}
+	})
+
+	err := recoverKey(sub, filepath.Join(sub, "app.pem"), testKey(t), errors.New("the install failed"))
+	if err == nil {
+		t.Fatal("recoverKey reported success writing into a read-only directory")
+	}
+
+	// It must NOT claim preservation, and it must not claim more than it knows:
+	// this directory failed, which is not proof that no directory would work.
+	if errors.Is(err, errCredentialPreserved) {
+		t.Errorf("a failed recovery was reported as preserved: %v", err)
+	}
+
+	if !strings.Contains(err.Error(), "delete the App") {
+		t.Errorf("a genuine loss must say what to do about the orphaned App: %v", err)
+	}
+}
+
+// lookupPath is what decides whether billet suggests `mv`, and `mv` replaces.
+// "Could not tell" must never read as "nothing there".
+func TestLookupPathDoesNotTreatAnErrorAsAbsence(t *testing.T) {
+	dir := t.TempDir()
+
+	if got := lookupPath(filepath.Join(dir, "nothing")); got != pathAbsent {
+		t.Errorf("a missing file: lookupPath = %v, want pathAbsent", got)
+	}
+
+	present := filepath.Join(dir, "something")
+	if err := os.WriteFile(present, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	if got := lookupPath(present); got != pathPresent {
+		t.Errorf("an existing file: lookupPath = %v, want pathPresent", got)
+	}
+
+	if runtime.GOOS != "windows" && os.Geteuid() != 0 {
+		// A path under an unsearchable directory cannot be stat'd, and that is
+		// not the same as it not existing.
+		locked := filepath.Join(dir, "locked")
+		if err := os.Mkdir(locked, 0o700); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+
+		hidden := filepath.Join(locked, "app.pem")
+		if err := os.WriteFile(hidden, testKey(t), 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+
+		if err := os.Chmod(locked, 0o000); err != nil {
+			t.Fatalf("chmod: %v", err)
+		}
+
+		t.Cleanup(func() {
+			if err := os.Chmod(locked, 0o700); err != nil {
+				t.Errorf("restore mode: %v", err)
+			}
+		})
+
+		if got := lookupPath(hidden); got != pathUnknown {
+			t.Errorf("an unstattable path: lookupPath = %v, want pathUnknown", got)
+		}
+	}
+}
+
 // maxKeySize is a documented bound. Asserting it against itself would let a
 // production edit move the limit and the test with it.
 func TestMaxKeySizeIsPinned(t *testing.T) {

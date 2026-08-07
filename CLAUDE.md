@@ -236,8 +236,11 @@ filesystem that cannot hard-link billet reports the staged key and the operator 
   unlinks by name, the check cannot be atomic with it, and a file swapped in between the two would be
   deleted. That residual is accepted and stated rather than claimed away.
 - **"Could not tell" is never "no key here."** `inspectKey` returns present / absent / unverifiable, and
-  only *absent* permits a deletion or a "your credential is gone" message — and a stat that FAILS is
-  not a mismatch either, so identity checks answer matches / differs / unknown for the same reason. Callers use `inspectKey`
+  only *absent* permits a deletion or a "your credential is gone" message. A stat that FAILS is not a
+  mismatch either, so identity answers matches / differs / unknown and path lookups answer present /
+  absent / unknown. **Three-valued types get collapsed back at the call site if you let them** — a
+  `!= identityMatches` undid one of these a line after it was introduced, and a `fileExists` that
+  returned false on EACCES made billet recommend `mv` onto an occupied destination. Callers use `inspectKey`
   directly — the boolean wrappers were deleted, because every one of them collapsed the third state at
   exactly the call site that needed it. Note that unlink permission comes from the DIRECTORY, so an
   operator can act on a bad `rm` suggestion for a file billet could not itself read.
@@ -254,10 +257,16 @@ while the run owns a DESCRIPTOR, so the staging name is verified against the des
 and the destination is verified after it — the second catches the window the first cannot. But what
 follows a failed check is **not** "your key is gone": `writeKeyAtomically` still holds the complete PEM
 at every one of those points, so it writes the key to a fresh `O_EXCL` file and reports where it
-landed. An earlier version reasoned that an unlinked inode cannot be given a name again — true, and
-irrelevant, because the bytes never depended on that inode. Declaring a credential unrecoverable while
-it sits in a live variable is the worst mistake available here, because the advice that follows is
-"delete the App". Only a recovery write that ALSO fails is loss.
+landed — verified against the descriptor and directory-synced before that promise is made. An earlier
+version reasoned that an unlinked inode cannot be given a name again: true, and irrelevant, because the
+bytes never depended on that inode. Declaring a credential unrecoverable while it sits in a live
+variable is the worst mistake available here, because the advice that follows is "delete the App".
+
+The same reasoning applies one level down, and the first version missed it there: a recovery write that
+REPORTS an error may still have left a usable key, so the file is inspected rather than assumed empty.
+**Loss is what remains after looking, never what is inferred from a return value.** A recovery that
+fails also says only what it knows — this directory could not hold it, which is not proof that none
+could.
 
 **`billet check` proves the key WORKS**, not that it exists — regular file, no group/other permission
 bits, bounded read, and actually parsed, all from one descriptor opened `O_NONBLOCK` so a FIFO cannot
@@ -330,8 +339,10 @@ answers 404, and the case that actually needed handling is the one that is unamb
 The callback queue is deep, and a callback that does **not** fit is refused rather than dropped — a
 silent drop plus an "App created" page meant the honest redirect could be discarded while its browser
 was told it had worked. What remains is a local process being able to *delay* onboarding up to
-`ManifestTTL` — not fixable while argv is readable, and a delay rather than a lost credential only
-because injected codes are retried alongside the honest one rather than ahead of it.
+`ManifestTTL` — not fixable while argv is readable. It stays a delay rather than a lost credential only
+because injected codes are retried alongside the honest one rather than ahead of it, and because the
+retry set is BOUNDED and deduplicated: moving each ambiguous code into an unbounded set freed channel
+capacity for more, so accumulated work could starve the honest code past the deadline.
 
 **`App` is redacted on every rendering path billet can reach.** `String`/`GoString` on a **value**
 receiver (a pointer receiver is not consulted when a value is formatted), `Format` so no verb falls
