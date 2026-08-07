@@ -241,16 +241,22 @@ filesystem that cannot hard-link billet reports the staged key and the operator 
   absent / unknown. **Three-valued types get collapsed back at the call site if you let them** — a
   `!= identityMatches` undid one of these a line after it was introduced, and a `fileExists` that
   returned false on EACCES made billet recommend `mv` onto an occupied destination. Callers use `inspectKey`
-  directly — the boolean wrappers were deleted, because every one of them collapsed the third state at
+  directly — the boolean wrappers over both were deleted, because every one of them collapsed the third state at
   exactly the call site that needed it. Note that unlink permission comes from the DIRECTORY, so an
   operator can act on a bad `rm` suggestion for a file billet could not itself read.
 - **The staging name is re-inspected after `O_EXCL` fails.** The answer from before the attempt is
   stale by then: a concurrent run's empty reservation can have become a complete key in between, and
   printing "it holds no usable key" beside an exact `rm` handed the operator a command that destroys it.
-- **"Not a valid key" is not "safe to clobber."** Whether to recommend `mv` asks `fileExists`, not
+- **"Not a valid key" is not "safe to clobber."** Whether to recommend `mv` asks `lookupPath`, not
   `inspectKey` — a PEM with trailing junk, a format this build cannot parse, or a file a live writer
   has not finished are all worth keeping, and `mv` replaces. Every `mv` suggestion in this file checks
   the destination first, because the operator is following *billet's* advice.
+
+**A pathname is only spoken about once it is tied to a descriptor.** `inspectKey(name)` answers "is
+there a usable key at that name", which is NOT "this run's key is there" — conflating them let a
+replaced recovery file be reported as this App's key while the real one sat at a moved path nobody was
+told about. Identity is established first, everywhere, and an unknown identity yields uncertainty
+rather than either claim.
 
 **A credential is never declared lost while its bytes are still in memory.** `os.Link` takes a NAME
 while the run owns a DESCRIPTOR, so the staging name is verified against the descriptor before the link
@@ -340,9 +346,11 @@ The callback queue is deep, and a callback that does **not** fit is refused rath
 silent drop plus an "App created" page meant the honest redirect could be discarded while its browser
 was told it had worked. What remains is a local process being able to *delay* onboarding up to
 `ManifestTTL` — not fixable while argv is readable. It stays a delay rather than a lost credential only
-because injected codes are retried alongside the honest one rather than ahead of it, and because the
-retry set is BOUNDED and deduplicated: moving each ambiguous code into an unbounded set freed channel
-capacity for more, so accumulated work could starve the honest code past the deadline.
+because injected codes are retried alongside the honest one rather than ahead of it, and because
+**every acknowledged callback is exchanged at least once**. The bound is on what is carried into the
+NEXT round, never on admission — bounding admission was strictly worse than having no bound at all,
+since permanently-ambiguous injected codes would then displace an honest redirect the HTTP handler had
+already answered "App created".
 
 **`App` is redacted on every rendering path billet can reach.** `String`/`GoString` on a **value**
 receiver (a pointer receiver is not consulted when a value is formatted), `Format` so no verb falls

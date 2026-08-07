@@ -48,10 +48,16 @@ var ErrCredentialUncertain = errors.New("billet could not verify whether the App
 // exchange and the honest redirect would be dropped on arrival.
 const codeQueueDepth = 32
 
-// maxPendingCodes bounds the codes held for retry. GitHub sends one; the rest of
-// the room is for a local process that is injecting them, and it exists so a
-// round stays short enough that the honest code is still tried promptly.
+// maxPendingCodes bounds how many unresolved codes are carried into the NEXT
+// round. It is deliberately not a bound on admission: every code the callback
+// acknowledged is tried at least once, because dropping one that was already
+// answered "App created" is how a credential goes missing.
 const maxPendingCodes = 8
+
+// maxSeenCodes bounds the deduplication set. Deduplication is an optimisation —
+// it stops one injected code being retried repeatedly — so running out of room
+// for it costs work, never a code.
+const maxSeenCodes = 1024
 
 // maxManifestCodeLen bounds what the callback will accept as a manifest code.
 // GitHub's are short; this is generous enough to survive a format change and
@@ -326,11 +332,15 @@ func (f *onboardFlow) register(ctx context.Context) (*App, error) {
 		// Take everything queued before spending time on any of it, so a code that
 		// arrived during the last round is tried in this one.
 		//
-		// BOUNDED and deduplicated. The channel caps what is in flight, but moving
-		// each ambiguous code into an unbounded retry set freed that capacity
-		// again: a local process could accumulate work indefinitely, and every
-		// round would then make one request per accumulated code — starving the
-		// honest code through the deadline rather than merely delaying it.
+		// Every drained code is admitted. The bound applies to RETRIES, further
+		// down, and that distinction is the whole correctness of this loop.
+		//
+		// Bounding admission instead was strictly worse than not bounding it at
+		// all: eight injected codes that stay ambiguous fill the set permanently,
+		// and the honest redirect — already answered "App created" by the HTTP
+		// handler — is then dropped before it is ever tried. The unbounded version
+		// at least got to it eventually. A callback that was acknowledged must get
+		// at least one exchange attempt.
 		pending = addCodes(pending, seen, f.drainCodes())
 
 		if len(pending) == 0 {
@@ -375,6 +385,16 @@ func (f *onboardFlow) register(ctx context.Context) (*App, error) {
 			}
 		}
 
+		// The bound lands HERE, on what is carried forward, so nothing is ever
+		// refused an attempt. Codes are kept oldest-first: the honest one is
+		// likelier to be early, and an attacker gains nothing by arriving later.
+		if len(keep) > maxPendingCodes {
+			f.opts.Log("Holding the first %d unresolved registrations for retry and dropping %d.",
+				maxPendingCodes, len(keep)-maxPendingCodes)
+
+			keep = keep[:maxPendingCodes]
+		}
+
 		pending = keep
 
 		if len(pending) == 0 {
@@ -417,11 +437,18 @@ func (f *onboardFlow) register(ctx context.Context) (*App, error) {
 // code frees one.
 func addCodes(pending []string, seen map[string]bool, codes []string) []string {
 	for _, code := range codes {
-		if seen[code] || len(pending) >= maxPendingCodes {
+		if seen[code] {
 			continue
 		}
 
-		seen[code] = true
+		// seen is capped rather than allowed to grow with everything a local
+		// process submits over an hour. Past the cap, deduplication stops and the
+		// retry bound is what limits the work — the reverse trade to dropping a
+		// code, which is the one thing this must never do.
+		if len(seen) < maxSeenCodes {
+			seen[code] = true
+		}
+
 		pending = append(pending, code)
 	}
 
