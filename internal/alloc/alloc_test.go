@@ -653,6 +653,159 @@ func registerNode(t *testing.T, a *Allocator, name string, provider config.Provi
 	}
 }
 
+// Removing a node must fence the host that was running its work.
+//
+// THE hazard, and it is silent. `leases.node` is ON DELETE SET NULL, so a bare
+// `DELETE FROM nodes` blanks the column for every lease the host was running
+// while the host itself keeps executing on a still-valid epoch. Ownership here
+// is RECORDED, not proven — nothing identifies who is asking — so the removed
+// host's next write is authorized against whatever the row now says, and a lease
+// that was merely `assigned` will rebind to a new host perfectly legally. Two
+// hosts, one slot, and no error anywhere.
+//
+// Two independent fences do that, and the distinction was measured rather than
+// assumed: terminalizing the lease refuses the write on its own (a host holding
+// the new epoch gets ErrLeaseNotFound), and the epoch bump refuses it again
+// (ErrFenced on the epoch it actually holds). The first version of this test
+// asserted only that the write was refused, which still passed with the epoch
+// bump deleted — so the bump is now asserted directly.
+func TestRemovingANodeFencesTheHostStillRunningItsWork(t *testing.T) {
+	a := newAllocator(t,
+		Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB},
+		[]config.Tier{tier("small", 4, 16*config.GiB)})
+
+	ctx := t.Context()
+
+	registerNode(t, a, "epyc-1", config.ProviderFirecracker)
+
+	lease, err := a.Reserve(ctx, "small")
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	if err := a.Assign(ctx, lease.ID, lease.Epoch, 101, 11); err != nil {
+		t.Fatalf("Assign: %v", err)
+	}
+
+	if err := a.Bind(ctx, lease.ID, lease.Epoch, "epyc-1"); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	// The host is running it, and holds this epoch.
+	if err := a.Advance(ctx, lease.ID, lease.Epoch, PhaseLaunching); err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+
+	fenced, err := a.RemoveNode(ctx, "epyc-1")
+	if err != nil {
+		t.Fatalf("RemoveNode: %v", err)
+	}
+
+	if fenced != 1 {
+		t.Errorf("fenced %d leases, want 1", fenced)
+	}
+
+	// The stale host, unaware it has been removed, reports progress on the epoch
+	// it still holds. It must be refused.
+	err = a.Advance(ctx, lease.ID, lease.Epoch, PhaseOnline)
+	if !errors.Is(err, ErrFenced) && !errors.Is(err, ErrLeaseNotFound) {
+		t.Errorf("the removed host advanced its lease anyway (%v); it can keep writing to a "+
+			"slot another host may now hold", err)
+	}
+
+	// And the epoch moved, which the check above does NOT prove: a lease that was
+	// only terminalized refuses the same write for a different reason.
+	var epoch int64
+
+	if err := a.db.Reader().QueryRowContext(ctx,
+		`SELECT epoch FROM leases WHERE id = ?`, lease.ID).Scan(&epoch); err != nil {
+		t.Fatalf("read lease epoch: %v", err)
+	}
+
+	if epoch <= lease.Epoch {
+		t.Errorf("the lease epoch is still %d; removing a host must fence its leases as well "+
+			"as terminalize them, so a returning host stays refused even if the phase check "+
+			"is ever relaxed", epoch)
+	}
+
+	// And the capacity came back rather than being stranded until the TTL.
+	usage, err := a.Usage(ctx)
+	if err != nil {
+		t.Fatalf("Usage: %v", err)
+	}
+
+	if usage.Leases != 0 {
+		t.Errorf("%d leases still open after their host was removed", usage.Leases)
+	}
+}
+
+// A lease PINNED to a removed node is fenced too.
+//
+// It is not running anywhere, so it is not the safety hazard above — it is a
+// liveness one. The host it is pinned to no longer exists, so it can never be
+// placed, and left alone it would hold its capacity until the reaper's TTL.
+func TestRemovingANodeFencesLeasesPinnedToIt(t *testing.T) {
+	a := newAllocator(t,
+		Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB},
+		[]config.Tier{{
+			Label: "mac", Provider: config.ProviderTart, GuestOS: config.GuestMacOS,
+			Node: "mac-mini-1", VCPU: 4, Memory: 16 * config.GiB, Image: "macos-26",
+		}})
+
+	ctx := t.Context()
+
+	registerNode(t, a, "mac-mini-1", config.ProviderTart)
+
+	if _, err := a.Reserve(ctx, "mac"); err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	fenced, err := a.RemoveNode(ctx, "mac-mini-1")
+	if err != nil {
+		t.Fatalf("RemoveNode: %v", err)
+	}
+
+	if fenced != 1 {
+		t.Errorf("fenced %d leases, want 1; a lease pinned to a removed host can never be "+
+			"placed and would hold its capacity until the reaper", fenced)
+	}
+}
+
+// Removing a node nobody registered is a typo worth hearing about.
+func TestRemovingAnUnknownNodeIsAnError(t *testing.T) {
+	a := newAllocator(t,
+		Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB},
+		[]config.Tier{tier("small", 4, 16*config.GiB)})
+
+	if _, err := a.RemoveNode(t.Context(), "never-registered"); !errors.Is(err, ErrNodeNotFound) {
+		t.Errorf("RemoveNode on an unknown host returned %v, want ErrNodeNotFound", err)
+	}
+}
+
+// A drained host with nothing left on it removes cleanly.
+func TestRemovingAnIdleNodeFencesNothing(t *testing.T) {
+	a := newAllocator(t,
+		Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB},
+		[]config.Tier{tier("small", 4, 16*config.GiB)})
+
+	ctx := t.Context()
+
+	registerNode(t, a, "epyc-1", config.ProviderFirecracker)
+
+	fenced, err := a.RemoveNode(ctx, "epyc-1")
+	if err != nil {
+		t.Fatalf("RemoveNode: %v", err)
+	}
+
+	if fenced != 0 {
+		t.Errorf("fenced %d leases on an idle host", fenced)
+	}
+
+	if _, err := a.RemoveNode(ctx, "epyc-1"); !errors.Is(err, ErrNodeNotFound) {
+		t.Errorf("the node survived its own removal: %v", err)
+	}
+}
+
 // A retry that contradicts what was recorded is a conflict, not a success:
 // returning nil while keeping the original assignment leaves the caller
 // believing a job is scheduled that nothing will ever run.
