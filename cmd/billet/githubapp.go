@@ -716,9 +716,16 @@ func recoverKeyAttempt(dir, destination string, pem []byte, cause error, attempt
 		// in memory — the same fact that started this function — so try again
 		// rather than returning uncertainty about a key that is about to vanish.
 		if attempt >= maxRecoveryAttempts {
-			return uncertainAt(name, destination, fmt.Errorf(
-				"%w\nEvery recovery file billet wrote was moved or replaced before it could be "+
-					"confirmed. Look for a recently written PEM private key in %s", cause, dir))
+			// NOT uncertainAt(name, ...): `name` has just been PROVEN not to be
+			// this descriptor's file, and uncertainAt would attribute it anyway —
+			// naming it as somewhere to look, and potentially offering to link it
+			// into place. The directory is all billet can honestly point at.
+			return fmt.Errorf(
+				"%w: %w\nEvery recovery file billet wrote was moved or replaced before it could be "+
+					"confirmed, so it cannot say where this App's key is. Do NOT delete the App: look "+
+					"for a recently written PEM private key in %s, and check anything already at %s "+
+					"before replacing it",
+				github.ErrCredentialUncertain, cause, dir, destination)
 		}
 
 		return recoverKeyAttempt(dir, destination, pem, cause, attempt+1)

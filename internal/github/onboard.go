@@ -352,7 +352,7 @@ func (f *onboardFlow) register(ctx context.Context) (*App, error) {
 			case err := <-f.errCh:
 				return nil, err
 			case <-ctx.Done():
-				return nil, f.registrationTimeout(ctx, lastRejection)
+				return nil, f.registrationTimeout(ctx, errors.Join(fatal, lastRejection))
 			}
 
 			continue
@@ -415,11 +415,16 @@ func (f *onboardFlow) register(ctx context.Context) (*App, error) {
 			}
 		}
 
-		pending = keep
+		// Drained BEFORE the fatal check, not after. A callback can be accepted
+		// while this round's requests are in flight, and returning without looking
+		// closes the listener on a code the handler already answered "App
+		// created" — which is the same abandonment this fatal-deferral exists to
+		// prevent, one step further out.
+		pending = addCodes(keep, seen, f.drainCodes())
 
 		if len(pending) == 0 {
-			// Nothing left to retry. A request that could not be completed is
-			// terminal once there is nothing else to try.
+			// Nothing left to retry, and nothing arrived while trying. A request
+			// that could not be completed is terminal once there is nothing else.
 			if fatal != nil {
 				return nil, fatal
 			}
@@ -469,8 +474,8 @@ func addCodes(pending []string, seen map[string]bool, codes []string) []string {
 
 		// seen is capped rather than allowed to grow with everything a local
 		// process submits over an hour. Past the cap, deduplication stops and the
-		// retry bound is what limits the work — the reverse trade to dropping a
-		// code, which is the one thing this must never do.
+		// per-round work bound is what limits the cost — the reverse trade to
+		// dropping a code, which is the one thing this must never do.
 		if len(seen) < maxSeenCodes {
 			seen[code] = true
 		}
