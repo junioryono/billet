@@ -1048,9 +1048,9 @@ func TestTheHonestCodeIsTriedEvenBehindAFullRetrySet(t *testing.T) {
 				return errors.New("could not read the state from the start page")
 			}
 
-			// Comfortably more than maxPendingCodes, all of them permanently
+			// Comfortably more than one round of attempts, all permanently
 			// ambiguous, all queued BEFORE the honest redirect.
-			for i := range maxPendingCodes * 2 {
+			for i := range maxAttemptsPerRound * 2 {
 				forged := fmt.Sprintf("%s/callback?code=injected-%d&state=%s",
 					strings.TrimSuffix(target, "/"), i, state)
 

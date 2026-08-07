@@ -287,11 +287,13 @@ func stagedKeyFoundError(path, staged string) error {
 			staged, path)
 	}
 
+	// ln rather than mv, and for the same reason as above: this text is composed
+	// now and typed later, and mv replaces whatever arrived in between.
 	return fmt.Errorf(
 		"%s holds an App private key from an interrupted run — do NOT delete it, and do not create "+
-			"another App. GitHub cannot re-issue this key. Move it into place and check it:\n"+
-			"    mv %s %s\n    billet check",
-		staged, staged, path)
+			"another App. GitHub cannot re-issue this key. Put it in place with a command that "+
+			"refuses to overwrite, then check it:\n    ln %s %s && rm %s\n    billet check",
+		staged, staged, path, staged)
 }
 
 // writeKeyAtomically installs the key GitHub has just issued.
@@ -557,10 +559,18 @@ func writeKeyAtomically(reserved *os.File, path string, pem []byte, onInstalled 
 		// the destination is not billet's to remove — but STAGING usually still
 		// holds this run's key, and writing a third copy while naming only the
 		// newest is worse than pointing at the one that is already there.
-		if verifyInstalled(reserved, staging) == identityMatches {
+		switch verifyInstalled(reserved, staging) {
+		case identityMatches:
 			return preservedAt(staging, fmt.Errorf(
 				"%s was linked, but it is not the file this run wrote — something replaced the staging "+
 					"name mid-install. %s is not billet's to remove", path, path))
+		case identityUnknown:
+			// Staging may well still hold the key; writing another copy would
+			// scatter one and then report only the new one.
+			return uncertainAt(staging, path, fmt.Errorf(
+				"%s was linked, but it is not the file this run wrote, and billet could not confirm "+
+					"what %s is", path, staging))
+		case identityDiffers:
 		}
 
 		// Staging is gone too, and the key is still in memory.
@@ -568,6 +578,14 @@ func writeKeyAtomically(reserved *os.File, path string, pem []byte, onInstalled 
 			"%s was linked, but it is not the file this run wrote — the staging name was replaced "+
 				"mid-install", path))
 	case identityUnknown:
+		// If staging is still provably this run's file, SAY so — that is more than
+		// "billet could not tell", and it is where the operator should look.
+		if verifyInstalled(reserved, staging) == identityMatches {
+			return uncertainAt(staging, path, fmt.Errorf(
+				"%s was linked, but billet could not confirm it is the file this run wrote; the key is "+
+					"also at %s", path, staging))
+		}
+
 		return uncertainAt(path, path, fmt.Errorf(
 			"%s was linked, but billet could not confirm it is the file this run wrote", path))
 	}
@@ -640,6 +658,15 @@ func verifyInstalled(reserved *os.File, path string) identity {
 // so the file is inspected rather than assumed empty. Loss is what remains after
 // looking, never what is inferred from a return value.
 func recoverKey(dir, destination string, pem []byte, cause error) error {
+	return recoverKeyAttempt(dir, destination, pem, cause, 1)
+}
+
+// maxRecoveryAttempts bounds retrying against a directory something else keeps
+// disturbing. Each attempt writes one file, so this is also a bound on how many
+// copies of the key a hostile directory can be made to scatter.
+const maxRecoveryAttempts = 3
+
+func recoverKeyAttempt(dir, destination string, pem []byte, cause error, attempt int) error {
 	f, err := os.CreateTemp(dir, ".billet-key-recovered-*")
 	if err != nil {
 		// This directory failed; that is not proof no directory would work. Say
@@ -670,11 +697,27 @@ func recoverKey(dir, destination string, pem []byte, cause error) error {
 	// a replaced recovery file be reported as this App's key while the real one
 	// sat at a moved path nobody was told about. The pathname is only attributed
 	// to this descriptor when they are known to be the same file.
-	if held != identityMatches {
+	switch held {
+	case identityMatches:
+	case identityUnknown:
+		// Not knowing is not grounds for writing yet another copy, and not grounds
+		// for a promise either.
 		return uncertainAt(name, destination, fmt.Errorf(
-			"%w\nThe key was written to a recovery file, but %s can no longer be tied to it (write: %w). "+
-				"Look for a recently written PEM private key in %s before doing anything else",
+			"%w\nThe key was written to a recovery file, but %s could not be confirmed to be it "+
+				"(write: %w). Look for a recently written PEM private key in %s before doing anything else",
 			cause, name, writeErr, dir))
+	case identityDiffers:
+		// PROVEN mismatch: this name is not the file that was written, so closing
+		// the descriptor is about to destroy an unlinked inode. The PEM is still
+		// in memory — the same fact that started this function — so try again
+		// rather than returning uncertainty about a key that is about to vanish.
+		if attempt >= maxRecoveryAttempts {
+			return uncertainAt(name, destination, fmt.Errorf(
+				"%w\nEvery recovery file billet wrote was moved or replaced before it could be "+
+					"confirmed. Look for a recently written PEM private key in %s", cause, dir))
+		}
+
+		return recoverKeyAttempt(dir, destination, pem, cause, attempt+1)
 	}
 
 	if writeErr == nil {
@@ -778,7 +821,13 @@ func uncertainAt(where, destination string, err error) error {
 			"each file belongs to first", destination)
 
 	if where != destination && lookupPath(destination) == pathAbsent {
-		move = fmt.Sprintf("if it holds a PEM private key, move it to %s and run `billet check`", destination)
+		// ln, not mv. The destination is checked when this text is COMPOSED and
+		// executed by a human some time later, so a plain mv can replace a key
+		// another run installed in between. ln refuses when the destination
+		// exists — the same no-clobber primitive billet installs with.
+		move = fmt.Sprintf(
+			"if it holds a PEM private key, put it in place with a command that refuses to "+
+				"overwrite:\n    ln %s %s && rm %s\n    billet check", where, destination, where)
 	}
 
 	return fmt.Errorf(

@@ -48,11 +48,13 @@ var ErrCredentialUncertain = errors.New("billet could not verify whether the App
 // exchange and the honest redirect would be dropped on arrival.
 const codeQueueDepth = 32
 
-// maxPendingCodes bounds how many unresolved codes are carried into the NEXT
-// round. It is deliberately not a bound on admission: every code the callback
-// acknowledged is tried at least once, because dropping one that was already
-// answered "App created" is how a credential goes missing.
-const maxPendingCodes = 8
+// maxAttemptsPerRound bounds the WORK a round does, not how many codes are kept.
+//
+// Nothing is ever discarded — codes not reached rotate to the front of the next
+// round. That is the only safe shape: billet cannot distinguish an injected code
+// from an honest one, so any cap on how many are RETAINED eventually throws away
+// a credential, which is what both previous versions did.
+const maxAttemptsPerRound = 8
 
 // maxSeenCodes bounds the deduplication set. Deduplication is an optimisation —
 // it stops one injected code being retried repeatedly — so running out of room
@@ -326,7 +328,7 @@ func (f *onboardFlow) register(ctx context.Context) (*App, error) {
 	seen := make(map[string]bool)
 	backoff := initialExchangeBackoff
 
-	var lastRejection error
+	var lastRejection, fatal error
 
 	for {
 		// Take everything queued before spending time on any of it, so a code that
@@ -358,9 +360,31 @@ func (f *onboardFlow) register(ctx context.Context) (*App, error) {
 
 		f.opts.Log("Exchanging %d registration(s) for credentials...", len(pending))
 
-		keep := pending[:0]
+		// At most maxAttemptsPerRound exchanges happen per round, and the codes not
+		// reached ROTATE to the front of the next one. Nothing is discarded.
+		//
+		// Both earlier versions dropped a code, and dropping is the one thing this
+		// loop must never do: bounding admission discarded an honest redirect the
+		// handler had already answered "App created", and bounding retention
+		// discarded it one ambiguous response later. There is no cap that is safe,
+		// because billet cannot tell an injected code from an honest one — only
+		// GitHub can, and only 404 is it saying so. So the bound is on WORK per
+		// round, which delays an attack without ever throwing away a credential.
+		attempts := 0
 
-		for _, code := range pending {
+		var keep []string
+
+		for i, code := range pending {
+			if attempts >= maxAttemptsPerRound {
+				// Everything not reached goes to the FRONT next time, so a long
+				// queue cannot starve its tail.
+				keep = append(pending[i:], keep...)
+
+				break
+			}
+
+			attempts++
+
 			app, err := convertManifestAt(ctx, f.opts.Client, f.opts.api(), code)
 			if err == nil {
 				return f.persist(app)
@@ -379,25 +403,27 @@ func (f *onboardFlow) register(ctx context.Context) (*App, error) {
 				lastRejection = err
 				keep = append(keep, code)
 			default:
-				// A request that could not be completed at all — no answer to
-				// interpret, and no second redirect coming to fix it.
-				return nil, err
+				// A request that could not be completed at all. It is NOT returned
+				// straight away: an honest code already acknowledged may be sitting
+				// behind this one, and returning here closes the listener with that
+				// code unredeemed. Remembered, and reported only if nothing else
+				// resolves.
+				lastRejection = err
+				fatal = err
+
+				f.opts.Log("A registration could not be exchanged at all (%v).", err)
 			}
-		}
-
-		// The bound lands HERE, on what is carried forward, so nothing is ever
-		// refused an attempt. Codes are kept oldest-first: the honest one is
-		// likelier to be early, and an attacker gains nothing by arriving later.
-		if len(keep) > maxPendingCodes {
-			f.opts.Log("Holding the first %d unresolved registrations for retry and dropping %d.",
-				maxPendingCodes, len(keep)-maxPendingCodes)
-
-			keep = keep[:maxPendingCodes]
 		}
 
 		pending = keep
 
 		if len(pending) == 0 {
+			// Nothing left to retry. A request that could not be completed is
+			// terminal once there is nothing else to try.
+			if fatal != nil {
+				return nil, fatal
+			}
+
 			continue
 		}
 
