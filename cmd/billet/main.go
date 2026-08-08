@@ -673,8 +673,39 @@ func cmdCheck(ctx context.Context, args []string) error {
 			backends = append(backends, string(kind))
 		}
 
-		fmt.Printf("  %-34s %2d vCPU  %8s  %s/%s%s\n",
-			t.Label, t.VCPU, t.Memory, strings.Join(backends, ","), t.GuestOS, intercept)
+		reserved := ""
+		if t.Reserved > 0 {
+			reserved = fmt.Sprintf("  reserved:%d", t.Reserved)
+		}
+
+		fmt.Printf("  %-34s %2d vCPU  %8s  %s/%s%s%s\n",
+			t.Label, t.VCPU, t.Memory, strings.Join(backends, ","), t.GuestOS,
+			reserved, intercept)
+	}
+
+	// HOW MUCH OF THE MACHINE IS SPOKEN FOR, shown whenever anything is reserved.
+	//
+	// A reservation is held back for as long as it is UNMET, which for a tier
+	// that gets no work is forever — so an operator can quietly make their
+	// machine smaller with no error and no log line, because from billet's point
+	// of view nothing is wrong. This is the one place they look to confirm what
+	// they configured, so the total belongs here rather than in a comment they
+	// have already read.
+	var (
+		reservedVCPU   int
+		reservedMemory config.ByteSize
+	)
+
+	for i := range cfg.Tiers {
+		reservedVCPU += cfg.Tiers[i].ReservedVCPU()
+		reservedMemory += cfg.Tiers[i].ReservedMemory()
+	}
+
+	if reservedVCPU > 0 && cfg.Server != nil && cfg.Server.MaxVCPU > 0 {
+		fmt.Printf("reserved %d of %d vCPU (%d%%) and %s of %s, held back from other tiers "+
+			"whether or not they are used\n",
+			reservedVCPU, cfg.Server.MaxVCPU, reservedVCPU*100/cfg.Server.MaxVCPU,
+			reservedMemory, cfg.Server.MaxMemory)
 	}
 	return nil
 }

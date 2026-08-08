@@ -399,3 +399,60 @@ func TestAnOverflowingNeighbourCannotInflateHeadroom(t *testing.T) {
 		t.Fatal("built an allocator carrying a wrapped reservation")
 	}
 }
+
+// macOS floors are checked against the HOST'S LICENCE CAP, not just vCPU.
+//
+// A Mac permits a fixed number of concurrent macOS guests, per host, across
+// every tier that targets it — so two macOS tiers on one Mac can be individually
+// legal and jointly unfillable. A floor there is worse than merely unmet: it
+// holds vCPU and memory back from every other tier while the reservation can
+// never be filled, because the constraint blocking it is not the one being
+// reserved against.
+//
+// config.Load rejects this from the other direction by capping combined
+// max_concurrent; alloc.New is exported and documented as unable to assume its
+// catalogue came through Load.
+func TestMacOSFloorsBeyondTheHostLicenceAreRefused(t *testing.T) {
+	t.Parallel()
+
+	mac := func(label string, reserved int) config.Tier {
+		return config.Tier{
+			Label: label, Provider: config.ProviderTart, GuestOS: config.GuestMacOS,
+			Node: "mac-mini-1", VCPU: 6, Memory: 16 * config.GiB,
+			Reserved: reserved, MaxConcurrent: reserved,
+		}
+	}
+
+	db := openState(t)
+
+	// Two macOS tiers on one Mac reserving two guests each: four, against a
+	// licence that permits two.
+	_, err := New(db, Limits{MaxVCPU: 256, MaxMemory: 512 * config.GiB},
+		[]config.Tier{mac("billet-6vcpu-macos-a", 2), mac("billet-6vcpu-macos-b", 2)})
+	if err == nil {
+		t.Fatal("accepted macOS reservations beyond the host's licence; the surplus could " +
+			"never be filled and would hold capacity back from every other tier")
+	}
+
+	if !strings.Contains(err.Error(), "mac-mini-1") {
+		t.Errorf("the error does not name the host: %v", err)
+	}
+}
+
+// Within the licence, macOS floors are fine.
+func TestMacOSFloorsWithinTheLicenceAreAccepted(t *testing.T) {
+	t.Parallel()
+
+	tier := config.Tier{
+		Label: "billet-6vcpu-macos", Provider: config.ProviderTart, GuestOS: config.GuestMacOS,
+		Node: "mac-mini-1", VCPU: 6, Memory: 16 * config.GiB,
+		Reserved: 2, MaxConcurrent: 2,
+	}
+
+	db := openState(t)
+
+	if _, err := New(db, Limits{MaxVCPU: 256, MaxMemory: 512 * config.GiB},
+		[]config.Tier{tier}); err != nil {
+		t.Fatalf("refused a macOS reservation the licence permits: %v", err)
+	}
+}

@@ -422,6 +422,22 @@ func New(db *state.DB, limits Limits, tiers []config.Tier, opts ...Option) (*All
 		return nil, err
 	}
 
+	// AND THE macOS DIMENSION, which vCPU and memory do not cover.
+	//
+	// A Mac caps concurrent macOS guests by licence, per HOST, across every tier
+	// that targets it — so two macOS tiers on one Mac can be individually legal
+	// and jointly unfillable. A floor there is worse than merely unmet: it holds
+	// vCPU and memory back from every other tier while the reservation can never
+	// be filled, because the constraint that blocks it is not the one being
+	// reserved against.
+	//
+	// config.Load rejects this from the other direction, by capping combined
+	// max_concurrent. This constructor is exported and documented as unable to
+	// assume its catalogue came through Load.
+	if err := a.checkMacOSFloors(); err != nil {
+		return nil, err
+	}
+
 	for _, opt := range opts {
 		opt(a)
 	}
@@ -1512,6 +1528,41 @@ func (a *Allocator) LaunchedLeaseIDs(ctx context.Context, node string) (map[stri
 	}
 
 	return open, nil
+}
+
+// checkMacOSFloors reports macOS reservations a host's licence cap can never
+// satisfy.
+func (a *Allocator) checkMacOSFloors() error {
+	reservedByNode := make(map[string]int)
+
+	labels := make([]string, 0, len(a.tiers))
+	for label := range a.tiers {
+		labels = append(labels, label)
+	}
+
+	sort.Strings(labels)
+
+	for _, label := range labels {
+		t := a.tiers[label]
+
+		if t.GuestOS != config.GuestMacOS || t.Reserved == 0 {
+			continue
+		}
+
+		// A macOS tier is required to name a node, checked above, so this is
+		// always a real host.
+		reservedByNode[t.Node] += t.Reserved
+
+		if limit := a.macOSLimit(t.Node); reservedByNode[t.Node] > limit {
+			return fmt.Errorf(
+				"alloc: macOS tiers on node %q reserve %d guests between them but the host "+
+					"permits %d; the surplus could never be filled and would hold vCPU and "+
+					"memory back from every other tier for as long as billet runs",
+				t.Node, reservedByNode[t.Node], limit)
+		}
+	}
+
+	return nil
 }
 
 // checkFloorsFit reports whether every tier's reservation can be honoured at
