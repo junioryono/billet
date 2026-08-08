@@ -113,27 +113,33 @@ func LockDeployment(id string, opts LockOptions) (*DeploymentLock, error) {
 		return unplaceable(opts, fmt.Sprintf("cannot create %s (%v)", dir, err))
 	}
 
-	// RESOLVED ONCE, THEN HELD. MkdirAll, a stat, a chmod and an open are four
-	// independent pathname resolutions, and between any two of them the directory
-	// can be replaced — so the thing that was checked need not be the thing that
-	// is used. os.Root resolves the path a single time into a descriptor and
-	// performs everything else relative to it, which collapses those windows into
-	// one and confines the lock file to the directory that was actually
-	// validated.
+	// RESOLVED ONCE, THEN HELD — and this is the second attempt at that sentence
+	// being true. MkdirAll, a stat, a chmod and an open are four independent
+	// pathname resolutions, and between any two of them the directory can be
+	// replaced, so the thing checked need not be the thing used. The first fix
+	// used os.Root, which was only most of the way there: it still needed a
+	// separate os.Lstat to ask whether the name was a symlink, and that second
+	// resolution could describe a different directory than the one the handle
+	// held.
+	//
+	// O_DIRECTORY|O_NOFOLLOW answers both at once. The name is walked a single
+	// time, a symlinked final component is refused by the kernel rather than
+	// diagnosed afterwards, and the descriptor keeps referring to that inode
+	// however the name is rearranged later.
 	//
 	// What it does NOT cover is an untrusted-writable ANCESTOR, because MkdirAll
 	// above still walks the path by name. That is a real residual and it is
 	// recorded rather than implied away.
-	root, err := os.OpenRoot(dir)
+	dirf, err := openLockDir(dir)
 	if err != nil {
 		return unplaceable(opts, fmt.Sprintf("cannot open %s (%v)", dir, err))
 	}
 
 	// Closed once the lock file is open: the flock lives on the FILE's
 	// descriptor, so the directory handle has no further job.
-	defer func() { _ = root.Close() }()
+	defer func() { _ = dirf.Close() }()
 
-	shared, gid, err := checkLockDir(root, dir, operatorChose)
+	shared, gid, err := checkLockDir(dirf, dir, operatorChose)
 	if err != nil {
 		return unplaceable(opts, err.Error())
 	}
@@ -141,7 +147,7 @@ func LockDeployment(id string, opts LockOptions) (*DeploymentLock, error) {
 	name := "deployment-" + id + ".lock"
 	path := filepath.Join(dir, name)
 
-	lock, err := lockFileIn(root, name, path, shared, gid)
+	lock, err := lockFileIn(dirf, name, path, shared, gid)
 	if err != nil {
 		if errors.Is(err, ErrLocked) {
 			return nil, fmt.Errorf(
@@ -218,34 +224,25 @@ func (d *DeploymentLock) Degraded() string {
 // unopenable by the operator it was widened for. Group-writable proves that
 // somebody intended sharing; setgid is what determines WHO. So the directory's
 // gid is returned and the lock file is required to match it.
-func checkLockDir(root *os.Root, dir string, operatorChose bool) (bool, int, error) {
-	// Through the held descriptor: "." is the directory that was resolved, not
-	// whatever the name refers to by the time this runs.
-	info, err := root.Stat(".")
+func checkLockDir(dirf *os.File, dir string, operatorChose bool) (bool, fileGroup, error) {
+	// ONE observation, of the descriptor. There is no second Lstat asking whether
+	// the name is a symlink, because O_DIRECTORY|O_NOFOLLOW already refused that
+	// at open time — and a separate resolution could have described a different
+	// directory than this handle refers to, which is what made the previous
+	// version's "resolved once" claim only nearly true.
+	info, err := dirf.Stat()
 	if err != nil {
-		return false, -1, fmt.Errorf("cannot inspect %s (%w)", dir, err)
-	}
-
-	// The symlink question is asked of the NAME, since a descriptor has already
-	// resolved past it. Lstat, not Stat: following it would answer a question
-	// about the target rather than about the redirection.
-	linkInfo, err := os.Lstat(dir)
-	if err != nil {
-		return false, -1, fmt.Errorf("cannot inspect %s (%w)", dir, err)
-	}
-
-	if linkInfo.Mode()&os.ModeSymlink != 0 {
-		return false, -1, fmt.Errorf("%s is a symlink, so what it locks can be redirected", dir)
+		return false, fileGroup{}, fmt.Errorf("cannot inspect %s (%w)", dir, err)
 	}
 
 	if !info.IsDir() {
-		return false, -1, fmt.Errorf("%s is not a directory", dir)
+		return false, fileGroup{}, fmt.Errorf("%s is not a directory", dir)
 	}
 
 	perm := info.Mode().Perm()
 
 	if perm&0o002 != 0 {
-		return false, -1, fmt.Errorf(
+		return false, fileGroup{}, fmt.Errorf(
 			"%s is world-writable (%o), so any local user could hold the lock file and keep "+
 				"billet from starting", dir, perm)
 	}
@@ -254,7 +251,7 @@ func checkLockDir(root *os.Root, dir string, operatorChose bool) (bool, int, err
 
 	if !operatorChose {
 		if perm&0o020 == 0 {
-			return false, -1, nil
+			return false, fileGroup{}, nil
 		}
 
 		// SETGID MEANS SOMEONE SHARED THIS ON PURPOSE, so tightening it would be
@@ -262,7 +259,7 @@ func checkLockDir(root *os.Root, dir string, operatorChose bool) (bool, int, err
 		// bit and locking out the other account, on no evidence beyond this
 		// invocation happening to omit lock_dir. Refuse and say what to do.
 		if setgid {
-			return false, -1, fmt.Errorf(
+			return false, fileGroup{}, fmt.Errorf(
 				"%s is a setgid group-shared directory (%o) but this billet did not ask for a "+
 					"shared one; set server.lock_dir to it explicitly if the sharing is intended, "+
 					"or point server.lock_dir somewhere private", dir, info.Mode().Perm())
@@ -271,28 +268,34 @@ func checkLockDir(root *os.Root, dir string, operatorChose bool) (bool, int, err
 		// Tightened rather than refused: billet picked this path, nobody declared
 		// it shared, and state.Open sets the precedent one screen up. Through the
 		// descriptor, so it cannot land on something swapped in since the stat.
-		if err := root.Chmod(".", 0o700); err != nil {
-			return false, -1, fmt.Errorf("cannot tighten %s from %o (%w)", dir, perm, err)
+		if err := dirf.Chmod(0o700); err != nil {
+			return false, fileGroup{}, fmt.Errorf("cannot tighten %s from %o (%w)", dir, perm, err)
 		}
 
-		return false, -1, nil
+		return false, fileGroup{}, nil
 	}
 
 	if perm&0o020 == 0 {
-		return false, -1, nil
+		return false, fileGroup{}, nil
 	}
 
+	// BOTH WAYS OUT ARE NAMED, because only one of them was and it was the wrong
+	// one for the commonest case. A single-user operator who pointed lock_dir at
+	// their own 0770 directory is not sharing with anybody; telling them only to
+	// `chmod g+s` sends them to set up a cross-account arrangement they do not
+	// want, when dropping group write is the answer.
 	if !setgid {
-		return false, -1, fmt.Errorf(
+		return false, fileGroup{}, fmt.Errorf(
 			"%s is group-writable (%o) but not setgid, so a lock file created there takes its "+
 				"creator's primary group rather than the directory's: an account sharing this "+
 				"directory through a supplemental group would produce a lock the other account "+
-				"still cannot open. Run: chmod g+s %s", dir, perm, dir)
+				"still cannot open. If two accounts really do share this directory, run "+
+				"`chmod g+s %s`; if it is only this one, run `chmod g-w %s`", dir, perm, dir, dir)
 	}
 
 	gid, err := dirGID(info)
 	if err != nil {
-		return false, -1, fmt.Errorf("cannot read the group of %s (%w)", dir, err)
+		return false, fileGroup{}, fmt.Errorf("cannot read the group of %s (%w)", dir, err)
 	}
 
 	return true, gid, nil

@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 // dirLock is an exclusive advisory lock on the state directory, held for the
@@ -64,22 +66,42 @@ func lockFile(path string, shared bool) (*dirLock, error) {
 
 	// Never shared: this path is the state directory's own lock, which is private
 	// by construction, so there is no group to match against.
-	return flockOwned(f, path, shared, -1)
+	return flockOwned(f, path, shared, fileGroup{})
 }
 
-// lockFileIn is the same thing relative to an already-resolved directory.
+// openLockDir opens a lock directory as a descriptor, refusing a symlink.
 //
-// Relative to a HELD DESCRIPTOR, so the directory that was validated is the
-// directory the lock lands in — separate resolutions of the same name can refer
-// to different inodes, and everything between the check and the open is a window
-// for exactly that.
-func lockFileIn(root *os.Root, name, path string, shared bool, gid int) (*dirLock, error) {
-	f, err := root.OpenFile(name, os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, lockFileMode(shared))
+// O_DIRECTORY|O_NOFOLLOW is the single resolution everything else hangs off:
+// the name is walked once, a symlinked final component is refused outright
+// rather than diagnosed afterwards, and the returned descriptor keeps referring
+// to THAT inode however the name is rearranged later.
+func openLockDir(dir string) (*os.File, error) {
+	return os.OpenFile(dir, os.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
+}
+
+// lockFileIn takes the lock relative to an already-resolved directory.
+//
+// openat, NOT os.Root — and this is the second time a no-follow claim here has
+// been wrong, so it is worth stating why. os.Root confines a path to its tree
+// but FOLLOWS symlinks that stay inside it, and its Unix implementation applies
+// its own O_NOFOLLOW internally, inspects the link on ELOOP and then follows it;
+// a caller's syscall.O_NOFOLLOW is indistinguishable from that and is ignored.
+// Measured, not read: a relative `link.lock -> real.lock` inside the directory
+// was opened and turned out to be the same file as its target. So a lock file
+// could be redirected onto another inode within the very directory billet had
+// just validated. unix.Openat honours the flag because the kernel does.
+func lockFileIn(dirf *os.File, name, path string, shared bool, gid fileGroup) (*dirLock, error) {
+	fd, err := unix.Openat(
+		int(dirf.Fd()),
+		name,
+		unix.O_CREAT|unix.O_RDWR|unix.O_NOFOLLOW|unix.O_CLOEXEC,
+		uint32(lockFileMode(shared)),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("open lock file %s: %w", path, err)
 	}
 
-	return flockOwned(f, path, shared, gid)
+	return flockOwned(os.NewFile(uintptr(fd), path), path, shared, gid)
 }
 
 // lockFileMode is the mode a NEW lock file is created with. The umask takes bits
@@ -92,18 +114,14 @@ func lockFileMode(shared bool) os.FileMode {
 	return 0o600
 }
 
-func flockOwned(f *os.File, path string, shared bool, gid int) (*dirLock, error) {
-	// THE UMASK SILENTLY REMOVES WHAT THE MODE ASKED FOR. A typical 022 turns
-	// 0660 into 0640, and 0640 cannot be opened O_RDWR by the other account — so
-	// the shared case would fail exactly as it did before, with the fix in place
-	// and looking applied. Corrected explicitly rather than trusted.
-	if shared {
-		if err := ensureGroupAccess(f, path, gid); err != nil {
-			_ = f.Close()
-
-			return nil, err
-		}
-	}
+func flockOwned(f *os.File, path string, shared bool, gid fileGroup) (*dirLock, error) {
+	// THE LOCK COMES FIRST, and the ordering is a correctness fix rather than
+	// tidiness. Metadata was validated before flocking, and a group mismatch told
+	// the operator to remove a "stale" lock file — advice given without ever
+	// discovering whether another process was holding it. An administrator who
+	// re-groups the directory while a billet is running would have been told to
+	// delete a live lock, after which the newcomer creates a fresh inode and both
+	// run. Nothing may be called stale until this succeeds.
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		_ = f.Close()
 		if errors.Is(err, syscall.EWOULDBLOCK) {
@@ -111,6 +129,28 @@ func flockOwned(f *os.File, path string, shared bool, gid int) (*dirLock, error)
 		}
 		return nil, fmt.Errorf("lock %s: %w", path, err)
 	}
+
+	// THE UMASK SILENTLY REMOVES WHAT THE MODE ASKED FOR. A typical 022 turns
+	// 0660 into 0640, and 0640 cannot be opened O_RDWR by the other account — so
+	// the shared case would fail exactly as it did before, with the fix in place
+	// and looking applied. Corrected explicitly rather than trusted.
+	if shared {
+		if err := ensureGroupAccess(f, path, gid); err != nil {
+			// Unlocked explicitly rather than left to the close, so a caller that
+			// retries is not racing this descriptor's teardown for the lock it just
+			// gave up. A failure here changes nothing the caller can act on — the
+			// close below drops the flock regardless — so it rides along with the
+			// error that actually matters.
+			if unlockErr := syscall.Flock(int(f.Fd()), syscall.LOCK_UN); unlockErr != nil {
+				err = errors.Join(err, unlockErr)
+			}
+
+			_ = f.Close()
+
+			return nil, err
+		}
+	}
+
 	return &dirLock{f: f}, nil
 }
 
@@ -129,18 +169,32 @@ func flockOwned(f *os.File, path string, shared bool, gid int) (*dirLock, error)
 // other-owned 0600 or 0640 file fails at the open. The earlier comment claimed
 // otherwise, which made a hole look handled — it fails closed, but it fails, and
 // the caller says how to fix it rather than pretending it recovered.
-func ensureGroupAccess(f *os.File, path string, gid int) error {
+//
+// Runs AFTER the flock, so anything it calls leftover really is unheld.
+func ensureGroupAccess(f *os.File, path string, gid fileGroup) error {
 	info, err := f.Stat()
 	if err != nil {
 		return fmt.Errorf("inspect lock file %s: %w", path, err)
 	}
 
-	if fileGID(info) != gid {
+	got, ok := fileGID(info)
+	if !ok {
 		return fmt.Errorf(
-			"lock file %s belongs to group %d, but the shared directory is group %d: the other "+
-				"account sharing that directory would not be able to open it. Make the directory "+
-				"setgid (chmod g+s) and remove the stale lock file so it is recreated",
-			path, fileGID(info), gid)
+			"the filesystem does not report a group owner for %s, so billet cannot tell whether "+
+				"the other account sharing this directory could open it", path)
+	}
+
+	if !gid.known || got != gid.gid {
+		// "No longer matches", not "stale" — this lock is HELD by this process as
+		// of a few lines ago, so the file is definitely not an abandoned leftover,
+		// and telling an operator to delete it while another billet holds a
+		// different one would be the same mistake one layer along.
+		return fmt.Errorf(
+			"lock file %s belongs to group %d but the shared directory is group %d, so the other "+
+				"account sharing that directory cannot open it. Stop every billet using this "+
+				"directory, then either chgrp the file to %d or delete it so the next start "+
+				"recreates it — and chmod g+s the directory so it does not happen again",
+			path, got, gid.gid, gid.gid)
 	}
 
 	if info.Mode().Perm()&0o060 == 0o060 {
@@ -180,26 +234,39 @@ func (l *dirLock) release() error {
 	return closeErr
 }
 
-// fileGID reports the group that owns a file, or -1 when the platform does not
-// say. A gid the caller cannot read is never treated as a MATCH: an unknown
-// group is exactly the case where widening the mode would look right and lock
-// the other account out anyway.
-func fileGID(info os.FileInfo) int {
+// fileGroup is a group owner that may not be known.
+//
+// A STRUCT RATHER THAN A -1 SENTINEL, because Stat_t.Gid is UNSIGNED and this
+// package compiles for 32-bit hosts too: a gid above MaxInt32 converted to a
+// 32-bit int comes out negative, so "no group owner" and "a very high group id"
+// became the same value. A shared directory with such a gid would have been
+// refused as unreadable. Absence is now its own field and cannot be spelled by
+// any real gid.
+type fileGroup struct {
+	gid   uint32
+	known bool
+}
+
+// fileGID reports the group that owns a file, and whether the platform said.
+//
+// An unknown group is never treated as a MATCH: it is exactly the case where
+// widening the mode would look right and lock the other account out anyway.
+func fileGID(info os.FileInfo) (uint32, bool) {
 	st, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {
-		return -1
+		return 0, false
 	}
 
-	return int(st.Gid)
+	return st.Gid, true
 }
 
 // dirGID is the same question asked of the shared lock directory, whose group is
 // the one every participant must end up in.
-func dirGID(info os.FileInfo) (int, error) {
-	gid := fileGID(info)
-	if gid < 0 {
-		return -1, errors.New("the filesystem did not report a group owner")
+func dirGID(info os.FileInfo) (fileGroup, error) {
+	gid, ok := fileGID(info)
+	if !ok {
+		return fileGroup{}, errors.New("the filesystem did not report a group owner")
 	}
 
-	return gid, nil
+	return fileGroup{gid: gid, known: true}, nil
 }

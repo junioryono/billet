@@ -700,10 +700,149 @@ func TestASharedLockDirectoryProducesAGroupOpenableLock(t *testing.T) {
 		t.Fatalf("stat dir: %v", err)
 	}
 
-	if got, want := fileGID(info), fileGID(dirInfo); got != want {
+	got, gotOK := fileGID(info)
+
+	want, wantOK := fileGID(dirInfo)
+	if !gotOK || !wantOK {
+		t.Fatal("the filesystem did not report group owners, so this proves nothing")
+	}
+
+	if got != want {
 		t.Errorf("the lock file belongs to group %d but the shared directory is group %d, so "+
 			"the other account in that group cannot open it", got, want)
 	}
+}
+
+// THE CHECK ITSELF, exercised — which the test above still does not do.
+//
+// Setting setgid BEFORE the lock file is created means the kernel supplies the
+// directory's group and billet's comparison is never the reason it matches.
+// Deleting the production comparison outright left that test green. The only way
+// to reach the check is to present it with a file that ALREADY has the wrong
+// group, which is exactly the real case: a lock file left by an earlier billet
+// in a directory that was not setgid at the time.
+func TestAnExistingLockFileWithTheWrongGroupIsRefused(t *testing.T) {
+	t.Parallel()
+
+	const id = "0123456789abcdef0123456789abcdef"
+
+	dir := t.TempDir()
+	borrowed := borrowedGroup(t)
+
+	// The lock file is created FIRST, while the directory is still plain, so it
+	// takes this process's primary group.
+	lockPath := filepath.Join(dir, "deployment-"+id+".lock")
+
+	if err := os.WriteFile(lockPath, nil, 0o660); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	// Only now is the directory shared, with a DIFFERENT group.
+	if err := os.Chown(dir, -1, borrowed); err != nil {
+		t.Skipf("cannot give the directory a non-primary group: %v", err)
+	}
+
+	if err := os.Chmod(dir, os.ModeSetgid|0o770); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+
+	fi, err := os.Stat(lockPath)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+
+	if gid, ok := fileGID(fi); !ok || gid == uint32(borrowed) {
+		t.Skipf("this platform gave the pre-created file the directory's group (%d), so a "+
+			"mismatch cannot be staged here", gid)
+	}
+
+	_, err = LockDeployment(id, LockOptions{Dir: dir})
+	if err == nil {
+		t.Fatal("billet accepted a lock file whose group the other account is not in, so the " +
+			"lock excludes nobody")
+	}
+
+	if !strings.Contains(err.Error(), "belongs to group") {
+		t.Errorf("the refusal is not about the group: %v", err)
+	}
+
+	// AND IT DOES NOT CALL IT STALE. The check now runs after the flock, so the
+	// advice can safely be about a file nothing holds — but it must still tell the
+	// operator to stop every billet first, because another one may hold a
+	// DIFFERENT lock in the same directory.
+	if !strings.Contains(err.Error(), "Stop every billet") {
+		t.Errorf("the refusal does not tell the operator to stop billet before repairing: %v", err)
+	}
+}
+
+// CONTENTION IS DISCOVERED BEFORE METADATA IS JUDGED.
+//
+// The ordering, proved rather than asserted in a comment. Metadata used to be
+// validated before the flock, so a group mismatch on a lock somebody was HOLDING
+// produced advice to delete it — and after the delete, the newcomer creates a
+// fresh inode while the holder keeps the old one and neither excludes the other.
+// Whatever else is wrong with the file, "someone is using it" has to win.
+func TestContentionIsReportedBeforeAGroupComplaint(t *testing.T) {
+	t.Parallel()
+
+	const id = "0123456789abcdef0123456789abcdef"
+
+	dir := t.TempDir()
+	borrowed := borrowedGroup(t)
+
+	// A lock file with the WRONG group, exactly as in the test above...
+	lockPath := filepath.Join(dir, "deployment-"+id+".lock")
+
+	if err := os.WriteFile(lockPath, nil, 0o660); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	if err := os.Chown(dir, -1, borrowed); err != nil {
+		t.Skipf("cannot give the directory a non-primary group: %v", err)
+	}
+
+	if err := os.Chmod(dir, os.ModeSetgid|0o770); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+
+	if gid, ok := fileGID(mustStat(t, lockPath)); !ok || gid == uint32(borrowed) {
+		t.Skip("this platform gave the pre-created file the directory's group, so a mismatch " +
+			"cannot be staged here")
+	}
+
+	// ...and somebody is holding it. A separate open file description, so the
+	// flock genuinely conflicts even from this process.
+	holder, err := lockFile(lockPath, false)
+	if err != nil {
+		t.Fatalf("hold the lock: %v", err)
+	}
+
+	t.Cleanup(func() {
+		if err := holder.release(); err != nil {
+			t.Errorf("release: %v", err)
+		}
+	})
+
+	_, err = LockDeployment(id, LockOptions{Dir: dir})
+	if err == nil {
+		t.Fatal("a held lock was taken a second time")
+	}
+
+	if !errors.Is(err, ErrDeploymentLocked) {
+		t.Fatalf("billet judged the file's group before noticing somebody holds it, so it "+
+			"would advise repairing or deleting a live lock: %v", err)
+	}
+}
+
+func mustStat(t *testing.T, path string) os.FileInfo {
+	t.Helper()
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+
+	return info
 }
 
 // A GROUP-WRITABLE DIRECTORY THAT IS NOT SETGID IS REFUSED, with the command to
@@ -877,23 +1016,60 @@ func TestASymlinkedLockDirectoryIsRefused(t *testing.T) {
 // one, and only the final component — whose name is predictable, since it is
 // derived from the deployment identity — has been replaced. Following it would
 // write and lock somewhere else entirely while reporting the expected path.
+// TWO SYMLINKS, and only the second one tests what this is named for.
+//
+// The first version pointed the lock's name at an ABSOLUTE path outside the
+// directory, which os.Root rejected as an escape — so it passed while saying
+// nothing about no-follow, and it kept passing when os.Root silently followed an
+// INTERNAL link. Measured afterwards: a relative `link.lock -> real.lock` inside
+// the directory really was opened as its target.
+//
+// So the internal case is the one that matters, and both stay: the escape is
+// worth keeping honest too, and having them side by side is what makes the
+// distinction visible to whoever reads this next.
 func TestASymlinkedLockFileIsRefused(t *testing.T) {
 	t.Parallel()
 
 	const id = "0123456789abcdef0123456789abcdef"
 
-	dir := t.TempDir()
-	elsewhere := filepath.Join(t.TempDir(), "real.lock")
+	name := "deployment-" + id + ".lock"
 
-	if err := os.WriteFile(elsewhere, nil, 0o600); err != nil {
-		t.Fatalf("write: %v", err)
-	}
+	t.Run("pointing outside the directory", func(t *testing.T) {
+		t.Parallel()
 
-	if err := os.Symlink(elsewhere, filepath.Join(dir, "deployment-"+id+".lock")); err != nil {
-		t.Fatalf("symlink: %v", err)
-	}
+		dir := t.TempDir()
+		elsewhere := filepath.Join(t.TempDir(), "real.lock")
 
-	if _, err := LockDeployment(id, LockOptions{Dir: dir}); err == nil {
-		t.Fatalf("the lock followed a symlink at its own path and locked %s instead", elsewhere)
-	}
+		if err := os.WriteFile(elsewhere, nil, 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+
+		if err := os.Symlink(elsewhere, filepath.Join(dir, name)); err != nil {
+			t.Fatalf("symlink: %v", err)
+		}
+
+		if _, err := LockDeployment(id, LockOptions{Dir: dir}); err == nil {
+			t.Fatalf("the lock followed a symlink at its own path and locked %s instead", elsewhere)
+		}
+	})
+
+	// The one a path-confinement API does NOT catch, because nothing escapes.
+	t.Run("pointing inside the directory", func(t *testing.T) {
+		t.Parallel()
+
+		dir := t.TempDir()
+
+		if err := os.WriteFile(filepath.Join(dir, "real.lock"), nil, 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+
+		if err := os.Symlink("real.lock", filepath.Join(dir, name)); err != nil {
+			t.Fatalf("symlink: %v", err)
+		}
+
+		if _, err := LockDeployment(id, LockOptions{Dir: dir}); err == nil {
+			t.Fatal("the lock followed a symlink to another file INSIDE its own directory, so " +
+				"two identities can be redirected onto one inode and neither excludes the other")
+		}
+	})
 }
