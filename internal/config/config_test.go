@@ -1298,3 +1298,54 @@ func TestMaxCustodyRefusesWhatItCannotRead(t *testing.T) {
 		})
 	}
 }
+
+// A bad max_custody is refused by LOADING the file, not only by the accessor.
+//
+// The accessor tests prove the parsing; this proves validation actually calls
+// it. Without this, removing the validation hook leaves every focused test green
+// while billet accepts a config it cannot act on — and the operator finds out
+// when a wedged container finally needs reclaiming.
+func TestLoadRejectsAnUnreadableMaxCustody(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "billet.yaml")
+
+	body := `
+server:
+  listen: 127.0.0.1:7717
+  state_dir: ` + dir + `
+  max_vcpu: 8
+  max_memory: 16GiB
+github:
+  org: acme
+  app_id: 1
+  installation_id: 2
+  private_key_path: ` + filepath.Join(dir, "key.pem") + `
+node:
+  name: test-host
+  server_addr: 127.0.0.1:7717
+  provider: docker
+  state_dir: ` + dir + `
+  max_custody: tomorrow
+tiers:
+  - label: billet-2vcpu
+    provider: docker
+    vcpu: 2
+    memory: 4GiB
+    image: busybox:latest
+`
+
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("loaded a config whose max_custody billet cannot read")
+	}
+
+	if !strings.Contains(err.Error(), "max_custody") {
+		t.Errorf("the error does not name the offending field: %v", err)
+	}
+}

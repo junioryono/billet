@@ -2,6 +2,7 @@ package e2e
 
 import (
 	"errors"
+	"slices"
 	"testing"
 	"time"
 
@@ -260,20 +261,30 @@ func TestARedeliveredAssignmentDoesNotStartASecondRunner(t *testing.T) {
 		t.Fatalf("the adopted job's lease was released by the redelivery: %v", err)
 	}
 
-	// And the lease the listener took for the redelivery went back rather than
-	// being stranded by a launch that refused. Asserted as "the ledger holds no
-	// more than the adopted job plus the listener's escrow", which is what a
-	// leaked lease would exceed.
-	usage, err := restarted.alloc.Usage(t.Context())
-	if err != nil {
-		t.Fatalf("Usage: %v", err)
-	}
+	// AND THE LISTENER ACTUALLY ASSIGNED A SECOND LEASE, which the runner then
+	// refused. This is the assertion that separates "the guard fired" from "the
+	// listener quietly dropped the assignment" — both of which leave one
+	// container and one open lease, so counting containers cannot tell them
+	// apart. A refused relaunch archives its lease as failed.
+	deadline = time.Now().Add(30 * time.Second)
 
-	// One adopted job (2 vCPU) plus at most a full budget of escrow. A leak shows
-	// up as leases that no listener is holding and no job is running.
-	if usage.VCPU > 8 {
-		t.Errorf("the refused relaunch stranded capacity: %d vCPU held against a budget of 8",
-			usage.VCPU)
+	for {
+		outcomes, err := restarted.alloc.HistoryOutcomesForRequest(t.Context(), lease.RequestID)
+		if err != nil {
+			t.Fatalf("read job history: %v", err)
+		}
+
+		if slices.Contains(outcomes, string(alloc.PhaseFailed)) {
+			break
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatalf("no lease for request %d was assigned and then failed, so the "+
+				"redelivered assignment never reached the runner's guard; archived: %v",
+				lease.RequestID, outcomes)
+		}
+
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 

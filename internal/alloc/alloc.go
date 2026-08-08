@@ -1341,6 +1341,50 @@ func (a *Allocator) countOpenMacOSByNode(ctx context.Context, tx *sql.Tx, node s
 	return n, nil
 }
 
+// HistoryOutcomesForRequest reports how every archived lease for one job request
+// was recorded, newest last.
+//
+// A job can have more than one lease across a restart — GitHub redelivers an
+// unacknowledged assignment, and the listener escrows a fresh lease for it — so
+// "what happened to request N" is a list rather than a value. That plurality is
+// the point: it is how a caller distinguishes a redelivery that was correctly
+// refused from one that was silently dropped.
+func (a *Allocator) HistoryOutcomesForRequest(ctx context.Context, requestID int64) ([]string, error) {
+	var outcomes []string
+
+	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx,
+			// NOT NULL, because a row is inserted at ASSIGNMENT with no conclusion
+			// and only filled in when the lease terminalizes. A job in flight is not
+			// an outcome, and scanning one into a string fails outright.
+			`SELECT conclusion FROM job_history
+			  WHERE request_id = ? AND conclusion IS NOT NULL
+			  ORDER BY finished_at`, requestID)
+		if err != nil {
+			return fmt.Errorf("alloc: read job history for request %d: %w", requestID, err)
+		}
+
+		defer func() { _ = rows.Close() }()
+
+		for rows.Next() {
+			var conclusion string
+
+			if err := rows.Scan(&conclusion); err != nil {
+				return fmt.Errorf("alloc: scan job history for request %d: %w", requestID, err)
+			}
+
+			outcomes = append(outcomes, conclusion)
+		}
+
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return outcomes, nil
+}
+
 // HistoryOutcome reports how a finished lease was recorded.
 //
 // The only DURABLE statement about what happened to a job, which is what makes

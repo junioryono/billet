@@ -868,9 +868,13 @@ func TestAConfiguredBoundDestroysAndRecordsAFailure(t *testing.T) {
 
 	frozen := time.Now()
 
-	restarted := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	// THROUGH THE OPTION, not the private field. Writing maxCustody directly
+	// tested the expiry logic while leaving the only way an operator can reach it
+	// — WithMaxCustody — uncovered, which is how the previous version of this
+	// capability shipped configurable in name only.
+	restarted := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil,
+		WithMaxCustody(2*time.Hour))
 	restarted.now = func() time.Time { return frozen }
-	restarted.maxCustody = 2 * time.Hour
 
 	if err := restarted.Recover(t.Context()); err != nil {
 		t.Fatalf("Recover: %v", err)
@@ -1544,5 +1548,69 @@ func TestAnUnseenStrayStillWaits(t *testing.T) {
 
 	if !r.heldLeases()[lease.ID] {
 		t.Error("released a stray billet has never seen, on a single negative observation")
+	}
+}
+
+// An entry billet has never seen becomes observed once Find succeeds.
+//
+// The transition in the middle: a stray that finally materialises is no longer a
+// maybe, so a LATER absence needs no grace period. Without it, a container that
+// appeared and was then destroyed ambiguously would make billet wait out the
+// remaining grace before reclaiming capacity it already knows about.
+func TestAStrayThatAppearsBecomesObserved(t *testing.T) {
+	t.Parallel()
+
+	// The launch fails and the stray is not visible yet, so custody starts unseen.
+	p := &fakeProvider{
+		kind:      config.ProviderDocker,
+		launchErr: errors.New("context deadline exceeded"),
+	}
+
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
+	frozen := time.Now()
+	r.now = func() time.Time { return frozen }
+
+	lease := assignedLease(t, a)
+
+	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err == nil {
+		t.Fatal("a launch that failed reported success")
+	}
+
+	for _, c := range r.custodySnapshot() {
+		if c.observed {
+			t.Fatal("custody started observed for compute billet never saw")
+		}
+	}
+
+	// THE DAEMON CATCHES UP: the container the lost create asked for appears, but
+	// destroying it fails, so the entry survives this tick having been seen.
+	name := provider.InstanceName(lease.ID)
+	p.add(&provider.Instance{ID: "late-" + lease.ID, Name: name, Running: true})
+	p.destroyErr = errors.New("daemon is not responding")
+
+	if err := r.Tend(t.Context()); err == nil {
+		t.Fatal("Tend reported success though the destroy failed")
+	}
+
+	for _, c := range r.custodySnapshot() {
+		if !c.observed {
+			t.Error("billet saw the instance and did not record it")
+		}
+	}
+
+	// Now it is gone, and the clock has NOT moved: an entry that waited out the
+	// grace would still be holding here.
+	p.destroyErr = nil
+	delete(p.live, name)
+
+	if err := r.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend: %v", err)
+	}
+
+	if len(r.heldLeases()) != 0 {
+		t.Error("held capacity for an instance billet had seen and then found gone, " +
+			"waiting out a grace period meant for compute that may never have started")
 	}
 }
