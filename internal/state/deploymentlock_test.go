@@ -309,3 +309,98 @@ func TestACopiedStateDirectoryCannotRunAlongsideTheOriginal(t *testing.T) {
 		t.Fatalf("the copy started alongside the original: %v", err)
 	}
 }
+
+// AN IDENTITY THAT WOULD ESCAPE THE LOCK DIRECTORY IS REFUSED, NOT DEGRADED.
+//
+// The consequential half. The identity becomes a filename, so a separator in it
+// puts the lock somewhere else — and the resulting open failure is
+// indistinguishable from a host with nowhere to put a lock, which DEGRADES. So
+// the protection would have switched itself off while blaming the cache
+// directory. A refusal is the only outcome that cannot be mistaken for working.
+func TestAnIdentityThatEscapesTheLockDirectoryIsRefused(t *testing.T) {
+	valid := strings.Repeat("a", deploymentIDLen)
+
+	for _, id := range []string{
+		"../../../../tmp/escape",
+		"a/b",
+		valid[:len(valid)-2] + "/x",
+		strings.Repeat("A", deploymentIDLen), // uppercase: one identity or two, per filesystem
+		valid + "extra",
+		valid[:len(valid)-1],
+		"deadbeef,label=x",
+		"dead=beef",
+	} {
+		t.Run(id, func(t *testing.T) {
+			useTempCache(t)
+
+			lock, err := LockDeployment(id)
+			if err == nil {
+				releaseAtEnd(t, lock)
+
+				t.Fatalf("identity %q was accepted, and its lock went to %q", id, lock.Path())
+			}
+
+			if lock != nil {
+				t.Errorf("a refused identity still produced a lock: degraded=%q", lock.Degraded())
+			}
+
+			// Specifically NOT a degradation — that is the failure this test exists
+			// for, and it is the silent one.
+			if strings.Contains(err.Error(), "cache") {
+				t.Errorf("the refusal reads as a cache-directory problem: %v", err)
+			}
+		})
+	}
+}
+
+// A HAND-EDITED IDENTITY FILE IS REFUSED AT THE SOURCE.
+//
+// Not sanitised. A sanitised identity is a DIFFERENT identity from the one
+// already written onto running containers, so billet would come up unable to see
+// its own compute while believing it could.
+func TestADeploymentIDFileBilletWouldNotHaveMintedIsRefused(t *testing.T) {
+	t.Parallel()
+
+	for _, content := range []string{
+		"../../etc/passwd",
+		"my-deployment",
+		strings.Repeat("A", deploymentIDLen),
+		"deadbeef",
+	} {
+		t.Run(content, func(t *testing.T) {
+			t.Parallel()
+
+			dir := t.TempDir()
+
+			if err := os.WriteFile(filepath.Join(dir, deploymentIDFile), []byte(content+"\n"), 0o600); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+
+			id, err := DeploymentID(dir)
+			if err == nil {
+				t.Fatalf("%q was accepted as an identity (%q), and it would be written onto "+
+					"every container this billet starts", content, id)
+			}
+
+			// The operator has to be able to act on it.
+			if !strings.Contains(err.Error(), deploymentIDFile) {
+				t.Errorf("the error does not name the file to fix: %v", err)
+			}
+		})
+	}
+}
+
+// The identity billet MINTS passes its own check — otherwise the check above is
+// a guarantee that billet cannot start.
+func TestAMintedIdentityIsAccepted(t *testing.T) {
+	t.Parallel()
+
+	id, err := DeploymentID(t.TempDir())
+	if err != nil {
+		t.Fatalf("DeploymentID: %v", err)
+	}
+
+	if err := validDeploymentID(id); err != nil {
+		t.Fatalf("billet minted an identity it refuses to accept: %v", err)
+	}
+}

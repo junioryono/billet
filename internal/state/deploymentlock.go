@@ -57,6 +57,16 @@ func LockDeployment(id string) (*DeploymentLock, error) {
 		return nil, errors.New("state: a deployment lock needs an identity")
 	}
 
+	// CHECKED AGAIN HERE, not only where the identity is read. This function
+	// builds a filename out of the value, and the failure mode of not checking is
+	// the bad one: an id containing a path separator lands outside the lock
+	// directory or fails to open, and a failure to open DEGRADES — so the
+	// protection would switch itself off and report a cache-directory problem.
+	// The check that matters is the one next to the interpolation.
+	if err := validDeploymentID(id); err != nil {
+		return nil, fmt.Errorf("state: refusing to lock: %w", err)
+	}
+
 	dir, err := deploymentLockDir()
 	if err != nil {
 		return &DeploymentLock{degraded: fmt.Sprintf("no cache directory (%v)", err)}, nil

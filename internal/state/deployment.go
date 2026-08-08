@@ -50,6 +50,10 @@ func DeploymentID(stateDir string) (string, error) {
 			return "", fmt.Errorf("state: %s is empty; delete it to have billet mint a new identity", path)
 		}
 
+		if err := validDeploymentID(id); err != nil {
+			return "", fmt.Errorf("state: %s: %w; delete it to have billet mint a new identity", path, err)
+		}
+
 		return id, nil
 	}
 
@@ -119,4 +123,40 @@ func DeploymentID(stateDir string) (string, error) {
 	}
 
 	return id, nil
+}
+
+// deploymentIDLen is the length of the hex encoding of the 16 random bytes an
+// identity is minted from.
+const deploymentIDLen = 32
+
+// validDeploymentID refuses anything billet would not have minted.
+//
+// THE IDENTITY IS INTERPOLATED INTO PLACES THAT PARSE, which is what makes this
+// worth checking rather than trusting. It becomes a filename in the host-wide
+// lock directory, where a `/` or a `..` leaves that directory entirely — and
+// silently, since the resulting lock failure is indistinguishable from a host
+// that has nowhere to put one, so the protection degrades off while reporting a
+// cache-directory problem. It is also written as a docker label and sent back as
+// `--filter label=…`, where a comma or an `=` changes what is being asked.
+//
+// Billet mints this value itself, so anything failing this check is a hand-edit
+// or a corrupted file. Refusing beats sanitising: a sanitised id is a DIFFERENT
+// identity from the one already written onto running containers, so billet would
+// come up unable to see its own compute while believing it could.
+func validDeploymentID(id string) error {
+	if len(id) != deploymentIDLen {
+		return fmt.Errorf("deployment identity %q is %d characters, not %d", id, len(id), deploymentIDLen)
+	}
+
+	// Not hex.DecodeString: it accepts uppercase, and an identity that differs
+	// only in case is two identities on a case-sensitive filesystem and one on a
+	// case-insensitive one. Pinning to the encoding billet emits keeps the lock
+	// meaning the same thing on both.
+	for _, r := range id {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return fmt.Errorf("deployment identity %q contains %q, but identities are lowercase hex", id, r)
+		}
+	}
+
+	return nil
 }
