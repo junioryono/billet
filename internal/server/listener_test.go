@@ -450,7 +450,21 @@ func newAllocator(t *testing.T, limits alloc.Limits, tiers []config.Tier,
 // tier escrows the capacity, and the poll returns an assignment backed by a lease
 // this listener no longer holds.
 func TestEscrowSurvivesAPollLongerThanTheLeaseTTL(t *testing.T) {
-	const ttl = 150 * time.Millisecond
+	// Raised from 150ms, and the honest version of why: this test failed twice
+	// during full `make check` runs on a loaded machine and has never failed in
+	// isolation — including at -count=10 under ten competing test binaries, at
+	// BOTH constants. So the leading explanation is that renewal at ttl/3 fired
+	// every 50ms, the same order as goroutine scheduling jitter under load, and
+	// 600ms gives that four times the room.
+	//
+	// It is a hypothesis, not a demonstration. I could not reproduce the original
+	// failure on demand, so I cannot claim this constant fixes it — only that the
+	// margin it removes was the smallest one in the test. What is NOT in doubt is
+	// that production is unaffected either way: the TTL there is 90s and renewal
+	// has 60s of slack, so the RATIO was never the thing at risk. If this fails
+	// again, the next step is instrumenting the renewal goroutine's actual wakeup
+	// times rather than raising the constant a second time.
+	const ttl = 600 * time.Millisecond
 
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
 

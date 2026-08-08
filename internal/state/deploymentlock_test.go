@@ -351,6 +351,31 @@ func TestAnEmptyIdentityIsRefused(t *testing.T) {
 	}
 }
 
+// borrowedGroup returns a group this process belongs to that is NOT its primary
+// one, skipping the test when there is none.
+//
+// Skipping rather than falling back to the primary group: a test that quietly
+// degrades to comparing a value with itself reports success while checking
+// nothing, which is the failure mode this helper exists to prevent.
+func borrowedGroup(t *testing.T) int {
+	t.Helper()
+
+	groups, err := os.Getgroups()
+	if err != nil {
+		t.Skipf("cannot read supplementary groups: %v", err)
+	}
+
+	for _, gid := range groups {
+		if gid != os.Getgid() {
+			return gid
+		}
+	}
+
+	t.Skip("this account has no supplementary group, so a group mismatch cannot be staged")
+
+	return -1
+}
+
 // releaseAtEnd drops a lock when the test finishes, and fails if it cannot —
 // a lock that will not release is a restart that will not start.
 func releaseAtEnd(t *testing.T, lock *DeploymentLock) {
@@ -619,6 +644,22 @@ func TestASharedLockDirectoryProducesAGroupOpenableLock(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
+
+	// A GROUP THAT IS NOT THIS PROCESS'S PRIMARY ONE, or the assertion below is
+	// true by construction and can never fail. MEASURED, not assumed: a t.TempDir
+	// comes out owned by the primary group, so comparing the lock file's group
+	// against the directory's compares 20 with 20 and would pass just as happily
+	// against the defect it exists to catch.
+	//
+	// A supplemental group is exactly the situation the defect arises from — the
+	// service account reaching the shared directory through one — so borrowing
+	// one here makes the test discriminate on Linux, where a non-setgid directory
+	// really does hand a new file the creator's primary group. On darwin it still
+	// cannot fail, because BSD gives a new file its directory's group whether or
+	// not setgid is set; the Linux CI runner is where this earns its keep.
+	if err := os.Chown(dir, -1, borrowedGroup(t)); err != nil {
+		t.Skipf("cannot give the directory a non-primary group: %v", err)
+	}
 
 	// SETGID group-writable: the shape an administrator provisions for two
 	// accounts, and the only shape that actually works. See the sibling test.
