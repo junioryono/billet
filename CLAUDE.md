@@ -587,9 +587,16 @@ compute by node name let one installation enumerate the other's containers and a
 on live jobs it had no relationship with.
 
 **A copied state directory deliberately keeps the original's identity** (the copy's
-containers are labelled with it). The lock does NOT make that safe — a copy is a
-different inode — so two copies can run at once. Closing that needs a host-wide
-lock keyed by the identity; see the task list.
+containers are labelled with it), and the directory lock does NOT make that safe —
+a copy is a different inode, so both directories lock happily. That is what
+`state.LockDeployment` is for: a SECOND lock keyed by the IDENTITY, taken host-wide
+in the user cache directory, so the copy collides and refuses to start. The user
+cache rather than `/tmp` because `/tmp` is world-writable and any local user could
+pre-create the file and hold it, keeping billet from ever booting. A host that
+cannot PLACE that lock degrades to the directory lock alone and reports why —
+refusing to boot there would trade a rare hazard for a common outage. The residual
+case, two different UNIX users sharing one docker daemon, is still open: they get
+different cache directories and so do not collide, while their containers do.
 
 ### `created` is not `running`
 

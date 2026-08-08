@@ -36,8 +36,10 @@ const deploymentIDFile = "deployment-id"
 // Random rather than derived from the path, so that copying a state directory
 // does not silently produce two installations claiming one identity — the copy
 // carries the original's id, which is the honest answer to "these are the same
-// installation" and keeps the failure to a lock conflict rather than a
-// cross-destruction.
+// installation". That is what makes the copy DETECTABLE: LockDeployment keys a
+// host-wide lock on the id, so running the copy alongside the original fails as a
+// lock conflict rather than as a cross-destruction. A derived id would give the
+// copy a different identity and no conflict to detect.
 func DeploymentID(stateDir string) (string, error) {
 	path := filepath.Join(stateDir, deploymentIDFile)
 

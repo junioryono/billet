@@ -98,17 +98,18 @@ func TestAnEmptyDeploymentIDIsRefused(t *testing.T) {
 // Deliberate: the copy IS the same installation as far as its containers are
 // concerned, and minting a new id for it would strand every one of them.
 //
-// THE EARLIER VERSION OF THIS COMMENT CLAIMED THE PROCESS LOCK MAKES THAT SAFE.
-// It does not. The lock is taken on a file inside the state directory, and a
-// COPY has its own inode, so both directories can be locked at once — two live
-// processes claiming one identity against one docker daemon, each able to act on
-// the other's containers. What limits the damage today is that recovery adopts
-// rather than destroys, so the second process holds capacity for work it did not
-// start instead of killing it. That is a smaller wound, not a closed one.
+// THE EARLIER VERSION OF THIS COMMENT CLAIMED THE DIRECTORY LOCK MAKES THAT SAFE.
+// It does not. That lock is taken on a file INSIDE the state directory, and a COPY
+// has its own inode, so both directories can be locked at once — two live processes
+// claiming one identity against one docker daemon, each able to act on the other's
+// containers.
 //
-// Closing it needs a host-wide lock keyed by the identity itself rather than by
-// a path. Recorded as a task; asserting it here would be asserting a property
-// nothing implements.
+// What closes it is a second lock keyed by the identity rather than by a path:
+// LockDeployment, exercised end to end by
+// TestACopiedStateDirectoryCannotRunAlongsideTheOriginal. This test is the half
+// that lock DEPENDS on — that the copy keeps the identity in the first place.
+// A copy that minted a fresh one would strand every container the original
+// started, and would never collide either.
 func TestACopiedStateDirectoryKeepsItsIdentity(t *testing.T) {
 	t.Parallel()
 
