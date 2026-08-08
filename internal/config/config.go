@@ -515,9 +515,14 @@ func (t Tier) GuestOSProviderErrors(where string) []error {
 //
 // The single reader for that question, so `provider:` and `providers:` cannot
 // drift apart. Callers must not consult Tier.Provider directly.
+// CLONED, because callers keep what this returns. The allocator copies the list
+// onto every lease it reserves, and handing out the tier's own backing array
+// meant a caller mutating one element afterwards changed what future leases
+// authorize — with no revalidation, and directly against the snapshot rule that
+// the rest of this design rests on. Following NodePolicy.Clone's precedent.
 func (t Tier) AcceptableProviders() []ProviderKind {
 	if len(t.Providers) > 0 {
-		return t.Providers
+		return slices.Clone(t.Providers)
 	}
 
 	if t.Provider != "" {

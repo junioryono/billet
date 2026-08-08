@@ -297,14 +297,119 @@ func TestAMalformedProviderListFailsClosed(t *testing.T) {
 	}
 }
 
-// A host may not change its backend while it is running work.
+// A host may not change its backend while it is running work, in ANY phase.
 //
 // Re-registration overwrote the provider freely, which falsified every lease
 // already bound there: each recorded the backend it chose at bind, and after the
 // change the ledger said a job ran on firecracker while the host called itself
 // docker. Later checks read the NODE's row, so they went on authorizing the
 // lease — the fact that had become wrong was the one nothing re-read.
+//
+// EVERY non-terminal phase is exercised. The first version bound a lease still
+// in `capacity` and stopped there, so a regression that guarded only that phase
+// would have passed — and `capacity` is the phase where the change matters least,
+// because nothing is running yet.
 func TestANodeCannotChangeBackendWhileRunningWork(t *testing.T) {
+	t.Parallel()
+
+	for _, phase := range []Phase{PhaseCapacity, PhaseAssigned, PhaseLaunching, PhaseOnline, PhaseBusy} {
+		t.Run(string(phase), func(t *testing.T) {
+			t.Parallel()
+
+			tier := config.Tier{
+				Label:     "billet-8vcpu-ubuntu-2404",
+				Providers: []config.ProviderKind{config.ProviderFirecracker, config.ProviderDocker},
+				VCPU:      8,
+				Memory:    32 * config.GiB,
+				GuestOS:   config.GuestLinux,
+			}
+
+			a := newAllocator(t, Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB},
+				[]config.Tier{tier})
+
+			if err := a.RegisterNode(t.Context(), "shapeshifter", config.ProviderFirecracker); err != nil {
+				t.Fatalf("RegisterNode: %v", err)
+			}
+
+			lease, err := a.Reserve(t.Context(), tier.Label)
+			if err != nil {
+				t.Fatalf("Reserve: %v", err)
+			}
+
+			if err := a.Bind(t.Context(), lease.ID, lease.Epoch, "shapeshifter"); err != nil {
+				t.Fatalf("Bind: %v", err)
+			}
+
+			advanceTo(t, a, lease, phase)
+
+			// Both backends are acceptable to the tier, so nothing downstream would
+			// object — which is exactly why the refusal has to happen here.
+			err = a.RegisterNode(t.Context(), "shapeshifter", config.ProviderDocker)
+			if !errors.Is(err, ErrWrongProvider) {
+				t.Fatalf("a host running %s work changed its backend: %v", phase, err)
+			}
+
+			// AND THE MESSAGE SAYS HOW TO GET OUT. This fires during startup — cmd
+			// registers the node before it recovers anything — so an operator meets
+			// it with billet refusing to boot. Naming the value to put back is the
+			// difference between an instruction and a dead end.
+			if !strings.Contains(err.Error(), string(config.ProviderFirecracker)) {
+				t.Errorf("the refusal does not name the provider to restore: %v", err)
+			}
+
+			// The lease still says what it actually chose.
+			bound, err := a.Lease(t.Context(), lease.ID)
+			if err != nil {
+				t.Fatalf("read the lease: %v", err)
+			}
+
+			if bound.Provider != config.ProviderFirecracker {
+				t.Errorf("the lease now claims %q; its compute is still on firecracker",
+					bound.Provider)
+			}
+		})
+	}
+}
+
+// A host may re-register with the SAME backend while busy — that is an ordinary
+// restart, and refusing it would make a crash unrecoverable.
+func TestABusyNodeMayReRegisterUnchanged(t *testing.T) {
+	t.Parallel()
+
+	tier := config.Tier{
+		Label:     "billet-8vcpu-ubuntu-2404",
+		Providers: []config.ProviderKind{config.ProviderFirecracker},
+		VCPU:      8,
+		Memory:    32 * config.GiB,
+		GuestOS:   config.GuestLinux,
+	}
+
+	a := newAllocator(t, Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB}, []config.Tier{tier})
+
+	if err := a.RegisterNode(t.Context(), "epyc-1", config.ProviderFirecracker); err != nil {
+		t.Fatalf("RegisterNode: %v", err)
+	}
+
+	lease, err := a.Reserve(t.Context(), tier.Label)
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	if err := a.Bind(t.Context(), lease.ID, lease.Epoch, "epyc-1"); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	advanceTo(t, a, lease, PhaseBusy)
+
+	if err := a.RegisterNode(t.Context(), "epyc-1", config.ProviderFirecracker); err != nil {
+		t.Fatalf("a busy host could not restart under the same backend, which makes a crash "+
+			"unrecoverable: %v", err)
+	}
+}
+
+// A host whose leases are all TERMINAL changes freely: nothing is running to
+// falsify.
+func TestANodeWithOnlyFinishedWorkMayChangeBackend(t *testing.T) {
 	t.Parallel()
 
 	tier := config.Tier{
@@ -317,7 +422,7 @@ func TestANodeCannotChangeBackendWhileRunningWork(t *testing.T) {
 
 	a := newAllocator(t, Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB}, []config.Tier{tier})
 
-	if err := a.RegisterNode(t.Context(), "shapeshifter", config.ProviderFirecracker); err != nil {
+	if err := a.RegisterNode(t.Context(), "epyc-1", config.ProviderFirecracker); err != nil {
 		t.Fatalf("RegisterNode: %v", err)
 	}
 
@@ -326,33 +431,37 @@ func TestANodeCannotChangeBackendWhileRunningWork(t *testing.T) {
 		t.Fatalf("Reserve: %v", err)
 	}
 
-	if err := a.Bind(t.Context(), lease.ID, lease.Epoch, "shapeshifter"); err != nil {
+	if err := a.Bind(t.Context(), lease.ID, lease.Epoch, "epyc-1"); err != nil {
 		t.Fatalf("Bind: %v", err)
 	}
 
-	// Both backends are acceptable to the tier, so nothing downstream would
-	// object — which is exactly why the refusal has to happen here.
-	err = a.RegisterNode(t.Context(), "shapeshifter", config.ProviderDocker)
-	if !errors.Is(err, ErrWrongProvider) {
-		t.Fatalf("a busy host changed its backend: %v", err)
+	if err := a.Release(t.Context(), lease.ID, lease.Epoch, PhaseDone); err != nil {
+		t.Fatalf("Release: %v", err)
 	}
 
-	// AND THE MESSAGE SAYS HOW TO GET OUT. This fires during startup — cmd
-	// registers the node before it recovers anything — so an operator meets it
-	// with billet refusing to boot. Naming the value to put back is the
-	// difference between a clear instruction and a dead end.
-	if !strings.Contains(err.Error(), string(config.ProviderFirecracker)) {
-		t.Errorf("the refusal does not name the provider to restore: %v", err)
+	if err := a.RegisterNode(t.Context(), "epyc-1", config.ProviderDocker); err != nil {
+		t.Fatalf("a host with only finished work could not change its backend: %v", err)
 	}
+}
 
-	// The lease still says what it actually chose.
-	bound, err := a.Lease(t.Context(), lease.ID)
-	if err != nil {
-		t.Fatalf("read the lease: %v", err)
-	}
+// advanceTo walks a bound lease to a phase.
+func advanceTo(t *testing.T, a *Allocator, lease *Lease, phase Phase) {
+	t.Helper()
 
-	if bound.Provider != config.ProviderFirecracker {
-		t.Errorf("the lease now claims %q; its compute is still on firecracker", bound.Provider)
+	order := []Phase{PhaseAssigned, PhaseLaunching, PhaseOnline, PhaseBusy}
+
+	for _, step := range order {
+		if step == PhaseAssigned {
+			if err := a.Assign(t.Context(), lease.ID, lease.Epoch, 1, 1); err != nil {
+				t.Fatalf("Assign: %v", err)
+			}
+		} else if err := a.Advance(t.Context(), lease.ID, lease.Epoch, step); err != nil {
+			t.Fatalf("Advance to %s: %v", step, err)
+		}
+
+		if step == phase {
+			return
+		}
 	}
 }
 

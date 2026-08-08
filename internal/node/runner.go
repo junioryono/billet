@@ -293,13 +293,30 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job Job) error 
 		// with no lease in it — unattributable to reconciliation, which is the one
 		// reader that has nothing else to go on. The JIT config carries GitHub's
 		// identity into the guest; the instance carries billet's.
-		Name:  name,
-		Image: tier.Image,
-		VCPU:  tier.VCPU,
+		Name: name,
 
-		Memory: tier.Memory,
-		Disk:   tier.Disk,
-		SHM:    tier.SHM,
+		// SIZE COMES FROM THE LEASE, not the catalogue, and this is the same
+		// two-authorities defect that was just fixed for providers — one field
+		// over.
+		//
+		// The ledger ESCROWED these numbers when the lease was reserved and is
+		// still accounting for them. Reading the live tier meant a label edited
+		// from 2 vCPU to 16 would start a 16-vCPU guest against 2 vCPU of
+		// reservation, and enough of those physically over-commit the machine
+		// while every ledger total still balances.
+		VCPU:   lease.VCPU,
+		Memory: lease.Memory,
+
+		// Disk, SHM and image come from the CATALOGUE, deliberately, and the
+		// distinction is what the ledger accounts for. Billet's budget is vCPU and
+		// memory; nothing reserves disk, so a change to these cannot over-commit
+		// anything — it only means a job launched after an edit uses the new
+		// value. Snapshotting them would make the lease the authority on facts the
+		// lease has no column for, which is how the provider list ended up
+		// duplicated in the first place.
+		Image: tier.Image,
+		Disk:  tier.Disk,
+		SHM:   tier.SHM,
 
 		// Classified from the event that queued the job. The zero value is
 		// unknown and backends refuse it, so a job whose event billet does not

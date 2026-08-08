@@ -1537,3 +1537,44 @@ func TestAPluralTierPinnedToAWrongHostIsRefused(t *testing.T) {
 			"its jobs would queue forever with no diagnostic")
 	}
 }
+
+// An UNPINNED plural tier is constrained by a matching host's allowlist.
+//
+// The unpinned branch compared the singular field, so a tier written with
+// `providers:` was never checked against any host's guest_os allowlist — the
+// list could contain tart and a macOS-only Mac would still not object. Every
+// existing test for this branch used `provider:`, so reverting it to equality
+// left them all green.
+func TestAnUnpinnedPluralTierIsCheckedAgainstAllowlists(t *testing.T) {
+	t.Parallel()
+
+	c := &Config{
+		// A Mac that will only run macOS guests.
+		Nodes: []NodePolicy{{
+			Name: "mac-mini-1", Provider: ProviderTart, GuestOS: []GuestOS{GuestMacOS},
+		}},
+		Tiers: []Tier{{
+			Label: "billet-4vcpu-ubuntu-arm",
+			// Unpinned, and tart is one of the backends it accepts — so this Mac is
+			// a placement candidate and its allowlist applies.
+			Providers: []ProviderKind{ProviderFirecracker, ProviderTart},
+			VCPU:      4,
+			Memory:    12 * GiB,
+			Image:     "ubuntu-2404-arm64",
+			GuestOS:   GuestLinux,
+		}},
+	}
+
+	var found bool
+
+	for _, err := range c.validateGuestOSRules("tiers[0]", &c.Tiers[0]) {
+		if strings.Contains(err.Error(), "allowlist") {
+			found = true
+		}
+	}
+
+	if !found {
+		t.Fatal("an unpinned plural tier was not checked against a candidate host's " +
+			"guest_os allowlist; a linux guest could be scheduled onto a macOS-only Mac")
+	}
+}

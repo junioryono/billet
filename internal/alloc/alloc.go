@@ -362,6 +362,13 @@ func New(db *state.DB, limits Limits, tiers []config.Tier, opts ...Option) (*All
 		// escrow capacity and never bind.
 		normalized := *t
 
+		// DETACHED from the caller's slice. `*t` is a shallow copy, so the
+		// provider list stayed aliased to whatever the caller still holds — and a
+		// mutation after validation would change what future leases record with
+		// nothing re-checking it. That is the snapshot invariant undone from the
+		// inside, by the one package that depends on it most.
+		normalized.Providers = slices.Clone(t.Providers)
+
 		if t.Node != "" {
 			normalized.Node = strings.TrimSpace(t.Node)
 
@@ -541,9 +548,17 @@ func (a *Allocator) checkPlacement(ctx context.Context, tx *sql.Tx, lease *Lease
 		// "Release it" rather than "reap it": Reap only collects leases whose TTL
 		// has expired, so while a holder keeps heartbeating it returns zero
 		// forever and the advice would be unfollowable.
+		// Two different situations reach here and the message used to name only
+		// one. A row written before providers were recorded is genuinely old; a
+		// row whose stored list billet cannot interpret — a provider from a newer
+		// version, seen after a downgrade — is perfectly valid NEWER data that
+		// this binary must refuse. Telling an operator their fresh lease
+		// "predates provider recording" sends them looking for history that is not
+		// there.
 		return fmt.Errorf(
-			"%w: lease %s predates provider recording and cannot be placed safely; "+
-				"release it, or stop its holder and let it expire",
+			"%w: lease %s records no provider list this version can interpret, so it cannot "+
+				"be placed safely — it predates provider recording, or names a backend a newer "+
+				"billet wrote; release it, or stop its holder and let it expire",
 			ErrNotPlaceable, lease.ID)
 	}
 

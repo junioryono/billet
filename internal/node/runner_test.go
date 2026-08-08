@@ -1016,3 +1016,51 @@ func TestTheLeaseOutranksALaterCatalogueEdit(t *testing.T) {
 		t.Error("the job did not start")
 	}
 }
+
+// THE SIZE COMES FROM THE LEASE, not the live catalogue.
+//
+// The ledger escrowed a lease's vCPU and memory when it was reserved and is
+// still accounting for those numbers. Reading the tier meant a label edited from
+// 2 vCPU to 16 started a 16-vCPU guest against 2 vCPU of reservation — and
+// enough of those physically over-commit the machine while every ledger total
+// still balances, which is the worst shape a capacity bug can take.
+//
+// The same two-authorities defect as the provider list, one field over.
+func TestLaunchSizesTheGuestFromTheLeaseNotTheCatalogue(t *testing.T) {
+	t.Parallel()
+
+	// Reserved small.
+	small := dockerTier()
+	small.VCPU = 2
+	small.Memory = 4 * config.GiB
+
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorForTiers(t, openState(t), small)
+	lease := assignedLease(t, a)
+
+	// The operator then edits the label to be much bigger and restarts.
+	big := small
+	big.VCPU = 16
+	big.Memory = 64 * config.GiB
+
+	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{big}, nil)
+
+	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	if len(p.launched) != 1 {
+		t.Fatal("nothing was started")
+	}
+
+	spec := p.launched[0]
+
+	if spec.VCPU != 2 {
+		t.Errorf("started a %d vCPU guest against a 2 vCPU reservation; the host is now "+
+			"over-committed and the ledger still balances", spec.VCPU)
+	}
+
+	if spec.Memory != 4*config.GiB {
+		t.Errorf("started a %s guest against a 4GiB reservation", spec.Memory)
+	}
+}
