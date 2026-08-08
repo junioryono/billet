@@ -1143,3 +1143,51 @@ func TestKeepAliveStopsWithItsContext(t *testing.T) {
 		t.Fatal("KeepAlive outlived its context")
 	}
 }
+
+// A renewal that fails does not end custody or destroy anything.
+//
+// KeepAlive's one job is to renew; deciding that compute should go belongs to
+// Tend. A keep-alive that tore something down on a transient ledger error would
+// put teardown on a path that must stay cheap and must never block.
+func TestKeepAliveDoesNotActOnARenewalFailure(t *testing.T) {
+	t.Parallel()
+
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+
+	warm := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	lease := assignedLease(t, a)
+
+	if err := warm.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	store := &brittleStore{LeaseStore: a}
+	r := New(store, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
+	if err := r.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+
+	store.heartbeatErr = errors.New("database is locked")
+
+	r.renewHeld(t.Context())
+
+	if !r.heldLeases()[lease.ID] {
+		t.Error("dropped custody because a single renewal failed")
+	}
+
+	if len(p.live) != 1 {
+		t.Error("the keep-alive destroyed compute; only Tend may do that")
+	}
+
+	// A lease that is genuinely GONE is not an error worth reporting on this
+	// path either — Tend is about to clean it up.
+	store.heartbeatErr = alloc.ErrLeaseNotFound
+
+	r.renewHeld(t.Context())
+
+	if !r.heldLeases()[lease.ID] {
+		t.Error("the keep-alive removed a custody entry; that is Tend's decision")
+	}
+}

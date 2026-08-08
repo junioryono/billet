@@ -676,7 +676,12 @@ testing is what found them, and it is not optional for anything load-bearing.
   work. The queue holds the head until its exact id is acked.
 - **A mutation that does not compile is caught by the compiler, not by a test.**
   Three of them looked like passes until the failure count read zero. Keep every
-  mutation compiling.
+  mutation compiling, and print the failing-test count so a zero is visible.
+- **A mutation that never APPLIED looks exactly like a surviving one.** A `perl`
+  substitution with three tabs of indentation against a line that has two matches
+  nothing, reports "SURVIVED", and sends you off to write a test for behaviour
+  that is already covered. Assert the substitution changed the file — `grep -c`
+  the original text and expect zero — before believing the result.
 
 ### The end-to-end suite
 

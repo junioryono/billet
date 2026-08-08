@@ -233,14 +233,28 @@ type fakeJIT struct {
 	// does not name the INSTANCE after it. The two are separate identities and
 	// conflating them is what made an orphan unattributable.
 	name string
+
+	// jitErr fails registration, which is what makes the scale-set cache drop
+	// reachable.
+	jitErr error
+
+	// describes counts scale-set resolutions, so a test can tell a cached answer
+	// from a fresh one.
+	describes int
 }
 
 func (f *fakeJIT) Describe(context.Context, string, string) (*Set, []string, error) {
+	f.describes++
+
 	return &Set{ID: f.setID, Name: "billet-2vcpu"}, nil, nil
 }
 
 func (f *fakeJIT) JITConfig(_ context.Context, _ int, name, _ string) (Registration, error) {
 	f.names = append(f.names, name)
+
+	if f.jitErr != nil {
+		return nil, f.jitErr
+	}
 
 	if f.name != "" {
 		return fakeRegistration{name: f.name}, nil
@@ -805,5 +819,58 @@ func TestRecoverReleasesTheLeaseOfATrueOrphan(t *testing.T) {
 	if after.Leases != 0 || after.VCPU != 0 {
 		t.Errorf("capacity stayed held after the compute was destroyed: %d leases, %d vCPU",
 			after.Leases, after.VCPU)
+	}
+}
+
+// A failed registration drops the cached scale-set id.
+//
+// The id is resolved once per tier and reused. If the scale set was deleted and
+// recreated — a teardown, then another control plane — every later launch would
+// keep targeting an id that no longer exists, and the only symptom is a tier
+// that silently stops working. Clearing it makes the NEXT job re-resolve.
+//
+// The failed job is NOT retried here: registration has an ambiguous-success case
+// of its own, and a blind retry is how one job becomes two runners.
+func TestAFailedRegistrationDropsTheCachedScaleSet(t *testing.T) {
+	t.Parallel()
+
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+	jit := &fakeJIT{setID: 7}
+	r := New(a, host, jit, p, []config.Tier{dockerTier()}, nil)
+
+	// A first launch resolves and caches the id.
+	if err := r.Launch(t.Context(), assignedLease(t, a), Job{RequestID: 1, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	if jit.describes != 1 {
+		t.Fatalf("resolved the scale set %d times for the first launch", jit.describes)
+	}
+
+	// A second one uses the cache rather than asking again.
+	if err := r.Launch(t.Context(), assignedLease(t, a), Job{RequestID: 2, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	if jit.describes != 1 {
+		t.Errorf("re-resolved a cached scale set; %d calls", jit.describes)
+	}
+
+	// Now registration fails.
+	jit.jitErr = errors.New("scale set not found")
+
+	if err := r.Launch(t.Context(), assignedLease(t, a), Job{RequestID: 3, Event: "push"}); err == nil {
+		t.Fatal("a launch whose registration failed reported success")
+	}
+
+	jit.jitErr = nil
+
+	if err := r.Launch(t.Context(), assignedLease(t, a), Job{RequestID: 4, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	if jit.describes != 2 {
+		t.Errorf("kept using a scale-set id that had just failed; %d resolutions", jit.describes)
 	}
 }
