@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"strconv"
+	"strings"
 	"syscall"
 	"text/tabwriter"
 
@@ -663,8 +664,17 @@ func cmdCheck(ctx context.Context, args []string) error {
 		if t.Intercept {
 			intercept = "  cache-intercept"
 		}
+		// The whole list, joined. Printing t.Provider alone showed a BLANK backend
+		// for any tier written with `providers:` — and `billet check` is the one
+		// place an operator looks to confirm what they configured, so a field that
+		// silently reads empty is worse than no field at all.
+		backends := make([]string, 0, 2)
+		for _, kind := range t.AcceptableProviders() {
+			backends = append(backends, string(kind))
+		}
+
 		fmt.Printf("  %-34s %2d vCPU  %8s  %s/%s%s\n",
-			t.Label, t.VCPU, t.Memory, t.Provider, t.GuestOS, intercept)
+			t.Label, t.VCPU, t.Memory, strings.Join(backends, ","), t.GuestOS, intercept)
 	}
 	return nil
 }

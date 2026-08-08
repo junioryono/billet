@@ -1460,3 +1460,43 @@ func TestAMacOSTierCannotFallBackOffAppleHardware(t *testing.T) {
 		t.Fatal("a macOS tier was allowed to fall back to a non-Apple backend")
 	}
 }
+
+// A tier that names providers is not given the local one as well.
+//
+// Defaulting tested the single `provider` field, which a tier written with
+// `providers:` leaves empty — so billet stamped the local backend onto a tier
+// that had already named several, and then refused the config as "you set both",
+// blaming the operator for a field it had just filled in itself. Found by
+// running `billet check` against a multi-provider tier, which is exactly the
+// thing the feature is for.
+func TestATierWithProvidersDoesNotInheritTheLocalOne(t *testing.T) {
+	t.Parallel()
+
+	c := &Config{
+		Server: &ServerConfig{Listen: "127.0.0.1:7717", StateDir: t.TempDir(),
+			MaxVCPU: 8, MaxMemory: 16 * GiB},
+		Node: &NodeConfig{
+			Name: "test-host", ServerAddr: "127.0.0.1:7717",
+			Provider: ProviderDocker, StateDir: t.TempDir(),
+		},
+		Tiers: []Tier{{
+			Label:     "billet-8vcpu-ubuntu-2404",
+			Providers: []ProviderKind{ProviderFirecracker, ProviderEC2},
+			VCPU:      8,
+			Memory:    32 * GiB,
+			Image:     "ubuntu-2404-x64",
+		}},
+	}
+
+	c.applyDefaults()
+
+	if c.Tiers[0].Provider != "" {
+		t.Fatalf("a tier that named providers was also given provider %q, which validation "+
+			"then refuses as setting both", c.Tiers[0].Provider)
+	}
+
+	accepted := c.Tiers[0].AcceptableProviders()
+	if len(accepted) != 2 || accepted[0] != ProviderFirecracker {
+		t.Errorf("the tier's own list was altered by defaulting: %v", accepted)
+	}
+}

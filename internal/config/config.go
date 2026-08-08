@@ -816,7 +816,13 @@ func (c *Config) applyDefaults() {
 		// The local provider is inherited only when it is itself valid, for the
 		// same reason: an invalid one copied here becomes a second diagnostic
 		// against a field the operator never wrote.
-		if t.Provider == "" && c.Node != nil && c.Node.Provider.Valid() {
+		//
+		// Checked against the whole LIST, not the single field. A tier written
+		// with `providers:` leaves Provider empty, so testing that field alone
+		// stamped the local backend onto a tier that had already named several —
+		// and validation then refused the pair as "you set both", blaming the
+		// operator for a field billet had just filled in itself.
+		if len(t.AcceptableProviders()) == 0 && c.Node != nil && c.Node.Provider.Valid() {
 			t.Provider = c.Node.Provider
 		}
 		if t.GuestOS == "" {
