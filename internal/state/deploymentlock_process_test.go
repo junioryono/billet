@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -139,20 +140,34 @@ func TestARealSecondProcessIsRefusedAndTheLockDiesWithIt(t *testing.T) {
 	}
 
 	// And the other half: when that process dies, the kernel drops the lock.
-	if err := stdin.Close(); err != nil {
-		t.Fatalf("close the helper's stdin: %v", err)
-	}
-
+	//
+	// KILLED WITH STDIN STILL OPEN, and the order is the whole point. Closing
+	// first lets the helper read EOF, return, and run its deferred Release on the
+	// way out — after which reacquisition succeeds because the helper let go
+	// politely, not because the kernel took the lock from a corpse. The test
+	// would pass while proving the opposite of its name, and would flake whenever
+	// the helper finished exiting before the Kill landed.
 	if err := helper.Process.Kill(); err != nil {
 		t.Fatalf("kill the helper: %v", err)
 	}
 
-	// A killed process always reports an error here; what matters is that it has
-	// been REAPED before the assertion below, or the kernel may not have dropped
-	// the flock yet and the test would be racing its own subject.
-	if err := helper.Wait(); err == nil {
-		t.Fatal("the helper exited cleanly despite being SIGKILLed, so it may have released " +
-			"the lock on its way out — which is not the property under test")
+	// A SIGKILLed process always reports an error here. Reaping before the
+	// assertion below also matters on its own: without it the kernel may not have
+	// dropped the flock yet and the test would be racing its own subject.
+	err = helper.Wait()
+	if err == nil {
+		t.Fatal("the helper exited cleanly despite being SIGKILLed, so it released the lock " +
+			"on its way out — which is not the property under test")
+	}
+
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) {
+		t.Fatalf("the helper did not exit on a signal: %v", err)
+	}
+
+	if status, ok := exit.Sys().(syscall.WaitStatus); ok && !status.Signaled() {
+		t.Fatalf("the helper exited on its own (%v) rather than being killed, so nothing here "+
+			"shows the kernel releasing a HELD lock", exit)
 	}
 
 	// SIGKILL, so nothing in the helper ran on the way out — no defer, no

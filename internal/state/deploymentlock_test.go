@@ -534,3 +534,199 @@ func TestAMintedIdentityIsAccepted(t *testing.T) {
 		t.Fatalf("billet minted an identity it refuses to accept: %v", err)
 	}
 }
+
+// A WORLD-WRITABLE LOCK DIRECTORY IS REFUSED.
+//
+// The interaction between two fixes, and the reason this check exists at all.
+// Failing closed made an untrusted lock directory WORSE rather than better:
+// before, a local user who could write there could defeat the lock by unlinking
+// the file; now they can hold the filename and keep billet from ever starting.
+// That is exactly the denial of service that ruled out /tmp in the first place,
+// so the cost of failing closed is paid here.
+func TestAWorldWritableLockDirectoryIsRefused(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	if err := os.Chmod(dir, 0o777); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+
+	_, err := LockDeployment("0123456789abcdef0123456789abcdef", LockOptions{Dir: dir})
+	if err == nil {
+		t.Fatal("billet locked in a directory any local user can write, where they could " +
+			"hold the filename and keep it from ever starting")
+	}
+
+	if !strings.Contains(err.Error(), "world-writable") {
+		t.Errorf("the refusal does not say what is wrong: %v", err)
+	}
+}
+
+// MkdirAll's mode applies only to components it CREATES, so an existing loose
+// directory keeps whatever permissions it had. state.Open already knew this and
+// tightens its own state directory; this did not, one screen away.
+func TestAnExistingLooseDefaultDirectoryIsTightened(t *testing.T) {
+	home := t.TempDir()
+
+	t.Setenv("XDG_STATE_HOME", home)
+	t.Setenv("HOME", home)
+
+	lock, err := LockDeployment("0123456789abcdef0123456789abcdef", LockOptions{})
+	if err != nil {
+		t.Fatalf("LockDeployment: %v", err)
+	}
+
+	dir := filepath.Dir(lock.Path())
+
+	if err := lock.Release(); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+
+	// Loosen it the way an umask, an earlier billet, or an operator would.
+	if err := os.Chmod(dir, 0o770); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+
+	again, err := LockDeployment("0123456789abcdef0123456789abcdef", LockOptions{})
+	if err != nil {
+		t.Fatalf("LockDeployment: %v", err)
+	}
+
+	releaseAtEnd(t, again)
+
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+
+	if perm := info.Mode().Perm(); perm != 0o700 {
+		t.Errorf("billet's own lock directory stayed mode %o; MkdirAll does not tighten an "+
+			"existing directory and nothing else did either", perm)
+	}
+}
+
+// A SHARED DIRECTORY PRODUCES A FILE THE OTHER USER CAN ACTUALLY OPEN.
+//
+// The whole documented purpose of server.lock_dir is a setgid directory shared
+// by a service account and an operator who both reach one docker socket. With
+// the lock file created 0600, the first process to run made it permanently
+// unopenable by the other — not merely while the lock was held, but ever after —
+// so the advertised use case failed forever and its only escape was to turn the
+// protection off.
+func TestASharedLockDirectoryProducesAGroupOpenableLock(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	// Group-writable: the shape an administrator provisions for two accounts.
+	if err := os.Chmod(dir, 0o770); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+
+	lock, err := LockDeployment("0123456789abcdef0123456789abcdef", LockOptions{Dir: dir})
+	if err != nil {
+		t.Fatalf("LockDeployment: %v", err)
+	}
+
+	releaseAtEnd(t, lock)
+
+	info, err := os.Stat(lock.Path())
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+
+	perm := info.Mode().Perm()
+
+	if perm&0o060 != 0o060 {
+		t.Errorf("the lock file is mode %o in a group-shared directory, so the other account "+
+			"in that group can never open it and server.lock_dir does not do what it says", perm)
+	}
+
+	if perm&0o007 != 0 {
+		t.Errorf("the lock file is world-accessible (%o)", perm)
+	}
+}
+
+// The per-user default stays 0600 — the widening is for a shared directory only,
+// not a blanket loosening.
+func TestTheDefaultLockFileStaysPrivate(t *testing.T) {
+	useTempCache(t)
+
+	lock, err := LockDeployment("0123456789abcdef0123456789abcdef", LockOptions{})
+	if err != nil {
+		t.Fatalf("LockDeployment: %v", err)
+	}
+
+	releaseAtEnd(t, lock)
+
+	info, err := os.Stat(lock.Path())
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("the default lock file is mode %o, want 600", perm)
+	}
+}
+
+// A relative lock_dir puts two billets sharing one config into different
+// collision domains while logging the same string — so the diagnostic that
+// exists to expose a mismatch would conceal this one.
+func TestARelativeLockDirectoryIsRefused(t *testing.T) {
+	t.Parallel()
+
+	_, err := LockDeployment("0123456789abcdef0123456789abcdef", LockOptions{Dir: "locks"})
+	if err == nil {
+		t.Fatal("a relative lock directory was accepted, so two billets started from " +
+			"different working directories would not collide")
+	}
+
+	if !strings.Contains(err.Error(), "absolute") {
+		t.Errorf("the refusal does not say what is wrong: %v", err)
+	}
+}
+
+// A symlinked lock directory is somebody redirecting where the lock lands.
+func TestASymlinkedLockDirectoryIsRefused(t *testing.T) {
+	t.Parallel()
+
+	target := t.TempDir()
+	link := filepath.Join(t.TempDir(), "locks")
+
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	if _, err := LockDeployment("0123456789abcdef0123456789abcdef", LockOptions{Dir: link}); err == nil {
+		t.Fatal("locked through a symlink, so where the lock lands can be redirected")
+	}
+}
+
+// A SYMLINK AT THE LOCK FILE ITSELF is a different attack from a symlinked
+// directory, and it is the one O_NOFOLLOW answers.
+//
+// The directory check cannot cover this: the directory is a perfectly ordinary
+// one, and only the final component — whose name is predictable, since it is
+// derived from the deployment identity — has been replaced. Following it would
+// write and lock somewhere else entirely while reporting the expected path.
+func TestASymlinkedLockFileIsRefused(t *testing.T) {
+	t.Parallel()
+
+	const id = "0123456789abcdef0123456789abcdef"
+
+	dir := t.TempDir()
+	elsewhere := filepath.Join(t.TempDir(), "real.lock")
+
+	if err := os.WriteFile(elsewhere, nil, 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	if err := os.Symlink(elsewhere, filepath.Join(dir, "deployment-"+id+".lock")); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	if _, err := LockDeployment(id, LockOptions{Dir: dir}); err == nil {
+		t.Fatalf("the lock followed a symlink at its own path and locked %s instead", elsewhere)
+	}
+}

@@ -1027,6 +1027,18 @@ func (c *Config) validateServer() []error {
 		errs = append(errs, errors.New(
 			"server.max_memory must be positive; it is the ceiling the allocator escrows against"))
 	}
+	// CAUGHT AT LOAD, not at lock time, because the failure it prevents is
+	// invisible at lock time. A relative lock_dir resolves against each process's
+	// working directory, so one config saying `lock_dir: locks` puts a systemd
+	// unit started in / and an operator started in /srv/billet into different
+	// collision domains — and both log the same relative string, so the startup
+	// diagnostic meant to expose a mismatch would hide this one instead.
+	if c.Server.LockDir != "" && !filepath.IsAbs(c.Server.LockDir) {
+		errs = append(errs, fmt.Errorf(
+			"server.lock_dir must be an absolute path, got %q: a relative one resolves against "+
+				"each process's working directory, so two billets sharing this config could "+
+				"lock different files while reporting the same path", c.Server.LockDir))
+	}
 	return errs
 }
 

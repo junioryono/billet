@@ -84,8 +84,8 @@ func LockDeployment(id string, opts LockOptions) (*DeploymentLock, error) {
 		return nil, fmt.Errorf("state: refusing to lock: %w", err)
 	}
 
-	dir := opts.Dir
-	if dir == "" {
+	dir, operatorChose := opts.Dir, opts.Dir != ""
+	if !operatorChose {
 		var err error
 
 		dir, err = defaultLockDir()
@@ -94,13 +94,33 @@ func LockDeployment(id string, opts LockOptions) (*DeploymentLock, error) {
 		}
 	}
 
+	// ABSOLUTE, AND RESOLVED BEFORE IT IS USED OR LOGGED. A relative lock_dir is
+	// interpreted against the working directory, so one config saying
+	// `lock_dir: locks` puts a systemd unit started in / and an operator started
+	// in /srv/billet into DIFFERENT collision domains — and both would log the
+	// same relative string, so the diagnostic that exists to expose a mismatch
+	// would conceal this one.
+	if !filepath.IsAbs(dir) {
+		return nil, fmt.Errorf(
+			"state: server.lock_dir must be an absolute path, got %q: a relative one resolves "+
+				"against each process's working directory, so two billets sharing this config "+
+				"could lock different files while reporting the same path", dir)
+	}
+
+	dir = filepath.Clean(dir)
+
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return unplaceable(opts, fmt.Sprintf("cannot create %s (%v)", dir, err))
 	}
 
+	shared, err := checkLockDir(dir, operatorChose)
+	if err != nil {
+		return unplaceable(opts, err.Error())
+	}
+
 	path := filepath.Join(dir, "deployment-"+id+".lock")
 
-	lock, err := lockFile(path)
+	lock, err := lockFile(path, shared)
 	if err != nil {
 		if errors.Is(err, ErrLocked) {
 			return nil, fmt.Errorf(
@@ -146,6 +166,67 @@ func (d *DeploymentLock) Degraded() string {
 	return d.degraded
 }
 
+// checkLockDir refuses a directory an untrusted party could interfere with, and
+// reports whether it is a SHARED one.
+//
+// MkdirAll IS NOT ENOUGH, which state.Open already knew and this did not: its
+// mode applies only to components it CREATES, so an existing directory keeps
+// whatever permissions it had. That matters more here than it looks, because
+// failing closed made it matter: with degradation gone, a directory an
+// unprivileged user can write is no longer just a way to defeat the lock by
+// unlinking the file — it is a way to hold the filename and keep billet from
+// ever starting. That is precisely the denial of service that ruled out /tmp in
+// the first place, so the two fixes interact and this is where it is paid for.
+//
+// TWO REGIMES, because the answer genuinely differs:
+//
+//   - A path BILLET chose (the per-user default) must be ours alone. Nobody else
+//     has any business writing there, so group- and world-writable are both
+//     refused, and the mode is tightened the way state.Open tightens its own.
+//   - A path the OPERATOR chose is allowed to be group-writable, because that is
+//     the entire point of server.lock_dir: a setgid directory shared by a service
+//     account and an operator who both reach the same docker socket. They are
+//     trusted with each other's compute by construction. World-writable is still
+//     refused under both.
+func checkLockDir(dir string, operatorChose bool) (bool, error) {
+	// Lstat, not Stat: a symlink here is someone redirecting the lock, and
+	// following it to ask about the target would answer the wrong question.
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return false, fmt.Errorf("cannot inspect %s (%w)", dir, err)
+	}
+
+	if info.Mode()&os.ModeSymlink != 0 {
+		return false, fmt.Errorf("%s is a symlink, so what it locks can be redirected", dir)
+	}
+
+	if !info.IsDir() {
+		return false, fmt.Errorf("%s is not a directory", dir)
+	}
+
+	perm := info.Mode().Perm()
+
+	if perm&0o002 != 0 {
+		return false, fmt.Errorf(
+			"%s is world-writable (%o), so any local user could hold the lock file and keep "+
+				"billet from starting", dir, perm)
+	}
+
+	if !operatorChose {
+		if perm&0o020 != 0 {
+			// Tightened rather than refused: billet picked this path, so it is
+			// billet's to correct — and state.Open sets the precedent one screen up.
+			if err := os.Chmod(dir, 0o700); err != nil {
+				return false, fmt.Errorf("cannot tighten %s from %o (%w)", dir, perm, err)
+			}
+		}
+
+		return false, nil
+	}
+
+	return perm&0o020 != 0, nil
+}
+
 // unplaceable is what happens when there is nowhere to put the lock: an error
 // unless the operator has said otherwise.
 func unplaceable(opts LockOptions, why string) (*DeploymentLock, error) {
@@ -183,17 +264,26 @@ func unplaceable(opts LockOptions, why string) (*DeploymentLock, error) {
 // Not /tmp, under any circumstances: it is world-writable, so any local user
 // could pre-create the lock file and hold it, keeping billet from ever starting.
 func defaultLockDir() (string, error) {
+	home, err := os.UserHomeDir()
+
+	// GOOS FIRST, and the previous order was a documentation bug as much as a
+	// code one: the comment said darwin uses Application Support while the code
+	// consulted XDG_STATE_HOME on every platform, so setting that variable moved
+	// a macOS lock somewhere the docs said it could not go.
+	if runtime.GOOS == "darwin" {
+		if err != nil {
+			return "", err
+		}
+
+		return filepath.Join(home, "Library", "Application Support", "billet", "locks"), nil
+	}
+
 	if dir := os.Getenv("XDG_STATE_HOME"); dir != "" && filepath.IsAbs(dir) {
 		return filepath.Join(dir, "billet", "locks"), nil
 	}
 
-	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
-	}
-
-	if runtime.GOOS == "darwin" {
-		return filepath.Join(home, "Library", "Application Support", "billet", "locks"), nil
 	}
 
 	return filepath.Join(home, ".local", "state", "billet", "locks"), nil
