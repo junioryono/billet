@@ -1349,3 +1349,232 @@ tiers:
 		t.Errorf("the error does not name the offending field: %v", err)
 	}
 }
+
+// A tier may name one backend or an ordered list, and both read the same way.
+func TestATierReportsItsAcceptableProviders(t *testing.T) {
+	t.Parallel()
+
+	single := Tier{Provider: ProviderDocker}
+
+	if got := single.AcceptableProviders(); len(got) != 1 || got[0] != ProviderDocker {
+		t.Errorf("a single provider read back as %v", got)
+	}
+
+	list := Tier{Providers: []ProviderKind{ProviderFirecracker, ProviderEC2}}
+
+	if got := list.AcceptableProviders(); len(got) != 2 || got[0] != ProviderFirecracker {
+		t.Errorf("a provider list read back as %v, and its ORDER is its meaning", got)
+	}
+
+	if !list.AcceptsProvider(ProviderEC2) {
+		t.Error("a listed fallback was not accepted")
+	}
+
+	if list.AcceptsProvider(ProviderDocker) {
+		t.Error("accepted a backend the tier never named")
+	}
+}
+
+// BOTH SPELLINGS IS AN ERROR, not a merge.
+//
+// They are two ways of writing the same field, and guessing which one an
+// operator meant is not a kindness when the answer decides where untrusted code
+// runs.
+func TestATierCannotSetBothProviderAndProviders(t *testing.T) {
+	t.Parallel()
+
+	tier := Tier{
+		Label:     "billet-8vcpu",
+		Provider:  ProviderFirecracker,
+		Providers: []ProviderKind{ProviderFirecracker, ProviderEC2},
+		VCPU:      8,
+		Memory:    32 * GiB,
+		Image:     "ubuntu-2404",
+		GuestOS:   GuestLinux,
+	}
+
+	errs := tier.ProviderErrors("tiers[0]")
+	if len(errs) == 0 {
+		t.Fatal("accepted a tier that sets provider and providers")
+	}
+
+	if !strings.Contains(errs[0].Error(), "not both") {
+		t.Errorf("the error does not say what to do: %v", errs[0])
+	}
+}
+
+// A repeated provider is a typo, not a stronger preference.
+//
+// There is no second chance at the same backend, so collapsing it silently would
+// hide the mistake inside a list whose entire meaning is its order.
+func TestADuplicateProviderIsRefused(t *testing.T) {
+	t.Parallel()
+
+	tier := Tier{
+		Label:     "billet-8vcpu",
+		Providers: []ProviderKind{ProviderEC2, ProviderEC2},
+	}
+
+	if errs := tier.ProviderErrors("tiers[0]"); len(errs) == 0 {
+		t.Fatal("accepted a tier listing the same provider twice")
+	}
+}
+
+func TestATierWithNoProviderIsRefused(t *testing.T) {
+	t.Parallel()
+
+	if errs := (Tier{Label: "billet-8vcpu"}).ProviderErrors("tiers[0]"); len(errs) == 0 {
+		t.Fatal("accepted a tier that names no backend; its leases could never be placed")
+	}
+}
+
+// A macOS tier may not carry a non-Apple FALLBACK.
+//
+// Apple's licence permits macOS guests only on Apple hardware, and a fallback is
+// exactly the case nobody is watching when it fires — so every listed provider
+// must be Tart, not merely the first.
+func TestAMacOSTierCannotFallBackOffAppleHardware(t *testing.T) {
+	t.Parallel()
+
+	c := &Config{
+		Tiers: []Tier{{
+			Label:     "billet-6vcpu-macos",
+			Providers: []ProviderKind{ProviderTart, ProviderEC2},
+			Node:      "mac-mini-1",
+			VCPU:      6,
+			Memory:    16 * GiB,
+			Image:     "macos-26",
+			GuestOS:   GuestMacOS,
+		}},
+	}
+
+	var found bool
+
+	for _, err := range c.validateGuestOSRules("tiers[0]", &c.Tiers[0]) {
+		if strings.Contains(err.Error(), "tart") {
+			found = true
+		}
+	}
+
+	if !found {
+		t.Fatal("a macOS tier was allowed to fall back to a non-Apple backend")
+	}
+}
+
+// A tier that names providers is not given the local one as well.
+//
+// Defaulting tested the single `provider` field, which a tier written with
+// `providers:` leaves empty — so billet stamped the local backend onto a tier
+// that had already named several, and then refused the config as "you set both",
+// blaming the operator for a field it had just filled in itself. Found by
+// running `billet check` against a multi-provider tier, which is exactly the
+// thing the feature is for.
+func TestATierWithProvidersDoesNotInheritTheLocalOne(t *testing.T) {
+	t.Parallel()
+
+	c := &Config{
+		Server: &ServerConfig{Listen: "127.0.0.1:7717", StateDir: t.TempDir(),
+			MaxVCPU: 8, MaxMemory: 16 * GiB},
+		Node: &NodeConfig{
+			Name: "test-host", ServerAddr: "127.0.0.1:7717",
+			Provider: ProviderDocker, StateDir: t.TempDir(),
+		},
+		Tiers: []Tier{{
+			Label:     "billet-8vcpu-ubuntu-2404",
+			Providers: []ProviderKind{ProviderFirecracker, ProviderEC2},
+			VCPU:      8,
+			Memory:    32 * GiB,
+			Image:     "ubuntu-2404-x64",
+		}},
+	}
+
+	c.applyDefaults()
+
+	if c.Tiers[0].Provider != "" {
+		t.Fatalf("a tier that named providers was also given provider %q, which validation "+
+			"then refuses as setting both", c.Tiers[0].Provider)
+	}
+
+	accepted := c.Tiers[0].AcceptableProviders()
+	if len(accepted) != 2 || accepted[0] != ProviderFirecracker {
+		t.Errorf("the tier's own list was altered by defaulting: %v", accepted)
+	}
+}
+
+// A PLURAL tier pinned to a host it can never bind to is refused at load.
+//
+// The check compared the singular `provider` field, which a tier written with
+// `providers:` leaves empty — so this config loaded perfectly cleanly and the
+// failure surfaced only at runtime, after capacity had been escrowed and a job
+// offered. The whole reason for a load-time guard is that the runtime symptom is
+// a job that queues forever.
+func TestAPluralTierPinnedToAWrongHostIsRefused(t *testing.T) {
+	t.Parallel()
+
+	c := &Config{
+		Nodes: []NodePolicy{{Name: "mac-mini-1", Provider: ProviderTart}},
+		Tiers: []Tier{{
+			Label:     "billet-8vcpu-ubuntu-2404",
+			Providers: []ProviderKind{ProviderFirecracker, ProviderEC2},
+			Node:      "mac-mini-1",
+			VCPU:      8,
+			Memory:    32 * GiB,
+			Image:     "ubuntu-2404-x64",
+			GuestOS:   GuestLinux,
+		}},
+	}
+
+	var found bool
+
+	for _, err := range c.validateGuestOSRules("tiers[0]", &c.Tiers[0]) {
+		if strings.Contains(err.Error(), "pinned to node") {
+			found = true
+		}
+	}
+
+	if !found {
+		t.Fatal("a tier that can never bind to the host it is pinned to loaded cleanly; " +
+			"its jobs would queue forever with no diagnostic")
+	}
+}
+
+// An UNPINNED plural tier is constrained by a matching host's allowlist.
+//
+// The unpinned branch compared the singular field, so a tier written with
+// `providers:` was never checked against any host's guest_os allowlist — the
+// list could contain tart and a macOS-only Mac would still not object. Every
+// existing test for this branch used `provider:`, so reverting it to equality
+// left them all green.
+func TestAnUnpinnedPluralTierIsCheckedAgainstAllowlists(t *testing.T) {
+	t.Parallel()
+
+	c := &Config{
+		// A Mac that will only run macOS guests.
+		Nodes: []NodePolicy{{
+			Name: "mac-mini-1", Provider: ProviderTart, GuestOS: []GuestOS{GuestMacOS},
+		}},
+		Tiers: []Tier{{
+			Label: "billet-4vcpu-ubuntu-arm",
+			// Unpinned, and tart is one of the backends it accepts — so this Mac is
+			// a placement candidate and its allowlist applies.
+			Providers: []ProviderKind{ProviderFirecracker, ProviderTart},
+			VCPU:      4,
+			Memory:    12 * GiB,
+			Image:     "ubuntu-2404-arm64",
+			GuestOS:   GuestLinux,
+		}},
+	}
+
+	var found bool
+
+	for _, err := range c.validateGuestOSRules("tiers[0]", &c.Tiers[0]) {
+		if strings.Contains(err.Error(), "allowlist") {
+			found = true
+		}
+	}
+
+	if !found {
+		t.Fatal("an unpinned plural tier was not checked against a candidate host's " +
+			"guest_os allowlist; a linux guest could be scheduled onto a macOS-only Mac")
+	}
+}

@@ -128,16 +128,19 @@ func TestUnrecognisedEventsAreNotTrusted(t *testing.T) {
 func TestATierForAnotherBackendIsRefused(t *testing.T) {
 	p := &fakeProvider{kind: config.ProviderDocker}
 
+	// The LEASE is reserved for firecracker; the host runs docker. Setting this
+	// up the other way round — a firecracker catalogue over a docker-reserved
+	// lease — tested nothing, because the runner reads the lease.
 	firecracker := dockerTier()
 	firecracker.Provider = config.ProviderFirecracker
 
-	a, host := newAllocatorWithHost(t)
+	a, host := newAllocatorForTiers(t, openState(t), firecracker)
 
 	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{firecracker}, nil)
 
 	err := r.Launch(t.Context(), assignedLease(t, a), Job{RequestID: 11, Event: "push"})
 	if err == nil {
-		t.Fatal("ran a firecracker tier's job on a docker host")
+		t.Fatal("ran a firecracker lease's job on a docker host")
 	}
 
 	if len(p.launched) != 0 {
@@ -456,8 +459,20 @@ func newAllocatorWithHost(t *testing.T) (*alloc.Allocator, string) {
 
 	t.Cleanup(func() { _ = db.Close() })
 
-	a, err := alloc.New(db, alloc.Limits{MaxVCPU: 32, MaxMemory: 128 * config.GiB},
-		[]config.Tier{dockerTier()})
+	return newAllocatorForTiers(t, db, dockerTier())
+}
+
+// newAllocatorForTiers builds an allocator over a chosen catalogue.
+//
+// The catalogue matters because the LEASE is the authority on which backends it
+// may run on: the ledger snapshots that list at reserve time so a config edit
+// under an in-flight lease cannot reclassify it. A test that wants the runner to
+// refuse a host has to arrange the mismatch HERE — handing the runner a
+// different live catalogue proves nothing, because the runner does not read it.
+func newAllocatorForTiers(t *testing.T, db *state.DB, tiers ...config.Tier) (*alloc.Allocator, string) {
+	t.Helper()
+
+	a, err := alloc.New(db, alloc.Limits{MaxVCPU: 32, MaxMemory: 128 * config.GiB}, tiers)
 	if err != nil {
 		t.Fatalf("alloc.New: %v", err)
 	}
@@ -469,6 +484,20 @@ func newAllocatorWithHost(t *testing.T) (*alloc.Allocator, string) {
 	}
 
 	return a, host
+}
+
+// openState opens a throwaway ledger.
+func openState(t *testing.T) *state.DB {
+	t.Helper()
+
+	db, err := state.Open(t.Context(), t.TempDir())
+	if err != nil {
+		t.Fatalf("state.Open: %v", err)
+	}
+
+	t.Cleanup(func() { _ = db.Close() })
+
+	return db
 }
 
 // assignedLease reserves and assigns a lease, which is the state Launch expects
@@ -894,5 +923,144 @@ func TestAFailedRegistrationDropsTheCachedScaleSet(t *testing.T) {
 
 	if jit.describes != 2 {
 		t.Errorf("kept using a scale-set id that had just failed; %d resolutions", jit.describes)
+	}
+}
+
+// A host running the tier's FALLBACK backend runs the job.
+//
+// The node had its own equality check against the single `provider:` field,
+// which is empty whenever `providers:` is used — so every legitimate fallback
+// was refused one layer below the allocator that had just permitted it. Two
+// checks of the same rule, and only one of them updated, is the shape of bug
+// that survives a green test suite.
+func TestAHostRunningTheFallbackBackendIsAccepted(t *testing.T) {
+	t.Parallel()
+
+	// The tier prefers firecracker; this host runs docker, which is second on the
+	// list.
+	// The lease is reserved for [firecracker, docker]; this host runs docker,
+	// which is second on the list.
+	tier := dockerTier()
+	tier.Provider = ""
+	tier.Providers = []config.ProviderKind{config.ProviderFirecracker, config.ProviderDocker}
+
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorForTiers(t, openState(t), tier)
+	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{tier}, nil)
+
+	if err := r.Launch(t.Context(), assignedLease(t, a), Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("a host running the lease's fallback backend refused the job: %v", err)
+	}
+
+	if len(p.launched) != 1 {
+		t.Fatal("nothing was started on the fallback host")
+	}
+}
+
+// A host running a backend the tier never named is still refused.
+func TestAHostOutsideTheTiersListIsRefused(t *testing.T) {
+	t.Parallel()
+
+	tier := dockerTier()
+	tier.Provider = ""
+	tier.Providers = []config.ProviderKind{config.ProviderFirecracker, config.ProviderEC2}
+
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorForTiers(t, openState(t), tier)
+	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{tier}, nil)
+
+	err := r.Launch(t.Context(), assignedLease(t, a), Job{RequestID: 11, Event: "push"})
+	if err == nil {
+		t.Fatal("ran a job on a backend its lease never named")
+	}
+
+	if len(p.launched) != 0 {
+		t.Fatal("started something before refusing")
+	}
+}
+
+// THE LEASE OUTRANKS THE CATALOGUE.
+//
+// The ledger snapshots a tier's acceptable backends at reserve time so an
+// operator editing the config cannot reclassify work that is already in flight.
+// The runner used to check the LIVE catalogue instead, which contradicted that
+// from both directions: remove a provider and it refused a lease the ledger
+// still permitted, so the listener released it and GitHub had to reassign the
+// job; add one and it waved through a lease Bind would refuse.
+//
+// Two authorities for one fact is the bug. This pins which one wins.
+func TestTheLeaseOutranksALaterCatalogueEdit(t *testing.T) {
+	t.Parallel()
+
+	// Reserved when the tier still accepted docker.
+	reserved := dockerTier()
+
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorForTiers(t, openState(t), reserved)
+	lease := assignedLease(t, a)
+
+	// The operator then edits the config to drop docker and restarts. The runner
+	// gets the NEW catalogue; the lease still carries the old list.
+	edited := dockerTier()
+	edited.Provider = ""
+	edited.Providers = []config.ProviderKind{config.ProviderFirecracker}
+
+	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{edited}, nil)
+
+	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("a catalogue edit reclassified a lease that was already placed, so the "+
+			"listener will release it and GitHub must reassign the job: %v", err)
+	}
+
+	if len(p.launched) != 1 {
+		t.Error("the job did not start")
+	}
+}
+
+// THE SIZE COMES FROM THE LEASE, not the live catalogue.
+//
+// The ledger escrowed a lease's vCPU and memory when it was reserved and is
+// still accounting for those numbers. Reading the tier meant a label edited from
+// 2 vCPU to 16 started a 16-vCPU guest against 2 vCPU of reservation — and
+// enough of those physically over-commit the machine while every ledger total
+// still balances, which is the worst shape a capacity bug can take.
+//
+// The same two-authorities defect as the provider list, one field over.
+func TestLaunchSizesTheGuestFromTheLeaseNotTheCatalogue(t *testing.T) {
+	t.Parallel()
+
+	// Reserved small.
+	small := dockerTier()
+	small.VCPU = 2
+	small.Memory = 4 * config.GiB
+
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorForTiers(t, openState(t), small)
+	lease := assignedLease(t, a)
+
+	// The operator then edits the label to be much bigger and restarts.
+	big := small
+	big.VCPU = 16
+	big.Memory = 64 * config.GiB
+
+	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{big}, nil)
+
+	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	if len(p.launched) != 1 {
+		t.Fatal("nothing was started")
+	}
+
+	spec := p.launched[0]
+
+	if spec.VCPU != 2 {
+		t.Errorf("started a %d vCPU guest against a 2 vCPU reservation; the host is now "+
+			"over-committed and the ledger still balances", spec.VCPU)
+	}
+
+	if spec.Memory != 4*config.GiB {
+		t.Errorf("started a %s guest against a 4GiB reservation", spec.Memory)
 	}
 }

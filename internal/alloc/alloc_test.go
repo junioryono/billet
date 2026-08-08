@@ -1358,7 +1358,7 @@ func TestUnverifiableLegacyLeaseFailsClosed(t *testing.T) {
 
 	// Reproduce a row written before the provider column existed.
 	if err := a.db.Tx(ctx, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `UPDATE leases SET provider = '' WHERE id = ?`, lease.ID)
+		_, err := tx.ExecContext(ctx, `UPDATE leases SET providers = '' WHERE id = ?`, lease.ID)
 
 		return err
 	}); err != nil {
@@ -1635,7 +1635,7 @@ func TestSamePhaseAdvanceStillChecksPlacement(t *testing.T) {
 	// its placement cannot be verified.
 	if err := a.db.Tx(ctx, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx,
-			`UPDATE leases SET phase = 'launching', node = 'epyc-1', provider = '' WHERE id = ?`,
+			`UPDATE leases SET phase = 'launching', node = 'epyc-1', providers = '' WHERE id = ?`,
 			lease.ID)
 
 		return err
