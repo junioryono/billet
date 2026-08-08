@@ -245,7 +245,12 @@ func runServer(ctx context.Context, cfg *config.Config, dryRun, dev bool) error 
 	}
 
 	if dev {
-		p, err := newProvider(cfg)
+		deployment, err := state.DeploymentID(cfg.Server.StateDir)
+		if err != nil {
+			return err
+		}
+
+		p, err := newProvider(cfg, deployment)
 		if err != nil {
 			return err
 		}
@@ -260,19 +265,18 @@ func runServer(ctx context.Context, cfg *config.Config, dryRun, dev bool) error 
 
 		runner := node.New(allocator, cfg.Node.Name, jitSource{c: client}, p, cfg.Tiers, slog.Default())
 
-		// SWEPT BEFORE A SINGLE JOB IS ADMITTED.
+		// CLEARED BEFORE A SINGLE JOB IS ADMITTED.
 		//
-		// A crash between starting a container and recording it leaves the
-		// container running and the lease gone. That container still holds vCPU and
-		// memory, and the allocator — which lost the lease — believes both are
-		// free. Admitting work first therefore over-commits the host by exactly as
-		// much as the crash leaked, and the symptom is a machine that thrashes
-		// after every unclean shutdown rather than an error anyone can read.
+		// Everything this backend is running belongs to a process that is gone —
+		// this one has empty maps and can neither heartbeat those leases nor notice
+		// their completion. Left alone, such a container runs forever on capacity
+		// the reaper will shortly hand back out, so the host ends up over-committed
+		// by exactly what the crash leaked.
 		//
 		// Fatal on failure, deliberately. Not knowing what is already running is
-		// not the same as nothing running, and starting anyway is the choice that
-		// turns a recoverable mess into a compounding one.
-		if err := runner.Reconcile(ctx); err != nil {
+		// not the same as nothing running, and starting anyway turns a recoverable
+		// mess into a compounding one.
+		if err := runner.Recover(ctx); err != nil {
 			return err
 		}
 
@@ -301,10 +305,14 @@ func runServer(ctx context.Context, cfg *config.Config, dryRun, dev bool) error 
 // Apple Silicon, ec2 needs an account — each is a separate implementation of the
 // same interface, and each is refused explicitly rather than falling through to
 // something that happens to compile.
-func newProvider(cfg *config.Config) (provider.Provider, error) {
+func newProvider(cfg *config.Config, deployment string) (provider.Provider, error) {
 	switch cfg.Node.Provider {
 	case config.ProviderDocker:
-		return docker.New(cfg.Node.Name, docker.WithLogger(slog.Default())), nil
+		// Labelled with the DEPLOYMENT id, not the node name. Two billets on one
+		// machine share a hostname — and therefore a default node name — while
+		// keeping separate state directories, so a node-name label would let each
+		// enumerate the other's containers and destroy them as orphans.
+		return docker.New(deployment, docker.WithLogger(slog.Default())), nil
 
 	case config.ProviderFirecracker, config.ProviderTart, config.ProviderEC2:
 		return nil, fmt.Errorf("%w: the %s provider is not built yet; --dev currently runs the "+

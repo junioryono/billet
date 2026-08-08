@@ -267,10 +267,37 @@ func (s *Server) reapPeriodically(ctx context.Context) {
 				s.log.Info("reclaimed capacity from leases with no live holder", "leases", n)
 			}
 
+			// SWEPT AFTER REAPING, IN THAT ORDER. The reap is what terminalizes the
+			// lease of a holder that died, so a container that was legitimate a
+			// moment ago becomes an orphan during this very tick. Sweeping first
+			// would consistently miss exactly the case the pair exists for.
+			s.sweep(ctx)
+
 			if s.onReap != nil {
 				s.onReap(n)
 			}
 		}
+	}
+}
+
+// sweep asks the runner to destroy compute no lease is holding, if it can.
+//
+// Failures are logged rather than returned: this runs on a timer beside the
+// reaper, and taking the control plane down because one container would not die
+// would convert a bounded over-commitment into a total outage. The next tick
+// tries again, which is the whole point of doing this on a timer.
+func (s *Server) sweep(ctx context.Context) {
+	sweeper, ok := s.runner.(Sweeper)
+	if !ok {
+		return
+	}
+
+	if err := sweeper.Sweep(ctx); err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+
+		s.log.Warn("could not remove compute that no lease is holding", "error", err)
 	}
 }
 

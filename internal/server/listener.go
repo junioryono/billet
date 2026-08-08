@@ -64,6 +64,25 @@ type Runner interface {
 	Destroy(ctx context.Context, requestID int64) error
 }
 
+// Sweeper is a Runner that can also find compute nothing is asking about.
+//
+// Optional, and asserted for rather than required, because the two questions are
+// answerable by different things. Launch and Destroy are per-job and a remote
+// node will always implement them; enumerating everything a backend is running
+// is a whole-host operation that a node may not be able to answer during a
+// partition — and a control plane that refused to start without it would be
+// trading a real capability for a hypothetical one.
+type Sweeper interface {
+	// Sweep destroys compute whose lease is no longer open.
+	//
+	// Called after each reap, because reaping is what MAKES a container an
+	// orphan: the lease it was running under is exactly what the reaper has just
+	// terminalized. Anything else that leaks compute — a stray a failed launch
+	// could not confirm, a Destroy the backend refused — is picked up by the same
+	// pass, which is why a failed cleanup is survivable rather than permanent.
+	Sweep(ctx context.Context) error
+}
+
 // errNoRunner means no compute is attached to this control plane.
 var errNoRunner = errors.New("server: no runner is configured, so nothing can start this job")
 

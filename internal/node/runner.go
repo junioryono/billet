@@ -9,6 +9,7 @@ package node
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -290,33 +291,113 @@ func (r *Runner) destroyStray(ctx context.Context, name string) {
 	}
 }
 
-// Reconcile destroys instances this node is running that no lease still wants.
+// Recover destroys everything this node is running, because nothing here is
+// ours yet. Called once at startup, before any listener opens a session.
 //
-// The recovery path for everything that can interrupt a launch. `running` is
-// in-memory, so a restart forgets every instance it started; the leases outlive
-// the process, and the instance names encode which lease each belongs to, so the
-// two together are enough to tell survivors from orphans without any durable
-// record of the launch itself.
+// The predicate is NOT "does a lease still want this". An open lease says the
+// job was wanted; it does not say the process that has just started can manage
+// the container. It cannot: the maps that map a request id to an instance, and a
+// lease to its heartbeat, are in memory, and this process has empty ones. A
+// container spared here would run with nothing to heartbeat its lease, nothing
+// to notice its completion, and nothing to destroy it afterwards — the lease
+// would expire, the reaper would hand its capacity back, and the container would
+// keep running forever on capacity billet had already re-sold.
 //
-// Run at startup, BEFORE any listener opens a session. An orphan holds vCPU and
-// memory the allocator has already released, so admitting work first means
-// over-committing the host by exactly as much as the crash leaked.
+// So a restart is destructive, and the honest description of the cost is that a
+// job which might have finished is killed and GitHub requeues it. That is what
+// already happens on a graceful shutdown, so it is not a new behaviour — only a
+// crash now behaves like a stop instead of leaking.
 //
-// It is deliberately not periodic. A sweep racing a live Launch would see an
-// instance whose lease had not yet been bound and destroy a job that was
-// starting normally; at startup nothing else is running, which is what makes the
-// comparison sound.
-func (r *Runner) Reconcile(ctx context.Context) error {
+// The alternative is adoption: reconstructing request-id ownership, heartbeat
+// responsibility, session semantics and completion teardown for compute this
+// process never started. That is a real feature, not a branch in this function,
+// and it is worth building only once the node runs in its own process — at which
+// point a server restart MUST not destroy a live node's work.
+func (r *Runner) Recover(ctx context.Context) error {
 	instances, err := r.provider.List(ctx)
 	if err != nil {
 		return fmt.Errorf("node: list what is already running: %w", err)
+	}
+
+	var failed int
+
+	for _, inst := range instances {
+		leaseID, ours := provider.LeaseOf(inst.Name)
+
+		// NOT OURS, NOT TOUCHED. The provider filters by this deployment's own
+		// label, so this should be unreachable — but the action here is
+		// destruction, and "should be unreachable" is a poor argument for a loop
+		// that destroys. Adopting a name billet did not choose is the one mistake
+		// with no undo.
+		if !ours {
+			r.log.Warn("ignoring an instance whose name billet did not assign",
+				"name", inst.Name, "instance", inst.ID)
+
+			continue
+		}
+
+		r.log.Warn("destroying an instance left by an earlier run; this process cannot manage it",
+			"name", inst.Name, "instance", inst.ID, "lease", leaseID)
+
+		if err := r.provider.Destroy(ctx, inst.ID); err != nil {
+			failed++
+
+			r.log.Error("could not destroy an instance left by an earlier run",
+				"name", inst.Name, "instance", inst.ID, "error", err)
+
+			continue
+		}
+
+		// The lease goes with it. Waiting for the reaper would hold its vCPU and
+		// memory for a full lease TTL after the compute they were paying for is
+		// already gone, which is a self-inflicted capacity shortfall on every
+		// restart.
+		if err := r.releaseOrphanedLease(ctx, leaseID); err != nil {
+			r.log.Warn("destroyed an instance but could not release its lease",
+				"lease", leaseID, "error", err)
+		}
+	}
+
+	if failed > 0 {
+		// REPORTED, not swallowed. An instance that resists destruction is holding
+		// capacity the ledger believes is free, and a caller that starts admitting
+		// work anyway over-commits the host by exactly that much.
+		return fmt.Errorf("node: %d instance(s) left by an earlier run could not be destroyed", failed)
+	}
+
+	if len(instances) > 0 {
+		r.log.Info("removed instances left behind by an earlier run", "count", len(instances))
+	}
+
+	return nil
+}
+
+// Sweep destroys instances whose lease is no longer open on this node.
+//
+// The steady-state counterpart to Recover, and the reason a failed cleanup is
+// survivable rather than permanent. Three things leak compute while the process
+// is alive and none of them is reachable by a startup-only pass: a stray that
+// Find could not confirm, a Destroy the daemon refused, and a lease reaped out
+// from under a container that is still running.
+//
+// Safe to run concurrently with live launches, because of an ordering the launch
+// path guarantees: Bind and Advance(launching) both commit BEFORE the provider
+// is asked to create anything. So an instance that appears in the list already
+// has a lease at launching or beyond, and a sweep cannot see compute whose lease
+// has not yet been written. (I had this backwards when Recover was written, and
+// argued a sweep would race a starting job. It cannot — the list is taken first,
+// so anything in it predates the query that judges it.)
+func (r *Runner) Sweep(ctx context.Context) error {
+	instances, err := r.provider.List(ctx)
+	if err != nil {
+		return fmt.Errorf("node: list running instances: %w", err)
 	}
 
 	if len(instances) == 0 {
 		return nil
 	}
 
-	open, err := r.alloc.OpenLeaseIDs(ctx, r.node)
+	open, err := r.alloc.LaunchedLeaseIDs(ctx, r.node)
 	if err != nil {
 		return fmt.Errorf("node: list leases still open on %s: %w", r.node, err)
 	}
@@ -325,11 +406,6 @@ func (r *Runner) Reconcile(ctx context.Context) error {
 
 	for _, inst := range instances {
 		leaseID, ours := provider.LeaseOf(inst.Name)
-
-		// NOT OURS, NOT TOUCHED. The provider filters by billet's owner label, so
-		// this should be unreachable — but "should be unreachable" is a poor
-		// argument for a loop whose action is destruction, and adopting a name
-		// billet did not choose is the one mistake with no undo.
 		if !ours {
 			r.log.Warn("ignoring an instance whose name billet did not assign",
 				"name", inst.Name, "instance", inst.ID)
@@ -355,17 +431,31 @@ func (r *Runner) Reconcile(ctx context.Context) error {
 	}
 
 	if failed > 0 {
-		// REPORTED, not swallowed. An orphan that resists destruction is holding
-		// capacity the allocator believes is free, and a caller that starts
-		// admitting work anyway will over-commit the host by that much.
 		return fmt.Errorf("node: %d of %d orphaned instances could not be destroyed", failed, orphans)
 	}
 
 	if orphans > 0 {
-		r.log.Info("removed instances left behind by an earlier run", "count", orphans)
+		r.log.Info("removed orphaned instances", "count", orphans)
 	}
 
 	return nil
+}
+
+// releaseOrphanedLease terminalizes a lease whose compute has just been
+// destroyed, tolerating one that is already gone.
+func (r *Runner) releaseOrphanedLease(ctx context.Context, leaseID string) error {
+	lease, err := r.alloc.Lease(ctx, leaseID)
+	if err != nil {
+		if errors.Is(err, alloc.ErrLeaseNotFound) {
+			// Already terminal, or never existed. Either way there is nothing
+			// holding capacity, which is the outcome this was after.
+			return nil
+		}
+
+		return err
+	}
+
+	return r.alloc.Release(ctx, lease.ID, lease.Epoch, alloc.PhaseFailed)
 }
 
 // forgetScaleSet drops a cached id so the next launch re-resolves it.

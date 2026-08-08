@@ -1201,7 +1201,57 @@ func (a *Allocator) usage(ctx context.Context, tx *sql.Tx) (Usage, error) {
 	return u, nil
 }
 
-// OpenLeaseIDs reports the ids of every lease bound to a node and not terminal.
+// Lease reads one lease by id, whatever epoch it is at.
+//
+// No epoch argument, deliberately, and it is the only reader shaped that way.
+// Every other path holds a lease it was handed and passes the epoch back as a
+// fence. This one exists for a caller that has just found ORPHANED compute and
+// knows only the id encoded in its name — it has no epoch to present, because
+// the process that held one is gone. Reading without a fence is safe here
+// precisely because nothing is being mutated on the strength of it; the caller
+// takes the epoch from the row and presents it to Release, which fences
+// normally. A lease that moved in between fails there, which is correct.
+//
+// Returns ErrLeaseNotFound for a lease that is absent OR already terminal, so a
+// caller cleaning up cannot mistake "already finished" for "still holding
+// capacity".
+func (a *Allocator) Lease(ctx context.Context, leaseID string) (*Lease, error) {
+	var out *Lease
+
+	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+		var epoch int64
+
+		err := tx.QueryRowContext(ctx, `SELECT epoch FROM leases WHERE id = ?`, leaseID).Scan(&epoch)
+
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			return fmt.Errorf("%w: %s", ErrLeaseNotFound, leaseID)
+		case err != nil:
+			return fmt.Errorf("alloc: read lease %s: %w", leaseID, err)
+		}
+
+		l, err := a.loadAny(ctx, tx, leaseID, epoch)
+		if err != nil {
+			return err
+		}
+
+		if l.Phase.Terminal() {
+			return fmt.Errorf("%w: %s is already %s", ErrLeaseNotFound, leaseID, l.Phase)
+		}
+
+		out = l
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return out, nil
+}
+
+// LaunchedLeaseIDs reports the leases on a node that could legitimately have
+// compute running for them.
 //
 // Reconciliation's other half. A node can enumerate the compute it is running,
 // but an instance alone does not say whether it is still WANTED — that is a fact
@@ -1212,16 +1262,23 @@ func (a *Allocator) usage(ctx context.Context, tx *sql.Tx) (Usage, error) {
 // does not own, and a set containing every node's leases would let a bug on one
 // host spare an orphan on another.
 //
-// Leases still in the capacity phase are included even though nothing has been
-// launched for them yet: a lease can be advanced to launching by a concurrent
-// Launch between this query and the sweep that uses it, and treating a lease as
-// closed a moment before it starts something would destroy a live container.
-func (a *Allocator) OpenLeaseIDs(ctx context.Context, node string) (map[string]bool, error) {
+// LAUNCHING, ONLINE and BUSY — not merely "not terminal". A lease in the
+// capacity or assigned phase has nothing running for it by construction, because
+// the launch path commits Bind and Advance(launching) before it asks a provider
+// to create anything. Including those phases would spare an instance that no
+// phase authorises, which is precisely the orphan the caller is hunting.
+//
+// I first wrote this as "not terminal" and justified the wider predicate with a
+// race that does not exist: the caller lists instances BEFORE calling this, so
+// anything it is judging was already created, and anything already created
+// already has a lease at launching or beyond.
+func (a *Allocator) LaunchedLeaseIDs(ctx context.Context, node string) (map[string]bool, error) {
 	open := make(map[string]bool)
 
 	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
 		rows, err := tx.QueryContext(ctx,
-			`SELECT id FROM leases WHERE node = ? AND phase NOT IN ('done','failed')`, node)
+			`SELECT id FROM leases WHERE node = ? AND phase IN (?,?,?)`,
+			node, PhaseLaunching, PhaseOnline, PhaseBusy)
 		if err != nil {
 			return fmt.Errorf("alloc: list open leases on %s: %w", node, err)
 		}

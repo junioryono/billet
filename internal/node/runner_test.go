@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/junioryono/billet/internal/alloc"
@@ -416,7 +417,11 @@ func newAllocatorWithHost(t *testing.T) (*alloc.Allocator, string) {
 
 // assignedLease reserves and assigns a lease, which is the state Launch expects
 // to receive one in.
-var nextRequest int64 = 1000
+//
+// Atomic because these tests run in parallel. Separate databases made duplicate
+// request ids harmless in practice, which is exactly why the race would have sat
+// there being reported only by -race on an unlucky run.
+var nextRequest atomic.Int64
 
 func assignedLease(t *testing.T, a *alloc.Allocator) *alloc.Lease {
 	t.Helper()
@@ -426,13 +431,13 @@ func assignedLease(t *testing.T, a *alloc.Allocator) *alloc.Lease {
 		t.Fatalf("Reserve: %v", err)
 	}
 
-	nextRequest++
+	request := nextRequest.Add(1)
 
-	if err := a.Assign(t.Context(), lease.ID, lease.Epoch, nextRequest, nextRequest); err != nil {
+	if err := a.Assign(t.Context(), lease.ID, lease.Epoch, request, request); err != nil {
 		t.Fatalf("Assign: %v", err)
 	}
 
-	lease.RequestID = nextRequest
+	lease.RequestID = request
 
 	return lease
 }
@@ -561,15 +566,165 @@ func TestLaunchNamesTheInstanceAfterTheLease(t *testing.T) {
 // Reconcile: what survived a crash, and whether anything still wants it.
 // ============================================================================
 
-func TestReconcileDestroysAnInstanceWhoseLeaseIsGone(t *testing.T) {
+func TestRecoverDestroysEverythingAnEarlierRunLeft(t *testing.T) {
 	t.Parallel()
 
 	p := &fakeProvider{kind: config.ProviderDocker}
 	a, host := newAllocatorWithHost(t)
 	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
 
-	// A previous process launched this and died. The lease was reaped, so nothing
-	// wants the container any more — but the container does not know that.
+	lease := assignedLease(t, a)
+
+	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	// A fresh runner, because a restart is what this models: the in-memory maps
+	// are empty and the container is all that is left. The LEASE IS STILL OPEN
+	// and that is the point — an open lease says the job was wanted, not that
+	// this process can heartbeat it, notice its completion, or destroy it.
+	restarted := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
+	if err := restarted.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+
+	if len(p.live) != 0 {
+		t.Fatalf("kept a container this process cannot manage: %v", p.live)
+	}
+}
+
+func TestRecoverReleasesTheLeaseOfWhatItDestroys(t *testing.T) {
+	t.Parallel()
+
+	// Capacity has to come back with the container. Leaving the lease for the
+	// reaper holds its vCPU and memory for a full TTL after the compute they were
+	// paying for is gone — a self-inflicted shortfall on every restart.
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
+	lease := assignedLease(t, a)
+
+	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	before, err := a.Usage(t.Context())
+	if err != nil {
+		t.Fatalf("Usage: %v", err)
+	}
+
+	if before.Leases == 0 {
+		t.Fatal("the lease was not open before recovery, so this proves nothing")
+	}
+
+	restarted := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
+	if err := restarted.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+
+	after, err := a.Usage(t.Context())
+	if err != nil {
+		t.Fatalf("Usage: %v", err)
+	}
+
+	if after.Leases != 0 || after.VCPU != 0 {
+		t.Errorf("capacity stayed held after the compute was destroyed: %d leases, %d vCPU",
+			after.Leases, after.VCPU)
+	}
+}
+
+func TestRecoverIgnoresInstancesBilletDidNotName(t *testing.T) {
+	t.Parallel()
+
+	// Should be unreachable — the provider filters by this deployment's own label
+	// — but the action here is destruction, and "should be unreachable" is not a
+	// good enough reason to destroy something whose name billet did not choose.
+	p := &fakeProvider{kind: config.ProviderDocker}
+	p.add(&provider.Instance{ID: "someone-elses", Name: "postgres-dev"})
+
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
+	if err := r.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+
+	if len(p.destroyed) != 0 {
+		t.Fatalf("destroyed an instance billet did not name: %v", p.destroyed)
+	}
+}
+
+func TestRecoverReportsInstancesItCouldNotDestroy(t *testing.T) {
+	t.Parallel()
+
+	// An instance that resists destruction is still holding vCPU and memory the
+	// allocator has already handed back out. Returning nil here would let the
+	// caller start admitting work against capacity that does not exist.
+	p := &fakeProvider{kind: config.ProviderDocker, destroyErr: errors.New("daemon is not responding")}
+	p.add(&provider.Instance{ID: "stuck", Name: provider.InstanceName("deadbeef")})
+
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
+	if err := r.Recover(t.Context()); err == nil {
+		t.Fatal("reported success while an instance was still holding capacity")
+	}
+}
+
+func TestRecoverReportsAProviderThatCannotBeEnumerated(t *testing.T) {
+	t.Parallel()
+
+	// Not knowing what is running is not the same as nothing running, and
+	// treating it as the latter is how a restart over-commits the host.
+	p := &fakeProvider{kind: config.ProviderDocker, listErr: errors.New("docker daemon is not running")}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
+	if err := r.Recover(t.Context()); err == nil {
+		t.Fatal("an unreadable provider was treated as an empty one")
+	}
+}
+
+// ============================================================================
+// Sweep: the steady-state pass, which is what makes a failed cleanup temporary.
+// ============================================================================
+
+func TestSweepKeepsAnInstanceWhoseLeaseIsLaunching(t *testing.T) {
+	t.Parallel()
+
+	// The one that matters most: a sweep that destroys live work is far worse
+	// than one that misses an orphan, and this runs on a timer beside every
+	// running job.
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
+	if err := r.Launch(t.Context(), assignedLease(t, a), Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	if err := r.Sweep(t.Context()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+
+	if len(p.live) != 1 {
+		t.Fatalf("the sweep destroyed a job that is starting normally: %v", p.live)
+	}
+}
+
+func TestSweepDestroysAnInstanceWhoseLeaseWasReaped(t *testing.T) {
+	t.Parallel()
+
+	// The case the sweep exists for. The reaper terminalizes the lease of a
+	// holder that stopped heartbeating; the container it was running under is an
+	// orphan from that moment, and nothing else will ever look at it.
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
 	lease := assignedLease(t, a)
 
 	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
@@ -580,100 +735,46 @@ func TestReconcileDestroysAnInstanceWhoseLeaseIsGone(t *testing.T) {
 		t.Fatalf("Release: %v", err)
 	}
 
-	// A fresh runner, because a restart is what this models: the in-memory map is
-	// empty and the instance is all that is left.
-	restarted := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
-
-	if err := restarted.Reconcile(t.Context()); err != nil {
-		t.Fatalf("Reconcile: %v", err)
+	if err := r.Sweep(t.Context()); err != nil {
+		t.Fatalf("Sweep: %v", err)
 	}
 
 	if len(p.live) != 0 {
-		t.Fatalf("the orphan survived reconciliation: %v", p.live)
+		t.Fatalf("the orphan survived the sweep: %v", p.live)
 	}
 }
 
-func TestReconcileKeepsAnInstanceWhoseLeaseIsStillOpen(t *testing.T) {
+func TestSweepDestroysAnInstanceWhoseLeaseNeverLaunched(t *testing.T) {
 	t.Parallel()
 
-	// The mirror image, and the one that matters more: reconciliation that
-	// destroys live work is far worse than reconciliation that misses an orphan.
+	// A lease in the capacity or assigned phase authorises no compute: the launch
+	// path binds and advances to launching BEFORE asking the provider for
+	// anything. So an instance carrying such a lease's id is an orphan, and the
+	// looser "not terminal" predicate this replaced would have spared it forever.
 	p := &fakeProvider{kind: config.ProviderDocker}
 	a, host := newAllocatorWithHost(t)
+
+	lease := assignedLease(t, a)
+
+	if err := a.Bind(t.Context(), lease.ID, lease.Epoch, host); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	// Bound and assigned, but never advanced to launching.
+	p.add(&provider.Instance{ID: "ghost", Name: provider.InstanceName(lease.ID)})
+
 	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
 
-	if err := r.Launch(t.Context(), assignedLease(t, a), Job{RequestID: 11, Event: "push"}); err != nil {
-		t.Fatalf("Launch: %v", err)
+	if err := r.Sweep(t.Context()); err != nil {
+		t.Fatalf("Sweep: %v", err)
 	}
 
-	restarted := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
-
-	if err := restarted.Reconcile(t.Context()); err != nil {
-		t.Fatalf("Reconcile: %v", err)
-	}
-
-	if len(p.live) != 1 {
-		t.Fatalf("reconciliation destroyed a running job: %v", p.live)
-	}
-
-	if len(p.destroyed) != 0 {
-		t.Fatalf("reconciliation destroyed %v, whose lease was still open", p.destroyed)
+	if len(p.live) != 0 {
+		t.Fatalf("spared an instance whose lease never reached launching: %v", p.live)
 	}
 }
 
-func TestReconcileIgnoresInstancesBilletDidNotName(t *testing.T) {
-	t.Parallel()
-
-	// Should be unreachable — the provider filters by billet's own label — but
-	// the action here is destruction, and "should be unreachable" is not a good
-	// enough reason to destroy something whose name billet did not choose.
-	p := &fakeProvider{kind: config.ProviderDocker}
-	p.add(&provider.Instance{ID: "someone-elses", Name: "postgres-dev"})
-
-	a, host := newAllocatorWithHost(t)
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
-
-	if err := r.Reconcile(t.Context()); err != nil {
-		t.Fatalf("Reconcile: %v", err)
-	}
-
-	if len(p.destroyed) != 0 {
-		t.Fatalf("destroyed an instance billet did not name: %v", p.destroyed)
-	}
-}
-
-func TestReconcileReportsInstancesItCouldNotDestroy(t *testing.T) {
-	t.Parallel()
-
-	// An orphan that resists destruction is still holding vCPU and memory the
-	// allocator has already handed back out. Returning nil here would let the
-	// caller start admitting work against capacity that does not exist.
-	p := &fakeProvider{kind: config.ProviderDocker, destroyErr: errors.New("daemon is not responding")}
-	p.add(&provider.Instance{ID: "stuck", Name: provider.InstanceName("deadbeef")})
-
-	a, host := newAllocatorWithHost(t)
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
-
-	if err := r.Reconcile(t.Context()); err == nil {
-		t.Fatal("reported success while an orphan was still holding capacity")
-	}
-}
-
-func TestReconcileReportsAProviderThatCannotBeEnumerated(t *testing.T) {
-	t.Parallel()
-
-	// Not knowing what is running is not the same as nothing running, and
-	// treating it as the latter is how a restart over-commits the host.
-	p := &fakeProvider{kind: config.ProviderDocker, listErr: errors.New("docker daemon is not running")}
-	a, host := newAllocatorWithHost(t)
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
-
-	if err := r.Reconcile(t.Context()); err == nil {
-		t.Fatal("an unreadable provider was treated as an empty one")
-	}
-}
-
-func TestReconcileDestroysAnInstanceBoundToAnotherNode(t *testing.T) {
+func TestSweepDestroysAnInstanceBoundToAnotherNode(t *testing.T) {
 	t.Parallel()
 
 	// A lease open on a DIFFERENT host does not justify an instance running on
@@ -692,15 +793,64 @@ func TestReconcileDestroysAnInstanceBoundToAnotherNode(t *testing.T) {
 		t.Fatalf("Bind: %v", err)
 	}
 
+	if err := a.Advance(t.Context(), lease.ID, lease.Epoch, alloc.PhaseLaunching); err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+
 	p.add(&provider.Instance{ID: "stray", Name: provider.InstanceName(lease.ID)})
 
 	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
 
-	if err := r.Reconcile(t.Context()); err != nil {
-		t.Fatalf("Reconcile: %v", err)
+	if err := r.Sweep(t.Context()); err != nil {
+		t.Fatalf("Sweep: %v", err)
 	}
 
 	if len(p.live) != 0 {
 		t.Fatalf("kept an instance whose lease belongs to another host: %v", p.live)
+	}
+}
+
+func TestSweepClearsUpAfterACleanupThatCouldNotBeConfirmed(t *testing.T) {
+	t.Parallel()
+
+	// The composite Codex asked for, and the reason the sweep is not optional.
+	// A launch fails ambiguously AND the cleanup cannot reach the daemon, so the
+	// listener releases the lease while a container is still running. That is a
+	// real over-commitment; what makes it survivable rather than permanent is
+	// that the next sweep finds it.
+	p := &fakeProvider{
+		kind:         config.ProviderDocker,
+		launchErr:    errors.New("context deadline exceeded"),
+		startsAnyway: true,
+		findErr:      errors.New("cannot connect to the docker daemon"),
+	}
+
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	lease := assignedLease(t, a)
+
+	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err == nil {
+		t.Fatal("a launch that failed reported success")
+	}
+
+	// The stray survived, because Find could not answer. This is the leak.
+	if len(p.live) != 1 {
+		t.Fatalf("expected the unconfirmed stray to still be running, got %v", p.live)
+	}
+
+	// The listener would now release the lease, since it releases on every launch
+	// error. Model that, then let the daemon come back.
+	if err := a.Release(t.Context(), lease.ID, lease.Epoch, alloc.PhaseFailed); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+
+	p.findErr = nil
+
+	if err := r.Sweep(t.Context()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+
+	if len(p.live) != 0 {
+		t.Fatalf("the leaked container was never cleaned up: %v", p.live)
 	}
 }

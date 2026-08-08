@@ -152,15 +152,46 @@ func TestRealDockerFindAndList(t *testing.T) {
 		t.Error("Find claimed to have found a container that does not exist")
 	}
 
-	// List sees both, and only billet's own: the owner label is unique to this
-	// test, so anything else running on the developer's machine must not appear.
+	// A DECOY, carrying a DIFFERENT owner label. Without one this assertion
+	// passes on an otherwise-empty daemon even if the owner filter is deleted
+	// entirely — which is the difference between testing the filter and testing
+	// that the developer had no other containers running.
+	decoy := fmt.Sprintf("billet-decoy-%d", os.Getpid())
+	other := New(owner + "-someone-else")
+
+	t.Cleanup(func() {
+		//nolint:errcheck // best-effort
+		_ = exec.CommandContext(context.WithoutCancel(t.Context()),
+			"docker", "rm", "-f", decoy).Run()
+	})
+
+	if _, err := other.Launch(t.Context(), provider.Spec{
+		Name:      decoy,
+		Image:     "busybox:latest",
+		VCPU:      1,
+		Memory:    256 * config.MiB,
+		Trust:     provider.TrustTrusted,
+		JITConfig: "not-a-real-registration",
+	}); err != nil {
+		t.Fatalf("Launch the decoy: %v", err)
+	}
+
+	// Find must not see it either, even though its name starts with billet-.
+	if _, found, err := p.Find(t.Context(), decoy); err != nil {
+		t.Fatalf("Find the decoy: %v", err)
+	} else if found {
+		t.Error("Find returned a container belonging to another billet deployment")
+	}
+
+	// List sees both of ours, and only ours.
 	all, err := p.List(t.Context())
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
 
 	if len(all) != 2 {
-		t.Fatalf("List returned %d containers, want the 2 this test started: %v", len(all), all)
+		t.Fatalf("List returned %d containers, want the 2 this deployment started "+
+			"(a third exists under a different owner label): %v", len(all), all)
 	}
 
 	for _, got := range all {

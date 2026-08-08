@@ -32,6 +32,14 @@ import (
 // package name on every line.
 type Instance = provider.Instance
 
+// ownerLabel carries the DEPLOYMENT identity of the billet that started a
+// container — not its node name, which defaults to the hostname and is therefore
+// shared by every billet installation on one machine. See state.DeploymentID.
+//
+// This label is what List filters on, and List feeds a loop that destroys, so a
+// label two installations can both carry is a way for one to destroy the other's
+// live jobs.
+//
 // ownerLabel marks every container billet started, so orphans left by a crash
 // can be found without guessing from names.
 const ownerLabel = "sh.billet.owner"
@@ -277,7 +285,14 @@ func (p *Provider) list(ctx context.Context, filters ...string) ([]*Instance, er
 
 		id, name, ok := strings.Cut(line, "\t")
 		if !ok {
-			continue
+			// REPORTED, not skipped. Neither a container id nor a name can contain
+			// a tab, so this line is not something billet knows how to read — a
+			// docker wrapper script, a podman version that formats differently, a
+			// warning on stdout. Skipping it would let List report success while
+			// omitting a billet container, and the caller's whole purpose is to act
+			// on what is missing from that list.
+			return nil, fmt.Errorf("docker: cannot read %q as an id and a name; "+
+				"is `docker` a wrapper that prints extra output?", line)
 		}
 
 		instances = append(instances, &Instance{ID: id, Name: name})

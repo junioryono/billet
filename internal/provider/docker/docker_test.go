@@ -167,6 +167,26 @@ func stubDocker(t *testing.T) (script, argvFile string) {
 	return script, argvFile
 }
 
+// stubPrinting is a docker that prints one fixed thing on stdout.
+//
+// Separate from stubDocker, which records argv and returns a container id: these
+// tests are about how billet READS output, so what matters is controlling stdout
+// exactly, including lines a wrapper might add.
+func stubPrinting(t *testing.T, out string) string {
+	t.Helper()
+
+	script := filepath.Join(t.TempDir(), "docker")
+
+	// A quoted heredoc, so nothing in the payload is expanded by the shell.
+	body := "#!/bin/sh\ncat <<'BILLET_EOF'\n" + out + "\nBILLET_EOF\n"
+
+	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+		t.Fatalf("write stub: %v", err)
+	}
+
+	return script
+}
+
 // Untrusted and UNCLASSIFIED work are both refused.
 //
 // The package comment always said this backend must refuse untrusted work rather
@@ -208,5 +228,43 @@ func TestUntrustedAndUnclassifiedWorkIsRefused(t *testing.T) {
 	// And nothing was started. A refusal that still launches is not a refusal.
 	if body, err := os.ReadFile(argvFile); err == nil && strings.Contains(string(body), "run") {
 		t.Errorf("a container was launched despite the refusal:\n%s", body)
+	}
+}
+
+// A line List cannot read is an error, not something to skip.
+//
+// The danger is specific: List feeds a loop that destroys whatever is NOT
+// accounted for, and enumeration failure is deliberately fatal. A wrapper script
+// or a podman version that prints one extra line would otherwise make List
+// report success while omitting a billet container — the one outcome the caller
+// cannot detect.
+func TestListRefusesOutputItCannotRead(t *testing.T) {
+	t.Parallel()
+
+	p := New("test-deployment", WithBinary(stubPrinting(t,
+		"abc123\tbillet-one\nWARNING: some wrapper wrote this")))
+
+	if _, err := p.List(t.Context()); err == nil {
+		t.Fatal("a line with no tab was skipped silently; a missing container would look like an empty host")
+	}
+}
+
+func TestListReadsWellFormedOutput(t *testing.T) {
+	t.Parallel()
+
+	p := New("test-deployment", WithBinary(stubPrinting(t,
+		"abc123\tbillet-one\ndef456\tbillet-two")))
+
+	got, err := p.List(t.Context())
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+
+	if len(got) != 2 {
+		t.Fatalf("read %d instances from two lines: %v", len(got), got)
+	}
+
+	if got[0].ID != "abc123" || got[0].Name != "billet-one" {
+		t.Errorf("first instance parsed as %+v", got[0])
 	}
 }
