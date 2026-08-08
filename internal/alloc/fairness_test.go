@@ -165,7 +165,7 @@ func TestFloorsThatDoNotFitAreRefused(t *testing.T) {
 		"more memory than the machine has": {
 			limits: Limits{MaxVCPU: 256, MaxMemory: 16 * config.GiB},
 			tiers:  []config.Tier{bigTier(2)}, // 32GiB > 16GiB
-			want:   "budget",
+			want:   "16GiB",
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -346,5 +346,56 @@ func TestThreeFloorsComposeWithoutOverDeducting(t *testing.T) {
 
 	if got := fill(t, a, "billet-4vcpu"); got != 2 {
 		t.Errorf("the 4 vCPU tier got %d, want its floor of 2", got)
+	}
+}
+
+// A reservation large enough to OVERFLOW is refused.
+//
+// `reserved * vcpu` is unchecked integer arithmetic on a number that comes from
+// a config file. A large enough value wraps NEGATIVE, and a negative total
+// passes a "does it fit" test comfortably — after which every tier subtracts a
+// negative unmet floor, which ADDS to its headroom, and Reserve hands out
+// capacity far past the ceiling this package exists to enforce.
+//
+// The check divides instead of multiplying, so the product is never formed.
+func TestAnOverflowingReservationIsRefused(t *testing.T) {
+	t.Parallel()
+
+	// Chosen so reserved*vcpu wraps: 2^62 * 3 overflows int64 to a negative.
+	huge := config.Tier{
+		Label: "billet-huge", Provider: config.ProviderDocker, GuestOS: config.GuestLinux,
+		VCPU: 3, Memory: 3, Reserved: 1 << 62,
+	}
+
+	db := openState(t)
+
+	if _, err := New(db, Limits{MaxVCPU: 8, MaxMemory: 8}, []config.Tier{huge}); err == nil {
+		t.Fatal("accepted a reservation whose size calculation wraps; headroom would then " +
+			"exceed the budget rather than fall short of it")
+	}
+}
+
+// And the budget is still enforced afterwards, which is the consequence that
+// would have been lost.
+func TestAnOverflowingNeighbourCannotInflateHeadroom(t *testing.T) {
+	t.Parallel()
+
+	huge := config.Tier{
+		Label: "billet-huge", Provider: config.ProviderDocker, GuestOS: config.GuestLinux,
+		VCPU: 3, Memory: 3, Reserved: 1 << 62,
+	}
+
+	tiny := config.Tier{
+		Label: "billet-tiny", Provider: config.ProviderDocker, GuestOS: config.GuestLinux,
+		VCPU: 1, Memory: 1,
+	}
+
+	db := openState(t)
+
+	// Construction must refuse the pair outright rather than build an allocator
+	// whose arithmetic is already poisoned.
+	if _, err := New(db, Limits{MaxVCPU: 8, MaxMemory: 8},
+		[]config.Tier{huge, tiny}); err == nil {
+		t.Fatal("built an allocator carrying a wrapped reservation")
 	}
 }

@@ -516,6 +516,27 @@ func (t Tier) ProviderErrors(where string) []error {
 	return errs
 }
 
+// ReservationErrors reports everything wrong with a tier's floor, on its own.
+//
+// The cross-tier sum is checked separately, because it needs the whole
+// catalogue and the budget.
+func (t Tier) ReservationErrors(where string) []error {
+	var errs []error
+
+	if t.Reserved < 0 {
+		errs = append(errs, fmt.Errorf("%s: reserved %d is negative", where, t.Reserved))
+	}
+
+	if t.MaxConcurrent > 0 && t.Reserved > t.MaxConcurrent {
+		errs = append(errs, fmt.Errorf(
+			"%s: reserved %d exceeds max_concurrent %d; the reservation could never be "+
+				"filled and would hold that capacity back from every other tier forever",
+			where, t.Reserved, t.MaxConcurrent))
+	}
+
+	return errs
+}
+
 // ReservedVCPU is the vCPU a tier's floor holds back from other tiers.
 func (t Tier) ReservedVCPU() int { return t.Reserved * t.VCPU }
 
@@ -1072,6 +1093,7 @@ func (c *Config) validateTiers() []error {
 		seen[t.Label] = struct{}{}
 
 		errs = append(errs, t.ProviderErrors(where)...)
+		errs = append(errs, t.ReservationErrors(where)...)
 		if !t.GuestOS.Valid() {
 			errs = append(errs, fmt.Errorf("%s: guest_os %q is not one of %v", where, t.GuestOS, allGuestOS))
 		}
@@ -1113,6 +1135,66 @@ func (c *Config) validateTiers() []error {
 
 		errs = append(errs, c.validateGuestOSRules(where, t)...)
 	}
+	// THE FLOORS MUST FIT TOGETHER, and this has to live here as well as in the
+	// allocator. `billet check` only runs config validation, so with these
+	// checks in alloc.New alone it reported a broken configuration as valid and
+	// the server failed later while constructing the allocator — which is the
+	// opposite of what a check command is for.
+	//
+	// Checked by division rather than by multiplying: `reserved * vcpu` is
+	// unchecked arithmetic on a config-supplied number, and a large enough one
+	// wraps negative, at which point a "does it fit" test passes comfortably.
+	if c.Server != nil {
+		errs = append(errs, c.floorFitErrors()...)
+	}
+
+	return errs
+}
+
+// floorFitErrors reports reservations that cannot all be honoured at once.
+//
+// The failure is invisible where it happens: every tier deducts every other
+// tier's unmet floor, so if the floors exceed the budget then EVERY tier
+// computes zero headroom and the whole deployment quietly advertises nothing.
+func (c *Config) floorFitErrors() []error {
+	remainingVCPU := c.Server.MaxVCPU
+	remainingMemory := c.Server.MaxMemory
+
+	var errs []error
+
+	for i := range c.Tiers {
+		t := &c.Tiers[i]
+
+		// Skip anything already reported: a tier with a bad size or a negative
+		// reservation would otherwise produce a second, stranger diagnostic.
+		if t.Reserved <= 0 || t.VCPU <= 0 || t.Memory <= 0 {
+			continue
+		}
+
+		if t.Reserved > remainingVCPU/t.VCPU {
+			errs = append(errs, fmt.Errorf(
+				"tiers[%d] (%s): reserved %d needs more than the %d vCPU left after the other "+
+					"tiers' reservations; every tier would then compute zero headroom and "+
+					"billet would advertise no capacity at all",
+				i, t.Label, t.Reserved, remainingVCPU))
+
+			continue
+		}
+
+		if ByteSize(t.Reserved) > remainingMemory/t.Memory {
+			errs = append(errs, fmt.Errorf(
+				"tiers[%d] (%s): reserved %d needs more than the %s left after the other "+
+					"tiers' reservations; every tier would then compute zero headroom and "+
+					"billet would advertise no capacity at all",
+				i, t.Label, t.Reserved, remainingMemory))
+
+			continue
+		}
+
+		remainingVCPU -= t.Reserved * t.VCPU
+		remainingMemory -= ByteSize(t.Reserved) * t.Memory
+	}
+
 	return errs
 }
 

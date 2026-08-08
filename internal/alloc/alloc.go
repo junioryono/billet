@@ -26,6 +26,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"sort"
 	"strings"
 	"time"
 
@@ -406,30 +407,19 @@ func New(db *state.DB, limits Limits, tiers []config.Tier, opts ...Option) (*All
 	// headroom and the whole deployment quietly advertises nothing. A control
 	// plane that accepts no work while reporting no error is the worst outcome
 	// this package can produce.
-	var (
-		floorVCPU   int
-		floorMemory config.ByteSize
-	)
-
-	for label := range a.tiers {
-		t := a.tiers[label]
-
-		floorVCPU += t.ReservedVCPU()
-		floorMemory += t.ReservedMemory()
-	}
-
-	if floorVCPU > limits.MaxVCPU {
-		return nil, fmt.Errorf(
-			"alloc: reserved tiers need %d vCPU together but the budget is %d; every tier would "+
-				"compute zero headroom and billet would advertise nothing",
-			floorVCPU, limits.MaxVCPU)
-	}
-
-	if floorMemory > limits.MaxMemory {
-		return nil, fmt.Errorf(
-			"alloc: reserved tiers need %s together but the budget is %s; every tier would "+
-				"compute zero headroom and billet would advertise nothing",
-			floorMemory, limits.MaxMemory)
+	//
+	// CHECKED BY DIVISION, NEVER BY MULTIPLYING FIRST. `reserved * vcpu` is
+	// unchecked integer arithmetic on a value that comes from a config file, so a
+	// large enough reservation WRAPS NEGATIVE — and a negative total passes a
+	// "does it fit" test comfortably. Every tier would then subtract a negative
+	// unmet floor, which ADDS to its headroom, and Reserve would hand out
+	// capacity far past the ceiling this package exists to enforce.
+	//
+	// Comparing against the remaining budget divided by the tier's size asks the
+	// same question without ever forming the product, and the subtraction
+	// afterwards is safe precisely because the comparison has just bounded it.
+	if err := checkFloorsFit(a.tiers, limits); err != nil {
+		return nil, err
 	}
 
 	for _, opt := range opts {
@@ -1522,6 +1512,55 @@ func (a *Allocator) LaunchedLeaseIDs(ctx context.Context, node string) (map[stri
 	}
 
 	return open, nil
+}
+
+// checkFloorsFit reports whether every tier's reservation can be honoured at
+// once, without ever multiplying a config-supplied count by a size.
+//
+// Deterministic order, so the tier named in the error is stable across runs. A
+// map iteration would blame a different tier each time for the same
+// misconfiguration, which is a miserable thing to debug.
+func checkFloorsFit(tiers map[string]config.Tier, limits Limits) error {
+	labels := make([]string, 0, len(tiers))
+	for label := range tiers {
+		labels = append(labels, label)
+	}
+
+	sort.Strings(labels)
+
+	remainingVCPU := limits.MaxVCPU
+	remainingMemory := limits.MaxMemory
+
+	for _, label := range labels {
+		t := tiers[label]
+
+		if t.Reserved == 0 {
+			continue
+		}
+
+		if t.Reserved > remainingVCPU/t.VCPU {
+			return fmt.Errorf(
+				"alloc: tier %q reserves %d instances of %d vCPU, which does not fit the %d vCPU "+
+					"left after the other tiers' reservations; every tier would compute zero "+
+					"headroom and billet would advertise nothing",
+				label, t.Reserved, t.VCPU, remainingVCPU)
+		}
+
+		if config.ByteSize(t.Reserved) > remainingMemory/t.Memory {
+			return fmt.Errorf(
+				"alloc: tier %q reserves %d instances of %s, which does not fit the %s "+
+					"left after the other tiers' reservations; every tier would compute zero "+
+					"headroom and billet would advertise nothing",
+				label, t.Reserved, t.Memory, remainingMemory)
+		}
+
+		// Safe now: the comparisons above proved each product fits in what is
+		// left, so neither subtraction can wrap or go negative.
+		remainingVCPU -= t.Reserved * t.VCPU
+		remainingMemory -= config.ByteSize(t.Reserved) * t.Memory
+	}
+
+	return nil
 }
 
 // unmetFloors reports the capacity other tiers are guaranteed and do not yet

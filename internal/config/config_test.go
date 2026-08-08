@@ -1578,3 +1578,80 @@ func TestAnUnpinnedPluralTierIsCheckedAgainstAllowlists(t *testing.T) {
 			"guest_os allowlist; a linux guest could be scheduled onto a macOS-only Mac")
 	}
 }
+
+// `billet check` catches a bad reservation, rather than the server failing
+// later.
+//
+// These validations lived only in alloc.New, and check runs config validation
+// alone — so it reported a broken configuration as valid and the failure
+// surfaced at startup while constructing the allocator. That is the opposite of
+// what a check command is for.
+func TestValidateRejectsBadReservations(t *testing.T) {
+	t.Parallel()
+
+	base := func(tiers []Tier) *Config {
+		return &Config{
+			Server: &ServerConfig{
+				Listen: "127.0.0.1:7717", StateDir: t.TempDir(),
+				MaxVCPU: 32, MaxMemory: 64 * GiB,
+			},
+			GitHub: &GitHubConfig{
+				Org: "acme", AppID: 1, InstallationID: 2,
+				PrivateKeyPath: filepath.Join(t.TempDir(), "key.pem"),
+			},
+			Node: &NodeConfig{
+				Name: "test-host", ServerAddr: "127.0.0.1:7717",
+				Provider: ProviderDocker, StateDir: t.TempDir(),
+			},
+			Tiers: tiers,
+		}
+	}
+
+	tier := func(label string, vcpu int, mem ByteSize, reserved, maxConc int) Tier {
+		return Tier{
+			Label: label, Provider: ProviderDocker, GuestOS: GuestLinux,
+			VCPU: vcpu, Memory: mem, Image: "ubuntu-2404",
+			Reserved: reserved, MaxConcurrent: maxConc,
+		}
+	}
+
+	for name, tc := range map[string]struct {
+		tiers []Tier
+		want  string
+	}{
+		"negative": {
+			tiers: []Tier{tier("billet-2vcpu", 2, 4*GiB, -1, 0)},
+			want:  "negative",
+		},
+		"above its own ceiling": {
+			tiers: []Tier{tier("billet-2vcpu", 2, 4*GiB, 4, 2)},
+			want:  "max_concurrent",
+		},
+		"more than the machine has": {
+			tiers: []Tier{
+				tier("billet-2vcpu", 2, 4*GiB, 8, 0),  // 16 vCPU
+				tier("billet-8vcpu", 8, 16*GiB, 4, 0), // 32 vCPU -> 48 > 32
+			},
+			want: "vCPU left",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			c := base(tc.tiers)
+			c.applyDefaults()
+
+			// Validate joins its errors, so the whole message is searched rather
+			// than a slice walked.
+			err := c.Validate()
+			if err == nil {
+				t.Fatal("validation accepted a reservation the allocator will refuse; " +
+					"`billet check` would report this config as fine")
+			}
+
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("the error does not mention %q: %v", tc.want, err)
+			}
+		})
+	}
+}
