@@ -3,6 +3,7 @@ package alloc
 import (
 	"database/sql"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/junioryono/billet/internal/config"
@@ -334,6 +335,14 @@ func TestANodeCannotChangeBackendWhileRunningWork(t *testing.T) {
 	err = a.RegisterNode(t.Context(), "shapeshifter", config.ProviderDocker)
 	if !errors.Is(err, ErrWrongProvider) {
 		t.Fatalf("a busy host changed its backend: %v", err)
+	}
+
+	// AND THE MESSAGE SAYS HOW TO GET OUT. This fires during startup — cmd
+	// registers the node before it recovers anything — so an operator meets it
+	// with billet refusing to boot. Naming the value to put back is the
+	// difference between a clear instruction and a dead end.
+	if !strings.Contains(err.Error(), string(config.ProviderFirecracker)) {
+		t.Errorf("the refusal does not name the provider to restore: %v", err)
 	}
 
 	// The lease still says what it actually chose.

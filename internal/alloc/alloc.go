@@ -1021,11 +1021,18 @@ func (a *Allocator) RegisterNode(ctx context.Context, name string, kind config.P
 			}
 
 			if bound > 0 {
+				// THE WAY OUT IS SPELLED OUT, because this fires during startup —
+				// cmd registers the node before it recovers anything — so an
+				// operator who changes node.provider with work still bound finds
+				// billet refusing to start, at the worst possible moment. "Drain the
+				// host" would not be actionable advice: there is no drain command,
+				// and billet is not running to accept one.
 				return fmt.Errorf(
 					"%w: node %s is registered as %q and now reports %q, but %d lease(s) are "+
-						"still bound to it and recorded the old backend; drain the host before "+
-						"changing what it runs",
-					ErrWrongProvider, name, current, kind, bound)
+						"still bound to it and recorded the old backend. Put node.provider back "+
+						"to %q and start billet; once those jobs finish (or their leases expire "+
+						"and are reaped) the host is free to change",
+					ErrWrongProvider, name, current, kind, bound, current)
 			}
 		}
 
