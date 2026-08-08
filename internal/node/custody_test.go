@@ -425,7 +425,8 @@ func TestCustodyIsKeptWhenTheReleaseFails(t *testing.T) {
 	a, host := newAllocatorWithHost(t)
 
 	// Releases fail; everything else works.
-	store := &brittleStore{LeaseStore: a, releaseErr: errors.New("database is locked")}
+	store := &brittleStore{LeaseStore: a}
+	store.failRelease(errors.New("database is locked"))
 
 	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
 
@@ -453,7 +454,7 @@ func TestCustodyIsKeptWhenTheReleaseFails(t *testing.T) {
 	}
 
 	// And it retries: once the ledger recovers, the next tick finishes the job.
-	store.releaseErr = nil
+	store.failRelease(nil)
 
 	if err := restarted.Tend(t.Context()); err != nil {
 		t.Fatalf("Tend after the ledger recovered: %v", err)
@@ -466,9 +467,15 @@ func TestCustodyIsKeptWhenTheReleaseFails(t *testing.T) {
 
 // brittleStore is a LeaseStore whose operations can be made to fail, so the
 // runner's refusal paths are reachable from a test.
+//
+// EVERY FIELD IS GUARDED, because KeepAlive reads this from its own goroutine
+// while a test writes to it — and a test-only race is still a race, reported at
+// whatever unlucky moment CI happens to schedule it. The setters exist so no
+// caller has to remember.
 type brittleStore struct {
 	LeaseStore
 
+	mu           sync.Mutex
 	releaseErr   error
 	heartbeatErr error
 	leaseErr     error
@@ -484,23 +491,59 @@ type brittleStore struct {
 	heartbeats atomic.Int64
 }
 
-func (b *brittleStore) Lease(ctx context.Context, leaseID string) (*alloc.Lease, error) {
-	if b.leaseErr != nil {
-		return nil, b.leaseErr
+func (b *brittleStore) failRelease(err error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	b.releaseErr = err
+}
+
+func (b *brittleStore) failHeartbeat(err error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	b.heartbeatErr = err
+}
+
+func (b *brittleStore) failLease(err error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	b.leaseErr = err
+}
+
+func (b *brittleStore) failReleaseOf(leaseID string, err error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.releaseErrFor == nil {
+		b.releaseErrFor = map[string]error{}
 	}
 
-	return b.LeaseStore.Lease(ctx, leaseID)
+	b.releaseErrFor[leaseID] = err
+}
+
+func (b *brittleStore) allowReleaseOf(leaseID string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	delete(b.releaseErrFor, leaseID)
 }
 
 func (b *brittleStore) Release(
 	ctx context.Context, leaseID string, epoch int64, outcome alloc.Phase,
 ) error {
-	if err, ok := b.releaseErrFor[leaseID]; ok {
+	b.mu.Lock()
+	err, forThis := b.releaseErrFor[leaseID]
+	all := b.releaseErr
+	b.mu.Unlock()
+
+	if forThis {
 		return err
 	}
 
-	if b.releaseErr != nil {
-		return b.releaseErr
+	if all != nil {
+		return all
 	}
 
 	return b.LeaseStore.Release(ctx, leaseID, epoch, outcome)
@@ -509,11 +552,27 @@ func (b *brittleStore) Release(
 func (b *brittleStore) Heartbeat(ctx context.Context, leaseID string, epoch int64) error {
 	b.heartbeats.Add(1)
 
-	if b.heartbeatErr != nil {
-		return b.heartbeatErr
+	b.mu.Lock()
+	err := b.heartbeatErr
+	b.mu.Unlock()
+
+	if err != nil {
+		return err
 	}
 
 	return b.LeaseStore.Heartbeat(ctx, leaseID, epoch)
+}
+
+func (b *brittleStore) Lease(ctx context.Context, leaseID string) (*alloc.Lease, error) {
+	b.mu.Lock()
+	err := b.leaseErr
+	b.mu.Unlock()
+
+	if err != nil {
+		return nil, err
+	}
+
+	return b.LeaseStore.Lease(ctx, leaseID)
 }
 
 // A ledger that cannot be reached is reported, not treated as a lease that went
@@ -540,7 +599,7 @@ func TestTendReportsAnUnreachableLedger(t *testing.T) {
 		t.Fatalf("Recover: %v", err)
 	}
 
-	store.heartbeatErr = errors.New("database is locked")
+	store.failHeartbeat(errors.New("database is locked"))
 
 	if err := restarted.Tend(t.Context()); err == nil {
 		t.Fatal("an unreachable ledger was treated as a successful tick")
@@ -575,7 +634,8 @@ func TestRecoverRenewsTheLeaseItAdopts(t *testing.T) {
 		t.Fatalf("Launch: %v", err)
 	}
 
-	store := &brittleStore{LeaseStore: a, heartbeatErr: errors.New("database is locked")}
+	store := &brittleStore{LeaseStore: a}
+	store.failHeartbeat(errors.New("database is locked"))
 	restarted := New(store, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
 
 	if err := restarted.Recover(t.Context()); err == nil {
@@ -606,7 +666,8 @@ func TestRecoverDoesNotDestroyWhenItCannotReadTheLease(t *testing.T) {
 		t.Fatalf("Launch: %v", err)
 	}
 
-	store := &brittleStore{LeaseStore: a, leaseErr: errors.New("disk I/O error")}
+	store := &brittleStore{LeaseStore: a}
+	store.failLease(errors.New("disk I/O error"))
 	restarted := New(store, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
 
 	if err := restarted.Recover(t.Context()); err == nil {
@@ -1223,7 +1284,7 @@ func TestKeepAliveDoesNotActOnARenewalFailure(t *testing.T) {
 		t.Fatalf("Recover: %v", err)
 	}
 
-	store.heartbeatErr = errors.New("database is locked")
+	store.failHeartbeat(errors.New("database is locked"))
 
 	r.renewHeld(t.Context())
 
@@ -1237,7 +1298,7 @@ func TestKeepAliveDoesNotActOnARenewalFailure(t *testing.T) {
 
 	// A lease that is genuinely GONE is not an error worth reporting on this
 	// path either — Tend is about to clean it up.
-	store.heartbeatErr = alloc.ErrLeaseNotFound
+	store.failHeartbeat(alloc.ErrLeaseNotFound)
 
 	r.renewHeld(t.Context())
 
@@ -1276,7 +1337,8 @@ func TestACustodyFailureDoesNotStrandTheListenersLease(t *testing.T) {
 	}
 
 	// Releases fail, so finishing the custody entry errors.
-	store := &brittleStore{LeaseStore: a, releaseErr: errors.New("database is locked")}
+	store := &brittleStore{LeaseStore: a}
+	store.failRelease(errors.New("database is locked"))
 	restarted := New(store, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
 
 	if err := restarted.Recover(t.Context()); err != nil {
@@ -1328,7 +1390,7 @@ func TestACompletionClearsEveryEntryForItsRequest(t *testing.T) {
 
 	p := &fakeProvider{kind: config.ProviderDocker}
 	a, host := newAllocatorWithHost(t)
-	store := &brittleStore{LeaseStore: a, releaseErrFor: map[string]error{}}
+	store := &brittleStore{LeaseStore: a}
 	r := New(store, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
 
 	const requestID = 9090
@@ -1356,7 +1418,7 @@ func TestACompletionClearsEveryEntryForItsRequest(t *testing.T) {
 	// are made to fail their release, then one is repaired, so whichever order
 	// the loop takes it must reach the repaired one.
 	for _, l := range leases {
-		store.releaseErrFor[l.ID] = errors.New("database is locked")
+		store.failReleaseOf(l.ID, errors.New("database is locked"))
 	}
 
 	if err := r.releaseRequest(t.Context(), requestID); err == nil {
@@ -1375,7 +1437,7 @@ func TestACompletionClearsEveryEntryForItsRequest(t *testing.T) {
 	}
 
 	// Now ONE recovers. The loop must reach it whichever order it visits.
-	delete(store.releaseErrFor, leases[0].ID)
+	store.allowReleaseOf(leases[0].ID)
 
 	if err := r.releaseRequest(t.Context(), requestID); err == nil {
 		t.Fatal("reported success though one release still fails")
