@@ -418,6 +418,17 @@ type Tier struct {
 	// unmet: a tier holding its floor already competes for the rest on equal
 	// terms, so capacity is never idled waiting for work that is not there.
 	//
+	// THE COST IS IDLE CAPACITY, and it is worth knowing before setting this. A
+	// reservation is held back for as long as it is unmet — which for a tier that
+	// gets no work is FOREVER. Reserve 2 slots of an 8 vCPU tier nothing ever
+	// uses and the machine is permanently 16 vCPU smaller, with no error and no
+	// log line, because from billet's point of view nothing is wrong.
+	//
+	// So reserve for tiers that have demand and are being crowded out, not for
+	// tiers that might one day want capacity. A static floor cannot tell the
+	// difference; a future demand-aware scheduler could, since GitHub reports
+	// queued jobs per scale set.
+	//
 	// Zero, the default, means no guarantee — which is the current behaviour and
 	// the right default, because a floor is a promise about a machine only its
 	// operator can make.

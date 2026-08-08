@@ -274,3 +274,77 @@ func TestTheMemoryFloorIsHeldBackOnItsOwn(t *testing.T) {
 			"held back on its own", got)
 	}
 }
+
+// A RESERVED TIER WITH NO DEMAND IDLES ITS CAPACITY, INDEFINITELY.
+//
+// The cost of a static floor, asserted rather than left to be discovered. There
+// is no timeout and no decay: an unmet reservation is held back for as long as
+// it is unmet, so reserving for a tier that never gets work makes the machine
+// permanently smaller with no error and no log line — from billet's point of
+// view nothing is wrong.
+//
+// This is the tradeoff a demand-aware scheduler would remove, and the reason the
+// documentation says to reserve for tiers being crowded out rather than for
+// tiers that might one day want capacity.
+func TestAnUnusedReservationIdlesItsCapacity(t *testing.T) {
+	t.Parallel()
+
+	a := newAllocator(t, Limits{MaxVCPU: 32, MaxMemory: 64 * config.GiB},
+		[]config.Tier{smallTier(0), bigTier(2)})
+
+	// The reserved tier never asks for anything.
+	took := fill(t, a, "billet-2vcpu")
+
+	if took != 8 {
+		t.Fatalf("the small tier took %d slots, want 8", took)
+	}
+
+	// 16 of the 32 vCPU are held for a tier with no work, and nothing reclaims
+	// them: filling again changes nothing.
+	if again := fill(t, a, "billet-2vcpu"); again != 0 {
+		t.Errorf("capacity was released after being idle: %d more slots", again)
+	}
+
+	usage, err := a.Usage(t.Context())
+	if err != nil {
+		t.Fatalf("Usage: %v", err)
+	}
+
+	if usage.VCPU != 16 {
+		t.Errorf("the machine is using %d of 32 vCPU; 16 are reserved for a tier that has "+
+			"never asked, which is the documented cost of a static floor", usage.VCPU)
+	}
+}
+
+// Three reserved tiers deduct correctly against each other rather than
+// compounding.
+//
+// Every tier subtracts every OTHER tier's unmet floor, so the arithmetic has to
+// compose: with three tiers it is no longer obvious by inspection that the
+// intended amount is left.
+func TestThreeFloorsComposeWithoutOverDeducting(t *testing.T) {
+	t.Parallel()
+
+	mid := config.Tier{
+		Label: "billet-4vcpu", Provider: config.ProviderDocker, GuestOS: config.GuestLinux,
+		VCPU: 4, Memory: 8 * config.GiB, Reserved: 2,
+	}
+
+	// 32 vCPU. Reserved: big 1x8 = 8, mid 2x4 = 8. 16 left for the small tier.
+	a := newAllocator(t, Limits{MaxVCPU: 32, MaxMemory: 256 * config.GiB},
+		[]config.Tier{smallTier(0), bigTier(1), mid})
+
+	if got := fill(t, a, "billet-2vcpu"); got != 8 {
+		t.Fatalf("the unreserved tier took %d slots, want 8 (16 vCPU of 32, with 16 "+
+			"reserved across two tiers)", got)
+	}
+
+	// Both reserved tiers can still claim exactly what they were promised.
+	if got := fill(t, a, "billet-8vcpu"); got != 1 {
+		t.Errorf("the 8 vCPU tier got %d, want its floor of 1", got)
+	}
+
+	if got := fill(t, a, "billet-4vcpu"); got != 2 {
+		t.Errorf("the 4 vCPU tier got %d, want its floor of 2", got)
+	}
+}
