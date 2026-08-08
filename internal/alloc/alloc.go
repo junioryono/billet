@@ -1341,6 +1341,35 @@ func (a *Allocator) countOpenMacOSByNode(ctx context.Context, tx *sql.Tx, node s
 	return n, nil
 }
 
+// HistoryOutcome reports how a finished lease was recorded.
+//
+// The only DURABLE statement about what happened to a job, which is what makes
+// it the right thing for a test to assert against. An in-memory field that feeds
+// the archive is an input, not a record: a test reading it stays green even if
+// the write hardcodes the wrong value.
+func (a *Allocator) HistoryOutcome(ctx context.Context, leaseID string) (string, error) {
+	var conclusion string
+
+	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+		err := tx.QueryRowContext(ctx,
+			`SELECT conclusion FROM job_history WHERE lease_id = ?`, leaseID).Scan(&conclusion)
+
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			return fmt.Errorf("%w: %s has not been archived", ErrLeaseNotFound, leaseID)
+		case err != nil:
+			return fmt.Errorf("alloc: read job history for %s: %w", leaseID, err)
+		}
+
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+
+	return conclusion, nil
+}
+
 // archive copies a finished lease into job_history before its row stops being
 // interesting, so "why did this queue" is answerable after the fact.
 func (a *Allocator) archive(ctx context.Context, tx *sql.Tx, l *Lease, outcome Phase) error {

@@ -81,7 +81,19 @@ func (r *Runner) adopt(lease *alloc.Lease, inst *provider.Instance) {
 // The instance id is not required and usually not known: the whole reason this
 // exists is that Find could not answer. The name is enough, because the name is
 // what identifies the instance to the backend.
-func (r *Runner) hold(lease *alloc.Lease, name string) {
+//
+// THE REQUEST ID IS PASSED IN, NOT READ OFF THE LEASE, and that is not a style
+// choice. Assign writes the request id to SQLite without touching the caller's
+// in-memory Lease, so the pointer a listener holds still carries RequestID 0 —
+// every discarded entry was being filed under request 0. A later assignment for
+// the real request then walked straight past heldForRequest and started a second
+// runner, and a completion for it could never find the entry at all.
+//
+// The unit tests could not see this because their helper writes the id back onto
+// the struct by hand, which no production path does. The same stale-pointer trap
+// bit a test in this package an hour earlier; I fixed it there and did not think
+// to look for it here.
+func (r *Runner) hold(lease *alloc.Lease, name string, requestID int64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -89,7 +101,7 @@ func (r *Runner) hold(lease *alloc.Lease, name string) {
 		leaseID:   lease.ID,
 		epoch:     lease.Epoch,
 		name:      name,
-		requestID: lease.RequestID,
+		requestID: requestID,
 		discard:   true,
 		// FAILED, not done. This lease's job never started.
 		outcome: alloc.PhaseFailed,
@@ -359,42 +371,51 @@ func (r *Runner) heldForRequest(requestID int64) (string, bool) {
 // without releasing anything; this is what connects the message to the container
 // a previous incarnation started.
 func (r *Runner) releaseRequest(ctx context.Context, requestID int64) (bool, error) {
-	r.mu.Lock()
-
-	var held *custody
-
-	for _, c := range r.custody {
-		if c.requestID == requestID {
-			held = c
-
-			break
-		}
-	}
-
-	r.mu.Unlock()
-
-	if held == nil {
-		return false, nil
-	}
-
 	// HELD ACROSS THE WHOLE TRANSITION, not just the flag write. This runs on the
 	// listener's goroutine while the periodic tick runs on the reaper's, so
 	// releasing the lock before tendOne would let both act on the same entry —
-	// duplicate destroys, and a delete racing a replacement. Serializing only the
-	// mutation was the same bug the serialization was added to fix, moved one
-	// line down.
+	// duplicate destroys, and a delete racing a replacement.
 	//
 	// tendOne does not take this lock itself, so holding it here is not
 	// re-entrant. The lock order is tending before mu, everywhere.
 	r.tending.Lock()
 	defer r.tending.Unlock()
 
-	held.discard = true
+	r.mu.Lock()
 
-	r.log.Info("a job billet adopted has been reported finished; releasing its compute",
-		"lease", held.leaseID, "request", requestID)
+	var held []*custody
 
-	return true, r.tendOne(ctx, held)
+	// EVERY entry for the request, not the first one found. One request should
+	// only ever have one, but "should" is doing a lot of work in a function whose
+	// job is cleaning up after states that should not exist — and stopping at the
+	// first match would destroy one container, acknowledge the completion, and
+	// leave the rest.
+	for _, c := range r.custody {
+		if c.requestID == requestID {
+			held = append(held, c)
+		}
+	}
+
+	r.mu.Unlock()
+
+	if len(held) == 0 {
+		return false, nil
+	}
+
+	var failures []error
+
+	for _, c := range held {
+		c.discard = true
+
+		r.log.Info("a job billet adopted has been reported finished; releasing its compute",
+			"lease", c.leaseID, "request", requestID)
+
+		if err := r.tendOne(ctx, c); err != nil {
+			failures = append(failures, err)
+		}
+	}
+
+	return true, errors.Join(failures...)
 }
 
 func (r *Runner) custodySnapshot() []*custody {

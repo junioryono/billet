@@ -816,22 +816,37 @@ func TestAConfiguredBoundDestroysAndRecordsAFailure(t *testing.T) {
 		t.Fatal("destroyed a job that was still inside the configured bound")
 	}
 
-	// Past it: destroyed, and recorded as failed.
+	// Past it: destroyed, and recorded as failed IN THE LEDGER.
+	//
+	// Asserted against job_history rather than the in-memory custody field, which
+	// is what the first version checked — and which would stay green if finish()
+	// hardcoded PhaseDone, since the field it read is only ever an input.
 	restarted.now = func() time.Time { return frozen.Add(3 * time.Hour) }
 
-	for _, c := range restarted.custodySnapshot() {
-		if err := restarted.Tend(t.Context()); err != nil {
-			t.Fatalf("Tend: %v", err)
-		}
-
-		if c.outcome != alloc.PhaseFailed {
-			t.Errorf("a job billet killed was recorded as %q, want %q", c.outcome, alloc.PhaseFailed)
-		}
+	if err := restarted.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend: %v", err)
 	}
 
 	if len(p.live) != 0 {
 		t.Fatalf("held compute past the configured bound: %v", p.live)
 	}
+
+	if got := archivedOutcome(t, a, lease.ID); got != string(alloc.PhaseFailed) {
+		t.Errorf("a job billet killed was archived as %q, want %q", got, alloc.PhaseFailed)
+	}
+}
+
+// archivedOutcome reads how a finished lease was recorded, which is the only
+// durable statement about what happened to a job.
+func archivedOutcome(t *testing.T, a *alloc.Allocator, leaseID string) string {
+	t.Helper()
+
+	outcome, err := a.HistoryOutcome(t.Context(), leaseID)
+	if err != nil {
+		t.Fatalf("read job history for %s: %v", leaseID, err)
+	}
+
+	return outcome
 }
 
 // A redelivered assignment does not start a second runner for a job billet
@@ -1070,12 +1085,12 @@ func TestACompletionDoesNotRaceTheTick(t *testing.T) {
 // slow `docker ps` delayed the next renewal without delaying the next reap, and
 // anything longer than the lease TTL let the reaper reclaim capacity billet was
 // holding on purpose while its container ran on.
-func TestKeepAliveRenewsHeldLeasesOnItsOwnClock(t *testing.T) {
+func TestKeepAliveRenewsHeldLeasesWhileTendIsBlocked(t *testing.T) {
 	t.Parallel()
 
-	// A provider that blocks forever inside Find, which is exactly the situation
-	// that used to starve renewal: if the keep-alive shared a schedule with
-	// anything that talks to a backend, this would stall it.
+	// A provider that blocks for an hour inside Find, which is the situation that
+	// used to starve renewal: Tend calls Find, so anything sharing Tend's
+	// schedule stops for as long as the backend does.
 	p := &fakeProvider{kind: config.ProviderDocker, findDelay: time.Hour}
 	a, host := newAllocatorWithHost(t)
 
@@ -1093,22 +1108,41 @@ func TestKeepAliveRenewsHeldLeasesOnItsOwnClock(t *testing.T) {
 		t.Fatalf("Recover: %v", err)
 	}
 
-	before := store.heartbeats.Load()
-
-	// A TTL short enough for the test to observe several ticks.
 	r.ttl = func() time.Duration { return 30 * time.Millisecond }
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
+	// TEND IS RUNNING AND STUCK, which is the whole point. Without it an
+	// implementation that simply called Tend — heartbeating once and then
+	// blocking in Find — would satisfy a test that only waits for one renewal.
+	go func() {
+		//nolint:errcheck // it is expected to block, not to return
+		_ = r.Tend(ctx)
+	}()
+
+	// Counted from AFTER the blocked Tend has taken its own heartbeat, so the
+	// renewals below are the keep-alive's and nothing else's. (The first version
+	// of this test never started the keep-alive at all, and the single heartbeat
+	// it saw was Tend's — which is exactly the confusion the count is here to
+	// prevent.)
+	time.Sleep(50 * time.Millisecond)
+
+	before := store.heartbeats.Load()
+
 	go r.KeepAlive(ctx)
 
-	deadline := time.Now().Add(10 * time.Second)
+	// SEVERAL renewals, not one. One proves the loop started; several prove it
+	// keeps going while the backend is wedged.
+	const want = 3
 
-	for store.heartbeats.Load() <= before {
+	deadline := time.Now().Add(15 * time.Second)
+
+	for store.heartbeats.Load() < before+want {
 		if time.Now().After(deadline) {
-			t.Fatal("the keep-alive loop never renewed a held lease; the reaper will reclaim " +
-				"its capacity while the container is still running")
+			t.Fatalf("the keep-alive renewed %d times while Tend was blocked, want at least %d; "+
+				"renewal is sharing a schedule with provider I/O",
+				store.heartbeats.Load()-before, want)
 		}
 
 		time.Sleep(5 * time.Millisecond)
@@ -1189,5 +1223,119 @@ func TestKeepAliveDoesNotActOnARenewalFailure(t *testing.T) {
 
 	if !r.heldLeases()[lease.ID] {
 		t.Error("the keep-alive removed a custody entry; that is Tend's decision")
+	}
+}
+
+// A custody error does not abandon the running instance.
+//
+// A completion for a request that has BOTH — which a redelivered assignment
+// after a crash produces — used to return on the first error, so the normal
+// running container was never destroyed. The listener treats that error as
+// non-fatal and acknowledges the message, and nothing ever comes back for the
+// abandoned half: its lease keeps being heartbeated and its container keeps
+// running.
+//
+// Both are attempted; the errors are joined so the caller still learns cleanup
+// was incomplete. What it must not do is choose which half to leak.
+func TestACustodyErrorDoesNotAbandonTheRunningInstance(t *testing.T) {
+	t.Parallel()
+
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+
+	warm := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	lease := assignedLease(t, a)
+
+	// THE LEASE'S OWN request id, not a constant. assignedLease writes its own
+	// value into the ledger, and recovery reads the request id back from THERE —
+	// so a test that launches under a different number files custody under one id
+	// and then asks about another, and Destroy correctly finds nothing. That is
+	// the same identity confusion this commit fixes in hold(), arriving from the
+	// other direction, and it is why this test was green for a while against a
+	// bug it was written to catch.
+	requestID := lease.RequestID
+
+	if err := warm.Launch(t.Context(), lease, Job{RequestID: requestID, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	// Releases fail, so finishing the custody entry errors.
+	store := &brittleStore{LeaseStore: a, releaseErr: errors.New("database is locked")}
+	restarted := New(store, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
+	if err := restarted.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+
+	// The other half: a normal running entry for the same request.
+	second := assignedLease(t, a)
+	running := &provider.Instance{
+		ID: "running-" + second.ID, Name: provider.InstanceName(second.ID), Running: true,
+	}
+	p.add(running)
+
+	restarted.mu.Lock()
+	restarted.running[requestID] = running
+	restarted.mu.Unlock()
+
+	// The completion arrives. It is EXPECTED to report an error, because the
+	// custody half genuinely could not be released.
+	if err := restarted.Destroy(t.Context(), requestID); err == nil {
+		t.Fatal("reported success though the custody half could not be released")
+	}
+
+	// ...but the running half must be gone regardless.
+	if _, stillThere := p.live[running.Name]; stillThere {
+		t.Error("a custody error left the running container behind; the listener will " +
+			"acknowledge the completion and nothing will come back for it")
+	}
+}
+
+// A completion clears EVERY custody entry for its request, not the first found.
+//
+// One request should only ever have one entry — the launch guard sees to that —
+// but "should" is doing a lot of work in a function whose whole job is cleaning
+// up after states that should not exist. Stopping at the first match would
+// destroy one container, acknowledge the completion, and leave the rest running
+// with nothing that will ever look for them again.
+func TestACompletionClearsEveryEntryForItsRequest(t *testing.T) {
+	t.Parallel()
+
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
+	const requestID = 9090
+
+	// Two entries for one request, built directly: reaching this state through
+	// the normal path is exactly what the launch guard prevents.
+	for range 2 {
+		lease := assignedLease(t, a)
+
+		inst := &provider.Instance{
+			ID: "inst-" + lease.ID, Name: provider.InstanceName(lease.ID), Running: true,
+		}
+		p.add(inst)
+
+		lease.RequestID = requestID
+
+		r.adopt(lease, inst)
+	}
+
+	if len(r.heldLeases()) != 2 {
+		t.Fatalf("expected two custody entries, got %d", len(r.heldLeases()))
+	}
+
+	if err := r.Destroy(t.Context(), requestID); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+
+	if len(p.live) != 0 {
+		t.Fatalf("a completion left %d container(s) running: %v", len(p.live), p.live)
+	}
+
+	if len(r.heldLeases()) != 0 {
+		t.Errorf("capacity is still held for %d entries after the job completed",
+			len(r.heldLeases()))
 	}
 }

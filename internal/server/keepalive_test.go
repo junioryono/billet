@@ -17,6 +17,7 @@ type sweepingRunner struct {
 	fakeRunner
 
 	keepAliveStarted chan struct{}
+	keepAliveExited  chan struct{}
 	startedOnce      atomic.Bool
 
 	tends  atomic.Int64
@@ -29,6 +30,10 @@ func (s *sweepingRunner) KeepAlive(ctx context.Context) {
 	}
 
 	<-ctx.Done()
+
+	if s.keepAliveExited != nil {
+		close(s.keepAliveExited)
+	}
 }
 
 func (s *sweepingRunner) Tend(context.Context) error {
@@ -97,11 +102,20 @@ func TestKeepAliveStartsBeforeScaleSetReconciliation(t *testing.T) {
 	}
 }
 
-// The keep-alive stops when the control plane does.
-func TestKeepAliveStopsWithTheControlPlane(t *testing.T) {
+// The keep-alive GOROUTINE exits when the control plane returns.
+//
+// The first version of this waited for Run to return and called that proof.
+// It is not: Run returning says nothing about the goroutine it started, and
+// removing the deferred cancel would have left the goroutine alive until the
+// test's own context was torn down — passing either way. This waits for the
+// goroutine itself.
+func TestTheKeepAliveGoroutineExitsWithTheControlPlane(t *testing.T) {
 	t.Parallel()
 
-	runner := &sweepingRunner{keepAliveStarted: make(chan struct{})}
+	runner := &sweepingRunner{
+		keepAliveStarted: make(chan struct{}),
+		keepAliveExited:  make(chan struct{}),
+	}
 
 	prov := &fakeProvisioner{
 		onEnsure: func(string) error {
@@ -115,9 +129,16 @@ func TestKeepAliveStopsWithTheControlPlane(t *testing.T) {
 	srv := New(a, prov, []config.Tier{tier("billet-4vcpu-a")}, "billet-test", nil,
 		WithNodeRunner(runner))
 
+	// A context of its OWN, never cancelled by this test. If Run does not cancel
+	// the keep-alive itself, nothing here will, and the wait below times out.
 	done := make(chan error, 1)
 
-	go func() { done <- srv.Run(t.Context()) }()
+	// context.Background(), NOT t.Context(), and the linter is wrong to want the
+	// latter here. t.Context() is cancelled during test teardown, which would
+	// cancel the keep-alive for us — so the assertion below would pass whether or
+	// not Run cancels it, which is the vacuity this test exists to close.
+	//nolint:usetesting // a context the test never cancels is the whole point
+	go func() { done <- srv.Run(context.Background()) }()
 
 	select {
 	case <-runner.keepAliveStarted:
@@ -125,11 +146,16 @@ func TestKeepAliveStopsWithTheControlPlane(t *testing.T) {
 		t.Fatal("the keep-alive never started")
 	}
 
-	// Run returns on the reconciliation error, which cancels the keep-alive's
-	// context via the deferred stop. Nothing to assert but that it does not hang.
 	select {
 	case <-done:
 	case <-time.After(10 * time.Second):
-		t.Fatal("the control plane did not stop, so the keep-alive is still running")
+		t.Fatal("the control plane did not stop")
+	}
+
+	select {
+	case <-runner.keepAliveExited:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the keep-alive goroutine outlived the control plane; it will heartbeat " +
+			"leases for a process that has stopped")
 	}
 }

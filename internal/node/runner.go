@@ -131,9 +131,25 @@ type Runner struct {
 const strayCleanupTimeout = 30 * time.Second
 
 // New builds a runner over a provider.
+// Option configures a Runner.
+type Option func(*Runner)
+
+// WithMaxCustody bounds how long compute may be held before billet destroys it
+// and reclaims the capacity.
+//
+// Zero, the default, means no bound — see DefaultMaxCustody for why. This exists
+// because the previous commit's message claimed an operator could configure the
+// limit while nothing in the package let them: the field was private and New
+// took no option, so the only configuration was a same-package test writing to
+// it directly. A capability described in a comment and absent from the API is
+// worse than one that was never claimed.
+func WithMaxCustody(d time.Duration) Option {
+	return func(r *Runner) { r.maxCustody = d }
+}
+
 func New(
 	a LeaseStore, node string, jit JITSource, p provider.Provider,
-	tiers []config.Tier, log *slog.Logger,
+	tiers []config.Tier, log *slog.Logger, opts ...Option,
 ) *Runner {
 	if log == nil {
 		log = slog.Default()
@@ -144,7 +160,7 @@ func New(
 		byLabel[tiers[i].Label] = tiers[i]
 	}
 
-	return &Runner{
+	r := &Runner{
 		jit:      jit,
 		provider: p,
 		alloc:    a,
@@ -159,6 +175,12 @@ func New(
 		running:    make(map[int64]*provider.Instance),
 		sets:       make(map[string]int),
 	}
+
+	for _, opt := range opts {
+		opt(r)
+	}
+
+	return r
 }
 
 var _ server.Runner = (*Runner)(nil)
@@ -296,7 +318,7 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job Job) error 
 		// does not, because the daemon may still be acting on a create whose
 		// response was lost.
 		if confirmed, cleanupErr := r.destroyStray(ctx, name); !confirmed {
-			r.hold(lease, name)
+			r.hold(lease, name, job.RequestID)
 
 			return errCustody(name, errors.Join(err, cleanupErr))
 		}
@@ -320,17 +342,15 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job Job) error 
 // Idempotent: a request nothing was started for is success, because this runs on
 // redelivered completions, on shutdown, and after a failure.
 func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
-	// BOTH, NOT EITHER. A request can have compute in the running map AND a
-	// custody entry — a redelivered assignment after a crash produces exactly
-	// that — and a completion that cleaned up only one of them would leave the
-	// other running with nothing left to notice it. Consulting custody only when
-	// the running map missed was the bug.
+	// BOTH ARE ATTEMPTED, whatever either of them does. A request can have compute
+	// in the running map AND a custody entry — a redelivered assignment after a
+	// crash produces exactly that — and returning on the first error left the
+	// other half running while the listener, which treats this error as
+	// non-fatal, acknowledged the completion. Nothing ever came back for it.
 	//
-	// Custody first, because it is the half nothing else will ever come back for:
-	// the restarted listener has no record of the request either.
-	if _, err := r.releaseRequest(ctx, requestID); err != nil {
-		return err
-	}
+	// The errors are joined so the caller still learns that cleanup was
+	// incomplete; what it must not do is choose which half to abandon.
+	_, custodyErr := r.releaseRequest(ctx, requestID)
 
 	r.mu.Lock()
 	inst, ok := r.running[requestID]
@@ -339,20 +359,21 @@ func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
 	if !ok {
 		// Idempotent: a request nothing was started for is success, because this
 		// runs on redelivered completions, on shutdown, and after a failure.
-		return nil
+		return custodyErr
 	}
 
 	if err := r.provider.Destroy(ctx, inst.ID); err != nil {
 		// KEPT in the map. The instance may still be running, and forgetting it
 		// here is how it becomes an orphan nobody can find by request id.
-		return fmt.Errorf("node: stop %s for request %d: %w", inst.Name, requestID, err)
+		return errors.Join(custodyErr,
+			fmt.Errorf("node: stop %s for request %d: %w", inst.Name, requestID, err))
 	}
 
 	r.mu.Lock()
 	delete(r.running, requestID)
 	r.mu.Unlock()
 
-	return nil
+	return custodyErr
 }
 
 // destroyStray removes an instance a failed launch may have left behind.

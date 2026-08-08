@@ -545,8 +545,13 @@ compute is confirmed gone. The rules that were each learned by getting them wron
 - **Serializing a mutation is not serializing a transition.** Holding the lock for
   the flag write and releasing it before the backend calls is the same race, one
   line down.
-- **Held compute is bounded** (`MaxCustody`, 24h) and warns hourly before that.
-  The warning is the mechanism; the bound is a backstop.
+- **Time warns; it does not authorise a teardown.** Held compute has NO bound by
+  default (`DefaultMaxCustody = 0`) and warns hourly. Elapsed time is not evidence
+  that a job stopped making progress — billet imposes no job limit and self-hosted
+  runners run past GitHub's six-hour default — so killing live work must be
+  authorised by a completion, an observed exit, or an operator. An operator who
+  knows their longest job can set one with `node.WithMaxCustody`; a job killed by
+  it is archived as FAILED, not done.
 
 ### GitHub does not requeue a job whose runner vanished mid-execution
 
