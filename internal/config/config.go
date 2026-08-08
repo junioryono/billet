@@ -401,6 +401,49 @@ type Tier struct {
 	// MaxConcurrent caps simultaneous instances of this tier, counting warm ones.
 	// Zero means "no per-tier cap" and is only legal for non-macOS tiers.
 	MaxConcurrent int `yaml:"max_concurrent,omitempty"`
+
+	// Reserved is how many simultaneous instances of this tier are always
+	// available to it, no matter how busy every other tier is.
+	//
+	// A FLOOR, where MaxConcurrent is a ceiling — and the difference is the
+	// difference between limiting a tier and guaranteeing one. Billet shares a
+	// single budget across every tier, and headroom is the whole of what is left,
+	// so a tier with steady demand can hold all of it: the others then advertise
+	// zero capacity, their jobs queue at GitHub indefinitely, and nothing in
+	// billet is behaving incorrectly. On Spendify's own catalogue — 2, 4 and
+	// 8 vCPU tiers on one machine — the 2 vCPU tier wins that race simply by
+	// fitting more often.
+	//
+	// A reservation is deducted from what OTHER tiers may take, only while it is
+	// unmet. A tier already holding its floor competes for the rest on equal
+	// terms — the deduction stops, it does not become a quota.
+	//
+	// THAT IS NOT THE SAME AS "capacity is never idled", which this comment used
+	// to claim one paragraph above saying the opposite. Listeners refill escrow
+	// EAGERLY, without consulting demand, so a reserved tier does not hold its
+	// floor in reserve — it CLAIMS it, keeps the leases alive, and advertises
+	// capacity to GitHub that nobody may want. See below.
+	//
+	// THE COST IS IDLE CAPACITY, and it is worth knowing before setting this.
+	// Reserve 2 slots of an 8 vCPU tier nothing ever uses and the machine is
+	// permanently 16 vCPU smaller, with no error and no log line, because from
+	// billet's point of view nothing is wrong.
+	//
+	// The mechanism is worth being precise about, because it is not "the floor
+	// sits unclaimed". Listeners refill escrow eagerly and without regard to
+	// demand, so the reserved tier CLAIMS its floor almost immediately and then
+	// heartbeats those leases for as long as it is healthy. The capacity is gone
+	// either way; it is simply held by a tier rather than withheld from one.
+	//
+	// So reserve for tiers that have demand and are being crowded out, not for
+	// tiers that might one day want capacity. A static floor cannot tell the
+	// difference; a future demand-aware scheduler could, since GitHub reports
+	// queued jobs per scale set.
+	//
+	// Zero, the default, means no guarantee — which is the current behaviour and
+	// the right default, because a floor is a promise about a machine only its
+	// operator can make.
+	Reserved int `yaml:"reserved,omitempty"`
 }
 
 // DefaultMacOSVMLimit is Apple's licensing cap on macOS guests per
@@ -483,6 +526,33 @@ func (t Tier) ProviderErrors(where string) []error {
 
 	return errs
 }
+
+// ReservationErrors reports everything wrong with a tier's floor, on its own.
+//
+// The cross-tier sum is checked separately, because it needs the whole
+// catalogue and the budget.
+func (t Tier) ReservationErrors(where string) []error {
+	var errs []error
+
+	if t.Reserved < 0 {
+		errs = append(errs, fmt.Errorf("%s: reserved %d is negative", where, t.Reserved))
+	}
+
+	if t.MaxConcurrent > 0 && t.Reserved > t.MaxConcurrent {
+		errs = append(errs, fmt.Errorf(
+			"%s: reserved %d exceeds max_concurrent %d; the reservation could never be "+
+				"filled and would hold that capacity back from every other tier forever",
+			where, t.Reserved, t.MaxConcurrent))
+	}
+
+	return errs
+}
+
+// ReservedVCPU is the vCPU a tier's floor holds back from other tiers.
+func (t Tier) ReservedVCPU() int { return t.Reserved * t.VCPU }
+
+// ReservedMemory is the memory a tier's floor holds back from other tiers.
+func (t Tier) ReservedMemory() ByteSize { return ByteSize(t.Reserved) * t.Memory }
 
 // GuestOSProviderErrors reports backends that cannot host a tier's guest OS.
 //
@@ -1034,6 +1104,7 @@ func (c *Config) validateTiers() []error {
 		seen[t.Label] = struct{}{}
 
 		errs = append(errs, t.ProviderErrors(where)...)
+		errs = append(errs, t.ReservationErrors(where)...)
 		if !t.GuestOS.Valid() {
 			errs = append(errs, fmt.Errorf("%s: guest_os %q is not one of %v", where, t.GuestOS, allGuestOS))
 		}
@@ -1075,6 +1146,83 @@ func (c *Config) validateTiers() []error {
 
 		errs = append(errs, c.validateGuestOSRules(where, t)...)
 	}
+	// THE FLOORS MUST FIT TOGETHER, and this has to live here as well as in the
+	// allocator. `billet check` only runs config validation, so with these
+	// checks in alloc.New alone it reported a broken configuration as valid and
+	// the server failed later while constructing the allocator — which is the
+	// opposite of what a check command is for.
+	//
+	// Checked by division rather than by multiplying: `reserved * vcpu` is
+	// unchecked arithmetic on a config-supplied number, and a large enough one
+	// wraps negative, at which point a "does it fit" test passes comfortably.
+	// Only when the budget is itself usable. A non-positive max_vcpu is already
+	// reported against the field that holds it, and running the floor check
+	// anyway adds a fabricated "needs more than the 0 vCPU left" for every
+	// reservation — sending the reader to fix tiers that are not the problem.
+	if c.Server != nil {
+		errs = append(errs, c.floorFitErrors()...)
+	}
+
+	return errs
+}
+
+// floorFitErrors reports reservations that cannot all be honoured at once.
+//
+// The failure is invisible where it happens: every tier deducts every other
+// tier's unmet floor, so if the floors exceed the budget then EVERY tier
+// computes zero headroom and the whole deployment quietly advertises nothing.
+func (c *Config) floorFitErrors() []error {
+	// A non-positive budget is already reported against the field that holds it.
+	// Checking floors against it produces a second, fabricated diagnostic per
+	// reservation, blaming tiers that are not the problem.
+	//
+	// GUARDED ONCE, HERE, and not again inside the loop. A per-iteration
+	// `remaining > 0` guard looks like the same defence and is not: the remaining
+	// budget legitimately reaches zero once earlier tiers have taken it all, and
+	// at that point a further reservation MUST be reported. Skipping the check
+	// there accepts a catalogue that cannot be honoured.
+	if c.Server.MaxVCPU <= 0 || c.Server.MaxMemory <= 0 {
+		return nil
+	}
+
+	remainingVCPU := c.Server.MaxVCPU
+	remainingMemory := c.Server.MaxMemory
+
+	var errs []error
+
+	for i := range c.Tiers {
+		t := &c.Tiers[i]
+
+		// Skip anything already reported: a tier with a bad size or a negative
+		// reservation would otherwise produce a second, stranger diagnostic.
+		if t.Reserved <= 0 || t.VCPU <= 0 || t.Memory <= 0 {
+			continue
+		}
+
+		if t.Reserved > remainingVCPU/t.VCPU {
+			errs = append(errs, fmt.Errorf(
+				"tiers[%d] (%s): reserved %d needs more than the %d vCPU left after the other "+
+					"tiers' reservations; every tier would then compute zero headroom and "+
+					"billet would advertise no capacity at all",
+				i, t.Label, t.Reserved, remainingVCPU))
+
+			continue
+		}
+
+		if ByteSize(t.Reserved) > remainingMemory/t.Memory {
+			errs = append(errs, fmt.Errorf(
+				"tiers[%d] (%s): reserved %d needs more than the %s left after the other "+
+					"tiers' reservations; every tier would then compute zero headroom and "+
+					"billet would advertise no capacity at all",
+				i, t.Label, t.Reserved, remainingMemory))
+
+			continue
+		}
+
+		remainingVCPU -= t.Reserved * t.VCPU
+		remainingMemory -= ByteSize(t.Reserved) * t.Memory
+	}
+
 	return errs
 }
 
