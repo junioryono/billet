@@ -3,6 +3,7 @@
 package state
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -27,15 +28,29 @@ type dirLock struct {
 }
 
 func lockDir(stateDir string) (*dirLock, error) {
-	path := filepath.Join(stateDir, "billet.lock")
+	lock, err := lockFile(filepath.Join(stateDir, "billet.lock"))
+	if err != nil && errors.Is(err, ErrLocked) {
+		// Reported against the DIRECTORY, which is what the operator named.
+		return nil, fmt.Errorf("%w: %s", ErrLocked, stateDir)
+	}
+
+	return lock, err
+}
+
+// lockFile takes an exclusive advisory lock on one path.
+//
+// Split out from lockDir because the host-wide deployment lock needs the same
+// mechanism at a path of its own — and having two flock implementations in one
+// package is how they come to disagree about whether a close releases.
+func lockFile(path string) (*dirLock, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("open lock file %s: %w", path, err)
 	}
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		_ = f.Close()
-		if err == syscall.EWOULDBLOCK {
-			return nil, fmt.Errorf("%w: %s", ErrLocked, stateDir)
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, fmt.Errorf("%w: %s", ErrLocked, path)
 		}
 		return nil, fmt.Errorf("lock %s: %w", path, err)
 	}

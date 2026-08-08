@@ -252,6 +252,34 @@ func runServer(ctx context.Context, cfg *config.Config, dryRun, dev bool) error 
 			return err
 		}
 
+		// LOCKED HOST-WIDE, BEFORE ANYTHING TOUCHES A CONTAINER.
+		//
+		// The state directory's own lock guards a PATH, so a copied directory is a
+		// different inode and both copies lock happily — while both carry the same
+		// deployment identity and therefore manage the same containers against the
+		// same daemon. This lock is keyed by the identity, so the copy collides.
+		deploymentLock, err := state.LockDeployment(deployment)
+		if err != nil {
+			return err
+		}
+
+		defer func() {
+			if err := deploymentLock.Release(); err != nil {
+				slog.Default().Warn("could not release the deployment lock; a restart may "+
+					"have to wait for the kernel to drop it", "error", err)
+			}
+		}()
+
+		if why := deploymentLock.Degraded(); why != "" {
+			// Said out loud, WITH THE REASON, rather than inferred from silence.
+			// This host has no usable location for a host-wide lock, so billet is
+			// back to the directory lock alone — which is what it had before, and
+			// still lets two copies of a state directory run at once.
+			slog.Default().Warn("no host-wide lock could be taken for this deployment, so "+
+				"nothing stops a COPY of this state directory from running alongside it and "+
+				"managing the same containers", "reason", why)
+		}
+
 		p, err := newProvider(cfg, deployment)
 		if err != nil {
 			return err
