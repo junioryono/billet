@@ -3,6 +3,7 @@ package state
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -558,5 +559,116 @@ func TestLeaseCapacityMustBePositive(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("insert with vcpu=0 succeeded; the CHECK constraint is missing")
+	}
+}
+
+// A lease written before the provider split still places after the upgrade.
+//
+// THE UPGRADE PATH, and the only test that exercises it. Migration 9 splits
+// "which backends may this lease run on" from "which one is it on"; a row that
+// predates it carries a single provider, and the placement check fails CLOSED on
+// a lease whose acceptable backends it cannot read. Get the migration wrong and
+// every in-flight job at upgrade time becomes unplaceable — visible only as work
+// that stops moving.
+//
+// Simulated by removing the new columns from a migrated database and replaying,
+// which is the closest thing to an old database this repository can construct:
+// the schema is defined in code, so there is no historical file to open.
+func TestMigrationCarriesASingleProviderForward(t *testing.T) {
+	dir := t.TempDir()
+
+	db, err := Open(t.Context(), dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	// Two rows: one never placed, one already bound.
+	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
+		// The bound lease references a node, and leases.node is a foreign key.
+		if _, err := tx.ExecContext(t.Context(),
+			`INSERT INTO nodes (name, provider, last_seen_at)
+			 VALUES ('epyc-1', 'firecracker', '2026-01-01T00:00:00Z')`); err != nil {
+			return fmt.Errorf("register the node: %w", err)
+		}
+
+		for _, row := range []struct {
+			id   string
+			node any
+		}{
+			{"unbound-lease", nil},
+			{"bound-lease", "epyc-1"},
+		} {
+			if _, err := tx.ExecContext(t.Context(),
+				`INSERT INTO leases
+				   (id, tier, node, macos_slot, guest_os, provider, providers, chosen_provider,
+				    phase, vcpu, memory, epoch, created_at, heartbeat_at, expires_at)
+				 VALUES (?, 'billet-8vcpu', ?, 0, 'linux', 'firecracker', '', '',
+				         'capacity', 8, 34359738368, 0, '2026-01-01T00:00:00Z',
+				         '2026-01-01T00:00:00Z', '2026-01-01T00:01:00Z')`,
+				row.id, row.node); err != nil {
+				return err
+			}
+		}
+
+		// Now make the database look pre-9.
+		for _, stmt := range []string{
+			`ALTER TABLE leases DROP COLUMN providers`,
+			`ALTER TABLE leases DROP COLUMN chosen_provider`,
+			`DELETE FROM schema_migrations WHERE version = 9`,
+		} {
+			if _, err := tx.ExecContext(t.Context(), stmt); err != nil {
+				return fmt.Errorf("%s: %w", stmt, err)
+			}
+		}
+
+		return nil
+	}); err != nil {
+		t.Fatalf("build a pre-migration database: %v", err)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// Reopening replays migration 9 over the old rows.
+	db, err = Open(t.Context(), dir)
+	if err != nil {
+		t.Fatalf("reopen and migrate: %v", err)
+	}
+
+	t.Cleanup(func() { _ = db.Close() })
+
+	for _, want := range []struct {
+		id        string
+		providers string
+		chosen    string
+	}{
+		// An unbound row has not chosen anything. Writing a choice for it would
+		// make the column mean "was reserved for" again, which is the exact
+		// conflation the migration exists to undo.
+		{"unbound-lease", "firecracker", ""},
+		// A bound row is running on the backend it was reserved for; that is the
+		// honest reading, and without it the row is indistinguishable from one
+		// that never placed.
+		{"bound-lease", "firecracker", "firecracker"},
+	} {
+		var providers, chosen string
+
+		if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
+			return tx.QueryRowContext(t.Context(),
+				`SELECT providers, chosen_provider FROM leases WHERE id = ?`, want.id).
+				Scan(&providers, &chosen)
+		}); err != nil {
+			t.Fatalf("read %s: %v", want.id, err)
+		}
+
+		if providers != want.providers {
+			t.Errorf("%s: providers = %q, want %q — this lease can no longer be placed",
+				want.id, providers, want.providers)
+		}
+
+		if chosen != want.chosen {
+			t.Errorf("%s: chosen_provider = %q, want %q", want.id, chosen, want.chosen)
+		}
 	}
 }

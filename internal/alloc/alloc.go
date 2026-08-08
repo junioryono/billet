@@ -25,6 +25,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -163,7 +164,22 @@ type Lease struct {
 	// Provider is the backend this lease needs, recorded for the same reason.
 	// Bind compares it against the node's REGISTERED provider: a Firecracker
 	// lease cannot run on a Tart host.
-	Provider  config.ProviderKind
+	// Provider is the backend the lease is ACTUALLY on, empty until it is bound.
+	//
+	// It used to be set at reserve time, which quietly made a tier's backend a
+	// property of the reservation and so pinned every lease to one host kind
+	// before anything knew where it would run. It is chosen at Bind now, from
+	// Providers.
+	Provider config.ProviderKind
+
+	// Providers is what the lease MAY run on, most preferred first, copied from
+	// the tier when the lease was reserved.
+	//
+	// Copied rather than looked up. The tier's configuration can change while a
+	// lease is open — an operator edits the file and restarts — and a placement
+	// decision has to be answerable from the lease itself, the same reason the
+	// single provider was recorded before it.
+	Providers []config.ProviderKind
 	Phase     Phase
 	VCPU      int
 	Memory    config.ByteSize
@@ -309,14 +325,20 @@ func New(db *state.DB, limits Limits, tiers []config.Tier, opts ...Option) (*All
 			return nil, fmt.Errorf("alloc: tier %q has memory %s; headroom divides by it", t.Label, t.Memory)
 		case t.MaxConcurrent < 0:
 			return nil, fmt.Errorf("alloc: tier %q has negative max_concurrent %d", t.Label, t.MaxConcurrent)
-		case !t.Provider.Valid():
-			// A blank provider makes a lease unplaceable; a NONBLANK invalid one
-			// is worse, because it compares unequal to every registered provider
-			// and so strands the lease at bind time with a confusing message.
-			// Both are refused here rather than discovered later.
+		case len(t.AcceptableProviders()) == 0:
+			// A tier with no backend makes every lease unplaceable, and the failure
+			// would surface at bind time as something that reads like a host
+			// problem.
 			return nil, fmt.Errorf(
-				"alloc: tier %q has provider %q, which is not a known backend; its leases could not be placed",
-				t.Label, t.Provider)
+				"alloc: tier %q names no provider; its leases could not be placed", t.Label)
+
+		case !validProviders(t):
+			// A NONBLANK invalid provider is worse than a missing one, because it
+			// compares unequal to every registered backend and so strands the lease
+			// at bind time with a confusing message. Refused here instead.
+			return nil, fmt.Errorf(
+				"alloc: tier %q lists provider %q, which is not a known backend; its leases "+
+					"could not be placed", t.Label, firstInvalidProvider(t))
 		case !t.GuestOS.Valid():
 			// Same reasoning from the other side: an unknown guest OS matches no
 			// allowlist, so it either strands the lease or reads as a value some
@@ -451,6 +473,53 @@ func (a *Allocator) Escrow(ctx context.Context, tier string, want int) ([]*Lease
 	return leases, nil
 }
 
+// encodeProviders renders a preference list for the ledger.
+//
+// Comma-separated rather than JSON: a provider kind is a short identifier from a
+// closed set that cannot contain a comma, the value is read back by exactly one
+// function, and a text column keeps the row legible to anyone opening the
+// database to work out why a job would not place.
+func encodeProviders(ps []config.ProviderKind) string {
+	out := make([]string, 0, len(ps))
+	for _, p := range ps {
+		out = append(out, string(p))
+	}
+
+	return strings.Join(out, ",")
+}
+
+// decodeProviders reads a preference list back, preserving order.
+func decodeProviders(s string) []config.ProviderKind {
+	if s == "" {
+		return nil
+	}
+
+	parts := strings.Split(s, ",")
+	out := make([]config.ProviderKind, 0, len(parts))
+
+	for _, p := range parts {
+		if p != "" {
+			out = append(out, config.ProviderKind(p))
+		}
+	}
+
+	return out
+}
+
+func validProviders(t *config.Tier) bool {
+	return firstInvalidProvider(t) == ""
+}
+
+func firstInvalidProvider(t *config.Tier) config.ProviderKind {
+	for _, p := range t.AcceptableProviders() {
+		if !p.Valid() {
+			return p
+		}
+	}
+
+	return ""
+}
+
 // checkPlacement reports whether a lease may run on a node, under the policy in
 // force RIGHT NOW.
 //
@@ -466,14 +535,14 @@ func (a *Allocator) checkPlacement(ctx context.Context, tx *sql.Tx, lease *Lease
 			ErrGuestOSNotAllowed, lease.ID, lease.GuestOS, node)
 	}
 
-	// A lease predating the provider column records "", so there is nothing to
-	// compare and it FAILS CLOSED. Tolerating it would be a bypass rather than a
-	// courtesy: such a lease may still be unbound, so it is not old work already
-	// placed — it is unplaced work whose backend nothing can verify, free to bind
-	// to a host running anything. The same rows are the ones migration 7 cannot
-	// reliably classify by guest OS either, since macos_slot only became truthful
-	// at migration 5.
-	if lease.Provider == "" {
+	// A lease with no acceptable providers records nothing to compare against and
+	// FAILS CLOSED. Tolerating it would be a bypass rather than a courtesy: such
+	// a lease may still be unbound, so it is not old work already placed — it is
+	// unplaced work whose backend nothing can verify, free to bind to a host
+	// running anything. The same rows are the ones migration 7 cannot reliably
+	// classify by guest OS either, since macos_slot only became truthful at
+	// migration 5.
+	if len(lease.Providers) == 0 {
 		// "Release it" rather than "reap it": Reap only collects leases whose TTL
 		// has expired, so while a holder keeps heartbeating it returns zero
 		// forever and the advice would be unfollowable.
@@ -496,9 +565,19 @@ func (a *Allocator) checkPlacement(ctx context.Context, tx *sql.Tx, lease *Lease
 		return fmt.Errorf("alloc: read node %s: %w", node, err)
 	}
 
-	if registered != string(lease.Provider) {
-		return fmt.Errorf("%w: lease %s needs provider %q but node %q runs %q",
-			ErrWrongProvider, lease.ID, lease.Provider, node, registered)
+	// MEMBERSHIP, not equality, and that one word is the whole of provider
+	// failover. A tier that lists several backends may be placed on a host
+	// running any of them, so losing the machine at home does not take the
+	// `runs-on` label down with it.
+	//
+	// The list is ORDERED, and the order is not consulted here on purpose: this
+	// function answers "may this lease run on the node that asked", and today the
+	// node is always the one binding itself. Preference is a choice among
+	// candidates, and choosing needs a chooser — which arrives with the node
+	// running in its own process.
+	if !slices.Contains(lease.Providers, config.ProviderKind(registered)) {
+		return fmt.Errorf("%w: lease %s accepts %v but node %q runs %q",
+			ErrWrongProvider, lease.ID, lease.Providers, node, registered)
 	}
 
 	return nil
@@ -632,10 +711,10 @@ func (a *Allocator) insertLease(ctx context.Context, tx *sql.Tx, t config.Tier) 
 
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO leases
-		   (id, tier, node, target_node, macos_slot, guest_os, provider, phase, vcpu, memory, epoch,
+		   (id, tier, node, target_node, macos_slot, guest_os, providers, phase, vcpu, memory, epoch,
 		    created_at, heartbeat_at, expires_at)
 		 VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
-		id, t.Label, targetNode, macSlot, string(t.GuestOS), string(t.Provider),
+		id, t.Label, targetNode, macSlot, string(t.GuestOS), encodeProviders(t.AcceptableProviders()),
 		string(PhaseCapacity), t.VCPU, int64(t.Memory),
 		ts(now), ts(now), ts(now.Add(a.leaseTTL))); err != nil {
 		return nil, fmt.Errorf("alloc: insert lease: %w", err)
@@ -647,7 +726,7 @@ func (a *Allocator) insertLease(ctx context.Context, tx *sql.Tx, t config.Tier) 
 		TargetNode: t.Node,
 		MacOSSlot:  macSlot == 1,
 		GuestOS:    t.GuestOS,
-		Provider:   t.Provider,
+		Providers:  t.AcceptableProviders(),
 		Phase:      PhaseCapacity,
 		VCPU:       t.VCPU,
 		Memory:     t.Memory,
@@ -804,8 +883,27 @@ func (a *Allocator) Bind(ctx context.Context, leaseID string, epoch int64, node 
 			return err
 		}
 
+		// THE CHOSEN BACKEND IS RECORDED HERE, and only here.
+		//
+		// It used to be written at reserve time from the tier, which made a
+		// backend a property of the reservation and pinned the lease before
+		// anything knew where it would run. What a lease MAY run on is decided
+		// when it is reserved; what it IS running on is only knowable once a host
+		// has taken it. Keeping them apart is what lets one label span two kinds
+		// of machine.
+		//
+		// Read back from the node's registration rather than assumed from the
+		// list, so the column says what is true rather than what was preferred.
+		var registered string
+
+		if err := tx.QueryRowContext(ctx,
+			`SELECT provider FROM nodes WHERE name = ?`, node).Scan(&registered); err != nil {
+			return fmt.Errorf("alloc: read the provider of node %s: %w", node, err)
+		}
+
 		if _, err := tx.ExecContext(ctx,
-			`UPDATE leases SET node = ? WHERE id = ? AND epoch = ?`, node, leaseID, epoch); err != nil {
+			`UPDATE leases SET node = ?, chosen_provider = ? WHERE id = ? AND epoch = ?`,
+			node, registered, leaseID, epoch); err != nil {
 			return fmt.Errorf("alloc: bind lease %s: %w", leaseID, err)
 		}
 
@@ -1144,7 +1242,8 @@ func (a *Allocator) loadAny(ctx context.Context, tx *sql.Tx, leaseID string, epo
 		targetNode sql.NullString
 		macSlot    int
 		guestOS    string
-		provider   string
+		providers  string
+		chosen     string
 		mem        int64
 		ph         string
 		runID      sql.NullInt64
@@ -1153,11 +1252,11 @@ func (a *Allocator) loadAny(ctx context.Context, tx *sql.Tx, leaseID string, epo
 	)
 
 	err := tx.QueryRowContext(ctx,
-		`SELECT id, tier, node, target_node, macos_slot, guest_os, provider, phase, vcpu, memory,
-		        epoch, run_id, request_id
+		`SELECT id, tier, node, target_node, macos_slot, guest_os, providers, chosen_provider,
+		        phase, vcpu, memory, epoch, run_id, request_id
 		   FROM leases WHERE id = ?`, leaseID).
-		Scan(&l.ID, &l.Tier, &node, &targetNode, &macSlot, &guestOS, &provider, &ph, &l.VCPU, &mem,
-			&curEpoch, &runID, &requestID)
+		Scan(&l.ID, &l.Tier, &node, &targetNode, &macSlot, &guestOS, &providers, &chosen,
+			&ph, &l.VCPU, &mem, &curEpoch, &runID, &requestID)
 
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
@@ -1174,7 +1273,8 @@ func (a *Allocator) loadAny(ctx context.Context, tx *sql.Tx, leaseID string, epo
 
 	l.Node, l.TargetNode = node.String, targetNode.String
 	l.MacOSSlot, l.Phase, l.Memory = macSlot == 1, Phase(ph), config.ByteSize(mem)
-	l.GuestOS, l.Provider = config.GuestOS(guestOS), config.ProviderKind(provider)
+	l.GuestOS = config.GuestOS(guestOS)
+	l.Providers, l.Provider = decodeProviders(providers), config.ProviderKind(chosen)
 	l.Epoch, l.RunID, l.RequestID = curEpoch, runID.Int64, requestID.Int64
 
 	return &l, nil

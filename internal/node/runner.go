@@ -192,12 +192,16 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job Job) error 
 		return fmt.Errorf("node: no tier named %q in the catalog", lease.Tier)
 	}
 
-	if tier.Provider != r.provider.Kind() {
+	// ACCEPTS, not equals. A tier may list several backends so that one runs-on
+	// label can span a machine at home and a cloud, and comparing against the
+	// single `provider:` field would refuse every legitimate fallback — the field
+	// is empty whenever `providers:` was used.
+	if !tier.AcceptsProvider(r.provider.Kind()) {
 		// Placement should have caught this, so reaching it means the catalog and
 		// the host disagree. Refusing is the only safe answer: the alternative is
 		// running a job on a backend its tier was never sized or trusted for.
-		return fmt.Errorf("node: tier %s wants provider %q but this host runs %q",
-			lease.Tier, tier.Provider, r.provider.Kind())
+		return fmt.Errorf("node: tier %s accepts %v but this host runs %q",
+			lease.Tier, tier.AcceptableProviders(), r.provider.Kind())
 	}
 
 	// ASKED BEFORE ANYTHING IRREVERSIBLE HAPPENS.

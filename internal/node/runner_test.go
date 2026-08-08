@@ -896,3 +896,54 @@ func TestAFailedRegistrationDropsTheCachedScaleSet(t *testing.T) {
 		t.Errorf("kept using a scale-set id that had just failed; %d resolutions", jit.describes)
 	}
 }
+
+// A host running the tier's FALLBACK backend runs the job.
+//
+// The node had its own equality check against the single `provider:` field,
+// which is empty whenever `providers:` is used — so every legitimate fallback
+// was refused one layer below the allocator that had just permitted it. Two
+// checks of the same rule, and only one of them updated, is the shape of bug
+// that survives a green test suite.
+func TestAHostRunningTheFallbackBackendIsAccepted(t *testing.T) {
+	t.Parallel()
+
+	// The tier prefers firecracker; this host runs docker, which is second on the
+	// list.
+	tier := dockerTier()
+	tier.Provider = ""
+	tier.Providers = []config.ProviderKind{config.ProviderFirecracker, config.ProviderDocker}
+
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{tier}, nil)
+
+	if err := r.Launch(t.Context(), assignedLease(t, a), Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("a host running the tier's fallback backend refused the job: %v", err)
+	}
+
+	if len(p.launched) != 1 {
+		t.Fatal("nothing was started on the fallback host")
+	}
+}
+
+// A host running a backend the tier never named is still refused.
+func TestAHostOutsideTheTiersListIsRefused(t *testing.T) {
+	t.Parallel()
+
+	tier := dockerTier()
+	tier.Provider = ""
+	tier.Providers = []config.ProviderKind{config.ProviderFirecracker, config.ProviderEC2}
+
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{tier}, nil)
+
+	err := r.Launch(t.Context(), assignedLease(t, a), Job{RequestID: 11, Event: "push"})
+	if err == nil {
+		t.Fatal("ran a job on a backend its tier never named")
+	}
+
+	if len(p.launched) != 0 {
+		t.Fatal("started something before refusing")
+	}
+}

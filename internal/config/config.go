@@ -327,8 +327,31 @@ type GitHubConfig struct {
 
 // Tier is one runner shape. Its Label is what appears in `runs-on`.
 type Tier struct {
-	Label    string       `yaml:"label"`
-	Provider ProviderKind `yaml:"provider"`
+	Label string `yaml:"label"`
+
+	// Provider is the single backend this tier runs on. Kept because it is what
+	// almost every deployment wants and what every existing config says; it is
+	// normalized into Providers, which is what the rest of billet reads.
+	Provider ProviderKind `yaml:"provider,omitempty"`
+
+	// Providers is an ORDERED preference list, most preferred first.
+	//
+	// The reason one `runs-on` label can span a machine at home and a cloud: a
+	// tier that lists `[firecracker, ec2]` may be placed on either, and losing
+	// the bare-metal host does not take the label down with it. That is the
+	// difference between self-hosted CI you can rely on and self-hosted CI you
+	// can rely on until the power goes out.
+	//
+	// Setting both this and Provider is an error rather than a merge. They are
+	// two spellings of the same field, and guessing which one an operator meant —
+	// when the answer decides where untrusted code runs — is not a kindness.
+	//
+	// THE ORDER IS RECORDED BUT NOT YET ACTED ON. Nothing chooses among nodes
+	// today: a node binds itself, so placement can only accept or refuse the node
+	// that asked. Preference starts to bite when the node runs in its own process
+	// and the control plane picks. Listing several providers already removes the
+	// hard pin, which is what a fallback needs.
+	Providers []ProviderKind `yaml:"providers,omitempty"`
 	// GuestOS defaults to linux. Set it explicitly for macOS and Windows tiers —
 	// licensing and capability checks key off this field, not off the label.
 	GuestOS GuestOS `yaml:"guest_os,omitempty"`
@@ -407,6 +430,74 @@ func (c *Config) NodePolicyFor(name string) (NodePolicy, bool) {
 	}
 
 	return NodePolicy{Name: name}, false
+}
+
+// providerErrors reports everything wrong with a tier's backend declaration.
+//
+// One function, because `provider:` and `providers:` are two spellings of the
+// same field and validating them separately is how they drift.
+func (t Tier) providerErrors(where string) []error {
+	var errs []error
+
+	// BOTH SPELLINGS IS AN ERROR, not a merge. Guessing which one an operator
+	// meant is not a kindness when the answer decides where untrusted code runs.
+	if t.Provider != "" && len(t.Providers) > 0 {
+		errs = append(errs, fmt.Errorf(
+			"%s: set either provider or providers, not both; they are two spellings of "+
+				"the same field and billet will not guess which one you meant", where))
+	}
+
+	accepted := t.AcceptableProviders()
+
+	if len(accepted) == 0 {
+		errs = append(errs, fmt.Errorf("%s: no provider; set provider, or providers for a "+
+			"tier that may fall back to another backend", where))
+
+		return errs
+	}
+
+	seen := make(map[ProviderKind]struct{}, len(accepted))
+
+	for _, p := range accepted {
+		if !p.Valid() {
+			errs = append(errs, fmt.Errorf("%s: provider %q is not one of %v", where, p, allProviders))
+
+			continue
+		}
+
+		// A repeat is a typo, not a stronger preference — there is no second
+		// chance at the same backend, so silently collapsing it would hide the
+		// mistake in a list whose whole meaning is its order.
+		if _, dup := seen[p]; dup {
+			errs = append(errs, fmt.Errorf("%s: provider %q is listed twice", where, p))
+		}
+
+		seen[p] = struct{}{}
+	}
+
+	return errs
+}
+
+// AcceptableProviders reports the backends this tier may run on, most preferred
+// first.
+//
+// The single reader for that question, so `provider:` and `providers:` cannot
+// drift apart. Callers must not consult Tier.Provider directly.
+func (t Tier) AcceptableProviders() []ProviderKind {
+	if len(t.Providers) > 0 {
+		return t.Providers
+	}
+
+	if t.Provider != "" {
+		return []ProviderKind{t.Provider}
+	}
+
+	return nil
+}
+
+// AcceptsProvider reports whether a tier may run on a backend.
+func (t Tier) AcceptsProvider(p ProviderKind) bool {
+	return slices.Contains(t.AcceptableProviders(), p)
 }
 
 // MaxCustodyDuration parses Node.MaxCustody, reporting zero when unset.
@@ -716,7 +807,7 @@ func (c *Config) applyDefaults() {
 		// Only a VALID provider is inherited. Copying an unknown one produces a
 		// second diagnostic blaming a field the operator never supplied, for a
 		// typo they made once somewhere else.
-		if t.Provider == "" && t.Node != "" {
+		if len(t.AcceptableProviders()) == 0 && t.Node != "" {
 			if p, declared := c.NodePolicyFor(t.Node); declared && p.Provider.Valid() {
 				t.Provider = p.Provider
 			}
@@ -899,9 +990,7 @@ func (c *Config) validateTiers() []error {
 		}
 		seen[t.Label] = struct{}{}
 
-		if !t.Provider.Valid() {
-			errs = append(errs, fmt.Errorf("%s: provider %q is not one of %v", where, t.Provider, allProviders))
-		}
+		errs = append(errs, t.providerErrors(where)...)
 		if !t.GuestOS.Valid() {
 			errs = append(errs, fmt.Errorf("%s: guest_os %q is not one of %v", where, t.GuestOS, allGuestOS))
 		}
@@ -953,7 +1042,7 @@ func (c *Config) validateGuestOSRules(where string, t *Tier) []error {
 	// value: the value itself is already reported, and comparing a typo against
 	// an allowlist produces a second diagnostic describing the same mistake in
 	// terms that send the reader to the wrong field.
-	if !t.GuestOS.Valid() || !t.Provider.Valid() {
+	if !t.GuestOS.Valid() || len(t.providerErrors("")) > 0 {
 		return errs
 	}
 
@@ -1021,9 +1110,16 @@ func (c *Config) validateGuestOSRules(where string, t *Tier) []error {
 	case GuestMacOS:
 		// Apple's licence permits macOS guests only on Apple-branded hardware,
 		// which for billet means the Tart provider.
-		if t.Provider != ProviderTart {
-			errs = append(errs, fmt.Errorf(
-				"%s: guest_os macos requires the tart provider (Apple hardware)", where))
+		// EVERY listed provider must be Tart, not merely one of them. A macOS tier
+		// that could fall back to EC2 is a tier that would run macOS somewhere
+		// Apple's licence does not permit — and the fallback is exactly the case
+		// nobody is watching when it happens.
+		for _, provider := range t.AcceptableProviders() {
+			if provider != ProviderTart {
+				errs = append(errs, fmt.Errorf(
+					"%s: guest_os macos requires the tart provider (Apple hardware), but this "+
+						"tier also accepts %q", where, provider))
+			}
 		}
 		if t.Node == "" {
 			errs = append(errs, fmt.Errorf(
@@ -1056,7 +1152,7 @@ func (c *Config) validateGuestOSRules(where string, t *Tier) []error {
 				where, limit, c.macOSLimitReason(t.Node)))
 		}
 	case GuestWindows:
-		if t.Provider == ProviderTart {
+		if t.AcceptsProvider(ProviderTart) {
 			errs = append(errs, fmt.Errorf("%s: the tart provider cannot run Windows guests", where))
 		}
 	}
