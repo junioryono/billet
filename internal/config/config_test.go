@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -1230,5 +1231,121 @@ func TestNodePoliciesCarriesTheDeclaredPolicy(t *testing.T) {
 	p.GuestOS[0] = GuestWindows
 	if cfg.Nodes[0].GuestOS[0] == GuestWindows {
 		t.Error("NodePolicies() aliased the config's guest_os slice")
+	}
+}
+
+// node.max_custody is optional, and its absence means NO bound.
+//
+// The default matters more than the parsing. Elapsed time is not evidence that a
+// job stopped making progress — billet imposes no job limit and self-hosted
+// runners run past GitHub's six-hour default — so a bound billet picked would
+// kill legitimate long jobs for no reason visible in the logs.
+func TestMaxCustodyDefaultsToNoBound(t *testing.T) {
+	t.Parallel()
+
+	var n *NodeConfig
+
+	if d, err := n.MaxCustodyDuration(); err != nil || d != 0 {
+		t.Errorf("a nil node section gave (%v, %v), want (0, nil)", d, err)
+	}
+
+	empty := &NodeConfig{}
+
+	if d, err := empty.MaxCustodyDuration(); err != nil || d != 0 {
+		t.Errorf("an unset max_custody gave (%v, %v), want (0, nil)", d, err)
+	}
+
+	blank := &NodeConfig{MaxCustody: "   "}
+
+	if d, err := blank.MaxCustodyDuration(); err != nil || d != 0 {
+		t.Errorf("a whitespace max_custody gave (%v, %v), want (0, nil)", d, err)
+	}
+}
+
+func TestMaxCustodyParsesADuration(t *testing.T) {
+	t.Parallel()
+
+	n := &NodeConfig{MaxCustody: " 36h "}
+
+	d, err := n.MaxCustodyDuration()
+	if err != nil {
+		t.Fatalf("MaxCustodyDuration: %v", err)
+	}
+
+	if d != 36*time.Hour {
+		t.Errorf("parsed %v, want 36h", d)
+	}
+}
+
+// A value billet cannot read is refused when the FILE is read, not hours later
+// when a wedged container finally needed reclaiming.
+func TestMaxCustodyRefusesWhatItCannotRead(t *testing.T) {
+	t.Parallel()
+
+	for name, value := range map[string]string{
+		"not a duration": "tomorrow",
+		"bare number":    "24",
+		"negative":       "-1h",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			n := &NodeConfig{MaxCustody: value}
+
+			if _, err := n.MaxCustodyDuration(); err == nil {
+				t.Errorf("accepted max_custody %q", value)
+			}
+		})
+	}
+}
+
+// A bad max_custody is refused by LOADING the file, not only by the accessor.
+//
+// The accessor tests prove the parsing; this proves validation actually calls
+// it. Without this, removing the validation hook leaves every focused test green
+// while billet accepts a config it cannot act on — and the operator finds out
+// when a wedged container finally needs reclaiming.
+func TestLoadRejectsAnUnreadableMaxCustody(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "billet.yaml")
+
+	body := `
+server:
+  listen: 127.0.0.1:7717
+  state_dir: ` + dir + `
+  max_vcpu: 8
+  max_memory: 16GiB
+github:
+  org: acme
+  app_id: 1
+  installation_id: 2
+  private_key_path: ` + filepath.Join(dir, "key.pem") + `
+node:
+  name: test-host
+  server_addr: 127.0.0.1:7717
+  provider: docker
+  state_dir: ` + dir + `
+  max_custody: tomorrow
+tiers:
+  - label: billet-2vcpu
+    provider: docker
+    vcpu: 2
+    memory: 4GiB
+    image: busybox:latest
+`
+
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("loaded a config whose max_custody billet cannot read")
+	}
+
+	if !strings.Contains(err.Error(), "max_custody") {
+		t.Errorf("the error does not name the offending field: %v", err)
 	}
 }

@@ -64,6 +64,56 @@ type Runner interface {
 	Destroy(ctx context.Context, requestID int64) error
 }
 
+// Sweeper is a Runner that can also find compute nothing is asking about.
+//
+// Optional, and asserted for rather than required, because the two questions are
+// answerable by different things. Launch and Destroy are per-job and a remote
+// node will always implement them; enumerating everything a backend is running
+// is a whole-host operation that a node may not be able to answer during a
+// partition — and a control plane that refused to start without it would be
+// trading a real capability for a hypothetical one.
+type Sweeper interface {
+	// Sweep destroys compute whose lease is no longer open.
+	//
+	// Called after each reap, because reaping is what MAKES a container an
+	// orphan: the lease it was running under is exactly what the reaper has just
+	// terminalized. Anything else that leaks compute — a stray a failed launch
+	// could not confirm, a Destroy the backend refused — is picked up by the same
+	// pass, which is why a failed cleanup is survivable rather than permanent.
+	Sweep(ctx context.Context) error
+
+	// Tend advances compute the runner is holding capacity for: heartbeating
+	// those leases so the reaper does not terminalize them, letting adopted work
+	// finish, and destroying what is confirmed finished or unwanted.
+	//
+	// Paired with Sweep rather than separate because the two are the same
+	// obligation seen from opposite ends — Sweep finds compute no lease is
+	// holding, Tend holds leases whose compute is unaccounted for.
+	Tend(ctx context.Context) error
+
+	// KeepAlive renews held leases until the context ends, on its OWN clock.
+	//
+	// Separate from Tend because renewal must not share a schedule with anything
+	// that talks to a compute backend. Tend and Sweep both make unbounded
+	// provider calls, and they run after the reaper on a shared tick — so a slow
+	// `docker ps` delays the next renewal without delaying the next reap, and
+	// anything longer than the lease TTL lets the reaper reclaim capacity that is
+	// being held on purpose.
+	//
+	// Blocks until ctx is done; the caller runs it in a goroutine.
+	KeepAlive(ctx context.Context)
+}
+
+// ErrCustody means the runner has taken responsibility for a lease's capacity,
+// so the caller must NOT release it.
+//
+// Returned from Launch when compute may exist that could not be confirmed gone.
+// Releasing the lease then would hand the capacity back while a container is
+// possibly still running on it — the exact over-commitment the reconciliation
+// work exists to prevent, arrived at by treating "the launch failed" as "nothing
+// is using the host".
+var ErrCustody = errors.New("server: the runner is holding this lease's capacity")
+
 // errNoRunner means no compute is attached to this control plane.
 var errNoRunner = errors.New("server: no runner is configured, so nothing can start this job")
 
@@ -1110,6 +1160,25 @@ func (l *Listener) launch(ctx context.Context, lease *alloc.Lease, job Job) erro
 				"unaccounted for and needs manual cleanup",
 				"tier", l.tier, "request", job.RequestID, "error", destroyErr)
 		}
+
+		return nil
+	}
+
+	// THE CAPACITY IS NOT HANDED BACK IF THE RUNNER IS STILL HOLDING IT.
+	//
+	// A launch that failed ambiguously may have started something, and the runner
+	// says so by returning ErrCustody: it has taken the lease into its own
+	// janitor, will keep heartbeating it, and will release it once the compute is
+	// confirmed gone. Releasing here as well would double-count the capacity —
+	// the listener would re-advertise it while a container is possibly running.
+	if errors.Is(err, ErrCustody) {
+		l.log.Warn("a job failed to start and its compute could not be confirmed gone; "+
+			"the runner is holding the capacity until it is",
+			"tier", l.tier, "request", job.RequestID, "lease", lease.ID, "error", err)
+
+		l.mu.Lock()
+		delete(l.running, job.RequestID)
+		l.mu.Unlock()
 
 		return nil
 	}

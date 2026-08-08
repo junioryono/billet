@@ -29,6 +29,7 @@ import (
 	"github.com/junioryono/billet/internal/scaleset"
 	"github.com/junioryono/billet/internal/server"
 	"github.com/junioryono/billet/internal/state"
+	"github.com/junioryono/billet/internal/wiring"
 )
 
 // errNotImplemented marks a role that is scaffolded but cannot serve yet.
@@ -245,7 +246,12 @@ func runServer(ctx context.Context, cfg *config.Config, dryRun, dev bool) error 
 	}
 
 	if dev {
-		p, err := newProvider(cfg)
+		deployment, err := state.DeploymentID(cfg.Server.StateDir)
+		if err != nil {
+			return err
+		}
+
+		p, err := newProvider(cfg, deployment)
 		if err != nil {
 			return err
 		}
@@ -258,11 +264,35 @@ func runServer(ctx context.Context, cfg *config.Config, dryRun, dev bool) error 
 			return err
 		}
 
-		opts = append(opts, server.WithNodeRunner(
-			node.New(allocator, cfg.Node.Name, jitSource{c: client}, p, cfg.Tiers, slog.Default())))
+		// Validation already parsed this, so it cannot fail here — but reading it
+		// through the same accessor keeps one definition of what the string means.
+		maxCustody, err := cfg.Node.MaxCustodyDuration()
+		if err != nil {
+			return err
+		}
+
+		runner := node.New(allocator, cfg.Node.Name, wiring.JITSource{Client: client}, p,
+			cfg.Tiers, slog.Default(), node.WithMaxCustody(maxCustody))
+
+		// CLEARED BEFORE A SINGLE JOB IS ADMITTED.
+		//
+		// Everything this backend is running belongs to a process that is gone —
+		// this one has empty maps and can neither heartbeat those leases nor notice
+		// their completion. Left alone, such a container runs forever on capacity
+		// the reaper will shortly hand back out, so the host ends up over-committed
+		// by exactly what the crash leaked.
+		//
+		// Fatal on failure, deliberately. Not knowing what is already running is
+		// not the same as nothing running, and starting anyway turns a recoverable
+		// mess into a compounding one.
+		if err := runner.Recover(ctx); err != nil {
+			return err
+		}
+
+		opts = append(opts, server.WithNodeRunner(runner))
 	}
 
-	plane := server.New(allocator, &provisioner{client}, cfg.Tiers, owner, slog.Default(), opts...)
+	plane := server.New(allocator, wiring.Provisioner{Client: client}, cfg.Tiers, owner, slog.Default(), opts...)
 	if err := plane.Run(ctx); err != nil {
 		return err
 	}
@@ -284,10 +314,14 @@ func runServer(ctx context.Context, cfg *config.Config, dryRun, dev bool) error 
 // Apple Silicon, ec2 needs an account — each is a separate implementation of the
 // same interface, and each is refused explicitly rather than falling through to
 // something that happens to compile.
-func newProvider(cfg *config.Config) (provider.Provider, error) {
+func newProvider(cfg *config.Config, deployment string) (provider.Provider, error) {
 	switch cfg.Node.Provider {
 	case config.ProviderDocker:
-		return docker.New(cfg.Node.Name, docker.WithLogger(slog.Default())), nil
+		// Labelled with the DEPLOYMENT id, not the node name. Two billets on one
+		// machine share a hostname — and therefore a default node name — while
+		// keeping separate state directories, so a node-name label would let each
+		// enumerate the other's containers and destroy them as orphans.
+		return docker.New(deployment, docker.WithLogger(slog.Default())), nil
 
 	case config.ProviderFirecracker, config.ProviderTart, config.ProviderEC2:
 		return nil, fmt.Errorf("%w: the %s provider is not built yet; --dev currently runs the "+
@@ -297,45 +331,6 @@ func newProvider(cfg *config.Config) (provider.Provider, error) {
 	default:
 		return nil, fmt.Errorf("billet: unknown provider %q", cfg.Node.Provider)
 	}
-}
-
-// jitSource adapts the scale-set client to what the node package needs.
-//
-// The adapter exists so internal/node does not import the preview scale-set API
-// at all: the node's contract is "mint me a registration", and which vendor
-// answers that is not its business.
-type jitSource struct{ c *scaleset.Client }
-
-func (j jitSource) Describe(ctx context.Context, name, group string) (*node.Set, []string, error) {
-	set, labels, err := j.c.Describe(ctx, name, group)
-	if err != nil || set == nil {
-		return nil, labels, err
-	}
-
-	return &node.Set{ID: set.ID, Name: set.Name}, labels, nil
-}
-
-func (j jitSource) JITConfig(
-	ctx context.Context, scaleSetID int, runnerName, workFolder string,
-) (node.Registration, error) {
-	return j.c.JITConfig(ctx, scaleSetID, runnerName, workFolder)
-}
-
-type provisioner struct{ c *scaleset.Client }
-
-func (p *provisioner) EnsureScaleSet(
-	ctx context.Context, name, group string, labels []string,
-) (*server.ScaleSet, error) {
-	set, err := p.c.EnsureScaleSet(ctx, name, group, labels)
-	if err != nil {
-		return nil, err
-	}
-
-	return &server.ScaleSet{ID: set.ID, Name: set.Name, Group: set.Group}, nil
-}
-
-func (p *provisioner) Session(ctx context.Context, scaleSetID int, owner string) (server.Session, error) {
-	return p.c.Session(ctx, scaleSetID, owner)
 }
 
 func cmdNode(_ context.Context, args []string) error {

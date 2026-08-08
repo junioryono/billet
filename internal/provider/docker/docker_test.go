@@ -167,6 +167,26 @@ func stubDocker(t *testing.T) (script, argvFile string) {
 	return script, argvFile
 }
 
+// stubPrinting is a docker that prints one fixed thing on stdout.
+//
+// Separate from stubDocker, which records argv and returns a container id: these
+// tests are about how billet READS output, so what matters is controlling stdout
+// exactly, including lines a wrapper might add.
+func stubPrinting(t *testing.T, out string) string {
+	t.Helper()
+
+	script := filepath.Join(t.TempDir(), "docker")
+
+	// A quoted heredoc, so nothing in the payload is expanded by the shell.
+	body := "#!/bin/sh\ncat <<'BILLET_EOF'\n" + out + "\nBILLET_EOF\n"
+
+	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+		t.Fatalf("write stub: %v", err)
+	}
+
+	return script
+}
+
 // Untrusted and UNCLASSIFIED work are both refused.
 //
 // The package comment always said this backend must refuse untrusted work rather
@@ -208,5 +228,83 @@ func TestUntrustedAndUnclassifiedWorkIsRefused(t *testing.T) {
 	// And nothing was started. A refusal that still launches is not a refusal.
 	if body, err := os.ReadFile(argvFile); err == nil && strings.Contains(string(body), "run") {
 		t.Errorf("a container was launched despite the refusal:\n%s", body)
+	}
+}
+
+// A line List cannot read is an error, not something to skip.
+//
+// The danger is specific: List feeds a loop that destroys whatever is NOT
+// accounted for, and enumeration failure is deliberately fatal. A wrapper script
+// or a podman version that prints one extra line would otherwise make List
+// report success while omitting a billet container — the one outcome the caller
+// cannot detect.
+func TestListRefusesOutputItCannotRead(t *testing.T) {
+	t.Parallel()
+
+	p := New("test-deployment", WithBinary(stubPrinting(t,
+		"abc123\tbillet-one\trunning\nWARNING: some wrapper wrote this")))
+
+	if _, err := p.List(t.Context()); err == nil {
+		t.Fatal("a line with no tab was skipped silently; a missing container would look like an empty host")
+	}
+}
+
+func TestListReadsWellFormedOutput(t *testing.T) {
+	t.Parallel()
+
+	p := New("test-deployment", WithBinary(stubPrinting(t,
+		"abc123\tbillet-one\trunning\ndef456\tbillet-two\texited\n"+
+			"ghi789\tbillet-three\tcreated\njkl012\tbillet-four\tsomethingnew")))
+
+	got, err := p.List(t.Context())
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+
+	if len(got) != 4 {
+		t.Fatalf("read %d instances from four lines: %v", len(got), got)
+	}
+
+	if got[0].ID != "abc123" || got[0].Name != "billet-one" || !got[0].Running {
+		t.Errorf("first instance parsed as %+v", got[0])
+	}
+
+	// The second is EXITED, and that distinction decides whether an adopted
+	// container is left to finish or cleaned up.
+	if got[1].Running {
+		t.Errorf("an exited container was reported as running: %+v", got[1])
+	}
+
+	// CREATED IS NOT RUNNING. A container that exists but was never started never
+	// will be — whatever would have started it is gone — so adopting it means
+	// holding its lease open forever for a job that cannot begin. It is the one
+	// state that looks alive and is not.
+	if got[2].Running {
+		t.Errorf("a created-but-never-started container was reported as running: %+v", got[2])
+	}
+
+	// An UNRECOGNISED state counts as running, and that asymmetry is deliberate:
+	// the caller destroys what is not running, and a state billet has never heard
+	// of is not evidence that a job is over.
+	if !got[3].Running {
+		t.Errorf("an unrecognised state was treated as finished, which would destroy live "+
+			"work: %+v", got[3])
+	}
+}
+
+// An extra column is refused, not absorbed into the name.
+//
+// strings.Cut proved a tab EXISTED; it did not prove there was only one, so a
+// wrapper printing a fourth field used to land inside the container name. A name
+// with a suffix still parses as billet's, so the lease lookup misses and the
+// periodic sweep destroys what it decides is an orphan — a live job.
+func TestListRefusesAnExtraColumn(t *testing.T) {
+	t.Parallel()
+
+	p := New("test-deployment", WithBinary(stubPrinting(t,
+		"abc123\tbillet-lease123\trunning\textra")))
+
+	if _, err := p.List(t.Context()); err == nil {
+		t.Fatal("an extra column was absorbed into the name, which mis-identifies the lease")
 	}
 }

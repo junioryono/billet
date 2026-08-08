@@ -519,6 +519,89 @@ is redirected; decoding GitHub's response still populates every field. Not absol
 known: an `App` reached through an unexported field of another struct, and any serializer that is
 neither `fmt` nor `encoding/json` nor `slog` — reflection-based dumpers read the fields directly.
 
+### Compute is unaccounted for until proven otherwise, and that is a state with a name
+
+`internal/node/custody.go`. A **custody** entry is a lease whose compute billet
+cannot account for and which nothing else in the process is managing. Two things
+produce one and they are the same situation from different sides:
+
+- **Adopted** — a container survived a restart. The runner inside is talking to
+  GitHub on its own and may well finish the job.
+- **Discarded** — a launch failed ambiguously and its cleanup was not confirmed.
+
+Both heartbeat the lease so the reaper leaves it alone; both release only when the
+compute is confirmed gone. The rules that were each learned by getting them wrong:
+
+- **A negative observation is not a causal result.** A `docker ps` issued right
+  after a lost `docker run` can overtake the daemon and see nothing. A successful
+  `Destroy` proves the compute is gone; an *absence* does not, and has to persist
+  through `strayGrace` before it is believed.
+- **Adoption renews the lease at the moment it adopts.** Billet may have been down
+  longer than a lease TTL, and the control plane reaps BEFORE its first tend — so
+  leaving the renewal to the tick let the reaper terminalize the lease that had
+  just been adopted.
+- **"Could not verify" is not "safe to destroy."** Only `ErrLeaseNotFound` proves
+  a lease is gone. Any other read error aborts recovery, having destroyed nothing.
+- **Serializing a mutation is not serializing a transition.** Holding the lock for
+  the flag write and releasing it before the backend calls is the same race, one
+  line down.
+- **Time warns; it does not authorise a teardown.** Held compute has NO bound by
+  default (`DefaultMaxCustody = 0`) and warns hourly. Elapsed time is not evidence
+  that a job stopped making progress — billet imposes no job limit and self-hosted
+  runners run past GitHub's six-hour default — so killing live work must be
+  authorised by a completion, an observed exit, or an operator. An operator who
+  knows their longest job can set one with `node.WithMaxCustody`; a job killed by
+  it is archived as FAILED, not done.
+
+### GitHub does not requeue a job whose runner vanished mid-execution
+
+Checked against the vendored `scaleset` README, after I asserted the opposite in a
+commit message and had to retract it. Reassignment is documented for a job
+*"assigned to your scale set but not acquired by a runner in time"* — GitHub
+cancels and requeues that, up to 3 times. It says **nothing** about a job a runner
+has already started.
+
+So force-killing a container that is running a job is a **deliberate job failure**,
+not a recovery, and "a graceful shutdown does it too" is not a defence: a graceful
+shutdown is a choice the operator made. This is why restart recovery adopts.
+
+### An instance is named for its lease, and the name is the only durable link
+
+`provider.InstanceName` / `provider.LeaseOf`. Nothing writes "this container
+belongs to that lease" anywhere, so after a crash the name is all reconciliation
+has. Two consequences:
+
+- The instance carries **billet's** name, never GitHub's runner name. They are
+  different identities and conflating them made every orphan unattributable.
+- Docker's `--filter name=X` is a **SUBSTRING** match — measured, not assumed:
+  `billet-abc` really does return `billet-abcdef`. `Find` compares exactly
+  afterwards.
+
+### Destruction is scoped by DEPLOYMENT identity, never by node name
+
+`state.DeploymentID`: random, minted once per state directory, `O_EXCL`, and the
+directory is fsynced as well as the file. The node name defaults to the hostname,
+so two billets on one machine share it while keeping separate state directories —
+and the process lock does not catch that, because it guards a *directory*. Labelling
+compute by node name let one installation enumerate the other's containers and act
+on live jobs it had no relationship with.
+
+**A copied state directory deliberately keeps the original's identity** (the copy's
+containers are labelled with it). The lock does NOT make that safe — a copy is a
+different inode — so two copies can run at once. Closing that needs a host-wide
+lock keyed by the identity; see the task list.
+
+### `created` is not `running`
+
+`docker ps` reports created/running/paused/restarting/removing/exited/dead. A
+container that exists but was never started never will be — whatever would have
+started it is gone — so adopting it holds a lease open forever for a job that
+cannot begin. It is the one state that looks alive and is not.
+
+An **unrecognised** state still counts as running. The asymmetry is deliberate: the
+caller destroys what is not running, and a state billet has never heard of is not
+evidence that a job is over.
+
 ### Never guess at a byte size
 
 `config.ByteSize` parses with exact integer arithmetic on a restricted grammar. It used
@@ -573,6 +656,54 @@ Rules already carrying real weight here:
 - Tests use `t.Context()` and `t.TempDir()` (enforced by `usetesting`).
 - `paralleltest` is deliberately off: these tests open real SQLite files, and `t.Parallel()`
   everywhere buys nothing and invites flakes.
+
+### Tests that could not have failed
+
+Every one of these passed against the exact bug it existed to catch. Mutation
+testing is what found them, and it is not optional for anything load-bearing.
+
+- **A fake that ignores `context`** cannot distinguish "cleanup ran on a cancelled
+  context" from "cleanup ran on a fresh one" — which was the entire subject of the
+  test. Fakes honour `ctx.Err()`.
+- **Cancelling before the call** made `Bind` fail first, so the launch path was
+  never reached and the test passed because *nothing happened*. The fake cancels
+  from inside `Launch` now, as a real timeout does, and the test asserts the
+  provider was actually called.
+- **A race whose window is nanoseconds** is not tested by two goroutines and a
+  `WaitGroup`: the mutation survived five runs under `-race`. The fake can delay
+  inside `Find`, which holds both callers inside the transition long enough to
+  genuinely overlap.
+- **Counting containers instead of RUNNING containers** let the headline
+  end-to-end test pass while the "runner" exited instantly — proving container
+  creation and removal, not that a job ran.
+- **A fake that pops a message on read** cannot model redelivery, so a test
+  "asserting" acknowledgement passed against a billet that acked before doing any
+  work. The queue holds the head until its exact id is acked.
+- **A mutation that does not compile is caught by the compiler, not by a test.**
+  Three of them looked like passes until the failure count read zero. Keep every
+  mutation compiling, and print the failing-test count so a zero is visible.
+- **A mutation that never APPLIED looks exactly like a surviving one.** A `perl`
+  substitution with three tabs of indentation against a line that has two matches
+  nothing, reports "SURVIVED", and sends you off to write a test for behaviour
+  that is already covered. Assert the substitution changed the file — `grep -c`
+  the original text and expect zero — before believing the result.
+
+### The end-to-end suite
+
+`internal/e2e` runs the real control plane and a real container runtime against
+`internal/fakeactions`, a scripted stand-in for GitHub. It exists because every
+other suite tests one seam, and this project's worst defect — acquiring jobs by the
+wrong id — lived in the relationship between billet and the wire, where billet's
+own types agreed with billet's own mistake.
+
+Two things it must keep doing:
+
+- **Assemble billet the way `cmd/billet` does**, through `internal/wiring`. The
+  hand-copied adapter it started with had already drifted — it dereferenced a
+  scale set the client returns as nil — and a test that assembles a different
+  program is testing a different program.
+- **Use an image that stays running.** busybox exits immediately, so recovery
+  correctly saw a finished job every time and adoption was untestable.
 
 ## Coverage
 
