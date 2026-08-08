@@ -8,11 +8,28 @@ is roughly what CI does to source code.
 > **Status: pre-alpha.** Nothing here is production-ready yet. Do not point release or deploy
 > pipelines at it. See [Status](#status) for what actually works today.
 
+## The idea
+
+**Your own hardware for the builds, the cloud for when it is not there.**
+
+A box under your desk is the cheapest fast CI you will ever have, and the reason people do not rely
+on it is that houses lose power and ISPs go down. billet is built so that one `runs-on` label can
+mean "the machine at home if it is up, EC2 if it is not" — the control plane lives somewhere always
+on, and the compute is wherever you have it.
+
+That combination is the thing billet is FOR. Kubernetes-based autoscalers do not span bare metal and
+cloud; the AWS-based projects are AWS-only; the microVM products are commercial. See
+[Alternatives](#alternatives) for an honest comparison, including cases where you should use
+something else.
+
+> The failover part is **designed, not built** — a tier names one provider today. See
+> [Status](#status).
+
 ## What it is
 
 `billet` is **being built** to run your GitHub Actions jobs on machines you control — a server under
 your desk, a Mac mini, or EC2 — with the accelerations that make self-hosting worth the trouble.
-None of the following works yet; see [Status](#status) for what does.
+Most of the following does not work yet; see [Status](#status) for what does.
 
 - **Ephemeral microVM per job.** Firecracker on bare metal, one job per VM, destroyed after. Stronger
   isolation than container-based runners.
@@ -47,31 +64,41 @@ git clone https://github.com/junioryono/billet && cd billet && go build ./cmd/bi
 
 ## Status
 
-billet is pre-alpha and most of it is unbuilt. What works **today**:
+billet is pre-alpha. **A job runs end to end in a container**, and nothing above that line is
+built. What works **today**:
 
 | | |
 |---|---|
 | `billet github-app create` | Creates and installs the GitHub App via the manifest flow |
 | `billet check` | Validates the config, the App private key, and the state database |
-| `internal/alloc` | The capacity ledger and lease state machine, with placement enforcement |
+| `billet server --dry-run` | Connects to a real org, reconciles scale sets, polls — accepts nothing |
+| `billet server --dev` | Control plane + node in one process: acquires jobs and runs them in containers |
+| `billet teardown` | Removes the scale sets billet created |
+| Capacity ledger | Lease state machine, fencing epochs, placement enforcement, escrow before advertising |
+| Docker provider | One container per job, JIT registration delivered off argv. **Trials only** — shares the host kernel, so it refuses anything not established as trusted |
+| Crash recovery | A job running when the controller dies is adopted and left to finish, not killed; its capacity stays held |
 
-Everything else — the scale-set listeners, every compute provider, the cache,
-sticky disks, trust classes, observability — is **not implemented**. `billet server` and `billet
-node` deliberately exit non-zero rather than idling, so a half-built control plane is never mistaken
-for a running one.
+**Not built:** Firecracker, Apple Silicon and EC2 providers; the cache; sticky disks; the node split
+over mTLS; provider failover; observability; the dashboard. Plain `billet server` (without `--dev`)
+exits non-zero rather than idling, so a half-built control plane is never mistaken for a running one.
+
+**Not yet run against a real organization.** The end-to-end path is exercised by a test suite that
+drives the real control plane and a real container runtime against a scripted stand-in for GitHub's
+Actions service. That catches protocol mistakes, but it is not the same as having run a workflow.
 
 Everything below describes the intended design. Where a thing is not built, it says so.
 
 ## Quickstart
 
-> **This is the intended flow, not a working one.** Only the first and third commands do anything
-> today. Nothing here runs a job yet.
+> Every command below works, with the caveat that the only compute backend is Docker, which is for
+> trials rather than for untrusted code. `billet init` is not built — copy the example config.
 
 ```bash
-billet github-app create --org myorg          # works
-cp billet.example.yaml ./billet.yaml          # `billet init` is not built yet
-billet check --config ./billet.yaml           # works
-billet server --dev --config ./billet.yaml    # NOT YET — returns "not implemented"
+billet github-app create --org myorg          # creates + installs the App
+cp billet.example.yaml ./billet.yaml          # edit: org, tiers, node provider
+billet check --config ./billet.yaml           # validates config, key, state
+billet server --dry-run --config ./billet.yaml  # first contact: polls, accepts nothing
+billet server --dev --config ./billet.yaml    # runs jobs
 ```
 
 `--config` is not optional here. billet deliberately does **not** read a
@@ -183,17 +210,36 @@ same as Docker or ZFS. `billet` itself is Apache-2.0 throughout.
 
 | Phase | Status |
 |---|---|
-| P0 — scaffolding, GitHub App onboarding, host prep | 🚧 in progress |
-| P1 — runner plane: scale sets, allocator, Firecracker | ⬜ |
+| P0 — scaffolding, GitHub App onboarding, host prep | ✅ mostly |
+| P1 — runner plane: scale sets, allocator, providers | 🚧 listeners, allocator and Docker done; Firecracker next |
 | P2 — guest images, node split, user-defined tiers | ⬜ |
 | P3 — copy-on-write storage layer, trust classes | ⬜ |
 | P4 — colocated Actions cache | ⬜ |
 | P5 — Docker layer cache, registry mirrors, container baseline | ⬜ |
 | P6 — observability, SSH-into-a-job | ⬜ |
 | P7 — Apple Silicon provider (macOS + Linux arm64) | ⬜ |
-| P8 — EC2 provider, WAN topology | ⬜ |
+| P8 — EC2 provider, cloud-hosted control plane, provider failover | ⬜ |
 | P10 — dashboard, signed releases, public launch | ⬜ |
 | P11 — AWS Terraform | ⬜ |
+
+## Alternatives
+
+Use one of these instead if it fits — most people should.
+
+| | License | Runs on | Isolation | Notes |
+|---|---|---|---|---|
+| [actions-runner-controller](https://github.com/actions/actions-runner-controller) | Apache-2.0 | Kubernetes | container | GitHub's own. Mature and widely deployed. Needs a cluster; tracks no individual job and delegates scheduling to k8s; no cache or persistent build state. |
+| [terraform-aws-github-runner](https://github.com/github-aws-runners/terraform-aws-github-runner) | MIT | AWS only | EC2 per job | Terraform + Lambda, webhook-driven. Well maintained. No cache service, no bare metal. |
+| [GARM](https://github.com/cloudbase/garm) | Apache-2.0 | many clouds + LXD | varies | The closest existing OSS control plane, and a genuine multi-provider design. No colocated cache or build-state caching. |
+| [Ubicloud](https://github.com/ubicloud/ubicloud) | **AGPL** | their cloud | microVM | The best open reference for how a commercial runner cloud is built. The licence makes adopting a piece of it hard. |
+| [Actuated](https://actuated.com) | commercial | your hardware | Firecracker | Closest on isolation. Paid. |
+| [Blacksmith](https://blacksmith.sh), [Namespace](https://namespace.so), [WarpBuild](https://warpbuild.com), [Depot](https://depot.dev), [BuildJet](https://buildjet.com) | commercial | their hardware | varies | Managed. If you do not want to run infrastructure, use one of these. |
+
+**Where billet is different:** one `runs-on` label spanning bare metal, Apple Silicon and cloud with
+failover between them, plus a colocated cache and persistent build state, in one Apache-2.0 binary
+with no Kubernetes. Every piece of that exists somewhere in the table; the combination does not.
+
+**Where it is worse, today:** all of them work and billet mostly does not.
 
 ## Prior art
 
