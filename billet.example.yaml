@@ -71,6 +71,23 @@ node:
 # Tiers are yours to define — this is not a fixed catalog. The label is what
 # users put in `runs-on`.
 tiers:
+  # ONE LABEL, TWO KINDS OF MACHINE. A tier may name several backends in
+  # preference order, so losing the box at home does not take the runs-on label
+  # down with it — jobs land on EC2 instead.
+  #
+  # The order is recorded but does not yet choose: today a node binds itself, so
+  # placement can only accept or refuse the host that asked. Listing several
+  # already removes the hard pin, which is what a fallback needs; preference
+  # starts to bite when the node runs in its own process and the control plane
+  # picks among live hosts.
+  #
+  # - label: billet-8vcpu-ubuntu-2404
+  #   providers: [firecracker, ec2]   # instead of `provider: firecracker`
+  #   vcpu: 8
+  #   memory: 32GiB
+  #   disk: 160GiB
+  #   image: ubuntu-2404-x64
+
   - label: billet-2vcpu-ubuntu-2404
     provider: firecracker
     vcpu: 2

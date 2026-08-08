@@ -22,8 +22,10 @@ cloud; the AWS-based projects are AWS-only; the microVM products are commercial.
 [Alternatives](#alternatives) for an honest comparison, including cases where you should use
 something else.
 
-> The failover part is **designed, not built** — a tier names one provider today. See
-> [Status](#status).
+> The failover part is **half built**. A tier can now name several backends and be
+> placed on any of them, so it is no longer pinned to one kind of machine. What is
+> missing is the part that CHOOSES: nothing picks among live hosts yet, because a
+> node binds itself. See [Status](#status).
 
 ## What it is
 
@@ -77,9 +79,11 @@ built. What works **today**:
 | Capacity ledger | Lease state machine, fencing epochs, placement enforcement, escrow before advertising |
 | Docker provider | One container per job, JIT registration delivered off argv. **Trials only** — shares the host kernel, so it refuses anything not established as trusted |
 | Crash recovery | A job running when the controller dies is adopted and left to finish, not killed; its capacity stays held |
+| Multi-backend tiers | One label can name several providers and be placed on any of them. The preference ORDER is recorded but not yet acted on — see below |
 
 **Not built:** Firecracker, Apple Silicon and EC2 providers; the cache; sticky disks; the node split
-over mTLS; provider failover; observability; the dashboard. Plain `billet server` (without `--dev`)
+over mTLS; the scheduler that would make provider preference and a cost policy mean something;
+observability; the dashboard. Plain `billet server` (without `--dev`)
 exits non-zero rather than idling, so a half-built control plane is never mistaken for a running one.
 
 **Not yet run against a real organization.** The end-to-end path is exercised by a test suite that
