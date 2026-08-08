@@ -71,6 +71,33 @@ node:
 # Tiers are yours to define — this is not a fixed catalog. The label is what
 # users put in `runs-on`.
 tiers:
+  # RESERVING A FLOOR. Every tier shares one budget, and headroom is whatever is
+  # left — so a tier with steady demand can hold all of it. The others then
+  # advertise zero capacity, their jobs queue at GitHub indefinitely, and nothing
+  # in billet is behaving incorrectly. A tier with small instances wins that race
+  # simply by fitting more often.
+  #
+  #   reserved: 2     # always keep room for 2 of these, however busy the rest is
+  #
+  # It is a FLOOR, where max_concurrent is a ceiling — the difference between
+  # limiting a tier and guaranteeing one. A reservation is deducted from what
+  # other tiers may take only while it is UNMET; once the tier holds its floor it
+  # competes for the rest on equal terms.
+  #
+  # THE COST IS REAL AND PERMANENT. Listeners claim escrow eagerly, without
+  # consulting demand, so a reserved tier does not leave its floor sitting in
+  # reserve — it takes those slots almost immediately and holds them for as long
+  # as billet runs, advertising capacity to GitHub that nobody may want. Reserve
+  # 2 slots of an 8 vCPU tier that gets no work and the machine is permanently
+  # 16 vCPU smaller, with no error and no log line.
+  #
+  # So reserve for a tier that HAS demand and is being crowded out, never for one
+  # that might someday want capacity. `billet check` prints how much of the
+  # machine is spoken for; read it before and after.
+  #
+  # Unset means no guarantee, which is the default: a floor is a promise about a
+  # machine that only its operator can make.
+
   # ONE LABEL, TWO KINDS OF MACHINE. A tier may name several backends in
   # preference order, so losing the box at home does not take the runs-on label
   # down with it — jobs land on EC2 instead.
