@@ -115,8 +115,13 @@ func Classify(event string) TrustClass {
 
 // Spec is one instance to launch.
 type Spec struct {
-	// Name identifies the instance to the operator and to GitHub. It is the
-	// runner name the JIT config was minted for, so the two must agree.
+	// Name is BILLET's handle for the instance, and it must encode the lease.
+	//
+	// Not GitHub's runner name, which is a different thing that can differ. This
+	// is what reconciliation reads back: after a crash the only surviving link
+	// between a running instance and the lease that authorised it is the name the
+	// instance carries, so a name that does not encode the lease makes an orphan
+	// unattributable. See InstanceName.
 	Name string
 	// Image is the tier's image reference, interpreted by the backend: a
 	// container image for docker, a rootfs for firecracker, an AMI for ec2.
@@ -145,7 +150,8 @@ type Spec struct {
 	JITConfig string
 }
 
-// Instance is a launched instance.
+// Instance is a unit of compute the backend knows about. It may or may not
+// still be running — see Running.
 type Instance struct {
 	// ID is the backend's own handle — a container id, a microVM id, an EC2
 	// instance id. Opaque to everything above.
@@ -153,6 +159,34 @@ type Instance struct {
 	// Name echoes the spec, so a caller holding only an Instance can still say
 	// which runner it is.
 	Name string
+
+	// Running reports whether the instance is still executing.
+	//
+	// The difference between "this job is in progress" and "this job is over and
+	// the container is a corpse holding a name and a disk", which is exactly the
+	// question an adopted instance has to be asked repeatedly. A backend that
+	// cannot tell should report true: treating an unknown state as finished would
+	// destroy live work, and treating it as running only delays a cleanup.
+	Running bool
+}
+
+// InstanceName is billet's handle for the compute backing a lease.
+//
+// Derived rather than stored, and that is the whole trick: it means a running
+// instance can be matched back to its lease with nothing but its own name, so
+// reconciliation after a crash needs no durable side table and no schema change.
+// The lease id is unique, so the name is too.
+func InstanceName(leaseID string) string { return "billet-" + leaseID }
+
+// LeaseOf reverses InstanceName, and reports whether the name was billet's.
+func LeaseOf(instanceName string) (string, bool) {
+	const prefix = "billet-"
+
+	if len(instanceName) <= len(prefix) || instanceName[:len(prefix)] != prefix {
+		return "", false
+	}
+
+	return instanceName[len(prefix):], true
 }
 
 // Provider launches and destroys the compute for one job at a time.
@@ -175,6 +209,27 @@ type Provider interface {
 	// it is ready. Readiness is a separate question with a separate timeout, and
 	// conflating them is how a slow image pull becomes a launch failure.
 	Launch(ctx context.Context, spec Spec) (*Instance, error)
+
+	// Find reports the instance with that name, and whether there was one.
+	//
+	// This is what makes a failed launch answerable rather than guessed at. An
+	// error from Launch does not prove nothing started — a cancelled context can
+	// kill the CLI after the daemon accepted the request, and a remote API can
+	// commit and lose the response — so the only honest way to find out is to
+	// ask. Retrying instead is how one job becomes two runners.
+	//
+	// The bool is explicit rather than a nil pointer, because the caller's next
+	// move on a hit is to DESTROY: "there is nothing here" and "something went
+	// wrong and you got a zero value" must not look alike at a call site with
+	// that consequence.
+	Find(ctx context.Context, name string) (*Instance, bool, error)
+
+	// List reports every instance this backend is running for billet.
+	//
+	// The input to reconciliation: anything here whose lease is no longer open is
+	// an orphan, and orphans are the residue of every crash between starting an
+	// instance and recording it.
+	List(ctx context.Context) ([]*Instance, error)
 
 	// Destroy removes an instance and everything it owns.
 	//
