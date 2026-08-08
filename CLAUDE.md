@@ -589,14 +589,45 @@ on live jobs it had no relationship with.
 **A copied state directory deliberately keeps the original's identity** (the copy's
 containers are labelled with it), and the directory lock does NOT make that safe —
 a copy is a different inode, so both directories lock happily. That is what
-`state.LockDeployment` is for: a SECOND lock keyed by the IDENTITY, taken host-wide
-in the user cache directory, so the copy collides and refuses to start. The user
-cache rather than `/tmp` because `/tmp` is world-writable and any local user could
-pre-create the file and hold it, keeping billet from ever booting. A host that
-cannot PLACE that lock degrades to the directory lock alone and reports why —
-refusing to boot there would trade a rare hazard for a common outage. The residual
-case, two different UNIX users sharing one docker daemon, is still open: they get
-different cache directories and so do not collide, while their containers do.
+`state.LockDeployment` is for: a SECOND lock keyed by the IDENTITY, so the copy
+collides and refuses to start.
+
+Three things about it were wrong on the first attempt and are worth not repeating:
+
+- **Never put a lock file in a cache directory.** It was there first, chosen over
+  `/tmp` because `/tmp` is world-writable and a local user could hold the file to
+  keep billet from booting. True, and still the wrong place: a cache directory's
+  contract is that its contents may be deleted at any time. Unlinking a held lock
+  file does not release the flock, but it detaches the PATH from the locked inode,
+  so the next process creates a new file there, locks that, and both run. **An
+  inode check does not fix this** — the newcomer's check passes because it created
+  the file it just locked. The location is the fix; it now lives in the state
+  directory (`$XDG_STATE_HOME`, or Application Support on darwin).
+- **Failing to place the lock is an ERROR, not a downgrade.** It used to degrade
+  on the reasoning that a host with nowhere to put a lock is more often one
+  deployment than two. That derives AUTHORIZATION FROM AN I/O FAILURE: a symlink
+  loop, a permissions change, ENOLCK, fd exhaustion, or a service manager with no
+  `HOME` all land there and look identical to the benign case. `server.
+  allow_unlocked_deployment` lets an operator opt in explicitly.
+- **The default location is per-user, which the lock cannot fix by itself.** A
+  system service and an operator sharing `/var/run/docker.sock`, or two containers
+  sharing a socket with private filesystems, get different directories and never
+  collide while their containers do. `server.lock_dir` puts them in one collision
+  domain, and the resolved path is logged every boot so which domain a process
+  joined is evidence rather than inference.
+
+**Claim the identity BEFORE `state.Open`.** It ran after, and `state.Open` applies
+migrations — so a process about to be refused first migrated the database it was
+refused the right to use (start an old copied backup beside a live original and
+the backup is silently upgraded on its way to the error).
+
+**A contention test that runs in one process is not a contention test.** Both of
+the original ones called `LockDeployment` twice in the same process; a
+package-level mutex or a PID in the filename satisfies that while two billets
+start against one daemon. Measured, not assumed — the in-process test really does
+pass a fake process-local mutex. The real one re-executes the test binary
+(`deploymentlock_process_test.go`), which is also the only way to assert that
+SIGKILLing the holder frees the identity.
 
 ### `created` is not `running`
 
