@@ -3,8 +3,10 @@ package e2e
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/fakeactions"
 	"github.com/junioryono/billet/internal/node"
 	"github.com/junioryono/billet/internal/provider"
 )
@@ -185,6 +187,83 @@ func TestARealUnconfirmedCleanupHoldsCapacity(t *testing.T) {
 	}
 }
 
+// A redelivered assignment does not start a second runner, THROUGH THE REAL
+// CONTROL PLANE.
+//
+// The unit test for this calls Launch directly, so it proves the guard exists
+// without proving the listener reaches it. This is the whole path: a crash
+// before an assignment was acknowledged, a restart that adopts the container,
+// and then GitHub redelivering the assignment to a listener whose maps are
+// empty. Without the guard it escrows a second lease and starts a second
+// container — a live runner registration that can pick up unrelated work.
+func TestARedeliveredAssignmentDoesNotStartASecondRunner(t *testing.T) {
+	s := newStack(t)
+
+	lease := s.launchDirectly(t)
+
+	// The controller dies without shutting down, and a new one adopts.
+	s.closeDB()
+
+	restarted := newStackIn(t, s.dir, s.plane)
+
+	if err := restarted.runner.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+
+	stop := restarted.run(t)
+	defer stop()
+
+	// GitHub redelivers the whole exchange for the SAME request.
+	restarted.plane.queue(fakeactions.StatisticsJSON(1, 0),
+		fakeactions.JobJSON("JobAvailable", lease.RequestID, "push", testTier))
+
+	deadline := time.Now().Add(30 * time.Second)
+
+	for len(restarted.plane.acquiredIDs()) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("billet never bid for the redelivered job")
+		}
+
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	restarted.plane.queue(fakeactions.StatisticsJSON(0, 1),
+		fakeactions.JobJSON("JobAssigned", lease.RequestID, "push", testTier))
+
+	// Long enough that a second container would have appeared. There is no
+	// positive signal for "nothing happened".
+	time.Sleep(3 * time.Second)
+
+	live, err := restarted.provider.List(t.Context())
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+
+	var running int
+
+	for _, inst := range live {
+		if inst.Running {
+			running++
+		}
+	}
+
+	if running != 1 {
+		t.Fatalf("a redelivered assignment produced %d runners for one job: %v", running, live)
+	}
+
+	// And the capacity the listener took for the redelivery went back, rather
+	// than being stranded by a launch that refused.
+	usage, err := restarted.alloc.Usage(t.Context())
+	if err != nil {
+		t.Fatalf("Usage: %v", err)
+	}
+
+	if usage.VCPU > 8 {
+		t.Errorf("the refused relaunch stranded capacity: %d vCPU held against a budget of 8",
+			usage.VCPU)
+	}
+}
+
 // launchDirectly reserves, assigns and launches one job without running the
 // control plane, and returns its lease.
 //
@@ -212,8 +291,17 @@ func (s *stack) launchDirectly(t *testing.T) *alloc.Lease {
 		t.Fatalf("Assign: %v", err)
 	}
 
-	if err := s.runner.Launch(t.Context(), lease, // A push, so the container backend accepts it: these tests are about
-		// recovery, not about the trust boundary.
+	// SET ON THE STRUCT TOO. Assign records the request id in the ledger but does
+	// not write it back to the caller's copy, so a lease straight out of Reserve
+	// carries RequestID 0. A test that then queues a message for lease.RequestID
+	// is asking billet about a different job entirely — which is how the first
+	// version of the redelivery test "reproduced" a second launch that was in
+	// fact billet correctly starting an unrelated request.
+	lease.RequestID = requestID
+
+	// A push, so the container backend accepts it: these tests are about
+	// recovery, not about the trust boundary.
+	if err := s.runner.Launch(t.Context(), lease,
 		node.Job{RequestID: requestID, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
