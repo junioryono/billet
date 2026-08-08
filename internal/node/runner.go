@@ -294,13 +294,12 @@ func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
 		// container whose job GitHub later reports finished is held forever: the
 		// restarted listener has no record of the request either, so nothing else
 		// connects the completion to the compute.
-		released, err := r.releaseRequest(ctx, requestID)
-		if err != nil {
+		// Idempotent either way: a request nothing was started for is success,
+		// because this runs on redelivered completions, on shutdown, and after a
+		// failure. The return value says whether custody handled it, which nothing
+		// above needs — the error is what matters.
+		if _, err := r.releaseRequest(ctx, requestID); err != nil {
 			return err
-		}
-
-		if released {
-			return nil
 		}
 
 		return nil

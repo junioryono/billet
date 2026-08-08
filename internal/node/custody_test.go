@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -831,5 +832,81 @@ func TestFinishingAStaleEntryDoesNotDropItsReplacement(t *testing.T) {
 	if held != replacement {
 		t.Fatal("a stale custody entry deleted its replacement, so billet has forgotten " +
 			"compute that still exists")
+	}
+}
+
+// A completion arriving while the periodic tick runs must not race it.
+//
+// These are genuinely different goroutines in production: completions come from
+// a listener, the tick from the reaper. Both end up in tendOne, which mutates
+// the entry in place and issues backend calls between reads — so two of them on
+// one entry destroy the same instance twice, and a delete can drop an entry that
+// was just replaced.
+//
+// Serializing only the FLAG WRITE was not enough, which is what this exists to
+// catch: it is the same bug the serialization was added for, moved one line
+// down. Run under -race, which is how the suite runs.
+func TestACompletionDoesNotRaceTheTick(t *testing.T) {
+	t.Parallel()
+
+	// The delay is what makes this a test rather than a coin flip: it holds both
+	// callers inside the transition long enough to genuinely overlap.
+	p := &fakeProvider{kind: config.ProviderDocker, findDelay: 20 * time.Millisecond}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
+	const requestID = 7777
+
+	lease := assignedLease(t, a)
+
+	if err := r.Launch(t.Context(), lease, Job{RequestID: requestID, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	restarted := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
+	if err := restarted.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+
+	var wg sync.WaitGroup
+
+	start := make(chan struct{})
+
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+
+		<-start
+
+		// The listener's completion.
+		if err := restarted.Destroy(t.Context(), lease.RequestID); err != nil {
+			t.Errorf("Destroy: %v", err)
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+
+		<-start
+
+		// The reaper's tick.
+		if err := restarted.Tend(t.Context()); err != nil {
+			t.Errorf("Tend: %v", err)
+		}
+	}()
+
+	close(start)
+	wg.Wait()
+
+	// Whichever won, the outcome is the same: the compute is gone and nothing is
+	// still holding capacity for it.
+	if len(p.live) != 0 {
+		t.Errorf("compute survived a completion: %v", p.live)
+	}
+
+	if len(restarted.heldLeases()) != 0 {
+		t.Error("capacity is still held for a job that has finished")
 	}
 }

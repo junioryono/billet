@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
@@ -281,6 +282,12 @@ type fakeProvider struct {
 	// passes because nothing happened, which is not the same as passing because
 	// cleanup worked.
 	cancelOnLaunch context.CancelFunc
+
+	// findDelay widens the window inside a custody transition, so two callers
+	// that are supposed to be serialized actually overlap if they are not. A race
+	// whose window is nanoseconds is one the detector reports only occasionally,
+	// which is the same as not testing it.
+	findDelay time.Duration
 }
 
 func (f *fakeProvider) Kind() config.ProviderKind { return f.kind }
@@ -317,6 +324,10 @@ func (f *fakeProvider) Launch(_ context.Context, spec provider.Spec) (*provider.
 }
 
 func (f *fakeProvider) Find(ctx context.Context, name string) (*provider.Instance, bool, error) {
+	if f.findDelay > 0 {
+		time.Sleep(f.findDelay)
+	}
+
 	// CONTEXT IS HONOURED, because a fake that ignores it cannot tell a caller
 	// using a cancelled context from one using a fresh one — and that difference
 	// is the entire subject of the cancelled-launch test.

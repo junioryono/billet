@@ -175,6 +175,10 @@ func (r *Runner) Tend(ctx context.Context) error {
 	return errors.Join(failures...)
 }
 
+// tendOne advances one custody entry. THE CALLER MUST HOLD r.tending: this
+// mutates the entry in place and issues backend calls between reads, so two
+// concurrent callers would destroy the same instance twice and could delete an
+// entry that had been replaced.
 func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 	held := r.now().Sub(c.since)
 
@@ -292,13 +296,19 @@ func (r *Runner) releaseRequest(ctx context.Context, requestID int64) (bool, err
 		return false, nil
 	}
 
-	// Marked for destruction rather than destroyed here, then advanced
-	// immediately. Going through the same path as every other custody transition
-	// keeps the ordering rules — destroy, then release, and keep the entry if
-	// either fails — in exactly one place.
+	// HELD ACROSS THE WHOLE TRANSITION, not just the flag write. This runs on the
+	// listener's goroutine while the periodic tick runs on the reaper's, so
+	// releasing the lock before tendOne would let both act on the same entry —
+	// duplicate destroys, and a delete racing a replacement. Serializing only the
+	// mutation was the same bug the serialization was added to fix, moved one
+	// line down.
+	//
+	// tendOne does not take this lock itself, so holding it here is not
+	// re-entrant. The lock order is tending before mu, everywhere.
 	r.tending.Lock()
+	defer r.tending.Unlock()
+
 	held.discard = true
-	r.tending.Unlock()
 
 	r.log.Info("a job billet adopted has been reported finished; releasing its compute",
 		"lease", held.leaseID, "request", requestID)
