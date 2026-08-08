@@ -52,36 +52,53 @@ func lockDir(stateDir string) (*dirLock, error) {
 // escape was to turn the protection off. The narrow widening is safe because the
 // group is the operator's own choice and world access is refused separately.
 func lockFile(path string, shared bool) (*dirLock, error) {
-	// gosec traces a path here from configuration (server.lock_dir) and from the
-	// deployment identity, and it is right that both reach this call. Both are
-	// accounted for: the directory is the operator's own choice, which is the
-	// point of the key — it exists so they can put the lock where every billet
-	// sharing a container runtime will meet — and the identity is checked against
-	// validDeploymentID immediately before it is interpolated, precisely so a
-	// separator cannot leave that directory.
-	//
-	mode := os.FileMode(0o600)
-	if shared {
-		mode = 0o660
-	}
-
-	// O_NOFOLLOW so the final component cannot be swapped for a symlink pointing
-	// somewhere else — the directory check rules out an untrusted party creating
-	// one, and this makes the open itself refuse rather than depending on that
-	// check having run first.
-	//
-	//nolint:gosec // G703: both taint sources are validated or operator-supplied; see above.
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, mode)
+	// No suppression here any more, and the reason is worth keeping: this call
+	// used to take a path built from server.lock_dir and the deployment identity,
+	// which gosec traced as tainted. Those now arrive through lockFileIn and its
+	// directory descriptor instead, so the only caller left passes a path built
+	// from the state directory alone.
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, lockFileMode(shared))
 	if err != nil {
 		return nil, fmt.Errorf("open lock file %s: %w", path, err)
 	}
 
-	// THE UMASK SILENTLY REMOVES WHAT THE MODE ASKED FOR. A typical 022 turns the
-	// 0660 above into 0640, and 0640 cannot be opened O_RDWR by the other account
-	// — so the shared case would fail exactly as it did before, with the fix in
-	// place and looking applied. Corrected explicitly rather than trusted.
+	// Never shared: this path is the state directory's own lock, which is private
+	// by construction, so there is no group to match against.
+	return flockOwned(f, path, shared, -1)
+}
+
+// lockFileIn is the same thing relative to an already-resolved directory.
+//
+// Relative to a HELD DESCRIPTOR, so the directory that was validated is the
+// directory the lock lands in — separate resolutions of the same name can refer
+// to different inodes, and everything between the check and the open is a window
+// for exactly that.
+func lockFileIn(root *os.Root, name, path string, shared bool, gid int) (*dirLock, error) {
+	f, err := root.OpenFile(name, os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, lockFileMode(shared))
+	if err != nil {
+		return nil, fmt.Errorf("open lock file %s: %w", path, err)
+	}
+
+	return flockOwned(f, path, shared, gid)
+}
+
+// lockFileMode is the mode a NEW lock file is created with. The umask takes bits
+// back off it, which is what ensureGroupAccess repairs.
+func lockFileMode(shared bool) os.FileMode {
 	if shared {
-		if err := ensureGroupAccess(f, path); err != nil {
+		return 0o660
+	}
+
+	return 0o600
+}
+
+func flockOwned(f *os.File, path string, shared bool, gid int) (*dirLock, error) {
+	// THE UMASK SILENTLY REMOVES WHAT THE MODE ASKED FOR. A typical 022 turns
+	// 0660 into 0640, and 0640 cannot be opened O_RDWR by the other account — so
+	// the shared case would fail exactly as it did before, with the fix in place
+	// and looking applied. Corrected explicitly rather than trusted.
+	if shared {
+		if err := ensureGroupAccess(f, path, gid); err != nil {
 			_ = f.Close()
 
 			return nil, err
@@ -98,16 +115,32 @@ func lockFile(path string, shared bool) (*dirLock, error) {
 }
 
 // ensureGroupAccess makes a lock file in a shared directory openable by the
-// owning group, whatever the umask was.
+// group that directory is shared through, whatever the umask was.
 //
-// A failure to chmod is NOT itself an error: in the shared case the file may
-// have been created by the other account, in which case it is not ours to change
-// and already has the mode we want. What matters is the mode that ends up there,
-// so that is what is checked.
-func ensureGroupAccess(f *os.File, path string) error {
+// THE MODE BITS ARE ONLY HALF THE QUESTION, and checking them alone is what the
+// previous version got wrong: 0660 says a group may open the file, not WHICH
+// group. A service account whose primary group is `service` and whose
+// supplemental group is `billet` creates a file owned by `service` in a
+// non-setgid directory — every bit the check asks for, and still unopenable by
+// the operator it was widened for. So the directory's gid is required to match.
+//
+// NOT a repair path for a file another account left too restrictive. That case
+// cannot reach here at all: billet must open the file O_RDWR first, and an
+// other-owned 0600 or 0640 file fails at the open. The earlier comment claimed
+// otherwise, which made a hole look handled — it fails closed, but it fails, and
+// the caller says how to fix it rather than pretending it recovered.
+func ensureGroupAccess(f *os.File, path string, gid int) error {
 	info, err := f.Stat()
 	if err != nil {
 		return fmt.Errorf("inspect lock file %s: %w", path, err)
+	}
+
+	if fileGID(info) != gid {
+		return fmt.Errorf(
+			"lock file %s belongs to group %d, but the shared directory is group %d: the other "+
+				"account sharing that directory would not be able to open it. Make the directory "+
+				"setgid (chmod g+s) and remove the stale lock file so it is recreated",
+			path, fileGID(info), gid)
 	}
 
 	if info.Mode().Perm()&0o060 == 0o060 {
@@ -145,4 +178,28 @@ func (l *dirLock) release() error {
 		return unlockErr
 	}
 	return closeErr
+}
+
+// fileGID reports the group that owns a file, or -1 when the platform does not
+// say. A gid the caller cannot read is never treated as a MATCH: an unknown
+// group is exactly the case where widening the mode would look right and lock
+// the other account out anyway.
+func fileGID(info os.FileInfo) int {
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return -1
+	}
+
+	return int(st.Gid)
+}
+
+// dirGID is the same question asked of the shared lock directory, whose group is
+// the one every participant must end up in.
+func dirGID(info os.FileInfo) (int, error) {
+	gid := fileGID(info)
+	if gid < 0 {
+		return -1, errors.New("the filesystem did not report a group owner")
+	}
+
+	return gid, nil
 }

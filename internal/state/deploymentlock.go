@@ -113,14 +113,35 @@ func LockDeployment(id string, opts LockOptions) (*DeploymentLock, error) {
 		return unplaceable(opts, fmt.Sprintf("cannot create %s (%v)", dir, err))
 	}
 
-	shared, err := checkLockDir(dir, operatorChose)
+	// RESOLVED ONCE, THEN HELD. MkdirAll, a stat, a chmod and an open are four
+	// independent pathname resolutions, and between any two of them the directory
+	// can be replaced — so the thing that was checked need not be the thing that
+	// is used. os.Root resolves the path a single time into a descriptor and
+	// performs everything else relative to it, which collapses those windows into
+	// one and confines the lock file to the directory that was actually
+	// validated.
+	//
+	// What it does NOT cover is an untrusted-writable ANCESTOR, because MkdirAll
+	// above still walks the path by name. That is a real residual and it is
+	// recorded rather than implied away.
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return unplaceable(opts, fmt.Sprintf("cannot open %s (%v)", dir, err))
+	}
+
+	// Closed once the lock file is open: the flock lives on the FILE's
+	// descriptor, so the directory handle has no further job.
+	defer func() { _ = root.Close() }()
+
+	shared, gid, err := checkLockDir(root, dir, operatorChose)
 	if err != nil {
 		return unplaceable(opts, err.Error())
 	}
 
-	path := filepath.Join(dir, "deployment-"+id+".lock")
+	name := "deployment-" + id + ".lock"
+	path := filepath.Join(dir, name)
 
-	lock, err := lockFile(path, shared)
+	lock, err := lockFileIn(root, name, path, shared, gid)
 	if err != nil {
 		if errors.Is(err, ErrLocked) {
 			return nil, fmt.Errorf(
@@ -188,43 +209,93 @@ func (d *DeploymentLock) Degraded() string {
 //     account and an operator who both reach the same docker socket. They are
 //     trusted with each other's compute by construction. World-writable is still
 //     refused under both.
-func checkLockDir(dir string, operatorChose bool) (bool, error) {
-	// Lstat, not Stat: a symlink here is someone redirecting the lock, and
-	// following it to ask about the target would answer the wrong question.
-	info, err := os.Lstat(dir)
+//
+// A SHARED DIRECTORY MUST BE SETGID, and that requirement is not bureaucracy —
+// it is the only thing that makes the sharing work. Without it a new file takes
+// the CREATOR'S primary group, so a service account whose primary group is
+// `service` and whose supplemental group is `billet` produces a lock file owned
+// by `service`: mode 0660, every permission bit the checks ask for, and still
+// unopenable by the operator it was widened for. Group-writable proves that
+// somebody intended sharing; setgid is what determines WHO. So the directory's
+// gid is returned and the lock file is required to match it.
+func checkLockDir(root *os.Root, dir string, operatorChose bool) (bool, int, error) {
+	// Through the held descriptor: "." is the directory that was resolved, not
+	// whatever the name refers to by the time this runs.
+	info, err := root.Stat(".")
 	if err != nil {
-		return false, fmt.Errorf("cannot inspect %s (%w)", dir, err)
+		return false, -1, fmt.Errorf("cannot inspect %s (%w)", dir, err)
 	}
 
-	if info.Mode()&os.ModeSymlink != 0 {
-		return false, fmt.Errorf("%s is a symlink, so what it locks can be redirected", dir)
+	// The symlink question is asked of the NAME, since a descriptor has already
+	// resolved past it. Lstat, not Stat: following it would answer a question
+	// about the target rather than about the redirection.
+	linkInfo, err := os.Lstat(dir)
+	if err != nil {
+		return false, -1, fmt.Errorf("cannot inspect %s (%w)", dir, err)
+	}
+
+	if linkInfo.Mode()&os.ModeSymlink != 0 {
+		return false, -1, fmt.Errorf("%s is a symlink, so what it locks can be redirected", dir)
 	}
 
 	if !info.IsDir() {
-		return false, fmt.Errorf("%s is not a directory", dir)
+		return false, -1, fmt.Errorf("%s is not a directory", dir)
 	}
 
 	perm := info.Mode().Perm()
 
 	if perm&0o002 != 0 {
-		return false, fmt.Errorf(
+		return false, -1, fmt.Errorf(
 			"%s is world-writable (%o), so any local user could hold the lock file and keep "+
 				"billet from starting", dir, perm)
 	}
 
+	setgid := info.Mode()&os.ModeSetgid != 0
+
 	if !operatorChose {
-		if perm&0o020 != 0 {
-			// Tightened rather than refused: billet picked this path, so it is
-			// billet's to correct — and state.Open sets the precedent one screen up.
-			if err := os.Chmod(dir, 0o700); err != nil {
-				return false, fmt.Errorf("cannot tighten %s from %o (%w)", dir, perm, err)
-			}
+		if perm&0o020 == 0 {
+			return false, -1, nil
 		}
 
-		return false, nil
+		// SETGID MEANS SOMEONE SHARED THIS ON PURPOSE, so tightening it would be
+		// billet quietly dismantling an arrangement it did not make — stripping the
+		// bit and locking out the other account, on no evidence beyond this
+		// invocation happening to omit lock_dir. Refuse and say what to do.
+		if setgid {
+			return false, -1, fmt.Errorf(
+				"%s is a setgid group-shared directory (%o) but this billet did not ask for a "+
+					"shared one; set server.lock_dir to it explicitly if the sharing is intended, "+
+					"or point server.lock_dir somewhere private", dir, info.Mode().Perm())
+		}
+
+		// Tightened rather than refused: billet picked this path, nobody declared
+		// it shared, and state.Open sets the precedent one screen up. Through the
+		// descriptor, so it cannot land on something swapped in since the stat.
+		if err := root.Chmod(".", 0o700); err != nil {
+			return false, -1, fmt.Errorf("cannot tighten %s from %o (%w)", dir, perm, err)
+		}
+
+		return false, -1, nil
 	}
 
-	return perm&0o020 != 0, nil
+	if perm&0o020 == 0 {
+		return false, -1, nil
+	}
+
+	if !setgid {
+		return false, -1, fmt.Errorf(
+			"%s is group-writable (%o) but not setgid, so a lock file created there takes its "+
+				"creator's primary group rather than the directory's: an account sharing this "+
+				"directory through a supplemental group would produce a lock the other account "+
+				"still cannot open. Run: chmod g+s %s", dir, perm, dir)
+	}
+
+	gid, err := dirGID(info)
+	if err != nil {
+		return false, -1, fmt.Errorf("cannot read the group of %s (%w)", dir, err)
+	}
+
+	return true, gid, nil
 }
 
 // unplaceable is what happens when there is nowhere to put the lock: an error

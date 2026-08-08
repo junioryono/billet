@@ -1747,3 +1747,43 @@ func TestAReservationAfterTheBudgetIsExhaustedIsRefused(t *testing.T) {
 		t.Errorf("the error does not name the tier that does not fit: %v", err)
 	}
 }
+
+// A RELATIVE server.lock_dir IS CAUGHT AT LOAD, not only when the lock is taken.
+//
+// Tested at this layer on its own, because the state package has its own check
+// and would keep passing if this one were deleted — so without this the config
+// gate could disappear and nothing would notice. It matters that the config
+// catches it: `billet check` is how an operator validates a file before it ever
+// reaches a host, and the failure it prevents is invisible at runtime. A
+// relative path resolves against each process working directory, so one config
+// puts a unit started in / and an operator started in /srv/billet into different
+// collision domains while both log the same string.
+func TestValidateRejectsARelativeLockDir(t *testing.T) {
+	body := `
+server:
+  listen: 127.0.0.1:7717
+  state_dir: /var/lib/billet/server
+  lock_dir: locks
+  max_vcpu: 8
+  max_memory: 32GiB
+github:
+  org: acme
+  app_id: 1
+  installation_id: 2
+  private_key_path: /tmp/key.pem
+tiers:
+  - label: billet-2vcpu
+    provider: docker
+    vcpu: 2
+    memory: 8GiB
+    image: ubuntu:24.04
+`
+	_, err := Load(writeConfig(t, body))
+	if err == nil {
+		t.Fatal("Load accepted a relative server.lock_dir")
+	}
+
+	if !strings.Contains(err.Error(), "lock_dir") {
+		t.Errorf("the error does not name the key: %v", err)
+	}
+}

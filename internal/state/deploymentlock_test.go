@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -619,8 +620,9 @@ func TestASharedLockDirectoryProducesAGroupOpenableLock(t *testing.T) {
 
 	dir := t.TempDir()
 
-	// Group-writable: the shape an administrator provisions for two accounts.
-	if err := os.Chmod(dir, 0o770); err != nil {
+	// SETGID group-writable: the shape an administrator provisions for two
+	// accounts, and the only shape that actually works. See the sibling test.
+	if err := os.Chmod(dir, os.ModeSetgid|0o770); err != nil {
 		t.Fatalf("chmod: %v", err)
 	}
 
@@ -645,6 +647,93 @@ func TestASharedLockDirectoryProducesAGroupOpenableLock(t *testing.T) {
 
 	if perm&0o007 != 0 {
 		t.Errorf("the lock file is world-accessible (%o)", perm)
+	}
+
+	// THE BITS ARE ONLY HALF THE QUESTION. 0660 says "a group may open this", not
+	// WHICH group — and the group that matters is the directory's, because that is
+	// the one both accounts were put in. A file carrying the creator's primary
+	// group instead passes every mode assertion above and is still unopenable by
+	// the account it was widened for.
+	dirInfo, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("stat dir: %v", err)
+	}
+
+	if got, want := fileGID(info), fileGID(dirInfo); got != want {
+		t.Errorf("the lock file belongs to group %d but the shared directory is group %d, so "+
+			"the other account in that group cannot open it", got, want)
+	}
+}
+
+// A GROUP-WRITABLE DIRECTORY THAT IS NOT SETGID IS REFUSED, with the command to
+// fix it.
+//
+// Group-writable proves somebody intended sharing; setgid is what decides WHO
+// gets it. Without setgid a new file takes the creator's PRIMARY group, so a
+// service account sharing through a supplemental group produces a lock file with
+// every permission bit the checks ask for that the operator still cannot open —
+// the same silent-success shape as the umask defect, one layer up.
+func TestAGroupWritableDirectoryWithoutSetgidIsRefused(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	if err := os.Chmod(dir, 0o770); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+
+	_, err := LockDeployment("0123456789abcdef0123456789abcdef", LockOptions{Dir: dir})
+	if err == nil {
+		t.Fatal("a group-writable directory was accepted as shared without setgid, so the " +
+			"lock file can carry a group the other account is not in")
+	}
+
+	if !strings.Contains(err.Error(), "g+s") {
+		t.Errorf("the refusal does not say how to fix it: %v", err)
+	}
+}
+
+// BILLET DOES NOT DISMANTLE A SHARE IT DID NOT MAKE.
+//
+// The default path is tightened to 0700 when it is loose, which is right for a
+// directory nobody declared shared. A SETGID one was declared shared, and
+// stripping that bit on the evidence that this invocation happened to omit
+// lock_dir would lock the other account out of a collision domain an
+// administrator built on purpose.
+func TestASetgidDefaultDirectoryIsRefusedRatherThanTightened(t *testing.T) {
+	home := t.TempDir()
+
+	t.Setenv("XDG_STATE_HOME", home)
+	t.Setenv("HOME", home)
+
+	lock, err := LockDeployment("0123456789abcdef0123456789abcdef", LockOptions{})
+	if err != nil {
+		t.Fatalf("LockDeployment: %v", err)
+	}
+
+	dir := filepath.Dir(lock.Path())
+
+	if err := lock.Release(); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+
+	// An administrator shares it deliberately.
+	if err := os.Chmod(dir, os.ModeSetgid|0o770); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+
+	if _, err := LockDeployment("0123456789abcdef0123456789abcdef", LockOptions{}); err == nil {
+		t.Fatal("billet silently took over a deliberately shared directory")
+	}
+
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+
+	if info.Mode()&os.ModeSetgid == 0 {
+		t.Error("billet stripped the setgid bit off a directory an administrator shared, " +
+			"locking out every other account that used it")
 	}
 }
 
@@ -684,6 +773,43 @@ func TestARelativeLockDirectoryIsRefused(t *testing.T) {
 
 	if !strings.Contains(err.Error(), "absolute") {
 		t.Errorf("the refusal does not say what is wrong: %v", err)
+	}
+}
+
+// WHICH LOCATION WINS, asked with the two candidates set to DIFFERENT values.
+//
+// The rest of the suite points XDG_STATE_HOME and HOME at one directory, which
+// is convenient and proves nothing about precedence: every ordering passes. The
+// ordering is not cosmetic — it was a real defect, where the comment promised
+// Application Support on darwin while the code consulted XDG on every platform,
+// so setting that variable moved a macOS lock somewhere the docs said it could
+// not go.
+func TestTheDefaultLocationFollowsThePlatformConvention(t *testing.T) {
+	xdg := t.TempDir()
+	home := t.TempDir()
+
+	t.Setenv("XDG_STATE_HOME", xdg)
+	t.Setenv("HOME", home)
+
+	lock, err := LockDeployment("0123456789abcdef0123456789abcdef", LockOptions{})
+	if err != nil {
+		t.Fatalf("LockDeployment: %v", err)
+	}
+
+	releaseAtEnd(t, lock)
+
+	if runtime.GOOS == "darwin" {
+		if !strings.HasPrefix(lock.Path(), home) {
+			t.Errorf("on darwin the lock went to %q, but Apple's convention is Application "+
+				"Support under HOME (%q) and XDG must not override it", lock.Path(), home)
+		}
+
+		return
+	}
+
+	if !strings.HasPrefix(lock.Path(), xdg) {
+		t.Errorf("XDG_STATE_HOME was set to %q and the lock went to %q instead",
+			xdg, lock.Path())
 	}
 }
 
