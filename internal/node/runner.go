@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
@@ -71,6 +72,11 @@ type Runner struct {
 	// the launch path is a round trip in front of every job.
 	sets map[string]int
 }
+
+// strayCleanupTimeout bounds the check after a failed launch. Short: it runs on
+// an error path the caller is waiting on, and a provider that cannot answer
+// quickly is better logged than waited for.
+const strayCleanupTimeout = 30 * time.Second
 
 // New builds a runner over a provider.
 func New(
@@ -154,7 +160,12 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job Job) error 
 	// from the other side — GenerateJitRunnerConfig fails with RunnerExistsError
 	// on a name that is already registered. A lease id is unique by construction,
 	// so neither collision is reachable.
-	name := "billet-" + lease.ID
+	//
+	// It also carries the only durable link between an instance and its lease.
+	// Nothing writes "this container belongs to that lease" anywhere, so after a
+	// crash the name is what reconciliation reads to decide whether a surviving
+	// instance is still wanted. See provider.InstanceName.
+	name := provider.InstanceName(lease.ID)
 
 	reg, err := r.jit.JITConfig(ctx, setID, name, "_work")
 	if err != nil {
@@ -170,7 +181,12 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job Job) error 
 	}
 
 	inst, err := r.provider.Launch(ctx, provider.Spec{
-		Name:  reg.RunnerName(),
+		// BILLET's name, not GitHub's. reg.RunnerName() is what GitHub called the
+		// runner, and using it here would have left the instance carrying a name
+		// with no lease in it — unattributable to reconciliation, which is the one
+		// reader that has nothing else to go on. The JIT config carries GitHub's
+		// identity into the guest; the instance carries billet's.
+		Name:  name,
 		Image: tier.Image,
 		VCPU:  tier.VCPU,
 
@@ -186,6 +202,19 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job Job) error 
 		JITConfig: reg.Config(),
 	})
 	if err != nil {
+		// A LAUNCH ERROR IS NOT PROOF NOTHING STARTED.
+		//
+		// A cancelled context can kill the CLI after the daemon accepted the create;
+		// a remote API can commit and lose the response. The error says the caller
+		// does not KNOW, which is not the same as knowing there is nothing there —
+		// and the difference is a container running a job nobody will ever collect,
+		// holding a runner registration nobody will ever delete.
+		//
+		// So ask. Whatever is found is destroyed rather than adopted: the lease is
+		// about to be failed, so an instance for it has no future, and an adopted
+		// half-started instance is a worse thing to own than a clean failure.
+		r.destroyStray(ctx, name)
+
 		return fmt.Errorf("node: start %s: %w", name, err)
 	}
 
@@ -222,6 +251,119 @@ func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
 	r.mu.Lock()
 	delete(r.running, requestID)
 	r.mu.Unlock()
+
+	return nil
+}
+
+// destroyStray removes an instance a failed launch may have left behind.
+//
+// Best-effort by construction, and the errors are logged rather than returned:
+// the caller is already failing, and replacing its error with this one would
+// hide why the launch failed in the first place. What must not happen is
+// silence — an operator who has to find an orphan by hand needs to know it
+// might exist.
+func (r *Runner) destroyStray(ctx context.Context, name string) {
+	// A fresh context, because the usual reason a launch failed is that the
+	// caller's was cancelled — and asking a cancelled context to clean up
+	// guarantees the cleanup fails too.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), strayCleanupTimeout)
+	defer cancel()
+
+	inst, found, err := r.provider.Find(ctx, name)
+	if err != nil {
+		r.log.Error("could not tell whether a failed launch left an instance behind",
+			"name", name, "error", err)
+
+		return
+	}
+
+	if !found {
+		return
+	}
+
+	r.log.Warn("a failed launch had in fact started something; removing it",
+		"name", name, "instance", inst.ID)
+
+	if err := r.provider.Destroy(ctx, inst.ID); err != nil {
+		r.log.Error("could not remove the instance a failed launch left behind",
+			"name", name, "instance", inst.ID, "error", err)
+	}
+}
+
+// Reconcile destroys instances this node is running that no lease still wants.
+//
+// The recovery path for everything that can interrupt a launch. `running` is
+// in-memory, so a restart forgets every instance it started; the leases outlive
+// the process, and the instance names encode which lease each belongs to, so the
+// two together are enough to tell survivors from orphans without any durable
+// record of the launch itself.
+//
+// Run at startup, BEFORE any listener opens a session. An orphan holds vCPU and
+// memory the allocator has already released, so admitting work first means
+// over-committing the host by exactly as much as the crash leaked.
+//
+// It is deliberately not periodic. A sweep racing a live Launch would see an
+// instance whose lease had not yet been bound and destroy a job that was
+// starting normally; at startup nothing else is running, which is what makes the
+// comparison sound.
+func (r *Runner) Reconcile(ctx context.Context) error {
+	instances, err := r.provider.List(ctx)
+	if err != nil {
+		return fmt.Errorf("node: list what is already running: %w", err)
+	}
+
+	if len(instances) == 0 {
+		return nil
+	}
+
+	open, err := r.alloc.OpenLeaseIDs(ctx, r.node)
+	if err != nil {
+		return fmt.Errorf("node: list leases still open on %s: %w", r.node, err)
+	}
+
+	var orphans, failed int
+
+	for _, inst := range instances {
+		leaseID, ours := provider.LeaseOf(inst.Name)
+
+		// NOT OURS, NOT TOUCHED. The provider filters by billet's owner label, so
+		// this should be unreachable — but "should be unreachable" is a poor
+		// argument for a loop whose action is destruction, and adopting a name
+		// billet did not choose is the one mistake with no undo.
+		if !ours {
+			r.log.Warn("ignoring an instance whose name billet did not assign",
+				"name", inst.Name, "instance", inst.ID)
+
+			continue
+		}
+
+		if open[leaseID] {
+			continue
+		}
+
+		orphans++
+
+		r.log.Warn("destroying an instance whose lease is gone",
+			"name", inst.Name, "instance", inst.ID, "lease", leaseID)
+
+		if err := r.provider.Destroy(ctx, inst.ID); err != nil {
+			failed++
+
+			r.log.Error("could not destroy an orphaned instance",
+				"name", inst.Name, "instance", inst.ID, "error", err)
+		}
+	}
+
+	if failed > 0 {
+		// REPORTED, not swallowed. An orphan that resists destruction is holding
+		// capacity the allocator believes is free, and a caller that starts
+		// admitting work anyway will over-commit the host by that much.
+		return fmt.Errorf("node: %d of %d orphaned instances could not be destroyed", failed, orphans)
+	}
+
+	if orphans > 0 {
+		r.log.Info("removed instances left behind by an earlier run", "count", orphans)
+	}
 
 	return nil
 }

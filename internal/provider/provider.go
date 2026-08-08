@@ -115,8 +115,13 @@ func Classify(event string) TrustClass {
 
 // Spec is one instance to launch.
 type Spec struct {
-	// Name identifies the instance to the operator and to GitHub. It is the
-	// runner name the JIT config was minted for, so the two must agree.
+	// Name is BILLET's handle for the instance, and it must encode the lease.
+	//
+	// Not GitHub's runner name, which is a different thing that can differ. This
+	// is what reconciliation reads back: after a crash the only surviving link
+	// between a running instance and the lease that authorised it is the name the
+	// instance carries, so a name that does not encode the lease makes an orphan
+	// unattributable. See InstanceName.
 	Name string
 	// Image is the tier's image reference, interpreted by the backend: a
 	// container image for docker, a rootfs for firecracker, an AMI for ec2.
@@ -155,6 +160,25 @@ type Instance struct {
 	Name string
 }
 
+// InstanceName is billet's handle for the compute backing a lease.
+//
+// Derived rather than stored, and that is the whole trick: it means a running
+// instance can be matched back to its lease with nothing but its own name, so
+// reconciliation after a crash needs no durable side table and no schema change.
+// The lease id is unique, so the name is too.
+func InstanceName(leaseID string) string { return "billet-" + leaseID }
+
+// LeaseOf reverses InstanceName, and reports whether the name was billet's.
+func LeaseOf(instanceName string) (string, bool) {
+	const prefix = "billet-"
+
+	if len(instanceName) <= len(prefix) || instanceName[:len(prefix)] != prefix {
+		return "", false
+	}
+
+	return instanceName[len(prefix):], true
+}
+
 // Provider launches and destroys the compute for one job at a time.
 type Provider interface {
 	// Accepts reports whether this backend may run work of that trust class.
@@ -175,6 +199,27 @@ type Provider interface {
 	// it is ready. Readiness is a separate question with a separate timeout, and
 	// conflating them is how a slow image pull becomes a launch failure.
 	Launch(ctx context.Context, spec Spec) (*Instance, error)
+
+	// Find reports the instance with that name, and whether there was one.
+	//
+	// This is what makes a failed launch answerable rather than guessed at. An
+	// error from Launch does not prove nothing started — a cancelled context can
+	// kill the CLI after the daemon accepted the request, and a remote API can
+	// commit and lose the response — so the only honest way to find out is to
+	// ask. Retrying instead is how one job becomes two runners.
+	//
+	// The bool is explicit rather than a nil pointer, because the caller's next
+	// move on a hit is to DESTROY: "there is nothing here" and "something went
+	// wrong and you got a zero value" must not look alike at a call site with
+	// that consequence.
+	Find(ctx context.Context, name string) (*Instance, bool, error)
+
+	// List reports every instance this backend is running for billet.
+	//
+	// The input to reconciliation: anything here whose lease is no longer open is
+	// an orphan, and orphans are the residue of every crash between starting an
+	// instance and recording it.
+	List(ctx context.Context) ([]*Instance, error)
 
 	// Destroy removes an instance and everything it owns.
 	//

@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"errors"
+	"sort"
 	"strings"
 	"testing"
 
@@ -225,6 +226,11 @@ func dockerTier() config.Tier {
 type fakeJIT struct {
 	setID int
 	names []string
+
+	// name overrides what GitHub calls the runner, so a test can prove billet
+	// does not name the INSTANCE after it. The two are separate identities and
+	// conflating them is what made an orphan unattributable.
+	name string
 }
 
 func (f *fakeJIT) Describe(context.Context, string, string) (*Set, []string, error) {
@@ -233,6 +239,10 @@ func (f *fakeJIT) Describe(context.Context, string, string) (*Set, []string, err
 
 func (f *fakeJIT) JITConfig(_ context.Context, _ int, name, _ string) (Registration, error) {
 	f.names = append(f.names, name)
+
+	if f.name != "" {
+		return fakeRegistration{name: f.name}, nil
+	}
 
 	return fakeRegistration{name: name}, nil
 }
@@ -248,6 +258,28 @@ type fakeProvider struct {
 	launched   []provider.Spec
 	destroyed  []string
 	destroyErr error
+
+	// live is what the backend is actually running, keyed by name. A map rather
+	// than a counter because Find and List have to agree with Launch and Destroy:
+	// a fake where the four drift apart proves nothing about reconciliation,
+	// which exists precisely to compare one against another.
+	live map[string]*provider.Instance
+
+	// launchErr makes Launch fail. startsAnyway makes it fail AFTER recording the
+	// instance — the ambiguous outcome that a failed launch cannot distinguish
+	// from a clean one, and the whole reason Find exists.
+	launchErr    error
+	startsAnyway bool
+
+	findErr error
+	listErr error
+
+	// cancelOnLaunch cancels the caller's context from INSIDE Launch, which is
+	// what a real timeout does. Cancelling before the call instead means Bind
+	// fails first and the launch path is never reached at all — the test then
+	// passes because nothing happened, which is not the same as passing because
+	// cleanup worked.
+	cancelOnLaunch context.CancelFunc
 }
 
 func (f *fakeProvider) Kind() config.ProviderKind { return f.kind }
@@ -265,17 +297,91 @@ func (f *fakeProvider) Accepts(trust provider.TrustClass) error {
 func (f *fakeProvider) Launch(_ context.Context, spec provider.Spec) (*provider.Instance, error) {
 	f.launched = append(f.launched, spec)
 
-	return &provider.Instance{ID: "instance-" + spec.Name, Name: spec.Name}, nil
+	if f.cancelOnLaunch != nil {
+		f.cancelOnLaunch()
+	}
+
+	if f.launchErr != nil && !f.startsAnyway {
+		return nil, f.launchErr
+	}
+
+	inst := &provider.Instance{ID: "instance-" + spec.Name, Name: spec.Name}
+	f.add(inst)
+
+	if f.launchErr != nil {
+		return nil, f.launchErr
+	}
+
+	return inst, nil
 }
 
-func (f *fakeProvider) Destroy(_ context.Context, id string) error {
+func (f *fakeProvider) Find(ctx context.Context, name string) (*provider.Instance, bool, error) {
+	// CONTEXT IS HONOURED, because a fake that ignores it cannot tell a caller
+	// using a cancelled context from one using a fresh one — and that difference
+	// is the entire subject of the cancelled-launch test.
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+
+	if f.findErr != nil {
+		return nil, false, f.findErr
+	}
+
+	inst, ok := f.live[name]
+
+	return inst, ok, nil
+}
+
+func (f *fakeProvider) List(ctx context.Context) ([]*provider.Instance, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+
+	var out []*provider.Instance
+
+	for _, inst := range f.live {
+		out = append(out, inst)
+	}
+
+	// Sorted so a test asserting on order is not flaky; map iteration is random
+	// by design and a reconciliation bug that only appears in one ordering is
+	// exactly the kind this suite should be able to reproduce.
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+
+	return out, nil
+}
+
+func (f *fakeProvider) Destroy(ctx context.Context, id string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	if f.destroyErr != nil {
 		return f.destroyErr
 	}
 
 	f.destroyed = append(f.destroyed, id)
 
+	for name, inst := range f.live {
+		if inst.ID == id {
+			delete(f.live, name)
+		}
+	}
+
 	return nil
+}
+
+// add records an instance as running.
+func (f *fakeProvider) add(inst *provider.Instance) {
+	if f.live == nil {
+		f.live = make(map[string]*provider.Instance)
+	}
+
+	f.live[inst.Name] = inst
 }
 
 // newAllocatorWithHost builds an allocator over a real store with one registered
@@ -329,4 +435,272 @@ func assignedLease(t *testing.T, a *alloc.Allocator) *alloc.Lease {
 	lease.RequestID = nextRequest
 
 	return lease
+}
+
+// ============================================================================
+// A launch error is not proof nothing started.
+// ============================================================================
+
+func TestLaunchRemovesWhatAFailedLaunchStarted(t *testing.T) {
+	t.Parallel()
+
+	// The ambiguous outcome: the backend created the instance and THEN failed to
+	// report it. Nothing in the error distinguishes this from a launch that never
+	// began, which is why the code has to go and look.
+	p := &fakeProvider{
+		kind:         config.ProviderDocker,
+		launchErr:    errors.New("context deadline exceeded"),
+		startsAnyway: true,
+	}
+
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	lease := assignedLease(t, a)
+
+	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err == nil {
+		t.Fatal("a launch that failed reported success")
+	}
+
+	if len(p.live) != 0 {
+		t.Fatalf("a failed launch left %d instance(s) running: %v", len(p.live), p.live)
+	}
+
+	if len(p.destroyed) != 1 {
+		t.Fatalf("the stray was not destroyed: destroyed %v", p.destroyed)
+	}
+}
+
+func TestLaunchDoesNotDestroyWhenNothingStarted(t *testing.T) {
+	t.Parallel()
+
+	// The unambiguous failure. Find answers "nothing there", and the code must
+	// take that answer rather than destroying on suspicion — a Destroy issued
+	// against an id that was never created is at best noise and at worst aimed at
+	// something else's instance.
+	p := &fakeProvider{
+		kind:      config.ProviderDocker,
+		launchErr: errors.New("no such image"),
+	}
+
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
+	if err := r.Launch(t.Context(), assignedLease(t, a), Job{RequestID: 11, Event: "push"}); err == nil {
+		t.Fatal("a launch that failed reported success")
+	}
+
+	if len(p.destroyed) != 0 {
+		t.Fatalf("destroyed something that was never started: %v", p.destroyed)
+	}
+}
+
+func TestLaunchSurvivesAFailedLaunchOnACancelledContext(t *testing.T) {
+	t.Parallel()
+
+	// The usual reason a launch fails is that the caller's context ran out, and
+	// cleanup that inherits that context cannot run. So the cancellation happens
+	// DURING the launch, exactly as a timeout would: everything before it
+	// succeeds, and only the cleanup afterwards has to cope with a dead context.
+	//
+	// Cancelling BEFORE the call instead — the obvious way to write this — makes
+	// Bind fail first, so the launch path is never reached and the test passes
+	// because nothing happened.
+	ctx, cancel := context.WithCancel(t.Context())
+
+	p := &fakeProvider{
+		kind:           config.ProviderDocker,
+		launchErr:      context.Canceled,
+		startsAnyway:   true,
+		cancelOnLaunch: cancel,
+	}
+
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	lease := assignedLease(t, a)
+
+	if err := r.Launch(ctx, lease, Job{RequestID: 11, Event: "push"}); err == nil {
+		t.Fatal("a launch on a cancelled context reported success")
+	}
+
+	// Proves the launch path was actually reached. Without this, the assertion
+	// below is satisfied by a Bind that failed before anything ever started.
+	if len(p.launched) != 1 {
+		t.Fatal("the provider was never asked to launch; this test proved nothing")
+	}
+
+	if len(p.live) != 0 {
+		t.Fatalf("a cancelled launch left an instance behind: %v", p.live)
+	}
+}
+
+func TestLaunchNamesTheInstanceAfterTheLease(t *testing.T) {
+	t.Parallel()
+
+	// GitHub's runner name and billet's instance name are different things, and
+	// the instance must carry billet's — it is the only thing that survives a
+	// crash to say which lease the instance belongs to.
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7, name: "github-picked-this"}, p,
+		[]config.Tier{dockerTier()}, nil)
+
+	lease := assignedLease(t, a)
+
+	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	want := provider.InstanceName(lease.ID)
+
+	if got := p.launched[0].Name; got != want {
+		t.Errorf("instance named %q, want %q — a name without the lease in it cannot be reconciled", got, want)
+	}
+}
+
+// ============================================================================
+// Reconcile: what survived a crash, and whether anything still wants it.
+// ============================================================================
+
+func TestReconcileDestroysAnInstanceWhoseLeaseIsGone(t *testing.T) {
+	t.Parallel()
+
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
+	// A previous process launched this and died. The lease was reaped, so nothing
+	// wants the container any more — but the container does not know that.
+	lease := assignedLease(t, a)
+
+	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	if err := a.Release(t.Context(), lease.ID, lease.Epoch, alloc.PhaseFailed); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+
+	// A fresh runner, because a restart is what this models: the in-memory map is
+	// empty and the instance is all that is left.
+	restarted := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
+	if err := restarted.Reconcile(t.Context()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	if len(p.live) != 0 {
+		t.Fatalf("the orphan survived reconciliation: %v", p.live)
+	}
+}
+
+func TestReconcileKeepsAnInstanceWhoseLeaseIsStillOpen(t *testing.T) {
+	t.Parallel()
+
+	// The mirror image, and the one that matters more: reconciliation that
+	// destroys live work is far worse than reconciliation that misses an orphan.
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
+	if err := r.Launch(t.Context(), assignedLease(t, a), Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	restarted := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
+	if err := restarted.Reconcile(t.Context()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	if len(p.live) != 1 {
+		t.Fatalf("reconciliation destroyed a running job: %v", p.live)
+	}
+
+	if len(p.destroyed) != 0 {
+		t.Fatalf("reconciliation destroyed %v, whose lease was still open", p.destroyed)
+	}
+}
+
+func TestReconcileIgnoresInstancesBilletDidNotName(t *testing.T) {
+	t.Parallel()
+
+	// Should be unreachable — the provider filters by billet's own label — but
+	// the action here is destruction, and "should be unreachable" is not a good
+	// enough reason to destroy something whose name billet did not choose.
+	p := &fakeProvider{kind: config.ProviderDocker}
+	p.add(&provider.Instance{ID: "someone-elses", Name: "postgres-dev"})
+
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
+	if err := r.Reconcile(t.Context()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	if len(p.destroyed) != 0 {
+		t.Fatalf("destroyed an instance billet did not name: %v", p.destroyed)
+	}
+}
+
+func TestReconcileReportsInstancesItCouldNotDestroy(t *testing.T) {
+	t.Parallel()
+
+	// An orphan that resists destruction is still holding vCPU and memory the
+	// allocator has already handed back out. Returning nil here would let the
+	// caller start admitting work against capacity that does not exist.
+	p := &fakeProvider{kind: config.ProviderDocker, destroyErr: errors.New("daemon is not responding")}
+	p.add(&provider.Instance{ID: "stuck", Name: provider.InstanceName("deadbeef")})
+
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
+	if err := r.Reconcile(t.Context()); err == nil {
+		t.Fatal("reported success while an orphan was still holding capacity")
+	}
+}
+
+func TestReconcileReportsAProviderThatCannotBeEnumerated(t *testing.T) {
+	t.Parallel()
+
+	// Not knowing what is running is not the same as nothing running, and
+	// treating it as the latter is how a restart over-commits the host.
+	p := &fakeProvider{kind: config.ProviderDocker, listErr: errors.New("docker daemon is not running")}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
+	if err := r.Reconcile(t.Context()); err == nil {
+		t.Fatal("an unreadable provider was treated as an empty one")
+	}
+}
+
+func TestReconcileDestroysAnInstanceBoundToAnotherNode(t *testing.T) {
+	t.Parallel()
+
+	// A lease open on a DIFFERENT host does not justify an instance running on
+	// this one. Scoping the query to this node is what makes that true, and a
+	// query over every node would have spared this orphan forever.
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+
+	if err := a.RegisterNode(t.Context(), "other-host", config.ProviderDocker); err != nil {
+		t.Fatalf("RegisterNode: %v", err)
+	}
+
+	lease := assignedLease(t, a)
+
+	if err := a.Bind(t.Context(), lease.ID, lease.Epoch, "other-host"); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	p.add(&provider.Instance{ID: "stray", Name: provider.InstanceName(lease.ID)})
+
+	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
+	if err := r.Reconcile(t.Context()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	if len(p.live) != 0 {
+		t.Fatalf("kept an instance whose lease belongs to another host: %v", p.live)
+	}
 }

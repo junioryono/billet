@@ -28,6 +28,10 @@ import (
 	"github.com/junioryono/billet/internal/provider"
 )
 
+// Instance is provider.Instance, aliased so this file does not repeat the
+// package name on every line.
+type Instance = provider.Instance
+
 // ownerLabel marks every container billet started, so orphans left by a crash
 // can be found without guessing from names.
 const ownerLabel = "sh.billet.owner"
@@ -209,6 +213,77 @@ func (p *Provider) Destroy(ctx context.Context, id string) error {
 	}
 
 	return fmt.Errorf("docker: destroy %s: %w", short(id), err)
+}
+
+// Find reports the container with that name, and whether there was one.
+//
+// Filtered by billet's own label as well as the name, so a container somebody
+// else happened to name the same way is not adopted — and adoption is the
+// dangerous direction here, because the caller may go on to destroy it.
+//
+// The name filter is a SUBSTRING match in docker, not an exact one, so the
+// results are compared exactly afterwards. Without that, a lookup for
+// `billet-abc` would happily return `billet-abcdef`.
+func (p *Provider) Find(ctx context.Context, name string) (*Instance, bool, error) {
+	found, err := p.list(ctx, "name="+name)
+	if err != nil {
+		return nil, false, err
+	}
+
+	for _, inst := range found {
+		if inst.Name == name {
+			return inst, true, nil
+		}
+	}
+
+	return nil, false, nil
+}
+
+// List reports every container billet started here, running or not.
+//
+// Stopped ones count. A container that exited still holds its name, its
+// anonymous volumes and its disk, and it still blocks a relaunch under the same
+// name — so reconciliation has to see it.
+func (p *Provider) List(ctx context.Context) ([]*Instance, error) {
+	return p.list(ctx)
+}
+
+// list runs `docker ps` with billet's owner label plus any extra filters.
+func (p *Provider) list(ctx context.Context, filters ...string) ([]*Instance, error) {
+	args := make([]string, 0, 6+2*len(filters))
+	args = append(args,
+		"ps", "--all",
+		"--filter", "label="+ownerLabel+"="+p.owner,
+		// Tab-separated rather than JSON: the format is billet's own, so there is
+		// nothing to parse defensively, and a name cannot contain a tab.
+		"--format", "{{.ID}}\t{{.Names}}",
+	)
+
+	for _, f := range filters {
+		args = append(args, "--filter", f)
+	}
+
+	out, err := p.run(ctx, args...)
+	if err != nil {
+		return nil, fmt.Errorf("docker: list billet containers: %w", err)
+	}
+
+	var instances []*Instance
+
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		if line == "" {
+			continue
+		}
+
+		id, name, ok := strings.Cut(line, "\t")
+		if !ok {
+			continue
+		}
+
+		instances = append(instances, &Instance{ID: id, Name: name})
+	}
+
+	return instances, nil
 }
 
 // writeEnvFile puts the runner's environment somewhere docker can read it and

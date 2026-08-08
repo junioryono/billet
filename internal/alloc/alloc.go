@@ -1201,6 +1201,52 @@ func (a *Allocator) usage(ctx context.Context, tx *sql.Tx) (Usage, error) {
 	return u, nil
 }
 
+// OpenLeaseIDs reports the ids of every lease bound to a node and not terminal.
+//
+// Reconciliation's other half. A node can enumerate the compute it is running,
+// but an instance alone does not say whether it is still WANTED — that is a fact
+// about the lease, and it lives here. Anything running whose id is absent from
+// this set is an orphan.
+//
+// Scoped to one node deliberately. A node must never reason about instances it
+// does not own, and a set containing every node's leases would let a bug on one
+// host spare an orphan on another.
+//
+// Leases still in the capacity phase are included even though nothing has been
+// launched for them yet: a lease can be advanced to launching by a concurrent
+// Launch between this query and the sweep that uses it, and treating a lease as
+// closed a moment before it starts something would destroy a live container.
+func (a *Allocator) OpenLeaseIDs(ctx context.Context, node string) (map[string]bool, error) {
+	open := make(map[string]bool)
+
+	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx,
+			`SELECT id FROM leases WHERE node = ? AND phase NOT IN ('done','failed')`, node)
+		if err != nil {
+			return fmt.Errorf("alloc: list open leases on %s: %w", node, err)
+		}
+
+		defer func() { _ = rows.Close() }()
+
+		for rows.Next() {
+			var id string
+
+			if err := rows.Scan(&id); err != nil {
+				return fmt.Errorf("alloc: scan an open lease on %s: %w", node, err)
+			}
+
+			open[id] = true
+		}
+
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return open, nil
+}
+
 func (a *Allocator) countOpenByTier(ctx context.Context, tx *sql.Tx, tier string) (int, error) {
 	var n int
 

@@ -258,8 +258,25 @@ func runServer(ctx context.Context, cfg *config.Config, dryRun, dev bool) error 
 			return err
 		}
 
-		opts = append(opts, server.WithNodeRunner(
-			node.New(allocator, cfg.Node.Name, jitSource{c: client}, p, cfg.Tiers, slog.Default())))
+		runner := node.New(allocator, cfg.Node.Name, jitSource{c: client}, p, cfg.Tiers, slog.Default())
+
+		// SWEPT BEFORE A SINGLE JOB IS ADMITTED.
+		//
+		// A crash between starting a container and recording it leaves the
+		// container running and the lease gone. That container still holds vCPU and
+		// memory, and the allocator — which lost the lease — believes both are
+		// free. Admitting work first therefore over-commits the host by exactly as
+		// much as the crash leaked, and the symptom is a machine that thrashes
+		// after every unclean shutdown rather than an error anyone can read.
+		//
+		// Fatal on failure, deliberately. Not knowing what is already running is
+		// not the same as nothing running, and starting anyway is the choice that
+		// turns a recoverable mess into a compounding one.
+		if err := runner.Reconcile(ctx); err != nil {
+			return err
+		}
+
+		opts = append(opts, server.WithNodeRunner(runner))
 	}
 
 	plane := server.New(allocator, &provisioner{client}, cfg.Tiers, owner, slog.Default(), opts...)
