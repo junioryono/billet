@@ -47,6 +47,18 @@ node:
   provider: firecracker
   state_dir: /var/lib/billet/node
 
+  # How long billet may hold capacity for compute it cannot account for — a
+  # container adopted from a crashed run, or one an ambiguous launch may have
+  # left behind — before destroying it and reclaiming the capacity.
+  #
+  # UNSET MEANS NO BOUND, which is the default. Billet does not limit job
+  # duration, and self-hosted runners are routinely configured past GitHub's
+  # six-hour default, so a limit billet chose for itself would kill legitimate
+  # long jobs. Set this only if you know your longest job; billet warns hourly
+  # about held capacity either way, which is the signal that actually helps.
+  #
+  # max_custody: 24h
+
   firecracker:
     # The guest kernel must include everything Docker needs, or service
     # containers fail in ways that are hard to read. Validate with moby's
