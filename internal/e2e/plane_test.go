@@ -442,14 +442,12 @@ func (s *stack) run(t *testing.T) func() {
 	}
 }
 
-// awaitContainer waits for exactly `want` RUNNING containers.
+// awaitRunning waits for exactly `want` RUNNING containers and returns their
+// names.
 //
 // Running, not merely present. `docker ps --all` lists exited containers too, so
-// counting everything let a test pass while the "runner" had already died — the
-// headline lifecycle test was doing exactly that against an image whose default
-// command exits immediately, proving container creation and removal rather than
-// that a job ran.
-func (s *stack) awaitContainer(t *testing.T, want int) []string {
+// counting everything let a test pass while the "runner" had already died.
+func (s *stack) awaitRunning(t *testing.T, want int) []string {
 	t.Helper()
 
 	deadline := time.Now().Add(60 * time.Second)
@@ -475,6 +473,36 @@ func (s *stack) awaitContainer(t *testing.T, want int) []string {
 		if time.Now().After(deadline) {
 			t.Fatalf("waited for %d running container(s), have %d (%d in any state)",
 				want, len(names), len(instances))
+		}
+
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// awaitGone waits until NOTHING remains, in any state.
+//
+// The right assertion for cleanup, and a genuinely different question from
+// awaitRunning(0). A container that has merely been STOPPED still holds its
+// name, its disk and its anonymous volumes, and still blocks a relaunch under
+// that name — so a regression that stopped containers instead of removing them
+// would pass a running-count check while leaking every job's disk.
+func (s *stack) awaitGone(t *testing.T) {
+	t.Helper()
+
+	deadline := time.Now().Add(60 * time.Second)
+
+	for {
+		instances, err := s.provider.List(t.Context())
+		if err != nil {
+			t.Fatalf("List: %v", err)
+		}
+
+		if len(instances) == 0 {
+			return
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatalf("containers were left behind in some state: %v", instances)
 		}
 
 		time.Sleep(100 * time.Millisecond)

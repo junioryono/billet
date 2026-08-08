@@ -67,6 +67,13 @@ type LeaseStore interface {
 	Release(ctx context.Context, leaseID string, epoch int64, outcome alloc.Phase) error
 	Lease(ctx context.Context, leaseID string) (*alloc.Lease, error)
 	LaunchedLeaseIDs(ctx context.Context, node string) (map[string]bool, error)
+
+	// LeaseTTL is how long a lease survives without a heartbeat, and it sets the
+	// cadence for renewing held ones. READ FROM THE LEDGER, never assumed: the
+	// last time a heartbeat interval was derived from a constant that no longer
+	// matched, advertised capacity climbed to six times the configured budget
+	// before anyone noticed.
+	LeaseTTL() time.Duration
 }
 
 // Runner starts and stops the compute for assigned leases.
@@ -89,6 +96,16 @@ type Runner struct {
 	// now is time.Now, replaceable so a test can age a custody entry without
 	// sleeping.
 	now func() time.Time
+
+	// ttl reports the lease TTL, which sets the heartbeat cadence for held
+	// leases. Read from the ledger rather than assumed: a heartbeat interval
+	// derived from a constant that no longer matches the allocator's TTL is how
+	// capacity quietly climbed to six times its budget once already.
+	ttl func() time.Duration
+
+	// maxCustody optionally bounds how long compute may be held. Zero means no
+	// bound; see DefaultMaxCustody for why that is the default.
+	maxCustody time.Duration
 
 	// node is this host's name, which is what leases are bound to. Placement is
 	// enforced against the node REGISTERED under this name, so it has to match a
@@ -134,10 +151,13 @@ func New(
 		node:     node,
 		custody:  make(map[string]*custody),
 		now:      time.Now,
-		log:      log,
-		tiers:    byLabel,
-		running:  make(map[int64]*provider.Instance),
-		sets:     make(map[string]int),
+		ttl:      a.LeaseTTL,
+
+		maxCustody: DefaultMaxCustody,
+		log:        log,
+		tiers:      byLabel,
+		running:    make(map[int64]*provider.Instance),
+		sets:       make(map[string]int),
 	}
 }
 
@@ -164,6 +184,22 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job Job) error 
 	// registered on GitHub with nothing to consume it — and since every pull
 	// request is refused by a container backend, that is one orphan per PR,
 	// accumulating quietly until somebody notices the runner list.
+	// ALREADY RUNNING SOMEWHERE. A crash before an assignment is acknowledged
+	// means GitHub redelivers it, and the restarted listener has empty maps — so
+	// without this it escrows a second lease and starts a second container for a
+	// job the adopted one is still running. The extra runner is a live
+	// registration that can pick up unrelated work, and the original's completion
+	// may then destroy it.
+	//
+	// An ordinary error, deliberately, not ErrCustody: the caller must release the
+	// lease it just took, because the capacity for this job is already held by the
+	// custody entry.
+	if leaseID, held := r.heldForRequest(job.RequestID); held {
+		return fmt.Errorf("node: request %d is already running under lease %s, which billet "+
+			"adopted from an earlier run; not starting a second runner for it",
+			job.RequestID, leaseID)
+	}
+
 	trust := provider.Classify(job.Event)
 
 	if err := r.provider.Accepts(trust); err != nil {
@@ -284,24 +320,25 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job Job) error 
 // Idempotent: a request nothing was started for is success, because this runs on
 // redelivered completions, on shutdown, and after a failure.
 func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
+	// BOTH, NOT EITHER. A request can have compute in the running map AND a
+	// custody entry — a redelivered assignment after a crash produces exactly
+	// that — and a completion that cleaned up only one of them would leave the
+	// other running with nothing left to notice it. Consulting custody only when
+	// the running map missed was the bug.
+	//
+	// Custody first, because it is the half nothing else will ever come back for:
+	// the restarted listener has no record of the request either.
+	if _, err := r.releaseRequest(ctx, requestID); err != nil {
+		return err
+	}
+
 	r.mu.Lock()
 	inst, ok := r.running[requestID]
 	r.mu.Unlock()
 
 	if !ok {
-		// Not something this incarnation started — but it may be something an
-		// earlier one did, which this one adopted. Without this an adopted
-		// container whose job GitHub later reports finished is held forever: the
-		// restarted listener has no record of the request either, so nothing else
-		// connects the completion to the compute.
-		// Idempotent either way: a request nothing was started for is success,
-		// because this runs on redelivered completions, on shutdown, and after a
-		// failure. The return value says whether custody handled it, which nothing
-		// above needs — the error is what matters.
-		if _, err := r.releaseRequest(ctx, requestID); err != nil {
-			return err
-		}
-
+		// Idempotent: a request nothing was started for is success, because this
+		// runs on redelivered completions, on shutdown, and after a failure.
 		return nil
 	}
 

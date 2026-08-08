@@ -53,7 +53,7 @@ func TestAJobRunsAndIsCleanedUp(t *testing.T) {
 	s.plane.queue(fakeactions.StatisticsJSON(0, 1),
 		fakeactions.JobJSON("JobAssigned", 4001, "push", testTier))
 
-	names := s.awaitContainer(t, 1)
+	names := s.awaitRunning(t, 1)
 
 	// Named after the LEASE, which is what makes it reconcilable after a crash.
 	leaseID, ours := provider.LeaseOf(names[0])
@@ -69,7 +69,9 @@ func TestAJobRunsAndIsCleanedUp(t *testing.T) {
 	s.plane.queue(fakeactions.StatisticsJSON(0, 0),
 		fakeactions.JobJSON("JobCompleted", 4001, "push", testTier))
 
-	s.awaitContainer(t, 0)
+	// GONE, not merely stopped: a stopped container still holds its name, its
+	// disk and its anonymous volumes.
+	s.awaitGone(t)
 
 	// AND THE JOB'S OWN LEASE IS TERMINAL. A container that is gone while its
 	// lease still holds vCPU is the leak this subsystem exists to prevent.
@@ -280,7 +282,7 @@ func TestTheSameJobIsNotStartedTwiceWhenAMessageIsRedelivered(t *testing.T) {
 	s.plane.queue(fakeactions.StatisticsJSON(0, 1),
 		fakeactions.JobJSON("JobAssigned", 4005, "push", testTier))
 
-	s.awaitContainer(t, 1)
+	s.awaitRunning(t, 1)
 
 	// Deliver the SAME assignment again, as the service does when an
 	// acknowledgement is lost.

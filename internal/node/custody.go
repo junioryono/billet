@@ -130,20 +130,79 @@ const strayGrace = time.Minute
 // too late to do anything about it.
 const custodyWarnAfter = time.Hour
 
-// MaxCustody is how long compute may be held before billet destroys it anyway.
+// DefaultMaxCustody is OFF, and that is a deliberate reversal.
 //
-// A HARD BOUND ON AN OTHERWISE UNBOUNDED HOLD. Adoption keeps a lease alive for
-// as long as its container runs, which is right for a job that is making
-// progress and wrong for one that has hung — a runner wedged on a network call
-// holds its vCPU forever, and the only evidence is a log line from the restart
-// that adopted it.
+// I gave this a 24-hour default and it was wrong. Elapsed time is not evidence
+// that a job has stopped making progress: billet imposes no job limit of its
+// own, self-hosted runners are routinely configured past GitHub's six-hour
+// default, and a legitimately long job restarted shortly after it began would be
+// killed a day later for no reason anyone could see in the logs.
 //
-// Twenty-four hours, because the thing being bounded is a JOB and the longest
-// legitimate one is far shorter. GitHub's own default job timeout is six hours;
-// self-hosted runners can be configured beyond that, which is why this is not
-// six. Nothing that has been running for a day is still doing useful CI work,
-// and holding capacity for it is a worse failure than killing it.
-const MaxCustody = 24 * time.Hour
+// Killing live work must be authorised by something that actually knows — a
+// completion from GitHub, an observed process exit, or an operator. Time drives
+// the WARNING instead, which is the honest signal: "billet is holding capacity
+// it cannot account for, and it has been doing so for two hours."
+//
+// An operator who does know their longest job can set a bound. Zero means none.
+const DefaultMaxCustody = 0
+
+// KeepAlive renews held leases on their own clock until the context ends.
+//
+// SEPARATE FROM Tend, AND THAT SEPARATION IS THE WHOLE POINT. Renewal used to
+// happen inside Tend, which runs after Reap on a shared tick and which makes
+// unbounded provider calls — a slow `docker ps` or a wedged daemon delays the
+// next renewal without delaying the next reap. The interval from a successful
+// heartbeat to the following Reap was therefore unbounded, and anything longer
+// than the lease TTL means the reaper terminalizes a lease that is being held on
+// purpose, hands its capacity back, and lets a listener advertise it while the
+// container is still running.
+//
+// So this does exactly one thing, touches only the ledger, and ticks at a third
+// of the TTL — the same cadence and the same reasoning as the listener's own
+// heartbeats. Two renewals may be missed entirely before anything expires.
+func (r *Runner) KeepAlive(ctx context.Context) {
+	every := r.ttl() / 3
+	if every <= 0 {
+		every = time.Second
+	}
+
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			r.renewHeld(ctx)
+		}
+	}
+}
+
+// renewHeld heartbeats every held lease once.
+//
+// Failures are logged rather than returned: a lease that will not renew is
+// handled by Tend, which is the only thing allowed to decide that compute should
+// go. Doing that here would put teardown on a path that must stay cheap and
+// never block.
+func (r *Runner) renewHeld(ctx context.Context) {
+	for _, c := range r.custodySnapshot() {
+		err := r.alloc.Heartbeat(ctx, c.leaseID, c.epoch)
+		if err == nil || ctx.Err() != nil {
+			continue
+		}
+
+		if errors.Is(err, alloc.ErrLeaseNotFound) || errors.Is(err, alloc.ErrFenced) {
+			// Expected once a job finishes: the listener released the lease and Tend
+			// is about to clean up the compute. Not worth a line every few seconds.
+			continue
+		}
+
+		r.log.Warn("could not renew a held lease; the reaper may reclaim its capacity "+
+			"while the compute is still running",
+			"lease", c.leaseID, "name", c.name, "error", err)
+	}
+}
 
 // Tend advances everything in custody by one step, and is called on the same
 // tick as Sweep.
@@ -182,16 +241,17 @@ func (r *Runner) Tend(ctx context.Context) error {
 func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 	held := r.now().Sub(c.since)
 
-	// PAST THE BOUND, IT GOES, whatever it was. An adopted container this old is
-	// not finishing, and continuing to hold its capacity means the host stays
-	// short by that much until somebody restarts billet.
-	if held > MaxCustody && !c.discard {
-		r.log.Error("a job has been held far too long to still be running; destroying it "+
+	// Past an operator-set bound, it goes — and it is recorded as a FAILURE,
+	// because that is what a forcibly killed job is. Keeping the adopted entry's
+	// "done" would archive a teardown billet chose as a job that finished.
+	if r.maxCustody > 0 && held > r.maxCustody && !c.discard {
+		r.log.Error("a job has been held past the configured limit; destroying it "+
 			"and reclaiming its capacity",
 			"name", c.name, "lease", c.leaseID, "held_for", held.Round(time.Minute),
-			"limit", MaxCustody)
+			"limit", r.maxCustody)
 
 		c.discard = true
+		c.outcome = alloc.PhaseFailed
 	} else if held > custodyWarnAfter {
 		r.log.Warn("still holding capacity for compute billet is not managing",
 			"name", c.name, "lease", c.leaseID, "held_for", held.Round(time.Minute),
@@ -268,6 +328,27 @@ func (r *Runner) finish(ctx context.Context, c *custody) error {
 	r.mu.Unlock()
 
 	return nil
+}
+
+// heldForRequest reports whether custody already covers a job.
+//
+// The guard against launching a SECOND runner for a request billet is already
+// running. After a crash, an unacknowledged assignment is redelivered; the new
+// listener has empty maps and would happily escrow another lease and start
+// another container, while the adopted one carries on. Two runners for one job
+// is worse than it sounds — the extra one is a live registration that can pick
+// up unrelated work, and the completion for the original may then kill it.
+func (r *Runner) heldForRequest(requestID int64) (string, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for _, c := range r.custody {
+		if c.requestID == requestID {
+			return c.leaseID, true
+		}
+	}
+
+	return "", false
 }
 
 // releaseRequest ends the custody of a job GitHub has reported finished, if

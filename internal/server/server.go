@@ -130,6 +130,20 @@ func (s *Server) Run(ctx context.Context) error {
 		return errors.New("server: no tiers configured; there is nothing to listen for")
 	}
 
+	// STARTED BEFORE ANYTHING SLOW, and before the first reap.
+	//
+	// Recovery renews each adopted lease once as it adopts, but scale-set
+	// reconciliation runs between that and the startup reap — a network round
+	// trip per tier against GitHub, which can exceed a lease TTL on a bad day.
+	// The reaper would then terminalize a lease billet is deliberately holding,
+	// and a listener would advertise its capacity while the container ran on.
+	if sweeper, ok := s.runner.(Sweeper); ok {
+		keepAlive, stopKeepAlive := context.WithCancel(ctx)
+		defer stopKeepAlive()
+
+		go sweeper.KeepAlive(keepAlive)
+	}
+
 	sets := make(map[string]*ScaleSet, len(s.tiers))
 
 	for i := range s.tiers {

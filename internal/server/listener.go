@@ -90,6 +90,18 @@ type Sweeper interface {
 	// obligation seen from opposite ends — Sweep finds compute no lease is
 	// holding, Tend holds leases whose compute is unaccounted for.
 	Tend(ctx context.Context) error
+
+	// KeepAlive renews held leases until the context ends, on its OWN clock.
+	//
+	// Separate from Tend because renewal must not share a schedule with anything
+	// that talks to a compute backend. Tend and Sweep both make unbounded
+	// provider calls, and they run after the reaper on a shared tick — so a slow
+	// `docker ps` delays the next renewal without delaying the next reap, and
+	// anything longer than the lease TTL lets the reaper reclaim capacity that is
+	// being held on purpose.
+	//
+	// Blocks until ctx is done; the caller runs it in a goroutine.
+	KeepAlive(ctx context.Context)
 }
 
 // ErrCustody means the runner has taken responsibility for a lease's capacity,

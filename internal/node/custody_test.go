@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -471,6 +472,10 @@ type brittleStore struct {
 	releaseErr   error
 	heartbeatErr error
 	leaseErr     error
+
+	// heartbeats counts renewals, so a test can prove the keep-alive loop is
+	// actually doing its one job.
+	heartbeats atomic.Int64
 }
 
 func (b *brittleStore) Lease(ctx context.Context, leaseID string) (*alloc.Lease, error) {
@@ -492,6 +497,8 @@ func (b *brittleStore) Release(
 }
 
 func (b *brittleStore) Heartbeat(ctx context.Context, leaseID string, epoch int64) error {
+	b.heartbeats.Add(1)
+
 	if b.heartbeatErr != nil {
 		return b.heartbeatErr
 	}
@@ -728,12 +735,14 @@ func TestAnAbsentStrayIsNotBelievedImmediately(t *testing.T) {
 	}
 }
 
-// Held compute that outlives any plausible job is destroyed.
+// Held compute is NOT destroyed on a timer by default.
 //
-// Adoption keeps a lease alive for as long as its container runs, which is right
-// for a job making progress and wrong for a runner wedged on a network call. The
-// bound is the difference between a delay and a permanent capacity loss.
-func TestHeldComputeIsBounded(t *testing.T) {
+// I gave this a 24-hour bound and it was wrong. Elapsed time is not evidence
+// that a job has stopped making progress — billet imposes no job limit, and
+// self-hosted runners are routinely configured past GitHub's six-hour default —
+// so a legitimately long job restarted shortly after it began would have been
+// killed a day later for no visible reason.
+func TestHeldComputeIsNotDestroyedOnATimerByDefault(t *testing.T) {
 	t.Parallel()
 
 	p := &fakeProvider{kind: config.ProviderDocker}
@@ -755,23 +764,166 @@ func TestHeldComputeIsBounded(t *testing.T) {
 		t.Fatalf("Recover: %v", err)
 	}
 
-	// Still within the bound: the job is left alone.
+	// A week later, with no bound configured.
+	restarted.now = func() time.Time { return frozen.Add(7 * 24 * time.Hour) }
+
 	if err := restarted.Tend(t.Context()); err != nil {
 		t.Fatalf("Tend: %v", err)
 	}
 
 	if len(p.live) != 1 {
-		t.Fatal("destroyed a job that was still within the holding bound")
+		t.Fatal("destroyed a running job on a timer; only a completion, an observed exit " +
+			"or an operator may authorise that")
+	}
+}
+
+// An operator who knows their longest job can set a bound, and a job killed by
+// it is recorded as a FAILURE.
+//
+// Keeping the adopted entry's "done" would archive a teardown billet chose as a
+// job that finished — a lie a later investigation would have to unpick.
+func TestAConfiguredBoundDestroysAndRecordsAFailure(t *testing.T) {
+	t.Parallel()
+
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
+	lease := assignedLease(t, a)
+
+	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
 	}
 
-	restarted.now = func() time.Time { return frozen.Add(MaxCustody + time.Minute) }
+	frozen := time.Now()
+
+	restarted := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	restarted.now = func() time.Time { return frozen }
+	restarted.maxCustody = 2 * time.Hour
+
+	if err := restarted.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+
+	// Inside the bound: left alone.
+	restarted.now = func() time.Time { return frozen.Add(time.Hour) }
 
 	if err := restarted.Tend(t.Context()); err != nil {
 		t.Fatalf("Tend: %v", err)
 	}
 
+	if len(p.live) != 1 {
+		t.Fatal("destroyed a job that was still inside the configured bound")
+	}
+
+	// Past it: destroyed, and recorded as failed.
+	restarted.now = func() time.Time { return frozen.Add(3 * time.Hour) }
+
+	for _, c := range restarted.custodySnapshot() {
+		if err := restarted.Tend(t.Context()); err != nil {
+			t.Fatalf("Tend: %v", err)
+		}
+
+		if c.outcome != alloc.PhaseFailed {
+			t.Errorf("a job billet killed was recorded as %q, want %q", c.outcome, alloc.PhaseFailed)
+		}
+	}
+
 	if len(p.live) != 0 {
-		t.Fatalf("held compute past the bound, so its capacity is lost until a restart: %v", p.live)
+		t.Fatalf("held compute past the configured bound: %v", p.live)
+	}
+}
+
+// A redelivered assignment does not start a second runner for a job billet
+// adopted.
+//
+// After a crash before an assignment was acknowledged, GitHub redelivers it and
+// the restarted listener has empty maps. Without a guard it escrows another
+// lease and starts another container while the adopted one carries on — and the
+// extra runner is a live registration that can pick up unrelated work.
+func TestAnAdoptedRequestIsNotLaunchedAgain(t *testing.T) {
+	t.Parallel()
+
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
+	const requestID = 5150
+
+	lease := assignedLease(t, a)
+
+	if err := r.Launch(t.Context(), lease, Job{RequestID: requestID, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	restarted := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
+	if err := restarted.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+
+	// The redelivery: a brand-new lease for the SAME request.
+	second := assignedLease(t, a)
+
+	err := restarted.Launch(t.Context(), second, Job{RequestID: lease.RequestID, Event: "push"})
+	if err == nil {
+		t.Fatal("started a second runner for a job billet is already running")
+	}
+
+	if len(p.live) != 1 {
+		t.Fatalf("two containers exist for one job: %v", p.live)
+	}
+}
+
+// A completion clears BOTH the running entry and the custody entry.
+//
+// A request can have each — a redelivered assignment after a crash produces
+// exactly that — and cleaning up only one leaves the other running with nothing
+// left to notice it.
+func TestACompletionClearsBothRunningAndHeldCompute(t *testing.T) {
+	t.Parallel()
+
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
+	const requestID = 6260
+
+	lease := assignedLease(t, a)
+
+	if err := r.Launch(t.Context(), lease, Job{RequestID: requestID, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	restarted := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
+	if err := restarted.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+
+	// Force the both-at-once state directly: the adopted entry plus a running
+	// entry for the same request, which is what a redelivery would produce if the
+	// launch guard were removed.
+	extra := assignedLease(t, a)
+	inst := &provider.Instance{
+		ID: "second-" + extra.ID, Name: provider.InstanceName(extra.ID), Running: true,
+	}
+	p.add(inst)
+
+	restarted.mu.Lock()
+	restarted.running[lease.RequestID] = inst
+	restarted.mu.Unlock()
+
+	if err := restarted.Destroy(t.Context(), lease.RequestID); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+
+	if len(p.live) != 0 {
+		t.Fatalf("a completion left compute behind: %v", p.live)
+	}
+
+	if len(restarted.heldLeases()) != 0 {
+		t.Error("capacity is still held after the job completed")
 	}
 }
 
@@ -908,5 +1060,86 @@ func TestACompletionDoesNotRaceTheTick(t *testing.T) {
 
 	if len(restarted.heldLeases()) != 0 {
 		t.Error("capacity is still held for a job that has finished")
+	}
+}
+
+// KeepAlive renews held leases on its own clock, without touching the backend.
+//
+// THE SEPARATION IS THE POINT. Renewal used to happen inside Tend, which runs
+// after the reaper on a shared tick and makes unbounded provider calls — so a
+// slow `docker ps` delayed the next renewal without delaying the next reap, and
+// anything longer than the lease TTL let the reaper reclaim capacity billet was
+// holding on purpose while its container ran on.
+func TestKeepAliveRenewsHeldLeasesOnItsOwnClock(t *testing.T) {
+	t.Parallel()
+
+	// A provider that blocks forever inside Find, which is exactly the situation
+	// that used to starve renewal: if the keep-alive shared a schedule with
+	// anything that talks to a backend, this would stall it.
+	p := &fakeProvider{kind: config.ProviderDocker, findDelay: time.Hour}
+	a, host := newAllocatorWithHost(t)
+
+	warm := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	lease := assignedLease(t, a)
+
+	if err := warm.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	store := &brittleStore{LeaseStore: a}
+	r := New(store, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
+	if err := r.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+
+	before := store.heartbeats.Load()
+
+	// A TTL short enough for the test to observe several ticks.
+	r.ttl = func() time.Duration { return 30 * time.Millisecond }
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	go r.KeepAlive(ctx)
+
+	deadline := time.Now().Add(10 * time.Second)
+
+	for store.heartbeats.Load() <= before {
+		if time.Now().After(deadline) {
+			t.Fatal("the keep-alive loop never renewed a held lease; the reaper will reclaim " +
+				"its capacity while the container is still running")
+		}
+
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// KeepAlive stops when its context does, rather than outliving the process it
+// belongs to.
+func TestKeepAliveStopsWithItsContext(t *testing.T) {
+	t.Parallel()
+
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
+	r.ttl = func() time.Duration { return 30 * time.Millisecond }
+
+	ctx, cancel := context.WithCancel(t.Context())
+
+	done := make(chan struct{})
+
+	go func() {
+		r.KeepAlive(ctx)
+		close(done)
+	}()
+
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("KeepAlive outlived its context")
 	}
 }
