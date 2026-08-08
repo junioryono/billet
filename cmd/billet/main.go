@@ -702,10 +702,15 @@ func cmdCheck(ctx context.Context, args []string) error {
 	}
 
 	if reservedVCPU > 0 && cfg.Server != nil && cfg.Server.MaxVCPU > 0 {
-		fmt.Printf("reserved %d of %d vCPU (%d%%) and %s of %s, held back from other tiers "+
+		// FLOAT, and one decimal place. The integer form multiplied before
+		// dividing, so it could wrap on a large budget — and more usefully, it
+		// printed 1 of 128 vCPU as "0%", which reads as "nothing is reserved"
+		// when something is.
+		share := float64(reservedVCPU) * 100 / float64(cfg.Server.MaxVCPU)
+
+		fmt.Printf("reserved %d of %d vCPU (%.1f%%) and %s of %s, held back from other tiers "+
 			"whether or not they are used\n",
-			reservedVCPU, cfg.Server.MaxVCPU, reservedVCPU*100/cfg.Server.MaxVCPU,
-			reservedMemory, cfg.Server.MaxMemory)
+			reservedVCPU, cfg.Server.MaxVCPU, share, reservedMemory, cfg.Server.MaxMemory)
 	}
 	return nil
 }

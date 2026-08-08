@@ -415,14 +415,25 @@ type Tier struct {
 	// fitting more often.
 	//
 	// A reservation is deducted from what OTHER tiers may take, only while it is
-	// unmet: a tier holding its floor already competes for the rest on equal
-	// terms, so capacity is never idled waiting for work that is not there.
+	// unmet. A tier already holding its floor competes for the rest on equal
+	// terms — the deduction stops, it does not become a quota.
 	//
-	// THE COST IS IDLE CAPACITY, and it is worth knowing before setting this. A
-	// reservation is held back for as long as it is unmet — which for a tier that
-	// gets no work is FOREVER. Reserve 2 slots of an 8 vCPU tier nothing ever
-	// uses and the machine is permanently 16 vCPU smaller, with no error and no
-	// log line, because from billet's point of view nothing is wrong.
+	// THAT IS NOT THE SAME AS "capacity is never idled", which this comment used
+	// to claim one paragraph above saying the opposite. Listeners refill escrow
+	// EAGERLY, without consulting demand, so a reserved tier does not hold its
+	// floor in reserve — it CLAIMS it, keeps the leases alive, and advertises
+	// capacity to GitHub that nobody may want. See below.
+	//
+	// THE COST IS IDLE CAPACITY, and it is worth knowing before setting this.
+	// Reserve 2 slots of an 8 vCPU tier nothing ever uses and the machine is
+	// permanently 16 vCPU smaller, with no error and no log line, because from
+	// billet's point of view nothing is wrong.
+	//
+	// The mechanism is worth being precise about, because it is not "the floor
+	// sits unclaimed". Listeners refill escrow eagerly and without regard to
+	// demand, so the reserved tier CLAIMS its floor almost immediately and then
+	// heartbeats those leases for as long as it is healthy. The capacity is gone
+	// either way; it is simply held by a tier rather than withheld from one.
 	//
 	// So reserve for tiers that have demand and are being crowded out, not for
 	// tiers that might one day want capacity. A static floor cannot tell the
@@ -1144,6 +1155,10 @@ func (c *Config) validateTiers() []error {
 	// Checked by division rather than by multiplying: `reserved * vcpu` is
 	// unchecked arithmetic on a config-supplied number, and a large enough one
 	// wraps negative, at which point a "does it fit" test passes comfortably.
+	// Only when the budget is itself usable. A non-positive max_vcpu is already
+	// reported against the field that holds it, and running the floor check
+	// anyway adds a fabricated "needs more than the 0 vCPU left" for every
+	// reservation — sending the reader to fix tiers that are not the problem.
 	if c.Server != nil {
 		errs = append(errs, c.floorFitErrors()...)
 	}
@@ -1157,6 +1172,19 @@ func (c *Config) validateTiers() []error {
 // tier's unmet floor, so if the floors exceed the budget then EVERY tier
 // computes zero headroom and the whole deployment quietly advertises nothing.
 func (c *Config) floorFitErrors() []error {
+	// A non-positive budget is already reported against the field that holds it.
+	// Checking floors against it produces a second, fabricated diagnostic per
+	// reservation, blaming tiers that are not the problem.
+	//
+	// GUARDED ONCE, HERE, and not again inside the loop. A per-iteration
+	// `remaining > 0` guard looks like the same defence and is not: the remaining
+	// budget legitimately reaches zero once earlier tiers have taken it all, and
+	// at that point a further reservation MUST be reported. Skipping the check
+	// there accepts a catalogue that cannot be honoured.
+	if c.Server.MaxVCPU <= 0 || c.Server.MaxMemory <= 0 {
+		return nil
+	}
+
 	remainingVCPU := c.Server.MaxVCPU
 	remainingMemory := c.Server.MaxMemory
 

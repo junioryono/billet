@@ -80,10 +80,20 @@ tiers:
   #   reserved: 2     # always keep room for 2 of these, however busy the rest is
   #
   # It is a FLOOR, where max_concurrent is a ceiling — the difference between
-  # limiting a tier and guaranteeing one. A reservation is held back from other
-  # tiers only while it is UNMET, so a tier already at its floor competes for the
-  # rest on equal terms and capacity is never idled waiting for work that has not
-  # arrived.
+  # limiting a tier and guaranteeing one. A reservation is deducted from what
+  # other tiers may take only while it is UNMET; once the tier holds its floor it
+  # competes for the rest on equal terms.
+  #
+  # THE COST IS REAL AND PERMANENT. Listeners claim escrow eagerly, without
+  # consulting demand, so a reserved tier does not leave its floor sitting in
+  # reserve — it takes those slots almost immediately and holds them for as long
+  # as billet runs, advertising capacity to GitHub that nobody may want. Reserve
+  # 2 slots of an 8 vCPU tier that gets no work and the machine is permanently
+  # 16 vCPU smaller, with no error and no log line.
+  #
+  # So reserve for a tier that HAS demand and is being crowded out, never for one
+  # that might someday want capacity. `billet check` prints how much of the
+  # machine is spoken for; read it before and after.
   #
   # Unset means no guarantee, which is the default: a floor is a promise about a
   # machine that only its operator can make.

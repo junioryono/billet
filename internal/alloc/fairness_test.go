@@ -375,6 +375,28 @@ func TestAnOverflowingReservationIsRefused(t *testing.T) {
 	}
 }
 
+// The MEMORY branch wraps independently of the vCPU one.
+//
+// Both dimensions multiply, and a test whose tier trips the vCPU check first
+// never reaches the memory one. Here vCPU is generous enough to pass, so memory
+// is the only thing that can catch it.
+func TestAnOverflowingMemoryReservationIsRefused(t *testing.T) {
+	t.Parallel()
+
+	huge := config.Tier{
+		Label: "billet-huge", Provider: config.ProviderDocker, GuestOS: config.GuestLinux,
+		// 1 vCPU each, so the vCPU check passes on a large budget; memory is what
+		// wraps.
+		VCPU: 1, Memory: 3, Reserved: 1 << 62,
+	}
+
+	db := openState(t)
+
+	if _, err := New(db, Limits{MaxVCPU: 1 << 62, MaxMemory: 8}, []config.Tier{huge}); err == nil {
+		t.Fatal("accepted a memory reservation whose size calculation wraps")
+	}
+}
+
 // And the budget is still enforced afterwards, which is the consequence that
 // would have been lost.
 func TestAnOverflowingNeighbourCannotInflateHeadroom(t *testing.T) {

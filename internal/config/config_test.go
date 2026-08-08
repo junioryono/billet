@@ -1655,3 +1655,95 @@ func TestValidateRejectsBadReservations(t *testing.T) {
 		})
 	}
 }
+
+// An invalid BUDGET does not produce fabricated floor errors.
+//
+// max_vcpu: 0 is already reported against the field that holds it. Running the
+// floor check anyway added "reserved 2 needs more than the 0 vCPU left" for
+// every reservation — sending the reader to fix tiers that are not the problem,
+// which is the worst thing a diagnostic can do.
+func TestAnInvalidBudgetDoesNotBlameTheTiers(t *testing.T) {
+	t.Parallel()
+
+	c := &Config{
+		Server: &ServerConfig{
+			Listen: "127.0.0.1:7717", StateDir: t.TempDir(),
+			MaxVCPU: 0, MaxMemory: 64 * GiB,
+		},
+		GitHub: &GitHubConfig{
+			Org: "acme", AppID: 1, InstallationID: 2,
+			PrivateKeyPath: filepath.Join(t.TempDir(), "key.pem"),
+		},
+		Node: &NodeConfig{
+			Name: "test-host", ServerAddr: "127.0.0.1:7717",
+			Provider: ProviderDocker, StateDir: t.TempDir(),
+		},
+		Tiers: []Tier{{
+			Label: "billet-2vcpu", Provider: ProviderDocker, GuestOS: GuestLinux,
+			VCPU: 2, Memory: 4 * GiB, Image: "ubuntu-2404", Reserved: 2,
+		}},
+	}
+
+	c.applyDefaults()
+
+	err := c.Validate()
+	if err == nil {
+		t.Fatal("accepted a zero vCPU budget")
+	}
+
+	if strings.Contains(err.Error(), "vCPU left") {
+		t.Errorf("the zero budget produced a fabricated per-tier floor error, which points "+
+			"the reader at the wrong field: %v", err)
+	}
+}
+
+// A reservation that arrives after the budget is EXACTLY exhausted is still an
+// error.
+//
+// The case a per-iteration "remaining > 0" guard silently accepts. The remaining
+// budget legitimately reaches zero once earlier tiers have taken it all, and at
+// that point a further reservation must be reported — skipping the check there
+// waves through a catalogue that cannot be honoured. Found by mutating the guard
+// I had just added as belt-and-braces.
+func TestAReservationAfterTheBudgetIsExhaustedIsRefused(t *testing.T) {
+	t.Parallel()
+
+	c := &Config{
+		Server: &ServerConfig{
+			Listen: "127.0.0.1:7717", StateDir: t.TempDir(),
+			MaxVCPU: 8, MaxMemory: 64 * GiB,
+		},
+		GitHub: &GitHubConfig{
+			Org: "acme", AppID: 1, InstallationID: 2,
+			PrivateKeyPath: filepath.Join(t.TempDir(), "key.pem"),
+		},
+		Node: &NodeConfig{
+			Name: "test-host", ServerAddr: "127.0.0.1:7717",
+			Provider: ProviderDocker, StateDir: t.TempDir(),
+		},
+		Tiers: []Tier{
+			// Takes the entire 8 vCPU budget, exactly.
+			{
+				Label: "billet-first", Provider: ProviderDocker, GuestOS: GuestLinux,
+				VCPU: 2, Memory: 1 * GiB, Image: "ubuntu-2404", Reserved: 4,
+			},
+			// Then asks for more of a budget that is now exactly zero.
+			{
+				Label: "billet-second", Provider: ProviderDocker, GuestOS: GuestLinux,
+				VCPU: 2, Memory: 1 * GiB, Image: "ubuntu-2404", Reserved: 1,
+			},
+		},
+	}
+
+	c.applyDefaults()
+
+	err := c.Validate()
+	if err == nil {
+		t.Fatal("accepted a reservation against an exhausted budget; every tier would " +
+			"compute zero headroom and billet would advertise nothing")
+	}
+
+	if !strings.Contains(err.Error(), "billet-second") {
+		t.Errorf("the error does not name the tier that does not fit: %v", err)
+	}
+}
