@@ -401,6 +401,27 @@ type Tier struct {
 	// MaxConcurrent caps simultaneous instances of this tier, counting warm ones.
 	// Zero means "no per-tier cap" and is only legal for non-macOS tiers.
 	MaxConcurrent int `yaml:"max_concurrent,omitempty"`
+
+	// Reserved is how many simultaneous instances of this tier are always
+	// available to it, no matter how busy every other tier is.
+	//
+	// A FLOOR, where MaxConcurrent is a ceiling — and the difference is the
+	// difference between limiting a tier and guaranteeing one. Billet shares a
+	// single budget across every tier, and headroom is the whole of what is left,
+	// so a tier with steady demand can hold all of it: the others then advertise
+	// zero capacity, their jobs queue at GitHub indefinitely, and nothing in
+	// billet is behaving incorrectly. On Spendify's own catalogue — 2, 4 and
+	// 8 vCPU tiers on one machine — the 2 vCPU tier wins that race simply by
+	// fitting more often.
+	//
+	// A reservation is deducted from what OTHER tiers may take, only while it is
+	// unmet: a tier holding its floor already competes for the rest on equal
+	// terms, so capacity is never idled waiting for work that is not there.
+	//
+	// Zero, the default, means no guarantee — which is the current behaviour and
+	// the right default, because a floor is a promise about a machine only its
+	// operator can make.
+	Reserved int `yaml:"reserved,omitempty"`
 }
 
 // DefaultMacOSVMLimit is Apple's licensing cap on macOS guests per
@@ -483,6 +504,12 @@ func (t Tier) ProviderErrors(where string) []error {
 
 	return errs
 }
+
+// ReservedVCPU is the vCPU a tier's floor holds back from other tiers.
+func (t Tier) ReservedVCPU() int { return t.Reserved * t.VCPU }
+
+// ReservedMemory is the memory a tier's floor holds back from other tiers.
+func (t Tier) ReservedMemory() ByteSize { return ByteSize(t.Reserved) * t.Memory }
 
 // GuestOSProviderErrors reports backends that cannot host a tier's guest OS.
 //

@@ -325,6 +325,18 @@ func New(db *state.DB, limits Limits, tiers []config.Tier, opts ...Option) (*All
 			return nil, fmt.Errorf("alloc: tier %q has memory %s; headroom divides by it", t.Label, t.Memory)
 		case t.MaxConcurrent < 0:
 			return nil, fmt.Errorf("alloc: tier %q has negative max_concurrent %d", t.Label, t.MaxConcurrent)
+
+		case t.Reserved < 0:
+			return nil, fmt.Errorf("alloc: tier %q has negative reserved %d", t.Label, t.Reserved)
+
+		case t.MaxConcurrent > 0 && t.Reserved > t.MaxConcurrent:
+			// A floor above the ceiling is unsatisfiable by construction: the
+			// reservation holds capacity back from every other tier, and this tier
+			// can never use it.
+			return nil, fmt.Errorf(
+				"alloc: tier %q reserves %d but caps itself at %d; the reservation could never "+
+					"be filled and would strand capacity",
+				t.Label, t.Reserved, t.MaxConcurrent)
 		// THE SAME RULES config.Load APPLIES, because this constructor is
 		// documented as unable to assume its catalogue came through Load — a
 		// caller can build tiers in code, and this one was accepting tiers that
@@ -384,6 +396,40 @@ func New(db *state.DB, limits Limits, tiers []config.Tier, opts ...Option) (*All
 		}
 
 		a.tiers[t.Label] = normalized
+	}
+
+	// THE FLOORS MUST FIT, together.
+	//
+	// Individually legal reservations can sum past the machine, and the failure
+	// is invisible where it happens: every tier deducts every other tier's unmet
+	// floor, so if the floors exceed the budget then EVERY tier computes zero
+	// headroom and the whole deployment quietly advertises nothing. A control
+	// plane that accepts no work while reporting no error is the worst outcome
+	// this package can produce.
+	var (
+		floorVCPU   int
+		floorMemory config.ByteSize
+	)
+
+	for label := range a.tiers {
+		t := a.tiers[label]
+
+		floorVCPU += t.ReservedVCPU()
+		floorMemory += t.ReservedMemory()
+	}
+
+	if floorVCPU > limits.MaxVCPU {
+		return nil, fmt.Errorf(
+			"alloc: reserved tiers need %d vCPU together but the budget is %d; every tier would "+
+				"compute zero headroom and billet would advertise nothing",
+			floorVCPU, limits.MaxVCPU)
+	}
+
+	if floorMemory > limits.MaxMemory {
+		return nil, fmt.Errorf(
+			"alloc: reserved tiers need %s together but the budget is %s; every tier would "+
+				"compute zero headroom and billet would advertise nothing",
+			floorMemory, limits.MaxMemory)
 	}
 
 	for _, opt := range opts {
@@ -624,8 +670,23 @@ func (a *Allocator) headroom(ctx context.Context, tx *sql.Tx, t config.Tier) (in
 		return 0, err
 	}
 
-	byVCPU := (a.limits.MaxVCPU - used.VCPU) / t.VCPU
-	byMemory := int((a.limits.MaxMemory - used.Memory) / t.Memory)
+	// WHAT OTHER TIERS ARE OWED IS NOT AVAILABLE HERE.
+	//
+	// Headroom used to be the whole of what was left, which let one tier hold the
+	// entire budget: the others then advertised zero, their jobs queued at GitHub
+	// indefinitely, and nothing in billet was behaving incorrectly. A tier with
+	// small instances wins that race simply by fitting more often.
+	//
+	// Only UNMET floors are deducted. A tier already holding its reservation
+	// competes for the remainder on equal terms, so capacity is never idled
+	// waiting for work that has not arrived.
+	owedVCPU, owedMemory, err := a.unmetFloors(ctx, tx, t.Label)
+	if err != nil {
+		return 0, err
+	}
+
+	byVCPU := (a.limits.MaxVCPU - used.VCPU - owedVCPU) / t.VCPU
+	byMemory := int((a.limits.MaxMemory - used.Memory - owedMemory) / t.Memory)
 
 	n := min(byVCPU, byMemory)
 
@@ -1461,6 +1522,86 @@ func (a *Allocator) LaunchedLeaseIDs(ctx context.Context, node string) (map[stri
 	}
 
 	return open, nil
+}
+
+// unmetFloors reports the capacity other tiers are guaranteed and do not yet
+// hold, which the caller may not take.
+//
+// One grouped query rather than one per tier: a loop of counts would be a
+// database call per catalogue entry inside the transaction that every
+// reservation waits on.
+//
+// A tier is "owed" only the part of its floor it is missing. Deducting the whole
+// floor would idle capacity a tier has already claimed, and deducting nothing
+// once a floor is met is what keeps a reservation a guarantee rather than a
+// quota — above the floor, everyone competes.
+func (a *Allocator) unmetFloors(
+	ctx context.Context, tx *sql.Tx, forTier string,
+) (int, config.ByteSize, error) {
+	held, err := a.countOpenPerTier(ctx, tx)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	var (
+		vcpu   int
+		memory config.ByteSize
+	)
+
+	for label := range a.tiers {
+		// A tier never holds capacity back from itself: its own floor is not an
+		// obstacle to filling it.
+		if label == forTier {
+			continue
+		}
+
+		t := a.tiers[label]
+		if t.Reserved == 0 {
+			continue
+		}
+
+		missing := t.Reserved - held[label]
+		if missing <= 0 {
+			continue
+		}
+
+		vcpu += missing * t.VCPU
+		memory += config.ByteSize(missing) * t.Memory
+	}
+
+	return vcpu, memory, nil
+}
+
+// countOpenPerTier reports how many non-terminal leases each tier holds.
+func (a *Allocator) countOpenPerTier(ctx context.Context, tx *sql.Tx) (map[string]int, error) {
+	rows, err := tx.QueryContext(ctx,
+		`SELECT tier, COUNT(*) FROM leases WHERE phase NOT IN ('done','failed') GROUP BY tier`)
+	if err != nil {
+		return nil, fmt.Errorf("alloc: count open leases per tier: %w", err)
+	}
+
+	defer func() { _ = rows.Close() }()
+
+	held := make(map[string]int, len(a.tiers))
+
+	for rows.Next() {
+		var (
+			label string
+			n     int
+		)
+
+		if err := rows.Scan(&label, &n); err != nil {
+			return nil, fmt.Errorf("alloc: scan per-tier lease counts: %w", err)
+		}
+
+		held[label] = n
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("alloc: read per-tier lease counts: %w", err)
+	}
+
+	return held, nil
 }
 
 func (a *Allocator) countOpenByTier(ctx context.Context, tx *sql.Tx, tier string) (int, error) {
