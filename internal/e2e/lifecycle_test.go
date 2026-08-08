@@ -204,12 +204,19 @@ func TestRefusedWorkReturnsItsCapacity(t *testing.T) {
 	}
 }
 
-// Every message is acknowledged, and only after its work is done.
+// A message is acknowledged only AFTER its work is done, and exactly once.
 //
-// An unacknowledged message is redelivered, so a missing ack is a job billet
-// processes twice. Acking too early is worse: the cursor advances past work that
-// was never done, and the message is never seen again.
-func TestMessagesAreAcknowledged(t *testing.T) {
+// The previous version waited for any acknowledgement at all, which is satisfied
+// by a billet that acks at the top of the handler before doing anything — the
+// precise bug it claimed to guard against. Acking early is worse than not acking:
+// an unacknowledged message is redelivered, so a missing ack costs a duplicate,
+// while an early one advances the cursor past work that never happened and the
+// job is never seen again.
+//
+// So this asserts the ORDER against something only the work produces: the
+// acquisition. A JobAvailable message cannot be acked before billet has bid for
+// the job it describes.
+func TestAMessageIsAcknowledgedOnlyAfterItsWorkIsDone(t *testing.T) {
 	s := newStack(t)
 
 	s.plane.queue(fakeactions.StatisticsJSON(1, 0),
@@ -221,11 +228,19 @@ func TestMessagesAreAcknowledged(t *testing.T) {
 	deadline := time.Now().Add(30 * time.Second)
 
 	for {
-		s.plane.mu.Lock()
-		acked := len(s.plane.deleted)
-		s.plane.mu.Unlock()
+		acked := s.plane.ackedIDs()
 
-		if acked > 0 {
+		if len(acked) > 0 {
+			// The acknowledgement has happened. The bid must already have.
+			if len(s.plane.acquiredIDs()) == 0 {
+				t.Fatal("message 1 was acknowledged before billet bid for the job in it; " +
+					"the cursor has advanced past work that never happened")
+			}
+
+			if acked[0] != 1 {
+				t.Fatalf("acknowledged message %d first, want 1", acked[0])
+			}
+
 			break
 		}
 
@@ -233,7 +248,64 @@ func TestMessagesAreAcknowledged(t *testing.T) {
 			t.Fatal("billet never acknowledged the message; it would be redelivered forever")
 		}
 
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// An unacknowledged message is redelivered, and billet copes.
+//
+// This is the contract the whole design rests on — it is why everything derived
+// from a message has to be idempotent — and nothing exercised it. The fake now
+// keeps the head of the queue until its exact id is deleted, so a billet that
+// forgot to acknowledge would loop here forever rather than passing.
+func TestTheSameJobIsNotStartedTwiceWhenAMessageIsRedelivered(t *testing.T) {
+	s := newStack(t)
+
+	s.plane.queue(fakeactions.StatisticsJSON(1, 0),
+		fakeactions.JobJSON("JobAvailable", 4005, "push", testTier))
+
+	stop := s.run(t)
+	defer stop()
+
+	deadline := time.Now().Add(30 * time.Second)
+
+	for len(s.plane.acquiredIDs()) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("billet never bid for the available job")
+		}
+
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	s.plane.queue(fakeactions.StatisticsJSON(0, 1),
+		fakeactions.JobJSON("JobAssigned", 4005, "push", testTier))
+
+	s.awaitContainer(t, 1)
+
+	// Deliver the SAME assignment again, as the service does when an
+	// acknowledgement is lost.
+	s.plane.queue(fakeactions.StatisticsJSON(0, 1),
+		fakeactions.JobJSON("JobAssigned", 4005, "push", testTier))
+
+	// Long enough for a second container to have appeared if billet were going to
+	// start one. There is no positive signal for "nothing happened".
+	time.Sleep(3 * time.Second)
+
+	instances, err := s.provider.List(t.Context())
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+
+	var running int
+
+	for _, inst := range instances {
+		if inst.Running {
+			running++
+		}
+	}
+
+	if running != 1 {
+		t.Fatalf("a redelivered assignment started %d containers for one job: %v", running, instances)
 	}
 }
 

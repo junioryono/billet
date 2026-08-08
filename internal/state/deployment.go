@@ -103,6 +103,16 @@ func DeploymentID(stateDir string) (string, error) {
 	defer func() { _ = dir.Close() }()
 
 	if err := dir.Sync(); err != nil {
+		// THE FILE GOES WITH THE FAILURE. Leaving it behind means the next call
+		// takes the read path, finds an id whose directory entry was never made
+		// durable, and returns it as though the guarantee held — turning a
+		// one-time startup error into a silent loss of the property this sync
+		// exists to provide.
+		if rmErr := os.Remove(path); rmErr != nil {
+			return "", fmt.Errorf("state: sync state dir (%w), and the half-written "+
+				"identity could not be removed (%v); delete %s by hand", err, rmErr, path)
+		}
+
 		return "", fmt.Errorf("state: sync state dir: %w", err)
 	}
 

@@ -76,6 +76,11 @@ type Runner struct {
 	alloc    LeaseStore
 	log      *slog.Logger
 
+	// tending serializes Tend, which mutates custody entries in place and issues
+	// backend calls between reads. Separate from mu, which guards the map itself
+	// for the brief moments it is read or written.
+	tending sync.Mutex
+
 	// custody holds leases whose compute is unaccounted for, keyed by lease id.
 	// See custody.go — it is what stops a launch failure or a restart from
 	// handing back capacity that something may still be using.
@@ -250,7 +255,11 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job Job) error 
 		// container might still be running on it, which is the over-commitment this
 		// whole subsystem exists to prevent — arrived at by treating "the launch
 		// failed" as "nothing is using the host".
-		if cleanupErr := r.destroyStray(ctx, name); cleanupErr != nil {
+		// CUSTODY UNLESS THE CLEANUP WAS CAUSAL. A successful Destroy proves the
+		// compute is gone; anything else — an error, or simply not finding it —
+		// does not, because the daemon may still be acting on a create whose
+		// response was lost.
+		if confirmed, cleanupErr := r.destroyStray(ctx, name); !confirmed {
 			r.hold(lease, name)
 
 			return errCustody(name, errors.Join(err, cleanupErr))
@@ -280,6 +289,20 @@ func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
 	r.mu.Unlock()
 
 	if !ok {
+		// Not something this incarnation started — but it may be something an
+		// earlier one did, which this one adopted. Without this an adopted
+		// container whose job GitHub later reports finished is held forever: the
+		// restarted listener has no record of the request either, so nothing else
+		// connects the completion to the compute.
+		released, err := r.releaseRequest(ctx, requestID)
+		if err != nil {
+			return err
+		}
+
+		if released {
+			return nil
+		}
+
 		return nil
 	}
 
@@ -303,7 +326,7 @@ func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
 // hide why the launch failed in the first place. What must not happen is
 // silence — an operator who has to find an orphan by hand needs to know it
 // might exist.
-func (r *Runner) destroyStray(ctx context.Context, name string) error {
+func (r *Runner) destroyStray(ctx context.Context, name string) (bool, error) {
 	// A fresh context, because the usual reason a launch failed is that the
 	// caller's was cancelled — and asking a cancelled context to clean up
 	// guarantees the cleanup fails too.
@@ -312,21 +335,25 @@ func (r *Runner) destroyStray(ctx context.Context, name string) error {
 
 	inst, found, err := r.provider.Find(ctx, name)
 	if err != nil {
-		return fmt.Errorf("could not tell whether a failed launch left %s behind: %w", name, err)
+		return false, fmt.Errorf("could not tell whether a failed launch left %s behind: %w", name, err)
 	}
 
 	if !found {
-		return nil
+		// NOT CONFIRMED. Absence in one observation is not proof that nothing will
+		// appear: the create may be in flight inside the daemon. The caller keeps
+		// the capacity and looks again.
+		return false, fmt.Errorf("no instance named %s is visible yet, which does not "+
+			"prove the daemon is not still starting one", name)
 	}
 
 	r.log.Warn("a failed launch had in fact started something; removing it",
 		"name", name, "instance", inst.ID)
 
 	if err := r.provider.Destroy(ctx, inst.ID); err != nil {
-		return fmt.Errorf("could not remove %s, which a failed launch had started: %w", name, err)
+		return false, fmt.Errorf("could not remove %s, which a failed launch had started: %w", name, err)
 	}
 
-	return nil
+	return true, nil
 }
 
 // Recover decides what to do with compute an earlier run left behind, once, at
@@ -386,13 +413,26 @@ func (r *Runner) Recover(ctx context.Context) error {
 
 		if open[leaseID] && inst.Running {
 			lease, err := r.alloc.Lease(ctx, leaseID)
-			if err != nil {
-				// The lease went terminal between the two reads. It is an orphan
-				// after all, and the destroy below is the right answer.
-				r.log.Warn("a surviving instance's lease disappeared while adopting it",
-					"name", inst.Name, "lease", leaseID, "error", err)
-			} else {
-				r.adopt(leaseID, inst, lease.Epoch)
+
+			switch {
+			case errors.Is(err, alloc.ErrLeaseNotFound):
+				// The lease went terminal between the two reads. It really is an
+				// orphan, and the destroy below is the right answer.
+				r.log.Warn("a surviving instance's lease was terminalized while adopting it",
+					"name", inst.Name, "lease", leaseID)
+
+			case err != nil:
+				// ANY OTHER ERROR MEANS "COULD NOT VERIFY", NOT "SAFE TO DESTROY".
+				// Falling through here turned a transient database read failure into
+				// a force-killed job, which is the single worst thing this function
+				// can do. Recovery aborts instead; the caller treats that as fatal
+				// and nothing has been destroyed.
+				return fmt.Errorf("node: read the lease of surviving instance %s: %w", inst.Name, err)
+
+			default:
+				if err := r.takeCustody(ctx, lease, inst); err != nil {
+					return err
+				}
 
 				adopted++
 
@@ -431,6 +471,24 @@ func (r *Runner) Recover(ctx context.Context) error {
 
 	r.log.Info("reconciled compute left by an earlier run",
 		"found", len(instances), "adopted", adopted)
+
+	return nil
+}
+
+// takeCustody adopts an instance and immediately renews its lease.
+//
+// THE RENEWAL IS THE POINT, and leaving it to the first periodic tick was a real
+// hole. Billet may have been down for longer than a lease TTL, so the lease it
+// is adopting can already be expired — and the control plane runs a reap BEFORE
+// its first tend. The reaper would terminalize the lease it had just adopted,
+// hand the capacity back, and let a listener advertise it while the container
+// carried on running.
+func (r *Runner) takeCustody(ctx context.Context, lease *alloc.Lease, inst *provider.Instance) error {
+	if err := r.alloc.Heartbeat(ctx, lease.ID, lease.Epoch); err != nil {
+		return fmt.Errorf("node: renew the lease of adopted instance %s: %w", inst.Name, err)
+	}
+
+	r.adopt(lease, inst)
 
 	return nil
 }

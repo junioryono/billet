@@ -162,6 +162,12 @@ func (p *plane) scaleSet() map[string]any {
 // connection open for the poll interval and then says nothing happened. A fake
 // that returned 200-with-empty instead would let billet mishandle the common
 // case undetected.
+//
+// THE HEAD IS NOT REMOVED HERE. An unacknowledged message is REDELIVERED — that
+// is the vendored client's stated contract and the reason DeleteMessage exists —
+// so a fake that popped on read could never catch a missing acknowledgement, and
+// the test claiming to check for one passed against a billet that never acked.
+// The message goes when its id is deleted.
 func (p *plane) getMessage(w http.ResponseWriter) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -172,12 +178,10 @@ func (p *plane) getMessage(w http.ResponseWriter) {
 		return
 	}
 
-	msg := p.queued[0]
-	p.queued = p.queued[1:]
-
-	fakeactions.WriteJSON(p.t, w, msg)
+	fakeactions.WriteJSON(p.t, w, p.queued[0])
 }
 
+// deleteMessage acknowledges the head of the queue and drops it.
 func (p *plane) deleteMessage(w http.ResponseWriter, path string) {
 	id, err := strconv.ParseInt(strings.TrimPrefix(path, "/queue/"), 10, 64)
 	if err != nil {
@@ -185,8 +189,24 @@ func (p *plane) deleteMessage(w http.ResponseWriter, path string) {
 	}
 
 	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	p.deleted = append(p.deleted, id)
-	p.mu.Unlock()
+
+	// Only the message actually acknowledged is dropped. Acking an id that is not
+	// the head means the cursor has run ahead of the work, which is the failure
+	// that loses a job silently.
+	head, ok := 0, false
+
+	if len(p.queued) > 0 {
+		head, ok = p.queued[0]["messageId"].(int)
+	}
+
+	if ok && int64(head) == id {
+		p.queued = p.queued[1:]
+	} else {
+		p.t.Errorf("acknowledged message %d, which is not the head of the queue", id)
+	}
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -231,6 +251,14 @@ func (p *plane) queue(stats map[string]any, jobs ...map[string]any) {
 
 	p.queued = append(p.queued, fakeactions.MessageJSON(p.t, p.nextMsgID, stats, jobs...))
 	p.nextMsgID++
+}
+
+// ackedIDs reports the messages billet has acknowledged, in order.
+func (p *plane) ackedIDs() []int64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return append([]int64(nil), p.deleted...)
 }
 
 func (p *plane) acquiredIDs() []int64 {
@@ -414,7 +442,13 @@ func (s *stack) run(t *testing.T) func() {
 	}
 }
 
-// awaitContainer waits for a container named after some lease to exist.
+// awaitContainer waits for exactly `want` RUNNING containers.
+//
+// Running, not merely present. `docker ps --all` lists exited containers too, so
+// counting everything let a test pass while the "runner" had already died — the
+// headline lifecycle test was doing exactly that against an image whose default
+// command exits immediately, proving container creation and removal rather than
+// that a job ran.
 func (s *stack) awaitContainer(t *testing.T, want int) []string {
 	t.Helper()
 
@@ -426,17 +460,21 @@ func (s *stack) awaitContainer(t *testing.T, want int) []string {
 			t.Fatalf("List: %v", err)
 		}
 
-		if len(instances) == want {
-			names := make([]string, 0, len(instances))
-			for _, inst := range instances {
+		names := make([]string, 0, len(instances))
+
+		for _, inst := range instances {
+			if inst.Running {
 				names = append(names, inst.Name)
 			}
+		}
 
+		if len(names) == want {
 			return names
 		}
 
 		if time.Now().After(deadline) {
-			t.Fatalf("waited for %d container(s), have %d", want, len(instances))
+			t.Fatalf("waited for %d running container(s), have %d (%d in any state)",
+				want, len(names), len(instances))
 		}
 
 		time.Sleep(100 * time.Millisecond)

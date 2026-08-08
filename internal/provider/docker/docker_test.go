@@ -253,15 +253,16 @@ func TestListReadsWellFormedOutput(t *testing.T) {
 	t.Parallel()
 
 	p := New("test-deployment", WithBinary(stubPrinting(t,
-		"abc123\tbillet-one\trunning\ndef456\tbillet-two\texited")))
+		"abc123\tbillet-one\trunning\ndef456\tbillet-two\texited\n"+
+			"ghi789\tbillet-three\tcreated\njkl012\tbillet-four\tsomethingnew")))
 
 	got, err := p.List(t.Context())
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
 
-	if len(got) != 2 {
-		t.Fatalf("read %d instances from two lines: %v", len(got), got)
+	if len(got) != 4 {
+		t.Fatalf("read %d instances from four lines: %v", len(got), got)
 	}
 
 	if got[0].ID != "abc123" || got[0].Name != "billet-one" || !got[0].Running {
@@ -272,6 +273,22 @@ func TestListReadsWellFormedOutput(t *testing.T) {
 	// container is left to finish or cleaned up.
 	if got[1].Running {
 		t.Errorf("an exited container was reported as running: %+v", got[1])
+	}
+
+	// CREATED IS NOT RUNNING. A container that exists but was never started never
+	// will be — whatever would have started it is gone — so adopting it means
+	// holding its lease open forever for a job that cannot begin. It is the one
+	// state that looks alive and is not.
+	if got[2].Running {
+		t.Errorf("a created-but-never-started container was reported as running: %+v", got[2])
+	}
+
+	// An UNRECOGNISED state counts as running, and that asymmetry is deliberate:
+	// the caller destroys what is not running, and a state billet has never heard
+	// of is not evidence that a job is over.
+	if !got[3].Running {
+		t.Errorf("an unrecognised state was treated as finished, which would destroy live "+
+			"work: %+v", got[3])
 	}
 }
 

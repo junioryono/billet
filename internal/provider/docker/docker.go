@@ -305,10 +305,18 @@ func (p *Provider) list(ctx context.Context, filters ...string) ([]*Instance, er
 			ID:   id,
 			Name: name,
 			// docker reports created/running/paused/restarting/removing/exited/dead.
-			// Anything that is not plainly finished counts as running, because the
-			// caller destroys what is not — and a state billet does not recognise is
-			// not evidence that a job is over.
-			Running: state != "exited" && state != "dead" && state != "removing",
+			//
+			// CREATED IS NOT RUNNING, and it counted as running until this was
+			// pointed out. A container that exists but was never started will never
+			// be started now — the process that would have done it is gone — so
+			// adopting it means heartbeating its lease forever for a job that cannot
+			// begin. It is the one state that looks alive and is not.
+			//
+			// An unrecognised state still counts as running: the caller destroys
+			// what is not, and a state billet has never heard of is not evidence
+			// that a job is over.
+			Running: state != "created" && state != "exited" &&
+				state != "dead" && state != "removing",
 		})
 	}
 

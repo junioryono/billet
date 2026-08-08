@@ -469,6 +469,15 @@ type brittleStore struct {
 
 	releaseErr   error
 	heartbeatErr error
+	leaseErr     error
+}
+
+func (b *brittleStore) Lease(ctx context.Context, leaseID string) (*alloc.Lease, error) {
+	if b.leaseErr != nil {
+		return nil, b.leaseErr
+	}
+
+	return b.LeaseStore.Lease(ctx, leaseID)
 }
 
 func (b *brittleStore) Release(
@@ -497,7 +506,7 @@ func TestTendReportsAnUnreachableLedger(t *testing.T) {
 
 	p := &fakeProvider{kind: config.ProviderDocker}
 	a, host := newAllocatorWithHost(t)
-	store := &brittleStore{LeaseStore: a, heartbeatErr: errors.New("database is locked")}
+	store := &brittleStore{LeaseStore: a}
 
 	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
 	lease := assignedLease(t, a)
@@ -508,9 +517,12 @@ func TestTendReportsAnUnreachableLedger(t *testing.T) {
 
 	restarted := New(store, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
 
+	// Adoption succeeds; the ledger fails afterwards.
 	if err := restarted.Recover(t.Context()); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
+
+	store.heartbeatErr = errors.New("database is locked")
 
 	if err := restarted.Tend(t.Context()); err == nil {
 		t.Fatal("an unreachable ledger was treated as a successful tick")
@@ -518,5 +530,306 @@ func TestTendReportsAnUnreachableLedger(t *testing.T) {
 
 	if len(p.live) != 1 {
 		t.Fatal("destroyed a running job because the ledger could not be reached")
+	}
+
+	if !restarted.heldLeases()[lease.ID] {
+		t.Error("dropped custody because the ledger was briefly unreachable")
+	}
+}
+
+// ADOPTION RENEWS THE LEASE IMMEDIATELY, and a failure to renew aborts recovery.
+//
+// Billet may have been down for longer than a lease TTL, so the lease being
+// adopted can already be expired — and the control plane runs a reap BEFORE its
+// first tend. Without the renewal, the reaper would terminalize the lease that
+// had just been adopted, hand its capacity back, and let a listener advertise it
+// while the container carried on running.
+func TestRecoverRenewsTheLeaseItAdopts(t *testing.T) {
+	t.Parallel()
+
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
+	lease := assignedLease(t, a)
+
+	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	store := &brittleStore{LeaseStore: a, heartbeatErr: errors.New("database is locked")}
+	restarted := New(store, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
+	if err := restarted.Recover(t.Context()); err == nil {
+		t.Fatal("recovery reported success though it could not renew the lease it adopted; " +
+			"the reaper would take that capacity while the container still runs")
+	}
+
+	// And it did not destroy the job on its way out.
+	if len(p.live) != 1 {
+		t.Fatalf("a failed renewal destroyed a running job: %v", p.live)
+	}
+}
+
+// A read failure while checking a surviving instance's lease is NOT a licence to
+// destroy it.
+//
+// "Could not verify" and "confirmed gone" reach the same line of code unless
+// they are told apart, and one of them force-kills a running job over a
+// transient database error.
+func TestRecoverDoesNotDestroyWhenItCannotReadTheLease(t *testing.T) {
+	t.Parallel()
+
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
+	if err := r.Launch(t.Context(), assignedLease(t, a), Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	store := &brittleStore{LeaseStore: a, leaseErr: errors.New("disk I/O error")}
+	restarted := New(store, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
+	if err := restarted.Recover(t.Context()); err == nil {
+		t.Fatal("recovery reported success though it could not read the lease")
+	}
+
+	if len(p.live) != 1 {
+		t.Fatalf("destroyed a running job because its lease could not be read: %v", p.live)
+	}
+}
+
+// A completion for an adopted job ends its custody.
+//
+// The restarted listener has no record of the request, so its own completion
+// handling releases nothing. Without this an adopted container whose job GitHub
+// later reports finished is held until the hard bound — hours of capacity for a
+// job that is over.
+func TestACompletionEndsAnAdoption(t *testing.T) {
+	t.Parallel()
+
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
+	const requestID = 4242
+
+	lease := assignedLease(t, a)
+
+	if err := r.Launch(t.Context(), lease, Job{RequestID: requestID, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	restarted := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
+	if err := restarted.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+
+	// GitHub reports the job finished. This arrives at Destroy, whose in-memory
+	// map is empty because a different process started the container.
+	if err := restarted.Destroy(t.Context(), lease.RequestID); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+
+	if len(p.live) != 0 {
+		t.Fatalf("an adopted job's container outlived its completion: %v", p.live)
+	}
+
+	if len(restarted.heldLeases()) != 0 {
+		t.Error("capacity is still held for a job that has finished")
+	}
+}
+
+// A discarded entry terminalizes as FAILED, not done.
+//
+// Durable history has to say what happened. "Done" for a runner that never
+// started is a lie a later investigation would have to unpick.
+func TestADiscardedCustodyRecordsAFailure(t *testing.T) {
+	t.Parallel()
+
+	p := &fakeProvider{
+		kind:         config.ProviderDocker,
+		launchErr:    errors.New("context deadline exceeded"),
+		startsAnyway: true,
+		findErr:      errors.New("cannot connect to the docker daemon"),
+	}
+
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
+	frozen := time.Now()
+	r.now = func() time.Time { return frozen }
+
+	lease := assignedLease(t, a)
+
+	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err == nil {
+		t.Fatal("a launch that failed reported success")
+	}
+
+	for _, c := range r.custodySnapshot() {
+		if c.outcome != alloc.PhaseFailed {
+			t.Errorf("a failed launch would be recorded as %q, want %q", c.outcome, alloc.PhaseFailed)
+		}
+	}
+}
+
+// An absent stray is not believed straight away.
+//
+// A `docker ps` issued right after a lost create can overtake the daemon and see
+// nothing. Releasing on that hands the capacity back moments before the
+// container appears, which is the interleaving a single observation cannot rule
+// out.
+func TestAnAbsentStrayIsNotBelievedImmediately(t *testing.T) {
+	t.Parallel()
+
+	p := &fakeProvider{
+		kind:      config.ProviderDocker,
+		launchErr: errors.New("context deadline exceeded"),
+	}
+
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
+	frozen := time.Now()
+	r.now = func() time.Time { return frozen }
+
+	lease := assignedLease(t, a)
+
+	err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"})
+	if err == nil {
+		t.Fatal("a launch that failed reported success")
+	}
+
+	if !errors.Is(err, server.ErrCustody) {
+		t.Fatalf("released the capacity on a single negative observation: %v", err)
+	}
+
+	// Still nothing there, but not yet long enough to be sure.
+	if err := r.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend: %v", err)
+	}
+
+	if !r.heldLeases()[lease.ID] {
+		t.Fatal("stopped looking for a possible stray before the grace period was up")
+	}
+
+	// Past the grace period, an absence is believed and the capacity goes back.
+	r.now = func() time.Time { return frozen.Add(strayGrace + time.Second) }
+
+	if err := r.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend: %v", err)
+	}
+
+	if len(r.heldLeases()) != 0 {
+		t.Error("held the capacity forever for a stray that never appeared")
+	}
+}
+
+// Held compute that outlives any plausible job is destroyed.
+//
+// Adoption keeps a lease alive for as long as its container runs, which is right
+// for a job making progress and wrong for a runner wedged on a network call. The
+// bound is the difference between a delay and a permanent capacity loss.
+func TestHeldComputeIsBounded(t *testing.T) {
+	t.Parallel()
+
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
+	lease := assignedLease(t, a)
+
+	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	frozen := time.Now()
+
+	restarted := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	restarted.now = func() time.Time { return frozen }
+
+	if err := restarted.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+
+	// Still within the bound: the job is left alone.
+	if err := restarted.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend: %v", err)
+	}
+
+	if len(p.live) != 1 {
+		t.Fatal("destroyed a job that was still within the holding bound")
+	}
+
+	restarted.now = func() time.Time { return frozen.Add(MaxCustody + time.Minute) }
+
+	if err := restarted.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend: %v", err)
+	}
+
+	if len(p.live) != 0 {
+		t.Fatalf("held compute past the bound, so its capacity is lost until a restart: %v", p.live)
+	}
+}
+
+// A custody entry that has been REPLACED must not be deleted by the old one.
+//
+// Tend works from a snapshot and calls into the backend between reads, so an
+// entry can be replaced for the same lease while an older call is finishing. A
+// delete keyed only on the lease id then drops the NEW entry — and with it, all
+// knowledge of compute that exists. The lease goes back into the budget and the
+// container runs on unaccounted for, which is the exact failure custody exists
+// to prevent, reached from inside custody itself.
+func TestFinishingAStaleEntryDoesNotDropItsReplacement(t *testing.T) {
+	t.Parallel()
+
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
+	lease := assignedLease(t, a)
+
+	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	restarted := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
+	if err := restarted.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+
+	stale := restarted.custodySnapshot()
+	if len(stale) != 1 {
+		t.Fatalf("expected one custody entry, got %d", len(stale))
+	}
+
+	// A NEW entry lands for the same lease while the old call is in flight.
+	replacement := &custody{
+		leaseID: lease.ID,
+		epoch:   lease.Epoch,
+		name:    provider.InstanceName(lease.ID),
+		outcome: alloc.PhaseDone,
+		since:   time.Now(),
+	}
+
+	restarted.mu.Lock()
+	restarted.custody[lease.ID] = replacement
+	restarted.mu.Unlock()
+
+	// The old call finishes. It must not remove the replacement.
+	if err := restarted.finish(t.Context(), stale[0]); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+
+	restarted.mu.Lock()
+	held := restarted.custody[lease.ID]
+	restarted.mu.Unlock()
+
+	if held != replacement {
+		t.Fatal("a stale custody entry deleted its replacement, so billet has forgotten " +
+			"compute that still exists")
 	}
 }

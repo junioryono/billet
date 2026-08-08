@@ -38,6 +38,19 @@ type custody struct {
 	name     string
 	instance string
 
+	// requestID is the job the lease was assigned, so a completion arriving for
+	// it can end the custody. Without it an adopted container that hangs is held
+	// forever: the restarted listener has no record of the request, so its
+	// completion handler returns without releasing anything, and nothing else
+	// ever connects the message to the compute.
+	requestID int64
+
+	// outcome is how the lease should be recorded once its compute is gone. A
+	// discarded entry is a launch that FAILED, and writing "done" into the
+	// durable history for a runner that never started is a lie a later
+	// investigation would have to unpick.
+	outcome alloc.Phase
+
 	// discard is true when the instance must go as soon as it can be found, and
 	// false when it is running work that should be allowed to finish.
 	discard bool
@@ -47,17 +60,19 @@ type custody struct {
 	since time.Time
 }
 
-// Adopt takes custody of an instance that survived a restart.
-func (r *Runner) adopt(leaseID string, inst *provider.Instance, epoch int64) {
+// adopt takes custody of an instance that survived a restart.
+func (r *Runner) adopt(lease *alloc.Lease, inst *provider.Instance) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	r.custody[leaseID] = &custody{
-		leaseID:  leaseID,
-		epoch:    epoch,
-		name:     inst.Name,
-		instance: inst.ID,
-		since:    r.now(),
+	r.custody[lease.ID] = &custody{
+		leaseID:   lease.ID,
+		epoch:     lease.Epoch,
+		name:      inst.Name,
+		instance:  inst.ID,
+		requestID: lease.RequestID,
+		outcome:   alloc.PhaseDone,
+		since:     r.now(),
 	}
 }
 
@@ -71,10 +86,13 @@ func (r *Runner) hold(lease *alloc.Lease, name string) {
 	defer r.mu.Unlock()
 
 	r.custody[lease.ID] = &custody{
-		leaseID: lease.ID,
-		epoch:   lease.Epoch,
-		name:    name,
-		discard: true,
+		leaseID:   lease.ID,
+		epoch:     lease.Epoch,
+		name:      name,
+		requestID: lease.RequestID,
+		discard:   true,
+		// FAILED, not done. This lease's job never started.
+		outcome: alloc.PhaseFailed,
 		since:   r.now(),
 	}
 }
@@ -93,6 +111,40 @@ func (r *Runner) heldLeases() map[string]bool {
 	return held
 }
 
+// strayGrace is how long a possible stray is looked for before an absence is
+// believed.
+//
+// The window in which a daemon that accepted a create can still act on it. Sixty
+// seconds is far longer than any container runtime needs and cheap to be wrong
+// about — the cost of waiting is one lease's capacity for a minute, and the cost
+// of not waiting is a container running on capacity billet has already resold.
+const strayGrace = time.Minute
+
+// custodyWarnAfter is how long a held lease may go unresolved before every tick
+// says so.
+//
+// An hour is longer than most CI jobs and far shorter than the point at which
+// the capacity loss stops mattering. The warning is the actual mechanism here:
+// the bound below is a backstop that should never fire, and an operator finding
+// out about held capacity only when it is destroyed a day later has been told
+// too late to do anything about it.
+const custodyWarnAfter = time.Hour
+
+// MaxCustody is how long compute may be held before billet destroys it anyway.
+//
+// A HARD BOUND ON AN OTHERWISE UNBOUNDED HOLD. Adoption keeps a lease alive for
+// as long as its container runs, which is right for a job that is making
+// progress and wrong for one that has hung — a runner wedged on a network call
+// holds its vCPU forever, and the only evidence is a log line from the restart
+// that adopted it.
+//
+// Twenty-four hours, because the thing being bounded is a JOB and the longest
+// legitimate one is far shorter. GitHub's own default job timeout is six hours;
+// self-hosted runners can be configured beyond that, which is why this is not
+// six. Nothing that has been running for a day is still doing useful CI work,
+// and holding capacity for it is a worse failure than killing it.
+const MaxCustody = 24 * time.Hour
+
 // Tend advances everything in custody by one step, and is called on the same
 // tick as Sweep.
 //
@@ -105,6 +157,13 @@ func (r *Runner) heldLeases() map[string]bool {
 // job complete, the listener releases the lease, and the next Tend finds the
 // heartbeat refused and cleans up.
 func (r *Runner) Tend(ctx context.Context) error {
+	// SERIALIZED. Today one goroutine calls this, but nothing in the Sweeper
+	// contract says so, and two concurrent ticks would race on an entry's discard
+	// flag and issue duplicate destroys — worse, one could delete an entry the
+	// other had just replaced, dropping custody of compute that still exists.
+	r.tending.Lock()
+	defer r.tending.Unlock()
+
 	var failures []error
 
 	for _, c := range r.custodySnapshot() {
@@ -117,6 +176,24 @@ func (r *Runner) Tend(ctx context.Context) error {
 }
 
 func (r *Runner) tendOne(ctx context.Context, c *custody) error {
+	held := r.now().Sub(c.since)
+
+	// PAST THE BOUND, IT GOES, whatever it was. An adopted container this old is
+	// not finishing, and continuing to hold its capacity means the host stays
+	// short by that much until somebody restarts billet.
+	if held > MaxCustody && !c.discard {
+		r.log.Error("a job has been held far too long to still be running; destroying it "+
+			"and reclaiming its capacity",
+			"name", c.name, "lease", c.leaseID, "held_for", held.Round(time.Minute),
+			"limit", MaxCustody)
+
+		c.discard = true
+	} else if held > custodyWarnAfter {
+		r.log.Warn("still holding capacity for compute billet is not managing",
+			"name", c.name, "lease", c.leaseID, "held_for", held.Round(time.Minute),
+			"adopted", !c.discard)
+	}
+
 	if err := r.alloc.Heartbeat(ctx, c.leaseID, c.epoch); err != nil {
 		if !errors.Is(err, alloc.ErrLeaseNotFound) && !errors.Is(err, alloc.ErrFenced) {
 			return fmt.Errorf("node: hold the capacity of lease %s: %w", c.leaseID, err)
@@ -133,9 +210,19 @@ func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 	}
 
 	if !found {
-		// Nothing there. For a discarded entry that is the answer it was waiting
-		// for; for an adopted one it means the container went away without billet
-		// seeing it stop. Either way the capacity can go back.
+		// AN ABSENCE IS A SNAPSHOT, NOT A CAUSAL RESULT. When a launch loses its
+		// response, the daemon may still be processing the create — a `docker ps`
+		// issued straight afterwards can overtake it and see nothing, and releasing
+		// on that would hand the capacity back moments before the container
+		// appears. So a discarded entry has to keep looking for a while before an
+		// absence is believed.
+		//
+		// An adopted entry is different: its container was observed running, so an
+		// absence now means it genuinely went away.
+		if c.discard && r.now().Sub(c.since) < strayGrace {
+			return nil
+		}
+
 		return r.finish(ctx, c)
 	}
 
@@ -159,7 +246,7 @@ func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 
 // finish releases a custody entry's lease and forgets it.
 func (r *Runner) finish(ctx context.Context, c *custody) error {
-	err := r.alloc.Release(ctx, c.leaseID, c.epoch, alloc.PhaseDone)
+	err := r.alloc.Release(ctx, c.leaseID, c.epoch, c.outcome)
 	if err != nil && !errors.Is(err, alloc.ErrLeaseNotFound) && !errors.Is(err, alloc.ErrFenced) {
 		// KEPT in custody. Failing to release means the capacity is still recorded
 		// as held, and dropping the entry now would leave nothing to retry it —
@@ -168,10 +255,55 @@ func (r *Runner) finish(ctx context.Context, c *custody) error {
 	}
 
 	r.mu.Lock()
-	delete(r.custody, c.leaseID)
+	// DELETED ONLY IF IT IS STILL THE SAME ENTRY. A launch can replace a custody
+	// entry for the same lease while this one is finishing, and deleting by id
+	// alone would drop the new entry — losing track of compute that exists.
+	if r.custody[c.leaseID] == c {
+		delete(r.custody, c.leaseID)
+	}
 	r.mu.Unlock()
 
 	return nil
+}
+
+// releaseRequest ends the custody of a job GitHub has reported finished, if
+// this runner is holding one for it.
+//
+// The other half of the fix for adopted compute that hangs. The restarted
+// listener has no record of the request, so its own completion handling returns
+// without releasing anything; this is what connects the message to the container
+// a previous incarnation started.
+func (r *Runner) releaseRequest(ctx context.Context, requestID int64) (bool, error) {
+	r.mu.Lock()
+
+	var held *custody
+
+	for _, c := range r.custody {
+		if c.requestID == requestID {
+			held = c
+
+			break
+		}
+	}
+
+	r.mu.Unlock()
+
+	if held == nil {
+		return false, nil
+	}
+
+	// Marked for destruction rather than destroyed here, then advanced
+	// immediately. Going through the same path as every other custody transition
+	// keeps the ordering rules — destroy, then release, and keep the entry if
+	// either fails — in exactly one place.
+	r.tending.Lock()
+	held.discard = true
+	r.tending.Unlock()
+
+	r.log.Info("a job billet adopted has been reported finished; releasing its compute",
+		"lease", held.leaseID, "request", requestID)
+
+	return true, r.tendOne(ctx, held)
 }
 
 func (r *Runner) custodySnapshot() []*custody {
