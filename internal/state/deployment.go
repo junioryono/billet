@@ -89,5 +89,22 @@ func DeploymentID(stateDir string) (string, error) {
 		return "", fmt.Errorf("state: sync deployment id: %w", err)
 	}
 
+	// THE DIRECTORY IS SYNCED TOO, and that is not belt-and-braces. Syncing a new
+	// file persists its CONTENTS; the directory entry that makes it findable is a
+	// separate write, and losing power between the two leaves a state directory
+	// with no identity in it. Billet would mint a fresh one on restart, and every
+	// container labelled with the old id becomes invisible — leases reaped,
+	// capacity resold, containers running forever.
+	dir, err := os.Open(stateDir)
+	if err != nil {
+		return "", fmt.Errorf("state: open state dir to sync it: %w", err)
+	}
+
+	defer func() { _ = dir.Close() }()
+
+	if err := dir.Sync(); err != nil {
+		return "", fmt.Errorf("state: sync state dir: %w", err)
+	}
+
 	return id, nil
 }

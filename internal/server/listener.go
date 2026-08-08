@@ -81,7 +81,26 @@ type Sweeper interface {
 	// could not confirm, a Destroy the backend refused — is picked up by the same
 	// pass, which is why a failed cleanup is survivable rather than permanent.
 	Sweep(ctx context.Context) error
+
+	// Tend advances compute the runner is holding capacity for: heartbeating
+	// those leases so the reaper does not terminalize them, letting adopted work
+	// finish, and destroying what is confirmed finished or unwanted.
+	//
+	// Paired with Sweep rather than separate because the two are the same
+	// obligation seen from opposite ends — Sweep finds compute no lease is
+	// holding, Tend holds leases whose compute is unaccounted for.
+	Tend(ctx context.Context) error
 }
+
+// ErrCustody means the runner has taken responsibility for a lease's capacity,
+// so the caller must NOT release it.
+//
+// Returned from Launch when compute may exist that could not be confirmed gone.
+// Releasing the lease then would hand the capacity back while a container is
+// possibly still running on it — the exact over-commitment the reconciliation
+// work exists to prevent, arrived at by treating "the launch failed" as "nothing
+// is using the host".
+var ErrCustody = errors.New("server: the runner is holding this lease's capacity")
 
 // errNoRunner means no compute is attached to this control plane.
 var errNoRunner = errors.New("server: no runner is configured, so nothing can start this job")
@@ -1129,6 +1148,25 @@ func (l *Listener) launch(ctx context.Context, lease *alloc.Lease, job Job) erro
 				"unaccounted for and needs manual cleanup",
 				"tier", l.tier, "request", job.RequestID, "error", destroyErr)
 		}
+
+		return nil
+	}
+
+	// THE CAPACITY IS NOT HANDED BACK IF THE RUNNER IS STILL HOLDING IT.
+	//
+	// A launch that failed ambiguously may have started something, and the runner
+	// says so by returning ErrCustody: it has taken the lease into its own
+	// janitor, will keep heartbeating it, and will release it once the compute is
+	// confirmed gone. Releasing here as well would double-count the capacity —
+	// the listener would re-advertise it while a container is possibly running.
+	if errors.Is(err, ErrCustody) {
+		l.log.Warn("a job failed to start and its compute could not be confirmed gone; "+
+			"the runner is holding the capacity until it is",
+			"tier", l.tier, "request", job.RequestID, "lease", lease.ID, "error", err)
+
+		l.mu.Lock()
+		delete(l.running, job.RequestID)
+		l.mu.Unlock()
 
 		return nil
 	}

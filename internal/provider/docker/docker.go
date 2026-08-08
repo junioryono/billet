@@ -264,7 +264,7 @@ func (p *Provider) list(ctx context.Context, filters ...string) ([]*Instance, er
 		"--filter", "label="+ownerLabel+"="+p.owner,
 		// Tab-separated rather than JSON: the format is billet's own, so there is
 		// nothing to parse defensively, and a name cannot contain a tab.
-		"--format", "{{.ID}}\t{{.Names}}",
+		"--format", "{{.ID}}\t{{.Names}}\t{{.State}}",
 	)
 
 	for _, f := range filters {
@@ -283,19 +283,33 @@ func (p *Provider) list(ctx context.Context, filters ...string) ([]*Instance, er
 			continue
 		}
 
-		id, name, ok := strings.Cut(line, "\t")
-		if !ok {
+		// SplitN with an exact count, not Cut. Cut proves a tab EXISTS; it does not
+		// prove there is only one, so a wrapper printing an extra column used to
+		// land inside the name — and a name with a suffix on it still parses as
+		// billet's, so the lease lookup misses and the sweep destroys a live job.
+		fields := strings.Split(line, "\t")
+		if len(fields) != 3 || fields[0] == "" || fields[1] == "" {
 			// REPORTED, not skipped. Neither a container id nor a name can contain
 			// a tab, so this line is not something billet knows how to read — a
 			// docker wrapper script, a podman version that formats differently, a
 			// warning on stdout. Skipping it would let List report success while
 			// omitting a billet container, and the caller's whole purpose is to act
 			// on what is missing from that list.
-			return nil, fmt.Errorf("docker: cannot read %q as an id and a name; "+
+			return nil, fmt.Errorf("docker: cannot read %q as an id, a name and a state; "+
 				"is `docker` a wrapper that prints extra output?", line)
 		}
 
-		instances = append(instances, &Instance{ID: id, Name: name})
+		id, name, state := fields[0], fields[1], fields[2]
+
+		instances = append(instances, &Instance{
+			ID:   id,
+			Name: name,
+			// docker reports created/running/paused/restarting/removing/exited/dead.
+			// Anything that is not plainly finished counts as running, because the
+			// caller destroys what is not — and a state billet does not recognise is
+			// not evidence that a job is over.
+			Running: state != "exited" && state != "dead" && state != "removing",
+		})
 	}
 
 	return instances, nil

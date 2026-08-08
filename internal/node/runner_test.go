@@ -306,7 +306,7 @@ func (f *fakeProvider) Launch(_ context.Context, spec provider.Spec) (*provider.
 		return nil, f.launchErr
 	}
 
-	inst := &provider.Instance{ID: "instance-" + spec.Name, Name: spec.Name}
+	inst := &provider.Instance{ID: "instance-" + spec.Name, Name: spec.Name, Running: true}
 	f.add(inst)
 
 	if f.launchErr != nil {
@@ -374,6 +374,15 @@ func (f *fakeProvider) Destroy(ctx context.Context, id string) error {
 	}
 
 	return nil
+}
+
+// stop marks an instance finished without removing it, which is what a
+// container that ran its job and exited looks like: still there, still holding
+// its name and its disk, no longer doing anything.
+func (f *fakeProvider) stop(name string) {
+	if inst, ok := f.live[name]; ok {
+		inst.Running = false
+	}
 }
 
 // add records an instance as running.
@@ -566,76 +575,6 @@ func TestLaunchNamesTheInstanceAfterTheLease(t *testing.T) {
 // Reconcile: what survived a crash, and whether anything still wants it.
 // ============================================================================
 
-func TestRecoverDestroysEverythingAnEarlierRunLeft(t *testing.T) {
-	t.Parallel()
-
-	p := &fakeProvider{kind: config.ProviderDocker}
-	a, host := newAllocatorWithHost(t)
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
-
-	lease := assignedLease(t, a)
-
-	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
-		t.Fatalf("Launch: %v", err)
-	}
-
-	// A fresh runner, because a restart is what this models: the in-memory maps
-	// are empty and the container is all that is left. The LEASE IS STILL OPEN
-	// and that is the point — an open lease says the job was wanted, not that
-	// this process can heartbeat it, notice its completion, or destroy it.
-	restarted := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
-
-	if err := restarted.Recover(t.Context()); err != nil {
-		t.Fatalf("Recover: %v", err)
-	}
-
-	if len(p.live) != 0 {
-		t.Fatalf("kept a container this process cannot manage: %v", p.live)
-	}
-}
-
-func TestRecoverReleasesTheLeaseOfWhatItDestroys(t *testing.T) {
-	t.Parallel()
-
-	// Capacity has to come back with the container. Leaving the lease for the
-	// reaper holds its vCPU and memory for a full TTL after the compute they were
-	// paying for is gone — a self-inflicted shortfall on every restart.
-	p := &fakeProvider{kind: config.ProviderDocker}
-	a, host := newAllocatorWithHost(t)
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
-
-	lease := assignedLease(t, a)
-
-	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
-		t.Fatalf("Launch: %v", err)
-	}
-
-	before, err := a.Usage(t.Context())
-	if err != nil {
-		t.Fatalf("Usage: %v", err)
-	}
-
-	if before.Leases == 0 {
-		t.Fatal("the lease was not open before recovery, so this proves nothing")
-	}
-
-	restarted := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
-
-	if err := restarted.Recover(t.Context()); err != nil {
-		t.Fatalf("Recover: %v", err)
-	}
-
-	after, err := a.Usage(t.Context())
-	if err != nil {
-		t.Fatalf("Usage: %v", err)
-	}
-
-	if after.Leases != 0 || after.VCPU != 0 {
-		t.Errorf("capacity stayed held after the compute was destroyed: %d leases, %d vCPU",
-			after.Leases, after.VCPU)
-	}
-}
-
 func TestRecoverIgnoresInstancesBilletDidNotName(t *testing.T) {
 	t.Parallel()
 
@@ -810,47 +749,50 @@ func TestSweepDestroysAnInstanceBoundToAnotherNode(t *testing.T) {
 	}
 }
 
-func TestSweepClearsUpAfterACleanupThatCouldNotBeConfirmed(t *testing.T) {
+func TestRecoverReleasesTheLeaseOfATrueOrphan(t *testing.T) {
 	t.Parallel()
 
-	// The composite Codex asked for, and the reason the sweep is not optional.
-	// A launch fails ambiguously AND the cleanup cannot reach the daemon, so the
-	// listener releases the lease while a container is still running. That is a
-	// real over-commitment; what makes it survivable rather than permanent is
-	// that the next sweep finds it.
-	p := &fakeProvider{
-		kind:         config.ProviderDocker,
-		launchErr:    errors.New("context deadline exceeded"),
-		startsAnyway: true,
-		findErr:      errors.New("cannot connect to the docker daemon"),
-	}
-
+	// Capacity has to come back with the container. Leaving the lease for the
+	// reaper holds its vCPU and memory for a full TTL after the compute they were
+	// paying for is gone — a self-inflicted shortfall on every restart.
+	//
+	// "True orphan" means the container is not running, so there is no job to
+	// protect: an instance that IS running with an open lease is adopted instead,
+	// which is the subject of custody_test.go.
+	p := &fakeProvider{kind: config.ProviderDocker}
 	a, host := newAllocatorWithHost(t)
 	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
 	lease := assignedLease(t, a)
 
-	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err == nil {
-		t.Fatal("a launch that failed reported success")
+	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
 	}
 
-	// The stray survived, because Find could not answer. This is the leak.
-	if len(p.live) != 1 {
-		t.Fatalf("expected the unconfirmed stray to still be running, got %v", p.live)
+	p.stop(provider.InstanceName(lease.ID))
+
+	before, err := a.Usage(t.Context())
+	if err != nil {
+		t.Fatalf("Usage: %v", err)
 	}
 
-	// The listener would now release the lease, since it releases on every launch
-	// error. Model that, then let the daemon come back.
-	if err := a.Release(t.Context(), lease.ID, lease.Epoch, alloc.PhaseFailed); err != nil {
-		t.Fatalf("Release: %v", err)
+	if before.Leases == 0 {
+		t.Fatal("the lease was not open before recovery, so this proves nothing")
 	}
 
-	p.findErr = nil
+	restarted := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
 
-	if err := r.Sweep(t.Context()); err != nil {
-		t.Fatalf("Sweep: %v", err)
+	if err := restarted.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover: %v", err)
 	}
 
-	if len(p.live) != 0 {
-		t.Fatalf("the leaked container was never cleaned up: %v", p.live)
+	after, err := a.Usage(t.Context())
+	if err != nil {
+		t.Fatalf("Usage: %v", err)
+	}
+
+	if after.Leases != 0 || after.VCPU != 0 {
+		t.Errorf("capacity stayed held after the compute was destroyed: %d leases, %d vCPU",
+			after.Leases, after.VCPU)
 	}
 }

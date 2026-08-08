@@ -49,12 +49,41 @@ type Registration interface {
 	RunnerName() string
 }
 
+// LeaseStore is the part of the capacity ledger the runner uses.
+//
+// An interface rather than *alloc.Allocator because the runner's hardest paths
+// are the ones where the ledger REFUSES, and a concrete allocator gives a test
+// no way to produce that. Custody exists to keep a lease held when compute is
+// unaccounted for; the branch that keeps holding it when the release itself
+// fails was untestable and therefore untested, which in this codebase has
+// reliably meant wrong.
+//
+// It is deliberately the whole set the runner calls and nothing more, so the
+// dependency is legible at a glance.
+type LeaseStore interface {
+	Bind(ctx context.Context, leaseID string, epoch int64, node string) error
+	Advance(ctx context.Context, leaseID string, epoch int64, to alloc.Phase) error
+	Heartbeat(ctx context.Context, leaseID string, epoch int64) error
+	Release(ctx context.Context, leaseID string, epoch int64, outcome alloc.Phase) error
+	Lease(ctx context.Context, leaseID string) (*alloc.Lease, error)
+	LaunchedLeaseIDs(ctx context.Context, node string) (map[string]bool, error)
+}
+
 // Runner starts and stops the compute for assigned leases.
 type Runner struct {
 	jit      JITSource
 	provider provider.Provider
-	alloc    *alloc.Allocator
+	alloc    LeaseStore
 	log      *slog.Logger
+
+	// custody holds leases whose compute is unaccounted for, keyed by lease id.
+	// See custody.go — it is what stops a launch failure or a restart from
+	// handing back capacity that something may still be using.
+	custody map[string]*custody
+
+	// now is time.Now, replaceable so a test can age a custody entry without
+	// sleeping.
+	now func() time.Time
 
 	// node is this host's name, which is what leases are bound to. Placement is
 	// enforced against the node REGISTERED under this name, so it has to match a
@@ -81,7 +110,7 @@ const strayCleanupTimeout = 30 * time.Second
 
 // New builds a runner over a provider.
 func New(
-	a *alloc.Allocator, node string, jit JITSource, p provider.Provider,
+	a LeaseStore, node string, jit JITSource, p provider.Provider,
 	tiers []config.Tier, log *slog.Logger,
 ) *Runner {
 	if log == nil {
@@ -98,6 +127,8 @@ func New(
 		provider: p,
 		alloc:    a,
 		node:     node,
+		custody:  make(map[string]*custody),
+		now:      time.Now,
 		log:      log,
 		tiers:    byLabel,
 		running:  make(map[int64]*provider.Instance),
@@ -214,7 +245,16 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job Job) error 
 		// So ask. Whatever is found is destroyed rather than adopted: the lease is
 		// about to be failed, so an instance for it has no future, and an adopted
 		// half-started instance is a worse thing to own than a clean failure.
-		r.destroyStray(ctx, name)
+		// If the stray could not be confirmed gone, the LEASE STAYS HELD. Returning
+		// an ordinary error here made the listener release the capacity while a
+		// container might still be running on it, which is the over-commitment this
+		// whole subsystem exists to prevent — arrived at by treating "the launch
+		// failed" as "nothing is using the host".
+		if cleanupErr := r.destroyStray(ctx, name); cleanupErr != nil {
+			r.hold(lease, name)
+
+			return errCustody(name, errors.Join(err, cleanupErr))
+		}
 
 		return fmt.Errorf("node: start %s: %w", name, err)
 	}
@@ -263,7 +303,7 @@ func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
 // hide why the launch failed in the first place. What must not happen is
 // silence — an operator who has to find an orphan by hand needs to know it
 // might exist.
-func (r *Runner) destroyStray(ctx context.Context, name string) {
+func (r *Runner) destroyStray(ctx context.Context, name string) error {
 	// A fresh context, because the usual reason a launch failed is that the
 	// caller's was cancelled — and asking a cancelled context to clean up
 	// guarantees the cleanup fails too.
@@ -272,54 +312,62 @@ func (r *Runner) destroyStray(ctx context.Context, name string) {
 
 	inst, found, err := r.provider.Find(ctx, name)
 	if err != nil {
-		r.log.Error("could not tell whether a failed launch left an instance behind",
-			"name", name, "error", err)
-
-		return
+		return fmt.Errorf("could not tell whether a failed launch left %s behind: %w", name, err)
 	}
 
 	if !found {
-		return
+		return nil
 	}
 
 	r.log.Warn("a failed launch had in fact started something; removing it",
 		"name", name, "instance", inst.ID)
 
 	if err := r.provider.Destroy(ctx, inst.ID); err != nil {
-		r.log.Error("could not remove the instance a failed launch left behind",
-			"name", name, "instance", inst.ID, "error", err)
+		return fmt.Errorf("could not remove %s, which a failed launch had started: %w", name, err)
 	}
+
+	return nil
 }
 
-// Recover destroys everything this node is running, because nothing here is
-// ours yet. Called once at startup, before any listener opens a session.
+// Recover decides what to do with compute an earlier run left behind, once, at
+// startup and before any listener opens a session.
 //
-// The predicate is NOT "does a lease still want this". An open lease says the
-// job was wanted; it does not say the process that has just started can manage
-// the container. It cannot: the maps that map a request id to an instance, and a
-// lease to its heartbeat, are in memory, and this process has empty ones. A
-// container spared here would run with nothing to heartbeat its lease, nothing
-// to notice its completion, and nothing to destroy it afterwards — the lease
-// would expire, the reaper would hand its capacity back, and the container would
-// keep running forever on capacity billet had already re-sold.
+// IT DOES NOT DESTROY EVERYTHING, and the previous version's argument for doing
+// so was wrong on a point of fact. I claimed a killed job would simply be
+// requeued by GitHub. The scale-set documentation says reassignment happens when
+// a job is assigned to a scale set "but not acquired by a runner in time" — it
+// says nothing about a job a runner has already started, and there is no
+// evidence GitHub transparently retries that. Force-killing a container running
+// a twenty-minute job is therefore a deliberate job failure, not a recovery, and
+// the fact that a graceful shutdown also kills jobs does not make doing it after
+// an unrelated controller crash acceptable.
 //
-// So a restart is destructive, and the honest description of the cost is that a
-// job which might have finished is killed and GitHub requeues it. That is what
-// already happens on a graceful shutdown, so it is not a new behaviour — only a
-// crash now behaves like a stop instead of leaking.
+// So a surviving container whose lease is still open is ADOPTED. Billet cannot
+// manage it — the request-id mapping and completion handling died with the last
+// process — but the runner inside is talking to GitHub on its own and may well
+// finish. What billet can do is keep the lease alive so the capacity is not
+// resold underneath it, and clean up once it stops. That is what custody is.
 //
-// The alternative is adoption: reconstructing request-id ownership, heartbeat
-// responsibility, session semantics and completion teardown for compute this
-// process never started. That is a real feature, not a branch in this function,
-// and it is worth building only once the node runs in its own process — at which
-// point a server restart MUST not destroy a live node's work.
+// A container whose lease is NOT open is a genuine orphan: nothing is waiting
+// for its result and its capacity has already gone back to the budget. Those are
+// destroyed here rather than left for the first sweep, because until they are
+// gone the host is over-committed by exactly their size.
 func (r *Runner) Recover(ctx context.Context) error {
 	instances, err := r.provider.List(ctx)
 	if err != nil {
 		return fmt.Errorf("node: list what is already running: %w", err)
 	}
 
-	var failed int
+	if len(instances) == 0 {
+		return nil
+	}
+
+	open, err := r.alloc.LaunchedLeaseIDs(ctx, r.node)
+	if err != nil {
+		return fmt.Errorf("node: list leases still open on %s: %w", r.node, err)
+	}
+
+	var adopted, failed int
 
 	for _, inst := range instances {
 		leaseID, ours := provider.LeaseOf(inst.Name)
@@ -336,8 +384,28 @@ func (r *Runner) Recover(ctx context.Context) error {
 			continue
 		}
 
-		r.log.Warn("destroying an instance left by an earlier run; this process cannot manage it",
-			"name", inst.Name, "instance", inst.ID, "lease", leaseID)
+		if open[leaseID] && inst.Running {
+			lease, err := r.alloc.Lease(ctx, leaseID)
+			if err != nil {
+				// The lease went terminal between the two reads. It is an orphan
+				// after all, and the destroy below is the right answer.
+				r.log.Warn("a surviving instance's lease disappeared while adopting it",
+					"name", inst.Name, "lease", leaseID, "error", err)
+			} else {
+				r.adopt(leaseID, inst, lease.Epoch)
+
+				adopted++
+
+				r.log.Info("adopted a running job from an earlier run; it will be left to "+
+					"finish and its capacity stays held",
+					"name", inst.Name, "instance", inst.ID, "lease", leaseID)
+
+				continue
+			}
+		}
+
+		r.log.Warn("destroying an instance nothing is waiting for",
+			"name", inst.Name, "instance", inst.ID, "lease", leaseID, "running", inst.Running)
 
 		if err := r.provider.Destroy(ctx, inst.ID); err != nil {
 			failed++
@@ -348,10 +416,6 @@ func (r *Runner) Recover(ctx context.Context) error {
 			continue
 		}
 
-		// The lease goes with it. Waiting for the reaper would hold its vCPU and
-		// memory for a full lease TTL after the compute they were paying for is
-		// already gone, which is a self-inflicted capacity shortfall on every
-		// restart.
 		if err := r.releaseOrphanedLease(ctx, leaseID); err != nil {
 			r.log.Warn("destroyed an instance but could not release its lease",
 				"lease", leaseID, "error", err)
@@ -365,9 +429,8 @@ func (r *Runner) Recover(ctx context.Context) error {
 		return fmt.Errorf("node: %d instance(s) left by an earlier run could not be destroyed", failed)
 	}
 
-	if len(instances) > 0 {
-		r.log.Info("removed instances left behind by an earlier run", "count", len(instances))
-	}
+	r.log.Info("reconciled compute left by an earlier run",
+		"found", len(instances), "adopted", adopted)
 
 	return nil
 }
@@ -402,6 +465,12 @@ func (r *Runner) Sweep(ctx context.Context) error {
 		return fmt.Errorf("node: list leases still open on %s: %w", r.node, err)
 	}
 
+	// Anything in custody is Tend's business, not the sweep's. Both would
+	// otherwise act on the same instance in the same tick — the sweep destroying
+	// an adopted container the moment its lease went terminal, before Tend had
+	// the chance to release the capacity in the right order.
+	held := r.heldLeases()
+
 	var orphans, failed int
 
 	for _, inst := range instances {
@@ -413,7 +482,7 @@ func (r *Runner) Sweep(ctx context.Context) error {
 			continue
 		}
 
-		if open[leaseID] {
+		if open[leaseID] || held[leaseID] {
 			continue
 		}
 

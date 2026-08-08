@@ -36,6 +36,10 @@ type Provisioner interface {
 // Server is billet's control plane: one listener per tier, one shared capacity
 // budget between them.
 type Server struct {
+	// warnNoSweeper makes the missing-capability warning appear once rather than
+	// on every tick, which would bury it.
+	warnNoSweeper sync.Once
+
 	alloc *alloc.Allocator
 	prov  Provisioner
 	tiers []config.Tier
@@ -289,7 +293,29 @@ func (s *Server) reapPeriodically(ctx context.Context) {
 func (s *Server) sweep(ctx context.Context) {
 	sweeper, ok := s.runner.(Sweeper)
 	if !ok {
+		// SAID OUT LOUD, once per tick's worth of surprise. A runner that cannot
+		// enumerate its compute has no orphan protection at all: after a reap frees
+		// capacity, whatever was running under that lease stays running while
+		// replacement work is admitted against the same vCPU. That is a real
+		// degradation and it must not be inferable only from a missing log line.
+		s.warnNoSweeper.Do(func() {
+			s.log.Warn("the attached runner cannot enumerate its compute, so billet " +
+				"cannot detect or remove instances whose lease is gone; a crash or a " +
+				"failed cleanup will over-commit this host until it is restarted")
+		})
+
 		return
+	}
+
+	// TENDED BEFORE SWEEPING. Tend is what keeps a held lease alive and what
+	// takes an adopted container out of custody when it finishes; sweeping first
+	// would judge those instances against a lease set Tend was about to change.
+	if err := sweeper.Tend(ctx); err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+
+		s.log.Warn("could not advance compute the runner is holding capacity for", "error", err)
 	}
 
 	if err := sweeper.Sweep(ctx); err != nil {

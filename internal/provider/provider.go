@@ -150,7 +150,8 @@ type Spec struct {
 	JITConfig string
 }
 
-// Instance is a launched instance.
+// Instance is a unit of compute the backend knows about. It may or may not
+// still be running — see Running.
 type Instance struct {
 	// ID is the backend's own handle — a container id, a microVM id, an EC2
 	// instance id. Opaque to everything above.
@@ -158,6 +159,15 @@ type Instance struct {
 	// Name echoes the spec, so a caller holding only an Instance can still say
 	// which runner it is.
 	Name string
+
+	// Running reports whether the instance is still executing.
+	//
+	// The difference between "this job is in progress" and "this job is over and
+	// the container is a corpse holding a name and a disk", which is exactly the
+	// question an adopted instance has to be asked repeatedly. A backend that
+	// cannot tell should report true: treating an unknown state as finished would
+	// destroy live work, and treating it as running only delays a cleanup.
+	Running bool
 }
 
 // InstanceName is billet's handle for the compute backing a lease.

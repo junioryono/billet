@@ -242,7 +242,7 @@ func TestListRefusesOutputItCannotRead(t *testing.T) {
 	t.Parallel()
 
 	p := New("test-deployment", WithBinary(stubPrinting(t,
-		"abc123\tbillet-one\nWARNING: some wrapper wrote this")))
+		"abc123\tbillet-one\trunning\nWARNING: some wrapper wrote this")))
 
 	if _, err := p.List(t.Context()); err == nil {
 		t.Fatal("a line with no tab was skipped silently; a missing container would look like an empty host")
@@ -253,7 +253,7 @@ func TestListReadsWellFormedOutput(t *testing.T) {
 	t.Parallel()
 
 	p := New("test-deployment", WithBinary(stubPrinting(t,
-		"abc123\tbillet-one\ndef456\tbillet-two")))
+		"abc123\tbillet-one\trunning\ndef456\tbillet-two\texited")))
 
 	got, err := p.List(t.Context())
 	if err != nil {
@@ -264,7 +264,30 @@ func TestListReadsWellFormedOutput(t *testing.T) {
 		t.Fatalf("read %d instances from two lines: %v", len(got), got)
 	}
 
-	if got[0].ID != "abc123" || got[0].Name != "billet-one" {
+	if got[0].ID != "abc123" || got[0].Name != "billet-one" || !got[0].Running {
 		t.Errorf("first instance parsed as %+v", got[0])
+	}
+
+	// The second is EXITED, and that distinction decides whether an adopted
+	// container is left to finish or cleaned up.
+	if got[1].Running {
+		t.Errorf("an exited container was reported as running: %+v", got[1])
+	}
+}
+
+// An extra column is refused, not absorbed into the name.
+//
+// strings.Cut proved a tab EXISTED; it did not prove there was only one, so a
+// wrapper printing a fourth field used to land inside the container name. A name
+// with a suffix still parses as billet's, so the lease lookup misses and the
+// periodic sweep destroys what it decides is an orphan — a live job.
+func TestListRefusesAnExtraColumn(t *testing.T) {
+	t.Parallel()
+
+	p := New("test-deployment", WithBinary(stubPrinting(t,
+		"abc123\tbillet-lease123\trunning\textra")))
+
+	if _, err := p.List(t.Context()); err == nil {
+		t.Fatal("an extra column was absorbed into the name, which mis-identifies the lease")
 	}
 }

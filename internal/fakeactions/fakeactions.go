@@ -95,7 +95,10 @@ func New(t *testing.T, handler http.HandlerFunc) *Server {
 				"expires_at": time.Now().Add(time.Hour).Format(time.RFC3339),
 			})
 
+		// 201 here too. Both token endpoints check for StatusCreated exactly, and
+		// a fake answering 200 produces an error that reads like billet's bug.
 		case strings.HasSuffix(r.URL.Path, "/actions/runners/registration-token"):
+			w.WriteHeader(http.StatusCreated)
 			WriteJSON(t, w, map[string]any{
 				"token":      "registration-token",
 				"expires_at": time.Now().Add(time.Hour).Format(time.RFC3339),
