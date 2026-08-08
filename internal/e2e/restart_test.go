@@ -230,9 +230,12 @@ func TestARedeliveredAssignmentDoesNotStartASecondRunner(t *testing.T) {
 	restarted.plane.queue(fakeactions.StatisticsJSON(0, 1),
 		fakeactions.JobJSON("JobAssigned", lease.RequestID, "push", testTier))
 
-	// Long enough that a second container would have appeared. There is no
-	// positive signal for "nothing happened".
-	time.Sleep(3 * time.Second)
+	// WAIT FOR THE ASSIGNMENT TO BE ACKNOWLEDGED, which is the only external
+	// signal that the listener actually handled it. The previous version slept
+	// three seconds and counted containers — so a listener that ignored Assigned
+	// entirely passed, since the adopted container was the only one either way.
+	// Message 2 is the JobAssigned.
+	awaitAck(t, restarted, 2)
 
 	live, err := restarted.provider.List(t.Context())
 	if err != nil {
@@ -251,16 +254,48 @@ func TestARedeliveredAssignmentDoesNotStartASecondRunner(t *testing.T) {
 		t.Fatalf("a redelivered assignment produced %d runners for one job: %v", running, live)
 	}
 
-	// And the capacity the listener took for the redelivery went back, rather
-	// than being stranded by a launch that refused.
+	// THE ADOPTED LEASE IS STILL THE ONE HOLDING THE JOB. If the refusal had
+	// released the wrong lease, this is where it shows.
+	if _, err := restarted.alloc.Lease(t.Context(), lease.ID); err != nil {
+		t.Fatalf("the adopted job's lease was released by the redelivery: %v", err)
+	}
+
+	// And the lease the listener took for the redelivery went back rather than
+	// being stranded by a launch that refused. Asserted as "the ledger holds no
+	// more than the adopted job plus the listener's escrow", which is what a
+	// leaked lease would exceed.
 	usage, err := restarted.alloc.Usage(t.Context())
 	if err != nil {
 		t.Fatalf("Usage: %v", err)
 	}
 
+	// One adopted job (2 vCPU) plus at most a full budget of escrow. A leak shows
+	// up as leases that no listener is holding and no job is running.
 	if usage.VCPU > 8 {
 		t.Errorf("the refused relaunch stranded capacity: %d vCPU held against a budget of 8",
 			usage.VCPU)
+	}
+}
+
+// awaitAck waits for billet to acknowledge a message, which it does only after
+// it has finished handling it.
+func awaitAck(t *testing.T, s *stack, messageID int64) {
+	t.Helper()
+
+	deadline := time.Now().Add(30 * time.Second)
+
+	for {
+		for _, got := range s.plane.ackedIDs() {
+			if got == messageID {
+				return
+			}
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatalf("billet never acknowledged message %d, so it never handled it", messageID)
+		}
+
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 

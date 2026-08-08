@@ -348,9 +348,22 @@ func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
 	// other half running while the listener, which treats this error as
 	// non-fatal, acknowledged the completion. Nothing ever came back for it.
 	//
-	// The errors are joined so the caller still learns that cleanup was
-	// incomplete; what it must not do is choose which half to abandon.
-	_, custodyErr := r.releaseRequest(ctx, requestID)
+	// THE CUSTODY FAILURE IS NOT RETURNED, and joining it was the mistake that
+	// replaced. The caller is a listener that reads any error as "the compute for
+	// MY lease may still exist" and therefore keeps its lease and heartbeats it —
+	// so a custody-only failure stranded a lease whose compute had just been
+	// destroyed successfully, permanently, until shutdown.
+	//
+	// Custody does not need the listener's help: its entry holds its own lease,
+	// which holds its own capacity, and Tend retries it every tick. What the
+	// listener needs to know is only whether ITS compute is gone. So the custody
+	// failure is logged here, where the context is, and the return value speaks
+	// for the running half alone.
+	if err := r.releaseRequest(ctx, requestID); err != nil {
+		r.log.Error("could not finish releasing compute billet was holding for a finished job; "+
+			"its lease still holds the capacity and the next sweep will retry",
+			"request", requestID, "error", err)
+	}
 
 	r.mu.Lock()
 	inst, ok := r.running[requestID]
@@ -359,21 +372,20 @@ func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
 	if !ok {
 		// Idempotent: a request nothing was started for is success, because this
 		// runs on redelivered completions, on shutdown, and after a failure.
-		return custodyErr
+		return nil
 	}
 
 	if err := r.provider.Destroy(ctx, inst.ID); err != nil {
 		// KEPT in the map. The instance may still be running, and forgetting it
 		// here is how it becomes an orphan nobody can find by request id.
-		return errors.Join(custodyErr,
-			fmt.Errorf("node: stop %s for request %d: %w", inst.Name, requestID, err))
+		return fmt.Errorf("node: stop %s for request %d: %w", inst.Name, requestID, err)
 	}
 
 	r.mu.Lock()
 	delete(r.running, requestID)
 	r.mu.Unlock()
 
-	return custodyErr
+	return nil
 }
 
 // destroyStray removes an instance a failed launch may have left behind.

@@ -53,7 +53,25 @@ type custody struct {
 
 	// discard is true when the instance must go as soon as it can be found, and
 	// false when it is running work that should be allowed to finish.
+	//
+	// It changes over an entry's life — a completion or a lost lease turns an
+	// adoption into a discard — so it says what to do NEXT, not where the entry
+	// came from.
 	discard bool
+
+	// observed is true once billet has actually seen this instance exist.
+	//
+	// SEPARATE FROM discard, and conflating the two was a bug. The grace period
+	// before an absence is believed exists for compute that may never have
+	// started: a create whose response was lost can still be in flight inside the
+	// daemon. It has nothing to say about an instance billet WATCHED running and
+	// then found gone — that one has genuinely finished, and making it wait out
+	// the grace held its capacity for a minute after its job was over.
+	//
+	// Because discard flips to true when a completion arrives, checking it alone
+	// applied the stray grace to every adopted job at exactly the moment it
+	// finished.
+	observed bool
 
 	// since is when custody was taken, for the diagnostic that matters most: how
 	// long capacity has been held for something nobody is watching.
@@ -72,7 +90,9 @@ func (r *Runner) adopt(lease *alloc.Lease, inst *provider.Instance) {
 		instance:  inst.ID,
 		requestID: lease.RequestID,
 		outcome:   alloc.PhaseDone,
-		since:     r.now(),
+		// Adoption starts from a container billet just watched running.
+		observed: true,
+		since:    r.now(),
 	}
 }
 
@@ -293,14 +313,19 @@ func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 		// appears. So a discarded entry has to keep looking for a while before an
 		// absence is believed.
 		//
-		// An adopted entry is different: its container was observed running, so an
-		// absence now means it genuinely went away.
-		if c.discard && r.now().Sub(c.since) < strayGrace {
+		// An entry billet has SEEN is different: its instance existed, so an
+		// absence now means it genuinely went away and the capacity can go back
+		// immediately.
+		if !c.observed && r.now().Sub(c.since) < strayGrace {
 			return nil
 		}
 
 		return r.finish(ctx, c)
 	}
+
+	// Seen it now, whatever it was before. A stray that has finally materialised
+	// is no longer a maybe, so a later absence needs no grace period.
+	c.observed = true
 
 	// An adopted instance that is still running is left alone. This is the case
 	// destructive recovery got wrong: the runner inside is talking to GitHub on
@@ -363,14 +388,18 @@ func (r *Runner) heldForRequest(requestID int64) (string, bool) {
 	return "", false
 }
 
-// releaseRequest ends the custody of a job GitHub has reported finished, if
-// this runner is holding one for it.
+// releaseRequest ends the custody of a job GitHub has reported finished, if this
+// runner is holding any for it.
+//
+// Reports only whether the transitions succeeded, not whether there was anything
+// to do: "custody handled this" had exactly one caller, and it stopped needing
+// the answer when a custody failure stopped being the listener's problem.
 //
 // The other half of the fix for adopted compute that hangs. The restarted
 // listener has no record of the request, so its own completion handling returns
 // without releasing anything; this is what connects the message to the container
 // a previous incarnation started.
-func (r *Runner) releaseRequest(ctx context.Context, requestID int64) (bool, error) {
+func (r *Runner) releaseRequest(ctx context.Context, requestID int64) error {
 	// HELD ACROSS THE WHOLE TRANSITION, not just the flag write. This runs on the
 	// listener's goroutine while the periodic tick runs on the reaper's, so
 	// releasing the lock before tendOne would let both act on the same entry —
@@ -399,7 +428,7 @@ func (r *Runner) releaseRequest(ctx context.Context, requestID int64) (bool, err
 	r.mu.Unlock()
 
 	if len(held) == 0 {
-		return false, nil
+		return nil
 	}
 
 	var failures []error
@@ -415,7 +444,7 @@ func (r *Runner) releaseRequest(ctx context.Context, requestID int64) (bool, err
 		}
 	}
 
-	return true, errors.Join(failures...)
+	return errors.Join(failures...)
 }
 
 func (r *Runner) custodySnapshot() []*custody {

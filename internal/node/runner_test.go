@@ -302,6 +302,10 @@ type fakeProvider struct {
 	// whose window is nanoseconds is one the detector reports only occasionally,
 	// which is the same as not testing it.
 	findDelay time.Duration
+
+	// enteredFind receives once per Find that has begun waiting, so a test can
+	// synchronise on the provider actually being busy instead of on a sleep.
+	enteredFind chan struct{}
 }
 
 func (f *fakeProvider) Kind() config.ProviderKind { return f.kind }
@@ -338,8 +342,26 @@ func (f *fakeProvider) Launch(_ context.Context, spec provider.Spec) (*provider.
 }
 
 func (f *fakeProvider) Find(ctx context.Context, name string) (*provider.Instance, bool, error) {
+	// Announced BEFORE the wait, so a test can synchronise on the provider being
+	// genuinely inside Find rather than sleeping and hoping the scheduler
+	// obliged.
+	if f.enteredFind != nil {
+		select {
+		case f.enteredFind <- struct{}{}:
+		default:
+		}
+	}
+
+	// CANCEL-AWARE. An unconditional Sleep left a goroutine parked for the full
+	// delay after the test ended — an hour, in the test that models a wedged
+	// daemon. Waiting on the context too means the delay ends when the caller
+	// does.
 	if f.findDelay > 0 {
-		time.Sleep(f.findDelay)
+		select {
+		case <-time.After(f.findDelay):
+		case <-ctx.Done():
+			return nil, false, ctx.Err()
+		}
 	}
 
 	// CONTEXT IS HONOURED, because a fake that ignores it cannot tell a caller

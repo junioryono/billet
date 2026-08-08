@@ -473,6 +473,12 @@ type brittleStore struct {
 	heartbeatErr error
 	leaseErr     error
 
+	// releaseErrFor fails ONE lease's release, which is what makes "the loop
+	// continues past a failure" testable. A store that fails every release cannot
+	// distinguish a loop that stopped early from one that ran to the end and had
+	// every entry fail.
+	releaseErrFor map[string]error
+
 	// heartbeats counts renewals, so a test can prove the keep-alive loop is
 	// actually doing its one job.
 	heartbeats atomic.Int64
@@ -489,6 +495,10 @@ func (b *brittleStore) Lease(ctx context.Context, leaseID string) (*alloc.Lease,
 func (b *brittleStore) Release(
 	ctx context.Context, leaseID string, epoch int64, outcome alloc.Phase,
 ) error {
+	if err, ok := b.releaseErrFor[leaseID]; ok {
+		return err
+	}
+
 	if b.releaseErr != nil {
 		return b.releaseErr
 	}
@@ -1091,7 +1101,12 @@ func TestKeepAliveRenewsHeldLeasesWhileTendIsBlocked(t *testing.T) {
 	// A provider that blocks for an hour inside Find, which is the situation that
 	// used to starve renewal: Tend calls Find, so anything sharing Tend's
 	// schedule stops for as long as the backend does.
-	p := &fakeProvider{kind: config.ProviderDocker, findDelay: time.Hour}
+	p := &fakeProvider{
+		kind:        config.ProviderDocker,
+		findDelay:   time.Hour,
+		enteredFind: make(chan struct{}, 1),
+	}
+
 	a, host := newAllocatorWithHost(t)
 
 	warm := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
@@ -1121,12 +1136,17 @@ func TestKeepAliveRenewsHeldLeasesWhileTendIsBlocked(t *testing.T) {
 		_ = r.Tend(ctx)
 	}()
 
-	// Counted from AFTER the blocked Tend has taken its own heartbeat, so the
-	// renewals below are the keep-alive's and nothing else's. (The first version
-	// of this test never started the keep-alive at all, and the single heartbeat
-	// it saw was Tend's — which is exactly the confusion the count is here to
-	// prevent.)
-	time.Sleep(50 * time.Millisecond)
+	// WAIT FOR TEND TO BE GENUINELY STUCK rather than sleeping and hoping. Once
+	// the provider says it is inside Find, Tend has already taken its own
+	// heartbeat and cannot take another — so every renewal counted below is the
+	// keep-alive's. (The first version of this test never started the keep-alive
+	// at all and the single heartbeat it saw was Tend's, which is exactly the
+	// confusion this synchronisation removes.)
+	select {
+	case <-p.enteredFind:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Tend never reached the provider")
+	}
 
 	before := store.heartbeats.Load()
 
@@ -1226,18 +1246,19 @@ func TestKeepAliveDoesNotActOnARenewalFailure(t *testing.T) {
 	}
 }
 
-// A custody error does not abandon the running instance.
+// A custody failure does not strand the listener's own lease.
 //
 // A completion for a request that has BOTH — which a redelivered assignment
-// after a crash produces — used to return on the first error, so the normal
-// running container was never destroyed. The listener treats that error as
-// non-fatal and acknowledges the message, and nothing ever comes back for the
-// abandoned half: its lease keeps being heartbeated and its container keeps
-// running.
+// after a crash produces — has to answer the listener's question, which is only
+// ever "is MY compute gone". The listener reads any error as "it may still
+// exist", so it keeps its lease and heartbeats it: returning a custody-only
+// failure stranded a lease whose compute had just been destroyed successfully,
+// permanently, until shutdown.
 //
-// Both are attempted; the errors are joined so the caller still learns cleanup
-// was incomplete. What it must not do is choose which half to leak.
-func TestACustodyErrorDoesNotAbandonTheRunningInstance(t *testing.T) {
+// Custody does not need the listener's help. Its entry holds its own lease,
+// which holds its own capacity, and Tend retries every tick. So the custody
+// failure is logged and the return value speaks for the running half alone.
+func TestACustodyFailureDoesNotStrandTheListenersLease(t *testing.T) {
 	t.Parallel()
 
 	p := &fakeProvider{kind: config.ProviderDocker}
@@ -1247,12 +1268,7 @@ func TestACustodyErrorDoesNotAbandonTheRunningInstance(t *testing.T) {
 	lease := assignedLease(t, a)
 
 	// THE LEASE'S OWN request id, not a constant. assignedLease writes its own
-	// value into the ledger, and recovery reads the request id back from THERE —
-	// so a test that launches under a different number files custody under one id
-	// and then asks about another, and Destroy correctly finds nothing. That is
-	// the same identity confusion this commit fixes in hold(), arriving from the
-	// other direction, and it is why this test was green for a while against a
-	// bug it was written to catch.
+	// value into the ledger, and recovery reads the request id back from THERE.
 	requestID := lease.RequestID
 
 	if err := warm.Launch(t.Context(), lease, Job{RequestID: requestID, Event: "push"}); err != nil {
@@ -1278,16 +1294,21 @@ func TestACustodyErrorDoesNotAbandonTheRunningInstance(t *testing.T) {
 	restarted.running[requestID] = running
 	restarted.mu.Unlock()
 
-	// The completion arrives. It is EXPECTED to report an error, because the
-	// custody half genuinely could not be released.
-	if err := restarted.Destroy(t.Context(), requestID); err == nil {
-		t.Fatal("reported success though the custody half could not be released")
+	// SUCCESS, because the listener's own compute is gone. Reporting the custody
+	// failure here is what made the listener keep a lease for a container that no
+	// longer existed.
+	if err := restarted.Destroy(t.Context(), requestID); err != nil {
+		t.Fatalf("a custody failure was reported to the listener, which will now keep "+
+			"heartbeating a lease whose compute is gone: %v", err)
 	}
 
-	// ...but the running half must be gone regardless.
 	if _, stillThere := p.live[running.Name]; stillThere {
-		t.Error("a custody error left the running container behind; the listener will " +
-			"acknowledge the completion and nothing will come back for it")
+		t.Error("the running container was left behind")
+	}
+
+	// And custody kept its own entry, so Tend will retry it.
+	if !restarted.heldLeases()[lease.ID] {
+		t.Error("custody dropped an entry whose release failed; nothing will retry it")
 	}
 }
 
@@ -1298,17 +1319,24 @@ func TestACustodyErrorDoesNotAbandonTheRunningInstance(t *testing.T) {
 // up after states that should not exist. Stopping at the first match would
 // destroy one container, acknowledge the completion, and leave the rest running
 // with nothing that will ever look for them again.
+//
+// THE FIRST ENTRY FAILS, deliberately. Giving every entry a clean path leaves a
+// regression that returns on the first error indistinguishable from correct
+// behaviour, which is what the previous version of this test did.
 func TestACompletionClearsEveryEntryForItsRequest(t *testing.T) {
 	t.Parallel()
 
 	p := &fakeProvider{kind: config.ProviderDocker}
 	a, host := newAllocatorWithHost(t)
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	store := &brittleStore{LeaseStore: a, releaseErrFor: map[string]error{}}
+	r := New(store, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
 
 	const requestID = 9090
 
 	// Two entries for one request, built directly: reaching this state through
 	// the normal path is exactly what the launch guard prevents.
+	var leases []*alloc.Lease
+
 	for range 2 {
 		lease := assignedLease(t, a)
 
@@ -1320,22 +1348,139 @@ func TestACompletionClearsEveryEntryForItsRequest(t *testing.T) {
 		lease.RequestID = requestID
 
 		r.adopt(lease, inst)
+
+		leases = append(leases, lease)
+	}
+
+	// Custody iterates a map, so which entry is "first" is not knowable — both
+	// are made to fail their release, then one is repaired, so whichever order
+	// the loop takes it must reach the repaired one.
+	for _, l := range leases {
+		store.releaseErrFor[l.ID] = errors.New("database is locked")
+	}
+
+	if err := r.releaseRequest(t.Context(), requestID); err == nil {
+		t.Fatal("reported success though both releases failed")
 	}
 
 	if len(r.heldLeases()) != 2 {
-		t.Fatalf("expected two custody entries, got %d", len(r.heldLeases()))
+		t.Fatalf("dropped custody of an entry whose release failed: %d held", len(r.heldLeases()))
 	}
 
-	if err := r.Destroy(t.Context(), requestID); err != nil {
-		t.Fatalf("Destroy: %v", err)
-	}
-
+	// Both containers were destroyed even though both releases failed — the
+	// destroy comes first, and a release failure keeps the entry for a retry
+	// rather than abandoning the compute.
 	if len(p.live) != 0 {
-		t.Fatalf("a completion left %d container(s) running: %v", len(p.live), p.live)
+		t.Fatalf("a release failure left containers running: %v", p.live)
 	}
 
-	if len(r.heldLeases()) != 0 {
-		t.Errorf("capacity is still held for %d entries after the job completed",
-			len(r.heldLeases()))
+	// Now ONE recovers. The loop must reach it whichever order it visits.
+	delete(store.releaseErrFor, leases[0].ID)
+
+	if err := r.releaseRequest(t.Context(), requestID); err == nil {
+		t.Fatal("reported success though one release still fails")
+	}
+
+	held := r.heldLeases()
+
+	if held[leases[0].ID] {
+		t.Error("the entry whose release succeeded was not removed; the loop stopped early")
+	}
+
+	if !held[leases[1].ID] {
+		t.Error("the entry whose release failed was dropped, so nothing will retry it")
+	}
+}
+
+// An adopted container that has VANISHED is released immediately, not after the
+// stray grace period.
+//
+// The grace exists for compute that may never have started — a create whose
+// response was lost can still be in flight inside the daemon. It has nothing to
+// say about an instance billet watched running and then found gone: that one has
+// genuinely finished, and making it wait held its capacity for a full minute
+// after its job was over.
+//
+// The distinction is `observed`, and conflating it with `discard` was a bug my
+// own test found: discard flips to true when a completion arrives, so checking
+// it alone applied the stray grace to every adopted job at exactly the moment it
+// finished.
+func TestAVanishedAdoptedContainerIsReleasedWithoutWaiting(t *testing.T) {
+	t.Parallel()
+
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+
+	warm := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	lease := assignedLease(t, a)
+
+	if err := warm.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	frozen := time.Now()
+
+	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r.now = func() time.Time { return frozen }
+
+	if err := r.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+
+	if !r.heldLeases()[lease.ID] {
+		t.Fatal("the running container was not adopted")
+	}
+
+	// It disappears — somebody ran `docker rm`, or the daemon restarted. The
+	// clock does NOT advance, so anything that waits for the grace period will
+	// still be holding when this checks.
+	delete(p.live, provider.InstanceName(lease.ID))
+
+	if err := r.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend: %v", err)
+	}
+
+	if r.heldLeases()[lease.ID] {
+		t.Error("held the capacity of a container billet had watched running and then " +
+			"found gone, waiting out a grace period meant for compute that may never " +
+			"have started")
+	}
+
+	if _, err := a.Lease(t.Context(), lease.ID); !errors.Is(err, alloc.ErrLeaseNotFound) {
+		t.Errorf("the vanished job's lease still holds capacity: %v", err)
+	}
+}
+
+// A DISCARDED entry billet has never seen still waits out the grace period.
+//
+// The other side of the same distinction: an absence here is a snapshot, not a
+// causal result, because the daemon may still be acting on a create whose
+// response was lost.
+func TestAnUnseenStrayStillWaits(t *testing.T) {
+	t.Parallel()
+
+	p := &fakeProvider{
+		kind:      config.ProviderDocker,
+		launchErr: errors.New("context deadline exceeded"),
+	}
+
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
+	frozen := time.Now()
+	r.now = func() time.Time { return frozen }
+
+	lease := assignedLease(t, a)
+
+	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err == nil {
+		t.Fatal("a launch that failed reported success")
+	}
+
+	if err := r.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend: %v", err)
+	}
+
+	if !r.heldLeases()[lease.ID] {
+		t.Error("released a stray billet has never seen, on a single negative observation")
 	}
 }

@@ -133,12 +133,20 @@ func TestTheKeepAliveGoroutineExitsWithTheControlPlane(t *testing.T) {
 	// the keep-alive itself, nothing here will, and the wait below times out.
 	done := make(chan error, 1)
 
-	// context.Background(), NOT t.Context(), and the linter is wrong to want the
-	// latter here. t.Context() is cancelled during test teardown, which would
+	// DERIVED FROM Background, NOT from t.Context(), and the linter is wrong to
+	// want the latter. t.Context() is cancelled during teardown, which would
 	// cancel the keep-alive for us — so the assertion below would pass whether or
 	// not Run cancels it, which is the vacuity this test exists to close.
-	//nolint:usetesting // a context the test never cancels is the whole point
-	go func() { done <- srv.Run(context.Background()) }()
+	//
+	// The cancel is deferred rather than absent, so a BROKEN implementation leaks
+	// its goroutine only until this test returns instead of until the process
+	// does. Deferring it does not weaken the assertion: it runs after the wait
+	// below has already succeeded or failed.
+	//nolint:usetesting // a context the test does not cancel until afterwards is the point
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	defer cancelRun()
+
+	go func() { done <- srv.Run(runCtx) }()
 
 	select {
 	case <-runner.keepAliveStarted:
