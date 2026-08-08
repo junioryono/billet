@@ -204,6 +204,25 @@ type NodeConfig struct {
 	StateDir string `yaml:"state_dir"`
 	// Firecracker is required when Provider is ProviderFirecracker.
 	Firecracker *FirecrackerConfig `yaml:"firecracker,omitempty"`
+
+	// MaxCustody bounds how long billet holds capacity for compute it cannot
+	// account for — a container adopted from a crashed run, or one an ambiguous
+	// launch may have left behind — before destroying it and reclaiming the
+	// capacity.
+	//
+	// EMPTY MEANS NO BOUND, and that is the right default rather than a cautious
+	// one. Elapsed time is not evidence that a job stopped making progress:
+	// billet imposes no job limit, and self-hosted runners are routinely
+	// configured past GitHub's six-hour default, so a bound picked by billet
+	// would kill legitimate long jobs for no reason visible in the logs. Killing
+	// live work should be authorised by a completion, an observed exit, or by an
+	// operator who knows their own longest job — which is what this is.
+	//
+	// Billet warns hourly about held capacity regardless, which is the signal
+	// that actually helps; this is a backstop for a runner that has wedged.
+	//
+	// A Go duration string: "24h", "90m".
+	MaxCustody string `yaml:"max_custody,omitempty"`
 }
 
 // ProviderKind names a compute backend.
@@ -388,6 +407,30 @@ func (c *Config) NodePolicyFor(name string) (NodePolicy, bool) {
 	}
 
 	return NodePolicy{Name: name}, false
+}
+
+// MaxCustodyDuration parses Node.MaxCustody, reporting zero when unset.
+//
+// Parsed on demand rather than at load time because the config type stays a
+// plain data shape — but validation calls it too, so a typo is reported when the
+// file is read rather than hours later when a container needs reclaiming.
+func (n *NodeConfig) MaxCustodyDuration() (time.Duration, error) {
+	if n == nil || strings.TrimSpace(n.MaxCustody) == "" {
+		return 0, nil
+	}
+
+	d, err := time.ParseDuration(strings.TrimSpace(n.MaxCustody))
+	if err != nil {
+		return 0, fmt.Errorf("node.max_custody: %q is not a duration like \"24h\": %w",
+			n.MaxCustody, err)
+	}
+
+	if d < 0 {
+		return 0, fmt.Errorf("node.max_custody: %q is negative; leave it unset for no bound",
+			n.MaxCustody)
+	}
+
+	return d, nil
 }
 
 // MacOSLimitForNode is the effective cap on concurrent macOS guests for a host.
@@ -786,6 +829,13 @@ func (c *Config) validateNode() []error {
 	var errs []error
 	if !c.Node.Provider.Valid() {
 		errs = append(errs, fmt.Errorf("node.provider %q is not one of %v", c.Node.Provider, allProviders))
+	}
+
+	// Parsed here so a typo is reported when the file is READ, rather than hours
+	// later when a wedged container needed reclaiming and the bound turned out to
+	// be unparseable.
+	if _, err := c.Node.MaxCustodyDuration(); err != nil {
+		errs = append(errs, err)
 	}
 	if err := ValidateNodeName("node.name", c.Node.Name); err != nil {
 		// Say where the name came from when billet supplied it. A hostname is not

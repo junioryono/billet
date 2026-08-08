@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -1230,5 +1231,70 @@ func TestNodePoliciesCarriesTheDeclaredPolicy(t *testing.T) {
 	p.GuestOS[0] = GuestWindows
 	if cfg.Nodes[0].GuestOS[0] == GuestWindows {
 		t.Error("NodePolicies() aliased the config's guest_os slice")
+	}
+}
+
+// node.max_custody is optional, and its absence means NO bound.
+//
+// The default matters more than the parsing. Elapsed time is not evidence that a
+// job stopped making progress — billet imposes no job limit and self-hosted
+// runners run past GitHub's six-hour default — so a bound billet picked would
+// kill legitimate long jobs for no reason visible in the logs.
+func TestMaxCustodyDefaultsToNoBound(t *testing.T) {
+	t.Parallel()
+
+	var n *NodeConfig
+
+	if d, err := n.MaxCustodyDuration(); err != nil || d != 0 {
+		t.Errorf("a nil node section gave (%v, %v), want (0, nil)", d, err)
+	}
+
+	empty := &NodeConfig{}
+
+	if d, err := empty.MaxCustodyDuration(); err != nil || d != 0 {
+		t.Errorf("an unset max_custody gave (%v, %v), want (0, nil)", d, err)
+	}
+
+	blank := &NodeConfig{MaxCustody: "   "}
+
+	if d, err := blank.MaxCustodyDuration(); err != nil || d != 0 {
+		t.Errorf("a whitespace max_custody gave (%v, %v), want (0, nil)", d, err)
+	}
+}
+
+func TestMaxCustodyParsesADuration(t *testing.T) {
+	t.Parallel()
+
+	n := &NodeConfig{MaxCustody: " 36h "}
+
+	d, err := n.MaxCustodyDuration()
+	if err != nil {
+		t.Fatalf("MaxCustodyDuration: %v", err)
+	}
+
+	if d != 36*time.Hour {
+		t.Errorf("parsed %v, want 36h", d)
+	}
+}
+
+// A value billet cannot read is refused when the FILE is read, not hours later
+// when a wedged container finally needed reclaiming.
+func TestMaxCustodyRefusesWhatItCannotRead(t *testing.T) {
+	t.Parallel()
+
+	for name, value := range map[string]string{
+		"not a duration": "tomorrow",
+		"bare number":    "24",
+		"negative":       "-1h",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			n := &NodeConfig{MaxCustody: value}
+
+			if _, err := n.MaxCustodyDuration(); err == nil {
+				t.Errorf("accepted max_custody %q", value)
+			}
+		})
 	}
 }

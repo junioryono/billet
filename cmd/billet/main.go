@@ -264,7 +264,15 @@ func runServer(ctx context.Context, cfg *config.Config, dryRun, dev bool) error 
 			return err
 		}
 
-		runner := node.New(allocator, cfg.Node.Name, wiring.JITSource{Client: client}, p, cfg.Tiers, slog.Default())
+		// Validation already parsed this, so it cannot fail here — but reading it
+		// through the same accessor keeps one definition of what the string means.
+		maxCustody, err := cfg.Node.MaxCustodyDuration()
+		if err != nil {
+			return err
+		}
+
+		runner := node.New(allocator, cfg.Node.Name, wiring.JITSource{Client: client}, p,
+			cfg.Tiers, slog.Default(), node.WithMaxCustody(maxCustody))
 
 		// CLEARED BEFORE A SINGLE JOB IS ADMITTED.
 		//
