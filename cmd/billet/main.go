@@ -196,6 +196,61 @@ func cmdServer(ctx context.Context, args []string) error {
 }
 
 // runServer starts the control plane and blocks until it is told to stop.
+// claimDeployment reads this installation's identity and takes the host-wide
+// lock on it, returning both.
+//
+// MUST BE CALLED BEFORE state.Open AND BEFORE newProvider. state.Open creates
+// files, runs integrity checks and applies migrations, so claiming afterwards
+// let a process that is about to be REFUSED first migrate the database it was
+// refused the right to use — start an old copied backup while the original is
+// live and the copy is silently upgraded on its way to the error. newProvider is
+// the other side of it: nothing may touch a container before the right to manage
+// containers under this identity is established.
+//
+// Split out of runServer to be testable. That covers the logic and NOT the call
+// site: deleting the call from runServer still leaves these tests green, and no
+// test in this repo would notice. Recorded rather than papered over.
+func claimDeployment(cfg *config.Config) (string, *state.DeploymentLock, error) {
+	deployment, err := state.DeploymentID(cfg.Server.StateDir)
+	if err != nil {
+		return "", nil, err
+	}
+
+	// The state directory's own lock guards a PATH, so a copied directory is a
+	// different inode and both copies lock happily — while both carry the same
+	// deployment identity and therefore manage the same containers against the
+	// same daemon. This lock is keyed by the identity, so the copy collides.
+	lock, err := state.LockDeployment(deployment, state.LockOptions{
+		Dir:              cfg.Server.LockDir,
+		AllowUnplaceable: cfg.Server.AllowUnlockedDeployment,
+	})
+	if err != nil {
+		return "", nil, err
+	}
+
+	if why := lock.Degraded(); why != "" {
+		// Reached only because the operator asked for it. Still said out loud every
+		// boot: billet is back to the directory lock alone, which is what it had
+		// before this existed and still lets two copies of a state directory run at
+		// once.
+		slog.Default().Warn("starting WITHOUT a host-wide deployment lock because "+
+			"allow_unlocked_deployment is set, so nothing stops a COPY of this state "+
+			"directory from running alongside it and managing the same containers",
+			"reason", why)
+
+		return deployment, lock, nil
+	}
+
+	// LOGGED SO A MISMATCH IS VISIBLE. The default location is per-user, so two
+	// billets that ought to collide can quietly pick different directories and
+	// both start. The path is the only evidence of which collision domain this
+	// process actually joined.
+	slog.Default().Info("holding the host-wide deployment lock",
+		"identity", deployment, "path", lock.Path())
+
+	return deployment, lock, nil
+}
+
 func runServer(ctx context.Context, cfg *config.Config, dryRun, dev bool) error {
 	// Built by the SHARED constructor, so the server and teardown authenticate
 	// identically. Two near-identical constructions is how one of them ends up
@@ -203,6 +258,32 @@ func runServer(ctx context.Context, cfg *config.Config, dryRun, dev bool) error 
 	client, err := newScaleSetClient(cfg)
 	if err != nil {
 		return err
+	}
+
+	// THE IDENTITY IS CLAIMED BEFORE THE DATABASE IS OPENED, and the ordering is
+	// the point rather than tidiness. state.Open creates files, runs integrity
+	// checks and applies migrations — so acquiring the lock afterwards let a
+	// process that is about to be REFUSED first migrate the database it was
+	// refused the right to use. Start an old copied backup while the original is
+	// live and the copy would be silently upgraded on its way to the error.
+	//
+	// Nothing here touches a container either: this runs before newProvider.
+	var deployment string
+
+	if dev {
+		var deploymentLock *state.DeploymentLock
+
+		deployment, deploymentLock, err = claimDeployment(cfg)
+		if err != nil {
+			return err
+		}
+
+		defer func() {
+			if err := deploymentLock.Release(); err != nil {
+				slog.Default().Warn("could not release the deployment lock; a restart may "+
+					"have to wait for the kernel to drop it", "error", err)
+			}
+		}()
 	}
 
 	db, err := state.Open(ctx, cfg.Server.StateDir)
@@ -247,39 +328,8 @@ func runServer(ctx context.Context, cfg *config.Config, dryRun, dev bool) error 
 	}
 
 	if dev {
-		deployment, err := state.DeploymentID(cfg.Server.StateDir)
-		if err != nil {
-			return err
-		}
-
-		// LOCKED HOST-WIDE, BEFORE ANYTHING TOUCHES A CONTAINER.
-		//
-		// The state directory's own lock guards a PATH, so a copied directory is a
-		// different inode and both copies lock happily — while both carry the same
-		// deployment identity and therefore manage the same containers against the
-		// same daemon. This lock is keyed by the identity, so the copy collides.
-		deploymentLock, err := state.LockDeployment(deployment)
-		if err != nil {
-			return err
-		}
-
-		defer func() {
-			if err := deploymentLock.Release(); err != nil {
-				slog.Default().Warn("could not release the deployment lock; a restart may "+
-					"have to wait for the kernel to drop it", "error", err)
-			}
-		}()
-
-		if why := deploymentLock.Degraded(); why != "" {
-			// Said out loud, WITH THE REASON, rather than inferred from silence.
-			// This host has no usable location for a host-wide lock, so billet is
-			// back to the directory lock alone — which is what it had before, and
-			// still lets two copies of a state directory run at once.
-			slog.Default().Warn("no host-wide lock could be taken for this deployment, so "+
-				"nothing stops a COPY of this state directory from running alongside it and "+
-				"managing the same containers", "reason", why)
-		}
-
+		// deployment and its host-wide lock were claimed above, before the database
+		// was opened.
 		p, err := newProvider(cfg, deployment)
 		if err != nil {
 			return err

@@ -187,6 +187,33 @@ type ServerConfig struct {
 	// with nothing to stop them.
 	MaxVCPU   int      `yaml:"max_vcpu"`
 	MaxMemory ByteSize `yaml:"max_memory"`
+	// LockDir is where the host-wide deployment lock is placed.
+	//
+	// THE LOCK'S SCOPE HAS TO MATCH THE DAEMON'S, and billet cannot derive that.
+	// The lock stops two processes carrying one deployment identity from managing
+	// the same containers, so every process that can reach the same container
+	// runtime must meet at the same directory. The default is per-user, which is
+	// right for the ordinary case and wrong for two: a system service and an
+	// operator sharing /var/run/docker.sock, and containers that share a socket
+	// while each has its own private filesystem. Both are invisible without this
+	// key — they simply do not collide.
+	//
+	// Point it at a path all of them can reach (a host /run/billet/locks
+	// bind-mounted into each container, say). It must NOT be world-writable: any
+	// local user could then hold the file and keep billet from ever starting.
+	LockDir string `yaml:"lock_dir,omitempty"`
+	// AllowUnlockedDeployment starts billet even when the host-wide lock cannot
+	// be placed.
+	//
+	// AN OPT-IN, BECAUSE AUTHORIZATION MUST NOT BE DERIVED FROM AN I/O FAILURE.
+	// This was originally the automatic behaviour: anything that stopped the lock
+	// being placed downgraded to a warning and billet started. That reasoning was
+	// backwards — it let a symlink loop, a permissions change, ENOLCK, descriptor
+	// exhaustion, or a service manager with no HOME each silently switch off the
+	// protection, and the operator's only evidence was a log line among many. An
+	// operator who knows their host has nowhere to put a lock can say so here;
+	// billet will not decide it on their behalf.
+	AllowUnlockedDeployment bool `yaml:"allow_unlocked_deployment,omitempty"`
 }
 
 // NodeConfig configures a compute host.

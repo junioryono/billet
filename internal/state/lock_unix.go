@@ -43,6 +43,15 @@ func lockDir(stateDir string) (*dirLock, error) {
 // mechanism at a path of its own — and having two flock implementations in one
 // package is how they come to disagree about whether a close releases.
 func lockFile(path string) (*dirLock, error) {
+	// gosec traces a path here from configuration (server.lock_dir) and from the
+	// deployment identity, and it is right that both reach this call. Both are
+	// accounted for: the directory is the operator's own choice, which is the
+	// point of the key — it exists so they can put the lock where every billet
+	// sharing a container runtime will meet — and the identity is checked against
+	// validDeploymentID immediately before it is interpolated, precisely so a
+	// separator cannot leave that directory.
+	//
+	//nolint:gosec // G703: both taint sources are validated or operator-supplied; see above.
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("open lock file %s: %w", path, err)

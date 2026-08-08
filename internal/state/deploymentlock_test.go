@@ -8,16 +8,20 @@ import (
 	"testing"
 )
 
-// useTempCache points the host-wide lock at a directory this test owns, so
-// tests do not fight each other or the developer's real cache.
+// useTempCache points the DEFAULT lock location at a directory this test owns,
+// so tests do not fight each other or the developer's real state directory.
+//
+// Deliberately exercising the default rather than passing LockOptions.Dir: the
+// default is what nearly every deployment uses, so a test suite that always
+// supplies an explicit directory would never notice the default breaking.
 func useTempCache(t *testing.T) {
 	t.Helper()
 
-	// XDG_CACHE_HOME on Linux, HOME on darwin — set both so the same test works
-	// on either.
+	// XDG_STATE_HOME is consulted first on every platform; HOME is the fallback
+	// both branches of defaultLockDir end at.
 	dir := t.TempDir()
 
-	t.Setenv("XDG_CACHE_HOME", dir)
+	t.Setenv("XDG_STATE_HOME", dir)
 	t.Setenv("HOME", dir)
 }
 
@@ -32,7 +36,7 @@ func TestASecondProcessWithTheSameIdentityIsRefused(t *testing.T) {
 
 	const id = "0123456789abcdef0123456789abcdef"
 
-	first, err := LockDeployment(id)
+	first, err := LockDeployment(id, LockOptions{})
 	if err != nil {
 		t.Fatalf("LockDeployment: %v", err)
 	}
@@ -43,7 +47,7 @@ func TestASecondProcessWithTheSameIdentityIsRefused(t *testing.T) {
 
 	releaseAtEnd(t, first)
 
-	_, err = LockDeployment(id)
+	_, err = LockDeployment(id, LockOptions{})
 	if !errors.Is(err, ErrDeploymentLocked) {
 		t.Fatalf("a second process took the same identity: %v", err)
 	}
@@ -59,14 +63,14 @@ func TestTheRefusalExplainsWhatToDo(t *testing.T) {
 
 	const id = "0123456789abcdef0123456789abcdef"
 
-	first, err := LockDeployment(id)
+	first, err := LockDeployment(id, LockOptions{})
 	if err != nil {
 		t.Fatalf("LockDeployment: %v", err)
 	}
 
 	releaseAtEnd(t, first)
 
-	_, err = LockDeployment(id)
+	_, err = LockDeployment(id, LockOptions{})
 	if err == nil {
 		t.Fatal("the second lock succeeded")
 	}
@@ -83,14 +87,14 @@ func TestTheRefusalExplainsWhatToDo(t *testing.T) {
 func TestTwoDeploymentsCoexist(t *testing.T) {
 	useTempCache(t)
 
-	a, err := LockDeployment("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	a, err := LockDeployment("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", LockOptions{})
 	if err != nil {
 		t.Fatalf("LockDeployment: %v", err)
 	}
 
 	releaseAtEnd(t, a)
 
-	b, err := LockDeployment("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+	b, err := LockDeployment("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", LockOptions{})
 	if err != nil {
 		t.Fatalf("a second, different deployment was refused: %v", err)
 	}
@@ -105,7 +109,7 @@ func TestReleasingFreesTheIdentity(t *testing.T) {
 
 	const id = "0123456789abcdef0123456789abcdef"
 
-	first, err := LockDeployment(id)
+	first, err := LockDeployment(id, LockOptions{})
 	if err != nil {
 		t.Fatalf("LockDeployment: %v", err)
 	}
@@ -114,7 +118,7 @@ func TestReleasingFreesTheIdentity(t *testing.T) {
 		t.Fatalf("Release: %v", err)
 	}
 
-	second, err := LockDeployment(id)
+	second, err := LockDeployment(id, LockOptions{})
 	if err != nil {
 		t.Fatalf("the identity stayed locked after release, so a restart would fail: %v", err)
 	}
@@ -127,7 +131,7 @@ func TestReleasingFreesTheIdentity(t *testing.T) {
 func TestTheLockFileIsPrivate(t *testing.T) {
 	useTempCache(t)
 
-	lock, err := LockDeployment("0123456789abcdef0123456789abcdef")
+	lock, err := LockDeployment("0123456789abcdef0123456789abcdef", LockOptions{})
 	if err != nil {
 		t.Fatalf("LockDeployment: %v", err)
 	}
@@ -153,28 +157,57 @@ func TestTheLockFileIsPrivate(t *testing.T) {
 	}
 }
 
-// A DEGRADED lock is safe to use and says why it is not a lock.
-//
-// The downgrade is deliberate: a host with no usable cache directory is a
-// legitimate single deployment far more often than it is two, and refusing to
-// boot there would trade a hazard nobody has hit for an outage everybody would.
-// What it must not do is look like a held lock — the caller has to be able to
-// tell an operator that a protection is absent, and with a reason.
-func TestADegradedLockSaysWhy(t *testing.T) {
-	// A cache directory that cannot be created, because its parent is a FILE.
-	dir := t.TempDir()
-	blocker := filepath.Join(dir, "notadir")
+// unplaceableLock makes the lock impossible to place, by giving the location a
+// parent that is a FILE.
+func unplaceableLock(t *testing.T) {
+	t.Helper()
+
+	blocker := filepath.Join(t.TempDir(), "notadir")
 
 	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 
-	t.Setenv("XDG_CACHE_HOME", blocker)
+	t.Setenv("XDG_STATE_HOME", blocker)
 	t.Setenv("HOME", blocker)
+}
 
-	lock, err := LockDeployment("0123456789abcdef0123456789abcdef")
+// A LOCK THAT CANNOT BE PLACED IS AN ERROR, and it did not used to be.
+//
+// The original reasoning: a host with nowhere to put a lock is far more often
+// one deployment than two, so refusing to boot trades a rare hazard for a common
+// outage. Defensible as a conclusion and wrong as a mechanism — it DERIVED
+// AUTHORIZATION FROM AN I/O FAILURE. A permissions change, a symlink loop,
+// ENOLCK, descriptor exhaustion, or a service manager providing no HOME all
+// reach this line, and every one of them is a misconfiguration that from in here
+// looks exactly like the benign case.
+func TestALockThatCannotBePlacedRefusesToStart(t *testing.T) {
+	unplaceableLock(t)
+
+	lock, err := LockDeployment("0123456789abcdef0123456789abcdef", LockOptions{})
+	if err == nil {
+		t.Fatalf("billet started without the protection and without being asked to; "+
+			"lock=%q degraded=%q", lock.Path(), lock.Degraded())
+	}
+
+	// The operator has to be able to act on it, which means naming both knobs.
+	for _, want := range []string{"lock_dir", "allow_unlocked_deployment"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not mention %q: %v", want, err)
+		}
+	}
+}
+
+// The operator CAN ask for it, and then it is a degraded lock that says why.
+//
+// What it must never do is look like a held lock: the caller has to be able to
+// tell an operator that a protection is absent, and with a reason.
+func TestAnOperatorCanOptOutOfTheLock(t *testing.T) {
+	unplaceableLock(t)
+
+	lock, err := LockDeployment("0123456789abcdef0123456789abcdef", LockOptions{AllowUnplaceable: true})
 	if err != nil {
-		t.Fatalf("a host that cannot place a lock should degrade, not fail: %v", err)
+		t.Fatalf("the opt-out did not take effect: %v", err)
 	}
 
 	if lock.Degraded() == "" {
@@ -189,6 +222,103 @@ func TestADegradedLockSaysWhy(t *testing.T) {
 	if err := lock.Release(); err != nil {
 		t.Errorf("releasing a degraded lock: %v", err)
 	}
+}
+
+// AN EXPLICIT DIRECTORY IS WHAT MAKES THE LOCK MEAN ANYTHING ACROSS USERS.
+//
+// The default location is per-user, so a system service and an operator sharing
+// one docker socket — or two containers sharing a socket with private
+// filesystems — get different directories and never collide, while their
+// containers do. server.lock_dir is the only way to put them in one collision
+// domain, so it has to actually win over the default.
+func TestAnExplicitDirectoryPutsBothProcessesInOneCollisionDomain(t *testing.T) {
+	shared := t.TempDir()
+
+	const id = "0123456789abcdef0123456789abcdef"
+
+	// Two DIFFERENT per-user defaults, standing in for two users.
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+
+	first, err := LockDeployment(id, LockOptions{Dir: shared})
+	if err != nil {
+		t.Fatalf("LockDeployment: %v", err)
+	}
+
+	releaseAtEnd(t, first)
+
+	if got := filepath.Dir(first.Path()); got != shared {
+		t.Fatalf("the explicit directory was ignored: locked in %q, want %q", got, shared)
+	}
+
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+
+	if _, err := LockDeployment(id, LockOptions{Dir: shared}); !errors.Is(err, ErrDeploymentLocked) {
+		t.Fatalf("two processes sharing a lock directory did not collide: %v", err)
+	}
+}
+
+// THE DEFAULT IS NOT THE CACHE DIRECTORY, and that is a correctness requirement
+// rather than a preference.
+//
+// A cache directory's contract is that anything in it may be deleted at any time
+// — by a cleaner, a packager, or a user reclaiming disk. Unlinking a held lock
+// file does not release the flock, but it does detach the PATH from the locked
+// inode, so the next process creates a fresh file there, locks that, and both
+// run. The one property a lock file needs is the one a cache directory
+// explicitly refuses to give.
+func TestTheDefaultLockLocationIsNotDisposable(t *testing.T) {
+	cache := t.TempDir()
+
+	t.Setenv("XDG_CACHE_HOME", cache)
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+
+	lock, err := LockDeployment("0123456789abcdef0123456789abcdef", LockOptions{})
+	if err != nil {
+		t.Fatalf("LockDeployment: %v", err)
+	}
+
+	releaseAtEnd(t, lock)
+
+	if strings.HasPrefix(lock.Path(), cache) {
+		t.Fatalf("the lock is in the cache directory (%q), whose contents may be deleted "+
+			"at any time — and deleting it while held lets a second billet start", lock.Path())
+	}
+}
+
+// The unlink hazard itself, demonstrated rather than argued.
+//
+// THIS IS NOT FIXED BY THE CODE, and the test says so on purpose. Path-based
+// flock cannot survive its path being unlinked: the holder keeps a lock on an
+// inode nobody can name, and the newcomer's own consistency check passes because
+// it created the file it just locked. There is no in-process guard that helps —
+// which is precisely why the LOCATION had to change. This test exists so the
+// claim stays honest if someone later proposes an inode check as the fix.
+func TestUnlinkingTheLockFileDefeatsItRegardlessOfAnyCheck(t *testing.T) {
+	dir := t.TempDir()
+
+	const id = "0123456789abcdef0123456789abcdef"
+
+	first, err := LockDeployment(id, LockOptions{Dir: dir})
+	if err != nil {
+		t.Fatalf("LockDeployment: %v", err)
+	}
+
+	releaseAtEnd(t, first)
+
+	if err := os.Remove(first.Path()); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+
+	second, err := LockDeployment(id, LockOptions{Dir: dir})
+	if err != nil {
+		t.Fatalf("unexpected: the lock survived its file being deleted (%v). If this now "+
+			"passes, the defence changed and the comment above is stale", err)
+	}
+
+	releaseAtEnd(t, second)
 }
 
 // A nil lock is safe too, since a caller that failed to obtain one may still
@@ -215,7 +345,7 @@ func TestANilLockIsSafeToUse(t *testing.T) {
 func TestAnEmptyIdentityIsRefused(t *testing.T) {
 	t.Parallel()
 
-	if _, err := LockDeployment(""); err == nil {
+	if _, err := LockDeployment("", LockOptions{}); err == nil {
 		t.Fatal("locked an empty identity, which would collide with every other empty one")
 	}
 }
@@ -298,14 +428,14 @@ func TestACopiedStateDirectoryCannotRunAlongsideTheOriginal(t *testing.T) {
 	}
 
 	// The identity lock is what stops them.
-	first, err := LockDeployment(id)
+	first, err := LockDeployment(id, LockOptions{})
 	if err != nil {
 		t.Fatalf("LockDeployment: %v", err)
 	}
 
 	releaseAtEnd(t, first)
 
-	if _, err := LockDeployment(copiedID); !errors.Is(err, ErrDeploymentLocked) {
+	if _, err := LockDeployment(copiedID, LockOptions{}); !errors.Is(err, ErrDeploymentLocked) {
 		t.Fatalf("the copy started alongside the original: %v", err)
 	}
 }
@@ -333,7 +463,7 @@ func TestAnIdentityThatEscapesTheLockDirectoryIsRefused(t *testing.T) {
 		t.Run(id, func(t *testing.T) {
 			useTempCache(t)
 
-			lock, err := LockDeployment(id)
+			lock, err := LockDeployment(id, LockOptions{})
 			if err == nil {
 				releaseAtEnd(t, lock)
 
