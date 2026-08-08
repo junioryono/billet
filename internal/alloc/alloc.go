@@ -325,20 +325,19 @@ func New(db *state.DB, limits Limits, tiers []config.Tier, opts ...Option) (*All
 			return nil, fmt.Errorf("alloc: tier %q has memory %s; headroom divides by it", t.Label, t.Memory)
 		case t.MaxConcurrent < 0:
 			return nil, fmt.Errorf("alloc: tier %q has negative max_concurrent %d", t.Label, t.MaxConcurrent)
-		case len(t.AcceptableProviders()) == 0:
-			// A tier with no backend makes every lease unplaceable, and the failure
-			// would surface at bind time as something that reads like a host
-			// problem.
-			return nil, fmt.Errorf(
-				"alloc: tier %q names no provider; its leases could not be placed", t.Label)
+		// THE SAME RULES config.Load APPLIES, because this constructor is
+		// documented as unable to assume its catalogue came through Load — a
+		// caller can build tiers in code, and this one was accepting tiers that
+		// package refuses. The macOS case is not a tidiness issue: placement only
+		// tests list membership, so a `[tart, ec2]` macOS tier would have bound a
+		// macOS lease to an EC2 node, which is the Apple-hardware invariant gone.
+		case len(t.ProviderErrors(fmt.Sprintf("tier %q", t.Label))) > 0:
+			return nil, fmt.Errorf("alloc: %w",
+				errors.Join(t.ProviderErrors(fmt.Sprintf("tier %q", t.Label))...))
 
-		case !validProviders(t):
-			// A NONBLANK invalid provider is worse than a missing one, because it
-			// compares unequal to every registered backend and so strands the lease
-			// at bind time with a confusing message. Refused here instead.
-			return nil, fmt.Errorf(
-				"alloc: tier %q lists provider %q, which is not a known backend; its leases "+
-					"could not be placed", t.Label, firstInvalidProvider(t))
+		case len(t.GuestOSProviderErrors(fmt.Sprintf("tier %q", t.Label))) > 0:
+			return nil, fmt.Errorf("alloc: %w",
+				errors.Join(t.GuestOSProviderErrors(fmt.Sprintf("tier %q", t.Label))...))
 		case !t.GuestOS.Valid():
 			// Same reasoning from the other side: an unknown guest OS matches no
 			// allowlist, so it either strands the lease or reads as a value some
@@ -489,6 +488,13 @@ func encodeProviders(ps []config.ProviderKind) string {
 }
 
 // decodeProviders reads a preference list back, preserving order.
+//
+// FAILS CLOSED on anything it does not fully understand, returning nil so the
+// caller's empty-list check refuses the placement. Dropping the bad entries and
+// keeping the rest was fail-OPEN: a stored value of "bogus,docker" still
+// authorized a docker node, which means a corrupted or truncated placement fact
+// silently became a narrower but still-valid one. An empty element is the same
+// story — ",docker," is not a list billet wrote.
 func decodeProviders(s string) []config.ProviderKind {
 	if s == "" {
 		return nil
@@ -498,26 +504,15 @@ func decodeProviders(s string) []config.ProviderKind {
 	out := make([]config.ProviderKind, 0, len(parts))
 
 	for _, p := range parts {
-		if p != "" {
-			out = append(out, config.ProviderKind(p))
+		kind := config.ProviderKind(p)
+		if !kind.Valid() {
+			return nil
 		}
+
+		out = append(out, kind)
 	}
 
 	return out
-}
-
-func validProviders(t *config.Tier) bool {
-	return firstInvalidProvider(t) == ""
-}
-
-func firstInvalidProvider(t *config.Tier) config.ProviderKind {
-	for _, p := range t.AcceptableProviders() {
-		if !p.Valid() {
-			return p
-		}
-	}
-
-	return ""
 }
 
 // checkPlacement reports whether a lease may run on a node, under the policy in
@@ -991,6 +986,48 @@ func (a *Allocator) RegisterNode(ctx context.Context, name string, kind config.P
 
 	return a.db.Tx(ctx, func(tx *sql.Tx) error {
 		now := ts(a.now().UTC())
+
+		// A HOST MAY NOT CHANGE ITS BACKEND WHILE IT IS RUNNING WORK.
+		//
+		// Re-registration used to overwrite the provider freely, which quietly
+		// falsified every lease already bound there: each one recorded the backend
+		// it chose at bind, and after the change the ledger said a job was running
+		// on firecracker while the host called itself docker. Later checks read
+		// the NODE's row, so they went on authorizing the lease — the fact that
+		// had become wrong was the one nothing re-read.
+		//
+		// Rewriting chosen_provider instead would be worse: it would relabel
+		// compute that is already running, making the record agree with the
+		// catalogue by lying about the past.
+		//
+		// So this is refused, and the operator's route is the honest one — drain
+		// the host, then re-register it. An unbound node changes freely.
+		var current string
+
+		switch err := tx.QueryRowContext(ctx,
+			`SELECT provider FROM nodes WHERE name = ?`, name).Scan(&current); {
+		case errors.Is(err, sql.ErrNoRows):
+			// First registration; nothing to contradict.
+		case err != nil:
+			return fmt.Errorf("alloc: read node %s: %w", name, err)
+
+		case current != string(kind):
+			var bound int
+
+			if err := tx.QueryRowContext(ctx,
+				`SELECT COUNT(*) FROM leases WHERE node = ? AND phase NOT IN ('done','failed')`,
+				name).Scan(&bound); err != nil {
+				return fmt.Errorf("alloc: count the leases on node %s: %w", name, err)
+			}
+
+			if bound > 0 {
+				return fmt.Errorf(
+					"%w: node %s is registered as %q and now reports %q, but %d lease(s) are "+
+						"still bound to it and recorded the old backend; drain the host before "+
+						"changing what it runs",
+					ErrWrongProvider, name, current, kind, bound)
+			}
+		}
 
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO nodes (name, provider, last_seen_at)

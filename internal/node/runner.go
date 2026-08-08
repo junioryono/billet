@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -192,16 +193,23 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job Job) error 
 		return fmt.Errorf("node: no tier named %q in the catalog", lease.Tier)
 	}
 
-	// ACCEPTS, not equals. A tier may list several backends so that one runs-on
-	// label can span a machine at home and a cloud, and comparing against the
-	// single `provider:` field would refuse every legitimate fallback — the field
-	// is empty whenever `providers:` was used.
-	if !tier.AcceptsProvider(r.provider.Kind()) {
-		// Placement should have caught this, so reaching it means the catalog and
+	// THE LEASE'S OWN LIST, NOT THE LIVE CATALOGUE.
+	//
+	// The ledger deliberately snapshots a tier's acceptable backends when the
+	// lease is reserved, so that editing the config under an in-flight lease
+	// cannot reclassify it. Checking the catalogue here contradicted that on both
+	// sides: remove a provider and the runner refuses a lease the ledger still
+	// permits, so the listener releases it and GitHub has to reassign; add one
+	// and the runner waves through a lease that Bind will refuse.
+	//
+	// Two authorities for one fact is the bug. The lease is the authority,
+	// because it is the thing that was actually placed.
+	if !slices.Contains(lease.Providers, r.provider.Kind()) {
+		// Placement should have caught this, so reaching it means the ledger and
 		// the host disagree. Refusing is the only safe answer: the alternative is
-		// running a job on a backend its tier was never sized or trusted for.
-		return fmt.Errorf("node: tier %s accepts %v but this host runs %q",
-			lease.Tier, tier.AcceptableProviders(), r.provider.Kind())
+		// running a job on a backend its lease was never sized or trusted for.
+		return fmt.Errorf("node: lease %s accepts %v but this host runs %q",
+			lease.ID, lease.Providers, r.provider.Kind())
 	}
 
 	// ASKED BEFORE ANYTHING IRREVERSIBLE HAPPENS.

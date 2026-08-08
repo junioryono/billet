@@ -562,19 +562,27 @@ func TestLeaseCapacityMustBePositive(t *testing.T) {
 	}
 }
 
-// A lease written before the provider split still places after the upgrade.
+// A lease written before the provider split is BACKFILLED correctly.
 //
-// THE UPGRADE PATH, and the only test that exercises it. Migration 9 splits
-// "which backends may this lease run on" from "which one is it on"; a row that
-// predates it carries a single provider, and the placement check fails CLOSED on
-// a lease whose acceptable backends it cannot read. Get the migration wrong and
-// every in-flight job at upgrade time becomes unplaceable — visible only as work
-// that stops moving.
+// THE UPGRADE PATH. Migration 9 splits "which backends may this lease run on"
+// from "which one is it on"; a row that predates it carries a single provider,
+// and the placement check fails CLOSED on a lease whose acceptable backends it
+// cannot read. Get the migration wrong and every in-flight job at upgrade time
+// becomes unplaceable — visible only as work that stops moving.
 //
 // Simulated by removing the new columns from a migrated database and replaying,
 // which is the closest thing to an old database this repository can construct:
 // the schema is defined in code, so there is no historical file to open.
-func TestMigrationCarriesASingleProviderForward(t *testing.T) {
+//
+// SCOPED TO THE COLUMNS, deliberately, and named for that. This package cannot
+// import internal/alloc — alloc depends on it — so proving the migrated rows
+// actually PLACE belongs in alloc's own suite, where TestAnUpgradedLeaseStillBinds
+// does it by binding one.
+//
+// A running-phase row whose node was deleted is covered too: the foreign key is
+// ON DELETE SET NULL, so it migrates with no chosen backend, and every path that
+// could double-place it refuses.
+func TestMigrationBackfillsASingleProvider(t *testing.T) {
 	dir := t.TempDir()
 
 	db, err := Open(t.Context(), dir)
@@ -592,20 +600,24 @@ func TestMigrationCarriesASingleProviderForward(t *testing.T) {
 		}
 
 		for _, row := range []struct {
-			id   string
-			node any
+			id    string
+			node  any
+			phase string
 		}{
-			{"unbound-lease", nil},
-			{"bound-lease", "epyc-1"},
+			{"unbound-lease", nil, "capacity"},
+			{"bound-lease", "epyc-1", "capacity"},
+			// The case the foreign key produces: a lease that WAS running when its
+			// node was deleted.
+			{"orphaned-running-lease", nil, "launching"},
 		} {
 			if _, err := tx.ExecContext(t.Context(),
 				`INSERT INTO leases
 				   (id, tier, node, macos_slot, guest_os, provider, providers, chosen_provider,
 				    phase, vcpu, memory, epoch, created_at, heartbeat_at, expires_at)
 				 VALUES (?, 'billet-8vcpu', ?, 0, 'linux', 'firecracker', '', '',
-				         'capacity', 8, 34359738368, 0, '2026-01-01T00:00:00Z',
+				         ?, 8, 34359738368, 0, '2026-01-01T00:00:00Z',
 				         '2026-01-01T00:00:00Z', '2026-01-01T00:01:00Z')`,
-				row.id, row.node); err != nil {
+				row.id, row.node, row.phase); err != nil {
 				return err
 			}
 		}
@@ -643,6 +655,12 @@ func TestMigrationCarriesASingleProviderForward(t *testing.T) {
 		providers string
 		chosen    string
 	}{
+		// A running lease whose node was deleted: ON DELETE SET NULL blanked the
+		// column, so it looks unbound and gets no chosen backend. Conservative and
+		// correct — Bind refuses it because its phase already requires placement,
+		// and Advance refuses because it names no node, so it cannot be adopted
+		// onto a second host. Release and Reap remain available.
+		{"orphaned-running-lease", "firecracker", ""},
 		// An unbound row has not chosen anything. Writing a choice for it would
 		// make the column mean "was reserved for" again, which is the exact
 		// conflation the migration exists to undo.

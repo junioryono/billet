@@ -1393,7 +1393,7 @@ func TestATierCannotSetBothProviderAndProviders(t *testing.T) {
 		GuestOS:   GuestLinux,
 	}
 
-	errs := tier.providerErrors("tiers[0]")
+	errs := tier.ProviderErrors("tiers[0]")
 	if len(errs) == 0 {
 		t.Fatal("accepted a tier that sets provider and providers")
 	}
@@ -1415,7 +1415,7 @@ func TestADuplicateProviderIsRefused(t *testing.T) {
 		Providers: []ProviderKind{ProviderEC2, ProviderEC2},
 	}
 
-	if errs := tier.providerErrors("tiers[0]"); len(errs) == 0 {
+	if errs := tier.ProviderErrors("tiers[0]"); len(errs) == 0 {
 		t.Fatal("accepted a tier listing the same provider twice")
 	}
 }
@@ -1423,7 +1423,7 @@ func TestADuplicateProviderIsRefused(t *testing.T) {
 func TestATierWithNoProviderIsRefused(t *testing.T) {
 	t.Parallel()
 
-	if errs := (Tier{Label: "billet-8vcpu"}).providerErrors("tiers[0]"); len(errs) == 0 {
+	if errs := (Tier{Label: "billet-8vcpu"}).ProviderErrors("tiers[0]"); len(errs) == 0 {
 		t.Fatal("accepted a tier that names no backend; its leases could never be placed")
 	}
 }
@@ -1498,5 +1498,42 @@ func TestATierWithProvidersDoesNotInheritTheLocalOne(t *testing.T) {
 	accepted := c.Tiers[0].AcceptableProviders()
 	if len(accepted) != 2 || accepted[0] != ProviderFirecracker {
 		t.Errorf("the tier's own list was altered by defaulting: %v", accepted)
+	}
+}
+
+// A PLURAL tier pinned to a host it can never bind to is refused at load.
+//
+// The check compared the singular `provider` field, which a tier written with
+// `providers:` leaves empty — so this config loaded perfectly cleanly and the
+// failure surfaced only at runtime, after capacity had been escrowed and a job
+// offered. The whole reason for a load-time guard is that the runtime symptom is
+// a job that queues forever.
+func TestAPluralTierPinnedToAWrongHostIsRefused(t *testing.T) {
+	t.Parallel()
+
+	c := &Config{
+		Nodes: []NodePolicy{{Name: "mac-mini-1", Provider: ProviderTart}},
+		Tiers: []Tier{{
+			Label:     "billet-8vcpu-ubuntu-2404",
+			Providers: []ProviderKind{ProviderFirecracker, ProviderEC2},
+			Node:      "mac-mini-1",
+			VCPU:      8,
+			Memory:    32 * GiB,
+			Image:     "ubuntu-2404-x64",
+			GuestOS:   GuestLinux,
+		}},
+	}
+
+	var found bool
+
+	for _, err := range c.validateGuestOSRules("tiers[0]", &c.Tiers[0]) {
+		if strings.Contains(err.Error(), "pinned to node") {
+			found = true
+		}
+	}
+
+	if !found {
+		t.Fatal("a tier that can never bind to the host it is pinned to loaded cleanly; " +
+			"its jobs would queue forever with no diagnostic")
 	}
 }

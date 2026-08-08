@@ -432,11 +432,17 @@ func (c *Config) NodePolicyFor(name string) (NodePolicy, bool) {
 	return NodePolicy{Name: name}, false
 }
 
-// providerErrors reports everything wrong with a tier's backend declaration.
+// ProviderErrors reports everything wrong with a tier's backend declaration.
 //
 // One function, because `provider:` and `providers:` are two spellings of the
 // same field and validating them separately is how they drift.
-func (t Tier) providerErrors(where string) []error {
+//
+// EXPORTED because alloc.New is documented as unable to assume its catalogue
+// came through Load — a caller can construct tiers directly — and it was
+// therefore accepting tiers this package refuses, including a macOS tier with a
+// non-Apple fallback. A rule that only one entry point enforces is a rule with a
+// second entry point that does not.
+func (t Tier) ProviderErrors(where string) []error {
 	var errs []error
 
 	// BOTH SPELLINGS IS AN ERROR, not a merge. Guessing which one an operator
@@ -473,6 +479,32 @@ func (t Tier) providerErrors(where string) []error {
 		}
 
 		seen[p] = struct{}{}
+	}
+
+	return errs
+}
+
+// GuestOSProviderErrors reports backends that cannot host a tier's guest OS.
+//
+// Split out from the fuller relational validation so alloc can apply the part
+// that is a SAFETY invariant rather than a configuration convenience. Apple's
+// licence permits macOS guests only on Apple hardware, and a catalogue built in
+// code was able to declare a macOS tier that falls back to EC2 — runtime
+// placement only tests list membership, so that lease would have bound to an EC2
+// node quite happily.
+func (t Tier) GuestOSProviderErrors(where string) []error {
+	var errs []error
+
+	for _, p := range t.AcceptableProviders() {
+		switch {
+		case t.GuestOS == GuestMacOS && p != ProviderTart:
+			errs = append(errs, fmt.Errorf(
+				"%s: guest_os macos requires the tart provider (Apple hardware), but this "+
+					"tier also accepts %q", where, p))
+
+		case t.GuestOS == GuestWindows && p == ProviderTart:
+			errs = append(errs, fmt.Errorf("%s: the tart provider cannot run Windows guests", where))
+		}
 	}
 
 	return errs
@@ -996,7 +1028,7 @@ func (c *Config) validateTiers() []error {
 		}
 		seen[t.Label] = struct{}{}
 
-		errs = append(errs, t.providerErrors(where)...)
+		errs = append(errs, t.ProviderErrors(where)...)
 		if !t.GuestOS.Valid() {
 			errs = append(errs, fmt.Errorf("%s: guest_os %q is not one of %v", where, t.GuestOS, allGuestOS))
 		}
@@ -1048,7 +1080,7 @@ func (c *Config) validateGuestOSRules(where string, t *Tier) []error {
 	// value: the value itself is already reported, and comparing a typo against
 	// an allowlist produces a second diagnostic describing the same mistake in
 	// terms that send the reader to the wrong field.
-	if !t.GuestOS.Valid() || len(t.providerErrors("")) > 0 {
+	if !t.GuestOS.Valid() || len(t.ProviderErrors("")) > 0 {
 		return errs
 	}
 
@@ -1066,13 +1098,18 @@ func (c *Config) validateGuestOSRules(where string, t *Tier) []error {
 			errs = append(errs, fmt.Errorf(
 				"%s: guest_os %s is not in node %q's guest_os allowlist %v",
 				where, t.GuestOS, t.Node, p.GuestOS))
-		case p.Provider != "" && t.Provider != "" && p.Provider != t.Provider:
+		// ACCEPTS, not equals. A tier written with `providers:` leaves the singular
+		// field empty, so comparing it let a plural tier pinned to a host it can
+		// never bind to load perfectly cleanly — the whole point of this check
+		// being that the failure would otherwise surface as a job that queues
+		// forever.
+		case p.Provider != "" && len(t.AcceptableProviders()) > 0 && !t.AcceptsProvider(p.Provider):
 			// A tier pinned to a host running a different backend loads cleanly
 			// and can never be placed: the host cannot run it. Silent at load
 			// time, this is a job that queues forever.
 			errs = append(errs, fmt.Errorf(
-				"%s: provider %s is pinned to node %q, which runs %s",
-				where, t.Provider, t.Node, p.Provider))
+				"%s: this tier accepts %v and is pinned to node %q, which runs %s",
+				where, t.AcceptableProviders(), t.Node, p.Provider))
 		}
 	} else {
 		// An UNPINNED tier may be placed on any host, so a restrictive allowlist
@@ -1100,7 +1137,11 @@ func (c *Config) validateGuestOSRules(where string, t *Tier) []error {
 				continue
 			}
 
-			if p.Provider == t.Provider && len(p.GuestOS) > 0 && !p.AllowsGuestOS(t.GuestOS) {
+			// Again ACCEPTS rather than equals: a plural tier that could land on
+			// this host is constrained by its allowlist, and comparing the empty
+			// singular field meant a list containing tart was never checked
+			// against a macOS-only Mac.
+			if t.AcceptsProvider(p.Provider) && len(p.GuestOS) > 0 && !p.AllowsGuestOS(t.GuestOS) {
 				errs = append(errs, fmt.Errorf(
 					"%s: guest_os %s is unpinned, but node %q runs the same provider and its "+
 						"guest_os allowlist %v excludes it; pin this tier to a host that permits "+
@@ -1120,13 +1161,7 @@ func (c *Config) validateGuestOSRules(where string, t *Tier) []error {
 		// that could fall back to EC2 is a tier that would run macOS somewhere
 		// Apple's licence does not permit — and the fallback is exactly the case
 		// nobody is watching when it happens.
-		for _, provider := range t.AcceptableProviders() {
-			if provider != ProviderTart {
-				errs = append(errs, fmt.Errorf(
-					"%s: guest_os macos requires the tart provider (Apple hardware), but this "+
-						"tier also accepts %q", where, provider))
-			}
-		}
+		errs = append(errs, t.GuestOSProviderErrors(where)...)
 		if t.Node == "" {
 			errs = append(errs, fmt.Errorf(
 				"%s: guest_os macos requires an explicit node, so the per-host licence limit can be enforced", where))
@@ -1158,9 +1193,7 @@ func (c *Config) validateGuestOSRules(where string, t *Tier) []error {
 				where, limit, c.macOSLimitReason(t.Node)))
 		}
 	case GuestWindows:
-		if t.AcceptsProvider(ProviderTart) {
-			errs = append(errs, fmt.Errorf("%s: the tart provider cannot run Windows guests", where))
-		}
+		errs = append(errs, t.GuestOSProviderErrors(where)...)
 	}
 	return errs
 }
