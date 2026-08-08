@@ -35,6 +35,7 @@ import (
 	"github.com/junioryono/billet/internal/scaleset"
 	"github.com/junioryono/billet/internal/server"
 	"github.com/junioryono/billet/internal/state"
+	"github.com/junioryono/billet/internal/wiring"
 )
 
 // plane is a scripted Actions service: it holds a queue of messages a test can
@@ -66,10 +67,15 @@ const (
 	testTier  = "billet-2vcpu-ubuntu-2404"
 	testGroup = "billet"
 
-	// busybox, not the runner image. The assertion is that billet starts and
-	// stops the right container, and a 2GB pull would turn this into a network
+	// Not the real runner image: the assertions are about billet starting and
+	// stopping the right container, and a 2GB pull would turn this into a network
 	// test that fails for reasons the code cannot cause.
-	testImage = "busybox:latest"
+	//
+	// It does have to STAY RUNNING, though, which busybox does not — its default
+	// command exits immediately, so recovery correctly treated every container as
+	// a finished job and destroyed it. A real runner occupies its container for
+	// the length of the job, and adoption is meaningless without that.
+	testImage = "nginx:alpine"
 )
 
 func newPlane(t *testing.T) *plane {
@@ -238,6 +244,13 @@ func (p *plane) acquiredIDs() []int64 {
 
 // stack is billet, assembled the way cmd/billet assembles it.
 type stack struct {
+	// dir is the state directory, so a restart can be built over it.
+	dir string
+
+	// closeDB releases the state lock, which the next incarnation needs before it
+	// can open the same directory. Idempotent — the cleanup calls it too.
+	closeDB func()
+
 	plane    *plane
 	alloc    *alloc.Allocator
 	runner   *node.Runner
@@ -249,11 +262,21 @@ type stack struct {
 func newStack(t *testing.T) *stack {
 	t.Helper()
 
+	return newStackIn(t, t.TempDir(), newPlane(t))
+}
+
+// newStackIn builds a stack over a GIVEN state directory and service.
+//
+// Restarting billet is exactly this: a new process over the same state and the
+// same deployment identity, with empty in-memory maps. A test that built a fresh
+// state directory instead would be testing a first run, which is the case where
+// there is nothing to recover.
+func newStackIn(t *testing.T, dir string, p *plane) *stack {
+	t.Helper()
+
 	if _, err := exec.LookPath("docker"); err != nil {
 		t.Skip("docker is not installed")
 	}
-
-	p := newPlane(t)
 
 	client, err := scaleset.New(scaleset.Config{
 		ConfigURL:      p.URL + "/acme",
@@ -265,14 +288,14 @@ func newStack(t *testing.T) *stack {
 		t.Fatalf("scaleset.New: %v", err)
 	}
 
-	dir := t.TempDir()
-
 	db, err := state.Open(t.Context(), dir)
 	if err != nil {
 		t.Fatalf("state.Open: %v", err)
 	}
 
-	t.Cleanup(func() { _ = db.Close() })
+	closeDB := sync.OnceFunc(func() { _ = db.Close() })
+
+	t.Cleanup(closeDB)
 
 	tiers := []config.Tier{{
 		Label:       testTier,
@@ -306,7 +329,9 @@ func newStack(t *testing.T) *stack {
 
 	prov := docker.New(deployment)
 
-	// Whatever this test leaves behind goes with it, even on a failure path.
+	// Whatever this test leaves behind goes with it, even on a failure path. Safe
+	// to register per incarnation: it runs after the test body, so nothing it
+	// destroys is still under assertion.
 	t.Cleanup(func() {
 		ctx := context.WithoutCancel(t.Context())
 
@@ -321,15 +346,18 @@ func newStack(t *testing.T) *stack {
 		}
 	})
 
-	runner := node.New(a, host, jitSource{client}, prov, tiers, testLogger(t))
+	runner := node.New(a, host, wiring.JITSource{Client: client}, prov, tiers, testLogger(t))
 
-	srv := server.New(a, provisioner{client}, tiers, "billet-test", testLogger(t),
+	srv := server.New(a, wiring.Provisioner{Client: client}, tiers, "billet-test", testLogger(t),
 		server.WithNodeRunner(runner),
 		// Fast, because the sweep rides this tick and a test that waits a minute
 		// for it is a test nobody runs.
 		server.WithReapInterval(200*time.Millisecond))
 
-	return &stack{plane: p, alloc: a, runner: runner, server: srv, provider: prov, node: host}
+	return &stack{
+		dir: dir, closeDB: closeDB, plane: p, alloc: a,
+		runner: runner, server: srv, provider: prov, node: host,
+	}
 }
 
 // run starts the control plane and returns a stop function.
@@ -416,44 +444,6 @@ func (s *stack) awaitContainer(t *testing.T, want int) []string {
 }
 
 // ------------------------------------------------------------- the adapters --
-
-// provisioner and jitSource mirror cmd/billet's adapters. They exist because
-// internal/scaleset returns its own types, and pointing the dependency the other
-// way would make the package whose job is to keep a preview API at arm's length
-// import the control plane.
-type provisioner struct{ c *scaleset.Client }
-
-func (p provisioner) EnsureScaleSet(
-	ctx context.Context, name, group string, labels []string,
-) (*server.ScaleSet, error) {
-	set, err := p.c.EnsureScaleSet(ctx, name, group, labels)
-	if err != nil {
-		return nil, err
-	}
-
-	return &server.ScaleSet{ID: set.ID, Group: set.Group}, nil
-}
-
-func (p provisioner) Session(ctx context.Context, id int, owner string) (server.Session, error) {
-	return p.c.Session(ctx, id, owner)
-}
-
-type jitSource struct{ c *scaleset.Client }
-
-func (j jitSource) Describe(ctx context.Context, tier, group string) (*node.Set, []string, error) {
-	set, labels, err := j.c.Describe(ctx, tier, group)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	return &node.Set{ID: set.ID, Name: set.Name}, labels, nil
-}
-
-func (j jitSource) JITConfig(
-	ctx context.Context, setID int, name, work string,
-) (node.Registration, error) {
-	return j.c.JITConfig(ctx, setID, name, work)
-}
 
 // testLogger writes the control plane's diagnostics into the test log, where
 // they appear only for a failing test. A discarded logger made the first

@@ -29,6 +29,7 @@ import (
 	"github.com/junioryono/billet/internal/scaleset"
 	"github.com/junioryono/billet/internal/server"
 	"github.com/junioryono/billet/internal/state"
+	"github.com/junioryono/billet/internal/wiring"
 )
 
 // errNotImplemented marks a role that is scaffolded but cannot serve yet.
@@ -263,7 +264,7 @@ func runServer(ctx context.Context, cfg *config.Config, dryRun, dev bool) error 
 			return err
 		}
 
-		runner := node.New(allocator, cfg.Node.Name, jitSource{c: client}, p, cfg.Tiers, slog.Default())
+		runner := node.New(allocator, cfg.Node.Name, wiring.JITSource{Client: client}, p, cfg.Tiers, slog.Default())
 
 		// CLEARED BEFORE A SINGLE JOB IS ADMITTED.
 		//
@@ -283,7 +284,7 @@ func runServer(ctx context.Context, cfg *config.Config, dryRun, dev bool) error 
 		opts = append(opts, server.WithNodeRunner(runner))
 	}
 
-	plane := server.New(allocator, &provisioner{client}, cfg.Tiers, owner, slog.Default(), opts...)
+	plane := server.New(allocator, wiring.Provisioner{Client: client}, cfg.Tiers, owner, slog.Default(), opts...)
 	if err := plane.Run(ctx); err != nil {
 		return err
 	}
@@ -322,45 +323,6 @@ func newProvider(cfg *config.Config, deployment string) (provider.Provider, erro
 	default:
 		return nil, fmt.Errorf("billet: unknown provider %q", cfg.Node.Provider)
 	}
-}
-
-// jitSource adapts the scale-set client to what the node package needs.
-//
-// The adapter exists so internal/node does not import the preview scale-set API
-// at all: the node's contract is "mint me a registration", and which vendor
-// answers that is not its business.
-type jitSource struct{ c *scaleset.Client }
-
-func (j jitSource) Describe(ctx context.Context, name, group string) (*node.Set, []string, error) {
-	set, labels, err := j.c.Describe(ctx, name, group)
-	if err != nil || set == nil {
-		return nil, labels, err
-	}
-
-	return &node.Set{ID: set.ID, Name: set.Name}, labels, nil
-}
-
-func (j jitSource) JITConfig(
-	ctx context.Context, scaleSetID int, runnerName, workFolder string,
-) (node.Registration, error) {
-	return j.c.JITConfig(ctx, scaleSetID, runnerName, workFolder)
-}
-
-type provisioner struct{ c *scaleset.Client }
-
-func (p *provisioner) EnsureScaleSet(
-	ctx context.Context, name, group string, labels []string,
-) (*server.ScaleSet, error) {
-	set, err := p.c.EnsureScaleSet(ctx, name, group, labels)
-	if err != nil {
-		return nil, err
-	}
-
-	return &server.ScaleSet{ID: set.ID, Name: set.Name, Group: set.Group}, nil
-}
-
-func (p *provisioner) Session(ctx context.Context, scaleSetID int, owner string) (server.Session, error) {
-	return p.c.Session(ctx, scaleSetID, owner)
 }
 
 func cmdNode(_ context.Context, args []string) error {
