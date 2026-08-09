@@ -577,6 +577,37 @@ has. Two consequences:
   `billet-abc` really does return `billet-abcdef`. `Find` compares exactly
   afterwards.
 
+### A node's identity is the name in its certificate, and its deployment is too
+
+The wire used to take both from the request — the node named itself in the path,
+and named its deployment in the registration body. Neither was verified, which is
+why it refused to serve anywhere but loopback.
+
+Now `internal/wirecert` mints one CA per deployment, held by the control plane,
+and `billet ca issue <node>` produces the bundle an operator copies to a host.
+Two rules follow, and both exist to keep ONE authority for one fact:
+
+- **The certificate's common name decides which node a request is from.** A path
+  that disagrees is refused, never reconciled. The check runs after routing (the
+  path variable does not exist until the mux has matched) and is applied in the
+  routing table itself, so a route added without it is visibly missing something.
+- **The certificate's organization decides which deployment the node belongs
+  to.** A node's state directory MINTS a random identity when it has none, which
+  is right for a control plane — where an installation begins — and wrong for a
+  node, which joins one. Before this, a freshly enrolled node invented an
+  identity and the control plane refused it forever; nothing an operator could
+  copy would have fixed it. `state.AdoptDeploymentID` writes the certificate's
+  answer down, and REFUSES rather than overwrites when the directory already
+  holds a different one, because the compute that directory is already managing
+  carries the old label.
+
+The server's own certificate is minted per boot and never stored: nothing
+verifies it except this CA, so persisting it would only add a file that expires,
+and its expiry would take the whole fleet offline at an hour nobody chose. The CA
+is the one thing that persists, and a CA directory holding only ONE of its two
+files is refused rather than repaired — minting a replacement is a new authority,
+and every node certificate ever issued stops verifying at once.
+
 ### Destruction is scoped by DEPLOYMENT identity, never by node name
 
 `state.DeploymentID`: random, minted once per state directory, `O_EXCL`, and the
@@ -806,6 +837,34 @@ testing is what found them, and it is not optional for anything load-bearing.
   nothing, reports "SURVIVED", and sends you off to write a test for behaviour
   that is already covered. Assert the substitution changed the file — `grep -c`
   the original text and expect zero — before believing the result.
+
+- **A test satisfied by "an error" cannot tell a refusal from a panic.** Deleting
+  the guard that checks a request carries a client certificate makes the code
+  after it dereference a nil `r.TLS` — the handler panics, the client sees an
+  error, and a test asserting `err != nil` passes. The mutation survived because
+  the assertion was too weak, not because the guard was covered. Assert the
+  SPECIFIC refusal: a sentinel error, or a status code.
+- **Every test dialling an `httptest` server shares an assumption no production
+  caller makes.** Its `URL` carries a scheme. `billet node` handed the client a
+  bare `host:port` from config and could not construct a single request, and the
+  whole suite was green — the one code path that builds a base URL from
+  configuration had no test at all.
+
+### Two things Go gets right and reviewers get wrong
+
+- **`url.Parse` accepts `"127.0.0.1:7717"`**, reading the host as a scheme. A
+  validation that only calls it therefore cannot fail on the input it exists to
+  reject. Check the parts you actually need — a scheme you recognise, a non-empty
+  `Host`.
+- **Deferred calls run last-in, first-out**, so
+
+  ```go
+  defer stopJanitor()   // runs SECOND
+  defer janitor.Wait()  // runs FIRST — waits for a goroutine nothing has stopped
+  ```
+
+  deadlocks on every exit path the parent context did not cause. Two defers whose
+  order matters belong in one defer, in the order written.
 
 ### The end-to-end suite
 
