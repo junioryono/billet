@@ -577,6 +577,57 @@ has. Two consequences:
   `billet-abc` really does return `billet-abcdef`. `Find` compares exactly
   afterwards.
 
+### A lease must be renewed by exactly one party, and there are three handovers
+
+Custody exists because a remote launch has three outcomes and one of them is
+UNKNOWN. Every defect in this area has been a moment where the count of parties
+renewing a lease was zero — never two, which is harmless, because `Heartbeat` is
+idempotent and a released lease answers `ErrLeaseNotFound`.
+
+The three moments, each of which cost a review round to find:
+
+- **While the provider is still working.** The plane gives up after the command
+  timeout and tells the listener the node has custody, so the listener stops. The
+  node is inside `provider.Launch` and adopts nothing until it returns. The node
+  now renews from the moment it commits to launching (`r.launching`), which is
+  the first instant either side can be sure something may exist.
+- **When the report arrives too late.** The plane records a TOMBSTONE for every
+  launch it abandons — on timeout and on re-registration — so a late success is
+  answered with "this lease is yours" instead of 204. Without the tombstone the
+  node files the instance in its ordinary running set, which nothing renews.
+- **When the result races the timeout.** Both select branches are live at once.
+  `settle` drains the result channel while holding the plane mutex, which is what
+  makes the answer exact: `Result` sends under the same lock, so the send has
+  either completed or not started.
+
+### A registration proves who you are; only a command proves what you may do
+
+The JIT endpoint required a registered node and nothing else, which made the
+README's containment claim false: a host holding a node certificate could mint
+runner registrations in a loop, for any scale set, under any name, and start
+runners billet never escrowed capacity for and never tears down.
+
+The entitlement was already in the request and unused. Billet's runner names
+carry the lease id (`provider.InstanceName`), so a node may mint exactly the
+registration for a launch command it currently holds. Apply the same shape to
+anything else the node can ask for: **authentication answers WHICH host, and the
+command table answers WHAT it was given.**
+
+### An empty CA directory is ambiguous, so something has to remember
+
+"No files" reads as day one, and day one mints a new authority that every issued
+bundle fails to verify against — the whole fleet drops off at once while the
+control plane looks healthy. A marker file written at creation is what makes a
+later absence mean *loss*; deleting it is how an operator starts over on purpose.
+
+Two more rules the same subsystem needs, both of which load cleanly when broken:
+a CA's subject must name THIS deployment (verifying against the CA is what
+decides who may connect, so somebody else's silently re-points that decision),
+and its key must be its certificate's key (unrelated halves sign leaves that fail
+days later on a node, in an error naming neither file). And a private key is
+refused unless the file itself is safe: creation's 0600 says nothing about what a
+backup restored.
+
 ### A node's identity is the name in its certificate, and its deployment is too
 
 The wire used to take both from the request — the node named itself in the path,
@@ -849,6 +900,16 @@ testing is what found them, and it is not optional for anything load-bearing.
   bare `host:port` from config and could not construct a single request, and the
   whole suite was green — the one code path that builds a base URL from
   configuration had no test at all.
+
+- **A wait that something else already satisfied is not a wait.** A test meant to
+  let the janitor renew once before changing the TTL waited for `heartbeats > 0`
+  — and `Recover` had already heartbeated while adopting, so it returned
+  instantly and the race it was added to remove was still there. Count from a
+  baseline taken before the thing under test exists.
+- **A fake that cannot be slow cannot model the bug.** The window where nobody
+  renews a lease only exists while a provider is working, so the fake provider
+  needs to block inside `Launch` and say when it has — a delay plus a channel,
+  never a sleep in the test.
 
 ### Two things Go gets right and reviewers get wrong
 
