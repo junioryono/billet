@@ -925,6 +925,57 @@ func TestAnUnreadableSharedDirectorySaysItNeedsRead(t *testing.T) {
 	}
 }
 
+// AND IT DOES NOT SAY THAT WHEN THE DIRECTORY IS FINE.
+//
+// EACCES arrives from anything in the path — an ancestor without search
+// permission, a MAC denial — and answering all of them with "set mode 2770"
+// sends an operator to change a mode that was never the problem.
+//
+// WHAT THIS PROVES IS THE END-TO-END PROPERTY, not the guard in openLockDir that
+// was written for it. Measured: with an unsearchable parent, MkdirAll fails
+// before openLockDir is ever called, so neutering that guard leaves this test
+// green. Both are kept deliberately — the guard still covers what MkdirAll
+// cannot (a permission change racing between the two calls, or a MAC policy that
+// permits mkdir and denies open), and this test still pins the property that
+// matters to an operator: whichever layer refuses, it must not blame a mode that
+// is already correct.
+func TestAnInaccessibleAncestorIsNotBlamedOnTheDirectoryMode(t *testing.T) {
+	t.Parallel()
+
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses directory permission checks, so this cannot be staged")
+	}
+
+	parent := t.TempDir()
+	dir := filepath.Join(parent, "locks")
+
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	t.Cleanup(func() {
+		// Restored, or t.TempDir cannot clean itself up.
+		if err := os.Chmod(parent, 0o700); err != nil {
+			t.Errorf("restore mode: %v", err)
+		}
+	})
+
+	// The DIRECTORY is perfectly readable; its parent is not searchable.
+	if err := os.Chmod(parent, 0o600); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+
+	_, err := LockDeployment("0123456789abcdef0123456789abcdef", LockOptions{Dir: dir})
+	if err == nil {
+		t.Fatal("billet reached a directory through an unsearchable parent")
+	}
+
+	if strings.Contains(err.Error(), "2770") {
+		t.Errorf("billet blamed the directory's own mode for a problem in its ancestry, "+
+			"sending the operator to change something that is already correct: %v", err)
+	}
+}
+
 // BILLET DOES NOT DISMANTLE A SHARE IT DID NOT MAKE.
 //
 // The default path is tightened to 0700 when it is loose, which is right for a

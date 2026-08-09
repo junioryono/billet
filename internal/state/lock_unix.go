@@ -93,10 +93,21 @@ func openLockDir(dir string) (*os.File, error) {
 	// the tightening path needs. That is platform-divergent handle juggling for an
 	// uncommon shape, so billet asks for the simpler contract and says so instead
 	// of failing with a bare EACCES.
+	// ONLY WHEN IT REALLY IS THIS DIRECTORY'S READ BIT. EACCES also comes from an
+	// ancestor without search permission, from a MAC denial, and from anything
+	// else in the path — and answering all of those with "set mode 2770" sends an
+	// operator to change a mode that was never the problem.
+	//
+	// os.Stat separates them, measured rather than assumed: an unreadable
+	// directory STATS FINE and fails to open, while a non-searchable ancestor
+	// fails both. So a successful stat alongside a refused open is the one case
+	// the advice fits.
 	if errors.Is(err, fs.ErrPermission) {
-		return nil, fmt.Errorf(
-			"%w — billet needs to READ this directory, not only write it, so a shared lock "+
-				"directory must be mode 2770 rather than 2730", err)
+		if _, statErr := os.Stat(dir); statErr == nil {
+			return nil, fmt.Errorf(
+				"%w — billet needs to READ this directory, not only write it, so a shared lock "+
+					"directory must be mode 2770 rather than 2730", err)
+		}
 	}
 
 	return nil, err
