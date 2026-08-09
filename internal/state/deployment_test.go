@@ -107,7 +107,7 @@ func TestAnEmptyDeploymentIDIsRefused(t *testing.T) {
 	// TestTheOwnerLabelMatchesWhatOperatorsAreTold. This assertion caught the
 	// first drift already: the message said "billet.deployment", which is not a
 	// label billet has ever written.
-	for _, want := range []string{"RESTORE", "backup", "sh.billet.owner"} {
+	for _, want := range []string{"RESTORE", "backup", "sh.billet.owner", "DISAGREE"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("the error does not mention %q, so it does not point at recovering the "+
 				"original identity before resetting it: %v", want, err)

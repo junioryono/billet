@@ -16,6 +16,28 @@ import (
 // database being rebuilt. Its lifetime is the state directory's.
 const deploymentIDFile = "deployment-id"
 
+// recoverIdentityAdvice is what an operator is told when the identity is gone or
+// unusable. One string, used by every branch that can say it.
+//
+// ONE COPY BECAUSE TWO DRIFTED. This started as duplicated prose on the empty
+// and invalid branches; a test pinned one of them, the other was free to lose
+// its guidance entirely, and an earlier version of both named a container label
+// that billet has never written.
+//
+// "COMPARE THE CANDIDATES" is not padding either. An operator who once followed
+// the older advice and reset the identity has containers under TWO ids, and
+// restoring an arbitrary one makes the other installation's live work invisible
+// — the same failure this text exists to prevent, reached by following it. The
+// only safe instruction is to reconcile the candidates and stop if they
+// disagree.
+const recoverIdentityAdvice = "RESTORE THE ORIGINAL IDENTITY if you can — from a backup, or from " +
+	"the sh.billet.owner label on containers this installation started. If the candidates " +
+	"DISAGREE, stop and work out which is current rather than picking one: an installation whose " +
+	"identity was reset in the past leaves containers under both, and restoring the wrong one " +
+	"hides live work. Deleting the file mints a NEW identity, and every container labelled with " +
+	"the old one becomes invisible to billet: its leases expire, its capacity is resold, and it " +
+	"runs forever. Only reset it once you have confirmed no compute is left under the old identity"
+
 // DeploymentID returns the stable identity of the billet installation rooted at
 // this state directory, creating it on first use.
 //
@@ -47,23 +69,11 @@ func DeploymentID(stateDir string) (string, error) {
 	if err == nil {
 		id := strings.TrimSpace(string(existing))
 		if id == "" {
-			return "", fmt.Errorf(
-				"state: %s is empty. RESTORE THE ORIGINAL IDENTITY if you can — from a backup, "+
-					"or from the sh.billet.owner label on any container this installation "+
-					"started. Deleting the file mints a NEW identity, and every container "+
-					"labelled with the old one becomes invisible to billet: its leases expire, "+
-					"its capacity is resold, and it runs forever. Only reset it once you have "+
-					"confirmed no compute is left under the old identity", path)
+			return "", fmt.Errorf("state: %s is empty. %s", path, recoverIdentityAdvice)
 		}
 
 		if err := validDeploymentID(id); err != nil {
-			return "", fmt.Errorf(
-				"state: %s: %w. RESTORE THE ORIGINAL IDENTITY if you can — from a backup, or "+
-					"from the sh.billet.owner label on any container this installation "+
-					"started. Deleting the file mints a NEW identity, and every container "+
-					"labelled with the old one becomes invisible to billet: its leases expire, "+
-					"its capacity is resold, and it runs forever. Only reset it once you have "+
-					"confirmed no compute is left under the old identity", path, err)
+			return "", fmt.Errorf("state: %s: %w. %s", path, err, recoverIdentityAdvice)
 		}
 
 		return id, nil

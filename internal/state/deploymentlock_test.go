@@ -81,6 +81,21 @@ func TestTheRefusalExplainsWhatToDo(t *testing.T) {
 			t.Errorf("the refusal does not mention %q: %v", want, err)
 		}
 	}
+
+	// THE FIX IT NAMES MUST BE THE SAFE ONE. This message used to say to give the
+	// copy its own identity "by deleting its deployment-id file" — which strands
+	// every container the original started, the exact failure the identity exists
+	// to prevent. Asserting only that "deployment-id" appears left that sentence
+	// free to come back, since the safe advice mentions the file too.
+	if !strings.Contains(err.Error(), "FRESH state directory") {
+		t.Errorf("the refusal does not point at a fresh state directory as the way to get a "+
+			"genuinely separate billet: %v", err)
+	}
+
+	if strings.Contains(err.Error(), "deleting its deployment-id") {
+		t.Errorf("the refusal tells the operator to delete the copy's identity, which strands "+
+			"every container the original started: %v", err)
+	}
 }
 
 // DIFFERENT identities do not collide. The lock is about one installation
@@ -542,6 +557,17 @@ func TestADeploymentIDFileBilletWouldNotHaveMintedIsRefused(t *testing.T) {
 			if !strings.Contains(err.Error(), deploymentIDFile) {
 				t.Errorf("the error does not name the file to fix: %v", err)
 			}
+
+			// AND CARRY THE RECOVERY GUIDANCE, which only the sibling empty-file
+			// branch was asserting. The two messages were separate prose; one was
+			// pinned and the other could have lost its guidance entirely, leaving an
+			// operator with a corrupt identity file and no hint that resetting it
+			// strands running compute. They are one constant now, and both branches
+			// are checked.
+			if !strings.Contains(err.Error(), recoverIdentityAdvice) {
+				t.Errorf("the error does not carry the recovery guidance, so an operator is left "+
+					"to guess that resetting the identity strands running containers: %v", err)
+			}
 		})
 	}
 }
@@ -930,6 +956,62 @@ func TestAnUnreadableSharedDirectoryStillWorks(t *testing.T) {
 	}
 
 	releaseAtEnd(t, lock)
+}
+
+// THE PERMISSION MESSAGE OFFERS EVERY CAUSE, not the one it guessed.
+//
+// Reached on billet's OWN directory, which is opened O_RDONLY because it may
+// have to be tightened — so unlike the operator's directory it cannot fall back
+// to a search-only handle, and this is where an unreadable directory still ends
+// the boot. The message used to assert a single cause and name 2770, which for a
+// PRIVATE directory is advice to widen group access that should not exist.
+//
+// Pinned because nothing else pins it: the ancestor test fails inside MkdirAll
+// before this line is reached, as its own comment says.
+func TestThePermissionMessageOffersEveryCause(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses directory permission checks, so this cannot be staged")
+	}
+
+	home := t.TempDir()
+
+	t.Setenv("XDG_STATE_HOME", home)
+	t.Setenv("HOME", home)
+
+	lock, err := LockDeployment("0123456789abcdef0123456789abcdef", LockOptions{})
+	if err != nil {
+		t.Fatalf("LockDeployment: %v", err)
+	}
+
+	dir := filepath.Dir(lock.Path())
+
+	if err := lock.Release(); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+
+	t.Cleanup(func() {
+		if err := os.Chmod(dir, 0o700); err != nil {
+			t.Errorf("restore mode: %v", err)
+		}
+	})
+
+	// Unreadable, but still creatable and statable, so MkdirAll succeeds and the
+	// open is what refuses.
+	if err := os.Chmod(dir, 0o300); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+
+	_, err = LockDeployment("0123456789abcdef0123456789abcdef", LockOptions{})
+	if err == nil {
+		t.Fatal("billet opened a directory it cannot read")
+	}
+
+	for _, want := range []string{"0700", "2770", "ACL"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the message does not offer %q as a possibility, so it asserts a cause "+
+				"it cannot know: %v", want, err)
+		}
+	}
 }
 
 // AND IT DOES NOT SAY THAT WHEN THE DIRECTORY IS FINE.

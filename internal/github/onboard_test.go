@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -17,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -211,20 +213,36 @@ type browser struct {
 	// authenticated poller as the only route to the installation.
 	skipSetupCallback bool
 	setupCallbacks    atomic.Int32
-	// getFailures counts requests that did not complete WHILE THE FLOW WAS STILL
-	// RUNNING. A silently-failing request is how the original version of this test
-	// passed without ever reaching /installed.
+	// getFailures counts requests that failed for a reason OTHER than the
+	// connection. A silently-failing request is how the original version of this
+	// test passed without ever reaching /installed — specifically a malformed URL,
+	// which fails while building or resolving the request.
 	//
-	// Scoped by flowDone because the unscoped version asserted something this
-	// file's own comment already called legitimate: the flow closes its listener
-	// when it finishes, so a request still in flight at that moment fails for a
-	// correct reason. That race fired twice — once on a loaded machine and once
-	// on an idle one — which makes it a flaky test rather than a finding.
-	// Counting only failures that PRECEDE completion keeps the property the
-	// assertion was written for (a request that silently fails mid-flow must not
-	// look like success) without asserting something that cannot hold.
+	// The unscoped counter asserted something this file's own comment already
+	// called legitimate: the flow closes its listener when it finishes, so a
+	// request still in flight then is refused correctly. That fired twice, once
+	// loaded and once idle. Classifying the error is what separates the two;
+	// gating on "has the flow returned yet" was the first attempt and was worse
+	// than the flake, because a genuinely malformed URL failing after the flow
+	// returned would have been discarded as well.
 	getFailures atomic.Int32
-	flowDone    atomic.Bool
+	// pending joins the fire-and-forget callback goroutine, so the assertions
+	// cannot read the counter while a request is still deciding its fate.
+	pending sync.WaitGroup
+}
+
+// isConnectionError reports whether a request failed at the socket rather than
+// at the URL — the flow closing its listener, not billet generating nonsense.
+func isConnectionError(err error) bool {
+	var opErr *net.OpError
+
+	return errors.As(err, &opErr) ||
+		errors.Is(err, syscall.ECONNREFUSED) ||
+		errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, io.EOF) ||
+		errors.Is(err, http.ErrServerClosed) ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded)
 }
 
 func (b *browser) open(ctx context.Context, target string) error {
@@ -249,7 +267,17 @@ func (b *browser) open(ctx context.Context, target string) error {
 
 		b.setupCallbacks.Add(1)
 
-		go b.get(ctx, installedURL)
+		// Tracked so the assertions can WAIT for it. Fire-and-forget left the
+		// counter being read while this request was still deciding whether it had
+		// failed, which is a race no atomic fixes: the value is correct and simply
+		// not there yet.
+		b.pending.Add(1)
+
+		go func() {
+			defer b.pending.Done()
+
+			b.get(ctx, installedURL)
+		}()
 
 		return nil
 	}
@@ -446,12 +474,18 @@ func (b *browser) get(ctx context.Context, target string) string {
 
 	resp, err := b.client.Do(req)
 	if err != nil {
-		// Counted rather than ignored. Swallowing this is precisely how the
-		// original test reported success while never reaching /installed. But
-		// only BEFORE the flow finishes: it closes its listener on the way out,
-		// so a request still in flight at that moment fails legitimately, and
-		// counting those made the assertion flaky rather than strict.
-		if !b.flowDone.Load() {
+		// COUNTED BY WHAT WENT WRONG, not by when. Swallowing this is precisely
+		// how the original test reported success while never reaching /installed;
+		// the defect it guards is a MALFORMED URL, which fails while building or
+		// resolving the request and never reaches a socket.
+		//
+		// A connection error is different in kind: the flow closes its listener
+		// as it finishes, so a request still in flight then is refused for a
+		// correct reason. Gating on a flowDone flag instead was the first attempt
+		// and it was worse than the flake it fixed — a genuinely malformed URL
+		// failing after the flow returned would have been discarded too, which is
+		// exactly the regression this counter exists to catch.
+		if !isConnectionError(err) {
 			b.getFailures.Add(1)
 		}
 
@@ -548,9 +582,9 @@ func TestOnboardEndToEnd(t *testing.T) {
 			return nil
 		},
 	})
-	// Set BEFORE the assertions and immediately after the flow returns: from here
-	// on, the listener is closed and a browser request failing is expected.
-	b.flowDone.Store(true)
+	// Joined before anything reads getFailures, so a callback still in flight has
+	// finished deciding whether it failed.
+	b.pending.Wait()
 
 	if err != nil {
 		t.Fatalf("Onboard: %v", err)

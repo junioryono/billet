@@ -91,12 +91,22 @@ func openLockDir(dir string, mayTighten bool) (*os.File, error) {
 	// 2730: write and traverse, no listing) works after all.
 	if !mayTighten {
 		if flag := searchOnlyFlag(); flag != 0 {
-			fd, err := unix.Open(dir, flag|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+			fd, err := searchOpen(dir, flag)
 			if err == nil {
 				return os.NewFile(uintptr(fd), dir), nil
 			}
-			// Falls through to O_RDONLY, which produces the better diagnosis
-			// below for the cases that are genuinely about permissions.
+
+			// FALLING BACK ONLY FOR "THIS PLATFORM CANNOT DO THAT". Swallowing
+			// every error made a wrong flag indistinguishable from a permissions
+			// problem: an EINVAL here would be retried as O_RDONLY, fail with
+			// EACCES on a 2730 directory, and be reported as the operator's
+			// permissions rather than as billet asking for something the kernel
+			// refused. Anything else is surfaced with its real cause.
+			if !errors.Is(err, unix.EINVAL) &&
+				!errors.Is(err, unix.ENOSYS) &&
+				!errors.Is(err, unix.EOPNOTSUPP) {
+				return nil, fmt.Errorf("open lock dir %s for search: %w", dir, err)
+			}
 		}
 	}
 
@@ -105,17 +115,6 @@ func openLockDir(dir string, mayTighten bool) (*os.File, error) {
 		return f, nil
 	}
 
-	// O_RDONLY NEEDS READ ON THE DIRECTORY, which openat of a known filename does
-	// not fundamentally require — search and write would do. So a shared directory
-	// provisioned 2730 (the classic drop-box shape: write and traverse, no
-	// listing) is refused even though every account could open the lock by name.
-	//
-	// Requiring read rather than working around it, deliberately. A search-only
-	// descriptor is O_PATH on Linux and neither O_PATH nor O_SEARCH on darwin —
-	// checked, not assumed — and an O_PATH descriptor cannot be fchmod'd, which
-	// the tightening path needs. That is platform-divergent handle juggling for an
-	// uncommon shape, so billet asks for the simpler contract and says so instead
-	// of failing with a bare EACCES.
 	// SUGGESTIONS, NOT A DIAGNOSIS. A successful stat proves the directory is
 	// reachable and its metadata readable; it does NOT prove why open was
 	// refused. The same EACCES comes from a private directory at 0300 (where the
@@ -138,6 +137,23 @@ func openLockDir(dir string, mayTighten bool) (*os.File, error) {
 	}
 
 	return nil, err
+}
+
+// searchOpen opens a directory search-only, retrying an interrupted call.
+//
+// EINTR is not a capability failure and must not be read as one: treating it as
+// "this platform cannot do that" would silently downgrade a perfectly capable
+// host to the read-requiring path on nothing more than a signal arriving at the
+// wrong moment.
+func searchOpen(dir string, flag int) (int, error) {
+	for {
+		fd, err := unix.Open(dir, flag|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if errors.Is(err, unix.EINTR) {
+			continue
+		}
+
+		return fd, err
+	}
 }
 
 // lockFileIn takes the lock relative to an already-resolved directory.
