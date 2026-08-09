@@ -75,16 +75,52 @@ built. What works **today**:
 | `billet check` | Validates the config, the App private key, and the state database |
 | `billet server --dry-run` | Connects to a real org, reconciles scale sets, polls — accepts nothing |
 | `billet server --dev` | Control plane + node in one process: acquires jobs and runs them in containers |
+| `billet node` | A separate compute host that dials the control plane and never listens |
+| `billet ca issue <node>` | Mints the certificate a node authenticates with, for an operator to copy |
 | `billet teardown` | Removes the scale sets billet created |
 | Capacity ledger | Lease state machine, fencing epochs, placement enforcement, escrow before advertising |
 | Docker provider | One container per job, JIT registration delivered off argv. **Trials only** — shares the host kernel, so it refuses anything not established as trusted |
 | Crash recovery | A job running when the controller dies is adopted and left to finish, not killed; its capacity stays held |
 | Multi-backend tiers | One label can name several providers and be placed on any of them. The preference ORDER is recorded but not yet acted on — see below |
 
-**Not built:** Firecracker, Apple Silicon and EC2 providers; the cache; sticky disks; the node split
-over mTLS; the scheduler that would make provider preference and a cost policy mean something;
-observability; the dashboard. Plain `billet server` (without `--dev`)
+**Not built:** Firecracker, Apple Silicon and EC2 providers; the cache; sticky disks; the scheduler
+that would make provider preference and a cost policy mean something; observability; the dashboard. Plain `billet server` (without `--dev`)
 exits non-zero rather than idling, so a half-built control plane is never mistaken for a running one.
+
+### Adding a second machine
+
+A control plane bound to a network address requires client certificates, and mints its own authority
+to issue them. There is no CA to run and nothing to install:
+
+```bash
+# on the control plane
+billet ca issue mac-mini-1          # writes ./mac-mini-1-billet-tls/
+scp -r mac-mini-1-billet-tls mac-mini-1:/etc/billet/tls
+
+# in that host's billet.yaml
+node:
+  name: mac-mini-1
+  server_addr: billet.example:7717
+  tls:
+    cert: /etc/billet/tls/node.crt
+    key:  /etc/billet/tls/node.key
+    ca:   /etc/billet/tls/ca.crt
+```
+
+The name in the certificate is the only thing that decides which node a request is from — a host
+holding this bundle can act as `mac-mini-1` and as nothing else. The certificate also carries which
+**deployment** it belongs to, so the copied bundle is all a fresh host needs; it does not invent an
+identity the control plane would refuse.
+
+Loopback stays plain HTTP, because there is nothing between the two processes to authenticate
+against. Anything else refuses to start without a certificate rather than serving unauthenticated on
+a network, which is the failure that looks like it works.
+
+Two things to know before relying on it. A node certificate lasts a year and its expiry takes that
+host out of the fleet with a handshake error, so the control plane warns for the last thirty days
+while the node is still working — re-issue on that warning, not on the outage. And there is no
+revocation: a compromised node means re-issuing the CA and every node certificate, which is a real
+cost and an honest one at this size.
 
 **Not yet run against a real organization.** The end-to-end path is exercised by a test suite that
 drives the real control plane and a real container runtime against a scripted stand-in for GitHub's

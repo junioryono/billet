@@ -8,7 +8,24 @@
 server:
   # Nodes dial the server; the server never dials out except to GitHub. On a
   # single box this stays on loopback, so billet exposes nothing to the network.
+  #
+  # ANY OTHER ADDRESS REQUIRES CLIENT CERTIFICATES, and billet mints them itself
+  # — there is no CA to run. The wire identifies a node by the name in its
+  # certificate, so without one the only identity available is the name a caller
+  # types into the URL, which anything on the network can type. Run
+  # `billet ca issue <node>` here and copy the bundle to that host.
   listen: 127.0.0.1:7717
+
+  # The names and addresses nodes will DIAL this control plane by. They become
+  # the subject names of the certificate it serves.
+  #
+  # Needed only when `listen` is a wildcard like 0.0.0.0:7717, which says which
+  # interfaces to accept on and says nothing about what a node types. A concrete
+  # listen address supplies itself.
+  #
+  # node_tls_hosts:
+  #   - billet.example
+  #   - 10.0.0.4
 
   # MUST be local storage. SQLite's WAL is not safe on NFS, and this directory
   # holds the capacity ledger.
@@ -46,6 +63,21 @@ node:
   server_addr: 127.0.0.1:7717
   provider: firecracker
   state_dir: /var/lib/billet/node
+
+  # The bundle `billet ca issue epyc-1` wrote on the control plane, copied here.
+  #
+  # REQUIRED TO DIAL ANYTHING BUT LOOPBACK. The name in this certificate is what
+  # the control plane authorises, so this host can act as the node it names and
+  # as nothing else. The certificate also carries which DEPLOYMENT it belongs to,
+  # so a fresh host needs nothing beyond these three files — it does not invent
+  # an identity the control plane would refuse.
+  #
+  # node.key is a private key: 0600, and it never leaves this machine.
+  #
+  # tls:
+  #   cert: /etc/billet/tls/node.crt
+  #   key: /etc/billet/tls/node.key
+  #   ca: /etc/billet/tls/ca.crt
 
   # How long billet may hold capacity for compute it cannot account for — a
   # container adopted from a crashed run, or one an ambiguous launch may have
