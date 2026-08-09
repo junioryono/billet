@@ -20,6 +20,27 @@ import (
 // not depend on the runtime it serves — the two are on opposite sides of a
 // process boundary and coupling them would defeat the point of having one. The
 // shapes match because both describe the same allocator.
+// JITSource mints runner registrations. Held by the control plane alone.
+//
+// The same shape internal/node.JITSource has, declared separately for the same
+// reason LeaseStore is: the transport must not depend on the runtime it serves.
+type JITSource interface {
+	Describe(ctx context.Context, name, group string) (*JITSet, []string, error)
+	JITConfig(ctx context.Context, scaleSetID int, runnerName, workFolder string) (JITRegistration, error)
+}
+
+// JITSet is a scale set, as the wire needs it.
+type JITSet struct {
+	ID   int
+	Name string
+}
+
+// JITRegistration is a minted registration whose config is a credential.
+type JITRegistration interface {
+	Config() string
+	RunnerName() string
+}
+
 type LeaseStore interface {
 	Bind(ctx context.Context, leaseID string, epoch int64, node string) error
 	Advance(ctx context.Context, leaseID string, epoch int64, to alloc.Phase) error
@@ -45,8 +66,8 @@ const maxBody = 1 << 20
 // see the guard in the command wiring — and why this comment is here rather than
 // in a design document: the next person to bind it to 0.0.0.0 should meet the
 // problem, not discover it.
-func Handler(log *slog.Logger, p *Plane, store LeaseStore) http.Handler {
-	h := &handler{log: log, plane: p, store: store}
+func Handler(log *slog.Logger, p *Plane, store LeaseStore, jit JITSource) http.Handler {
+	h := &handler{log: log, plane: p, store: store, jit: jit}
 
 	mux := http.NewServeMux()
 
@@ -59,6 +80,8 @@ func Handler(log *slog.Logger, p *Plane, store LeaseStore) http.Handler {
 	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/release", h.release)
 	mux.HandleFunc("GET /v1/nodes/{node}/leases/{lease}", h.lease)
 	mux.HandleFunc("GET /v1/nodes/{node}/launched", h.launched)
+	mux.HandleFunc("POST /v1/nodes/{node}/describe", h.describe)
+	mux.HandleFunc("POST /v1/nodes/{node}/jit", h.jitConfig)
 
 	return mux
 }
@@ -67,6 +90,7 @@ type handler struct {
 	log   *slog.Logger
 	plane *Plane
 	store LeaseStore
+	jit   JITSource
 }
 
 func (h *handler) register(w http.ResponseWriter, r *http.Request) {
@@ -267,6 +291,81 @@ func (h *handler) launched(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, nodeapi.LaunchedResponse{LeaseIDs: ids})
+}
+
+func (h *handler) describe(w http.ResponseWriter, r *http.Request) {
+	var req nodeapi.DescribeRequest
+	if !decode(w, r, &req) {
+		return
+	}
+
+	if err := h.requireRegistered(r.PathValue("node")); err != nil {
+		writeStoreErr(w, err)
+
+		return
+	}
+
+	if h.jit == nil {
+		writeErr(w, http.StatusServiceUnavailable, "",
+			"this control plane has no GitHub client, so it cannot describe scale sets")
+
+		return
+	}
+
+	set, names, err := h.jit.Describe(r.Context(), req.Name, req.Group)
+	if err != nil {
+		writeStoreErr(w, err)
+
+		return
+	}
+
+	res := nodeapi.DescribeResponse{Names: names}
+
+	// FOUND IS A FIELD BECAUSE ABSENCE IS NOT ID ZERO. A missing scale set and a
+	// scale set numbered nothing are different answers, and the runner stops on
+	// one and launches on the other.
+	if set != nil {
+		res.Found = true
+		res.ID = set.ID
+		res.Name = set.Name
+	}
+
+	writeJSON(w, http.StatusOK, res)
+}
+
+func (h *handler) jitConfig(w http.ResponseWriter, r *http.Request) {
+	var req nodeapi.JITRequest
+	if !decode(w, r, &req) {
+		return
+	}
+
+	if err := h.requireRegistered(r.PathValue("node")); err != nil {
+		writeStoreErr(w, err)
+
+		return
+	}
+
+	if h.jit == nil {
+		writeErr(w, http.StatusServiceUnavailable, "",
+			"this control plane has no GitHub client, so it cannot mint registrations")
+
+		return
+	}
+
+	reg, err := h.jit.JITConfig(r.Context(), req.ScaleSetID, req.RunnerName, req.WorkFolder)
+	if err != nil {
+		// NOT LOGGED WITH THE REQUEST. A failure to mint can carry the runner name
+		// and the scale set, which are harmless, but this path is one edit away
+		// from carrying the config itself into a log line that outlives the job.
+		writeStoreErr(w, err)
+
+		return
+	}
+
+	writeJSON(w, http.StatusOK, nodeapi.JITResponse{
+		Config:     reg.Config(),
+		RunnerName: reg.RunnerName(),
+	})
 }
 
 // requireRegistered refuses lease work from a node the plane does not know.

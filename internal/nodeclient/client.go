@@ -21,6 +21,7 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/node"
 	"github.com/junioryono/billet/internal/nodeapi"
 )
 
@@ -160,9 +161,9 @@ func (c *Client) Report(ctx context.Context, res nodeapi.CommandResult) error {
 }
 
 // Bind claims a lease for this node.
-func (c *Client) Bind(ctx context.Context, leaseID string, epoch int64, node string) error {
+func (c *Client) Bind(ctx context.Context, leaseID string, epoch int64, nodeName string) error {
 	return c.do(ctx, http.MethodPost, c.leasePath(leaseID, "/bind"),
-		nodeapi.BindRequest{Epoch: epoch, Node: node}, nil)
+		nodeapi.BindRequest{Epoch: epoch, Node: nodeName}, nil)
 }
 
 // Advance moves a lease to a new phase.
@@ -199,10 +200,10 @@ func (c *Client) Lease(ctx context.Context, leaseID string) (*alloc.Lease, error
 }
 
 // LaunchedLeaseIDs reports which leases this node is believed to have launched.
-func (c *Client) LaunchedLeaseIDs(ctx context.Context, node string) (map[string]bool, error) {
+func (c *Client) LaunchedLeaseIDs(ctx context.Context, nodeName string) (map[string]bool, error) {
 	var res nodeapi.LaunchedResponse
 
-	if err := c.do(ctx, http.MethodGet, "/v1/nodes/"+url.PathEscape(node)+"/launched", nil, &res); err != nil {
+	if err := c.do(ctx, http.MethodGet, "/v1/nodes/"+url.PathEscape(nodeName)+"/launched", nil, &res); err != nil {
 		return nil, err
 	}
 
@@ -211,6 +212,73 @@ func (c *Client) LaunchedLeaseIDs(ctx context.Context, node string) (map[string]
 	}
 
 	return res.LeaseIDs, nil
+}
+
+// Describe finds a tier's scale set, via the control plane.
+//
+// The node cannot ask GitHub itself: it holds no App key, by design. See the JIT
+// half of internal/nodeapi for why that is a security property rather than an
+// inconvenience.
+func (c *Client) Describe(ctx context.Context, name, group string) (*node.Set, []string, error) {
+	var res nodeapi.DescribeResponse
+
+	err := c.do(ctx, http.MethodPost, c.nodePath("/describe"),
+		nodeapi.DescribeRequest{Name: name, Group: group}, &res)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if !res.Found {
+		// A NIL SET IS THE CONTRACT for "there is no such scale set", and the
+		// runner treats it as a reason to stop. Returning a zero-valued set would
+		// have it launch against scale set 0.
+		return nil, res.Names, nil
+	}
+
+	return &node.Set{ID: res.ID, Name: res.Name}, res.Names, nil
+}
+
+// JITConfig asks the control plane to mint one runner registration.
+func (c *Client) JITConfig(
+	ctx context.Context, scaleSetID int, runnerName, workFolder string,
+) (node.Registration, error) {
+	var res nodeapi.JITResponse
+
+	err := c.do(ctx, http.MethodPost, c.nodePath("/jit"), nodeapi.JITRequest{
+		ScaleSetID: scaleSetID,
+		RunnerName: runnerName,
+		WorkFolder: workFolder,
+	}, &res)
+	if err != nil {
+		return nil, err
+	}
+
+	if res.Config == "" {
+		return nil, fmt.Errorf(
+			"nodeclient: the control plane returned an empty registration for %q, which would "+
+				"start an instance that can never register", runnerName)
+	}
+
+	return &registration{config: res.Config, name: res.RunnerName}, nil
+}
+
+// registration is a minted registration whose config is a CREDENTIAL.
+//
+// The field is unexported and reachable only through Config(), so printing the
+// value with %v or %+v yields a struct with no visible secret. That is a small
+// thing until somebody logs the registration while debugging a launch, which is
+// exactly when it would happen.
+type registration struct {
+	config string
+	name   string
+}
+
+func (r *registration) Config() string     { return r.config }
+func (r *registration) RunnerName() string { return r.name }
+
+// String keeps the credential out of anything that formats this value.
+func (r *registration) String() string {
+	return "nodeclient.registration{runner:" + r.name + ", config:REDACTED}"
 }
 
 func (c *Client) nodePath(suffix string) string {

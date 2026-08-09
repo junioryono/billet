@@ -95,7 +95,7 @@ func serve(t *testing.T, store nodeplane.LeaseStore, opts ...nodeplane.Option) (
 
 	log := slog.New(slog.DiscardHandler)
 	p := nodeplane.New(log, deployment, time.Minute, opts...)
-	srv := httptest.NewServer(nodeplane.Handler(log, p, store))
+	srv := httptest.NewServer(nodeplane.Handler(log, p, store, nil))
 
 	t.Cleanup(srv.Close)
 
@@ -411,7 +411,7 @@ func TestTheNodeTakesItsTimingsFromTheServer(t *testing.T) {
 
 	log := slog.New(slog.DiscardHandler)
 	p := nodeplane.New(log, deployment, 90*time.Second)
-	srv := httptest.NewServer(nodeplane.Handler(log, p, &fakeStore{}))
+	srv := httptest.NewServer(nodeplane.Handler(log, p, &fakeStore{}, nil))
 
 	t.Cleanup(srv.Close)
 
