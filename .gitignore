@@ -16,8 +16,17 @@
 billet.yaml
 *.pem
 *.key
+*.crt
 !testdata/**/*.pem
 !testdata/**/*.key
+!testdata/**/*.crt
+
+# `billet ca issue <node>` writes here when --out is not given, which is the
+# right default for an operator standing in their home directory and the wrong
+# one for anything run inside the repo. *.key already kept the private half out;
+# the certificates were not covered, and two of them were committed by a test
+# run before this line existed.
+*-billet-tls/
 
 # Guest images and rootfs artifacts (large, rebuildable)
 /images/**/out/
