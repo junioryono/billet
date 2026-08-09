@@ -1,0 +1,116 @@
+package nodeapi
+
+import "github.com/junioryono/billet/internal/alloc"
+
+// The lease half of the wire.
+//
+// internal/node.Runner already takes its ledger through a LeaseStore interface
+// — Bind, Advance, Heartbeat, Release, Lease, LaunchedLeaseIDs — which is what
+// makes a remote node possible without touching the runner at all. These types
+// are that interface written down as messages.
+//
+// THE SERVER REMAINS THE ONLY WRITER. A node does not keep lease state of its
+// own and cannot reconstruct any: every transition goes through here and is
+// durable on the server before the node acts on it. That is deliberate and it is
+// the same rule that #14 exists to enforce one layer up — a commitment that
+// lives only in a process is a commitment lost when that process dies.
+
+// BindRequest claims a lease for this node.
+type BindRequest struct {
+	Epoch int64  `json:"epoch"`
+	Node  string `json:"node"`
+	// Provider is the backend the node is actually going to run it on, chosen
+	// from the lease's acceptable list. Sent because Bind is where the provider
+	// stops being a preference and becomes a fact.
+	Provider string `json:"provider,omitempty"`
+}
+
+// AdvanceRequest moves a lease to a new phase.
+//
+// The phase is sent as its string form rather than an integer: an enum whose
+// numbering is a wire contract is one insertion away from silently remapping
+// every in-flight lease during a rolling upgrade.
+type AdvanceRequest struct {
+	Epoch int64  `json:"epoch"`
+	Phase string `json:"phase"`
+}
+
+// HeartbeatRequest renews a lease.
+type HeartbeatRequest struct {
+	Epoch int64 `json:"epoch"`
+}
+
+// ReleaseRequest ends a lease with a terminal outcome.
+type ReleaseRequest struct {
+	Epoch   int64  `json:"epoch"`
+	Outcome string `json:"outcome"`
+}
+
+// LeaseResponse carries a lease back to the node.
+type LeaseResponse struct {
+	Lease *alloc.Lease `json:"lease"`
+}
+
+// LaunchedResponse lists the leases this node is believed to have launched.
+//
+// A map rather than a list, matching LeaseStore's own shape, because every
+// caller is asking "is this one mine?" and a list would be turned into this on
+// arrival anyway.
+type LaunchedResponse struct {
+	LeaseIDs map[string]bool `json:"lease_ids"`
+}
+
+// ErrorResponse is how a refusal crosses the wire.
+//
+// Code is a STABLE STRING the node may branch on; Message is for a human. The
+// separation matters because the node genuinely must distinguish some failures:
+// a fenced lease means stop and let go, while a transport error means retry.
+// Matching that out of prose is how a reworded message becomes an outage.
+type ErrorResponse struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+// Error codes the node branches on. Anything else is "unknown, retry".
+const (
+	// CodeFenced means another holder has the lease at a higher epoch. The node
+	// must stop working on it and must NOT destroy the compute on this basis
+	// alone — something else already owns it.
+	CodeFenced = "fenced"
+	// CodeNotFound means the lease is gone. Terminal for the node's purposes.
+	CodeNotFound = "not_found"
+	// CodeRefused means the request was understood and rejected — a placement
+	// the server will not allow. Retrying it unchanged cannot help.
+	CodeRefused = "refused"
+	// CodeUnregistered means the server does not know this node. The node must
+	// register again before anything else it says will be accepted; this is what
+	// a node sees after the server restarts.
+	CodeUnregistered = "unregistered"
+)
+
+// ParsePhase turns a wire phase into an alloc.Phase, refusing anything else.
+//
+// alloc.Phase is a string type, so an unrecognised value would flow through
+// untouched and be caught later by validTransitions — which has no edge to it
+// and therefore fails closed. That is the right OUTCOME reached for the wrong
+// REASON: the operator gets "invalid transition to \"lauching\"" from deep in
+// the ledger instead of "that is not a phase" from the boundary that could see
+// it. Parsing here keeps a typo in one place and keeps the ledger's error about
+// the ledger.
+//
+// The terminal phases are accepted because Release carries one, and refusing
+// them here would mean two spellings of the same enum.
+func ParsePhase(s string) (alloc.Phase, bool) {
+	switch alloc.Phase(s) {
+	case alloc.PhaseCapacity,
+		alloc.PhaseAssigned,
+		alloc.PhaseLaunching,
+		alloc.PhaseOnline,
+		alloc.PhaseBusy,
+		alloc.PhaseDone,
+		alloc.PhaseFailed:
+		return alloc.Phase(s), true
+	default:
+		return "", false
+	}
+}
