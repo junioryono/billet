@@ -308,3 +308,26 @@ func TestListRefusesAnExtraColumn(t *testing.T) {
 		t.Fatal("an extra column was absorbed into the name, which mis-identifies the lease")
 	}
 }
+
+// THE LABEL OPERATORS ARE TOLD TO LOOK FOR IS THIS ONE.
+//
+// internal/state tells an operator recovering a lost deployment identity to read
+// it off a container's label, and it cannot import this package to name it — the
+// control plane must not depend on a compute backend. So the string is written
+// out there and pinned here.
+//
+// Not hypothetical tidiness: that message shipped naming "billet.deployment",
+// which billet has never written to a container. An operator following it during
+// an incident would have found nothing and concluded their compute was
+// unrecoverable — while the containers sat there labelled correctly.
+func TestTheOwnerLabelMatchesWhatOperatorsAreTold(t *testing.T) {
+	t.Parallel()
+
+	const told = "sh.billet.owner"
+
+	if ownerLabel != told {
+		t.Fatalf("containers are labelled %q, but internal/state tells operators to look for "+
+			"%q; one of the two has to change, and the operator-facing message is the one "+
+			"somebody reads during an incident", ownerLabel, told)
+	}
+}

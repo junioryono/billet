@@ -49,7 +49,7 @@ func DeploymentID(stateDir string) (string, error) {
 		if id == "" {
 			return "", fmt.Errorf(
 				"state: %s is empty. RESTORE THE ORIGINAL IDENTITY if you can — from a backup, "+
-					"or from the billet.deployment label on any container this installation "+
+					"or from the sh.billet.owner label on any container this installation "+
 					"started. Deleting the file mints a NEW identity, and every container "+
 					"labelled with the old one becomes invisible to billet: its leases expire, "+
 					"its capacity is resold, and it runs forever. Only reset it once you have "+
@@ -59,7 +59,7 @@ func DeploymentID(stateDir string) (string, error) {
 		if err := validDeploymentID(id); err != nil {
 			return "", fmt.Errorf(
 				"state: %s: %w. RESTORE THE ORIGINAL IDENTITY if you can — from a backup, or "+
-					"from the billet.deployment label on any container this installation "+
+					"from the sh.billet.owner label on any container this installation "+
 					"started. Deleting the file mints a NEW identity, and every container "+
 					"labelled with the old one becomes invisible to billet: its leases expire, "+
 					"its capacity is resold, and it runs forever. Only reset it once you have "+

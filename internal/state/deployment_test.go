@@ -101,7 +101,13 @@ func TestAnEmptyDeploymentIDIsRefused(t *testing.T) {
 	// identity, finds nothing, lets the leases expire, resells the capacity, and
 	// the old containers run forever. Asserted here because nothing else would
 	// notice the sentence coming back.
-	for _, want := range []string{"RESTORE", "backup", "billet.deployment"} {
+	// The label name is spelled out rather than imported: internal/state must not
+	// depend on a compute backend. That makes drift possible, so the docker
+	// package pins the same string against its own constant — see
+	// TestTheOwnerLabelMatchesWhatOperatorsAreTold. This assertion caught the
+	// first drift already: the message said "billet.deployment", which is not a
+	// label billet has ever written.
+	for _, want := range []string{"RESTORE", "backup", "sh.billet.owner"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("the error does not mention %q, so it does not point at recovering the "+
 				"original identity before resetting it: %v", want, err)
