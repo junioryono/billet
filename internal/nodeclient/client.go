@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -34,11 +35,12 @@ var ErrUnregistered = errors.New("nodeclient: the control plane does not know th
 
 // Client talks to a control plane.
 type Client struct {
-	base string
-	node string
-	http *http.Client
-	ttl  time.Duration
-	poll time.Duration
+	base       string
+	node       string
+	http       *http.Client
+	ttl        time.Duration
+	poll       time.Duration
+	reqTimeout time.Duration
 }
 
 // Options configures a Client.
@@ -51,6 +53,12 @@ type Options struct {
 	// HTTP is the transport. A caller supplies one so timeouts and, later, mTLS
 	// are decided once rather than here.
 	HTTP *http.Client
+	// RequestTimeout bounds an ordinary request. Zero uses requestTimeout.
+	//
+	// Configuration rather than a test hook: a node on a slow or distant link
+	// legitimately needs longer, and the alternative is every such deployment
+	// discovering the constant by hitting it.
+	RequestTimeout time.Duration
 }
 
 // New builds a Client. It does not dial; Register does.
@@ -68,16 +76,36 @@ func New(opts Options) (*Client, error) {
 	}
 
 	c := &Client{
-		base: strings.TrimSuffix(opts.Base, "/"),
-		node: opts.Node,
-		http: opts.HTTP,
+		base:       strings.TrimSuffix(opts.Base, "/"),
+		node:       opts.Node,
+		http:       opts.HTTP,
+		reqTimeout: opts.RequestTimeout,
+	}
+
+	if c.reqTimeout <= 0 {
+		c.reqTimeout = requestTimeout
 	}
 
 	if c.http == nil {
-		// NO CLIENT-WIDE TIMEOUT, deliberately. A command poll is a long poll and
-		// a blanket Timeout would cut it every cycle; the per-request context is
-		// what bounds each call, and the poll's context is meant to be long.
-		c.http = &http.Client{}
+		// NO CLIENT-WIDE TIMEOUT, deliberately: a command poll is a long poll and
+		// a blanket Timeout would cut it every cycle. What replaces it is a
+		// per-request deadline, applied below — the first version of this comment
+		// promised that and no call actually had one, so every operation could
+		// hang forever against a control plane that accepted the connection and
+		// then said nothing.
+		//
+		// The transport still bounds the phases a long poll does not need to keep
+		// open. A dial or a TLS handshake that never completes is never a healthy
+		// poll, and leaving those unbounded means a wedged network holds a
+		// goroutine and a socket indefinitely.
+		c.http = &http.Client{
+			Transport: &http.Transport{
+				DialContext:           (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
+				TLSHandshakeTimeout:   10 * time.Second,
+				ResponseHeaderTimeout: 0, // a long poll withholds headers on purpose
+				IdleConnTimeout:       90 * time.Second,
+			},
+		}
 	}
 
 	return c, nil
@@ -123,6 +151,20 @@ func (c *Client) Register(
 	return nil
 }
 
+// requestTimeout bounds an ordinary request.
+//
+// Generous enough for a slow control plane doing a database write, short enough
+// that a wedged one does not stall the node's whole loop. A heartbeat that takes
+// this long has already missed its purpose.
+const requestTimeout = 30 * time.Second
+
+// pollSlack is added to the negotiated poll window before the node gives up.
+//
+// The server closes an idle poll at the window; the node must allow for that
+// answer to travel. Cutting at exactly the window would abort healthy polls at
+// the moment they were about to return 204.
+const pollSlack = 15 * time.Second
+
 // LeaseTTL is how long a lease survives without a heartbeat.
 func (c *Client) LeaseTTL() time.Duration { return c.ttl }
 
@@ -142,6 +184,12 @@ func (c *Client) PollWindow() time.Duration {
 // uses on the other side, for the same reason.
 func (c *Client) Poll(ctx context.Context) (nodeapi.Command, bool, error) {
 	var cmd nodeapi.Command
+
+	// BOUNDED BY THE NEGOTIATED WINDOW, not by the request timeout. This is the
+	// one call that is meant to block, and the only call whose deadline comes
+	// from what the server said rather than from a constant here.
+	ctx, cancel := context.WithTimeout(ctx, c.PollWindow()+pollSlack)
+	defer cancel()
 
 	status, err := c.doStatus(ctx, http.MethodPost, c.nodePath("/poll"), nil, &cmd)
 	if err != nil {
@@ -289,7 +337,14 @@ func (c *Client) leasePath(leaseID, suffix string) string {
 	return c.nodePath("/leases/" + url.PathEscape(leaseID) + suffix)
 }
 
+// do performs an ordinary request under the standard deadline.
+//
+// Every caller but Poll goes through here, which is what makes the bound
+// universal rather than something each call site remembers.
 func (c *Client) do(ctx context.Context, method, path string, body, into any) error {
+	ctx, cancel := context.WithTimeout(ctx, c.reqTimeout)
+	defer cancel()
+
 	_, err := c.doStatus(ctx, method, path, body, into)
 
 	return err

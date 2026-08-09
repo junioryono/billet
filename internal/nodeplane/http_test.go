@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -19,6 +20,33 @@ import (
 )
 
 const deployment = "0123456789abcdef0123456789abcdef"
+
+// fakeRegistrar stands in for the allocator's node table.
+type fakeRegistrar struct {
+	mu       sync.Mutex
+	err      error
+	accepted []string
+}
+
+func (f *fakeRegistrar) RegisterNode(_ context.Context, name string, _ config.ProviderKind) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.err != nil {
+		return f.err
+	}
+
+	f.accepted = append(f.accepted, name)
+
+	return nil
+}
+
+func (f *fakeRegistrar) names() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return append([]string(nil), f.accepted...)
+}
 
 // fakeStore is a ledger that answers whatever a test needs.
 //
@@ -464,6 +492,126 @@ func TestUnknownFieldsAreRefused(t *testing.T) {
 
 	if resp.StatusCode < 400 {
 		t.Errorf("an empty registration was accepted with %s", resp.Status)
+	}
+}
+
+// A CONTROL PLANE THAT ACCEPTS AND NEVER ANSWERS MUST NOT HANG THE NODE.
+//
+// The client has no client-wide timeout on purpose — a command poll is a long
+// poll — and the first version replaced it with nothing, so every ordinary
+// request could block forever against a server that completed the TCP handshake
+// and then said nothing. A stuck heartbeat is worse than a failed one: it also
+// stops the sweep, the custody tend, and every subsequent poll.
+func TestARequestAgainstASilentServerGivesUp(t *testing.T) {
+	t.Parallel()
+
+	// Accepts the connection, reads nothing, writes nothing, ever.
+	var lc net.ListenConfig
+
+	ln, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	t.Cleanup(func() { _ = ln.Close() })
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+
+			// Held open deliberately; never answered.
+			t.Cleanup(func() { _ = conn.Close() })
+		}
+	}()
+
+	// A SHORT DEADLINE, so the suite does not spend the production constant
+	// waiting. What is under test is that a deadline exists and fires at all —
+	// the value itself is configuration, asserted separately.
+	c, err := nodeclient.New(nodeclient.Options{
+		Base:           "http://" + ln.Addr().String(),
+		Node:           "n1",
+		RequestTimeout: 300 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+
+	// Bounded by the test rather than by the client's own deadline, so a client
+	// that hangs fails here instead of running until the whole suite times out.
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+
+	done := make(chan error, 1)
+
+	go func() {
+		done <- c.Heartbeat(ctx, "l1", 1)
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("a request to a server that never answered reported success")
+		}
+	case <-ctx.Done():
+		t.Fatal("the request never gave up; a node against a wedged control plane would " +
+			"stop heartbeating, sweeping and polling forever")
+	}
+}
+
+// THE LEDGER IS TOLD ABOUT A NODE, not just the in-memory plane.
+//
+// The plane's map decides where commands go; the allocator's node row is what
+// Bind checks before placing a lease. Registering in one and not the other
+// produced a node that took commands and then had every Bind refused — which
+// reads as a broken node rather than a missing row.
+func TestRegistrationReachesTheLedger(t *testing.T) {
+	t.Parallel()
+
+	reg := &fakeRegistrar{}
+
+	log := slog.New(slog.DiscardHandler)
+	p := nodeplane.New(log, deployment, time.Minute, nodeplane.WithRegistrar(reg))
+	srv := httptest.NewServer(nodeplane.Handler(log, p, &fakeStore{}, nil))
+
+	t.Cleanup(srv.Close)
+
+	dial(t, srv.URL)
+
+	if got := reg.names(); len(got) != 1 || got[0] != "n1" {
+		t.Fatalf("the ledger was told about %v, want [n1]", got)
+	}
+}
+
+// A LEDGER THAT REFUSES LEAVES THE PLANE UNCHANGED.
+//
+// Otherwise the node believes it registered, starts polling, and has every lease
+// operation refused — with no way to discover that the row it needs was never
+// written.
+func TestALedgerRefusalFailsTheRegistration(t *testing.T) {
+	t.Parallel()
+
+	reg := &fakeRegistrar{err: errors.New("no such node in the fleet configuration")}
+
+	log := slog.New(slog.DiscardHandler)
+	p := nodeplane.New(log, deployment, time.Minute, nodeplane.WithRegistrar(reg))
+	srv := httptest.NewServer(nodeplane.Handler(log, p, &fakeStore{}, nil))
+
+	t.Cleanup(srv.Close)
+
+	c, err := nodeclient.New(nodeclient.Options{Base: srv.URL, Node: "n1"})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+
+	if err := c.Register(t.Context(), config.ProviderDocker, nil, deployment); err == nil {
+		t.Fatal("a node the ledger refused was registered anyway")
+	}
+
+	if len(p.Nodes()) != 0 {
+		t.Errorf("the plane kept %v after the ledger refused", p.Nodes())
 	}
 }
 

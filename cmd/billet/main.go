@@ -175,27 +175,15 @@ func cmdServer(ctx context.Context, args []string) error {
 		return fmt.Errorf("%s has no github section; run `billet github-app create` first", *cfgPath)
 	}
 
-	// FAIL CLOSED while nothing can launch a job.
+	// STANDALONE `billet server` IS THE POINT OF THE SPLIT, and it used to be
+	// refused. The old guard said "without --dev nothing in this process can
+	// launch a job", which was true until a node could dial in from another
+	// machine. It is false now, and leaving it would have made the whole feature
+	// unreachable from the command line.
 	//
-	// The listener plane is complete: it reconciles scale sets, advertises
-	// capacity, acquires offers and binds leases. What does not exist yet is the
-	// node runtime that turns a lease into a running VM. A control plane that
-	// accepts work it cannot run does not fail visibly — GitHub marks the jobs
-	// assigned, billet holds leases nothing fulfils, and somebody's CI queues
-	// until it times out while this command reports itself healthy.
-	//
-	// Refusing is not the whole answer either, because the path still has to be
-	// provable against a real organization before P2 lands. --dry-run does that:
-	// the same App auth, reconciliation, session and long poll, advertising zero.
-	// Everything except accepting a job.
-	if !*dryRun && !*dev {
-		return fmt.Errorf(
-			"%w: without --dev nothing in this process can launch a job, so it will not accept one.\n"+
-				"Run `billet server --dev` to run a node here too, or `billet server --dry-run` to "+
-				"exercise the whole path against GitHub while advertising zero capacity. Accepting work "+
-				"with no node would strand it: GitHub marks the job assigned and nothing runs it",
-			errNotImplemented)
-	}
+	// A control plane with no nodes yet is not an error: jobs queue until one
+	// registers, which is the ordinary state while a fleet is being set up.
+	// --dry-run remains for proving the GitHub path while advertising zero.
 
 	return runServer(ctx, cfg, *dryRun, *dev)
 }
@@ -273,7 +261,14 @@ func runServer(ctx context.Context, cfg *config.Config, dryRun, dev bool) error 
 	// live and the copy would be silently upgraded on its way to the error.
 	//
 	// Nothing here touches a container either: this runs before newProvider.
-	var deployment string
+	// CLAIMED FOR EVERY SERVER, not only for --dev. The node wire refuses a node
+	// whose deployment identity differs from this control plane's, so a server
+	// that never learned its own would compare every node against "" and refuse
+	// the entire fleet — the feature failing closed for a reason nobody could see.
+	deployment, err := state.DeploymentID(cfg.Server.StateDir)
+	if err != nil {
+		return err
+	}
 
 	if dev {
 		var deploymentLock *state.DeploymentLock
@@ -382,7 +377,8 @@ func runServer(ctx context.Context, cfg *config.Config, dryRun, dev bool) error 
 	// would make the first node's setup a chicken-and-egg problem, and there is
 	// nothing to guard: an empty fleet answers every request with "I do not know
 	// you".
-	nodes := nodeplane.New(slog.Default(), deployment, allocator.LeaseTTL())
+	nodes := nodeplane.New(slog.Default(), deployment, allocator.LeaseTTL(),
+		nodeplane.WithRegistrar(allocator))
 
 	stopWire, err := serveNodeWire(ctx, cfg, nodes, allocator, wiring.NodeJIT{Client: client})
 	if err != nil {
@@ -390,6 +386,19 @@ func runServer(ctx context.Context, cfg *config.Config, dryRun, dev bool) error 
 	}
 
 	defer stopWire()
+
+	// THE REMOTE PLANE DRIVES COMPUTE WHENEVER THERE IS NO LOCAL NODE.
+	//
+	// --dev already attached an in-process runner above, and it wins for that
+	// process: a single-machine deployment should not send commands to itself
+	// over a loopback socket to reach a runner it already holds. Without --dev
+	// this is the only thing that can launch anything, and forgetting to attach
+	// it — which is exactly what the first version of this branch did — leaves a
+	// control plane that serves the node wire, accepts registrations, and then
+	// never sends a single command.
+	if !dev {
+		opts = append(opts, server.WithNodeRunner(nodes.NewRunner()))
+	}
 
 	plane := server.New(allocator, wiring.Provisioner{Client: client}, cfg.Tiers, owner, slog.Default(), opts...)
 	if err := plane.Run(ctx); err != nil {

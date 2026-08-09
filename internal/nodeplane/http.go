@@ -98,7 +98,7 @@ func (h *handler) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	res, err := h.plane.Register(req)
+	res, err := h.plane.Register(r.Context(), req)
 	if err != nil {
 		// REFUSED, not "try again". A version mismatch or a foreign deployment
 		// cannot be fixed by retrying, and a node that retries forever against a

@@ -58,6 +58,8 @@ type Plane struct {
 	mu    sync.Mutex
 	nodes map[string]*node
 
+	registrar Registrar
+
 	// deployment is the identity this control plane belongs to. A node carrying a
 	// different one is refused: it would label its compute with an identity this
 	// installation does not recognise, and the orphan sweeper would then find
@@ -154,6 +156,20 @@ func New(log *slog.Logger, deployment string, leaseTTL time.Duration, opts ...Op
 	return p
 }
 
+// Registrar is the ledger's node table.
+//
+// A NODE IS NOT REGISTERED UNTIL THE LEDGER SAYS SO. The plane's own map decides
+// where commands go; the allocator's node row is what Bind checks before it will
+// place a lease. Registering in one and not the other produced a node that took
+// commands and then had every Bind refused — which looked like a broken node
+// rather than a missing row.
+type Registrar interface {
+	RegisterNode(ctx context.Context, name string, kind config.ProviderKind) error
+}
+
+// WithRegistrar makes registration durable in the ledger as well as in memory.
+func WithRegistrar(r Registrar) Option { return func(p *Plane) { p.registrar = r } }
+
 // Register records a node's claim about itself.
 //
 // EVERY FIELD IS A CLAIM. What a node says about its provider and guest-OS
@@ -161,7 +177,9 @@ func New(log *slog.Logger, deployment string, leaseTTL time.Duration, opts ...Op
 // capacity ledger, whose limits come from the server's own configuration. A node
 // that lies gets commands it cannot execute and fails them, which is a bad node
 // rather than an over-committed host.
-func (p *Plane) Register(req nodeapi.RegisterRequest) (nodeapi.RegisterResponse, error) {
+func (p *Plane) Register(
+	ctx context.Context, req nodeapi.RegisterRequest,
+) (nodeapi.RegisterResponse, error) {
 	if req.Version != nodeapi.Version {
 		return nodeapi.RegisterResponse{}, fmt.Errorf(
 			"nodeplane: node %q speaks protocol version %d, this control plane speaks %d; "+
@@ -180,6 +198,18 @@ func (p *Plane) Register(req nodeapi.RegisterRequest) (nodeapi.RegisterResponse,
 				"labels its compute with its own identity, so accepting it would produce "+
 				"containers this installation cannot attribute",
 			req.Node, req.Deployment, p.deployment)
+	}
+
+	// THE LEDGER FIRST, and outside the mutex. A node that appears in the plane's
+	// map but not in the allocator's node table takes commands and then has every
+	// Bind refused — the failure looks like a broken node instead of a missing
+	// row. Doing it first means a ledger that refuses leaves the plane unchanged,
+	// so the node retries registration rather than believing it succeeded.
+	if p.registrar != nil {
+		if err := p.registrar.RegisterNode(ctx, req.Node, req.Provider); err != nil {
+			return nodeapi.RegisterResponse{}, fmt.Errorf(
+				"nodeplane: the ledger refused node %q: %w", req.Node, err)
+		}
 	}
 
 	p.mu.Lock()

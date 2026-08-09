@@ -25,7 +25,7 @@ func testPlane(t *testing.T, opts ...Option) *Plane {
 func register(t *testing.T, p *Plane, name string, provider config.ProviderKind) {
 	t.Helper()
 
-	if _, err := p.Register(nodeapi.RegisterRequest{
+	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
 		Version:    nodeapi.Version,
 		Node:       name,
 		Provider:   provider,
@@ -233,7 +233,7 @@ func TestANodeFromAnotherDeploymentIsRefused(t *testing.T) {
 
 	p := testPlane(t)
 
-	_, err := p.Register(nodeapi.RegisterRequest{
+	_, err := p.Register(t.Context(), nodeapi.RegisterRequest{
 		Version:    nodeapi.Version,
 		Node:       "n1",
 		Provider:   config.ProviderDocker,
@@ -251,7 +251,7 @@ func TestAVersionMismatchIsRefused(t *testing.T) {
 
 	p := testPlane(t)
 
-	_, err := p.Register(nodeapi.RegisterRequest{
+	_, err := p.Register(t.Context(), nodeapi.RegisterRequest{
 		Version:    nodeapi.Version + 1,
 		Node:       "n1",
 		Deployment: deployment,
