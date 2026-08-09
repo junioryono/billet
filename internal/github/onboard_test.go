@@ -282,7 +282,18 @@ func (b *browser) open(ctx context.Context, target string) error {
 		return nil
 	}
 
-	go b.driveRegistration(ctx, target)
+	// TRACKED TOO, and finding this took looking rather than assuming. Joining
+	// only the /installed callback left this one — which issues its own requests
+	// through the same counter — free to increment after the assertions had
+	// already read it. A missed increment here is the same blind spot the join
+	// was added to remove, one goroutine over.
+	b.pending.Add(1)
+
+	go func() {
+		defer b.pending.Done()
+
+		b.driveRegistration(ctx, target)
+	}()
 
 	return nil
 }
