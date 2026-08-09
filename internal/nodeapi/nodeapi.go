@@ -99,6 +99,20 @@ type Command struct {
 	RequestID int64 `json:"request_id,omitempty"`
 }
 
+// RequestIDOf is the request a command concerns, wherever it is carried.
+//
+// A destroy names the request directly; a launch carries it inside the job. The
+// two spellings exist because a destroy must work for compute whose lease is
+// already gone, and asking each caller to remember which field applies is how
+// one of them reads the wrong zero.
+func (c Command) RequestIDOf() int64 {
+	if c.Job != nil {
+		return c.Job.RequestID
+	}
+
+	return c.RequestID
+}
+
 // Job is the scale-set assignment a launch is for.
 //
 // Declared here rather than reusing internal/server's so the wire has its own

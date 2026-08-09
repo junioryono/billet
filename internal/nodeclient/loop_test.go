@@ -35,16 +35,82 @@ type fakeCompute struct {
 	// order records the sequence of calls, which is what proves Recover ran
 	// before any work was taken.
 	order []string
+
+	keptAlive   int
+	tendedCount int
+	assumed     []int64
+
+	// launchGate lets a test hold a launch open. Launch closes launchStarted and
+	// then waits, which is the only way to act on the world WHILE a launch is in
+	// flight — polling for the launch to finish always loses to the report that
+	// follows it microseconds later.
+	launchGate    chan struct{}
+	launchStarted chan struct{}
+}
+
+func (f *fakeCompute) KeepAlive(ctx context.Context) {
+	f.mu.Lock()
+	f.keptAlive++
+	f.mu.Unlock()
+
+	<-ctx.Done()
+}
+
+func (f *fakeCompute) Tend(context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.tendedCount++
+
+	return nil
+}
+
+func (f *fakeCompute) AssumeCustody(_ context.Context, _ *alloc.Lease, requestID int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.assumed = append(f.assumed, requestID)
+
+	return nil
+}
+
+func (f *fakeCompute) custodyTaken() []int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return append([]int64(nil), f.assumed...)
+}
+
+func (f *fakeCompute) tended() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return f.tendedCount
+}
+
+func (f *fakeCompute) aliveCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return f.keptAlive
 }
 
 func (f *fakeCompute) Launch(_ context.Context, _ *alloc.Lease, job server.Job) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
-
 	f.launched = append(f.launched, job.RequestID)
 	f.order = append(f.order, "launch")
+	started, gate, err := f.launchStarted, f.launchGate, f.launchErr
+	f.mu.Unlock()
 
-	return f.launchErr
+	if started != nil {
+		close(started)
+	}
+
+	if gate != nil {
+		<-gate
+	}
+
+	return err
 }
 
 func (f *fakeCompute) Destroy(_ context.Context, requestID int64) error {
@@ -368,6 +434,131 @@ func TestALaunchWithoutALeaseIsRefused(t *testing.T) {
 	if res.OK {
 		t.Fatal("a launch with no lease reported success")
 	}
+}
+
+// THE CUSTODY JANITOR RUNS, and without it the whole custody design is broken
+// across the split.
+//
+// In one process the runner renews the leases of compute it could not confirm
+// gone. A node that never starts that janitor answers the server with "I am
+// holding this" while holding nothing: the server stops heartbeating, the reaper
+// releases the capacity a TTL later, and a container keeps running on capacity
+// that has been sold to somebody else.
+func TestTheCustodyJanitorIsStarted(t *testing.T) {
+	t.Parallel()
+
+	_, c := harness(t)
+	compute := &fakeCompute{}
+
+	runLoop(t, c, compute)
+
+	waitFor(t, func() bool { return compute.aliveCount() == 1 })
+}
+
+// A LOST RESULT MAKES THE NODE TAKE CUSTODY, because the server already has.
+//
+// The failure this prevents: the launch succeeds, the report is lost, the plane
+// times the command out and reports custody to the listener — which stops
+// heartbeating, since custody means the node holds it. The node meanwhile
+// believes it merely launched something and holds the instance in its ordinary
+// running set, which nothing renews. The lease is reaped while the container
+// runs and its capacity is sold twice.
+//
+// The handoff has to be CAUSED rather than hoped for, so the party that could
+// not report is the party that takes custody.
+func TestALostResultMakesTheNodeAssumeCustody(t *testing.T) {
+	t.Parallel()
+
+	p, c := harness(t)
+	compute := &fakeCompute{}
+
+	runLoop(t, c, compute)
+	waitFor(t, func() bool { return len(p.Nodes()) == 1 })
+
+	lease := &alloc.Lease{
+		ID:        "l1",
+		VCPU:      2,
+		Memory:    8 * config.GiB,
+		GuestOS:   config.GuestLinux,
+		Providers: []config.ProviderKind{config.ProviderDocker},
+		Epoch:     1,
+		RequestID: 7,
+	}
+
+	// The launch is delivered and executed; the REPORT is what fails. Forgetting
+	// the node makes its result rejected with "register again", which is exactly
+	// the state a restarted control plane produces.
+	//
+	// Held open while that happens, because a report follows its launch by
+	// microseconds and any attempt to interleave by polling loses the race.
+	compute.mu.Lock()
+	compute.launchStarted = make(chan struct{})
+	compute.launchGate = make(chan struct{})
+	started, gate := compute.launchStarted, compute.launchGate
+	compute.mu.Unlock()
+
+	go func() {
+		<-started
+		p.ForgetForTest("n1")
+		close(gate)
+	}()
+
+	// The launch's own outcome is not what is under test — the plane reports
+	// custody, correctly — so what matters is what the NODE did about it.
+	if err := p.NewRunner().Launch(t.Context(), lease, server.Job{RequestID: 7}); err == nil {
+		t.Fatal("a launch whose result was lost reported success")
+	}
+
+	waitFor(t, func() bool {
+		for _, id := range compute.custodyTaken() {
+			if id == 7 {
+				return true
+			}
+		}
+
+		return false
+	})
+}
+
+// CUSTODY IS ADVANCED, not merely held.
+//
+// The janitor renews the leases of compute that could not be confirmed gone;
+// Tend is what ENDS those entries once it is. Without it a node holds every
+// custody lease forever and the capacity behind them is never returned — the
+// mirror of the failure that starting the janitor prevents.
+func TestCustodyIsAdvancedOnTheSweepCadence(t *testing.T) {
+	t.Parallel()
+
+	_, c := harness(t)
+	compute := &fakeCompute{}
+
+	ctx, cancel := context.WithCancel(t.Context())
+
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+
+	go func() {
+		defer wg.Done()
+
+		err := nodeclient.Run(ctx, c, compute, nodeclient.LoopOptions{
+			Provider:   config.ProviderDocker,
+			Deployment: deployment,
+			Log:        slog.New(slog.DiscardHandler),
+			Backoff:    20 * time.Millisecond,
+			SweepEvery: 10 * time.Millisecond,
+		})
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("the loop stopped for a reason other than shutdown: %v", err)
+		}
+	}()
+
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+	})
+
+	waitFor(t, func() bool { return compute.tended() > 0 })
 }
 
 func waitFor(t *testing.T, cond func() bool) {

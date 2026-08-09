@@ -101,6 +101,18 @@ type Option func(*Plane)
 // WithClock replaces the clock, for tests.
 func WithClock(now func() time.Time) Option { return func(p *Plane) { p.now = now } }
 
+// ForgetForTest drops a node, as a control-plane restart would.
+//
+// Exported for tests only. It stages the one state a node cannot produce for
+// itself: being unknown to a server that is still answering, which is what makes
+// its next write fail with "register again" rather than with a transport error.
+func (p *Plane) ForgetForTest(name string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	delete(p.nodes, name)
+}
+
 // SetPollWindowForTest shortens the long-poll window.
 //
 // Exported for tests only, and named so nobody mistakes it for configuration:

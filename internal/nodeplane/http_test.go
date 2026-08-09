@@ -468,6 +468,12 @@ func TestUnknownFieldsAreRefused(t *testing.T) {
 }
 
 // Loopback is the only address the wire may serve on without TLS.
+//
+// THIS TEST USED TO ASSERT THE VULNERABILITY. It listed ":7717" as safe, which is
+// the wildcard — net.Listen binds every interface for an empty host — so the
+// unauthenticated wire, JIT credential endpoint included, was served to the whole
+// network by a guard that reported it had not. The hole was pinned by its own
+// test rather than caught by it.
 func TestOnlyLoopbackIsSafeWithoutTLS(t *testing.T) {
 	t.Parallel()
 
@@ -476,10 +482,30 @@ func TestOnlyLoopbackIsSafeWithoutTLS(t *testing.T) {
 		"localhost:7717":  true,
 		"[::1]:7717":      true,
 		"127.0.0.53:7717": true,
-		":7717":           true,
-		"0.0.0.0:7717":    false,
-		"10.0.0.5:7717":   false,
-		"example.com:443": false,
+
+		// AN IPv4-MAPPED LOOPBACK, which is loopback and which no amount of
+		// prefix-matching on "127." recognises. Included because without it the
+		// whole test passes against a string-comparison implementation, and this
+		// function's first version was exactly that.
+		"[::ffff:127.0.0.1]:7717": true,
+
+		// THE WILDCARD, in every spelling. An empty host is not "unspecified so
+		// probably local"; it is every interface this machine has.
+		":7717":         false,
+		"0.0.0.0:7717":  false,
+		"[::]:7717":     false,
+		"10.0.0.5:7717": false,
+
+		// A name that might resolve to loopback is still not loopback: what it
+		// resolves to is not knowable here and can change under the process.
+		"example.com:443":       false,
+		"localhost.evil.com:80": false,
+
+		// Not an address at all. Refusing beats guessing.
+		"127.0.0.1":   false,
+		"":            false,
+		"garbage":     false,
+		"1.2.3.4.5:1": false,
 	} {
 		if got := nodeplane.LoopbackOnly(addr); got != want {
 			t.Errorf("LoopbackOnly(%q) = %v, want %v", addr, got, want)

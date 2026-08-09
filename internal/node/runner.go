@@ -591,6 +591,37 @@ func (r *Runner) takeCustody(ctx context.Context, lease *alloc.Lease, inst *prov
 	return nil
 }
 
+// AssumeCustody takes responsibility for a lease whose launch SUCCEEDED but
+// whose outcome the caller could not deliver.
+//
+// EXISTS BECAUSE THE SPLIT CREATED A GAP IN-PROCESS OPERATION CANNOT HAVE. When
+// the runner and the listener share a process, a successful launch is reported
+// by returning nil and the listener keeps heartbeating the lease. Over a wire
+// the report can be lost: the control plane times the command out and must
+// assume custody — the only safe reading of silence — and stops heartbeating,
+// because custody means the node is holding it. Meanwhile the node believes it
+// merely launched something, so nothing renews the lease and the reaper releases
+// capacity that a container is still using.
+//
+// The handoff has to be CAUSAL rather than hopeful, so the party that failed to
+// report is the party that takes custody. Idempotent: adopting a lease already
+// held simply refreshes it.
+func (r *Runner) AssumeCustody(ctx context.Context, lease *alloc.Lease, requestID int64) error {
+	r.mu.Lock()
+	inst, ok := r.running[requestID]
+	r.mu.Unlock()
+
+	if !ok {
+		// Nothing is running for this request, so there is nothing to hold — which
+		// is what a launch that genuinely failed looks like. The control plane
+		// releasing the lease is then correct, and claiming custody would strand
+		// the capacity instead.
+		return nil
+	}
+
+	return r.takeCustody(ctx, lease, inst)
+}
+
 // Sweep destroys instances whose lease is no longer open on this node.
 //
 // The steady-state counterpart to Recover, and the reason a failed cleanup is

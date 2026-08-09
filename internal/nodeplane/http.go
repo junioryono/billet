@@ -6,9 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
-	"strings"
-	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/nodeapi"
@@ -450,20 +449,32 @@ func writeStoreErr(w http.ResponseWriter, err error) {
 // alternative is a deployment that looks like it works and has no boundary at
 // all.
 func LoopbackOnly(addr string) bool {
-	host := addr
-
-	if i := strings.LastIndex(addr, ":"); i >= 0 {
-		host = addr[:i]
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		// Not an address billet can reason about, so not one it will serve on.
+		return false
 	}
 
-	host = strings.Trim(host, "[]")
+	// AN EMPTY HOST IS THE WILDCARD, NOT LOOPBACK, and the first version of this
+	// function said the opposite. net.Listen("tcp", ":7717") binds every
+	// interface, so treating ":7717" as safe served the unauthenticated wire to
+	// the whole network while reporting that it had not — with a JIT credential
+	// endpoint behind it. The test asserted that behaviour too, which pinned the
+	// hole rather than catching it.
+	if host == "" {
+		return false
+	}
 
-	switch host {
-	case "localhost", "127.0.0.1", "::1", "":
+	// The one hostname whose meaning is fixed by convention everywhere billet
+	// runs. Anything else that might resolve to loopback is not trusted: what it
+	// resolves to is not knowable here and can change under the process.
+	if host == "localhost" {
 		return true
-	default:
-		return strings.HasPrefix(host, "127.")
 	}
-}
 
-var _ = time.Second
+	// ASKED, not pattern-matched. 127.0.0.1, ::1 and the rest of 127/8 are all
+	// loopback and a prefix test on the string got some of them by accident.
+	ip := net.ParseIP(host)
+
+	return ip != nil && ip.IsLoopback()
+}
