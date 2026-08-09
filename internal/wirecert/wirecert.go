@@ -345,7 +345,21 @@ func (b Bundle) Write(dir string) error {
 		return fmt.Errorf("wirecert: create %s: %w", dir, err)
 	}
 
-	if err := writeSecret(filepath.Join(dir, "node.key"), b.KeyPEM); err != nil {
+	keyPath := filepath.Join(dir, "node.key")
+
+	if err := writeSecret(keyPath, b.KeyPEM); err != nil {
+		if os.IsExist(err) {
+			// SAYS WHAT TO DO. writeSecret returns the bare os error so its other
+			// caller can detect the race that means "someone else initialised this
+			// authority first"; here there is no race, only an operator pointing at a
+			// directory that already holds a bundle.
+			return fmt.Errorf(
+				"wirecert: %s already exists and billet will not overwrite it. That node is "+
+					"probably already enrolled — re-issuing would leave it holding a key this "+
+					"bundle does not match until someone restarts it. Write to a new directory "+
+					"with --out, or move this one aside deliberately", keyPath)
+		}
+
 		return err
 	}
 

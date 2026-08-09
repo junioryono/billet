@@ -126,13 +126,62 @@ func newFlagSet(name string) *flag.FlagSet {
 // parse rejects leftover positional arguments, so a typo like
 // `billet server --dev extra` fails instead of being silently ignored.
 func parse(fs *flag.FlagSet, args []string) error {
+	return parseWithArgs(fs, args, 0)
+}
+
+// parseWithArgs parses flags for a command that takes positional arguments.
+//
+// A COMMAND MUST SAY HOW MANY IT WANTS. The default of zero is what catches a
+// typo'd flag, which flag.Parse hands back as a positional rather than
+// rejecting: `billet server -dvе` becomes an argument, the flag stays false, and
+// the process runs in a mode nobody asked for. That protection is worth keeping,
+// which is why this is opt-in per command rather than simply removed — `billet
+// ca issue <node>` was written against the strict version and could not run at
+// all.
+func parseWithArgs(fs *flag.FlagSet, args []string, want int) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if fs.NArg() > 0 {
-		return fmt.Errorf("unexpected argument %q", fs.Arg(0))
+
+	if fs.NArg() > want {
+		return fmt.Errorf("unexpected argument %q", fs.Arg(want))
 	}
+
 	return nil
+}
+
+// parseWithName parses a command that takes one positional argument, whichever
+// side of the flags it was written on.
+//
+// GO'S FLAG PACKAGE STOPS AT THE FIRST POSITIONAL, so `billet ca issue epyc-1
+// --config x.yaml` leaves `--config x.yaml` sitting in the argument list: the
+// config path is silently ignored and the command reads the default file. That
+// is the order every operator writes — the subject first, the options after —
+// and it is the order every example in the README uses.
+//
+// So the flags are parsed twice: once to reach the positional, once for whatever
+// followed it.
+func parseWithName(fs *flag.FlagSet, args []string) (string, error) {
+	if err := fs.Parse(args); err != nil {
+		return "", err
+	}
+
+	rest := fs.Args()
+	if len(rest) == 0 {
+		return "", nil
+	}
+
+	name := rest[0]
+
+	if err := fs.Parse(rest[1:]); err != nil {
+		return "", err
+	}
+
+	if fs.NArg() > 0 {
+		return "", fmt.Errorf("unexpected argument %q", fs.Arg(0))
+	}
+
+	return name, nil
 }
 
 // defaultConfigPath deliberately does NOT look in the working directory.
@@ -1005,11 +1054,11 @@ func cmdCAIssue(args []string) error {
 	cfgPath := addConfigFlag(fs)
 	out := fs.String("out", "", "directory to write the bundle to (default ./<node>-billet-tls)")
 
-	if err := parse(fs, args); err != nil {
+	name, err := parseWithName(fs, args)
+	if err != nil {
 		return err
 	}
 
-	name := fs.Arg(0)
 	if name == "" {
 		return errors.New("usage: billet ca issue <node> [--out <dir>]")
 	}
