@@ -16,13 +16,16 @@ import "github.com/junioryono/billet/internal/alloc"
 // lives only in a process is a commitment lost when that process dies.
 
 // BindRequest claims a lease for this node.
+//
+// NO PROVIDER FIELD, deliberately. Bind chooses the provider itself, from the
+// lease's acceptable list and the node's REGISTERED backend — both of which the
+// server already holds. Letting the node name one would create a second
+// authority for a fact the ledger owns, which is the recurring defect shape in
+// this codebase: the snapshot and the live value disagree, and the disagreement
+// is silent.
 type BindRequest struct {
 	Epoch int64  `json:"epoch"`
 	Node  string `json:"node"`
-	// Provider is the backend the node is actually going to run it on, chosen
-	// from the lease's acceptable list. Sent because Bind is where the provider
-	// stops being a preference and becomes a fact.
-	Provider string `json:"provider,omitempty"`
 }
 
 // AdvanceRequest moves a lease to a new phase.

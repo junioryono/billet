@@ -101,6 +101,19 @@ type Option func(*Plane)
 // WithClock replaces the clock, for tests.
 func WithClock(now func() time.Time) Option { return func(p *Plane) { p.now = now } }
 
+// SetPollWindowForTest shortens the long-poll window.
+//
+// Exported for tests only, and named so nobody mistakes it for configuration:
+// the window is part of the contract a node is told at registration, so a
+// deployment that wants a different one changes it in one place rather than
+// having each side pick.
+func (p *Plane) SetPollWindowForTest(d time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.poll = d
+}
+
 // WithCommandTimeout bounds how long a launch waits for its result.
 func WithCommandTimeout(d time.Duration) Option {
 	return func(p *Plane) {
