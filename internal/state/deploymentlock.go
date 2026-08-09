@@ -130,7 +130,7 @@ func LockDeployment(id string, opts LockOptions) (*DeploymentLock, error) {
 	// What it does NOT cover is an untrusted-writable ANCESTOR, because MkdirAll
 	// above still walks the path by name. That is a real residual and it is
 	// recorded rather than implied away.
-	dirf, err := openLockDir(dir)
+	dirf, err := openLockDir(dir, !operatorChose)
 	if err != nil {
 		return unplaceable(opts, fmt.Sprintf("cannot open %s (%v)", dir, err))
 	}
@@ -152,9 +152,12 @@ func LockDeployment(id string, opts LockOptions) (*DeploymentLock, error) {
 		if errors.Is(err, ErrLocked) {
 			return nil, fmt.Errorf(
 				"%w: identity %s is held by another process (%s). Two billets sharing one "+
-					"identity manage the same containers and heartbeat each other's leases — "+
-					"if this is a COPY of a state directory, give it its own by deleting its "+
-					"deployment-id file",
+					"identity manage the same containers and heartbeat each other's leases. "+
+					"If this is a COPY of a state directory, it is not a second installation "+
+					"and must not be started as one — stop it, and if you want a genuinely "+
+					"separate billet, give it a FRESH state directory rather than deleting the "+
+					"copy's deployment-id: the identity is what its containers are labelled "+
+					"with, and minting a new one strands every container the original started",
 				ErrDeploymentLocked, id, path)
 		}
 

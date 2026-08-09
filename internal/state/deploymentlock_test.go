@@ -880,15 +880,21 @@ func TestAGroupWritableDirectoryWithoutSetgidIsRefused(t *testing.T) {
 	}
 }
 
-// A SHARED DIRECTORY MUST BE READABLE, and the refusal has to say why.
+// A DROP-BOX SHARED DIRECTORY WORKS: write and traverse, no listing.
 //
-// billet opens the lock directory to validate it, so the 2730 drop-box shape —
-// write and traverse but no listing — is refused even though openat of a known
-// filename would not need read. That is a deliberate contract rather than an
-// oversight (a search-only descriptor is O_PATH on Linux, absent on darwin, and
-// cannot be fchmod'd), so the one thing it must not do is fail with a bare
-// permission error that sends an operator looking for the wrong problem.
-func TestAnUnreadableSharedDirectorySaysItNeedsRead(t *testing.T) {
+// This test used to assert the OPPOSITE, and the reason is worth keeping. The
+// lock directory was opened O_RDONLY, which needs read on the directory, so mode
+// 2730 was refused — justified in a comment claiming darwin has neither O_PATH
+// nor O_SEARCH. That was a check of whether x/sys/unix EXPORTS the symbol, read
+// as a claim about the platform: darwin's fcntl.h defines
+// `O_SEARCH (O_EXEC | O_DIRECTORY)`, and a probe confirmed open, fstat, openat
+// and openat-with-O_CREAT all work through such a handle on a directory the
+// caller cannot read.
+//
+// The other half of that justification was wrong too: fchmod is needed only for
+// the directory BILLET picked, never for one the operator named, so the two
+// cases can simply open differently.
+func TestAnUnreadableSharedDirectoryStillWorks(t *testing.T) {
 	t.Parallel()
 
 	if os.Geteuid() == 0 {
@@ -905,24 +911,25 @@ func TestAnUnreadableSharedDirectorySaysItNeedsRead(t *testing.T) {
 	})
 
 	// READ REMOVED FROM THE OWNER, not from the group. The shape this models is a
-	// 2730 directory seen by the OTHER account, which a single-user test cannot
-	// stage: at 2730 the owner still has rwx, so the open succeeds and the case
-	// never arises — measured on darwin, where exactly that happened and this test
-	// skipped itself into proving nothing. Taking read off the owner reproduces
-	// the same EACCES from the same line.
+	// 2730 directory as the OTHER account sees it, which a single-user test cannot
+	// stage: at 2730 the owner still has rwx, so the open succeeds through the
+	// ordinary path and the case never arises — measured on darwin, where exactly
+	// that happened.
 	if err := os.Chmod(dir, os.ModeSetgid|0o370); err != nil {
 		t.Fatalf("chmod: %v", err)
 	}
 
-	_, err := LockDeployment("0123456789abcdef0123456789abcdef", LockOptions{Dir: dir})
-	if err == nil {
-		t.Fatal("billet opened a directory it cannot read, so the contract this message " +
-			"describes is not the one being enforced")
+	lock, err := LockDeployment("0123456789abcdef0123456789abcdef", LockOptions{Dir: dir})
+	if err != nil {
+		if searchOnlyFlag() == 0 {
+			t.Skipf("this platform has no search-only directory open, so the read requirement "+
+				"stands here: %v", err)
+		}
+
+		t.Fatalf("a drop-box shared directory was refused: %v", err)
 	}
 
-	if !strings.Contains(err.Error(), "2770") {
-		t.Errorf("the refusal does not name the mode that works: %v", err)
-	}
+	releaseAtEnd(t, lock)
 }
 
 // AND IT DOES NOT SAY THAT WHEN THE DIRECTORY IS FINE.

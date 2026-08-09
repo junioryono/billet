@@ -76,7 +76,30 @@ func lockFile(path string, shared bool) (*dirLock, error) {
 // the name is walked once, a symlinked final component is refused outright
 // rather than diagnosed afterwards, and the returned descriptor keeps referring
 // to THAT inode however the name is rearranged later.
-func openLockDir(dir string) (*os.File, error) {
+func openLockDir(dir string, mayTighten bool) (*os.File, error) {
+	// SEARCH-ONLY WHERE READ IS NOT NEEDED, and the previous version's reason for
+	// not doing this was simply wrong. It claimed darwin has neither O_PATH nor
+	// O_SEARCH — that was a check of whether x/sys/unix EXPORTS the symbol, read
+	// as a statement about the platform. darwin's own fcntl.h defines
+	// `O_SEARCH (O_EXEC | O_DIRECTORY)`, and a probe confirmed the whole chain
+	// works on a directory the caller cannot read: open, fstat, openat, and
+	// openat with O_CREAT.
+	//
+	// The fchmod objection was misplaced too. Tightening happens ONLY for the
+	// default directory billet picked itself; a directory the operator named is
+	// never tightened. So the two cases can differ, and the drop-box shape (mode
+	// 2730: write and traverse, no listing) works after all.
+	if !mayTighten {
+		if flag := searchOnlyFlag(); flag != 0 {
+			fd, err := unix.Open(dir, flag|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+			if err == nil {
+				return os.NewFile(uintptr(fd), dir), nil
+			}
+			// Falls through to O_RDONLY, which produces the better diagnosis
+			// below for the cases that are genuinely about permissions.
+		}
+	}
+
 	f, err := os.OpenFile(dir, os.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
 	if err == nil {
 		return f, nil
@@ -93,20 +116,24 @@ func openLockDir(dir string) (*os.File, error) {
 	// the tightening path needs. That is platform-divergent handle juggling for an
 	// uncommon shape, so billet asks for the simpler contract and says so instead
 	// of failing with a bare EACCES.
-	// ONLY WHEN IT REALLY IS THIS DIRECTORY'S READ BIT. EACCES also comes from an
-	// ancestor without search permission, from a MAC denial, and from anything
-	// else in the path — and answering all of those with "set mode 2770" sends an
-	// operator to change a mode that was never the problem.
+	// SUGGESTIONS, NOT A DIAGNOSIS. A successful stat proves the directory is
+	// reachable and its metadata readable; it does NOT prove why open was
+	// refused. The same EACCES comes from a private directory at 0300 (where the
+	// fix is 0700, and telling the operator to widen it to 2770 would be actively
+	// wrong), from an ACL or MAC policy that permits a lookup and denies an open,
+	// and from an ancestor — so the message lists what it could be rather than
+	// asserting the one it guessed.
 	//
-	// os.Stat separates them, measured rather than assumed: an unreadable
-	// directory STATS FINE and fails to open, while a non-searchable ancestor
-	// fails both. So a successful stat alongside a refused open is the one case
-	// the advice fits.
+	// Reached far less often now that the operator-chosen directory opens
+	// search-only: this is the private path, or a platform with no search-only
+	// open, or a search-only open that itself failed.
 	if errors.Is(err, fs.ErrPermission) {
 		if _, statErr := os.Stat(dir); statErr == nil {
 			return nil, fmt.Errorf(
-				"%w — billet needs to READ this directory, not only write it, so a shared lock "+
-					"directory must be mode 2770 rather than 2730", err)
+				"%w — billet could reach this directory but not open it. If it is private to "+
+					"this account, it needs mode 0700; if two accounts share it, 2770 (or 2730 "+
+					"where billet can open a directory for search only); otherwise look for an "+
+					"ACL or a MAC policy that allows a lookup and denies an open", err)
 		}
 	}
 

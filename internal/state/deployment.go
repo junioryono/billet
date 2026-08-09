@@ -47,11 +47,23 @@ func DeploymentID(stateDir string) (string, error) {
 	if err == nil {
 		id := strings.TrimSpace(string(existing))
 		if id == "" {
-			return "", fmt.Errorf("state: %s is empty; delete it to have billet mint a new identity", path)
+			return "", fmt.Errorf(
+				"state: %s is empty. RESTORE THE ORIGINAL IDENTITY if you can — from a backup, "+
+					"or from the billet.deployment label on any container this installation "+
+					"started. Deleting the file mints a NEW identity, and every container "+
+					"labelled with the old one becomes invisible to billet: its leases expire, "+
+					"its capacity is resold, and it runs forever. Only reset it once you have "+
+					"confirmed no compute is left under the old identity", path)
 		}
 
 		if err := validDeploymentID(id); err != nil {
-			return "", fmt.Errorf("state: %s: %w; delete it to have billet mint a new identity", path, err)
+			return "", fmt.Errorf(
+				"state: %s: %w. RESTORE THE ORIGINAL IDENTITY if you can — from a backup, or "+
+					"from the billet.deployment label on any container this installation "+
+					"started. Deleting the file mints a NEW identity, and every container "+
+					"labelled with the old one becomes invisible to billet: its leases expire, "+
+					"its capacity is resold, and it runs forever. Only reset it once you have "+
+					"confirmed no compute is left under the old identity", path, err)
 		}
 
 		return id, nil

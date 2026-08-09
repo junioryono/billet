@@ -3,6 +3,7 @@ package state
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -88,8 +89,28 @@ func TestAnEmptyDeploymentIDIsRefused(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	if _, err := DeploymentID(dir); err == nil {
+	err := func() error { _, err := DeploymentID(dir); return err }()
+	if err == nil {
 		t.Fatal("an empty identity file was accepted, so compute would be labelled with nothing")
+	}
+
+	// THE ADVICE IS PART OF THE BEHAVIOUR, and this message used to say only
+	// "delete it to have billet mint a new identity" — which contradicts the
+	// invariant the identity exists to hold. An operator who follows that while
+	// containers are running strands every one of them: billet filters by the new
+	// identity, finds nothing, lets the leases expire, resells the capacity, and
+	// the old containers run forever. Asserted here because nothing else would
+	// notice the sentence coming back.
+	for _, want := range []string{"RESTORE", "backup", "billet.deployment"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the error does not mention %q, so it does not point at recovering the "+
+				"original identity before resetting it: %v", want, err)
+		}
+	}
+
+	if strings.Contains(err.Error(), "delete it to have billet mint") {
+		t.Error("the error tells the operator to delete the identity as a standalone repair, " +
+			"which strands every container already labelled with it")
 	}
 }
 

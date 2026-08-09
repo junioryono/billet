@@ -211,10 +211,20 @@ type browser struct {
 	// authenticated poller as the only route to the installation.
 	skipSetupCallback bool
 	setupCallbacks    atomic.Int32
-	// getFailures counts requests that did not complete. A silently-failing
-	// request is how the original version of this test passed without ever
-	// reaching /installed.
+	// getFailures counts requests that did not complete WHILE THE FLOW WAS STILL
+	// RUNNING. A silently-failing request is how the original version of this test
+	// passed without ever reaching /installed.
+	//
+	// Scoped by flowDone because the unscoped version asserted something this
+	// file's own comment already called legitimate: the flow closes its listener
+	// when it finishes, so a request still in flight at that moment fails for a
+	// correct reason. That race fired twice — once on a loaded machine and once
+	// on an idle one — which makes it a flaky test rather than a finding.
+	// Counting only failures that PRECEDE completion keeps the property the
+	// assertion was written for (a request that silently fails mid-flow must not
+	// look like success) without asserting something that cannot hold.
 	getFailures atomic.Int32
+	flowDone    atomic.Bool
 }
 
 func (b *browser) open(ctx context.Context, target string) error {
@@ -437,10 +447,13 @@ func (b *browser) get(ctx context.Context, target string) string {
 	resp, err := b.client.Do(req)
 	if err != nil {
 		// Counted rather than ignored. Swallowing this is precisely how the
-		// original test reported success while never reaching /installed; the
-		// flow closes its listener when it finishes, so a late failure is
-		// legitimate, but it must be visible to the assertions.
-		b.getFailures.Add(1)
+		// original test reported success while never reaching /installed. But
+		// only BEFORE the flow finishes: it closes its listener on the way out,
+		// so a request still in flight at that moment fails legitimately, and
+		// counting those made the assertion flaky rather than strict.
+		if !b.flowDone.Load() {
+			b.getFailures.Add(1)
+		}
 
 		return ""
 	}
@@ -535,6 +548,10 @@ func TestOnboardEndToEnd(t *testing.T) {
 			return nil
 		},
 	})
+	// Set BEFORE the assertions and immediately after the flow returns: from here
+	// on, the listener is closed and a browser request failing is expected.
+	b.flowDone.Store(true)
+
 	if err != nil {
 		t.Fatalf("Onboard: %v", err)
 	}

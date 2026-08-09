@@ -202,12 +202,13 @@ type ServerConfig struct {
 	// bind-mounted into each container, say). It must NOT be world-writable: any
 	// local user could then hold the file and keep billet from ever starting.
 	//
-	// A directory genuinely shared between two accounts must be mode 2770 — the
-	// SETGID bit is what makes a new lock file carry the directory's group rather
-	// than its creator's primary one, without which the other account cannot open
-	// it; and the group READ bit is needed because billet opens the directory to
-	// validate it, so the otherwise-tempting 2730 drop-box shape is refused. A
-	// directory only this account uses wants no group access at all.
+	// A directory genuinely shared between two accounts must be SETGID — 2770, or
+	// 2730 for a drop box where neither account should list the other's locks.
+	// Setgid is what makes a new lock file carry the directory's group rather
+	// than its creator's primary one, and without it the other account cannot
+	// open the lock at all. Billet opens a directory it did not choose for search
+	// only, so it does not need to read it. A directory only this account uses
+	// wants no group access at all.
 	LockDir string `yaml:"lock_dir,omitempty"`
 	// AllowUnlockedDeployment starts billet even when the host-wide lock cannot
 	// be placed.
