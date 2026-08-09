@@ -616,6 +616,35 @@ Three things about it were wrong on the first attempt and are worth not repeatin
   domain, and the resolved path is logged every boot so which domain a process
   joined is evidence rather than inference.
 
+- **A shared directory must be SETGID, and mode bits alone never prove sharing
+  works.** `0660` says *a* group may open the file, not *which*. A service account
+  whose primary group is `service` and whose supplemental group is `billet`
+  creates the lock owned by `service` in a non-setgid directory — every permission
+  bit a check could ask for, and still unopenable by the operator it was widened
+  for. Group-writable proves sharing was *intended*; setgid decides *who gets it*.
+  So the directory's gid is captured and the lock file's gid must match. The umask
+  is the same trap one level down: it turns a requested `0660` into `0640`, which
+  cannot be opened `O_RDWR`, so the mode is corrected explicitly and verified by
+  result rather than by intent.
+- **`os.Root` confines a path; it does NOT refuse a symlink.** It follows links
+  that stay inside the root, and its Unix implementation applies its own
+  `O_NOFOLLOW` internally, inspects the link on `ELOOP`, then follows — so a
+  caller's `syscall.O_NOFOLLOW` is indistinguishable from its own and is ignored.
+  Measured, not read: a relative `link.lock -> real.lock` inside the directory
+  opened as `os.SameFile` with its target. Use `unix.Openat` against a real
+  directory descriptor, which honours the flag because the kernel does. Opening
+  the directory itself `O_DIRECTORY|O_NOFOLLOW` then removes the separate
+  `os.Lstat` too — one resolution, and no second one that could describe a
+  different directory than the handle holds.
+- **Take the flock BEFORE judging metadata.** Validating first meant a group
+  mismatch told the operator to delete a "stale" lock file that nobody had checked
+  was unheld — and after the delete the newcomer creates a fresh inode while the
+  holder keeps the old one, so neither excludes the other. Nothing may be called
+  stale until the lock is held.
+- **A gid sentinel of `-1` is not safe.** `Stat_t.Gid` is unsigned, so on a 32-bit
+  host a gid above `MaxInt32` converts to a negative `int` and becomes
+  indistinguishable from "no group owner". Absence gets its own field.
+
 **Claim the identity BEFORE `state.Open`.** It ran after, and `state.Open` applies
 migrations — so a process about to be refused first migrated the database it was
 refused the right to use (start an old copied backup beside a live original and
@@ -628,6 +657,33 @@ start against one daemon. Measured, not assumed — the in-process test really d
 pass a fake process-local mutex. The real one re-executes the test binary
 (`deploymentlock_process_test.go`), which is also the only way to assert that
 SIGKILLing the holder frees the identity.
+
+### The test written to prove a fix tends to prove the adjacent thing
+
+Four consecutive review rounds on the deployment lock found tests that passed
+while the check they named did nothing. They are worth listing together, because
+the shape is the same every time and it is not carelessness — each test was
+**about** the right subject and **exercised** something else:
+
+| Meant to prove | Actually proved |
+|---|---|
+| the lock file's gid matches the directory's | `20 == 20` — a `t.TempDir` is owned by the primary group |
+| ...then, with a borrowed group | the *kernel* supplied the gid — setgid was set before the file was created, so the comparison was never reached |
+| `O_NOFOLLOW` refuses a symlinked lock file | `os.Root` refuses an *escape* — the target was an absolute path outside the directory |
+| a second *process* is refused | flock works within one process; a package-local mutex passes identically |
+
+**The check that catches this is mutation, not review.** Delete or neuter the
+production line the test names and re-run only that test: if it stays green, the
+test is about something else. Every one of the four above was found that way, three
+of them after a human-style reading had already called them correct. A test whose
+mutation survives is not necessarily wrong, but it must be shown to be redundant
+rather than assumed to be — and the redundancy said out loud.
+
+A related habit that paid off repeatedly: when a platform behaviour matters
+(`os.Root` and symlinks, umask stripping mode bits, BSD versus Linux gid
+inheritance, `os.UserCacheDir`'s environment dependence), **write a throwaway probe
+that prints what actually happens** instead of reasoning from the documentation.
+Three of the defects above were documented behaviour that read the other way.
 
 ### `created` is not `running`
 
