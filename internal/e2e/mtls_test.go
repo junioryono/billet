@@ -287,6 +287,99 @@ func TestAWireRequiringCertificatesRefusesAPlainConnection(t *testing.T) {
 	}
 }
 
+// A COPIED BUNDLE ON TWO HOSTS IS CAUGHT, and mTLS alone cannot catch it.
+//
+// The certificate is genuine on both machines — that is what copying it means —
+// so both authenticate as the same node and the control plane's answer to
+// "whose compute is this" becomes whichever host polled last. Each host's
+// reconciliation then reasons about leases the other one owns.
+//
+// The node name is configuration and the certificate is copyable, so neither can
+// distinguish a restart from a duplicate. A per-PROCESS incarnation can: a
+// restart brings a new value and the old process is gone, while a duplicate
+// brings a new value and the old process keeps talking. Only the second produces
+// requests carrying an incarnation that is no longer current.
+func TestTwoHostsSharingOneNodeNameAreCaught(t *testing.T) {
+	t.Parallel()
+
+	ca, base := mtlsWire(t)
+
+	bundle, err := ca.IssueNode("epyc-1")
+	if err != nil {
+		t.Fatalf("issue: %v", err)
+	}
+
+	conf, err := wirecert.ClientTLS(bundle)
+	if err != nil {
+		t.Fatalf("client tls: %v", err)
+	}
+
+	// THE SAME BUNDLE, TWICE. Two clients, two processes, one certificate.
+	first, err := nodeclient.New(nodeclient.Options{Base: base, Node: "epyc-1", TLS: conf})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+
+	second, err := nodeclient.New(nodeclient.Options{Base: base, Node: "epyc-1", TLS: conf})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+
+	if first.Incarnation() == second.Incarnation() {
+		t.Fatal("two node processes minted the same incarnation, so nothing can tell them apart")
+	}
+
+	if err := first.Register(t.Context(), config.ProviderDocker, nil, wireDeployment); err != nil {
+		t.Fatalf("the first host could not register: %v", err)
+	}
+
+	// The first host is working normally at this point.
+	if _, err := first.Lease(t.Context(), "l1"); err != nil {
+		t.Fatalf("the first host was refused before anything superseded it: %v", err)
+	}
+
+	if err := second.Register(t.Context(), config.ProviderDocker, nil, wireDeployment); err != nil {
+		t.Fatalf("the second host could not register: %v", err)
+	}
+
+	// AND NOW THE FIRST IS FENCED. It is still running, still authenticated, and
+	// still convinced it owns the name.
+	_, err = first.Lease(t.Context(), "l1")
+	if !errors.Is(err, nodeclient.ErrSuperseded) {
+		t.Errorf("the superseded host was not fenced (%v); two hosts are acting as one node "+
+			"and their compute cannot be told apart", err)
+	}
+
+	// The host that registered most recently is the one that works.
+	if _, err := second.Lease(t.Context(), "l1"); err != nil {
+		t.Errorf("the current host was refused: %v", err)
+	}
+}
+
+// A RESTART IS NOT A DUPLICATE, and refusing one would be worse than the bug.
+//
+// The same process re-registering after the control plane forgot it — a plane
+// restart, a partition — keeps its incarnation, so nothing fences it. Getting
+// this wrong takes out a healthy fleet at exactly the moment the control plane
+// is least able to explain why.
+func TestAReconnectingNodeIsNotFenced(t *testing.T) {
+	t.Parallel()
+
+	ca, base := mtlsWire(t)
+
+	c := nodeClient(t, ca, base, "epyc-1", "epyc-1")
+
+	for range 3 {
+		if err := c.Register(t.Context(), config.ProviderDocker, nil, wireDeployment); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+
+		if _, err := c.Lease(t.Context(), "l1"); err != nil {
+			t.Fatalf("a node that re-registered as itself was fenced: %v", err)
+		}
+	}
+}
+
 // A CERTIFICATE FROM ANOTHER DEPLOYMENT NEVER REACHES A HANDLER.
 //
 // Two billet installations on one network are ordinary — a laptop and a server,

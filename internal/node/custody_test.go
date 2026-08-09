@@ -1234,6 +1234,69 @@ func TestKeepAliveRenewsHeldLeasesWhileTendIsBlocked(t *testing.T) {
 	}
 }
 
+// A LAUNCH IN PROGRESS IS RENEWED, because for its whole duration nobody else
+// is doing it.
+//
+// Across the wire the control plane stops waiting after its command timeout and
+// hands the listener custody, which stops the listener heartbeating. The node is
+// meanwhile still inside provider.Launch — pulling a large image, say — and does
+// not adopt anything until that call returns. Between those two moments the
+// lease had no owner: the reaper released its capacity, the allocator sold it to
+// another job, and then the launch completed and started a second workload on
+// hardware that was already spoken for.
+func TestALaunchInProgressKeepsItsLeaseRenewed(t *testing.T) {
+	t.Parallel()
+
+	// A provider that blocks inside Launch, which is the whole situation.
+	p := &fakeProvider{
+		kind:          config.ProviderDocker,
+		launchDelay:   time.Hour,
+		enteredLaunch: make(chan struct{}, 1),
+	}
+
+	a, host := newAllocatorWithHost(t)
+
+	store := &brittleStore{LeaseStore: a}
+	r := New(store, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r.ttl = func() time.Duration { return 30 * time.Millisecond }
+
+	lease := assignedLease(t, a)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	go func() {
+		//nolint:errcheck // it is expected to block, not to return
+		_ = r.Launch(ctx, lease, Job{RequestID: 11, Event: "push"})
+	}()
+
+	select {
+	case <-p.enteredLaunch:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the provider was never asked to launch")
+	}
+
+	before := store.heartbeats.Load()
+
+	go r.KeepAlive(ctx)
+
+	// SEVERAL renewals, not one: one could be a coincidence of ordering.
+	const want = 3
+
+	deadline := time.Now().Add(15 * time.Second)
+
+	for store.heartbeats.Load() < before+want {
+		if time.Now().After(deadline) {
+			t.Fatalf("a lease whose launch is still running was renewed %d times, want at "+
+				"least %d; nothing holds it while the provider works, so the reaper "+
+				"reclaims its capacity and the launch lands on hardware already resold",
+				store.heartbeats.Load()-before, want)
+		}
+
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // THE JANITOR FOLLOWS A RENEGOTIATED TTL, because the plane can shorten it.
 //
 // The TTL is agreed at registration, and a node re-registers whenever the

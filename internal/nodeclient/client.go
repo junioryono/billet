@@ -10,7 +10,9 @@ package nodeclient
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -54,12 +56,29 @@ var ErrRefused = errors.New("nodeclient: the control plane refused this node")
 // had.
 var ErrUnauthenticated = errors.New("nodeclient: this node did not prove who it is")
 
+// ErrSuperseded means another process has registered under this node's name.
+//
+// The node STOPS on this, and stopping is the point. Re-registering would take
+// the name back, the other host would take it back in turn, and the control
+// plane's accounting would follow neither while both ran containers against the
+// same leases. It is a configuration mistake — one certificate bundle copied to
+// two machines, or one name written into two config files — and an operator has
+// to fix it.
+var ErrSuperseded = errors.New("nodeclient: another process is registered as this node")
+
 // Client talks to a control plane.
 type Client struct {
-	base       string
-	node       string
-	http       *http.Client
-	reqTimeout time.Duration
+	base string
+	node string
+	// incarnation identifies THIS node process, for the whole of its life.
+	//
+	// Minted once, here, rather than per registration: a node that re-registers
+	// after the plane forgot it is the same process holding the same compute, and
+	// giving it a new identity each time would make every reconnect look like a
+	// second host.
+	incarnation string
+	http        *http.Client
+	reqTimeout  time.Duration
 
 	// WRITTEN BY EVERY REGISTRATION, READ BY THE JANITOR AND THE POLL LOOP, which
 	// are different goroutines with no lock between them. Plain fields here were a
@@ -116,11 +135,17 @@ func New(opts Options) (*Client, error) {
 		return nil, err
 	}
 
+	incarnation, err := mintIncarnation()
+	if err != nil {
+		return nil, err
+	}
+
 	c := &Client{
-		base:       base,
-		node:       opts.Node,
-		http:       opts.HTTP,
-		reqTimeout: opts.RequestTimeout,
+		base:        base,
+		node:        opts.Node,
+		incarnation: incarnation,
+		http:        opts.HTTP,
+		reqTimeout:  opts.RequestTimeout,
 	}
 
 	if c.reqTimeout <= 0 {
@@ -236,11 +261,12 @@ func (c *Client) Register(
 	var res nodeapi.RegisterResponse
 
 	err := c.do(ctx, http.MethodPost, "/v1/register", nodeapi.RegisterRequest{
-		Version:    nodeapi.Version,
-		Node:       c.node,
-		Provider:   provider,
-		GuestOS:    guestOS,
-		Deployment: deployment,
+		Version:     nodeapi.Version,
+		Incarnation: c.incarnation,
+		Node:        c.node,
+		Provider:    provider,
+		GuestOS:     guestOS,
+		Deployment:  deployment,
 	}, &res)
 	if err != nil {
 		return err
@@ -268,6 +294,25 @@ func (c *Client) Register(
 	c.poll.Store(int64(time.Duration(res.PollSeconds) * time.Second))
 
 	return nil
+}
+
+// Incarnation identifies this node process.
+func (c *Client) Incarnation() string { return c.incarnation }
+
+// mintIncarnation picks a value no other node process will hold.
+//
+// RANDOM, NOT A COUNTER OR A TIMESTAMP. A counter starts again at one after a
+// restart, and two hosts booted by the same automation at the same second share
+// a timestamp — both of which produce collisions in exactly the situation this
+// exists to detect.
+func mintIncarnation() (string, error) {
+	var raw [16]byte
+
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", fmt.Errorf("nodeclient: mint an incarnation: %w", err)
+	}
+
+	return hex.EncodeToString(raw[:]), nil
 }
 
 // requestTimeout bounds an ordinary request.
@@ -494,6 +539,12 @@ func (c *Client) doStatus(ctx context.Context, method, path string, body, into a
 		req.Header.Set("Content-Type", "application/json")
 	}
 
+	// ON EVERY REQUEST, including the ones with no body. The registration claims
+	// an incarnation; each request after it proves the claim is still held by the
+	// process that made it, which is what lets the control plane tell a restart
+	// from a second host wearing the same name.
+	req.Header.Set(nodeapi.HeaderIncarnation, c.incarnation)
+
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return 0, fmt.Errorf("nodeclient: %s %s: %w", method, path, err)
@@ -551,6 +602,8 @@ func (c *Client) decodeErr(resp *http.Response) error {
 	switch body.Code {
 	case nodeapi.CodeRefused:
 		return fmt.Errorf("%w: %s", ErrRefused, body.Message)
+	case nodeapi.CodeSuperseded:
+		return fmt.Errorf("%w: %s", ErrSuperseded, body.Message)
 	case nodeapi.CodeUnauthenticated:
 		return fmt.Errorf("%w: %s", ErrUnauthenticated, body.Message)
 	case nodeapi.CodeCustody:

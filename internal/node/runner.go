@@ -94,6 +94,15 @@ type Runner struct {
 	// handing back capacity that something may still be using.
 	custody map[string]*custody
 
+	// launching holds leases whose compute is being created right now.
+	//
+	// SEPARATE FROM custody because it means something different: custody is
+	// compute billet cannot account for, and this is compute it is deliberately
+	// creating. They are renewed identically and for the same reason — something
+	// has to hold the lease while nobody else can — but an entry here is expected
+	// to disappear within one launch, and an entry in custody is a problem.
+	launching map[string]*custody
+
 	// now is time.Now, replaceable so a test can age a custody entry without
 	// sleeping.
 	now func() time.Time
@@ -286,6 +295,13 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job Job) error 
 
 		return fmt.Errorf("node: mint a registration for %s: %w", name, err)
 	}
+
+	// RENEWED FROM HERE, because from here something may exist. The control plane
+	// gives up on an unanswered command after its timeout and hands the listener
+	// custody, which stops the listener heartbeating; if the provider is still
+	// working at that moment, nothing at all is holding the lease.
+	stopHolding := r.holdWhileLaunching(lease, name)
+	defer stopHolding()
 
 	inst, err := r.provider.Launch(ctx, provider.Spec{
 		// BILLET's name, not GitHub's. reg.RunnerName() is what GitHub called the

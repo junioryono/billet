@@ -646,6 +646,84 @@ func TestAForgottenNodeReleasesItsQueuedWork(t *testing.T) {
 	}
 }
 
+// A RESULT THAT LANDS AS THE TIMER FIRES IS STILL A RESULT.
+//
+// Both branches of dispatch's select are live at once. The timer fires, and
+// Result takes the plane's mutex first: it deletes the inflight entry, delivers
+// the answer, and replies 204 to a node that is now certain its report landed.
+// The timeout branch used to declare custody anyway, and the listener stopped
+// heartbeating on the strength of it. Nobody held the lease, the container was
+// running, and each side believed the other had it.
+//
+// Written against settle directly rather than raced, because a test that merely
+// runs the race proves whichever ordering it happened to get. This reproduces
+// the losing ordering exactly: the result is already delivered and the inflight
+// entry already gone, which is the state Result leaves behind.
+func TestAResultThatLandedBeforeTheTimeoutIsTaken(t *testing.T) {
+	t.Parallel()
+
+	p := testPlane(t)
+	register(t, p, "n1", config.ProviderDocker)
+
+	p.mu.Lock()
+	n := p.nodes["n1"]
+	p.mu.Unlock()
+
+	pend := &pending{
+		cmd:       nodeapi.Command{ID: "c1", Kind: nodeapi.CommandLaunch, RequestID: 7},
+		done:      make(chan nodeapi.CommandResult, 1),
+		delivered: true,
+	}
+
+	// Exactly what Result leaves behind when it wins the mutex.
+	pend.done <- nodeapi.CommandResult{ID: "c1", OK: true}
+
+	res, err := p.settle(n, pend, errors.New("the command timed out"))
+	if err != nil {
+		t.Fatalf("a launch whose result had already arrived was reported as %v; the node was "+
+			"told 204 and will not take custody, so nothing holds that lease", err)
+	}
+
+	if !res.OK {
+		t.Errorf("the delivered result was not returned: %+v", res)
+	}
+}
+
+// The mirror: with nothing delivered, a timed-out launch still means custody.
+//
+// Without this the test above would pass against a settle that returned success
+// unconditionally, which is the opposite bug and a worse one.
+func TestATimedOutLaunchWithNoResultStillMeansCustody(t *testing.T) {
+	t.Parallel()
+
+	p := testPlane(t)
+	register(t, p, "n1", config.ProviderDocker)
+
+	p.mu.Lock()
+	n := p.nodes["n1"]
+	p.mu.Unlock()
+
+	pend := &pending{
+		cmd:       nodeapi.Command{ID: "c1", Kind: nodeapi.CommandLaunch, RequestID: 7},
+		done:      make(chan nodeapi.CommandResult, 1),
+		delivered: true,
+	}
+
+	n.inflight[pend.cmd.ID] = pend
+
+	_, err := p.settle(n, pend, errors.New("the command timed out"))
+	if !errors.Is(err, server.ErrCustody) {
+		t.Fatalf("a delivered launch that never answered must report custody, got %v", err)
+	}
+
+	// And it left the tombstone that tells a late report the lease is now the
+	// node's.
+	if _, ok := n.abandoned[pend.cmd.ID]; !ok {
+		t.Error("no tombstone was recorded, so a late success is answered with a shrug and " +
+			"the container runs under a lease nothing renews")
+	}
+}
+
 // A DESTROY NOBODY CONFIRMED IS A FAILURE, EVEN WHEN THE NODE HAS GONE.
 //
 // The tempting reading is that a vanished node took its containers with it, so

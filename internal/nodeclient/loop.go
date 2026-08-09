@@ -195,6 +195,17 @@ func Run(ctx context.Context, c *Client, compute Compute, opts LoopOptions) erro
 			return ctx.Err()
 		}
 
+		// SUPERSEDED IS NOT SOMETHING TO RETRY, and re-registering is the specific
+		// wrong move. It would take the name back from whichever host holds it now,
+		// that host would take it back in turn, and the control plane's accounting
+		// would follow neither while both ran containers against the same leases.
+		// Two hosts under one node name is a configuration mistake — a certificate
+		// bundle copied to both, or the same node.name in two files — and an
+		// operator has to fix it.
+		if errors.Is(err, ErrSuperseded) {
+			return fmt.Errorf("this node has been superseded: %w", err)
+		}
+
 		// RE-REGISTERING IS THE ONLY ANSWER to being unknown, and it is what a node
 		// meets after the control plane restarts. Anything else is retried in
 		// place by serve itself.
@@ -243,7 +254,7 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 
 		cmd, ok, err := c.Poll(ctx)
 		if err != nil {
-			if errors.Is(err, ErrUnregistered) || ctx.Err() != nil {
+			if errors.Is(err, ErrUnregistered) || errors.Is(err, ErrSuperseded) || ctx.Err() != nil {
 				return err
 			}
 

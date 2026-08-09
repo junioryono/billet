@@ -75,6 +75,20 @@ type RegisterRequest struct {
 	// server can refuse a node that belongs to a different installation rather
 	// than accepting commands it will label unrecognisably.
 	Deployment string `json:"deployment"`
+	// Incarnation is a fresh random value for THIS node process.
+	//
+	// IT DISTINGUISHES A RESTART FROM A DUPLICATE, which the node name alone
+	// cannot. A name is configuration and a certificate can be copied, so two
+	// hosts can arrive claiming to be the same node — and once they have, the
+	// control plane's answer to "whose compute is this" is a coin toss. Commands
+	// go to whichever polled last, and each host's reconciliation reasons about
+	// leases the other one owns.
+	//
+	// A restart is the benign case and looks identical at the name level: the new
+	// process supersedes the old, which is gone. What separates them is whether
+	// the OLD incarnation keeps talking afterwards, and that is a question only a
+	// per-process value can answer.
+	Incarnation string `json:"incarnation"`
 }
 
 // RegisterResponse tells a node what it needs to behave correctly.
@@ -88,6 +102,14 @@ type RegisterResponse struct {
 	// when silence means "nothing to do" rather than "the connection is dead".
 	PollSeconds int `json:"poll_seconds"`
 }
+
+// HeaderIncarnation carries the node process's identity on every request.
+//
+// A HEADER RATHER THAN A BODY FIELD, because it has to be on requests that have
+// no body — the long poll, the lease reads — and on every one of them. The
+// registration is where an incarnation is CLAIMED; this is how each later
+// request proves it is still the process that claimed it.
+const HeaderIncarnation = "Billet-Incarnation"
 
 // Command is one instruction, delivered in answer to a long poll.
 //

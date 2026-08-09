@@ -89,10 +89,19 @@ type Plane struct {
 
 // node is one registered compute host.
 type node struct {
-	name     string
-	provider config.ProviderKind
-	guestOS  []config.GuestOS
-	lastSeen time.Time
+	name string
+	// incarnation is the node PROCESS currently registered under this name.
+	//
+	// The name is configuration and a certificate can be copied, so the name
+	// alone cannot say whether a second registration is the same host restarting
+	// or a different host arriving. This can: a restart brings a new value and
+	// the old process is gone, while a duplicate brings a new value and the old
+	// process keeps talking. Only the second produces requests carrying an
+	// incarnation that is no longer current, and those are refused.
+	incarnation string
+	provider    config.ProviderKind
+	guestOS     []config.GuestOS
+	lastSeen    time.Time
 
 	// queue holds commands not yet handed to the node.
 	queue []*pending
@@ -299,6 +308,18 @@ func (p *Plane) Register(
 		p.nodes[req.Node] = n
 	}
 
+	if n.incarnation != "" && n.incarnation != req.Incarnation {
+		// SAID OUT LOUD, because the two causes need different fixes and look
+		// identical from here. A restart is ordinary. A SECOND HOST arriving under
+		// a name that is already taken is a configuration mistake — one bundle
+		// copied to two machines, or one name in two config files — and the first
+		// symptom otherwise is compute nobody can attribute.
+		p.log.Warn("a different process has registered under this node's name; if the previous "+
+			"one is still running, two hosts are sharing one identity and their compute "+
+			"cannot be told apart",
+			"node", req.Node, "was", n.incarnation, "now", req.Incarnation)
+	}
+
 	// A RE-REGISTRATION IS A RESTART, and its in-flight commands are lost.
 	//
 	// The node that took them is gone, so nothing will ever report their results.
@@ -307,6 +328,17 @@ func (p *Plane) Register(
 	// recovery is what finds it. Retrying here would risk a second container for
 	// one job.
 	for id, pend := range n.inflight {
+		// TOMBSTONED, EXACTLY AS A TIMEOUT IS. This lease is being handed to the
+		// node, and until now nothing recorded that. A launch that was in flight
+		// across the re-registration — a partitioned host still working, or a
+		// process that restarted while its provider kept going — would report
+		// success afterwards, find no inflight entry and no tombstone, and be
+		// answered 204. The listener had already stopped heartbeating on the
+		// custody it was told about, so nothing held the lease at all.
+		if pend.cmd.Kind == nodeapi.CommandLaunch {
+			n.rememberAbandoned(id, p.now())
+		}
+
 		p.answerLocked(pend, nodeapi.CommandResult{
 			ID:      id,
 			Custody: pend.cmd.Kind == nodeapi.CommandLaunch,
@@ -316,6 +348,7 @@ func (p *Plane) Register(
 	}
 
 	n.inflight = map[string]*pending{}
+	n.incarnation = req.Incarnation
 	n.provider = req.Provider
 	n.guestOS = req.GuestOS
 	n.lastSeen = p.now()
@@ -336,6 +369,43 @@ func (p *Plane) answerLocked(pend *pending, res nodeapi.CommandResult) {
 	case pend.done <- res:
 	default:
 	}
+}
+
+// ErrSuperseded means the request came from a node process that is no longer the
+// registered one.
+//
+// TWO HOSTS UNDER ONE NAME is what this catches, and it is the shape a copied
+// certificate bundle produces. Both authenticate — the certificate is genuine —
+// and both claim the same node. Without this the control plane's answer to
+// "whose compute is this" is whichever host polled last, and each host's
+// reconciliation reasons about leases the other one owns.
+var ErrSuperseded = errors.New("nodeplane: another process is registered as this node")
+
+// CheckIncarnation reports whether a request came from the current node process.
+//
+// An empty claim is accepted from a node that has not registered since this
+// plane learned the field, and from the in-process runner, which has no wire to
+// carry one. It is the MISMATCH that is refused, never the absence: refusing an
+// absent value would take out every node mid-upgrade, which is the moment a
+// control plane most needs its fleet.
+func (p *Plane) CheckIncarnation(name, claimed string) error {
+	if claimed == "" {
+		return nil
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	n, ok := p.nodes[name]
+	if !ok || n.incarnation == "" || n.incarnation == claimed {
+		return nil
+	}
+
+	return fmt.Errorf(
+		"%w: node %q is registered by process %s, and this request came from %s. Two hosts "+
+			"are configured as the same node — check for a certificate bundle copied to both, "+
+			"or the same node.name in two config files",
+		ErrSuperseded, name, n.incarnation, claimed)
 }
 
 // Seen records that a node just spoke, whatever it said.

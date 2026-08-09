@@ -339,11 +339,38 @@ func (p *Plane) dispatch(ctx context.Context, n *node, pend *pending) (nodeapi.C
 	case res := <-pend.done:
 		return res, nil
 	case <-ctx.Done():
-		return nodeapi.CommandResult{}, p.abandon(n, pend, ctx.Err())
+		return p.settle(n, pend, ctx.Err())
 	case <-timer.C:
-		return nodeapi.CommandResult{}, p.abandon(n, pend,
+		return p.settle(n, pend,
 			fmt.Errorf("node %s did not answer within %s", n.name, p.commandTimeout))
 	}
+}
+
+// settle decides what a timed-out wait actually means.
+//
+// THE ANSWER MAY HAVE ARRIVED WHILE WE WERE WAKING UP, and treating that as a
+// timeout was a way to lose a launch. Both branches are live at once: the timer
+// fires, and Result takes the mutex first — deletes the inflight entry, sends
+// the answer, and replies 204 to a node that is now certain its report landed.
+// The timeout branch then declared custody to the listener, which stopped
+// heartbeating. Nobody was holding the lease, the container was running, and
+// both sides believed the other had it.
+//
+// Draining happens UNDER THE MUTEX, which is what makes it exact rather than
+// hopeful: Result sends on this channel while holding the same lock, so once
+// this goroutine holds it either the send has completed or it has not started.
+// There is no third state to lose a result in.
+func (p *Plane) settle(n *node, pend *pending, cause error) (nodeapi.CommandResult, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	select {
+	case res := <-pend.done:
+		return res, nil
+	default:
+	}
+
+	return nodeapi.CommandResult{}, p.abandonLocked(n, pend, cause)
 }
 
 // abandon stops waiting for a command and says what that means.
@@ -353,10 +380,7 @@ func (p *Plane) dispatch(ctx context.Context, n *node, pend *pending) (nodeapi.C
 // One already handed over may be running, and the only safe answer is custody —
 // the same answer the in-process runner gives when it cannot confirm a launch
 // failed cleanly.
-func (p *Plane) abandon(n *node, pend *pending, cause error) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
+func (p *Plane) abandonLocked(n *node, pend *pending, cause error) error {
 	if pend.delivered {
 		delete(n.inflight, pend.cmd.ID)
 

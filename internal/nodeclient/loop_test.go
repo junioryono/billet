@@ -621,6 +621,78 @@ func TestALateResultMakesTheNodeAssumeCustody(t *testing.T) {
 	}
 }
 
+// A RE-REGISTRATION HANDS OVER CUSTODY TOO, and it left no record that it had.
+//
+// The timeout path tombstones an abandoned launch so a late report is answered
+// with "this is yours". Re-registration does the same handover — every in-flight
+// command is failed with custody, and the listener stops heartbeating on the
+// strength of it — and recorded nothing. A launch still running across that
+// moment, on a partitioned host or one whose provider outlived its billet
+// process, would report success afterwards, find neither an inflight entry nor a
+// tombstone, and be answered 204. Nothing held the lease at all.
+func TestARegistrationHandsOverCustodyOfWhatWasInFlight(t *testing.T) {
+	t.Parallel()
+
+	p, c := harness(t)
+
+	gate := make(chan struct{})
+	compute := &fakeCompute{
+		launchGate:    gate,
+		launchStarted: make(chan struct{}),
+	}
+
+	runLoop(t, c, compute)
+
+	waitFor(t, func() bool { return len(p.Nodes()) == 1 })
+
+	launched := make(chan error, 1)
+
+	go func() {
+		lease := &alloc.Lease{
+			ID:        "l1",
+			VCPU:      2,
+			Memory:    8 * config.GiB,
+			GuestOS:   config.GuestLinux,
+			Providers: []config.ProviderKind{config.ProviderDocker},
+			Epoch:     1,
+		}
+
+		launched <- p.NewRunner().Launch(t.Context(), lease, server.Job{RequestID: 7})
+	}()
+
+	select {
+	case <-compute.launchStarted:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the node never started the launch")
+	}
+
+	// The node re-registers while its launch is still running, which is what a
+	// reconnect after a partition looks like from the plane's side.
+	if err := c.Register(t.Context(), config.ProviderDocker, nil, deployment); err != nil {
+		t.Fatalf("re-register: %v", err)
+	}
+
+	select {
+	case err := <-launched:
+		if !errors.Is(err, server.ErrCustody) {
+			t.Fatalf("a launch in flight across a re-registration must report custody, got %v",
+				err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the launch never returned")
+	}
+
+	// Only now does the provider finish, so the report arrives after the handover.
+	close(gate)
+
+	waitFor(t, func() bool { return len(compute.custodyTaken()) == 1 })
+
+	if got := compute.custodyTaken(); len(got) != 1 || got[0] != 7 {
+		t.Errorf("custody taken for %v, want the request the plane handed over; without it "+
+			"the container runs under a lease nothing renews", got)
+	}
+}
+
 // A LOST RESULT MAKES THE NODE TAKE CUSTODY, because the server already has.
 //
 // The failure this prevents: the launch succeeds, the report is lost, the plane

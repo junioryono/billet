@@ -94,6 +94,15 @@ const (
 	// late, it is yours now" — because the plane already told the listener to stop
 	// heartbeating, and something has to be holding the lease.
 	CodeCustody = "custody"
+	// CodeSuperseded means another process has registered as this node.
+	//
+	// TERMINAL FOR THE NODE THAT RECEIVES IT. Re-registering would take the name
+	// back from whoever holds it now, and the two hosts would trade it forever
+	// while the control plane's accounting followed neither. Two hosts sharing a
+	// node name is a configuration mistake — a copied certificate bundle, or the
+	// same name written into two files — and it is fixed by an operator, not by
+	// retrying.
+	CodeSuperseded = "superseded"
 	// CodeUnauthenticated means the request carried no identity the control plane
 	// would accept. DISTINCT FROM CodeRefused on purpose: refused is a verdict on
 	// a node the plane knows, and the node stops. This one says the connection

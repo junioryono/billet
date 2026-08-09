@@ -124,7 +124,19 @@ type handler struct {
 // passing every request, and looking exactly like a working check.
 func (h *handler) forNode(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !h.authorise(w, r, r.PathValue("node")) {
+		node := r.PathValue("node")
+
+		if !h.authorise(w, r, node) {
+			return
+		}
+
+		// WHO is settled above; WHICH PROCESS is settled here. A certificate proves
+		// the host is entitled to the name; it cannot say whether this is still the
+		// process that registered under it, because a bundle copied to a second
+		// machine authenticates exactly as well as the original.
+		if err := h.plane.CheckIncarnation(node, r.Header.Get(nodeapi.HeaderIncarnation)); err != nil {
+			writeErr(w, http.StatusConflict, nodeapi.CodeSuperseded, err.Error())
+
 			return
 		}
 

@@ -309,6 +309,14 @@ type fakeProvider struct {
 	// enteredFind receives once per Find that has begun waiting, so a test can
 	// synchronise on the provider actually being busy instead of on a sleep.
 	enteredFind chan struct{}
+
+	// launchDelay holds Launch open, which is the situation a slow image pull
+	// produces and the one where nobody was renewing the lease.
+	launchDelay time.Duration
+
+	// enteredLaunch receives once Launch has begun waiting, so a test can act
+	// while the provider is genuinely mid-launch rather than sleeping and hoping.
+	enteredLaunch chan struct{}
 }
 
 func (f *fakeProvider) Kind() config.ProviderKind { return f.kind }
@@ -323,11 +331,26 @@ func (f *fakeProvider) Accepts(trust provider.TrustClass) error {
 	return errors.New("fake: refusing work that is not established as trusted")
 }
 
-func (f *fakeProvider) Launch(_ context.Context, spec provider.Spec) (*provider.Instance, error) {
+func (f *fakeProvider) Launch(ctx context.Context, spec provider.Spec) (*provider.Instance, error) {
 	f.launched = append(f.launched, spec)
 
 	if f.cancelOnLaunch != nil {
 		f.cancelOnLaunch()
+	}
+
+	if f.launchDelay > 0 {
+		if f.enteredLaunch != nil {
+			select {
+			case f.enteredLaunch <- struct{}{}:
+			default:
+			}
+		}
+
+		select {
+		case <-time.After(f.launchDelay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 
 	if f.launchErr != nil && !f.startsAnyway {

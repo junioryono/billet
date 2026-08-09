@@ -471,12 +471,56 @@ func (r *Runner) custodySnapshot() []*custody {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	out := make([]*custody, 0, len(r.custody))
+	out := make([]*custody, 0, len(r.custody)+len(r.launching))
 	for _, c := range r.custody {
 		out = append(out, c)
 	}
 
+	// A LAUNCH IN PROGRESS NEEDS RENEWING TOO, and nothing was doing it.
+	//
+	// Across the wire, the control plane stops waiting after the command timeout
+	// and hands the listener custody — which stops heartbeating on the strength of
+	// it. The node meanwhile is still INSIDE provider.Launch, pulling a large
+	// image, and does not adopt anything until that call returns. Between those
+	// two moments the lease has no owner at all: the reaper releases its capacity,
+	// the allocator sells it to another job, and then the launch completes and
+	// starts a second workload on the same hardware.
+	//
+	// So the node renews from the instant it commits to launching, which is the
+	// only moment either side can be sure something is about to exist.
+	for _, c := range r.launching {
+		out = append(out, c)
+	}
+
 	return out
+}
+
+// holdWhileLaunching keeps a lease renewed for as long as the launch runs.
+//
+// Returns the function that stops it. Renewing the same lease twice is harmless
+// — Heartbeat is idempotent, and a lease already gone answers ErrLeaseNotFound,
+// which renewHeld ignores — so the overlap with the listener's own heartbeat
+// costs nothing and the gap it closes is unbounded.
+func (r *Runner) holdWhileLaunching(lease *alloc.Lease, name string) func() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.launching == nil {
+		r.launching = make(map[string]*custody)
+	}
+
+	r.launching[lease.ID] = &custody{
+		leaseID: lease.ID,
+		epoch:   lease.Epoch,
+		name:    name,
+	}
+
+	return func() {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+
+		delete(r.launching, lease.ID)
+	}
 }
 
 // errCustody is returned by Launch when the runner has taken responsibility for
