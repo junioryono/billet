@@ -121,4 +121,20 @@ type CommandResult struct {
 	ID    string `json:"id"`
 	OK    bool   `json:"ok"`
 	Error string `json:"error,omitempty"`
+
+	// Custody says the node MAY have started something and is keeping the lease.
+	//
+	// Its own field because the server branches on it and must not read it out of
+	// the prose above. In-process this is server.ErrCustody, and the difference it
+	// makes is total: a clean failure releases the lease, while custody means the
+	// node has taken the lease into its own janitor, is still heartbeating it, and
+	// will release it once the compute is confirmed gone. Releasing as well would
+	// re-advertise capacity that a container may still be using.
+	//
+	// A LOST RESULT MEANS CUSTODY TOO. If the node dies between launching and
+	// reporting, the server learns nothing — and "nothing" is indistinguishable
+	// from "it started". The ambiguity resolves the same way it does in-process:
+	// assume something is running, keep the lease, and let the node's recovery
+	// adopt it. The opposite default releases capacity that is genuinely in use.
+	Custody bool `json:"custody,omitempty"`
 }
