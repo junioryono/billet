@@ -868,8 +868,60 @@ func TestAGroupWritableDirectoryWithoutSetgidIsRefused(t *testing.T) {
 			"lock file can carry a group the other account is not in")
 	}
 
-	if !strings.Contains(err.Error(), "g+s") {
-		t.Errorf("the refusal does not say how to fix it: %v", err)
+	// BOTH REMEDIES, because only one of them was asserted and it was the wrong
+	// one for the commoner case. A single-user operator with their own 0770
+	// directory is not sharing with anybody, and `chmod g+s` sends them to build a
+	// cross-account arrangement they do not want. Asserting only "g+s" let the
+	// `g-w` half be deleted with every test still green.
+	for _, want := range []string{"g+s", "g-w"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not offer %q as a way out: %v", want, err)
+		}
+	}
+}
+
+// A SHARED DIRECTORY MUST BE READABLE, and the refusal has to say why.
+//
+// billet opens the lock directory to validate it, so the 2730 drop-box shape —
+// write and traverse but no listing — is refused even though openat of a known
+// filename would not need read. That is a deliberate contract rather than an
+// oversight (a search-only descriptor is O_PATH on Linux, absent on darwin, and
+// cannot be fchmod'd), so the one thing it must not do is fail with a bare
+// permission error that sends an operator looking for the wrong problem.
+func TestAnUnreadableSharedDirectorySaysItNeedsRead(t *testing.T) {
+	t.Parallel()
+
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses directory permission checks, so this cannot be staged")
+	}
+
+	dir := t.TempDir()
+
+	t.Cleanup(func() {
+		// Restored, or t.TempDir cannot clean itself up.
+		if err := os.Chmod(dir, 0o700); err != nil {
+			t.Errorf("restore mode: %v", err)
+		}
+	})
+
+	// READ REMOVED FROM THE OWNER, not from the group. The shape this models is a
+	// 2730 directory seen by the OTHER account, which a single-user test cannot
+	// stage: at 2730 the owner still has rwx, so the open succeeds and the case
+	// never arises — measured on darwin, where exactly that happened and this test
+	// skipped itself into proving nothing. Taking read off the owner reproduces
+	// the same EACCES from the same line.
+	if err := os.Chmod(dir, os.ModeSetgid|0o370); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+
+	_, err := LockDeployment("0123456789abcdef0123456789abcdef", LockOptions{Dir: dir})
+	if err == nil {
+		t.Fatal("billet opened a directory it cannot read, so the contract this message " +
+			"describes is not the one being enforced")
+	}
+
+	if !strings.Contains(err.Error(), "2770") {
+		t.Errorf("the refusal does not name the mode that works: %v", err)
 	}
 }
 

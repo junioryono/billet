@@ -5,6 +5,7 @@ package state
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -76,7 +77,29 @@ func lockFile(path string, shared bool) (*dirLock, error) {
 // rather than diagnosed afterwards, and the returned descriptor keeps referring
 // to THAT inode however the name is rearranged later.
 func openLockDir(dir string) (*os.File, error) {
-	return os.OpenFile(dir, os.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
+	f, err := os.OpenFile(dir, os.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
+	if err == nil {
+		return f, nil
+	}
+
+	// O_RDONLY NEEDS READ ON THE DIRECTORY, which openat of a known filename does
+	// not fundamentally require — search and write would do. So a shared directory
+	// provisioned 2730 (the classic drop-box shape: write and traverse, no
+	// listing) is refused even though every account could open the lock by name.
+	//
+	// Requiring read rather than working around it, deliberately. A search-only
+	// descriptor is O_PATH on Linux and neither O_PATH nor O_SEARCH on darwin —
+	// checked, not assumed — and an O_PATH descriptor cannot be fchmod'd, which
+	// the tightening path needs. That is platform-divergent handle juggling for an
+	// uncommon shape, so billet asks for the simpler contract and says so instead
+	// of failing with a bare EACCES.
+	if errors.Is(err, fs.ErrPermission) {
+		return nil, fmt.Errorf(
+			"%w — billet needs to READ this directory, not only write it, so a shared lock "+
+				"directory must be mode 2770 rather than 2730", err)
+	}
+
+	return nil, err
 }
 
 // lockFileIn takes the lock relative to an already-resolved directory.
