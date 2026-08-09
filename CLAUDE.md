@@ -685,6 +685,31 @@ inheritance, `os.UserCacheDir`'s environment dependence), **write a throwaway pr
 that prints what actually happens** instead of reasoning from the documentation.
 Three of the defects above were documented behaviour that read the other way.
 
+**A mutation harness must prove it CHANGED the file.** Verify by hash, not by
+grepping for a string that may already be absent — a substitution that matches
+nothing reports SURVIVED, which is indistinguishable from a vacuous test and sends
+you to fix a test that was fine. This produced three false verdicts in one
+session, one of them because a route is registered as `root+"/installed"` rather
+than the literal the pattern looked for.
+
+**A clean `-race` run is evidence, not proof.** It only sees the interleavings
+that actually occurred. A concurrent slice read in the onboarding fake survived
+six clean `-race` runs because the racing append only happens while a request from
+the *previous* visit is still in flight. If two goroutines can reach the same
+field, fix it because they can, not because the detector complained.
+
+**A catch-all route means a deleted route still answers 200.** The onboarding
+loopback mux registers `root+"/"`, so removing `/installed` sends the callback to
+the start page rather than to a 404 — every status-based assertion reads that as
+success. Where a route matters, assert something only its handler produces.
+
+**A fallback path can make the thing it backs up untestable.** The same fake
+marked the installation visible as soon as the install page opened, so the
+authenticated poller completed the flow whether or not a callback was ever issued
+— deleting the callback, its route, or its address all left the tests green. When
+a fast path and a fallback both lead to success, the test has to withhold the
+fallback or it is only ever testing the fallback.
+
 ### `created` is not `running`
 
 `docker ps` reports created/running/paused/restarting/removing/exited/dead. A
