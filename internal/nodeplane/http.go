@@ -100,11 +100,18 @@ func (h *handler) register(w http.ResponseWriter, r *http.Request) {
 
 	res, err := h.plane.Register(r.Context(), req)
 	if err != nil {
-		// REFUSED, not "try again". A version mismatch or a foreign deployment
-		// cannot be fixed by retrying, and a node that retries forever against a
-		// control plane that will never accept it is a node nobody notices is
-		// broken.
-		writeErr(w, http.StatusForbidden, nodeapi.CodeRefused, err.Error())
+		// TWO KINDS OF NO, and conflating them was the bug. A verdict — wrong
+		// protocol version, foreign deployment — cannot be fixed by retrying, and
+		// a node that retried forever against it is a node nobody notices is
+		// broken. An OUTAGE, such as a ledger that cannot write, heals; telling
+		// that node to give up leaves it down after the database comes back.
+		if errors.Is(err, ErrRefused) {
+			writeErr(w, http.StatusForbidden, nodeapi.CodeRefused, err.Error())
+
+			return
+		}
+
+		writeErr(w, http.StatusServiceUnavailable, "", err.Error())
 
 		return
 	}

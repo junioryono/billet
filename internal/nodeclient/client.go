@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
@@ -47,9 +48,15 @@ type Client struct {
 	base       string
 	node       string
 	http       *http.Client
-	ttl        time.Duration
-	poll       time.Duration
 	reqTimeout time.Duration
+
+	// WRITTEN BY EVERY REGISTRATION, READ BY THE JANITOR AND THE POLL LOOP, which
+	// are different goroutines with no lock between them. Plain fields here were a
+	// data race that -race would only catch on the re-registration a test has to
+	// go out of its way to produce: the first registration happens-before the
+	// janitor starts, and every one after it does not.
+	ttl  atomic.Int64 // nanoseconds
+	poll atomic.Int64 // nanoseconds
 }
 
 // Options configures a Client.
@@ -149,13 +156,17 @@ func (c *Client) Register(
 	// TAKEN FROM THE SERVER, not chosen here. The reaper on the other side is what
 	// enforces the TTL, so a node that picked its own renewal cadence would be
 	// guessing at someone else's deadline.
-	c.ttl = time.Duration(res.LeaseTTLSeconds) * time.Second
-	c.poll = time.Duration(res.PollSeconds) * time.Second
+	ttl := time.Duration(res.LeaseTTLSeconds) * time.Second
 
-	if c.ttl <= 0 {
+	// VALIDATED BEFORE IT IS PUBLISHED. Storing an unusable TTL and then reporting
+	// the error would leave a janitor already running on the bad value.
+	if ttl <= 0 {
 		return fmt.Errorf("nodeclient: control plane reported a lease TTL of %ds, which cannot "+
 			"be renewed against", res.LeaseTTLSeconds)
 	}
+
+	c.ttl.Store(int64(ttl))
+	c.poll.Store(int64(time.Duration(res.PollSeconds) * time.Second))
 
 	return nil
 }
@@ -175,15 +186,18 @@ const requestTimeout = 30 * time.Second
 const pollSlack = 15 * time.Second
 
 // LeaseTTL is how long a lease survives without a heartbeat.
-func (c *Client) LeaseTTL() time.Duration { return c.ttl }
+//
+// Zero until the first registration answers, because the server is what decides
+// it. A caller that renews on this must not start before then.
+func (c *Client) LeaseTTL() time.Duration { return time.Duration(c.ttl.Load()) }
 
 // PollWindow is how long a command poll may block.
 func (c *Client) PollWindow() time.Duration {
-	if c.poll <= 0 {
-		return 50 * time.Second
+	if poll := time.Duration(c.poll.Load()); poll > 0 {
+		return poll
 	}
 
-	return c.poll
+	return 50 * time.Second
 }
 
 // Poll waits for one command.

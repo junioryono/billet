@@ -615,6 +615,63 @@ func TestALedgerRefusalFailsTheRegistration(t *testing.T) {
 	}
 }
 
+// A LEDGER OUTAGE IS RETRYABLE; A VERDICT IS NOT.
+//
+// The node STOPS on a refusal, so the classification decides whether a database
+// blip takes a host down permanently. A ledger that could not write the node row
+// will succeed once it answers again; a protocol mismatch never will.
+func TestOnlyAVerdictIsPermanent(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a ledger outage is retryable", func(t *testing.T) {
+		t.Parallel()
+
+		reg := &fakeRegistrar{err: errors.New("database is locked")}
+
+		log := slog.New(slog.DiscardHandler)
+		p := nodeplane.New(log, deployment, time.Minute, nodeplane.WithRegistrar(reg))
+		srv := httptest.NewServer(nodeplane.Handler(log, p, &fakeStore{}, nil))
+
+		t.Cleanup(srv.Close)
+
+		c, err := nodeclient.New(nodeclient.Options{Base: srv.URL, Node: "n1"})
+		if err != nil {
+			t.Fatalf("new client: %v", err)
+		}
+
+		err = c.Register(t.Context(), config.ProviderDocker, nil, deployment)
+		if err == nil {
+			t.Fatal("a registration the ledger could not record was accepted")
+		}
+
+		if errors.Is(err, nodeclient.ErrRefused) {
+			t.Errorf("a ledger outage was reported as a permanent refusal, so the node would "+
+				"give up and stay down after the database recovered: %v", err)
+		}
+	})
+
+	t.Run("a foreign deployment is permanent", func(t *testing.T) {
+		t.Parallel()
+
+		log := slog.New(slog.DiscardHandler)
+		p := nodeplane.New(log, deployment, time.Minute)
+		srv := httptest.NewServer(nodeplane.Handler(log, p, &fakeStore{}, nil))
+
+		t.Cleanup(srv.Close)
+
+		c, err := nodeclient.New(nodeclient.Options{Base: srv.URL, Node: "n1"})
+		if err != nil {
+			t.Fatalf("new client: %v", err)
+		}
+
+		err = c.Register(t.Context(), config.ProviderDocker, nil, "ffffffffffffffffffffffffffffffff")
+		if !errors.Is(err, nodeclient.ErrRefused) {
+			t.Errorf("a foreign deployment identity must be permanent, or the node retries "+
+				"something that will never be accepted: %v", err)
+		}
+	})
+}
+
 // Loopback is the only address the wire may serve on without TLS.
 //
 // THIS TEST USED TO ASSERT THE VULNERABILITY. It listed ":7717" as safe, which is

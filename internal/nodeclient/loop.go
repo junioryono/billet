@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
@@ -96,19 +97,44 @@ func Run(ctx context.Context, c *Client, compute Compute, opts LoopOptions) erro
 		backoff = 5 * time.Second
 	}
 
-	// STARTED ONCE, FOR THE PROCESS'S WHOLE LIFE, and outside the register loop.
+	// STARTED ONCE, AFTER THE FIRST SUCCESSFUL REGISTRATION, and stopped with Run.
 	//
 	// Custody outlives any single registration: a lease the runner is holding
 	// because it could not confirm a container gone must keep being renewed while
 	// the node re-registers, reconnects, or waits out a control plane that is
-	// restarting. Tying the janitor to a registration would stop renewing exactly
-	// when the connection is least reliable, which is when custody is most likely
-	// to exist.
+	// restarting. Tying the janitor to each registration would stop renewing
+	// exactly when the connection is least reliable, which is when custody is most
+	// likely to exist.
 	//
-	// It renews on its own clock rather than on the poll's, because the poll can
-	// block for the whole poll window and a lease TTL is shorter than that window
-	// is allowed to be.
-	go compute.KeepAlive(ctx)
+	// But it cannot start BEFORE the first one either, which is where it began.
+	// The janitor reads the lease TTL to pick its cadence, and that value is
+	// learned during registration — starting first meant reading a zero and
+	// renewing on a one-second fallback for the process's whole life, while
+	// racing the write that would have told it the truth.
+	//
+	// Its own context, cancelled when Run returns, so a node that stops because
+	// it was refused does not leave a goroutine heartbeating behind it.
+	janitorCtx, stopJanitor := context.WithCancel(ctx)
+	defer stopJanitor()
+
+	var (
+		janitor     sync.WaitGroup
+		startedOnce sync.Once
+	)
+
+	defer janitor.Wait()
+
+	startJanitor := func() {
+		startedOnce.Do(func() {
+			janitor.Add(1)
+
+			go func() {
+				defer janitor.Done()
+
+				compute.KeepAlive(janitorCtx)
+			}()
+		})
+	}
 
 	for {
 		if err := c.Register(ctx, opts.Provider, opts.GuestOS, opts.Deployment); err != nil {
@@ -138,6 +164,10 @@ func Run(ctx context.Context, c *Client, compute Compute, opts LoopOptions) erro
 
 		log.Info("registered with the control plane",
 			"node", c.node, "provider", opts.Provider, "lease_ttl", c.LeaseTTL())
+
+		// Now that the TTL is known, the janitor can pick a cadence that matches
+		// the deadline the reaper on the other side actually enforces.
+		startJanitor()
 
 		if err := compute.Recover(ctx); err != nil {
 			log.Error("could not reconcile with what is already running; not taking work "+
@@ -243,9 +273,13 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 			// the control plane is exactly when custody matters most, and returning
 			// first would skip it.
 			if res.OK && cmd.Kind == nodeapi.CommandLaunch && cmd.Lease != nil {
+				// A FAILURE HERE IS RENEWAL FAILING, NOT CUSTODY FAILING. The
+				// runner records the lease before it tries to renew it, precisely
+				// because this call happens during the outage that lost the report
+				// — so the janitor already owns it and will keep retrying.
 				if custodyErr := compute.AssumeCustody(ctx, cmd.Lease, cmd.RequestIDOf()); custodyErr != nil {
-					log.Error("could not take custody of a launch whose result was lost; its "+
-						"lease will be reaped while the container runs",
+					log.Warn("took custody of a launch whose result was lost, but could not "+
+						"renew its lease yet; the janitor will keep trying",
 						"command", cmd.ID, "lease", cmd.Lease.ID, "error", custodyErr)
 				}
 			}

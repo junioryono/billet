@@ -1010,6 +1010,25 @@ func defaultStateDir(role string) string {
 	return filepath.Join(".", ".billet", role)
 }
 
+// LockDirsAgree reports whether both roles would take their lock in the same
+// place.
+//
+// ASKED WHERE THE ROLES ACTUALLY CO-LOCATE, not at load. Requiring equality
+// whenever both YAML sections exist looked tidy and refused a legitimate shape:
+// one configuration file deployed to every machine, carrying a controller's
+// lock_dir that a node-only host never uses. That host would fail to start over a
+// setting with no bearing on it.
+//
+// `server --dev` is the case that matters, because it is the one process that
+// runs both roles in one place — see cmdServer, which asks this.
+func (c *Config) LockDirsAgree() bool {
+	if c.Server == nil || c.Node == nil {
+		return true
+	}
+
+	return c.Server.LockDir == c.Node.LockDir
+}
+
 // Validate reports every problem it finds rather than stopping at the first, so
 // a misconfigured deployment takes one round trip to fix instead of five.
 func (c *Config) Validate() error {
@@ -1106,17 +1125,6 @@ func (c *Config) validateNode() []error {
 			"node.lock_dir must be an absolute path, got %q: a relative one resolves against "+
 				"each process's working directory, so the node and the server could lock "+
 				"different files for one deployment identity", c.Node.LockDir))
-	}
-
-	// BOTH OR NEITHER, on a host that runs both roles. Setting one and not the
-	// other is the exact shape that produces two locks for one identity, and it
-	// looks deliberate enough that nothing else would question it.
-	if c.Server != nil && c.Server.LockDir != c.Node.LockDir {
-		errs = append(errs, fmt.Errorf(
-			"server.lock_dir is %q but node.lock_dir is %q; on a host running both roles they "+
-				"must match, or the two processes take different locks for one deployment "+
-				"identity and both manage the same containers",
-			c.Server.LockDir, c.Node.LockDir))
 	}
 
 	// Parsed here so a typo is reported when the file is READ, rather than hours

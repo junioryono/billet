@@ -30,6 +30,16 @@ var ErrNoNode = errors.New("nodeplane: no registered node can run this lease")
 // ErrUnregistered means the node making a request is not known.
 var ErrUnregistered = errors.New("nodeplane: node is not registered")
 
+// ErrRefused means a registration was understood and rejected on its merits.
+//
+// PERMANENT, AND THAT IS THE DISTINCTION THAT MATTERS. A node told this stops
+// rather than retrying, so it must never carry a failure that could heal. A
+// protocol version mismatch and a foreign deployment identity qualify: they will
+// be refused identically forever. A ledger that could not write the node row
+// does NOT — that is an outage, and a node that gave up on it would stay down
+// after the database came back.
+var ErrRefused = errors.New("nodeplane: registration refused")
+
 // defaultCommandTimeout bounds how long a launch waits for a node to answer.
 //
 // It is NOT a statement that nothing started. A command already handed to a node
@@ -115,6 +125,24 @@ func (p *Plane) ForgetForTest(name string) {
 	delete(p.nodes, name)
 }
 
+// QueuedForTest reports how many commands are waiting to be taken.
+//
+// Exported for tests only. Expiry and dispatch race unless a test can see that
+// the command it queued has actually arrived, and polling for that is the only
+// way to make the ordering deterministic without inventing a hook production
+// would never use.
+func (p *Plane) QueuedForTest(name string) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	n, ok := p.nodes[name]
+	if !ok {
+		return 0
+	}
+
+	return len(n.queue)
+}
+
 // SetPollWindowForTest shortens the long-poll window.
 //
 // Exported for tests only, and named so nobody mistakes it for configuration:
@@ -182,22 +210,22 @@ func (p *Plane) Register(
 ) (nodeapi.RegisterResponse, error) {
 	if req.Version != nodeapi.Version {
 		return nodeapi.RegisterResponse{}, fmt.Errorf(
-			"nodeplane: node %q speaks protocol version %d, this control plane speaks %d; "+
+			"%w: node %q speaks protocol version %d, this control plane speaks %d; "+
 				"upgrade whichever is older — they are separately deployed on purpose and a "+
 				"mismatch must be a refusal rather than a decode error mid-launch",
-			req.Node, req.Version, nodeapi.Version)
+			ErrRefused, req.Node, req.Version, nodeapi.Version)
 	}
 
 	if req.Node == "" {
-		return nodeapi.RegisterResponse{}, errors.New("nodeplane: a node must have a name")
+		return nodeapi.RegisterResponse{}, fmt.Errorf("%w: a node must have a name", ErrRefused)
 	}
 
 	if req.Deployment != p.deployment {
 		return nodeapi.RegisterResponse{}, fmt.Errorf(
-			"nodeplane: node %q belongs to deployment %s, this control plane is %s; a node "+
-				"labels its compute with its own identity, so accepting it would produce "+
-				"containers this installation cannot attribute",
-			req.Node, req.Deployment, p.deployment)
+			"%w: node %q belongs to deployment %s, this control plane is %s; a node labels its "+
+				"compute with its own identity, so accepting it would produce containers this "+
+				"installation cannot attribute",
+			ErrRefused, req.Node, req.Deployment, p.deployment)
 	}
 
 	// THE LEDGER FIRST, and outside the mutex. A node that appears in the plane's
@@ -207,8 +235,12 @@ func (p *Plane) Register(
 	// so the node retries registration rather than believing it succeeded.
 	if p.registrar != nil {
 		if err := p.registrar.RegisterNode(ctx, req.Node, req.Provider); err != nil {
+			// NOT WRAPPED IN ErrRefused. A ledger that cannot write is an outage,
+			// not a verdict: the same node with the same config will succeed once
+			// the database answers again, and a node that gave up here would stay
+			// down after it recovered.
 			return nodeapi.RegisterResponse{}, fmt.Errorf(
-				"nodeplane: the ledger refused node %q: %w", req.Node, err)
+				"nodeplane: the ledger could not record node %q: %w", req.Node, err)
 		}
 	}
 
@@ -372,14 +404,28 @@ func (p *Plane) Result(nodeName string, res nodeapi.CommandResult) error {
 	return nil
 }
 
+// staleWindows is how many poll windows of silence mean a node is gone.
+//
+// A healthy node re-polls the moment its window closes, so several missed
+// windows is real absence rather than idleness. Generous by that measure on
+// purpose: forgetting a live node makes its next request fail with "register
+// again", which recovers in one round trip, while forgetting too slowly leaves a
+// corpse in every broadcast — and it was the corpse that caused the damage.
+const staleWindows = 4
+
 // staleAfter is how long a node may be silent before the plane forgets it.
 //
-// A healthy node re-polls the moment its window closes, so silence for several
-// windows means it is gone rather than idle. Generous by that measure on
-// purpose: forgetting a live node makes its next request fail with "register
-// again", which is recoverable, while forgetting too slowly leaves a corpse in
-// every broadcast — and it was the corpse that caused the damage.
-const staleAfter = 4 * defaultPollTimeout
+// DERIVED FROM THE WINDOW THE NODE WAS ACTUALLY TOLD, not from the default. A
+// deployment that lengthens the poll window would otherwise have healthy nodes
+// expired during the very window the server instructed them to wait out.
+func (p *Plane) staleAfter() time.Duration {
+	window := p.poll
+	if window <= 0 {
+		window = defaultPollTimeout
+	}
+
+	return staleWindows * window
+}
 
 // expireStaleLocked drops nodes that have gone silent.
 //
@@ -395,10 +441,28 @@ const staleAfter = 4 * defaultPollTimeout
 // went quiet, and a destroy becomes a plain failure the caller can retry.
 // Dropping them silently would leave callers waiting on a machine that is gone.
 func (p *Plane) expireStaleLocked() {
-	cutoff := p.now().Add(-staleAfter)
+	cutoff := p.now().Add(-p.staleAfter())
 
 	for name, n := range p.nodes {
 		if !n.lastSeen.Before(cutoff) {
+			continue
+		}
+
+		// A NODE WITH WORK IN FLIGHT IS NOT SILENT, IT IS BUSY.
+		//
+		// The loop executes commands synchronously, so a node pulling a five-minute
+		// image does not poll while it works — and expiring it there was actively
+		// harmful rather than merely wrong. Expiry answers an in-flight launch with
+		// custody, the listener stops heartbeating on that, and the lease is reaped
+		// before the provider has even returned. The launch then starts a runner on
+		// capacity that has already been sold to somebody else.
+		//
+		// The command timeout is what bounds this instead, and it is the right
+		// instrument: it is already the thing that decides how long an unanswered
+		// command may run before its outcome is called unknown. A node that is
+		// genuinely dead has its commands timed out first and becomes expirable
+		// immediately afterwards.
+		if len(n.inflight) > 0 {
 			continue
 		}
 
@@ -407,7 +471,7 @@ func (p *Plane) expireStaleLocked() {
 				ID:      id,
 				Custody: pend.cmd.Kind == nodeapi.CommandLaunch,
 				Error: fmt.Sprintf("node %q went silent for %s, so the outcome of this command "+
-					"is unknown", name, staleAfter),
+					"is unknown", name, p.staleAfter()),
 			})
 		}
 

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,6 +16,30 @@ import (
 )
 
 const deployment = "0123456789abcdef0123456789abcdef"
+
+// testClock is a clock a test can move.
+//
+// ATOMIC BECAUSE THE PLANE READS IT FROM ITS OWN GOROUTINES. A closure over a
+// plain variable is the obvious shape and it is a data race the moment the code
+// under test consults the clock anywhere but the test's own goroutine — which is
+// exactly what expiry does, from inside a broadcast.
+type testClock struct {
+	nanos atomic.Int64
+}
+
+func newTestClock() *testClock {
+	c := &testClock{}
+	c.nanos.Store(time.Now().UnixNano())
+
+	return c
+}
+
+func (c *testClock) now() time.Time { return time.Unix(0, c.nanos.Load()) }
+
+// advancePastSilence moves the clock beyond any node's silence window, which is
+// the only jump these tests need: every one of them is asking what happens to a
+// node the plane would now consider gone.
+func (c *testClock) advancePastSilence() { c.nanos.Add(int64(10 * time.Minute)) }
 
 func testPlane(t *testing.T, opts ...Option) *Plane {
 	t.Helper()
@@ -475,10 +500,9 @@ func TestADestroyReportsEveryNodeThatFailed(t *testing.T) {
 func TestASilentNodeIsForgotten(t *testing.T) {
 	t.Parallel()
 
-	now := time.Now()
-	clock := func() time.Time { return now }
+	clock := newTestClock()
 
-	p := testPlane(t, WithClock(clock))
+	p := testPlane(t, WithClock(clock.now))
 	register(t, p, "n1", config.ProviderDocker)
 
 	if len(p.Nodes()) != 1 {
@@ -486,7 +510,7 @@ func TestASilentNodeIsForgotten(t *testing.T) {
 	}
 
 	// Silent for longer than the plane tolerates.
-	now = now.Add(10 * time.Minute)
+	clock.advancePastSilence()
 
 	if got := p.Nodes(); len(got) != 0 {
 		t.Fatalf("a node silent for 10 minutes is still in the fleet: %v", got)
@@ -497,16 +521,15 @@ func TestASilentNodeIsForgotten(t *testing.T) {
 func TestADestroySkipsAForgottenNode(t *testing.T) {
 	t.Parallel()
 
-	now := time.Now()
-	clock := func() time.Time { return now }
+	clock := newTestClock()
 
 	// A long command timeout on purpose: if the stale node were still consulted,
 	// the destroy would block on it for this long and the test would time out
 	// rather than merely fail.
-	p := testPlane(t, WithClock(clock), WithCommandTimeout(time.Hour))
+	p := testPlane(t, WithClock(clock.now), WithCommandTimeout(time.Hour))
 	register(t, p, "dead", config.ProviderDocker)
 
-	now = now.Add(10 * time.Minute)
+	clock.advancePastSilence()
 
 	done := make(chan error, 1)
 
@@ -524,14 +547,23 @@ func TestADestroySkipsAForgottenNode(t *testing.T) {
 	}
 }
 
-// A launch waiting on a node that then goes silent is told, rather than left.
-func TestAForgottenNodeReleasesItsWaiters(t *testing.T) {
+// A NODE WITH WORK IN FLIGHT IS BUSY, NOT SILENT.
+//
+// The node loop executes commands synchronously, so a host pulling a
+// five-minute image does not poll while it works. Expiring it there was actively
+// harmful: expiry answers an in-flight launch with custody, the listener stops
+// heartbeating on that, and the lease is reaped before the provider has even
+// returned — after which the launch starts a runner on capacity already sold to
+// somebody else.
+//
+// The command timeout bounds this instead, which is the instrument that already
+// decides how long an unanswered command may run before its outcome is unknown.
+func TestABusyNodeIsNotForgotten(t *testing.T) {
 	t.Parallel()
 
-	now := time.Now()
-	clock := func() time.Time { return now }
+	clock := newTestClock()
 
-	p := testPlane(t, WithClock(clock), WithCommandTimeout(time.Hour))
+	p := testPlane(t, WithClock(clock.now), WithCommandTimeout(time.Hour))
 	register(t, p, "n1", config.ProviderDocker)
 
 	taken := make(chan struct{})
@@ -542,10 +574,13 @@ func TestAForgottenNodeReleasesItsWaiters(t *testing.T) {
 		}
 	}()
 
-	launched := make(chan error, 1)
+	// Buffered and never read: the launch's outcome is not what this test is
+	// about, but a launch has to be IN FLIGHT for there to be anything to expire
+	// around.
+	inFlight := make(chan error, 1)
 
 	go func() {
-		launched <- p.NewRunner().Launch(t.Context(), testLease(), server.Job{RequestID: 7})
+		inFlight <- p.NewRunner().Launch(t.Context(), testLease(), server.Job{RequestID: 7})
 	}()
 
 	select {
@@ -554,19 +589,116 @@ func TestAForgottenNodeReleasesItsWaiters(t *testing.T) {
 		t.Fatal("the node never took the command")
 	}
 
-	now = now.Add(10 * time.Minute)
+	// Long past the silence window, but it is working.
+	clock.advancePastSilence()
 
-	// Something has to consult the clock for expiry to happen; Nodes is the
-	// cheapest way to say "time passed" without inventing a second mechanism.
+	if got := p.Nodes(); len(got) != 1 {
+		t.Fatalf("a node executing a command was forgotten: %v", got)
+	}
+}
+
+// A COMMAND THAT NEVER LEFT THE QUEUE IS RELEASED when its node is forgotten.
+//
+// The mirror of the case above, and the one where expiry genuinely helps: the
+// node never took this command, so nothing started and the caller is entitled to
+// that certainty rather than to a wait it cannot end.
+func TestAForgottenNodeReleasesItsQueuedWork(t *testing.T) {
+	t.Parallel()
+
+	clock := newTestClock()
+
+	p := testPlane(t, WithClock(clock.now), WithCommandTimeout(time.Hour))
+	register(t, p, "n1", config.ProviderDocker)
+
+	launched := make(chan error, 1)
+
+	go func() {
+		launched <- p.NewRunner().Launch(t.Context(), testLease(), server.Job{RequestID: 7})
+	}()
+
+	// Nobody polls, so the command sits queued. Wait until it is there, or the
+	// expiry below would race the dispatch that creates it.
+	deadline := time.Now().Add(5 * time.Second)
+	for p.QueuedForTest("n1") == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the command was never queued")
+		}
+
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	clock.advancePastSilence()
+
+	// Something has to consult the clock for expiry to happen.
 	_ = p.Nodes()
 
 	select {
 	case err := <-launched:
-		if !errors.Is(err, server.ErrCustody) {
-			t.Fatalf("a launch lost to a node going silent must report custody, got %v", err)
+		if err == nil {
+			t.Fatal("a launch nobody took reported success")
+		}
+
+		if errors.Is(err, server.ErrCustody) {
+			t.Errorf("a command that never left the queue reported custody: %v", err)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("the caller was left waiting on a node the plane has forgotten")
+	}
+}
+
+// A NODE THAT DIES DURING A DESTROY LANDS WHERE ONE THAT DIED BEFORE IT LANDS.
+//
+// The snapshot Destroy broadcasts to is taken once. A node already forgotten is
+// not in it, is never asked, and Destroy reports success — there is nowhere for
+// the compute to be. A node forgotten half a second later IS asked, cannot
+// answer, and fails its leg, and a failed destroy makes the listener hold the
+// lease with nothing to retry it and no host coming back to release it.
+//
+// Two identical situations decided by microseconds, with opposite outcomes, one
+// of which leaks a capacity slot permanently. The sweep a returning node runs is
+// what removes compute the server no longer recognises, and a node that never
+// returns took its containers down with it.
+func TestADestroyIsNotFailedByANodeThatIsGone(t *testing.T) {
+	t.Parallel()
+
+	clock := newTestClock()
+
+	p := testPlane(t, WithClock(clock.now), WithCommandTimeout(150*time.Millisecond))
+	register(t, p, "n1", config.ProviderDocker)
+
+	// The node takes the destroy and then dies holding it, which is the window:
+	// it is busy, so it is exempt from expiry until its command stops waiting.
+	taken := make(chan struct{})
+
+	go func() {
+		if _, _, err := p.Poll(t.Context(), "n1"); err == nil {
+			close(taken)
+		}
+	}()
+
+	destroyed := make(chan error, 1)
+
+	go func() {
+		destroyed <- p.NewRunner().Destroy(t.Context(), 7)
+	}()
+
+	select {
+	case <-taken:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the node never took the destroy")
+	}
+
+	// Silent well past the window, so once the command gives up it is gone.
+	clock.advancePastSilence()
+
+	select {
+	case err := <-destroyed:
+		if err != nil {
+			t.Errorf("a destroy unanswered by a node that has since been forgotten was "+
+				"reported as a failure, so the listener holds that lease forever: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the destroy never returned")
 	}
 }
 

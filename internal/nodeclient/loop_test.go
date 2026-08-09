@@ -40,6 +40,15 @@ type fakeCompute struct {
 	tendedCount int
 	assumed     []int64
 
+	// ttlProbe is read by KeepAlive at the moment it starts, which is how a test
+	// observes whether the janitor could already see the negotiated TTL.
+	ttlProbe func() time.Duration
+	ttlSeen  time.Duration
+
+	// aliveReturned counts janitors that have exited, which is how a test
+	// observes that none outlived the loop.
+	aliveReturned int
+
 	// launchGate lets a test hold a launch open. Launch closes launchStarted and
 	// then waits, which is the only way to act on the world WHILE a launch is in
 	// flight — polling for the launch to finish always loses to the report that
@@ -51,9 +60,32 @@ type fakeCompute struct {
 func (f *fakeCompute) KeepAlive(ctx context.Context) {
 	f.mu.Lock()
 	f.keptAlive++
+
+	if f.ttlProbe != nil {
+		f.ttlSeen = f.ttlProbe()
+	}
+
 	f.mu.Unlock()
 
 	<-ctx.Done()
+
+	f.mu.Lock()
+	f.aliveReturned++
+	f.mu.Unlock()
+}
+
+func (f *fakeCompute) ttlAtStart() time.Duration {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return f.ttlSeen
+}
+
+func (f *fakeCompute) aliveReturnedCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return f.aliveReturned
 }
 
 func (f *fakeCompute) Tend(context.Context) error {
@@ -448,11 +480,70 @@ func TestTheCustodyJanitorIsStarted(t *testing.T) {
 	t.Parallel()
 
 	_, c := harness(t)
-	compute := &fakeCompute{}
+	compute := &fakeCompute{ttlProbe: c.LeaseTTL}
 
 	runLoop(t, c, compute)
 
 	waitFor(t, func() bool { return compute.aliveCount() == 1 })
+
+	// STARTED AFTER THE FIRST REGISTRATION, not before it. The janitor picks its
+	// renewal cadence from the TTL, and that value arrives with the registration
+	// response — starting first meant reading a zero and renewing on a fallback
+	// clock for the process's whole life, while racing the write that would have
+	// told it the truth.
+	if compute.ttlAtStart() <= 0 {
+		t.Error("the janitor started before it could know the lease TTL, so it renews on a " +
+			"cadence nobody chose")
+	}
+}
+
+// THE JANITOR STOPS WITH THE LOOP, and stopping is the whole point.
+//
+// It was started on the loop's own context, which outlives Run: a node that
+// exits because it was refused, or a `server --dev` that shuts one node down,
+// would leave a goroutine heartbeating leases for a runtime nobody is driving
+// any more. Nothing crashes, so nothing draws attention.
+func TestTheCustodyJanitorDoesNotOutliveTheLoop(t *testing.T) {
+	t.Parallel()
+
+	_, c := harness(t)
+	compute := &fakeCompute{}
+
+	ctx, cancel := context.WithCancel(t.Context())
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		err := nodeclient.Run(ctx, c, compute, nodeclient.LoopOptions{
+			Provider:   config.ProviderDocker,
+			Deployment: deployment,
+			Log:        slog.New(slog.DiscardHandler),
+			Backoff:    20 * time.Millisecond,
+		})
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("the loop stopped for a reason other than shutdown: %v", err)
+		}
+	}()
+
+	waitFor(t, func() bool { return compute.aliveCount() == 1 })
+
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the loop did not return after its context was cancelled")
+	}
+
+	// Read AFTER Run returned, deliberately. Run waits for the janitor before
+	// returning, so a poll here would let a janitor that merely exits soon look
+	// identical to one the loop actually waited for.
+	if compute.aliveReturnedCount() != 1 {
+		t.Error("the loop returned while its custody janitor was still running, so the " +
+			"goroutine outlives the node it belongs to")
+	}
 }
 
 // A LOST RESULT MAKES THE NODE TAKE CUSTODY, because the server already has.

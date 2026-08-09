@@ -112,11 +112,15 @@ func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
 	// destroy for that timeout before the next node was even asked — and destroy
 	// runs on shutdown and on completion paths, where blocking for minutes turns
 	// one bad host into a stalled control plane.
+	type leg struct {
+		node string
+		err  error
+	}
+
 	var (
-		wg     sync.WaitGroup
-		mu     sync.Mutex
-		errs   []error
-		failed int
+		wg   sync.WaitGroup
+		mu   sync.Mutex
+		legs []leg
 	)
 
 	for _, n := range targets {
@@ -133,16 +137,55 @@ func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
 			mu.Lock()
 			defer mu.Unlock()
 
-			failed++
-
-			errs = append(errs, err)
+			legs = append(legs, leg{node: n.name, err: err})
 		}()
 	}
 
 	wg.Wait()
 
-	if failed == 0 {
+	if len(legs) == 0 {
 		return nil
+	}
+
+	// A NODE FORGOTTEN DURING THE DESTROY IS THE SAME AS ONE FORGOTTEN BEFORE IT,
+	// and the two disagreeing was the defect. A node already gone at the snapshot
+	// above is not asked at all, and Destroy reports success. A node that dies
+	// half a second later fails its leg, and a failed destroy makes the listener
+	// hold the lease — for good, since nothing retries it and the host never comes
+	// back to answer. Identical situations, opposite outcomes, decided by
+	// microseconds.
+	//
+	// So they are made to agree, in the direction the rest of the design already
+	// chose: the sweep a returning node runs is what removes compute the server no
+	// longer recognises, and a node that never returns took its containers down
+	// with it. Holding the capacity forever protects nothing and costs a slot.
+	//
+	// Note this asks the question AFTER the legs finish, deliberately: a node with
+	// a command in flight is exempt from expiry, so it cannot be judged absent
+	// until its command has stopped waiting.
+	live := r.liveSet()
+
+	kept := legs[:0]
+
+	for _, l := range legs {
+		if !live[l.node] {
+			r.plane.log.Warn("a destroy went unanswered by a node that has since been forgotten; "+
+				"its compute is the sweep's to remove when it returns",
+				"node", l.node, "request_id", requestID, "err", l.err)
+
+			continue
+		}
+
+		kept = append(kept, l)
+	}
+
+	if len(kept) == 0 {
+		return nil
+	}
+
+	errs := make([]error, 0, len(kept))
+	for _, l := range kept {
+		errs = append(errs, l.err)
 	}
 
 	// EVERY FAILURE, not the first. A destroy that worked on four nodes and
@@ -262,6 +305,17 @@ func (r *Runner) liveNodes() []*node {
 	}
 
 	return out
+}
+
+// liveSet names the nodes the plane still knows about, expiring stale ones
+// first.
+func (r *Runner) liveSet() map[string]bool {
+	live := make(map[string]bool)
+	for _, n := range r.liveNodes() {
+		live[n.name] = true
+	}
+
+	return live
 }
 
 // destroyOn asks one node to remove a request's compute.

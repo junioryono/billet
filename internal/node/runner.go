@@ -582,11 +582,27 @@ func (r *Runner) Recover(ctx context.Context) error {
 // hand the capacity back, and let a listener advertise it while the container
 // carried on running.
 func (r *Runner) takeCustody(ctx context.Context, lease *alloc.Lease, inst *provider.Instance) error {
-	if err := r.alloc.Heartbeat(ctx, lease.ID, lease.Epoch); err != nil {
-		return fmt.Errorf("node: renew the lease of adopted instance %s: %w", inst.Name, err)
-	}
-
+	// RECORDED FIRST, RENEWED SECOND, and the order is the whole correctness of
+	// custody across a network.
+	//
+	// It used to heartbeat first and adopt only on success, which meant a renewal
+	// that failed left NOTHING holding the lease. That is survivable in-process,
+	// where the failure is a database blip and the caller still has the lease.
+	// Over a wire it is the common case: the same outage that lost the launch
+	// report loses this heartbeat too, and a node that has just been forgotten by
+	// a restarted control plane will have it refused outright — which is exactly
+	// the situation custody exists for.
+	//
+	// Recording locally first means the janitor OWNS the lease from this moment
+	// and keeps retrying renewal on its own clock. A fenced or missing lease is
+	// then discovered by Tend, which destroys the compute rather than leaving it
+	// running against capacity somebody else now holds.
 	r.adopt(lease, inst)
+
+	if err := r.alloc.Heartbeat(ctx, lease.ID, lease.Epoch); err != nil {
+		return fmt.Errorf("node: renew the lease of adopted instance %s (it is held in custody "+
+			"regardless, and renewal will be retried): %w", inst.Name, err)
+	}
 
 	return nil
 }

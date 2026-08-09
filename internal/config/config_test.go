@@ -1788,28 +1788,29 @@ tiers:
 	}
 }
 
-// THE TWO ROLES MUST LOCK IN THE SAME PLACE ON ONE HOST.
+// TWO ROLES MAY NAME DIFFERENT LOCK DIRECTORIES, and one config file is why.
 //
-// Setting server.lock_dir and leaving node.lock_dir empty gives a --dev server
-// and a standalone node two DIFFERENT locks for one deployment identity — after
-// which both manage the same containers and either can adopt or destroy the
-// other's live work. It looks deliberate enough that nothing else would question
-// it, so the config refuses it.
-func TestLockDirsMustMatchAcrossRoles(t *testing.T) {
+// A single billet.yaml deployed to every machine carries the controller's
+// lock_dir alongside each node's. A node-only host never reads the server
+// section, so refusing to load over it would take that host down for a setting
+// with no bearing on it. Whether the two agree is asked by `server --dev`, which
+// is the one process that runs both roles at once.
+func TestOneFileMayConfigureBothRolesDifferently(t *testing.T) {
 	t.Parallel()
 
 	body := `
 server:
   listen: 127.0.0.1:7717
   state_dir: /var/lib/billet/server
-  lock_dir: /run/billet/locks
+  lock_dir: /run/billet/server-locks
   max_vcpu: 8
   max_memory: 32GiB
 node:
   name: host-1
-  server_addr: http://127.0.0.1:7717
+  server_addr: 127.0.0.1:7717
   provider: docker
   state_dir: /var/lib/billet/node
+  lock_dir: /run/billet/node-locks
 github:
   org: acme
   app_id: 1
@@ -1823,13 +1824,55 @@ tiers:
     image: ubuntu:24.04
 `
 
-	_, err := Load(writeConfig(t, body))
-	if err == nil {
-		t.Fatal("a server with a lock_dir and a node without one was accepted")
+	cfg, err := Load(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("a shared config file naming a lock_dir per role was refused: %v", err)
 	}
 
-	if !strings.Contains(err.Error(), "lock_dir") {
-		t.Errorf("the error does not name the key: %v", err)
+	if cfg.LockDirsAgree() {
+		t.Error("two different lock directories were reported as agreeing, so `server --dev` " +
+			"would take two locks for one deployment identity")
+	}
+}
+
+// The same question, answered the other way.
+func TestMatchingLockDirsAgree(t *testing.T) {
+	t.Parallel()
+
+	body := `
+server:
+  listen: 127.0.0.1:7717
+  state_dir: /var/lib/billet/server
+  lock_dir: /run/billet/locks
+  max_vcpu: 8
+  max_memory: 32GiB
+node:
+  name: host-1
+  server_addr: 127.0.0.1:7717
+  provider: docker
+  state_dir: /var/lib/billet/node
+  lock_dir: /run/billet/locks
+github:
+  org: acme
+  app_id: 1
+  installation_id: 2
+  private_key_path: /tmp/key.pem
+tiers:
+  - label: billet-2vcpu
+    provider: docker
+    vcpu: 2
+    memory: 8GiB
+    image: ubuntu:24.04
+`
+
+	cfg, err := Load(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	if !cfg.LockDirsAgree() {
+		t.Error("identical lock directories were reported as disagreeing, so `server --dev` " +
+			"would refuse a correct configuration")
 	}
 }
 
@@ -1846,7 +1889,7 @@ server:
   max_memory: 32GiB
 node:
   name: host-1
-  server_addr: http://127.0.0.1:7717
+  server_addr: 127.0.0.1:7717
   provider: docker
   state_dir: /var/lib/billet/node
   lock_dir: locks

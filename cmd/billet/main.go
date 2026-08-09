@@ -171,6 +171,17 @@ func cmdServer(ctx context.Context, args []string) error {
 		return fmt.Errorf("--dev needs a node section in %s", *cfgPath)
 	}
 
+	// ONLY --dev RUNS BOTH ROLES, so only --dev needs them to agree. Enforcing it
+	// at load would refuse a shared configuration file on a node-only host merely
+	// because the unused server section names a controller's lock directory.
+	if *dev && !cfg.LockDirsAgree() {
+		return fmt.Errorf(
+			"--dev runs a server and a node in one process, but server.lock_dir (%q) and "+
+				"node.lock_dir (%q) differ; they would take two locks for one deployment "+
+				"identity and both manage the same containers",
+			cfg.Server.LockDir, cfg.Node.LockDir)
+	}
+
 	if cfg.GitHub == nil {
 		return fmt.Errorf("%s has no github section; run `billet github-app create` first", *cfgPath)
 	}
