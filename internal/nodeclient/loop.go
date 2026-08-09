@@ -318,6 +318,28 @@ func execute(ctx context.Context, compute Compute, cmd nodeapi.Command) nodeapi.
 
 		return res
 
+	case nodeapi.CommandSweep:
+		if err := compute.Sweep(ctx); err != nil {
+			res.Error = err.Error()
+
+			return res
+		}
+
+		res.OK = true
+
+		return res
+
+	case nodeapi.CommandTend:
+		if err := compute.Tend(ctx); err != nil {
+			res.Error = err.Error()
+
+			return res
+		}
+
+		res.OK = true
+
+		return res
+
 	default:
 		// A COMMAND FROM A NEWER SERVER, refused rather than ignored. Ignoring it
 		// would leave the caller waiting for a result that never comes, and its

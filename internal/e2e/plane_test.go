@@ -17,8 +17,10 @@ package e2e
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os/exec"
 	"strconv"
@@ -31,6 +33,8 @@ import (
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/fakeactions"
 	"github.com/junioryono/billet/internal/node"
+	"github.com/junioryono/billet/internal/nodeclient"
+	"github.com/junioryono/billet/internal/nodeplane"
 	"github.com/junioryono/billet/internal/provider/docker"
 	"github.com/junioryono/billet/internal/scaleset"
 	"github.com/junioryono/billet/internal/server"
@@ -293,14 +297,45 @@ func newStack(t *testing.T) *stack {
 	return newStackIn(t, t.TempDir(), newPlane(t))
 }
 
+// newWireStack builds the same stack with the node REACHED OVER THE WIRE.
+//
+// The one place a real control plane, a real HTTP listener, a real node loop and
+// a real Docker daemon are all in play at once. It matters because the wire is
+// the only part with no in-process equivalent to fall back on: every unit test
+// of it necessarily supplies one side.
+//
+// `server --dev` deliberately does not go through this path — a single-machine
+// deployment should not send commands to itself over a socket to reach a runner
+// it already holds — which is precisely why the wire needs its own end-to-end
+// coverage instead of inheriting the dev suite's.
+func newWireStack(t *testing.T) *stack {
+	t.Helper()
+
+	return newStackIn(t, t.TempDir(), newPlane(t), overTheWire)
+}
+
+// stackOpt varies how a stack is assembled.
+type stackOpt func(*stackConfig)
+
+type stackConfig struct{ wire bool }
+
+// overTheWire puts a real node wire between the control plane and the runner.
+func overTheWire(c *stackConfig) { c.wire = true }
+
 // newStackIn builds a stack over a GIVEN state directory and service.
 //
 // Restarting billet is exactly this: a new process over the same state and the
 // same deployment identity, with empty in-memory maps. A test that built a fresh
 // state directory instead would be testing a first run, which is the case where
 // there is nothing to recover.
-func newStackIn(t *testing.T, dir string, p *plane) *stack {
+func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 	t.Helper()
+
+	var sc stackConfig
+
+	for _, o := range opts {
+		o(&sc)
+	}
 
 	if _, err := exec.LookPath("docker"); err != nil {
 		t.Skip("docker is not installed")
@@ -343,8 +378,14 @@ func newStackIn(t *testing.T, dir string, p *plane) *stack {
 
 	const host = "e2e-host"
 
-	if err := a.RegisterNode(t.Context(), host, config.ProviderDocker); err != nil {
-		t.Fatalf("RegisterNode: %v", err)
+	// PRE-REGISTERED ONLY FOR THE IN-PROCESS STACK. Over the wire the plane's own
+	// registration must write this row, so doing it here would hide a regression
+	// that stopped it — the node would bind happily against a row this harness
+	// had helpfully created.
+	if !sc.wire {
+		if err := a.RegisterNode(t.Context(), host, config.ProviderDocker); err != nil {
+			t.Fatalf("RegisterNode: %v", err)
+		}
 	}
 
 	// A per-test deployment identity, so two of these running concurrently do not
@@ -374,18 +415,123 @@ func newStackIn(t *testing.T, dir string, p *plane) *stack {
 		}
 	})
 
-	runner := node.New(a, host, wiring.JITSource{Client: client}, prov, tiers, testLogger(t))
+	log := testLogger(t)
 
-	srv := server.New(a, wiring.Provisioner{Client: client}, tiers, "billet-test", testLogger(t),
-		server.WithNodeRunner(runner),
-		// Fast, because the sweep rides this tick and a test that waits a minute
-		// for it is a test nobody runs.
-		server.WithReapInterval(200*time.Millisecond))
+	var (
+		runner      *node.Runner
+		serverOpts  []server.ControlPlaneOption
+		computeName = host
+	)
+
+	if sc.wire {
+		runner, serverOpts = wireUp(t, log, a, client, prov, tiers, deployment, computeName)
+	} else {
+		runner = node.New(a, host, wiring.JITSource{Client: client}, prov, tiers, log)
+		serverOpts = []server.ControlPlaneOption{server.WithNodeRunner(runner)}
+	}
+
+	// Fast, because the sweep rides this tick and a test that waits a minute for
+	// it is a test nobody runs.
+	serverOpts = append(serverOpts, server.WithReapInterval(200*time.Millisecond))
+
+	srv := server.New(a, wiring.Provisioner{Client: client}, tiers, "billet-test", log, serverOpts...)
 
 	return &stack{
 		dir: dir, closeDB: closeDB, plane: p, alloc: a,
 		runner: runner, server: srv, provider: prov, node: host,
 	}
+}
+
+// wireUp puts a real HTTP node wire between the control plane and the runner.
+func wireUp(
+	t *testing.T,
+	log *slog.Logger,
+	a *alloc.Allocator,
+	client *scaleset.Client,
+	prov *docker.Provider,
+	tiers []config.Tier,
+	deployment, host string,
+) (*node.Runner, []server.ControlPlaneOption) {
+	t.Helper()
+
+	plane := nodeplane.New(log, deployment, a.LeaseTTL(), nodeplane.WithRegistrar(a))
+
+	var lc net.ListenConfig
+
+	ln, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	wire := &http.Server{
+		Handler:           nodeplane.Handler(log, plane, a, wiring.NodeJIT{Client: client}),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+
+	go func() {
+		// Ends when Shutdown is called, which is the only way this test stops it.
+		if err := wire.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			t.Errorf("the node wire stopped unexpectedly: %v", err)
+		}
+	}()
+
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 5*time.Second)
+		defer cancel()
+
+		if err := wire.Shutdown(ctx); err != nil {
+			t.Errorf("the node wire did not shut down cleanly: %v", err)
+		}
+	})
+
+	nc, err := nodeclient.New(nodeclient.Options{Base: "http://" + ln.Addr().String(), Node: host})
+	if err != nil {
+		t.Fatalf("nodeclient.New: %v", err)
+	}
+
+	// THE CLIENT IS BOTH LEDGER AND MINT, exactly as `billet node` wires it. The
+	// runner has no idea it became remote.
+	runner := node.New(nc, host, nc, prov, tiers, log)
+
+	ctx, cancel := context.WithCancel(t.Context())
+
+	var loop sync.WaitGroup
+
+	loop.Add(1)
+
+	go func() {
+		defer loop.Done()
+
+		// Run only ends when the context does; anything else is a real failure.
+		err := nodeclient.Run(ctx, nc, runner, nodeclient.LoopOptions{
+			Provider:   config.ProviderDocker,
+			Deployment: deployment,
+			Log:        log,
+			Backoff:    50 * time.Millisecond,
+		})
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("the node loop stopped for a reason other than shutdown: %v", err)
+		}
+	}()
+
+	t.Cleanup(func() {
+		cancel()
+		loop.Wait()
+	})
+
+	// REGISTERED BEFORE THE CONTROL PLANE HAS ANYTHING TO GIVE IT. Otherwise the
+	// first launch legitimately finds no node and the test measures startup order
+	// rather than the wire.
+	deadline := time.Now().Add(30 * time.Second)
+	for len(plane.Nodes()) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the node never registered over the wire")
+		}
+
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	return runner, []server.ControlPlaneOption{server.WithNodeRunner(plane.NewRunner())}
 }
 
 // run starts the control plane and returns a stop function.

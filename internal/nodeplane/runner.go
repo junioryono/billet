@@ -94,20 +94,11 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job server.Job)
 // The result is the FIRST failure, if any: a destroy that only partly succeeded
 // has left compute running somewhere and must not report success.
 func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
-	r.plane.mu.Lock()
-
 	// A DESTROY MUST NOT WAIT ON A CORPSE. This is the broadcast that made stale
 	// nodes expensive: each one held the call for the full command timeout and
 	// then failed it, and the listener answers a failed destroy by holding its
-	// lease forever.
-	r.plane.expireStaleLocked()
-
-	targets := make([]*node, 0, len(r.plane.nodes))
-	for _, n := range r.plane.nodes {
-		targets = append(targets, n)
-	}
-
-	r.plane.mu.Unlock()
+	// lease forever. liveNodes expires them first.
+	targets := r.liveNodes()
 
 	if len(targets) == 0 {
 		// NOT AN ERROR. There is nowhere for the compute to be, so there is
@@ -159,6 +150,118 @@ func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
 	// know which — reporting only the first would hide the rest behind whichever
 	// goroutine happened to finish soonest.
 	return errors.Join(errs...)
+}
+
+// Sweep asks every node to destroy compute whose lease is no longer open.
+//
+// THIS IS WHAT KEEPS ORPHAN DETECTION ALIVE ACROSS THE SPLIT. The control plane
+// sweeps after each reap, because the lease it has just terminalised is exactly
+// what leaves a container unaccounted for — and it cannot enumerate a remote
+// host. Without implementing this the server logs that its runner "cannot
+// enumerate its compute" and quietly loses the ability to notice a leak at the
+// only moment it reliably could.
+//
+// The node also sweeps on a timer of its own. That is a backstop, not a
+// substitute: a timer notices minutes later, and only the server knows when an
+// orphan was actually created.
+func (r *Runner) Sweep(ctx context.Context) error {
+	return r.broadcast(ctx, nodeapi.CommandSweep, "sweep")
+}
+
+// Tend asks every node to advance the compute it is holding capacity for.
+func (r *Runner) Tend(ctx context.Context) error {
+	return r.broadcast(ctx, nodeapi.CommandTend, "tend")
+}
+
+// KeepAlive does nothing here, and the nothing is the design.
+//
+// A NO-OP THAT SAYS WHY, because a silent one is indistinguishable from
+// forgetting to implement it — and this interface exists precisely so the server
+// can tell whether renewal is happening at all.
+//
+// Renewal is for leases a RUNNER is holding: compute it could not confirm gone,
+// tracked in its custody map. When the runner is remote that map lives on the
+// node, and the control plane cannot enumerate it. The node runs the same
+// janitor for its own custody on its own clock, which is where it has to be —
+// this interface's own comment says renewal must not share a schedule with
+// anything that talks to a compute backend, and the only party talking to that
+// backend is the node.
+//
+// So there is genuinely nothing here to renew, and pretending otherwise would
+// mean guessing at leases this side cannot see. Blocking until the context ends
+// matches the contract the caller relies on: it runs this in a goroutine and
+// expects it to live as long as the process.
+func (r *Runner) KeepAlive(ctx context.Context) { <-ctx.Done() }
+
+// broadcast sends one whole-host command to every live node.
+func (r *Runner) broadcast(ctx context.Context, kind nodeapi.CommandKind, what string) error {
+	targets := r.liveNodes()
+
+	if len(targets) == 0 {
+		return nil
+	}
+
+	var (
+		wg   sync.WaitGroup
+		mu   sync.Mutex
+		errs []error
+	)
+
+	for _, n := range targets {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			id, err := commandID()
+			if err != nil {
+				mu.Lock()
+				errs = append(errs, err)
+				mu.Unlock()
+
+				return
+			}
+
+			pend := &pending{
+				cmd:  nodeapi.Command{ID: id, Kind: kind},
+				done: make(chan nodeapi.CommandResult, 1),
+			}
+
+			res, err := r.plane.dispatch(ctx, n, pend)
+			if err != nil {
+				mu.Lock()
+				errs = append(errs, fmt.Errorf("node %s: %w", n.name, err))
+				mu.Unlock()
+
+				return
+			}
+
+			if !res.OK {
+				mu.Lock()
+				errs = append(errs, fmt.Errorf("node %s could not %s: %s", n.name, what, res.Error))
+				mu.Unlock()
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	return errors.Join(errs...)
+}
+
+// liveNodes snapshots the fleet, forgetting anything that has gone silent.
+func (r *Runner) liveNodes() []*node {
+	r.plane.mu.Lock()
+	defer r.plane.mu.Unlock()
+
+	r.plane.expireStaleLocked()
+
+	out := make([]*node, 0, len(r.plane.nodes))
+	for _, n := range r.plane.nodes {
+		out = append(out, n)
+	}
+
+	return out
 }
 
 // destroyOn asks one node to remove a request's compute.

@@ -41,6 +41,20 @@ const (
 	CommandLaunch CommandKind = "launch"
 	// CommandDestroy removes whatever a launch started for a request.
 	CommandDestroy CommandKind = "destroy"
+	// CommandSweep asks a node to destroy compute whose lease is no longer open.
+	//
+	// EXISTS BECAUSE REAPING IS WHAT MAKES AN ORPHAN. The control plane sweeps
+	// after every reap — the lease it just terminalised is exactly what leaves a
+	// container unaccounted for — and it cannot enumerate a remote host itself.
+	// Without this the causal link is broken by the split: the server would reap,
+	// and the node would notice minutes later on a timer of its own, if at all.
+	CommandSweep CommandKind = "sweep"
+	// CommandTend advances the compute a node is holding capacity for.
+	//
+	// The companion to sweep for custody: adopted work that has finished, and
+	// discarded work whose cleanup is now confirmed. The node runs this on its own
+	// cadence too; the command is what keeps it tied to the server's reap.
+	CommandTend CommandKind = "tend"
 )
 
 // RegisterRequest is a node introducing itself.
