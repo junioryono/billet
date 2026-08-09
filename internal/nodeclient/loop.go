@@ -54,7 +54,28 @@ type LoopOptions struct {
 	SweepEvery time.Duration
 	// Backoff is how long to wait after a failed registration or poll. Zero uses
 	// a default.
+	//
+	// It governs BOTH, which the first version claimed and did not do: poll
+	// failures used a hard-coded second, so a caller that lengthened this to calm
+	// a flapping link still hammered the poll endpoint.
 	Backoff time.Duration
+}
+
+// pollBackoff is how long to wait after a failed poll.
+//
+// Shorter than the registration backoff on purpose — a poll failure is usually a
+// blink and the node should be back in line quickly — but derived from the
+// caller's setting rather than fixed, so raising Backoff raises this too.
+func (o LoopOptions) pollBackoff() time.Duration {
+	if o.Backoff <= 0 {
+		return time.Second
+	}
+
+	if o.Backoff < 5*time.Second {
+		return o.Backoff
+	}
+
+	return o.Backoff / 5
 }
 
 // Run registers this node and serves commands until the context ends.
@@ -95,10 +116,16 @@ func Run(ctx context.Context, c *Client, compute Compute, opts LoopOptions) erro
 				return ctx.Err()
 			}
 
-			// A REFUSAL AND AN OUTAGE LOOK THE SAME FROM HERE, and both are retried
-			// — but the log has to say which, because one is fixed by waiting and
-			// the other never is. A node quietly retrying a version mismatch
-			// forever is a node nobody notices is broken.
+			// A REFUSAL IS NOT AN OUTAGE, and treating them alike was the bug. A
+			// version mismatch or a foreign deployment identity is refused the same
+			// way forever; retrying it every few seconds produces a process that
+			// looks alive, never works, and crashes nothing that would draw
+			// attention. Stopping is the honest outcome — a supervisor restarting
+			// it will meet the same wall and say so again.
+			if errors.Is(err, ErrRefused) {
+				return fmt.Errorf("this node cannot join that control plane: %w", err)
+			}
+
 			log.Error("could not register with the control plane; retrying",
 				"error", err, "retry_in", backoff)
 
@@ -184,9 +211,9 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 
 			// A POLL THAT FAILS IS ORDINARY. The control plane may be restarting or
 			// the network may have blinked, and the node's job is to keep asking.
-			log.Warn("command poll failed; retrying", "error", err)
+			log.Warn("command poll failed; retrying", "error", err, "retry_in", opts.pollBackoff())
 
-			if !sleep(ctx, time.Second) {
+			if !sleep(ctx, opts.pollBackoff()) {
 				return ctx.Err()
 			}
 

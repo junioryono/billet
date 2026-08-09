@@ -96,6 +96,12 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job server.Job)
 func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
 	r.plane.mu.Lock()
 
+	// A DESTROY MUST NOT WAIT ON A CORPSE. This is the broadcast that made stale
+	// nodes expensive: each one held the call for the full command timeout and
+	// then failed it, and the listener answers a failed destroy by holding its
+	// lease forever.
+	r.plane.expireStaleLocked()
+
 	targets := make([]*node, 0, len(r.plane.nodes))
 	for _, n := range r.plane.nodes {
 		targets = append(targets, n)

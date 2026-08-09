@@ -1787,3 +1787,84 @@ tiers:
 		t.Errorf("the error does not name the key: %v", err)
 	}
 }
+
+// THE TWO ROLES MUST LOCK IN THE SAME PLACE ON ONE HOST.
+//
+// Setting server.lock_dir and leaving node.lock_dir empty gives a --dev server
+// and a standalone node two DIFFERENT locks for one deployment identity — after
+// which both manage the same containers and either can adopt or destroy the
+// other's live work. It looks deliberate enough that nothing else would question
+// it, so the config refuses it.
+func TestLockDirsMustMatchAcrossRoles(t *testing.T) {
+	t.Parallel()
+
+	body := `
+server:
+  listen: 127.0.0.1:7717
+  state_dir: /var/lib/billet/server
+  lock_dir: /run/billet/locks
+  max_vcpu: 8
+  max_memory: 32GiB
+node:
+  name: host-1
+  server_addr: http://127.0.0.1:7717
+  provider: docker
+  state_dir: /var/lib/billet/node
+github:
+  org: acme
+  app_id: 1
+  installation_id: 2
+  private_key_path: /tmp/key.pem
+tiers:
+  - label: billet-2vcpu
+    provider: docker
+    vcpu: 2
+    memory: 8GiB
+    image: ubuntu:24.04
+`
+
+	_, err := Load(writeConfig(t, body))
+	if err == nil {
+		t.Fatal("a server with a lock_dir and a node without one was accepted")
+	}
+
+	if !strings.Contains(err.Error(), "lock_dir") {
+		t.Errorf("the error does not name the key: %v", err)
+	}
+}
+
+// A relative node.lock_dir is refused for the same reason the server's is.
+func TestARelativeNodeLockDirIsRefused(t *testing.T) {
+	t.Parallel()
+
+	body := `
+server:
+  listen: 127.0.0.1:7717
+  state_dir: /var/lib/billet/server
+  lock_dir: locks
+  max_vcpu: 8
+  max_memory: 32GiB
+node:
+  name: host-1
+  server_addr: http://127.0.0.1:7717
+  provider: docker
+  state_dir: /var/lib/billet/node
+  lock_dir: locks
+github:
+  org: acme
+  app_id: 1
+  installation_id: 2
+  private_key_path: /tmp/key.pem
+tiers:
+  - label: billet-2vcpu
+    provider: docker
+    vcpu: 2
+    memory: 8GiB
+    image: ubuntu:24.04
+`
+
+	_, err := Load(writeConfig(t, body))
+	if err == nil {
+		t.Fatal("a relative node.lock_dir was accepted")
+	}
+}

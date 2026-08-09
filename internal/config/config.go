@@ -237,6 +237,19 @@ type NodeConfig struct {
 	ServerAddr string `yaml:"server_addr"`
 	// Provider selects the compute backend for this host.
 	Provider ProviderKind `yaml:"provider"`
+	// LockDir is where this node places its host-wide deployment lock.
+	//
+	// SAME KEY, SAME MEANING, SAME HOST as server.lock_dir, and it exists because
+	// the two roles can run on one machine. A `server --dev` honouring
+	// server.lock_dir while a standalone node used the per-user default would take
+	// two DIFFERENT locks for one deployment identity — and then both would manage
+	// the same containers, each able to adopt or destroy the other's live work.
+	// That is precisely the failure the identity lock exists to prevent, reached
+	// by giving the two roles separate settings.
+	//
+	// Leave it empty and both roles use the same default, which is already
+	// consistent. Set it on the server and you must set it here too.
+	LockDir string `yaml:"lock_dir,omitempty"`
 	// StateDir holds node-local data: the generation pointer store (which is
 	// authoritative for this node's volumes), image cache, and mTLS identity.
 	StateDir string `yaml:"state_dir"`
@@ -1083,6 +1096,27 @@ func (c *Config) validateNode() []error {
 	var errs []error
 	if !c.Node.Provider.Valid() {
 		errs = append(errs, fmt.Errorf("node.provider %q is not one of %v", c.Node.Provider, allProviders))
+	}
+
+	// Same rule as server.lock_dir, and for the same reason: a relative path
+	// resolves against each process's working directory, so one config could put
+	// the server and the node into different collision domains on one host.
+	if c.Node.LockDir != "" && !filepath.IsAbs(c.Node.LockDir) {
+		errs = append(errs, fmt.Errorf(
+			"node.lock_dir must be an absolute path, got %q: a relative one resolves against "+
+				"each process's working directory, so the node and the server could lock "+
+				"different files for one deployment identity", c.Node.LockDir))
+	}
+
+	// BOTH OR NEITHER, on a host that runs both roles. Setting one and not the
+	// other is the exact shape that produces two locks for one identity, and it
+	// looks deliberate enough that nothing else would question it.
+	if c.Server != nil && c.Server.LockDir != c.Node.LockDir {
+		errs = append(errs, fmt.Errorf(
+			"server.lock_dir is %q but node.lock_dir is %q; on a host running both roles they "+
+				"must match, or the two processes take different locks for one deployment "+
+				"identity and both manage the same containers",
+			c.Server.LockDir, c.Node.LockDir))
 	}
 
 	// Parsed here so a typo is reported when the file is READ, rather than hours

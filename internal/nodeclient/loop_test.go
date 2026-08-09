@@ -561,6 +561,53 @@ func TestCustodyIsAdvancedOnTheSweepCadence(t *testing.T) {
 	waitFor(t, func() bool { return compute.tended() > 0 })
 }
 
+// A NODE THAT CANNOT JOIN STOPS, rather than retrying forever.
+//
+// A protocol mismatch or a foreign deployment identity is refused identically
+// every time. Retrying it every few seconds produces a process that looks alive,
+// never works, and crashes nothing that would draw attention — the failure mode
+// nobody notices. Stopping makes it visible: a supervisor restarting the node
+// meets the same wall and says so again.
+func TestANodeThatIsRefusedStops(t *testing.T) {
+	t.Parallel()
+
+	log := slog.New(slog.DiscardHandler)
+	p := nodeplane.New(log, deployment, time.Minute)
+	srv := httptest.NewServer(nodeplane.Handler(log, p, stubStore{}, stubJIT{}))
+
+	t.Cleanup(srv.Close)
+
+	c, err := nodeclient.New(nodeclient.Options{Base: srv.URL, Node: "n1"})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+
+	done := make(chan error, 1)
+
+	go func() {
+		// A deployment identity this control plane will never accept.
+		done <- nodeclient.Run(t.Context(), c, &fakeCompute{}, nodeclient.LoopOptions{
+			Provider:   config.ProviderDocker,
+			Deployment: "ffffffffffffffffffffffffffffffff",
+			Log:        slog.New(slog.DiscardHandler),
+			Backoff:    20 * time.Millisecond,
+		})
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("a refused node reported a clean exit")
+		}
+
+		if !errors.Is(err, nodeclient.ErrRefused) {
+			t.Errorf("the node stopped for the wrong reason: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a node the control plane will never accept is still retrying")
+	}
+}
+
 func waitFor(t *testing.T, cond func() bool) {
 	t.Helper()
 

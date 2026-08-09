@@ -265,6 +265,8 @@ func (p *Plane) Nodes() []string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	p.expireStaleLocked()
+
 	out := make([]string, 0, len(p.nodes))
 	for name := range p.nodes {
 		out = append(out, name)
@@ -370,6 +372,62 @@ func (p *Plane) Result(nodeName string, res nodeapi.CommandResult) error {
 	return nil
 }
 
+// staleAfter is how long a node may be silent before the plane forgets it.
+//
+// A healthy node re-polls the moment its window closes, so silence for several
+// windows means it is gone rather than idle. Generous by that measure on
+// purpose: forgetting a live node makes its next request fail with "register
+// again", which is recoverable, while forgetting too slowly leaves a corpse in
+// every broadcast — and it was the corpse that caused the damage.
+const staleAfter = 4 * defaultPollTimeout
+
+// expireStaleLocked drops nodes that have gone silent.
+//
+// NODES USED TO LIVE FOREVER, and lastSeen was written and never read. One host
+// that was unplugged a week ago stayed in the fleet, so every Destroy broadcast
+// waited out the full command timeout against it and returned an error — and the
+// listener answers a destroy error by holding its lease and heartbeating it
+// indefinitely. A single dead machine therefore made every subsequent completed
+// job leak its capacity, permanently.
+//
+// In-flight commands are answered exactly as a re-registration answers them: a
+// launch becomes custody, because the node may have started something before it
+// went quiet, and a destroy becomes a plain failure the caller can retry.
+// Dropping them silently would leave callers waiting on a machine that is gone.
+func (p *Plane) expireStaleLocked() {
+	cutoff := p.now().Add(-staleAfter)
+
+	for name, n := range p.nodes {
+		if !n.lastSeen.Before(cutoff) {
+			continue
+		}
+
+		for id, pend := range n.inflight {
+			p.answerLocked(pend, nodeapi.CommandResult{
+				ID:      id,
+				Custody: pend.cmd.Kind == nodeapi.CommandLaunch,
+				Error: fmt.Sprintf("node %q went silent for %s, so the outcome of this command "+
+					"is unknown", name, staleAfter),
+			})
+		}
+
+		// Queued commands never reached it, so they are unambiguous: nothing
+		// started, and the caller may act on that certainty.
+		for _, pend := range n.queue {
+			p.answerLocked(pend, nodeapi.CommandResult{
+				ID: pend.cmd.ID,
+				Error: fmt.Sprintf("node %q went silent before taking this command, so nothing "+
+					"started", name),
+			})
+		}
+
+		p.log.Warn("forgetting a node that stopped polling; it will have to register again",
+			"node", name, "silent_for", p.now().Sub(n.lastSeen))
+
+		delete(p.nodes, name)
+	}
+}
+
 // pick chooses a node for a lease.
 //
 // The lease's own recorded constraints decide, not the live catalogue: TargetNode
@@ -379,6 +437,12 @@ func (p *Plane) Result(nodeName string, res nodeapi.CommandResult) error {
 func (p *Plane) pick(lease *alloc.Lease) (*node, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	// EXPIRED LAZILY, at the two places staleness can do harm: choosing where to
+	// launch, and broadcasting a destroy. A background sweeper would need its own
+	// lifecycle and would only ever run between these; doing it here means a
+	// stale node cannot be picked even once.
+	p.expireStaleLocked()
 
 	if lease.TargetNode != "" {
 		n, ok := p.nodes[lease.TargetNode]

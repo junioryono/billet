@@ -204,7 +204,25 @@ func cmdServer(ctx context.Context, args []string) error {
 // site: deleting the call from runServer still leaves these tests green, and no
 // test in this repo would notice. Recorded rather than papered over.
 func claimDeployment(cfg *config.Config) (string, *state.DeploymentLock, error) {
-	deployment, err := state.DeploymentID(cfg.Server.StateDir)
+	return claimIdentity(cfg.Server.StateDir, cfg.Server.LockDir, cfg.Server.AllowUnlockedDeployment)
+}
+
+// claimNodeDeployment is the same claim for a standalone node.
+//
+// SHARES claimIdentity with the server rather than repeating it, because the two
+// roles can run on one host and the thing that must not diverge is exactly this:
+// where the lock lands. A second copy of these four lines is how one of them
+// keeps the default while the other honours a configured directory, after which
+// both processes manage the same containers.
+func claimNodeDeployment(cfg *config.Config) (string, *state.DeploymentLock, error) {
+	return claimIdentity(cfg.Node.StateDir, cfg.Node.LockDir, false)
+}
+
+// claimIdentity reads an installation identity and takes the host-wide lock.
+func claimIdentity(
+	stateDir, lockDir string, allowUnplaceable bool,
+) (string, *state.DeploymentLock, error) {
+	deployment, err := state.DeploymentID(stateDir)
 	if err != nil {
 		return "", nil, err
 	}
@@ -214,8 +232,8 @@ func claimDeployment(cfg *config.Config) (string, *state.DeploymentLock, error) 
 	// deployment identity and therefore manage the same containers against the
 	// same daemon. This lock is keyed by the identity, so the copy collides.
 	lock, err := state.LockDeployment(deployment, state.LockOptions{
-		Dir:              cfg.Server.LockDir,
-		AllowUnplaceable: cfg.Server.AllowUnlockedDeployment,
+		Dir:              lockDir,
+		AllowUnplaceable: allowUnplaceable,
 	})
 	if err != nil {
 		return "", nil, err
@@ -530,16 +548,12 @@ func cmdNode(ctx context.Context, args []string) error {
 	// server. It labels its compute with this, and the control plane refuses a
 	// node whose deployment differs — otherwise a host would start containers
 	// this installation could never attribute.
-	deployment, err := state.DeploymentID(cfg.Node.StateDir)
-	if err != nil {
-		return err
-	}
-
-	// The node takes the host-wide lock on its own identity for the same reason
-	// the server does: two billets sharing one identity manage the same
-	// containers. A node's config has no lock_dir of its own — that key belongs
-	// to the control plane's section — so this uses the default location.
-	lock, err := state.LockDeployment(deployment, state.LockOptions{})
+	// THE NODE'S LOCK MUST LAND WHERE THE SERVER'S DOES. Both roles can run on
+	// one host, and a server honouring server.lock_dir while this used the
+	// per-user default would take two different locks for one identity — after
+	// which both manage the same containers and either can adopt or destroy the
+	// other's live work. Sharing the claim is what keeps that true.
+	deployment, lock, err := claimNodeDeployment(cfg)
 	if err != nil {
 		return err
 	}

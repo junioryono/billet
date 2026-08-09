@@ -33,6 +33,15 @@ import (
 // write it will keep refusing is an infinite loop that fixes nothing.
 var ErrUnregistered = errors.New("nodeclient: the control plane does not know this node")
 
+// ErrRefused means the control plane understood the request and rejected it.
+//
+// RETRYING CANNOT HELP, which is the whole reason it is a distinct error. A
+// protocol version mismatch or a foreign deployment identity will be refused
+// identically forever, and a node that retried every five seconds would sit
+// there looking alive while never being able to work — the failure nobody
+// notices because nothing is crashing.
+var ErrRefused = errors.New("nodeclient: the control plane refused this node")
+
 // Client talks to a control plane.
 type Client struct {
 	base       string
@@ -427,6 +436,8 @@ func (c *Client) decodeErr(resp *http.Response) error {
 	}
 
 	switch body.Code {
+	case nodeapi.CodeRefused:
+		return fmt.Errorf("%w: %s", ErrRefused, body.Message)
 	case nodeapi.CodeFenced:
 		return fmt.Errorf("%w: %s", alloc.ErrFenced, body.Message)
 	case nodeapi.CodeNotFound:

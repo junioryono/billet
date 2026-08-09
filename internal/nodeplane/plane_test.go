@@ -464,6 +464,112 @@ func TestADestroyReportsEveryNodeThatFailed(t *testing.T) {
 	}
 }
 
+// A NODE THAT WENT SILENT IS FORGOTTEN, and until it was, one dead machine
+// leaked capacity forever.
+//
+// lastSeen was written and never read, so a host unplugged a week ago stayed in
+// the fleet. Every Destroy broadcast then waited the full command timeout
+// against it and returned an error — and the listener answers a failed destroy
+// by holding its lease and heartbeating it indefinitely. So every completed job
+// after that machine died kept its capacity, permanently.
+func TestASilentNodeIsForgotten(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	clock := func() time.Time { return now }
+
+	p := testPlane(t, WithClock(clock))
+	register(t, p, "n1", config.ProviderDocker)
+
+	if len(p.Nodes()) != 1 {
+		t.Fatalf("the node did not register: %v", p.Nodes())
+	}
+
+	// Silent for longer than the plane tolerates.
+	now = now.Add(10 * time.Minute)
+
+	if got := p.Nodes(); len(got) != 0 {
+		t.Fatalf("a node silent for 10 minutes is still in the fleet: %v", got)
+	}
+}
+
+// A STALE NODE DOES NOT HOLD UP A DESTROY, which is the damage its presence did.
+func TestADestroySkipsAForgottenNode(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	clock := func() time.Time { return now }
+
+	// A long command timeout on purpose: if the stale node were still consulted,
+	// the destroy would block on it for this long and the test would time out
+	// rather than merely fail.
+	p := testPlane(t, WithClock(clock), WithCommandTimeout(time.Hour))
+	register(t, p, "dead", config.ProviderDocker)
+
+	now = now.Add(10 * time.Minute)
+
+	done := make(chan error, 1)
+
+	go func() { done <- p.NewRunner().Destroy(t.Context(), 7) }()
+
+	select {
+	case err := <-done:
+		// No live nodes, so there is nowhere for the compute to be and nothing to
+		// remove — which is success, not failure.
+		if err != nil {
+			t.Fatalf("a destroy against a fleet of one dead node: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the destroy waited on a node that has been silent for ten minutes")
+	}
+}
+
+// A launch waiting on a node that then goes silent is told, rather than left.
+func TestAForgottenNodeReleasesItsWaiters(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	clock := func() time.Time { return now }
+
+	p := testPlane(t, WithClock(clock), WithCommandTimeout(time.Hour))
+	register(t, p, "n1", config.ProviderDocker)
+
+	taken := make(chan struct{})
+
+	go func() {
+		if _, _, err := p.Poll(t.Context(), "n1"); err == nil {
+			close(taken)
+		}
+	}()
+
+	launched := make(chan error, 1)
+
+	go func() {
+		launched <- p.NewRunner().Launch(t.Context(), testLease(), server.Job{RequestID: 7})
+	}()
+
+	select {
+	case <-taken:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the node never took the command")
+	}
+
+	now = now.Add(10 * time.Minute)
+
+	// Something has to consult the clock for expiry to happen; Nodes is the
+	// cheapest way to say "time passed" without inventing a second mechanism.
+	_ = p.Nodes()
+
+	select {
+	case err := <-launched:
+		if !errors.Is(err, server.ErrCustody) {
+			t.Fatalf("a launch lost to a node going silent must report custody, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the caller was left waiting on a node the plane has forgotten")
+	}
+}
+
 // Destroy with no nodes is not a failure: there is nowhere for the compute to
 // be, so there is nothing to remove.
 func TestDestroyWithNoNodesIsQuiet(t *testing.T) {
