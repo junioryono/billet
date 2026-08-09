@@ -207,8 +207,12 @@ type browser struct {
 	t      *testing.T
 	fake   *fakeGitHub
 	client *http.Client
-	// visits records the URLs the flow asked the operator to open.
+	// visits records the URLs the flow asked the operator to open. Written and
+	// read only on the goroutine that drives the flow.
 	visits []string
+	// origin is the loopback base the flow served, captured from the first visit
+	// and never rewritten, so goroutines can read it without touching visits.
+	origin string
 	// skipSetupCallback simulates an operator who closes the tab, leaving the
 	// authenticated poller as the only route to the installation.
 	skipSetupCallback bool
@@ -248,6 +252,17 @@ func (b *browser) track() {
 func (b *browser) open(ctx context.Context, target string) error {
 	b.visits = append(b.visits, target)
 
+	// CAPTURED ONCE, on this goroutine, before any of the goroutines below exist.
+	//
+	// b.visits is appended here and was read from the callback and registration
+	// goroutines — a concurrent read of a slice header while it is being
+	// reallocated, which is a data race whatever the values happen to be. It had
+	// not fired under -race, which is timing rather than proof: the second append
+	// races only with a request already in flight from the first.
+	if b.origin == "" {
+		b.origin = target
+	}
+
 	// The first URL is the loopback start page; the second is GitHub's install
 	// page, which the test answers by "completing" the install.
 	if strings.Contains(target, "/installations/new") {
@@ -262,7 +277,7 @@ func (b *browser) open(ctx context.Context, target string) error {
 		// Built by trimming the trailing slash and appending, NOT by replacing the
 		// first "/" — that replaces the one in "http://" and yields a hostless
 		// URL whose request silently fails, letting the poller carry the test.
-		installedURL := strings.TrimSuffix(b.visits[0], "/") + "/installed" +
+		installedURL := strings.TrimSuffix(b.origin, "/") + "/installed" +
 			"?installation_id=" + fmt.Sprint(b.fake.installationID) + "&setup_action=install"
 
 		// Tracked so the assertions can WAIT for it. Fire-and-forget left the
@@ -582,11 +597,11 @@ func (b *browser) get(ctx context.Context, target string) (string, bool) {
 // place would have looked exactly like a listener closing on time. Only failures
 // against the flow's OWN loopback origin can be excused.
 func (b *browser) benignFailure(target string, err error) bool {
-	if len(b.visits) == 0 {
+	if b.origin == "" {
 		return false
 	}
 
-	want, wantErr := url.Parse(b.visits[0])
+	want, wantErr := url.Parse(b.origin)
 	got, gotErr := url.Parse(target)
 
 	if wantErr != nil || gotErr != nil || want.Scheme != got.Scheme || want.Host != got.Host {
@@ -795,7 +810,7 @@ func TestOnboardIgnoresSpoofedInstallationID(t *testing.T) {
 			go func() {
 				defer b.pending.Done()
 
-				_, _ = b.get(ctx, strings.TrimSuffix(b.visits[0], "/")+
+				_, _ = b.get(ctx, strings.TrimSuffix(b.origin, "/")+
 					"/installed?installation_id=999999999")
 			}()
 
