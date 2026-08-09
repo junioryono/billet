@@ -18,6 +18,7 @@ import (
 	"context"
 
 	"github.com/junioryono/billet/internal/node"
+	"github.com/junioryono/billet/internal/nodeplane"
 	"github.com/junioryono/billet/internal/scaleset"
 	"github.com/junioryono/billet/internal/server"
 )
@@ -65,4 +66,36 @@ func (j JITSource) JITConfig(
 	ctx context.Context, scaleSetID int, runnerName, workFolder string,
 ) (node.Registration, error) {
 	return j.Client.JITConfig(ctx, scaleSetID, runnerName, workFolder)
+}
+
+// NodeJIT is the same source, shaped for the node wire.
+//
+// TWO SHAPES FOR ONE THING, and the duplication is deliberate. internal/nodeplane
+// declares its own JITSet and JITRegistration so the transport does not import
+// the runtime it serves — they sit on opposite sides of a process boundary, and
+// coupling them would defeat the point of having one. The cost is this adapter;
+// the benefit is that neither side moves because the other was edited.
+type NodeJIT struct{ Client *scaleset.Client }
+
+// Describe finds a scale set for the wire.
+//
+// The nil-set-means-absent contract is preserved rather than flattened: the node
+// treats absence as a reason to stop, and a zero-valued set would have it launch
+// against scale set 0.
+func (n NodeJIT) Describe(
+	ctx context.Context, name, group string,
+) (*nodeplane.JITSet, []string, error) {
+	set, labels, err := n.Client.Describe(ctx, name, group)
+	if err != nil || set == nil {
+		return nil, labels, err
+	}
+
+	return &nodeplane.JITSet{ID: set.ID, Name: set.Name}, labels, nil
+}
+
+// JITConfig mints a registration for a remote node.
+func (n NodeJIT) JITConfig(
+	ctx context.Context, scaleSetID int, runnerName, workFolder string,
+) (nodeplane.JITRegistration, error) {
+	return n.Client.JITConfig(ctx, scaleSetID, runnerName, workFolder)
 }

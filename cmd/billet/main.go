@@ -13,6 +13,8 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -21,10 +23,13 @@ import (
 	"strings"
 	"syscall"
 	"text/tabwriter"
+	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/node"
+	"github.com/junioryono/billet/internal/nodeclient"
+	"github.com/junioryono/billet/internal/nodeplane"
 	"github.com/junioryono/billet/internal/provider"
 	"github.com/junioryono/billet/internal/provider/docker"
 	"github.com/junioryono/billet/internal/scaleset"
@@ -371,6 +376,21 @@ func runServer(ctx context.Context, cfg *config.Config, dryRun, dev bool) error 
 		opts = append(opts, server.WithNodeRunner(runner))
 	}
 
+	// THE NODE WIRE IS SERVED WHETHER OR NOT ANY NODE EXISTS YET.
+	//
+	// A control plane that only opened its listener once a node was configured
+	// would make the first node's setup a chicken-and-egg problem, and there is
+	// nothing to guard: an empty fleet answers every request with "I do not know
+	// you".
+	nodes := nodeplane.New(slog.Default(), deployment, allocator.LeaseTTL())
+
+	stopWire, err := serveNodeWire(ctx, cfg, nodes, allocator, wiring.NodeJIT{Client: client})
+	if err != nil {
+		return err
+	}
+
+	defer stopWire()
+
 	plane := server.New(allocator, wiring.Provisioner{Client: client}, cfg.Tiers, owner, slog.Default(), opts...)
 	if err := plane.Run(ctx); err != nil {
 		return err
@@ -387,6 +407,71 @@ func runServer(ctx context.Context, cfg *config.Config, dryRun, dev bool) error 
 // alternative is that package importing internal/server purely to name a
 // two-field struct, which points the dependency the wrong way for a package
 // whose job is to keep a preview API at arm's length.
+// serveNodeWire opens the listener nodes dial.
+//
+// REFUSES ANYTHING BUT LOOPBACK, and that refusal is the whole security boundary
+// today. A node names itself in the request path and nothing verifies the claim,
+// so a listener reachable from the network would let anything on it bind leases,
+// take commands, and — worst — ask for a JIT registration, which is a credential
+// that can register a runner against the organisation.
+//
+// Failing to start is deliberate rather than degrading to loopback: an operator
+// who wrote a LAN address meant it, and quietly serving somewhere else would
+// leave them believing their second machine could connect while it silently
+// could not.
+func serveNodeWire(
+	ctx context.Context,
+	cfg *config.Config, nodes *nodeplane.Plane, store nodeplane.LeaseStore, jit nodeplane.JITSource,
+) (func(), error) {
+	addr := cfg.Server.Listen
+
+	if !nodeplane.LoopbackOnly(addr) {
+		return nil, fmt.Errorf(
+			"server.listen is %q, but billet has no transport security for the node wire yet: "+
+				"a node names itself in the request path and nothing verifies it, so anything "+
+				"that can reach this address could bind leases and ask for runner "+
+				"registrations. Bind it to loopback until mTLS lands",
+			addr)
+	}
+
+	var lc net.ListenConfig
+
+	ln, err := lc.Listen(ctx, "tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("listen for nodes on %s: %w", addr, err)
+	}
+
+	srv := &http.Server{
+		Handler: nodeplane.Handler(slog.Default(), nodes, store, jit),
+		// A command poll is a LONG poll, so there is deliberately no write or idle
+		// timeout that would cut one. The read-header timeout still bounds the one
+		// phase a client controls before the handler is entered, which is what
+		// stops a stalled connection holding a goroutine forever.
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+
+	go func() {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Default().Error("the node listener stopped", "error", err)
+		}
+	}()
+
+	slog.Default().Info("serving the node wire", "addr", ln.Addr().String())
+
+	return func() {
+		// A FRESH CONTEXT, deliberately. Shutdown runs while the caller's context
+		// is already cancelled — that cancellation is what brought us here — so
+		// deriving from it would abort the drain instantly and cut the very
+		// connections this is meant to let finish.
+		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			slog.Default().Warn("the node listener did not shut down cleanly", "error", err)
+		}
+	}, nil
+}
+
 // newProvider builds the compute backend this host runs.
 //
 // Only docker exists today. firecracker needs Linux and /dev/kvm, tart needs
@@ -412,7 +497,7 @@ func newProvider(cfg *config.Config, deployment string) (provider.Provider, erro
 	}
 }
 
-func cmdNode(_ context.Context, args []string) error {
+func cmdNode(ctx context.Context, args []string) error {
 	fs := newFlagSet("billet node")
 	cfgPath := addConfigFlag(fs)
 	if err := parse(fs, args); err != nil {
@@ -427,7 +512,73 @@ func cmdNode(_ context.Context, args []string) error {
 		return fmt.Errorf("%s has no node section", *cfgPath)
 	}
 
-	return fmt.Errorf("%w: P2 brings the node runtime and its mTLS dial-out", errNotImplemented)
+	if cfg.Node.ServerAddr == "" {
+		return fmt.Errorf("%s has no node.server_addr, so this host does not know which "+
+			"control plane to dial", *cfgPath)
+	}
+
+	// THE NODE'S IDENTITY COMES FROM ITS OWN STATE DIRECTORY, not from the
+	// server. It labels its compute with this, and the control plane refuses a
+	// node whose deployment differs — otherwise a host would start containers
+	// this installation could never attribute.
+	deployment, err := state.DeploymentID(cfg.Node.StateDir)
+	if err != nil {
+		return err
+	}
+
+	// The node takes the host-wide lock on its own identity for the same reason
+	// the server does: two billets sharing one identity manage the same
+	// containers. A node's config has no lock_dir of its own — that key belongs
+	// to the control plane's section — so this uses the default location.
+	lock, err := state.LockDeployment(deployment, state.LockOptions{})
+	if err != nil {
+		return err
+	}
+
+	defer func() {
+		if err := lock.Release(); err != nil {
+			slog.Default().Warn("could not release the deployment lock", "error", err)
+		}
+	}()
+
+	client, err := nodeclient.New(nodeclient.Options{
+		Base: cfg.Node.ServerAddr,
+		Node: cfg.Node.Name,
+	})
+	if err != nil {
+		return err
+	}
+
+	p, err := newProvider(cfg, deployment)
+	if err != nil {
+		return err
+	}
+
+	maxCustody, err := cfg.Node.MaxCustodyDuration()
+	if err != nil {
+		return err
+	}
+
+	// THE CLIENT IS BOTH THE LEDGER AND THE MINT.
+	//
+	// It satisfies node.LeaseStore and node.JITSource, which is the whole reason
+	// the runner needs no idea it is remote: the interfaces it already took are
+	// the seam the network went through.
+	runner := node.New(client, cfg.Node.Name, client, p, cfg.Tiers, slog.Default(),
+		node.WithMaxCustody(maxCustody))
+
+	fmt.Printf("billet node %s: dialing %s\n", cfg.Node.Name, cfg.Node.ServerAddr)
+
+	// NO GUEST-OS CLAIM. A host's allowlist lives in the SERVER's fleet
+	// configuration, not here, and Bind is what enforces it. Sending one from the
+	// node would be a second authority for a fact the operator already stated in
+	// one place — and the node's copy is the one nobody would think to update.
+	return nodeclient.Run(ctx, client, runner, nodeclient.LoopOptions{
+		Provider:   cfg.Node.Provider,
+		Deployment: deployment,
+		Log:        slog.Default(),
+		SweepEvery: 5 * time.Minute,
+	})
 }
 
 // cmdCheck is the explicit "is this deployment sane" command. It is the only
