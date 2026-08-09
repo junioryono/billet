@@ -10,6 +10,7 @@ package nodeclient
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,6 +26,7 @@ import (
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/node"
 	"github.com/junioryono/billet/internal/nodeapi"
+	"github.com/junioryono/billet/internal/server"
 )
 
 // ErrUnregistered means the control plane does not know this node.
@@ -42,6 +44,15 @@ var ErrUnregistered = errors.New("nodeclient: the control plane does not know th
 // there looking alive while never being able to work — the failure nobody
 // notices because nothing is crashing.
 var ErrRefused = errors.New("nodeclient: the control plane refused this node")
+
+// ErrUnauthenticated means the connection proved nothing about who it is.
+//
+// NOT A VERDICT, and that distinction is the point. ErrRefused is permanent and
+// the node stops on it. This is an expired, missing, or replaced certificate —
+// something an operator fixes on this host, after which the same node connects
+// fine. A node that gave up here would have to be restarted by hand once they
+// had.
+var ErrUnauthenticated = errors.New("nodeclient: this node did not prove who it is")
 
 // Client talks to a control plane.
 type Client struct {
@@ -61,14 +72,27 @@ type Client struct {
 
 // Options configures a Client.
 type Options struct {
-	// Base is the control plane's address, e.g. http://127.0.0.1:7717.
+	// Base is the control plane's address, as a URL or a bare host:port.
+	//
+	// A bare address takes its scheme from whether TLS is configured, which is the
+	// only place that answer is known. Config carries host:port because that is
+	// what an operator writes and what the address can be validated as; a URL
+	// there would let someone write http:// beside a certificate and get a node
+	// that quietly never used it.
 	Base string
 	// Node is this host's name, which must match its entry in the server's
 	// fleet configuration.
 	Node string
-	// HTTP is the transport. A caller supplies one so timeouts and, later, mTLS
-	// are decided once rather than here.
+	// HTTP is the transport. A caller supplies one so timeouts are decided once
+	// rather than here.
 	HTTP *http.Client
+	// TLS is the node's side of the wire: its certificate, and the deployment
+	// authority it verifies the control plane against.
+	//
+	// Nil serves loopback, and nothing else — a control plane bound to a network
+	// address refuses to start without a certificate, so a node reaching one over
+	// the network without this fails at the handshake rather than half-connecting.
+	TLS *tls.Config
 	// RequestTimeout bounds an ordinary request. Zero uses requestTimeout.
 	//
 	// Configuration rather than a test hook: a node on a slow or distant link
@@ -87,12 +111,13 @@ func New(opts Options) (*Client, error) {
 		return nil, errors.New("nodeclient: a node name is required")
 	}
 
-	if _, err := url.Parse(opts.Base); err != nil {
-		return nil, fmt.Errorf("nodeclient: control plane address %q: %w", opts.Base, err)
+	base, err := normaliseBase(opts.Base, opts.TLS != nil)
+	if err != nil {
+		return nil, err
 	}
 
 	c := &Client{
-		base:       strings.TrimSuffix(opts.Base, "/"),
+		base:       base,
 		node:       opts.Node,
 		http:       opts.HTTP,
 		reqTimeout: opts.RequestTimeout,
@@ -100,6 +125,16 @@ func New(opts Options) (*Client, error) {
 
 	if c.reqTimeout <= 0 {
 		c.reqTimeout = requestTimeout
+	}
+
+	// A SUPPLIED CLIENT KEEPS ITS OWN TRANSPORT. Reaching into someone else's
+	// http.Client to install a TLS config would silently change every other
+	// request that client makes, and the caller that passed it in is the one who
+	// knows whether that is wanted.
+	if c.http != nil && opts.TLS != nil {
+		return nil, errors.New(
+			"nodeclient: both an HTTP client and a TLS config were supplied; the TLS config " +
+				"would have to be installed into a transport this package does not own")
 	}
 
 	if c.http == nil {
@@ -117,6 +152,7 @@ func New(opts Options) (*Client, error) {
 		c.http = &http.Client{
 			Transport: &http.Transport{
 				DialContext:           (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
+				TLSClientConfig:       opts.TLS,
 				TLSHandshakeTimeout:   10 * time.Second,
 				ResponseHeaderTimeout: 0, // a long poll withholds headers on purpose
 				IdleConnTimeout:       90 * time.Second,
@@ -126,6 +162,69 @@ func New(opts Options) (*Client, error) {
 
 	return c, nil
 }
+
+// normaliseBase turns what an operator wrote into a URL requests can be built
+// from.
+//
+// THIS IS WHERE `billet node` WAS BROKEN, and nothing caught it because the
+// check that stood here could not fail: url.Parse accepts "127.0.0.1:7717"
+// happily — it reads the host as a scheme — so a config-supplied host:port
+// passed validation, became the base, and then every single request died at
+// construction with "first path segment in URL cannot contain colon". The node
+// command could not make one call. Every test dialled an httptest server, whose
+// URL already carries a scheme, so the whole suite was green.
+func normaliseBase(raw string, secure bool) (string, error) {
+	raw = strings.TrimSuffix(raw, "/")
+
+	scheme := "http"
+	if secure {
+		scheme = "https"
+	}
+
+	if !strings.Contains(raw, "://") {
+		raw = scheme + "://" + raw
+	}
+
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("nodeclient: control plane address %q: %w", raw, err)
+	}
+
+	if u.Host == "" {
+		return "", fmt.Errorf(
+			"nodeclient: control plane address %q names no host", raw)
+	}
+
+	switch u.Scheme {
+	case "http":
+		// A CERTIFICATE THAT WOULD NEVER BE PRESENTED IS A CONFIGURATION ERROR, not
+		// a fallback. The handshake would fail anyway against a plane that requires
+		// one; refusing here says why, instead of leaving an operator reading TLS
+		// errors from a node they believed was configured for TLS.
+		if secure {
+			return "", fmt.Errorf(
+				"nodeclient: control plane address %q is http, but this node has a certificate "+
+					"to present; drop the scheme or write https", raw)
+		}
+	case "https":
+		if !secure {
+			return "", fmt.Errorf(
+				"nodeclient: control plane address %q is https, but this node has no certificate "+
+					"to present, so the control plane will reject the handshake", raw)
+		}
+	default:
+		return "", fmt.Errorf(
+			"nodeclient: control plane address %q must be http or https", raw)
+	}
+
+	return u.Scheme + "://" + u.Host + strings.TrimSuffix(u.Path, "/"), nil
+}
+
+// BaseForTest reports the URL requests are built from.
+//
+// Exported for tests because the failure it guards is invisible from outside:
+// a base without a scheme builds a request that never leaves the process.
+func (c *Client) BaseForTest() string { return c.base }
 
 // Register introduces this node and learns the timings it must respect.
 func (c *Client) Register(
@@ -452,6 +551,10 @@ func (c *Client) decodeErr(resp *http.Response) error {
 	switch body.Code {
 	case nodeapi.CodeRefused:
 		return fmt.Errorf("%w: %s", ErrRefused, body.Message)
+	case nodeapi.CodeUnauthenticated:
+		return fmt.Errorf("%w: %s", ErrUnauthenticated, body.Message)
+	case nodeapi.CodeCustody:
+		return fmt.Errorf("%w: %s", server.ErrCustody, body.Message)
 	case nodeapi.CodeFenced:
 		return fmt.Errorf("%w: %s", alloc.ErrFenced, body.Message)
 	case nodeapi.CodeNotFound:

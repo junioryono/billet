@@ -646,19 +646,23 @@ func TestAForgottenNodeReleasesItsQueuedWork(t *testing.T) {
 	}
 }
 
-// A NODE THAT DIES DURING A DESTROY LANDS WHERE ONE THAT DIED BEFORE IT LANDS.
+// A DESTROY NOBODY CONFIRMED IS A FAILURE, EVEN WHEN THE NODE HAS GONE.
 //
-// The snapshot Destroy broadcasts to is taken once. A node already forgotten is
-// not in it, is never asked, and Destroy reports success — there is nowhere for
-// the compute to be. A node forgotten half a second later IS asked, cannot
-// answer, and fails its leg, and a failed destroy makes the listener hold the
-// lease with nothing to retry it and no host coming back to release it.
+// The tempting reading is that a vanished node took its containers with it, so
+// its unanswered destroy may as well be forgiven — otherwise the listener holds
+// that lease for good, with nothing to retry it and no host coming back. This
+// code was written that way for exactly one review round.
 //
-// Two identical situations decided by microseconds, with opposite outcomes, one
-// of which leaks a capacity slot permanently. The sweep a returning node runs is
-// what removes compute the server no longer recognises, and a node that never
-// returns took its containers down with it.
-func TestADestroyIsNotFailedByANodeThatIsGone(t *testing.T) {
+// It is false wherever the compute runtime outlives the billet process, which is
+// every provider there is. A node that takes a destroy and then crashes leaves a
+// Docker daemon holding a container that is still running and still occupying
+// the capacity this lease represents. Releasing the lease sells that capacity
+// twice, which is the one thing the allocator exists to prevent.
+//
+// So the failure stands and the lease is held. That leaks a slot when a host
+// never returns, and the leak is the better half of the trade: it costs
+// capacity, where the alternative costs correctness.
+func TestADestroyNoNodeConfirmedIsAFailure(t *testing.T) {
 	t.Parallel()
 
 	clock := newTestClock()
@@ -666,8 +670,7 @@ func TestADestroyIsNotFailedByANodeThatIsGone(t *testing.T) {
 	p := testPlane(t, WithClock(clock.now), WithCommandTimeout(150*time.Millisecond))
 	register(t, p, "n1", config.ProviderDocker)
 
-	// The node takes the destroy and then dies holding it, which is the window:
-	// it is busy, so it is exempt from expiry until its command stops waiting.
+	// The node takes the destroy and then dies holding it.
 	taken := make(chan struct{})
 
 	go func() {
@@ -688,14 +691,15 @@ func TestADestroyIsNotFailedByANodeThatIsGone(t *testing.T) {
 		t.Fatal("the node never took the destroy")
 	}
 
-	// Silent well past the window, so once the command gives up it is gone.
+	// Silent well past the window, so the plane forgets it once the command stops
+	// waiting — the case that used to be forgiven.
 	clock.advancePastSilence()
 
 	select {
 	case err := <-destroyed:
-		if err != nil {
-			t.Errorf("a destroy unanswered by a node that has since been forgotten was "+
-				"reported as a failure, so the listener holds that lease forever: %v", err)
+		if err == nil {
+			t.Error("a destroy no node confirmed reported success, so the listener releases " +
+				"capacity that a container may still be using")
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("the destroy never returned")

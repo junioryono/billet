@@ -546,6 +546,81 @@ func TestTheCustodyJanitorDoesNotOutliveTheLoop(t *testing.T) {
 	}
 }
 
+// A LATE RESULT MAKES THE NODE ASSUME CUSTODY TOO, and this is the path the
+// first version missed.
+//
+// The other test forces the report itself to FAIL, which is one of the two ways
+// a launch and its lease can come apart. The other is worse because everything
+// appears to work: the launch takes longer than the command timeout, the plane
+// abandons it and tells the listener the node has custody, the listener stops
+// heartbeating — and THEN the provider returns successfully and the node reports
+// it. The report arrives, the plane says 204, and the node files the instance in
+// its ordinary running set. Nothing renews that lease. The reaper releases its
+// capacity while the container runs, and the same capacity is sold twice.
+//
+// So a report for a launch the plane has already abandoned is answered with
+// custody rather than with a shrug.
+func TestALateResultMakesTheNodeAssumeCustody(t *testing.T) {
+	t.Parallel()
+
+	p, c := harness(t)
+
+	gate := make(chan struct{})
+	compute := &fakeCompute{
+		launchGate:    gate,
+		launchStarted: make(chan struct{}),
+	}
+
+	runLoop(t, c, compute)
+
+	// Registered first, or the launch below finds no node and fails instantly for
+	// a reason that has nothing to do with what this test is about.
+	waitFor(t, func() bool { return len(p.Nodes()) == 1 })
+
+	// The launch is dispatched, and the fake holds it open past the plane's
+	// command timeout.
+	launched := make(chan error, 1)
+
+	go func() {
+		lease := &alloc.Lease{
+			ID:        "l1",
+			VCPU:      2,
+			Memory:    8 * config.GiB,
+			GuestOS:   config.GuestLinux,
+			Providers: []config.ProviderKind{config.ProviderDocker},
+			Epoch:     1,
+		}
+
+		launched <- p.NewRunner().Launch(t.Context(), lease, server.Job{RequestID: 7})
+	}()
+
+	select {
+	case <-compute.launchStarted:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the node never started the launch")
+	}
+
+	// The plane stops waiting and hands the listener custody.
+	select {
+	case err := <-launched:
+		if !errors.Is(err, server.ErrCustody) {
+			t.Fatalf("an abandoned in-flight launch must report custody, got %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the launch never returned")
+	}
+
+	// Only now does the provider succeed, so the report is late rather than lost.
+	close(gate)
+
+	waitFor(t, func() bool { return len(compute.custodyTaken()) == 1 })
+
+	if got := compute.custodyTaken(); len(got) != 1 || got[0] != 7 {
+		t.Errorf("custody taken for %v, want the request the plane abandoned; without this "+
+			"the container runs under a lease nothing renews", got)
+	}
+}
+
 // A LOST RESULT MAKES THE NODE TAKE CUSTODY, because the server already has.
 //
 // The failure this prevents: the launch succeeds, the report is lost, the plane

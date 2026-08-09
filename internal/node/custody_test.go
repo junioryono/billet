@@ -1234,6 +1234,73 @@ func TestKeepAliveRenewsHeldLeasesWhileTendIsBlocked(t *testing.T) {
 	}
 }
 
+// THE JANITOR FOLLOWS A RENEGOTIATED TTL, because the plane can shorten it.
+//
+// The TTL is agreed at registration, and a node re-registers whenever the
+// control plane forgets it or restarts. A plane that comes back advertising a
+// SHORTER TTL leaves a janitor built on the old one renewing too slowly: the
+// lease expires between two heartbeats, the reaper resells its capacity, and the
+// container it was holding is still running.
+//
+// The janitor is deliberately started once — custody outlives any single
+// registration — so re-reading the value each cycle is the only place that
+// correction can happen.
+func TestKeepAliveFollowsAShortenedLeaseTTL(t *testing.T) {
+	t.Parallel()
+
+	p := &fakeProvider{kind: config.ProviderDocker}
+
+	a, host := newAllocatorWithHost(t)
+
+	warm := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	lease := assignedLease(t, a)
+
+	if err := warm.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	store := &brittleStore{LeaseStore: a}
+	r := New(store, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
+	if err := r.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+
+	// Long enough that a janitor which fixed its cadence here would renew roughly
+	// never on the timescale of this test.
+	var ttl atomic.Int64
+
+	ttl.Store(int64(90 * time.Second))
+
+	r.ttl = func() time.Duration { return time.Duration(ttl.Load()) }
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	go r.KeepAlive(ctx)
+
+	// The plane comes back with a much shorter TTL, as a restarted or
+	// reconfigured control plane does.
+	ttl.Store(int64(30 * time.Millisecond))
+
+	// SEVERAL renewals, not one: one could be a single fire of a timer that then
+	// went back to the ninety-second cadence.
+	const want = 3
+
+	deadline := time.Now().Add(20 * time.Second)
+
+	for store.heartbeats.Load() < want {
+		if time.Now().After(deadline) {
+			t.Fatalf("the janitor renewed %d times after the TTL was shortened, want at least "+
+				"%d; it is still renewing on the cadence it was born with, so a lease can "+
+				"expire between heartbeats while its container runs",
+				store.heartbeats.Load(), want)
+		}
+
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // KeepAlive stops when its context does, rather than outliving the process it
 // belongs to.
 func TestKeepAliveStopsWithItsContext(t *testing.T) {

@@ -40,6 +40,16 @@ var ErrUnregistered = errors.New("nodeplane: node is not registered")
 // after the database came back.
 var ErrRefused = errors.New("nodeplane: registration refused")
 
+// ErrTakeCustody answers a result for a launch the plane stopped waiting for.
+//
+// THE REPORT IS NOT REJECTED, IT IS REDIRECTED. The node did the work and told
+// the truth; it is simply later than the command timeout, and by then the plane
+// had already told the listener that this lease was the node's. Answering 204
+// would leave the container running under a lease NOBODY renews — the listener
+// stopped because it was told custody, and the node never learned it had any.
+// The reaper resells that capacity a TTL later.
+var ErrTakeCustody = errors.New("nodeplane: this launch's lease is now the node's to hold")
+
 // defaultCommandTimeout bounds how long a launch waits for a node to answer.
 //
 // It is NOT a statement that nothing started. A command already handed to a node
@@ -93,8 +103,44 @@ type node struct {
 	// the node reconnects and asks for it again.
 	inflight map[string]*pending
 
+	// abandoned holds launches the plane stopped waiting for, by command id, with
+	// the moment it gave up.
+	//
+	// A TOMBSTONE, and what it records is the lease changing hands. Abandoning a
+	// delivered launch tells the listener the node has custody; if that launch
+	// then succeeds and reports, this is the only thing left that can tell the
+	// node it owns what it started.
+	abandoned map[string]time.Time
+
 	// waiting is signalled when a command arrives for a node that is polling.
 	waiting chan struct{}
+}
+
+// rememberAbandoned records a launch the plane gave up waiting for.
+func (n *node) rememberAbandoned(id string, at time.Time) {
+	if n.abandoned == nil {
+		n.abandoned = make(map[string]time.Time)
+	}
+
+	if len(n.abandoned) >= maxAbandoned {
+		// Drop the oldest. The newer entries are the launches still likely to
+		// report, and an unbounded map on a node whose every launch outlasts the
+		// command timeout is a slow leak in the one process that must not fall over.
+		var (
+			oldest string
+			when   time.Time
+		)
+
+		for id, at := range n.abandoned {
+			if oldest == "" || at.Before(when) {
+				oldest, when = id, at
+			}
+		}
+
+		delete(n.abandoned, oldest)
+	}
+
+	n.abandoned[id] = at
 }
 
 // pending is a command and the caller waiting for its result.
@@ -292,6 +338,37 @@ func (p *Plane) answerLocked(pend *pending, res nodeapi.CommandResult) {
 	}
 }
 
+// Seen records that a node just spoke, whatever it said.
+//
+// EVERY REQUEST IS EVIDENCE OF LIFE, and taking it only from Poll and Result was
+// a silent way to kill a working node. The node's command loop is synchronous:
+// if Recover, Sweep or Tend wedges — a hung Docker call is enough — the loop
+// never reaches Poll again. Its custody janitor is a separate goroutine and
+// keeps heartbeating perfectly well, but each heartbeat asked whether the node
+// was registered, that question ran expiry, and the same call that proved the
+// node alive was the one that declared it dead. Every later heartbeat was then
+// refused as unregistered, and the leases it held — for compute that may still
+// be running — expired.
+//
+// Command eligibility is bounded by the command timeout, which is the right
+// instrument for a node that takes work and never answers. Membership is bounded
+// by silence, which is the right instrument for a node that has gone.
+// maxAbandoned bounds what one node's tombstones can cost.
+//
+// A node whose launches all outlast the command timeout would otherwise grow
+// this without limit. Losing the OLDEST entry is the right sacrifice: the newer
+// ones are the launches still likely to report.
+const maxAbandoned = 1024
+
+func (p *Plane) Seen(name string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if n, ok := p.nodes[name]; ok {
+		n.lastSeen = p.now()
+	}
+}
+
 // Nodes reports the registered node names, for diagnostics.
 func (p *Plane) Nodes() []string {
 	p.mu.Lock()
@@ -391,10 +468,27 @@ func (p *Plane) Result(nodeName string, res nodeapi.CommandResult) error {
 
 	pend, ok := n.inflight[res.ID]
 	if !ok {
-		// A RESULT FOR SOMETHING NOBODY IS WAITING FOR IS NOT AN ERROR. The
-		// caller may have timed out, or the node may be reporting again after a
-		// reconnect. Both are ordinary, and refusing would make a node retry
-		// something already accounted for.
+		// A LAUNCH THE PLANE GAVE UP ON IS DIFFERENT FROM ONE NOBODY IS WAITING
+		// FOR. Abandoning a delivered launch tells the listener "the node has
+		// custody", and the listener stops heartbeating on the strength of it. If
+		// that launch then succeeds and reports, answering with a shrug leaves the
+		// container running under a lease nothing renews.
+		if _, abandoned := n.abandoned[res.ID]; abandoned {
+			delete(n.abandoned, res.ID)
+
+			if res.OK {
+				return ErrTakeCustody
+			}
+
+			// A FAILED LATE REPORT NEEDS NO HANDOFF. Nothing is running, so there is
+			// nothing to hold, and telling the node to take custody of a launch that
+			// failed would have it renew a lease for compute that does not exist.
+			return nil
+		}
+
+		// Otherwise ordinary: the caller may have timed out on a command that is
+		// not a launch, or the node may be reporting again after a reconnect.
+		// Refusing would make a node retry something already accounted for.
 		return nil
 	}
 

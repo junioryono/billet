@@ -8,9 +8,11 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/nodeapi"
+	"github.com/junioryono/billet/internal/wirecert"
 )
 
 // LeaseStore is the ledger, as the node wire needs it.
@@ -57,39 +59,137 @@ type LeaseStore interface {
 // one process whose loss stops every job in the organisation.
 const maxBody = 1 << 20
 
+// HandlerOption configures the wire.
+type HandlerOption func(*handler)
+
+// RequireClientCert makes a verified certificate the source of a node's name.
+//
+// WITHOUT IT THE PATH IS THE ONLY AUTHORITY, which is not authentication at all:
+// any process that can reach the listener claims to be any node, binds its
+// leases, takes its commands, and asks for a JIT registration — a credential
+// that registers a runner against the organisation. That is why a wire served
+// without this refuses to bind anywhere but loopback.
+//
+// With it, the name in the certificate decides, and a request whose path
+// disagrees is rejected rather than reconciled. Two authorities for one fact is
+// how this codebase's worst bugs have started, and an authenticated identity is
+// the one place it must not happen.
+func RequireClientCert() HandlerOption {
+	return func(h *handler) { h.requireCert = true }
+}
+
 // Handler serves the node wire.
 //
-// THE NODE NAMES ITSELF IN THE PATH, AND THAT IS NOT AUTHENTICATION. Until mTLS
-// lands, any process that can reach this listener can claim to be any node. That
-// is why the server refuses to serve this on anything but loopback without TLS —
-// see the guard in the command wiring — and why this comment is here rather than
-// in a design document: the next person to bind it to 0.0.0.0 should meet the
-// problem, not discover it.
-func Handler(log *slog.Logger, p *Plane, store LeaseStore, jit JITSource) http.Handler {
+// Every route that acts for a node is wrapped in forNode, and that is deliberate
+// rather than tidy: the enforcement is visible in the routing table, so a route
+// added without it is missing something a reader can SEE, instead of missing a
+// check buried in a handler nobody re-reads.
+func Handler(log *slog.Logger, p *Plane, store LeaseStore, jit JITSource, opts ...HandlerOption) http.Handler {
 	h := &handler{log: log, plane: p, store: store, jit: jit}
+
+	for _, opt := range opts {
+		opt(h)
+	}
 
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("POST /v1/register", h.register)
-	mux.HandleFunc("POST /v1/nodes/{node}/poll", h.poll)
-	mux.HandleFunc("POST /v1/nodes/{node}/result", h.result)
-	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/bind", h.bind)
-	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/advance", h.advance)
-	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/heartbeat", h.heartbeat)
-	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/release", h.release)
-	mux.HandleFunc("GET /v1/nodes/{node}/leases/{lease}", h.lease)
-	mux.HandleFunc("GET /v1/nodes/{node}/launched", h.launched)
-	mux.HandleFunc("POST /v1/nodes/{node}/describe", h.describe)
-	mux.HandleFunc("POST /v1/nodes/{node}/jit", h.jitConfig)
+	mux.HandleFunc("POST /v1/nodes/{node}/poll", h.forNode(h.poll))
+	mux.HandleFunc("POST /v1/nodes/{node}/result", h.forNode(h.result))
+	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/bind", h.forNode(h.bind))
+	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/advance", h.forNode(h.advance))
+	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/heartbeat", h.forNode(h.heartbeat))
+	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/release", h.forNode(h.release))
+	mux.HandleFunc("GET /v1/nodes/{node}/leases/{lease}", h.forNode(h.lease))
+	mux.HandleFunc("GET /v1/nodes/{node}/launched", h.forNode(h.launched))
+	mux.HandleFunc("POST /v1/nodes/{node}/describe", h.forNode(h.describe))
+	mux.HandleFunc("POST /v1/nodes/{node}/jit", h.forNode(h.jitConfig))
 
 	return mux
 }
 
 type handler struct {
-	log   *slog.Logger
-	plane *Plane
-	store LeaseStore
-	jit   JITSource
+	log         *slog.Logger
+	plane       *Plane
+	store       LeaseStore
+	jit         JITSource
+	requireCert bool
+}
+
+// forNode admits a request only if the certificate agrees with the path.
+//
+// AFTER ROUTING, WHICH IS WHY IT IS NOT MIDDLEWARE AROUND THE MUX. The path
+// variable does not exist until the mux has matched, so a wrapper outside it
+// would read an empty node name and compare the certificate against nothing —
+// passing every request, and looking exactly like a working check.
+func (h *handler) forNode(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !h.authorise(w, r, r.PathValue("node")) {
+			return
+		}
+
+		next(w, r)
+	}
+}
+
+// authorise reports whether the connection may act for the node it claims.
+func (h *handler) authorise(w http.ResponseWriter, r *http.Request, claimed string) bool {
+	if !h.requireCert {
+		return true
+	}
+
+	// BELT AND BRACES. tls.RequireAndVerifyClientCert means an unverified
+	// connection never reaches a handler, so this branch should be unreachable —
+	// which is precisely why it is here. If some future wiring serves this mux
+	// over a listener that does not require certificates, the failure must be a
+	// refusal rather than every request silently authenticating as whatever the
+	// path says.
+	if r.TLS == nil || len(r.TLS.VerifiedChains) == 0 || len(r.TLS.PeerCertificates) == 0 {
+		writeErr(w, http.StatusUnauthorized, nodeapi.CodeUnauthenticated,
+			"this wire requires a client certificate issued by the deployment's authority")
+
+		return false
+	}
+
+	name := r.TLS.PeerCertificates[0].Subject.CommonName
+	if name == "" {
+		writeErr(w, http.StatusUnauthorized, nodeapi.CodeUnauthenticated,
+			"the client certificate names no node, so there is nothing to act as")
+
+		return false
+	}
+
+	if name != claimed {
+		// NAMES BOTH, because the two ways to arrive here need different fixes: a
+		// node dialling with the wrong bundle after a rename, and something on the
+		// network trying to act as a host it is not.
+		h.log.Warn("a connection tried to act for a node it is not",
+			"certificate", name, "claimed", claimed, "path", r.URL.Path)
+
+		writeErr(w, http.StatusForbidden, nodeapi.CodeRefused, fmt.Sprintf(
+			"this connection is authenticated as node %q and cannot act for %q", name, claimed))
+
+		return false
+	}
+
+	return true
+}
+
+// warnIfExpiring complains about a certificate while the node still works.
+//
+// The alternative is finding out on the day it stops: an expired node
+// certificate is a TLS failure at dial time, so the node simply disappears from
+// the fleet and the control plane has no way left to tell anyone why.
+func (h *handler) warnIfExpiring(r *http.Request, node string) {
+	if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
+		return
+	}
+
+	if left, soon := wirecert.ExpiresSoon(r.TLS.PeerCertificates[0]); soon {
+		h.log.Warn("a node certificate is close to expiry; re-issue it before it stops working",
+			"node", node, "expires_in", left.Round(time.Hour),
+			"not_after", r.TLS.PeerCertificates[0].NotAfter)
+	}
 }
 
 func (h *handler) register(w http.ResponseWriter, r *http.Request) {
@@ -97,6 +197,15 @@ func (h *handler) register(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
+
+	// REGISTER NAMES ITSELF IN THE BODY, not the path, so it cannot use forNode.
+	// It is also the request that matters most: it is what puts a node in the
+	// fleet, and everything downstream trusts that membership.
+	if !h.authorise(w, r, req.Node) {
+		return
+	}
+
+	h.warnIfExpiring(r, req.Node)
 
 	res, err := h.plane.Register(r.Context(), req)
 	if err != nil {
@@ -380,6 +489,12 @@ func (h *handler) jitConfig(w http.ResponseWriter, r *http.Request) {
 // lease writes are rejected with a code that means "register again" rather than
 // a generic failure it would retry forever without ever fixing.
 func (h *handler) requireRegistered(node string) error {
+	// RECORDED BEFORE THE QUESTION IS ASKED, because asking it runs expiry. A
+	// custody heartbeat arriving from a healthy janitor used to expire the very
+	// node it came from — the node had not polled, and nothing else counted as
+	// life — and then be refused as unregistered.
+	h.plane.Seen(node)
+
 	for _, known := range h.plane.Nodes() {
 		if known == node {
 			return nil
@@ -432,6 +547,10 @@ func writeErr(w http.ResponseWriter, status int, code, msg string) {
 // reworded error becomes an outage.
 func writeStoreErr(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, ErrTakeCustody):
+		// 409, NOT AN ERROR STATUS THE NODE WILL RETRY. The report was accepted;
+		// what is being returned is an instruction about who now holds the lease.
+		writeErr(w, http.StatusConflict, nodeapi.CodeCustody, err.Error())
 	case errors.Is(err, ErrUnregistered):
 		writeErr(w, http.StatusUnauthorized, nodeapi.CodeUnregistered, err.Error())
 	case errors.Is(err, alloc.ErrFenced):

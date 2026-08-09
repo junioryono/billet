@@ -147,44 +147,29 @@ func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
 		return nil
 	}
 
-	// A NODE FORGOTTEN DURING THE DESTROY IS THE SAME AS ONE FORGOTTEN BEFORE IT,
-	// and the two disagreeing was the defect. A node already gone at the snapshot
-	// above is not asked at all, and Destroy reports success. A node that dies
-	// half a second later fails its leg, and a failed destroy makes the listener
-	// hold the lease — for good, since nothing retries it and the host never comes
-	// back to answer. Identical situations, opposite outcomes, decided by
-	// microseconds.
+	// A NODE'S ABSENCE IS NOT PROOF THAT ITS COMPUTE IS GONE, and for one review
+	// round this code assumed it was. The reasoning looked sound: a node forgotten
+	// BEFORE the snapshot above is never asked and Destroy reports success, so a
+	// node forgotten half a second later ought to land the same way rather than
+	// failing forever with nothing to retry it.
 	//
-	// So they are made to agree, in the direction the rest of the design already
-	// chose: the sweep a returning node runs is what removes compute the server no
-	// longer recognises, and a node that never returns took its containers down
-	// with it. Holding the capacity forever protects nothing and costs a slot.
+	// It is false for every provider whose runtime outlives the billet process,
+	// which is all of them. A node that takes a destroy and then crashes leaves a
+	// Docker daemon holding a container that is still running, still executing a
+	// job, and still using the capacity this lease represents. Forgiving that leg
+	// releases the lease, and the capacity is sold twice.
 	//
-	// Note this asks the question AFTER the legs finish, deliberately: a node with
-	// a command in flight is exempt from expiry, so it cannot be judged absent
-	// until its command has stopped waiting.
-	live := r.liveSet()
-
-	kept := legs[:0]
-
+	// So the failure stands and the listener keeps holding the lease, which is the
+	// safe direction: never release capacity while compute may be running. It
+	// leaks a slot when a host never comes back, and that trade is deliberate — a
+	// leak costs capacity, and the alternative costs correctness.
+	//
+	// The proper repair is to stop broadcasting. Destroy fans out because the
+	// plane does not record WHERE a request's compute was placed, and the lease
+	// already knows — it is bound to a node. Addressing the destroy there answers
+	// both cases exactly, instead of inferring compute from fleet membership.
+	errs := make([]error, 0, len(legs))
 	for _, l := range legs {
-		if !live[l.node] {
-			r.plane.log.Warn("a destroy went unanswered by a node that has since been forgotten; "+
-				"its compute is the sweep's to remove when it returns",
-				"node", l.node, "request_id", requestID, "err", l.err)
-
-			continue
-		}
-
-		kept = append(kept, l)
-	}
-
-	if len(kept) == 0 {
-		return nil
-	}
-
-	errs := make([]error, 0, len(kept))
-	for _, l := range kept {
 		errs = append(errs, l.err)
 	}
 
@@ -307,17 +292,6 @@ func (r *Runner) liveNodes() []*node {
 	return out
 }
 
-// liveSet names the nodes the plane still knows about, expiring stale ones
-// first.
-func (r *Runner) liveSet() map[string]bool {
-	live := make(map[string]bool)
-	for _, n := range r.liveNodes() {
-		live[n.name] = true
-	}
-
-	return live
-}
-
 // destroyOn asks one node to remove a request's compute.
 func (r *Runner) destroyOn(ctx context.Context, n *node, requestID int64) error {
 	id, err := commandID()
@@ -387,6 +361,13 @@ func (p *Plane) abandon(n *node, pend *pending, cause error) error {
 		delete(n.inflight, pend.cmd.ID)
 
 		if pend.cmd.Kind == nodeapi.CommandLaunch {
+			// REMEMBERED, because this is the moment the lease changes hands. The
+			// listener is about to be told the node has custody and will stop
+			// heartbeating. If the launch later succeeds and reports, the node has to
+			// be told it now owns what it started — and the only thing that can tell
+			// it is this record.
+			n.rememberAbandoned(pend.cmd.ID, p.now())
+
 			return fmt.Errorf("%w: %w, so whether compute started is unknown",
 				server.ErrCustody, cause)
 		}

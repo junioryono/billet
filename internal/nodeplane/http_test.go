@@ -3,11 +3,14 @@ package nodeplane_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -473,26 +476,67 @@ func TestAForeignNodeIsRefusedOverTheWire(t *testing.T) {
 func TestUnknownFieldsAreRefused(t *testing.T) {
 	t.Parallel()
 
-	_, base := serve(t, &fakeStore{})
+	log := slog.New(slog.DiscardHandler)
+	p := nodeplane.New(log, deployment, time.Minute)
+	srv := httptest.NewServer(nodeplane.Handler(log, p, &fakeStore{}, nil))
 
-	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost,
-		base+"/v1/register", http.NoBody)
+	t.Cleanup(srv.Close)
+
+	// AN OTHERWISE VALID REGISTRATION, differing only in the bogus field. The
+	// version that stood here posted an empty body, which is refused for being
+	// empty — so deleting DisallowUnknownFields left it green, and the check it
+	// existed to guard was unprotected.
+	valid := fmt.Sprintf(
+		`{"version":%d,"node":"n1","provider":"docker","deployment":%q}`,
+		nodeapi.Version, deployment)
+
+	accepted, err := postRaw(t, srv.URL+"/v1/register", valid)
 	if err != nil {
-		t.Fatalf("request: %v", err)
+		t.Fatalf("post: %v", err)
 	}
 
-	req.Body = http.NoBody
+	if accepted != http.StatusOK {
+		t.Fatalf("the control registration was rejected with %d, so this test cannot tell a "+
+			"refused unknown field from a refused registration", accepted)
+	}
 
-	resp, err := http.DefaultClient.Do(req)
+	withBogus := fmt.Sprintf(
+		`{"version":%d,"node":"n2","provider":"docker","deployment":%q,"turbo":true}`,
+		nodeapi.Version, deployment)
+
+	got, err := postRaw(t, srv.URL+"/v1/register", withBogus)
 	if err != nil {
-		t.Fatalf("do: %v", err)
+		t.Fatalf("post: %v", err)
 	}
 
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode < 400 {
-		t.Errorf("an empty registration was accepted with %s", resp.Status)
+	if got == http.StatusOK {
+		t.Error("a registration carrying a field this build does not understand was accepted: " +
+			"the two sides are deployed separately, so an unknown field is a version mismatch " +
+			"and silently dropping it hides one until something behaves oddly much later")
 	}
+}
+
+// postRaw posts a literal body, which is the only way to send a field no Go type
+// on this side has.
+func postRaw(t *testing.T, url, body string) (int, error) {
+	t.Helper()
+
+	req, err := http.NewRequestWithContext(
+		t.Context(), http.MethodPost, url, strings.NewReader(body))
+	if err != nil {
+		return 0, err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, err
+	}
+
+	defer func() { _ = res.Body.Close() }()
+
+	return res.StatusCode, nil
 }
 
 // A CONTROL PLANE THAT ACCEPTS AND NEVER ANSWERS MUST NOT HANG THE NODE.
@@ -612,6 +656,61 @@ func TestALedgerRefusalFailsTheRegistration(t *testing.T) {
 
 	if len(p.Nodes()) != 0 {
 		t.Errorf("the plane kept %v after the ledger refused", p.Nodes())
+	}
+}
+
+// A CUSTODY HEARTBEAT IS EVIDENCE THE NODE IS ALIVE.
+//
+// The node's command loop is synchronous: if Recover, Sweep or Tend wedges — a
+// hung Docker call is enough — the loop never reaches Poll again. Its custody
+// janitor is a separate goroutine and keeps heartbeating perfectly well.
+//
+// When only Poll and Result counted as life, that heartbeat asked whether the
+// node was registered, the question ran expiry, and the same call that proved
+// the node alive was the one that declared it dead. Every heartbeat afterwards
+// was refused as unregistered, the wedged loop could not reach Poll to
+// re-register, and the leases it was holding — for compute that may still be
+// running — expired.
+func TestACustodyHeartbeatKeepsANodeRegistered(t *testing.T) {
+	t.Parallel()
+
+	// A clock this test moves. Atomic because the plane reads it from its own
+	// goroutines, and a closure over a plain variable is a data race the moment
+	// anything but the test consults it.
+	var nanos atomic.Int64
+
+	nanos.Store(time.Now().UnixNano())
+
+	clock := func() time.Time { return time.Unix(0, nanos.Load()) }
+
+	log := slog.New(slog.DiscardHandler)
+	p := nodeplane.New(log, deployment, time.Minute, nodeplane.WithClock(clock))
+	srv := httptest.NewServer(nodeplane.Handler(log, p, &fakeStore{}, nil))
+
+	t.Cleanup(srv.Close)
+
+	c, err := nodeclient.New(nodeclient.Options{Base: srv.URL, Node: "n1"})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+
+	if err := c.Register(t.Context(), config.ProviderDocker, nil, deployment); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	// Silent on the POLL for well past the window — the wedged-loop case — while
+	// the janitor keeps renewing.
+	for range 3 {
+		nanos.Add(int64(10 * time.Minute))
+
+		if err := c.Heartbeat(t.Context(), "l1", 1); err != nil {
+			t.Fatalf("a heartbeat from a node whose command loop is stuck was refused, so the "+
+				"leases it holds expire while its compute may still be running: %v", err)
+		}
+	}
+
+	if got := p.Nodes(); len(got) != 1 {
+		t.Errorf("a node that heartbeated throughout was forgotten: %v", got)
 	}
 }
 

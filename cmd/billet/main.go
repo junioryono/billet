@@ -9,6 +9,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
@@ -35,6 +36,7 @@ import (
 	"github.com/junioryono/billet/internal/scaleset"
 	"github.com/junioryono/billet/internal/server"
 	"github.com/junioryono/billet/internal/state"
+	"github.com/junioryono/billet/internal/wirecert"
 	"github.com/junioryono/billet/internal/wiring"
 )
 
@@ -67,6 +69,7 @@ func commands() []command {
 	return []command{
 		{"server", "run the control plane (add --dev to also run a node here)", cmdServer},
 		{"node", "run a compute host that dials a control plane", cmdNode},
+		{"ca", "issue the certificates nodes authenticate with", cmdCA},
 		{"check", "validate the config and state directory, then exit", cmdCheck},
 		{"init", "generate a billet.yaml interactively", cmdInit},
 		{"github-app", "create and install the GitHub App billet uses", cmdGitHubApp},
@@ -225,7 +228,25 @@ func claimDeployment(cfg *config.Config) (string, *state.DeploymentLock, error) 
 // where the lock lands. A second copy of these four lines is how one of them
 // keeps the default while the other honours a configured directory, after which
 // both processes manage the same containers.
-func claimNodeDeployment(cfg *config.Config) (string, *state.DeploymentLock, error) {
+func claimNodeDeployment(cfg *config.Config, bundle *wirecert.Bundle) (string, *state.DeploymentLock, error) {
+	// A NODE JOINS A DEPLOYMENT, IT DOES NOT FOUND ONE. Without a bundle there is
+	// nothing to join — config validation has already established that means a
+	// control plane inside this machine — so minting is correct. With one, the
+	// certificate says which installation this host belongs to, and inventing a
+	// different answer produces a node the control plane refuses forever.
+	if bundle == nil {
+		return claimIdentity(cfg.Node.StateDir, cfg.Node.LockDir, false)
+	}
+
+	deployment, err := bundle.Deployment()
+	if err != nil {
+		return "", nil, err
+	}
+
+	if _, err := state.AdoptDeploymentID(cfg.Node.StateDir, deployment); err != nil {
+		return "", nil, err
+	}
+
 	return claimIdentity(cfg.Node.StateDir, cfg.Node.LockDir, false)
 }
 
@@ -409,7 +430,7 @@ func runServer(ctx context.Context, cfg *config.Config, dryRun, dev bool) error 
 	nodes := nodeplane.New(slog.Default(), deployment, allocator.LeaseTTL(),
 		nodeplane.WithRegistrar(allocator))
 
-	stopWire, err := serveNodeWire(ctx, cfg, nodes, allocator, wiring.NodeJIT{Client: client})
+	stopWire, err := serveNodeWire(ctx, cfg, owner, nodes, allocator, wiring.NodeJIT{Client: client})
 	if err != nil {
 		return err
 	}
@@ -439,6 +460,43 @@ func runServer(ctx context.Context, cfg *config.Config, dryRun, dev bool) error 
 	return nil
 }
 
+// caDir is where a deployment keeps its node-wire authority.
+//
+// Beside the state directory rather than inside it, because the state directory
+// is the one an operator is told they may delete to start over. Losing the CA
+// means re-issuing every node certificate by hand.
+func caDir(cfg *config.Config) string {
+	return filepath.Join(cfg.Server.StateDir, "ca")
+}
+
+// nodeTLSHosts is what a node will type to reach this control plane.
+//
+// A WILDCARD LISTEN ADDRESS ANSWERS A DIFFERENT QUESTION than this one. It says
+// which interfaces to accept on; it says nothing about the name a node dials,
+// and a certificate minted for "0.0.0.0" matches nothing. The failure would land
+// on the node as a name mismatch, on the far side of the deployment from the
+// file that caused it — so it is refused here, where the file is.
+func nodeTLSHosts(cfg *config.Config) ([]string, error) {
+	if len(cfg.Server.NodeTLSHosts) > 0 {
+		return cfg.Server.NodeTLSHosts, nil
+	}
+
+	host, _, err := net.SplitHostPort(cfg.Server.Listen)
+	if err != nil {
+		return nil, fmt.Errorf("server.listen %q must be host:port: %w", cfg.Server.Listen, err)
+	}
+
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		return nil, fmt.Errorf(
+			"server.listen is %q, which accepts on every interface and so does not say what a "+
+				"node will dial. Set server.node_tls_hosts to the names and addresses nodes use "+
+				"for this control plane; they become the subject names of the certificate it "+
+				"serves", cfg.Server.Listen)
+	}
+
+	return []string{host}, nil
+}
+
 // provisioner adapts the scale-set client to what the control plane consumes.
 //
 // It exists because internal/scaleset returns its OWN ScaleSet type: the
@@ -447,29 +505,54 @@ func runServer(ctx context.Context, cfg *config.Config, dryRun, dev bool) error 
 // whose job is to keep a preview API at arm's length.
 // serveNodeWire opens the listener nodes dial.
 //
-// REFUSES ANYTHING BUT LOOPBACK, and that refusal is the whole security boundary
-// today. A node names itself in the request path and nothing verifies the claim,
-// so a listener reachable from the network would let anything on it bind leases,
-// take commands, and — worst — ask for a JIT registration, which is a credential
-// that can register a runner against the organisation.
+// LOOPBACK IS THE ONLY ADDRESS SERVED WITHOUT mTLS. The wire identifies a node
+// by the name in its certificate; without one, the only thing left is the name
+// in the request path, which is a claim rather than a proof. Anything that could
+// reach such a listener could bind another node's leases, take its commands,
+// and — worst — ask for a JIT registration, a credential that registers a runner
+// against the organisation.
 //
-// Failing to start is deliberate rather than degrading to loopback: an operator
-// who wrote a LAN address meant it, and quietly serving somewhere else would
-// leave them believing their second machine could connect while it silently
-// could not.
+// So a network address mints a certificate from the deployment's own authority
+// and requires one back. There is nothing to configure and nothing to install:
+// the CA lives beside the state directory, and `billet ca issue <node>` produces
+// the bundle a node is given.
 func serveNodeWire(
 	ctx context.Context,
-	cfg *config.Config, nodes *nodeplane.Plane, store nodeplane.LeaseStore, jit nodeplane.JITSource,
+	cfg *config.Config, deployment string,
+	nodes *nodeplane.Plane, store nodeplane.LeaseStore, jit nodeplane.JITSource,
 ) (func(), error) {
 	addr := cfg.Server.Listen
+	loopback := nodeplane.LoopbackOnly(addr)
 
-	if !nodeplane.LoopbackOnly(addr) {
-		return nil, fmt.Errorf(
-			"server.listen is %q, but billet has no transport security for the node wire yet: "+
-				"a node names itself in the request path and nothing verifies it, so anything "+
-				"that can reach this address could bind leases and ask for runner "+
-				"registrations. Bind it to loopback until mTLS lands",
-			addr)
+	var (
+		handlerOpts []nodeplane.HandlerOption
+		tlsConf     *tls.Config
+	)
+
+	if !loopback {
+		hosts, err := nodeTLSHosts(cfg)
+		if err != nil {
+			return nil, err
+		}
+
+		ca, err := wirecert.LoadOrCreateCA(caDir(cfg), deployment)
+		if err != nil {
+			return nil, err
+		}
+
+		bundle, err := ca.IssueServer(hosts)
+		if err != nil {
+			return nil, err
+		}
+
+		if tlsConf, err = wirecert.ServerTLS(bundle); err != nil {
+			return nil, err
+		}
+
+		handlerOpts = append(handlerOpts, nodeplane.RequireClientCert())
+
+		slog.Default().Info("the node wire requires client certificates",
+			"hosts", hosts, "ca_expires", ca.NotAfter().Format(time.DateOnly))
 	}
 
 	var lc net.ListenConfig
@@ -479,8 +562,12 @@ func serveNodeWire(
 		return nil, fmt.Errorf("listen for nodes on %s: %w", addr, err)
 	}
 
+	if tlsConf != nil {
+		ln = tls.NewListener(ln, tlsConf)
+	}
+
 	srv := &http.Server{
-		Handler: nodeplane.Handler(slog.Default(), nodes, store, jit),
+		Handler: nodeplane.Handler(slog.Default(), nodes, store, jit, handlerOpts...),
 		// A command poll is a LONG poll, so there is deliberately no write or idle
 		// timeout that would cut one. The read-header timeout still bounds the one
 		// phase a client controls before the handler is entered, which is what
@@ -535,6 +622,40 @@ func newProvider(cfg *config.Config, deployment string) (provider.Provider, erro
 	}
 }
 
+// nodeBundle loads the certificate this node presents, if it has one.
+//
+// Config validation is what refuses a network address without a bundle, so a nil
+// return here means loopback — the one case where the control plane is inside
+// this machine and there is nothing between the two to authenticate against.
+func nodeBundle(cfg *config.Config) (*wirecert.Bundle, error) {
+	if cfg.Node.TLS == nil {
+		return nil, nil //nolint:nilnil // no bundle is a state, not an error
+	}
+
+	bundle, err := wirecert.LoadBundle(cfg.Node.TLS.CertPath, cfg.Node.TLS.KeyPath, cfg.Node.TLS.CAPath)
+	if err != nil {
+		return nil, err
+	}
+
+	// CHECKED HERE, WHERE THE FILES ARE NAMED. The control plane refuses a
+	// mismatch too, but it can only say "you are not who you claim" — this can say
+	// which file on this host holds the wrong certificate, which is the sentence
+	// an operator can act on.
+	name, err := bundle.NodeName()
+	if err != nil {
+		return nil, err
+	}
+
+	if name != cfg.Node.Name {
+		return nil, fmt.Errorf(
+			"node.name is %q but %s was issued for %q; the control plane authorises by the "+
+				"name in the certificate, so this node could only ever act as %q",
+			cfg.Node.Name, cfg.Node.TLS.CertPath, name, name)
+	}
+
+	return &bundle, nil
+}
+
 func cmdNode(ctx context.Context, args []string) error {
 	fs := newFlagSet("billet node")
 	cfgPath := addConfigFlag(fs)
@@ -555,16 +676,24 @@ func cmdNode(ctx context.Context, args []string) error {
 			"control plane to dial", *cfgPath)
 	}
 
-	// THE NODE'S IDENTITY COMES FROM ITS OWN STATE DIRECTORY, not from the
-	// server. It labels its compute with this, and the control plane refuses a
-	// node whose deployment differs — otherwise a host would start containers
-	// this installation could never attribute.
+	// LOADED BEFORE THE IDENTITY IS CLAIMED, because the certificate is what
+	// decides the identity. A node JOINS a deployment; it does not found one.
+	bundle, err := nodeBundle(cfg)
+	if err != nil {
+		return err
+	}
+
+	// THE NODE'S IDENTITY COMES FROM THE CERTIFICATE IT WAS ISSUED, falling back
+	// to its own state directory only when there is no control plane beyond this
+	// machine to join. It labels its compute with this, and the control plane
+	// refuses a node whose deployment differs — otherwise a host would start
+	// containers this installation could never attribute.
 	// THE NODE'S LOCK MUST LAND WHERE THE SERVER'S DOES. Both roles can run on
 	// one host, and a server honouring server.lock_dir while this used the
 	// per-user default would take two different locks for one identity — after
 	// which both manage the same containers and either can adopt or destroy the
 	// other's live work. Sharing the claim is what keeps that true.
-	deployment, lock, err := claimNodeDeployment(cfg)
+	deployment, lock, err := claimNodeDeployment(cfg, bundle)
 	if err != nil {
 		return err
 	}
@@ -575,9 +704,18 @@ func cmdNode(ctx context.Context, args []string) error {
 		}
 	}()
 
+	var tlsConf *tls.Config
+
+	if bundle != nil {
+		if tlsConf, err = wirecert.ClientTLS(*bundle); err != nil {
+			return err
+		}
+	}
+
 	client, err := nodeclient.New(nodeclient.Options{
 		Base: cfg.Node.ServerAddr,
 		Node: cfg.Node.Name,
+		TLS:  tlsConf,
 	})
 	if err != nil {
 		return err
@@ -839,6 +977,131 @@ func confirmOrganization(ctx context.Context, org string) error {
 
 		return nil
 	}
+}
+
+// cmdCA issues the certificates the node wire authenticates with.
+//
+// RUN ON THE CONTROL PLANE, because that is where the authority's private key
+// is and where it stays. The bundle it writes is copied to the node — the key
+// travels once, by an operator, rather than over a wire that does not yet trust
+// anybody.
+func cmdCA(_ context.Context, args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: billet ca issue <node> [--out <dir>] | billet ca show")
+	}
+
+	switch args[0] {
+	case "issue":
+		return cmdCAIssue(args[1:])
+	case "show":
+		return cmdCAShow(args[1:])
+	}
+
+	return fmt.Errorf("unknown ca command %q; try issue or show", args[0])
+}
+
+func cmdCAIssue(args []string) error {
+	fs := newFlagSet("billet ca issue")
+	cfgPath := addConfigFlag(fs)
+	out := fs.String("out", "", "directory to write the bundle to (default ./<node>-billet-tls)")
+
+	if err := parse(fs, args); err != nil {
+		return err
+	}
+
+	name := fs.Arg(0)
+	if name == "" {
+		return errors.New("usage: billet ca issue <node> [--out <dir>]")
+	}
+
+	// VALIDATED HERE, not on first connection. The common name IS the node's
+	// identity on the wire, so a certificate whose name the server would never
+	// accept is a bundle an operator installs, restarts a host for, and only then
+	// discovers is useless.
+	if err := config.ValidateNodeName("node", name); err != nil {
+		return err
+	}
+
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		return err
+	}
+
+	if cfg.Server == nil {
+		return fmt.Errorf("%s has no server section, so it does not hold a certificate "+
+			"authority; run this on the control plane", *cfgPath)
+	}
+
+	deployment, err := state.DeploymentID(cfg.Server.StateDir)
+	if err != nil {
+		return err
+	}
+
+	ca, err := wirecert.LoadOrCreateCA(caDir(cfg), deployment)
+	if err != nil {
+		return err
+	}
+
+	bundle, err := ca.IssueNode(name)
+	if err != nil {
+		return err
+	}
+
+	dir := *out
+	if dir == "" {
+		dir = name + "-billet-tls"
+	}
+
+	if err := bundle.Write(dir); err != nil {
+		return err
+	}
+
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		abs = dir
+	}
+
+	fmt.Printf("billet ca: wrote a bundle for node %q to %s\n\n", name, abs)
+	fmt.Print("Copy that directory to the node, then point its config at the files:\n\n")
+	fmt.Printf("  node:\n    name: %s\n    tls:\n      cert: /etc/billet/tls/node.crt\n"+
+		"      key:  /etc/billet/tls/node.key\n      ca:   /etc/billet/tls/ca.crt\n\n", name)
+	fmt.Print("node.key is a private key: keep it 0600 and do not copy it anywhere else.\n")
+
+	return nil
+}
+
+func cmdCAShow(args []string) error {
+	fs := newFlagSet("billet ca show")
+	cfgPath := addConfigFlag(fs)
+
+	if err := parse(fs, args); err != nil {
+		return err
+	}
+
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		return err
+	}
+
+	if cfg.Server == nil {
+		return fmt.Errorf("%s has no server section, so it does not hold a certificate "+
+			"authority", *cfgPath)
+	}
+
+	deployment, err := state.DeploymentID(cfg.Server.StateDir)
+	if err != nil {
+		return err
+	}
+
+	ca, err := wirecert.LoadOrCreateCA(caDir(cfg), deployment)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("deployment %s\nauthority   %s\nexpires     %s\n",
+		deployment, caDir(cfg), ca.NotAfter().Format(time.RFC3339))
+
+	return nil
 }
 
 func cmdCheck(ctx context.Context, args []string) error {

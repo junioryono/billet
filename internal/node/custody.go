@@ -193,22 +193,42 @@ const DefaultMaxCustody = 0
 // of the TTL — the same cadence and the same reasoning as the listener's own
 // heartbeats. Two renewals may be missed entirely before anything expires.
 func (r *Runner) KeepAlive(ctx context.Context) {
-	every := r.ttl() / 3
-	if every <= 0 {
-		every = time.Second
-	}
-
-	ticker := time.NewTicker(every)
-	defer ticker.Stop()
+	// THE CADENCE IS RE-READ EVERY CYCLE, not fixed at the first one.
+	//
+	// The TTL is negotiated at registration, and a node re-registers whenever the
+	// control plane forgets it or restarts. A plane that comes back advertising a
+	// SHORTER TTL leaves a janitor built on the old one renewing too slowly: the
+	// lease expires between two heartbeats, the reaper resells its capacity, and
+	// the container it was holding is still running. The janitor is started once
+	// on purpose — custody outlives any registration — so re-reading here is the
+	// only place that correction can happen.
+	timer := time.NewTimer(r.renewEvery())
+	defer timer.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-timer.C:
 			r.renewHeld(ctx)
+			timer.Reset(r.renewEvery())
 		}
 	}
+}
+
+// renewEvery is how long to wait between renewals.
+//
+// A THIRD OF THE TTL, so two consecutive failures still leave a renewal before
+// the deadline the reaper on the other side enforces.
+func (r *Runner) renewEvery() time.Duration {
+	every := r.ttl() / 3
+	if every <= 0 {
+		// Only before the first registration answers, and the janitor no longer
+		// starts before then. Kept because a cadence of zero is a busy loop.
+		return time.Second
+	}
+
+	return every
 }
 
 // renewHeld heartbeats every held lease once.

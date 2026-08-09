@@ -152,7 +152,7 @@ func TestTheNodeLocksWhereItWasTold(t *testing.T) {
 		LockDir:  lockDir,
 	}}
 
-	id, lock, err := claimNodeDeployment(cfg)
+	id, lock, err := claimNodeDeployment(cfg, nil)
 	if err != nil {
 		t.Fatalf("claimNodeDeployment: %v", err)
 	}
@@ -201,7 +201,7 @@ func TestAServerAndANodeOnOneHostCollide(t *testing.T) {
 		LockDir:  lockDir,
 	}}
 
-	if _, _, err := claimNodeDeployment(node); !errors.Is(err, state.ErrDeploymentLocked) {
+	if _, _, err := claimNodeDeployment(node, nil); !errors.Is(err, state.ErrDeploymentLocked) {
 		t.Fatalf("a node started alongside a server holding the same identity: %v", err)
 	}
 }

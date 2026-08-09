@@ -115,14 +115,22 @@ func Run(ctx context.Context, c *Client, compute Compute, opts LoopOptions) erro
 	// Its own context, cancelled when Run returns, so a node that stops because
 	// it was refused does not leave a goroutine heartbeating behind it.
 	janitorCtx, stopJanitor := context.WithCancel(ctx)
-	defer stopJanitor()
 
 	var (
 		janitor     sync.WaitGroup
 		startedOnce sync.Once
 	)
 
-	defer janitor.Wait()
+	// ONE DEFER, IN ONE ORDER, because two were silently the wrong way round.
+	// Deferred calls run last-in-first-out, so `defer stopJanitor()` followed by
+	// `defer janitor.Wait()` waits FIRST and cancels afterwards — and Run hangs
+	// forever on any exit its parent context did not cause. A registration refused
+	// after the janitor had started is exactly that exit, and it is the one a node
+	// takes when a control plane is replaced.
+	defer func() {
+		stopJanitor()
+		janitor.Wait()
+	}()
 
 	startJanitor := func() {
 		startedOnce.Do(func() {
@@ -257,10 +265,18 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 		res := execute(ctx, compute, cmd)
 
 		if err := c.Report(ctx, res); err != nil {
-			// THE WORK IS DONE AND THE ANSWER IS LOST, and that is not merely
+			// THE WORK IS DONE AND THE ANSWER DID NOT LAND, and that is not merely
 			// survivable — it has to be MADE survivable here, because the control
 			// plane's safe assumption and the node's belief would otherwise
 			// disagree in the one direction that leaks.
+			//
+			// Two ways to arrive, one answer. The report may have been LOST, in
+			// which case the plane timed the command out and assumed custody. Or it
+			// may have ARRIVED TOO LATE and been answered with ErrCustody, which is
+			// the plane saying the same thing out loud: it already told the listener
+			// to stop heartbeating, so the lease is the node's now. A late success
+			// used to be answered with a shrug, which left the container running
+			// under a lease nobody renewed at all.
 			//
 			// The plane times the command out and reports custody, so it stops
 			// heartbeating the lease. The node, having launched successfully, holds

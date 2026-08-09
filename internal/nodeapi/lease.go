@@ -85,6 +85,22 @@ const (
 	// CodeRefused means the request was understood and rejected — a placement
 	// the server will not allow. Retrying it unchanged cannot help.
 	CodeRefused = "refused"
+	// CodeCustody means the control plane stopped waiting for this command and
+	// handed the node custody of its lease. The node must adopt the compute it
+	// started and keep the lease renewed; nothing else will.
+	//
+	// IT ANSWERS A SUCCESSFUL REPORT, which is what makes it easy to miss. The
+	// launch worked, the node is telling the truth, and the answer is still "too
+	// late, it is yours now" — because the plane already told the listener to stop
+	// heartbeating, and something has to be holding the lease.
+	CodeCustody = "custody"
+	// CodeUnauthenticated means the request carried no identity the control plane
+	// would accept. DISTINCT FROM CodeRefused on purpose: refused is a verdict on
+	// a node the plane knows, and the node stops. This one says the connection
+	// itself was not proven, which a certificate that has expired or been
+	// replaced produces — an operator fixes it, so the node must not treat it as
+	// its own permanent defeat.
+	CodeUnauthenticated = "unauthenticated"
 	// CodeUnregistered means the server does not know this node. The node must
 	// register again before anything else it says will be accepted; this is what
 	// a node sees after the server restarts.
