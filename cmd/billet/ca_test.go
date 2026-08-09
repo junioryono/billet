@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/wirecert"
 )
 
@@ -194,5 +195,134 @@ tiers:
 
 	if !strings.Contains(err.Error(), "control plane") {
 		t.Errorf("the error does not say where to run this: %v", err)
+	}
+}
+
+// nodeConfigFor writes the config a freshly enrolled host would have.
+func nodeConfigFor(t *testing.T, name, stateDir, bundleDir string) *config.Config {
+	t.Helper()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "billet.yaml")
+
+	body := `
+node:
+  name: ` + name + `
+  server_addr: 10.0.0.4:7717
+  provider: docker
+  state_dir: ` + stateDir + `
+  tls:
+    cert: ` + filepath.Join(bundleDir, "node.crt") + `
+    key: ` + filepath.Join(bundleDir, "node.key") + `
+    ca: ` + filepath.Join(bundleDir, "ca.crt") + `
+github:
+  org: acme
+  app_id: 1
+  installation_id: 2
+  private_key_path: /tmp/key.pem
+tiers:
+  - label: billet-2vcpu
+    provider: docker
+    vcpu: 2
+    memory: 8GiB
+    image: ubuntu:24.04
+`
+
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("load node config: %v", err)
+	}
+
+	return cfg
+}
+
+// THE WHOLE ENROLLMENT, END TO END: issue on the control plane, configure the
+// node against the copied files, and check the node arrives as the right host in
+// the right deployment.
+//
+// This is the path the P1 broke — a node minted a random deployment identity
+// that the control plane refused forever, and nothing an operator could copy
+// would have fixed it.
+func TestAnEnrolledNodeTakesItsIdentityFromItsBundle(t *testing.T) {
+	t.Parallel()
+
+	serverState := t.TempDir()
+	serverCfg := writeCAConfig(t, serverState)
+	out := filepath.Join(t.TempDir(), "bundle")
+
+	if err := cmdCAIssue([]string{"epyc-1", "--config", serverCfg, "--out", out}); err != nil {
+		t.Fatalf("ca issue: %v", err)
+	}
+
+	nodeState := t.TempDir()
+	cfg := nodeConfigFor(t, "epyc-1", nodeState, out)
+
+	bundle, err := nodeBundle(cfg)
+	if err != nil {
+		t.Fatalf("the node could not load the bundle it was given: %v", err)
+	}
+
+	if bundle == nil {
+		t.Fatal("a node configured with node.tls loaded no bundle")
+	}
+
+	deployment, _, err := claimNodeDeployment(cfg, bundle)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+
+	want, err := os.ReadFile(filepath.Join(serverState, "deployment-id"))
+	if err != nil {
+		t.Fatalf("read the server's identity: %v", err)
+	}
+
+	if deployment != strings.TrimSpace(string(want)) {
+		t.Errorf("the node joined deployment %q but the control plane that issued its "+
+			"certificate is %q; it would be refused on every registration forever",
+			deployment, strings.TrimSpace(string(want)))
+	}
+
+	// And it wrote it down, so the containers it labels stay attributable across a
+	// restart.
+	onDisk, err := os.ReadFile(filepath.Join(nodeState, "deployment-id"))
+	if err != nil {
+		t.Fatalf("the node did not record its identity: %v", err)
+	}
+
+	if strings.TrimSpace(string(onDisk)) != deployment {
+		t.Errorf("the node recorded %q but is running as %q",
+			strings.TrimSpace(string(onDisk)), deployment)
+	}
+}
+
+// A BUNDLE FOR A DIFFERENT NODE IS CAUGHT HERE, where the file that holds it can
+// be named.
+//
+// The control plane refuses the mismatch too, but all it can say is "you are not
+// who you claim". This can say which file on this host holds the wrong
+// certificate, which is the sentence an operator can act on.
+func TestANodeRefusesABundleIssuedForSomebodyElse(t *testing.T) {
+	t.Parallel()
+
+	serverCfg := writeCAConfig(t, t.TempDir())
+	out := filepath.Join(t.TempDir(), "bundle")
+
+	if err := cmdCAIssue([]string{"mac-mini-1", "--config", serverCfg, "--out", out}); err != nil {
+		t.Fatalf("ca issue: %v", err)
+	}
+
+	cfg := nodeConfigFor(t, "epyc-1", t.TempDir(), out)
+
+	_, err := nodeBundle(cfg)
+	if err == nil {
+		t.Fatal("a node called epyc-1 accepted a bundle issued for mac-mini-1")
+	}
+
+	if !strings.Contains(err.Error(), "node.crt") {
+		t.Errorf("the error does not name the file holding the wrong certificate: %v", err)
 	}
 }
