@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
@@ -109,33 +110,73 @@ func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
 		return nil
 	}
 
-	var firstErr error
+	// CONCURRENTLY, because sequentially is a trap. Every dispatch waits up to
+	// the command timeout, so one wedged node in a fleet of twenty would hold a
+	// destroy for that timeout before the next node was even asked — and destroy
+	// runs on shutdown and on completion paths, where blocking for minutes turns
+	// one bad host into a stalled control plane.
+	var (
+		wg     sync.WaitGroup
+		mu     sync.Mutex
+		errs   []error
+		failed int
+	)
 
 	for _, n := range targets {
-		id, err := commandID()
-		if err != nil {
-			return err
-		}
+		wg.Add(1)
 
-		pend := &pending{
-			cmd:  nodeapi.Command{ID: id, Kind: nodeapi.CommandDestroy, RequestID: requestID},
-			done: make(chan nodeapi.CommandResult, 1),
-		}
+		go func() {
+			defer wg.Done()
 
-		res, err := r.plane.dispatch(ctx, n, pend)
-		if err != nil && firstErr == nil {
-			firstErr = fmt.Errorf("node %s: %w", n.name, err)
+			err := r.destroyOn(ctx, n, requestID)
+			if err == nil {
+				return
+			}
 
-			continue
-		}
+			mu.Lock()
+			defer mu.Unlock()
 
-		if err == nil && !res.OK && firstErr == nil {
-			firstErr = fmt.Errorf("node %s could not destroy request %d: %s",
-				n.name, requestID, res.Error)
-		}
+			failed++
+
+			errs = append(errs, err)
+		}()
 	}
 
-	return firstErr
+	wg.Wait()
+
+	if failed == 0 {
+		return nil
+	}
+
+	// EVERY FAILURE, not the first. A destroy that worked on four nodes and
+	// failed on one has left compute running somewhere, and the operator needs to
+	// know which — reporting only the first would hide the rest behind whichever
+	// goroutine happened to finish soonest.
+	return errors.Join(errs...)
+}
+
+// destroyOn asks one node to remove a request's compute.
+func (r *Runner) destroyOn(ctx context.Context, n *node, requestID int64) error {
+	id, err := commandID()
+	if err != nil {
+		return err
+	}
+
+	pend := &pending{
+		cmd:  nodeapi.Command{ID: id, Kind: nodeapi.CommandDestroy, RequestID: requestID},
+		done: make(chan nodeapi.CommandResult, 1),
+	}
+
+	res, err := r.plane.dispatch(ctx, n, pend)
+	if err != nil {
+		return fmt.Errorf("node %s: %w", n.name, err)
+	}
+
+	if !res.OK {
+		return fmt.Errorf("node %s could not destroy request %d: %s", n.name, requestID, res.Error)
+	}
+
+	return nil
 }
 
 // dispatch queues a command and waits for its result.

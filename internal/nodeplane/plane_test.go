@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -376,6 +377,90 @@ func TestAnIdlePollIsNotAnError(t *testing.T) {
 
 	if ok {
 		t.Errorf("an idle poll produced a command: %+v", cmd)
+	}
+}
+
+// ONE WEDGED NODE MUST NOT HOLD UP A DESTROY ON THE OTHERS.
+//
+// Destroy broadcasts, and the first version asked each node in turn — so a
+// single host that never answers would block the whole call for the command
+// timeout before the next node was even asked. Destroy runs on shutdown and on
+// completion paths, where minutes of that turns one bad host into a stalled
+// control plane.
+//
+// The timing assertion is deliberately loose: what is being proved is
+// "concurrent, not serial", and a threshold near the timeout distinguishes those
+// two without being sensitive to how fast the machine is.
+func TestOneWedgedNodeDoesNotStallADestroy(t *testing.T) {
+	t.Parallel()
+
+	const timeout = 600 * time.Millisecond
+
+	p := testPlane(t, WithCommandTimeout(timeout))
+
+	for _, name := range []string{"wedged-a", "wedged-b", "wedged-c"} {
+		register(t, p, name, config.ProviderDocker)
+
+		// Each takes its command and never answers.
+		go func() {
+			if _, _, err := p.Poll(t.Context(), name); err != nil {
+				return
+			}
+		}()
+	}
+
+	start := time.Now()
+
+	err := p.NewRunner().Destroy(t.Context(), 7)
+	if err == nil {
+		t.Fatal("three silent nodes reported a successful destroy")
+	}
+
+	// Serial would be at least three timeouts; concurrent is about one.
+	if elapsed := time.Since(start); elapsed > 2*timeout {
+		t.Errorf("the destroy took %v against three nodes with a %v timeout, which means it "+
+			"asked them one at a time", elapsed, timeout)
+	}
+}
+
+// EVERY FAILING NODE IS NAMED, not just the first.
+//
+// A destroy that worked on four hosts and failed on one has left compute running
+// somewhere specific, and reporting only the first failure hides the rest behind
+// whichever goroutine finished soonest.
+func TestADestroyReportsEveryNodeThatFailed(t *testing.T) {
+	t.Parallel()
+
+	p := testPlane(t, WithCommandTimeout(3*time.Second))
+
+	for _, name := range []string{"n1", "n2"} {
+		register(t, p, name, config.ProviderDocker)
+
+		go func() {
+			cmd, ok, err := p.Poll(t.Context(), name)
+			if err != nil || !ok {
+				return
+			}
+
+			if err := p.Result(name, nodeapi.CommandResult{
+				ID:    cmd.ID,
+				Error: "docker refused on " + name,
+			}); err != nil {
+				t.Errorf("Result: %v", err)
+			}
+		}()
+	}
+
+	err := p.NewRunner().Destroy(t.Context(), 7)
+	if err == nil {
+		t.Fatal("two failed destroys reported success")
+	}
+
+	for _, want := range []string{"n1", "n2"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the error does not name %s, so an operator cannot tell which host still "+
+				"has compute on it: %v", want, err)
+		}
 	}
 }
 
