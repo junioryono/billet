@@ -3,6 +3,7 @@ package state
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -88,8 +89,34 @@ func TestAnEmptyDeploymentIDIsRefused(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	if _, err := DeploymentID(dir); err == nil {
+	err := func() error { _, err := DeploymentID(dir); return err }()
+	if err == nil {
 		t.Fatal("an empty identity file was accepted, so compute would be labelled with nothing")
+	}
+
+	// THE ADVICE IS PART OF THE BEHAVIOUR, and this message used to say only
+	// "delete it to have billet mint a new identity" — which contradicts the
+	// invariant the identity exists to hold. An operator who follows that while
+	// containers are running strands every one of them: billet filters by the new
+	// identity, finds nothing, lets the leases expire, resells the capacity, and
+	// the old containers run forever. Asserted here because nothing else would
+	// notice the sentence coming back.
+	// The label name is spelled out rather than imported: internal/state must not
+	// depend on a compute backend. That makes drift possible, so the docker
+	// package pins the same string against its own constant — see
+	// TestTheOwnerLabelMatchesWhatOperatorsAreTold. This assertion caught the
+	// first drift already: the message said "billet.deployment", which is not a
+	// label billet has ever written.
+	for _, want := range []string{"RESTORE", "backup", "sh.billet.owner", "DISAGREE"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the error does not mention %q, so it does not point at recovering the "+
+				"original identity before resetting it: %v", want, err)
+		}
+	}
+
+	if strings.Contains(err.Error(), "delete it to have billet mint") {
+		t.Error("the error tells the operator to delete the identity as a standalone repair, " +
+			"which strands every container already labelled with it")
 	}
 }
 
@@ -98,17 +125,18 @@ func TestAnEmptyDeploymentIDIsRefused(t *testing.T) {
 // Deliberate: the copy IS the same installation as far as its containers are
 // concerned, and minting a new id for it would strand every one of them.
 //
-// THE EARLIER VERSION OF THIS COMMENT CLAIMED THE PROCESS LOCK MAKES THAT SAFE.
-// It does not. The lock is taken on a file inside the state directory, and a
-// COPY has its own inode, so both directories can be locked at once — two live
-// processes claiming one identity against one docker daemon, each able to act on
-// the other's containers. What limits the damage today is that recovery adopts
-// rather than destroys, so the second process holds capacity for work it did not
-// start instead of killing it. That is a smaller wound, not a closed one.
+// THE EARLIER VERSION OF THIS COMMENT CLAIMED THE DIRECTORY LOCK MAKES THAT SAFE.
+// It does not. That lock is taken on a file INSIDE the state directory, and a COPY
+// has its own inode, so both directories can be locked at once — two live processes
+// claiming one identity against one docker daemon, each able to act on the other's
+// containers.
 //
-// Closing it needs a host-wide lock keyed by the identity itself rather than by
-// a path. Recorded as a task; asserting it here would be asserting a property
-// nothing implements.
+// What closes it is a second lock keyed by the identity rather than by a path:
+// LockDeployment, exercised end to end by
+// TestACopiedStateDirectoryCannotRunAlongsideTheOriginal. This test is the half
+// that lock DEPENDS on — that the copy keeps the identity in the first place.
+// A copy that minted a fresh one would strand every container the original
+// started, and would never collide either.
 func TestACopiedStateDirectoryKeepsItsIdentity(t *testing.T) {
 	t.Parallel()
 

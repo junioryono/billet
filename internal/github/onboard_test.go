@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -17,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -205,46 +207,147 @@ type browser struct {
 	t      *testing.T
 	fake   *fakeGitHub
 	client *http.Client
-	// visits records the URLs the flow asked the operator to open.
+	// visits records the URLs the flow asked the operator to open. Written and
+	// read only on the goroutine that drives the flow.
 	visits []string
+	// origin is the loopback base the flow served, captured from the first visit
+	// and never rewritten, so goroutines can read it without touching visits.
+	origin string
 	// skipSetupCallback simulates an operator who closes the tab, leaving the
 	// authenticated poller as the only route to the installation.
 	skipSetupCallback bool
 	setupCallbacks    atomic.Int32
-	// getFailures counts requests that did not complete. A silently-failing
-	// request is how the original version of this test passed without ever
-	// reaching /installed.
+	// getFailures counts requests that failed for a reason OTHER than the
+	// connection. A silently-failing request is how the original version of this
+	// test passed without ever reaching /installed — specifically a malformed URL,
+	// which fails while building or resolving the request.
+	//
+	// The unscoped counter asserted something this file's own comment already
+	// called legitimate: the flow closes its listener when it finishes, so a
+	// request still in flight then is refused correctly. That fired twice, once
+	// loaded and once idle. Classifying the error is what separates the two;
+	// gating on "has the flow returned yet" was the first attempt and was worse
+	// than the flake, because a genuinely malformed URL failing after the flow
+	// returned would have been discarded as well.
 	getFailures atomic.Int32
+	// pending joins the fire-and-forget callback goroutines, so the assertions
+	// cannot read the counter while a request is still deciding its fate.
+	pending  sync.WaitGroup
+	joinOnce sync.Once
+}
+
+// track registers a goroutine that must finish before its test does.
+//
+// The cleanup is registered HERE rather than at each of the eleven places a
+// browser is built, because that is the version that cannot be forgotten — and
+// forgetting it is not hypothetical: only one test called Wait explicitly, so
+// every other one could return while a request was still in flight and have its
+// t.Errorf fire against a finished test.
+func (b *browser) track() {
+	b.joinOnce.Do(func() { b.t.Cleanup(b.pending.Wait) })
+
+	b.pending.Add(1)
 }
 
 func (b *browser) open(ctx context.Context, target string) error {
 	b.visits = append(b.visits, target)
 
+	// CAPTURED ONCE, on this goroutine, before any of the goroutines below exist.
+	//
+	// b.visits is appended here and was read from the callback and registration
+	// goroutines — a concurrent read of a slice header while it is being
+	// reallocated, which is a data race whatever the values happen to be. It had
+	// not fired under -race, which is timing rather than proof: the second append
+	// races only with a request already in flight from the first.
+	if b.origin == "" {
+		b.origin = target
+	}
+
 	// The first URL is the loopback start page; the second is GitHub's install
 	// page, which the test answers by "completing" the install.
 	if strings.Contains(target, "/installations/new") {
-		b.fake.installed.Store(true)
-
 		if b.skipSetupCallback {
 			// Exercise the poller alone: an operator who closed the tab, or
 			// finished the install on another machine.
+			b.fake.installed.Store(true)
+
 			return nil
 		}
 
 		// Built by trimming the trailing slash and appending, NOT by replacing the
 		// first "/" — that replaces the one in "http://" and yields a hostless
 		// URL whose request silently fails, letting the poller carry the test.
-		installedURL := strings.TrimSuffix(b.visits[0], "/") + "/installed" +
+		installedURL := strings.TrimSuffix(b.origin, "/") + "/installed" +
 			"?installation_id=" + fmt.Sprint(b.fake.installationID) + "&setup_action=install"
 
+		// Tracked so the assertions can WAIT for it. Fire-and-forget left the
+		// counter being read while this request was still deciding whether it had
+		// failed, which is a race no atomic fixes: the value is correct and simply
+		// not there yet.
+		b.track()
+
+		// COUNTED ON ATTEMPT, not on delivery. Counting deliveries is the stronger
+		// assertion and it cannot be made honestly here: the poller may legitimately
+		// finish the flow first, close the listener, and leave the callback refused
+		// for a correct reason — measured at 3 of 12 runs on a loaded machine, with
+		// getFailures rightly staying zero. What makes the attempt count MEAN
+		// something is the store below.
 		b.setupCallbacks.Add(1)
 
-		go b.get(ctx, installedURL)
+		go func() {
+			defer b.pending.Done()
+
+			// THE INSTALLATION BECOMES VISIBLE ONLY BECAUSE THIS RUNS. It used to
+			// be set as soon as the install page opened, which let the poller
+			// complete the whole flow whether or not a callback was ever issued —
+			// so deleting the callback, or the route it targets, left every
+			// assertion green. Moving it here means an absent callback is an absent
+			// installation: the flow cannot finish by any route, and the test fails
+			// instead of passing by the fallback it was meant to prove unnecessary.
+			//
+			// AFTER the request, which is the only ordering that makes the callback
+			// necessary. Storing first — either here or back where the install page
+			// opens — lets the flow's immediate installation check succeed on its
+			// own, so the callback's fate stops mattering and every mutation to it
+			// passes. Storing after costs nothing: the handler wakes the flow, the
+			// flow looks the installation up and gets a 404, and it simply keeps
+			// polling until this store lands one interval later.
+			page, ok := b.get(ctx, installedURL)
+
+			// THE BODY IS CHECKED BECAUSE THE STATUS CANNOT BE. The loopback mux
+			// registers root+"/" as a catch-all, so deleting the /installed route
+			// does not produce a 404 — the request falls through to the start page
+			// and answers 200, which every status-based check reads as success.
+			// Only the content distinguishes them.
+			//
+			// Skipped when the request did not arrive at all: a callback refused
+			// because the poller already finished is legitimate, and get has
+			// already accounted for it.
+			if ok && !strings.Contains(page, "Installed") {
+				b.getFailures.Add(1)
+
+				b.t.Errorf("the setup callback reached something other than the installed "+
+					"page, so the route it targets is gone or has moved: %.120s", page)
+			}
+
+			b.fake.installed.Store(true)
+		}()
 
 		return nil
 	}
 
-	go b.driveRegistration(ctx, target)
+	// TRACKED TOO, and finding this took looking rather than assuming. Joining
+	// only the /installed callback left this one — which issues its own requests
+	// through the same counter — free to increment after the assertions had
+	// already read it. A missed increment here is the same blind spot the join
+	// was added to remove, one goroutine over.
+	b.track()
+
+	go func() {
+		defer b.pending.Done()
+
+		b.driveRegistration(ctx, target)
+	}()
 
 	return nil
 }
@@ -258,7 +361,7 @@ func (b *browser) open(ctx context.Context, target string) error {
 // anything — which is how a manifest missing the required hook_attributes.url
 // passed a green test suite and would have failed on first contact with GitHub.
 func (b *browser) driveRegistration(ctx context.Context, startURL string) {
-	body := b.get(ctx, startURL)
+	body, _ := b.get(ctx, startURL)
 
 	action := extractFormAction(b.t, body)
 	if action == "" {
@@ -281,7 +384,7 @@ func (b *browser) driveRegistration(ctx context.Context, startURL string) {
 	}
 
 	base := strings.TrimSuffix(startURL, "/")
-	b.get(ctx, base+"/callback?code=testcode&state="+url.QueryEscape(state))
+	_, _ = b.get(ctx, base+"/callback?code=testcode&state="+url.QueryEscape(state))
 }
 
 // validateManifest enforces billet's manifest invariants.
@@ -427,33 +530,94 @@ func (b *browser) validateManifest(raw, base string) {
 	}
 }
 
-func (b *browser) get(ctx context.Context, target string) string {
+// get fetches a URL, reporting the body and whether it was DELIVERED — reached
+// the intended server and came back 2xx.
+func (b *browser) get(ctx context.Context, target string) (string, bool) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, http.NoBody)
 	if err != nil {
 		b.t.Errorf("build request: %v", err)
-		return ""
+
+		return "", false
 	}
 
 	resp, err := b.client.Do(req)
 	if err != nil {
-		// Counted rather than ignored. Swallowing this is precisely how the
-		// original test reported success while never reaching /installed; the
-		// flow closes its listener when it finishes, so a late failure is
-		// legitimate, but it must be visible to the assertions.
-		b.getFailures.Add(1)
+		// COUNTED BY WHAT WENT WRONG, not by when. Swallowing this is precisely
+		// how the original test reported success while never reaching /installed;
+		// the defect it guards is a MALFORMED URL, which fails while building or
+		// resolving the request and never reaches a socket.
+		//
+		// A connection error is different in kind: the flow closes its listener
+		// as it finishes, so a request still in flight then is refused for a
+		// correct reason. Gating on a flowDone flag instead was the first attempt
+		// and it was worse than the flake it fixed — a genuinely malformed URL
+		// failing after the flow returned would have been discarded too, which is
+		// exactly the regression this counter exists to catch.
+		if !b.benignFailure(target, err) {
+			b.getFailures.Add(1)
+		}
 
-		return ""
+		return "", false
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		b.t.Errorf("read %s: %v", target, err)
+		// CLASSIFIED LIKE THE REQUEST ERROR, and previously not. The handler
+		// signals the flow BEFORE writing its response, so the server can be
+		// closed while the body is still going out — which surfaces here as
+		// io.ErrUnexpectedEOF and was reported unconditionally, reopening the
+		// same flake through a second door.
+		if !b.benignFailure(target, err) {
+			b.t.Errorf("read %s: %v", target, err)
+		}
 
-		return ""
+		return "", false
 	}
 
-	return string(body)
+	// A ROUTE THAT NO LONGER EXISTS ANSWERS 404, and the status was never
+	// examined — so deleting the production /installed route left every
+	// assertion green while the poller quietly carried the flow.
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		b.getFailures.Add(1)
+
+		return string(body), false
+	}
+
+	return string(body), true
+}
+
+// benignFailure reports whether a request failure is the expected consequence of
+// the flow shutting down, rather than billet aiming somewhere wrong.
+//
+// THE DESTINATION IS CHECKED, not just the error type. Treating every
+// net.OpError as benign hid an entire class of regression: a syntactically valid
+// callback URL pointing at the wrong host or port fails through the same
+// net.OpError (a DNS or dial error), so a flow that started addressing the wrong
+// place would have looked exactly like a listener closing on time. Only failures
+// against the flow's OWN loopback origin can be excused.
+func (b *browser) benignFailure(target string, err error) bool {
+	if b.origin == "" {
+		return false
+	}
+
+	want, wantErr := url.Parse(b.origin)
+	got, gotErr := url.Parse(target)
+
+	if wantErr != nil || gotErr != nil || want.Scheme != got.Scheme || want.Host != got.Host {
+		return false
+	}
+
+	var opErr *net.OpError
+
+	return errors.As(err, &opErr) ||
+		errors.Is(err, syscall.ECONNREFUSED) ||
+		errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, http.ErrServerClosed) ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded)
 }
 
 func extractFormAction(t *testing.T, page string) string {
@@ -535,6 +699,10 @@ func TestOnboardEndToEnd(t *testing.T) {
 			return nil
 		},
 	})
+	// Joined before anything reads getFailures, so a callback still in flight has
+	// finished deciding whether it failed.
+	b.pending.Wait()
+
 	if err != nil {
 		t.Fatalf("Onboard: %v", err)
 	}
@@ -635,7 +803,16 @@ func TestOnboardIgnoresSpoofedInstallationID(t *testing.T) {
 		if strings.Contains(target, "/installations/new") {
 			fake.installed.Store(true)
 
-			go b.get(ctx, strings.TrimSuffix(b.visits[0], "/")+"/installed?installation_id=999999999")
+			// Tracked like the others, so this goroutine cannot outlive its test
+			// and call t.Errorf after it has finished.
+			b.track()
+
+			go func() {
+				defer b.pending.Done()
+
+				_, _ = b.get(ctx, strings.TrimSuffix(b.origin, "/")+
+					"/installed?installation_id=999999999")
+			}()
 
 			return nil
 		}
@@ -903,7 +1080,8 @@ func TestOnboardSurvivesAnInjectedCode(t *testing.T) {
 			// The attacker knows the secret path — it read the browser command
 			// line — so it can also read the state out of the start page, exactly
 			// as the legitimate browser does.
-			state := extractAttr(browser.get(ctx, target), "state=")
+			page, _ := browser.get(ctx, target)
+			state := extractAttr(page, "state=")
 			if state == "" {
 				t.Error("could not read the state from the start page")
 			}
@@ -1033,7 +1211,8 @@ func TestAPersistentlyAmbiguousCodeDoesNotBlockTheHonestOne(t *testing.T) {
 
 	attacked := func(ctx context.Context, target string) error {
 		if calls.Add(1) == 1 {
-			state := extractAttr(browser.get(ctx, target), "state=")
+			page, _ := browser.get(ctx, target)
+			state := extractAttr(page, "state=")
 			if state == "" {
 				return errors.New("could not read the state from the start page")
 			}
@@ -1099,7 +1278,8 @@ func TestTheHonestCodeIsTriedEvenBehindAFullRetrySet(t *testing.T) {
 
 	attacked := func(ctx context.Context, target string) error {
 		if calls.Add(1) == 1 {
-			state := extractAttr(browser.get(ctx, target), "state=")
+			page, _ := browser.get(ctx, target)
+			state := extractAttr(page, "state=")
 			if state == "" {
 				return errors.New("could not read the state from the start page")
 			}
@@ -1264,7 +1444,8 @@ func TestEveryAcknowledgedCodeIsAttempted(t *testing.T) {
 
 			attacked := func(ctx context.Context, target string) error {
 				if calls.Add(1) == 1 {
-					state := extractAttr(browser.get(ctx, target), "state=")
+					page, _ := browser.get(ctx, target)
+					state := extractAttr(page, "state=")
 					if state == "" {
 						return errors.New("could not read the state from the start page")
 					}

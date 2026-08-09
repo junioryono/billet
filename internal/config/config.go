@@ -187,6 +187,44 @@ type ServerConfig struct {
 	// with nothing to stop them.
 	MaxVCPU   int      `yaml:"max_vcpu"`
 	MaxMemory ByteSize `yaml:"max_memory"`
+	// LockDir is where the host-wide deployment lock is placed.
+	//
+	// THE LOCK'S SCOPE HAS TO MATCH THE DAEMON'S, and billet cannot derive that.
+	// The lock stops two processes carrying one deployment identity from managing
+	// the same containers, so every process that can reach the same container
+	// runtime must meet at the same directory. The default is per-user, which is
+	// right for the ordinary case and wrong for two: a system service and an
+	// operator sharing /var/run/docker.sock, and containers that share a socket
+	// while each has its own private filesystem. Both are invisible without this
+	// key — they simply do not collide.
+	//
+	// Point it at a path all of them can reach (a host /run/billet/locks
+	// bind-mounted into each container, say). It must NOT be world-writable: any
+	// local user could then hold the file and keep billet from ever starting.
+	//
+	// A directory genuinely shared between two accounts must be SETGID. Setgid is
+	// what makes a new lock file carry the directory's group rather than its
+	// creator's primary one, and without it the other account cannot open the
+	// lock at all. A directory only this account uses wants no group access.
+	//
+	// 2770 works everywhere. 2730 — the drop box, where neither account can list
+	// the other's locks — works only where billet can open a directory for search
+	// without reading it: Linux (O_PATH), darwin and FreeBSD (O_SEARCH). On
+	// OpenBSD, NetBSD, Solaris and the rest, billet falls back to needing read
+	// and will refuse 2730 with a message saying so.
+	LockDir string `yaml:"lock_dir,omitempty"`
+	// AllowUnlockedDeployment starts billet even when the host-wide lock cannot
+	// be placed.
+	//
+	// AN OPT-IN, BECAUSE AUTHORIZATION MUST NOT BE DERIVED FROM AN I/O FAILURE.
+	// This was originally the automatic behaviour: anything that stopped the lock
+	// being placed downgraded to a warning and billet started. That reasoning was
+	// backwards — it let a symlink loop, a permissions change, ENOLCK, descriptor
+	// exhaustion, or a service manager with no HOME each silently switch off the
+	// protection, and the operator's only evidence was a log line among many. An
+	// operator who knows their host has nowhere to put a lock can say so here;
+	// billet will not decide it on their behalf.
+	AllowUnlockedDeployment bool `yaml:"allow_unlocked_deployment,omitempty"`
 }
 
 // NodeConfig configures a compute host.
@@ -999,6 +1037,18 @@ func (c *Config) validateServer() []error {
 	if c.Server.MaxMemory <= 0 {
 		errs = append(errs, errors.New(
 			"server.max_memory must be positive; it is the ceiling the allocator escrows against"))
+	}
+	// CAUGHT AT LOAD, not at lock time, because the failure it prevents is
+	// invisible at lock time. A relative lock_dir resolves against each process's
+	// working directory, so one config saying `lock_dir: locks` puts a systemd
+	// unit started in / and an operator started in /srv/billet into different
+	// collision domains — and both log the same relative string, so the startup
+	// diagnostic meant to expose a mismatch would hide this one instead.
+	if c.Server.LockDir != "" && !filepath.IsAbs(c.Server.LockDir) {
+		errs = append(errs, fmt.Errorf(
+			"server.lock_dir must be an absolute path, got %q: a relative one resolves against "+
+				"each process's working directory, so two billets sharing this config could "+
+				"lock different files while reporting the same path", c.Server.LockDir))
 	}
 	return errs
 }

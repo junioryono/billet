@@ -16,6 +16,28 @@ import (
 // database being rebuilt. Its lifetime is the state directory's.
 const deploymentIDFile = "deployment-id"
 
+// recoverIdentityAdvice is what an operator is told when the identity is gone or
+// unusable. One string, used by every branch that can say it.
+//
+// ONE COPY BECAUSE TWO DRIFTED. This started as duplicated prose on the empty
+// and invalid branches; a test pinned one of them, the other was free to lose
+// its guidance entirely, and an earlier version of both named a container label
+// that billet has never written.
+//
+// "COMPARE THE CANDIDATES" is not padding either. An operator who once followed
+// the older advice and reset the identity has containers under TWO ids, and
+// restoring an arbitrary one makes the other installation's live work invisible
+// — the same failure this text exists to prevent, reached by following it. The
+// only safe instruction is to reconcile the candidates and stop if they
+// disagree.
+const recoverIdentityAdvice = "RESTORE THE ORIGINAL IDENTITY if you can — from a backup, or from " +
+	"the sh.billet.owner label on containers this installation started. If the candidates " +
+	"DISAGREE, stop and work out which is current rather than picking one: an installation whose " +
+	"identity was reset in the past leaves containers under both, and restoring the wrong one " +
+	"hides live work. Deleting the file mints a NEW identity, and every container labelled with " +
+	"the old one becomes invisible to billet: its leases expire, its capacity is resold, and it " +
+	"runs forever. Only reset it once you have confirmed no compute is left under the old identity"
+
 // DeploymentID returns the stable identity of the billet installation rooted at
 // this state directory, creating it on first use.
 //
@@ -36,8 +58,10 @@ const deploymentIDFile = "deployment-id"
 // Random rather than derived from the path, so that copying a state directory
 // does not silently produce two installations claiming one identity — the copy
 // carries the original's id, which is the honest answer to "these are the same
-// installation" and keeps the failure to a lock conflict rather than a
-// cross-destruction.
+// installation". That is what makes the copy DETECTABLE: LockDeployment keys a
+// host-wide lock on the id, so running the copy alongside the original fails as a
+// lock conflict rather than as a cross-destruction. A derived id would give the
+// copy a different identity and no conflict to detect.
 func DeploymentID(stateDir string) (string, error) {
 	path := filepath.Join(stateDir, deploymentIDFile)
 
@@ -45,7 +69,11 @@ func DeploymentID(stateDir string) (string, error) {
 	if err == nil {
 		id := strings.TrimSpace(string(existing))
 		if id == "" {
-			return "", fmt.Errorf("state: %s is empty; delete it to have billet mint a new identity", path)
+			return "", fmt.Errorf("state: %s is empty. %s", path, recoverIdentityAdvice)
+		}
+
+		if err := validDeploymentID(id); err != nil {
+			return "", fmt.Errorf("state: %s: %w. %s", path, err, recoverIdentityAdvice)
 		}
 
 		return id, nil
@@ -117,4 +145,40 @@ func DeploymentID(stateDir string) (string, error) {
 	}
 
 	return id, nil
+}
+
+// deploymentIDLen is the length of the hex encoding of the 16 random bytes an
+// identity is minted from.
+const deploymentIDLen = 32
+
+// validDeploymentID refuses anything billet would not have minted.
+//
+// THE IDENTITY IS INTERPOLATED INTO PLACES THAT PARSE, which is what makes this
+// worth checking rather than trusting. It becomes a filename in the host-wide
+// lock directory, where a `/` or a `..` leaves that directory entirely — and
+// silently, since the resulting lock failure is indistinguishable from a host
+// that has nowhere to put one, so the protection degrades off while reporting a
+// cache-directory problem. It is also written as a docker label and sent back as
+// `--filter label=…`, where a comma or an `=` changes what is being asked.
+//
+// Billet mints this value itself, so anything failing this check is a hand-edit
+// or a corrupted file. Refusing beats sanitising: a sanitised id is a DIFFERENT
+// identity from the one already written onto running containers, so billet would
+// come up unable to see its own compute while believing it could.
+func validDeploymentID(id string) error {
+	if len(id) != deploymentIDLen {
+		return fmt.Errorf("deployment identity %q is %d characters, not %d", id, len(id), deploymentIDLen)
+	}
+
+	// Not hex.DecodeString: it accepts uppercase, and an identity that differs
+	// only in case is two identities on a case-sensitive filesystem and one on a
+	// case-insensitive one. Pinning to the encoding billet emits keeps the lock
+	// meaning the same thing on both.
+	for _, r := range id {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return fmt.Errorf("deployment identity %q contains %q, but identities are lowercase hex", id, r)
+		}
+	}
+
+	return nil
 }
