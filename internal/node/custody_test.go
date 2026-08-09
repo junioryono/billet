@@ -1329,11 +1329,9 @@ func TestKeepAliveFollowsAShortenedLeaseTTL(t *testing.T) {
 		t.Fatalf("Recover: %v", err)
 	}
 
-	// Long enough that a janitor which fixed its cadence here would renew roughly
-	// never on the timescale of this test.
 	var ttl atomic.Int64
 
-	ttl.Store(int64(90 * time.Second))
+	ttl.Store(int64(3 * time.Second)) // renew every second
 
 	r.ttl = func() time.Duration { return time.Duration(ttl.Load()) }
 
@@ -1342,22 +1340,51 @@ func TestKeepAliveFollowsAShortenedLeaseTTL(t *testing.T) {
 
 	go r.KeepAlive(ctx)
 
+	// WAIT FOR A RENEWAL BY THE JANITOR BEFORE SHORTENING, which is the whole
+	// point and which took two attempts to get right.
+	//
+	// The first version stored the short TTL immediately after starting the
+	// goroutine, so the goroutine usually read the SHORT value on its very first
+	// pass: it proved a store beating a scheduler, not an armed timer adapting.
+	// The second waited for a heartbeat — and Recover had ALREADY heartbeated
+	// while adopting, so the wait returned instantly and the race was exactly as
+	// before. Counting from a baseline taken before the janitor exists is what
+	// makes the wait mean "the janitor has renewed", which is the only condition
+	// that proves it is committed to the long cadence.
+	baseline := store.heartbeats.Load()
+
+	firstBy := time.Now().Add(15 * time.Second)
+	for store.heartbeats.Load() <= baseline {
+		if time.Now().After(firstBy) {
+			t.Fatal("the janitor never renewed at its original cadence")
+		}
+
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	before := store.heartbeats.Load()
+
 	// The plane comes back with a much shorter TTL, as a restarted or
-	// reconfigured control plane does.
+	// reconfigured control plane does. A janitor that only re-reads when its
+	// timer fires would now sleep out the remaining ten seconds.
 	ttl.Store(int64(30 * time.Millisecond))
 
 	// SEVERAL renewals, not one: one could be a single fire of a timer that then
 	// went back to the ninety-second cadence.
 	const want = 3
 
-	deadline := time.Now().Add(20 * time.Second)
+	// A WINDOW SHORTER THAN THE OLD CADENCE, which is what makes this a test
+	// rather than a wait. At the old interval one renewal was already scheduled a
+	// second out; only a janitor that pulled its deadline in can fit three
+	// renewals into 600ms.
+	deadline := time.Now().Add(600 * time.Millisecond)
 
-	for store.heartbeats.Load() < want {
+	for store.heartbeats.Load() < before+want {
 		if time.Now().After(deadline) {
-			t.Fatalf("the janitor renewed %d times after the TTL was shortened, want at least "+
-				"%d; it is still renewing on the cadence it was born with, so a lease can "+
-				"expire between heartbeats while its container runs",
-				store.heartbeats.Load(), want)
+			t.Fatalf("the janitor renewed %d times in the 600ms after the TTL was shortened, "+
+				"want at least %d; its timer is still armed for the cadence it held when the "+
+				"TTL changed, so a lease can expire between heartbeats while its container "+
+				"runs", store.heartbeats.Load()-before, want)
 		}
 
 		time.Sleep(5 * time.Millisecond)

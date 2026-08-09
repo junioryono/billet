@@ -24,6 +24,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"os"
@@ -59,6 +60,20 @@ const ExpiryWarning = 30 * 24 * time.Hour
 // that cannot reach it.
 var ErrHalfInitialised = errors.New("wirecert: the CA directory holds only one of its two files")
 
+// ErrAuthorityLost means this deployment had an authority and its files are gone.
+//
+// LOSING BOTH FILES IS INDISTINGUISHABLE FROM A FIRST RUN unless something
+// remembers, and "mint a new one" is the wrong answer to exactly one of those.
+// A restored backup that omitted the CA directory, a state directory recreated
+// by a provisioning script, an operator clearing what they thought was cache —
+// each looks like day one, and each would silently produce a NEW authority that
+// every issued node bundle fails to verify against. The whole fleet drops off at
+// once, and the control plane looks perfectly healthy.
+var ErrAuthorityLost = errors.New("wirecert: this deployment had a certificate authority and it is gone")
+
+// ErrForeignAuthority means the CA on disk belongs to a different deployment.
+var ErrForeignAuthority = errors.New("wirecert: this authority was issued for another deployment")
+
 // CA is a deployment's certificate authority.
 type CA struct {
 	deployment string
@@ -87,14 +102,30 @@ type Bundle struct {
 func LoadOrCreateCA(dir, deployment string) (*CA, error) {
 	certPath, keyPath := filepath.Join(dir, "ca.crt"), filepath.Join(dir, "ca.key")
 
-	certPEM, certErr := os.ReadFile(certPath)
-	keyPEM, keyErr := os.ReadFile(keyPath)
+	certPEM, certErr := readPublic(certPath)
+	keyPEM, keyErr := readSecret(keyPath)
 
 	switch {
 	case certErr == nil && keyErr == nil:
 		return parseCA(certPEM, keyPEM, deployment)
 
 	case os.IsNotExist(certErr) && os.IsNotExist(keyErr):
+		// BOTH GONE IS NOT AUTOMATICALLY DAY ONE. The marker below is the only
+		// thing that can tell a first run from a restore that dropped the CA
+		// directory, and getting it wrong mints a new authority that every issued
+		// bundle fails against.
+		if had, err := hadAuthority(dir); err != nil {
+			return nil, err
+		} else if had {
+			return nil, fmt.Errorf(
+				"%w: %s records that one was created here, but %s and %s are missing. Billet "+
+					"will not mint a replacement — a new authority invalidates every node "+
+					"certificate this deployment ever issued, and the whole fleet stops "+
+					"connecting at once. Restore the directory from backup, or delete %s to "+
+					"start a new authority deliberately and re-issue every node",
+				ErrAuthorityLost, markerPath(dir), certPath, keyPath, markerPath(dir))
+		}
+
 		return createCA(dir, certPath, keyPath, deployment)
 
 	case certErr != nil && !os.IsNotExist(certErr):
@@ -179,6 +210,14 @@ func createCA(dir, certPath, keyPath, deployment string) (*CA, error) {
 		return nil, err
 	}
 
+	// WRITTEN LAST, so a crash mid-creation leaves no claim that an authority
+	// exists here. The marker's only job is to make a later ABSENCE meaningful:
+	// an empty directory is day one, and an empty directory that once held an
+	// authority is a loss.
+	if err := writePublic(markerPath(dir), []byte(deployment+"\n")); err != nil {
+		return nil, err
+	}
+
 	if err := syncDir(dir); err != nil {
 		return nil, err
 	}
@@ -193,6 +232,23 @@ func createCA(dir, certPath, keyPath, deployment string) (*CA, error) {
 	}
 
 	return &CA{deployment: deployment, cert: cert, key: key, certPEM: certPEM}, nil
+}
+
+// markerPath names the file that records an authority once existed here.
+func markerPath(dir string) string { return filepath.Join(dir, "authority-created") }
+
+// hadAuthority reports whether one was ever created in this directory.
+func hadAuthority(dir string) (bool, error) {
+	_, err := os.Stat(markerPath(dir))
+	if err == nil {
+		return true, nil
+	}
+
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+
+	return false, fmt.Errorf("wirecert: read %s: %w", markerPath(dir), err)
 }
 
 func parseCA(certPEM, keyPEM []byte, deployment string) (*CA, error) {
@@ -218,6 +274,28 @@ func parseCA(certPEM, keyPEM []byte, deployment string) (*CA, error) {
 
 	if !cert.IsCA {
 		return nil, errors.New("wirecert: the CA certificate is not a certificate authority")
+	}
+
+	// THE KEY MUST BE THIS CERTIFICATE'S KEY. Two unrelated halves load happily
+	// and then sign leaves nothing can verify — a failure that surfaces on a node,
+	// days later, as a handshake error naming neither file.
+	if !key.PublicKey.Equal(cert.PublicKey) {
+		return nil, errors.New(
+			"wirecert: ca.key is not the key for ca.crt; every certificate signed with this " +
+				"pair would fail verification on the node that presented it")
+	}
+
+	// AND IT MUST BE THIS DEPLOYMENT'S AUTHORITY. Verifying against the CA is
+	// what decides which deployment may connect at all, so a CA restored from
+	// somewhere else silently re-points that decision: a holder of the OTHER
+	// installation's node certificate connects, names this deployment in its
+	// registration body, and is accepted.
+	if len(cert.Subject.Organization) != 1 || cert.Subject.Organization[0] != deployment {
+		return nil, fmt.Errorf(
+			"%w: this control plane is deployment %s and %v was issued for %v. A certificate "+
+				"authority decides which nodes may connect, so using another installation's "+
+				"would let its nodes drive this one",
+			ErrForeignAuthority, deployment, "ca.crt", cert.Subject.Organization)
 	}
 
 	return &CA{deployment: deployment, cert: cert, key: key, certPEM: certPEM}, nil
@@ -466,18 +544,22 @@ func ClientTLS(b Bundle) (*tls.Config, error) {
 }
 
 // LoadBundle reads a bundle a node was given.
+//
+// The node's key is held to the same standard as the control plane's: it is the
+// credential that lets this host act as this node, and a host whose key any
+// local user can read is a host any local user can impersonate.
 func LoadBundle(certPath, keyPath, caPath string) (Bundle, error) {
-	certPEM, err := os.ReadFile(certPath)
+	certPEM, err := readPublic(certPath)
 	if err != nil {
 		return Bundle{}, fmt.Errorf("wirecert: read %s: %w", certPath, err)
 	}
 
-	keyPEM, err := os.ReadFile(keyPath)
+	keyPEM, err := readSecret(keyPath)
 	if err != nil {
 		return Bundle{}, fmt.Errorf("wirecert: read %s: %w", keyPath, err)
 	}
 
-	caPEM, err := os.ReadFile(caPath)
+	caPEM, err := readPublic(caPath)
 	if err != nil {
 		return Bundle{}, fmt.Errorf("wirecert: read %s: %w", caPath, err)
 	}
@@ -506,6 +588,85 @@ func serialNumber() (*big.Int, error) {
 	}
 
 	return serial, nil
+}
+
+// maxPEM bounds what will be read as a certificate or a key.
+//
+// A key is a few hundred bytes. Without a limit, a path pointing at something
+// enormous — a device, a log, a mistake — is read entirely into the control
+// plane's memory before anything notices it is not a key.
+const maxPEM = 1 << 20
+
+// readSecret reads a private key, refusing anything a private key must not be.
+//
+// FAIL CLOSED ON THE FILE ITSELF, because creation's 0600 says nothing about
+// what is there NOW. A backup that restored ca.key as 0644 into a traversable
+// directory starts billet perfectly happily while any local user copies the
+// authority and mints node identities at will. A symlink is refused for the
+// same reason: the path billet was told to read is the only one it should read.
+func readSecret(path string) ([]byte, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err // may be os.IsNotExist, which callers branch on
+	}
+
+	if info.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf(
+			"wirecert: %s is a symlink; billet reads a private key only from the path it was "+
+				"given, so that what it loads is what an operator secured", path)
+	}
+
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("wirecert: %s is not a regular file", path)
+	}
+
+	if perm := info.Mode().Perm(); perm&0o077 != 0 {
+		return nil, fmt.Errorf(
+			"wirecert: %s is mode %04o and must not be readable by anyone else; it signs every "+
+				"node identity in this deployment. Run: chmod 600 %s", path, perm, path)
+	}
+
+	return readCapped(path)
+}
+
+// readPublic reads a certificate, which is not a secret but is still a file
+// billet is about to trust.
+func readPublic(path string) ([]byte, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+
+	if info.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("wirecert: %s is a symlink", path)
+	}
+
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("wirecert: %s is not a regular file", path)
+	}
+
+	return readCapped(path)
+}
+
+func readCapped(path string) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+
+	defer func() { _ = f.Close() }()
+
+	body, err := io.ReadAll(io.LimitReader(f, maxPEM+1))
+	if err != nil {
+		return nil, fmt.Errorf("wirecert: read %s: %w", path, err)
+	}
+
+	if len(body) > maxPEM {
+		return nil, fmt.Errorf("wirecert: %s is larger than %d bytes, which no key or "+
+			"certificate is", path, maxPEM)
+	}
+
+	return body, nil
 }
 
 func writeSecret(path string, body []byte) error {

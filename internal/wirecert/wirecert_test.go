@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -333,4 +334,218 @@ func parse(t *testing.T, certPEM []byte) *x509.Certificate {
 	}
 
 	return cert
+}
+
+// LOSING BOTH CA FILES IS NOT A FIRST RUN, and nothing could tell the difference
+// until something remembered.
+//
+// A restored backup that omitted the CA directory, a state directory recreated
+// by a provisioning script, an operator clearing what they took for cache — each
+// leaves an empty directory that looks exactly like day one. Minting a new
+// authority there invalidates every node certificate this deployment ever
+// issued: the whole fleet drops off at once, and the control plane looks
+// perfectly healthy while it happens.
+func TestAnAuthorityThatVanishedIsNotSilentlyReplaced(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	first, err := wirecert.LoadOrCreateCA(dir, deployment)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	for _, name := range []string{"ca.crt", "ca.key"} {
+		if err := os.Remove(filepath.Join(dir, name)); err != nil {
+			t.Fatalf("remove %s: %v", name, err)
+		}
+	}
+
+	second, err := wirecert.LoadOrCreateCA(dir, deployment)
+	if !errors.Is(err, wirecert.ErrAuthorityLost) {
+		t.Fatalf("a deployment whose authority disappeared minted a new one (%v); every "+
+			"bundle it ever issued now fails to verify", err)
+	}
+
+	if second != nil && !bytes.Equal(second.CertPEM(), first.CertPEM()) {
+		t.Error("a replacement authority was returned alongside the error")
+	}
+}
+
+// The marker is what an operator deletes to start over deliberately.
+func TestAuthorityLossIsRecoverableByChoice(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	if _, err := wirecert.LoadOrCreateCA(dir, deployment); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	for _, name := range []string{"ca.crt", "ca.key", "authority-created"} {
+		if err := os.Remove(filepath.Join(dir, name)); err != nil {
+			t.Fatalf("remove %s: %v", name, err)
+		}
+	}
+
+	if _, err := wirecert.LoadOrCreateCA(dir, deployment); err != nil {
+		t.Errorf("an operator who removed the marker deliberately could not start over: %v", err)
+	}
+}
+
+// AN AUTHORITY FROM ANOTHER DEPLOYMENT IS REFUSED.
+//
+// Verifying against the CA is what decides which nodes may connect at all, so a
+// CA restored from somewhere else silently re-points that decision: a holder of
+// the other installation's node certificate connects, names this deployment in
+// its registration body, and is accepted.
+func TestAForeignAuthorityIsRefused(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	if _, err := wirecert.LoadOrCreateCA(dir, "ffffffffffffffffffffffffffffffff"); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	_, err := wirecert.LoadOrCreateCA(dir, deployment)
+	if !errors.Is(err, wirecert.ErrForeignAuthority) {
+		t.Errorf("a control plane loaded another deployment's authority (%v); its nodes could "+
+			"then drive this installation", err)
+	}
+}
+
+// A KEY THAT ANY LOCAL USER CAN READ IS NOT A KEY.
+//
+// Creation writes 0600, and that says nothing about what is on disk now. A
+// backup that restored ca.key as 0644 starts billet perfectly happily while
+// anyone on the host copies the authority and mints node identities at will.
+func TestAWorldReadableAuthorityKeyIsRefused(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	if _, err := wirecert.LoadOrCreateCA(dir, deployment); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	key := filepath.Join(dir, "ca.key")
+	if err := os.Chmod(key, 0o644); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+
+	_, err := wirecert.LoadOrCreateCA(dir, deployment)
+	if err == nil {
+		t.Fatal("a CA key readable by every local user was accepted")
+	}
+
+	if !strings.Contains(err.Error(), "chmod") {
+		t.Errorf("the error does not say how to fix it: %v", err)
+	}
+}
+
+// A key reached through a symlink is refused: billet reads the path it was
+// given, so that what it loads is what an operator secured.
+func TestASymlinkedAuthorityKeyIsRefused(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	if _, err := wirecert.LoadOrCreateCA(dir, deployment); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	key := filepath.Join(dir, "ca.key")
+
+	elsewhere := filepath.Join(t.TempDir(), "real.key")
+
+	body, err := os.ReadFile(key)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+
+	if err := os.WriteFile(elsewhere, body, 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	if err := os.Remove(key); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+
+	if err := os.Symlink(elsewhere, key); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	if _, err := wirecert.LoadOrCreateCA(dir, deployment); err == nil {
+		t.Error("a CA key reached through a symlink was accepted")
+	}
+}
+
+// MISMATCHED HALVES FAIL AT STARTUP, not days later on a node.
+//
+// Two unrelated files load happily and then sign leaves that nothing can verify.
+// The failure surfaces as a handshake error on a machine that names neither
+// file.
+func TestAKeyThatDoesNotMatchItsCertificateIsRefused(t *testing.T) {
+	t.Parallel()
+
+	a, b := t.TempDir(), t.TempDir()
+
+	if _, err := wirecert.LoadOrCreateCA(a, deployment); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	if _, err := wirecert.LoadOrCreateCA(b, deployment); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// B's key beside A's certificate, which is what half a restore looks like.
+	body, err := os.ReadFile(filepath.Join(b, "ca.key"))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(a, "ca.key"), body, 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	if _, err := wirecert.LoadOrCreateCA(a, deployment); err == nil {
+		t.Error("a certificate and an unrelated key were loaded as an authority; every " +
+			"certificate signed with them would fail on the node presenting it")
+	}
+}
+
+// A node's key is held to the same standard, for the same reason: it is the
+// credential that lets a host act as that node.
+func TestAWorldReadableNodeKeyIsRefused(t *testing.T) {
+	t.Parallel()
+
+	ca, err := wirecert.LoadOrCreateCA(t.TempDir(), deployment)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	bundle, err := ca.IssueNode("n1")
+	if err != nil {
+		t.Fatalf("issue: %v", err)
+	}
+
+	dir := filepath.Join(t.TempDir(), "bundle")
+
+	if err := bundle.Write(dir); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	if err := os.Chmod(filepath.Join(dir, "node.key"), 0o644); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+
+	_, err = wirecert.LoadBundle(
+		filepath.Join(dir, "node.crt"),
+		filepath.Join(dir, "node.key"),
+		filepath.Join(dir, "ca.crt"))
+	if err == nil {
+		t.Error("a node key readable by every local user was accepted; any local user could " +
+			"act as this node")
+	}
 }

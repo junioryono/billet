@@ -202,19 +202,61 @@ func (r *Runner) KeepAlive(ctx context.Context) {
 	// the container it was holding is still running. The janitor is started once
 	// on purpose — custody outlives any registration — so re-reading here is the
 	// only place that correction can happen.
-	timer := time.NewTimer(r.renewEvery())
+	// WAKES OFTEN, RENEWS ON SCHEDULE, and the two are deliberately separate.
+	//
+	// Re-reading the TTL when the timer fires is not enough: a timer armed for
+	// thirty seconds under a ninety-second TTL stays armed for thirty seconds even
+	// if the plane comes back advertising nine. The lease expires while a correct
+	// cadence sits in a variable nothing has consulted yet.
+	//
+	// So the loop wakes on a short fixed tick and asks whether a renewal is DUE.
+	// The cost is a few no-op wakeups a minute in a background goroutine; the
+	// alternative is a lease reaped between two heartbeats while its container
+	// runs.
+	next := time.Now().Add(r.renewEvery())
+
+	timer := time.NewTimer(watchTick)
 	defer timer.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-timer.C:
-			r.renewHeld(ctx)
-			timer.Reset(r.renewEvery())
+		case now := <-timer.C:
+			due := r.renewEvery()
+
+			// A SHORTENED CADENCE PULLS THE DEADLINE IN. This is the whole point of
+			// waking early: a deadline further away than the current interval allows
+			// was set under a TTL that no longer applies, and keeping it would let the
+			// lease expire before the next renewal.
+			if latest := now.Add(due); next.After(latest) {
+				next = latest
+			}
+
+			if !now.Before(next) {
+				r.renewHeld(ctx)
+
+				next = time.Now().Add(due)
+			}
+
+			// Sleep until the deadline, but never longer than one tick, so the next
+			// change of cadence is noticed just as quickly.
+			wait := watchTick
+			if until := time.Until(next); until > 0 && until < wait {
+				wait = until
+			}
+
+			timer.Reset(wait)
 		}
 	}
 }
+
+// watchTick bounds how long the janitor can be unaware of a shortened TTL.
+//
+// Short enough that a renegotiated cadence takes effect within one tick, long
+// enough that a fleet of idle nodes is not spinning. It is a ceiling on the
+// sleep, never the renewal interval itself.
+const watchTick = 500 * time.Millisecond
 
 // renewEvery is how long to wait between renewals.
 //
