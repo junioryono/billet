@@ -1878,7 +1878,7 @@ func TestACompleteNodeTLSBlockIsAccepted(t *testing.T) {
 
 	body := `
 server:
-  listen: 127.0.0.1:7717
+  listen: 0.0.0.0:7717
   state_dir: /var/lib/billet/server
   lock_dir: /run/billet/locks
   max_vcpu: 8
@@ -1924,7 +1924,7 @@ func TestAPartialNodeTLSBlockIsRefused(t *testing.T) {
 
 	body := `
 server:
-  listen: 127.0.0.1:7717
+  listen: 0.0.0.0:7717
   state_dir: /var/lib/billet/server
   lock_dir: /run/billet/locks
   max_vcpu: 8
@@ -1969,7 +1969,7 @@ func TestARelativeNodeTLSPathIsRefused(t *testing.T) {
 
 	body := `
 server:
-  listen: 127.0.0.1:7717
+  listen: 0.0.0.0:7717
   state_dir: /var/lib/billet/server
   lock_dir: /run/billet/locks
   max_vcpu: 8
@@ -2007,16 +2007,21 @@ tiers:
 	}
 }
 
-// A LOOPBACK CONTROL PLANE SERVES PLAINTEXT, so a bundle pointed at one can
-// never be presented.
+// A CONTROL PLANE THAT LISTENS ONLY ON LOOPBACK SERVES PLAINTEXT, so a bundle
+// aimed at it can never be presented.
 //
 // Two authorities for one fact, and this is the configuration where they
-// disagree. The server chooses transport security by ADDRESS — loopback needs
-// none, because there is nothing between the two processes — and the node chose
-// it by whether it holds a certificate. The result loaded cleanly and then
-// looped forever: the node dialled https, the listener spoke http, and every
-// handshake failed with nothing in either log naming the setting responsible.
-func TestACertificateAimedAtALoopbackControlPlaneIsRefused(t *testing.T) {
+// disagreed: the server chooses transport security from its LISTEN address —
+// loopback needs none, because there is nothing between the two processes — and
+// the node chose it from whether it held a certificate. The result loaded
+// cleanly and looped forever, with nothing in either log naming the setting.
+//
+// Note what is NOT refused. A server on 0.0.0.0 serves mTLS on every interface
+// including loopback, so a node colocated with it dials 127.0.0.1 and needs its
+// certificate — the first version of this rule refused that, which is the
+// ordinary production shape. The listener's address is the authority, and a
+// node's destination cannot stand in for it.
+func TestACertificateAimedAtALoopbackOnlyControlPlaneIsRefused(t *testing.T) {
 	t.Parallel()
 
 	body := `
@@ -2051,12 +2056,55 @@ tiers:
 
 	_, err := Load(writeConfig(t, body))
 	if err == nil {
-		t.Fatal("a node was configured to present a certificate to a control plane inside " +
-			"its own machine, which serves plain HTTP; it would never connect")
+		t.Fatal("a node was configured to present a certificate to a control plane that " +
+			"accepts only on loopback and therefore serves plain HTTP")
 	}
 
 	if !strings.Contains(err.Error(), "node.tls") {
 		t.Errorf("the error does not name the key to remove: %v", err)
+	}
+}
+
+// A WILDCARD LISTENER SERVES mTLS EVERYWHERE, loopback included, so a colocated
+// node both dials 127.0.0.1 and needs its bundle.
+func TestACertificateIsAllowedAgainstAWildcardListener(t *testing.T) {
+	t.Parallel()
+
+	body := `
+server:
+  listen: 0.0.0.0:7717
+  state_dir: /var/lib/billet/server
+  lock_dir: /run/billet/locks
+  max_vcpu: 8
+  max_memory: 32GiB
+  node_tls_hosts:
+    - billet.example
+node:
+  name: host-1
+  server_addr: 127.0.0.1:7717
+  provider: docker
+  state_dir: /var/lib/billet/node
+  lock_dir: /run/billet/locks
+  tls:
+    cert: /etc/billet/tls/node.crt
+    key: /etc/billet/tls/node.key
+    ca: /etc/billet/tls/ca.crt
+github:
+  org: acme
+  app_id: 1
+  installation_id: 2
+  private_key_path: /tmp/key.pem
+tiers:
+  - label: billet-2vcpu
+    provider: docker
+    vcpu: 2
+    memory: 8GiB
+    image: ubuntu:24.04
+`
+
+	if _, err := Load(writeConfig(t, body)); err != nil {
+		t.Errorf("a node colocated with a control plane that serves mTLS on every interface "+
+			"was refused its certificate: %v", err)
 	}
 }
 

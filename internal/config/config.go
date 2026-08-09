@@ -1068,25 +1068,24 @@ func (c *Config) validateNodeTLS() []error {
 		return errs
 	}
 
-	// A LOOPBACK CONTROL PLANE SERVES PLAINTEXT, so a bundle pointed at one can
-	// never be presented. The server decides by ADDRESS — loopback needs no
-	// transport security because there is nothing between the two processes — and
-	// the node decides by whether it holds a certificate. Those are two
-	// authorities for one fact, and the configuration where they disagree loads
-	// cleanly and then loops forever: the node dials https, the listener speaks
-	// http, and every handshake fails.
+	// THE SERVER'S LISTEN ADDRESS DECIDES THE TRANSPORT, and the node's
+	// destination cannot be used to infer it. The first attempt at this rule
+	// refused any bundle aimed at loopback — which is wrong for the ordinary
+	// production shape: a control plane listening on 0.0.0.0 serves mTLS on EVERY
+	// interface, loopback included, so a node colocated with it dials 127.0.0.1
+	// AND needs its certificate.
 	//
-	// The address is the authority, on both sides. A node on the same machine as
-	// its control plane does not need a bundle, and one that has been given a
-	// bundle is not talking to a control plane on this machine.
-	if isLoopbackHostPort(c.Node.ServerAddr) {
+	// So the question is only answerable when this file describes both roles, and
+	// then it is answerable exactly. A standalone node's file says nothing about
+	// how the server bound its listener, and guessing there is what produced two
+	// authorities for one fact.
+	if c.Server != nil && LoopbackAddr(c.Server.Listen) {
 		errs = append(errs, fmt.Errorf(
-			"node.tls is set but node.server_addr is %q, which is a control plane inside this "+
-				"machine. It serves plain HTTP, because there is nothing between the two "+
-				"processes to authenticate — so this node would dial https and never connect. "+
-				"Remove node.tls, or point node.server_addr at the address the control plane "+
-				"publishes to its fleet",
-			c.Node.ServerAddr))
+			"node.tls is set, but server.listen is %q — a control plane that accepts only on "+
+				"loopback serves plain HTTP, because there is nothing between the two "+
+				"processes to authenticate. This node would dial https and never connect. "+
+				"Remove node.tls, or bind the server to the address it publishes to its fleet",
+			c.Server.Listen))
 
 		return errs
 	}
@@ -1118,6 +1117,16 @@ func (c *Config) validateNodeTLS() []error {
 	slices.SortFunc(errs, func(a, b error) int { return strings.Compare(a.Error(), b.Error()) })
 
 	return errs
+}
+
+// LoopbackAddr reports whether an address accepts only from this machine.
+//
+// SHARED WITH THE SERVER'S OWN DECISION, deliberately: the wire is served
+// without TLS on exactly the addresses this returns true for, so config
+// validation and the listener must not answer the question differently. A
+// wildcard is NOT loopback — it accepts from everywhere, including loopback.
+func LoopbackAddr(addr string) bool {
+	return isLoopbackHostPort(addr)
 }
 
 // isLoopbackHostPort reports whether an address is on this machine.

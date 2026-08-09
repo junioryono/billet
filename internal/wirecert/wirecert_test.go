@@ -59,7 +59,7 @@ func TestAHalfInitialisedAuthorityIsRefused(t *testing.T) {
 				t.Fatalf("create: %v", err)
 			}
 
-			if err := os.Remove(filepath.Join(dir, missing)); err != nil {
+			if err := os.Remove(filepath.Join(wirecert.CADir(dir), missing)); err != nil {
 				t.Fatalf("remove %s: %v", missing, err)
 			}
 
@@ -81,7 +81,7 @@ func TestTheAuthorityKeyIsNotReadableByOthers(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 
-	info, err := os.Stat(filepath.Join(dir, "ca.key"))
+	info, err := os.Stat(filepath.Join(wirecert.CADir(dir), "ca.key"))
 	if err != nil {
 		t.Fatalf("stat: %v", err)
 	}
@@ -356,7 +356,7 @@ func TestAnAuthorityThatVanishedIsNotSilentlyReplaced(t *testing.T) {
 	}
 
 	for _, name := range []string{"ca.crt", "ca.key"} {
-		if err := os.Remove(filepath.Join(dir, name)); err != nil {
+		if err := os.Remove(filepath.Join(wirecert.CADir(dir), name)); err != nil {
 			t.Fatalf("remove %s: %v", name, err)
 		}
 	}
@@ -382,9 +382,13 @@ func TestAuthorityLossIsRecoverableByChoice(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 
-	for _, name := range []string{"ca.crt", "ca.key", "authority-created"} {
-		if err := os.Remove(filepath.Join(dir, name)); err != nil {
-			t.Fatalf("remove %s: %v", name, err)
+	for _, path := range []string{
+		filepath.Join(wirecert.CADir(dir), "ca.crt"),
+		filepath.Join(wirecert.CADir(dir), "ca.key"),
+		filepath.Join(dir, "authority-created"),
+	} {
+		if err := os.Remove(path); err != nil {
+			t.Fatalf("remove %s: %v", path, err)
 		}
 	}
 
@@ -429,7 +433,7 @@ func TestAWorldReadableAuthorityKeyIsRefused(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 
-	key := filepath.Join(dir, "ca.key")
+	key := filepath.Join(wirecert.CADir(dir), "ca.key")
 	if err := os.Chmod(key, 0o644); err != nil {
 		t.Fatalf("chmod: %v", err)
 	}
@@ -455,7 +459,7 @@ func TestASymlinkedAuthorityKeyIsRefused(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 
-	key := filepath.Join(dir, "ca.key")
+	key := filepath.Join(wirecert.CADir(dir), "ca.key")
 
 	elsewhere := filepath.Join(t.TempDir(), "real.key")
 
@@ -500,12 +504,12 @@ func TestAKeyThatDoesNotMatchItsCertificateIsRefused(t *testing.T) {
 	}
 
 	// B's key beside A's certificate, which is what half a restore looks like.
-	body, err := os.ReadFile(filepath.Join(b, "ca.key"))
+	body, err := os.ReadFile(filepath.Join(wirecert.CADir(b), "ca.key"))
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
 
-	if err := os.WriteFile(filepath.Join(a, "ca.key"), body, 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(wirecert.CADir(a), "ca.key"), body, 0o600); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 
@@ -543,9 +547,108 @@ func TestAWorldReadableNodeKeyIsRefused(t *testing.T) {
 	_, err = wirecert.LoadBundle(
 		filepath.Join(dir, "node.crt"),
 		filepath.Join(dir, "node.key"),
-		filepath.Join(dir, "ca.crt"))
+		filepath.Join(wirecert.CADir(dir), "ca.crt"))
 	if err == nil {
 		t.Error("a node key readable by every local user was accepted; any local user could " +
 			"act as this node")
+	}
+}
+
+// THE WHOLE ca DIRECTORY GOING MISSING IS THE FAILURE THIS EXISTS FOR, and the
+// first version could not survive it: the marker lived inside that directory, so
+// a backup or a provisioning script that omitted it took the witness along and
+// hadAuthority answered "day one". The test deleted two files and kept the
+// marker, which modelled a case that does not happen.
+func TestLosingTheWholeAuthorityDirectoryIsDetected(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	if _, err := wirecert.LoadOrCreateCA(dir, deployment); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	if err := os.RemoveAll(wirecert.CADir(dir)); err != nil {
+		t.Fatalf("remove the ca directory: %v", err)
+	}
+
+	if _, err := wirecert.LoadOrCreateCA(dir, deployment); !errors.Is(err, wirecert.ErrAuthorityLost) {
+		t.Errorf("a deployment whose entire ca directory was dropped minted a new authority "+
+			"(%v); every bundle it ever issued now fails to verify", err)
+	}
+}
+
+// AN INSTALLATION OLDER THAN THE MARKER IS PROTECTED FROM ITS SECOND BOOT.
+//
+// Without a backfill the upgrade does nothing for exactly the deployments that
+// have the most to lose: the ones that have been issuing certificates for
+// longest.
+func TestAnAuthorityPredatingTheMarkerIsBackfilled(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	if _, err := wirecert.LoadOrCreateCA(dir, deployment); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// An installation created before the marker existed.
+	if err := os.Remove(filepath.Join(dir, "authority-created")); err != nil {
+		t.Fatalf("remove the marker: %v", err)
+	}
+
+	// A boot on the new code, which loads the existing authority happily.
+	if _, err := wirecert.LoadOrCreateCA(dir, deployment); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(dir, "authority-created")); err != nil {
+		t.Fatalf("the marker was not backfilled, so this deployment keeps the old behaviour "+
+			"forever: %v", err)
+	}
+
+	// And from here it is protected like any other.
+	if err := os.RemoveAll(wirecert.CADir(dir)); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+
+	if _, err := wirecert.LoadOrCreateCA(dir, deployment); !errors.Is(err, wirecert.ErrAuthorityLost) {
+		t.Errorf("a backfilled installation still minted a replacement: %v", err)
+	}
+}
+
+// A BUNDLE WHOSE HALVES COME FROM DIFFERENT DEPLOYMENTS IS REFUSED.
+//
+// The leaf and key being a matched pair says nothing about whether the CA beside
+// them issued that leaf. A node adopts its DEPLOYMENT from the leaf, so a mixed
+// bundle wrote the wrong identity permanently, trusted a server that would
+// reject it, and then refused the correct bundle as a conflict.
+func TestABundleWhoseCertificateDoesNotChainToItsCAIsRefused(t *testing.T) {
+	t.Parallel()
+
+	a, err := wirecert.LoadOrCreateCA(t.TempDir(), deployment)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	b, err := wirecert.LoadOrCreateCA(t.TempDir(), "ffffffffffffffffffffffffffffffff")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	mine, err := a.IssueNode("epyc-1")
+	if err != nil {
+		t.Fatalf("issue: %v", err)
+	}
+
+	mixed := wirecert.Bundle{
+		CertPEM: mine.CertPEM,
+		KeyPEM:  mine.KeyPEM,
+		CAPEM:   b.CertPEM(), // somebody else's authority
+	}
+
+	if _, err := wirecert.ClientTLS(mixed); err == nil {
+		t.Error("a node certificate was accepted beside an authority that did not issue it; " +
+			"the node would adopt the wrong deployment permanently and still be rejected")
 	}
 }

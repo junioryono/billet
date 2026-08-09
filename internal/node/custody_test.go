@@ -1329,62 +1329,70 @@ func TestKeepAliveFollowsAShortenedLeaseTTL(t *testing.T) {
 		t.Fatalf("Recover: %v", err)
 	}
 
-	var ttl atomic.Int64
+	// A CADENCE NO TEST COULD OUTLIVE, deliberately. If the janitor does not pull
+	// its deadline in, the next renewal is a hundred seconds away and this test
+	// simply never sees one — which makes the assertion below structural rather
+	// than a race against a stopwatch. An earlier version asserted three renewals
+	// inside 600ms and flaked under an instrumented parallel run, where a
+	// goroutine can go unscheduled for longer than that.
+	var (
+		ttl   atomic.Int64
+		reads atomic.Int64
+	)
 
-	ttl.Store(int64(3 * time.Second)) // renew every second
+	ttl.Store(int64(300 * time.Second)) // renew every 100 seconds
 
-	r.ttl = func() time.Duration { return time.Duration(ttl.Load()) }
+	r.ttl = func() time.Duration {
+		reads.Add(1)
+
+		return time.Duration(ttl.Load())
+	}
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
 	go r.KeepAlive(ctx)
 
-	// WAIT FOR A RENEWAL BY THE JANITOR BEFORE SHORTENING, which is the whole
-	// point and which took two attempts to get right.
+	// WAIT UNTIL THE JANITOR HAS READ THE LONG TTL, which is the moment it is
+	// committed to that cadence, and the only thing that makes shortening it a
+	// test of adaptation rather than of scheduling order.
 	//
-	// The first version stored the short TTL immediately after starting the
-	// goroutine, so the goroutine usually read the SHORT value on its very first
-	// pass: it proved a store beating a scheduler, not an armed timer adapting.
-	// The second waited for a heartbeat — and Recover had ALREADY heartbeated
-	// while adopting, so the wait returned instantly and the race was exactly as
-	// before. Counting from a baseline taken before the janitor exists is what
-	// makes the wait mean "the janitor has renewed", which is the only condition
-	// that proves it is committed to the long cadence.
-	baseline := store.heartbeats.Load()
-
-	firstBy := time.Now().Add(15 * time.Second)
-	for store.heartbeats.Load() <= baseline {
-		if time.Now().After(firstBy) {
-			t.Fatal("the janitor never renewed at its original cadence")
+	// This took three attempts. The first stored the short value immediately
+	// after starting the goroutine, so the goroutine usually read the SHORT one on
+	// its first pass. The second waited for a heartbeat — and Recover had already
+	// heartbeated while adopting, so the wait returned instantly and the race was
+	// exactly as before. Counting the janitor's own reads is the signal that
+	// cannot be satisfied by anything else.
+	armedBy := time.Now().Add(15 * time.Second)
+	for reads.Load() == 0 {
+		if time.Now().After(armedBy) {
+			t.Fatal("the janitor never read the lease TTL, so it never armed")
 		}
 
-		time.Sleep(5 * time.Millisecond)
+		time.Sleep(time.Millisecond)
 	}
 
 	before := store.heartbeats.Load()
 
 	// The plane comes back with a much shorter TTL, as a restarted or
-	// reconfigured control plane does. A janitor that only re-reads when its
-	// timer fires would now sleep out the remaining ten seconds.
+	// reconfigured control plane does.
 	ttl.Store(int64(30 * time.Millisecond))
 
 	// SEVERAL renewals, not one: one could be a single fire of a timer that then
-	// went back to the ninety-second cadence.
+	// went back to the hundred-second cadence.
 	const want = 3
 
-	// A WINDOW SHORTER THAN THE OLD CADENCE, which is what makes this a test
-	// rather than a wait. At the old interval one renewal was already scheduled a
-	// second out; only a janitor that pulled its deadline in can fit three
-	// renewals into 600ms.
-	deadline := time.Now().Add(600 * time.Millisecond)
+	// Generous, because the discrimination is structural: without the pull-in the
+	// next renewal is a hundred seconds out, so no amount of waiting here would
+	// produce one.
+	deadline := time.Now().Add(10 * time.Second)
 
 	for store.heartbeats.Load() < before+want {
 		if time.Now().After(deadline) {
-			t.Fatalf("the janitor renewed %d times in the 600ms after the TTL was shortened, "+
-				"want at least %d; its timer is still armed for the cadence it held when the "+
-				"TTL changed, so a lease can expire between heartbeats while its container "+
-				"runs", store.heartbeats.Load()-before, want)
+			t.Fatalf("the janitor renewed %d times in the ten seconds after the TTL was "+
+				"shortened, want at least %d; its timer is still armed for the cadence it "+
+				"held when the TTL changed, so a lease can expire between heartbeats while "+
+				"its container runs", store.heartbeats.Load()-before, want)
 		}
 
 		time.Sleep(5 * time.Millisecond)

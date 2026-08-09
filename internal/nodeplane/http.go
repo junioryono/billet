@@ -95,9 +95,13 @@ func Handler(log *slog.Logger, p *Plane, store LeaseStore, jit JITSource, opts .
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("POST /v1/register", h.register)
-	mux.HandleFunc("POST /v1/nodes/{node}/poll", h.forNode(h.poll))
+	// POLL AND BIND ARE WHERE WORK IS ACQUIRED, so those are the routes a
+	// superseded process is refused. Everything else it may still call: it may be
+	// holding a container, and cutting it off from heartbeating or reporting is
+	// how a lease ends up owned by nobody.
+	mux.HandleFunc("POST /v1/nodes/{node}/poll", h.forNewWork(h.poll))
 	mux.HandleFunc("POST /v1/nodes/{node}/result", h.forNode(h.result))
-	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/bind", h.forNode(h.bind))
+	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/bind", h.forNewWork(h.bind))
 	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/advance", h.forNode(h.advance))
 	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/heartbeat", h.forNode(h.heartbeat))
 	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/release", h.forNode(h.release))
@@ -124,17 +128,50 @@ type handler struct {
 // would read an empty node name and compare the certificate against nothing —
 // passing every request, and looking exactly like a working check.
 func (h *handler) forNode(next http.HandlerFunc) http.HandlerFunc {
+	return h.guard(next, false)
+}
+
+// forNewWork wraps a route by which a node ACQUIRES work or capacity.
+//
+// SUPERSEDING A NODE MUST NOT SILENCE IT, and treating every route alike was a
+// way to lose a lease outright. A host that is superseded — a copied bundle
+// arriving on a second machine — may well be holding a container right now. It
+// is refused new work, because two hosts under one name cannot both be given
+// work. It is NOT refused the calls that maintain and conclude what it already
+// has: the heartbeat that keeps its lease alive, and the result that hands
+// custody over.
+//
+// Fencing those was worse than not fencing at all. Registration tells the
+// listener the node has custody, so the listener stops heartbeating; if the
+// superseded process can then neither renew nor report, the lease expires while
+// its container runs and the capacity is resold. The tombstone recorded for
+// exactly that report becomes unreachable by the only process that could consume
+// it.
+//
+// The same distinction the expiry rules needed, one layer over: eligibility for
+// NEW work and permission to maintain EXISTING work have different lifetimes.
+func (h *handler) forNewWork(next http.HandlerFunc) http.HandlerFunc {
+	return h.guard(next, true)
+}
+
+func (h *handler) guard(next http.HandlerFunc, fenceSuperseded bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		node := r.PathValue("node")
 
+		// WHO is settled here. A certificate proves the host is entitled to the
+		// name; it cannot say whether this is still the process that registered
+		// under it, because a bundle copied to a second machine authenticates
+		// exactly as well as the original.
 		if !h.authorise(w, r, node) {
 			return
 		}
 
-		// WHO is settled above; WHICH PROCESS is settled here. A certificate proves
-		// the host is entitled to the name; it cannot say whether this is still the
-		// process that registered under it, because a bundle copied to a second
-		// machine authenticates exactly as well as the original.
+		if !fenceSuperseded {
+			next(w, r)
+
+			return
+		}
+
 		if err := h.plane.CheckIncarnation(node, r.Header.Get(nodeapi.HeaderIncarnation)); err != nil {
 			writeErr(w, http.StatusConflict, nodeapi.CodeSuperseded, err.Error())
 
@@ -503,11 +540,37 @@ func (h *handler) jitConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.plane.EntitledToLaunch(r.PathValue("node"), leaseID); err != nil {
+	tier, err := h.plane.EntitledToLaunch(r.PathValue("node"), leaseID)
+	if err != nil {
 		h.log.Warn("refused a runner registration a node was not entitled to",
 			"node", r.PathValue("node"), "lease", leaseID, "scale_set", req.ScaleSetID)
 
 		writeStoreErr(w, err)
+
+		return
+	}
+
+	// AND THE SCALE SET IS PART OF THE ENTITLEMENT. Checking only the lease left a
+	// substitution open: a node holding an ordinary launch for a low-privilege
+	// tier could ask for a registration in ANOTHER set, and the runner it started
+	// would join a tier with different labels, different jobs and possibly
+	// different secrets. The set is resolved here, from the lease's own tier,
+	// rather than taken from the request.
+	set, _, err := h.jit.Describe(r.Context(), tier, "")
+	if err != nil {
+		writeStoreErr(w, err)
+
+		return
+	}
+
+	if set == nil || set.ID != req.ScaleSetID {
+		h.log.Warn("refused a runner registration for a scale set the launch does not name",
+			"node", r.PathValue("node"), "lease", leaseID, "tier", tier,
+			"asked_for", req.ScaleSetID)
+
+		writeErr(w, http.StatusForbidden, nodeapi.CodeRefused, fmt.Sprintf(
+			"lease %s belongs to tier %q, so a registration may be minted in that tier's "+
+				"scale set and no other", leaseID, tier))
 
 		return
 	}
@@ -615,6 +678,10 @@ func writeStoreErr(w http.ResponseWriter, err error) {
 
 // LoopbackOnly reports whether an address is safe to serve the node wire on
 // without TLS.
+//
+// config.LoopbackAddr answers the same question for validation, and the two must
+// agree: whether a node needs a certificate is decided by whether the listener
+// will ask for one.
 //
 // Until mTLS lands the node names itself in the path and nothing verifies that
 // claim, so a listener reachable beyond this host would let anything on the

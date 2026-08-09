@@ -99,7 +99,18 @@ type Bundle struct {
 // authority for which deployment a node belongs to — verifying against this CA
 // is that answer, and registration checks the id it was told for the same reason
 // it always did.
-func LoadOrCreateCA(dir, deployment string) (*CA, error) {
+func LoadOrCreateCA(stateDir, deployment string) (*CA, error) {
+	// THE CALLER NAMES THE STATE DIRECTORY, NOT THE CA DIRECTORY, and that is what
+	// lets the loss marker outlive the thing it witnesses. The marker cannot live
+	// inside the ca directory — the failure it exists for is that directory being
+	// omitted from a backup, which would take the witness with it — and deriving
+	// its location from a parent path is worse than it sounds: two deployments
+	// whose ca directories happen to share a parent would share one marker.
+	//
+	// So the layout is billet's to decide, in one place: the authority lives in
+	// <state_dir>/ca, and the fact that it exists is recorded beside it.
+	dir := CADir(stateDir)
+
 	certPath, keyPath := filepath.Join(dir, "ca.crt"), filepath.Join(dir, "ca.key")
 
 	certPEM, certErr := readPublic(certPath)
@@ -107,14 +118,28 @@ func LoadOrCreateCA(dir, deployment string) (*CA, error) {
 
 	switch {
 	case certErr == nil && keyErr == nil:
-		return parseCA(certPEM, keyPEM, deployment)
+		ca, err := parseCA(certPEM, keyPEM, deployment)
+		if err != nil {
+			return nil, err
+		}
+
+		// BACKFILLED ON A SUCCESSFUL LOAD, so an installation created before the
+		// marker existed is protected from the second boot onwards. Without this,
+		// every deployment that predates this code keeps the old behaviour forever
+		// — the upgrade silently does nothing for exactly the installations that
+		// have the most to lose.
+		if err := noteAuthority(stateDir, deployment); err != nil {
+			return nil, err
+		}
+
+		return ca, nil
 
 	case os.IsNotExist(certErr) && os.IsNotExist(keyErr):
 		// BOTH GONE IS NOT AUTOMATICALLY DAY ONE. The marker below is the only
 		// thing that can tell a first run from a restore that dropped the CA
 		// directory, and getting it wrong mints a new authority that every issued
 		// bundle fails against.
-		if had, err := hadAuthority(dir); err != nil {
+		if had, err := hadAuthority(stateDir); err != nil {
 			return nil, err
 		} else if had {
 			return nil, fmt.Errorf(
@@ -123,10 +148,10 @@ func LoadOrCreateCA(dir, deployment string) (*CA, error) {
 					"certificate this deployment ever issued, and the whole fleet stops "+
 					"connecting at once. Restore the directory from backup, or delete %s to "+
 					"start a new authority deliberately and re-issue every node",
-				ErrAuthorityLost, markerPath(dir), certPath, keyPath, markerPath(dir))
+				ErrAuthorityLost, markerPath(stateDir), certPath, keyPath, markerPath(stateDir))
 		}
 
-		return createCA(dir, certPath, keyPath, deployment)
+		return createCA(stateDir, dir, certPath, keyPath, deployment)
 
 	case certErr != nil && !os.IsNotExist(certErr):
 		return nil, fmt.Errorf("wirecert: read %s: %w", certPath, certErr)
@@ -148,7 +173,7 @@ func LoadOrCreateCA(dir, deployment string) (*CA, error) {
 		ErrHalfInitialised, present, missing)
 }
 
-func createCA(dir, certPath, keyPath, deployment string) (*CA, error) {
+func createCA(stateDir, dir, certPath, keyPath, deployment string) (*CA, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("wirecert: create %s: %w", dir, err)
 	}
@@ -200,7 +225,7 @@ func createCA(dir, certPath, keyPath, deployment string) (*CA, error) {
 	// rather than a certificate whose key was never written.
 	if err := writeSecret(keyPath, keyPEM); err != nil {
 		if os.IsExist(err) {
-			return LoadOrCreateCA(dir, deployment)
+			return LoadOrCreateCA(stateDir, deployment)
 		}
 
 		return nil, err
@@ -214,7 +239,7 @@ func createCA(dir, certPath, keyPath, deployment string) (*CA, error) {
 	// exists here. The marker's only job is to make a later ABSENCE meaningful:
 	// an empty directory is day one, and an empty directory that once held an
 	// authority is a loss.
-	if err := writePublic(markerPath(dir), []byte(deployment+"\n")); err != nil {
+	if err := noteAuthority(stateDir, deployment); err != nil {
 		return nil, err
 	}
 
@@ -235,11 +260,47 @@ func createCA(dir, certPath, keyPath, deployment string) (*CA, error) {
 }
 
 // markerPath names the file that records an authority once existed here.
-func markerPath(dir string) string { return filepath.Join(dir, "authority-created") }
+//
+// BESIDE THE CA DIRECTORY, NOT INSIDE IT, because a witness that disappears with
+// the thing it witnesses is not a witness. The failure this whole mechanism
+// exists for — a backup or a provisioning script that omits the ca directory —
+// took the marker with it in the first version, hadAuthority answered false, and
+// a replacement authority was minted exactly as before.
+func markerPath(stateDir string) string {
+	return filepath.Join(stateDir, "authority-created")
+}
 
-// hadAuthority reports whether one was ever created in this directory.
-func hadAuthority(dir string) (bool, error) {
-	_, err := os.Stat(markerPath(dir))
+// CADir is where a deployment's authority lives inside its state directory.
+func CADir(stateDir string) string { return filepath.Join(stateDir, "ca") }
+
+// noteAuthority records that an authority exists, idempotently.
+func noteAuthority(stateDir, deployment string) error {
+	path := markerPath(stateDir)
+
+	if _, err := os.Stat(path); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("wirecert: read %s: %w", path, err)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("wirecert: create %s: %w", filepath.Dir(path), err)
+	}
+
+	if err := writePublic(path, []byte(deployment+"\n")); err != nil {
+		if os.IsExist(err) {
+			return nil // another process won; the fact is what matters, not the writer
+		}
+
+		return err
+	}
+
+	return syncDir(filepath.Dir(path))
+}
+
+// hadAuthority reports whether one was ever created for this directory.
+func hadAuthority(stateDir string) (bool, error) {
+	_, err := os.Stat(markerPath(stateDir))
 	if err == nil {
 		return true, nil
 	}
@@ -248,7 +309,7 @@ func hadAuthority(dir string) (bool, error) {
 		return false, nil
 	}
 
-	return false, fmt.Errorf("wirecert: read %s: %w", markerPath(dir), err)
+	return false, fmt.Errorf("wirecert: read %s: %w", markerPath(stateDir), err)
 }
 
 func parseCA(certPEM, keyPEM []byte, deployment string) (*CA, error) {
@@ -525,6 +586,14 @@ func ServerTLS(b Bundle) (*tls.Config, error) {
 }
 
 // ClientTLS is a node's side of the wire.
+//
+// VERIFIES THE LEAF AGAINST ITS OWN CA, which the first version did not: it
+// checked that the certificate and key were a pair and separately parsed the
+// root, and never asked whether the two halves belonged together. A bundle whose
+// node.crt came from one deployment and whose ca.crt came from another loaded
+// cleanly — and since the node adopts its DEPLOYMENT from the leaf, it wrote the
+// wrong identity permanently, trusted a server that would reject it, and then
+// refused the correct bundle as a conflict.
 func ClientTLS(b Bundle) (*tls.Config, error) {
 	cert, err := tls.X509KeyPair(b.CertPEM, b.KeyPEM)
 	if err != nil {
@@ -534,6 +603,20 @@ func ClientTLS(b Bundle) (*tls.Config, error) {
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(b.CAPEM) {
 		return nil, errors.New("wirecert: the CA certificate could not be parsed for verification")
+	}
+
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		return nil, fmt.Errorf("wirecert: parse the node certificate: %w", err)
+	}
+
+	if _, err := leaf.Verify(x509.VerifyOptions{
+		Roots:     pool,
+		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}); err != nil {
+		return nil, fmt.Errorf(
+			"wirecert: this node's certificate was not issued by the authority beside it, so "+
+				"the control plane would reject it: %w", err)
 	}
 
 	return &tls.Config{

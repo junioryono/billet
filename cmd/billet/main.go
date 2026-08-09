@@ -509,15 +509,6 @@ func runServer(ctx context.Context, cfg *config.Config, dryRun, dev bool) error 
 	return nil
 }
 
-// caDir is where a deployment keeps its node-wire authority.
-//
-// Beside the state directory rather than inside it, because the state directory
-// is the one an operator is told they may delete to start over. Losing the CA
-// means re-issuing every node certificate by hand.
-func caDir(cfg *config.Config) string {
-	return filepath.Join(cfg.Server.StateDir, "ca")
-}
-
 // nodeTLSHosts is what a node will type to reach this control plane.
 //
 // A WILDCARD LISTEN ADDRESS ANSWERS A DIFFERENT QUESTION than this one. It says
@@ -584,7 +575,7 @@ func serveNodeWire(
 			return nil, err
 		}
 
-		ca, err := wirecert.LoadOrCreateCA(caDir(cfg), deployment)
+		ca, err := wirecert.LoadOrCreateCA(cfg.Server.StateDir, deployment)
 		if err != nil {
 			return nil, err
 		}
@@ -1096,7 +1087,7 @@ func cmdCAIssue(args []string) error {
 		return err
 	}
 
-	ca, err := wirecert.LoadOrCreateCA(caDir(cfg), deployment)
+	ca, err := wirecert.LoadOrCreateCA(cfg.Server.StateDir, deployment)
 	if err != nil {
 		return err
 	}
@@ -1152,13 +1143,13 @@ func cmdCAShow(args []string) error {
 		return err
 	}
 
-	ca, err := wirecert.LoadOrCreateCA(caDir(cfg), deployment)
+	ca, err := wirecert.LoadOrCreateCA(cfg.Server.StateDir, deployment)
 	if err != nil {
 		return err
 	}
 
 	fmt.Printf("deployment %s\nauthority   %s\nexpires     %s\n",
-		deployment, caDir(cfg), ca.NotAfter().Format(time.RFC3339))
+		deployment, wirecert.CADir(cfg.Server.StateDir), ca.NotAfter().Format(time.RFC3339))
 
 	return nil
 }

@@ -280,7 +280,7 @@ func (r *Runner) renewEvery() time.Duration {
 // go. Doing that here would put teardown on a path that must stay cheap and
 // never block.
 func (r *Runner) renewHeld(ctx context.Context) {
-	for _, c := range r.custodySnapshot() {
+	for _, c := range r.renewSnapshot() {
 		err := r.alloc.Heartbeat(ctx, c.leaseID, c.epoch)
 		if err == nil || ctx.Err() != nil {
 			continue
@@ -513,23 +513,44 @@ func (r *Runner) custodySnapshot() []*custody {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	out := make([]*custody, 0, len(r.custody))
+	for _, c := range r.custody {
+		out = append(out, c)
+	}
+
+	return out
+}
+
+// renewSnapshot is everything whose lease this node must keep alive.
+//
+// WIDER THAN CUSTODY, AND ONLY FOR RENEWAL. A launch in progress needs its lease
+// renewed for exactly the same reason a custody entry does — for its duration
+// nobody else is doing it — but it is not custody and must not be TENDED.
+//
+// Putting the launching entries into custodySnapshot instead was a real bug and
+// an instructive one: Tend iterates that same snapshot to decide which compute
+// is finished and release its lease, so a launch still in progress was handed to
+// teardown. It carries no outcome, so the release failed with `invalid phase
+// transition: "" is not terminal`, and the container it had just started was
+// left with a lease the node had already stopped tracking.
+//
+// The gap it closes is real, so the fix is a second view rather than a revert:
+//
+// Across the wire, the control plane stops waiting after the command timeout and
+// hands the listener custody, which stops the listener heartbeating. The node is
+// meanwhile still inside provider.Launch, pulling a large image, and adopts
+// nothing until that call returns. Between those two moments the lease has no
+// owner at all: the reaper releases its capacity, the allocator sells it to
+// another job, and then the launch completes onto hardware already spoken for.
+func (r *Runner) renewSnapshot() []*custody {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	out := make([]*custody, 0, len(r.custody)+len(r.launching))
 	for _, c := range r.custody {
 		out = append(out, c)
 	}
 
-	// A LAUNCH IN PROGRESS NEEDS RENEWING TOO, and nothing was doing it.
-	//
-	// Across the wire, the control plane stops waiting after the command timeout
-	// and hands the listener custody — which stops heartbeating on the strength of
-	// it. The node meanwhile is still INSIDE provider.Launch, pulling a large
-	// image, and does not adopt anything until that call returns. Between those
-	// two moments the lease has no owner at all: the reaper releases its capacity,
-	// the allocator sells it to another job, and then the launch completes and
-	// starts a second workload on the same hardware.
-	//
-	// So the node renews from the instant it commits to launching, which is the
-	// only moment either side can be sure something is about to exist.
 	for _, c := range r.launching {
 		out = append(out, c)
 	}

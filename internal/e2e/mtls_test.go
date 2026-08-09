@@ -3,17 +3,22 @@ package e2e
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/nodeclient"
 	"github.com/junioryono/billet/internal/nodeplane"
+	"github.com/junioryono/billet/internal/server"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/wirecert"
 )
@@ -55,18 +60,23 @@ func mtlsWire(t *testing.T) (*wirecert.CA, string) {
 		t.Fatalf("create the authority: %v", err)
 	}
 
-	server, err := ca.IssueServer([]string{"127.0.0.1"})
+	serving, err := ca.IssueServer([]string{"127.0.0.1"})
 	if err != nil {
 		t.Fatalf("issue the server certificate: %v", err)
 	}
 
-	conf, err := wirecert.ServerTLS(server)
+	conf, err := wirecert.ServerTLS(serving)
 	if err != nil {
 		t.Fatalf("server tls: %v", err)
 	}
 
 	log := slog.New(slog.DiscardHandler)
 	plane := nodeplane.New(log, wireDeployment, time.Minute)
+
+	// A SHORT POLL WINDOW, because these tests poll to observe a REFUSAL. At the
+	// production window an accepted poll blocks for the best part of a minute,
+	// which turns a fencing assertion into a fifty-second wait.
+	plane.SetPollWindowForTest(200 * time.Millisecond)
 
 	srv := httptest.NewUnstartedServer(
 		nodeplane.Handler(log, plane, mtlsStore{}, nil, nodeplane.RequireClientCert()))
@@ -83,23 +93,38 @@ func mtlsWire(t *testing.T) (*wirecert.CA, string) {
 func mtlsWireWithJIT(t *testing.T) (*wirecert.CA, string) {
 	t.Helper()
 
+	ca, base, _ := mtlsWireWithPlane(t)
+
+	return ca, base
+}
+
+func mtlsWireWithPlane(t *testing.T) (*wirecert.CA, string, *nodeplane.Plane) {
+	t.Helper()
+
+	t.Helper()
+
 	ca, err := wirecert.LoadOrCreateCA(t.TempDir(), wireDeployment)
 	if err != nil {
 		t.Fatalf("create the authority: %v", err)
 	}
 
-	server, err := ca.IssueServer([]string{"127.0.0.1"})
+	serving, err := ca.IssueServer([]string{"127.0.0.1"})
 	if err != nil {
 		t.Fatalf("issue the server certificate: %v", err)
 	}
 
-	conf, err := wirecert.ServerTLS(server)
+	conf, err := wirecert.ServerTLS(serving)
 	if err != nil {
 		t.Fatalf("server tls: %v", err)
 	}
 
 	log := slog.New(slog.DiscardHandler)
 	plane := nodeplane.New(log, wireDeployment, time.Minute)
+
+	// A SHORT POLL WINDOW, because these tests poll to observe a REFUSAL. At the
+	// production window an accepted poll blocks for the best part of a minute,
+	// which turns a fencing assertion into a fifty-second wait.
+	plane.SetPollWindowForTest(200 * time.Millisecond)
 
 	srv := httptest.NewUnstartedServer(
 		nodeplane.Handler(log, plane, mtlsStore{}, alwaysMints{}, nodeplane.RequireClientCert()))
@@ -108,7 +133,7 @@ func mtlsWireWithJIT(t *testing.T) (*wirecert.CA, string) {
 
 	t.Cleanup(srv.Close)
 
-	return ca, srv.URL
+	return ca, srv.URL, plane
 }
 
 // alwaysMints hands out a registration for anything it is asked, so the only
@@ -308,6 +333,11 @@ func TestAWireRequiringCertificatesRefusesAPlainConnection(t *testing.T) {
 	log := slog.New(slog.DiscardHandler)
 	plane := nodeplane.New(log, wireDeployment, time.Minute)
 
+	// A SHORT POLL WINDOW, because these tests poll to observe a REFUSAL. At the
+	// production window an accepted poll blocks for the best part of a minute,
+	// which turns a fencing assertion into a fifty-second wait.
+	plane.SetPollWindowForTest(200 * time.Millisecond)
+
 	// No TLS at all: r.TLS is nil for every request that arrives.
 	srv := httptest.NewServer(
 		nodeplane.Handler(log, plane, mtlsStore{}, nil, nodeplane.RequireClientCert()))
@@ -383,27 +413,133 @@ func TestTwoHostsSharingOneNodeNameAreCaught(t *testing.T) {
 		t.Fatalf("the first host could not register: %v", err)
 	}
 
-	// The first host is working normally at this point.
-	if _, err := first.Lease(t.Context(), "l1"); err != nil {
-		t.Fatalf("the first host was refused before anything superseded it: %v", err)
-	}
-
 	if err := second.Register(t.Context(), config.ProviderDocker, nil, wireDeployment); err != nil {
 		t.Fatalf("the second host could not register: %v", err)
 	}
 
-	// AND NOW THE FIRST IS FENCED. It is still running, still authenticated, and
-	// still convinced it owns the name.
-	_, err = first.Lease(t.Context(), "l1")
-	if !errors.Is(err, nodeclient.ErrSuperseded) {
-		t.Errorf("the superseded host was not fenced (%v); two hosts are acting as one node "+
-			"and their compute cannot be told apart", err)
+	// THE FIRST IS REFUSED NEW WORK. It is still running, still authenticated, and
+	// still convinced it owns the name — and two hosts under one name cannot both
+	// be given work.
+	if _, _, err := first.Poll(t.Context()); !errors.Is(err, nodeclient.ErrSuperseded) {
+		t.Errorf("a superseded host was still offered work (%v); two hosts would act as one "+
+			"node and their compute could not be told apart", err)
 	}
 
-	// The host that registered most recently is the one that works.
+	if err := first.Bind(t.Context(), "l1", 1, "epyc-1"); !errors.Is(err, nodeclient.ErrSuperseded) {
+		t.Errorf("a superseded host still bound a lease: %v", err)
+	}
+
+	// BUT IT IS NOT SILENCED, and that distinction is the whole of the fix. A
+	// superseded host may be holding a container right now. Registration already
+	// told the listener that this lease is the node's, so the listener has stopped
+	// heartbeating — and if this process can neither renew nor report, the lease
+	// expires while its container runs and the capacity is resold.
+	if err := first.Heartbeat(t.Context(), "l1", 1); err != nil {
+		t.Errorf("a superseded host could not renew a lease it may still be holding (%v); "+
+			"nothing else is renewing it, so its capacity is resold under a running "+
+			"container", err)
+	}
+
+	if err := first.Report(t.Context(), nodeapi.CommandResult{ID: "c1", OK: true}); err != nil {
+		t.Errorf("a superseded host could not report a result (%v); the tombstone recorded to "+
+			"hand it custody is unreachable by the only process that could consume it", err)
+	}
+
+	// The host that registered most recently is the one that gets work.
 	if _, err := second.Lease(t.Context(), "l1"); err != nil {
 		t.Errorf("the current host was refused: %v", err)
 	}
+}
+
+// AN OLDER NODE CANNOT SLIP PAST THE FENCE BY SAYING NOTHING.
+//
+// Compatibility has to be scoped to nodes that have not CLAIMED an incarnation,
+// and the first version scoped it to the REQUEST instead: an absent header
+// returned early and accepted everything. A billet predating the field, running
+// beside a current one with a copied bundle, would simply never send it — and
+// both would take work as the same node forever. The fence was disabled by
+// exactly the situation it exists to catch.
+//
+// The same hole existed through registration: an empty claim overwrote a live
+// incarnation, after which every process passed.
+func TestAnOlderNodeCannotSlipPastTheFence(t *testing.T) {
+	t.Parallel()
+
+	ca, base := mtlsWire(t)
+
+	bundle, err := ca.IssueNode("epyc-1")
+	if err != nil {
+		t.Fatalf("issue: %v", err)
+	}
+
+	conf, err := wirecert.ClientTLS(bundle)
+	if err != nil {
+		t.Fatalf("client tls: %v", err)
+	}
+
+	current, err := nodeclient.New(nodeclient.Options{Base: base, Node: "epyc-1", TLS: conf})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+
+	if err := current.Register(t.Context(), config.ProviderDocker, nil, wireDeployment); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	// A build with no notion of incarnations: no header, and no field in the
+	// registration body either.
+	old := &http.Client{Transport: &http.Transport{TLSClientConfig: conf}}
+
+	body := fmt.Sprintf(`{"version":%d,"node":"epyc-1","provider":"docker","deployment":%q}`,
+		nodeapi.Version, wireDeployment)
+
+	status, err := postAs(t, old, base+"/v1/register", body)
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+
+	// It may register — that is the compatibility path — but it must not have
+	// taken the name.
+	if status == http.StatusOK {
+		if _, _, err := current.Poll(t.Context()); errors.Is(err, nodeclient.ErrSuperseded) {
+			t.Error("an older node with no incarnation took the name from the current one")
+		}
+	}
+
+	// And it is refused work of its own, because the name is claimed.
+	status, err = postAs(t, old, base+"/v1/nodes/epyc-1/poll", "")
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+
+	if status != http.StatusConflict {
+		t.Errorf("an older node polled for work as a name another process holds and got %d, "+
+			"want 409; two hosts would take commands as one node", status)
+	}
+}
+
+// postAs sends a literal body as a specific client, which is the only way to
+// speak as a build that does not set the incarnation header.
+func postAs(t *testing.T, c *http.Client, url, body string) (int, error) {
+	t.Helper()
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, url, strings.NewReader(body))
+	if err != nil {
+		return 0, err
+	}
+
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
+	res, err := c.Do(req)
+	if err != nil {
+		return 0, err
+	}
+
+	defer func() { _ = res.Body.Close() }()
+
+	return res.StatusCode, nil
 }
 
 // A RESTART IS NOT A DUPLICATE, and refusing one would be worse than the bug.
@@ -427,6 +563,71 @@ func TestAReconnectingNodeIsNotFenced(t *testing.T) {
 		if _, err := c.Lease(t.Context(), "l1"); err != nil {
 			t.Fatalf("a node that re-registered as itself was fenced: %v", err)
 		}
+	}
+}
+
+// THE SCALE SET IS PART OF THE ENTITLEMENT, not just the lease.
+//
+// Checking only the lease id left a substitution open, and it is the more useful
+// attack of the two: a compromised node holding an ORDINARY launch for a
+// low-privilege tier asks for that lease's own runner name paired with another
+// tier's scale set. The lease check passes. The runner it starts joins a tier
+// with different labels, different jobs, and possibly different secrets.
+//
+// The set is resolved from the lease's own tier now, rather than taken from the
+// request.
+func TestANodeCannotMintIntoAnotherTiersScaleSet(t *testing.T) {
+	t.Parallel()
+
+	ca, base, plane := mtlsWireWithPlane(t)
+
+	c := nodeClient(t, ca, base, "epyc-1", "epyc-1")
+
+	if err := c.Register(t.Context(), config.ProviderDocker, nil, wireDeployment); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	// A genuine launch, in flight and unanswered, so the node is entitled to
+	// exactly one registration.
+	launched := make(chan error, 1)
+
+	go func() {
+		lease := &alloc.Lease{
+			ID:        "l1",
+			Tier:      "billet-2vcpu",
+			VCPU:      2,
+			Memory:    8 * config.GiB,
+			GuestOS:   config.GuestLinux,
+			Providers: []config.ProviderKind{config.ProviderDocker},
+			Epoch:     1,
+		}
+
+		// Buffered and never read: this launch exists to be IN FLIGHT, and its
+		// eventual outcome is not what the test is about.
+		launched <- plane.NewRunner().Launch(t.Context(), lease, server.Job{RequestID: 7})
+	}()
+
+	cmd, ok, err := c.Poll(t.Context())
+	if err != nil || !ok {
+		t.Fatalf("the node was not given the launch: ok=%v err=%v", ok, err)
+	}
+
+	if cmd.Lease == nil || cmd.Lease.ID != "l1" {
+		t.Fatalf("unexpected command: %+v", cmd)
+	}
+
+	// Its own runner name, somebody else's scale set.
+	if _, err := c.JITConfig(t.Context(), 999, "billet-l1", "_work"); err == nil {
+		t.Error("a node minted a registration in a scale set its launch does not name; the " +
+			"runner it starts joins a tier with different labels and possibly different " +
+			"secrets")
+	}
+
+	// And the legitimate request still works, or the check above would be
+	// satisfied by refusing everything.
+	if _, err := c.JITConfig(t.Context(), 7, "billet-l1", "_work"); err != nil {
+		t.Errorf("the launch the node was actually given could not mint its registration: %v",
+			err)
 	}
 }
 
@@ -492,13 +693,26 @@ func TestACertificateFromAnotherDeploymentIsRefused(t *testing.T) {
 	// too meant the CLIENT rejected the server's certificate first — the
 	// handshake failed before the server ever examined the client's, so the test
 	// passed identically with server-side client authentication switched off.
-	conf, err := wirecert.ClientTLS(wirecert.Bundle{
-		CertPEM: foreign.CertPEM,
-		KeyPEM:  foreign.KeyPEM,
-		CAPEM:   ca.CertPEM(),
-	})
+	//
+	// Assembled by hand rather than through ClientTLS, because ClientTLS now
+	// refuses this exact combination: a node whose certificate does not chain to
+	// the authority beside it is stopped on the node, which is the right place. A
+	// real host cannot reach this state — but a hostile one is not obliged to use
+	// billet's constructor, and the server must refuse it regardless.
+	pair, err := tls.X509KeyPair(foreign.CertPEM, foreign.KeyPEM)
 	if err != nil {
-		t.Fatalf("client tls: %v", err)
+		t.Fatalf("key pair: %v", err)
+	}
+
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(ca.CertPEM()) {
+		t.Fatal("could not parse the legitimate authority")
+	}
+
+	conf := &tls.Config{
+		Certificates: []tls.Certificate{pair},
+		RootCAs:      roots,
+		MinVersion:   tls.VersionTLS13,
 	}
 
 	c, err := nodeclient.New(nodeclient.Options{Base: base, Node: "epyc-1", TLS: conf})

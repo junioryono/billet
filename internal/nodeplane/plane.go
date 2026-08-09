@@ -348,7 +348,14 @@ func (p *Plane) Register(
 	}
 
 	n.inflight = map[string]*pending{}
-	n.incarnation = req.Incarnation
+
+	// AN EMPTY CLAIM DOES NOT TAKE THE NAME. An older node registering beside a
+	// current one would otherwise blank the stored incarnation, after which every
+	// process passes the check and the fence is gone — the same bypass as an
+	// absent header, arriving through registration instead.
+	if req.Incarnation != "" {
+		n.incarnation = req.Incarnation
+	}
 	n.provider = req.Provider
 	n.guestOS = req.GuestOS
 	n.lastSeen = p.now()
@@ -383,22 +390,30 @@ var ErrSuperseded = errors.New("nodeplane: another process is registered as this
 
 // CheckIncarnation reports whether a request came from the current node process.
 //
-// An empty claim is accepted from a node that has not registered since this
-// plane learned the field, and from the in-process runner, which has no wire to
-// carry one. It is the MISMATCH that is refused, never the absence: refusing an
-// absent value would take out every node mid-upgrade, which is the moment a
-// control plane most needs its fleet.
+// COMPATIBILITY IS SCOPED TO NODES THAT HAVE NOT CLAIMED ONE, and the first
+// version scoped it to the REQUEST instead — which meant an absent header
+// bypassed the check entirely. An older node running beside a current one would
+// simply never send the header, and both would take work as the same node
+// forever: the fence was disabled by the very thing it exists to catch.
+//
+// So absence is accepted only while the registered node is also absent — a fleet
+// mid-upgrade, or the in-process runner, which has no wire to carry one. Once a
+// process has claimed an incarnation, every later request must carry it.
 func (p *Plane) CheckIncarnation(name, claimed string) error {
-	if claimed == "" {
-		return nil
-	}
-
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	n, ok := p.nodes[name]
 	if !ok || n.incarnation == "" || n.incarnation == claimed {
 		return nil
+	}
+
+	if claimed == "" {
+		return fmt.Errorf(
+			"%w: node %q is registered by process %s and this request carried no incarnation. "+
+				"An older billet is running under the same node name — upgrade it, or check "+
+				"for a certificate bundle copied to two machines",
+			ErrSuperseded, name, n.incarnation)
 	}
 
 	return fmt.Errorf(
@@ -426,13 +441,13 @@ var ErrNotEntitled = errors.New("nodeplane: this node holds no command that enti
 // The lease id carries the entitlement because it is already in the runner name
 // billet chooses (see provider.InstanceName), so a node can only ask for the
 // registration belonging to the launch it was actually told to perform.
-func (p *Plane) EntitledToLaunch(node, leaseID string) error {
+func (p *Plane) EntitledToLaunch(node, leaseID string) (string, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	n, ok := p.nodes[node]
 	if !ok {
-		return fmt.Errorf("%w: %s", ErrUnregistered, node)
+		return "", fmt.Errorf("%w: %s", ErrUnregistered, node)
 	}
 
 	for _, pend := range n.inflight {
@@ -441,11 +456,17 @@ func (p *Plane) EntitledToLaunch(node, leaseID string) error {
 		}
 
 		if pend.cmd.Lease.ID == leaseID {
-			return nil
+			// THE TIER COMES BACK, because the lease id alone is not the whole
+			// entitlement. A node holding an ordinary launch could otherwise ask for
+			// a registration in ANOTHER scale set — the lease check passes, and the
+			// runner it starts joins a tier with different labels, different jobs and
+			// possibly different secrets. The caller resolves this tier's own set and
+			// refuses anything else.
+			return pend.cmd.Lease.Tier, nil
 		}
 	}
 
-	return fmt.Errorf(
+	return "", fmt.Errorf(
 		"%w: node %q was not given a launch for lease %s, so it may not mint a runner "+
 			"registration for it", ErrNotEntitled, node, leaseID)
 }
