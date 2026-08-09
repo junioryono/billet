@@ -408,6 +408,48 @@ func (p *Plane) CheckIncarnation(name, claimed string) error {
 		ErrSuperseded, name, n.incarnation, claimed)
 }
 
+// ErrNotEntitled means a node asked for something no command it holds allows.
+var ErrNotEntitled = errors.New("nodeplane: this node holds no command that entitles it to that")
+
+// EntitledToLaunch reports whether a node is currently executing a launch for
+// this lease.
+//
+// A REGISTERED NODE IS NOT AN ENTITLED ONE, and conflating the two left the JIT
+// endpoint open to anything holding a node certificate. A registration proves
+// which host you are; it says nothing about what work you were given. Without
+// this, a compromised host could ask for runner registrations in a loop — for
+// any scale set, under any name — and start runners that billet never escrowed
+// capacity for, never tracked, and never tears down. That contradicts the one
+// containment property the design claims: that compromising a compute host does
+// not let it mint runners.
+//
+// The lease id carries the entitlement because it is already in the runner name
+// billet chooses (see provider.InstanceName), so a node can only ask for the
+// registration belonging to the launch it was actually told to perform.
+func (p *Plane) EntitledToLaunch(node, leaseID string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	n, ok := p.nodes[node]
+	if !ok {
+		return fmt.Errorf("%w: %s", ErrUnregistered, node)
+	}
+
+	for _, pend := range n.inflight {
+		if pend.cmd.Kind != nodeapi.CommandLaunch || pend.cmd.Lease == nil {
+			continue
+		}
+
+		if pend.cmd.Lease.ID == leaseID {
+			return nil
+		}
+	}
+
+	return fmt.Errorf(
+		"%w: node %q was not given a launch for lease %s, so it may not mint a runner "+
+			"registration for it", ErrNotEntitled, node, leaseID)
+}
+
 // Seen records that a node just spoke, whatever it said.
 //
 // EVERY REQUEST IS EVIDENCE OF LIFE, and taking it only from Poll and Result was

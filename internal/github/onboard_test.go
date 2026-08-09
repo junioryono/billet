@@ -230,6 +230,16 @@ type browser struct {
 	// than the flake, because a genuinely malformed URL failing after the flow
 	// returned would have been discarded as well.
 	getFailures atomic.Int32
+
+	// reached counts requests that got a RESPONSE, whatever became of the body.
+	//
+	// The attempt counter cannot tell "delivered" from "refused", and a refusal
+	// against the flow's own origin is deliberately excused — so without this a
+	// regression that closed the listener before /installed left an attempt
+	// recorded, a refusal forgiven, and every other assertion passing while the
+	// callback was never delivered. A truncated body still counts: the request
+	// reached the handler, which is the fact being asserted.
+	reached atomic.Int32
 	// pending joins the fire-and-forget callback goroutines, so the assertions
 	// cannot read the counter while a request is still deciding its fate.
 	pending  sync.WaitGroup
@@ -541,6 +551,14 @@ func (b *browser) get(ctx context.Context, target string) (string, bool) {
 	}
 
 	resp, err := b.client.Do(req)
+
+	// SCOPED TO THE CALLBACK, which is the request whose delivery cannot be
+	// inferred from anything else. The browser makes several requests in a flow;
+	// counting them all would assert a total that changes whenever the flow does.
+	if err == nil && strings.Contains(target, "/installed") {
+		b.reached.Add(1)
+	}
+
 	if err != nil {
 		// COUNTED BY WHAT WENT WRONG, not by when. Swallowing this is precisely
 		// how the original test reported success while never reaching /installed;
@@ -787,6 +805,19 @@ func TestOnboardEndToEnd(t *testing.T) {
 	// stops the fast path silently regressing into "the poller carried it".
 	if n := b.setupCallbacks.Load(); n != 1 {
 		t.Errorf("setup callback fired %d times, want 1", n)
+	}
+
+	// THE CALLBACK MUST HAVE BEEN ANSWERED, not merely attempted. The counter
+	// above is incremented before the request is made, and a connection refused
+	// against the flow's own origin is excused as an orderly shutdown — so a
+	// regression that closed the listener BEFORE /installed produced exactly this
+	// shape: an attempt recorded, a refusal forgiven, and every remaining
+	// assertion passing while the callback was never delivered.
+	if n := b.reached.Load(); n != 1 {
+		t.Errorf("the setup callback got a response %d times, want 1: it was attempted but "+
+			"never reached the flow's listener, and a refusal against our own origin is "+
+			"excused as an orderly shutdown — so the callback can go undelivered with every "+
+			"other assertion still passing", n)
 	}
 
 	if n := b.getFailures.Load(); n != 0 {

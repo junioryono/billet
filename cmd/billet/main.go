@@ -686,6 +686,16 @@ func nodeBundle(cfg *config.Config) (*wirecert.Bundle, error) {
 		return nil, err
 	}
 
+	// VALIDATED BEFORE ANYTHING IS WRITTEN FROM IT, because the deployment
+	// identity this bundle names is about to be recorded permanently. A malformed
+	// or mixed bundle would otherwise write deployment A into the state directory
+	// and only then fail on the key pair — after which the CORRECT bundle for
+	// deployment B is refused as an identity conflict, and an operator has to
+	// clear state by hand for an enrollment that never succeeded.
+	if _, err := wirecert.ClientTLS(bundle); err != nil {
+		return nil, err
+	}
+
 	// CHECKED HERE, WHERE THE FILES ARE NAMED. The control plane refuses a
 	// mismatch too, but it can only say "you are not who you claim" — this can say
 	// which file on this host holds the wrong certificate, which is the sentence

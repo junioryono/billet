@@ -1068,6 +1068,29 @@ func (c *Config) validateNodeTLS() []error {
 		return errs
 	}
 
+	// A LOOPBACK CONTROL PLANE SERVES PLAINTEXT, so a bundle pointed at one can
+	// never be presented. The server decides by ADDRESS — loopback needs no
+	// transport security because there is nothing between the two processes — and
+	// the node decides by whether it holds a certificate. Those are two
+	// authorities for one fact, and the configuration where they disagree loads
+	// cleanly and then loops forever: the node dials https, the listener speaks
+	// http, and every handshake fails.
+	//
+	// The address is the authority, on both sides. A node on the same machine as
+	// its control plane does not need a bundle, and one that has been given a
+	// bundle is not talking to a control plane on this machine.
+	if isLoopbackHostPort(c.Node.ServerAddr) {
+		errs = append(errs, fmt.Errorf(
+			"node.tls is set but node.server_addr is %q, which is a control plane inside this "+
+				"machine. It serves plain HTTP, because there is nothing between the two "+
+				"processes to authenticate — so this node would dial https and never connect. "+
+				"Remove node.tls, or point node.server_addr at the address the control plane "+
+				"publishes to its fleet",
+			c.Node.ServerAddr))
+
+		return errs
+	}
+
 	for key, path := range map[string]string{
 		"node.tls.cert": c.Node.TLS.CertPath,
 		"node.tls.key":  c.Node.TLS.KeyPath,

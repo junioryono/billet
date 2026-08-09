@@ -326,3 +326,50 @@ func TestANodeRefusesABundleIssuedForSomebodyElse(t *testing.T) {
 		t.Errorf("the error does not name the file holding the wrong certificate: %v", err)
 	}
 }
+
+// A BUNDLE THAT CANNOT BE USED MUST NOT LEAVE AN IDENTITY BEHIND.
+//
+// The deployment a certificate names is recorded permanently, and a node refuses
+// to adopt a different one afterwards — correctly, because its compute carries
+// the old label. So a malformed or mixed bundle that wrote its identity and THEN
+// failed validation would leave the host unable to accept the right bundle
+// without an operator clearing state by hand, for an enrollment that never
+// succeeded.
+func TestAnUnusableBundleLeavesNoIdentityBehind(t *testing.T) {
+	t.Parallel()
+
+	serverCfg := writeCAConfig(t, t.TempDir())
+	out := filepath.Join(t.TempDir(), "bundle")
+
+	if err := cmdCAIssue([]string{"epyc-1", "--config", serverCfg, "--out", out}); err != nil {
+		t.Fatalf("ca issue: %v", err)
+	}
+
+	// A key that belongs to a different certificate, which is what half a copy
+	// looks like.
+	other := filepath.Join(t.TempDir(), "other")
+	if err := cmdCAIssue([]string{"epyc-1", "--config", writeCAConfig(t, t.TempDir()), "--out", other}); err != nil {
+		t.Fatalf("ca issue: %v", err)
+	}
+
+	body, err := os.ReadFile(filepath.Join(other, "node.key"))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(out, "node.key"), body, 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	nodeState := t.TempDir()
+	cfg := nodeConfigFor(t, "epyc-1", nodeState, out)
+
+	if _, err := nodeBundle(cfg); err == nil {
+		t.Fatal("a certificate and an unrelated key were accepted as a bundle")
+	}
+
+	if _, err := os.Stat(filepath.Join(nodeState, "deployment-id")); err == nil {
+		t.Error("the failed enrollment still recorded a deployment identity, so the correct " +
+			"bundle would now be refused as a conflict")
+	}
+}

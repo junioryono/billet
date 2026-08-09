@@ -12,6 +12,7 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/nodeapi"
+	"github.com/junioryono/billet/internal/provider"
 	"github.com/junioryono/billet/internal/wirecert"
 )
 
@@ -479,6 +480,38 @@ func (h *handler) jitConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// BOUND TO A COMMAND, not merely to a registration. A JIT config registers a
+	// runner against the organisation; a node that could ask for one whenever it
+	// liked could start runners billet never escrowed capacity for, never
+	// tracked, and never tears down.
+	//
+	// The runner name billet chooses carries the lease id, so the entitlement is
+	// already in the request: the node may mint exactly the registration for the
+	// launch it was told to perform, and nothing else.
+	leaseID, named := provider.LeaseOf(req.RunnerName)
+
+	// FOR THE MESSAGE, NOT FOR THE DECISION. A name billet did not assign yields
+	// no lease id, and no in-flight launch matches an empty one, so the check
+	// below refuses it either way. Saying which of the two things went wrong is
+	// worth a branch: "that is not a name I assign" and "you were not given that
+	// launch" send an operator to different places.
+	if !named {
+		writeErr(w, http.StatusForbidden, nodeapi.CodeRefused, fmt.Sprintf(
+			"runner name %q was not assigned by billet, so no command entitles this node to "+
+				"a registration for it", req.RunnerName))
+
+		return
+	}
+
+	if err := h.plane.EntitledToLaunch(r.PathValue("node"), leaseID); err != nil {
+		h.log.Warn("refused a runner registration a node was not entitled to",
+			"node", r.PathValue("node"), "lease", leaseID, "scale_set", req.ScaleSetID)
+
+		writeStoreErr(w, err)
+
+		return
+	}
+
 	reg, err := h.jit.JITConfig(r.Context(), req.ScaleSetID, req.RunnerName, req.WorkFolder)
 	if err != nil {
 		// NOT LOGGED WITH THE REQUEST. A failure to mint can carry the runner name
@@ -559,6 +592,8 @@ func writeErr(w http.ResponseWriter, status int, code, msg string) {
 // reworded error becomes an outage.
 func writeStoreErr(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, ErrNotEntitled):
+		writeErr(w, http.StatusForbidden, nodeapi.CodeRefused, err.Error())
 	case errors.Is(err, ErrTakeCustody):
 		// 409, NOT AN ERROR STATUS THE NODE WILL RETRY. The report was accepted;
 		// what is being returned is an instruction about who now holds the lease.

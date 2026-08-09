@@ -78,6 +78,56 @@ func mtlsWire(t *testing.T) (*wirecert.CA, string) {
 	return ca, srv.URL
 }
 
+// mtlsWireWithJIT is the same wire with a minting source attached, so a refusal
+// is the entitlement check speaking rather than the absence of a GitHub client.
+func mtlsWireWithJIT(t *testing.T) (*wirecert.CA, string) {
+	t.Helper()
+
+	ca, err := wirecert.LoadOrCreateCA(t.TempDir(), wireDeployment)
+	if err != nil {
+		t.Fatalf("create the authority: %v", err)
+	}
+
+	server, err := ca.IssueServer([]string{"127.0.0.1"})
+	if err != nil {
+		t.Fatalf("issue the server certificate: %v", err)
+	}
+
+	conf, err := wirecert.ServerTLS(server)
+	if err != nil {
+		t.Fatalf("server tls: %v", err)
+	}
+
+	log := slog.New(slog.DiscardHandler)
+	plane := nodeplane.New(log, wireDeployment, time.Minute)
+
+	srv := httptest.NewUnstartedServer(
+		nodeplane.Handler(log, plane, mtlsStore{}, alwaysMints{}, nodeplane.RequireClientCert()))
+	srv.TLS = conf
+	srv.StartTLS()
+
+	t.Cleanup(srv.Close)
+
+	return ca, srv.URL
+}
+
+// alwaysMints hands out a registration for anything it is asked, so the only
+// thing that can refuse is the entitlement check under test.
+type alwaysMints struct{}
+
+func (alwaysMints) Describe(context.Context, string, string) (*nodeplane.JITSet, []string, error) {
+	return &nodeplane.JITSet{ID: 7, Name: "billet-2vcpu"}, nil, nil
+}
+
+func (alwaysMints) JITConfig(_ context.Context, _ int, runnerName, _ string) (nodeplane.JITRegistration, error) {
+	return mintedFor(runnerName), nil
+}
+
+type mintedFor string
+
+func (m mintedFor) Config() string     { return "a credential" }
+func (m mintedFor) RunnerName() string { return string(m) }
+
 func nodeClient(t *testing.T, ca *wirecert.CA, base, certName, dialAs string) *nodeclient.Client {
 	t.Helper()
 
@@ -380,6 +430,42 @@ func TestAReconnectingNodeIsNotFenced(t *testing.T) {
 	}
 }
 
+// A REGISTERED NODE IS NOT AN ENTITLED ONE, and the JIT endpoint is where that
+// distinction matters most.
+//
+// A JIT config registers a runner against the organisation. A node that could
+// ask for one whenever it liked could start runners billet never escrowed
+// capacity for, never tracked, and never tears down — for any scale set, under
+// any name, in a loop. That contradicts the one containment property the design
+// claims: compromising a compute host must not let it mint runners.
+//
+// A registration proves which host you are. It says nothing about what work you
+// were given, and only a command can say that.
+func TestANodeCannotMintRunnersItWasNotAskedToLaunch(t *testing.T) {
+	t.Parallel()
+
+	ca, base := mtlsWireWithJIT(t)
+
+	c := nodeClient(t, ca, base, "epyc-1", "epyc-1")
+
+	if err := c.Register(t.Context(), config.ProviderDocker, nil, wireDeployment); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	// A well-formed request for a lease this node was never given.
+	_, err := c.JITConfig(t.Context(), 7, "billet-l1", "_work")
+	if err == nil {
+		t.Fatal("a node with no launch in flight minted a runner registration; a compromised " +
+			"host could start unmanaged runners against the organisation")
+	}
+
+	// And a name billet never assigns at all.
+	if _, err := c.JITConfig(t.Context(), 7, "anything-i-like", "_work"); err == nil {
+		t.Error("a runner name billet never assigned was accepted, so the entitlement check " +
+			"has nothing to bind to")
+	}
+}
+
 // A CERTIFICATE FROM ANOTHER DEPLOYMENT NEVER REACHES A HANDLER.
 //
 // Two billet installations on one network are ordinary — a laptop and a server,
@@ -389,14 +475,36 @@ func TestAReconnectingNodeIsNotFenced(t *testing.T) {
 func TestACertificateFromAnotherDeploymentIsRefused(t *testing.T) {
 	t.Parallel()
 
-	_, base := mtlsWire(t)
+	ca, base := mtlsWire(t)
 
 	stranger, err := wirecert.LoadOrCreateCA(t.TempDir(), "ffffffffffffffffffffffffffffffff")
 	if err != nil {
 		t.Fatalf("create the other authority: %v", err)
 	}
 
-	c := nodeClient(t, stranger, base, "epyc-1", "epyc-1")
+	foreign, err := stranger.IssueNode("epyc-1")
+	if err != nil {
+		t.Fatalf("issue: %v", err)
+	}
+
+	// THE FOREIGN IDENTITY, THE LEGITIMATE TRUST ROOT, and getting that pairing
+	// wrong made this test prove nothing. Configuring RootCAs from the stranger
+	// too meant the CLIENT rejected the server's certificate first — the
+	// handshake failed before the server ever examined the client's, so the test
+	// passed identically with server-side client authentication switched off.
+	conf, err := wirecert.ClientTLS(wirecert.Bundle{
+		CertPEM: foreign.CertPEM,
+		KeyPEM:  foreign.KeyPEM,
+		CAPEM:   ca.CertPEM(),
+	})
+	if err != nil {
+		t.Fatalf("client tls: %v", err)
+	}
+
+	c, err := nodeclient.New(nodeclient.Options{Base: base, Node: "epyc-1", TLS: conf})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
 
 	err = c.Register(t.Context(), config.ProviderDocker, nil, wireDeployment)
 	if err == nil {
