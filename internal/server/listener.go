@@ -231,7 +231,11 @@ type Listener struct {
 	// sits in `running` and this listener heartbeats it for the life of the
 	// process. Retrying on the renewal clock is what turns "held" into something
 	// other than a leak.
-	cleanup map[int64]Job
+	// Entries carry their own next-attempt time, because a node that is never
+	// coming back must not occupy every pass ahead of one that has just recovered:
+	// retries are sequential and a single Destroy can wait the full node command
+	// timeout, so N hopeless entries cost N times that before a live one is tried.
+	cleanup map[int64]*pendingCleanup
 	// acquiring is escrow PROMISED to a request billet has claimed from GitHub but
 	// has not yet been given, keyed by the request id it was promised to.
 	//
@@ -258,6 +262,15 @@ type Listener struct {
 	// stalePromise is how long a promise may go unclaimed before it is reported.
 	stalePromise time.Duration
 
+	// shutdownGrace bounds the teardown, so an unbounded Destroy or session close
+	// cannot keep Run — and the renewal that outlives it — running forever.
+	shutdownGrace time.Duration
+
+	// retryFirst and retryMax pace the cleanup retries. retryFirst <= 0 turns
+	// pacing off entirely, which only tests ask for.
+	retryFirst time.Duration
+	retryMax   time.Duration
+
 	// runner turns assigned leases into compute. Never nil; see noRunner.
 	runner Runner
 
@@ -270,13 +283,17 @@ type Listener struct {
 // NewListener builds a listener for one tier.
 func NewListener(a *alloc.Allocator, tier string, session Session, opts ...Option) *Listener {
 	l := &Listener{
-		alloc:        a,
-		tier:         tier,
-		session:      session,
-		log:          slog.Default(),
-		running:      make(map[int64]*alloc.Lease),
-		acquiring:    make(map[int64]*promise),
-		stalePromise: defaultStalePromise,
+		alloc:         a,
+		tier:          tier,
+		session:       session,
+		log:           slog.Default(),
+		running:       make(map[int64]*alloc.Lease),
+		acquiring:     make(map[int64]*promise),
+		cleanup:       make(map[int64]*pendingCleanup),
+		stalePromise:  defaultStalePromise,
+		shutdownGrace: defaultShutdownGrace,
+		retryFirst:    firstRetryEvery,
+		retryMax:      maxRetryEvery,
 	}
 
 	for _, opt := range opts {
@@ -318,6 +335,51 @@ type promise struct {
 	reported bool
 }
 
+// pendingCleanup is a completion whose destroy has not succeeded yet.
+type pendingCleanup struct {
+	job Job
+	// wait is how long to leave it after the most recent failure, doubling each
+	// time up to maxRetryEvery.
+	wait time.Duration
+	// at is when it may next be attempted. Zero means immediately, which is what
+	// a freshly recorded failure wants: the node may have blinked.
+	at time.Time
+}
+
+// due reports whether this entry may be attempted at the given moment.
+func (p *pendingCleanup) due(now time.Time) bool {
+	return !now.Before(p.at)
+}
+
+// failed pushes the next attempt out, doubling the wait to a ceiling.
+//
+// The FIRST failure is what created the entry, so the first retry is immediate:
+// the overwhelmingly common case is a node that was briefly busy, and making it
+// wait would slow down every ordinary recovery to protect against the rare
+// permanent one.
+func (p *pendingCleanup) failed(now time.Time, first, ceiling time.Duration) {
+	if first <= 0 {
+		// Pacing off. Used by tests whose subject is what a retry DOES rather than
+		// when it runs; the pacing itself has a test of its own.
+		p.wait, p.at = 0, time.Time{}
+
+		return
+	}
+
+	switch {
+	case p.wait == 0:
+		p.wait = first
+	case p.wait < ceiling:
+		p.wait *= 2
+	}
+
+	if p.wait > ceiling {
+		p.wait = ceiling
+	}
+
+	p.at = now.Add(p.wait)
+}
+
 // defaultStalePromise is how long a promise may go unclaimed before billet says
 // so. It is a DIAGNOSTIC threshold, not a deadline.
 //
@@ -334,6 +396,23 @@ type promise struct {
 // genuinely still owes. See TestAStalePromiseIsReportedAndKept.
 const defaultStalePromise = 5 * time.Minute
 
+const (
+	// firstRetryEvery is the pause after a retry fails for the first time.
+	firstRetryEvery = 15 * time.Second
+	// maxRetryEvery is the ceiling. A node that has been refusing for this long is
+	// not about to answer sooner for being asked more often, and the point of the
+	// ceiling is that it keeps asking at all.
+	maxRetryEvery = 5 * time.Minute
+	// defaultShutdownGrace bounds the whole teardown.
+	//
+	// Renewal no longer stops when the caller cancels, which is what lets the
+	// release destroy compute without the reaper taking the capacity underneath
+	// it. The cost of that is a wedged teardown renewing leases forever while Run
+	// never returns — so the teardown gets a deadline of its own. Longer than any
+	// ordinary destroy, short enough that an operator's interrupt is answered.
+	defaultShutdownGrace = 90 * time.Second
+)
+
 // Option configures a Listener.
 type Option func(*Listener)
 
@@ -341,6 +420,31 @@ type Option func(*Listener)
 // billet reports it. It does not reclaim anything — see defaultStalePromise.
 func WithStalePromiseAfter(d time.Duration) Option {
 	return func(l *Listener) { l.stalePromise = d }
+}
+
+// WithShutdownGrace bounds the teardown: how long the listener will spend
+// destroying compute and closing its session before giving up and letting the
+// reaper deal with what is left.
+//
+// Worth setting on a deployment whose provider is genuinely slow to destroy —
+// the alternative to a grace that is too short is not a cleaner shutdown, it is
+// leases nobody releases and containers nobody removes.
+func WithShutdownGrace(d time.Duration) Option {
+	return func(l *Listener) { l.shutdownGrace = d }
+}
+
+// WithCleanupRetryPacing sets how long a failed cleanup retry waits before the
+// next attempt, and the ceiling that wait doubles towards.
+//
+// A first value of zero or less turns pacing off, so every pass tries every
+// pending record. That is only ever what a test wants: in production it lets one
+// permanently unreachable node occupy each pass ahead of a node that has just
+// come back, because retries are sequential and a Destroy can wait the full node
+// command timeout.
+func WithCleanupRetryPacing(first, ceiling time.Duration) Option {
+	return func(l *Listener) {
+		l.retryFirst, l.retryMax = first, ceiling
+	}
 }
 
 // WithLogger sets the logger. The default is slog.Default().
@@ -445,6 +549,18 @@ func (l *Listener) Run(ctx context.Context) error {
 	// of all things. It was split across Run and its caller, and Go's defer order
 	// put them the wrong way round.
 	defer func() {
+		// BOUNDED, because renewal no longer stops when the caller cancels.
+		//
+		// That is what lets the release destroy compute without the reaper taking
+		// the capacity underneath it, and the price is a teardown that can no
+		// longer be ended from outside: a Destroy or a session Close that ignores
+		// cancellation would leave Run wedged forever, renewing every lease it
+		// holds so the reaper can never reclaim them either, and the process unable
+		// to exit. Neither Runner nor Session promises a bound, so the listener
+		// imposes one.
+		stopCtx, endGrace := context.WithTimeout(context.WithoutCancel(ctx), l.shutdownGrace)
+		defer endGrace()
+
 		// RENEWAL STOPS LAST, so it is deferred first. The release below destroys
 		// whatever is still running, which is slow and remote, and every lease it
 		// has not reached yet has to keep being renewed while it works.
@@ -453,15 +569,60 @@ func (l *Listener) Run(ctx context.Context) error {
 			beating.Wait()
 		}()
 
+		// AND IT STOPS ON THE GRACE EVEN IF THE TEARDOWN NEVER FINISHES, which a
+		// deadline on its own cannot deliver.
+		//
+		// The grace bounds everything that honours a context: the wait below, and
+		// any Session or Runner that respects the one it is handed. NOTHING can
+		// bound a Destroy that ignores its context outright, and neither interface
+		// forbids one — so a bad implementation can still wedge Run, and pretending
+		// otherwise would be the more dangerous comment to leave here.
+		//
+		// What must not ALSO happen is that a wedged listener goes on renewing.
+		// That is what stops the reaper reclaiming, turning one stuck teardown into
+		// capacity no operator gets back without killing the process. So renewal
+		// has a deadline of its own: a wedged listener leaks a goroutine and says
+		// so, and the ledger recovers without it.
+		guard := make(chan struct{})
+		defer close(guard)
+
+		go func() {
+			select {
+			case <-stopCtx.Done():
+				l.log.Error("this listener's teardown outran its shutdown grace; renewal is "+
+					"stopping so the reaper can reclaim what it still holds, but the compute "+
+					"it was destroying may still be running on its host",
+					"tier", l.tier, "grace", l.shutdownGrace)
+
+				stopBeating()
+			case <-guard:
+			}
+		}()
+
 		// AND CLEANUP IS STOPPED AND JOINED BEFORE ANY OF IT. Cancelling was not
 		// enough: a retry blocked in a remote Destroy outlived Run, and came back
 		// to call alloc.Release against a database the caller had every right to
 		// have closed by then. Nothing joined it, so the only thing deciding
 		// whether that happened was how long the node took to answer.
+		//
+		// The wait is bounded by the same grace: a runner that ignores its context
+		// must not be able to hold the process open, and a bounded misbehaviour
+		// that says so is better than an unbounded one that does not.
 		stopSweeping()
-		sweeping.Wait()
 
-		stopCtx := context.WithoutCancel(ctx)
+		if !waitWithin(stopCtx, &sweeping) {
+			l.log.Error("a cleanup retry did not return within the shutdown grace; it may "+
+				"still release a lease after this listener has stopped",
+				"tier", l.tier, "grace", l.shutdownGrace)
+		}
+
+		// WHAT THE RELEASE WILL NOT COVER, done while there is still grace for it.
+		// releaseAll visits held, running and acquiring; a completion whose lease
+		// was already reaped is in none of them, so without this its container
+		// outlives the process and the obligation lasts only until the next
+		// shutdown — which is not what "only a successful destroy discharges it"
+		// can mean.
+		l.drainCleanup(stopCtx)
 
 		if err := l.session.Close(stopCtx); err != nil {
 			l.log.Warn("could not close message session; capacity is held until it expires",
@@ -636,9 +797,22 @@ func (l *Listener) heartbeatLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			// EACH PASS IS BOUNDED, and it has to be bounded here rather than by the
+			// caller: this context deliberately does not inherit the caller's
+			// cancellation, so without a deadline of its own an allocator call that
+			// never returns holds l.mu forever. The teardown then blocks taking that
+			// mutex, and the defer that would have stopped this loop is behind the
+			// teardown. Renewal deadlocks the shutdown that was waiting for it.
+			//
+			// One interval, so a pass that overruns is abandoned and the next tick
+			// tries again with three chances inside a TTL.
+			pass, endPass := context.WithTimeout(ctx, l.heartbeatInterval())
+
 			l.mu.Lock()
-			l.heartbeatHeld(ctx)
+			l.heartbeatHeld(pass)
 			l.mu.Unlock()
+
+			endPass()
 		}
 	}
 }
@@ -665,20 +839,112 @@ func (l *Listener) cleanupLoop(ctx context.Context) {
 // releasing the lease before the compute is confirmed gone, which complete
 // already refuses to do.
 func (l *Listener) retryCleanup(ctx context.Context) {
+	now := time.Now()
+
 	l.mu.Lock()
 
+	// ONLY THE ONES THAT ARE DUE. Everything here is retried in one sequential
+	// pass and a single Destroy can wait the full node command timeout, so
+	// attempting entries whose node has been refusing for an hour would push the
+	// one that just recovered behind them.
 	pending := make([]Job, 0, len(l.cleanup))
-	for _, job := range l.cleanup {
-		pending = append(pending, job)
+
+	for _, entry := range l.cleanup {
+		if entry.due(now) {
+			pending = append(pending, entry.job)
+		}
 	}
 
 	l.mu.Unlock()
 
 	for _, job := range pending {
-		if err := l.complete(ctx, job); err != nil {
-			l.log.Error("could not finish cleaning up a completed job; will retry",
-				"tier", l.tier, "request", job.RequestID, "error", err)
+		err := l.complete(ctx, job)
+		if err == nil {
+			continue
 		}
+
+		l.log.Error("could not finish cleaning up a completed job; will retry",
+			"tier", l.tier, "request", job.RequestID, "error", err)
+
+		l.backOff(job.RequestID)
+	}
+}
+
+// waitWithin waits for a WaitGroup, giving up when the context is done.
+//
+// Reports whether the wait completed. The watcher goroutine outlives a giving-up
+// caller, which is deliberate: the thing being waited for is by definition
+// misbehaving, and a goroutine parked on a WaitGroup is the cheapest way to
+// contain it.
+func waitWithin(ctx context.Context, wg *sync.WaitGroup) bool {
+	done := make(chan struct{})
+
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// drainCleanup destroys compute for completions whose lease is already gone.
+//
+// These are invisible to releaseAll, which walks the lease maps, and the loop
+// that would have retried them has just been stopped. A record whose lease is
+// still held needs nothing here — releaseAll destroys it on the way past.
+func (l *Listener) drainCleanup(ctx context.Context) {
+	l.mu.Lock()
+
+	orphaned := make([]Job, 0, len(l.cleanup))
+
+	for id, entry := range l.cleanup {
+		if _, running := l.running[id]; running {
+			continue
+		}
+
+		if _, promised := l.acquiring[id]; promised {
+			continue
+		}
+
+		orphaned = append(orphaned, entry.job)
+	}
+
+	l.mu.Unlock()
+
+	// IGNORING THE BACKOFF, deliberately. It exists so a hopeless entry cannot
+	// crowd out a live one across repeated passes; this is the last pass there
+	// will ever be, so the only thing waiting achieves is losing the work.
+	for _, job := range orphaned {
+		if err := l.runner.Destroy(ctx, job.RequestID); err != nil {
+			l.log.Error("could not destroy the compute for a completed job before stopping; "+
+				"it is still running on its host and no lease accounts for it, so nothing "+
+				"will reclaim it until that host is swept or restarted",
+				"tier", l.tier, "request", job.RequestID, "error", err)
+
+			continue
+		}
+
+		l.mu.Lock()
+		delete(l.cleanup, job.RequestID)
+		l.mu.Unlock()
+	}
+}
+
+// backOff pushes a failed retry's next attempt out.
+//
+// Called for a release failure here and from complete for a destroy failure, so
+// both halves of a retry that could not finish are paced the same way.
+func (l *Listener) backOff(requestID int64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if entry, ok := l.cleanup[requestID]; ok {
+		entry.failed(time.Now(), l.retryFirst, l.retryMax)
 	}
 }
 
@@ -772,8 +1038,10 @@ func (l *Listener) renew(ctx context.Context, lease *alloc.Lease) bool {
 	}
 
 	if ctx.Err() != nil {
-		// Shutting down. Keep it: the release path is about to hand it back, and
-		// dropping it here would leak it instead.
+		// Shutting down, or this renewal pass ran out of its own deadline. Keep it
+		// either way: on shutdown the release path is about to hand it back, and on
+		// a slow pass the allocator never said this lease was not ours. Dropping it
+		// would stop advertising capacity billet still holds, on no evidence.
 		return true
 	}
 
@@ -1362,12 +1630,18 @@ func (l *Listener) complete(ctx context.Context, job Job) error {
 		// while the lease lived on for the reaper — and recording those would grow
 		// the map with entries whose retry can never accomplish anything.
 		_, held := l.running[job.RequestID]
-		if _, promised := l.acquiring[job.RequestID]; held || promised {
+
+		if entry, ok := l.cleanup[job.RequestID]; ok {
+			// A RETRY THAT FAILED AGAIN, so it waits longer before the next one.
+			entry.failed(time.Now(), l.retryFirst, l.retryMax)
+		} else if _, promised := l.acquiring[job.RequestID]; held || promised {
 			if l.cleanup == nil {
-				l.cleanup = make(map[int64]Job)
+				l.cleanup = make(map[int64]*pendingCleanup)
 			}
 
-			l.cleanup[job.RequestID] = job
+			// Recorded ready to run: the first retry is immediate because a node
+			// that was briefly busy is far and away the common case.
+			l.cleanup[job.RequestID] = &pendingCleanup{job: job}
 		}
 
 		// AND AN EXISTING RECORD IS NEVER DROPPED HERE, which is a different rule
@@ -1385,6 +1659,22 @@ func (l *Listener) complete(ctx context.Context, job Job) error {
 		// runner is plugged in — with a non-sweeping one, nothing destroys the
 		// container until the host restarts. An obligation is not discharged by
 		// noticing that something else would probably have covered it.
+		//
+		// The pile-up this can cause is real, and an earlier version of this comment
+		// argued it away incorrectly. The claim was that a record's lease stays in
+		// `running` being renewed, so its capacity is never reissued and the map is
+		// bounded by the tier's capacity. That holds only while the lease is OURS —
+		// and the case this whole rule is about is the one where it is not. Once the
+		// lease is reaped the capacity IS reissued, a new job can take it, complete,
+		// fail to destroy, and add another record. Ownership loss is exactly what
+		// unbinds the growth.
+		//
+		// So retention needs scheduling around it rather than a reassuring argument:
+		// entries back off (retryEvery, capped at maxRetryEvery) so a node that is
+		// never coming back cannot occupy every pass ahead of one that has just
+		// recovered. What that does NOT fix is surviving a restart — the map is in
+		// memory, so a process that dies still forgets. That needs durable cleanup
+		// state and is tracked separately.
 
 		l.mu.Unlock()
 

@@ -1758,6 +1758,9 @@ func TestASlowCleanupDoesNotStarveRenewal(t *testing.T) {
 
 	// A destroy that blocks the way an unreachable node does.
 	blocked := make(chan struct{})
+	unblock := sync.OnceFunc(func() { close(blocked) })
+
+	t.Cleanup(unblock)
 	entered := make(chan struct{}, 1)
 
 	runner := &fakeRunner{onDestroy: func(int64) error {
@@ -1778,7 +1781,7 @@ func TestASlowCleanupDoesNotStarveRenewal(t *testing.T) {
 	// A completion whose destroy already failed, so the loop has something to
 	// retry as soon as Run starts it.
 	l.mu.Lock()
-	l.cleanup = map[int64]Job{7: {RequestID: 7}}
+	l.cleanup = map[int64]*pendingCleanup{7: {job: Job{RequestID: 7}}}
 	l.mu.Unlock()
 
 	runDone := make(chan struct{})
@@ -1826,9 +1829,9 @@ func TestASlowCleanupDoesNotStarveRenewal(t *testing.T) {
 	// The blocked goroutine belongs to Run, so nothing else joins it — and if it
 	// resumed after the test closed the database, its release would race that
 	// close.
-	close(blocked)
+	unblock()
 
-	for pendingCleanup(l) > 0 {
+	for cleanupCount(l) > 0 {
 		select {
 		case <-time.After(20 * time.Millisecond):
 		case <-ctx.Done():
@@ -1861,13 +1864,28 @@ func TestRunWaitsForACleanupStillInTheProvider(t *testing.T) {
 		alloc.WithLeaseTTL(ttl))
 
 	blocked := make(chan struct{})
+	unblock := sync.OnceFunc(func() { close(blocked) })
+
+	t.Cleanup(unblock)
+
 	entered := make(chan struct{}, 1)
 
+	// ONLY THE FIRST CALL BLOCKS, and that is what isolates the join.
+	//
+	// If every call blocked, the shutdown drain would block as well and Run would
+	// wait THERE instead — so the test passed with the join deleted, because
+	// something else happened to be slow in the same place. A mutation run found
+	// that, not review. The first call is the cleanup loop's retry; the drain's
+	// later call returns at once, leaving the join as the only thing that can
+	// keep Run from returning while that retry is still inside the provider.
+	var firstCall atomic.Bool
+
 	runner := &fakeRunner{onDestroy: func(int64) error {
-		select {
-		case entered <- struct{}{}:
-		default:
+		if !firstCall.CompareAndSwap(false, true) {
+			return nil
 		}
+
+		entered <- struct{}{}
 
 		<-blocked
 
@@ -1877,11 +1895,20 @@ func TestRunWaitsForACleanupStillInTheProvider(t *testing.T) {
 	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner))
 
 	l.mu.Lock()
-	l.cleanup = map[int64]Job{7: {RequestID: 7}}
+	l.cleanup = map[int64]*pendingCleanup{7: {job: Job{RequestID: 7}}}
 	l.mu.Unlock()
 
 	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
 	defer cancel()
+
+	// CAUSAL, not merely temporal. The timed check below can only ever say "Run
+	// had not returned yet", which a descheduled goroutine satisfies too. This
+	// records whether the destroy had come back at the moment Run returned, which
+	// is the actual property and cannot be faked by scheduling.
+	var (
+		released atomic.Bool
+		tooEarly atomic.Bool
+	)
 
 	runDone := make(chan struct{})
 
@@ -1890,6 +1917,10 @@ func TestRunWaitsForACleanupStillInTheProvider(t *testing.T) {
 
 		if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			t.Errorf("Run: %v", err)
+		}
+
+		if !released.Load() {
+			tooEarly.Store(true)
 		}
 	}()
 
@@ -1903,10 +1934,7 @@ func TestRunWaitsForACleanupStillInTheProvider(t *testing.T) {
 
 	cancel()
 
-	// STILL RUNNING, because the destroy has not come back. A generous window: the
-	// failure being ruled out is Run returning immediately, so any wait long
-	// enough to distinguish "blocked" from "returned" will do, and a longer one
-	// only makes a false pass less likely.
+	// STILL RUNNING, because the destroy has not come back.
 	select {
 	case <-runDone:
 		t.Fatal("Run returned while a cleanup retry was still inside the provider; that " +
@@ -1915,12 +1943,19 @@ func TestRunWaitsForACleanupStillInTheProvider(t *testing.T) {
 	case <-time.After(500 * time.Millisecond):
 	}
 
-	close(blocked)
+	released.Store(true)
+	unblock()
 
 	select {
 	case <-runDone:
 	case <-time.After(30 * time.Second):
 		t.Fatal("Run never returned after the node answered")
+	}
+
+	if tooEarly.Load() {
+		t.Fatal("Run returned before the cleanup retry had left the provider; the join is " +
+			"what makes that impossible, and without it the retry outlives Run and " +
+			"releases against state the caller has already torn down")
 	}
 }
 
@@ -1946,6 +1981,9 @@ func TestRenewalOutlivesTheShutdownRelease(t *testing.T) {
 		alloc.WithLeaseTTL(ttl))
 
 	blocked := make(chan struct{})
+	unblock := sync.OnceFunc(func() { close(blocked) })
+
+	t.Cleanup(unblock)
 	entered := make(chan struct{}, 1)
 
 	runner := &fakeRunner{onDestroy: func(int64) error {
@@ -2006,7 +2044,7 @@ func TestRenewalOutlivesTheShutdownRelease(t *testing.T) {
 			"the host, so another tier can escrow it", err)
 	}
 
-	close(blocked)
+	unblock()
 
 	select {
 	case <-runDone:
@@ -2015,8 +2053,236 @@ func TestRenewalOutlivesTheShutdownRelease(t *testing.T) {
 	}
 }
 
-// pendingCleanup reports how many completions are waiting to be retried.
-func pendingCleanup(l *Listener) int {
+// A FAILED RETRY WAITS BEFORE THE NEXT ONE, so a node that is never coming back
+// cannot occupy every pass.
+//
+// Retries run in one sequential pass and a single Destroy can wait the full node
+// command timeout, so N hopeless records cost N timeouts before a node that has
+// just recovered is tried at all. Keeping records until the destroy succeeds —
+// which is correct — is what makes this matter, because ownership loss lets the
+// count grow past the tier's capacity.
+func TestAFailedRetryWaitsBeforeTheNextOne(t *testing.T) {
+	t.Parallel()
+
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+
+	var attempts atomic.Int32
+
+	runner := &fakeRunner{onDestroy: func(int64) error {
+		attempts.Add(1)
+
+		return errors.New("the node is not answering")
+	}}
+
+	// A wait far longer than the test, so "waited" and "did not wait" cannot be
+	// confused by timing.
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner),
+		WithCleanupRetryPacing(time.Hour, time.Hour))
+
+	holdRunning(t, l, a, tiers[0].Label, 7)
+
+	if err := l.complete(t.Context(), Job{RequestID: 7}); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("the completion's own destroy did not run: %d attempts", got)
+	}
+
+	// THE FIRST RETRY IS IMMEDIATE. A node that was briefly busy is the common
+	// case by a wide margin, and making it wait would slow every ordinary recovery
+	// to guard against the rare permanent one.
+	l.retryCleanup(t.Context())
+
+	if got := attempts.Load(); got != 2 {
+		t.Fatalf("the first retry did not run immediately: %d attempts", got)
+	}
+
+	// Having failed, it waits.
+	l.retryCleanup(t.Context())
+
+	if got := attempts.Load(); got != 2 {
+		t.Errorf("a retry that had just failed was attempted again on the very next pass "+
+			"(%d attempts); with a node that is never coming back, every such record "+
+			"costs a destroy timeout ahead of one whose node has recovered", got)
+	}
+
+	// And when it comes due it runs again — the pacing is a delay, not a give-up.
+	l.mu.Lock()
+	l.cleanup[7].at = time.Now().Add(-time.Second)
+	l.mu.Unlock()
+
+	l.retryCleanup(t.Context())
+
+	if got := attempts.Load(); got != 3 {
+		t.Errorf("a retry that had come due was not attempted (%d attempts); the backoff "+
+			"is meant to pace the work, not abandon it", got)
+	}
+}
+
+// SHUTDOWN DESTROYS COMPLETIONS WHOSE LEASE IS ALREADY GONE.
+//
+// releaseAll walks the lease maps — held, running, acquiring — so a record whose
+// lease was reaped is in none of them, and the loop that would have retried it
+// has just been stopped. Without a drain the obligation to destroy that
+// container lasts exactly until the next shutdown, which is not what "only a
+// successful destroy discharges it" can mean.
+func TestShutdownDestroysCompletionsWhoseLeaseIsGone(t *testing.T) {
+	t.Parallel()
+
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+
+	destroyed := make(chan int64, 4)
+
+	runner := &fakeRunner{onDestroy: func(id int64) error {
+		destroyed <- id
+
+		return nil
+	}}
+
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner))
+
+	// A record with NO lease behind it, which is the whole point: nothing in the
+	// lease maps refers to request 7. The allocator's default TTL keeps the
+	// cleanup loop's ticker from firing inside this test, so a destroy here can
+	// only have come from the shutdown drain.
+	l.mu.Lock()
+	l.cleanup = map[int64]*pendingCleanup{7: {job: Job{RequestID: 7}}}
+	l.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	defer cancel()
+
+	runDone := make(chan struct{})
+
+	go func() {
+		defer close(runDone)
+
+		if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("Run: %v", err)
+		}
+	}()
+
+	cancel()
+
+	select {
+	case <-runDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("Run never returned")
+	}
+
+	select {
+	case id := <-destroyed:
+		if id != 7 {
+			t.Errorf("shutdown destroyed request %d, want 7", id)
+		}
+	default:
+		t.Fatal("shutdown left a completed job's compute running: its lease was already " +
+			"gone, so releaseAll never saw it and the retry loop had been stopped. " +
+			"Nothing else will ever remove that container")
+	}
+
+	if cleanupCount(l) != 0 {
+		t.Errorf("a discharged cleanup record survived the drain: %d", cleanupCount(l))
+	}
+}
+
+// A WEDGED TEARDOWN STOPS RENEWING, so the reaper can reclaim what it holds.
+//
+// Nothing can bound a Destroy that ignores its context, and the Runner interface
+// does not forbid one — so Run can be wedged by a bad implementation whatever
+// this listener does. What must not also happen is that it goes on renewing
+// while wedged: renewal is exactly what stops the reaper reclaiming, so one
+// stuck teardown would become capacity no operator gets back without killing the
+// process.
+func TestAWedgedTeardownStopsRenewing(t *testing.T) {
+	t.Parallel()
+
+	const (
+		ttl   = 600 * time.Millisecond
+		grace = 300 * time.Millisecond
+	)
+
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
+		alloc.WithLeaseTTL(ttl))
+
+	// A destroy that ignores its context entirely. Registered for cleanup at the
+	// moment it is created, so a t.Fatal below cannot strand the goroutine.
+	blocked := make(chan struct{})
+	unblock := sync.OnceFunc(func() { close(blocked) })
+
+	t.Cleanup(unblock)
+
+	entered := make(chan struct{}, 1)
+
+	runner := &fakeRunner{onDestroy: func(int64) error {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+
+		<-blocked
+
+		return nil
+	}}
+
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner),
+		WithShutdownGrace(grace))
+
+	lease := holdRunning(t, l, a, tiers[0].Label, 7)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	defer cancel()
+
+	runDone := make(chan struct{})
+
+	go func() {
+		defer close(runDone)
+
+		if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("Run: %v", err)
+		}
+	}()
+
+	cancel()
+
+	select {
+	case <-entered:
+	case <-runDone:
+		t.Fatal("the listener returned without destroying the job it was running")
+	case <-time.After(30 * time.Second):
+		t.Fatal("the shutdown release never reached the runner")
+	}
+
+	// Well past the grace AND past the TTL, so renewal has had to stop and the
+	// lease has had to expire. Reaped synchronously so expiry is enforced at the
+	// moment it is checked rather than by a background ticker.
+	time.Sleep(grace + 2*ttl)
+
+	if _, err := a.Reap(t.Context()); err != nil {
+		t.Fatalf("reap: %v", err)
+	}
+
+	if err := a.Heartbeat(t.Context(), lease.ID, lease.Epoch); err == nil {
+		t.Fatal("a listener wedged in its teardown was still renewing after the shutdown " +
+			"grace; the reaper can never reclaim that capacity, so one stuck destroy " +
+			"costs the deployment those vCPUs until the process is killed")
+	}
+
+	unblock()
+
+	select {
+	case <-runDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("Run never returned after the node answered")
+	}
+}
+
+// cleanupCount reports how many completions are waiting to be retried.
+func cleanupCount(l *Listener) int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -2047,7 +2313,8 @@ func TestATransientReleaseFailureKeepsTheRetry(t *testing.T) {
 		return nil
 	}}
 
-	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner))
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner),
+		WithCleanupRetryPacing(0, 0))
 
 	holdRunning(t, l, a, tiers[0].Label, 7)
 
@@ -2138,7 +2405,8 @@ func TestALostLeaseKeepsItsPendingRetry(t *testing.T) {
 		return errors.New("the node is not answering")
 	}}
 
-	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner))
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner),
+		WithCleanupRetryPacing(0, 0))
 
 	holdRunning(t, l, a, tiers[0].Label, 7)
 
@@ -2146,8 +2414,8 @@ func TestALostLeaseKeepsItsPendingRetry(t *testing.T) {
 		t.Fatalf("complete: %v", err)
 	}
 
-	if pendingCleanup(l) != 1 {
-		t.Fatalf("a completion whose destroy failed was not recorded: %d", pendingCleanup(l))
+	if cleanupCount(l) != 1 {
+		t.Fatalf("a completion whose destroy failed was not recorded: %d", cleanupCount(l))
 	}
 
 	// REAPED, not released. A direct release leaves the lease terminal at the same
@@ -2170,11 +2438,11 @@ func TestALostLeaseKeepsItsPendingRetry(t *testing.T) {
 			"point is exercising a lost lease")
 	}
 
-	if pendingCleanup(l) != 1 {
+	if cleanupCount(l) != 1 {
 		t.Errorf("the retry record was dropped when the lease was reaped (%d pending); the "+
 			"container is still running on a host, GitHub will not redeliver the "+
 			"completion, and with a runner that cannot sweep nothing else would ever "+
-			"ask again", pendingCleanup(l))
+			"ask again", cleanupCount(l))
 	}
 
 	// AND A RETRY THAT REDISCOVERS THE LOSS KEEPS IT TOO. The heartbeat is not the
@@ -2182,10 +2450,10 @@ func TestALostLeaseKeepsItsPendingRetry(t *testing.T) {
 	// gone, and that path drops the record separately from the one above.
 	l.retryCleanup(t.Context())
 
-	if pendingCleanup(l) != 1 {
+	if cleanupCount(l) != 1 {
 		t.Errorf("a retry that found its lease gone dropped the record (%d pending); the "+
 			"destroy had still not succeeded, so the container is still there",
-			pendingCleanup(l))
+			cleanupCount(l))
 	}
 
 	// AND THE DESTROY IS WHAT ENDS IT. There is no lease left to release, so a
@@ -2195,9 +2463,42 @@ func TestALostLeaseKeepsItsPendingRetry(t *testing.T) {
 
 	l.retryCleanup(t.Context())
 
-	if pendingCleanup(l) != 0 {
+	if cleanupCount(l) != 0 {
 		t.Errorf("a retry whose destroy finally succeeded is still pending (%d); it would "+
-			"be attempted on every pass for the life of the process", pendingCleanup(l))
+			"be attempted on every pass for the life of the process", cleanupCount(l))
+	}
+
+	// AND THE PROMISED HALF, which is its own branch in the heartbeat. Without
+	// this, restoring the deletion there alone would pass every assertion above.
+	promised, err := a.Reserve(t.Context(), tiers[0].Label)
+	if err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+
+	l.mu.Lock()
+	l.acquiring[9] = &promise{lease: promised, at: time.Now()}
+	l.cleanup = map[int64]*pendingCleanup{9: {job: Job{RequestID: 9}}}
+	l.mu.Unlock()
+
+	time.Sleep(2 * ttl)
+
+	if _, err := a.Reap(t.Context()); err != nil {
+		t.Fatalf("reap the promised lease: %v", err)
+	}
+
+	l.mu.Lock()
+	l.heartbeatHeld(t.Context())
+	_, stillPromised := l.acquiring[9]
+	l.mu.Unlock()
+
+	if stillPromised {
+		t.Fatal("the listener kept a promise the reaper had taken, so this proves nothing")
+	}
+
+	if cleanupCount(l) != 1 {
+		t.Errorf("the retry record was dropped when a PROMISED lease was reaped (%d "+
+			"pending); a job billet acquired and launched leaves compute behind exactly "+
+			"like an assigned one", cleanupCount(l))
 	}
 }
 
@@ -2304,7 +2605,7 @@ func TestRunStartsTheCleanupLoop(t *testing.T) {
 	// call Destroy on the way in, and this test would then pass on that call
 	// rather than on anything the loop did.
 	l.mu.Lock()
-	l.cleanup = map[int64]Job{11: {RequestID: 11}}
+	l.cleanup = map[int64]*pendingCleanup{11: {job: Job{RequestID: 11}}}
 	l.mu.Unlock()
 
 	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
