@@ -918,6 +918,23 @@ testing is what found them, and it is not optional for anything load-bearing.
   coverage. `make check` now carries the flags, because a local gate weaker than
   CI trains you to trust it.
 
+### An edit that did not apply looks exactly like an edit that did
+
+Twice in one session a scripted `replace()` matched nothing and reported success:
+once because the anchor said HANDOVER where the file said HANDOFF, once because a
+comment had been reworded a round earlier. The build passed, the tests passed,
+and the bug the edit was meant to fix was untouched — the only reason it surfaced
+was a test written against the behaviour rather than the code.
+
+**Assert every substitution.** `assert old in s` before replacing, and check the
+file hash changed afterwards. This is the same rule already written down for
+mutation testing, and it applies to every scripted edit for the same reason: the
+failure mode is silence.
+
+**And use `-F` for every commit message.** Backticks in `git commit -m` are
+command substitution: three messages this session lost a phrase to it, in a
+project whose commit messages are the design record. A file cannot misfire.
+
 ### Two things Go gets right and reviewers get wrong
 
 - **`url.Parse` accepts `"127.0.0.1:7717"`**, reading the host as a scheme. A
