@@ -545,19 +545,26 @@ compute is confirmed gone. The rules that were each learned by getting them wron
 - **Serializing a mutation is not serializing a transition.** Holding the lock for
   the flag write and releasing it before the backend calls is the same race, one
   line down.
-- **Declining to ADD a record is not the same as REMOVING one.** The listener
-  stopped recording completion retries for leases it does not hold, which fixed
-  only the arrival path. A lease can be fenced or reaped BETWEEN the completion
-  that recorded a retry and the retry itself, and the record left behind can
-  never succeed — while retries are sequential and each destroy can wait the full
-  node command timeout, so dead entries delay live ones and every ownership-loss
-  cycle adds another. Whenever a guard is added at the point a record is created,
-  ask what removes the records that already exist.
-- **Losing the lease is what ends this listener's business with a request.** Not
-  the destroy succeeding. A fenced lease belongs to another holder and a reaped
-  one has already had its capacity reclaimed, so continuing to act on either is
-  work that cannot land — and, for a fenced lease, work aimed at compute that is
-  now someone else's to manage.
+- **A cleanup obligation is owed to the COMPUTE, not to the lease.** Only a
+  successful destroy discharges a pending completion retry. Losing the lease —
+  fenced, reaped — changes who owns the capacity; it does not make the container
+  stop running, and GitHub will not redeliver the completion that would ask
+  again. If no lease remains, skip the release and keep destroying.
+
+  Written down because the opposite was committed for one round and the argument
+  for it was seductive: the capacity really is someone else's, so the record
+  looks like litter. Two separate rules were being conflated. No record is
+  CREATED for a request this listener never held — a restart loses the map while
+  leases live on, and those retries could accomplish nothing. That says nothing
+  about a record created when the listener DID hold the lease.
+- **An OPTIONAL capability cannot carry a safety invariant.** The reversed change
+  above was defended with "both shipped runners implement `Sweeper`, which
+  destroys compute no lease is holding." True, and irrelevant: `Sweeper` is a
+  type assertion on `Runner`, so that reasoning makes correctness depend on which
+  implementation is plugged in, and billet is meant to be extended by strangers.
+  If safety rests on a capability, the interface must require it — otherwise
+  assume the implementation without it, and let the capability be a backstop
+  rather than the mechanism.
 - **Time warns; it does not authorise a teardown.** Held compute has NO bound by
   default (`DefaultMaxCustody = 0`) and warns hourly. Elapsed time is not evidence
   that a job stopped making progress — billet imposes no job limit and self-hosted
@@ -933,6 +940,28 @@ testing is what found them, and it is not optional for anything load-bearing.
   property is about scheduling, the test has to use the scheduler under test:
   drive `Run`, and assert the CONSEQUENCE (a lease the reaper took) rather than
   the mechanism.
+- **A shutdown-time worker must not run on the caller's context.** Renewal was
+  started on a child of `ctx`, so the caller cancelling to shut down stopped it
+  at that instant — before the session close, before the release, before every
+  slow remote destroy the release performs. Stopping it "last" in the deferred
+  teardown was decoration: it had already stopped. Anything that must stay alive
+  DURING shutdown gets `context.WithCancel(context.WithoutCancel(ctx))` and is
+  stopped explicitly by the function that owns the teardown.
+
+  The general form: if a goroutine's job is to protect the teardown, inheriting
+  the cancellation that triggers the teardown is exactly backwards.
+- **Cancelling a goroutine is not stopping it.** A cleanup retry blocked in a
+  remote `Destroy` outlived `Run` and came back afterwards to release against a
+  database the caller was entitled to have closed. Cancel AND join, and be
+  explicit about the order when two workers must stop at different times —
+  cleanup before the release that would race it, renewal after.
+- **A test whose observation can also be produced by shutdown proves nothing
+  about the loop.** The first version of the cleanup-loop wiring test let the
+  context expire and then asked whether a destroy had happened. `releaseAll`
+  destroys everything still running, so it produced one — the test passed with
+  the loop deleted, and the mutation run reported a kill only because `Run`
+  incidentally returned `DeadlineExceeded`. Observe the effect while the system
+  is still running, and enumerate every other path that could produce it.
 - **A mutant that applies but changes no behaviour reports SURVIVED, and that is
   indistinguishable from a real gap.** Inserting `_ = id` next to a `delete` left
   the delete in place; the harness verified the file hash changed, so every
