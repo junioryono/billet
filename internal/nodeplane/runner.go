@@ -417,14 +417,16 @@ func (p *Plane) abandonLocked(n *node, pend *pending, cause error) error {
 	if pend.delivered {
 		delete(n.inflight, pend.cmd.ID)
 
-		if pend.cmd.Kind == nodeapi.CommandLaunch {
-			// REMEMBERED, because this is the moment the lease changes hands. The
-			// listener is about to be told the node has custody and will stop
-			// heartbeating. If the launch later succeeds and reports, the node has to
-			// be told it now owns what it started — and the only thing that can tell
-			// it is this record.
-			n.rememberAbandoned(pend.cmd.ID, p.now())
+		// REMEMBERED, whatever it was. For a LAUNCH this is the moment the lease
+		// changes hands: the listener is about to be told the node has custody and
+		// will stop heartbeating, so a launch that later succeeds must learn it now
+		// owns what it started. For a DESTROY it is the opposite and just as
+		// necessary — a late success is the only proof the compute is gone, and
+		// discarding it left the plane reporting custody forever for a container
+		// that had already been removed.
+		n.rememberAbandoned(pend.cmd, p.now())
 
+		if pend.cmd.Kind == nodeapi.CommandLaunch {
 			return fmt.Errorf("%w: %w, so whether compute started is unknown",
 				server.ErrCustody, cause)
 		}

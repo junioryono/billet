@@ -134,7 +134,7 @@ type node struct {
 	// delivered launch tells the listener the node has custody; if that launch
 	// then succeeds and reports, this is the only thing left that can tell the
 	// node it owns what it started.
-	abandoned map[string]time.Time
+	abandoned map[string]abandonedCmd
 
 	// waiting is signalled when a command arrives for a node that is polling.
 	waiting chan struct{}
@@ -144,10 +144,22 @@ type node struct {
 	waiters int
 }
 
-// rememberAbandoned records a launch the plane gave up waiting for.
-func (n *node) rememberAbandoned(id string, at time.Time) {
+// abandonedCmd is a command the plane stopped waiting for.
+//
+// The KIND and the REQUEST matter, not just the fact. A late launch result hands
+// the node custody; a late DESTROY result is the opposite — it is the only proof
+// that compute is gone, and discarding it left the plane reporting custody
+// forever for a container that no longer existed.
+type abandonedCmd struct {
+	kind      nodeapi.CommandKind
+	requestID int64
+	at        time.Time
+}
+
+// rememberAbandoned records a command the plane gave up waiting for.
+func (n *node) rememberAbandoned(cmd nodeapi.Command, at time.Time) {
 	if n.abandoned == nil {
-		n.abandoned = make(map[string]time.Time)
+		n.abandoned = make(map[string]abandonedCmd)
 	}
 
 	if len(n.abandoned) >= maxAbandoned {
@@ -159,16 +171,20 @@ func (n *node) rememberAbandoned(id string, at time.Time) {
 			when   time.Time
 		)
 
-		for id, at := range n.abandoned {
-			if oldest == "" || at.Before(when) {
-				oldest, when = id, at
+		for id, entry := range n.abandoned {
+			if oldest == "" || entry.at.Before(when) {
+				oldest, when = id, entry.at
 			}
 		}
 
 		delete(n.abandoned, oldest)
 	}
 
-	n.abandoned[id] = at
+	n.abandoned[cmd.ID] = abandonedCmd{
+		kind:      cmd.Kind,
+		requestID: cmd.RequestIDOf(),
+		at:        at,
+	}
 }
 
 // pending is a command and the caller waiting for its result.
@@ -391,16 +407,21 @@ func (p *Plane) Register(
 	// recovery is what finds it. Retrying here would risk a second container for
 	// one job.
 	for id, pend := range n.inflight {
-		// TOMBSTONED, EXACTLY AS A TIMEOUT IS. This lease is being handed to the
-		// node, and until now nothing recorded that. A launch that was in flight
-		// across the re-registration — a partitioned host still working, or a
-		// process that restarted while its provider kept going — would report
-		// success afterwards, find no inflight entry and no tombstone, and be
-		// answered 204. The listener had already stopped heartbeating on the
-		// custody it was told about, so nothing held the lease at all.
-		if pend.cmd.Kind == nodeapi.CommandLaunch {
-			n.rememberAbandoned(id, p.now())
-		}
+		// TOMBSTONED, EXACTLY AS A TIMEOUT IS, AND FOR EVERY KIND.
+		//
+		// A LAUNCH in flight across a re-registration — a partitioned host still
+		// working, or a process that restarted while its provider kept going — would
+		// otherwise report success afterwards, find no inflight entry and no
+		// tombstone, and be answered 204, while the listener had already stopped
+		// heartbeating on the custody it was told about.
+		//
+		// A DESTROY is the case this used to miss entirely. The process that took it
+		// can succeed and be superseded before it reports; its late result was then
+		// discarded, so the ownership record survived, that process drained to
+		// nothing and exited, and every later destroy was answered by its
+		// replacement — which cannot confirm somebody else's ownership. The plane
+		// reported custody forever for a container that had already been removed.
+		n.rememberAbandoned(pend.cmd, p.now())
 
 		p.answerLocked(pend, nodeapi.CommandResult{
 			ID:      id,
@@ -500,6 +521,10 @@ func (p *Plane) forgetForRequest(requestID int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	p.forgetForRequestLocked(requestID)
+}
+
+func (p *Plane) forgetForRequestLocked(requestID int64) {
 	for id, owner := range p.owners {
 		if owner.requestID == requestID {
 			delete(p.owners, id)
@@ -965,16 +990,36 @@ func (p *Plane) Result(nodeName, incarnation string, res nodeapi.CommandResult) 
 		// custody", and the listener stops heartbeating on the strength of it. If
 		// that launch then succeeds and reports, answering with a shrug leaves the
 		// container running under a lease nothing renews.
-		if _, abandoned := n.abandoned[res.ID]; abandoned {
+		if entry, abandoned := n.abandoned[res.ID]; abandoned {
 			delete(n.abandoned, res.ID)
 
-			if res.OK {
+			switch {
+			case entry.kind == nodeapi.CommandDestroy && res.OK:
+				// THE ONLY PROOF THE COMPUTE IS GONE, arriving late. A destroy taken by
+				// a process that was superseded before it could answer used to be
+				// discarded here — so the ownership record survived, that process
+				// drained to nothing and exited, and every later destroy was answered
+				// by its replacement, which cannot confirm somebody else's ownership.
+				// The plane then reported custody forever for a container that had
+				// already been removed, while the listener kept heartbeating its
+				// capacity.
+				p.forgetForRequestLocked(entry.requestID)
+
+				return nil
+
+			case entry.kind == nodeapi.CommandLaunch && res.OK:
 				return ErrTakeCustody
+
+			case entry.kind == nodeapi.CommandLaunch:
+				// A FAILED LATE LAUNCH NEEDS NO HANDOFF: nothing is running, so there
+				// is nothing to hold — and nothing left to own either.
+				p.forgetForRequestLocked(entry.requestID)
+
+				return nil
 			}
 
-			// A FAILED LATE REPORT NEEDS NO HANDOFF. Nothing is running, so there is
-			// nothing to hold, and telling the node to take custody of a launch that
-			// failed would have it renew a lease for compute that does not exist.
+			// A destroy that FAILED leaves the compute where it was, so its owner
+			// keeps it.
 			return nil
 		}
 

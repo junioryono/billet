@@ -968,29 +968,47 @@ func TestRegistrationPrunesOwnershipTheLedgerHasEnded(t *testing.T) {
 // the earlier reading treats that as the owner confirming, and the lease is
 // released under a live container.
 //
-// Only the incarnation that actually answered can confirm anything.
+// THE ORDERING IS ESTABLISHED, NOT HOPED FOR, and the first version of this test
+// did hope. It started the replacement in a goroutine alongside Destroy, so the
+// registration could land FIRST — and in that ordering even the buggy code reads
+// the owner as already superseded and returns custody, so every assertion passed
+// without the race ever happening. Waiting for the command to be queued proves
+// the owner snapshot has already been taken.
 func TestASupersessionDuringADestroyIsNotAConfirmation(t *testing.T) {
 	t.Parallel()
 
 	p, _ := deliverLaunch(t)
 
-	// The replacement arrives while the destroy is being prepared, and it is the
-	// one that answers.
-	answered := make(chan struct{})
+	destroyed := make(chan error, 1)
 
 	go func() {
-		defer close(answered)
+		destroyed <- p.NewRunner().Destroy(t.Context(), 7)
+	}()
 
-		if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
-			Version:     nodeapi.Version,
-			Node:        "n1",
-			Provider:    config.ProviderDocker,
-			Deployment:  deployment,
-			Incarnation: "second",
-		}); err != nil {
-			return
+	// The command is queued, so OwnerOfRequest has already been read and the
+	// snapshot says "first" is current. Only now can the supersession race it.
+	deadline := time.Now().Add(5 * time.Second)
+	for p.QueuedForTest("n1") == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the destroy was never queued")
 		}
 
+		time.Sleep(time.Millisecond)
+	}
+
+	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
+		Version:     nodeapi.Version,
+		Node:        "n1",
+		Provider:    config.ProviderDocker,
+		Deployment:  deployment,
+		Incarnation: "second",
+	}); err != nil {
+		t.Fatalf("re-register: %v", err)
+	}
+
+	// The replacement takes the destroy and answers it truthfully: it has nothing
+	// to remove, because it does not have it.
+	go func() {
 		got, took, err := p.Poll(t.Context(), "n1", "second")
 		if err != nil || !took {
 			return
@@ -1000,17 +1018,91 @@ func TestASupersessionDuringADestroyIsNotAConfirmation(t *testing.T) {
 		_ = p.Result("n1", "second", nodeapi.CommandResult{ID: got.ID, OK: true})
 	}()
 
-	err := p.NewRunner().Destroy(t.Context(), 7)
-
-	<-answered
-
-	if !errors.Is(err, server.ErrCustody) {
-		t.Errorf("a destroy answered by the process that replaced the owner reported %v; the "+
-			"listener releases the lease while the container is still running", err)
+	select {
+	case err := <-destroyed:
+		if !errors.Is(err, server.ErrCustody) {
+			t.Errorf("a destroy answered by the process that replaced the owner reported %v; "+
+				"the listener releases the lease while the container is still running", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the destroy never returned")
 	}
 
 	if !p.OwnsForTest("l1", "n1", "first") {
 		t.Error("the owner's record was dropped on somebody else's confirmation")
+	}
+}
+
+// A DESTROY THE OWNER COMPLETED BUT COULD NOT REPORT STILL ENDS ITS OWNERSHIP.
+//
+// The process that takes a destroy can succeed and be superseded before it
+// answers. Registration then fails its in-flight command, and its late result
+// used to be discarded — so the ownership record survived, that process drained
+// to nothing and exited, and every later destroy was answered by its
+// replacement, which cannot confirm somebody else's ownership. The plane
+// reported custody forever for a container that had already been removed, and
+// the listener went on heartbeating its capacity.
+func TestALateDestroyResultFromTheOwnerEndsItsOwnership(t *testing.T) {
+	t.Parallel()
+
+	p, _ := deliverLaunch(t)
+
+	destroyed := make(chan error, 1)
+
+	go func() {
+		destroyed <- p.NewRunner().Destroy(t.Context(), 7)
+	}()
+
+	// The owner takes the destroy — and then says nothing.
+	var taken nodeapi.Command
+
+	deadline := time.Now().Add(5 * time.Second)
+
+	for {
+		got, took, err := p.Poll(t.Context(), "n1", "first")
+		if err != nil {
+			t.Fatalf("poll: %v", err)
+		}
+
+		if took {
+			if got.Kind != nodeapi.CommandDestroy {
+				t.Fatalf("polled a %s command, want the destroy", got.Kind)
+			}
+
+			taken = got
+
+			break
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatal("the destroy was never delivered")
+		}
+	}
+
+	// A replacement arrives, which fails the in-flight destroy.
+	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
+		Version:     nodeapi.Version,
+		Node:        "n1",
+		Provider:    config.ProviderDocker,
+		Deployment:  deployment,
+		Incarnation: "second",
+	}); err != nil {
+		t.Fatalf("re-register: %v", err)
+	}
+
+	if err := <-destroyed; err == nil {
+		t.Fatal("a destroy failed by a re-registration reported success")
+	}
+
+	// The owner had already removed the container, and now reports it.
+	if err := p.Result("n1", "first", nodeapi.CommandResult{ID: taken.ID, OK: true}); err != nil {
+		t.Fatalf("late result: %v", err)
+	}
+
+	if p.OwnsForTest("l1", "n1", "first") {
+		t.Error("a late destroy result proving the compute gone left the ownership behind; " +
+			"once that process drains and exits, every later destroy reports custody " +
+			"forever and the capacity is never reclaimed")
 	}
 }
 
