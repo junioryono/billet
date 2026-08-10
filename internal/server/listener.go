@@ -390,10 +390,36 @@ func (l *Listener) Run(ctx context.Context) error {
 	//
 	// Tying renewal to the poll cadence made the safety of the whole escrow
 	// depend on a timeout billet does not control.
-	beat, stopBeating := context.WithCancel(ctx)
+	// AND IT DOES NOT INHERIT THE CALLER'S CANCELLATION, which is what made the
+	// ordering below matter in the first place.
+	//
+	// `beat` used to be a child of ctx, so a caller cancelling to shut down killed
+	// renewal at that instant — before the session close, before the release, and
+	// before every slow remote destroy the release performs. Stopping the
+	// heartbeat last was therefore decoration: it had already stopped. A teardown
+	// slower than the lease TTL let the reaper take leases whose compute was still
+	// being destroyed, and another tier could escrow that capacity while the
+	// container was still on the host.
+	//
+	// The listener owns when renewal ends, and it ends after the release.
+	beat, stopBeating := context.WithCancel(context.WithoutCancel(ctx))
 	defer stopBeating()
 
-	go l.heartbeatLoop(beat)
+	// SEPARATE LIFETIMES, not just separate clocks, because shutdown needs them
+	// in opposite orders: the cleanup loop must be finished before the release
+	// runs, and renewal must still be running while it does.
+	sweep, stopSweeping := context.WithCancel(ctx)
+	defer stopSweeping()
+
+	var beating, sweeping sync.WaitGroup
+
+	beating.Add(1)
+
+	go func() {
+		defer beating.Done()
+
+		l.heartbeatLoop(beat)
+	}()
 
 	// A SEPARATE LOOP, NOT A STEP IN THE HEARTBEAT. Retrying a destroy means
 	// broadcasting to nodes and waiting up to the command timeout, and the
@@ -401,7 +427,13 @@ func (l *Listener) Run(ctx context.Context) error {
 	// slow. Hanging this off the same tick would let one unreachable host delay
 	// every renewal on the listener and expire the leases it was protecting —
 	// which is the failure the separate clock was introduced to prevent.
-	go l.cleanupLoop(beat)
+	sweeping.Add(1)
+
+	go func() {
+		defer sweeping.Done()
+
+		l.cleanupLoop(sweep)
+	}()
 
 	// CLOSE THEN RELEASE, in that order, and the listener owns both so the order
 	// cannot be split across two functions again.
@@ -413,6 +445,22 @@ func (l *Listener) Run(ctx context.Context) error {
 	// of all things. It was split across Run and its caller, and Go's defer order
 	// put them the wrong way round.
 	defer func() {
+		// RENEWAL STOPS LAST, so it is deferred first. The release below destroys
+		// whatever is still running, which is slow and remote, and every lease it
+		// has not reached yet has to keep being renewed while it works.
+		defer func() {
+			stopBeating()
+			beating.Wait()
+		}()
+
+		// AND CLEANUP IS STOPPED AND JOINED BEFORE ANY OF IT. Cancelling was not
+		// enough: a retry blocked in a remote Destroy outlived Run, and came back
+		// to call alloc.Release against a database the caller had every right to
+		// have closed by then. Nothing joined it, so the only thing deciding
+		// whether that happened was how long the node took to answer.
+		stopSweeping()
+		sweeping.Wait()
+
 		stopCtx := context.WithoutCancel(ctx)
 
 		if err := l.session.Close(stopCtx); err != nil {
@@ -685,11 +733,10 @@ func (l *Listener) heartbeatHeld(ctx context.Context) {
 		if !l.renew(ctx, lease) {
 			delete(l.running, id)
 
-			// The pending retry goes with it. Losing the lease is what ends this
-			// listener's business with the request — a fenced lease belongs to
-			// another holder and a reaped one has already had its capacity
-			// reclaimed, so retrying the destroy can only occupy the cleanup pass.
-			delete(l.cleanup, id)
+			// THE PENDING RETRY STAYS. Losing the lease ends this listener's claim
+			// on the capacity, not its obligation to destroy what it started: the
+			// container is still running on a host, and the record is the only
+			// thing that will ask again.
 		}
 	}
 
@@ -713,7 +760,6 @@ func (l *Listener) heartbeatHeld(ctx context.Context) {
 
 		if !l.renew(ctx, p.lease) {
 			delete(l.acquiring, id)
-			delete(l.cleanup, id)
 		}
 	}
 }
@@ -1322,19 +1368,23 @@ func (l *Listener) complete(ctx context.Context, job Job) error {
 			}
 
 			l.cleanup[job.RequestID] = job
-		} else {
-			// AND AN EXISTING RECORD IS DROPPED, which declining to add a new one
-			// did not do. A lease can be fenced or reaped between the completion
-			// that recorded the retry and the retry itself; the heartbeat then
-			// removes it from `running`, and from that moment this listener can
-			// accomplish nothing for it — the capacity is already someone else's.
-			//
-			// Leaving the record cost more than a stale map entry. Retries are
-			// sequential and each Destroy can wait up to the node command timeout,
-			// so entries that can never succeed delay the ones that can, and every
-			// ownership-loss cycle adds another.
-			delete(l.cleanup, job.RequestID)
 		}
+
+		// AND AN EXISTING RECORD IS NEVER DROPPED HERE, which is a different rule
+		// from the one above and was briefly conflated with it.
+		//
+		// Losing the lease does not prove the container is gone. A record exists
+		// because this listener launched something and could not destroy it; if
+		// the lease is then fenced or reaped, the obligation is unchanged — the
+		// capacity is someone else's, but the compute is still ours to remove, and
+		// GitHub will not redeliver the completion that would ask again.
+		//
+		// Dropping it looked safe because both shipped runners implement Sweeper,
+		// which destroys compute no lease is holding. But Sweeper is OPTIONAL on
+		// the Runner interface, so that reasoning makes correctness depend on which
+		// runner is plugged in — with a non-sweeping one, nothing destroys the
+		// container until the host restarts. An obligation is not discharged by
+		// noticing that something else would probably have covered it.
 
 		l.mu.Unlock()
 
