@@ -262,9 +262,12 @@ type Listener struct {
 	// stalePromise is how long a promise may go unclaimed before it is reported.
 	stalePromise time.Duration
 
-	// shutdownGrace bounds the teardown, so an unbounded Destroy or session close
-	// cannot keep Run — and the renewal that outlives it — running forever.
+	// shutdownGrace bounds the remote half of the teardown, so an unbounded
+	// Destroy cannot keep Run — and the renewal that outlives it — running
+	// forever. closeGrace and releaseGrace bound the two local phases after it.
 	shutdownGrace time.Duration
+	closeGrace    time.Duration
+	releaseGrace  time.Duration
 
 	// retryFirst and retryMax pace the cleanup retries. retryFirst <= 0 turns
 	// pacing off entirely, which only tests ask for.
@@ -299,6 +302,8 @@ func NewListener(a *alloc.Allocator, tier string, session Session, opts ...Optio
 		confirmed:     make(map[string]time.Time),
 		stalePromise:  defaultStalePromise,
 		shutdownGrace: defaultShutdownGrace,
+		closeGrace:    defaultCloseGrace,
+		releaseGrace:  defaultReleaseGrace,
 		retryFirst:    firstRetryEvery,
 		retryMax:      maxRetryEvery,
 	}
@@ -436,13 +441,15 @@ const (
 	// went quiet, and concurrency never helped there anyway.
 	teardownConcurrency = 1
 
-	// finishGrace bounds the local half of the teardown — closing the session and
-	// releasing leases — separately from the remote destroys.
+	// closeGrace and releaseGrace bound the local half of the teardown, separately
+	// from the remote destroys AND from each other.
 	//
-	// Short, because none of it waits on a node. Its own, because sharing the
-	// destroy budget meant a slow node could cost billet the release of capacity
-	// it had already freed.
-	finishGrace = 30 * time.Second
+	// Short, because neither waits on a node. Separate, because a session close
+	// that used most of a shared budget left the releases — sequential, against
+	// one SQLite writer — to fail on what was left, turning a clean shutdown into
+	// a tier's worth of capacity withheld until the reaper.
+	defaultCloseGrace   = 30 * time.Second
+	defaultReleaseGrace = 30 * time.Second
 
 	// defaultShutdownGrace bounds the whole teardown.
 	//
@@ -493,6 +500,18 @@ func WithStalePromiseAfter(d time.Duration) Option {
 // leases nobody releases and containers nobody removes.
 func WithShutdownGrace(d time.Duration) Option {
 	return func(l *Listener) { l.shutdownGrace = d }
+}
+
+// WithFinishGraces bounds the two local phases of the teardown: closing the
+// session, and releasing leases.
+//
+// Separate from the shutdown grace because they wait on nothing remote, and
+// separate from each other because a slow close must not leave the releases to
+// fail on what is left of a shared budget.
+func WithFinishGraces(closing, releasing time.Duration) Option {
+	return func(l *Listener) {
+		l.closeGrace, l.releaseGrace = closing, releasing
+	}
 }
 
 // WithCleanupRetryPacing sets how long a failed cleanup retry waits before the
@@ -623,6 +642,17 @@ func (l *Listener) Run(ctx context.Context) error {
 		stopCtx, endGrace := context.WithTimeout(context.WithoutCancel(ctx), l.shutdownGrace)
 		defer endGrace()
 
+		// RENEWAL OUTLASTS BOTH PHASES, not just the destroys.
+		//
+		// The watchdog used to fire when the destroy budget expired, and the close
+		// and release then ran for another finishGrace with nothing renewing. Held
+		// and promised leases could expire in that window while the session — and
+		// the positive maxCapacity GitHub last saw — was still open, which is the
+		// close-before-release invariant broken by expiry rather than by a call.
+		renewCtx, endRenewal := context.WithTimeout(context.WithoutCancel(ctx),
+			l.shutdownGrace+l.closeGrace+l.releaseGrace)
+		defer endRenewal()
+
 		// RENEWAL STOPS LAST, so it is deferred first. The release below destroys
 		// whatever is still running, which is slow and remote, and every lease it
 		// has not reached yet has to keep being renewed while it works.
@@ -662,7 +692,7 @@ func (l *Listener) Run(ctx context.Context) error {
 			select {
 			case <-guard:
 				return
-			case <-stopCtx.Done():
+			case <-renewCtx.Done():
 			}
 
 			select {
@@ -672,10 +702,11 @@ func (l *Listener) Run(ctx context.Context) error {
 			default:
 			}
 
-			l.log.Error("this listener's teardown outran its shutdown grace; renewal is "+
-				"stopping so the reaper can reclaim what it still holds, but the compute "+
+			l.log.Error("this listener's teardown outran its whole shutdown budget; renewal "+
+				"is stopping so the reaper can reclaim what it still holds, but the compute "+
 				"it was destroying may still be running on its host",
-				"tier", l.tier, "grace", l.shutdownGrace)
+				"tier", l.tier,
+				"budget", l.shutdownGrace+l.closeGrace+l.releaseGrace)
 
 			stopBeating()
 		}()
@@ -713,18 +744,22 @@ func (l *Listener) Run(ctx context.Context) error {
 		destroyed := l.destroyAll(stopCtx)
 
 		// A FRESH BUDGET FOR THE LOCAL HALF, because it was being starved by the
-		// remote one.
+		// remote one — and one EACH, because the close was then starving the
+		// release.
 		//
 		// Closing the session and releasing leases are fast and mostly local, but
-		// they shared the destroy pass's deadline — so two slow destroys consumed
-		// the whole grace and the close was then handed an already-expired context.
-		// It failed, the early return skipped releaseAll, and leases whose compute
-		// had been destroyed SUCCESSFULLY were left for the reaper anyway. The
-		// expensive half failing must not also throw away the cheap half's work.
-		finishCtx, endFinish := context.WithTimeout(context.WithoutCancel(ctx), finishGrace)
-		defer endFinish()
+		// they shared the destroy pass's deadline, so a slow destroy handed the
+		// close an already-expired context; it failed, the early return skipped
+		// releaseAll, and leases whose compute had been destroyed SUCCESSFULLY were
+		// left for the reaper. Giving the pair one shared budget fixed that and
+		// left a smaller version of it: a close that takes nearly all of it leaves
+		// the releases — which run one at a time against a single SQLite writer —
+		// to fail on the remainder, so a clean shutdown can still withhold the
+		// whole tier's capacity until the reaper.
+		closeCtx, endClose := context.WithTimeout(context.WithoutCancel(ctx), l.closeGrace)
+		defer endClose()
 
-		if err := l.session.Close(finishCtx); err != nil {
+		if err := l.session.Close(closeCtx); err != nil {
 			l.log.Warn("could not close message session; capacity is held until it expires",
 				"tier", l.tier, "error", err)
 
@@ -735,7 +770,10 @@ func (l *Listener) Run(ctx context.Context) error {
 			return
 		}
 
-		l.releaseAll(finishCtx, destroyed)
+		releaseCtx, endRelease := context.WithTimeout(context.WithoutCancel(ctx), l.releaseGrace)
+		defer endRelease()
+
+		l.releaseAll(releaseCtx, destroyed)
 	}()
 
 	// Seeded from the session before the first poll. A restart does not replay
@@ -1360,16 +1398,28 @@ func (l *Listener) refillEscrow(ctx context.Context) error {
 		return nil
 	}
 
+	// STAMPED BEFORE THE CALL, which is the only place a second clock can be
+	// safely wrong.
+	//
+	// This has now been moved twice. Sampling after l.mu let a slow heartbeat pass
+	// hold the mutex and date a lease TTL/3 late; sampling after Escrow RETURNED
+	// was better and still wrong, because the goroutine can be descheduled between
+	// the commit and the sample and date it arbitrarily late. Every one of those
+	// errors runs in the same direction: a lease dated later than it really is
+	// stays advertisable after the reaper could already have taken it.
+	//
+	// Taken beforehand, the error runs the other way — the lease is dated slightly
+	// EARLIER than the allocator's own expiry basis, so the worst case is dropping
+	// one billet still owns. That costs a re-escrow and the reaper reclaims late;
+	// the opposite costs two tiers the same machine. The right fix is for Escrow
+	// to return the allocator's authoritative expiry, which is filed with the rest
+	// of the lifecycle work.
+	created := time.Now()
+
 	leases, err := l.alloc.Escrow(ctx, l.tier, room)
 	if err != nil {
 		return fmt.Errorf("server: escrow for %s: %w", l.tier, err)
 	}
-
-	// STAMPED BEFORE THE MUTEX, because the mutex is exactly what can be slow. A
-	// heartbeat pass holds l.mu for up to its own deadline, so a lease created at
-	// t=0 could be stamped at t=TTL/3 and stay advertisable until t=4TTL/3 — most
-	// of the window the seeding was added to close.
-	created := time.Now()
 
 	l.mu.Lock()
 
