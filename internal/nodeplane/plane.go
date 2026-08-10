@@ -507,6 +507,43 @@ func (p *Plane) forgetForRequest(requestID int64) {
 	}
 }
 
+// OwnerOfRequest reports which process holds the compute a request was launched
+// under, and whether that process is still the node's current one.
+//
+// A DESTROY IS ONLY CONFIRMED BY THE PROCESS THAT HAS THE CONTAINER. The wire
+// broadcasts to whoever is polling, which is the CURRENT incarnation — so a
+// superseded process draining its custody is never asked, answers nothing, and
+// its replacement reports the destroy as done because it genuinely has nothing
+// to remove. Believing that answer releases the lease under a live job.
+func (p *Plane) OwnerOfRequest(requestID int64) (RequestOwner, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	for _, owner := range p.owners {
+		if owner.requestID != requestID {
+			continue
+		}
+
+		n, live := p.nodes[owner.node]
+
+		return RequestOwner{
+			Node:    owner.node,
+			Current: live && n.incarnation == owner.incarnation,
+		}, true
+	}
+
+	return RequestOwner{}, false
+}
+
+// RequestOwner is the process holding a request's compute, and whether it is
+// still the one its node's commands reach.
+type RequestOwner struct {
+	Node string
+	// Current is false for a superseded process that is draining: it does not
+	// poll, so it never sees a destroy and cannot confirm one.
+	Current bool
+}
+
 // ForgetLease drops the ownership record for a lease that has ended.
 //
 // BOUNDED, because the alternative is one map entry per job for the life of the
@@ -545,7 +582,10 @@ func (p *Plane) AdoptOwnership(node, incarnation string, leaseIDs []string) {
 		p.owners = make(map[string]leaseOwner, len(leaseIDs))
 	}
 
+	open := make(map[string]bool, len(leaseIDs))
 	for _, id := range leaseIDs {
+		open[id] = true
+
 		// GAPS ONLY, never a claim. Every registration runs this, so overwriting
 		// would let a REPLACEMENT take ownership of the leases the process it
 		// superseded is still draining — which is the exact situation this exists
@@ -553,6 +593,21 @@ func (p *Plane) AdoptOwnership(node, incarnation string, leaseIDs []string) {
 		// current incarnation is permitted anyway, by name.
 		if _, taken := p.owners[id]; !taken {
 			p.owners[id] = leaseOwner{node: node, incarnation: incarnation}
+		}
+	}
+
+	// AND ANYTHING THIS NODE OWNS THAT THE LEDGER NO LONGER HAS OPEN IS OVER. The
+	// snapshot above is read before the registration commits, so a lease can end in
+	// between and be adopted as an entry no later event can name: it carries no
+	// request id, so no destroy will ever match it, and the plane's own map
+	// outlives node expiry. Repeated registration races would accumulate those
+	// forever.
+	//
+	// A lease in custody is still OPEN in the ledger, so a draining process keeps
+	// what it holds; only genuinely terminal leases are dropped.
+	for id, owner := range p.owners {
+		if owner.node == node && !open[id] {
+			delete(p.owners, id)
 		}
 	}
 }

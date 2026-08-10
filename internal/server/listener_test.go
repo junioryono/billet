@@ -256,11 +256,11 @@ func TestAvailableIsAcquiredAndAssignedConsumesEscrow(t *testing.T) {
 	}
 
 	// A ceiling, so a genuine failure to make progress ends the test rather than
-	// waiting out the context.
-	go func() {
-		time.Sleep(10 * time.Second)
-		stop()
-	}()
+	// waiting out the context — and a STOPPABLE one, because a sleeping goroutine
+	// outlives the test that started it, holding its state for the full ten
+	// seconds while the rest of the package runs in parallel.
+	ceiling := time.AfterFunc(10*time.Second, stop)
+	defer ceiling.Stop()
 
 	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) &&
 		!errors.Is(err, context.DeadlineExceeded) {

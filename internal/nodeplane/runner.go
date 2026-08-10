@@ -94,10 +94,11 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job server.Job)
 // The result is the FIRST failure, if any: a destroy that only partly succeeded
 // has left compute running somewhere and must not report success.
 func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
-	// THE COMPUTE IS ENDING, SO ITS OWNERSHIP IS TOO. This is the only moment the
-	// wire hears about an ordinary successful job finishing: its lease is released
-	// in-process by the listener, which never calls the node.
-	defer r.plane.forgetForRequest(requestID)
+	// WHO HOLDS THIS, AND IS THAT PROCESS STILL LISTENING? A destroy reaches
+	// whoever is polling, which is the CURRENT incarnation. A superseded process
+	// draining its custody is never asked — so if it is the one with the
+	// container, an answer from its replacement means nothing.
+	owner, known := r.plane.OwnerOfRequest(requestID)
 
 	// A DESTROY MUST NOT WAIT ON A CORPSE. This is the broadcast that made stale
 	// nodes expensive: each one held the call for the full command timeout and
@@ -106,9 +107,18 @@ func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
 	targets := r.liveNodes()
 
 	if len(targets) == 0 {
-		// NOT AN ERROR. There is nowhere for the compute to be, so there is
-		// nothing to remove. Reporting failure here would make every shutdown
+		// UNLESS SOMEBODY IS KNOWN TO BE HOLDING IT. A draining process does not
+		// poll, so it is never in this list — and an empty fleet says nothing about
+		// a container it is still running.
+		if known && !owner.Current {
+			return heldByADrainingProcess(owner.Node, requestID)
+		}
+
+		// NOT AN ERROR otherwise. There is nowhere for the compute to be, so there
+		// is nothing to remove. Reporting failure here would make every shutdown
 		// path on a fleet-less control plane look broken.
+		r.plane.forgetForRequest(requestID)
+
 		return nil
 	}
 
@@ -149,6 +159,22 @@ func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
 	wg.Wait()
 
 	if len(legs) == 0 {
+		// NOT CONFIRMED BY THE PROCESS THAT HAS IT. The replacement answered, and
+		// it answered honestly: it has nothing to remove. The container is on the
+		// superseded process, which is renewing that lease and will destroy it when
+		// its own tend confirms the job done. Custody is exactly that statement —
+		// somebody is holding this, do not release it.
+		if known && !owner.Current {
+			return heldByADrainingProcess(owner.Node, requestID)
+		}
+
+		// THE COMPUTE IS ENDING, SO ITS OWNERSHIP IS TOO — and only here, where
+		// every leg succeeded and the process that holds it was among them. An
+		// unconditional forget dropped the record on a FAILED destroy too, which
+		// left a process that was later superseded unable to renew or release what
+		// it was holding, and its drain unable to end.
+		r.plane.forgetForRequest(requestID)
+
 		return nil
 	}
 
@@ -295,6 +321,19 @@ func (r *Runner) liveNodes() []*node {
 	}
 
 	return out
+}
+
+// heldByADrainingProcess says that the only process able to confirm this destroy
+// was never asked.
+//
+// Custody is exactly that statement: somebody is holding this, so its capacity
+// must not be released. The draining process renews the lease and destroys the
+// compute once its own tend confirms the job finished.
+func heldByADrainingProcess(node string, requestID int64) error {
+	return fmt.Errorf(
+		"%w: request %d was launched by a process on %s that has since been superseded and "+
+			"is draining; it holds that lease until its compute is confirmed gone",
+		server.ErrCustody, requestID, node)
 }
 
 // destroyOn asks one node to remove a request's compute.

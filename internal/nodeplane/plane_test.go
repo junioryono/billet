@@ -915,6 +915,123 @@ func deliverLaunch(t *testing.T) (*Plane, nodeapi.Command) {
 	}
 }
 
+// A REGISTRATION DROPS OWNERSHIP THE LEDGER NO LONGER HAS OPEN.
+//
+// The ledger snapshot is read before the registration commits, so a lease can
+// end in between and be adopted as an entry nothing can ever name: it carries no
+// request id, so no destroy matches it, and the plane's map outlives node
+// expiry. Repeated registration races would accumulate those forever.
+//
+// A lease in CUSTODY is still open in the ledger, so a draining process keeps
+// what it holds; only genuinely terminal leases go.
+func TestRegistrationPrunesOwnershipTheLedgerHasEnded(t *testing.T) {
+	t.Parallel()
+
+	p := testPlane(t)
+
+	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
+		Version:     nodeapi.Version,
+		Node:        "n1",
+		Provider:    config.ProviderDocker,
+		Deployment:  deployment,
+		Incarnation: "first",
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	// Two leases the ledger reported as open at that moment.
+	p.AdoptOwnership("n1", "first", []string{"l1", "l2"})
+
+	if !p.OwnsForTest("l1", "n1", "first") || !p.OwnsForTest("l2", "n1", "first") {
+		t.Fatal("adoption did not record both leases")
+	}
+
+	// The node registers again, and by now l2 has ended.
+	p.AdoptOwnership("n1", "first", []string{"l1"})
+
+	if !p.OwnsForTest("l1", "n1", "first") {
+		t.Error("a lease the ledger still has open lost its owner; the process holding it " +
+			"can no longer renew or release it")
+	}
+
+	if p.OwnsForTest("l2", "n1", "first") {
+		t.Error("a lease the ledger no longer has open kept its owner; nothing can ever name " +
+			"that entry again, so it accumulates for the life of the installation")
+	}
+}
+
+// A DESTROY IS ONLY CONFIRMED BY THE PROCESS THAT HAS THE CONTAINER.
+//
+// The wire broadcasts to whoever is polling, which is the CURRENT incarnation. A
+// superseded process draining its custody never polls, so it is never asked —
+// and its replacement answers honestly that it has nothing to remove, because it
+// does not have it. Believing that answer releases the lease under a live job.
+//
+// Custody is the right answer: somebody is holding this. The draining process
+// renews the lease and destroys the compute once its own tend confirms the job
+// finished.
+func TestADestroyIsNotConfirmedByTheWrongProcess(t *testing.T) {
+	t.Parallel()
+
+	p, _ := deliverLaunch(t)
+
+	// A second process takes the name. The first is now draining, and does not
+	// poll.
+	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
+		Version:     nodeapi.Version,
+		Node:        "n1",
+		Provider:    config.ProviderDocker,
+		Deployment:  deployment,
+		Incarnation: "second",
+	}); err != nil {
+		t.Fatalf("re-register: %v", err)
+	}
+
+	// The replacement answers the destroy, truthfully: it has nothing to remove.
+	go func() {
+		got, took, err := p.Poll(t.Context(), "n1", "second")
+		if err != nil || !took {
+			return
+		}
+
+		//nolint:errcheck // the result's fate is not what this test is about
+		_ = p.Result("n1", "second", nodeapi.CommandResult{ID: got.ID, OK: true})
+	}()
+
+	err := p.NewRunner().Destroy(t.Context(), 7)
+	if !errors.Is(err, server.ErrCustody) {
+		t.Errorf("a destroy answered by a process that does not hold the container reported "+
+			"%v; the listener releases the lease while the job is still running", err)
+	}
+
+	// And the record survives, because the draining process still needs to renew
+	// and release what it is holding.
+	if !p.OwnsForTest("l1", "n1", "first") {
+		t.Error("the ownership record was dropped by a destroy its owner never answered; " +
+			"that process can no longer renew or release, and its drain cannot end")
+	}
+}
+
+// A FAILED DESTROY KEEPS THE OWNERSHIP RECORD TOO.
+//
+// An unconditional forget dropped it on failure as well, which left a process
+// that was later superseded unable to renew or release what it was holding.
+func TestAFailedDestroyKeepsItsOwnershipRecord(t *testing.T) {
+	t.Parallel()
+
+	p, _ := deliverLaunch(t)
+
+	// Nobody answers the destroy, so it times out.
+	if err := p.NewRunner().Destroy(t.Context(), 7); err == nil {
+		t.Fatal("a destroy nobody answered reported success")
+	}
+
+	if !p.OwnsForTest("l1", "n1", "first") {
+		t.Error("a failed destroy dropped the ownership record; the process holding that " +
+			"compute can no longer renew or release it")
+	}
+}
+
 // A DESTROY NOBODY CONFIRMED IS A FAILURE, EVEN WHEN THE NODE HAS GONE.
 //
 // The tempting reading is that a vanished node took its containers with it, so
