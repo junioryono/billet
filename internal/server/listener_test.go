@@ -1941,3 +1941,71 @@ func holdRunning(t *testing.T, l *Listener, a *alloc.Allocator, tier string, req
 	l.running[requestID] = lease
 	l.mu.Unlock()
 }
+
+// THE WIRING, WHICH IS A DIFFERENT PROPERTY FROM THE BEHAVIOUR.
+//
+// Every other test of the retry calls retryCleanup directly, so all of them pass
+// against a Run that never starts the loop — the retry works perfectly and is
+// simply never invoked, and in production nothing else invokes it. Deleting the
+// `go l.cleanupLoop(beat)` line survived the entire suite.
+//
+// So this test refuses to touch retryCleanup or complete. It installs a pending
+// cleanup, starts Run, and waits for a destroy that only the loop can produce.
+func TestRunStartsTheCleanupLoop(t *testing.T) {
+	t.Parallel()
+
+	// The loop ticks at ttl/3, so this retries roughly every 100ms. The TTL is
+	// short to make the ticker fire, not to test expiry: no reaper runs here, and
+	// the listener renews its own running leases, so nothing expires underneath.
+	const ttl = 300 * time.Millisecond
+
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
+		alloc.WithLeaseTTL(ttl))
+
+	destroyed := make(chan struct{})
+
+	var once sync.Once
+
+	runner := &fakeRunner{onDestroy: func(int64) error {
+		once.Do(func() { close(destroyed) })
+
+		return nil
+	}}
+
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner))
+
+	holdRunning(t, l, a, tiers[0].Label, 11)
+
+	// Installed DIRECTLY, not through complete(). Going through complete would
+	// call Destroy on the way in, and this test would then pass on that call
+	// rather than on anything the loop did.
+	l.mu.Lock()
+	l.cleanup = map[int64]Job{11: {RequestID: 11}}
+	l.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+
+	// The retry is what ends the test. Without the loop, nothing does, and the
+	// context bound is what turns a missing goroutine into a failure.
+	go func() {
+		select {
+		case <-destroyed:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run: %v", err)
+	}
+
+	select {
+	case <-destroyed:
+	default:
+		t.Fatal("Run never retried a pending cleanup, so nothing started cleanupLoop: a " +
+			"completion whose destroy failed holds its capacity for the life of the " +
+			"process, because GitHub does not redeliver a completion it has acknowledged")
+	}
+}
