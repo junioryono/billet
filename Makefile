@@ -24,8 +24,18 @@ vet:
 	go vet ./...
 
 .PHONY: test
-test: ## Race-enabled test run
-	go test -race -count=1 ./...
+test: ## Race-enabled test run, instrumented exactly as CI runs it
+	# COVERAGE INSTRUMENTATION IS PART OF THE GATE, not an extra. CI runs the
+	# suite with -covermode=atomic, and that is not the same test run: the
+	# counters change timing enough to reorder goroutines the plain -race build
+	# happens to schedule one way every time.
+	#
+	# This is not hypothetical. A launch still in progress was being handed to
+	# teardown — it carries no outcome, so the release failed with `invalid phase
+	# transition: "" is not terminal` — and the bug was invisible here while being
+	# reliable under coverage. A local gate that is weaker than CI trains you to
+	# trust it and then be surprised.
+	go test -race -count=1 -covermode=atomic -coverprofile=$(COVERPROFILE) ./...
 
 .PHONY: cover
 cover: ## Coverage profile + HTML report
