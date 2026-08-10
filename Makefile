@@ -12,7 +12,7 @@ COVERPROFILE     := coverage.out
 .DEFAULT_GOAL := check
 
 .PHONY: check
-check: build vet fmt-check lint test ## The pre-commit gate (CI runs this and more)
+check: no-mutants build vet fmt-check lint test ## The pre-commit gate (CI runs this and more)
 
 .PHONY: build
 build: ## Build ./bin/billet
@@ -42,6 +42,14 @@ cover: ## Coverage profile + HTML report
 	go test -race -count=1 -coverprofile=$(COVERPROFILE) -covermode=atomic ./...
 	go tool cover -func=$(COVERPROFILE) | tail -1
 	go tool cover -html=$(COVERPROFILE)
+
+.PHONY: no-mutants
+no-mutants: ## Refuse to proceed while a killed mutation run has left a mutant on disk
+	@# FIRST in `check`, unlike tests-kept, because this one cannot be a false
+	@# alarm: a `.bak` beside a tracked file means an interrupted mutation run
+	@# left the ORIGINAL holding a mutant. It compiles and mostly passes, so
+	@# every other gate is happy to tell you so.
+	python3 scripts/check-no-mutants.py
 
 .PHONY: tests-kept
 tests-kept: ## Report Test functions that HEAD has and the working tree does not

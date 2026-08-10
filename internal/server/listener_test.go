@@ -815,7 +815,11 @@ func TestARedeliveredCompletionDoesNotConsumeASecondLease(t *testing.T) {
 			"without that failure there is no redelivery to be idempotent against", err)
 	}
 
-	// Restarted the way the control plane would restart it.
+	// Restarted the way the control plane restarts it: a NEW listener on the same
+	// session. Reusing the old one was neither what Server does — it builds one
+	// per tier run — nor safe, since a listener that has shut down has sealed its
+	// cleanup loop and closed its session.
+	l = NewListener(a, tiers[0].Label, session)
 
 	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run after redelivery: %v", err)
@@ -2938,7 +2942,10 @@ func TestRunSealsTheCleanupLoop(t *testing.T) {
 	t.Parallel()
 
 	const (
-		grace = 200 * time.Millisecond
+		// Roomy, because the teardown must get through its own destroy pass inside
+		// this budget. At 200ms a scheduling hiccup after the join expired left
+		// nothing for the destroy, and the test failed on correct code.
+		grace = time.Second
 		// The cleanup loop ticks at TTL/3, so the DEFAULT 90 second TTL means its
 		// first pass is 30 seconds away. This test waited 30 seconds for that pass
 		// and passed in isolation by about three seconds — then failed under the
@@ -2962,6 +2969,10 @@ func TestRunSealsTheCleanupLoop(t *testing.T) {
 		announced atomic.Bool
 	)
 
+	// resumed says the loop's blocked destroy has actually returned, which is the
+	// causal anchor the final assertion needs.
+	resumed := make(chan struct{})
+
 	// Only the loop's FIRST destroy blocks; everything else returns at once, so
 	// what distinguishes the behaviours is a count rather than a hang.
 	runner := &fakeRunner{onDestroy: func(int64) error {
@@ -2971,6 +2982,7 @@ func TestRunSealsTheCleanupLoop(t *testing.T) {
 			entered <- struct{}{}
 
 			<-blocked
+			close(resumed)
 		}
 
 		return errors.New("the node is not answering")
@@ -3027,15 +3039,72 @@ func TestRunSealsTheCleanupLoop(t *testing.T) {
 
 	unblock()
 
-	// Long enough for an unsealed loop to advance and issue its second destroy —
-	// it has nothing left to wait for.
-	time.Sleep(10 * grace)
+	// WAIT FOR THE LOOP TO BE RUNNING AGAIN before judging what it does next.
+	// Without this anchor, "no further destroys after a fixed sleep" also passes
+	// when the orphaned goroutine simply never got scheduled — and the no-seal
+	// mutation survives on that.
+	select {
+	case <-resumed:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the blocked destroy never returned")
+	}
+
+	// From here an unsealed loop has one map lookup and a Destroy left, so this
+	// waits for something that would happen immediately rather than guessing how
+	// long a goroutine might take to be scheduled at all.
+	time.Sleep(grace)
 
 	if got := destroys.Load(); got != afterRun {
 		t.Errorf("the cleanup loop issued %d more destroy(s) after Run returned; nothing "+
 			"sealed it, so it walked on through a snapshot the teardown had already "+
 			"claimed — outside the single slot, with no process left to own it",
 			got-afterRun)
+	}
+}
+
+// A LISTENER IS SINGLE USE, and says so rather than misbehaving quietly.
+//
+// Shutdown seals the cleanup loop permanently and closes the session, so a
+// second Run gets a listener polling a closed session whose retries all return
+// "sealed" — which retryCleanup reads as success, so it neither retries nor
+// backs off nor complains. Every completion whose destroy fails after that is
+// silently abandoned.
+//
+// Server builds a fresh listener per tier run, so nothing in production does
+// this. A TEST did, with a comment claiming it was restarting the way the
+// control plane restarts, which is exactly the misunderstanding an exported Run
+// with no guard invites.
+func TestAListenerIsSingleUse(t *testing.T) {
+	t.Parallel()
+
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(&fakeRunner{}))
+
+	first, stop := context.WithTimeout(t.Context(), 30*time.Second)
+
+	t.Cleanup(stop)
+
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		stop()
+	}()
+
+	if err := l.Run(first); err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("first run: %v", err)
+	}
+
+	err := l.Run(t.Context())
+	if err == nil {
+		t.Fatal("a listener that had already shut down ran again; its cleanup loop is " +
+			"sealed and its session closed, so every failed destroy from here is " +
+			"abandoned without a word")
+	}
+
+	if !strings.Contains(err.Error(), "already run") {
+		t.Errorf("second run failed with %v; want a refusal saying so, because any other "+
+			"error means it started and stopped for an unrelated reason", err)
 	}
 }
 
@@ -3061,6 +3130,15 @@ func TestAPanickingRetryStillReleasesItsMark(t *testing.T) {
 
 	holdRunning(t, l, a, tiers[0].Label, 7)
 
+	l.mu.Lock()
+	l.cleanup = map[int64]*pendingCleanup{7: {job: Job{RequestID: 7}}}
+	l.mu.Unlock()
+
+	// THROUGH retryCleanup, which is what the cleanup loop calls. Driving
+	// `attempt` directly proved the method was exception-safe and nothing about
+	// the path that uses it: a version that inlined the old mark/complete/unmark
+	// sequence back into retryCleanup, never calling attempt at all, left that
+	// test green.
 	func() {
 		defer func() {
 			if recover() == nil {
@@ -3068,11 +3146,7 @@ func TestAPanickingRetryStillReleasesItsMark(t *testing.T) {
 			}
 		}()
 
-		// Unreachable when the runner panics, which is the point — and a real
-		// assertion rather than a discarded error if it ever stops panicking.
-		if err := l.attempt(t.Context(), Job{RequestID: 7}); err != nil {
-			t.Errorf("attempt: %v", err)
-		}
+		l.retryCleanup(t.Context())
 	}()
 
 	l.mu.Lock()

@@ -1024,6 +1024,7 @@ before the fifth one: **the thing that would have objected was itself missing.**
 | A mutant applied but changed no behaviour | `SURVIVED` — identical to a real coverage gap | A mutant must remove or invert behaviour; if you cannot name the assertion it should break, it is not a mutant |
 | A review prompt file did not exist | `codex exec` exit 0, no findings — identical to a clean round | `run_round.sh` refuses to launch without a non-empty prompt |
 | A scripted edit deleted a whole test | Suite green; a deleted test cannot fail | `make tests-kept` — compares Test function names against HEAD |
+| A killed mutation run left its mutant in the file | Compiles, mostly passes; an earlier green gate says nothing because the mutation landed after it | `make no-mutants` — runs FIRST in `check`; a stranded `.bak` is the only evidence |
 
 The last one was found only because a mutation run happened to name that test and
 reported `NO SUCH TEST`. Nothing else in the toolchain noticed, and nothing else

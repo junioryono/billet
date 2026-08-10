@@ -286,6 +286,9 @@ type Listener struct {
 	// decision rather than two — see attempt.
 	sealed bool
 
+	// ran records that Run has been called. A Listener is single-use; see Run.
+	ran bool
+
 	// confirmed is when each lease was last successfully renewed, keyed by lease
 	// id. It is what turns "no answer" into a bounded state: past the TTL without
 	// a confirmation the reaper may already have taken the lease, so advertising
@@ -686,6 +689,27 @@ func (l *Listener) Run(ctx context.Context) error {
 	// twelve quiet minutes of something they did not ask for.
 	if err := l.configError(); err != nil {
 		return fmt.Errorf("server: listener for %s is misconfigured: %w", l.tier, err)
+	}
+
+	// SINGLE USE, said out loud rather than left as a property of the caller.
+	//
+	// Shutdown seals the cleanup loop permanently and closes the session, so a
+	// second Run gets a listener that polls a closed session and whose retries all
+	// return "sealed" — which retryCleanup reads as success, so it neither retries
+	// nor backs off nor complains. Every completion whose destroy fails from then
+	// on is silently abandoned.
+	//
+	// Server builds a fresh listener per tier run, so nothing in production does
+	// this. A test did, with a comment saying it was restarting the way the
+	// control plane restarts — which is exactly the misunderstanding an exported
+	// Run with no guard invites.
+	l.mu.Lock()
+	reused := l.ran
+	l.ran = true
+	l.mu.Unlock()
+
+	if reused {
+		return fmt.Errorf("server: listener for %s has already run; build a new one", l.tier)
 	}
 
 	// Heartbeats run on their OWN clock, not between polls.
@@ -1401,6 +1425,14 @@ func (l *Listener) attempt(ctx context.Context, job Job) error {
 // Called BEFORE the loop is cancelled, because cancelling is a request and this
 // is a fact: once it returns, every request not already marked in `destroying`
 // is the teardown's alone.
+//
+// PERMANENT, AND THAT IS ONLY SAFE BECAUSE A LISTENER IS NEVER REUSED. Server
+// builds and runs one in a single expression — `NewListener(...).Run(ctx)` —
+// so nothing holds a reference across a Run. If that changes, a supervisor that
+// retries a tier by calling Run again on the same value gets a listener whose
+// cleanup loop is dead for the rest of the process: retrying nothing, reporting
+// nothing, and skipping every request at the next shutdown. Add an unseal, or
+// keep building a new one.
 func (l *Listener) seal() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
