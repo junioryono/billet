@@ -1869,4 +1869,18 @@ func TestSupersessionMovesRunningWorkIntoCustody(t *testing.T) {
 	if got := len(r.custodySnapshot()); got != 1 {
 		t.Errorf("a second supersession produced %d custody entries, want 1", got)
 	}
+
+	// MOVED, NOT COPIED, which is the assertion that matters and the one the
+	// first version of this test left out. Once Tend has confirmed the compute
+	// gone and dropped the custody entry, this process must be holding nothing —
+	// an entry left behind in `running` keeps Holding() true forever and the
+	// drain can never end.
+	r.mu.Lock()
+	r.custody = map[string]*custody{}
+	r.mu.Unlock()
+
+	if r.Holding() {
+		t.Error("after its custody was discharged the node still reported that it was " +
+			"holding something; a superseded process in that state drains forever")
+	}
 }

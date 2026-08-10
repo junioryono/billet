@@ -236,13 +236,30 @@ func TestAvailableIsAcquiredAndAssignedConsumesEscrow(t *testing.T) {
 	// asserted after Run returns would see zero either way and prove nothing.
 	var running atomic.Int32
 
+	// STOPS ON THE CONDITION, NOT ON A STOPWATCH. This used to sleep 150ms and
+	// then cancel, which is a bet that a machine running fourteen instrumented
+	// test binaries in parallel gets through an acquire, an assign and a launch in
+	// that window. It usually does, and when it does not the failure reads as a
+	// listener that acquired nothing — a real-looking bug that is only a slow
+	// scheduler.
+	//
+	// The listener has done what this test is about once a poll observes the
+	// running lease; anything after that is the shutdown path, which is a
+	// different test.
+	stop := sync.OnceFunc(cancel)
+
 	session.onPoll = func(int) {
-		running.Store(int32(l.Running()))
+		if n := int32(l.Running()); n > 0 {
+			running.Store(n)
+			stop()
+		}
 	}
 
+	// A ceiling, so a genuine failure to make progress ends the test rather than
+	// waiting out the context.
 	go func() {
-		time.Sleep(150 * time.Millisecond)
-		cancel()
+		time.Sleep(10 * time.Second)
+		stop()
 	}()
 
 	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) &&

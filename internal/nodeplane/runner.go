@@ -94,6 +94,11 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job server.Job)
 // The result is the FIRST failure, if any: a destroy that only partly succeeded
 // has left compute running somewhere and must not report success.
 func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
+	// THE COMPUTE IS ENDING, SO ITS OWNERSHIP IS TOO. This is the only moment the
+	// wire hears about an ordinary successful job finishing: its lease is released
+	// in-process by the listener, which never calls the node.
+	defer r.plane.forgetForRequest(requestID)
+
 	// A DESTROY MUST NOT WAIT ON A CORPSE. This is the broadcast that made stale
 	// nodes expensive: each one held the call for the full command timeout and
 	// then failed it, and the listener answers a failed destroy by holding its

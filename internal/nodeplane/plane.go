@@ -192,6 +192,10 @@ type pending struct {
 type leaseOwner struct {
 	node        string
 	incarnation string
+	// requestID is the job this lease was launched for, so the destroy that ends
+	// an ordinary job can end its ownership too. That destroy is the only signal
+	// the wire gets: the lease itself is released in-process by the listener.
+	requestID int64
 }
 
 // Option configures a Plane.
@@ -484,6 +488,24 @@ func (p *Plane) CheckIncarnation(name, claimed string) error {
 
 // ErrNotEntitled means a node asked for something no command it holds allows.
 var ErrNotEntitled = errors.New("nodeplane: this node holds no command that entitles it to that")
+
+// forgetForRequest drops the ownership of whatever lease a request was launched
+// under.
+//
+// The listener destroys a job's compute when it completes, which is the ONLY
+// signal for an ordinary successful job: its lease is then released through the
+// allocator, in-process, without ever touching this wire. Without this, every
+// completed job left an entry for the life of the installation.
+func (p *Plane) forgetForRequest(requestID int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	for id, owner := range p.owners {
+		if owner.requestID == requestID {
+			delete(p.owners, id)
+		}
+	}
+}
 
 // ForgetLease drops the ownership record for a lease that has ended.
 //
@@ -827,7 +849,11 @@ func (p *Plane) takeLocked(n *node, incarnation string) (nodeapi.Command, bool) 
 			p.owners = make(map[string]leaseOwner)
 		}
 
-		p.owners[pend.cmd.Lease.ID] = leaseOwner{node: n.name, incarnation: incarnation}
+		p.owners[pend.cmd.Lease.ID] = leaseOwner{
+			node:        n.name,
+			incarnation: incarnation,
+			requestID:   pend.cmd.RequestIDOf(),
+		}
 	}
 
 	return pend.cmd, true
@@ -879,16 +905,21 @@ func (p *Plane) Result(nodeName, incarnation string, res nodeapi.CommandResult) 
 
 	delete(n.inflight, res.ID)
 
-	// THE COMMAND IS OVER, SO THE OWNERSHIP RECORD IS TOO, unless custody has
-	// begun — in which case the node still needs the right to renew and release
-	// what it is holding.
+	// OWNERSHIP OUTLIVES THE COMMAND, and tying it to the command was a way to
+	// lose a container. A launch that SUCCEEDS leaves a container running; deleting
+	// the owner then let a second host register, take the lease through
+	// AdoptOwnership, and refuse the process that is actually running it when it
+	// later takes custody. A completion routed to the new owner finds nothing,
+	// reports success, and the lease is released under a live job.
 	//
-	// Cleaning up only on the node's release route was not enough: an ordinary
-	// successful job is released by the LISTENER through the allocator, which
-	// never touches this wire. One entry per historical job accumulated for the
-	// life of the installation, since a node that never goes quiet is never
-	// expired.
-	if pend.cmd.Kind == nodeapi.CommandLaunch && pend.cmd.Lease != nil && !res.Custody {
+	// So a successful launch KEEPS its owner, and the record ends where the
+	// compute does: when the listener destroys it (destroyLocked below) or the
+	// node releases it over the wire.
+	//
+	// A launch that FAILED without custody started nothing, so there is nothing
+	// left to own.
+	if pend.cmd.Kind == nodeapi.CommandLaunch && pend.cmd.Lease != nil &&
+		!res.OK && !res.Custody {
 		delete(p.owners, pend.cmd.Lease.ID)
 	}
 

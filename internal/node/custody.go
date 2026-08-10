@@ -541,14 +541,19 @@ func (r *Runner) Superseded() {
 	defer r.mu.Unlock()
 
 	for requestID, inst := range r.running {
-		if lease, ok := r.runningLease[requestID]; ok {
-			if _, held := r.custody[lease.ID]; held {
-				continue
-			}
-		}
-
 		lease, ok := r.runningLease[requestID]
 		if !ok {
+			continue
+		}
+
+		// MOVED, NOT COPIED, and copying was a way to make the drain eternal. An
+		// entry left in `running` keeps Holding() true after Tend has confirmed the
+		// compute gone and removed its custody entry — so the process has nothing
+		// left to do and can never stop.
+		delete(r.running, requestID)
+		delete(r.runningLease, requestID)
+
+		if _, held := r.custody[lease.ID]; held {
 			continue
 		}
 

@@ -385,6 +385,24 @@ func (h *handler) register(w http.ResponseWriter, r *http.Request) {
 
 	h.warnIfExpiring(r, req.Node)
 
+	// READ BEFORE COMMITTING, because Register is not a question — it supersedes
+	// whatever process held the name, resolves its in-flight commands, and makes
+	// the new one current. Doing the ledger read afterwards and answering 503
+	// produced the worst of both: the caller believed it had failed and backed
+	// off, while the plane had already replaced a healthy process with one that
+	// never considered itself registered.
+	ids, err := h.store.LaunchedLeaseIDs(r.Context(), req.Node)
+	if err != nil {
+		h.log.Warn("could not read which leases this node already holds; refusing the "+
+			"registration rather than accepting a node whose existing compute the plane "+
+			"cannot attribute", "node", req.Node, "error", err)
+
+		writeErr(w, http.StatusServiceUnavailable, "", fmt.Sprintf(
+			"could not read the leases already placed on %s: %v", req.Node, err))
+
+		return
+	}
+
 	res, err := h.plane.Register(r.Context(), req)
 	if err != nil {
 		// TWO KINDS OF NO, and conflating them was the bug. A verdict — wrong
@@ -403,33 +421,11 @@ func (h *handler) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// OWNERSHIP IS REBUILT FROM THE LEDGER, because the plane's copy does not
-	// survive a restart and a superseded process cannot finish without it. The
-	// sequence that breaks otherwise: a node is holding compute, the control plane
-	// restarts, the node re-registers and adopts what it finds, a second host
-	// supersedes it — and the new plane never saw those launches, so it refuses
-	// the draining process its own release and the drain never ends.
-	//
-	// AND A REBUILD THAT FAILED IS NOT A REGISTRATION THAT SUCCEEDED. Treating it
-	// as best-effort was wrong: the node goes on to adopt its surviving compute
-	// believing it is registered, and if it is later superseded the plane has no
-	// record that those leases are its — so its renewals are refused and the
-	// leases are reaped under running containers.
-	//
-	// A ledger that cannot answer is an outage, so this is a 503 the node retries,
-	// not a verdict it stops on.
-	ids, err := h.store.LaunchedLeaseIDs(r.Context(), req.Node)
-	if err != nil {
-		h.log.Warn("could not read which leases this node already holds; refusing the "+
-			"registration rather than accepting a node whose existing compute the plane "+
-			"cannot attribute", "node", req.Node, "error", err)
-
-		writeErr(w, http.StatusServiceUnavailable, "", fmt.Sprintf(
-			"could not read the leases already placed on %s: %v", req.Node, err))
-
-		return
-	}
-
+	// OWNERSHIP IS REBUILT FROM WHAT WAS READ ABOVE, because the plane's copy does
+	// not survive a restart and a superseded process cannot finish without it: a
+	// node holding compute, a plane that restarts, a re-registration, and then a
+	// second host — the new plane never saw those launches, so it would refuse the
+	// draining process its own release.
 	open := make([]string, 0, len(ids))
 	for id := range ids {
 		open = append(open, id)
@@ -569,15 +565,21 @@ func (h *handler) release(w http.ResponseWriter, r *http.Request) {
 	// owns the lease, and a draining process outlives the node record on purpose.
 
 	if err := h.store.Release(r.Context(), r.PathValue("lease"), req.Epoch, outcome); err != nil {
+		// TERMINAL FOR THE NODE IS TERMINAL FOR THE RECORD. A lease that is gone or
+		// fenced will never be released successfully — the node stops holding it on
+		// exactly these answers — so returning without dropping the ownership left
+		// an entry no later event could ever remove.
+		if errors.Is(err, alloc.ErrLeaseNotFound) || errors.Is(err, alloc.ErrFenced) {
+			h.plane.ForgetLease(r.PathValue("node"), r.PathValue("lease"))
+		}
+
 		writeStoreErr(w, err)
 
 		return
 	}
 
 	// THE OWNERSHIP RECORD ENDS WITH THE LEASE. Kept only while somebody might
-	// still need to prove they hold it; one entry per historical job would grow
-	// for the life of the installation, since a node that never goes quiet is
-	// never expired.
+	// still need to prove they hold it.
 	h.plane.ForgetLease(r.PathValue("node"), r.PathValue("lease"))
 
 	w.WriteHeader(http.StatusNoContent)
