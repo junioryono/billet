@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"sync"
 	"time"
 
@@ -499,7 +500,7 @@ func WithStalePromiseAfter(d time.Duration) Option {
 // the alternative to a grace that is too short is not a cleaner shutdown, it is
 // leases nobody releases and containers nobody removes.
 func WithShutdownGrace(d time.Duration) Option {
-	return func(l *Listener) { l.shutdownGrace = d }
+	return func(l *Listener) { l.shutdownGrace = positiveOr(d, defaultShutdownGrace) }
 }
 
 // WithFinishGraces bounds the two local phases of the teardown: closing the
@@ -510,8 +511,46 @@ func WithShutdownGrace(d time.Duration) Option {
 // fail on what is left of a shared budget.
 func WithFinishGraces(closing, releasing time.Duration) Option {
 	return func(l *Listener) {
-		l.closeGrace, l.releaseGrace = closing, releasing
+		l.closeGrace = positiveOr(closing, defaultCloseGrace)
+		l.releaseGrace = positiveOr(releasing, defaultReleaseGrace)
 	}
+}
+
+// sumBudgets adds the teardown budgets without letting them wrap.
+//
+// Three valid positive durations can overflow int64 and come out NEGATIVE, which
+// context.WithTimeout reads as already expired — so an operator who set an
+// absurdly long grace would get a watchdog that fired instantly and stopped
+// renewing while the destroys ran on. Saturating is the honest answer: a budget
+// nobody will reach, rather than one that has already passed.
+func sumBudgets(budgets ...time.Duration) time.Duration {
+	total := time.Duration(0)
+
+	for _, b := range budgets {
+		if total > math.MaxInt64-b {
+			return time.Duration(math.MaxInt64)
+		}
+
+		total += b
+	}
+
+	return total
+}
+
+// positiveOr keeps a non-positive duration from becoming an already-expired
+// deadline.
+//
+// Zero is the value a caller passes by leaving a field unset, and
+// context.WithTimeout treats it as "already over" — so a shutdown budget of zero
+// would fail the session close on its first instruction, take the early return,
+// and skip the release entirely. A misconfiguration should cost the default, not
+// the teardown.
+func positiveOr(d, fallback time.Duration) time.Duration {
+	if d <= 0 {
+		return fallback
+	}
+
+	return d
 }
 
 // WithCleanupRetryPacing sets how long a failed cleanup retry waits before the
@@ -639,19 +678,31 @@ func (l *Listener) Run(ctx context.Context) error {
 		// holds so the reaper can never reclaim them either, and the process unable
 		// to exit. Neither Runner nor Session promises a bound, so the listener
 		// imposes one.
-		stopCtx, endGrace := context.WithTimeout(context.WithoutCancel(ctx), l.shutdownGrace)
-		defer endGrace()
-
-		// RENEWAL OUTLASTS BOTH PHASES, not just the destroys.
+		// ONE DEADLINE THAT EVERY PHASE INHERITS, rather than a sum the phases can
+		// outlive.
 		//
-		// The watchdog used to fire when the destroy budget expired, and the close
-		// and release then ran for another finishGrace with nothing renewing. Held
-		// and promised leases could expire in that window while the session — and
-		// the positive maxCapacity GitHub last saw — was still open, which is the
-		// close-before-release invariant broken by expiry rather than by a call.
-		renewCtx, endRenewal := context.WithTimeout(context.WithoutCancel(ctx),
-			l.shutdownGrace+l.closeGrace+l.releaseGrace)
-		defer endRenewal()
+		// Renewal has to outlast the whole teardown: it used to stop when the
+		// destroy budget expired, leaving the close and the release running with
+		// nothing renewing, so held and promised leases could expire while the
+		// session — and the positive maxCapacity GitHub last saw — was still open.
+		// That is the close-before-release invariant broken by expiry rather than
+		// by a call.
+		//
+		// Giving renewal the SUM of the three budgets did not establish that,
+		// because each later phase started its own fresh budget when the previous
+		// one finished: a destroy that ran to the summed deadline was followed by a
+		// close with a full closeGrace still ahead of it. Deriving every phase from
+		// one overall deadline makes each of them min(its own budget, what is left)
+		// — so no phase can outlive renewal, by construction rather than by
+		// arithmetic.
+		overall, endOverall := context.WithTimeout(context.WithoutCancel(ctx),
+			sumBudgets(l.shutdownGrace, l.closeGrace, l.releaseGrace))
+		defer endOverall()
+
+		renewCtx := overall
+
+		stopCtx, endGrace := context.WithTimeout(overall, l.shutdownGrace)
+		defer endGrace()
 
 		// RENEWAL STOPS LAST, so it is deferred first. The release below destroys
 		// whatever is still running, which is slow and remote, and every lease it
@@ -702,11 +753,17 @@ func (l *Listener) Run(ctx context.Context) error {
 			default:
 			}
 
+			// THE COMPONENTS, not just the total. The sum is not a knob: an operator
+			// reading "budget=13m" cannot tell which of the three to change, and
+			// raising the wrong one only delays the reclaim rather than giving the
+			// destroys longer.
 			l.log.Error("this listener's teardown outran its whole shutdown budget; renewal "+
 				"is stopping so the reaper can reclaim what it still holds, but the compute "+
 				"it was destroying may still be running on its host",
 				"tier", l.tier,
-				"budget", l.shutdownGrace+l.closeGrace+l.releaseGrace)
+				"destroy_grace", l.shutdownGrace,
+				"close_grace", l.closeGrace,
+				"release_grace", l.releaseGrace)
 
 			stopBeating()
 		}()
@@ -756,7 +813,7 @@ func (l *Listener) Run(ctx context.Context) error {
 		// the releases — which run one at a time against a single SQLite writer —
 		// to fail on the remainder, so a clean shutdown can still withhold the
 		// whole tier's capacity until the reaper.
-		closeCtx, endClose := context.WithTimeout(context.WithoutCancel(ctx), l.closeGrace)
+		closeCtx, endClose := context.WithTimeout(overall, l.closeGrace)
 		defer endClose()
 
 		if err := l.session.Close(closeCtx); err != nil {
@@ -770,7 +827,7 @@ func (l *Listener) Run(ctx context.Context) error {
 			return
 		}
 
-		releaseCtx, endRelease := context.WithTimeout(context.WithoutCancel(ctx), l.releaseGrace)
+		releaseCtx, endRelease := context.WithTimeout(overall, l.releaseGrace)
 		defer endRelease()
 
 		l.releaseAll(releaseCtx, destroyed)

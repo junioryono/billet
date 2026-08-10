@@ -1611,8 +1611,9 @@ type fakeSession struct {
 	// another scale set wins the same offer.
 	onAcquire func(ids []int64) ([]int64, error)
 	// onClose fails the session close, which sends shutdown down the path that
-	// deliberately skips the release.
-	onClose func() error
+	// deliberately skips the release. It receives the context so a test can
+	// inspect the deadline the close was given.
+	onClose func(ctx context.Context) error
 	stats   *Statistics
 	// acquired records every request id the listener asked GitHub to claim, so a
 	// test can assert WHICH class of message drove the acquisition.
@@ -1680,7 +1681,7 @@ func (f *fakeSession) Close(ctx context.Context) error {
 	}
 
 	if f.onClose != nil {
-		return f.onClose()
+		return f.onClose(ctx)
 	}
 
 	return nil
@@ -2139,6 +2140,182 @@ func TestShutdownDestroysEachRequestOnce(t *testing.T) {
 	}
 }
 
+// A SHUTDOWN BUDGET OF ZERO IS A MISCONFIGURATION, NOT AN INSTRUCTION.
+//
+// Zero is what a caller passes by leaving a field unset, and context.WithTimeout
+// reads it as "already over" — so a zero budget would fail the session close on
+// its first instruction, take the early return that exists for a session billet
+// could not close, and skip the release entirely. Every lease would be left for
+// the reaper by a configuration mistake that looks like no configuration at all.
+func TestANonPositiveGraceFallsBackToTheDefault(t *testing.T) {
+	t.Parallel()
+
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(&fakeRunner{}),
+		WithShutdownGrace(0), WithFinishGraces(0, -time.Second))
+
+	if l.shutdownGrace != defaultShutdownGrace {
+		t.Errorf("a zero shutdown grace became %v, want the default %v",
+			l.shutdownGrace, defaultShutdownGrace)
+	}
+
+	if l.closeGrace != defaultCloseGrace {
+		t.Errorf("a zero close grace became %v, want the default %v",
+			l.closeGrace, defaultCloseGrace)
+	}
+
+	if l.releaseGrace != defaultReleaseGrace {
+		t.Errorf("a negative release grace became %v, want the default %v",
+			l.releaseGrace, defaultReleaseGrace)
+	}
+
+	// AND A POSITIVE VALUE IS ACTUALLY WIRED THROUGH. Every other test of these
+	// budgets would pass against an option that ignored its arguments and kept the
+	// defaults, because the defaults are generous enough for all of them.
+	set := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(&fakeRunner{}),
+		WithShutdownGrace(time.Second), WithFinishGraces(2*time.Second, 3*time.Second))
+
+	if set.shutdownGrace != time.Second ||
+		set.closeGrace != 2*time.Second ||
+		set.releaseGrace != 3*time.Second {
+		t.Errorf("configured graces came out as %v/%v/%v, want 1s/2s/3s",
+			set.shutdownGrace, set.closeGrace, set.releaseGrace)
+	}
+}
+
+// AN ABSURD GRACE DOES NOT WRAP THE BUDGET.
+//
+// Three valid positive durations can overflow int64 and come out NEGATIVE, which
+// context.WithTimeout reads as already expired. An operator who set a very long
+// grace — the direction a cautious one errs in — would get the exact opposite of
+// what they asked for: a watchdog that fired immediately and stopped renewing
+// while the destroys ran on.
+func TestAnAbsurdGraceDoesNotWrapTheBudget(t *testing.T) {
+	t.Parallel()
+
+	const huge = time.Duration(1) << 62
+
+	if got := sumBudgets(huge, huge, huge); got <= 0 {
+		t.Errorf("three large budgets summed to %v; a negative total is an "+
+			"already-expired deadline, so the longest configuration produces the "+
+			"shortest behaviour", got)
+	}
+
+	// And the ordinary case still adds up.
+	if got := sumBudgets(time.Second, 2*time.Second, 3*time.Second); got != 6*time.Second {
+		t.Errorf("sumBudgets(1s, 2s, 3s) = %v, want 6s", got)
+	}
+}
+
+// A PHASE THAT OVERRUNS DOES NOT PUSH THE NEXT ONE PAST THE WHOLE BUDGET.
+//
+// Renewal is bounded by the sum of the three phase budgets, so no phase may end
+// after that sum — otherwise the close or the release runs with nothing renewing
+// and leases expire while the session is still open. Giving each phase its own
+// fresh budget did not establish that: the phases run in sequence, so a destroy
+// that IGNORES its context and overruns leaves the close starting late with a
+// full closeGrace still ahead of it, ending after the sum.
+//
+// Deriving every phase from one overall deadline makes each of them min(its own
+// budget, what is left), which is the property this checks directly — what
+// deadline the close was actually handed, not merely how long it took.
+func TestAnOverrunningPhaseCannotPushTheNextPastTheBudget(t *testing.T) {
+	t.Parallel()
+
+	const (
+		destroying = 300 * time.Millisecond
+		overrun    = 2 * time.Second
+		closing    = 10 * time.Second
+		releasing  = 300 * time.Millisecond
+	)
+
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+
+	// A destroy that ignores its context and overruns the destroy budget, which
+	// nothing in the Runner contract forbids.
+	runner := &fakeRunner{onDestroy: func(int64) error {
+		time.Sleep(overrun)
+
+		return nil
+	}}
+
+	deadlines := make(chan time.Time, 1)
+
+	session := &fakeSession{onClose: func(ctx context.Context) error {
+		d, ok := ctx.Deadline()
+		if !ok {
+			d = time.Time{}
+		}
+
+		select {
+		case deadlines <- d:
+		default:
+		}
+
+		return nil
+	}}
+
+	l := NewListener(a, tiers[0].Label, session, WithRunner(runner),
+		WithShutdownGrace(destroying), WithFinishGraces(closing, releasing))
+
+	holdRunning(t, l, a, tiers[0].Label, 7)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	defer cancel()
+
+	runDone := make(chan struct{})
+
+	go func() {
+		defer close(runDone)
+
+		if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("Run: %v", err)
+		}
+	}()
+
+	// The budget starts when the TEARDOWN does, not when Run does. Measuring from
+	// before the run makes the bound tighter than the code ever promised, and
+	// fails it by the microseconds between the two.
+	cancel()
+
+	teardown := time.Now()
+
+	select {
+	case <-runDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("Run never returned")
+	}
+
+	var closeDeadline time.Time
+
+	select {
+	case closeDeadline = <-deadlines:
+	default:
+		t.Fatal("the shutdown never closed the session")
+	}
+
+	if closeDeadline.IsZero() {
+		t.Fatal("the session close was handed a context with no deadline at all")
+	}
+
+	// Slack for the gap between cancelling and the teardown actually beginning.
+	// Small next to what this is distinguishing: without the overall deadline the
+	// close gets a fresh ten seconds against roughly eight that remain, so the
+	// overshoot to catch is well over a second.
+	const slack = 500 * time.Millisecond
+
+	budget := sumBudgets(destroying, closing, releasing)
+
+	if over := closeDeadline.Sub(teardown.Add(budget)); over > slack {
+		t.Errorf("the session close was given until %v past the whole shutdown budget; "+
+			"renewal stops at that budget, so the close and the release run with "+
+			"nothing renewing and leases expire while the session is still open", over)
+	}
+}
+
 // A BLOCKED REQUEST IS REPORTED ONCE, NOT ON EVERY OFFER.
 //
 // GitHub re-offers a job nobody acquires for as long as it stays queued, so a
@@ -2181,10 +2358,27 @@ func TestABlockedRequestIsReportedOnce(t *testing.T) {
 			"as long as the node is away", got)
 	}
 
+	// AND EACH REQUEST GETS ITS OWN. Suppressing per LISTENER would satisfy
+	// everything above while silencing every request after the first, which is the
+	// version of this that hides an outage behind one line about an unrelated job.
+	l.mu.Lock()
+	l.cleanup[9] = &pendingCleanup{job: Job{RequestID: 9}}
+	l.mu.Unlock()
+
+	if got := l.reserve([]Job{{RequestID: 9}}); len(got) != 0 {
+		t.Fatalf("reserved %v for a second blocked request", got)
+	}
+
+	if got := lines.count("previous run"); got != 2 {
+		t.Errorf("two blocked requests produced %d warnings, want 2; suppressing per "+
+			"listener rather than per obligation hides every request after the first", got)
+	}
+
 	// A NEW OBLIGATION IS NEW NEWS. Suppressing per entry rather than per request
 	// is what makes that true, and silence here would be the opposite failure.
 	l.mu.Lock()
 	delete(l.cleanup, 7)
+	delete(l.cleanup, 9)
 	l.mu.Unlock()
 
 	owe()
@@ -2193,8 +2387,8 @@ func TestABlockedRequestIsReportedOnce(t *testing.T) {
 		t.Fatalf("reserved %v for a freshly owed request", got)
 	}
 
-	if got := lines.count("previous run"); got != 2 {
-		t.Errorf("a second, separate obligation produced %d warnings in total, want 2; "+
+	if got := lines.count("previous run"); got != 3 {
+		t.Errorf("a third, separate obligation produced %d warnings in total, want 3; "+
 			"suppressing it would hide a request that had started failing again", got)
 	}
 }
@@ -2319,7 +2513,7 @@ func TestASlowCloseDoesNotCostTheReleaseItsBudget(t *testing.T) {
 	// A close that overruns its budget and then succeeds anyway — nothing in the
 	// Session contract says it must honour the deadline, and that is exactly when
 	// a shared budget hurts.
-	session := &fakeSession{onClose: func() error {
+	session := &fakeSession{onClose: func(context.Context) error {
 		time.Sleep(2 * closing)
 
 		return nil
@@ -2917,7 +3111,7 @@ func TestASessionThatWillNotCloseStillDestroysItsCompute(t *testing.T) {
 		return nil
 	}}
 
-	session := &fakeSession{onClose: func() error {
+	session := &fakeSession{onClose: func(context.Context) error {
 		return errors.New("the scale set session is not answering")
 	}}
 
@@ -2989,15 +3183,21 @@ func TestRenewalCoversTheWholeShutdownBudget(t *testing.T) {
 	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
 		alloc.WithLeaseTTL(ttl))
 
-	// A close slow enough that a lease nobody renews expires inside it.
+	// A close that BLOCKS UNTIL THE TEST SAYS SO, rather than sleeping for a
+	// guessed interval. Sleeping meant the assertion raced the close: if the test
+	// goroutine lost 300ms to the scheduler, or the reap took it, the close
+	// finished and releaseAll removed the lease before the check — and correct
+	// code was reported as a renewal failure. Under t.Parallel on a loaded machine
+	// that is not a remote possibility.
 	closing0 := make(chan struct{})
+	checked := make(chan struct{})
 
 	var once sync.Once
 
-	session := &fakeSession{onClose: func() error {
+	session := &fakeSession{onClose: func(context.Context) error {
 		once.Do(func() { close(closing0) })
 
-		time.Sleep(4 * ttl)
+		<-checked
 
 		return nil
 	}}
@@ -3030,18 +3230,24 @@ func TestRenewalCoversTheWholeShutdownBudget(t *testing.T) {
 		t.Fatal("the shutdown never reached the session close")
 	}
 
-	// INSIDE THE CLOSE, and past both the destroy budget and a lease TTL. If
-	// renewal stopped when the destroys did, this lease is gone by now.
+	// INSIDE THE CLOSE, and past both the destroy budget and a lease TTL. The
+	// close cannot finish until this is done, so the only thing that can have kept
+	// the lease alive is renewal.
 	time.Sleep(grace + 2*ttl)
 
-	if _, err := a.Reap(t.Context()); err != nil {
-		t.Fatalf("reap: %v", err)
+	_, reapErr := a.Reap(t.Context())
+	beat := a.Heartbeat(t.Context(), lease.ID, lease.Epoch)
+
+	close(checked)
+
+	if reapErr != nil {
+		t.Fatalf("reap: %v", reapErr)
 	}
 
-	if err := a.Heartbeat(t.Context(), lease.ID, lease.Epoch); err != nil {
+	if beat != nil {
 		t.Fatalf("a lease expired while the shutdown was still closing its session (%v); "+
 			"the old maxCapacity is still live at that moment, so another tier can "+
-			"escrow capacity GitHub may still assign against", err)
+			"escrow capacity GitHub may still assign against", beat)
 	}
 
 	select {
