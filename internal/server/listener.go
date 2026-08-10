@@ -351,6 +351,10 @@ type pendingCleanup struct {
 	// at is when it may next be attempted. Zero means immediately, which is what
 	// a freshly recorded failure wants: the node may have blinked.
 	at time.Time
+	// declined keeps a request billet cannot take yet from saying so on every
+	// poll. GitHub re-offers an unacquired job indefinitely, so the message is
+	// worth exactly once per obligation.
+	declined bool
 }
 
 // due reports whether this entry may be attempted at the given moment.
@@ -432,6 +436,14 @@ const (
 	// went quiet, and concurrency never helped there anyway.
 	teardownConcurrency = 1
 
+	// finishGrace bounds the local half of the teardown — closing the session and
+	// releasing leases — separately from the remote destroys.
+	//
+	// Short, because none of it waits on a node. Its own, because sharing the
+	// destroy budget meant a slow node could cost billet the release of capacity
+	// it had already freed.
+	finishGrace = 30 * time.Second
+
 	// defaultShutdownGrace bounds the whole teardown.
 	//
 	// Renewal no longer stops when the caller cancels, which is what lets the
@@ -448,10 +460,18 @@ const (
 	// destroyed. That is the precise failure the grace exists to avoid, caused by
 	// the grace.
 	//
-	// So it covers one command timeout with room to spare, and releaseAll
-	// destroys concurrently rather than in sequence — otherwise N running jobs
-	// would need N timeouts and no single value could be right. A wedged shutdown
-	// costs this long once; a healthy one returns as soon as the work is done.
+	// This covers ONE such destroy with room to spare, and destroys run one at a
+	// time — so N jobs whose nodes have all gone quiet need N times this and will
+	// not get it. That is a known and deliberate gap rather than an oversight: the
+	// alternative on offer is a grace of N times ten minutes, which is not a
+	// grace, and concurrency cannot fix it while Destroy broadcasts to every node.
+	// What it costs is bounded and reported — every request the pass could not
+	// reach is named in the log, and its lease is kept rather than released, so
+	// the reaper reclaims late instead of the capacity being handed out twice.
+	//
+	// The real fix is a destroy addressed to the lease's own node, which makes one
+	// in-flight command per node safe and the whole teardown roughly one timeout
+	// again. Tracked separately.
 	defaultShutdownGrace = 12 * time.Minute
 )
 
@@ -692,7 +712,19 @@ func (l *Listener) Run(ctx context.Context) error {
 		// releases.
 		destroyed := l.destroyAll(stopCtx)
 
-		if err := l.session.Close(stopCtx); err != nil {
+		// A FRESH BUDGET FOR THE LOCAL HALF, because it was being starved by the
+		// remote one.
+		//
+		// Closing the session and releasing leases are fast and mostly local, but
+		// they shared the destroy pass's deadline — so two slow destroys consumed
+		// the whole grace and the close was then handed an already-expired context.
+		// It failed, the early return skipped releaseAll, and leases whose compute
+		// had been destroyed SUCCESSFULLY were left for the reaper anyway. The
+		// expensive half failing must not also throw away the cheap half's work.
+		finishCtx, endFinish := context.WithTimeout(context.WithoutCancel(ctx), finishGrace)
+		defer endFinish()
+
+		if err := l.session.Close(finishCtx); err != nil {
 			l.log.Warn("could not close message session; capacity is held until it expires",
 				"tier", l.tier, "error", err)
 
@@ -703,7 +735,7 @@ func (l *Listener) Run(ctx context.Context) error {
 			return
 		}
 
-		l.releaseAll(stopCtx, destroyed)
+		l.releaseAll(finishCtx, destroyed)
 	}()
 
 	// Seeded from the session before the first poll. A restart does not replay
@@ -1624,10 +1656,18 @@ func (l *Listener) reserve(available []Job) []int64 {
 		// container and release the new job's lease. Request id alone cannot tell
 		// two incarnations apart, so the id stays occupied until the first one is
 		// discharged.
-		if _, ok := l.cleanup[job.RequestID]; ok {
-			l.log.Warn("declining a job whose previous run has compute billet has not "+
-				"managed to destroy; it will be offered again once that is cleaned up",
-				"tier", l.tier, "request", job.RequestID)
+		if entry, ok := l.cleanup[job.RequestID]; ok {
+			// SAID ONCE. GitHub re-offers a job nobody acquires for as long as it is
+			// queued, so warning per offer turns one stuck obligation into a line
+			// every poll for as long as the node stays away.
+			if !entry.declined {
+				entry.declined = true
+
+				l.log.Warn("declining a job whose previous run left compute billet has not "+
+					"managed to destroy; it stays queued until that is cleaned up, and this "+
+					"is reported once rather than on every offer",
+					"tier", l.tier, "request", job.RequestID)
+			}
 
 			continue
 		}
@@ -1719,9 +1759,22 @@ func (l *Listener) assign(ctx context.Context, job Job) (*alloc.Lease, bool, err
 	// reserve: a pending cleanup is addressed by request id, so accepting an
 	// assignment for that id hands the old retry a container and a lease that
 	// belong to the new job.
+	//
+	// AND THIS IS NOT A DECLINE, whatever the reserve path can honestly call
+	// itself. Leaving a request out of AcquireJobs is a real non-acquisition —
+	// GitHub can offer it to another scale set or offer it again. There is no
+	// equivalent call for a job already ASSIGNED to this scale set: billet simply
+	// does not launch it, acknowledges the message, and the job waits for GitHub's
+	// pickup deadline to reassign it. That is a delay, not a loss, and it is the
+	// least bad option available here — holding the message unacknowledged instead
+	// would re-deliver it every poll and block every message behind it.
+	//
+	// Doing better needs the assignment held locally until the obligation clears,
+	// which needs a launch identity rather than a request id. Tracked separately.
 	if _, ok := l.cleanup[job.RequestID]; ok {
-		l.log.Warn("declining an assignment whose previous run has compute billet has not "+
-			"managed to destroy",
+		l.log.Error("cannot start an assigned job while its previous run's compute is still "+
+			"waiting to be destroyed; billet is not launching it and GitHub will reassign it "+
+			"after its pickup deadline",
 			"tier", l.tier, "request", job.RequestID)
 
 		return nil, false, nil

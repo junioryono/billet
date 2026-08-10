@@ -2130,6 +2130,72 @@ func TestShutdownDestroysEachRequestOnce(t *testing.T) {
 	}
 }
 
+// A SLOW DESTROY DOES NOT COST THE RELEASE ITS BUDGET.
+//
+// Closing the session and releasing leases are fast and local, but they used to
+// share the destroy pass's deadline. A destroy that outlasted the grace then
+// handed the close an already-expired context; it failed, the early return
+// skipped releaseAll, and leases whose compute had been destroyed SUCCESSFULLY
+// were left for the reaper anyway. The expensive half failing must not throw
+// away the cheap half's work.
+func TestASlowDestroyDoesNotCostTheReleaseItsBudget(t *testing.T) {
+	t.Parallel()
+
+	const grace = 200 * time.Millisecond
+
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+
+	// Slower than the grace, and it IGNORES the context — nothing in the Runner
+	// contract says it must not, and that is precisely when the grace matters.
+	// It succeeds, so its lease is owed a release.
+	runner := &fakeRunner{onDestroy: func(int64) error {
+		time.Sleep(2 * grace)
+
+		return nil
+	}}
+
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner),
+		WithShutdownGrace(grace))
+
+	holdRunning(t, l, a, tiers[0].Label, 7)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	defer cancel()
+
+	runDone := make(chan struct{})
+
+	go func() {
+		defer close(runDone)
+
+		if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("Run: %v", err)
+		}
+	}()
+
+	cancel()
+
+	select {
+	case <-runDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("Run never returned")
+	}
+
+	// EVERY LEASE BACK. The escrowed ones and the running one whose destroy
+	// succeeded: headroom returning to its full two is the allocator agreeing
+	// nothing is still held.
+	room, err := a.Headroom(t.Context(), tiers[0].Label)
+	if err != nil {
+		t.Fatalf("headroom: %v", err)
+	}
+
+	if room != 2 {
+		t.Errorf("%d of 2 slots came back after shutdown; a destroy that outlasted the "+
+			"grace left the session close and the release with an expired context, so "+
+			"capacity billet had already freed stays held until the reaper", room)
+	}
+}
+
 // A REQUEST WHOSE LAST CONTAINER IS STILL OWED IS NOT TAKEN AGAIN.
 //
 // Cleanup is addressed BY REQUEST ID, because that is all a completion gives us.
@@ -2262,7 +2328,7 @@ func TestARunningLeaseLostLeavesItsComputeOwed(t *testing.T) {
 	l.mu.Lock()
 	l.heartbeatHeld(unreachable)
 	_, stillRunningStale := l.running[9]
-	_, owed := l.cleanup[9]
+	staleEntry, owed := l.cleanup[9]
 	l.mu.Unlock()
 
 	if stillRunningStale {
@@ -2270,9 +2336,17 @@ func TestARunningLeaseLostLeavesItsComputeOwed(t *testing.T) {
 	}
 
 	if !owed {
-		t.Error("a running job dropped for staleness left no cleanup obligation; the " +
+		t.Fatal("a running job dropped for staleness left no cleanup obligation; the " +
 			"allocator never said the lease was lost, so there is even less reason to " +
 			"assume the container is gone")
+	}
+
+	// The same payload check as the lost branch. Asserting only that the key
+	// exists let an empty pendingCleanup{} through, whose retry then destroys
+	// request 0 and leaves the real container running.
+	if staleEntry.job.RequestID != 9 {
+		t.Errorf("the stale branch's obligation names request %d, want 9",
+			staleEntry.job.RequestID)
 	}
 }
 
@@ -2361,9 +2435,9 @@ func TestALeaseNeverConfirmedIsStillBoundedByItsTTL(t *testing.T) {
 	// up to its own deadline, so in production the gap is real: stamping after the
 	// wait gave a lease created at t=0 a clock reading t=TTL/3 and kept it
 	// advertisable to t=4TTL/3, most of the window the seeding exists to close.
-	// The mutex is held for LONGER THAN THE TTL, so the two candidate clocks are
-	// on opposite sides of the deadline when it is checked: a lease stamped at
-	// creation is overdue by then, and one stamped after the wait is not.
+	// The mutex is held for LONGER THAN THE TTL, so the two candidate clocks land
+	// on opposite sides of the deadline: a lease stamped at creation is overdue by
+	// the time it is checked, and one stamped after the wait is not.
 	const contended = 3 * ttl
 
 	l.mu.Lock()
@@ -2372,6 +2446,26 @@ func TestALeaseNeverConfirmedIsStillBoundedByItsTTL(t *testing.T) {
 
 	go func() { escrowed <- l.refillEscrow(t.Context()) }()
 
+	// WAIT FOR THE LEASE TO EXIST, rather than sleeping and assuming it does.
+	// Sleeping first made the test's meaning depend on the scheduler: on a loaded
+	// machine the goroutine could reach Escrow only after the unlock, and then
+	// correct code fails. Headroom dropping to zero is the allocator saying the
+	// escrow has committed, which is the event the clock is supposed to date from.
+	for {
+		room, err := a.Headroom(t.Context(), tiers[0].Label)
+		if err != nil {
+			l.mu.Unlock()
+			t.Fatalf("headroom: %v", err)
+		}
+
+		if room == 0 {
+			break
+		}
+
+		time.Sleep(time.Millisecond)
+	}
+
+	// Only now does the contended wait begin, so it measures what it claims to.
 	time.Sleep(contended)
 	l.mu.Unlock()
 
@@ -2386,14 +2480,13 @@ func TestALeaseNeverConfirmedIsStillBoundedByItsTTL(t *testing.T) {
 	unreachable, cancel := context.WithCancel(t.Context())
 	cancel()
 
-	// A SHORT WAIT, deliberately. The lease is already well past its TTL measured
-	// from creation, and still comfortably inside one measured from the moment the
-	// mutex was released — which is what makes the two clocks tell different
-	// stories here. Waiting longer would put both past the deadline and the test
-	// would pass either way, which is exactly how the first version of it missed
-	// the defect it was written for.
-	time.Sleep(ttl / 3)
-
+	// CHECKED IMMEDIATELY, with no further wait. The lease is already well past a
+	// TTL measured from its creation and barely any time past one measured from
+	// the unlock, so the two clocks give opposite answers with a full TTL of
+	// margin either way. Sleeping here would eat into that margin for no gain —
+	// waiting long enough puts BOTH clocks past the deadline and the test passes
+	// against the defect it exists to catch, which is how its first version went
+	// wrong.
 	l.mu.Lock()
 	l.heartbeatHeld(unreachable)
 	held := len(l.held)
