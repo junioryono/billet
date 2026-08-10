@@ -43,6 +43,14 @@ cover: ## Coverage profile + HTML report
 	go tool cover -func=$(COVERPROFILE) | tail -1
 	go tool cover -html=$(COVERPROFILE)
 
+.PHONY: tests-kept
+tests-kept: ## Report Test functions that HEAD has and the working tree does not
+	@# NOT part of `check`, because deleting a test is sometimes right and this
+	@# cannot tell. It is for scripted edits to _test.go files, where a replaced
+	@# range can swallow a neighbouring test and every gate stays green — a
+	@# deleted test cannot fail. That has happened once; see the script's header.
+	python3 scripts/check-tests-kept.py
+
 .PHONY: lint
 lint: ## golangci-lint (pinned version)
 	golangci-lint run --timeout=5m

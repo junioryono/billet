@@ -1012,6 +1012,23 @@ testing is what found them, and it is not optional for anything load-bearing.
   coverage. `make check` now carries the flags, because a local gate weaker than
   CI trains you to trust it.
 
+### Four ways silence has looked like success, and the guards for each
+
+Every one of these produced a green gate and an untrue conclusion. They are the
+same failure wearing different clothes, and the pattern is worth recognising
+before the fifth one: **the thing that would have objected was itself missing.**
+
+| What went missing | What it looked like | Guard |
+|---|---|---|
+| A scripted substitution matched nothing | Build and tests pass, bug untouched | `assert old in s` before replacing, and verify the file hash changed |
+| A mutant applied but changed no behaviour | `SURVIVED` — identical to a real coverage gap | A mutant must remove or invert behaviour; if you cannot name the assertion it should break, it is not a mutant |
+| A review prompt file did not exist | `codex exec` exit 0, no findings — identical to a clean round | `run_round.sh` refuses to launch without a non-empty prompt |
+| A scripted edit deleted a whole test | Suite green; a deleted test cannot fail | `make tests-kept` — compares Test function names against HEAD |
+
+The last one was found only because a mutation run happened to name that test and
+reported `NO SUCH TEST`. Nothing else in the toolchain noticed, and nothing else
+would have.
+
 ### An edit that did not apply looks exactly like an edit that did
 
 Twice in one session a scripted `replace()` matched nothing and reported success:
