@@ -94,10 +94,8 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job server.Job)
 // The result is the FIRST failure, if any: a destroy that only partly succeeded
 // has left compute running somewhere and must not report success.
 func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
-	// WHO HOLDS THIS, AND IS THAT PROCESS STILL LISTENING? A destroy reaches
-	// whoever is polling, which is the CURRENT incarnation. A superseded process
-	// draining its custody is never asked — so if it is the one with the
-	// container, an answer from its replacement means nothing.
+	// WHO HOLDS THIS? The node name is not enough: a superseded process and its
+	// replacement share it, and only one of them has the container.
 	owner, known := r.plane.OwnerOfRequest(requestID)
 
 	// A DESTROY MUST NOT WAIT ON A CORPSE. This is the broadcast that made stale
@@ -107,18 +105,15 @@ func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
 	targets := r.liveNodes()
 
 	if len(targets) == 0 {
-		// UNLESS SOMEBODY IS KNOWN TO BE HOLDING IT. A draining process does not
-		// poll, so it is never in this list — and an empty fleet says nothing about
-		// a container it is still running.
-		if known && !owner.Current {
+		// A DRAINING PROCESS IS NEVER IN THIS LIST — it does not poll — so an empty
+		// fleet says nothing about a container it is still running.
+		if known {
 			return heldByADrainingProcess(owner.Node, requestID)
 		}
 
 		// NOT AN ERROR otherwise. There is nowhere for the compute to be, so there
 		// is nothing to remove. Reporting failure here would make every shutdown
 		// path on a fleet-less control plane look broken.
-		r.plane.forgetForRequest(requestID)
-
 		return nil
 	}
 
@@ -128,8 +123,9 @@ func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
 	// runs on shutdown and on completion paths, where blocking for minutes turns
 	// one bad host into a stalled control plane.
 	type leg struct {
-		node string
-		err  error
+		node        string
+		incarnation string
+		err         error
 	}
 
 	var (
@@ -144,71 +140,59 @@ func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
 		go func() {
 			defer wg.Done()
 
-			err := r.destroyOn(ctx, n, requestID)
-			if err == nil {
-				return
-			}
+			incarnation, err := r.destroyOn(ctx, n, requestID)
 
 			mu.Lock()
 			defer mu.Unlock()
 
-			legs = append(legs, leg{node: n.name, err: err})
+			legs = append(legs, leg{node: n.name, incarnation: incarnation, err: err})
 		}()
 	}
 
 	wg.Wait()
 
-	if len(legs) == 0 {
-		// NOT CONFIRMED BY THE PROCESS THAT HAS IT. The replacement answered, and
-		// it answered honestly: it has nothing to remove. The container is on the
-		// superseded process, which is renewing that lease and will destroy it when
-		// its own tend confirms the job done. Custody is exactly that statement —
-		// somebody is holding this, do not release it.
-		if known && !owner.Current {
-			return heldByADrainingProcess(owner.Node, requestID)
+	// CONFIRMED BY THE PROCESS THAT HOLDS IT, or not confirmed at all. Deciding on
+	// the currency read before dispatch was a check-then-act race: a replacement
+	// can register, take the destroy, and truthfully report nothing to remove
+	// while the earlier reading still says the owner is current.
+	confirmed := !known
+
+	var errs []error
+
+	for _, l := range legs {
+		if l.err != nil {
+			errs = append(errs, l.err)
+
+			continue
 		}
 
-		// THE COMPUTE IS ENDING, SO ITS OWNERSHIP IS TOO — and only here, where
-		// every leg succeeded and the process that holds it was among them. An
-		// unconditional forget dropped the record on a FAILED destroy too, which
-		// left a process that was later superseded unable to renew or release what
-		// it was holding, and its drain unable to end.
+		if known && l.node == owner.Node && l.incarnation == owner.Incarnation {
+			confirmed = true
+		}
+	}
+
+	// THE OWNER'S CONFIRMATION STANDS ON ITS OWN, even if another node's leg
+	// failed. Holding the record back until every leg succeeded stranded it: the
+	// owner had already destroyed its container and would later drain to nothing,
+	// after which every future destroy saw a superseded owner and reported custody
+	// forever for compute that no longer existed.
+	if confirmed {
 		r.plane.forgetForRequest(requestID)
-
-		return nil
 	}
 
-	// A NODE'S ABSENCE IS NOT PROOF THAT ITS COMPUTE IS GONE, and for one review
-	// round this code assumed it was. The reasoning looked sound: a node forgotten
-	// BEFORE the snapshot above is never asked and Destroy reports success, so a
-	// node forgotten half a second later ought to land the same way rather than
-	// failing forever with nothing to retry it.
-	//
-	// It is false for every provider whose runtime outlives the billet process,
-	// which is all of them. A node that takes a destroy and then crashes leaves a
-	// Docker daemon holding a container that is still running, still executing a
-	// job, and still using the capacity this lease represents. Forgiving that leg
-	// releases the lease, and the capacity is sold twice.
-	//
-	// So the failure stands and the listener keeps holding the lease, which is the
-	// safe direction: never release capacity while compute may be running. It
-	// leaks a slot when a host never comes back, and that trade is deliberate — a
-	// leak costs capacity, and the alternative costs correctness.
-	//
-	// The proper repair is to stop broadcasting. Destroy fans out because the
-	// plane does not record WHERE a request's compute was placed, and the lease
-	// already knows — it is bound to a node. Addressing the destroy there answers
-	// both cases exactly, instead of inferring compute from fleet membership.
-	errs := make([]error, 0, len(legs))
-	for _, l := range legs {
-		errs = append(errs, l.err)
+	if len(errs) > 0 {
+		// EVERY FAILURE, not the first. A destroy that worked on four nodes and
+		// failed on one has left compute running somewhere, and the operator needs
+		// to know which — reporting only the first would hide the rest behind
+		// whichever goroutine happened to finish soonest.
+		return errors.Join(errs...)
 	}
 
-	// EVERY FAILURE, not the first. A destroy that worked on four nodes and
-	// failed on one has left compute running somewhere, and the operator needs to
-	// know which — reporting only the first would hide the rest behind whichever
-	// goroutine happened to finish soonest.
-	return errors.Join(errs...)
+	if !confirmed {
+		return heldByADrainingProcess(owner.Node, requestID)
+	}
+
+	return nil
 }
 
 // Sweep asks every node to destroy compute whose lease is no longer open.
@@ -337,10 +321,10 @@ func heldByADrainingProcess(node string, requestID int64) error {
 }
 
 // destroyOn asks one node to remove a request's compute.
-func (r *Runner) destroyOn(ctx context.Context, n *node, requestID int64) error {
+func (r *Runner) destroyOn(ctx context.Context, n *node, requestID int64) (string, error) {
 	id, err := commandID()
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	pend := &pending{
@@ -350,14 +334,19 @@ func (r *Runner) destroyOn(ctx context.Context, n *node, requestID int64) error 
 
 	res, err := r.plane.dispatch(ctx, n, pend)
 	if err != nil {
-		return fmt.Errorf("node %s: %w", n.name, err)
+		return "", fmt.Errorf("node %s: %w", n.name, err)
 	}
 
 	if !res.OK {
-		return fmt.Errorf("node %s could not destroy request %d: %s", n.name, requestID, res.Error)
+		return "", fmt.Errorf("node %s could not destroy request %d: %s",
+			n.name, requestID, res.Error)
 	}
 
-	return nil
+	// WHICH PROCESS ANSWERED, recorded when the command was taken. This is the
+	// only thing that can confirm a destroy: the node NAME is shared by a
+	// superseded process and its replacement, and the replacement answers
+	// truthfully that it has nothing to remove.
+	return r.plane.tookCommand(pend), nil
 }
 
 // dispatch queues a command and waits for its result.

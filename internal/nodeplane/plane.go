@@ -507,6 +507,14 @@ func (p *Plane) forgetForRequest(requestID int64) {
 	}
 }
 
+// tookCommand reports which process was handed this command.
+func (p *Plane) tookCommand(pend *pending) string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return pend.incarnation
+}
+
 // OwnerOfRequest reports which process holds the compute a request was launched
 // under, and whether that process is still the node's current one.
 //
@@ -527,8 +535,9 @@ func (p *Plane) OwnerOfRequest(requestID int64) (RequestOwner, bool) {
 		n, live := p.nodes[owner.node]
 
 		return RequestOwner{
-			Node:    owner.node,
-			Current: live && n.incarnation == owner.incarnation,
+			Node:        owner.node,
+			Incarnation: owner.incarnation,
+			Current:     live && n.incarnation == owner.incarnation,
 		}, true
 	}
 
@@ -539,8 +548,18 @@ func (p *Plane) OwnerOfRequest(requestID int64) (RequestOwner, bool) {
 // still the one its node's commands reach.
 type RequestOwner struct {
 	Node string
+	// Incarnation is the process itself, which is what a destroy's confirmation
+	// must be compared against.
+	//
+	// CURRENCY IS A SNAPSHOT AND CANNOT BE TRUSTED LATER. It is read before the
+	// command is dispatched and can change while the command is in flight: a
+	// replacement registers, TAKES the destroy, truthfully reports it has nothing
+	// to remove, and a decision made on the earlier reading treats that as the
+	// owner confirming. The lease is released under a live container.
+	Incarnation string
 	// Current is false for a superseded process that is draining: it does not
-	// poll, so it never sees a destroy and cannot confirm one.
+	// poll, so it never sees a destroy and cannot confirm one. Useful for
+	// deciding whether to bother asking, never for deciding who answered.
 	Current bool
 }
 
@@ -571,10 +590,6 @@ func (p *Plane) ForgetLease(node, leaseID string) {
 // The ledger knows what it forgot: a lease bound to this node and still open is
 // this node's, and the process registering now is the one holding it.
 func (p *Plane) AdoptOwnership(node, incarnation string, leaseIDs []string) {
-	if incarnation == "" || len(leaseIDs) == 0 {
-		return
-	}
-
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -583,8 +598,13 @@ func (p *Plane) AdoptOwnership(node, incarnation string, leaseIDs []string) {
 	}
 
 	open := make(map[string]bool, len(leaseIDs))
+
 	for _, id := range leaseIDs {
 		open[id] = true
+
+		if incarnation == "" {
+			continue
+		}
 
 		// GAPS ONLY, never a claim. Every registration runs this, so overwriting
 		// would let a REPLACEMENT take ownership of the leases the process it
@@ -596,17 +616,23 @@ func (p *Plane) AdoptOwnership(node, incarnation string, leaseIDs []string) {
 		}
 	}
 
-	// AND ANYTHING THIS NODE OWNS THAT THE LEDGER NO LONGER HAS OPEN IS OVER. The
-	// snapshot above is read before the registration commits, so a lease can end in
-	// between and be adopted as an entry no later event can name: it carries no
-	// request id, so no destroy will ever match it, and the plane's own map
-	// outlives node expiry. Repeated registration races would accumulate those
-	// forever.
+	// AND STALE ADOPTIONS ARE DROPPED — but ONLY adoptions.
 	//
-	// A lease in custody is still OPEN in the ledger, so a draining process keeps
-	// what it holds; only genuinely terminal leases are dropped.
+	// An entry adopted from a snapshot carries no request id, so nothing can ever
+	// name it again: no destroy matches it, and this map outlives node expiry. A
+	// lease that ends between the read and the adopt leaves exactly that, and
+	// repeated races accumulate them forever.
+	//
+	// A record created by DELIVERY is a different thing and must not be touched
+	// here. Absence from the snapshot does not prove terminality: LaunchedLeaseIDs
+	// reports only launching, online and busy, so a lease that was delivered and is
+	// still `assigned` is legitimately missing — and deleting its owner would let
+	// somebody else answer a destroy for a container that is about to exist.
+	//
+	// Runs even for an empty snapshot, because one-to-zero is exactly the shape
+	// that used to strand an entry for the life of the process.
 	for id, owner := range p.owners {
-		if owner.node == node && !open[id] {
+		if owner.node == node && owner.requestID == 0 && !open[id] {
 			delete(p.owners, id)
 		}
 	}

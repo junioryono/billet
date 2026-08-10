@@ -960,6 +960,150 @@ func TestRegistrationPrunesOwnershipTheLedgerHasEnded(t *testing.T) {
 	}
 }
 
+// SUPERSESSION DURING A DESTROY IS STILL NOT A CONFIRMATION.
+//
+// The owner's currency is read before the command is dispatched, and it can
+// change while the command is in flight: a replacement registers, TAKES the
+// destroy, and truthfully reports it has nothing to remove. A decision made on
+// the earlier reading treats that as the owner confirming, and the lease is
+// released under a live container.
+//
+// Only the incarnation that actually answered can confirm anything.
+func TestASupersessionDuringADestroyIsNotAConfirmation(t *testing.T) {
+	t.Parallel()
+
+	p, _ := deliverLaunch(t)
+
+	// The replacement arrives while the destroy is being prepared, and it is the
+	// one that answers.
+	answered := make(chan struct{})
+
+	go func() {
+		defer close(answered)
+
+		if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
+			Version:     nodeapi.Version,
+			Node:        "n1",
+			Provider:    config.ProviderDocker,
+			Deployment:  deployment,
+			Incarnation: "second",
+		}); err != nil {
+			return
+		}
+
+		got, took, err := p.Poll(t.Context(), "n1", "second")
+		if err != nil || !took {
+			return
+		}
+
+		//nolint:errcheck // the result's fate is not what this test is about
+		_ = p.Result("n1", "second", nodeapi.CommandResult{ID: got.ID, OK: true})
+	}()
+
+	err := p.NewRunner().Destroy(t.Context(), 7)
+
+	<-answered
+
+	if !errors.Is(err, server.ErrCustody) {
+		t.Errorf("a destroy answered by the process that replaced the owner reported %v; the "+
+			"listener releases the lease while the container is still running", err)
+	}
+
+	if !p.OwnsForTest("l1", "n1", "first") {
+		t.Error("the owner's record was dropped on somebody else's confirmation")
+	}
+}
+
+// THE OWNER'S CONFIRMATION STANDS ON ITS OWN, even when another node fails.
+//
+// Holding the record back until every leg succeeded stranded it: the owner had
+// already destroyed its container and would later drain to nothing, after which
+// every future destroy saw a superseded owner and reported custody forever for
+// compute that no longer existed.
+func TestAnOwnersConfirmationCountsDespiteAnotherNodesFailure(t *testing.T) {
+	t.Parallel()
+
+	p, _ := deliverLaunch(t)
+
+	// A second node in the fleet that never answers anything.
+	register(t, p, "n2", config.ProviderDocker)
+
+	// The owner answers its own leg.
+	go func() {
+		got, took, err := p.Poll(t.Context(), "n1", "first")
+		if err != nil || !took {
+			return
+		}
+
+		//nolint:errcheck // the result's fate is not what this test is about
+		_ = p.Result("n1", "first", nodeapi.CommandResult{ID: got.ID, OK: true})
+	}()
+
+	// The broadcast fails overall, because n2 never answers.
+	if err := p.NewRunner().Destroy(t.Context(), 7); err == nil {
+		t.Fatal("a destroy with an unanswered leg reported success")
+	}
+
+	if p.OwnsForTest("l1", "n1", "first") {
+		t.Error("the owner confirmed its own destroy and kept the record anyway; once it " +
+			"drains to nothing, every later destroy reports custody forever for compute " +
+			"that no longer exists")
+	}
+}
+
+// A DELIVERED LAUNCH IS NOT PRUNED BY A SNAPSHOT THAT PREDATES IT.
+//
+// LaunchedLeaseIDs reports only launching, online and busy — so a lease that has
+// been delivered and is still `assigned` is legitimately absent, and treating
+// absence as terminality deletes the owner of a container that is about to
+// exist. Only records adopted FROM a snapshot, which carry no request id, are
+// candidates.
+func TestPruningDoesNotTouchADeliveredLaunch(t *testing.T) {
+	t.Parallel()
+
+	p, _ := deliverLaunch(t)
+
+	// A registration whose snapshot does not mention l1 at all.
+	p.AdoptOwnership("n1", "first", []string{"somebody-else"})
+
+	if !p.OwnsForTest("l1", "n1", "first") {
+		t.Error("a launch this plane delivered lost its owner to a snapshot taken before it; " +
+			"a later destroy finds no owner and the capacity is released under the container")
+	}
+}
+
+// AND AN EMPTY SNAPSHOT STILL PRUNES, which is the shape that used to strand an
+// entry for the life of the process.
+func TestAnEmptySnapshotStillPrunesAdoptedOwnership(t *testing.T) {
+	t.Parallel()
+
+	p := testPlane(t)
+
+	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
+		Version:     nodeapi.Version,
+		Node:        "n1",
+		Provider:    config.ProviderDocker,
+		Deployment:  deployment,
+		Incarnation: "first",
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	p.AdoptOwnership("n1", "first", []string{"l1"})
+
+	if !p.OwnsForTest("l1", "n1", "first") {
+		t.Fatal("adoption did not record the lease")
+	}
+
+	// The node registers again and the ledger now reports nothing open.
+	p.AdoptOwnership("n1", "first", nil)
+
+	if p.OwnsForTest("l1", "n1", "first") {
+		t.Error("an adopted record survived a snapshot that reported no open leases; nothing " +
+			"can ever name it again, so it stays for the life of the control plane")
+	}
+}
+
 // A DESTROY IS ONLY CONFIRMED BY THE PROCESS THAT HAS THE CONTAINER.
 //
 // The wire broadcasts to whoever is polling, which is the CURRENT incarnation. A
