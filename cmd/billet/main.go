@@ -96,6 +96,31 @@ func run(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// AND A SECOND SIGNAL LEAVES, which the first one deliberately does not.
+	//
+	// A graceful stop is the right default — it destroys compute and hands
+	// capacity back rather than stranding containers and leases — but it can take
+	// minutes: destroying a job on a node that has gone quiet waits out the node
+	// command timeout, and the shutdown grace is sized to cover that. Meanwhile
+	// signal.NotifyContext keeps intercepting, so the operator's habitual second
+	// Ctrl-C did nothing at all and the terminal looked hung.
+	//
+	// The first signal asks; the second insists. Anything a forced exit strands is
+	// what restart recovery and the reaper exist for.
+	go func() {
+		forced := make(chan os.Signal, 1)
+		signal.Notify(forced, os.Interrupt, syscall.SIGTERM)
+
+		<-ctx.Done()
+		<-forced
+
+		fmt.Fprintln(os.Stderr, "billet: second signal; exiting without finishing the "+
+			"shutdown. Compute this process was destroying may still be running, and its "+
+			"capacity is held until the reaper reclaims it.")
+
+		os.Exit(130)
+	}()
+
 	for _, c := range commands() {
 		if c.name == args[0] {
 			return c.run(ctx, args[1:])

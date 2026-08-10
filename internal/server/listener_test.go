@@ -2066,6 +2066,114 @@ func TestRenewalOutlivesTheShutdownRelease(t *testing.T) {
 	}
 }
 
+// THE SHUTDOWN DESTROYS EACH REQUEST ONCE, NOT ONCE PER SET IT APPEARS IN.
+//
+// A completion whose destroy failed keeps its lease in `running` AND has a
+// cleanup record, so the two sets overlap. Draining the records and then letting
+// releaseAll destroy the running jobs meant a second remote round trip for every
+// job in both — against the same shutdown grace, which is exactly what the grace
+// was too small for.
+func TestShutdownDestroysEachRequestOnce(t *testing.T) {
+	t.Parallel()
+
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+
+	var attempts atomic.Int32
+
+	runner := &fakeRunner{onDestroy: func(int64) error {
+		attempts.Add(1)
+
+		return nil
+	}}
+
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner))
+
+	// In BOTH sets: a running lease and a cleanup record for the same request,
+	// which is the ordinary state after a completion whose destroy failed.
+	holdRunning(t, l, a, tiers[0].Label, 7)
+
+	l.mu.Lock()
+	l.cleanup = map[int64]*pendingCleanup{
+		7: {job: Job{RequestID: 7}, at: time.Now().Add(time.Hour)},
+	}
+	l.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	defer cancel()
+
+	runDone := make(chan struct{})
+
+	go func() {
+		defer close(runDone)
+
+		if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("Run: %v", err)
+		}
+	}()
+
+	cancel()
+
+	select {
+	case <-runDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("Run never returned")
+	}
+
+	if got := attempts.Load(); got != 1 {
+		t.Errorf("shutdown destroyed request 7 %d times, want 1; each extra call is "+
+			"another remote round trip against the same shutdown grace", got)
+	}
+
+	if cleanupCount(l) != 0 {
+		t.Errorf("a discharged cleanup record survived the shutdown: %d", cleanupCount(l))
+	}
+}
+
+// LOSING A RUNNING LEASE LEAVES THE CONTAINER OWED.
+//
+// The heartbeat used to delete a running job outright when its lease could not
+// be renewed. That is right about the CAPACITY — fenced, it belongs to another
+// holder — and wrong about the compute: this listener launched a container, it
+// is still running, GitHub will not send the completion again, and with a runner
+// that cannot sweep nothing else would ever remove it. The record moves to the
+// cleanup set instead, where only a successful destroy discharges it.
+func TestARunningLeaseLostLeavesItsComputeOwed(t *testing.T) {
+	t.Parallel()
+
+	const ttl = 300 * time.Millisecond
+
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
+		alloc.WithLeaseTTL(ttl))
+
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(&fakeRunner{}))
+
+	holdRunning(t, l, a, tiers[0].Label, 7)
+
+	// Reaped, so the heartbeat sees the fence a real reap produces.
+	time.Sleep(2 * ttl)
+
+	if _, err := a.Reap(t.Context()); err != nil {
+		t.Fatalf("reap: %v", err)
+	}
+
+	l.mu.Lock()
+	l.heartbeatHeld(t.Context())
+	_, stillRunning := l.running[7]
+	l.mu.Unlock()
+
+	if stillRunning {
+		t.Fatal("the listener kept a lease the reaper had taken, so this proves nothing")
+	}
+
+	if cleanupCount(l) != 1 {
+		t.Errorf("a running job whose lease was reaped left no cleanup obligation (%d "+
+			"pending); its container is still on a host, GitHub will not redeliver the "+
+			"completion, and only an optional Sweeper would ever notice", cleanupCount(l))
+	}
+}
+
 // UNCERTAINTY IS NOT ALLOWED TO OUTLAST THE LEASE.
 //
 // A renewal that cannot reach the allocator says nothing about ownership, so the
@@ -2120,6 +2228,87 @@ func TestALeaseUnconfirmedForLongerThanItsTTLIsDropped(t *testing.T) {
 		t.Error("a lease went unconfirmed for longer than its TTL and was still being " +
 			"advertised; the reaper can have reclaimed it by now, so the capacity may " +
 			"already belong to another tier")
+	}
+}
+
+// THE UNCERTAINTY CLOCK STARTS AT ESCROW, NOT AT THE FIRST FAILED RENEWAL.
+//
+// A lease that has NEVER been confirmed is the worst case, not an exempt one:
+// escrowed at t=0 it expires at t=TTL whatever happens. Starting its clock at
+// the first failure — around t=TTL/3 — bought it an extra TTL it had not earned
+// and kept it advertised well past the point the reaper could have taken it.
+//
+// The distinguishing test is that no successful renewal ever happens here. The
+// test above performs one first, so it cannot see this.
+func TestALeaseNeverConfirmedIsStillBoundedByItsTTL(t *testing.T) {
+	t.Parallel()
+
+	const ttl = 300 * time.Millisecond
+
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
+		alloc.WithLeaseTTL(ttl))
+
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(&fakeRunner{}))
+
+	// Escrowed through the real path, so the clock is seeded the way production
+	// seeds it. Nothing renews it after this.
+	if err := l.refillEscrow(t.Context()); err != nil {
+		t.Fatalf("refillEscrow: %v", err)
+	}
+
+	if len(l.Held()) == 0 {
+		t.Fatal("nothing was escrowed; the test proves nothing")
+	}
+
+	unreachable, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	// A TTL after ESCROW. If the clock only started at the first failure, this
+	// lease still has most of a TTL to run and stays advertised.
+	time.Sleep(2 * ttl)
+
+	l.mu.Lock()
+	l.heartbeatHeld(unreachable)
+	held := len(l.held)
+	l.mu.Unlock()
+
+	if held != 0 {
+		t.Errorf("a lease that was never once confirmed was still advertised a TTL after "+
+			"it was escrowed (%d held); its clock started at the first failed renewal "+
+			"rather than at the moment it became this listener's", held)
+	}
+}
+
+// A LEASE THAT LEAVES TAKES ITS RENEWAL TIMESTAMP WITH IT.
+//
+// The confirmed map is keyed by lease id and a listener processes an unbounded
+// number of leases over its life, so an entry that outlives its lease is a leak
+// that grows with uptime rather than with load.
+func TestRenewalTimestampsDoNotOutliveTheirLeases(t *testing.T) {
+	t.Parallel()
+
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(&fakeRunner{}))
+
+	holdRunning(t, l, a, tiers[0].Label, 7)
+
+	l.mu.Lock()
+	l.confirmed["a-lease-that-is-long-gone"] = time.Now()
+	l.heartbeatHeld(t.Context())
+	_, stale := l.confirmed["a-lease-that-is-long-gone"]
+	tracked := len(l.confirmed)
+	l.mu.Unlock()
+
+	if stale {
+		t.Error("a renewal timestamp survived the lease it was for; the map is keyed by " +
+			"lease id and grows with every job this listener ever runs")
+	}
+
+	if tracked != 1 {
+		t.Errorf("tracking %d leases, want 1 — the running lease and nothing else", tracked)
 	}
 }
 
