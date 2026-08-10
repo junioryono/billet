@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"slices"
 	"sync"
 	"time"
 
@@ -275,14 +276,23 @@ type Listener struct {
 	retryFirst time.Duration
 	retryMax   time.Duration
 
+	// destroying is the requests a cleanup retry is inside a Destroy for right
+	// now. The shutdown pass skips them: that destroy is already happening, and
+	// issuing a second one only spends the teardown budget on work in progress.
+	destroying map[int64]bool
+
 	// confirmed is when each lease was last successfully renewed, keyed by lease
 	// id. It is what turns "no answer" into a bounded state: past the TTL without
 	// a confirmation the reaper may already have taken the lease, so advertising
 	// it is advertising capacity that is now someone else's.
 	confirmed map[string]time.Time
 
-	// configErr is anything an Option refused. Run returns it rather than starting.
-	configErr error
+	// configErrs is what each option refused, keyed by the field it sets, so a
+	// later option replaces an earlier one's error along with its value. Appending
+	// instead made an invalid value permanently fatal even when a subsequent
+	// option had corrected it — which is not how last-value-wins options behave
+	// anywhere else, and layered defaults do exactly that.
+	configErrs map[string]error
 
 	// runner turns assigned leases into compute. Never nil; see noRunner.
 	runner Runner
@@ -303,6 +313,8 @@ func NewListener(a *alloc.Allocator, tier string, session Session, opts ...Optio
 		running:       make(map[int64]*alloc.Lease),
 		acquiring:     make(map[int64]*promise),
 		cleanup:       make(map[int64]*pendingCleanup),
+		destroying:    make(map[int64]bool),
+		configErrs:    make(map[string]error),
 		confirmed:     make(map[string]time.Time),
 		stalePromise:  defaultStalePromise,
 		shutdownGrace: defaultShutdownGrace,
@@ -511,14 +523,44 @@ func WithStalePromiseAfter(d time.Duration) Option {
 // leases nobody releases and containers nobody removes.
 func WithShutdownGrace(d time.Duration) Option {
 	return func(l *Listener) {
-		if err := checkGrace("shutdown grace", d); err != nil {
-			l.configErr = errors.Join(l.configErr, err)
-
-			return
+		if l.set("shutdown grace", d) {
+			l.shutdownGrace = d
 		}
-
-		l.shutdownGrace = d
 	}
+}
+
+// set validates one budget and records the outcome against its field name,
+// replacing whatever the last option said about that field. It reports whether
+// the value may be used.
+func (l *Listener) set(field string, d time.Duration) bool {
+	err := checkGrace(field, d)
+
+	if err != nil {
+		l.configErrs[field] = err
+
+		return false
+	}
+
+	delete(l.configErrs, field)
+
+	return true
+}
+
+// configError is everything still wrong with this listener's configuration.
+func (l *Listener) configError() error {
+	fields := make([]string, 0, len(l.configErrs))
+	for field := range l.configErrs {
+		fields = append(fields, field)
+	}
+
+	slices.Sort(fields)
+
+	errs := make([]error, 0, len(fields))
+	for _, field := range fields {
+		errs = append(errs, l.configErrs[field])
+	}
+
+	return errors.Join(errs...)
 }
 
 // WithFinishGraces bounds the two local phases of the teardown: closing the
@@ -529,16 +571,11 @@ func WithShutdownGrace(d time.Duration) Option {
 // fail on what is left of a shared budget.
 func WithFinishGraces(closing, releasing time.Duration) Option {
 	return func(l *Listener) {
-		closeErr := checkGrace("close grace", closing)
-		releaseErr := checkGrace("release grace", releasing)
-
-		l.configErr = errors.Join(l.configErr, closeErr, releaseErr)
-
-		if closeErr == nil {
+		if l.set("close grace", closing) {
 			l.closeGrace = closing
 		}
 
-		if releaseErr == nil {
+		if l.set("release grace", releasing) {
 			l.releaseGrace = releasing
 		}
 	}
@@ -642,8 +679,8 @@ func (l *Listener) Run(ctx context.Context) error {
 	// protecting capacity whose compute may still be running, so a caller whose
 	// arithmetic produced a nonsense one has to hear about it rather than get
 	// twelve quiet minutes of something they did not ask for.
-	if l.configErr != nil {
-		return fmt.Errorf("server: listener for %s is misconfigured: %w", l.tier, l.configErr)
+	if err := l.configError(); err != nil {
+		return fmt.Errorf("server: listener for %s is misconfigured: %w", l.tier, err)
 	}
 
 	// Heartbeats run on their OWN clock, not between polls.
@@ -856,13 +893,12 @@ func (l *Listener) Run(ctx context.Context) error {
 		// deadline, so a slow drain could eat the grace the release still needed.
 		// Now the union is destroyed once, concurrently, and the release only ever
 		// releases.
-		if err := overall.Err(); err != nil {
-			l.log.Error("the shutdown budget was gone before billet began destroying "+
-				"compute; a cleanup retry held the whole of it, so nothing below was "+
-				"attempted and every lease is left for the reaper",
-				"tier", l.tier, "budget", l.teardownBudget())
-		}
-
+		// NO BUDGET CHECK HERE, deliberately: this point cannot be reached with the
+		// overall budget spent. The join's context is min(shutdownGrace, what is
+		// left), so when it returns there is always shutdownGrace + closeGrace +
+		// releaseGrace still to run. A guard was written for this and removed — it
+		// could never fire, and its mutant survived for exactly that reason, which
+		// reads identically to missing coverage.
 		destroyed := l.destroyAll(stopCtx)
 
 		// A FRESH BUDGET FOR THE LOCAL HALF, because it was being starved by the
@@ -885,10 +921,18 @@ func (l *Listener) Run(ctx context.Context) error {
 		// expired overall budget fails without being attempted, and reporting that
 		// as "could not close message session" blames the session for a deadline
 		// the destroys had already spent.
+		// STOPPED, not merely reported, and this one is reachable: a Destroy that
+		// ignores its context can run past the whole budget and then return.
+		// Logging and carrying on meant calling Close with an already-expired
+		// context — and Session does not promise to honour one either, so a phase
+		// just declared hopeless could block indefinitely, past the deadline
+		// announced as final. There is nothing left to spend.
 		if err := overall.Err(); err != nil {
 			l.log.Error("the shutdown budget was gone before billet closed its session; "+
 				"the capacity this listener holds is left for the reaper",
 				"tier", l.tier, "budget", l.teardownBudget())
+
+			return
 		}
 
 		if err := l.session.Close(closeCtx); err != nil {
@@ -1128,7 +1172,16 @@ func (l *Listener) retryCleanup(ctx context.Context) {
 	l.mu.Unlock()
 
 	for _, job := range pending {
+		l.mu.Lock()
+		l.destroying[job.RequestID] = true
+		l.mu.Unlock()
+
 		err := l.complete(ctx, job)
+
+		l.mu.Lock()
+		delete(l.destroying, job.RequestID)
+		l.mu.Unlock()
+
 		if err == nil {
 			continue
 		}
@@ -1195,17 +1248,47 @@ func (l *Listener) destroyAll(ctx context.Context) map[int64]bool {
 
 	requests := make([]int64, 0, len(l.running)+len(l.cleanup))
 
+	// NOT WHAT A RETRY IS ALREADY INSIDE. The join gives that retry a whole
+	// destroy budget to return in; when it does not, the destroy is still
+	// happening, and putting the same request into this pass issues a SECOND one
+	// that then wins the single teardown slot and spends the second budget on work
+	// already in progress. Unrelated requests are never reached — which is the
+	// starvation the separate join phase was meant to end, arriving by another
+	// route.
+	skipped := make([]int64, 0, len(l.destroying))
+
 	for id := range l.running {
+		if l.destroying[id] {
+			skipped = append(skipped, id)
+
+			continue
+		}
+
 		requests = append(requests, id)
 	}
 
 	for id := range l.cleanup {
+		if l.destroying[id] {
+			if _, running := l.running[id]; !running {
+				skipped = append(skipped, id)
+			}
+
+			continue
+		}
+
 		if _, running := l.running[id]; !running {
 			requests = append(requests, id)
 		}
 	}
 
 	l.mu.Unlock()
+
+	for _, id := range skipped {
+		l.log.Warn("not destroying this job's compute during shutdown because a cleanup "+
+			"retry is still inside a destroy for it; that attempt is the one that counts, "+
+			"and it did not return within its own budget",
+			"tier", l.tier, "request", id)
+	}
 
 	var (
 		mu   sync.Mutex
@@ -1220,10 +1303,21 @@ func (l *Listener) destroyAll(ctx context.Context) map[int64]bool {
 		go func() {
 			defer wg.Done()
 
-			select {
-			case slot <- struct{}{}:
-				defer func() { <-slot }()
-			case <-ctx.Done():
+			// CHECKED BEFORE THE SELECT, because select does not prefer a ready
+			// cancellation over a ready slot — it picks uniformly among whatever is
+			// ready. With an already-expired budget and a free slot, roughly half
+			// these goroutines went on to call Destroy anyway, so "we stop when the
+			// budget is gone" was true only on average. It also made a mutation run
+			// a coin toss, which is how it was found.
+			if ctx.Err() == nil {
+				select {
+				case slot <- struct{}{}:
+					defer func() { <-slot }()
+				case <-ctx.Done():
+				}
+			}
+
+			if ctx.Err() != nil {
 				// NAMED, not silently skipped. Returning quietly left a request that
 				// was never even attempted indistinguishable from one that was
 				// destroyed: no outcome, no log, and for a cleanup-only record no

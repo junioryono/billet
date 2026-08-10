@@ -1617,12 +1617,34 @@ type fakeSession struct {
 	onClose func(ctx context.Context) error
 	stats   *Statistics
 	// acquired records every request id the listener asked GitHub to claim, so a
-	// test can assert WHICH class of message drove the acquisition.
+	// test can assert WHICH class of message drove the acquisition. polled counts
+	// GetMessage calls, which is how a test tells "refused before starting" from
+	// "started and then stopped".
 	acquiredMu sync.Mutex
 	acquired   []int64
+	polled     int
+	closed     int
+}
+
+func (f *fakeSession) closes() int {
+	f.acquiredMu.Lock()
+	defer f.acquiredMu.Unlock()
+
+	return f.closed
+}
+
+func (f *fakeSession) polls() int {
+	f.acquiredMu.Lock()
+	defer f.acquiredMu.Unlock()
+
+	return f.polled
 }
 
 func (f *fakeSession) GetMessage(ctx context.Context, _ int64, maxCapacity int) (*Message, error) {
+	f.acquiredMu.Lock()
+	f.polled++
+	f.acquiredMu.Unlock()
+
 	if f.onPoll != nil {
 		f.onPoll(maxCapacity)
 	}
@@ -1677,6 +1699,10 @@ func (f *fakeSession) acquiredIDs() []int64 {
 // handed, so a change that gave it an already-expired one was invisible — which
 // is exactly the defect the separate teardown budgets exist to prevent.
 func (f *fakeSession) Close(ctx context.Context) error {
+	f.acquiredMu.Lock()
+	f.closed++
+	f.acquiredMu.Unlock()
+
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("fake session close: %w", err)
 	}
@@ -2198,14 +2224,60 @@ func TestANonsenseBudgetRefusesToRun(t *testing.T) {
 		})
 	}
 
-	// AND A SANE ONE IS ACTUALLY USED, not merely accepted. Every other test of
-	// these budgets passes against options that ignore their arguments, because
-	// the defaults are generous enough for all of them.
-	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(&fakeRunner{}),
+	// AND A SANE ONE STILL RUNS. Matching on a word cannot tell "refused for this
+	// reason" from "refuses everything": a Run that returned a misconfiguration
+	// error unconditionally would satisfy every case above. This half is what
+	// makes those cases mean anything.
+	session := &fakeSession{}
+
+	l := NewListener(a, tiers[0].Label, session, WithRunner(&fakeRunner{}),
 		WithShutdownGrace(time.Second), WithFinishGraces(2*time.Second, 3*time.Second))
 
-	if l.configErr != nil {
-		t.Fatalf("a sane configuration was refused: %v", l.configErr)
+	if err := l.configError(); err != nil {
+		t.Fatalf("a sane configuration was refused: %v", err)
+	}
+
+	polled := make(chan struct{})
+
+	session.onPoll = func(int) {
+		select {
+		case polled <- struct{}{}:
+		default:
+		}
+	}
+
+	runCtx, stop := context.WithTimeout(t.Context(), 30*time.Second)
+
+	t.Cleanup(stop)
+
+	ran := make(chan error, 1)
+
+	go func() { ran <- l.Run(runCtx) }()
+
+	select {
+	case <-polled:
+	case err := <-ran:
+		t.Fatalf("a sanely configured listener refused to start: %v", err)
+	case <-time.After(30 * time.Second):
+		t.Fatal("a sanely configured listener never polled")
+	}
+
+	stop()
+	<-ran
+
+	// AND A REFUSED ONE NEVER TOUCHED ITS SESSION, so the refusal happened before
+	// anything was advertised to GitHub.
+	refused := &fakeSession{}
+	bad := NewListener(a, tiers[0].Label, refused, WithRunner(&fakeRunner{}),
+		WithShutdownGrace(0))
+
+	if err := bad.Run(t.Context()); err == nil {
+		t.Fatal("a listener with a zero grace started")
+	}
+
+	if refused.polls() != 0 {
+		t.Errorf("a refused listener polled %d times; the refusal has to happen before "+
+			"it advertises anything", refused.polls())
 	}
 
 	// Two destroy-length phases — the cleanup-loop join and the destroy pass —
@@ -2214,6 +2286,43 @@ func TestANonsenseBudgetRefusesToRun(t *testing.T) {
 		t.Errorf("teardown budget is %v, want 7s (1s join + 1s destroy + 2s close + 3s "+
 			"release); a budget that ignores its configuration bounds nothing an "+
 			"operator asked for", got)
+	}
+}
+
+// A LATER OPTION REPLACES AN EARLIER REFUSAL, because that is how every other
+// option behaves.
+//
+// Validation errors were append-only while values were last-wins, so a layered
+// configuration that set a bad default and then corrected it produced a listener
+// refusing to start with the CORRECT value in place. Nothing about that is
+// safer; it just makes the override unusable.
+func TestALaterOptionReplacesAnEarlierRefusal(t *testing.T) {
+	t.Parallel()
+
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+
+	corrected := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(&fakeRunner{}),
+		WithShutdownGrace(0),
+		WithShutdownGrace(30*time.Second))
+
+	if err := corrected.configError(); err != nil {
+		t.Errorf("a corrected option left the listener refusing to start: %v; a default "+
+			"that a later option overrides is the ordinary way to layer configuration", err)
+	}
+
+	if corrected.shutdownGrace != 30*time.Second {
+		t.Errorf("shutdown grace is %v, want 30s", corrected.shutdownGrace)
+	}
+
+	// AND THE OTHER ORDER STILL REFUSES. Replacing must not mean forgetting.
+	spoiled := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(&fakeRunner{}),
+		WithShutdownGrace(30*time.Second),
+		WithShutdownGrace(0))
+
+	if err := spoiled.configError(); err == nil {
+		t.Error("a valid value followed by a nonsense one was accepted; last-wins has to " +
+			"apply to the refusal as well as the value")
 	}
 }
 
@@ -2242,7 +2351,7 @@ func TestTheBudgetSumSaturatesRatherThanWrapping(t *testing.T) {
 
 // A PHASE THAT OVERRUNS DOES NOT PUSH THE NEXT ONE PAST THE WHOLE BUDGET.
 //
-// Renewal is bounded by the sum of the three phase budgets, so no phase may end
+// Renewal is bounded by the sum of the four phase budgets, so no phase may end
 // after that sum — otherwise the close or the release runs with nothing renewing
 // and leases expire while the session is still open. Giving each phase its own
 // fresh budget did not establish that: the phases run in sequence, so a destroy
@@ -2488,17 +2597,25 @@ func TestAStuckCleanupRetryDoesNotStarveTheDestroys(t *testing.T) {
 	entered := make(chan struct{}, 1)
 
 	var (
-		stuck     atomic.Bool
+		announced atomic.Bool
 		destroyed atomic.Bool
+		reissued  atomic.Int32
 	)
 
-	// Request 7 is the stuck retry, and it blocks only ONCE — the cleanup loop's
-	// call. The shutdown's own pass runs it again and must not be held there too,
-	// or the test would be measuring the sequential destroy pass rather than the
-	// join. Request 9 is the work the join must not have starved.
+	// Request 7 BLOCKS ON EVERY CALL, which is the point. The first version let
+	// it through on the second, so the shutdown could re-issue the same destroy
+	// and the test would not notice: with only one teardown slot, that second
+	// attempt wins it and spends the whole destroy budget on work already in
+	// flight, and request 9 — the unrelated job this is really about — is never
+	// reached. Blocking throughout means the only way 9 gets destroyed is if the
+	// shutdown declines to re-issue 7 at all.
 	runner := &fakeRunner{onDestroy: func(id int64) error {
-		if id == 7 && stuck.CompareAndSwap(false, true) {
-			entered <- struct{}{}
+		if id == 7 {
+			reissued.Add(1)
+
+			if announced.CompareAndSwap(false, true) {
+				entered <- struct{}{}
+			}
 
 			<-blocked
 
@@ -2555,6 +2672,145 @@ func TestAStuckCleanupRetryDoesNotStarveTheDestroys(t *testing.T) {
 		t.Error("the shutdown never tried to destroy the running job's compute: one stuck " +
 			"cleanup retry consumed the destroy budget before the destroy pass began, so " +
 			"that container is still on its host and its lease waits for the reaper")
+	}
+
+	// ORDER-INDEPENDENT, which the assertion above is not. With the skip removed
+	// the destroy pass holds both requests and map order decides which takes the
+	// single slot first, so request 9 still got destroyed about half the time —
+	// the mutant survived on a coin toss. Request 7's call count does not depend
+	// on that: the cleanup loop's attempt is the only one there should ever be.
+	if got := reissued.Load(); got != 1 {
+		t.Errorf("request 7 was handed to the runner %d times, want 1; the shutdown "+
+			"re-issued a destroy that a retry was already inside, and with one slot "+
+			"that second attempt spends the budget on work already in flight", got)
+	}
+}
+
+// A RETRY THAT HAS FINISHED DOES NOT BLOCK THE SHUTDOWN'S DESTROY.
+//
+// Skipping requests a cleanup retry is already inside needs the mark CLEARED
+// when that retry returns. Leaving it set is the quiet half of the bug it fixes:
+// the shutdown would decline to destroy a request on the grounds that something
+// else was handling it, when nothing was, and the container would outlive the
+// process with nobody having said so.
+func TestAFinishedRetryDoesNotBlockTheShutdownDestroy(t *testing.T) {
+	t.Parallel()
+
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+
+	var destroys atomic.Int32
+
+	// Never succeeds, so the record survives its retry and is still owed at
+	// shutdown — which is exactly when the stale mark would hide it.
+	runner := &fakeRunner{onDestroy: func(int64) error {
+		destroys.Add(1)
+
+		return errors.New("the node is not answering")
+	}}
+
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner),
+		WithCleanupRetryPacing(0, 0))
+
+	holdRunning(t, l, a, tiers[0].Label, 7)
+
+	if err := l.complete(t.Context(), Job{RequestID: 7}); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+
+	// A retry that runs to completion and leaves the obligation in place.
+	l.retryCleanup(t.Context())
+
+	before := destroys.Load()
+	if before < 2 {
+		t.Fatalf("the retry never reached the runner: %d destroys", before)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	defer cancel()
+
+	runDone := make(chan struct{})
+
+	go func() {
+		defer close(runDone)
+
+		if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("Run: %v", err)
+		}
+	}()
+
+	cancel()
+
+	select {
+	case <-runDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("Run never returned")
+	}
+
+	if destroys.Load() <= before {
+		t.Error("the shutdown skipped a request whose cleanup retry had already finished: " +
+			"the in-flight mark outlived the attempt it stood for, so billet declined to " +
+			"destroy that container on the grounds that something else was doing it")
+	}
+}
+
+// A DESTROY THAT OUTRUNS THE WHOLE BUDGET STOPS THE TEARDOWN.
+//
+// Nothing obliges a Runner to honour its context, so a destroy can return only
+// after the overall deadline has passed. Announcing that the budget is gone and
+// then calling Close anyway is a contradiction: Session does not promise to
+// honour a context either, so a phase just declared hopeless could block
+// indefinitely — past the deadline announced as final.
+func TestADestroyThatOutrunsTheBudgetStopsTheTeardown(t *testing.T) {
+	t.Parallel()
+
+	const (
+		destroying = 200 * time.Millisecond
+		finishing  = 200 * time.Millisecond
+	)
+
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+
+	// Ignores its context and outlasts join + destroy + close + release together.
+	runner := &fakeRunner{onDestroy: func(int64) error {
+		time.Sleep(2 * (2*destroying + 2*finishing))
+
+		return nil
+	}}
+
+	session := &fakeSession{}
+
+	l := NewListener(a, tiers[0].Label, session, WithRunner(runner),
+		WithShutdownGrace(destroying), WithFinishGraces(finishing, finishing))
+
+	holdRunning(t, l, a, tiers[0].Label, 7)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	defer cancel()
+
+	runDone := make(chan struct{})
+
+	go func() {
+		defer close(runDone)
+
+		if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("Run: %v", err)
+		}
+	}()
+
+	cancel()
+
+	select {
+	case <-runDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("Run never returned")
+	}
+
+	if session.closes() != 0 {
+		t.Errorf("the session was closed %d times after the whole shutdown budget had "+
+			"already gone; a phase billet has just declared hopeless must not be started, "+
+			"because nothing promises it will return", session.closes())
 	}
 }
 
