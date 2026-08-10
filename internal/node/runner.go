@@ -264,6 +264,22 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job Job) error 
 		return fmt.Errorf("node: mark lease %s launching: %w", lease.ID, err)
 	}
 
+	// RENEWED FROM THE MOMENT THE LEASE SAYS "LAUNCHING", not from the moment the
+	// provider is called. Everything between those two points is a REMOTE call —
+	// resolving the scale set, minting a registration — and each can block for as
+	// long as GitHub takes. The plane gives up on an unanswered command after its
+	// timeout and tells the listener the node has custody, which stops the
+	// listener heartbeating; if the node has not started renewing yet, the lease
+	// has no owner for the whole of that window and its capacity is resold before
+	// the container even exists.
+	//
+	// The hold was placed just above provider.Launch first, which closed the long
+	// half of the gap and left the remote half open. The transition above is the
+	// right anchor: it is the first moment the ledger says this node is doing
+	// something with the lease.
+	stopHolding := r.holdWhileLaunching(lease, provider.InstanceName(lease.ID))
+	defer stopHolding()
+
 	setID, err := r.scaleSetID(ctx, tier)
 	if err != nil {
 		return err
@@ -295,13 +311,6 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job Job) error 
 
 		return fmt.Errorf("node: mint a registration for %s: %w", name, err)
 	}
-
-	// RENEWED FROM HERE, because from here something may exist. The control plane
-	// gives up on an unanswered command after its timeout and hands the listener
-	// custody, which stops the listener heartbeating; if the provider is still
-	// working at that moment, nothing at all is holding the lease.
-	stopHolding := r.holdWhileLaunching(lease, name)
-	defer stopHolding()
 
 	inst, err := r.provider.Launch(ctx, provider.Spec{
 		// BILLET's name, not GitHub's. reg.RunnerName() is what GitHub called the

@@ -521,6 +521,19 @@ func (r *Runner) custodySnapshot() []*custody {
 	return out
 }
 
+// Holding reports whether this node is still responsible for compute.
+//
+// ASKED WHEN THE NODE HAS BEEN SUPERSEDED and is deciding whether it may stop.
+// Exiting while custody remains is how a container ends up with a lease nobody
+// renews: the replacement cannot see it — it is on a different machine — so
+// nothing else will ever hold it.
+func (r *Runner) Holding() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return len(r.custody) > 0 || len(r.launching) > 0
+}
+
 // renewSnapshot is everything whose lease this node must keep alive.
 //
 // WIDER THAN CUSTODY, AND ONLY FOR RENEWAL. A launch in progress needs its lease

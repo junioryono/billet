@@ -49,6 +49,9 @@ type fakeCompute struct {
 	// observes that none outlived the loop.
 	aliveReturned int
 
+	// holding reports compute this node is still responsible for.
+	holding bool
+
 	// launchGate lets a test hold a launch open. Launch closes launchStarted and
 	// then waits, which is the only way to act on the world WHILE a launch is in
 	// flight — polling for the launch to finish always loses to the report that
@@ -72,6 +75,15 @@ func (f *fakeCompute) KeepAlive(ctx context.Context) {
 	f.mu.Lock()
 	f.aliveReturned++
 	f.mu.Unlock()
+}
+
+// holding lets a test say this node is still responsible for compute, which is
+// what keeps a superseded process draining rather than exiting.
+func (f *fakeCompute) Holding() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return f.holding
 }
 
 func (f *fakeCompute) ttlAtStart() time.Duration {
@@ -797,6 +809,72 @@ func TestCustodyIsAdvancedOnTheSweepCadence(t *testing.T) {
 	})
 
 	waitFor(t, func() bool { return compute.tended() > 0 })
+}
+
+// A SUPERSEDED NODE DRAINS WHAT IT HOLDS BEFORE IT STOPS.
+//
+// The server keeps the heartbeat and result routes open for a superseded process
+// precisely so a launch it began can finish — and that permission is worthless if
+// the process exits the moment its poll is refused, which is what the first
+// version did. Exiting cancels the janitor, and the replacement cannot adopt what
+// it cannot see, because the container is on THIS machine. The lease is then
+// renewed by nobody and its capacity is resold under a running job.
+func TestASupersededNodeDrainsBeforeStopping(t *testing.T) {
+	t.Parallel()
+
+	_, c := harness(t)
+
+	compute := &fakeCompute{holding: true}
+
+	done := make(chan error, 1)
+
+	go func() {
+		done <- nodeclient.Run(t.Context(), c, compute, nodeclient.LoopOptions{
+			Provider:   config.ProviderDocker,
+			Deployment: deployment,
+			Log:        slog.New(slog.DiscardHandler),
+			Backoff:    20 * time.Millisecond,
+			SweepEvery: 10 * time.Millisecond,
+		})
+	}()
+
+	// A second process takes the name.
+	other, err := nodeclient.New(nodeclient.Options{Base: c.BaseForTest(), Node: "n1"})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+
+	waitFor(t, func() bool { return compute.aliveCount() == 1 })
+
+	if err := other.Register(t.Context(), config.ProviderDocker, nil, deployment); err != nil {
+		t.Fatalf("the second process could not register: %v", err)
+	}
+
+	// IT KEEPS TENDING while it is holding something. Tend is what releases a
+	// lease once its compute is confirmed gone, so this is the work that lets the
+	// hand-over ever complete.
+	waitFor(t, func() bool { return compute.tended() > 0 })
+
+	select {
+	case <-done:
+		t.Fatal("a superseded node stopped while it was still holding compute; nothing else " +
+			"can renew those leases, because the containers are on this machine")
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	// Once it is holding nothing, there is nothing left that depends on it.
+	compute.mu.Lock()
+	compute.holding = false
+	compute.mu.Unlock()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, nodeclient.ErrSuperseded) {
+			t.Errorf("want ErrSuperseded once drained, got %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("a drained node never stopped")
+	}
 }
 
 // A NODE THAT CANNOT JOIN STOPS, rather than retrying forever.

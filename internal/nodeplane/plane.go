@@ -112,6 +112,19 @@ type node struct {
 	// the node reconnects and asks for it again.
 	inflight map[string]*pending
 
+	// owners records which incarnation was given the launch for each lease.
+	//
+	// A SUPERSEDED PROCESS MAY MAINTAIN WHAT IT HOLDS AND NOTHING ELSE. Permitting
+	// every lease route by node name alone let a superseded host read the current
+	// one's leases and RELEASE them: same name, same certificate, and an epoch it
+	// could simply ask for. The capacity came back while a container was running.
+	//
+	// Renewal is deliberately not gated on this. A heartbeat can only extend a
+	// lease, never free it, so the worst a confused process achieves is holding
+	// capacity slightly longer — which is the direction this whole design errs in
+	// anyway.
+	owners map[string]string
+
 	// abandoned holds launches the plane stopped waiting for, by command id, with
 	// the moment it gave up.
 	//
@@ -123,6 +136,10 @@ type node struct {
 
 	// waiting is signalled when a command arrives for a node that is polling.
 	waiting chan struct{}
+
+	// waiters counts pollers parked on this node, so a test can synchronise on a
+	// poll that is genuinely blocked rather than on a sleep.
+	waiters int
 }
 
 // rememberAbandoned records a launch the plane gave up waiting for.
@@ -156,6 +173,13 @@ func (n *node) rememberAbandoned(id string, at time.Time) {
 type pending struct {
 	cmd  nodeapi.Command
 	done chan nodeapi.CommandResult
+	// incarnation is the node PROCESS that took this command.
+	//
+	// The node NAME is not enough. A superseded process and its replacement share
+	// a name and a certificate, so an entitlement looked up by name hands one
+	// process the other's work — and the JIT route, which must stay open so a
+	// launch already under way can finish, is exactly where that matters.
+	incarnation string
 	// delivered records that a node took this command. After that point a
 	// timeout is AMBIGUOUS rather than a failure, because the node may be acting
 	// on it right now.
@@ -178,6 +202,23 @@ func (p *Plane) ForgetForTest(name string) {
 	defer p.mu.Unlock()
 
 	delete(p.nodes, name)
+}
+
+// WaitersForTest reports how many pollers are parked on this node.
+//
+// Exported for tests so they can synchronise on a poll that is genuinely WAITING
+// rather than sleeping and hoping — the difference between testing what happens
+// to a woken poll and testing what happens to a poll that never blocked.
+func (p *Plane) WaitersForTest(name string) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	n, ok := p.nodes[name]
+	if !ok {
+		return 0
+	}
+
+	return n.waiters
 }
 
 // QueuedForTest reports how many commands are waiting to be taken.
@@ -426,6 +467,38 @@ func (p *Plane) CheckIncarnation(name, claimed string) error {
 // ErrNotEntitled means a node asked for something no command it holds allows.
 var ErrNotEntitled = errors.New("nodeplane: this node holds no command that entitles it to that")
 
+// MayMutateLease reports whether this process may change a lease's fate.
+//
+// THE CURRENT PROCESS, OR THE ONE THAT WAS GIVEN THE LAUNCH. Anything else is a
+// host acting on work it was never handed — which, between a superseded
+// incarnation and its replacement, means releasing capacity that another host's
+// container is still using.
+func (p *Plane) MayMutateLease(node, incarnation, leaseID string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	n, ok := p.nodes[node]
+	if !ok {
+		return fmt.Errorf("%w: %s", ErrUnregistered, node)
+	}
+
+	// Nothing has claimed an incarnation, so there is nothing to tell apart: a
+	// fleet mid-upgrade, or the in-process runner, which has no wire to carry one.
+	if n.incarnation == "" || incarnation == "" || n.incarnation == incarnation {
+		return nil
+	}
+
+	if owner, ok := n.owners[leaseID]; ok && owner == incarnation {
+		return nil
+	}
+
+	return fmt.Errorf(
+		"%w: node %q is registered by process %s, this request came from %s, and that process "+
+			"was not given lease %s. A superseded process may maintain what it already holds "+
+			"and nothing else",
+		ErrSuperseded, node, n.incarnation, incarnation, leaseID)
+}
+
 // EntitledToLaunch reports whether a node is currently executing a launch for
 // this lease.
 //
@@ -441,7 +514,7 @@ var ErrNotEntitled = errors.New("nodeplane: this node holds no command that enti
 // The lease id carries the entitlement because it is already in the runner name
 // billet chooses (see provider.InstanceName), so a node can only ask for the
 // registration belonging to the launch it was actually told to perform.
-func (p *Plane) EntitledToLaunch(node, leaseID string) (string, error) {
+func (p *Plane) EntitledToLaunch(node, incarnation, leaseID string) (string, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -452,6 +525,16 @@ func (p *Plane) EntitledToLaunch(node, leaseID string) (string, error) {
 
 	for _, pend := range n.inflight {
 		if pend.cmd.Kind != nodeapi.CommandLaunch || pend.cmd.Lease == nil {
+			continue
+		}
+
+		// THE PROCESS THAT WAS GIVEN THE COMMAND, not merely the node that was.
+		// The JIT route stays open to a superseded process on purpose — a launch it
+		// began must be able to finish — and looking the entitlement up by name
+		// alone would hand it the CURRENT process's work instead. A long poll
+		// admitted before supersession can still wake afterwards holding a command,
+		// so this is reachable without anything hostile happening.
+		if pend.incarnation != "" && incarnation != "" && pend.incarnation != incarnation {
 			continue
 		}
 
@@ -528,7 +611,7 @@ func (p *Plane) Nodes() []string {
 //
 // An empty command with ok=false is how a quiet poll ends. The node re-polls
 // immediately; that is not an error and must not be treated as one.
-func (p *Plane) Poll(ctx context.Context, nodeName string) (nodeapi.Command, bool, error) {
+func (p *Plane) Poll(ctx context.Context, nodeName, incarnation string) (nodeapi.Command, bool, error) {
 	p.mu.Lock()
 
 	n, ok := p.nodes[nodeName]
@@ -540,14 +623,25 @@ func (p *Plane) Poll(ctx context.Context, nodeName string) (nodeapi.Command, boo
 
 	n.lastSeen = p.now()
 
-	if cmd, took := p.takeLocked(n); took {
+	if cmd, took := p.takeLocked(n, incarnation); took {
 		p.mu.Unlock()
 
 		return cmd, true, nil
 	}
 
 	wait := n.waiting
+	n.waiters++
 	p.mu.Unlock()
+
+	defer func() {
+		p.mu.Lock()
+
+		if n, ok := p.nodes[nodeName]; ok {
+			n.waiters--
+		}
+
+		p.mu.Unlock()
+	}()
 
 	timer := time.NewTimer(p.poll)
 	defer timer.Stop()
@@ -568,13 +662,24 @@ func (p *Plane) Poll(ctx context.Context, nodeName string) (nodeapi.Command, boo
 		return nodeapi.Command{}, false, ErrUnregistered
 	}
 
-	cmd, took := p.takeLocked(n)
+	// CHECKED AGAIN AFTER WAITING, because a long poll is admitted at the start
+	// and answered at the end, and a supersession can land between the two. The
+	// handler's check passed when this request arrived; without a second look, a
+	// process that has since been replaced still walks away with a command — and
+	// then legitimately holds an entitlement to mint its runner.
+	if n.incarnation != "" && incarnation != "" && n.incarnation != incarnation {
+		return nodeapi.Command{}, false, fmt.Errorf(
+			"%w: node %q is registered by process %s and this poll came from %s",
+			ErrSuperseded, nodeName, n.incarnation, incarnation)
+	}
+
+	cmd, took := p.takeLocked(n, incarnation)
 
 	return cmd, took, nil
 }
 
-// takeLocked moves the head of the queue into flight.
-func (p *Plane) takeLocked(n *node) (nodeapi.Command, bool) {
+// takeLocked moves the head of the queue into flight, recording who took it.
+func (p *Plane) takeLocked(n *node, incarnation string) (nodeapi.Command, bool) {
 	if len(n.queue) == 0 {
 		return nodeapi.Command{}, false
 	}
@@ -582,7 +687,20 @@ func (p *Plane) takeLocked(n *node) (nodeapi.Command, bool) {
 	pend := n.queue[0]
 	n.queue = n.queue[1:]
 	pend.delivered = true
+	pend.incarnation = incarnation
 	n.inflight[pend.cmd.ID] = pend
+
+	// THE LEASE FOLLOWS THE PROCESS THAT WAS GIVEN IT. This is what lets a
+	// superseded incarnation keep maintaining the launch it began — and stops it
+	// touching one it was not given, which shares its node name and its
+	// certificate and is otherwise indistinguishable.
+	if pend.cmd.Kind == nodeapi.CommandLaunch && pend.cmd.Lease != nil && incarnation != "" {
+		if n.owners == nil {
+			n.owners = make(map[string]string)
+		}
+
+		n.owners[pend.cmd.Lease.ID] = incarnation
+	}
 
 	return pend.cmd, true
 }

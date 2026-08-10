@@ -42,6 +42,10 @@ type Compute interface {
 	// AssumeCustody takes a lease whose launch succeeded but whose result could
 	// not be delivered, because the control plane will assume custody too.
 	AssumeCustody(ctx context.Context, lease *alloc.Lease, requestID int64) error
+
+	// Holding reports whether this node is still responsible for compute, which
+	// is what decides whether a superseded process may stop.
+	Holding() bool
 }
 
 // LoopOptions configures Run.
@@ -202,7 +206,16 @@ func Run(ctx context.Context, c *Client, compute Compute, opts LoopOptions) erro
 		// Two hosts under one node name is a configuration mistake — a certificate
 		// bundle copied to both, or the same node.name in two files — and an
 		// operator has to fix it.
+		//
+		// STOPPING IMMEDIATELY IS ALSO WRONG, and that was the first version. This
+		// process may be holding compute right now; the control plane keeps its
+		// heartbeat and its result routes open precisely so it can finish. Exiting
+		// cancels the janitor, and the replacement cannot adopt what it cannot see
+		// — the container is on this machine — so the lease is renewed by nobody
+		// and its capacity is resold under a running job.
 		if errors.Is(err, ErrSuperseded) {
+			drain(ctx, compute, log, opts)
+
 			return fmt.Errorf("this node has been superseded: %w", err)
 		}
 
@@ -221,6 +234,44 @@ func Run(ctx context.Context, c *Client, compute Compute, opts LoopOptions) erro
 			return ctx.Err()
 		}
 	}
+}
+
+// drain keeps a superseded node's obligations alive until it has none.
+//
+// It takes no new work — the control plane refuses it — and does the two things
+// that let compute finish and be accounted for: renew what is held, and tend it
+// so a lease is released once its container is confirmed gone. When nothing is
+// held, this process has nothing left that anybody depends on.
+//
+// Bounded by the caller's context and nothing else, deliberately. A time limit
+// here would be a limit on how long a job may run, which billet does not impose
+// anywhere: the operator's fix is to stop the duplicate host, and until they do,
+// holding the lease is the safe direction.
+func drain(ctx context.Context, compute Compute, log *slog.Logger, opts LoopOptions) {
+	if !compute.Holding() {
+		return
+	}
+
+	log.Warn("another process has registered as this node; not taking further work, but " +
+		"keeping the leases of compute already running here renewed until it finishes. " +
+		"Stop whichever host is not meant to be this node")
+
+	every := opts.SweepEvery
+	if every <= 0 {
+		every = time.Second
+	}
+
+	for compute.Holding() {
+		if err := compute.Tend(ctx); err != nil {
+			log.Error("could not advance custody while draining", "error", err)
+		}
+
+		if !sleep(ctx, every) {
+			return
+		}
+	}
+
+	log.Info("everything this node was holding has finished; stopping")
 }
 
 // serve polls for commands until something needs the caller to re-register.

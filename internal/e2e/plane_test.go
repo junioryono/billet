@@ -464,7 +464,7 @@ func wireUp(
 	}
 
 	wire := &http.Server{
-		Handler:           nodeplane.Handler(log, plane, a, wiring.NodeJIT{Client: client}),
+		Handler:           nodeplane.Handler(log, plane, a, wiring.NodeJIT{Client: client}, nodeplane.WithTiers(tiers)),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 

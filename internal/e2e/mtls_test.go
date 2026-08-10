@@ -127,7 +127,12 @@ func mtlsWireWithPlane(t *testing.T) (*wirecert.CA, string, *nodeplane.Plane) {
 	plane.SetPollWindowForTest(200 * time.Millisecond)
 
 	srv := httptest.NewUnstartedServer(
-		nodeplane.Handler(log, plane, mtlsStore{}, alwaysMints{}, nodeplane.RequireClientCert()))
+		nodeplane.Handler(log, plane, mtlsStore{}, alwaysMints{},
+			nodeplane.RequireClientCert(),
+			// The catalogue a JIT request is checked against. Its runner group is
+			// part of a tier's address, so a wire without it refuses every
+			// legitimate registration for a tier outside the default group.
+			nodeplane.WithTiers([]config.Tier{{Label: "billet-2vcpu", RunnerGroup: "billet"}})))
 	srv.TLS = conf
 	srv.StartTLS()
 
@@ -140,8 +145,16 @@ func mtlsWireWithPlane(t *testing.T) (*wirecert.CA, string, *nodeplane.Plane) {
 // thing that can refuse is the entitlement check under test.
 type alwaysMints struct{}
 
-func (alwaysMints) Describe(context.Context, string, string) (*nodeplane.JITSet, []string, error) {
-	return &nodeplane.JITSet{ID: 7, Name: "billet-2vcpu"}, nil, nil
+// THE GROUP IS PART OF THE ADDRESS, and a fake that ignores it cannot catch the
+// bug where billet resolves a tier in the wrong one. Real Describe defaults an
+// empty group to "default", so a tier deliberately placed elsewhere is simply
+// not found — and its legitimate registrations are refused.
+func (alwaysMints) Describe(_ context.Context, name, group string) (*nodeplane.JITSet, []string, error) {
+	if name != "billet-2vcpu" || group != "billet" {
+		return nil, nil, nil
+	}
+
+	return &nodeplane.JITSet{ID: 7, Name: name}, nil, nil
 }
 
 func (alwaysMints) JITConfig(_ context.Context, _ int, runnerName, _ string) (nodeplane.JITRegistration, error) {
@@ -542,6 +555,243 @@ func postAs(t *testing.T, c *http.Client, url, body string) (int, error) {
 	return res.StatusCode, nil
 }
 
+// A SUPERSEDED HOST CAN FINISH THE LEASE IT WAS GIVEN, which is the half that
+// makes draining possible at all.
+//
+// The refusal in the next test is only safe because of this one. A superseded
+// process keeps renewing what it holds and tends it until the compute is
+// confirmed gone — and tending ENDS with a release. If that release were refused
+// along with everything else, the drain could never complete and the lease would
+// be held until an operator intervened.
+func TestASupersededHostCanFinishItsOwnLease(t *testing.T) {
+	t.Parallel()
+
+	ca, base, plane := mtlsWireWithPlane(t)
+
+	bundle, err := ca.IssueNode("epyc-1")
+	if err != nil {
+		t.Fatalf("issue: %v", err)
+	}
+
+	conf, err := wirecert.ClientTLS(bundle)
+	if err != nil {
+		t.Fatalf("client tls: %v", err)
+	}
+
+	first, err := nodeclient.New(nodeclient.Options{Base: base, Node: "epyc-1", TLS: conf})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+
+	second, err := nodeclient.New(nodeclient.Options{Base: base, Node: "epyc-1", TLS: conf})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+
+	if err := first.Register(t.Context(), config.ProviderDocker, nil, wireDeployment); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	// The first process is GIVEN lease l1, which is what makes it l1's owner.
+	go func() {
+		lease := &alloc.Lease{
+			ID:        "l1",
+			Tier:      "billet-2vcpu",
+			VCPU:      2,
+			Memory:    8 * config.GiB,
+			GuestOS:   config.GuestLinux,
+			Providers: []config.ProviderKind{config.ProviderDocker},
+			Epoch:     1,
+		}
+
+		//nolint:errcheck // the launch's fate is not what this test is about
+		_ = plane.NewRunner().Launch(t.Context(), lease, server.Job{RequestID: 7})
+	}()
+
+	cmd, ok, err := first.Poll(t.Context())
+	if err != nil || !ok || cmd.Lease == nil {
+		t.Fatalf("the first process was not given the launch: ok=%v err=%v", ok, err)
+	}
+
+	// And then it is superseded, mid-launch.
+	if err := second.Register(t.Context(), config.ProviderDocker, nil, wireDeployment); err != nil {
+		t.Fatalf("the second process could not register: %v", err)
+	}
+
+	if err := first.Release(t.Context(), "l1", 1, alloc.PhaseDone); err != nil {
+		t.Errorf("a superseded process could not release the lease it was actually given "+
+			"(%v); its drain can never finish, so the capacity is held until somebody "+
+			"intervenes by hand", err)
+	}
+}
+
+// A SUPERSEDED HOST CANNOT RELEASE A LEASE IT WAS NEVER GIVEN.
+//
+// Permitting every lease route by node name was too broad. A superseded process
+// shares the name and the certificate with its replacement, so it could ask for
+// the current process's lease, read its epoch, and release it — returning
+// capacity while the other host's container was still running. Both requests
+// look identical to a handler that checks only the name.
+//
+// What it MAY do is maintain what it was actually given: renewing extends a
+// lease and can never free one, so that stays open for every process.
+func TestASupersededHostCannotReleaseAnotherProcessLease(t *testing.T) {
+	t.Parallel()
+
+	ca, base := mtlsWire(t)
+
+	bundle, err := ca.IssueNode("epyc-1")
+	if err != nil {
+		t.Fatalf("issue: %v", err)
+	}
+
+	conf, err := wirecert.ClientTLS(bundle)
+	if err != nil {
+		t.Fatalf("client tls: %v", err)
+	}
+
+	first, err := nodeclient.New(nodeclient.Options{Base: base, Node: "epyc-1", TLS: conf})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+
+	second, err := nodeclient.New(nodeclient.Options{Base: base, Node: "epyc-1", TLS: conf})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+
+	if err := first.Register(t.Context(), config.ProviderDocker, nil, wireDeployment); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	if err := second.Register(t.Context(), config.ProviderDocker, nil, wireDeployment); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	// The superseded process was never given l1 — the second one owns the name
+	// now — so it may not decide that lease's fate.
+	err = first.Release(t.Context(), "l1", 1, alloc.PhaseFailed)
+	if !errors.Is(err, nodeclient.ErrSuperseded) {
+		t.Errorf("a superseded host released a lease it was never given (%v); the capacity "+
+			"goes back while another host's container is still using it", err)
+	}
+
+	if err := first.Advance(t.Context(), "l1", 1, alloc.PhaseOnline); !errors.Is(err, nodeclient.ErrSuperseded) {
+		t.Errorf("a superseded host advanced a lease it was never given: %v", err)
+	}
+
+	// But renewal stays open, because it can only ever extend.
+	if err := first.Heartbeat(t.Context(), "l1", 1); err != nil {
+		t.Errorf("a superseded host could not renew (%v); renewal never frees capacity, and "+
+			"refusing it is how a lease ends up owned by nobody", err)
+	}
+
+	// And the current process is unaffected.
+	if err := second.Release(t.Context(), "l1", 1, alloc.PhaseFailed); err != nil {
+		t.Errorf("the current process was refused its own lease: %v", err)
+	}
+}
+
+// A POLL ADMITTED BEFORE SUPERSESSION IS REFUSED WHEN IT WAKES.
+//
+// A long poll is checked when it ARRIVES and answered when a command appears,
+// and a supersession can land between the two. Without a second look, a process
+// that has since been replaced still walks away with a command — and then holds
+// a genuine entitlement to mint that runner's registration, having never done
+// anything the handler could object to.
+func TestAWokenPollFromASupersededProcessIsRefused(t *testing.T) {
+	t.Parallel()
+
+	ca, base, plane := mtlsWireWithPlane(t)
+
+	// Long enough that the poll below is still waiting when the second process
+	// registers, rather than having timed out and returned nothing.
+	plane.SetPollWindowForTest(10 * time.Second)
+
+	bundle, err := ca.IssueNode("epyc-1")
+	if err != nil {
+		t.Fatalf("issue: %v", err)
+	}
+
+	conf, err := wirecert.ClientTLS(bundle)
+	if err != nil {
+		t.Fatalf("client tls: %v", err)
+	}
+
+	first, err := nodeclient.New(nodeclient.Options{Base: base, Node: "epyc-1", TLS: conf})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+
+	second, err := nodeclient.New(nodeclient.Options{Base: base, Node: "epyc-1", TLS: conf})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+
+	if err := first.Register(t.Context(), config.ProviderDocker, nil, wireDeployment); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	type polled struct {
+		cmd nodeapi.Command
+		ok  bool
+		err error
+	}
+
+	answer := make(chan polled, 1)
+
+	go func() {
+		cmd, ok, err := first.Poll(t.Context())
+		answer <- polled{cmd, ok, err}
+	}()
+
+	// Wait until the poll is genuinely waiting, or the supersession below would
+	// race it and the test would prove the ordinary path instead.
+	waitingBy := time.Now().Add(10 * time.Second)
+	for plane.WaitersForTest("epyc-1") == 0 {
+		if time.Now().After(waitingBy) {
+			t.Fatal("the poll never blocked, so nothing was superseded mid-wait")
+		}
+
+		time.Sleep(time.Millisecond)
+	}
+
+	if err := second.Register(t.Context(), config.ProviderDocker, nil, wireDeployment); err != nil {
+		t.Fatalf("the second process could not register: %v", err)
+	}
+
+	// A command arrives, waking the older poll.
+	go func() {
+		lease := &alloc.Lease{
+			ID:        "l1",
+			Tier:      "billet-2vcpu",
+			VCPU:      2,
+			Memory:    8 * config.GiB,
+			GuestOS:   config.GuestLinux,
+			Providers: []config.ProviderKind{config.ProviderDocker},
+			Epoch:     1,
+		}
+
+		//nolint:errcheck // the launch's fate is not what this test is about
+		_ = plane.NewRunner().Launch(t.Context(), lease, server.Job{RequestID: 7})
+	}()
+
+	select {
+	case got := <-answer:
+		if got.ok {
+			t.Errorf("a poll admitted before supersession still took command %s; that process "+
+				"is now entitled to mint the runner for a launch it should never have been "+
+				"given", got.cmd.ID)
+		}
+
+		if !errors.Is(got.err, nodeclient.ErrSuperseded) {
+			t.Errorf("want ErrSuperseded from a woken poll, got %v", got.err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("the poll never returned")
+	}
+}
+
 // A RESTART IS NOT A DUPLICATE, and refusing one would be worse than the bug.
 //
 // The same process re-registering after the control plane forgot it — a plane
@@ -563,6 +813,54 @@ func TestAReconnectingNodeIsNotFenced(t *testing.T) {
 		if _, err := c.Lease(t.Context(), "l1"); err != nil {
 			t.Fatalf("a node that re-registered as itself was fenced: %v", err)
 		}
+	}
+}
+
+// A TIER OUTSIDE THE DEFAULT RUNNER GROUP STILL GETS ITS REGISTRATIONS.
+//
+// Resolving a scale set without a group silently means "the default group", and
+// a tier deliberately placed elsewhere — which is how an operator keeps it away
+// from every repository in the organisation — would simply not be found. Every
+// launch on that tier would then fail at the moment it asked for its
+// registration, on the control plane, for a reason no node could report usefully.
+//
+// The tightening that closed the scale-set substitution is what introduced this:
+// the first version resolved the set with an empty group. It is the same defect
+// shape as the substitution it was fixing — an address with a piece missing.
+func TestATierInANonDefaultRunnerGroupCanStillMint(t *testing.T) {
+	t.Parallel()
+
+	ca, base, plane := mtlsWireWithPlane(t)
+
+	c := nodeClient(t, ca, base, "epyc-1", "epyc-1")
+
+	if err := c.Register(t.Context(), config.ProviderDocker, nil, wireDeployment); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	launched := make(chan error, 1)
+
+	go func() {
+		lease := &alloc.Lease{
+			ID:        "l1",
+			Tier:      "billet-2vcpu", // configured into runner group "billet"
+			VCPU:      2,
+			Memory:    8 * config.GiB,
+			GuestOS:   config.GuestLinux,
+			Providers: []config.ProviderKind{config.ProviderDocker},
+			Epoch:     1,
+		}
+
+		launched <- plane.NewRunner().Launch(t.Context(), lease, server.Job{RequestID: 7})
+	}()
+
+	if _, ok, err := c.Poll(t.Context()); err != nil || !ok {
+		t.Fatalf("the node was not given the launch: ok=%v err=%v", ok, err)
+	}
+
+	if _, err := c.JITConfig(t.Context(), 7, "billet-l1", "_work"); err != nil {
+		t.Errorf("a tier in a non-default runner group could not mint the registration for "+
+			"the launch it was given: %v", err)
 	}
 }
 

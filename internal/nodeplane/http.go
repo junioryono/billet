@@ -8,9 +8,11 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/provider"
 	"github.com/junioryono/billet/internal/wirecert"
@@ -63,6 +65,22 @@ const maxBody = 1 << 20
 // HandlerOption configures the wire.
 type HandlerOption func(*handler)
 
+// WithTiers gives the wire the catalogue it needs to check a JIT request.
+//
+// A TIER'S RUNNER GROUP IS PART OF ITS ADDRESS, and resolving a scale set
+// without one silently means "the default group". A tier deliberately placed in
+// another group — which is how an operator stops every repository in the
+// organisation from reaching it — would then have its legitimate registrations
+// refused, because the set looked for is not the set that exists.
+func WithTiers(tiers []config.Tier) HandlerOption {
+	return func(h *handler) {
+		h.tiers = make(map[string]config.Tier, len(tiers))
+		for i := range tiers {
+			h.tiers[tiers[i].Label] = tiers[i]
+		}
+	}
+}
+
 // RequireClientCert makes a verified certificate the source of a node's name.
 //
 // WITHOUT IT THE PATH IS THE ONLY AUTHORITY, which is not authentication at all:
@@ -95,16 +113,24 @@ func Handler(log *slog.Logger, p *Plane, store LeaseStore, jit JITSource, opts .
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("POST /v1/register", h.register)
-	// POLL AND BIND ARE WHERE WORK IS ACQUIRED, so those are the routes a
-	// superseded process is refused. Everything else it may still call: it may be
-	// holding a container, and cutting it off from heartbeating or reporting is
-	// how a lease ends up owned by nobody.
+	// THREE CLASSES, and the distinction is what a request can COST.
+	//
+	// forNewWork — poll and bind — acquires work or capacity. A superseded process
+	// is refused: two hosts under one name cannot both be given work.
+	//
+	// forOwnLease — advance and release — changes a lease's fate. Permitted only
+	// for a lease this process was actually given, or if it is the current one.
+	//
+	// forNode — heartbeat, result, reads — maintains or concludes what is already
+	// held. Open to a superseded process on purpose: it may be holding a container
+	// right now, and cutting it off from renewing or reporting is how a lease ends
+	// up owned by nobody at all.
 	mux.HandleFunc("POST /v1/nodes/{node}/poll", h.forNewWork(h.poll))
 	mux.HandleFunc("POST /v1/nodes/{node}/result", h.forNode(h.result))
 	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/bind", h.forNewWork(h.bind))
-	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/advance", h.forNode(h.advance))
+	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/advance", h.forOwnLease(h.advance))
 	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/heartbeat", h.forNode(h.heartbeat))
-	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/release", h.forNode(h.release))
+	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/release", h.forOwnLease(h.release))
 	mux.HandleFunc("GET /v1/nodes/{node}/leases/{lease}", h.forNode(h.lease))
 	mux.HandleFunc("GET /v1/nodes/{node}/launched", h.forNode(h.launched))
 	mux.HandleFunc("POST /v1/nodes/{node}/describe", h.forNode(h.describe))
@@ -119,6 +145,51 @@ type handler struct {
 	store       LeaseStore
 	jit         JITSource
 	requireCert bool
+
+	// tiers is the catalogue, by label, used to resolve a lease's scale set.
+	tiers map[string]config.Tier
+
+	// sets caches the resolved scale set per tier.
+	//
+	// A JIT REQUEST IS ON THE PATH OF EVERY JOB, and resolving the set means two
+	// GitHub calls — a runner-group lookup and a scale-set lookup. Making them per
+	// job would double this control plane's API traffic against a rate limit it
+	// shares with every listener, to answer a question whose answer changes only
+	// when somebody edits the organisation.
+	setsMu sync.Mutex
+	sets   map[string]int
+}
+
+// scaleSetFor resolves a tier's scale set id, once.
+func (h *handler) scaleSetFor(ctx context.Context, tier config.Tier) (int, error) {
+	h.setsMu.Lock()
+	id, cached := h.sets[tier.Label]
+	h.setsMu.Unlock()
+
+	if cached {
+		return id, nil
+	}
+
+	set, _, err := h.jit.Describe(ctx, tier.Label, tier.RunnerGroup)
+	if err != nil {
+		return 0, err
+	}
+
+	if set == nil {
+		return 0, fmt.Errorf("nodeplane: tier %q has no scale set in runner group %q",
+			tier.Label, tier.RunnerGroup)
+	}
+
+	h.setsMu.Lock()
+
+	if h.sets == nil {
+		h.sets = make(map[string]int)
+	}
+
+	h.sets[tier.Label] = set.ID
+	h.setsMu.Unlock()
+
+	return set.ID, nil
 }
 
 // forNode admits a request only if the certificate agrees with the path.
@@ -129,6 +200,37 @@ type handler struct {
 // passing every request, and looking exactly like a working check.
 func (h *handler) forNode(next http.HandlerFunc) http.HandlerFunc {
 	return h.guard(next, false)
+}
+
+// forOwnLease wraps a route that changes a lease's FATE rather than its deadline.
+//
+// A superseded process may finish what it was given and nothing else. Advancing
+// or releasing a lease it never received is how one host returns capacity that
+// another host's container is still using — and between an incarnation and its
+// replacement, the node name and the certificate are identical, so nothing else
+// can tell them apart.
+//
+// Renewal is deliberately NOT here. A heartbeat only ever extends a lease, so
+// the worst a confused process achieves is holding capacity a little longer,
+// which is the direction this design errs in everywhere else.
+func (h *handler) forOwnLease(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		node := r.PathValue("node")
+
+		if !h.authorise(w, r, node) {
+			return
+		}
+
+		err := h.plane.MayMutateLease(node,
+			r.Header.Get(nodeapi.HeaderIncarnation), r.PathValue("lease"))
+		if err != nil {
+			writeStoreErr(w, err)
+
+			return
+		}
+
+		next(w, r)
+	}
 }
 
 // forNewWork wraps a route by which a node ACQUIRES work or capacity.
@@ -282,7 +384,8 @@ func (h *handler) register(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) poll(w http.ResponseWriter, r *http.Request) {
-	cmd, ok, err := h.plane.Poll(r.Context(), r.PathValue("node"))
+	cmd, ok, err := h.plane.Poll(r.Context(), r.PathValue("node"),
+		r.Header.Get(nodeapi.HeaderIncarnation))
 	if err != nil {
 		writeStoreErr(w, err)
 
@@ -540,7 +643,8 @@ func (h *handler) jitConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tier, err := h.plane.EntitledToLaunch(r.PathValue("node"), leaseID)
+	tier, err := h.plane.EntitledToLaunch(r.PathValue("node"),
+		r.Header.Get(nodeapi.HeaderIncarnation), leaseID)
 	if err != nil {
 		h.log.Warn("refused a runner registration a node was not entitled to",
 			"node", r.PathValue("node"), "lease", leaseID, "scale_set", req.ScaleSetID)
@@ -556,17 +660,25 @@ func (h *handler) jitConfig(w http.ResponseWriter, r *http.Request) {
 	// would join a tier with different labels, different jobs and possibly
 	// different secrets. The set is resolved here, from the lease's own tier,
 	// rather than taken from the request.
-	set, _, err := h.jit.Describe(r.Context(), tier, "")
+	known, ok := h.tiers[tier]
+	if !ok {
+		writeErr(w, http.StatusForbidden, nodeapi.CodeRefused, fmt.Sprintf(
+			"lease %s names tier %q, which is not in this control plane's catalogue", leaseID, tier))
+
+		return
+	}
+
+	setID, err := h.scaleSetFor(r.Context(), known)
 	if err != nil {
 		writeStoreErr(w, err)
 
 		return
 	}
 
-	if set == nil || set.ID != req.ScaleSetID {
+	if setID != req.ScaleSetID {
 		h.log.Warn("refused a runner registration for a scale set the launch does not name",
 			"node", r.PathValue("node"), "lease", leaseID, "tier", tier,
-			"asked_for", req.ScaleSetID)
+			"asked_for", req.ScaleSetID, "belongs_to", setID)
 
 		writeErr(w, http.StatusForbidden, nodeapi.CodeRefused, fmt.Sprintf(
 			"lease %s belongs to tier %q, so a registration may be minted in that tier's "+
@@ -655,6 +767,8 @@ func writeErr(w http.ResponseWriter, status int, code, msg string) {
 // reworded error becomes an outage.
 func writeStoreErr(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, ErrSuperseded):
+		writeErr(w, http.StatusConflict, nodeapi.CodeSuperseded, err.Error())
 	case errors.Is(err, ErrNotEntitled):
 		writeErr(w, http.StatusForbidden, nodeapi.CodeRefused, err.Error())
 	case errors.Is(err, ErrTakeCustody):

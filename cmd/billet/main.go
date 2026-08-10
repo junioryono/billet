@@ -564,10 +564,13 @@ func serveNodeWire(
 	addr := cfg.Server.Listen
 	loopback := nodeplane.LoopbackOnly(addr)
 
-	var (
-		handlerOpts []nodeplane.HandlerOption
-		tlsConf     *tls.Config
-	)
+	// THE CATALOGUE TRAVELS WITH THE WIRE, because a JIT request is checked
+	// against the tier its lease names — including that tier's runner group,
+	// which is how an operator keeps a tier away from every repository in the
+	// organisation.
+	handlerOpts := []nodeplane.HandlerOption{nodeplane.WithTiers(cfg.Tiers)}
+
+	var tlsConf *tls.Config
 
 	if !loopback {
 		hosts, err := nodeTLSHosts(cfg)

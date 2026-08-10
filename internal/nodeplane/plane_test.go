@@ -108,7 +108,7 @@ func TestASilentNodeLeavesTheLeaseInCustody(t *testing.T) {
 
 	// The node takes the command and never answers.
 	go func() {
-		if _, _, err := p.Poll(t.Context(), "n1"); err != nil {
+		if _, _, err := p.Poll(t.Context(), "n1", ""); err != nil {
 			return
 		}
 	}()
@@ -175,7 +175,7 @@ func TestANodesVerdictIsCarriedBack(t *testing.T) {
 			register(t, p, "n1", config.ProviderDocker)
 
 			go func() {
-				cmd, ok, err := p.Poll(t.Context(), "n1")
+				cmd, ok, err := p.Poll(t.Context(), "n1", "")
 				if err != nil || !ok {
 					return
 				}
@@ -219,7 +219,7 @@ func TestARestartedNodeLeavesItsLaunchesInCustody(t *testing.T) {
 	taken := make(chan struct{})
 
 	go func() {
-		if _, _, err := p.Poll(t.Context(), "n1"); err == nil {
+		if _, _, err := p.Poll(t.Context(), "n1", ""); err == nil {
 			close(taken)
 		}
 	}()
@@ -305,7 +305,7 @@ func TestTheLeasesPreferenceOrderDecides(t *testing.T) {
 
 	for _, name := range []string{"docker-host", "ec2-host"} {
 		go func() {
-			cmd, ok, err := p.Poll(t.Context(), name)
+			cmd, ok, err := p.Poll(t.Context(), name, "")
 			if err != nil || !ok {
 				return
 			}
@@ -346,7 +346,7 @@ func TestAPinnedLeaseWillNotWander(t *testing.T) {
 	register(t, p, "other", config.ProviderDocker)
 
 	go func() {
-		cmd, ok, err := p.Poll(t.Context(), "other")
+		cmd, ok, err := p.Poll(t.Context(), "other", "")
 		if err != nil || !ok {
 			return
 		}
@@ -376,7 +376,7 @@ func TestAnUnregisteredNodeIsToldToRegister(t *testing.T) {
 
 	p := testPlane(t)
 
-	if _, _, err := p.Poll(t.Context(), "ghost"); !errors.Is(err, ErrUnregistered) {
+	if _, _, err := p.Poll(t.Context(), "ghost", ""); !errors.Is(err, ErrUnregistered) {
 		t.Fatalf("want ErrUnregistered, got %v", err)
 	}
 
@@ -395,7 +395,7 @@ func TestAnIdlePollIsNotAnError(t *testing.T) {
 
 	register(t, p, "n1", config.ProviderDocker)
 
-	cmd, ok, err := p.Poll(t.Context(), "n1")
+	cmd, ok, err := p.Poll(t.Context(), "n1", "")
 	if err != nil {
 		t.Fatalf("an idle poll reported an error: %v", err)
 	}
@@ -428,7 +428,7 @@ func TestOneWedgedNodeDoesNotStallADestroy(t *testing.T) {
 
 		// Each takes its command and never answers.
 		go func() {
-			if _, _, err := p.Poll(t.Context(), name); err != nil {
+			if _, _, err := p.Poll(t.Context(), name, ""); err != nil {
 				return
 			}
 		}()
@@ -462,7 +462,7 @@ func TestADestroyReportsEveryNodeThatFailed(t *testing.T) {
 		register(t, p, name, config.ProviderDocker)
 
 		go func() {
-			cmd, ok, err := p.Poll(t.Context(), name)
+			cmd, ok, err := p.Poll(t.Context(), name, "")
 			if err != nil || !ok {
 				return
 			}
@@ -569,7 +569,7 @@ func TestABusyNodeIsNotForgotten(t *testing.T) {
 	taken := make(chan struct{})
 
 	go func() {
-		if _, _, err := p.Poll(t.Context(), "n1"); err == nil {
+		if _, _, err := p.Poll(t.Context(), "n1", ""); err == nil {
 			close(taken)
 		}
 	}()
@@ -752,7 +752,7 @@ func TestADestroyNoNodeConfirmedIsAFailure(t *testing.T) {
 	taken := make(chan struct{})
 
 	go func() {
-		if _, _, err := p.Poll(t.Context(), "n1"); err == nil {
+		if _, _, err := p.Poll(t.Context(), "n1", ""); err == nil {
 			close(taken)
 		}
 	}()
