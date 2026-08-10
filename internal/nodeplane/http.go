@@ -235,9 +235,21 @@ func (h *handler) forOwnLease(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		err := h.plane.MayMutateLease(node,
-			r.Header.Get(nodeapi.HeaderIncarnation), r.PathValue("lease"))
-		if err != nil {
+		incarnation := r.Header.Get(nodeapi.HeaderIncarnation)
+
+		// STILL EVIDENCE OF LIFE, for the process that currently owns the name. A
+		// node whose command loop is wedged keeps heartbeating from its janitor,
+		// and that must keep it in the fleet — the alternative is the plane
+		// expiring a node whose every heartbeat proves it is there. Seen itself
+		// ignores a superseded process, so a drain does not vouch for anybody.
+		h.plane.Seen(node, incarnation)
+
+		// OWNERSHIP IS THE AUTHORISATION HERE, not fleet membership — which is why
+		// these handlers do not also demand registration. A draining process
+		// outlives its replacement on purpose, and once the replacement goes silent
+		// the node is forgotten; requiring membership refused the drain its own
+		// lease at exactly the moment nothing else was renewing it.
+		if err := h.plane.MayMutateLease(node, incarnation, r.PathValue("lease")); err != nil {
 			writeStoreErr(w, err)
 
 			return
@@ -398,21 +410,32 @@ func (h *handler) register(w http.ResponseWriter, r *http.Request) {
 	// supersedes it — and the new plane never saw those launches, so it refuses
 	// the draining process its own release and the drain never ends.
 	//
-	// Best effort: a ledger that cannot answer is not a reason to refuse a
-	// registration, and the consequence of missing it is a drain that needs an
-	// operator, not compute that runs unaccounted for.
-	if ids, err := h.store.LaunchedLeaseIDs(r.Context(), req.Node); err != nil {
-		h.log.Warn("could not rebuild which leases this node already holds; a process that is "+
-			"later superseded may be unable to release them",
-			"node", req.Node, "error", err)
-	} else {
-		open := make([]string, 0, len(ids))
-		for id := range ids {
-			open = append(open, id)
-		}
+	// AND A REBUILD THAT FAILED IS NOT A REGISTRATION THAT SUCCEEDED. Treating it
+	// as best-effort was wrong: the node goes on to adopt its surviving compute
+	// believing it is registered, and if it is later superseded the plane has no
+	// record that those leases are its — so its renewals are refused and the
+	// leases are reaped under running containers.
+	//
+	// A ledger that cannot answer is an outage, so this is a 503 the node retries,
+	// not a verdict it stops on.
+	ids, err := h.store.LaunchedLeaseIDs(r.Context(), req.Node)
+	if err != nil {
+		h.log.Warn("could not read which leases this node already holds; refusing the "+
+			"registration rather than accepting a node whose existing compute the plane "+
+			"cannot attribute", "node", req.Node, "error", err)
 
-		h.plane.AdoptOwnership(req.Node, req.Incarnation, open)
+		writeErr(w, http.StatusServiceUnavailable, "", fmt.Sprintf(
+			"could not read the leases already placed on %s: %v", req.Node, err))
+
+		return
 	}
+
+	open := make([]string, 0, len(ids))
+	for id := range ids {
+		open = append(open, id)
+	}
+
+	h.plane.AdoptOwnership(req.Node, req.Incarnation, open)
 
 	h.log.Info("node registered",
 		"node", req.Node, "provider", req.Provider, "guest_os", req.GuestOS)
@@ -498,11 +521,8 @@ func (h *handler) advance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.registered(r); err != nil {
-		writeStoreErr(w, err)
-
-		return
-	}
+	// NO MEMBERSHIP CHECK: forOwnLease has already established that this process
+	// owns the lease, and a draining process outlives the node record on purpose.
 
 	if err := h.store.Advance(r.Context(), r.PathValue("lease"), req.Epoch, phase); err != nil {
 		writeStoreErr(w, err)
@@ -519,11 +539,8 @@ func (h *handler) heartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.registered(r); err != nil {
-		writeStoreErr(w, err)
-
-		return
-	}
+	// NO MEMBERSHIP CHECK: forOwnLease has already established that this process
+	// owns the lease, and a draining process outlives the node record on purpose.
 
 	if err := h.store.Heartbeat(r.Context(), r.PathValue("lease"), req.Epoch); err != nil {
 		writeStoreErr(w, err)
@@ -548,11 +565,8 @@ func (h *handler) release(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.registered(r); err != nil {
-		writeStoreErr(w, err)
-
-		return
-	}
+	// NO MEMBERSHIP CHECK: forOwnLease has already established that this process
+	// owns the lease, and a draining process outlives the node record on purpose.
 
 	if err := h.store.Release(r.Context(), r.PathValue("lease"), req.Epoch, outcome); err != nil {
 		writeStoreErr(w, err)
@@ -570,11 +584,8 @@ func (h *handler) release(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) lease(w http.ResponseWriter, r *http.Request) {
-	if err := h.registered(r); err != nil {
-		writeStoreErr(w, err)
-
-		return
-	}
+	// NO MEMBERSHIP CHECK: forOwnLease has already established that this process
+	// owns the lease, and a draining process outlives the node record on purpose.
 
 	lease, err := h.store.Lease(r.Context(), r.PathValue("lease"))
 	if err != nil {

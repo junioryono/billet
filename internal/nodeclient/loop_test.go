@@ -52,6 +52,9 @@ type fakeCompute struct {
 	// holding reports compute this node is still responsible for.
 	holding bool
 
+	// supersededCalls counts hand-overs of running work into custody.
+	supersededCalls int
+
 	// launchGate lets a test hold a launch open. Launch closes launchStarted and
 	// then waits, which is the only way to act on the world WHILE a launch is in
 	// flight — polling for the launch to finish always loses to the report that
@@ -84,6 +87,22 @@ func (f *fakeCompute) Holding() bool {
 	defer f.mu.Unlock()
 
 	return f.holding
+}
+
+// Superseded records that the loop converted running work into custody, which
+// is what lets a drain ever finish.
+func (f *fakeCompute) Superseded() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.supersededCalls++
+}
+
+func (f *fakeCompute) supersededCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return f.supersededCalls
 }
 
 func (f *fakeCompute) ttlAtStart() time.Duration {
@@ -850,7 +869,14 @@ func TestASupersededNodeDrainsBeforeStopping(t *testing.T) {
 		t.Fatalf("the second process could not register: %v", err)
 	}
 
-	// IT KEEPS TENDING while it is holding something. Tend is what releases a
+	// FIRST IT TAKES CUSTODY OF WHAT IT IS RUNNING, because after supersession the
+	// control plane routes those completions to the replacement — which cannot see
+	// them, reports the destroy as done, and lets the lease go. Tend only ever
+	// looks at custody, so running work left where it was would keep this process
+	// holding forever and never finish.
+	waitFor(t, func() bool { return compute.supersededCount() > 0 })
+
+	// THEN IT KEEPS TENDING while it is holding something. Tend is what releases a
 	// lease once its compute is confirmed gone, so this is the work that lets the
 	// hand-over ever complete.
 	waitFor(t, func() bool { return compute.tended() > 0 })

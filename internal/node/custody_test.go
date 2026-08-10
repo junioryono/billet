@@ -1816,3 +1816,57 @@ func TestAnOrdinaryRunningJobCountsAsHolding(t *testing.T) {
 			"replacement that cannot see it")
 	}
 }
+
+// SUPERSESSION TURNS RUNNING WORK INTO CUSTODY, which is what lets a drain end.
+//
+// After supersession the control plane routes a job's completion to whichever
+// process owns the node's name. For a container running HERE that is the
+// replacement, which cannot see it, reports the destroy as done, and lets the
+// lease be released under a running job. Nothing on this side would ever finish
+// it either: Tend is what confirms compute gone and releases its lease, and Tend
+// looks only at custody.
+func TestSupersessionMovesRunningWorkIntoCustody(t *testing.T) {
+	t.Parallel()
+
+	p := &fakeProvider{kind: config.ProviderDocker}
+
+	a, host := newAllocatorWithHost(t)
+
+	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	lease := assignedLease(t, a)
+
+	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	if got := len(r.custodySnapshot()); got != 0 {
+		t.Fatalf("a cleanly launched job was already in custody: %d", got)
+	}
+
+	r.Superseded()
+
+	held := r.custodySnapshot()
+	if len(held) != 1 {
+		t.Fatalf("supersession left %d entries in custody, want the running job", len(held))
+	}
+
+	if held[0].leaseID != lease.ID {
+		t.Errorf("custody holds lease %q, want %q", held[0].leaseID, lease.ID)
+	}
+
+	// DONE, not failed: the job launched cleanly and is running. What changed is
+	// who may talk about it, not whether it worked — and writing "failed" into
+	// the durable history for a job that ran is a lie a later investigation would
+	// have to unpick.
+	if held[0].outcome != alloc.PhaseDone {
+		t.Errorf("custody records outcome %q for a job that launched cleanly, want done",
+			held[0].outcome)
+	}
+
+	// And it is idempotent, because a drain may call it more than once.
+	r.Superseded()
+
+	if got := len(r.custodySnapshot()); got != 1 {
+		t.Errorf("a second supersession produced %d custody entries, want 1", got)
+	}
+}

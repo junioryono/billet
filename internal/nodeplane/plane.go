@@ -67,6 +67,21 @@ const defaultPollTimeout = 50 * time.Second
 
 // Plane tracks nodes and routes commands to them.
 type Plane struct {
+	// owners records which incarnation was given the launch for each lease.
+	//
+	// A SUPERSEDED PROCESS MAY MAINTAIN WHAT IT HOLDS AND NOTHING ELSE. Permitting
+	// every lease route by node name alone let a superseded host read the current
+	// one's leases and RELEASE them: same name, same certificate, and an epoch it
+	// could simply ask for. The capacity came back while a container was running.
+	//
+	// HELD ON THE PLANE, NOT ON THE NODE RECORD, because the node record expires.
+	// A draining process outlives its replacement by design — that is the whole
+	// point of draining — so when the replacement went silent and the node was
+	// forgotten, the ownership went with it and the drain lost the right to renew
+	// its own lease. Liveness and ownership answer different questions and cannot
+	// share a lifetime.
+	owners map[string]leaseOwner
+
 	log  *slog.Logger
 	now  func() time.Time
 	ttl  time.Duration
@@ -111,19 +126,6 @@ type node struct {
 	// than an accident of leaving things on a list. A command moves back only if
 	// the node reconnects and asks for it again.
 	inflight map[string]*pending
-
-	// owners records which incarnation was given the launch for each lease.
-	//
-	// A SUPERSEDED PROCESS MAY MAINTAIN WHAT IT HOLDS AND NOTHING ELSE. Permitting
-	// every lease route by node name alone let a superseded host read the current
-	// one's leases and RELEASE them: same name, same certificate, and an epoch it
-	// could simply ask for. The capacity came back while a container was running.
-	//
-	// Renewal is deliberately not gated on this. A heartbeat can only extend a
-	// lease, never free it, so the worst a confused process achieves is holding
-	// capacity slightly longer — which is the direction this whole design errs in
-	// anyway.
-	owners map[string]string
 
 	// abandoned holds launches the plane stopped waiting for, by command id, with
 	// the moment it gave up.
@@ -186,6 +188,12 @@ type pending struct {
 	delivered bool
 }
 
+// leaseOwner is the node process responsible for a lease.
+type leaseOwner struct {
+	node        string
+	incarnation string
+}
+
 // Option configures a Plane.
 type Option func(*Plane)
 
@@ -202,6 +210,16 @@ func (p *Plane) ForgetForTest(name string) {
 	defer p.mu.Unlock()
 
 	delete(p.nodes, name)
+}
+
+// OwnsForTest reports whether a process is recorded as a lease's owner.
+func (p *Plane) OwnsForTest(leaseID, node, incarnation string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	owner, ok := p.owners[leaseID]
+
+	return ok && owner.node == node && owner.incarnation == incarnation
 }
 
 // WaitersForTest reports how many pollers are parked on this node.
@@ -476,8 +494,8 @@ func (p *Plane) ForgetLease(node, leaseID string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if n, ok := p.nodes[node]; ok {
-		delete(n.owners, leaseID)
+	if owner, ok := p.owners[leaseID]; ok && owner.node == node {
+		delete(p.owners, leaseID)
 	}
 }
 
@@ -501,13 +519,8 @@ func (p *Plane) AdoptOwnership(node, incarnation string, leaseIDs []string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	n, ok := p.nodes[node]
-	if !ok {
-		return
-	}
-
-	if n.owners == nil {
-		n.owners = make(map[string]string, len(leaseIDs))
+	if p.owners == nil {
+		p.owners = make(map[string]leaseOwner, len(leaseIDs))
 	}
 
 	for _, id := range leaseIDs {
@@ -516,8 +529,8 @@ func (p *Plane) AdoptOwnership(node, incarnation string, leaseIDs []string) {
 		// superseded is still draining — which is the exact situation this exists
 		// to survive. A lease already attributed to a process stays with it; the
 		// current incarnation is permitted anyway, by name.
-		if _, taken := n.owners[id]; !taken {
-			n.owners[id] = incarnation
+		if _, taken := p.owners[id]; !taken {
+			p.owners[id] = leaseOwner{node: node, incarnation: incarnation}
 		}
 	}
 }
@@ -532,6 +545,16 @@ func (p *Plane) MayMutateLease(node, incarnation, leaseID string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	// OWNERSHIP IS CHECKED BEFORE MEMBERSHIP, and that order is the fix. A
+	// draining process outlives its replacement by design; when the replacement
+	// goes silent the node record is forgotten, and requiring membership first
+	// refused the drain the right to renew its own lease at exactly the moment
+	// nothing else could. The lease then expired under compute that was still
+	// running.
+	if owner, ok := p.owners[leaseID]; ok && owner.node == node && owner.incarnation == incarnation {
+		return nil
+	}
+
 	n, ok := p.nodes[node]
 	if !ok {
 		return fmt.Errorf("%w: %s", ErrUnregistered, node)
@@ -544,10 +567,6 @@ func (p *Plane) MayMutateLease(node, incarnation, leaseID string) error {
 	// stops sending it, reads a lease id and epoch through the open routes, and
 	// releases the replacement's lease.
 	if n.incarnation == "" || n.incarnation == incarnation {
-		return nil
-	}
-
-	if owner, ok := n.owners[leaseID]; ok && owner == incarnation {
 		return nil
 	}
 
@@ -657,7 +676,7 @@ func (p *Plane) Seen(name, incarnation string) {
 	// The draining process is not being disbelieved — its heartbeats and results
 	// are still accepted. It simply is not evidence that the node is available
 	// for work, because it is the one process that has been told it is not.
-	if n.incarnation != "" && incarnation != "" && n.incarnation != incarnation {
+	if !currentLocked(n, incarnation) {
 		return
 	}
 
@@ -763,6 +782,16 @@ func (p *Plane) Poll(ctx context.Context, nodeName, incarnation string) (nodeapi
 	return cmd, took, nil
 }
 
+// currentLocked reports whether this request speaks for the node's live process.
+//
+// AN EMPTY CLAIM IS NOT CURRENT once a process has claimed the name — the third
+// place this needed saying. Treating it as eligible let a superseded process
+// drop the header and keep a dead replacement schedulable indefinitely, simply
+// by submitting results nobody asked for.
+func currentLocked(n *node, incarnation string) bool {
+	return n.incarnation == "" || n.incarnation == incarnation
+}
+
 // supersededLocked reports whether this process has lost the node's name.
 //
 // One place, so the fast path and the woken path cannot drift — they already had,
@@ -794,11 +823,11 @@ func (p *Plane) takeLocked(n *node, incarnation string) (nodeapi.Command, bool) 
 	// touching one it was not given, which shares its node name and its
 	// certificate and is otherwise indistinguishable.
 	if pend.cmd.Kind == nodeapi.CommandLaunch && pend.cmd.Lease != nil && incarnation != "" {
-		if n.owners == nil {
-			n.owners = make(map[string]string)
+		if p.owners == nil {
+			p.owners = make(map[string]leaseOwner)
 		}
 
-		n.owners[pend.cmd.Lease.ID] = incarnation
+		p.owners[pend.cmd.Lease.ID] = leaseOwner{node: n.name, incarnation: incarnation}
 	}
 
 	return pend.cmd, true
@@ -818,7 +847,7 @@ func (p *Plane) Result(nodeName, incarnation string, res nodeapi.CommandResult) 
 	// only the CURRENT one is evidence that this node can be given work. A
 	// superseded process draining its custody reports for as long as its job runs,
 	// and counting that as liveness kept a dead replacement in the fleet.
-	if n.incarnation == "" || incarnation == "" || n.incarnation == incarnation {
+	if currentLocked(n, incarnation) {
 		n.lastSeen = p.now()
 	}
 
@@ -849,6 +878,20 @@ func (p *Plane) Result(nodeName, incarnation string, res nodeapi.CommandResult) 
 	}
 
 	delete(n.inflight, res.ID)
+
+	// THE COMMAND IS OVER, SO THE OWNERSHIP RECORD IS TOO, unless custody has
+	// begun — in which case the node still needs the right to renew and release
+	// what it is holding.
+	//
+	// Cleaning up only on the node's release route was not enough: an ordinary
+	// successful job is released by the LISTENER through the allocator, which
+	// never touches this wire. One entry per historical job accumulated for the
+	// life of the installation, since a node that never goes quiet is never
+	// expired.
+	if pend.cmd.Kind == nodeapi.CommandLaunch && pend.cmd.Lease != nil && !res.Custody {
+		delete(p.owners, pend.cmd.Lease.ID)
+	}
+
 	p.answerLocked(pend, res)
 
 	return nil

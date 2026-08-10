@@ -36,6 +36,10 @@ type mtlsStore struct {
 	// launched is what the ledger says this node already holds, which is how a
 	// restarted control plane rebuilds ownership it never saw created.
 	launched map[string]bool
+
+	// launchedErr makes that query fail, which must not produce a node the plane
+	// has accepted but whose existing compute it cannot attribute.
+	launchedErr error
 }
 
 func (mtlsStore) Bind(context.Context, string, int64, string) error { return nil }
@@ -51,6 +55,10 @@ func (mtlsStore) Lease(context.Context, string) (*alloc.Lease, error) {
 }
 
 func (m mtlsStore) LaunchedLeaseIDs(context.Context, string) (map[string]bool, error) {
+	if m.launchedErr != nil {
+		return nil, m.launchedErr
+	}
+
 	if m.launched == nil {
 		return map[string]bool{}, nil
 	}
@@ -984,14 +992,35 @@ func TestADrainingProcessDoesNotKeepADeadNodeSchedulable(t *testing.T) {
 	// working through its drain.
 	clock.advancePastSilence()
 
+	// EVERY LATER REQUEST HAPPENS BEFORE ANYTHING ASKS Nodes(), deliberately.
+	// Asking is what runs expiry, so a test that checks the fleet first has
+	// already removed the node and can no longer observe anything refreshing it.
 	if err := first.Report(t.Context(), nodeapi.CommandResult{ID: "c1", OK: true}); err != nil {
 		t.Fatalf("the draining process could not report: %v", err)
 	}
 
+	// AND OMITTING THE HEADER IS NOT A WAY BACK IN. An empty claim was treated as
+	// eligible to refresh liveness, so a process that simply stopped saying which
+	// one it was could keep a dead node schedulable indefinitely — by posting
+	// results nobody asked for, which the result route accepts from anybody
+	// because reporting is the handover.
+	quiet := &http.Client{Transport: &http.Transport{TLSClientConfig: conf}}
+
+	status, err := postAs(t, quiet, base+"/v1/nodes/epyc-1/result",
+		`{"id":"nobody-asked","ok":true}`)
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+
+	if status >= 500 {
+		t.Fatalf("the result route failed with %d", status)
+	}
+
 	if got := plane.Nodes(); len(got) != 0 {
 		t.Errorf("a node whose current process died is still in the fleet (%v), kept there by "+
-			"a superseded process draining its own work; every launch sent to it waits out "+
-			"the command timeout and fails", got)
+			"a superseded process draining its own work — or by one that declined to say "+
+			"which process it was; every launch sent to it waits out the command timeout "+
+			"and fails", got)
 	}
 }
 
@@ -1111,6 +1140,101 @@ func TestARecreatedScaleSetDoesNotWedgeTheTier(t *testing.T) {
 	if _, err := c.JITConfig(t.Context(), 11, "billet-l2", "_work"); err != nil {
 		t.Errorf("a launch after the scale set was recreated was refused against the cached "+
 			"id (%v); every job on this tier fails until the control plane restarts", err)
+	}
+}
+
+// A REGISTRATION WHOSE OWNERSHIP REBUILD FAILED IS NOT A REGISTRATION.
+//
+// Treating the rebuild as best-effort was wrong. The node goes on to adopt its
+// surviving compute believing it is registered, and if it is later superseded
+// the plane has no record that those leases are its — so its renewals are
+// refused and the leases are reaped under running containers.
+//
+// A ledger that cannot answer is an outage, so this is a 503 the node retries
+// rather than a verdict it stops on.
+func TestARegistrationThatCannotRebuildOwnershipIsRefused(t *testing.T) {
+	t.Parallel()
+
+	ca, base, _ := mtlsWireWithStore(t, nil, mtlsStore{
+		launchedErr: errors.New("database is locked"),
+	})
+
+	c := nodeClient(t, ca, base, "epyc-1", "epyc-1")
+
+	err := c.Register(t.Context(), config.ProviderDocker, nil, wireDeployment)
+	if err == nil {
+		t.Fatal("a node registered although the plane could not read which leases it already " +
+			"holds; superseded later, it would be refused its own renewals")
+	}
+
+	if errors.Is(err, nodeclient.ErrRefused) {
+		t.Errorf("a ledger outage was reported as a permanent refusal, so the node gives up "+
+			"and stays down after the database recovers: %v", err)
+	}
+}
+
+// A DRAIN OUTLIVES THE NODE RECORD, because that is the situation it is for.
+//
+// Ownership used to live on the node's own entry, which expires. A draining
+// process outlives its replacement by design — so when the replacement went
+// silent and the node was forgotten, the ownership went with it and the drain
+// lost the right to renew the lease of compute that was still running.
+//
+// Liveness and ownership answer different questions and cannot share a lifetime.
+func TestADrainOutlivesTheNodeRecord(t *testing.T) {
+	t.Parallel()
+
+	clock := newWireClock()
+
+	ca, base, plane, _ := mtlsWireWithSets(t, clock.now, mtlsStore{
+		launched: map[string]bool{"l1": true},
+	})
+
+	bundle, err := ca.IssueNode("epyc-1")
+	if err != nil {
+		t.Fatalf("issue: %v", err)
+	}
+
+	conf, err := wirecert.ClientTLS(bundle)
+	if err != nil {
+		t.Fatalf("client tls: %v", err)
+	}
+
+	first, err := nodeclient.New(nodeclient.Options{Base: base, Node: "epyc-1", TLS: conf})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+
+	second, err := nodeclient.New(nodeclient.Options{Base: base, Node: "epyc-1", TLS: conf})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+
+	if err := first.Register(t.Context(), config.ProviderDocker, nil, wireDeployment); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	if err := second.Register(t.Context(), config.ProviderDocker, nil, wireDeployment); err != nil {
+		t.Fatalf("the second process could not register: %v", err)
+	}
+
+	// The replacement dies. The draining process keeps going, and its traffic
+	// deliberately does not vouch for the node — so the record is forgotten.
+	clock.advancePastSilence()
+
+	if got := plane.Nodes(); len(got) != 0 {
+		t.Fatalf("the node was still in the fleet after its current process went silent: %v",
+			got)
+	}
+
+	if err := first.Heartbeat(t.Context(), "l1", 1); err != nil {
+		t.Errorf("a draining process could not renew its own lease once the node record had "+
+			"expired (%v); nothing else is renewing it, so the capacity is reclaimed under "+
+			"a running container", err)
+	}
+
+	if err := first.Release(t.Context(), "l1", 1, alloc.PhaseDone); err != nil {
+		t.Errorf("a draining process could not finish once the node record had expired: %v", err)
 	}
 }
 

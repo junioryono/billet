@@ -788,6 +788,84 @@ func TestAQueuedCommandIsNotGivenToASupersededProcess(t *testing.T) {
 	}
 }
 
+// OWNERSHIP ENDS WITH THE COMMAND, unless custody has begun.
+//
+// Cleaning up only on the node's own release route was not enough: an ordinary
+// successful job is released by the LISTENER through the allocator, which never
+// touches this wire. One entry per historical job would accumulate for the life
+// of the installation, because a node that never goes quiet is never expired.
+//
+// A result claiming CUSTODY is the exception: that node still needs the right to
+// renew and release what it is holding.
+func TestOwnershipEndsWithTheCommand(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name    string
+		custody bool
+		want    bool
+	}{
+		{"an ordinary completion", false, false},
+		{"a result claiming custody", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			p := testPlane(t, WithCommandTimeout(2*time.Second))
+
+			if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
+				Version:     nodeapi.Version,
+				Node:        "n1",
+				Provider:    config.ProviderDocker,
+				Deployment:  deployment,
+				Incarnation: "first",
+			}); err != nil {
+				t.Fatalf("register: %v", err)
+			}
+
+			go func() {
+				//nolint:errcheck // the launch's fate is not what this test is about
+				_ = p.NewRunner().Launch(t.Context(), testLease(), server.Job{RequestID: 7})
+			}()
+
+			var cmd nodeapi.Command
+
+			deadline := time.Now().Add(5 * time.Second)
+
+			for {
+				got, took, err := p.Poll(t.Context(), "n1", "first")
+				if err != nil {
+					t.Fatalf("poll: %v", err)
+				}
+
+				if took {
+					cmd = got
+
+					break
+				}
+
+				if time.Now().After(deadline) {
+					t.Fatal("the command was never delivered")
+				}
+			}
+
+			if !p.OwnsForTest("l1", "n1", "first") {
+				t.Fatal("delivering a launch did not record its owner")
+			}
+
+			if err := p.Result("n1", "first", nodeapi.CommandResult{
+				ID: cmd.ID, OK: !tc.custody, Custody: tc.custody,
+			}); err != nil {
+				t.Fatalf("result: %v", err)
+			}
+
+			if got := p.OwnsForTest("l1", "n1", "first"); got != tc.want {
+				t.Errorf("ownership retained = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 // A DESTROY NOBODY CONFIRMED IS A FAILURE, EVEN WHEN THE NODE HAS GONE.
 //
 // The tempting reading is that a vanished node took its containers with it, so

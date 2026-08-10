@@ -46,6 +46,10 @@ type Compute interface {
 	// Holding reports whether this node is still responsible for compute, which
 	// is what decides whether a superseded process may stop.
 	Holding() bool
+
+	// Superseded moves running work into custody, because after supersession the
+	// control plane routes its completions to somebody else.
+	Superseded()
 }
 
 // LoopOptions configures Run.
@@ -248,6 +252,14 @@ func Run(ctx context.Context, c *Client, compute Compute, opts LoopOptions) erro
 // anywhere: the operator's fix is to stop the duplicate host, and until they do,
 // holding the lease is the safe direction.
 func drain(ctx context.Context, compute Compute, log *slog.Logger, opts LoopOptions) {
+	// EVERYTHING RUNNING HERE IS NOW UNACCOUNTED FOR, which is what custody
+	// means. The completion of a job running on this host is routed to whichever
+	// process owns the name — the replacement — which cannot see it, reports the
+	// destroy as done, and lets the lease go. Nothing would ever finish this work
+	// otherwise: Tend is what confirms compute gone and releases its lease, and
+	// Tend only looks at custody.
+	compute.Superseded()
+
 	if !compute.Holding() {
 		return
 	}

@@ -126,6 +126,10 @@ type Runner struct {
 	tiers map[string]config.Tier
 
 	mu sync.Mutex
+	// runningLease is the lease each running request holds, kept because renewing
+	// or releasing one needs its epoch and the instance name carries only the id.
+	runningLease map[int64]*alloc.Lease
+
 	// running maps a request to what was started for it, which is the only way
 	// Destroy knows what to remove.
 	running map[int64]*provider.Instance
@@ -179,11 +183,12 @@ func New(
 		now:      time.Now,
 		ttl:      a.LeaseTTL,
 
-		maxCustody: DefaultMaxCustody,
-		log:        log,
-		tiers:      byLabel,
-		running:    make(map[int64]*provider.Instance),
-		sets:       make(map[string]int),
+		maxCustody:   DefaultMaxCustody,
+		log:          log,
+		tiers:        byLabel,
+		running:      make(map[int64]*provider.Instance),
+		runningLease: make(map[int64]*alloc.Lease),
+		sets:         make(map[string]int),
 	}
 
 	for _, opt := range opts {
@@ -382,6 +387,11 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job Job) error 
 
 	r.mu.Lock()
 	r.running[job.RequestID] = inst
+	// THE LEASE IS KEPT WITH THE INSTANCE, because renewing or releasing it needs
+	// the epoch and the instance name carries only the id. It is needed exactly
+	// once — when this process is superseded and everything it is running becomes
+	// compute nobody else can account for.
+	r.runningLease[job.RequestID] = lease
 	r.mu.Unlock()
 
 	r.log.Info("started a runner",
@@ -437,6 +447,7 @@ func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
 
 	r.mu.Lock()
 	delete(r.running, requestID)
+	delete(r.runningLease, requestID)
 	r.mu.Unlock()
 
 	return nil

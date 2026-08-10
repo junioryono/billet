@@ -521,6 +521,49 @@ func (r *Runner) custodySnapshot() []*custody {
 	return out
 }
 
+// Superseded moves everything this node is running into custody.
+//
+// AFTER SUPERSESSION, EVERYTHING HERE IS UNACCOUNTED FOR — which is the
+// definition of custody. The control plane routes a job's completion to whichever
+// process currently owns the name, so the destroy for a container running HERE
+// now goes to the replacement, which cannot see it, reports success, and lets the
+// lease be released.
+//
+// Nothing else would ever finish this work. Tend is what confirms compute gone
+// and releases its lease, and Tend only looks at custody — so a running entry
+// left where it was made Holding() true forever and the drain unable to end.
+//
+// The lease's outcome is recorded as done rather than failed: the job was
+// launched cleanly and is running: what changed is who is allowed to talk about
+// it, not whether it worked.
+func (r *Runner) Superseded() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for requestID, inst := range r.running {
+		if lease, ok := r.runningLease[requestID]; ok {
+			if _, held := r.custody[lease.ID]; held {
+				continue
+			}
+		}
+
+		lease, ok := r.runningLease[requestID]
+		if !ok {
+			continue
+		}
+
+		r.custody[lease.ID] = &custody{
+			leaseID:   lease.ID,
+			epoch:     lease.Epoch,
+			name:      inst.Name,
+			instance:  inst.ID,
+			requestID: requestID,
+			outcome:   alloc.PhaseDone,
+			since:     r.now(),
+		}
+	}
+}
+
 // Holding reports whether this node is still responsible for compute.
 //
 // ASKED WHEN THE NODE HAS BEEN SUPERSEDED and is deciding whether it may stop.
