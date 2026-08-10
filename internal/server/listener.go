@@ -412,16 +412,25 @@ const (
 	maxRetryEvery = 5 * time.Minute
 	// teardownConcurrency is how many destroys the shutdown runs at once.
 	//
-	// NOT UNBOUNDED, which is where this started. A node executes commands one at
-	// a time and each command's timeout starts when it is QUEUED, so firing twenty
-	// destroys at a single node starts twenty ten-minute clocks against a queue
-	// that serves them in turn: the later ones expire while the node is working
-	// happily through the earlier ones, and healthy jobs are recorded as failed
+	// ONE, and the two failed attempts at a larger number are worth keeping. A
+	// node executes commands one at a time and each command's timeout starts when
+	// it is QUEUED, so N concurrent destroys start N ten-minute clocks against a
+	// queue that serves them in turn: the ones at the back expire while the node
+	// works happily through the front, and healthy jobs are recorded as failed
 	// destroys with their leases held back.
 	//
-	// Small enough to keep a node's queue moving, more than one so a single slow
-	// host cannot serialise the whole teardown.
-	teardownConcurrency = 4
+	// Capping the fan-out at four did not fix that, because Destroy BROADCASTS to
+	// every live node — it is addressed by request id, and only the node holding
+	// that request knows whether it is theirs. Four concurrent destroys therefore
+	// still queue four commands on every node.
+	//
+	// So the only safe number here is one, and real concurrency has to come from
+	// the runner instead: one command in flight per node, parallel across nodes,
+	// which needs a destroy addressed to the lease's own node rather than
+	// broadcast. That is tracked separately. In the ordinary case a destroy takes
+	// seconds and sequence costs nothing; the pathological case is a node that
+	// went quiet, and concurrency never helped there anyway.
+	teardownConcurrency = 1
 
 	// defaultShutdownGrace bounds the whole teardown.
 	//
@@ -1003,6 +1012,16 @@ func (l *Listener) destroyAll(ctx context.Context) map[int64]bool {
 			case slot <- struct{}{}:
 				defer func() { <-slot }()
 			case <-ctx.Done():
+				// NAMED, not silently skipped. Returning quietly left a request that
+				// was never even attempted indistinguishable from one that was
+				// destroyed: no outcome, no log, and for a cleanup-only record no
+				// lease either — so the obligation simply evaporated on an ORDINARY
+				// shutdown, not merely on a kill.
+				l.log.Error("the shutdown grace ran out before billet tried to destroy this "+
+					"job's compute; it was never attempted, and if no lease accounts for it "+
+					"nothing will reclaim it until its host is swept or restarted",
+					"tier", l.tier, "request", requestID)
+
 				return
 			}
 
@@ -1314,6 +1333,12 @@ func (l *Listener) refillEscrow(ctx context.Context) error {
 		return fmt.Errorf("server: escrow for %s: %w", l.tier, err)
 	}
 
+	// STAMPED BEFORE THE MUTEX, because the mutex is exactly what can be slow. A
+	// heartbeat pass holds l.mu for up to its own deadline, so a lease created at
+	// t=0 could be stamped at t=TTL/3 and stay advertisable until t=4TTL/3 — most
+	// of the window the seeding was added to close.
+	created := time.Now()
+
 	l.mu.Lock()
 
 	l.held = append(l.held, leases...)
@@ -1327,9 +1352,8 @@ func (l *Listener) refillEscrow(ctx context.Context) error {
 	// expiring at t=TTL, a lease whose first heartbeat failed at t=TTL/3 had its
 	// clock set there and stayed advertised past t=4TTL/3, long after the reaper
 	// could have taken it.
-	now := time.Now()
 	for _, lease := range leases {
-		l.confirmed[lease.ID] = now
+		l.confirmed[lease.ID] = created
 	}
 
 	l.mu.Unlock()
@@ -1593,6 +1617,21 @@ func (l *Listener) reserve(available []Job) []int64 {
 			continue
 		}
 
+		// AND NOT WHILE ITS LAST CONTAINER IS STILL OWED. A request whose compute
+		// this listener has not managed to destroy is not a free request id: the
+		// cleanup retry addresses a Destroy BY REQUEST ID, so taking the same id
+		// again would give the old retry the power to destroy the new job's
+		// container and release the new job's lease. Request id alone cannot tell
+		// two incarnations apart, so the id stays occupied until the first one is
+		// discharged.
+		if _, ok := l.cleanup[job.RequestID]; ok {
+			l.log.Warn("declining a job whose previous run has compute billet has not "+
+				"managed to destroy; it will be offered again once that is cleaned up",
+				"tier", l.tier, "request", job.RequestID)
+
+			continue
+		}
+
 		if len(l.held) == 0 {
 			l.log.Warn("declining an offer with no escrow to back it",
 				"tier", l.tier, "request", job.RequestID)
@@ -1673,6 +1712,18 @@ func (l *Listener) assign(ctx context.Context, job Job) (*alloc.Lease, bool, err
 	// ordinary event rather than a fault — and consuming a second lease for one
 	// job would leak capacity that nothing ever gives back.
 	if _, ok := l.running[job.RequestID]; ok {
+		return nil, false, nil
+	}
+
+	// NOR WHILE THE PREVIOUS RUN'S COMPUTE IS STILL OWED. Same reasoning as
+	// reserve: a pending cleanup is addressed by request id, so accepting an
+	// assignment for that id hands the old retry a container and a lease that
+	// belong to the new job.
+	if _, ok := l.cleanup[job.RequestID]; ok {
+		l.log.Warn("declining an assignment whose previous run has compute billet has not "+
+			"managed to destroy",
+			"tier", l.tier, "request", job.RequestID)
+
 		return nil, false, nil
 	}
 

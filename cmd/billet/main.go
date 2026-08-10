@@ -93,26 +93,35 @@ func run(args []string) error {
 	// Ctrl-C and SIGTERM cancel the context. Every long-running role is expected
 	// to drain rather than drop jobs on the floor: a runner killed mid-job leaves
 	// an orphaned registration on GitHub that someone has to clean up by hand.
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	// THE FIRST ASKS, THE SECOND INSISTS — from ONE registration, because two
+	// registrations both receive every signal.
+	//
+	// A graceful stop is the right default: it destroys compute and hands capacity
+	// back rather than stranding containers and leases. But it can take minutes,
+	// since destroying a job on a node that has gone quiet waits out the node
+	// command timeout and the shutdown grace is sized to cover that — and while it
+	// runs, an operator's habitual second Ctrl-C was being swallowed, so the
+	// terminal simply looked hung.
+	//
+	// The first attempt at this used signal.NotifyContext for the graceful stop
+	// AND a second signal.Notify for the forced exit. Go delivers a signal to
+	// every channel registered for it, so the first Ctrl-C cancelled the context
+	// and sat buffered in the forced channel; the goroutine woke on the
+	// cancellation it had just caused, consumed its own signal, and exited
+	// immediately. That did not add a forced exit — it deleted the graceful one.
+	ctx, cancelGraceful := context.WithCancel(context.Background())
+	defer cancelGraceful()
 
-	// AND A SECOND SIGNAL LEAVES, which the first one deliberately does not.
-	//
-	// A graceful stop is the right default — it destroys compute and hands
-	// capacity back rather than stranding containers and leases — but it can take
-	// minutes: destroying a job on a node that has gone quiet waits out the node
-	// command timeout, and the shutdown grace is sized to cover that. Meanwhile
-	// signal.NotifyContext keeps intercepting, so the operator's habitual second
-	// Ctrl-C did nothing at all and the terminal looked hung.
-	//
-	// The first signal asks; the second insists. Anything a forced exit strands is
-	// what restart recovery and the reaper exist for.
+	signals := make(chan os.Signal, 2)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+
+	defer signal.Stop(signals)
+
 	go func() {
-		forced := make(chan os.Signal, 1)
-		signal.Notify(forced, os.Interrupt, syscall.SIGTERM)
+		<-signals
+		cancelGraceful()
 
-		<-ctx.Done()
-		<-forced
+		<-signals
 
 		fmt.Fprintln(os.Stderr, "billet: second signal; exiting without finishing the "+
 			"shutdown. Compute this process was destroying may still be running, and its "+

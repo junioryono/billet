@@ -2130,6 +2130,63 @@ func TestShutdownDestroysEachRequestOnce(t *testing.T) {
 	}
 }
 
+// A REQUEST WHOSE LAST CONTAINER IS STILL OWED IS NOT TAKEN AGAIN.
+//
+// Cleanup is addressed BY REQUEST ID, because that is all a completion gives us.
+// So a request id with an undischarged container is not a free id: if GitHub
+// re-offers it and this listener accepts, the old retry gains the power to
+// destroy the NEW job's container and release the NEW job's lease. Request id
+// alone cannot tell two incarnations apart, so the id stays occupied until the
+// first one is discharged.
+//
+// This became reachable when a lost running lease started leaving a cleanup
+// record behind — before that, a request in cleanup was always also in running,
+// which already blocked reassignment.
+func TestARequestWithComputeStillOwedIsNotTakenAgain(t *testing.T) {
+	t.Parallel()
+
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(&fakeRunner{}))
+
+	if err := l.refillEscrow(t.Context()); err != nil {
+		t.Fatalf("refillEscrow: %v", err)
+	}
+
+	// The state a lost running lease leaves: no lease, but a container this
+	// listener still has to destroy.
+	l.mu.Lock()
+	l.cleanup = map[int64]*pendingCleanup{7: {job: Job{RequestID: 7}}}
+	l.mu.Unlock()
+
+	if got := l.reserve([]Job{{RequestID: 7}}); len(got) != 0 {
+		t.Errorf("reserved %v for a request whose previous container is still owed; the "+
+			"pending retry would destroy the new job's compute and release its lease", got)
+	}
+
+	lease, ok, err := l.assign(t.Context(), Job{RequestID: 7})
+	if err != nil {
+		t.Fatalf("assign: %v", err)
+	}
+
+	if ok || lease != nil {
+		t.Error("assigned a request whose previous container is still owed; two runs now " +
+			"share one request id, and the older one's cleanup can destroy the newer")
+	}
+
+	// AND IT IS TAKEN AGAIN ONCE THE OBLIGATION IS DISCHARGED. Blocking forever
+	// would be its own bug — the id has to come back.
+	l.mu.Lock()
+	delete(l.cleanup, 7)
+	l.mu.Unlock()
+
+	if got := l.reserve([]Job{{RequestID: 7}}); len(got) != 1 {
+		t.Errorf("reserved %v after the obligation was discharged, want one id; the "+
+			"request would never be runnable again", got)
+	}
+}
+
 // LOSING A RUNNING LEASE LEAVES THE CONTAINER OWED.
 //
 // The heartbeat used to delete a running job outright when its lease could not
@@ -2168,9 +2225,54 @@ func TestARunningLeaseLostLeavesItsComputeOwed(t *testing.T) {
 	}
 
 	if cleanupCount(l) != 1 {
-		t.Errorf("a running job whose lease was reaped left no cleanup obligation (%d "+
+		t.Fatalf("a running job whose lease was reaped left no cleanup obligation (%d "+
 			"pending); its container is still on a host, GitHub will not redeliver the "+
 			"completion, and only an optional Sweeper would ever notice", cleanupCount(l))
+	}
+
+	// THE RIGHT REQUEST. Counting the map only proves something was recorded: an
+	// empty pendingCleanup{} satisfies a count and then destroys request 0, which
+	// is nobody's container.
+	l.mu.Lock()
+	entry, recorded := l.cleanup[7]
+	l.mu.Unlock()
+
+	if !recorded {
+		t.Fatal("a cleanup obligation was recorded under some other request id")
+	}
+
+	if entry.job.RequestID != 7 {
+		t.Errorf("the obligation names request %d, want 7; a destroy addressed to the "+
+			"wrong id leaves the real container running", entry.job.RequestID)
+	}
+
+	// AND THE SAME FOR A STALE LEASE, which is a different branch: `lost` is the
+	// allocator saying the lease is not ours, `stale` is the allocator saying
+	// nothing for longer than the lease could survive. Both end the claim; neither
+	// ends the obligation.
+	second := holdRunning(t, l, a, tiers[0].Label, 9)
+
+	l.mu.Lock()
+	l.confirmed[second.ID] = time.Now().Add(-2 * ttl)
+	l.mu.Unlock()
+
+	unreachable, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	l.mu.Lock()
+	l.heartbeatHeld(unreachable)
+	_, stillRunningStale := l.running[9]
+	_, owed := l.cleanup[9]
+	l.mu.Unlock()
+
+	if stillRunningStale {
+		t.Fatal("a lease unconfirmed for longer than its TTL was still being advertised")
+	}
+
+	if !owed {
+		t.Error("a running job dropped for staleness left no cleanup obligation; the " +
+			"allocator never said the lease was lost, so there is even less reason to " +
+			"assume the container is gone")
 	}
 }
 
@@ -2251,9 +2353,29 @@ func TestALeaseNeverConfirmedIsStillBoundedByItsTTL(t *testing.T) {
 
 	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(&fakeRunner{}))
 
-	// Escrowed through the real path, so the clock is seeded the way production
-	// seeds it. Nothing renews it after this.
-	if err := l.refillEscrow(t.Context()); err != nil {
+	// ESCROWED WHILE THE MUTEX IS CONTENDED, which is the whole point.
+	//
+	// Without contention this test passed against a version that stamped the
+	// clock AFTER taking l.mu — the lease was created and stamped in the same
+	// instant, so the two were indistinguishable. A heartbeat pass holds l.mu for
+	// up to its own deadline, so in production the gap is real: stamping after the
+	// wait gave a lease created at t=0 a clock reading t=TTL/3 and kept it
+	// advertisable to t=4TTL/3, most of the window the seeding exists to close.
+	// The mutex is held for LONGER THAN THE TTL, so the two candidate clocks are
+	// on opposite sides of the deadline when it is checked: a lease stamped at
+	// creation is overdue by then, and one stamped after the wait is not.
+	const contended = 3 * ttl
+
+	l.mu.Lock()
+
+	escrowed := make(chan error, 1)
+
+	go func() { escrowed <- l.refillEscrow(t.Context()) }()
+
+	time.Sleep(contended)
+	l.mu.Unlock()
+
+	if err := <-escrowed; err != nil {
 		t.Fatalf("refillEscrow: %v", err)
 	}
 
@@ -2264,9 +2386,13 @@ func TestALeaseNeverConfirmedIsStillBoundedByItsTTL(t *testing.T) {
 	unreachable, cancel := context.WithCancel(t.Context())
 	cancel()
 
-	// A TTL after ESCROW. If the clock only started at the first failure, this
-	// lease still has most of a TTL to run and stays advertised.
-	time.Sleep(2 * ttl)
+	// A SHORT WAIT, deliberately. The lease is already well past its TTL measured
+	// from creation, and still comfortably inside one measured from the moment the
+	// mutex was released — which is what makes the two clocks tell different
+	// stories here. Waiting longer would put both past the deadline and the test
+	// would pass either way, which is exactly how the first version of it missed
+	// the defect it was written for.
+	time.Sleep(ttl / 3)
 
 	l.mu.Lock()
 	l.heartbeatHeld(unreachable)
