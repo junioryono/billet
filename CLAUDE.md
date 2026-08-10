@@ -557,6 +557,34 @@ compute is confirmed gone. The rules that were each learned by getting them wron
   CREATED for a request this listener never held — a restart loses the map while
   leases live on, and those retries could accomplish nothing. That says nothing
   about a record created when the listener DID hold the lease.
+- **"Could not X" usually collapses two different facts, and only one is
+  evidence.** A heartbeat that returns ErrFenced is the allocator SAYING the
+  lease is not ours; a heartbeat that times out is the database saying nothing at
+  all. Returning one boolean for both made a listener that briefly lost its
+  ledger forget the containers it had launched. The same shape recurs everywhere
+  in this codebase — a failed destroy is not proof the container survived, an
+  absent `docker ps` row is not proof it is gone. When a call can fail for
+  reasons that mean opposite things, the return type has to be able to say so.
+- **A claim and an obligation expire differently.** Losing a lease ends this
+  listener's claim on the CAPACITY. It does not end its obligation to destroy the
+  container it started, and the two have been conflated three separate times:
+  once for pending cleanup records, once for running leases dropped by the
+  heartbeat, once at shutdown. Whenever a record is removed because "it is not
+  ours any more", ask what was launched under it.
+- **A bound shorter than the work it bounds causes the failure it prevents.** The
+  shutdown grace was 90 seconds against a node command timeout of TEN MINUTES, so
+  an ordinary slow destroy tripped the watchdog, stopped renewal, and let the
+  reaper reclaim capacity whose container was still being destroyed — precisely
+  what the grace existed to avoid. Before choosing a timeout, find the longest
+  legitimate operation underneath it and make the bound larger, or make the work
+  smaller.
+- **Concurrency against a serial queue can be worse than sequence.** A node runs
+  commands one at a time and each command's timeout starts when it is QUEUED, so
+  firing twenty destroys at once starts twenty ten-minute clocks against a queue
+  that serves them in turn: the later ones expire while the node is working
+  happily through the earlier ones, and healthy jobs are recorded as failures.
+  Fan-out needs a bound chosen against the SERVER's concurrency, not the client's
+  patience.
 - **An OPTIONAL capability cannot carry a safety invariant.** The reversed change
   above was defended with "both shipped runners implement `Sweeper`, which
   destroys compute no lease is holding." True, and irrelevant: `Sweeper` is a
@@ -950,6 +978,14 @@ testing is what found them, and it is not optional for anything load-bearing.
 
   The general form: if a goroutine's job is to protect the teardown, inheriting
   the cancellation that triggers the teardown is exactly backwards.
+
+  The discriminator, having audited the other two sites — `Server.Run`'s sweeper
+  `KeepAlive` and `nodeclient`'s janitor — is whether the function does
+  meaningful work AFTER its context is cancelled. Both of those simply return, so
+  a child context is right there and nothing needs changing: on process exit
+  their leases are reaped and restart recovery re-adopts. Only the listener keeps
+  working after cancellation, because its teardown destroys compute and releases
+  capacity, and that work is what has to be protected.
 - **Cancelling a goroutine is not stopping it.** A cleanup retry blocked in a
   remote `Destroy` outlived `Run` and came back afterwards to release against a
   database the caller was entitled to have closed. Cancel AND join, and be
