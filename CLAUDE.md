@@ -545,6 +545,19 @@ compute is confirmed gone. The rules that were each learned by getting them wron
 - **Serializing a mutation is not serializing a transition.** Holding the lock for
   the flag write and releasing it before the backend calls is the same race, one
   line down.
+- **Declining to ADD a record is not the same as REMOVING one.** The listener
+  stopped recording completion retries for leases it does not hold, which fixed
+  only the arrival path. A lease can be fenced or reaped BETWEEN the completion
+  that recorded a retry and the retry itself, and the record left behind can
+  never succeed — while retries are sequential and each destroy can wait the full
+  node command timeout, so dead entries delay live ones and every ownership-loss
+  cycle adds another. Whenever a guard is added at the point a record is created,
+  ask what removes the records that already exist.
+- **Losing the lease is what ends this listener's business with a request.** Not
+  the destroy succeeding. A fenced lease belongs to another holder and a reaped
+  one has already had its capacity reclaimed, so continuing to act on either is
+  work that cannot land — and, for a fenced lease, work aimed at compute that is
+  now someone else's to manage.
 - **Time warns; it does not authorise a teardown.** Held compute has NO bound by
   default (`DefaultMaxCustody = 0`) and warns hourly. Elapsed time is not evidence
   that a job stopped making progress — billet imposes no job limit and self-hosted
@@ -911,6 +924,22 @@ testing is what found them, and it is not optional for anything load-bearing.
   needs to block inside `Launch` and say when it has — a delay plus a channel,
   never a sleep in the test.
 
+- **A test that manufactures the concurrency it is checking proves only the
+  narrow half.** The starvation test started `retryCleanup` in one goroutine and
+  `heartbeatHeld` in another, then asserted the second could run while the first
+  was stuck. That proves a stuck destroy does not hold `l.mu` — and nothing else.
+  The property it was NAMED for is that the two run on separate clocks, and
+  moving cleanup back onto the heartbeat's tick passed it unchanged. When the
+  property is about scheduling, the test has to use the scheduler under test:
+  drive `Run`, and assert the CONSEQUENCE (a lease the reaper took) rather than
+  the mechanism.
+- **A mutant that applies but changes no behaviour reports SURVIVED, and that is
+  indistinguishable from a real gap.** Inserting `_ = id` next to a `delete` left
+  the delete in place; the harness verified the file hash changed, so every
+  existing guard passed, and the output said the property was uncovered when it
+  was not. Hash-verification catches an edit that did not apply, not an edit that
+  did nothing. A mutant must remove or invert behaviour — if you cannot say which
+  assertion it should break, it is not a mutant.
 - **Run the suite the way CI runs it, instrumented.** `-covermode=atomic` is not
   a reporting flag; the counters change timing enough to reorder goroutines that
   a plain `-race` build schedules identically every time. A launch in progress
