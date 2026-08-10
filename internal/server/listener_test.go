@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"slices"
 	"strings"
 	"sync"
@@ -2140,70 +2141,100 @@ func TestShutdownDestroysEachRequestOnce(t *testing.T) {
 	}
 }
 
-// A SHUTDOWN BUDGET OF ZERO IS A MISCONFIGURATION, NOT AN INSTRUCTION.
+// A NONSENSE BUDGET STOPS THE LISTENER RATHER THAN BEING CORRECTED.
 //
-// Zero is what a caller passes by leaving a field unset, and context.WithTimeout
-// reads it as "already over" — so a zero budget would fail the session close on
-// its first instruction, take the early return that exists for a session billet
-// could not close, and skip the release entirely. Every lease would be left for
-// the reaper by a configuration mistake that looks like no configuration at all.
-func TestANonPositiveGraceFallsBackToTheDefault(t *testing.T) {
+// The first version of this substituted the default and carried on, on the
+// reasoning that zero is what a caller passes by leaving a field unset. It is
+// not — omitting the option already selects the default, so passing zero is an
+// explicit instruction. Running for twelve quiet minutes instead of the -1s
+// somebody's arithmetic produced is the same misconfiguration with the evidence
+// removed, and these budgets decide when billet stops protecting capacity whose
+// compute may still be running.
+//
+// The ceiling is the same argument from the other end: durations near MaxInt64
+// sum to a NEGATIVE one, and saturating instead gives a watchdog that fires in
+// about 292 years, which is not a watchdog.
+func TestANonsenseBudgetRefusesToRun(t *testing.T) {
 	t.Parallel()
 
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
 	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
 
+	for _, tc := range []struct {
+		name string
+		opt  Option
+	}{
+		{"zero shutdown grace", WithShutdownGrace(0)},
+		{"negative shutdown grace", WithShutdownGrace(-time.Second)},
+		{"absurd shutdown grace", WithShutdownGrace(time.Duration(1) << 62)},
+		{"zero close grace", WithFinishGraces(0, time.Second)},
+		{"negative release grace", WithFinishGraces(time.Second, -time.Second)},
+		{"absurd release grace", WithFinishGraces(time.Second, time.Duration(1)<<62)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(&fakeRunner{}), tc.opt)
+
+			// SHORT, so a listener that does not refuse is caught by what it
+			// returns rather than by how long this takes.
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+
+			err := l.Run(ctx)
+			if err == nil {
+				t.Fatal("the listener started with a budget that cannot mean what it says")
+			}
+
+			// THE REASON, not merely an error. Asserting "some error" passed
+			// against a listener that started happily and returned
+			// DeadlineExceeded when the test's own context ran out — so every
+			// silently tolerated misconfiguration looked like a refusal.
+			if !strings.Contains(err.Error(), "misconfigured") {
+				t.Fatalf("Run failed with %v; want a refusal naming the misconfiguration, "+
+					"because anything else means it started and stopped for another reason",
+					err)
+			}
+		})
+	}
+
+	// AND A SANE ONE IS ACTUALLY USED, not merely accepted. Every other test of
+	// these budgets passes against options that ignore their arguments, because
+	// the defaults are generous enough for all of them.
 	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(&fakeRunner{}),
-		WithShutdownGrace(0), WithFinishGraces(0, -time.Second))
-
-	if l.shutdownGrace != defaultShutdownGrace {
-		t.Errorf("a zero shutdown grace became %v, want the default %v",
-			l.shutdownGrace, defaultShutdownGrace)
-	}
-
-	if l.closeGrace != defaultCloseGrace {
-		t.Errorf("a zero close grace became %v, want the default %v",
-			l.closeGrace, defaultCloseGrace)
-	}
-
-	if l.releaseGrace != defaultReleaseGrace {
-		t.Errorf("a negative release grace became %v, want the default %v",
-			l.releaseGrace, defaultReleaseGrace)
-	}
-
-	// AND A POSITIVE VALUE IS ACTUALLY WIRED THROUGH. Every other test of these
-	// budgets would pass against an option that ignored its arguments and kept the
-	// defaults, because the defaults are generous enough for all of them.
-	set := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(&fakeRunner{}),
 		WithShutdownGrace(time.Second), WithFinishGraces(2*time.Second, 3*time.Second))
 
-	if set.shutdownGrace != time.Second ||
-		set.closeGrace != 2*time.Second ||
-		set.releaseGrace != 3*time.Second {
-		t.Errorf("configured graces came out as %v/%v/%v, want 1s/2s/3s",
-			set.shutdownGrace, set.closeGrace, set.releaseGrace)
+	if l.configErr != nil {
+		t.Fatalf("a sane configuration was refused: %v", l.configErr)
+	}
+
+	// Two destroy-length phases — the cleanup-loop join and the destroy pass —
+	// then the close and the release.
+	if got := l.teardownBudget(); got != 7*time.Second {
+		t.Errorf("teardown budget is %v, want 7s (1s join + 1s destroy + 2s close + 3s "+
+			"release); a budget that ignores its configuration bounds nothing an "+
+			"operator asked for", got)
 	}
 }
 
-// AN ABSURD GRACE DOES NOT WRAP THE BUDGET.
+// THE BUDGET SUM STILL CANNOT WRAP, even though the ceiling now makes it
+// unreachable.
 //
-// Three valid positive durations can overflow int64 and come out NEGATIVE, which
-// context.WithTimeout reads as already expired. An operator who set a very long
-// grace — the direction a cautious one errs in — would get the exact opposite of
-// what they asked for: a watchdog that fired immediately and stopped renewing
-// while the destroys ran on.
-func TestAnAbsurdGraceDoesNotWrapTheBudget(t *testing.T) {
+// Validation is what stops an absurd budget arriving, and this is the second
+// line: nothing in the type system stops a future phase being added with a large
+// constant, and int64 overflow turns the longest configuration into an
+// already-expired deadline — the least cautious possible behaviour from the most
+// cautious possible input.
+func TestTheBudgetSumSaturatesRatherThanWrapping(t *testing.T) {
 	t.Parallel()
 
 	const huge = time.Duration(1) << 62
 
-	if got := sumBudgets(huge, huge, huge); got <= 0 {
-		t.Errorf("three large budgets summed to %v; a negative total is an "+
-			"already-expired deadline, so the longest configuration produces the "+
-			"shortest behaviour", got)
+	if got := sumBudgets(huge, huge, huge, huge); got != time.Duration(math.MaxInt64) {
+		t.Errorf("four large budgets summed to %v, want saturation at MaxInt64; anything "+
+			"negative is a deadline that has already passed", got)
 	}
 
-	// And the ordinary case still adds up.
 	if got := sumBudgets(time.Second, 2*time.Second, 3*time.Second); got != 6*time.Second {
 		t.Errorf("sumBudgets(1s, 2s, 3s) = %v, want 6s", got)
 	}
@@ -2307,7 +2338,7 @@ func TestAnOverrunningPhaseCannotPushTheNextPastTheBudget(t *testing.T) {
 	// overshoot to catch is well over a second.
 	const slack = 500 * time.Millisecond
 
-	budget := sumBudgets(destroying, closing, releasing)
+	budget := l.teardownBudget()
 
 	if over := closeDeadline.Sub(teardown.Add(budget)); over > slack {
 		t.Errorf("the session close was given until %v past the whole shutdown budget; "+
@@ -2426,6 +2457,105 @@ func (h *countingHandler) count(substr string) int {
 	}
 
 	return n
+}
+
+// A STUCK CLEANUP RETRY DOES NOT STARVE THE SHUTDOWN'S OWN DESTROYS.
+//
+// Waiting for the cleanup loop to return is waiting for a Destroy, so it can
+// take exactly as long as a destroy can — and it shared the destroy phase's
+// budget with the destroys themselves. One retry that stalled for the whole
+// grace left destroyAll starting with an already-dead context: every remaining
+// request reported as never attempted, its container still running and its lease
+// left for the reaper. That is the close starving the release again, one phase
+// further up, which is why the join is now its own phase.
+func TestAStuckCleanupRetryDoesNotStarveTheDestroys(t *testing.T) {
+	t.Parallel()
+
+	const (
+		ttl   = 300 * time.Millisecond
+		grace = 300 * time.Millisecond
+	)
+
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
+		alloc.WithLeaseTTL(ttl))
+
+	blocked := make(chan struct{})
+	unblock := sync.OnceFunc(func() { close(blocked) })
+
+	t.Cleanup(unblock)
+
+	entered := make(chan struct{}, 1)
+
+	var (
+		stuck     atomic.Bool
+		destroyed atomic.Bool
+	)
+
+	// Request 7 is the stuck retry, and it blocks only ONCE — the cleanup loop's
+	// call. The shutdown's own pass runs it again and must not be held there too,
+	// or the test would be measuring the sequential destroy pass rather than the
+	// join. Request 9 is the work the join must not have starved.
+	runner := &fakeRunner{onDestroy: func(id int64) error {
+		if id == 7 && stuck.CompareAndSwap(false, true) {
+			entered <- struct{}{}
+
+			<-blocked
+
+			return nil
+		}
+
+		if id == 9 {
+			destroyed.Store(true)
+		}
+
+		return nil
+	}}
+
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner),
+		WithShutdownGrace(grace), WithFinishGraces(time.Second, time.Second))
+
+	holdRunning(t, l, a, tiers[0].Label, 9)
+
+	l.mu.Lock()
+	l.cleanup = map[int64]*pendingCleanup{7: {job: Job{RequestID: 7}}}
+	l.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	defer cancel()
+
+	runDone := make(chan struct{})
+
+	go func() {
+		defer close(runDone)
+
+		if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("Run: %v", err)
+		}
+	}()
+
+	select {
+	case <-entered:
+	case <-runDone:
+		t.Fatal("the listener stopped before its cleanup loop reached the runner")
+	case <-time.After(30 * time.Second):
+		t.Fatal("the cleanup retry never reached the runner")
+	}
+
+	// The retry is stuck. Shutting down now makes the join wait for it.
+	cancel()
+
+	select {
+	case <-runDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("Run never returned")
+	}
+
+	if !destroyed.Load() {
+		t.Error("the shutdown never tried to destroy the running job's compute: one stuck " +
+			"cleanup retry consumed the destroy budget before the destroy pass began, so " +
+			"that container is still on its host and its lease waits for the reaper")
+	}
 }
 
 // A SLOW DESTROY DOES NOT COST THE RELEASE ITS BUDGET.
@@ -3347,10 +3477,11 @@ func TestAWedgedTeardownStopsRenewing(t *testing.T) {
 			"the watchdog", err)
 	}
 
-	// AND DEAD AFTER. Past the grace now, so the watchdog has had to stop renewal.
-	// Reaped synchronously so expiry is enforced at the moment it is checked
-	// rather than by a background ticker.
-	time.Sleep(grace + 2*ttl)
+	// AND DEAD AFTER THE WHOLE BUDGET. Taken from the listener rather than
+	// restated here: the teardown has four phases now, and a test that hardcodes
+	// "past the grace" starts failing the next time one is added — which is
+	// exactly how this one broke when the cleanup-loop join got its own.
+	time.Sleep(l.teardownBudget() + 2*ttl)
 
 	if _, err := a.Reap(t.Context()); err != nil {
 		t.Fatalf("reap: %v", err)

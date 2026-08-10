@@ -281,6 +281,9 @@ type Listener struct {
 	// it is advertising capacity that is now someone else's.
 	confirmed map[string]time.Time
 
+	// configErr is anything an Option refused. Run returns it rather than starting.
+	configErr error
+
 	// runner turns assigned leases into compute. Never nil; see noRunner.
 	runner Runner
 
@@ -452,6 +455,13 @@ const (
 	defaultCloseGrace   = 30 * time.Second
 	defaultReleaseGrace = 30 * time.Second
 
+	// maxGrace is the largest teardown budget a caller may ask for.
+	//
+	// Longer than any real teardown and plainly finite, so the four budgets cannot
+	// sum to something int64 cannot hold — and so a watchdog always fires on a
+	// timescale an operator lives on.
+	maxGrace = time.Hour
+
 	// defaultShutdownGrace bounds the whole teardown.
 	//
 	// Renewal no longer stops when the caller cancels, which is what lets the
@@ -500,7 +510,15 @@ func WithStalePromiseAfter(d time.Duration) Option {
 // the alternative to a grace that is too short is not a cleaner shutdown, it is
 // leases nobody releases and containers nobody removes.
 func WithShutdownGrace(d time.Duration) Option {
-	return func(l *Listener) { l.shutdownGrace = positiveOr(d, defaultShutdownGrace) }
+	return func(l *Listener) {
+		if err := checkGrace("shutdown grace", d); err != nil {
+			l.configErr = errors.Join(l.configErr, err)
+
+			return
+		}
+
+		l.shutdownGrace = d
+	}
 }
 
 // WithFinishGraces bounds the two local phases of the teardown: closing the
@@ -511,8 +529,18 @@ func WithShutdownGrace(d time.Duration) Option {
 // fail on what is left of a shared budget.
 func WithFinishGraces(closing, releasing time.Duration) Option {
 	return func(l *Listener) {
-		l.closeGrace = positiveOr(closing, defaultCloseGrace)
-		l.releaseGrace = positiveOr(releasing, defaultReleaseGrace)
+		closeErr := checkGrace("close grace", closing)
+		releaseErr := checkGrace("release grace", releasing)
+
+		l.configErr = errors.Join(l.configErr, closeErr, releaseErr)
+
+		if closeErr == nil {
+			l.closeGrace = closing
+		}
+
+		if releaseErr == nil {
+			l.releaseGrace = releasing
+		}
 	}
 }
 
@@ -537,20 +565,29 @@ func sumBudgets(budgets ...time.Duration) time.Duration {
 	return total
 }
 
-// positiveOr keeps a non-positive duration from becoming an already-expired
-// deadline.
+// checkGrace refuses a teardown budget that cannot mean what it says.
 //
-// Zero is the value a caller passes by leaving a field unset, and
-// context.WithTimeout treats it as "already over" — so a shutdown budget of zero
-// would fail the session close on its first instruction, take the early return,
-// and skip the release entirely. A misconfiguration should cost the default, not
-// the teardown.
-func positiveOr(d, fallback time.Duration) time.Duration {
-	if d <= 0 {
-		return fallback
+// SILENTLY SUBSTITUTING A DEFAULT WAS WRONG, and the argument for it was that
+// zero is what a caller passes by leaving a field unset. It is not: omitting the
+// option already selects the default, so passing zero is an explicit instruction
+// — and context.WithTimeout reads it as "already over", which would fail the
+// session close on its first instruction and skip every release. Quietly running
+// for twelve minutes instead of the -1s somebody's arithmetic produced is not
+// safer, it is the same misconfiguration with the evidence removed.
+//
+// The ceiling matters for the same reason. Three durations near MaxInt64 sum to
+// a NEGATIVE one, which is an expired deadline; saturating instead gives a
+// watchdog that fires in about 292 years, which is not a watchdog. A bound that
+// is plainly longer than any real teardown and plainly finite avoids both.
+func checkGrace(name string, d time.Duration) error {
+	switch {
+	case d <= 0:
+		return fmt.Errorf("server: %s must be positive, got %s", name, d)
+	case d > maxGrace:
+		return fmt.Errorf("server: %s must be at most %s, got %s", name, maxGrace, d)
 	}
 
-	return d
+	return nil
 }
 
 // WithCleanupRetryPacing sets how long a failed cleanup retry waits before the
@@ -601,6 +638,14 @@ func WithMaxCapacity(ceiling int) Option {
 // The vendor's own listener package computes a desired runner count itself,
 // which is why billet does not use it.
 func (l *Listener) Run(ctx context.Context) error {
+	// REFUSED RATHER THAN CORRECTED. These budgets decide when billet stops
+	// protecting capacity whose compute may still be running, so a caller whose
+	// arithmetic produced a nonsense one has to hear about it rather than get
+	// twelve quiet minutes of something they did not ask for.
+	if l.configErr != nil {
+		return fmt.Errorf("server: listener for %s is misconfigured: %w", l.tier, l.configErr)
+	}
+
 	// Heartbeats run on their OWN clock, not between polls.
 	//
 	// A long poll was assumed to be about 50 seconds against a 90 second lease
@@ -696,13 +741,10 @@ func (l *Listener) Run(ctx context.Context) error {
 		// — so no phase can outlive renewal, by construction rather than by
 		// arithmetic.
 		overall, endOverall := context.WithTimeout(context.WithoutCancel(ctx),
-			sumBudgets(l.shutdownGrace, l.closeGrace, l.releaseGrace))
+			l.teardownBudget())
 		defer endOverall()
 
 		renewCtx := overall
-
-		stopCtx, endGrace := context.WithTimeout(overall, l.shutdownGrace)
-		defer endGrace()
 
 		// RENEWAL STOPS LAST, so it is deferred first. The release below destroys
 		// whatever is still running, which is slow and remote, and every lease it
@@ -784,11 +826,27 @@ func (l *Listener) Run(ctx context.Context) error {
 		// that says so is better than an unbounded one that does not.
 		stopSweeping()
 
-		if !waitWithin(stopCtx, &sweeping) {
-			l.log.Error("a cleanup retry did not return within the shutdown grace; it may "+
+		// ITS OWN PHASE, with its own copy of the destroy budget.
+		//
+		// This waits for a retry that is inside a Destroy, so it can take exactly as
+		// long as a destroy can — and it used to share the destroy phase's budget
+		// with the destroys themselves. A retry that stalled for the whole grace
+		// therefore left destroyAll starting with an already-dead context: every
+		// remaining request reported as never attempted, its compute still running
+		// and its lease left for the reaper. That is the close starving the release
+		// again, one phase further up.
+		joinCtx, endJoin := context.WithTimeout(overall, l.shutdownGrace)
+		defer endJoin()
+
+		if !waitWithin(joinCtx, &sweeping) {
+			l.log.Error("a cleanup retry did not return within its shutdown budget; it may "+
 				"still release a lease after this listener has stopped",
 				"tier", l.tier, "grace", l.shutdownGrace)
 		}
+
+		// AND THE DESTROY BUDGET STARTS HERE, after the join rather than beside it.
+		stopCtx, endGrace := context.WithTimeout(overall, l.shutdownGrace)
+		defer endGrace()
 
 		// ONE DESTROY PASS FOR EVERYTHING, before the session closes.
 		//
@@ -798,6 +856,13 @@ func (l *Listener) Run(ctx context.Context) error {
 		// deadline, so a slow drain could eat the grace the release still needed.
 		// Now the union is destroyed once, concurrently, and the release only ever
 		// releases.
+		if err := overall.Err(); err != nil {
+			l.log.Error("the shutdown budget was gone before billet began destroying "+
+				"compute; a cleanup retry held the whole of it, so nothing below was "+
+				"attempted and every lease is left for the reaper",
+				"tier", l.tier, "budget", l.teardownBudget())
+		}
+
 		destroyed := l.destroyAll(stopCtx)
 
 		// A FRESH BUDGET FOR THE LOCAL HALF, because it was being starved by the
@@ -815,6 +880,16 @@ func (l *Listener) Run(ctx context.Context) error {
 		// whole tier's capacity until the reaper.
 		closeCtx, endClose := context.WithTimeout(overall, l.closeGrace)
 		defer endClose()
+
+		// WHOSE FAULT, before the failure is attributed. A phase entered with an
+		// expired overall budget fails without being attempted, and reporting that
+		// as "could not close message session" blames the session for a deadline
+		// the destroys had already spent.
+		if err := overall.Err(); err != nil {
+			l.log.Error("the shutdown budget was gone before billet closed its session; "+
+				"the capacity this listener holds is left for the reaper",
+				"tier", l.tier, "budget", l.teardownBudget())
+		}
 
 		if err := l.session.Close(closeCtx); err != nil {
 			l.log.Warn("could not close message session; capacity is held until it expires",
@@ -1063,6 +1138,16 @@ func (l *Listener) retryCleanup(ctx context.Context) {
 
 		l.backOff(job.RequestID)
 	}
+}
+
+// teardownBudget is how long the whole shutdown may take: the cleanup-loop join
+// and the destroy pass each get the destroy budget, then the close and the
+// release get theirs.
+//
+// Every phase derives from a deadline this far out, so each of them is min(its
+// own budget, what is left) and none can outlive the renewal that protects them.
+func (l *Listener) teardownBudget() time.Duration {
+	return sumBudgets(l.shutdownGrace, l.shutdownGrace, l.closeGrace, l.releaseGrace)
 }
 
 // waitWithin waits for a WaitGroup, giving up when the context is done.
