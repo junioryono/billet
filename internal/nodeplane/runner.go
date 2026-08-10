@@ -424,7 +424,7 @@ func (p *Plane) abandonLocked(n *node, pend *pending, cause error) error {
 		// necessary — a late success is the only proof the compute is gone, and
 		// discarding it left the plane reporting custody forever for a container
 		// that had already been removed.
-		n.rememberAbandoned(pend.cmd, p.now())
+		n.rememberAbandoned(pend.cmd, pend.incarnation, p.now())
 
 		if pend.cmd.Kind == nodeapi.CommandLaunch {
 			return fmt.Errorf("%w: %w, so whether compute started is unknown",

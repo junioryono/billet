@@ -1196,6 +1196,115 @@ func TestAnEmptySnapshotStillPrunesAdoptedOwnership(t *testing.T) {
 	}
 }
 
+// A LATE DESTROY FROM SOMEBODY ELSE PROVES NOTHING ABOUT THE OWNER.
+//
+// A destroy answered by a process that is not the owner is telling the truth
+// about ITSELF — it has nothing to remove — and saying nothing about a container
+// on a machine it cannot see. Ending the owner's record on it lets the next
+// completion accept a no-op destroy and release capacity under a live job.
+//
+// Reachable without any restart: A owns a container, B supersedes A and takes a
+// destroy, C supersedes B before B reports, and B's late success arrives.
+func TestALateDestroyFromANonOwnerDoesNotEndOwnership(t *testing.T) {
+	t.Parallel()
+
+	p, _ := deliverLaunch(t)
+
+	// B takes the name and the destroy.
+	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
+		Version: nodeapi.Version, Node: "n1", Provider: config.ProviderDocker,
+		Deployment: deployment, Incarnation: "second",
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	destroyed := make(chan error, 1)
+
+	go func() {
+		destroyed <- p.NewRunner().Destroy(t.Context(), 7)
+	}()
+
+	var taken nodeapi.Command
+
+	deadline := time.Now().Add(5 * time.Second)
+
+	for {
+		got, took, err := p.Poll(t.Context(), "n1", "second")
+		if err != nil {
+			t.Fatalf("poll: %v", err)
+		}
+
+		if took {
+			taken = got
+
+			break
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatal("the destroy was never delivered")
+		}
+	}
+
+	// C supersedes B, tombstoning B's in-flight destroy.
+	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
+		Version: nodeapi.Version, Node: "n1", Provider: config.ProviderDocker,
+		Deployment: deployment, Incarnation: "third",
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	<-destroyed
+
+	// B reports the success it truthfully had: it removed nothing.
+	if err := p.Result("n1", "second", nodeapi.CommandResult{ID: taken.ID, OK: true}); err != nil {
+		t.Fatalf("late result: %v", err)
+	}
+
+	if !p.OwnsForTest("l1", "n1", "first") {
+		t.Error("a destroy answered by a process that never held the container ended the " +
+			"owner's record; the next completion accepts a no-op destroy and releases " +
+			"capacity while that container is still running")
+	}
+}
+
+// SWEEPS AND TENDS DO NOT COMPETE FOR THE TOMBSTONE BUDGET.
+//
+// A late sweep or tend result tells the plane nothing it acts on, and letting
+// them share a bounded budget with launches let a burst of them EVICT a
+// safety-critical entry: the launch that then reported success was answered with
+// an ordinary 204, so the node never adopted the lease the listener had already
+// stopped renewing, and it expired under a running container.
+func TestOnlyLaunchesAndDestroysAreTombstoned(t *testing.T) {
+	t.Parallel()
+
+	p := testPlane(t)
+
+	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
+		Version: nodeapi.Version, Node: "n1", Provider: config.ProviderDocker,
+		Deployment: deployment, Incarnation: "first",
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	p.mu.Lock()
+	n := p.nodes["n1"]
+
+	for _, kind := range []nodeapi.CommandKind{
+		nodeapi.CommandSweep, nodeapi.CommandTend,
+		nodeapi.CommandLaunch, nodeapi.CommandDestroy,
+	} {
+		n.rememberAbandoned(nodeapi.Command{ID: string(kind), Kind: kind}, "first", time.Now())
+	}
+
+	got := len(n.abandoned)
+	p.mu.Unlock()
+
+	if got != 2 {
+		t.Errorf("%d commands were tombstoned, want only the launch and the destroy; the "+
+			"others share a bounded budget and can evict one that matters", got)
+	}
+}
+
 // A DESTROY IS ONLY CONFIRMED BY THE PROCESS THAT HAS THE CONTAINER.
 //
 // The wire broadcasts to whoever is polling, which is the CURRENT incarnation. A

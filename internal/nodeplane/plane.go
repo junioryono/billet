@@ -151,13 +151,33 @@ type node struct {
 // that compute is gone, and discarding it left the plane reporting custody
 // forever for a container that no longer existed.
 type abandonedCmd struct {
-	kind      nodeapi.CommandKind
-	requestID int64
-	at        time.Time
+	kind nodeapi.CommandKind
+	// incarnation is the process that TOOK the command, without which a late
+	// result cannot be attributed.
+	//
+	// A destroy answered by a process that is not the owner proves nothing about
+	// the owner's container: A owns a running container, B supersedes A and takes
+	// a destroy, truthfully finds nothing, and C supersedes B before B reports. B's
+	// late success would then end A's ownership — and the next completion, seeing
+	// no owner, accepts a no-op destroy and releases capacity while A's container
+	// is still running.
+	incarnation string
+	requestID   int64
+	at          time.Time
 }
 
 // rememberAbandoned records a command the plane gave up waiting for.
-func (n *node) rememberAbandoned(cmd nodeapi.Command, at time.Time) {
+func (n *node) rememberAbandoned(cmd nodeapi.Command, takenBy string, at time.Time) {
+	// ONLY THE KINDS WHOSE LATE ANSWER MEANS SOMETHING. A sweep or a tend result
+	// arriving late tells the plane nothing it acts on, and letting them share a
+	// bounded budget with launches and destroys let a burst of them EVICT a
+	// safety-critical entry: the launch that then reported success was answered
+	// with an ordinary 204, so the node never adopted the lease the listener had
+	// already stopped renewing, and it expired under a running container.
+	if cmd.Kind != nodeapi.CommandLaunch && cmd.Kind != nodeapi.CommandDestroy {
+		return
+	}
+
 	if n.abandoned == nil {
 		n.abandoned = make(map[string]abandonedCmd)
 	}
@@ -181,9 +201,10 @@ func (n *node) rememberAbandoned(cmd nodeapi.Command, at time.Time) {
 	}
 
 	n.abandoned[cmd.ID] = abandonedCmd{
-		kind:      cmd.Kind,
-		requestID: cmd.RequestIDOf(),
-		at:        at,
+		kind:        cmd.Kind,
+		incarnation: takenBy,
+		requestID:   cmd.RequestIDOf(),
+		at:          at,
 	}
 }
 
@@ -421,7 +442,7 @@ func (p *Plane) Register(
 		// nothing and exited, and every later destroy was answered by its
 		// replacement — which cannot confirm somebody else's ownership. The plane
 		// reported custody forever for a container that had already been removed.
-		n.rememberAbandoned(pend.cmd, p.now())
+		n.rememberAbandoned(pend.cmd, pend.incarnation, p.now())
 
 		p.answerLocked(pend, nodeapi.CommandResult{
 			ID:      id,
@@ -509,6 +530,27 @@ func (p *Plane) CheckIncarnation(name, claimed string) error {
 
 // ErrNotEntitled means a node asked for something no command it holds allows.
 var ErrNotEntitled = errors.New("nodeplane: this node holds no command that entitles it to that")
+
+// ownedByLocked reports whether this process is the one recorded as holding a
+// request's compute.
+//
+// A DESTROY ONLY PROVES SOMETHING ABOUT THE PROCESS THAT RAN IT. Any other
+// process answering "nothing to remove" is telling the truth about itself and
+// saying nothing about the container, which is on a machine it cannot see.
+func (p *Plane) ownedByLocked(requestID int64, node, incarnation string) bool {
+	if incarnation == "" {
+		return false
+	}
+
+	for _, owner := range p.owners {
+		if owner.requestID == requestID {
+			return owner.node == node && owner.incarnation == incarnation
+		}
+	}
+
+	// Nothing recorded, so there is nothing to contradict and nothing to end.
+	return false
+}
 
 // forgetForRequest drops the ownership of whatever lease a request was launched
 // under.
@@ -994,7 +1036,8 @@ func (p *Plane) Result(nodeName, incarnation string, res nodeapi.CommandResult) 
 			delete(n.abandoned, res.ID)
 
 			switch {
-			case entry.kind == nodeapi.CommandDestroy && res.OK:
+			case entry.kind == nodeapi.CommandDestroy && res.OK &&
+				p.ownedByLocked(entry.requestID, nodeName, entry.incarnation):
 				// THE ONLY PROOF THE COMPUTE IS GONE, arriving late. A destroy taken by
 				// a process that was superseded before it could answer used to be
 				// discarded here — so the ownership record survived, that process

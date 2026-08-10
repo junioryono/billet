@@ -1667,3 +1667,55 @@ func (f *fakeSession) acquiredIDs() []int64 {
 }
 
 func (f *fakeSession) Close(context.Context) error { return nil }
+
+// A COMPLETION WHOSE DESTROY FAILED IS RETRIED, which is what turns "capacity
+// held" into something other than a leak.
+//
+// Holding it is deliberate: releasing while the compute may still be running is
+// the overcommit the whole ordering exists to prevent. But nothing else was ever
+// going to try again — GitHub's completion has been acknowledged so it will not
+// be redelivered, the node may already have destroyed what it had, and the lease
+// sits in `running` being heartbeated for the life of the process.
+func TestACompletionWhoseDestroyFailedIsRetried(t *testing.T) {
+	t.Parallel()
+
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+
+	var failures atomic.Int32
+
+	runner := &fakeRunner{onDestroy: func(int64) error {
+		if failures.Add(1) == 1 {
+			return errors.New("the docker daemon is not answering")
+		}
+
+		return nil
+	}}
+
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner))
+
+	// The first completion cannot destroy, so its capacity is held.
+	if err := l.complete(t.Context(), Job{RequestID: 7}); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+
+	l.mu.Lock()
+	held := len(l.cleanup)
+	l.mu.Unlock()
+
+	if held != 1 {
+		t.Fatalf("a completion whose destroy failed was not recorded for retry: %d", held)
+	}
+
+	// The retry runs on the renewal clock and succeeds.
+	l.retryCleanup(t.Context())
+
+	l.mu.Lock()
+	held = len(l.cleanup)
+	l.mu.Unlock()
+
+	if held != 0 {
+		t.Errorf("a completion whose destroy later succeeded is still pending (%d); its "+
+			"capacity is held for the life of the process", held)
+	}
+}

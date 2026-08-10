@@ -221,6 +221,17 @@ type Listener struct {
 	// unacknowledged message comes back, and assigning it twice would consume a
 	// second lease for one job.
 	running map[int64]*alloc.Lease
+
+	// cleanup holds completions whose destroy failed.
+	//
+	// A FAILED DESTROY DELIBERATELY KEEPS THE CAPACITY HELD — releasing it while
+	// the compute may still be running is the overcommit the whole ordering exists
+	// to prevent — but nothing else was ever going to try again. GitHub's
+	// completion has been acknowledged, so it will not be redelivered; the lease
+	// sits in `running` and this listener heartbeats it for the life of the
+	// process. Retrying on the renewal clock is what turns "held" into something
+	// other than a leak.
+	cleanup map[int64]Job
 	// acquiring is escrow PROMISED to a request billet has claimed from GitHub but
 	// has not yet been given, keyed by the request id it was promised to.
 	//
@@ -572,6 +583,35 @@ func (l *Listener) heartbeatLoop(ctx context.Context) {
 			l.mu.Lock()
 			l.heartbeatHeld(ctx)
 			l.mu.Unlock()
+
+			// ON THE RENEWAL CLOCK, because these are exactly the leases being
+			// renewed. A completion whose destroy failed keeps its capacity held on
+			// purpose; retrying here is what eventually gives it back.
+			l.retryCleanup(ctx)
+		}
+	}
+}
+
+// retryCleanup finishes completions whose destroy failed.
+//
+// Idempotent by contract on the runner's side, so retrying a destroy that
+// actually succeeded is free — and the ONE thing that must not happen is
+// releasing the lease before the compute is confirmed gone, which complete
+// already refuses to do.
+func (l *Listener) retryCleanup(ctx context.Context) {
+	l.mu.Lock()
+
+	pending := make([]Job, 0, len(l.cleanup))
+	for _, job := range l.cleanup {
+		pending = append(pending, job)
+	}
+
+	l.mu.Unlock()
+
+	for _, job := range pending {
+		if err := l.complete(ctx, job); err != nil {
+			l.log.Error("could not finish cleaning up a completed job; will retry",
+				"tier", l.tier, "request", job.RequestID, "error", err)
 		}
 	}
 }
@@ -1233,12 +1273,32 @@ func (l *Listener) complete(ctx context.Context, job Job) error {
 		// fleet. That is the same disproportion already rejected for an unbacked
 		// assignment.
 		l.log.Error("could not destroy the compute for a finished job; keeping its capacity "+
-			"held, because releasing it now would let another tier use a machine this job "+
-			"may still be on",
+			"held and retrying, because releasing it now would let another tier use a "+
+			"machine this job may still be on",
 			"tier", l.tier, "request", job.RequestID, "error", err)
+
+		// AND RETRIED, which is what turns "held" into something other than a leak.
+		//
+		// The comment above was true and incomplete: holding the capacity is safe,
+		// and holding it FOREVER is not. Nothing else was ever going to try again —
+		// GitHub's completion has been acknowledged, the node has already destroyed
+		// what it had, and the lease sits in `running` being heartbeated by this
+		// listener for the life of the process.
+		l.mu.Lock()
+
+		if l.cleanup == nil {
+			l.cleanup = make(map[int64]Job)
+		}
+
+		l.cleanup[job.RequestID] = job
+		l.mu.Unlock()
 
 		return nil
 	}
+
+	l.mu.Lock()
+	delete(l.cleanup, job.RequestID)
+	l.mu.Unlock()
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
