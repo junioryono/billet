@@ -911,6 +911,13 @@ testing is what found them, and it is not optional for anything load-bearing.
   needs to block inside `Launch` and say when it has — a delay plus a channel,
   never a sleep in the test.
 
+- **Run the suite the way CI runs it, instrumented.** `-covermode=atomic` is not
+  a reporting flag; the counters change timing enough to reorder goroutines that
+  a plain `-race` build schedules identically every time. A launch in progress
+  being handed to teardown was invisible under `make check` and reliable under
+  coverage. `make check` now carries the flags, because a local gate weaker than
+  CI trains you to trust it.
+
 ### Two things Go gets right and reviewers get wrong
 
 - **`url.Parse` accepts `"127.0.0.1:7717"`**, reading the host as a scheme. A

@@ -252,7 +252,7 @@ same as Docker or ZFS. `billet` itself is Apache-2.0 throughout.
 |---|---|
 | P0 — scaffolding, GitHub App onboarding, host prep | ✅ mostly |
 | P1 — runner plane: scale sets, allocator, providers | 🚧 listeners, allocator and Docker done; Firecracker next |
-| P2 — guest images, node split, user-defined tiers | ⬜ |
+| P2 — guest images, node split, user-defined tiers | 🚧 node split + mTLS done; guest images need the machine |
 | P3 — copy-on-write storage layer, trust classes | ⬜ |
 | P4 — colocated Actions cache | ⬜ |
 | P5 — Docker layer cache, registry mirrors, container baseline | ⬜ |
