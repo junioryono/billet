@@ -2324,6 +2324,43 @@ func TestALaterOptionReplacesAnEarlierRefusal(t *testing.T) {
 		t.Error("a valid value followed by a nonsense one was accepted; last-wins has to " +
 			"apply to the refusal as well as the value")
 	}
+
+	// THE PAIRED OPTION TOO, which sets two fields at once. Testing only the
+	// single-field option left room for a regression that kept append-only
+	// behaviour in exactly the place where two errors can be live at the same
+	// time — and each call has to clear the field it fixes without touching the
+	// other's verdict.
+	crossed := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(&fakeRunner{}),
+		WithFinishGraces(0, 5*time.Second),
+		WithFinishGraces(5*time.Second, 0))
+
+	err := crossed.configError()
+	if err == nil {
+		t.Fatal("a nonsense release grace was accepted because an earlier call had set a " +
+			"good one")
+	}
+
+	if strings.Contains(err.Error(), "close grace") {
+		t.Errorf("the corrected close grace is still being reported: %v", err)
+	}
+
+	if !strings.Contains(err.Error(), "release grace") {
+		t.Errorf("the broken release grace is not being reported: %v", err)
+	}
+
+	// And correcting both clears both.
+	fixed := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(&fakeRunner{}),
+		WithFinishGraces(0, 0),
+		WithFinishGraces(5*time.Second, 6*time.Second))
+
+	if err := fixed.configError(); err != nil {
+		t.Errorf("correcting both graces left the listener refusing to start: %v", err)
+	}
+
+	if fixed.closeGrace != 5*time.Second || fixed.releaseGrace != 6*time.Second {
+		t.Errorf("corrected graces are %v/%v, want 5s/6s",
+			fixed.closeGrace, fixed.releaseGrace)
+	}
 }
 
 // THE BUDGET SUM STILL CANNOT WRAP, even though the ceiling now makes it
@@ -2772,8 +2809,12 @@ func TestADestroyThatOutrunsTheBudgetStopsTheTeardown(t *testing.T) {
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
 	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
 
+	var destroys atomic.Int32
+
 	// Ignores its context and outlasts join + destroy + close + release together.
 	runner := &fakeRunner{onDestroy: func(int64) error {
+		destroys.Add(1)
+
 		time.Sleep(2 * (2*destroying + 2*finishing))
 
 		return nil
@@ -2790,6 +2831,7 @@ func TestADestroyThatOutrunsTheBudgetStopsTheTeardown(t *testing.T) {
 	defer cancel()
 
 	runDone := make(chan struct{})
+	started := time.Now()
 
 	go func() {
 		defer close(runDone)
@@ -2807,10 +2849,240 @@ func TestADestroyThatOutrunsTheBudgetStopsTheTeardown(t *testing.T) {
 		t.Fatal("Run never returned")
 	}
 
+	// THE PREMISE FIRST. A negative assertion passes for any reason the teardown
+	// ended early, including the session close being removed entirely — so the
+	// destroy has to be shown to have run and outlasted the budget.
+	if destroys.Load() != 1 {
+		t.Fatalf("the destroy ran %d times; this test means nothing unless it ran once "+
+			"and outlasted the budget", destroys.Load())
+	}
+
+	if elapsed := time.Since(started); elapsed <= l.teardownBudget() {
+		t.Fatalf("the teardown finished in %v, inside its %v budget; nothing overran, so "+
+			"the check being tested was never reached", elapsed, l.teardownBudget())
+	}
+
 	if session.closes() != 0 {
 		t.Errorf("the session was closed %d times after the whole shutdown budget had "+
 			"already gone; a phase billet has just declared hopeless must not be started, "+
 			"because nothing promises it will return", session.closes())
+	}
+}
+
+// A SEALED CLEANUP LOOP STARTS NOTHING NEW, even mid-snapshot.
+//
+// retryCleanup walks a snapshot of due jobs, and cancellation does not stop it
+// between items. So a loop that was inside a slow destroy for request 7 when
+// shutdown began could finish it, move on, and start a BRAND NEW destroy for
+// request 9 — which the teardown was destroying at that same moment. Two
+// broadcasts to every node for one request, outside the single teardown slot,
+// and possibly after Run had returned.
+//
+// Sealing is a fact settled under the mutex the shutdown snapshot reads;
+// cancelling is only a request.
+func TestASealedCleanupLoopStartsNothingNew(t *testing.T) {
+	t.Parallel()
+
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+
+	var attempts atomic.Int32
+
+	runner := &fakeRunner{onDestroy: func(int64) error {
+		attempts.Add(1)
+
+		return errors.New("the node is not answering")
+	}}
+
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner),
+		WithCleanupRetryPacing(0, 0))
+
+	// Two obligations, so a snapshot has somewhere to advance TO.
+	l.mu.Lock()
+	l.cleanup = map[int64]*pendingCleanup{
+		7: {job: Job{RequestID: 7}},
+		9: {job: Job{RequestID: 9}},
+	}
+	l.mu.Unlock()
+
+	// The teardown has claimed them. Nothing the loop does from here may reach
+	// the runner.
+	l.seal()
+
+	l.retryCleanup(t.Context())
+
+	if got := attempts.Load(); got != 0 {
+		t.Errorf("a sealed cleanup loop reached the runner %d times; the shutdown has "+
+			"already decided which requests are its own, and a second broadcast for one "+
+			"of them runs outside the single teardown slot", got)
+	}
+
+	// AND THE OBLIGATIONS SURVIVE. Sealing stops the loop; it does not discharge
+	// anything, and the teardown still owes these containers a destroy.
+	if cleanupCount(l) != 2 {
+		t.Errorf("sealing dropped obligations: %d pending, want 2", cleanupCount(l))
+	}
+}
+
+// AND THE SHUTDOWN ACTUALLY SEALS, which is a different property from sealing
+// working.
+//
+// The test above calls seal() itself, so it passes against a Run that never
+// does — the same gap that once let `go l.cleanupLoop` be deleted with a green
+// suite. Here the loop is genuinely mid-snapshot when shutdown begins: it blocks
+// inside the first destroy, the join gives up, the teardown destroys the other
+// request, and only then does the first destroy return. An unsealed loop
+// advances to the second request and destroys it again — after Run has returned,
+// outside the teardown's single slot.
+func TestRunSealsTheCleanupLoop(t *testing.T) {
+	t.Parallel()
+
+	const (
+		grace = 200 * time.Millisecond
+		// The cleanup loop ticks at TTL/3, so the DEFAULT 90 second TTL means its
+		// first pass is 30 seconds away. This test waited 30 seconds for that pass
+		// and passed in isolation by about three seconds — then failed under the
+		// full suite, which is the definition of a test that will flake in CI.
+		ttl = 300 * time.Millisecond
+	)
+
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
+		alloc.WithLeaseTTL(ttl))
+
+	blocked := make(chan struct{})
+	unblock := sync.OnceFunc(func() { close(blocked) })
+
+	t.Cleanup(unblock)
+
+	entered := make(chan struct{}, 1)
+
+	var (
+		destroys  atomic.Int32
+		announced atomic.Bool
+	)
+
+	// Only the loop's FIRST destroy blocks; everything else returns at once, so
+	// what distinguishes the behaviours is a count rather than a hang.
+	runner := &fakeRunner{onDestroy: func(int64) error {
+		destroys.Add(1)
+
+		if announced.CompareAndSwap(false, true) {
+			entered <- struct{}{}
+
+			<-blocked
+		}
+
+		return errors.New("the node is not answering")
+	}}
+
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner),
+		WithShutdownGrace(grace), WithFinishGraces(grace, grace),
+		WithCleanupRetryPacing(0, 0))
+
+	// Two obligations, so the loop's snapshot has somewhere to advance to.
+	l.mu.Lock()
+	l.cleanup = map[int64]*pendingCleanup{
+		7: {job: Job{RequestID: 7}},
+		9: {job: Job{RequestID: 9}},
+	}
+	l.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	defer cancel()
+
+	runDone := make(chan struct{})
+
+	go func() {
+		defer close(runDone)
+
+		if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("Run: %v", err)
+		}
+	}()
+
+	select {
+	case <-entered:
+	case <-runDone:
+		t.Fatal("the listener stopped before its cleanup loop reached the runner")
+	case <-time.After(30 * time.Second):
+		t.Fatal("the cleanup retry never reached the runner")
+	}
+
+	cancel()
+
+	select {
+	case <-runDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("Run never returned")
+	}
+
+	// The loop's first destroy is still blocked and the teardown has been and
+	// gone: its own call, plus the teardown's for the other request.
+	afterRun := destroys.Load()
+	if afterRun != 2 {
+		t.Fatalf("%d destroys before releasing the stuck one, want 2 (the loop's and the "+
+			"teardown's); the setup is not what this test describes", afterRun)
+	}
+
+	unblock()
+
+	// Long enough for an unsealed loop to advance and issue its second destroy —
+	// it has nothing left to wait for.
+	time.Sleep(10 * grace)
+
+	if got := destroys.Load(); got != afterRun {
+		t.Errorf("the cleanup loop issued %d more destroy(s) after Run returned; nothing "+
+			"sealed it, so it walked on through a snapshot the teardown had already "+
+			"claimed — outside the single slot, with no process left to own it",
+			got-afterRun)
+	}
+}
+
+// A RETRY THAT PANICS STILL RELEASES ITS IN-FLIGHT MARK.
+//
+// The mark makes the shutdown skip a request on the grounds that a retry is
+// already destroying it. An entry that outlives its attempt therefore hides that
+// request from teardown permanently — a container nobody destroys and nobody
+// mentions, which is strictly worse than the double-destroy the mark exists to
+// prevent. Unmarking after the call rather than in a defer left that to luck:
+// any panic under complete, in the runner or the allocator, and the mark stays.
+func TestAPanickingRetryStillReleasesItsMark(t *testing.T) {
+	t.Parallel()
+
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+
+	runner := &fakeRunner{onDestroy: func(int64) error {
+		panic("the provider exploded")
+	}}
+
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner))
+
+	holdRunning(t, l, a, tiers[0].Label, 7)
+
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Error("the runner did not panic, so this proves nothing")
+			}
+		}()
+
+		// Unreachable when the runner panics, which is the point — and a real
+		// assertion rather than a discarded error if it ever stops panicking.
+		if err := l.attempt(t.Context(), Job{RequestID: 7}); err != nil {
+			t.Errorf("attempt: %v", err)
+		}
+	}()
+
+	l.mu.Lock()
+	inFlight := len(l.destroying)
+	l.mu.Unlock()
+
+	if inFlight != 0 {
+		t.Errorf("%d request(s) are still marked as being destroyed after the attempt "+
+			"blew up; the shutdown will skip them believing a retry has them, and their "+
+			"containers outlive the process with nothing said", inFlight)
 	}
 }
 

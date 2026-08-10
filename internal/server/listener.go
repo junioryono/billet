@@ -281,6 +281,11 @@ type Listener struct {
 	// issuing a second one only spends the teardown budget on work in progress.
 	destroying map[int64]bool
 
+	// sealed stops the cleanup loop starting anything new. Set under l.mu before
+	// the loop is cancelled, so "no new attempts" and "what is in flight" are one
+	// decision rather than two — see attempt.
+	sealed bool
+
 	// confirmed is when each lease was last successfully renewed, keyed by lease
 	// id. It is what turns "no answer" into a bounded state: past the TTL without
 	// a confirmation the reaper may already have taken the lease, so advertising
@@ -861,6 +866,10 @@ func (l *Listener) Run(ctx context.Context) error {
 		// The wait is bounded by the same grace: a runner that ignores its context
 		// must not be able to hold the process open, and a bounded misbehaviour
 		// that says so is better than an unbounded one that does not.
+		// SEALED FIRST, then cancelled. Cancelling asks the loop to stop and says
+		// nothing about what it is midway through starting; sealing settles that
+		// under the same mutex the shutdown snapshot reads.
+		l.seal()
 		stopSweeping()
 
 		// ITS OWN PHASE, with its own copy of the destroy budget.
@@ -1172,16 +1181,7 @@ func (l *Listener) retryCleanup(ctx context.Context) {
 	l.mu.Unlock()
 
 	for _, job := range pending {
-		l.mu.Lock()
-		l.destroying[job.RequestID] = true
-		l.mu.Unlock()
-
-		err := l.complete(ctx, job)
-
-		l.mu.Lock()
-		delete(l.destroying, job.RequestID)
-		l.mu.Unlock()
-
+		err := l.attempt(ctx, job)
 		if err == nil {
 			continue
 		}
@@ -1355,6 +1355,57 @@ func (l *Listener) destroyAll(ctx context.Context) map[int64]bool {
 	wg.Wait()
 
 	return done
+}
+
+// attempt runs one cleanup retry, marked as in flight for its duration.
+//
+// THE UNMARKING IS A DEFER, and that is the whole reason this is a function. The
+// mark makes the shutdown skip a request on the grounds that a retry is already
+// destroying it, so an entry that outlives its attempt hides that request from
+// teardown permanently — a container nobody destroys and nobody mentions. A
+// panic anywhere under complete would have done it, and the safety of the skip
+// depends on this pairing being unbreakable rather than merely written down.
+func (l *Listener) attempt(ctx context.Context, job Job) error {
+	l.mu.Lock()
+
+	// CLAIMED UNDER THE SAME LOCK THAT SEALS, which is what makes the shutdown's
+	// snapshot trustworthy.
+	//
+	// retryCleanup walks a snapshot of due jobs and cancellation does not stop it
+	// mid-list: with only a context check, the loop could finish a slow destroy,
+	// see the shutdown had already skipped past, and start a BRAND NEW one for the
+	// next job — which the teardown was destroying at the same moment. Two
+	// broadcasts to every node for one request, outside the single teardown slot,
+	// and possibly after Run had returned. Checking a flag and then taking the
+	// mark in two steps leaves the same window one instruction wide.
+	if l.sealed {
+		l.mu.Unlock()
+
+		return nil
+	}
+
+	l.destroying[job.RequestID] = true
+	l.mu.Unlock()
+
+	defer func() {
+		l.mu.Lock()
+		delete(l.destroying, job.RequestID)
+		l.mu.Unlock()
+	}()
+
+	return l.complete(ctx, job)
+}
+
+// seal stops the cleanup loop from starting any further destroys.
+//
+// Called BEFORE the loop is cancelled, because cancelling is a request and this
+// is a fact: once it returns, every request not already marked in `destroying`
+// is the teardown's alone.
+func (l *Listener) seal() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	l.sealed = true
 }
 
 // backOff pushes a failed retry's next attempt out.
