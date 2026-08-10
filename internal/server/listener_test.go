@@ -1610,7 +1610,10 @@ type fakeSession struct {
 	// onAcquire grants fewer ids than were asked for, which GitHub does when
 	// another scale set wins the same offer.
 	onAcquire func(ids []int64) ([]int64, error)
-	stats     *Statistics
+	// onClose fails the session close, which sends shutdown down the path that
+	// deliberately skips the release.
+	onClose func() error
+	stats   *Statistics
 	// acquired records every request id the listener asked GitHub to claim, so a
 	// test can assert WHICH class of message drove the acquisition.
 	acquiredMu sync.Mutex
@@ -1666,7 +1669,13 @@ func (f *fakeSession) acquiredIDs() []int64 {
 	return append([]int64(nil), f.acquired...)
 }
 
-func (f *fakeSession) Close(context.Context) error { return nil }
+func (f *fakeSession) Close(context.Context) error {
+	if f.onClose != nil {
+		return f.onClose()
+	}
+
+	return nil
+}
 
 // A COMPLETION WHOSE DESTROY FAILED IS RETRIED, which is what turns "capacity
 // held" into something other than a leak.
@@ -1878,7 +1887,10 @@ func TestRunWaitsForACleanupStillInTheProvider(t *testing.T) {
 	// that, not review. The first call is the cleanup loop's retry; the drain's
 	// later call returns at once, leaving the join as the only thing that can
 	// keep Run from returning while that retry is still inside the provider.
-	var firstCall atomic.Bool
+	var (
+		firstCall atomic.Bool
+		returned  atomic.Bool
+	)
 
 	runner := &fakeRunner{onDestroy: func(int64) error {
 		if !firstCall.CompareAndSwap(false, true) {
@@ -1888,6 +1900,7 @@ func TestRunWaitsForACleanupStillInTheProvider(t *testing.T) {
 		entered <- struct{}{}
 
 		<-blocked
+		returned.Store(true)
 
 		return nil
 	}}
@@ -1903,12 +1916,13 @@ func TestRunWaitsForACleanupStillInTheProvider(t *testing.T) {
 
 	// CAUSAL, not merely temporal. The timed check below can only ever say "Run
 	// had not returned yet", which a descheduled goroutine satisfies too. This
-	// records whether the destroy had come back at the moment Run returned, which
-	// is the actual property and cannot be faked by scheduling.
-	var (
-		released atomic.Bool
-		tooEarly atomic.Bool
-	)
+	// records whether the destroy had come back at the moment Run returned.
+	//
+	// `returned` is set by the fake INSIDE the destroy, after the block clears —
+	// setting it in the test just before unblocking left a window where Run could
+	// resume, see it already true, and report nothing wrong while the destroy was
+	// still in flight.
+	var tooEarly atomic.Bool
 
 	runDone := make(chan struct{})
 
@@ -1919,7 +1933,7 @@ func TestRunWaitsForACleanupStillInTheProvider(t *testing.T) {
 			t.Errorf("Run: %v", err)
 		}
 
-		if !released.Load() {
+		if !returned.Load() {
 			tooEarly.Store(true)
 		}
 	}()
@@ -1943,7 +1957,6 @@ func TestRunWaitsForACleanupStillInTheProvider(t *testing.T) {
 	case <-time.After(500 * time.Millisecond):
 	}
 
-	released.Store(true)
 	unblock()
 
 	select {
@@ -2053,6 +2066,117 @@ func TestRenewalOutlivesTheShutdownRelease(t *testing.T) {
 	}
 }
 
+// UNCERTAINTY IS NOT ALLOWED TO OUTLAST THE LEASE.
+//
+// A renewal that cannot reach the allocator says nothing about ownership, so the
+// lease is kept — but only up to a point. Past the TTL with no confirmed
+// renewal, the reaper can have taken it, and "no evidence it is lost" has become
+// a reason to advertise capacity that is gone.
+func TestALeaseUnconfirmedForLongerThanItsTTLIsDropped(t *testing.T) {
+	t.Parallel()
+
+	const ttl = 200 * time.Millisecond
+
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
+		alloc.WithLeaseTTL(ttl))
+
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(&fakeRunner{}))
+
+	holdRunning(t, l, a, tiers[0].Label, 7)
+
+	// One good pass, so there is a confirmed renewal to measure from.
+	l.mu.Lock()
+	l.heartbeatHeld(t.Context())
+	l.mu.Unlock()
+
+	if _, ok := l.running[7]; !ok {
+		t.Fatal("a healthy renewal dropped the lease")
+	}
+
+	// Now nothing gets through. A cancelled context is the cheapest stand-in for
+	// an allocator that cannot be reached.
+	unreachable, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	l.mu.Lock()
+	l.heartbeatHeld(unreachable)
+	_, keptAtOnce := l.running[7]
+	l.mu.Unlock()
+
+	if !keptAtOnce {
+		t.Fatal("a single unreachable renewal dropped the lease; a failure to ask is not " +
+			"an answer, and dropping it removes the lease from the release path too")
+	}
+
+	time.Sleep(2 * ttl)
+
+	l.mu.Lock()
+	l.heartbeatHeld(unreachable)
+	_, keptTooLong := l.running[7]
+	l.mu.Unlock()
+
+	if keptTooLong {
+		t.Error("a lease went unconfirmed for longer than its TTL and was still being " +
+			"advertised; the reaper can have reclaimed it by now, so the capacity may " +
+			"already belong to another tier")
+	}
+}
+
+// THE WAIT DOUBLES AND THEN STOPS AT THE CEILING.
+//
+// Tested directly on the entry, because the test below can only show that SOME
+// wait was imposed: it would pass just as well against a fixed delay with no
+// growth and no ceiling. Growth is what stops a node that is never coming back
+// being asked every fifteen seconds forever; the ceiling is what keeps it being
+// asked at all.
+func TestTheRetryWaitDoublesToACeiling(t *testing.T) {
+	t.Parallel()
+
+	const (
+		first   = time.Second
+		ceiling = 4 * time.Second
+	)
+
+	now := time.Now()
+	entry := &pendingCleanup{job: Job{RequestID: 7}}
+
+	// Recorded ready to run: the first attempt after a failed completion is
+	// immediate, because a node that was briefly busy is the common case.
+	if !entry.due(now) {
+		t.Fatal("a freshly recorded cleanup was not due immediately")
+	}
+
+	for i, want := range []time.Duration{first, 2 * first, ceiling, ceiling, ceiling} {
+		entry.failed(now, first, ceiling)
+
+		if entry.wait != want {
+			t.Errorf("failure %d waits %v, want %v", i+1, entry.wait, want)
+		}
+
+		if entry.due(now) {
+			t.Errorf("failure %d left the entry due immediately", i+1)
+		}
+
+		if !entry.due(now.Add(want)) {
+			t.Errorf("failure %d was not due again after %v", i+1, want)
+		}
+	}
+
+	// AND A DOUBLING THAT OVERSHOOTS IS CLAMPED. With 1s doubling to a 4s ceiling
+	// the sequence lands on it exactly, so the clamp is never reached and a
+	// version without it passes — which is what a mutation run found. Any pacing
+	// whose ceiling is not a power of two multiple of the first wait needs it.
+	overshoot := &pendingCleanup{job: Job{RequestID: 9}}
+
+	overshoot.failed(now, 3*time.Second, 4*time.Second)
+	overshoot.failed(now, 3*time.Second, 4*time.Second)
+
+	if overshoot.wait != 4*time.Second {
+		t.Errorf("a doubling that overshot the ceiling waits %v, want 4s", overshoot.wait)
+	}
+}
+
 // A FAILED RETRY WAITS BEFORE THE NEXT ONE, so a node that is never coming back
 // cannot occupy every pass.
 //
@@ -2145,11 +2269,18 @@ func TestShutdownDestroysCompletionsWhoseLeaseIsGone(t *testing.T) {
 	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner))
 
 	// A record with NO lease behind it, which is the whole point: nothing in the
-	// lease maps refers to request 7. The allocator's default TTL keeps the
-	// cleanup loop's ticker from firing inside this test, so a destroy here can
-	// only have come from the shutdown drain.
+	// lease maps refers to request 7.
+	//
+	// NOT DUE FOR AN HOUR, so the retry loop will not touch it however the test is
+	// scheduled. Relying on the default TTL keeping the loop's ticker late was a
+	// race: descheduled long enough, the loop could do the destroy and this would
+	// pass with drainCleanup deleted. The drain ignores the backoff deliberately —
+	// it is the last pass there will ever be — so making the entry ineligible for
+	// the loop leaves the drain as the only possible source of a destroy.
 	l.mu.Lock()
-	l.cleanup = map[int64]*pendingCleanup{7: {job: Job{RequestID: 7}}}
+	l.cleanup = map[int64]*pendingCleanup{
+		7: {job: Job{RequestID: 7}, at: time.Now().Add(time.Hour)},
+	}
 	l.mu.Unlock()
 
 	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
@@ -2189,6 +2320,78 @@ func TestShutdownDestroysCompletionsWhoseLeaseIsGone(t *testing.T) {
 	}
 }
 
+// A SESSION THAT WILL NOT CLOSE STILL DESTROYS WHAT THIS LISTENER STARTED.
+//
+// That path returns early on purpose: a session billet could not close may still
+// be handing this scale set work, so the capacity is left to expire rather than
+// handed back while GitHub believes the tier has room. Releasing is what is
+// skipped — destroying is not, and the drain used to skip records whose lease
+// was still held on the grounds that releaseAll would deal with them. On this
+// path releaseAll never runs, so nobody did.
+func TestASessionThatWillNotCloseStillDestroysItsCompute(t *testing.T) {
+	t.Parallel()
+
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+
+	destroyed := make(chan int64, 4)
+
+	runner := &fakeRunner{onDestroy: func(id int64) error {
+		destroyed <- id
+
+		return nil
+	}}
+
+	session := &fakeSession{onClose: func() error {
+		return errors.New("the scale set session is not answering")
+	}}
+
+	l := NewListener(a, tiers[0].Label, session, WithRunner(runner))
+
+	// A record whose lease this listener STILL HOLDS, which is the case the drain
+	// used to skip. Not due for an hour, so the retry loop cannot be what destroys
+	// it however the test is scheduled.
+	holdRunning(t, l, a, tiers[0].Label, 7)
+
+	l.mu.Lock()
+	l.cleanup = map[int64]*pendingCleanup{
+		7: {job: Job{RequestID: 7}, at: time.Now().Add(time.Hour)},
+	}
+	l.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	defer cancel()
+
+	runDone := make(chan struct{})
+
+	go func() {
+		defer close(runDone)
+
+		if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("Run: %v", err)
+		}
+	}()
+
+	cancel()
+
+	select {
+	case <-runDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("Run never returned")
+	}
+
+	select {
+	case id := <-destroyed:
+		if id != 7 {
+			t.Errorf("shutdown destroyed request %d, want 7", id)
+		}
+	default:
+		t.Fatal("a session that would not close left a completed job's compute running: " +
+			"the release is skipped on that path deliberately, but the destroy is not " +
+			"supposed to be, and nothing else will ever remove that container")
+	}
+}
+
 // A WEDGED TEARDOWN STOPS RENEWING, so the reaper can reclaim what it holds.
 //
 // Nothing can bound a Destroy that ignores its context, and the Runner interface
@@ -2200,9 +2403,11 @@ func TestShutdownDestroysCompletionsWhoseLeaseIsGone(t *testing.T) {
 func TestAWedgedTeardownStopsRenewing(t *testing.T) {
 	t.Parallel()
 
+	// The grace has to outlast the "still alive" check below, or the watchdog
+	// fires before the test has established that renewal was ever running.
 	const (
-		ttl   = 600 * time.Millisecond
-		grace = 300 * time.Millisecond
+		ttl   = 300 * time.Millisecond
+		grace = 1500 * time.Millisecond
 	)
 
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
@@ -2257,9 +2462,26 @@ func TestAWedgedTeardownStopsRenewing(t *testing.T) {
 		t.Fatal("the shutdown release never reached the runner")
 	}
 
-	// Well past the grace AND past the TTL, so renewal has had to stop and the
-	// lease has had to expire. Reaped synchronously so expiry is enforced at the
-	// moment it is checked rather than by a background ticker.
+	// ALIVE FIRST. Without this the test passes against a listener whose
+	// heartbeat never started, or stopped the instant the caller cancelled — it
+	// would be proving only that an unrenewed lease dies, which needs no
+	// watchdog. Past a TTL into the teardown, still renewable, is what says
+	// renewal was running when the grace began.
+	time.Sleep(2 * ttl)
+
+	if _, err := a.Reap(t.Context()); err != nil {
+		t.Fatalf("reap before the grace: %v", err)
+	}
+
+	if err := a.Heartbeat(t.Context(), lease.ID, lease.Epoch); err != nil {
+		t.Fatalf("the lease was already gone before the shutdown grace expired (%v); "+
+			"renewal was not running during the teardown, so this proves nothing about "+
+			"the watchdog", err)
+	}
+
+	// AND DEAD AFTER. Past the grace now, so the watchdog has had to stop renewal.
+	// Reaped synchronously so expiry is enforced at the moment it is checked
+	// rather than by a background ticker.
 	time.Sleep(grace + 2*ttl)
 
 	if _, err := a.Reap(t.Context()); err != nil {
