@@ -467,6 +467,61 @@ func (p *Plane) CheckIncarnation(name, claimed string) error {
 // ErrNotEntitled means a node asked for something no command it holds allows.
 var ErrNotEntitled = errors.New("nodeplane: this node holds no command that entitles it to that")
 
+// ForgetLease drops the ownership record for a lease that has ended.
+//
+// BOUNDED, because the alternative is one map entry per job for the life of the
+// installation. A node that never goes quiet is never expired, so nothing else
+// would ever remove them.
+func (p *Plane) ForgetLease(node, leaseID string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if n, ok := p.nodes[node]; ok {
+		delete(n.owners, leaseID)
+	}
+}
+
+// AdoptOwnership records that this process is responsible for leases the ledger
+// already places on its node.
+//
+// A CONTROL PLANE RESTART FORGETS EVERYTHING, and a superseded process then
+// cannot finish. The sequence: a node is holding compute, the plane restarts, the
+// node re-registers and adopts what it finds, a second host supersedes it — and
+// the new plane never saw the launch, so it has no owner for that lease. The
+// draining process is refused its own release, custody is never given up, and
+// the drain runs forever.
+//
+// The ledger knows what it forgot: a lease bound to this node and still open is
+// this node's, and the process registering now is the one holding it.
+func (p *Plane) AdoptOwnership(node, incarnation string, leaseIDs []string) {
+	if incarnation == "" || len(leaseIDs) == 0 {
+		return
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	n, ok := p.nodes[node]
+	if !ok {
+		return
+	}
+
+	if n.owners == nil {
+		n.owners = make(map[string]string, len(leaseIDs))
+	}
+
+	for _, id := range leaseIDs {
+		// GAPS ONLY, never a claim. Every registration runs this, so overwriting
+		// would let a REPLACEMENT take ownership of the leases the process it
+		// superseded is still draining — which is the exact situation this exists
+		// to survive. A lease already attributed to a process stays with it; the
+		// current incarnation is permitted anyway, by name.
+		if _, taken := n.owners[id]; !taken {
+			n.owners[id] = incarnation
+		}
+	}
+}
+
 // MayMutateLease reports whether this process may change a lease's fate.
 //
 // THE CURRENT PROCESS, OR THE ONE THAT WAS GIVEN THE LAUNCH. Anything else is a
@@ -482,9 +537,13 @@ func (p *Plane) MayMutateLease(node, incarnation, leaseID string) error {
 		return fmt.Errorf("%w: %s", ErrUnregistered, node)
 	}
 
-	// Nothing has claimed an incarnation, so there is nothing to tell apart: a
-	// fleet mid-upgrade, or the in-process runner, which has no wire to carry one.
-	if n.incarnation == "" || incarnation == "" || n.incarnation == incarnation {
+	// COMPATIBILITY IS SCOPED TO THE NODE, NOT THE REQUEST — the same correction
+	// CheckIncarnation needed last round, and I did not apply it here or to
+	// EntitledToLaunch. Accepting an empty claim unconditionally makes the header
+	// optional, and an optional fence is no fence: a superseded process simply
+	// stops sending it, reads a lease id and epoch through the open routes, and
+	// releases the replacement's lease.
+	if n.incarnation == "" || n.incarnation == incarnation {
 		return nil
 	}
 
@@ -534,7 +593,11 @@ func (p *Plane) EntitledToLaunch(node, incarnation, leaseID string) (string, err
 		// alone would hand it the CURRENT process's work instead. A long poll
 		// admitted before supersession can still wake afterwards holding a command,
 		// so this is reachable without anything hostile happening.
-		if pend.incarnation != "" && incarnation != "" && pend.incarnation != incarnation {
+		//
+		// An EMPTY claim does not match a command that has an owner. Treating it as
+		// a wildcard made the header optional, which let a process mint the
+		// registration for somebody else's in-flight launch by simply omitting it.
+		if pend.incarnation != "" && pend.incarnation != incarnation {
 			continue
 		}
 
@@ -576,13 +639,29 @@ func (p *Plane) EntitledToLaunch(node, incarnation, leaseID string) (string, err
 // ones are the launches still likely to report.
 const maxAbandoned = 1024
 
-func (p *Plane) Seen(name string) {
+func (p *Plane) Seen(name, incarnation string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if n, ok := p.nodes[name]; ok {
-		n.lastSeen = p.now()
+	n, ok := p.nodes[name]
+	if !ok {
+		return
 	}
+
+	// ONLY THE CURRENT PROCESS VOUCHES FOR THE NODE. A superseded one draining its
+	// custody keeps talking for as long as its job runs, and counting that as
+	// liveness kept a DEAD replacement in the fleet: the plane went on choosing
+	// that node, every launch it sent waited out the command timeout, and the
+	// tier was effectively down for the length of somebody else's job.
+	//
+	// The draining process is not being disbelieved — its heartbeats and results
+	// are still accepted. It simply is not evidence that the node is available
+	// for work, because it is the one process that has been told it is not.
+	if n.incarnation != "" && incarnation != "" && n.incarnation != incarnation {
+		return
+	}
+
+	n.lastSeen = p.now()
 }
 
 // Nodes reports the registered node names, for diagnostics.
@@ -619,6 +698,17 @@ func (p *Plane) Poll(ctx context.Context, nodeName, incarnation string) (nodeapi
 		p.mu.Unlock()
 
 		return nodeapi.Command{}, false, ErrUnregistered
+	}
+
+	// CHECKED BEFORE EVERY HANDOVER, not only after a wait. The HTTP guard runs
+	// before this function takes the mutex, so a supersession can land in between
+	// and the fast path would hand a queued command to a process that no longer
+	// owns the name — which then becomes that lease's recorded owner and holds a
+	// genuine entitlement to mint its runner.
+	if err := supersededLocked(n, nodeName, incarnation); err != nil {
+		p.mu.Unlock()
+
+		return nodeapi.Command{}, false, err
 	}
 
 	n.lastSeen = p.now()
@@ -662,20 +752,29 @@ func (p *Plane) Poll(ctx context.Context, nodeName, incarnation string) (nodeapi
 		return nodeapi.Command{}, false, ErrUnregistered
 	}
 
-	// CHECKED AGAIN AFTER WAITING, because a long poll is admitted at the start
-	// and answered at the end, and a supersession can land between the two. The
-	// handler's check passed when this request arrived; without a second look, a
-	// process that has since been replaced still walks away with a command — and
-	// then legitimately holds an entitlement to mint its runner.
-	if n.incarnation != "" && incarnation != "" && n.incarnation != incarnation {
-		return nodeapi.Command{}, false, fmt.Errorf(
-			"%w: node %q is registered by process %s and this poll came from %s",
-			ErrSuperseded, nodeName, n.incarnation, incarnation)
+	// AND AGAIN AFTER WAITING, because a long poll is admitted at the start and
+	// answered at the end, and a supersession can land between the two.
+	if err := supersededLocked(n, nodeName, incarnation); err != nil {
+		return nodeapi.Command{}, false, err
 	}
 
 	cmd, took := p.takeLocked(n, incarnation)
 
 	return cmd, took, nil
+}
+
+// supersededLocked reports whether this process has lost the node's name.
+//
+// One place, so the fast path and the woken path cannot drift — they already had,
+// which is how a queued command reached a process that no longer owned the name.
+func supersededLocked(n *node, name, incarnation string) error {
+	if n.incarnation == "" || n.incarnation == incarnation {
+		return nil
+	}
+
+	return fmt.Errorf(
+		"%w: node %q is registered by process %s and this request came from %s",
+		ErrSuperseded, name, n.incarnation, incarnation)
 }
 
 // takeLocked moves the head of the queue into flight, recording who took it.
@@ -706,7 +805,7 @@ func (p *Plane) takeLocked(n *node, incarnation string) (nodeapi.Command, bool) 
 }
 
 // Result records what a node made of a command.
-func (p *Plane) Result(nodeName string, res nodeapi.CommandResult) error {
+func (p *Plane) Result(nodeName, incarnation string, res nodeapi.CommandResult) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -715,7 +814,13 @@ func (p *Plane) Result(nodeName string, res nodeapi.CommandResult) error {
 		return ErrUnregistered
 	}
 
-	n.lastSeen = p.now()
+	// THE RESULT IS ACCEPTED FROM ANY PROCESS — it is the handover itself — but
+	// only the CURRENT one is evidence that this node can be given work. A
+	// superseded process draining its custody reports for as long as its job runs,
+	// and counting that as liveness kept a dead replacement in the fleet.
+	if n.incarnation == "" || incarnation == "" || n.incarnation == incarnation {
+		n.lastSeen = p.now()
+	}
 
 	pend, ok := n.inflight[res.ID]
 	if !ok {

@@ -183,7 +183,7 @@ func TestANodesVerdictIsCarriedBack(t *testing.T) {
 				res := tc.res
 				res.ID = cmd.ID
 
-				if err := p.Result("n1", res); err != nil {
+				if err := p.Result("n1", "", res); err != nil {
 					t.Errorf("Result: %v", err)
 				}
 			}()
@@ -312,7 +312,7 @@ func TestTheLeasesPreferenceOrderDecides(t *testing.T) {
 
 			got <- name
 
-			if err := p.Result(name, nodeapi.CommandResult{ID: cmd.ID, OK: true}); err != nil {
+			if err := p.Result(name, "", nodeapi.CommandResult{ID: cmd.ID, OK: true}); err != nil {
 				t.Errorf("Result: %v", err)
 			}
 		}()
@@ -351,7 +351,7 @@ func TestAPinnedLeaseWillNotWander(t *testing.T) {
 			return
 		}
 
-		if err := p.Result("other", nodeapi.CommandResult{ID: cmd.ID, OK: true}); err != nil {
+		if err := p.Result("other", "", nodeapi.CommandResult{ID: cmd.ID, OK: true}); err != nil {
 			t.Errorf("Result: %v", err)
 		}
 	}()
@@ -380,7 +380,7 @@ func TestAnUnregisteredNodeIsToldToRegister(t *testing.T) {
 		t.Fatalf("want ErrUnregistered, got %v", err)
 	}
 
-	if err := p.Result("ghost", nodeapi.CommandResult{ID: "x"}); !errors.Is(err, ErrUnregistered) {
+	if err := p.Result("ghost", "", nodeapi.CommandResult{ID: "x"}); !errors.Is(err, ErrUnregistered) {
 		t.Fatalf("want ErrUnregistered from Result, got %v", err)
 	}
 }
@@ -467,7 +467,7 @@ func TestADestroyReportsEveryNodeThatFailed(t *testing.T) {
 				return
 			}
 
-			if err := p.Result(name, nodeapi.CommandResult{
+			if err := p.Result(name, "", nodeapi.CommandResult{
 				ID:    cmd.ID,
 				Error: "docker refused on " + name,
 			}); err != nil {
@@ -721,6 +721,70 @@ func TestATimedOutLaunchWithNoResultStillMeansCustody(t *testing.T) {
 	if _, ok := n.abandoned[pend.cmd.ID]; !ok {
 		t.Error("no tombstone was recorded, so a late success is answered with a shrug and " +
 			"the container runs under a lease nothing renews")
+	}
+}
+
+// A QUEUED COMMAND IS NOT HANDED TO A PROCESS THAT HAS LOST THE NAME.
+//
+// The HTTP guard checks the incarnation before this function takes the mutex, so
+// a supersession landing in between reaches a fast path that never looked again.
+// The command would be handed over, that process recorded as the lease's owner,
+// and — since the JIT entitlement follows the command — it would hold a genuine
+// right to mint that runner's registration.
+//
+// Driven against Plane.Poll directly, because the race it guards cannot be
+// produced from outside: the guard would refuse the request long before the
+// window opens. Calling the function the window exists inside is the only way to
+// stand in it.
+func TestAQueuedCommandIsNotGivenToASupersededProcess(t *testing.T) {
+	t.Parallel()
+
+	p := testPlane(t, WithCommandTimeout(time.Second))
+
+	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
+		Version:     nodeapi.Version,
+		Node:        "n1",
+		Provider:    config.ProviderDocker,
+		Deployment:  deployment,
+		Incarnation: "first",
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	// Something is waiting to be delivered.
+	go func() {
+		//nolint:errcheck // the launch's fate is not what this test is about
+		_ = p.NewRunner().Launch(t.Context(), testLease(), server.Job{RequestID: 7})
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for p.QueuedForTest("n1") == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the command was never queued")
+		}
+
+		time.Sleep(time.Millisecond)
+	}
+
+	// A second process takes the name while that command sits in the queue.
+	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
+		Version:     nodeapi.Version,
+		Node:        "n1",
+		Provider:    config.ProviderDocker,
+		Deployment:  deployment,
+		Incarnation: "second",
+	}); err != nil {
+		t.Fatalf("re-register: %v", err)
+	}
+
+	cmd, took, err := p.Poll(t.Context(), "n1", "first")
+	if took {
+		t.Errorf("a superseded process was handed queued command %s; it is now that lease's "+
+			"recorded owner and may mint the runner for it", cmd.ID)
+	}
+
+	if !errors.Is(err, ErrSuperseded) {
+		t.Errorf("want ErrSuperseded, got %v", err)
 	}
 }
 

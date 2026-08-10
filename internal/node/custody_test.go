@@ -1779,3 +1779,40 @@ func TestAStrayThatAppearsBecomesObserved(t *testing.T) {
 			"waiting out a grace period meant for compute that may never have started")
 	}
 }
+
+// AN ORDINARY RUNNING JOB IS SOMETHING THIS NODE IS HOLDING.
+//
+// Custody is compute billet cannot account for; launching is compute it is
+// creating. A job that started cleanly and is running right now is neither — and
+// it is exactly as much this process's responsibility, because its completion
+// will be routed here and nowhere else.
+//
+// Leaving it out meant a superseded node with a healthy running job saw "holding
+// nothing", exited, and left a container whose completion now reaches a
+// replacement that cannot see it: that Destroy finds nothing, reports success,
+// and the lease is released under a running job.
+func TestAnOrdinaryRunningJobCountsAsHolding(t *testing.T) {
+	t.Parallel()
+
+	p := &fakeProvider{kind: config.ProviderDocker}
+
+	a, host := newAllocatorWithHost(t)
+
+	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
+	if r.Holding() {
+		t.Fatal("a node with nothing running reported that it was holding something")
+	}
+
+	lease := assignedLease(t, a)
+
+	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	if !r.Holding() {
+		t.Error("a node running a job it launched cleanly reported that it was holding " +
+			"nothing; superseded, it would exit and leave that container's lease to a " +
+			"replacement that cannot see it")
+	}
+}

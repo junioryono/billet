@@ -113,27 +113,27 @@ func Handler(log *slog.Logger, p *Plane, store LeaseStore, jit JITSource, opts .
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("POST /v1/register", h.register)
-	// THREE CLASSES, and the distinction is what a request can COST.
+	// THREE CLASSES, and the distinction is what a request can REACH.
 	//
-	// forNewWork — poll and bind — acquires work or capacity. A superseded process
-	// is refused: two hosts under one name cannot both be given work.
+	// forNewWork — poll, bind, and anything that enumerates the node — is the
+	// current process's alone. Two hosts under one name cannot both be given work,
+	// and a list of the node's leases is the first step of acting on them.
 	//
-	// forOwnLease — advance and release — changes a lease's fate. Permitted only
-	// for a lease this process was actually given, or if it is the current one.
+	// forOwnLease — everything addressed to ONE lease, renewal included — is
+	// permitted for a lease this process was given, or if it is the current one.
 	//
-	// forNode — heartbeat, result, reads — maintains or concludes what is already
-	// held. Open to a superseded process on purpose: it may be holding a container
-	// right now, and cutting it off from renewing or reporting is how a lease ends
-	// up owned by nobody at all.
+	// forNode — the result route — stays open to any process holding the
+	// certificate, because reporting is the handover itself: a superseded process
+	// that cannot report is a container whose lease nobody ends up owning.
 	mux.HandleFunc("POST /v1/nodes/{node}/poll", h.forNewWork(h.poll))
 	mux.HandleFunc("POST /v1/nodes/{node}/result", h.forNode(h.result))
 	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/bind", h.forNewWork(h.bind))
 	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/advance", h.forOwnLease(h.advance))
-	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/heartbeat", h.forNode(h.heartbeat))
+	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/heartbeat", h.forOwnLease(h.heartbeat))
 	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/release", h.forOwnLease(h.release))
-	mux.HandleFunc("GET /v1/nodes/{node}/leases/{lease}", h.forNode(h.lease))
-	mux.HandleFunc("GET /v1/nodes/{node}/launched", h.forNode(h.launched))
-	mux.HandleFunc("POST /v1/nodes/{node}/describe", h.forNode(h.describe))
+	mux.HandleFunc("GET /v1/nodes/{node}/leases/{lease}", h.forOwnLease(h.lease))
+	mux.HandleFunc("GET /v1/nodes/{node}/launched", h.forNewWork(h.launched))
+	mux.HandleFunc("POST /v1/nodes/{node}/describe", h.forNewWork(h.describe))
 	mux.HandleFunc("POST /v1/nodes/{node}/jit", h.forNode(h.jitConfig))
 
 	return mux
@@ -158,6 +158,14 @@ type handler struct {
 	// when somebody edits the organisation.
 	setsMu sync.Mutex
 	sets   map[string]int
+}
+
+// forgetScaleSet drops a cached id so the next request resolves it again.
+func (h *handler) forgetScaleSet(label string) {
+	h.setsMu.Lock()
+	defer h.setsMu.Unlock()
+
+	delete(h.sets, label)
 }
 
 // scaleSetFor resolves a tier's scale set id, once.
@@ -202,17 +210,23 @@ func (h *handler) forNode(next http.HandlerFunc) http.HandlerFunc {
 	return h.guard(next, false)
 }
 
-// forOwnLease wraps a route that changes a lease's FATE rather than its deadline.
+// forOwnLease wraps every route that touches ONE named lease.
 //
-// A superseded process may finish what it was given and nothing else. Advancing
-// or releasing a lease it never received is how one host returns capacity that
-// another host's container is still using — and between an incarnation and its
-// replacement, the node name and the certificate are identical, so nothing else
-// can tell them apart.
+// A superseded process may finish what it was given and nothing else. Between an
+// incarnation and its replacement the node name and the certificate are
+// identical, so a permission keyed on either lets one host act on the other's
+// work: releasing capacity a running container is using, or advancing a lease it
+// never received.
 //
-// Renewal is deliberately NOT here. A heartbeat only ever extends a lease, so
-// the worst a confused process achieves is holding capacity a little longer,
-// which is the direction this design errs in everywhere else.
+// RENEWAL IS HERE TOO, and the argument for leaving it out was wrong. "A
+// heartbeat only extends a lease" is true of one heartbeat and false of a
+// process that keeps sending them: repeated renewal does not hold capacity
+// slightly longer, it denies it indefinitely. If the current process dies before
+// releasing, the reaper is the mechanism that reclaims — and a superseded
+// process renewing that lease forever is precisely what stops it.
+//
+// Reads are here for the same reason: a lease id and its epoch are what a
+// release needs, and handing them out defeats the check on the release itself.
 func (h *handler) forOwnLease(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		node := r.PathValue("node")
@@ -377,6 +391,29 @@ func (h *handler) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// OWNERSHIP IS REBUILT FROM THE LEDGER, because the plane's copy does not
+	// survive a restart and a superseded process cannot finish without it. The
+	// sequence that breaks otherwise: a node is holding compute, the control plane
+	// restarts, the node re-registers and adopts what it finds, a second host
+	// supersedes it — and the new plane never saw those launches, so it refuses
+	// the draining process its own release and the drain never ends.
+	//
+	// Best effort: a ledger that cannot answer is not a reason to refuse a
+	// registration, and the consequence of missing it is a drain that needs an
+	// operator, not compute that runs unaccounted for.
+	if ids, err := h.store.LaunchedLeaseIDs(r.Context(), req.Node); err != nil {
+		h.log.Warn("could not rebuild which leases this node already holds; a process that is "+
+			"later superseded may be unable to release them",
+			"node", req.Node, "error", err)
+	} else {
+		open := make([]string, 0, len(ids))
+		for id := range ids {
+			open = append(open, id)
+		}
+
+		h.plane.AdoptOwnership(req.Node, req.Incarnation, open)
+	}
+
 	h.log.Info("node registered",
 		"node", req.Node, "provider", req.Provider, "guest_os", req.GuestOS)
 
@@ -410,7 +447,8 @@ func (h *handler) result(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.plane.Result(r.PathValue("node"), res); err != nil {
+	if err := h.plane.Result(r.PathValue("node"),
+		r.Header.Get(nodeapi.HeaderIncarnation), res); err != nil {
 		writeStoreErr(w, err)
 
 		return
@@ -460,7 +498,7 @@ func (h *handler) advance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.requireRegistered(r.PathValue("node")); err != nil {
+	if err := h.registered(r); err != nil {
 		writeStoreErr(w, err)
 
 		return
@@ -481,7 +519,7 @@ func (h *handler) heartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.requireRegistered(r.PathValue("node")); err != nil {
+	if err := h.registered(r); err != nil {
 		writeStoreErr(w, err)
 
 		return
@@ -510,7 +548,7 @@ func (h *handler) release(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.requireRegistered(r.PathValue("node")); err != nil {
+	if err := h.registered(r); err != nil {
 		writeStoreErr(w, err)
 
 		return
@@ -522,11 +560,17 @@ func (h *handler) release(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// THE OWNERSHIP RECORD ENDS WITH THE LEASE. Kept only while somebody might
+	// still need to prove they hold it; one entry per historical job would grow
+	// for the life of the installation, since a node that never goes quiet is
+	// never expired.
+	h.plane.ForgetLease(r.PathValue("node"), r.PathValue("lease"))
+
 	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *handler) lease(w http.ResponseWriter, r *http.Request) {
-	if err := h.requireRegistered(r.PathValue("node")); err != nil {
+	if err := h.registered(r); err != nil {
 		writeStoreErr(w, err)
 
 		return
@@ -567,7 +611,7 @@ func (h *handler) describe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.requireRegistered(r.PathValue("node")); err != nil {
+	if err := h.registered(r); err != nil {
 		writeStoreErr(w, err)
 
 		return
@@ -607,7 +651,7 @@ func (h *handler) jitConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.requireRegistered(r.PathValue("node")); err != nil {
+	if err := h.registered(r); err != nil {
 		writeStoreErr(w, err)
 
 		return
@@ -675,6 +719,23 @@ func (h *handler) jitConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A RECREATED SCALE SET MUST NOT WEDGE THE TIER. The cached id is a fact about
+	// somebody else's system, and deleting and recreating a scale set changes it.
+	// The node re-resolves on its own failure and arrives with the NEW id; a cache
+	// that never re-checks refuses it against the old one forever, and every
+	// launch for that tier fails until the control plane is restarted.
+	//
+	// So a mismatch is a reason to look again, once, before refusing.
+	if setID != req.ScaleSetID {
+		h.forgetScaleSet(known.Label)
+
+		if setID, err = h.scaleSetFor(r.Context(), known); err != nil {
+			writeStoreErr(w, err)
+
+			return
+		}
+	}
+
 	if setID != req.ScaleSetID {
 		h.log.Warn("refused a runner registration for a scale set the launch does not name",
 			"node", r.PathValue("node"), "lease", leaseID, "tier", tier,
@@ -703,17 +764,27 @@ func (h *handler) jitConfig(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// registered is requireRegistered for a request, carrying its incarnation so
+// only the CURRENT process refreshes the node's scheduling liveness.
+func (h *handler) registered(r *http.Request) error {
+	return h.requireRegisteredAs(r.PathValue("node"), r.Header.Get(nodeapi.HeaderIncarnation))
+}
+
 // requireRegistered refuses lease work from a node the plane does not know.
 //
 // This is what a node meets after the CONTROL PLANE restarts: its commands and
 // lease writes are rejected with a code that means "register again" rather than
 // a generic failure it would retry forever without ever fixing.
 func (h *handler) requireRegistered(node string) error {
+	return h.requireRegisteredAs(node, "")
+}
+
+func (h *handler) requireRegisteredAs(node, incarnation string) error {
 	// RECORDED BEFORE THE QUESTION IS ASKED, because asking it runs expiry. A
 	// custody heartbeat arriving from a healthy janitor used to expire the very
 	// node it came from — the node had not polled, and nothing else counted as
 	// life — and then be refused as unregistered.
-	h.plane.Seen(node)
+	h.plane.Seen(node, incarnation)
 
 	for _, known := range h.plane.Nodes() {
 		if known == node {

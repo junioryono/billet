@@ -531,7 +531,16 @@ func (r *Runner) Holding() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	return len(r.custody) > 0 || len(r.launching) > 0
+	// RUNNING COUNTS, and leaving it out was the whole bug. Custody is compute
+	// billet cannot account for and launching is compute it is creating — but an
+	// ordinary job that launched cleanly and is running right now is neither, and
+	// it is just as much this process's responsibility.
+	//
+	// Without it a node that had successfully started a job saw "holding nothing"
+	// the moment it was superseded, exited, and left a container whose completion
+	// is now routed to a replacement that cannot see it. That Destroy finds
+	// nothing, reports success, and the lease is released under a running job.
+	return len(r.custody) > 0 || len(r.launching) > 0 || len(r.running) > 0
 }
 
 // renewSnapshot is everything whose lease this node must keep alive.
