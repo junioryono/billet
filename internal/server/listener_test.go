@@ -1734,21 +1734,48 @@ func TestACompletionWhoseDestroyFailedIsRetried(t *testing.T) {
 func TestASlowCleanupDoesNotStarveRenewal(t *testing.T) {
 	t.Parallel()
 
-	tiers := []config.Tier{tier("billet-4vcpu-a")}
-	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+	// DRIVEN THROUGH Run, because the property is about two loops and the earlier
+	// version manufactured both of them itself.
+	//
+	// Starting retryCleanup in one goroutine and heartbeatHeld in another proves
+	// only that a stuck destroy does not hold l.mu. It passes just as well against
+	// a heartbeat loop that calls retryCleanup on its own tick — which is exactly
+	// the regression this test is named for, and the shape production had before
+	// the separate clock was introduced. The loops therefore have to be the ones
+	// Run starts, and the detector has to be the consequence rather than the
+	// mechanism: a lease that stops being renewed is reaped.
+	const ttl = 900 * time.Millisecond
 
-	// A destroy that fails immediately the first time, then blocks the way an
-	// unreachable node does.
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
+		alloc.WithLeaseTTL(ttl))
+
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	defer cancel()
+
+	// The reaper has to be running, or a missed heartbeat costs nothing and this
+	// passes against a listener that never renews anything.
+	go func() {
+		tick := time.NewTicker(ttl / 5)
+		defer tick.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+				if _, err := a.Reap(ctx); err != nil && ctx.Err() == nil {
+					t.Errorf("Reap: %v", err)
+				}
+			}
+		}
+	}()
+
+	// A destroy that blocks the way an unreachable node does.
 	blocked := make(chan struct{})
 	entered := make(chan struct{}, 1)
 
-	var attempts atomic.Int32
-
 	runner := &fakeRunner{onDestroy: func(int64) error {
-		if attempts.Add(1) == 1 {
-			return errors.New("the node is not answering")
-		}
-
 		select {
 		case entered <- struct{}{}:
 		default:
@@ -1761,52 +1788,70 @@ func TestASlowCleanupDoesNotStarveRenewal(t *testing.T) {
 
 	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner))
 
-	t.Cleanup(func() { close(blocked) })
+	lease := holdRunning(t, l, a, tiers[0].Label, 7)
 
-	holdRunning(t, l, a, tiers[0].Label, 7)
+	// A completion whose destroy already failed, so the loop has something to
+	// retry as soon as Run starts it.
+	l.mu.Lock()
+	l.cleanup = map[int64]Job{7: {RequestID: 7}}
+	l.mu.Unlock()
 
-	// A completion whose destroy failed, so there is something to retry.
-	if err := l.complete(t.Context(), Job{RequestID: 7}); err != nil {
-		t.Fatalf("complete: %v", err)
-	}
-
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-
-	// retryCleanup directly rather than cleanupLoop: the question is whether a
-	// stuck retry holds anything renewal needs, not how long the loop's ticker
-	// waits before the first attempt.
-	go l.retryCleanup(ctx)
-
-	// Wait until the retry is genuinely stuck inside the provider, which is the
-	// state the whole test is about.
-	select {
-	case <-entered:
-	case <-time.After(30 * time.Second):
-		t.Fatal("the retry never reached the runner")
-	}
-
-	// AND RENEWAL STILL RUNS. Called directly rather than waited for, because the
-	// question is whether the cleanup holds a lock or a goroutine that renewal
-	// needs — not how fast the ticker is. If retryCleanup were on the heartbeat's
-	// tick, this work would simply not be happening while that destroy is stuck.
-	done := make(chan struct{})
+	runDone := make(chan struct{})
 
 	go func() {
-		defer close(done)
+		defer close(runDone)
 
-		l.mu.Lock()
-		l.heartbeatHeld(ctx)
-		l.mu.Unlock()
+		if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("Run: %v", err)
+		}
 	}()
 
+	// Nothing below proves anything until the retry is genuinely stuck inside the
+	// provider, which is the state the whole test is about.
 	select {
-	case <-done:
+	case <-entered:
+	case <-runDone:
+		t.Fatal("the listener stopped before its cleanup loop reached the runner")
 	case <-time.After(30 * time.Second):
-		t.Fatal("renewal could not run while a cleanup retry was stuck in the provider; one " +
-			"unreachable host delays every renewal on this listener and expires the leases " +
-			"it is protecting")
+		t.Fatal("the retry never reached the runner, so nothing started the cleanup loop")
 	}
+
+	// AND RENEWAL OUTLIVES THE STUCK DESTROY — comfortably past the TTL, with the
+	// reaper running throughout. If cleanup sat on the heartbeat's tick, this
+	// lease stopped being renewed the moment that destroy blocked, and the reaper
+	// has taken it by now.
+	time.Sleep(3 * ttl)
+
+	if err := a.Heartbeat(ctx, lease.ID, lease.Epoch); err != nil {
+		t.Fatalf("a running lease was lost while a cleanup retry was stuck in the provider "+
+			"(%v); one unreachable host delays every renewal on this listener and expires "+
+			"the leases it was protecting", err)
+	}
+
+	// Let the destroy finish, and WAIT FOR THE RETRY TO DRAIN before returning.
+	// The blocked goroutine belongs to Run, so nothing else joins it — and if it
+	// resumed after the test closed the database, its release would race that
+	// close.
+	close(blocked)
+
+	for pendingCleanup(l) > 0 {
+		select {
+		case <-time.After(20 * time.Millisecond):
+		case <-ctx.Done():
+			t.Fatal("the retry never drained after the node started answering")
+		}
+	}
+
+	cancel()
+	<-runDone
+}
+
+// pendingCleanup reports how many completions are waiting to be retried.
+func pendingCleanup(l *Listener) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	return len(l.cleanup)
 }
 
 // A TRANSIENT RELEASE FAILURE MUST NOT LOSE THE RETRY.
@@ -1851,11 +1896,18 @@ func TestATransientReleaseFailureKeepsTheRetry(t *testing.T) {
 
 	// The retry destroys successfully, and the release fails: a cancelled context
 	// is the cheapest transient failure that reaches the allocator.
+	//
+	// DRIVEN THROUGH retryCleanup, not complete. The dispatcher is half of the
+	// property and calling complete directly skipped it, so every test on this
+	// path passed equally against a retryCleanup that deleted the record whatever
+	// error complete handed back.
 	cancelled, cancel := context.WithCancel(t.Context())
 	cancel()
 
-	if err := l.complete(cancelled, Job{RequestID: 7}); err == nil {
-		t.Fatal("a release that could not run reported success")
+	l.retryCleanup(cancelled)
+
+	if got := attempts.Load(); got != 2 {
+		t.Fatalf("the retry never reached the runner: %d destroy attempts, want 2", got)
 	}
 
 	l.mu.Lock()
@@ -1869,9 +1921,7 @@ func TestATransientReleaseFailureKeepsTheRetry(t *testing.T) {
 	}
 
 	// And once the release can run, the job is finally over.
-	if err := l.complete(t.Context(), Job{RequestID: 7}); err != nil {
-		t.Fatalf("complete: %v", err)
-	}
+	l.retryCleanup(t.Context())
 
 	l.mu.Lock()
 	pending = len(l.cleanup)
@@ -1881,6 +1931,98 @@ func TestATransientReleaseFailureKeepsTheRetry(t *testing.T) {
 	if pending != 0 || running != 0 {
 		t.Errorf("after a successful release: %d pending, %d running, want 0 and 0",
 			pending, running)
+	}
+}
+
+// A RETRY RECORD DIES WITH THE LEASE IT WAS FOR.
+//
+// Declining to ADD a record for a lease this listener does not hold left the
+// other half undone: a lease can be fenced or reaped between the completion that
+// recorded the retry and the retry itself. The heartbeat then drops it from
+// `running` and the record stays behind, attempted on every pass for the life of
+// the process — and since retries are sequential and each destroy can wait up to
+// the node command timeout, entries that can never succeed delay the ones that
+// can. Every ownership-loss cycle added another.
+func TestALostLeaseDropsItsPendingRetry(t *testing.T) {
+	t.Parallel()
+
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+
+	// A node that never answers, so nothing is ever resolved by succeeding.
+	runner := &fakeRunner{onDestroy: func(int64) error {
+		return errors.New("the node is not answering")
+	}}
+
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner))
+
+	lease := holdRunning(t, l, a, tiers[0].Label, 7)
+
+	if err := l.complete(t.Context(), Job{RequestID: 7}); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+
+	if pendingCleanup(l) != 1 {
+		t.Fatalf("a completion whose destroy failed was not recorded: %d", pendingCleanup(l))
+	}
+
+	// The lease goes away underneath the listener. Released here rather than
+	// fenced because the listener cannot tell the difference: both come back from
+	// the heartbeat as "no longer yours", which is the only thing it acts on.
+	if err := a.Release(t.Context(), lease.ID, lease.Epoch, alloc.PhaseDone); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+
+	l.mu.Lock()
+	l.heartbeatHeld(t.Context())
+	l.mu.Unlock()
+
+	if pendingCleanup(l) != 0 {
+		t.Errorf("a retry record outlived the lease it was for (%d pending); this listener "+
+			"can accomplish nothing for a request whose capacity is already someone "+
+			"else's, and the entry is retried on every pass forever", pendingCleanup(l))
+	}
+
+	// AND THE SAME IS TRUE ARRIVING FROM THE OTHER SIDE. The heartbeat is not the
+	// only way to notice: a retry can be the thing that discovers the lease is
+	// gone, and declining to re-add the record is not the same as removing it.
+	l.mu.Lock()
+	l.cleanup = map[int64]Job{7: {RequestID: 7}}
+	delete(l.running, 7)
+	l.mu.Unlock()
+
+	l.retryCleanup(t.Context())
+
+	if pendingCleanup(l) != 0 {
+		t.Errorf("a retry whose lease had already gone left its record in place (%d "+
+			"pending); nothing it does can ever succeed and every pass tries it again",
+			pendingCleanup(l))
+	}
+
+	// AND THE PROMISED HALF, which is its own line in the heartbeat and would
+	// otherwise be covered by nothing: escrow held for a job GitHub acquired but
+	// has not yet assigned is lost the same way and leaves the same residue.
+	promised, err := a.Reserve(t.Context(), tiers[0].Label)
+	if err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+
+	l.mu.Lock()
+	l.acquiring[9] = &promise{lease: promised, at: time.Now()}
+	l.cleanup = map[int64]Job{9: {RequestID: 9}}
+	l.mu.Unlock()
+
+	if err := a.Release(t.Context(), promised.ID, promised.Epoch, alloc.PhaseDone); err != nil {
+		t.Fatalf("release the promised lease: %v", err)
+	}
+
+	l.mu.Lock()
+	l.heartbeatHeld(t.Context())
+	l.mu.Unlock()
+
+	if pendingCleanup(l) != 0 {
+		t.Errorf("a retry record outlived the promise it was for (%d pending)",
+			pendingCleanup(l))
 	}
 }
 
@@ -1925,7 +2067,11 @@ func TestACompletionNotHeldIsNotRecorded(t *testing.T) {
 // lives on for the reaper, and retrying those would grow the map with entries
 // whose retry can never accomplish anything. So a test about the retry has to
 // install the lease first, or it is testing the ignore path.
-func holdRunning(t *testing.T, l *Listener, a *alloc.Allocator, tier string, requestID int64) {
+// It returns the lease so a test can ask the allocator about it directly, which
+// is the only way to tell "still renewed" from "reaped" from outside.
+func holdRunning(t *testing.T, l *Listener, a *alloc.Allocator, tier string,
+	requestID int64,
+) *alloc.Lease {
 	t.Helper()
 
 	lease, err := a.Reserve(t.Context(), tier)
@@ -1940,6 +2086,8 @@ func holdRunning(t *testing.T, l *Listener, a *alloc.Allocator, tier string, req
 	l.mu.Lock()
 	l.running[requestID] = lease
 	l.mu.Unlock()
+
+	return lease
 }
 
 // THE WIRING, WHICH IS A DIFFERENT PROPERTY FROM THE BEHAVIOUR.

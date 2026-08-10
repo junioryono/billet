@@ -684,6 +684,12 @@ func (l *Listener) heartbeatHeld(ctx context.Context) {
 	for id, lease := range l.running {
 		if !l.renew(ctx, lease) {
 			delete(l.running, id)
+
+			// The pending retry goes with it. Losing the lease is what ends this
+			// listener's business with the request — a fenced lease belongs to
+			// another holder and a reaped one has already had its capacity
+			// reclaimed, so retrying the destroy can only occupy the cleanup pass.
+			delete(l.cleanup, id)
 		}
 	}
 
@@ -707,6 +713,7 @@ func (l *Listener) heartbeatHeld(ctx context.Context) {
 
 		if !l.renew(ctx, p.lease) {
 			delete(l.acquiring, id)
+			delete(l.cleanup, id)
 		}
 	}
 }
@@ -1315,6 +1322,18 @@ func (l *Listener) complete(ctx context.Context, job Job) error {
 			}
 
 			l.cleanup[job.RequestID] = job
+		} else {
+			// AND AN EXISTING RECORD IS DROPPED, which declining to add a new one
+			// did not do. A lease can be fenced or reaped between the completion
+			// that recorded the retry and the retry itself; the heartbeat then
+			// removes it from `running`, and from that moment this listener can
+			// accomplish nothing for it — the capacity is already someone else's.
+			//
+			// Leaving the record cost more than a stale map entry. Retries are
+			// sequential and each Destroy can wait up to the node command timeout,
+			// so entries that can never succeed delay the ones that can, and every
+			// ownership-loss cycle adds another.
+			delete(l.cleanup, job.RequestID)
 		}
 
 		l.mu.Unlock()
