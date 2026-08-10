@@ -1304,11 +1304,19 @@ func (l *Listener) complete(ctx context.Context, job Job) error {
 		// listener for the life of the process.
 		l.mu.Lock()
 
-		if l.cleanup == nil {
-			l.cleanup = make(map[int64]Job)
+		// ONLY IF THIS LISTENER ACTUALLY HOLDS THE LEASE. A completion can arrive
+		// for a job this listener never assigned — a restart lost the in-memory map
+		// while the lease lived on for the reaper — and recording those would grow
+		// the map with entries whose retry can never accomplish anything.
+		_, held := l.running[job.RequestID]
+		if _, promised := l.acquiring[job.RequestID]; held || promised {
+			if l.cleanup == nil {
+				l.cleanup = make(map[int64]Job)
+			}
+
+			l.cleanup[job.RequestID] = job
 		}
 
-		l.cleanup[job.RequestID] = job
 		l.mu.Unlock()
 
 		return nil
@@ -1316,10 +1324,6 @@ func (l *Listener) complete(ctx context.Context, job Job) error {
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
-
-	// The destroy succeeded, so there is nothing left to retry for this job —
-	// whether this call came from a completion or from the retry loop.
-	delete(l.cleanup, job.RequestID)
 
 	lease, ok := l.running[job.RequestID]
 
@@ -1339,16 +1343,29 @@ func (l *Listener) complete(ctx context.Context, job Job) error {
 		// Not ours, or already released. Both are ordinary: GitHub can report a
 		// job completed that this listener never assigned, if a restart lost the
 		// in-memory map while the lease lives on in the ledger for the reaper.
+		//
+		// Nothing left to retry either way — including for a lease that was fenced
+		// or reaped out from under this listener, whose entry would otherwise sit
+		// in the map being retried for the life of the process.
+		delete(l.cleanup, job.RequestID)
+
 		return nil
 	}
 
 	if err := l.alloc.Release(ctx, lease.ID, lease.Epoch, alloc.PhaseDone); err != nil {
+		// THE ENTRY STAYS, and that is the whole point of keeping one. Deleting it
+		// when the DESTROY succeeded lost the retry to a transient release failure:
+		// the lease stayed in `running` being renewed forever, GitHub will not
+		// redeliver a completion it has already acknowledged, and nothing else was
+		// ever going to try the release again.
 		return fmt.Errorf("server: release lease %s for finished request %d: %w",
 			lease.ID, job.RequestID, err)
 	}
 
+	// RELEASED, so the job is finally over and there is nothing to retry.
 	delete(l.running, job.RequestID)
 	delete(l.acquiring, job.RequestID)
+	delete(l.cleanup, job.RequestID)
 
 	return nil
 }
