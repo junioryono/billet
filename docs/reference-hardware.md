@@ -135,6 +135,41 @@ one thing in a billet deployment that is not disposable. Cache data and sticky
 disks are disposable by design and do not need the same treatment.
 
 
+## The reference host as actually built (verified, not assumed)
+
+Ubuntu 26.04 LTS, kernel 7.0.0-29-generic. `/dev/kvm` present, `kvm_amd` loaded, cgroup v2 — which
+is the jailer's requirement, not a nice-to-have.
+
+**Firecracker and jailer pinned at v1.16.1** (released 2026-07-02), installed as versioned filenames
+behind stable symlinks so `firecracker --version` always matches what is on disk and a bump is
+reversible. Billet pins to what the host has rather than the other way round: the provider is
+written against a version known to be installed, not against a version someone hopes is.
+
+**ZFS pool `tank`**, a mirror of the two bare NVMe, with `tank/images` at 128K recordsize and
+`tank/cache` at 1M, lz4 on both. The name matches `billet.example.yaml` so nothing has to be edited
+to match a machine.
+
+`/var/lib/billet/node` exists at 0750 on local disk — the mdraid root, never NFS, because the state
+directory holds SQLite and the deployment identity.
+
+**The host kernel is newer than Firecracker's CI is likely to cover.** A 7.0 host kernel is well past
+anything a 2026-07 release was tested against, and the interface that matters is the KVM ioctl
+surface the VMM uses plus the jailer's cgroup v2 handling. This is not something to settle by
+reading: boot one microVM on the box before designing around it. It is a cheap check now and an
+expensive surprise during P2.
+
+## An inherited machine can arrive with ZFS's worst case already set up
+
+The four NVMe drives arrived configured as a **4-way RAID 0** — no redundancy, and exactly the
+"handing ZFS a RAID volume" shape this document warns against. It was destroyed and rebuilt as
+mdraid RAID1 for root plus two bare disks for the pool.
+
+Worth stating because the failure is SILENT. ZFS on top of a RAID volume still imports, still
+scrubs, and still reports healthy; what it loses is the per-disk visibility that lets it identify
+and repair the bad copy, which is the entire reason it was chosen. Nothing warns you, and the day
+you find out is the day a disk starts lying. On any inherited or vendor-configured machine, check
+what the disks actually are before building a pool on them.
+
 ## Guest egress: what this host in particular must block
 
 The security model says guests are blocked from the host LAN, RFC1918, BMC/IPMI,

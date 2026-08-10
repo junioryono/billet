@@ -95,6 +95,10 @@ node:
     # The guest kernel must include everything Docker needs, or service
     # containers fail in ways that are hard to read. Validate with moby's
     # contrib/check-config.sh rather than a hand-written list.
+    # Pinned to what the reference host runs: firecracker and jailer v1.16.1,
+    # installed as versioned filenames behind stable symlinks. See
+    # docs/reference-hardware.md — billet pins to the version the host has,
+    # rather than asking a host to match a version billet prefers.
     kernel_image: /var/lib/billet/images/vmlinux
     # Backs golden images, per-job root clones, and cache volumes via CoW.
     zfs_pool: tank

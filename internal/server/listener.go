@@ -395,6 +395,14 @@ func (l *Listener) Run(ctx context.Context) error {
 
 	go l.heartbeatLoop(beat)
 
+	// A SEPARATE LOOP, NOT A STEP IN THE HEARTBEAT. Retrying a destroy means
+	// broadcasting to nodes and waiting up to the command timeout, and the
+	// heartbeat loop exists precisely so that renewal is never behind something
+	// slow. Hanging this off the same tick would let one unreachable host delay
+	// every renewal on the listener and expire the leases it was protecting —
+	// which is the failure the separate clock was introduced to prevent.
+	go l.cleanupLoop(beat)
+
 	// CLOSE THEN RELEASE, in that order, and the listener owns both so the order
 	// cannot be split across two functions again.
 	//
@@ -583,10 +591,20 @@ func (l *Listener) heartbeatLoop(ctx context.Context) {
 			l.mu.Lock()
 			l.heartbeatHeld(ctx)
 			l.mu.Unlock()
+		}
+	}
+}
 
-			// ON THE RENEWAL CLOCK, because these are exactly the leases being
-			// renewed. A completion whose destroy failed keeps its capacity held on
-			// purpose; retrying here is what eventually gives it back.
+// cleanupLoop retries completions whose destroy failed, on its own clock.
+func (l *Listener) cleanupLoop(ctx context.Context) {
+	ticker := time.NewTicker(l.heartbeatInterval())
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
 			l.retryCleanup(ctx)
 		}
 	}
@@ -1297,11 +1315,11 @@ func (l *Listener) complete(ctx context.Context, job Job) error {
 	}
 
 	l.mu.Lock()
-	delete(l.cleanup, job.RequestID)
-	l.mu.Unlock()
-
-	l.mu.Lock()
 	defer l.mu.Unlock()
+
+	// The destroy succeeded, so there is nothing left to retry for this job —
+	// whether this call came from a completion or from the retry loop.
+	delete(l.cleanup, job.RequestID)
 
 	lease, ok := l.running[job.RequestID]
 
