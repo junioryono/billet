@@ -1777,11 +1777,6 @@ func TestBindRefusesANodeRunningAnotherProvider(t *testing.T) {
 
 	ctx := t.Context()
 
-	// A HOST CAN CHANGE ITS BACKEND WHILE A LEASE IS ONLY AIMED AT IT, which is
-	// the window this check exists for. Placement will not send a firecracker
-	// lease to a tart host — that host is not a candidate — so the mismatch has to
-	// arrive AFTER the reservation, and it can: re-registering under a new backend
-	// is refused only while leases are BOUND there.
 	registerNode(t, a, "shapeshifter", config.ProviderFirecracker)
 
 	lease := reserve(t, a, "small")
@@ -1791,8 +1786,23 @@ func TestBindRefusesANodeRunningAnotherProvider(t *testing.T) {
 			lease.TargetNode)
 	}
 
-	if _, err := a.RegisterNode(ctx, testRegistration("shapeshifter", config.ProviderTart)); err != nil {
-		t.Fatalf("the host could not change backend while merely targeted: %v", err)
+	// SEEDED, BECAUSE REGISTRATION NO LONGER ALLOWS IT. A host used to be able to
+	// change backend while a lease was merely AIMED at it — the guard counted only
+	// bound leases — and that was the window this check was written for. It is
+	// closed now: escrow names its machine, so the guard refuses the change while
+	// capacity is outstanding, whether or not anything has bound.
+	//
+	// The check below is therefore defence in depth rather than the primary
+	// defence, and it is worth keeping as exactly that: Bind compares against the
+	// provider the node REGISTERED, so it holds even if a mismatch reaches the
+	// ledger by some route that is not re-registration.
+	if err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx,
+			`UPDATE nodes SET provider = ? WHERE name = ?`, config.ProviderTart, "shapeshifter")
+
+		return err
+	}); err != nil {
+		t.Fatalf("seed the backend change: %v", err)
 	}
 
 	if err := a.Bind(ctx, lease.ID, lease.Epoch, "shapeshifter"); !errors.Is(err, ErrWrongProvider) {

@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 
 	"github.com/junioryono/billet/internal/config"
 )
@@ -176,13 +178,25 @@ func (a *Allocator) usageOn(ctx context.Context, tx *sql.Tx, node string) (Usage
 	return u, nil
 }
 
-// Stranded reports which of these leases are aimed at a machine that is no
-// longer live.
+// Stranded reports which of these leases their target machine can no longer
+// honour — because it is gone, or because it is no longer big enough.
 //
 // FOR CAPACITY THAT HAS BEEN ADVERTISED BUT NOT USED. A listener holds escrow
-// and tells GitHub about it; if the host those reservations name goes away, the
-// number is a promise nothing can keep, and the listener only ever ADDS to it.
-// These are the ones it can safely take back.
+// and tells GitHub about it; if the host those reservations name cannot keep
+// them, the number is a promise nothing will honour, and the listener only ever
+// ADDS to it. These are the ones it can safely take back.
+//
+// TWO WAYS TO BE STRANDED, and only the first was handled. A host that
+// DISAPPEARS is the obvious one. A host that SHRINKS is the same failure with a
+// quieter cause: capacity is deliberately overwritten on re-registration, so an
+// operator who halves node.max_vcpu and restarts leaves the ledger recording a
+// machine smaller than the escrow already aimed at it. It stays perfectly live,
+// so a liveness question returns nothing, and billet goes on advertising slots
+// that will fail to launch on arrival.
+//
+// ONLY THE EXCESS. Shedding every lease on an overcommitted host would give back
+// capacity it can still honour, and the listener would immediately re-escrow it
+// — advertisement flapping once per poll for as long as the host stayed small.
 //
 // A lease with no target is NOT stranded. Every reservation names a machine now,
 // so an empty target is a row from before that was true — and guessing that such
@@ -198,19 +212,25 @@ func (a *Allocator) Stranded(ctx context.Context, ids []string) ([]string, error
 	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
 		out = out[:0]
 
+		// Candidates that survive the liveness question, grouped by the host they
+		// are aimed at, so the overcommit below is measured per machine.
+		onNode := make(map[string][]strandedCandidate)
+
 		for _, id := range ids {
 			var (
 				target sql.NullString
 				live   sql.NullBool
+				c      = strandedCandidate{id: id}
+				mem    int64
 			)
 
 			// LEFT JOIN, because a target naming a host the ledger has never heard
 			// of is the same situation as one it has forgotten: there is nowhere for
 			// that reservation to go.
 			err := tx.QueryRowContext(ctx,
-				`SELECT l.target_node, n.live
+				`SELECT l.target_node, l.vcpu, l.memory, n.live
 				   FROM leases l LEFT JOIN nodes n ON n.name = l.target_node
-				  WHERE l.id = ?`, id).Scan(&target, &live)
+				  WHERE l.id = ?`, id).Scan(&target, &c.vcpu, &mem, &live)
 
 			switch {
 			case errors.Is(err, sql.ErrNoRows):
@@ -226,16 +246,145 @@ func (a *Allocator) Stranded(ctx context.Context, ids []string) ([]string, error
 
 			if !live.Valid || !live.Bool {
 				out = append(out, id)
+
+				continue
 			}
+
+			c.memory = config.ByteSize(mem)
+			onNode[target.String] = append(onNode[target.String], c)
 		}
 
-		return nil
+		return a.shedOvercommit(ctx, tx, onNode, &out)
 	})
 	if err != nil {
 		return nil, err
 	}
 
 	return out, nil
+}
+
+// strandedCandidate is a held reservation on a live host, and what it costs that
+// host if it stays.
+type strandedCandidate struct {
+	id     string
+	vcpu   int
+	memory config.ByteSize
+}
+
+// shedOvercommit adds enough of each host's candidates to the stranded list to
+// bring it back inside what it now says it has.
+//
+// THE FEWEST LEASES THAT SETTLE IT, because every one shed is a slot billet
+// stops advertising: giving back two where one would have done costs GitHub two
+// jobs' worth of capacity to recover the same room.
+//
+// SCORED AGAINST WHAT IS STILL MISSING, not against a fixed dimension. A host
+// runs out of vCPU and memory independently, so no single ordering is right for
+// both: the widest lease by vCPU may free almost no memory, and a machine short
+// of one fat reservation would shed several slim ones first, none of which were
+// the problem. Worse when BOTH are short — leading by either one can take a
+// lease that settles half the deficit and then have to take the other anyway.
+//
+// So each step asks what fraction of the REMAINING shortfall a candidate covers,
+// in both dimensions at once, and takes the best answer. A lease that settles
+// everything by itself always outscores one that settles half. The deficits
+// shrink as leases are taken, so the question is re-asked each time rather than
+// answered once up front.
+//
+// The id breaks ties, because Go map iteration is randomised and an
+// advertisement that depends on iteration order cannot be reproduced from a log.
+//
+// IT SEES ONLY ONE LISTENER'S LEASES, and that is safe in the direction that
+// matters. Each tier asks about its own escrow, so a host overcommitted across
+// several tiers may be trimmed by more than one of them and give back a little
+// too much. Over-shedding costs a re-escrow on the next poll; under-shedding
+// leaves billet advertising a slot that will fail on arrival. It also converges:
+// the second caller measures the ledger the first one already corrected.
+func (a *Allocator) shedOvercommit(
+	ctx context.Context, tx *sql.Tx, onNode map[string][]strandedCandidate, out *[]string,
+) error {
+	nodes := make([]string, 0, len(onNode))
+	for name := range onNode {
+		nodes = append(nodes, name)
+	}
+
+	slices.Sort(nodes)
+
+	for _, name := range nodes {
+		var total nodeRow
+
+		if err := tx.QueryRowContext(ctx,
+			`SELECT total_vcpu, total_memory FROM nodes WHERE name = ?`, name).
+			Scan(&total.vcpu, &total.memory); err != nil {
+			return fmt.Errorf("alloc: read the size of node %s: %w", name, err)
+		}
+
+		used, err := a.usageOn(ctx, tx, name)
+		if err != nil {
+			return err
+		}
+
+		overVCPU := used.VCPU - total.vcpu
+		overMemory := used.Memory - total.memory
+
+		if overVCPU <= 0 && overMemory <= 0 {
+			continue
+		}
+
+		// BY ID FIRST, so that when two candidates score identically — the common
+		// case, since a tier's leases are all the same shape — the one taken is
+		// the same on every run.
+		candidates := slices.Clone(onNode[name])
+		slices.SortFunc(candidates, func(x, y strandedCandidate) int {
+			return strings.Compare(x.id, y.id)
+		})
+
+		for len(candidates) > 0 && (overVCPU > 0 || overMemory > 0) {
+			best := 0
+
+			for i := 1; i < len(candidates); i++ {
+				if candidates[i].covers(overVCPU, overMemory) >
+					candidates[best].covers(overVCPU, overMemory) {
+					best = i
+				}
+			}
+
+			c := candidates[best]
+			candidates = slices.Delete(candidates, best, best+1)
+
+			*out = append(*out, c.id)
+			overVCPU -= c.vcpu
+			overMemory -= c.memory
+		}
+	}
+
+	return nil
+}
+
+// covers is how much of a host's remaining shortfall this reservation would
+// settle: the fraction of each deficit it closes, added together.
+//
+// A FRACTION RATHER THAN AN AMOUNT, because vCPU and bytes cannot be added.
+// Normalising each dimension by what is still missing makes them comparable and
+// says the useful thing directly — a lease that closes a deficit entirely scores
+// 1 for it, whether that deficit is 2 vCPU or 200 GiB — so a candidate that
+// settles both dimensions outscores every candidate that settles one.
+//
+// Surplus does not count. A 200 GiB reservation against a 10 GiB shortfall is
+// worth exactly as much as a 10 GiB one, and letting it score higher would take
+// back far more than the host needed.
+func (c strandedCandidate) covers(overVCPU int, overMemory config.ByteSize) float64 {
+	score := 0.0
+
+	if overVCPU > 0 {
+		score += float64(min(c.vcpu, overVCPU)) / float64(overVCPU)
+	}
+
+	if overMemory > 0 {
+		score += float64(min(c.memory, overMemory)) / float64(overMemory)
+	}
+
+	return score
 }
 
 // liveNodes lists every reachable host, whatever any tier can use.
