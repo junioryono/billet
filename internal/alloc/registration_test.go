@@ -1,6 +1,7 @@
 package alloc
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -94,15 +95,89 @@ func TestAHostMayContributeLessThanItDidBefore(t *testing.T) {
 		t.Fatalf("re-registering smaller: %v", err)
 	}
 
-	var vcpu int
+	// BOTH FIELDS, because they are written by one statement and only one of them
+	// was being read. An UPSERT that updated the cores and dropped the memory
+	// clause passed this test while leaving the ledger describing a machine that
+	// does not exist.
+	var (
+		vcpu   int
+		memory int64
+	)
+
 	if err := a.db.Reader().QueryRowContext(t.Context(),
-		`SELECT total_vcpu FROM nodes WHERE name = ?`, first.Name).Scan(&vcpu); err != nil {
+		`SELECT total_vcpu, total_memory FROM nodes WHERE name = ?`, first.Name).
+		Scan(&vcpu, &memory); err != nil {
 		t.Fatalf("read the node back: %v", err)
 	}
 
 	if vcpu != second.VCPU {
 		t.Errorf("total_vcpu = %d, want %d — the new contribution did not replace the old",
 			vcpu, second.VCPU)
+	}
+
+	if config.ByteSize(memory) != second.Memory {
+		t.Errorf("total_memory = %s, want %s — the new contribution did not replace the old",
+			config.ByteSize(memory), second.Memory)
+	}
+}
+
+// A HOST DOES NOT MOVE WHILE IT IS RUNNING WORK.
+//
+// The same rule as a backend change and for the same reason: the leases bound
+// here recorded where they are, and a machine that re-registers somewhere else
+// relabels compute that has not gone anywhere. Site is where a cache lives, so
+// the ledger would start pointing later placements at storage in a different
+// building from the containers already running.
+func TestAHostMayNotMoveSiteWhileWorkIsBoundToIt(t *testing.T) {
+	// The node runs docker, so the tier must accept docker or Bind refuses on the
+	// provider before it can reach the site check this test is about.
+	small := tier("small", 4, 16*config.GiB)
+	small.Provider = config.ProviderDocker
+
+	a := newAllocator(t, Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB}, []config.Tier{small})
+
+	home := NodeRegistration{
+		Name: "epyc-1", Provider: config.ProviderDocker, Site: "home",
+		VCPU: 120, Memory: 480 * config.GiB,
+	}
+	if err := a.RegisterNode(t.Context(), home); err != nil {
+		t.Fatalf("RegisterNode: %v", err)
+	}
+
+	// An unbound host moves freely; it is the binding that pins it.
+	moved := home
+	moved.Site = "aws"
+
+	if err := a.RegisterNode(t.Context(), moved); err != nil {
+		t.Fatalf("an idle host was not allowed to move: %v", err)
+	}
+
+	if err := a.RegisterNode(t.Context(), home); err != nil {
+		t.Fatalf("moving back: %v", err)
+	}
+
+	lease, err := a.Reserve(t.Context(), "small")
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	if err := a.Bind(t.Context(), lease.ID, lease.Epoch, home.Name); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	err = a.RegisterNode(t.Context(), moved)
+	if err == nil {
+		t.Fatal("a host moved site while a lease was still bound to it")
+	}
+
+	if !errors.Is(err, ErrWrongSite) {
+		t.Errorf("want ErrWrongSite, got %v", err)
+	}
+
+	// The way back has to be in the message: this fires at startup, so an
+	// operator who edited node.site finds billet refusing to boot.
+	if !strings.Contains(err.Error(), "home") {
+		t.Errorf("the refusal does not say what to put the site back to: %v", err)
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -55,6 +56,10 @@ func register(t *testing.T, p *Plane, name string, provider config.ProviderKind)
 		Node:       name,
 		Provider:   provider,
 		Deployment: deployment,
+		// What this host contributes. The plane refuses a registration offering
+		// nothing, so every test node has to say something.
+		VCPU:   8,
+		Memory: 32 * config.GiB,
 	}); err != nil {
 		t.Fatalf("register %s: %v", name, err)
 	}
@@ -276,13 +281,36 @@ func TestAVersionMismatchIsRefused(t *testing.T) {
 
 	p := testPlane(t)
 
-	_, err := p.Register(t.Context(), nodeapi.RegisterRequest{
-		Version:    nodeapi.Version + 1,
-		Node:       "n1",
-		Deployment: deployment,
-	})
-	if err == nil {
-		t.Fatal("a node speaking a different protocol version was accepted")
+	// BOTH DIRECTIONS, AND ONE OF THEM IS THE REAL CASE. A node OLDER than the
+	// server is what actually happens during a rolling upgrade — version 1
+	// reports no capacity and no site — while a newer node is the rarer reverse.
+	// Testing only Version+1 left the case an operator will actually hit
+	// unasserted.
+	for _, version := range []int{1, nodeapi.Version + 1} {
+		_, err := p.Register(t.Context(), nodeapi.RegisterRequest{
+			Version:    version,
+			Node:       "n1",
+			Deployment: deployment,
+			VCPU:       8,
+			Memory:     32 * config.GiB,
+		})
+		if err == nil {
+			t.Fatalf("a node speaking protocol version %d was accepted", version)
+		}
+
+		// PERMANENT, which is the half that matters. A node retries anything that
+		// might heal; this cannot, so a refusal reported as an outage would have
+		// the node reconnecting forever instead of telling somebody to upgrade.
+		if !errors.Is(err, ErrRefused) {
+			t.Errorf("version %d was not refused permanently: %v", version, err)
+		}
+
+		// The diagnostic has to name both numbers, because "upgrade whichever is
+		// older" is not actionable without knowing which one that is.
+		if !strings.Contains(err.Error(), strconv.Itoa(version)) ||
+			!strings.Contains(err.Error(), strconv.Itoa(nodeapi.Version)) {
+			t.Errorf("the refusal does not name both versions: %v", err)
+		}
 	}
 }
 
@@ -746,6 +774,8 @@ func TestAQueuedCommandIsNotGivenToASupersededProcess(t *testing.T) {
 		Node:        "n1",
 		Provider:    config.ProviderDocker,
 		Deployment:  deployment,
+		VCPU:        8,
+		Memory:      32 * config.GiB,
 		Incarnation: "first",
 	}); err != nil {
 		t.Fatalf("register: %v", err)
@@ -772,6 +802,8 @@ func TestAQueuedCommandIsNotGivenToASupersededProcess(t *testing.T) {
 		Node:        "n1",
 		Provider:    config.ProviderDocker,
 		Deployment:  deployment,
+		VCPU:        8,
+		Memory:      32 * config.GiB,
 		Incarnation: "second",
 	}); err != nil {
 		t.Fatalf("re-register: %v", err)
@@ -883,6 +915,8 @@ func deliverLaunch(t *testing.T) (*Plane, nodeapi.Command) {
 		Node:        "n1",
 		Provider:    config.ProviderDocker,
 		Deployment:  deployment,
+		VCPU:        8,
+		Memory:      32 * config.GiB,
 		Incarnation: "first",
 	}); err != nil {
 		t.Fatalf("register: %v", err)
@@ -934,6 +968,8 @@ func TestRegistrationPrunesOwnershipTheLedgerHasEnded(t *testing.T) {
 		Node:        "n1",
 		Provider:    config.ProviderDocker,
 		Deployment:  deployment,
+		VCPU:        8,
+		Memory:      32 * config.GiB,
 		Incarnation: "first",
 	}); err != nil {
 		t.Fatalf("register: %v", err)
@@ -1001,6 +1037,8 @@ func TestASupersessionDuringADestroyIsNotAConfirmation(t *testing.T) {
 		Node:        "n1",
 		Provider:    config.ProviderDocker,
 		Deployment:  deployment,
+		VCPU:        8,
+		Memory:      32 * config.GiB,
 		Incarnation: "second",
 	}); err != nil {
 		t.Fatalf("re-register: %v", err)
@@ -1085,6 +1123,8 @@ func TestALateDestroyResultFromTheOwnerEndsItsOwnership(t *testing.T) {
 		Node:        "n1",
 		Provider:    config.ProviderDocker,
 		Deployment:  deployment,
+		VCPU:        8,
+		Memory:      32 * config.GiB,
 		Incarnation: "second",
 	}); err != nil {
 		t.Fatalf("re-register: %v", err)
@@ -1176,6 +1216,8 @@ func TestAnEmptySnapshotStillPrunesAdoptedOwnership(t *testing.T) {
 		Node:        "n1",
 		Provider:    config.ProviderDocker,
 		Deployment:  deployment,
+		VCPU:        8,
+		Memory:      32 * config.GiB,
 		Incarnation: "first",
 	}); err != nil {
 		t.Fatalf("register: %v", err)
@@ -1213,7 +1255,9 @@ func TestALateDestroyFromANonOwnerDoesNotEndOwnership(t *testing.T) {
 	// B takes the name and the destroy.
 	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
 		Version: nodeapi.Version, Node: "n1", Provider: config.ProviderDocker,
-		Deployment: deployment, Incarnation: "second",
+		Deployment: deployment,
+		VCPU:       8,
+		Memory:     32 * config.GiB, Incarnation: "second",
 	}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
@@ -1248,7 +1292,9 @@ func TestALateDestroyFromANonOwnerDoesNotEndOwnership(t *testing.T) {
 	// C supersedes B, tombstoning B's in-flight destroy.
 	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
 		Version: nodeapi.Version, Node: "n1", Provider: config.ProviderDocker,
-		Deployment: deployment, Incarnation: "third",
+		Deployment: deployment,
+		VCPU:       8,
+		Memory:     32 * config.GiB, Incarnation: "third",
 	}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
@@ -1281,7 +1327,9 @@ func TestOnlyLaunchesAndDestroysAreTombstoned(t *testing.T) {
 
 	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
 		Version: nodeapi.Version, Node: "n1", Provider: config.ProviderDocker,
-		Deployment: deployment, Incarnation: "first",
+		Deployment: deployment,
+		VCPU:       8,
+		Memory:     32 * config.GiB, Incarnation: "first",
 	}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
@@ -1327,6 +1375,8 @@ func TestADestroyIsNotConfirmedByTheWrongProcess(t *testing.T) {
 		Node:        "n1",
 		Provider:    config.ProviderDocker,
 		Deployment:  deployment,
+		VCPU:        8,
+		Memory:      32 * config.GiB,
 		Incarnation: "second",
 	}); err != nil {
 		t.Fatalf("re-register: %v", err)

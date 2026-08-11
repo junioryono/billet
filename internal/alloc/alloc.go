@@ -118,6 +118,10 @@ var (
 	// ErrWrongProvider means the node runs a different compute backend than the
 	// lease requires — a Firecracker lease cannot run on a Tart host.
 	ErrWrongProvider = errors.New("alloc: node runs a different provider")
+	// ErrWrongSite means a host reported a different location while it still has
+	// work bound to it there. Distinct from ErrWrongProvider because the fix is
+	// different: one is a backend change, the other is a machine that moved.
+	ErrWrongSite = errors.New("alloc: node reports a different site")
 	// ErrNotPlaced means a lease reached a phase that presumes a host without
 	// ever being bound to one.
 	ErrNotPlaced = errors.New("alloc: lease has no bound node")
@@ -1123,14 +1127,41 @@ func (a *Allocator) RegisterNode(ctx context.Context, reg NodeRegistration) erro
 		//
 		// So this is refused, and the operator's route is the honest one — drain
 		// the host, then re-register it. An unbound node changes freely.
-		var current string
+		var current, currentSite string
 
 		switch err := tx.QueryRowContext(ctx,
-			`SELECT provider FROM nodes WHERE name = ?`, name).Scan(&current); {
+			`SELECT provider, site FROM nodes WHERE name = ?`, name).Scan(&current, &currentSite); {
 		case errors.Is(err, sql.ErrNoRows):
 			// First registration; nothing to contradict.
 		case err != nil:
 			return fmt.Errorf("alloc: read node %s: %w", name, err)
+
+		// A HOST DOES NOT MOVE WHILE IT IS RUNNING WORK, for the same reason it
+		// may not change its backend: the leases bound here recorded where they
+		// are, and a machine that re-registers somewhere else relabels compute
+		// that has not gone anywhere. Site is where a cache lives, so the ledger
+		// would then be pointing later placements at storage in a different
+		// building from the containers already running.
+		//
+		// Capacity is different and IS overwritten below. A host offering less has
+		// been reconfigured, which changes nothing about work already placed.
+		case currentSite != reg.Site:
+			var bound int
+
+			if err := tx.QueryRowContext(ctx,
+				`SELECT COUNT(*) FROM leases WHERE node = ? AND phase NOT IN ('done','failed')`,
+				name).Scan(&bound); err != nil {
+				return fmt.Errorf("alloc: count the leases on node %s: %w", name, err)
+			}
+
+			if bound > 0 {
+				return fmt.Errorf(
+					"%w: node %s is recorded at site %q and now reports %q, but %d lease(s) are "+
+						"still bound to it there. Put node.site back to %q and start billet; once "+
+						"those jobs finish (or their leases expire and are reaped) the host is "+
+						"free to move",
+					ErrWrongSite, name, currentSite, reg.Site, bound, currentSite)
+			}
 
 		case current != string(kind):
 			var bound int

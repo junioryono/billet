@@ -422,6 +422,21 @@ func (p *Plane) Register(
 			ErrRefused, req.Node, req.Deployment, p.deployment)
 	}
 
+	// REFUSED HERE, PERMANENTLY, rather than by the ledger. The allocator also
+	// rejects a contribution of nothing — it has to, because --dev registers
+	// without passing through this function — but an error from the registrar is
+	// treated as an OUTAGE below and answered 503, so the node retries. A node
+	// whose config offers no capacity would then retry forever, every backoff,
+	// and nothing in the loop would ever say why. Observed doing exactly that in
+	// the end-to-end suite: 50ms apart, indefinitely.
+	if req.VCPU <= 0 || req.Memory <= 0 {
+		return nodeapi.RegisterResponse{}, fmt.Errorf(
+			"%w: node %q contributes %d vcpu and %s of memory; a host that offers nothing "+
+				"can never be given work, so set node.max_vcpu and node.max_memory or leave "+
+				"them unset to contribute what the machine has",
+			ErrRefused, req.Node, req.VCPU, req.Memory)
+	}
+
 	// REFUSED RATHER THAN RECORDED, because a site nobody declared is
 	// indistinguishable afterwards from a real one. A typo becomes a place of a
 	// single machine, with a cache of its own that is always empty, and every job

@@ -36,6 +36,17 @@ type fakeRegistrar struct {
 	mu       sync.Mutex
 	err      error
 	accepted []string
+	// last is the whole registration, so a wire test can prove the fields
+	// actually arrived rather than only that a name did.
+	last alloc.NodeRegistration
+}
+
+// lastRegistration is what the plane most recently handed the ledger.
+func (f *fakeRegistrar) lastRegistration() alloc.NodeRegistration {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return f.last
 }
 
 func (f *fakeRegistrar) RegisterNode(_ context.Context, reg alloc.NodeRegistration) error {
@@ -49,6 +60,7 @@ func (f *fakeRegistrar) RegisterNode(_ context.Context, reg alloc.NodeRegistrati
 	}
 
 	f.accepted = append(f.accepted, name)
+	f.last = reg
 
 	return nil
 }
@@ -497,7 +509,8 @@ func TestUnknownFieldsAreRefused(t *testing.T) {
 	// empty — so deleting DisallowUnknownFields left it green, and the check it
 	// existed to guard was unprotected.
 	valid := fmt.Sprintf(
-		`{"version":%d,"node":"n1","provider":"docker","deployment":%q}`,
+		`{"version":%d,"node":"n1","provider":"docker","deployment":%q,`+
+			`"vcpu":8,"memory":34359738368}`,
 		nodeapi.Version, deployment)
 
 	accepted, err := postRaw(t, srv.URL+"/v1/register", valid)

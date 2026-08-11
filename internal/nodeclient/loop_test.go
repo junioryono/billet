@@ -276,6 +276,9 @@ func runLoop(t *testing.T, c *nodeclient.Client, compute nodeclient.Compute) {
 		// cancellation. Asserting anything else would assert the test's own
 		// teardown.
 		err := nodeclient.Run(ctx, c, compute, nodeclient.LoopOptions{
+			// What this host contributes; the control plane refuses a node offering none.
+			VCPU:       testNodeVCPU,
+			Memory:     testNodeMemory,
 			Provider:   config.ProviderDocker,
 			GuestOS:    []config.GuestOS{config.GuestLinux},
 			Deployment: deployment,
@@ -555,6 +558,9 @@ func TestTheCustodyJanitorDoesNotOutliveTheLoop(t *testing.T) {
 		defer close(done)
 
 		err := nodeclient.Run(ctx, c, compute, nodeclient.LoopOptions{
+			// What this host contributes; the control plane refuses a node offering none.
+			VCPU:       testNodeVCPU,
+			Memory:     testNodeMemory,
 			Provider:   config.ProviderDocker,
 			Deployment: deployment,
 			Log:        slog.New(slog.DiscardHandler),
@@ -818,6 +824,9 @@ func TestCustodyIsAdvancedOnTheSweepCadence(t *testing.T) {
 		defer wg.Done()
 
 		err := nodeclient.Run(ctx, c, compute, nodeclient.LoopOptions{
+			// What this host contributes; the control plane refuses a node offering none.
+			VCPU:       testNodeVCPU,
+			Memory:     testNodeMemory,
 			Provider:   config.ProviderDocker,
 			Deployment: deployment,
 			Log:        slog.New(slog.DiscardHandler),
@@ -856,6 +865,9 @@ func TestASupersededNodeDrainsBeforeStopping(t *testing.T) {
 
 	go func() {
 		done <- nodeclient.Run(t.Context(), c, compute, nodeclient.LoopOptions{
+			// What this host contributes; the control plane refuses a node offering none.
+			VCPU:       testNodeVCPU,
+			Memory:     testNodeMemory,
 			Provider:   config.ProviderDocker,
 			Deployment: deployment,
 			Log:        slog.New(slog.DiscardHandler),
@@ -936,6 +948,9 @@ func TestANodeThatIsRefusedStops(t *testing.T) {
 	go func() {
 		// A deployment identity this control plane will never accept.
 		done <- nodeclient.Run(t.Context(), c, &fakeCompute{}, nodeclient.LoopOptions{
+			// What this host contributes; the control plane refuses a node offering none.
+			VCPU:       testNodeVCPU,
+			Memory:     testNodeMemory,
 			Provider:   config.ProviderDocker,
 			Deployment: "ffffffffffffffffffffffffffffffff",
 			Log:        slog.New(slog.DiscardHandler),
