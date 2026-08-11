@@ -558,7 +558,12 @@ func runServer(ctx context.Context, lc *lifecycle, cfg *config.Config, dryRun, d
 	// nothing to guard: an empty fleet answers every request with "I do not know
 	// you".
 	nodes := nodeplane.New(slog.Default(), deployment, allocator.LeaseTTL(),
-		nodeplane.WithRegistrar(allocator))
+		nodeplane.WithRegistrar(allocator),
+		// The declared places, so a node claiming one nobody declared is refused
+		// here rather than recorded. A node's own config cannot make this check —
+		// sites are the control plane's to declare and the node's file has no
+		// reason to list them.
+		nodeplane.WithSites(cfg.SiteNames()))
 
 	stopWire, err := serveNodeWire(ctx, cfg, owner, nodes, allocator, wiring.NodeJIT{Client: client})
 	if err != nil {

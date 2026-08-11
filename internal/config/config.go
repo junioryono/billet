@@ -1709,6 +1709,19 @@ func (c *Config) macOSLimitReason(node string) string {
 		DefaultMacOSVMLimit, node)
 }
 
+// SiteNames lists the places this deployment declares.
+//
+// For the node wire, which is where a REMOTE node's claim to be somewhere is
+// checked — the node's own config cannot answer that question.
+func (c *Config) SiteNames() []string {
+	out := make([]string, 0, len(c.Sites))
+	for _, s := range c.Sites {
+		out = append(out, s.Name)
+	}
+
+	return out
+}
+
 // validateSites checks the declared places, and everything that refers to one.
 //
 // FAIL CLOSED ON A NAME THAT WAS NEVER DECLARED, which is the whole reason a
@@ -1742,13 +1755,16 @@ func (c *Config) validateSites() []error {
 		declared[name] = true
 	}
 
-	// NAMED WITH NO BLOCK IS A TYPO, NOT AN OPT-OUT. Sites are optional and a
-	// single-machine deployment never writes one — but an operator who wrote a
-	// site meant something by it, and silently ignoring the field helps nobody.
-	if c.Node != nil {
-		errs = append(errs, siteRefError("node.site", c.Node.Site, declared)...)
-	}
-
+	// NODE.SITE IS NOT CHECKED HERE, and that is not an omission.
+	//
+	// This file may be the NODE's, on another machine, where a sites block has no
+	// reason to exist — sites are the control plane's to declare. Checking it
+	// against a local block would refuse exactly the deployment this feature is
+	// for: a node that correctly names one of the server's places, in a config
+	// that has never heard of them.
+	//
+	// The claim is checked where the answer lives, when the node registers. See
+	// nodeplane.WithSites.
 	for i := range c.Tiers {
 		errs = append(errs, siteRefError(
 			fmt.Sprintf("tiers[%d] (%s): site", i, c.Tiers[i].Label),
