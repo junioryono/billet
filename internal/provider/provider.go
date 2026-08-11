@@ -135,6 +135,20 @@ type Spec struct {
 	// ways that look like unrelated crashes.
 	SHM config.ByteSize
 
+	// Command starts the runner inside the instance.
+	//
+	// REQUIRED, and backends refuse an empty one, for the same reason Trust's zero
+	// value is refused: the alternative is not a failure but a SUCCESS that does
+	// nothing. A container image's default command is usually a shell, so
+	// launching without this starts a container that exits immediately — the CLI
+	// reports success, billet logs a started runner, and the job sits queued
+	// forever. Found on the first job billet was ever given.
+	//
+	// A []string rather than a string so no backend has to guess at word
+	// splitting, and so an image needing arguments does not have to smuggle them
+	// through a shell.
+	Command []string
+
 	// Trust is how much this workload is trusted. The zero value is UNKNOWN and
 	// backends refuse it, which is what makes an unclassified job impossible to
 	// route somewhere weak by omission rather than by decision.
