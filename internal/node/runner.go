@@ -94,6 +94,15 @@ type Runner struct {
 	// handing back capacity that something may still be using.
 	custody map[string]*custody
 
+	// launching holds leases whose compute is being created right now.
+	//
+	// SEPARATE FROM custody because it means something different: custody is
+	// compute billet cannot account for, and this is compute it is deliberately
+	// creating. They are renewed identically and for the same reason — something
+	// has to hold the lease while nobody else can — but an entry here is expected
+	// to disappear within one launch, and an entry in custody is a problem.
+	launching map[string]*custody
+
 	// now is time.Now, replaceable so a test can age a custody entry without
 	// sleeping.
 	now func() time.Time
@@ -117,6 +126,10 @@ type Runner struct {
 	tiers map[string]config.Tier
 
 	mu sync.Mutex
+	// runningLease is the lease each running request holds, kept because renewing
+	// or releasing one needs its epoch and the instance name carries only the id.
+	runningLease map[int64]*alloc.Lease
+
 	// running maps a request to what was started for it, which is the only way
 	// Destroy knows what to remove.
 	running map[int64]*provider.Instance
@@ -170,11 +183,12 @@ func New(
 		now:      time.Now,
 		ttl:      a.LeaseTTL,
 
-		maxCustody: DefaultMaxCustody,
-		log:        log,
-		tiers:      byLabel,
-		running:    make(map[int64]*provider.Instance),
-		sets:       make(map[string]int),
+		maxCustody:   DefaultMaxCustody,
+		log:          log,
+		tiers:        byLabel,
+		running:      make(map[int64]*provider.Instance),
+		runningLease: make(map[int64]*alloc.Lease),
+		sets:         make(map[string]int),
 	}
 
 	for _, opt := range opts {
@@ -254,6 +268,22 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job Job) error 
 	if err := r.alloc.Advance(ctx, lease.ID, lease.Epoch, alloc.PhaseLaunching); err != nil {
 		return fmt.Errorf("node: mark lease %s launching: %w", lease.ID, err)
 	}
+
+	// RENEWED FROM THE MOMENT THE LEASE SAYS "LAUNCHING", not from the moment the
+	// provider is called. Everything between those two points is a REMOTE call —
+	// resolving the scale set, minting a registration — and each can block for as
+	// long as GitHub takes. The plane gives up on an unanswered command after its
+	// timeout and tells the listener the node has custody, which stops the
+	// listener heartbeating; if the node has not started renewing yet, the lease
+	// has no owner for the whole of that window and its capacity is resold before
+	// the container even exists.
+	//
+	// The hold was placed just above provider.Launch first, which closed the long
+	// half of the gap and left the remote half open. The transition above is the
+	// right anchor: it is the first moment the ledger says this node is doing
+	// something with the lease.
+	stopHolding := r.holdWhileLaunching(lease, provider.InstanceName(lease.ID))
+	defer stopHolding()
 
 	setID, err := r.scaleSetID(ctx, tier)
 	if err != nil {
@@ -362,6 +392,11 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job Job) error 
 
 	r.mu.Lock()
 	r.running[job.RequestID] = inst
+	// THE LEASE IS KEPT WITH THE INSTANCE, because renewing or releasing it needs
+	// the epoch and the instance name carries only the id. It is needed exactly
+	// once — when this process is superseded and everything it is running becomes
+	// compute nobody else can account for.
+	r.runningLease[job.RequestID] = lease
 	r.mu.Unlock()
 
 	r.log.Info("started a runner",
@@ -417,6 +452,7 @@ func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
 
 	r.mu.Lock()
 	delete(r.running, requestID)
+	delete(r.runningLease, requestID)
 	r.mu.Unlock()
 
 	return nil
@@ -587,13 +623,60 @@ func (r *Runner) Recover(ctx context.Context) error {
 // hand the capacity back, and let a listener advertise it while the container
 // carried on running.
 func (r *Runner) takeCustody(ctx context.Context, lease *alloc.Lease, inst *provider.Instance) error {
-	if err := r.alloc.Heartbeat(ctx, lease.ID, lease.Epoch); err != nil {
-		return fmt.Errorf("node: renew the lease of adopted instance %s: %w", inst.Name, err)
-	}
-
+	// RECORDED FIRST, RENEWED SECOND, and the order is the whole correctness of
+	// custody across a network.
+	//
+	// It used to heartbeat first and adopt only on success, which meant a renewal
+	// that failed left NOTHING holding the lease. That is survivable in-process,
+	// where the failure is a database blip and the caller still has the lease.
+	// Over a wire it is the common case: the same outage that lost the launch
+	// report loses this heartbeat too, and a node that has just been forgotten by
+	// a restarted control plane will have it refused outright — which is exactly
+	// the situation custody exists for.
+	//
+	// Recording locally first means the janitor OWNS the lease from this moment
+	// and keeps retrying renewal on its own clock. A fenced or missing lease is
+	// then discovered by Tend, which destroys the compute rather than leaving it
+	// running against capacity somebody else now holds.
 	r.adopt(lease, inst)
 
+	if err := r.alloc.Heartbeat(ctx, lease.ID, lease.Epoch); err != nil {
+		return fmt.Errorf("node: renew the lease of adopted instance %s (it is held in custody "+
+			"regardless, and renewal will be retried): %w", inst.Name, err)
+	}
+
 	return nil
+}
+
+// AssumeCustody takes responsibility for a lease whose launch SUCCEEDED but
+// whose outcome the caller could not deliver.
+//
+// EXISTS BECAUSE THE SPLIT CREATED A GAP IN-PROCESS OPERATION CANNOT HAVE. When
+// the runner and the listener share a process, a successful launch is reported
+// by returning nil and the listener keeps heartbeating the lease. Over a wire
+// the report can be lost: the control plane times the command out and must
+// assume custody — the only safe reading of silence — and stops heartbeating,
+// because custody means the node is holding it. Meanwhile the node believes it
+// merely launched something, so nothing renews the lease and the reaper releases
+// capacity that a container is still using.
+//
+// The handoff has to be CAUSAL rather than hopeful, so the party that failed to
+// report is the party that takes custody. Idempotent: adopting a lease already
+// held simply refreshes it.
+func (r *Runner) AssumeCustody(ctx context.Context, lease *alloc.Lease, requestID int64) error {
+	r.mu.Lock()
+	inst, ok := r.running[requestID]
+	r.mu.Unlock()
+
+	if !ok {
+		// Nothing is running for this request, so there is nothing to hold — which
+		// is what a launch that genuinely failed looks like. The control plane
+		// releasing the lease is then correct, and claiming custody would strand
+		// the capacity instead.
+		return nil
+	}
+
+	return r.takeCustody(ctx, lease, inst)
 }
 
 // Sweep destroys instances whose lease is no longer open on this node.

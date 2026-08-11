@@ -12,7 +12,7 @@ COVERPROFILE     := coverage.out
 .DEFAULT_GOAL := check
 
 .PHONY: check
-check: build vet fmt-check lint test ## The pre-commit gate (CI runs this and more)
+check: no-mutants build vet fmt-check lint test ## The pre-commit gate (CI runs this and more)
 
 .PHONY: build
 build: ## Build ./bin/billet
@@ -24,14 +24,40 @@ vet:
 	go vet ./...
 
 .PHONY: test
-test: ## Race-enabled test run
-	go test -race -count=1 ./...
+test: ## Race-enabled test run, instrumented exactly as CI runs it
+	# COVERAGE INSTRUMENTATION IS PART OF THE GATE, not an extra. CI runs the
+	# suite with -covermode=atomic, and that is not the same test run: the
+	# counters change timing enough to reorder goroutines the plain -race build
+	# happens to schedule one way every time.
+	#
+	# This is not hypothetical. A launch still in progress was being handed to
+	# teardown — it carries no outcome, so the release failed with `invalid phase
+	# transition: "" is not terminal` — and the bug was invisible here while being
+	# reliable under coverage. A local gate that is weaker than CI trains you to
+	# trust it and then be surprised.
+	go test -race -count=1 -covermode=atomic -coverprofile=$(COVERPROFILE) ./...
 
 .PHONY: cover
 cover: ## Coverage profile + HTML report
 	go test -race -count=1 -coverprofile=$(COVERPROFILE) -covermode=atomic ./...
 	go tool cover -func=$(COVERPROFILE) | tail -1
 	go tool cover -html=$(COVERPROFILE)
+
+.PHONY: no-mutants
+no-mutants: ## Refuse to proceed while a killed mutation run has left a mutant on disk
+	@# FIRST in `check`, unlike tests-kept, because this one cannot be a false
+	@# alarm: a `.bak` beside a tracked file means an interrupted mutation run
+	@# left the ORIGINAL holding a mutant. It compiles and mostly passes, so
+	@# every other gate is happy to tell you so.
+	python3 scripts/check-no-mutants.py
+
+.PHONY: tests-kept
+tests-kept: ## Report Test functions that HEAD has and the working tree does not
+	@# NOT part of `check`, because deleting a test is sometimes right and this
+	@# cannot tell. It is for scripted edits to _test.go files, where a replaced
+	@# range can swallow a neighbouring test and every gate stays green — a
+	@# deleted test cannot fail. That has happened once; see the script's header.
+	python3 scripts/check-tests-kept.py
 
 .PHONY: lint
 lint: ## golangci-lint (pinned version)

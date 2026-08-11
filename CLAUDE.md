@@ -545,6 +545,54 @@ compute is confirmed gone. The rules that were each learned by getting them wron
 - **Serializing a mutation is not serializing a transition.** Holding the lock for
   the flag write and releasing it before the backend calls is the same race, one
   line down.
+- **A cleanup obligation is owed to the COMPUTE, not to the lease.** Only a
+  successful destroy discharges a pending completion retry. Losing the lease —
+  fenced, reaped — changes who owns the capacity; it does not make the container
+  stop running, and GitHub will not redeliver the completion that would ask
+  again. If no lease remains, skip the release and keep destroying.
+
+  Written down because the opposite was committed for one round and the argument
+  for it was seductive: the capacity really is someone else's, so the record
+  looks like litter. Two separate rules were being conflated. No record is
+  CREATED for a request this listener never held — a restart loses the map while
+  leases live on, and those retries could accomplish nothing. That says nothing
+  about a record created when the listener DID hold the lease.
+- **"Could not X" usually collapses two different facts, and only one is
+  evidence.** A heartbeat that returns ErrFenced is the allocator SAYING the
+  lease is not ours; a heartbeat that times out is the database saying nothing at
+  all. Returning one boolean for both made a listener that briefly lost its
+  ledger forget the containers it had launched. The same shape recurs everywhere
+  in this codebase — a failed destroy is not proof the container survived, an
+  absent `docker ps` row is not proof it is gone. When a call can fail for
+  reasons that mean opposite things, the return type has to be able to say so.
+- **A claim and an obligation expire differently.** Losing a lease ends this
+  listener's claim on the CAPACITY. It does not end its obligation to destroy the
+  container it started, and the two have been conflated three separate times:
+  once for pending cleanup records, once for running leases dropped by the
+  heartbeat, once at shutdown. Whenever a record is removed because "it is not
+  ours any more", ask what was launched under it.
+- **A bound shorter than the work it bounds causes the failure it prevents.** The
+  shutdown grace was 90 seconds against a node command timeout of TEN MINUTES, so
+  an ordinary slow destroy tripped the watchdog, stopped renewal, and let the
+  reaper reclaim capacity whose container was still being destroyed — precisely
+  what the grace existed to avoid. Before choosing a timeout, find the longest
+  legitimate operation underneath it and make the bound larger, or make the work
+  smaller.
+- **Concurrency against a serial queue can be worse than sequence.** A node runs
+  commands one at a time and each command's timeout starts when it is QUEUED, so
+  firing twenty destroys at once starts twenty ten-minute clocks against a queue
+  that serves them in turn: the later ones expire while the node is working
+  happily through the earlier ones, and healthy jobs are recorded as failures.
+  Fan-out needs a bound chosen against the SERVER's concurrency, not the client's
+  patience.
+- **An OPTIONAL capability cannot carry a safety invariant.** The reversed change
+  above was defended with "both shipped runners implement `Sweeper`, which
+  destroys compute no lease is holding." True, and irrelevant: `Sweeper` is a
+  type assertion on `Runner`, so that reasoning makes correctness depend on which
+  implementation is plugged in, and billet is meant to be extended by strangers.
+  If safety rests on a capability, the interface must require it — otherwise
+  assume the implementation without it, and let the capability be a backstop
+  rather than the mechanism.
 - **Time warns; it does not authorise a teardown.** Held compute has NO bound by
   default (`DefaultMaxCustody = 0`) and warns hourly. Elapsed time is not evidence
   that a job stopped making progress — billet imposes no job limit and self-hosted
@@ -576,6 +624,88 @@ has. Two consequences:
 - Docker's `--filter name=X` is a **SUBSTRING** match — measured, not assumed:
   `billet-abc` really does return `billet-abcdef`. `Find` compares exactly
   afterwards.
+
+### A lease must be renewed by exactly one party, and there are three handovers
+
+Custody exists because a remote launch has three outcomes and one of them is
+UNKNOWN. Every defect in this area has been a moment where the count of parties
+renewing a lease was zero — never two, which is harmless, because `Heartbeat` is
+idempotent and a released lease answers `ErrLeaseNotFound`.
+
+The three moments, each of which cost a review round to find:
+
+- **While the provider is still working.** The plane gives up after the command
+  timeout and tells the listener the node has custody, so the listener stops. The
+  node is inside `provider.Launch` and adopts nothing until it returns. The node
+  now renews from the moment it commits to launching (`r.launching`), which is
+  the first instant either side can be sure something may exist.
+- **When the report arrives too late.** The plane records a TOMBSTONE for every
+  launch it abandons — on timeout and on re-registration — so a late success is
+  answered with "this lease is yours" instead of 204. Without the tombstone the
+  node files the instance in its ordinary running set, which nothing renews.
+- **When the result races the timeout.** Both select branches are live at once.
+  `settle` drains the result channel while holding the plane mutex, which is what
+  makes the answer exact: `Result` sends under the same lock, so the send has
+  either completed or not started.
+
+### A registration proves who you are; only a command proves what you may do
+
+The JIT endpoint required a registered node and nothing else, which made the
+README's containment claim false: a host holding a node certificate could mint
+runner registrations in a loop, for any scale set, under any name, and start
+runners billet never escrowed capacity for and never tears down.
+
+The entitlement was already in the request and unused. Billet's runner names
+carry the lease id (`provider.InstanceName`), so a node may mint exactly the
+registration for a launch command it currently holds. Apply the same shape to
+anything else the node can ask for: **authentication answers WHICH host, and the
+command table answers WHAT it was given.**
+
+### An empty CA directory is ambiguous, so something has to remember
+
+"No files" reads as day one, and day one mints a new authority that every issued
+bundle fails to verify against — the whole fleet drops off at once while the
+control plane looks healthy. A marker file written at creation is what makes a
+later absence mean *loss*; deleting it is how an operator starts over on purpose.
+
+Two more rules the same subsystem needs, both of which load cleanly when broken:
+a CA's subject must name THIS deployment (verifying against the CA is what
+decides who may connect, so somebody else's silently re-points that decision),
+and its key must be its certificate's key (unrelated halves sign leaves that fail
+days later on a node, in an error naming neither file). And a private key is
+refused unless the file itself is safe: creation's 0600 says nothing about what a
+backup restored.
+
+### A node's identity is the name in its certificate, and its deployment is too
+
+The wire used to take both from the request — the node named itself in the path,
+and named its deployment in the registration body. Neither was verified, which is
+why it refused to serve anywhere but loopback.
+
+Now `internal/wirecert` mints one CA per deployment, held by the control plane,
+and `billet ca issue <node>` produces the bundle an operator copies to a host.
+Two rules follow, and both exist to keep ONE authority for one fact:
+
+- **The certificate's common name decides which node a request is from.** A path
+  that disagrees is refused, never reconciled. The check runs after routing (the
+  path variable does not exist until the mux has matched) and is applied in the
+  routing table itself, so a route added without it is visibly missing something.
+- **The certificate's organization decides which deployment the node belongs
+  to.** A node's state directory MINTS a random identity when it has none, which
+  is right for a control plane — where an installation begins — and wrong for a
+  node, which joins one. Before this, a freshly enrolled node invented an
+  identity and the control plane refused it forever; nothing an operator could
+  copy would have fixed it. `state.AdoptDeploymentID` writes the certificate's
+  answer down, and REFUSES rather than overwrites when the directory already
+  holds a different one, because the compute that directory is already managing
+  carries the old label.
+
+The server's own certificate is minted per boot and never stored: nothing
+verifies it except this CA, so persisting it would only add a file that expires,
+and its expiry would take the whole fleet offline at an hour nobody chose. The CA
+is the one thing that persists, and a CA directory holding only ONE of its two
+files is refused rather than repaired — minting a replacement is a new authority,
+and every node certificate ever issued stops verifying at once.
 
 ### Destruction is scoped by DEPLOYMENT identity, never by node name
 
@@ -806,6 +936,132 @@ testing is what found them, and it is not optional for anything load-bearing.
   nothing, reports "SURVIVED", and sends you off to write a test for behaviour
   that is already covered. Assert the substitution changed the file — `grep -c`
   the original text and expect zero — before believing the result.
+
+- **A test satisfied by "an error" cannot tell a refusal from a panic.** Deleting
+  the guard that checks a request carries a client certificate makes the code
+  after it dereference a nil `r.TLS` — the handler panics, the client sees an
+  error, and a test asserting `err != nil` passes. The mutation survived because
+  the assertion was too weak, not because the guard was covered. Assert the
+  SPECIFIC refusal: a sentinel error, or a status code.
+- **Every test dialling an `httptest` server shares an assumption no production
+  caller makes.** Its `URL` carries a scheme. `billet node` handed the client a
+  bare `host:port` from config and could not construct a single request, and the
+  whole suite was green — the one code path that builds a base URL from
+  configuration had no test at all.
+
+- **A wait that something else already satisfied is not a wait.** A test meant to
+  let the janitor renew once before changing the TTL waited for `heartbeats > 0`
+  — and `Recover` had already heartbeated while adopting, so it returned
+  instantly and the race it was added to remove was still there. Count from a
+  baseline taken before the thing under test exists.
+- **A fake that cannot be slow cannot model the bug.** The window where nobody
+  renews a lease only exists while a provider is working, so the fake provider
+  needs to block inside `Launch` and say when it has — a delay plus a channel,
+  never a sleep in the test.
+
+- **A test that manufactures the concurrency it is checking proves only the
+  narrow half.** The starvation test started `retryCleanup` in one goroutine and
+  `heartbeatHeld` in another, then asserted the second could run while the first
+  was stuck. That proves a stuck destroy does not hold `l.mu` — and nothing else.
+  The property it was NAMED for is that the two run on separate clocks, and
+  moving cleanup back onto the heartbeat's tick passed it unchanged. When the
+  property is about scheduling, the test has to use the scheduler under test:
+  drive `Run`, and assert the CONSEQUENCE (a lease the reaper took) rather than
+  the mechanism.
+- **A shutdown-time worker must not run on the caller's context.** Renewal was
+  started on a child of `ctx`, so the caller cancelling to shut down stopped it
+  at that instant — before the session close, before the release, before every
+  slow remote destroy the release performs. Stopping it "last" in the deferred
+  teardown was decoration: it had already stopped. Anything that must stay alive
+  DURING shutdown gets `context.WithCancel(context.WithoutCancel(ctx))` and is
+  stopped explicitly by the function that owns the teardown.
+
+  The general form: if a goroutine's job is to protect the teardown, inheriting
+  the cancellation that triggers the teardown is exactly backwards.
+
+  The discriminator, having audited the other two sites — `Server.Run`'s sweeper
+  `KeepAlive` and `nodeclient`'s janitor — is whether the function does
+  meaningful work AFTER its context is cancelled. Both of those simply return, so
+  a child context is right there and nothing needs changing: on process exit
+  their leases are reaped and restart recovery re-adopts. Only the listener keeps
+  working after cancellation, because its teardown destroys compute and releases
+  capacity, and that work is what has to be protected.
+- **Cancelling a goroutine is not stopping it.** A cleanup retry blocked in a
+  remote `Destroy` outlived `Run` and came back afterwards to release against a
+  database the caller was entitled to have closed. Cancel AND join, and be
+  explicit about the order when two workers must stop at different times —
+  cleanup before the release that would race it, renewal after.
+- **A test whose observation can also be produced by shutdown proves nothing
+  about the loop.** The first version of the cleanup-loop wiring test let the
+  context expire and then asked whether a destroy had happened. `releaseAll`
+  destroys everything still running, so it produced one — the test passed with
+  the loop deleted, and the mutation run reported a kill only because `Run`
+  incidentally returned `DeadlineExceeded`. Observe the effect while the system
+  is still running, and enumerate every other path that could produce it.
+- **A mutant that applies but changes no behaviour reports SURVIVED, and that is
+  indistinguishable from a real gap.** Inserting `_ = id` next to a `delete` left
+  the delete in place; the harness verified the file hash changed, so every
+  existing guard passed, and the output said the property was uncovered when it
+  was not. Hash-verification catches an edit that did not apply, not an edit that
+  did nothing. A mutant must remove or invert behaviour — if you cannot say which
+  assertion it should break, it is not a mutant.
+- **Run the suite the way CI runs it, instrumented.** `-covermode=atomic` is not
+  a reporting flag; the counters change timing enough to reorder goroutines that
+  a plain `-race` build schedules identically every time. A launch in progress
+  being handed to teardown was invisible under `make check` and reliable under
+  coverage. `make check` now carries the flags, because a local gate weaker than
+  CI trains you to trust it.
+
+### Four ways silence has looked like success, and the guards for each
+
+Every one of these produced a green gate and an untrue conclusion. They are the
+same failure wearing different clothes, and the pattern is worth recognising
+before the fifth one: **the thing that would have objected was itself missing.**
+
+| What went missing | What it looked like | Guard |
+|---|---|---|
+| A scripted substitution matched nothing | Build and tests pass, bug untouched | `assert old in s` before replacing, and verify the file hash changed |
+| A mutant applied but changed no behaviour | `SURVIVED` — identical to a real coverage gap | A mutant must remove or invert behaviour; if you cannot name the assertion it should break, it is not a mutant |
+| A review prompt file did not exist | `codex exec` exit 0, no findings — identical to a clean round | `run_round.sh` refuses to launch without a non-empty prompt |
+| A scripted edit deleted a whole test | Suite green; a deleted test cannot fail | `make tests-kept` — compares Test function names against HEAD |
+| A killed mutation run left its mutant in the file | Compiles, mostly passes; an earlier green gate says nothing because the mutation landed after it | `make no-mutants` — runs FIRST in `check`; a stranded `.bak` is the only evidence |
+
+The last one was found only because a mutation run happened to name that test and
+reported `NO SUCH TEST`. Nothing else in the toolchain noticed, and nothing else
+would have.
+
+### An edit that did not apply looks exactly like an edit that did
+
+Twice in one session a scripted `replace()` matched nothing and reported success:
+once because the anchor said HANDOVER where the file said HANDOFF, once because a
+comment had been reworded a round earlier. The build passed, the tests passed,
+and the bug the edit was meant to fix was untouched — the only reason it surfaced
+was a test written against the behaviour rather than the code.
+
+**Assert every substitution.** `assert old in s` before replacing, and check the
+file hash changed afterwards. This is the same rule already written down for
+mutation testing, and it applies to every scripted edit for the same reason: the
+failure mode is silence.
+
+**And use `-F` for every commit message.** Backticks in `git commit -m` are
+command substitution: three messages this session lost a phrase to it, in a
+project whose commit messages are the design record. A file cannot misfire.
+
+### Two things Go gets right and reviewers get wrong
+
+- **`url.Parse` accepts `"127.0.0.1:7717"`**, reading the host as a scheme. A
+  validation that only calls it therefore cannot fail on the input it exists to
+  reject. Check the parts you actually need — a scheme you recognise, a non-empty
+  `Host`.
+- **Deferred calls run last-in, first-out**, so
+
+  ```go
+  defer stopJanitor()   // runs SECOND
+  defer janitor.Wait()  // runs FIRST — waits for a goroutine nothing has stopped
+  ```
+
+  deadlocks on every exit path the parent context did not cause. Two defers whose
+  order matters belong in one defer, in the order written.
 
 ### The end-to-end suite
 

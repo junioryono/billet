@@ -230,6 +230,16 @@ type browser struct {
 	// than the flake, because a genuinely malformed URL failing after the flow
 	// returned would have been discarded as well.
 	getFailures atomic.Int32
+
+	// reached counts requests that got a RESPONSE, whatever became of the body.
+	//
+	// The attempt counter cannot tell "delivered" from "refused", and a refusal
+	// against the flow's own origin is deliberately excused — so without this a
+	// regression that closed the listener before /installed left an attempt
+	// recorded, a refusal forgiven, and every other assertion passing while the
+	// callback was never delivered. A truncated body still counts: the request
+	// reached the handler, which is the fact being asserted.
+	reached atomic.Int32
 	// pending joins the fire-and-forget callback goroutines, so the assertions
 	// cannot read the counter while a request is still deciding its fate.
 	pending  sync.WaitGroup
@@ -541,6 +551,14 @@ func (b *browser) get(ctx context.Context, target string) (string, bool) {
 	}
 
 	resp, err := b.client.Do(req)
+
+	// SCOPED TO THE CALLBACK, which is the request whose delivery cannot be
+	// inferred from anything else. The browser makes several requests in a flow;
+	// counting them all would assert a total that changes whenever the flow does.
+	if err == nil && strings.Contains(target, "/installed") {
+		b.reached.Add(1)
+	}
+
 	if err != nil {
 		// COUNTED BY WHAT WENT WRONG, not by when. Swallowing this is precisely
 		// how the original test reported success while never reaching /installed;
@@ -618,6 +636,58 @@ func (b *browser) benignFailure(target string, err error) bool {
 		errors.Is(err, http.ErrServerClosed) ||
 		errors.Is(err, context.Canceled) ||
 		errors.Is(err, context.DeadlineExceeded)
+}
+
+// THE CLASSIFIER IS THE GUARD, so it gets its own test.
+//
+// The end-to-end test above counts only failures benignFailure declines to
+// excuse, which makes this function the entire difference between catching a
+// regression and reporting a clean run. And it is the kind of function that
+// looks obviously right and can be quietly wrong in the direction that hides
+// bugs: excusing too much costs nothing visible, ever.
+//
+// The regression it exists to catch is a syntactically valid callback URL
+// aimed at the wrong host or port. That fails with the same net.OpError as a
+// listener closing on time, so "is it an OpError" — the obvious implementation —
+// would excuse it.
+func TestOnlyFailuresAgainstOurOwnOriginAreExcused(t *testing.T) {
+	t.Parallel()
+
+	b := &browser{origin: "http://127.0.0.1:41234"}
+
+	refused := &net.OpError{Op: "dial", Err: syscall.ECONNREFUSED}
+
+	if !b.benignFailure("http://127.0.0.1:41234/installed", refused) {
+		t.Error("a connection refused by our own listener was counted as a failure; the flow " +
+			"closes that listener as it finishes, so a request still in flight then is " +
+			"refused for a correct reason and the test flakes")
+	}
+
+	for _, wrong := range []string{
+		"http://127.0.0.1:41235/installed", // right host, wrong port
+		"http://10.0.0.4:41234/installed",  // wrong host, right port
+		"https://127.0.0.1:41234/installed",
+	} {
+		if b.benignFailure(wrong, refused) {
+			t.Errorf("a request to %s was excused; it fails with the same error as a closing "+
+				"listener, so excusing it means a flow aimed at the wrong place looks "+
+				"identical to one that worked", wrong)
+		}
+	}
+
+	// An error that has nothing to do with shutting down is never benign, even
+	// against the right origin.
+	if b.benignFailure("http://127.0.0.1:41234/installed", errors.New("no such host")) {
+		t.Error("an unrelated error against our own origin was excused")
+	}
+
+	// NO ORIGIN MEANS NOTHING IS EXCUSED. Before the flow has published one there
+	// is no address to compare against, and excusing by default would blind the
+	// counter for the whole first half of the flow.
+	empty := &browser{}
+	if empty.benignFailure("http://127.0.0.1:41234/installed", refused) {
+		t.Error("a failure was excused before the flow had an origin to compare against")
+	}
 }
 
 func extractFormAction(t *testing.T, page string) string {
@@ -737,8 +807,28 @@ func TestOnboardEndToEnd(t *testing.T) {
 		t.Errorf("setup callback fired %d times, want 1", n)
 	}
 
+	// THE CALLBACK MUST HAVE BEEN ANSWERED, not merely attempted. The counter
+	// above is incremented before the request is made, and a connection refused
+	// against the flow's own origin is excused as an orderly shutdown — so a
+	// regression that closed the listener BEFORE /installed produced exactly this
+	// shape: an attempt recorded, a refusal forgiven, and every remaining
+	// assertion passing while the callback was never delivered.
+	if n := b.reached.Load(); n != 1 {
+		t.Errorf("the setup callback got a response %d times, want 1: it was attempted but "+
+			"never reached the flow's listener, and a refusal against our own origin is "+
+			"excused as an orderly shutdown — so the callback can go undelivered with every "+
+			"other assertion still passing", n)
+	}
+
 	if n := b.getFailures.Load(); n != 0 {
-		t.Errorf("%d browser requests failed; the callback URL is probably malformed", n)
+		// SAYS WHAT HAPPENED, not what probably caused it. The old wording blamed
+		// a malformed URL, which is one of three things this counts — the others
+		// are a request to the wrong host or port, and a route that answered a
+		// non-2xx status — and naming the wrong one sends the reader looking in
+		// the wrong place first.
+		t.Errorf("%d browser requests failed for a reason other than the flow shutting down: "+
+			"billet built a URL that could not be requested, aimed one somewhere other than "+
+			"its own callback origin, or a route answered a non-2xx status", n)
 	}
 
 	if len(b.visits) != 2 {
