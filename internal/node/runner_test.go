@@ -556,14 +556,13 @@ func openState(t *testing.T) *state.DB {
 	return db
 }
 
-// assignedLease reserves and assigns a lease, which is the state Launch expects
-// to receive one in.
-//
-// Atomic because these tests run in parallel. Separate databases made duplicate
-// request ids harmless in practice, which is exactly why the race would have sat
-// there being reported only by -race on an unlucky run.
+// nextRequest is atomic because these tests run in parallel: separate databases
+// make duplicate request ids harmless in practice, which is exactly why such a
+// race would be reported only by -race on an unlucky run.
 var nextRequest atomic.Int64
 
+// assignedLease reserves and assigns a lease, which is the state Launch expects
+// to receive one in.
 func assignedLease(t *testing.T, a *alloc.Allocator) *alloc.Lease {
 	t.Helper()
 

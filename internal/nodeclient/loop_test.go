@@ -972,10 +972,16 @@ func TestANodeThatIsRefusedStops(t *testing.T) {
 	}
 }
 
+// waitFor polls a condition rather than sleeping a fixed amount.
+//
+// The deadline is generous because these are wall-clock waits taken while the
+// whole suite runs in parallel: the conditions here are reached in milliseconds
+// when the machine is idle, so a failure means the condition never happened
+// rather than that it was slow. A tighter bound just turns load into a flake.
 func waitFor(t *testing.T, cond func() bool) {
 	t.Helper()
 
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(20 * time.Second)
 
 	for time.Now().Before(deadline) {
 		if cond() {

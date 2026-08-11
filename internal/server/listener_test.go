@@ -206,10 +206,6 @@ func TestAdvertisingNothingAlsoRefusesWork(t *testing.T) {
 	}
 }
 
-// tier builds a catalog entry. Every tier here is 4 vCPU so the arithmetic in
-// the capacity assertions stays legible; the parameter exists so a test that
-// needs an uneven catalog does not have to rewrite this.
-//
 // AVAILABLE is what gets acquired; ASSIGNED is what consumes escrow.
 //
 // Available is the OFFER — the message whose RunnerRequestID claims work.
@@ -434,6 +430,8 @@ func TestSessionStatisticsAreObserved(t *testing.T) {
 	}
 }
 
+// tier builds a catalog entry. Every tier here is 4 vCPU so the arithmetic in the
+// capacity assertions stays legible.
 func tier(label string) config.Tier {
 	const vcpu = tierVCPU
 

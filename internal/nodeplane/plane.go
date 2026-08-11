@@ -1074,21 +1074,6 @@ func (p *Plane) EntitledToLaunch(node, incarnation, leaseID string) (string, err
 			"registration for it", ErrNotEntitled, node, leaseID)
 }
 
-// Seen records that a node just spoke, whatever it said.
-//
-// EVERY REQUEST IS EVIDENCE OF LIFE, and taking it only from Poll and Result was
-// a silent way to kill a working node. The node's command loop is synchronous:
-// if Recover, Sweep or Tend wedges — a hung Docker call is enough — the loop
-// never reaches Poll again. Its custody janitor is a separate goroutine and
-// keeps heartbeating perfectly well, but each heartbeat asked whether the node
-// was registered, that question ran expiry, and the same call that proved the
-// node alive was the one that declared it dead. Every later heartbeat was then
-// refused as unregistered, and the leases it held — for compute that may still
-// be running — expired.
-//
-// Command eligibility is bounded by the command timeout, which is the right
-// instrument for a node that takes work and never answers. Membership is bounded
-// by silence, which is the right instrument for a node that has gone.
 // maxAbandoned bounds what one node's tombstones can cost.
 //
 // A node whose launches all outlast the command timeout would otherwise grow
@@ -1096,6 +1081,18 @@ func (p *Plane) EntitledToLaunch(node, incarnation, leaseID string) (string, err
 // ones are the launches still likely to report.
 const maxAbandoned = 1024
 
+// Seen records that a node just spoke, whatever it said.
+//
+// EVERY REQUEST IS EVIDENCE OF LIFE. The node's command loop is synchronous, so
+// if Recover, Sweep or Tend wedges it never reaches Poll again — while its
+// custody janitor keeps heartbeating perfectly well. Taking liveness only from
+// Poll and Result would let each heartbeat run expiry, so the same call that
+// proved the node alive would declare it dead, and every later heartbeat would
+// be refused as unregistered while its leases expired.
+//
+// Command eligibility is bounded by the command timeout, which is the right
+// instrument for a node that takes work and never answers. Membership is bounded
+// by silence, which is the right instrument for a node that has gone.
 func (p *Plane) Seen(name, incarnation string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
