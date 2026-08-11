@@ -1,9 +1,11 @@
 // Package config defines billet's on-disk configuration and its validation rules.
 //
 // A single billet.yaml describes both roles. `billet server` reads the server and
-// github sections plus the tier catalog; `billet node` reads the node section and
-// learns its tier assignments from the server. On a single machine the two
-// processes read the same file.
+// github sections; `billet node` reads the node section. BOTH read the tier
+// catalog — the node needs each tier's image, command, disk and shm, which the
+// lease riding on a launch command does not carry — so the catalog is duplicated
+// on every machine with nothing checking that the copies agree. On a single
+// machine the two processes read the same file.
 package config
 
 import (

@@ -48,6 +48,16 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job server.Job)
 		return err
 	}
 
+	// THE SHAPE TRAVELS WITH THE COMMAND. A node keeps no catalogue, so a tier
+	// this plane does not know is refused here rather than on the far side of a
+	// wire, where the node's answer would be about a file the operator would then
+	// have to go and compare by hand.
+	tier, ok := r.plane.tierFor(lease.Tier)
+	if !ok {
+		return fmt.Errorf("%w: lease %s names tier %q, which is not in this deployment's catalogue",
+			ErrNoNode, lease.ID, lease.Tier)
+	}
+
 	id, err := commandID()
 	if err != nil {
 		return err
@@ -58,6 +68,7 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job server.Job)
 			ID:    id,
 			Kind:  nodeapi.CommandLaunch,
 			Lease: lease,
+			Tier:  nodeapi.TierSpecOf(tier),
 			Job: &nodeapi.Job{
 				RequestID: job.RequestID,
 				RunID:     job.RunID,

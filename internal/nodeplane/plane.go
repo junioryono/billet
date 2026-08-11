@@ -104,6 +104,11 @@ type Plane struct {
 	// that has not needed the distinction. See WithSites.
 	sites map[string]bool
 
+	// tiers is the deployment's catalogue and the ONE authority on what a tier
+	// is. The wire checks a JIT request against it, and a launch carries the
+	// shape a node needs so that no node keeps a copy of its own.
+	tiers map[string]config.Tier
+
 	// pendingGone holds hosts the plane has forgotten but the ledger has not yet been
 	// told about. Guarded by mu.
 	//
@@ -490,6 +495,28 @@ func sortedSites(set map[string]bool) []string {
 	slices.Sort(out)
 
 	return out
+}
+
+// WithTierCatalog gives the plane the deployment's tiers.
+//
+// HELD HERE RATHER THAN ON THE NODE, because a node with its own copy needs that
+// copy to agree with the server's and nothing checks: a missing tier refuses the
+// launch loudly, but a drifted `image:` runs the wrong image silently. The plane
+// puts the shape on the launch command instead.
+func WithTierCatalog(tiers []config.Tier) Option {
+	return func(p *Plane) {
+		p.tiers = make(map[string]config.Tier, len(tiers))
+		for i := range tiers {
+			p.tiers[tiers[i].Label] = tiers[i]
+		}
+	}
+}
+
+// tierFor reports a tier from the catalogue.
+func (p *Plane) tierFor(label string) (config.Tier, bool) {
+	t, ok := p.tiers[label]
+
+	return t, ok
 }
 
 // WithSites declares the places this deployment has compute in.

@@ -506,7 +506,10 @@ func runServer(ctx context.Context, lc *lifecycle, cfg *config.Config, dryRun bo
 		// here rather than recorded. A node's own config cannot make this check —
 		// sites are the control plane's to declare and the node's file has no
 		// reason to list them.
-		nodeplane.WithSites(cfg.SiteNames()))
+		nodeplane.WithSites(cfg.SiteNames()),
+		// The catalogue lives here, and a launch carries the shape a node needs, so
+		// no node keeps a copy that can drift from this one.
+		nodeplane.WithTierCatalog(cfg.Tiers))
 
 	stopWire, err := serveNodeWire(ctx, cfg, owner, nodes, allocator, wiring.NodeJIT{Client: client})
 	if err != nil {
@@ -596,7 +599,7 @@ func serveNodeWire(
 	// against the tier its lease names — including that tier's runner group,
 	// which is how an operator keeps a tier away from every repository in the
 	// organisation.
-	handlerOpts := []nodeplane.HandlerOption{nodeplane.WithTiers(cfg.Tiers)}
+	var handlerOpts []nodeplane.HandlerOption
 
 	var tlsConf *tls.Config
 
@@ -817,7 +820,7 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 	// It satisfies node.LeaseStore and node.JITSource, which is the whole reason
 	// the runner needs no idea it is remote: the interfaces it already took are
 	// the seam the network went through.
-	runner := node.New(client, cfg.Node.Name, client, p, cfg.Tiers, slog.Default(),
+	runner := node.New(client, cfg.Node.Name, client, p, slog.Default(),
 		node.WithMaxCustody(maxCustody))
 
 	fmt.Printf("billet node %s: dialing %s\n", cfg.Node.Name, cfg.Node.ServerAddr)

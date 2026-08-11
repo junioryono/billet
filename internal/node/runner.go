@@ -17,7 +17,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
-	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/provider"
 	"github.com/junioryono/billet/internal/server"
 )
@@ -122,9 +122,6 @@ type Runner struct {
 	// row in the nodes table rather than being decorative.
 	node string
 
-	// tiers is the catalog, so a lease's tier can be turned into a machine shape.
-	tiers map[string]config.Tier
-
 	mu sync.Mutex
 	// runningLease is the lease each running request holds, kept because renewing
 	// or releasing one needs its epoch and the instance name carries only the id.
@@ -163,15 +160,10 @@ func WithMaxCustody(d time.Duration) Option {
 // New builds a runner over a provider.
 func New(
 	a LeaseStore, node string, jit JITSource, p provider.Provider,
-	tiers []config.Tier, log *slog.Logger, opts ...Option,
+	log *slog.Logger, opts ...Option,
 ) *Runner {
 	if log == nil {
 		log = slog.Default()
-	}
-
-	byLabel := make(map[string]config.Tier, len(tiers))
-	for i := range tiers {
-		byLabel[tiers[i].Label] = tiers[i]
 	}
 
 	r := &Runner{
@@ -185,7 +177,6 @@ func New(
 
 		maxCustody:   DefaultMaxCustody,
 		log:          log,
-		tiers:        byLabel,
 		running:      make(map[int64]*provider.Instance),
 		runningLease: make(map[int64]*alloc.Lease),
 		sets:         make(map[string]int),
@@ -198,13 +189,16 @@ func New(
 	return r
 }
 
-var _ server.Runner = (*Runner)(nil)
-
 // Launch mints a registration and starts something that will consume it.
-func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job Job) error {
-	tier, ok := r.tiers[lease.Tier]
-	if !ok {
-		return fmt.Errorf("node: no tier named %q in the catalog", lease.Tier)
+func (r *Runner) Launch(
+	ctx context.Context, lease *alloc.Lease, tier *nodeapi.TierSpec, job Job,
+) error {
+	// SENT BY THE CONTROL PLANE, not read from a file here. A node with its own
+	// catalogue needed it to agree with the server's, and a drifted `image:` ran
+	// the wrong image with nothing reporting it.
+	if tier == nil {
+		return fmt.Errorf("node: the launch for lease %s carried no tier shape; this node and "+
+			"its control plane are not speaking the same protocol version", lease.ID)
 	}
 
 	// THE LEASE'S OWN LIST, NOT THE LIVE CATALOGUE.
@@ -358,7 +352,7 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job Job) error 
 		// What actually starts the runner. Backends refuse an empty command
 		// because a container image's default is a shell, which exits at once and
 		// leaves the job queued while every signal says the launch worked.
-		Command: tier.RunnerCommand(),
+		Command: tier.Command,
 	})
 	if err != nil {
 		// A LAUNCH ERROR IS NOT PROOF NOTHING STARTED.
@@ -773,7 +767,7 @@ func (r *Runner) forgetScaleSet(tier string) {
 }
 
 // scaleSetID resolves a tier's scale set, once.
-func (r *Runner) scaleSetID(ctx context.Context, tier config.Tier) (int, error) {
+func (r *Runner) scaleSetID(ctx context.Context, tier *nodeapi.TierSpec) (int, error) {
 	r.mu.Lock()
 	id, cached := r.sets[tier.Label]
 	r.mu.Unlock()
