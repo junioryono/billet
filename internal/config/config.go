@@ -507,14 +507,17 @@ type Tier struct {
 	// two spellings of the same field, and guessing which one an operator meant —
 	// when the answer decides where untrusted code runs — is not a kindness.
 	//
-	// THE ORDER IS HONOURED WHERE THE CONTROL PLANE PICKS, and nowhere else.
-	// nodeplane.pick walks this slice most-preferred-first over the registered
-	// nodes, so a remote node is chosen by preference rather than by map order.
-	// What does not exist is choosing at ESCROW time against per-node capacity
-	// and cost (#30) — capacity is one deployment-wide budget, so billet can
-	// advertise a slot no single machine can host. In --dev the node binds itself
-	// and placement can only accept or refuse the node that asked. And with
-	// Docker the only provider built, the ordering cannot be exercised yet.
+	// THE ORDER DECIDES, AT ESCROW. The allocator walks this slice
+	// most-preferred-first over the hosts that can serve the tier and have room,
+	// and records the choice on the lease — so the reservation billet advertises
+	// is already backed by a specific machine, and a job reaches the cloud only
+	// when home is full rather than when a cloud node polls first.
+	//
+	// A tuning knob never overrules it: server.placement decides only between
+	// hosts this order cannot separate.
+	//
+	// What is missing is the cloud itself. Docker is the only provider built, so
+	// the fallback half cannot be exercised yet (#32).
 	Providers []ProviderKind `yaml:"providers,omitempty"`
 	// GuestOS defaults to linux. Set it explicitly for macOS and Windows tiers —
 	// licensing and capability checks key off this field, not off the label.

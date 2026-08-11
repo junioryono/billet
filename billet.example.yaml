@@ -125,6 +125,28 @@ node:
   provider: firecracker
   state_dir: /var/lib/billet/node
 
+  # WHAT THIS MACHINE CONTRIBUTES, which is not the same as what it has. Unset
+  # means "everything I can detect", which is what a dedicated box wants.
+  #
+  # Declared HERE, on the machine, rather than in the control plane's config,
+  # because the person running this host is the one who knows what else it does.
+  # Setting them above what the machine has is allowed — overcommitting is a
+  # decision you are entitled to make — and warned about at startup.
+  #
+  # A number here is what the allocator escrows against, so it is also the
+  # answer to "why is this host not being given work".
+  #
+  # max_vcpu: 120
+  # max_memory: 480GiB
+
+  # WHERE THIS MACHINE IS, naming one of the control plane's declared sites
+  # below. Optional, and only meaningful once a deployment has more than one
+  # place. A node claiming a site the control plane does not declare is refused
+  # at registration — a typo would otherwise become a place of its own, with a
+  # cache of its own that is always empty.
+  #
+  # site: home
+
   # The bundle `billet ca issue epyc-1` wrote on the control plane, copied here.
   #
   # REQUIRED TO DIAL ANYTHING BUT LOOPBACK. The name in this certificate is what
@@ -213,13 +235,13 @@ tiers:
   # preference order, so losing the box at home does not take the runs-on label
   # down with it — jobs land on EC2 instead.
   #
-  # The order IS honoured where the control plane picks: it walks this list
-  # most-preferred-first over the registered nodes. What does not exist is
-  # choosing when the job is ADMITTED — capacity is one deployment-wide budget,
-  # so billet can accept work no single machine can host. In `--dev` the node
-  # binds itself and placement can only accept or refuse the host that asked.
-  # And with Docker the only provider built, the EC2 half of this cannot be
-  # exercised at all yet.
+  # THE ORDER DECIDES. The control plane picks the machine when the job is
+  # ADMITTED, walking this list most-preferred-first over the hosts that can
+  # serve the tier and have room — so a job goes to the cloud only when home is
+  # full, rather than to whichever machine happened to ask first.
+  #
+  # What is missing is the cloud itself: Docker is the only provider built, so
+  # the EC2 half of this cannot be exercised yet (#32).
   #
   # - label: billet-8vcpu-ubuntu-2404
   #   providers: [firecracker, ec2]   # instead of `provider: firecracker`
@@ -337,3 +359,34 @@ tiers:
 # permits per Apple-branded host. billet does not know what agreement you have,
 # so raising it is allowed — but doing so is an assertion about YOUR licence,
 # not a tuning knob.
+
+# The places this deployment has compute in. Optional: a single-machine
+# deployment never writes one.
+#
+# A SITE IS WHERE COMPUTE AND ITS STORAGE SHARE A FAST NETWORK, which is the
+# answer to "which storage" — a question every cache has to have one of, because
+# a cache is fast precisely because it sits next to the machine using it.
+#
+# Declared here rather than inferred from what nodes claim, because a free
+# string cannot tell a typo from a new location: a node that means "home" and
+# types "hom" would get a site of its own, an empty cache, and every job placed
+# there running cold while the fleet looked healthy.
+#
+# Today a site carries identity, which is the half placement needs. The storage
+# backend that will hang off it — Ceph at a bare-metal site, EBS and S3 in a
+# cloud region — arrives with the storage layer (#23, #25).
+#
+# sites:
+#   - name: home
+#   - name: aws-us-west-2
+#
+# A tier may then insist on one, the way it can already pin a node — except a
+# site holds several machines, so it constrains WITHOUT giving up the fallback
+# that having several of them buys:
+#
+#   - label: billet-4vcpu-ubuntu-2404-home
+#     provider: firecracker
+#     site: home
+#     vcpu: 4
+#     memory: 16GiB
+#     image: ubuntu-2404-x64

@@ -22,14 +22,13 @@ cloud; the AWS-based projects are AWS-only; the microVM products are commercial.
 [Alternatives](#alternatives) for an honest comparison, including cases where you should use
 something else.
 
-> The failover part is **half built**. A tier can name several backends, and the
-> control plane already picks among registered nodes in the tier's preference
-> order. What is missing is choosing when the job is ADMITTED rather than after —
-> capacity is one deployment-wide budget, so nothing weighs a node's spare room or
-> its cost before accepting the work
-> ([#30](https://github.com/junioryono/billet/issues/30)). And there is no EC2
-> provider to fail over TO ([#32](https://github.com/junioryono/billet/issues/32)),
-> so none of it can be exercised yet. See [Status](#status).
+> The failover MACHINERY is built and has nowhere to fail over to. A tier can name
+> several backends, capacity is measured per machine, and the control plane picks
+> the host when the job is admitted — in the tier's own order of preference, so
+> `[firecracker, ec2]` means the box at home before the cloud. What is missing is
+> the cloud: Docker is the only provider, so today a second machine is a second
+> Docker host ([#32](https://github.com/junioryono/billet/issues/32)). See
+> [Status](#status).
 
 ## What it is
 
@@ -189,24 +188,32 @@ built. What works **today**:
 | Capacity ledger | Lease state machine, fencing epochs, placement enforcement, escrow before advertising |
 | Docker provider | One container per job, JIT registration delivered off argv. **Trials only** — shares the host kernel, so it refuses anything not established as trusted |
 | Crash recovery | A job running when the controller dies is adopted and left to finish, not killed; its capacity stays held |
+| Per-machine capacity | Each node reports what it contributes; a tier advertises the smaller of the deployment ceiling and what its machines can hold. A host nothing can reach stops backing advertisements |
+| Placement | The control plane chooses the machine when the work is admitted, by provider preference, then packing (`placement: spread` to even the load instead), then name. Reserved floors are held against the machines that could keep them |
+| Sites | A node says where it is; a tier may insist on a place. Carries identity today — the storage that will key off it is [#23](https://github.com/junioryono/billet/issues/23) |
 | Graceful drain | SIGTERM stops it taking new work and waits for the jobs already running, so `systemctl restart` does not fail somebody's build. See [Updating](#updating) |
 | Release pipeline | Tagged releases with checksums, `.deb`/`.rpm` with systemd units, and the install script — **built and never yet run: there are no tags, so no release exists to install.** Build from source until there is one |
-| Multi-backend tiers | One label can name several providers and be placed on any of them, and the preference order IS honoured when the control plane picks among registered nodes (`nodeplane.pick` walks it most-preferred-first). What is missing is choosing at escrow time, against per-node capacity and cost ([#30](https://github.com/junioryono/billet/issues/30)) — and Docker is the only provider built, so the ordering cannot be exercised yet |
+| Multi-backend tiers | One label can name several providers, and the preference ORDER decides: the control plane picks the host when the job is admitted, walking the tier's list most-preferred-first. Docker is the only provider built, so the fallback half cannot be exercised yet ([#32](https://github.com/junioryono/billet/issues/32)) |
 
-**Not built:** Firecracker, Apple Silicon and EC2 providers; the cache; sticky disks; admission-time
-placement, which is what would let provider preference and a cost policy govern whether work is taken
-on at all rather than only which registered node runs it; observability; the dashboard.
+**Not built:** Firecracker, Apple Silicon and EC2 providers; the cache; sticky disks; a cost policy,
+which needs a provider that charges money before there is anything to weigh; observability; the
+dashboard.
 
-**billet is a one-machine product today, and the reasons are specific rather than general.** Capacity
-is a single deployment-wide budget rather than a figure per machine, so two hosts of different sizes
-cannot be described ([#21](https://github.com/junioryono/billet/issues/21)); the node is chosen only
-once a job has already been acquired, so nothing weighs capacity or cost when the work is admitted
-([#30](https://github.com/junioryono/billet/issues/30)); a destroy is
-broadcast to every node instead of addressed to the one holding the job
-([#31](https://github.com/junioryono/billet/issues/31)); and a cache lives on the machine that built
-it ([#23](https://github.com/junioryono/billet/issues/23)). Each is invisible with one machine and
-wrong the moment there are two. [#33](https://github.com/junioryono/billet/issues/33) tracks the
-whole plan.
+**billet runs a fleet, with one thing still missing before it is worth having one.** Capacity is a
+figure per machine, so hosts of different sizes can be described and a tier advertises only what its
+machines can actually hold. The control plane chooses the host when the work is ADMITTED — which is
+what finally makes `providers: [firecracker, ec2]` mean "the machine at home first, the cloud if you
+must" — and a destroy goes to the machine holding the container rather than to everyone
+([#21](https://github.com/junioryono/billet/issues/21),
+[#30](https://github.com/junioryono/billet/issues/30),
+[#31](https://github.com/junioryono/billet/issues/31)).
+
+What is still true is that **a cache lives on the machine that built it**
+([#23](https://github.com/junioryono/billet/issues/23)), so a second host is a second cold cache
+until shared storage lands. And there is still only one provider, so a second machine today means a
+second Docker host rather than the cloud fallback the labels can already express
+([#32](https://github.com/junioryono/billet/issues/32)).
+[#33](https://github.com/junioryono/billet/issues/33) tracks the whole plan.
 
 ### Adding a second machine
 

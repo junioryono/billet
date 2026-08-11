@@ -59,7 +59,7 @@ cmd/billet/          the binary: server | node | dev roles, plus the whole opera
 internal/config/     billet.yaml schema + validation (a leaf package — imports nothing of ours)
 internal/state/      SQLite control-plane store: capacity ledger, job history, process lock
 internal/github/     App Manifest onboarding, App JWT, installation resolution
-internal/alloc/      global capacity allocator + lease state machine
+internal/alloc/      per-machine capacity allocator, placement + lease state machine
 internal/server/     scale-set listeners, scheduler                              (P1)
 internal/node/       node runtime: provider driver, capacity reporting, mTLS     (P2)
 internal/provider/   firecracker | tart | ec2 | docker                            (P1+)
@@ -100,9 +100,9 @@ Two things from it that come up constantly:
   module at the same version, so the `listener` package inside it is ARC's, not a generic vendor's.
 - **billet is not actions-runner-controller without Kubernetes.** ARC does not track individual jobs
   at all; its whole scaling decision is `min(MinRunners+TotalAssignedJobs, MaxRunners)` and
-  Kubernetes absorbs scheduling, queueing and placement. Billet has fixed hardware, one global budget
-  across tiers, and placement constraints (CCD locality, the macOS licence cap, guest-OS allowlists)
-  that need a lease bound to a specific host. ARC has no cache, no sticky disks, no microVM
+  Kubernetes absorbs scheduling, queueing and placement. Billet has fixed hardware, a budget per
+  machine under a deployment ceiling, and placement constraints (CCD locality, the macOS licence cap,
+  guest-OS allowlists) that need a lease bound to a specific host. ARC has no cache, no sticky disks, no microVM
   isolation — everything that makes this project worth building.
 
 ## Invariants
@@ -227,11 +227,19 @@ memory, macOS licence slots, disk — never one integer.
 - **The headroom check and the insert are ONE transaction.** Checking outside it is a read followed
   by a hopeful write. Measured: moving the check out produced **28 grants against a ceiling of 4**
   under concurrency. `TestConcurrentReservationsNeverOvercommit` is the guard.
-- **A lease's `node` stays NULL until a node binds it.** A reservation is *constrained* to a node by
-  its tier's config, not *bound* to one — and the column has a foreign key to `nodes(name)`, which at
-  reserve time may name a host that has not registered yet. So Apple's per-host limit counts by the
-  set of macOS tiers pinned to that node, not by `leases.node`, which would read zero during exactly
-  the window the limit exists to cover.
+- **A lease's `node` stays NULL until a node binds it, but `target_node` is set at ESCROW.** The two
+  answer different questions: the target is where billet decided the work goes, the node is where it
+  actually went. Capacity is charged on `COALESCE(node, target_node)`, because a reservation aimed at
+  a machine has already spent it — counting only bound leases let a tier escrow against the same host
+  repeatedly in the window before its first launch, which is the overcommit the escrow exists to
+  prevent, moved down from the deployment to the machine.
+- **Every reservation names a machine.** It used to be set only for a tier that pinned itself, which
+  left an ordinary lease charged to the deployment and to no host — so the fleet's remaining room
+  never shrank and billet advertised the same slots repeatedly. `Bind` was always a verifier and
+  needed no change; it simply started always having a target to verify against.
+- **What a tier advertises is `min(deployment ceiling, Σ over eligible machines)`.** The fleet term
+  stops billet promising more than the machines can hold; the ceiling keeps a one-box install
+  behaving as it did, since a host detecting more threads than its config allows would otherwise win.
 - **The epoch is a fence, and a reclaim bumps it.** Without that, a holder declared dead and replaced
   keeps writing to a lease someone else now owns — an orderly takeover becoming two concurrent owners
   of one slot. Every write presents its epoch; a stale one is refused.
