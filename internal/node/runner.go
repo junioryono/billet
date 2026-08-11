@@ -324,6 +324,11 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job Job) error 
 		Trust: trust,
 
 		JITConfig: reg.Config(),
+
+		// What actually starts the runner. Backends refuse an empty command
+		// because a container image's default is a shell, which exits at once and
+		// leaves the job queued while every signal says the launch worked.
+		Command: tier.RunnerCommand(),
 	})
 	if err != nil {
 		// A LAUNCH ERROR IS NOT PROOF NOTHING STARTED.
