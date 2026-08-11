@@ -144,7 +144,6 @@ type Runner struct {
 // quickly is better logged than waited for.
 const strayCleanupTimeout = 30 * time.Second
 
-// New builds a runner over a provider.
 // Option configures a Runner.
 type Option func(*Runner)
 
@@ -161,6 +160,7 @@ func WithMaxCustody(d time.Duration) Option {
 	return func(r *Runner) { r.maxCustody = d }
 }
 
+// New builds a runner over a provider.
 func New(
 	a LeaseStore, node string, jit JITSource, p provider.Provider,
 	tiers []config.Tier, log *slog.Logger, opts ...Option,

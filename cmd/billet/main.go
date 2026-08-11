@@ -266,7 +266,6 @@ func cmdServer(ctx context.Context, lc *lifecycle, args []string) error {
 	return runServer(ctx, lc, cfg, *dryRun)
 }
 
-// runServer starts the control plane and blocks until it is told to stop.
 // claimNodeDeployment reads this host's identity and takes the host-wide lock on
 // it.
 //
@@ -398,6 +397,7 @@ func nodeContribution(cfg *config.Config) (config.Contribution, error) {
 	return cfg.Node.Contribution(vcpu, memory), nil
 }
 
+// runServer starts the control plane and blocks until it is told to stop.
 func runServer(ctx context.Context, lc *lifecycle, cfg *config.Config, dryRun bool) error {
 	// Built by the SHARED constructor, so the server and teardown authenticate
 	// identically. Two near-identical constructions is how one of them ends up
@@ -860,9 +860,6 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 	})
 }
 
-// cmdCheck is the explicit "is this deployment sane" command. It is the only
-// path that opens — and therefore migrates — the state database, so that
-// mutating durable state is always something the operator asked for.
 // newScaleSetClient builds the GitHub client from config, reading the key with
 // the same hardened reader `billet check` uses.
 //
@@ -1211,6 +1208,9 @@ func cmdCAShow(args []string) error {
 	return nil
 }
 
+// cmdCheck is the explicit "is this deployment sane" command. It is the only
+// path that opens — and therefore migrates — the state database, so mutating
+// durable state is always something the operator asked for.
 func cmdCheck(ctx context.Context, args []string) error {
 	fs := newFlagSet("billet check")
 	cfgPath := addConfigFlag(fs)

@@ -18,12 +18,6 @@ import (
 	"github.com/junioryono/billet/internal/wirecert"
 )
 
-// LeaseStore is the ledger, as the node wire needs it.
-//
-// Declared here rather than imported from internal/node so the transport does
-// not depend on the runtime it serves — the two are on opposite sides of a
-// process boundary and coupling them would defeat the point of having one. The
-// shapes match because both describe the same allocator.
 // JITSource mints runner registrations. Held by the control plane alone.
 //
 // The same shape internal/node.JITSource has, declared separately for the same
@@ -45,6 +39,11 @@ type JITRegistration interface {
 	RunnerName() string
 }
 
+// LeaseStore is the ledger, as the node wire needs it.
+//
+// Declared here rather than imported from internal/node so the transport does
+// not depend on the runtime it serves — the two are on opposite sides of a
+// process boundary. The shapes match because both describe the same allocator.
 type LeaseStore interface {
 	Bind(ctx context.Context, leaseID string, epoch int64, node string) error
 	Advance(ctx context.Context, leaseID string, epoch int64, to alloc.Phase) error
