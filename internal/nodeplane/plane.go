@@ -1159,15 +1159,12 @@ func (p *Plane) expireStaleLocked() {
 			continue
 		}
 
-		for id, pend := range n.inflight {
-			p.answerLocked(pend, nodeapi.CommandResult{
-				ID:      id,
-				Custody: pend.cmd.Kind == nodeapi.CommandLaunch,
-				Error: fmt.Sprintf("node %q went silent for %s, so the outcome of this command "+
-					"is unknown", name, p.staleAfter()),
-			})
-		}
-
+		// NOTHING IN FLIGHT IS ANSWERED HERE, because the guard above means there
+		// is nothing in flight to answer. A loop doing exactly that used to sit at
+		// this line, unreachable, telling a reader that expiry hands custody of a
+		// running launch to the node. It does not, and it must not — that is the
+		// harm the guard was added to prevent.
+		//
 		// Queued commands never reached it, so they are unambiguous: nothing
 		// started, and the caller may act on that certainty.
 		for _, pend := range n.queue {
