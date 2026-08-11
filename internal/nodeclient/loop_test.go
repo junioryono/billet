@@ -165,7 +165,9 @@ func (f *fakeCompute) aliveCount() int {
 	return f.keptAlive
 }
 
-func (f *fakeCompute) Launch(_ context.Context, _ *alloc.Lease, job server.Job) error {
+func (f *fakeCompute) Launch(
+	_ context.Context, _ *alloc.Lease, _ *nodeapi.TierSpec, job server.Job,
+) error {
 	f.mu.Lock()
 	f.launched = append(f.launched, job.RequestID)
 	f.order = append(f.order, "launch")
@@ -246,7 +248,14 @@ func harness(t *testing.T) (*nodeplane.Plane, *nodeclient.Client) {
 	t.Helper()
 
 	log := slog.New(slog.DiscardHandler)
-	p := nodeplane.New(log, deployment, time.Minute, nodeplane.WithCommandTimeout(5*time.Second))
+	// WITH A CATALOGUE: a launch carries its tier's shape to the node, so a plane
+	// that cannot describe the tier refuses the launch before dispatching it.
+	p := nodeplane.New(log, deployment, time.Minute,
+		nodeplane.WithCommandTimeout(5*time.Second),
+		nodeplane.WithTierCatalog([]config.Tier{{
+			Label: "billet-2vcpu", Provider: config.ProviderDocker, GuestOS: config.GuestLinux,
+			VCPU: 2, Memory: 8 * config.GiB, Image: "ubuntu-2404-x64",
+		}}))
 	p.SetPollWindowForTest(60 * time.Millisecond)
 
 	srv := httptest.NewServer(nodeplane.Handler(log, p, stubStore{}, stubJIT{}))
@@ -315,6 +324,7 @@ func TestRecoveryPrecedesTheFirstLaunch(t *testing.T) {
 
 	lease := &alloc.Lease{
 		ID:        "l1",
+		Tier:      "billet-2vcpu",
 		VCPU:      2,
 		Memory:    8 * config.GiB,
 		GuestOS:   config.GuestLinux,
@@ -379,6 +389,7 @@ func TestCustodyCrossesBackAsAFlag(t *testing.T) {
 
 	lease := &alloc.Lease{
 		ID:        "l1",
+		Tier:      "billet-2vcpu",
 		VCPU:      2,
 		Memory:    8 * config.GiB,
 		GuestOS:   config.GuestLinux,
@@ -409,6 +420,7 @@ func TestACleanFailureIsNotCustody(t *testing.T) {
 
 	lease := &alloc.Lease{
 		ID:        "l1",
+		Tier:      "billet-2vcpu",
 		VCPU:      2,
 		Memory:    8 * config.GiB,
 		GuestOS:   config.GuestLinux,
@@ -444,6 +456,7 @@ func TestANodeThatCannotRecoverTakesNoWork(t *testing.T) {
 	// the caller is told nothing started.
 	lease := &alloc.Lease{
 		ID:        "l1",
+		Tier:      "billet-2vcpu",
 		VCPU:      2,
 		Memory:    8 * config.GiB,
 		GuestOS:   config.GuestLinux,
@@ -628,6 +641,7 @@ func TestALateResultMakesTheNodeAssumeCustody(t *testing.T) {
 	go func() {
 		lease := &alloc.Lease{
 			ID:        "l1",
+			Tier:      "billet-2vcpu",
 			VCPU:      2,
 			Memory:    8 * config.GiB,
 			GuestOS:   config.GuestLinux,
@@ -694,6 +708,7 @@ func TestARegistrationHandsOverCustodyOfWhatWasInFlight(t *testing.T) {
 	go func() {
 		lease := &alloc.Lease{
 			ID:        "l1",
+			Tier:      "billet-2vcpu",
 			VCPU:      2,
 			Memory:    8 * config.GiB,
 			GuestOS:   config.GuestLinux,
@@ -759,6 +774,7 @@ func TestALostResultMakesTheNodeAssumeCustody(t *testing.T) {
 
 	lease := &alloc.Lease{
 		ID:        "l1",
+		Tier:      "billet-2vcpu",
 		VCPU:      2,
 		Memory:    8 * config.GiB,
 		GuestOS:   config.GuestLinux,

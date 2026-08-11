@@ -410,6 +410,7 @@ func TestADrainingNodeAcceptsDestroyAndRefusesLaunch(t *testing.T) {
 	// because each new job extends the wait it is trying to finish.
 	lease := &alloc.Lease{
 		ID:        "l1",
+		Tier:      "billet-2vcpu",
 		VCPU:      2,
 		Memory:    8 * config.GiB,
 		GuestOS:   config.GuestLinux,

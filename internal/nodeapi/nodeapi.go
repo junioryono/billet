@@ -36,7 +36,7 @@ import (
 // register a host nothing can ever be placed on — silently, because a node with
 // no capacity is indistinguishable from a busy one. Refusing the registration is
 // the correct outcome rather than an inconvenience, which is what this bump buys.
-const Version = 2
+const Version = 3
 
 // CommandKind names what the server is asking a node to do.
 type CommandKind string
@@ -148,6 +148,15 @@ type Command struct {
 	Lease *alloc.Lease `json:"lease,omitempty"`
 	Job   *Job         `json:"job,omitempty"`
 
+	// Tier is the shape of the machine to start, carried so a node needs no tier
+	// catalogue of its own.
+	//
+	// THE CONTROL PLANE IS THE ONE AUTHORITY ON WHAT A TIER IS. A node that read
+	// its own copy needed that copy to match the server's, and nothing checked:
+	// a missing tier refused the launch loudly, but a tier whose `image:` had
+	// drifted ran the WRONG image with no error anywhere.
+	Tier *TierSpec `json:"tier,omitempty"`
+
 	// RequestID is what a destroy names. Destroy is by request rather than by
 	// lease because it must work for compute whose lease is already gone.
 	RequestID int64 `json:"request_id,omitempty"`
@@ -165,6 +174,39 @@ func (c Command) RequestIDOf() int64 {
 	}
 
 	return c.RequestID
+}
+
+// TierSpec is everything about a tier a node needs to start an instance and to
+// mint a registration for it.
+//
+// Only the fields the lease does not already carry. vCPU, memory, guest OS and
+// the acceptable providers ride on the lease, which is the authority for them
+// precisely because it was snapshotted when the reservation was made.
+type TierSpec struct {
+	Label string `json:"label"`
+	Image string `json:"image"`
+	// Command starts the runner inside the instance. Empty means the image's
+	// stock entrypoint.
+	Command []string `json:"command,omitempty"`
+	// Disk and SHM size the instance. Zero means the backend's default.
+	Disk config.ByteSize `json:"disk,omitempty"`
+	SHM  config.ByteSize `json:"shm,omitempty"`
+	// RunnerGroup is part of a tier's ADDRESS: resolving a scale set without one
+	// silently means "the default group", so a tier deliberately placed elsewhere
+	// would have its registrations refused.
+	RunnerGroup string `json:"runner_group,omitempty"`
+}
+
+// TierSpecOf renders the parts of a tier that travel to a node.
+func TierSpecOf(t config.Tier) *TierSpec {
+	return &TierSpec{
+		Label:       t.Label,
+		Image:       t.Image,
+		Command:     t.RunnerCommand(),
+		Disk:        t.Disk,
+		SHM:         t.SHM,
+		RunnerGroup: t.RunnerGroup,
+	}
 }
 
 // Job is the scale-set assignment a launch is for.

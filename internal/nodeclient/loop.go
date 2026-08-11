@@ -28,7 +28,7 @@ import (
 // sold to somebody else. That is precisely the failure custody was built to
 // prevent, reintroduced by moving the runner behind a network.
 type Compute interface {
-	Launch(ctx context.Context, lease *alloc.Lease, job server.Job) error
+	Launch(ctx context.Context, lease *alloc.Lease, tier *nodeapi.TierSpec, job server.Job) error
 	Destroy(ctx context.Context, requestID int64) error
 	Recover(ctx context.Context) error
 	Sweep(ctx context.Context) error
@@ -624,7 +624,7 @@ func execute(ctx context.Context, compute Compute, cmd nodeapi.Command, draining
 			return res
 		}
 
-		err := compute.Launch(ctx, cmd.Lease, server.Job{
+		err := compute.Launch(ctx, cmd.Lease, cmd.Tier, server.Job{
 			RequestID: cmd.Job.RequestID,
 			RunID:     cmd.Job.RunID,
 			Event:     cmd.Job.Event,

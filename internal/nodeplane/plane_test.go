@@ -45,7 +45,21 @@ func (c *testClock) advancePastSilence() { c.nanos.Add(int64(10 * time.Minute)) 
 func testPlane(t *testing.T, opts ...Option) *Plane {
 	t.Helper()
 
+	// WITH A CATALOGUE, because a launch carries the tier's shape to the node and
+	// the plane refuses one it cannot describe. A test plane without it fails
+	// every launch before dispatch, which reads as "the command was never
+	// delivered".
+	opts = append([]Option{WithTierCatalog([]config.Tier{testTier()})}, opts...)
+
 	return New(slog.New(slog.DiscardHandler), deployment, time.Minute, opts...)
+}
+
+// testTier is the catalogue entry testLease names.
+func testTier() config.Tier {
+	return config.Tier{
+		Label: "billet-2vcpu", Provider: config.ProviderDocker, GuestOS: config.GuestLinux,
+		VCPU: 2, Memory: 8 * config.GiB, Image: "ubuntu-2404-x64",
+	}
 }
 
 func register(t *testing.T, p *Plane, name string, provider config.ProviderKind) {

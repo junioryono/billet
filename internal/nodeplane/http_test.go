@@ -173,6 +173,10 @@ func serve(t *testing.T, store nodeplane.LeaseStore, opts ...nodeplane.Option) (
 	t.Helper()
 
 	log := slog.New(slog.DiscardHandler)
+	opts = append([]nodeplane.Option{nodeplane.WithTierCatalog([]config.Tier{{
+		Label: "billet-2vcpu", Provider: config.ProviderDocker, GuestOS: config.GuestLinux,
+		VCPU: 2, Memory: 8 * config.GiB, Image: "ubuntu-2404-x64",
+	}})}, opts...)
 	p := nodeplane.New(log, deployment, time.Minute, opts...)
 	srv := httptest.NewServer(nodeplane.Handler(log, p, store, nil))
 
@@ -224,6 +228,7 @@ func TestACommandAndItsResultCrossTheWire(t *testing.T) {
 
 	lease := &alloc.Lease{
 		ID:        "l1",
+		Tier:      "billet-2vcpu",
 		VCPU:      2,
 		Memory:    8 * config.GiB,
 		GuestOS:   config.GuestLinux,
@@ -490,7 +495,10 @@ func TestTheNodeTakesItsTimingsFromTheServer(t *testing.T) {
 	t.Parallel()
 
 	log := slog.New(slog.DiscardHandler)
-	p := nodeplane.New(log, deployment, 90*time.Second)
+	p := nodeplane.New(log, deployment, 90*time.Second, nodeplane.WithTierCatalog([]config.Tier{{
+		Label: "billet-2vcpu", Provider: config.ProviderDocker, GuestOS: config.GuestLinux,
+		VCPU: 2, Memory: 8 * config.GiB, Image: "ubuntu-2404-x64",
+	}}))
 	srv := httptest.NewServer(nodeplane.Handler(log, p, &fakeStore{}, nil))
 
 	t.Cleanup(srv.Close)
@@ -526,7 +534,10 @@ func TestUnknownFieldsAreRefused(t *testing.T) {
 	t.Parallel()
 
 	log := slog.New(slog.DiscardHandler)
-	p := nodeplane.New(log, deployment, time.Minute)
+	p := nodeplane.New(log, deployment, time.Minute, nodeplane.WithTierCatalog([]config.Tier{{
+		Label: "billet-2vcpu", Provider: config.ProviderDocker, GuestOS: config.GuestLinux,
+		VCPU: 2, Memory: 8 * config.GiB, Image: "ubuntu-2404-x64",
+	}}))
 	srv := httptest.NewServer(nodeplane.Handler(log, p, &fakeStore{}, nil))
 
 	t.Cleanup(srv.Close)
@@ -667,7 +678,10 @@ func TestRegistrationReachesTheLedger(t *testing.T) {
 	reg := &fakeRegistrar{}
 
 	log := slog.New(slog.DiscardHandler)
-	p := nodeplane.New(log, deployment, time.Minute, nodeplane.WithRegistrar(reg))
+	p := nodeplane.New(log, deployment, time.Minute, nodeplane.WithRegistrar(reg), nodeplane.WithTierCatalog([]config.Tier{{
+		Label: "billet-2vcpu", Provider: config.ProviderDocker, GuestOS: config.GuestLinux,
+		VCPU: 2, Memory: 8 * config.GiB, Image: "ubuntu-2404-x64",
+	}}))
 	srv := httptest.NewServer(nodeplane.Handler(log, p, &fakeStore{}, nil))
 
 	t.Cleanup(srv.Close)
@@ -690,7 +704,10 @@ func TestALedgerRefusalFailsTheRegistration(t *testing.T) {
 	reg := &fakeRegistrar{err: errors.New("no such node in the fleet configuration")}
 
 	log := slog.New(slog.DiscardHandler)
-	p := nodeplane.New(log, deployment, time.Minute, nodeplane.WithRegistrar(reg))
+	p := nodeplane.New(log, deployment, time.Minute, nodeplane.WithRegistrar(reg), nodeplane.WithTierCatalog([]config.Tier{{
+		Label: "billet-2vcpu", Provider: config.ProviderDocker, GuestOS: config.GuestLinux,
+		VCPU: 2, Memory: 8 * config.GiB, Image: "ubuntu-2404-x64",
+	}}))
 	srv := httptest.NewServer(nodeplane.Handler(log, p, &fakeStore{}, nil))
 
 	t.Cleanup(srv.Close)
@@ -778,7 +795,10 @@ func TestOnlyAVerdictIsPermanent(t *testing.T) {
 		reg := &fakeRegistrar{err: errors.New("database is locked")}
 
 		log := slog.New(slog.DiscardHandler)
-		p := nodeplane.New(log, deployment, time.Minute, nodeplane.WithRegistrar(reg))
+		p := nodeplane.New(log, deployment, time.Minute, nodeplane.WithRegistrar(reg), nodeplane.WithTierCatalog([]config.Tier{{
+			Label: "billet-2vcpu", Provider: config.ProviderDocker, GuestOS: config.GuestLinux,
+			VCPU: 2, Memory: 8 * config.GiB, Image: "ubuntu-2404-x64",
+		}}))
 		srv := httptest.NewServer(nodeplane.Handler(log, p, &fakeStore{}, nil))
 
 		t.Cleanup(srv.Close)
@@ -803,7 +823,10 @@ func TestOnlyAVerdictIsPermanent(t *testing.T) {
 		t.Parallel()
 
 		log := slog.New(slog.DiscardHandler)
-		p := nodeplane.New(log, deployment, time.Minute)
+		p := nodeplane.New(log, deployment, time.Minute, nodeplane.WithTierCatalog([]config.Tier{{
+			Label: "billet-2vcpu", Provider: config.ProviderDocker, GuestOS: config.GuestLinux,
+			VCPU: 2, Memory: 8 * config.GiB, Image: "ubuntu-2404-x64",
+		}}))
 		srv := httptest.NewServer(nodeplane.Handler(log, p, &fakeStore{}, nil))
 
 		t.Cleanup(srv.Close)
@@ -864,5 +887,78 @@ func TestOnlyLoopbackIsSafeWithoutTLS(t *testing.T) {
 		if got := nodeplane.LoopbackOnly(addr); got != want {
 			t.Errorf("LoopbackOnly(%q) = %v, want %v", addr, got, want)
 		}
+	}
+}
+
+// THE TIER'S SHAPE TRAVELS WITH THE LAUNCH, so a node keeps no catalogue.
+//
+// A node that read its own copy needed that copy to agree with the control
+// plane's, and nothing checked. A tier missing from the node's file refused the
+// launch loudly; a tier whose `image:` had drifted ran the WRONG image, with no
+// error anywhere and nothing to compare against.
+//
+// The lease already carries what was decided when the reservation was made —
+// vCPU, memory, guest OS, acceptable providers. This is the rest of it: the
+// fields a node cannot get from the lease and previously had to look up.
+func TestALaunchCarriesTheTierShape(t *testing.T) {
+	t.Parallel()
+
+	p, base := serve(t, &fakeStore{}, nodeplane.WithTierCatalog([]config.Tier{{
+		Label: "billet-2vcpu", Provider: config.ProviderDocker, GuestOS: config.GuestLinux,
+		VCPU: 2, Memory: 8 * config.GiB,
+		Image: "ghcr.io/actions/actions-runner:latest",
+		Disk:  40 * config.GiB, SHM: 512 * config.MiB,
+		RunnerGroup: "billet", Command: []string{"/entrypoint.sh"},
+	}}))
+
+	c := dial(t, base)
+
+	got := make(chan nodeapi.Command, 1)
+
+	go func() {
+		cmd, took, err := c.Poll(t.Context())
+		if err == nil && took {
+			got <- cmd
+		}
+	}()
+
+	lease := &alloc.Lease{
+		ID: "l1", Tier: "billet-2vcpu", VCPU: 2, Memory: 8 * config.GiB,
+		GuestOS: config.GuestLinux, Providers: []config.ProviderKind{config.ProviderDocker},
+		Epoch: 1,
+	}
+
+	// Buffered and never read: the node never answers, so this returns custody
+	// long after the assertions below. The test is about what was DELIVERED.
+	launched := make(chan error, 1)
+
+	go func() { launched <- p.NewRunner().Launch(t.Context(), lease, server.Job{RequestID: 7}) }()
+
+	select {
+	case cmd := <-got:
+		if cmd.Tier == nil {
+			t.Fatal("the launch carried no tier shape, so the node has nothing to start")
+		}
+
+		if cmd.Tier.Image != "ghcr.io/actions/actions-runner:latest" {
+			t.Errorf("image = %q, want the catalogue's", cmd.Tier.Image)
+		}
+
+		if cmd.Tier.Disk != 40*config.GiB || cmd.Tier.SHM != 512*config.MiB {
+			t.Errorf("disk/shm = %s/%s, want the catalogue's", cmd.Tier.Disk, cmd.Tier.SHM)
+		}
+
+		// The runner group is part of a tier's ADDRESS: without it the node
+		// resolves the scale set in GitHub's default group and its registrations
+		// are refused.
+		if cmd.Tier.RunnerGroup != "billet" {
+			t.Errorf("runner_group = %q, want %q", cmd.Tier.RunnerGroup, "billet")
+		}
+
+		if len(cmd.Tier.Command) != 1 || cmd.Tier.Command[0] != "/entrypoint.sh" {
+			t.Errorf("command = %v, want the catalogue's", cmd.Tier.Command)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the launch never reached the node")
 	}
 }

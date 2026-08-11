@@ -88,7 +88,11 @@ func mtlsWire(t *testing.T) (*wirecert.CA, string) {
 	}
 
 	log := slog.New(slog.DiscardHandler)
-	plane := nodeplane.New(log, wireDeployment, time.Minute)
+	plane := nodeplane.New(log, wireDeployment, time.Minute,
+		nodeplane.WithTierCatalog([]config.Tier{{
+			Label: "billet-2vcpu", Provider: config.ProviderDocker, GuestOS: config.GuestLinux,
+			VCPU: 2, Memory: 8 * config.GiB, Image: "ubuntu-2404-x64", RunnerGroup: "billet",
+		}}))
 
 	// A SHORT POLL WINDOW, because these tests poll to observe a REFUSAL. At the
 	// production window an accepted poll blocks for the best part of a minute,
@@ -188,7 +192,11 @@ func mtlsWireWithSets(
 		opts = append(opts, nodeplane.WithClock(clock))
 	}
 
-	plane := nodeplane.New(log, wireDeployment, time.Minute, opts...)
+	plane := nodeplane.New(log, wireDeployment, time.Minute, append(opts,
+		nodeplane.WithTierCatalog([]config.Tier{{
+			Label: "billet-2vcpu", Provider: config.ProviderDocker, GuestOS: config.GuestLinux,
+			VCPU: 2, Memory: 8 * config.GiB, Image: "ubuntu-2404-x64", RunnerGroup: "billet",
+		}}))...)
 
 	// A SHORT POLL WINDOW, because these tests poll to observe a REFUSAL. At the
 	// production window an accepted poll blocks for the best part of a minute,
@@ -201,7 +209,7 @@ func mtlsWireWithSets(
 			// The catalogue a JIT request is checked against. Its runner group is
 			// part of a tier's address, so a wire without it refuses every
 			// legitimate registration for a tier outside the default group.
-			nodeplane.WithTiers([]config.Tier{{Label: "billet-2vcpu", RunnerGroup: "billet"}})))
+		))
 	srv.TLS = conf
 	srv.StartTLS()
 
@@ -419,7 +427,11 @@ func TestAWireRequiringCertificatesRefusesAPlainConnection(t *testing.T) {
 	t.Parallel()
 
 	log := slog.New(slog.DiscardHandler)
-	plane := nodeplane.New(log, wireDeployment, time.Minute)
+	plane := nodeplane.New(log, wireDeployment, time.Minute,
+		nodeplane.WithTierCatalog([]config.Tier{{
+			Label: "billet-2vcpu", Provider: config.ProviderDocker, GuestOS: config.GuestLinux,
+			VCPU: 2, Memory: 8 * config.GiB, Image: "ubuntu-2404-x64", RunnerGroup: "billet",
+		}}))
 
 	// A SHORT POLL WINDOW, because these tests poll to observe a REFUSAL. At the
 	// production window an accepted poll blocks for the best part of a minute,

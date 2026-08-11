@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -33,6 +34,7 @@ import (
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/fakeactions"
 	"github.com/junioryono/billet/internal/node"
+	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/nodeclient"
 	"github.com/junioryono/billet/internal/nodeplane"
 	"github.com/junioryono/billet/internal/provider/docker"
@@ -291,9 +293,12 @@ type stack struct {
 	// can open the same directory. Idempotent — the cleanup calls it too.
 	closeDB func()
 
-	plane    *plane
-	alloc    *alloc.Allocator
-	runner   *node.Runner
+	plane  *plane
+	alloc  *alloc.Allocator
+	runner *node.Runner
+	// tiers is the catalogue this stack was built with, so a test driving the
+	// runner directly can send the shape the control plane would have sent.
+	tiers    []config.Tier
 	server   *server.Server
 	provider *docker.Provider
 	node     string
@@ -325,6 +330,37 @@ func newWireStack(t *testing.T) *stack {
 type stackOpt func(*stackConfig)
 
 type stackConfig struct{ wire bool }
+
+// directRunner drives the node runtime without a socket between it and the
+// control plane.
+//
+// A TEST HARNESS, NOT A DEPLOYMENT SHAPE. billet has no in-process node any
+// more, so the only thing that supplies a launch with its tier shape in
+// production is the plane's dispatch. This stands in for that, which is exactly
+// why the wire has its own end-to-end stack: a bug in what the plane puts ON the
+// command is invisible from here.
+type directRunner struct {
+	runner *node.Runner
+	tiers  []config.Tier
+}
+
+func (d directRunner) Launch(ctx context.Context, lease *alloc.Lease, job server.Job) error {
+	for i := range d.tiers {
+		if d.tiers[i].Label == lease.Tier {
+			return d.runner.Launch(ctx, lease, nodeapi.TierSpecOf(d.tiers[i]), job)
+		}
+	}
+
+	return fmt.Errorf("e2e: no tier %q in the test catalogue", lease.Tier)
+}
+
+func (d directRunner) Destroy(ctx context.Context, requestID int64) error {
+	return d.runner.Destroy(ctx, requestID)
+}
+
+func (d directRunner) Sweep(ctx context.Context) error { return d.runner.Sweep(ctx) }
+func (d directRunner) Tend(ctx context.Context) error  { return d.runner.Tend(ctx) }
+func (d directRunner) KeepAlive(ctx context.Context)   { d.runner.KeepAlive(ctx) }
 
 // overTheWire puts a real node wire between the control plane and the runner.
 func overTheWire(c *stackConfig) { c.wire = true }
@@ -441,8 +477,10 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 	if sc.wire {
 		runner, serverOpts = wireUp(t, log, a, client, prov, tiers, deployment, computeName)
 	} else {
-		runner = node.New(a, host, wiring.JITSource{Client: client}, prov, tiers, log)
-		serverOpts = []server.ControlPlaneOption{server.WithNodeRunner(runner)}
+		runner = node.New(a, host, wiring.JITSource{Client: client}, prov, log)
+		serverOpts = []server.ControlPlaneOption{
+			server.WithNodeRunner(directRunner{runner: runner, tiers: tiers}),
+		}
 	}
 
 	serverOpts = append(serverOpts,
@@ -466,7 +504,7 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 
 	return &stack{
 		dir: dir, closeDB: closeDB, plane: p, alloc: a,
-		runner: runner, server: srv, provider: prov, node: host,
+		runner: runner, server: srv, provider: prov, node: host, tiers: tiers,
 	}
 }
 
@@ -482,7 +520,8 @@ func wireUp(
 ) (*node.Runner, []server.ControlPlaneOption) {
 	t.Helper()
 
-	plane := nodeplane.New(log, deployment, a.LeaseTTL(), nodeplane.WithRegistrar(a))
+	plane := nodeplane.New(log, deployment, a.LeaseTTL(),
+		nodeplane.WithRegistrar(a), nodeplane.WithTierCatalog(tiers))
 
 	var lc net.ListenConfig
 
@@ -492,7 +531,7 @@ func wireUp(
 	}
 
 	wire := &http.Server{
-		Handler:           nodeplane.Handler(log, plane, a, wiring.NodeJIT{Client: client}, nodeplane.WithTiers(tiers)),
+		Handler:           nodeplane.Handler(log, plane, a, wiring.NodeJIT{Client: client}),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -519,7 +558,7 @@ func wireUp(
 
 	// THE CLIENT IS BOTH LEDGER AND MINT, exactly as `billet node` wires it. The
 	// runner has no idea it became remote.
-	runner := node.New(nc, host, nc, prov, tiers, log)
+	runner := node.New(nc, host, nc, prov, log)
 
 	ctx, cancel := context.WithCancel(t.Context())
 

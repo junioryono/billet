@@ -64,22 +64,6 @@ const maxBody = 1 << 20
 // HandlerOption configures the wire.
 type HandlerOption func(*handler)
 
-// WithTiers gives the wire the catalogue it needs to check a JIT request.
-//
-// A TIER'S RUNNER GROUP IS PART OF ITS ADDRESS, and resolving a scale set
-// without one silently means "the default group". A tier deliberately placed in
-// another group — which is how an operator stops every repository in the
-// organisation from reaching it — would then have its legitimate registrations
-// refused, because the set looked for is not the set that exists.
-func WithTiers(tiers []config.Tier) HandlerOption {
-	return func(h *handler) {
-		h.tiers = make(map[string]config.Tier, len(tiers))
-		for i := range tiers {
-			h.tiers[tiers[i].Label] = tiers[i]
-		}
-	}
-}
-
 // RequireClientCert makes a verified certificate the source of a node's name.
 //
 // WITHOUT IT THE PATH IS THE ONLY AUTHORITY, which is not authentication at all:
@@ -144,9 +128,6 @@ type handler struct {
 	store       LeaseStore
 	jit         JITSource
 	requireCert bool
-
-	// tiers is the catalogue, by label, used to resolve a lease's scale set.
-	tiers map[string]config.Tier
 
 	// sets caches the resolved scale set per tier.
 	//
@@ -716,7 +697,7 @@ func (h *handler) jitConfig(w http.ResponseWriter, r *http.Request) {
 	// would join a tier with different labels, different jobs and possibly
 	// different secrets. The set is resolved here, from the lease's own tier,
 	// rather than taken from the request.
-	known, ok := h.tiers[tier]
+	known, ok := h.plane.tierFor(tier)
 	if !ok {
 		writeErr(w, http.StatusForbidden, nodeapi.CodeRefused, fmt.Sprintf(
 			"lease %s names tier %q, which is not in this control plane's catalogue", leaseID, tier))
