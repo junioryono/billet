@@ -237,36 +237,31 @@ type Listener struct {
 
 	lastMessageID int64
 
-	// maxCapacity, when set, caps what this listener advertises. nil means the
-	// escrow decides, which is the ordinary case.
+	// maxCapacity caps what this listener advertises. nil lets the escrow decide.
 	maxCapacity *int
 
-	// stalePromise is how long a promise may go unclaimed before it is reported.
 	stalePromise time.Duration
 
-	// shutdownGrace bounds the remote half of the teardown, so an unbounded
-	// Destroy cannot keep Run — and the renewal that outlives it — running
-	// forever. closeGrace and releaseGrace bound the two local phases after it.
+	// Bounds the remote half of the teardown, so an unbounded Destroy cannot keep
+	// Run — and the renewal that outlives it — running forever. closeGrace and
+	// releaseGrace bound the two local phases after it.
 	shutdownGrace time.Duration
 	closeGrace    time.Duration
 	releaseGrace  time.Duration
 
-	// retryFirst and retryMax pace the cleanup retries. retryFirst <= 0 turns
-	// pacing off entirely, which only tests ask for.
+	// retryFirst <= 0 turns retry pacing off entirely, which only tests ask for.
 	retryFirst time.Duration
 	retryMax   time.Duration
 
-	// destroying is the requests a cleanup retry is inside a Destroy for right
-	// now. The shutdown pass skips them: that destroy is already happening, and
-	// issuing a second one only spends the teardown budget on work in progress.
+	// Requests a cleanup retry is inside a Destroy for right now. The shutdown
+	// pass skips them rather than spending its budget on work already happening.
 	destroying map[int64]bool
 
-	// sealed stops the cleanup loop starting anything new. Set under l.mu before
-	// the loop is cancelled, so "no new attempts" and "what is in flight" are one
-	// decision rather than two — see attempt.
+	// Stops the cleanup loop starting anything new. Set under l.mu before the loop
+	// is cancelled, so "no new attempts" and "what is in flight" are one decision.
 	sealed bool
 
-	// ran records that Run has been called. A Listener is single-use; see Run.
+	// A Listener is single-use; see Run.
 	ran bool
 
 	// confirmed is when each lease was last successfully renewed, keyed by lease
@@ -282,24 +277,20 @@ type Listener struct {
 	// anywhere else, and layered defaults do exactly that.
 	configErrs map[string]error
 
-	// runner turns assigned leases into compute. Never nil; see noRunner.
+	// Never nil; see noRunner.
 	runner Runner
 
-	// observed is the last statistics GitHub reported. TotalAssignedJobs is the
-	// documented scaling signal — counting messages is not, because a response
-	// carries at most 50 and a large backlog is truncated.
+	// TotalAssignedJobs is the documented scaling signal; counting messages is
+	// not, because a response carries at most 50 and a large backlog is truncated.
 	observed *Statistics
 
-	// drainGrace bounds the DRAIN, which is a different kind of wait from every
-	// other budget here and so has its own ceiling. The others bound a teardown —
-	// work billet is doing. This one bounds somebody else's JOB.
+	// Bounds somebody else's JOB rather than billet's own teardown, so it has its
+	// own ceiling. See maxDrainGrace.
 	drainGrace time.Duration
-	// draining says this listener has been asked to stop and is finishing what it
-	// already has. Guarded by mu, and NOT the same thing as sealed.
+	// Guarded by mu, and NOT the same thing as sealed.
 	draining bool
-	// hurry, when closed, ends the drain's wait early. It is how a second signal
-	// says "stop waiting" without also saying "abandon what you are holding".
-	// Read here and never closed here.
+	// Closing it ends the drain's wait without abandoning what is held. Read
+	// here, never closed here.
 	hurry <-chan struct{}
 }
 
@@ -360,15 +351,12 @@ type promise struct {
 // pendingCleanup is a completion whose destroy has not succeeded yet.
 type pendingCleanup struct {
 	job Job
-	// wait is how long to leave it after the most recent failure, doubling each
-	// time up to maxRetryEvery.
+	// Doubles after each failure, up to maxRetryEvery.
 	wait time.Duration
-	// at is when it may next be attempted. Zero means immediately, which is what
-	// a freshly recorded failure wants: the node may have blinked.
+	// Zero means immediately, which is what a freshly recorded failure wants.
 	at time.Time
-	// declined keeps a request billet cannot take yet from saying so on every
-	// poll. GitHub re-offers an unacquired job indefinitely, so the message is
-	// worth exactly once per obligation.
+	// GitHub re-offers an unacquired job indefinitely, so the message is worth
+	// exactly once per obligation.
 	declined bool
 }
 
@@ -385,8 +373,7 @@ func (p *pendingCleanup) due(now time.Time) bool {
 // permanent one.
 func (p *pendingCleanup) failed(now time.Time, first, ceiling time.Duration) {
 	if first <= 0 {
-		// Pacing off. Used by tests whose subject is what a retry DOES rather than
-		// when it runs; the pacing itself has a test of its own.
+		// Pacing off, for tests whose subject is what a retry does rather than when.
 		p.wait, p.at = 0, time.Time{}
 
 		return
@@ -420,11 +407,9 @@ func (p *pendingCleanup) failed(now time.Time, first, ceiling time.Duration) {
 const defaultStalePromise = 5 * time.Minute
 
 const (
-	// firstRetryEvery is the pause after a retry fails for the first time.
 	firstRetryEvery = 15 * time.Second
-	// maxRetryEvery is the ceiling. A node that has been refusing for this long is
-	// not about to answer sooner for being asked more often, and the point of the
-	// ceiling is that it keeps asking at all.
+	// A node refusing this long will not answer sooner for being asked more often;
+	// the point of the ceiling is that it keeps asking at all.
 	maxRetryEvery = 5 * time.Minute
 	// teardownConcurrency is how many destroys the shutdown runs at once.
 	//
@@ -987,9 +972,8 @@ func (l *Listener) Run(ctx context.Context) error {
 		l.releaseAll(releaseCtx, destroyed)
 	}()
 
-	// Seeded from the session before the first poll. A restart does not replay
-	// messages for work already assigned, so a listener that waits to be told
-	// about a backlog sits idle in front of one.
+	// A restart does not replay messages for work already assigned, so a listener
+	// that waits to be told about a backlog sits idle in front of one.
 	l.observed = l.session.Statistics()
 	l.reportOrphanedBacklog()
 
