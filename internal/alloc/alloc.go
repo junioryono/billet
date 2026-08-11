@@ -534,13 +534,13 @@ func (a *Allocator) Escrow(ctx context.Context, tier string, want int) ([]*Lease
 		// until the transaction commits. Asking the ledger again per lease would
 		// return the same fleet every time and aim every reservation at the same
 		// machine.
-		place, err := a.newPlacer(ctx, tx, t)
+		place, err := a.placerWithFloors(ctx, tx, t)
 		if err != nil {
 			return err
 		}
 
 		for range take {
-			target, ok := place.next()
+			target, ok := place.next(t)
 			if !ok {
 				// The fleet ran out before the ceiling did. Headroom is the smaller
 				// of the two, so this should not happen — but returning what was
@@ -774,23 +774,12 @@ func (a *Allocator) headroom(ctx context.Context, tx *sql.Tx, t config.Tier) (in
 // nothing, which is why a deployment whose only machine runs the wrong backend
 // advertises zero rather than its ceiling.
 func (a *Allocator) fleetHeadroom(ctx context.Context, tx *sql.Tx, t config.Tier) (int, error) {
-	nodes, err := a.eligibleNodes(ctx, tx, t)
+	p, err := a.placerWithFloors(ctx, tx, t)
 	if err != nil {
 		return 0, err
 	}
 
-	total := 0
-
-	for _, n := range nodes {
-		room, err := a.headroomOn(ctx, tx, n, t)
-		if err != nil {
-			return 0, err
-		}
-
-		total += room
-	}
-
-	return total, nil
+	return p.total(t), nil
 }
 
 // Reserve escrows capacity for one instance of a tier.
@@ -818,12 +807,12 @@ func (a *Allocator) Reserve(ctx context.Context, tier string) (*Lease, error) {
 			return fmt.Errorf("%w for tier %q", ErrNoCapacity, t.Label)
 		}
 
-		place, err := a.newPlacer(ctx, tx, t)
+		place, err := a.placerWithFloors(ctx, tx, t)
 		if err != nil {
 			return err
 		}
 
-		target, ok := place.next()
+		target, ok := place.next(t)
 		if !ok {
 			return fmt.Errorf("%w for tier %q", ErrNoCapacity, t.Label)
 		}
