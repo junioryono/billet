@@ -180,9 +180,8 @@ built. What works **today**:
 | `billet github-app create` | Creates and installs the GitHub App via the manifest flow |
 | `billet check` | Validates the config, the App private key, and the state database |
 | `billet server --dry-run` | Connects to a real org, reconciles scale sets, polls — accepts nothing |
-| `billet server` | The control plane on its own, serving the node wire. **Start the nodes first** — capacity is advertised from the budget without checking that any node exists, so a job assigned while none is registered is acquired and fails to launch. billet releases its own capacity, but it has no way to decline the assignment — that stays with GitHub until the pickup deadline, which cancels and requeues it [up to three times](https://github.com/actions/scaleset/blob/v0.4.0/README.md#job-reassignment) |
-| `billet server --dev` | Control plane + node in one process: acquires jobs and runs them in containers |
-| `billet node` | A separate compute host that dials the control plane and never listens |
+| `billet server` | The control plane, serving the node wire. It runs no compute of its own — a machine that should also run jobs runs `billet node` beside it. A fleet with no live node advertises zero, so an empty fleet is told to GitHub rather than discovered when a job fails to launch |
+| `billet node` | A compute host: dials the control plane, never listens. One per machine, including the machine the server is on |
 | `billet ca issue <node>` | Mints the certificate a node authenticates with, for an operator to copy |
 | `billet teardown` | Removes the scale sets billet created |
 | Capacity ledger | Lease state machine, fencing epochs, placement enforcement, escrow before advertising |
@@ -259,8 +258,8 @@ Everything below describes the intended design. Where a thing is not built, it s
 ## Quickstart
 
 > **The example config does not run as shipped**, and the provider is not the only thing to change. It
-> describes the intended Firecracker deployment, and that provider is not built, so `--dev` refuses
-> it. Change `provider: firecracker` to `provider: docker` in the `node:` section and in every tier
+> describes the intended Firecracker deployment, and that provider is not built, so `billet node`
+> refuses it. Change `provider: firecracker` to `provider: docker` in the `node:` section and in every tier
 > — **and** change each tier's `image:` to a Docker image containing the GitHub runner, such as
 > `ghcr.io/actions/actions-runner:latest`. The image name is handed straight to `docker run`, so
 > `ubuntu-2404-x64` is a Firecracker golden-image name and will not pull. Making only the first edit
@@ -273,8 +272,16 @@ billet github-app create --org myorg           # creates + installs the App, PRI
 cp billet.example.yaml ./billet.yaml           # then edit it — see below, three things
 billet check --config ./billet.yaml            # validates config, key, state
 billet server --dry-run --config ./billet.yaml  # first contact: polls, accepts nothing
-billet server --dev --config ./billet.yaml     # runs jobs
+
+billet server --config ./billet.yaml            # then, in two terminals:
+billet node   --config ./billet.yaml            # the machine that runs the jobs
 ```
+
+**A single machine runs both**, as two processes reading the same file. They talk over the loopback
+address in `server.listen`, so nothing is exposed to the network and no certificates are involved: a
+control plane listening only on loopback serves plain HTTP, because there is nothing between two
+processes on one box to authenticate. Certificates start mattering when you add a second machine —
+`billet ca issue <node>` mints one, and the server then has to listen where that machine can reach it.
 
 **The three edits**, because nothing writes the file for you:
 
@@ -285,10 +292,12 @@ billet server --dev --config ./billet.yaml     # runs jobs
    warning above.
 3. **`server.state_dir`** defaults to `/var/lib/billet/server`, which an unprivileged `billet server`
    cannot create. Point it somewhere you can write (`./state/server`) or pre-create it with the right
-   owner. `node.state_dir` only matters for a standalone `billet node`; `--dev` never reads it.
+   owner. `node.state_dir` is separate and is read by `billet node`; on one machine the two
+   directories are different and that is fine — a node with no certificate takes its deployment
+   identity from the `server:` section in the same file.
 
-**And Docker has to be there.** `billet check` never touches it, but `server --dev` calls
-`docker ps` before it polls anything, to re-adopt containers from a previous run. No CLI, no running
+**And Docker has to be there.** `billet check` never touches it, but `billet node` calls
+`docker ps` before it takes any work, to re-adopt containers from a previous run. No CLI, no running
 daemon, or no permission on the socket, and it stops there.
 
 `--config` is not optional here. billet deliberately does **not** read a
@@ -310,10 +319,11 @@ jobs:
 One binary, two roles (the Nomad/Consul model):
 
 ```
-billet server        control plane — scale-set listeners, capacity allocator, scheduler, state
-billet node          compute host  — runs a provider, launches instances, reports capacity
-billet server --dev  both, on one box
+billet server   control plane — scale-set listeners, capacity allocator, scheduler, state
+billet node     compute host  — runs a provider, launches instances, reports capacity
 ```
+
+One machine runs both as two processes over loopback; there is no combined mode.
 
 ```
                  GitHub  ◄── outbound long-poll only, no inbound

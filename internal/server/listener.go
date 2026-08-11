@@ -43,7 +43,7 @@ type Session interface {
 // Runner turns an assigned lease into running compute, and tears it down again.
 //
 // The seam between the control plane and a host. Today the only implementation
-// runs in this process (`billet server --dev`); the node split puts a remote one
+// ran in this process before the node split; that split puts a remote one
 // behind the same two methods, which is the point of naming it now rather than
 // calling a provider directly from the listener.
 //

@@ -541,9 +541,9 @@ func TestTheCustodyJanitorIsStarted(t *testing.T) {
 // THE JANITOR STOPS WITH THE LOOP, and stopping is the whole point.
 //
 // It was started on the loop's own context, which outlives Run: a node that
-// exits because it was refused, or a `server --dev` that shuts one node down,
-// would leave a goroutine heartbeating leases for a runtime nobody is driving
-// any more. Nothing crashes, so nothing draws attention.
+// exits because it was refused, or one shutting down while its control plane
+// keeps running, would leave a goroutine heartbeating leases for a runtime
+// nobody is driving any more. Nothing crashes, so nothing draws attention.
 func TestTheCustodyJanitorDoesNotOutliveTheLoop(t *testing.T) {
 	t.Parallel()
 

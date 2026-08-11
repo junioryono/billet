@@ -580,6 +580,50 @@ func TestExampleConfigIsValid(t *testing.T) {
 	}
 }
 
+// THE PACKAGED CONFIG IS SHIPPED TOO, and nothing was checking it.
+//
+// deploy/billet.yaml is installed by the .deb and .rpm and marked as a config
+// file, so it is what an operator's first `systemctl start billet-server` reads
+// — and unlike billet.example.yaml, which this suite has always parsed, it had
+// no test at all. Moving server.lock_dir to the node broke it, and the only
+// thing that would have noticed was somebody installing the package.
+//
+// Parsed rather than validated, because max_vcpu is deliberately 0: the package
+// must not guess a machine's capacity, so billet refuses to start until the
+// operator sizes it. KnownFields is the half that matters here — it is what
+// catches a key this package renamed or moved out from under the file.
+func TestThePackagedConfigParses(t *testing.T) {
+	t.Parallel()
+
+	f, err := os.Open(filepath.Join("..", "..", "deploy", "billet.yaml"))
+	if err != nil {
+		t.Fatalf("open the packaged config: %v", err)
+	}
+
+	defer f.Close()
+
+	var c Config
+
+	dec := yaml.NewDecoder(f)
+	dec.KnownFields(true)
+
+	if err := dec.Decode(&c); err != nil {
+		t.Fatalf("deploy/billet.yaml does not parse against the current schema, so the package "+
+			"installs a file billet cannot read: %v", err)
+	}
+
+	if c.Server == nil {
+		t.Fatal("the packaged config has no server section")
+	}
+
+	// The placeholder that makes it refuse to start, which is deliberate and
+	// must stay that way: a guessed ceiling silently overcommits a smaller host.
+	if c.Server.MaxVCPU != 0 {
+		t.Errorf("the packaged config ships max_vcpu %d; a package must not guess capacity",
+			c.Server.MaxVCPU)
+	}
+}
+
 // --- Per-host node policy -------------------------------------------------
 //
 // A host's capabilities are not implied by its provider. An Apple Silicon
@@ -1748,46 +1792,6 @@ func TestAReservationAfterTheBudgetIsExhaustedIsRefused(t *testing.T) {
 	}
 }
 
-// A RELATIVE server.lock_dir IS CAUGHT AT LOAD, not only when the lock is taken.
-//
-// Tested at this layer on its own, because the state package has its own check
-// and would keep passing if this one were deleted — so without this the config
-// gate could disappear and nothing would notice. It matters that the config
-// catches it: `billet check` is how an operator validates a file before it ever
-// reaches a host, and the failure it prevents is invisible at runtime. A
-// relative path resolves against each process working directory, so one config
-// puts a unit started in / and an operator started in /srv/billet into different
-// collision domains while both log the same string.
-func TestValidateRejectsARelativeLockDir(t *testing.T) {
-	body := `
-server:
-  listen: 127.0.0.1:7717
-  state_dir: /var/lib/billet/server
-  lock_dir: locks
-  max_vcpu: 8
-  max_memory: 32GiB
-github:
-  org: acme
-  app_id: 1
-  installation_id: 2
-  private_key_path: /tmp/key.pem
-tiers:
-  - label: billet-2vcpu
-    provider: docker
-    vcpu: 2
-    memory: 8GiB
-    image: ubuntu:24.04
-`
-	_, err := Load(writeConfig(t, body))
-	if err == nil {
-		t.Fatal("Load accepted a relative server.lock_dir")
-	}
-
-	if !strings.Contains(err.Error(), "lock_dir") {
-		t.Errorf("the error does not name the key: %v", err)
-	}
-}
-
 // A NODE THAT DIALS THE NETWORK NEEDS A CERTIFICATE, and saying so here is the
 // difference between one clear error and a handshake failure on another machine.
 //
@@ -1802,7 +1806,6 @@ func TestARemoteNodeNeedsACertificate(t *testing.T) {
 server:
   listen: 127.0.0.1:7717
   state_dir: /var/lib/billet/server
-  lock_dir: /run/billet/locks
   max_vcpu: 8
   max_memory: 32GiB
 node:
@@ -1843,7 +1846,6 @@ func TestALoopbackNodeNeedsNoCertificate(t *testing.T) {
 server:
   listen: 127.0.0.1:7717
   state_dir: /var/lib/billet/server
-  lock_dir: /run/billet/locks
   max_vcpu: 8
   max_memory: 32GiB
 node:
@@ -1880,7 +1882,6 @@ func TestACompleteNodeTLSBlockIsAccepted(t *testing.T) {
 server:
   listen: 0.0.0.0:7717
   state_dir: /var/lib/billet/server
-  lock_dir: /run/billet/locks
   max_vcpu: 8
   max_memory: 32GiB
 node:
@@ -1926,7 +1927,6 @@ func TestAPartialNodeTLSBlockIsRefused(t *testing.T) {
 server:
   listen: 0.0.0.0:7717
   state_dir: /var/lib/billet/server
-  lock_dir: /run/billet/locks
   max_vcpu: 8
   max_memory: 32GiB
 node:
@@ -1971,7 +1971,6 @@ func TestARelativeNodeTLSPathIsRefused(t *testing.T) {
 server:
   listen: 0.0.0.0:7717
   state_dir: /var/lib/billet/server
-  lock_dir: /run/billet/locks
   max_vcpu: 8
   max_memory: 32GiB
 node:
@@ -2028,7 +2027,6 @@ func TestACertificateAimedAtALoopbackOnlyControlPlaneIsRefused(t *testing.T) {
 server:
   listen: 127.0.0.1:7717
   state_dir: /var/lib/billet/server
-  lock_dir: /run/billet/locks
   max_vcpu: 8
   max_memory: 32GiB
 node:
@@ -2074,7 +2072,6 @@ func TestACertificateIsAllowedAgainstAWildcardListener(t *testing.T) {
 server:
   listen: 0.0.0.0:7717
   state_dir: /var/lib/billet/server
-  lock_dir: /run/billet/locks
   max_vcpu: 8
   max_memory: 32GiB
   node_tls_hosts:
@@ -2108,62 +2105,20 @@ tiers:
 	}
 }
 
-// TWO ROLES MAY NAME DIFFERENT LOCK DIRECTORIES, and one config file is why.
+// ONE FILE MAY STILL CONFIGURE BOTH ROLES, which is the single-machine
+// deployment: `billet server` and `billet node` read the same billet.yaml.
 //
-// A single billet.yaml deployed to every machine carries the controller's
-// lock_dir alongside each node's. A node-only host never reads the server
-// section, so refusing to load over it would take that host down for a setting
-// with no bearing on it. Whether the two agree is asked by `server --dev`, which
-// is the one process that runs both roles at once.
-func TestOneFileMayConfigureBothRolesDifferently(t *testing.T) {
+// The lock keys used to exist on both sections and had to be compared, because
+// `server --dev` ran both roles in one process. The lock belongs to the node
+// alone now — the server manages no containers — so there is nothing to compare
+// and `server.lock_dir` is gone.
+func TestOneFileMayConfigureBothRoles(t *testing.T) {
 	t.Parallel()
 
 	body := `
 server:
   listen: 127.0.0.1:7717
   state_dir: /var/lib/billet/server
-  lock_dir: /run/billet/server-locks
-  max_vcpu: 8
-  max_memory: 32GiB
-node:
-  name: host-1
-  server_addr: 127.0.0.1:7717
-  provider: docker
-  state_dir: /var/lib/billet/node
-  lock_dir: /run/billet/node-locks
-github:
-  org: acme
-  app_id: 1
-  installation_id: 2
-  private_key_path: /tmp/key.pem
-tiers:
-  - label: billet-2vcpu
-    provider: docker
-    vcpu: 2
-    memory: 8GiB
-    image: ubuntu:24.04
-`
-
-	cfg, err := Load(writeConfig(t, body))
-	if err != nil {
-		t.Fatalf("a shared config file naming a lock_dir per role was refused: %v", err)
-	}
-
-	if cfg.LockDirsAgree() {
-		t.Error("two different lock directories were reported as agreeing, so `server --dev` " +
-			"would take two locks for one deployment identity")
-	}
-}
-
-// The same question, answered the other way.
-func TestMatchingLockDirsAgree(t *testing.T) {
-	t.Parallel()
-
-	body := `
-server:
-  listen: 127.0.0.1:7717
-  state_dir: /var/lib/billet/server
-  lock_dir: /run/billet/locks
   max_vcpu: 8
   max_memory: 32GiB
 node:
@@ -2187,16 +2142,72 @@ tiers:
 
 	cfg, err := Load(writeConfig(t, body))
 	if err != nil {
-		t.Fatalf("load: %v", err)
+		t.Fatalf("a shared config file describing both roles on one machine was refused: %v", err)
 	}
 
-	if !cfg.LockDirsAgree() {
-		t.Error("identical lock directories were reported as disagreeing, so `server --dev` " +
-			"would refuse a correct configuration")
+	if cfg.Server == nil || cfg.Node == nil {
+		t.Fatal("one file has to be able to describe both roles; that is the single-machine shape")
 	}
 }
 
-// A relative node.lock_dir is refused for the same reason the server's is.
+// A KEY THAT MOVED SAYS SO, rather than failing as an unknown field.
+//
+// server.lock_dir and server.allow_unlocked_deployment were real settings that
+// operators put in real files, and they are gone because the server no longer
+// takes the lock. KnownFields would refuse them as typos — technically a
+// refusal, and a useless one, since the operator's setting was correct when
+// they wrote it and the fix is to move it rather than delete it.
+func TestTheMovedLockKeysNameTheirNewHome(t *testing.T) {
+	t.Parallel()
+
+	for _, key := range []string{
+		"lock_dir: /run/billet/locks",
+		"allow_unlocked_deployment: true",
+	} {
+		body := `
+server:
+  listen: 127.0.0.1:7717
+  state_dir: /var/lib/billet/server
+  max_vcpu: 8
+  max_memory: 32GiB
+  ` + key + `
+github:
+  org: acme
+  app_id: 1
+  installation_id: 2
+  private_key_path: /tmp/key.pem
+tiers:
+  - label: billet-2vcpu
+    provider: docker
+    vcpu: 2
+    memory: 8GiB
+    image: ubuntu:24.04
+`
+
+		_, err := Load(writeConfig(t, body))
+		if err == nil {
+			t.Fatalf("server.%s was accepted and silently does nothing", key)
+		}
+
+		if !strings.Contains(err.Error(), "node.") {
+			t.Errorf("the refusal of server.%s does not say where the key went: %v", key, err)
+		}
+	}
+}
+
+// A RELATIVE node.lock_dir IS CAUGHT AT LOAD, not only when the lock is taken.
+//
+// Tested at this layer on its own, because the state package has its own check
+// and would keep passing if this one were deleted — so without this the config
+// gate could disappear and nothing would notice. It matters that the config
+// catches it: `billet check` is how an operator validates a file before it ever
+// reaches a host, and the failure it prevents is invisible at runtime. A
+// relative path resolves against each process working directory, so one config
+// puts a unit started in / and an operator started in /srv/billet into different
+// collision domains while both log the same string.
+//
+// This used to be the server's key as well. The node is the only role that takes
+// the lock now, so this is the only place the rule can be broken.
 func TestARelativeNodeLockDirIsRefused(t *testing.T) {
 	t.Parallel()
 
@@ -2204,7 +2215,6 @@ func TestARelativeNodeLockDirIsRefused(t *testing.T) {
 server:
   listen: 127.0.0.1:7717
   state_dir: /var/lib/billet/server
-  lock_dir: locks
   max_vcpu: 8
   max_memory: 32GiB
 node:

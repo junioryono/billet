@@ -11,16 +11,24 @@ import (
 	"github.com/junioryono/billet/internal/state"
 )
 
+// claimConfig is a node, because the node is the role that takes the lock. The
+// server takes none: it manages no containers, and holding the identity would
+// keep a node on the same machine from ever starting.
 func claimConfig(t *testing.T, stateDir, lockDir string) *config.Config {
 	t.Helper()
 
-	return &config.Config{Server: &config.ServerConfig{
+	return &config.Config{Node: &config.NodeConfig{
+		Name:     "host-1",
 		StateDir: stateDir,
 		LockDir:  lockDir,
 	}}
 }
 
-// The dev path claims the identity and takes the lock.
+func claimDeployment(cfg *config.Config) (string, *state.DeploymentLock, error) {
+	return claimNodeDeployment(cfg, nil)
+}
+
+// A node claims the identity and takes the lock.
 func TestClaimDeploymentTakesTheLock(t *testing.T) {
 	lockDir := t.TempDir()
 
@@ -44,7 +52,7 @@ func TestClaimDeploymentTakesTheLock(t *testing.T) {
 	}
 
 	if filepath.Dir(lock.Path()) != lockDir {
-		t.Errorf("server.lock_dir was not honoured: locked in %q", lock.Path())
+		t.Errorf("node.lock_dir was not honoured: locked in %q", lock.Path())
 	}
 }
 
@@ -123,7 +131,7 @@ func TestTheOptOutIsActuallyWired(t *testing.T) {
 		t.Errorf("the refusal does not name the opt-out: %v", err)
 	}
 
-	cfg.Server.AllowUnlockedDeployment = true
+	cfg.Node.AllowUnlockedDeployment = true
 
 	_, lock, err := claimDeployment(cfg)
 	if err != nil {
@@ -173,20 +181,30 @@ func TestTheNodeLocksWhereItWasTold(t *testing.T) {
 	}
 }
 
-// A SERVER AND A NODE ON ONE HOST COLLIDE, which is the whole point.
+// TWO NODES ON ONE HOST COLLIDE, which is the whole point of the lock.
 //
 // Same identity, same configured directory: the second must be refused. If they
 // landed in different files both would run, and both would manage the same
-// containers.
-func TestAServerAndANodeOnOneHostCollide(t *testing.T) {
+// containers, each able to adopt or destroy the other's live work.
+//
+// A SERVER ALONGSIDE THEM DOES NOT COLLIDE, and the earlier version of this test
+// asserted the opposite — that a server and a node on one host must refuse each
+// other. That was right while `--dev` existed, because a --dev server WAS a
+// node: it ran a provider in its own process, so a second node beside it really
+// was two managers of one machine's containers. With --dev gone the server runs
+// no compute and takes no lock, and server-plus-node on one box is not a
+// conflict to be caught — it is the single-machine deployment.
+func TestTwoNodesOnOneHostCollide(t *testing.T) {
 	lockDir := t.TempDir()
 	stateDir := t.TempDir()
 
-	server := &config.Config{Server: &config.ServerConfig{StateDir: stateDir, LockDir: lockDir}}
+	first := &config.Config{Node: &config.NodeConfig{
+		Name: "host-1", StateDir: stateDir, LockDir: lockDir,
+	}}
 
-	_, lock, err := claimDeployment(server)
+	_, lock, err := claimNodeDeployment(first, nil)
 	if err != nil {
-		t.Fatalf("the server could not claim: %v", err)
+		t.Fatalf("the first node could not claim: %v", err)
 	}
 
 	t.Cleanup(func() {
@@ -195,13 +213,67 @@ func TestAServerAndANodeOnOneHostCollide(t *testing.T) {
 		}
 	})
 
-	node := &config.Config{Node: &config.NodeConfig{
-		Name:     "host-1",
-		StateDir: stateDir,
-		LockDir:  lockDir,
+	second := &config.Config{Node: &config.NodeConfig{
+		Name: "host-2", StateDir: stateDir, LockDir: lockDir,
 	}}
 
-	if _, _, err := claimNodeDeployment(node, nil); !errors.Is(err, state.ErrDeploymentLocked) {
-		t.Fatalf("a node started alongside a server holding the same identity: %v", err)
+	if _, _, err := claimNodeDeployment(second, nil); !errors.Is(err, state.ErrDeploymentLocked) {
+		t.Fatalf("a second node started alongside one holding the same identity: %v", err)
+	}
+}
+
+// A NODE WITH NO CERTIFICATE JOINS THE CONTROL PLANE DESCRIBED BESIDE IT.
+//
+// This is the single-machine deployment, and it was broken in a way nothing
+// could see. A control plane on loopback serves plain HTTP — a certificate there
+// is a config ERROR, because there is nothing between two processes on one box
+// to authenticate — so the node has no bundle, and a bundle is what normally
+// says which deployment it is joining.
+//
+// Falling back to its own state directory looks reasonable and is wrong: that
+// directory MINTS a fresh random identity when it has none. The server minted
+// one too, in its own directory, and the two never match. The plane then refuses
+// the node for belonging to another deployment — with ErrRefused, which the node
+// loop treats as a verdict rather than an outage, so the process EXITS. Nothing
+// retries and nothing repairs it. The shipped example config has exactly this
+// shape: server.state_dir and node.state_dir are different paths.
+//
+// The rule is the same one the certificate path follows — identity comes from
+// whatever proves which deployment you are joining. Without a certificate, that
+// proof is this file describing the control plane itself.
+func TestACertlessNodeJoinsTheServerInItsOwnConfig(t *testing.T) {
+	serverState := t.TempDir()
+
+	// The server founds the deployment, exactly as runServer does.
+	want, err := state.DeploymentID(serverState)
+	if err != nil {
+		t.Fatalf("DeploymentID: %v", err)
+	}
+
+	cfg := &config.Config{
+		Server: &config.ServerConfig{StateDir: serverState, Listen: "127.0.0.1:7717"},
+		Node: &config.NodeConfig{
+			Name: "host-1", ServerAddr: "127.0.0.1:7717",
+			// A DIFFERENT DIRECTORY, which is what billet.example.yaml ships.
+			StateDir: t.TempDir(),
+			LockDir:  t.TempDir(),
+		},
+	}
+
+	got, lock, err := claimNodeDeployment(cfg, nil)
+	if err != nil {
+		t.Fatalf("claimNodeDeployment: %v", err)
+	}
+
+	t.Cleanup(func() {
+		if err := lock.Release(); err != nil {
+			t.Errorf("release: %v", err)
+		}
+	})
+
+	if got != want {
+		t.Errorf("the node claimed deployment %s but the control plane in the same file is %s; "+
+			"the plane refuses that with ErrRefused and the node process exits, so a "+
+			"single-machine deployment never starts", got, want)
 	}
 }

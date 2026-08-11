@@ -312,10 +312,9 @@ func newStack(t *testing.T) *stack {
 // the only part with no in-process equivalent to fall back on: every unit test
 // of it necessarily supplies one side.
 //
-// `server --dev` deliberately does not go through this path — a single-machine
-// deployment should not send commands to itself over a socket to reach a runner
-// it already holds — which is precisely why the wire needs its own end-to-end
-// coverage instead of inheriting the dev suite's.
+// It used to be possible to skip this path entirely: `server --dev` ran a node
+// in the control plane's own process. With that gone the wire carries every
+// deployment shape billet has, including the single-machine one.
 func newWireStack(t *testing.T) *stack {
 	t.Helper()
 

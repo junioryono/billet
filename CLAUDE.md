@@ -51,11 +51,14 @@ improvising the command; several of its details each cost a debugging session to
 
 One binary, two roles. `billet server` is the control plane: it long-polls GitHub's Runner Scale Set
 API for assigned jobs, owns the capacity ledger, and tells nodes what to launch. `billet node` is a
-compute host: it runs a provider and launches instances. `billet server --dev` runs both in one
-process — the single-machine deployment.
+compute host: it runs a provider and launches instances. A single machine runs BOTH, as two
+processes reading one config file and talking over loopback — there is no combined mode. `--dev`
+used to be one, running a node inside the control-plane process; it was removed because it was a
+second code path to the same ledger row (direct registration, in-process runner, its own boot
+ordering) and every bug it caused was invisible in the split shape everyone else ran.
 
 ```
-cmd/billet/          the binary: server | node | dev roles, plus the whole operator CLI
+cmd/billet/          the binary: server | node roles, plus the whole operator CLI
 internal/config/     billet.yaml schema + validation (a leaf package — imports nothing of ours)
 internal/state/      SQLite control-plane store: capacity ledger, job history, process lock
 internal/github/     App Manifest onboarding, App JWT, installation resolution

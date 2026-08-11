@@ -409,7 +409,7 @@ func TestACertificateCannotActForAnotherNode(t *testing.T) {
 // listener normally makes this branch unreachable, since RequireAndVerifyClientCert
 // rejects an anonymous connection before any handler runs. That is exactly what
 // makes it fragile. If some future wiring serves this mux over a plain listener
-// — a debug endpoint, a proxy, a --dev path that grew a network address — every
+// — a debug endpoint, a proxy, a loopback path that grew a network address — every
 // request would authenticate as whatever the URL said, and nothing else in the
 // system would notice.
 //

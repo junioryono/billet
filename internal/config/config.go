@@ -2,7 +2,8 @@
 //
 // A single billet.yaml describes both roles. `billet server` reads the server and
 // github sections plus the tier catalog; `billet node` reads the node section and
-// learns its tier assignments from the server. Running `billet server --dev` reads
+// learns its tier assignments from the server. One file may describe both roles
+// on a single machine, where `billet server` and `billet node` each read
 // everything and runs both in one process.
 package config
 
@@ -24,11 +25,13 @@ import (
 
 // Config is the whole of billet.yaml.
 type Config struct {
-	// Server is required for the server and dev roles, ignored by a pure node.
+	// Server is required by `billet server`. A node reads it too when the two
+	// share a file on one machine: it is where a certless node learns which
+	// deployment it is joining.
 	Server *ServerConfig `yaml:"server,omitempty"`
-	// Node is required for the node and dev roles, ignored by a pure server.
+	// Node is required by `billet node`, ignored by a pure server.
 	Node *NodeConfig `yaml:"node,omitempty"`
-	// GitHub is required for the server and dev roles.
+	// GitHub is required by `billet server`.
 	GitHub *GitHubConfig `yaml:"github,omitempty"`
 	// Tiers is the runner catalog. Each tier becomes one GitHub scale set, and
 	// its Label is what users put in `runs-on`.
@@ -228,44 +231,6 @@ type ServerConfig struct {
 	// A concrete listen address supplies itself, so single-address deployments
 	// leave this empty.
 	NodeTLSHosts []string `yaml:"node_tls_hosts,omitempty"`
-	// LockDir is where the host-wide deployment lock is placed.
-	//
-	// THE LOCK'S SCOPE HAS TO MATCH THE DAEMON'S, and billet cannot derive that.
-	// The lock stops two processes carrying one deployment identity from managing
-	// the same containers, so every process that can reach the same container
-	// runtime must meet at the same directory. The default is per-user, which is
-	// right for the ordinary case and wrong for two: a system service and an
-	// operator sharing /var/run/docker.sock, and containers that share a socket
-	// while each has its own private filesystem. Both are invisible without this
-	// key — they simply do not collide.
-	//
-	// Point it at a path all of them can reach (a host /run/billet/locks
-	// bind-mounted into each container, say). It must NOT be world-writable: any
-	// local user could then hold the file and keep billet from ever starting.
-	//
-	// A directory genuinely shared between two accounts must be SETGID. Setgid is
-	// what makes a new lock file carry the directory's group rather than its
-	// creator's primary one, and without it the other account cannot open the
-	// lock at all. A directory only this account uses wants no group access.
-	//
-	// 2770 works everywhere. 2730 — the drop box, where neither account can list
-	// the other's locks — works only where billet can open a directory for search
-	// without reading it: Linux (O_PATH), darwin and FreeBSD (O_SEARCH). On
-	// OpenBSD, NetBSD, Solaris and the rest, billet falls back to needing read
-	// and will refuse 2730 with a message saying so.
-	LockDir string `yaml:"lock_dir,omitempty"`
-	// AllowUnlockedDeployment starts billet even when the host-wide lock cannot
-	// be placed.
-	//
-	// AN OPT-IN, BECAUSE AUTHORIZATION MUST NOT BE DERIVED FROM AN I/O FAILURE.
-	// This was originally the automatic behaviour: anything that stopped the lock
-	// being placed downgraded to a warning and billet started. That reasoning was
-	// backwards — it let a symlink loop, a permissions change, ENOLCK, descriptor
-	// exhaustion, or a service manager with no HOME each silently switch off the
-	// protection, and the operator's only evidence was a log line among many. An
-	// operator who knows their host has nowhere to put a lock can say so here;
-	// billet will not decide it on their behalf.
-	AllowUnlockedDeployment bool `yaml:"allow_unlocked_deployment,omitempty"`
 	// DrainTimeout bounds how long a stopping control plane waits for the jobs it
 	// is already running before it destroys them. See defaultDrainTimeout for the
 	// default and why it is the length of a job rather than the length of a
@@ -330,19 +295,54 @@ type NodeConfig struct {
 	// is the name in this certificate, so a node without one can only talk to a
 	// control plane in its own machine.
 	TLS *NodeTLS `yaml:"tls,omitempty"`
-	// LockDir is where this node places its host-wide deployment lock.
+	// LockDir is where this node places the host-wide deployment lock.
 	//
-	// SAME KEY, SAME MEANING, SAME HOST as server.lock_dir, and it exists because
-	// the two roles can run on one machine. A `server --dev` honouring
-	// server.lock_dir while a standalone node used the per-user default would take
-	// two DIFFERENT locks for one deployment identity — and then both would manage
-	// the same containers, each able to adopt or destroy the other's live work.
-	// That is precisely the failure the identity lock exists to prevent, reached
-	// by giving the two roles separate settings.
+	// THE LOCK BELONGS TO THE NODE ROLE, because the node is what manages
+	// containers. It stops two processes carrying one deployment identity from
+	// managing the same compute, and a control plane manages none — which is why
+	// `server.lock_dir` no longer exists. It could not: the lock is exclusive per
+	// identity, so a server that took it would keep the node on the same machine
+	// from ever starting, and a single-machine deployment is now exactly that
+	// pair of processes.
 	//
-	// Leave it empty and both roles use the same default, which is already
-	// consistent. Set it on the server and you must set it here too.
+	// THE LOCK'S SCOPE HAS TO MATCH THE DAEMON'S, and billet cannot derive that.
+	// Every process that can reach the same container runtime must meet at the
+	// same directory. The default is per-user, which is right for the ordinary
+	// case and wrong for two: a system service and an operator sharing
+	// /var/run/docker.sock, and containers that share a socket while each has its
+	// own private filesystem. Both are invisible without this key — they simply do
+	// not collide.
+	//
+	// Point it at a path all of them can reach (a host /run/billet/locks
+	// bind-mounted into each container, say). It must NOT be world-writable: any
+	// local user could then hold the file and keep billet from ever starting.
+	//
+	// A directory genuinely shared between two accounts must be SETGID. Setgid is
+	// what makes a new lock file carry the directory's group rather than its
+	// creator's primary one, and without it the other account cannot open the
+	// lock at all. A directory only this account uses wants no group access.
+	//
+	// 2770 works everywhere. 2730 — the drop box, where neither account can list
+	// the other's locks — works only where billet can open a directory for search
+	// without reading it: Linux (O_PATH), darwin and FreeBSD (O_SEARCH). On
+	// OpenBSD, NetBSD, Solaris and the rest, billet falls back to needing read
+	// and will refuse 2730 with a message saying so.
 	LockDir string `yaml:"lock_dir,omitempty"`
+	// AllowUnlockedDeployment starts this node even when the host-wide lock cannot
+	// be placed.
+	//
+	// AN OPT-IN, BECAUSE AUTHORIZATION MUST NOT BE DERIVED FROM AN I/O FAILURE.
+	// This was originally the automatic behaviour: anything that stopped the lock
+	// being placed downgraded to a warning and billet started. That reasoning was
+	// backwards — it let a symlink loop, a permissions change, ENOLCK, descriptor
+	// exhaustion, or a service manager with no HOME each silently switch off the
+	// protection, and the operator's only evidence was a log line among many. An
+	// operator who knows their host has nowhere to put a lock can say so here;
+	// billet will not decide it on their behalf.
+	//
+	// It lives on the node for the same reason lock_dir does: the node is the role
+	// that takes the lock.
+	AllowUnlockedDeployment bool `yaml:"allow_unlocked_deployment,omitempty"`
 	// StateDir holds node-local data: the generation pointer store (which is
 	// authoritative for this node's volumes), image cache, and mTLS identity.
 	StateDir string `yaml:"state_dir"`
@@ -1020,7 +1020,7 @@ func Load(path string) (*Config, error) {
 	dec := yaml.NewDecoder(f)
 	dec.KnownFields(true) // typos in a CI config should be loud, not ignored
 	if err := dec.Decode(&c); err != nil {
-		return nil, fmt.Errorf("parse config %s: %w", path, err)
+		return nil, fmt.Errorf("parse config %s: %w", path, relocatedKeyHint(err))
 	}
 	// A second document would otherwise be silently ignored, which for a config
 	// that assigns capacity is a quiet way to run something other than intended.
@@ -1034,6 +1034,41 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("invalid config %s: %w", path, err)
 	}
 	return &c, nil
+}
+
+// relocatedKeyHint turns "unknown field" into "that key moved, and here is
+// where".
+//
+// KNOWNFIELDS CANNOT TELL A TYPO FROM A REMOVAL, and it reports both as a field
+// that does not exist. For a genuine typo that is the whole story. For a setting
+// that was correct when the operator wrote it and has since moved roles, it is a
+// dead end: the message names the key they already know about and says nothing
+// about what to do, so the honest fix looks like deleting a setting they
+// deliberately chose.
+//
+// The lock keys moved from the server to the node because the node became the
+// only role that takes the lock.
+func relocatedKeyHint(err error) error {
+	moved := map[string]string{
+		"lock_dir":                  "node.lock_dir",
+		"allow_unlocked_deployment": "node.allow_unlocked_deployment",
+	}
+
+	msg := err.Error()
+
+	for key, home := range moved {
+		if !strings.Contains(msg, "field "+key+" not found in type config.ServerConfig") {
+			continue
+		}
+
+		return fmt.Errorf("%w\n\nserver.%s has moved to %s. The host-wide deployment lock "+
+			"stops two processes managing one deployment's containers, and a control plane "+
+			"manages none — the node takes it. A server that held it too would keep a node on "+
+			"the same machine from ever starting, which is the single-machine deployment: "+
+			"`billet server` and `billet node` side by side", err, key, home)
+	}
+
+	return err
 }
 
 func (c *Config) applyDefaults() {
@@ -1245,25 +1280,6 @@ func isLoopbackHostPort(addr string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-// LockDirsAgree reports whether both roles would take their lock in the same
-// place.
-//
-// ASKED WHERE THE ROLES ACTUALLY CO-LOCATE, not at load. Requiring equality
-// whenever both YAML sections exist looked tidy and refused a legitimate shape:
-// one configuration file deployed to every machine, carrying a controller's
-// lock_dir that a node-only host never uses. That host would fail to start over a
-// setting with no bearing on it.
-//
-// `server --dev` is the case that matters, because it is the one process that
-// runs both roles in one place — see cmdServer, which asks this.
-func (c *Config) LockDirsAgree() bool {
-	if c.Server == nil || c.Node == nil {
-		return true
-	}
-
-	return c.Server.LockDir == c.Node.LockDir
-}
-
 // Validate reports every problem it finds rather than stopping at the first, so
 // a misconfigured deployment takes one round trip to fix instead of five.
 func (c *Config) Validate() error {
@@ -1321,12 +1337,6 @@ func (c *Config) validateServer() []error {
 	// that will not finish and has no reason to suspect the config.
 	if _, err := c.Server.DrainTimeoutDuration(); err != nil {
 		errs = append(errs, err)
-	}
-	if c.Server.LockDir != "" && !filepath.IsAbs(c.Server.LockDir) {
-		errs = append(errs, fmt.Errorf(
-			"server.lock_dir must be an absolute path, got %q: a relative one resolves against "+
-				"each process's working directory, so two billets sharing this config could "+
-				"lock different files while reporting the same path", c.Server.LockDir))
 	}
 	return errs
 }
