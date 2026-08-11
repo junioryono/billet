@@ -67,7 +67,7 @@ no webhook endpoint, no tunnel.
 
 ```bash
 git clone https://github.com/junioryono/billet && cd billet && go build ./cmd/billet
-sudo install -m 0755 billet /usr/local/bin/billet    # or keep it local and call ./billet
+sudo mkdir -p /usr/local/bin && sudo install -m 0755 billet /usr/local/bin/billet
 ```
 
 That second line is what makes the bare `billet` in every command below work; `go build` leaves the
@@ -131,7 +131,7 @@ sudo systemctl enable --now billet-node
 
 ```bash
 git pull && go build ./cmd/billet
-sudo install -m 0755 billet /usr/local/bin/billet   # wherever you put it
+sudo mkdir -p /usr/local/bin && sudo install -m 0755 billet /usr/local/bin/billet
 sudo systemctl restart billet-server                # if you wrote your own unit
 ```
 
@@ -263,7 +263,7 @@ Everything below describes the intended design. Where a thing is not built, it s
 
 ```bash
 billet github-app create --org myorg           # creates + installs the App, PRINTS a github: block
-cp billet.example.yaml ./billet.yaml           # then edit it — see below, four things
+cp billet.example.yaml ./billet.yaml           # then edit it — see below, three things
 billet check --config ./billet.yaml            # validates config, key, state
 billet server --dry-run --config ./billet.yaml  # first contact: polls, accepts nothing
 billet server --dev --config ./billet.yaml     # runs jobs
