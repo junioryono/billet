@@ -2,9 +2,8 @@
 //
 // A single billet.yaml describes both roles. `billet server` reads the server and
 // github sections plus the tier catalog; `billet node` reads the node section and
-// learns its tier assignments from the server. One file may describe both roles
-// on a single machine, where `billet server` and `billet node` each read
-// everything and runs both in one process.
+// learns its tier assignments from the server. On a single machine the two
+// processes read the same file.
 package config
 
 import (
@@ -43,46 +42,38 @@ type Config struct {
 	// nameDefaulted records THAT node.name was defaulted from the hostname;
 	// nameFromHostname records what that hostname was.
 	//
-	// Two fields, because a non-empty value is not the same fact as "billet
-	// supplied this". A machine whose hostname is blank or all whitespace
-	// defaults to an empty name — still defaulted, still the case where the
-	// operator needs to be told where it came from — and a single string field
-	// reported that one with the generic wording, which sends someone who never
-	// typed a name looking for a field that is not in their file.
+	// Two fields, because a non-empty value is not the same fact as "billet supplied
+	// this": a machine whose hostname is blank defaults to an empty name, which is
+	// still the case where the operator needs to be told where it came from.
 	nameDefaulted    bool
 	nameFromHostname string
 
-	// Nodes describes per-host policy to the server. It is optional and separate
-	// from the Node section on purpose: Node is how a host describes ITSELF,
-	// while Nodes is how the control plane describes the FLEET. Host policy has
-	// to live on the server side, because the limits it expresses are enforced
-	// across tiers the individual host never sees.
+	// Nodes describes per-host policy to the server. Separate from the Node section
+	// on purpose: Node is how a host describes ITSELF, while Nodes is how the control
+	// plane describes the FLEET — and host policy has to live server-side, because
+	// the limits it expresses are enforced across tiers the host never sees.
 	//
-	// Every field defaults, so a deployment that wants the standard behaviour
-	// omits the section entirely.
+	// Every field defaults, so a deployment wanting standard behaviour omits it.
 	Nodes []NodePolicy `yaml:"nodes,omitempty"`
 
-	// Sites are the places this deployment has compute in. Optional: a
-	// single-machine deployment never writes one.
+	// Sites are the places this deployment has compute in. Optional: a single-machine
+	// deployment never writes one.
 	//
-	// A SITE IS WHERE COMPUTE AND ITS STORAGE SHARE A FAST NETWORK. It is the
-	// answer to "which storage", which is a question every cache has to have one
-	// of — a cache is fast because it is next to the machine using it, and that
-	// relationship needs a name before anything can be keyed on it.
+	// A SITE IS WHERE COMPUTE AND ITS STORAGE SHARE A FAST NETWORK — the answer to
+	// "which storage", which every cache needs one of.
 	//
-	// DECLARED RATHER THAN INFERRED FROM WHAT NODES SAY, because the failure a
-	// free string produces is silent: a node that means "home" and types "hom"
-	// would get its own site, with its own empty cache, and every job placed
-	// there would run cold while looking perfectly healthy.
+	// DECLARED RATHER THAN INFERRED FROM WHAT NODES SAY, because the failure a free
+	// string produces is silent: a node that means "home" and types "hom" would get
+	// its own site, with its own empty cache, and every job placed there would run
+	// cold while looking perfectly healthy.
 	Sites []SiteConfig `yaml:"sites,omitempty"`
 }
 
 // SiteConfig declares one place compute runs.
 //
-// A STRUCT RATHER THAN A STRING, because a site is where the storage backend
-// will be configured — Ceph at a bare-metal site, EBS and S3 in a cloud region
-// (#23/#25). Today it carries identity, which is the half placement needs; the
-// backend has nowhere to be configured yet because there is no storage layer.
+// A STRUCT RATHER THAN A STRING, because a site is where the storage backend will
+// be configured — Ceph at a bare-metal site, EBS and S3 in a cloud region
+// (#23/#25). Today it carries identity, which is the half placement needs.
 type SiteConfig struct {
 	// Name is what a node and a tier refer to this site by.
 	Name string `yaml:"name"`
@@ -90,21 +81,17 @@ type SiteConfig struct {
 
 // NodePolicy is what one compute host is permitted to run.
 //
-// It exists because a host's capabilities are not implied by its provider. An
-// Apple Silicon machine can serve macOS guests, Linux arm64 guests, or both,
-// and which of those an operator wants is a deployment decision rather than a
-// property of the hardware — someone may keep a Mac exclusively for macOS so
-// the licensed guests never contend with Linux builds, or run it purely as an
-// arm64 Linux builder and never boot macOS on it at all.
+// A host's capabilities are not implied by its provider: an Apple Silicon machine
+// can serve macOS guests, Linux arm64 guests, or both, and which of those an
+// operator wants is a deployment decision rather than a property of the hardware.
 type NodePolicy struct {
 	// Name matches Tier.Node and NodeConfig.Name.
 	Name string `yaml:"name"`
 
-	// Provider is the compute backend this host runs, matching NodeConfig.
-	// Provider. Optional, and used only to decide whether an unpinned tier could
-	// ever land here: a firecracker tier is not a placement candidate for a Tart
-	// host, so without it a macOS-only Mac would appear to conflict with every
-	// x64 Linux tier in the deployment.
+	// Provider is the compute backend this host runs, matching NodeConfig.Provider.
+	// Optional, and used only to decide whether an unpinned tier could ever land
+	// here: without it a macOS-only Mac would appear to conflict with every x64 Linux
+	// tier in the deployment.
 	Provider ProviderKind `yaml:"provider,omitempty"`
 
 	// GuestOS is an allowlist of what may be scheduled here. Empty means
@@ -115,16 +102,14 @@ type NodePolicy struct {
 	// tier boots exactly one guest OS, while a host may permit several.
 	GuestOS []GuestOS `yaml:"guest_os,omitempty"`
 
-	// MacOSVMLimit caps concurrent macOS guests on this host, counting warm
-	// ones. Nil means DefaultMacOSVMLimit — an unconfigured Apple host is still
-	// bound by Apple's licence, so the default is the licence, not "unlimited".
+	// MacOSVMLimit caps concurrent macOS guests on this host, counting warm ones. Nil
+	// means DefaultMacOSVMLimit — an unconfigured Apple host is still bound by
+	// Apple's licence, so the default is the licence, not "unlimited".
 	//
-	// Lowering it is the common case: reserve one slot for interactive use, or
-	// set 0 to keep a Mac for Linux arm64 work only. Raising it above
-	// DefaultMacOSVMLimit is permitted because billet cannot know what licence
-	// or hardware agreement a given operator has, but Apple's standard terms
-	// allow at most DefaultMacOSVMLimit macOS guests per Apple-branded host —
-	// exceeding that is an assertion about YOUR licence, not a tuning knob.
+	// Raising it above DefaultMacOSVMLimit is permitted because billet cannot know
+	// what licence an operator has, but Apple's standard terms allow at most
+	// DefaultMacOSVMLimit macOS guests per Apple-branded host — exceeding that is an
+	// assertion about YOUR licence, not a tuning knob.
 	MacOSVMLimit *int `yaml:"macos_vm_limit,omitempty"`
 }
 
@@ -148,11 +133,10 @@ func (p NodePolicy) policyEnumsValid() bool {
 
 // Clone returns a deep copy, sharing nothing mutable with the receiver.
 //
-// A shallow struct copy is not enough and the difference is silent: GuestOS is a
-// slice and MacOSVMLimit is a POINTER, so a caller holding the original can
-// widen a host's allowlist or raise its macOS cap after the allocator has been
-// built from it — moving a licence limit out from under leases already counted
-// against it, with nothing to indicate the rules changed.
+// A shallow struct copy is not enough, and the difference is silent: GuestOS is a
+// slice and MacOSVMLimit is a POINTER, so a caller holding the original could
+// widen a host's allowlist or raise its macOS cap after the allocator was built
+// from it — moving a licence limit out from under leases already counted.
 func (p NodePolicy) Clone() NodePolicy {
 	p.GuestOS = slices.Clone(p.GuestOS)
 
@@ -182,10 +166,8 @@ func (p NodePolicy) AllowsGuestOS(g GuestOS) bool {
 
 // MacOSLimit is the effective cap on concurrent macOS guests for this host.
 //
-// An allowlist that excludes macOS yields 0 whatever MacOSVMLimit says, so the
-// two fields cannot disagree about whether macOS runs here. Validation rejects
-// the contradictory config that would make this matter; this method makes the
-// answer well-defined regardless of how it was constructed.
+// An allowlist that excludes macOS yields 0 whatever MacOSVMLimit says, so the two
+// fields cannot disagree about whether macOS runs here.
 func (p NodePolicy) MacOSLimit() int {
 	if !p.AllowsGuestOS(GuestMacOS) {
 		return 0
@@ -208,45 +190,37 @@ type ServerConfig struct {
 	// MUST be on local storage: SQLite's WAL cannot work on a network filesystem,
 	// and the state package fails closed if it detects otherwise.
 	StateDir string `yaml:"state_dir"`
-	// MaxVCPU and MaxMemory bound what the allocator will ever hand out across
-	// every tier combined. They are required and must be positive: capacity is
-	// escrowed before each scale-set listener advertises to GitHub, and an absent
-	// ceiling means concurrent listeners can collectively overcommit the machine
-	// with nothing to stop them.
+	// MaxVCPU and MaxMemory bound what the allocator will ever hand out across every
+	// tier combined. Required and positive: capacity is escrowed before each listener
+	// advertises, so an absent ceiling lets concurrent listeners collectively
+	// overcommit the machine.
 	MaxVCPU   int      `yaml:"max_vcpu"`
 	MaxMemory ByteSize `yaml:"max_memory"`
 
 	// Placement decides which of several suitable machines a job is sent to.
 	// Empty means pack. Only meaningful once a deployment has more than one.
 	Placement PlacementPolicy `yaml:"placement,omitempty"`
-	// NodeTLSHosts are the names and addresses nodes will dial this control plane
-	// by. They become the subject names of the certificate it serves.
+	// NodeTLSHosts are the names and addresses nodes will dial this control plane by.
+	// They become the subject names of the certificate it serves.
 	//
-	// REQUIRED WHEN listen IS A WILDCARD, because a wildcard says which
-	// interfaces to accept on and says nothing about what a node types. A
-	// certificate minted for "0.0.0.0" matches nothing any node would dial, and
-	// the failure arrives as a name-mismatch handshake error on the node — the far
-	// side of the deployment from the file that caused it.
-	//
-	// A concrete listen address supplies itself, so single-address deployments
-	// leave this empty.
+	// REQUIRED WHEN listen IS A WILDCARD, which says which interfaces to accept on and
+	// nothing about what a node types: a certificate minted for "0.0.0.0" matches
+	// nothing, and the failure arrives as a handshake error on the node. A concrete
+	// listen address supplies itself.
 	NodeTLSHosts []string `yaml:"node_tls_hosts,omitempty"`
-	// DrainTimeout bounds how long a stopping control plane waits for the jobs it
-	// is already running before it destroys them. See defaultDrainTimeout for the
-	// default and why it is the length of a job rather than the length of a
-	// shutdown. A Go duration string: "6h", "90m".
+	// DrainTimeout bounds how long a stopping control plane waits for the jobs it is
+	// already running before it destroys them. A Go duration string: "6h", "90m".
 	//
-	// A service manager's stop timeout must exceed this plus the teardown, or its
-	// own expiry arrives first as a SIGKILL — which skips the teardown entirely
-	// and strands exactly the compute the drain was protecting.
+	// A service manager's stop timeout must exceed this plus the teardown, or its own
+	// expiry arrives first as a SIGKILL — skipping the teardown and stranding exactly
+	// the compute the drain was protecting.
 	DrainTimeout string `yaml:"drain_timeout,omitempty"`
 }
 
 // NodeTLS points at the three files `billet ca issue` produced.
 //
-// Paths rather than inline PEM, deliberately: a private key pasted into a config
-// file is a key that ends up in a backup, a paste buffer, and eventually a
-// support thread. The key file is written 0600 and stays that way.
+// Paths rather than inline PEM: a private key pasted into a config file ends up in
+// a backup, a paste buffer, and eventually a support thread.
 type NodeTLS struct {
 	// CertPath is this node's certificate. Its common name is the node name the
 	// control plane will act on.
@@ -274,17 +248,15 @@ type NodeConfig struct {
 	// has more than one place.
 	Site string `yaml:"site,omitempty"`
 
-	// MaxVCPU and MaxMemory are what this host CONTRIBUTES, which is not the same
-	// as what it has. Unset means "everything I can detect".
+	// MaxVCPU and MaxMemory are what this host CONTRIBUTES, which is not what it has.
+	// Unset means "everything I can detect".
 	//
-	// DECLARED HERE, ON THE MACHINE, rather than in the control plane's config,
-	// because the person running this host is the one who knows what else it
-	// does. It is the same reason the provider is declared here: a host is the
-	// authority on itself, and a catalog claiming otherwise is what should lose.
+	// DECLARED ON THE MACHINE rather than in the control plane's config, because the
+	// person running this host knows what else it does — the same reason the provider
+	// is declared here.
 	//
-	// Setting these ABOVE what the machine has is allowed — overcommitting is a
-	// decision an operator is entitled to make — and warned about, because the
-	// alternative is billet quietly deciding it knows better.
+	// Setting them ABOVE what the machine has is allowed and warned about;
+	// overcommitting is a decision an operator is entitled to make.
 	MaxVCPU   int      `yaml:"max_vcpu,omitempty"`
 	MaxMemory ByteSize `yaml:"max_memory,omitempty"`
 
@@ -297,51 +269,29 @@ type NodeConfig struct {
 	TLS *NodeTLS `yaml:"tls,omitempty"`
 	// LockDir is where this node places the host-wide deployment lock.
 	//
-	// THE LOCK BELONGS TO THE NODE ROLE, because the node is what manages
-	// containers. It stops two processes carrying one deployment identity from
-	// managing the same compute, and a control plane manages none — which is why
-	// `server.lock_dir` no longer exists. It could not: the lock is exclusive per
-	// identity, so a server that took it would keep the node on the same machine
-	// from ever starting, and a single-machine deployment is now exactly that
-	// pair of processes.
+	// THE LOCK BELONGS TO THE NODE ROLE, because the node is what manages containers
+	// and a control plane manages none. It is exclusive per identity, so a server
+	// that took it would keep a node on the same machine from ever starting.
 	//
-	// THE LOCK'S SCOPE HAS TO MATCH THE DAEMON'S, and billet cannot derive that.
-	// Every process that can reach the same container runtime must meet at the
-	// same directory. The default is per-user, which is right for the ordinary
-	// case and wrong for two: a system service and an operator sharing
-	// /var/run/docker.sock, and containers that share a socket while each has its
-	// own private filesystem. Both are invisible without this key — they simply do
-	// not collide.
+	// THE LOCK'S SCOPE HAS TO MATCH THE DAEMON'S, and billet cannot derive that: every
+	// process reaching the same container runtime must meet at the same directory.
+	// The per-user default is wrong for a system service and an operator sharing
+	// /var/run/docker.sock, and for containers sharing a socket with private
+	// filesystems — neither collides without this key.
 	//
-	// Point it at a path all of them can reach (a host /run/billet/locks
-	// bind-mounted into each container, say). It must NOT be world-writable: any
-	// local user could then hold the file and keep billet from ever starting.
-	//
-	// A directory genuinely shared between two accounts must be SETGID. Setgid is
-	// what makes a new lock file carry the directory's group rather than its
-	// creator's primary one, and without it the other account cannot open the
-	// lock at all. A directory only this account uses wants no group access.
-	//
-	// 2770 works everywhere. 2730 — the drop box, where neither account can list
-	// the other's locks — works only where billet can open a directory for search
-	// without reading it: Linux (O_PATH), darwin and FreeBSD (O_SEARCH). On
-	// OpenBSD, NetBSD, Solaris and the rest, billet falls back to needing read
-	// and will refuse 2730 with a message saying so.
+	// It must NOT be world-writable, or any local user could hold the file and keep
+	// billet from starting. A directory shared between two accounts must be SETGID,
+	// or the second account cannot open the lock at all; 2770 works everywhere, while
+	// 2730 works only where a directory can be opened for search without reading it
+	// (Linux O_PATH, darwin and FreeBSD O_SEARCH).
 	LockDir string `yaml:"lock_dir,omitempty"`
-	// AllowUnlockedDeployment starts this node even when the host-wide lock cannot
-	// be placed.
+	// AllowUnlockedDeployment starts this node even when the host-wide lock cannot be
+	// placed.
 	//
 	// AN OPT-IN, BECAUSE AUTHORIZATION MUST NOT BE DERIVED FROM AN I/O FAILURE.
-	// This was originally the automatic behaviour: anything that stopped the lock
-	// being placed downgraded to a warning and billet started. That reasoning was
-	// backwards — it let a symlink loop, a permissions change, ENOLCK, descriptor
-	// exhaustion, or a service manager with no HOME each silently switch off the
-	// protection, and the operator's only evidence was a log line among many. An
-	// operator who knows their host has nowhere to put a lock can say so here;
-	// billet will not decide it on their behalf.
-	//
-	// It lives on the node for the same reason lock_dir does: the node is the role
-	// that takes the lock.
+	// Downgrading automatically would let a symlink loop, a permissions change,
+	// ENOLCK, descriptor exhaustion or a service manager with no HOME each silently
+	// switch off the protection, with a log line as the only evidence.
 	AllowUnlockedDeployment bool `yaml:"allow_unlocked_deployment,omitempty"`
 	// StateDir holds node-local data: the generation pointer store (which is
 	// authoritative for this node's volumes), image cache, and mTLS identity.
@@ -349,32 +299,21 @@ type NodeConfig struct {
 	// Firecracker is required when Provider is ProviderFirecracker.
 	Firecracker *FirecrackerConfig `yaml:"firecracker,omitempty"`
 
-	// MaxCustody bounds how long billet holds capacity for compute it cannot
-	// account for — a container adopted from a crashed run, or one an ambiguous
-	// launch may have left behind — before destroying it and reclaiming the
-	// capacity.
+	// MaxCustody bounds how long billet holds capacity for compute it cannot account
+	// for — a container adopted from a crashed run, or one an ambiguous launch may
+	// have left behind — before destroying it. A Go duration string.
 	//
-	// EMPTY MEANS NO BOUND, and that is the right default rather than a cautious
-	// one. Elapsed time is not evidence that a job stopped making progress:
-	// billet imposes no job limit, and self-hosted runners are routinely
-	// configured past GitHub's six-hour default, so a bound picked by billet
-	// would kill legitimate long jobs for no reason visible in the logs. Killing
-	// live work should be authorised by a completion, an observed exit, or by an
-	// operator who knows their own longest job — which is what this is.
-	//
-	// Billet warns hourly about held capacity regardless, which is the signal
-	// that actually helps; this is a backstop for a runner that has wedged.
-	//
-	// A Go duration string: "24h", "90m".
+	// EMPTY MEANS NO BOUND, deliberately. Elapsed time is not evidence that a job
+	// stopped making progress: billet imposes no job limit and self-hosted runners are
+	// routinely configured past GitHub's six-hour default, so a bound picked by billet
+	// would kill legitimate long jobs for no reason visible in the logs. Billet warns
+	// hourly about held capacity regardless.
 	MaxCustody string `yaml:"max_custody,omitempty"`
-	// DrainTimeout bounds how long a stopping node waits for the compute it is
-	// still holding before it gives up and lets the teardown destroy it. See
-	// defaultDrainTimeout.
+	// DrainTimeout bounds how long a stopping node waits for the compute it is still
+	// holding before letting the teardown destroy it. A Go duration string.
 	//
-	// Separate from the control plane's key: a node and a control plane are
-	// restarted for different reasons and need not wait the same amount of time.
-	//
-	// A Go duration string: "6h", "90m".
+	// Separate from the control plane's key: the two are restarted for different
+	// reasons and need not wait the same amount of time.
 	DrainTimeout string `yaml:"drain_timeout,omitempty"`
 }
 
@@ -411,10 +350,11 @@ func (p ProviderKind) Valid() bool {
 	return false
 }
 
-// GuestOS classifies what a tier boots. It exists as an explicit field rather
-// than being inferred from the label because Apple's licensing limit is enforced
-// against it: inferring "this is macOS" from the operator's chosen label means a
-// tier named `sonoma-arm64` silently escapes the cap.
+// GuestOS classifies what a tier boots.
+//
+// An explicit field rather than inferred from the label, because Apple's licensing
+// limit is enforced against it: inferring "this is macOS" from the operator's
+// chosen label lets a tier named `sonoma-arm64` silently escape the cap.
 type GuestOS string
 
 const (
@@ -446,13 +386,9 @@ type FirecrackerConfig struct {
 	KernelImage string `yaml:"kernel_image"`
 	// ZFSPool backs golden images, per-job root clones, and cache volumes.
 	//
-	// SLATED FOR REPLACEMENT BY CEPH RBD (#23). A ZFS snapshot exists only on the
-	// machine that took it, so a cache kept here pins a repository to the host
-	// that first built it. That is the STORAGE reason billet is a one-machine
-	// product; global rather than per-node capacity (#21), escrow-time placement
-	// (#30) and broadcast teardown (#31) are the others, and Ceph fixes none of
-	// them. This field is what the config accepts today, not the intended
-	// architecture.
+	// SLATED FOR REPLACEMENT BY CEPH RBD (#23): a ZFS snapshot exists only on the
+	// machine that took it, so a cache kept here pins a repository to the host that
+	// first built it.
 	ZFSPool string `yaml:"zfs_pool"`
 	// Bridge is the host bridge guests attach to.
 	Bridge string `yaml:"bridge,omitempty"`
@@ -497,27 +433,22 @@ type Tier struct {
 
 	// Providers is an ORDERED preference list, most preferred first.
 	//
-	// The reason one `runs-on` label can span a machine at home and a cloud: a
-	// tier that lists `[firecracker, ec2]` may be placed on either, and losing
-	// the bare-metal host does not take the label down with it. That is the
-	// difference between self-hosted CI you can rely on and self-hosted CI you
-	// can rely on until the power goes out.
+	// The reason one `runs-on` label can span a machine at home and a cloud: a tier
+	// listing `[firecracker, ec2]` may be placed on either, so losing the bare-metal
+	// host does not take the label down with it.
 	//
-	// Setting both this and Provider is an error rather than a merge. They are
-	// two spellings of the same field, and guessing which one an operator meant —
-	// when the answer decides where untrusted code runs — is not a kindness.
+	// THE ORDER DECIDES, AT ESCROW. The allocator walks it most-preferred-first over
+	// the hosts that can serve the tier and have room, and records the choice on the
+	// lease — so a job reaches the cloud only when home is full, rather than when a
+	// cloud node polls first. server.placement decides only between hosts this order
+	// cannot separate.
 	//
-	// THE ORDER DECIDES, AT ESCROW. The allocator walks this slice
-	// most-preferred-first over the hosts that can serve the tier and have room,
-	// and records the choice on the lease — so the reservation billet advertises
-	// is already backed by a specific machine, and a job reaches the cloud only
-	// when home is full rather than when a cloud node polls first.
+	// Setting both this and Provider is an error rather than a merge: they are two
+	// spellings of the same field, and guessing which an operator meant — when the
+	// answer decides where untrusted code runs — is not a kindness.
 	//
-	// A tuning knob never overrules it: server.placement decides only between
-	// hosts this order cannot separate.
-	//
-	// What is missing is the cloud itself. Docker is the only provider built, so
-	// the fallback half cannot be exercised yet (#32).
+	// Docker is the only provider built, so the fallback half cannot be exercised
+	// yet (#32).
 	Providers []ProviderKind `yaml:"providers,omitempty"`
 	// GuestOS defaults to linux. Set it explicitly for macOS and Windows tiers —
 	// licensing and capability checks key off this field, not off the label.
@@ -526,41 +457,33 @@ type Tier struct {
 	// node can serve it — macOS tiers, for example.
 	Node string `yaml:"node,omitempty"`
 
-	// Site optionally confines this tier to one place, the way Node confines it
-	// to one machine — but a site holds several machines, so it constrains
-	// WITHOUT giving up the fallback that having several of them buys.
+	// Site optionally confines this tier to one place, the way Node confines it to one
+	// machine — but a site holds several machines, so it constrains without giving up
+	// the fallback that having several of them buys.
 	//
-	// The reason to reach for it is data rather than hardware: a job that must
-	// not leave a location, or one whose cache only exists in one place and would
-	// run cold anywhere else.
+	// The reason to reach for it is data rather than hardware: a job that must not
+	// leave a location, or one whose cache exists in only one place.
 	Site string `yaml:"site,omitempty"`
-	// RunnerGroup is the GitHub runner group this tier's scale set belongs to.
-	// Empty means GitHub's "default" group.
+	// RunnerGroup is the GitHub runner group this tier's scale set belongs to. Empty
+	// means GitHub's "default" group.
 	//
-	// It matters for access control rather than for scheduling: a runner group is
-	// how an organization decides which repositories may use these runners, and
-	// putting every tier in the default group hands them to every repository in
-	// the org. billet does not enforce that policy — GitHub does — but it must be
-	// expressible, or an operator has to go and move the scale set by hand after
-	// every reconcile.
+	// Access control rather than scheduling: a runner group is how an organization
+	// decides which repositories may use these runners, and putting every tier in the
+	// default group hands them to every repository in the org.
 	RunnerGroup string `yaml:"runner_group,omitempty"`
 
-	// Command starts the runner inside this tier's image. Empty means the stock
-	// runner image's `./run.sh`, which is what almost every tier wants.
+	// Command starts the runner inside this tier's image. Empty means the stock runner
+	// image's `./run.sh`.
 	//
-	// It is expressible at all because a container image's default command is a
-	// shell: a backend that launches one gets a container that exits immediately
-	// while every signal reports success, so the command cannot be left to the
-	// image. Set this only for an image that does not lay the runner out the
-	// stock way.
+	// Expressible because a container image's default command is a shell: a backend
+	// that launches one gets a container that exits immediately while every signal
+	// reports success, so the command cannot be left to the image.
 	Command []string `yaml:"command,omitempty"`
 
-	// NOTE on what is accepted: the scale-set client interpolates this name into
-	// a query string WITHOUT escaping it, so a perfectly ordinary group name like
-	// "Platform & Security" is parsed as two parameters and comes back as "group
-	// not found" — a confusing first-contact failure that looks like a
-	// permissions problem. Validation therefore rejects what the client cannot
-	// carry, rather than letting GitHub answer confusingly. See validateTier.
+	// NOTE: the scale-set client interpolates this name into a query string WITHOUT
+	// escaping it, so an ordinary group name like "Platform & Security" is parsed as
+	// two parameters and comes back as "group not found". Validation rejects what the
+	// client cannot carry rather than letting GitHub answer confusingly.
 
 	VCPU   int      `yaml:"vcpu"`
 	Memory ByteSize `yaml:"memory"`
@@ -571,80 +494,54 @@ type Tier struct {
 
 	Image string `yaml:"image"`
 
-	// WarmPool pre-boots idle VMs to hide cold-start latency. Start at 0-2 and
-	// raise it only after measuring what cold start actually costs; a large warm
-	// pool burns memory to solve a problem Firecracker may not have. Warm guests
-	// count against MaxConcurrent, because a warm macOS guest is still a running
-	// macOS guest as far as Apple's licence is concerned.
+	// WarmPool pre-boots idle VMs to hide cold-start latency. Warm guests count
+	// against MaxConcurrent, because a warm macOS guest is still a running macOS guest
+	// as far as Apple's licence is concerned.
 	WarmPool int `yaml:"warm_pool,omitempty"`
 
-	// Intercept enables the colocated Actions cache for this tier. It defaults
-	// to false for a reason: cache interception terminates TLS in front of
-	// GitHub's results service, which also carries artifact metadata. Leave it
-	// off for tiers that publish release artifacts or hold deployment secrets.
+	// Intercept enables the colocated Actions cache for this tier. Off by default:
+	// cache interception terminates TLS in front of GitHub's results service, which
+	// also carries artifact metadata. Leave it off for tiers that publish release
+	// artifacts or hold deployment secrets.
 	Intercept bool `yaml:"intercept,omitempty"`
 
 	// MaxConcurrent caps simultaneous instances of this tier, counting warm ones.
 	// Zero means "no per-tier cap" and is only legal for non-macOS tiers.
 	MaxConcurrent int `yaml:"max_concurrent,omitempty"`
 
-	// Reserved is how many simultaneous instances of this tier are always
-	// available to it, no matter how busy every other tier is.
+	// Reserved is how many simultaneous instances of this tier are always available to
+	// it, no matter how busy every other tier is.
 	//
-	// A FLOOR, where MaxConcurrent is a ceiling — and the difference is the
-	// difference between limiting a tier and guaranteeing one. Billet shares a
-	// single budget across every tier, and headroom is the whole of what is left,
-	// so a tier with steady demand can hold all of it: the others then advertise
-	// zero capacity, their jobs queue at GitHub indefinitely, and nothing in
-	// billet is behaving incorrectly. On the catalogue in billet.example.yaml —
-	// 2, 4 and 8 vCPU tiers sharing one machine — the 2 vCPU tier wins that race
-	// simply by fitting more often.
+	// A FLOOR, where MaxConcurrent is a ceiling. Billet shares one budget across every
+	// tier and headroom is whatever is left, so a tier with steady demand can hold all
+	// of it while the others advertise zero and their jobs queue at GitHub — with
+	// nothing behaving incorrectly. On the catalogue in billet.example.yaml the 2 vCPU
+	// tier wins that race simply by fitting more often.
 	//
 	// A reservation is deducted from what OTHER tiers may take, only while it is
-	// unmet. A tier already holding its floor competes for the rest on equal
-	// terms — the deduction stops, it does not become a quota.
+	// unmet. A tier already holding its floor competes for the rest on equal terms.
 	//
-	// THAT IS NOT THE SAME AS "capacity is never idled", which this comment used
-	// to claim one paragraph above saying the opposite. Listeners refill escrow
-	// EAGERLY, without consulting demand, so a reserved tier does not hold its
-	// floor in reserve — it CLAIMS it, keeps the leases alive, and advertises
-	// capacity to GitHub that nobody may want. See below.
+	// THE COST IS IDLE CAPACITY, and it is not "the floor sits unclaimed": listeners
+	// refill escrow eagerly and without regard to demand, so the reserved tier CLAIMS
+	// its floor almost immediately and heartbeats those leases for as long as it is
+	// healthy. Reserve 2 slots of an 8 vCPU tier nothing uses and the machine is
+	// permanently 16 vCPU smaller, with no error and no log line.
 	//
-	// THE COST IS IDLE CAPACITY, and it is worth knowing before setting this.
-	// Reserve 2 slots of an 8 vCPU tier nothing ever uses and the machine is
-	// permanently 16 vCPU smaller, with no error and no log line, because from
-	// billet's point of view nothing is wrong.
-	//
-	// The mechanism is worth being precise about, because it is not "the floor
-	// sits unclaimed". Listeners refill escrow eagerly and without regard to
-	// demand, so the reserved tier CLAIMS its floor almost immediately and then
-	// heartbeats those leases for as long as it is healthy. The capacity is gone
-	// either way; it is simply held by a tier rather than withheld from one.
-	//
-	// So reserve for tiers that have demand and are being crowded out, not for
-	// tiers that might one day want capacity. A static floor cannot tell the
-	// difference; a future demand-aware scheduler could, since GitHub reports
-	// queued jobs per scale set.
-	//
-	// Zero, the default, means no guarantee — which is the current behaviour and
-	// the right default, because a floor is a promise about a machine only its
-	// operator can make.
+	// So reserve for tiers that have demand and are being crowded out, not for tiers
+	// that might one day want capacity. Zero, the default, means no guarantee.
 	Reserved int `yaml:"reserved,omitempty"`
 }
 
-// DefaultMacOSVMLimit is Apple's licensing cap on macOS guests per
-// Apple-branded host. Linux guests on the same machine are not subject to it.
+// DefaultMacOSVMLimit is Apple's licensing cap on macOS guests per Apple-branded
+// host. Linux guests on the same machine are not subject to it.
 //
-// This is the DEFAULT, not a hard ceiling: a deployment sets its own per-host
-// number via NodePolicy.MacOSVMLimit, because billet cannot know what hardware
-// or licence agreement an operator has. What the default guarantees is that a
-// config which says nothing gets Apple's standard terms rather than "unlimited".
+// A DEFAULT, not a hard ceiling: a deployment sets its own per-host number via
+// NodePolicy.MacOSVMLimit. What the default guarantees is that a config which says
+// nothing gets Apple's standard terms rather than "unlimited".
 //
-// The static check here is a guard, not the enforcement point: the allocator
-// additionally holds a single host-wide count of running plus warm macOS guests
-// at runtime, because two separately-valid tiers on one node still share one
-// physical Mac. Both read the effective limit from the same NodePolicy, so there
-// is one number rather than two that can drift apart.
+// The static check is a guard, not the enforcement point — the allocator also
+// holds a host-wide count of running plus warm macOS guests at runtime, because
+// two separately-valid tiers on one node share one physical Mac.
 const DefaultMacOSVMLimit = 2
 
 // NodePolicyFor returns the policy for a named host, and whether one was
@@ -663,14 +560,12 @@ func (c *Config) NodePolicyFor(name string) (NodePolicy, bool) {
 
 // ProviderErrors reports everything wrong with a tier's backend declaration.
 //
-// One function, because `provider:` and `providers:` are two spellings of the
-// same field and validating them separately is how they drift.
+// One function, because `provider:` and `providers:` are two spellings of the same
+// field and validating them separately is how they drift.
 //
-// EXPORTED because alloc.New is documented as unable to assume its catalogue
-// came through Load — a caller can construct tiers directly — and it was
-// therefore accepting tiers this package refuses, including a macOS tier with a
-// non-Apple fallback. A rule that only one entry point enforces is a rule with a
-// second entry point that does not.
+// EXPORTED because alloc.New cannot assume its catalogue came through Load — a
+// caller can construct tiers directly — and a rule only one entry point enforces
+// is a rule with a second entry point that does not.
 func (t Tier) ProviderErrors(where string) []error {
 	var errs []error
 
@@ -742,12 +637,10 @@ func (t Tier) ReservedMemory() ByteSize { return ByteSize(t.Reserved) * t.Memory
 
 // GuestOSProviderErrors reports backends that cannot host a tier's guest OS.
 //
-// Split out from the fuller relational validation so alloc can apply the part
-// that is a SAFETY invariant rather than a configuration convenience. Apple's
-// licence permits macOS guests only on Apple hardware, and a catalogue built in
-// code was able to declare a macOS tier that falls back to EC2 — runtime
-// placement only tests list membership, so that lease would have bound to an EC2
-// node quite happily.
+// Split out from the fuller relational validation so alloc can apply the part that
+// is a SAFETY invariant rather than a configuration convenience: Apple's licence
+// permits macOS guests only on Apple hardware, and runtime placement only tests
+// list membership, so a macOS tier that fell back to EC2 would bind there happily.
 func (t Tier) GuestOSProviderErrors(where string) []error {
 	var errs []error
 
@@ -767,15 +660,12 @@ func (t Tier) GuestOSProviderErrors(where string) []error {
 }
 
 // AcceptableProviders reports the backends this tier may run on, most preferred
-// first.
+// first. The single reader for that question, so `provider:` and `providers:`
+// cannot drift apart — callers must not consult Tier.Provider directly.
 //
-// The single reader for that question, so `provider:` and `providers:` cannot
-// drift apart. Callers must not consult Tier.Provider directly.
-// CLONED, because callers keep what this returns. The allocator copies the list
-// onto every lease it reserves, and handing out the tier's own backing array
-// meant a caller mutating one element afterwards changed what future leases
-// authorize — with no revalidation, and directly against the snapshot rule that
-// the rest of this design rests on. Following NodePolicy.Clone's precedent.
+// CLONED, because callers keep what this returns: the allocator copies the list
+// onto every lease it reserves, and handing out the tier's own backing array would
+// let a caller change what future leases authorize.
 func (t Tier) AcceptableProviders() []ProviderKind {
 	if len(t.Providers) > 0 {
 		return slices.Clone(t.Providers)
@@ -795,9 +685,9 @@ func (t Tier) AcceptsProvider(p ProviderKind) bool {
 
 // MaxCustodyDuration parses Node.MaxCustody, reporting zero when unset.
 //
-// Parsed on demand rather than at load time because the config type stays a
-// plain data shape — but validation calls it too, so a typo is reported when the
-// file is read rather than hours later when a container needs reclaiming.
+// Parsed on demand so the config type stays a plain data shape — but validation
+// calls it too, so a typo is reported when the file is read rather than hours
+// later when a container needs reclaiming.
 func (n *NodeConfig) MaxCustodyDuration() (time.Duration, error) {
 	if n == nil || strings.TrimSpace(n.MaxCustody) == "" {
 		return 0, nil
@@ -824,13 +714,12 @@ func (c *Config) MacOSLimitForNode(name string) int {
 	return p.MacOSLimit()
 }
 
-// NodePolicies is the declared fleet policy keyed by node name. It is what the
-// allocator is built from, so runtime enforcement and this package's load-time
-// guard read the same rules rather than two copies that can drift.
+// NodePolicies is the declared fleet policy keyed by node name. The allocator is
+// built from it, so runtime enforcement and this package's load-time guard read
+// the same rules rather than two copies that can drift.
 //
-// Only DECLARED hosts appear. An absent host is unconstrained in guest OS and
-// carries Apple's default macOS limit — the same thing the allocator assumes
-// for a name it does not recognise.
+// Only DECLARED hosts appear; an absent host is unconstrained in guest OS and
+// carries Apple's default macOS limit.
 func (c *Config) NodePolicies() map[string]NodePolicy {
 	policies := make(map[string]NodePolicy, len(c.Nodes))
 
@@ -843,44 +732,27 @@ func (c *Config) NodePolicies() map[string]NodePolicy {
 
 var labelRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$`)
 
-// runnerGroupUnsafe are the characters that do not survive the scale-set
-// client's handling of a group name.
+// runnerGroupUnsafe are the characters that do not survive the scale-set client's
+// handling of a group name.
 //
-// This started as an allowlist and the allowlist was wrong in both directions.
-// The client interpolates the name unescaped into a path (client.go:351), then
-// url.Parse's it, reads Query(), and re-Encode's it — so the question is not
-// "is this character legal in a URL" but "does this character survive one
-// parse-and-re-encode round trip". Measured against v0.4.0, rather than
-// reasoned about:
+// The client interpolates the name unescaped into a path, then url.Parse's it,
+// reads Query(), and re-Encode's it — so the question is not "is this legal in a
+// URL" but "does it survive one parse-and-re-encode round trip". Measured against
+// v0.4.0 rather than reasoned about:
 //
 //	&   splits the value into another parameter    "Platform & Security" -> "Platform "
 //	#   starts a fragment and truncates it         "a#b"                 -> "a"
 //	;   ParseQuery has rejected it as a separator
 //	    since Go 1.17 and drops the whole pair     "a;b"                 -> ""
-//	%   is decoded and re-encoded, so a literal
-//	    one is either destroyed or transformed     "100%" -> ""   "%41" -> "A"
-//	+   is decoded to a space                      "a+b"                 -> "a b"
-//
-// Everything else survives, INCLUDING = and ? and / and : and quotes — and
-// including non-ASCII, so the old rule rejected "Grupo-Ñ" and "研发" for no
-// reason. Control characters are excluded separately: url.Parse refuses them
-// outright, which is a clean failure but a much later and stranger one.
 const runnerGroupUnsafe = "&#;%+"
 
 // maxRunnerGroupLen is BILLET's sanity bound, not GitHub's rule.
 //
-// The 100 it replaces was carried over from the regex this check replaced, where
-// it was equally invented — and stating an invented number as though it were
-// GitHub's is the same mistake as the allowlist: a rule about someone else's API
-// that is not pinned to that API's behaviour. GitHub does not document a runner
-// group name length, so billet does not claim to know one.
-//
-// What is genuinely billet's concern is that a runaway config value cannot build
-// a URL the Actions service rejects wholesale, and 512 bytes is far above any
-// plausible group name while still catching a field that was pasted into by
-// accident. It counts BYTES because the thing being bounded is a URL, and it is
-// generous enough that the bytes-versus-runes distinction cannot reject a real
-// name: 512 bytes is 170 characters even in the worst case for CJK text.
+// GitHub does not document a runner group name length, so billet does not claim to
+// know one. What is genuinely billet's concern is that a runaway config value
+// cannot build a URL the Actions service rejects wholesale. It counts BYTES
+// because the thing being bounded is a URL, and 512 is 170 characters even in the
+// worst case for CJK text.
 const maxRunnerGroupLen = 512
 
 // checkRunnerGroup reports why a runner group name cannot be looked up, or nil.
@@ -919,16 +791,14 @@ func checkRunnerGroup(group string) error {
 	return nil
 }
 
-// validateNodeName is the ONE rule for a node identifier, wherever it appears:
-// node.name, nodes[].name, and tiers[].node all name hosts in a single
-// namespace, so validating them differently lets the same string be a legal
-// host here and an illegal one there.
+// ValidateNodeName is the ONE rule for a node identifier, wherever it appears:
+// node.name, nodes[].name and tiers[].node all name hosts in a single namespace,
+// so validating them differently lets the same string be a legal host here and an
+// illegal one there.
 //
-// A whitespace-only pin is what made that concrete. This package treated it as
-// "pinned" — a macOS tier satisfied the must-name-a-node rule and inherited a
-// concurrency default from it — while the allocator trimmed it to empty and
-// rejected the same tier. On a Linux tier the trim silently turned a pin into
-// no pin at all, which is a placement decision changed by whitespace.
+// A whitespace-only pin is the concrete case: treated as "pinned" here it
+// satisfies the must-name-a-node rule, while a consumer that trims it sees no pin
+// at all — a placement decision changed by whitespace.
 func ValidateNodeName(where, name string) error {
 	if !labelRe.MatchString(name) {
 		return fmt.Errorf("%s: node name %q must match %s", where, name, labelRe)
@@ -939,16 +809,13 @@ func ValidateNodeName(where, name string) error {
 
 // trimNodeName strips surrounding whitespace ONLY when something is left.
 //
-// Trimming unconditionally destroyed the difference between "absent" and
-// "present but unusable", and both directions were wrong. A `node.name` of
-// "   " became empty and was replaced by the machine's hostname, silently
-// adopting a different identity than the one written. A tier's `node: "   "`
-// became unpinned, and the `if t.Node != ""` guard then skipped validation
-// entirely — removing the operator's placement constraint, which is precisely
-// what validating names was meant to prevent.
+// Trimming unconditionally destroys the difference between "absent" and "present
+// but unusable", and both directions are wrong: a node.name of "   " would become
+// empty and silently adopt the machine's hostname, and a tier's `node: "   "`
+// would become unpinned and skip validation entirely.
 //
 // Leaving a whitespace-only value intact lets it reach the pattern check and be
-// rejected, which is the honest outcome.
+// rejected.
 func trimNodeName(name string) string {
 	if trimmed := strings.TrimSpace(name); trimmed != "" {
 		return trimmed
@@ -960,9 +827,8 @@ func trimNodeName(name string) string {
 // Validate reports every way this policy is malformed on its own terms.
 //
 // Exported because internal/alloc must apply the SAME rules: its constructor
-// accepts a catalog it cannot prove came through Load, and a second
-// hand-written copy of these checks is how the two drift into disagreeing about
-// which hosts are legal.
+// accepts a catalog it cannot prove came through Load, and a second hand-written
+// copy is how the two drift into disagreeing about which hosts are legal.
 func (p NodePolicy) Validate(where string) []error {
 	var errs []error
 
@@ -1036,18 +902,12 @@ func Load(path string) (*Config, error) {
 	return &c, nil
 }
 
-// relocatedKeyHint turns "unknown field" into "that key moved, and here is
-// where".
+// relocatedKeyHint turns "unknown field" into "that key moved, and here is where".
 //
-// KNOWNFIELDS CANNOT TELL A TYPO FROM A REMOVAL, and it reports both as a field
-// that does not exist. For a genuine typo that is the whole story. For a setting
-// that was correct when the operator wrote it and has since moved roles, it is a
-// dead end: the message names the key they already know about and says nothing
-// about what to do, so the honest fix looks like deleting a setting they
-// deliberately chose.
-//
-// The lock keys moved from the server to the node because the node became the
-// only role that takes the lock.
+// KnownFields cannot tell a typo from a removal. For a typo that is the whole
+// story; for a setting that was correct when the operator wrote it and has since
+// moved roles, the message names the key they already know about and says nothing
+// about what to do.
 func relocatedKeyHint(err error) error {
 	moved := map[string]string{
 		"lock_dir":                  "node.lock_dir",
@@ -1126,30 +986,21 @@ func (c *Config) applyDefaults() {
 	}
 	for i := range c.Tiers {
 		t := &c.Tiers[i]
-		// The PINNED host's provider wins over the local node's. Defaulting from
-		// the local node is right for an unpinned tier and wrong for a pinned
-		// one: on a multi-host deployment, the file describing the EPYC box would
-		// otherwise stamp `firecracker` onto a tier pinned to a Mac, producing a
-		// contradiction the operator never wrote. Pinning names a host, and that
-		// host's declared provider is the more specific answer.
-		// Only a VALID provider is inherited. Copying an unknown one produces a
-		// second diagnostic blaming a field the operator never supplied, for a
-		// typo they made once somewhere else.
+		// The PINNED host's provider wins over the local node's: on a multi-host
+		// deployment the file describing the EPYC box would otherwise stamp `firecracker`
+		// onto a tier pinned to a Mac. Only a VALID provider is inherited, or an unknown
+		// one produces a second diagnostic blaming a field the operator never supplied.
 		if len(t.AcceptableProviders()) == 0 && t.Node != "" {
 			if p, declared := c.NodePolicyFor(t.Node); declared && p.Provider.Valid() {
 				t.Provider = p.Provider
 			}
 		}
 
-		// The local provider is inherited only when it is itself valid, for the
-		// same reason: an invalid one copied here becomes a second diagnostic
-		// against a field the operator never wrote.
-		//
-		// Checked against the whole LIST, not the single field. A tier written
-		// with `providers:` leaves Provider empty, so testing that field alone
-		// stamped the local backend onto a tier that had already named several —
-		// and validation then refused the pair as "you set both", blaming the
-		// operator for a field billet had just filled in itself.
+		// The local provider is inherited only when it is itself valid, for the same
+		// reason. Checked against the whole LIST, not the single field: a tier written
+		// with `providers:` leaves Provider empty, so testing that field alone would stamp
+		// the local backend onto a tier that had already named several — and validation
+		// would then refuse the pair as "you set both".
 		if len(t.AcceptableProviders()) == 0 && c.Node != nil && c.Node.Provider.Valid() {
 			t.Provider = c.Node.Provider
 		}
@@ -1157,14 +1008,9 @@ func (c *Config) applyDefaults() {
 			t.GuestOS = GuestLinux
 		}
 		// A macOS tier with no explicit cap inherits its host's limit rather than
-		// "unlimited", so forgetting the field fails safe. Reading it from the
-		// node policy means lowering a Mac's limit tightens every macOS tier
-		// pinned to it, instead of leaving tiers at a default the host no longer
-		// permits.
-		// Only from a usable limit. A negative one is a config error reported by
-		// validateNodes, and copying it here would turn one bad field into three
-		// diagnostics, two of them naming max_concurrent — which the operator
-		// never set.
+		// "unlimited", so forgetting the field fails safe, and lowering a Mac's limit
+		// tightens every macOS tier pinned to it. Only from a usable limit — copying a
+		// negative one would turn one bad field into three diagnostics.
 		if t.GuestOS == GuestMacOS && t.MaxConcurrent == 0 {
 			if limit := c.MacOSLimitForNode(t.Node); limit > 0 {
 				t.MaxConcurrent = limit
@@ -1203,17 +1049,13 @@ func (c *Config) validateNodeTLS() []error {
 		return errs
 	}
 
-	// THE SERVER'S LISTEN ADDRESS DECIDES THE TRANSPORT, and the node's
-	// destination cannot be used to infer it. The first attempt at this rule
-	// refused any bundle aimed at loopback — which is wrong for the ordinary
-	// production shape: a control plane listening on 0.0.0.0 serves mTLS on EVERY
-	// interface, loopback included, so a node colocated with it dials 127.0.0.1
+	// THE SERVER'S LISTEN ADDRESS DECIDES THE TRANSPORT, and the node's destination
+	// cannot be used to infer it: a control plane listening on 0.0.0.0 serves mTLS on
+	// EVERY interface, loopback included, so a node colocated with it dials 127.0.0.1
 	// AND needs its certificate.
 	//
-	// So the question is only answerable when this file describes both roles, and
-	// then it is answerable exactly. A standalone node's file says nothing about
-	// how the server bound its listener, and guessing there is what produced two
-	// authorities for one fact.
+	// So the question is only answerable when this file describes both roles. A
+	// standalone node's file says nothing about how the server bound its listener.
 	if c.Server != nil && LoopbackAddr(c.Server.Listen) {
 		errs = append(errs, fmt.Errorf(
 			"node.tls is set, but server.listen is %q — a control plane that accepts only on "+
@@ -1236,10 +1078,9 @@ func (c *Config) validateNodeTLS() []error {
 			continue
 		}
 
-		// Absolute for the same reason every other path here is: a node is a
-		// long-lived service whose working directory is whatever started it, and a
-		// relative certificate path resolves differently under systemd than it did
-		// in the shell where it was tested.
+		// Absolute, because a node is a long-lived service whose working directory is
+		// whatever started it: a relative certificate path resolves differently under
+		// systemd than in the shell where it was tested.
 		if !filepath.IsAbs(path) {
 			errs = append(errs, fmt.Errorf(
 				"%s must be an absolute path, got %q: a relative one resolves against whatever "+
@@ -1256,10 +1097,9 @@ func (c *Config) validateNodeTLS() []error {
 
 // LoopbackAddr reports whether an address accepts only from this machine.
 //
-// SHARED WITH THE SERVER'S OWN DECISION, deliberately: the wire is served
-// without TLS on exactly the addresses this returns true for, so config
-// validation and the listener must not answer the question differently. A
-// wildcard is NOT loopback — it accepts from everywhere, including loopback.
+// SHARED WITH THE SERVER'S OWN DECISION: the wire is served without TLS on exactly
+// the addresses this returns true for, so config validation and the listener must
+// not answer differently. A wildcard is NOT loopback.
 func LoopbackAddr(addr string) bool {
 	return isLoopbackHostPort(addr)
 }
@@ -1326,12 +1166,6 @@ func (c *Config) validateServer() []error {
 		errs = append(errs, errors.New(
 			"server.max_memory must be positive; it is the ceiling the allocator escrows against"))
 	}
-	// CAUGHT AT LOAD, not at lock time, because the failure it prevents is
-	// invisible at lock time. A relative lock_dir resolves against each process's
-	// working directory, so one config saying `lock_dir: locks` puts a systemd
-	// unit started in / and an operator started in /srv/billet into different
-	// collision domains — and both log the same relative string, so the startup
-	// diagnostic meant to expose a mismatch would hide this one instead.
 	// Parsed here so a typo is reported when the file is READ, rather than at the
 	// shutdown that needed it — by which point the operator is watching a restart
 	// that will not finish and has no reason to suspect the config.
@@ -1373,9 +1207,9 @@ func (c *Config) validateNode() []error {
 		errs = append(errs, fmt.Errorf("node.provider %q is not one of %v", c.Node.Provider, allProviders))
 	}
 
-	// Same rule as server.lock_dir, and for the same reason: a relative path
-	// resolves against each process's working directory, so one config could put
-	// the server and the node into different collision domains on one host.
+	// Absolute, because a relative path resolves against each process's working
+	// directory: one config could put the server and the node into different
+	// collision domains on one host.
 	if c.Node.LockDir != "" && !filepath.IsAbs(c.Node.LockDir) {
 		errs = append(errs, fmt.Errorf(
 			"node.lock_dir must be an absolute path, got %q: a relative one resolves against "+
@@ -1383,11 +1217,10 @@ func (c *Config) validateNode() []error {
 				"different files for one deployment identity", c.Node.LockDir))
 	}
 
-	// ZERO IS "I DID NOT SAY" AND NEGATIVE IS NOT A SMALLER OFFER. A negative
-	// contribution is a ceiling every comparison passes, which is the capacity
-	// check silently switched off rather than a host that gives a little. The
-	// memory side is refused when the size is parsed; this one is a plain int
-	// with nothing standing in front of it.
+	// ZERO IS "I DID NOT SAY" AND NEGATIVE IS NOT A SMALLER OFFER: a negative
+	// contribution is a ceiling every comparison passes, which switches the capacity
+	// check off rather than offering a little. The memory side is refused when the
+	// size is parsed; this one is a plain int.
 	if c.Node.MaxVCPU < 0 {
 		errs = append(errs, fmt.Errorf("node.max_vcpu is %d; leave it unset to contribute "+
 			"everything this machine has", c.Node.MaxVCPU))
@@ -1404,10 +1237,9 @@ func (c *Config) validateNode() []error {
 		errs = append(errs, err)
 	}
 	if err := ValidateNodeName("node.name", c.Node.Name); err != nil {
-		// Say where the name came from when billet supplied it. A hostname is not
-		// guaranteed to be a legal node name — a long FQDN exceeds the length
-		// limit — and "node.name is invalid" sends an operator who never typed
-		// one looking for a field that is not in their file.
+		// Say where the name came from when billet supplied it: a hostname is not
+		// guaranteed to be a legal node name, and "node.name is invalid" sends an
+		// operator who never typed one looking for a field not in their file.
 		if c.nameDefaulted {
 			err = fmt.Errorf(
 				"node.name defaulted to this machine's hostname %q, which is not a usable node name "+
@@ -1456,12 +1288,9 @@ func (c *Config) validateTiers() []error {
 			errs = append(errs, fmt.Errorf("%s: duplicate label", where))
 		}
 
-		// Rejected HERE rather than left for GitHub to answer confusingly. The
-		// scale-set client interpolates this name into a query string without
-		// escaping it, so a group name containing & — "Platform & Security" is a
-		// realistic one — is parsed as several parameters and comes back as
-		// "group not found". That reads as a permissions problem and sends an
-		// operator to the wrong page entirely.
+		// Rejected HERE rather than left for GitHub to answer confusingly: an unescaped
+		// "Platform & Security" comes back as "group not found", which reads as a
+		// permissions problem.
 		if err := checkRunnerGroup(t.RunnerGroup); err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", where, err))
 		}
@@ -1510,19 +1339,9 @@ func (c *Config) validateTiers() []error {
 
 		errs = append(errs, c.validateGuestOSRules(where, t)...)
 	}
-	// THE FLOORS MUST FIT TOGETHER, and this has to live here as well as in the
-	// allocator. `billet check` only runs config validation, so with these
-	// checks in alloc.New alone it reported a broken configuration as valid and
-	// the server failed later while constructing the allocator — which is the
-	// opposite of what a check command is for.
-	//
-	// Checked by division rather than by multiplying: `reserved * vcpu` is
-	// unchecked arithmetic on a config-supplied number, and a large enough one
-	// wraps negative, at which point a "does it fit" test passes comfortably.
-	// Only when the budget is itself usable. A non-positive max_vcpu is already
-	// reported against the field that holds it, and running the floor check
-	// anyway adds a fabricated "needs more than the 0 vCPU left" for every
-	// reservation — sending the reader to fix tiers that are not the problem.
+	// THE FLOORS MUST FIT TOGETHER, and this must live here as well as in the
+	// allocator: `billet check` only runs config validation, so with the check in
+	// alloc.New alone it would report a broken configuration as valid.
 	if c.Server != nil {
 		errs = append(errs, c.floorFitErrors()...)
 	}
@@ -1532,19 +1351,20 @@ func (c *Config) validateTiers() []error {
 
 // floorFitErrors reports reservations that cannot all be honoured at once.
 //
-// The failure is invisible where it happens: every tier deducts every other
-// tier's unmet floor, so if the floors exceed the budget then EVERY tier
-// computes zero headroom and the whole deployment quietly advertises nothing.
+// The failure is invisible where it happens: every tier deducts every other tier's
+// unmet floor, so floors exceeding the budget make EVERY tier compute zero
+// headroom and the whole deployment quietly advertise nothing.
+//
+// Checked by division rather than multiplication: `reserved * vcpu` is unchecked
+// arithmetic on a config-supplied number, and a large enough one wraps negative,
+// at which point a "does it fit" test passes comfortably.
 func (c *Config) floorFitErrors() []error {
-	// A non-positive budget is already reported against the field that holds it.
-	// Checking floors against it produces a second, fabricated diagnostic per
-	// reservation, blaming tiers that are not the problem.
+	// A non-positive budget is already reported against the field that holds it, and
+	// checking floors against it produces a fabricated diagnostic per reservation.
 	//
-	// GUARDED ONCE, HERE, and not again inside the loop. A per-iteration
-	// `remaining > 0` guard looks like the same defence and is not: the remaining
-	// budget legitimately reaches zero once earlier tiers have taken it all, and
-	// at that point a further reservation MUST be reported. Skipping the check
-	// there accepts a catalogue that cannot be honoured.
+	// GUARDED ONCE, HERE, and not again inside the loop: the remaining budget
+	// legitimately reaches zero once earlier tiers have taken it all, and a further
+	// reservation MUST be reported at that point.
 	if c.Server.MaxVCPU <= 0 || c.Server.MaxMemory <= 0 {
 		return nil
 	}
@@ -1593,10 +1413,9 @@ func (c *Config) floorFitErrors() []error {
 func (c *Config) validateGuestOSRules(where string, t *Tier) []error {
 	var errs []error
 
-	// Relational checks are skipped when either side carries an invalid enum
-	// value: the value itself is already reported, and comparing a typo against
-	// an allowlist produces a second diagnostic describing the same mistake in
-	// terms that send the reader to the wrong field.
+	// Relational checks are skipped when either side carries an invalid enum value:
+	// the value is already reported, and comparing a typo against an allowlist
+	// produces a second diagnostic pointing at the wrong field.
 	if !t.GuestOS.Valid() || len(t.ProviderErrors("")) > 0 {
 		return errs
 	}
@@ -1615,10 +1434,9 @@ func (c *Config) validateGuestOSRules(where string, t *Tier) []error {
 			errs = append(errs, fmt.Errorf(
 				"%s: guest_os %s is not in node %q's guest_os allowlist %v",
 				where, t.GuestOS, t.Node, p.GuestOS))
-		// ACCEPTS, not equals. A tier written with `providers:` leaves the singular
-		// field empty, so comparing it let a plural tier pinned to a host it can
-		// never bind to load perfectly cleanly — the whole point of this check
-		// being that the failure would otherwise surface as a job that queues
+		// ACCEPTS, not equals: a tier written with `providers:` leaves the singular field
+		// empty, so comparing it would let a plural tier pinned to a host it can never
+		// bind to load cleanly — and the failure would surface as a job that queues
 		// forever.
 		case p.Provider != "" && len(t.AcceptableProviders()) > 0 && !t.AcceptsProvider(p.Provider):
 			// A tier pinned to a host running a different backend loads cleanly
@@ -1630,34 +1448,25 @@ func (c *Config) validateGuestOSRules(where string, t *Tier) []error {
 		}
 	} else {
 		// An UNPINNED tier may be placed on any host, so a restrictive allowlist
-		// constrains it even though it names no host. Checking only pinned tiers
-		// left the allowlist bypassable: a macOS-only Mac could still be handed a
-		// Linux guest, because nothing tied the tier to a host for the check to
-		// fire on.
+		// constrains it even though it names no host. Checking only pinned tiers would
+		// leave the allowlist bypassable.
 		//
-		// The predicate is "could this tier actually land here", not guest OS
-		// alone. A firecracker tier can never run on a Tart host, so a bare
-		// guest-OS comparison would make declaring one macOS-only Mac an error
-		// for every ordinary x64 Linux tier in the deployment. Only a host that
-		// declares the SAME provider can be a placement candidate, which is why
-		// this fires on provider match and stays silent otherwise.
+		// The predicate is "could this tier actually land here", not guest OS alone: a
+		// firecracker tier can never run on a Tart host, so a bare guest-OS comparison
+		// would make declaring one macOS-only Mac an error for every x64 Linux tier.
+		// Silence is not safety — a node declaring no provider cannot be reasoned about
+		// here, and the allocator enforces the allowlist again at Bind.
 		//
-		// Silence is not safety: a node that declares no provider cannot be
-		// reasoned about here, and the allocator enforces the allowlist again at
-		// Bind, where the host is actually known.
-		//
-		// Only the first offending host is reported — one unpinned tier against
-		// five restrictive hosts is one mistake, not five.
+		// Only the first offending host is reported: one unpinned tier against five
+		// restrictive hosts is one mistake, not five.
 		for i := range c.Nodes {
 			p := &c.Nodes[i]
 			if !p.policyEnumsValid() {
 				continue
 			}
 
-			// Again ACCEPTS rather than equals: a plural tier that could land on
-			// this host is constrained by its allowlist, and comparing the empty
-			// singular field meant a list containing tart was never checked
-			// against a macOS-only Mac.
+			// Again ACCEPTS rather than equals: comparing the empty singular field would mean
+			// a list containing tart was never checked against a macOS-only Mac.
 			if t.AcceptsProvider(p.Provider) && len(p.GuestOS) > 0 && !p.AllowsGuestOS(t.GuestOS) {
 				errs = append(errs, fmt.Errorf(
 					"%s: guest_os %s is unpinned, but node %q runs the same provider and its "+
@@ -1672,12 +1481,9 @@ func (c *Config) validateGuestOSRules(where string, t *Tier) []error {
 
 	switch t.GuestOS {
 	case GuestMacOS:
-		// Apple's licence permits macOS guests only on Apple-branded hardware,
-		// which for billet means the Tart provider.
-		// EVERY listed provider must be Tart, not merely one of them. A macOS tier
-		// that could fall back to EC2 is a tier that would run macOS somewhere
-		// Apple's licence does not permit — and the fallback is exactly the case
-		// nobody is watching when it happens.
+		// EVERY listed provider must be Tart, not merely one of them: Apple's licence
+		// permits macOS guests only on Apple hardware, and a macOS tier that could fall
+		// back to EC2 is the case nobody is watching when it happens.
 		errs = append(errs, t.GuestOSProviderErrors(where)...)
 		if t.Node == "" {
 			errs = append(errs, fmt.Errorf(
