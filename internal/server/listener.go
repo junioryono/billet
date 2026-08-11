@@ -2893,11 +2893,15 @@ func (l *Listener) releaseAll(ctx context.Context, destroyed map[int64]bool) {
 	//   - ErrUntrustworthySession deliberately skips the drain even when
 	//     cancellation has already arrived — there is nothing left to drain
 	//     through.
-	//   - A Run that returns for its own reasons, like a poll error it cannot
-	//     continue past, never set `draining` at all.
+	//   - A Run that returns on an error it cannot continue past. Before the drain
+	//     starts this is the ordinary failure exit. DURING one it also cuts the
+	//     drain short: cancelledWhileServing answers false once `draining` is set,
+	//     so an error that would have been read as "the shutdown arriving" while
+	//     serving is read as a real failure while draining, and Run returns
+	//     instead of polling on.
 	//
-	// For all three this is the first and only stop, and everything still running
-	// is destroyed immediately.
+	// For all of them this is the first and only stop, and everything still
+	// running is destroyed immediately.
 	//
 	// DESTROYED ALREADY, by destroyAll, which is why this only releases. Doing
 	// both here meant the teardown could not be planned as a whole: the drain and
