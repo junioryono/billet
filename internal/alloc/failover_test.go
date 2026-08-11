@@ -136,20 +136,23 @@ func TestAProviderOutsideTheListIsStillRefused(t *testing.T) {
 	}
 }
 
-// THE ENCODING PRESERVES THE ORDER, which matters because the order is a
-// preference and not a set.
+// THE ENCODING PRESERVES THE ORDER, because the order is a preference and not a
+// set: encodeProviders and decodeProviders are the durable representation, and a
+// representation that sorted or deduplicated would change what the list MEANS.
 //
-// Providers is written to the ledger as text and read back by every operation
-// that reloads a lease — Release, transition, Lease(id). nodeplane.pick walks
-// that list most-preferred-first, so a lease that came back from the ledger
-// reordered would land its job on a different machine than the tier asked for.
+// THIS COMMENT HAS BEEN WRONG TWICE, both times by claiming a consequence
+// instead of stating the property, so here is what is actually traceable today.
+// No decoded lease reaches the chooser. insertLease returns a freshly built
+// Lease carrying Providers straight from the tier config; that is the value the
+// listener holds and hands to Launch, and nodeplane.pick walks THAT. The reload
+// paths that decode Providers — Assign, Bind, Heartbeat, Release, transition,
+// Lease(id) — do not feed it. So reordering in decodeProviders would fail this
+// test and would not, today, move a job.
 //
-// WHAT THIS DOES NOT PROVE, because an earlier version of this comment claimed
-// it: the launch path does not read a round-tripped lease. insertLease returns a
-// freshly built Lease carrying Providers straight from the tier config, and that
-// is the value the listener holds and hands to Launch. The round trip is what a
-// RELOAD gets, so this test is about the encoding surviving, not about the
-// chooser consulting it on the happy path.
+// Which is the reason to keep the test rather than to weaken it. The order has
+// to already be intact in the ledger on the day something reads it back and
+// chooses: escrow-time placement (#30) is exactly that change, and it is easier
+// to hold an invariant than to discover it was lost.
 func TestThePreferenceOrderIsPreserved(t *testing.T) {
 	t.Parallel()
 
