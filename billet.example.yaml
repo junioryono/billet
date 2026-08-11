@@ -2,10 +2,21 @@
 #
 # THIS FILE DOES NOT RUN AS SHIPPED. It describes the intended deployment, which
 # is Firecracker, and the Firecracker provider is not built — `billet server
-# --dev` will refuse it. To actually start something today, change `provider:
-# firecracker` to `provider: docker` in the node section AND in every tier, and
-# ignore the `firecracker:` block. Docker shares the host kernel and is for
-# trials rather than for untrusted code.
+# --dev` refuses it. Two edits make it start today, and BOTH are needed:
+#
+#   1. `provider: firecracker` -> `provider: docker`, in the node section and in
+#      every tier.
+#   2. `image:` -> a Docker image that contains the GitHub runner, for example
+#      `ghcr.io/actions/actions-runner:latest`. The image name is passed
+#      straight to `docker run`, so `ubuntu-2404-x64` below is a golden-image
+#      name for Firecracker and is not pullable.
+#
+# The first edit alone gets you a config that validates and a server that
+# starts, and every job then fails to launch — which is why the second is here.
+#
+# The Docker provider reads vcpu, memory and shm; it ignores disk and
+# warm_pool, and the whole `firecracker:` block is unused. Docker shares the
+# host kernel and is for trials rather than for untrusted code.
 #
 # This example is the single-machine deployment: control plane and compute host
 # in one process, started with `billet server --dev`. Split them by running

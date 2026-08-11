@@ -244,10 +244,15 @@ Everything below describes the intended design. Where a thing is not built, it s
 
 ## Quickstart
 
-> **The example config does not run as shipped.** It describes the intended Firecracker deployment,
-> and that provider is not built, so `--dev` refuses it. Change `provider: firecracker` to
-> `provider: docker` in the `node:` section and in every tier. Docker shares the host kernel and is
-> for trials rather than for untrusted code. `billet init` is not built either — copy the example.
+> **The example config does not run as shipped**, and it takes two edits rather than one. It
+> describes the intended Firecracker deployment, and that provider is not built, so `--dev` refuses
+> it. Change `provider: firecracker` to `provider: docker` in the `node:` section and in every tier
+> — **and** change each tier's `image:` to a Docker image containing the GitHub runner, such as
+> `ghcr.io/actions/actions-runner:latest`. The image name is handed straight to `docker run`, so
+> `ubuntu-2404-x64` is a Firecracker golden-image name and will not pull. Making only the first edit
+> gets you a config that validates and a server that starts, and jobs that all fail to launch.
+> Docker shares the host kernel and is for trials rather than for untrusted code. `billet init` is
+> not built either — copy the example.
 
 ```bash
 billet github-app create --org myorg          # creates + installs the App
