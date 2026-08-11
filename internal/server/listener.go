@@ -1456,8 +1456,13 @@ func (l *Listener) Backlog() int {
 // it is the only honest thing to do with them. A fresh listener holds nothing,
 // so a non-zero TotalAssignedJobs means jobs were assigned to this scale set
 // before the process restarted: GitHub is waiting on runners that died with it.
-// Those jobs sit until GitHub's pickup deadline and are then reassigned, which
-// looks from the outside like billet silently dropping work.
+// NOT ALL OF THEM COME BACK, and the statistic cannot say which will. Upstream
+// defines TotalAssignedJobs as "both jobs waiting for a runner and jobs already
+// running" (actions/scaleset, Autoscaling). The ones still waiting are reassigned
+// when GitHub's pickup deadline passes. The ones a dead runner had already
+// STARTED are not — GitHub does not requeue a job whose runner vanished
+// mid-execution, so those fail. Either way it looks from the outside like billet
+// silently dropping work, which is the whole reason to say it.
 //
 // Deliberately NOT a failure. The jobs are already lost by the time this runs
 // and refusing to start would strand the tier's remaining capacity too. Nor is
@@ -1471,8 +1476,9 @@ func (l *Listener) reportOrphanedBacklog() {
 	}
 
 	l.log.Warn("github reports jobs already assigned to this scale set that billet has no lease "+
-		"for; they were assigned before this process started and will be reassigned when "+
-		"github's pickup deadline passes",
+		"for; they were assigned before this process started. Any that no runner had picked up "+
+		"are reassigned when github's pickup deadline passes; any that were already running "+
+		"have lost their runner and will fail",
 		"tier", l.tier, "assigned", backlog)
 }
 
@@ -2876,11 +2882,22 @@ func (l *Listener) releaseAll(ctx context.Context, destroyed map[int64]bool) {
 	// stopping and can no longer manage those jobs, so a failed build beats
 	// containers nobody is tracking.
 	//
-	// AN ORDINARY SHUTDOWN RARELY GETS HERE WITH ANYTHING RUNNING, because the
-	// drain waits first and this only inherits what outlived its budget. A Run
-	// that returns for its own reasons — an untrustworthy session, a poll error
-	// it cannot continue past — never drained at all, so for those this is the
-	// first and only stop and everything still running is destroyed.
+	// A PATIENT SHUTDOWN RARELY GETS HERE WITH ANYTHING RUNNING: the drain waits
+	// first, and this inherits only what outlived the budget. Three other ways in,
+	// none of which waited that long:
+	//
+	//   - A second signal ends the drain where it stands (see the hurry goroutine
+	//     in beginDrain). The work destroyed here had time left and did not get it,
+	//     which is the operator's decision to make and the reason the message says
+	//     what it costs.
+	//   - ErrUntrustworthySession deliberately skips the drain even when
+	//     cancellation has already arrived — there is nothing left to drain
+	//     through.
+	//   - A Run that returns for its own reasons, like a poll error it cannot
+	//     continue past, never set `draining` at all.
+	//
+	// For all three this is the first and only stop, and everything still running
+	// is destroyed immediately.
 	//
 	// DESTROYED ALREADY, by destroyAll, which is why this only releases. Doing
 	// both here meant the teardown could not be planned as a whole: the drain and
