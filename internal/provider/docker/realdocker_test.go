@@ -41,6 +41,7 @@ func TestRealDockerLaunchAndDestroy(t *testing.T) {
 	inst, err := p.Launch(t.Context(), provider.Spec{
 		Name:      name,
 		Image:     "busybox:latest",
+		Command:   []string{"sleep", "300"},
 		VCPU:      1,
 		Memory:    256 * config.MiB,
 		Trust:     provider.TrustTrusted,
@@ -121,6 +122,7 @@ func TestRealDockerFindAndList(t *testing.T) {
 		if _, err := p.Launch(t.Context(), provider.Spec{
 			Name:      name,
 			Image:     "busybox:latest",
+			Command:   []string{"sleep", "300"},
 			VCPU:      1,
 			Memory:    256 * config.MiB,
 			Trust:     provider.TrustTrusted,
@@ -168,6 +170,7 @@ func TestRealDockerFindAndList(t *testing.T) {
 	if _, err := other.Launch(t.Context(), provider.Spec{
 		Name:      decoy,
 		Image:     "busybox:latest",
+		Command:   []string{"sleep", "300"},
 		VCPU:      1,
 		Memory:    256 * config.MiB,
 		Trust:     provider.TrustTrusted,
@@ -226,6 +229,7 @@ func TestRealDockerListSeesStoppedContainers(t *testing.T) {
 	if _, err := p.Launch(t.Context(), provider.Spec{
 		Name:      name,
 		Image:     "busybox:latest",
+		Command:   []string{"sleep", "300"},
 		VCPU:      1,
 		Memory:    256 * config.MiB,
 		Trust:     provider.TrustTrusted,

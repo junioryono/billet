@@ -37,6 +37,7 @@ func TestTheJITConfigNeverAppearsInArgv(t *testing.T) {
 		Memory:    2 * config.GiB,
 		Trust:     provider.TrustTrusted,
 		JITConfig: secret,
+		Command:   config.Tier{}.RunnerCommand(),
 	})
 	if err != nil {
 		t.Fatalf("Launch: %v", err)
@@ -120,6 +121,92 @@ func TestDestroyIsIdempotent(t *testing.T) {
 
 	if err := p.Destroy(t.Context(), "billet-nonexistent-container-name"); err != nil {
 		t.Errorf("destroying a container that does not exist reported an error: %v", err)
+	}
+}
+
+// A LAUNCHED CONTAINER MUST BE TOLD TO RUN THE RUNNER.
+//
+// Found on the first job billet was ever given, against a real organization.
+// `docker run` succeeded, the JIT config was in the container's environment, and
+// billet logged "started a runner" — then the container exited 0 within twenty
+// seconds and the job stayed queued, because the stock image's default CMD is
+// /bin/bash and a detached bash with no TTY has nothing to do.
+//
+// Every signal billet had said the launch worked, which is what makes this worth
+// a test rather than only a fix: the failure is a tier that looks healthy and
+// silently runs nothing, and no amount of dry-running reaches it, because a dry
+// run never launches anything.
+func TestLaunchTellsTheContainerToRunTheRunner(t *testing.T) {
+	stub, argvFile := stubDocker(t)
+
+	p := New("billet-test", WithBinary(stub))
+
+	// The command a tier with no override supplies, taken from config rather than
+	// restated, so this test follows the default if it ever moves.
+	want := config.Tier{}.RunnerCommand()
+
+	if _, err := p.Launch(t.Context(), provider.Spec{
+		Name:      "billet-runner-1",
+		Image:     "ghcr.io/actions/actions-runner:latest",
+		VCPU:      2,
+		Memory:    2 * config.GiB,
+		Trust:     provider.TrustTrusted,
+		JITConfig: "eyJzZXJ2ZXJVcmwiOiJodHRwczovL2V4YW1wbGUifQ==",
+		Command:   want,
+	}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	argv, err := os.ReadFile(argvFile)
+	if err != nil {
+		t.Fatalf("read recorded argv: %v", err)
+	}
+
+	fields := strings.Fields(string(argv))
+	if len(fields) < 2 {
+		t.Fatalf("nothing meaningful was handed to the container CLI: %s", argv)
+	}
+
+	// LAST, AND AFTER THE IMAGE. Docker reads everything following the image
+	// reference as the command, so asserting mere presence would pass against an
+	// argv that put it earlier — where it is swallowed as a flag value and the
+	// container runs its default shell anyway.
+	if last := fields[len(fields)-1]; last != want[0] {
+		t.Errorf("the container's command is %q, want %q; without it the image runs its "+
+			"default shell, which exits at once and leaves the job queued while billet "+
+			"reports a runner started\nargv: %s", last, want[0], argv)
+	}
+
+	if image := fields[len(fields)-2]; image != "ghcr.io/actions/actions-runner:latest" {
+		t.Errorf("the command does not directly follow the image; got %q before it\nargv: %s",
+			image, argv)
+	}
+}
+
+// A spec with no command is refused rather than launched.
+//
+// The refusal IS the fix, not the default. Defaulting to ./run.sh here would
+// suit the stock image and silently break any other, and the failure it produces
+// is the worst kind: a container that starts, exits at once, and reports success
+// the whole way while the job stays queued.
+func TestLaunchRefusesASpecWithNoCommand(t *testing.T) {
+	stub, _ := stubDocker(t)
+
+	p := New("billet-test", WithBinary(stub))
+
+	_, err := p.Launch(t.Context(), provider.Spec{
+		Name:      "billet-runner-1",
+		Image:     "ghcr.io/actions/actions-runner:latest",
+		Trust:     provider.TrustTrusted,
+		JITConfig: "eyJzZXJ2ZXJVcmwiOiJodHRwczovL2V4YW1wbGUifQ==",
+	})
+	if err == nil {
+		t.Fatal("launched a container with no command; the image's default is a shell, so " +
+			"it would exit immediately while billet reported a started runner")
+	}
+
+	if !strings.Contains(err.Error(), "command") {
+		t.Errorf("the error does not say what is missing: %v", err)
 	}
 }
 

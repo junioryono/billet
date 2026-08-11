@@ -369,6 +369,14 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 		Image:       testImage,
 		RunnerGroup: testGroup,
 		GuestOS:     config.GuestLinux,
+
+		// SAID EXPLICITLY, because this is not a runner image. These tests are
+		// about the plane's lifecycle — a container that starts, stays up, and is
+		// destroyed — so what runs inside only has to keep running. The stock
+		// default (./run.sh) does not exist in nginx:alpine, and a container that
+		// exits at once fails every "is it still running" assertion here for a
+		// reason that has nothing to do with what is being tested.
+		Command: []string{"sleep", "300"},
 	}}
 
 	a, err := alloc.New(db, alloc.Limits{MaxVCPU: 8, MaxMemory: 16 * config.GiB}, tiers)

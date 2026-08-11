@@ -126,6 +126,20 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*provider.In
 		return nil, fmt.Errorf("%w (job %s)", err, spec.Name)
 	}
 
+	// REFUSED, not defaulted. Every stock runner image's default command is a
+	// shell, so a spec with no command produces a container that starts, exits at
+	// once, and reports success the whole way — billet logs a started runner and
+	// the job stays queued until GitHub gives up on it.
+	//
+	// Refusing turns that into a launch failure, which the caller already handles
+	// by handing the capacity back. Defaulting to ./run.sh instead would be a
+	// guess that happens to suit one image and silently breaks any other.
+	if len(spec.Command) == 0 {
+		return nil, fmt.Errorf(
+			"docker: %s has no command, so the image's default would run instead of the "+
+				"runner and the container would exit immediately", spec.Name)
+	}
+
 	// THE CREDENTIAL GOES IN A FILE, NOT IN ARGV.
 	//
 	// `docker run -e VAR=value` puts the value in this process's command line,
@@ -164,7 +178,21 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*provider.In
 		args = append(args, "--shm-size", strconv.FormatInt(int64(spec.SHM), 10))
 	}
 
+	// AND THE COMMAND, because the image's default one is a shell.
+	//
+	// Found on the first job billet was ever given. The container started, the JIT
+	// config was in its environment, `docker run` reported success and billet
+	// logged "started a runner" — and eighteen seconds later the container had
+	// exited 0 with the job still queued, because the image's default CMD is
+	// /bin/bash and a detached bash with no TTY has nothing to do.
+	//
+	// Every signal available to billet said the launch worked. The runner never
+	// started, so it never took the job, so GitHub kept it queued and eventually
+	// would have reassigned it — the failure mode is a tier that looks healthy and
+	// silently runs nothing, which is precisely what --dry-run could not have
+	// caught.
 	args = append(args, spec.Image)
+	args = append(args, spec.Command...)
 
 	stdout, err := p.run(ctx, args...)
 	if err != nil {

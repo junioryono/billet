@@ -455,6 +455,16 @@ type Tier struct {
 	// every reconcile.
 	RunnerGroup string `yaml:"runner_group,omitempty"`
 
+	// Command starts the runner inside this tier's image. Empty means the stock
+	// runner image's `./run.sh`, which is what almost every tier wants.
+	//
+	// It is expressible at all because a container image's default command is a
+	// shell: a backend that launches one gets a container that exits immediately
+	// while every signal reports success, so the command cannot be left to the
+	// image. Set this only for an image that does not lay the runner out the
+	// stock way.
+	Command []string `yaml:"command,omitempty"`
+
 	// NOTE on what is accepted: the scale-set client interpolates this name into
 	// a query string WITHOUT escaping it, so a perfectly ordinary group name like
 	// "Platform & Security" is parsed as two parameters and comes back as "group
@@ -1742,3 +1752,16 @@ func (c *Config) TierByLabel(label string) (*Tier, bool) {
 // nothing has changed. Assignment itself is push-driven; this is only a
 // liveness and drift backstop.
 const PollInterval = 15 * time.Second
+
+// RunnerCommand is what starts the runner inside this tier's image.
+//
+// Defaulted here rather than in each backend so every provider agrees, and so
+// the default is stated once in a place an operator reads. `./run.sh` is
+// relative because the stock image's working directory is the runner's home.
+func (t Tier) RunnerCommand() []string {
+	if len(t.Command) > 0 {
+		return t.Command
+	}
+
+	return []string{"./run.sh"}
+}
