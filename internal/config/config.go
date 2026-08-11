@@ -524,9 +524,9 @@ type Tier struct {
 	// single budget across every tier, and headroom is the whole of what is left,
 	// so a tier with steady demand can hold all of it: the others then advertise
 	// zero capacity, their jobs queue at GitHub indefinitely, and nothing in
-	// billet is behaving incorrectly. On Spendify's own catalogue — 2, 4 and
-	// 8 vCPU tiers on one machine — the 2 vCPU tier wins that race simply by
-	// fitting more often.
+	// billet is behaving incorrectly. On the catalogue in billet.example.yaml —
+	// 2, 4 and 8 vCPU tiers sharing one machine — the 2 vCPU tier wins that race
+	// simply by fitting more often.
 	//
 	// A reservation is deducted from what OTHER tiers may take, only while it is
 	// unmet. A tier already holding its floor competes for the rest on equal

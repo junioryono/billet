@@ -25,7 +25,9 @@ something else.
 > The failover part is **half built**. A tier can now name several backends and be
 > placed on any of them, so it is no longer pinned to one kind of machine. What is
 > missing is the part that CHOOSES: nothing picks among live hosts yet, because a
-> node binds itself. See [Status](#status).
+> node binds itself ([#30](https://github.com/junioryono/billet/issues/30)) — and
+> there is no EC2 provider for it to choose
+> ([#32](https://github.com/junioryono/billet/issues/32)). See [Status](#status).
 
 ## What it is
 
@@ -158,6 +160,7 @@ built. What works **today**:
 | `billet github-app create` | Creates and installs the GitHub App via the manifest flow |
 | `billet check` | Validates the config, the App private key, and the state database |
 | `billet server --dry-run` | Connects to a real org, reconciles scale sets, polls — accepts nothing |
+| `billet server` | The control plane on its own. Jobs queue until a node registers, which is the ordinary state while a fleet is being set up |
 | `billet server --dev` | Control plane + node in one process: acquires jobs and runs them in containers |
 | `billet node` | A separate compute host that dials the control plane and never listens |
 | `billet ca issue <node>` | Mints the certificate a node authenticates with, for an operator to copy |
@@ -165,10 +168,22 @@ built. What works **today**:
 | Capacity ledger | Lease state machine, fencing epochs, placement enforcement, escrow before advertising |
 | Docker provider | One container per job, JIT registration delivered off argv. **Trials only** — shares the host kernel, so it refuses anything not established as trusted |
 | Crash recovery | A job running when the controller dies is adopted and left to finish, not killed; its capacity stays held |
+| Graceful drain | SIGTERM stops it taking new work and waits for the jobs already running, so `systemctl restart` does not fail somebody's build. See [Updating](#updating) |
+| Releases and packages | Tagged releases with checksums, `.deb`/`.rpm` with systemd units, and the install script above |
 | Multi-backend tiers | One label can name several providers and be placed on any of them. The preference ORDER is recorded but not yet acted on — see below |
 
 **Not built:** Firecracker, Apple Silicon and EC2 providers; the cache; sticky disks; the scheduler
 that would make provider preference and a cost policy mean something; observability; the dashboard.
+
+**billet is a one-machine product today, and the reasons are specific rather than general.** Capacity
+is a single deployment-wide budget rather than a figure per machine, so two hosts of different sizes
+cannot be described ([#21](https://github.com/junioryono/billet/issues/21)); nothing chooses a node,
+because a node binds itself ([#30](https://github.com/junioryono/billet/issues/30)); a destroy is
+broadcast to every node instead of addressed to the one holding the job
+([#31](https://github.com/junioryono/billet/issues/31)); and a cache lives on the machine that built
+it ([#23](https://github.com/junioryono/billet/issues/23)). Each is invisible with one machine and
+wrong the moment there are two. [#33](https://github.com/junioryono/billet/issues/33) tracks the
+whole plan.
 
 ### Adding a second machine
 
@@ -316,8 +331,15 @@ in your release path. Per-org and per-repo controls do not exist yet.
 
 ## Compatibility caveats
 
+**There is no supported way to point `actions/cache` at your own server**, which is why billet
+intercepts it rather than asking you to swap the action out.
+[actions/toolkit#1051](https://github.com/actions/toolkit/issues/1051) — "add support for
+non-GitHub-hosted caching for self-hosted runners" — has been open since **April 2022**, and the PR
+to allow a custom cache URL is still unmerged. Every self-hosted cache worth using does the same
+thing for the same reason.
+
 **The Actions Cache v2 protocol is reverse-engineered.** GitHub has never published the `.proto`
-files ([actions/toolkit#1931](https://github.com/actions/toolkit/discussions/1890) has been open
+files ([actions/toolkit#1931](https://github.com/actions/toolkit/issues/1931) has been open
 since January 2025), so every implementation — including the one billet will have — is derived from the generated
 TypeScript client and wire captures. **GitHub can change it without notice.** The plan is a
 conformance suite run against live GitHub on every image build to catch drift early, plus **failing
@@ -327,21 +349,31 @@ a stall. Neither exists yet; the cache itself is unimplemented.
 **Apple Silicon support requires [Tart](https://tart.run), which is not open source.** Tart is
 licensed FSL-1.1-ALv2; each release converts to Apache-2.0 after two years, and competing commercial
 use is restricted. `billet` treats it as an optional external dependency you install yourself, the
-same as Docker or ZFS. `billet` itself is Apache-2.0 throughout.
+same as Docker or Ceph. `billet` itself is Apache-2.0 throughout.
+
+**The cache will need Ceph, on the nodes' own NVMe.** A snapshot on one machine cannot be mounted on
+another, so a cache kept in local storage is a cache that pins every repository to the host that
+first built it. Ceph RBD gives the same snapshot-and-clone primitive from a pool any node can map,
+which is what makes a cache a property of a *place* rather than of a machine — and it is what the
+commercial products run. It replaces ZFS rather than sitting beside it
+([#23](https://github.com/junioryono/billet/issues/23)); on a single box it is honestly more moving
+parts than ZFS, and the reason to adopt it anyway is that retrofitting shared storage later means
+rewriting placement at the same time.
 
 ## Roadmap
 
 | Phase | Status |
 |---|---|
 | P0 — scaffolding, GitHub App onboarding, host prep | ✅ mostly |
-| P1 — runner plane: scale sets, allocator, providers | 🚧 listeners, allocator and Docker done; Firecracker next |
-| P2 — guest images, node split, user-defined tiers | 🚧 node split + mTLS done; guest images need the machine |
-| P3 — copy-on-write storage layer, trust classes | ⬜ |
-| P4 — colocated Actions cache | ⬜ |
-| P5 — Docker layer cache, registry mirrors, container baseline | ⬜ |
+| P1 — runner plane: scale sets, allocator, providers | 🚧 listeners, allocator, Docker and the drain done; Firecracker next ([#24](https://github.com/junioryono/billet/issues/24)) |
+| P2 — guest images, node split, user-defined tiers | 🚧 node split + mTLS done; guest images need the machine ([#24](https://github.com/junioryono/billet/issues/24)) |
+| P3 — Ceph, the storage layer, sticky disks, trust classes | ⬜ [#20](https://github.com/junioryono/billet/issues/20) [#23](https://github.com/junioryono/billet/issues/23) [#25](https://github.com/junioryono/billet/issues/25) [#26](https://github.com/junioryono/billet/issues/26) |
+| P4 — colocated Actions cache | ⬜ [#29](https://github.com/junioryono/billet/issues/29) |
+| P5 — Docker layer cache, registry mirrors, container baseline | ⬜ [#27](https://github.com/junioryono/billet/issues/27) [#28](https://github.com/junioryono/billet/issues/28) |
 | P6 — observability, SSH-into-a-job | ⬜ |
 | P7 — Apple Silicon provider (macOS + Linux arm64) | ⬜ |
-| P8 — EC2 provider, cloud-hosted control plane, provider failover | ⬜ |
+| P8 — EC2 provider, cloud-hosted control plane, provider failover | ⬜ [#32](https://github.com/junioryono/billet/issues/32) |
+| P9 — per-node capacity, real placement, addressed teardown. **A prerequisite of P8**, not a sequel: failover means nothing until something chooses | ⬜ [#21](https://github.com/junioryono/billet/issues/21) [#30](https://github.com/junioryono/billet/issues/30) [#31](https://github.com/junioryono/billet/issues/31) |
 | P10 — dashboard, signed releases, public launch | 🚧 releases and packages done; signing and the dashboard are not |
 | P11 — AWS Terraform | ⬜ |
 
