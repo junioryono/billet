@@ -3,8 +3,33 @@ package config
 import (
 	"math"
 	"runtime"
+	"strings"
 	"testing"
 )
+
+// A CONTRIBUTION OF ZERO IS "I DID NOT SAY", and a negative one is not a smaller
+// contribution — it is a number that makes every capacity comparison pass. The
+// memory side is already refused when the size is parsed (bytesize.go); vcpu is
+// a plain int and has nothing standing in front of it.
+func TestANegativeContributionIsRefused(t *testing.T) {
+	body := strings.Replace(validConfig, "  name: epyc-1", "  name: epyc-1\n  max_vcpu: -1", 1)
+
+	_, err := Load(writeConfig(t, body))
+	if err == nil {
+		t.Fatal("Load accepted a node contributing a negative number of vCPU")
+	}
+
+	if !strings.Contains(err.Error(), "max_vcpu") {
+		t.Errorf("the error does not name the field: %v", err)
+	}
+}
+
+// Unset is the ordinary case and means "detect it", so it must keep loading.
+func TestAnUnsetContributionIsAccepted(t *testing.T) {
+	if _, err := Load(writeConfig(t, validConfig)); err != nil {
+		t.Fatalf("a node that does not declare a contribution was refused: %v", err)
+	}
+}
 
 // WHAT A NODE CONTRIBUTES WHEN NOBODY SAID, and the reason this is tested at all
 // is that the failure is silent. A detector that returns zero does not error; it

@@ -58,6 +58,31 @@ type Config struct {
 	// Every field defaults, so a deployment that wants the standard behaviour
 	// omits the section entirely.
 	Nodes []NodePolicy `yaml:"nodes,omitempty"`
+
+	// Sites are the places this deployment has compute in. Optional: a
+	// single-machine deployment never writes one.
+	//
+	// A SITE IS WHERE COMPUTE AND ITS STORAGE SHARE A FAST NETWORK. It is the
+	// answer to "which storage", which is a question every cache has to have one
+	// of — a cache is fast because it is next to the machine using it, and that
+	// relationship needs a name before anything can be keyed on it.
+	//
+	// DECLARED RATHER THAN INFERRED FROM WHAT NODES SAY, because the failure a
+	// free string produces is silent: a node that means "home" and types "hom"
+	// would get its own site, with its own empty cache, and every job placed
+	// there would run cold while looking perfectly healthy.
+	Sites []SiteConfig `yaml:"sites,omitempty"`
+}
+
+// SiteConfig declares one place compute runs.
+//
+// A STRUCT RATHER THAN A STRING, because a site is where the storage backend
+// will be configured — Ceph at a bare-metal site, EBS and S3 in a cloud region
+// (#23/#25). Today it carries identity, which is the half placement needs; the
+// backend has nowhere to be configured yet because there is no storage layer.
+type SiteConfig struct {
+	// Name is what a node and a tier refer to this site by.
+	Name string `yaml:"name"`
 }
 
 // NodePolicy is what one compute host is permitted to run.
@@ -274,6 +299,26 @@ type NodeConfig struct {
 	ServerAddr string `yaml:"server_addr"`
 	// Provider selects the compute backend for this host.
 	Provider ProviderKind `yaml:"provider"`
+
+	// Site is where this machine physically is, naming one of the control
+	// plane's declared sites. Optional, and only meaningful once a deployment
+	// has more than one place.
+	Site string `yaml:"site,omitempty"`
+
+	// MaxVCPU and MaxMemory are what this host CONTRIBUTES, which is not the same
+	// as what it has. Unset means "everything I can detect".
+	//
+	// DECLARED HERE, ON THE MACHINE, rather than in the control plane's config,
+	// because the person running this host is the one who knows what else it
+	// does. It is the same reason the provider is declared here: a host is the
+	// authority on itself, and a catalog claiming otherwise is what should lose.
+	//
+	// Setting these ABOVE what the machine has is allowed — overcommitting is a
+	// decision an operator is entitled to make — and warned about, because the
+	// alternative is billet quietly deciding it knows better.
+	MaxVCPU   int      `yaml:"max_vcpu,omitempty"`
+	MaxMemory ByteSize `yaml:"max_memory,omitempty"`
+
 	// TLS is the certificate bundle this node presents, issued by the control
 	// plane's `billet ca issue`.
 	//
@@ -473,6 +518,15 @@ type Tier struct {
 	// Node optionally pins this tier to a named node. Required when only one
 	// node can serve it — macOS tiers, for example.
 	Node string `yaml:"node,omitempty"`
+
+	// Site optionally confines this tier to one place, the way Node confines it
+	// to one machine — but a site holds several machines, so it constrains
+	// WITHOUT giving up the fallback that having several of them buys.
+	//
+	// The reason to reach for it is data rather than hardware: a job that must
+	// not leave a location, or one whose cache only exists in one place and would
+	// run cold anywhere else.
+	Site string `yaml:"site,omitempty"`
 	// RunnerGroup is the GitHub runner group this tier's scale set belongs to.
 	// Empty means GitHub's "default" group.
 	//
@@ -1216,6 +1270,7 @@ func (c *Config) Validate() error {
 	errs = append(errs, c.validateGitHub()...)
 	errs = append(errs, c.validateNode()...)
 	errs = append(errs, c.validateNodes()...)
+	errs = append(errs, c.validateSites()...)
 	errs = append(errs, c.validateTiers()...)
 	errs = append(errs, c.validateCapacity()...)
 	errs = append(errs, c.validateMacOSHostLimits()...)
@@ -1305,6 +1360,16 @@ func (c *Config) validateNode() []error {
 			"node.lock_dir must be an absolute path, got %q: a relative one resolves against "+
 				"each process's working directory, so the node and the server could lock "+
 				"different files for one deployment identity", c.Node.LockDir))
+	}
+
+	// ZERO IS "I DID NOT SAY" AND NEGATIVE IS NOT A SMALLER OFFER. A negative
+	// contribution is a ceiling every comparison passes, which is the capacity
+	// check silently switched off rather than a host that gives a little. The
+	// memory side is refused when the size is parsed; this one is a plain int
+	// with nothing standing in front of it.
+	if c.Node.MaxVCPU < 0 {
+		errs = append(errs, fmt.Errorf("node.max_vcpu is %d; leave it unset to contribute "+
+			"everything this machine has", c.Node.MaxVCPU))
 	}
 
 	// Parsed here so a typo is reported when the file is READ, rather than hours
@@ -1642,6 +1707,87 @@ func (c *Config) macOSLimitReason(node string) string {
 	return fmt.Sprintf(
 		"Apple's licence limit of %d macOS guests per Apple-branded host (node %q does not override it)",
 		DefaultMacOSVMLimit, node)
+}
+
+// validateSites checks the declared places, and everything that refers to one.
+//
+// FAIL CLOSED ON A NAME THAT WAS NEVER DECLARED, which is the whole reason a
+// site is a declared block. A free string cannot tell a typo from a new place,
+// so "hom" would become a site of its own with an empty cache, and every job
+// there would run cold while the deployment looked healthy. There is no signal
+// after startup that says which of those two an operator meant, so this is the
+// only moment it can be caught.
+func (c *Config) validateSites() []error {
+	var errs []error
+
+	declared := make(map[string]bool, len(c.Sites))
+
+	for i, s := range c.Sites {
+		name := strings.TrimSpace(s.Name)
+
+		if name == "" {
+			errs = append(errs, fmt.Errorf("sites[%d]: a site must have a name; nothing can "+
+				"refer to one without it", i))
+
+			continue
+		}
+
+		if declared[name] {
+			errs = append(errs, fmt.Errorf("sites[%d]: site %q is declared twice; a site is "+
+				"where a cache lives, so two answers to that is one too many", i, name))
+
+			continue
+		}
+
+		declared[name] = true
+	}
+
+	// NAMED WITH NO BLOCK IS A TYPO, NOT AN OPT-OUT. Sites are optional and a
+	// single-machine deployment never writes one — but an operator who wrote a
+	// site meant something by it, and silently ignoring the field helps nobody.
+	if c.Node != nil {
+		errs = append(errs, siteRefError("node.site", c.Node.Site, declared)...)
+	}
+
+	for i := range c.Tiers {
+		errs = append(errs, siteRefError(
+			fmt.Sprintf("tiers[%d] (%s): site", i, c.Tiers[i].Label),
+			c.Tiers[i].Site, declared)...)
+	}
+
+	return errs
+}
+
+// siteRefError checks one reference to a site.
+func siteRefError(where, site string, declared map[string]bool) []error {
+	if site == "" {
+		return nil
+	}
+
+	if len(declared) == 0 {
+		return []error{fmt.Errorf("%s is %q, but this config declares no sites; add a sites "+
+			"block naming it", where, site)}
+	}
+
+	if !declared[site] {
+		return []error{fmt.Errorf("%s is %q, which is not a declared site (have %s)",
+			where, site, strings.Join(sortedKeys(declared), ", "))}
+	}
+
+	return nil
+}
+
+// sortedKeys lists a set in a stable order, so a diagnostic naming what IS valid
+// reads the same on every run.
+func sortedKeys(set map[string]bool) []string {
+	out := make([]string, 0, len(set))
+	for k := range set {
+		out = append(out, k)
+	}
+
+	slices.Sort(out)
+
+	return out
 }
 
 // validateNodes checks the fleet catalog on its own terms, before any tier
