@@ -149,6 +149,11 @@ written against a version known to be installed, not against a version someone h
 `tank/cache` at 1M, lz4 on both. The name matches `billet.example.yaml` so nothing has to be edited
 to match a machine.
 
+> **Provisional: Ceph RBD replaces ZFS ([#23](https://github.com/junioryono/billet/issues/23)).**
+> A snapshot here exists only on this machine, so any cache written to it belongs to this host and to
+> no other — which is the reason billet is a one-machine product. Ceph runs on these same NVMe and
+> presents them as a pool every node can map. Provision ZFS today; expect to re-provision.
+
 `/var/lib/billet/node` exists at 0750 on local disk — the mdraid root, never NFS, because the state
 directory holds SQLite and the deployment identity.
 

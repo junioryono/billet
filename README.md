@@ -58,6 +58,17 @@ no webhook endpoint, no tunnel.
 
 ## Install
 
+> **There is no release yet, so build from source.** The repository has no tags,
+> which means the two paths below — the install script and the packages — have
+> nothing to download and will fail. They are documented because the pipeline
+> that produces them is built and tested; the first tag has simply not been cut.
+
+```bash
+git clone https://github.com/junioryono/billet && cd billet && go build ./cmd/billet
+```
+
+Once a release exists:
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/junioryono/billet/main/scripts/install.sh | sh
 ```
@@ -108,12 +119,6 @@ sudo systemctl enable --now billet-node
 > container or mount the filesystem. Prefer rootless Docker where the workload
 > allows it.
 
-Or build from source:
-
-```bash
-git clone https://github.com/junioryono/billet && cd billet && go build ./cmd/billet
-```
-
 ## Updating
 
 **If you installed the package:**
@@ -160,7 +165,7 @@ built. What works **today**:
 | `billet github-app create` | Creates and installs the GitHub App via the manifest flow |
 | `billet check` | Validates the config, the App private key, and the state database |
 | `billet server --dry-run` | Connects to a real org, reconciles scale sets, polls — accepts nothing |
-| `billet server` | The control plane on its own. Jobs queue until a node registers, which is the ordinary state while a fleet is being set up |
+| `billet server` | The control plane on its own, serving the node wire. **Start the nodes first** — capacity is advertised from the budget without checking that any node exists, so a job assigned while none is registered is acquired, fails to launch, and is handed back. GitHub retries that about three times and then the job fails |
 | `billet server --dev` | Control plane + node in one process: acquires jobs and runs them in containers |
 | `billet node` | A separate compute host that dials the control plane and never listens |
 | `billet ca issue <node>` | Mints the certificate a node authenticates with, for an operator to copy |
@@ -169,7 +174,7 @@ built. What works **today**:
 | Docker provider | One container per job, JIT registration delivered off argv. **Trials only** — shares the host kernel, so it refuses anything not established as trusted |
 | Crash recovery | A job running when the controller dies is adopted and left to finish, not killed; its capacity stays held |
 | Graceful drain | SIGTERM stops it taking new work and waits for the jobs already running, so `systemctl restart` does not fail somebody's build. See [Updating](#updating) |
-| Releases and packages | Tagged releases with checksums, `.deb`/`.rpm` with systemd units, and the install script above |
+| Release pipeline | Tagged releases with checksums, `.deb`/`.rpm` with systemd units, and the install script — **built and never yet run: there are no tags, so no release exists to install.** Build from source until there is one |
 | Multi-backend tiers | One label can name several providers and be placed on any of them. The preference ORDER is recorded but not yet acted on — see below |
 
 **Not built:** Firecracker, Apple Silicon and EC2 providers; the cache; sticky disks; the scheduler
@@ -296,9 +301,10 @@ Read this before pointing `billet` at anything.
 **Do not use self-hosted runners with public repositories.** This is
 [GitHub's own guidance](https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/manage-access),
 not ours. Fork pull requests do not receive your secrets, but they *do* get arbitrary code execution
-on your hardware. `billet` isolates jobs in microVMs, which helps, but it does not make running
-untrusted code on your own machine safe. Private repos with trusted contributors are the intended
-use case.
+on your hardware. `billet` is *designed* to isolate jobs in microVMs, which helps — but **today the
+only provider is Docker, which shares the host kernel**, so what you actually get is container
+isolation. Even once Firecracker lands it will not make running untrusted code on your own machine
+safe. Private repos with trusted contributors are the intended use case.
 
 **Caches are a deliberate cross-job channel.** A job that writes a secret into a cached directory
 persists it for later jobs to read. Trust classes are *designed* to control who may publish a cache —

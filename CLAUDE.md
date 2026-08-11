@@ -63,7 +63,7 @@ internal/alloc/      global capacity allocator + lease state machine
 internal/server/     scale-set listeners, scheduler                              (P1)
 internal/node/       node runtime: provider driver, capacity reporting, mTLS     (P2)
 internal/provider/   firecracker | tart | ec2 | docker                            (P1+)
-internal/store/      zfs | ebs | apfs — CoW clone, generations, atomic publish   (P3)
+internal/store/      ceph | ebs — CoW clone, generations, atomic publish   (P3, #23 — Ceph replaces ZFS)
 internal/cachev2/    GitHub Actions Cache v2 Twirp + conformance suite           (P4)
 docs/                reference-hardware.md — the bare-metal host billet is measured against
 ```

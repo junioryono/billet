@@ -396,6 +396,11 @@ type FirecrackerConfig struct {
 	// rather than a hand-maintained list.
 	KernelImage string `yaml:"kernel_image"`
 	// ZFSPool backs golden images, per-job root clones, and cache volumes.
+	//
+	// SLATED FOR REPLACEMENT BY CEPH RBD (#23). A ZFS snapshot exists only on the
+	// machine that took it, so a cache kept here pins a repository to the host
+	// that first built it — which is why billet is a one-machine product. This
+	// field is what the config accepts today; it is not the intended architecture.
 	ZFSPool string `yaml:"zfs_pool"`
 	// Bridge is the host bridge guests attach to.
 	Bridge string `yaml:"bridge,omitempty"`
