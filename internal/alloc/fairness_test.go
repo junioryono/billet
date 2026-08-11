@@ -9,8 +9,8 @@ import (
 )
 
 // smallTier and bigTier share one budget, which is the situation every real
-// deployment is in: a real catalogue is 2, 4 and 8 vCPU tiers on one
-// machine.
+// deployment is in: the catalogue in billet.example.yaml is 2, 4 and 8 vCPU
+// tiers on one machine.
 func smallTier(reserved int) config.Tier {
 	return config.Tier{
 		Label: "billet-2vcpu", Provider: config.ProviderDocker, GuestOS: config.GuestLinux,

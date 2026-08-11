@@ -22,10 +22,14 @@ cloud; the AWS-based projects are AWS-only; the microVM products are commercial.
 [Alternatives](#alternatives) for an honest comparison, including cases where you should use
 something else.
 
-> The failover part is **half built**. A tier can now name several backends and be
-> placed on any of them, so it is no longer pinned to one kind of machine. What is
-> missing is the part that CHOOSES: nothing picks among live hosts yet, because a
-> node binds itself. See [Status](#status).
+> The failover part is **half built**. A tier can name several backends, and the
+> control plane already picks among registered nodes in the tier's preference
+> order. What is missing is choosing when the job is ADMITTED rather than after —
+> capacity is one deployment-wide budget, so nothing weighs a node's spare room or
+> its cost before accepting the work
+> ([#30](https://github.com/junioryono/billet/issues/30)). And there is no EC2
+> provider to fail over TO ([#32](https://github.com/junioryono/billet/issues/32)),
+> so none of it can be exercised yet. See [Status](#status).
 
 ## What it is
 
@@ -55,6 +59,21 @@ no webhook endpoint, no tunnel.
 - **Not free of operational burden.** One machine is one failure domain. Budget for that.
 
 ## Install
+
+> **There is no release yet, so build from source.** The repository has no tags,
+> which means the two paths below — the install script and the packages — have
+> nothing to download and will fail. They are documented because the pipeline
+> that produces them is built and tested; the first tag has simply not been cut.
+
+```bash
+git clone https://github.com/junioryono/billet && cd billet && go build ./cmd/billet
+sudo install -m 0755 billet /usr/local/bin/billet    # or keep it local and call ./billet
+```
+
+That second line is what makes the bare `billet` in every command below work; `go build` leaves the
+binary in the current directory and installs nothing.
+
+Once a release exists:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/junioryono/billet/main/scripts/install.sh | sh
@@ -106,13 +125,17 @@ sudo systemctl enable --now billet-node
 > container or mount the filesystem. Prefer rootless Docker where the workload
 > allows it.
 
-Or build from source:
+## Updating
+
+**If you built from source** — the only path that works until a release is cut:
 
 ```bash
-git clone https://github.com/junioryono/billet && cd billet && go build ./cmd/billet
+git pull && go build ./cmd/billet
+sudo install -m 0755 billet /usr/local/bin/billet   # wherever you put it
+sudo systemctl restart billet-server                # if you wrote your own unit
 ```
 
-## Updating
+The two paths below need a published release, and there is not one yet.
 
 **If you installed the package:**
 
@@ -158,6 +181,7 @@ built. What works **today**:
 | `billet github-app create` | Creates and installs the GitHub App via the manifest flow |
 | `billet check` | Validates the config, the App private key, and the state database |
 | `billet server --dry-run` | Connects to a real org, reconciles scale sets, polls — accepts nothing |
+| `billet server` | The control plane on its own, serving the node wire. **Start the nodes first** — capacity is advertised from the budget without checking that any node exists, so a job assigned while none is registered is acquired and fails to launch. billet releases its own capacity, but it has no way to decline the assignment — that stays with GitHub until the pickup deadline, which cancels and requeues it [up to three times](https://github.com/actions/scaleset/blob/v0.4.0/README.md#job-reassignment) |
 | `billet server --dev` | Control plane + node in one process: acquires jobs and runs them in containers |
 | `billet node` | A separate compute host that dials the control plane and never listens |
 | `billet ca issue <node>` | Mints the certificate a node authenticates with, for an operator to copy |
@@ -165,10 +189,24 @@ built. What works **today**:
 | Capacity ledger | Lease state machine, fencing epochs, placement enforcement, escrow before advertising |
 | Docker provider | One container per job, JIT registration delivered off argv. **Trials only** — shares the host kernel, so it refuses anything not established as trusted |
 | Crash recovery | A job running when the controller dies is adopted and left to finish, not killed; its capacity stays held |
-| Multi-backend tiers | One label can name several providers and be placed on any of them. The preference ORDER is recorded but not yet acted on — see below |
+| Graceful drain | SIGTERM stops it taking new work and waits for the jobs already running, so `systemctl restart` does not fail somebody's build. See [Updating](#updating) |
+| Release pipeline | Tagged releases with checksums, `.deb`/`.rpm` with systemd units, and the install script — **built and never yet run: there are no tags, so no release exists to install.** Build from source until there is one |
+| Multi-backend tiers | One label can name several providers and be placed on any of them, and the preference order IS honoured when the control plane picks among registered nodes (`nodeplane.pick` walks it most-preferred-first). What is missing is choosing at escrow time, against per-node capacity and cost ([#30](https://github.com/junioryono/billet/issues/30)) — and Docker is the only provider built, so the ordering cannot be exercised yet |
 
-**Not built:** Firecracker, Apple Silicon and EC2 providers; the cache; sticky disks; the scheduler
-that would make provider preference and a cost policy mean something; observability; the dashboard.
+**Not built:** Firecracker, Apple Silicon and EC2 providers; the cache; sticky disks; admission-time
+placement, which is what would let provider preference and a cost policy govern whether work is taken
+on at all rather than only which registered node runs it; observability; the dashboard.
+
+**billet is a one-machine product today, and the reasons are specific rather than general.** Capacity
+is a single deployment-wide budget rather than a figure per machine, so two hosts of different sizes
+cannot be described ([#21](https://github.com/junioryono/billet/issues/21)); the node is chosen only
+once a job has already been acquired, so nothing weighs capacity or cost when the work is admitted
+([#30](https://github.com/junioryono/billet/issues/30)); a destroy is
+broadcast to every node instead of addressed to the one holding the job
+([#31](https://github.com/junioryono/billet/issues/31)); and a cache lives on the machine that built
+it ([#23](https://github.com/junioryono/billet/issues/23)). Each is invisible with one machine and
+wrong the moment there are two. [#33](https://github.com/junioryono/billet/issues/33) tracks the
+whole plan.
 
 ### Adding a second machine
 
@@ -213,16 +251,38 @@ Everything below describes the intended design. Where a thing is not built, it s
 
 ## Quickstart
 
-> Every command below works, with the caveat that the only compute backend is Docker, which is for
-> trials rather than for untrusted code. `billet init` is not built — copy the example config.
+> **The example config does not run as shipped**, and the provider is not the only thing to change. It
+> describes the intended Firecracker deployment, and that provider is not built, so `--dev` refuses
+> it. Change `provider: firecracker` to `provider: docker` in the `node:` section and in every tier
+> — **and** change each tier's `image:` to a Docker image containing the GitHub runner, such as
+> `ghcr.io/actions/actions-runner:latest`. The image name is handed straight to `docker run`, so
+> `ubuntu-2404-x64` is a Firecracker golden-image name and will not pull. Making only the first edit
+> gets you a config that validates and a server that starts, and jobs that all fail to launch.
+> Docker shares the host kernel and is for trials rather than for untrusted code. `billet init` is
+> not built either — copy the example.
 
 ```bash
-billet github-app create --org myorg          # creates + installs the App
-cp billet.example.yaml ./billet.yaml          # edit: org, tiers, node provider
-billet check --config ./billet.yaml           # validates config, key, state
+billet github-app create --org myorg           # creates + installs the App, PRINTS a github: block
+cp billet.example.yaml ./billet.yaml           # then edit it — see below, four things
+billet check --config ./billet.yaml            # validates config, key, state
 billet server --dry-run --config ./billet.yaml  # first contact: polls, accepts nothing
-billet server --dev --config ./billet.yaml    # runs jobs
+billet server --dev --config ./billet.yaml     # runs jobs
 ```
+
+**The three edits**, because nothing writes the file for you:
+
+1. **Paste the `github:` block** that `github-app create` printed. It prints; it does not edit your
+   config, so `app_id` and `installation_id` stay `0` and `billet check` says so. The block already
+   carries `private_key_path` pointing at the key it just wrote, so pasting it settles that too.
+2. **`provider: docker` and a runner `image:`**, in the `node:` section and every tier — see the
+   warning above.
+3. **`server.state_dir`** defaults to `/var/lib/billet/server`, which an unprivileged `billet server`
+   cannot create. Point it somewhere you can write (`./state/server`) or pre-create it with the right
+   owner. `node.state_dir` only matters for a standalone `billet node`; `--dev` never reads it.
+
+**And Docker has to be there.** `billet check` never touches it, but `server --dev` calls
+`docker ps` before it polls anything, to re-adopt containers from a previous run. No CLI, no running
+daemon, or no permission on the socket, and it stops there.
 
 `--config` is not optional here. billet deliberately does **not** read a
 `billet.yaml` from the working directory — a server started from a directory
@@ -281,9 +341,10 @@ Read this before pointing `billet` at anything.
 **Do not use self-hosted runners with public repositories.** This is
 [GitHub's own guidance](https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/manage-access),
 not ours. Fork pull requests do not receive your secrets, but they *do* get arbitrary code execution
-on your hardware. `billet` isolates jobs in microVMs, which helps, but it does not make running
-untrusted code on your own machine safe. Private repos with trusted contributors are the intended
-use case.
+on your hardware. `billet` is *designed* to isolate jobs in microVMs, which helps — but **today the
+only provider is Docker, which shares the host kernel**, so what you actually get is container
+isolation. Even once Firecracker lands it will not make running untrusted code on your own machine
+safe. Private repos with trusted contributors are the intended use case.
 
 **Caches are a deliberate cross-job channel.** A job that writes a secret into a cached directory
 persists it for later jobs to read. Trust classes are *designed* to control who may publish a cache —
@@ -316,8 +377,15 @@ in your release path. Per-org and per-repo controls do not exist yet.
 
 ## Compatibility caveats
 
+**There is no supported way to point `actions/cache` at your own server**, which is why billet
+intercepts it rather than asking you to swap the action out.
+[actions/toolkit#1051](https://github.com/actions/toolkit/issues/1051) — "add support for
+non-GitHub-hosted caching for self-hosted runners" — has been open since **April 2022**, and the PR
+to allow a custom cache URL is still unmerged. Every self-hosted cache worth using does the same
+thing for the same reason.
+
 **The Actions Cache v2 protocol is reverse-engineered.** GitHub has never published the `.proto`
-files ([actions/toolkit#1931](https://github.com/actions/toolkit/discussions/1890) has been open
+files ([actions/toolkit#1931](https://github.com/actions/toolkit/issues/1931) has been open
 since January 2025), so every implementation — including the one billet will have — is derived from the generated
 TypeScript client and wire captures. **GitHub can change it without notice.** The plan is a
 conformance suite run against live GitHub on every image build to catch drift early, plus **failing
@@ -327,21 +395,31 @@ a stall. Neither exists yet; the cache itself is unimplemented.
 **Apple Silicon support requires [Tart](https://tart.run), which is not open source.** Tart is
 licensed FSL-1.1-ALv2; each release converts to Apache-2.0 after two years, and competing commercial
 use is restricted. `billet` treats it as an optional external dependency you install yourself, the
-same as Docker or ZFS. `billet` itself is Apache-2.0 throughout.
+same as Docker or Ceph. `billet` itself is Apache-2.0 throughout.
+
+**The cache will need Ceph, on the nodes' own NVMe.** A snapshot on one machine cannot be mounted on
+another, so a cache kept in local storage is a cache that pins every repository to the host that
+first built it. Ceph RBD gives the same snapshot-and-clone primitive from a pool any node can map,
+which is what makes a cache a property of a *place* rather than of a machine — and it is what the
+commercial products run. It replaces ZFS rather than sitting beside it
+([#23](https://github.com/junioryono/billet/issues/23)); on a single box it is honestly more moving
+parts than ZFS, and the reason to adopt it anyway is that retrofitting shared storage later means
+rewriting placement at the same time.
 
 ## Roadmap
 
 | Phase | Status |
 |---|---|
 | P0 — scaffolding, GitHub App onboarding, host prep | ✅ mostly |
-| P1 — runner plane: scale sets, allocator, providers | 🚧 listeners, allocator and Docker done; Firecracker next |
-| P2 — guest images, node split, user-defined tiers | 🚧 node split + mTLS done; guest images need the machine |
-| P3 — copy-on-write storage layer, trust classes | ⬜ |
-| P4 — colocated Actions cache | ⬜ |
-| P5 — Docker layer cache, registry mirrors, container baseline | ⬜ |
+| P1 — runner plane: scale sets, allocator, providers | 🚧 listeners, allocator, Docker and the drain done; Firecracker next ([#24](https://github.com/junioryono/billet/issues/24)) |
+| P2 — guest images, node split, user-defined tiers | 🚧 node split + mTLS done; guest images need the machine ([#24](https://github.com/junioryono/billet/issues/24)) |
+| P3 — Ceph, the storage layer, sticky disks, trust classes | ⬜ [#20](https://github.com/junioryono/billet/issues/20) [#23](https://github.com/junioryono/billet/issues/23) [#25](https://github.com/junioryono/billet/issues/25) [#26](https://github.com/junioryono/billet/issues/26) |
+| P4 — colocated Actions cache | ⬜ [#29](https://github.com/junioryono/billet/issues/29) |
+| P5 — Docker layer cache, registry mirrors, container baseline | ⬜ [#27](https://github.com/junioryono/billet/issues/27) [#28](https://github.com/junioryono/billet/issues/28) |
 | P6 — observability, SSH-into-a-job | ⬜ |
 | P7 — Apple Silicon provider (macOS + Linux arm64) | ⬜ |
-| P8 — EC2 provider, cloud-hosted control plane, provider failover | ⬜ |
+| P8 — EC2 provider, cloud-hosted control plane, provider failover | ⬜ [#32](https://github.com/junioryono/billet/issues/32) |
+| P9 — per-node capacity, admission-time placement, addressed teardown. **A prerequisite of P8**, not a sequel: picking among registered nodes already works, but failover needs the decision made before the work is accepted | ⬜ [#21](https://github.com/junioryono/billet/issues/21) [#30](https://github.com/junioryono/billet/issues/30) [#31](https://github.com/junioryono/billet/issues/31) |
 | P10 — dashboard, signed releases, public launch | 🚧 releases and packages done; signing and the dashboard are not |
 | P11 — AWS Terraform | ⬜ |
 
