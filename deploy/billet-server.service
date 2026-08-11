@@ -59,8 +59,14 @@ TimeoutStopSec=23400
 KillSignal=SIGTERM
 
 # A second SIGTERM stops billet waiting for its running jobs and tears down
-# immediately; a third gives up where it stands. `systemctl kill -s SIGTERM
-# billet-server` is how an operator sends one.
+# immediately; a third gives up where it stands. To send one:
+#
+#   systemctl kill --kill-whom=main --signal=SIGTERM billet-server
+#
+# --kill-whom=main MATTERS. Without it systemctl signals every process in the
+# service, including a container CLI billet has in flight — which kills the child
+# out from under the teardown that was trying to use it. Re-running
+# `systemctl stop` does not send a second application-level SIGTERM either.
 KillMode=mixed
 
 # A clean exit after a drain is a clean exit. `always` would restart a control

@@ -19,9 +19,17 @@ Type=exec
 User=billet
 Group=billet
 
-# THE ONLY DIFFERENCE FROM THE SERVER'S UNIT THAT MATTERS. A node launches
-# containers, so it needs the docker socket; the control plane does not, unless
-# it is running --dev.
+# THE ONLY DIFFERENCE FROM THE SERVER'S UNIT THAT MATTERS, and it is a trust
+# boundary rather than a permission.
+#
+# ACCESS TO A ROOTFUL DOCKER SOCKET IS ROOT ON THIS HOST. Anything that can talk
+# to it can start a privileged container or bind-mount /, so a compromise of the
+# billet node process is a compromise of the machine — and none of the hardening
+# below contains that. It is stated plainly because it is easy to read
+# "SupplementaryGroups=docker" as a detail about permissions.
+#
+# Prefer rootless Docker where the workload allows it. The runner containers
+# billet launches are not themselves given the socket.
 SupplementaryGroups=docker
 
 ExecStart=/usr/bin/billet node --config /etc/billet/billet.yaml

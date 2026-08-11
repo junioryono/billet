@@ -1,25 +1,46 @@
 #!/bin/sh
 set -e
 
-# DAEMON-RELOAD AND NOTHING ELSE.
+# DAEMON-RELOAD AND NOTHING ELSE IS STARTED.
 #
 # The package does not enable or start billet. Installing it must not connect a
 # machine to GitHub and begin accepting other people's jobs — that is the
-# administrator's decision, and it cannot be made before /etc/billet/billet.yaml
-# says something true. An upgrade must not start a service the operator had
-# deliberately stopped, either.
+# administrator's decision, and it cannot be made before
+# /etc/billet/billet.yaml says something true. An upgrade must not start a
+# service the operator had deliberately stopped, either.
 #
 #   systemctl enable --now billet-server
 #   systemctl enable --now billet-node
+
+STATE_DIR=/var/lib/billet
+CONF_DIR=/etc/billet
+CONF="${CONF_DIR}/billet.yaml"
+# NOT under /usr/share/doc: Debian's slim images set
+# `path-exclude=/usr/share/doc/*`, which silently drops anything kept there.
+TEMPLATE=/usr/share/billet/billet.yaml
+KEY="${CONF_DIR}/app-private-key.pem"
 
 if ! getent group billet >/dev/null 2>&1; then
     groupadd --system billet
 fi
 
-if ! getent passwd billet >/dev/null 2>&1; then
+if getent passwd billet >/dev/null 2>&1; then
+    # AN EXISTING ACCOUNT IS NOT AUTOMATICALLY OURS. What follows hands this
+    # identity the deployment's private CA key and group-read on the GitHub App
+    # key, so a login account or a directory-service account that happens to be
+    # called "billet" must not silently inherit an organization credential.
+    home="$(getent passwd billet | cut -d: -f6)"
+    if [ "${home}" != "${STATE_DIR}" ]; then
+        echo "billet: a user named 'billet' already exists with home ${home}," >&2
+        echo "        not ${STATE_DIR}. Refusing to give it this deployment's" >&2
+        echo "        credentials. Remove or rename that account, or install" >&2
+        echo "        billet under a different user by editing the units." >&2
+        exit 1
+    fi
+else
     # The nologin shell is not in the same place everywhere: Debian has
-    # /usr/sbin/nologin, and a minimal Fedora has neither that nor a symlink to
-    # it, where useradd warns and creates the account with a shell that does not
+    # /usr/sbin/nologin, and a minimal Fedora has neither that nor a symlink,
+    # where useradd warns and creates an account with a shell that does not
     # exist. /bin/false is the portable fallback.
     shell=/bin/false
     for candidate in /usr/sbin/nologin /sbin/nologin; do
@@ -29,37 +50,60 @@ if ! getent passwd billet >/dev/null 2>&1; then
         fi
     done
 
-    useradd --system --gid billet --home-dir /var/lib/billet \
+    useradd --system --gid billet --home-dir "${STATE_DIR}" \
         --shell "${shell}" \
         --comment "billet self-hosted runner platform" billet
 fi
 
-# 0700: this holds the capacity ledger, the deployment identity and the mTLS CA's
-# private key. billet sets this itself on every start; doing it here means the
-# directory is never briefly readable between install and first run.
-mkdir -p /var/lib/billet
-chown billet:billet /var/lib/billet
-chmod 0700 /var/lib/billet
+# NOT SHIPPED IN THE PACKAGE, CREATED HERE. A directory the package manager owns
+# is a directory it deletes: shipping this one meant `dpkg -r billet` removed the
+# deployment identity and the mTLS CA's private key, invalidating every node
+# certificate in the fleet.
+mkdir -p "${STATE_DIR}"
+chown billet:billet "${STATE_DIR}"
+chmod 0700 "${STATE_DIR}"
 
-# /etc/billet is written by an operator and READ BY THE SERVICE USER, which is
-# the half the modes have to get right in both directions: root owns it so an
-# unprivileged process cannot edit the config or the App key, and the billet
-# group can read it so the service can start at all.
-#
-# THE GROUP ON THE FILES MATTERS AS MUCH AS THE ONE ON THE DIRECTORY. Left at
-# root:root with mode 0640, the directory is traversable by the billet group and
-# the file inside it is readable by nobody but root — so billet.service starts,
-# fails to open its own config, and the diagnostic is a permission error on a
-# path the operator can plainly see and read themselves.
-chown root:billet /etc/billet
-chmod 0750 /etc/billet
+mkdir -p "${CONF_DIR}"
+chown root:billet "${CONF_DIR}"
+chmod 0750 "${CONF_DIR}"
 
-for f in /etc/billet/billet.yaml /etc/billet/app-private-key.pem; do
-    if [ -e "${f}" ]; then
-        chown root:billet "${f}"
-        chmod 0640 "${f}"
+# SEEDED, NOT OWNED, for the same reason as the state directory. A config the
+# package manager owns is one `apt purge` removes and one `rpm -e` can rename to
+# .rpmsave — taking the App ids, the tier catalog and the capacity ceilings with
+# it, while the deployment identity and the App key survive separately. That
+# leaves a half-recoverable machine, which is the state all of this exists to
+# avoid. The template lives under /usr/share/doc and is copied here once.
+if [ ! -e "${CONF}" ]; then
+    if [ -e "${TEMPLATE}" ]; then
+        cp "${TEMPLATE}" "${CONF}"
+    else
+        # Loud, because the alternative is a machine with no config and nothing
+        # to say why.
+        echo "billet: ${TEMPLATE} is missing, so ${CONF} was not created." >&2
+        echo "        Copy billet.example.yaml there before starting billet." >&2
     fi
-done
+fi
+
+if [ -e "${CONF}" ]; then
+    # root owns it so an unprivileged process cannot edit what billet trusts;
+    # the billet group can read it or the service cannot start at all.
+    chown root:billet "${CONF}"
+    chmod 0640 "${CONF}"
+fi
+
+# THE APP KEY IS OWNED BY THE SERVICE USER AT 0600, and it is the one file here
+# that cannot be root-owned-and-group-readable.
+#
+# billet refuses any App key with group or other bits set (githubapp.go, the
+# perm&0o077 check) — a private key readable by a group is one that leaks through
+# a group. So 0640 root:billet, which is right for the config, makes the server
+# refuse to start; and 0600 root:root is unreadable by the service. The only
+# arrangement that satisfies both is the ordinary Unix one: the process that
+# needs the secret owns the secret.
+if [ -e "${KEY}" ]; then
+    chown billet:billet "${KEY}"
+    chmod 0600 "${KEY}"
+fi
 
 if [ -d /run/systemd/system ]; then
     systemctl daemon-reload || true

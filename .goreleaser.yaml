@@ -63,7 +63,11 @@ nfpms:
       billet runs a control plane that talks to GitHub's scale-set API and
       launches ephemeral runners on machines you own.
     license: Apache-2.0
-    formats: [deb, rpm, apk]
+    # NO apk. Alpine uses BusyBox adduser/addgroup rather than GNU
+    # useradd/groupadd, and OpenRC rather than systemd — so an apk built from
+    # these scripts and these units could not install, and shipping a package
+    # that cannot work is worse than not shipping one.
+    formats: [deb, rpm]
     bindir: /usr/bin
     contents:
       - src: deploy/billet-server.service
@@ -71,15 +75,26 @@ nfpms:
       - src: deploy/billet-node.service
         dst: /usr/lib/systemd/system/billet-node.service
 
-      # NOREPLACE, and it is the whole reason this is marked as config at all: an
-      # upgrade must never overwrite a file the operator edited. Losing
-      # /etc/billet/billet.yaml would take the GitHub App id, the tier catalog and
-      # the capacity ceilings with it.
+      # THE LIVE CONFIG IS NOT PACKAGED — postinstall copies this template to
+      # /etc/billet/billet.yaml when nothing is there yet.
+      #
+      # config|noreplace protects an UPGRADE and nothing else. `apt purge` still
+      # removes a conffile, and `rpm -e` can rename a modified one to .rpmsave —
+      # either takes the App ids, the tier catalog and the capacity ceilings with
+      # it while the deployment identity and the App key survive separately,
+      # which is the half-recoverable machine all of this exists to avoid. The
+      # same reasoning as /var/lib/billet: what must outlive the package must not
+      # be owned by the package manager.
+      #
+      # NOT UNDER /usr/share/doc, and that was found by installing on a slim
+      # image. Debian's minimal images ship
+      # /etc/dpkg/dpkg.cfg.d/docker with `path-exclude=/usr/share/doc/*`, so a
+      # template kept there is silently dropped at unpack time — postinstall then
+      # finds nothing to copy and the machine ends up with no config at all, with
+      # no error anywhere. Anything postinstall depends on has to live outside
+      # the paths a minimal install is entitled to throw away.
       - src: deploy/billet.yaml
-        dst: /etc/billet/billet.yaml
-        type: "config|noreplace"
-        file_info:
-          mode: 0640
+        dst: /usr/share/billet/billet.yaml
 
       - src: billet.example.yaml
         dst: /usr/share/doc/billet/billet.example.yaml
