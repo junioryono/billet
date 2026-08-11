@@ -1129,10 +1129,10 @@ func (p *Plane) staleAfter() time.Duration {
 // indefinitely. A single dead machine therefore made every subsequent completed
 // job leak its capacity, permanently.
 //
-// In-flight commands are answered exactly as a re-registration answers them: a
-// launch becomes custody, because the node may have started something before it
-// went quiet, and a destroy becomes a plain failure the caller can retry.
-// Dropping them silently would leave callers waiting on a machine that is gone.
+// A node with commands IN FLIGHT is not expired at all — see the guard below —
+// so nothing here answers one, and custody is never transferred by expiry. What
+// is answered is the QUEUE: those commands never reached the node, so a caller
+// waiting on a machine that is gone is told plainly that nothing started.
 func (p *Plane) expireStaleLocked() {
 	cutoff := p.now().Add(-p.staleAfter())
 
@@ -1145,10 +1145,11 @@ func (p *Plane) expireStaleLocked() {
 		//
 		// The loop executes commands synchronously, so a node pulling a five-minute
 		// image does not poll while it works — and expiring it there was actively
-		// harmful rather than merely wrong. Expiry answers an in-flight launch with
-		// custody, the listener stops heartbeating on that, and the lease is reaped
-		// before the provider has even returned. The launch then starts a runner on
-		// capacity that has already been sold to somebody else.
+		// harmful rather than merely wrong. Expiring it WOULD answer an in-flight
+		// launch with custody, the listener would stop heartbeating on that, and the
+		// lease would be reaped before the provider had even returned — after which
+		// the launch starts a runner on capacity already sold to somebody else.
+		// This guard is what makes that conditional rather than what happens.
 		//
 		// The command timeout is what bounds this instead, and it is the right
 		// instrument: it is already the thing that decides how long an unanswered
