@@ -51,6 +51,8 @@ type Server struct {
 	maxCapacity *int
 	// reapEvery is how often abandoned capacity is reclaimed.
 	reapEvery time.Duration
+	// hurry, when closed, ends every listener's drain wait early.
+	hurry <-chan struct{}
 	// drainTimeout is how long every listener waits for its running jobs on
 	// shutdown.
 	//
@@ -101,6 +103,14 @@ func WithNodeRunner(r Runner) ControlPlaneOption {
 // rather than the length of a shutdown.
 func WithDrainTimeout(d time.Duration) ControlPlaneOption {
 	return func(s *Server) { s.drainTimeout = &d }
+}
+
+// WithHurry gives every listener the channel that ends its drain wait early.
+//
+// This is the operator's second signal reaching the code that honours it. See
+// WithHurrySignal for what a listener does with it.
+func WithHurry(c <-chan struct{}) ControlPlaneOption {
+	return func(s *Server) { s.hurry = c }
 }
 
 // OptionsFromConfig is the control-plane configuration implied by billet.yaml.
@@ -307,6 +317,10 @@ func (s *Server) listenerOpts() []Option {
 	// those out here would hide them from the listener's own validation and leave
 	// Run using a default nobody asked for; passing them through means configError
 	// refuses to start, which is what every other budget does.
+	if s.hurry != nil {
+		opts = append(opts, WithHurrySignal(s.hurry))
+	}
+
 	if s.drainTimeout != nil {
 		opts = append(opts, WithDrainGrace(*s.drainTimeout))
 	}

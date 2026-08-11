@@ -317,6 +317,10 @@ type Listener struct {
 	// draining says this listener has been asked to stop and is finishing what it
 	// already has. Guarded by mu, and NOT the same thing as sealed.
 	draining bool
+	// hurry, when closed, ends the drain's wait early. It is how a second signal
+	// says "stop waiting" without also saying "abandon what you are holding".
+	// Read here and never closed here.
+	hurry <-chan struct{}
 }
 
 // NewListener builds a listener for one tier.
@@ -581,6 +585,19 @@ func WithShutdownGrace(d time.Duration) Option {
 // Validated against maxDrainGrace rather than maxGrace, because this is the one
 // budget here that waits on somebody else's job rather than on billet's own
 // teardown. See defaultDrainGrace.
+// WithHurrySignal gives the listener a channel whose closing ends the drain's
+// wait.
+//
+// The drain is bounded by drainGrace, which is measured in hours because a job
+// is. An operator who does not want to wait that long needs a lever that stops
+// the WAITING without stopping the teardown — closing this is that lever, and
+// what follows is the ordinary destroy-and-release the drain was standing in
+// front of. Without it the only escape is killing the process, which strands
+// exactly the containers the drain existed to protect.
+func WithHurrySignal(c <-chan struct{}) Option {
+	return func(l *Listener) { l.hurry = c }
+}
+
 func WithDrainGrace(d time.Duration) Option {
 	return func(l *Listener) {
 		if l.setWithin("drain grace", d, maxDrainGrace) {
@@ -1135,7 +1152,7 @@ func (l *Listener) Run(ctx context.Context) error {
 		// trying to leave, and the drain could never reach zero.
 		if !draining {
 			if err := l.refillEscrow(pollCtx); err != nil {
-				if cancelledWhileServing(ctx, draining) {
+				if cancelledWhileServing(ctx, draining, err) {
 					continue
 				}
 
@@ -1154,7 +1171,7 @@ func (l *Listener) Run(ctx context.Context) error {
 		}
 
 		if err != nil {
-			if cancelledWhileServing(ctx, draining) {
+			if cancelledWhileServing(ctx, draining, err) {
 				continue
 			}
 
@@ -1162,7 +1179,7 @@ func (l *Listener) Run(ctx context.Context) error {
 		}
 
 		if err := l.handle(pollCtx, msg); err != nil {
-			if cancelledWhileServing(ctx, draining) {
+			if cancelledWhileServing(ctx, draining, err) {
 				continue
 			}
 
@@ -1171,15 +1188,28 @@ func (l *Listener) Run(ctx context.Context) error {
 	}
 }
 
-// cancelledWhileServing reports whether a failed call failed only because the
-// caller asked billet to stop, and the drain has not taken over yet.
+// cancelledWhileServing reports whether a failed call failed BECAUSE the caller
+// asked billet to stop, and the drain has not taken over yet.
 //
-// Such a call is not a failure to report; it is the shutdown arriving mid-call.
-// Looping round lets the drain start on the next pass, on a context that is not
-// cancelled, so the work already running still gets its chance to finish. Once
-// draining, this is false and a real error is a real error again.
-func cancelledWhileServing(ctx context.Context, draining bool) bool {
-	return !draining && ctx.Err() != nil
+// THE ERROR IS INSPECTED, NOT JUST THE CLOCK, and the first version only looked
+// at the clock. Any failure that happened to coincide with a cancellation was
+// swallowed and the loop carried on into the drain — including the fatal ones.
+// "an acquisition response is not a subset of its request" stops the control
+// plane on purpose, because once GitHub returns an id nobody offered for, billet
+// cannot tell which of its commitments are real. Erasing that because somebody
+// pressed Ctrl-C at the same moment would leave the drain running the same
+// session for hours on exactly the state that is not safe to run on.
+//
+// So only a cancellation is treated as one. Anything else keeps its fail-stop
+// behaviour, and the cost of a driver that reports cancellation as some other
+// error is a missed drain — the behaviour billet had before there was one —
+// rather than a fatal error quietly discarded.
+func cancelledWhileServing(ctx context.Context, draining bool, err error) bool {
+	if draining || ctx.Err() == nil {
+		return false
+	}
+
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // beginDrain stops this listener taking new work and hands back the capacity
@@ -1199,11 +1229,34 @@ func cancelledWhileServing(ctx context.Context, draining bool) bool {
 // actually refuses the work is the local check in handle, for the same reason
 // the dry run needs one.
 func (l *Listener) beginDrain(ctx context.Context) (context.Context, context.CancelFunc) {
+	// BOUNDED, and bounded only as far as anything here can be. The deadline is
+	// observed between calls, so a Session that returns — however slowly — is
+	// bounded by it, while one that blocks inside GetMessage forever is not. That
+	// is the same limit the teardown documents for a Destroy that ignores its
+	// context, and neither interface forbids one; saying so is more useful than a
+	// comment claiming a guarantee this cannot give.
+	//
 	// The drain's context is built FIRST because the release below needs a live
 	// one: ctx is already cancelled by the time this is called, and handing a
 	// cancelled context to alloc.Release would fail every one of them and strand
 	// the very capacity this is giving back.
 	drainCtx, endDrain := context.WithTimeout(context.WithoutCancel(ctx), l.drainGrace)
+
+	// A SECOND SIGNAL ENDS THE WAIT, not the teardown. What follows is the
+	// ordinary destroy-and-release; only the waiting is cut short.
+	//
+	// The goroutine also selects on drainCtx so it cannot outlive the drain. A
+	// version that only waited on hurry would park forever in every process that
+	// drains normally, which is all of them.
+	if l.hurry != nil {
+		go func() {
+			select {
+			case <-l.hurry:
+				endDrain()
+			case <-drainCtx.Done():
+			}
+		}()
+	}
 
 	// NOT l.seal(), WHICH MEANS SOMETHING ELSE. Sealing stops the cleanup loop
 	// starting new destroys, and belongs at the teardown where it is. A drain can
@@ -1235,40 +1288,44 @@ func (l *Listener) beginDrain(ctx context.Context) (context.Context, context.Can
 // escrow capacity that is already spoken for, which is the overcommit the whole
 // escrow exists to prevent.
 func (l *Listener) releaseIdleEscrow(ctx context.Context) int {
+	// A SNAPSHOT TO ITERATE, BUT EACH LEASE LEAVES `held` ONLY WHEN IT IS
+	// ACTUALLY RELEASED. The first version took the whole slice out up front and
+	// appended the failures back afterwards, which is wrong twice over.
+	//
+	// While a lease is out of `held` the heartbeat cannot see it, so it stops
+	// being renewed — and a release pass that runs longer than a lease TTL would
+	// let the reaper reclaim one, after which appending it back would have this
+	// listener advertising capacity it no longer owns. That is the double
+	// admission the whole escrow exists to prevent, reached through the code that
+	// was meant to hand capacity back.
+	//
+	// It also raced the heartbeat's own pruning: heartbeatHeld drops leases it has
+	// lost, and replacing the slice wholesale would resurrect one it had just
+	// dropped. Deleting by id leaves both free to act on the same collection.
 	l.mu.Lock()
-	held := l.held
-	l.held = nil
+	snapshot := append([]*alloc.Lease(nil), l.held...)
 	l.mu.Unlock()
 
-	var (
-		released int
-		kept     []*alloc.Lease
-	)
+	released := 0
 
-	for _, lease := range held {
+	for _, lease := range snapshot {
 		if err := l.alloc.Release(ctx, lease.ID, lease.Epoch, alloc.PhaseDone); err != nil {
-			// PUT BACK, NOT DROPPED. Taking it out of `held` and then failing to
-			// release it would strand the lease in neither place: releaseAll walks
-			// `held` at teardown, so a lease removed here and never released is one
-			// nothing tries again and only the reaper recovers. Returning it leaves
-			// the teardown a second attempt on its own budget, which is the whole
-			// reason that pass exists.
-			l.log.Warn("could not release idle escrow while draining; it will be "+
-				"released again at shutdown",
+			// LEFT IN `held`, so it is still renewed, still correctly counted as
+			// this listener's, and tried again by the teardown's own release pass
+			// on its own budget. Dropping it here would leak the capacity until the
+			// reaper; advertising it after losing it would be worse.
+			l.log.Warn("could not release idle escrow while draining; it stays this "+
+				"listener's and will be released at shutdown",
 				"tier", l.tier, "lease", lease.ID, "error", err)
-
-			kept = append(kept, lease)
 
 			continue
 		}
 
-		released++
-	}
-
-	if len(kept) > 0 {
 		l.mu.Lock()
-		l.held = append(l.held, kept...)
+		l.held = slices.DeleteFunc(l.held, func(h *alloc.Lease) bool { return h.ID == lease.ID })
 		l.mu.Unlock()
+
+		released++
 	}
 
 	return released
