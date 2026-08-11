@@ -1138,6 +1138,28 @@ another workflow — GitHub's recursion guard — which is why a release button
 usually needs a PAT or an App. A `workflow_call` is not an event, so billet needs
 no repository secrets.
 
+## Deployment
+
+`deploy/` holds the systemd units and the packaged config; GoReleaser's `nfpms`
+section turns them into `.deb`, `.rpm` and `.apk`. Three things there are
+load-bearing and were each found by installing a package rather than by reading
+one:
+
+- **`--config /etc/billet/billet.yaml` is explicit in both units.** billet's
+  default config path is per-user and deliberately never reads the working
+  directory; a unit that relied on the default would find nothing.
+- **`lock_dir` is set in the packaged config.** billet derives its default from
+  `HOME`, which a service does not have, so without this billet refuses to start
+  rather than run without the lock that stops two processes managing one host's
+  containers.
+- **`TimeoutStopSec` is sized from `drain_timeout` plus the teardown.** systemd's
+  expiry is a SIGKILL through the middle of the shutdown. Lower `drain_timeout`
+  first, then the unit; never the unit alone.
+
+The package **does not enable or start anything**. `/var/lib/billet` is created
+by postinstall rather than shipped, so a package removal cannot delete the
+deployment identity and the mTLS CA.
+
 ## Git workflow
 
 Feature branches, never commit to `main`. See the `billet-git-flow` skill for branch naming, commit
