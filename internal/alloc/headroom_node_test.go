@@ -119,7 +119,7 @@ func TestWorkIsChargedToTheHostHoldingIt(t *testing.T) {
 	small := tier("small", 4, 8*config.GiB)
 	small.Provider = config.ProviderDocker
 
-	a := newAllocator(t, Limits{MaxVCPU: 1000, MaxMemory: 4000 * config.GiB},
+	a := newBareAllocator(t, Limits{MaxVCPU: 1000, MaxMemory: 4000 * config.GiB},
 		[]config.Tier{small})
 
 	busy, _ := mustRegister(t, a, NodeRegistration{

@@ -446,7 +446,7 @@ func runServer(ctx context.Context, lc *lifecycle, cfg *config.Config, dryRun, d
 		MaxVCPU:   cfg.Server.MaxVCPU,
 		MaxMemory: cfg.Server.MaxMemory,
 		Nodes:     cfg.NodePolicies(),
-	}, cfg.Tiers)
+	}, cfg.Tiers, alloc.WithPlacement(cfg.Server.Placement))
 	if err != nil {
 		return fmt.Errorf("capacity allocator: %w", err)
 	}

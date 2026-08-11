@@ -213,12 +213,25 @@ type Allocator struct {
 	// way its capacity must come back or the host slowly fills with ghosts.
 	leaseTTL time.Duration
 
+	// placement decides which of several equally preferred hosts a reservation is
+	// aimed at. Empty is treated as pack; see WithPlacement.
+	placement config.PlacementPolicy
+
 	// now is injectable so expiry can be tested without sleeping.
 	now func() time.Time
 }
 
 // Option configures an Allocator.
 type Option func(*Allocator)
+
+// WithPlacement chooses how a reservation picks among equally preferred hosts.
+//
+// Empty means pack, which is the default and the safer failure: spreading
+// strands capacity in fragments too small for a large tier, and a job that
+// cannot be placed is worse than one that shares a disk.
+func WithPlacement(p config.PlacementPolicy) Option {
+	return func(a *Allocator) { a.placement = p.Or() }
+}
 
 // WithClock replaces the clock. Test-only in practice.
 func WithClock(now func() time.Time) Option {
@@ -517,8 +530,26 @@ func (a *Allocator) Escrow(ctx context.Context, tier string, want int) ([]*Lease
 		take := min(want, room)
 		leases = make([]*Lease, 0, take)
 
+		// MEASURED ONCE AND SPENT DOWN, because none of these choices is durable
+		// until the transaction commits. Asking the ledger again per lease would
+		// return the same fleet every time and aim every reservation at the same
+		// machine.
+		place, err := a.newPlacer(ctx, tx, t)
+		if err != nil {
+			return err
+		}
+
 		for range take {
-			lease, err := a.insertLease(ctx, tx, t)
+			target, ok := place.next()
+			if !ok {
+				// The fleet ran out before the ceiling did. Headroom is the smaller
+				// of the two, so this should not happen — but returning what was
+				// placed is the safe reading either way, and silently inserting an
+				// unplaced lease is the bug this whole commit removes.
+				break
+			}
+
+			lease, err := a.insertLease(ctx, tx, t, target)
 			if err != nil {
 				return err
 			}
@@ -787,7 +818,17 @@ func (a *Allocator) Reserve(ctx context.Context, tier string) (*Lease, error) {
 			return fmt.Errorf("%w for tier %q", ErrNoCapacity, t.Label)
 		}
 
-		lease, err = a.insertLease(ctx, tx, t)
+		place, err := a.newPlacer(ctx, tx, t)
+		if err != nil {
+			return err
+		}
+
+		target, ok := place.next()
+		if !ok {
+			return fmt.Errorf("%w for tier %q", ErrNoCapacity, t.Label)
+		}
+
+		lease, err = a.insertLease(ctx, tx, t, target)
 
 		return err
 	})
@@ -800,7 +841,9 @@ func (a *Allocator) Reserve(ctx context.Context, tier string) (*Lease, error) {
 
 // insertLease writes one escrowed lease. Callers must already hold a transaction
 // in which they have confirmed headroom.
-func (a *Allocator) insertLease(ctx context.Context, tx *sql.Tx, t config.Tier) (*Lease, error) {
+func (a *Allocator) insertLease(
+	ctx context.Context, tx *sql.Tx, t config.Tier, target string,
+) (*Lease, error) {
 	id, err := newLeaseID()
 	if err != nil {
 		return nil, err
@@ -817,9 +860,16 @@ func (a *Allocator) insertLease(ctx context.Context, tx *sql.Tx, t config.Tier) 
 	// macos_slot is stored rather than re-derived, so renaming a tier, changing
 	// its guest_os, or restarting against a different catalog cannot silently
 	// reclassify leases that are already in flight.
+	// EVERY LEASE NAMES ITS MACHINE NOW. It used to be set only for a tier that
+	// pinned itself, which left an ordinary reservation charged to the deployment
+	// and to no host — so the fleet's remaining room never shrank and billet
+	// advertised the same slots repeatedly.
+	//
+	// A pin still wins, and placement already honoured it: the chosen host is
+	// drawn from the eligible set, and a pin makes that set exactly one machine.
 	var targetNode any
-	if t.Node != "" {
-		targetNode = t.Node
+	if target != "" {
+		targetNode = target
 	}
 
 	macSlot := 0
@@ -841,7 +891,7 @@ func (a *Allocator) insertLease(ctx context.Context, tx *sql.Tx, t config.Tier) 
 	return &Lease{
 		ID:         id,
 		Tier:       t.Label,
-		TargetNode: t.Node,
+		TargetNode: target,
 		MacOSSlot:  macSlot == 1,
 		GuestOS:    t.GuestOS,
 		Providers:  t.AcceptableProviders(),

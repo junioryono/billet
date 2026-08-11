@@ -80,6 +80,30 @@ server:
   max_vcpu: 120
   max_memory: 480GiB
 
+  # WHICH MACHINE A JOB GOES TO, once more than one could take it. Only
+  # meaningful with a fleet; a single-host deployment can ignore it.
+  #
+  #   pack   (default) fill a machine before starting on the next
+  #   spread             keep machines as even as possible
+  #
+  # PACK BECAUSE FRAGMENTS CANNOT HOLD A BIG JOB. Spreading leaves every host
+  # partly used, and six 4 vCPU jobs spread across two 16 vCPU machines leave
+  # four free on each — so an 8 vCPU job fits nowhere while eight vCPU sit idle
+  # in the fleet. A job that cannot be placed is worse than a job that shares a
+  # disk.
+  #
+  # The usual reason to spread is contention, and it is weaker here than it
+  # looks: billet escrows vCPU and memory and the provider enforces both per
+  # container, so two jobs on one host do not take each other's cores or RAM.
+  # What they share is disk, page cache and network — so reach for `spread` if
+  # your builds are IO-heavy and you would rather fit less work than have them
+  # contend.
+  #
+  # Provider preference always wins over this: `providers: [firecracker, ec2]`
+  # means the machine at home before the cloud, whichever policy is set.
+  #
+  # placement: pack
+
 github:
   org: your-org
 
