@@ -505,10 +505,25 @@ var providerListMigration = migration{
 	},
 }
 
+// A NODE IS SOMEWHERE, and until there was a word for where, a cache had no
+// address and every host looked equally close to every other one.
+//
+// Empty is "unsited", which is what every existing row is and what a
+// single-machine deployment stays. It is a real value rather than a missing one:
+// one place is still one place, and a deployment that never names it should not
+// have to.
+var nodeSiteMigration = migration{
+	Version: 10,
+	Name:    "node_site",
+	Stmts: []string{
+		`ALTER TABLE nodes ADD COLUMN site TEXT NOT NULL DEFAULT ''`,
+	},
+}
+
 func init() {
 	migrations = append(migrations,
 		placementMigration, guestOSMigration, placementFactsMigration, requestIDMigration,
-		providerListMigration)
+		providerListMigration, nodeSiteMigration)
 }
 
 const bootstrapSchemaMigrations = `CREATE TABLE IF NOT EXISTS schema_migrations (

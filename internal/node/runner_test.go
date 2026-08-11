@@ -15,6 +15,14 @@ import (
 	"github.com/junioryono/billet/internal/state"
 )
 
+// A registered host in these tests is deliberately larger than any budget they
+// set, so the deployment-wide ceiling stays the binding constraint and every
+// test written before nodes carried capacity keeps measuring what it did.
+const (
+	testNodeVCPU   = 1 << 20
+	testNodeMemory = 1 << 20 * config.GiB
+)
+
 // A launch mints a registration and hands it to the provider, with the tier's
 // shape and the job's trust class.
 func TestLaunchMintsARegistrationAndStartsIt(t *testing.T) {
@@ -502,7 +510,7 @@ func newAllocatorForTiers(t *testing.T, db *state.DB, tiers ...config.Tier) (*al
 
 	const host = "test-host"
 
-	if err := a.RegisterNode(t.Context(), host, config.ProviderDocker); err != nil {
+	if err := a.RegisterNode(t.Context(), alloc.NodeRegistration{Name: host, Provider: config.ProviderDocker, VCPU: testNodeVCPU, Memory: testNodeMemory}); err != nil {
 		t.Fatalf("RegisterNode: %v", err)
 	}
 
@@ -821,7 +829,7 @@ func TestSweepDestroysAnInstanceBoundToAnotherNode(t *testing.T) {
 	p := &fakeProvider{kind: config.ProviderDocker}
 	a, host := newAllocatorWithHost(t)
 
-	if err := a.RegisterNode(t.Context(), "other-host", config.ProviderDocker); err != nil {
+	if err := a.RegisterNode(t.Context(), alloc.NodeRegistration{Name: "other-host", Provider: config.ProviderDocker, VCPU: testNodeVCPU, Memory: testNodeMemory}); err != nil {
 		t.Fatalf("RegisterNode: %v", err)
 	}
 

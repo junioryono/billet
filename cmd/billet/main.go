@@ -377,6 +377,22 @@ func claimIdentity(
 	return deployment, lock, nil
 }
 
+// nodeContribution is what this host offers: what it detected, unless its own
+// config said otherwise.
+//
+// ONE DEFINITION FOR BOTH ROLES. `billet node` sends this over the wire and
+// `billet server --dev` writes it to the ledger directly, and if the two
+// resolved it differently the same config file would describe a different
+// machine depending on which process happened to run it.
+func nodeContribution(cfg *config.Config) (config.Contribution, error) {
+	vcpu, memory, err := config.DetectHostCapacity()
+	if err != nil {
+		return config.Contribution{}, err
+	}
+
+	return cfg.Node.Contribution(vcpu, memory), nil
+}
+
 func runServer(ctx context.Context, lc *lifecycle, cfg *config.Config, dryRun, dev bool) error {
 	// Built by the SHARED constructor, so the server and teardown authenticate
 	// identically. Two near-identical constructions is how one of them ends up
@@ -482,7 +498,28 @@ func runServer(ctx context.Context, lc *lifecycle, cfg *config.Config, dryRun, d
 		// because it said so, and placement compares a lease against the provider
 		// the host REGISTERED rather than one a catalog claims — so Bind refuses
 		// every lease until this row is here.
-		if err := allocator.RegisterNode(ctx, cfg.Node.Name, cfg.Node.Provider); err != nil {
+		//
+		// --dev registers directly rather than over the wire, so the contribution
+		// is resolved here exactly as nodeclient resolves it for a remote host.
+		// Two paths to one ledger row, and they must agree about what this machine
+		// offers or the same config would mean different things depending on
+		// whether the node happened to be in this process.
+		contribution, err := nodeContribution(cfg)
+		if err != nil {
+			return err
+		}
+
+		for _, w := range contribution.Warnings {
+			slog.Default().Warn(w, "node", cfg.Node.Name)
+		}
+
+		if err := allocator.RegisterNode(ctx, alloc.NodeRegistration{
+			Name:     cfg.Node.Name,
+			Provider: cfg.Node.Provider,
+			Site:     cfg.Node.Site,
+			VCPU:     contribution.VCPU,
+			Memory:   contribution.Memory,
+		}); err != nil {
 			return err
 		}
 
@@ -850,9 +887,24 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 		return err
 	}
 
+	// RESOLVED ONCE, HERE, rather than on each re-registration. A drain
+	// re-registers, and a node that came back reporting a different contribution
+	// would move the fleet's arithmetic underneath work it is still holding.
+	contribution, err := nodeContribution(cfg)
+	if err != nil {
+		return err
+	}
+
+	for _, w := range contribution.Warnings {
+		slog.Default().Warn(w, "node", cfg.Node.Name)
+	}
+
 	return nodeclient.Run(ctx, client, runner, nodeclient.LoopOptions{
 		Provider:     cfg.Node.Provider,
 		Deployment:   deployment,
+		Site:         cfg.Node.Site,
+		VCPU:         contribution.VCPU,
+		Memory:       contribution.Memory,
 		Log:          slog.Default(),
 		SweepEvery:   5 * time.Minute,
 		DrainTimeout: drainTimeout,

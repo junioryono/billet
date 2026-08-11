@@ -42,6 +42,14 @@ import (
 	"github.com/junioryono/billet/internal/wiring"
 )
 
+// A registered host in these tests is deliberately larger than any budget they
+// set, so the deployment-wide ceiling stays the binding constraint and every
+// test written before nodes carried capacity keeps measuring what it did.
+const (
+	testNodeVCPU   = 1 << 20
+	testNodeMemory = 1 << 20 * config.GiB
+)
+
 // plane is a scripted Actions service: it holds a queue of messages a test can
 // push to, and records what billet acquired and acknowledged.
 //
@@ -391,7 +399,7 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 	// that stopped it — the node would bind happily against a row this harness
 	// had helpfully created.
 	if !sc.wire {
-		if err := a.RegisterNode(t.Context(), host, config.ProviderDocker); err != nil {
+		if err := a.RegisterNode(t.Context(), alloc.NodeRegistration{Name: host, Provider: config.ProviderDocker, VCPU: testNodeVCPU, Memory: testNodeMemory}); err != nil {
 			t.Fatalf("RegisterNode: %v", err)
 		}
 	}
@@ -527,8 +535,12 @@ func wireUp(
 		err := nodeclient.Run(ctx, nc, runner, nodeclient.LoopOptions{
 			Provider:   config.ProviderDocker,
 			Deployment: deployment,
-			Log:        log,
-			Backoff:    50 * time.Millisecond,
+			// What this host contributes. Required now: a node reporting nothing is
+			// refused rather than joining the fleet and never being chosen.
+			VCPU:    testNodeVCPU,
+			Memory:  testNodeMemory,
+			Log:     log,
+			Backoff: 50 * time.Millisecond,
 		})
 		if err != nil && !errors.Is(err, context.Canceled) {
 			t.Errorf("the node loop stopped for a reason other than shutdown: %v", err)

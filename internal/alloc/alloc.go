@@ -1044,6 +1044,28 @@ func (a *Allocator) Release(ctx context.Context, leaseID string, epoch int64, ou
 	})
 }
 
+// NodeRegistration is what a host tells the ledger about itself.
+//
+// A STRUCT RATHER THAN FIVE ARGUMENTS, because two of them are strings that mean
+// entirely different things (a name and a place) and two are numbers that are
+// not interchangeable either. Positionally, transposing any pair compiles and
+// runs, and the resulting fleet is wrong in a way that surfaces as bad placement
+// rather than as an error.
+type NodeRegistration struct {
+	// Name is what tiers pin to and what certificates authorise.
+	Name string
+	// Provider is the compute backend this host runs. A host is the authority on
+	// this, which is why it is reported rather than read from a catalogue.
+	Provider config.ProviderKind
+	// Site is where this machine is, or empty for a deployment that has not
+	// needed the distinction.
+	Site string
+	// VCPU and Memory are what this host CONTRIBUTES, which is not necessarily
+	// what it has — see config.NodeConfig.Contribution.
+	VCPU   int
+	Memory config.ByteSize
+}
+
 // RegisterNode records a host and what it runs, so leases can be placed on it.
 //
 // A node exists in this table because it TOLD billet it exists, not because
@@ -1056,7 +1078,9 @@ func (a *Allocator) Release(ctx context.Context, leaseID string, epoch int64, ou
 // on re-registration so a previous instance of the same host — a process that
 // was killed and came back, or one that hung and returned — finds its writes
 // refused rather than operating on leases the new instance now owns.
-func (a *Allocator) RegisterNode(ctx context.Context, name string, kind config.ProviderKind) error {
+func (a *Allocator) RegisterNode(ctx context.Context, reg NodeRegistration) error {
+	name, kind := reg.Name, reg.Provider
+
 	if name == "" {
 		return errors.New("alloc: a node must have a name")
 	}
@@ -1064,6 +1088,21 @@ func (a *Allocator) RegisterNode(ctx context.Context, name string, kind config.P
 	if kind == "" {
 		return fmt.Errorf("alloc: node %s registered no provider, so nothing could be placed "+
 			"on it safely", name)
+	}
+
+	// A CONTRIBUTION OF NOTHING FAILS NOWHERE ELSE, which is why it fails here. A
+	// node recorded with zero capacity registers cleanly, joins the fleet, and is
+	// simply never chosen — so the tier it was meant to serve advertises nothing
+	// while the machine sits there looking healthy. There is no later error to
+	// find, and no log line that points at the cause.
+	if reg.VCPU <= 0 {
+		return fmt.Errorf("alloc: node %s contributes %d vcpu; a host that offers no cores "+
+			"can never be given work", name, reg.VCPU)
+	}
+
+	if reg.Memory <= 0 {
+		return fmt.Errorf("alloc: node %s contributes %s of memory; a host that offers none "+
+			"can never be given work", name, reg.Memory)
 	}
 
 	return a.db.Tx(ctx, func(tx *sql.Tx) error {
@@ -1118,14 +1157,23 @@ func (a *Allocator) RegisterNode(ctx context.Context, name string, kind config.P
 			}
 		}
 
+		// CAPACITY AND SITE ARE OVERWRITTEN ON EVERY REGISTRATION, unlike the
+		// provider above. A host that comes back offering less has been reconfigured
+		// and restarted, which is the supported way to change what it gives; leases
+		// already open keep their capacity charged, so the only effect is that no
+		// new work fits until enough of them drain. Refusing that would take a
+		// machine out of the fleet for telling the truth about itself.
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO nodes (name, provider, last_seen_at)
-			 VALUES (?, ?, ?)
+			`INSERT INTO nodes (name, provider, site, total_vcpu, total_memory, last_seen_at)
+			 VALUES (?, ?, ?, ?, ?, ?)
 			 ON CONFLICT (name) DO UPDATE SET
 			   provider     = excluded.provider,
+			   site         = excluded.site,
+			   total_vcpu   = excluded.total_vcpu,
+			   total_memory = excluded.total_memory,
 			   last_seen_at = excluded.last_seen_at,
 			   epoch        = nodes.epoch + 1`,
-			name, string(kind), now); err != nil {
+			name, string(kind), reg.Site, reg.VCPU, int64(reg.Memory), now); err != nil {
 			return fmt.Errorf("alloc: register node %s: %w", name, err)
 		}
 
