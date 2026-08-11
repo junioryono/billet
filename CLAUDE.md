@@ -174,7 +174,9 @@ silently resolving — a config that reads as "two macOS guests" must not schedu
 **Placement is checked where the host is known, and again at the launch boundary.** Config
 validation cannot see every placement: an *unpinned* tier names no host, so nothing ties it to the
 allowlist, and a scheduler that simply picked a node with free capacity would put a Linux guest on a
-macOS-only Mac. `Bind` is the first point at which the host is known. The load-time guard covers what
+macOS-only Mac. `nodeplane.pick` is where a host is first chosen and it checks the tier's allowlist
+there; `Bind` is where the allocator durably validates that choice, and it is the one that has to
+hold, because a node cannot route around it. The load-time guard covers what
 it can prove — a pinned tier, or an unpinned one against a host declaring the *same provider*, since
 a Firecracker tier can never land on a Tart host and comparing guest OS alone would make one
 macOS-only Mac an error for every x64 Linux tier in the deployment.
