@@ -1,0 +1,70 @@
+# billet compute host.
+#
+# NOT ENABLED OR STARTED BY THE PACKAGE.
+#
+#   systemctl enable --now billet-node
+#
+# A node needs three things before it will start: a node section in
+# /etc/billet/billet.yaml naming the control plane, the certificate bundle
+# `billet ca issue <name>` produced on that control plane, and access to a
+# container runtime.
+[Unit]
+Description=billet compute host
+Documentation=https://github.com/junioryono/billet
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=billet
+Group=billet
+
+# THE ONLY DIFFERENCE FROM THE SERVER'S UNIT THAT MATTERS, and it is a trust
+# boundary rather than a permission.
+#
+# ACCESS TO A ROOTFUL DOCKER SOCKET IS ROOT ON THIS HOST. Anything that can talk
+# to it can start a privileged container or bind-mount /, so a compromise of the
+# billet node process is a compromise of the machine — and none of the hardening
+# below contains that. It is stated plainly because it is easy to read
+# "SupplementaryGroups=docker" as a detail about permissions.
+#
+# Prefer rootless Docker where the workload allows it. The runner containers
+# billet launches are not themselves given the socket.
+SupplementaryGroups=docker
+
+ExecStart=/usr/bin/billet node --config /etc/billet/billet.yaml
+
+StateDirectory=billet
+StateDirectoryMode=0700
+
+# THE SAME LOCK DIRECTORY AS THE SERVER'S, and that is load-bearing when both run
+# on one host. The lock stops two processes carrying one deployment identity from
+# managing the same containers, so they have to meet at the same path — billet
+# only checks that they agree when it is running both roles in one process.
+RuntimeDirectory=billet
+RuntimeDirectoryMode=0750
+
+# See the note in billet-server.service: drain (6h) + teardown (~25m) + margin.
+# A node's drain waits for the containers it is holding, and a SIGKILL through
+# the middle of it leaves them running with their leases renewed by nobody.
+TimeoutStopSec=23400
+KillSignal=SIGTERM
+KillMode=mixed
+
+Restart=on-failure
+RestartSec=5s
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+
+ReadOnlyPaths=/etc/billet
+
+[Install]
+WantedBy=multi-user.target

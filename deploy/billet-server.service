@@ -1,0 +1,96 @@
+# billet control plane.
+#
+# NOT ENABLED OR STARTED BY THE PACKAGE. Installing billet does not connect
+# anything to GitHub; that is the administrator's decision, made after
+# /etc/billet/billet.yaml says something true.
+#
+#   systemctl enable --now billet-server
+#
+[Unit]
+Description=billet control plane
+Documentation=https://github.com/junioryono/billet
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=billet
+Group=billet
+
+# EXPLICIT, AND NOT OPTIONAL. billet's default config path is per-user — it
+# resolves through os.UserConfigDir() and only falls back to /etc — and it
+# deliberately never reads the working directory, because a service that adopted
+# a billet.yaml from wherever it happened to start would be taking the state
+# directory, the App key path and every tier's resources from an attacker.
+ExecStart=/usr/bin/billet server --config /etc/billet/billet.yaml
+
+# /var/lib/billet, which billet then chmods to 0700 itself: it holds the SQLite
+# capacity ledger, the deployment identity, and the mTLS CA's private key.
+# Declaring the mode here means the two agree rather than one silently correcting
+# the other on every start.
+StateDirectory=billet
+StateDirectoryMode=0700
+
+# /run/billet, which is where the host-wide deployment lock goes.
+#
+# THE LOCK NEEDS A DIRECTORY BILLET CAN NAME. Its default is derived from HOME,
+# and a service has none — so without this the lock cannot be placed, and billet
+# refuses to start rather than quietly running without the thing that stops two
+# processes managing one host's containers. The shipped billet.yaml points
+# lock_dir here.
+RuntimeDirectory=billet
+RuntimeDirectoryMode=0750
+
+# SIX AND A HALF HOURS, AND THE ARITHMETIC IS THE POINT.
+#
+#   drain_timeout   6h     — how long billet waits for the jobs already running
+#   teardown       ~25m    — destroy (12m) + destroy (12m) + close (30s) + release (30s)
+#   margin           5m
+#
+# systemd sends SIGTERM and then SIGKILL when this expires. A SIGKILL lands in
+# the middle of the teardown: containers survive with nobody tracking them, and
+# their leases are renewed by nobody. So this must exceed what billet is allowed
+# to spend, or the service manager's impatience undoes the shutdown ordering
+# billet exists to get right.
+#
+# LOWER drain_timeout FIRST if this is too long for you, then lower this to
+# match. Do not lower this alone.
+TimeoutStopSec=23400
+KillSignal=SIGTERM
+
+# A second SIGTERM stops billet waiting for its running jobs and tears down
+# immediately; a third gives up where it stands. To send one:
+#
+#   systemctl kill --kill-whom=main --signal=SIGTERM billet-server
+#
+# --kill-whom=main MATTERS. Without it systemctl signals every process in the
+# service, including a container CLI billet has in flight — which kills the child
+# out from under the teardown that was trying to use it. Re-running
+# `systemctl stop` does not send a second application-level SIGTERM either.
+KillMode=mixed
+
+# A clean exit after a drain is a clean exit. `always` would restart a control
+# plane an operator had just asked to stop.
+Restart=on-failure
+RestartSec=5s
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+
+# The GitHub App private key and the config live here, read-only.
+ReadOnlyPaths=/etc/billet
+
+[Install]
+WantedBy=multi-user.target

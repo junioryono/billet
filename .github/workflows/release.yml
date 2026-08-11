@@ -1,0 +1,60 @@
+name: Release
+
+# Two ways in, and the second exists to avoid a secret.
+#
+#   • a v* tag pushed by a human — a hotfix tagged on a release branch
+#   • called by cut-release.yml, which creates the tag itself
+#
+# A ref pushed with the default GITHUB_TOKEN does NOT trigger another workflow;
+# that is GitHub's recursion guard, and it is why a "cut a release" button
+# usually needs a PAT or a GitHub App to push with. Calling this workflow
+# directly sidesteps it: a workflow_call is not an event, so the guard never
+# applies and billet needs no repository secrets at all.
+on:
+  push:
+    tags: ["v*"]
+  workflow_call:
+    inputs:
+      tag:
+        description: The tag to build.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      # Creating the GitHub Release and uploading its archives.
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # The TAG, whichever way we got here. When called, the caller has just
+          # created it on a release branch and the workflow files come from the
+          # calling commit — so the ref has to be named explicitly or this builds
+          # the caller's branch instead.
+          ref: ${{ inputs.tag || github.ref }}
+          # GoReleaser reads the tag history to work out the version and the
+          # changelog. A shallow clone gives it neither.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          # Pinned exactly, the way golangci-lint is. "~> v2" downloads whichever
+          # v2 exists at the time, so a release built today and one rebuilt next
+          # month are not the same build.
+          version: "v2.17.1"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
