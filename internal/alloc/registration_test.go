@@ -134,7 +134,8 @@ func TestAHostMayNotMoveSiteWhileWorkIsBoundToIt(t *testing.T) {
 	small := tier("small", 4, 16*config.GiB)
 	small.Provider = config.ProviderDocker
 
-	a := newAllocator(t, Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB}, []config.Tier{small})
+	a := newBareAllocator(t, Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB},
+		[]config.Tier{small})
 
 	home := NodeRegistration{
 		Name: "epyc-1", Provider: config.ProviderDocker, Site: "home",

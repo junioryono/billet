@@ -39,7 +39,7 @@ func TestATierWithSeveralProvidersBindsToEither(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			a := newAllocator(t, Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB},
+			a := newBareAllocator(t, Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB},
 				[]config.Tier{tier})
 
 			if _, err := a.RegisterNode(t.Context(), testRegistration(host.node, host.provider)); err != nil {
@@ -88,7 +88,14 @@ func TestAReservedLeaseHasNotChosenABackend(t *testing.T) {
 		GuestOS:   config.GuestLinux,
 	}
 
-	a := newAllocator(t, Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB}, []config.Tier{tier})
+	a := newBareAllocator(t, Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB}, []config.Tier{tier})
+
+	// Somewhere to put it: escrow chooses a machine now, so a reservation against
+	// an empty fleet is refused rather than left unplaced.
+	if _, err := a.RegisterNode(t.Context(),
+		testRegistration("epyc-1", config.ProviderFirecracker)); err != nil {
+		t.Fatalf("RegisterNode: %v", err)
+	}
 
 	lease, err := a.Reserve(t.Context(), tier.Label)
 	if err != nil {
@@ -119,9 +126,14 @@ func TestAProviderOutsideTheListIsStillRefused(t *testing.T) {
 		GuestOS:   config.GuestLinux,
 	}
 
-	a := newAllocator(t, Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB}, []config.Tier{tier})
+	a := newBareAllocator(t, Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB}, []config.Tier{tier})
 
-	if _, err := a.RegisterNode(t.Context(), testRegistration("laptop", config.ProviderDocker)); err != nil {
+	// A HOST THE TIER ACCEPTS, because a reservation has to be placeable before
+	// there is anything to bind. A fleet of only unacceptable machines advertises
+	// nothing now, which is the placement side of this rule and is covered by
+	// TestOnlyHostsThatCouldServeATierAreEligible.
+	if _, err := a.RegisterNode(t.Context(),
+		testRegistration("epyc-1", config.ProviderFirecracker)); err != nil {
 		t.Fatalf("RegisterNode: %v", err)
 	}
 
@@ -130,7 +142,17 @@ func TestAProviderOutsideTheListIsStillRefused(t *testing.T) {
 		t.Fatalf("Reserve: %v", err)
 	}
 
-	err = a.Bind(t.Context(), lease.ID, lease.Epoch, "laptop")
+	// THE BACKEND CHANGES UNDER THE RESERVATION, which is the window this check
+	// still guards. Placement will not aim an [firecracker, ec2] lease at a docker
+	// host — it is not a candidate — so the only way to reach Bind's provider
+	// check is for the chosen host to become something the tier does not accept,
+	// which it may do while no lease is BOUND to it.
+	if _, err := a.RegisterNode(t.Context(),
+		testRegistration("epyc-1", config.ProviderDocker)); err != nil {
+		t.Fatalf("the host could not change backend while merely targeted: %v", err)
+	}
+
+	err = a.Bind(t.Context(), lease.ID, lease.Epoch, "epyc-1")
 	if !errors.Is(err, ErrWrongProvider) {
 		t.Fatalf("bind to a backend the tier does not accept = %v, want ErrWrongProvider", err)
 	}
@@ -164,7 +186,14 @@ func TestThePreferenceOrderIsPreserved(t *testing.T) {
 		GuestOS:   config.GuestLinux,
 	}
 
-	a := newAllocator(t, Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB}, []config.Tier{tier})
+	a := newBareAllocator(t, Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB}, []config.Tier{tier})
+
+	// Somewhere to put it: escrow chooses a machine now, so a reservation against
+	// an empty fleet is refused rather than left unplaced.
+	if _, err := a.RegisterNode(t.Context(),
+		testRegistration("epyc-1", config.ProviderFirecracker)); err != nil {
+		t.Fatalf("RegisterNode: %v", err)
+	}
 
 	lease, err := a.Reserve(t.Context(), tier.Label)
 	if err != nil {
@@ -200,7 +229,7 @@ func TestASingleProviderStillPlaces(t *testing.T) {
 		GuestOS:  config.GuestLinux,
 	}
 
-	a := newAllocator(t, Limits{MaxVCPU: 8, MaxMemory: 16 * config.GiB}, []config.Tier{tier})
+	a := newBareAllocator(t, Limits{MaxVCPU: 8, MaxMemory: 16 * config.GiB}, []config.Tier{tier})
 
 	if _, err := a.RegisterNode(t.Context(), testRegistration("laptop", config.ProviderDocker)); err != nil {
 		t.Fatalf("RegisterNode: %v", err)
@@ -335,7 +364,7 @@ func TestANodeCannotChangeBackendWhileRunningWork(t *testing.T) {
 				GuestOS:   config.GuestLinux,
 			}
 
-			a := newAllocator(t, Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB},
+			a := newBareAllocator(t, Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB},
 				[]config.Tier{tier})
 
 			if _, err := a.RegisterNode(t.Context(), testRegistration("shapeshifter", config.ProviderFirecracker)); err != nil {
@@ -395,7 +424,7 @@ func TestABusyNodeMayReRegisterUnchanged(t *testing.T) {
 		GuestOS:   config.GuestLinux,
 	}
 
-	a := newAllocator(t, Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB}, []config.Tier{tier})
+	a := newBareAllocator(t, Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB}, []config.Tier{tier})
 
 	if _, err := a.RegisterNode(t.Context(), testRegistration("epyc-1", config.ProviderFirecracker)); err != nil {
 		t.Fatalf("RegisterNode: %v", err)
@@ -431,7 +460,7 @@ func TestANodeWithOnlyFinishedWorkMayChangeBackend(t *testing.T) {
 		GuestOS:   config.GuestLinux,
 	}
 
-	a := newAllocator(t, Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB}, []config.Tier{tier})
+	a := newBareAllocator(t, Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB}, []config.Tier{tier})
 
 	if _, err := a.RegisterNode(t.Context(), testRegistration("epyc-1", config.ProviderFirecracker)); err != nil {
 		t.Fatalf("RegisterNode: %v", err)
@@ -481,7 +510,7 @@ func advanceTo(t *testing.T, a *Allocator, lease *Lease, phase Phase) {
 func TestAnIdleNodeMayChangeBackend(t *testing.T) {
 	t.Parallel()
 
-	a := newAllocator(t, Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB},
+	a := newBareAllocator(t, Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB},
 		[]config.Tier{{
 			Label: "billet-8vcpu", Providers: []config.ProviderKind{config.ProviderDocker},
 			VCPU: 8, Memory: 32 * config.GiB, GuestOS: config.GuestLinux,

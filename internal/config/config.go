@@ -212,6 +212,10 @@ type ServerConfig struct {
 	// with nothing to stop them.
 	MaxVCPU   int      `yaml:"max_vcpu"`
 	MaxMemory ByteSize `yaml:"max_memory"`
+
+	// Placement decides which of several suitable machines a job is sent to.
+	// Empty means pack. Only meaningful once a deployment has more than one.
+	Placement PlacementPolicy `yaml:"placement,omitempty"`
 	// NodeTLSHosts are the names and addresses nodes will dial this control plane
 	// by. They become the subject names of the certificate it serves.
 	//
@@ -1287,6 +1291,10 @@ func (c *Config) validateServer() []error {
 		errs = append(errs, errors.New("server.state_dir is required"))
 	}
 	if err := validateHostPort("server.listen", c.Server.Listen); err != nil {
+		errs = append(errs, err)
+	}
+
+	if err := c.Server.Placement.Validate(); err != nil {
 		errs = append(errs, err)
 	}
 	// Required, not optional. Without a ceiling the allocator has nothing to

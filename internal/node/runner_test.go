@@ -143,6 +143,7 @@ func TestATierForAnotherBackendIsRefused(t *testing.T) {
 	firecracker.Provider = config.ProviderFirecracker
 
 	a, host := newAllocatorForTiers(t, openState(t), firecracker)
+	registerElsewhere(t, a, config.ProviderFirecracker)
 
 	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{firecracker}, nil)
 
@@ -520,30 +521,25 @@ func newAllocatorForTiers(t *testing.T, db *state.DB, tiers ...config.Tier) (*al
 		t.Fatalf("RegisterNode: %v", err)
 	}
 
-	// AND A HOST FOR EVERY BACKEND THE CATALOGUE NAMES, so a tier can be RESERVED
-	// even when the machine under test cannot run it.
-	//
-	// Capacity is per machine now: a tier no registered host can serve advertises
-	// zero, so Reserve refuses before Bind is ever reached. That is the point of
-	// the change, and it would also make "the runner refuses a host outside the
-	// tier's list" untestable — the mismatch has to be at BIND, which means the
-	// fleet must be able to hold the lease somewhere else.
-	for i := range tiers {
-		for _, provider := range tiers[i].AcceptableProviders() {
-			if provider == config.ProviderDocker {
-				continue
-			}
-
-			if _, err := a.RegisterNode(t.Context(), alloc.NodeRegistration{
-				Name: "elsewhere-" + string(provider), Provider: provider,
-				VCPU: testNodeVCPU, Memory: testNodeMemory,
-			}); err != nil {
-				t.Fatalf("RegisterNode %s: %v", provider, err)
-			}
-		}
-	}
-
 	return a, host
+}
+
+// registerElsewhere gives the fleet a host the TIER accepts but the runner under
+// test is not.
+//
+// Escrow chooses a machine now, so a tier no registered host can serve cannot be
+// RESERVED at all — which is correct, and which makes "the runner refuses a host
+// outside its lease's list" untestable unless the lease can be placed somewhere
+// else first. The mismatch has to be at bind, not at reserve.
+func registerElsewhere(t *testing.T, a *alloc.Allocator, kind config.ProviderKind) {
+	t.Helper()
+
+	if _, err := a.RegisterNode(t.Context(), alloc.NodeRegistration{
+		Name: "elsewhere", Provider: kind,
+		VCPU: testNodeVCPU, Memory: testNodeMemory,
+	}); err != nil {
+		t.Fatalf("RegisterNode elsewhere: %v", err)
+	}
 }
 
 // openState opens a throwaway ledger.
@@ -1027,6 +1023,8 @@ func TestAHostOutsideTheTiersListIsRefused(t *testing.T) {
 
 	p := &fakeProvider{kind: config.ProviderDocker}
 	a, host := newAllocatorForTiers(t, openState(t), tier)
+	registerElsewhere(t, a, config.ProviderFirecracker)
+
 	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{tier}, nil)
 
 	err := r.Launch(t.Context(), assignedLease(t, a), Job{RequestID: 11, Event: "push"})
