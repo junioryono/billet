@@ -1,5 +1,25 @@
 # billet configuration — copy to billet.yaml and edit.
 #
+# THIS FILE DOES NOT RUN AS SHIPPED. It describes the intended deployment, which
+# is Firecracker, and the Firecracker provider is not built — `billet server
+# --dev` refuses it. Two edits HERE make it start today, and both are needed —
+# the README's quickstart lists what else the file needs (the github: block, a
+# writable server.state_dir) and the Docker daemon it assumes:
+#
+#   1. `provider: firecracker` -> `provider: docker`, in the node section and in
+#      every tier.
+#   2. `image:` -> a Docker image that contains the GitHub runner, for example
+#      `ghcr.io/actions/actions-runner:latest`. The image name is passed
+#      straight to `docker run`, so `ubuntu-2404-x64` below is a golden-image
+#      name for Firecracker and is not pullable.
+#
+# The first edit alone gets you a config that validates and a server that
+# starts, and every job then fails to launch — which is why the second is here.
+#
+# The Docker provider reads vcpu, memory and shm; it ignores disk and
+# warm_pool, and the whole `firecracker:` block is unused. Docker shares the
+# host kernel and is for trials rather than for untrusted code.
+#
 # This example is the single-machine deployment: control plane and compute host
 # in one process, started with `billet server --dev`. Split them by running
 # `billet server` here and `billet node` on each additional machine, with the
@@ -126,6 +146,12 @@ node:
     # rather than asking a host to match a version billet prefers.
     kernel_image: /var/lib/billet/images/vmlinux
     # Backs golden images, per-job root clones, and cache volumes via CoW.
+    #
+    # BEING REPLACED BY CEPH RBD (#23). A ZFS snapshot exists only on this
+    # machine, so a cache written here belongs to this host and to no other —
+    # which is the storage-specific reason billet is a one-machine product —
+    # capacity, placement and teardown are the others. Set it today; expect this key
+    # to change once the storage layer lands.
     zfs_pool: tank
     bridge: br0
 
@@ -163,11 +189,13 @@ tiers:
   # preference order, so losing the box at home does not take the runs-on label
   # down with it — jobs land on EC2 instead.
   #
-  # The order is recorded but does not yet choose: today a node binds itself, so
-  # placement can only accept or refuse the host that asked. Listing several
-  # already removes the hard pin, which is what a fallback needs; preference
-  # starts to bite when the node runs in its own process and the control plane
-  # picks among live hosts.
+  # The order IS honoured where the control plane picks: it walks this list
+  # most-preferred-first over the registered nodes. What does not exist is
+  # choosing when the job is ADMITTED — capacity is one deployment-wide budget,
+  # so billet can accept work no single machine can host. In `--dev` the node
+  # binds itself and placement can only accept or refuse the host that asked.
+  # And with Docker the only provider built, the EC2 half of this cannot be
+  # exercised at all yet.
   #
   # - label: billet-8vcpu-ubuntu-2404
   #   providers: [firecracker, ec2]   # instead of `provider: firecracker`

@@ -136,12 +136,20 @@ func TestAProviderOutsideTheListIsStillRefused(t *testing.T) {
 	}
 }
 
-// The ORDER is recorded even though nothing acts on it yet.
+// THE ENCODING PRESERVES THE ORDER, which matters because the order is a
+// preference and not a set.
 //
-// Preference is a choice among candidates, and choosing needs a chooser — which
-// arrives when the node runs in its own process and the control plane picks
-// rather than the node binding itself. Recording the order now is what makes
-// that a scheduling change rather than a schema change.
+// Providers is written to the ledger as text and read back by every operation
+// that reloads a lease — Release, transition, Lease(id). nodeplane.pick walks
+// that list most-preferred-first, so a lease that came back from the ledger
+// reordered would land its job on a different machine than the tier asked for.
+//
+// WHAT THIS DOES NOT PROVE, because an earlier version of this comment claimed
+// it: the launch path does not read a round-tripped lease. insertLease returns a
+// freshly built Lease carrying Providers straight from the tier config, and that
+// is the value the listener holds and hands to Launch. The round trip is what a
+// RELOAD gets, so this test is about the encoding surviving, not about the
+// chooser consulting it on the happy path.
 func TestThePreferenceOrderIsPreserved(t *testing.T) {
 	t.Parallel()
 
