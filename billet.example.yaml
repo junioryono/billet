@@ -2,7 +2,9 @@
 #
 # THIS FILE DOES NOT RUN AS SHIPPED. It describes the intended deployment, which
 # is Firecracker, and the Firecracker provider is not built — `billet server
-# --dev` refuses it. Two edits make it start today, and BOTH are needed:
+# --dev` refuses it. Two edits HERE make it start today, and both are needed —
+# the README's quickstart lists what else the file needs (the github: block, a
+# writable server.state_dir) and the Docker daemon it assumes:
 #
 #   1. `provider: firecracker` -> `provider: docker`, in the node section and in
 #      every tier.

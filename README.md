@@ -67,7 +67,11 @@ no webhook endpoint, no tunnel.
 
 ```bash
 git clone https://github.com/junioryono/billet && cd billet && go build ./cmd/billet
+sudo install -m 0755 billet /usr/local/bin/billet    # or keep it local and call ./billet
 ```
+
+That second line is what makes the bare `billet` in every command below work; `go build` leaves the
+binary in the current directory and installs nothing.
 
 Once a release exists:
 
@@ -189,8 +193,9 @@ built. What works **today**:
 | Release pipeline | Tagged releases with checksums, `.deb`/`.rpm` with systemd units, and the install script — **built and never yet run: there are no tags, so no release exists to install.** Build from source until there is one |
 | Multi-backend tiers | One label can name several providers and be placed on any of them, and the preference order IS honoured when the control plane picks among registered nodes (`nodeplane.pick` walks it most-preferred-first). What is missing is choosing at escrow time, against per-node capacity and cost ([#30](https://github.com/junioryono/billet/issues/30)) — and Docker is the only provider built, so the ordering cannot be exercised yet |
 
-**Not built:** Firecracker, Apple Silicon and EC2 providers; the cache; sticky disks; the scheduler
-that would make provider preference and a cost policy mean something; observability; the dashboard.
+**Not built:** Firecracker, Apple Silicon and EC2 providers; the cache; sticky disks; admission-time
+placement, which is what would let provider preference and a cost policy govern whether work is taken
+on at all rather than only which registered node runs it; observability; the dashboard.
 
 **billet is a one-machine product today, and the reasons are specific rather than general.** Capacity
 is a single deployment-wide budget rather than a figure per machine, so two hosts of different sizes
@@ -246,7 +251,7 @@ Everything below describes the intended design. Where a thing is not built, it s
 
 ## Quickstart
 
-> **The example config does not run as shipped**, and it takes two edits rather than one. It
+> **The example config does not run as shipped**, and the provider is not the only thing to change. It
 > describes the intended Firecracker deployment, and that provider is not built, so `--dev` refuses
 > it. Change `provider: firecracker` to `provider: docker` in the `node:` section and in every tier
 > — **and** change each tier's `image:` to a Docker image containing the GitHub runner, such as
@@ -264,17 +269,20 @@ billet server --dry-run --config ./billet.yaml  # first contact: polls, accepts 
 billet server --dev --config ./billet.yaml     # runs jobs
 ```
 
-**The four edits**, because nothing writes the file for you:
+**The three edits**, because nothing writes the file for you:
 
 1. **Paste the `github:` block** that `github-app create` printed. It prints; it does not edit your
-   config, so `app_id` and `installation_id` stay `0` and `billet check` says so.
-2. **`private_key_path`** — point it where `github-app create` actually wrote the key. The example
-   says `/etc/billet/app-private-key.pem`, which is root-owned.
-3. **`provider: docker` and a runner `image:`**, in the `node:` section and every tier — see the
+   config, so `app_id` and `installation_id` stay `0` and `billet check` says so. The block already
+   carries `private_key_path` pointing at the key it just wrote, so pasting it settles that too.
+2. **`provider: docker` and a runner `image:`**, in the `node:` section and every tier — see the
    warning above.
-4. **Both `state_dir`s** default to `/var/lib/billet/...`, which an unprivileged `billet server`
-   cannot create. Point them somewhere you can write (`./state/server`, `./state/node`) or
-   pre-create them with the right owner.
+3. **`server.state_dir`** defaults to `/var/lib/billet/server`, which an unprivileged `billet server`
+   cannot create. Point it somewhere you can write (`./state/server`) or pre-create it with the right
+   owner. `node.state_dir` only matters for a standalone `billet node`; `--dev` never reads it.
+
+**And Docker has to be there.** `billet check` never touches it, but `server --dev` calls
+`docker ps` before it polls anything, to re-adopt containers from a previous run. No CLI, no running
+daemon, or no permission on the socket, and it stops there.
 
 `--config` is not optional here. billet deliberately does **not** read a
 `billet.yaml` from the working directory — a server started from a directory
@@ -411,7 +419,7 @@ rewriting placement at the same time.
 | P6 — observability, SSH-into-a-job | ⬜ |
 | P7 — Apple Silicon provider (macOS + Linux arm64) | ⬜ |
 | P8 — EC2 provider, cloud-hosted control plane, provider failover | ⬜ [#32](https://github.com/junioryono/billet/issues/32) |
-| P9 — per-node capacity, real placement, addressed teardown. **A prerequisite of P8**, not a sequel: failover means nothing until something chooses | ⬜ [#21](https://github.com/junioryono/billet/issues/21) [#30](https://github.com/junioryono/billet/issues/30) [#31](https://github.com/junioryono/billet/issues/31) |
+| P9 — per-node capacity, admission-time placement, addressed teardown. **A prerequisite of P8**, not a sequel: picking among registered nodes already works, but failover needs the decision made before the work is accepted | ⬜ [#21](https://github.com/junioryono/billet/issues/21) [#30](https://github.com/junioryono/billet/issues/30) [#31](https://github.com/junioryono/billet/issues/31) |
 | P10 — dashboard, signed releases, public launch | 🚧 releases and packages done; signing and the dashboard are not |
 | P11 — AWS Terraform | ⬜ |
 
