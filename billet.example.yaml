@@ -1,8 +1,8 @@
 # billet configuration — copy to billet.yaml and edit.
 #
 # THIS FILE DOES NOT RUN AS SHIPPED. It describes the intended deployment, which
-# is Firecracker, and the Firecracker provider is not built — `billet server
-# --dev` refuses it. Two edits HERE make it start today, and both are needed —
+# is Firecracker, and the Firecracker provider is not built — `billet node`
+# refuses it. Two edits HERE make it start today, and both are needed —
 # the README's quickstart lists what else the file needs (the github: block, a
 # writable server.state_dir) and the Docker daemon it assumes:
 #
@@ -20,10 +20,20 @@
 # warm_pool, and the whole `firecracker:` block is unused. Docker shares the
 # host kernel and is for trials rather than for untrusted code.
 #
-# This example is the single-machine deployment: control plane and compute host
-# in one process, started with `billet server --dev`. Split them by running
-# `billet server` here and `billet node` on each additional machine, with the
-# node's server_addr pointing back at this listen address.
+# This example is the single-machine deployment, which is TWO PROCESSES reading
+# this one file:
+#
+#   billet server --config ./billet.yaml     # the control plane
+#   billet node   --config ./billet.yaml     # the compute host
+#
+# They talk over the loopback address below. Nothing is exposed to the network
+# and no certificates are involved — a control plane listening only on loopback
+# serves plain HTTP, because there is nothing between two processes on one box to
+# authenticate. (Setting node.tls against a loopback server is refused for that
+# reason.) Add machines by running `billet node` on each with its own copy of
+# this file, its server_addr pointing at this one, and a bundle from
+# `billet ca issue` — at which point the server has to listen on an address those
+# machines can reach, and the wire becomes mTLS.
 
 server:
   # Nodes dial the server; the server never dials out except to GitHub. On a
@@ -119,11 +129,29 @@ github:
   installation_id: 0
   private_key_path: /etc/billet/app-private-key.pem
 
+# Read by `billet node`. On a single machine this sits beside the server section
+# above and the two processes share the file.
 node:
   name: epyc-1
   server_addr: 127.0.0.1:7717
   provider: firecracker
+
+  # NODE-LOCAL DATA: the generation pointer store, the image cache, and this
+  # host's mTLS identity. It is not the server's state_dir and does not need to
+  # be — a node with no certificate takes its deployment identity from the
+  # `server:` section in this same file, which is what lets the two directories
+  # differ on one machine.
+  #
+  # A node whose file has NO server section (the ordinary multi-machine case)
+  # gets its identity from its certificate instead.
   state_dir: /var/lib/billet/node
+
+  # Where this host takes the deployment lock, which stops two processes managing
+  # the same containers. It belongs to the node because the node is what runs
+  # them; the control plane takes no lock. Leave it unset for the per-user
+  # default. (This key used to be `server.lock_dir` too — it is node-only now.)
+  #
+  # lock_dir: /run/billet/locks
 
   # WHAT THIS MACHINE CONTRIBUTES, which is not the same as what it has. Unset
   # means "everything I can detect", which is what a dedicated box wants.

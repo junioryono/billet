@@ -569,8 +569,9 @@ func (p *Plane) Register(
 	}
 
 	// REFUSED HERE, PERMANENTLY, rather than by the ledger. The allocator also
-	// rejects a contribution of nothing — it has to, because --dev registers
-	// without passing through this function — but an error from the registrar is
+	// rejects a contribution of nothing too, which is now belt and braces rather
+	// than a second entrance: --dev used to register straight into the ledger
+	// without passing through here. But an error from the registrar is
 	// treated as an OUTAGE below and answered 503, so the node retries. A node
 	// whose config offers no capacity would then retry forever, every backoff,
 	// and nothing in the loop would ever say why. Observed doing exactly that in

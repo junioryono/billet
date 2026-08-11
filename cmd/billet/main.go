@@ -3,8 +3,8 @@
 // One binary, two roles. `billet server` is the control plane: it long-polls
 // GitHub for assigned jobs, owns the capacity ledger, and tells nodes what to
 // launch. `billet node` is a compute host: it runs a provider and launches
-// instances. `billet server --dev` runs both in one process, which is the
-// single-machine deployment.
+// instances. A single-machine deployment runs both, side by side, talking over
+// loopback — there is no combined mode and no flag for one.
 package main
 
 import (
@@ -73,7 +73,7 @@ type command struct {
 // widening every command's signature or, worse, becoming package state.
 func commands(lc *lifecycle) []command {
 	return []command{
-		{"server", "run the control plane (add --dev to also run a node here)",
+		{"server", "run the control plane (run `billet node` alongside it to run jobs here)",
 			func(ctx context.Context, args []string) error { return cmdServer(ctx, lc, args) }},
 		{"node", "run a compute host that dials a control plane",
 			func(ctx context.Context, args []string) error { return cmdNode(ctx, lc, args) }},
@@ -151,7 +151,7 @@ func newFlagSet(name string) *flag.FlagSet {
 }
 
 // parse rejects leftover positional arguments, so a typo like
-// `billet server --dev extra` fails instead of being silently ignored.
+// `billet server --dry-run extra` fails instead of being silently ignored.
 func parse(fs *flag.FlagSet, args []string) error {
 	return parseWithArgs(fs, args, 0)
 }
@@ -232,7 +232,6 @@ func addConfigFlag(fs *flag.FlagSet) *string {
 func cmdServer(ctx context.Context, lc *lifecycle, args []string) error {
 	fs := newFlagSet("billet server")
 	cfgPath := addConfigFlag(fs)
-	dev := fs.Bool("dev", false, "also run a node in this process (single-machine deployment)")
 	dryRun := fs.Bool("dry-run", false,
 		"connect to GitHub and advertise ZERO capacity: proves the whole path without accepting a job")
 	if err := parse(fs, args); err != nil {
@@ -246,91 +245,96 @@ func cmdServer(ctx context.Context, lc *lifecycle, args []string) error {
 	if cfg.Server == nil {
 		return fmt.Errorf("%s has no server section", *cfgPath)
 	}
-	if *dev && cfg.Node == nil {
-		return fmt.Errorf("--dev needs a node section in %s", *cfgPath)
-	}
-
-	// ONLY --dev RUNS BOTH ROLES, so only --dev needs them to agree. Enforcing it
-	// at load would refuse a shared configuration file on a node-only host merely
-	// because the unused server section names a controller's lock directory.
-	if *dev && !cfg.LockDirsAgree() {
-		return fmt.Errorf(
-			"--dev runs a server and a node in one process, but server.lock_dir (%q) and "+
-				"node.lock_dir (%q) differ; they would take two locks for one deployment "+
-				"identity and both manage the same containers",
-			cfg.Server.LockDir, cfg.Node.LockDir)
-	}
-
 	if cfg.GitHub == nil {
 		return fmt.Errorf("%s has no github section; run `billet github-app create` first", *cfgPath)
 	}
 
-	// STANDALONE `billet server` IS THE POINT OF THE SPLIT, and it used to be
-	// refused. The old guard said "without --dev nothing in this process can
-	// launch a job", which was true until a node could dial in from another
-	// machine. It is false now, and leaving it would have made the whole feature
-	// unreachable from the command line.
+	// THE CONTROL PLANE RUNS NO COMPUTE, and that is now the only shape. It used
+	// to be able to host a node in this process under --dev, which was the
+	// single-machine deployment; that is two processes today, `billet server` and
+	// `billet node`, talking over loopback.
 	//
-	// A control plane with no nodes yet is not an error, but it is not free
-	// either, and the earlier version of this comment said it was: "jobs queue
-	// until one registers". They do not. Capacity is advertised from the budget
-	// without consulting node availability, so a job assigned while the fleet is
-	// empty is ACQUIRED and then fails to launch with ErrNoNode. billet releases
-	// its own lease and has no way to decline the assignment, so it stays with
-	// GitHub until the pickup deadline and is requeued a bounded number of times.
-	// Start the nodes first.
+	// A control plane with no nodes advertises nothing, so an empty fleet is
+	// harmless: GitHub is told zero and assigns nothing. That is a recent
+	// property and worth stating, because the version of this comment that stood
+	// here through the --dev era described the opposite — capacity came from the
+	// budget alone, so a job assigned to an empty fleet was ACQUIRED and then
+	// failed to launch with ErrNoNode. Advertisement now asks the fleet.
 	//
 	// --dry-run remains for proving the GitHub path while advertising zero.
 
-	return runServer(ctx, lc, cfg, *dryRun, *dev)
+	return runServer(ctx, lc, cfg, *dryRun)
 }
 
 // runServer starts the control plane and blocks until it is told to stop.
-// claimDeployment reads this installation's identity and takes the host-wide
-// lock on it, returning both.
+// claimNodeDeployment reads this host's identity and takes the host-wide lock on
+// it.
 //
-// MUST BE CALLED BEFORE state.Open AND BEFORE newProvider. state.Open creates
-// files, runs integrity checks and applies migrations, so claiming afterwards
-// let a process that is about to be REFUSED first migrate the database it was
-// refused the right to use — start an old copied backup while the original is
-// live and the copy is silently upgraded on its way to the error. newProvider is
-// the other side of it: nothing may touch a container before the right to manage
-// containers under this identity is established.
+// THE LOCK IS THE NODE'S ALONE, because the node is the role that manages
+// containers. It stops two processes carrying one deployment identity from
+// managing the same compute, and a control plane manages none — so the server
+// takes no lock, and `server.lock_dir` is gone.
 //
-// Split out of runServer to be testable. That covers the logic and NOT the call
-// site: deleting the call from runServer still leaves these tests green, and no
-// test in this repo would notice. Recorded rather than papered over.
-func claimDeployment(cfg *config.Config) (string, *state.DeploymentLock, error) {
-	return claimIdentity(cfg.Server.StateDir, cfg.Server.LockDir, cfg.Server.AllowUnlockedDeployment)
-}
-
-// claimNodeDeployment is the same claim for a standalone node.
+// That is not tidying, it is a requirement. The lock is EXCLUSIVE per identity,
+// so a server that took it would keep a node on the same machine from ever
+// starting — and one machine running both is the single-machine deployment,
+// which is now precisely `billet server` and `billet node` side by side.
 //
-// SHARES claimIdentity with the server rather than repeating it, because the two
-// roles can run on one host and the thing that must not diverge is exactly this:
-// where the lock lands. A second copy of these four lines is how one of them
-// keeps the default while the other honours a configured directory, after which
-// both processes manage the same containers.
+// MUST BE CALLED BEFORE newProvider: nothing may touch a container before the
+// right to manage containers under this identity is established.
 func claimNodeDeployment(cfg *config.Config, bundle *wirecert.Bundle) (string, *state.DeploymentLock, error) {
-	// A NODE JOINS A DEPLOYMENT, IT DOES NOT FOUND ONE. Without a bundle there is
-	// nothing to join — config validation has already established that means a
-	// control plane inside this machine — so minting is correct. With one, the
-	// certificate says which installation this host belongs to, and inventing a
-	// different answer produces a node the control plane refuses forever.
-	if bundle == nil {
-		return claimIdentity(cfg.Node.StateDir, cfg.Node.LockDir, false)
-	}
-
-	deployment, err := bundle.Deployment()
+	// A NODE JOINS A DEPLOYMENT, IT DOES NOT FOUND ONE, and the whole question is
+	// what tells it which one. A certificate answers directly. Without one, the
+	// node can only reach a control plane inside this machine — validation
+	// guarantees that, because a certless node may dial nothing but loopback —
+	// and if this file also describes that control plane, its state directory
+	// holds the answer.
+	//
+	// MINTING ITS OWN WAS WRONG, and invisibly so. A state directory with no
+	// identity MINTS a fresh random one, so a node falling back to its own
+	// directory invented a deployment nobody else had heard of. The server had
+	// already minted a different one in its own directory — the shipped example
+	// config gives the two roles different paths — and the plane then refused the
+	// node for belonging elsewhere. That refusal is ErrRefused, which the node
+	// loop reads as a verdict rather than an outage, so the process exits and
+	// nothing ever repairs it. The single-machine deployment simply did not
+	// start, and `--dev` hid it by never registering over the wire at all.
+	deployment, err := nodeDeploymentID(cfg, bundle)
 	if err != nil {
 		return "", nil, err
 	}
 
-	if _, err := state.AdoptDeploymentID(cfg.Node.StateDir, deployment); err != nil {
-		return "", nil, err
+	if deployment != "" {
+		if _, err := state.AdoptDeploymentID(cfg.Node.StateDir, deployment); err != nil {
+			return "", nil, err
+		}
 	}
 
-	return claimIdentity(cfg.Node.StateDir, cfg.Node.LockDir, false)
+	return claimIdentity(cfg.Node.StateDir, cfg.Node.LockDir, cfg.Node.AllowUnlockedDeployment)
+}
+
+// nodeDeploymentID is the identity this host must claim, or "" when only its own
+// state directory can say.
+//
+// The certificate outranks the config file: a bundle is proof issued BY the
+// control plane, while a `server:` section is merely a description sitting next
+// to the node's own. They agree in every sane deployment, and where they do not,
+// the one the plane will actually check is the certificate.
+func nodeDeploymentID(cfg *config.Config, bundle *wirecert.Bundle) (string, error) {
+	if bundle != nil {
+		return bundle.Deployment()
+	}
+
+	if cfg.Server != nil {
+		// Founding it here is correct if the server has not started yet: whichever
+		// role runs first mints the identity, and the other reads that same file.
+		return state.DeploymentID(cfg.Server.StateDir)
+	}
+
+	// A node whose file says nothing about the control plane it dials. Its own
+	// directory is the only answer available, so it must already hold the right
+	// one — see the node.state_dir note in billet.example.yaml.
+	return "", nil
 }
 
 // claimIdentity reads an installation identity and takes the host-wide lock.
@@ -380,10 +384,11 @@ func claimIdentity(
 // nodeContribution is what this host offers: what it detected, unless its own
 // config said otherwise.
 //
-// ONE DEFINITION FOR BOTH ROLES. `billet node` sends this over the wire and
-// `billet server --dev` writes it to the ledger directly, and if the two
-// resolved it differently the same config file would describe a different
-// machine depending on which process happened to run it.
+// ONE DEFINITION, ONE CALLER, now that `billet node` is the only way a host
+// joins. It used to have two: --dev wrote the contribution straight into the
+// ledger while the node sent it over the wire, and if those ever resolved it
+// differently the same file would describe a different machine depending on
+// which process happened to read it.
 func nodeContribution(cfg *config.Config) (config.Contribution, error) {
 	vcpu, memory, err := config.DetectHostCapacity()
 	if err != nil {
@@ -393,7 +398,7 @@ func nodeContribution(cfg *config.Config) (config.Contribution, error) {
 	return cfg.Node.Contribution(vcpu, memory), nil
 }
 
-func runServer(ctx context.Context, lc *lifecycle, cfg *config.Config, dryRun, dev bool) error {
+func runServer(ctx context.Context, lc *lifecycle, cfg *config.Config, dryRun bool) error {
 	// Built by the SHARED constructor, so the server and teardown authenticate
 	// identically. Two near-identical constructions is how one of them ends up
 	// pointed at a different organization than the other.
@@ -402,37 +407,22 @@ func runServer(ctx context.Context, lc *lifecycle, cfg *config.Config, dryRun, d
 		return err
 	}
 
-	// THE IDENTITY IS CLAIMED BEFORE THE DATABASE IS OPENED, and the ordering is
-	// the point rather than tidiness. state.Open creates files, runs integrity
-	// checks and applies migrations — so acquiring the lock afterwards let a
-	// process that is about to be REFUSED first migrate the database it was
-	// refused the right to use. Start an old copied backup while the original is
-	// live and the copy would be silently upgraded on its way to the error.
+	// READ, NOT CLAIMED. The host-wide lock exists to stop two processes managing
+	// one deployment's containers, and a control plane manages none — the node
+	// takes that lock. A server that took it too would be holding the identity a
+	// co-resident node needs, which is the single-machine deployment refusing to
+	// start.
 	//
-	// Nothing here touches a container either: this runs before newProvider.
-	// CLAIMED FOR EVERY SERVER, not only for --dev. The node wire refuses a node
-	// whose deployment identity differs from this control plane's, so a server
-	// that never learned its own would compare every node against "" and refuse
-	// the entire fleet — the feature failing closed for a reason nobody could see.
+	// The identity itself is still required: the node wire refuses a node whose
+	// deployment differs from this plane's, so a server that never learned its
+	// own would compare every node against "" and refuse the entire fleet — the
+	// feature failing closed for a reason nobody could see.
+	//
+	// FOUNDED HERE IN THE ORDINARY CASE, before the database is opened. Whichever
+	// role starts first mints it; the other reads that same file.
 	deployment, err := state.DeploymentID(cfg.Server.StateDir)
 	if err != nil {
 		return err
-	}
-
-	if dev {
-		var deploymentLock *state.DeploymentLock
-
-		deployment, deploymentLock, err = claimDeployment(cfg)
-		if err != nil {
-			return err
-		}
-
-		defer func() {
-			if err := deploymentLock.Release(); err != nil {
-				slog.Default().Warn("could not release the deployment lock; a restart may "+
-					"have to wait for the kernel to drop it", "error", err)
-			}
-		}()
 	}
 
 	db, err := state.Open(ctx, cfg.Server.StateDir)
@@ -493,77 +483,15 @@ func runServer(ctx context.Context, lc *lifecycle, cfg *config.Config, dryRun, d
 	// none: its map is empty. Rows left by the previous process would otherwise
 	// back advertisements for machines this one has never heard from.
 	//
-	// Sweeping AFTER --dev registered its in-process node marked that node dead
-	// and nothing ever brought it back — it does not register over the wire, so
-	// there is no second chance. The colocated runner would have advertised zero
-	// forever, on the one deployment shape where there is no other machine.
+	// Every node re-registers over the wire within a poll, so the cost is a brief
+	// zero that is also the truth. That was NOT true while --dev ran a node in
+	// this process: it registered straight into the ledger and never dialled the
+	// wire, so a sweep after it registered marked it dead with no second chance —
+	// the colocated runner advertised zero forever, on the one deployment shape
+	// with no other machine to fall back on. Deleting that path deleted the
+	// ordering hazard with it.
 	if err := allocator.ForgetEveryNode(ctx); err != nil {
 		return fmt.Errorf("server: could not clear the fleet's liveness: %w", err)
-	}
-
-	if dev {
-		// deployment and its host-wide lock were claimed above, before the database
-		// was opened.
-		p, err := newProvider(cfg, deployment)
-		if err != nil {
-			return err
-		}
-
-		// REGISTERED BEFORE ANYTHING IS PLACED ON IT. A node exists in the ledger
-		// because it said so, and placement compares a lease against the provider
-		// the host REGISTERED rather than one a catalog claims — so Bind refuses
-		// every lease until this row is here.
-		//
-		// --dev registers directly rather than over the wire, so the contribution
-		// is resolved here exactly as nodeclient resolves it for a remote host.
-		// Two paths to one ledger row, and they must agree about what this machine
-		// offers or the same config would mean different things depending on
-		// whether the node happened to be in this process.
-		contribution, err := nodeContribution(cfg)
-		if err != nil {
-			return err
-		}
-
-		for _, w := range contribution.Warnings {
-			slog.Default().Warn(w, "node", cfg.Node.Name)
-		}
-
-		if _, err := allocator.RegisterNode(ctx, alloc.NodeRegistration{
-			Name:     cfg.Node.Name,
-			Provider: cfg.Node.Provider,
-			Site:     cfg.Node.Site,
-			VCPU:     contribution.VCPU,
-			Memory:   contribution.Memory,
-		}); err != nil {
-			return err
-		}
-
-		// Validation already parsed this, so it cannot fail here — but reading it
-		// through the same accessor keeps one definition of what the string means.
-		maxCustody, err := cfg.Node.MaxCustodyDuration()
-		if err != nil {
-			return err
-		}
-
-		runner := node.New(allocator, cfg.Node.Name, wiring.JITSource{Client: client}, p,
-			cfg.Tiers, slog.Default(), node.WithMaxCustody(maxCustody))
-
-		// CLEARED BEFORE A SINGLE JOB IS ADMITTED.
-		//
-		// Everything this backend is running belongs to a process that is gone —
-		// this one has empty maps and can neither heartbeat those leases nor notice
-		// their completion. Left alone, such a container runs forever on capacity
-		// the reaper will shortly hand back out, so the host ends up over-committed
-		// by exactly what the crash leaked.
-		//
-		// Fatal on failure, deliberately. Not knowing what is already running is
-		// not the same as nothing running, and starting anyway turns a recoverable
-		// mess into a compounding one.
-		if err := runner.Recover(ctx); err != nil {
-			return err
-		}
-
-		opts = append(opts, server.WithNodeRunner(runner))
 	}
 
 	// THE NODE WIRE IS SERVED WHETHER OR NOT ANY NODE EXISTS YET.
@@ -593,18 +521,11 @@ func runServer(ctx context.Context, lc *lifecycle, cfg *config.Config, dryRun, d
 	// capacity advertised until somebody happened to need it.
 	go nodes.Watch(ctx)
 
-	// THE REMOTE PLANE DRIVES COMPUTE WHENEVER THERE IS NO LOCAL NODE.
-	//
-	// --dev already attached an in-process runner above, and it wins for that
-	// process: a single-machine deployment should not send commands to itself
-	// over a loopback socket to reach a runner it already holds. Without --dev
-	// this is the only thing that can launch anything, and forgetting to attach
-	// it — which is exactly what the first version of this branch did — leaves a
-	// control plane that serves the node wire, accepts registrations, and then
-	// never sends a single command.
-	if !dev {
-		opts = append(opts, server.WithNodeRunner(nodes.NewRunner()))
-	}
+	// THE REMOTE PLANE DRIVES ALL COMPUTE, and it is now the only thing that can.
+	// Forgetting to attach it — which is exactly what the first version of the
+	// node split did — leaves a control plane that serves the node wire, accepts
+	// registrations, and then never sends a single command.
+	opts = append(opts, server.WithNodeRunner(nodes.NewRunner()))
 
 	plane := server.New(allocator, wiring.Provisioner{Client: client}, cfg.Tiers, owner, slog.Default(), opts...)
 	if err := plane.Run(ctx); err != nil {
@@ -763,7 +684,7 @@ func newProvider(cfg *config.Config, deployment string) (provider.Provider, erro
 		return docker.New(deployment, docker.WithLogger(slog.Default())), nil
 
 	case config.ProviderFirecracker, config.ProviderTart, config.ProviderEC2:
-		return nil, fmt.Errorf("%w: the %s provider is not built yet; --dev currently runs the "+
+		return nil, fmt.Errorf("%w: the %s provider is not built yet; billet currently runs the "+
 			"docker backend, which shares the host kernel and is for trials rather than for "+
 			"untrusted work", errNotImplemented, cfg.Node.Provider)
 

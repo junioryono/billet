@@ -57,6 +57,15 @@ func TestADestroyGoesOnlyToTheNodeHoldingTheJob(t *testing.T) {
 		}
 	}()
 
+	// PARKED BEFORE THE LAUNCH IS DISPATCHED, which is what makes this
+	// deterministic. A dispatched command is discarded once the command timeout
+	// elapses, so starting the poller and the launch together was a race against
+	// the scheduler: under the full suite's parallelism the poll goroutine could
+	// simply not run inside that window, the launch would expire unclaimed, and
+	// the test failed for a reason that had nothing to do with addressing.
+	waitFor(t, "the holder to park on a poll",
+		func() bool { return p.WaitersForTest("holder") == 1 })
+
 	launched := make(chan error, 1)
 
 	go func() {
@@ -68,7 +77,7 @@ func TestADestroyGoesOnlyToTheNodeHoldingTheJob(t *testing.T) {
 
 	select {
 	case <-taken:
-	case <-time.After(5 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("the holder never took the launch")
 	}
 
@@ -77,14 +86,8 @@ func TestADestroyGoesOnlyToTheNodeHoldingTheJob(t *testing.T) {
 
 	// Nobody is polling now, so a dispatched destroy sits in a queue where it can
 	// be counted.
-	deadline := time.Now().Add(5 * time.Second)
-	for p.QueuedForTest("holder") == 0 {
-		if time.Now().After(deadline) {
-			t.Fatal("the machine holding the job was never asked to destroy it")
-		}
-
-		time.Sleep(time.Millisecond)
-	}
+	waitFor(t, "the machine holding the job to be asked to destroy it",
+		func() bool { return p.QueuedForTest("holder") > 0 })
 
 	// NOTHING ELSE WAS ASKED. A bystander receiving a destroy for a container it
 	// has never heard of answers "not found", which is harmless in itself and is
