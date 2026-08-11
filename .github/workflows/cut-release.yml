@@ -1,0 +1,123 @@
+name: Cut Release
+
+# The manual "ship main" button. Press it and billet cuts a release branch, tags
+# it, and builds it.
+#
+# THE BRANCH OUTLIVES THE RELEASE, which is the point of the shape. One branch
+# per MINOR version carries every patch on it: cut release/v0.4 and tag v0.4.0,
+# then a hotfix later is a commit on that same branch tagged v0.4.1 — without
+# dragging in whatever main has done since. A branch per release would need a new
+# one for every hotfix and could not do that.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to cut, e.g. v0.4.0. Leave blank for the next minor.'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  cut:
+    name: Cut the release branch and tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Work out what to cut
+        id: plan
+        env:
+          # Through the environment, not interpolated into the script. A
+          # workflow_dispatch input is attacker-controlled in the sense that
+          # matters here: `"; rm -rf /` in a expression-substituted string is a
+          # shell injection, and this one runs with contents: write.
+          REQUESTED: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          newest="$(git tag --list 'v*' --sort=-v:refname | head -n1)"
+
+          if [ -n "${REQUESTED}" ]; then
+            tag="${REQUESTED}"
+          elif [ -z "${newest}" ]; then
+            # The first release. v0.1.0 rather than v1.0.0: billet is pre-alpha,
+            # and staying on v0 also means the module path never needs a /vN
+            # suffix, which Go requires from major version 2 onwards.
+            tag="v0.1.0"
+          else
+            tag="$(echo "${newest}" | awk -F. '{ sub(/^v/, "", $1); printf "v%d.%d.0\n", $1, $2 + 1 }')"
+          fi
+
+          # SEMVER OR NOTHING. GoReleaser refuses a non-semver tag, and Go refuses
+          # to resolve one as a module version, so a typo caught here is a typo
+          # that would otherwise fail after the branch had been created.
+          if ! echo "${tag}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::${tag} is not a semantic version like v0.4.0" >&2
+            exit 1
+          fi
+
+          if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            echo "::error::${tag} already exists" >&2
+            exit 1
+          fi
+
+          # Refuse to go backwards. `sort -V` puts the newest last, so if the
+          # requested tag is not strictly newer than what exists, it sorts first.
+          if [ -n "${newest}" ] && [ "$(printf '%s\n%s\n' "${newest}" "${tag}" | sort -V | tail -n1)" != "${tag}" ]; then
+            echo "::error::${tag} is not newer than ${newest}" >&2
+            exit 1
+          fi
+
+          branch="release/$(echo "${tag}" | awk -F. '{ print $1 "." $2 }')"
+
+          {
+            echo "tag=${tag}"
+            echo "branch=${branch}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Cut it
+        env:
+          TAG: ${{ steps.plan.outputs.tag }}
+          BRANCH: ${{ steps.plan.outputs.branch }}
+        run: |
+          set -euo pipefail
+
+          # The branch may already exist: that is what a second patch on the same
+          # minor series looks like, and it is the case this shape exists for.
+          if git ls-remote --exit-code --heads origin "${BRANCH}" >/dev/null 2>&1; then
+            echo "${BRANCH} already exists; tagging its tip rather than main"
+            git fetch origin "${BRANCH}:${BRANCH}"
+            git checkout "${BRANCH}"
+          else
+            git checkout -b "${BRANCH}"
+            git push origin "${BRANCH}"
+          fi
+
+          git tag -a "${TAG}" -m "${TAG}"
+          git push origin "${TAG}"
+
+          {
+            echo "## Cut \`${TAG}\`"
+            echo ""
+            echo "From \`${BRANCH}\` at \`$(git rev-parse --short HEAD)\`. The release build is running."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Called rather than triggered: a tag pushed with GITHUB_TOKEN above does not
+  # start a workflow of its own.
+  release:
+    needs: cut
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.cut.outputs.tag }}
+    permissions:
+      contents: write

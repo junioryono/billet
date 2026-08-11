@@ -68,6 +68,15 @@ jobs:
       - name: gofmt
         run: make fmt-check
 
+      # A broken release config should fail on the PR that broke it, not at the
+      # moment somebody presses the release button. `check` is cheap — it parses
+      # and validates, it does not build.
+      - name: Validate the release config
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          version: "~> v2"
+          args: check
+
       - uses: golangci/golangci-lint-action@v9
         with:
           # Pinned, not `latest`: a linter that changes under you turns an

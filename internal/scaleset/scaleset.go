@@ -19,11 +19,17 @@ import (
 	gh "github.com/actions/scaleset"
 
 	"github.com/junioryono/billet/internal/server"
+	"github.com/junioryono/billet/internal/version"
 )
 
-// Version is reported to GitHub as part of the client's system info, so a
+// clientVersion is reported to GitHub as part of the client's system info, so a
 // deployment showing up in their telemetry is identifiable as billet.
-const Version = "0.0.0-dev"
+//
+// A FUNCTION, NOT A CONST, and that is the whole point of the change. It was
+// `const Version = "0.0.0-dev"`, which nothing else in this repository reads —
+// the only observer is GitHub's telemetry, so every release would have reported
+// itself as a development build and nothing here would ever have noticed.
+func clientVersion() string { return version.Version() }
 
 // Config is what billet needs to reach one organization's scale sets.
 type Config struct {
@@ -60,7 +66,7 @@ func New(cfg Config, log *slog.Logger) (*Client, error) {
 		},
 		SystemInfo: gh.SystemInfo{
 			System:    "billet",
-			Version:   Version,
+			Version:   clientVersion(),
 			Subsystem: "listener",
 		},
 	}, gh.WithLogger(log))

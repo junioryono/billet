@@ -1,0 +1,76 @@
+# GoReleaser builds and publishes what a tag says.
+#
+# It creates no tags of its own — it runs on the one that is already there, and
+# it REFUSES a tag that is not semantic versioning. That is the constraint Go
+# imposes on this project and the one place billet cannot copy a date-stamped
+# release scheme: a module version must be vX.Y.Z, so a tag like
+# "2026.08.11-03.58.56" is not a version Go will ever resolve.
+version: 2
+
+project_name: billet
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: billet
+    main: ./cmd/billet
+    binary: billet
+    env:
+      # NO CGO, ANYWHERE. A node is deployed by copying one static file, which is
+      # the whole reason billet uses a pure-Go SQLite driver.
+      - CGO_ENABLED=0
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    ignore:
+      # macOS on Intel is not a platform billet targets. `make cross` builds the
+      # same three, and the two lists must agree or CI proves something the
+      # release does not ship.
+      - goos: darwin
+        goarch: amd64
+    flags:
+      - -trimpath
+    ldflags:
+      # -s -w strip the symbol and DWARF tables. The version is INJECTED rather
+      # than left to Go's VCS stamping because -trimpath and -buildvcs interact
+      # in ways that would silently produce "(devel)" in a published artifact;
+      # internal/version keeps the stamping as a fallback for ordinary builds.
+      - -s -w
+      - -X github.com/junioryono/billet/internal/version.version={{.Version}}
+      - -X github.com/junioryono/billet/internal/version.commit={{.FullCommit}}
+      - -X github.com/junioryono/billet/internal/version.date={{.Date}}
+
+archives:
+  - id: billet
+    # The install script derives this name from uname, so it is a contract rather
+    # than a preference. Changing it breaks every existing installer.
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+      - LICENSE
+      - billet.example.yaml
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  # FROM COMMIT SUBJECTS, not from a label taxonomy, and that is a deliberate
+  # departure from how the author's other repositories do this. billet's commit
+  # subjects are already declarative sentences written to be read — "A launched
+  # container is told what to run, or it is not launched" — so a PR-label scheme
+  # would be process bought with nothing to show for it.
+  use: git
+  sort: asc
+  filters:
+    exclude:
+      - "^Merge "
+      - "^chore\\(deps\\)"
+
+release:
+  draft: false
+  prerelease: auto
+  # Pre-alpha. Anyone arriving from a tag should be told before they deploy it.
+  header: |
+    billet is pre-alpha. Interfaces, config keys and on-disk formats change
+    without notice. Do not point release or deploy pipelines at it yet.

@@ -1105,7 +1105,38 @@ make lint-fix  # auto-fix what can be auto-fixed
 make fmt       # gofmt -s -w .
 make tidy      # go mod tidy
 make cross     # build every target a node can run on
+make dist      # build the release artifacts locally, exactly as a tag would
 ```
+
+## Releases
+
+Semantic version tags, because Go gives no choice: a module version must be
+`vX.Y.Z`, so a date-stamped tag is not a version Go will ever resolve. Staying on
+`v0` also keeps the module path free of a `/vN` suffix, which is required from
+major version 2 onwards.
+
+One branch per MINOR version, carrying every patch on it:
+
+```
+main ──●──●──●──●──●──●──▶
+        \              \
+         \              release/v0.4 ── v0.4.0
+          release/v0.3 ─┬─ v0.3.0   (cut)
+                        ├─ v0.3.1   (hotfix)
+                        └─ v0.3.2   (hotfix)
+```
+
+Cut with the **Cut Release** workflow (Actions → Run workflow). Blank version
+cuts the next minor; supply one to bump deliberately. A hotfix is a commit on the
+existing `release/vX.Y` branch and a press of the same button with the patch
+version typed in — then **merge that branch back into main**, or the next release
+reverts the fix.
+
+`cut-release.yml` creates the tag and CALLS `release.yml` rather than relying on
+the tag push to trigger it. A ref pushed with `GITHUB_TOKEN` does not start
+another workflow — GitHub's recursion guard — which is why a release button
+usually needs a PAT or an App. A `workflow_call` is not an event, so billet needs
+no repository secrets.
 
 ## Git workflow
 
