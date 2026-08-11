@@ -14,6 +14,10 @@
 *.lock
 /.billet/
 billet.yaml
+# ...except the one the package ships. This rule is for an operator's own
+# config, and it silently swallowed deploy/billet.yaml — so the package built
+# locally and could not have built from a clean checkout at all.
+!deploy/billet.yaml
 *.pem
 *.key
 *.crt

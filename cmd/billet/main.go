@@ -36,6 +36,7 @@ import (
 	"github.com/junioryono/billet/internal/scaleset"
 	"github.com/junioryono/billet/internal/server"
 	"github.com/junioryono/billet/internal/state"
+	"github.com/junioryono/billet/internal/version"
 	"github.com/junioryono/billet/internal/wirecert"
 	"github.com/junioryono/billet/internal/wiring"
 )
@@ -1362,23 +1363,15 @@ func cmdVersion(_ context.Context, args []string) error {
 	if err := parse(fs, args); err != nil {
 		return err
 	}
-	info, ok := debug.ReadBuildInfo()
-	if !ok {
-		fmt.Println("billet (unknown version)")
-		return nil
+
+	// The release version, not just the revision. This printed a bare commit sha,
+	// which is true and unhelpful: an operator comparing what is installed against
+	// what was released has to go and look the sha up.
+	fmt.Printf("billet %s\n", version.String())
+
+	if info, ok := debug.ReadBuildInfo(); ok {
+		fmt.Printf("  go %s\n", info.GoVersion)
 	}
-	rev, dirty := "unknown", ""
-	for _, s := range info.Settings {
-		switch s.Key {
-		case "vcs.revision":
-			rev = s.Value
-		case "vcs.modified":
-			if s.Value == "true" {
-				dirty = " (dirty)"
-			}
-		}
-	}
-	fmt.Printf("billet %s%s\n", rev, dirty)
-	fmt.Printf("  go %s\n", info.GoVersion)
+
 	return nil
 }

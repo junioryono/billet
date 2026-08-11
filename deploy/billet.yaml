@@ -1,0 +1,78 @@
+# billet configuration.
+#
+# Installed by the package and NEVER overwritten by an upgrade — it is marked as
+# a config file, so your edits survive. Nothing starts until this says something
+# true; see billet.example.yaml for every key and why it exists.
+
+server:
+  # Loopback only. Any other address requires client certificates, which billet
+  # mints itself — run `billet ca issue <node>` and copy the bundle to that host.
+  listen: 127.0.0.1:7717
+
+  state_dir: /var/lib/billet/server
+
+  # THE HOST-WIDE DEPLOYMENT LOCK, and the packaged units depend on this exact
+  # path. It stops two processes carrying one deployment identity from managing
+  # the same containers, so every process that can reach the same container
+  # runtime has to meet at the same directory. billet's own default is derived
+  # from HOME, which a systemd service does not have — so leaving this out means
+  # billet refuses to start rather than quietly running without the protection.
+  #
+  # /run/billet is created by the units' RuntimeDirectory=. It is tmpfs, which is
+  # correct: the lock is meaningful per boot.
+  lock_dir: /run/billet/locks
+
+  # ZERO ON PURPOSE, so billet refuses to start until you size it.
+  #
+  # THIS IS THE ONE NUMBER A PACKAGE MUST NOT GUESS. It is the hard ceiling the
+  # allocator escrows against, and it is what stops concurrent tiers from
+  # collectively overcommitting the machine. A plausible default — 4 vCPU, say —
+  # is silently wrong on a smaller host: billet would admit more work than the
+  # machine has, which is the exact failure the global ledger exists to prevent,
+  # and nothing would report it.
+  #
+  # Leave headroom for the host. `billet check` prints how much of the machine is
+  # spoken for once these are set.
+  max_vcpu: 0
+  max_memory: 0
+
+  # How long a stopping billet waits for the jobs it is already running. This is
+  # what makes `systemctl restart` safe rather than a way to fail somebody's CI.
+  #
+  # THE UNITS' TimeoutStopSec IS SIZED FROM THIS. If you lower it, lower theirs
+  # to match; if you raise it, raise theirs FIRST, or systemd's SIGKILL arrives
+  # in the middle of the teardown and strands the containers.
+  #
+  # drain_timeout: 6h
+
+github:
+  org: your-org
+
+  # Populated by `billet github-app create --org your-org`.
+  app_id: 0
+  installation_id: 0
+  private_key_path: /etc/billet/app-private-key.pem
+
+# Uncomment on a machine that should run jobs. On a single-machine deployment,
+# run `billet server --dev` instead of the two units.
+#
+# node:
+#   name: this-host
+#   server_addr: 127.0.0.1:7717
+#   provider: docker
+#   state_dir: /var/lib/billet/node
+#   lock_dir: /run/billet/locks
+#   tls:
+#     cert: /etc/billet/tls/node.crt
+#     key: /etc/billet/tls/node.key
+#     ca: /etc/billet/tls/ca.crt
+
+# Tiers are yours to define. The label is what users put in `runs-on`.
+tiers:
+  - label: billet-2vcpu-ubuntu-2404
+    provider: docker
+    vcpu: 2
+    memory: 8GiB
+    disk: 40GiB
+    image: ghcr.io/actions/actions-runner:latest
+    command: ["./run.sh"]

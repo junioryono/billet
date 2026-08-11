@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -75,17 +76,115 @@ func (d *drainLog) option() Option {
 	return WithLogger(slog.New(slog.NewTextHandler(d, &slog.HandlerOptions{Level: slog.LevelInfo})))
 }
 
+// slowPoll makes a fake session behave like a long poll instead of a spin.
+//
+// A fake that returns ErrNoMessage immediately turns the drain's loop into a hot
+// spin: it takes l.mu on every pass through capacity() and drained(), and under
+// -race that is enough to starve the heartbeat goroutine. A lease whose renewal
+// goes stale is then MOVED OUT of `running` into the cleanup set — the listener
+// says so where it does it, "THE LEASE GOES; THE OBLIGATION DOES NOT" — and
+// drained() only looks at `running`, so the drain reports itself finished and
+// its budget never expires.
+func slowPoll() { time.Sleep(2 * time.Millisecond) }
+
+// outlivesTheDrain is a lease TTL long enough that no lease can expire while a
+// drain is being timed out.
+//
+// A TEST THAT ASSERTS THE DRAIN RAN OUT OF BUDGET MUST OUTLIVE ITS OWN LEASES.
+// The drain ends on whichever comes first: everything finished, or the budget
+// gone. A lease that expires mid-drain empties `running`, so the drain ends by
+// being FINISHED — the other branch, which never writes the line those tests
+// assert on.
+//
+// Tests asserting the drain finished its work do not need this: a lease expiring
+// early pushes them towards the outcome they already expect.
+const outlivesTheDrain = 30 * time.Second
+
 // beganDraining is the drain's announcement of itself.
 const beganDraining = "draining: not taking new work"
 
 // stoppedWaiting is the drain giving up on its budget, as opposed to finishing.
 const stoppedWaiting = "stopped waiting"
 
+// runResult is Run's outcome, observable without being taken.
+//
+// A plain `chan error` cannot be both watched and waited on: awaitDrainStart has
+// to notice that Run returned, and awaitRun has to read what it returned, and a
+// receive in the first consumes the value the second needs. That produced a test
+// that hung waiting for a result something else had already thrown away.
+type runResult struct {
+	done chan struct{}
+
+	mu       sync.Mutex
+	err      error
+	returned bool
+}
+
+// startRun runs the listener and records how it ended.
+func startRun(ctx context.Context, l *Listener) *runResult {
+	r := &runResult{done: make(chan struct{})}
+
+	go func() {
+		err := l.Run(ctx)
+
+		r.mu.Lock()
+		r.err, r.returned = err, true
+		r.mu.Unlock()
+
+		close(r.done)
+	}()
+
+	return r
+}
+
+func (r *runResult) has() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.returned
+}
+
 // awaitDrainStart blocks until the listener says it has begun draining.
-func awaitDrainStart(ctx context.Context, t *testing.T, d *drainLog) {
+//
+// IT ALSO WATCHES FOR RUN RETURNING FIRST, because that is the failure this
+// otherwise reports as "the drain never began" — thirty seconds later, naming
+// the symptom and hiding the cause. A poll or an escrow refill that fails for
+// its own reasons ends Run before the cancel ever arrives; under a loaded
+// machine running fourteen instrumented test binaries, that is a transient
+// database error, and the test should say so rather than describe a drain that
+// was never going to happen.
+func awaitDrainStart(ctx context.Context, t *testing.T, d *drainLog, run *runResult) {
 	t.Helper()
 
-	waitUntil(ctx, t, "the drain to begin", func() bool { return d.saw(beganDraining) })
+	for !d.saw(beganDraining) {
+		// CHECKED IN THIS ORDER, and re-checked after. A drain with nothing to wait
+		// for begins and finishes in the same instant, so Run can have returned by
+		// the time this looks — and the log is the evidence that it drained on the
+		// way out rather than skipping it.
+		if run.has() {
+			if d.saw(beganDraining) {
+				return
+			}
+
+			t.Fatalf("Run returned before the drain began: %v\n%s", run.get(), d.String())
+		}
+
+		select {
+		case <-time.After(2 * time.Millisecond):
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for the drain to begin\n%s", d.String())
+		}
+	}
+}
+
+// get is Run's error. Blocks until it has one.
+func (r *runResult) get() error {
+	<-r.done
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.err
 }
 
 // awaitRun receives Run's result within the deadline.
@@ -93,12 +192,12 @@ func awaitDrainStart(ctx context.Context, t *testing.T, d *drainLog) {
 // A bare `<-runDone` hangs the whole package when a regression stops Run
 // returning, so the failure arrives as a ten-minute timeout with a goroutine
 // dump rather than as this test failing.
-func awaitRun(ctx context.Context, t *testing.T, runDone <-chan error) {
+func awaitRun(ctx context.Context, t *testing.T, run *runResult) {
 	t.Helper()
 
 	select {
-	case err := <-runDone:
-		if err == nil {
+	case <-run.done:
+		if run.get() == nil {
 			t.Error("Run returned nil after its context was cancelled")
 		}
 	case <-ctx.Done():
@@ -188,9 +287,7 @@ func TestADrainReleasesIdleEscrowAndAdvertisesOnlyWhatIsRunning(t *testing.T) {
 		WithDrainGrace(20*time.Second),
 		dl.option())
 
-	runDone := make(chan error, 1)
-
-	go func() { runDone <- l.Run(ctx) }()
+	run := startRun(ctx, l)
 
 	waitUntil(deadline, t, "the job to be running", func() bool { return l.Running() == 1 })
 	waitUntil(deadline, t, "the spare capacity to be escrowed", func() bool { return len(l.Held()) > 0 })
@@ -227,7 +324,7 @@ func TestADrainReleasesIdleEscrowAndAdvertisesOnlyWhatIsRunning(t *testing.T) {
 
 	close(finish)
 
-	awaitRun(deadline, t, runDone)
+	awaitRun(deadline, t, run)
 
 	if got := l.Running(); got != 0 {
 		t.Errorf("Running() = %d after the drain, want 0", got)
@@ -303,9 +400,7 @@ func TestADrainRefusesNewWorkAndStillHearsCompletions(t *testing.T) {
 	l := NewListener(a, "billet-4vcpu-a", session,
 		WithRunner(runner), WithDrainGrace(20*time.Second), dl.option())
 
-	runDone := make(chan error, 1)
-
-	go func() { runDone <- l.Run(ctx) }()
+	run := startRun(ctx, l)
 
 	waitUntil(deadline, t, "the job to be running", func() bool { return l.Running() == 1 })
 
@@ -337,7 +432,7 @@ func TestADrainRefusesNewWorkAndStillHearsCompletions(t *testing.T) {
 	// terminate at all.
 	close(finish)
 
-	awaitRun(deadline, t, runDone)
+	awaitRun(deadline, t, run)
 
 	if got := l.Running(); got != 0 {
 		t.Errorf("Running() = %d after the drain, want 0", got)
@@ -350,7 +445,7 @@ func TestADrainRefusesNewWorkAndStillHearsCompletions(t *testing.T) {
 func TestADrainThatOverrunsItsBudgetDestroysWhatIsLeft(t *testing.T) {
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
 	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
-		alloc.WithLeaseTTL(300*time.Millisecond))
+		alloc.WithLeaseTTL(outlivesTheDrain))
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -367,6 +462,8 @@ func TestADrainThatOverrunsItsBudgetDestroysWhatIsLeft(t *testing.T) {
 		}
 
 		// The completion NEVER arrives. This is the job that outlives the drain.
+		slowPoll()
+
 		return nil, ErrNoMessage
 	}
 
@@ -385,9 +482,7 @@ func TestADrainThatOverrunsItsBudgetDestroysWhatIsLeft(t *testing.T) {
 	l := NewListener(a, "billet-4vcpu-a", session,
 		WithRunner(runner), WithDrainGrace(200*time.Millisecond), dl.option())
 
-	runDone := make(chan error, 1)
-
-	go func() { runDone <- l.Run(ctx) }()
+	run := startRun(ctx, l)
 
 	waitUntil(deadline, t, "the job to be running", func() bool { return l.Running() == 1 })
 
@@ -396,9 +491,9 @@ func TestADrainThatOverrunsItsBudgetDestroysWhatIsLeft(t *testing.T) {
 	// It DRAINED first. Without this the test passes against a listener that goes
 	// straight to the teardown, because the teardown destroys the job and returns
 	// too — the same two observations this asserts on.
-	awaitDrainStart(deadline, t, &dl)
+	awaitDrainStart(deadline, t, &dl, run)
 
-	awaitRun(deadline, t, runDone)
+	awaitRun(deadline, t, run)
 
 	// AND IT STOPPED BECAUSE THE BUDGET RAN OUT, which is the case this test is
 	// named for. A drain that ended for any other reason would satisfy everything
@@ -436,15 +531,28 @@ func TestADrainDoesNotWaitForAPromiseThatWasNeverAssigned(t *testing.T) {
 	deadline, cancelDeadline := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancelDeadline()
 
-	var offered atomic.Bool
+	var (
+		offered atomic.Bool
+		settled = make(chan struct{})
+	)
 
 	session := &fakeSession{}
 	session.onGet = func() (*Message, error) {
 		// An OFFER that is acquired and then never assigned, which is the state
 		// GitHub leaves behind when another scale set wins the same job.
 		if offered.CompareAndSwap(false, true) {
+			close(settled)
+
 			return &Message{MessageID: 1, Available: []Job{{RequestID: 11, RunID: 101}}}, nil
 		}
+
+		// A REAL LONG POLL BLOCKS, AND SO DOES THIS. Returning ErrNoMessage
+		// immediately spins the loop through refillEscrow — a database write — as
+		// fast as the scheduler allows, and on a machine running the whole suite
+		// under -race that is enough to turn a transient error into a certainty.
+		// The listener then ends for its own reasons before the cancel arrives,
+		// and the drain this test is about never happens.
+		<-settled
 
 		return nil, ErrNoMessage
 	}
@@ -461,9 +569,7 @@ func TestADrainDoesNotWaitForAPromiseThatWasNeverAssigned(t *testing.T) {
 		WithDrainGrace(20*time.Second),
 		dl.option())
 
-	runDone := make(chan error, 1)
-
-	go func() { runDone <- l.Run(ctx) }()
+	run := startRun(ctx, l)
 
 	waitUntil(deadline, t, "the offer to be acquired", func() bool { return l.Acquiring() == 1 })
 
@@ -473,9 +579,9 @@ func TestADrainDoesNotWaitForAPromiseThatWasNeverAssigned(t *testing.T) {
 
 	cancel()
 
-	awaitDrainStart(deadline, t, &dl)
+	awaitDrainStart(deadline, t, &dl, run)
 
-	awaitRun(deadline, t, runDone)
+	awaitRun(deadline, t, run)
 
 	if dl.saw(stoppedWaiting) {
 		t.Errorf("the drain waited out its budget for a promise that will never be "+
@@ -528,7 +634,7 @@ func (d deafSession) GetMessage(_ context.Context, _ int64, capacity int) (*Mess
 func TestADrainIsBoundedEvenWhenTheSessionIgnoresItsContext(t *testing.T) {
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
 	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
-		alloc.WithLeaseTTL(300*time.Millisecond))
+		alloc.WithLeaseTTL(outlivesTheDrain))
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -545,6 +651,8 @@ func TestADrainIsBoundedEvenWhenTheSessionIgnoresItsContext(t *testing.T) {
 		}
 
 		// No completion, ever, and no notice taken of any deadline.
+		slowPoll()
+
 		return nil, ErrNoMessage
 	}
 
@@ -553,18 +661,17 @@ func TestADrainIsBoundedEvenWhenTheSessionIgnoresItsContext(t *testing.T) {
 	l := NewListener(a, "billet-4vcpu-a", deafSession{fakeSession: inner},
 		WithRunner(&fakeRunner{}), WithDrainGrace(200*time.Millisecond), dl.option())
 
-	runDone := make(chan error, 1)
-
-	go func() { runDone <- l.Run(ctx) }()
+	run := startRun(ctx, l)
 
 	waitUntil(deadline, t, "the job to be running", func() bool { return l.Running() == 1 })
 
 	cancel()
 
-	awaitDrainStart(deadline, t, &dl)
+	awaitDrainStart(deadline, t, &dl, run)
 
 	select {
-	case err := <-runDone:
+	case <-run.done:
+		err := run.get()
 		if err == nil {
 			t.Error("Run returned nil after its context was cancelled")
 		}
@@ -628,20 +735,19 @@ func TestADrainStopsWhenTheWorkFinishesRatherThanWhenItsBudgetDoes(t *testing.T)
 		WithDrainGrace(20*time.Second),
 		dl.option())
 
-	runDone := make(chan error, 1)
-
-	go func() { runDone <- l.Run(ctx) }()
+	run := startRun(ctx, l)
 
 	waitUntil(deadline, t, "the job to be running", func() bool { return l.Running() == 1 })
 
 	cancel()
 
-	awaitDrainStart(deadline, t, &dl)
+	awaitDrainStart(deadline, t, &dl, run)
 
 	close(finish)
 
 	select {
-	case err := <-runDone:
+	case <-run.done:
+		err := run.get()
 		if err == nil {
 			t.Error("Run returned nil after its context was cancelled")
 		}
@@ -715,9 +821,7 @@ func TestACancellationInsideTheLongPollStillDrains(t *testing.T) {
 	l := NewListener(a, "billet-4vcpu-a", session,
 		WithRunner(&fakeRunner{}), WithDrainGrace(20*time.Second), dl.option())
 
-	runDone := make(chan error, 1)
-
-	go func() { runDone <- l.Run(ctx) }()
+	run := startRun(ctx, l)
 
 	waitUntil(deadline, t, "the job to be running", func() bool { return l.Running() == 1 })
 
@@ -733,7 +837,7 @@ func TestACancellationInsideTheLongPollStillDrains(t *testing.T) {
 	close(release)
 
 	// It drained rather than returning: idle escrow handed back, job untouched.
-	awaitDrainStart(deadline, t, &dl)
+	awaitDrainStart(deadline, t, &dl, run)
 
 	if got := l.Running(); got != 1 {
 		t.Fatalf("the job was abandoned rather than drained: Running() = %d, want 1", got)
@@ -741,7 +845,7 @@ func TestACancellationInsideTheLongPollStillDrains(t *testing.T) {
 
 	close(finish)
 
-	awaitRun(deadline, t, runDone)
+	awaitRun(deadline, t, run)
 
 	if got := l.Running(); got != 0 {
 		t.Errorf("Running() = %d after the drain, want 0", got)
@@ -774,16 +878,14 @@ func TestAnIdleLeaseTheDrainCouldNotReleaseIsReleasedAtShutdown(t *testing.T) {
 	l := NewListener(a, "billet-4vcpu-a", &fakeSession{},
 		WithRunner(&fakeRunner{}), WithDrainGrace(time.Nanosecond), dl.option())
 
-	runDone := make(chan error, 1)
-
-	go func() { runDone <- l.Run(ctx) }()
+	run := startRun(ctx, l)
 
 	waitUntil(deadline, t, "the escrow to be taken", func() bool { return len(l.Held()) > 0 })
 
 	cancel()
 
 	select {
-	case <-runDone:
+	case <-run.done:
 	case <-deadline.Done():
 		t.Fatal("Run never returned")
 	}
@@ -850,20 +952,19 @@ func TestAHurriedDrainStopsWaitingButStillTearsDown(t *testing.T) {
 	l := NewListener(a, "billet-4vcpu-a", session,
 		WithRunner(runner), WithDrainGrace(time.Hour), WithHurrySignal(hurry), dl.option())
 
-	runDone := make(chan error, 1)
-
-	go func() { runDone <- l.Run(ctx) }()
+	run := startRun(ctx, l)
 
 	waitUntil(deadline, t, "the job to be running", func() bool { return l.Running() == 1 })
 
 	cancel()
 
-	awaitDrainStart(deadline, t, &dl)
+	awaitDrainStart(deadline, t, &dl, run)
 
 	close(hurry)
 
 	select {
-	case err := <-runDone:
+	case <-run.done:
+		err := run.get()
 		if err == nil {
 			t.Error("Run returned nil after its context was cancelled")
 		}
@@ -909,7 +1010,12 @@ func TestTheHurryChannelReachesEveryListener(t *testing.T) {
 // operator happened to press Ctrl-C at the same moment, and the drain would go
 // on running that session for hours.
 //
-// The rule is that only a cancellation is treated as one.
+// The rule is asked the other way round: once the caller has asked billet to
+// stop, an error IS the shutdown arriving unless it is one billet must stop for
+// regardless. Looking only for context.Canceled instead was worse in a quieter
+// way — a cancellation landing inside handle() surfaces as whatever domain error
+// that path produces, none of which wrap the context error, so the drain was
+// skipped intermittently for the most ordinary reason there is.
 func TestAFatalErrorDuringCancellationIsNotSwallowedByTheDrain(t *testing.T) {
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
 	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
@@ -921,7 +1027,11 @@ func TestAFatalErrorDuringCancellationIsNotSwallowedByTheDrain(t *testing.T) {
 	deadline, cancelDeadline := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancelDeadline()
 
-	fatal := errors.New("the scale set said something billet cannot act on")
+	// THE NAMED ONE. Under the rule this test guards, a cancellation makes billet
+	// drain unless the error is one it must stop for whatever else is happening —
+	// and there is exactly one of those, because "which of my commitments are
+	// real" is the only question a drain cannot proceed without an answer to.
+	fatal := fmt.Errorf("%w: the ids do not match", ErrUntrustworthySession)
 
 	var (
 		ready   atomic.Bool
@@ -945,9 +1055,7 @@ func TestAFatalErrorDuringCancellationIsNotSwallowedByTheDrain(t *testing.T) {
 	l := NewListener(a, "billet-4vcpu-a", session,
 		WithRunner(&fakeRunner{}), WithDrainGrace(20*time.Second), dl.option())
 
-	runDone := make(chan error, 1)
-
-	go func() { runDone <- l.Run(ctx) }()
+	run := startRun(ctx, l)
 
 	waitUntil(deadline, t, "the listener to be inside a poll", ready.Load)
 
@@ -955,7 +1063,8 @@ func TestAFatalErrorDuringCancellationIsNotSwallowedByTheDrain(t *testing.T) {
 	close(release)
 
 	select {
-	case err := <-runDone:
+	case <-run.done:
+		err := run.get()
 		// stopping() reports the cancellation once ctx is done, which is the
 		// listener's existing contract and not what this test is about. What must
 		// NOT happen is the loop carrying on into a drain on a session it has just
@@ -971,5 +1080,202 @@ func TestAFatalErrorDuringCancellationIsNotSwallowedByTheDrain(t *testing.T) {
 	if dl.saw(beganDraining) {
 		t.Errorf("a fatal error was treated as a cancellation and the listener "+
 			"drained instead of stopping:\n%s", dl.String())
+	}
+}
+
+// A CANCELLATION THAT SURFACES AS SOMETHING ELSE IS STILL A CANCELLATION.
+//
+// This is the case that made the drain unreliable rather than broken, which is
+// worse. When the caller cancels, whatever call is in flight fails — and it does
+// not necessarily fail with context.Canceled. A cancellation landing inside
+// handle() comes back as whatever domain error that path produces, and those do
+// not wrap the context error. A rule that looked for context.Canceled therefore
+// skipped the drain intermittently, depending on where the cancel landed, which
+// is the shape of a feature that passes its tests and does not work on a real
+// machine.
+//
+// The session here fails with a plain error the moment the context is cancelled,
+// so the placement is not left to the scheduler.
+func TestACancellationThatSurfacesAsAnotherErrorStillDrains(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
+		alloc.WithLeaseTTL(300*time.Millisecond))
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	deadline, cancelDeadline := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancelDeadline()
+
+	var (
+		assigned atomic.Bool
+		inPoll   = make(chan struct{}, 1)
+		release  = make(chan struct{})
+	)
+
+	session := &fakeSession{}
+	session.onGet = func() (*Message, error) {
+		if assigned.CompareAndSwap(false, true) {
+			return &Message{MessageID: 1, Assigned: []Job{{RequestID: 11, RunID: 101}}}, nil
+		}
+
+		// BLOCKED INSIDE THE POLL until the test has cancelled, because that is
+		// the only placement that tests anything. If the cancel lands between two
+		// polls, the top of the loop notices it directly and the drain begins
+		// whatever any call returned — so the error classification is never
+		// consulted and a rule that gets it wrong still passes.
+		select {
+		case inPoll <- struct{}{}:
+			<-release
+		default:
+		}
+
+		// NOT a context error, and deliberately not wrapping one: this stands in
+		// for every domain error a cancelled call can produce on its way out.
+		if ctx.Err() != nil {
+			return nil, errors.New("the transport gave up")
+		}
+
+		return nil, ErrNoMessage
+	}
+
+	var dl drainLog
+
+	l := NewListener(a, "billet-4vcpu-a", session,
+		WithRunner(&fakeRunner{}), WithDrainGrace(2*time.Second), dl.option())
+
+	run := startRun(ctx, l)
+
+	waitUntil(deadline, t, "the job to be running", func() bool { return l.Running() == 1 })
+
+	select {
+	case <-inPoll:
+	case <-deadline.Done():
+		t.Fatal("the listener never blocked inside a poll")
+	}
+
+	cancel()
+	close(release)
+
+	awaitDrainStart(deadline, t, &dl, run)
+}
+
+// THE ONE ERROR THAT IS FATAL WHATEVER ELSE IS HAPPENING, driven through the
+// real acquisition path rather than constructed by the test.
+//
+// GitHub returning an id nobody offered for means billet cannot tell which of
+// its commitments are real. Draining against that session would be operating on
+// exactly the state that is not safe to operate on — so this must stop, and a
+// cancellation arriving at the same moment must not turn it into a drain.
+func TestAnUntrustworthyScaleSetResponseStopsTheListenerEvenWhileStopping(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
+		alloc.WithLeaseTTL(300*time.Millisecond))
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	deadline, cancelDeadline := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancelDeadline()
+
+	var offered atomic.Bool
+
+	session := &fakeSession{}
+	session.onGet = func() (*Message, error) {
+		if offered.CompareAndSwap(false, true) {
+			return &Message{MessageID: 1, Available: []Job{{RequestID: 11, RunID: 101}}}, nil
+		}
+
+		return nil, ErrNoMessage
+	}
+
+	// THE SHUTDOWN ARRIVES EXACTLY AT THE VIOLATION.
+	//
+	// Cancelling earlier does not test this: the listener would notice the
+	// cancellation on its way through handle, begin draining, and decline the
+	// offer — so the violation never happens and there is nothing to be fatal
+	// about. That is correct behaviour and a different case. The two have to
+	// coincide, so the cancel is fired from inside the acquisition that returns
+	// an id nobody offered for.
+	session.onAcquire = func([]int64) ([]int64, error) {
+		cancel()
+
+		return []int64{11, 999}, nil
+	}
+
+	var dl drainLog
+
+	l := NewListener(a, "billet-4vcpu-a", session,
+		WithRunner(&fakeRunner{}), WithDrainGrace(20*time.Second), dl.option())
+
+	run := startRun(ctx, l)
+
+	select {
+	case <-run.done:
+	case <-deadline.Done():
+		t.Fatal("the listener drained against a session it cannot trust")
+	}
+
+	if dl.saw(beganDraining) {
+		t.Errorf("the listener drained against a scale set it cannot trust:\n%s", dl.String())
+	}
+}
+
+// AN ERROR DURING THE DRAIN ENDS THE DRAIN.
+//
+// Suppression is for the cancellation arriving mid-call, before the drain has
+// taken over. Once draining, a failure is a failure again: a listener that
+// swallowed them would loop on a broken session until its whole grace expired —
+// hours — and only then tear down, having achieved nothing but a delay.
+func TestAnErrorDuringTheDrainEndsIt(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
+		alloc.WithLeaseTTL(300*time.Millisecond))
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	deadline, cancelDeadline := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancelDeadline()
+
+	var (
+		assigned atomic.Bool
+		draining atomic.Bool
+	)
+
+	session := &fakeSession{}
+	session.onGet = func() (*Message, error) {
+		if assigned.CompareAndSwap(false, true) {
+			return &Message{MessageID: 1, Assigned: []Job{{RequestID: 11, RunID: 101}}}, nil
+		}
+
+		if draining.Load() {
+			return nil, errors.New("the session is gone")
+		}
+
+		return nil, ErrNoMessage
+	}
+
+	var dl drainLog
+
+	// An hour, so a drain that swallowed the error would hang rather than finish
+	// slowly — and this test would fail on its deadline rather than pass late.
+	l := NewListener(a, "billet-4vcpu-a", session,
+		WithRunner(&fakeRunner{}), WithDrainGrace(time.Hour), dl.option())
+
+	run := startRun(ctx, l)
+
+	waitUntil(deadline, t, "the job to be running", func() bool { return l.Running() == 1 })
+
+	cancel()
+
+	awaitDrainStart(deadline, t, &dl, run)
+
+	draining.Store(true)
+
+	select {
+	case <-run.done:
+	case <-deadline.Done():
+		t.Fatal("a failing session during the drain did not end it")
 	}
 }

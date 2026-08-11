@@ -19,11 +19,31 @@ import (
 	gh "github.com/actions/scaleset"
 
 	"github.com/junioryono/billet/internal/server"
+	"github.com/junioryono/billet/internal/version"
 )
 
-// Version is reported to GitHub as part of the client's system info, so a
+// clientVersion is reported to GitHub as part of the client's system info, so a
 // deployment showing up in their telemetry is identifiable as billet.
-const Version = "0.0.0-dev"
+//
+// A FUNCTION, NOT A CONST, and that is the whole point of the change. It was
+// `const Version = "0.0.0-dev"`, which nothing else in this repository reads —
+// the only observer is GitHub's telemetry, so every release would have reported
+// itself as a development build and nothing here would ever have noticed.
+func clientVersion() string { return version.Version() }
+
+// systemInfo is what billet tells GitHub about itself on every poll.
+//
+// ASSEMBLED IN ONE PLACE SO A TEST CAN SEE IT. Built inline in New, the only
+// assertion available was that clientVersion() agreed with version.Version() —
+// which stays true while the struct literal in New says something else entirely.
+// The value that reaches GitHub is the one worth testing.
+func systemInfo() gh.SystemInfo {
+	return gh.SystemInfo{
+		System:    "billet",
+		Version:   clientVersion(),
+		Subsystem: "listener",
+	}
+}
 
 // Config is what billet needs to reach one organization's scale sets.
 type Config struct {
@@ -64,11 +84,7 @@ func New(cfg Config, log *slog.Logger) (*Client, error) {
 			InstallationID: cfg.InstallationID,
 			PrivateKey:     cfg.PrivateKey,
 		},
-		SystemInfo: gh.SystemInfo{
-			System:    "billet",
-			Version:   Version,
-			Subsystem: "listener",
-		},
+		SystemInfo: systemInfo(),
 	}, gh.WithLogger(quiet))
 	if err != nil {
 		// NOT wrapped with the config: GitHubAppAuth holds the private key, and a
