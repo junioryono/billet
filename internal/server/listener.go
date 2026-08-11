@@ -2874,8 +2874,13 @@ func (l *Listener) releaseAll(ctx context.Context, destroyed map[int64]bool) {
 	// a job that was assigned but never picked up, and says nothing about one a
 	// runner has already started. Tearing them down is still right: billet is
 	// stopping and can no longer manage those jobs, so a failed build beats
-	// containers nobody is tracking. It is rare because the drain above runs
-	// first — a teardown only reaches here for work that outlived its budget.
+	// containers nobody is tracking.
+	//
+	// AN ORDINARY SHUTDOWN RARELY GETS HERE WITH ANYTHING RUNNING, because the
+	// drain waits first and this only inherits what outlived its budget. A Run
+	// that returns for its own reasons — an untrustworthy session, a poll error
+	// it cannot continue past — never drained at all, so for those this is the
+	// first and only stop and everything still running is destroyed.
 	//
 	// DESTROYED ALREADY, by destroyAll, which is why this only releases. Doing
 	// both here meant the teardown could not be planned as a whole: the drain and
