@@ -5,26 +5,22 @@ import (
 	"testing"
 )
 
-// A SITE IS A PLACE WHERE COMPUTE AND ITS STORAGE SHARE A FAST NETWORK, and the
-// reason it is a declared block rather than a free string is that the failure it
-// prevents is silent.
+// A NODE'S SITE IS NOT THIS FILE'S TO JUDGE, and asserting otherwise was wrong
+// in exactly the deployment sites exist for.
 //
-// A cache belongs to a site. A node that means "home" and types "hom" does not
-// get an error under a free-string scheme — it gets its own site, with its own
-// empty cache, and every job placed there runs cold while looking entirely
-// healthy. Declaring the set once and refusing anything outside it turns that
-// into a message at startup.
-func TestANodeCannotJoinASiteThatWasNeverDeclared(t *testing.T) {
-	body := withSites("home") + "\n"
-	body = strings.Replace(body, "  name: epyc-1", "  name: epyc-1\n  site: hom", 1)
+// This config may be the NODE's, on its own machine, where a sites block has no
+// reason to exist — sites are declared by the control plane. An earlier version
+// of this validation refused node.site whenever the local file listed no sites,
+// which would have turned away every remote node that correctly named one of the
+// server's places.
+//
+// The claim is checked where the answer lives: at registration, by the control
+// plane. See TestANodeCannotRegisterIntoAnUndeclaredSite in internal/nodeplane.
+func TestANodesOwnConfigDoesNotJudgeItsSite(t *testing.T) {
+	body := strings.Replace(validConfig, "  name: epyc-1", "  name: epyc-1\n  site: anywhere", 1)
 
-	_, err := Load(writeConfig(t, body))
-	if err == nil {
-		t.Fatal("Load accepted a node whose site is not in the sites block")
-	}
-
-	if !strings.Contains(err.Error(), "hom") || !strings.Contains(err.Error(), "site") {
-		t.Errorf("the error does not name the offending site: %v", err)
+	if _, err := Load(writeConfig(t, body)); err != nil {
+		t.Fatalf("a node naming a site its own config does not declare was refused: %v", err)
 	}
 }
 
@@ -46,15 +42,15 @@ func TestATierCannotRequireASiteThatWasNeverDeclared(t *testing.T) {
 	}
 }
 
-// NAMING A SITE WITH NO SITES BLOCK IS THE TYPO CASE, not the "sites are
-// optional" case. An operator who wrote a site meant something by it, so
-// silently ignoring the field is the one outcome that helps nobody.
-func TestASiteWithoutASitesBlockIsRefused(t *testing.T) {
-	body := strings.Replace(validConfig, "  name: epyc-1", "  name: epyc-1\n  site: home", 1)
+// A tier's site IS this file's to judge, because tiers and sites are declared
+// together, in the control plane's config, by the same person.
+func TestATierSiteWithoutASitesBlockIsRefused(t *testing.T) {
+	body := strings.Replace(validConfig, "  - label: billet-4vcpu-ubuntu-2404",
+		"  - label: billet-4vcpu-ubuntu-2404\n    site: home", 1)
 
 	_, err := Load(writeConfig(t, body))
 	if err == nil {
-		t.Fatal("Load accepted a node with a site but no sites block")
+		t.Fatal("Load accepted a tier with a site but no sites block")
 	}
 
 	if !strings.Contains(err.Error(), "sites") {
@@ -73,7 +69,6 @@ func TestASiteIsOptional(t *testing.T) {
 // A declared site that a node and a tier both name is the ordinary case.
 func TestADeclaredSiteIsAccepted(t *testing.T) {
 	body := withSites("home")
-	body = strings.Replace(body, "  name: epyc-1", "  name: epyc-1\n  site: home", 1)
 	body = strings.Replace(body, "  - label: billet-4vcpu-ubuntu-2404",
 		"  - label: billet-4vcpu-ubuntu-2404\n    site: home", 1)
 

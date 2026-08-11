@@ -12,6 +12,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -100,6 +102,10 @@ type Plane struct {
 	// installation does not recognise, and the orphan sweeper would then find
 	// containers it cannot attribute.
 	deployment string
+
+	// sites are the places this deployment declares, or empty for a deployment
+	// that has not needed the distinction. See WithSites.
+	sites map[string]bool
 }
 
 // node is one registered compute host.
@@ -350,6 +356,39 @@ type Registrar interface {
 	RegisterNode(ctx context.Context, reg alloc.NodeRegistration) error
 }
 
+// sortedSites lists the declared places in a stable order, so a refusal naming
+// what IS valid reads the same on every run.
+func sortedSites(set map[string]bool) []string {
+	out := make([]string, 0, len(set))
+	for k := range set {
+		out = append(out, k)
+	}
+
+	slices.Sort(out)
+
+	return out
+}
+
+// WithSites declares the places this deployment has compute in.
+//
+// THE CONTROL PLANE IS THE AUTHORITY, and this is the only place the rule can be
+// enforced. A site is declared in the control plane's configuration; a node
+// names one in ITS OWN config, on another machine, in a file with no reason to
+// list the deployment's places — so a node cannot check itself, because it does
+// not know the answer. Validating the server's own file only ever guards the
+// server's tiers. Every remote claim arrives at Register.
+//
+// Empty means the deployment has declared no sites, in which case a node
+// claiming one is refused: there is nothing it could correctly mean.
+func WithSites(names []string) Option {
+	return func(p *Plane) {
+		p.sites = make(map[string]bool, len(names))
+		for _, n := range names {
+			p.sites[n] = true
+		}
+	}
+}
+
 // WithRegistrar makes registration durable in the ledger as well as in memory.
 func WithRegistrar(r Registrar) Option { return func(p *Plane) { p.registrar = r } }
 
@@ -381,6 +420,27 @@ func (p *Plane) Register(
 				"compute with its own identity, so accepting it would produce containers this "+
 				"installation cannot attribute",
 			ErrRefused, req.Node, req.Deployment, p.deployment)
+	}
+
+	// REFUSED RATHER THAN RECORDED, because a site nobody declared is
+	// indistinguishable afterwards from a real one. A typo becomes a place of a
+	// single machine, with a cache of its own that is always empty, and every job
+	// sent there runs cold while the fleet looks perfectly healthy.
+	//
+	// PERMANENT, like the version and deployment checks above it. The same node
+	// with the same config will be refused forever, so a node that treated this as
+	// an outage would retry until someone read a log.
+	if req.Site != "" && !p.sites[req.Site] {
+		if len(p.sites) == 0 {
+			return nodeapi.RegisterResponse{}, fmt.Errorf(
+				"%w: node %q is at site %q, but this control plane declares no sites; add a "+
+					"sites block naming it, or remove node.site",
+				ErrRefused, req.Node, req.Site)
+		}
+
+		return nodeapi.RegisterResponse{}, fmt.Errorf(
+			"%w: node %q is at site %q, which this control plane does not declare (have %s)",
+			ErrRefused, req.Node, req.Site, strings.Join(sortedSites(p.sites), ", "))
 	}
 
 	// THE LEDGER FIRST, and outside the mutex. A node that appears in the plane's
