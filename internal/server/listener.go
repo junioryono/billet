@@ -1165,6 +1165,13 @@ func (l *Listener) Run(ctx context.Context) error {
 		// intends to advertise, and the drain has just handed back the capacity
 		// nobody was using. Topping it up again would re-advertise the tier it is
 		// trying to leave, and the drain could never reach zero.
+		// BEFORE TOPPING UP, so the number this poll advertises already reflects a
+		// machine that has gone. Doing it after would tell GitHub about capacity
+		// billet had just decided it did not have.
+		if !draining {
+			l.releaseStrandedEscrow(pollCtx)
+		}
+
 		if !draining {
 			if err := l.refillEscrow(pollCtx); err != nil {
 				if cancelledWhileServing(ctx, draining, err) {
@@ -1303,6 +1310,89 @@ func (l *Listener) beginDrain(ctx context.Context) (context.Context, context.Can
 // `running` is backing a live container; releasing either would let another tier
 // escrow capacity that is already spoken for, which is the overcommit the whole
 // escrow exists to prevent.
+// releaseStrandedEscrow hands back capacity whose machine has gone away.
+//
+// AN ADVERTISEMENT OUTLIVES THE MACHINE BEHIND IT, and nothing was taking it
+// back. Escrow is what billet advertises, refillEscrow only ever ADDS, and the
+// number GitHub is told is however many leases this listener holds — so when the
+// host those reservations name disappears, the promise does not move. GitHub
+// goes on assigning against it and every one of those jobs is acquired and then
+// fails to launch.
+//
+// ONLY `held` LEASES, which is what makes this safe. A held lease has never been
+// assigned, so nothing is running under it and nobody is waiting on it; giving
+// it back costs a re-escrow at worst. Anything acquiring or running is somebody's
+// job and is not touched here — that is the drain's and the teardown's business.
+func (l *Listener) releaseStrandedEscrow(ctx context.Context) int {
+	l.mu.Lock()
+	snapshot := append([]*alloc.Lease(nil), l.held...)
+	l.mu.Unlock()
+
+	if len(snapshot) == 0 {
+		return 0
+	}
+
+	ids := make([]string, 0, len(snapshot))
+	for _, lease := range snapshot {
+		ids = append(ids, lease.ID)
+	}
+
+	stranded, err := l.alloc.Stranded(ctx, ids)
+	if err != nil {
+		// NOT FATAL. Not knowing whether a machine is still there is a reason to
+		// keep advertising what was already promised, not to tear it down: the
+		// ledger will answer on the next pass, and releasing on a failed read
+		// would hand back capacity over a database blip.
+		l.log.Warn("could not check whether this tier's escrow still has machines behind it",
+			"tier", l.tier, "error", err)
+
+		return 0
+	}
+
+	if len(stranded) == 0 {
+		return 0
+	}
+
+	gone := make(map[string]bool, len(stranded))
+	for _, id := range stranded {
+		gone[id] = true
+	}
+
+	released := 0
+
+	for _, lease := range snapshot {
+		if !gone[lease.ID] {
+			continue
+		}
+
+		// PhaseDone, not PhaseFailed: nothing was attempted and nothing went
+		// wrong. The reservation is simply being given back.
+		if err := l.alloc.Release(ctx, lease.ID, lease.Epoch, alloc.PhaseDone); err != nil {
+			// LEFT IN `held`, so it stays renewed and correctly counted as this
+			// listener's, and is tried again on the next pass. Dropping it here
+			// would leak the capacity until the reaper.
+			l.log.Warn("could not release escrow whose machine is gone; it stays this "+
+				"listener's and will be tried again",
+				"tier", l.tier, "lease", lease.ID, "error", err)
+
+			continue
+		}
+
+		l.mu.Lock()
+		l.held = slices.DeleteFunc(l.held, func(h *alloc.Lease) bool { return h.ID == lease.ID })
+		l.mu.Unlock()
+
+		released++
+	}
+
+	if released > 0 {
+		l.log.Info("released escrow whose machines are no longer in the fleet; this tier now "+
+			"advertises less", "tier", l.tier, "released", released)
+	}
+
+	return released
+}
+
 func (l *Listener) releaseIdleEscrow(ctx context.Context) int {
 	// A SNAPSHOT TO ITERATE, BUT EACH LEASE LEAVES `held` ONLY WHEN IT IS
 	// ACTUALLY RELEASED. The first version took the whole slice out up front and

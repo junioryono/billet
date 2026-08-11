@@ -474,12 +474,7 @@ func newAllocator(t *testing.T, limits alloc.Limits, tiers []config.Tier,
 ) *alloc.Allocator {
 	t.Helper()
 
-	db := openState(t)
-
-	a, err := alloc.New(db, limits, tiers, opts...)
-	if err != nil {
-		t.Fatalf("alloc.New: %v", err)
-	}
+	a := newBareAllocator(t, limits, tiers, opts...)
 
 	// A HOST, BECAUSE CAPACITY IS PER MACHINE NOW. A deployment with no
 	// registered node can place nothing, so every tier advertises zero — correct,
@@ -500,6 +495,22 @@ func newAllocator(t *testing.T, limits alloc.Limits, tiers []config.Tier,
 		}); err != nil {
 			t.Fatalf("registering the default host: %v", err)
 		}
+	}
+
+	return a
+}
+
+// newBareAllocator is an allocator with NO hosts, for a test that declares its
+// own fleet — which is now part of the setup rather than an implementation
+// detail.
+func newBareAllocator(t *testing.T, limits alloc.Limits, tiers []config.Tier,
+	opts ...alloc.Option,
+) *alloc.Allocator {
+	t.Helper()
+
+	a, err := alloc.New(openState(t), limits, tiers, opts...)
+	if err != nil {
+		t.Fatalf("alloc.New: %v", err)
 	}
 
 	return a

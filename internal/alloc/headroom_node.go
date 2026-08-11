@@ -3,6 +3,7 @@ package alloc
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 
 	"github.com/junioryono/billet/internal/config"
@@ -173,4 +174,66 @@ func (a *Allocator) usageOn(ctx context.Context, tx *sql.Tx, node string) (Usage
 	u.Memory = config.ByteSize(mem.Int64)
 
 	return u, nil
+}
+
+// Stranded reports which of these leases are aimed at a machine that is no
+// longer live.
+//
+// FOR CAPACITY THAT HAS BEEN ADVERTISED BUT NOT USED. A listener holds escrow
+// and tells GitHub about it; if the host those reservations name goes away, the
+// number is a promise nothing can keep, and the listener only ever ADDS to it.
+// These are the ones it can safely take back.
+//
+// A lease with no target is NOT stranded. Every reservation names a machine now,
+// so an empty target is a row from before that was true — and guessing that such
+// a lease is worthless is exactly the kind of cleanup that deletes something
+// real. It fails closed by being left alone.
+func (a *Allocator) Stranded(ctx context.Context, ids []string) ([]string, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+
+	var out []string
+
+	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+		out = out[:0]
+
+		for _, id := range ids {
+			var (
+				target sql.NullString
+				live   sql.NullBool
+			)
+
+			// LEFT JOIN, because a target naming a host the ledger has never heard
+			// of is the same situation as one it has forgotten: there is nowhere for
+			// that reservation to go.
+			err := tx.QueryRowContext(ctx,
+				`SELECT l.target_node, n.live
+				   FROM leases l LEFT JOIN nodes n ON n.name = l.target_node
+				  WHERE l.id = ?`, id).Scan(&target, &live)
+
+			switch {
+			case errors.Is(err, sql.ErrNoRows):
+				// Already gone from the ledger; the caller will notice by other means.
+				continue
+			case err != nil:
+				return fmt.Errorf("alloc: read the target of lease %s: %w", id, err)
+			}
+
+			if target.String == "" {
+				continue
+			}
+
+			if !live.Valid || !live.Bool {
+				out = append(out, id)
+			}
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return out, nil
 }
