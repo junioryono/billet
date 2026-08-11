@@ -79,8 +79,10 @@ func (d *drainLog) option() Option {
 // beganDraining is the drain's announcement of itself.
 const beganDraining = "draining: not taking new work"
 
-// stoppedWaiting is the drain giving up on its budget, as opposed to finishing.
-const stoppedWaiting = "stopped waiting"
+// gaveUp is the drain giving up on its budget, as opposed to finishing. Kept as
+// a constant so a reworded message breaks the tests that depend on it here
+// rather than making them quietly stop distinguishing the two endings.
+const gaveUp = "giving up on the jobs"
 
 // runResult is Run's outcome, observable without being taken.
 //
@@ -472,7 +474,7 @@ func TestADrainThatOverrunsItsBudgetDestroysWhatIsLeft(t *testing.T) {
 	// AND IT STOPPED BECAUSE THE BUDGET RAN OUT, which is the case this test is
 	// named for. A drain that ended for any other reason would satisfy everything
 	// above.
-	if !dl.saw(stoppedWaiting) {
+	if !dl.saw(gaveUp) {
 		t.Errorf("the drain did not report giving up on its budget:\n%s", dl.String())
 	}
 
@@ -557,7 +559,7 @@ func TestADrainDoesNotWaitForAPromiseThatWasNeverAssigned(t *testing.T) {
 
 	awaitRun(deadline, t, run)
 
-	if dl.saw(stoppedWaiting) {
+	if dl.saw(gaveUp) {
 		t.Errorf("the drain waited out its budget for a promise that will never be "+
 			"assigned:\n%s", dl.String())
 	}
@@ -651,7 +653,7 @@ func TestADrainIsBoundedEvenWhenTheSessionIgnoresItsContext(t *testing.T) {
 		t.Fatal("a session that ignores its context made the drain unbounded")
 	}
 
-	if !dl.saw(stoppedWaiting) {
+	if !dl.saw(gaveUp) {
 		t.Errorf("the drain stopped for some reason other than its own deadline:\n%s",
 			dl.String())
 	}
@@ -727,7 +729,7 @@ func TestADrainStopsWhenTheWorkFinishesRatherThanWhenItsBudgetDoes(t *testing.T)
 		t.Fatal("Run never returned after the job finished")
 	}
 
-	if dl.saw(stoppedWaiting) {
+	if dl.saw(gaveUp) {
 		t.Errorf("the drain ran out of budget rather than noticing its work had "+
 			"finished:\n%s", dl.String())
 	}

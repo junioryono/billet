@@ -1146,8 +1146,15 @@ func (l *Listener) Run(ctx context.Context) error {
 				// The drain's budget is gone, or a second signal cut it short.
 				// What is still running is now the teardown's problem, and it
 				// destroys it exactly as it did before a drain existed.
-				l.log.Warn("stopped waiting for the jobs still running here; they will be "+
-					"destroyed and GitHub will reassign them",
+				// NOT "GitHub will reassign them". It does not: reassignment is
+				// documented for a job assigned to a scale set but never acquired
+				// by a runner, and says nothing about one a runner has already
+				// started. Destroying a running container FAILS that job, and a
+				// message that calls it a reassignment tells an operator the cost
+				// is nothing when the cost is somebody's build.
+				l.log.Warn("giving up on the jobs still running here; destroying them "+
+					"will FAIL them, and GitHub does not requeue a job whose runner "+
+					"vanished mid-execution",
 					"tier", l.tier, "running", l.Running(), "grace", l.drainGrace)
 
 				return ctx.Err()

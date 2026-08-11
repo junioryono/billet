@@ -101,8 +101,9 @@ dist: ## Build the release artifacts locally, exactly as a tag would
 	@# before every commit. Run it when touching .goreleaser.yaml.
 	goreleaser release --snapshot --clean --skip=publish
 
-tools: ## Install the pinned linter
+tools: ## Install the pinned linter and goreleaser
 	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_VERSION)
+	go install github.com/goreleaser/goreleaser/v2@$(GORELEASER_VERSION)
 
 .PHONY: clean
 clean:

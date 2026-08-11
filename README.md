@@ -65,28 +65,46 @@ the binary in `/usr/local/bin`. It does not create users, write config, or start
 anything.
 
 **For a machine that should run jobs across reboots, install the package
-instead** — it ships the systemd units:
+instead** — it ships the systemd units. Pick the file for your platform from the
+[latest release](https://github.com/junioryono/billet/releases/latest):
 
 ```bash
-# Debian / Ubuntu
-curl -fsSLO https://github.com/junioryono/billet/releases/latest/download/billet_VERSION_linux_amd64.deb
-sudo dpkg -i billet_*_linux_amd64.deb
-
-# Fedora / RHEL
-sudo rpm -i https://github.com/junioryono/billet/releases/latest/download/billet_VERSION_linux_amd64.rpm
+sudo dpkg -i billet_*_linux_amd64.deb    # Debian / Ubuntu
+sudo rpm -i  billet_*_linux_amd64.rpm    # Fedora / RHEL
 ```
 
 The package installs the units and **does not enable or start them**. Installing
 billet should not connect a machine to GitHub and begin accepting jobs; that is
 your decision, and it cannot be made before `/etc/billet/billet.yaml` says
-something true:
+something true.
+
+**A control plane** — talks to GitHub, owns the capacity ledger:
 
 ```bash
-sudo -u billet billet github-app create --org YOUR-ORG
-sudoedit /etc/billet/billet.yaml          # set max_vcpu and max_memory
-sudo -u billet billet check               # says what is still missing
+# Creates the App and prints the github: block to paste in. The key goes
+# somewhere the service user can write; /etc/billet is root-owned.
+sudo -H -u billet billet github-app create \
+    --org YOUR-ORG --key-path /var/lib/billet/app-private-key.pem
+
+sudoedit /etc/billet/billet.yaml     # paste that block; set max_vcpu/max_memory
+sudo -H -u billet billet check --config /etc/billet/billet.yaml
 sudo systemctl enable --now billet-server
 ```
+
+**A compute host** — runs the containers. It needs a `node:` section naming the
+control plane, and the certificate bundle `billet ca issue <name>` produced
+there (see [Adding a second machine](#adding-a-second-machine)):
+
+```bash
+sudoedit /etc/billet/billet.yaml     # uncomment and fill in the node: section
+sudo -H -u billet billet check --config /etc/billet/billet.yaml
+sudo systemctl enable --now billet-node
+```
+
+> **`billet-node` is root on that host.** It joins the `docker` group, and
+> anything that can reach a rootful Docker socket can start a privileged
+> container or mount the filesystem. Prefer rootless Docker where the workload
+> allows it.
 
 Or build from source:
 
@@ -96,27 +114,36 @@ git clone https://github.com/junioryono/billet && cd billet && go build ./cmd/bi
 
 ## Updating
 
+**If you installed the package:**
+
 ```bash
-sudo dpkg -i billet_NEW_linux_amd64.deb   # or rpm -U, or re-run the install script
-sudo systemctl restart billet-server
+sudo dpkg -i billet_*_linux_amd64.deb        # or rpm -U
+sudo systemctl restart billet-server         # and/or billet-node
 ```
+
+**If you used the install script**, re-run it. Note that it writes
+`/usr/local/bin/billet` while the packaged units run `/usr/bin/billet` — so if
+this machine has the package installed, update the package rather than the
+script, or the units keep running the old binary.
 
 **The restart is safe because billet drains.** SIGTERM stops it taking new work
 and waits for the jobs already running before tearing anything down, so an update
-does not fail somebody's CI. That is the whole point of the drain, and it is the
-reason this is two commands rather than a maintenance window.
+does not fail somebody's CI. That is the whole point of the drain, and the reason
+this is two commands rather than a maintenance window.
 
 **It is not instant.** The restart takes as long as the longest job still
 running, up to `drain_timeout` (6h by default, which is how long GitHub lets a
-job run). If you do not want to wait, send a second signal:
+job run). If you do not want to wait:
 
 ```bash
 sudo systemctl kill --kill-whom=main --signal=SIGTERM billet-server
 ```
 
-That stops the waiting and tears down properly — the jobs still running are
-destroyed and GitHub reassigns them. A third signal gives up where it stands and
-leaves containers behind for the reaper.
+That stops the waiting and tears down properly. **The jobs still running are
+destroyed, and destroying them FAILS those builds** — GitHub requeues a job that
+was assigned but never picked up, and does not requeue one a runner has already
+started. A third signal gives up where it stands and leaves containers behind for
+the reaper.
 
 `--kill-whom=main` matters: without it systemctl signals every process in the
 service, including a container CLI billet has in flight.
@@ -141,8 +168,7 @@ built. What works **today**:
 | Multi-backend tiers | One label can name several providers and be placed on any of them. The preference ORDER is recorded but not yet acted on — see below |
 
 **Not built:** Firecracker, Apple Silicon and EC2 providers; the cache; sticky disks; the scheduler
-that would make provider preference and a cost policy mean something; observability; the dashboard. Plain `billet server` (without `--dev`)
-exits non-zero rather than idling, so a half-built control plane is never mistaken for a running one.
+that would make provider preference and a cost policy mean something; observability; the dashboard.
 
 ### Adding a second machine
 

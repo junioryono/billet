@@ -1149,12 +1149,14 @@ The restart is safe because billet drains — SIGTERM stops it taking new work a
 waits for the jobs already running. It is NOT instant: it takes as long as the
 longest job still running, up to `drain_timeout`. A second signal
 (`systemctl kill --kill-whom=main --signal=SIGTERM`) stops the waiting and tears
-down properly; a third gives up where it stands.
+down properly — which DESTROYS the jobs still running and fails those builds,
+because GitHub does not requeue a job whose runner vanished mid-execution. A
+third gives up where it stands.
 
 ## Deployment
 
 `deploy/` holds the systemd units and the packaged config; GoReleaser's `nfpms`
-section turns them into `.deb`, `.rpm` and `.apk`. Three things there are
+section turns them into `.deb` and `.rpm` (not `.apk`: Alpine uses BusyBox `adduser` and OpenRC, so a package built from these scripts and units could not install). Three things there are
 load-bearing and were each found by installing a package rather than by reading
 one:
 
