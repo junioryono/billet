@@ -6,7 +6,7 @@
 #
 # Downloads the latest release for this platform, VERIFIES ITS CHECKSUM, and
 # installs the binary to /usr/local/bin. It does not create users, write config,
-# or start anything — use the .deb/.rpm/.apk if you want the systemd units.
+# or start anything — use the .deb or .rpm if you want the systemd units.
 #
 # POSIX sh, not bash: this runs on whatever a fresh host happens to have.
 set -eu
@@ -15,6 +15,12 @@ REPO="junioryono/billet"
 BIN="billet"
 INSTALL_DIR="${BILLET_INSTALL_DIR:-/usr/local/bin}"
 VERSION="${BILLET_VERSION:-latest}"
+
+# HTTPS ONLY, INCLUDING ACROSS REDIRECTS. -L follows wherever it is sent, and a
+# release asset redirect that downgraded to http would put the bytes this script
+# is about to run on the wire in the clear. The checksum is fetched the same way,
+# so an attacker who could rewrite one could rewrite both.
+CURL="curl -fsSL --proto =https --proto-redir =https"
 
 die() {
     echo "install: $*" >&2
@@ -81,7 +87,7 @@ main() {
     trap 'rm -rf "${tmp}"' EXIT INT TERM
 
     echo "Fetching the checksums..."
-    curl -fsSL "${base}/checksums.txt" -o "${tmp}/checksums.txt" ||
+    ${CURL} "${base}/checksums.txt" -o "${tmp}/checksums.txt" ||
         die "could not fetch ${base}/checksums.txt — is ${VERSION} a release that exists?"
 
     # THE ARCHIVE NAME COMES OUT OF THE CHECKSUM FILE rather than being
@@ -94,7 +100,7 @@ main() {
         die "this release has no build for ${platform}"
 
     echo "Downloading ${archive}..."
-    curl -fsSL "${base}/${archive}" -o "${tmp}/${archive}" ||
+    ${CURL} "${base}/${archive}" -o "${tmp}/${archive}" ||
         die "could not download ${base}/${archive}"
 
     # VERIFIED BEFORE IT IS UNPACKED. A tarball fetched over the network and
@@ -117,11 +123,35 @@ This is not the file the release says it is. Do not install it."
 
     chmod +x "${tmp}/${BIN}"
 
+    case "${INSTALL_DIR}" in
+        /*) ;;
+        *) die "BILLET_INSTALL_DIR must be an absolute path, got ${INSTALL_DIR}" ;;
+    esac
+
+    [ -d "${INSTALL_DIR}" ] ||
+        die "${INSTALL_DIR} does not exist. Create it, or set BILLET_INSTALL_DIR
+to somewhere that does."
+
+    # RENAMED INTO PLACE FROM THE SAME DIRECTORY, so the replacement is atomic.
+    #
+    # mv from a temporary directory is usually /tmp, which is usually a different
+    # filesystem — and a cross-filesystem mv is a copy followed by a delete. An
+    # interruption or a full disk in the middle of that leaves a truncated
+    # executable where a working billet used to be, which is a worse outcome than
+    # any failure this script is trying to avoid.
+    staged="${INSTALL_DIR}/.${BIN}.incoming"
+
+    install_with() {
+        $1 cp "${tmp}/${BIN}" "${staged}" &&
+            $1 chmod 0755 "${staged}" &&
+            $1 mv "${staged}" "${INSTALL_DIR}/${BIN}"
+    }
+
     if [ -w "${INSTALL_DIR}" ]; then
-        mv "${tmp}/${BIN}" "${INSTALL_DIR}/${BIN}"
+        install_with "" || die "could not install to ${INSTALL_DIR}"
     elif command -v sudo >/dev/null 2>&1; then
         echo "Installing to ${INSTALL_DIR} (needs sudo)..."
-        sudo mv "${tmp}/${BIN}" "${INSTALL_DIR}/${BIN}"
+        install_with sudo || die "could not install to ${INSTALL_DIR}"
     else
         die "${INSTALL_DIR} is not writable and sudo is not available.
 Set BILLET_INSTALL_DIR to somewhere you can write."
@@ -132,10 +162,15 @@ Set BILLET_INSTALL_DIR to somewhere you can write."
     echo
     echo "Next:"
     echo "  billet github-app create --org YOUR-ORG"
-    echo "  billet check"
+    echo
+    echo "That prints a github: block. Put it in a billet.yaml alongside your"
+    echo "tiers — there is a fully commented example at"
+    echo "  https://github.com/${REPO}/blob/main/billet.example.yaml"
+    echo "then:"
+    echo "  billet check --config /path/to/billet.yaml"
     echo
     echo "For a machine that should run jobs across reboots, install the package"
-    echo "instead — it ships systemd units:"
+    echo "instead — it ships systemd units and a config skeleton:"
     echo "  https://github.com/${REPO}/releases/latest"
 }
 

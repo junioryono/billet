@@ -58,8 +58,13 @@ func (lc *lifecycle) escalate(signals <-chan os.Signal, exit func(int)) {
 	lc.cancel()
 
 	<-signals
+	// NOT "reassign". GitHub requeues a job assigned to a scale set and never
+	// acquired; it says nothing about one a runner has already started. Killing
+	// that container FAILS the job, and an operator deciding whether to press
+	// Ctrl-C again deserves to know that rather than be told it is free.
 	fmt.Fprintln(os.Stderr, "billet: second signal; no longer waiting for the jobs "+
-		"still running here. They will be destroyed and GitHub will reassign them.")
+		"still running here. Destroying them will FAIL those builds — GitHub does "+
+		"not requeue a job whose runner vanished mid-execution.")
 	lc.rush()
 
 	<-signals

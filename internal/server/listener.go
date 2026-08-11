@@ -1146,8 +1146,15 @@ func (l *Listener) Run(ctx context.Context) error {
 				// The drain's budget is gone, or a second signal cut it short.
 				// What is still running is now the teardown's problem, and it
 				// destroys it exactly as it did before a drain existed.
-				l.log.Warn("stopped waiting for the jobs still running here; they will be "+
-					"destroyed and GitHub will reassign them",
+				// NOT "GitHub will reassign them". It does not: reassignment is
+				// documented for a job assigned to a scale set but never acquired
+				// by a runner, and says nothing about one a runner has already
+				// started. Destroying a running container FAILS that job, and a
+				// message that calls it a reassignment tells an operator the cost
+				// is nothing when the cost is somebody's build.
+				l.log.Warn("giving up on the jobs still running here; destroying them "+
+					"will FAIL them, and GitHub does not requeue a job whose runner "+
+					"vanished mid-execution",
 					"tier", l.tier, "running", l.Running(), "grace", l.drainGrace)
 
 				return ctx.Err()
@@ -1449,8 +1456,13 @@ func (l *Listener) Backlog() int {
 // it is the only honest thing to do with them. A fresh listener holds nothing,
 // so a non-zero TotalAssignedJobs means jobs were assigned to this scale set
 // before the process restarted: GitHub is waiting on runners that died with it.
-// Those jobs sit until GitHub's pickup deadline and are then reassigned, which
-// looks from the outside like billet silently dropping work.
+// NOT ALL OF THEM COME BACK, and the statistic cannot say which will. Upstream
+// defines TotalAssignedJobs as "both jobs waiting for a runner and jobs already
+// running" (actions/scaleset, Autoscaling). The ones still waiting are reassigned
+// when GitHub's pickup deadline passes. The ones a dead runner had already
+// STARTED are not — GitHub does not requeue a job whose runner vanished
+// mid-execution, so those fail. Either way it looks from the outside like billet
+// silently dropping work, which is the whole reason to say it.
 //
 // Deliberately NOT a failure. The jobs are already lost by the time this runs
 // and refusing to start would strand the tier's remaining capacity too. Nor is
@@ -1464,8 +1476,9 @@ func (l *Listener) reportOrphanedBacklog() {
 	}
 
 	l.log.Warn("github reports jobs already assigned to this scale set that billet has no lease "+
-		"for; they were assigned before this process started and will be reassigned when "+
-		"github's pickup deadline passes",
+		"for; they were assigned before this process started. Any that no runner had picked up "+
+		"are reassigned when github's pickup deadline passes; any that were already running "+
+		"have lost their runner and will fail",
 		"tier", l.tier, "assigned", backlog)
 }
 
@@ -2863,12 +2876,33 @@ func (l *Listener) releaseAll(ctx context.Context, destroyed map[int64]bool) {
 	// A lease whose compute will not die is NOT released. Capacity that the reaper
 	// reclaims late is recoverable; capacity handed out twice is not.
 	//
-	// This does kill work in flight, which is honest rather than good: billet is
-	// stopping and can no longer manage those jobs, so tearing them down and
-	// letting GitHub reassign beats leaving containers nobody is tracking. A
-	// graceful drain — stop taking new work, wait for the running jobs, then exit
-	// — is the thing that makes a restart free, and it is filed rather than
-	// smuggled in here.
+	// This does kill work in flight, and it FAILS those builds — GitHub requeues
+	// a job that was assigned but never picked up, and says nothing about one a
+	// runner has already started. Tearing them down is still right: billet is
+	// stopping and can no longer manage those jobs, so a failed build beats
+	// containers nobody is tracking.
+	//
+	// A PATIENT SHUTDOWN RARELY GETS HERE WITH ANYTHING RUNNING: the drain waits
+	// first, and this inherits only what outlived the budget. Three other ways in,
+	// none of which waited that long:
+	//
+	//   - A second signal ends the drain where it stands (see the hurry goroutine
+	//     in beginDrain). The work destroyed here had time left and did not get it,
+	//     which is the operator's decision to make and the reason the message says
+	//     what it costs.
+	//   - ErrUntrustworthySession deliberately skips the drain even when
+	//     cancellation has already arrived — there is nothing left to drain
+	//     through.
+	//   - A Run that returns on an error it cannot continue past. Before the drain
+	//     starts this is the ordinary failure exit. DURING one it also cuts the
+	//     drain short: cancelledWhileServing answers false once `draining` is set,
+	//     so an error that would have been read as "the shutdown arriving" while
+	//     serving is read as a real failure while draining, and Run returns
+	//     instead of polling on.
+	//
+	// For all of them this is the first and only stop, and everything still
+	// running is destroyed immediately.
+	//
 	// DESTROYED ALREADY, by destroyAll, which is why this only releases. Doing
 	// both here meant the teardown could not be planned as a whole: the drain and
 	// the release each had their own idea of what needed destroying and neither

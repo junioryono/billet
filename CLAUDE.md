@@ -1138,10 +1138,25 @@ another workflow — GitHub's recursion guard — which is why a release button
 usually needs a PAT or an App. A `workflow_call` is not an event, so billet needs
 no repository secrets.
 
+## Updating a running host
+
+```bash
+sudo dpkg -i billet_NEW_linux_amd64.deb
+sudo systemctl restart billet-server
+```
+
+The restart is safe because billet drains — SIGTERM stops it taking new work and
+waits for the jobs already running. It is NOT instant: it takes as long as the
+longest job still running, up to `drain_timeout`. A second signal
+(`systemctl kill --kill-whom=main --signal=SIGTERM`) stops the waiting and tears
+down properly — which DESTROYS the jobs still running and fails those builds,
+because GitHub does not requeue a job whose runner vanished mid-execution. A
+third gives up where it stands.
+
 ## Deployment
 
 `deploy/` holds the systemd units and the packaged config; GoReleaser's `nfpms`
-section turns them into `.deb`, `.rpm` and `.apk`. Three things there are
+section turns them into `.deb` and `.rpm` (not `.apk`: Alpine uses BusyBox `adduser` and OpenRC, so a package built from these scripts and units could not install). Three things there are
 load-bearing and were each found by installing a package rather than by reading
 one:
 
