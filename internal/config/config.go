@@ -399,8 +399,11 @@ type FirecrackerConfig struct {
 	//
 	// SLATED FOR REPLACEMENT BY CEPH RBD (#23). A ZFS snapshot exists only on the
 	// machine that took it, so a cache kept here pins a repository to the host
-	// that first built it — which is why billet is a one-machine product. This
-	// field is what the config accepts today; it is not the intended architecture.
+	// that first built it. That is the STORAGE reason billet is a one-machine
+	// product; global rather than per-node capacity (#21), escrow-time placement
+	// (#30) and broadcast teardown (#31) are the others, and Ceph fixes none of
+	// them. This field is what the config accepts today, not the intended
+	// architecture.
 	ZFSPool string `yaml:"zfs_pool"`
 	// Bridge is the host bridge guests attach to.
 	Bridge string `yaml:"bridge,omitempty"`
@@ -455,11 +458,14 @@ type Tier struct {
 	// two spellings of the same field, and guessing which one an operator meant —
 	// when the answer decides where untrusted code runs — is not a kindness.
 	//
-	// THE ORDER IS RECORDED BUT NOT YET ACTED ON. Nothing chooses among nodes
-	// today: a node binds itself, so placement can only accept or refuse the node
-	// that asked. Preference starts to bite when the node runs in its own process
-	// and the control plane picks. Listing several providers already removes the
-	// hard pin, which is what a fallback needs.
+	// THE ORDER IS HONOURED WHERE THE CONTROL PLANE PICKS, and nowhere else.
+	// nodeplane.pick walks this slice most-preferred-first over the registered
+	// nodes, so a remote node is chosen by preference rather than by map order.
+	// What does not exist is choosing at ESCROW time against per-node capacity
+	// and cost (#30) — capacity is one deployment-wide budget, so billet can
+	// advertise a slot no single machine can host. In --dev the node binds itself
+	// and placement can only accept or refuse the node that asked. And with
+	// Docker the only provider built, the ordering cannot be exercised yet.
 	Providers []ProviderKind `yaml:"providers,omitempty"`
 	// GuestOS defaults to linux. Set it explicitly for macOS and Windows tiers —
 	// licensing and capability checks key off this field, not off the label.

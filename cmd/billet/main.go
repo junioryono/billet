@@ -271,8 +271,15 @@ func cmdServer(ctx context.Context, lc *lifecycle, args []string) error {
 	// machine. It is false now, and leaving it would have made the whole feature
 	// unreachable from the command line.
 	//
-	// A control plane with no nodes yet is not an error: jobs queue until one
-	// registers, which is the ordinary state while a fleet is being set up.
+	// A control plane with no nodes yet is not an error, but it is not free
+	// either, and the earlier version of this comment said it was: "jobs queue
+	// until one registers". They do not. Capacity is advertised from the budget
+	// without consulting node availability, so a job assigned while the fleet is
+	// empty is ACQUIRED and then fails to launch with ErrNoNode. billet releases
+	// its own lease and has no way to decline the assignment, so it stays with
+	// GitHub until the pickup deadline and is requeued a bounded number of times.
+	// Start the nodes first.
+	//
 	// --dry-run remains for proving the GitHub path while advertising zero.
 
 	return runServer(ctx, lc, cfg, *dryRun, *dev)

@@ -151,7 +151,9 @@ to match a machine.
 
 > **Provisional: Ceph RBD replaces ZFS ([#23](https://github.com/junioryono/billet/issues/23)).**
 > A snapshot here exists only on this machine, so any cache written to it belongs to this host and to
-> no other — which is the reason billet is a one-machine product. Ceph runs on these same NVMe and
+> no other — the storage-specific reason billet is a one-machine product, alongside global rather
+> than per-node capacity (#21), escrow-time placement (#30) and broadcast teardown (#31). Ceph runs
+> on these same NVMe and
 > presents them as a pool every node can map. Provision ZFS today; expect to re-provision.
 
 `/var/lib/billet/node` exists at 0750 on local disk — the mdraid root, never NFS, because the state

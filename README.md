@@ -175,7 +175,7 @@ built. What works **today**:
 | `billet github-app create` | Creates and installs the GitHub App via the manifest flow |
 | `billet check` | Validates the config, the App private key, and the state database |
 | `billet server --dry-run` | Connects to a real org, reconciles scale sets, polls — accepts nothing |
-| `billet server` | The control plane on its own, serving the node wire. **Start the nodes first** — capacity is advertised from the budget without checking that any node exists, so a job assigned while none is registered is acquired, fails to launch, and is handed back. GitHub retries that about three times and then the job fails |
+| `billet server` | The control plane on its own, serving the node wire. **Start the nodes first** — capacity is advertised from the budget without checking that any node exists, so a job assigned while none is registered is acquired and fails to launch. billet releases its own capacity, but it has no way to decline the assignment — that stays with GitHub until the pickup deadline, which cancels and requeues it [up to three times](https://github.com/actions/scaleset/blob/v0.4.0/README.md#job-reassignment) |
 | `billet server --dev` | Control plane + node in one process: acquires jobs and runs them in containers |
 | `billet node` | A separate compute host that dials the control plane and never listens |
 | `billet ca issue <node>` | Mints the certificate a node authenticates with, for an operator to copy |
@@ -185,7 +185,7 @@ built. What works **today**:
 | Crash recovery | A job running when the controller dies is adopted and left to finish, not killed; its capacity stays held |
 | Graceful drain | SIGTERM stops it taking new work and waits for the jobs already running, so `systemctl restart` does not fail somebody's build. See [Updating](#updating) |
 | Release pipeline | Tagged releases with checksums, `.deb`/`.rpm` with systemd units, and the install script — **built and never yet run: there are no tags, so no release exists to install.** Build from source until there is one |
-| Multi-backend tiers | One label can name several providers and be placed on any of them. The preference ORDER is recorded but not yet acted on — see below |
+| Multi-backend tiers | One label can name several providers and be placed on any of them, and the preference order IS honoured when the control plane picks among registered nodes (`nodeplane.pick` walks it most-preferred-first). What is missing is choosing at escrow time, against per-node capacity and cost ([#30](https://github.com/junioryono/billet/issues/30)) — and Docker is the only provider built, so the ordering cannot be exercised yet |
 
 **Not built:** Firecracker, Apple Silicon and EC2 providers; the cache; sticky disks; the scheduler
 that would make provider preference and a cost policy mean something; observability; the dashboard.

@@ -129,7 +129,8 @@ node:
     #
     # BEING REPLACED BY CEPH RBD (#23). A ZFS snapshot exists only on this
     # machine, so a cache written here belongs to this host and to no other —
-    # which is what keeps billet to one machine. Set it today; expect this key
+    # which is the storage-specific reason billet is a one-machine product —
+    # capacity, placement and teardown are the others. Set it today; expect this key
     # to change once the storage layer lands.
     zfs_pool: tank
     bridge: br0
