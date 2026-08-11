@@ -24,10 +24,22 @@ func detectTotalMemory() (uint64, error) {
 		return 0, fmt.Errorf("sysinfo: %w", err)
 	}
 
+	return bytesFromBlocks(si.Totalram, si.Unit)
+}
+
+// bytesFromBlocks turns sysinfo's count-and-unit into a byte count.
+//
+// SEPARATE FROM THE SYSCALL SO THE MULTIPLICATION CAN BE TESTED, and that is not
+// ceremony: mem_unit is 1 on an ordinary 64-bit kernel, so a version of this
+// that dropped the multiply entirely would agree with the real syscall on every
+// machine billet is likely to be tested on, and be wrong by a factor of 4096 on
+// the one where it is not. A test that can only observe this host cannot see
+// that, so the arithmetic is exercised with units the host does not have.
+func bytesFromBlocks(blocks uint64, memUnit uint32) (uint64, error) {
 	// TREATED AS BYTES WHEN THE KERNEL SAYS NOTHING. mem_unit arrived in Linux
 	// 2.3.23 and is 1 on anything current, but a zero here would multiply the
 	// whole reading away and report a host with no memory at all.
-	unit := uint64(si.Unit)
+	unit := uint64(memUnit)
 	if unit == 0 {
 		unit = 1
 	}
@@ -35,10 +47,10 @@ func detectTotalMemory() (uint64, error) {
 	// CHECKED BEFORE IT IS DONE, because this product is the one place an
 	// unsigned overflow could wrap to a small number and look like a plausible
 	// reading rather than an error.
-	if si.Totalram > ^uint64(0)/unit {
+	if blocks > ^uint64(0)/unit {
 		return 0, fmt.Errorf("sysinfo reports %d blocks of %d bytes, which overflows",
-			si.Totalram, unit)
+			blocks, unit)
 	}
 
-	return si.Totalram * unit, nil
+	return blocks * unit, nil
 }
