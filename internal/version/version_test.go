@@ -139,3 +139,41 @@ func TestStringIsAlwaysReadable(t *testing.T) {
 		t.Errorf("String() = %q, which reads like a template with holes in it", got)
 	}
 }
+
+// The fallback chain, exercised directly.
+//
+// debug.ReadBuildInfo always succeeds inside a test binary and always reports
+// "(devel)", so calling Version() can never reach the second or third branch of
+// this. Testing resolve with a synthetic BuildInfo is the only way to see them —
+// and without it, deleting either branch survived every test, which looks
+// identical to the branch being unnecessary.
+//
+// Restored after an edit deleted it. `make tests-kept` is what noticed; the
+// mutation run that had proved these branches were covered would otherwise have
+// been the last time anything did.
+func TestTheFallbackChain(t *testing.T) {
+	tagged := &debug.BuildInfo{Main: debug.Module{Version: "v9.9.9"}}
+	devel := &debug.BuildInfo{Main: debug.Module{Version: "(devel)"}}
+	blank := &debug.BuildInfo{Main: debug.Module{Version: ""}}
+
+	for _, tc := range []struct {
+		name     string
+		injected string
+		info     *debug.BuildInfo
+		ok       bool
+		want     string
+	}{
+		{"injected wins over build info", "v1.2.3", tagged, true, "v1.2.3"},
+		{"build info when nothing is injected", "", tagged, true, "v9.9.9"},
+		{"(devel) is still better than nothing", "", devel, true, "(devel)"},
+		{"no build info at all", "", nil, false, unknown},
+		{"build info with an empty version", "", blank, true, unknown},
+		{"a blank injected value is not a value", "   ", tagged, true, "v9.9.9"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resolve(tc.injected, tc.info, tc.ok); got != tc.want {
+				t.Errorf("resolve(%q, …) = %q, want %q", tc.injected, got, tc.want)
+			}
+		})
+	}
+}
