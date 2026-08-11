@@ -121,3 +121,39 @@ func TestAnImpossibleFloorDoesNotStopEveryoneElse(t *testing.T) {
 		t.Error("the reserved tier cannot place anything, so nobody can use this fleet at all")
 	}
 }
+
+// A FLOOR IS KEPT WHERE ITS OWN TIER COULD RUN, and holding it anywhere else is
+// wrong in both directions at once.
+//
+// A macOS tier's reservation belongs on the Mac. Held against the machines the
+// ASKING tier happens to use, it denies those machines room to protect a floor
+// that could never be kept there, and leaves the Mac — the only host that
+// matters to it — untouched. The reserved tier is no safer and everyone else is
+// poorer.
+func TestAFloorIsHeldOnTheMachinesItsOwnTierCouldUse(t *testing.T) {
+	mac := config.Tier{
+		Label: "macos", Provider: config.ProviderTart, GuestOS: config.GuestMacOS,
+		Node: "mac-mini-1", VCPU: 4, Memory: 8 * config.GiB, Image: "macos-26",
+	}
+	mac.Reserved = 2
+
+	linux := tier("linux", 4, 8*config.GiB)
+	linux.Provider = config.ProviderDocker
+
+	a := newBareAllocator(t, Limits{MaxVCPU: 1000, MaxMemory: 4000 * config.GiB},
+		[]config.Tier{mac, linux})
+
+	// The Mac, which is the only host the reserved tier can use.
+	mustRegister(t, a, NodeRegistration{
+		Name: "mac-mini-1", Provider: config.ProviderTart, VCPU: 64, Memory: 512 * config.GiB})
+
+	// A docker box with room for exactly two of the linux tier, and no business
+	// keeping a macOS reservation.
+	mustRegister(t, a, NodeRegistration{
+		Name: "docker-box", Provider: config.ProviderDocker, VCPU: 8, Memory: 64 * config.GiB})
+
+	if got, want := headroom(t, a, "linux"), 2; got != want {
+		t.Errorf("the linux tier was offered %d of its %d slots; a macOS floor is being kept "+
+			"on a machine that cannot boot macOS", got, want)
+	}
+}

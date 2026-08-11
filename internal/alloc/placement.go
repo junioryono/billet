@@ -37,24 +37,34 @@ type placer struct {
 	policy config.PlacementPolicy
 }
 
-// newPlacer measures the fleet for one tier.
+// fleet is what every machine has left, measured once.
 //
-// INSIDE THE CALLER'S TRANSACTION, which is what makes the whole thing atomic
-// against a concurrent escrow. Measuring outside it would be a read followed by
-// a hopeful write — the 7x overcommit this package exists to prevent.
-func (a *Allocator) newPlacer(ctx context.Context, tx *sql.Tx, t config.Tier) (*placer, error) {
-	nodes, err := a.eligibleNodes(ctx, tx, t)
+// MEASURED OVER THE WHOLE FLEET, NOT ONE TIER'S CANDIDATES, because tiers
+// compete for the same machines and a floor belonging to another tier has to be
+// held on the hosts IT could use. A per-tier measurement has no entry for a
+// machine that tier cannot use — so a macOS floor weighed against a docker
+// tier's candidates was held on docker boxes: room denied to protect a
+// reservation that could never be kept there, and the Mac left untouched.
+type fleet struct {
+	vcpu   map[string]int
+	memory map[string]config.ByteSize
+	macOS  map[string]int
+}
+
+// fleetResources measures every reachable machine, inside the caller's
+// transaction — which is what makes the whole thing atomic against a concurrent
+// escrow. Measuring outside it would be a read followed by a hopeful write, the
+// 7x overcommit this package exists to prevent.
+func (a *Allocator) fleetResources(ctx context.Context, tx *sql.Tx) (*fleet, error) {
+	nodes, err := a.liveNodes(ctx, tx)
 	if err != nil {
 		return nil, err
 	}
 
-	p := &placer{
-		order:      nodes,
-		freeVCPU:   make(map[string]int, len(nodes)),
-		freeMemory: make(map[string]config.ByteSize, len(nodes)),
-		freeMacOS:  make(map[string]int, len(nodes)),
-		rank:       make(map[string]int, len(nodes)),
-		policy:     a.placement.Or(),
+	f := &fleet{
+		vcpu:   make(map[string]int, len(nodes)),
+		memory: make(map[string]config.ByteSize, len(nodes)),
+		macOS:  make(map[string]int, len(nodes)),
 	}
 
 	for _, n := range nodes {
@@ -63,15 +73,40 @@ func (a *Allocator) newPlacer(ctx context.Context, tx *sql.Tx, t config.Tier) (*
 			return nil, err
 		}
 
-		p.freeVCPU[n.name] = n.vcpu - used.VCPU
-		p.freeMemory[n.name] = n.memory - used.Memory
+		f.vcpu[n.name] = n.vcpu - used.VCPU
+		f.memory[n.name] = n.memory - used.Memory
 
 		guests, err := a.countOpenMacOSByNode(ctx, tx, n.name)
 		if err != nil {
 			return nil, err
 		}
 
-		p.freeMacOS[n.name] = a.macOSLimit(n.name) - guests
+		f.macOS[n.name] = a.macOSLimit(n.name) - guests
+	}
+
+	return f, nil
+}
+
+// forTier is a placer over the hosts one tier may use, spending the fleet's
+// shared remaining resources.
+//
+// SHARED ON PURPOSE: whatever one tier's floor takes is gone from the machines
+// every other tier is offered, because they are the same machines.
+func (f *fleet) forTier(
+	ctx context.Context, tx *sql.Tx, a *Allocator, t config.Tier,
+) (*placer, error) {
+	nodes, err := a.eligibleNodes(ctx, tx, t)
+	if err != nil {
+		return nil, err
+	}
+
+	p := &placer{
+		order:      nodes,
+		freeVCPU:   f.vcpu,
+		freeMemory: f.memory,
+		freeMacOS:  f.macOS,
+		rank:       make(map[string]int, len(nodes)),
+		policy:     a.placement.Or(),
 	}
 
 	p.rankBy(t)
@@ -89,16 +124,16 @@ func (a *Allocator) newPlacer(ctx context.Context, tx *sql.Tx, t config.Tier) (*
 func (a *Allocator) placerWithFloors(
 	ctx context.Context, tx *sql.Tx, t config.Tier,
 ) (*placer, error) {
-	p, err := a.newPlacer(ctx, tx, t)
+	free, err := a.fleetResources(ctx, tx)
 	if err != nil {
 		return nil, err
 	}
 
-	if err := a.reserveFloors(ctx, tx, t.Label, p); err != nil {
+	if err := a.reserveFloors(ctx, tx, t.Label, free); err != nil {
 		return nil, err
 	}
 
-	return p, nil
+	return free.forTier(ctx, tx, a, t)
 }
 
 // rankBy scores the hosts against one tier's provider preference.
