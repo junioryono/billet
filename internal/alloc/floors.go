@@ -34,7 +34,7 @@ import (
 // literally would refuse every other tier forever while waiting for room that
 // cannot exist. Billet holds back what it can and lets the rest compete.
 func (a *Allocator) reserveFloors(
-	ctx context.Context, tx *sql.Tx, forTier string, p *placer,
+	ctx context.Context, tx *sql.Tx, forTier string, free *fleet,
 ) error {
 	held, err := a.countOpenPerTier(ctx, tx)
 	if err != nil {
@@ -65,7 +65,9 @@ func (a *Allocator) reserveFloors(
 			continue
 		}
 
-		a.holdFloor(t, missing, p)
+		if err := a.holdFloor(ctx, tx, t, missing, free); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -78,26 +80,26 @@ func (a *Allocator) reserveFloors(
 // is kept on the Mac, and holding it anywhere else would reserve room that tier
 // could never use. Only the hosts they SHARE are actually affected, which is
 // exactly the contention a floor is meant to survive.
-func (a *Allocator) holdFloor(t config.Tier, missing int, p *placer) {
-	// RANKED FOR THE FLOOR'S OWN TIER while spending the caller's resources: the
-	// hosts are the same machines, so what this takes is unavailable to whoever
-	// asked. Preference belongs to the tier being reserved for.
-	held := &placer{
-		order:      p.order,
-		freeVCPU:   p.freeVCPU,
-		freeMemory: p.freeMemory,
-		freeMacOS:  p.freeMacOS,
-		rank:       make(map[string]int, len(p.order)),
-		policy:     p.policy,
+func (a *Allocator) holdFloor(
+	ctx context.Context, tx *sql.Tx, t config.Tier, missing int, free *fleet,
+) error {
+	// ITS OWN CANDIDATES, SPENDING THE SHARED FLEET. A floor on a macOS tier is
+	// kept on the Mac; holding it against whichever machines the ASKING tier
+	// happens to use is wrong twice — it denies them room to protect a
+	// reservation that could never be kept there, and leaves the only host that
+	// matters untouched.
+	held, err := free.forTier(ctx, tx, a, t)
+	if err != nil {
+		return err
 	}
-
-	held.rankBy(t)
 
 	for range missing {
 		if _, ok := held.next(t); !ok {
 			// The fleet cannot keep the rest of this floor. Stopping here is what
 			// keeps an impossible reservation from freezing everyone else.
-			return
+			return nil
 		}
 	}
+
+	return nil
 }

@@ -237,3 +237,45 @@ func (a *Allocator) Stranded(ctx context.Context, ids []string) ([]string, error
 
 	return out, nil
 }
+
+// liveNodes lists every reachable host, whatever any tier can use.
+//
+// THE WHOLE FLEET, because tiers compete for the same machines: a floor
+// belonging to one tier is held on the hosts IT could use, which the asking
+// tier may not share. Measuring only one tier's candidates left no entry for a
+// machine it cannot use, so another tier's reservation had nowhere correct to go.
+func (a *Allocator) liveNodes(ctx context.Context, tx *sql.Tx) ([]nodeRow, error) {
+	rows, err := tx.QueryContext(ctx,
+		`SELECT name, provider, site, total_vcpu, total_memory
+		   FROM nodes
+		  WHERE live = 1 AND drained = 0
+		  ORDER BY name`)
+	if err != nil {
+		return nil, fmt.Errorf("alloc: list the fleet: %w", err)
+	}
+
+	defer func() { _ = rows.Close() }()
+
+	var out []nodeRow
+
+	for rows.Next() {
+		var (
+			n        nodeRow
+			provider string
+			memory   int64
+		)
+
+		if err := rows.Scan(&n.name, &provider, &n.site, &n.vcpu, &memory); err != nil {
+			return nil, fmt.Errorf("alloc: read a node row: %w", err)
+		}
+
+		n.provider, n.memory = config.ProviderKind(provider), config.ByteSize(memory)
+		out = append(out, n)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("alloc: list the fleet: %w", err)
+	}
+
+	return out, nil
+}
