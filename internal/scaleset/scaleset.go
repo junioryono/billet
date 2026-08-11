@@ -71,6 +71,12 @@ func New(cfg Config, log *slog.Logger) (*Client, error) {
 		log = slog.Default()
 	}
 
+	// THE VENDORED CLIENT GETS A QUIETENED LOGGER, not billet's own. It hands this
+	// to a retryable HTTP transport that reports every failed request at Error,
+	// and a shutdown cancels the long poll in flight — so an ordinary restart
+	// would end with an ERROR line every time. See quieten.
+	quiet := slog.New(quieten(log.Handler()))
+
 	c, err := gh.NewClientWithGitHubApp(gh.ClientWithGitHubAppConfig{
 		GitHubConfigURL: cfg.ConfigURL,
 		GitHubAppAuth: gh.GitHubAppAuth{
@@ -79,7 +85,7 @@ func New(cfg Config, log *slog.Logger) (*Client, error) {
 			PrivateKey:     cfg.PrivateKey,
 		},
 		SystemInfo: systemInfo(),
-	}, gh.WithLogger(log))
+	}, gh.WithLogger(quiet))
 	if err != nil {
 		// NOT wrapped with the config: GitHubAppAuth holds the private key, and a
 		// validation error that renders the struct it validated would put it in

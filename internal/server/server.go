@@ -51,6 +51,18 @@ type Server struct {
 	maxCapacity *int
 	// reapEvery is how often abandoned capacity is reclaimed.
 	reapEvery time.Duration
+	// hurry, when closed, ends every listener's drain wait early.
+	hurry <-chan struct{}
+	// drainTimeout is how long every listener waits for its running jobs on
+	// shutdown.
+	//
+	// A POINTER so "never configured" is distinguishable from "configured as
+	// zero". Guarding on `> 0` instead made WithDrainTimeout(0) silently select
+	// the default — which is the exact substitution checkGrace refuses to make,
+	// for the reason it gives: omitting the option already selects the default,
+	// so passing zero is an explicit instruction and swallowing it removes the
+	// evidence of the mistake.
+	drainTimeout *time.Duration
 	// runner is handed to every listener, so an assigned lease becomes compute.
 	// nil means none is attached and the listeners fail closed.
 	runner Runner
@@ -81,6 +93,44 @@ func WithReapInterval(d time.Duration) ControlPlaneOption {
 // the work, rather than accepting jobs nothing can run.
 func WithNodeRunner(r Runner) ControlPlaneOption {
 	return func(s *Server) { s.runner = r }
+}
+
+// WithDrainTimeout sets how long every listener waits for the jobs it is
+// already running before a shutdown destroys them.
+//
+// This is the operator's key — server.drain_timeout — reaching the code that
+// honours it. See defaultDrainGrace for why the default is the length of a job
+// rather than the length of a shutdown.
+func WithDrainTimeout(d time.Duration) ControlPlaneOption {
+	return func(s *Server) { s.drainTimeout = &d }
+}
+
+// WithHurry gives every listener the channel that ends its drain wait early.
+//
+// This is the operator's second signal reaching the code that honours it. See
+// WithHurrySignal for what a listener does with it.
+func WithHurry(c <-chan struct{}) ControlPlaneOption {
+	return func(s *Server) { s.hurry = c }
+}
+
+// OptionsFromConfig is the control-plane configuration implied by billet.yaml.
+//
+// It lives here rather than in cmd/billet so the whole chain — the YAML key, the
+// parse, the control-plane option, and the listener it configures — is one
+// package's worth of code and can be tested end to end. Assembling it at the
+// call site left the only link that matters, a value reaching a listener,
+// spanning two packages with a test on neither side of the join.
+func OptionsFromConfig(cfg *config.Config) ([]ControlPlaneOption, error) {
+	if cfg == nil {
+		return nil, nil
+	}
+
+	drain, err := cfg.Server.DrainTimeoutDuration()
+	if err != nil {
+		return nil, err
+	}
+
+	return []ControlPlaneOption{WithDrainTimeout(drain)}, nil
 }
 
 // AdvertiseNothing makes every listener advertise zero capacity.
@@ -243,6 +293,17 @@ func (s *Server) runTier(ctx context.Context, t *config.Tier, set *ScaleSet) err
 	// what put them in the wrong order: Go runs Run's defer first, so the escrow
 	// went back while the advertisement was still live.
 
+	return NewListener(s.alloc, t.Label, session, s.listenerOpts()...).Run(ctx)
+}
+
+// listenerOpts is what every listener this control plane starts is configured
+// with.
+//
+// Factored out of runTier so a test can assert that a control-plane option
+// actually reaches a listener. Asserting on the option alone passes while the
+// value never leaves the config file, which is the whole failure worth catching
+// here.
+func (s *Server) listenerOpts() []Option {
 	opts := []Option{WithLogger(s.log)}
 	if s.maxCapacity != nil {
 		opts = append(opts, WithMaxCapacity(*s.maxCapacity))
@@ -252,7 +313,19 @@ func (s *Server) runTier(ctx context.Context, t *config.Tier, set *ScaleSet) err
 		opts = append(opts, WithRunner(s.runner))
 	}
 
-	return NewListener(s.alloc, t.Label, session, opts...).Run(ctx)
+	// FORWARDED WHENEVER IT WAS SET, including a zero or negative one. Filtering
+	// those out here would hide them from the listener's own validation and leave
+	// Run using a default nobody asked for; passing them through means configError
+	// refuses to start, which is what every other budget does.
+	if s.hurry != nil {
+		opts = append(opts, WithHurrySignal(s.hurry))
+	}
+
+	if s.drainTimeout != nil {
+		opts = append(opts, WithDrainGrace(*s.drainTimeout))
+	}
+
+	return opts
 }
 
 // reapPeriodically reclaims capacity from leases whose holder stopped

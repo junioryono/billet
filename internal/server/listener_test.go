@@ -19,6 +19,19 @@ import (
 	"github.com/junioryono/billet/internal/state"
 )
 
+// notDrainingHere is the drain grace for tests that are NOT about draining.
+//
+// Cancelling with a job still running now means a drain: the listener waits for
+// a completion before tearing anything down. These fake sessions were written
+// before the drain existed and never send one, so on the real six-hour default
+// they would wait it out — which is the drain working correctly, since the job
+// genuinely is still running.
+//
+// A test about escrow, acquisition or teardown says here that it is not testing
+// the drain. Shortening the drain for everybody to keep them passing would be
+// the wrong fix, and would quietly delete the behaviour from production.
+const notDrainingHere = 50 * time.Millisecond
+
 // tierVCPU is the size of every tier in these tests. One number, so the capacity
 // arithmetic in the assertions can be read without cross-referencing.
 const tierVCPU = 4
@@ -230,7 +243,8 @@ func TestAvailableIsAcquiredAndAssignedConsumesEscrow(t *testing.T) {
 		// A runner that starts things, because these assertions are about escrow
 		// rather than launching. The default fails closed, which correctly hands
 		// the capacity back and would empty every count below.
-		WithRunner(&fakeRunner{}))
+		WithRunner(&fakeRunner{}),
+		WithDrainGrace(notDrainingHere))
 
 	// Observed DURING the run. Shutdown releases running leases as well as held
 	// ones — correctly, since nothing can be executing them yet — so anything
@@ -320,7 +334,8 @@ func TestRedeliveredAssignmentDoesNotConsumeASecondLease(t *testing.T) {
 		// A runner that starts things, because these assertions are about escrow
 		// rather than launching. The default fails closed, which correctly hands
 		// the capacity back and would empty every count below.
-		WithRunner(&fakeRunner{}))
+		WithRunner(&fakeRunner{}),
+		WithDrainGrace(notDrainingHere))
 
 	var running atomic.Int32
 
@@ -665,7 +680,8 @@ func TestOffersAreAcquiredOnlyUpToFreeEscrow(t *testing.T) {
 		// A runner that starts things, because these assertions are about escrow
 		// rather than launching. The default fails closed, which correctly hands
 		// the capacity back and would empty every count below.
-		WithRunner(&fakeRunner{}))
+		WithRunner(&fakeRunner{}),
+		WithDrainGrace(notDrainingHere))
 
 	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run: %v", err)
@@ -885,7 +901,7 @@ func TestOneLeaseCannotBackTwoAcquisitions(t *testing.T) {
 		return nil, ErrNoMessage
 	}
 
-	l := NewListener(a, tiers[0].Label, session)
+	l := NewListener(a, tiers[0].Label, session, WithDrainGrace(notDrainingHere))
 
 	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run: %v", err)
@@ -941,7 +957,7 @@ func TestEscrowIsReturnedWhenAnOfferIsNotGranted(t *testing.T) {
 		return nil, ErrNoMessage
 	}
 
-	l = NewListener(a, tiers[0].Label, session)
+	l = NewListener(a, tiers[0].Label, session, WithDrainGrace(notDrainingHere))
 
 	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run: %v", err)
@@ -1067,7 +1083,7 @@ func TestACancelledOfferReturnsItsPromisedEscrow(t *testing.T) {
 		return nil, ErrNoMessage
 	}
 
-	l := NewListener(a, tiers[0].Label, session)
+	l := NewListener(a, tiers[0].Label, session, WithDrainGrace(notDrainingHere))
 
 	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run: %v", err)
@@ -1153,7 +1169,8 @@ func TestAStalePromiseIsReportedAndKept(t *testing.T) {
 	l = NewListener(a, tiers[0].Label, session,
 		WithStalePromiseAfter(100*time.Millisecond),
 		WithLogger(slog.New(slog.NewTextHandler(&syncWriter{mu: &logMu, w: &logged},
-			&slog.HandlerOptions{Level: slog.LevelWarn}))))
+			&slog.HandlerOptions{Level: slog.LevelWarn}))),
+		WithDrainGrace(notDrainingHere))
 
 	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run: %v", err)
@@ -1242,7 +1259,8 @@ func TestAReofferedRequestKeepsItsExistingPromise(t *testing.T) {
 		// A runner that starts things, because these assertions are about escrow
 		// rather than launching. The default fails closed, which correctly hands
 		// the capacity back and would empty every count below.
-		WithRunner(&fakeRunner{}))
+		WithRunner(&fakeRunner{}),
+		WithDrainGrace(notDrainingHere))
 
 	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run: %v", err)
@@ -1499,7 +1517,7 @@ func TestCapacityIsHeldWhenTheComputeWillNotDie(t *testing.T) {
 		return nil, ErrNoMessage
 	}
 
-	l := NewListener(a, tiers[0].Label, session, WithRunner(runner))
+	l := NewListener(a, tiers[0].Label, session, WithRunner(runner), WithDrainGrace(notDrainingHere))
 
 	// NOT fatal, and that is a deliberate separation of two questions. A listener
 	// error cancels every other listener, and their shutdowns then destroy every
@@ -2051,7 +2069,7 @@ func TestRenewalOutlivesTheShutdownRelease(t *testing.T) {
 		return nil
 	}}
 
-	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner))
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner), WithDrainGrace(notDrainingHere))
 
 	lease := holdRunning(t, l, a, tiers[0].Label, 7)
 
@@ -2128,7 +2146,7 @@ func TestShutdownDestroysEachRequestOnce(t *testing.T) {
 		return nil
 	}}
 
-	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner))
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner), WithDrainGrace(notDrainingHere))
 
 	// In BOTH sets: a running lease and a cleanup record for the same request,
 	// which is the ordinary state after a completion whose destroy failed.
@@ -2440,7 +2458,8 @@ func TestAnOverrunningPhaseCannotPushTheNextPastTheBudget(t *testing.T) {
 	}}
 
 	l := NewListener(a, tiers[0].Label, session, WithRunner(runner),
-		WithShutdownGrace(destroying), WithFinishGraces(closing, releasing))
+		WithShutdownGrace(destroying), WithFinishGraces(closing, releasing),
+		WithDrainGrace(notDrainingHere))
 
 	holdRunning(t, l, a, tiers[0].Label, 7)
 
@@ -2671,7 +2690,8 @@ func TestAStuckCleanupRetryDoesNotStarveTheDestroys(t *testing.T) {
 	}}
 
 	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner),
-		WithShutdownGrace(grace), WithFinishGraces(time.Second, time.Second))
+		WithShutdownGrace(grace), WithFinishGraces(time.Second, time.Second),
+		WithDrainGrace(notDrainingHere))
 
 	holdRunning(t, l, a, tiers[0].Label, 9)
 
@@ -2751,7 +2771,8 @@ func TestAFinishedRetryDoesNotBlockTheShutdownDestroy(t *testing.T) {
 	}}
 
 	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner),
-		WithCleanupRetryPacing(0, 0))
+		WithCleanupRetryPacing(0, 0),
+		WithDrainGrace(notDrainingHere))
 
 	holdRunning(t, l, a, tiers[0].Label, 7)
 
@@ -2827,7 +2848,8 @@ func TestADestroyThatOutrunsTheBudgetStopsTheTeardown(t *testing.T) {
 	session := &fakeSession{}
 
 	l := NewListener(a, tiers[0].Label, session, WithRunner(runner),
-		WithShutdownGrace(destroying), WithFinishGraces(finishing, finishing))
+		WithShutdownGrace(destroying), WithFinishGraces(finishing, finishing),
+		WithDrainGrace(notDrainingHere))
 
 	holdRunning(t, l, a, tiers[0].Label, 7)
 
@@ -3186,7 +3208,8 @@ func TestASlowDestroyDoesNotCostTheReleaseItsBudget(t *testing.T) {
 	}}
 
 	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner),
-		WithShutdownGrace(grace))
+		WithShutdownGrace(grace),
+		WithDrainGrace(notDrainingHere))
 
 	holdRunning(t, l, a, tiers[0].Label, 7)
 
@@ -3252,7 +3275,8 @@ func TestASlowCloseDoesNotCostTheReleaseItsBudget(t *testing.T) {
 	}}
 
 	l := NewListener(a, tiers[0].Label, session, WithRunner(&fakeRunner{}),
-		WithFinishGraces(closing, 10*time.Second))
+		WithFinishGraces(closing, 10*time.Second),
+		WithDrainGrace(notDrainingHere))
 
 	holdRunning(t, l, a, tiers[0].Label, 7)
 
@@ -3847,7 +3871,7 @@ func TestASessionThatWillNotCloseStillDestroysItsCompute(t *testing.T) {
 		return errors.New("the scale set session is not answering")
 	}}
 
-	l := NewListener(a, tiers[0].Label, session, WithRunner(runner))
+	l := NewListener(a, tiers[0].Label, session, WithRunner(runner), WithDrainGrace(notDrainingHere))
 
 	// A record whose lease this listener STILL HOLDS, which is the case the drain
 	// used to skip. Not due for an hour, so the retry loop cannot be what destroys
@@ -3935,7 +3959,8 @@ func TestRenewalCoversTheWholeShutdownBudget(t *testing.T) {
 	}}
 
 	l := NewListener(a, tiers[0].Label, session, WithRunner(&fakeRunner{}),
-		WithShutdownGrace(grace), WithFinishGraces(closing, closing))
+		WithShutdownGrace(grace), WithFinishGraces(closing, closing),
+		WithDrainGrace(notDrainingHere))
 
 	lease := holdRunning(t, l, a, tiers[0].Label, 7)
 
@@ -4035,7 +4060,8 @@ func TestAWedgedTeardownStopsRenewing(t *testing.T) {
 	// so they are small here for the same reason the grace is: the test is about
 	// what happens when the whole budget is spent, not about how long it is.
 	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner),
-		WithShutdownGrace(grace), WithFinishGraces(grace/3, grace/3))
+		WithShutdownGrace(grace), WithFinishGraces(grace/3, grace/3),
+		WithDrainGrace(notDrainingHere))
 
 	lease := holdRunning(t, l, a, tiers[0].Label, 7)
 

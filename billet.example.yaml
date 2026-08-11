@@ -31,6 +31,23 @@ server:
   # holds the capacity ledger.
   state_dir: /var/lib/billet/server
 
+  # How long a stopping billet waits for the jobs it is ALREADY running before it
+  # destroys them. This is what makes `systemctl restart` free rather than a way
+  # to fail somebody's CI.
+  #
+  # Defaults to 6h, which is how long GitHub lets a job run by default — not how
+  # long a shutdown ought to take. Raise it if your jobs run longer, as
+  # self-hosted runners often are: a drain shorter than your longest job kills
+  # exactly the work it exists to protect. Overrunning it is safe — billet stops
+  # waiting and destroys what is left, which is what it did before there was a
+  # drain at all.
+  #
+  # A service manager's stop timeout must exceed this PLUS the teardown, or its
+  # own expiry arrives first as a SIGKILL, which skips the teardown and strands
+  # the containers. The shipped units size TimeoutStopSec from this.
+  #
+  # drain_timeout: 6h
+
   # Hard ceiling on what the allocator will hand out across every tier combined.
   # Capacity is escrowed before each scale-set listener advertises to GitHub, so
   # this is what stops concurrent tiers from collectively overcommitting the box.
@@ -90,6 +107,14 @@ node:
   # about held capacity either way, which is the signal that actually helps.
   #
   # max_custody: 24h
+
+  # How long a stopping node waits for the compute it is still holding before it
+  # gives up and lets the teardown destroy it. Defaults to 6h.
+  #
+  # Separate from the control plane's key on purpose: a node and a control plane
+  # are restarted for different reasons and need not wait the same amount of time.
+  #
+  # drain_timeout: 6h
 
   firecracker:
     # The guest kernel must include everything Docker needs, or service
