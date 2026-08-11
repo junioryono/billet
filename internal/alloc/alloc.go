@@ -1082,15 +1082,15 @@ type NodeRegistration struct {
 // on re-registration so a previous instance of the same host — a process that
 // was killed and came back, or one that hung and returned — finds its writes
 // refused rather than operating on leases the new instance now owns.
-func (a *Allocator) RegisterNode(ctx context.Context, reg NodeRegistration) error {
+func (a *Allocator) RegisterNode(ctx context.Context, reg NodeRegistration) (int64, error) {
 	name, kind := reg.Name, reg.Provider
 
 	if name == "" {
-		return errors.New("alloc: a node must have a name")
+		return 0, errors.New("alloc: a node must have a name")
 	}
 
 	if kind == "" {
-		return fmt.Errorf("alloc: node %s registered no provider, so nothing could be placed "+
+		return 0, fmt.Errorf("alloc: node %s registered no provider, so nothing could be placed "+
 			"on it safely", name)
 	}
 
@@ -1100,16 +1100,18 @@ func (a *Allocator) RegisterNode(ctx context.Context, reg NodeRegistration) erro
 	// while the machine sits there looking healthy. There is no later error to
 	// find, and no log line that points at the cause.
 	if reg.VCPU <= 0 {
-		return fmt.Errorf("alloc: node %s contributes %d vcpu; a host that offers no cores "+
+		return 0, fmt.Errorf("alloc: node %s contributes %d vcpu; a host that offers no cores "+
 			"can never be given work", name, reg.VCPU)
 	}
 
 	if reg.Memory <= 0 {
-		return fmt.Errorf("alloc: node %s contributes %s of memory; a host that offers none "+
+		return 0, fmt.Errorf("alloc: node %s contributes %s of memory; a host that offers none "+
 			"can never be given work", name, reg.Memory)
 	}
 
-	return a.db.Tx(ctx, func(tx *sql.Tx) error {
+	var epoch int64
+
+	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
 		now := ts(a.now().UTC())
 
 		// A HOST MAY NOT CHANGE ITS BACKEND WHILE IT IS RUNNING WORK.
@@ -1194,18 +1196,70 @@ func (a *Allocator) RegisterNode(ctx context.Context, reg NodeRegistration) erro
 		// already open keep their capacity charged, so the only effect is that no
 		// new work fits until enough of them drain. Refusing that would take a
 		// machine out of the fleet for telling the truth about itself.
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO nodes (name, provider, site, total_vcpu, total_memory, last_seen_at)
-			 VALUES (?, ?, ?, ?, ?, ?)
+		// LIVE, AND THE EPOCH COMES BACK OUT. The epoch is this row's fencing token
+		// — it moves on every registration — and returning it is what lets a later
+		// "this node is gone" be attributed to the incarnation that actually went.
+		// RETURNING makes that one statement rather than a write and a hopeful read.
+		if err := tx.QueryRowContext(ctx,
+			`INSERT INTO nodes (name, provider, site, total_vcpu, total_memory, last_seen_at, live)
+			 VALUES (?, ?, ?, ?, ?, ?, 1)
 			 ON CONFLICT (name) DO UPDATE SET
 			   provider     = excluded.provider,
 			   site         = excluded.site,
 			   total_vcpu   = excluded.total_vcpu,
 			   total_memory = excluded.total_memory,
 			   last_seen_at = excluded.last_seen_at,
-			   epoch        = nodes.epoch + 1`,
-			name, string(kind), reg.Site, reg.VCPU, int64(reg.Memory), now); err != nil {
+			   live         = 1,
+			   epoch        = nodes.epoch + 1
+			 RETURNING epoch`,
+			name, string(kind), reg.Site, reg.VCPU, int64(reg.Memory), now).Scan(&epoch); err != nil {
 			return fmt.Errorf("alloc: register node %s: %w", name, err)
+		}
+
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+
+	return epoch, nil
+}
+
+// NodeGone records that the control plane has given up on a host.
+//
+// FENCED ON THE EPOCH, and the race it prevents is in the ordering of the code
+// rather than in theory. Registration commits to the ledger BEFORE it takes the
+// plane's mutex, and expiry holds that mutex while dropping the old entry — so a
+// host that restarts quickly can commit its new registration and then be marked
+// dead by the expiry of the incarnation it replaced. The ledger would say the
+// fleet is empty while the plane launches onto a node that is right there, and
+// every tier would advertise zero against a working machine.
+//
+// A no-op once the epoch has moved, which is the whole point: the write matches
+// nothing.
+func (a *Allocator) NodeGone(ctx context.Context, name string, epoch int64) error {
+	return a.db.Tx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE nodes SET live = 0 WHERE name = ? AND epoch = ?`, name, epoch); err != nil {
+			return fmt.Errorf("alloc: mark node %s gone: %w", name, err)
+		}
+
+		return nil
+	})
+}
+
+// ForgetEveryNode marks the whole fleet unreachable, for a control plane that
+// has just started.
+//
+// LIVENESS IS THE PLANE'S JUDGEMENT, and a plane that has just started has not
+// formed one — its map is empty. Rows left by the previous process would
+// otherwise back advertisements for machines this one has never heard from,
+// which is over-advertisement wearing a different hat. Every node re-registers
+// within a poll, so the cost is a brief zero that is also the truth.
+func (a *Allocator) ForgetEveryNode(ctx context.Context) error {
+	return a.db.Tx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `UPDATE nodes SET live = 0`); err != nil {
+			return fmt.Errorf("alloc: forget the fleet: %w", err)
 		}
 
 		return nil

@@ -513,7 +513,7 @@ func runServer(ctx context.Context, lc *lifecycle, cfg *config.Config, dryRun, d
 			slog.Default().Warn(w, "node", cfg.Node.Name)
 		}
 
-		if err := allocator.RegisterNode(ctx, alloc.NodeRegistration{
+		if _, err := allocator.RegisterNode(ctx, alloc.NodeRegistration{
 			Name:     cfg.Node.Name,
 			Provider: cfg.Node.Provider,
 			Site:     cfg.Node.Site,
@@ -565,12 +565,29 @@ func runServer(ctx context.Context, lc *lifecycle, cfg *config.Config, dryRun, d
 		// reason to list them.
 		nodeplane.WithSites(cfg.SiteNames()))
 
+	// NOTHING IS LIVE UNTIL IT SAYS SO AGAIN.
+	//
+	// Liveness is the plane's judgement and this plane has just started, so it has
+	// none: its map is empty. Rows left by the previous process would otherwise
+	// back advertisements for machines this one has never heard from, which is the
+	// same over-advertisement the per-node budget exists to prevent, arriving
+	// through a restart instead. Every node re-registers within a poll.
+	if err := allocator.ForgetEveryNode(ctx); err != nil {
+		return fmt.Errorf("server: could not clear the fleet's liveness: %w", err)
+	}
+
 	stopWire, err := serveNodeWire(ctx, cfg, owner, nodes, allocator, wiring.NodeJIT{Client: client})
 	if err != nil {
 		return err
 	}
 
 	defer stopWire()
+
+	// A TIMER, BECAUSE NOTHING ELSE ASKS. A node's liveness now decides what its
+	// tier advertises, and an idle deployment never launches, lists or destroys —
+	// so without this a host that crashed on a quiet afternoon would keep its
+	// capacity advertised until somebody happened to need it.
+	go nodes.Watch(ctx)
 
 	// THE REMOTE PLANE DRIVES COMPUTE WHENEVER THERE IS NO LOCAL NODE.
 	//

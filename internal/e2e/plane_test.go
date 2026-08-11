@@ -399,7 +399,7 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 	// that stopped it — the node would bind happily against a row this harness
 	// had helpfully created.
 	if !sc.wire {
-		if err := a.RegisterNode(t.Context(), alloc.NodeRegistration{Name: host, Provider: config.ProviderDocker, VCPU: testNodeVCPU, Memory: testNodeMemory}); err != nil {
+		if _, err := a.RegisterNode(t.Context(), alloc.NodeRegistration{Name: host, Provider: config.ProviderDocker, VCPU: testNodeVCPU, Memory: testNodeMemory}); err != nil {
 			t.Fatalf("RegisterNode: %v", err)
 		}
 	}
