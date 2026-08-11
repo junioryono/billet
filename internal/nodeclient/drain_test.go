@@ -39,6 +39,9 @@ func TestASignalledNodeDrainsWithoutHandingOverCustody(t *testing.T) {
 
 	go func() {
 		done <- nodeclient.Run(ctx, c, compute, nodeclient.LoopOptions{
+			// What this host contributes; the control plane refuses a node offering none.
+			VCPU:         testNodeVCPU,
+			Memory:       testNodeMemory,
 			Provider:     config.ProviderDocker,
 			Deployment:   deployment,
 			Log:          slog.New(slog.DiscardHandler),
@@ -112,6 +115,9 @@ func TestANodeHoldingNothingStopsImmediatelyAndSaysNothingAboutDraining(t *testi
 
 	go func() {
 		done <- nodeclient.Run(ctx, c, compute, nodeclient.LoopOptions{
+			// What this host contributes; the control plane refuses a node offering none.
+			VCPU:       testNodeVCPU,
+			Memory:     testNodeMemory,
 			Provider:   config.ProviderDocker,
 			Deployment: deployment,
 			Log: slog.New(slog.NewTextHandler(&lockedWriter{mu: &logMu, w: &logged},
@@ -186,6 +192,9 @@ func TestANodeDrainIsBounded(t *testing.T) {
 
 	go func() {
 		done <- nodeclient.Run(ctx, c, compute, nodeclient.LoopOptions{
+			// What this host contributes; the control plane refuses a node offering none.
+			VCPU:       testNodeVCPU,
+			Memory:     testNodeMemory,
 			Provider:   config.ProviderDocker,
 			Deployment: deployment,
 			Log: slog.New(slog.NewTextHandler(&lockedWriter{mu: &logMu, w: &logged},
@@ -240,6 +249,9 @@ func TestASecondSignalEndsTheNodesDrain(t *testing.T) {
 
 	go func() {
 		done <- nodeclient.Run(ctx, c, compute, nodeclient.LoopOptions{
+			// What this host contributes; the control plane refuses a node offering none.
+			VCPU:       testNodeVCPU,
+			Memory:     testNodeMemory,
 			Provider:   config.ProviderDocker,
 			Deployment: deployment,
 			Log:        slog.New(slog.DiscardHandler),
@@ -298,6 +310,9 @@ func TestTheJanitorKeepsRenewingForTheWholeDrain(t *testing.T) {
 
 	go func() {
 		done <- nodeclient.Run(ctx, c, compute, nodeclient.LoopOptions{
+			// What this host contributes; the control plane refuses a node offering none.
+			VCPU:         testNodeVCPU,
+			Memory:       testNodeMemory,
 			Provider:     config.ProviderDocker,
 			Deployment:   deployment,
 			Log:          slog.New(slog.DiscardHandler),
@@ -359,6 +374,9 @@ func TestADrainingNodeAcceptsDestroyAndRefusesLaunch(t *testing.T) {
 
 	go func() {
 		done <- nodeclient.Run(ctx, c, compute, nodeclient.LoopOptions{
+			// What this host contributes; the control plane refuses a node offering none.
+			VCPU:         testNodeVCPU,
+			Memory:       testNodeMemory,
 			Provider:     config.ProviderDocker,
 			Deployment:   deployment,
 			Log:          slog.New(slog.DiscardHandler),

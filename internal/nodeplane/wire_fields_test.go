@@ -1,0 +1,62 @@
+package nodeplane_test
+
+import (
+	"testing"
+
+	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/nodeclient"
+	"github.com/junioryono/billet/internal/nodeplane"
+)
+
+// WHAT THE NODE SAID HAS TO REACH THE LEDGER, and nothing was proving it did.
+//
+// The registration path is node config → HTTP body → plane → registrar, and the
+// only thing asserted across it was the node's NAME. A serialiser that dropped
+// the capacity, a plane that forgot to copy a field into the registration, or a
+// json tag that never matched would all have passed — and the failure is silent
+// downstream: a host recorded as contributing nothing joins the fleet, is never
+// chosen, and produces no error anywhere.
+func TestWhatTheNodeReportsArrivesAtTheLedger(t *testing.T) {
+	t.Parallel()
+
+	const (
+		wantVCPU   = 96
+		wantMemory = 384 * config.GiB
+		wantSite   = "home"
+	)
+
+	reg := &fakeRegistrar{}
+
+	_, base := serve(t, &fakeStore{}, nodeplane.WithRegistrar(reg),
+		nodeplane.WithSites([]string{wantSite}))
+
+	c := dial(t, base)
+
+	if err := c.Register(t.Context(), nodeclient.Registration{
+		Provider:   config.ProviderDocker,
+		Deployment: deployment,
+		Site:       wantSite,
+		VCPU:       wantVCPU,
+		Memory:     wantMemory,
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	got := reg.lastRegistration()
+
+	if got.VCPU != wantVCPU {
+		t.Errorf("vcpu reached the ledger as %d, want %d", got.VCPU, wantVCPU)
+	}
+
+	if got.Memory != wantMemory {
+		t.Errorf("memory reached the ledger as %s, want %s", got.Memory, wantMemory)
+	}
+
+	if got.Site != wantSite {
+		t.Errorf("site reached the ledger as %q, want %q", got.Site, wantSite)
+	}
+
+	if got.Provider != config.ProviderDocker {
+		t.Errorf("provider reached the ledger as %q, want %q", got.Provider, config.ProviderDocker)
+	}
+}
