@@ -251,22 +251,36 @@ func normaliseBase(raw string, secure bool) (string, error) {
 // a base without a scheme builds a request that never leaves the process.
 func (c *Client) BaseForTest() string { return c.base }
 
+// Registration is what this node says about itself when it introduces itself.
+//
+// A STRUCT RATHER THAN A GROWING PARAMETER LIST. Two of these are strings that
+// mean unrelated things — a deployment identity and a place — and transposing
+// them compiles, runs, and produces a node in the wrong deployment or the wrong
+// site rather than an error.
+type Registration struct {
+	Provider   config.ProviderKind
+	GuestOS    []config.GuestOS
+	Deployment string
+	Site       string
+	// VCPU and Memory are what this host contributes.
+	VCPU   int
+	Memory config.ByteSize
+}
+
 // Register introduces this node and learns the timings it must respect.
-func (c *Client) Register(
-	ctx context.Context,
-	provider config.ProviderKind,
-	guestOS []config.GuestOS,
-	deployment string,
-) error {
+func (c *Client) Register(ctx context.Context, reg Registration) error {
 	var res nodeapi.RegisterResponse
 
 	err := c.do(ctx, http.MethodPost, "/v1/register", nodeapi.RegisterRequest{
 		Version:     nodeapi.Version,
 		Incarnation: c.incarnation,
 		Node:        c.node,
-		Provider:    provider,
-		GuestOS:     guestOS,
-		Deployment:  deployment,
+		Provider:    reg.Provider,
+		GuestOS:     reg.GuestOS,
+		Deployment:  reg.Deployment,
+		Site:        reg.Site,
+		VCPU:        reg.VCPU,
+		Memory:      reg.Memory,
 	}, &res)
 	if err != nil {
 		return err

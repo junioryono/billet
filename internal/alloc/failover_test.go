@@ -42,7 +42,7 @@ func TestATierWithSeveralProvidersBindsToEither(t *testing.T) {
 			a := newAllocator(t, Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB},
 				[]config.Tier{tier})
 
-			if err := a.RegisterNode(t.Context(), host.node, host.provider); err != nil {
+			if err := a.RegisterNode(t.Context(), testRegistration(host.node, host.provider)); err != nil {
 				t.Fatalf("RegisterNode: %v", err)
 			}
 
@@ -121,7 +121,7 @@ func TestAProviderOutsideTheListIsStillRefused(t *testing.T) {
 
 	a := newAllocator(t, Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB}, []config.Tier{tier})
 
-	if err := a.RegisterNode(t.Context(), "laptop", config.ProviderDocker); err != nil {
+	if err := a.RegisterNode(t.Context(), testRegistration("laptop", config.ProviderDocker)); err != nil {
 		t.Fatalf("RegisterNode: %v", err)
 	}
 
@@ -202,7 +202,7 @@ func TestASingleProviderStillPlaces(t *testing.T) {
 
 	a := newAllocator(t, Limits{MaxVCPU: 8, MaxMemory: 16 * config.GiB}, []config.Tier{tier})
 
-	if err := a.RegisterNode(t.Context(), "laptop", config.ProviderDocker); err != nil {
+	if err := a.RegisterNode(t.Context(), testRegistration("laptop", config.ProviderDocker)); err != nil {
 		t.Fatalf("RegisterNode: %v", err)
 	}
 
@@ -338,7 +338,7 @@ func TestANodeCannotChangeBackendWhileRunningWork(t *testing.T) {
 			a := newAllocator(t, Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB},
 				[]config.Tier{tier})
 
-			if err := a.RegisterNode(t.Context(), "shapeshifter", config.ProviderFirecracker); err != nil {
+			if err := a.RegisterNode(t.Context(), testRegistration("shapeshifter", config.ProviderFirecracker)); err != nil {
 				t.Fatalf("RegisterNode: %v", err)
 			}
 
@@ -355,7 +355,7 @@ func TestANodeCannotChangeBackendWhileRunningWork(t *testing.T) {
 
 			// Both backends are acceptable to the tier, so nothing downstream would
 			// object — which is exactly why the refusal has to happen here.
-			err = a.RegisterNode(t.Context(), "shapeshifter", config.ProviderDocker)
+			err = a.RegisterNode(t.Context(), testRegistration("shapeshifter", config.ProviderDocker))
 			if !errors.Is(err, ErrWrongProvider) {
 				t.Fatalf("a host running %s work changed its backend: %v", phase, err)
 			}
@@ -397,7 +397,7 @@ func TestABusyNodeMayReRegisterUnchanged(t *testing.T) {
 
 	a := newAllocator(t, Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB}, []config.Tier{tier})
 
-	if err := a.RegisterNode(t.Context(), "epyc-1", config.ProviderFirecracker); err != nil {
+	if err := a.RegisterNode(t.Context(), testRegistration("epyc-1", config.ProviderFirecracker)); err != nil {
 		t.Fatalf("RegisterNode: %v", err)
 	}
 
@@ -412,7 +412,7 @@ func TestABusyNodeMayReRegisterUnchanged(t *testing.T) {
 
 	advanceTo(t, a, lease, PhaseBusy)
 
-	if err := a.RegisterNode(t.Context(), "epyc-1", config.ProviderFirecracker); err != nil {
+	if err := a.RegisterNode(t.Context(), testRegistration("epyc-1", config.ProviderFirecracker)); err != nil {
 		t.Fatalf("a busy host could not restart under the same backend, which makes a crash "+
 			"unrecoverable: %v", err)
 	}
@@ -433,7 +433,7 @@ func TestANodeWithOnlyFinishedWorkMayChangeBackend(t *testing.T) {
 
 	a := newAllocator(t, Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB}, []config.Tier{tier})
 
-	if err := a.RegisterNode(t.Context(), "epyc-1", config.ProviderFirecracker); err != nil {
+	if err := a.RegisterNode(t.Context(), testRegistration("epyc-1", config.ProviderFirecracker)); err != nil {
 		t.Fatalf("RegisterNode: %v", err)
 	}
 
@@ -450,7 +450,7 @@ func TestANodeWithOnlyFinishedWorkMayChangeBackend(t *testing.T) {
 		t.Fatalf("Release: %v", err)
 	}
 
-	if err := a.RegisterNode(t.Context(), "epyc-1", config.ProviderDocker); err != nil {
+	if err := a.RegisterNode(t.Context(), testRegistration("epyc-1", config.ProviderDocker)); err != nil {
 		t.Fatalf("a host with only finished work could not change its backend: %v", err)
 	}
 }
@@ -487,11 +487,11 @@ func TestAnIdleNodeMayChangeBackend(t *testing.T) {
 			VCPU: 8, Memory: 32 * config.GiB, GuestOS: config.GuestLinux,
 		}})
 
-	if err := a.RegisterNode(t.Context(), "spare", config.ProviderFirecracker); err != nil {
+	if err := a.RegisterNode(t.Context(), testRegistration("spare", config.ProviderFirecracker)); err != nil {
 		t.Fatalf("RegisterNode: %v", err)
 	}
 
-	if err := a.RegisterNode(t.Context(), "spare", config.ProviderDocker); err != nil {
+	if err := a.RegisterNode(t.Context(), testRegistration("spare", config.ProviderDocker)); err != nil {
 		t.Fatalf("an idle host could not change its backend: %v", err)
 	}
 }
@@ -525,7 +525,7 @@ func TestAnUpgradedLeaseStillBinds(t *testing.T) {
 		t.Fatalf("alloc.New: %v", err)
 	}
 
-	if err := a.RegisterNode(t.Context(), "epyc-1", config.ProviderFirecracker); err != nil {
+	if err := a.RegisterNode(t.Context(), testRegistration("epyc-1", config.ProviderFirecracker)); err != nil {
 		t.Fatalf("RegisterNode: %v", err)
 	}
 

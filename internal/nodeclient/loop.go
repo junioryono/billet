@@ -65,7 +65,17 @@ type LoopOptions struct {
 	Provider   config.ProviderKind
 	GuestOS    []config.GuestOS
 	Deployment string
-	Log        *slog.Logger
+	// Site is where this machine is, or empty in a deployment with one place.
+	Site string
+	// VCPU and Memory are what this host CONTRIBUTES, which is what it detected
+	// unless its own config said otherwise.
+	//
+	// Required. The control plane refuses a registration that offers nothing,
+	// because a node contributing zero joins the fleet, is never chosen, and
+	// produces no error for anyone to find.
+	VCPU   int
+	Memory config.ByteSize
+	Log    *slog.Logger
 	// SweepEvery bounds how often the node looks for compute nothing is asking
 	// about. Zero disables it.
 	SweepEvery time.Duration
@@ -83,6 +93,23 @@ type LoopOptions struct {
 	// failures used a hard-coded second, so a caller that lengthened this to calm
 	// a flapping link still hammered the poll endpoint.
 	Backoff time.Duration
+}
+
+// registration is what this node tells the control plane about itself.
+//
+// Built in one place so the first registration and every re-registration after a
+// reconnect describe the same machine. A drain re-registers too, and a node that
+// came back claiming different capacity would move the fleet's arithmetic
+// underneath work it is still holding.
+func (o LoopOptions) registration() Registration {
+	return Registration{
+		Provider:   o.Provider,
+		GuestOS:    o.GuestOS,
+		Deployment: o.Deployment,
+		Site:       o.Site,
+		VCPU:       o.VCPU,
+		Memory:     o.Memory,
+	}
 }
 
 // pollBackoff is how long to wait after a failed poll.
@@ -179,7 +206,7 @@ func Run(ctx context.Context, c *Client, compute Compute, opts LoopOptions) erro
 	}
 
 	for {
-		if err := c.Register(ctx, opts.Provider, opts.GuestOS, opts.Deployment); err != nil {
+		if err := c.Register(ctx, opts.registration()); err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
@@ -386,7 +413,7 @@ func stopGracefully(ctx context.Context, c *Client, compute Compute, log *slog.L
 				log.Warn("the control plane no longer knows this node; registering again " +
 					"so it can still be told to destroy what is running here")
 
-				if err := c.Register(drainCtx, opts.Provider, opts.GuestOS, opts.Deployment); err != nil {
+				if err := c.Register(drainCtx, opts.registration()); err != nil {
 					log.Error("could not register again while draining", "error", err)
 
 					if !sleep(drainCtx, backoffFor(opts)) {

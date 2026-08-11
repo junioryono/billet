@@ -17,6 +17,13 @@ import (
 	"github.com/junioryono/billet/internal/server"
 )
 
+// A registered host in these tests is deliberately larger than any budget they
+// set, so the deployment-wide ceiling stays the binding constraint.
+const (
+	testNodeVCPU   = 1 << 20
+	testNodeMemory = 1 << 20 * config.GiB
+)
+
 const deployment = "0123456789abcdef0123456789abcdef"
 
 // fakeCompute records what the loop asked of it.
@@ -699,7 +706,7 @@ func TestARegistrationHandsOverCustodyOfWhatWasInFlight(t *testing.T) {
 
 	// The node re-registers while its launch is still running, which is what a
 	// reconnect after a partition looks like from the plane's side.
-	if err := c.Register(t.Context(), config.ProviderDocker, nil, deployment); err != nil {
+	if err := c.Register(t.Context(), nodeclient.Registration{Provider: config.ProviderDocker, Deployment: deployment, VCPU: testNodeVCPU, Memory: testNodeMemory}); err != nil {
 		t.Fatalf("re-register: %v", err)
 	}
 
@@ -865,7 +872,7 @@ func TestASupersededNodeDrainsBeforeStopping(t *testing.T) {
 
 	waitFor(t, func() bool { return compute.aliveCount() == 1 })
 
-	if err := other.Register(t.Context(), config.ProviderDocker, nil, deployment); err != nil {
+	if err := other.Register(t.Context(), nodeclient.Registration{Provider: config.ProviderDocker, Deployment: deployment, VCPU: testNodeVCPU, Memory: testNodeMemory}); err != nil {
 		t.Fatalf("the second process could not register: %v", err)
 	}
 

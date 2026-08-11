@@ -347,7 +347,7 @@ func New(log *slog.Logger, deployment string, leaseTTL time.Duration, opts ...Op
 // commands and then had every Bind refused — which looked like a broken node
 // rather than a missing row.
 type Registrar interface {
-	RegisterNode(ctx context.Context, name string, kind config.ProviderKind) error
+	RegisterNode(ctx context.Context, reg alloc.NodeRegistration) error
 }
 
 // WithRegistrar makes registration durable in the ledger as well as in memory.
@@ -389,7 +389,15 @@ func (p *Plane) Register(
 	// row. Doing it first means a ledger that refuses leaves the plane unchanged,
 	// so the node retries registration rather than believing it succeeded.
 	if p.registrar != nil {
-		if err := p.registrar.RegisterNode(ctx, req.Node, req.Provider); err != nil {
+		reg := alloc.NodeRegistration{
+			Name:     req.Node,
+			Provider: req.Provider,
+			Site:     req.Site,
+			VCPU:     req.VCPU,
+			Memory:   req.Memory,
+		}
+
+		if err := p.registrar.RegisterNode(ctx, reg); err != nil {
 			// NOT WRAPPED IN ErrRefused. A ledger that cannot write is an outage,
 			// not a verdict: the same node with the same config will succeed once
 			// the database answers again, and a node that gave up here would stay

@@ -274,7 +274,7 @@ func TestANodeWithItsOwnCertificateRegisters(t *testing.T) {
 
 	c := nodeClient(t, ca, base, "epyc-1", "epyc-1")
 
-	if err := c.Register(t.Context(), config.ProviderDocker, nil, wireDeployment); err != nil {
+	if err := c.Register(t.Context(), nodeclient.Registration{Provider: config.ProviderDocker, Deployment: wireDeployment, VCPU: testNodeVCPU, Memory: testNodeMemory}); err != nil {
 		t.Fatalf("a node presenting its own certificate was refused: %v", err)
 	}
 }
@@ -386,7 +386,7 @@ func TestACertificateCannotActForAnotherNode(t *testing.T) {
 	// Authenticated as mac-1, dialling every route as epyc-1.
 	c := nodeClient(t, ca, base, "mac-1", "epyc-1")
 
-	if err := c.Register(t.Context(), config.ProviderDocker, nil, wireDeployment); err == nil {
+	if err := c.Register(t.Context(), nodeclient.Registration{Provider: config.ProviderDocker, Deployment: wireDeployment, VCPU: testNodeVCPU, Memory: testNodeMemory}); err == nil {
 		t.Error("a certificate for mac-1 registered a node called epyc-1")
 	}
 
@@ -442,7 +442,7 @@ func TestAWireRequiringCertificatesRefusesAPlainConnection(t *testing.T) {
 	// deliberate refusal from a crash — and a crash is precisely what removing
 	// this guard causes, since the code after it reads the certificate that is
 	// not there.
-	err = c.Register(t.Context(), config.ProviderDocker, nil, wireDeployment)
+	err = c.Register(t.Context(), nodeclient.Registration{Provider: config.ProviderDocker, Deployment: wireDeployment, VCPU: testNodeVCPU, Memory: testNodeMemory})
 	if !errors.Is(err, nodeclient.ErrUnauthenticated) {
 		t.Errorf("a registration with no certificate must be refused as unauthenticated, "+
 			"got %v; otherwise the node's name is taken from the request body unverified", err)
@@ -497,11 +497,11 @@ func TestTwoHostsSharingOneNodeNameAreCaught(t *testing.T) {
 		t.Fatal("two node processes minted the same incarnation, so nothing can tell them apart")
 	}
 
-	if err := first.Register(t.Context(), config.ProviderDocker, nil, wireDeployment); err != nil {
+	if err := first.Register(t.Context(), nodeclient.Registration{Provider: config.ProviderDocker, Deployment: wireDeployment, VCPU: testNodeVCPU, Memory: testNodeMemory}); err != nil {
 		t.Fatalf("the first host could not register: %v", err)
 	}
 
-	if err := second.Register(t.Context(), config.ProviderDocker, nil, wireDeployment); err != nil {
+	if err := second.Register(t.Context(), nodeclient.Registration{Provider: config.ProviderDocker, Deployment: wireDeployment, VCPU: testNodeVCPU, Memory: testNodeMemory}); err != nil {
 		t.Fatalf("the second host could not register: %v", err)
 	}
 
@@ -568,7 +568,7 @@ func TestAnOlderNodeCannotSlipPastTheFence(t *testing.T) {
 		t.Fatalf("new client: %v", err)
 	}
 
-	if err := current.Register(t.Context(), config.ProviderDocker, nil, wireDeployment); err != nil {
+	if err := current.Register(t.Context(), nodeclient.Registration{Provider: config.ProviderDocker, Deployment: wireDeployment, VCPU: testNodeVCPU, Memory: testNodeMemory}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 
@@ -661,7 +661,7 @@ func TestASupersededHostCanFinishItsOwnLease(t *testing.T) {
 		t.Fatalf("new client: %v", err)
 	}
 
-	if err := first.Register(t.Context(), config.ProviderDocker, nil, wireDeployment); err != nil {
+	if err := first.Register(t.Context(), nodeclient.Registration{Provider: config.ProviderDocker, Deployment: wireDeployment, VCPU: testNodeVCPU, Memory: testNodeMemory}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 
@@ -687,7 +687,7 @@ func TestASupersededHostCanFinishItsOwnLease(t *testing.T) {
 	}
 
 	// And then it is superseded, mid-launch.
-	if err := second.Register(t.Context(), config.ProviderDocker, nil, wireDeployment); err != nil {
+	if err := second.Register(t.Context(), nodeclient.Registration{Provider: config.ProviderDocker, Deployment: wireDeployment, VCPU: testNodeVCPU, Memory: testNodeMemory}); err != nil {
 		t.Fatalf("the second process could not register: %v", err)
 	}
 
@@ -741,11 +741,11 @@ func TestASupersededHostCannotReleaseAnotherProcessLease(t *testing.T) {
 		t.Fatalf("new client: %v", err)
 	}
 
-	if err := first.Register(t.Context(), config.ProviderDocker, nil, wireDeployment); err != nil {
+	if err := first.Register(t.Context(), nodeclient.Registration{Provider: config.ProviderDocker, Deployment: wireDeployment, VCPU: testNodeVCPU, Memory: testNodeMemory}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 
-	if err := second.Register(t.Context(), config.ProviderDocker, nil, wireDeployment); err != nil {
+	if err := second.Register(t.Context(), nodeclient.Registration{Provider: config.ProviderDocker, Deployment: wireDeployment, VCPU: testNodeVCPU, Memory: testNodeMemory}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 
@@ -823,7 +823,7 @@ func TestAWokenPollFromASupersededProcessIsRefused(t *testing.T) {
 		t.Fatalf("new client: %v", err)
 	}
 
-	if err := first.Register(t.Context(), config.ProviderDocker, nil, wireDeployment); err != nil {
+	if err := first.Register(t.Context(), nodeclient.Registration{Provider: config.ProviderDocker, Deployment: wireDeployment, VCPU: testNodeVCPU, Memory: testNodeMemory}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 
@@ -851,7 +851,7 @@ func TestAWokenPollFromASupersededProcessIsRefused(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 
-	if err := second.Register(t.Context(), config.ProviderDocker, nil, wireDeployment); err != nil {
+	if err := second.Register(t.Context(), nodeclient.Registration{Provider: config.ProviderDocker, Deployment: wireDeployment, VCPU: testNodeVCPU, Memory: testNodeMemory}); err != nil {
 		t.Fatalf("the second process could not register: %v", err)
 	}
 
@@ -917,7 +917,7 @@ func TestOmittingTheIncarnationIsNotAWildcard(t *testing.T) {
 		t.Fatalf("new client: %v", err)
 	}
 
-	if err := current.Register(t.Context(), config.ProviderDocker, nil, wireDeployment); err != nil {
+	if err := current.Register(t.Context(), nodeclient.Registration{Provider: config.ProviderDocker, Deployment: wireDeployment, VCPU: testNodeVCPU, Memory: testNodeMemory}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 
@@ -980,11 +980,11 @@ func TestADrainingProcessDoesNotKeepADeadNodeSchedulable(t *testing.T) {
 		t.Fatalf("new client: %v", err)
 	}
 
-	if err := first.Register(t.Context(), config.ProviderDocker, nil, wireDeployment); err != nil {
+	if err := first.Register(t.Context(), nodeclient.Registration{Provider: config.ProviderDocker, Deployment: wireDeployment, VCPU: testNodeVCPU, Memory: testNodeMemory}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 
-	if err := second.Register(t.Context(), config.ProviderDocker, nil, wireDeployment); err != nil {
+	if err := second.Register(t.Context(), nodeclient.Registration{Provider: config.ProviderDocker, Deployment: wireDeployment, VCPU: testNodeVCPU, Memory: testNodeMemory}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 
@@ -1064,11 +1064,11 @@ func TestOwnershipSurvivesAControlPlaneRestart(t *testing.T) {
 
 	// The node re-registers against the fresh plane; nothing here ever delivered
 	// it a launch command for l1.
-	if err := first.Register(t.Context(), config.ProviderDocker, nil, wireDeployment); err != nil {
+	if err := first.Register(t.Context(), nodeclient.Registration{Provider: config.ProviderDocker, Deployment: wireDeployment, VCPU: testNodeVCPU, Memory: testNodeMemory}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 
-	if err := second.Register(t.Context(), config.ProviderDocker, nil, wireDeployment); err != nil {
+	if err := second.Register(t.Context(), nodeclient.Registration{Provider: config.ProviderDocker, Deployment: wireDeployment, VCPU: testNodeVCPU, Memory: testNodeMemory}); err != nil {
 		t.Fatalf("the second process could not register: %v", err)
 	}
 
@@ -1098,7 +1098,7 @@ func TestARecreatedScaleSetDoesNotWedgeTheTier(t *testing.T) {
 
 	c := nodeClient(t, ca, base, "epyc-1", "epyc-1")
 
-	if err := c.Register(t.Context(), config.ProviderDocker, nil, wireDeployment); err != nil {
+	if err := c.Register(t.Context(), nodeclient.Registration{Provider: config.ProviderDocker, Deployment: wireDeployment, VCPU: testNodeVCPU, Memory: testNodeMemory}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 
@@ -1161,7 +1161,7 @@ func TestARegistrationThatCannotRebuildOwnershipIsRefused(t *testing.T) {
 
 	c := nodeClient(t, ca, base, "epyc-1", "epyc-1")
 
-	err := c.Register(t.Context(), config.ProviderDocker, nil, wireDeployment)
+	err := c.Register(t.Context(), nodeclient.Registration{Provider: config.ProviderDocker, Deployment: wireDeployment, VCPU: testNodeVCPU, Memory: testNodeMemory})
 	if err == nil {
 		t.Fatal("a node registered although the plane could not read which leases it already " +
 			"holds; superseded later, it would be refused its own renewals")
@@ -1210,11 +1210,11 @@ func TestADrainOutlivesTheNodeRecord(t *testing.T) {
 		t.Fatalf("new client: %v", err)
 	}
 
-	if err := first.Register(t.Context(), config.ProviderDocker, nil, wireDeployment); err != nil {
+	if err := first.Register(t.Context(), nodeclient.Registration{Provider: config.ProviderDocker, Deployment: wireDeployment, VCPU: testNodeVCPU, Memory: testNodeMemory}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 
-	if err := second.Register(t.Context(), config.ProviderDocker, nil, wireDeployment); err != nil {
+	if err := second.Register(t.Context(), nodeclient.Registration{Provider: config.ProviderDocker, Deployment: wireDeployment, VCPU: testNodeVCPU, Memory: testNodeMemory}); err != nil {
 		t.Fatalf("the second process could not register: %v", err)
 	}
 
@@ -1252,7 +1252,7 @@ func TestAReconnectingNodeIsNotFenced(t *testing.T) {
 	c := nodeClient(t, ca, base, "epyc-1", "epyc-1")
 
 	for range 3 {
-		if err := c.Register(t.Context(), config.ProviderDocker, nil, wireDeployment); err != nil {
+		if err := c.Register(t.Context(), nodeclient.Registration{Provider: config.ProviderDocker, Deployment: wireDeployment, VCPU: testNodeVCPU, Memory: testNodeMemory}); err != nil {
 			t.Fatalf("register: %v", err)
 		}
 
@@ -1280,7 +1280,7 @@ func TestATierInANonDefaultRunnerGroupCanStillMint(t *testing.T) {
 
 	c := nodeClient(t, ca, base, "epyc-1", "epyc-1")
 
-	if err := c.Register(t.Context(), config.ProviderDocker, nil, wireDeployment); err != nil {
+	if err := c.Register(t.Context(), nodeclient.Registration{Provider: config.ProviderDocker, Deployment: wireDeployment, VCPU: testNodeVCPU, Memory: testNodeMemory}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 
@@ -1327,7 +1327,7 @@ func TestANodeCannotMintIntoAnotherTiersScaleSet(t *testing.T) {
 
 	c := nodeClient(t, ca, base, "epyc-1", "epyc-1")
 
-	if err := c.Register(t.Context(), config.ProviderDocker, nil, wireDeployment); err != nil {
+	if err := c.Register(t.Context(), nodeclient.Registration{Provider: config.ProviderDocker, Deployment: wireDeployment, VCPU: testNodeVCPU, Memory: testNodeMemory}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 
@@ -1393,7 +1393,7 @@ func TestANodeCannotMintRunnersItWasNotAskedToLaunch(t *testing.T) {
 
 	c := nodeClient(t, ca, base, "epyc-1", "epyc-1")
 
-	if err := c.Register(t.Context(), config.ProviderDocker, nil, wireDeployment); err != nil {
+	if err := c.Register(t.Context(), nodeclient.Registration{Provider: config.ProviderDocker, Deployment: wireDeployment, VCPU: testNodeVCPU, Memory: testNodeMemory}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 
@@ -1464,7 +1464,7 @@ func TestACertificateFromAnotherDeploymentIsRefused(t *testing.T) {
 		t.Fatalf("new client: %v", err)
 	}
 
-	err = c.Register(t.Context(), config.ProviderDocker, nil, wireDeployment)
+	err = c.Register(t.Context(), nodeclient.Registration{Provider: config.ProviderDocker, Deployment: wireDeployment, VCPU: testNodeVCPU, Memory: testNodeMemory})
 	if err == nil {
 		t.Fatal("a node holding another deployment's certificate registered")
 	}
@@ -1517,7 +1517,7 @@ func TestATLSFailureIsNotAVerdict(t *testing.T) {
 
 	c := nodeClient(t, stranger, base, "n1", "n1")
 
-	err = c.Register(t.Context(), config.ProviderDocker, nil, wireDeployment)
+	err = c.Register(t.Context(), nodeclient.Registration{Provider: config.ProviderDocker, Deployment: wireDeployment, VCPU: testNodeVCPU, Memory: testNodeMemory})
 	if err == nil {
 		t.Fatal("a rejected handshake was reported as a successful registration")
 	}

@@ -22,6 +22,13 @@ import (
 	"github.com/junioryono/billet/internal/server"
 )
 
+// A registered host in these tests is deliberately larger than any budget they
+// set, so the deployment-wide ceiling stays the binding constraint.
+const (
+	testNodeVCPU   = 1 << 20
+	testNodeMemory = 1 << 20 * config.GiB
+)
+
 const deployment = "0123456789abcdef0123456789abcdef"
 
 // fakeRegistrar stands in for the allocator's node table.
@@ -31,7 +38,9 @@ type fakeRegistrar struct {
 	accepted []string
 }
 
-func (f *fakeRegistrar) RegisterNode(_ context.Context, name string, _ config.ProviderKind) error {
+func (f *fakeRegistrar) RegisterNode(_ context.Context, reg alloc.NodeRegistration) error {
+	name := reg.Name
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -141,8 +150,9 @@ func dial(tb testing.TB, base string) *nodeclient.Client {
 		tb.Fatalf("new client: %v", err)
 	}
 
-	if err := c.Register(tb.Context(), config.ProviderDocker,
-		[]config.GuestOS{config.GuestLinux}, deployment); err != nil {
+	if err := c.Register(tb.Context(), nodeclient.Registration{Provider: config.ProviderDocker,
+		GuestOS: []config.GuestOS{config.GuestLinux}, Deployment: deployment,
+		VCPU: testNodeVCPU, Memory: testNodeMemory}); err != nil {
 		tb.Fatalf("register: %v", err)
 	}
 
@@ -465,7 +475,7 @@ func TestAForeignNodeIsRefusedOverTheWire(t *testing.T) {
 		t.Fatalf("new client: %v", err)
 	}
 
-	err = c.Register(t.Context(), config.ProviderDocker, nil, "ffffffffffffffffffffffffffffffff")
+	err = c.Register(t.Context(), nodeclient.Registration{Provider: config.ProviderDocker, Deployment: "ffffffffffffffffffffffffffffffff", VCPU: testNodeVCPU, Memory: testNodeMemory})
 	if err == nil {
 		t.Fatal("a node from another deployment registered")
 	}
@@ -650,7 +660,7 @@ func TestALedgerRefusalFailsTheRegistration(t *testing.T) {
 		t.Fatalf("new client: %v", err)
 	}
 
-	if err := c.Register(t.Context(), config.ProviderDocker, nil, deployment); err == nil {
+	if err := c.Register(t.Context(), nodeclient.Registration{Provider: config.ProviderDocker, Deployment: deployment, VCPU: testNodeVCPU, Memory: testNodeMemory}); err == nil {
 		t.Fatal("a node the ledger refused was registered anyway")
 	}
 
@@ -694,7 +704,7 @@ func TestACustodyHeartbeatKeepsANodeRegistered(t *testing.T) {
 		t.Fatalf("new client: %v", err)
 	}
 
-	if err := c.Register(t.Context(), config.ProviderDocker, nil, deployment); err != nil {
+	if err := c.Register(t.Context(), nodeclient.Registration{Provider: config.ProviderDocker, Deployment: deployment, VCPU: testNodeVCPU, Memory: testNodeMemory}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 
@@ -738,7 +748,7 @@ func TestOnlyAVerdictIsPermanent(t *testing.T) {
 			t.Fatalf("new client: %v", err)
 		}
 
-		err = c.Register(t.Context(), config.ProviderDocker, nil, deployment)
+		err = c.Register(t.Context(), nodeclient.Registration{Provider: config.ProviderDocker, Deployment: deployment, VCPU: testNodeVCPU, Memory: testNodeMemory})
 		if err == nil {
 			t.Fatal("a registration the ledger could not record was accepted")
 		}
@@ -763,7 +773,7 @@ func TestOnlyAVerdictIsPermanent(t *testing.T) {
 			t.Fatalf("new client: %v", err)
 		}
 
-		err = c.Register(t.Context(), config.ProviderDocker, nil, "ffffffffffffffffffffffffffffffff")
+		err = c.Register(t.Context(), nodeclient.Registration{Provider: config.ProviderDocker, Deployment: "ffffffffffffffffffffffffffffffff", VCPU: testNodeVCPU, Memory: testNodeMemory})
 		if !errors.Is(err, nodeclient.ErrRefused) {
 			t.Errorf("a foreign deployment identity must be permanent, or the node retries "+
 				"something that will never be accepted: %v", err)

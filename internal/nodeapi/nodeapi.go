@@ -30,7 +30,13 @@ import (
 // A node and a server are separately deployed and WILL be different builds —
 // that is the point of splitting them — so the mismatch has to be a refusal with
 // a readable message rather than a decode error halfway through a launch.
-const Version = 1
+//
+// VERSION 2 ADDED THE CAPACITY A NODE CONTRIBUTES, and its site. A version 1
+// node reports neither, and a server that read the absent numbers as zero would
+// register a host nothing can ever be placed on — silently, because a node with
+// no capacity is indistinguishable from a busy one. Refusing the registration is
+// the correct outcome rather than an inconvenience, which is what this bump buys.
+const Version = 2
 
 // CommandKind names what the server is asking a node to do.
 type CommandKind string
@@ -71,6 +77,18 @@ type RegisterRequest struct {
 	// sending it lets the server refuse an obviously wrong pairing at
 	// registration instead of at the first launch.
 	GuestOS []config.GuestOS `json:"guest_os,omitempty"`
+	// Site is where this machine is, or empty in a deployment that has one place.
+	Site string `json:"site,omitempty"`
+	// VCPU and Memory are what this host CONTRIBUTES, which is what it detected
+	// unless its own config said otherwise.
+	//
+	// REPORTED BY THE HOST, NOT CONFIGURED CENTRALLY, for the same reason the
+	// provider is: the machine knows what it has and the person running it knows
+	// what it should give, while the control plane knows neither. Required — a
+	// registration carrying zero is refused, because a node that contributes
+	// nothing joins the fleet, is never chosen, and produces no error to find.
+	VCPU   int             `json:"vcpu"`
+	Memory config.ByteSize `json:"memory"`
 	// Deployment is the identity the node labels its compute with. Sent so the
 	// server can refuse a node that belongs to a different installation rather
 	// than accepting commands it will label unrecognisably.
