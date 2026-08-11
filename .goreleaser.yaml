@@ -9,9 +9,10 @@ version: 2
 
 project_name: billet
 
-before:
-  hooks:
-    - go mod tidy
+# NO before.hooks. A release must build what the tag says and nothing else: a
+# `go mod tidy` here would edit go.mod and go.sum during the build, so what is
+# published could differ from what was reviewed and tested. CI already fails a
+# PR whose modules are untidy, which is the right place for it.
 
 builds:
   - id: billet

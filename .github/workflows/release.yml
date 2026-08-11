@@ -51,7 +51,10 @@ jobs:
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v7
         with:
-          version: "~> v2"
+          # Pinned exactly, the way golangci-lint is. "~> v2" downloads whichever
+          # v2 exists at the time, so a release built today and one rebuilt next
+          # month are not the same build.
+          version: "v2.17.1"
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

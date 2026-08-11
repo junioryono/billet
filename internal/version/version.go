@@ -107,37 +107,42 @@ func Dirty() bool {
 }
 
 // String is the one-line description a bug report will quote.
-//
-// Assembled from the parts that are actually present rather than from a fixed
-// template, so an unstamped build prints something readable instead of a line of
-// empty brackets and stray commas.
 func String() string {
-	v := Version()
-	parts := []string{v}
+	return render(Version(), Revision(), strings.TrimSpace(date), Dirty())
+}
+
+// render assembles the line from the parts that are actually present.
+//
+// A PURE FUNCTION SO EVERY COMBINATION CAN BE TESTED. Driven only through
+// String(), the dirty flag and the missing-revision case could not be reached
+// independently — a build is either dirty or it is not, and the test binary
+// decides which. Mutations that deleted the dirty suffix survived for that
+// reason, which reads the same as the suffix being pointless.
+func render(version, revision, built string, dirty bool) string {
+	parts := []string{version}
 
 	// NOT REPEATED. Go's own pseudo-version for an untagged build already embeds
 	// the short revision and a +dirty suffix, so appending both again produces
 	// "v0.0.0-20260811035856-83de6dda9f5b+dirty 83de6dda9f5b (dirty)" — three
-	// statements of the same two facts, in a line an operator is meant to be able
-	// to read at a glance.
-	if rev := Revision(); rev != "" {
-		short := rev
+	// statements of the same two facts, in a line meant to be read at a glance.
+	if revision != "" {
+		short := revision
 		if len(short) > 12 {
 			short = short[:12]
 		}
 
-		if !strings.Contains(v, short) {
+		if !strings.Contains(version, short) {
 			parts = append(parts, short)
 		}
 	}
 
-	if d := strings.TrimSpace(date); d != "" {
-		parts = append(parts, d)
+	if built != "" {
+		parts = append(parts, built)
 	}
 
 	out := strings.Join(parts, " ")
 
-	if Dirty() && !strings.Contains(out, "dirty") {
+	if dirty && !strings.Contains(out, "dirty") {
 		out += " (dirty)"
 	}
 

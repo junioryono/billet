@@ -31,6 +31,20 @@ import (
 // itself as a development build and nothing here would ever have noticed.
 func clientVersion() string { return version.Version() }
 
+// systemInfo is what billet tells GitHub about itself on every poll.
+//
+// ASSEMBLED IN ONE PLACE SO A TEST CAN SEE IT. Built inline in New, the only
+// assertion available was that clientVersion() agreed with version.Version() —
+// which stays true while the struct literal in New says something else entirely.
+// The value that reaches GitHub is the one worth testing.
+func systemInfo() gh.SystemInfo {
+	return gh.SystemInfo{
+		System:    "billet",
+		Version:   clientVersion(),
+		Subsystem: "listener",
+	}
+}
+
 // Config is what billet needs to reach one organization's scale sets.
 type Config struct {
 	// ConfigURL is the organization URL, e.g. https://github.com/acme.
@@ -64,11 +78,7 @@ func New(cfg Config, log *slog.Logger) (*Client, error) {
 			InstallationID: cfg.InstallationID,
 			PrivateKey:     cfg.PrivateKey,
 		},
-		SystemInfo: gh.SystemInfo{
-			System:    "billet",
-			Version:   clientVersion(),
-			Subsystem: "listener",
-		},
+		SystemInfo: systemInfo(),
 	}, gh.WithLogger(log))
 	if err != nil {
 		// NOT wrapped with the config: GitHubAppAuth holds the private key, and a

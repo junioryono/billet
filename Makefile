@@ -6,7 +6,7 @@
 # check is necessary rather than sufficient.
 
 GOLANGCI_VERSION := v2.12.2
-GORELEASER_VERSION := v2
+GORELEASER_VERSION := v2.17.1
 BIN              := bin/billet
 COVERPROFILE     := coverage.out
 
@@ -94,6 +94,7 @@ cross: ## Build every target a node can run on
 	done
 
 .PHONY: tools
+.PHONY: dist
 dist: ## Build the release artifacts locally, exactly as a tag would
 	@# NOT part of `check`: it needs goreleaser installed and takes twenty seconds
 	@# to cross-compile three targets, neither of which belongs in a gate that runs
