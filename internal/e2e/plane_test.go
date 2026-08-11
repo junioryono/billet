@@ -438,9 +438,22 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 		serverOpts = []server.ControlPlaneOption{server.WithNodeRunner(runner)}
 	}
 
-	// Fast, because the sweep rides this tick and a test that waits a minute for
-	// it is a test nobody runs.
-	serverOpts = append(serverOpts, server.WithReapInterval(200*time.Millisecond))
+	serverOpts = append(serverOpts,
+		// Fast, because the sweep rides this tick and a test that waits a minute
+		// for it is a test nobody runs.
+		server.WithReapInterval(200*time.Millisecond),
+		// AND A DRAIN THESE TESTS DO NOT WAIT OUT.
+		//
+		// Stopping the plane now begins a drain, and these scenarios stop it while
+		// a container is deliberately still running — the fake GitHub never sends
+		// the completion, because the point of the scenario was what happens
+		// BEFORE one. On the real six-hour default the plane would correctly sit
+		// there waiting.
+		//
+		// The drain has its own end-to-end coverage; here it is scenery, so it is
+		// made short rather than the production default being lowered to keep the
+		// suite quick.
+		server.WithDrainTimeout(200*time.Millisecond))
 
 	srv := server.New(a, wiring.Provisioner{Client: client}, tiers, "billet-test", log, serverOpts...)
 

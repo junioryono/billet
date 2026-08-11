@@ -237,6 +237,15 @@ type ServerConfig struct {
 	// operator who knows their host has nowhere to put a lock can say so here;
 	// billet will not decide it on their behalf.
 	AllowUnlockedDeployment bool `yaml:"allow_unlocked_deployment,omitempty"`
+	// DrainTimeout bounds how long a stopping control plane waits for the jobs it
+	// is already running before it destroys them. See defaultDrainTimeout for the
+	// default and why it is the length of a job rather than the length of a
+	// shutdown. A Go duration string: "6h", "90m".
+	//
+	// A service manager's stop timeout must exceed this plus the teardown, or its
+	// own expiry arrives first as a SIGKILL — which skips the teardown entirely
+	// and strands exactly the compute the drain was protecting.
+	DrainTimeout string `yaml:"drain_timeout,omitempty"`
 }
 
 // NodeTLS points at the three files `billet ca issue` produced.
@@ -309,6 +318,15 @@ type NodeConfig struct {
 	//
 	// A Go duration string: "24h", "90m".
 	MaxCustody string `yaml:"max_custody,omitempty"`
+	// DrainTimeout bounds how long a stopping node waits for the compute it is
+	// still holding before it gives up and lets the teardown destroy it. See
+	// defaultDrainTimeout.
+	//
+	// Separate from the control plane's key: a node and a control plane are
+	// restarted for different reasons and need not wait the same amount of time.
+	//
+	// A Go duration string: "6h", "90m".
+	DrainTimeout string `yaml:"drain_timeout,omitempty"`
 }
 
 // ProviderKind names a compute backend.
@@ -1221,6 +1239,12 @@ func (c *Config) validateServer() []error {
 	// unit started in / and an operator started in /srv/billet into different
 	// collision domains — and both log the same relative string, so the startup
 	// diagnostic meant to expose a mismatch would hide this one instead.
+	// Parsed here so a typo is reported when the file is READ, rather than at the
+	// shutdown that needed it — by which point the operator is watching a restart
+	// that will not finish and has no reason to suspect the config.
+	if _, err := c.Server.DrainTimeoutDuration(); err != nil {
+		errs = append(errs, err)
+	}
 	if c.Server.LockDir != "" && !filepath.IsAbs(c.Server.LockDir) {
 		errs = append(errs, fmt.Errorf(
 			"server.lock_dir must be an absolute path, got %q: a relative one resolves against "+
@@ -1275,6 +1299,10 @@ func (c *Config) validateNode() []error {
 	// Parsed here so a typo is reported when the file is READ, rather than hours
 	// later when a wedged container needed reclaiming and the bound turned out to
 	// be unparseable.
+	if _, err := c.Node.DrainTimeoutDuration(); err != nil {
+		errs = append(errs, err)
+	}
+
 	if _, err := c.Node.MaxCustodyDuration(); err != nil {
 		errs = append(errs, err)
 	}
