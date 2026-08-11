@@ -1,6 +1,8 @@
 package server
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -87,31 +89,94 @@ func TestARefusedDrainGraceLeavesTheDefaultInPlace(t *testing.T) {
 // The whole point of the config key: what an operator writes in billet.yaml is
 // what the listener waits.
 //
-// Started from a real ServerConfig rather than from a duration literal, so the
-// whole chain is under test — the YAML value, the parse, the control-plane
-// option, and the listener it configures. A test of the option alone passes
-// happily while the value never leaves the config file.
+// Started from real YAML on disk, through config.Load, so every link is under
+// test — the key, its parse, the control-plane option, and the listener it
+// configures. Building a config struct by hand instead would skip the parse and
+// leave the comment claiming more than the test does.
 func TestTheConfiguredDrainTimeoutReachesEveryListener(t *testing.T) {
-	cfg := &config.ServerConfig{DrainTimeout: "90m"}
+	for _, tc := range []struct {
+		name string
+		key  string
+		want time.Duration
+	}{
+		{"configured", "\n  drain_timeout: 90m", 90 * time.Minute},
+		{"absent", "", 6 * time.Hour},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := loadConfig(t, tc.key)
 
-	d, err := cfg.DrainTimeoutDuration()
-	if err != nil {
-		t.Fatalf("DrainTimeoutDuration: %v", err)
-	}
+			opts, err := OptionsFromConfig(cfg)
+			if err != nil {
+				t.Fatalf("OptionsFromConfig: %v", err)
+			}
 
-	s := New(nil, nil, nil, "owner", nil, WithDrainTimeout(d))
+			s := New(nil, nil, nil, "owner", nil, opts...)
 
-	l := NewListener(nil, "tier", nil, s.listenerOpts()...)
-	if l.drainGrace != 90*time.Minute {
-		t.Errorf("listener drain grace = %s, want the configured 90m", l.drainGrace)
+			l := NewListener(nil, "tier", nil, s.listenerOpts()...)
+			if l.drainGrace != tc.want {
+				t.Errorf("listener drain grace = %s, want %s", l.drainGrace, tc.want)
+			}
+
+			if err := l.configError(); err != nil {
+				t.Errorf("a config-derived drain grace was refused: %v", err)
+			}
+		})
 	}
 }
 
-func TestListenersDefaultToTheDrainDefaultWhenUnconfigured(t *testing.T) {
-	s := New(nil, nil, nil, "owner", nil)
+// An explicitly bad control-plane value must REACH the listener and be refused
+// there, not be filtered out on the way and replaced by a default.
+//
+// Guarding the hand-off on `> 0` looks like defensiveness and is the opposite:
+// it turns an operator's mistake into a silent six-hour wait, which is the
+// substitution checkGrace exists to refuse. Found by review, not by the tests
+// above, which is why it has its own.
+func TestAnExplicitlyBadDrainTimeoutIsRefusedRatherThanDefaulted(t *testing.T) {
+	for _, d := range []time.Duration{0, -time.Second, 25 * time.Hour} {
+		s := New(nil, nil, nil, "owner", nil, WithDrainTimeout(d))
 
-	l := NewListener(nil, "tier", nil, s.listenerOpts()...)
-	if l.drainGrace != 6*time.Hour {
-		t.Errorf("listener drain grace = %s, want the 6h default", l.drainGrace)
+		l := NewListener(nil, "tier", nil, s.listenerOpts()...)
+		if err := l.configError(); err == nil {
+			t.Errorf("WithDrainTimeout(%s) was silently replaced by the default %s", d, l.drainGrace)
+		}
 	}
+}
+
+// loadConfig writes a minimal server config with an optional extra server key
+// and loads it the way billet does.
+func loadConfig(t *testing.T, serverKey string) *config.Config {
+	t.Helper()
+
+	body := `
+server:
+  listen: 127.0.0.1:7717
+  state_dir: /var/lib/billet/server
+  max_vcpu: 8
+  max_memory: 64GiB` + serverKey + `
+github:
+  org: acme
+  app_id: 1
+  installation_id: 2
+  private_key_path: /etc/billet/app.pem
+tiers:
+  - label: billet-4vcpu-a
+    provider: docker
+    vcpu: 4
+    memory: 16GiB
+    disk: 80GiB
+    image: ghcr.io/example/runner:latest
+    command: ["./run.sh"]
+`
+
+	path := filepath.Join(t.TempDir(), "billet.yaml")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	return cfg
 }

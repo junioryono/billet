@@ -51,9 +51,16 @@ type Server struct {
 	maxCapacity *int
 	// reapEvery is how often abandoned capacity is reclaimed.
 	reapEvery time.Duration
-	// drainTimeout, when positive, is how long every listener waits for its
-	// running jobs on shutdown. Zero leaves each listener on its own default.
-	drainTimeout time.Duration
+	// drainTimeout is how long every listener waits for its running jobs on
+	// shutdown.
+	//
+	// A POINTER so "never configured" is distinguishable from "configured as
+	// zero". Guarding on `> 0` instead made WithDrainTimeout(0) silently select
+	// the default — which is the exact substitution checkGrace refuses to make,
+	// for the reason it gives: omitting the option already selects the default,
+	// so passing zero is an explicit instruction and swallowing it removes the
+	// evidence of the mistake.
+	drainTimeout *time.Duration
 	// runner is handed to every listener, so an assigned lease becomes compute.
 	// nil means none is attached and the listeners fail closed.
 	runner Runner
@@ -93,7 +100,27 @@ func WithNodeRunner(r Runner) ControlPlaneOption {
 // honours it. See defaultDrainGrace for why the default is the length of a job
 // rather than the length of a shutdown.
 func WithDrainTimeout(d time.Duration) ControlPlaneOption {
-	return func(s *Server) { s.drainTimeout = d }
+	return func(s *Server) { s.drainTimeout = &d }
+}
+
+// OptionsFromConfig is the control-plane configuration implied by billet.yaml.
+//
+// It lives here rather than in cmd/billet so the whole chain — the YAML key, the
+// parse, the control-plane option, and the listener it configures — is one
+// package's worth of code and can be tested end to end. Assembling it at the
+// call site left the only link that matters, a value reaching a listener,
+// spanning two packages with a test on neither side of the join.
+func OptionsFromConfig(cfg *config.Config) ([]ControlPlaneOption, error) {
+	if cfg == nil {
+		return nil, nil
+	}
+
+	drain, err := cfg.Server.DrainTimeoutDuration()
+	if err != nil {
+		return nil, err
+	}
+
+	return []ControlPlaneOption{WithDrainTimeout(drain)}, nil
 }
 
 // AdvertiseNothing makes every listener advertise zero capacity.
@@ -276,8 +303,12 @@ func (s *Server) listenerOpts() []Option {
 		opts = append(opts, WithRunner(s.runner))
 	}
 
-	if s.drainTimeout > 0 {
-		opts = append(opts, WithDrainGrace(s.drainTimeout))
+	// FORWARDED WHENEVER IT WAS SET, including a zero or negative one. Filtering
+	// those out here would hide them from the listener's own validation and leave
+	// Run using a default nobody asked for; passing them through means configError
+	// refuses to start, which is what every other budget does.
+	if s.drainTimeout != nil {
+		opts = append(opts, WithDrainGrace(*s.drainTimeout))
 	}
 
 	return opts

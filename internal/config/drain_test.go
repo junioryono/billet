@@ -137,8 +137,20 @@ func TestDrainTimeoutIsValidated(t *testing.T) {
 		// The node's key is validated by the same rules. Validating only the
 		// server's would leave a node that cannot start, diagnosed on the far side
 		// of the deployment from the file that caused it.
-		if _, err := Load(writeConfig(t, withNodeKey("drain_timeout: "+tc.value))); err == nil {
+		//
+		// Asserting the DIAGNOSTIC here too, not merely that an error occurred: the
+		// fixture has plenty of other ways to fail validation, so "some error"
+		// would stay green if node.drain_timeout stopped being checked at all.
+		_, err = Load(writeConfig(t, withNodeKey("drain_timeout: "+tc.value)))
+		if err == nil {
 			t.Errorf("Load accepted node.drain_timeout: %s", tc.value)
+			continue
+		}
+
+		if !strings.Contains(err.Error(), "node.drain_timeout") ||
+			!strings.Contains(err.Error(), tc.want) {
+			t.Errorf("node.drain_timeout: %s\n got: %v\nwant it to name node.drain_timeout and contain: %q",
+				tc.value, err, tc.want)
 		}
 	}
 }
