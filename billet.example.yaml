@@ -1,5 +1,12 @@
 # billet configuration — copy to billet.yaml and edit.
 #
+# THIS FILE DOES NOT RUN AS SHIPPED. It describes the intended deployment, which
+# is Firecracker, and the Firecracker provider is not built — `billet server
+# --dev` will refuse it. To actually start something today, change `provider:
+# firecracker` to `provider: docker` in the node section AND in every tier, and
+# ignore the `firecracker:` block. Docker shares the host kernel and is for
+# trials rather than for untrusted code.
+#
 # This example is the single-machine deployment: control plane and compute host
 # in one process, started with `billet server --dev`. Split them by running
 # `billet server` here and `billet node` on each additional machine, with the
@@ -169,11 +176,13 @@ tiers:
   # preference order, so losing the box at home does not take the runs-on label
   # down with it — jobs land on EC2 instead.
   #
-  # The order is recorded but does not yet choose: today a node binds itself, so
-  # placement can only accept or refuse the host that asked. Listing several
-  # already removes the hard pin, which is what a fallback needs; preference
-  # starts to bite when the node runs in its own process and the control plane
-  # picks among live hosts.
+  # The order IS honoured where the control plane picks: it walks this list
+  # most-preferred-first over the registered nodes. What does not exist is
+  # choosing when the job is ADMITTED — capacity is one deployment-wide budget,
+  # so billet can accept work no single machine can host. In `--dev` the node
+  # binds itself and placement can only accept or refuse the host that asked.
+  # And with Docker the only provider built, the EC2 half of this cannot be
+  # exercised at all yet.
   #
   # - label: billet-8vcpu-ubuntu-2404
   #   providers: [firecracker, ec2]   # instead of `provider: firecracker`

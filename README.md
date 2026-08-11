@@ -192,8 +192,9 @@ that would make provider preference and a cost policy mean something; observabil
 
 **billet is a one-machine product today, and the reasons are specific rather than general.** Capacity
 is a single deployment-wide budget rather than a figure per machine, so two hosts of different sizes
-cannot be described ([#21](https://github.com/junioryono/billet/issues/21)); nothing chooses a node,
-because a node binds itself ([#30](https://github.com/junioryono/billet/issues/30)); a destroy is
+cannot be described ([#21](https://github.com/junioryono/billet/issues/21)); the node is chosen only
+once a job has already been acquired, so nothing weighs capacity or cost when the work is admitted
+([#30](https://github.com/junioryono/billet/issues/30)); a destroy is
 broadcast to every node instead of addressed to the one holding the job
 ([#31](https://github.com/junioryono/billet/issues/31)); and a cache lives on the machine that built
 it ([#23](https://github.com/junioryono/billet/issues/23)). Each is invisible with one machine and
@@ -243,12 +244,14 @@ Everything below describes the intended design. Where a thing is not built, it s
 
 ## Quickstart
 
-> Every command below works, with the caveat that the only compute backend is Docker, which is for
-> trials rather than for untrusted code. `billet init` is not built — copy the example config.
+> **The example config does not run as shipped.** It describes the intended Firecracker deployment,
+> and that provider is not built, so `--dev` refuses it. Change `provider: firecracker` to
+> `provider: docker` in the `node:` section and in every tier. Docker shares the host kernel and is
+> for trials rather than for untrusted code. `billet init` is not built either — copy the example.
 
 ```bash
 billet github-app create --org myorg          # creates + installs the App
-cp billet.example.yaml ./billet.yaml          # edit: org, tiers, node provider
+cp billet.example.yaml ./billet.yaml          # then set org, and provider: docker throughout
 billet check --config ./billet.yaml           # validates config, key, state
 billet server --dry-run --config ./billet.yaml  # first contact: polls, accepts nothing
 billet server --dev --config ./billet.yaml    # runs jobs
