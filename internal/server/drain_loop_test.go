@@ -79,6 +79,34 @@ func (d *drainLog) option() Option {
 // beganDraining is the drain's announcement of itself.
 const beganDraining = "draining: not taking new work"
 
+// slowPoll makes a fake session behave like a long poll instead of a spin.
+//
+// A fake that returns ErrNoMessage immediately turns the drain's loop into a hot
+// spin: it takes l.mu on every pass through capacity() and drained(), and under
+// -race that is enough to starve the heartbeat goroutine. A lease whose renewal
+// goes stale is then MOVED OUT of `running` into the cleanup set — the listener
+// says so at the point it does it, "THE LEASE GOES; THE OBLIGATION DOES NOT" —
+// and drained() only looks at `running`, so the drain reports itself finished
+// and its budget never expires.
+//
+// Short enough not to slow the suite, long enough to let the heartbeat run.
+func slowPoll() { time.Sleep(2 * time.Millisecond) }
+
+// outlivesTheDrain is a lease TTL long enough that no lease can expire while a
+// drain is being timed out.
+//
+// A TEST THAT ASSERTS THE DRAIN RAN OUT OF BUDGET MUST OUTLIVE ITS OWN LEASES,
+// and that is not obvious until it bites. The drain ends on whichever comes
+// first: everything finished, or the budget gone. A lease that expires mid-drain
+// empties `running`, so the drain ends by being FINISHED — the other branch,
+// which never writes the line those tests assert on. With the 300ms TTL the
+// other drain tests use, that happened about one run in four under -race, and it
+// is the failure CI caught on #19.
+//
+// Tests asserting the drain finished its work (gaveUp ABSENT) do not need this:
+// a lease expiring early pushes them further towards the outcome they expect.
+const outlivesTheDrain = 30 * time.Second
+
 // gaveUp is the drain giving up on its budget, as opposed to finishing. Kept as
 // a constant so a reworded message breaks the tests that depend on it here
 // rather than making them quietly stop distinguishing the two endings.
@@ -422,8 +450,9 @@ func TestADrainRefusesNewWorkAndStillHearsCompletions(t *testing.T) {
 // shutdown did before a drain existed, so an overrun degrades rather than fails.
 func TestADrainThatOverrunsItsBudgetDestroysWhatIsLeft(t *testing.T) {
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	// A lease TTL longer than the drain budget — see outlivesTheDrain.
 	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
-		alloc.WithLeaseTTL(300*time.Millisecond))
+		alloc.WithLeaseTTL(outlivesTheDrain))
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -439,7 +468,17 @@ func TestADrainThatOverrunsItsBudgetDestroysWhatIsLeft(t *testing.T) {
 			return &Message{MessageID: 1, Assigned: []Job{{RequestID: 11, RunID: 101}}}, nil
 		}
 
+		// A REAL LONG POLL BLOCKS, AND SO DOES THIS — see slowPoll. Returning
+		// immediately spins the drain loop as fast as the scheduler allows, which
+		// starves the heartbeat, and a lease whose renewal goes stale is MOVED OUT
+		// OF `running` into the cleanup set (listener.go, "THE LEASE GOES; THE
+		// OBLIGATION DOES NOT"). drained() then reports the drain finished and the
+		// budget never expires — so the test asserts on a line that was never
+		// going to be written.
+		//
 		// The completion NEVER arrives. This is the job that outlives the drain.
+		slowPoll()
+
 		return nil, ErrNoMessage
 	}
 
@@ -609,8 +648,9 @@ func (d deafSession) GetMessage(_ context.Context, _ int64, capacity int) (*Mess
 // wedged transport being interrupted.
 func TestADrainIsBoundedEvenWhenTheSessionIgnoresItsContext(t *testing.T) {
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	// A lease TTL longer than the drain budget — see outlivesTheDrain.
 	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
-		alloc.WithLeaseTTL(300*time.Millisecond))
+		alloc.WithLeaseTTL(outlivesTheDrain))
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -625,6 +665,9 @@ func TestADrainIsBoundedEvenWhenTheSessionIgnoresItsContext(t *testing.T) {
 		if assigned.CompareAndSwap(false, true) {
 			return &Message{MessageID: 1, Assigned: []Job{{RequestID: 11, RunID: 101}}}, nil
 		}
+
+		// Blocks briefly rather than spinning — see slowPoll.
+		slowPoll()
 
 		// No completion, ever, and no notice taken of any deadline.
 		return nil, ErrNoMessage
