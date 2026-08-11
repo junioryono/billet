@@ -71,17 +71,14 @@ const defaultPollTimeout = 50 * time.Second
 type Plane struct {
 	// owners records which incarnation was given the launch for each lease.
 	//
-	// A SUPERSEDED PROCESS MAY MAINTAIN WHAT IT HOLDS AND NOTHING ELSE. Permitting
-	// every lease route by node name alone let a superseded host read the current
-	// one's leases and RELEASE them: same name, same certificate, and an epoch it
-	// could simply ask for. The capacity came back while a container was running.
+	// A SUPERSEDED PROCESS MAY MAINTAIN WHAT IT HOLDS AND NOTHING ELSE. Routing by
+	// node name alone would let a superseded host read the current one's leases and
+	// RELEASE them — same name, same certificate — returning capacity while a
+	// container ran.
 	//
-	// HELD ON THE PLANE, NOT ON THE NODE RECORD, because the node record expires.
-	// A draining process outlives its replacement by design — that is the whole
-	// point of draining — so when the replacement went silent and the node was
-	// forgotten, the ownership went with it and the drain lost the right to renew
-	// its own lease. Liveness and ownership answer different questions and cannot
-	// share a lifetime.
+	// HELD ON THE PLANE, NOT ON THE NODE RECORD, because the node record expires. A
+	// draining process outlives its replacement by design, so ownership tied to
+	// liveness would vanish exactly when the drain still needed to renew its lease.
 	owners map[string]leaseOwner
 
 	log  *slog.Logger
@@ -107,20 +104,17 @@ type Plane struct {
 	// that has not needed the distinction. See WithSites.
 	sites map[string]bool
 
-	// pendingGone holds hosts the plane has forgotten but the ledger has not yet
-	// been told about. Guarded by mu.
+	// pendingGone holds hosts the plane has forgotten but the ledger has not yet been
+	// told about. Guarded by mu.
 	//
-	// A QUEUE RATHER THAN A RETURN VALUE, because expiry happens in places that
-	// cannot write to a database. Most callers reach it incidentally — picking a
-	// node, listing the fleet, answering a poll — while holding the mutex and in
-	// the middle of doing something else. Handing them the fact to record meant
-	// they dropped it, and a node deleted from the map can never be rediscovered:
-	// the ledger would believe in it forever, backing advertisements for a
-	// machine nothing can reach.
+	// A QUEUE RATHER THAN A RETURN VALUE, because expiry happens in places that cannot
+	// write to a database: most callers reach it incidentally while holding the mutex
+	// and in the middle of something else, so handing them the fact to record means
+	// they drop it — and a node deleted from the map can never be rediscovered, so the
+	// ledger would believe in it forever.
 	//
-	// So expiry records the fact here and the timer drains it. A write that fails
-	// goes back on the queue, because the alternative is the same permanent lie
-	// arriving through a transient database error.
+	// A write that fails goes back on the queue, because the alternative is the same
+	// permanent lie arriving through a transient database error.
 	pendingGone []goneNode
 }
 
@@ -182,15 +176,14 @@ type node struct {
 // forever for a container that no longer existed.
 type abandonedCmd struct {
 	kind nodeapi.CommandKind
-	// incarnation is the process that TOOK the command, without which a late
-	// result cannot be attributed.
+	// incarnation is the process that TOOK the command, without which a late result
+	// cannot be attributed.
 	//
-	// A destroy answered by a process that is not the owner proves nothing about
-	// the owner's container: A owns a running container, B supersedes A and takes
-	// a destroy, truthfully finds nothing, and C supersedes B before B reports. B's
-	// late success would then end A's ownership — and the next completion, seeing
-	// no owner, accepts a no-op destroy and releases capacity while A's container
-	// is still running.
+	// A destroy answered by a process that is not the owner proves nothing about the
+	// owner's container: A owns a running container, B supersedes A and takes a
+	// destroy, truthfully finds nothing, and C supersedes B before B reports. B's late
+	// success would end A's ownership, and the next completion would accept a no-op
+	// destroy and release capacity while A's container still runs.
 	incarnation string
 	requestID   int64
 	at          time.Time
@@ -502,14 +495,12 @@ func sortedSites(set map[string]bool) []string {
 // WithSites declares the places this deployment has compute in.
 //
 // THE CONTROL PLANE IS THE AUTHORITY, and this is the only place the rule can be
-// enforced. A site is declared in the control plane's configuration; a node
-// names one in ITS OWN config, on another machine, in a file with no reason to
-// list the deployment's places — so a node cannot check itself, because it does
-// not know the answer. Validating the server's own file only ever guards the
-// server's tiers. Every remote claim arrives at Register.
+// enforced: a node names a site in ITS OWN config, on another machine, in a file
+// with no reason to list the deployment's places, so it cannot check itself.
+// Every remote claim arrives at Register.
 //
-// Empty means the deployment has declared no sites, in which case a node
-// claiming one is refused: there is nothing it could correctly mean.
+// Empty means the deployment has declared no sites, in which case a node claiming
+// one is refused: there is nothing it could correctly mean.
 func WithSites(names []string) Option {
 	return func(p *Plane) {
 		p.sites = make(map[string]bool, len(names))
@@ -643,17 +634,14 @@ func (p *Plane) Register(
 	// AN OVERTAKEN REGISTRATION CHANGES NOTHING, and this has to be decided BEFORE
 	// anything below it runs.
 	//
-	// The ledger write happens outside this mutex, so two registrations for one
-	// node can commit in one order and arrive in the other: A is handed epoch 1, B
-	// is handed 2, B installs, and then A finally gets the lock. Everything past
-	// this point treats the request as the current process — it tombstones the
-	// in-flight commands B is working on, hands their leases to custody, and
-	// overwrites B's incarnation, provider and guest-OS claims with A's.
+	// The ledger write happens outside this mutex, so two registrations for one node
+	// can commit in one order and arrive in the other: A is handed epoch 1, B is handed
+	// 2, B installs, and then A gets the lock. Everything past this point treats the
+	// request as the current process — tombstoning the commands B is working on and
+	// overwriting its incarnation, provider and guest-OS claims.
 	//
-	// Keeping only the EPOCH monotonic was not enough, and that is the shape of
-	// the bug worth remembering: the fence was applied at the end, after the
-	// damage it was meant to prevent had already been done. The ledger and the
-	// command plane then disagreed about which process owned the node.
+	// Keeping only the EPOCH monotonic is not enough: a fence at the end of a function
+	// runs after the damage it was meant to prevent.
 	if epoch > 0 && epoch < n.ledgerEpoch {
 		p.log.Warn("ignoring a registration that was overtaken by a newer one from the same "+
 			"node; the newer process keeps its commands",
@@ -688,18 +676,14 @@ func (p *Plane) Register(
 	for id, pend := range n.inflight {
 		// TOMBSTONED, EXACTLY AS A TIMEOUT IS, AND FOR EVERY KIND.
 		//
-		// A LAUNCH in flight across a re-registration — a partitioned host still
-		// working, or a process that restarted while its provider kept going — would
-		// otherwise report success afterwards, find no inflight entry and no
-		// tombstone, and be answered 204, while the listener had already stopped
-		// heartbeating on the custody it was told about.
+		// A LAUNCH in flight across a re-registration would otherwise report success
+		// afterwards, find no inflight entry and no tombstone, and be answered 204 — while
+		// the listener had already stopped heartbeating the custody it was told about.
 		//
-		// A DESTROY is the easy case to miss. The process that took it can succeed
-		// and be superseded before it reports; discarding that late result leaves
-		// the ownership record alive after that process exits, so every later
-		// destroy is answered by its replacement — which cannot confirm somebody
-		// else's ownership — and the plane reports custody forever for a container
-		// that has already been removed.
+		// A DESTROY is the easy case to miss: the process that took it can succeed and be
+		// superseded before it reports, and discarding that late result leaves the
+		// ownership record alive after that process exits, so the plane reports custody
+		// forever for a container that has already been removed.
 		n.rememberAbandoned(pend.cmd, pend.incarnation, p.now())
 
 		p.answerLocked(pend, nodeapi.CommandResult{
@@ -763,15 +747,14 @@ var ErrSuperseded = errors.New("nodeplane: another process is registered as this
 
 // CheckIncarnation reports whether a request came from the current node process.
 //
-// COMPATIBILITY IS SCOPED TO NODES THAT HAVE NOT CLAIMED ONE, and the first
-// version scoped it to the REQUEST instead — which meant an absent header
-// bypassed the check entirely. An older node running beside a current one would
-// simply never send the header, and both would take work as the same node
-// forever: the fence was disabled by the very thing it exists to catch.
+// COMPATIBILITY IS SCOPED TO NODES THAT HAVE NOT CLAIMED ONE, not to the REQUEST:
+// scoping it to the request would let an absent header bypass the check entirely,
+// so an older node beside a current one would never send the header and both would
+// take work as the same node forever.
 //
 // So absence is accepted only while the registered node is also absent — a fleet
-// mid-upgrade, or the in-process runner, which has no wire to carry one. Once a
-// process has claimed an incarnation, every later request must carry it.
+// mid-upgrade. Once a process has claimed an incarnation, every later request must
+// carry it.
 func (p *Plane) CheckIncarnation(name, claimed string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
