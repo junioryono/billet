@@ -151,6 +151,14 @@ func (noRunner) Destroy(context.Context, int64) error { return nil }
 // caller has to remember which of the two it is looking at.
 var ErrNoMessage = errors.New("server: no message")
 
+// ErrUntrustworthySession marks a scale-set response billet cannot act on.
+//
+// FATAL WHENEVER IT ARRIVES, including in the middle of a shutdown. Once GitHub
+// returns an id nobody offered for, billet cannot tell which of its commitments
+// are real — so it must stop rather than keep operating that session, and a
+// cancellation happening at the same moment must not turn that into a drain.
+var ErrUntrustworthySession = errors.New("server: the scale set returned something billet cannot act on")
+
 // Message is one batch of scale-set news.
 type Message struct {
 	MessageID  int64
@@ -1188,28 +1196,29 @@ func (l *Listener) Run(ctx context.Context) error {
 	}
 }
 
-// cancelledWhileServing reports whether a failed call failed BECAUSE the caller
-// asked billet to stop, and the drain has not taken over yet.
+// cancelledWhileServing reports whether a failed call should be read as the
+// shutdown arriving mid-call rather than as a failure to report.
 //
-// THE ERROR IS INSPECTED, NOT JUST THE CLOCK, and the first version only looked
-// at the clock. Any failure that happened to coincide with a cancellation was
-// swallowed and the loop carried on into the drain — including the fatal ones.
-// "an acquisition response is not a subset of its request" stops the control
-// plane on purpose, because once GitHub returns an id nobody offered for, billet
-// cannot tell which of its commitments are real. Erasing that because somebody
-// pressed Ctrl-C at the same moment would leave the drain running the same
-// session for hours on exactly the state that is not safe to run on.
+// THE FIRST VERSION LOOKED ONLY AT THE CLOCK, and swallowed every error that
+// happened to coincide with a cancellation — including the fatal ones. The
+// second looked only for context.Canceled, and was worse in a quieter way: a
+// cancellation that lands inside handle() surfaces as whatever domain error that
+// path produces, and those do not wrap the context error. The drain was then
+// skipped for the most ordinary reason there is, intermittently, which is the
+// shape of a feature that works in tests and not on a real machine.
 //
-// So only a cancellation is treated as one. Anything else keeps its fail-stop
-// behaviour, and the cost of a driver that reports cancellation as some other
-// error is a missed drain — the behaviour billet had before there was one —
-// rather than a fatal error quietly discarded.
+// So the question is asked the other way round. Once the caller has asked billet
+// to stop, an error is the shutdown arriving UNLESS it is one billet must stop
+// for regardless of when it arrives. There is one of those, and it is named:
+// a scale-set response billet cannot act on means it no longer knows which of
+// its commitments are real, and draining against that session would be operating
+// on exactly the state that is not safe to operate on.
 func cancelledWhileServing(ctx context.Context, draining bool, err error) bool {
 	if draining || ctx.Err() == nil {
 		return false
 	}
 
-	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+	return !errors.Is(err, ErrUntrustworthySession)
 }
 
 // beginDrain stops this listener taking new work and hands back the capacity
@@ -2347,9 +2356,10 @@ func (l *Listener) acquire(ctx context.Context, available []Job) error {
 		// exactly what is no longer known.
 		l.unreserve(reserved)
 
-		return fmt.Errorf("server: %s acquired job requests it did not offer for "+
+		return fmt.Errorf("%w: %s acquired job requests it did not offer for "+
 			"(unrequested %v, requested %v); refusing to continue against a scale-set "+
-			"response that is not a subset of its request", l.tier, extra, reserved)
+			"response that is not a subset of its request",
+			ErrUntrustworthySession, l.tier, extra, reserved)
 	}
 
 	// GitHub returns what it ACTUALLY gave, which can be fewer than were asked
