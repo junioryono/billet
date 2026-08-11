@@ -136,7 +136,13 @@ func TestAnAvailableJobIsAcquiredByItsOwnRequestID(t *testing.T) {
 		}
 	}()
 
-	l := server.NewListener(a, "billet-4vcpu", sess)
+	l := server.NewListener(a, "billet-4vcpu", sess,
+		// This test cancels while a job is running, and a cancel now begins a
+		// DRAIN: the listener waits for a completion this fake GitHub never
+		// sends. That is the drain working — the job genuinely has not finished —
+		// so a test about the acquisition path says here that it is not testing
+		// the drain, rather than the drain being shortened to suit it.
+		server.WithDrainGrace(50*time.Millisecond))
 	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run: %v", err)
 	}
@@ -272,7 +278,13 @@ func TestAdvertisedCapacityReachesTheWireAsAHeader(t *testing.T) {
 		}
 	}()
 
-	l := server.NewListener(a, "billet-4vcpu", sess)
+	l := server.NewListener(a, "billet-4vcpu", sess,
+		// This test cancels while a job is running, and a cancel now begins a
+		// DRAIN: the listener waits for a completion this fake GitHub never
+		// sends. That is the drain working — the job genuinely has not finished —
+		// so a test about the acquisition path says here that it is not testing
+		// the drain, rather than the drain being shortened to suit it.
+		server.WithDrainGrace(50*time.Millisecond))
 	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run: %v", err)
 	}
