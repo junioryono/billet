@@ -309,6 +309,18 @@ type Listener struct {
 	// documented scaling signal — counting messages is not, because a response
 	// carries at most 50 and a large backlog is truncated.
 	observed *Statistics
+
+	// drainGrace bounds the DRAIN, which is a different kind of wait from every
+	// other budget here and so has its own ceiling. The others bound a teardown —
+	// work billet is doing. This one bounds somebody else's JOB.
+	drainGrace time.Duration
+	// draining says this listener has been asked to stop and is finishing what it
+	// already has. Guarded by mu, and NOT the same thing as sealed.
+	draining bool
+	// hurry, when closed, ends the drain's wait early. It is how a second signal
+	// says "stop waiting" without also saying "abandon what you are holding".
+	// Read here and never closed here.
+	hurry <-chan struct{}
 }
 
 // NewListener builds a listener for one tier.
@@ -328,6 +340,7 @@ func NewListener(a *alloc.Allocator, tier string, session Session, opts ...Optio
 		shutdownGrace: defaultShutdownGrace,
 		closeGrace:    defaultCloseGrace,
 		releaseGrace:  defaultReleaseGrace,
+		drainGrace:    defaultDrainGrace,
 		retryFirst:    firstRetryEvery,
 		retryMax:      maxRetryEvery,
 	}
@@ -480,7 +493,36 @@ const (
 	// Longer than any real teardown and plainly finite, so the four budgets cannot
 	// sum to something int64 cannot hold — and so a watchdog always fires on a
 	// timescale an operator lives on.
+	//
+	// It deliberately does NOT bound the drain; see maxDrainGrace.
 	maxGrace = time.Hour
+
+	// defaultDrainGrace bounds how long the listener keeps polling for
+	// completions after it has been asked to stop, before it gives up waiting and
+	// destroys whatever is still running.
+	//
+	// SIX HOURS BECAUSE THAT IS THE LENGTH OF A JOB, not the length of a
+	// shutdown: GitHub's jobs.<job_id>.timeout-minutes defaults to 360. Every
+	// other budget in this file bounds work BILLET is doing, where an hour is
+	// already generous. This one bounds work somebody ELSE is doing, which is why
+	// it is three orders of magnitude larger and has a separate ceiling.
+	//
+	// Overrunning it is not a failure state. The drain stops waiting and the
+	// ordinary teardown destroys what is left — exactly what happened on every
+	// shutdown before a drain existed.
+	defaultDrainGrace = 6 * time.Hour
+
+	// maxDrainGrace is the largest drain a caller may ask for.
+	//
+	// Separate from maxGrace because the two bound different things. Reusing the
+	// teardown's one-hour ceiling here would refuse every honest value for a fleet
+	// whose jobs run longer than an hour — which is most of them — and push those
+	// operators back onto the job-killing restart the drain replaced.
+	//
+	// A day is still a ceiling: past this a typo is likelier than the intent, and
+	// a service manager's stop timeout sized from a year-long drain would wait
+	// effectively forever.
+	maxDrainGrace = 24 * time.Hour
 
 	// defaultShutdownGrace bounds the whole teardown.
 	//
@@ -537,11 +579,48 @@ func WithShutdownGrace(d time.Duration) Option {
 	}
 }
 
+// WithDrainGrace bounds how long a stopping listener waits for the jobs it is
+// already running to finish before it destroys them.
+//
+// Validated against maxDrainGrace rather than maxGrace, because this is the one
+// budget here that waits on somebody else's job rather than on billet's own
+// teardown. See defaultDrainGrace.
+// WithHurrySignal gives the listener a channel whose closing ends the drain's
+// wait.
+//
+// The drain is bounded by drainGrace, which is measured in hours because a job
+// is. An operator who does not want to wait that long needs a lever that stops
+// the WAITING without stopping the teardown — closing this is that lever, and
+// what follows is the ordinary destroy-and-release the drain was standing in
+// front of. Without it the only escape is killing the process, which strands
+// exactly the containers the drain existed to protect.
+func WithHurrySignal(c <-chan struct{}) Option {
+	return func(l *Listener) { l.hurry = c }
+}
+
+func WithDrainGrace(d time.Duration) Option {
+	return func(l *Listener) {
+		if l.setWithin("drain grace", d, maxDrainGrace) {
+			l.drainGrace = d
+		}
+	}
+}
+
 // set validates one budget and records the outcome against its field name,
 // replacing whatever the last option said about that field. It reports whether
 // the value may be used.
 func (l *Listener) set(field string, d time.Duration) bool {
-	err := checkGrace(field, d)
+	return l.setWithin(field, d, maxGrace)
+}
+
+// setWithin is set with an explicit ceiling, so the drain can be validated
+// against maxDrainGrace while every teardown budget keeps maxGrace.
+//
+// A parameter rather than a second copy of this bookkeeping: the "last value
+// wins, including a correction" behaviour below is subtle enough that two
+// implementations of it would drift.
+func (l *Listener) setWithin(field string, d, ceiling time.Duration) bool {
+	err := checkGrace(field, d, ceiling)
 
 	if err != nil {
 		l.configErrs[field] = err
@@ -624,12 +703,17 @@ func sumBudgets(budgets ...time.Duration) time.Duration {
 // a NEGATIVE one, which is an expired deadline; saturating instead gives a
 // watchdog that fires in about 292 years, which is not a watchdog. A bound that
 // is plainly longer than any real teardown and plainly finite avoids both.
-func checkGrace(name string, d time.Duration) error {
+//
+// The ceiling is a PARAMETER because one of these budgets is not like the
+// others: the drain waits on somebody else's job and is bounded by
+// maxDrainGrace, while every teardown budget waits on billet's own work and is
+// bounded by maxGrace. See maxDrainGrace for why they cannot be one number.
+func checkGrace(name string, d, ceiling time.Duration) error {
 	switch {
 	case d <= 0:
 		return fmt.Errorf("server: %s must be positive, got %s", name, d)
-	case d > maxGrace:
-		return fmt.Errorf("server: %s must be at most %s, got %s", name, maxGrace, d)
+	case d > ceiling:
+		return fmt.Errorf("server: %s must be at most %s, got %s", name, ceiling, d)
 	}
 
 	return nil
@@ -743,7 +827,17 @@ func (l *Listener) Run(ctx context.Context) error {
 	// SEPARATE LIFETIMES, not just separate clocks, because shutdown needs them
 	// in opposite orders: the cleanup loop must be finished before the release
 	// runs, and renewal must still be running while it does.
-	sweep, stopSweeping := context.WithCancel(ctx)
+	//
+	// AND IT DOES NOT INHERIT THE CALLER'S CANCELLATION EITHER, for the drain's
+	// sake. This was a child of ctx, which was right while cancellation meant
+	// "tear down now": the loop stopped at the same instant the polling did.
+	// A drain keeps the listener alive for as long as a job runs, and a failed
+	// destroy has to keep being retried across all of it — a cleanup record that
+	// stopped being retried the moment the operator pressed Ctrl-C would sit
+	// untouched for hours and then be handed to a teardown that has one grace to
+	// finish it. The teardown still stops this loop explicitly, so the shutdown
+	// ordering below is unchanged.
+	sweep, stopSweeping := context.WithCancel(context.WithoutCancel(ctx))
 	defer stopSweeping()
 
 	var beating, sweeping sync.WaitGroup
@@ -991,16 +1085,82 @@ func (l *Listener) Run(ctx context.Context) error {
 	l.observed = l.session.Statistics()
 	l.reportOrphanedBacklog()
 
+	// THE DRAIN IS A STATE OF THIS LOOP, NOT A PHASE OF THE TEARDOWN, and that is
+	// the whole design rather than a detail of it.
+	//
+	// Putting it in the deferred teardown is the obvious place and cannot work:
+	// by the time a deferred function runs, ctx is cancelled and the long poll is
+	// dead, so the listener can no longer be TOLD that a job finished. A drain
+	// there would wait for news that can never arrive, spend its entire budget,
+	// and then destroy the jobs anyway — slower than not draining at all.
+	//
+	// So cancellation stops the listener taking NEW work and nothing else. It
+	// keeps polling on a context of its own, because reporting is the handover:
+	// the completion that empties `running` arrives through the same long poll
+	// that offers new jobs.
+	pollCtx := ctx
+
+	var (
+		draining bool
+		endDrain context.CancelFunc
+	)
+
+	defer func() {
+		if endDrain != nil {
+			endDrain()
+		}
+	}()
+
 	for {
-		if err := ctx.Err(); err != nil {
-			return err
+		// THE TRANSITION IS CHECKED HERE AND AFTER EVERY CALL, because the
+		// cancellation almost always lands DURING one rather than between two.
+		// The listener spends nearly all of its life inside a long poll, so a
+		// version that only looked at the top of the loop saw the poll fail with
+		// context.Canceled first and returned — draining exactly never.
+		if !draining && ctx.Err() != nil {
+			draining = true
+			// The budget has to START HERE, at the cancellation, which is why this
+			// cannot be hoisted above the loop: a deadline created when Run began
+			// would already be spent by the time anybody asked billet to stop.
+			// `draining` makes it a once-per-Run assignment, not a per-iteration one.
+			//nolint:fatcontext // Assigned at most once; see the comment above.
+			pollCtx, endDrain = l.beginDrain(ctx)
 		}
 
-		if err := l.refillEscrow(ctx); err != nil {
-			return stopping(ctx, err)
+		if draining {
+			if l.drained() {
+				l.log.Info("everything running here has finished; stopping", "tier", l.tier)
+
+				return ctx.Err()
+			}
+
+			if pollCtx.Err() != nil {
+				// The drain's budget is gone, or a second signal cut it short.
+				// What is still running is now the teardown's problem, and it
+				// destroys it exactly as it did before a drain existed.
+				l.log.Warn("stopped waiting for the jobs still running here; they will be "+
+					"destroyed and GitHub will reassign them",
+					"tier", l.tier, "running", l.Running(), "grace", l.drainGrace)
+
+				return ctx.Err()
+			}
 		}
 
-		msg, err := l.session.GetMessage(ctx, l.lastMessageID, l.capacity())
+		// NOT WHILE DRAINING. Escrow is how this listener claims capacity it
+		// intends to advertise, and the drain has just handed back the capacity
+		// nobody was using. Topping it up again would re-advertise the tier it is
+		// trying to leave, and the drain could never reach zero.
+		if !draining {
+			if err := l.refillEscrow(pollCtx); err != nil {
+				if cancelledWhileServing(ctx, draining, err) {
+					continue
+				}
+
+				return stopping(ctx, err)
+			}
+		}
+
+		msg, err := l.session.GetMessage(pollCtx, l.lastMessageID, l.capacity())
 
 		// A timed-out long poll is the ordinary case. Poll again immediately —
 		// the escrow is KEPT, because releasing and retaking it every poll
@@ -1011,13 +1171,200 @@ func (l *Listener) Run(ctx context.Context) error {
 		}
 
 		if err != nil {
+			if cancelledWhileServing(ctx, draining, err) {
+				continue
+			}
+
 			return stopping(ctx, fmt.Errorf("server: poll %s: %w", l.tier, err))
 		}
 
-		if err := l.handle(ctx, msg); err != nil {
+		if err := l.handle(pollCtx, msg); err != nil {
+			if cancelledWhileServing(ctx, draining, err) {
+				continue
+			}
+
 			return stopping(ctx, err)
 		}
 	}
+}
+
+// cancelledWhileServing reports whether a failed call failed BECAUSE the caller
+// asked billet to stop, and the drain has not taken over yet.
+//
+// THE ERROR IS INSPECTED, NOT JUST THE CLOCK, and the first version only looked
+// at the clock. Any failure that happened to coincide with a cancellation was
+// swallowed and the loop carried on into the drain — including the fatal ones.
+// "an acquisition response is not a subset of its request" stops the control
+// plane on purpose, because once GitHub returns an id nobody offered for, billet
+// cannot tell which of its commitments are real. Erasing that because somebody
+// pressed Ctrl-C at the same moment would leave the drain running the same
+// session for hours on exactly the state that is not safe to run on.
+//
+// So only a cancellation is treated as one. Anything else keeps its fail-stop
+// behaviour, and the cost of a driver that reports cancellation as some other
+// error is a missed drain — the behaviour billet had before there was one —
+// rather than a fatal error quietly discarded.
+func cancelledWhileServing(ctx context.Context, draining bool, err error) bool {
+	if draining || ctx.Err() == nil {
+		return false
+	}
+
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+// beginDrain stops this listener taking new work and hands back the capacity
+// nobody is using, returning the context the drain polls on.
+//
+// THE ADVERTISEMENT IS NOT FORCED TO ZERO, and the first version of this did
+// force it. What billet sends on each poll is documented as the scale set's
+// TOTAL capacity, so a constant zero while a job runs is a statement that is not
+// true. Releasing the idle escrow instead makes capacity() — held + acquiring +
+// running — fall to exactly the work still in flight, shrink as each job
+// finishes, and reach zero by itself at the moment the drain is complete. The
+// number GitHub sees stays honest and the completion condition needs no second
+// source of truth.
+//
+// The advertisement is a courtesy to GitHub's scheduler and NOT the guard: a
+// queued message can still arrive, and a redelivered one certainly can. What
+// actually refuses the work is the local check in handle, for the same reason
+// the dry run needs one.
+func (l *Listener) beginDrain(ctx context.Context) (context.Context, context.CancelFunc) {
+	// BOUNDED, and bounded only as far as anything here can be. The deadline is
+	// observed between calls, so a Session that returns — however slowly — is
+	// bounded by it, while one that blocks inside GetMessage forever is not. That
+	// is the same limit the teardown documents for a Destroy that ignores its
+	// context, and neither interface forbids one; saying so is more useful than a
+	// comment claiming a guarantee this cannot give.
+	//
+	// The drain's context is built FIRST because the release below needs a live
+	// one: ctx is already cancelled by the time this is called, and handing a
+	// cancelled context to alloc.Release would fail every one of them and strand
+	// the very capacity this is giving back.
+	drainCtx, endDrain := context.WithTimeout(context.WithoutCancel(ctx), l.drainGrace)
+
+	// A SECOND SIGNAL ENDS THE WAIT, not the teardown. What follows is the
+	// ordinary destroy-and-release; only the waiting is cut short.
+	//
+	// The goroutine also selects on drainCtx so it cannot outlive the drain. A
+	// version that only waited on hurry would park forever in every process that
+	// drains normally, which is all of them.
+	if l.hurry != nil {
+		go func() {
+			select {
+			case <-l.hurry:
+				endDrain()
+			case <-drainCtx.Done():
+			}
+		}()
+	}
+
+	// NOT l.seal(), WHICH MEANS SOMETHING ELSE. Sealing stops the cleanup loop
+	// starting new destroys, and belongs at the teardown where it is. A drain can
+	// last as long as a job, so sealing here would leave every failed destroy
+	// un-retried for hours and then hand the whole backlog to a teardown with one
+	// grace to clear it — the opposite of what the drain is for.
+	//
+	// MARKED BEFORE THE ESCROW GOES BACK. The other order leaves a window in
+	// which the capacity has been released but an offer can still be accepted, so
+	// the listener would claim a job it no longer has anything to back.
+	l.mu.Lock()
+	l.draining = true
+	l.mu.Unlock()
+
+	released := l.releaseIdleEscrow(drainCtx)
+
+	l.log.Info("draining: not taking new work, waiting for what is already running",
+		"tier", l.tier, "running", l.Running(), "released_idle_leases", released,
+		"grace", l.drainGrace)
+
+	return drainCtx, endDrain
+}
+
+// releaseIdleEscrow hands back every lease this listener holds but has not given
+// to a job, reporting how many.
+//
+// Only `held`. `acquiring` has been promised to a job that is starting and
+// `running` is backing a live container; releasing either would let another tier
+// escrow capacity that is already spoken for, which is the overcommit the whole
+// escrow exists to prevent.
+func (l *Listener) releaseIdleEscrow(ctx context.Context) int {
+	// A SNAPSHOT TO ITERATE, BUT EACH LEASE LEAVES `held` ONLY WHEN IT IS
+	// ACTUALLY RELEASED. The first version took the whole slice out up front and
+	// appended the failures back afterwards, which is wrong twice over.
+	//
+	// While a lease is out of `held` the heartbeat cannot see it, so it stops
+	// being renewed — and a release pass that runs longer than a lease TTL would
+	// let the reaper reclaim one, after which appending it back would have this
+	// listener advertising capacity it no longer owns. That is the double
+	// admission the whole escrow exists to prevent, reached through the code that
+	// was meant to hand capacity back.
+	//
+	// It also raced the heartbeat's own pruning: heartbeatHeld drops leases it has
+	// lost, and replacing the slice wholesale would resurrect one it had just
+	// dropped. Deleting by id leaves both free to act on the same collection.
+	l.mu.Lock()
+	snapshot := append([]*alloc.Lease(nil), l.held...)
+	l.mu.Unlock()
+
+	released := 0
+
+	for _, lease := range snapshot {
+		if err := l.alloc.Release(ctx, lease.ID, lease.Epoch, alloc.PhaseDone); err != nil {
+			// LEFT IN `held`, so it is still renewed, still correctly counted as
+			// this listener's, and tried again by the teardown's own release pass
+			// on its own budget. Dropping it here would leak the capacity until the
+			// reaper; advertising it after losing it would be worse.
+			l.log.Warn("could not release idle escrow while draining; it stays this "+
+				"listener's and will be released at shutdown",
+				"tier", l.tier, "lease", lease.ID, "error", err)
+
+			continue
+		}
+
+		l.mu.Lock()
+		l.held = slices.DeleteFunc(l.held, func(h *alloc.Lease) bool { return h.ID == lease.ID })
+		l.mu.Unlock()
+
+		released++
+	}
+
+	return released
+}
+
+// isDraining reports whether this listener has been asked to stop and is
+// waiting out the work it already has.
+//
+// Distinct from `sealed`, which stops the cleanup loop at teardown. The two are
+// hours apart in the life of a drain and mean different things.
+func (l *Listener) isDraining() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	return l.draining
+}
+
+// drained reports whether this listener still owes anybody a running job.
+//
+// RUNNING ONLY, AND `acquiring` DELIBERATELY NOT. A promise is escrow held for
+// work billet claimed from GitHub and has not been assigned, and GitHub may
+// never assign it — another scale set can win the same offer. The listener keeps
+// such a promise on purpose: renewLoop reports it as stale and holds its lease,
+// because the thing that resolves it is the session ending, which releases every
+// promise with it.
+//
+// The session ends in the teardown, which is on the far side of this wait. So a
+// drain that waited for `acquiring` to empty would be waiting for something only
+// the step after it can do: it would spend its entire budget, destroy nothing,
+// and have achieved a six-hour pause. The end-to-end suite found exactly that —
+// a control plane that would not stop, with running=0.
+//
+// A promise assigned DURING the drain is still launched and still waited for,
+// because by then it is running work like any other.
+func (l *Listener) drained() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	return len(l.running) == 0
 }
 
 // capacity is what this listener advertises: TOTAL escrowed, not free.
@@ -1844,22 +2191,43 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 		}
 	}
 
-	// Topped up between the release and the acquisition, so the slot just freed is
-	// available to back the offer that arrived with it. It may lose the race to
-	// another tier — escrow is first-come — and that is a fairness question, not a
-	// correctness one: what matters is that billet does not claim work it cannot
-	// back. See TestAGreedyTierCanTakeTheWholeBudget.
-	if len(msg.Available) > 0 {
-		if err := l.refillEscrow(ctx); err != nil {
+	// NO NEW WORK WHILE DRAINING, and the refusal has to be HERE rather than in
+	// the advertisement.
+	//
+	// Releasing the idle escrow drops the number billet sends, which asks GitHub
+	// to stop offering — it does not stop a message already queued from arriving,
+	// or an unacknowledged one from being redelivered. Both would otherwise be
+	// acquired, because the refill immediately below would take the capacity back
+	// and the acquisition would then be perfectly backed. The drain would never
+	// converge: every offer it accepted would extend it.
+	//
+	// ONLY OFFERS. Assigned still runs and Completed still completes — those are
+	// promises made before the drain started, and abandoning them would strand the
+	// leases the drain is waiting on and leave GitHub holding a job nothing will
+	// launch.
+	if l.isDraining() {
+		if len(msg.Available) > 0 {
+			l.log.Info("declining an offer while draining",
+				"tier", l.tier, "available", len(msg.Available))
+		}
+	} else {
+		// Topped up between the release and the acquisition, so the slot just freed
+		// is available to back the offer that arrived with it. It may lose the race
+		// to another tier — escrow is first-come — and that is a fairness question,
+		// not a correctness one: what matters is that billet does not claim work it
+		// cannot back. See TestAGreedyTierCanTakeTheWholeBudget.
+		if len(msg.Available) > 0 {
+			if err := l.refillEscrow(ctx); err != nil {
+				return err
+			}
+		}
+
+		// AVAILABLE is what gets acquired. Available is the offer; Assigned is the
+		// confirmation that an offer was claimed. Acquiring from Assigned asks
+		// GitHub to claim work it has already handed over, and drops every offer.
+		if err := l.acquire(ctx, msg.Available); err != nil {
 			return err
 		}
-	}
-
-	// AVAILABLE is what gets acquired. Available is the offer; Assigned is the
-	// confirmation that an offer was claimed. Acquiring from Assigned asks GitHub
-	// to claim work it has already handed over, and drops every offer.
-	if err := l.acquire(ctx, msg.Available); err != nil {
-		return err
 	}
 
 	// ASSIGNED is what consumes escrow. The lease is bound here because this is

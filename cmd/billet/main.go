@@ -66,10 +66,17 @@ type command struct {
 	run     func(ctx context.Context, args []string) error
 }
 
-func commands() []command {
+// commands takes the lifecycle so the two long-running roles can close over it.
+//
+// Only `server` and `node` can be hurried — the rest either exit on their own or
+// have nothing running to wait for — so it is captured by those two rather than
+// widening every command's signature or, worse, becoming package state.
+func commands(lc *lifecycle) []command {
 	return []command{
-		{"server", "run the control plane (add --dev to also run a node here)", cmdServer},
-		{"node", "run a compute host that dials a control plane", cmdNode},
+		{"server", "run the control plane (add --dev to also run a node here)",
+			func(ctx context.Context, args []string) error { return cmdServer(ctx, lc, args) }},
+		{"node", "run a compute host that dials a control plane",
+			func(ctx context.Context, args []string) error { return cmdNode(ctx, lc, args) }},
 		{"ca", "issue the certificates nodes authenticate with", cmdCA},
 		{"check", "validate the config and state directory, then exit", cmdCheck},
 		{"init", "generate a billet.yaml interactively", cmdInit},
@@ -91,47 +98,29 @@ func run(args []string) error {
 		return nil
 	}
 
-	// Ctrl-C and SIGTERM cancel the context. Every long-running role is expected
-	// to drain rather than drop jobs on the floor: a runner killed mid-job leaves
-	// an orphaned registration on GitHub that someone has to clean up by hand.
-	// THE FIRST ASKS, THE SECOND INSISTS — from ONE registration, because two
-	// registrations both receive every signal.
+	// Ctrl-C and SIGTERM cancel the context. Every long-running role drains rather
+	// than dropping jobs on the floor: a runner killed mid-job leaves an orphaned
+	// registration on GitHub that someone has to clean up by hand.
 	//
-	// A graceful stop is the right default: it destroys compute and hands capacity
-	// back rather than stranding containers and leases. But it can take minutes,
-	// since destroying a job on a node that has gone quiet waits out the node
-	// command timeout and the shutdown grace is sized to cover that — and while it
-	// runs, an operator's habitual second Ctrl-C was being swallowed, so the
-	// terminal simply looked hung.
-	//
-	// The first attempt at this used signal.NotifyContext for the graceful stop
-	// AND a second signal.Notify for the forced exit. Go delivers a signal to
-	// every channel registered for it, so the first Ctrl-C cancelled the context
-	// and sat buffered in the forced channel; the goroutine woke on the
-	// cancellation it had just caused, consumed its own signal, and exited
-	// immediately. That did not add a forced exit — it deleted the graceful one.
+	// THE FIRST ASKS, THE SECOND INSISTS, THE THIRD GIVES UP — from ONE
+	// registration, because two registrations both receive every signal. See
+	// lifecycle.escalate for what each level does and for the bug the single
+	// registration exists to prevent.
 	ctx, cancelGraceful := context.WithCancel(context.Background())
 	defer cancelGraceful()
 
-	signals := make(chan os.Signal, 2)
+	lc := newLifecycle(cancelGraceful)
+
+	// Buffered for three, because there are now three levels and a signal that
+	// arrives while the goroutine is between receives must not be dropped.
+	signals := make(chan os.Signal, 3)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
 
 	defer signal.Stop(signals)
 
-	go func() {
-		<-signals
-		cancelGraceful()
+	go lc.escalate(signals, os.Exit)
 
-		<-signals
-
-		fmt.Fprintln(os.Stderr, "billet: second signal; exiting without finishing the "+
-			"shutdown. Compute this process was destroying may still be running, and its "+
-			"capacity is held until the reaper reclaims it.")
-
-		os.Exit(130)
-	}()
-
-	for _, c := range commands() {
+	for _, c := range commands(lc) {
 		if c.name == args[0] {
 			return c.run(ctx, args[1:])
 		}
@@ -143,7 +132,10 @@ func run(args []string) error {
 func usage() {
 	fmt.Fprint(os.Stderr, "billet — self-hosted GitHub Actions runners\n\nusage: billet <command> [flags]\n\n")
 	w := tabwriter.NewWriter(os.Stderr, 0, 0, 3, ' ', 0)
-	for _, c := range commands() {
+	// A lifecycle nothing will use: usage only reads names and summaries, and
+	// building one here keeps commands() from needing a nil-safe path that only
+	// this call site would ever exercise.
+	for _, c := range commands(newLifecycle(func() {})) {
 		fmt.Fprintf(w, "  %s\t%s\n", c.name, c.summary)
 	}
 	_ = w.Flush()
@@ -237,7 +229,7 @@ func addConfigFlag(fs *flag.FlagSet) *string {
 	return fs.String("config", defaultConfigPath(), "path to billet.yaml")
 }
 
-func cmdServer(ctx context.Context, args []string) error {
+func cmdServer(ctx context.Context, lc *lifecycle, args []string) error {
 	fs := newFlagSet("billet server")
 	cfgPath := addConfigFlag(fs)
 	dev := fs.Bool("dev", false, "also run a node in this process (single-machine deployment)")
@@ -283,7 +275,7 @@ func cmdServer(ctx context.Context, args []string) error {
 	// registers, which is the ordinary state while a fleet is being set up.
 	// --dry-run remains for proving the GitHub path while advertising zero.
 
-	return runServer(ctx, cfg, *dryRun, *dev)
+	return runServer(ctx, lc, cfg, *dryRun, *dev)
 }
 
 // runServer starts the control plane and blocks until it is told to stop.
@@ -378,7 +370,7 @@ func claimIdentity(
 	return deployment, lock, nil
 }
 
-func runServer(ctx context.Context, cfg *config.Config, dryRun, dev bool) error {
+func runServer(ctx context.Context, lc *lifecycle, cfg *config.Config, dryRun, dev bool) error {
 	// Built by the SHARED constructor, so the server and teardown authenticate
 	// identically. Two near-identical constructions is how one of them ends up
 	// pointed at a different organization than the other.
@@ -442,7 +434,17 @@ func runServer(ctx context.Context, cfg *config.Config, dryRun, dev bool) error 
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	var opts []server.ControlPlaneOption
+	// Everything billet.yaml says about the control plane, assembled in one place
+	// inside the server package so the config-to-listener chain is testable
+	// without spanning two packages. Whatever this command adds below is about
+	// how it was INVOKED — a flag, a co-resident node — not about the file.
+	opts, err := server.OptionsFromConfig(cfg)
+	if err != nil {
+		return err
+	}
+
+	// The second signal, reaching the drain that honours it.
+	opts = append(opts, server.WithHurry(lc.hurry))
 
 	if dryRun {
 		opts = append(opts, server.AdvertiseNothing())
@@ -744,7 +746,7 @@ func nodeBundle(cfg *config.Config) (*wirecert.Bundle, error) {
 	return &bundle, nil
 }
 
-func cmdNode(ctx context.Context, args []string) error {
+func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 	fs := newFlagSet("billet node")
 	cfgPath := addConfigFlag(fs)
 	if err := parse(fs, args); err != nil {
@@ -833,11 +835,22 @@ func cmdNode(ctx context.Context, args []string) error {
 	// configuration, not here, and Bind is what enforces it. Sending one from the
 	// node would be a second authority for a fact the operator already stated in
 	// one place — and the node's copy is the one nobody would think to update.
+	// Parsed rather than trusted: Validate rejected a bad value when the file was
+	// read, so this cannot normally fail — but reading it is the only thing that
+	// makes node.drain_timeout take effect.
+	drainTimeout, err := cfg.Node.DrainTimeoutDuration()
+	if err != nil {
+		return err
+	}
+
 	return nodeclient.Run(ctx, client, runner, nodeclient.LoopOptions{
-		Provider:   cfg.Node.Provider,
-		Deployment: deployment,
-		Log:        slog.Default(),
-		SweepEvery: 5 * time.Minute,
+		Provider:     cfg.Node.Provider,
+		Deployment:   deployment,
+		Log:          slog.Default(),
+		SweepEvery:   5 * time.Minute,
+		DrainTimeout: drainTimeout,
+		// The second signal, reaching the wait that honours it.
+		Hurry: lc.hurry,
 	})
 }
 

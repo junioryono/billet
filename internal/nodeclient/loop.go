@@ -52,6 +52,14 @@ type Compute interface {
 	Superseded()
 }
 
+// defaultDrainTimeout bounds how long a stopping node waits for the compute it
+// is holding.
+//
+// SIX HOURS BECAUSE THAT IS THE LENGTH OF A JOB: GitHub's
+// jobs.<job_id>.timeout-minutes defaults to 360. A shorter wait would routinely
+// destroy work that was about to finish, which is what the drain exists to stop.
+const defaultDrainTimeout = 6 * time.Hour
+
 // LoopOptions configures Run.
 type LoopOptions struct {
 	Provider   config.ProviderKind
@@ -61,6 +69,13 @@ type LoopOptions struct {
 	// SweepEvery bounds how often the node looks for compute nothing is asking
 	// about. Zero disables it.
 	SweepEvery time.Duration
+	// Hurry, when closed, ends the drain's wait early. It is the operator's
+	// second signal: stop waiting, but still stop properly.
+	Hurry <-chan struct{}
+	// DrainTimeout bounds how long a stopping node waits for the compute it is
+	// still holding before it gives up and lets the process exit. Zero uses a
+	// default of six hours, which is how long GitHub lets a job run.
+	DrainTimeout time.Duration
 	// Backoff is how long to wait after a failed registration or poll. Zero uses
 	// a default.
 	//
@@ -120,9 +135,20 @@ func Run(ctx context.Context, c *Client, compute Compute, opts LoopOptions) erro
 	// renewing on a one-second fallback for the process's whole life, while
 	// racing the write that would have told it the truth.
 	//
-	// Its own context, cancelled when Run returns, so a node that stops because
-	// it was refused does not leave a goroutine heartbeating behind it.
-	janitorCtx, stopJanitor := context.WithCancel(ctx)
+	// AND IT DOES NOT INHERIT THE CALLER'S CANCELLATION, which is what makes the
+	// drain mean anything at all.
+	//
+	// This was a child of ctx, so the first signal stopped KeepAlive at the exact
+	// moment stopGracefully began waiting on the compute those leases back. The
+	// node would sit there holding containers whose leases nothing was renewing,
+	// the reaper would expire them, and another tier could escrow the same
+	// capacity while the container was still on this host — the double admission
+	// the whole escrow exists to prevent, arrived at through the code meant to
+	// protect the work.
+	//
+	// Cancelled when Run RETURNS instead, by the defer below, so a node that stops
+	// because it was refused still leaves no goroutine heartbeating behind it.
+	janitorCtx, stopJanitor := context.WithCancel(context.WithoutCancel(ctx))
 
 	var (
 		janitor     sync.WaitGroup
@@ -198,9 +224,9 @@ func Run(ctx context.Context, c *Client, compute Compute, opts LoopOptions) erro
 			continue
 		}
 
-		err := serve(ctx, c, compute, log, opts)
+		err := serve(ctx, c, compute, log, opts, false)
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return stopGracefully(ctx, c, compute, log, opts)
 		}
 
 		// SUPERSEDED IS NOT SOMETHING TO RETRY, and re-registering is the specific
@@ -268,6 +294,157 @@ func drain(ctx context.Context, compute Compute, log *slog.Logger, opts LoopOpti
 		"keeping the leases of compute already running here renewed until it finishes. " +
 		"Stop whichever host is not meant to be this node")
 
+	if waitForHolding(ctx, compute, log, opts) {
+		log.Info("everything this node was holding has finished; stopping")
+	}
+}
+
+// stopGracefully waits for the compute this node is holding to finish before
+// letting the process exit.
+//
+// THE SAME WAIT AS A SUPERSEDED NODE'S, WITHOUT THE HAND-OVER, and the missing
+// call is the whole difference. drain opens with compute.Superseded() because
+// after supersession the control plane routes those completions to whichever
+// process now holds the name; moving the work into custody is what stops this
+// process waiting for reports that will never come to it.
+//
+// A SIGTERM is not that. Nobody is taking over, the completions still belong
+// here, and calling Superseded would strand the very reports this wait exists
+// for. The work stays exactly where it is and Holding() drains it.
+//
+// Nothing is served during this wait, so no new launch can arrive: serve has
+// already returned, which is what brought us here.
+func stopGracefully(ctx context.Context, c *Client, compute Compute, log *slog.Logger, opts LoopOptions) error {
+	// A node holding nothing stops at once. The drain is for work in flight, not
+	// a delay every restart pays.
+	if !compute.Holding() {
+		return ctx.Err()
+	}
+
+	grace := opts.DrainTimeout
+	if grace <= 0 {
+		grace = defaultDrainTimeout
+	}
+
+	drainCtx, endDrain := context.WithTimeout(context.WithoutCancel(ctx), grace)
+	defer endDrain()
+
+	// A SECOND SIGNAL ENDS THE WAIT, not the process. The goroutine also selects
+	// on drainCtx so it cannot outlive the drain — one parked on a hurry channel
+	// nobody closes would leak in every node that drains normally, which is all
+	// of them.
+	if opts.Hurry != nil {
+		go func() {
+			select {
+			case <-opts.Hurry:
+				endDrain()
+			case <-drainCtx.Done():
+			}
+		}()
+	}
+
+	log.Info("draining: not taking new work, waiting for the compute already running here",
+		"grace", grace)
+
+	// IT KEEPS ANSWERING THE CONTROL PLANE, and the first version did not — which
+	// made the drain useless in the ordinary case.
+	//
+	// Tend advances CUSTODY: work this node adopted or could not account for. A
+	// job running normally is not custody, and what removes it is a Destroy, which
+	// arrives over this command poll after the control plane learns from GitHub
+	// that the job finished. Stop polling and that message can never be delivered,
+	// so Holding() stays true until the whole grace expires — a node that always
+	// waits its maximum, which is the opposite of draining.
+	//
+	// Launches are refused while this runs; see execute.
+	var serving sync.WaitGroup
+
+	serving.Add(1)
+
+	go func() {
+		defer serving.Done()
+
+		for drainCtx.Err() == nil {
+			err := serve(drainCtx, c, compute, log, opts, true)
+			if drainCtx.Err() != nil {
+				return
+			}
+
+			// SUPERSEDED DURING A DRAIN IS STILL SUPERSESSION. Another process now
+			// owns this name, so the completions this wait depends on are being
+			// routed there instead. Handing the work to custody is what lets Tend
+			// finish it here rather than waiting for reports that will never come.
+			if errors.Is(err, ErrSuperseded) {
+				log.Warn("another process registered as this node while it was draining; " +
+					"keeping its leases renewed until what is running here finishes")
+				compute.Superseded()
+
+				return
+			}
+
+			if errors.Is(err, ErrUnregistered) {
+				log.Warn("the control plane no longer knows this node; registering again " +
+					"so it can still be told to destroy what is running here")
+
+				if err := c.Register(drainCtx, opts.Provider, opts.GuestOS, opts.Deployment); err != nil {
+					log.Error("could not register again while draining", "error", err)
+
+					if !sleep(drainCtx, backoffFor(opts)) {
+						return
+					}
+				}
+
+				continue
+			}
+
+			if !sleep(drainCtx, backoffFor(opts)) {
+				return
+			}
+		}
+	}()
+
+	drained := waitForHolding(drainCtx, compute, log, opts)
+
+	// Stop serving before returning, and JOIN it: a command still in flight would
+	// otherwise outlive Run and act on a node that has stopped.
+	endDrain()
+	serving.Wait()
+
+	if drained {
+		log.Info("everything running here has finished; stopping")
+
+		return ctx.Err()
+	}
+
+	// NO TEARDOWN FOLLOWS THIS, and saying so plainly is better than implying one.
+	// A node does not destroy its own compute on the way out: the containers
+	// outlive this process, Recover re-adopts them when it starts again, and the
+	// control plane's reaper reclaims the leases once they expire. Destroying them
+	// here would kill jobs that are still running to save capacity that comes back
+	// on its own.
+	log.Warn("stopped waiting for the compute still running here; it keeps running and "+
+		"will be re-adopted when this node starts again, and its capacity is held "+
+		"until the reaper reclaims it",
+		"grace", grace)
+
+	return ctx.Err()
+}
+
+// backoffFor is the pause after a failed registration or poll.
+func backoffFor(opts LoopOptions) time.Duration {
+	if opts.Backoff > 0 {
+		return opts.Backoff
+	}
+
+	return 5 * time.Second
+}
+
+// waitForHolding tends custody until this node is holding nothing, reporting
+// whether it got there before the context ended.
+//
+// Shared by the supersession drain and the signal drain so the two cannot drift.
+// What they must NOT share is the step before it — see stopGracefully.
+func waitForHolding(ctx context.Context, compute Compute, log *slog.Logger, opts LoopOptions) bool {
 	every := opts.SweepEvery
 	if every <= 0 {
 		every = time.Second
@@ -279,15 +456,15 @@ func drain(ctx context.Context, compute Compute, log *slog.Logger, opts LoopOpti
 		}
 
 		if !sleep(ctx, every) {
-			return
+			return false
 		}
 	}
 
-	log.Info("everything this node was holding has finished; stopping")
+	return true
 }
 
 // serve polls for commands until something needs the caller to re-register.
-func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, opts LoopOptions) error {
+func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, opts LoopOptions, draining bool) error {
 	sweepAt := time.Now().Add(opts.SweepEvery)
 
 	for {
@@ -336,7 +513,7 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 			continue
 		}
 
-		res := execute(ctx, compute, cmd)
+		res := execute(ctx, compute, cmd, draining)
 
 		if err := c.Report(ctx, res); err != nil {
 			// THE WORK IS DONE AND THE ANSWER DID NOT LAND, and that is not merely
@@ -395,15 +572,29 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 // staging either over a real wire would mean building a deliberately wrong
 // control plane to test a node.
 func ExecuteForTest(ctx context.Context, compute Compute, cmd nodeapi.Command) nodeapi.CommandResult {
-	return execute(ctx, compute, cmd)
+	return execute(ctx, compute, cmd, false)
 }
 
 // execute runs one command and describes what happened.
-func execute(ctx context.Context, compute Compute, cmd nodeapi.Command) nodeapi.CommandResult {
+func execute(ctx context.Context, compute Compute, cmd nodeapi.Command, draining bool) nodeapi.CommandResult {
 	res := nodeapi.CommandResult{ID: cmd.ID}
 
 	switch cmd.Kind {
 	case nodeapi.CommandLaunch:
+		// NO NEW WORK ON A NODE THAT IS STOPPING. It answers commands during a
+		// drain so the control plane can still destroy what is here and hear that
+		// it is gone; accepting a launch as well would mean the drain never
+		// converges, since each new job extends the wait it is trying to finish.
+		//
+		// Refused rather than silently dropped: the control plane already knows
+		// how to handle a launch that failed — it hands the capacity back and
+		// GitHub reassigns — and no custody is claimed, because nothing started.
+		if draining {
+			res.Error = "this node is draining and will not start new work"
+
+			return res
+		}
+
 		if cmd.Lease == nil || cmd.Job == nil {
 			res.Error = "launch command arrived without a lease or a job"
 
