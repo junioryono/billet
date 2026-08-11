@@ -486,6 +486,21 @@ func runServer(ctx context.Context, lc *lifecycle, cfg *config.Config, dryRun, d
 		owner = "billet"
 	}
 
+	// NOTHING IS LIVE UNTIL IT SAYS SO AGAIN, and this has to happen BEFORE
+	// anything registers.
+	//
+	// Liveness is the plane's judgement and this plane has just started, so it has
+	// none: its map is empty. Rows left by the previous process would otherwise
+	// back advertisements for machines this one has never heard from.
+	//
+	// Sweeping AFTER --dev registered its in-process node marked that node dead
+	// and nothing ever brought it back — it does not register over the wire, so
+	// there is no second chance. The colocated runner would have advertised zero
+	// forever, on the one deployment shape where there is no other machine.
+	if err := allocator.ForgetEveryNode(ctx); err != nil {
+		return fmt.Errorf("server: could not clear the fleet's liveness: %w", err)
+	}
+
 	if dev {
 		// deployment and its host-wide lock were claimed above, before the database
 		// was opened.
@@ -564,17 +579,6 @@ func runServer(ctx context.Context, lc *lifecycle, cfg *config.Config, dryRun, d
 		// sites are the control plane's to declare and the node's file has no
 		// reason to list them.
 		nodeplane.WithSites(cfg.SiteNames()))
-
-	// NOTHING IS LIVE UNTIL IT SAYS SO AGAIN.
-	//
-	// Liveness is the plane's judgement and this plane has just started, so it has
-	// none: its map is empty. Rows left by the previous process would otherwise
-	// back advertisements for machines this one has never heard from, which is the
-	// same over-advertisement the per-node budget exists to prevent, arriving
-	// through a restart instead. Every node re-registers within a poll.
-	if err := allocator.ForgetEveryNode(ctx); err != nil {
-		return fmt.Errorf("server: could not clear the fleet's liveness: %w", err)
-	}
 
 	stopWire, err := serveNodeWire(ctx, cfg, owner, nodes, allocator, wiring.NodeJIT{Client: client})
 	if err != nil {
