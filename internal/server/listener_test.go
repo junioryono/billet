@@ -41,19 +41,15 @@ const tierVCPU = 4
 // **The sum of what every listener has advertised to GitHub at any instant never
 // exceeds the global budget.**
 //
-// Each tier is its own scale set with its own `maxCapacity`, sent on every
-// long-poll as X-ScaleSetMaxCapacity. If each listener computed its own maximum
-// from its own tier's headroom, GitHub could fill all of them at once: three
-// tiers each advertising "I can take 10" on a host with room for 12 is a promise
-// billet cannot keep, and GitHub has already assigned the jobs by the time
-// anyone notices. Reserving on ASSIGNMENT is too late for the same reason.
+// Each tier is its own scale set with its own `maxCapacity`. If each listener
+// computed its own maximum from its own tier's headroom, GitHub could fill all
+// of them at once: three tiers each advertising "I can take 10" on a host with
+// room for 12 is a promise billet cannot keep. Reserving on ASSIGNMENT is too
+// late for the same reason.
 //
 // So capacity is escrowed BEFORE it is advertised, and a listener may only
-// advertise what the escrow actually returned. This test drives several
-// listeners at once against one allocator and watches what they advertise.
-//
-// It is written against a fake session rather than GitHub because the property
-// is about billet's arithmetic, not about the wire protocol.
+// advertise what the escrow returned. This drives several listeners at once
+// against one allocator and watches what they advertise.
 func TestAdvertisedCapacityNeverExceedsTheBudget(t *testing.T) {
 	const (
 		budget  = 12       // vCPU
@@ -216,16 +212,12 @@ func TestAdvertisingNothingAlsoRefusesWork(t *testing.T) {
 //
 // AVAILABLE is what gets acquired; ASSIGNED is what consumes escrow.
 //
-// This was wrong, and the comment explaining why it was right was wrong too:
-// JobAvailable was dropped in translation as "pre-assignment noise" and
-// AcquireJobs was called with the ids from JobAssigned. Available is the OFFER —
-// it is the message whose RunnerRequestID claims work. Assigned is the later
-// confirmation that a claim succeeded. Acquiring from Assigned asks GitHub to
-// claim work it has already handed over, while every actual offer goes on the
-// floor, so the scale set advertises capacity and never takes a job.
-//
-// It compiled, the tests passed, and it would have failed on first contact with
-// a real organization in a way that looks like "GitHub never sends us work".
+// Available is the OFFER — the message whose RunnerRequestID claims work.
+// Assigned is the later confirmation that a claim succeeded. Acquiring from
+// Assigned asks GitHub to claim work it has already handed over while every
+// actual offer goes on the floor, so the scale set advertises capacity and never
+// takes a job. That compiles and passes, and fails on first contact with a real
+// organization in a way that looks like "GitHub never sends us work".
 func TestAvailableIsAcquiredAndAssignedConsumesEscrow(t *testing.T) {
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
 
@@ -528,20 +520,15 @@ func newBareAllocator(t *testing.T, limits alloc.Limits, tiers []config.Tier,
 // tier escrows the capacity, and the poll returns an assignment backed by a lease
 // this listener no longer holds.
 func TestEscrowSurvivesAPollLongerThanTheLeaseTTL(t *testing.T) {
-	// Raised from 150ms, and the honest version of why: this test failed twice
-	// during full `make check` runs on a loaded machine and has never failed in
-	// isolation — including at -count=10 under ten competing test binaries, at
-	// BOTH constants. So the leading explanation is that renewal at ttl/3 fired
-	// every 50ms, the same order as goroutine scheduling jitter under load, and
-	// 600ms gives that four times the room.
+	// Long enough that renewal at ttl/3 is not competing with goroutine
+	// scheduling jitter under a loaded `make check`. At 150ms it fired every 50ms
+	// and this failed twice under full runs while never failing in isolation.
 	//
-	// It is a hypothesis, not a demonstration. I could not reproduce the original
-	// failure on demand, so I cannot claim this constant fixes it — only that the
-	// margin it removes was the smallest one in the test. What is NOT in doubt is
-	// that production is unaffected either way: the TTL there is 90s and renewal
-	// has 60s of slack, so the RATIO was never the thing at risk. If this fails
-	// again, the next step is instrumenting the renewal goroutine's actual wakeup
-	// times rather than raising the constant a second time.
+	// A hypothesis rather than a demonstration — the original failure was not
+	// reproducible on demand — but the margin it removes was the smallest in the
+	// test. Production is unaffected either way: the TTL there is 90s with 60s of
+	// slack, so the ratio was never at risk. If it fails again, instrument the
+	// renewal goroutine's wakeups rather than raising this a second time.
 	const ttl = 600 * time.Millisecond
 
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
@@ -638,16 +625,12 @@ func TestEscrowSurvivesAPollLongerThanTheLeaseTTL(t *testing.T) {
 
 // A backlog GitHub already assigned has to be SAID, not merely stored.
 //
-// The session's statistics were being copied into a field that nothing read,
-// which is indistinguishable from not collecting them. On a restart, GitHub goes
-// on believing this scale set is running jobs whose runners died with the
-// process. The ones no runner had picked up sit until the pickup deadline and
-// are then reassigned; the ones already running are not reassigned at all and
-// fail. From the outside billet looks like it silently dropped both.
-//
-// Recovering them needs a node runtime that can adopt a running instance, which
-// does not exist. Reporting them is what makes the gap visible rather than
-// mysterious, so that is what is tested.
+// On a restart, GitHub goes on believing this scale set is running jobs whose
+// runners died with the process. The ones no runner picked up sit until the
+// pickup deadline and are reassigned; the ones already running are not
+// reassigned at all and fail. Collecting the statistics into a field nothing
+// reads is indistinguishable from not collecting them, so reporting them is what
+// makes the gap visible rather than mysterious.
 func TestAnAlreadyAssignedBacklogIsReported(t *testing.T) {
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
 
