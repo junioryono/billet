@@ -157,3 +157,39 @@ func TestAFloorIsHeldOnTheMachinesItsOwnTierCouldUse(t *testing.T) {
 			"on a machine that cannot boot macOS", got, want)
 	}
 }
+
+// A FLOOR NOBODY CAN KEEP MUST NOT SPEND THE DEPLOYMENT'S CEILING.
+//
+// The fleet term holds floors on the machines that could keep them, which is
+// where the promise lives. The GLOBAL term was also deducting every unmet floor
+// from the deployment ceiling, without asking whether any machine could serve
+// it — so a reservation on a tier with no suitable host anywhere took the
+// ceiling away from tiers that were perfectly placeable.
+//
+// A Tart tier reserving two slots on a fleet of one Docker box is the clean
+// case: nothing can ever keep that floor, and the Docker tier is the only thing
+// that can run at all. Deducting it twice — once impossibly, once against a
+// machine it cannot use — left an entirely healthy fleet advertising nothing.
+func TestAFloorWithNoSuitableMachineDoesNotSpendTheCeiling(t *testing.T) {
+	tart := config.Tier{
+		Label: "tart-only", Provider: config.ProviderTart, GuestOS: config.GuestLinux,
+		VCPU: 4, Memory: 8 * config.GiB, Image: "ubuntu-arm64",
+	}
+	tart.Reserved = 2
+
+	docker := tier("docker", 4, 8*config.GiB)
+	docker.Provider = config.ProviderDocker
+
+	// A ceiling with room for exactly two of the docker tier.
+	a := newBareAllocator(t, Limits{MaxVCPU: 8, MaxMemory: 4000 * config.GiB},
+		[]config.Tier{tart, docker})
+
+	// The only machine cannot run the reserved tier at all.
+	mustRegister(t, a, NodeRegistration{
+		Name: "docker-box", Provider: config.ProviderDocker, VCPU: 64, Memory: 512 * config.GiB})
+
+	if got, want := headroom(t, a, "docker"), 2; got != want {
+		t.Errorf("the docker tier was offered %d of %d; a floor no machine can keep is "+
+			"still taking the deployment's ceiling away from a tier that can run", got, want)
+	}
+}

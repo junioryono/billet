@@ -534,7 +534,7 @@ func (a *Allocator) Escrow(ctx context.Context, tier string, want int) ([]*Lease
 		// until the transaction commits. Asking the ledger again per lease would
 		// return the same fleet every time and aim every reservation at the same
 		// machine.
-		place, err := a.placerWithFloors(ctx, tx, t)
+		place, _, _, err := a.placerWithFloors(ctx, tx, t)
 		if err != nil {
 			return err
 		}
@@ -711,17 +711,20 @@ func (a *Allocator) headroom(ctx context.Context, tx *sql.Tx, t config.Tier) (in
 		return 0, err
 	}
 
-	// WHAT OTHER TIERS ARE OWED IS NOT AVAILABLE HERE.
+	// FLOORS ARE NOT DEDUCTED HERE ANY MORE, and removing it was a correction
+	// rather than a simplification.
 	//
-	// Headroom used to be the whole of what was left, which let one tier hold the
-	// entire budget: the others then advertised zero, their jobs queued at GitHub
-	// indefinitely, and nothing in billet was behaving incorrectly. A tier with
-	// small instances wins that race simply by fitting more often.
+	// This used to subtract every other tier's unmet floor from the deployment
+	// ceiling. That was the whole mechanism while capacity was one pool, and it
+	// asked no question it could not answer: whether any MACHINE could keep the
+	// floor. So a reservation on a tier with no suitable host anywhere — a Tart
+	// tier on a fleet of Docker boxes — took the ceiling away from tiers that
+	// were perfectly placeable, and an entirely healthy fleet advertised nothing.
 	//
-	// Only UNMET floors are deducted. A tier already holding its reservation
-	// competes for the remainder on equal terms, so capacity is never idled
-	// waiting for work that has not arrived.
-	owedVCPU, owedMemory, err := a.unmetFloors(ctx, tx, t.Label)
+	// Floors are held against the machines that could keep them instead, in
+	// reserveFloors, which is both where the promise lives and the only place it
+	// can be checked honestly. Deducting in both places would also double-count.
+	place, owedVCPU, owedMemory, err := a.placerWithFloors(ctx, tx, t)
 	if err != nil {
 		return 0, err
 	}
@@ -757,29 +760,7 @@ func (a *Allocator) headroom(ctx context.Context, tx *sql.Tx, t config.Tier) (in
 	//
 	// The per-host macOS licence lives in headroomOn, with the other limits that
 	// belong to a machine rather than to a tier.
-	fleet, err := a.fleetHeadroom(ctx, tx, t)
-	if err != nil {
-		return 0, err
-	}
-
-	return max(min(n, fleet), 0), nil
-}
-
-// fleetHeadroom is how many of a tier the registered machines can hold between
-// them.
-//
-// A SUM OVER CANDIDATES, not a maximum: two hosts with room for one each can
-// hold two, and a tier that advertised only the largest one would leave the rest
-// of the fleet idle. Hosts that cannot serve this tier at all contribute
-// nothing, which is why a deployment whose only machine runs the wrong backend
-// advertises zero rather than its ceiling.
-func (a *Allocator) fleetHeadroom(ctx context.Context, tx *sql.Tx, t config.Tier) (int, error) {
-	p, err := a.placerWithFloors(ctx, tx, t)
-	if err != nil {
-		return 0, err
-	}
-
-	return p.total(t), nil
+	return max(min(n, place.total(t)), 0), nil
 }
 
 // Reserve escrows capacity for one instance of a tier.
@@ -807,7 +788,7 @@ func (a *Allocator) Reserve(ctx context.Context, tier string) (*Lease, error) {
 			return fmt.Errorf("%w for tier %q", ErrNoCapacity, t.Label)
 		}
 
-		place, err := a.placerWithFloors(ctx, tx, t)
+		place, _, _, err := a.placerWithFloors(ctx, tx, t)
 		if err != nil {
 			return err
 		}
@@ -1821,54 +1802,6 @@ func checkFloorsFit(tiers map[string]config.Tier, limits Limits) error {
 	}
 
 	return nil
-}
-
-// unmetFloors reports the capacity other tiers are guaranteed and do not yet
-// hold, which the caller may not take.
-//
-// One grouped query rather than one per tier: a loop of counts would be a
-// database call per catalogue entry inside the transaction that every
-// reservation waits on.
-//
-// A tier is "owed" only the part of its floor it is missing. Deducting the whole
-// floor would idle capacity a tier has already claimed, and deducting nothing
-// once a floor is met is what keeps a reservation a guarantee rather than a
-// quota — above the floor, everyone competes.
-func (a *Allocator) unmetFloors(
-	ctx context.Context, tx *sql.Tx, forTier string,
-) (int, config.ByteSize, error) {
-	held, err := a.countOpenPerTier(ctx, tx)
-	if err != nil {
-		return 0, 0, err
-	}
-
-	var (
-		vcpu   int
-		memory config.ByteSize
-	)
-
-	for label := range a.tiers {
-		// A tier never holds capacity back from itself: its own floor is not an
-		// obstacle to filling it.
-		if label == forTier {
-			continue
-		}
-
-		t := a.tiers[label]
-		if t.Reserved == 0 {
-			continue
-		}
-
-		missing := t.Reserved - held[label]
-		if missing <= 0 {
-			continue
-		}
-
-		vcpu += missing * t.VCPU
-		memory += config.ByteSize(missing) * t.Memory
-	}
-
-	return vcpu, memory, nil
 }
 
 // countOpenPerTier reports how many non-terminal leases each tier holds.

@@ -123,17 +123,20 @@ func (f *fleet) forTier(
 // refused, which reads as billet dropping jobs.
 func (a *Allocator) placerWithFloors(
 	ctx context.Context, tx *sql.Tx, t config.Tier,
-) (*placer, error) {
+) (*placer, int, config.ByteSize, error) {
 	free, err := a.fleetResources(ctx, tx)
 	if err != nil {
-		return nil, err
+		return nil, 0, 0, err
 	}
 
-	if err := a.reserveFloors(ctx, tx, t.Label, free); err != nil {
-		return nil, err
+	vcpu, memory, err := a.reserveFloors(ctx, tx, t.Label, free)
+	if err != nil {
+		return nil, 0, 0, err
 	}
 
-	return free.forTier(ctx, tx, a, t)
+	p, err := free.forTier(ctx, tx, a, t)
+
+	return p, vcpu, memory, err
 }
 
 // rankBy scores the hosts against one tier's provider preference.

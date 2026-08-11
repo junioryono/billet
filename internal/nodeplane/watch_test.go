@@ -9,6 +9,7 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/nodeapi"
 )
 
 // ledger is a Registrar that records what the plane told it.
@@ -197,7 +198,7 @@ func TestANodeExpiredBySomethingElseIsStillRecorded(t *testing.T) {
 // STAGED RATHER THAN REASONED ABOUT. The fake holds A inside its ledger write
 // until B has finished, which is precisely the interleaving and is otherwise
 // only reachable by luck.
-func TestALateRegistrationCannotInstallAnOlderEpoch(t *testing.T) {
+func TestALateRegistrationCannotSupersedeTheNewerProcess(t *testing.T) {
 	t.Parallel()
 
 	led := newLedger()
@@ -212,28 +213,74 @@ func TestALateRegistrationCannotInstallAnOlderEpoch(t *testing.T) {
 	go func() {
 		defer close(first)
 
-		register(t, p, "n1", config.ProviderDocker)
+		if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
+			Version: nodeapi.Version, Node: "n1", Provider: config.ProviderDocker,
+			Deployment: deployment, Incarnation: "old", VCPU: 8, Memory: 32 * config.GiB,
+		}); err != nil {
+			t.Errorf("first Register: %v", err)
+		}
 	}()
 
-	// A is inside the ledger write holding epoch 1.
+	// A is inside the ledger write holding the older epoch.
 	waitFor(t, "the first registration to reach the ledger", func() bool {
 		return led.held()
 	})
 
-	register(t, p, "n1", config.ProviderDocker)
-
-	if got := p.epochForTest("n1"); got != 2 {
-		t.Fatalf("the second registration installed epoch %d, want 2", got)
+	// B arrives and completes: a different process, on a different backend.
+	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
+		Version: nodeapi.Version, Node: "n1", Provider: config.ProviderFirecracker,
+		Deployment: deployment, Incarnation: "new", VCPU: 8, Memory: 32 * config.GiB,
+	}); err != nil {
+		t.Fatalf("second Register: %v", err)
 	}
 
 	close(proceed)
 	<-first
 
+	// EVERY FIELD, NOT JUST THE EPOCH. Keeping the epoch monotonic while letting
+	// the rest of the registration through was the bug: the older request still
+	// tombstoned the newer process's in-flight commands, handed their leases to
+	// custody, and overwrote the incarnation and provider — so the ledger and the
+	// command plane disagreed about who owned the node and what it ran.
 	if got := p.epochForTest("n1"); got != 2 {
-		t.Errorf("a registration that committed FIRST but arrived LAST installed epoch %d, "+
-			"overwriting the newer %d; expiry would then present a stale token, the fenced "+
-			"write would match nothing, and the ledger would believe in a forgotten host", got, 2)
+		t.Errorf("ledger epoch = %d, want 2", got)
 	}
+
+	if got := p.incarnationForTest("n1"); got != "new" {
+		t.Errorf("incarnation = %q, want the newer process; a registration that committed "+
+			"FIRST but arrived LAST superseded the one that replaced it", got)
+	}
+
+	if got := p.providerForTest("n1"); got != config.ProviderFirecracker {
+		t.Errorf("provider = %q, want the newer process's; the command plane now disagrees "+
+			"with the ledger about what this host runs", got)
+	}
+}
+
+// incarnationForTest reports which process the plane believes owns a node.
+func (p *Plane) incarnationForTest(name string) string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	n, ok := p.nodes[name]
+	if !ok {
+		return ""
+	}
+
+	return n.incarnation
+}
+
+// providerForTest reports the backend the plane believes a node runs.
+func (p *Plane) providerForTest(name string) config.ProviderKind {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	n, ok := p.nodes[name]
+	if !ok {
+		return ""
+	}
+
+	return n.provider
 }
 
 // epochForTest reports the ledger epoch the plane holds for a node.

@@ -35,11 +35,16 @@ import (
 // cannot exist. Billet holds back what it can and lets the rest compete.
 func (a *Allocator) reserveFloors(
 	ctx context.Context, tx *sql.Tx, forTier string, free *fleet,
-) error {
-	held, err := a.countOpenPerTier(ctx, tx)
+) (int, config.ByteSize, error) {
+	open, err := a.countOpenPerTier(ctx, tx)
 	if err != nil {
-		return err
+		return 0, 0, err
 	}
+
+	var (
+		heldVCPU   int
+		heldMemory config.ByteSize
+	)
 
 	// IN A FIXED ORDER, because these floors compete with each other for the same
 	// hosts and Go map iteration is randomised. Without it one fleet answers
@@ -60,17 +65,27 @@ func (a *Allocator) reserveFloors(
 
 		t := a.tiers[label]
 
-		missing := t.Reserved - held[label]
+		missing := t.Reserved - open[label]
 		if t.Reserved == 0 || missing <= 0 {
 			continue
 		}
 
-		if err := a.holdFloor(ctx, tx, t, missing, free); err != nil {
-			return err
+		kept, err := a.holdFloor(ctx, tx, t, missing, free)
+		if err != nil {
+			return 0, 0, err
 		}
+
+		// ONLY WHAT WAS ACTUALLY KEPT counts against the deployment ceiling. The
+		// old arithmetic deducted every configured floor from that ceiling without
+		// asking whether a machine could serve it, so a reservation on a tier with
+		// no suitable host anywhere took the ceiling away from tiers that were
+		// perfectly placeable — a Tart floor on a fleet of Docker boxes left an
+		// entirely healthy deployment advertising nothing.
+		heldVCPU += kept * t.VCPU
+		heldMemory += config.ByteSize(kept) * t.Memory
 	}
 
-	return nil
+	return heldVCPU, heldMemory, nil
 }
 
 // holdFloor takes one tier's outstanding reservation off the machines it could
@@ -82,7 +97,7 @@ func (a *Allocator) reserveFloors(
 // exactly the contention a floor is meant to survive.
 func (a *Allocator) holdFloor(
 	ctx context.Context, tx *sql.Tx, t config.Tier, missing int, free *fleet,
-) error {
+) (int, error) {
 	// ITS OWN CANDIDATES, SPENDING THE SHARED FLEET. A floor on a macOS tier is
 	// kept on the Mac; holding it against whichever machines the ASKING tier
 	// happens to use is wrong twice — it denies them room to protect a
@@ -90,16 +105,20 @@ func (a *Allocator) holdFloor(
 	// matters untouched.
 	held, err := free.forTier(ctx, tx, a, t)
 	if err != nil {
-		return err
+		return 0, err
 	}
+
+	kept := 0
 
 	for range missing {
 		if _, ok := held.next(t); !ok {
 			// The fleet cannot keep the rest of this floor. Stopping here is what
 			// keeps an impossible reservation from freezing everyone else.
-			return nil
+			break
 		}
+
+		kept++
 	}
 
-	return nil
+	return kept, nil
 }

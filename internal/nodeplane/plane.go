@@ -645,6 +645,32 @@ func (p *Plane) Register(
 		p.nodes[req.Node] = n
 	}
 
+	// AN OVERTAKEN REGISTRATION CHANGES NOTHING, and this has to be decided BEFORE
+	// anything below it runs.
+	//
+	// The ledger write happens outside this mutex, so two registrations for one
+	// node can commit in one order and arrive in the other: A is handed epoch 1, B
+	// is handed 2, B installs, and then A finally gets the lock. Everything past
+	// this point treats the request as the current process — it tombstones the
+	// in-flight commands B is working on, hands their leases to custody, and
+	// overwrites B's incarnation, provider and guest-OS claims with A's.
+	//
+	// Keeping only the EPOCH monotonic was not enough, and that is the shape of
+	// the bug worth remembering: the fence was applied at the end, after the
+	// damage it was meant to prevent had already been done. The ledger and the
+	// command plane then disagreed about which process owned the node.
+	if epoch > 0 && epoch < n.ledgerEpoch {
+		p.log.Warn("ignoring a registration that was overtaken by a newer one from the same "+
+			"node; the newer process keeps its commands",
+			"node", req.Node, "arrived_at_epoch", epoch, "current", n.ledgerEpoch)
+
+		return nodeapi.RegisterResponse{
+			Version:         nodeapi.Version,
+			LeaseTTLSeconds: int(p.ttl.Seconds()),
+			PollSeconds:     int(p.poll.Seconds()),
+		}, nil
+	}
+
 	if n.incarnation != "" && n.incarnation != req.Incarnation {
 		// SAID OUT LOUD, because the two causes need different fixes and look
 		// identical from here. A restart is ordinary. A SECOND HOST arriving under
