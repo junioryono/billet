@@ -106,6 +106,22 @@ type Plane struct {
 	// sites are the places this deployment declares, or empty for a deployment
 	// that has not needed the distinction. See WithSites.
 	sites map[string]bool
+
+	// pendingGone holds hosts the plane has forgotten but the ledger has not yet
+	// been told about. Guarded by mu.
+	//
+	// A QUEUE RATHER THAN A RETURN VALUE, because expiry happens in places that
+	// cannot write to a database. Most callers reach it incidentally — picking a
+	// node, listing the fleet, answering a poll — while holding the mutex and in
+	// the middle of doing something else. Handing them the fact to record meant
+	// they dropped it, and a node deleted from the map can never be rediscovered:
+	// the ledger would believe in it forever, backing advertisements for a
+	// machine nothing can reach.
+	//
+	// So expiry records the fact here and the timer drains it. A write that fails
+	// goes back on the queue, because the alternative is the same permanent lie
+	// arriving through a transient database error.
+	pendingGone []goneNode
 }
 
 // node is one registered compute host.
@@ -381,10 +397,19 @@ func (p *Plane) Watch(ctx context.Context) {
 			return
 		case <-t.C:
 			p.mu.Lock()
-			gone := p.expireStaleLocked()
+			p.expireStaleLocked()
+
+			pending := p.pendingGone
+			p.pendingGone = nil
 			p.mu.Unlock()
 
-			p.recordGone(ctx, gone)
+			if failed := p.recordGone(ctx, pending); len(failed) > 0 {
+				// BACK ON THE QUEUE. A database that was briefly unavailable must not
+				// cost the ledger a permanent belief in a machine that is gone.
+				p.mu.Lock()
+				p.pendingGone = append(failed, p.pendingGone...)
+				p.mu.Unlock()
+			}
 		}
 	}
 }
@@ -408,18 +433,24 @@ type goneNode struct {
 // Best effort. A failure leaves the ledger believing in a node for longer than
 // it should — corrected by the next registration, the next tick, or a restart —
 // and there is nobody here to return an error to.
-func (p *Plane) recordGone(ctx context.Context, gone []goneNode) {
+func (p *Plane) recordGone(ctx context.Context, gone []goneNode) []goneNode {
 	if p.registrar == nil {
-		return
+		return nil
 	}
+
+	var failed []goneNode
 
 	for _, g := range gone {
 		if err := p.registrar.NodeGone(ctx, g.name, g.epoch); err != nil {
-			p.log.Warn("could not record that a node is gone; its capacity stays advertised "+
-				"until it registers again or this control plane restarts",
+			p.log.Warn("could not record that a node is gone; retrying, and its capacity "+
+				"stays advertised until that succeeds",
 				"node", g.name, "error", err)
+
+			failed = append(failed, g)
 		}
 	}
+
+	return failed
 }
 
 // Registrar is the ledger's node table.
@@ -656,7 +687,16 @@ func (p *Plane) Register(
 	n.provider = req.Provider
 	n.guestOS = req.GuestOS
 	n.lastSeen = p.now()
-	n.ledgerEpoch = epoch
+
+	// NEVER BACKWARDS. Two registrations for one node can commit to the ledger in
+	// one order and reach this mutex in the other — the ledger write happens
+	// before the lock is taken — so installing unconditionally lets the older
+	// epoch win. Expiry would then present a stale token, the fenced write would
+	// match nothing, and the node would stay live in the ledger after the plane
+	// had forgotten it.
+	if epoch > n.ledgerEpoch {
+		n.ledgerEpoch = epoch
+	}
 
 	return nodeapi.RegisterResponse{
 		Version:         nodeapi.Version,
@@ -1326,9 +1366,7 @@ func (p *Plane) staleAfter() time.Duration {
 // so nothing here answers one, and custody is never transferred by expiry. What
 // is answered is the QUEUE: those commands never reached the node, so a caller
 // waiting on a machine that is gone is told plainly that nothing started.
-func (p *Plane) expireStaleLocked() []goneNode {
-	var gone []goneNode
-
+func (p *Plane) expireStaleLocked() {
 	cutoff := p.now().Add(-p.staleAfter())
 
 	for name, n := range p.nodes {
@@ -1384,12 +1422,10 @@ func (p *Plane) expireStaleLocked() []goneNode {
 		// Callers that expire as a side effect of doing something else discard it;
 		// the timer reconciles within a tick, and until it does the ledger is
 		// merely behind rather than wrong.
-		gone = append(gone, goneNode{name: name, epoch: n.ledgerEpoch})
+		p.pendingGone = append(p.pendingGone, goneNode{name: name, epoch: n.ledgerEpoch})
 
 		delete(p.nodes, name)
 	}
-
-	return gone
 }
 
 // pick chooses a node for a lease.
