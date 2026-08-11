@@ -2870,12 +2870,13 @@ func (l *Listener) releaseAll(ctx context.Context, destroyed map[int64]bool) {
 	// A lease whose compute will not die is NOT released. Capacity that the reaper
 	// reclaims late is recoverable; capacity handed out twice is not.
 	//
-	// This does kill work in flight, which is honest rather than good: billet is
-	// stopping and can no longer manage those jobs, so tearing them down and
-	// letting GitHub reassign beats leaving containers nobody is tracking. A
-	// graceful drain — stop taking new work, wait for the running jobs, then exit
-	// — is the thing that makes a restart free, and it is filed rather than
-	// smuggled in here.
+	// This does kill work in flight, and it FAILS those builds — GitHub requeues
+	// a job that was assigned but never picked up, and says nothing about one a
+	// runner has already started. Tearing them down is still right: billet is
+	// stopping and can no longer manage those jobs, so a failed build beats
+	// containers nobody is tracking. It is rare because the drain above runs
+	// first — a teardown only reaches here for work that outlived its budget.
+	//
 	// DESTROYED ALREADY, by destroyAll, which is why this only releases. Doing
 	// both here meant the teardown could not be planned as a whole: the drain and
 	// the release each had their own idea of what needed destroying and neither
