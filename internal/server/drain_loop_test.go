@@ -76,6 +76,30 @@ func (d *drainLog) option() Option {
 	return WithLogger(slog.New(slog.NewTextHandler(d, &slog.HandlerOptions{Level: slog.LevelInfo})))
 }
 
+// slowPoll makes a fake session behave like a long poll instead of a spin.
+//
+// A fake that returns ErrNoMessage immediately turns the drain's loop into a hot
+// spin: it takes l.mu on every pass through capacity() and drained(), and under
+// -race that is enough to starve the heartbeat goroutine. A lease whose renewal
+// goes stale is then MOVED OUT of `running` into the cleanup set — the listener
+// says so where it does it, "THE LEASE GOES; THE OBLIGATION DOES NOT" — and
+// drained() only looks at `running`, so the drain reports itself finished and
+// its budget never expires.
+func slowPoll() { time.Sleep(2 * time.Millisecond) }
+
+// outlivesTheDrain is a lease TTL long enough that no lease can expire while a
+// drain is being timed out.
+//
+// A TEST THAT ASSERTS THE DRAIN RAN OUT OF BUDGET MUST OUTLIVE ITS OWN LEASES.
+// The drain ends on whichever comes first: everything finished, or the budget
+// gone. A lease that expires mid-drain empties `running`, so the drain ends by
+// being FINISHED — the other branch, which never writes the line those tests
+// assert on.
+//
+// Tests asserting the drain finished its work do not need this: a lease expiring
+// early pushes them towards the outcome they already expect.
+const outlivesTheDrain = 30 * time.Second
+
 // beganDraining is the drain's announcement of itself.
 const beganDraining = "draining: not taking new work"
 
@@ -421,7 +445,7 @@ func TestADrainRefusesNewWorkAndStillHearsCompletions(t *testing.T) {
 func TestADrainThatOverrunsItsBudgetDestroysWhatIsLeft(t *testing.T) {
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
 	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
-		alloc.WithLeaseTTL(300*time.Millisecond))
+		alloc.WithLeaseTTL(outlivesTheDrain))
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -438,6 +462,8 @@ func TestADrainThatOverrunsItsBudgetDestroysWhatIsLeft(t *testing.T) {
 		}
 
 		// The completion NEVER arrives. This is the job that outlives the drain.
+		slowPoll()
+
 		return nil, ErrNoMessage
 	}
 
@@ -608,7 +634,7 @@ func (d deafSession) GetMessage(_ context.Context, _ int64, capacity int) (*Mess
 func TestADrainIsBoundedEvenWhenTheSessionIgnoresItsContext(t *testing.T) {
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
 	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
-		alloc.WithLeaseTTL(300*time.Millisecond))
+		alloc.WithLeaseTTL(outlivesTheDrain))
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -625,6 +651,8 @@ func TestADrainIsBoundedEvenWhenTheSessionIgnoresItsContext(t *testing.T) {
 		}
 
 		// No completion, ever, and no notice taken of any deadline.
+		slowPoll()
+
 		return nil, ErrNoMessage
 	}
 
