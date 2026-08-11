@@ -709,20 +709,57 @@ func (a *Allocator) headroom(ctx context.Context, tx *sql.Tx, t config.Tier) (in
 		n = min(n, t.MaxConcurrent-tierUsed)
 	}
 
-	// A host caps concurrent macOS guests, counting every running one regardless
-	// of which tier asked for it. Two individually legal macOS tiers on one Mac
-	// still share one machine, so the limit is enforced per NODE across tiers
-	// rather than per tier.
-	if t.GuestOS == config.GuestMacOS && t.Node != "" {
-		hostUsed, err := a.countOpenMacOSByNode(ctx, tx, t.Node)
+	// WHAT THE MACHINES CAN ACTUALLY HOLD, which is the other half of the answer.
+	//
+	// Everything above bounds the DEPLOYMENT: one ceiling, one tier's floor, one
+	// tier's concurrency limit. None of it knows whether any single machine has
+	// room. With a 64 vCPU box and an 8 vCPU Mac mini under a ceiling of 120,
+	// that arithmetic will happily escrow 120 vCPU of work, advertise it, and
+	// then be unable to place most of it — jobs assigned to a fleet that cannot
+	// run them.
+	//
+	// So the answer is the SMALLER of the two. The fleet term stops billet
+	// promising more than the machines can hold; the deployment term stops it
+	// exceeding what the operator allowed, which is what keeps a one-box install
+	// behaving exactly as it did — the reference host detects 128 threads while
+	// its config says 120, and without this the fleet term would win.
+	//
+	// The per-host macOS licence lives in headroomOn, with the other limits that
+	// belong to a machine rather than to a tier.
+	fleet, err := a.fleetHeadroom(ctx, tx, t)
+	if err != nil {
+		return 0, err
+	}
+
+	return max(min(n, fleet), 0), nil
+}
+
+// fleetHeadroom is how many of a tier the registered machines can hold between
+// them.
+//
+// A SUM OVER CANDIDATES, not a maximum: two hosts with room for one each can
+// hold two, and a tier that advertised only the largest one would leave the rest
+// of the fleet idle. Hosts that cannot serve this tier at all contribute
+// nothing, which is why a deployment whose only machine runs the wrong backend
+// advertises zero rather than its ceiling.
+func (a *Allocator) fleetHeadroom(ctx context.Context, tx *sql.Tx, t config.Tier) (int, error) {
+	nodes, err := a.eligibleNodes(ctx, tx, t)
+	if err != nil {
+		return 0, err
+	}
+
+	total := 0
+
+	for _, n := range nodes {
+		room, err := a.headroomOn(ctx, tx, n, t)
 		if err != nil {
 			return 0, err
 		}
 
-		n = min(n, a.macOSLimit(t.Node)-hostUsed)
+		total += room
 	}
 
-	return max(n, 0), nil
+	return total, nil
 }
 
 // Reserve escrows capacity for one instance of a tier.
