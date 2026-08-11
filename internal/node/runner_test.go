@@ -510,8 +510,37 @@ func newAllocatorForTiers(t *testing.T, db *state.DB, tiers ...config.Tier) (*al
 
 	const host = "test-host"
 
-	if _, err := a.RegisterNode(t.Context(), alloc.NodeRegistration{Name: host, Provider: config.ProviderDocker, VCPU: testNodeVCPU, Memory: testNodeMemory}); err != nil {
+	// THE HOST UNDER TEST RUNS DOCKER, and it is the one returned. Its name is
+	// what a test hands the runner, so this is the machine whose refusals the
+	// tests are about.
+	if _, err := a.RegisterNode(t.Context(), alloc.NodeRegistration{
+		Name: host, Provider: config.ProviderDocker,
+		VCPU: testNodeVCPU, Memory: testNodeMemory,
+	}); err != nil {
 		t.Fatalf("RegisterNode: %v", err)
+	}
+
+	// AND A HOST FOR EVERY BACKEND THE CATALOGUE NAMES, so a tier can be RESERVED
+	// even when the machine under test cannot run it.
+	//
+	// Capacity is per machine now: a tier no registered host can serve advertises
+	// zero, so Reserve refuses before Bind is ever reached. That is the point of
+	// the change, and it would also make "the runner refuses a host outside the
+	// tier's list" untestable — the mismatch has to be at BIND, which means the
+	// fleet must be able to hold the lease somewhere else.
+	for i := range tiers {
+		for _, provider := range tiers[i].AcceptableProviders() {
+			if provider == config.ProviderDocker {
+				continue
+			}
+
+			if _, err := a.RegisterNode(t.Context(), alloc.NodeRegistration{
+				Name: "elsewhere-" + string(provider), Provider: provider,
+				VCPU: testNodeVCPU, Memory: testNodeMemory,
+			}); err != nil {
+				t.Fatalf("RegisterNode %s: %v", provider, err)
+			}
+		}
 	}
 
 	return a, host

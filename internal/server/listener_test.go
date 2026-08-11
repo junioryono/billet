@@ -134,6 +134,19 @@ func TestAdvertisedCapacityNeverExceedsTheBudget(t *testing.T) {
 		t.Fatal("no listener ever polled; this test proves nothing")
 	}
 
+	// ZERO SATISFIES "NEVER EXCEEDS", WHICH IS WHY THIS IS HERE.
+	//
+	// The assertion below is one-sided: a billet that advertised nothing at all
+	// would pass it perfectly. That was harmless while capacity came from a config
+	// number, because there was no way to reach zero by accident. It stopped being
+	// harmless the moment capacity came from a FLEET — a deployment with no
+	// registered host now correctly advertises zero, so this test would have gone
+	// on passing while proving nothing about the invariant it is named for.
+	if peak == 0 {
+		t.Fatal("no listener ever advertised anything, so the ceiling below was never " +
+			"exercised; the fleet these listeners run on can hold nothing")
+	}
+
 	// vCPU, not runner count: the budget is a vector and this is the axis the
 	// tiers here contend on.
 	if got := peak * perTier; got > budget {
@@ -468,6 +481,27 @@ func newAllocator(t *testing.T, limits alloc.Limits, tiers []config.Tier,
 		t.Fatalf("alloc.New: %v", err)
 	}
 
+	// A HOST, BECAUSE CAPACITY IS PER MACHINE NOW. A deployment with no
+	// registered node can place nothing, so every tier advertises zero — correct,
+	// and it would also turn this package's tests into assertions about an empty
+	// fleet rather than about the listener.
+	//
+	// Larger than any budget these tests set, so the deployment ceiling stays the
+	// binding constraint and each test measures what it was written to measure. A
+	// test about the FLEET registers its own machines.
+	for _, provider := range []config.ProviderKind{
+		config.ProviderDocker, config.ProviderFirecracker, config.ProviderTart,
+	} {
+		if _, err := a.RegisterNode(t.Context(), alloc.NodeRegistration{
+			Name:     "test-host-" + string(provider),
+			Provider: provider,
+			VCPU:     1 << 20,
+			Memory:   1 << 20 * config.GiB,
+		}); err != nil {
+			t.Fatalf("registering the default host: %v", err)
+		}
+	}
+
 	return a
 }
 
@@ -501,11 +535,8 @@ func TestEscrowSurvivesAPollLongerThanTheLeaseTTL(t *testing.T) {
 
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
 
-	a, err := alloc.New(openState(t), alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
 		alloc.WithLeaseTTL(ttl))
-	if err != nil {
-		t.Fatalf("alloc.New: %v", err)
-	}
 
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	defer cancel()

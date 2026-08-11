@@ -55,7 +55,57 @@ func reserve(t *testing.T, a *Allocator, tier string) *Lease {
 	return lease
 }
 
+// newAllocator is an allocator with ONE HOST ALREADY IN IT, big enough that it
+// is never the constraint.
+//
+// Capacity is per machine now, so a deployment with no registered host can place
+// nothing and every tier advertises zero. That is correct, and it would also
+// silently turn most of this package's tests into assertions about an empty
+// fleet. Registering a host larger than any budget these tests set keeps the
+// deployment ceiling as the binding constraint, which is what they were written
+// to measure.
+//
+// A test that wants the FLEET to be the constraint uses newBareAllocator and
+// says which machines exist.
 func newAllocator(t *testing.T, limits Limits, tiers []config.Tier, opts ...Option) *Allocator {
+	t.Helper()
+
+	a := newBareAllocator(t, limits, tiers, opts...)
+
+	// ONE HOST PER BACKEND, so a tier naming any of them has somewhere to go.
+	for _, provider := range []config.ProviderKind{
+		config.ProviderDocker, config.ProviderFirecracker, config.ProviderTart,
+	} {
+		if _, err := a.RegisterNode(t.Context(), testRegistration(
+			"test-host-"+string(provider), provider)); err != nil {
+			t.Fatalf("registering the default host: %v", err)
+		}
+	}
+
+	// AND ONE FOR EVERY HOST A TIER PINS TO. A pin is an allowlist of one, so a
+	// tier naming a machine that does not exist can be placed nowhere and
+	// advertises zero — which would quietly turn every macOS test in this package
+	// into an assertion about an empty fleet.
+	for i := range tiers {
+		if tiers[i].Node == "" {
+			continue
+		}
+
+		provider := tiers[i].Provider
+		if provider == "" && len(tiers[i].Providers) > 0 {
+			provider = tiers[i].Providers[0]
+		}
+
+		if _, err := a.RegisterNode(t.Context(), testRegistration(tiers[i].Node, provider)); err != nil {
+			t.Fatalf("registering pinned host %s: %v", tiers[i].Node, err)
+		}
+	}
+
+	return a
+}
+
+// newBareAllocator is an allocator with NO hosts, for tests about the fleet.
+func newBareAllocator(t *testing.T, limits Limits, tiers []config.Tier, opts ...Option) *Allocator {
 	t.Helper()
 
 	db, err := state.Open(t.Context(), t.TempDir())
@@ -613,6 +663,11 @@ func TestMacOSAccountingSurvivesCatalogChange(t *testing.T) {
 
 	ctx := t.Context()
 
+	// The Mac has to exist, or the tier pinned to it can be placed nowhere. This
+	// test builds its allocators directly because it needs TWO of them over one
+	// database, so it registers the host itself.
+	registerNode(t, first, "mac-mini-1", config.ProviderTart)
+
 	for range config.DefaultMacOSVMLimit {
 		if _, err := first.Reserve(ctx, "mac-6"); err != nil {
 			t.Fatalf("Reserve: %v", err)
@@ -642,13 +697,11 @@ func TestMacOSAccountingSurvivesCatalogChange(t *testing.T) {
 func registerNode(t *testing.T, a *Allocator, name string, provider config.ProviderKind) {
 	t.Helper()
 
-	if err := a.db.Tx(t.Context(), func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(t.Context(),
-			`INSERT INTO nodes (name, provider, last_seen_at) VALUES (?, ?, ?)`,
-			name, string(provider), ts(time.Now()))
-
-		return err
-	}); err != nil {
+	// THROUGH THE REAL PATH. This used to be a raw INSERT, which stopped being
+	// equivalent the moment a node carried liveness and capacity: it produced
+	// hosts recorded as unreachable and contributing nothing, so every tier they
+	// were supposed to serve advertised zero and the tests read as capacity bugs.
+	if _, err := a.RegisterNode(t.Context(), testRegistration(name, provider)); err != nil {
 		t.Fatalf("register node %s: %v", name, err)
 	}
 }

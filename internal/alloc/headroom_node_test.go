@@ -222,7 +222,7 @@ func TestAMacsLicenceBoundsItsHeadroomAcrossTiers(t *testing.T) {
 // A TIER MAY ONLY BE PLACED WHERE IT COULD ACTUALLY RUN, and every one of these
 // filters is a way for a fleet to contain a host that cannot serve it.
 func TestOnlyHostsThatCouldServeATierAreEligible(t *testing.T) {
-	a := newAllocator(t, Limits{MaxVCPU: 1000, MaxMemory: 4000 * config.GiB}, nil)
+	a := newBareAllocator(t, Limits{MaxVCPU: 1000, MaxMemory: 4000 * config.GiB}, nil)
 
 	epochs := map[string]int64{}
 
