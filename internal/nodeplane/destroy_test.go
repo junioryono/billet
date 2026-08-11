@@ -99,3 +99,93 @@ func TestADestroyGoesOnlyToTheNodeHoldingTheJob(t *testing.T) {
 	<-destroyed
 	<-launched
 }
+
+// A BOUND LEASE GOES TO THE MACHINE IT IS BOUND TO, and `pick` was only asking
+// where it was AIMED.
+//
+// The two answer different questions. target_node is where placement decided the
+// work should go; node is where it actually went, written at Bind. Resolving only
+// the target meant a lease already running somewhere could be launched again on a
+// different host — and with the target empty, the choice fell through to the
+// fallback, which walks a MAP. So the second host was picked by hash order: the
+// same lease landed on a different machine from run to run.
+//
+// Everywhere else on this path attributes a lease as COALESCE(node, target_node),
+// because a reservation aimed at a machine has already spent its capacity. This
+// is the one place that did not.
+func TestALeaseGoesToTheNodeItIsBoundTo(t *testing.T) {
+	t.Parallel()
+
+	p := testPlane(t)
+
+	for _, name := range []string{"a-holder", "z-bystander"} {
+		if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
+			Version: nodeapi.Version, Node: name, Provider: config.ProviderDocker,
+			Deployment: deployment, Incarnation: name + "-1",
+			VCPU: 8, Memory: 32 * config.GiB,
+		}); err != nil {
+			t.Fatalf("register %s: %v", name, err)
+		}
+	}
+
+	// Bound, not merely aimed: target_node is deliberately empty.
+	lease := testLease()
+	lease.Node = "z-bystander"
+	lease.TargetNode = ""
+
+	n, err := p.PickForTest(lease)
+	if err != nil {
+		t.Fatalf("pick: %v", err)
+	}
+
+	if n != "z-bystander" {
+		t.Errorf("a lease bound to %q was aimed at %q; the node it is BOUND to is where its "+
+			"container already is", lease.Node, n)
+	}
+}
+
+// AND AN UNBOUND, UNAIMED LEASE PICKS THE SAME HOST EVERY TIME.
+//
+// The fallback walks the lease's provider preference, which is ordered — but for
+// each provider it iterated the node MAP, so among equally acceptable hosts the
+// answer came out in hash order. Two identical fleets then place the same lease
+// differently, which cannot be reproduced from a log or asserted in a test.
+func TestAnUnpinnedLeasePicksDeterministically(t *testing.T) {
+	t.Parallel()
+
+	p := testPlane(t)
+
+	for _, name := range []string{"m", "a", "z"} {
+		if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
+			Version: nodeapi.Version, Node: name, Provider: config.ProviderDocker,
+			Deployment: deployment, Incarnation: name + "-1",
+			VCPU: 8, Memory: 32 * config.GiB,
+		}); err != nil {
+			t.Fatalf("register %s: %v", name, err)
+		}
+	}
+
+	lease := testLease()
+	lease.Node, lease.TargetNode = "", ""
+
+	first, err := p.PickForTest(lease)
+	if err != nil {
+		t.Fatalf("pick: %v", err)
+	}
+
+	for range 50 {
+		got, err := p.PickForTest(lease)
+		if err != nil {
+			t.Fatalf("pick: %v", err)
+		}
+
+		if got != first {
+			t.Fatalf("the same lease on the same fleet was aimed at %q and then %q", first, got)
+		}
+	}
+
+	if first != "a" {
+		t.Errorf("the fallback chose %q; with nothing else to separate them the name decides, "+
+			"so it should be the first in order", first)
+	}
+}
