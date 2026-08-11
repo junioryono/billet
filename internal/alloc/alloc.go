@@ -166,15 +166,11 @@ type Lease struct {
 	// redefined underneath an in-flight lease cannot reclassify it. Bind checks
 	// it against the target host's allowlist.
 	GuestOS config.GuestOS
-	// Provider is the backend this lease needs, recorded for the same reason.
-	// Bind compares it against the node's REGISTERED provider: a Firecracker
-	// lease cannot run on a Tart host.
 	// Provider is the backend the lease is ACTUALLY on, empty until it is bound.
 	//
-	// It used to be set at reserve time, which quietly made a tier's backend a
-	// property of the reservation and so pinned every lease to one host kind
-	// before anything knew where it would run. It is chosen at Bind now, from
-	// Providers.
+	// Chosen at Bind, from Providers. What a lease MAY run on is decided when it
+	// is reserved; what it IS running on is only knowable once a host has taken
+	// it.
 	Provider config.ProviderKind
 
 	// Providers is what the lease MAY run on, most preferred first, copied from
@@ -287,23 +283,16 @@ func New(db *state.DB, limits Limits, tiers []config.Tier, opts ...Option) (*All
 
 	for node, p := range limits.Nodes {
 		// The SAME rules config applies, not a second hand-written copy that can
-		// drift into disagreeing about which hosts are legal. This covers the
-		// raw fields rather than the effective limit — a negative
-		// macos_vm_limit slipped past a check reading MacOSLimit(), which
-		// normalizes it to zero whenever the allowlist excludes macOS.
+		// drift into disagreeing about which hosts are legal. It covers the raw
+		// fields rather than the effective limit, because MacOSLimit() normalizes a
+		// negative macos_vm_limit to zero whenever the allowlist excludes macOS.
+		//
 		// The map KEY is how every lookup finds this policy, so a key that is not
 		// the canonical node name silently detaches the policy from its host: the
-		// tier's node is normalized, the key is not, the lookup misses, and an
-		// explicit macos_vm_limit of 0 is replaced by Apple's default of 2. The
-		// policy appears to be enforced and is not.
-		//
-		// Two checks compose to prevent that, and there is deliberately no third.
-		// An explicit "the key has no surrounding whitespace" test used to sit
-		// here and could never fire in either order: Validate rejects a padded
-		// NAME outright (the label pattern is anchored, so the padding is part of
-		// what must match), and a key that differs from a valid name is caught
-		// below. Two mutation runs were what established that — the case written
-		// to cover it stayed green with the check deleted.
+		// lookup misses, and an explicit macos_vm_limit of 0 is replaced by Apple's
+		// default of 2. Two checks compose to prevent that, and a third testing the
+		// key for whitespace could never fire — Validate rejects a padded NAME
+		// outright, and a key differing from a valid name is caught below.
 		if errs := p.Validate(fmt.Sprintf("alloc: node %q", node)); len(errs) > 0 {
 			return nil, errors.Join(errs...)
 		}
@@ -633,15 +622,13 @@ func (a *Allocator) checkPlacement(ctx context.Context, tx *sql.Tx, lease *Lease
 	// migration 5.
 	if len(lease.Providers) == 0 {
 		// "Release it" rather than "reap it": Reap only collects leases whose TTL
-		// has expired, so while a holder keeps heartbeating it returns zero
-		// forever and the advice would be unfollowable.
-		// Two different situations reach here and the message used to name only
-		// one. A row written before providers were recorded is genuinely old; a
-		// row whose stored list billet cannot interpret — a provider from a newer
-		// version, seen after a downgrade — is perfectly valid NEWER data that
-		// this binary must refuse. Telling an operator their fresh lease
-		// "predates provider recording" sends them looking for history that is not
-		// there.
+		// has expired, so while a holder keeps heartbeating it returns zero forever
+		// and the advice would be unfollowable.
+		//
+		// The message names BOTH situations that reach here. A row written before
+		// providers were recorded is genuinely old; a row whose stored list billet
+		// cannot interpret — a provider from a newer version, seen after a
+		// downgrade — is valid NEWER data this binary must refuse.
 		return fmt.Errorf(
 			"%w: lease %s records no provider list this version can interpret, so it cannot "+
 				"be placed safely — it predates provider recording, or names a backend a newer "+
@@ -711,19 +698,14 @@ func (a *Allocator) headroom(ctx context.Context, tx *sql.Tx, t config.Tier) (in
 		return 0, err
 	}
 
-	// FLOORS ARE NOT DEDUCTED HERE ANY MORE, and removing it was a correction
-	// rather than a simplification.
+	// FLOORS ARE NOT DEDUCTED HERE. They are held against the machines that could
+	// keep them, in reserveFloors, which is where the promise lives and the only
+	// place it can be checked honestly; deducting in both would double-count.
 	//
-	// This used to subtract every other tier's unmet floor from the deployment
-	// ceiling. That was the whole mechanism while capacity was one pool, and it
-	// asked no question it could not answer: whether any MACHINE could keep the
-	// floor. So a reservation on a tier with no suitable host anywhere — a Tart
-	// tier on a fleet of Docker boxes — took the ceiling away from tiers that
-	// were perfectly placeable, and an entirely healthy fleet advertised nothing.
-	//
-	// Floors are held against the machines that could keep them instead, in
-	// reserveFloors, which is both where the promise lives and the only place it
-	// can be checked honestly. Deducting in both places would also double-count.
+	// Subtracting every unmet floor from the deployment ceiling cannot ask whether
+	// any MACHINE could keep the floor, so a reservation on a tier with no
+	// suitable host anywhere — a Tart tier on a fleet of Docker boxes — would take
+	// the ceiling from tiers that are perfectly placeable.
 	place, owedVCPU, owedMemory, err := a.placerWithFloors(ctx, tx, t)
 	if err != nil {
 		return 0, err
@@ -830,12 +812,10 @@ func (a *Allocator) insertLease(
 	// macos_slot is stored rather than re-derived, so renaming a tier, changing
 	// its guest_os, or restarting against a different catalog cannot silently
 	// reclassify leases that are already in flight.
-	// EVERY LEASE NAMES ITS MACHINE NOW. It used to be set only for a tier that
-	// pinned itself, which left an ordinary reservation charged to the deployment
-	// and to no host — so the fleet's remaining room never shrank and billet
-	// advertised the same slots repeatedly.
 	//
-	// A pin still wins, and placement already honoured it: the chosen host is
+	// EVERY LEASE NAMES ITS MACHINE. A reservation charged to the deployment and
+	// to no host would leave the fleet's remaining room unchanged, so billet would
+	// advertise the same slots repeatedly. A pin still wins: the chosen host is
 	// drawn from the eligible set, and a pin makes that set exactly one machine.
 	var targetNode any
 	if target != "" {
@@ -1021,17 +1001,13 @@ func (a *Allocator) Bind(ctx context.Context, leaseID string, epoch int64, node 
 			return err
 		}
 
-		// THE CHOSEN BACKEND IS RECORDED HERE, and only here.
+		// THE CHOSEN BACKEND IS RECORDED HERE, and only here. What a lease MAY run
+		// on is decided when it is reserved; what it IS running on is only knowable
+		// once a host has taken it, and keeping them apart is what lets one label
+		// span two kinds of machine.
 		//
-		// It used to be written at reserve time from the tier, which made a
-		// backend a property of the reservation and pinned the lease before
-		// anything knew where it would run. What a lease MAY run on is decided
-		// when it is reserved; what it IS running on is only knowable once a host
-		// has taken it. Keeping them apart is what lets one label span two kinds
-		// of machine.
-		//
-		// Read back from the node's registration rather than assumed from the
-		// list, so the column says what is true rather than what was preferred.
+		// Read back from the node's registration rather than assumed from the list,
+		// so the column says what is true rather than what was preferred.
 		var registered string
 
 		if err := tx.QueryRowContext(ctx,
@@ -1173,19 +1149,14 @@ func (a *Allocator) RegisterNode(ctx context.Context, reg NodeRegistration) (int
 
 		// A HOST MAY NOT CHANGE ITS BACKEND WHILE IT IS RUNNING WORK.
 		//
-		// Re-registration used to overwrite the provider freely, which quietly
-		// falsified every lease already bound there: each one recorded the backend
-		// it chose at bind, and after the change the ledger said a job was running
-		// on firecracker while the host called itself docker. Later checks read
-		// the NODE's row, so they went on authorizing the lease — the fact that
-		// had become wrong was the one nothing re-read.
+		// Overwriting the provider would falsify every lease already bound there:
+		// each recorded the backend it chose at bind, so the ledger would say a job
+		// runs on firecracker while the host calls itself docker — and later checks
+		// read the NODE's row, so they would go on authorizing the lease.
 		//
-		// Rewriting chosen_provider instead would be worse: it would relabel
-		// compute that is already running, making the record agree with the
-		// catalogue by lying about the past.
-		//
-		// So this is refused, and the operator's route is the honest one — drain
-		// the host, then re-register it. An unbound node changes freely.
+		// Rewriting chosen_provider instead would be worse: it relabels compute
+		// that is already running. So this is refused, and the operator's route is
+		// to drain the host and re-register it. An unbound node changes freely.
 		var current, currentSite string
 
 		switch err := tx.QueryRowContext(ctx,
@@ -1984,8 +1955,8 @@ func (a *Allocator) archive(ctx context.Context, tx *sql.Tx, l *Lease, outcome P
 	}
 
 	// COALESCE on update, so terminalizing never erases what assignment recorded.
-	// Reap in particular used to arrive with NULL ids because it did not select
-	// them, overwriting real attribution on the very leases worth investigating.
+	// A caller that does not select the ids — Reap — would otherwise arrive with
+	// NULLs and wipe real attribution from the leases most worth investigating.
 	_, err := tx.ExecContext(ctx,
 		`INSERT INTO job_history (lease_id, tier, node, run_id, request_id, conclusion, queued_at, finished_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)

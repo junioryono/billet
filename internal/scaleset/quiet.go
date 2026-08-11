@@ -28,11 +28,10 @@ import (
 // rot the first time upstream reworded it, and would be a rule about a string
 // rather than about a fact.
 //
-// CANCELLATION ONLY, AND NOT DEADLINES. An earlier version demoted
-// context.DeadlineExceeded too, which is a different thing entirely: a request
-// that ran out of time during ordinary operation means GitHub is slow or
-// unreachable, and that is exactly the error an operator needs to see. Only a
-// cancellation is unambiguously billet stopping something on purpose.
+// CANCELLATION ONLY, AND NOT DEADLINES. A request that ran out of time during
+// ordinary operation means GitHub is slow or unreachable, which is exactly the
+// error an operator needs to see. Only a cancellation is unambiguously billet
+// stopping something on purpose.
 //
 // AND ONLY WHEN THAT IS ALL IT IS. errors.Join(realFailure, context.Canceled)
 // satisfies errors.Is for the cancellation while carrying a genuine failure

@@ -498,15 +498,11 @@ func (r *Runner) destroyStray(ctx context.Context, name string) (bool, error) {
 // Recover decides what to do with compute an earlier run left behind, once, at
 // startup and before any listener opens a session.
 //
-// IT DOES NOT DESTROY EVERYTHING, and the previous version's argument for doing
-// so was wrong on a point of fact. I claimed a killed job would simply be
-// requeued by GitHub. The scale-set documentation says reassignment happens when
-// a job is assigned to a scale set "but not acquired by a runner in time" — it
-// says nothing about a job a runner has already started, and there is no
-// evidence GitHub transparently retries that. Force-killing a container running
-// a twenty-minute job is therefore a deliberate job failure, not a recovery, and
-// the fact that a graceful shutdown also kills jobs does not make doing it after
-// an unrelated controller crash acceptable.
+// IT DOES NOT DESTROY EVERYTHING. GitHub does not transparently retry a job a
+// runner has already started: the scale-set documentation describes reassignment
+// only for a job "not acquired by a runner in time". Force-killing a container
+// running a twenty-minute job is therefore a deliberate job failure, not a
+// recovery.
 //
 // So a surviving container whose lease is still open is ADOPTED. Billet cannot
 // manage it — the request-id mapping and completion handling died with the last
@@ -626,13 +622,12 @@ func (r *Runner) takeCustody(ctx context.Context, lease *alloc.Lease, inst *prov
 	// RECORDED FIRST, RENEWED SECOND, and the order is the whole correctness of
 	// custody across a network.
 	//
-	// It used to heartbeat first and adopt only on success, which meant a renewal
-	// that failed left NOTHING holding the lease. That is survivable in-process,
-	// where the failure is a database blip and the caller still has the lease.
-	// Over a wire it is the common case: the same outage that lost the launch
-	// report loses this heartbeat too, and a node that has just been forgotten by
-	// a restarted control plane will have it refused outright — which is exactly
-	// the situation custody exists for.
+	// Heartbeating first and adopting only on success would leave NOTHING holding
+	// the lease when a renewal fails. That is survivable in-process, where the
+	// failure is a database blip and the caller still has the lease. Over a wire
+	// it is the common case: the same outage that lost the launch report loses
+	// this heartbeat too, and a node just forgotten by a restarted control plane
+	// has it refused outright — exactly the situation custody exists for.
 	//
 	// Recording locally first means the janitor OWNS the lease from this moment
 	// and keeps retrying renewal on its own clock. A fenced or missing lease is
@@ -691,9 +686,8 @@ func (r *Runner) AssumeCustody(ctx context.Context, lease *alloc.Lease, requestI
 // path guarantees: Bind and Advance(launching) both commit BEFORE the provider
 // is asked to create anything. So an instance that appears in the list already
 // has a lease at launching or beyond, and a sweep cannot see compute whose lease
-// has not yet been written. (I had this backwards when Recover was written, and
-// argued a sweep would race a starting job. It cannot — the list is taken first,
-// so anything in it predates the query that judges it.)
+// has not yet been written. It cannot race a starting job either — the list is
+// taken first, so anything in it predates the query that judges it.
 func (r *Runner) Sweep(ctx context.Context) error {
 	instances, err := r.provider.List(ctx)
 	if err != nil {

@@ -89,9 +89,8 @@ type LoopOptions struct {
 	// Backoff is how long to wait after a failed registration or poll. Zero uses
 	// a default.
 	//
-	// It governs BOTH, which the first version claimed and did not do: poll
-	// failures used a hard-coded second, so a caller that lengthened this to calm
-	// a flapping link still hammered the poll endpoint.
+	// It governs BOTH registration and poll failures, so a caller lengthening it
+	// to calm a flapping link is not left hammering the poll endpoint.
 	Backoff time.Duration
 }
 
@@ -264,12 +263,12 @@ func Run(ctx context.Context, c *Client, compute Compute, opts LoopOptions) erro
 		// bundle copied to both, or the same node.name in two files — and an
 		// operator has to fix it.
 		//
-		// STOPPING IMMEDIATELY IS ALSO WRONG, and that was the first version. This
-		// process may be holding compute right now; the control plane keeps its
-		// heartbeat and its result routes open precisely so it can finish. Exiting
-		// cancels the janitor, and the replacement cannot adopt what it cannot see
-		// — the container is on this machine — so the lease is renewed by nobody
-		// and its capacity is resold under a running job.
+		// STOPPING IMMEDIATELY IS ALSO WRONG. This process may be holding compute
+		// right now, and the control plane keeps its heartbeat and result routes
+		// open precisely so it can finish. Exiting cancels the janitor, and the
+		// replacement cannot adopt what it cannot see — the container is on this
+		// machine — so the lease is renewed by nobody and its capacity is resold
+		// under a running job.
 		if errors.Is(err, ErrSuperseded) {
 			drain(ctx, compute, log, opts)
 
@@ -373,8 +372,8 @@ func stopGracefully(ctx context.Context, c *Client, compute Compute, log *slog.L
 	log.Info("draining: not taking new work, waiting for the compute already running here",
 		"grace", grace)
 
-	// IT KEEPS ANSWERING THE CONTROL PLANE, and the first version did not — which
-	// made the drain useless in the ordinary case.
+	// IT KEEPS ANSWERING THE CONTROL PLANE, without which the drain is useless in
+	// the ordinary case.
 	//
 	// Tend advances CUSTODY: work this node adopted or could not account for. A
 	// job running normally is not custody, and what removes it is a Destroy, which
@@ -549,19 +548,16 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 			// disagree in the one direction that leaks.
 			//
 			// Two ways to arrive, one answer. The report may have been LOST, in
-			// which case the plane timed the command out and assumed custody. Or it
-			// may have ARRIVED TOO LATE and been answered with ErrCustody, which is
-			// the plane saying the same thing out loud: it already told the listener
-			// to stop heartbeating, so the lease is the node's now. A late success
-			// used to be answered with a shrug, which left the container running
-			// under a lease nobody renewed at all.
+			// which case the plane timed the command out and assumed custody; or it
+			// may have ARRIVED TOO LATE and been answered with ErrCustody, which
+			// says the same thing out loud.
 			//
-			// The plane times the command out and reports custody, so it stops
-			// heartbeating the lease. The node, having launched successfully, holds
-			// the instance in its ordinary running set, which nothing renews. The
-			// lease is then reaped while the container runs and its capacity is
-			// sold twice. So the party that failed to report takes custody: the
-			// handoff is caused rather than hoped for.
+			// Either way the plane has stopped heartbeating the lease, while the
+			// node — having launched successfully — holds the instance in its
+			// ordinary running set, which nothing renews. The lease is then reaped
+			// while the container runs and its capacity is sold twice. So the party
+			// that failed to report takes custody: the handoff is caused rather
+			// than hoped for.
 			//
 			// Done before the ErrUnregistered check on purpose. Being unknown to
 			// the control plane is exactly when custody matters most, and returning

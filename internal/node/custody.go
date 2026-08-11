@@ -162,13 +162,12 @@ const strayGrace = time.Minute
 // too late to do anything about it.
 const custodyWarnAfter = time.Hour
 
-// DefaultMaxCustody is OFF, and that is a deliberate reversal.
+// DefaultMaxCustody is OFF, deliberately.
 //
-// I gave this a 24-hour default and it was wrong. Elapsed time is not evidence
-// that a job has stopped making progress: billet imposes no job limit of its
-// own, self-hosted runners are routinely configured past GitHub's six-hour
-// default, and a legitimately long job restarted shortly after it began would be
-// killed a day later for no reason anyone could see in the logs.
+// Elapsed time is not evidence that a job has stopped making progress: billet
+// imposes no job limit of its own, self-hosted runners are routinely configured
+// past GitHub's six-hour default, and a legitimately long job would be killed
+// for no reason anyone could see in the logs.
 //
 // Killing live work must be authorised by something that actually knows — a
 // completion from GitHub, an observed process exit, or an operator. Time drives
@@ -180,14 +179,13 @@ const DefaultMaxCustody = 0
 
 // KeepAlive renews held leases on their own clock until the context ends.
 //
-// SEPARATE FROM Tend, AND THAT SEPARATION IS THE WHOLE POINT. Renewal used to
-// happen inside Tend, which runs after Reap on a shared tick and which makes
-// unbounded provider calls — a slow `docker ps` or a wedged daemon delays the
-// next renewal without delaying the next reap. The interval from a successful
-// heartbeat to the following Reap was therefore unbounded, and anything longer
-// than the lease TTL means the reaper terminalizes a lease that is being held on
-// purpose, hands its capacity back, and lets a listener advertise it while the
-// container is still running.
+// SEPARATE FROM Tend, AND THAT SEPARATION IS THE WHOLE POINT. Tend runs after
+// Reap on a shared tick and makes unbounded provider calls, so renewal inside it
+// would leave the interval from a successful heartbeat to the following Reap
+// unbounded — a slow `docker ps` delays the next renewal without delaying the
+// next reap. Anything longer than the lease TTL and the reaper terminalizes a
+// lease held on purpose, hands its capacity back, and lets a listener advertise
+// it while the container is still running.
 //
 // So this does exactly one thing, touches only the ledger, and ticks at a third
 // of the TTL — the same cadence and the same reasoning as the listener's own
