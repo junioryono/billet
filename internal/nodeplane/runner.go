@@ -98,11 +98,25 @@ func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
 	// replacement share it, and only one of them has the container.
 	owner, known := r.plane.OwnerOfRequest(requestID)
 
-	// A DESTROY MUST NOT WAIT ON A CORPSE. This is the broadcast that made stale
-	// nodes expensive: each one held the call for the full command timeout and
-	// then failed it, and the listener answers a failed destroy by holding its
-	// lease forever. liveNodes expires them first.
+	// ADDRESSED WHEN THE PLANE KNOWS WHO HAS IT, which is every request this
+	// process handed out. Asking one machine is one command; asking all of them
+	// is one command per machine, each able to wait the full command timeout — and
+	// that is why the listener had to serialise teardown, so a fleet of twenty
+	// could not turn a shutdown into twenty timeouts. Teardown scaled with the
+	// size of the fleet rather than with the work being torn down.
+	//
+	// THE BROADCAST REMAINS FOR THE CASE IT WAS REALLY FOR: a request this process
+	// never dispatched. After a restart the plane's ownership map is empty, so the
+	// only way to find a container adopted from a previous incarnation is to ask
+	// everyone. Guessing wrong there leaves compute running on capacity that has
+	// been handed back.
 	targets := r.liveNodes()
+
+	if known {
+		if only := r.plane.liveNode(owner.Node); only != nil {
+			targets = []*node{only}
+		}
+	}
 
 	if len(targets) == 0 {
 		// A DRAINING PROCESS IS NEVER IN THIS LIST — it does not poll — so an empty

@@ -414,6 +414,20 @@ func (p *Plane) Watch(ctx context.Context) {
 	}
 }
 
+// liveNode returns one host if it is currently live, or nil.
+//
+// Expiry runs first, so a name that belongs to a machine the plane has given up
+// on answers nil rather than a corpse — which is the whole reason a destroy
+// cannot simply trust a name it was handed.
+func (p *Plane) liveNode(name string) *node {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.expireStaleLocked()
+
+	return p.nodes[name]
+}
+
 // goneNode is a host the plane has given up on, with the epoch it had.
 //
 // The epoch travels with the name because by the time this is written the node

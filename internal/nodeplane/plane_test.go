@@ -1152,12 +1152,14 @@ func TestALateDestroyResultFromTheOwnerEndsItsOwnership(t *testing.T) {
 // already destroyed its container and would later drain to nothing, after which
 // every future destroy saw a superseded owner and reported custody forever for
 // compute that no longer existed.
-func TestAnOwnersConfirmationCountsDespiteAnotherNodesFailure(t *testing.T) {
+func TestAnOwnersConfirmationClearsTheRecordAndNobodyElseIsAsked(t *testing.T) {
 	t.Parallel()
 
 	p, _ := deliverLaunch(t)
 
-	// A second node in the fleet that never answers anything.
+	// A second node in the fleet that never answers anything. It used to be asked
+	// too — the destroy was broadcast — and its silence failed the whole call for
+	// a container it had never heard of.
 	register(t, p, "n2", config.ProviderDocker)
 
 	// The owner answers its own leg.
@@ -1171,9 +1173,12 @@ func TestAnOwnersConfirmationCountsDespiteAnotherNodesFailure(t *testing.T) {
 		_ = p.Result("n1", "first", nodeapi.CommandResult{ID: got.ID, OK: true})
 	}()
 
-	// The broadcast fails overall, because n2 never answers.
-	if err := p.NewRunner().Destroy(t.Context(), 7); err == nil {
-		t.Fatal("a destroy with an unanswered leg reported success")
+	// ADDRESSED, so a silent bystander is irrelevant. This assertion is the
+	// inverse of what it used to be, and deliberately: the machine that has the
+	// container is the only one asked, so the one that does not have it can no
+	// longer fail a destroy it was never part of.
+	if err := p.NewRunner().Destroy(t.Context(), 7); err != nil {
+		t.Fatalf("a destroy addressed to the owner was failed by a bystander: %v", err)
 	}
 
 	if p.OwnsForTest("l1", "n1", "first") {
