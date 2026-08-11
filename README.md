@@ -57,12 +57,69 @@ no webhook endpoint, no tunnel.
 ## Install
 
 ```bash
-curl -fsSL https://billet.sh/install | sh     # not live yet — build from source for now
+curl -fsSL https://raw.githubusercontent.com/junioryono/billet/main/scripts/install.sh | sh
 ```
+
+Downloads the latest release for your platform, verifies its checksum, and puts
+the binary in `/usr/local/bin`. It does not create users, write config, or start
+anything.
+
+**For a machine that should run jobs across reboots, install the package
+instead** — it ships the systemd units:
+
+```bash
+# Debian / Ubuntu
+curl -fsSLO https://github.com/junioryono/billet/releases/latest/download/billet_VERSION_linux_amd64.deb
+sudo dpkg -i billet_*_linux_amd64.deb
+
+# Fedora / RHEL
+sudo rpm -i https://github.com/junioryono/billet/releases/latest/download/billet_VERSION_linux_amd64.rpm
+```
+
+The package installs the units and **does not enable or start them**. Installing
+billet should not connect a machine to GitHub and begin accepting jobs; that is
+your decision, and it cannot be made before `/etc/billet/billet.yaml` says
+something true:
+
+```bash
+sudo -u billet billet github-app create --org YOUR-ORG
+sudoedit /etc/billet/billet.yaml          # set max_vcpu and max_memory
+sudo -u billet billet check               # says what is still missing
+sudo systemctl enable --now billet-server
+```
+
+Or build from source:
 
 ```bash
 git clone https://github.com/junioryono/billet && cd billet && go build ./cmd/billet
 ```
+
+## Updating
+
+```bash
+sudo dpkg -i billet_NEW_linux_amd64.deb   # or rpm -U, or re-run the install script
+sudo systemctl restart billet-server
+```
+
+**The restart is safe because billet drains.** SIGTERM stops it taking new work
+and waits for the jobs already running before tearing anything down, so an update
+does not fail somebody's CI. That is the whole point of the drain, and it is the
+reason this is two commands rather than a maintenance window.
+
+**It is not instant.** The restart takes as long as the longest job still
+running, up to `drain_timeout` (6h by default, which is how long GitHub lets a
+job run). If you do not want to wait, send a second signal:
+
+```bash
+sudo systemctl kill --kill-whom=main --signal=SIGTERM billet-server
+```
+
+That stops the waiting and tears down properly — the jobs still running are
+destroyed and GitHub reassigns them. A third signal gives up where it stands and
+leaves containers behind for the reaper.
+
+`--kill-whom=main` matters: without it systemctl signals every process in the
+service, including a container CLI billet has in flight.
 
 ## Status
 
@@ -259,7 +316,7 @@ same as Docker or ZFS. `billet` itself is Apache-2.0 throughout.
 | P6 — observability, SSH-into-a-job | ⬜ |
 | P7 — Apple Silicon provider (macOS + Linux arm64) | ⬜ |
 | P8 — EC2 provider, cloud-hosted control plane, provider failover | ⬜ |
-| P10 — dashboard, signed releases, public launch | ⬜ |
+| P10 — dashboard, signed releases, public launch | 🚧 releases and packages done; signing and the dashboard are not |
 | P11 — AWS Terraform | ⬜ |
 
 ## Alternatives
