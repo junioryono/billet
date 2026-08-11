@@ -136,12 +136,16 @@ func TestAProviderOutsideTheListIsStillRefused(t *testing.T) {
 	}
 }
 
-// The ORDER is recorded even though nothing acts on it yet.
+// THE LEDGER PRESERVES THE ORDER, because the chooser reads it from here.
 //
-// Preference is a choice among candidates, and choosing needs a chooser — which
-// arrives when the node runs in its own process and the control plane picks
-// rather than the node binding itself. Recording the order now is what makes
-// that a scheduling change rather than a schema change.
+// nodeplane.pick walks Providers most-preferred-first over the registered nodes,
+// so an order this layer reversed or sorted would silently change which machine
+// a job lands on. The allocator does not choose — it is the record the chooser
+// consults, and that is exactly why the order has to survive a round trip.
+//
+// What still does not exist is choosing at ESCROW time against per-node capacity
+// and cost (#30); this test is about the order surviving, not about when it is
+// consulted.
 func TestThePreferenceOrderIsPreserved(t *testing.T) {
 	t.Parallel()
 

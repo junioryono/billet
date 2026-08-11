@@ -22,12 +22,14 @@ cloud; the AWS-based projects are AWS-only; the microVM products are commercial.
 [Alternatives](#alternatives) for an honest comparison, including cases where you should use
 something else.
 
-> The failover part is **half built**. A tier can now name several backends and be
-> placed on any of them, so it is no longer pinned to one kind of machine. What is
-> missing is the part that CHOOSES: nothing picks among live hosts yet, because a
-> node binds itself ([#30](https://github.com/junioryono/billet/issues/30)) — and
-> there is no EC2 provider for it to choose
-> ([#32](https://github.com/junioryono/billet/issues/32)). See [Status](#status).
+> The failover part is **half built**. A tier can name several backends, and the
+> control plane already picks among registered nodes in the tier's preference
+> order. What is missing is choosing when the job is ADMITTED rather than after —
+> capacity is one deployment-wide budget, so nothing weighs a node's spare room or
+> its cost before accepting the work
+> ([#30](https://github.com/junioryono/billet/issues/30)). And there is no EC2
+> provider to fail over TO ([#32](https://github.com/junioryono/billet/issues/32)),
+> so none of it can be exercised yet. See [Status](#status).
 
 ## What it is
 
@@ -255,12 +257,24 @@ Everything below describes the intended design. Where a thing is not built, it s
 > not built either — copy the example.
 
 ```bash
-billet github-app create --org myorg          # creates + installs the App
-cp billet.example.yaml ./billet.yaml          # then set org, and provider: docker throughout
-billet check --config ./billet.yaml           # validates config, key, state
+billet github-app create --org myorg           # creates + installs the App, PRINTS a github: block
+cp billet.example.yaml ./billet.yaml           # then edit it — see below, four things
+billet check --config ./billet.yaml            # validates config, key, state
 billet server --dry-run --config ./billet.yaml  # first contact: polls, accepts nothing
-billet server --dev --config ./billet.yaml    # runs jobs
+billet server --dev --config ./billet.yaml     # runs jobs
 ```
+
+**The four edits**, because nothing writes the file for you:
+
+1. **Paste the `github:` block** that `github-app create` printed. It prints; it does not edit your
+   config, so `app_id` and `installation_id` stay `0` and `billet check` says so.
+2. **`private_key_path`** — point it where `github-app create` actually wrote the key. The example
+   says `/etc/billet/app-private-key.pem`, which is root-owned.
+3. **`provider: docker` and a runner `image:`**, in the `node:` section and every tier — see the
+   warning above.
+4. **Both `state_dir`s** default to `/var/lib/billet/...`, which an unprivileged `billet server`
+   cannot create. Point them somewhere you can write (`./state/server`, `./state/node`) or
+   pre-create them with the right owner.
 
 `--config` is not optional here. billet deliberately does **not** read a
 `billet.yaml` from the working directory — a server started from a directory
