@@ -478,12 +478,22 @@ const (
 	// that request knows whether it is theirs. Four concurrent destroys therefore
 	// still queue four commands on every node.
 	//
-	// So the only safe number here is one, and real concurrency has to come from
-	// the runner instead: one command in flight per node, parallel across nodes,
-	// which needs a destroy addressed to the lease's own node rather than
-	// broadcast. That is tracked separately. In the ordinary case a destroy takes
-	// seconds and sequence costs nothing; the pathological case is a node that
-	// went quiet, and concurrency never helped there anyway.
+	// THE BROADCAST IS GONE AND THIS IS STILL ONE, which is worth stating so the
+	// next reader does not assume the blocker was removed. A destroy now goes to
+	// the machine holding the request, so N concurrent destroys no longer queue N
+	// commands on EVERY node — but several requests can be on the SAME node, and
+	// there the original problem is untouched: their timeouts all start at queue
+	// time and the ones at the back expire while the node works through the front.
+	//
+	// What is still missing is the other half — one command in flight PER NODE,
+	// parallel across nodes — and that belongs in the plane rather than here,
+	// because only the plane knows which commands share a queue. Doing it by
+	// holding a per-node slot across dispatch would also serialise launches behind
+	// destroys, so it needs its own design rather than a constant.
+	//
+	// In the ordinary case a destroy takes seconds and sequence costs nothing; the
+	// pathological case is a node that went quiet, and concurrency never helped
+	// there anyway.
 	teardownConcurrency = 1
 
 	// closeGrace and releaseGrace bound the local half of the teardown, separately
