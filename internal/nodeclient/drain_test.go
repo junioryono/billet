@@ -10,8 +10,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/nodeclient"
+	"github.com/junioryono/billet/internal/server"
 )
 
 // A NODE FINISHES ITS CONTAINERS BEFORE IT STOPS, and it does NOT hand them to
@@ -125,7 +127,13 @@ func TestANodeHoldingNothingStopsImmediatelyAndSaysNothingAboutDraining(t *testi
 	cancel()
 
 	select {
-	case <-done:
+	case err := <-done:
+		// CHECKED, because ignoring it lets any unrelated early exit satisfy this
+		// test — a registration that failed, a refused provider — none of which is
+		// the behaviour being asserted.
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("the node stopped for some reason other than the signal: %v", err)
+		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("a node with nothing running waited out a drain it did not need")
 	}
@@ -153,7 +161,11 @@ func (l *lockedWriter) Write(p []byte) (int, error) {
 }
 
 // The drain is bounded. A container that never reports must not keep the process
-// alive forever — the teardown has to get its turn.
+// alive forever.
+//
+// The assertion is on WHY it stopped, not just that it did within ten seconds:
+// an upper bound alone is satisfied by a drain that was never entered, which is
+// exactly the regression worth catching.
 func TestANodeDrainIsBounded(t *testing.T) {
 	t.Parallel()
 
@@ -165,13 +177,19 @@ func TestANodeDrainIsBounded(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
+	var (
+		logMu  sync.Mutex
+		logged bytes.Buffer
+	)
+
 	done := make(chan error, 1)
 
 	go func() {
 		done <- nodeclient.Run(ctx, c, compute, nodeclient.LoopOptions{
-			Provider:     config.ProviderDocker,
-			Deployment:   deployment,
-			Log:          slog.New(slog.DiscardHandler),
+			Provider:   config.ProviderDocker,
+			Deployment: deployment,
+			Log: slog.New(slog.NewTextHandler(&lockedWriter{mu: &logMu, w: &logged},
+				&slog.HandlerOptions{Level: slog.LevelInfo})),
 			Backoff:      20 * time.Millisecond,
 			SweepEvery:   10 * time.Millisecond,
 			DrainTimeout: 200 * time.Millisecond,
@@ -186,6 +204,19 @@ func TestANodeDrainIsBounded(t *testing.T) {
 	case <-done:
 	case <-time.After(10 * time.Second):
 		t.Fatal("a node drain with no bound never let the process stop")
+	}
+
+	logMu.Lock()
+	defer logMu.Unlock()
+
+	if !strings.Contains(logged.String(), "draining") {
+		t.Errorf("the node never entered a drain, so its bound proves nothing:\n%s",
+			logged.String())
+	}
+
+	if !strings.Contains(logged.String(), "stopped waiting") {
+		t.Errorf("the drain ended for some reason other than its own bound:\n%s",
+			logged.String())
 	}
 }
 
@@ -239,5 +270,153 @@ func TestASecondSignalEndsTheNodesDrain(t *testing.T) {
 	case <-done:
 	case <-time.After(10 * time.Second):
 		t.Fatal("the second signal did not end the node's drain")
+	}
+}
+
+// THE LEASES STAY RENEWED FOR THE WHOLE DRAIN, or the drain is worse than not
+// draining at all.
+//
+// KeepAlive is what renews the leases of compute this node is holding. Its
+// context used to be a child of the caller's, so the first signal stopped it at
+// the exact moment the wait began — the node would sit holding containers whose
+// leases nothing was renewing, the reaper would expire them, and another tier
+// could escrow the same capacity while the container was still here.
+//
+// aliveCount() only counts janitors STARTED, which is why it could not see this.
+// aliveReturned() counts the ones that have exited.
+func TestTheJanitorKeepsRenewingForTheWholeDrain(t *testing.T) {
+	t.Parallel()
+
+	_, c := harness(t)
+
+	compute := &fakeCompute{holding: true}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	done := make(chan error, 1)
+
+	go func() {
+		done <- nodeclient.Run(ctx, c, compute, nodeclient.LoopOptions{
+			Provider:     config.ProviderDocker,
+			Deployment:   deployment,
+			Log:          slog.New(slog.DiscardHandler),
+			Backoff:      20 * time.Millisecond,
+			SweepEvery:   10 * time.Millisecond,
+			DrainTimeout: 20 * time.Second,
+		})
+	}()
+
+	waitFor(t, func() bool { return compute.aliveCount() == 1 })
+
+	cancel()
+
+	// The drain is under way: custody is being advanced.
+	waitFor(t, func() bool { return compute.tended() > 0 })
+
+	if n := compute.aliveReturnedCount(); n != 0 {
+		t.Fatalf("the janitor stopped renewing while the node was still draining "+
+			"(%d returned); those leases are now expiring under running containers", n)
+	}
+
+	compute.mu.Lock()
+	compute.holding = false
+	compute.mu.Unlock()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("a drained node never stopped")
+	}
+
+	// And it does stop once Run returns, so nothing heartbeats behind it.
+	waitFor(t, func() bool { return compute.aliveReturnedCount() == 1 })
+}
+
+// A DRAINING NODE STILL ANSWERS THE CONTROL PLANE, and without that the drain is
+// useless in the ordinary case.
+//
+// Tend advances CUSTODY — work this node adopted or could not account for. A job
+// running normally is not custody, and what removes it is a Destroy, which
+// arrives over the command poll after the control plane learns from GitHub that
+// the job finished. A drain that stopped polling could never receive that, so
+// Holding() would stay true until the whole grace expired: a node that always
+// waits its maximum, which is the opposite of draining.
+//
+// It also refuses a Launch, because accepting one would extend the wait it is
+// trying to finish.
+func TestADrainingNodeAcceptsDestroyAndRefusesLaunch(t *testing.T) {
+	t.Parallel()
+
+	plane, c := harness(t)
+
+	compute := &fakeCompute{holding: true}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	done := make(chan error, 1)
+
+	go func() {
+		done <- nodeclient.Run(ctx, c, compute, nodeclient.LoopOptions{
+			Provider:     config.ProviderDocker,
+			Deployment:   deployment,
+			Log:          slog.New(slog.DiscardHandler),
+			Backoff:      20 * time.Millisecond,
+			SweepEvery:   10 * time.Millisecond,
+			DrainTimeout: 20 * time.Second,
+		})
+	}()
+
+	waitFor(t, func() bool { return len(plane.Nodes()) == 1 })
+
+	cancel()
+
+	// The drain has to be under way before either command is sent, or this tests
+	// the ordinary loop rather than the draining one.
+	waitFor(t, func() bool { return compute.tended() > 0 })
+
+	// A DESTROY IS ACCEPTED, which is the message that ends a drain in real life:
+	// the job finished, GitHub told the control plane, and the control plane is
+	// telling this node to tear the container down.
+	if err := plane.NewRunner().Destroy(t.Context(), 42); err != nil {
+		t.Fatalf("a draining node refused a destroy: %v", err)
+	}
+
+	if _, _, destroyed := compute.snapshot(); len(destroyed) == 0 {
+		t.Fatal("the destroy never reached the compute; a drain that cannot be told " +
+			"to destroy anything can only ever wait out its grace")
+	}
+
+	// A LAUNCH IS REFUSED. Accepting one would mean the drain never converges,
+	// because each new job extends the wait it is trying to finish.
+	lease := &alloc.Lease{
+		ID:        "l1",
+		VCPU:      2,
+		Memory:    8 * config.GiB,
+		GuestOS:   config.GuestLinux,
+		Providers: []config.ProviderKind{config.ProviderDocker},
+		Epoch:     1,
+	}
+
+	err := plane.NewRunner().Launch(t.Context(), lease, server.Job{RequestID: 7})
+	if err == nil {
+		t.Error("a draining node accepted a launch")
+	} else if !strings.Contains(err.Error(), "draining") {
+		t.Errorf("the refusal should say the node is draining, got: %v", err)
+	}
+
+	if _, launched, _ := compute.snapshot(); len(launched) != 0 {
+		t.Errorf("a draining node launched %v", launched)
+	}
+
+	compute.mu.Lock()
+	compute.holding = false
+	compute.mu.Unlock()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("a drained node never stopped")
 	}
 }

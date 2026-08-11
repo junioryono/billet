@@ -27,6 +27,18 @@ import (
 // of the error, not of the sentence around it. Matching "request failed" would
 // rot the first time upstream reworded it, and would be a rule about a string
 // rather than about a fact.
+//
+// CANCELLATION ONLY, AND NOT DEADLINES. An earlier version demoted
+// context.DeadlineExceeded too, which is a different thing entirely: a request
+// that ran out of time during ordinary operation means GitHub is slow or
+// unreachable, and that is exactly the error an operator needs to see. Only a
+// cancellation is unambiguously billet stopping something on purpose.
+//
+// AND ONLY WHEN THAT IS ALL IT IS. errors.Join(realFailure, context.Canceled)
+// satisfies errors.Is for the cancellation while carrying a genuine failure
+// alongside it, so a rule written as a bare errors.Is would quietly demote the
+// real one. A joined error is demoted only when every branch of it is a
+// cancellation.
 func quieten(h slog.Handler) slog.Handler {
 	return &quietHandler{Handler: h}
 }
@@ -36,7 +48,7 @@ type quietHandler struct {
 }
 
 func (q *quietHandler) Handle(ctx context.Context, r slog.Record) error {
-	if r.Level >= slog.LevelInfo && cancelled(r) {
+	if r.Level >= slog.LevelInfo && onlyCancellations(r) {
 		// A NEW RECORD, because slog.Record.Level is a field on a value the caller
 		// still owns; mutating the one handed in would be a data race with any
 		// other handler in the chain.
@@ -73,9 +85,11 @@ func (q *quietHandler) Enabled(ctx context.Context, level slog.Level) bool {
 	return q.Handler.Enabled(ctx, level) || q.Handler.Enabled(ctx, slog.LevelDebug)
 }
 
-// cancelled reports whether a record carries an error that is a cancellation.
-func cancelled(r slog.Record) bool {
+// onlyCancellations reports whether a record carries at least one error and
+// every error it carries is nothing but a cancellation.
+func onlyCancellations(r slog.Record) bool {
 	found := false
+	all := true
 
 	r.Attrs(func(a slog.Attr) bool {
 		err, ok := a.Value.Any().(error)
@@ -83,8 +97,10 @@ func cancelled(r slog.Record) bool {
 			return true
 		}
 
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			found = true
+		found = true
+
+		if !onlyCancellation(err) {
+			all = false
 
 			return false
 		}
@@ -92,5 +108,35 @@ func cancelled(r slog.Record) bool {
 		return true
 	})
 
-	return found
+	return found && all
+}
+
+// onlyCancellation reports whether an error is a cancellation and nothing else.
+//
+// A joined error — errors.Join, or fmt.Errorf with several %w — unwraps to a
+// list, and errors.Is is satisfied by ANY branch matching. That is the wrong
+// question here: a failure joined with a cancellation is still a failure, and
+// demoting it would hide the half that matters. Every branch has to be a
+// cancellation for the whole to be one.
+func onlyCancellation(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		branches := joined.Unwrap()
+		if len(branches) == 0 {
+			return false
+		}
+
+		for _, branch := range branches {
+			if !onlyCancellation(branch) {
+				return false
+			}
+		}
+
+		return true
+	}
+
+	return errors.Is(err, context.Canceled)
 }

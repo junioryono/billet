@@ -35,7 +35,17 @@ func TestACancelledRequestIsNotLoggedAsAnError(t *testing.T) {
 	}{
 		{"a cancelled request", context.Canceled, slog.LevelDebug},
 		{"a wrapped cancellation", fmt.Errorf("get message: %w", context.Canceled), slog.LevelDebug},
-		{"a deadline that expired", context.DeadlineExceeded, slog.LevelDebug},
+		// A DEADLINE IS NOT A CANCELLATION. A request that ran out of time during
+		// ordinary operation means GitHub is slow or unreachable, which is exactly
+		// what an operator needs to see. An earlier version demoted these too.
+		{"a deadline that expired", context.DeadlineExceeded, slog.LevelError},
+		// A REAL FAILURE JOINED WITH A CANCELLATION IS STILL A REAL FAILURE.
+		// errors.Is is satisfied by any branch, so a rule written as a bare
+		// errors.Is would demote this and hide the half that matters.
+		{"a failure joined with a cancellation",
+			errors.Join(errors.New("401 Bad credentials"), context.Canceled), slog.LevelError},
+		{"cancellations joined together",
+			errors.Join(context.Canceled, fmt.Errorf("poll: %w", context.Canceled)), slog.LevelDebug},
 		// EVERYTHING ELSE IS UNTOUCHED. A demotion that swallowed real failures
 		// would be a worse bug than the noise it was fixing: a 401 from GitHub
 		// during a shutdown is exactly the thing an operator has to see.
