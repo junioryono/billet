@@ -371,14 +371,11 @@ func New(log *slog.Logger, deployment string, leaseTTL time.Duration, opts ...Op
 
 // Watch expires silent nodes until the context ends.
 //
-// A TIMER, BECAUSE NOTHING ELSE ASKS. Expiry used to run only where the answer
-// was needed — picking a node, listing the fleet, broadcasting a destroy — which
-// was enough while its only job was to keep those three from consulting a
-// corpse. It is not enough now: a node's liveness decides what its tier
-// ADVERTISES, and an idle deployment does none of those three things. A host
-// that crashes on a quiet afternoon would keep its capacity advertised until
-// somebody happened to launch something, and GitHub would go on assigning
-// against a machine that is not there.
+// A TIMER, BECAUSE NOTHING ELSE ASKS. A node's liveness decides what its tier
+// ADVERTISES, and an idle deployment never picks a node, lists the fleet or
+// destroys anything — so expiry driven only by those would leave a host that
+// crashed on a quiet afternoon advertising its capacity until somebody happened
+// to launch something.
 //
 // Half the silence window, so a node is noticed within about one and a half of
 // them rather than up to two.
@@ -568,14 +565,11 @@ func (p *Plane) Register(
 			ErrRefused, req.Node, req.Deployment, p.deployment)
 	}
 
-	// REFUSED HERE, PERMANENTLY, rather than by the ledger. The allocator also
-	// rejects a contribution of nothing too, which is now belt and braces rather
-	// than a second entrance: --dev used to register straight into the ledger
-	// without passing through here. But an error from the registrar is
-	// treated as an OUTAGE below and answered 503, so the node retries. A node
-	// whose config offers no capacity would then retry forever, every backoff,
-	// and nothing in the loop would ever say why. Observed doing exactly that in
-	// the end-to-end suite: 50ms apart, indefinitely.
+	// REFUSED HERE, PERMANENTLY, rather than by the ledger. The allocator rejects
+	// a contribution of nothing as well, but an error from the registrar is
+	// treated as an OUTAGE below and answered 503, so the node retries — a node
+	// whose config offers no capacity would retry forever, every backoff, with
+	// nothing in the loop ever saying why.
 	if req.VCPU <= 0 || req.Memory <= 0 {
 		return nodeapi.RegisterResponse{}, fmt.Errorf(
 			"%w: node %q contributes %d vcpu and %s of memory; a host that offers nothing "+
@@ -700,12 +694,12 @@ func (p *Plane) Register(
 		// tombstone, and be answered 204, while the listener had already stopped
 		// heartbeating on the custody it was told about.
 		//
-		// A DESTROY is the case this used to miss entirely. The process that took it
-		// can succeed and be superseded before it reports; its late result was then
-		// discarded, so the ownership record survived, that process drained to
-		// nothing and exited, and every later destroy was answered by its
-		// replacement — which cannot confirm somebody else's ownership. The plane
-		// reported custody forever for a container that had already been removed.
+		// A DESTROY is the easy case to miss. The process that took it can succeed
+		// and be superseded before it reports; discarding that late result leaves
+		// the ownership record alive after that process exits, so every later
+		// destroy is answered by its replacement — which cannot confirm somebody
+		// else's ownership — and the plane reports custody forever for a container
+		// that has already been removed.
 		n.rememberAbandoned(pend.cmd, pend.incarnation, p.now())
 
 		p.answerLocked(pend, nodeapi.CommandResult{
@@ -970,8 +964,8 @@ func (p *Plane) AdoptOwnership(node, incarnation string, leaseIDs []string) {
 	// still `assigned` is legitimately missing — and deleting its owner would let
 	// somebody else answer a destroy for a container that is about to exist.
 	//
-	// Runs even for an empty snapshot, because one-to-zero is exactly the shape
-	// that used to strand an entry for the life of the process.
+	// Runs even for an empty snapshot: one-to-zero is exactly the shape that
+	// strands an entry for the life of the process.
 	for id, owner := range p.owners {
 		if owner.node == node && owner.requestID == 0 && !open[id] {
 			delete(p.owners, id)
@@ -1312,14 +1306,12 @@ func (p *Plane) Result(nodeName, incarnation string, res nodeapi.CommandResult) 
 			switch {
 			case entry.kind == nodeapi.CommandDestroy && res.OK &&
 				p.ownedByLocked(entry.requestID, nodeName, entry.incarnation):
-				// THE ONLY PROOF THE COMPUTE IS GONE, arriving late. A destroy taken by
-				// a process that was superseded before it could answer used to be
-				// discarded here — so the ownership record survived, that process
-				// drained to nothing and exited, and every later destroy was answered
-				// by its replacement, which cannot confirm somebody else's ownership.
-				// The plane then reported custody forever for a container that had
-				// already been removed, while the listener kept heartbeating its
-				// capacity.
+				// THE ONLY PROOF THE COMPUTE IS GONE, arriving late. Discarding the
+				// answer of a destroy whose process was superseded before it could
+				// report leaves the ownership record alive after that process exits,
+				// so every later destroy is answered by its replacement — which
+				// cannot confirm somebody else's ownership — and the plane reports
+				// custody forever while the listener heartbeats its capacity.
 				p.forgetForRequestLocked(entry.requestID)
 
 				return nil
@@ -1396,12 +1388,11 @@ func (p *Plane) staleAfter() time.Duration {
 
 // expireStaleLocked drops nodes that have gone silent.
 //
-// NODES USED TO LIVE FOREVER, and lastSeen was written and never read. One host
-// that was unplugged a week ago stayed in the fleet, so every Destroy broadcast
-// waited out the full command timeout against it and returned an error — and the
-// listener answers a destroy error by holding its lease and heartbeating it
-// indefinitely. A single dead machine therefore made every subsequent completed
-// job leak its capacity, permanently.
+// A NODE THAT NEVER EXPIRES POISONS THE FLEET. One host unplugged a week ago
+// would stay in it, so every command aimed there waits out the full command
+// timeout and returns an error — and the listener answers a destroy error by
+// holding its lease and heartbeating it indefinitely, so a single dead machine
+// makes every later completed job leak its capacity.
 //
 // A node with commands IN FLIGHT is not expired at all — see the guard below —
 // so nothing here answers one, and custody is never transferred by expiry. What
@@ -1435,10 +1426,8 @@ func (p *Plane) expireStaleLocked() {
 		}
 
 		// NOTHING IN FLIGHT IS ANSWERED HERE, because the guard above means there
-		// is nothing in flight to answer. A loop doing exactly that used to sit at
-		// this line, unreachable, telling a reader that expiry hands custody of a
-		// running launch to the node. It does not, and it must not — that is the
-		// harm the guard was added to prevent.
+		// is nothing in flight to answer. Expiry must never hand custody of a
+		// running launch to the node.
 		//
 		// Queued commands never reached it, so they are unambiguous: nothing
 		// started, and the caller may act on that certainty.
