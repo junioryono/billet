@@ -1140,6 +1140,9 @@ no repository secrets.
 
 ## Updating a running host
 
+**No release has been cut, so there is no package to install yet** — the pipeline
+is built and untriggered. Until then this is a `go build` and a restart.
+
 ```bash
 sudo dpkg -i billet_NEW_linux_amd64.deb
 sudo systemctl restart billet-server

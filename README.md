@@ -121,6 +121,16 @@ sudo systemctl enable --now billet-node
 
 ## Updating
 
+**If you built from source** — the only path that works until a release is cut:
+
+```bash
+git pull && go build ./cmd/billet
+sudo install -m 0755 billet /usr/local/bin/billet   # wherever you put it
+sudo systemctl restart billet-server                # if you wrote your own unit
+```
+
+The two paths below need a published release, and there is not one yet.
+
 **If you installed the package:**
 
 ```bash
