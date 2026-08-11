@@ -599,8 +599,9 @@ func TestEscrowSurvivesAPollLongerThanTheLeaseTTL(t *testing.T) {
 // The session's statistics were being copied into a field that nothing read,
 // which is indistinguishable from not collecting them. On a restart, GitHub goes
 // on believing this scale set is running jobs whose runners died with the
-// process; they sit until the pickup deadline and are then reassigned, and from
-// the outside billet looks like it silently dropped them.
+// process. The ones no runner had picked up sit until the pickup deadline and
+// are then reassigned; the ones already running are not reassigned at all and
+// fail. From the outside billet looks like it silently dropped both.
 //
 // Recovering them needs a node runtime that can adopt a running instance, which
 // does not exist. Reporting them is what makes the gap visible rather than

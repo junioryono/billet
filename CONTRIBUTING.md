@@ -7,7 +7,7 @@ time.
 
 ```bash
 git clone https://github.com/junioryono/billet && cd billet
-make tools     # installs the pinned golangci-lint
+make tools     # installs the pinned golangci-lint and goreleaser
 make check     # build + vet + fmt + lint + race test
 ```
 
