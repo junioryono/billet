@@ -142,14 +142,19 @@ func TestAProviderOutsideTheListIsStillRefused(t *testing.T) {
 		t.Fatalf("Reserve: %v", err)
 	}
 
-	// THE BACKEND CHANGES UNDER THE RESERVATION, which is the window this check
-	// still guards. Placement will not aim an [firecracker, ec2] lease at a docker
-	// host — it is not a candidate — so the only way to reach Bind's provider
-	// check is for the chosen host to become something the tier does not accept,
-	// which it may do while no lease is BOUND to it.
-	if _, err := a.RegisterNode(t.Context(),
-		testRegistration("epyc-1", config.ProviderDocker)); err != nil {
-		t.Fatalf("the host could not change backend while merely targeted: %v", err)
+	// SEEDED, BECAUSE REGISTRATION NO LONGER ALLOWS IT. The backend changing under
+	// a reservation was the window this check guarded, and the registration guard
+	// now closes it: escrow names its machine, so a host with capacity outstanding
+	// cannot change backend even before anything binds. Bind's check stays as
+	// depth — it compares against the provider the node registered, not one a
+	// catalogue claims — so it is reached here the only way left.
+	if err := a.db.Tx(t.Context(), func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(t.Context(),
+			`UPDATE nodes SET provider = ? WHERE name = ?`, config.ProviderDocker, "epyc-1")
+
+		return err
+	}); err != nil {
+		t.Fatalf("seed the backend change: %v", err)
 	}
 
 	err = a.Bind(t.Context(), lease.ID, lease.Epoch, "epyc-1")

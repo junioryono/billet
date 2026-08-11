@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/internal/config"
 )
@@ -216,5 +217,132 @@ func TestANodeThatContributesNothingIsRefused(t *testing.T) {
 				t.Errorf("the error does not name what was missing: %v", err)
 			}
 		})
+	}
+}
+
+// A HOST DOES NOT MOVE OUT FROM UNDER CAPACITY THAT HAS ALREADY BEEN PROMISED
+// ON ITS BEHALF, which is a wider set of leases than the ones bound to it.
+//
+// The guard counted `leases.node`, and that column is only filled at bind. A
+// reservation is aimed at a machine well before then — escrow picks the host,
+// records it in target_node, and billet advertises the capacity to GitHub on
+// that basis. Between those two moments the guard saw nothing, so a host could
+// change site or backend while work was already inbound for it: the job arrives,
+// binds to a machine that has since moved buildings, and the placement that was
+// made against a cache in one site is now running in another.
+//
+// It is the same attribution the arithmetic uses everywhere else —
+// COALESCE(node, target_node) — and the guard was the one place still asking
+// only half the question.
+func TestAHostMayNotMoveWhileWorkIsMerelyAimedAtIt(t *testing.T) {
+	small := tier("small", 4, 16*config.GiB)
+	small.Provider = config.ProviderDocker
+
+	a := newBareAllocator(t, Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB},
+		[]config.Tier{small})
+
+	home := NodeRegistration{
+		Name: "epyc-1", Provider: config.ProviderDocker, Site: "home",
+		VCPU: 120, Memory: 480 * config.GiB,
+	}
+	if _, err := a.RegisterNode(t.Context(), home); err != nil {
+		t.Fatalf("RegisterNode: %v", err)
+	}
+
+	// RESERVED BUT NOT BOUND. This is the state billet spends most of its time
+	// in: the capacity is escrowed, the machine is chosen, and GitHub has been
+	// told the slot exists. Nothing has bound because no job has arrived yet.
+	if _, err := a.Reserve(t.Context(), "small"); err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	moved := home
+	moved.Site = "aws"
+
+	_, err := a.RegisterNode(t.Context(), moved)
+	if err == nil {
+		t.Fatal("a host moved site while capacity was already escrowed against it; the job " +
+			"that arrives for that slot will run in a different building from the cache it " +
+			"was placed against")
+	}
+
+	if !errors.Is(err, ErrWrongSite) {
+		t.Errorf("want ErrWrongSite, got %v", err)
+	}
+
+	// The provider guard reads the same column and was wrong the same way.
+	rebadged := home
+	rebadged.Provider = config.ProviderTart
+
+	if _, err := a.RegisterNode(t.Context(), rebadged); !errors.Is(err, ErrWrongProvider) {
+		t.Errorf("a host changed backend with capacity escrowed against it: %v", err)
+	}
+}
+
+// ESCROW LEFT BY A CRASH MUST NOT LOCK THE HOST OUT OF THE FLEET FOREVER.
+//
+// The guards refuse a site or backend change while work is outstanding, and that
+// is right for work that exists. An EXPIRED lease is not that: its holder
+// stopped heartbeating, and the reaper's whole job is to fail it. Counting it as
+// outstanding turns a crash into a permanent refusal to start.
+//
+// It is permanent, not merely slow, and the ordering is why. billet registers
+// the node BEFORE the server runs, and the reaper only runs inside the server —
+// so a registration refused on the strength of expired leases prevents the very
+// process that would have cleared them. Every restart meets the same wall, and
+// the only ways out are editing the config back or repairing the ledger by hand.
+//
+// So the guards ask about live work, using the same definition of expiry the
+// reaper does. A heartbeating lease still pins the host; an abandoned one does
+// not get a vote.
+func TestACrashedHostsExpiredEscrowDoesNotLockItOut(t *testing.T) {
+	now := time.Date(2026, time.August, 11, 12, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+
+	small := tier("small", 4, 16*config.GiB)
+	small.Provider = config.ProviderDocker
+
+	a := newBareAllocator(t, Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB},
+		[]config.Tier{small},
+		WithClock(func() time.Time { return clock() }),
+		WithLeaseTTL(30*time.Second))
+
+	home := NodeRegistration{
+		Name: "epyc-1", Provider: config.ProviderDocker, Site: "home",
+		VCPU: 64, Memory: 256 * config.GiB,
+	}
+	if _, err := a.RegisterNode(t.Context(), home); err != nil {
+		t.Fatalf("RegisterNode: %v", err)
+	}
+
+	if _, err := a.Reserve(t.Context(), "small"); err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	moved := home
+	moved.Site = "aws"
+
+	// While the escrow is live the host is pinned, which is the rule working.
+	if _, err := a.RegisterNode(t.Context(), moved); !errors.Is(err, ErrWrongSite) {
+		t.Fatalf("a live reservation stopped pinning the host: %v", err)
+	}
+
+	// THE PROCESS DIES. Nothing heartbeats, and the lease ages out — but nothing
+	// reaps it either, because the reaper lives in the server this registration
+	// is blocking.
+	now = now.Add(31 * time.Second)
+
+	if _, err := a.RegisterNode(t.Context(), moved); err != nil {
+		t.Errorf("a host could not rejoin the fleet because of escrow abandoned by a crash: "+
+			"%v — and nothing will ever clear it, because the reaper runs inside the server "+
+			"this registration has to succeed to start", err)
+	}
+
+	// The backend guard reads the same column and deadlocks the same way.
+	rebadged := moved
+	rebadged.Provider = config.ProviderTart
+
+	if _, err := a.RegisterNode(t.Context(), rebadged); err != nil {
+		t.Errorf("a host could not change backend after a crash left expired escrow: %v", err)
 	}
 }

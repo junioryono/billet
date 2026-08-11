@@ -1202,36 +1202,63 @@ func (a *Allocator) RegisterNode(ctx context.Context, reg NodeRegistration) (int
 		// would then be pointing later placements at storage in a different
 		// building from the containers already running.
 		//
+		// WORK MERELY AIMED HERE COUNTS TOO, which is why both guards attribute a
+		// lease the way the rest of the arithmetic does — COALESCE(node,
+		// target_node). `node` is filled at bind, but escrow chose the machine
+		// long before that and billet has already advertised the slot on its
+		// behalf. Counting only bound leases left the whole reserved-but-unbound
+		// window unguarded, and that window is where billet spends most of its
+		// time.
+		//
+		// EXPIRED WORK DOES NOT GET A VOTE, and leaving it one made a crash
+		// unrecoverable. A lease whose holder stopped heartbeating is what the
+		// reaper exists to fail — but billet registers the node BEFORE the server
+		// starts, and the reaper runs inside that server. A registration refused
+		// on the strength of expired leases therefore prevents the only process
+		// that could have cleared them, so every restart meets the same wall and
+		// the operator's only ways out are reverting the config or repairing the
+		// ledger by hand. The refusal message even promised the leases would
+		// "expire and be reaped", which was the one thing that could not happen.
+		//
+		// So the cutoff is the reaper's own: a lease still heartbeating pins the
+		// host, an abandoned one does not.
+		//
 		// Capacity is different and IS overwritten below. A host offering less has
 		// been reconfigured, which changes nothing about work already placed.
 		case currentSite != reg.Site:
-			var bound int
+			var outstanding int
 
 			if err := tx.QueryRowContext(ctx,
-				`SELECT COUNT(*) FROM leases WHERE node = ? AND phase NOT IN ('done','failed')`,
-				name).Scan(&bound); err != nil {
+				`SELECT COUNT(*) FROM leases
+				 WHERE COALESCE(node, target_node) = ?
+				   AND phase NOT IN ('done','failed')
+				   AND expires_at > ?`,
+				name, now).Scan(&outstanding); err != nil {
 				return fmt.Errorf("alloc: count the leases on node %s: %w", name, err)
 			}
 
-			if bound > 0 {
+			if outstanding > 0 {
 				return fmt.Errorf(
 					"%w: node %s is recorded at site %q and now reports %q, but %d lease(s) are "+
-						"still bound to it there. Put node.site back to %q and start billet; once "+
-						"those jobs finish (or their leases expire and are reaped) the host is "+
+						"still outstanding against it there. Put node.site back to %q and start "+
+						"billet; once those jobs finish (or their leases expire) the host is "+
 						"free to move",
-					ErrWrongSite, name, currentSite, reg.Site, bound, currentSite)
+					ErrWrongSite, name, currentSite, reg.Site, outstanding, currentSite)
 			}
 
 		case current != string(kind):
-			var bound int
+			var outstanding int
 
 			if err := tx.QueryRowContext(ctx,
-				`SELECT COUNT(*) FROM leases WHERE node = ? AND phase NOT IN ('done','failed')`,
-				name).Scan(&bound); err != nil {
+				`SELECT COUNT(*) FROM leases
+				 WHERE COALESCE(node, target_node) = ?
+				   AND phase NOT IN ('done','failed')
+				   AND expires_at > ?`,
+				name, now).Scan(&outstanding); err != nil {
 				return fmt.Errorf("alloc: count the leases on node %s: %w", name, err)
 			}
 
-			if bound > 0 {
+			if outstanding > 0 {
 				// THE WAY OUT IS SPELLED OUT, because this fires during startup —
 				// cmd registers the node before it recovers anything — so an
 				// operator who changes node.provider with work still bound finds
@@ -1240,10 +1267,10 @@ func (a *Allocator) RegisterNode(ctx context.Context, reg NodeRegistration) (int
 				// and billet is not running to accept one.
 				return fmt.Errorf(
 					"%w: node %s is registered as %q and now reports %q, but %d lease(s) are "+
-						"still bound to it and recorded the old backend. Put node.provider back "+
-						"to %q and start billet; once those jobs finish (or their leases expire "+
-						"and are reaped) the host is free to change",
-					ErrWrongProvider, name, current, kind, bound, current)
+						"still outstanding against it and recorded the old backend. Put "+
+						"node.provider back to %q and start billet; once those jobs finish (or "+
+						"their leases expire) the host is free to change",
+					ErrWrongProvider, name, current, kind, outstanding, current)
 			}
 		}
 
