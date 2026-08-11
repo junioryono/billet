@@ -41,7 +41,7 @@ func TestRegistrationRecordsWhatTheNodeContributes(t *testing.T) {
 		Memory:   480 * config.GiB,
 	}
 
-	if err := a.RegisterNode(t.Context(), reg); err != nil {
+	if _, err := a.RegisterNode(t.Context(), reg); err != nil {
 		t.Fatalf("RegisterNode: %v", err)
 	}
 
@@ -84,14 +84,14 @@ func TestAHostMayContributeLessThanItDidBefore(t *testing.T) {
 		Name: "epyc-1", Provider: config.ProviderDocker,
 		VCPU: 120, Memory: 480 * config.GiB,
 	}
-	if err := a.RegisterNode(t.Context(), first); err != nil {
+	if _, err := a.RegisterNode(t.Context(), first); err != nil {
 		t.Fatalf("first RegisterNode: %v", err)
 	}
 
 	second := first
 	second.VCPU, second.Memory = 8, 32*config.GiB
 
-	if err := a.RegisterNode(t.Context(), second); err != nil {
+	if _, err := a.RegisterNode(t.Context(), second); err != nil {
 		t.Fatalf("re-registering smaller: %v", err)
 	}
 
@@ -140,7 +140,7 @@ func TestAHostMayNotMoveSiteWhileWorkIsBoundToIt(t *testing.T) {
 		Name: "epyc-1", Provider: config.ProviderDocker, Site: "home",
 		VCPU: 120, Memory: 480 * config.GiB,
 	}
-	if err := a.RegisterNode(t.Context(), home); err != nil {
+	if _, err := a.RegisterNode(t.Context(), home); err != nil {
 		t.Fatalf("RegisterNode: %v", err)
 	}
 
@@ -148,11 +148,11 @@ func TestAHostMayNotMoveSiteWhileWorkIsBoundToIt(t *testing.T) {
 	moved := home
 	moved.Site = "aws"
 
-	if err := a.RegisterNode(t.Context(), moved); err != nil {
+	if _, err := a.RegisterNode(t.Context(), moved); err != nil {
 		t.Fatalf("an idle host was not allowed to move: %v", err)
 	}
 
-	if err := a.RegisterNode(t.Context(), home); err != nil {
+	if _, err := a.RegisterNode(t.Context(), home); err != nil {
 		t.Fatalf("moving back: %v", err)
 	}
 
@@ -165,7 +165,7 @@ func TestAHostMayNotMoveSiteWhileWorkIsBoundToIt(t *testing.T) {
 		t.Fatalf("Bind: %v", err)
 	}
 
-	err = a.RegisterNode(t.Context(), moved)
+	_, err = a.RegisterNode(t.Context(), moved)
 	if err == nil {
 		t.Fatal("a host moved site while a lease was still bound to it")
 	}
@@ -206,7 +206,7 @@ func TestANodeThatContributesNothingIsRefused(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			err := a.RegisterNode(t.Context(), tc.reg)
+			_, err := a.RegisterNode(t.Context(), tc.reg)
 			if err == nil {
 				t.Fatal("a node contributing nothing was registered")
 			}

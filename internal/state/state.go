@@ -520,10 +520,29 @@ var nodeSiteMigration = migration{
 	},
 }
 
+// WHETHER A HOST IS REACHABLE IS NOW A FACT THE LEDGER NEEDS, because capacity
+// is counted here and a machine that is gone must stop backing advertisements.
+//
+// SEPARATE FROM `drained`, which is a different state: draining is a host that
+// is finishing its work and taking no more, and it is still there. This is the
+// plane's judgement about whether it is there at all.
+//
+// DEFAULTS TO 0, so a ledger written by an older billet trusts nothing until
+// each node registers again — which is the same conservative start a restart
+// gets, and the correct one: liveness is the plane's judgement and a plane that
+// has just started has not formed one.
+var nodeLivenessMigration = migration{
+	Version: 11,
+	Name:    "node_liveness",
+	Stmts: []string{
+		`ALTER TABLE nodes ADD COLUMN live INTEGER NOT NULL DEFAULT 0 CHECK (live IN (0, 1))`,
+	},
+}
+
 func init() {
 	migrations = append(migrations,
 		placementMigration, guestOSMigration, placementFactsMigration, requestIDMigration,
-		providerListMigration, nodeSiteMigration)
+		providerListMigration, nodeSiteMigration, nodeLivenessMigration)
 }
 
 const bootstrapSchemaMigrations = `CREATE TABLE IF NOT EXISTS schema_migrations (

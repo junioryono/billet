@@ -124,6 +124,14 @@ type node struct {
 	guestOS     []config.GuestOS
 	lastSeen    time.Time
 
+	// ledgerEpoch is the fencing token the ledger gave this registration.
+	//
+	// Carried so expiry can say WHICH incarnation it is giving up on. Without it
+	// a "this node is gone" written after the host has already come back would
+	// mark the live one dead — registration commits to the ledger before taking
+	// this mutex, so that ordering is reachable rather than theoretical.
+	ledgerEpoch int64
+
 	// queue holds commands not yet handed to the node.
 	queue []*pending
 	// inflight holds commands handed over but not yet answered, by command id.
@@ -345,6 +353,75 @@ func New(log *slog.Logger, deployment string, leaseTTL time.Duration, opts ...Op
 	return p
 }
 
+// Watch expires silent nodes until the context ends.
+//
+// A TIMER, BECAUSE NOTHING ELSE ASKS. Expiry used to run only where the answer
+// was needed — picking a node, listing the fleet, broadcasting a destroy — which
+// was enough while its only job was to keep those three from consulting a
+// corpse. It is not enough now: a node's liveness decides what its tier
+// ADVERTISES, and an idle deployment does none of those three things. A host
+// that crashes on a quiet afternoon would keep its capacity advertised until
+// somebody happened to launch something, and GitHub would go on assigning
+// against a machine that is not there.
+//
+// Half the silence window, so a node is noticed within about one and a half of
+// them rather than up to two.
+func (p *Plane) Watch(ctx context.Context) {
+	every := p.staleAfter() / 2
+	if every <= 0 {
+		return
+	}
+
+	t := time.NewTicker(every)
+	defer t.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			p.mu.Lock()
+			gone := p.expireStaleLocked()
+			p.mu.Unlock()
+
+			p.recordGone(ctx, gone)
+		}
+	}
+}
+
+// goneNode is a host the plane has given up on, with the epoch it had.
+//
+// The epoch travels with the name because by the time this is written the node
+// may have registered again — a fast restart — and the write must then match
+// nothing rather than kill the incarnation that replaced it.
+type goneNode struct {
+	name  string
+	epoch int64
+}
+
+// recordGone tells the ledger about hosts the plane has forgotten.
+//
+// OUTSIDE p.mu, which is the whole reason expiry reports rather than writes: a
+// database write while holding that mutex stalls every launch and every poll for
+// as long as the database takes.
+//
+// Best effort. A failure leaves the ledger believing in a node for longer than
+// it should — corrected by the next registration, the next tick, or a restart —
+// and there is nobody here to return an error to.
+func (p *Plane) recordGone(ctx context.Context, gone []goneNode) {
+	if p.registrar == nil {
+		return
+	}
+
+	for _, g := range gone {
+		if err := p.registrar.NodeGone(ctx, g.name, g.epoch); err != nil {
+			p.log.Warn("could not record that a node is gone; its capacity stays advertised "+
+				"until it registers again or this control plane restarts",
+				"node", g.name, "error", err)
+		}
+	}
+}
+
 // Registrar is the ledger's node table.
 //
 // A NODE IS NOT REGISTERED UNTIL THE LEDGER SAYS SO. The plane's own map decides
@@ -353,7 +430,18 @@ func New(log *slog.Logger, deployment string, leaseTTL time.Duration, opts ...Op
 // commands and then had every Bind refused — which looked like a broken node
 // rather than a missing row.
 type Registrar interface {
-	RegisterNode(ctx context.Context, reg alloc.NodeRegistration) error
+	// RegisterNode records the host and returns the row's new fencing epoch, which
+	// NodeGone must present to prove which incarnation it is talking about.
+	RegisterNode(ctx context.Context, reg alloc.NodeRegistration) (int64, error)
+
+	// NodeGone records that this control plane has given up on a host. Fenced on
+	// the epoch, so an expiry that lands after the node has already come back
+	// matches nothing.
+	NodeGone(ctx context.Context, name string, epoch int64) error
+
+	// ForgetEveryNode marks the whole fleet unreachable, for a plane that has just
+	// started and has no judgement about anything yet.
+	ForgetEveryNode(ctx context.Context) error
 }
 
 // sortedSites lists the declared places in a stable order, so a refusal naming
@@ -391,6 +479,19 @@ func WithSites(names []string) Option {
 
 // WithRegistrar makes registration durable in the ledger as well as in memory.
 func WithRegistrar(r Registrar) Option { return func(p *Plane) { p.registrar = r } }
+
+// WithPollTimeout sets the long-poll window a node is told to wait out.
+//
+// It also sets how long silence has to last before a node is forgotten, and
+// therefore how often Watch looks — see staleAfter. Shortening it in a test is
+// what makes expiry observable without waiting out the real window.
+func WithPollTimeout(d time.Duration) Option {
+	return func(p *Plane) {
+		if d > 0 {
+			p.poll = d
+		}
+	}
+}
 
 // Register records a node's claim about itself.
 //
@@ -463,6 +564,11 @@ func (p *Plane) Register(
 	// Bind refused — the failure looks like a broken node instead of a missing
 	// row. Doing it first means a ledger that refuses leaves the plane unchanged,
 	// so the node retries registration rather than believing it succeeded.
+	// Scoped outside the registrar block: a plane without one (tests, and the
+	// in-process path) has no ledger to fence against, and zero is the epoch a
+	// node that was never recorded would carry anyway.
+	var epoch int64
+
 	if p.registrar != nil {
 		reg := alloc.NodeRegistration{
 			Name:     req.Node,
@@ -472,7 +578,10 @@ func (p *Plane) Register(
 			Memory:   req.Memory,
 		}
 
-		if err := p.registrar.RegisterNode(ctx, reg); err != nil {
+		var err error
+
+		epoch, err = p.registrar.RegisterNode(ctx, reg)
+		if err != nil {
 			// NOT WRAPPED IN ErrRefused. A ledger that cannot write is an outage,
 			// not a verdict: the same node with the same config will succeed once
 			// the database answers again, and a node that gave up here would stay
@@ -547,6 +656,7 @@ func (p *Plane) Register(
 	n.provider = req.Provider
 	n.guestOS = req.GuestOS
 	n.lastSeen = p.now()
+	n.ledgerEpoch = epoch
 
 	return nodeapi.RegisterResponse{
 		Version:         nodeapi.Version,
@@ -1216,7 +1326,9 @@ func (p *Plane) staleAfter() time.Duration {
 // so nothing here answers one, and custody is never transferred by expiry. What
 // is answered is the QUEUE: those commands never reached the node, so a caller
 // waiting on a machine that is gone is told plainly that nothing started.
-func (p *Plane) expireStaleLocked() {
+func (p *Plane) expireStaleLocked() []goneNode {
+	var gone []goneNode
+
 	cutoff := p.now().Add(-p.staleAfter())
 
 	for name, n := range p.nodes {
@@ -1262,8 +1374,22 @@ func (p *Plane) expireStaleLocked() {
 		p.log.Warn("forgetting a node that stopped polling; it will have to register again",
 			"node", name, "silent_for", p.now().Sub(n.lastSeen))
 
+		// REPORTED, NOT WRITTEN. The ledger has to learn this too — capacity is
+		// counted there, and a node the plane has forgotten while the ledger still
+		// believes in it goes on backing advertisements for a machine nothing can
+		// reach. But this runs holding p.mu, and a database write under that mutex
+		// stalls every launch and every poll for as long as the database takes.
+		//
+		// So the fact is handed back and Watch records it with the lock released.
+		// Callers that expire as a side effect of doing something else discard it;
+		// the timer reconciles within a tick, and until it does the ledger is
+		// merely behind rather than wrong.
+		gone = append(gone, goneNode{name: name, epoch: n.ledgerEpoch})
+
 		delete(p.nodes, name)
 	}
+
+	return gone
 }
 
 // pick chooses a node for a lease.

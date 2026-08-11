@@ -39,6 +39,32 @@ type fakeRegistrar struct {
 	// last is the whole registration, so a wire test can prove the fields
 	// actually arrived rather than only that a name did.
 	last alloc.NodeRegistration
+
+	epoch     int64
+	goneName  string
+	goneEpoch int64
+	forgotten bool
+}
+
+// gone records which node the plane gave up on, and at which epoch.
+func (f *fakeRegistrar) NodeGone(_ context.Context, name string, epoch int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.goneName, f.goneEpoch = name, epoch
+
+	return nil
+}
+
+// ForgetEveryNode is what a restarted control plane calls before it trusts
+// anything.
+func (f *fakeRegistrar) ForgetEveryNode(_ context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.forgotten = true
+
+	return nil
 }
 
 // lastRegistration is what the plane most recently handed the ledger.
@@ -49,20 +75,21 @@ func (f *fakeRegistrar) lastRegistration() alloc.NodeRegistration {
 	return f.last
 }
 
-func (f *fakeRegistrar) RegisterNode(_ context.Context, reg alloc.NodeRegistration) error {
+func (f *fakeRegistrar) RegisterNode(_ context.Context, reg alloc.NodeRegistration) (int64, error) {
 	name := reg.Name
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	if f.err != nil {
-		return f.err
+		return 0, f.err
 	}
 
 	f.accepted = append(f.accepted, name)
 	f.last = reg
+	f.epoch++
 
-	return nil
+	return f.epoch, nil
 }
 
 func (f *fakeRegistrar) names() []string {

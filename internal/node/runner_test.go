@@ -510,7 +510,7 @@ func newAllocatorForTiers(t *testing.T, db *state.DB, tiers ...config.Tier) (*al
 
 	const host = "test-host"
 
-	if err := a.RegisterNode(t.Context(), alloc.NodeRegistration{Name: host, Provider: config.ProviderDocker, VCPU: testNodeVCPU, Memory: testNodeMemory}); err != nil {
+	if _, err := a.RegisterNode(t.Context(), alloc.NodeRegistration{Name: host, Provider: config.ProviderDocker, VCPU: testNodeVCPU, Memory: testNodeMemory}); err != nil {
 		t.Fatalf("RegisterNode: %v", err)
 	}
 
@@ -829,7 +829,7 @@ func TestSweepDestroysAnInstanceBoundToAnotherNode(t *testing.T) {
 	p := &fakeProvider{kind: config.ProviderDocker}
 	a, host := newAllocatorWithHost(t)
 
-	if err := a.RegisterNode(t.Context(), alloc.NodeRegistration{Name: "other-host", Provider: config.ProviderDocker, VCPU: testNodeVCPU, Memory: testNodeMemory}); err != nil {
+	if _, err := a.RegisterNode(t.Context(), alloc.NodeRegistration{Name: "other-host", Provider: config.ProviderDocker, VCPU: testNodeVCPU, Memory: testNodeMemory}); err != nil {
 		t.Fatalf("RegisterNode: %v", err)
 	}
 
