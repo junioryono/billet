@@ -1454,28 +1454,37 @@ func (p *Plane) pick(lease *alloc.Lease) (*node, error) {
 	// stale node cannot be picked even once.
 	p.expireStaleLocked()
 
+	// COALESCE(node, target_node), the same attribution the ledger uses. The two
+	// answer different questions — target_node is where placement decided the work
+	// goes, node is where it actually went — and the BOUND one wins, because that
+	// is where the container already is. Resolving only the target let a bound
+	// lease be launched on a different host.
+	if pinned := lease.Node; pinned != "" {
+		return p.pinnedLocked(lease, pinned, "bound to")
+	}
+
 	if lease.TargetNode != "" {
-		n, ok := p.nodes[lease.TargetNode]
-		if !ok {
-			return nil, fmt.Errorf("%w: lease %s is pinned to node %q, which is not registered",
-				ErrNoNode, lease.ID, lease.TargetNode)
-		}
-
-		if !acceptsProvider(n, lease) {
-			return nil, fmt.Errorf(
-				"%w: lease %s is pinned to node %q, which runs %s and the lease may not use it",
-				ErrNoNode, lease.ID, n.name, n.provider)
-		}
-
-		return n, nil
+		return p.pinnedLocked(lease, lease.TargetNode, "pinned to")
 	}
 
 	// IN THE LEASE'S OWN ORDER OF PREFERENCE. Providers is most-preferred-first,
 	// so walking it rather than the node map is what makes the preference mean
-	// anything — iterating a map would pick by hash order.
+	// anything.
+	//
+	// BY NAME WITHIN A PROVIDER, because the node map iterates in hash order: two
+	// identical fleets would otherwise place the same lease differently, which
+	// cannot be reproduced from a log. Escrow already names a machine for every
+	// reservation, so this runs only for a lease that carries neither.
+	names := make([]string, 0, len(p.nodes))
+	for name := range p.nodes {
+		names = append(names, name)
+	}
+
+	slices.Sort(names)
+
 	for _, want := range lease.Providers {
-		for _, n := range p.nodes {
-			if n.provider == want && acceptsGuestOS(n, lease) {
+		for _, name := range names {
+			if n := p.nodes[name]; n.provider == want && acceptsGuestOS(n, lease) {
 				return n, nil
 			}
 		}
@@ -1483,6 +1492,33 @@ func (p *Plane) pick(lease *alloc.Lease) (*node, error) {
 
 	return nil, fmt.Errorf("%w: lease %s needs one of %v and no registered node offers it",
 		ErrNoNode, lease.ID, lease.Providers)
+}
+
+// pinnedLocked resolves a lease that names its machine. Caller holds p.mu.
+func (p *Plane) pinnedLocked(lease *alloc.Lease, name, how string) (*node, error) {
+	n, ok := p.nodes[name]
+	if !ok {
+		return nil, fmt.Errorf("%w: lease %s is %s node %q, which is not registered",
+			ErrNoNode, lease.ID, how, name)
+	}
+
+	if !acceptsProvider(n, lease) {
+		return nil, fmt.Errorf(
+			"%w: lease %s is %s node %q, which runs %s and the lease may not use it",
+			ErrNoNode, lease.ID, how, n.name, n.provider)
+	}
+
+	return n, nil
+}
+
+// PickForTest reports which node a lease would be aimed at.
+func (p *Plane) PickForTest(lease *alloc.Lease) (string, error) {
+	n, err := p.pick(lease)
+	if err != nil {
+		return "", err
+	}
+
+	return n.name, nil
 }
 
 func acceptsProvider(n *node, lease *alloc.Lease) bool {
