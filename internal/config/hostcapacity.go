@@ -29,11 +29,16 @@ func DetectHostCapacity() (int, ByteSize, error) {
 		return 0, 0, err
 	}
 
-	// NumCPU is what the Go runtime may actually schedule on, which is the honest
-	// answer for a bare-metal node: it follows CPU affinity, so a host confined to
-	// half its cores reports half. It does NOT follow a cgroup CPU quota, which
-	// matters only if billet itself is containerised — and a node is the thing
-	// running containers, not a thing inside one.
+	// NumCPU is what the Go runtime may schedule on, which is the honest answer
+	// for a bare-metal node. Three qualifications, because none of them is
+	// visible from the call: on Linux it is the affinity mask read at process
+	// START, so narrowing a running billet's affinity does not change it; on
+	// Darwin it is hw.ncpu; and on neither does it follow a cgroup CPU quota, so
+	// a process limited to 2 of 64 still reports 64.
+	//
+	// That last one only matters if billet itself is containerised, and a node is
+	// the thing running containers rather than a thing inside one. An operator who
+	// does containerise it sets node.max_vcpu, which is what that key is for.
 	return runtime.NumCPU(), memory, nil
 }
 
