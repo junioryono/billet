@@ -1234,6 +1234,171 @@ func TestKeepAliveRenewsHeldLeasesWhileTendIsBlocked(t *testing.T) {
 	}
 }
 
+// A LAUNCH IN PROGRESS IS RENEWED, because for its whole duration nobody else
+// is doing it.
+//
+// Across the wire the control plane stops waiting after its command timeout and
+// hands the listener custody, which stops the listener heartbeating. The node is
+// meanwhile still inside provider.Launch — pulling a large image, say — and does
+// not adopt anything until that call returns. Between those two moments the
+// lease had no owner: the reaper released its capacity, the allocator sold it to
+// another job, and then the launch completed and started a second workload on
+// hardware that was already spoken for.
+func TestALaunchInProgressKeepsItsLeaseRenewed(t *testing.T) {
+	t.Parallel()
+
+	// A provider that blocks inside Launch, which is the whole situation.
+	p := &fakeProvider{
+		kind:          config.ProviderDocker,
+		launchDelay:   time.Hour,
+		enteredLaunch: make(chan struct{}, 1),
+	}
+
+	a, host := newAllocatorWithHost(t)
+
+	store := &brittleStore{LeaseStore: a}
+	r := New(store, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r.ttl = func() time.Duration { return 30 * time.Millisecond }
+
+	lease := assignedLease(t, a)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	go func() {
+		//nolint:errcheck // it is expected to block, not to return
+		_ = r.Launch(ctx, lease, Job{RequestID: 11, Event: "push"})
+	}()
+
+	select {
+	case <-p.enteredLaunch:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the provider was never asked to launch")
+	}
+
+	before := store.heartbeats.Load()
+
+	go r.KeepAlive(ctx)
+
+	// SEVERAL renewals, not one: one could be a coincidence of ordering.
+	const want = 3
+
+	deadline := time.Now().Add(15 * time.Second)
+
+	for store.heartbeats.Load() < before+want {
+		if time.Now().After(deadline) {
+			t.Fatalf("a lease whose launch is still running was renewed %d times, want at "+
+				"least %d; nothing holds it while the provider works, so the reaper "+
+				"reclaims its capacity and the launch lands on hardware already resold",
+				store.heartbeats.Load()-before, want)
+		}
+
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// THE JANITOR FOLLOWS A RENEGOTIATED TTL, because the plane can shorten it.
+//
+// The TTL is agreed at registration, and a node re-registers whenever the
+// control plane forgets it or restarts. A plane that comes back advertising a
+// SHORTER TTL leaves a janitor built on the old one renewing too slowly: the
+// lease expires between two heartbeats, the reaper resells its capacity, and the
+// container it was holding is still running.
+//
+// The janitor is deliberately started once — custody outlives any single
+// registration — so re-reading the value each cycle is the only place that
+// correction can happen.
+func TestKeepAliveFollowsAShortenedLeaseTTL(t *testing.T) {
+	t.Parallel()
+
+	p := &fakeProvider{kind: config.ProviderDocker}
+
+	a, host := newAllocatorWithHost(t)
+
+	warm := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	lease := assignedLease(t, a)
+
+	if err := warm.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	store := &brittleStore{LeaseStore: a}
+	r := New(store, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
+	if err := r.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+
+	// A CADENCE NO TEST COULD OUTLIVE, deliberately. If the janitor does not pull
+	// its deadline in, the next renewal is a hundred seconds away and this test
+	// simply never sees one — which makes the assertion below structural rather
+	// than a race against a stopwatch. An earlier version asserted three renewals
+	// inside 600ms and flaked under an instrumented parallel run, where a
+	// goroutine can go unscheduled for longer than that.
+	var (
+		ttl   atomic.Int64
+		reads atomic.Int64
+	)
+
+	ttl.Store(int64(300 * time.Second)) // renew every 100 seconds
+
+	r.ttl = func() time.Duration {
+		reads.Add(1)
+
+		return time.Duration(ttl.Load())
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	go r.KeepAlive(ctx)
+
+	// WAIT UNTIL THE JANITOR HAS READ THE LONG TTL, which is the moment it is
+	// committed to that cadence, and the only thing that makes shortening it a
+	// test of adaptation rather than of scheduling order.
+	//
+	// This took three attempts. The first stored the short value immediately
+	// after starting the goroutine, so the goroutine usually read the SHORT one on
+	// its first pass. The second waited for a heartbeat — and Recover had already
+	// heartbeated while adopting, so the wait returned instantly and the race was
+	// exactly as before. Counting the janitor's own reads is the signal that
+	// cannot be satisfied by anything else.
+	armedBy := time.Now().Add(15 * time.Second)
+	for reads.Load() == 0 {
+		if time.Now().After(armedBy) {
+			t.Fatal("the janitor never read the lease TTL, so it never armed")
+		}
+
+		time.Sleep(time.Millisecond)
+	}
+
+	before := store.heartbeats.Load()
+
+	// The plane comes back with a much shorter TTL, as a restarted or
+	// reconfigured control plane does.
+	ttl.Store(int64(30 * time.Millisecond))
+
+	// SEVERAL renewals, not one: one could be a single fire of a timer that then
+	// went back to the hundred-second cadence.
+	const want = 3
+
+	// Generous, because the discrimination is structural: without the pull-in the
+	// next renewal is a hundred seconds out, so no amount of waiting here would
+	// produce one.
+	deadline := time.Now().Add(10 * time.Second)
+
+	for store.heartbeats.Load() < before+want {
+		if time.Now().After(deadline) {
+			t.Fatalf("the janitor renewed %d times in the ten seconds after the TTL was "+
+				"shortened, want at least %d; its timer is still armed for the cadence it "+
+				"held when the TTL changed, so a lease can expire between heartbeats while "+
+				"its container runs", store.heartbeats.Load()-before, want)
+		}
+
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // KeepAlive stops when its context does, rather than outliving the process it
 // belongs to.
 func TestKeepAliveStopsWithItsContext(t *testing.T) {
@@ -1612,5 +1777,110 @@ func TestAStrayThatAppearsBecomesObserved(t *testing.T) {
 	if len(r.heldLeases()) != 0 {
 		t.Error("held capacity for an instance billet had seen and then found gone, " +
 			"waiting out a grace period meant for compute that may never have started")
+	}
+}
+
+// AN ORDINARY RUNNING JOB IS SOMETHING THIS NODE IS HOLDING.
+//
+// Custody is compute billet cannot account for; launching is compute it is
+// creating. A job that started cleanly and is running right now is neither — and
+// it is exactly as much this process's responsibility, because its completion
+// will be routed here and nowhere else.
+//
+// Leaving it out meant a superseded node with a healthy running job saw "holding
+// nothing", exited, and left a container whose completion now reaches a
+// replacement that cannot see it: that Destroy finds nothing, reports success,
+// and the lease is released under a running job.
+func TestAnOrdinaryRunningJobCountsAsHolding(t *testing.T) {
+	t.Parallel()
+
+	p := &fakeProvider{kind: config.ProviderDocker}
+
+	a, host := newAllocatorWithHost(t)
+
+	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+
+	if r.Holding() {
+		t.Fatal("a node with nothing running reported that it was holding something")
+	}
+
+	lease := assignedLease(t, a)
+
+	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	if !r.Holding() {
+		t.Error("a node running a job it launched cleanly reported that it was holding " +
+			"nothing; superseded, it would exit and leave that container's lease to a " +
+			"replacement that cannot see it")
+	}
+}
+
+// SUPERSESSION TURNS RUNNING WORK INTO CUSTODY, which is what lets a drain end.
+//
+// After supersession the control plane routes a job's completion to whichever
+// process owns the node's name. For a container running HERE that is the
+// replacement, which cannot see it, reports the destroy as done, and lets the
+// lease be released under a running job. Nothing on this side would ever finish
+// it either: Tend is what confirms compute gone and releases its lease, and Tend
+// looks only at custody.
+func TestSupersessionMovesRunningWorkIntoCustody(t *testing.T) {
+	t.Parallel()
+
+	p := &fakeProvider{kind: config.ProviderDocker}
+
+	a, host := newAllocatorWithHost(t)
+
+	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	lease := assignedLease(t, a)
+
+	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	if got := len(r.custodySnapshot()); got != 0 {
+		t.Fatalf("a cleanly launched job was already in custody: %d", got)
+	}
+
+	r.Superseded()
+
+	held := r.custodySnapshot()
+	if len(held) != 1 {
+		t.Fatalf("supersession left %d entries in custody, want the running job", len(held))
+	}
+
+	if held[0].leaseID != lease.ID {
+		t.Errorf("custody holds lease %q, want %q", held[0].leaseID, lease.ID)
+	}
+
+	// DONE, not failed: the job launched cleanly and is running. What changed is
+	// who may talk about it, not whether it worked — and writing "failed" into
+	// the durable history for a job that ran is a lie a later investigation would
+	// have to unpick.
+	if held[0].outcome != alloc.PhaseDone {
+		t.Errorf("custody records outcome %q for a job that launched cleanly, want done",
+			held[0].outcome)
+	}
+
+	// And it is idempotent, because a drain may call it more than once.
+	r.Superseded()
+
+	if got := len(r.custodySnapshot()); got != 1 {
+		t.Errorf("a second supersession produced %d custody entries, want 1", got)
+	}
+
+	// MOVED, NOT COPIED, which is the assertion that matters and the one the
+	// first version of this test left out. Once Tend has confirmed the compute
+	// gone and dropped the custody entry, this process must be holding nothing —
+	// an entry left behind in `running` keeps Holding() true forever and the
+	// drain can never end.
+	r.mu.Lock()
+	r.custody = map[string]*custody{}
+	r.mu.Unlock()
+
+	if r.Holding() {
+		t.Error("after its custody was discharged the node still reported that it was " +
+			"holding something; a superseded process in that state drains forever")
 	}
 }

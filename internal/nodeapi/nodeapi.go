@@ -1,0 +1,190 @@
+// Package nodeapi is the wire between a control plane and a compute host.
+//
+// THE NODE DIALS OUT AND NEVER LISTENS, which is the property the whole
+// deployment story rests on: a host behind NAT, on a home network, or in a
+// locked-down VPC needs no inbound reachability, no port forward and no tunnel.
+// GitHub's own runner works this way and so does billet's scale-set listener, so
+// this is the third place in the codebase using the same shape rather than a new
+// idea.
+//
+// That inverts the obvious client/server roles for half the traffic. The server
+// has work for the node — launch this, destroy that — but cannot call it, so the
+// node long-polls for commands. Everything else (registering, reading and
+// writing leases) is an ordinary request in the direction the connection was
+// opened.
+//
+// WHY NOT gRPC: billet already speaks long-poll to GitHub and already has to
+// reason about its failure modes — a poll that outlives its lease TTL, a
+// redelivered message, a session that ends mid-poll. Reusing that shape means
+// one set of failure modes to understand instead of two, and keeps the single
+// static binary free of a protobuf toolchain.
+package nodeapi
+
+import (
+	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/config"
+)
+
+// Version is the protocol version a node announces when it registers.
+//
+// A node and a server are separately deployed and WILL be different builds —
+// that is the point of splitting them — so the mismatch has to be a refusal with
+// a readable message rather than a decode error halfway through a launch.
+const Version = 1
+
+// CommandKind names what the server is asking a node to do.
+type CommandKind string
+
+const (
+	// CommandLaunch starts compute for a lease that is already durable and
+	// already counted against the budget.
+	CommandLaunch CommandKind = "launch"
+	// CommandDestroy removes whatever a launch started for a request.
+	CommandDestroy CommandKind = "destroy"
+	// CommandSweep asks a node to destroy compute whose lease is no longer open.
+	//
+	// EXISTS BECAUSE REAPING IS WHAT MAKES AN ORPHAN. The control plane sweeps
+	// after every reap — the lease it just terminalised is exactly what leaves a
+	// container unaccounted for — and it cannot enumerate a remote host itself.
+	// Without this the causal link is broken by the split: the server would reap,
+	// and the node would notice minutes later on a timer of its own, if at all.
+	CommandSweep CommandKind = "sweep"
+	// CommandTend advances the compute a node is holding capacity for.
+	//
+	// The companion to sweep for custody: adopted work that has finished, and
+	// discarded work whose cleanup is now confirmed. The node runs this on its own
+	// cadence too; the command is what keeps it tied to the server's reap.
+	CommandTend CommandKind = "tend"
+)
+
+// RegisterRequest is a node introducing itself.
+//
+// Every field is a CLAIM, not a fact. The server records what a node says about
+// itself and validates it against its own configuration — a node cannot talk its
+// way into more capacity than the operator gave it, because the ledger's limits
+// come from the server's config and never from here.
+type RegisterRequest struct {
+	Version  int                 `json:"version"`
+	Node     string              `json:"node"`
+	Provider config.ProviderKind `json:"provider"`
+	// GuestOS is what this host can boot. Placement already checks it at Bind;
+	// sending it lets the server refuse an obviously wrong pairing at
+	// registration instead of at the first launch.
+	GuestOS []config.GuestOS `json:"guest_os,omitempty"`
+	// Deployment is the identity the node labels its compute with. Sent so the
+	// server can refuse a node that belongs to a different installation rather
+	// than accepting commands it will label unrecognisably.
+	Deployment string `json:"deployment"`
+	// Incarnation is a fresh random value for THIS node process.
+	//
+	// IT DISTINGUISHES A RESTART FROM A DUPLICATE, which the node name alone
+	// cannot. A name is configuration and a certificate can be copied, so two
+	// hosts can arrive claiming to be the same node — and once they have, the
+	// control plane's answer to "whose compute is this" is a coin toss. Commands
+	// go to whichever polled last, and each host's reconciliation reasons about
+	// leases the other one owns.
+	//
+	// A restart is the benign case and looks identical at the name level: the new
+	// process supersedes the old, which is gone. What separates them is whether
+	// the OLD incarnation keeps talking afterwards, and that is a question only a
+	// per-process value can answer.
+	Incarnation string `json:"incarnation"`
+}
+
+// RegisterResponse tells a node what it needs to behave correctly.
+type RegisterResponse struct {
+	Version int `json:"version"`
+	// LeaseTTLSeconds is how long a lease survives without a heartbeat. The node
+	// needs it to pick its own renewal cadence; it is NOT free to invent one,
+	// because the reaper on the other side is what enforces it.
+	LeaseTTLSeconds int `json:"lease_ttl_seconds"`
+	// PollSeconds bounds a command long-poll, so a node and a server agree on
+	// when silence means "nothing to do" rather than "the connection is dead".
+	PollSeconds int `json:"poll_seconds"`
+}
+
+// HeaderIncarnation carries the node process's identity on every request.
+//
+// A HEADER RATHER THAN A BODY FIELD, because it has to be on requests that have
+// no body — the long poll, the lease reads — and on every one of them. The
+// registration is where an incarnation is CLAIMED; this is how each later
+// request proves it is still the process that claimed it.
+const HeaderIncarnation = "Billet-Incarnation"
+
+// Command is one instruction, delivered in answer to a long poll.
+//
+// ID exists so the node can report the outcome of a specific instruction and so
+// a REDELIVERY is recognisable. Redelivery is expected rather than exceptional:
+// a node that dies between receiving a launch and reporting it will be told
+// again, and the runner's adoption path is what makes that safe.
+type Command struct {
+	ID   string      `json:"id"`
+	Kind CommandKind `json:"kind"`
+
+	// Lease is carried in full for a launch rather than by id.
+	//
+	// The node needs vCPU, memory, guest OS and provider to start anything, and
+	// fetching them separately would open a window where the lease changed
+	// between the command and the read. It also keeps a launch answerable from
+	// one message, which is what makes redelivery idempotent.
+	Lease *alloc.Lease `json:"lease,omitempty"`
+	Job   *Job         `json:"job,omitempty"`
+
+	// RequestID is what a destroy names. Destroy is by request rather than by
+	// lease because it must work for compute whose lease is already gone.
+	RequestID int64 `json:"request_id,omitempty"`
+}
+
+// RequestIDOf is the request a command concerns, wherever it is carried.
+//
+// A destroy names the request directly; a launch carries it inside the job. The
+// two spellings exist because a destroy must work for compute whose lease is
+// already gone, and asking each caller to remember which field applies is how
+// one of them reads the wrong zero.
+func (c Command) RequestIDOf() int64 {
+	if c.Job != nil {
+		return c.Job.RequestID
+	}
+
+	return c.RequestID
+}
+
+// Job is the scale-set assignment a launch is for.
+//
+// Declared here rather than reusing internal/server's so the wire has its own
+// stable shape: the server's struct is free to grow fields that are nobody
+// else's business, and a protocol that silently follows an internal type is one
+// refactor away from a breaking change nobody noticed.
+type Job struct {
+	RequestID int64  `json:"request_id"`
+	RunID     int64  `json:"run_id"`
+	Event     string `json:"event"`
+}
+
+// CommandResult reports what happened.
+//
+// Error is a STRING because it crosses a process boundary: the node's error
+// values mean nothing on the other side, and the server's only sane responses
+// are to log it and release the lease. Anything the server must branch on gets
+// its own field rather than being matched out of prose.
+type CommandResult struct {
+	ID    string `json:"id"`
+	OK    bool   `json:"ok"`
+	Error string `json:"error,omitempty"`
+
+	// Custody says the node MAY have started something and is keeping the lease.
+	//
+	// Its own field because the server branches on it and must not read it out of
+	// the prose above. In-process this is server.ErrCustody, and the difference it
+	// makes is total: a clean failure releases the lease, while custody means the
+	// node has taken the lease into its own janitor, is still heartbeating it, and
+	// will release it once the compute is confirmed gone. Releasing as well would
+	// re-advertise capacity that a container may still be using.
+	//
+	// A LOST RESULT MEANS CUSTODY TOO. If the node dies between launching and
+	// reporting, the server learns nothing — and "nothing" is indistinguishable
+	// from "it started". The ambiguity resolves the same way it does in-process:
+	// assume something is running, keep the lease, and let the node's recovery
+	// adopt it. The opposite default releases capacity that is genuinely in use.
+	Custody bool `json:"custody,omitempty"`
+}

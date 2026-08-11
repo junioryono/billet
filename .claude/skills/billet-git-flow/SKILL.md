@@ -80,6 +80,45 @@ overstated an argument about token validation that did not apply. Open the cited
 `file:line`, decide Confirmed / False positive, and fix what is confirmed. Say in
 the PR which findings were accepted and which were rejected, with the reason.
 
+## What to put IN the review prompt, and why it is most of the value
+
+A bare "review this diff" wastes the round. Twelve rounds on the node split
+converged only once the prompt carried four things. Rebuild it from this list;
+do not rely on a previous session's scratchpad, which does not survive.
+
+1. **SCOPE, narrowly.** "The N most recent commits; run `git log --oneline -N`,
+   then `git diff HEAD~N..HEAD`." A whole-branch review of a large diff runs for
+   an hour and can get killed before it writes anything. One to three commits is
+   the working size. Add: *do not go exploring the rest of the repository; if a
+   finding needs context from an unchanged file, read only the function you
+   need,* and give it a wall-clock budget with "an unfinished review is worth
+   nothing, so write your findings before you run out of time."
+
+2. **The MODEL as it currently stands**, in a paragraph or two of invariants —
+   not the diff restated. What the classes of thing are, what each is allowed to
+   do, and which fact is authoritative. Codex finds the good defects by reasoning
+   about the model, so a stale or vague description produces stale findings.
+
+3. **What is KNOWN AND DELIBERATELY NOT FIXED**, by name, with "do not
+   re-report it; DO report anything else it implies that is fixable." Without
+   this you get the same accepted limitation every round, crowding out new
+   findings. (Currently: the plane cannot tell which of two hosts sharing a name
+   physically holds a container after a restart — that needs durable
+   per-incarnation state, task #14.)
+
+4. **An ATTACK LIST in priority order**, ending with test quality. The test items
+   that have actually caught things: assertions that cannot fail, assertions a
+   panic would satisfy, waits satisfied by something other than the thing under
+   test, ordering that makes an assertion unobservable, wall-clock sleeps
+   standing in for conditions, tests claiming to stage a race without
+   establishing its ordering, goroutines outliving their test, and shared state
+   one test mutates.
+
+Then: **fix, mutation-test each fix, run `make check`, commit, and immediately
+launch the next round.** Severity falls over rounds but does not reach zero
+quickly — most rounds find a defect in code written to fix the previous round,
+so do not treat a small round as the last one.
+
 ## The gate runs before the commit, not after the push
 
 ```bash

@@ -187,6 +187,18 @@ type ServerConfig struct {
 	// with nothing to stop them.
 	MaxVCPU   int      `yaml:"max_vcpu"`
 	MaxMemory ByteSize `yaml:"max_memory"`
+	// NodeTLSHosts are the names and addresses nodes will dial this control plane
+	// by. They become the subject names of the certificate it serves.
+	//
+	// REQUIRED WHEN listen IS A WILDCARD, because a wildcard says which
+	// interfaces to accept on and says nothing about what a node types. A
+	// certificate minted for "0.0.0.0" matches nothing any node would dial, and
+	// the failure arrives as a name-mismatch handshake error on the node — the far
+	// side of the deployment from the file that caused it.
+	//
+	// A concrete listen address supplies itself, so single-address deployments
+	// leave this empty.
+	NodeTLSHosts []string `yaml:"node_tls_hosts,omitempty"`
 	// LockDir is where the host-wide deployment lock is placed.
 	//
 	// THE LOCK'S SCOPE HAS TO MATCH THE DAEMON'S, and billet cannot derive that.
@@ -227,6 +239,22 @@ type ServerConfig struct {
 	AllowUnlockedDeployment bool `yaml:"allow_unlocked_deployment,omitempty"`
 }
 
+// NodeTLS points at the three files `billet ca issue` produced.
+//
+// Paths rather than inline PEM, deliberately: a private key pasted into a config
+// file is a key that ends up in a backup, a paste buffer, and eventually a
+// support thread. The key file is written 0600 and stays that way.
+type NodeTLS struct {
+	// CertPath is this node's certificate. Its common name is the node name the
+	// control plane will act on.
+	CertPath string `yaml:"cert"`
+	// KeyPath is the matching private key. A secret.
+	KeyPath string `yaml:"key"`
+	// CAPath is the deployment authority this node verifies the control plane
+	// against.
+	CAPath string `yaml:"ca"`
+}
+
 // NodeConfig configures a compute host.
 type NodeConfig struct {
 	// Name identifies this node to the server and in tier pinning. Defaults to
@@ -237,6 +265,26 @@ type NodeConfig struct {
 	ServerAddr string `yaml:"server_addr"`
 	// Provider selects the compute backend for this host.
 	Provider ProviderKind `yaml:"provider"`
+	// TLS is the certificate bundle this node presents, issued by the control
+	// plane's `billet ca issue`.
+	//
+	// REQUIRED TO DIAL ANYTHING BUT LOOPBACK. The wire's whole authorisation model
+	// is the name in this certificate, so a node without one can only talk to a
+	// control plane in its own machine.
+	TLS *NodeTLS `yaml:"tls,omitempty"`
+	// LockDir is where this node places its host-wide deployment lock.
+	//
+	// SAME KEY, SAME MEANING, SAME HOST as server.lock_dir, and it exists because
+	// the two roles can run on one machine. A `server --dev` honouring
+	// server.lock_dir while a standalone node used the per-user default would take
+	// two DIFFERENT locks for one deployment identity — and then both would manage
+	// the same containers, each able to adopt or destroy the other's live work.
+	// That is precisely the failure the identity lock exists to prevent, reached
+	// by giving the two roles separate settings.
+	//
+	// Leave it empty and both roles use the same default, which is already
+	// consistent. Set it on the server and you must set it here too.
+	LockDir string `yaml:"lock_dir,omitempty"`
 	// StateDir holds node-local data: the generation pointer store (which is
 	// authoritative for this node's volumes), image cache, and mTLS identity.
 	StateDir string `yaml:"state_dir"`
@@ -1007,6 +1055,125 @@ func defaultStateDir(role string) string {
 	return filepath.Join(".", ".billet", role)
 }
 
+// validateNodeTLS refuses a node that would dial the network unauthenticated.
+//
+// THE NAME IN THE CERTIFICATE IS THE ONLY THING THAT AUTHORISES A NODE, so a
+// host without one can only reach a control plane inside its own machine. The
+// alternative — letting it try, and failing at the handshake — reports the
+// problem on the wrong machine at the wrong time, in a TLS error that does not
+// mention the config key that caused it.
+func (c *Config) validateNodeTLS() []error {
+	var errs []error
+
+	if c.Node.TLS == nil {
+		if c.Node.ServerAddr != "" && !isLoopbackHostPort(c.Node.ServerAddr) {
+			errs = append(errs, fmt.Errorf(
+				"node.server_addr is %q, which is not on this machine, but node.tls is not set: "+
+					"the control plane identifies a node by the name in its certificate and will "+
+					"refuse a connection without one. Run `billet ca issue %s` on the control "+
+					"plane and copy the bundle here",
+				c.Node.ServerAddr, c.Node.Name))
+		}
+
+		return errs
+	}
+
+	// THE SERVER'S LISTEN ADDRESS DECIDES THE TRANSPORT, and the node's
+	// destination cannot be used to infer it. The first attempt at this rule
+	// refused any bundle aimed at loopback — which is wrong for the ordinary
+	// production shape: a control plane listening on 0.0.0.0 serves mTLS on EVERY
+	// interface, loopback included, so a node colocated with it dials 127.0.0.1
+	// AND needs its certificate.
+	//
+	// So the question is only answerable when this file describes both roles, and
+	// then it is answerable exactly. A standalone node's file says nothing about
+	// how the server bound its listener, and guessing there is what produced two
+	// authorities for one fact.
+	if c.Server != nil && LoopbackAddr(c.Server.Listen) {
+		errs = append(errs, fmt.Errorf(
+			"node.tls is set, but server.listen is %q — a control plane that accepts only on "+
+				"loopback serves plain HTTP, because there is nothing between the two "+
+				"processes to authenticate. This node would dial https and never connect. "+
+				"Remove node.tls, or bind the server to the address it publishes to its fleet",
+			c.Server.Listen))
+
+		return errs
+	}
+
+	for key, path := range map[string]string{
+		"node.tls.cert": c.Node.TLS.CertPath,
+		"node.tls.key":  c.Node.TLS.KeyPath,
+		"node.tls.ca":   c.Node.TLS.CAPath,
+	} {
+		if path == "" {
+			errs = append(errs, fmt.Errorf("%s is required when node.tls is set", key))
+
+			continue
+		}
+
+		// Absolute for the same reason every other path here is: a node is a
+		// long-lived service whose working directory is whatever started it, and a
+		// relative certificate path resolves differently under systemd than it did
+		// in the shell where it was tested.
+		if !filepath.IsAbs(path) {
+			errs = append(errs, fmt.Errorf(
+				"%s must be an absolute path, got %q: a relative one resolves against whatever "+
+					"working directory the service happens to start in", key, path))
+		}
+	}
+
+	// SORTED, because the map above iterates in a random order and an error list
+	// that reshuffles between runs is one an operator cannot diff.
+	slices.SortFunc(errs, func(a, b error) int { return strings.Compare(a.Error(), b.Error()) })
+
+	return errs
+}
+
+// LoopbackAddr reports whether an address accepts only from this machine.
+//
+// SHARED WITH THE SERVER'S OWN DECISION, deliberately: the wire is served
+// without TLS on exactly the addresses this returns true for, so config
+// validation and the listener must not answer the question differently. A
+// wildcard is NOT loopback — it accepts from everywhere, including loopback.
+func LoopbackAddr(addr string) bool {
+	return isLoopbackHostPort(addr)
+}
+
+// isLoopbackHostPort reports whether an address is on this machine.
+func isLoopbackHostPort(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+
+	if host == "localhost" {
+		return true
+	}
+
+	ip := net.ParseIP(host)
+
+	return ip != nil && ip.IsLoopback()
+}
+
+// LockDirsAgree reports whether both roles would take their lock in the same
+// place.
+//
+// ASKED WHERE THE ROLES ACTUALLY CO-LOCATE, not at load. Requiring equality
+// whenever both YAML sections exist looked tidy and refused a legitimate shape:
+// one configuration file deployed to every machine, carrying a controller's
+// lock_dir that a node-only host never uses. That host would fail to start over a
+// setting with no bearing on it.
+//
+// `server --dev` is the case that matters, because it is the one process that
+// runs both roles in one place — see cmdServer, which asks this.
+func (c *Config) LockDirsAgree() bool {
+	if c.Server == nil || c.Node == nil {
+		return true
+	}
+
+	return c.Server.LockDir == c.Node.LockDir
+}
+
 // Validate reports every problem it finds rather than stopping at the first, so
 // a misconfigured deployment takes one round trip to fix instead of five.
 func (c *Config) Validate() error {
@@ -1095,6 +1262,16 @@ func (c *Config) validateNode() []error {
 		errs = append(errs, fmt.Errorf("node.provider %q is not one of %v", c.Node.Provider, allProviders))
 	}
 
+	// Same rule as server.lock_dir, and for the same reason: a relative path
+	// resolves against each process's working directory, so one config could put
+	// the server and the node into different collision domains on one host.
+	if c.Node.LockDir != "" && !filepath.IsAbs(c.Node.LockDir) {
+		errs = append(errs, fmt.Errorf(
+			"node.lock_dir must be an absolute path, got %q: a relative one resolves against "+
+				"each process's working directory, so the node and the server could lock "+
+				"different files for one deployment identity", c.Node.LockDir))
+	}
+
 	// Parsed here so a typo is reported when the file is READ, rather than hours
 	// later when a wedged container needed reclaiming and the bound turned out to
 	// be unparseable.
@@ -1121,6 +1298,8 @@ func (c *Config) validateNode() []error {
 	if err := validateHostPort("node.server_addr", c.Node.ServerAddr); err != nil {
 		errs = append(errs, err)
 	}
+
+	errs = append(errs, c.validateNodeTLS()...)
 	if c.Node.Provider == ProviderFirecracker {
 		if c.Node.Firecracker == nil {
 			errs = append(errs, errors.New("node.firecracker is required when provider is firecracker"))

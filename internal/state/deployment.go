@@ -62,6 +62,117 @@ const recoverIdentityAdvice = "RESTORE THE ORIGINAL IDENTITY if you can — from
 // host-wide lock on the id, so running the copy alongside the original fails as a
 // lock conflict rather than as a cross-destruction. A derived id would give the
 // copy a different identity and no conflict to detect.
+// writeDeploymentID puts an identity on disk durably, or not at all.
+func writeDeploymentID(path, stateDir, id string) error {
+	// O_EXCL, so two processes racing to initialise the same directory cannot
+	// each write an id and have the loser's compute labelled with a value nothing
+	// will look for afterwards.
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		if os.IsExist(err) {
+			return err
+		}
+
+		return fmt.Errorf("state: write deployment id: %w", err)
+	}
+
+	defer func() { _ = f.Close() }()
+
+	if _, err := f.WriteString(id + "\n"); err != nil {
+		return fmt.Errorf("state: write deployment id: %w", err)
+	}
+
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("state: sync deployment id: %w", err)
+	}
+
+	// THE DIRECTORY IS SYNCED TOO, and that is not belt-and-braces. Syncing a new
+	// file persists its CONTENTS; the directory entry that makes it findable is a
+	// separate write, and losing power between the two leaves a state directory
+	// with no identity in it. Billet would mint a fresh one on restart, and every
+	// container labelled with the old id becomes invisible — leases reaped,
+	// capacity resold, containers running forever.
+	dir, err := os.Open(stateDir)
+	if err != nil {
+		return fmt.Errorf("state: open state dir to sync it: %w", err)
+	}
+
+	defer func() { _ = dir.Close() }()
+
+	if err := dir.Sync(); err != nil {
+		// THE FILE GOES WITH THE FAILURE. Leaving it behind means the next call
+		// takes the read path, finds an id whose directory entry was never made
+		// durable, and returns it as though the guarantee held — turning a
+		// one-time startup error into a silent loss of the property this sync
+		// exists to provide.
+		if rmErr := os.Remove(path); rmErr != nil {
+			return fmt.Errorf("state: sync state dir (%w), and the half-written identity "+
+				"could not be removed (%v); delete %s by hand", err, rmErr, path)
+		}
+
+		return fmt.Errorf("state: sync state dir: %w", err)
+	}
+
+	return nil
+}
+
+// AdoptDeploymentID records an identity this installation was handed.
+//
+// A NODE DOES NOT GET TO INVENT ITS DEPLOYMENT, and letting it was a defect that
+// made standalone enrollment impossible. DeploymentID mints a random identity
+// when a state directory has none — right for a control plane, which is where an
+// installation begins, and wrong for a node, which JOINS one. A fresh node minted
+// its own, the control plane compared it with its own and refused the
+// registration, and nothing in the enrollment instructions could have prevented
+// it: the bundle carried a certificate and no identity.
+//
+// So the certificate carries it, and this writes it down. Refuses rather than
+// overwrites when the directory already holds a DIFFERENT one — that state
+// directory's containers are labelled with the old identity, and quietly
+// relabelling the node would orphan every one of them.
+func AdoptDeploymentID(stateDir, id string) (string, error) {
+	if err := validDeploymentID(id); err != nil {
+		return "", fmt.Errorf("state: adopt deployment id %q: %w", id, err)
+	}
+
+	path := filepath.Join(stateDir, deploymentIDFile)
+
+	existing, err := os.ReadFile(path)
+	if err == nil {
+		have := strings.TrimSpace(string(existing))
+		if have == id {
+			return id, nil
+		}
+
+		return "", fmt.Errorf(
+			"state: %s says this host belongs to deployment %s, but it was given a certificate "+
+				"for %s. Billet will not relabel it: the compute it is already managing carries "+
+				"the old identity and would become invisible to both installations. Point "+
+				"node.state_dir somewhere new to join a different deployment",
+			path, have, id)
+	}
+
+	if !os.IsNotExist(err) {
+		return "", fmt.Errorf("state: read deployment id: %w", err)
+	}
+
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		return "", fmt.Errorf("state: create state dir %s: %w", stateDir, err)
+	}
+
+	if err := writeDeploymentID(path, stateDir, id); err != nil {
+		if os.IsExist(err) {
+			// Another process won the race and wrote one. Re-read rather than
+			// assume it wrote the same thing.
+			return AdoptDeploymentID(stateDir, id)
+		}
+
+		return "", err
+	}
+
+	return id, nil
+}
+
 func DeploymentID(stateDir string) (string, error) {
 	path := filepath.Join(stateDir, deploymentIDFile)
 
@@ -95,53 +206,14 @@ func DeploymentID(stateDir string) (string, error) {
 
 	id := hex.EncodeToString(raw[:])
 
-	// O_EXCL, so two processes racing to initialise the same directory cannot
-	// each mint an id and have the loser's compute labelled with a value nothing
-	// will look for afterwards. The loser re-reads the winner's.
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
+	if err := writeDeploymentID(path, stateDir, id); err != nil {
 		if os.IsExist(err) {
+			// Another process won the race. The loser re-reads the winner's, so the
+			// two never label compute with different values.
 			return DeploymentID(stateDir)
 		}
 
-		return "", fmt.Errorf("state: write deployment id: %w", err)
-	}
-
-	defer func() { _ = f.Close() }()
-
-	if _, err := f.WriteString(id + "\n"); err != nil {
-		return "", fmt.Errorf("state: write deployment id: %w", err)
-	}
-
-	if err := f.Sync(); err != nil {
-		return "", fmt.Errorf("state: sync deployment id: %w", err)
-	}
-
-	// THE DIRECTORY IS SYNCED TOO, and that is not belt-and-braces. Syncing a new
-	// file persists its CONTENTS; the directory entry that makes it findable is a
-	// separate write, and losing power between the two leaves a state directory
-	// with no identity in it. Billet would mint a fresh one on restart, and every
-	// container labelled with the old id becomes invisible — leases reaped,
-	// capacity resold, containers running forever.
-	dir, err := os.Open(stateDir)
-	if err != nil {
-		return "", fmt.Errorf("state: open state dir to sync it: %w", err)
-	}
-
-	defer func() { _ = dir.Close() }()
-
-	if err := dir.Sync(); err != nil {
-		// THE FILE GOES WITH THE FAILURE. Leaving it behind means the next call
-		// takes the read path, finds an id whose directory entry was never made
-		// durable, and returns it as though the guarantee held — turning a
-		// one-time startup error into a silent loss of the property this sync
-		// exists to provide.
-		if rmErr := os.Remove(path); rmErr != nil {
-			return "", fmt.Errorf("state: sync state dir (%w), and the half-written "+
-				"identity could not be removed (%v); delete %s by hand", err, rmErr, path)
-		}
-
-		return "", fmt.Errorf("state: sync state dir: %w", err)
+		return "", err
 	}
 
 	return id, nil

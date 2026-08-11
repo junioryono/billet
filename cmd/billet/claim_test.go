@@ -134,3 +134,74 @@ func TestTheOptOutIsActuallyWired(t *testing.T) {
 		t.Error("the lock claims to be held, but nothing could be locked")
 	}
 }
+
+// THE NODE LOCKS WHERE IT WAS TOLD TO, which is what keeps it colliding with a
+// server on the same host.
+//
+// A server honouring server.lock_dir while the node used the per-user default
+// would take two different locks for one deployment identity — and then both
+// processes manage the same containers, each able to adopt or destroy the
+// other's live work. The config refuses a mismatched pair; this proves the node
+// actually uses the value rather than merely accepting it.
+func TestTheNodeLocksWhereItWasTold(t *testing.T) {
+	lockDir := t.TempDir()
+
+	cfg := &config.Config{Node: &config.NodeConfig{
+		Name:     "host-1",
+		StateDir: t.TempDir(),
+		LockDir:  lockDir,
+	}}
+
+	id, lock, err := claimNodeDeployment(cfg, nil)
+	if err != nil {
+		t.Fatalf("claimNodeDeployment: %v", err)
+	}
+
+	t.Cleanup(func() {
+		if err := lock.Release(); err != nil {
+			t.Errorf("release: %v", err)
+		}
+	})
+
+	if id == "" {
+		t.Fatal("the node claimed no identity")
+	}
+
+	if got := filepath.Dir(lock.Path()); got != lockDir {
+		t.Fatalf("the node locked in %q, but node.lock_dir said %q — on a host also running a "+
+			"server, those are two locks for one identity", got, lockDir)
+	}
+}
+
+// A SERVER AND A NODE ON ONE HOST COLLIDE, which is the whole point.
+//
+// Same identity, same configured directory: the second must be refused. If they
+// landed in different files both would run, and both would manage the same
+// containers.
+func TestAServerAndANodeOnOneHostCollide(t *testing.T) {
+	lockDir := t.TempDir()
+	stateDir := t.TempDir()
+
+	server := &config.Config{Server: &config.ServerConfig{StateDir: stateDir, LockDir: lockDir}}
+
+	_, lock, err := claimDeployment(server)
+	if err != nil {
+		t.Fatalf("the server could not claim: %v", err)
+	}
+
+	t.Cleanup(func() {
+		if err := lock.Release(); err != nil {
+			t.Errorf("release: %v", err)
+		}
+	})
+
+	node := &config.Config{Node: &config.NodeConfig{
+		Name:     "host-1",
+		StateDir: stateDir,
+		LockDir:  lockDir,
+	}}
+
+	if _, _, err := claimNodeDeployment(node, nil); !errors.Is(err, state.ErrDeploymentLocked) {
+		t.Fatalf("a node started alongside a server holding the same identity: %v", err)
+	}
+}

@@ -193,22 +193,84 @@ const DefaultMaxCustody = 0
 // of the TTL — the same cadence and the same reasoning as the listener's own
 // heartbeats. Two renewals may be missed entirely before anything expires.
 func (r *Runner) KeepAlive(ctx context.Context) {
-	every := r.ttl() / 3
-	if every <= 0 {
-		every = time.Second
-	}
+	// THE CADENCE IS RE-READ EVERY CYCLE, not fixed at the first one.
+	//
+	// The TTL is negotiated at registration, and a node re-registers whenever the
+	// control plane forgets it or restarts. A plane that comes back advertising a
+	// SHORTER TTL leaves a janitor built on the old one renewing too slowly: the
+	// lease expires between two heartbeats, the reaper resells its capacity, and
+	// the container it was holding is still running. The janitor is started once
+	// on purpose — custody outlives any registration — so re-reading here is the
+	// only place that correction can happen.
+	// WAKES OFTEN, RENEWS ON SCHEDULE, and the two are deliberately separate.
+	//
+	// Re-reading the TTL when the timer fires is not enough: a timer armed for
+	// thirty seconds under a ninety-second TTL stays armed for thirty seconds even
+	// if the plane comes back advertising nine. The lease expires while a correct
+	// cadence sits in a variable nothing has consulted yet.
+	//
+	// So the loop wakes on a short fixed tick and asks whether a renewal is DUE.
+	// The cost is a few no-op wakeups a minute in a background goroutine; the
+	// alternative is a lease reaped between two heartbeats while its container
+	// runs.
+	next := time.Now().Add(r.renewEvery())
 
-	ticker := time.NewTicker(every)
-	defer ticker.Stop()
+	timer := time.NewTimer(watchTick)
+	defer timer.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			r.renewHeld(ctx)
+		case now := <-timer.C:
+			due := r.renewEvery()
+
+			// A SHORTENED CADENCE PULLS THE DEADLINE IN. This is the whole point of
+			// waking early: a deadline further away than the current interval allows
+			// was set under a TTL that no longer applies, and keeping it would let the
+			// lease expire before the next renewal.
+			if latest := now.Add(due); next.After(latest) {
+				next = latest
+			}
+
+			if !now.Before(next) {
+				r.renewHeld(ctx)
+
+				next = time.Now().Add(due)
+			}
+
+			// Sleep until the deadline, but never longer than one tick, so the next
+			// change of cadence is noticed just as quickly.
+			wait := watchTick
+			if until := time.Until(next); until > 0 && until < wait {
+				wait = until
+			}
+
+			timer.Reset(wait)
 		}
 	}
+}
+
+// watchTick bounds how long the janitor can be unaware of a shortened TTL.
+//
+// Short enough that a renegotiated cadence takes effect within one tick, long
+// enough that a fleet of idle nodes is not spinning. It is a ceiling on the
+// sleep, never the renewal interval itself.
+const watchTick = 500 * time.Millisecond
+
+// renewEvery is how long to wait between renewals.
+//
+// A THIRD OF THE TTL, so two consecutive failures still leave a renewal before
+// the deadline the reaper on the other side enforces.
+func (r *Runner) renewEvery() time.Duration {
+	every := r.ttl() / 3
+	if every <= 0 {
+		// Only before the first registration answers, and the janitor no longer
+		// starts before then. Kept because a cadence of zero is a busy loop.
+		return time.Second
+	}
+
+	return every
 }
 
 // renewHeld heartbeats every held lease once.
@@ -218,7 +280,7 @@ func (r *Runner) KeepAlive(ctx context.Context) {
 // go. Doing that here would put teardown on a path that must stay cheap and
 // never block.
 func (r *Runner) renewHeld(ctx context.Context) {
-	for _, c := range r.custodySnapshot() {
+	for _, c := range r.renewSnapshot() {
 		err := r.alloc.Heartbeat(ctx, c.leaseID, c.epoch)
 		if err == nil || ctx.Err() != nil {
 			continue
@@ -457,6 +519,141 @@ func (r *Runner) custodySnapshot() []*custody {
 	}
 
 	return out
+}
+
+// Superseded moves everything this node is running into custody.
+//
+// AFTER SUPERSESSION, EVERYTHING HERE IS UNACCOUNTED FOR — which is the
+// definition of custody. The control plane routes a job's completion to whichever
+// process currently owns the name, so the destroy for a container running HERE
+// now goes to the replacement, which cannot see it, reports success, and lets the
+// lease be released.
+//
+// Nothing else would ever finish this work. Tend is what confirms compute gone
+// and releases its lease, and Tend only looks at custody — so a running entry
+// left where it was made Holding() true forever and the drain unable to end.
+//
+// The lease's outcome is recorded as done rather than failed: the job was
+// launched cleanly and is running: what changed is who is allowed to talk about
+// it, not whether it worked.
+func (r *Runner) Superseded() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for requestID, inst := range r.running {
+		lease, ok := r.runningLease[requestID]
+		if !ok {
+			continue
+		}
+
+		// MOVED, NOT COPIED, and copying was a way to make the drain eternal. An
+		// entry left in `running` keeps Holding() true after Tend has confirmed the
+		// compute gone and removed its custody entry — so the process has nothing
+		// left to do and can never stop.
+		delete(r.running, requestID)
+		delete(r.runningLease, requestID)
+
+		if _, held := r.custody[lease.ID]; held {
+			continue
+		}
+
+		r.custody[lease.ID] = &custody{
+			leaseID:   lease.ID,
+			epoch:     lease.Epoch,
+			name:      inst.Name,
+			instance:  inst.ID,
+			requestID: requestID,
+			outcome:   alloc.PhaseDone,
+			since:     r.now(),
+		}
+	}
+}
+
+// Holding reports whether this node is still responsible for compute.
+//
+// ASKED WHEN THE NODE HAS BEEN SUPERSEDED and is deciding whether it may stop.
+// Exiting while custody remains is how a container ends up with a lease nobody
+// renews: the replacement cannot see it — it is on a different machine — so
+// nothing else will ever hold it.
+func (r *Runner) Holding() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// RUNNING COUNTS, and leaving it out was the whole bug. Custody is compute
+	// billet cannot account for and launching is compute it is creating — but an
+	// ordinary job that launched cleanly and is running right now is neither, and
+	// it is just as much this process's responsibility.
+	//
+	// Without it a node that had successfully started a job saw "holding nothing"
+	// the moment it was superseded, exited, and left a container whose completion
+	// is now routed to a replacement that cannot see it. That Destroy finds
+	// nothing, reports success, and the lease is released under a running job.
+	return len(r.custody) > 0 || len(r.launching) > 0 || len(r.running) > 0
+}
+
+// renewSnapshot is everything whose lease this node must keep alive.
+//
+// WIDER THAN CUSTODY, AND ONLY FOR RENEWAL. A launch in progress needs its lease
+// renewed for exactly the same reason a custody entry does — for its duration
+// nobody else is doing it — but it is not custody and must not be TENDED.
+//
+// Putting the launching entries into custodySnapshot instead was a real bug and
+// an instructive one: Tend iterates that same snapshot to decide which compute
+// is finished and release its lease, so a launch still in progress was handed to
+// teardown. It carries no outcome, so the release failed with `invalid phase
+// transition: "" is not terminal`, and the container it had just started was
+// left with a lease the node had already stopped tracking.
+//
+// The gap it closes is real, so the fix is a second view rather than a revert:
+//
+// Across the wire, the control plane stops waiting after the command timeout and
+// hands the listener custody, which stops the listener heartbeating. The node is
+// meanwhile still inside provider.Launch, pulling a large image, and adopts
+// nothing until that call returns. Between those two moments the lease has no
+// owner at all: the reaper releases its capacity, the allocator sells it to
+// another job, and then the launch completes onto hardware already spoken for.
+func (r *Runner) renewSnapshot() []*custody {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	out := make([]*custody, 0, len(r.custody)+len(r.launching))
+	for _, c := range r.custody {
+		out = append(out, c)
+	}
+
+	for _, c := range r.launching {
+		out = append(out, c)
+	}
+
+	return out
+}
+
+// holdWhileLaunching keeps a lease renewed for as long as the launch runs.
+//
+// Returns the function that stops it. Renewing the same lease twice is harmless
+// — Heartbeat is idempotent, and a lease already gone answers ErrLeaseNotFound,
+// which renewHeld ignores — so the overlap with the listener's own heartbeat
+// costs nothing and the gap it closes is unbounded.
+func (r *Runner) holdWhileLaunching(lease *alloc.Lease, name string) func() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.launching == nil {
+		r.launching = make(map[string]*custody)
+	}
+
+	r.launching[lease.ID] = &custody{
+		leaseID: lease.ID,
+		epoch:   lease.Epoch,
+		name:    name,
+	}
+
+	return func() {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+
+		delete(r.launching, lease.ID)
+	}
 }
 
 // errCustody is returned by Launch when the runner has taken responsibility for

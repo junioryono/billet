@@ -1787,3 +1787,447 @@ tiers:
 		t.Errorf("the error does not name the key: %v", err)
 	}
 }
+
+// A NODE THAT DIALS THE NETWORK NEEDS A CERTIFICATE, and saying so here is the
+// difference between one clear error and a handshake failure on another machine.
+//
+// The control plane identifies a node by the name in its certificate and refuses
+// a connection without one, so a node configured to reach a remote control plane
+// with no bundle can never work. It would fail at the TLS layer, on the node, in
+// a message that does not mention the config key that caused it.
+func TestARemoteNodeNeedsACertificate(t *testing.T) {
+	t.Parallel()
+
+	body := `
+server:
+  listen: 127.0.0.1:7717
+  state_dir: /var/lib/billet/server
+  lock_dir: /run/billet/locks
+  max_vcpu: 8
+  max_memory: 32GiB
+node:
+  name: host-1
+  server_addr: 10.0.0.4:7717
+  provider: docker
+  state_dir: /var/lib/billet/node
+  lock_dir: /run/billet/locks
+github:
+  org: acme
+  app_id: 1
+  installation_id: 2
+  private_key_path: /tmp/key.pem
+tiers:
+  - label: billet-2vcpu
+    provider: docker
+    vcpu: 2
+    memory: 8GiB
+    image: ubuntu:24.04
+`
+
+	_, err := Load(writeConfig(t, body))
+	if err == nil {
+		t.Fatal("a node pointed at a remote control plane with no node.tls was accepted")
+	}
+
+	if !strings.Contains(err.Error(), "node.tls") {
+		t.Errorf("the error does not name the key an operator has to add: %v", err)
+	}
+}
+
+// Loopback is the exception, because the control plane is inside this machine
+// and there is nothing between the two to authenticate against.
+func TestALoopbackNodeNeedsNoCertificate(t *testing.T) {
+	t.Parallel()
+
+	body := `
+server:
+  listen: 127.0.0.1:7717
+  state_dir: /var/lib/billet/server
+  lock_dir: /run/billet/locks
+  max_vcpu: 8
+  max_memory: 32GiB
+node:
+  name: host-1
+  server_addr: 127.0.0.1:7717
+  provider: docker
+  state_dir: /var/lib/billet/node
+  lock_dir: /run/billet/locks
+github:
+  org: acme
+  app_id: 1
+  installation_id: 2
+  private_key_path: /tmp/key.pem
+tiers:
+  - label: billet-2vcpu
+    provider: docker
+    vcpu: 2
+    memory: 8GiB
+    image: ubuntu:24.04
+`
+
+	if _, err := Load(writeConfig(t, body)); err != nil {
+		t.Errorf("a node dialling a control plane in its own machine was refused for having "+
+			"no certificate: %v", err)
+	}
+}
+
+// The complete shape loads, which is what keeps the three tests above from all
+// passing against a rule that refuses everything.
+func TestACompleteNodeTLSBlockIsAccepted(t *testing.T) {
+	t.Parallel()
+
+	body := `
+server:
+  listen: 0.0.0.0:7717
+  state_dir: /var/lib/billet/server
+  lock_dir: /run/billet/locks
+  max_vcpu: 8
+  max_memory: 32GiB
+node:
+  name: host-1
+  server_addr: 10.0.0.4:7717
+  provider: docker
+  state_dir: /var/lib/billet/node
+  lock_dir: /run/billet/locks
+  tls:
+    cert: /etc/billet/tls/node.crt
+    key: /etc/billet/tls/node.key
+    ca: /etc/billet/tls/ca.crt
+github:
+  org: acme
+  app_id: 1
+  installation_id: 2
+  private_key_path: /tmp/key.pem
+tiers:
+  - label: billet-2vcpu
+    provider: docker
+    vcpu: 2
+    memory: 8GiB
+    image: ubuntu:24.04
+`
+
+	cfg, err := Load(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("a complete node.tls block was refused: %v", err)
+	}
+
+	if cfg.Node.TLS == nil || cfg.Node.TLS.CertPath != "/etc/billet/tls/node.crt" {
+		t.Errorf("the certificate path did not survive loading: %+v", cfg.Node.TLS)
+	}
+}
+
+// HALF A BUNDLE IS NOT A BUNDLE. Each file has a distinct job — the identity,
+// the key that proves it, and the authority the control plane is checked against
+// — so a missing one is not something to default.
+func TestAPartialNodeTLSBlockIsRefused(t *testing.T) {
+	t.Parallel()
+
+	body := `
+server:
+  listen: 0.0.0.0:7717
+  state_dir: /var/lib/billet/server
+  lock_dir: /run/billet/locks
+  max_vcpu: 8
+  max_memory: 32GiB
+node:
+  name: host-1
+  server_addr: 10.0.0.4:7717
+  provider: docker
+  state_dir: /var/lib/billet/node
+  lock_dir: /run/billet/locks
+  tls:
+    cert: /etc/billet/tls/node.crt
+    ca: /etc/billet/tls/ca.crt
+github:
+  org: acme
+  app_id: 1
+  installation_id: 2
+  private_key_path: /tmp/key.pem
+tiers:
+  - label: billet-2vcpu
+    provider: docker
+    vcpu: 2
+    memory: 8GiB
+    image: ubuntu:24.04
+`
+
+	_, err := Load(writeConfig(t, body))
+	if err == nil {
+		t.Fatal("a node.tls block with no key was accepted")
+	}
+
+	if !strings.Contains(err.Error(), "node.tls.key") {
+		t.Errorf("the error does not name the missing file: %v", err)
+	}
+}
+
+// A RELATIVE CERTIFICATE PATH RESOLVES AGAINST WHATEVER STARTED THE SERVICE,
+// which is one directory under systemd and another in the shell where it was
+// tested.
+func TestARelativeNodeTLSPathIsRefused(t *testing.T) {
+	t.Parallel()
+
+	body := `
+server:
+  listen: 0.0.0.0:7717
+  state_dir: /var/lib/billet/server
+  lock_dir: /run/billet/locks
+  max_vcpu: 8
+  max_memory: 32GiB
+node:
+  name: host-1
+  server_addr: 10.0.0.4:7717
+  provider: docker
+  state_dir: /var/lib/billet/node
+  lock_dir: /run/billet/locks
+  tls:
+    cert: node.crt
+    key: /etc/billet/tls/node.key
+    ca: /etc/billet/tls/ca.crt
+github:
+  org: acme
+  app_id: 1
+  installation_id: 2
+  private_key_path: /tmp/key.pem
+tiers:
+  - label: billet-2vcpu
+    provider: docker
+    vcpu: 2
+    memory: 8GiB
+    image: ubuntu:24.04
+`
+
+	_, err := Load(writeConfig(t, body))
+	if err == nil {
+		t.Fatal("a relative node.tls.cert was accepted")
+	}
+
+	if !strings.Contains(err.Error(), "node.tls.cert") {
+		t.Errorf("the error does not name the offending key: %v", err)
+	}
+}
+
+// A CONTROL PLANE THAT LISTENS ONLY ON LOOPBACK SERVES PLAINTEXT, so a bundle
+// aimed at it can never be presented.
+//
+// Two authorities for one fact, and this is the configuration where they
+// disagreed: the server chooses transport security from its LISTEN address —
+// loopback needs none, because there is nothing between the two processes — and
+// the node chose it from whether it held a certificate. The result loaded
+// cleanly and looped forever, with nothing in either log naming the setting.
+//
+// Note what is NOT refused. A server on 0.0.0.0 serves mTLS on every interface
+// including loopback, so a node colocated with it dials 127.0.0.1 and needs its
+// certificate — the first version of this rule refused that, which is the
+// ordinary production shape. The listener's address is the authority, and a
+// node's destination cannot stand in for it.
+func TestACertificateAimedAtALoopbackOnlyControlPlaneIsRefused(t *testing.T) {
+	t.Parallel()
+
+	body := `
+server:
+  listen: 127.0.0.1:7717
+  state_dir: /var/lib/billet/server
+  lock_dir: /run/billet/locks
+  max_vcpu: 8
+  max_memory: 32GiB
+node:
+  name: host-1
+  server_addr: 127.0.0.1:7717
+  provider: docker
+  state_dir: /var/lib/billet/node
+  lock_dir: /run/billet/locks
+  tls:
+    cert: /etc/billet/tls/node.crt
+    key: /etc/billet/tls/node.key
+    ca: /etc/billet/tls/ca.crt
+github:
+  org: acme
+  app_id: 1
+  installation_id: 2
+  private_key_path: /tmp/key.pem
+tiers:
+  - label: billet-2vcpu
+    provider: docker
+    vcpu: 2
+    memory: 8GiB
+    image: ubuntu:24.04
+`
+
+	_, err := Load(writeConfig(t, body))
+	if err == nil {
+		t.Fatal("a node was configured to present a certificate to a control plane that " +
+			"accepts only on loopback and therefore serves plain HTTP")
+	}
+
+	if !strings.Contains(err.Error(), "node.tls") {
+		t.Errorf("the error does not name the key to remove: %v", err)
+	}
+}
+
+// A WILDCARD LISTENER SERVES mTLS EVERYWHERE, loopback included, so a colocated
+// node both dials 127.0.0.1 and needs its bundle.
+func TestACertificateIsAllowedAgainstAWildcardListener(t *testing.T) {
+	t.Parallel()
+
+	body := `
+server:
+  listen: 0.0.0.0:7717
+  state_dir: /var/lib/billet/server
+  lock_dir: /run/billet/locks
+  max_vcpu: 8
+  max_memory: 32GiB
+  node_tls_hosts:
+    - billet.example
+node:
+  name: host-1
+  server_addr: 127.0.0.1:7717
+  provider: docker
+  state_dir: /var/lib/billet/node
+  lock_dir: /run/billet/locks
+  tls:
+    cert: /etc/billet/tls/node.crt
+    key: /etc/billet/tls/node.key
+    ca: /etc/billet/tls/ca.crt
+github:
+  org: acme
+  app_id: 1
+  installation_id: 2
+  private_key_path: /tmp/key.pem
+tiers:
+  - label: billet-2vcpu
+    provider: docker
+    vcpu: 2
+    memory: 8GiB
+    image: ubuntu:24.04
+`
+
+	if _, err := Load(writeConfig(t, body)); err != nil {
+		t.Errorf("a node colocated with a control plane that serves mTLS on every interface "+
+			"was refused its certificate: %v", err)
+	}
+}
+
+// TWO ROLES MAY NAME DIFFERENT LOCK DIRECTORIES, and one config file is why.
+//
+// A single billet.yaml deployed to every machine carries the controller's
+// lock_dir alongside each node's. A node-only host never reads the server
+// section, so refusing to load over it would take that host down for a setting
+// with no bearing on it. Whether the two agree is asked by `server --dev`, which
+// is the one process that runs both roles at once.
+func TestOneFileMayConfigureBothRolesDifferently(t *testing.T) {
+	t.Parallel()
+
+	body := `
+server:
+  listen: 127.0.0.1:7717
+  state_dir: /var/lib/billet/server
+  lock_dir: /run/billet/server-locks
+  max_vcpu: 8
+  max_memory: 32GiB
+node:
+  name: host-1
+  server_addr: 127.0.0.1:7717
+  provider: docker
+  state_dir: /var/lib/billet/node
+  lock_dir: /run/billet/node-locks
+github:
+  org: acme
+  app_id: 1
+  installation_id: 2
+  private_key_path: /tmp/key.pem
+tiers:
+  - label: billet-2vcpu
+    provider: docker
+    vcpu: 2
+    memory: 8GiB
+    image: ubuntu:24.04
+`
+
+	cfg, err := Load(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("a shared config file naming a lock_dir per role was refused: %v", err)
+	}
+
+	if cfg.LockDirsAgree() {
+		t.Error("two different lock directories were reported as agreeing, so `server --dev` " +
+			"would take two locks for one deployment identity")
+	}
+}
+
+// The same question, answered the other way.
+func TestMatchingLockDirsAgree(t *testing.T) {
+	t.Parallel()
+
+	body := `
+server:
+  listen: 127.0.0.1:7717
+  state_dir: /var/lib/billet/server
+  lock_dir: /run/billet/locks
+  max_vcpu: 8
+  max_memory: 32GiB
+node:
+  name: host-1
+  server_addr: 127.0.0.1:7717
+  provider: docker
+  state_dir: /var/lib/billet/node
+  lock_dir: /run/billet/locks
+github:
+  org: acme
+  app_id: 1
+  installation_id: 2
+  private_key_path: /tmp/key.pem
+tiers:
+  - label: billet-2vcpu
+    provider: docker
+    vcpu: 2
+    memory: 8GiB
+    image: ubuntu:24.04
+`
+
+	cfg, err := Load(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	if !cfg.LockDirsAgree() {
+		t.Error("identical lock directories were reported as disagreeing, so `server --dev` " +
+			"would refuse a correct configuration")
+	}
+}
+
+// A relative node.lock_dir is refused for the same reason the server's is.
+func TestARelativeNodeLockDirIsRefused(t *testing.T) {
+	t.Parallel()
+
+	body := `
+server:
+  listen: 127.0.0.1:7717
+  state_dir: /var/lib/billet/server
+  lock_dir: locks
+  max_vcpu: 8
+  max_memory: 32GiB
+node:
+  name: host-1
+  server_addr: 127.0.0.1:7717
+  provider: docker
+  state_dir: /var/lib/billet/node
+  lock_dir: locks
+github:
+  org: acme
+  app_id: 1
+  installation_id: 2
+  private_key_path: /tmp/key.pem
+tiers:
+  - label: billet-2vcpu
+    provider: docker
+    vcpu: 2
+    memory: 8GiB
+    image: ubuntu:24.04
+`
+
+	_, err := Load(writeConfig(t, body))
+	if err == nil {
+		t.Fatal("a relative node.lock_dir was accepted")
+	}
+}

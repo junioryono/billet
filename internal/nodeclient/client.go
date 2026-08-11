@@ -1,0 +1,620 @@
+// Package nodeclient is a compute host's half of the node wire.
+//
+// It dials the control plane, registers, and then does two things forever: long-
+// polls for commands, and answers the ledger questions the runner asks. The
+// LeaseStore it implements is the same interface internal/node.Runner already
+// takes, which is why the runner needs no knowledge that its ledger is now on
+// the other side of a network.
+package nodeclient
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/tls"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/node"
+	"github.com/junioryono/billet/internal/nodeapi"
+	"github.com/junioryono/billet/internal/server"
+)
+
+// ErrUnregistered means the control plane does not know this node.
+//
+// The node's answer is to register again, not to retry the same call: this is
+// what a restarted control plane looks like from here, and retrying a lease
+// write it will keep refusing is an infinite loop that fixes nothing.
+var ErrUnregistered = errors.New("nodeclient: the control plane does not know this node")
+
+// ErrRefused means the control plane understood the request and rejected it.
+//
+// RETRYING CANNOT HELP, which is the whole reason it is a distinct error. A
+// protocol version mismatch or a foreign deployment identity will be refused
+// identically forever, and a node that retried every five seconds would sit
+// there looking alive while never being able to work — the failure nobody
+// notices because nothing is crashing.
+var ErrRefused = errors.New("nodeclient: the control plane refused this node")
+
+// ErrUnauthenticated means the connection proved nothing about who it is.
+//
+// NOT A VERDICT, and that distinction is the point. ErrRefused is permanent and
+// the node stops on it. This is an expired, missing, or replaced certificate —
+// something an operator fixes on this host, after which the same node connects
+// fine. A node that gave up here would have to be restarted by hand once they
+// had.
+var ErrUnauthenticated = errors.New("nodeclient: this node did not prove who it is")
+
+// ErrSuperseded means another process has registered under this node's name.
+//
+// The node STOPS on this, and stopping is the point. Re-registering would take
+// the name back, the other host would take it back in turn, and the control
+// plane's accounting would follow neither while both ran containers against the
+// same leases. It is a configuration mistake — one certificate bundle copied to
+// two machines, or one name written into two config files — and an operator has
+// to fix it.
+var ErrSuperseded = errors.New("nodeclient: another process is registered as this node")
+
+// Client talks to a control plane.
+type Client struct {
+	base string
+	node string
+	// incarnation identifies THIS node process, for the whole of its life.
+	//
+	// Minted once, here, rather than per registration: a node that re-registers
+	// after the plane forgot it is the same process holding the same compute, and
+	// giving it a new identity each time would make every reconnect look like a
+	// second host.
+	incarnation string
+	http        *http.Client
+	reqTimeout  time.Duration
+
+	// WRITTEN BY EVERY REGISTRATION, READ BY THE JANITOR AND THE POLL LOOP, which
+	// are different goroutines with no lock between them. Plain fields here were a
+	// data race that -race would only catch on the re-registration a test has to
+	// go out of its way to produce: the first registration happens-before the
+	// janitor starts, and every one after it does not.
+	ttl  atomic.Int64 // nanoseconds
+	poll atomic.Int64 // nanoseconds
+}
+
+// Options configures a Client.
+type Options struct {
+	// Base is the control plane's address, as a URL or a bare host:port.
+	//
+	// A bare address takes its scheme from whether TLS is configured, which is the
+	// only place that answer is known. Config carries host:port because that is
+	// what an operator writes and what the address can be validated as; a URL
+	// there would let someone write http:// beside a certificate and get a node
+	// that quietly never used it.
+	Base string
+	// Node is this host's name, which must match its entry in the server's
+	// fleet configuration.
+	Node string
+	// HTTP is the transport. A caller supplies one so timeouts are decided once
+	// rather than here.
+	HTTP *http.Client
+	// TLS is the node's side of the wire: its certificate, and the deployment
+	// authority it verifies the control plane against.
+	//
+	// Nil serves loopback, and nothing else — a control plane bound to a network
+	// address refuses to start without a certificate, so a node reaching one over
+	// the network without this fails at the handshake rather than half-connecting.
+	TLS *tls.Config
+	// RequestTimeout bounds an ordinary request. Zero uses requestTimeout.
+	//
+	// Configuration rather than a test hook: a node on a slow or distant link
+	// legitimately needs longer, and the alternative is every such deployment
+	// discovering the constant by hitting it.
+	RequestTimeout time.Duration
+}
+
+// New builds a Client. It does not dial; Register does.
+func New(opts Options) (*Client, error) {
+	if opts.Base == "" {
+		return nil, errors.New("nodeclient: a control plane address is required")
+	}
+
+	if opts.Node == "" {
+		return nil, errors.New("nodeclient: a node name is required")
+	}
+
+	base, err := normaliseBase(opts.Base, opts.TLS != nil)
+	if err != nil {
+		return nil, err
+	}
+
+	incarnation, err := mintIncarnation()
+	if err != nil {
+		return nil, err
+	}
+
+	c := &Client{
+		base:        base,
+		node:        opts.Node,
+		incarnation: incarnation,
+		http:        opts.HTTP,
+		reqTimeout:  opts.RequestTimeout,
+	}
+
+	if c.reqTimeout <= 0 {
+		c.reqTimeout = requestTimeout
+	}
+
+	// A SUPPLIED CLIENT KEEPS ITS OWN TRANSPORT. Reaching into someone else's
+	// http.Client to install a TLS config would silently change every other
+	// request that client makes, and the caller that passed it in is the one who
+	// knows whether that is wanted.
+	if c.http != nil && opts.TLS != nil {
+		return nil, errors.New(
+			"nodeclient: both an HTTP client and a TLS config were supplied; the TLS config " +
+				"would have to be installed into a transport this package does not own")
+	}
+
+	if c.http == nil {
+		// NO CLIENT-WIDE TIMEOUT, deliberately: a command poll is a long poll and
+		// a blanket Timeout would cut it every cycle. What replaces it is a
+		// per-request deadline, applied below — the first version of this comment
+		// promised that and no call actually had one, so every operation could
+		// hang forever against a control plane that accepted the connection and
+		// then said nothing.
+		//
+		// The transport still bounds the phases a long poll does not need to keep
+		// open. A dial or a TLS handshake that never completes is never a healthy
+		// poll, and leaving those unbounded means a wedged network holds a
+		// goroutine and a socket indefinitely.
+		c.http = &http.Client{
+			Transport: &http.Transport{
+				DialContext:           (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
+				TLSClientConfig:       opts.TLS,
+				TLSHandshakeTimeout:   10 * time.Second,
+				ResponseHeaderTimeout: 0, // a long poll withholds headers on purpose
+				IdleConnTimeout:       90 * time.Second,
+			},
+		}
+	}
+
+	return c, nil
+}
+
+// normaliseBase turns what an operator wrote into a URL requests can be built
+// from.
+//
+// THIS IS WHERE `billet node` WAS BROKEN, and nothing caught it because the
+// check that stood here could not fail: url.Parse accepts "127.0.0.1:7717"
+// happily — it reads the host as a scheme — so a config-supplied host:port
+// passed validation, became the base, and then every single request died at
+// construction with "first path segment in URL cannot contain colon". The node
+// command could not make one call. Every test dialled an httptest server, whose
+// URL already carries a scheme, so the whole suite was green.
+func normaliseBase(raw string, secure bool) (string, error) {
+	raw = strings.TrimSuffix(raw, "/")
+
+	scheme := "http"
+	if secure {
+		scheme = "https"
+	}
+
+	if !strings.Contains(raw, "://") {
+		raw = scheme + "://" + raw
+	}
+
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("nodeclient: control plane address %q: %w", raw, err)
+	}
+
+	if u.Host == "" {
+		return "", fmt.Errorf(
+			"nodeclient: control plane address %q names no host", raw)
+	}
+
+	switch u.Scheme {
+	case "http":
+		// A CERTIFICATE THAT WOULD NEVER BE PRESENTED IS A CONFIGURATION ERROR, not
+		// a fallback. The handshake would fail anyway against a plane that requires
+		// one; refusing here says why, instead of leaving an operator reading TLS
+		// errors from a node they believed was configured for TLS.
+		if secure {
+			return "", fmt.Errorf(
+				"nodeclient: control plane address %q is http, but this node has a certificate "+
+					"to present; drop the scheme or write https", raw)
+		}
+	case "https":
+		if !secure {
+			return "", fmt.Errorf(
+				"nodeclient: control plane address %q is https, but this node has no certificate "+
+					"to present, so the control plane will reject the handshake", raw)
+		}
+	default:
+		return "", fmt.Errorf(
+			"nodeclient: control plane address %q must be http or https", raw)
+	}
+
+	return u.Scheme + "://" + u.Host + strings.TrimSuffix(u.Path, "/"), nil
+}
+
+// BaseForTest reports the URL requests are built from.
+//
+// Exported for tests because the failure it guards is invisible from outside:
+// a base without a scheme builds a request that never leaves the process.
+func (c *Client) BaseForTest() string { return c.base }
+
+// Register introduces this node and learns the timings it must respect.
+func (c *Client) Register(
+	ctx context.Context,
+	provider config.ProviderKind,
+	guestOS []config.GuestOS,
+	deployment string,
+) error {
+	var res nodeapi.RegisterResponse
+
+	err := c.do(ctx, http.MethodPost, "/v1/register", nodeapi.RegisterRequest{
+		Version:     nodeapi.Version,
+		Incarnation: c.incarnation,
+		Node:        c.node,
+		Provider:    provider,
+		GuestOS:     guestOS,
+		Deployment:  deployment,
+	}, &res)
+	if err != nil {
+		return err
+	}
+
+	if res.Version != nodeapi.Version {
+		return fmt.Errorf(
+			"nodeclient: control plane answered with protocol version %d, this node speaks %d",
+			res.Version, nodeapi.Version)
+	}
+
+	// TAKEN FROM THE SERVER, not chosen here. The reaper on the other side is what
+	// enforces the TTL, so a node that picked its own renewal cadence would be
+	// guessing at someone else's deadline.
+	ttl := time.Duration(res.LeaseTTLSeconds) * time.Second
+
+	// VALIDATED BEFORE IT IS PUBLISHED. Storing an unusable TTL and then reporting
+	// the error would leave a janitor already running on the bad value.
+	if ttl <= 0 {
+		return fmt.Errorf("nodeclient: control plane reported a lease TTL of %ds, which cannot "+
+			"be renewed against", res.LeaseTTLSeconds)
+	}
+
+	c.ttl.Store(int64(ttl))
+	c.poll.Store(int64(time.Duration(res.PollSeconds) * time.Second))
+
+	return nil
+}
+
+// Incarnation identifies this node process.
+func (c *Client) Incarnation() string { return c.incarnation }
+
+// mintIncarnation picks a value no other node process will hold.
+//
+// RANDOM, NOT A COUNTER OR A TIMESTAMP. A counter starts again at one after a
+// restart, and two hosts booted by the same automation at the same second share
+// a timestamp — both of which produce collisions in exactly the situation this
+// exists to detect.
+func mintIncarnation() (string, error) {
+	var raw [16]byte
+
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", fmt.Errorf("nodeclient: mint an incarnation: %w", err)
+	}
+
+	return hex.EncodeToString(raw[:]), nil
+}
+
+// requestTimeout bounds an ordinary request.
+//
+// Generous enough for a slow control plane doing a database write, short enough
+// that a wedged one does not stall the node's whole loop. A heartbeat that takes
+// this long has already missed its purpose.
+const requestTimeout = 30 * time.Second
+
+// pollSlack is added to the negotiated poll window before the node gives up.
+//
+// The server closes an idle poll at the window; the node must allow for that
+// answer to travel. Cutting at exactly the window would abort healthy polls at
+// the moment they were about to return 204.
+const pollSlack = 15 * time.Second
+
+// LeaseTTL is how long a lease survives without a heartbeat.
+//
+// Zero until the first registration answers, because the server is what decides
+// it. A caller that renews on this must not start before then.
+func (c *Client) LeaseTTL() time.Duration { return time.Duration(c.ttl.Load()) }
+
+// PollWindow is how long a command poll may block.
+func (c *Client) PollWindow() time.Duration {
+	if poll := time.Duration(c.poll.Load()); poll > 0 {
+		return poll
+	}
+
+	return 50 * time.Second
+}
+
+// Poll waits for one command.
+//
+// Returns ok=false when the window closed with nothing to do, which is the
+// ordinary outcome on an idle fleet and not an error — the same shape the plane
+// uses on the other side, for the same reason.
+func (c *Client) Poll(ctx context.Context) (nodeapi.Command, bool, error) {
+	var cmd nodeapi.Command
+
+	// BOUNDED BY THE NEGOTIATED WINDOW, not by the request timeout. This is the
+	// one call that is meant to block, and the only call whose deadline comes
+	// from what the server said rather than from a constant here.
+	ctx, cancel := context.WithTimeout(ctx, c.PollWindow()+pollSlack)
+	defer cancel()
+
+	status, err := c.doStatus(ctx, http.MethodPost, c.nodePath("/poll"), nil, &cmd)
+	if err != nil {
+		return nodeapi.Command{}, false, err
+	}
+
+	if status == http.StatusNoContent {
+		return nodeapi.Command{}, false, nil
+	}
+
+	return cmd, true, nil
+}
+
+// Report tells the control plane what happened to a command.
+func (c *Client) Report(ctx context.Context, res nodeapi.CommandResult) error {
+	return c.do(ctx, http.MethodPost, c.nodePath("/result"), res, nil)
+}
+
+// Bind claims a lease for this node.
+func (c *Client) Bind(ctx context.Context, leaseID string, epoch int64, nodeName string) error {
+	return c.do(ctx, http.MethodPost, c.leasePath(leaseID, "/bind"),
+		nodeapi.BindRequest{Epoch: epoch, Node: nodeName}, nil)
+}
+
+// Advance moves a lease to a new phase.
+func (c *Client) Advance(ctx context.Context, leaseID string, epoch int64, to alloc.Phase) error {
+	return c.do(ctx, http.MethodPost, c.leasePath(leaseID, "/advance"),
+		nodeapi.AdvanceRequest{Epoch: epoch, Phase: string(to)}, nil)
+}
+
+// Heartbeat renews a lease.
+func (c *Client) Heartbeat(ctx context.Context, leaseID string, epoch int64) error {
+	return c.do(ctx, http.MethodPost, c.leasePath(leaseID, "/heartbeat"),
+		nodeapi.HeartbeatRequest{Epoch: epoch}, nil)
+}
+
+// Release ends a lease with a terminal outcome.
+func (c *Client) Release(ctx context.Context, leaseID string, epoch int64, outcome alloc.Phase) error {
+	return c.do(ctx, http.MethodPost, c.leasePath(leaseID, "/release"),
+		nodeapi.ReleaseRequest{Epoch: epoch, Outcome: string(outcome)}, nil)
+}
+
+// Lease reads a lease.
+func (c *Client) Lease(ctx context.Context, leaseID string) (*alloc.Lease, error) {
+	var res nodeapi.LeaseResponse
+
+	if err := c.do(ctx, http.MethodGet, c.leasePath(leaseID, ""), nil, &res); err != nil {
+		return nil, err
+	}
+
+	if res.Lease == nil {
+		return nil, fmt.Errorf("%w: %s", alloc.ErrLeaseNotFound, leaseID)
+	}
+
+	return res.Lease, nil
+}
+
+// LaunchedLeaseIDs reports which leases this node is believed to have launched.
+func (c *Client) LaunchedLeaseIDs(ctx context.Context, nodeName string) (map[string]bool, error) {
+	var res nodeapi.LaunchedResponse
+
+	if err := c.do(ctx, http.MethodGet, "/v1/nodes/"+url.PathEscape(nodeName)+"/launched", nil, &res); err != nil {
+		return nil, err
+	}
+
+	if res.LeaseIDs == nil {
+		return map[string]bool{}, nil
+	}
+
+	return res.LeaseIDs, nil
+}
+
+// Describe finds a tier's scale set, via the control plane.
+//
+// The node cannot ask GitHub itself: it holds no App key, by design. See the JIT
+// half of internal/nodeapi for why that is a security property rather than an
+// inconvenience.
+func (c *Client) Describe(ctx context.Context, name, group string) (*node.Set, []string, error) {
+	var res nodeapi.DescribeResponse
+
+	err := c.do(ctx, http.MethodPost, c.nodePath("/describe"),
+		nodeapi.DescribeRequest{Name: name, Group: group}, &res)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if !res.Found {
+		// A NIL SET IS THE CONTRACT for "there is no such scale set", and the
+		// runner treats it as a reason to stop. Returning a zero-valued set would
+		// have it launch against scale set 0.
+		return nil, res.Names, nil
+	}
+
+	return &node.Set{ID: res.ID, Name: res.Name}, res.Names, nil
+}
+
+// JITConfig asks the control plane to mint one runner registration.
+func (c *Client) JITConfig(
+	ctx context.Context, scaleSetID int, runnerName, workFolder string,
+) (node.Registration, error) {
+	var res nodeapi.JITResponse
+
+	err := c.do(ctx, http.MethodPost, c.nodePath("/jit"), nodeapi.JITRequest{
+		ScaleSetID: scaleSetID,
+		RunnerName: runnerName,
+		WorkFolder: workFolder,
+	}, &res)
+	if err != nil {
+		return nil, err
+	}
+
+	if res.Config == "" {
+		return nil, fmt.Errorf(
+			"nodeclient: the control plane returned an empty registration for %q, which would "+
+				"start an instance that can never register", runnerName)
+	}
+
+	return &registration{config: res.Config, name: res.RunnerName}, nil
+}
+
+// registration is a minted registration whose config is a CREDENTIAL.
+//
+// The field is unexported and reachable only through Config(), so printing the
+// value with %v or %+v yields a struct with no visible secret. That is a small
+// thing until somebody logs the registration while debugging a launch, which is
+// exactly when it would happen.
+type registration struct {
+	config string
+	name   string
+}
+
+func (r *registration) Config() string     { return r.config }
+func (r *registration) RunnerName() string { return r.name }
+
+// String keeps the credential out of anything that formats this value.
+func (r *registration) String() string {
+	return "nodeclient.registration{runner:" + r.name + ", config:REDACTED}"
+}
+
+func (c *Client) nodePath(suffix string) string {
+	return "/v1/nodes/" + url.PathEscape(c.node) + suffix
+}
+
+func (c *Client) leasePath(leaseID, suffix string) string {
+	return c.nodePath("/leases/" + url.PathEscape(leaseID) + suffix)
+}
+
+// do performs an ordinary request under the standard deadline.
+//
+// Every caller but Poll goes through here, which is what makes the bound
+// universal rather than something each call site remembers.
+func (c *Client) do(ctx context.Context, method, path string, body, into any) error {
+	ctx, cancel := context.WithTimeout(ctx, c.reqTimeout)
+	defer cancel()
+
+	_, err := c.doStatus(ctx, method, path, body, into)
+
+	return err
+}
+
+// doStatus performs one request and translates the answer.
+func (c *Client) doStatus(ctx context.Context, method, path string, body, into any) (int, error) {
+	var reader io.Reader
+
+	if body != nil {
+		raw, err := json.Marshal(body)
+		if err != nil {
+			return 0, fmt.Errorf("nodeclient: encode %s: %w", path, err)
+		}
+
+		reader = bytes.NewReader(raw)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, c.base+path, reader)
+	if err != nil {
+		return 0, fmt.Errorf("nodeclient: build %s: %w", path, err)
+	}
+
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
+	// ON EVERY REQUEST, including the ones with no body. The registration claims
+	// an incarnation; each request after it proves the claim is still held by the
+	// process that made it, which is what lets the control plane tell a restart
+	// from a second host wearing the same name.
+	req.Header.Set(nodeapi.HeaderIncarnation, c.incarnation)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("nodeclient: %s %s: %w", method, path, err)
+	}
+
+	defer func() {
+		// DRAINED BEFORE CLOSING so the connection can be reused. A node holds one
+		// control plane for its whole life and makes a heartbeat-rate stream of
+		// small requests; leaking a connection per call would eventually exhaust
+		// the ports on a busy host.
+		//
+		// A drain that fails changes nothing the caller can act on — the response
+		// has already been read or has already failed — so it is deliberately not
+		// propagated. Closing still happens either way.
+		if _, err := io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16)); err != nil {
+			_ = err
+		}
+
+		if err := resp.Body.Close(); err != nil {
+			_ = err
+		}
+	}()
+
+	if resp.StatusCode == http.StatusNoContent {
+		return resp.StatusCode, nil
+	}
+
+	if resp.StatusCode >= 300 {
+		return resp.StatusCode, c.decodeErr(resp)
+	}
+
+	if into != nil {
+		if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(into); err != nil {
+			return resp.StatusCode, fmt.Errorf("nodeclient: decode %s: %w", path, err)
+		}
+	}
+
+	return resp.StatusCode, nil
+}
+
+// decodeErr turns a refusal into an error the node can branch on.
+//
+// THE CODE IS WHAT MATTERS. A fenced lease means stop — something else owns it —
+// and must surface as alloc.ErrFenced so the runner's existing handling applies
+// unchanged. That the failure arrived over a network is an implementation
+// detail the runner should never have to know.
+func (c *Client) decodeErr(resp *http.Response) error {
+	var body nodeapi.ErrorResponse
+
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<16)).Decode(&body); err != nil {
+		return fmt.Errorf("nodeclient: %s (and its error body was unreadable: %w)",
+			resp.Status, err)
+	}
+
+	switch body.Code {
+	case nodeapi.CodeRefused:
+		return fmt.Errorf("%w: %s", ErrRefused, body.Message)
+	case nodeapi.CodeSuperseded:
+		return fmt.Errorf("%w: %s", ErrSuperseded, body.Message)
+	case nodeapi.CodeUnauthenticated:
+		return fmt.Errorf("%w: %s", ErrUnauthenticated, body.Message)
+	case nodeapi.CodeCustody:
+		return fmt.Errorf("%w: %s", server.ErrCustody, body.Message)
+	case nodeapi.CodeFenced:
+		return fmt.Errorf("%w: %s", alloc.ErrFenced, body.Message)
+	case nodeapi.CodeNotFound:
+		return fmt.Errorf("%w: %s", alloc.ErrLeaseNotFound, body.Message)
+	case nodeapi.CodeUnregistered:
+		return fmt.Errorf("%w: %s", ErrUnregistered, body.Message)
+	default:
+		return fmt.Errorf("nodeclient: control plane refused: %s (%s)", body.Message, resp.Status)
+	}
+}
