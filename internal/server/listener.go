@@ -309,6 +309,11 @@ type Listener struct {
 	// documented scaling signal — counting messages is not, because a response
 	// carries at most 50 and a large backlog is truncated.
 	observed *Statistics
+
+	// drainGrace bounds the DRAIN, which is a different kind of wait from every
+	// other budget here and so has its own ceiling. The others bound a teardown —
+	// work billet is doing. This one bounds somebody else's JOB.
+	drainGrace time.Duration
 }
 
 // NewListener builds a listener for one tier.
@@ -328,6 +333,7 @@ func NewListener(a *alloc.Allocator, tier string, session Session, opts ...Optio
 		shutdownGrace: defaultShutdownGrace,
 		closeGrace:    defaultCloseGrace,
 		releaseGrace:  defaultReleaseGrace,
+		drainGrace:    defaultDrainGrace,
 		retryFirst:    firstRetryEvery,
 		retryMax:      maxRetryEvery,
 	}
@@ -480,7 +486,36 @@ const (
 	// Longer than any real teardown and plainly finite, so the four budgets cannot
 	// sum to something int64 cannot hold — and so a watchdog always fires on a
 	// timescale an operator lives on.
+	//
+	// It deliberately does NOT bound the drain; see maxDrainGrace.
 	maxGrace = time.Hour
+
+	// defaultDrainGrace bounds how long the listener keeps polling for
+	// completions after it has been asked to stop, before it gives up waiting and
+	// destroys whatever is still running.
+	//
+	// SIX HOURS BECAUSE THAT IS THE LENGTH OF A JOB, not the length of a
+	// shutdown: GitHub's jobs.<job_id>.timeout-minutes defaults to 360. Every
+	// other budget in this file bounds work BILLET is doing, where an hour is
+	// already generous. This one bounds work somebody ELSE is doing, which is why
+	// it is three orders of magnitude larger and has a separate ceiling.
+	//
+	// Overrunning it is not a failure state. The drain stops waiting and the
+	// ordinary teardown destroys what is left — exactly what happened on every
+	// shutdown before a drain existed.
+	defaultDrainGrace = 6 * time.Hour
+
+	// maxDrainGrace is the largest drain a caller may ask for.
+	//
+	// Separate from maxGrace because the two bound different things. Reusing the
+	// teardown's one-hour ceiling here would refuse every honest value for a fleet
+	// whose jobs run longer than an hour — which is most of them — and push those
+	// operators back onto the job-killing restart the drain replaced.
+	//
+	// A day is still a ceiling: past this a typo is likelier than the intent, and
+	// a service manager's stop timeout sized from a year-long drain would wait
+	// effectively forever.
+	maxDrainGrace = 24 * time.Hour
 
 	// defaultShutdownGrace bounds the whole teardown.
 	//
@@ -537,11 +572,35 @@ func WithShutdownGrace(d time.Duration) Option {
 	}
 }
 
+// WithDrainGrace bounds how long a stopping listener waits for the jobs it is
+// already running to finish before it destroys them.
+//
+// Validated against maxDrainGrace rather than maxGrace, because this is the one
+// budget here that waits on somebody else's job rather than on billet's own
+// teardown. See defaultDrainGrace.
+func WithDrainGrace(d time.Duration) Option {
+	return func(l *Listener) {
+		if l.setWithin("drain grace", d, maxDrainGrace) {
+			l.drainGrace = d
+		}
+	}
+}
+
 // set validates one budget and records the outcome against its field name,
 // replacing whatever the last option said about that field. It reports whether
 // the value may be used.
 func (l *Listener) set(field string, d time.Duration) bool {
-	err := checkGrace(field, d)
+	return l.setWithin(field, d, maxGrace)
+}
+
+// setWithin is set with an explicit ceiling, so the drain can be validated
+// against maxDrainGrace while every teardown budget keeps maxGrace.
+//
+// A parameter rather than a second copy of this bookkeeping: the "last value
+// wins, including a correction" behaviour below is subtle enough that two
+// implementations of it would drift.
+func (l *Listener) setWithin(field string, d, ceiling time.Duration) bool {
+	err := checkGrace(field, d, ceiling)
 
 	if err != nil {
 		l.configErrs[field] = err
@@ -624,12 +683,17 @@ func sumBudgets(budgets ...time.Duration) time.Duration {
 // a NEGATIVE one, which is an expired deadline; saturating instead gives a
 // watchdog that fires in about 292 years, which is not a watchdog. A bound that
 // is plainly longer than any real teardown and plainly finite avoids both.
-func checkGrace(name string, d time.Duration) error {
+//
+// The ceiling is a PARAMETER because one of these budgets is not like the
+// others: the drain waits on somebody else's job and is bounded by
+// maxDrainGrace, while every teardown budget waits on billet's own work and is
+// bounded by maxGrace. See maxDrainGrace for why they cannot be one number.
+func checkGrace(name string, d, ceiling time.Duration) error {
 	switch {
 	case d <= 0:
 		return fmt.Errorf("server: %s must be positive, got %s", name, d)
-	case d > maxGrace:
-		return fmt.Errorf("server: %s must be at most %s, got %s", name, maxGrace, d)
+	case d > ceiling:
+		return fmt.Errorf("server: %s must be at most %s, got %s", name, ceiling, d)
 	}
 
 	return nil

@@ -51,6 +51,9 @@ type Server struct {
 	maxCapacity *int
 	// reapEvery is how often abandoned capacity is reclaimed.
 	reapEvery time.Duration
+	// drainTimeout, when positive, is how long every listener waits for its
+	// running jobs on shutdown. Zero leaves each listener on its own default.
+	drainTimeout time.Duration
 	// runner is handed to every listener, so an assigned lease becomes compute.
 	// nil means none is attached and the listeners fail closed.
 	runner Runner
@@ -81,6 +84,16 @@ func WithReapInterval(d time.Duration) ControlPlaneOption {
 // the work, rather than accepting jobs nothing can run.
 func WithNodeRunner(r Runner) ControlPlaneOption {
 	return func(s *Server) { s.runner = r }
+}
+
+// WithDrainTimeout sets how long every listener waits for the jobs it is
+// already running before a shutdown destroys them.
+//
+// This is the operator's key — server.drain_timeout — reaching the code that
+// honours it. See defaultDrainGrace for why the default is the length of a job
+// rather than the length of a shutdown.
+func WithDrainTimeout(d time.Duration) ControlPlaneOption {
+	return func(s *Server) { s.drainTimeout = d }
 }
 
 // AdvertiseNothing makes every listener advertise zero capacity.
@@ -243,6 +256,17 @@ func (s *Server) runTier(ctx context.Context, t *config.Tier, set *ScaleSet) err
 	// what put them in the wrong order: Go runs Run's defer first, so the escrow
 	// went back while the advertisement was still live.
 
+	return NewListener(s.alloc, t.Label, session, s.listenerOpts()...).Run(ctx)
+}
+
+// listenerOpts is what every listener this control plane starts is configured
+// with.
+//
+// Factored out of runTier so a test can assert that a control-plane option
+// actually reaches a listener. Asserting on the option alone passes while the
+// value never leaves the config file, which is the whole failure worth catching
+// here.
+func (s *Server) listenerOpts() []Option {
 	opts := []Option{WithLogger(s.log)}
 	if s.maxCapacity != nil {
 		opts = append(opts, WithMaxCapacity(*s.maxCapacity))
@@ -252,7 +276,11 @@ func (s *Server) runTier(ctx context.Context, t *config.Tier, set *ScaleSet) err
 		opts = append(opts, WithRunner(s.runner))
 	}
 
-	return NewListener(s.alloc, t.Label, session, opts...).Run(ctx)
+	if s.drainTimeout > 0 {
+		opts = append(opts, WithDrainGrace(s.drainTimeout))
+	}
+
+	return opts
 }
 
 // reapPeriodically reclaims capacity from leases whose holder stopped

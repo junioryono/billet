@@ -441,7 +441,17 @@ func runServer(ctx context.Context, cfg *config.Config, dryRun, dev bool) error 
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	var opts []server.ControlPlaneOption
+	// Parsed rather than trusted. Validate already rejected a bad value when the
+	// file was read, so this cannot normally fail — but reading it is the only
+	// thing that makes the operator's key take effect, and discarding the error
+	// would leave every listener on the default with nothing to say the config
+	// had asked for something else.
+	drainTimeout, err := cfg.Server.DrainTimeoutDuration()
+	if err != nil {
+		return err
+	}
+
+	opts := []server.ControlPlaneOption{server.WithDrainTimeout(drainTimeout)}
 
 	if dryRun {
 		opts = append(opts, server.AdvertiseNothing())
