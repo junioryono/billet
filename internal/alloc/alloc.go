@@ -1080,20 +1080,17 @@ func (a *Allocator) RegisterNode(ctx context.Context, reg NodeRegistration) (int
 
 		// A HOST DOES NOT MOVE WHILE IT IS RUNNING WORK, for the same reason it may not
 		// change its backend: the leases here recorded where they are, and site is where a
-		// cache lives, so the ledger would point later placements at storage in a
-		// different building from the containers already running.
+		// cache lives, so the ledger would point later placements at storage in a different
+		// building from the containers already running.
 		//
 		// WORK MERELY AIMED HERE COUNTS TOO, so both guards attribute a lease the way the
 		// rest of the arithmetic does — COALESCE(node, target_node). `node` is filled at
-		// bind, but escrow chose the machine long before that and billet has already
-		// advertised the slot on its behalf.
+		// bind, but escrow chose the machine long before that.
 		//
 		// EXPIRED WORK DOES NOT GET A VOTE. billet registers the node BEFORE the server
 		// starts and the reaper runs inside that server, so a registration refused on the
-		// strength of expired leases prevents the only process that could clear them, and
-		// every restart meets the same wall. The cutoff is the reaper's own.
-		//
-		// Capacity is different and IS overwritten below.
+		// strength of expired leases prevents the only process that could clear them. The
+		// cutoff is the reaper's own. Capacity is different and IS overwritten below.
 		case currentSite != reg.Site:
 			var outstanding int
 

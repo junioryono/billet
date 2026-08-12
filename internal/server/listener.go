@@ -1672,23 +1672,20 @@ func (l *Listener) renew(ctx context.Context, lease *alloc.Lease) renewal {
 		return renewalLost
 	}
 
-	// NO ANSWER. Shutting down, the pass ran out of its own deadline, or the
-	// database is busy — the allocator never said this lease was not ours, so it
-	// is kept. Dropping it would remove it from the release path too, and the
-	// ledger would keep counting it until the reaper got it back.
+	// NO ANSWER. Shutting down, the pass ran out of its own deadline, or the database
+	// is busy — the allocator never said this lease was not ours, so it is kept.
+	// Dropping it would remove it from the release path too, and the ledger would keep
+	// counting it until the reaper got it back.
 	//
-	// BUT NOT FOREVER. "No evidence it is lost" stops being a reason once the TTL
-	// has passed without a single confirmed renewal: by then the reaper can have
-	// taken it, and advertising capacity that is now someone else's is the exact
-	// double-admission the escrow exists to prevent. Uncertainty for longer than
-	// a lease can survive is not uncertainty.
-	// The clock starts when the lease is TRACKED, not when the first renewal
-	// fails. Starting it here handed a never-confirmed lease an extra TTL it had
-	// never earned: escrowed at t=0 and expiring at t=TTL, its first failed
-	// renewal at t=TTL/3 would set the clock there, and it stayed advertised past
-	// t=4TTL/3 — well after the reaper could have taken it. Every entry point
-	// seeds `confirmed` now, so a missing entry means the lease is not one of
-	// ours to renew.
+	// BUT NOT FOREVER. "No evidence it is lost" stops being a reason once the TTL has
+	// passed without a single confirmed renewal: by then the reaper can have taken it,
+	// and advertising capacity that is now someone else's is the exact double-admission
+	// the escrow exists to prevent.
+	//
+	// The clock starts when the lease is TRACKED, not when the first renewal fails —
+	// otherwise a never-confirmed lease gets an extra TTL it never earned. Every entry
+	// point seeds `confirmed`, so a missing entry means the lease is not one of ours to
+	// renew.
 	last, seen := l.confirmed[lease.ID]
 	if !seen {
 		l.log.Warn("renewing a lease this listener never recorded; treating it as unknown",
@@ -1741,22 +1738,18 @@ func (l *Listener) refillEscrow(ctx context.Context) error {
 		return nil
 	}
 
-	// STAMPED BEFORE THE CALL, which is the only place a second clock can be
-	// safely wrong.
-	//
-	// This has now been moved twice. Sampling after l.mu let a slow heartbeat pass
-	// hold the mutex and date a lease TTL/3 late; sampling after Escrow RETURNED
-	// was better and still wrong, because the goroutine can be descheduled between
-	// the commit and the sample and date it arbitrarily late. Every one of those
-	// errors runs in the same direction: a lease dated later than it really is
-	// stays advertisable after the reaper could already have taken it.
+	// STAMPED BEFORE THE CALL, which is the only place a second clock can be safely
+	// wrong. Sampling after l.mu lets a slow heartbeat pass hold the mutex and date a
+	// lease TTL/3 late; sampling after Escrow returns is no better, because the
+	// goroutine can be descheduled between the commit and the sample. Both errors run
+	// in the same direction: a lease dated later than it really is stays advertisable
+	// after the reaper could already have taken it.
 	//
 	// Taken beforehand, the error runs the other way — the lease is dated slightly
-	// EARLIER than the allocator's own expiry basis, so the worst case is dropping
-	// one billet still owns. That costs a re-escrow and the reaper reclaims late;
-	// the opposite costs two tiers the same machine. The right fix is for Escrow
-	// to return the allocator's authoritative expiry, which is filed with the rest
-	// of the lifecycle work.
+	// EARLIER than the allocator's own expiry basis, so the worst case is dropping one
+	// billet still owns. That costs a re-escrow; the opposite costs two tiers the same
+	// machine. The real fix is for Escrow to return the allocator's authoritative
+	// expiry, filed with the rest of the lifecycle work.
 	created := time.Now()
 
 	leases, err := l.alloc.Escrow(ctx, l.tier, room)
@@ -1988,24 +1981,20 @@ func (l *Listener) acquire(ctx context.Context, available []Job) error {
 		return fmt.Errorf("server: acquire jobs for %s: %w", l.tier, err)
 	}
 
-	// GitHub returns what it ACTUALLY gave, which can be fewer than were asked
-	// for — another scale set can win the same offer. Escrow reserved for an
-	// offer billet did not get goes back immediately; holding it would strand
-	// capacity waiting for an assignment that is never coming.
-	// A response is only meaningful as a subset of the request, and a response
-	// that is not one is not merely noteworthy — it means billet cannot tell what
-	// it has committed to. An id nobody offered for has no reservation to match
-	// it to, and if the response body is wrong about that id it may be wrong
-	// about the others, so the reserved ids cannot be trusted either.
+	// GitHub returns what it ACTUALLY gave, which can be fewer than were asked for —
+	// another scale set can win the same offer. Escrow reserved for an offer billet
+	// did not get goes back immediately.
+	//
+	// A response that is not a subset of the request means billet cannot tell what it
+	// has committed to: an id nobody offered for has no reservation to match, and a
+	// body wrong about that id may be wrong about the reserved ids too.
 	//
 	// This STOPS the listener, unlike an unbacked assignment, which declines and
-	// carries on. The difference is what each condition means. An unbacked
-	// assignment is reachable by ordinary races — the heartbeat drops a fenced
-	// lease, a restart loses a promise — so killing the control plane over one is
-	// disproportionate. A response outside its own contract is not reachable by
-	// any race; it means the API broke, and continuing means acting on state that
-	// cannot be reasoned about. Stopping is also the remedy: the session is
-	// recreated, and GitHub redelivers or reassigns whatever was unacknowledged.
+	// carries on. An unbacked assignment is reachable by ordinary races — a heartbeat
+	// drops a fenced lease, a restart loses a promise — so killing the control plane
+	// over one is disproportionate. A response outside its own contract is not
+	// reachable by any race, and stopping is also the remedy: the session is recreated
+	// and GitHub redelivers whatever was unacknowledged.
 	if extra := missing(acquired, reserved); len(extra) > 0 {
 		// Everything, not just the unmatched ids. Which commitments are real is
 		// exactly what is no longer known.
@@ -2157,22 +2146,19 @@ func (l *Listener) assign(ctx context.Context, job Job) (*alloc.Lease, bool, err
 		return nil, false, nil
 	}
 
-	// NOR WHILE THE PREVIOUS RUN'S COMPUTE IS STILL OWED. Same reasoning as
-	// reserve: a pending cleanup is addressed by request id, so accepting an
-	// assignment for that id hands the old retry a container and a lease that
-	// belong to the new job.
+	// NOR WHILE THE PREVIOUS RUN'S COMPUTE IS STILL OWED. Same reasoning as reserve: a
+	// pending cleanup is addressed by request id, so accepting an assignment for that
+	// id hands the old retry a container and a lease that belong to the new job.
 	//
-	// AND THIS IS NOT A DECLINE, whatever the reserve path can honestly call
-	// itself. Leaving a request out of AcquireJobs is a real non-acquisition —
-	// GitHub can offer it to another scale set or offer it again. There is no
-	// equivalent call for a job already ASSIGNED to this scale set: billet simply
+	// AND THIS IS NOT A DECLINE. Leaving a request out of AcquireJobs is a real
+	// non-acquisition — GitHub can offer it to another scale set or offer it again.
+	// There is no equivalent call for a job already ASSIGNED to this scale set: billet
 	// does not launch it, acknowledges the message, and the job waits for GitHub's
-	// pickup deadline to reassign it. That is a delay, not a loss, and it is the
-	// least bad option available here — holding the message unacknowledged instead
-	// would re-deliver it every poll and block every message behind it.
-	//
-	// Doing better needs the assignment held locally until the obligation clears,
-	// which needs a launch identity rather than a request id. Tracked separately.
+	// pickup deadline to reassign it. A delay, not a loss, and the least bad option
+	// here — holding the message unacknowledged would re-deliver it every poll and
+	// block every message behind it. Doing better needs the assignment held locally
+	// until the obligation clears, which needs a launch identity rather than a request
+	// id. Tracked separately.
 	if _, ok := l.cleanup[job.RequestID]; ok {
 		l.log.Error("cannot start an assigned job while its previous run's compute is still "+
 			"waiting to be destroyed; billet is not launching it and GitHub will reassign it "+
@@ -2381,32 +2367,20 @@ func (l *Listener) complete(ctx context.Context, job Job) error {
 			l.cleanup[job.RequestID] = &pendingCleanup{job: job}
 		}
 
-		// AND AN EXISTING RECORD IS NEVER DROPPED HERE, which is a different rule
-		// from the one above.
+		// AN EXISTING RECORD IS NEVER DROPPED HERE, unlike the rule above.
 		//
-		// Losing the lease does not prove the container is gone. A record exists
-		// because this listener launched something and could not destroy it; if
-		// the lease is then fenced or reaped, the obligation is unchanged — the
-		// capacity is someone else's, but the compute is still ours to remove, and
-		// GitHub will not redeliver the completion that would ask again.
+		// Losing the lease does not prove the container is gone. The record exists
+		// because this listener launched something and could not destroy it; once the
+		// lease is fenced or reaped the capacity is someone else's, but the compute is
+		// still ours to remove, and GitHub will not redeliver the completion that would
+		// ask again. Sweeper is not a substitute: it is OPTIONAL on the Runner
+		// interface, so a non-sweeping runner leaves the container until the host
+		// restarts.
 		//
-		// Sweeper is not the answer either. It destroys compute no lease is
-		// holding, but it is OPTIONAL on the Runner interface, so relying on it
-		// makes correctness depend on which runner is plugged in — with a
-		// non-sweeping one, nothing destroys the container until the host restarts.
-		//
-		// The pile-up this can cause is real. It is tempting to argue it away by
-		// saying a record's lease stays in `running` being renewed, so its capacity
-		// is never reissued and the map is bounded by the tier's capacity — but
-		// that holds only while the lease is OURS, and this rule is about the case
-		// where it is not. Once the lease is reaped the capacity IS reissued, a new
-		// job can take it, complete, fail to destroy, and add another record.
-		//
-		// So retention is scheduled rather than argued: entries back off
-		// (retryEvery, capped at maxRetryEvery) so a node that is never coming back
-		// cannot occupy every pass ahead of one that has just recovered. That does
-		// NOT survive a restart — the map is in memory — which needs durable
-		// cleanup state and is tracked separately.
+		// Entries back off (retryEvery, capped at maxRetryEvery) so a node that is never
+		// coming back cannot occupy every pass ahead of one that has just recovered. The
+		// map is in memory, so this does not survive a restart; durable cleanup state is
+		// tracked separately.
 
 		l.mu.Unlock()
 

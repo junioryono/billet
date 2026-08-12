@@ -584,26 +584,15 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 		res := execute(ctx, compute, cmd, draining)
 
 		if err := c.Report(ctx, res); err != nil {
-			// THE WORK IS DONE AND THE ANSWER DID NOT LAND, and that is not merely
-			// survivable — it has to be MADE survivable here, because the control
-			// plane's safe assumption and the node's belief would otherwise
-			// disagree in the one direction that leaks.
+			// THE WORK IS DONE AND THE ANSWER DID NOT LAND. The report was lost and the
+			// plane timed the command out, or it arrived late and was answered with
+			// ErrCustody — either way the plane has stopped heartbeating the lease while
+			// the node holds the instance in its ordinary running set, which nothing
+			// renews. The lease is then reaped while the container runs and its capacity
+			// is sold twice, so the party that failed to report takes custody.
 			//
-			// Two ways to arrive, one answer. The report may have been LOST, in
-			// which case the plane timed the command out and assumed custody; or it
-			// may have ARRIVED TOO LATE and been answered with ErrCustody, which
-			// says the same thing out loud.
-			//
-			// Either way the plane has stopped heartbeating the lease, while the
-			// node — having launched successfully — holds the instance in its
-			// ordinary running set, which nothing renews. The lease is then reaped
-			// while the container runs and its capacity is sold twice. So the party
-			// that failed to report takes custody: the handoff is caused rather
-			// than hoped for.
-			//
-			// Done before the ErrUnregistered check on purpose. Being unknown to
-			// the control plane is exactly when custody matters most, and returning
-			// first would skip it.
+			// Done before the ErrUnregistered check on purpose: being unknown to the
+			// control plane is when custody matters most, and returning first would skip it.
 			if res.OK && cmd.Kind == nodeapi.CommandLaunch && cmd.Lease != nil {
 				// A FAILURE HERE IS RENEWAL FAILING, NOT CUSTODY FAILING. The
 				// runner records the lease before it tries to renew it, precisely

@@ -269,22 +269,17 @@ func cmdServer(ctx context.Context, lc *lifecycle, args []string) error {
 // MUST BE CALLED BEFORE newProvider: nothing may touch a container before the
 // right to manage containers under this identity is established.
 func claimNodeDeployment(cfg *config.Config, bundle *wirecert.Bundle) (string, *state.DeploymentLock, error) {
-	// A NODE JOINS A DEPLOYMENT, IT DOES NOT FOUND ONE, and the whole question is
-	// what tells it which one. A certificate answers directly. Without one, the
-	// node can only reach a control plane inside this machine — validation
-	// guarantees that, because a certless node may dial nothing but loopback —
-	// and if this file also describes that control plane, its state directory
-	// holds the answer.
+	// A NODE JOINS A DEPLOYMENT, IT DOES NOT FOUND ONE, and the whole question is what
+	// tells it which one. A certificate answers directly. Without one, the node can
+	// only reach a control plane inside this machine — validation guarantees that,
+	// because a certless node may dial nothing but loopback — and if this file also
+	// describes that control plane, its state directory holds the answer.
 	//
-	// MINTING ITS OWN WAS WRONG, and invisibly so. A state directory with no
-	// identity MINTS a fresh random one, so a node falling back to its own
-	// directory invented a deployment nobody else had heard of. The server had
-	// already minted a different one in its own directory — the shipped example
-	// config gives the two roles different paths — and the plane then refused the
-	// node for belonging elsewhere. That refusal is ErrRefused, which the node
-	// loop reads as a verdict rather than an outage, so the process exits and
-	// nothing ever repairs it. The single-machine deployment simply did not
-	// start, and `--dev` hid it by never registering over the wire at all.
+	// Falling back to the node's OWN directory is not an option, and fails invisibly:
+	// a state directory with no identity MINTS a fresh random one, so the node invents
+	// a deployment nobody has heard of, the plane refuses it for belonging elsewhere,
+	// and that refusal is ErrRefused — which the node loop reads as a verdict rather
+	// than an outage, so the process exits and nothing repairs it.
 	deployment, err := nodeDeploymentID(cfg, bundle)
 	if err != nil {
 		return "", nil, err
