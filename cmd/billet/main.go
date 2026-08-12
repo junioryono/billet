@@ -771,6 +771,8 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 		"ask the control plane to admit this machine, then wait for an operator to approve it")
 	caFingerprint := fs.String("ca-fingerprint", "",
 		"the control plane's CA fingerprint, from `billet ca show` (required with --enroll)")
+	joinToken := fs.String("join-token", "",
+		"a short-lived token from `billet ca token` (required with --enroll)")
 
 	if err := parse(fs, args); err != nil {
 		return err
@@ -792,7 +794,7 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 	// BEFORE ANYTHING ELSE, because enrolling is what produces the bundle
 	// everything below reads.
 	if *enroll {
-		return enrollNode(ctx, cfg, *caFingerprint)
+		return enrollNode(ctx, cfg, *caFingerprint, *joinToken)
 	}
 
 	// LOADED BEFORE THE IDENTITY IS CLAIMED, because the certificate is what
@@ -1140,22 +1142,24 @@ func confirmOrganization(ctx context.Context, org string) error {
 // anybody.
 func cmdCA(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: billet ca issue <node> [--out <dir>] | billet ca revoke <node> | " +
-			"billet ca revocations | billet ca show")
+		return errors.New("usage: billet ca issue <node> [--out <dir>] | billet ca token | " +
+			"billet ca revoke <node> | billet ca revocations | billet ca show")
 	}
 
 	switch args[0] {
 	case "issue":
-		return cmdCAIssue(args[1:])
+		return cmdCAIssue(ctx, args[1:])
 	case "revoke":
 		return cmdCARevoke(ctx, args[1:])
 	case "revocations":
 		return cmdCARevocations(ctx, args[1:])
+	case "token":
+		return cmdCAToken(ctx, args[1:])
 	case "show":
 		return cmdCAShow(args[1:])
 	}
 
-	return fmt.Errorf("unknown ca command %q; try issue, revoke, revocations or show", args[0])
+	return fmt.Errorf("unknown ca command %q; try issue, token, revoke, revocations or show", args[0])
 }
 
 // cmdCARevoke withdraws a node's certificate.
@@ -1302,7 +1306,7 @@ func serialFromCert(path string) (string, error) {
 	return wirecert.Serial(cert), nil
 }
 
-func cmdCAIssue(args []string) error {
+func cmdCAIssue(ctx context.Context, args []string) error {
 	fs := newFlagSet("billet ca issue")
 	cfgPath := addConfigFlag(fs)
 	out := fs.String("out", "", "directory to write the bundle to (default ./<node>-billet-tls)")
@@ -1363,13 +1367,52 @@ func cmdCAIssue(args []string) error {
 		abs = dir
 	}
 
+	// RECORDED, so both ways into a deployment leave the same trail. Issuing
+	// directly used to write nothing down, and a fleet built this way was
+	// invisible to the list that shows what has been admitted.
+	//
+	// Not fatal if it fails: the bundle is already on disk and the operator has
+	// what they came for. Losing the audit row is worth saying out loud and not
+	// worth throwing the certificate away over.
+	if leaf, lerr := wirecert.LeafOf(bundle); lerr != nil {
+		fmt.Fprintf(os.Stderr, "could not read back the certificate to record it: %v\n", lerr)
+	} else if rerr := recordIssued(ctx, *cfgPath, name, wirecert.FingerprintOfCert(leaf),
+		string(bundle.CertPEM)); rerr != nil {
+		fmt.Fprintf(os.Stderr, "issued the bundle but could not record it: %v\n", rerr)
+	}
+
 	fmt.Printf("billet ca: wrote a bundle for node %q to %s\n\n", name, abs)
+	fmt.Printf("  fingerprint  %s\n\n", wirecert.Fingerprint(mustSPKI(bundle)))
 	fmt.Print("Copy that directory to the node, then point its config at the files:\n\n")
-	fmt.Printf("  node:\n    name: %s\n    tls:\n      cert: /etc/billet/tls/node.crt\n"+
-		"      key:  /etc/billet/tls/node.key\n      ca:   /etc/billet/tls/ca.crt\n\n", name)
+	fmt.Printf("  node:\n    tls:\n      cert: /etc/billet/tls/node.crt\n" +
+		"      key:  /etc/billet/tls/node.key\n      ca:   /etc/billet/tls/ca.crt\n\n")
+	fmt.Print("node.name comes from the certificate, so it does not have to be written.\n")
 	fmt.Print("node.key is a private key: keep it 0600 and do not copy it anywhere else.\n")
 
 	return nil
+}
+
+// mustSPKI is the bundle's public key bytes, or nothing if it cannot be read.
+// Used only for display beside a bundle that has already been written.
+func mustSPKI(b wirecert.Bundle) []byte {
+	leaf, err := wirecert.LeafOf(b)
+	if err != nil {
+		return nil
+	}
+
+	return leaf.RawSubjectPublicKeyInfo
+}
+
+// recordIssued writes a directly-issued certificate into the admission trail.
+func recordIssued(ctx context.Context, cfgPath, name, fingerprint, certPEM string) error {
+	a, closeDB, err := controlPlaneAllocator(ctx, cfgPath)
+	if err != nil {
+		return err
+	}
+
+	defer closeDB()
+
+	return a.RecordIssued(ctx, name, fingerprint, certPEM)
 }
 
 func cmdCAShow(args []string) error {
@@ -1403,6 +1446,15 @@ func cmdCAShow(args []string) error {
 	fmt.Printf("deployment  %s\nauthority   %s\nexpires     %s\nfingerprint %s\n",
 		deployment, wirecert.CADir(cfg.Server.StateDir), ca.NotAfter().Format(time.RFC3339),
 		ca.Fingerprint())
+
+	if left, capping := ca.Capping(); capping {
+		fmt.Printf("\nWARNING: this authority expires in %s, which is less than a certificate's\n",
+			left.Round(24*time.Hour))
+		fmt.Printf("full life, so every certificate it issues from now on is SHORTER than the\n")
+		fmt.Printf("last — and when it expires, every node stops at once. Nothing will error\n")
+		fmt.Printf("before that. Plan a rotation: issue a new authority, let nodes pick it up\n")
+		fmt.Printf("through renewal while both are trusted, then retire the old one.\n")
+	}
 
 	fmt.Printf("\nGive the fingerprint to a node that is enrolling, so it can tell this control\n")
 	fmt.Printf("plane from anything else that answers:\n\n")

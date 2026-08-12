@@ -53,6 +53,25 @@ func (e *enrollments) RequestEnrollment(
 	return rec, nil
 }
 
+func (e *enrollments) LookupEnrollment(_ context.Context, name string) (alloc.Enrollment, bool, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	rec, ok := e.by[name]
+
+	return rec, ok, nil
+}
+
+// SpendJoinToken accepts anything non-empty: what these tests are about is the
+// enrollment handshake, and the token's own rules have their own test.
+func (e *enrollments) SpendJoinToken(_ context.Context, token string) error {
+	if token == "" {
+		return alloc.ErrBadJoinToken
+	}
+
+	return nil
+}
+
 func (e *enrollments) approve(t *testing.T, ca *wirecert.CA, name string) {
 	t.Helper()
 	e.mu.Lock()
@@ -139,13 +158,13 @@ func TestAnEnrollingNodeWaitsForApproval(t *testing.T) {
 	}
 
 	// PENDING, not admitted. Nothing has decided yet.
-	if _, err := nodeclient.Enroll(t.Context(), base, "epyc-1", caPEM, csrPEM); !errors.Is(err, nodeclient.ErrNotApproved) {
+	if _, err := nodeclient.Enroll(t.Context(), base, "epyc-1", "a-token", caPEM, csrPEM); !errors.Is(err, nodeclient.ErrNotApproved) {
 		t.Fatalf("an unapproved node was admitted: %v", err)
 	}
 
 	list.approve(t, ca, "epyc-1")
 
-	certPEM, err := nodeclient.Enroll(t.Context(), base, "epyc-1", caPEM, csrPEM)
+	certPEM, err := nodeclient.Enroll(t.Context(), base, "epyc-1", "a-token", caPEM, csrPEM)
 	if err != nil {
 		t.Fatalf("an approved node was not admitted: %v", err)
 	}
@@ -185,13 +204,13 @@ func TestTheApprovedFingerprintSurvivesSigning(t *testing.T) {
 		t.Fatalf("fingerprint: %v", err)
 	}
 
-	if _, err := nodeclient.Enroll(t.Context(), base, "epyc-1", caPEM, csrPEM); !errors.Is(err, nodeclient.ErrNotApproved) {
+	if _, err := nodeclient.Enroll(t.Context(), base, "epyc-1", "a-token", caPEM, csrPEM); !errors.Is(err, nodeclient.ErrNotApproved) {
 		t.Fatalf("unexpected: %v", err)
 	}
 
 	list.approve(t, ca, "epyc-1")
 
-	certPEM, err := nodeclient.Enroll(t.Context(), base, "epyc-1", caPEM, csrPEM)
+	certPEM, err := nodeclient.Enroll(t.Context(), base, "epyc-1", "a-token", caPEM, csrPEM)
 	if err != nil {
 		t.Fatalf("enroll: %v", err)
 	}
@@ -255,7 +274,7 @@ func TestASecondKeyCannotTakeAClaimedName(t *testing.T) {
 		t.Fatalf("csr: %v", err)
 	}
 
-	if _, err := nodeclient.Enroll(t.Context(), base, "epyc-1", caPEM, first); !errors.Is(err, nodeclient.ErrNotApproved) {
+	if _, err := nodeclient.Enroll(t.Context(), base, "epyc-1", "a-token", caPEM, first); !errors.Is(err, nodeclient.ErrNotApproved) {
 		t.Fatalf("unexpected: %v", err)
 	}
 
@@ -264,7 +283,7 @@ func TestASecondKeyCannotTakeAClaimedName(t *testing.T) {
 		t.Fatalf("csr: %v", err)
 	}
 
-	if _, err := nodeclient.Enroll(t.Context(), base, "epyc-1", caPEM, second); err == nil {
+	if _, err := nodeclient.Enroll(t.Context(), base, "epyc-1", "a-token", caPEM, second); err == nil {
 		t.Fatal("a second key took a name that was already claimed")
 	}
 }
@@ -327,5 +346,38 @@ func TestAnUnenrolledConnectionCanReachNothingElse(t *testing.T) {
 			t.Errorf("%s %s answered %s to a connection with no certificate; want 401.\n%s",
 				route.method, route.path, res.Status, body)
 		}
+	}
+}
+
+// ENROLLING NEEDS A CREDENTIAL, even though approval is what admits.
+//
+// Approval cannot be tricked — an operator matches a fingerprint against what
+// the node printed — but an unauthenticated endpoint lets anyone who can reach
+// the port fill the pending list with plausible entries, and TAKE A NAME before
+// the machine that should have it. "First key claims the name" protects an
+// operator from approving a substitute; without a credential in front of it, it
+// also lets a stranger deny a machine its own name.
+func TestEnrollingNeedsAJoinToken(t *testing.T) {
+	t.Parallel()
+
+	ca, base, _ := enrollableWire(t)
+
+	caPEM, _, err := nodeclient.FetchCA(t.Context(), base, ca.Fingerprint())
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+
+	csrPEM, _, err := wirecert.NewNodeCSR("epyc-1")
+	if err != nil {
+		t.Fatalf("csr: %v", err)
+	}
+
+	_, err = nodeclient.Enroll(t.Context(), base, "epyc-1", "", caPEM, csrPEM)
+	if err == nil {
+		t.Fatal("a machine with no join token was allowed to claim a name")
+	}
+
+	if !strings.Contains(err.Error(), "join token") {
+		t.Errorf("the refusal does not say what is missing: %v", err)
 	}
 }

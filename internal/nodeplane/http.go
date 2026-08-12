@@ -98,9 +98,12 @@ func WithRevocations(r Revocations) HandlerOption {
 	return func(h *handler) { h.revocations = r }
 }
 
-// Enrollments records machines asking to join and what was decided about them.
+// Enrollments records machines asking to join and what was decided about them,
+// and checks the credential that lets one ask at all.
 type Enrollments interface {
 	RequestEnrollment(ctx context.Context, name, fingerprint, csrPEM string) (alloc.Enrollment, error)
+	LookupEnrollment(ctx context.Context, name string) (alloc.Enrollment, bool, error)
+	SpendJoinToken(ctx context.Context, token string) error
 }
 
 // WithEnrollment lets a machine ask to join without already holding a
@@ -517,6 +520,22 @@ func (h *handler) enroll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// SPENT ONLY WHEN THE REQUEST IS NEW. A node polls this endpoint until an
+	// operator decides, so charging every call would spend a single-use token on
+	// the second poll and strand the machine it was minted for.
+	if !h.knownEnrollment(r.Context(), req.Node, fingerprint) {
+		if err := h.enrollments.SpendJoinToken(r.Context(), req.JoinToken); err != nil {
+			h.log.Warn("an enrollment was attempted without a usable join token",
+				"node", req.Node, "fingerprint", fingerprint)
+
+			writeErr(w, http.StatusUnauthorized, nodeapi.CodeUnauthenticated,
+				"enrolling needs a join token: run `billet ca token` on the control plane and "+
+					"pass it as --join-token")
+
+			return
+		}
+	}
+
 	enrollment, err := h.enrollments.RequestEnrollment(r.Context(), req.Node, fingerprint, req.CSRPEM)
 	if err != nil {
 		if errors.Is(err, alloc.ErrEnrollmentConflict) {
@@ -549,6 +568,16 @@ func (h *handler) enroll(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, res)
+}
+
+// knownEnrollment reports whether this exact request has already been recorded,
+// which is what makes a node's repeated polling free.
+//
+// A READ, never a write. Asking the question must not record an answer.
+func (h *handler) knownEnrollment(ctx context.Context, name, fingerprint string) bool {
+	existing, found, err := h.enrollments.LookupEnrollment(ctx, name)
+
+	return err == nil && found && existing.Fingerprint == fingerprint
 }
 
 // renew signs a new certificate for a node that already has a valid one.

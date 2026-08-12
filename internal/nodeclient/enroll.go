@@ -106,7 +106,7 @@ func FetchCA(ctx context.Context, base, wantFingerprint string) ([]byte, string,
 // Returns ErrNotApproved while an operator has not decided, which is the
 // ordinary case on the first call: the caller prints the fingerprint, waits, and
 // asks again.
-func Enroll(ctx context.Context, base, name string, caPEM, csrPEM []byte) ([]byte, error) {
+func Enroll(ctx context.Context, base, name, joinToken string, caPEM, csrPEM []byte) ([]byte, error) {
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(caPEM) {
 		return nil, errors.New("nodeclient: the authority could not be parsed for verification")
@@ -127,7 +127,9 @@ func Enroll(ctx context.Context, base, name string, caPEM, csrPEM []byte) ([]byt
 		return nil, fmt.Errorf("nodeclient: build the enroll url: %w", err)
 	}
 
-	payload, err := json.Marshal(nodeapi.EnrollRequest{Node: name, CSRPEM: string(csrPEM)})
+	payload, err := json.Marshal(nodeapi.EnrollRequest{
+		Node: name, CSRPEM: string(csrPEM), JoinToken: joinToken,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("nodeclient: encode the enrollment request: %w", err)
 	}
@@ -145,6 +147,11 @@ func Enroll(ctx context.Context, base, name string, caPEM, csrPEM []byte) ([]byt
 	}
 
 	defer res.Body.Close()
+
+	if res.StatusCode == http.StatusUnauthorized {
+		return nil, fmt.Errorf("nodeclient: this control plane requires a join token to enroll; " +
+			"run `billet ca token` on it and pass the value as --join-token")
+	}
 
 	if res.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("nodeclient: the control plane refused this enrollment: %s", res.Status)

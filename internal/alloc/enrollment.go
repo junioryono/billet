@@ -29,6 +29,9 @@ type Enrollment struct {
 	CSRPEM      string
 	CertPEM     string
 	State       string
+	// Source is how this machine got in: `enrolled` (it asked and an operator
+	// approved a fingerprint) or `issued` (an operator handed it a bundle).
+	Source      string
 	RequestedAt string
 	DecidedAt   string
 }
@@ -78,6 +81,38 @@ func (a *Allocator) RequestEnrollment(ctx context.Context, name, fingerprint, cs
 	return out, err
 }
 
+// LookupEnrollment reads a request without creating one.
+//
+// SEPARATE FROM RequestEnrollment, which INSERTS. Reusing that to ask "does this
+// already exist" would record a row as a side effect of the question — and with
+// no CSR on it, because a question does not carry one, leaving an enrollment
+// that can never be approved.
+func (a *Allocator) LookupEnrollment(ctx context.Context, name string) (Enrollment, bool, error) {
+	var (
+		out   Enrollment
+		found bool
+	)
+
+	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+		e, err := readEnrollment(ctx, tx, name)
+
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			found = false
+
+			return nil
+		case err != nil:
+			return err
+		}
+
+		out, found = e, true
+
+		return nil
+	})
+
+	return out, found, err
+}
+
 // DecideEnrollment approves or denies a pending request.
 //
 // THE FINGERPRINT IS PART OF THE DECISION, not just a thing to look at. An
@@ -121,6 +156,40 @@ func fingerprintMatches(recorded, supplied string) bool {
 	return supplied != "" && recorded == supplied
 }
 
+// RecordIssued writes down a certificate handed out directly, so both ways into
+// a deployment leave the same trail.
+//
+// `billet ca issue` is the older path and the right one for a machine being
+// provisioned anyway — cloud-init can drop a bundle on it, and no human is
+// standing there to compare a fingerprint. It recorded NOTHING, so there was no
+// single answer to "what has been admitted here, and when": a fleet built that
+// way was invisible to the same list that shows what is waiting.
+//
+// Marked as its own source, because the two are not the same fact. One was
+// approved by somebody comparing a fingerprint; this one was issued.
+func (a *Allocator) RecordIssued(ctx context.Context, name, fingerprint, certPEM string) error {
+	return a.db.Tx(ctx, func(tx *sql.Tx) error {
+		now := ts(a.now().UTC())
+
+		_, err := tx.ExecContext(ctx,
+			`INSERT INTO node_enrollments
+			   (name, fingerprint, csr_pem, cert_pem, state, source, requested_at, decided_at)
+			 VALUES (?, ?, '', ?, ?, 'issued', ?, ?)
+			 ON CONFLICT (name) DO UPDATE SET
+			   fingerprint = excluded.fingerprint,
+			   cert_pem    = excluded.cert_pem,
+			   state       = excluded.state,
+			   source      = excluded.source,
+			   decided_at  = excluded.decided_at`,
+			name, fingerprint, certPEM, EnrollApproved, now, now)
+		if err != nil {
+			return fmt.Errorf("alloc: record the certificate issued to %s: %w", name, err)
+		}
+
+		return nil
+	})
+}
+
 // Enrollments lists what has asked to join.
 func (a *Allocator) Enrollments(ctx context.Context, state string) ([]Enrollment, error) {
 	var out []Enrollment
@@ -128,7 +197,7 @@ func (a *Allocator) Enrollments(ctx context.Context, state string) ([]Enrollment
 	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
 		out = nil
 
-		query := `SELECT name, fingerprint, csr_pem, cert_pem, state, requested_at, decided_at
+		query := `SELECT name, fingerprint, csr_pem, cert_pem, state, source, requested_at, decided_at
 		            FROM node_enrollments`
 		args := []any{}
 
@@ -149,7 +218,7 @@ func (a *Allocator) Enrollments(ctx context.Context, state string) ([]Enrollment
 		for rows.Next() {
 			var e Enrollment
 			if err := rows.Scan(&e.Name, &e.Fingerprint, &e.CSRPEM, &e.CertPEM,
-				&e.State, &e.RequestedAt, &e.DecidedAt); err != nil {
+				&e.State, &e.Source, &e.RequestedAt, &e.DecidedAt); err != nil {
 				return fmt.Errorf("alloc: scan an enrollment: %w", err)
 			}
 
@@ -166,9 +235,10 @@ func readEnrollment(ctx context.Context, tx *sql.Tx, name string) (Enrollment, e
 	var e Enrollment
 
 	err := tx.QueryRowContext(ctx,
-		`SELECT name, fingerprint, csr_pem, cert_pem, state, requested_at, decided_at
+		`SELECT name, fingerprint, csr_pem, cert_pem, state, source, requested_at, decided_at
 		   FROM node_enrollments WHERE name = ?`, name).
-		Scan(&e.Name, &e.Fingerprint, &e.CSRPEM, &e.CertPEM, &e.State, &e.RequestedAt, &e.DecidedAt)
+		Scan(&e.Name, &e.Fingerprint, &e.CSRPEM, &e.CertPEM, &e.State, &e.Source,
+			&e.RequestedAt, &e.DecidedAt)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return e, fmt.Errorf("alloc: read the enrollment of %s: %w", name, err)
 	}

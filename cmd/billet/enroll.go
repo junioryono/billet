@@ -76,10 +76,11 @@ func cmdNodesPending(ctx context.Context, args []string) error {
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "NODE\tFINGERPRINT\tSTATE\tASKED")
+	fmt.Fprintln(w, "NODE\tFINGERPRINT\tSTATE\tHOW\tASKED")
 
-	for _, e := range pending {
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", e.Name, e.Fingerprint, e.State, e.RequestedAt)
+	for i := range pending {
+		e := &pending[i]
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", e.Name, e.Fingerprint, e.State, e.Source, e.RequestedAt)
 	}
 
 	if err := w.Flush(); err != nil {
@@ -145,9 +146,9 @@ func cmdNodesDecide(ctx context.Context, args []string, decision string) error {
 
 		var csr string
 
-		for _, e := range requests {
-			if e.Name == name {
-				csr = e.CSRPEM
+		for i := range requests {
+			if requests[i].Name == name {
+				csr = requests[i].CSRPEM
 			}
 		}
 
@@ -219,7 +220,7 @@ func controlPlaneAllocator(ctx context.Context, cfgPath string) (*alloc.Allocato
 // ends displaying the same number, over a channel an attacker on the network
 // does not control. That comparison is the trust decision; everything else here
 // is transport.
-func enrollNode(ctx context.Context, cfg *config.Config, caFingerprint string) error {
+func enrollNode(ctx context.Context, cfg *config.Config, caFingerprint, joinToken string) error {
 	if cfg.Node.TLS == nil {
 		return errors.New("enrolling writes a certificate, so node.tls must say where to put it")
 	}
@@ -251,7 +252,7 @@ func enrollNode(ctx context.Context, cfg *config.Config, caFingerprint string) e
 	fmt.Printf("  billet nodes approve %s --fingerprint %s\n\n", name, fingerprint)
 
 	for {
-		certPEM, err := nodeclient.Enroll(ctx, "https://"+cfg.Node.ServerAddr, name, caPEM, csrPEM)
+		certPEM, err := nodeclient.Enroll(ctx, "https://"+cfg.Node.ServerAddr, name, joinToken, caPEM, csrPEM)
 
 		switch {
 		case err == nil:
@@ -300,6 +301,44 @@ func writeBundle(tls *config.NodeTLS, certPEM, keyPEM, caPEM []byte) error {
 
 	fmt.Printf("Approved. Wrote:\n  %s\n  %s\n  %s\n\n", tls.CertPath, tls.KeyPath, tls.CAPath)
 	fmt.Printf("Start the node normally now: billet node\n")
+
+	return nil
+}
+
+// cmdCAToken mints the credential a machine needs to ASK to enroll.
+//
+// SHOWN ONCE AND STORED AS A HASH, for the same reason a password is: the ledger
+// needs to recognise the token, not to be able to reproduce it.
+//
+// It admits nothing on its own. A request still waits for an operator to compare
+// fingerprints; what the token stops is a stranger who can reach the port filling
+// the pending list, or taking a name before the machine that should have it.
+func cmdCAToken(ctx context.Context, args []string) error {
+	fs := newFlagSet("billet ca token")
+	cfgPath := addConfigFlag(fs)
+	ttl := fs.Duration("ttl", time.Hour, "how long the token may be used for")
+	uses := fs.Int("uses", 1, "how many machines may enroll with it")
+	note := fs.String("note", "", "what it is for, recorded alongside it")
+
+	if err := parse(fs, args); err != nil {
+		return err
+	}
+
+	a, closeDB, err := controlPlaneAllocator(ctx, *cfgPath)
+	if err != nil {
+		return err
+	}
+
+	defer closeDB()
+
+	token, err := a.NewJoinToken(ctx, *ttl, *uses, *note)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Join token (shown once, valid for %s, %d use(s)):\n\n  %s\n\n", *ttl, *uses, token)
+	fmt.Printf("On the machine that should join:\n\n")
+	fmt.Printf("  billet node --enroll --ca-fingerprint <from `billet ca show`> --join-token %s\n", token)
 
 	return nil
 }
