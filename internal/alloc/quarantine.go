@@ -98,7 +98,17 @@ func (a *Allocator) QuarantinedLeaseIDs(ctx context.Context, node string) (map[s
 // can never arrive in — a machine that is not coming back — because otherwise its
 // capacity would be missing from the deployment permanently, and the ceiling is
 // deployment-wide.
-func (a *Allocator) ResolveQuarantine(ctx context.Context, leaseID string) error {
+// THE OUTCOME IS THE CALLER'S, because they are not all the same event. A
+// listener resolving one after a completion knows the job finished; a node
+// cleaning up compute it could not account for, and an operator forcing a
+// machine that is never coming back, both know the opposite. Recording every
+// one of them as `failed` puts a lie in the history of a job GitHub reported
+// completed — the same objection the launch path makes in reverse.
+func (a *Allocator) ResolveQuarantine(ctx context.Context, leaseID string, outcome Phase) error {
+	if !outcome.Terminal() {
+		return fmt.Errorf("%w: %q is not terminal", ErrBadTransition, outcome)
+	}
+
 	return a.db.Tx(ctx, func(tx *sql.Tx) error {
 		lease, err := quarantinedLeaseTx(ctx, tx, a, leaseID)
 		if err != nil {
@@ -106,12 +116,12 @@ func (a *Allocator) ResolveQuarantine(ctx context.Context, leaseID string) error
 		}
 
 		if _, err := tx.ExecContext(ctx,
-			`UPDATE leases SET phase = 'failed', epoch = epoch + 1 WHERE id = ?`,
-			leaseID); err != nil {
+			`UPDATE leases SET phase = ?, epoch = epoch + 1 WHERE id = ?`,
+			string(outcome), leaseID); err != nil {
 			return fmt.Errorf("alloc: resolve quarantined lease %s: %w", leaseID, err)
 		}
 
-		return a.archive(ctx, tx, lease, PhaseFailed)
+		return a.archive(ctx, tx, lease, outcome)
 	})
 }
 

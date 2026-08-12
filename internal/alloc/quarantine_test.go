@@ -197,7 +197,7 @@ func TestResolvingAQuarantinedLeaseReturnsItsCapacity(t *testing.T) {
 			"capacity", held)
 	}
 
-	if err := a.ResolveQuarantine(t.Context(), lease.ID); err != nil {
+	if err := a.ResolveQuarantine(t.Context(), lease.ID, PhaseDone); err != nil {
 		t.Fatalf("ResolveQuarantine: %v", err)
 	}
 
@@ -394,5 +394,44 @@ func TestAnOvertakenRegistrationDoesNotResolveQuarantine(t *testing.T) {
 	if resolved != 0 {
 		t.Errorf("an overtaken registration freed %d lease(s) using its own stale inventory",
 			resolved)
+	}
+}
+
+// THE HISTORY RECORDS WHAT ACTUALLY HAPPENED, not how the capacity came back.
+//
+// A job can finish and have its release lose the race to the reaper: the lease
+// is quarantined, and the listener then resolves it with the destroy as proof.
+// Archiving that as `failed` because of the route it took would record a job
+// GitHub reported completed as one that did not — the same objection the launch
+// path makes in the other direction, where calling an unstarted job `done` is
+// the lie.
+func TestResolvingAQuarantineKeepsTheCallersOutcome(t *testing.T) {
+	for _, outcome := range []Phase{PhaseDone, PhaseFailed} {
+		t.Run(string(outcome), func(t *testing.T) {
+			now := time.Now().UTC()
+			a := quarantineFleet(t, &now)
+			lease := busyLease(t, a)
+
+			now = now.Add(31 * time.Second)
+
+			if _, err := a.Reap(t.Context()); err != nil {
+				t.Fatalf("Reap: %v", err)
+			}
+
+			if err := a.ResolveQuarantine(t.Context(), lease.ID, outcome); err != nil {
+				t.Fatalf("ResolveQuarantine: %v", err)
+			}
+
+			// The id advanceTo assigns; the lease was read before that happened, so
+			// its own copy is still zero.
+			got, err := a.HistoryOutcomesForRequest(t.Context(), 1)
+			if err != nil {
+				t.Fatalf("history: %v", err)
+			}
+
+			if len(got) != 1 || got[0] != string(outcome) {
+				t.Errorf("job history records %v for a job that ended as %q", got, outcome)
+			}
+		})
 	}
 }

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"text/tabwriter"
+
+	"github.com/junioryono/billet/internal/alloc"
 )
 
 // cmdLeases is the operator's view of capacity that has not come back.
@@ -131,7 +133,9 @@ func cmdLeasesRelease(ctx context.Context, args []string) error {
 			leaseID)
 	}
 
-	if err := a.ResolveQuarantine(ctx, leaseID); err != nil {
+	// FAILED, because an operator forcing this is asserting the machine is not
+	// coming back — whatever the job was doing, it did not finish.
+	if err := a.ResolveQuarantine(ctx, leaseID, alloc.PhaseFailed); err != nil {
 		return err
 	}
 
