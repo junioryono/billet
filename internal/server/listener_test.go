@@ -4624,3 +4624,65 @@ func TestAParkedReleaseIsRetriedAndClears(t *testing.T) {
 		t.Errorf("job history records %v; a runner that never started did not finish", outcomes)
 	}
 }
+
+// A RELEASE FAILURE DOES NOT KILL THE LISTENER, and the blast radius is why.
+//
+// complete runs on the poll path as well as the cleanup loop, and there a
+// returned error is fatal: it stops the listener, which cancels every other
+// listener, whose shutdowns destroy every job running on this host. So a busy
+// database at the moment GitHub happens to report a completion took the whole
+// deployment down and failed every build on it.
+//
+// It was also self-defeating — the error was returned to preserve the
+// obligation for a retry, and the retry runs in the process the error kills.
+func TestACompletionWhoseReleaseFailsDoesNotStopTheListener(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, tiers)
+
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(&fakeRunner{}))
+
+	holdRunning(t, l, a, tiers[0].Label, 7)
+
+	// The ledger cannot answer, which is what a cancelled context produces.
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	if err := l.complete(ctx, Job{RequestID: 7}); err != nil {
+		t.Fatalf("a completion whose release could not reach the ledger returned an error; on "+
+			"the poll path that stops this listener, cancels every other one, and their "+
+			"shutdowns destroy every job on this host: %v", err)
+	}
+
+	// AND THE OBLIGATION SURVIVES, which is the half that makes returning nil
+	// honest rather than a swallow.
+	l.mu.Lock()
+	entry, parked := l.cleanup[7]
+	_, stillRunning := l.running[7]
+	l.mu.Unlock()
+
+	if !parked {
+		t.Fatal("the completion was reported handled and its capacity was dropped on the " +
+			"floor; the ledger charges for it until the reaper arrives")
+	}
+
+	if entry.lease == nil {
+		t.Error("the parked entry carries no lease, so the retry has nothing to release")
+	}
+
+	if stillRunning {
+		t.Error("the request id is still held, so a redelivery is swallowed as work already " +
+			"in flight")
+	}
+
+	// And the retry discharges it once the ledger answers again.
+	l.retryCleanup(t.Context())
+
+	l.mu.Lock()
+	_, stillParked := l.cleanup[7]
+	l.mu.Unlock()
+
+	if stillParked {
+		t.Error("the parked obligation was not discharged by a retry that could reach the " +
+			"ledger, so its request id is refused for the life of the process")
+	}
+}
