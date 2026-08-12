@@ -275,12 +275,15 @@ Both paths are recorded, so `billet nodes pending --all` is the single answer to
 
 **A node registers itself, and the fleet is not something you edit.** Registration is dynamic and never asks whether a host was declared anywhere: it checks the protocol version, a non-empty name, the deployment identity, that the contribution is non-zero, and that the site is one this deployment declares. The allocator then requires a provider, and refuses to move a host to a different provider or site while leases are still outstanding against it. So `nodes:` is policy *about* hosts rather than a roster *of* them. The one config fact registration does enforce is `sites:` — a node claiming a site the control plane has never heard of is refused rather than recorded, because a typo would otherwise become a place of its own with a cache that is always empty.
 
-**But admitting a new machine needs the server stopped today, and that is a defect rather than a design.** `billet nodes pending`, `nodes approve`, `nodes revoke`, `ca token`, `ca issue`, `leases quarantined` and `leases release` all open the control plane's state directory directly, and a running server holds an exclusive lock on it for its whole life — so every one of them fails with `another billet process holds this state directory` until you stop it. Registration needing no restart is therefore true of the protocol and not yet true of the workflow. It bites hardest on `billet leases release --force`, whose entire purpose is reclaiming capacity on a **running** deployment.
+**And the operator commands run against a live control plane**, which is when you actually need them. `billet nodes pending|approve|revoke`, `ca token|issue|revoke|revocations`, `leases quarantined|release` and `check` reach the ledger without taking the exclusive lock the server holds: that lock exists to stop two control planes writing conflicting scheduling decisions, and a one-shot command is not one — it makes no scheduling decisions and commits a single transaction SQLite serialises against the server's own.
+
+What they deliberately will **not** do is migrate it. Run a newer billet's CLI against an older running control plane and it refuses rather than upgrading a schema that plane is mid-transaction against, and tells you which side to restart.
 
 | Action | Control-plane restart? |
 |---|---|
 | A registered machine reconnecting | **No** — it re-registers itself |
-| Admitting a **new** machine | **Yes, today** — the admission CLI cannot open the locked ledger |
+| Admitting a **new** machine | **No** — enroll it, approve the fingerprint, and it joins |
+| Reclaiming stranded capacity | **No** — `leases release --force` works on a running deployment, which is the only place quarantine happens |
 | Add or change a **tier** | **Yes** — tiers are read at startup, and each becomes one scale set |
 | Change the `nodes:` policy block | **Yes** — it is snapshotted into the allocator at construction and enforced during placement |
 

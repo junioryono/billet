@@ -1271,7 +1271,9 @@ func cmdCARevoke(ctx context.Context, args []string) error {
 		return err
 	}
 
-	db, err := state.Open(ctx, cfg.Server.StateDir)
+	// Revoking matters most while the control plane is UP, so it must not need
+	// the directory lock that plane is holding. See state.OpenAdmin.
+	db, err := state.OpenAdmin(ctx, cfg.Server.StateDir)
 	if err != nil {
 		return fmt.Errorf("server state: %w", err)
 	}
@@ -1316,7 +1318,7 @@ func cmdCARevocations(ctx context.Context, args []string) error {
 		return errors.New("the revocation list lives on the control plane, and this config has no server section")
 	}
 
-	db, err := state.Open(ctx, cfg.Server.StateDir)
+	db, err := state.OpenAdmin(ctx, cfg.Server.StateDir)
 	if err != nil {
 		return fmt.Errorf("server state: %w", err)
 	}
@@ -1580,7 +1582,10 @@ func cmdCheck(ctx context.Context, args []string) error {
 		fmt.Printf("listen   %s\n", cfg.Server.Listen)
 		fmt.Printf("ceiling  %d vCPU, %s\n", cfg.Server.MaxVCPU, cfg.Server.MaxMemory)
 
-		db, err := state.Open(ctx, cfg.Server.StateDir)
+		// `billet check` is the command an operator reaches for WHEN SOMETHING IS
+		// WRONG, which is exactly when the server is running. Opening the ledger
+		// exclusively made it unusable at that moment.
+		db, err := state.OpenAdmin(ctx, cfg.Server.StateDir)
 		if err != nil {
 			return fmt.Errorf("server state: %w", err)
 		}
