@@ -61,6 +61,10 @@ type LeaseResponse struct {
 // arrival anyway.
 type LaunchedResponse struct {
 	LeaseIDs map[string]bool `json:"lease_ids"`
+	// Quarantined are leases whose holder stopped heartbeating while compute may
+	// still exist for them. Something IS waiting for these — the capacity is
+	// still charged — so a node must not treat their instances as orphans.
+	Quarantined map[string]bool `json:"quarantined,omitempty"`
 }
 
 // ErrorResponse is how a refusal crosses the wire.

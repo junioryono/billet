@@ -54,6 +54,10 @@ func (mtlsStore) Lease(context.Context, string) (*alloc.Lease, error) {
 	return &alloc.Lease{ID: "l1", Epoch: 1}, nil
 }
 
+func (m mtlsStore) QuarantinedLeaseIDs(context.Context, string) (map[string]bool, error) {
+	return map[string]bool{}, nil
+}
+
 func (m mtlsStore) LaunchedLeaseIDs(context.Context, string) (map[string]bool, error) {
 	if m.launchedErr != nil {
 		return nil, m.launchedErr

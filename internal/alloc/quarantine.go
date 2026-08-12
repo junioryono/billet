@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/junioryono/billet/internal/config"
 )
@@ -59,6 +60,36 @@ func (a *Allocator) Quarantined(ctx context.Context) ([]QuarantinedLease, error)
 	return out, err
 }
 
+// QuarantinedLeaseIDs reports the quarantined leases attributed to one node.
+//
+// SOMETHING IS STILL WAITING FOR THIS COMPUTE, which is the question the node is
+// asking. LaunchedLeaseIDs answers it for leases a listener is managing, and
+// deliberately does not include quarantine — the plane uses that set to decide
+// ownership. But a quarantined lease is the case where the compute matters MOST:
+// nobody is managing it, so a node that read only the launched set would see a
+// running job as an orphan and destroy it.
+func (a *Allocator) QuarantinedLeaseIDs(ctx context.Context, node string) (map[string]bool, error) {
+	out := map[string]bool{}
+
+	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+		// EVERY quarantined lease, whatever its age: the node is asking which of its
+		// containers something is still waiting for, and a young quarantine is
+		// exactly the one it must not destroy.
+		ids, err := quarantinedIDsOn(ctx, tx, node, "")
+		if err != nil {
+			return err
+		}
+
+		for _, id := range ids {
+			out[id] = true
+		}
+
+		return nil
+	})
+
+	return out, err
+}
+
 // ResolveQuarantine terminalizes a quarantined lease, returning its capacity.
 //
 // PROOF, OR AN OPERATOR SAYING SO. The node calls this when it has destroyed the
@@ -90,8 +121,21 @@ func (a *Allocator) ResolveQuarantine(ctx context.Context, leaseID string) error
 // A NODE THAT COMES BACK IS THE EVIDENCE. It enumerates what it is actually
 // running as part of registering; a quarantined lease missing from that list has
 // no container, whether the host rebooted or the sweep already removed it.
+// quarantineGrace is how long a lease stays quarantined before an ABSENCE from a
+// node's inventory is believed.
+//
+// AN ABSENCE IS A SNAPSHOT, NOT A CAUSAL RESULT — the same rule custody's
+// strayGrace exists for, and it applies here for the same reason. A launch whose
+// response was lost may have left the daemon still creating the container, and a
+// listing issued afterwards can overtake it and see nothing. Freeing the
+// capacity on that hands the slot back moments before the container appears.
+//
+// Measured from when the lease EXPIRED, so a lease has already gone a full TTL
+// without a heartbeat before this clock starts.
+const quarantineGrace = time.Minute
+
 func (a *Allocator) ResolveQuarantineFor(
-	ctx context.Context, node string, running []string,
+	ctx context.Context, node string, running []string, epoch int64,
 ) (int, error) {
 	held := make(map[string]bool, len(running))
 	for _, id := range running {
@@ -106,7 +150,26 @@ func (a *Allocator) ResolveQuarantineFor(
 		// READ FULLY BEFORE WRITING. The caller runs more statements inside this
 		// transaction, so the cursor has to be closed first — which is why the ids
 		// are collected in their own function rather than iterated in place.
-		ids, err := quarantinedIDsOn(ctx, tx, node)
+		// FENCED ON THE REGISTRATION THAT REPORTED IT. Two registrations can be in
+		// flight — a node restarting twice, or a duplicate host — and the one that
+		// arrives second is current. Letting an overtaken registration act on its
+		// own stale inventory would terminalize a lease a newer one had just
+		// vouched for, using a listing taken before that container was visible.
+		var current int64
+
+		switch err := tx.QueryRowContext(ctx,
+			`SELECT epoch FROM nodes WHERE name = ?`, node).Scan(&current); {
+		case errors.Is(err, sql.ErrNoRows):
+			return nil
+		case err != nil:
+			return fmt.Errorf("alloc: read the epoch of node %s: %w", node, err)
+		}
+
+		if current != epoch {
+			return nil
+		}
+
+		ids, err := quarantinedIDsOn(ctx, tx, node, ts(a.now().UTC().Add(-quarantineGrace)))
 		if err != nil {
 			return err
 		}
@@ -166,11 +229,14 @@ func quarantinedLeaseTx(ctx context.Context, tx *sql.Tx, a *Allocator, leaseID s
 	return lease, nil
 }
 
-// quarantinedIDsOn lists the quarantined leases attributed to one host.
-func quarantinedIDsOn(ctx context.Context, tx *sql.Tx, node string) ([]string, error) {
+// quarantinedIDsOn lists the quarantined leases attributed to one host, or only
+// those that expired before `settled` when one is given.
+func quarantinedIDsOn(ctx context.Context, tx *sql.Tx, node, settled string) ([]string, error) {
 	rows, err := tx.QueryContext(ctx,
-		`SELECT id FROM leases WHERE phase = ? AND COALESCE(node, target_node) = ?`,
-		string(PhaseQuarantine), node)
+		`SELECT id FROM leases
+		  WHERE phase = ? AND COALESCE(node, target_node) = ?
+		    AND (? = '' OR expires_at < ?)`,
+		string(PhaseQuarantine), node, settled, settled)
 	if err != nil {
 		return nil, fmt.Errorf("alloc: list quarantined leases on %s: %w", node, err)
 	}
@@ -189,4 +255,23 @@ func quarantinedIDsOn(ctx context.Context, tx *sql.Tx, node string) ([]string, e
 	}
 
 	return ids, rows.Err()
+}
+
+// ExpireForTest ages a lease out, so a test can drive the real reaper.
+//
+// A TEST THAT STAGES THE PHASE BY HAND PROVES NOTHING about the path it claims
+// to protect: the reaper is what decides quarantine, and its rule about which
+// phases keep their compute is exactly the thing worth testing. Moving the clock
+// is the alternative, and it makes every helper take one.
+func (a *Allocator) ExpireForTest(ctx context.Context, leaseID string) error {
+	return a.db.Tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx,
+			`UPDATE leases SET expires_at = ? WHERE id = ?`,
+			ts(a.now().UTC().Add(-time.Hour)), leaseID)
+		if err != nil {
+			return fmt.Errorf("alloc: expire lease %s: %w", leaseID, err)
+		}
+
+		return nil
+	})
 }

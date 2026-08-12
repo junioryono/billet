@@ -85,7 +85,9 @@ func (l *ledger) NodeGone(_ context.Context, name string, epoch int64) error {
 }
 
 // ResolveQuarantineFor records what a returning host said it is running.
-func (l *ledger) ResolveQuarantineFor(_ context.Context, node string, running []string) (int, error) {
+func (l *ledger) ResolveQuarantineFor(
+	_ context.Context, node string, running []string, _ int64,
+) (int, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 

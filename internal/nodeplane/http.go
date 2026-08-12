@@ -51,6 +51,10 @@ type LeaseStore interface {
 	Release(ctx context.Context, leaseID string, epoch int64, outcome alloc.Phase) error
 	Lease(ctx context.Context, leaseID string) (*alloc.Lease, error)
 	LaunchedLeaseIDs(ctx context.Context, node string) (map[string]bool, error)
+	// QuarantinedLeaseIDs are leases holding capacity for compute nobody has
+	// accounted for. A node needs them to tell an orphan from a job whose
+	// listener died while it was still running.
+	QuarantinedLeaseIDs(ctx context.Context, node string) (map[string]bool, error)
 }
 
 // maxBody bounds a request body.
@@ -992,7 +996,14 @@ func (h *handler) launched(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, nodeapi.LaunchedResponse{LeaseIDs: ids})
+	held, err := h.store.QuarantinedLeaseIDs(r.Context(), node)
+	if err != nil {
+		writeStoreErr(w, err)
+
+		return
+	}
+
+	writeJSON(w, http.StatusOK, nodeapi.LaunchedResponse{LeaseIDs: ids, Quarantined: held})
 }
 
 func (h *handler) describe(w http.ResponseWriter, r *http.Request) {
