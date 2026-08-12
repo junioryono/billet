@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -735,5 +736,270 @@ func TestEveryTableIsStrict(t *testing.T) {
 
 	if err := rows.Err(); err != nil {
 		t.Fatalf("rows: %v", err)
+	}
+}
+
+// A REBUILDING MIGRATION COPIES EVERY COLUMN IT DECLARES.
+//
+// Migrations 16 and 17 rebuild tables, because a CHECK constraint and STRICT are
+// both properties of the declaration and SQLite cannot alter either. A rebuild
+// is the one migration shape that silently loses things: a column left out of
+// the copy list keeps its DEFAULT in the new table and nothing complains.
+//
+// IT HAS TO BE CHECKED STRUCTURALLY, and the first version of this test is why.
+// It opened a database, inserted rows, and read them back — but Open runs every
+// migration before returning, so the rebuild had already happened against empty
+// tables and the rows were written to the table that came out of it. Dropping a
+// column from the copy list did not fail it. The migration only ever runs on
+// data that predates it, which a test starting from Open can never produce.
+//
+// So the statements themselves are read: every column the new table declares
+// must appear in both halves of the INSERT ... SELECT that fills it.
+func TestRebuildingMigrationsCopyEveryColumn(t *testing.T) {
+	for _, m := range []migration{quarantineMigration, strictTrustTablesMigration} {
+		declared := map[string][]string{}
+		inserted := map[string][]string{}
+		selected := map[string][]string{}
+
+		for _, stmt := range m.Stmts {
+			switch {
+			case strings.HasPrefix(stmt, "CREATE TABLE "):
+				table, cols := parseCreate(t, stmt)
+				declared[table] = cols
+			case strings.HasPrefix(stmt, "INSERT INTO "):
+				table, into, from := parseInsertSelect(t, stmt)
+				inserted[table], selected[table] = into, from
+			}
+		}
+
+		for table, cols := range declared {
+			into, from := inserted[table], selected[table]
+
+			// COVERAGE is a question about sets: every declared column has to be
+			// filled by something, in whatever order the statement lists them.
+			declaredSorted := slices.Sorted(slices.Values(cols))
+			intoSorted := slices.Sorted(slices.Values(into))
+
+			if !slices.Equal(declaredSorted, intoSorted) {
+				t.Errorf("migration %d rebuilds %s with columns %v but only fills %v; the "+
+					"difference keeps its default and nothing says so",
+					m.Version, table, declaredSorted, intoSorted)
+			}
+
+			// CORRESPONDENCE is a question about ORDER, and must not be sorted
+			// away. INSERT INTO t (a, b) SELECT b, a is valid SQL that swaps two
+			// values, and SQLite accepts it silently whenever the types agree —
+			// which for a table of TEXT columns is always.
+			if !slices.Equal(into, from) {
+				t.Errorf("migration %d writes %v into %s but reads %v in that order; the two "+
+					"lists are positional, so this shuffles values between columns",
+					m.Version, into, table, from)
+			}
+		}
+
+		if len(declared) == 0 {
+			t.Errorf("migration %d declares no rebuilt table, so this test checked nothing",
+				m.Version)
+		}
+	}
+}
+
+// parseCreate reads a table name and its column names out of a CREATE TABLE.
+func parseCreate(t *testing.T, stmt string) (string, []string) {
+	t.Helper()
+
+	name := strings.TrimSuffix(strings.Fields(strings.TrimPrefix(stmt, "CREATE TABLE "))[0], "_new")
+	body := stmt[strings.Index(stmt, "(")+1 : strings.LastIndex(stmt, ")")]
+
+	var cols []string
+
+	depth := 0
+	current := strings.Builder{}
+
+	flush := func() {
+		line := strings.TrimSpace(current.String())
+		current.Reset()
+
+		if line == "" {
+			return
+		}
+
+		first := strings.Fields(line)[0]
+		// Table-level constraints are not columns.
+		if strings.EqualFold(first, "PRIMARY") || strings.EqualFold(first, "CHECK") ||
+			strings.EqualFold(first, "FOREIGN") || strings.EqualFold(first, "UNIQUE") {
+			return
+		}
+
+		cols = append(cols, first)
+	}
+
+	for _, r := range body {
+		switch {
+		case r == '(':
+			depth++
+		case r == ')':
+			depth--
+		case r == ',' && depth == 0:
+			flush()
+
+			continue
+		}
+
+		current.WriteRune(r)
+	}
+
+	flush()
+
+	return name, cols
+}
+
+// parseInsertSelect reads the two column lists out of an INSERT ... SELECT.
+func parseInsertSelect(t *testing.T, stmt string) (table string, into, from []string) {
+	t.Helper()
+
+	table = strings.TrimSuffix(strings.Fields(strings.TrimPrefix(stmt, "INSERT INTO "))[0], "_new")
+
+	openAt := strings.Index(stmt, "(")
+	closeAt := strings.Index(stmt, ")")
+	selectAt := strings.Index(stmt, "SELECT")
+	fromAt := strings.LastIndex(stmt, "FROM")
+
+	if openAt < 0 || closeAt < 0 || selectAt < 0 || fromAt < 0 {
+		t.Fatalf("cannot read the column lists out of: %s", stmt)
+	}
+
+	split := func(s string) []string {
+		var out []string
+
+		for _, f := range strings.Split(s, ",") {
+			if f = strings.TrimSpace(f); f != "" {
+				out = append(out, f)
+			}
+		}
+
+		return out
+	}
+
+	return table, split(stmt[openAt+1 : closeAt]), split(stmt[selectAt+len("SELECT") : fromAt])
+}
+
+// AND THE SHAPE THAT COMES OUT IS THE ONE THE CODE EXPECTS.
+//
+// The indexes a rebuild drops with the table have to come back, the columns have
+// to round-trip their values, and the widened CHECK has to accept the phase it
+// was widened for. Unlike the copy lists above, all of that is observable from a
+// database Open has already migrated.
+func TestRebuildingMigrationsKeepRowsIndexesAndKeys(t *testing.T) {
+	dir := t.TempDir()
+
+	db, err := Open(t.Context(), dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	defer db.Close()
+
+	// Rows written the way the previous version would have.
+	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(t.Context(),
+			`INSERT INTO nodes (name, provider, last_seen_at)
+			 VALUES ('epyc-1', 'docker', '2026-01-01T00:00:00Z')`); err != nil {
+			return err
+		}
+
+		if _, err := tx.ExecContext(t.Context(),
+			`INSERT INTO leases
+			   (id, tier, node, phase, vcpu, memory, epoch, created_at, heartbeat_at,
+			    expires_at, target_node, macos_slot, guest_os, provider, providers,
+			    chosen_provider, run_id, request_id)
+			 VALUES ('l1','small','epyc-1','busy',2,8589934592,3,'t','t','t','epyc-1',
+			         1,'macos','tart','tart,ec2','tart',77,88)`); err != nil {
+			return err
+		}
+
+		_, err := tx.ExecContext(t.Context(),
+			`INSERT INTO join_tokens (token_sha256, note, uses_remaining, created_at, expires_at)
+			 VALUES ('abc','a note',2,'t','t')`)
+
+		return err
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	// EVERY COLUMN SURVIVES. A copy list that forgets one loses it silently.
+	var (
+		tier, node, phase, target, guestOS, provider, providers, chosen string
+		vcpu, epoch, macos, runID, requestID                            int64
+		memory                                                          int64
+	)
+
+	if err := db.Reader().QueryRowContext(t.Context(),
+		`SELECT tier, node, phase, target_node, guest_os, provider, providers, chosen_provider,
+		        vcpu, memory, epoch, macos_slot, run_id, request_id
+		   FROM leases WHERE id = 'l1'`).
+		Scan(&tier, &node, &phase, &target, &guestOS, &provider, &providers, &chosen,
+			&vcpu, &memory, &epoch, &macos, &runID, &requestID); err != nil {
+		t.Fatalf("read the lease back: %v", err)
+	}
+
+	for _, tc := range []struct{ name, got, want string }{
+		{"tier", tier, "small"}, {"node", node, "epyc-1"}, {"phase", phase, "busy"},
+		{"target_node", target, "epyc-1"}, {"guest_os", guestOS, "macos"},
+		{"provider", provider, "tart"}, {"providers", providers, "tart,ec2"},
+		{"chosen_provider", chosen, "tart"},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("leases.%s is %q after the rebuild, was %q", tc.name, tc.got, tc.want)
+		}
+	}
+
+	for _, tc := range []struct {
+		name string
+		got  int64
+		want int64
+	}{
+		{"vcpu", vcpu, 2}, {"memory", memory, 8589934592}, {"epoch", epoch, 3},
+		{"macos_slot", macos, 1}, {"run_id", runID, 77}, {"request_id", requestID, 88},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("leases.%s is %d after the rebuild, was %d", tc.name, tc.got, tc.want)
+		}
+	}
+
+	var note string
+
+	var uses int
+
+	if err := db.Reader().QueryRowContext(t.Context(),
+		`SELECT note, uses_remaining FROM join_tokens WHERE token_sha256 = 'abc'`).
+		Scan(&note, &uses); err != nil {
+		t.Fatalf("read the join token back: %v", err)
+	}
+
+	if note != "a note" || uses != 2 {
+		t.Errorf("join_tokens holds %q/%d after the rebuild, was \"a note\"/2", note, uses)
+	}
+
+	// THE INDEXES COME BACK. A rebuild drops them with the table, and a missing
+	// one is invisible until the fleet is large enough for it to matter.
+	for _, want := range []string{"leases_open_idx", "leases_node_idx", "idx_revoked_certs_node"} {
+		var name string
+
+		err := db.Reader().QueryRowContext(t.Context(),
+			`SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?`, want).Scan(&name)
+		if err != nil {
+			t.Errorf("index %s did not survive the rebuild: %v", want, err)
+		}
+	}
+
+	// AND THE NEW PHASE IS ACCEPTED, which is what migration 16 was for.
+	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(t.Context(),
+			`UPDATE leases SET phase = 'quarantine' WHERE id = 'l1'`)
+
+		return err
+	}); err != nil {
+		t.Errorf("the rebuilt table refuses the quarantine phase: %v", err)
 	}
 }
