@@ -250,16 +250,67 @@ func LeafOf(b Bundle) (*x509.Certificate, error) {
 	return cert, nil
 }
 
-func writeAtomic(path string, data []byte, mode os.FileMode) error {
-	tmp := filepath.Join(filepath.Dir(path), "."+filepath.Base(path)+".tmp")
+// WriteFileAtomic replaces a file with data, giving it exactly mode, and leaves
+// either the old contents or the new ones behind.
+//
+// NOT os.WriteFile, FOR TWO REASONS THAT BOTH MATTER FOR A PRIVATE KEY.
+//
+// It applies its mode only when it CREATES the file, so writing a fresh key over
+// an existing node.key that happened to be 0644 left a new secret world-readable
+// and reported success. And it FOLLOWS SYMLINKS: with a temporary name derived
+// from the destination, anyone able to write the directory can plant that name
+// pointing somewhere they can read, and the key is written there before the
+// rename puts it back. The approval wait makes that window minutes long and
+// entirely predictable.
+//
+// So the temporary is created with a random name by CreateTemp — which uses
+// O_EXCL, so it cannot be an attacker's symlink — chmodded explicitly rather
+// than inheriting anything, and fsynced before the rename. The directory is
+// synced afterwards, so the rename survives a power cut rather than leaving a
+// name pointing at nothing.
+func WriteFileAtomic(path string, data []byte, mode os.FileMode) error {
+	dir := filepath.Dir(path)
 
-	if err := os.WriteFile(tmp, data, mode); err != nil {
+	f, err := os.CreateTemp(dir, ".billet-*")
+	if err != nil {
+		return fmt.Errorf("wirecert: stage a replacement for %s: %w", path, err)
+	}
+
+	tmp := f.Name()
+
+	// Best effort on every failure path: a temporary left behind is litter, and
+	// litter holding a private key is worse than that.
+	defer func() {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+	}()
+
+	// EXPLICIT, because CreateTemp makes 0600 and a caller asking for 0644 must
+	// get it — and because relying on the default would make the secret case
+	// correct by accident rather than by instruction.
+	if err := f.Chmod(mode); err != nil {
+		return fmt.Errorf("wirecert: set the mode on %s: %w", tmp, err)
+	}
+
+	if _, err := f.Write(data); err != nil {
 		return fmt.Errorf("wirecert: write %s: %w", tmp, err)
+	}
+
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("wirecert: flush %s: %w", tmp, err)
+	}
+
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("wirecert: close %s: %w", tmp, err)
 	}
 
 	if err := os.Rename(tmp, path); err != nil {
 		return fmt.Errorf("wirecert: replace %s: %w", path, err)
 	}
 
-	return nil
+	return syncDir(dir)
+}
+
+func writeAtomic(path string, data []byte, mode os.FileMode) error {
+	return WriteFileAtomic(path, data, mode)
 }
