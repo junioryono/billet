@@ -257,48 +257,24 @@ Everything below describes the intended design. Where a thing is not built, it s
 
 ## Quickstart
 
-> **The example config does not run as shipped**, and the provider is not the only thing to change. It
-> describes the intended Firecracker deployment, and that provider is not built, so `billet node`
-> refuses it. Change `provider: firecracker` to `provider: docker` in the `node:` section and in every tier
-> — **and** change each tier's `image:` to a Docker image containing the GitHub runner, such as
-> `ghcr.io/actions/actions-runner:latest`. The image name is handed straight to `docker run`, so
-> `ubuntu-2404-x64` is a Firecracker golden-image name and will not pull. Making only the first edit
-> gets you a config that validates and a server that starts, and jobs that all fail to launch.
-> Docker shares the host kernel and is for trials rather than for untrusted code. `billet init` is
-> not built either — copy the example.
+> **Use `billet init` rather than copying `billet.example.yaml`.** The example describes the intended Firecracker deployment, and that provider is not built, so it does not run as shipped: the provider has to change in the node section and in every tier, and each tier's `image:` has to become something pullable, because the image name is handed straight to the backend and `ubuntu-2404-x64` is a golden-image name. `billet init` writes a config that runs today.
+>
+> Docker shares the host kernel and is for trials rather than for untrusted code.
 
 ```bash
-billet github-app create --org myorg           # creates + installs the App, PRINTS a github: block
-cp billet.example.yaml ./billet.yaml           # then edit it — see below, three things
-billet check --config ./billet.yaml            # validates config, key, state
-billet server --dry-run --config ./billet.yaml  # first contact: polls, accepts nothing
+billet init --org myorg --config ./billet.yaml     # writes a config sized to this machine
+billet github-app create --org myorg --config ./billet.yaml   # creates the App, fills the block in
+billet check --config ./billet.yaml                # validates config, key, state
 
-billet server --config ./billet.yaml            # then, in two terminals:
-billet node   --config ./billet.yaml            # the machine that runs the jobs
+billet server --config ./billet.yaml               # then, in two terminals:
+billet node   --config ./billet.yaml               # the machine that runs the jobs
 ```
 
-**A single machine runs both**, as two processes reading the same file. They talk over the loopback
-address in `server.listen`, so nothing is exposed to the network and no certificates are involved: a
-control plane listening only on loopback serves plain HTTP, because there is nothing between two
-processes on one box to authenticate. Certificates start mattering when you add a second machine —
-`billet ca issue <node>` mints one, and the server then has to listen where that machine can reach it.
+`billet init` measures this host and writes a ceiling below what it found, leaving room for the kernel, the container runtime and your shell. It picks a runner image that is actually pullable, points the state directories somewhere writable, and describes both roles in one file. Nothing in it has to be hand-edited: `github-app create --config` writes the App ids into the same file rather than printing a block to paste, and it will not overwrite a config you already have without `--force`.
 
-**The three edits**, because nothing writes the file for you:
+**A single machine runs both roles**, as two processes reading that one file. They talk over the loopback address in `server.listen`, so nothing is exposed to the network and no certificates are involved: a control plane listening only on loopback serves plain HTTP, because there is nothing between two processes on one box to authenticate. Certificates start mattering when you add a second machine — `billet ca issue <node>` mints one, the new host's `node.name` comes from it, and the server then has to listen where that machine can reach it.
 
-1. **Paste the `github:` block** that `github-app create` printed. It prints; it does not edit your
-   config, so `app_id` and `installation_id` stay `0` and `billet check` says so. The block already
-   carries `private_key_path` pointing at the key it just wrote, so pasting it settles that too.
-2. **`provider: docker` and a runner `image:`**, in the `node:` section and every tier — see the
-   warning above.
-3. **`server.state_dir`** defaults to `/var/lib/billet/server`, which an unprivileged `billet server`
-   cannot create. Point it somewhere you can write (`./state/server`) or pre-create it with the right
-   owner. `node.state_dir` is separate and is read by `billet node`; on one machine the two
-   directories are different and that is fine — a node with no certificate takes its deployment
-   identity from the `server:` section in the same file.
-
-**And Docker has to be there.** `billet check` never touches it, but `billet node` calls
-`docker ps` before it takes any work, to re-adopt containers from a previous run. No CLI, no running
-daemon, or no permission on the socket, and it stops there.
+**And Docker has to be there.** `billet check` never touches it, but `billet node` calls `docker ps` before it takes any work, to re-adopt containers from a previous run. No CLI, no running daemon, or no permission on the socket, and it stops there.
 
 `--config` is not optional here. billet deliberately does **not** read a
 `billet.yaml` from the working directory — a server started from a directory
