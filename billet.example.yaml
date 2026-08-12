@@ -132,6 +132,11 @@ github:
 # Read by `billet node`. On a single machine this sits beside the server section
 # above and the two processes share the file.
 node:
+  # OPTIONAL WITH A CERTIFICATE. The control plane authorises a node by the name
+  # in its certificate, so an enrolled host takes its name from there and this
+  # key is a second place to write the same fact. Set it on a loopback node,
+  # which has no certificate to take one from — and if it is set alongside a
+  # certificate, the two must agree.
   name: epyc-1
   server_addr: 127.0.0.1:7717
   provider: firecracker
