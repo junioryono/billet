@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -10,6 +11,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
+
+	"gopkg.in/yaml.v3"
 
 	"github.com/junioryono/billet/internal/github"
 )
@@ -35,6 +39,7 @@ func githubAppCreate(ctx context.Context, args []string) error {
 	org := fs.String("org", "", "GitHub organization to create the App for (required)")
 	name := fs.String("name", "", "suggested App name (GitHub App names are globally unique; you can edit it there)")
 	keyPath := fs.String("key-path", "", "where to write the App private key (default: alongside billet.yaml)")
+	cfgPath := fs.String("config", "", "billet.yaml to write the github block into")
 	noBrowser := fs.Bool("no-browser", false, "print URLs instead of opening a browser")
 	port := fs.Int("port", 0, "fixed loopback callback port (needed for `ssh -L` when onboarding a remote host)")
 
@@ -136,22 +141,65 @@ func githubAppCreate(ctx context.Context, args []string) error {
 
 	fmt.Printf("\nDone.\n\n")
 	fmt.Printf("  private key      %s\n", *keyPath)
+
+	block := githubBlock{
+		Org:            *org,
+		AppID:          result.App.ID,
+		ClientID:       result.App.ClientID,
+		InstallationID: result.Installation.ID,
+		PrivateKeyPath: *keyPath,
+	}
+
+	// WRITTEN INTO THE FILE RATHER THAN PRINTED FOR PASTING. Printing was one
+	// more step to get wrong, and getting it wrong is quiet: an app_id left at 0
+	// is only reported later by `billet check`, and a mistyped one comes back as
+	// an authentication failure that says nothing about which digit moved.
+	if *cfgPath != "" {
+		if err := writeGitHubBlock(*cfgPath, block); err != nil {
+			// NOT FATAL, because the App exists by now and the credential it
+			// issued cannot be re-created. Printing the block is the fallback that
+			// keeps this run recoverable.
+			fmt.Fprintf(os.Stderr, "\ncould not update %s: %v\n", *cfgPath, err)
+			printGitHubBlock(block)
+
+			return nil
+		}
+
+		fmt.Printf("  config           %s (updated)\n", *cfgPath)
+		fmt.Printf("\nThen run: billet check --config %s\n", *cfgPath)
+
+		return nil
+	}
+
 	fmt.Printf("\nAdd this to your billet.yaml:\n\n")
+	printGitHubBlock(block)
+	fmt.Printf("\nOr re-run with --config <path> and billet will write it for you.\n")
+
+	return nil
+}
+
+// githubBlock is the App identity a config needs.
+type githubBlock struct {
+	Org            string
+	AppID          int64
+	ClientID       string
+	InstallationID int64
+	PrivateKeyPath string
+}
+
+func printGitHubBlock(b githubBlock) {
 	fmt.Printf("github:\n")
-	fmt.Printf("  org: %s\n", *org)
-	fmt.Printf("  app_id: %d\n", result.App.ID)
+	fmt.Printf("  org: %s\n", b.Org)
+	fmt.Printf("  app_id: %d\n", b.AppID)
 
 	// Printed when GitHub returned one, because the operator cannot recover it
 	// from anywhere else without going back through the browser.
-	if result.App.ClientID != "" {
-		fmt.Printf("  client_id: %s\n", result.App.ClientID)
+	if b.ClientID != "" {
+		fmt.Printf("  client_id: %s\n", b.ClientID)
 	}
 
-	fmt.Printf("  installation_id: %d\n", result.Installation.ID)
-	fmt.Printf("  private_key_path: %s\n", *keyPath)
-	fmt.Printf("\nThen run: billet check\n")
-
-	return nil
+	fmt.Printf("  installation_id: %d\n", b.InstallationID)
+	fmt.Printf("  private_key_path: %s\n", b.PrivateKeyPath)
 }
 
 // reserveKeyFile creates the App key file 0600, refusing to clobber an existing
@@ -1107,4 +1155,107 @@ func readPrivateKey(path string) ([]byte, error) {
 	}
 
 	return pemBytes, nil
+}
+
+// writeGitHubBlock sets the App identity in a config, leaving everything else —
+// including the comments — as it was.
+//
+// A YAML NODE TREE RATHER THAN MARSHALLING THE STRUCT BACK. config.Config drops
+// every comment and reorders nothing predictably, so a round trip through it
+// would hand back a file that is technically equivalent and unrecognisable: the
+// operator's own notes gone, and the diff impossible to review. Editing the
+// tree touches five scalars.
+//
+// ATOMIC, because this file is the only record of where the state directory and
+// the App key live. A partial write during a crash would leave a config that
+// does not parse and a deployment that cannot start.
+func writeGitHubBlock(path string, b githubBlock) error {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", path, err)
+	}
+
+	var doc yaml.Node
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		return fmt.Errorf("parse %s: %w", path, err)
+	}
+
+	if doc.Kind != yaml.DocumentNode || len(doc.Content) == 0 {
+		return fmt.Errorf("%s is empty", path)
+	}
+
+	root := doc.Content[0]
+	if root.Kind != yaml.MappingNode {
+		return fmt.Errorf("%s is not a mapping", path)
+	}
+
+	gh := mappingFor(root, "github")
+
+	setScalar(gh, "org", b.Org)
+	setScalar(gh, "app_id", strconv.FormatInt(b.AppID, 10))
+	setScalar(gh, "installation_id", strconv.FormatInt(b.InstallationID, 10))
+	setScalar(gh, "private_key_path", b.PrivateKeyPath)
+
+	// Only when GitHub returned one: writing an empty client_id would be a key
+	// the operator then has to wonder about.
+	if b.ClientID != "" {
+		setScalar(gh, "client_id", b.ClientID)
+	}
+
+	var out bytes.Buffer
+
+	enc := yaml.NewEncoder(&out)
+	enc.SetIndent(2)
+
+	if err := enc.Encode(&doc); err != nil {
+		return fmt.Errorf("render %s: %w", path, err)
+	}
+
+	if err := enc.Close(); err != nil {
+		return fmt.Errorf("render %s: %w", path, err)
+	}
+
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, out.Bytes(), 0o600); err != nil {
+		return fmt.Errorf("write %s: %w", tmp, err)
+	}
+
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("replace %s: %w", path, err)
+	}
+
+	return nil
+}
+
+// mappingFor returns the mapping at a top-level key, creating it if absent.
+func mappingFor(root *yaml.Node, key string) *yaml.Node {
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		if root.Content[i].Value == key {
+			return root.Content[i+1]
+		}
+	}
+
+	k := &yaml.Node{Kind: yaml.ScalarNode, Value: key}
+	v := &yaml.Node{Kind: yaml.MappingNode}
+	root.Content = append(root.Content, k, v)
+
+	return v
+}
+
+// setScalar sets a key in a mapping, replacing the value and keeping the key's
+// comments.
+func setScalar(m *yaml.Node, key, value string) {
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		if m.Content[i].Value == key {
+			m.Content[i+1].Value = value
+			m.Content[i+1].Tag = ""
+			m.Content[i+1].Style = 0
+
+			return
+		}
+	}
+
+	m.Content = append(m.Content,
+		&yaml.Node{Kind: yaml.ScalarNode, Value: key},
+		&yaml.Node{Kind: yaml.ScalarNode, Value: value})
 }

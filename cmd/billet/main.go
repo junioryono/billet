@@ -1362,14 +1362,6 @@ func cmdCheck(ctx context.Context, args []string) error {
 	return nil
 }
 
-func cmdInit(_ context.Context, args []string) error {
-	fs := newFlagSet("billet init")
-	if err := parse(fs, args); err != nil {
-		return err
-	}
-	return fmt.Errorf("%w: writes a billet.yaml after asking for a provider and tier shapes", errNotImplemented)
-}
-
 func cmdStatus(_ context.Context, args []string) error {
 	fs := newFlagSet("billet status")
 	if err := parse(fs, args); err != nil {
