@@ -79,6 +79,7 @@ Report what happened, not what should have happened: if a test fails, say so and
 - **A loopback `server.listen` serves plain HTTP.** That is the single-machine shape, and setting `node.tls` against it is a config error rather than an upgrade.
 - **`make cross` before anything touching build tags.** The `flock` state lock is `//go:build unix`; CI cross-builds linux/amd64, linux/arm64 and darwin/arm64.
 - **Never guess a byte size.** Use `config.ByteSize`; a bare int of bytes is how a memory limit ends up 1024x wrong.
+- **Adding a machine needs no restart; adding a tier does.** `Plane.Register` never asks whether a host was declared — it checks the protocol version, the deployment identity, a non-zero contribution, and that the site is one the deployment declares (`WithSites`, wired from `cfg.SiteNames()`). So `nodes:` is policy about hosts rather than a roster of them. Tiers are read at startup and each becomes one scale set, and `nodes:` reaches the allocator through `Limits.Nodes` when it is built, so changing either needs a restart.
 
 ## Decisions written down
 
