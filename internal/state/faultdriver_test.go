@@ -94,25 +94,22 @@ func TestACancelledBeginStillReportsAStorageFault(t *testing.T) {
 	}
 }
 
-// A CANCELLED QUERY MUST COME BACK AS SOMETHING beginWrite CAN CLASSIFY.
+// A DEPENDENCY PROBE, AND NOTHING MORE THAN THAT.
 //
-// beginWrite translates exactly one driver code into the caller's context error,
-// and 9 was a guess until this measured it. This project's rule is that a claim
-// about somebody else's code is pinned to what that code does, not to what its
-// documentation implies.
+// It records how modernc reports a cancelled QUERY today: as context.Canceled,
+// normalised by the driver. It says nothing about BeginTx, which is the path
+// beginWrite uses and which need not behave the same way — so it is not evidence
+// about whether the SQLITE_INTERRUPT branch is reachable, and it does not pin the
+// code that branch matches on. Both of those are somebody else's behaviour that
+// this package cannot reach from here.
 //
-// MEASURED, AND ONLY ABOUT THE QUERY PATH: modernc normalises a cancelled QUERY
-// to context.Canceled itself. That is not evidence about BeginTx, which is what
-// beginWrite uses and which need not behave the same way — so this says nothing
-// about whether the SQLITE_INTERRUPT branch is reachable, and an earlier version
-// of this comment wrongly implied it did. The branch's own behaviour is pinned
-// separately, by TestAnInterruptedBeginIsReportedAsCancellation.
+// The branch's own behaviour is pinned by
+// TestAnInterruptedBeginIsReportedAsCancellation, which drives it end to end.
 //
-// What this one is worth: if a future driver version stops normalising the query
-// path, that is a signal the transaction path may have changed too.
-//
-// Either answer passes. Anything else fails, because beginWrite would hand a
-// caller an error it cannot recognise as cancellation at all.
+// What this one earns its place with: if a future driver version stops
+// normalising the query path, that is the first sign the transaction path may
+// have moved too — and this fails, loudly, in a file whose comment then tells the
+// next reader where to look.
 func TestACancelledQueryIsRecognisableAsCancellation(t *testing.T) {
 	db := open(t)
 
@@ -141,8 +138,9 @@ func TestACancelledQueryIsRecognisableAsCancellation(t *testing.T) {
 	}
 
 	t.Errorf("a cancelled query produced %#v, which is neither a context error nor "+
-		"recognised by isInterrupt — beginWrite would return it to a caller testing "+
-		"for context.Canceled", err)
+		"recognised by isInterrupt. This driver used to normalise it; if that has "+
+		"changed, check whether BeginTx changed with it — beginWrite's interrupt "+
+		"handling assumes SQLite's code 9", err)
 }
 
 // AN INTERRUPTED BEGIN IS REPORTED AS CANCELLATION.
