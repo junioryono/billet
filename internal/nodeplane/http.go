@@ -105,7 +105,9 @@ type Revocations interface {
 	// revoked since this request began, in one transaction. Two calls would let a
 	// revocation commit between the check and the record and take back a
 	// credential the machine had already stopped presenting.
-	RecordRenewedCert(ctx context.Context, cert alloc.IssuedCert, parent string) error
+	RecordRenewedCert(
+		ctx context.Context, cert alloc.IssuedCert, parent string, parentIssuedAt time.Time,
+	) error
 }
 
 // WithRevocations lets the wire refuse a credential an operator has taken back.
@@ -721,14 +723,15 @@ func (h *handler) renew(w http.ResponseWriter, r *http.Request) {
 		// milliseconds later; without naming the parent here, a revocation
 		// committing in between takes back a credential the machine has already
 		// stopped presenting and reports success.
-		parent := wirecert.Serial(r.TLS.PeerCertificates[0])
+		presented := r.TLS.PeerCertificates[0]
+		parent := wirecert.Serial(presented)
 
 		recErr := h.revocations.RecordRenewedCert(r.Context(), alloc.IssuedCert{
 			Serial:   wirecert.Serial(leaf),
 			Node:     node,
 			Source:   alloc.CertRenewed,
 			NotAfter: leaf.NotAfter.UTC().Format(time.RFC3339),
-		}, parent)
+		}, parent, presented.NotBefore.Add(wirecert.ClockSkew))
 
 		if errors.Is(recErr, alloc.ErrParentRevoked) {
 			h.log.Warn("a revoked certificate tried to renew itself", "node", node)

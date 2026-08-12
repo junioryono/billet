@@ -2493,7 +2493,37 @@ func (l *Listener) complete(ctx context.Context, job Job) error {
 		return nil
 	}
 
-	if err := l.alloc.Release(ctx, lease.ID, lease.Epoch, outcome); !releaseSettled(err) {
+	relErr := l.alloc.Release(ctx, lease.ID, lease.Epoch, outcome)
+
+	// FENCED NO LONGER PROVES THE CAPACITY CAME BACK.
+	//
+	// It used to: the reaper terminalized whatever it took, so a stale epoch
+	// meant the lease was already finished. Quarantine changed that — a lease
+	// with compute behind it is moved aside and KEPT CHARGED, so a release
+	// refused for a stale epoch may be refused by a lease that is still holding
+	// its host's capacity.
+	//
+	// This listener can settle it, because it has the one thing the quarantine is
+	// waiting for: the destroy above SUCCEEDED, so the compute is confirmed gone.
+	// That is the same proof a node offers, and it goes through the same door.
+	// Terminalizing at the current epoch instead would be the dangerous version
+	// of this — it would free the capacity on the strength of the epoch alone,
+	// which says nothing about whether a container exists.
+	if errors.Is(relErr, alloc.ErrFenced) {
+		if err := l.alloc.ResolveQuarantine(ctx, lease.ID); err == nil {
+			l.log.Warn("a finished job's lease had been quarantined before its release "+
+				"landed; its compute is confirmed gone, so the capacity is back",
+				"tier", l.tier, "request", job.RequestID, "lease", lease.ID)
+
+			relErr = nil
+		} else if !errors.Is(err, alloc.ErrLeaseNotFound) {
+			// Not quarantined, or the ledger could not answer. Either way this is
+			// not settled by us.
+			relErr = err
+		}
+	}
+
+	if err := relErr; !releaseSettled(err) {
 		// PARKED AND NOT RETURNED, because of who is calling.
 		//
 		// complete runs on the poll path as well as the cleanup loop, and there

@@ -162,7 +162,9 @@ var ErrParentRevoked = errors.New("alloc: the certificate being renewed has been
 // The wire refuses the renewal when this does, so the node keeps the certificate
 // it has — which is the revoked one, and will be turned away on its next
 // request. That is the intended outcome.
-func (a *Allocator) RecordRenewedCert(ctx context.Context, cert IssuedCert, parent string) error {
+func (a *Allocator) RecordRenewedCert(
+	ctx context.Context, cert IssuedCert, parent string, parentIssuedAt time.Time,
+) error {
 	if cert.Serial == "" {
 		return fmt.Errorf("alloc: an issued certificate needs a serial")
 	}
@@ -177,6 +179,28 @@ func (a *Allocator) RecordRenewedCert(ctx context.Context, cert IssuedCert, pare
 			return fmt.Errorf("alloc: read the revocation list: %w", err)
 		default:
 			return fmt.Errorf("%w: %s", ErrParentRevoked, parent)
+		}
+
+		// AND THE NODE CUTOFF, which is the half a serial cannot answer.
+		//
+		// The cutoff exists precisely for credentials billet never wrote down, so
+		// checking only the serial leaves them a way out: an unrecorded certificate
+		// opens a renewal, the revocation commits while its request body is still
+		// arriving — nothing bounds that but the read-header timeout — and the
+		// child it is handed is minted AFTER the cutoff and therefore accepted. The
+		// node renews its way out of a revocation it was never named in.
+		var cutoff string
+
+		switch err := tx.QueryRowContext(ctx,
+			`SELECT revoked_before FROM node_revocations WHERE node = ?`, cert.Node).Scan(&cutoff); {
+		case errors.Is(err, sql.ErrNoRows):
+		case err != nil:
+			return fmt.Errorf("alloc: read the revocation cutoff for %s: %w", cert.Node, err)
+		default:
+			if ts(parentIssuedAt.UTC().Truncate(time.Second)) < cutoff {
+				return fmt.Errorf("%w: %s was issued before %s was revoked",
+					ErrParentRevoked, parent, cert.Node)
+			}
 		}
 
 		_, err := tx.ExecContext(ctx,

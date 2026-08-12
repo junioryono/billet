@@ -42,12 +42,19 @@ type revocations struct {
 // fake shaped that way would let a revocation commit in the gap and pass a test
 // of the very property it breaks.
 func (r *revocations) RecordRenewedCert(
-	_ context.Context, cert alloc.IssuedCert, parent string,
+	_ context.Context, cert alloc.IssuedCert, parent string, parentIssuedAt time.Time,
 ) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	if r.serials[parent] {
+		return fmt.Errorf("%w: %s", alloc.ErrParentRevoked, parent)
+	}
+
+	// AND THE CUTOFF, the way the real one does: a serial cannot answer for a
+	// credential billet never recorded.
+	if cutoff, ok := r.cutoffs[cert.Node]; ok &&
+		parentIssuedAt.Truncate(time.Second).Before(cutoff) {
 		return fmt.Errorf("%w: %s", alloc.ErrParentRevoked, parent)
 	}
 

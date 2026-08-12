@@ -157,7 +157,7 @@ func TestARenewalIsRefusedWhenItsParentHasBeenRevoked(t *testing.T) {
 
 	// The renewal that was already in flight lands afterwards.
 	err := a.RecordRenewedCert(t.Context(),
-		IssuedCert{Serial: "child", Node: "epyc-1", Source: CertRenewed, NotAfter: future}, "parent")
+		IssuedCert{Serial: "child", Node: "epyc-1", Source: CertRenewed, NotAfter: future}, "parent", now)
 	if !errors.Is(err, ErrParentRevoked) {
 		t.Fatalf("a revoked certificate renewed itself into a credential nobody revoked: %v", err)
 	}
@@ -190,7 +190,7 @@ func TestARenewalIsRecordedWhenItsParentIsGood(t *testing.T) {
 
 	if err := a.RecordRenewedCert(t.Context(),
 		IssuedCert{Serial: "child", Node: "epyc-1", Source: CertRenewed, NotAfter: future},
-		"parent"); err != nil {
+		"parent", now); err != nil {
 		t.Fatalf("an ordinary renewal was refused: %v", err)
 	}
 

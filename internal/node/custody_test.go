@@ -1871,3 +1871,99 @@ func TestSupersessionMovesRunningWorkIntoCustody(t *testing.T) {
 			"holding something; a superseded process in that state drains forever")
 	}
 }
+
+// EVERY CUSTODY ENTRY RENEWS WITH ITS LEASE'S OWN EPOCH.
+//
+// The epoch is the fencing token: an entry carrying the wrong one is refused by
+// the ledger on its first heartbeat, which custody reads as "this lease is
+// gone" — and then destroys the compute it was holding. An entry that starts at
+// zero therefore does the opposite of what custody is for.
+//
+// This is a structural property of every constructor rather than of one path,
+// and it is checked that way because converting the field to an atomic silently
+// dropped the assignment from two of them. Nothing failed: no test heartbeated
+// an entry from those paths, so a zero epoch was invisible.
+func TestEveryCustodyEntryCarriesItsLeasesEpoch(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name  string
+		build func(r *Runner, lease *alloc.Lease, inst *provider.Instance)
+	}{
+		{"adopted after a restart", func(r *Runner, l *alloc.Lease, i *provider.Instance) {
+			r.adopt(l, i)
+		}},
+		{"held when a launch could not be confirmed", func(r *Runner, l *alloc.Lease, i *provider.Instance) {
+			r.hold(l, i.Name, l.RequestID)
+		}},
+		{"superseded by another process", func(r *Runner, l *alloc.Lease, i *provider.Instance) {
+			r.mu.Lock()
+			r.running[l.RequestID] = i
+			r.runningLease[l.RequestID] = l
+			r.mu.Unlock()
+
+			r.Superseded()
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			p := &fakeProvider{kind: config.ProviderDocker}
+			a, host := newAllocatorWithHost(t)
+			r := New(a, host, &fakeJIT{setID: 7}, p, nil)
+
+			lease := assignedLease(t, a)
+			if err := a.Bind(t.Context(), lease.ID, lease.Epoch, host); err != nil {
+				t.Fatalf("bind: %v", err)
+			}
+
+			// RUNNING, THEN QUARANTINED, so the lease's epoch is not zero. Only the reaper
+			// moves an epoch, so an ordinary lease sits at 0 — and a test built on
+			// one compares 0 against 0 and passes with the assignment removed. It is
+			// also the case that matters: recovery adopts quarantined compute, and
+			// that is the only path where the epoch has moved.
+			for _, to := range []alloc.Phase{alloc.PhaseLaunching, alloc.PhaseOnline, alloc.PhaseBusy} {
+				if err := a.Advance(t.Context(), lease.ID, lease.Epoch, to); err != nil {
+					t.Fatalf("advance to %s: %v", to, err)
+				}
+			}
+
+			if err := a.ExpireForTest(t.Context(), lease.ID); err != nil {
+				t.Fatalf("expire: %v", err)
+			}
+
+			if _, err := a.Reap(t.Context()); err != nil {
+				t.Fatalf("reap: %v", err)
+			}
+
+			bound, err := a.Lease(t.Context(), lease.ID)
+			if err != nil {
+				t.Fatalf("lease: %v", err)
+			}
+
+			if bound.Epoch == 0 {
+				t.Fatal("this test cannot tell a missing epoch from a zero one")
+			}
+
+			inst := &provider.Instance{
+				ID: "i1", Name: provider.InstanceName(bound.ID), Running: true,
+			}
+
+			tc.build(r, bound, inst)
+
+			r.mu.Lock()
+			entry, held := r.custody[bound.ID]
+			r.mu.Unlock()
+
+			if !held {
+				t.Fatal("nothing was taken into custody")
+			}
+
+			if got := entry.epoch.Load(); got != bound.Epoch {
+				t.Errorf("the entry renews with epoch %d and its lease is at %d; the first "+
+					"heartbeat is fenced, custody reads that as the lease being gone, and "+
+					"destroys the compute it was holding", got, bound.Epoch)
+			}
+		})
+	}
+}
