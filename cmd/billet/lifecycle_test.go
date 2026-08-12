@@ -10,10 +10,17 @@ import (
 
 // waitFor polls a condition rather than sleeping a fixed amount, so the test is
 // not a bet on how fast a goroutine gets scheduled.
+// waitFor polls a condition rather than sleeping a fixed amount.
+//
+// The deadline bounds a STALL rather than budgeting the work, so it is far
+// larger than any of these waits needs. Five seconds looked ample and was not:
+// under the full suite, with -race and -covermode=atomic, a goroutine can go
+// unscheduled that long and the test then fails on the wait rather than on
+// what it asserts.
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
 
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(60 * time.Second)
 	for !cond() {
 		if time.Now().After(deadline) {
 			t.Fatalf("timed out waiting for %s", what)
