@@ -377,3 +377,78 @@ func TestATierNoDeclaredShapeCanHoldIsRefusedAtLoad(t *testing.T) {
 		}
 	}
 }
+
+// A URL is a thing that gets logged, so a credential must not live in one.
+// billet authenticates with a request signature, so userinfo authenticates
+// nothing and is pure exposure.
+func TestACloudEndpointMustNotCarryACredential(t *testing.T) {
+	got := loadErr(t, cloudConfig(t, "    region: us-west-2\n",
+		"    region: us-west-2\n    endpoint: https://user:pass@ec2.us-west-2.amazonaws.com/\n"))
+
+	if !strings.Contains(got, "password") {
+		t.Errorf("the error does not explain what is wrong: %s", got)
+	}
+
+	// AND THE PASSWORD IS NOT IN THE ERROR, which would put it in the log that
+	// reports the config being invalid.
+	if strings.Contains(got, "pass@") || strings.Contains(got, "user:pass") {
+		t.Errorf("the error rendered the credential it is refusing: %s", got)
+	}
+}
+
+// A DNS NAME THAT HAPPENS TO RESOLVE TO LOOPBACK IS NOT LOOPBACK. billet does not
+// resolve the host, so only a literal loopback address or "localhost" takes the
+// exception — the safe direction, since resolution is attacker-influenceable and
+// can change between the check and the request.
+func TestTheLoopbackExceptionIsNotResolved(t *testing.T) {
+	got := loadErr(t, cloudConfig(t, "    region: us-west-2\n",
+		"    region: us-west-2\n    endpoint: http://localtest.me/\n"))
+
+	if !strings.Contains(got, "https") {
+		t.Errorf("a plaintext endpoint to a resolvable name was not refused: %s", got)
+	}
+}
+
+// A REFUSAL MUST NOT PRINT THE CREDENTIAL IT IS REFUSING, whatever the reason for
+// refusing. Checking the scheme before the userinfo meant a non-http scheme was
+// rejected by a message that rendered the password — a validation rule creating
+// the exposure it exists to prevent.
+func TestNoEndpointRefusalRendersAPassword(t *testing.T) {
+	for name, endpoint := range map[string]string{
+		"an odd scheme": "ftp://alice:secret@example.com/",
+		"plaintext":     "http://alice:secret@example.com/",
+		"unparseable":   "https://alice:secret@exa mple.com/",
+		"no host":       "https://alice:secret@/v1",
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := loadErr(t, cloudConfig(t, "    region: us-west-2\n",
+				"    region: us-west-2\n    endpoint: \""+endpoint+"\"\n"))
+
+			if strings.Contains(got, "secret") {
+				t.Errorf("the refusal rendered the password: %s", got)
+			}
+		})
+	}
+}
+
+// A FLEET'S TIERS ARE READ BY EVERY NODE, so a small cloud node must not refuse
+// the config because it can see a tier meant for a large one.
+//
+// The allocator never places work on a node beyond its own contribution, so a
+// tier larger than this node's budget is not a contradiction — it is another
+// machine's job. Refusing it would make one deployment's config unloadable on
+// half its machines.
+func TestATierThisNodeCouldNeverBeGivenIsNotItsProblem(t *testing.T) {
+	body := cloudConfig(t, "", "")
+	// Larger than the node's 64 vCPU budget, so it can never be placed here.
+	// Bigger than the node's 64 vCPU budget and still inside server.max_vcpu, so
+	// the only thing that could refuse it is the shape check under test.
+	body = strings.Replace(body,
+		"  - label: billet-8vcpu-ubuntu-2404\n    provider: firecracker\n    vcpu: 8\n",
+		"  - label: billet-8vcpu-ubuntu-2404\n    provider: ec2\n    vcpu: 96\n", 1)
+	body = strings.Replace(body, "    memory: 32GiB\n", "    memory: 200GiB\n", 1)
+
+	if _, err := Load(writeConfig(t, body)); err != nil {
+		t.Errorf("a tier too large for this node to be given was refused: %v", err)
+	}
+}

@@ -3,6 +3,7 @@ package e2e
 import (
 	"context"
 	"encoding/base64"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -119,6 +120,19 @@ func newFakeCloud(t *testing.T) *fakeCloud {
 			reply = `<TerminateInstancesResponse/>`
 
 		default: // DescribeInstances
+			// HONOURING THE STATE FILTER, so the fake cannot flatter billet by
+			// returning rows it never asked for.
+			wanted := map[string]bool{}
+
+			for i := 1; ; i++ {
+				v := params.Get(fmt.Sprintf("Filter.2.Value.%d", i))
+				if v == "" {
+					break
+				}
+
+				wanted[v] = true
+			}
+
 			var b strings.Builder
 
 			b.WriteString(`<DescribeInstancesResponse><reservationSet><item><instancesSet>`)
@@ -130,11 +144,13 @@ func newFakeCloud(t *testing.T) *fakeCloud {
 					`</tagSet></item>`)
 			}
 
-			for id, name := range f.shuttingDown {
-				b.WriteString(`<item><instanceId>` + id + `</instanceId>` +
-					`<instanceState><name>shutting-down</name></instanceState><tagSet>` +
-					`<item><key>Name</key><value>` + name + `</value></item>` +
-					`</tagSet></item>`)
+			if wanted["shutting-down"] {
+				for id, name := range f.shuttingDown {
+					b.WriteString(`<item><instanceId>` + id + `</instanceId>` +
+						`<instanceState><name>shutting-down</name></instanceState><tagSet>` +
+						`<item><key>Name</key><value>` + name + `</value></item>` +
+						`</tagSet></item>`)
+				}
 			}
 
 			b.WriteString(`</instancesSet></item></reservationSet></DescribeInstancesResponse>`)
@@ -355,10 +371,14 @@ func TestAJobReachesACloudInstance(t *testing.T) {
 	//
 	// Unlike `docker rm --force`, TerminateInstances returns once the request is
 	// accepted and the instance sits in shutting-down for a while afterwards.
-	// billet keeps reporting it for that window — `shutting-down` counts as
-	// running — and that is the SAFE direction: the capacity stays charged to this
-	// host until the machine is provably gone, which is the same rule custody
-	// follows everywhere else.
+	// billet keeps reporting it for that window, because `shutting-down` is one of
+	// the states it asks for and counts as running.
+	//
+	// WHAT THIS ASSERTS IS THE INVENTORY, WHICH IS THIS PACKAGE'S HALF. What the
+	// control plane then does with it — holding quarantined capacity for anything
+	// still reported — is Reconcile's, and is tested against the ledger in
+	// internal/alloc. Claiming the capacity half here would be claiming something
+	// these lines do not observe.
 	during, err := s.runner.Instances(t.Context())
 	if err != nil {
 		t.Fatalf("Instances after destroy: %v", err)

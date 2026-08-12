@@ -1507,18 +1507,32 @@ func (e *EC2Config) normalize() {
 
 // emptyGroupErrors reports blank entries in a security group list.
 func emptyGroupErrors(field string, groups []string) []error {
-	var errs []error
+	if err := CheckEC2SecurityGroups(field, groups); err != nil {
+		return []error{err}
+	}
 
+	return nil
+}
+
+// CheckEC2SecurityGroups refuses a list holding a blank entry.
+//
+// EXPORTED AND CALLED FROM BOTH SIDES, like CheckEC2Endpoint and for the same
+// reason: the provider's constructor is exported and cannot assume its
+// configuration came through Load. It matters most on the untrusted list, where
+// Accepts admits fork pull-request work as soon as the list is non-empty — so a
+// list holding one empty string opens the backend to untrusted code with no
+// network actually described for it.
+func CheckEC2SecurityGroups(field string, groups []string) error {
 	for i, g := range groups {
-		if g == "" {
-			errs = append(errs, fmt.Errorf(
+		if strings.TrimSpace(g) == "" {
+			return fmt.Errorf(
 				"node.ec2.%s[%d] is empty; an empty string is not a security group, and on the "+
 					"untrusted list a non-empty list is what admits fork pull-request work",
-				field, i))
+				field, i)
 		}
 	}
 
-	return errs
+	return nil
 }
 
 // CheckEC2Endpoint refuses an endpoint that would carry a credential in the clear.
@@ -1540,33 +1554,62 @@ func CheckEC2Endpoint(endpoint string) error {
 
 	u, err := url.Parse(endpoint)
 	if err != nil {
-		return fmt.Errorf("node.ec2.endpoint %q is not a url: %w", endpoint, err)
+		// NEITHER THE STRING NOR THE PARSE ERROR IS RENDERED. url.Parse fails with
+		// a *url.Error, and that type EMBEDS THE WHOLE URL in its own message — so
+		// wrapping it verbatim prints the password just as surely as printing the
+		// endpoint would. Only the reason underneath it is safe, and it is the only
+		// part that says anything an operator can act on.
+		reason := err
+
+		var uerr *url.Error
+		if errors.As(err, &uerr) {
+			reason = uerr.Err
+		}
+
+		return fmt.Errorf("node.ec2.endpoint is not a url: %w", reason)
 	}
 
-	// THE SCHEME IS CHECKED FIRST, because a bare `ec2.us-west-2.amazonaws.com`
+	// USERINFO IS CHECKED BEFORE ANYTHING ELSE CAN RENDER THE URL, and that
+	// ordering is the whole point rather than a style choice. Checking the scheme
+	// first meant `ftp://alice:secret@example.com` was refused by a message that
+	// printed the password it was refusing — a validation rule that creates the
+	// exposure it exists to prevent.
+	//
+	// billet authenticates with SigV4, so a username and password in the endpoint
+	// authenticate nothing. They are pure exposure.
+	if u.User != nil {
+		return fmt.Errorf("node.ec2.endpoint must not carry a username or password: billet "+
+			"authenticates with a request signature, so it would be a credential in a string "+
+			"that gets logged and nothing else (host %s)", u.Hostname())
+	}
+
+	// THE SCHEME IS CHECKED NEXT, because a bare `ec2.us-west-2.amazonaws.com`
 	// parses as a PATH — so asking about the host first answers "names no host",
 	// which sends an operator looking for a typo in a hostname that is correct.
 	if u.Scheme != "https" && u.Scheme != "http" {
-		return endpointNeedsHTTPS(endpoint)
+		return endpointNeedsHTTPS(u)
 	}
 
 	if u.Hostname() == "" {
-		return fmt.Errorf("node.ec2.endpoint %q names no host", endpoint)
+		return fmt.Errorf("node.ec2.endpoint %q names no host", u.Redacted())
 	}
 
 	if u.Scheme == "https" || isLoopbackHost(u.Hostname()) {
 		return nil
 	}
 
-	return endpointNeedsHTTPS(endpoint)
+	return endpointNeedsHTTPS(u)
 }
 
-func endpointNeedsHTTPS(endpoint string) error {
+// endpointNeedsHTTPS renders the refusal through url.Redacted, which replaces a
+// password with "xxxxx" — belt and braces, since userinfo is already refused
+// above, and the cheaper habit to keep than remembering which paths are safe.
+func endpointNeedsHTTPS(u *url.URL) error {
 	return fmt.Errorf(
 		"node.ec2.endpoint %q must use https: billet signs each request and sends a session "+
 			"token with it, so plaintext hands an on-path observer a replayable request. Only a "+
 			"loopback address may use http, where the trust boundary is the machine itself",
-		endpoint)
+		u.Redacted())
 }
 
 // isLoopbackHost reports whether a host names this machine.
@@ -2141,6 +2184,20 @@ func (c *Config) validateEC2Shapes() []error {
 		// machine, so the shapes this one may buy say nothing about whether it can
 		// run.
 		if t.Node != "" && t.Node != c.Node.Name {
+			continue
+		}
+
+		// NOR IS A TIER THIS NODE COULD NEVER BE GIVEN. Every node in a fleet reads
+		// the same tier catalogue, so a small cloud node sees the tiers meant for a
+		// large one — and refusing them would make one deployment's config
+		// unloadable on half its machines. The allocator will never place work here
+		// that exceeds this node's own contribution, so a shape that cannot hold it
+		// is not a contradiction.
+		//
+		// What remains refused is the case that really is broken: a tier this node
+		// IS eligible for, and no declared shape can buy.
+		if (c.Node.MaxVCPU > 0 && t.VCPU > c.Node.MaxVCPU) ||
+			(c.Node.MaxMemory > 0 && t.Memory > c.Node.MaxMemory) {
 			continue
 		}
 

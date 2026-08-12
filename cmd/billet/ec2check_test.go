@@ -4,6 +4,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -13,19 +14,56 @@ import (
 
 // fakeEC2 answers DescribeInstances, so the pre-flight's live call has somewhere
 // to go that is not somebody's AWS account.
-func fakeEC2(t *testing.T, status int) string {
+//
+// IT CHECKS WHAT IT WAS ASKED, rather than answering a fixed status to anything.
+// A fake that ignores the request leaves the test green when the call is
+// unsigned, is a different action, or is made with some other identity — so it
+// would assert only that a status propagates, which is not what this pre-flight
+// is for. `accept` is the identity the call must present, and anything else is
+// refused the way AWS would refuse it.
+func fakeEC2(t *testing.T, accept string) string {
 	t.Helper()
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(status)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read body: %v", err)
 
-		body := `<DescribeInstancesResponse><reservationSet/></DescribeInstancesResponse>`
-		if status != http.StatusOK {
-			body = `<Response><Errors><Error><Code>UnauthorizedOperation</Code>` +
-				`<Message>no</Message></Error></Errors></Response>`
+			return
 		}
 
-		if _, err := io.WriteString(w, body); err != nil {
+		params, err := url.ParseQuery(string(body))
+		if err != nil {
+			t.Errorf("parse body: %v", err)
+
+			return
+		}
+
+		if got := params.Get("Action"); got != "DescribeInstances" {
+			t.Errorf("the pre-flight called %q, want the read-only DescribeInstances", got)
+		}
+
+		auth := r.Header.Get("Authorization")
+		if auth == "" {
+			t.Error("the pre-flight sent an unsigned request")
+		}
+
+		// The identity is in the credential scope, so a call made with some other
+		// key than the one reported is refused here rather than silently accepted.
+		if accept == "" || !strings.Contains(auth, "Credential="+accept+"/") {
+			w.WriteHeader(http.StatusForbidden)
+
+			if _, err := io.WriteString(w, `<Response><Errors><Error>`+
+				`<Code>UnauthorizedOperation</Code><Message>no</Message>`+
+				`</Error></Errors></Response>`); err != nil {
+				t.Errorf("write: %v", err)
+			}
+
+			return
+		}
+
+		if _, err := io.WriteString(w,
+			`<DescribeInstancesResponse><reservationSet/></DescribeInstancesResponse>`); err != nil {
 			t.Errorf("write: %v", err)
 		}
 	}))
@@ -86,7 +124,7 @@ func TestTheCloudPreflightNamesTheIdentityAndNotTheSecret(t *testing.T) {
 
 	cfg := &config.EC2Config{
 		Region:           "us-west-2",
-		Endpoint:         fakeEC2(t, http.StatusOK),
+		Endpoint:         fakeEC2(t, "AKIDEXAMPLE"),
 		SubnetID:         "subnet-0abc",
 		SecurityGroupIDs: []string{"sg-0abc"},
 		InstanceTypes:    []config.EC2InstanceType{{Type: "c7i.2xlarge", VCPU: 8, Memory: 16 * config.GiB}},
@@ -125,7 +163,7 @@ func TestTheCloudPreflightSaysWhatSpotCosts(t *testing.T) {
 
 	cfg := &config.EC2Config{
 		Region:                    "us-west-2",
-		Endpoint:                  fakeEC2(t, http.StatusOK),
+		Endpoint:                  fakeEC2(t, "AKIDEXAMPLE"),
 		SubnetID:                  "subnet-0abc",
 		SecurityGroupIDs:          []string{"sg-0abc"},
 		UntrustedSecurityGroupIDs: []string{"sg-fork"},
@@ -163,7 +201,7 @@ func TestTheCloudPreflightFailsWhenTheCredentialsCannotBeUsed(t *testing.T) {
 
 	cfg := &config.EC2Config{
 		Region:           "us-west-2",
-		Endpoint:         fakeEC2(t, http.StatusForbidden),
+		Endpoint:         fakeEC2(t, "SOME-OTHER-KEY"),
 		SubnetID:         "subnet-0abc",
 		SecurityGroupIDs: []string{"sg-0abc"},
 		InstanceTypes:    []config.EC2InstanceType{{Type: "c7i.2xlarge", VCPU: 8, Memory: 16 * config.GiB}},
