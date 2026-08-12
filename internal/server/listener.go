@@ -105,13 +105,12 @@ func (n noRunner) Launch(_ context.Context, lease *alloc.Lease, job Job) error {
 
 func (noRunner) Destroy(context.Context, int64) error { return nil }
 
-// ErrNoMessage means a long poll timed out with nothing to report. It is the
-// ordinary outcome, not a failure — the caller polls again.
+// ErrNoMessage means a long poll timed out with nothing to report — the ordinary
+// outcome, not a failure.
 //
-// A sentinel rather than (nil, nil), which the upstream client returns and this
-// package deliberately does not propagate: a nil message with a nil error is
-// indistinguishable from "something went wrong and nobody said so", and every
-// caller has to remember which of the two it is looking at.
+// A sentinel rather than (nil, nil), which the upstream client returns: a nil
+// message with a nil error is indistinguishable from "something went wrong and
+// nobody said so".
 var ErrNoMessage = errors.New("server: no message")
 
 // ErrUntrustworthySession marks a scale-set response billet cannot act on.
@@ -184,23 +183,21 @@ type Listener struct {
 	// allocator, never one computed from headroom.
 	running map[int64]*alloc.Lease
 
-	// Completions whose destroy failed. A failed destroy deliberately keeps the
-	// capacity held, because releasing it while the compute may still be running
-	// is the overcommit the ordering exists to prevent — and GitHub's completion
-	// has been acknowledged, so nothing else will ever ask again. Retrying on the
+	// Completions whose destroy failed. Releasing while the compute may still be
+	// running is the overcommit the ordering exists to prevent, and GitHub's completion
+	// has been acknowledged, so nothing else will ever ask again — retrying on the
 	// renewal clock is what stops "held" becoming a leak.
 	//
-	// Entries carry their own next-attempt time: retries are sequential and a
-	// single Destroy can wait the full node command timeout.
+	// Entries carry their own next-attempt time: retries are sequential and one Destroy
+	// can wait the full node command timeout.
 	cleanup map[int64]*pendingCleanup
-	// Escrow PROMISED to a request claimed from GitHub but not yet given, keyed by
-	// that request id.
+	// Escrow PROMISED to a request claimed from GitHub but not yet given, keyed by that
+	// request id.
 	//
-	// An acquisition is an OBLIGATION lasting until the Assigned message arrives,
-	// not an instantaneous count. Capping at len(held) instead would let one lease
-	// be promised to request B and then consumed by the assignment of request A,
-	// so B's assignment finds nothing left. Reserving under the mutex BEFORE the
-	// network call also closes the race with the heartbeat.
+	// An acquisition is an OBLIGATION lasting until the Assigned message arrives, not
+	// an instantaneous count: capping at len(held) lets one lease be promised to B and
+	// consumed by A's assignment. Reserving under the mutex before the network call
+	// also closes the race with the heartbeat.
 	acquiring map[int64]*promise
 
 	lastMessageID int64
@@ -299,13 +296,10 @@ func WithRunner(r Runner) Option {
 }
 
 // promise is escrow held for a request GitHub has been told billet will run, and
-// the moment that undertaking was made.
+// when that undertaking was made.
 //
-// `at` IS DIAGNOSTIC ONLY — it drives one stale-promise warning. It must not
-// time the promise out: see defaultStalePromise. A promise ends in exactly four
-// ways, none of them local to this struct: the assignment arrives, a completion
-// or cancellation arrives, the heartbeat finds the lease fenced, or the session
-// ends and releaseAll hands it back.
+// `at` IS DIAGNOSTIC ONLY — it drives one stale-promise warning and must not time
+// the promise out; see defaultStalePromise.
 type promise struct {
 	lease *alloc.Lease
 	at    time.Time
@@ -359,11 +353,8 @@ func (p *pendingCleanup) failed(now time.Time, first, ceiling time.Duration) {
 }
 
 // defaultStalePromise is how long a promise may go unclaimed before billet warns.
-//
-// DIAGNOSTIC, not a deadline: passing it must not release the escrow. An
-// acquisition is a commitment to GitHub that no local timer can revoke —
-// AcquireJobs is one-way and DeleteMessage acknowledges a notification rather
-// than refusing a job — so a timed release would only mean billet had forgotten
+// DIAGNOSTIC, not a deadline: an acquisition is a commitment to GitHub that no
+// local timer can revoke, so a timed release would only mean billet had forgotten
 // it owes a runner while GitHub still expects one.
 const defaultStalePromise = 5 * time.Minute
 
@@ -372,14 +363,12 @@ const (
 	// A node refusing this long will not answer sooner for being asked more often;
 	// the point of the ceiling is that it keeps asking at all.
 	maxRetryEvery = 5 * time.Minute
-	// ONE, because a node executes commands one at a time and each command's
-	// timeout starts when it is QUEUED. Several requests can share a node, so
-	// concurrent destroys there start N clocks against a queue served in turn: the
-	// ones at the back expire while the node works through the front, and healthy
-	// jobs are recorded as failed destroys with their leases held.
+	// ONE. A node executes commands one at a time and each command's timeout starts
+	// when it is QUEUED, so concurrent destroys against one node start N clocks against
+	// a queue served in turn and the ones at the back expire.
 	//
-	// The useful shape is one command in flight PER NODE, parallel across nodes,
-	// which belongs in the plane — only it knows which commands share a queue.
+	// The useful shape is one command in flight PER NODE, which belongs in the plane —
+	// only it knows which commands share a queue.
 	teardownConcurrency = 1
 
 	// The local half of the teardown. Short, because neither waits on a node, and
@@ -394,13 +383,11 @@ const (
 	// on. Deliberately does NOT bound the drain; see maxDrainGrace.
 	maxGrace = time.Hour
 
-	// How long the listener keeps polling for completions after being asked to
-	// stop, before destroying whatever is still running.
+	// How long the listener keeps polling for completions after being asked to stop.
 	//
 	// SIX HOURS BECAUSE THAT IS THE LENGTH OF A JOB, not of a shutdown: GitHub's
-	// jobs.<job_id>.timeout-minutes defaults to 360. Every other budget here
-	// bounds work BILLET is doing; this one bounds somebody else's. Overrunning it
-	// is not a failure state.
+	// timeout-minutes defaults to 360. Every other budget here bounds work BILLET is
+	// doing. Overrunning it is not a failure state.
 	defaultDrainGrace = 6 * time.Hour
 
 	// Separate from maxGrace: reusing the teardown's one-hour ceiling would refuse
@@ -408,17 +395,15 @@ const (
 	// still a ceiling — past this a typo is likelier than the intent.
 	maxDrainGrace = 24 * time.Hour
 
-	// Bounds the whole teardown. Renewal continues after the caller cancels, which
-	// is what lets the release destroy compute without the reaper taking the
-	// capacity underneath it; the cost is a wedged teardown renewing forever, so
-	// it gets a deadline of its own.
+	// Bounds the whole teardown. Renewal continues after the caller cancels, which lets
+	// the release destroy compute without the reaper taking the capacity underneath it;
+	// the cost is a wedged teardown renewing forever, so it gets its own deadline.
 	//
-	// IT MUST EXCEED A LEGITIMATE TEARDOWN. The node command timeout is TEN
-	// MINUTES, so a destroy of a node that accepted the command and went quiet can
-	// outlast a short grace — after which the watchdog stops renewal, the reaper
-	// reclaims, and another tier can take a machine whose container is still being
-	// destroyed. This covers ONE such destroy; N of them need N times this and
-	// will not get it, which is bounded and reported rather than silent.
+	// IT MUST EXCEED A LEGITIMATE TEARDOWN. The node command timeout is TEN MINUTES, so
+	// a destroy of a node that went quiet can outlast a short grace — after which the
+	// watchdog stops renewal, the reaper reclaims, and another tier can take a machine
+	// whose container is still being destroyed. This covers ONE such destroy; N of them
+	// need N times this and will not get it, which is bounded and reported.
 	defaultShutdownGrace = 12 * time.Minute
 )
 
@@ -537,10 +522,8 @@ func WithFinishGraces(closing, releasing time.Duration) Option {
 // sumBudgets adds the teardown budgets without letting them wrap.
 //
 // Three valid positive durations can overflow int64 and come out NEGATIVE, which
-// context.WithTimeout reads as already expired — so an operator who set an
-// absurdly long grace would get a watchdog that fired instantly and stopped
-// renewing while the destroys ran on. Saturating is the honest answer: a budget
-// nobody will reach, rather than one that has already passed.
+// context.WithTimeout reads as already expired — so an absurdly long grace would
+// give a watchdog that fired instantly. Saturating is the honest answer.
 func sumBudgets(budgets ...time.Duration) time.Duration {
 	total := time.Duration(0)
 
@@ -558,19 +541,12 @@ func sumBudgets(budgets ...time.Duration) time.Duration {
 // checkGrace refuses a teardown budget that cannot mean what it says.
 //
 // A ZERO IS AN INSTRUCTION, NOT AN OMISSION: leaving the option unset already
-// selects the default, so an explicit zero means something, and
-// context.WithTimeout reads it as "already over" — which fails the session close
-// on its first instruction and skips every release. Substituting a default
-// quietly would run for twelve minutes instead of the -1s somebody's arithmetic
-// produced: the same misconfiguration with the evidence removed.
+// selects the default, and context.WithTimeout reads an explicit zero as "already
+// over", which fails the session close on its first instruction.
 //
-// The ceiling matters for the same reason: three durations near MaxInt64 sum to
-// a NEGATIVE one, which is an expired deadline, and saturating instead gives a
-// watchdog that fires in about 292 years.
-//
-// It is a PARAMETER because the drain waits on somebody else's job and is bounded
-// by maxDrainGrace, while every teardown budget waits on billet's own work and is
-// bounded by maxGrace.
+// The ceiling matters for the same reason — three durations near MaxInt64 sum to a
+// NEGATIVE one. It is a PARAMETER because the drain waits on somebody else's job
+// and is bounded by maxDrainGrace.
 func checkGrace(name string, d, ceiling time.Duration) error {
 	switch {
 	case d <= 0:
@@ -582,14 +558,12 @@ func checkGrace(name string, d, ceiling time.Duration) error {
 	return nil
 }
 
-// WithCleanupRetryPacing sets how long a failed cleanup retry waits before the
-// next attempt, and the ceiling that wait doubles towards.
+// WithCleanupRetryPacing sets how long a failed cleanup retry waits, and the ceiling
+// it doubles towards.
 //
-// A first value of zero or less turns pacing off, so every pass tries every
-// pending record. That is only ever what a test wants: in production it lets one
-// permanently unreachable node occupy each pass ahead of a node that has just
-// come back, because retries are sequential and a Destroy can wait the full node
-// command timeout.
+// A first value of zero or less turns pacing off, which only a test wants: in
+// production it lets one unreachable node occupy each pass ahead of a node that has
+// just come back.
 func WithCleanupRetryPacing(first, ceiling time.Duration) Option {
 	return func(l *Listener) {
 		l.retryFirst, l.retryMax = first, ceiling
@@ -693,15 +667,12 @@ func (l *Listener) Run(ctx context.Context) error {
 	// live until the session ends, so releasing escrow first leaves a positive
 	// advertisement standing with nothing behind it.
 	defer func() {
-		// BOUNDED, because renewal continues after the caller cancels. Neither
-		// Runner nor Session promises to honour a context, so without this a
-		// teardown could wedge Run forever while renewing every lease it holds.
+		// BOUNDED, because renewal continues after the caller cancels and neither Runner
+		// nor Session promises to honour a context.
 		//
-		// ONE DEADLINE THAT EVERY PHASE INHERITS, rather than a sum the phases can
-		// outlive: renewal has to outlast the whole teardown, and a sum would not
-		// establish that because each later phase starts a fresh budget. Deriving
-		// every phase from one overall deadline makes each min(its own budget, what
-		// is left).
+		// ONE DEADLINE THAT EVERY PHASE INHERITS, not a sum they can outlive: renewal has
+		// to outlast the whole teardown, and each phase is min(its own budget, what is
+		// left).
 		overall, endOverall := context.WithTimeout(context.WithoutCancel(ctx),
 			l.teardownBudget())
 		defer endOverall()
@@ -716,15 +687,12 @@ func (l *Listener) Run(ctx context.Context) error {
 			beating.Wait()
 		}()
 
-		// AND RENEWAL STOPS ON THE GRACE EVEN IF THE TEARDOWN NEVER FINISHES.
-		// Nothing can bound a Destroy that ignores its context, so a bad
-		// implementation can wedge Run — but a wedged listener must not also go on
-		// renewing, which would stop the reaper reclaiming. It leaks a goroutine and
-		// says so, and the ledger recovers without it.
+		// AND RENEWAL STOPS ON THE GRACE EVEN IF THE TEARDOWN NEVER FINISHES. A wedged
+		// listener that went on renewing would stop the reaper reclaiming; it leaks a
+		// goroutine and says so, and the ledger recovers without it.
 		//
-		// Decided on `guard` alone rather than on whichever channel select picks:
-		// both are ready once a healthy teardown cancels the grace, and select
-		// chooses uniformly, so a clean shutdown could otherwise report an overrun.
+		// Decided on `guard` alone rather than on whichever channel select picks, since
+		// both are ready after a healthy teardown and select chooses uniformly.
 		guard := make(chan struct{})
 
 		var watching sync.WaitGroup
@@ -765,13 +733,12 @@ func (l *Listener) Run(ctx context.Context) error {
 			watching.Wait()
 		}()
 
-		// CLEANUP IS STOPPED AND JOINED BEFORE ANY OF IT, because a retry blocked
-		// in a remote Destroy outlives Run and comes back to call alloc.Release
-		// against a database the caller had every right to have closed.
+		// CLEANUP IS STOPPED AND JOINED BEFORE ANY OF IT: a retry blocked in a remote
+		// Destroy outlives Run and comes back to call alloc.Release against a database the
+		// caller had every right to have closed.
 		//
-		// SEALED FIRST, then cancelled: cancelling says nothing about what the loop
-		// is midway through starting, and sealing settles that under the same mutex
-		// the shutdown snapshot reads.
+		// SEALED FIRST, then cancelled — cancelling says nothing about what the loop is
+		// midway through starting.
 		l.seal()
 		stopSweeping()
 
@@ -791,13 +758,11 @@ func (l *Listener) Run(ctx context.Context) error {
 		stopCtx, endGrace := context.WithTimeout(overall, l.shutdownGrace)
 		defer endGrace()
 
-		// ONE DESTROY PASS FOR EVERYTHING, before the session closes: the union of
-		// cleanup records and running jobs, destroyed once, so the release only ever
-		// releases.
+		// ONE DESTROY PASS FOR EVERYTHING, before the session closes, so the release only
+		// ever releases.
 		//
-		// No budget check here: the join's context is min(shutdownGrace, what is
-		// left), so this cannot be reached with the overall budget spent. A guard
-		// could never fire, and a mutant of one survives.
+		// No budget check: the join's context is min(shutdownGrace, what is left), so this
+		// cannot be reached with the budget spent. A guard here could never fire.
 		destroyed := l.destroyAll(stopCtx)
 
 		// A FRESH BUDGET FOR THE LOCAL HALF, and one EACH. Sharing the destroy
@@ -807,15 +772,12 @@ func (l *Listener) Run(ctx context.Context) error {
 		closeCtx, endClose := context.WithTimeout(overall, l.closeGrace)
 		defer endClose()
 
-		// WHOSE FAULT, before the failure is attributed: a phase entered with an
-		// expired overall budget fails without being attempted, and reporting that
-		// as "could not close message session" blames the session for a deadline
-		// the destroys had already spent.
+		// WHOSE FAULT, before the failure is attributed: a phase entered with an expired
+		// budget fails without being attempted, and reporting that as "could not close
+		// message session" blames the session for a deadline the destroys spent.
 		//
-		// STOPPED rather than merely reported, and reachable — a Destroy that
-		// ignores its context can run past the whole budget and return. Carrying on
-		// would call Close with an already-expired context, and Session does not
-		// promise to honour one either.
+		// STOPPED rather than reported, and reachable — Session does not promise to honour
+		// an already-expired context either.
 		if err := overall.Err(); err != nil {
 			l.log.Error("the shutdown budget was gone before billet closed its session; "+
 				"the capacity this listener holds is left for the reaper",
@@ -846,14 +808,11 @@ func (l *Listener) Run(ctx context.Context) error {
 	l.observed = l.session.Statistics()
 	l.reportOrphanedBacklog()
 
-	// THE DRAIN IS A STATE OF THIS LOOP, NOT A PHASE OF THE TEARDOWN. In the
-	// deferred teardown ctx is already cancelled and the long poll dead, so the
-	// listener could no longer be TOLD that a job finished: it would wait for news
-	// that can never arrive and then destroy the jobs anyway.
+	// THE DRAIN IS A STATE OF THIS LOOP, NOT A PHASE OF THE TEARDOWN. There ctx is
+	// already cancelled and the long poll dead, so the listener could not be TOLD a job
+	// finished: it would wait for news that cannot arrive and destroy the jobs anyway.
 	//
-	// So cancellation stops the listener taking NEW work and nothing else, and it
-	// keeps polling on a context of its own — the completion that empties
-	// `running` arrives through the same long poll that offers new jobs.
+	// So cancellation stops it taking NEW work and nothing else.
 	pollCtx := ctx
 
 	var (
@@ -950,21 +909,16 @@ func (l *Listener) Run(ctx context.Context) error {
 	}
 }
 
-// cancelledWhileServing reports whether a failed call should be read as the
-// shutdown arriving mid-call rather than as a failure to report.
+// cancelledWhileServing reports whether a failed call is the shutdown arriving
+// mid-call rather than a failure to report.
 //
-// ASKED THE OTHER WAY ROUND, because neither obvious test works. Looking only at
-// the clock swallows every error that happens to coincide with a cancellation,
-// including the fatal ones. Looking only for context.Canceled is worse in a
-// quieter way: a cancellation landing inside handle() surfaces as whatever domain
-// error that path produces, and those do not wrap the context error, so the drain
-// is skipped intermittently for the most ordinary reason there is.
+// Neither obvious test works. The clock alone swallows fatal errors that coincide
+// with a cancellation; context.Canceled alone misses one landing inside handle(),
+// which surfaces as a domain error that does not wrap it — so the drain is skipped
+// intermittently for the most ordinary reason there is.
 //
-// So: once the caller has asked billet to stop, an error is the shutdown arriving
-// UNLESS it is one billet must stop for regardless. There is one of those — a
-// scale-set response billet cannot act on means it no longer knows which of its
-// commitments are real, and draining against that session would operate on
-// exactly the state that is not safe to operate on.
+// So: once stopping, an error IS the shutdown unless it is one billet must stop for
+// regardless. A scale-set response it cannot act on is the only one.
 func cancelledWhileServing(ctx context.Context, draining bool, err error) bool {
 	if draining || ctx.Err() == nil {
 		return false
@@ -973,26 +927,21 @@ func cancelledWhileServing(ctx context.Context, draining bool, err error) bool {
 	return !errors.Is(err, ErrUntrustworthySession)
 }
 
-// beginDrain stops this listener taking new work and hands back the capacity
-// nobody is using, returning the context the drain polls on.
+// beginDrain stops this listener taking new work and hands back the capacity nobody
+// is using, returning the context the drain polls on.
 //
-// THE ADVERTISEMENT IS NOT FORCED TO ZERO. What billet sends on each poll is the
-// scale set's TOTAL capacity, so a constant zero while a job runs is untrue.
-// Releasing the idle escrow makes capacity() — held + acquiring + running — fall
-// to exactly the work still in flight and reach zero by itself when the drain
-// completes, so the completion condition needs no second source of truth.
+// THE ADVERTISEMENT IS NOT FORCED TO ZERO: what billet sends is the scale set's
+// TOTAL capacity, so a constant zero while a job runs is untrue. Releasing the idle
+// escrow makes capacity() fall to the work still in flight and reach zero by itself.
 //
-// The advertisement is a courtesy to GitHub's scheduler and NOT the guard: a
-// queued or redelivered message can still arrive, and what refuses it is the
-// local check in handle.
+// It is a courtesy to GitHub's scheduler and NOT the guard — a redelivered message
+// can still arrive, and the local check in handle is what refuses it.
 func (l *Listener) beginDrain(ctx context.Context) (context.Context, context.CancelFunc) {
-	// BOUNDED only as far as anything here can be: the deadline is observed
-	// between calls, so a Session that blocks inside GetMessage forever is not
-	// bounded by it.
+	// BOUNDED only as far as anything here can be: the deadline is observed between
+	// calls, so a Session that blocks inside GetMessage forever is not bounded by it.
 	//
 	// Built FIRST because the release below needs a live context — ctx is already
-	// cancelled by the time this is called, and alloc.Release would fail on it and
-	// strand the very capacity this is giving back.
+	// cancelled, and alloc.Release would fail on it and strand the capacity.
 	drainCtx, endDrain := context.WithTimeout(context.WithoutCancel(ctx), l.drainGrace)
 
 	// A SECOND SIGNAL ENDS THE WAIT, not the teardown. The goroutine also selects
@@ -1028,14 +977,12 @@ func (l *Listener) beginDrain(ctx context.Context) (context.Context, context.Can
 
 // releaseStrandedEscrow hands back capacity whose machine has gone away.
 //
-// Escrow is what billet advertises and refillEscrow only ever ADDS, so when the
-// host a reservation names disappears the promise does not move: GitHub goes on
-// assigning against it, and every one of those jobs is acquired and then fails
-// to launch.
+// refillEscrow only ever ADDS, so when the host a reservation names disappears the
+// promise does not move: GitHub goes on assigning against it and every job is
+// acquired and then fails to launch.
 //
-// ONLY `held` LEASES, which is what makes it safe. A held lease has never been
-// assigned, so nothing is running under it and giving it back costs a re-escrow
-// at worst. Anything acquiring or running is somebody's job.
+// ONLY `held` LEASES: one has never been assigned, so giving it back costs a
+// re-escrow at worst. Anything acquiring or running is somebody's job.
 func (l *Listener) releaseStrandedEscrow(ctx context.Context) int {
 	l.mu.Lock()
 	snapshot := append([]*alloc.Lease(nil), l.held...)
@@ -1114,13 +1061,10 @@ func (l *Listener) releaseStrandedEscrow(ctx context.Context) int {
 // escrow capacity that is already spoken for.
 func (l *Listener) releaseIdleEscrow(ctx context.Context) int {
 	// A SNAPSHOT TO ITERATE, BUT EACH LEASE LEAVES `held` ONLY WHEN IT IS ACTUALLY
-	// RELEASED — never taken out up front and appended back on failure. Out of
-	// `held` the heartbeat cannot see it, so a release pass longer than a lease TTL
-	// would let the reaper reclaim one and appending it back would advertise
-	// capacity this listener no longer owns.
-	//
-	// Deleting by id rather than replacing the slice also avoids resurrecting a
-	// lease heartbeatHeld has just dropped.
+	// RELEASED. Out of `held` the heartbeat cannot see it, so a pass longer than a TTL
+	// lets the reaper reclaim one, and appending it back would advertise capacity this
+	// listener no longer owns. Deleting by id also avoids resurrecting a lease
+	// heartbeatHeld just dropped.
 	l.mu.Lock()
 	snapshot := append([]*alloc.Lease(nil), l.held...)
 	l.mu.Unlock()
@@ -1164,14 +1108,10 @@ func (l *Listener) isDraining() bool {
 
 // drained reports whether this listener still owes anybody a running job.
 //
-// RUNNING ONLY, AND `acquiring` DELIBERATELY NOT. GitHub may never assign a
-// promise — another scale set can win the same offer — and what resolves one is
-// the session ending, which happens in the teardown on the far side of this
-// wait. So a drain waiting for `acquiring` to empty would spend its entire
-// budget, destroy nothing, and achieve a six-hour pause.
-//
-// A promise assigned DURING the drain is still launched and waited for, because
-// by then it is running work like any other.
+// RUNNING ONLY, AND `acquiring` DELIBERATELY NOT: GitHub may never assign a promise,
+// and what resolves one is the session ending — which happens in the teardown, on
+// the far side of this wait. A drain waiting for it would spend its whole budget
+// and destroy nothing.
 func (l *Listener) drained() bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -1181,13 +1121,9 @@ func (l *Listener) drained() bool {
 
 // capacity is what this listener advertises: TOTAL escrowed, not free.
 //
-// All three collections count, and every lease in each was taken from the
-// allocator, so the sum across listeners is still bounded by the budget.
-//
-// TOTAL rather than spare: maxCapacity is the scale set's total capacity, and
-// sending only the free half would shrink the advertisement every time a job
-// started, so a tier with room for two would tell GitHub "1" the moment the
-// first job landed and leave the second slot unused.
+// All three collections count, and each lease came from the allocator, so the sum
+// across listeners is still bounded by the budget. Sending only the free half would
+// shrink the advertisement every time a job started.
 func (l *Listener) capacity() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -1238,19 +1174,14 @@ func (l *Listener) Backlog() int {
 	return l.observed.TotalAssignedJobs
 }
 
-// reportOrphanedBacklog says out loud when GitHub believes this scale set is
-// already running work that billet has no lease for.
+// reportOrphanedBacklog says out loud when GitHub believes this scale set is already
+// running work billet has no lease for.
 //
 // A fresh listener holds nothing, so a non-zero TotalAssignedJobs means jobs were
-// assigned before the process restarted and GitHub is waiting on runners that
-// died with it.
+// assigned before the process restarted. The ones still waiting are reassigned at
+// the pickup deadline; the ones a dead runner had STARTED are not, and fail.
 //
-// NOT ALL OF THEM COME BACK, and the statistic cannot say which will: upstream
-// defines it as "both jobs waiting for a runner and jobs already running". The
-// ones still waiting are reassigned at the pickup deadline; the ones a dead
-// runner had STARTED are not, and fail.
-//
-// Deliberately NOT a failure — the jobs are already lost, and refusing to start
+// Deliberately NOT a failure — those jobs are already lost, and refusing to start
 // would strand the tier's remaining capacity too.
 func (l *Listener) reportOrphanedBacklog() {
 	backlog := l.Backlog()
@@ -1292,13 +1223,10 @@ func (l *Listener) heartbeatLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// EACH PASS IS BOUNDED here rather than by the caller: this context does not
-			// inherit the caller's cancellation, so without its own deadline an allocator
-			// call that never returns holds l.mu forever — and the teardown then blocks on
-			// that mutex behind the defer that would have stopped this loop.
-			//
-			// One interval, so an overrunning pass is abandoned and the next tick still has
-			// three chances inside a TTL.
+			// EACH PASS IS BOUNDED here rather than by the caller: this context does not inherit
+			// the caller's cancellation, so without its own deadline an allocator call that
+			// never returns holds l.mu forever, and the teardown blocks on that mutex behind
+			// the defer that would have stopped this loop.
 			pass, endPass := context.WithTimeout(ctx, l.heartbeatInterval())
 
 			l.mu.Lock()
@@ -1392,21 +1320,16 @@ func waitWithin(ctx context.Context, wg *sync.WaitGroup) bool {
 	}
 }
 
-// destroyAll tears down every piece of compute this listener is responsible for
-// and reports which requests are confirmed gone.
+// destroyAll tears down every piece of compute this listener is responsible for and
+// reports which requests are confirmed gone.
 //
-// THE UNION OF running AND cleanup, each destroyed exactly once. The two sets
-// overlap — a completion whose destroy failed keeps its lease in `running` — and
-// idempotence makes a second call safe, not free: it is another remote round trip
-// against the same grace.
+// THE UNION OF running AND cleanup, each destroyed exactly once: the sets overlap,
+// and idempotence makes a second call safe but not free.
 //
 // Concurrent, because each Destroy can wait the node command timeout. Bounded,
-// because a node executes commands one at a time, so firing every request at once
-// starts every timeout at once and the later ones expire while the node works
-// through the earlier ones.
-//
-// The backoff is ignored on purpose: it exists so a hopeless record cannot crowd
-// out a live one across repeated passes, and this is the last pass.
+// because a node executes commands one at a time. The backoff is ignored — it
+// exists so a hopeless record cannot crowd out a live one, and this is the last
+// pass.
 func (l *Listener) destroyAll(ctx context.Context) map[int64]bool {
 	l.mu.Lock()
 
@@ -1549,12 +1472,8 @@ func (l *Listener) attempt(ctx context.Context, job Job) error {
 
 // seal stops the cleanup loop from starting any further destroys.
 //
-// Called BEFORE the loop is cancelled, because cancelling is a request and this
-// is a fact: once it returns, every request not already marked in `destroying` is
-// the teardown's alone.
-//
-// PERMANENT, AND ONLY SAFE BECAUSE A LISTENER IS NEVER REUSED. Server builds and
-// runs one in a single expression, so nothing holds a reference across a Run.
+// Called BEFORE the loop is cancelled, because cancelling is a request and this is a
+// fact. PERMANENT, and only safe because a listener is never reused.
 func (l *Listener) seal() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -1576,12 +1495,9 @@ func (l *Listener) backOff(requestID int64) {
 }
 
 // heartbeatInterval is how often held capacity is renewed: a third of the
-// allocator's ACTUAL TTL, so two consecutive failures are survivable.
-//
-// Read from the ALLOCATOR rather than from DefaultLeaseTTL: with a shorter
-// configured TTL, a cadence derived from the default lets every lease expire
-// between beats, so the reaper collects it, the listener re-escrows, and
-// advertised capacity climbs to several times the budget.
+// allocator's ACTUAL TTL, so two consecutive failures are survivable. Read from the
+// ALLOCATOR, because with a shorter configured TTL a cadence derived from the
+// default lets every lease expire between beats.
 func (l *Listener) heartbeatInterval() time.Duration {
 	if ttl := l.alloc.LeaseTTL(); ttl > 0 {
 		return ttl / 3
@@ -1616,21 +1532,15 @@ func (r renewal) advertisable() bool {
 	return r == renewalOwned || r == renewalUnknown
 }
 
-// heartbeatHeld renews the leases this listener is advertising, and drops any it
-// has lost.
+// heartbeatHeld renews the leases this listener is advertising, and drops any it has
+// lost.
 //
-// This is what makes the reaper safe to run at all. A lease expires after
-// alloc.DefaultLeaseTTL without a heartbeat — 90 seconds — while a long poll
-// blocks for about 50, so escrow held across two polls would be reclaimed
-// underneath a listener that is still advertising it. Another tier could then
-// escrow the same capacity, which is precisely the double-admission the escrow
-// exists to prevent. Turning the reaper on without this would have broken the
-// central invariant rather than protected it.
+// This is what makes the reaper safe to run at all: a lease expires after 90 seconds
+// without a heartbeat while a long poll blocks for about 50, so escrow held across
+// two polls would be reclaimed underneath a listener still advertising it.
 //
-// A lease that cannot be renewed is DROPPED rather than retried. Failure here
-// means the allocator no longer agrees this listener owns it — reaped, or fenced
-// by a new holder — and continuing to advertise it would be advertising capacity
-// somebody else now has.
+// A lease that cannot be renewed is DROPPED rather than retried — failure means the
+// allocator no longer agrees this listener owns it.
 func (l *Listener) heartbeatHeld(ctx context.Context) {
 	kept := l.held[:0]
 
@@ -1654,15 +1564,11 @@ func (l *Listener) heartbeatHeld(ctx context.Context) {
 			continue
 		}
 
-		// THE LEASE GOES; THE OBLIGATION DOES NOT. This listener launched a
-		// container for that request and losing the ledger entry does not stop it
-		// running — a fence means another holder owns the CAPACITY, and a stale
-		// renewal means nobody knows who owns it. Neither is a reason to forget the
-		// compute, and GitHub will not send the completion again.
-		//
-		// So the entry moves to the cleanup set, where the only thing that
-		// discharges it is a successful destroy. Deleting it outright left the
-		// container untracked and reachable by nothing but an optional Sweeper.
+		// THE LEASE GOES; THE OBLIGATION DOES NOT. This listener launched a container and
+		// losing the ledger entry does not stop it running; GitHub will not send the
+		// completion again. So the entry moves to the cleanup set, where only a successful
+		// destroy discharges it — deleting it leaves the container reachable by nothing but
+		// an optional Sweeper.
 		delete(l.running, id)
 		delete(l.confirmed, lease.ID)
 
