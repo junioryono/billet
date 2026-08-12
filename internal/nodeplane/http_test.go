@@ -1188,3 +1188,46 @@ func TestASupersededIncarnationCannotReconcile(t *testing.T) {
 		t.Error("the stale report reached the ledger anyway")
 	}
 }
+
+// THE QUARANTINED SET CROSSES THE WIRE, and dropping it is silent.
+//
+// A remote node reads this to tell an orphan from a job whose listener died. If
+// the field never arrives the node sees an empty set, `open || held` is false
+// for a live container, and it DESTROYS the job the quarantine exists to
+// protect — the round-2 P0, reachable again through a response field nothing
+// asserted.
+func TestQuarantinedLeasesCrossTheWire(t *testing.T) {
+	t.Parallel()
+
+	store := &fakeStore{
+		launched:    map[string]bool{"running": true},
+		quarantined: map[string]bool{"held": true},
+	}
+
+	_, base := serve(t, store)
+	c := dial(t, base)
+
+	held, err := c.QuarantinedLeaseIDs(t.Context(), "n1")
+	if err != nil {
+		t.Fatalf("QuarantinedLeaseIDs: %v", err)
+	}
+
+	if !held["held"] {
+		t.Error("the quarantined set did not reach the node, so it will treat a job whose " +
+			"listener died as an orphan and destroy it")
+	}
+
+	if held["running"] {
+		t.Error("a launched lease was reported as quarantined")
+	}
+
+	// And the launched set is still its own answer.
+	open, err := c.LaunchedLeaseIDs(t.Context(), "n1")
+	if err != nil {
+		t.Fatalf("LaunchedLeaseIDs: %v", err)
+	}
+
+	if !open["running"] || open["held"] {
+		t.Errorf("the launched set is %v; the two answers have been conflated", open)
+	}
+}

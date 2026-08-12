@@ -1052,11 +1052,11 @@ func TestFinishingAStaleEntryDoesNotDropItsReplacement(t *testing.T) {
 	// A NEW entry lands for the same lease while the old call is in flight.
 	replacement := &custody{
 		leaseID: lease.ID,
-		epoch:   lease.Epoch,
 		name:    provider.InstanceName(lease.ID),
 		outcome: alloc.PhaseDone,
 		since:   time.Now(),
 	}
+	replacement.epoch.Store(lease.Epoch)
 
 	restarted.mu.Lock()
 	restarted.custody[lease.ID] = replacement

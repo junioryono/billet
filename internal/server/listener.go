@@ -2494,20 +2494,37 @@ func (l *Listener) complete(ctx context.Context, job Job) error {
 	}
 
 	if err := l.alloc.Release(ctx, lease.ID, lease.Epoch, outcome); !releaseSettled(err) {
-		// THE ENTRY STAYS, and that is the whole point of keeping one. Deleting it
-		// when the DESTROY succeeded lost the retry to a transient release failure:
-		// the lease stayed in `running` being renewed forever, GitHub will not
-		// redeliver a completion it has already acknowledged, and nothing else was
-		// ever going to try the release again.
+		// PARKED AND NOT RETURNED, because of who is calling.
 		//
-		// SETTLED IS NOT THE SAME AS SUCCEEDED, and treating every error alike was
-		// its own trap. A parked lease outlives its own epoch: the outage that
-		// stopped the release lasts past the TTL, the reaper moves the lease on and
-		// bumps the epoch, and every retry from here is fenced with the stale one —
-		// forever, while `reserve` and `assign` go on refusing that request id.
-		// Fenced and not-found both mean this claim on capacity is over.
-		return fmt.Errorf("server: release lease %s for finished request %d: %w",
-			lease.ID, job.RequestID, err)
+		// complete runs on the poll path as well as the cleanup loop, and there
+		// the returned error is FATAL: it stops the listener, which cancels every
+		// other listener, whose shutdowns destroy every job running on this host.
+		// A busy database while GitHub happens to report a completion would take
+		// the whole deployment down.
+		//
+		// That is also self-defeating. The reason for returning the error was to
+		// keep the obligation alive for a retry — and the retry runs in the
+		// process the error kills. So the obligation is recorded here, where it
+		// will be picked up, and the caller is told the completion was handled.
+		if l.cleanup == nil {
+			l.cleanup = make(map[int64]*pendingCleanup)
+		}
+
+		if entry, pending := l.cleanup[job.RequestID]; pending {
+			entry.lease, entry.outcome = lease, outcome
+			entry.failed(time.Now(), l.retryFirst, l.retryMax)
+		} else {
+			l.cleanup[job.RequestID] = &pendingCleanup{job: job, lease: lease, outcome: outcome}
+		}
+
+		l.log.Error("could not release the lease of a finished job; its capacity is held "+
+			"until this is retried",
+			"tier", l.tier, "request", job.RequestID, "lease", lease.ID, "error", err)
+
+		delete(l.running, job.RequestID)
+		delete(l.acquiring, job.RequestID)
+
+		return nil
 	}
 
 	// RELEASED, so the job is finally over and there is nothing to retry.

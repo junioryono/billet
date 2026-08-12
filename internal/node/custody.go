@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
@@ -28,8 +29,15 @@ import (
 // attempt to find out what happened. The only difference is what a still-running
 // instance means — leave it, or kill it.
 type custody struct {
-	leaseID  string
-	epoch    int64
+	leaseID string
+	// epoch is the fencing token this entry renews with.
+	//
+	// ATOMIC BECAUSE IT MOVES NOW. It was immutable once an entry existed, so a
+	// plain field was safe; re-adopting a lease the reaper quarantined under us
+	// writes it from Tend while KeepAlive is reading it from its own goroutine —
+	// and that separation is the whole point of the two loops, so the write
+	// cannot simply borrow Tend's lock.
+	epoch    atomic.Int64
 	name     string
 	instance string
 
@@ -76,8 +84,8 @@ func (r *Runner) adopt(lease *alloc.Lease, inst *provider.Instance) {
 	defer r.mu.Unlock()
 
 	r.custody[lease.ID] = &custody{
-		leaseID:   lease.ID,
-		epoch:     lease.Epoch,
+		leaseID: lease.ID,
+
 		name:      inst.Name,
 		instance:  inst.ID,
 		requestID: lease.RequestID,
@@ -103,8 +111,8 @@ func (r *Runner) hold(lease *alloc.Lease, name string, requestID int64) {
 	defer r.mu.Unlock()
 
 	r.custody[lease.ID] = &custody{
-		leaseID:   lease.ID,
-		epoch:     lease.Epoch,
+		leaseID: lease.ID,
+
 		name:      name,
 		requestID: requestID,
 		discard:   true,
@@ -263,7 +271,7 @@ func (r *Runner) renewEvery() time.Duration {
 // never block.
 func (r *Runner) renewHeld(ctx context.Context) {
 	for _, c := range r.renewSnapshot() {
-		err := r.alloc.Heartbeat(ctx, c.leaseID, c.epoch)
+		err := r.alloc.Heartbeat(ctx, c.leaseID, c.epoch.Load())
 		if err == nil || ctx.Err() != nil {
 			continue
 		}
@@ -334,7 +342,7 @@ func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 			"adopted", !c.discard)
 	}
 
-	if err := r.alloc.Heartbeat(ctx, c.leaseID, c.epoch); err != nil {
+	if err := r.alloc.Heartbeat(ctx, c.leaseID, c.epoch.Load()); err != nil {
 		if !errors.Is(err, alloc.ErrLeaseNotFound) && !errors.Is(err, alloc.ErrFenced) {
 			return fmt.Errorf("node: hold the capacity of lease %s: %w", c.leaseID, err)
 		}
@@ -437,14 +445,14 @@ func (r *Runner) requarantined(ctx context.Context, c *custody) (bool, error) {
 		"and keeping the job running",
 		"name", c.name, "lease", c.leaseID, "epoch", lease.Epoch)
 
-	c.epoch = lease.Epoch
+	c.epoch.Store(lease.Epoch)
 
 	return true, nil
 }
 
 // finish releases a custody entry's lease and forgets it.
 func (r *Runner) finish(ctx context.Context, c *custody) error {
-	err := r.alloc.Release(ctx, c.leaseID, c.epoch, c.outcome)
+	err := r.alloc.Release(ctx, c.leaseID, c.epoch.Load(), c.outcome)
 	if err != nil && !errors.Is(err, alloc.ErrLeaseNotFound) && !errors.Is(err, alloc.ErrFenced) {
 		// KEPT in custody. Failing to release means the capacity is still recorded
 		// as held, and dropping the entry now would leave nothing to retry it —
@@ -593,8 +601,8 @@ func (r *Runner) Superseded() {
 		}
 
 		r.custody[lease.ID] = &custody{
-			leaseID:   lease.ID,
-			epoch:     lease.Epoch,
+			leaseID: lease.ID,
+
 			name:      inst.Name,
 			instance:  inst.ID,
 			requestID: requestID,
@@ -677,11 +685,10 @@ func (r *Runner) holdWhileLaunching(lease *alloc.Lease, name string) func() {
 		r.launching = make(map[string]*custody)
 	}
 
-	r.launching[lease.ID] = &custody{
-		leaseID: lease.ID,
-		epoch:   lease.Epoch,
-		name:    name,
-	}
+	entry := &custody{leaseID: lease.ID, name: name}
+	entry.epoch.Store(lease.Epoch)
+
+	r.launching[lease.ID] = entry
 
 	return func() {
 		r.mu.Lock()
