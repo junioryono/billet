@@ -27,6 +27,8 @@ type fakeEC2 struct {
 
 	// respond decides the reply. Nil means the default for the action.
 	respond func(action string, params url.Values) (int, string)
+	// redirectTo, when set, is sent as the Location of any non-200 reply.
+	redirectTo string
 }
 
 func newFakeEC2(t *testing.T) *fakeEC2 {
@@ -66,6 +68,10 @@ func newFakeEC2(t *testing.T) *fakeEC2 {
 		status, reply := http.StatusOK, defaultReply(action)
 		if respond != nil {
 			status, reply = respond(action, params)
+		}
+
+		if f.redirectTo != "" && status != http.StatusOK {
+			w.Header().Set("Location", f.redirectTo)
 		}
 
 		w.WriteHeader(status)
@@ -1029,6 +1035,40 @@ func TestAnIncompleteInventoryIsRefusedRatherThanShortened(t *testing.T) {
 	}
 }
 
+// A PRESENT-BUT-USELESS NAME IS THE SAME FAILURE AS AN ABSENT ONE.
+//
+// The guard used to ask only whether the tag EXISTED, so `<value/>` produced an
+// instance named "" and a name billet never assigned produced one it cannot map
+// to a lease — both landing in the inventory as though they were accounted for,
+// which is the reconciliation hazard the missing-tag case was fixed for, one
+// field value away.
+func TestANameThatCannotIdentifyALeaseIsRefused(t *testing.T) {
+	for name, value := range map[string]string{
+		"empty":            "",
+		"not billet's":     "someone-elses-instance",
+		"the prefix alone": "billet-",
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newFakeEC2(t)
+			f.respond = func(string, url.Values) (int, string) {
+				return http.StatusOK, `<DescribeInstancesResponse><reservationSet><item>` +
+					`<instancesSet><item><instanceId>i-9</instanceId>` +
+					`<instanceState><name>running</name></instanceState><tagSet>` +
+					`<item><key>Name</key><value>` + value + `</value></item>` +
+					`<item><key>sh.billet.owner</key><value>dep-1</value></item>` +
+					`</tagSet></item></instancesSet></item></reservationSet></DescribeInstancesResponse>`
+			}
+
+			p := newTestProvider(t, f, nil)
+
+			if got, err := p.List(t.Context()); err == nil {
+				t.Fatalf("an instance billet cannot match to a lease was reported as "+
+					"accounted for: %+v", got)
+			}
+		})
+	}
+}
+
 // An instance with no ID is the same failure one field over, and the same answer.
 func TestAnInstanceWithNoIDIsRefused(t *testing.T) {
 	f := newFakeEC2(t)
@@ -1149,5 +1189,62 @@ func TestAProviderRefusesAPlaintextEndpoint(t *testing.T) {
 	// And loopback still works, or every test in this file would be impossible.
 	if _, err := New("dep-1", validEC2Config("http://127.0.0.1:9/")); err != nil {
 		t.Errorf("a loopback endpoint was refused: %v", err)
+	}
+}
+
+// A REDIRECT MUST NOT CARRY A SIGNED REQUEST SOMEWHERE ELSE.
+//
+// The endpoint is validated as https, and then Go's client follows redirects by
+// default — so a 307 preserves the method and body, and the hop can be plaintext
+// or another host entirely. Everything the endpoint check exists to prevent
+// happens one response later, to a URL nobody validated.
+//
+// AWS does not redirect. That is exactly why this must be refused rather than
+// followed: a redirect from this endpoint is not the API answering.
+func TestASignedRequestIsNotFollowedToARedirect(t *testing.T) {
+	var reached int
+
+	elsewhere := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		reached++
+	}))
+
+	t.Cleanup(elsewhere.Close)
+
+	f := newFakeEC2(t)
+	f.respond = func(string, url.Values) (int, string) {
+		return http.StatusTemporaryRedirect, ""
+	}
+
+	p := newTestProvider(t, f, nil)
+
+	// The fake sets Location via respond's status only, so add it here.
+	f.redirectTo = elsewhere.URL
+
+	if _, err := p.List(t.Context()); err == nil {
+		t.Fatal("a signed request followed a redirect")
+	}
+
+	if reached != 0 {
+		t.Errorf("a signed request reached the redirect target %d time(s)", reached)
+	}
+}
+
+// THE CONSTRUCTOR RE-APPLIES THE SECURITY-GROUP RULE, not only config
+// validation. New is exported, so `New(..., EC2Config{UntrustedSecurityGroupIDs:
+// []string{""}})` would otherwise admit fork pull-request work on the strength of
+// a list holding one empty string — Accepts gates on length.
+func TestAProviderRefusesABlankSecurityGroup(t *testing.T) {
+	for name, mutate := range map[string]func(*config.EC2Config){
+		"trusted":   func(c *config.EC2Config) { c.SecurityGroupIDs = []string{"sg-a", ""} },
+		"untrusted": func(c *config.EC2Config) { c.UntrustedSecurityGroupIDs = []string{"  "} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := validEC2Config("https://ec2.us-west-2.amazonaws.com/")
+			mutate(&cfg)
+
+			if _, err := New("dep-1", cfg); err == nil {
+				t.Fatal("a provider was built with a blank security group")
+			}
+		})
 	}
 }

@@ -131,7 +131,20 @@ func New(owner string, cfg config.EC2Config, opts ...Option) (*Provider, error) 
 	}
 
 	if _, err := url.Parse(endpoint); err != nil {
-		return nil, fmt.Errorf("ec2: node.ec2.endpoint %q is not a url: %w", endpoint, err)
+		return nil, fmt.Errorf("ec2: node.ec2.endpoint is not a url: %w", err)
+	}
+
+	// THE SAME RE-APPLICATION, one field over. Accepts admits fork pull-request
+	// work as soon as the untrusted list is non-empty, so a list holding one blank
+	// entry would open this backend to untrusted code with no network described
+	// for it — through a constructor that never saw config.Load.
+	for field, groups := range map[string][]string{
+		"security_group_ids":           cfg.SecurityGroupIDs,
+		"untrusted_security_group_ids": cfg.UntrustedSecurityGroupIDs,
+	} {
+		if err := config.CheckEC2SecurityGroups(field, groups); err != nil {
+			return nil, fmt.Errorf("ec2: %w", err)
+		}
 	}
 
 	p := &Provider{
@@ -150,6 +163,25 @@ func New(owner string, cfg config.EC2Config, opts ...Option) (*Provider, error) 
 	for _, opt := range opts {
 		opt(p)
 	}
+
+	// AFTER THE OPTIONS, so a client supplied by a caller is covered too.
+	//
+	// A REDIRECT MUST NOT CARRY A SIGNED REQUEST SOMEWHERE ELSE. The endpoint is
+	// checked for https and then Go's client follows redirects by default — a 307
+	// preserves the method and body, and the hop can be plaintext or another host
+	// entirely, so everything the endpoint rule prevents happens one response
+	// later to a URL nobody validated. Measured before this existed: three signed
+	// requests reached the redirect target, one per retry.
+	//
+	// AWS does not redirect, which is the reason this is a refusal rather than a
+	// policy: a redirect from this endpoint is not the API answering.
+	client := *p.api.http
+	client.CheckRedirect = func(req *http.Request, _ []*http.Request) error {
+		return fmt.Errorf("ec2: refusing to follow a redirect to %s: a signed request carries a "+
+			"session token, and the ec2 api does not redirect", req.URL.Redacted())
+	}
+
+	p.api.http = &client
 
 	return p, nil
 }
@@ -669,7 +701,7 @@ func (p *Provider) describe(ctx context.Context, extra ...filter) ([]*provider.I
 
 		for _, r := range out.Reservations {
 			for _, item := range r.Instances {
-				name, ok := item.tag(nameTag)
+				name, _ := item.tag(nameTag)
 
 				// AN INCOMPLETE INVENTORY IS NOT A SHORTER ONE, and the whole
 				// function fails rather than omitting a row.
@@ -684,12 +716,35 @@ func (p *Provider) describe(ctx context.Context, extra ...filter) ([]*provider.I
 				// cannot be matched to a lease, and one with no id is compute
 				// nothing can destroy. Both need an operator, and the docker
 				// backend fails its own List for the same reason.
-				if !ok || item.InstanceID == "" {
+				// A MISSING ID IS ITS OWN DIAGNOSIS. Blaming the Name tag for it
+				// sends an operator to the wrong field.
+				if item.InstanceID == "" {
 					return nil, fmt.Errorf(
-						"ec2: instance %q carries this deployment's owner tag but no usable "+
-							"%s tag, so billet cannot match it to a lease or account for it; "+
-							"refusing to report an inventory it is missing from",
-						item.InstanceID, nameTag)
+						"ec2: the api described an instance with this deployment's owner tag "+
+							"(%s=%s) and no instance id, which billet can neither account for "+
+							"nor destroy; refusing to report an inventory it is missing from",
+						ownerTag, p.owner)
+				}
+
+				// AND A NAME THAT CANNOT IDENTIFY A LEASE IS NO BETTER THAN AN
+				// ABSENT ONE. Asking only whether the tag EXISTED let `<value/>`
+				// through as a name of "", and a name billet never assigned through
+				// as one it cannot map — both landing in the inventory as though
+				// they were accounted for.
+				//
+				// THE MESSAGE HAS TO BE ACTIONABLE, because failing closed stops
+				// this node's sweep until somebody intervenes. That is the right
+				// direction — the alternative sells a running machine's capacity
+				// twice, silently — but only if an operator is told which instance
+				// and what to do about it. Both remedies are named, and either takes
+				// a minute.
+				if _, ours := provider.LeaseOf(name); !ours {
+					return nil, fmt.Errorf(
+						"ec2: instance %s carries this deployment's owner tag (%s=%s) but its "+
+							"%s tag is %q, which names no lease, so billet cannot account for "+
+							"it and will not report an inventory it is missing from: either "+
+							"terminate that instance or restore its %s tag to billet-<lease-id>",
+						item.InstanceID, ownerTag, p.owner, nameTag, name, nameTag)
 				}
 
 				instances = append(instances, &provider.Instance{

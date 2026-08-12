@@ -1811,8 +1811,9 @@ func checkEC2Credentials(ctx context.Context, cfg *config.EC2Config) error {
 	// SAID, BECAUSE THE CHECK IS NARROWER THAN IT LOOKS. A read-only call says
 	// nothing about permission to LAUNCH, and an operator who reads "ok" and then
 	// watches every job fail on an IAM denial has been misled by this line.
-	fmt.Printf("         (describe only — launching also needs ec2:RunInstances, " +
-		"ec2:TerminateInstances and ec2:CreateTags)\n")
+	fmt.Printf("         (describe only — launching also needs at least ec2:RunInstances, " +
+		"ec2:TerminateInstances, ec2:CreateTags and ec2:DescribeImages, plus iam:PassRole " +
+		"if node.ec2.instance_profile is set)\n")
 
 	// SAID OUT LOUD RATHER THAN INFERRED FROM AN ABSENT KEY. A deployment that
 	// expected to run fork pull requests on rented machines and finds them queuing
