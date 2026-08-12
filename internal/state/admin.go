@@ -22,9 +22,11 @@ var ErrSchemaBehind = errors.New("state: the ledger needs migrating and another 
 // simultaneous writes but does not prevent two billets both long-polling GitHub
 // and taking turns writing conflicting scheduling decisions. A command that
 // approves an enrollment or forces one quarantined lease back is not a second
-// control plane: it makes no scheduling decisions, holds nothing open, and
-// commits one bounded transaction that SQLite serialises against the server's
-// own.
+// control plane: it makes no scheduling decisions and holds nothing open, and
+// the writes it does make are ordinary transactions SQLite serialises against
+// the server's own. Some commands commit more than one — `nodes revoke` records
+// each older serial before withdrawing them — which is why the give-up
+// diagnostic says what already stands rather than claiming a no-op.
 //
 // Opening through Open instead meant every such command failed against a live
 // deployment — `nodes pending|approve|revoke`, `ca token|issue|revoke|

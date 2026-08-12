@@ -123,6 +123,11 @@ func TestEveryReadOnlyOperationRunsWhileTheWriterSlotIsHeld(t *testing.T) {
 		{"JoinTokens", func() error { _, err := a.JoinTokens(read); return err }},
 		{"HistoryOutcomesForRequest", func() error { _, err := a.HistoryOutcomesForRequest(read, 1); return err }},
 		{"HistoryOutcome", func() error { _, err := a.HistoryOutcome(read, lease.ID); return err }},
+		// A NODE THE LEDGER HAS NEVER HEARD OF, so Reconcile returns straight
+		// after its epoch READ and never reaches the write behind it. That is
+		// what makes it a fair test of the read: with the lookup reverted to a
+		// write transaction it contends before answering.
+		{"Reconcile", func() error { _, err := a.Reconcile(read, "no-such-host", nil); return err }},
 	} {
 		err := tc.run()
 

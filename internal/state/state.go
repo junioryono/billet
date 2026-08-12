@@ -482,9 +482,9 @@ func (db *DB) beginWrite(ctx context.Context) (*sql.Tx, error) {
 				// failing leaves the earlier ones committed. Claiming otherwise would
 				// send an operator away believing a half-done command was a no-op.
 				return nil, fmt.Errorf(
-					"the control plane held this ledger's write lock for longer than %s, so this "+
+					"another process held this ledger's write lock for longer than %s, so this "+
 						"command stopped rather than waiting silently. Anything it had already "+
-						"committed stands; run it again when the plane is quieter: %w",
+						"committed stands; run it again in a moment: %w",
 					adminBusyLimit, errBusy)
 			}
 		}
@@ -494,24 +494,23 @@ func (db *DB) beginWrite(ctx context.Context) (*sql.Tx, error) {
 			return tx, nil
 		}
 
-		// THE CONTEXT IS ASKED FIRST, before the driver's error is classified.
-		// Cancellation does not always reach us as context.Canceled: modernc can
-		// interrupt a BEGIN and surface SQLITE_INTERRUPT, which is not busy — so
-		// classifying first returns a driver code and a caller testing for Canceled
-		// or DeadlineExceeded sees neither.
-		//
-		// NOT COVERED BY A TEST, and said so rather than implied. Deleting this
-		// check leaves the suite green: the reachable cancellation path returns
-		// SQLITE_BUSY, which the retry timer's own ctx.Done branch already answers
-		// correctly. What this guards is the INTERRUPT path, and nothing here can
-		// make the driver take it on demand — there is no seam between beginWrite
-		// and BeginTx to inject one. It stays because it is correct and costs a
-		// comparison; if a seam ever appears, this is the line to pin.
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, fmt.Errorf("begin write tx: %w", ctxErr)
-		}
-
 		if !isBusy(err) {
+			// A REAL FAILURE, AND POSSIBLY A CANCELLATION AS WELL — reported as
+			// both rather than as whichever was looked at first.
+			//
+			// Cancellation does not always arrive as context.Canceled: modernc can
+			// interrupt a BEGIN and surface SQLITE_INTERRUPT, which is not busy, so
+			// a caller testing for Canceled would see nothing. But asking the
+			// context FIRST and returning only its error was worse in the other
+			// direction: it threw away SQLITE_CORRUPT and SQLITE_IOERR whenever
+			// cancellation happened to race the return, hiding a storage fault
+			// behind a routine cancellation.
+			//
+			// errors.Join keeps both identities, so errors.Is finds either.
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, fmt.Errorf("begin write tx: %w", errors.Join(ctxErr, err))
+			}
+
 			return nil, fmt.Errorf("begin write tx: %w", err)
 		}
 

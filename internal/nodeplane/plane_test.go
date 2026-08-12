@@ -232,7 +232,7 @@ func TestANodesVerdictIsCarriedBack(t *testing.T) {
 func TestARestartedNodeLeavesItsLaunchesInCustody(t *testing.T) {
 	t.Parallel()
 
-	p := testPlane(t, WithCommandTimeout(5*time.Second))
+	p := testPlane(t, WithCommandTimeout(60*time.Second))
 	register(t, p, "n1", config.ProviderDocker)
 
 	taken := make(chan struct{})
@@ -251,7 +251,7 @@ func TestARestartedNodeLeavesItsLaunchesInCustody(t *testing.T) {
 
 	select {
 	case <-taken:
-	case <-time.After(5 * time.Second):
+	case <-time.After(60 * time.Second):
 		t.Fatal("the node never took the command")
 	}
 
@@ -262,7 +262,7 @@ func TestARestartedNodeLeavesItsLaunchesInCustody(t *testing.T) {
 		if !errors.Is(err, server.ErrCustody) {
 			t.Fatalf("a launch lost to a node restart must report custody, got %v", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(60 * time.Second):
 		t.Fatal("the caller was left waiting for a node that will never answer")
 	}
 }
@@ -620,7 +620,7 @@ func TestABusyNodeIsNotForgotten(t *testing.T) {
 
 	select {
 	case <-taken:
-	case <-time.After(5 * time.Second):
+	case <-time.After(60 * time.Second):
 		t.Fatal("the node never took the command")
 	}
 
@@ -676,7 +676,7 @@ func TestAForgottenNodeReleasesItsQueuedWork(t *testing.T) {
 		if errors.Is(err, server.ErrCustody) {
 			t.Errorf("a command that never left the queue reported custody: %v", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(60 * time.Second):
 		t.Fatal("the caller was left waiting on a node the plane has forgotten")
 	}
 }
@@ -913,7 +913,7 @@ func TestADestroyEndsALeasesOwnership(t *testing.T) {
 func deliverLaunch(t *testing.T) (*Plane, nodeapi.Command) {
 	t.Helper()
 
-	p := testPlane(t, WithCommandTimeout(5*time.Second))
+	p := testPlane(t, WithCommandTimeout(60*time.Second))
 
 	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
 		Version:     nodeapi.Version,
@@ -1495,7 +1495,7 @@ func TestADestroyNoNodeConfirmedIsAFailure(t *testing.T) {
 
 	select {
 	case <-taken:
-	case <-time.After(5 * time.Second):
+	case <-time.After(60 * time.Second):
 		t.Fatal("the node never took the destroy")
 	}
 

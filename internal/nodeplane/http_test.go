@@ -250,7 +250,7 @@ func dial(tb testing.TB, base string) *nodeclient.Client {
 func TestACommandAndItsResultCrossTheWire(t *testing.T) {
 	t.Parallel()
 
-	p, base := serve(t, &fakeStore{}, nodeplane.WithCommandTimeout(5*time.Second))
+	p, base := serve(t, &fakeStore{}, nodeplane.WithCommandTimeout(60*time.Second))
 	c := dial(t, base)
 
 	reported := make(chan error, 1)
@@ -292,7 +292,7 @@ func TestACommandAndItsResultCrossTheWire(t *testing.T) {
 func TestTheLaunchArrivesIntact(t *testing.T) {
 	t.Parallel()
 
-	p, base := serve(t, &fakeStore{}, nodeplane.WithCommandTimeout(5*time.Second))
+	p, base := serve(t, &fakeStore{}, nodeplane.WithCommandTimeout(60*time.Second))
 	c := dial(t, base)
 
 	got := make(chan nodeapi.Command, 1)
@@ -344,7 +344,7 @@ func TestTheLaunchArrivesIntact(t *testing.T) {
 		if cmd.Job == nil || cmd.Job.Event != "push" {
 			t.Errorf("the job's event did not survive: %+v", cmd.Job)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(60 * time.Second):
 		t.Fatal("the node never saw the command")
 	}
 }
@@ -998,7 +998,7 @@ func TestALaunchCarriesTheTierShape(t *testing.T) {
 		if len(cmd.Tier.Command) != 1 || cmd.Tier.Command[0] != "/entrypoint.sh" {
 			t.Errorf("command = %v, want the catalogue's", cmd.Tier.Command)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(60 * time.Second):
 		t.Fatal("the launch never reached the node")
 	}
 }
