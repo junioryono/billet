@@ -36,6 +36,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -441,6 +442,28 @@ func (db *DB) View(ctx context.Context, fn func(Querier) error) error {
 // and the point is to be waiting when that process lets go.
 const busyRetryInterval = 50 * time.Millisecond
 
+// stallWarnAfter is how long a write may wait for the lock before saying so, and
+// stallWarnEvery paces the repeats.
+//
+// WAITING FOREVER IS THE DESIGN; WAITING SILENTLY IS NOT. A control plane never
+// gives up, because an escrow error stops the listener and destroys every job on
+// the host — but that means an operator command stalled inside an open
+// transaction (a suspended shell, a debugger, a wedged disk) takes every
+// scheduling write down with it, indefinitely, with nothing anywhere saying why.
+// The plane just goes quiet.
+//
+// Before this package admitted a second writer that was unreachable. It is the
+// new failure mode the capability brought, so it gets the one thing that makes it
+// diagnosable.
+const (
+	stallWarnAfter = time.Second
+	stallWarnEvery = 15 * time.Second
+)
+
+// onBusyRetry observes a writer about to wait out a busy BEGIN. Nil in
+// production; a test sets it to synchronise on the state it needs.
+var onBusyRetry func()
+
 // adminBusyLimit bounds how long an OPERATOR COMMAND waits for the write lock
 // before reporting that the control plane is busy.
 //
@@ -486,6 +509,9 @@ func (db *DB) beginWrite(ctx context.Context) (*sql.Tx, error) {
 	if db.admin {
 		deadline = time.Now().Add(adminBusyLimit)
 	}
+
+	started := time.Now()
+	warned := time.Time{}
 
 	for attempt := 0; ; attempt++ {
 		// CHECKED BEFORE STARTING, never only after. An attempt that begins inside
@@ -547,6 +573,26 @@ func (db *DB) beginWrite(ctx context.Context) (*sql.Tx, error) {
 		}
 
 		errBusy = err
+
+		// SAID OUT LOUD ONCE IT STOPS LOOKING LIKE CONTENTION AND STARTS LOOKING
+		// LIKE A STALL. Rate-limited, because this runs on every writer and a wedged
+		// holder would otherwise produce a line per retry.
+		if waited := time.Since(started); waited > stallWarnAfter &&
+			(warned.IsZero() || time.Since(warned) > stallWarnEvery) {
+			warned = time.Now()
+
+			slog.Default().Warn("still waiting for the ledger's write lock; another billet "+
+				"process is holding it. Scheduling writes are queued behind this",
+				"waited", waited.Round(time.Second), "operator_command", db.admin)
+		}
+
+		// A TEST HOOK, nil in production. The cancellation branch below is only
+		// reachable once a caller is genuinely waiting out a busy BEGIN, and a test
+		// that cancels on a guess exercises it on some runs and not others — which
+		// is indistinguishable from a test that does not exercise it at all.
+		if onBusyRetry != nil {
+			onBusyRetry()
+		}
 
 		// time.After would leak its timer until it fired, and forbidigo bans it
 		// for exactly that reason.
