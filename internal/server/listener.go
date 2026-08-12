@@ -1835,29 +1835,16 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 		return nil
 	}
 
-	// COMPLETED IS PROCESSED FIRST, and the order is the fix.
+	// COMPLETED IS PROCESSED FIRST. Otherwise the cycle never closes — the lease stays
+	// open until the reaper expires it — and it must come first because GitHub batches
+	// the completion of one job with the offer of its replacement: acquiring before
+	// releasing claims the replacement while still holding the finished job's lease.
 	//
-	// Without this the cycle never closes: the lease stays open until the reaper
-	// expires it, holding capacity for a job that finished and recording the wrong
-	// conclusion against it. But it has to come FIRST, because GitHub batches the
-	// completion of one job with the offer of its replacement — it considers the
-	// slot free the moment the job ends. Acquiring before releasing meant billet
-	// claimed the replacement while still holding the finished job's lease, then
-	// released it, and had nothing left to back the claim.
-	//
-	// finished is scoped to THIS MESSAGE and nothing longer, which is the whole
-	// lifetime the problem has. A batch can carry Assigned and Completed for the
-	// same request — that is an assigned-then-cancelled job, which GitHub does to
-	// one no runner picks up in time — and processing completions first would
-	// otherwise let that assignment take a lease for a job already over.
-	//
-	// It does not need to survive the call. A message is immutable, so a
-	// redelivery carries the same completions and rebuilds this set before the
-	// assignments are read. A longer-lived map — say a fixed 4096 entries on the
-	// listener — buys nothing and costs something real: a request id GitHub
-	// requeues after cancelling it would be silently skipped, and billet would sit
-	// on the assignment until it timed out. A fixed count is not the semantic
-	// lifetime of the fact.
+	// `finished` is scoped to THIS MESSAGE, which is the whole lifetime the problem
+	// has. A batch can carry Assigned and Completed for the same request — an
+	// assigned-then-cancelled job — and it does not need to survive the call, because a
+	// redelivery rebuilds it before the assignments are read. A longer-lived map would
+	// silently skip a request id GitHub requeued after cancelling it.
 	finished := make(map[int64]struct{}, len(msg.Completed))
 
 	for _, job := range msg.Completed {
@@ -2516,44 +2503,20 @@ func (l *Listener) releaseAll(ctx context.Context, destroyed map[int64]bool) {
 		release(lease)
 	}
 
-	// RUNNING leases are DESTROYED before they are released. Freeing the capacity
-	// while a container or microVM is still on the host lets another tier escrow
-	// it and overcommits the machine.
+	// RUNNING leases are DESTROYED before they are released: freeing the capacity while
+	// a container is still on the host lets another tier escrow it. A lease whose
+	// compute will not die is NOT released — capacity the reaper reclaims late is
+	// recoverable, capacity handed out twice is not.
 	//
-	// A lease whose compute will not die is NOT released. Capacity that the reaper
-	// reclaims late is recoverable; capacity handed out twice is not.
+	// This kills work in flight and FAILS those builds; GitHub does not requeue a job a
+	// runner has already started. It is still right: billet is stopping and can no
+	// longer manage them, so a failed build beats containers nobody is tracking.
 	//
-	// This does kill work in flight, and it FAILS those builds — GitHub requeues
-	// a job that was assigned but never picked up, and says nothing about one a
-	// runner has already started. Tearing them down is still right: billet is
-	// stopping and can no longer manage those jobs, so a failed build beats
-	// containers nobody is tracking.
+	// A patient shutdown rarely arrives here with anything running — the drain waits
+	// first. The ways in that did not wait are a second signal, an untrustworthy
+	// session, and a Run that returned on an error it could not continue past.
 	//
-	// A PATIENT SHUTDOWN RARELY GETS HERE WITH ANYTHING RUNNING: the drain waits
-	// first, and this inherits only what outlived the budget. Three other ways in,
-	// none of which waited that long:
-	//
-	//   - A second signal ends the drain where it stands (see the hurry goroutine
-	//     in beginDrain). The work destroyed here had time left and did not get it,
-	//     which is the operator's decision to make and the reason the message says
-	//     what it costs.
-	//   - ErrUntrustworthySession deliberately skips the drain even when
-	//     cancellation has already arrived — there is nothing left to drain
-	//     through.
-	//   - A Run that returns on an error it cannot continue past. Before the drain
-	//     starts this is the ordinary failure exit. DURING one it also cuts the
-	//     drain short: cancelledWhileServing answers false once `draining` is set,
-	//     so an error that would have been read as "the shutdown arriving" while
-	//     serving is read as a real failure while draining, and Run returns
-	//     instead of polling on.
-	//
-	// For all of them this is the first and only stop, and everything still
-	// running is destroyed immediately.
-	//
-	// DESTROYED ALREADY, by destroyAll, which is why this only releases. Doing
-	// both here would mean the teardown could not be planned as a whole: the drain
-	// and the release would each have their own idea of what needed destroying,
-	// and neither could see the other's work.
+	// DESTROYED ALREADY, by destroyAll, which is why this only releases.
 	for requestID, lease := range running {
 		if !destroyed[requestID] {
 			// NOT RELEASED, and kept in `running`. Freeing capacity whose container

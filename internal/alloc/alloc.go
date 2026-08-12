@@ -1,16 +1,13 @@
 // Package alloc is billet's global capacity allocator.
 //
-// Every runner billet launches is preceded by a LEASE, and a lease exists from the
-// moment capacity is escrowed — before a scale-set listener advertises it to
-// GitHub — not from the moment a VM boots.
+// Every runner is preceded by a LEASE, and a lease exists from the moment capacity
+// is escrowed — before a listener advertises it to GitHub — not from the moment a VM
+// boots. That ordering is the design: each tier is its own scale set with its own
+// advertised maxCapacity, so listeners computing their own would let GitHub fill all
+// of them at once, and reserving on assignment is already too late.
 //
-// That ordering is the whole design. Each tier is its own scale set with its own
-// advertised maxCapacity, so if each listener computed its own maximum GitHub
-// could fill all of them at once. Reserving on assignment is already too late.
-//
-// Capacity is a VECTOR — vCPU, memory, per-tier concurrency, and per-node macOS
-// licence slots — never a single integer. A host runs out of memory long before it
-// runs out of cores, and a macOS guest limit is not expressible in either.
+// Capacity is a VECTOR — vCPU, memory, per-tier concurrency, per-node macOS licence
+// slots — never a single integer.
 package alloc
 
 import (
@@ -381,30 +378,26 @@ func New(db *state.DB, limits Limits, tiers []config.Tier, opts ...Option) (*All
 		a.tiers[t.Label] = normalized
 	}
 
-	// THE FLOORS MUST FIT, together.
-	//
-	// Individually legal reservations can sum past the machine, and the failure is
-	// invisible where it happens: every tier deducts every other tier's unmet floor,
-	// so floors exceeding the budget make EVERY tier compute zero headroom and the
-	// whole deployment quietly advertise nothing.
+	// THE FLOORS MUST FIT, together. Individually legal reservations can sum past the
+	// machine, and the failure is invisible: every tier deducts every other tier's unmet
+	// floor, so floors exceeding the budget make EVERY tier compute zero headroom and
+	// the deployment quietly advertise nothing.
 	//
 	// CHECKED BY DIVISION, NEVER BY MULTIPLYING FIRST. `reserved * vcpu` is unchecked
-	// integer arithmetic on a config-supplied value, so a large enough reservation
-	// WRAPS NEGATIVE — and a negative total passes a "does it fit" test comfortably,
-	// after which every tier subtracts a negative floor, which ADDS to its headroom.
+	// arithmetic on a config value, so a large enough one WRAPS NEGATIVE — and a negative
+	// total passes a "does it fit" test, after which every tier subtracts a negative
+	// floor, which ADDS to its headroom.
 	if err := checkFloorsFit(a.tiers, limits); err != nil {
 		return nil, err
 	}
 
-	// AND THE macOS DIMENSION, which vCPU and memory do not cover.
+	// AND THE macOS DIMENSION, which vCPU and memory do not cover. A Mac caps concurrent
+	// macOS guests per HOST across every tier targeting it, so two macOS tiers on one Mac
+	// can be individually legal and jointly unfillable — and such a floor holds vCPU and
+	// memory back while never being fillable.
 	//
-	// A Mac caps concurrent macOS guests by licence, per HOST, across every tier that
-	// targets it, so two macOS tiers on one Mac can be individually legal and jointly
-	// unfillable. A floor there is worse than unmet: it holds vCPU and memory back
-	// from every other tier while the reservation can never be filled.
-	//
-	// config.Load rejects this from the other direction. This constructor is exported
-	// and cannot assume its catalogue came through Load.
+	// config.Load rejects this from the other direction; this constructor is exported and
+	// cannot assume its catalogue came through Load.
 	if err := a.checkMacOSFloors(); err != nil {
 		return nil, err
 	}

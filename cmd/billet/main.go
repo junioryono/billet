@@ -101,14 +101,11 @@ func run(args []string) error {
 		return nil
 	}
 
-	// Ctrl-C and SIGTERM cancel the context. Every long-running role drains rather
-	// than dropping jobs on the floor: a runner killed mid-job leaves an orphaned
-	// registration on GitHub that someone has to clean up by hand.
+	// Ctrl-C and SIGTERM cancel the context. Every long-running role drains rather than
+	// dropping jobs: a runner killed mid-job leaves an orphaned registration on GitHub.
 	//
-	// THE FIRST ASKS, THE SECOND INSISTS, THE THIRD GIVES UP — from ONE
-	// registration, because two registrations both receive every signal. See
-	// lifecycle.escalate for what each level does and for the bug the single
-	// registration exists to prevent.
+	// THE FIRST ASKS, THE SECOND INSISTS, THE THIRD GIVES UP — from ONE registration,
+	// because two both receive every signal. See lifecycle.escalate.
 	ctx, cancelGraceful := context.WithCancel(context.Background())
 	defer cancelGraceful()
 
@@ -161,13 +158,10 @@ func parse(fs *flag.FlagSet, args []string) error {
 
 // parseWithArgs parses flags for a command that takes positional arguments.
 //
-// A COMMAND MUST SAY HOW MANY IT WANTS. The default of zero is what catches a
-// typo'd flag, which flag.Parse hands back as a positional rather than
-// rejecting: `billet server -dvе` becomes an argument, the flag stays false, and
-// the process runs in a mode nobody asked for. That protection is worth keeping,
-// which is why this is opt-in per command rather than simply removed — `billet
-// ca issue <node>` was written against the strict version and could not run at
-// all.
+// A COMMAND MUST SAY HOW MANY IT WANTS. The default of zero catches a typo'd flag,
+// which flag.Parse hands back as a positional rather than rejecting: `billet server
+// -dvе` becomes an argument, the flag stays false, and the process runs in a mode
+// nobody asked for.
 func parseWithArgs(fs *flag.FlagSet, args []string, want int) error {
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -180,17 +174,13 @@ func parseWithArgs(fs *flag.FlagSet, args []string, want int) error {
 	return nil
 }
 
-// parseWithName parses a command that takes one positional argument, whichever
-// side of the flags it was written on.
+// parseWithName parses a command that takes one positional argument, whichever side
+// of the flags it was written on.
 //
 // GO'S FLAG PACKAGE STOPS AT THE FIRST POSITIONAL, so `billet ca issue epyc-1
-// --config x.yaml` leaves `--config x.yaml` sitting in the argument list: the
-// config path is silently ignored and the command reads the default file. That
-// is the order every operator writes — the subject first, the options after —
-// and it is the order every example in the README uses.
-//
-// So the flags are parsed twice: once to reach the positional, once for whatever
-// followed it.
+// --config x.yaml` leaves the config path sitting in the argument list, silently
+// ignored — and that is the order every operator writes and every README example
+// uses. So the flags are parsed twice.
 func parseWithName(fs *flag.FlagSet, args []string) (string, error) {
 	if err := fs.Parse(args); err != nil {
 		return "", err
@@ -252,17 +242,11 @@ func cmdServer(ctx context.Context, lc *lifecycle, args []string) error {
 		return fmt.Errorf("%s has no github section; run `billet github-app create` first", *cfgPath)
 	}
 
-	// THE CONTROL PLANE RUNS NO COMPUTE, and that is now the only shape. It used
-	// to be able to host a node in this process under --dev, which was the
-	// single-machine deployment; that is two processes today, `billet server` and
-	// `billet node`, talking over loopback.
+	// THE CONTROL PLANE RUNS NO COMPUTE. A single machine runs `billet server` and
+	// `billet node` as two processes over loopback.
 	//
-	// A control plane with no nodes advertises nothing, so an empty fleet is
-	// harmless: GitHub is told zero and assigns nothing. That is a recent
-	// property and worth stating, because the version of this comment that stood
-	// here through the --dev era described the opposite — capacity came from the
-	// budget alone, so a job assigned to an empty fleet was ACQUIRED and then
-	// failed to launch with ErrNoNode. Advertisement now asks the fleet.
+	// A control plane with no nodes advertises nothing, so an empty fleet is harmless:
+	// GitHub is told zero and assigns nothing.
 	//
 	// --dry-run remains for proving the GitHub path while advertising zero.
 

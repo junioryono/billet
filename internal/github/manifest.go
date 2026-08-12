@@ -623,27 +623,18 @@ func conversionError(status int, _ []byte) error {
 
 	// An AMBIGUOUS status keeps the code and tries it again.
 	//
-	// Making 422 fatal was still credential loss with extra steps: the code lives
-	// in a local variable, the loopback server exits with the function, and
-	// "wait and run the command again" creates a SECOND App rather than
-	// recovering the first one's key. If the honest code drew a 422 because an
-	// attacker tripped abuse protection, the App exists and its key is gone.
+	// Making 422 fatal is credential loss with extra steps: the code lives in a local
+	// variable and the loopback server exits with the function, so "run the command
+	// again" creates a SECOND App rather than recovering the first one's key.
 	//
-	// So the same code is retried with backoff until it redeems, is definitively
-	// rejected, or the manifest deadline expires. Nothing is discarded on a
-	// response that never said the code was bad.
-	// EVERYTHING that is not a definitive rejection is ambiguous.
+	// EVERYTHING that is not a definitive rejection is ambiguous. An enumerated list of
+	// ambiguous statuses leaves every status in NEITHER set falling through as fatal,
+	// which is how removing 414 from the rejection set preserved the failure it was
+	// removed to fix.
 	//
-	// An enumerated list of ambiguous statuses left every status in NEITHER set
-	// falling through as fatal — which is how removing 414 from the rejection set
-	// preserved the exact failure it was removed to fix: an intermediary answers
-	// 414, the exchange aborts, and the App's key is orphaned. The same held for
-	// 401, 425, 426 and 431.
-	//
-	// The default has to be "keep the code", because the two mistakes are not
-	// symmetric. Retrying a status that really did mean the code was bad costs a
-	// wait bounded by GitHub's own window. Discarding one that did not costs a
-	// key that cannot be re-issued.
+	// The default has to be "keep the code": retrying a status that really did mean the
+	// code was bad costs a wait bounded by GitHub's own window, and discarding one that
+	// did not costs a key that cannot be re-issued.
 	return fmt.Errorf("%w: %w", errCodeAmbiguous, rendered)
 }
 
