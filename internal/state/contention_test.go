@@ -317,8 +317,15 @@ func TestAnOperatorWriteGivesUpRatherThanHanging(t *testing.T) {
 	// The server holds the writer slot throughout, so the operator write can
 	// never get in — which is the situation that used to hang.
 	if err := server.Tx(ctx, func(*sql.Tx) error {
-		adminErr = admin.Tx(ctx, func(atx *sql.Tx) error {
-			_, err := atx.ExecContext(ctx, `DELETE FROM join_tokens`)
+		// A BACKSTOP, so a regression fails as an assertion rather than as a
+		// package timeout: without the bound this retries forever while the
+		// server holds the slot forever, and the test never reaches its
+		// assertion at all. Generous, and armed immediately before the call.
+		bounded, cancelBounded := context.WithTimeout(ctx, 30*time.Second)
+		defer cancelBounded()
+
+		adminErr = admin.Tx(bounded, func(atx *sql.Tx) error {
+			_, err := atx.ExecContext(bounded, `DELETE FROM join_tokens`)
 
 			return err
 		})
@@ -332,9 +339,10 @@ func TestAnOperatorWriteGivesUpRatherThanHanging(t *testing.T) {
 		t.Fatal("the operator write should not have got in while the server held the lock")
 	}
 
-	// THE MESSAGE IS THE POINT: it has to tell an operator that nothing changed
-	// and that running it again is the answer.
-	if got := adminErr.Error(); !strings.Contains(got, "run it again when the plane is quieter") {
+	// THE MESSAGE IS THE POINT: it has to tell an operator what already stands
+	// and that running it again is the answer — not that nothing happened, which
+	// is untrue of the commands that commit more than one transaction.
+	if got := adminErr.Error(); !strings.Contains(got, "run it again in a moment") {
 		t.Errorf("the diagnostic should tell the operator what stands and to run it again, got: %v", got)
 	}
 }
@@ -471,7 +479,7 @@ func TestALockOwningOperatorCommandIsStillBounded(t *testing.T) {
 		t.Fatal("the lock-owning command should not have got in while the other held the slot")
 	}
 
-	if got := ownerErr.Error(); !strings.Contains(got, "run it again when the plane is quieter") {
+	if got := ownerErr.Error(); !strings.Contains(got, "run it again in a moment") {
 		t.Errorf("a command that owns the lock must still give up with advice, got: %v", got)
 	}
 }
