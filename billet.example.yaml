@@ -327,6 +327,11 @@ tiers:
 # macOS guests and native Linux arm64 guests, but whether it does is your
 # decision — see the nodes section below.
 #
+# Apple's licence allows at most 2 concurrent macOS guests per physical Mac, and
+# that is WHY a macOS tier has to name its host: without the name billet cannot
+# tell which Mac to count a guest against, and two macOS tiers on one machine
+# would each believe they had 2.
+#
 # guest_os is what the licence check keys off — not the label — so a macOS tier
 # named anything at all is still capped, and a Linux tier with "macos" in its
 # name is not.
@@ -334,7 +339,7 @@ tiers:
 #  - label: billet-6vcpu-macos-26
 #    provider: tart
 #    guest_os: macos
-#    node: mac-mini-1      # required for macOS: the cap is per physical host
+#    node: mac-mini-1      # required: 2 macOS guests per Mac, counted per host
 #    vcpu: 6
 #    memory: 24GiB
 #    image: macos-26
