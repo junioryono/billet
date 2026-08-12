@@ -75,6 +75,17 @@ type DB struct {
 //
 // The caller's context bounds startup only; it does not own the returned DB.
 func Open(ctx context.Context, stateDir string) (*DB, error) {
+	return openDir(ctx, stateDir, false)
+}
+
+// openDir is the shared body of Open and OpenAdmin.
+//
+// admin says the caller is a ONE-SHOT OPERATOR COMMAND rather than a control
+// plane, which changes exactly two things and nothing else: it may proceed
+// without the exclusive directory lock when a control plane already holds it,
+// and in that case it VERIFIES the schema instead of migrating it. See
+// OpenAdmin for why both halves are necessary.
+func openDir(ctx context.Context, stateDir string, admin bool) (*DB, error) {
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
 		return nil, fmt.Errorf("create state dir %s: %w", stateDir, err)
 	}
@@ -84,8 +95,16 @@ func Open(ctx context.Context, stateDir string) (*DB, error) {
 		return nil, fmt.Errorf("tighten state dir %s: %w", stateDir, err)
 	}
 
+	// A NIL LOCK MEANS "SOMEBODY ELSE IS THE CONTROL PLANE HERE", and it is
+	// reachable only for an admin caller. Everything downstream branches on this
+	// one value rather than re-deriving the situation.
 	lock, err := lockDir(stateDir)
-	if err != nil {
+
+	switch {
+	case err == nil:
+	case admin && errors.Is(err, ErrLocked):
+		lock = nil
+	default:
 		return nil, err
 	}
 
@@ -140,6 +159,19 @@ func Open(ctx context.Context, stateDir string) (*DB, error) {
 	if err := db.PingContext(startupCtx); err != nil {
 		return nil, errors.Join(err, db.Close())
 	}
+
+	// MIGRATING IS THE LOCK HOLDER'S JOB. Without the lock another billet is
+	// already using this schema, and upgrading it underneath a process that is
+	// mid-transaction against it is the one thing an operator command must never
+	// do — so it checks instead, and refuses if it would have had to write.
+	if lock == nil {
+		if err := db.verifySchema(startupCtx); err != nil {
+			return nil, errors.Join(err, db.Close())
+		}
+
+		return db, nil
+	}
+
 	if err := db.migrate(startupCtx); err != nil {
 		return nil, errors.Join(fmt.Errorf("migrate state db: %w", err), db.Close())
 	}
@@ -815,8 +847,8 @@ const bootstrapSchemaMigrations = `CREATE TABLE IF NOT EXISTS schema_migrations 
 // expects. billet has had no released version, so the only way to hit this is a
 // database left by a development build; the remedy is to delete it rather than
 // to write a migration for the migration table.
-func checkBookkeepingSchema(ctx context.Context, tx *sql.Tx) error {
-	rows, err := tx.QueryContext(ctx, `PRAGMA table_info(schema_migrations)`)
+func checkBookkeepingSchema(ctx context.Context, q Querier) error {
+	rows, err := q.QueryContext(ctx, `PRAGMA table_info(schema_migrations)`)
 	if err != nil {
 		return fmt.Errorf("inspect schema_migrations: %w", err)
 	}
@@ -862,8 +894,8 @@ type appliedMigration struct {
 // readAppliedMigrations exists as its own function so `defer rows.Close()` is
 // usable: the caller runs inside a transaction and issues further statements, so
 // the cursor has to be closed before it continues.
-func readAppliedMigrations(ctx context.Context, tx *sql.Tx) (map[int]appliedMigration, error) {
-	rows, err := tx.QueryContext(ctx,
+func readAppliedMigrations(ctx context.Context, q Querier) (map[int]appliedMigration, error) {
+	rows, err := q.QueryContext(ctx,
 		`SELECT version, name, checksum FROM schema_migrations ORDER BY version`)
 	if err != nil {
 		// Propagated, not swallowed. A permission, corruption, or locking error must
@@ -915,24 +947,8 @@ func (db *DB) migrate(ctx context.Context) error {
 			return err
 		}
 
-		applied := make(map[int]struct{}, len(seen))
-		for v := range seen {
-			applied[v] = struct{}{}
-		}
-
-		known := make(map[int]struct{}, len(migrations))
-		for _, m := range migrations {
-			known[m.Version] = struct{}{}
-		}
-		// A version this binary has never heard of means the database was written
-		// by a newer billet. Running an older control plane against a newer schema
-		// corrupts state slowly and confusingly; refuse instead.
-		for v := range applied {
-			if _, ok := known[v]; !ok {
-				return fmt.Errorf(
-					"state database has migration %d, which this billet does not know about; "+
-						"it was written by a newer version", v)
-			}
+		if err := refuseUnknownVersions(seen); err != nil {
+			return err
 		}
 
 		for _, m := range migrations {
