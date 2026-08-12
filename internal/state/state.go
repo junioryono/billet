@@ -509,7 +509,11 @@ func (db *DB) beginWrite(ctx context.Context) (*sql.Tx, error) {
 		case <-ctx.Done():
 			wait.Stop()
 
-			return nil, fmt.Errorf("begin write tx: %w", err)
+			// ctx.Err(), NOT the busy error that happened to be last. Cancellation
+			// is what ended this wait, and a caller testing for context.Canceled or
+			// DeadlineExceeded has to be able to see it — the guarantee two lines up
+			// is worthless if this branch quietly returns something else.
+			return nil, fmt.Errorf("begin write tx: %w", ctx.Err())
 		case <-wait.C:
 		}
 	}
