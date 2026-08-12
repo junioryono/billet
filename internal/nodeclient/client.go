@@ -29,6 +29,7 @@ import (
 	"github.com/junioryono/billet/internal/node"
 	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/server"
+	"github.com/junioryono/billet/internal/wirecert"
 )
 
 // ErrUnregistered means the control plane does not know this node.
@@ -631,4 +632,29 @@ func (c *Client) decodeErr(resp *http.Response) error {
 	default:
 		return fmt.Errorf("nodeclient: control plane refused: %s (%s)", body.Message, resp.Status)
 	}
+}
+
+// Renew asks the control plane to sign a new certificate for this node.
+//
+// The key is generated HERE and stays here; only the request and the signature
+// cross the wire. Authenticated by the certificate being replaced, so it grants
+// nothing new — a host that can already act as this node asks to keep doing so.
+func (c *Client) Renew(ctx context.Context, name string) ([]byte, []byte, error) {
+	csrPEM, keyPEM, err := wirecert.NewNodeCSR(name)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var res nodeapi.RenewResponse
+
+	if err := c.do(ctx, http.MethodPost, "/v1/nodes/"+url.PathEscape(c.node)+"/renew",
+		nodeapi.RenewRequest{CSRPEM: string(csrPEM)}, &res); err != nil {
+		return nil, nil, err
+	}
+
+	if res.CertPEM == "" {
+		return nil, nil, errors.New("nodeclient: the control plane signed nothing")
+	}
+
+	return []byte(res.CertPEM), keyPEM, nil
 }

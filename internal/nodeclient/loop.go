@@ -12,6 +12,7 @@ import (
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/server"
+	"github.com/junioryono/billet/internal/wirecert"
 )
 
 // Compute is the part of internal/node.Runner the loop drives.
@@ -79,6 +80,16 @@ type LoopOptions struct {
 	// SweepEvery bounds how often the node looks for compute nothing is asking
 	// about. Zero disables it.
 	SweepEvery time.Duration
+	// Identity is this node's rotating certificate, when it has one. Nil on a
+	// loopback wire, where there are no certificates to renew.
+	//
+	// GIVEN TO THE LOOP RATHER THAN RENEWED BY THE CALLER, because renewal has to
+	// happen while the node is RUNNING. A check at startup would leave a host that
+	// is up for a year to expire in place, and the failure is total: an expired
+	// certificate cannot renew — renewal is authenticated by the certificate being
+	// renewed — so the node has to be re-enrolled by hand.
+	Identity *wirecert.Rotating
+
 	// Hurry, when closed, ends the drain's wait early. It is the operator's
 	// second signal: stop waiting, but still stop properly.
 	Hurry <-chan struct{}
@@ -489,6 +500,48 @@ func waitForHolding(ctx context.Context, compute Compute, log *slog.Logger, opts
 	return true
 }
 
+// renewIfDue replaces this node's certificate before it expires.
+//
+// BEST EFFORT, AND QUIET WHEN IT FAILS. The window is a third of the
+// certificate's remaining life — months, not hours — so a control plane that is
+// down for a week costs nothing but a retry on the next pass. Making a renewal
+// failure fatal would take a node out of the fleet over something it has ample
+// time to do later.
+//
+// It is loud when it SUCCEEDS, because a certificate changing under a running
+// host is exactly the kind of thing an operator wants in the log when they are
+// working out why a fingerprint moved.
+func renewIfDue(ctx context.Context, c *Client, log *slog.Logger, opts LoopOptions) {
+	if opts.Identity == nil {
+		return
+	}
+
+	left, due := wirecert.RenewalDue(opts.Identity.Leaf())
+	if !due {
+		return
+	}
+
+	certPEM, keyPEM, err := c.Renew(ctx, c.node)
+	if err != nil {
+		log.Warn("could not renew this node's certificate; will try again",
+			"expires_in", left.Round(time.Hour), "error", err)
+
+		return
+	}
+
+	if err := opts.Identity.Replace(certPEM, keyPEM); err != nil {
+		// The OLD certificate is still in force: Replace verifies before it
+		// installs, so a bad renewal leaves a working node working.
+		log.Error("the control plane signed a certificate this node cannot use; keeping the "+
+			"current one", "expires_in", left.Round(time.Hour), "error", err)
+
+		return
+	}
+
+	log.Info("renewed this node's certificate",
+		"not_after", opts.Identity.Leaf().NotAfter)
+}
+
 // serve polls for commands until something needs the caller to re-register.
 func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, opts LoopOptions, draining bool) error {
 	sweepAt := time.Now().Add(opts.SweepEvery)
@@ -497,6 +550,11 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+
+		// ON THE SAME PASS AS THE SWEEP, so renewal needs no clock of its own. The
+		// window is a third of the certificate's life, so a node that polls at all
+		// in that time renews; one that does not is not running anyway.
+		renewIfDue(ctx, c, log, opts)
 
 		if opts.SweepEvery > 0 && time.Now().After(sweepAt) {
 			if err := compute.Sweep(ctx); err != nil {
