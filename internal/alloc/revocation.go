@@ -98,3 +98,107 @@ func (a *Allocator) RevokedCerts(ctx context.Context) ([]RevokedCert, error) {
 
 	return out, err
 }
+
+// IssuedCert is a credential this deployment handed out.
+type IssuedCert struct {
+	Serial   string
+	Node     string
+	Source   string
+	NotAfter string
+	IssuedAt string
+}
+
+// Sources a certificate can come from.
+const (
+	CertEnrolled = "enrolled"
+	CertIssued   = "issued"
+	CertRenewed  = "renewed"
+)
+
+// RecordIssuedCert writes down a credential at the moment it is handed out.
+//
+// WITHOUT THIS, REVOCATION CANNOT REACH A RENEWAL. Revocation names one serial,
+// which is the right granularity — a node name is legitimately re-issued to a
+// replacement machine — but it only works on serials billet knows about.
+// Renewal mints a fresh key and serial over the wire, so a node that has renewed
+// once is presenting a credential that exists nowhere but on that node. An
+// operator revoking the bundle they originally issued takes back a serial nobody
+// holds, and the host carries on.
+func (a *Allocator) RecordIssuedCert(ctx context.Context, c IssuedCert) error {
+	if c.Serial == "" {
+		return fmt.Errorf("alloc: an issued certificate needs a serial")
+	}
+
+	return a.db.Tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx,
+			`INSERT INTO issued_certs (serial, node, source, not_after, issued_at)
+			 VALUES (?, ?, ?, ?, ?)
+			 ON CONFLICT (serial) DO NOTHING`,
+			c.Serial, c.Node, c.Source, c.NotAfter, ts(a.now().UTC()))
+		if err != nil {
+			return fmt.Errorf("alloc: record the certificate issued to %s: %w", c.Node, err)
+		}
+
+		return nil
+	})
+}
+
+// LiveCertsFor lists the credentials a node holds that are neither expired nor
+// already revoked.
+func (a *Allocator) LiveCertsFor(ctx context.Context, node string) ([]IssuedCert, error) {
+	var out []IssuedCert
+
+	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+		out = nil
+
+		rows, err := tx.QueryContext(ctx,
+			`SELECT i.serial, i.node, i.source, i.not_after, i.issued_at
+			   FROM issued_certs i
+			   LEFT JOIN revoked_certs r ON r.serial = i.serial
+			  WHERE i.node = ? AND r.serial IS NULL AND i.not_after > ?
+			  ORDER BY i.issued_at DESC`, node, ts(a.now().UTC()))
+		if err != nil {
+			return fmt.Errorf("alloc: list the certificates held by %s: %w", node, err)
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var c IssuedCert
+			if err := rows.Scan(&c.Serial, &c.Node, &c.Source, &c.NotAfter, &c.IssuedAt); err != nil {
+				return fmt.Errorf("alloc: scan a certificate: %w", err)
+			}
+
+			out = append(out, c)
+		}
+
+		return rows.Err()
+	})
+
+	return out, err
+}
+
+// RevokeNode withdraws every credential a node currently holds, and reports what
+// it took back.
+//
+// THE HANDLE AN OPERATOR ACTUALLY HAS. Responding to a compromised machine means
+// taking back everything that machine can present, and after a renewal that is
+// not the bundle in their hands — it is a serial they have never seen. Revoking
+// by serial from a file silently leaves the live credential working.
+//
+// A replacement machine under the same name is unaffected: this revokes the
+// serials outstanding right now, and a certificate issued afterwards is not one
+// of them.
+func (a *Allocator) RevokeNode(ctx context.Context, node, reason string) ([]IssuedCert, error) {
+	live, err := a.LiveCertsFor(ctx, node)
+	if err != nil {
+		return nil, err
+	}
+
+	for i := range live {
+		if err := a.RevokeCert(ctx, live[i].Serial, node, reason); err != nil {
+			return nil, err
+		}
+	}
+
+	return live, nil
+}

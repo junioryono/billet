@@ -2,6 +2,7 @@ package e2e
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http/httptest"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/nodeclient"
 	"github.com/junioryono/billet/internal/nodeplane"
@@ -20,6 +22,35 @@ type revocations struct {
 	mu      sync.Mutex
 	serials map[string]bool
 	err     error
+
+	// issued is every credential the wire has handed out, which is what makes a
+	// renewal revocable at all.
+	issued []alloc.IssuedCert
+	// recordErr stands in for a ledger that cannot write down what it just
+	// signed.
+	recordErr error
+}
+
+func (r *revocations) RecordIssuedCert(_ context.Context, cert alloc.IssuedCert) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.recordErr != nil {
+		return r.recordErr
+	}
+
+	r.issued = append(r.issued, cert)
+
+	return nil
+}
+
+// issuedCerts is what the wire has recorded, copied so a caller cannot race the
+// handler still writing to it.
+func (r *revocations) issuedCerts() []alloc.IssuedCert {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return append([]alloc.IssuedCert(nil), r.issued...)
 }
 
 func (r *revocations) CertRevoked(_ context.Context, serial string) (bool, error) {
@@ -290,5 +321,124 @@ func TestRenewalCannotMintAnotherNodesName(t *testing.T) {
 		t.Errorf("the control plane signed a certificate for %q on a connection authenticated "+
 			"as %q; every node could then act as every other",
 			got.Subject.CommonName, "epyc-1")
+	}
+}
+
+// A RENEWED CERTIFICATE IS ONE THE DEPLOYMENT CAN TAKE BACK.
+//
+// Revocation is keyed on serial, which is the right granularity — a node name is
+// legitimately re-issued to a replacement machine, so revoking the NAME would
+// refuse the replacement too. The cost is that it only reaches serials billet
+// wrote down, and renewal mints a fresh key and serial over the wire.
+//
+// So a host that had renewed once was presenting a credential that existed
+// nowhere but on that host. The operator responding to a compromise revokes the
+// bundle they issued, is told it will be refused on its next request, and
+// nothing happens: the machine keeps registering, binding leases, and asking for
+// JIT registrations — credentials that register runners against the
+// organisation.
+func TestARenewedCertificateIsRecordedSoItCanBeRevoked(t *testing.T) {
+	t.Parallel()
+
+	ca, base, list := revocableWire(t)
+
+	bundle, err := ca.IssueNode("epyc-1")
+	if err != nil {
+		t.Fatalf("issue: %v", err)
+	}
+
+	conf, err := wirecert.ClientTLS(bundle)
+	if err != nil {
+		t.Fatalf("client tls: %v", err)
+	}
+
+	c, err := nodeclient.New(nodeclient.Options{Base: base, Node: "epyc-1", TLS: conf})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+
+	certPEM, keyPEM, caPEM, err := c.Renew(t.Context(), "epyc-1")
+	if err != nil {
+		t.Fatalf("renew: %v", err)
+	}
+
+	renewedLeaf, err := wirecert.LeafOf(wirecert.Bundle{CertPEM: certPEM})
+	if err != nil {
+		t.Fatalf("parse the renewed certificate: %v", err)
+	}
+
+	renewedSerial := wirecert.Serial(renewedLeaf)
+
+	// THE SERIAL THE NODE NOW PRESENTS IS ONE BILLET KNOWS ABOUT. Without this
+	// there is no handle at all: the operator's file names the old one.
+	var recorded bool
+
+	for _, c := range list.issuedCerts() {
+		if c.Serial == renewedSerial && c.Node == "epyc-1" {
+			recorded = true
+		}
+	}
+
+	if !recorded {
+		t.Fatalf("the wire signed serial %s for epyc-1 and recorded nothing, so no operator "+
+			"can ever revoke it", renewedSerial)
+	}
+
+	// And revoking it actually stops the machine.
+	list.revoke(renewedSerial)
+
+	renewed, err := wirecert.ClientTLS(wirecert.Bundle{
+		CertPEM: certPEM, KeyPEM: keyPEM, CAPEM: caPEM,
+	})
+	if err != nil {
+		t.Fatalf("client tls: %v", err)
+	}
+
+	c2, err := nodeclient.New(nodeclient.Options{Base: base, Node: "epyc-1", TLS: renewed})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+
+	if err := c2.Register(t.Context(), nodeclient.Registration{
+		Provider: config.ProviderDocker, Deployment: wireDeployment,
+		VCPU: 8, Memory: 32 * config.GiB,
+	}); err == nil {
+		t.Error("a revoked renewal was still allowed to register")
+	}
+}
+
+// A RENEWAL BILLET CANNOT WRITE DOWN IS REFUSED, rather than handed over.
+//
+// The node keeps the certificate it already has — recorded, revocable, and good
+// for months — and tries again on its next pass. Handing over a credential the
+// control plane cannot name would trade a recoverable outage for a permanent
+// hole in revocation.
+func TestARenewalIsRefusedWhenItCannotBeRecorded(t *testing.T) {
+	t.Parallel()
+
+	ca, base, list := revocableWire(t)
+
+	list.mu.Lock()
+	list.recordErr = errors.New("database is locked")
+	list.mu.Unlock()
+
+	bundle, err := ca.IssueNode("epyc-1")
+	if err != nil {
+		t.Fatalf("issue: %v", err)
+	}
+
+	conf, err := wirecert.ClientTLS(bundle)
+	if err != nil {
+		t.Fatalf("client tls: %v", err)
+	}
+
+	c, err := nodeclient.New(nodeclient.Options{Base: base, Node: "epyc-1", TLS: conf})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+
+	if _, _, _, err := c.Renew(t.Context(), "epyc-1"); err == nil {
+		t.Error("a renewal that could not be recorded was handed over anyway, so the node is " +
+			"now presenting a credential nobody can revoke")
 	}
 }

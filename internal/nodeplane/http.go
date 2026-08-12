@@ -78,12 +78,20 @@ func RequireClientCert() HandlerOption {
 	return func(h *handler) { h.requireCert = true }
 }
 
-// Revocations answers whether a certificate has been withdrawn.
+// Revocations answers whether a certificate has been withdrawn, and records the
+// ones this wire hands out.
 //
-// An interface rather than the allocator, so the wire depends on the one
-// question it asks rather than on the ledger.
+// AN ISSUE IS PART OF REVOCATION, not a separate concern. A credential billet
+// never wrote down cannot be taken back: renewal mints a fresh key and serial
+// over this wire, and without recording it the only serials an operator can name
+// are the ones from bundles they issued by hand — which a node that has renewed
+// is no longer presenting.
+//
+// An interface rather than the allocator, so the wire depends on the two
+// questions it asks rather than on the ledger.
 type Revocations interface {
 	CertRevoked(ctx context.Context, serial string) (bool, error)
+	RecordIssuedCert(ctx context.Context, cert alloc.IssuedCert) error
 }
 
 // WithRevocations lets the wire refuse a credential an operator has taken back.
@@ -687,6 +695,38 @@ func (h *handler) renew(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("this certificate request cannot be signed: %v", err))
 
 		return
+	}
+
+	// RECORDED BEFORE IT IS HANDED OVER, because the alternative is a live
+	// credential the control plane cannot name. A failure here refuses the
+	// renewal: the node keeps the certificate it already has — which is recorded,
+	// revocable, and good for months — and tries again on its next pass.
+	if h.revocations != nil {
+		leaf, leafErr := wirecert.LeafOf(bundle)
+		if leafErr != nil {
+			h.log.Error("could not read a renewed certificate back", "node", node, "error", leafErr)
+
+			writeErr(w, http.StatusInternalServerError, nodeapi.CodeUnavailable,
+				"billet could not read the certificate it just signed; the node keeps the one "+
+					"it has")
+
+			return
+		}
+
+		if recErr := h.revocations.RecordIssuedCert(r.Context(), alloc.IssuedCert{
+			Serial:   wirecert.Serial(leaf),
+			Node:     node,
+			Source:   alloc.CertRenewed,
+			NotAfter: leaf.NotAfter.UTC().Format(time.RFC3339),
+		}); recErr != nil {
+			h.log.Error("could not record a renewed certificate; refusing the renewal so the "+
+				"credential stays one an operator can revoke", "node", node, "error", recErr)
+
+			writeErr(w, http.StatusServiceUnavailable, nodeapi.CodeUnavailable,
+				"billet could not record this renewal; the node keeps the certificate it has")
+
+			return
+		}
 	}
 
 	h.log.Info("renewed a node certificate", "node", node)

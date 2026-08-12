@@ -1406,6 +1406,17 @@ func cmdCAIssue(ctx context.Context, args []string) error {
 		return err
 	}
 
+	// RECORDED BEFORE IT IS WRITTEN DOWN, and fatal if it fails.
+	//
+	// Two facts go in: the admission trail, so a fleet built by issuing directly
+	// is visible to the same list that shows what is waiting, and the SERIAL,
+	// without which this credential can never be revoked. Handing an operator a
+	// bundle billet cannot take back is worse than handing them an error, and the
+	// error is recoverable — nothing has been written yet, so re-running is safe.
+	if err := recordIssued(ctx, *cfgPath, name, bundle); err != nil {
+		return err
+	}
+
 	dir := *out
 	if dir == "" {
 		dir = name + "-billet-tls"
@@ -1418,20 +1429,6 @@ func cmdCAIssue(ctx context.Context, args []string) error {
 	abs, err := filepath.Abs(dir)
 	if err != nil {
 		abs = dir
-	}
-
-	// RECORDED, so both ways into a deployment leave the same trail: a fleet built by
-	// issuing directly would otherwise be invisible to the list that shows what has
-	// been admitted.
-	//
-	// Not fatal if it fails: the bundle is already on disk and the operator has what
-	// they came for. Losing the audit row is worth saying out loud and not worth
-	// throwing the certificate away over.
-	if leaf, lerr := wirecert.LeafOf(bundle); lerr != nil {
-		fmt.Fprintf(os.Stderr, "could not read back the certificate to record it: %v\n", lerr)
-	} else if rerr := recordIssued(ctx, *cfgPath, name, wirecert.FingerprintOfCert(leaf),
-		string(bundle.CertPEM)); rerr != nil {
-		fmt.Fprintf(os.Stderr, "issued the bundle but could not record it: %v\n", rerr)
 	}
 
 	fmt.Printf("billet ca: wrote a bundle for node %q to %s\n\n", name, abs)
@@ -1457,7 +1454,12 @@ func mustSPKI(b wirecert.Bundle) []byte {
 }
 
 // recordIssued writes a directly-issued certificate into the admission trail.
-func recordIssued(ctx context.Context, cfgPath, name, fingerprint, certPEM string) error {
+func recordIssued(ctx context.Context, cfgPath, name string, bundle wirecert.Bundle) error {
+	leaf, err := wirecert.LeafOf(bundle)
+	if err != nil {
+		return fmt.Errorf("read back the certificate just issued to %s: %w", name, err)
+	}
+
 	a, closeDB, err := controlPlaneAllocator(ctx, cfgPath)
 	if err != nil {
 		return err
@@ -1465,7 +1467,11 @@ func recordIssued(ctx context.Context, cfgPath, name, fingerprint, certPEM strin
 
 	defer closeDB()
 
-	displaced, err := a.RecordIssued(ctx, name, fingerprint, certPEM)
+	if err := recordIssuedCert(ctx, a, bundle, name, alloc.CertIssued); err != nil {
+		return err
+	}
+
+	displaced, err := a.RecordIssued(ctx, name, wirecert.FingerprintOfCert(leaf), string(bundle.CertPEM))
 	if err != nil {
 		return err
 	}
