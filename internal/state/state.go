@@ -601,7 +601,13 @@ func isBusy(err error) bool {
 // Narrow deliberately: this is the ONLY driver code translated into the caller's
 // context error, because every other failure is a fact about the database that
 // must survive being reported.
-func isInterrupt(err error) bool {
+// A VAR SO A TEST CAN REACH THE BRANCH IT GUARDS. modernc's *sqlite.Error has
+// unexported fields, so a code-9 error cannot be fabricated from here and the
+// translation below it would otherwise be unreachable from any test — which is
+// how it came to be written on an unverified premise in the first place. The
+// same reason adminBusyLimit is a var; nothing outside this package writes
+// either.
+var isInterrupt = func(err error) bool {
 	var serr *sqlite.Error
 	if !errors.As(err, &serr) {
 		return false
