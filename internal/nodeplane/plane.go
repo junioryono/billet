@@ -797,6 +797,45 @@ func (p *Plane) answerLocked(pend *pending, res nodeapi.CommandResult) {
 // reconciliation reasons about leases the other one owns.
 var ErrSuperseded = errors.New("nodeplane: another process is registered as this node")
 
+// ReconcileInventory frees capacity held for compute this host says it is not
+// running.
+//
+// THE SAME PROOF AS REGISTRATION, ON A CADENCE THAT ACTUALLY MEETS IT. A lease
+// is quarantined by the reaper, whose clock is the lease TTL — and a node that
+// reconnects after a control-plane restart does so within seconds, long before
+// the leases it was holding expire. So the inventory that arrives with a
+// registration is almost always taken BEFORE the quarantine it would resolve,
+// and nothing looked again.
+//
+// Fenced by the wire rather than by an epoch: this route refuses a superseded
+// incarnation, which is a stronger statement than the registration epoch — it is
+// about the process, not the registration.
+func (p *Plane) ReconcileInventory(ctx context.Context, node string, running []string) (int, error) {
+	if p.registrar == nil {
+		return 0, nil
+	}
+
+	epoch, err := p.LedgerEpoch(node)
+	if err != nil {
+		return 0, err
+	}
+
+	return p.registrar.ResolveQuarantineFor(ctx, node, running, epoch)
+}
+
+// LedgerEpoch is the fencing token the plane last recorded for a node.
+func (p *Plane) LedgerEpoch(node string) (int64, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	n, ok := p.nodes[node]
+	if !ok {
+		return 0, fmt.Errorf("%w: %s", ErrUnregistered, node)
+	}
+
+	return n.ledgerEpoch, nil
+}
+
 // CheckIncarnation reports whether a request came from the current node process.
 //
 // COMPATIBILITY IS SCOPED TO NODES THAT HAVE NOT CLAIMED ONE, not to the REQUEST:

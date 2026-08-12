@@ -275,3 +275,43 @@ func (a *Allocator) ExpireForTest(ctx context.Context, leaseID string) error {
 		return nil
 	})
 }
+
+// Reconcile frees capacity held for compute a host says it is not running.
+//
+// THE IN-PROCESS SIDE OF THE NODE WIRE'S /reconcile, so a colocated node reaches
+// the same code as a remote one. It reads the node's current epoch itself
+// because there is no registration in flight to carry one — the caller IS the
+// current incarnation by construction.
+func (a *Allocator) Reconcile(ctx context.Context, node string, running []string) (int, error) {
+	var epoch int64
+
+	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+		return tx.QueryRowContext(ctx,
+			`SELECT epoch FROM nodes WHERE name = ?`, node).Scan(&epoch)
+	})
+
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		// Not in the fleet, so it holds nothing to free.
+		return 0, nil
+	case err != nil:
+		return 0, fmt.Errorf("alloc: read the epoch of node %s: %w", node, err)
+	}
+
+	return a.ResolveQuarantineFor(ctx, node, running, epoch)
+}
+
+// AgeQuarantineForTest pushes a quarantined lease past the grace, so a test can
+// reach the settled case without a clock.
+func (a *Allocator) AgeQuarantineForTest(ctx context.Context, leaseID string) error {
+	return a.db.Tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx,
+			`UPDATE leases SET expires_at = ? WHERE id = ?`,
+			ts(a.now().UTC().Add(-2*quarantineGrace)), leaseID)
+		if err != nil {
+			return fmt.Errorf("alloc: age lease %s: %w", leaseID, err)
+		}
+
+		return nil
+	})
+}

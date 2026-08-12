@@ -1288,3 +1288,70 @@ func TestCustodySurvivesItsLeaseBeingQuarantined(t *testing.T) {
 		t.Errorf("the job survived one tick and not the next: %v", p.live)
 	}
 }
+
+// A HOST RUNNING NOTHING SAYS SO, EVERY SWEEP.
+//
+// Quarantine happens on the REAPER's clock, not the node's. A control plane that
+// restarts sees its nodes re-register within seconds — before the leases they
+// were holding have expired — so the inventory that arrives with a registration
+// is taken BEFORE the quarantine it would resolve, and nothing looked again.
+//
+// The capacity of a job that finished during the outage was then held until an
+// operator ran `billet leases release --force`. Every plane restart permanently
+// shrank the fleet by its already-finished in-flight leases, and the early
+// return for "this host is running nothing" is what made the case unreachable —
+// a host running nothing is exactly the one whose capacity should come back.
+func TestASweepReportsAnEmptyInventory(t *testing.T) {
+	t.Parallel()
+
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
+
+	lease := assignedLease(t, a)
+
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	// The job finishes and its container goes, while the control plane is not
+	// watching.
+	running, err := p.List(t.Context())
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+
+	for _, inst := range running {
+		if err := p.Destroy(t.Context(), inst.ID); err != nil {
+			t.Fatalf("destroy: %v", err)
+		}
+	}
+
+	// The lease ages out and is quarantined, AFTER any registration this node
+	// would have made.
+	if err := a.ExpireForTest(t.Context(), lease.ID); err != nil {
+		t.Fatalf("expire: %v", err)
+	}
+
+	if _, err := a.Reap(t.Context()); err != nil {
+		t.Fatalf("Reap: %v", err)
+	}
+
+	if err := a.AgeQuarantineForTest(t.Context(), lease.ID); err != nil {
+		t.Fatalf("age: %v", err)
+	}
+
+	if err := r.Sweep(t.Context()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+
+	held, err := a.Quarantined(t.Context())
+	if err != nil {
+		t.Fatalf("Quarantined: %v", err)
+	}
+
+	if len(held) != 0 {
+		t.Errorf("%d lease(s) still hold capacity for compute this host says it is not "+
+			"running; nothing else will ever ask again: %+v", len(held), held)
+	}
+}
