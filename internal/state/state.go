@@ -68,6 +68,12 @@ type DB struct {
 	w    *sql.DB
 	r    *sql.DB
 	lock *dirLock
+
+	// unlocked marks a handle opened by an operator command while a control
+	// plane held the directory. Such a handle did not migrate and cannot assume
+	// the schema it verified at open is still the one it is writing against, so
+	// every transaction re-checks. See OpenAdmin and verifySchemaIn.
+	unlocked bool
 }
 
 // Open prepares the state directory, takes the exclusive process lock, opens the
@@ -114,9 +120,29 @@ func openDir(ctx context.Context, stateDir string, admin bool) (*DB, error) {
 	// transactions on power loss, and the capacity ledger is exactly the thing
 	// that must survive an unclean shutdown for restart reconciliation to work.
 	//
-	// busy_timeout is a backstop. With a single writer it should never fire; if
-	// it does, something is holding a write transaction far too long.
-	writerDSN := dsn(path,
+	// busy_timeout covers a writer waiting for another writer, which is now
+	// REACHABLE rather than theoretical: an operator command opens this same
+	// database while the control plane is running. See OpenAdmin.
+	//
+	// _txlock=immediate IS LOAD-BEARING, and it is the reason that is safe.
+	//
+	// database/sql's BeginTx issues a plain BEGIN, which in WAL mode is DEFERRED:
+	// the transaction takes a read snapshot at its first read and only asks for
+	// the write lock later. Every allocation decision here is read-current,
+	// decide, record — so if anything commits in between, SQLite cannot promote
+	// the now-stale snapshot and fails the write with SQLITE_BUSY_SNAPSHOT (517).
+	// busy_timeout does NOT rescue that: waiting cannot make an old snapshot
+	// current, so it fails immediately however long the caller is willing to wait.
+	//
+	// The blast radius is what makes this a correctness rule rather than a tuning
+	// one. Escrow's error reaches refillEscrow, which stops the listener, which
+	// cancels every other listener, whose shutdowns destroy every job on the host.
+	// One badly-timed `billet ca token` would have taken the deployment down.
+	//
+	// BEGIN IMMEDIATE takes the write lock up front, so there is no snapshot to
+	// promote and a second writer simply queues on busy_timeout. It costs nothing
+	// here because there is one writer connection per process already.
+	writerDSN := dsnWith(path, map[string]string{"_txlock": "immediate"},
 		"journal_mode(WAL)",
 		"synchronous(FULL)",
 		"busy_timeout(5000)",
@@ -147,7 +173,7 @@ func openDir(ctx context.Context, stateDir string, admin bool) (*DB, error) {
 	}
 	r.SetMaxOpenConns(4)
 
-	db := &DB{w: w, r: r, lock: lock}
+	db := &DB{w: w, r: r, lock: lock, unlocked: lock == nil}
 
 	startupCtx, cancel := context.WithTimeout(ctx, startupTimeout)
 	defer cancel()
@@ -197,11 +223,22 @@ func (db *DB) PingContext(ctx context.Context) error {
 // dsn builds a file: URI with the given pragmas, escaping the path so a state
 // directory containing spaces, '?' or '#' does not silently truncate the DSN.
 func dsn(path string, pragmas ...string) string {
+	return dsnWith(path, nil, pragmas...)
+}
+
+// dsnWith is dsn plus driver parameters that are not pragmas — _txlock, which
+// decides whether BeginTx issues BEGIN or BEGIN IMMEDIATE, is one.
+func dsnWith(path string, extra map[string]string, pragmas ...string) string {
 	u := url.URL{Scheme: "file", Path: path}
 	q := url.Values{}
 	for _, p := range pragmas {
 		q.Add("_pragma", p)
 	}
+
+	for k, v := range extra {
+		q.Set(k, v)
+	}
+
 	u.RawQuery = q.Encode()
 	return u.String()
 }
@@ -285,6 +322,18 @@ func (db *DB) Tx(ctx context.Context, fn func(*sql.Tx) error) error {
 		//nolint:errcheck // see above: no-op after Commit, and fn's error wins otherwise.
 		_ = tx.Rollback()
 	}()
+
+	// RE-CHECKED INSIDE THE TRANSACTION, for a handle that never held the lock.
+	// The check at open time is only true of the control plane that was running
+	// then; this one is true of the schema this transaction is actually writing
+	// against, because BEGIN IMMEDIATE already holds the write lock a migration
+	// would need.
+	if db.unlocked {
+		if err := verifySchemaIn(ctx, tx); err != nil {
+			return err
+		}
+	}
+
 	if err := fn(tx); err != nil {
 		return err
 	}

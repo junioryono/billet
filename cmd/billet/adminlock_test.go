@@ -2,10 +2,53 @@ package main
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/junioryono/billet/internal/state"
+	"github.com/junioryono/billet/internal/wirecert"
 )
+
+// writeAdminConfig is writeCAConfig with a REAL App private key, which cmdCheck
+// insists on before it ever reaches the state directory.
+func writeAdminConfig(t *testing.T, stateDir string) string {
+	t.Helper()
+
+	dir := t.TempDir()
+	keyPath := filepath.Join(dir, "app.pem")
+
+	if err := os.WriteFile(keyPath, testKey(t), 0o600); err != nil {
+		t.Fatalf("write the app key: %v", err)
+	}
+
+	path := filepath.Join(dir, "billet.yaml")
+
+	body := `
+server:
+  listen: 127.0.0.1:7717
+  state_dir: ` + stateDir + `
+  max_vcpu: 8
+  max_memory: 32GiB
+github:
+  org: acme
+  app_id: 1
+  installation_id: 2
+  private_key_path: ` + keyPath + `
+tiers:
+  - label: billet-2vcpu
+    provider: docker
+    vcpu: 2
+    memory: 8GiB
+    image: ubuntu:24.04
+`
+
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	return path
+}
 
 // THE COMMANDS THEMSELVES MUST WORK WHILE THE CONTROL PLANE IS RUNNING.
 //
@@ -68,5 +111,70 @@ func TestOperatorCommandsRunWhileTheControlPlaneIsRunning(t *testing.T) {
 
 	if tokens != 1 {
 		t.Errorf("join_tokens = %d, want 1 minted by `billet ca token`", tokens)
+	}
+}
+
+// THE TWO COMMANDS THAT OPEN THE LEDGER DIRECTLY, rather than through
+// controlPlaneAllocator.
+//
+// Separate from the test above because they need real fixtures — an App key for
+// `check`, an issued certificate for `ca revoke` — and because without them
+// either call site could be reverted to state.Open while everything else stayed
+// green, which is the regression this pair exists to catch.
+func TestTheDirectLedgerCommandsRunWhileTheControlPlaneIsRunning(t *testing.T) {
+	stateDir := t.TempDir()
+	cfg := writeAdminConfig(t, stateDir)
+	ctx := t.Context()
+
+	// A certificate for `ca revoke --cert` to name, issued before the server
+	// takes the directory so the fixture is not itself part of what is measured.
+	deployment, err := state.DeploymentID(stateDir)
+	if err != nil {
+		t.Fatalf("deployment id: %v", err)
+	}
+
+	ca, err := wirecert.LoadOrCreateCA(stateDir, deployment)
+	if err != nil {
+		t.Fatalf("authority: %v", err)
+	}
+
+	bundle, err := ca.IssueNode("epyc-1")
+	if err != nil {
+		t.Fatalf("issue a node certificate: %v", err)
+	}
+
+	bundleDir := t.TempDir()
+	if err := bundle.Write(bundleDir); err != nil {
+		t.Fatalf("write the bundle: %v", err)
+	}
+
+	server, err := state.Open(ctx, stateDir)
+	if err != nil {
+		t.Fatalf("open the server's ledger: %v", err)
+	}
+
+	t.Cleanup(func() { _ = server.Close() })
+
+	if err := cmdCheck(ctx, []string{"--config", cfg}); err != nil {
+		t.Errorf("billet check against a running control plane: %v", err)
+	}
+
+	if err := cmdCARevoke(ctx, []string{
+		"epyc-1", "--config", cfg, "--cert", filepath.Join(bundleDir, "node.crt"),
+	}); err != nil {
+		t.Errorf("billet ca revoke against a running control plane: %v", err)
+	}
+
+	// AND THE REVOCATION LANDED WHERE THE SERVER READS IT, which is the whole
+	// point of being allowed to run at all.
+	var revoked int
+
+	if err := server.Reader().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM revoked_certs WHERE node = ?`, "epyc-1").Scan(&revoked); err != nil {
+		t.Fatalf("count revocations the server can see: %v", err)
+	}
+
+	if revoked != 1 {
+		t.Errorf("revoked_certs for epyc-1 = %d, want 1", revoked)
 	}
 }
