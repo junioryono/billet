@@ -1032,7 +1032,13 @@ func TestRegistrationPrunesOwnershipTheLedgerHasEnded(t *testing.T) {
 func TestASupersessionDuringADestroyIsNotAConfirmation(t *testing.T) {
 	t.Parallel()
 
-	p, _ := deliverLaunch(t)
+	// GENEROUS EXPLICITLY, unlike its siblings. This is the one caller where the
+	// default five seconds is a live ceiling rather than dead margin: the destroy
+	// deliberately sits QUEUED with no poller while the supersession below is
+	// staged, so a stall in that choreography would time the destroy out
+	// undelivered and fail this test on something it is not about. Nothing here
+	// ever needs the timeout to fire.
+	p, _ := deliverLaunch(t, WithCommandTimeout(60*time.Second))
 
 	destroyed := make(chan error, 1)
 
