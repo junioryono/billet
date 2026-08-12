@@ -3,6 +3,8 @@ package state
 import (
 	"database/sql"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -248,37 +250,82 @@ func TestAnOperatorTransactionRechecksTheSchemaItIsWritingAgainst(t *testing.T) 
 // thirty-second startup budget — so a large or loaded deployment could lose every
 // live administration command, the emergency one included.
 //
-// The control plane still scans: it is about to schedule against this ledger.
-func TestOnlyTheControlPlaneScansTheLedgerAtOpen(t *testing.T) {
+// ASSERTED BY CORRUPTING THE LEDGER rather than by a flag. An earlier version
+// recorded "did we scan" on the handle, which proved only that the bookkeeping
+// ran: deleting the PRAGMA and keeping the assignment satisfied it. This asks the
+// question the operator cares about — does this handle REFUSE a broken database —
+// and the answer differs for the two kinds of caller.
+func TestOnlyTheControlPlaneRefusesACorruptedLedger(t *testing.T) {
 	dir := t.TempDir()
 	ctx := t.Context()
 
-	server, err := Open(ctx, dir)
+	db, err := Open(ctx, dir)
 	if err != nil {
-		t.Fatalf("Open (the server): %v", err)
+		t.Fatalf("Open: %v", err)
 	}
 
-	t.Cleanup(func() { _ = server.Close() })
-
-	if !server.scanned {
-		t.Error("a control plane must verify the ledger's integrity before scheduling against it")
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
 	}
 
+	corruptPages(t, filepath.Join(dir, "billet.db"))
+
+	// THE CONTROL PLANE REFUSES. It is about to make scheduling decisions
+	// against this file and cannot do that against a ledger it cannot trust.
+	if _, err := Open(ctx, dir); err == nil {
+		t.Error("a control plane opened a corrupted ledger; it schedules against this file")
+	} else if !strings.Contains(err.Error(), "integrity") {
+		t.Errorf("the refusal should name the integrity check, got: %v", err)
+	}
+
+	// AN OPERATOR COMMAND DOES NOT, because it does not scan. Reading the
+	// quarantine list or approving a node does not require re-proving the whole
+	// file, and making it do so put a growing scan in front of the command an
+	// operator reaches for in an emergency.
 	admin, err := OpenAdmin(ctx, dir)
 	if err != nil {
-		t.Fatalf("OpenAdmin: %v", err)
+		t.Fatalf("an operator command must not re-scan the ledger to open it: %v", err)
 	}
 
 	t.Cleanup(func() { _ = admin.Close() })
 
-	if admin.scanned {
-		t.Error("an operator command re-scanned the whole ledger; that cost grows with " +
-			"job_history and sits in front of the command an operator runs in an emergency")
+	// AND THE SCAN IS STILL AVAILABLE ON DEMAND, which is what `billet check`
+	// uses and how an operator finds out.
+	if err := admin.IntegrityCheck(ctx); err == nil {
+		t.Error("IntegrityCheck passed a corrupted ledger, so `billet check` would report it healthy")
+	}
+}
+
+// corruptPages overwrites whole pages in the middle of a SQLite file.
+//
+// Whole pages, and several of them: measured, a couple of hundred bytes near the
+// header lands in unused space and quick_check reports nothing, which would make
+// this test pass for the wrong reason.
+func corruptPages(t *testing.T, path string) {
+	t.Helper()
+
+	f, err := os.OpenFile(path, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatalf("open the ledger file: %v", err)
 	}
 
-	// AND IT IS STILL AVAILABLE ON DEMAND, which is what `billet check` uses.
-	if err := admin.IntegrityCheck(ctx); err != nil {
-		t.Errorf("IntegrityCheck on a healthy ledger: %v", err)
+	defer func() {
+		if err := f.Close(); err != nil {
+			t.Errorf("close the ledger file: %v", err)
+		}
+	}()
+
+	const pageSize = 4096
+
+	junk := make([]byte, pageSize)
+	for i := range junk {
+		junk[i] = 0xAB
+	}
+
+	for _, page := range []int64{2, 5, 9, 14} {
+		if _, err := f.WriteAt(junk, page*pageSize); err != nil {
+			t.Fatalf("corrupt page %d: %v", page, err)
+		}
 	}
 }
 
