@@ -1881,7 +1881,7 @@ func TestSupersessionMovesRunningWorkIntoCustody(t *testing.T) {
 //
 // This is a structural property of every constructor rather than of one path,
 // and it is checked that way because converting the field to an atomic silently
-// dropped the assignment from two of them. Nothing failed: no test heartbeated
+// dropped the assignment from three of them. Nothing failed: no test heartbeated
 // an entry from those paths, so a zero epoch was invisible.
 func TestEveryCustodyEntryCarriesItsLeasesEpoch(t *testing.T) {
 	t.Parallel()

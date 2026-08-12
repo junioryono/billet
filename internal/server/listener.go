@@ -2542,7 +2542,11 @@ func (l *Listener) complete(ctx context.Context, job Job) {
 	// of this — it would free the capacity on the strength of the epoch alone,
 	// which says nothing about whether a container exists.
 	if errors.Is(relErr, alloc.ErrFenced) {
-		if err := l.alloc.ResolveQuarantine(ctx, lease.ID); err == nil {
+		// WITH THE OUTCOME THIS PATH ALREADY KNOWS. The job finished and its
+		// compute is confirmed gone; archiving it as failed because the reaper got
+		// to the lease first would record a job GitHub reported completed as one
+		// that did not.
+		if err := l.alloc.ResolveQuarantine(ctx, lease.ID, outcome); err == nil {
 			l.log.Warn("a finished job's lease had been quarantined before its release "+
 				"landed; its compute is confirmed gone, so the capacity is back",
 				"tier", l.tier, "request", job.RequestID, "lease", lease.ID)
