@@ -823,12 +823,27 @@ func (a *Allocator) Assign(ctx context.Context, leaseID string, epoch, runID, re
 	})
 }
 
+// attribution is the host a history row belongs to.
+//
+// COALESCE(node, target_node), the way the rest of the arithmetic reads a lease.
+// `node` is filled at bind and escrow chose the machine long before that, so a
+// lease that never binds — assigned by GitHub, then the process dies — recorded
+// no host at all, and the jobs most worth investigating are exactly the ones
+// that end that way.
+func attribution(l *Lease) any {
+	switch {
+	case l.Node != "":
+		return l.Node
+	case l.TargetNode != "":
+		return l.TargetNode
+	default:
+		return nil
+	}
+}
+
 // recordAssignment opens the history row at assignment time.
 func (a *Allocator) recordAssignment(ctx context.Context, tx *sql.Tx, l *Lease, runID, requestID int64, now time.Time) error {
-	var node any
-	if l.Node != "" {
-		node = l.Node
-	}
+	node := attribution(l)
 
 	_, err := tx.ExecContext(ctx,
 		`INSERT INTO job_history (lease_id, tier, node, run_id, request_id, queued_at, assigned_at)
@@ -1087,10 +1102,21 @@ func (a *Allocator) RegisterNode(ctx context.Context, reg NodeRegistration) (int
 		// rest of the arithmetic does — COALESCE(node, target_node). `node` is filled at
 		// bind, but escrow chose the machine long before that.
 		//
-		// EXPIRED WORK DOES NOT GET A VOTE. billet registers the node BEFORE the server
-		// starts and the reaper runs inside that server, so a registration refused on the
-		// strength of expired leases prevents the only process that could clear them. The
-		// cutoff is the reaper's own. Capacity is different and IS overwritten below.
+		// EXPIRED IDLE WORK DOES NOT GET A VOTE. billet registers the node BEFORE the
+		// server starts and the reaper runs inside that server, so a registration refused
+		// on the strength of abandoned escrow prevents the only process that could clear
+		// it. The cutoff is the reaper's own.
+		//
+		// A RUNNING LEASE STILL DOES, EXPIRED OR NOT, because expiry proves only that the
+		// control-plane holder stopped heartbeating — never that the container stopped.
+		// Reading the two the same way let a host change its backend out from under work
+		// the new backend cannot see: the docker container keeps running, tart
+		// reconciliation cannot enumerate it, the reaper frees the lease, and the next
+		// escrow puts a second job on a machine still running the first. This does not
+		// deadlock, because the reaper lives in the server, the server starts without this
+		// node, and a terminalised lease stops counting here.
+		//
+		// Capacity is different and IS overwritten below.
 		case currentSite != reg.Site:
 			var outstanding int
 
@@ -1098,7 +1124,7 @@ func (a *Allocator) RegisterNode(ctx context.Context, reg NodeRegistration) (int
 				`SELECT COUNT(*) FROM leases
 				 WHERE COALESCE(node, target_node) = ?
 				   AND phase NOT IN ('done','failed')
-				   AND expires_at > ?`,
+				   AND (phase IN ('launching','online','busy') OR expires_at > ?)`,
 				name, now).Scan(&outstanding); err != nil {
 				return fmt.Errorf("alloc: count the leases on node %s: %w", name, err)
 			}
@@ -1119,7 +1145,7 @@ func (a *Allocator) RegisterNode(ctx context.Context, reg NodeRegistration) (int
 				`SELECT COUNT(*) FROM leases
 				 WHERE COALESCE(node, target_node) = ?
 				   AND phase NOT IN ('done','failed')
-				   AND expires_at > ?`,
+				   AND (phase IN ('launching','online','busy') OR expires_at > ?)`,
 				name, now).Scan(&outstanding); err != nil {
 				return fmt.Errorf("alloc: count the leases on node %s: %w", name, err)
 			}
@@ -1686,10 +1712,30 @@ func checkFloorsFit(tiers map[string]config.Tier, limits Limits) error {
 	return nil
 }
 
-// countOpenPerTier reports how many non-terminal leases each tier holds.
+// countOpenPerTier reports how many non-terminal leases each tier holds ON A
+// MACHINE THAT CAN STILL SERVE THEM.
+//
+// THE SAME DEFINITION OF A USABLE HOST THAT PLACEMENT USES, and the two
+// disagreeing is what made a floor stop being a promise. Placement asks for
+// `live = 1 AND drained = 0`, so a machine that is gone offers nothing — while
+// this count asked only whether a lease was non-terminal, wherever it was aimed.
+// Escrow stranded on a vanished host therefore read as "the reservation is
+// already met", nothing was held back for it, and another tier was offered the
+// last machine that could have served it. The stranded lease is then released,
+// and the reserved tier has none of its promised slots and nowhere to put one.
+//
+// A lease aimed at NO machine still counts. There is nothing to prove it
+// stranded, and treating it as unmet would reserve room on top of leases that
+// are perfectly fine.
 func (a *Allocator) countOpenPerTier(ctx context.Context, tx *sql.Tx) (map[string]int, error) {
 	rows, err := tx.QueryContext(ctx,
-		`SELECT tier, COUNT(*) FROM leases WHERE phase NOT IN ('done','failed') GROUP BY tier`)
+		`SELECT l.tier, COUNT(*)
+		   FROM leases l
+		   LEFT JOIN nodes n ON n.name = COALESCE(l.node, l.target_node)
+		  WHERE l.phase NOT IN ('done','failed')
+		    AND (COALESCE(l.node, l.target_node, '') = ''
+		         OR (n.live = 1 AND n.drained = 0))
+		  GROUP BY l.tier`)
 	if err != nil {
 		return nil, fmt.Errorf("alloc: count open leases per tier: %w", err)
 	}
@@ -1833,10 +1879,7 @@ func (a *Allocator) HistoryOutcome(ctx context.Context, leaseID string) (string,
 func (a *Allocator) archive(ctx context.Context, tx *sql.Tx, l *Lease, outcome Phase) error {
 	now := a.now().UTC()
 
-	var node any
-	if l.Node != "" {
-		node = l.Node
-	}
+	node := attribution(l)
 
 	// COALESCE on update, so terminalizing never erases what assignment recorded.
 	// A caller that does not select the ids — Reap — would otherwise arrive with

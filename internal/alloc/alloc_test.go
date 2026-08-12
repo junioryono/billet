@@ -1908,3 +1908,44 @@ func TestNewRejectsNegativeMacOSLimit(t *testing.T) {
 		t.Error("New accepted a negative per-host macOS limit")
 	}
 }
+
+// A LEASE THAT NEVER BOUND STILL SAYS WHERE IT WAS GOING.
+//
+// Escrow chooses the machine and `node` is not filled until bind, so a lease
+// that GitHub assigned and nothing ever launched recorded no host at all — the
+// history said the job touched nowhere, when the ledger knew exactly which
+// machine had been promised to it. Those are the rows most worth reading later,
+// because a lease that dies between assignment and bind is the shape a crash
+// leaves behind.
+func TestHistoryAttributesALeaseToTheMachineEscrowChose(t *testing.T) {
+	a := newBareAllocator(t, Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB},
+		[]config.Tier{{
+			Label: "small", Provider: config.ProviderDocker, GuestOS: config.GuestLinux,
+			VCPU: 2, Memory: 8 * config.GiB, Image: "img",
+		}})
+
+	mustRegister(t, a, NodeRegistration{
+		Name: "epyc-1", Provider: config.ProviderDocker, VCPU: 64, Memory: 256 * config.GiB})
+
+	lease, err := a.Reserve(t.Context(), "small")
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	// Assigned by GitHub, and then nothing: no bind, no launch.
+	if err := a.Assign(t.Context(), lease.ID, lease.Epoch, 7, 9); err != nil {
+		t.Fatalf("Assign: %v", err)
+	}
+
+	var node sql.NullString
+
+	if err := a.db.Reader().QueryRowContext(t.Context(),
+		`SELECT node FROM job_history WHERE lease_id = ?`, lease.ID).Scan(&node); err != nil {
+		t.Fatalf("read history: %v", err)
+	}
+
+	if node.String != "epyc-1" {
+		t.Errorf("job_history attributes this lease to %q, and escrow placed it on %q",
+			node.String, lease.TargetNode)
+	}
+}
