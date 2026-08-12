@@ -3,6 +3,7 @@ package alloc
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 )
 
@@ -143,38 +144,96 @@ func (a *Allocator) RecordIssuedCert(ctx context.Context, c IssuedCert) error {
 	})
 }
 
+// ErrParentRevoked means a renewal was signed by a certificate that has since
+// been taken back.
+var ErrParentRevoked = errors.New("alloc: the certificate being renewed has been revoked")
+
+// RecordRenewedCert records a renewal, refusing one whose parent was revoked.
+//
+// THE RACE THIS CLOSES. Revocation checks the presented certificate at the start
+// of a request, and a renewal signed a new serial some milliseconds later; a
+// revocation committing in between took back a credential the machine had
+// already stopped presenting, and reported success. Recording the child in the
+// same transaction that asks about the parent makes the order decide: either the
+// renewal lands first and RevokeNode sees its serial, or the revocation lands
+// first and this refuses.
+//
+// The wire refuses the renewal when this does, so the node keeps the certificate
+// it has — which is the revoked one, and will be turned away on its next
+// request. That is the intended outcome.
+func (a *Allocator) RecordRenewedCert(ctx context.Context, cert IssuedCert, parent string) error {
+	if cert.Serial == "" {
+		return fmt.Errorf("alloc: an issued certificate needs a serial")
+	}
+
+	return a.db.Tx(ctx, func(tx *sql.Tx) error {
+		var one int
+
+		switch err := tx.QueryRowContext(ctx,
+			`SELECT 1 FROM revoked_certs WHERE serial = ?`, parent).Scan(&one); {
+		case errors.Is(err, sql.ErrNoRows):
+		case err != nil:
+			return fmt.Errorf("alloc: read the revocation list: %w", err)
+		default:
+			return fmt.Errorf("%w: %s", ErrParentRevoked, parent)
+		}
+
+		_, err := tx.ExecContext(ctx,
+			`INSERT INTO issued_certs (serial, node, source, not_after, issued_at)
+			 VALUES (?, ?, ?, ?, ?)
+			 ON CONFLICT (serial) DO NOTHING`,
+			cert.Serial, cert.Node, cert.Source, cert.NotAfter, ts(a.now().UTC()))
+		if err != nil {
+			return fmt.Errorf("alloc: record the certificate issued to %s: %w", cert.Node, err)
+		}
+
+		return nil
+	})
+}
+
 // LiveCertsFor lists the credentials a node holds that are neither expired nor
 // already revoked.
 func (a *Allocator) LiveCertsFor(ctx context.Context, node string) ([]IssuedCert, error) {
 	var out []IssuedCert
 
 	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
-		out = nil
+		var err error
 
-		rows, err := tx.QueryContext(ctx,
-			`SELECT i.serial, i.node, i.source, i.not_after, i.issued_at
-			   FROM issued_certs i
-			   LEFT JOIN revoked_certs r ON r.serial = i.serial
-			  WHERE i.node = ? AND r.serial IS NULL AND i.not_after > ?
-			  ORDER BY i.issued_at DESC`, node, ts(a.now().UTC()))
-		if err != nil {
-			return fmt.Errorf("alloc: list the certificates held by %s: %w", node, err)
-		}
-		defer rows.Close()
+		out, err = liveCertsForTx(ctx, tx, node, ts(a.now().UTC()))
 
-		for rows.Next() {
-			var c IssuedCert
-			if err := rows.Scan(&c.Serial, &c.Node, &c.Source, &c.NotAfter, &c.IssuedAt); err != nil {
-				return fmt.Errorf("alloc: scan a certificate: %w", err)
-			}
-
-			out = append(out, c)
-		}
-
-		return rows.Err()
+		return err
 	})
 
 	return out, err
+}
+
+// liveCertsForTx is the query, inside a caller's transaction so a revocation can
+// be atomic with the read that decided what to revoke.
+func liveCertsForTx(ctx context.Context, tx *sql.Tx, node, now string) ([]IssuedCert, error) {
+	rows, err := tx.QueryContext(ctx,
+		`SELECT i.serial, i.node, i.source, i.not_after, i.issued_at
+		   FROM issued_certs i
+		   LEFT JOIN revoked_certs r ON r.serial = i.serial
+		  WHERE i.node = ? AND r.serial IS NULL AND i.not_after > ?
+		  ORDER BY i.issued_at DESC`, node, now)
+	if err != nil {
+		return nil, fmt.Errorf("alloc: list the certificates held by %s: %w", node, err)
+	}
+
+	defer func() { _ = rows.Close() }()
+
+	var out []IssuedCert
+
+	for rows.Next() {
+		var c IssuedCert
+		if err := rows.Scan(&c.Serial, &c.Node, &c.Source, &c.NotAfter, &c.IssuedAt); err != nil {
+			return nil, fmt.Errorf("alloc: scan a certificate: %w", err)
+		}
+
+		out = append(out, c)
+	}
+
+	return out, rows.Err()
 }
 
 // RevokeNode withdraws every credential a node currently holds, and reports what
@@ -189,16 +248,40 @@ func (a *Allocator) LiveCertsFor(ctx context.Context, node string) ([]IssuedCert
 // serials outstanding right now, and a certificate issued afterwards is not one
 // of them.
 func (a *Allocator) RevokeNode(ctx context.Context, node, reason string) ([]IssuedCert, error) {
-	live, err := a.LiveCertsFor(ctx, node)
-	if err != nil {
-		return nil, err
-	}
+	var revoked []IssuedCert
 
-	for i := range live {
-		if err := a.RevokeCert(ctx, live[i].Serial, node, reason); err != nil {
-			return nil, err
+	// ONE TRANSACTION, because a renewal is racing this.
+	//
+	// Reading the live certificates and then revoking them one at a time left a
+	// window exactly where it hurts: a compromised host authenticates with the
+	// certificate being taken back and asks to renew, the read misses the new
+	// serial because it does not exist yet, the renewal records it, and the
+	// revocation reports success over a credential the machine is no longer
+	// presenting. Reading and revoking together makes the order decide: either
+	// the renewal lands first and its serial is in the list, or this commits
+	// first and the renewal is refused for renewing a revoked certificate.
+	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+		revoked = nil
+
+		live, err := liveCertsForTx(ctx, tx, node, ts(a.now().UTC()))
+		if err != nil {
+			return err
 		}
-	}
 
-	return live, nil
+		for i := range live {
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO revoked_certs (serial, node, reason, revoked_at)
+				 VALUES (?, ?, ?, ?)
+				 ON CONFLICT (serial) DO NOTHING`,
+				live[i].Serial, node, reason, ts(a.now().UTC())); err != nil {
+				return fmt.Errorf("alloc: revoke certificate %s: %w", live[i].Serial, err)
+			}
+		}
+
+		revoked = live
+
+		return nil
+	})
+
+	return revoked, err
 }

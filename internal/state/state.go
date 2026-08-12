@@ -700,8 +700,14 @@ var quarantineMigration = migration{
 		   FROM leases`,
 		`DROP TABLE leases`,
 		`ALTER TABLE leases_new RENAME TO leases`,
+		// EVERY index the old table carried, not the ones that came to mind. A
+		// rebuild drops them all, and a missing one is invisible until the table is
+		// large enough for the scan to matter — leases_expiry_idx is what keeps the
+		// reaper from scanning the whole lease history on the single writer
+		// connection every listener is waiting for.
 		`CREATE INDEX leases_open_idx ON leases(phase) WHERE phase NOT IN ('done','failed')`,
 		`CREATE INDEX leases_node_idx ON leases(node)`,
+		`CREATE INDEX leases_expiry_idx ON leases(expires_at) WHERE phase NOT IN ('done','failed')`,
 	},
 }
 

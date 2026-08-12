@@ -1,6 +1,7 @@
 package alloc
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -249,5 +250,36 @@ func TestANodeStillRunningTheContainerKeepsItQuarantined(t *testing.T) {
 	if got := headroom(t, a, "small"); got != 0 {
 		t.Errorf("the machine offered %d slots while its host says the container is still "+
 			"there", got)
+	}
+}
+
+// A QUARANTINED LEASE PINS ITS HOST'S BACKEND, and it is the LAST phase that
+// should not.
+//
+// The reaper reaching this verdict is billet saying, in the ledger, that a
+// container may still be running on that machine and nothing has confirmed
+// otherwise. Letting the host change its provider on the strength of that turns
+// the reaper's own conclusion into the thing that unlocks the move — after
+// which the new backend cannot enumerate the old container, the host reports an
+// inventory without it, and the quarantine is resolved by a machine that cannot
+// see what it is vouching for.
+func TestAQuarantinedLeasePinsItsHostsBackend(t *testing.T) {
+	now := time.Now().UTC()
+	a := quarantineFleet(t, &now)
+
+	busyLease(t, a)
+
+	now = now.Add(31 * time.Second)
+
+	if _, err := a.Reap(t.Context()); err != nil {
+		t.Fatalf("Reap: %v", err)
+	}
+
+	moved := NodeRegistration{
+		Name: "epyc-1", Provider: config.ProviderTart, VCPU: 4, Memory: 16 * config.GiB,
+	}
+
+	if _, err := a.RegisterNode(t.Context(), moved); !errors.Is(err, ErrWrongProvider) {
+		t.Fatalf("a host holding quarantined compute changed its backend: %v", err)
 	}
 }

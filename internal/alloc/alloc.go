@@ -1147,6 +1147,10 @@ func (a *Allocator) RegisterNode(ctx context.Context, reg NodeRegistration) (int
 		//
 		// A RUNNING LEASE STILL DOES, EXPIRED OR NOT, because expiry proves only that the
 		// control-plane holder stopped heartbeating — never that the container stopped.
+		// QUARANTINE IS THE SAME ANSWER WRITTEN DOWN: the reaper reached exactly that
+		// conclusion about this lease, so it is the LAST phase that should let a host
+		// change its backend. Leaving it out made the reaper's own verdict the thing
+		// that unlocked the move.
 		// Reading the two the same way let a host change its backend out from under work
 		// the new backend cannot see: the docker container keeps running, tart
 		// reconciliation cannot enumerate it, the reaper frees the lease, and the next
@@ -1162,7 +1166,7 @@ func (a *Allocator) RegisterNode(ctx context.Context, reg NodeRegistration) (int
 				`SELECT COUNT(*) FROM leases
 				 WHERE COALESCE(node, target_node) = ?
 				   AND phase NOT IN ('done','failed')
-				   AND (phase IN ('launching','online','busy') OR expires_at > ?)`,
+				   AND (phase IN ('launching','online','busy','quarantine') OR expires_at > ?)`,
 				name, now).Scan(&outstanding); err != nil {
 				return fmt.Errorf("alloc: count the leases on node %s: %w", name, err)
 			}
@@ -1183,7 +1187,7 @@ func (a *Allocator) RegisterNode(ctx context.Context, reg NodeRegistration) (int
 				`SELECT COUNT(*) FROM leases
 				 WHERE COALESCE(node, target_node) = ?
 				   AND phase NOT IN ('done','failed')
-				   AND (phase IN ('launching','online','busy') OR expires_at > ?)`,
+				   AND (phase IN ('launching','online','busy','quarantine') OR expires_at > ?)`,
 				name, now).Scan(&outstanding); err != nil {
 				return fmt.Errorf("alloc: count the leases on node %s: %w", name, err)
 			}
