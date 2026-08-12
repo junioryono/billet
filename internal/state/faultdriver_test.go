@@ -101,13 +101,15 @@ func TestACancelledBeginStillReportsAStorageFault(t *testing.T) {
 // about somebody else's code is pinned to what that code does, not to what its
 // documentation implies.
 //
-// MEASURED: modernc normalises a cancelled query to context.Canceled itself, so
-// the SQLITE_INTERRUPT branch is belt-and-braces against a case this driver
-// version does not appear to produce. It is kept because the cost is one
-// comparison and the failure it would prevent — a caller testing for
-// context.Canceled seeing a raw driver code — is silent. If a future version
-// stops normalising, this test is what says so, and that is the moment the
-// branch starts earning its place.
+// MEASURED, AND ONLY ABOUT THE QUERY PATH: modernc normalises a cancelled QUERY
+// to context.Canceled itself. That is not evidence about BeginTx, which is what
+// beginWrite uses and which need not behave the same way — so this says nothing
+// about whether the SQLITE_INTERRUPT branch is reachable, and an earlier version
+// of this comment wrongly implied it did. The branch's own behaviour is pinned
+// separately, by TestAnInterruptedBeginIsReportedAsCancellation.
+//
+// What this one is worth: if a future driver version stops normalising the query
+// path, that is a signal the transaction path may have changed too.
 //
 // Either answer passes. Anything else fails, because beginWrite would hand a
 // caller an error it cannot recognise as cancellation at all.
@@ -141,4 +143,44 @@ func TestACancelledQueryIsRecognisableAsCancellation(t *testing.T) {
 	t.Errorf("a cancelled query produced %#v, which is neither a context error nor "+
 		"recognised by isInterrupt — beginWrite would return it to a caller testing "+
 		"for context.Canceled", err)
+}
+
+// AN INTERRUPTED BEGIN IS REPORTED AS CANCELLATION.
+//
+// This is the branch itself, driven end to end: beginWrite receives an error its
+// classifier calls an interrupt while the context is cancelled, and must hand the
+// caller context.Canceled rather than the driver's error.
+//
+// The classifier is swapped rather than provoked because modernc's *sqlite.Error
+// has unexported fields, so a code-9 error cannot be built from here. What that
+// leaves unpinned is narrow and stated: whether 9 is the right code. What it pins
+// is everything downstream of that decision, which is where the behaviour lives —
+// removing the translation fails this by returning the driver's error instead.
+func TestAnInterruptedBeginIsReportedAsCancellation(t *testing.T) {
+	restore := isInterrupt
+	isInterrupt = func(error) bool { return true }
+
+	t.Cleanup(func() { isInterrupt = restore })
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	faulty := sql.OpenDB(faultConnector{cancel: cancel})
+
+	t.Cleanup(func() { _ = faulty.Close() })
+
+	db := &DB{w: faulty}
+
+	err := db.Tx(ctx, func(*sql.Tx) error {
+		t.Error("the callback must not run when the transaction never began")
+
+		return nil
+	})
+	if err == nil {
+		t.Fatal("a failed BeginTx must be reported")
+	}
+
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("an interrupted BEGIN on a cancelled context must report cancellation, got: %v", err)
+	}
 }
