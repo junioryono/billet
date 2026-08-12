@@ -578,6 +578,10 @@ func ServerTLS(b Bundle) (*tls.Config, error) {
 		return nil, fmt.Errorf("wirecert: load the server certificate: %w", err)
 	}
 
+	// A BUNDLE, not one certificate. During a rotation this carries both the new
+	// authority and the one being retired, so a node that has renewed and a node
+	// that has not are both still recognised. AppendCertsFromPEM reads every
+	// certificate in the input.
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(b.CAPEM) {
 		return nil, errors.New("wirecert: the CA certificate could not be parsed for verification")

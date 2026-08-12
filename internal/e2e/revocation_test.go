@@ -216,7 +216,7 @@ func TestANodeRenewsItsOwnCertificate(t *testing.T) {
 		t.Fatalf("new client: %v", err)
 	}
 
-	certPEM, keyPEM, err := c.Renew(t.Context(), "epyc-1")
+	certPEM, keyPEM, caPEM, err := c.Renew(t.Context(), "epyc-1")
 	if err != nil {
 		t.Fatalf("renew: %v", err)
 	}
@@ -224,8 +224,14 @@ func TestANodeRenewsItsOwnCertificate(t *testing.T) {
 	// USABLE, which is the only thing that matters: a renewal that produces a
 	// certificate the control plane would reject is worse than none, because the
 	// node overwrites a working identity with it.
+	// THE AUTHORITY COMES BACK WITH IT, which is what lets a CA rotation reach a
+	// node: during an overlap this is a bundle holding both.
+	if len(caPEM) == 0 {
+		t.Fatal("the renewal carried no authority, so a rotation could never reach this node")
+	}
+
 	renewed, err := wirecert.ClientTLS(wirecert.Bundle{
-		CertPEM: certPEM, KeyPEM: keyPEM, CAPEM: bundle.CAPEM,
+		CertPEM: certPEM, KeyPEM: keyPEM, CAPEM: caPEM,
 	})
 	if err != nil {
 		t.Fatalf("the renewed certificate does not verify against its own authority: %v", err)
@@ -270,7 +276,7 @@ func TestRenewalCannotMintAnotherNodesName(t *testing.T) {
 	}
 
 	// Asks for a certificate naming somebody else.
-	certPEM, _, err := c.Renew(t.Context(), "mac-mini-1")
+	certPEM, _, _, err := c.Renew(t.Context(), "mac-mini-1")
 	if err != nil {
 		t.Fatalf("renew: %v", err)
 	}

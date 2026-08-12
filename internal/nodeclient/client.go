@@ -639,22 +639,24 @@ func (c *Client) decodeErr(resp *http.Response) error {
 // The key is generated HERE and stays here; only the request and the signature
 // cross the wire. Authenticated by the certificate being replaced, so it grants
 // nothing new — a host that can already act as this node asks to keep doing so.
-func (c *Client) Renew(ctx context.Context, name string) ([]byte, []byte, error) {
-	csrPEM, keyPEM, err := wirecert.NewNodeCSR(name)
+func (c *Client) Renew(ctx context.Context, name string) ([]byte, []byte, []byte, error) {
+	csrPEM, key, err := wirecert.NewNodeCSR(name)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	var res nodeapi.RenewResponse
 
 	if err := c.do(ctx, http.MethodPost, "/v1/nodes/"+url.PathEscape(c.node)+"/renew",
 		nodeapi.RenewRequest{CSRPEM: string(csrPEM)}, &res); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	if res.CertPEM == "" {
-		return nil, nil, errors.New("nodeclient: the control plane signed nothing")
+		return nil, nil, nil, errors.New("nodeclient: the control plane signed nothing")
 	}
 
-	return []byte(res.CertPEM), keyPEM, nil
+	// THE AUTHORITY TRAVELS WITH THE CERTIFICATE, which is what lets a CA
+	// rotation reach a node: during an overlap this is a bundle holding both.
+	return []byte(res.CertPEM), key, []byte(res.CAPEM), nil
 }
