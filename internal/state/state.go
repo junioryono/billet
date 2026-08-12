@@ -505,10 +505,130 @@ var providerListMigration = migration{
 	},
 }
 
+// A NODE IS SOMEWHERE, and until there was a word for where, a cache had no
+// address and every host looked equally close to every other one.
+//
+// Empty is "unsited", which is what every existing row is and what a
+// single-machine deployment stays. It is a real value rather than a missing one:
+// one place is still one place, and a deployment that never names it should not
+// have to.
+var nodeSiteMigration = migration{
+	Version: 10,
+	Name:    "node_site",
+	Stmts: []string{
+		`ALTER TABLE nodes ADD COLUMN site TEXT NOT NULL DEFAULT ''`,
+	},
+}
+
+// WHETHER A HOST IS REACHABLE IS NOW A FACT THE LEDGER NEEDS, because capacity
+// is counted here and a machine that is gone must stop backing advertisements.
+//
+// SEPARATE FROM `drained`, which is a different state: draining is a host that
+// is finishing its work and taking no more, and it is still there. This is the
+// plane's judgement about whether it is there at all.
+//
+// DEFAULTS TO 0, so a ledger written by an older billet trusts nothing until
+// each node registers again — which is the same conservative start a restart
+// gets, and the correct one: liveness is the plane's judgement and a plane that
+// has just started has not formed one.
+var nodeLivenessMigration = migration{
+	Version: 11,
+	Name:    "node_liveness",
+	Stmts: []string{
+		`ALTER TABLE nodes ADD COLUMN live INTEGER NOT NULL DEFAULT 0 CHECK (live IN (0, 1))`,
+	},
+}
+
+// A CERTIFICATE CAN BE TAKEN BACK, which until now it could not.
+//
+// The wire's whole admission decision is "an operator issued this host a
+// certificate", and it lasts a year. A decommissioned machine, or one whose key
+// leaked, could rejoin and be handed work — including a JIT credential that
+// registers a runner against the organisation — and the only remedy was to
+// rotate the CA, which invalidates every node at once.
+//
+// KEYED ON SERIAL, not on node name. A name can be re-issued to a replacement
+// machine deliberately, and revoking the name would refuse the replacement too.
+// The serial identifies the one credential being withdrawn.
+var certRevocationMigration = migration{
+	Version: 12,
+	Name:    "cert_revocation",
+	Stmts: []string{
+		`CREATE TABLE revoked_certs (
+			serial     TEXT PRIMARY KEY,
+			node       TEXT NOT NULL,
+			reason     TEXT NOT NULL DEFAULT '',
+			revoked_at TEXT NOT NULL
+		)`,
+		`CREATE INDEX idx_revoked_certs_node ON revoked_certs (node)`,
+	},
+}
+
+// A NODE ASKS TO JOIN AND AN OPERATOR SAYS YES, which is a decision that needs
+// somewhere to sit between the two.
+//
+// Admission used to be entirely out of band: an operator ran `billet ca issue`
+// and copied a bundle to the machine. That works and it is not discoverable — a
+// node that is powered on and pointed at a control plane appears nowhere, so the
+// operator has to already know it exists, and the thing they compare to decide
+// it is the right machine is a file they copied rather than anything the node
+// proved.
+//
+// KEYED ON NAME, WITH THE FINGERPRINT AS THE FACT BEING APPROVED. The name is
+// how an operator refers to a host; the fingerprint is what makes approving it
+// mean something, because it is the one value both ends can display and a human
+// can compare out of band.
+var nodeEnrollmentMigration = migration{
+	Version: 13,
+	Name:    "node_enrollment",
+	Stmts: []string{
+		`CREATE TABLE node_enrollments (
+			name         TEXT PRIMARY KEY,
+			fingerprint  TEXT NOT NULL,
+			csr_pem      TEXT NOT NULL,
+			cert_pem     TEXT NOT NULL DEFAULT '',
+			state        TEXT NOT NULL CHECK (state IN ('pending','approved','denied')),
+			requested_at TEXT NOT NULL,
+			decided_at   TEXT NOT NULL DEFAULT ''
+		)`,
+	},
+}
+
+// ENROLLING HAS TO COST SOMETHING TO ATTEMPT, or the request endpoint is open
+// to anyone who can reach the port.
+//
+// Approval still cannot be tricked — an operator matches a fingerprint against
+// what the node printed — but an unauthenticated endpoint lets a stranger fill
+// the pending list with plausible entries, and take a NAME before the real
+// machine asks for it. "First key claims the name" protects an operator from
+// approving a substitute; without a credential in front of it, it also lets
+// somebody deny a machine its own name.
+//
+// HASHED, NEVER STORED. A join token is a credential, so the ledger keeps only
+// what is needed to recognise one — the same reason a password is not stored.
+var joinTokenMigration = migration{
+	Version: 14,
+	Name:    "join_tokens",
+	Stmts: []string{
+		`CREATE TABLE join_tokens (
+			token_sha256   TEXT PRIMARY KEY,
+			note           TEXT NOT NULL DEFAULT '',
+			uses_remaining INTEGER NOT NULL,
+			created_at     TEXT NOT NULL,
+			expires_at     TEXT NOT NULL
+		)`,
+		// A certificate handed out by `billet ca issue` is an admission too, and
+		// it left no record: nothing could answer "what has been let into this
+		// deployment, and when".
+		`ALTER TABLE node_enrollments ADD COLUMN source TEXT NOT NULL DEFAULT 'enrolled'`,
+	},
+}
+
 func init() {
 	migrations = append(migrations,
 		placementMigration, guestOSMigration, placementFactsMigration, requestIDMigration,
-		providerListMigration)
+		providerListMigration, nodeSiteMigration, nodeLivenessMigration,
+		certRevocationMigration, nodeEnrollmentMigration, joinTokenMigration)
 }
 
 const bootstrapSchemaMigrations = `CREATE TABLE IF NOT EXISTS schema_migrations (

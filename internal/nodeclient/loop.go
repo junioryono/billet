@@ -12,6 +12,7 @@ import (
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/server"
+	"github.com/junioryono/billet/internal/wirecert"
 )
 
 // Compute is the part of internal/node.Runner the loop drives.
@@ -28,7 +29,7 @@ import (
 // sold to somebody else. That is precisely the failure custody was built to
 // prevent, reintroduced by moving the runner behind a network.
 type Compute interface {
-	Launch(ctx context.Context, lease *alloc.Lease, job server.Job) error
+	Launch(ctx context.Context, lease *alloc.Lease, tier *nodeapi.TierSpec, job server.Job) error
 	Destroy(ctx context.Context, requestID int64) error
 	Recover(ctx context.Context) error
 	Sweep(ctx context.Context) error
@@ -65,10 +66,30 @@ type LoopOptions struct {
 	Provider   config.ProviderKind
 	GuestOS    []config.GuestOS
 	Deployment string
-	Log        *slog.Logger
+	// Site is where this machine is, or empty in a deployment with one place.
+	Site string
+	// VCPU and Memory are what this host CONTRIBUTES, which is what it detected
+	// unless its own config said otherwise.
+	//
+	// Required. The control plane refuses a registration that offers nothing,
+	// because a node contributing zero joins the fleet, is never chosen, and
+	// produces no error for anyone to find.
+	VCPU   int
+	Memory config.ByteSize
+	Log    *slog.Logger
 	// SweepEvery bounds how often the node looks for compute nothing is asking
 	// about. Zero disables it.
 	SweepEvery time.Duration
+	// Identity is this node's rotating certificate, when it has one. Nil on a
+	// loopback wire, where there are no certificates to renew.
+	//
+	// GIVEN TO THE LOOP RATHER THAN RENEWED BY THE CALLER, because renewal has to
+	// happen while the node is RUNNING. A check at startup would leave a host that
+	// is up for a year to expire in place, and the failure is total: an expired
+	// certificate cannot renew — renewal is authenticated by the certificate being
+	// renewed — so the node has to be re-enrolled by hand.
+	Identity *wirecert.Rotating
+
 	// Hurry, when closed, ends the drain's wait early. It is the operator's
 	// second signal: stop waiting, but still stop properly.
 	Hurry <-chan struct{}
@@ -79,10 +100,26 @@ type LoopOptions struct {
 	// Backoff is how long to wait after a failed registration or poll. Zero uses
 	// a default.
 	//
-	// It governs BOTH, which the first version claimed and did not do: poll
-	// failures used a hard-coded second, so a caller that lengthened this to calm
-	// a flapping link still hammered the poll endpoint.
+	// It governs BOTH registration and poll failures, so a caller lengthening it
+	// to calm a flapping link is not left hammering the poll endpoint.
 	Backoff time.Duration
+}
+
+// registration is what this node tells the control plane about itself.
+//
+// Built in one place so the first registration and every re-registration after a
+// reconnect describe the same machine. A drain re-registers too, and a node that
+// came back claiming different capacity would move the fleet's arithmetic
+// underneath work it is still holding.
+func (o LoopOptions) registration() Registration {
+	return Registration{
+		Provider:   o.Provider,
+		GuestOS:    o.GuestOS,
+		Deployment: o.Deployment,
+		Site:       o.Site,
+		VCPU:       o.VCPU,
+		Memory:     o.Memory,
+	}
 }
 
 // pollBackoff is how long to wait after a failed poll.
@@ -122,32 +159,16 @@ func Run(ctx context.Context, c *Client, compute Compute, opts LoopOptions) erro
 
 	// STARTED ONCE, AFTER THE FIRST SUCCESSFUL REGISTRATION, and stopped with Run.
 	//
-	// Custody outlives any single registration: a lease the runner is holding
-	// because it could not confirm a container gone must keep being renewed while
-	// the node re-registers, reconnects, or waits out a control plane that is
-	// restarting. Tying the janitor to each registration would stop renewing
-	// exactly when the connection is least reliable, which is when custody is most
-	// likely to exist.
+	// Custody outlives any single registration: a lease held because a container could
+	// not be confirmed gone must keep being renewed while the node re-registers or waits
+	// out a restarting control plane. But it cannot start BEFORE the first one either —
+	// the janitor reads the lease TTL to pick its cadence, and starting first means
+	// reading a zero and renewing on a one-second fallback forever.
 	//
-	// But it cannot start BEFORE the first one either, which is where it began.
-	// The janitor reads the lease TTL to pick its cadence, and that value is
-	// learned during registration — starting first meant reading a zero and
-	// renewing on a one-second fallback for the process's whole life, while
-	// racing the write that would have told it the truth.
-	//
-	// AND IT DOES NOT INHERIT THE CALLER'S CANCELLATION, which is what makes the
-	// drain mean anything at all.
-	//
-	// This was a child of ctx, so the first signal stopped KeepAlive at the exact
-	// moment stopGracefully began waiting on the compute those leases back. The
-	// node would sit there holding containers whose leases nothing was renewing,
-	// the reaper would expire them, and another tier could escrow the same
-	// capacity while the container was still on this host — the double admission
-	// the whole escrow exists to prevent, arrived at through the code meant to
-	// protect the work.
-	//
-	// Cancelled when Run RETURNS instead, by the defer below, so a node that stops
-	// because it was refused still leaves no goroutine heartbeating behind it.
+	// AND IT DOES NOT INHERIT THE CALLER'S CANCELLATION, which is what makes the drain
+	// mean anything: as a child of ctx it would stop renewing at the exact moment the
+	// drain began waiting on that compute, and another tier could escrow capacity while
+	// the container was still here. Cancelled when Run RETURNS instead.
 	janitorCtx, stopJanitor := context.WithCancel(context.WithoutCancel(ctx))
 
 	var (
@@ -178,8 +199,42 @@ func Run(ctx context.Context, c *Client, compute Compute, opts LoopOptions) erro
 		})
 	}
 
+	err := register(ctx, c, compute, log, opts, backoff, startJanitor)
+
+	// ONE PLACE DECIDES THAT A STOP MEANS A DRAIN, and it is here because there
+	// are five ways out of the loop below and only one of them used to.
+	//
+	// A node notices its context has ended wherever it happens to be: inside the
+	// registration call, inside a backoff after one failed, inside the backoff
+	// after Recover failed, inside serve, or in the backoff after serve returned
+	// something else. Only the serve path drained, and the rest are not idle
+	// states — the ordinary route into them is a control plane restarting, which
+	// leaves a node with containers running and a registration it cannot renew.
+	// Stopping there renewed nothing, so the reaper reclaimed those leases at the
+	// TTL and the capacity was sold to a second job while the first still ran.
+	//
+	// Draining when the node is holding nothing costs nothing: stopGracefully
+	// returns immediately.
+	if ctx.Err() != nil {
+		return stopGracefully(ctx, c, compute, log, opts)
+	}
+
+	return err
+}
+
+// register keeps this node registered and serving until its context ends or it
+// meets something no retry can fix.
+func register(
+	ctx context.Context,
+	c *Client,
+	compute Compute,
+	log *slog.Logger,
+	opts LoopOptions,
+	backoff time.Duration,
+	startJanitor func(),
+) error {
 	for {
-		if err := c.Register(ctx, opts.Provider, opts.GuestOS, opts.Deployment); err != nil {
+		if err := c.Register(ctx, opts.registration()); err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
@@ -226,7 +281,7 @@ func Run(ctx context.Context, c *Client, compute Compute, opts LoopOptions) erro
 
 		err := serve(ctx, c, compute, log, opts, false)
 		if ctx.Err() != nil {
-			return stopGracefully(ctx, c, compute, log, opts)
+			return ctx.Err()
 		}
 
 		// SUPERSEDED IS NOT SOMETHING TO RETRY, and re-registering is the specific
@@ -237,12 +292,12 @@ func Run(ctx context.Context, c *Client, compute Compute, opts LoopOptions) erro
 		// bundle copied to both, or the same node.name in two files — and an
 		// operator has to fix it.
 		//
-		// STOPPING IMMEDIATELY IS ALSO WRONG, and that was the first version. This
-		// process may be holding compute right now; the control plane keeps its
-		// heartbeat and its result routes open precisely so it can finish. Exiting
-		// cancels the janitor, and the replacement cannot adopt what it cannot see
-		// — the container is on this machine — so the lease is renewed by nobody
-		// and its capacity is resold under a running job.
+		// STOPPING IMMEDIATELY IS ALSO WRONG. This process may be holding compute
+		// right now, and the control plane keeps its heartbeat and result routes
+		// open precisely so it can finish. Exiting cancels the janitor, and the
+		// replacement cannot adopt what it cannot see — the container is on this
+		// machine — so the lease is renewed by nobody and its capacity is resold
+		// under a running job.
 		if errors.Is(err, ErrSuperseded) {
 			drain(ctx, compute, log, opts)
 
@@ -346,8 +401,8 @@ func stopGracefully(ctx context.Context, c *Client, compute Compute, log *slog.L
 	log.Info("draining: not taking new work, waiting for the compute already running here",
 		"grace", grace)
 
-	// IT KEEPS ANSWERING THE CONTROL PLANE, and the first version did not — which
-	// made the drain useless in the ordinary case.
+	// IT KEEPS ANSWERING THE CONTROL PLANE, without which the drain is useless in
+	// the ordinary case.
 	//
 	// Tend advances CUSTODY: work this node adopted or could not account for. A
 	// job running normally is not custody, and what removes it is a Destroy, which
@@ -386,7 +441,7 @@ func stopGracefully(ctx context.Context, c *Client, compute Compute, log *slog.L
 				log.Warn("the control plane no longer knows this node; registering again " +
 					"so it can still be told to destroy what is running here")
 
-				if err := c.Register(drainCtx, opts.Provider, opts.GuestOS, opts.Deployment); err != nil {
+				if err := c.Register(drainCtx, opts.registration()); err != nil {
 					log.Error("could not register again while draining", "error", err)
 
 					if !sleep(drainCtx, backoffFor(opts)) {
@@ -463,6 +518,48 @@ func waitForHolding(ctx context.Context, compute Compute, log *slog.Logger, opts
 	return true
 }
 
+// renewIfDue replaces this node's certificate before it expires.
+//
+// BEST EFFORT, AND QUIET WHEN IT FAILS. The window is a third of the
+// certificate's remaining life — months, not hours — so a control plane that is
+// down for a week costs nothing but a retry on the next pass. Making a renewal
+// failure fatal would take a node out of the fleet over something it has ample
+// time to do later.
+//
+// It is loud when it SUCCEEDS, because a certificate changing under a running
+// host is exactly the kind of thing an operator wants in the log when they are
+// working out why a fingerprint moved.
+func renewIfDue(ctx context.Context, c *Client, log *slog.Logger, opts LoopOptions) {
+	if opts.Identity == nil {
+		return
+	}
+
+	left, due := wirecert.RenewalDue(opts.Identity.Leaf())
+	if !due {
+		return
+	}
+
+	certPEM, keyPEM, caPEM, err := c.Renew(ctx, c.node)
+	if err != nil {
+		log.Warn("could not renew this node's certificate; will try again",
+			"expires_in", left.Round(time.Hour), "error", err)
+
+		return
+	}
+
+	if err := opts.Identity.Replace(certPEM, keyPEM, caPEM); err != nil {
+		// The OLD certificate is still in force: Replace verifies before it
+		// installs, so a bad renewal leaves a working node working.
+		log.Error("the control plane signed a certificate this node cannot use; keeping the "+
+			"current one", "expires_in", left.Round(time.Hour), "error", err)
+
+		return
+	}
+
+	log.Info("renewed this node's certificate",
+		"not_after", opts.Identity.Leaf().NotAfter)
+}
+
 // serve polls for commands until something needs the caller to re-register.
 func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, opts LoopOptions, draining bool) error {
 	sweepAt := time.Now().Add(opts.SweepEvery)
@@ -471,6 +568,11 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+
+		// ON THE SAME PASS AS THE SWEEP, so renewal needs no clock of its own. The
+		// window is a third of the certificate's life, so a node that polls at all
+		// in that time renews; one that does not is not running anyway.
+		renewIfDue(ctx, c, log, opts)
 
 		if opts.SweepEvery > 0 && time.Now().After(sweepAt) {
 			if err := compute.Sweep(ctx); err != nil {
@@ -516,29 +618,15 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 		res := execute(ctx, compute, cmd, draining)
 
 		if err := c.Report(ctx, res); err != nil {
-			// THE WORK IS DONE AND THE ANSWER DID NOT LAND, and that is not merely
-			// survivable — it has to be MADE survivable here, because the control
-			// plane's safe assumption and the node's belief would otherwise
-			// disagree in the one direction that leaks.
+			// THE WORK IS DONE AND THE ANSWER DID NOT LAND. The report was lost and the
+			// plane timed the command out, or it arrived late and was answered with
+			// ErrCustody — either way the plane has stopped heartbeating the lease while
+			// the node holds the instance in its ordinary running set, which nothing
+			// renews. The lease is then reaped while the container runs and its capacity
+			// is sold twice, so the party that failed to report takes custody.
 			//
-			// Two ways to arrive, one answer. The report may have been LOST, in
-			// which case the plane timed the command out and assumed custody. Or it
-			// may have ARRIVED TOO LATE and been answered with ErrCustody, which is
-			// the plane saying the same thing out loud: it already told the listener
-			// to stop heartbeating, so the lease is the node's now. A late success
-			// used to be answered with a shrug, which left the container running
-			// under a lease nobody renewed at all.
-			//
-			// The plane times the command out and reports custody, so it stops
-			// heartbeating the lease. The node, having launched successfully, holds
-			// the instance in its ordinary running set, which nothing renews. The
-			// lease is then reaped while the container runs and its capacity is
-			// sold twice. So the party that failed to report takes custody: the
-			// handoff is caused rather than hoped for.
-			//
-			// Done before the ErrUnregistered check on purpose. Being unknown to
-			// the control plane is exactly when custody matters most, and returning
-			// first would skip it.
+			// Done before the ErrUnregistered check on purpose: being unknown to the
+			// control plane is when custody matters most, and returning first would skip it.
 			if res.OK && cmd.Kind == nodeapi.CommandLaunch && cmd.Lease != nil {
 				// A FAILURE HERE IS RENEWAL FAILING, NOT CUSTODY FAILING. The
 				// runner records the lease before it tries to renew it, precisely
@@ -601,7 +689,7 @@ func execute(ctx context.Context, compute Compute, cmd nodeapi.Command, draining
 			return res
 		}
 
-		err := compute.Launch(ctx, cmd.Lease, server.Job{
+		err := compute.Launch(ctx, cmd.Lease, cmd.Tier, server.Job{
 			RequestID: cmd.Job.RequestID,
 			RunID:     cmd.Job.RunID,
 			Event:     cmd.Job.Event,

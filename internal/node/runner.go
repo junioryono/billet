@@ -17,7 +17,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
-	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/provider"
 	"github.com/junioryono/billet/internal/server"
 )
@@ -122,9 +122,6 @@ type Runner struct {
 	// row in the nodes table rather than being decorative.
 	node string
 
-	// tiers is the catalog, so a lease's tier can be turned into a machine shape.
-	tiers map[string]config.Tier
-
 	mu sync.Mutex
 	// runningLease is the lease each running request holds, kept because renewing
 	// or releasing one needs its epoch and the instance name carries only the id.
@@ -144,7 +141,6 @@ type Runner struct {
 // quickly is better logged than waited for.
 const strayCleanupTimeout = 30 * time.Second
 
-// New builds a runner over a provider.
 // Option configures a Runner.
 type Option func(*Runner)
 
@@ -161,17 +157,13 @@ func WithMaxCustody(d time.Duration) Option {
 	return func(r *Runner) { r.maxCustody = d }
 }
 
+// New builds a runner over a provider.
 func New(
 	a LeaseStore, node string, jit JITSource, p provider.Provider,
-	tiers []config.Tier, log *slog.Logger, opts ...Option,
+	log *slog.Logger, opts ...Option,
 ) *Runner {
 	if log == nil {
 		log = slog.Default()
-	}
-
-	byLabel := make(map[string]config.Tier, len(tiers))
-	for i := range tiers {
-		byLabel[tiers[i].Label] = tiers[i]
 	}
 
 	r := &Runner{
@@ -185,7 +177,6 @@ func New(
 
 		maxCustody:   DefaultMaxCustody,
 		log:          log,
-		tiers:        byLabel,
 		running:      make(map[int64]*provider.Instance),
 		runningLease: make(map[int64]*alloc.Lease),
 		sets:         make(map[string]int),
@@ -198,13 +189,16 @@ func New(
 	return r
 }
 
-var _ server.Runner = (*Runner)(nil)
-
 // Launch mints a registration and starts something that will consume it.
-func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job Job) error {
-	tier, ok := r.tiers[lease.Tier]
-	if !ok {
-		return fmt.Errorf("node: no tier named %q in the catalog", lease.Tier)
+func (r *Runner) Launch(
+	ctx context.Context, lease *alloc.Lease, tier *nodeapi.TierSpec, job Job,
+) error {
+	// SENT BY THE CONTROL PLANE, not read from a file here. A node with its own
+	// catalogue needed it to agree with the server's, and a drifted `image:` ran
+	// the wrong image with nothing reporting it.
+	if tier == nil {
+		return fmt.Errorf("node: the launch for lease %s carried no tier shape; this node and "+
+			"its control plane are not speaking the same protocol version", lease.ID)
 	}
 
 	// THE LEASE'S OWN LIST, NOT THE LIVE CATALOGUE.
@@ -226,18 +220,16 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job Job) error 
 			lease.ID, lease.Providers, r.provider.Kind())
 	}
 
-	// ASKED BEFORE ANYTHING IRREVERSIBLE HAPPENS.
+	// ASKED BEFORE ANYTHING IRREVERSIBLE HAPPENS. Minting the registration first and
+	// being refused afterwards leaves a runner registered on GitHub with nothing to
+	// consume it — one orphan per pull request, since every PR is refused by a
+	// container backend, accumulating until somebody notices the runner list.
 	//
-	// Minting the registration first and being refused afterwards leaves a runner
-	// registered on GitHub with nothing to consume it — and since every pull
-	// request is refused by a container backend, that is one orphan per PR,
-	// accumulating quietly until somebody notices the runner list.
-	// ALREADY RUNNING SOMEWHERE. A crash before an assignment is acknowledged
-	// means GitHub redelivers it, and the restarted listener has empty maps — so
-	// without this it escrows a second lease and starts a second container for a
-	// job the adopted one is still running. The extra runner is a live
-	// registration that can pick up unrelated work, and the original's completion
-	// may then destroy it.
+	// ALREADY RUNNING SOMEWHERE. A crash before an assignment is acknowledged means
+	// GitHub redelivers it, and the restarted listener has empty maps — so without
+	// this it escrows a second lease and starts a second container for a job the
+	// adopted one is still running. The extra runner is a live registration that can
+	// pick up unrelated work, and the original's completion may then destroy it.
 	//
 	// An ordinary error, deliberately, not ErrCustody: the caller must release the
 	// lease it just took, because the capacity for this job is already held by the
@@ -358,29 +350,19 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job Job) error 
 		// What actually starts the runner. Backends refuse an empty command
 		// because a container image's default is a shell, which exits at once and
 		// leaves the job queued while every signal says the launch worked.
-		Command: tier.RunnerCommand(),
+		Command: tier.Command,
 	})
 	if err != nil {
-		// A LAUNCH ERROR IS NOT PROOF NOTHING STARTED.
+		// A LAUNCH ERROR IS NOT PROOF NOTHING STARTED. A cancelled context can kill the CLI
+		// after the daemon accepted the create; a remote API can commit and lose the
+		// response. The error says the caller does not KNOW.
 		//
-		// A cancelled context can kill the CLI after the daemon accepted the create;
-		// a remote API can commit and lose the response. The error says the caller
-		// does not KNOW, which is not the same as knowing there is nothing there —
-		// and the difference is a container running a job nobody will ever collect,
-		// holding a runner registration nobody will ever delete.
+		// So ask, and destroy whatever is found rather than adopting it: the lease is about
+		// to be failed, so an instance for it has no future.
 		//
-		// So ask. Whatever is found is destroyed rather than adopted: the lease is
-		// about to be failed, so an instance for it has no future, and an adopted
-		// half-started instance is a worse thing to own than a clean failure.
-		// If the stray could not be confirmed gone, the LEASE STAYS HELD. Returning
-		// an ordinary error here made the listener release the capacity while a
-		// container might still be running on it, which is the over-commitment this
-		// whole subsystem exists to prevent — arrived at by treating "the launch
-		// failed" as "nothing is using the host".
-		// CUSTODY UNLESS THE CLEANUP WAS CAUSAL. A successful Destroy proves the
-		// compute is gone; anything else — an error, or simply not finding it —
-		// does not, because the daemon may still be acting on a create whose
-		// response was lost.
+		// If the stray could not be confirmed gone the LEASE STAYS HELD — releasing it would
+		// hand back capacity a container may still be using. CUSTODY UNLESS THE CLEANUP WAS
+		// CAUSAL: a successful Destroy proves the compute is gone, and nothing else does.
 		if confirmed, cleanupErr := r.destroyStray(ctx, name); !confirmed {
 			r.hold(lease, name, job.RequestID)
 
@@ -411,23 +393,19 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job Job) error 
 // Idempotent: a request nothing was started for is success, because this runs on
 // redelivered completions, on shutdown, and after a failure.
 func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
-	// BOTH ARE ATTEMPTED, whatever either of them does. A request can have compute
-	// in the running map AND a custody entry — a redelivered assignment after a
-	// crash produces exactly that — and returning on the first error left the
-	// other half running while the listener, which treats this error as
-	// non-fatal, acknowledged the completion. Nothing ever came back for it.
+	// BOTH ARE ATTEMPTED, whatever either of them does. A request can have compute in
+	// the running map AND a custody entry — a redelivered assignment after a crash
+	// produces exactly that — and returning on the first error leaves the other half
+	// running while the listener, which treats this error as non-fatal, acknowledges
+	// the completion.
 	//
-	// THE CUSTODY FAILURE IS NOT RETURNED, and joining it was the mistake that
-	// replaced. The caller is a listener that reads any error as "the compute for
-	// MY lease may still exist" and therefore keeps its lease and heartbeats it —
-	// so a custody-only failure stranded a lease whose compute had just been
-	// destroyed successfully, permanently, until shutdown.
-	//
-	// Custody does not need the listener's help: its entry holds its own lease,
-	// which holds its own capacity, and Tend retries it every tick. What the
-	// listener needs to know is only whether ITS compute is gone. So the custody
-	// failure is logged here, where the context is, and the return value speaks
-	// for the running half alone.
+	// THE CUSTODY FAILURE IS NOT RETURNED. The caller is a listener that reads any
+	// error as "the compute for MY lease may still exist" and therefore keeps its
+	// lease and heartbeats it, so a custody-only failure would strand a lease whose
+	// compute had just been destroyed successfully. Custody does not need the
+	// listener's help: its entry holds its own lease, and Tend retries it every tick.
+	// So it is logged here, where the context is, and the return value speaks for the
+	// running half alone.
 	if err := r.releaseRequest(ctx, requestID); err != nil {
 		r.log.Error("could not finish releasing compute billet was holding for a finished job; "+
 			"its lease still holds the capacity and the next sweep will retry",
@@ -498,15 +476,11 @@ func (r *Runner) destroyStray(ctx context.Context, name string) (bool, error) {
 // Recover decides what to do with compute an earlier run left behind, once, at
 // startup and before any listener opens a session.
 //
-// IT DOES NOT DESTROY EVERYTHING, and the previous version's argument for doing
-// so was wrong on a point of fact. I claimed a killed job would simply be
-// requeued by GitHub. The scale-set documentation says reassignment happens when
-// a job is assigned to a scale set "but not acquired by a runner in time" — it
-// says nothing about a job a runner has already started, and there is no
-// evidence GitHub transparently retries that. Force-killing a container running
-// a twenty-minute job is therefore a deliberate job failure, not a recovery, and
-// the fact that a graceful shutdown also kills jobs does not make doing it after
-// an unrelated controller crash acceptable.
+// IT DOES NOT DESTROY EVERYTHING. GitHub does not transparently retry a job a
+// runner has already started: the scale-set documentation describes reassignment
+// only for a job "not acquired by a runner in time". Force-killing a container
+// running a twenty-minute job is therefore a deliberate job failure, not a
+// recovery.
 //
 // So a surviving container whose lease is still open is ADOPTED. Billet cannot
 // manage it — the request-id mapping and completion handling died with the last
@@ -626,13 +600,12 @@ func (r *Runner) takeCustody(ctx context.Context, lease *alloc.Lease, inst *prov
 	// RECORDED FIRST, RENEWED SECOND, and the order is the whole correctness of
 	// custody across a network.
 	//
-	// It used to heartbeat first and adopt only on success, which meant a renewal
-	// that failed left NOTHING holding the lease. That is survivable in-process,
-	// where the failure is a database blip and the caller still has the lease.
-	// Over a wire it is the common case: the same outage that lost the launch
-	// report loses this heartbeat too, and a node that has just been forgotten by
-	// a restarted control plane will have it refused outright — which is exactly
-	// the situation custody exists for.
+	// Heartbeating first and adopting only on success would leave NOTHING holding
+	// the lease when a renewal fails. That is survivable in-process, where the
+	// failure is a database blip and the caller still has the lease. Over a wire
+	// it is the common case: the same outage that lost the launch report loses
+	// this heartbeat too, and a node just forgotten by a restarted control plane
+	// has it refused outright — exactly the situation custody exists for.
 	//
 	// Recording locally first means the janitor OWNS the lease from this moment
 	// and keeps retrying renewal on its own clock. A fenced or missing lease is
@@ -691,9 +664,8 @@ func (r *Runner) AssumeCustody(ctx context.Context, lease *alloc.Lease, requestI
 // path guarantees: Bind and Advance(launching) both commit BEFORE the provider
 // is asked to create anything. So an instance that appears in the list already
 // has a lease at launching or beyond, and a sweep cannot see compute whose lease
-// has not yet been written. (I had this backwards when Recover was written, and
-// argued a sweep would race a starting job. It cannot — the list is taken first,
-// so anything in it predates the query that judges it.)
+// has not yet been written. It cannot race a starting job either — the list is
+// taken first, so anything in it predates the query that judges it.
 func (r *Runner) Sweep(ctx context.Context) error {
 	instances, err := r.provider.List(ctx)
 	if err != nil {
@@ -779,7 +751,7 @@ func (r *Runner) forgetScaleSet(tier string) {
 }
 
 // scaleSetID resolves a tier's scale set, once.
-func (r *Runner) scaleSetID(ctx context.Context, tier config.Tier) (int, error) {
+func (r *Runner) scaleSetID(ctx context.Context, tier *nodeapi.TierSpec) (int, error) {
 	r.mu.Lock()
 	id, cached := r.sets[tier.Label]
 	r.mu.Unlock()

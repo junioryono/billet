@@ -21,39 +21,24 @@ import (
 
 // notDrainingHere is the drain grace for tests that are NOT about draining.
 //
-// Cancelling with a job still running now means a drain: the listener waits for
-// a completion before tearing anything down. These fake sessions were written
-// before the drain existed and never send one, so on the real six-hour default
-// they would wait it out — which is the drain working correctly, since the job
-// genuinely is still running.
-//
-// A test about escrow, acquisition or teardown says here that it is not testing
-// the drain. Shortening the drain for everybody to keep them passing would be
-// the wrong fix, and would quietly delete the behaviour from production.
+// Cancelling with a job still running means a drain, and these fake sessions never
+// send a completion, so on the six-hour default they would wait it out. Shortening
+// the drain for everybody to keep them passing would delete the behaviour from
+// production instead.
 const notDrainingHere = 50 * time.Millisecond
 
 // tierVCPU is the size of every tier in these tests. One number, so the capacity
 // arithmetic in the assertions can be read without cross-referencing.
 const tierVCPU = 4
 
-// THE invariant of the listener plane, and the reason the allocator exists.
+// THE invariant of the listener plane, and the reason the allocator exists: the sum
+// of what every listener has advertised to GitHub at any instant never exceeds the
+// global budget.
 //
-// **The sum of what every listener has advertised to GitHub at any instant never
-// exceeds the global budget.**
-//
-// Each tier is its own scale set with its own `maxCapacity`, sent on every
-// long-poll as X-ScaleSetMaxCapacity. If each listener computed its own maximum
-// from its own tier's headroom, GitHub could fill all of them at once: three
-// tiers each advertising "I can take 10" on a host with room for 12 is a promise
-// billet cannot keep, and GitHub has already assigned the jobs by the time
-// anyone notices. Reserving on ASSIGNMENT is too late for the same reason.
-//
-// So capacity is escrowed BEFORE it is advertised, and a listener may only
-// advertise what the escrow actually returned. This test drives several
-// listeners at once against one allocator and watches what they advertise.
-//
-// It is written against a fake session rather than GitHub because the property
-// is about billet's arithmetic, not about the wire protocol.
+// Each tier is its own scale set with its own `maxCapacity`, so listeners computing
+// their own maximum would let GitHub fill all of them at once. Reserving on
+// ASSIGNMENT is too late. Capacity is escrowed BEFORE it is advertised, and this
+// drives several listeners against one allocator to watch what they advertise.
 func TestAdvertisedCapacityNeverExceedsTheBudget(t *testing.T) {
 	const (
 		budget  = 12       // vCPU
@@ -134,6 +119,19 @@ func TestAdvertisedCapacityNeverExceedsTheBudget(t *testing.T) {
 		t.Fatal("no listener ever polled; this test proves nothing")
 	}
 
+	// ZERO SATISFIES "NEVER EXCEEDS", WHICH IS WHY THIS IS HERE.
+	//
+	// The assertion below is one-sided: a billet that advertised nothing at all
+	// would pass it perfectly. That was harmless while capacity came from a config
+	// number, because there was no way to reach zero by accident. It stopped being
+	// harmless the moment capacity came from a FLEET — a deployment with no
+	// registered host now correctly advertises zero, so this test would have gone
+	// on passing while proving nothing about the invariant it is named for.
+	if peak == 0 {
+		t.Fatal("no listener ever advertised anything, so the ceiling below was never " +
+			"exercised; the fleet these listeners run on can hold nothing")
+	}
+
 	// vCPU, not runner count: the budget is a vector and this is the axis the
 	// tiers here contend on.
 	if got := peak * perTier; got > budget {
@@ -197,22 +195,14 @@ func TestAdvertisingNothingAlsoRefusesWork(t *testing.T) {
 	}
 }
 
-// tier builds a catalog entry. Every tier here is 4 vCPU so the arithmetic in
-// the capacity assertions stays legible; the parameter exists so a test that
-// needs an uneven catalog does not have to rewrite this.
-//
 // AVAILABLE is what gets acquired; ASSIGNED is what consumes escrow.
 //
-// This was wrong, and the comment explaining why it was right was wrong too:
-// JobAvailable was dropped in translation as "pre-assignment noise" and
-// AcquireJobs was called with the ids from JobAssigned. Available is the OFFER —
-// it is the message whose RunnerRequestID claims work. Assigned is the later
-// confirmation that a claim succeeded. Acquiring from Assigned asks GitHub to
-// claim work it has already handed over, while every actual offer goes on the
-// floor, so the scale set advertises capacity and never takes a job.
-//
-// It compiled, the tests passed, and it would have failed on first contact with
-// a real organization in a way that looks like "GitHub never sends us work".
+// Available is the OFFER — the message whose RunnerRequestID claims work.
+// Assigned is the later confirmation that a claim succeeded. Acquiring from
+// Assigned asks GitHub to claim work it has already handed over while every
+// actual offer goes on the floor, so the scale set advertises capacity and never
+// takes a job. That compiles and passes, and fails on first contact with a real
+// organization in a way that looks like "GitHub never sends us work".
 func TestAvailableIsAcquiredAndAssignedConsumesEscrow(t *testing.T) {
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
 
@@ -251,16 +241,10 @@ func TestAvailableIsAcquiredAndAssignedConsumesEscrow(t *testing.T) {
 	// asserted after Run returns would see zero either way and prove nothing.
 	var running atomic.Int32
 
-	// STOPS ON THE CONDITION, NOT ON A STOPWATCH. This used to sleep 150ms and
-	// then cancel, which is a bet that a machine running fourteen instrumented
-	// test binaries in parallel gets through an acquire, an assign and a launch in
-	// that window. It usually does, and when it does not the failure reads as a
-	// listener that acquired nothing — a real-looking bug that is only a slow
-	// scheduler.
-	//
-	// The listener has done what this test is about once a poll observes the
-	// running lease; anything after that is the shutdown path, which is a
-	// different test.
+	// STOPS ON THE CONDITION, NOT ON A STOPWATCH. Sleeping and then cancelling is a bet
+	// that a machine running fourteen instrumented test binaries gets through an
+	// acquire, an assign and a launch in that window; when it loses, the failure reads
+	// as a listener that acquired nothing.
 	stop := sync.OnceFunc(cancel)
 
 	session.onPoll = func(int) {
@@ -429,6 +413,8 @@ func TestSessionStatisticsAreObserved(t *testing.T) {
 	}
 }
 
+// tier builds a catalog entry. Every tier here is 4 vCPU so the arithmetic in the
+// capacity assertions stays legible.
 func tier(label string) config.Tier {
 	const vcpu = tierVCPU
 
@@ -461,9 +447,41 @@ func newAllocator(t *testing.T, limits alloc.Limits, tiers []config.Tier,
 ) *alloc.Allocator {
 	t.Helper()
 
-	db := openState(t)
+	a := newBareAllocator(t, limits, tiers, opts...)
 
-	a, err := alloc.New(db, limits, tiers, opts...)
+	// A HOST, BECAUSE CAPACITY IS PER MACHINE NOW. A deployment with no
+	// registered node can place nothing, so every tier advertises zero — correct,
+	// and it would also turn this package's tests into assertions about an empty
+	// fleet rather than about the listener.
+	//
+	// Larger than any budget these tests set, so the deployment ceiling stays the
+	// binding constraint and each test measures what it was written to measure. A
+	// test about the FLEET registers its own machines.
+	for _, provider := range []config.ProviderKind{
+		config.ProviderDocker, config.ProviderFirecracker, config.ProviderTart,
+	} {
+		if _, err := a.RegisterNode(t.Context(), alloc.NodeRegistration{
+			Name:     "test-host-" + string(provider),
+			Provider: provider,
+			VCPU:     1 << 20,
+			Memory:   1 << 20 * config.GiB,
+		}); err != nil {
+			t.Fatalf("registering the default host: %v", err)
+		}
+	}
+
+	return a
+}
+
+// newBareAllocator is an allocator with NO hosts, for a test that declares its
+// own fleet — which is now part of the setup rather than an implementation
+// detail.
+func newBareAllocator(t *testing.T, limits alloc.Limits, tiers []config.Tier,
+	opts ...alloc.Option,
+) *alloc.Allocator {
+	t.Helper()
+
+	a, err := alloc.New(openState(t), limits, tiers, opts...)
 	if err != nil {
 		t.Fatalf("alloc.New: %v", err)
 	}
@@ -471,41 +489,25 @@ func newAllocator(t *testing.T, limits alloc.Limits, tiers []config.Tier,
 	return a
 }
 
-// A poll that lasts longer than the lease TTL must not cost the listener its
-// escrow.
+// A poll that lasts longer than the lease TTL must not cost the listener its escrow.
 //
 // This is the failure that made heartbeats independent. A long poll is nominally
-// ~50 seconds against a 90 second TTL, which reads like ample margin. Measured
-// against a real organization, the first poll ever made ran ~88 seconds — but the
-// vendor's HTTP client permits a request to run for minutes once slow responses
-// and retries are counted, and heartbeats that happen only BETWEEN polls stop for
-// as long as one poll lasts. The reaper then terminalises the leases, another
-// tier escrows the capacity, and the poll returns an assignment backed by a lease
-// this listener no longer holds.
+// ~50 seconds against a 90 second TTL; measured against a real organization the
+// first one ran ~88 seconds, and the vendor's HTTP client permits minutes once
+// retries are counted. Heartbeats that happen only BETWEEN polls stop for as long
+// as one lasts, the reaper terminalises the leases, and the poll returns an
+// assignment backed by a lease this listener no longer holds.
 func TestEscrowSurvivesAPollLongerThanTheLeaseTTL(t *testing.T) {
-	// Raised from 150ms, and the honest version of why: this test failed twice
-	// during full `make check` runs on a loaded machine and has never failed in
-	// isolation — including at -count=10 under ten competing test binaries, at
-	// BOTH constants. So the leading explanation is that renewal at ttl/3 fired
-	// every 50ms, the same order as goroutine scheduling jitter under load, and
-	// 600ms gives that four times the room.
-	//
-	// It is a hypothesis, not a demonstration. I could not reproduce the original
-	// failure on demand, so I cannot claim this constant fixes it — only that the
-	// margin it removes was the smallest one in the test. What is NOT in doubt is
-	// that production is unaffected either way: the TTL there is 90s and renewal
-	// has 60s of slack, so the RATIO was never the thing at risk. If this fails
-	// again, the next step is instrumenting the renewal goroutine's actual wakeup
-	// times rather than raising the constant a second time.
+	// Long enough that renewal at ttl/3 is not competing with goroutine scheduling
+	// jitter under a loaded `make check`: at 150ms it fired every 50ms and failed
+	// twice under full runs while never failing in isolation. Production is
+	// unaffected — 90s TTL with 60s of slack — so the ratio was never at risk.
 	const ttl = 600 * time.Millisecond
 
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
 
-	a, err := alloc.New(openState(t), alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
 		alloc.WithLeaseTTL(ttl))
-	if err != nil {
-		t.Fatalf("alloc.New: %v", err)
-	}
 
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	defer cancel()
@@ -548,17 +550,12 @@ func TestEscrowSurvivesAPollLongerThanTheLeaseTTL(t *testing.T) {
 
 			time.Sleep(5 * ttl)
 
-			// Checked HERE, not after Run returns: shutdown releases the escrow,
-			// so by then every lease is legitimately terminal and the assertion
-			// would fire against correct behaviour. This is the only moment that
-			// distinguishes "renewed through the long poll" from "reaped during
-			// it" — one poll later, and refillEscrow has already replaced them.
+			// Checked HERE, not after Run returns: shutdown releases the escrow, so by then
+			// every lease is legitimately terminal and the assertion would fire against correct
+			// behaviour. One poll later, refillEscrow has already replaced them.
 			//
-			// Identity, not count: a listener that loses its escrow re-escrows and
-			// ends up holding the same NUMBER of leases. Renewability of these
-			// specific leases is the property, and it is exactly what the listener
-			// needs to be true — a reaped lease is terminal, so heartbeating one
-			// reports ErrFenced or ErrLeaseNotFound.
+			// Identity, not count: a listener that loses its escrow re-escrows and holds the
+			// same NUMBER of leases. Renewability of these specific leases is the property.
 			var errs []error
 
 			for _, lease := range held {
@@ -596,16 +593,12 @@ func TestEscrowSurvivesAPollLongerThanTheLeaseTTL(t *testing.T) {
 
 // A backlog GitHub already assigned has to be SAID, not merely stored.
 //
-// The session's statistics were being copied into a field that nothing read,
-// which is indistinguishable from not collecting them. On a restart, GitHub goes
-// on believing this scale set is running jobs whose runners died with the
-// process. The ones no runner had picked up sit until the pickup deadline and
-// are then reassigned; the ones already running are not reassigned at all and
-// fail. From the outside billet looks like it silently dropped both.
-//
-// Recovering them needs a node runtime that can adopt a running instance, which
-// does not exist. Reporting them is what makes the gap visible rather than
-// mysterious, so that is what is tested.
+// On a restart, GitHub goes on believing this scale set is running jobs whose
+// runners died with the process. The ones no runner picked up sit until the
+// pickup deadline and are reassigned; the ones already running are not
+// reassigned at all and fail. Collecting the statistics into a field nothing
+// reads is indistinguishable from not collecting them, so reporting them is what
+// makes the gap visible rather than mysterious.
 func TestAnAlreadyAssignedBacklogIsReported(t *testing.T) {
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
 
@@ -759,15 +752,13 @@ func TestACompletionFreesTheSlotItsReplacementNeeds(t *testing.T) {
 
 // A redelivered batch must not consume a second lease for a job that is over.
 //
-// Billet acknowledges a message AFTER handling it — unlike the vendor's listener,
-// which deletes first and so handles everything at most once. Acking last means a
-// crash mid-handling redelivers rather than silently dropping a job, which is the
-// safer trade for capacity, but it only holds if every handler is idempotent.
+// billet acknowledges a message AFTER handling it, so a crash mid-handling
+// redelivers rather than silently dropping a job — safer for capacity, but only
+// while every handler is idempotent.
 //
 // `running` alone is not enough: complete() removes the entry, so on redelivery
-// the request looks brand new. That is not a contrived case — a batch carrying
-// Assigned and Completed for the SAME request is what an assigned-then-cancelled
-// job looks like, which GitHub does to a job no runner picks up in time.
+// the request looks brand new. A batch carrying Assigned and Completed for the
+// SAME request is what an assigned-then-cancelled job looks like.
 func TestARedeliveredCompletionDoesNotConsumeASecondLease(t *testing.T) {
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
 
@@ -842,16 +833,13 @@ func TestARedeliveredCompletionDoesNotConsumeASecondLease(t *testing.T) {
 		t.Fatalf("Run after redelivery: %v", err)
 	}
 
-	// Counted in job_history, NOT in open leases.
+	// Counted in job_history, NOT in open leases. Asserting no lease is left open
+	// proves nothing: shutdown releases running leases too, so a redelivery that
+	// consumed a second lease still ends at zero — which is what the first version of
+	// this test did, confirmed by mutation.
 	//
-	// Asserting that no lease is left open proves nothing here: shutdown releases
-	// running leases too, so a redelivery that consumed a second lease still ends
-	// at zero and the test passes against the bug it exists to catch. Confirmed by
-	// mutation — that is exactly what the first version of this test did.
-	//
-	// Every assignment writes a job_history row keyed by lease id, so a second
-	// lease for one request leaves a second row carrying the same request id.
-	// That evidence outlives the release.
+	// Every assignment writes a job_history row keyed by lease id, so a second lease
+	// for one request leaves a second row carrying the same request id.
 	var leases int
 
 	if err := db.Reader().QueryRowContext(t.Context(),
@@ -867,15 +855,11 @@ func TestARedeliveredCompletionDoesNotConsumeASecondLease(t *testing.T) {
 
 // One lease cannot back two promises.
 //
-// An acquisition is an obligation that lasts until the Assigned message arrives,
-// and capping acquisitions at an instantaneous count of free leases does not
-// model that. The lease stayed in `held` while the claim was in flight, so the
-// next batch's offer counted the very same lease as available and billet
-// promised GitHub two jobs it had capacity for one of.
-//
-// Consecutive offers are the clearest form: nothing about the second batch tells
-// the listener the first lease is already spoken for, unless the reservation is
-// recorded when the promise is made.
+// An acquisition is an obligation lasting until the Assigned message arrives, and
+// an instantaneous count of free leases does not model that: the lease stays in
+// `held` while the claim is in flight, so the next batch's offer counts the same
+// lease as available. Consecutive offers are the clearest form — nothing about the
+// second tells the listener the first lease is already spoken for.
 func TestOneLeaseCannotBackTwoAcquisitions(t *testing.T) {
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
 
@@ -972,15 +956,13 @@ func TestEscrowIsReturnedWhenAnOfferIsNotGranted(t *testing.T) {
 
 // An assignment with nothing behind it is declined, not fatal.
 //
-// This used to return an error, on the grounds that being assigned more than was
-// advertised is a protocol violation rather than a race billet can absorb. That
-// held when GitHub over-assigning was the only way to reach it. It is not any
-// more: billet's own escrow can vanish underneath an acquisition — the heartbeat
-// drops a fenced lease, a restart loses the promise — and a listener error takes
-// the whole control plane down, stranding every tier's capacity over one job.
+// Being assigned more than was advertised looks like a protocol violation, but
+// billet's own escrow can vanish underneath an acquisition — a heartbeat drops a
+// fenced lease, a restart loses the promise — and a listener error takes the whole
+// control plane down, stranding every tier's capacity over one job.
 //
-// The invariant that matters is preserved either way: nothing runs without
-// escrow. What changes is the blast radius.
+// The invariant is preserved either way: nothing runs without escrow. What changes
+// is the blast radius.
 func TestAnUnbackedAssignmentIsDeclinedRatherThanFatal(t *testing.T) {
 	tiers := []config.Tier{tier("billet-4vcpu-a"), tier("billet-4vcpu-b")}
 
@@ -1029,14 +1011,13 @@ func TestAnUnbackedAssignmentIsDeclinedRatherThanFatal(t *testing.T) {
 
 // A job cancelled before it was ever assigned still has to give its escrow back.
 //
-// GitHub cancels an assignment no runner picks up in time, and that cancellation
-// arrives as a completion — for a request billet acquired but was never given.
-// The lease sits in the promised state, which is neither free nor running, so a
-// completion path that only looks at running leaves it reserved for an
-// assignment that is never coming, until the reaper takes it.
+// GitHub cancels an assignment no runner picks up in time, and that arrives as a
+// completion for a request billet acquired but was never given. The lease sits in
+// the promised state, which is neither free nor running, so a completion path that
+// only looks at running leaves it reserved until the reaper takes it.
 //
-// The discriminating assertion is the NEXT offer: escrow that did not come back
-// is escrow the following request cannot use.
+// The discriminating assertion is the NEXT offer: escrow that did not come back is
+// escrow the following request cannot use.
 func TestACancelledOfferReturnsItsPromisedEscrow(t *testing.T) {
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
 
@@ -1106,18 +1087,14 @@ func TestACancelledOfferReturnsItsPromisedEscrow(t *testing.T) {
 
 // A promise that goes unclaimed is REPORTED and KEPT, never reclaimed.
 //
-// This asserts the reverse of what it originally did, and the reversal is the
-// point. Releasing the escrow when a promise aged out looked like the obvious
-// fix for a lease nothing else could reclaim — and it was wrong, because an
-// acquisition is a commitment made to GitHub that no local timer can revoke.
-// AcquireJobs is one-way: the session client has no decline or release endpoint,
-// and DeleteMessage acknowledges a notification rather than refusing a job. A
-// timed release therefore hands nothing back. It only means billet has forgotten
-// it owes a runner while GitHub still expects one, so the freed slot goes to
-// another tier and the assignment, when it comes, has nothing behind it.
+// An acquisition is a commitment made to GitHub that no local timer can revoke.
+// AcquireJobs is one-way — the session client has no decline or release endpoint,
+// and DeleteMessage acknowledges a notification rather than refusing a job — so a
+// timed release hands nothing back. It only means billet has forgotten it owes a
+// runner while GitHub still expects one, and the freed slot goes to another tier.
 //
-// Holding the lease is the lesser evil and the honest one: it is capacity billet
-// genuinely still owes. What resolves it is the session ending.
+// Holding the lease is the honest answer: it is capacity billet genuinely owes.
+// What resolves it is the session ending.
 func TestAStalePromiseIsReportedAndKept(t *testing.T) {
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
 
@@ -1288,20 +1265,17 @@ func (s *syncWriter) Write(p []byte) (int, error) {
 	return s.w.Write(p)
 }
 
-// A scale-set response that is not a subset of its request stops the listener,
-// and the reserved escrow is not left where the next offer can spend it.
+// A scale-set response that is not a subset of its request stops the listener, and
+// the reserved escrow is not left where the next offer can spend it.
 //
-// Logging and carrying on was not enough. Once a response contains an id nobody
-// offered for, billet cannot tell which remote commitments are real: the
-// unmatched id has no reservation, and a body wrong about that id may be wrong
-// about the others. Continuing means spending reserved leases on later offers
-// while GitHub may believe the original jobs are billet's.
+// Once a response contains an id nobody offered for, billet cannot tell which
+// remote commitments are real: the unmatched id has no reservation, and a body
+// wrong about that id may be wrong about the others.
 //
-// Deliberately harsher than an unbacked assignment, which declines and carries
-// on. That one is reachable by ordinary races, so stopping the control plane
-// over it is disproportionate. This one is not reachable by any race — it means
-// the API broke — and stopping is itself the remedy, because the session is
-// recreated and GitHub redelivers whatever was unacknowledged.
+// Deliberately harsher than an unbacked assignment, which declines and carries on.
+// That is reachable by ordinary races; this is not — it means the API broke — and
+// stopping is itself the remedy, because the session is recreated and GitHub
+// redelivers whatever was unacknowledged.
 func TestAnAcquisitionOutsideItsRequestStopsTheListener(t *testing.T) {
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
 

@@ -30,7 +30,13 @@ import (
 // A node and a server are separately deployed and WILL be different builds —
 // that is the point of splitting them — so the mismatch has to be a refusal with
 // a readable message rather than a decode error halfway through a launch.
-const Version = 1
+//
+// VERSION 2 ADDED THE CAPACITY A NODE CONTRIBUTES, and its site. A version 1
+// node reports neither, and a server that read the absent numbers as zero would
+// register a host nothing can ever be placed on — silently, because a node with
+// no capacity is indistinguishable from a busy one. Refusing the registration is
+// the correct outcome rather than an inconvenience, which is what this bump buys.
+const Version = 5
 
 // CommandKind names what the server is asking a node to do.
 type CommandKind string
@@ -71,6 +77,18 @@ type RegisterRequest struct {
 	// sending it lets the server refuse an obviously wrong pairing at
 	// registration instead of at the first launch.
 	GuestOS []config.GuestOS `json:"guest_os,omitempty"`
+	// Site is where this machine is, or empty in a deployment that has one place.
+	Site string `json:"site,omitempty"`
+	// VCPU and Memory are what this host CONTRIBUTES, which is what it detected
+	// unless its own config said otherwise.
+	//
+	// REPORTED BY THE HOST, NOT CONFIGURED CENTRALLY, for the same reason the
+	// provider is: the machine knows what it has and the person running it knows
+	// what it should give, while the control plane knows neither. Required — a
+	// registration carrying zero is refused, because a node that contributes
+	// nothing joins the fleet, is never chosen, and produces no error to find.
+	VCPU   int             `json:"vcpu"`
+	Memory config.ByteSize `json:"memory"`
 	// Deployment is the identity the node labels its compute with. Sent so the
 	// server can refuse a node that belongs to a different installation rather
 	// than accepting commands it will label unrecognisably.
@@ -94,6 +112,13 @@ type RegisterRequest struct {
 // RegisterResponse tells a node what it needs to behave correctly.
 type RegisterResponse struct {
 	Version int `json:"version"`
+	// Deployment is which installation answered.
+	//
+	// SO THE NODE CAN CHECK TOO. TLS already binds this — the node verifies the
+	// server against a per-deployment CA — but a node that never looks has no way
+	// to say WHICH installation it is working for, and "am I doing work for the
+	// right control plane" is a question an operator asks during an incident.
+	Deployment string `json:"deployment,omitempty"`
 	// LeaseTTLSeconds is how long a lease survives without a heartbeat. The node
 	// needs it to pick its own renewal cadence; it is NOT free to invent one,
 	// because the reaper on the other side is what enforces it.
@@ -130,6 +155,15 @@ type Command struct {
 	Lease *alloc.Lease `json:"lease,omitempty"`
 	Job   *Job         `json:"job,omitempty"`
 
+	// Tier is the shape of the machine to start, carried so a node needs no tier
+	// catalogue of its own.
+	//
+	// THE CONTROL PLANE IS THE ONE AUTHORITY ON WHAT A TIER IS. A node that read
+	// its own copy needed that copy to match the server's, and nothing checked:
+	// a missing tier refused the launch loudly, but a tier whose `image:` had
+	// drifted ran the WRONG image with no error anywhere.
+	Tier *TierSpec `json:"tier,omitempty"`
+
 	// RequestID is what a destroy names. Destroy is by request rather than by
 	// lease because it must work for compute whose lease is already gone.
 	RequestID int64 `json:"request_id,omitempty"`
@@ -147,6 +181,99 @@ func (c Command) RequestIDOf() int64 {
 	}
 
 	return c.RequestID
+}
+
+// TierSpec is everything about a tier a node needs to start an instance and to
+// mint a registration for it.
+//
+// Only the fields the lease does not already carry. vCPU, memory, guest OS and
+// the acceptable providers ride on the lease, which is the authority for them
+// precisely because it was snapshotted when the reservation was made.
+type TierSpec struct {
+	Label string `json:"label"`
+	Image string `json:"image"`
+	// Command starts the runner inside the instance. Empty means the image's
+	// stock entrypoint.
+	Command []string `json:"command,omitempty"`
+	// Disk and SHM size the instance. Zero means the backend's default.
+	Disk config.ByteSize `json:"disk,omitempty"`
+	SHM  config.ByteSize `json:"shm,omitempty"`
+	// RunnerGroup is part of a tier's ADDRESS: resolving a scale set without one
+	// silently means "the default group", so a tier deliberately placed elsewhere
+	// would have its registrations refused.
+	RunnerGroup string `json:"runner_group,omitempty"`
+}
+
+// TierSpecOf renders the parts of a tier that travel to a node.
+func TierSpecOf(t config.Tier) *TierSpec {
+	return &TierSpec{
+		Label:       t.Label,
+		Image:       t.Image,
+		Command:     t.RunnerCommand(),
+		Disk:        t.Disk,
+		SHM:         t.SHM,
+		RunnerGroup: t.RunnerGroup,
+	}
+}
+
+// EnrollRequest asks to join a deployment.
+//
+// UNAUTHENTICATED BY DESIGN: a machine that has never been enrolled has no
+// certificate to authenticate with. What makes it safe is that asking grants
+// nothing — the request sits as `pending` until an operator compares its
+// fingerprint against what the node printed and approves it.
+type EnrollRequest struct {
+	Node   string `json:"node"`
+	CSRPEM string `json:"csr_pem"`
+	// JoinToken is a short-lived credential from `billet ca token`.
+	//
+	// It admits nothing on its own — the request still waits for an operator to
+	// compare fingerprints — but without one this endpoint is open to anyone who
+	// can reach the port, who could then fill the pending list or take a name
+	// before the machine that should have it.
+	JoinToken string `json:"join_token"`
+}
+
+// EnrollResponse is the decision, or that there is not one yet.
+type EnrollResponse struct {
+	// State is pending, approved or denied.
+	State string `json:"state"`
+	// Fingerprint is what an operator has to compare, echoed so the node can
+	// print the same value the server will show.
+	Fingerprint string `json:"fingerprint"`
+	// CertPEM and CAPEM are set once approved.
+	CertPEM string `json:"cert_pem,omitempty"`
+	CAPEM   string `json:"ca_pem,omitempty"`
+}
+
+// CAResponse is the authority a node verifies the control plane against.
+//
+// SERVED UNAUTHENTICATED, and that is not a leak: a CA certificate is public by
+// construction — every node already has it and every TLS handshake presents the
+// chain. What matters is that the node checks the FINGERPRINT it was given out
+// of band before trusting what this returns.
+type CAResponse struct {
+	CAPEM       string `json:"ca_pem"`
+	Fingerprint string `json:"fingerprint"`
+	Deployment  string `json:"deployment"`
+}
+
+// RenewRequest asks the control plane to sign a new certificate for the node
+// that is already authenticated on this connection.
+//
+// A CSR RATHER THAN A REQUEST FOR A BUNDLE, so the private key never crosses the
+// wire: the node generates the key, keeps it, and asks only for a signature.
+type RenewRequest struct {
+	CSRPEM string `json:"csr_pem"`
+}
+
+// RenewResponse is the signed certificate and the authority that signed it.
+//
+// The CA travels too, because a node that renews across a CA rotation needs the
+// new authority to keep verifying the control plane it is talking to.
+type RenewResponse struct {
+	CertPEM string `json:"cert_pem"`
+	CAPEM   string `json:"ca_pem"`
 }
 
 // Job is the scale-set assignment a launch is for.

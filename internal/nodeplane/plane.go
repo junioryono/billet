@@ -12,6 +12,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -32,22 +34,18 @@ var ErrUnregistered = errors.New("nodeplane: node is not registered")
 
 // ErrRefused means a registration was understood and rejected on its merits.
 //
-// PERMANENT, AND THAT IS THE DISTINCTION THAT MATTERS. A node told this stops
-// rather than retrying, so it must never carry a failure that could heal. A
-// protocol version mismatch and a foreign deployment identity qualify: they will
-// be refused identically forever. A ledger that could not write the node row
-// does NOT — that is an outage, and a node that gave up on it would stay down
-// after the database came back.
+// PERMANENT, which is the distinction that matters: a node told this stops rather
+// than retrying, so it must never carry a failure that could heal. A version
+// mismatch and a foreign deployment qualify; a ledger that could not write the node
+// row does not — that is an outage.
 var ErrRefused = errors.New("nodeplane: registration refused")
 
 // ErrTakeCustody answers a result for a launch the plane stopped waiting for.
 //
-// THE REPORT IS NOT REJECTED, IT IS REDIRECTED. The node did the work and told
-// the truth; it is simply later than the command timeout, and by then the plane
-// had already told the listener that this lease was the node's. Answering 204
-// would leave the container running under a lease NOBODY renews — the listener
-// stopped because it was told custody, and the node never learned it had any.
-// The reaper resells that capacity a TTL later.
+// THE REPORT IS NOT REJECTED, IT IS REDIRECTED. The node did the work and told the
+// truth, just later than the command timeout — by which point the plane had told the
+// listener the lease was the node's. Answering 204 would leave the container running
+// under a lease NOBODY renews, and the reaper resells that capacity a TTL later.
 var ErrTakeCustody = errors.New("nodeplane: this launch's lease is now the node's to hold")
 
 // defaultCommandTimeout bounds how long a launch waits for a node to answer.
@@ -69,17 +67,13 @@ const defaultPollTimeout = 50 * time.Second
 type Plane struct {
 	// owners records which incarnation was given the launch for each lease.
 	//
-	// A SUPERSEDED PROCESS MAY MAINTAIN WHAT IT HOLDS AND NOTHING ELSE. Permitting
-	// every lease route by node name alone let a superseded host read the current
-	// one's leases and RELEASE them: same name, same certificate, and an epoch it
-	// could simply ask for. The capacity came back while a container was running.
+	// A SUPERSEDED PROCESS MAY MAINTAIN WHAT IT HOLDS AND NOTHING ELSE. Routing by node
+	// name alone lets a superseded host release the current one's leases — same name,
+	// same certificate — returning capacity while a container runs.
 	//
-	// HELD ON THE PLANE, NOT ON THE NODE RECORD, because the node record expires.
-	// A draining process outlives its replacement by design — that is the whole
-	// point of draining — so when the replacement went silent and the node was
-	// forgotten, the ownership went with it and the drain lost the right to renew
-	// its own lease. Liveness and ownership answer different questions and cannot
-	// share a lifetime.
+	// HELD ON THE PLANE, NOT THE NODE RECORD, which expires: a draining process outlives
+	// its replacement by design, so ownership tied to liveness would vanish exactly when
+	// the drain still needed to renew.
 	owners map[string]leaseOwner
 
 	log  *slog.Logger
@@ -100,6 +94,25 @@ type Plane struct {
 	// installation does not recognise, and the orphan sweeper would then find
 	// containers it cannot attribute.
 	deployment string
+
+	// sites are the places this deployment declares, or empty for a deployment
+	// that has not needed the distinction. See WithSites.
+	sites map[string]bool
+
+	// tiers is the deployment's catalogue and the ONE authority on what a tier
+	// is. The wire checks a JIT request against it, and a launch carries the
+	// shape a node needs so that no node keeps a copy of its own.
+	tiers map[string]config.Tier
+
+	// pendingGone holds hosts the plane has forgotten but the ledger has not been told
+	// about. Guarded by mu.
+	//
+	// A QUEUE RATHER THAN A RETURN VALUE, because expiry happens in places that cannot
+	// write to a database: callers reach it incidentally while holding the mutex, so
+	// handing them the fact means they drop it — and a node deleted from the map can
+	// never be rediscovered, so the ledger would believe in it forever. A failed write
+	// goes back on the queue.
+	pendingGone []goneNode
 }
 
 // node is one registered compute host.
@@ -117,6 +130,14 @@ type node struct {
 	provider    config.ProviderKind
 	guestOS     []config.GuestOS
 	lastSeen    time.Time
+
+	// ledgerEpoch is the fencing token the ledger gave this registration.
+	//
+	// Carried so expiry can say WHICH incarnation it is giving up on. Without it
+	// a "this node is gone" written after the host has already come back would
+	// mark the live one dead — registration commits to the ledger before taking
+	// this mutex, so that ordering is reachable rather than theoretical.
+	ledgerEpoch int64
 
 	// queue holds commands not yet handed to the node.
 	queue []*pending
@@ -152,15 +173,14 @@ type node struct {
 // forever for a container that no longer existed.
 type abandonedCmd struct {
 	kind nodeapi.CommandKind
-	// incarnation is the process that TOOK the command, without which a late
-	// result cannot be attributed.
+	// incarnation is the process that TOOK the command, without which a late result
+	// cannot be attributed.
 	//
-	// A destroy answered by a process that is not the owner proves nothing about
-	// the owner's container: A owns a running container, B supersedes A and takes
-	// a destroy, truthfully finds nothing, and C supersedes B before B reports. B's
-	// late success would then end A's ownership — and the next completion, seeing
-	// no owner, accepts a no-op destroy and releases capacity while A's container
-	// is still running.
+	// A destroy answered by a process that is not the owner proves nothing about the
+	// owner's container: A owns a running container, B supersedes A and takes a
+	// destroy, truthfully finds nothing, and C supersedes B before B reports. B's late
+	// success would end A's ownership, and the next completion would accept a no-op
+	// destroy and release capacity while A's container still runs.
 	incarnation string
 	requestID   int64
 	at          time.Time
@@ -339,6 +359,101 @@ func New(log *slog.Logger, deployment string, leaseTTL time.Duration, opts ...Op
 	return p
 }
 
+// Watch expires silent nodes until the context ends.
+//
+// A TIMER, BECAUSE NOTHING ELSE ASKS. A node's liveness decides what its tier
+// ADVERTISES, and an idle deployment never picks a node, lists the fleet or
+// destroys anything — so expiry driven only by those would leave a host that
+// crashed on a quiet afternoon advertising its capacity until somebody happened
+// to launch something.
+//
+// Half the silence window, so a node is noticed within about one and a half of
+// them rather than up to two.
+func (p *Plane) Watch(ctx context.Context) {
+	every := p.staleAfter() / 2
+	if every <= 0 {
+		return
+	}
+
+	t := time.NewTicker(every)
+	defer t.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			p.mu.Lock()
+			p.expireStaleLocked()
+
+			pending := p.pendingGone
+			p.pendingGone = nil
+			p.mu.Unlock()
+
+			if failed := p.recordGone(ctx, pending); len(failed) > 0 {
+				// BACK ON THE QUEUE. A database that was briefly unavailable must not
+				// cost the ledger a permanent belief in a machine that is gone.
+				p.mu.Lock()
+				p.pendingGone = append(failed, p.pendingGone...)
+				p.mu.Unlock()
+			}
+		}
+	}
+}
+
+// liveNode returns one host if it is currently live, or nil.
+//
+// Expiry runs first, so a name that belongs to a machine the plane has given up
+// on answers nil rather than a corpse — which is the whole reason a destroy
+// cannot simply trust a name it was handed.
+func (p *Plane) liveNode(name string) *node {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.expireStaleLocked()
+
+	return p.nodes[name]
+}
+
+// goneNode is a host the plane has given up on, with the epoch it had.
+//
+// The epoch travels with the name because by the time this is written the node
+// may have registered again — a fast restart — and the write must then match
+// nothing rather than kill the incarnation that replaced it.
+type goneNode struct {
+	name  string
+	epoch int64
+}
+
+// recordGone tells the ledger about hosts the plane has forgotten.
+//
+// OUTSIDE p.mu, which is the whole reason expiry reports rather than writes: a
+// database write while holding that mutex stalls every launch and every poll for
+// as long as the database takes.
+//
+// Best effort. A failure leaves the ledger believing in a node for longer than
+// it should — corrected by the next registration, the next tick, or a restart —
+// and there is nobody here to return an error to.
+func (p *Plane) recordGone(ctx context.Context, gone []goneNode) []goneNode {
+	if p.registrar == nil {
+		return nil
+	}
+
+	var failed []goneNode
+
+	for _, g := range gone {
+		if err := p.registrar.NodeGone(ctx, g.name, g.epoch); err != nil {
+			p.log.Warn("could not record that a node is gone; retrying, and its capacity "+
+				"stays advertised until that succeeds",
+				"node", g.name, "error", err)
+
+			failed = append(failed, g)
+		}
+	}
+
+	return failed
+}
+
 // Registrar is the ledger's node table.
 //
 // A NODE IS NOT REGISTERED UNTIL THE LEDGER SAYS SO. The plane's own map decides
@@ -347,11 +462,88 @@ func New(log *slog.Logger, deployment string, leaseTTL time.Duration, opts ...Op
 // commands and then had every Bind refused — which looked like a broken node
 // rather than a missing row.
 type Registrar interface {
-	RegisterNode(ctx context.Context, name string, kind config.ProviderKind) error
+	// RegisterNode records the host and returns the row's new fencing epoch, which
+	// NodeGone must present to prove which incarnation it is talking about.
+	RegisterNode(ctx context.Context, reg alloc.NodeRegistration) (int64, error)
+
+	// NodeGone records that this control plane has given up on a host. Fenced on
+	// the epoch, so an expiry that lands after the node has already come back
+	// matches nothing.
+	NodeGone(ctx context.Context, name string, epoch int64) error
+
+	// ForgetEveryNode marks the whole fleet unreachable, for a plane that has just
+	// started and has no judgement about anything yet.
+	ForgetEveryNode(ctx context.Context) error
+}
+
+// sortedSites lists the declared places in a stable order, so a refusal naming
+// what IS valid reads the same on every run.
+func sortedSites(set map[string]bool) []string {
+	out := make([]string, 0, len(set))
+	for k := range set {
+		out = append(out, k)
+	}
+
+	slices.Sort(out)
+
+	return out
+}
+
+// WithTierCatalog gives the plane the deployment's tiers.
+//
+// HELD HERE RATHER THAN ON THE NODE, because a node with its own copy needs that
+// copy to agree with the server's and nothing checks: a missing tier refuses the
+// launch loudly, but a drifted `image:` runs the wrong image silently. The plane
+// puts the shape on the launch command instead.
+func WithTierCatalog(tiers []config.Tier) Option {
+	return func(p *Plane) {
+		p.tiers = make(map[string]config.Tier, len(tiers))
+		for i := range tiers {
+			p.tiers[tiers[i].Label] = tiers[i]
+		}
+	}
+}
+
+// tierFor reports a tier from the catalogue.
+func (p *Plane) tierFor(label string) (config.Tier, bool) {
+	t, ok := p.tiers[label]
+
+	return t, ok
+}
+
+// WithSites declares the places this deployment has compute in.
+//
+// THE CONTROL PLANE IS THE AUTHORITY, and this is the only place the rule can be
+// enforced: a node names a site in ITS OWN config, on another machine, in a file
+// with no reason to list the deployment's places, so it cannot check itself.
+// Every remote claim arrives at Register.
+//
+// Empty means the deployment has declared no sites, in which case a node claiming
+// one is refused: there is nothing it could correctly mean.
+func WithSites(names []string) Option {
+	return func(p *Plane) {
+		p.sites = make(map[string]bool, len(names))
+		for _, n := range names {
+			p.sites[n] = true
+		}
+	}
 }
 
 // WithRegistrar makes registration durable in the ledger as well as in memory.
 func WithRegistrar(r Registrar) Option { return func(p *Plane) { p.registrar = r } }
+
+// WithPollTimeout sets the long-poll window a node is told to wait out.
+//
+// It also sets how long silence has to last before a node is forgotten, and
+// therefore how often Watch looks — see staleAfter. Shortening it in a test is
+// what makes expiry observable without waiting out the real window.
+func WithPollTimeout(d time.Duration) Option {
+	return func(p *Plane) {
+		if d > 0 {
+			p.poll = d
+		}
+	}
+}
 
 // Register records a node's claim about itself.
 //
@@ -383,13 +575,63 @@ func (p *Plane) Register(
 			ErrRefused, req.Node, req.Deployment, p.deployment)
 	}
 
+	// REFUSED HERE, PERMANENTLY, rather than by the ledger. The allocator rejects
+	// a contribution of nothing as well, but an error from the registrar is
+	// treated as an OUTAGE below and answered 503, so the node retries — a node
+	// whose config offers no capacity would retry forever, every backoff, with
+	// nothing in the loop ever saying why.
+	if req.VCPU <= 0 || req.Memory <= 0 {
+		return nodeapi.RegisterResponse{}, fmt.Errorf(
+			"%w: node %q contributes %d vcpu and %s of memory; a host that offers nothing "+
+				"can never be given work, so set node.max_vcpu and node.max_memory or leave "+
+				"them unset to contribute what the machine has",
+			ErrRefused, req.Node, req.VCPU, req.Memory)
+	}
+
+	// REFUSED RATHER THAN RECORDED, because a site nobody declared is
+	// indistinguishable afterwards from a real one. A typo becomes a place of a
+	// single machine, with a cache of its own that is always empty, and every job
+	// sent there runs cold while the fleet looks perfectly healthy.
+	//
+	// PERMANENT, like the version and deployment checks above it. The same node
+	// with the same config will be refused forever, so a node that treated this as
+	// an outage would retry until someone read a log.
+	if req.Site != "" && !p.sites[req.Site] {
+		if len(p.sites) == 0 {
+			return nodeapi.RegisterResponse{}, fmt.Errorf(
+				"%w: node %q is at site %q, but this control plane declares no sites; add a "+
+					"sites block naming it, or remove node.site",
+				ErrRefused, req.Node, req.Site)
+		}
+
+		return nodeapi.RegisterResponse{}, fmt.Errorf(
+			"%w: node %q is at site %q, which this control plane does not declare (have %s)",
+			ErrRefused, req.Node, req.Site, strings.Join(sortedSites(p.sites), ", "))
+	}
+
 	// THE LEDGER FIRST, and outside the mutex. A node that appears in the plane's
 	// map but not in the allocator's node table takes commands and then has every
 	// Bind refused — the failure looks like a broken node instead of a missing
 	// row. Doing it first means a ledger that refuses leaves the plane unchanged,
 	// so the node retries registration rather than believing it succeeded.
+	// Scoped outside the registrar block: a plane without one (tests, and the
+	// in-process path) has no ledger to fence against, and zero is the epoch a
+	// node that was never recorded would carry anyway.
+	var epoch int64
+
 	if p.registrar != nil {
-		if err := p.registrar.RegisterNode(ctx, req.Node, req.Provider); err != nil {
+		reg := alloc.NodeRegistration{
+			Name:     req.Node,
+			Provider: req.Provider,
+			Site:     req.Site,
+			VCPU:     req.VCPU,
+			Memory:   req.Memory,
+		}
+
+		var err error
+
+		epoch, err = p.registrar.RegisterNode(ctx, reg)
+		if err != nil {
 			// NOT WRAPPED IN ErrRefused. A ledger that cannot write is an outage,
 			// not a verdict: the same node with the same config will succeed once
 			// the database answers again, and a node that gave up here would stay
@@ -406,6 +648,29 @@ func (p *Plane) Register(
 	if !ok {
 		n = &node{name: req.Node, inflight: map[string]*pending{}, waiting: make(chan struct{}, 1)}
 		p.nodes[req.Node] = n
+	}
+
+	// AN OVERTAKEN REGISTRATION CHANGES NOTHING, and this has to be decided BEFORE
+	// anything below it runs.
+	//
+	// The ledger write happens outside this mutex, so two registrations for one node
+	// can commit in one order and arrive in the other: A is handed epoch 1, B is handed
+	// 2, B installs, and then A gets the lock. Everything past this point treats the
+	// request as the current process — tombstoning the commands B is working on and
+	// overwriting its incarnation, provider and guest-OS claims.
+	//
+	// Keeping only the EPOCH monotonic is not enough: a fence at the end of a function
+	// runs after the damage it was meant to prevent.
+	if epoch > 0 && epoch < n.ledgerEpoch {
+		p.log.Warn("ignoring a registration that was overtaken by a newer one from the same "+
+			"node; the newer process keeps its commands",
+			"node", req.Node, "arrived_at_epoch", epoch, "current", n.ledgerEpoch)
+
+		return nodeapi.RegisterResponse{
+			Version:         nodeapi.Version,
+			LeaseTTLSeconds: int(p.ttl.Seconds()),
+			PollSeconds:     int(p.poll.Seconds()),
+		}, nil
 	}
 
 	if n.incarnation != "" && n.incarnation != req.Incarnation {
@@ -430,18 +695,14 @@ func (p *Plane) Register(
 	for id, pend := range n.inflight {
 		// TOMBSTONED, EXACTLY AS A TIMEOUT IS, AND FOR EVERY KIND.
 		//
-		// A LAUNCH in flight across a re-registration — a partitioned host still
-		// working, or a process that restarted while its provider kept going — would
-		// otherwise report success afterwards, find no inflight entry and no
-		// tombstone, and be answered 204, while the listener had already stopped
-		// heartbeating on the custody it was told about.
+		// A LAUNCH in flight across a re-registration would otherwise report success
+		// afterwards, find no inflight entry and no tombstone, and be answered 204 — while
+		// the listener had already stopped heartbeating the custody it was told about.
 		//
-		// A DESTROY is the case this used to miss entirely. The process that took it
-		// can succeed and be superseded before it reports; its late result was then
-		// discarded, so the ownership record survived, that process drained to
-		// nothing and exited, and every later destroy was answered by its
-		// replacement — which cannot confirm somebody else's ownership. The plane
-		// reported custody forever for a container that had already been removed.
+		// A DESTROY is the easy case to miss: the process that took it can succeed and be
+		// superseded before it reports, and discarding that late result leaves the
+		// ownership record alive after that process exits, so the plane reports custody
+		// forever for a container that has already been removed.
 		n.rememberAbandoned(pend.cmd, pend.incarnation, p.now())
 
 		p.answerLocked(pend, nodeapi.CommandResult{
@@ -464,6 +725,16 @@ func (p *Plane) Register(
 	n.provider = req.Provider
 	n.guestOS = req.GuestOS
 	n.lastSeen = p.now()
+
+	// NEVER BACKWARDS. Two registrations for one node can commit to the ledger in
+	// one order and reach this mutex in the other — the ledger write happens
+	// before the lock is taken — so installing unconditionally lets the older
+	// epoch win. Expiry would then present a stale token, the fenced write would
+	// match nothing, and the node would stay live in the ledger after the plane
+	// had forgotten it.
+	if epoch > n.ledgerEpoch {
+		n.ledgerEpoch = epoch
+	}
 
 	return nodeapi.RegisterResponse{
 		Version:         nodeapi.Version,
@@ -495,15 +766,14 @@ var ErrSuperseded = errors.New("nodeplane: another process is registered as this
 
 // CheckIncarnation reports whether a request came from the current node process.
 //
-// COMPATIBILITY IS SCOPED TO NODES THAT HAVE NOT CLAIMED ONE, and the first
-// version scoped it to the REQUEST instead — which meant an absent header
-// bypassed the check entirely. An older node running beside a current one would
-// simply never send the header, and both would take work as the same node
-// forever: the fence was disabled by the very thing it exists to catch.
+// COMPATIBILITY IS SCOPED TO NODES THAT HAVE NOT CLAIMED ONE, not to the REQUEST:
+// scoping it to the request would let an absent header bypass the check entirely,
+// so an older node beside a current one would never send the header and both would
+// take work as the same node forever.
 //
 // So absence is accepted only while the registered node is also absent — a fleet
-// mid-upgrade, or the in-process runner, which has no wire to carry one. Once a
-// process has claimed an incarnation, every later request must carry it.
+// mid-upgrade. Once a process has claimed an incarnation, every later request must
+// carry it.
 func (p *Plane) CheckIncarnation(name, claimed string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -696,8 +966,8 @@ func (p *Plane) AdoptOwnership(node, incarnation string, leaseIDs []string) {
 	// still `assigned` is legitimately missing — and deleting its owner would let
 	// somebody else answer a destroy for a container that is about to exist.
 	//
-	// Runs even for an empty snapshot, because one-to-zero is exactly the shape
-	// that used to strand an entry for the life of the process.
+	// Runs even for an empty snapshot: one-to-zero is exactly the shape that
+	// strands an entry for the life of the process.
 	for id, owner := range p.owners {
 		if owner.node == node && owner.requestID == 0 && !open[id] {
 			delete(p.owners, id)
@@ -721,8 +991,26 @@ func (p *Plane) MayMutateLease(node, incarnation, leaseID string) error {
 	// refused the drain the right to renew its own lease at exactly the moment
 	// nothing else could. The lease then expired under compute that was still
 	// running.
-	if owner, ok := p.owners[leaseID]; ok && owner.node == node && owner.incarnation == incarnation {
+	owner, owned := p.owners[leaseID]
+	if owned && owner.node == node && owner.incarnation == incarnation {
 		return nil
+	}
+
+	// AND AN OWNER THAT NAMES ANOTHER HOST ENDS IT HERE, rather than falling
+	// through to the membership check below — which admitted any current node for
+	// any lease id, because being registered proves which host you are and says
+	// nothing about what work you were given. EntitledToLaunch draws that line for
+	// JIT credentials; this is the same line for a lease's fate.
+	//
+	// Lease ids are not secret — provider.InstanceName puts them in the runner
+	// name, which the organisation's runner list shows — so this was reachable by
+	// reading a web page: release somebody else's lease, and the ledger frees vCPU
+	// that a container on another machine is still using.
+	if owned && owner.node != node {
+		return fmt.Errorf(
+			"%w: lease %s was given to node %q and this request came from %q. A node may "+
+				"change the fate only of work it was handed",
+			ErrSuperseded, leaseID, owner.node, node)
 	}
 
 	n, ok := p.nodes[node]
@@ -806,21 +1094,6 @@ func (p *Plane) EntitledToLaunch(node, incarnation, leaseID string) (string, err
 			"registration for it", ErrNotEntitled, node, leaseID)
 }
 
-// Seen records that a node just spoke, whatever it said.
-//
-// EVERY REQUEST IS EVIDENCE OF LIFE, and taking it only from Poll and Result was
-// a silent way to kill a working node. The node's command loop is synchronous:
-// if Recover, Sweep or Tend wedges — a hung Docker call is enough — the loop
-// never reaches Poll again. Its custody janitor is a separate goroutine and
-// keeps heartbeating perfectly well, but each heartbeat asked whether the node
-// was registered, that question ran expiry, and the same call that proved the
-// node alive was the one that declared it dead. Every later heartbeat was then
-// refused as unregistered, and the leases it held — for compute that may still
-// be running — expired.
-//
-// Command eligibility is bounded by the command timeout, which is the right
-// instrument for a node that takes work and never answers. Membership is bounded
-// by silence, which is the right instrument for a node that has gone.
 // maxAbandoned bounds what one node's tombstones can cost.
 //
 // A node whose launches all outlast the command timeout would otherwise grow
@@ -828,6 +1101,18 @@ func (p *Plane) EntitledToLaunch(node, incarnation, leaseID string) (string, err
 // ones are the launches still likely to report.
 const maxAbandoned = 1024
 
+// Seen records that a node just spoke, whatever it said.
+//
+// EVERY REQUEST IS EVIDENCE OF LIFE. The node's command loop is synchronous, so
+// if Recover, Sweep or Tend wedges it never reaches Poll again — while its
+// custody janitor keeps heartbeating perfectly well. Taking liveness only from
+// Poll and Result would let each heartbeat run expiry, so the same call that
+// proved the node alive would declare it dead, and every later heartbeat would
+// be refused as unregistered while its leases expired.
+//
+// Command eligibility is bounded by the command timeout, which is the right
+// instrument for a node that takes work and never answers. Membership is bounded
+// by silence, which is the right instrument for a node that has gone.
 func (p *Plane) Seen(name, incarnation string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -1038,14 +1323,12 @@ func (p *Plane) Result(nodeName, incarnation string, res nodeapi.CommandResult) 
 			switch {
 			case entry.kind == nodeapi.CommandDestroy && res.OK &&
 				p.ownedByLocked(entry.requestID, nodeName, entry.incarnation):
-				// THE ONLY PROOF THE COMPUTE IS GONE, arriving late. A destroy taken by
-				// a process that was superseded before it could answer used to be
-				// discarded here — so the ownership record survived, that process
-				// drained to nothing and exited, and every later destroy was answered
-				// by its replacement, which cannot confirm somebody else's ownership.
-				// The plane then reported custody forever for a container that had
-				// already been removed, while the listener kept heartbeating its
-				// capacity.
+				// THE ONLY PROOF THE COMPUTE IS GONE, arriving late. Discarding the
+				// answer of a destroy whose process was superseded before it could
+				// report leaves the ownership record alive after that process exits,
+				// so every later destroy is answered by its replacement — which
+				// cannot confirm somebody else's ownership — and the plane reports
+				// custody forever while the listener heartbeats its capacity.
 				p.forgetForRequestLocked(entry.requestID)
 
 				return nil
@@ -1122,17 +1405,16 @@ func (p *Plane) staleAfter() time.Duration {
 
 // expireStaleLocked drops nodes that have gone silent.
 //
-// NODES USED TO LIVE FOREVER, and lastSeen was written and never read. One host
-// that was unplugged a week ago stayed in the fleet, so every Destroy broadcast
-// waited out the full command timeout against it and returned an error — and the
-// listener answers a destroy error by holding its lease and heartbeating it
-// indefinitely. A single dead machine therefore made every subsequent completed
-// job leak its capacity, permanently.
+// A NODE THAT NEVER EXPIRES POISONS THE FLEET. One host unplugged a week ago
+// would stay in it, so every command aimed there waits out the full command
+// timeout and returns an error — and the listener answers a destroy error by
+// holding its lease and heartbeating it indefinitely, so a single dead machine
+// makes every later completed job leak its capacity.
 //
-// In-flight commands are answered exactly as a re-registration answers them: a
-// launch becomes custody, because the node may have started something before it
-// went quiet, and a destroy becomes a plain failure the caller can retry.
-// Dropping them silently would leave callers waiting on a machine that is gone.
+// A node with commands IN FLIGHT is not expired at all — see the guard below —
+// so nothing here answers one, and custody is never transferred by expiry. What
+// is answered is the QUEUE: those commands never reached the node, so a caller
+// waiting on a machine that is gone is told plainly that nothing started.
 func (p *Plane) expireStaleLocked() {
 	cutoff := p.now().Add(-p.staleAfter())
 
@@ -1145,10 +1427,11 @@ func (p *Plane) expireStaleLocked() {
 		//
 		// The loop executes commands synchronously, so a node pulling a five-minute
 		// image does not poll while it works — and expiring it there was actively
-		// harmful rather than merely wrong. Expiry answers an in-flight launch with
-		// custody, the listener stops heartbeating on that, and the lease is reaped
-		// before the provider has even returned. The launch then starts a runner on
-		// capacity that has already been sold to somebody else.
+		// harmful rather than merely wrong. Expiring it WOULD answer an in-flight
+		// launch with custody, the listener would stop heartbeating on that, and the
+		// lease would be reaped before the provider had even returned — after which
+		// the launch starts a runner on capacity already sold to somebody else.
+		// This guard is what makes that conditional rather than what happens.
 		//
 		// The command timeout is what bounds this instead, and it is the right
 		// instrument: it is already the thing that decides how long an unanswered
@@ -1159,15 +1442,10 @@ func (p *Plane) expireStaleLocked() {
 			continue
 		}
 
-		for id, pend := range n.inflight {
-			p.answerLocked(pend, nodeapi.CommandResult{
-				ID:      id,
-				Custody: pend.cmd.Kind == nodeapi.CommandLaunch,
-				Error: fmt.Sprintf("node %q went silent for %s, so the outcome of this command "+
-					"is unknown", name, p.staleAfter()),
-			})
-		}
-
+		// NOTHING IN FLIGHT IS ANSWERED HERE, because the guard above means there
+		// is nothing in flight to answer. Expiry must never hand custody of a
+		// running launch to the node.
+		//
 		// Queued commands never reached it, so they are unambiguous: nothing
 		// started, and the caller may act on that certainty.
 		for _, pend := range n.queue {
@@ -1180,6 +1458,18 @@ func (p *Plane) expireStaleLocked() {
 
 		p.log.Warn("forgetting a node that stopped polling; it will have to register again",
 			"node", name, "silent_for", p.now().Sub(n.lastSeen))
+
+		// REPORTED, NOT WRITTEN. The ledger has to learn this too — capacity is
+		// counted there, and a node the plane has forgotten while the ledger still
+		// believes in it goes on backing advertisements for a machine nothing can
+		// reach. But this runs holding p.mu, and a database write under that mutex
+		// stalls every launch and every poll for as long as the database takes.
+		//
+		// So the fact is handed back and Watch records it with the lock released.
+		// Callers that expire as a side effect of doing something else discard it;
+		// the timer reconciles within a tick, and until it does the ledger is
+		// merely behind rather than wrong.
+		p.pendingGone = append(p.pendingGone, goneNode{name: name, epoch: n.ledgerEpoch})
 
 		delete(p.nodes, name)
 	}
@@ -1201,28 +1491,37 @@ func (p *Plane) pick(lease *alloc.Lease) (*node, error) {
 	// stale node cannot be picked even once.
 	p.expireStaleLocked()
 
+	// COALESCE(node, target_node), the same attribution the ledger uses. The two
+	// answer different questions — target_node is where placement decided the work
+	// goes, node is where it actually went — and the BOUND one wins, because that
+	// is where the container already is. Resolving only the target let a bound
+	// lease be launched on a different host.
+	if pinned := lease.Node; pinned != "" {
+		return p.pinnedLocked(lease, pinned, "bound to")
+	}
+
 	if lease.TargetNode != "" {
-		n, ok := p.nodes[lease.TargetNode]
-		if !ok {
-			return nil, fmt.Errorf("%w: lease %s is pinned to node %q, which is not registered",
-				ErrNoNode, lease.ID, lease.TargetNode)
-		}
-
-		if !acceptsProvider(n, lease) {
-			return nil, fmt.Errorf(
-				"%w: lease %s is pinned to node %q, which runs %s and the lease may not use it",
-				ErrNoNode, lease.ID, n.name, n.provider)
-		}
-
-		return n, nil
+		return p.pinnedLocked(lease, lease.TargetNode, "pinned to")
 	}
 
 	// IN THE LEASE'S OWN ORDER OF PREFERENCE. Providers is most-preferred-first,
 	// so walking it rather than the node map is what makes the preference mean
-	// anything — iterating a map would pick by hash order.
+	// anything.
+	//
+	// BY NAME WITHIN A PROVIDER, because the node map iterates in hash order: two
+	// identical fleets would otherwise place the same lease differently, which
+	// cannot be reproduced from a log. Escrow already names a machine for every
+	// reservation, so this runs only for a lease that carries neither.
+	names := make([]string, 0, len(p.nodes))
+	for name := range p.nodes {
+		names = append(names, name)
+	}
+
+	slices.Sort(names)
+
 	for _, want := range lease.Providers {
-		for _, n := range p.nodes {
-			if n.provider == want && acceptsGuestOS(n, lease) {
+		for _, name := range names {
+			if n := p.nodes[name]; n.provider == want && acceptsGuestOS(n, lease) {
 				return n, nil
 			}
 		}
@@ -1230,6 +1529,33 @@ func (p *Plane) pick(lease *alloc.Lease) (*node, error) {
 
 	return nil, fmt.Errorf("%w: lease %s needs one of %v and no registered node offers it",
 		ErrNoNode, lease.ID, lease.Providers)
+}
+
+// pinnedLocked resolves a lease that names its machine. Caller holds p.mu.
+func (p *Plane) pinnedLocked(lease *alloc.Lease, name, how string) (*node, error) {
+	n, ok := p.nodes[name]
+	if !ok {
+		return nil, fmt.Errorf("%w: lease %s is %s node %q, which is not registered",
+			ErrNoNode, lease.ID, how, name)
+	}
+
+	if !acceptsProvider(n, lease) {
+		return nil, fmt.Errorf(
+			"%w: lease %s is %s node %q, which runs %s and the lease may not use it",
+			ErrNoNode, lease.ID, how, n.name, n.provider)
+	}
+
+	return n, nil
+}
+
+// PickForTest reports which node a lease would be aimed at.
+func (p *Plane) PickForTest(lease *alloc.Lease) (string, error) {
+	n, err := p.pick(lease)
+	if err != nil {
+		return "", err
+	}
+
+	return n.name, nil
 }
 
 func acceptsProvider(n *node, lease *alloc.Lease) bool {
@@ -1259,4 +1585,19 @@ func acceptsGuestOS(n *node, lease *alloc.Lease) bool {
 	}
 
 	return false
+}
+
+// LeaseOwnerRecorded reports whether the plane has a delivery record for a lease.
+//
+// Its absence is what sends the wire to the ledger: the owners map holds only
+// what this process has DELIVERED, so held escrow — and everything at all in the
+// window after a restart, before the fleet re-adopts — is missing from it
+// legitimately.
+func (p *Plane) LeaseOwnerRecorded(leaseID string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	_, ok := p.owners[leaseID]
+
+	return ok
 }

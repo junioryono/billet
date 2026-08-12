@@ -11,8 +11,17 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/provider"
 	"github.com/junioryono/billet/internal/state"
+)
+
+// A registered host in these tests is deliberately larger than any budget they
+// set, so the deployment-wide ceiling stays the binding constraint and every
+// test written before nodes carried capacity keeps measuring what it did.
+const (
+	testNodeVCPU   = 1 << 20
+	testNodeMemory = 1 << 20 * config.GiB
 )
 
 // A launch mints a registration and hands it to the provider, with the tier's
@@ -22,11 +31,11 @@ func TestLaunchMintsARegistrationAndStartsIt(t *testing.T) {
 
 	a, host := newAllocatorWithHost(t)
 
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
 	lease := assignedLease(t, a)
 
-	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, RunID: 101, Event: "push"}); err != nil {
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, RunID: 101, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 
@@ -63,12 +72,12 @@ func TestTheRunnerIsNamedAfterItsLease(t *testing.T) {
 
 	a, host := newAllocatorWithHost(t)
 
-	r := New(a, host, jit, p, []config.Tier{dockerTier()}, nil)
+	r := New(a, host, jit, p, nil)
 
 	for range 2 {
 		lease := assignedLease(t, a)
 
-		if err := r.Launch(t.Context(), lease, Job{RequestID: lease.RequestID, Event: "push"}); err != nil {
+		if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: lease.RequestID, Event: "push"}); err != nil {
 			t.Fatalf("Launch: %v", err)
 		}
 	}
@@ -135,10 +144,11 @@ func TestATierForAnotherBackendIsRefused(t *testing.T) {
 	firecracker.Provider = config.ProviderFirecracker
 
 	a, host := newAllocatorForTiers(t, openState(t), firecracker)
+	registerElsewhere(t, a, config.ProviderFirecracker)
 
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{firecracker}, nil)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
-	err := r.Launch(t.Context(), assignedLease(t, a), Job{RequestID: 11, Event: "push"})
+	err := r.Launch(t.Context(), assignedLease(t, a), dockerSpec(), Job{RequestID: 11, Event: "push"})
 	if err == nil {
 		t.Fatal("ran a firecracker lease's job on a docker host")
 	}
@@ -154,11 +164,11 @@ func TestDestroyRemovesWhatWasStarted(t *testing.T) {
 
 	a, host := newAllocatorWithHost(t)
 
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
 	lease := assignedLease(t, a)
 
-	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 
@@ -193,9 +203,9 @@ func TestAnInstanceThatWillNotDieStaysTracked(t *testing.T) {
 
 	a, host := newAllocatorWithHost(t)
 
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
-	if err := r.Launch(t.Context(), assignedLease(t, a), Job{RequestID: 11, Event: "push"}); err != nil {
+	if err := r.Launch(t.Context(), assignedLease(t, a), dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 
@@ -219,6 +229,11 @@ func TestAnInstanceThatWillNotDieStaysTracked(t *testing.T) {
 			"first failure and became an orphan nothing can find by request id",
 			len(p.destroyed))
 	}
+}
+
+// dockerSpec is what the control plane sends with a launch for dockerTier.
+func dockerSpec() *nodeapi.TierSpec {
+	return nodeapi.TierSpecOf(dockerTier())
 }
 
 func dockerTier() config.Tier {
@@ -502,11 +517,35 @@ func newAllocatorForTiers(t *testing.T, db *state.DB, tiers ...config.Tier) (*al
 
 	const host = "test-host"
 
-	if err := a.RegisterNode(t.Context(), host, config.ProviderDocker); err != nil {
+	// THE HOST UNDER TEST RUNS DOCKER, and it is the one returned. Its name is
+	// what a test hands the runner, so this is the machine whose refusals the
+	// tests are about.
+	if _, err := a.RegisterNode(t.Context(), alloc.NodeRegistration{
+		Name: host, Provider: config.ProviderDocker,
+		VCPU: testNodeVCPU, Memory: testNodeMemory,
+	}); err != nil {
 		t.Fatalf("RegisterNode: %v", err)
 	}
 
 	return a, host
+}
+
+// registerElsewhere gives the fleet a host the TIER accepts but the runner under
+// test is not.
+//
+// Escrow chooses a machine now, so a tier no registered host can serve cannot be
+// RESERVED at all — which is correct, and which makes "the runner refuses a host
+// outside its lease's list" untestable unless the lease can be placed somewhere
+// else first. The mismatch has to be at bind, not at reserve.
+func registerElsewhere(t *testing.T, a *alloc.Allocator, kind config.ProviderKind) {
+	t.Helper()
+
+	if _, err := a.RegisterNode(t.Context(), alloc.NodeRegistration{
+		Name: "elsewhere", Provider: kind,
+		VCPU: testNodeVCPU, Memory: testNodeMemory,
+	}); err != nil {
+		t.Fatalf("RegisterNode elsewhere: %v", err)
+	}
 }
 
 // openState opens a throwaway ledger.
@@ -523,14 +562,13 @@ func openState(t *testing.T) *state.DB {
 	return db
 }
 
-// assignedLease reserves and assigns a lease, which is the state Launch expects
-// to receive one in.
-//
-// Atomic because these tests run in parallel. Separate databases made duplicate
-// request ids harmless in practice, which is exactly why the race would have sat
-// there being reported only by -race on an unlucky run.
+// nextRequest is atomic because these tests run in parallel: separate databases
+// make duplicate request ids harmless in practice, which is exactly why such a
+// race would be reported only by -race on an unlucky run.
 var nextRequest atomic.Int64
 
+// assignedLease reserves and assigns a lease, which is the state Launch expects
+// to receive one in.
 func assignedLease(t *testing.T, a *alloc.Allocator) *alloc.Lease {
 	t.Helper()
 
@@ -567,10 +605,10 @@ func TestLaunchRemovesWhatAFailedLaunchStarted(t *testing.T) {
 	}
 
 	a, host := newAllocatorWithHost(t)
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 	lease := assignedLease(t, a)
 
-	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err == nil {
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err == nil {
 		t.Fatal("a launch that failed reported success")
 	}
 
@@ -596,9 +634,9 @@ func TestLaunchDoesNotDestroyWhenNothingStarted(t *testing.T) {
 	}
 
 	a, host := newAllocatorWithHost(t)
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
-	if err := r.Launch(t.Context(), assignedLease(t, a), Job{RequestID: 11, Event: "push"}); err == nil {
+	if err := r.Launch(t.Context(), assignedLease(t, a), dockerSpec(), Job{RequestID: 11, Event: "push"}); err == nil {
 		t.Fatal("a launch that failed reported success")
 	}
 
@@ -628,10 +666,10 @@ func TestLaunchSurvivesAFailedLaunchOnACancelledContext(t *testing.T) {
 	}
 
 	a, host := newAllocatorWithHost(t)
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 	lease := assignedLease(t, a)
 
-	if err := r.Launch(ctx, lease, Job{RequestID: 11, Event: "push"}); err == nil {
+	if err := r.Launch(ctx, lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err == nil {
 		t.Fatal("a launch on a cancelled context reported success")
 	}
 
@@ -654,12 +692,11 @@ func TestLaunchNamesTheInstanceAfterTheLease(t *testing.T) {
 	// crash to say which lease the instance belongs to.
 	p := &fakeProvider{kind: config.ProviderDocker}
 	a, host := newAllocatorWithHost(t)
-	r := New(a, host, &fakeJIT{setID: 7, name: "github-picked-this"}, p,
-		[]config.Tier{dockerTier()}, nil)
+	r := New(a, host, &fakeJIT{setID: 7, name: "github-picked-this"}, p, nil)
 
 	lease := assignedLease(t, a)
 
-	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 
@@ -684,7 +721,7 @@ func TestRecoverIgnoresInstancesBilletDidNotName(t *testing.T) {
 	p.add(&provider.Instance{ID: "someone-elses", Name: "postgres-dev"})
 
 	a, host := newAllocatorWithHost(t)
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
 	if err := r.Recover(t.Context()); err != nil {
 		t.Fatalf("Recover: %v", err)
@@ -705,7 +742,7 @@ func TestRecoverReportsInstancesItCouldNotDestroy(t *testing.T) {
 	p.add(&provider.Instance{ID: "stuck", Name: provider.InstanceName("deadbeef")})
 
 	a, host := newAllocatorWithHost(t)
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
 	if err := r.Recover(t.Context()); err == nil {
 		t.Fatal("reported success while an instance was still holding capacity")
@@ -719,7 +756,7 @@ func TestRecoverReportsAProviderThatCannotBeEnumerated(t *testing.T) {
 	// treating it as the latter is how a restart over-commits the host.
 	p := &fakeProvider{kind: config.ProviderDocker, listErr: errors.New("docker daemon is not running")}
 	a, host := newAllocatorWithHost(t)
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
 	if err := r.Recover(t.Context()); err == nil {
 		t.Fatal("an unreadable provider was treated as an empty one")
@@ -738,9 +775,9 @@ func TestSweepKeepsAnInstanceWhoseLeaseIsLaunching(t *testing.T) {
 	// running job.
 	p := &fakeProvider{kind: config.ProviderDocker}
 	a, host := newAllocatorWithHost(t)
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
-	if err := r.Launch(t.Context(), assignedLease(t, a), Job{RequestID: 11, Event: "push"}); err != nil {
+	if err := r.Launch(t.Context(), assignedLease(t, a), dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 
@@ -761,11 +798,11 @@ func TestSweepDestroysAnInstanceWhoseLeaseWasReaped(t *testing.T) {
 	// orphan from that moment, and nothing else will ever look at it.
 	p := &fakeProvider{kind: config.ProviderDocker}
 	a, host := newAllocatorWithHost(t)
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
 	lease := assignedLease(t, a)
 
-	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 
@@ -801,7 +838,7 @@ func TestSweepDestroysAnInstanceWhoseLeaseNeverLaunched(t *testing.T) {
 	// Bound and assigned, but never advanced to launching.
 	p.add(&provider.Instance{ID: "ghost", Name: provider.InstanceName(lease.ID)})
 
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
 	if err := r.Sweep(t.Context()); err != nil {
 		t.Fatalf("Sweep: %v", err)
@@ -821,7 +858,7 @@ func TestSweepDestroysAnInstanceBoundToAnotherNode(t *testing.T) {
 	p := &fakeProvider{kind: config.ProviderDocker}
 	a, host := newAllocatorWithHost(t)
 
-	if err := a.RegisterNode(t.Context(), "other-host", config.ProviderDocker); err != nil {
+	if _, err := a.RegisterNode(t.Context(), alloc.NodeRegistration{Name: "other-host", Provider: config.ProviderDocker, VCPU: testNodeVCPU, Memory: testNodeMemory}); err != nil {
 		t.Fatalf("RegisterNode: %v", err)
 	}
 
@@ -837,7 +874,7 @@ func TestSweepDestroysAnInstanceBoundToAnotherNode(t *testing.T) {
 
 	p.add(&provider.Instance{ID: "stray", Name: provider.InstanceName(lease.ID)})
 
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
 	if err := r.Sweep(t.Context()); err != nil {
 		t.Fatalf("Sweep: %v", err)
@@ -860,11 +897,11 @@ func TestRecoverReleasesTheLeaseOfATrueOrphan(t *testing.T) {
 	// which is the subject of custody_test.go.
 	p := &fakeProvider{kind: config.ProviderDocker}
 	a, host := newAllocatorWithHost(t)
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
 	lease := assignedLease(t, a)
 
-	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 
@@ -879,7 +916,7 @@ func TestRecoverReleasesTheLeaseOfATrueOrphan(t *testing.T) {
 		t.Fatal("the lease was not open before recovery, so this proves nothing")
 	}
 
-	restarted := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	restarted := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
 	if err := restarted.Recover(t.Context()); err != nil {
 		t.Fatalf("Recover: %v", err)
@@ -911,10 +948,10 @@ func TestAFailedRegistrationDropsTheCachedScaleSet(t *testing.T) {
 	p := &fakeProvider{kind: config.ProviderDocker}
 	a, host := newAllocatorWithHost(t)
 	jit := &fakeJIT{setID: 7}
-	r := New(a, host, jit, p, []config.Tier{dockerTier()}, nil)
+	r := New(a, host, jit, p, nil)
 
 	// A first launch resolves and caches the id.
-	if err := r.Launch(t.Context(), assignedLease(t, a), Job{RequestID: 1, Event: "push"}); err != nil {
+	if err := r.Launch(t.Context(), assignedLease(t, a), dockerSpec(), Job{RequestID: 1, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 
@@ -923,7 +960,7 @@ func TestAFailedRegistrationDropsTheCachedScaleSet(t *testing.T) {
 	}
 
 	// A second one uses the cache rather than asking again.
-	if err := r.Launch(t.Context(), assignedLease(t, a), Job{RequestID: 2, Event: "push"}); err != nil {
+	if err := r.Launch(t.Context(), assignedLease(t, a), dockerSpec(), Job{RequestID: 2, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 
@@ -934,13 +971,13 @@ func TestAFailedRegistrationDropsTheCachedScaleSet(t *testing.T) {
 	// Now registration fails.
 	jit.jitErr = errors.New("scale set not found")
 
-	if err := r.Launch(t.Context(), assignedLease(t, a), Job{RequestID: 3, Event: "push"}); err == nil {
+	if err := r.Launch(t.Context(), assignedLease(t, a), dockerSpec(), Job{RequestID: 3, Event: "push"}); err == nil {
 		t.Fatal("a launch whose registration failed reported success")
 	}
 
 	jit.jitErr = nil
 
-	if err := r.Launch(t.Context(), assignedLease(t, a), Job{RequestID: 4, Event: "push"}); err != nil {
+	if err := r.Launch(t.Context(), assignedLease(t, a), dockerSpec(), Job{RequestID: 4, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 
@@ -969,9 +1006,9 @@ func TestAHostRunningTheFallbackBackendIsAccepted(t *testing.T) {
 
 	p := &fakeProvider{kind: config.ProviderDocker}
 	a, host := newAllocatorForTiers(t, openState(t), tier)
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{tier}, nil)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
-	if err := r.Launch(t.Context(), assignedLease(t, a), Job{RequestID: 11, Event: "push"}); err != nil {
+	if err := r.Launch(t.Context(), assignedLease(t, a), dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
 		t.Fatalf("a host running the lease's fallback backend refused the job: %v", err)
 	}
 
@@ -990,9 +1027,11 @@ func TestAHostOutsideTheTiersListIsRefused(t *testing.T) {
 
 	p := &fakeProvider{kind: config.ProviderDocker}
 	a, host := newAllocatorForTiers(t, openState(t), tier)
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{tier}, nil)
+	registerElsewhere(t, a, config.ProviderFirecracker)
 
-	err := r.Launch(t.Context(), assignedLease(t, a), Job{RequestID: 11, Event: "push"})
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
+
+	err := r.Launch(t.Context(), assignedLease(t, a), dockerSpec(), Job{RequestID: 11, Event: "push"})
 	if err == nil {
 		t.Fatal("ran a job on a backend its lease never named")
 	}
@@ -1028,9 +1067,9 @@ func TestTheLeaseOutranksALaterCatalogueEdit(t *testing.T) {
 	edited.Provider = ""
 	edited.Providers = []config.ProviderKind{config.ProviderFirecracker}
 
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{edited}, nil)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
-	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
 		t.Fatalf("a catalogue edit reclassified a lease that was already placed, so the "+
 			"listener will release it and GitHub must reassign the job: %v", err)
 	}
@@ -1066,9 +1105,9 @@ func TestLaunchSizesTheGuestFromTheLeaseNotTheCatalogue(t *testing.T) {
 	big.VCPU = 16
 	big.Memory = 64 * config.GiB
 
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{big}, nil)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
-	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 

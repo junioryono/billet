@@ -1,12 +1,16 @@
 package main
 
 import (
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/nodeplane"
+	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/wirecert"
 )
 
@@ -56,12 +60,12 @@ tiers:
 func TestCAIssueWritesAUsableBundle(t *testing.T) {
 	t.Parallel()
 
-	state := t.TempDir()
-	cfg := writeCAConfig(t, state)
+	serverState := t.TempDir()
+	cfg := writeCAConfig(t, serverState)
 	out := filepath.Join(t.TempDir(), "bundle")
 
 	// The order an operator writes: the subject first, the options after.
-	if err := cmdCAIssue([]string{"epyc-1", "--config", cfg, "--out", out}); err != nil {
+	if err := cmdCAIssue(t.Context(), []string{"epyc-1", "--config", cfg, "--out", out}); err != nil {
 		t.Fatalf("ca issue: %v", err)
 	}
 
@@ -93,7 +97,7 @@ func TestCAIssueWritesAUsableBundle(t *testing.T) {
 		t.Fatalf("deployment: %v", err)
 	}
 
-	want, err := os.ReadFile(filepath.Join(state, "deployment-id"))
+	want, err := os.ReadFile(filepath.Join(serverState, "deployment-id"))
 	if err != nil {
 		t.Fatalf("read the server's identity: %v", err)
 	}
@@ -112,7 +116,7 @@ func TestCAIssueAcceptsFlagsBeforeTheNode(t *testing.T) {
 	cfg := writeCAConfig(t, t.TempDir())
 	out := filepath.Join(t.TempDir(), "bundle")
 
-	if err := cmdCAIssue([]string{"--config", cfg, "--out", out, "mac-mini-1"}); err != nil {
+	if err := cmdCAIssue(t.Context(), []string{"--config", cfg, "--out", out, "mac-mini-1"}); err != nil {
 		t.Fatalf("ca issue: %v", err)
 	}
 
@@ -128,7 +132,7 @@ func TestCAIssueRefusesAnUnusableNodeName(t *testing.T) {
 
 	cfg := writeCAConfig(t, t.TempDir())
 
-	err := cmdCAIssue([]string{"Not A Name", "--config", cfg, "--out", filepath.Join(t.TempDir(), "b")})
+	err := cmdCAIssue(t.Context(), []string{"Not A Name", "--config", cfg, "--out", filepath.Join(t.TempDir(), "b")})
 	if err == nil {
 		t.Fatal("a certificate was issued for a name that is not a legal node name")
 	}
@@ -142,11 +146,11 @@ func TestCAIssueWillNotOverwriteABundle(t *testing.T) {
 	cfg := writeCAConfig(t, t.TempDir())
 	out := filepath.Join(t.TempDir(), "bundle")
 
-	if err := cmdCAIssue([]string{"epyc-1", "--config", cfg, "--out", out}); err != nil {
+	if err := cmdCAIssue(t.Context(), []string{"epyc-1", "--config", cfg, "--out", out}); err != nil {
 		t.Fatalf("ca issue: %v", err)
 	}
 
-	err := cmdCAIssue([]string{"epyc-1", "--config", cfg, "--out", out})
+	err := cmdCAIssue(t.Context(), []string{"epyc-1", "--config", cfg, "--out", out})
 	if err == nil {
 		t.Fatal("a second bundle was written over the first")
 	}
@@ -188,7 +192,7 @@ tiers:
 		t.Fatalf("write config: %v", err)
 	}
 
-	err := cmdCAIssue([]string{"epyc-1", "--config", path, "--out", filepath.Join(dir, "b")})
+	err := cmdCAIssue(t.Context(), []string{"epyc-1", "--config", path, "--out", filepath.Join(dir, "b")})
 	if err == nil {
 		t.Fatal("a node-only host issued a certificate")
 	}
@@ -254,7 +258,7 @@ func TestAnEnrolledNodeTakesItsIdentityFromItsBundle(t *testing.T) {
 	serverCfg := writeCAConfig(t, serverState)
 	out := filepath.Join(t.TempDir(), "bundle")
 
-	if err := cmdCAIssue([]string{"epyc-1", "--config", serverCfg, "--out", out}); err != nil {
+	if err := cmdCAIssue(t.Context(), []string{"epyc-1", "--config", serverCfg, "--out", out}); err != nil {
 		t.Fatalf("ca issue: %v", err)
 	}
 
@@ -311,7 +315,7 @@ func TestANodeRefusesABundleIssuedForSomebodyElse(t *testing.T) {
 	serverCfg := writeCAConfig(t, t.TempDir())
 	out := filepath.Join(t.TempDir(), "bundle")
 
-	if err := cmdCAIssue([]string{"mac-mini-1", "--config", serverCfg, "--out", out}); err != nil {
+	if err := cmdCAIssue(t.Context(), []string{"mac-mini-1", "--config", serverCfg, "--out", out}); err != nil {
 		t.Fatalf("ca issue: %v", err)
 	}
 
@@ -341,14 +345,14 @@ func TestAnUnusableBundleLeavesNoIdentityBehind(t *testing.T) {
 	serverCfg := writeCAConfig(t, t.TempDir())
 	out := filepath.Join(t.TempDir(), "bundle")
 
-	if err := cmdCAIssue([]string{"epyc-1", "--config", serverCfg, "--out", out}); err != nil {
+	if err := cmdCAIssue(t.Context(), []string{"epyc-1", "--config", serverCfg, "--out", out}); err != nil {
 		t.Fatalf("ca issue: %v", err)
 	}
 
 	// A key that belongs to a different certificate, which is what half a copy
 	// looks like.
 	other := filepath.Join(t.TempDir(), "other")
-	if err := cmdCAIssue([]string{"epyc-1", "--config", writeCAConfig(t, t.TempDir()), "--out", other}); err != nil {
+	if err := cmdCAIssue(t.Context(), []string{"epyc-1", "--config", writeCAConfig(t, t.TempDir()), "--out", other}); err != nil {
 		t.Fatalf("ca issue: %v", err)
 	}
 
@@ -372,4 +376,176 @@ func TestAnUnusableBundleLeavesNoIdentityBehind(t *testing.T) {
 		t.Error("the failed enrollment still recorded a deployment identity, so the correct " +
 			"bundle would now be refused as a conflict")
 	}
+}
+
+// A NODE WITH A CERTIFICATE NEED NOT BE TOLD ITS OWN NAME.
+//
+// The control plane authorises a node by the name in its certificate, so
+// node.name is a second place to write a fact the bundle already carries — and
+// the two can disagree. Worse, the default made them disagree by accident:
+// with node.name absent, config.Load filled it from the HOSTNAME, so a machine
+// whose hostname is not its node name (`ip-10-0-0-5` for a node enrolled as
+// `epyc-1`) got a name the control plane refuses, chosen by nobody.
+//
+// So a config with a bundle and no name loads, and the name comes from the
+// certificate.
+func TestANodeWithABundleNeedsNoName(t *testing.T) {
+	t.Parallel()
+
+	serverCfg := writeCAConfig(t, t.TempDir())
+	out := filepath.Join(t.TempDir(), "bundle")
+
+	if err := cmdCAIssue(t.Context(), []string{"epyc-1", "--config", serverCfg, "--out", out}); err != nil {
+		t.Fatalf("ca issue: %v", err)
+	}
+
+	cfg := nodeConfigWithoutName(t, t.TempDir(), out)
+
+	if cfg.Node.Name != "" {
+		t.Fatalf("config.Load supplied the name %q; with a bundle present the certificate "+
+			"is the authority and the hostname default only ever fights it", cfg.Node.Name)
+	}
+
+	if _, err := nodeBundle(cfg); err != nil {
+		t.Fatalf("loading the bundle: %v", err)
+	}
+
+	if cfg.Node.Name != "epyc-1" {
+		t.Errorf("the node is called %q; the certificate says %q, and that is the name the "+
+			"control plane will authorise", cfg.Node.Name, "epyc-1")
+	}
+}
+
+// AND A NAME THAT CONTRADICTS THE CERTIFICATE IS STILL REFUSED. Deriving the
+// name is not the same as ignoring one: an operator who wrote a name that the
+// bundle disagrees with has made a mistake worth naming, and the message says
+// which way out they have.
+func TestANameThatContradictsTheCertificateIsRefused(t *testing.T) {
+	t.Parallel()
+
+	serverCfg := writeCAConfig(t, t.TempDir())
+	out := filepath.Join(t.TempDir(), "bundle")
+
+	if err := cmdCAIssue(t.Context(), []string{"epyc-1", "--config", serverCfg, "--out", out}); err != nil {
+		t.Fatalf("ca issue: %v", err)
+	}
+
+	cfg := nodeConfigFor(t, "mac-mini-1", t.TempDir(), out)
+
+	_, err := nodeBundle(cfg)
+	if err == nil {
+		t.Fatal("a node claimed a name its certificate does not carry")
+	}
+
+	if !strings.Contains(err.Error(), "Remove node.name") {
+		t.Errorf("the refusal does not say how to resolve it: %v", err)
+	}
+}
+
+// nodeConfigWithoutName is nodeConfigFor with the name left to the certificate.
+func nodeConfigWithoutName(t *testing.T, stateDir, bundleDir string) *config.Config {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), "billet.yaml")
+
+	body := `
+node:
+  server_addr: 10.0.0.4:7717
+  provider: docker
+  state_dir: ` + stateDir + `
+  tls:
+    cert: ` + filepath.Join(bundleDir, "node.crt") + `
+    key: ` + filepath.Join(bundleDir, "node.key") + `
+    ca: ` + filepath.Join(bundleDir, "ca.crt") + `
+`
+
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("a node config that leaves its name to the certificate was refused: %v", err)
+	}
+
+	return cfg
+}
+
+// THE WIRE'S AUTHORITY BELONGS TO THE DEPLOYMENT, NOT TO THE HOSTNAME.
+//
+// serveNodeWire's third parameter is the deployment id, and every mTLS
+// deployment turns on it: the CA is minted with the deployment in its
+// Organization, a node reads its own deployment out of the certificate it is
+// given, and Plane.Register refuses a node whose deployment is not this one's.
+//
+// Handing it the hostname instead breaks both boot orders and neither says why.
+// Server first: the CA carries the hostname, so every node certificate does too,
+// the enrolled node cannot even parse it into a deployment id — the format is 32
+// hex characters and a hostname is not — and if it could, the plane would refuse
+// it forever as foreign. CLI first: `billet ca issue` mints against the real id,
+// and then the control plane will not start at all, because parseCA refuses an
+// authority issued for something else.
+//
+// Nothing else catches it. A loopback listener skips the whole block, which is
+// every local run and, until this test, every test.
+func TestTheNodeWireMintsItsAuthorityForTheDeployment(t *testing.T) {
+	stateDir := t.TempDir()
+
+	deploymentID, err := state.DeploymentID(stateDir)
+	if err != nil {
+		t.Fatalf("deployment id: %v", err)
+	}
+
+	// ":0" is the wildcard — every interface, which is exactly the case that
+	// requires certificates. A loopback address would serve plain HTTP and mint
+	// nothing.
+	cfg := &config.Config{Server: &config.ServerConfig{
+		Listen: ":0", StateDir: stateDir, NodeTLSHosts: []string{"billet.example"},
+	}}
+
+	stop, err := serveNodeWire(t.Context(), cfg,
+		nodeplane.New(slog.New(slog.DiscardHandler), deploymentID, time.Minute),
+		nil, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("serving the node wire on a network address: %v", err)
+	}
+
+	t.Cleanup(stop)
+
+	// The authority on disk has to be one this deployment can load. It is the
+	// same call `billet ca issue` and `billet nodes approve` make, so an
+	// authority that fails here is one no node can ever be admitted against.
+	if _, err := wirecert.LoadOrCreateCA(stateDir, deploymentID); err != nil {
+		t.Fatalf("the wire minted an authority this deployment cannot use: %v", err)
+	}
+}
+
+// AND IT ACCEPTS THE ONE THE CLI ALREADY MINTED, which is the other boot order:
+// an operator runs `billet ca issue` for the first node before ever starting the
+// control plane on an address nodes can reach.
+func TestTheNodeWireAcceptsTheAuthorityTheCLIMinted(t *testing.T) {
+	stateDir := t.TempDir()
+
+	deploymentID, err := state.DeploymentID(stateDir)
+	if err != nil {
+		t.Fatalf("deployment id: %v", err)
+	}
+
+	// What `billet ca issue` does before the server has ever run.
+	if _, err := wirecert.LoadOrCreateCA(stateDir, deploymentID); err != nil {
+		t.Fatalf("minting the authority: %v", err)
+	}
+
+	cfg := &config.Config{Server: &config.ServerConfig{
+		Listen: ":0", StateDir: stateDir, NodeTLSHosts: []string{"billet.example"},
+	}}
+
+	stop, err := serveNodeWire(t.Context(), cfg,
+		nodeplane.New(slog.New(slog.DiscardHandler), deploymentID, time.Minute),
+		nil, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("the control plane refused the authority its own CLI minted: %v", err)
+	}
+
+	t.Cleanup(stop)
 }

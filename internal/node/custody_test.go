@@ -27,16 +27,16 @@ func TestRecoverAdoptsAJobThatIsStillRunning(t *testing.T) {
 
 	p := &fakeProvider{kind: config.ProviderDocker}
 	a, host := newAllocatorWithHost(t)
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
 	lease := assignedLease(t, a)
 
-	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 
 	// A restart: empty maps, the container still running.
-	restarted := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	restarted := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
 	if err := restarted.Recover(t.Context()); err != nil {
 		t.Fatalf("Recover: %v", err)
@@ -61,15 +61,15 @@ func TestAnAdoptedLeaseIsKeptAlive(t *testing.T) {
 
 	p := &fakeProvider{kind: config.ProviderDocker}
 	a, host := newAllocatorWithHost(t)
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
 	lease := assignedLease(t, a)
 
-	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 
-	restarted := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	restarted := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
 	if err := restarted.Recover(t.Context()); err != nil {
 		t.Fatalf("Recover: %v", err)
@@ -100,15 +100,15 @@ func TestAnAdoptedJobIsCleanedUpWhenItFinishes(t *testing.T) {
 
 	p := &fakeProvider{kind: config.ProviderDocker}
 	a, host := newAllocatorWithHost(t)
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
 	lease := assignedLease(t, a)
 
-	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 
-	restarted := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	restarted := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
 	if err := restarted.Recover(t.Context()); err != nil {
 		t.Fatalf("Recover: %v", err)
@@ -144,15 +144,15 @@ func TestAnAdoptedJobIsDestroyedWhenItsLeaseIsReleased(t *testing.T) {
 
 	p := &fakeProvider{kind: config.ProviderDocker}
 	a, host := newAllocatorWithHost(t)
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
 	lease := assignedLease(t, a)
 
-	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 
-	restarted := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	restarted := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
 	if err := restarted.Recover(t.Context()); err != nil {
 		t.Fatalf("Recover: %v", err)
@@ -184,7 +184,7 @@ func TestRecoverDestroysWhatNothingIsWaitingFor(t *testing.T) {
 	})
 
 	a, host := newAllocatorWithHost(t)
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
 	if err := r.Recover(t.Context()); err != nil {
 		t.Fatalf("Recover: %v", err)
@@ -202,17 +202,17 @@ func TestRecoverDoesNotAdoptAnExitedContainer(t *testing.T) {
 
 	p := &fakeProvider{kind: config.ProviderDocker}
 	a, host := newAllocatorWithHost(t)
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
 	lease := assignedLease(t, a)
 
-	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 
 	p.stop(provider.InstanceName(lease.ID))
 
-	restarted := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	restarted := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
 	if err := restarted.Recover(t.Context()); err != nil {
 		t.Fatalf("Recover: %v", err)
@@ -247,10 +247,10 @@ func TestAnUnconfirmedCleanupHoldsTheCapacity(t *testing.T) {
 	}
 
 	a, host := newAllocatorWithHost(t)
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 	lease := assignedLease(t, a)
 
-	err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"})
+	err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"})
 	if err == nil {
 		t.Fatal("a launch that failed reported success")
 	}
@@ -276,10 +276,10 @@ func TestAConfirmedCleanupHoldsNothing(t *testing.T) {
 	}
 
 	a, host := newAllocatorWithHost(t)
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 	lease := assignedLease(t, a)
 
-	err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"})
+	err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"})
 	if err == nil {
 		t.Fatal("a launch that failed reported success")
 	}
@@ -305,10 +305,10 @@ func TestCustodyEndsWhenTheStrayIsFinallyDestroyed(t *testing.T) {
 	}
 
 	a, host := newAllocatorWithHost(t)
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 	lease := assignedLease(t, a)
 
-	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err == nil {
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err == nil {
 		t.Fatal("a launch that failed reported success")
 	}
 
@@ -351,15 +351,15 @@ func TestSweepLeavesHeldComputeAlone(t *testing.T) {
 
 	p := &fakeProvider{kind: config.ProviderDocker}
 	a, host := newAllocatorWithHost(t)
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
 	lease := assignedLease(t, a)
 
-	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 
-	restarted := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	restarted := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
 	if err := restarted.Recover(t.Context()); err != nil {
 		t.Fatalf("Recover: %v", err)
@@ -385,18 +385,18 @@ func TestCustodyRecordsWhenItStarted(t *testing.T) {
 
 	p := &fakeProvider{kind: config.ProviderDocker}
 	a, host := newAllocatorWithHost(t)
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
 	frozen := time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC)
 	r.now = func() time.Time { return frozen }
 
 	lease := assignedLease(t, a)
 
-	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 
-	restarted := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	restarted := New(a, host, &fakeJIT{setID: 7}, p, nil)
 	restarted.now = func() time.Time { return frozen }
 
 	if err := restarted.Recover(t.Context()); err != nil {
@@ -428,15 +428,15 @@ func TestCustodyIsKeptWhenTheReleaseFails(t *testing.T) {
 	store := &brittleStore{LeaseStore: a}
 	store.failRelease(errors.New("database is locked"))
 
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
 	lease := assignedLease(t, a)
 
-	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 
-	restarted := New(store, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	restarted := New(store, host, &fakeJIT{setID: 7}, p, nil)
 
 	if err := restarted.Recover(t.Context()); err != nil {
 		t.Fatalf("Recover: %v", err)
@@ -585,14 +585,14 @@ func TestTendReportsAnUnreachableLedger(t *testing.T) {
 	a, host := newAllocatorWithHost(t)
 	store := &brittleStore{LeaseStore: a}
 
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 	lease := assignedLease(t, a)
 
-	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 
-	restarted := New(store, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	restarted := New(store, host, &fakeJIT{setID: 7}, p, nil)
 
 	// Adoption succeeds; the ledger fails afterwards.
 	if err := restarted.Recover(t.Context()); err != nil {
@@ -626,17 +626,17 @@ func TestRecoverRenewsTheLeaseItAdopts(t *testing.T) {
 
 	p := &fakeProvider{kind: config.ProviderDocker}
 	a, host := newAllocatorWithHost(t)
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
 	lease := assignedLease(t, a)
 
-	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 
 	store := &brittleStore{LeaseStore: a}
 	store.failHeartbeat(errors.New("database is locked"))
-	restarted := New(store, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	restarted := New(store, host, &fakeJIT{setID: 7}, p, nil)
 
 	if err := restarted.Recover(t.Context()); err == nil {
 		t.Fatal("recovery reported success though it could not renew the lease it adopted; " +
@@ -660,15 +660,15 @@ func TestRecoverDoesNotDestroyWhenItCannotReadTheLease(t *testing.T) {
 
 	p := &fakeProvider{kind: config.ProviderDocker}
 	a, host := newAllocatorWithHost(t)
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
-	if err := r.Launch(t.Context(), assignedLease(t, a), Job{RequestID: 11, Event: "push"}); err != nil {
+	if err := r.Launch(t.Context(), assignedLease(t, a), dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 
 	store := &brittleStore{LeaseStore: a}
 	store.failLease(errors.New("disk I/O error"))
-	restarted := New(store, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	restarted := New(store, host, &fakeJIT{setID: 7}, p, nil)
 
 	if err := restarted.Recover(t.Context()); err == nil {
 		t.Fatal("recovery reported success though it could not read the lease")
@@ -690,17 +690,17 @@ func TestACompletionEndsAnAdoption(t *testing.T) {
 
 	p := &fakeProvider{kind: config.ProviderDocker}
 	a, host := newAllocatorWithHost(t)
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
 	const requestID = 4242
 
 	lease := assignedLease(t, a)
 
-	if err := r.Launch(t.Context(), lease, Job{RequestID: requestID, Event: "push"}); err != nil {
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: requestID, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 
-	restarted := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	restarted := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
 	if err := restarted.Recover(t.Context()); err != nil {
 		t.Fatalf("Recover: %v", err)
@@ -736,14 +736,14 @@ func TestADiscardedCustodyRecordsAFailure(t *testing.T) {
 	}
 
 	a, host := newAllocatorWithHost(t)
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
 	frozen := time.Now()
 	r.now = func() time.Time { return frozen }
 
 	lease := assignedLease(t, a)
 
-	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err == nil {
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err == nil {
 		t.Fatal("a launch that failed reported success")
 	}
 
@@ -769,14 +769,14 @@ func TestAnAbsentStrayIsNotBelievedImmediately(t *testing.T) {
 	}
 
 	a, host := newAllocatorWithHost(t)
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
 	frozen := time.Now()
 	r.now = func() time.Time { return frozen }
 
 	lease := assignedLease(t, a)
 
-	err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"})
+	err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"})
 	if err == nil {
 		t.Fatal("a launch that failed reported success")
 	}
@@ -818,17 +818,17 @@ func TestHeldComputeIsNotDestroyedOnATimerByDefault(t *testing.T) {
 
 	p := &fakeProvider{kind: config.ProviderDocker}
 	a, host := newAllocatorWithHost(t)
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
 	lease := assignedLease(t, a)
 
-	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 
 	frozen := time.Now()
 
-	restarted := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	restarted := New(a, host, &fakeJIT{setID: 7}, p, nil)
 	restarted.now = func() time.Time { return frozen }
 
 	if err := restarted.Recover(t.Context()); err != nil {
@@ -858,11 +858,11 @@ func TestAConfiguredBoundDestroysAndRecordsAFailure(t *testing.T) {
 
 	p := &fakeProvider{kind: config.ProviderDocker}
 	a, host := newAllocatorWithHost(t)
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
 	lease := assignedLease(t, a)
 
-	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 
@@ -872,7 +872,7 @@ func TestAConfiguredBoundDestroysAndRecordsAFailure(t *testing.T) {
 	// tested the expiry logic while leaving the only way an operator can reach it
 	// — WithMaxCustody — uncovered, which is how the previous version of this
 	// capability shipped configurable in name only.
-	restarted := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil,
+	restarted := New(a, host, &fakeJIT{setID: 7}, p, nil,
 		WithMaxCustody(2*time.Hour))
 	restarted.now = func() time.Time { return frozen }
 
@@ -936,17 +936,17 @@ func TestAnAdoptedRequestIsNotLaunchedAgain(t *testing.T) {
 
 	p := &fakeProvider{kind: config.ProviderDocker}
 	a, host := newAllocatorWithHost(t)
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
 	const requestID = 5150
 
 	lease := assignedLease(t, a)
 
-	if err := r.Launch(t.Context(), lease, Job{RequestID: requestID, Event: "push"}); err != nil {
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: requestID, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 
-	restarted := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	restarted := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
 	if err := restarted.Recover(t.Context()); err != nil {
 		t.Fatalf("Recover: %v", err)
@@ -955,7 +955,7 @@ func TestAnAdoptedRequestIsNotLaunchedAgain(t *testing.T) {
 	// The redelivery: a brand-new lease for the SAME request.
 	second := assignedLease(t, a)
 
-	err := restarted.Launch(t.Context(), second, Job{RequestID: lease.RequestID, Event: "push"})
+	err := restarted.Launch(t.Context(), second, dockerSpec(), Job{RequestID: lease.RequestID, Event: "push"})
 	if err == nil {
 		t.Fatal("started a second runner for a job billet is already running")
 	}
@@ -975,17 +975,17 @@ func TestACompletionClearsBothRunningAndHeldCompute(t *testing.T) {
 
 	p := &fakeProvider{kind: config.ProviderDocker}
 	a, host := newAllocatorWithHost(t)
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
 	const requestID = 6260
 
 	lease := assignedLease(t, a)
 
-	if err := r.Launch(t.Context(), lease, Job{RequestID: requestID, Event: "push"}); err != nil {
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: requestID, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 
-	restarted := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	restarted := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
 	if err := restarted.Recover(t.Context()); err != nil {
 		t.Fatalf("Recover: %v", err)
@@ -1030,15 +1030,15 @@ func TestFinishingAStaleEntryDoesNotDropItsReplacement(t *testing.T) {
 
 	p := &fakeProvider{kind: config.ProviderDocker}
 	a, host := newAllocatorWithHost(t)
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
 	lease := assignedLease(t, a)
 
-	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 
-	restarted := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	restarted := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
 	if err := restarted.Recover(t.Context()); err != nil {
 		t.Fatalf("Recover: %v", err)
@@ -1079,15 +1079,13 @@ func TestFinishingAStaleEntryDoesNotDropItsReplacement(t *testing.T) {
 
 // A completion arriving while the periodic tick runs must not race it.
 //
-// These are genuinely different goroutines in production: completions come from
-// a listener, the tick from the reaper. Both end up in tendOne, which mutates
-// the entry in place and issues backend calls between reads — so two of them on
-// one entry destroy the same instance twice, and a delete can drop an entry that
-// was just replaced.
+// These are different goroutines in production — completions from a listener, the
+// tick from the reaper — and both reach tendOne, which mutates the entry in place
+// and issues backend calls between reads. Two of them destroy the same instance
+// twice, and a delete can drop an entry that was just replaced.
 //
-// Serializing only the FLAG WRITE was not enough, which is what this exists to
-// catch: it is the same bug the serialization was added for, moved one line
-// down. Run under -race, which is how the suite runs.
+// Serializing only the FLAG WRITE is the same bug moved one line down, which is
+// what this catches. Run under -race.
 func TestACompletionDoesNotRaceTheTick(t *testing.T) {
 	t.Parallel()
 
@@ -1095,17 +1093,17 @@ func TestACompletionDoesNotRaceTheTick(t *testing.T) {
 	// callers inside the transition long enough to genuinely overlap.
 	p := &fakeProvider{kind: config.ProviderDocker, findDelay: 20 * time.Millisecond}
 	a, host := newAllocatorWithHost(t)
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
 	const requestID = 7777
 
 	lease := assignedLease(t, a)
 
-	if err := r.Launch(t.Context(), lease, Job{RequestID: requestID, Event: "push"}); err != nil {
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: requestID, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 
-	restarted := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	restarted := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
 	if err := restarted.Recover(t.Context()); err != nil {
 		t.Fatalf("Recover: %v", err)
@@ -1174,15 +1172,15 @@ func TestKeepAliveRenewsHeldLeasesWhileTendIsBlocked(t *testing.T) {
 
 	a, host := newAllocatorWithHost(t)
 
-	warm := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	warm := New(a, host, &fakeJIT{setID: 7}, p, nil)
 	lease := assignedLease(t, a)
 
-	if err := warm.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
+	if err := warm.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 
 	store := &brittleStore{LeaseStore: a}
-	r := New(store, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r := New(store, host, &fakeJIT{setID: 7}, p, nil)
 
 	if err := r.Recover(t.Context()); err != nil {
 		t.Fatalf("Recover: %v", err)
@@ -1234,16 +1232,14 @@ func TestKeepAliveRenewsHeldLeasesWhileTendIsBlocked(t *testing.T) {
 	}
 }
 
-// A LAUNCH IN PROGRESS IS RENEWED, because for its whole duration nobody else
-// is doing it.
+// A LAUNCH IN PROGRESS IS RENEWED, because for its whole duration nobody else is
+// doing it.
 //
 // Across the wire the control plane stops waiting after its command timeout and
-// hands the listener custody, which stops the listener heartbeating. The node is
-// meanwhile still inside provider.Launch — pulling a large image, say — and does
-// not adopt anything until that call returns. Between those two moments the
-// lease had no owner: the reaper released its capacity, the allocator sold it to
-// another job, and then the launch completed and started a second workload on
-// hardware that was already spoken for.
+// hands the listener custody, which stops the listener heartbeating — while the node
+// is still inside provider.Launch and adopts nothing until it returns. Between
+// those moments the lease has no owner: the reaper releases its capacity and the
+// allocator sells it to another job.
 func TestALaunchInProgressKeepsItsLeaseRenewed(t *testing.T) {
 	t.Parallel()
 
@@ -1257,7 +1253,7 @@ func TestALaunchInProgressKeepsItsLeaseRenewed(t *testing.T) {
 	a, host := newAllocatorWithHost(t)
 
 	store := &brittleStore{LeaseStore: a}
-	r := New(store, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r := New(store, host, &fakeJIT{setID: 7}, p, nil)
 	r.ttl = func() time.Duration { return 30 * time.Millisecond }
 
 	lease := assignedLease(t, a)
@@ -1267,7 +1263,7 @@ func TestALaunchInProgressKeepsItsLeaseRenewed(t *testing.T) {
 
 	go func() {
 		//nolint:errcheck // it is expected to block, not to return
-		_ = r.Launch(ctx, lease, Job{RequestID: 11, Event: "push"})
+		_ = r.Launch(ctx, lease, dockerSpec(), Job{RequestID: 11, Event: "push"})
 	}()
 
 	select {
@@ -1299,15 +1295,11 @@ func TestALaunchInProgressKeepsItsLeaseRenewed(t *testing.T) {
 
 // THE JANITOR FOLLOWS A RENEGOTIATED TTL, because the plane can shorten it.
 //
-// The TTL is agreed at registration, and a node re-registers whenever the
-// control plane forgets it or restarts. A plane that comes back advertising a
-// SHORTER TTL leaves a janitor built on the old one renewing too slowly: the
-// lease expires between two heartbeats, the reaper resells its capacity, and the
-// container it was holding is still running.
-//
-// The janitor is deliberately started once — custody outlives any single
-// registration — so re-reading the value each cycle is the only place that
-// correction can happen.
+// The TTL is agreed at registration, and a node re-registers whenever the control
+// plane forgets it. A plane advertising a SHORTER one leaves a janitor built on the
+// old value renewing too slowly, so the lease expires between heartbeats while its
+// container runs. The janitor starts once — custody outlives any registration — so
+// re-reading each cycle is the only place that correction can happen.
 func TestKeepAliveFollowsAShortenedLeaseTTL(t *testing.T) {
 	t.Parallel()
 
@@ -1315,15 +1307,15 @@ func TestKeepAliveFollowsAShortenedLeaseTTL(t *testing.T) {
 
 	a, host := newAllocatorWithHost(t)
 
-	warm := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	warm := New(a, host, &fakeJIT{setID: 7}, p, nil)
 	lease := assignedLease(t, a)
 
-	if err := warm.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
+	if err := warm.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 
 	store := &brittleStore{LeaseStore: a}
-	r := New(store, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r := New(store, host, &fakeJIT{setID: 7}, p, nil)
 
 	if err := r.Recover(t.Context()); err != nil {
 		t.Fatalf("Recover: %v", err)
@@ -1353,16 +1345,14 @@ func TestKeepAliveFollowsAShortenedLeaseTTL(t *testing.T) {
 
 	go r.KeepAlive(ctx)
 
-	// WAIT UNTIL THE JANITOR HAS READ THE LONG TTL, which is the moment it is
-	// committed to that cadence, and the only thing that makes shortening it a
-	// test of adaptation rather than of scheduling order.
+	// WAIT UNTIL THE JANITOR HAS READ THE LONG TTL, which is the moment it commits to
+	// that cadence and the only thing that makes shortening it a test of adaptation
+	// rather than of scheduling order.
 	//
-	// This took three attempts. The first stored the short value immediately
-	// after starting the goroutine, so the goroutine usually read the SHORT one on
-	// its first pass. The second waited for a heartbeat — and Recover had already
-	// heartbeated while adopting, so the wait returned instantly and the race was
-	// exactly as before. Counting the janitor's own reads is the signal that
-	// cannot be satisfied by anything else.
+	// Storing the short value straight after starting the goroutine lets it read the
+	// SHORT one first; waiting for a heartbeat returns instantly because Recover already
+	// heartbeated while adopting. Counting the janitor's own reads is the only signal
+	// nothing else satisfies.
 	armedBy := time.Now().Add(15 * time.Second)
 	for reads.Load() == 0 {
 		if time.Now().After(armedBy) {
@@ -1406,7 +1396,7 @@ func TestKeepAliveStopsWithItsContext(t *testing.T) {
 
 	p := &fakeProvider{kind: config.ProviderDocker}
 	a, host := newAllocatorWithHost(t)
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
 	r.ttl = func() time.Duration { return 30 * time.Millisecond }
 
@@ -1439,15 +1429,15 @@ func TestKeepAliveDoesNotActOnARenewalFailure(t *testing.T) {
 	p := &fakeProvider{kind: config.ProviderDocker}
 	a, host := newAllocatorWithHost(t)
 
-	warm := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	warm := New(a, host, &fakeJIT{setID: 7}, p, nil)
 	lease := assignedLease(t, a)
 
-	if err := warm.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
+	if err := warm.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 
 	store := &brittleStore{LeaseStore: a}
-	r := New(store, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r := New(store, host, &fakeJIT{setID: 7}, p, nil)
 
 	if err := r.Recover(t.Context()); err != nil {
 		t.Fatalf("Recover: %v", err)
@@ -1478,37 +1468,34 @@ func TestKeepAliveDoesNotActOnARenewalFailure(t *testing.T) {
 
 // A custody failure does not strand the listener's own lease.
 //
-// A completion for a request that has BOTH — which a redelivered assignment
-// after a crash produces — has to answer the listener's question, which is only
-// ever "is MY compute gone". The listener reads any error as "it may still
-// exist", so it keeps its lease and heartbeats it: returning a custody-only
-// failure stranded a lease whose compute had just been destroyed successfully,
-// permanently, until shutdown.
+// A completion for a request that has BOTH — which a redelivered assignment after a
+// crash produces — answers only "is MY compute gone". The listener reads any error
+// as "it may still exist" and keeps heartbeating, so a custody-only failure strands
+// a lease whose compute was just destroyed successfully.
 //
-// Custody does not need the listener's help. Its entry holds its own lease,
-// which holds its own capacity, and Tend retries every tick. So the custody
-// failure is logged and the return value speaks for the running half alone.
+// Custody does not need the help: its entry holds its own lease, and Tend retries
+// every tick.
 func TestACustodyFailureDoesNotStrandTheListenersLease(t *testing.T) {
 	t.Parallel()
 
 	p := &fakeProvider{kind: config.ProviderDocker}
 	a, host := newAllocatorWithHost(t)
 
-	warm := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	warm := New(a, host, &fakeJIT{setID: 7}, p, nil)
 	lease := assignedLease(t, a)
 
 	// THE LEASE'S OWN request id, not a constant. assignedLease writes its own
 	// value into the ledger, and recovery reads the request id back from THERE.
 	requestID := lease.RequestID
 
-	if err := warm.Launch(t.Context(), lease, Job{RequestID: requestID, Event: "push"}); err != nil {
+	if err := warm.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: requestID, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 
 	// Releases fail, so finishing the custody entry errors.
 	store := &brittleStore{LeaseStore: a}
 	store.failRelease(errors.New("database is locked"))
-	restarted := New(store, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	restarted := New(store, host, &fakeJIT{setID: 7}, p, nil)
 
 	if err := restarted.Recover(t.Context()); err != nil {
 		t.Fatalf("Recover: %v", err)
@@ -1560,7 +1547,7 @@ func TestACompletionClearsEveryEntryForItsRequest(t *testing.T) {
 	p := &fakeProvider{kind: config.ProviderDocker}
 	a, host := newAllocatorWithHost(t)
 	store := &brittleStore{LeaseStore: a}
-	r := New(store, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r := New(store, host, &fakeJIT{setID: 7}, p, nil)
 
 	const requestID = 9090
 
@@ -1642,16 +1629,16 @@ func TestAVanishedAdoptedContainerIsReleasedWithoutWaiting(t *testing.T) {
 	p := &fakeProvider{kind: config.ProviderDocker}
 	a, host := newAllocatorWithHost(t)
 
-	warm := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	warm := New(a, host, &fakeJIT{setID: 7}, p, nil)
 	lease := assignedLease(t, a)
 
-	if err := warm.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
+	if err := warm.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 
 	frozen := time.Now()
 
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 	r.now = func() time.Time { return frozen }
 
 	if err := r.Recover(t.Context()); err != nil {
@@ -1696,14 +1683,14 @@ func TestAnUnseenStrayStillWaits(t *testing.T) {
 	}
 
 	a, host := newAllocatorWithHost(t)
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
 	frozen := time.Now()
 	r.now = func() time.Time { return frozen }
 
 	lease := assignedLease(t, a)
 
-	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err == nil {
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err == nil {
 		t.Fatal("a launch that failed reported success")
 	}
 
@@ -1732,14 +1719,14 @@ func TestAStrayThatAppearsBecomesObserved(t *testing.T) {
 	}
 
 	a, host := newAllocatorWithHost(t)
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
 	frozen := time.Now()
 	r.now = func() time.Time { return frozen }
 
 	lease := assignedLease(t, a)
 
-	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err == nil {
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err == nil {
 		t.Fatal("a launch that failed reported success")
 	}
 
@@ -1798,7 +1785,7 @@ func TestAnOrdinaryRunningJobCountsAsHolding(t *testing.T) {
 
 	a, host := newAllocatorWithHost(t)
 
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 
 	if r.Holding() {
 		t.Fatal("a node with nothing running reported that it was holding something")
@@ -1806,7 +1793,7 @@ func TestAnOrdinaryRunningJobCountsAsHolding(t *testing.T) {
 
 	lease := assignedLease(t, a)
 
-	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 
@@ -1832,10 +1819,10 @@ func TestSupersessionMovesRunningWorkIntoCustody(t *testing.T) {
 
 	a, host := newAllocatorWithHost(t)
 
-	r := New(a, host, &fakeJIT{setID: 7}, p, []config.Tier{dockerTier()}, nil)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 	lease := assignedLease(t, a)
 
-	if err := r.Launch(t.Context(), lease, Job{RequestID: 11, Event: "push"}); err != nil {
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 

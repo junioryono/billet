@@ -35,15 +35,12 @@ func waitUntil(ctx context.Context, t *testing.T, what string, cond func() bool)
 	}
 }
 
-// drainLog captures a listener's log so a test can observe that the drain
-// actually began.
+// drainLog captures a listener's log so a test can observe that the drain began.
 //
-// EVERY DRAIN TEST NEEDS THIS, and the first versions did not have it. The
-// observable effects of a drain — the idle escrow released, the job destroyed,
-// Run returning — are ALSO what the ordinary teardown does, so a test that waits
-// on those alone passes just as happily against a listener that never drained at
-// all. The drain announces itself exactly once, and that announcement is the only
-// unambiguous evidence that this code path ran.
+// EVERY DRAIN TEST NEEDS THIS. The observable effects of a drain — idle escrow
+// released, job destroyed, Run returning — are ALSO what the ordinary teardown does,
+// so waiting on those alone passes against a listener that never drained. The drain
+// announces itself exactly once.
 type drainLog struct {
 	mu  sync.Mutex
 	buf bytes.Buffer
@@ -81,30 +78,23 @@ const beganDraining = "draining: not taking new work"
 
 // slowPoll makes a fake session behave like a long poll instead of a spin.
 //
-// A fake that returns ErrNoMessage immediately turns the drain's loop into a hot
-// spin: it takes l.mu on every pass through capacity() and drained(), and under
-// -race that is enough to starve the heartbeat goroutine. A lease whose renewal
-// goes stale is then MOVED OUT of `running` into the cleanup set — the listener
-// says so at the point it does it, "THE LEASE GOES; THE OBLIGATION DOES NOT" —
-// and drained() only looks at `running`, so the drain reports itself finished
-// and its budget never expires.
-//
-// Short enough not to slow the suite, long enough to let the heartbeat run.
+// A fake returning ErrNoMessage immediately turns the drain's loop into a hot spin:
+// it takes l.mu on every pass through capacity() and drained(), and under -race that
+// starves the heartbeat. A lease whose renewal goes stale is then MOVED OUT of
+// `running` into the cleanup set, and drained() only looks at `running` — so the
+// drain reports itself finished and its budget never expires.
 func slowPoll() { time.Sleep(2 * time.Millisecond) }
 
-// outlivesTheDrain is a lease TTL long enough that no lease can expire while a
-// drain is being timed out.
+// outlivesTheDrain is a lease TTL long enough that no lease can expire while a drain
+// is being timed out.
 //
-// A TEST THAT ASSERTS THE DRAIN RAN OUT OF BUDGET MUST OUTLIVE ITS OWN LEASES,
-// and that is not obvious until it bites. The drain ends on whichever comes
-// first: everything finished, or the budget gone. A lease that expires mid-drain
-// empties `running`, so the drain ends by being FINISHED — the other branch,
-// which never writes the line those tests assert on. With the 300ms TTL the
-// other drain tests use, that happened about one run in four under -race, and it
-// is the failure CI caught on #19.
+// A TEST THAT ASSERTS THE DRAIN RAN OUT OF BUDGET MUST OUTLIVE ITS OWN LEASES. The
+// drain ends on whichever comes first — everything finished, or the budget gone —
+// and a lease expiring mid-drain empties `running`, so it ends by being FINISHED and
+// never writes the line those tests assert on. At the 300ms TTL the other drain
+// tests use that happened about one run in four under -race.
 //
-// Tests asserting the drain finished its work (gaveUp ABSENT) do not need this:
-// a lease expiring early pushes them further towards the outcome they expect.
+// Tests asserting the drain finished its work do not need this.
 const outlivesTheDrain = 30 * time.Second
 
 // gaveUp is the drain giving up on its budget, as opposed to finishing. Kept as
@@ -152,13 +142,10 @@ func (r *runResult) has() bool {
 
 // awaitDrainStart blocks until the listener says it has begun draining.
 //
-// IT ALSO WATCHES FOR RUN RETURNING FIRST, because that is the failure this
-// otherwise reports as "the drain never began" — thirty seconds later, naming
-// the symptom and hiding the cause. A poll or an escrow refill that fails for
-// its own reasons ends Run before the cancel ever arrives; under a loaded
-// machine running fourteen instrumented test binaries, that is a transient
-// database error, and the test should say so rather than describe a drain that
-// was never going to happen.
+// IT ALSO WATCHES FOR RUN RETURNING FIRST, because that failure otherwise reports as
+// "the drain never began" thirty seconds later, naming the symptom and hiding the
+// cause: a poll or an escrow refill that fails for its own reasons ends Run before
+// the cancel arrives.
 func awaitDrainStart(ctx context.Context, t *testing.T, d *drainLog, run *runResult) {
 	t.Helper()
 
@@ -211,15 +198,13 @@ func awaitRun(ctx context.Context, t *testing.T, run *runResult) {
 	}
 }
 
-// THE FIRST HALF OF A DRAIN: stop offering capacity nobody is using, without
-// lying to GitHub about the capacity somebody IS using.
+// THE FIRST HALF OF A DRAIN: stop offering capacity nobody is using, without lying
+// to GitHub about the capacity somebody IS using.
 //
-// The naive way to stop taking work is to advertise a constant zero. That is
-// untrue while a job runs, and the number billet sends is documented as the
-// scale set's TOTAL capacity rather than its spare. Releasing the idle escrow
-// instead makes the advertisement fall to exactly the work still in flight and
-// reach zero by itself when the last job finishes — the drain's own completion
-// condition, arrived at without a second source of truth.
+// Advertising a constant zero is untrue while a job runs, and the number billet
+// sends is the scale set's TOTAL capacity rather than its spare. Releasing the idle
+// escrow makes the advertisement fall to the work still in flight and reach zero by
+// itself — the drain's completion condition, without a second source of truth.
 func TestADrainReleasesIdleEscrowAndAdvertisesOnlyWhatIsRunning(t *testing.T) {
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
 	// Room for two runners at four vCPU each, so there is genuinely idle escrow

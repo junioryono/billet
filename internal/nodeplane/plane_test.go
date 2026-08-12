@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -44,7 +45,21 @@ func (c *testClock) advancePastSilence() { c.nanos.Add(int64(10 * time.Minute)) 
 func testPlane(t *testing.T, opts ...Option) *Plane {
 	t.Helper()
 
+	// WITH A CATALOGUE, because a launch carries the tier's shape to the node and
+	// the plane refuses one it cannot describe. A test plane without it fails
+	// every launch before dispatch, which reads as "the command was never
+	// delivered".
+	opts = append([]Option{WithTierCatalog([]config.Tier{testTier()})}, opts...)
+
 	return New(slog.New(slog.DiscardHandler), deployment, time.Minute, opts...)
+}
+
+// testTier is the catalogue entry testLease names.
+func testTier() config.Tier {
+	return config.Tier{
+		Label: "billet-2vcpu", Provider: config.ProviderDocker, GuestOS: config.GuestLinux,
+		VCPU: 2, Memory: 8 * config.GiB, Image: "ubuntu-2404-x64",
+	}
 }
 
 func register(t *testing.T, p *Plane, name string, provider config.ProviderKind) {
@@ -55,6 +70,10 @@ func register(t *testing.T, p *Plane, name string, provider config.ProviderKind)
 		Node:       name,
 		Provider:   provider,
 		Deployment: deployment,
+		// What this host contributes. The plane refuses a registration offering
+		// nothing, so every test node has to say something.
+		VCPU:   8,
+		Memory: 32 * config.GiB,
 	}); err != nil {
 		t.Fatalf("register %s: %v", name, err)
 	}
@@ -276,13 +295,36 @@ func TestAVersionMismatchIsRefused(t *testing.T) {
 
 	p := testPlane(t)
 
-	_, err := p.Register(t.Context(), nodeapi.RegisterRequest{
-		Version:    nodeapi.Version + 1,
-		Node:       "n1",
-		Deployment: deployment,
-	})
-	if err == nil {
-		t.Fatal("a node speaking a different protocol version was accepted")
+	// BOTH DIRECTIONS, AND ONE OF THEM IS THE REAL CASE. A node OLDER than the
+	// server is what actually happens during a rolling upgrade — version 1
+	// reports no capacity and no site — while a newer node is the rarer reverse.
+	// Testing only Version+1 left the case an operator will actually hit
+	// unasserted.
+	for _, version := range []int{1, nodeapi.Version + 1} {
+		_, err := p.Register(t.Context(), nodeapi.RegisterRequest{
+			Version:    version,
+			Node:       "n1",
+			Deployment: deployment,
+			VCPU:       8,
+			Memory:     32 * config.GiB,
+		})
+		if err == nil {
+			t.Fatalf("a node speaking protocol version %d was accepted", version)
+		}
+
+		// PERMANENT, which is the half that matters. A node retries anything that
+		// might heal; this cannot, so a refusal reported as an outage would have
+		// the node reconnecting forever instead of telling somebody to upgrade.
+		if !errors.Is(err, ErrRefused) {
+			t.Errorf("version %d was not refused permanently: %v", version, err)
+		}
+
+		// The diagnostic has to name both numbers, because "upgrade whichever is
+		// older" is not actionable without knowing which one that is.
+		if !strings.Contains(err.Error(), strconv.Itoa(version)) ||
+			!strings.Contains(err.Error(), strconv.Itoa(nodeapi.Version)) {
+			t.Errorf("the refusal does not name both versions: %v", err)
+		}
 	}
 }
 
@@ -407,15 +449,12 @@ func TestAnIdlePollIsNotAnError(t *testing.T) {
 
 // ONE WEDGED NODE MUST NOT HOLD UP A DESTROY ON THE OTHERS.
 //
-// Destroy broadcasts, and the first version asked each node in turn — so a
-// single host that never answers would block the whole call for the command
-// timeout before the next node was even asked. Destroy runs on shutdown and on
-// completion paths, where minutes of that turns one bad host into a stalled
+// Asking each node in turn lets a single host that never answers block the whole
+// call for the command timeout before the next is asked — and Destroy runs on
+// shutdown and completion paths, where that turns one bad host into a stalled
 // control plane.
 //
-// The timing assertion is deliberately loose: what is being proved is
-// "concurrent, not serial", and a threshold near the timeout distinguishes those
-// two without being sensitive to how fast the machine is.
+// The timing assertion is deliberately loose: it proves "concurrent, not serial".
 func TestOneWedgedNodeDoesNotStallADestroy(t *testing.T) {
 	t.Parallel()
 
@@ -549,15 +588,11 @@ func TestADestroySkipsAForgottenNode(t *testing.T) {
 
 // A NODE WITH WORK IN FLIGHT IS BUSY, NOT SILENT.
 //
-// The node loop executes commands synchronously, so a host pulling a
-// five-minute image does not poll while it works. Expiring it there was actively
-// harmful: expiry answers an in-flight launch with custody, the listener stops
-// heartbeating on that, and the lease is reaped before the provider has even
-// returned — after which the launch starts a runner on capacity already sold to
-// somebody else.
-//
-// The command timeout bounds this instead, which is the instrument that already
-// decides how long an unanswered command may run before its outcome is unknown.
+// The node loop executes commands synchronously, so a host pulling a five-minute
+// image does not poll while it works. Expiring it answers an in-flight launch with
+// custody, the listener stops heartbeating, and the lease is reaped before the
+// provider has returned — after which the launch starts a runner on capacity already
+// sold. The command timeout bounds this instead.
 func TestABusyNodeIsNotForgotten(t *testing.T) {
 	t.Parallel()
 
@@ -648,17 +683,13 @@ func TestAForgottenNodeReleasesItsQueuedWork(t *testing.T) {
 
 // A RESULT THAT LANDS AS THE TIMER FIRES IS STILL A RESULT.
 //
-// Both branches of dispatch's select are live at once. The timer fires, and
-// Result takes the plane's mutex first: it deletes the inflight entry, delivers
-// the answer, and replies 204 to a node that is now certain its report landed.
-// The timeout branch used to declare custody anyway, and the listener stopped
-// heartbeating on the strength of it. Nobody held the lease, the container was
-// running, and each side believed the other had it.
+// Both branches of dispatch's select are live at once. Result takes the mutex first,
+// deletes the inflight entry, and replies 204 to a node now certain its report
+// landed; a timeout branch that declared custody anyway left nobody holding the
+// lease while the container ran.
 //
-// Written against settle directly rather than raced, because a test that merely
-// runs the race proves whichever ordering it happened to get. This reproduces
-// the losing ordering exactly: the result is already delivered and the inflight
-// entry already gone, which is the state Result leaves behind.
+// Written against settle directly rather than raced, because a test that runs the
+// race proves whichever ordering it happened to get.
 func TestAResultThatLandedBeforeTheTimeoutIsTaken(t *testing.T) {
 	t.Parallel()
 
@@ -726,16 +757,13 @@ func TestATimedOutLaunchWithNoResultStillMeansCustody(t *testing.T) {
 
 // A QUEUED COMMAND IS NOT HANDED TO A PROCESS THAT HAS LOST THE NAME.
 //
-// The HTTP guard checks the incarnation before this function takes the mutex, so
-// a supersession landing in between reaches a fast path that never looked again.
-// The command would be handed over, that process recorded as the lease's owner,
-// and — since the JIT entitlement follows the command — it would hold a genuine
-// right to mint that runner's registration.
+// The HTTP guard checks the incarnation before this function takes the mutex, so a
+// supersession landing in between reaches a fast path that never looked again — and
+// since the JIT entitlement follows the command, that process would hold a genuine
+// right to mint the runner's registration.
 //
-// Driven against Plane.Poll directly, because the race it guards cannot be
-// produced from outside: the guard would refuse the request long before the
-// window opens. Calling the function the window exists inside is the only way to
-// stand in it.
+// Driven against Plane.Poll directly: the guard would refuse the request long before
+// the window opens.
 func TestAQueuedCommandIsNotGivenToASupersededProcess(t *testing.T) {
 	t.Parallel()
 
@@ -746,6 +774,8 @@ func TestAQueuedCommandIsNotGivenToASupersededProcess(t *testing.T) {
 		Node:        "n1",
 		Provider:    config.ProviderDocker,
 		Deployment:  deployment,
+		VCPU:        8,
+		Memory:      32 * config.GiB,
 		Incarnation: "first",
 	}); err != nil {
 		t.Fatalf("register: %v", err)
@@ -772,6 +802,8 @@ func TestAQueuedCommandIsNotGivenToASupersededProcess(t *testing.T) {
 		Node:        "n1",
 		Provider:    config.ProviderDocker,
 		Deployment:  deployment,
+		VCPU:        8,
+		Memory:      32 * config.GiB,
 		Incarnation: "second",
 	}); err != nil {
 		t.Fatalf("re-register: %v", err)
@@ -883,6 +915,8 @@ func deliverLaunch(t *testing.T) (*Plane, nodeapi.Command) {
 		Node:        "n1",
 		Provider:    config.ProviderDocker,
 		Deployment:  deployment,
+		VCPU:        8,
+		Memory:      32 * config.GiB,
 		Incarnation: "first",
 	}); err != nil {
 		t.Fatalf("register: %v", err)
@@ -934,6 +968,8 @@ func TestRegistrationPrunesOwnershipTheLedgerHasEnded(t *testing.T) {
 		Node:        "n1",
 		Provider:    config.ProviderDocker,
 		Deployment:  deployment,
+		VCPU:        8,
+		Memory:      32 * config.GiB,
 		Incarnation: "first",
 	}); err != nil {
 		t.Fatalf("register: %v", err)
@@ -1001,6 +1037,8 @@ func TestASupersessionDuringADestroyIsNotAConfirmation(t *testing.T) {
 		Node:        "n1",
 		Provider:    config.ProviderDocker,
 		Deployment:  deployment,
+		VCPU:        8,
+		Memory:      32 * config.GiB,
 		Incarnation: "second",
 	}); err != nil {
 		t.Fatalf("re-register: %v", err)
@@ -1085,6 +1123,8 @@ func TestALateDestroyResultFromTheOwnerEndsItsOwnership(t *testing.T) {
 		Node:        "n1",
 		Provider:    config.ProviderDocker,
 		Deployment:  deployment,
+		VCPU:        8,
+		Memory:      32 * config.GiB,
 		Incarnation: "second",
 	}); err != nil {
 		t.Fatalf("re-register: %v", err)
@@ -1112,12 +1152,14 @@ func TestALateDestroyResultFromTheOwnerEndsItsOwnership(t *testing.T) {
 // already destroyed its container and would later drain to nothing, after which
 // every future destroy saw a superseded owner and reported custody forever for
 // compute that no longer existed.
-func TestAnOwnersConfirmationCountsDespiteAnotherNodesFailure(t *testing.T) {
+func TestAnOwnersConfirmationClearsTheRecordAndNobodyElseIsAsked(t *testing.T) {
 	t.Parallel()
 
 	p, _ := deliverLaunch(t)
 
-	// A second node in the fleet that never answers anything.
+	// A second node in the fleet that never answers anything. It used to be asked
+	// too — the destroy was broadcast — and its silence failed the whole call for
+	// a container it had never heard of.
 	register(t, p, "n2", config.ProviderDocker)
 
 	// The owner answers its own leg.
@@ -1131,9 +1173,12 @@ func TestAnOwnersConfirmationCountsDespiteAnotherNodesFailure(t *testing.T) {
 		_ = p.Result("n1", "first", nodeapi.CommandResult{ID: got.ID, OK: true})
 	}()
 
-	// The broadcast fails overall, because n2 never answers.
-	if err := p.NewRunner().Destroy(t.Context(), 7); err == nil {
-		t.Fatal("a destroy with an unanswered leg reported success")
+	// ADDRESSED, so a silent bystander is irrelevant. This assertion is the
+	// inverse of what it used to be, and deliberately: the machine that has the
+	// container is the only one asked, so the one that does not have it can no
+	// longer fail a destroy it was never part of.
+	if err := p.NewRunner().Destroy(t.Context(), 7); err != nil {
+		t.Fatalf("a destroy addressed to the owner was failed by a bystander: %v", err)
 	}
 
 	if p.OwnsForTest("l1", "n1", "first") {
@@ -1176,6 +1221,8 @@ func TestAnEmptySnapshotStillPrunesAdoptedOwnership(t *testing.T) {
 		Node:        "n1",
 		Provider:    config.ProviderDocker,
 		Deployment:  deployment,
+		VCPU:        8,
+		Memory:      32 * config.GiB,
 		Incarnation: "first",
 	}); err != nil {
 		t.Fatalf("register: %v", err)
@@ -1213,7 +1260,9 @@ func TestALateDestroyFromANonOwnerDoesNotEndOwnership(t *testing.T) {
 	// B takes the name and the destroy.
 	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
 		Version: nodeapi.Version, Node: "n1", Provider: config.ProviderDocker,
-		Deployment: deployment, Incarnation: "second",
+		Deployment: deployment,
+		VCPU:       8,
+		Memory:     32 * config.GiB, Incarnation: "second",
 	}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
@@ -1248,7 +1297,9 @@ func TestALateDestroyFromANonOwnerDoesNotEndOwnership(t *testing.T) {
 	// C supersedes B, tombstoning B's in-flight destroy.
 	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
 		Version: nodeapi.Version, Node: "n1", Provider: config.ProviderDocker,
-		Deployment: deployment, Incarnation: "third",
+		Deployment: deployment,
+		VCPU:       8,
+		Memory:     32 * config.GiB, Incarnation: "third",
 	}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
@@ -1281,7 +1332,9 @@ func TestOnlyLaunchesAndDestroysAreTombstoned(t *testing.T) {
 
 	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
 		Version: nodeapi.Version, Node: "n1", Provider: config.ProviderDocker,
-		Deployment: deployment, Incarnation: "first",
+		Deployment: deployment,
+		VCPU:       8,
+		Memory:     32 * config.GiB, Incarnation: "first",
 	}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
@@ -1327,6 +1380,8 @@ func TestADestroyIsNotConfirmedByTheWrongProcess(t *testing.T) {
 		Node:        "n1",
 		Provider:    config.ProviderDocker,
 		Deployment:  deployment,
+		VCPU:        8,
+		Memory:      32 * config.GiB,
 		Incarnation: "second",
 	}); err != nil {
 		t.Fatalf("re-register: %v", err)
@@ -1464,5 +1519,40 @@ func TestACancelledCallerIsNotStuck(t *testing.T) {
 	err := p.NewRunner().Launch(ctx, testLease(), server.Job{RequestID: 7})
 	if err == nil {
 		t.Fatal("a cancelled launch reported success")
+	}
+}
+
+// A NODE MAY NOT TOUCH ANOTHER NODE'S LEASE, and being registered is not the
+// thing that decides it.
+//
+// MayMutateLease checks ownership first, which is right, and then falls through
+// to fleet membership when the owner does not match — which admitted ANY current
+// node for ANY lease id. Registration proves which host you are; it says nothing
+// about what work you were given. EntitledToLaunch already draws that line for
+// JIT credentials, and this is the same line for the lease's fate.
+//
+// The reachable damage is capacity, not just tidiness. Lease ids are not secret:
+// provider.InstanceName puts them in the runner name, which is visible in the
+// organisation's runner list. A host that reads one and releases it terminalises
+// a lease whose container is still running on somebody else's machine, and the
+// freed vCPU is escrowed to another tier — the double-admission the ledger
+// exists to prevent, caused from outside the ledger.
+func TestANodeCannotReleaseAnotherNodesLease(t *testing.T) {
+	p := New(slog.New(slog.DiscardHandler), deployment, time.Minute)
+
+	register(t, p, "a", config.ProviderDocker)
+	register(t, p, "b", config.ProviderDocker)
+
+	// The launch went to a, so a owns it.
+	p.AdoptOwnership("a", "inc-a", []string{"l1"})
+
+	if err := p.MayMutateLease("a", "inc-a", "l1"); err != nil {
+		t.Fatalf("the node the lease was given to may not maintain it: %v", err)
+	}
+
+	err := p.MayMutateLease("b", "inc-b", "l1")
+	if err == nil {
+		t.Fatal("a registered node was allowed to change the fate of a lease belonging to " +
+			"another node; it can release capacity out from under a running container")
 	}
 }

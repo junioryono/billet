@@ -671,18 +671,13 @@ func TestASharedLockDirectoryProducesAGroupOpenableLock(t *testing.T) {
 
 	dir := t.TempDir()
 
-	// A GROUP THAT IS NOT THIS PROCESS'S PRIMARY ONE, or the assertion below is
-	// true by construction and can never fail. MEASURED, not assumed: a t.TempDir
-	// comes out owned by the primary group, so comparing the lock file's group
-	// against the directory's compares 20 with 20 and would pass just as happily
-	// against the defect it exists to catch.
+	// A GROUP THAT IS NOT THIS PROCESS'S PRIMARY ONE, or the assertion below is true by
+	// construction. MEASURED, not assumed: a t.TempDir comes out owned by the primary
+	// group, so comparing the lock file's group against the directory's compares 20 with
+	// 20 and passes against the defect it exists to catch.
 	//
-	// A supplemental group is exactly the situation the defect arises from — the
-	// service account reaching the shared directory through one — so borrowing
-	// one here makes the test discriminate on Linux, where a non-setgid directory
-	// really does hand a new file the creator's primary group. On darwin it still
-	// cannot fail, because BSD gives a new file its directory's group whether or
-	// not setgid is set; the Linux CI runner is where this earns its keep.
+	// On darwin it still cannot fail — BSD gives a new file its directory's group
+	// whether or not setgid is set — so the Linux CI runner is where this earns its keep.
 	if err := os.Chown(dir, -1, borrowedGroup(t)); err != nil {
 		t.Skipf("cannot give the directory a non-primary group: %v", err)
 	}
@@ -908,18 +903,14 @@ func TestAGroupWritableDirectoryWithoutSetgidIsRefused(t *testing.T) {
 
 // A DROP-BOX SHARED DIRECTORY WORKS: write and traverse, no listing.
 //
-// This test used to assert the OPPOSITE, and the reason is worth keeping. The
-// lock directory was opened O_RDONLY, which needs read on the directory, so mode
-// 2730 was refused — justified in a comment claiming darwin has neither O_PATH
-// nor O_SEARCH. That was a check of whether x/sys/unix EXPORTS the symbol, read
-// as a claim about the platform: darwin's fcntl.h defines
-// `O_SEARCH (O_EXEC | O_DIRECTORY)`, and a probe confirmed open, fstat, openat
-// and openat-with-O_CREAT all work through such a handle on a directory the
-// caller cannot read.
+// Mode 2730 was once refused, justified by a claim that darwin has neither O_PATH nor
+// O_SEARCH — which was a check of whether x/sys/unix EXPORTS the symbol, read as a
+// claim about the platform. darwin's fcntl.h defines `O_SEARCH (O_EXEC |
+// O_DIRECTORY)`, and a probe confirmed open, fstat, openat and openat-with-O_CREAT
+// all work through such a handle.
 //
-// The other half of that justification was wrong too: fchmod is needed only for
-// the directory BILLET picked, never for one the operator named, so the two
-// cases can simply open differently.
+// fchmod is needed only for the directory BILLET picked, never one the operator
+// named, so the two cases open differently.
 func TestAnUnreadableSharedDirectoryStillWorks(t *testing.T) {
 	t.Parallel()
 
@@ -1016,18 +1007,14 @@ func TestThePermissionMessageOffersEveryCause(t *testing.T) {
 
 // AND IT DOES NOT SAY THAT WHEN THE DIRECTORY IS FINE.
 //
-// EACCES arrives from anything in the path — an ancestor without search
-// permission, a MAC denial — and answering all of them with "set mode 2770"
-// sends an operator to change a mode that was never the problem.
+// EACCES arrives from anything in the path — an ancestor without search permission, a
+// MAC denial — and answering all of them with "set mode 2770" sends an operator to
+// change a mode that was never the problem.
 //
-// WHAT THIS PROVES IS THE END-TO-END PROPERTY, not the guard in openLockDir that
-// was written for it. Measured: with an unsearchable parent, MkdirAll fails
-// before openLockDir is ever called, so neutering that guard leaves this test
-// green. Both are kept deliberately — the guard still covers what MkdirAll
-// cannot (a permission change racing between the two calls, or a MAC policy that
-// permits mkdir and denies open), and this test still pins the property that
-// matters to an operator: whichever layer refuses, it must not blame a mode that
-// is already correct.
+// WHAT THIS PROVES IS THE END-TO-END PROPERTY, not the guard in openLockDir written
+// for it: with an unsearchable parent, MkdirAll fails before openLockDir is called,
+// so neutering that guard leaves this test green. Both are kept — the guard covers
+// what MkdirAll cannot, and this pins what matters to an operator.
 func TestAnInaccessibleAncestorIsNotBlamedOnTheDirectoryMode(t *testing.T) {
 	t.Parallel()
 

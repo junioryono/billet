@@ -1,21 +1,13 @@
 // Package alloc is billet's global capacity allocator.
 //
-// Every runner billet launches is preceded by a LEASE, and a lease exists from
-// the moment capacity is escrowed — before a scale-set listener advertises that
-// capacity to GitHub — not from the moment a VM boots.
+// Every runner is preceded by a LEASE, and a lease exists from the moment capacity
+// is escrowed — before a listener advertises it to GitHub — not from the moment a VM
+// boots. That ordering is the design: each tier is its own scale set with its own
+// advertised maxCapacity, so listeners computing their own would let GitHub fill all
+// of them at once, and reserving on assignment is already too late.
 //
-// That ordering is the whole design. Each runner tier is its own GitHub scale
-// set with its own advertised maxCapacity. If each listener computed its own
-// maximum independently, GitHub could fill all of them at once and the host
-// would be overcommitted with nothing anywhere to stop it. Reserving on
-// assignment is already too late: by then GitHub has made a promise billet
-// cannot keep. So a listener may only advertise what this package has already
-// set aside.
-//
-// Capacity is a VECTOR — vCPU, memory, per-tier concurrency, and per-node macOS
-// licence slots — never a single integer. A host runs out of memory long before
-// it runs out of cores, and a host's macOS guest limit is not expressible in
-// either.
+// Capacity is a VECTOR — vCPU, memory, per-tier concurrency, per-node macOS licence
+// slots — never a single integer.
 package alloc
 
 import (
@@ -58,9 +50,8 @@ const (
 // validTransitions is the state machine, written down rather than implied by
 // scattered UPDATE statements. A transition not listed here is refused.
 //
-// Terminal phases have no successors on purpose: a lease that has released its
-// capacity must never re-acquire it by moving backwards, which is how a
-// double-admit would look from the inside.
+// Terminal phases have no successors: a lease that has released its capacity must
+// never re-acquire it by moving backwards.
 var validTransitions = map[Phase][]Phase{
 	PhaseCapacity:  {PhaseAssigned, PhaseDone, PhaseFailed},
 	PhaseAssigned:  {PhaseLaunching, PhaseDone, PhaseFailed},
@@ -118,6 +109,10 @@ var (
 	// ErrWrongProvider means the node runs a different compute backend than the
 	// lease requires — a Firecracker lease cannot run on a Tart host.
 	ErrWrongProvider = errors.New("alloc: node runs a different provider")
+	// ErrWrongSite means a host reported a different location while it still has
+	// work bound to it there. Distinct from ErrWrongProvider because the fix is
+	// different: one is a backend change, the other is a machine that moved.
+	ErrWrongSite = errors.New("alloc: node reports a different site")
 	// ErrNotPlaced means a lease reached a phase that presumes a host without
 	// ever being bound to one.
 	ErrNotPlaced = errors.New("alloc: lease has no bound node")
@@ -133,14 +128,12 @@ type Limits struct {
 	MaxMemory config.ByteSize
 
 	// Nodes is per-host policy keyed by node name. Build it with
-	// config.Config.NodePolicies so the runtime checks and the load-time guard
-	// read the same rules rather than two copies that can drift.
+	// config.Config.NodePolicies so the runtime checks and the load-time guard read
+	// the same rules.
 	//
 	// A node absent from the map is unconstrained in guest OS and falls back to
-	// config.DefaultMacOSVMLimit. An unconfigured Apple host is still bound by
-	// Apple's licence, so the absent case must be the licence rather than
-	// "unlimited" — a mistyped node name then costs a scheduling constraint, not
-	// a licence violation.
+	// config.DefaultMacOSVMLimit — the licence rather than "unlimited", so a mistyped
+	// node name costs a scheduling constraint rather than a licence violation.
 	Nodes map[string]config.NodePolicy
 }
 
@@ -162,24 +155,18 @@ type Lease struct {
 	// redefined underneath an in-flight lease cannot reclassify it. Bind checks
 	// it against the target host's allowlist.
 	GuestOS config.GuestOS
-	// Provider is the backend this lease needs, recorded for the same reason.
-	// Bind compares it against the node's REGISTERED provider: a Firecracker
-	// lease cannot run on a Tart host.
 	// Provider is the backend the lease is ACTUALLY on, empty until it is bound.
 	//
-	// It used to be set at reserve time, which quietly made a tier's backend a
-	// property of the reservation and so pinned every lease to one host kind
-	// before anything knew where it would run. It is chosen at Bind now, from
-	// Providers.
+	// Chosen at Bind, from Providers. What a lease MAY run on is decided when it
+	// is reserved; what it IS running on is only knowable once a host has taken
+	// it.
 	Provider config.ProviderKind
 
-	// Providers is what the lease MAY run on, most preferred first, copied from
-	// the tier when the lease was reserved.
+	// Providers is what the lease MAY run on, most preferred first, copied from the
+	// tier when the lease was reserved.
 	//
-	// Copied rather than looked up. The tier's configuration can change while a
-	// lease is open — an operator edits the file and restarts — and a placement
-	// decision has to be answerable from the lease itself, the same reason the
-	// single provider was recorded before it.
+	// Copied rather than looked up: a tier's configuration can change while a lease is
+	// open, and a placement decision has to be answerable from the lease itself.
 	Providers []config.ProviderKind
 	Phase     Phase
 	VCPU      int
@@ -204,10 +191,14 @@ type Allocator struct {
 	limits Limits
 	tiers  map[string]config.Tier
 
-	// leaseTTL is how long a lease survives without a heartbeat. A holder that
-	// stops heartbeating has crashed, been partitioned, or been stopped; either
-	// way its capacity must come back or the host slowly fills with ghosts.
+	// leaseTTL is how long a lease survives without a heartbeat. A holder that stops
+	// heartbeating has crashed, been partitioned, or been stopped; either way its
+	// capacity must come back or the host slowly fills with ghosts.
 	leaseTTL time.Duration
+
+	// placement decides which of several equally preferred hosts a reservation is
+	// aimed at. Empty is treated as pack; see WithPlacement.
+	placement config.PlacementPolicy
 
 	// now is injectable so expiry can be tested without sleeping.
 	now func() time.Time
@@ -216,6 +207,15 @@ type Allocator struct {
 // Option configures an Allocator.
 type Option func(*Allocator)
 
+// WithPlacement chooses how a reservation picks among equally preferred hosts.
+//
+// Empty means pack, which is the safer failure: spreading strands capacity in
+// fragments too small for a large tier, and a job that cannot be placed is worse
+// than one that shares a disk.
+func WithPlacement(p config.PlacementPolicy) Option {
+	return func(a *Allocator) { a.placement = p.Or() }
+}
+
 // WithClock replaces the clock. Test-only in practice.
 func WithClock(now func() time.Time) Option {
 	return func(a *Allocator) { a.now = now }
@@ -223,10 +223,9 @@ func WithClock(now func() time.Time) Option {
 
 // LeaseTTL reports how long a lease survives without a heartbeat.
 //
-// Exported because a holder has to renew FASTER than this, and a holder that
-// derives its cadence from DefaultLeaseTTL instead is correct only when the
-// default is in use — a configured shorter TTL then expires every lease it
-// holds, silently, while it waits for a beat that comes too late.
+// Exported because a holder has to renew FASTER than this: one deriving its cadence
+// from DefaultLeaseTTL is correct only when the default is in use, and a shorter
+// configured TTL then silently expires every lease it holds.
 func (a *Allocator) LeaseTTL() time.Duration { return a.leaseTTL }
 
 // WithLeaseTTL sets how long a lease survives without a heartbeat.
@@ -243,9 +242,8 @@ const DefaultLeaseTTL = 90 * time.Second
 //
 // Reap holds the store's single writer connection for the whole batch, so an
 // unbounded scan of a large expired backlog would block every reservation and
-// heartbeat behind it — turning a backlog into more expiries, which is a
-// feedback loop rather than a slowdown. Callers reap on a timer; a batch that
-// fills is simply drained by the next tick.
+// heartbeat behind it — turning a backlog into more expiries. Callers reap on a
+// timer, so a batch that fills is drained by the next tick.
 const reapBatchSize = 256
 
 // New builds an allocator over the given tier catalog.
@@ -260,33 +258,18 @@ func New(db *state.DB, limits Limits, tiers []config.Tier, opts ...Option) (*All
 			limits.MaxVCPU, limits.MaxMemory)
 	}
 
-	// Deep-copied rather than aliased: Limits is a value type, but the map, the
-	// GuestOS slices and the MacOSVMLimit pointers inside it are all shared with
-	// the caller. Copying only the map would still let a caller widen a host's
-	// allowlist or raise its cap after construction, moving a licence limit out
-	// from under leases already counted against it. NodePolicy.Clone owns that
-	// knowledge so it lives in one place.
+	// Deep-copied rather than aliased: Limits is a value type, but the map, the GuestOS
+	// slices and the MacOSVMLimit pointers inside it are shared with the caller, so a
+	// shallow copy would still let a caller raise a host's cap after construction.
 	perNode := make(map[string]config.NodePolicy, len(limits.Nodes))
 
 	for node, p := range limits.Nodes {
-		// The SAME rules config applies, not a second hand-written copy that can
-		// drift into disagreeing about which hosts are legal. This covers the
-		// raw fields rather than the effective limit — a negative
-		// macos_vm_limit slipped past a check reading MacOSLimit(), which
-		// normalizes it to zero whenever the allowlist excludes macOS.
-		// The map KEY is how every lookup finds this policy, so a key that is not
-		// the canonical node name silently detaches the policy from its host: the
-		// tier's node is normalized, the key is not, the lookup misses, and an
-		// explicit macos_vm_limit of 0 is replaced by Apple's default of 2. The
-		// policy appears to be enforced and is not.
+		// The SAME rules config applies, not a second hand-written copy that can drift.
+		// It covers the raw fields rather than the effective limit, because MacOSLimit()
+		// normalizes a negative macos_vm_limit to zero when the allowlist excludes macOS.
 		//
-		// Two checks compose to prevent that, and there is deliberately no third.
-		// An explicit "the key has no surrounding whitespace" test used to sit
-		// here and could never fire in either order: Validate rejects a padded
-		// NAME outright (the label pattern is anchored, so the padding is part of
-		// what must match), and a key that differs from a valid name is caught
-		// below. Two mutation runs were what established that — the case written
-		// to cover it stayed green with the check deleted.
+		// The map KEY is how every lookup finds this policy, so a key that is not the
+		// canonical node name silently detaches the policy from its host.
 		if errs := p.Validate(fmt.Sprintf("alloc: node %q", node)); len(errs) > 0 {
 			return nil, errors.Join(errs...)
 		}
@@ -308,12 +291,12 @@ func New(db *state.DB, limits Limits, tiers []config.Tier, opts ...Option) (*All
 		now:      time.Now,
 	}
 
-	// Validate every precondition the allocator's arithmetic and limits depend
-	// on. config.Load enforces most of these, but this constructor is exported
-	// and cannot prove its catalog came through that path — and the failure modes
-	// are bad: VCPU or Memory of zero is a division by zero in headroom, a macOS
-	// tier with no node skips the licence cap entirely, a negative MaxConcurrent
-	// reads as unlimited, and a duplicate label silently shadows a tier.
+	// Validate every precondition the allocator's arithmetic depends on. config.Load
+	// enforces most of these, but this constructor is exported and cannot prove its
+	// catalog came through that path — and the failure modes are bad: a VCPU or Memory
+	// of zero divides by zero in headroom, a macOS tier with no node skips the licence
+	// cap, a negative MaxConcurrent reads as unlimited, and a duplicate label silently
+	// shadows a tier.
 	for i := range tiers {
 		t := &tiers[i]
 
@@ -367,19 +350,15 @@ func New(db *state.DB, limits Limits, tiers []config.Tier, opts ...Option) (*All
 			return nil, fmt.Errorf("alloc: duplicate tier label %q", t.Label)
 		}
 
-		// A pin is validated, not silently normalized away. Trimming
-		// unconditionally turned `node: "   "` into an unpinned tier here — the
-		// same silent loss of a placement constraint that config.Load was fixed
-		// to reject, still reachable through this constructor. And a name like
-		// "mac mini" matches no node that could ever register, so the lease would
-		// escrow capacity and never bind.
+		// A pin is validated, not silently normalized away: trimming unconditionally would
+		// turn `node: "   "` into an unpinned tier, and a name like "mac mini" matches no
+		// node that could ever register, so the lease would escrow capacity and never
+		// bind.
 		normalized := *t
 
-		// DETACHED from the caller's slice. `*t` is a shallow copy, so the
-		// provider list stayed aliased to whatever the caller still holds — and a
-		// mutation after validation would change what future leases record with
-		// nothing re-checking it. That is the snapshot invariant undone from the
-		// inside, by the one package that depends on it most.
+		// DETACHED from the caller's slice: `*t` is a shallow copy, so the provider list
+		// would stay aliased to whatever the caller holds, and a mutation after validation
+		// would change what future leases record with nothing re-checking it.
 		normalized.Providers = slices.Clone(t.Providers)
 
 		if t.Node != "" {
@@ -399,41 +378,26 @@ func New(db *state.DB, limits Limits, tiers []config.Tier, opts ...Option) (*All
 		a.tiers[t.Label] = normalized
 	}
 
-	// THE FLOORS MUST FIT, together.
+	// THE FLOORS MUST FIT, together. Individually legal reservations can sum past the
+	// machine, and the failure is invisible: every tier deducts every other tier's unmet
+	// floor, so floors exceeding the budget make EVERY tier compute zero headroom and
+	// the deployment quietly advertise nothing.
 	//
-	// Individually legal reservations can sum past the machine, and the failure
-	// is invisible where it happens: every tier deducts every other tier's unmet
-	// floor, so if the floors exceed the budget then EVERY tier computes zero
-	// headroom and the whole deployment quietly advertises nothing. A control
-	// plane that accepts no work while reporting no error is the worst outcome
-	// this package can produce.
-	//
-	// CHECKED BY DIVISION, NEVER BY MULTIPLYING FIRST. `reserved * vcpu` is
-	// unchecked integer arithmetic on a value that comes from a config file, so a
-	// large enough reservation WRAPS NEGATIVE — and a negative total passes a
-	// "does it fit" test comfortably. Every tier would then subtract a negative
-	// unmet floor, which ADDS to its headroom, and Reserve would hand out
-	// capacity far past the ceiling this package exists to enforce.
-	//
-	// Comparing against the remaining budget divided by the tier's size asks the
-	// same question without ever forming the product, and the subtraction
-	// afterwards is safe precisely because the comparison has just bounded it.
+	// CHECKED BY DIVISION, NEVER BY MULTIPLYING FIRST. `reserved * vcpu` is unchecked
+	// arithmetic on a config value, so a large enough one WRAPS NEGATIVE — and a negative
+	// total passes a "does it fit" test, after which every tier subtracts a negative
+	// floor, which ADDS to its headroom.
 	if err := checkFloorsFit(a.tiers, limits); err != nil {
 		return nil, err
 	}
 
-	// AND THE macOS DIMENSION, which vCPU and memory do not cover.
+	// AND THE macOS DIMENSION, which vCPU and memory do not cover. A Mac caps concurrent
+	// macOS guests per HOST across every tier targeting it, so two macOS tiers on one Mac
+	// can be individually legal and jointly unfillable — and such a floor holds vCPU and
+	// memory back while never being fillable.
 	//
-	// A Mac caps concurrent macOS guests by licence, per HOST, across every tier
-	// that targets it — so two macOS tiers on one Mac can be individually legal
-	// and jointly unfillable. A floor there is worse than merely unmet: it holds
-	// vCPU and memory back from every other tier while the reservation can never
-	// be filled, because the constraint that blocks it is not the one being
-	// reserved against.
-	//
-	// config.Load rejects this from the other direction, by capping combined
-	// max_concurrent. This constructor is exported and documented as unable to
-	// assume its catalogue came through Load.
+	// config.Load rejects this from the other direction; this constructor is exported and
+	// cannot assume its catalogue came through Load.
 	if err := a.checkMacOSFloors(); err != nil {
 		return nil, err
 	}
@@ -442,9 +406,9 @@ func New(db *state.DB, limits Limits, tiers []config.Tier, opts ...Option) (*All
 		opt(a)
 	}
 
-	// Options are validated AFTER they are applied: a zero TTL creates leases
-	// that are already expired, so Reap recycles live capacity immediately, and a
-	// nil clock panics on first use rather than at construction.
+	// Options are validated AFTER they are applied: a zero TTL creates leases that are
+	// already expired, and a nil clock panics on first use rather than at
+	// construction.
 	if a.leaseTTL <= 0 {
 		return nil, fmt.Errorf("alloc: lease TTL must be positive, got %s", a.leaseTTL)
 	}
@@ -458,10 +422,10 @@ func New(db *state.DB, limits Limits, tiers []config.Tier, opts ...Option) (*All
 
 // Headroom reports how many more instances of a tier would fit right now.
 //
-// DIAGNOSTIC ONLY — never advertise this number to GitHub. It reserves nothing,
-// so two tier listeners can each read four free slots and each advertise four,
-// and the atomicity of Reserve cannot retract a promise GitHub has already
-// received. Advertise what Escrow returns, which is capacity actually set aside.
+// DIAGNOSTIC ONLY — never advertise this number to GitHub. It reserves nothing, so
+// two listeners can each read four free slots and each advertise four, and Reserve
+// cannot retract a promise GitHub has already received. Advertise what Escrow
+// returns.
 func (a *Allocator) Headroom(ctx context.Context, tier string) (int, error) {
 	t, ok := a.tiers[tier]
 	if !ok {
@@ -480,14 +444,12 @@ func (a *Allocator) Headroom(ctx context.Context, tier string) (int, error) {
 	return n, err
 }
 
-// Escrow reserves up to want instances of a tier and returns the leases it
-// actually took. len(result) is what a scale-set listener may advertise.
+// Escrow reserves up to want instances of a tier and returns the leases it actually
+// took. len(result) is what a scale-set listener may advertise.
 //
-// Reading headroom and then advertising it are two steps with a gap between
-// them, and the gap is where two listeners promise the same slots. Escrow closes
-// it by making the promise and the reservation one act: whatever comes back is
-// already held, so a listener asking immediately afterwards sees a smaller
-// machine. Taking fewer than requested is the ordinary case, not an error.
+// Reading headroom and then advertising it are two steps with a gap between them,
+// and the gap is where two listeners promise the same slots. Escrow makes the
+// promise and the reservation one act. Taking fewer than requested is ordinary.
 func (a *Allocator) Escrow(ctx context.Context, tier string, want int) ([]*Lease, error) {
 	if want < 0 {
 		return nil, fmt.Errorf("alloc: want must not be negative, got %d", want)
@@ -513,8 +475,24 @@ func (a *Allocator) Escrow(ctx context.Context, tier string, want int) ([]*Lease
 		take := min(want, room)
 		leases = make([]*Lease, 0, take)
 
+		// MEASURED ONCE AND SPENT DOWN, because none of these choices is durable until the
+		// transaction commits: asking the ledger again per lease would return the same
+		// fleet every time and aim every reservation at the same machine.
+		place, _, _, err := a.placerWithFloors(ctx, tx, t)
+		if err != nil {
+			return err
+		}
+
 		for range take {
-			lease, err := a.insertLease(ctx, tx, t)
+			target, ok := place.next(t)
+			if !ok {
+				// The fleet ran out before the ceiling did. Headroom is the smaller of the two, so
+				// this should not happen — but returning what was placed is the safe reading, and
+				// inserting an unplaced lease is the failure this design exists to prevent.
+				break
+			}
+
+			lease, err := a.insertLease(ctx, tx, t, target)
 			if err != nil {
 				return err
 			}
@@ -534,9 +512,8 @@ func (a *Allocator) Escrow(ctx context.Context, tier string, want int) ([]*Lease
 // encodeProviders renders a preference list for the ledger.
 //
 // Comma-separated rather than JSON: a provider kind is a short identifier from a
-// closed set that cannot contain a comma, the value is read back by exactly one
-// function, and a text column keeps the row legible to anyone opening the
-// database to work out why a job would not place.
+// closed set that cannot contain a comma, and a text column keeps the row legible
+// to anyone opening the database to work out why a job would not place.
 func encodeProviders(ps []config.ProviderKind) string {
 	out := make([]string, 0, len(ps))
 	for _, p := range ps {
@@ -549,11 +526,9 @@ func encodeProviders(ps []config.ProviderKind) string {
 // decodeProviders reads a preference list back, preserving order.
 //
 // FAILS CLOSED on anything it does not fully understand, returning nil so the
-// caller's empty-list check refuses the placement. Dropping the bad entries and
-// keeping the rest was fail-OPEN: a stored value of "bogus,docker" still
-// authorized a docker node, which means a corrupted or truncated placement fact
-// silently became a narrower but still-valid one. An empty element is the same
-// story — ",docker," is not a list billet wrote.
+// caller's empty-list check refuses the placement. Dropping bad entries and keeping
+// the rest would be fail-OPEN: "bogus,docker" would still authorize a docker node,
+// so a corrupted placement fact silently becomes a narrower valid one.
 func decodeProviders(s string) []config.ProviderKind {
 	if s == "" {
 		return nil
@@ -577,36 +552,28 @@ func decodeProviders(s string) []config.ProviderKind {
 // checkPlacement reports whether a lease may run on a node, under the policy in
 // force RIGHT NOW.
 //
-// Called from Bind and again on entry to launching, deliberately. Binding is not
-// launching: a lease can be bound while still in `capacity`, so a policy that
-// tightens in between would otherwise let an instance start on a host that no
-// longer permits it — the check having passed at a moment that has since become
-// irrelevant. Re-checking at the launch boundary is what makes the guarantee
-// "this placement is legal now" rather than "was legal once".
+// Called from Bind and again on entry to launching: a lease can be bound while
+// still in `capacity`, so a policy that tightens in between would otherwise let an
+// instance start on a host that no longer permits it.
 func (a *Allocator) checkPlacement(ctx context.Context, tx *sql.Tx, lease *Lease, node string) error {
 	if !a.allowsGuestOS(node, lease.GuestOS) {
 		return fmt.Errorf("%w: lease %s is a %s guest and node %q does not permit that guest OS",
 			ErrGuestOSNotAllowed, lease.ID, lease.GuestOS, node)
 	}
 
-	// A lease with no acceptable providers records nothing to compare against and
-	// FAILS CLOSED. Tolerating it would be a bypass rather than a courtesy: such
-	// a lease may still be unbound, so it is not old work already placed — it is
-	// unplaced work whose backend nothing can verify, free to bind to a host
-	// running anything. The same rows are the ones migration 7 cannot reliably
-	// classify by guest OS either, since macos_slot only became truthful at
-	// migration 5.
+	// A lease with no acceptable providers records nothing to compare against and FAILS
+	// CLOSED. Tolerating it would be a bypass: such a lease may still be unbound, so it
+	// is unplaced work whose backend nothing can verify, free to bind to a host running
+	// anything.
 	if len(lease.Providers) == 0 {
 		// "Release it" rather than "reap it": Reap only collects leases whose TTL
-		// has expired, so while a holder keeps heartbeating it returns zero
-		// forever and the advice would be unfollowable.
-		// Two different situations reach here and the message used to name only
-		// one. A row written before providers were recorded is genuinely old; a
-		// row whose stored list billet cannot interpret — a provider from a newer
-		// version, seen after a downgrade — is perfectly valid NEWER data that
-		// this binary must refuse. Telling an operator their fresh lease
-		// "predates provider recording" sends them looking for history that is not
-		// there.
+		// has expired, so while a holder keeps heartbeating it returns zero forever
+		// and the advice would be unfollowable.
+		//
+		// The message names BOTH situations that reach here. A row written before
+		// providers were recorded is genuinely old; a row whose stored list billet
+		// cannot interpret — a provider from a newer version, seen after a
+		// downgrade — is valid NEWER data this binary must refuse.
 		return fmt.Errorf(
 			"%w: lease %s records no provider list this version can interpret, so it cannot "+
 				"be placed safely — it predates provider recording, or names a backend a newer "+
@@ -614,9 +581,8 @@ func (a *Allocator) checkPlacement(ctx context.Context, tx *sql.Tx, lease *Lease
 			ErrNotPlaceable, lease.ID)
 	}
 
-	// The node's REGISTERED provider, not one from config: a Firecracker lease
-	// cannot run on a Tart host, and the registration is what the host itself
-	// reported rather than what a catalog claims about it.
+	// The node's REGISTERED provider, not one from config: the registration is what the
+	// host itself reported rather than what a catalog claims about it.
 	var registered string
 
 	switch err := tx.QueryRowContext(ctx,
@@ -627,16 +593,12 @@ func (a *Allocator) checkPlacement(ctx context.Context, tx *sql.Tx, lease *Lease
 		return fmt.Errorf("alloc: read node %s: %w", node, err)
 	}
 
-	// MEMBERSHIP, not equality, and that one word is the whole of provider
-	// failover. A tier that lists several backends may be placed on a host
-	// running any of them, so losing the machine at home does not take the
-	// `runs-on` label down with it.
+	// MEMBERSHIP, not equality, and that one word is the whole of provider failover: a
+	// tier listing several backends may be placed on a host running any of them.
 	//
-	// The list is ORDERED, and the order is not consulted here on purpose: this
-	// function answers "may this lease run on the node that asked", and today the
-	// node is always the one binding itself. Preference is a choice among
-	// candidates, and choosing needs a chooser — which arrives with the node
-	// running in its own process.
+	// The list is ORDERED, and the order is not consulted here: this answers "may this
+	// lease run on the node that asked", while preference is a choice among candidates
+	// made at escrow.
 	if !slices.Contains(lease.Providers, config.ProviderKind(registered)) {
 		return fmt.Errorf("%w: lease %s accepts %v but node %q runs %q",
 			ErrWrongProvider, lease.ID, lease.Providers, node, registered)
@@ -667,26 +629,24 @@ func (a *Allocator) allowsGuestOS(node string, os config.GuestOS) bool {
 	return p.AllowsGuestOS(os)
 }
 
-// headroom computes how many more of a tier fit. Every limit is applied, and the
-// smallest wins — capacity is a vector, so "enough cores" says nothing about
-// memory or about the per-host macOS guest limit.
+// headroom computes how many more of a tier fit. Every limit is applied and the
+// smallest wins — capacity is a vector, so "enough cores" says nothing about memory
+// or about the per-host macOS guest limit.
 func (a *Allocator) headroom(ctx context.Context, tx *sql.Tx, t config.Tier) (int, error) {
 	used, err := a.usage(ctx, tx)
 	if err != nil {
 		return 0, err
 	}
 
-	// WHAT OTHER TIERS ARE OWED IS NOT AVAILABLE HERE.
+	// FLOORS ARE NOT DEDUCTED HERE. They are held against the machines that could
+	// keep them, in reserveFloors, which is where the promise lives and the only
+	// place it can be checked honestly; deducting in both would double-count.
 	//
-	// Headroom used to be the whole of what was left, which let one tier hold the
-	// entire budget: the others then advertised zero, their jobs queued at GitHub
-	// indefinitely, and nothing in billet was behaving incorrectly. A tier with
-	// small instances wins that race simply by fitting more often.
-	//
-	// Only UNMET floors are deducted. A tier already holding its reservation
-	// competes for the remainder on equal terms, so capacity is never idled
-	// waiting for work that has not arrived.
-	owedVCPU, owedMemory, err := a.unmetFloors(ctx, tx, t.Label)
+	// Subtracting every unmet floor from the deployment ceiling cannot ask whether
+	// any MACHINE could keep the floor, so a reservation on a tier with no
+	// suitable host anywhere — a Tart tier on a fleet of Docker boxes — would take
+	// the ceiling from tiers that are perfectly placeable.
+	place, owedVCPU, owedMemory, err := a.placerWithFloors(ctx, tx, t)
 	if err != nil {
 		return 0, err
 	}
@@ -705,20 +665,17 @@ func (a *Allocator) headroom(ctx context.Context, tx *sql.Tx, t config.Tier) (in
 		n = min(n, t.MaxConcurrent-tierUsed)
 	}
 
-	// A host caps concurrent macOS guests, counting every running one regardless
-	// of which tier asked for it. Two individually legal macOS tiers on one Mac
-	// still share one machine, so the limit is enforced per NODE across tiers
-	// rather than per tier.
-	if t.GuestOS == config.GuestMacOS && t.Node != "" {
-		hostUsed, err := a.countOpenMacOSByNode(ctx, tx, t.Node)
-		if err != nil {
-			return 0, err
-		}
-
-		n = min(n, a.macOSLimit(t.Node)-hostUsed)
-	}
-
-	return max(n, 0), nil
+	// WHAT THE MACHINES CAN ACTUALLY HOLD, which is the other half of the answer.
+	// Everything above bounds the DEPLOYMENT and none of it knows whether any single
+	// machine has room: with a 64 vCPU box and an 8 vCPU Mac mini under a ceiling of
+	// 120, that arithmetic would escrow 120 vCPU and be unable to place most of it.
+	//
+	// So the answer is the SMALLER of the two. The fleet term stops billet promising
+	// more than the machines can hold; the deployment term stops it exceeding what the
+	// operator allowed, which is what keeps a one-box install behaving as before.
+	//
+	// The per-host macOS licence lives in headroomOn.
+	return max(min(n, place.total(t)), 0), nil
 }
 
 // Reserve escrows capacity for one instance of a tier.
@@ -734,9 +691,8 @@ func (a *Allocator) Reserve(ctx context.Context, tier string) (*Lease, error) {
 	var lease *Lease
 
 	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
-		// Headroom and insert in ONE transaction. Checking outside it would be a
-		// read followed by a hopeful write — measured at a 7x overcommit under
-		// concurrency, which is exactly the race this package exists to prevent.
+		// Headroom and insert in ONE transaction. Checking outside it would be a read
+		// followed by a hopeful write — measured at a 7x overcommit under concurrency.
 		room, err := a.headroom(ctx, tx, t)
 		if err != nil {
 			return err
@@ -746,7 +702,17 @@ func (a *Allocator) Reserve(ctx context.Context, tier string) (*Lease, error) {
 			return fmt.Errorf("%w for tier %q", ErrNoCapacity, t.Label)
 		}
 
-		lease, err = a.insertLease(ctx, tx, t)
+		place, _, _, err := a.placerWithFloors(ctx, tx, t)
+		if err != nil {
+			return err
+		}
+
+		target, ok := place.next(t)
+		if !ok {
+			return fmt.Errorf("%w for tier %q", ErrNoCapacity, t.Label)
+		}
+
+		lease, err = a.insertLease(ctx, tx, t, target)
 
 		return err
 	})
@@ -759,7 +725,9 @@ func (a *Allocator) Reserve(ctx context.Context, tier string) (*Lease, error) {
 
 // insertLease writes one escrowed lease. Callers must already hold a transaction
 // in which they have confirmed headroom.
-func (a *Allocator) insertLease(ctx context.Context, tx *sql.Tx, t config.Tier) (*Lease, error) {
+func (a *Allocator) insertLease(
+	ctx context.Context, tx *sql.Tx, t config.Tier, target string,
+) (*Lease, error) {
 	id, err := newLeaseID()
 	if err != nil {
 		return nil, err
@@ -767,18 +735,21 @@ func (a *Allocator) insertLease(ctx context.Context, tx *sql.Tx, t config.Tier) 
 
 	now := a.now().UTC()
 
-	// `node` stays NULL until Bind, while `target_node` records the constraint.
-	// They answer different questions: a reservation is CONSTRAINED to a node by
-	// its tier's config, and only later BOUND to one. `node` keeps its foreign
-	// key because binding proves the node registered; `target_node` cannot have
-	// one, because at reserve time it may name a host that has not started yet.
+	// `node` stays NULL until Bind, while `target_node` records the constraint: a
+	// reservation is CONSTRAINED to a node by its tier's config and only later BOUND
+	// to one. `node` keeps its foreign key because binding proves the node registered;
+	// `target_node` cannot, because at reserve time it may name a host that has not
+	// started yet.
 	//
-	// macos_slot is stored rather than re-derived, so renaming a tier, changing
-	// its guest_os, or restarting against a different catalog cannot silently
-	// reclassify leases that are already in flight.
+	// macos_slot is stored rather than re-derived, so renaming a tier or restarting
+	// against a different catalog cannot reclassify leases already in flight.
+	//
+	// EVERY LEASE NAMES ITS MACHINE. A reservation charged to the deployment and to no
+	// host would leave the fleet's remaining room unchanged, so billet would advertise
+	// the same slots repeatedly.
 	var targetNode any
-	if t.Node != "" {
-		targetNode = t.Node
+	if target != "" {
+		targetNode = target
 	}
 
 	macSlot := 0
@@ -800,7 +771,7 @@ func (a *Allocator) insertLease(ctx context.Context, tx *sql.Tx, t config.Tier) 
 	return &Lease{
 		ID:         id,
 		Tier:       t.Label,
-		TargetNode: t.Node,
+		TargetNode: target,
 		MacOSSlot:  macSlot == 1,
 		GuestOS:    t.GuestOS,
 		Providers:  t.AcceptableProviders(),
@@ -814,9 +785,9 @@ func (a *Allocator) insertLease(ctx context.Context, tx *sql.Tx, t config.Tier) 
 // Assign binds a reserved lease to a GitHub job.
 //
 // Retrying with the SAME job is idempotent. Retrying with a DIFFERENT job is
-// ErrConflict, not success: an escrowed slot holds one job, and quietly
-// returning nil while keeping the original assignment would leave the caller
-// believing a job is scheduled that nothing will ever run.
+// ErrConflict, not success: an escrowed slot holds one job, and returning nil while
+// keeping the original would leave the caller believing a job is scheduled that
+// nothing will run.
 func (a *Allocator) Assign(ctx context.Context, leaseID string, epoch, runID, requestID int64) error {
 	return a.db.Tx(ctx, func(tx *sql.Tx) error {
 		lease, err := a.load(ctx, tx, leaseID, epoch)
@@ -852,12 +823,27 @@ func (a *Allocator) Assign(ctx context.Context, leaseID string, epoch, runID, re
 	})
 }
 
+// attribution is the host a history row belongs to.
+//
+// COALESCE(node, target_node), the way the rest of the arithmetic reads a lease.
+// `node` is filled at bind and escrow chose the machine long before that, so a
+// lease that never binds — assigned by GitHub, then the process dies — recorded
+// no host at all, and the jobs most worth investigating are exactly the ones
+// that end that way.
+func attribution(l *Lease) any {
+	switch {
+	case l.Node != "":
+		return l.Node
+	case l.TargetNode != "":
+		return l.TargetNode
+	default:
+		return nil
+	}
+}
+
 // recordAssignment opens the history row at assignment time.
 func (a *Allocator) recordAssignment(ctx context.Context, tx *sql.Tx, l *Lease, runID, requestID int64, now time.Time) error {
-	var node any
-	if l.Node != "" {
-		node = l.Node
-	}
+	node := attribution(l)
 
 	_, err := tx.ExecContext(ctx,
 		`INSERT INTO job_history (lease_id, tier, node, run_id, request_id, queued_at, assigned_at)
@@ -880,14 +866,14 @@ func (a *Allocator) Advance(ctx context.Context, leaseID string, epoch int64, to
 
 // Bind records which node is running a lease.
 //
-// A lease pinned to a node may only bind to THAT node. Without the check, a
-// macOS lease pinned to one Mac could be bound to another while its licence slot
-// stayed charged to the first — and the second host would then accept guests
-// beyond Apple's limit with every individual decision looking correct.
+// A lease pinned to a node may only bind to THAT node: without the check, a macOS
+// lease pinned to one Mac could bind to another while its licence slot stayed
+// charged to the first, and the second host would accept guests beyond Apple's
+// limit with every individual decision looking correct.
 //
-// Rebinding to a different node is refused rather than silently overwritten;
-// repeating the same bind is idempotent, because a node retrying after a lost
-// response must not be told its own success was a conflict.
+// Rebinding elsewhere is refused rather than silently overwritten; repeating the
+// same bind is idempotent, because a node retrying after a lost response must not
+// be told its own success was a conflict.
 func (a *Allocator) Bind(ctx context.Context, leaseID string, epoch int64, node string) error {
 	if node == "" {
 		return errors.New("alloc: node must not be empty")
@@ -904,12 +890,10 @@ func (a *Allocator) Bind(ctx context.Context, leaseID string, epoch int64, node 
 				ErrWrongNode, leaseID, lease.TargetNode, node)
 		}
 
-		// Answered BEFORE the allowlist, because a repeat changes nothing. If the
-		// host's policy tightened after this lease was placed, refusing the retry
-		// un-binds nothing — the guest is running either way — and turns a
-		// harmless no-op into a hard error that a node retrying past a transient
-		// failure would read as "tear this job down". The policy gates NEW
-		// placements; an existing one is the reaper's problem, not Bind's.
+		// Answered BEFORE the allowlist, because a repeat changes nothing: if the host's
+		// policy tightened after this lease was placed, refusing the retry un-binds
+		// nothing and turns a no-op into an error a node would read as "tear this down".
+		// The policy gates NEW placements.
 		if lease.Node == node {
 			return nil // idempotent repeat
 		}
@@ -919,58 +903,41 @@ func (a *Allocator) Bind(ctx context.Context, leaseID string, epoch int64, node 
 				ErrWrongNode, leaseID, lease.Node, node)
 		}
 
-		// A FIRST binding for a lease already in a running phase means its node
-		// went missing rather than that it was never placed, and adopting it onto
-		// a new host would create a second owner of one slot.
+		// A FIRST binding for a lease already in a running phase means its node went
+		// missing rather than that it was never placed, and adopting it onto a new host
+		// would create a second owner of one slot.
 		//
-		// `leases.node` is ON DELETE SET NULL, so deleting a node silently blanks
-		// the column for every lease it was running. The lease then LOOKS unbound
-		// while the original host is still executing the job and still holds a
-		// valid epoch, so its heartbeats keep succeeding — bind it elsewhere and
-		// two hosts own the same lease. Reap cannot resolve that while either one
-		// keeps heartbeating.
+		// `leases.node` is ON DELETE SET NULL, so deleting a node blanks the column for
+		// every lease it was running: the lease LOOKS unbound while the original host is
+		// still executing the job and still holds a valid epoch.
 		//
-		// This refusal narrows the route; it does NOT close it, and the difference
-		// matters before node removal is built. A lease still in `assigned` when
-		// its node is deleted is not yet running, so it binds to a new host
-		// perfectly legally — and the stale original still holds the same epoch,
-		// so its own Advance is authorized against whatever node the row now
-		// names rather than against the caller. Ownership is recorded, not
-		// proven: nothing here identifies WHO is asking.
-		//
-		// Closing that needs fencing at deletion, or a durable holder identity
-		// checked on every authorization. Both belong with node lifecycle, which
-		// does not exist yet — there is deliberately no delete path in this
-		// package, so the residual hole is not reachable through this binary.
+		// This refusal NARROWS the route and does not close it. A lease still in `assigned`
+		// when its node is deleted is not yet running, so it binds elsewhere legally while
+		// the stale original holds the same epoch — ownership is recorded, not proven.
+		// Closing that needs fencing at deletion or a durable holder identity, which
+		// belong with node lifecycle; there is deliberately no delete path here.
 		if requiresPlacement(lease.Phase) {
 			return fmt.Errorf(
 				"%w: lease %s is already %s; a first binding now would make node %q a second owner",
 				ErrWrongNode, leaseID, lease.Phase, node)
 		}
 
-		// The host's guest-OS allowlist is enforced HERE because this is the
-		// first point at which the host is known. A lease with no target_node
-		// names no host at reserve time, so config validation cannot rule out a
-		// placement it never sees — a scheduler that simply picked a node with
-		// free capacity would otherwise put a Linux guest on a macOS-only Mac.
+		// The host's guest-OS allowlist is enforced HERE because this is the first point at
+		// which the host is known: a lease with no target_node names no host at reserve
+		// time, so config validation cannot rule out a placement it never sees.
 		//
-		// The guest OS comes from the lease's own column, not the live catalog,
-		// so a tier redefined underneath an in-flight lease cannot reclassify it.
+		// The guest OS comes from the lease's own column, not the live catalog.
 		if err := a.checkPlacement(ctx, tx, lease, node); err != nil {
 			return err
 		}
 
-		// THE CHOSEN BACKEND IS RECORDED HERE, and only here.
+		// THE CHOSEN BACKEND IS RECORDED HERE, and only here. What a lease MAY run
+		// on is decided when it is reserved; what it IS running on is only knowable
+		// once a host has taken it, and keeping them apart is what lets one label
+		// span two kinds of machine.
 		//
-		// It used to be written at reserve time from the tier, which made a
-		// backend a property of the reservation and pinned the lease before
-		// anything knew where it would run. What a lease MAY run on is decided
-		// when it is reserved; what it IS running on is only knowable once a host
-		// has taken it. Keeping them apart is what lets one label span two kinds
-		// of machine.
-		//
-		// Read back from the node's registration rather than assumed from the
-		// list, so the column says what is true rather than what was preferred.
+		// Read back from the node's registration rather than assumed from the list,
+		// so the column says what is true rather than what was preferred.
 		var registered string
 
 		if err := tx.QueryRowContext(ctx,
@@ -1017,9 +984,8 @@ func (a *Allocator) Release(ctx context.Context, leaseID string, epoch int64, ou
 
 	return a.db.Tx(ctx, func(tx *sql.Tx) error {
 		// loadAny, not load: an idempotency decision needs to SEE the terminal row.
-		// Treating every not-found as success meant releasing an id that never
-		// existed returned nil, and re-releasing a `done` lease as `failed` also
-		// returned nil while history kept saying `done`.
+		// Treating every not-found as success would make releasing an id that never existed
+		// return nil, and re-releasing a `done` lease as `failed` return nil too.
 		lease, err := a.loadAny(ctx, tx, leaseID, epoch)
 		if err != nil {
 			return err
@@ -1044,6 +1010,27 @@ func (a *Allocator) Release(ctx context.Context, leaseID string, epoch int64, ou
 	})
 }
 
+// NodeRegistration is what a host tells the ledger about itself.
+//
+// A STRUCT RATHER THAN FIVE ARGUMENTS: two are strings meaning entirely different
+// things and two are numbers that are not interchangeable, so positionally,
+// transposing any pair compiles and produces a fleet that is wrong in a way that
+// surfaces as bad placement rather than as an error.
+type NodeRegistration struct {
+	// Name is what tiers pin to and what certificates authorise.
+	Name string
+	// Provider is the compute backend this host runs. A host is the authority on
+	// this, which is why it is reported rather than read from a catalogue.
+	Provider config.ProviderKind
+	// Site is where this machine is, or empty for a deployment that has not
+	// needed the distinction.
+	Site string
+	// VCPU and Memory are what this host CONTRIBUTES, which is not necessarily
+	// what it has — see config.NodeConfig.Contribution.
+	VCPU   int
+	Memory config.ByteSize
+}
+
 // RegisterNode records a host and what it runs, so leases can be placed on it.
 //
 // A node exists in this table because it TOLD billet it exists, not because
@@ -1056,53 +1043,114 @@ func (a *Allocator) Release(ctx context.Context, leaseID string, epoch int64, ou
 // on re-registration so a previous instance of the same host — a process that
 // was killed and came back, or one that hung and returned — finds its writes
 // refused rather than operating on leases the new instance now owns.
-func (a *Allocator) RegisterNode(ctx context.Context, name string, kind config.ProviderKind) error {
+func (a *Allocator) RegisterNode(ctx context.Context, reg NodeRegistration) (int64, error) {
+	name, kind := reg.Name, reg.Provider
+
 	if name == "" {
-		return errors.New("alloc: a node must have a name")
+		return 0, errors.New("alloc: a node must have a name")
 	}
 
 	if kind == "" {
-		return fmt.Errorf("alloc: node %s registered no provider, so nothing could be placed "+
+		return 0, fmt.Errorf("alloc: node %s registered no provider, so nothing could be placed "+
 			"on it safely", name)
 	}
 
-	return a.db.Tx(ctx, func(tx *sql.Tx) error {
+	// A CONTRIBUTION OF NOTHING FAILS NOWHERE ELSE, which is why it fails here: a node
+	// recorded with zero capacity registers cleanly, joins the fleet, and is simply
+	// never chosen, so the tier it was meant to serve advertises nothing while the
+	// machine looks healthy.
+	if reg.VCPU <= 0 {
+		return 0, fmt.Errorf("alloc: node %s contributes %d vcpu; a host that offers no cores "+
+			"can never be given work", name, reg.VCPU)
+	}
+
+	if reg.Memory <= 0 {
+		return 0, fmt.Errorf("alloc: node %s contributes %s of memory; a host that offers none "+
+			"can never be given work", name, reg.Memory)
+	}
+
+	var epoch int64
+
+	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
 		now := ts(a.now().UTC())
 
 		// A HOST MAY NOT CHANGE ITS BACKEND WHILE IT IS RUNNING WORK.
 		//
-		// Re-registration used to overwrite the provider freely, which quietly
-		// falsified every lease already bound there: each one recorded the backend
-		// it chose at bind, and after the change the ledger said a job was running
-		// on firecracker while the host called itself docker. Later checks read
-		// the NODE's row, so they went on authorizing the lease — the fact that
-		// had become wrong was the one nothing re-read.
+		// Overwriting the provider would falsify every lease already bound there:
+		// each recorded the backend it chose at bind, so the ledger would say a job
+		// runs on firecracker while the host calls itself docker — and later checks
+		// read the NODE's row, so they would go on authorizing the lease.
 		//
-		// Rewriting chosen_provider instead would be worse: it would relabel
-		// compute that is already running, making the record agree with the
-		// catalogue by lying about the past.
-		//
-		// So this is refused, and the operator's route is the honest one — drain
-		// the host, then re-register it. An unbound node changes freely.
-		var current string
+		// Rewriting chosen_provider instead would be worse: it relabels compute
+		// that is already running. So this is refused, and the operator's route is
+		// to drain the host and re-register it. An unbound node changes freely.
+		var current, currentSite string
 
 		switch err := tx.QueryRowContext(ctx,
-			`SELECT provider FROM nodes WHERE name = ?`, name).Scan(&current); {
+			`SELECT provider, site FROM nodes WHERE name = ?`, name).Scan(&current, &currentSite); {
 		case errors.Is(err, sql.ErrNoRows):
 			// First registration; nothing to contradict.
 		case err != nil:
 			return fmt.Errorf("alloc: read node %s: %w", name, err)
 
-		case current != string(kind):
-			var bound int
+		// A HOST DOES NOT MOVE WHILE IT IS RUNNING WORK, for the same reason it may not
+		// change its backend: the leases here recorded where they are, and site is where a
+		// cache lives, so the ledger would point later placements at storage in a different
+		// building from the containers already running.
+		//
+		// WORK MERELY AIMED HERE COUNTS TOO, so both guards attribute a lease the way the
+		// rest of the arithmetic does — COALESCE(node, target_node). `node` is filled at
+		// bind, but escrow chose the machine long before that.
+		//
+		// EXPIRED IDLE WORK DOES NOT GET A VOTE. billet registers the node BEFORE the
+		// server starts and the reaper runs inside that server, so a registration refused
+		// on the strength of abandoned escrow prevents the only process that could clear
+		// it. The cutoff is the reaper's own.
+		//
+		// A RUNNING LEASE STILL DOES, EXPIRED OR NOT, because expiry proves only that the
+		// control-plane holder stopped heartbeating — never that the container stopped.
+		// Reading the two the same way let a host change its backend out from under work
+		// the new backend cannot see: the docker container keeps running, tart
+		// reconciliation cannot enumerate it, the reaper frees the lease, and the next
+		// escrow puts a second job on a machine still running the first. This does not
+		// deadlock, because the reaper lives in the server, the server starts without this
+		// node, and a terminalised lease stops counting here.
+		//
+		// Capacity is different and IS overwritten below.
+		case currentSite != reg.Site:
+			var outstanding int
 
 			if err := tx.QueryRowContext(ctx,
-				`SELECT COUNT(*) FROM leases WHERE node = ? AND phase NOT IN ('done','failed')`,
-				name).Scan(&bound); err != nil {
+				`SELECT COUNT(*) FROM leases
+				 WHERE COALESCE(node, target_node) = ?
+				   AND phase NOT IN ('done','failed')
+				   AND (phase IN ('launching','online','busy') OR expires_at > ?)`,
+				name, now).Scan(&outstanding); err != nil {
 				return fmt.Errorf("alloc: count the leases on node %s: %w", name, err)
 			}
 
-			if bound > 0 {
+			if outstanding > 0 {
+				return fmt.Errorf(
+					"%w: node %s is recorded at site %q and now reports %q, but %d lease(s) are "+
+						"still outstanding against it there. Put node.site back to %q and start "+
+						"billet; once those jobs finish (or their leases expire) the host is "+
+						"free to move",
+					ErrWrongSite, name, currentSite, reg.Site, outstanding, currentSite)
+			}
+
+		case current != string(kind):
+			var outstanding int
+
+			if err := tx.QueryRowContext(ctx,
+				`SELECT COUNT(*) FROM leases
+				 WHERE COALESCE(node, target_node) = ?
+				   AND phase NOT IN ('done','failed')
+				   AND (phase IN ('launching','online','busy') OR expires_at > ?)`,
+				name, now).Scan(&outstanding); err != nil {
+				return fmt.Errorf("alloc: count the leases on node %s: %w", name, err)
+			}
+
+			if outstanding > 0 {
 				// THE WAY OUT IS SPELLED OUT, because this fires during startup —
 				// cmd registers the node before it recovers anything — so an
 				// operator who changes node.provider with work still bound finds
@@ -1111,22 +1159,75 @@ func (a *Allocator) RegisterNode(ctx context.Context, name string, kind config.P
 				// and billet is not running to accept one.
 				return fmt.Errorf(
 					"%w: node %s is registered as %q and now reports %q, but %d lease(s) are "+
-						"still bound to it and recorded the old backend. Put node.provider back "+
-						"to %q and start billet; once those jobs finish (or their leases expire "+
-						"and are reaped) the host is free to change",
-					ErrWrongProvider, name, current, kind, bound, current)
+						"still outstanding against it and recorded the old backend. Put "+
+						"node.provider back to %q and start billet; once those jobs finish (or "+
+						"their leases expire) the host is free to change",
+					ErrWrongProvider, name, current, kind, outstanding, current)
 			}
 		}
 
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO nodes (name, provider, last_seen_at)
-			 VALUES (?, ?, ?)
+		// CAPACITY AND SITE ARE OVERWRITTEN ON EVERY REGISTRATION, unlike the provider
+		// above: a host that comes back offering less has been reconfigured, and leases
+		// already open keep their capacity charged, so the only effect is that no new work
+		// fits until enough of them drain.
+		//
+		// THE EPOCH COMES BACK OUT. It is this row's fencing token, and returning it is
+		// what lets a later "this node is gone" be attributed to the incarnation that
+		// actually went. RETURNING makes that one statement rather than a write and a
+		// hopeful read.
+		if err := tx.QueryRowContext(ctx,
+			`INSERT INTO nodes (name, provider, site, total_vcpu, total_memory, last_seen_at, live)
+			 VALUES (?, ?, ?, ?, ?, ?, 1)
 			 ON CONFLICT (name) DO UPDATE SET
 			   provider     = excluded.provider,
+			   site         = excluded.site,
+			   total_vcpu   = excluded.total_vcpu,
+			   total_memory = excluded.total_memory,
 			   last_seen_at = excluded.last_seen_at,
-			   epoch        = nodes.epoch + 1`,
-			name, string(kind), now); err != nil {
+			   live         = 1,
+			   epoch        = nodes.epoch + 1
+			 RETURNING epoch`,
+			name, string(kind), reg.Site, reg.VCPU, int64(reg.Memory), now).Scan(&epoch); err != nil {
 			return fmt.Errorf("alloc: register node %s: %w", name, err)
+		}
+
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+
+	return epoch, nil
+}
+
+// NodeGone records that the control plane has given up on a host.
+//
+// FENCED ON THE EPOCH. Registration commits to the ledger BEFORE it takes the
+// plane's mutex, and expiry holds that mutex while dropping the old entry — so a
+// host that restarts quickly could commit its new registration and then be marked
+// dead by the expiry of the incarnation it replaced. A no-op once the epoch has
+// moved, which is the point.
+func (a *Allocator) NodeGone(ctx context.Context, name string, epoch int64) error {
+	return a.db.Tx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE nodes SET live = 0 WHERE name = ? AND epoch = ?`, name, epoch); err != nil {
+			return fmt.Errorf("alloc: mark node %s gone: %w", name, err)
+		}
+
+		return nil
+	})
+}
+
+// ForgetEveryNode marks the whole fleet unreachable, for a control plane that has
+// just started.
+//
+// LIVENESS IS THE PLANE'S JUDGEMENT, and a plane that has just started has not
+// formed one. Every node re-registers within a poll, so the cost is a brief zero
+// that is also the truth.
+func (a *Allocator) ForgetEveryNode(ctx context.Context) error {
+	return a.db.Tx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `UPDATE nodes SET live = 0`); err != nil {
+			return fmt.Errorf("alloc: forget the fleet: %w", err)
 		}
 
 		return nil
@@ -1143,9 +1244,8 @@ func (a *Allocator) Reap(ctx context.Context) (int, error) {
 	var reaped int
 
 	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
-		// Reset inside the transaction: a retry, or a rollback, must not leave a
-		// count from a previous attempt. Reap previously reported leases it had
-		// reclaimed even when the transaction rolled back and reclaimed none.
+		// Reset inside the transaction: a retry or a rollback must not leave a count from a
+		// previous attempt.
 		reaped = 0
 
 		now := a.now().UTC()
@@ -1174,9 +1274,8 @@ func (a *Allocator) Reap(ctx context.Context) (int, error) {
 	})
 
 	if err != nil {
-		// The transaction rolled back, so nothing was reclaimed. Reporting a
-		// nonzero count alongside an error invites a caller to believe progress
-		// was made and stop retrying.
+		// The transaction rolled back, so nothing was reclaimed. A nonzero count alongside
+		// an error invites a caller to believe progress was made and stop retrying.
 		return 0, err
 	}
 
@@ -1188,12 +1287,11 @@ func (a *Allocator) Reap(ctx context.Context) (int, error) {
 // must be closed before it continues.
 func readExpiredLeases(ctx context.Context, tx *sql.Tx, cutoff string, limit int) ([]Lease, error) {
 	// run_id and request_id are selected because archive needs them: without them a
-	// reaped lease lands in job_history with NULL attribution, so the very jobs
-	// worth investigating are the ones that lose their identity.
+	// reaped lease lands in job_history with NULL attribution, so the jobs most worth
+	// investigating are the ones that lose their identity.
 	//
-	// Ordered and LIMITed so one transaction cannot hold the single writer
-	// connection while it drains an arbitrarily large backlog, blocking every
-	// reservation and heartbeat behind it.
+	// Ordered and LIMITed so one transaction cannot hold the single writer connection
+	// while it drains an arbitrarily large backlog.
 	rows, err := tx.QueryContext(ctx,
 		`SELECT id, tier, node, target_node, macos_slot, phase, vcpu, memory, epoch, run_id, request_id
 		   FROM leases
@@ -1614,58 +1712,30 @@ func checkFloorsFit(tiers map[string]config.Tier, limits Limits) error {
 	return nil
 }
 
-// unmetFloors reports the capacity other tiers are guaranteed and do not yet
-// hold, which the caller may not take.
+// countOpenPerTier reports how many non-terminal leases each tier holds ON A
+// MACHINE THAT CAN STILL SERVE THEM.
 //
-// One grouped query rather than one per tier: a loop of counts would be a
-// database call per catalogue entry inside the transaction that every
-// reservation waits on.
+// THE SAME DEFINITION OF A USABLE HOST THAT PLACEMENT USES, and the two
+// disagreeing is what made a floor stop being a promise. Placement asks for
+// `live = 1 AND drained = 0`, so a machine that is gone offers nothing — while
+// this count asked only whether a lease was non-terminal, wherever it was aimed.
+// Escrow stranded on a vanished host therefore read as "the reservation is
+// already met", nothing was held back for it, and another tier was offered the
+// last machine that could have served it. The stranded lease is then released,
+// and the reserved tier has none of its promised slots and nowhere to put one.
 //
-// A tier is "owed" only the part of its floor it is missing. Deducting the whole
-// floor would idle capacity a tier has already claimed, and deducting nothing
-// once a floor is met is what keeps a reservation a guarantee rather than a
-// quota — above the floor, everyone competes.
-func (a *Allocator) unmetFloors(
-	ctx context.Context, tx *sql.Tx, forTier string,
-) (int, config.ByteSize, error) {
-	held, err := a.countOpenPerTier(ctx, tx)
-	if err != nil {
-		return 0, 0, err
-	}
-
-	var (
-		vcpu   int
-		memory config.ByteSize
-	)
-
-	for label := range a.tiers {
-		// A tier never holds capacity back from itself: its own floor is not an
-		// obstacle to filling it.
-		if label == forTier {
-			continue
-		}
-
-		t := a.tiers[label]
-		if t.Reserved == 0 {
-			continue
-		}
-
-		missing := t.Reserved - held[label]
-		if missing <= 0 {
-			continue
-		}
-
-		vcpu += missing * t.VCPU
-		memory += config.ByteSize(missing) * t.Memory
-	}
-
-	return vcpu, memory, nil
-}
-
-// countOpenPerTier reports how many non-terminal leases each tier holds.
+// A lease aimed at NO machine still counts. There is nothing to prove it
+// stranded, and treating it as unmet would reserve room on top of leases that
+// are perfectly fine.
 func (a *Allocator) countOpenPerTier(ctx context.Context, tx *sql.Tx) (map[string]int, error) {
 	rows, err := tx.QueryContext(ctx,
-		`SELECT tier, COUNT(*) FROM leases WHERE phase NOT IN ('done','failed') GROUP BY tier`)
+		`SELECT l.tier, COUNT(*)
+		   FROM leases l
+		   LEFT JOIN nodes n ON n.name = COALESCE(l.node, l.target_node)
+		  WHERE l.phase NOT IN ('done','failed')
+		    AND (COALESCE(l.node, l.target_node, '') = ''
+		         OR (n.live = 1 AND n.drained = 0))
+		  GROUP BY l.tier`)
 	if err != nil {
 		return nil, fmt.Errorf("alloc: count open leases per tier: %w", err)
 	}
@@ -1809,14 +1879,11 @@ func (a *Allocator) HistoryOutcome(ctx context.Context, leaseID string) (string,
 func (a *Allocator) archive(ctx context.Context, tx *sql.Tx, l *Lease, outcome Phase) error {
 	now := a.now().UTC()
 
-	var node any
-	if l.Node != "" {
-		node = l.Node
-	}
+	node := attribution(l)
 
 	// COALESCE on update, so terminalizing never erases what assignment recorded.
-	// Reap in particular used to arrive with NULL ids because it did not select
-	// them, overwriting real attribution on the very leases worth investigating.
+	// A caller that does not select the ids — Reap — would otherwise arrive with
+	// NULLs and wipe real attribution from the leases most worth investigating.
 	_, err := tx.ExecContext(ctx,
 		`INSERT INTO job_history (lease_id, tier, node, run_id, request_id, conclusion, queued_at, finished_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)

@@ -38,30 +38,6 @@ const recoverIdentityAdvice = "RESTORE THE ORIGINAL IDENTITY if you can — from
 	"the old one becomes invisible to billet: its leases expire, its capacity is resold, and it " +
 	"runs forever. Only reset it once you have confirmed no compute is left under the old identity"
 
-// DeploymentID returns the stable identity of the billet installation rooted at
-// this state directory, creating it on first use.
-//
-// THIS IS WHAT MAKES DESTRUCTIVE RECONCILIATION SAFE, and it is the reason the
-// node name could not be used for it. The node name defaults to the hostname, so
-// two billet installations on one machine — a production one and someone trying
-// the quickstart, or two worktrees — carry the same name while keeping separate
-// state directories. The process lock does not catch that: it guards a
-// directory, and their directories differ. Labelling compute by node name would
-// then let one installation enumerate the other's containers, find their lease
-// ids absent from its own database, and destroy live jobs it has no relationship
-// with.
-//
-// Renaming a node is the reason it cannot be derived from configuration either:
-// a derived label would change under the operator's feet and orphan every
-// running container by making it invisible to the thing that owns it.
-//
-// Random rather than derived from the path, so that copying a state directory
-// does not silently produce two installations claiming one identity — the copy
-// carries the original's id, which is the honest answer to "these are the same
-// installation". That is what makes the copy DETECTABLE: LockDeployment keys a
-// host-wide lock on the id, so running the copy alongside the original fails as a
-// lock conflict rather than as a cross-destruction. A derived id would give the
-// copy a different identity and no conflict to detect.
 // writeDeploymentID puts an identity on disk durably, or not at all.
 func writeDeploymentID(path, stateDir, id string) error {
 	// O_EXCL, so two processes racing to initialise the same directory cannot
@@ -173,6 +149,24 @@ func AdoptDeploymentID(stateDir, id string) (string, error) {
 	return id, nil
 }
 
+// DeploymentID returns the stable identity of the billet installation rooted at
+// this state directory, creating it on first use.
+//
+// THIS IS WHAT MAKES DESTRUCTIVE RECONCILIATION SAFE, and the reason the node
+// name cannot be used for it: the node name defaults to the hostname, so two
+// installations on one machine carry the same name while keeping separate state
+// directories, and the process lock guards a directory rather than a name.
+// Labelling compute by node name would let one installation enumerate the
+// other's containers, find their lease ids absent from its own database, and
+// destroy live jobs. It cannot be derived from configuration either — a derived
+// label would change under the operator's feet and orphan every running
+// container.
+//
+// RANDOM rather than derived from the path, so copying a state directory does
+// not silently produce two installations claiming one identity: the copy carries
+// the original's id, which is what makes it DETECTABLE — LockDeployment keys a
+// host-wide lock on the id, so running the copy alongside the original fails as
+// a lock conflict.
 func DeploymentID(stateDir string) (string, error) {
 	path := filepath.Join(stateDir, deploymentIDFile)
 

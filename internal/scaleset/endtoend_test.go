@@ -114,6 +114,17 @@ func TestAnAvailableJobIsAcquiredByItsOwnRequestID(t *testing.T) {
 		t.Fatalf("alloc.New: %v", err)
 	}
 
+	// A HOST, because capacity is per machine: a deployment with none can place
+	// nothing and every tier advertises zero. Larger than the budget, so the
+	// deployment ceiling stays the binding constraint and this test still measures
+	// what reaches the wire.
+	if _, err := a.RegisterNode(t.Context(), alloc.NodeRegistration{
+		Name: "test-host", Provider: config.ProviderFirecracker,
+		VCPU: 1 << 20, Memory: 1 << 20 * config.GiB,
+	}); err != nil {
+		t.Fatalf("RegisterNode: %v", err)
+	}
+
 	sess, err := client.Session(t.Context(), 1, "billet-test")
 	if err != nil {
 		t.Fatalf("Session: %v", err)
@@ -256,6 +267,17 @@ func TestAdvertisedCapacityReachesTheWireAsAHeader(t *testing.T) {
 	a, err := alloc.New(db, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
 	if err != nil {
 		t.Fatalf("alloc.New: %v", err)
+	}
+
+	// A HOST, because capacity is per machine: a deployment with none can place
+	// nothing and every tier advertises zero. Larger than the budget, so the
+	// deployment ceiling stays the binding constraint and this test still measures
+	// what reaches the wire.
+	if _, err := a.RegisterNode(t.Context(), alloc.NodeRegistration{
+		Name: "test-host", Provider: config.ProviderFirecracker,
+		VCPU: 1 << 20, Memory: 1 << 20 * config.GiB,
+	}); err != nil {
+		t.Fatalf("RegisterNode: %v", err)
 	}
 
 	sess, err := client.Session(t.Context(), 1, "billet-test")

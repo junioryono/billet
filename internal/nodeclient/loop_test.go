@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,6 +17,13 @@ import (
 	"github.com/junioryono/billet/internal/nodeclient"
 	"github.com/junioryono/billet/internal/nodeplane"
 	"github.com/junioryono/billet/internal/server"
+)
+
+// A registered host in these tests is deliberately larger than any budget they
+// set, so the deployment-wide ceiling stays the binding constraint.
+const (
+	testNodeVCPU   = 1 << 20
+	testNodeMemory = 1 << 20 * config.GiB
 )
 
 const deployment = "0123456789abcdef0123456789abcdef"
@@ -158,7 +167,9 @@ func (f *fakeCompute) aliveCount() int {
 	return f.keptAlive
 }
 
-func (f *fakeCompute) Launch(_ context.Context, _ *alloc.Lease, job server.Job) error {
+func (f *fakeCompute) Launch(
+	_ context.Context, _ *alloc.Lease, _ *nodeapi.TierSpec, job server.Job,
+) error {
 	f.mu.Lock()
 	f.launched = append(f.launched, job.RequestID)
 	f.order = append(f.order, "launch")
@@ -239,7 +250,14 @@ func harness(t *testing.T) (*nodeplane.Plane, *nodeclient.Client) {
 	t.Helper()
 
 	log := slog.New(slog.DiscardHandler)
-	p := nodeplane.New(log, deployment, time.Minute, nodeplane.WithCommandTimeout(5*time.Second))
+	// WITH A CATALOGUE: a launch carries its tier's shape to the node, so a plane
+	// that cannot describe the tier refuses the launch before dispatching it.
+	p := nodeplane.New(log, deployment, time.Minute,
+		nodeplane.WithCommandTimeout(5*time.Second),
+		nodeplane.WithTierCatalog([]config.Tier{{
+			Label: "billet-2vcpu", Provider: config.ProviderDocker, GuestOS: config.GuestLinux,
+			VCPU: 2, Memory: 8 * config.GiB, Image: "ubuntu-2404-x64",
+		}}))
 	p.SetPollWindowForTest(60 * time.Millisecond)
 
 	srv := httptest.NewServer(nodeplane.Handler(log, p, stubStore{}, stubJIT{}))
@@ -269,6 +287,9 @@ func runLoop(t *testing.T, c *nodeclient.Client, compute nodeclient.Compute) {
 		// cancellation. Asserting anything else would assert the test's own
 		// teardown.
 		err := nodeclient.Run(ctx, c, compute, nodeclient.LoopOptions{
+			// What this host contributes; the control plane refuses a node offering none.
+			VCPU:       testNodeVCPU,
+			Memory:     testNodeMemory,
 			Provider:   config.ProviderDocker,
 			GuestOS:    []config.GuestOS{config.GuestLinux},
 			Deployment: deployment,
@@ -305,6 +326,7 @@ func TestRecoveryPrecedesTheFirstLaunch(t *testing.T) {
 
 	lease := &alloc.Lease{
 		ID:        "l1",
+		Tier:      "billet-2vcpu",
 		VCPU:      2,
 		Memory:    8 * config.GiB,
 		GuestOS:   config.GuestLinux,
@@ -369,6 +391,7 @@ func TestCustodyCrossesBackAsAFlag(t *testing.T) {
 
 	lease := &alloc.Lease{
 		ID:        "l1",
+		Tier:      "billet-2vcpu",
 		VCPU:      2,
 		Memory:    8 * config.GiB,
 		GuestOS:   config.GuestLinux,
@@ -399,6 +422,7 @@ func TestACleanFailureIsNotCustody(t *testing.T) {
 
 	lease := &alloc.Lease{
 		ID:        "l1",
+		Tier:      "billet-2vcpu",
 		VCPU:      2,
 		Memory:    8 * config.GiB,
 		GuestOS:   config.GuestLinux,
@@ -434,6 +458,7 @@ func TestANodeThatCannotRecoverTakesNoWork(t *testing.T) {
 	// the caller is told nothing started.
 	lease := &alloc.Lease{
 		ID:        "l1",
+		Tier:      "billet-2vcpu",
 		VCPU:      2,
 		Memory:    8 * config.GiB,
 		GuestOS:   config.GuestLinux,
@@ -531,9 +556,9 @@ func TestTheCustodyJanitorIsStarted(t *testing.T) {
 // THE JANITOR STOPS WITH THE LOOP, and stopping is the whole point.
 //
 // It was started on the loop's own context, which outlives Run: a node that
-// exits because it was refused, or a `server --dev` that shuts one node down,
-// would leave a goroutine heartbeating leases for a runtime nobody is driving
-// any more. Nothing crashes, so nothing draws attention.
+// exits because it was refused, or one shutting down while its control plane
+// keeps running, would leave a goroutine heartbeating leases for a runtime
+// nobody is driving any more. Nothing crashes, so nothing draws attention.
 func TestTheCustodyJanitorDoesNotOutliveTheLoop(t *testing.T) {
 	t.Parallel()
 
@@ -548,6 +573,9 @@ func TestTheCustodyJanitorDoesNotOutliveTheLoop(t *testing.T) {
 		defer close(done)
 
 		err := nodeclient.Run(ctx, c, compute, nodeclient.LoopOptions{
+			// What this host contributes; the control plane refuses a node offering none.
+			VCPU:       testNodeVCPU,
+			Memory:     testNodeMemory,
 			Provider:   config.ProviderDocker,
 			Deployment: deployment,
 			Log:        slog.New(slog.DiscardHandler),
@@ -615,6 +643,7 @@ func TestALateResultMakesTheNodeAssumeCustody(t *testing.T) {
 	go func() {
 		lease := &alloc.Lease{
 			ID:        "l1",
+			Tier:      "billet-2vcpu",
 			VCPU:      2,
 			Memory:    8 * config.GiB,
 			GuestOS:   config.GuestLinux,
@@ -681,6 +710,7 @@ func TestARegistrationHandsOverCustodyOfWhatWasInFlight(t *testing.T) {
 	go func() {
 		lease := &alloc.Lease{
 			ID:        "l1",
+			Tier:      "billet-2vcpu",
 			VCPU:      2,
 			Memory:    8 * config.GiB,
 			GuestOS:   config.GuestLinux,
@@ -699,7 +729,7 @@ func TestARegistrationHandsOverCustodyOfWhatWasInFlight(t *testing.T) {
 
 	// The node re-registers while its launch is still running, which is what a
 	// reconnect after a partition looks like from the plane's side.
-	if err := c.Register(t.Context(), config.ProviderDocker, nil, deployment); err != nil {
+	if err := c.Register(t.Context(), nodeclient.Registration{Provider: config.ProviderDocker, Deployment: deployment, VCPU: testNodeVCPU, Memory: testNodeMemory}); err != nil {
 		t.Fatalf("re-register: %v", err)
 	}
 
@@ -746,6 +776,7 @@ func TestALostResultMakesTheNodeAssumeCustody(t *testing.T) {
 
 	lease := &alloc.Lease{
 		ID:        "l1",
+		Tier:      "billet-2vcpu",
 		VCPU:      2,
 		Memory:    8 * config.GiB,
 		GuestOS:   config.GuestLinux,
@@ -811,6 +842,9 @@ func TestCustodyIsAdvancedOnTheSweepCadence(t *testing.T) {
 		defer wg.Done()
 
 		err := nodeclient.Run(ctx, c, compute, nodeclient.LoopOptions{
+			// What this host contributes; the control plane refuses a node offering none.
+			VCPU:       testNodeVCPU,
+			Memory:     testNodeMemory,
 			Provider:   config.ProviderDocker,
 			Deployment: deployment,
 			Log:        slog.New(slog.DiscardHandler),
@@ -849,6 +883,9 @@ func TestASupersededNodeDrainsBeforeStopping(t *testing.T) {
 
 	go func() {
 		done <- nodeclient.Run(t.Context(), c, compute, nodeclient.LoopOptions{
+			// What this host contributes; the control plane refuses a node offering none.
+			VCPU:       testNodeVCPU,
+			Memory:     testNodeMemory,
 			Provider:   config.ProviderDocker,
 			Deployment: deployment,
 			Log:        slog.New(slog.DiscardHandler),
@@ -865,7 +902,7 @@ func TestASupersededNodeDrainsBeforeStopping(t *testing.T) {
 
 	waitFor(t, func() bool { return compute.aliveCount() == 1 })
 
-	if err := other.Register(t.Context(), config.ProviderDocker, nil, deployment); err != nil {
+	if err := other.Register(t.Context(), nodeclient.Registration{Provider: config.ProviderDocker, Deployment: deployment, VCPU: testNodeVCPU, Memory: testNodeMemory}); err != nil {
 		t.Fatalf("the second process could not register: %v", err)
 	}
 
@@ -929,6 +966,9 @@ func TestANodeThatIsRefusedStops(t *testing.T) {
 	go func() {
 		// A deployment identity this control plane will never accept.
 		done <- nodeclient.Run(t.Context(), c, &fakeCompute{}, nodeclient.LoopOptions{
+			// What this host contributes; the control plane refuses a node offering none.
+			VCPU:       testNodeVCPU,
+			Memory:     testNodeMemory,
 			Provider:   config.ProviderDocker,
 			Deployment: "ffffffffffffffffffffffffffffffff",
 			Log:        slog.New(slog.DiscardHandler),
@@ -950,10 +990,16 @@ func TestANodeThatIsRefusedStops(t *testing.T) {
 	}
 }
 
+// waitFor polls a condition rather than sleeping a fixed amount.
+//
+// The deadline is generous because these are wall-clock waits taken while the
+// whole suite runs in parallel: the conditions here are reached in milliseconds
+// when the machine is idle, so a failure means the condition never happened
+// rather than that it was slow. A tighter bound just turns load into a flake.
 func waitFor(t *testing.T, cond func() bool) {
 	t.Helper()
 
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(20 * time.Second)
 
 	for time.Now().Before(deadline) {
 		if cond() {
@@ -964,4 +1010,53 @@ func waitFor(t *testing.T, cond func() bool) {
 	}
 
 	t.Fatal("condition never became true")
+}
+
+// breaker makes the control plane stop accepting registrations, which is what a
+// node meets while the plane is restarting.
+type breaker struct {
+	inner http.Handler
+
+	failRegister     atomic.Bool
+	registerAttempts atomic.Int64
+}
+
+func (b *breaker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/v1/register" {
+		b.registerAttempts.Add(1)
+
+		if b.failRegister.Load() {
+			http.Error(w, "the control plane is still starting", http.StatusServiceUnavailable)
+
+			return
+		}
+	}
+
+	b.inner.ServeHTTP(w, r)
+}
+
+// breakableHarness is harness with a control plane a test can take away.
+func breakableHarness(t *testing.T) (*nodeplane.Plane, *nodeclient.Client, *breaker) {
+	t.Helper()
+
+	log := slog.New(slog.DiscardHandler)
+	p := nodeplane.New(log, deployment, time.Minute,
+		nodeplane.WithCommandTimeout(5*time.Second),
+		nodeplane.WithTierCatalog([]config.Tier{{
+			Label: "billet-2vcpu", Provider: config.ProviderDocker, GuestOS: config.GuestLinux,
+			VCPU: 2, Memory: 8 * config.GiB, Image: "ubuntu-2404-x64",
+		}}))
+	p.SetPollWindowForTest(60 * time.Millisecond)
+
+	b := &breaker{inner: nodeplane.Handler(log, p, stubStore{}, stubJIT{})}
+
+	srv := httptest.NewServer(b)
+	t.Cleanup(srv.Close)
+
+	c, err := nodeclient.New(nodeclient.Options{Base: srv.URL, Node: "n1"})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+
+	return p, c, b
 }

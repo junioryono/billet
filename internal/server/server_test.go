@@ -226,13 +226,8 @@ func TestReconciliationFailureStopsStartup(t *testing.T) {
 func TestReaperDoesNotReclaimCapacityStillAdvertised(t *testing.T) {
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
 
-	db := openState(t)
-
-	a, err := alloc.New(db, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
 		alloc.WithLeaseTTL(150*time.Millisecond))
-	if err != nil {
-		t.Fatalf("alloc.New: %v", err)
-	}
 
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()

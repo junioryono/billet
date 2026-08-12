@@ -2,6 +2,7 @@ package wirecert_test
 
 import (
 	"bytes"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
@@ -292,9 +293,16 @@ func TestTheServerConfigRequiresAClientCertificate(t *testing.T) {
 		t.Fatalf("server tls: %v", err)
 	}
 
-	if conf.ClientAuth != 4 { // tls.RequireAndVerifyClientCert
-		t.Errorf("client auth is %v; anything short of require-and-verify lets an "+
-			"unauthenticated connection reach a handler", conf.ClientAuth)
+	// VERIFY IF GIVEN, not require. An unenrolled machine has no certificate and
+	// still has to reach /v1/ca and /v1/enroll; every other route is behind a
+	// handler guard that refuses a connection with no verified chain, which
+	// TestAnUnenrolledConnectionCanReachNothingElse is the proof of.
+	//
+	// What must NOT weaken is the verification of a certificate that IS
+	// presented: ClientCAs below is what keeps a forged one out.
+	if conf.ClientAuth != tls.VerifyClientCertIfGiven {
+		t.Errorf("client auth is %v; want VerifyClientCertIfGiven, so an unenrolled machine "+
+			"can ask to join while a presented certificate is still verified", conf.ClientAuth)
 	}
 
 	if conf.ClientCAs == nil {
@@ -650,5 +658,44 @@ func TestABundleWhoseCertificateDoesNotChainToItsCAIsRefused(t *testing.T) {
 	if _, err := wirecert.ClientTLS(mixed); err == nil {
 		t.Error("a node certificate was accepted beside an authority that did not issue it; " +
 			"the node would adopt the wrong deployment permanently and still be rejected")
+	}
+}
+
+// AN AUTHORITY RUNNING OUT SHORTENS EVERY CERTIFICATE IT ISSUES, silently, and
+// that is what Capping exists to say out loud.
+//
+// A leaf may not outlive its authority, so once the CA has less than a leaf's
+// life left every certificate is quietly shorter than the last. Renewals keep
+// working — faster and faster — and then the whole fleet expires on the day the
+// authority does. Nothing errors before that, which is exactly why an operator
+// has to be told while there is still time to rotate.
+func TestAnExpiringAuthorityIsReported(t *testing.T) {
+	t.Parallel()
+
+	ca, err := wirecert.LoadOrCreateCA(t.TempDir(), "0123456789abcdef0123456789abcdef")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// A fresh authority has years left and is not capping anything.
+	if left, capping := ca.Capping(); capping {
+		t.Errorf("a new authority reports that it is shortening certificates (%s left)", left)
+	}
+
+	// And what it issues gets the full life rather than a truncated one.
+	bundle, err := ca.IssueNode("epyc-1")
+	if err != nil {
+		t.Fatalf("issue: %v", err)
+	}
+
+	leaf, err := wirecert.LeafOf(bundle)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	if got := time.Until(leaf.NotAfter); got < wirecert.LeafLifetime-48*time.Hour {
+		t.Errorf("a certificate from a fresh authority is only %s long, want about %s; it is "+
+			"being capped, which is the state that ends with the whole fleet stopping at once",
+			got.Round(time.Hour), wirecert.LeafLifetime)
 	}
 }

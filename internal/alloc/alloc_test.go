@@ -55,7 +55,57 @@ func reserve(t *testing.T, a *Allocator, tier string) *Lease {
 	return lease
 }
 
+// newAllocator is an allocator with ONE HOST ALREADY IN IT, big enough that it
+// is never the constraint.
+//
+// Capacity is per machine now, so a deployment with no registered host can place
+// nothing and every tier advertises zero. That is correct, and it would also
+// silently turn most of this package's tests into assertions about an empty
+// fleet. Registering a host larger than any budget these tests set keeps the
+// deployment ceiling as the binding constraint, which is what they were written
+// to measure.
+//
+// A test that wants the FLEET to be the constraint uses newBareAllocator and
+// says which machines exist.
 func newAllocator(t *testing.T, limits Limits, tiers []config.Tier, opts ...Option) *Allocator {
+	t.Helper()
+
+	a := newBareAllocator(t, limits, tiers, opts...)
+
+	// ONE HOST PER BACKEND, so a tier naming any of them has somewhere to go.
+	for _, provider := range []config.ProviderKind{
+		config.ProviderDocker, config.ProviderFirecracker, config.ProviderTart,
+	} {
+		if _, err := a.RegisterNode(t.Context(), testRegistration(
+			"test-host-"+string(provider), provider)); err != nil {
+			t.Fatalf("registering the default host: %v", err)
+		}
+	}
+
+	// AND ONE FOR EVERY HOST A TIER PINS TO. A pin is an allowlist of one, so a
+	// tier naming a machine that does not exist can be placed nowhere and
+	// advertises zero — which would quietly turn every macOS test in this package
+	// into an assertion about an empty fleet.
+	for i := range tiers {
+		if tiers[i].Node == "" {
+			continue
+		}
+
+		provider := tiers[i].Provider
+		if provider == "" && len(tiers[i].Providers) > 0 {
+			provider = tiers[i].Providers[0]
+		}
+
+		if _, err := a.RegisterNode(t.Context(), testRegistration(tiers[i].Node, provider)); err != nil {
+			t.Fatalf("registering pinned host %s: %v", tiers[i].Node, err)
+		}
+	}
+
+	return a
+}
+
+// newBareAllocator is an allocator with NO hosts, for tests about the fleet.
+func newBareAllocator(t *testing.T, limits Limits, tiers []config.Tier, opts ...Option) *Allocator {
 	t.Helper()
 
 	db, err := state.Open(t.Context(), t.TempDir())
@@ -333,9 +383,16 @@ func TestLifecycleTransitions(t *testing.T) {
 	// Binding is part of the lifecycle, not an optional extra: launching means a
 	// host is already bringing the instance up. This test previously skipped it,
 	// which is what made Bind's placement checks routable-around.
-	registerNode(t, a, "epyc-1", config.ProviderFirecracker)
+	//
+	// THE HOST IS THE ONE THE LEASE WAS AIMED AT. Escrow chooses now, so a test
+	// that binds to a machine of its own choosing is testing the pin fence rather
+	// than the lifecycle it is named for.
+	host := lease.TargetNode
+	if host == "" {
+		t.Fatal("the reservation named no host, so there is nothing to bind it to")
+	}
 
-	if err := a.Bind(ctx, lease.ID, lease.Epoch, "epyc-1"); err != nil {
+	if err := a.Bind(ctx, lease.ID, lease.Epoch, host); err != nil {
 		t.Fatalf("Bind: %v", err)
 	}
 
@@ -613,6 +670,11 @@ func TestMacOSAccountingSurvivesCatalogChange(t *testing.T) {
 
 	ctx := t.Context()
 
+	// The Mac has to exist, or the tier pinned to it can be placed nowhere. This
+	// test builds its allocators directly because it needs TWO of them over one
+	// database, so it registers the host itself.
+	registerNode(t, first, "mac-mini-1", config.ProviderTart)
+
 	for range config.DefaultMacOSVMLimit {
 		if _, err := first.Reserve(ctx, "mac-6"); err != nil {
 			t.Fatalf("Reserve: %v", err)
@@ -642,13 +704,11 @@ func TestMacOSAccountingSurvivesCatalogChange(t *testing.T) {
 func registerNode(t *testing.T, a *Allocator, name string, provider config.ProviderKind) {
 	t.Helper()
 
-	if err := a.db.Tx(t.Context(), func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(t.Context(),
-			`INSERT INTO nodes (name, provider, last_seen_at) VALUES (?, ?, ?)`,
-			name, string(provider), ts(time.Now()))
-
-		return err
-	}); err != nil {
+	// THROUGH THE REAL PATH. This used to be a raw INSERT, which stopped being
+	// equivalent the moment a node carried liveness and capacity: it produced
+	// hosts recorded as unreachable and contributing nothing, so every tier they
+	// were supposed to serve advertised zero and the tests read as capacity bugs.
+	if _, err := a.RegisterNode(t.Context(), testRegistration(name, provider)); err != nil {
 		t.Fatalf("register node %s: %v", name, err)
 	}
 }
@@ -1143,19 +1203,21 @@ func TestNodePolicyGuestOSSliceIsCopied(t *testing.T) {
 		VCPU: 4, Memory: 12 * config.GiB, Image: "ubuntu-2404-arm64",
 	}
 
-	a := newAllocator(t, limits, []config.Tier{linux})
+	a := newBareAllocator(t, limits, []config.Tier{linux})
 
 	// Widening the caller's slice in place must not widen the allocator's rules.
 	allowlist[0] = config.GuestLinux
 
-	ctx := t.Context()
-
 	registerNode(t, a, "mac-mini-1", config.ProviderTart)
 
-	lease := reserve(t, a, "linux-arm")
-
-	if err := a.Bind(ctx, lease.ID, lease.Epoch, "mac-mini-1"); !errors.Is(err, ErrGuestOSNotAllowed) {
-		t.Errorf("bind = %v; the caller widened the allowlist after New", err)
+	// OBSERVED THROUGH ELIGIBILITY, which is where the allowlist is read now. The
+	// Mac is the only host, and it permits macOS only — so a linux tier has
+	// nowhere to go and advertises nothing. If the allocator had kept the
+	// caller's slice, the mutation above would have widened it to linux and the
+	// tier would suddenly have somewhere to run.
+	if got := headroom(t, a, "linux-arm"); got != 0 {
+		t.Errorf("headroom = %d, want 0 — the caller mutated its slice after New and the "+
+			"allocator followed", got)
 	}
 }
 
@@ -1170,23 +1232,50 @@ func TestBindRefusesAGuestOSTheHostDisallows(t *testing.T) {
 		VCPU: 4, Memory: 12 * config.GiB, Image: "ubuntu-2404-arm64",
 	}
 
-	a := newAllocator(t,
-		Limits{
-			MaxVCPU: 256, MaxMemory: 512 * config.GiB,
-			Nodes: map[string]config.NodePolicy{
-				"mac-mini-1": {Name: "mac-mini-1", GuestOS: []config.GuestOS{config.GuestMacOS}},
-			},
-		},
-		[]config.Tier{linux})
+	db, err := state.Open(t.Context(), t.TempDir())
+	if err != nil {
+		t.Fatalf("state.Open: %v", err)
+	}
+
+	defer db.Close()
 
 	ctx := t.Context()
 
-	registerNode(t, a, "mac-mini-1", config.ProviderTart)
+	// THE POLICY HAS TO TIGHTEN BETWEEN ESCROW AND BIND, which is the only way
+	// this check is reachable now and is a real thing an operator does.
+	//
+	// Placement will not aim a linux lease at a macOS-only Mac in the first place
+	// — the host is not even a candidate — so the lease has to be reserved while
+	// the Mac still permits linux. Bind is the fence that catches the change,
+	// which is exactly its job: the allocator re-reads policy at the moment it
+	// commits a placement rather than trusting a decision taken earlier.
+	before, err := New(db, Limits{MaxVCPU: 256, MaxMemory: 512 * config.GiB},
+		[]config.Tier{linux})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
 
-	lease := reserve(t, a, "linux-arm")
+	registerNode(t, before, "mac-mini-1", config.ProviderTart)
 
-	if err := a.Bind(ctx, lease.ID, lease.Epoch, "mac-mini-1"); !errors.Is(err, ErrGuestOSNotAllowed) {
-		t.Errorf("bind of a linux guest to a macos-only host = %v, want ErrGuestOSNotAllowed", err)
+	lease := reserve(t, before, "linux-arm")
+
+	if lease.TargetNode != "mac-mini-1" {
+		t.Fatalf("the lease was aimed at %q, so this test is not about the Mac", lease.TargetNode)
+	}
+
+	// The operator restricts that Mac to macOS and restarts.
+	after, err := New(db, Limits{
+		MaxVCPU: 256, MaxMemory: 512 * config.GiB,
+		Nodes: map[string]config.NodePolicy{
+			"mac-mini-1": {Name: "mac-mini-1", GuestOS: []config.GuestOS{config.GuestMacOS}},
+		},
+	}, []config.Tier{linux})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	if err := after.Bind(ctx, lease.ID, lease.Epoch, "mac-mini-1"); !errors.Is(err, ErrGuestOSNotAllowed) {
+		t.Errorf("bind of a linux guest to a now-macos-only host = %v, want ErrGuestOSNotAllowed", err)
 	}
 }
 
@@ -1681,18 +1770,43 @@ func TestBindRefusesToAdoptAnAlreadyRunningLease(t *testing.T) {
 // A Firecracker lease cannot run on a Tart host. The comparison is against the
 // provider the node REGISTERED, not one a catalog claims about it.
 func TestBindRefusesANodeRunningAnotherProvider(t *testing.T) {
-	a := newAllocator(t,
-		Limits{MaxVCPU: 64, MaxMemory: 128 * config.GiB},
-		[]config.Tier{tier("small", 4, 16*config.GiB)}) // firecracker
+	small := tier("small", 4, 16*config.GiB) // firecracker
+
+	a := newBareAllocator(t, Limits{MaxVCPU: 64, MaxMemory: 128 * config.GiB},
+		[]config.Tier{small})
 
 	ctx := t.Context()
 
-	registerNode(t, a, "mac-mini-1", config.ProviderTart)
+	registerNode(t, a, "shapeshifter", config.ProviderFirecracker)
 
 	lease := reserve(t, a, "small")
 
-	if err := a.Bind(ctx, lease.ID, lease.Epoch, "mac-mini-1"); !errors.Is(err, ErrWrongProvider) {
-		t.Errorf("bind of a firecracker lease to a tart host = %v, want ErrWrongProvider", err)
+	if lease.TargetNode != "shapeshifter" {
+		t.Fatalf("the lease was aimed at %q, so this test is not about that host",
+			lease.TargetNode)
+	}
+
+	// SEEDED, BECAUSE REGISTRATION NO LONGER ALLOWS IT. A host used to be able to
+	// change backend while a lease was merely AIMED at it — the guard counted only
+	// bound leases — and that was the window this check was written for. It is
+	// closed now: escrow names its machine, so the guard refuses the change while
+	// capacity is outstanding, whether or not anything has bound.
+	//
+	// The check below is therefore defence in depth rather than the primary
+	// defence, and it is worth keeping as exactly that: Bind compares against the
+	// provider the node REGISTERED, so it holds even if a mismatch reaches the
+	// ledger by some route that is not re-registration.
+	if err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx,
+			`UPDATE nodes SET provider = ? WHERE name = ?`, config.ProviderTart, "shapeshifter")
+
+		return err
+	}); err != nil {
+		t.Fatalf("seed the backend change: %v", err)
+	}
+
+	if err := a.Bind(ctx, lease.ID, lease.Epoch, "shapeshifter"); !errors.Is(err, ErrWrongProvider) {
+		t.Errorf("bind of a firecracker lease to a host now running tart = %v, want ErrWrongProvider", err)
 	}
 }
 
@@ -1792,5 +1906,46 @@ func TestNewRejectsNegativeMacOSLimit(t *testing.T) {
 
 	if _, err := New(db, limits, nil); err == nil {
 		t.Error("New accepted a negative per-host macOS limit")
+	}
+}
+
+// A LEASE THAT NEVER BOUND STILL SAYS WHERE IT WAS GOING.
+//
+// Escrow chooses the machine and `node` is not filled until bind, so a lease
+// that GitHub assigned and nothing ever launched recorded no host at all — the
+// history said the job touched nowhere, when the ledger knew exactly which
+// machine had been promised to it. Those are the rows most worth reading later,
+// because a lease that dies between assignment and bind is the shape a crash
+// leaves behind.
+func TestHistoryAttributesALeaseToTheMachineEscrowChose(t *testing.T) {
+	a := newBareAllocator(t, Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB},
+		[]config.Tier{{
+			Label: "small", Provider: config.ProviderDocker, GuestOS: config.GuestLinux,
+			VCPU: 2, Memory: 8 * config.GiB, Image: "img",
+		}})
+
+	mustRegister(t, a, NodeRegistration{
+		Name: "epyc-1", Provider: config.ProviderDocker, VCPU: 64, Memory: 256 * config.GiB})
+
+	lease, err := a.Reserve(t.Context(), "small")
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	// Assigned by GitHub, and then nothing: no bind, no launch.
+	if err := a.Assign(t.Context(), lease.ID, lease.Epoch, 7, 9); err != nil {
+		t.Fatalf("Assign: %v", err)
+	}
+
+	var node sql.NullString
+
+	if err := a.db.Reader().QueryRowContext(t.Context(),
+		`SELECT node FROM job_history WHERE lease_id = ?`, lease.ID).Scan(&node); err != nil {
+		t.Fatalf("read history: %v", err)
+	}
+
+	if node.String != "epyc-1" {
+		t.Errorf("job_history attributes this lease to %q, and escrow placed it on %q",
+			node.String, lease.TargetNode)
 	}
 }
