@@ -166,13 +166,13 @@ func TestAnEnrollingNodeWaitsForApproval(t *testing.T) {
 	}
 
 	// PENDING, not admitted. Nothing has decided yet.
-	if _, err := nodeclient.Enroll(t.Context(), base, "epyc-1", "a-token", caPEM, csrPEM); !errors.Is(err, nodeclient.ErrNotApproved) {
+	if _, _, err := nodeclient.Enroll(t.Context(), base, "epyc-1", "a-token", caPEM, csrPEM); !errors.Is(err, nodeclient.ErrNotApproved) {
 		t.Fatalf("an unapproved node was admitted: %v", err)
 	}
 
 	list.approve(t, ca, "epyc-1")
 
-	certPEM, err := nodeclient.Enroll(t.Context(), base, "epyc-1", "a-token", caPEM, csrPEM)
+	certPEM, _, err := nodeclient.Enroll(t.Context(), base, "epyc-1", "a-token", caPEM, csrPEM)
 	if err != nil {
 		t.Fatalf("an approved node was not admitted: %v", err)
 	}
@@ -212,13 +212,13 @@ func TestTheApprovedFingerprintSurvivesSigning(t *testing.T) {
 		t.Fatalf("fingerprint: %v", err)
 	}
 
-	if _, err := nodeclient.Enroll(t.Context(), base, "epyc-1", "a-token", caPEM, csrPEM); !errors.Is(err, nodeclient.ErrNotApproved) {
+	if _, _, err := nodeclient.Enroll(t.Context(), base, "epyc-1", "a-token", caPEM, csrPEM); !errors.Is(err, nodeclient.ErrNotApproved) {
 		t.Fatalf("unexpected: %v", err)
 	}
 
 	list.approve(t, ca, "epyc-1")
 
-	certPEM, err := nodeclient.Enroll(t.Context(), base, "epyc-1", "a-token", caPEM, csrPEM)
+	certPEM, _, err := nodeclient.Enroll(t.Context(), base, "epyc-1", "a-token", caPEM, csrPEM)
 	if err != nil {
 		t.Fatalf("enroll: %v", err)
 	}
@@ -282,7 +282,7 @@ func TestASecondKeyCannotTakeAClaimedName(t *testing.T) {
 		t.Fatalf("csr: %v", err)
 	}
 
-	if _, err := nodeclient.Enroll(t.Context(), base, "epyc-1", "a-token", caPEM, first); !errors.Is(err, nodeclient.ErrNotApproved) {
+	if _, _, err := nodeclient.Enroll(t.Context(), base, "epyc-1", "a-token", caPEM, first); !errors.Is(err, nodeclient.ErrNotApproved) {
 		t.Fatalf("unexpected: %v", err)
 	}
 
@@ -291,7 +291,7 @@ func TestASecondKeyCannotTakeAClaimedName(t *testing.T) {
 		t.Fatalf("csr: %v", err)
 	}
 
-	if _, err := nodeclient.Enroll(t.Context(), base, "epyc-1", "a-token", caPEM, second); err == nil {
+	if _, _, err := nodeclient.Enroll(t.Context(), base, "epyc-1", "a-token", caPEM, second); err == nil {
 		t.Fatal("a second key took a name that was already claimed")
 	}
 }
@@ -380,7 +380,7 @@ func TestEnrollingNeedsAJoinToken(t *testing.T) {
 		t.Fatalf("csr: %v", err)
 	}
 
-	_, err = nodeclient.Enroll(t.Context(), base, "epyc-1", "", caPEM, csrPEM)
+	_, _, err = nodeclient.Enroll(t.Context(), base, "epyc-1", "", caPEM, csrPEM)
 	if err == nil {
 		t.Fatal("a machine with no join token was allowed to claim a name")
 	}
@@ -419,7 +419,7 @@ func TestALedgerOutageIsNotReportedAsAMissingJoinToken(t *testing.T) {
 		t.Fatalf("csr: %v", err)
 	}
 
-	_, err = nodeclient.Enroll(t.Context(), base, "epyc-1", "a-token", caPEM, csrPEM)
+	_, _, err = nodeclient.Enroll(t.Context(), base, "epyc-1", "a-token", caPEM, csrPEM)
 	if err == nil {
 		t.Fatal("enrolling succeeded while the ledger could not answer")
 	}
@@ -427,5 +427,94 @@ func TestALedgerOutageIsNotReportedAsAMissingJoinToken(t *testing.T) {
 	if strings.Contains(err.Error(), "run `billet ca token`") {
 		t.Errorf("a ledger outage was reported as a missing credential, which sends an "+
 			"operator to mint tokens that cannot help: %v", err)
+	}
+}
+
+// ENROLLMENT THAT SPANS A ROTATION INSTALLS THE AUTHORITY IT WAS SIGNED BY.
+//
+// The node pins the bootstrap authority, prints its fingerprint, and waits for a
+// human. That wait is unbounded by design, so an operator rotating the
+// deployment's CA in the middle of it is an ordinary sequence, not a contrived
+// one — approval then signs the CSR with the NEW authority.
+//
+// The server gets this right: it answers with a trust bundle holding both. The
+// client threw it away and returned only the certificate, so the caller wrote
+// the bootstrap authority it had been holding since before the rotation. The
+// node's own certificate does not chain to its own ca.crt, and it cannot start —
+// the one outcome enrollment exists to avoid, arriving at the end of a
+// successful approval.
+func TestEnrollmentAcrossARotationWritesTheAuthorityThatSignedIt(t *testing.T) {
+	t.Parallel()
+
+	// The authority the node bootstraps against, and the one a rotation moves to.
+	oldCA, err := wirecert.LoadOrCreateCA(t.TempDir(), wireDeployment)
+	if err != nil {
+		t.Fatalf("create the old authority: %v", err)
+	}
+
+	newCA, err := wirecert.LoadOrCreateCA(t.TempDir(), wireDeployment)
+	if err != nil {
+		t.Fatalf("create the new authority: %v", err)
+	}
+
+	// Mid-overlap: the OLD authority still signs what the server presents, and
+	// both are trusted for clients.
+	serving, err := oldCA.IssueServer([]string{"127.0.0.1"})
+	if err != nil {
+		t.Fatalf("issue the server certificate: %v", err)
+	}
+
+	conf, err := wirecert.ServerTLS(serving)
+	if err != nil {
+		t.Fatalf("server tls: %v", err)
+	}
+
+	trust := append(append([]byte(nil), newCA.CertPEM()...), oldCA.CertPEM()...)
+
+	log := slog.New(slog.DiscardHandler)
+	list := &enrollments{}
+
+	plane := nodeplane.New(log, wireDeployment, time.Minute)
+
+	srv := httptest.NewUnstartedServer(
+		nodeplane.Handler(log, plane, mtlsStore{}, alwaysMints{},
+			nodeplane.RequireClientCert(),
+			nodeplane.WithRenewal(newCA),
+			nodeplane.WithTrustBundle(trust),
+			nodeplane.WithEnrollment(list)))
+	srv.TLS = conf
+	srv.StartTLS()
+
+	t.Cleanup(srv.Close)
+
+	// WHAT THE NODE IS HOLDING WHEN THE ROTATION HAPPENS. It fetched and pinned
+	// the authority before any of this, which is the only CA it knows.
+	caPEM := oldCA.CertPEM()
+
+	csrPEM, keyPEM, err := wirecert.NewNodeCSR("epyc-1")
+	if err != nil {
+		t.Fatalf("csr: %v", err)
+	}
+
+	if _, _, err := nodeclient.Enroll(t.Context(), srv.URL, "epyc-1", "a-token", caPEM, csrPEM); !errors.Is(err, nodeclient.ErrNotApproved) {
+		t.Fatalf("unexpected: %v", err)
+	}
+
+	// The rotation happens while the operator is deciding, so approval signs with
+	// the new authority.
+	list.approve(t, newCA, "epyc-1")
+
+	certPEM, installCA, err := nodeclient.Enroll(t.Context(), srv.URL, "epyc-1", "a-token", caPEM, csrPEM)
+	if err != nil {
+		t.Fatalf("enroll: %v", err)
+	}
+
+	// WHAT THE NODE WOULD WRITE HAS TO WORK. Loading it is the same thing the
+	// node does on its next start, and it is where the old behaviour died.
+	if _, err := wirecert.ClientTLS(wirecert.Bundle{
+		CertPEM: certPEM, KeyPEM: keyPEM, CAPEM: installCA,
+	}); err != nil {
+		t.Fatalf("the bundle this node would install does not verify against itself, so it "+
+			"cannot start: %v", err)
 	}
 }

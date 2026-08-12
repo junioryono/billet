@@ -341,11 +341,24 @@ func enrollNode(ctx context.Context, cfg *config.Config, caFingerprint, joinToke
 	fmt.Printf("  billet nodes approve %s --fingerprint %s\n\n", name, fingerprint)
 
 	for {
-		certPEM, err := nodeclient.Enroll(ctx, "https://"+cfg.Node.ServerAddr, name, joinToken, caPEM, csrPEM)
+		certPEM, signedBy, err := nodeclient.Enroll(
+			ctx, "https://"+cfg.Node.ServerAddr, name, joinToken, caPEM, csrPEM)
 
 		switch {
 		case err == nil:
-			return writeBundle(cfg.Node.TLS, certPEM, keyPEM, caPEM)
+			// THE AUTHORITY THAT SIGNED IT, NOT THE ONE WE STARTED WITH. Waiting
+			// for a human is unbounded, so the deployment's CA can rotate while
+			// this loop is polling and approval then signs with the new one.
+			// Writing the bootstrap authority here left a node whose own
+			// certificate does not chain to its own ca.crt.
+			if _, verifyErr := wirecert.ClientTLS(wirecert.Bundle{
+				CertPEM: certPEM, KeyPEM: keyPEM, CAPEM: signedBy,
+			}); verifyErr != nil {
+				return fmt.Errorf("the control plane approved this node but the bundle it "+
+					"returned does not verify against itself, so it would not start: %w", verifyErr)
+			}
+
+			return writeBundle(cfg.Node.TLS, certPEM, keyPEM, signedBy)
 		case errors.Is(err, nodeclient.ErrDenied):
 			return fmt.Errorf("an operator denied this node; nothing to retry")
 		case errors.Is(err, nodeclient.ErrNotApproved):
