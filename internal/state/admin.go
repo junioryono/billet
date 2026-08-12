@@ -48,28 +48,50 @@ func OpenAdmin(ctx context.Context, stateDir string) (*DB, error) {
 // database a control plane is actively writing to, and query_only makes that
 // structural rather than a promise.
 func (db *DB) verifySchema(ctx context.Context) error {
+	return verifySchemaIn(ctx, db.Reader())
+}
+
+// verifySchemaIn is the check itself, against whatever is asking.
+//
+// TAKEN AGAINST A TRANSACTION AS WELL AS THE READER, because the open-time check
+// alone is a time-of-check-to-time-of-use: an admin handle verifies against the
+// control plane it found, that plane exits, a NEWER one acquires the lock and
+// migrates, and the still-running command then writes against a schema it never
+// checked — defeating refuseUnknownVersions during exactly the restart it exists
+// to protect. Re-running it inside each transaction closes that, and it is sound
+// precisely because the writer begins IMMEDIATE: holding the write lock is what
+// makes a migration unable to interleave between the check and the work.
+func verifySchemaIn(ctx context.Context, q Querier) error {
 	// THE BOOKKEEPING TABLE MAY NOT EXIST AT ALL. An empty state directory that
 	// something else has locked has no schema yet, and checkBookkeepingSchema
 	// would report that as a corrupt table and tell the operator to delete the
 	// directory — advice that would destroy a running deployment's ledger.
 	var name string
 
-	err := db.Reader().QueryRowContext(ctx,
+	err := q.QueryRowContext(ctx,
 		`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'`).
 		Scan(&name)
 
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
-		return fmt.Errorf("%w: it has no schema yet", ErrSchemaBehind)
+		// NOT "your control plane is older". Nothing has created the schema yet,
+		// and the likeliest reason is that another billet holds the directory and
+		// is still initialising it — two operator commands on a fresh install race
+		// exactly here. Telling someone to restart a control plane that does not
+		// exist would send them looking for the wrong thing.
+		return fmt.Errorf(
+			"%w: nothing has created it yet, and another billet process holds this directory — "+
+				"it is most likely still initialising. Try again in a moment",
+			ErrSchemaBehind)
 	case err != nil:
 		return fmt.Errorf("inspect the ledger's schema: %w", err)
 	}
 
-	if err := checkBookkeepingSchema(ctx, db.Reader()); err != nil {
+	if err := checkBookkeepingSchema(ctx, q); err != nil {
 		return err
 	}
 
-	seen, err := readAppliedMigrations(ctx, db.Reader())
+	seen, err := readAppliedMigrations(ctx, q)
 	if err != nil {
 		return err
 	}

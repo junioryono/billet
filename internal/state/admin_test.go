@@ -3,6 +3,7 @@ package state
 import (
 	"database/sql"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -164,5 +165,118 @@ func TestAnOperatorCommandRefusesToMigrateUnderARunningServer(t *testing.T) {
 	// message attached.
 	if got := schemaVersion(t, server); got != behind {
 		t.Errorf("schema version = %d after a refused admin open, want %d untouched", got, behind)
+	}
+}
+
+// THE OPEN-TIME CHECK IS A TIME-OF-CHECK-TO-TIME-OF-USE ON ITS OWN.
+//
+// An admin handle verifies the schema against the control plane it found. That
+// plane can then exit and a NEWER one acquire the lock and migrate, leaving the
+// still-running command writing against a schema it never checked — which is
+// precisely the restart boundary refuseUnknownVersions exists to guard. So every
+// transaction on an unlocked handle re-checks.
+//
+// The migration is staged by writing the bookkeeping row a newer billet would
+// have written, which is what an older binary actually sees afterwards.
+func TestAnOperatorTransactionRechecksTheSchemaItIsWritingAgainst(t *testing.T) {
+	dir := t.TempDir()
+	ctx := t.Context()
+
+	server, err := Open(ctx, dir)
+	if err != nil {
+		t.Fatalf("Open (the server): %v", err)
+	}
+
+	t.Cleanup(func() { _ = server.Close() })
+
+	admin, err := OpenAdmin(ctx, dir)
+	if err != nil {
+		t.Fatalf("OpenAdmin: %v", err)
+	}
+
+	t.Cleanup(func() { _ = admin.Close() })
+
+	// It verified cleanly at open, which is what makes this a TOCTOU rather than
+	// an ordinary refusal.
+	if err := admin.Tx(ctx, func(*sql.Tx) error { return nil }); err != nil {
+		t.Fatalf("the admin handle should be usable before anything changes: %v", err)
+	}
+
+	// A NEWER BILLET MIGRATES. From this binary's side that is a recorded
+	// migration it has never heard of.
+	if err := server.Tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx,
+			`INSERT INTO schema_migrations (version, name, checksum, applied_at) VALUES (?, ?, ?, ?)`,
+			9999, "from_a_newer_billet", "whatever", time.Now().UTC().Format(time.RFC3339Nano))
+
+		return err
+	}); err != nil {
+		t.Fatalf("stage a newer billet's migration: %v", err)
+	}
+
+	err = admin.Tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx,
+			`INSERT INTO nodes (name, provider, last_seen_at) VALUES (?, ?, ?)`,
+			"epyc-1", "docker", time.Now().UTC().Format(time.RFC3339Nano))
+
+		return err
+	})
+	if err == nil {
+		t.Fatal("a transaction on an unlocked handle must re-check the schema; the database was " +
+			"migrated by a newer billet after this handle verified it")
+	}
+
+	// AND THE WRITE DID NOT LAND. Refusing after committing would be the defect
+	// with a message attached.
+	var nodes int
+
+	if err := server.Reader().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM nodes WHERE name = ?`, "epyc-1").Scan(&nodes); err != nil {
+		t.Fatalf("count nodes: %v", err)
+	}
+
+	if nodes != 0 {
+		t.Errorf("the refused transaction still wrote %d node row(s)", nodes)
+	}
+}
+
+// TWO OPERATOR COMMANDS ON A FRESH INSTALL RACE HERE, and the answer has to be
+// honest about which situation it is.
+//
+// The first takes the free lock and creates the schema; the second finds the
+// lock held, which is indistinguishable from a running control plane, and finds
+// no schema at all. Reporting that as "the plane holding this directory is older
+// than you" would send an operator looking for a control plane that does not
+// exist.
+func TestAnOperatorCommandSaysTheDirectoryIsStillBeingInitialised(t *testing.T) {
+	dir := t.TempDir()
+	ctx := t.Context()
+
+	// Somebody else holds the directory and has not created the schema yet,
+	// which is what the middle of a first-run migration looks like from here.
+	held, err := lockDir(dir)
+	if err != nil {
+		t.Fatalf("take the directory lock: %v", err)
+	}
+
+	t.Cleanup(func() {
+		if err := held.release(); err != nil {
+			t.Errorf("release the directory lock: %v", err)
+		}
+	})
+
+	_, err = OpenAdmin(ctx, dir)
+	if err == nil {
+		t.Fatal("OpenAdmin must refuse a directory whose schema does not exist yet")
+	}
+
+	if !errors.Is(err, ErrSchemaBehind) {
+		t.Fatalf("error should be ErrSchemaBehind, got: %v", err)
+	}
+
+	// THE REMEDY IS THE POINT, not the sentinel. "Restart the older control
+	// plane" is the wrong advice here and is what this asserts against.
+	if got := err.Error(); !strings.Contains(got, "initialising") {
+		t.Errorf("the diagnostic should say the directory is being initialised, got: %v", got)
 	}
 }

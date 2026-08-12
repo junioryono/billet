@@ -1554,9 +1554,13 @@ func cmdCAShow(args []string) error {
 	return nil
 }
 
-// cmdCheck is the explicit "is this deployment sane" command. It is the only
-// path that opens — and therefore migrates — the state database, so mutating
-// durable state is always something the operator asked for.
+// cmdCheck is the explicit "is this deployment sane" command.
+//
+// It opens the ledger through OpenAdmin, so it answers WHILE the control plane
+// is running — which is exactly when an operator reaches for it, and when
+// opening exclusively made it useless. It still migrates when nothing holds the
+// directory, so a first run sets the schema up; against a live plane it verifies
+// and refuses rather than upgrading a schema that plane is using.
 func cmdCheck(ctx context.Context, args []string) error {
 	fs := newFlagSet("billet check")
 	cfgPath := addConfigFlag(fs)
