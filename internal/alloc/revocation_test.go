@@ -1,6 +1,7 @@
 package alloc
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -126,5 +127,79 @@ func TestRevokingANodeIgnoresExpiredCredentials(t *testing.T) {
 	if len(revoked) != 0 {
 		t.Errorf("revoked %d expired certificate(s); an expired credential already refuses itself",
 			len(revoked))
+	}
+}
+
+// A REVOKED CERTIFICATE CANNOT RENEW ITS WAY OUT.
+//
+// Revocation checks the presented certificate at the start of a request and the
+// signing happens milliseconds later, so a revocation committing in between took
+// back a credential the machine had already stopped presenting — and reported
+// success. Recording the child in the same transaction that asks about the
+// parent makes the order decide.
+func TestARenewalIsRefusedWhenItsParentHasBeenRevoked(t *testing.T) {
+	now := time.Now().UTC()
+
+	a := newBareAllocator(t, Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, nil,
+		WithClock(func() time.Time { return now }))
+
+	future := now.Add(365 * 24 * time.Hour).Format(time.RFC3339)
+
+	if err := a.RecordIssuedCert(t.Context(),
+		IssuedCert{Serial: "parent", Node: "epyc-1", Source: CertIssued, NotAfter: future}); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+
+	// The operator takes the machine's credentials back.
+	if _, err := a.RevokeNode(t.Context(), "epyc-1", "compromised"); err != nil {
+		t.Fatalf("RevokeNode: %v", err)
+	}
+
+	// The renewal that was already in flight lands afterwards.
+	err := a.RecordRenewedCert(t.Context(),
+		IssuedCert{Serial: "child", Node: "epyc-1", Source: CertRenewed, NotAfter: future}, "parent")
+	if !errors.Is(err, ErrParentRevoked) {
+		t.Fatalf("a revoked certificate renewed itself into a credential nobody revoked: %v", err)
+	}
+
+	// And nothing was written, so the machine holds only what was taken back.
+	live, err := a.LiveCertsFor(t.Context(), "epyc-1")
+	if err != nil {
+		t.Fatalf("LiveCertsFor: %v", err)
+	}
+
+	if len(live) != 0 {
+		t.Errorf("epyc-1 still holds %d live certificate(s) after being revoked: %+v", len(live), live)
+	}
+}
+
+// AND AN ORDINARY RENEWAL STILL WORKS, which is the direction that must not be
+// broken by the check above.
+func TestARenewalIsRecordedWhenItsParentIsGood(t *testing.T) {
+	now := time.Now().UTC()
+
+	a := newBareAllocator(t, Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, nil,
+		WithClock(func() time.Time { return now }))
+
+	future := now.Add(365 * 24 * time.Hour).Format(time.RFC3339)
+
+	if err := a.RecordIssuedCert(t.Context(),
+		IssuedCert{Serial: "parent", Node: "epyc-1", Source: CertIssued, NotAfter: future}); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+
+	if err := a.RecordRenewedCert(t.Context(),
+		IssuedCert{Serial: "child", Node: "epyc-1", Source: CertRenewed, NotAfter: future},
+		"parent"); err != nil {
+		t.Fatalf("an ordinary renewal was refused: %v", err)
+	}
+
+	live, err := a.LiveCertsFor(t.Context(), "epyc-1")
+	if err != nil {
+		t.Fatalf("LiveCertsFor: %v", err)
+	}
+
+	if len(live) != 2 {
+		t.Errorf("epyc-1 holds %d certificates, want the original and its renewal", len(live))
 	}
 }

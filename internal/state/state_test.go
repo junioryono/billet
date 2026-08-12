@@ -804,6 +804,35 @@ func TestRebuildingMigrationsCopyEveryColumn(t *testing.T) {
 	}
 }
 
+// indexNamesInMigrations is every index the migration set creates, deduplicated.
+//
+// A rebuild recreates the ones it names; anything created earlier and not named
+// again is gone. Reading them out of the statements is what makes "every index
+// survives" a property rather than a list somebody has to remember to update.
+func indexNamesInMigrations() []string {
+	seen := map[string]bool{}
+
+	var names []string
+
+	for _, m := range migrations {
+		for _, stmt := range m.Stmts {
+			const prefix = "CREATE INDEX "
+			if !strings.HasPrefix(stmt, prefix) {
+				continue
+			}
+
+			name := strings.Fields(strings.TrimPrefix(stmt, prefix))[0]
+			if !seen[name] {
+				seen[name] = true
+
+				names = append(names, name)
+			}
+		}
+	}
+
+	return names
+}
+
 // parseCreate reads a table name and its column names out of a CREATE TABLE.
 func parseCreate(t *testing.T, stmt string) (string, []string) {
 	t.Helper()
@@ -981,9 +1010,14 @@ func TestRebuildingMigrationsKeepRowsIndexesAndKeys(t *testing.T) {
 		t.Errorf("join_tokens holds %q/%d after the rebuild, was \"a note\"/2", note, uses)
 	}
 
-	// THE INDEXES COME BACK. A rebuild drops them with the table, and a missing
-	// one is invisible until the fleet is large enough for it to matter.
-	for _, want := range []string{"leases_open_idx", "leases_node_idx", "idx_revoked_certs_node"} {
+	// EVERY INDEX ANY MIGRATION EVER CREATED IS STILL THERE.
+	//
+	// Derived rather than listed, because listing them is the bug: the first
+	// version of this test named the three indexes I happened to remember and
+	// missed leases_expiry_idx, which migration 5 added and the rebuild dropped —
+	// the one that keeps the reaper from scanning the whole lease history on the
+	// single writer connection.
+	for _, want := range indexNamesInMigrations() {
 		var name string
 
 		err := db.Reader().QueryRowContext(t.Context(),

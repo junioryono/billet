@@ -3,6 +3,7 @@ package e2e
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http/httptest"
 	"strings"
@@ -29,6 +30,22 @@ type revocations struct {
 	// recordErr stands in for a ledger that cannot write down what it just
 	// signed.
 	recordErr error
+}
+
+// RecordRenewedCert mirrors the real one: a renewal whose parent has been
+// revoked is refused, in the same step that records it.
+func (r *revocations) RecordRenewedCert(
+	ctx context.Context, cert alloc.IssuedCert, parent string,
+) error {
+	r.mu.Lock()
+	revoked := r.serials[parent]
+	r.mu.Unlock()
+
+	if revoked {
+		return fmt.Errorf("%w: %s", alloc.ErrParentRevoked, parent)
+	}
+
+	return r.RecordIssuedCert(ctx, cert)
 }
 
 func (r *revocations) RecordIssuedCert(_ context.Context, cert alloc.IssuedCert) error {

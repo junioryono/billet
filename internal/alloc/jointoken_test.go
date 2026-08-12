@@ -215,3 +215,44 @@ func TestPollingAnEnrollmentDoesNotSpendTheToken(t *testing.T) {
 		}
 	}
 }
+
+// A NODE LEARNING IT WAS DENIED DOES NOT PAY AGAIN.
+//
+// "Denied" is a decision, and it is the one that stops a node retrying — so it
+// has to be able to read it. Treating the same key asking again as a NEW request
+// spent another use of the token that already paid for the request being
+// answered: a single-use token returned 401, and the operator saw a credential
+// problem where there was a verdict.
+func TestPollingAfterADecisionDoesNotSpendTheToken(t *testing.T) {
+	for _, decision := range []string{EnrollApproved, EnrollDenied} {
+		t.Run(decision, func(t *testing.T) {
+			a := newAllocator(t, Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, nil)
+
+			token, err := a.NewJoinToken(t.Context(), time.Hour, 1, "")
+			if err != nil {
+				t.Fatalf("mint: %v", err)
+			}
+
+			if _, err := a.RequestEnrollmentWithToken(
+				t.Context(), "epyc-1", "SHA256:same", "csr-1", token,
+			); err != nil {
+				t.Fatalf("first request: %v", err)
+			}
+
+			if err := a.DecideEnrollment(t.Context(), "epyc-1", "SHA256:same", decision, "cert"); err != nil {
+				t.Fatalf("decide: %v", err)
+			}
+
+			rec, err := a.RequestEnrollmentWithToken(
+				t.Context(), "epyc-1", "SHA256:same", "csr-1", token)
+			if err != nil {
+				t.Fatalf("the node could not read its own %s decision because polling for it "+
+					"was charged as a new request: %v", decision, err)
+			}
+
+			if rec.State != decision {
+				t.Errorf("the poll reported %q rather than the recorded %q", rec.State, decision)
+			}
+		})
+	}
+}

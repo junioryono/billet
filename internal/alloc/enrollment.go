@@ -105,9 +105,17 @@ func isKnownEnrollmentTx(ctx context.Context, tx *sql.Tx, name, fingerprint stri
 		return false, err
 	}
 
-	// A denied row is about to be replaced rather than resumed, so it is not the
-	// same request and its successor pays.
-	return existing.Fingerprint == fingerprint && existing.State != EnrollDenied, nil
+	// THE FINGERPRINT ALONE DECIDES, whatever state the row is in.
+	//
+	// A node polls until it learns a decision, and "denied" IS a decision — it is
+	// what stops the node retrying. Treating the same key asking again as a new
+	// request made the poll spend another use of the token that already paid for
+	// it, so a single-use token answered 401 instead of "denied" and the operator
+	// saw a credential problem where there was a verdict.
+	//
+	// A DIFFERENT key against a denied row is a genuinely new request, replacing
+	// one that no longer holds the name, and it pays.
+	return existing.Fingerprint == fingerprint, nil
 }
 
 // requestEnrollmentTx is the body of a request, inside a caller's transaction.
