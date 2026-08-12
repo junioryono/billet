@@ -240,6 +240,63 @@ func TestAnOperatorTransactionRechecksTheSchemaItIsWritingAgainst(t *testing.T) 
 	}
 }
 
+// AND A READ RE-CHECKS TOO, for the same reason a write does.
+//
+// Separate from the transaction test above because View has its own code path:
+// deleting its verification left every other test green, so the guard was
+// decorative. A read against a schema a newer billet has rebuilt would report
+// rows that no longer mean what this binary thinks they mean.
+func TestAnOperatorReadRechecksTheSchemaItIsReadingFrom(t *testing.T) {
+	dir := t.TempDir()
+	ctx := t.Context()
+
+	server, err := Open(ctx, dir)
+	if err != nil {
+		t.Fatalf("Open (the server): %v", err)
+	}
+
+	t.Cleanup(func() { _ = server.Close() })
+
+	admin, err := OpenAdmin(ctx, dir)
+	if err != nil {
+		t.Fatalf("OpenAdmin: %v", err)
+	}
+
+	t.Cleanup(func() { _ = admin.Close() })
+
+	if err := admin.View(ctx, func(Querier) error { return nil }); err != nil {
+		t.Fatalf("the admin handle should read cleanly before anything changes: %v", err)
+	}
+
+	if err := server.Tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx,
+			`INSERT INTO schema_migrations (version, name, checksum, applied_at) VALUES (?, ?, ?, ?)`,
+			9999, "from_a_newer_billet", "whatever", time.Now().UTC().Format(time.RFC3339Nano))
+
+		return err
+	}); err != nil {
+		t.Fatalf("stage a newer billet's migration: %v", err)
+	}
+
+	called := false
+
+	err = admin.View(ctx, func(Querier) error {
+		called = true
+
+		return nil
+	})
+	if err == nil {
+		t.Fatal("a read on an unlocked handle must re-check the schema")
+	}
+
+	// REFUSED BEFORE THE CALLBACK RAN, not after. Reporting an error having
+	// already handed the caller rows from a schema it does not understand would
+	// be the defect with a message attached.
+	if called {
+		t.Error("the callback ran despite the schema check failing")
+	}
+}
+
 // TWO OPERATOR COMMANDS ON A FRESH INSTALL RACE HERE, and the answer has to be
 // honest about which situation it is.
 //

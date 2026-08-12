@@ -277,7 +277,7 @@ Both paths are recorded, so `billet nodes pending --all` is the single answer to
 
 **And the operator commands run against a live control plane**, which is when you actually need them. `billet nodes pending|approve|revoke`, `ca token|issue|revoke|revocations`, `leases quarantined|release` and `check` reach the ledger without taking the exclusive lock the server holds: that lock exists to stop two control planes writing conflicting scheduling decisions, and a one-shot command is not one — it makes no scheduling decisions and commits a single transaction SQLite serialises against the server's own.
 
-What they deliberately will **not** do is migrate it. Run a newer billet's CLI against an older running control plane and it refuses rather than upgrading a schema that plane is mid-transaction against, and tells you which side to restart. A command that needs to *write* while the plane happens to be mid-decision waits for it, and if it waits too long it stops and says to run it again rather than hanging silently — nothing is changed when that happens. Reads never wait at all.
+What they deliberately will **not** do is migrate it. Run a newer billet's CLI against an older running control plane and it refuses rather than upgrading a schema that plane is mid-transaction against, and tells you which side to restart. A command that needs to *write* while the plane happens to be mid-decision waits for it, and if it waits too long it stops and says to run it again rather than hanging silently — nothing is changed when that happens. A command that only reads never waits for the write lock at all, which is why `leases quarantined` and `nodes pending` answer immediately however busy the deployment is.
 
 | Action | Control-plane restart? |
 |---|---|

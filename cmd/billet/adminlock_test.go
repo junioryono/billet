@@ -215,7 +215,14 @@ func TestAReadOnlyCommandRunsWhileTheServerHoldsTheWriteLock(t *testing.T) {
 		})
 	}()
 
-	<-holding
+	// SELECT, not a bare receive: if the transaction fails BEFORE reaching its
+	// callback, nothing ever closes `holding` and the test would hang until the
+	// suite timed out — reporting a wedge instead of the error that caused it.
+	select {
+	case <-holding:
+	case err := <-held:
+		t.Fatalf("the server's transaction ended before it took the lock: %v", err)
+	}
 
 	for _, tc := range []struct {
 		name string
