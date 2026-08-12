@@ -371,7 +371,7 @@ func (a *Allocator) CertRevokedFor(
 ) (bool, error) {
 	var revoked bool
 
-	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+	err := a.db.View(ctx, func(tx querier) error {
 		revoked = false
 
 		var one int

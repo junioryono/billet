@@ -29,7 +29,7 @@ type nodeRow struct {
 // ORDERED BY NAME, because Go map iteration is not and this list decides
 // placement. An unordered candidate set makes the same fleet produce different
 // answers on different runs, which is untestable and unexplainable in a log.
-func (a *Allocator) eligibleNodes(ctx context.Context, tx *sql.Tx, t config.Tier) ([]nodeRow, error) {
+func (a *Allocator) eligibleNodes(ctx context.Context, tx querier, t config.Tier) ([]nodeRow, error) {
 	rows, err := tx.QueryContext(ctx,
 		`SELECT name, provider, site, total_vcpu, total_memory
 		   FROM nodes
@@ -112,7 +112,7 @@ func slicesContains(haystack []config.ProviderKind, needle config.ProviderKind) 
 // Capacity is a vector: enough cores says nothing about memory, and the smallest
 // answer is the true one.
 func (a *Allocator) headroomOn(
-	ctx context.Context, tx *sql.Tx, n nodeRow, t config.Tier,
+	ctx context.Context, tx querier, n nodeRow, t config.Tier,
 ) (int, error) {
 	used, err := a.usageOn(ctx, tx, n.name)
 	if err != nil {
@@ -155,7 +155,7 @@ func (a *Allocator) headroomOn(
 // against the same host repeatedly in the window before its first launch, which
 // is the overcommit the escrow exists to prevent, moved from the deployment down
 // to the machine.
-func (a *Allocator) usageOn(ctx context.Context, tx *sql.Tx, node string) (Usage, error) {
+func (a *Allocator) usageOn(ctx context.Context, tx querier, node string) (Usage, error) {
 	var (
 		u    Usage
 		vcpu sql.NullInt64
@@ -209,7 +209,7 @@ func (a *Allocator) Stranded(ctx context.Context, ids []string) ([]string, error
 
 	var out []string
 
-	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+	err := a.db.View(ctx, func(tx querier) error {
 		out = out[:0]
 
 		// Candidates that survive the liveness question, grouped by the host they
@@ -293,7 +293,7 @@ type strandedCandidate struct {
 // arrival. It converges — the second caller measures the ledger the first one
 // already corrected.
 func (a *Allocator) shedOvercommit(
-	ctx context.Context, tx *sql.Tx, onNode map[string][]strandedCandidate, out *[]string,
+	ctx context.Context, tx querier, onNode map[string][]strandedCandidate, out *[]string,
 ) error {
 	nodes := make([]string, 0, len(onNode))
 	for name := range onNode {
@@ -385,7 +385,7 @@ func (c strandedCandidate) covers(overVCPU int, overMemory config.ByteSize) floa
 // belonging to one tier is held on the hosts IT could use, which the asking
 // tier may not share. Measuring only one tier's candidates left no entry for a
 // machine it cannot use, so another tier's reservation had nowhere correct to go.
-func (a *Allocator) liveNodes(ctx context.Context, tx *sql.Tx) ([]nodeRow, error) {
+func (a *Allocator) liveNodes(ctx context.Context, tx querier) ([]nodeRow, error) {
 	rows, err := tx.QueryContext(ctx,
 		`SELECT name, provider, site, total_vcpu, total_memory
 		   FROM nodes

@@ -332,6 +332,81 @@ func TestAnOperatorWriteGivesUpRatherThanHanging(t *testing.T) {
 	}
 }
 
+// THE BOUND FOLLOWS THE COMMAND, NOT THE LOCK.
+//
+// Patience was originally selected by whether the handle held the directory
+// lock, which is not the same question. An operator command run against a
+// STOPPED server takes that lock — so it counted as a control plane and waited
+// forever, against a second command that had beaten it to SQLite's writer slot.
+// The hang the bound exists to prevent, reachable precisely because this command
+// won the lock.
+//
+// Two operator handles and no server at all, which is what a fresh install looks
+// like when someone runs two commands at once.
+func TestALockOwningOperatorCommandIsStillBounded(t *testing.T) {
+	dir := t.TempDir()
+	ctx := t.Context()
+
+	// The one that takes the directory lock, and would once have been mistaken
+	// for a control plane.
+	owner, err := OpenAdmin(ctx, dir)
+	if err != nil {
+		t.Fatalf("OpenAdmin (the lock owner): %v", err)
+	}
+
+	t.Cleanup(func() { _ = owner.Close() })
+
+	if owner.unlocked {
+		t.Fatal("this test needs the first handle to OWN the directory lock")
+	}
+
+	other, err := OpenAdmin(ctx, dir)
+	if err != nil {
+		t.Fatalf("OpenAdmin (the second command): %v", err)
+	}
+
+	t.Cleanup(func() { _ = other.Close() })
+
+	restore := adminBusyLimit
+	adminBusyLimit = 150 * time.Millisecond
+
+	t.Cleanup(func() { adminBusyLimit = restore })
+
+	if _, err := owner.w.ExecContext(ctx, `PRAGMA busy_timeout = 0`); err != nil {
+		t.Fatalf("disable the lock owner's busy timeout: %v", err)
+	}
+
+	var ownerErr error
+
+	// A BACKSTOP, so a regression fails as an ASSERTION rather than as a suite
+	// timeout. If the bound stops applying to this handle it retries until its
+	// context ends — and the error then carries a deadline rather than the advice
+	// asserted below, which is a clean failure instead of a hang.
+	bounded, cancelBounded := context.WithTimeout(ctx, 2*time.Second)
+	defer cancelBounded()
+
+	// The OTHER command holds the writer slot; the lock owner cannot get in.
+	if err := other.Tx(ctx, func(*sql.Tx) error {
+		ownerErr = owner.Tx(bounded, func(otx *sql.Tx) error {
+			_, err := otx.ExecContext(bounded, `DELETE FROM join_tokens`)
+
+			return err
+		})
+
+		return nil
+	}); err != nil {
+		t.Fatalf("the second command's transaction: %v", err)
+	}
+
+	if ownerErr == nil {
+		t.Fatal("the lock-owning command should not have got in while the other held the slot")
+	}
+
+	if got := ownerErr.Error(); !strings.Contains(got, "run it again") {
+		t.Errorf("a command that owns the lock must still give up with advice, got: %v", got)
+	}
+}
+
 // A READ MUST NOT QUEUE BEHIND A WRITE IT DOES NOT NEED.
 //
 // Every write transaction now begins IMMEDIATE, so anything routed through Tx

@@ -75,10 +75,22 @@ type DB struct {
 	r    *sql.DB
 	lock *dirLock
 
-	// unlocked marks a handle opened by an operator command while a control
-	// plane held the directory. Such a handle did not migrate and cannot assume
+	// admin marks a handle belonging to a ONE-SHOT OPERATOR COMMAND, whether or
+	// not it managed to take the directory lock. It decides how patient the
+	// handle is: a command has a person waiting on it and gives up, a control
+	// plane never does.
+	admin bool
+
+	// unlocked marks a handle that did NOT take the directory lock, because
+	// something else holds it. Such a handle did not migrate and cannot assume
 	// the schema it verified at open is still the one it is writing against, so
 	// every transaction re-checks. See OpenAdmin and verifySchemaIn.
+	//
+	// SEPARATE FROM admin, and conflating them was a bug: an operator command on
+	// a STOPPED server takes the lock, so a single flag made it a control plane
+	// for the purposes of patience — and it would then retry forever against
+	// another command that had beaten it to SQLite's writer slot, which is
+	// exactly the hang the bound exists to prevent.
 	unlocked bool
 }
 
@@ -151,7 +163,14 @@ func openDir(ctx context.Context, stateDir string, admin bool) (*DB, error) {
 	writerDSN := dsnWith(path, map[string]string{"_txlock": "immediate"},
 		"journal_mode(WAL)",
 		"synchronous(FULL)",
-		"busy_timeout(5000)",
+		// SHORT ON PURPOSE, because beginWrite owns the waiting now. A five-second
+		// timeout inside SQLite made both bounds a fiction: an attempt begun just
+		// under adminBusyLimit could block for another five seconds past it, and a
+		// blocked BEGIN does not observe context cancellation — modernc arms
+		// sqlite3_interrupt but SQLite's busy handler sleeps without consulting it,
+		// so a cancelled caller still waited out the full timeout. Returning
+		// quickly and retrying in Go makes both the deadline and the context real.
+		"busy_timeout(50)",
 		"foreign_keys(ON)",
 	)
 	// The reader stays read-write at the OS level on purpose. mode=ro cannot open
@@ -179,7 +198,7 @@ func openDir(ctx context.Context, stateDir string, admin bool) (*DB, error) {
 	}
 	r.SetMaxOpenConns(4)
 
-	db := &DB{w: w, r: r, lock: lock, unlocked: lock == nil}
+	db := &DB{w: w, r: r, lock: lock, admin: admin, unlocked: lock == nil}
 
 	startupCtx, cancel := context.WithTimeout(ctx, startupTimeout)
 	defer cancel()
@@ -435,26 +454,51 @@ func (db *DB) beginWrite(ctx context.Context) (*sql.Tx, error) {
 	// Not expressed as a derived context, deliberately: the transaction that
 	// BeginTx returns stays bound to the context it was given, so cancelling one
 	// here would roll the transaction back the moment this function returned.
+	var errBusy error
+
 	var deadline time.Time
-	if db.unlocked {
+	if db.admin {
 		deadline = time.Now().Add(adminBusyLimit)
 	}
 
-	for {
+	for attempt := 0; ; attempt++ {
+		// CHECKED BEFORE STARTING, never only after. An attempt that begins inside
+		// the bound can still block for busy_timeout, so testing afterwards let the
+		// effective wait run past the number this promises. Refusing to START a
+		// late attempt keeps the overshoot to one busy_timeout rather than
+		// unbounded — and a transaction that IS won is never thrown away, because
+		// having the lock is strictly better than reporting that we could not get
+		// it.
+		if attempt > 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, fmt.Errorf("begin write tx: %w", err)
+			}
+
+			if !deadline.IsZero() && time.Now().After(deadline) {
+				return nil, fmt.Errorf(
+					"the control plane held this ledger's write lock for longer than %s, so this "+
+						"command gave up rather than waiting silently — nothing was changed, so "+
+						"run it again: %w", adminBusyLimit, errBusy)
+			}
+		}
+
 		tx, err := db.w.BeginTx(ctx, nil)
 		if err == nil {
 			return tx, nil
 		}
 
-		if !isBusy(err) || ctx.Err() != nil {
+		if !isBusy(err) {
 			return nil, fmt.Errorf("begin write tx: %w", err)
 		}
 
-		if !deadline.IsZero() && time.Now().After(deadline) {
-			return nil, fmt.Errorf(
-				"the control plane held this ledger's write lock for longer than %s, so this "+
-					"command gave up rather than waiting silently — nothing was changed, so run "+
-					"it again: %w", adminBusyLimit, err)
+		errBusy = err
+
+		// CANCELLATION KEEPS ITS IDENTITY. Wrapping SQLite's busy error here would
+		// hide context.Canceled and DeadlineExceeded from every caller that tests
+		// for them, and a blocked BEGIN reports busy rather than the cancellation
+		// that actually ended the wait.
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("begin write tx: %w", err)
 		}
 
 		// time.After would leak its timer until it fired, and forbidigo bans it
