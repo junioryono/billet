@@ -2,7 +2,6 @@ package alloc
 
 import (
 	"context"
-	"database/sql"
 	"slices"
 
 	"github.com/junioryono/billet/internal/config"
@@ -30,7 +29,7 @@ import (
 // would refuse every other tier forever. Billet holds back what it can and lets the
 // rest compete.
 func (a *Allocator) reserveFloors(
-	ctx context.Context, tx *sql.Tx, forTier string, free *fleet,
+	ctx context.Context, tx querier, forTier string, free *fleet,
 ) (int, config.ByteSize, error) {
 	open, err := a.countOpenPerTier(ctx, tx)
 	if err != nil {
@@ -92,7 +91,7 @@ func (a *Allocator) reserveFloors(
 // could never use. Only the hosts they SHARE are actually affected, which is
 // exactly the contention a floor is meant to survive.
 func (a *Allocator) holdFloor(
-	ctx context.Context, tx *sql.Tx, t config.Tier, missing int, free *fleet,
+	ctx context.Context, tx querier, t config.Tier, missing int, free *fleet,
 ) (int, error) {
 	// ITS OWN CANDIDATES, SPENDING THE SHARED FLEET. A floor on a macOS tier is
 	// kept on the Mac; holding it against whichever machines the ASKING tier

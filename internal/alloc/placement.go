@@ -2,7 +2,6 @@ package alloc
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"slices"
 
@@ -56,7 +55,7 @@ type fleet struct {
 // transaction — which is what makes the whole thing atomic against a concurrent
 // escrow. Measuring outside it would be a read followed by a hopeful write, the
 // 7x overcommit this package exists to prevent.
-func (a *Allocator) fleetResources(ctx context.Context, tx *sql.Tx) (*fleet, error) {
+func (a *Allocator) fleetResources(ctx context.Context, tx querier) (*fleet, error) {
 	nodes, err := a.liveNodes(ctx, tx)
 	if err != nil {
 		return nil, err
@@ -105,7 +104,7 @@ type nodeUsage struct {
 // countOpenMacOSByNode use one host at a time. A lease that has been bound is
 // charged to the host running it; one only AIMED at a host is charged there too,
 // because escrow commits a machine's room before any container starts.
-func (a *Allocator) usageByNode(ctx context.Context, tx *sql.Tx) (map[string]nodeUsage, error) {
+func (a *Allocator) usageByNode(ctx context.Context, tx querier) (map[string]nodeUsage, error) {
 	rows, err := tx.QueryContext(ctx,
 		`SELECT COALESCE(node, target_node, ''),
 		        COALESCE(SUM(vcpu), 0),
@@ -146,7 +145,7 @@ func (a *Allocator) usageByNode(ctx context.Context, tx *sql.Tx) (map[string]nod
 // SHARED ON PURPOSE: whatever one tier's floor takes is gone from the machines
 // every other tier is offered, because they are the same machines.
 func (f *fleet) forTier(
-	ctx context.Context, tx *sql.Tx, a *Allocator, t config.Tier,
+	ctx context.Context, tx querier, a *Allocator, t config.Tier,
 ) (*placer, error) {
 	nodes, err := a.eligibleNodes(ctx, tx, t)
 	if err != nil {
@@ -175,7 +174,7 @@ func (f *fleet) forTier(
 // counted room a floor was holding, GitHub would send work that escrow then
 // refused, which reads as billet dropping jobs.
 func (a *Allocator) placerWithFloors(
-	ctx context.Context, tx *sql.Tx, t config.Tier,
+	ctx context.Context, tx querier, t config.Tier,
 ) (*placer, int, config.ByteSize, error) {
 	free, err := a.fleetResources(ctx, tx)
 	if err != nil {

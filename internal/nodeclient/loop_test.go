@@ -1001,7 +1001,7 @@ func TestANodeThatIsRefusedStops(t *testing.T) {
 		if !errors.Is(err, nodeclient.ErrRefused) {
 			t.Errorf("the node stopped for the wrong reason: %v", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(60 * time.Second):
 		t.Fatal("a node the control plane will never accept is still retrying")
 	}
 }

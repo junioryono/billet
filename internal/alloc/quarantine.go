@@ -29,7 +29,7 @@ type QuarantinedLease struct {
 func (a *Allocator) Quarantined(ctx context.Context) ([]QuarantinedLease, error) {
 	var out []QuarantinedLease
 
-	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+	err := a.db.View(ctx, func(tx querier) error {
 		out = nil
 
 		rows, err := tx.QueryContext(ctx,
@@ -71,7 +71,7 @@ func (a *Allocator) Quarantined(ctx context.Context) ([]QuarantinedLease, error)
 func (a *Allocator) QuarantinedLeaseIDs(ctx context.Context, node string) (map[string]bool, error) {
 	out := map[string]bool{}
 
-	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+	err := a.db.View(ctx, func(tx querier) error {
 		// EVERY quarantined lease, whatever its age: the node is asking which of its
 		// containers something is still waiting for, and a young quarantine is
 		// exactly the one it must not destroy.
@@ -249,7 +249,7 @@ func quarantinedLeaseTx(ctx context.Context, tx *sql.Tx, a *Allocator, leaseID s
 
 // quarantinedIDsOn lists the quarantined leases attributed to one host, or only
 // those that expired before `settled` when one is given.
-func quarantinedIDsOn(ctx context.Context, tx *sql.Tx, node, settled string) ([]string, error) {
+func quarantinedIDsOn(ctx context.Context, tx querier, node, settled string) ([]string, error) {
 	rows, err := tx.QueryContext(ctx,
 		`SELECT id FROM leases
 		  WHERE phase = ? AND COALESCE(node, target_node) = ?
@@ -303,7 +303,7 @@ func (a *Allocator) ExpireForTest(ctx context.Context, leaseID string) error {
 func (a *Allocator) Reconcile(ctx context.Context, node string, running []string) (int, error) {
 	var epoch int64
 
-	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+	err := a.db.View(ctx, func(tx querier) error {
 		return tx.QueryRowContext(ctx,
 			`SELECT epoch FROM nodes WHERE name = ?`, node).Scan(&epoch)
 	})

@@ -27,6 +27,13 @@ import (
 	"github.com/junioryono/billet/internal/state"
 )
 
+// querier is state.Querier under a local name.
+//
+// Aliased so a read-only helper can name it without each file importing the
+// store package — and so Enrollments, whose own parameter is called `state`, can
+// still refer to the type at all.
+type querier = state.Querier
+
 // Phase is a lease's position in its lifecycle. The values are constrained by a
 // CHECK in the schema, so a typo cannot sit in the open-lease index forever.
 type Phase string
@@ -465,7 +472,7 @@ func (a *Allocator) Headroom(ctx context.Context, tier string) (int, error) {
 
 	var n int
 
-	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+	err := a.db.View(ctx, func(tx querier) error {
 		var err error
 		n, err = a.headroom(ctx, tx, t)
 
@@ -582,7 +589,7 @@ func decodeProviders(s string) []config.ProviderKind {
 // Called from Bind and again on entry to launching: a lease can be bound while
 // still in `capacity`, so a policy that tightens in between would otherwise let an
 // instance start on a host that no longer permits it.
-func (a *Allocator) checkPlacement(ctx context.Context, tx *sql.Tx, lease *Lease, node string) error {
+func (a *Allocator) checkPlacement(ctx context.Context, tx querier, lease *Lease, node string) error {
 	if !a.allowsGuestOS(node, lease.GuestOS) {
 		return fmt.Errorf("%w: lease %s is a %s guest and node %q does not permit that guest OS",
 			ErrGuestOSNotAllowed, lease.ID, lease.GuestOS, node)
@@ -659,7 +666,7 @@ func (a *Allocator) allowsGuestOS(node string, os config.GuestOS) bool {
 // headroom computes how many more of a tier fit. Every limit is applied and the
 // smallest wins — capacity is a vector, so "enough cores" says nothing about memory
 // or about the per-host macOS guest limit.
-func (a *Allocator) headroom(ctx context.Context, tx *sql.Tx, t config.Tier) (int, error) {
+func (a *Allocator) headroom(ctx context.Context, tx querier, t config.Tier) (int, error) {
 	n, _, err := a.headroomWithPlacer(ctx, tx, t)
 
 	return n, err
@@ -674,7 +681,7 @@ func (a *Allocator) headroom(ctx context.Context, tx *sql.Tx, t config.Tier) (in
 // the one that should answer the second — and reusing it removes any chance of
 // the two disagreeing.
 func (a *Allocator) headroomWithPlacer(
-	ctx context.Context, tx *sql.Tx, t config.Tier,
+	ctx context.Context, tx querier, t config.Tier,
 ) (int, *placer, error) {
 	used, err := a.usage(ctx, tx)
 	if err != nil {
@@ -1410,7 +1417,7 @@ func readExpiredLeases(ctx context.Context, tx *sql.Tx, cutoff string, limit int
 func (a *Allocator) Usage(ctx context.Context) (Usage, error) {
 	var u Usage
 
-	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+	err := a.db.View(ctx, func(tx querier) error {
 		var err error
 		u, err = a.usage(ctx, tx)
 
@@ -1530,7 +1537,7 @@ func (a *Allocator) load(ctx context.Context, tx *sql.Tx, leaseID string, epoch 
 
 // loadAny is load without the terminal-phase filter, for callers deciding
 // idempotency — they must be able to see that a lease already finished, and how.
-func (a *Allocator) loadAny(ctx context.Context, tx *sql.Tx, leaseID string, epoch int64) (*Lease, error) {
+func (a *Allocator) loadAny(ctx context.Context, tx querier, leaseID string, epoch int64) (*Lease, error) {
 	var (
 		l          Lease
 		node       sql.NullString
@@ -1575,7 +1582,7 @@ func (a *Allocator) loadAny(ctx context.Context, tx *sql.Tx, leaseID string, epo
 	return &l, nil
 }
 
-func (a *Allocator) usage(ctx context.Context, tx *sql.Tx) (Usage, error) {
+func (a *Allocator) usage(ctx context.Context, tx querier) (Usage, error) {
 	var (
 		u    Usage
 		vcpu sql.NullInt64
@@ -1613,7 +1620,7 @@ func (a *Allocator) usage(ctx context.Context, tx *sql.Tx) (Usage, error) {
 func (a *Allocator) Lease(ctx context.Context, leaseID string) (*Lease, error) {
 	var out *Lease
 
-	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+	err := a.db.View(ctx, func(tx querier) error {
 		var epoch int64
 
 		err := tx.QueryRowContext(ctx, `SELECT epoch FROM leases WHERE id = ?`, leaseID).Scan(&epoch)
@@ -1670,7 +1677,7 @@ func (a *Allocator) Lease(ctx context.Context, leaseID string) (*Lease, error) {
 func (a *Allocator) LaunchedLeaseIDs(ctx context.Context, node string) (map[string]bool, error) {
 	open := make(map[string]bool)
 
-	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+	err := a.db.View(ctx, func(tx querier) error {
 		rows, err := tx.QueryContext(ctx,
 			`SELECT id FROM leases WHERE node = ? AND phase IN (?,?,?)`,
 			node, PhaseLaunching, PhaseOnline, PhaseBusy)
@@ -1798,7 +1805,7 @@ func checkFloorsFit(tiers map[string]config.Tier, limits Limits) error {
 // A lease aimed at NO machine still counts. There is nothing to prove it
 // stranded, and treating it as unmet would reserve room on top of leases that
 // are perfectly fine.
-func (a *Allocator) countOpenPerTier(ctx context.Context, tx *sql.Tx) (map[string]int, error) {
+func (a *Allocator) countOpenPerTier(ctx context.Context, tx querier) (map[string]int, error) {
 	rows, err := tx.QueryContext(ctx,
 		`SELECT l.tier, COUNT(*)
 		   FROM leases l
@@ -1835,7 +1842,7 @@ func (a *Allocator) countOpenPerTier(ctx context.Context, tx *sql.Tx) (map[strin
 	return held, nil
 }
 
-func (a *Allocator) countOpenByTier(ctx context.Context, tx *sql.Tx, tier string) (int, error) {
+func (a *Allocator) countOpenByTier(ctx context.Context, tx querier, tier string) (int, error) {
 	var n int
 
 	err := tx.QueryRowContext(ctx,
@@ -1855,7 +1862,7 @@ func (a *Allocator) countOpenByTier(ctx context.Context, tx *sql.Tx, tier string
 // guest_os, or restarting against a different config silently reclassified
 // leases already in flight — and a lease bound to a different node than its tier
 // named would be charged to the wrong host entirely.
-func (a *Allocator) countOpenMacOSByNode(ctx context.Context, tx *sql.Tx, node string) (int, error) {
+func (a *Allocator) countOpenMacOSByNode(ctx context.Context, tx querier, node string) (int, error) {
 	var n int
 
 	// COALESCE(node, target_node): once a lease is bound, the node it actually
@@ -1883,7 +1890,7 @@ func (a *Allocator) countOpenMacOSByNode(ctx context.Context, tx *sql.Tx, node s
 func (a *Allocator) HistoryOutcomesForRequest(ctx context.Context, requestID int64) ([]string, error) {
 	var outcomes []string
 
-	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+	err := a.db.View(ctx, func(tx querier) error {
 		rows, err := tx.QueryContext(ctx,
 			// NOT NULL, because a row is inserted at ASSIGNMENT with no conclusion
 			// and only filled in when the lease terminalizes. A job in flight is not
@@ -1925,7 +1932,7 @@ func (a *Allocator) HistoryOutcomesForRequest(ctx context.Context, requestID int
 func (a *Allocator) HistoryOutcome(ctx context.Context, leaseID string) (string, error) {
 	var conclusion string
 
-	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+	err := a.db.View(ctx, func(tx querier) error {
 		err := tx.QueryRowContext(ctx,
 			`SELECT conclusion FROM job_history WHERE lease_id = ?`, leaseID).Scan(&conclusion)
 

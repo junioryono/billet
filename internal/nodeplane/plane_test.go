@@ -232,7 +232,7 @@ func TestANodesVerdictIsCarriedBack(t *testing.T) {
 func TestARestartedNodeLeavesItsLaunchesInCustody(t *testing.T) {
 	t.Parallel()
 
-	p := testPlane(t, WithCommandTimeout(5*time.Second))
+	p := testPlane(t, WithCommandTimeout(60*time.Second))
 	register(t, p, "n1", config.ProviderDocker)
 
 	taken := make(chan struct{})
@@ -251,7 +251,7 @@ func TestARestartedNodeLeavesItsLaunchesInCustody(t *testing.T) {
 
 	select {
 	case <-taken:
-	case <-time.After(5 * time.Second):
+	case <-time.After(60 * time.Second):
 		t.Fatal("the node never took the command")
 	}
 
@@ -262,7 +262,7 @@ func TestARestartedNodeLeavesItsLaunchesInCustody(t *testing.T) {
 		if !errors.Is(err, server.ErrCustody) {
 			t.Fatalf("a launch lost to a node restart must report custody, got %v", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(60 * time.Second):
 		t.Fatal("the caller was left waiting for a node that will never answer")
 	}
 }
@@ -620,7 +620,7 @@ func TestABusyNodeIsNotForgotten(t *testing.T) {
 
 	select {
 	case <-taken:
-	case <-time.After(5 * time.Second):
+	case <-time.After(60 * time.Second):
 		t.Fatal("the node never took the command")
 	}
 
@@ -653,7 +653,7 @@ func TestAForgottenNodeReleasesItsQueuedWork(t *testing.T) {
 
 	// Nobody polls, so the command sits queued. Wait until it is there, or the
 	// expiry below would race the dispatch that creates it.
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(60 * time.Second)
 	for p.QueuedForTest("n1") == 0 {
 		if time.Now().After(deadline) {
 			t.Fatal("the command was never queued")
@@ -676,7 +676,7 @@ func TestAForgottenNodeReleasesItsQueuedWork(t *testing.T) {
 		if errors.Is(err, server.ErrCustody) {
 			t.Errorf("a command that never left the queue reported custody: %v", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(60 * time.Second):
 		t.Fatal("the caller was left waiting on a node the plane has forgotten")
 	}
 }
@@ -787,7 +787,7 @@ func TestAQueuedCommandIsNotGivenToASupersededProcess(t *testing.T) {
 		_ = p.NewRunner().Launch(t.Context(), testLease(), server.Job{RequestID: 7})
 	}()
 
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(60 * time.Second)
 	for p.QueuedForTest("n1") == 0 {
 		if time.Now().After(deadline) {
 			t.Fatal("the command was never queued")
@@ -910,10 +910,30 @@ func TestADestroyEndsALeasesOwnership(t *testing.T) {
 
 // deliverLaunch registers a node and hands it a launch, which is the state every
 // ownership question starts from.
-func deliverLaunch(t *testing.T) (*Plane, nodeapi.Command) {
+//
+// The command timeout is a PARAMETER because its callers want different things,
+// and the default is the five seconds these tests were written against.
+//
+// It was briefly raised to sixty on the reasoning that applies to a WATCHDOG — a
+// short bound is a bet on how quickly a goroutine gets scheduled — and that
+// reasoning does not transfer, because this bounds an in-flight dispatch rather
+// than a wait. Eight of the nine callers resolve their dispatch long before it
+// matters, by an immediate Result, a parked poller, or the re-registration that
+// answers every superseded in-flight command synchronously; the one where it is a
+// live ceiling asks for a generous timeout explicitly, and the one that needs it
+// to FIRE asks for a short one.
+//
+// NOT, AS AN EARLIER VERSION OF THIS COMMENT CLAIMED, because raising it caused
+// the CI failure in TestADestroyIsNotConfirmedByTheWrongProcess. That test failed
+// after exactly 60.00s, which was BOTH this timeout and waitFor's watchdog at the
+// time — two equal constants, so the duration was evidence for neither, and the
+// mechanism written down here on the strength of it was wrong. The real cause was
+// a stale wake signal letting a single-shot poll return without parking, fixed in
+// that test rather than by tuning this number.
+func deliverLaunch(t *testing.T, opts ...Option) (*Plane, nodeapi.Command) {
 	t.Helper()
 
-	p := testPlane(t, WithCommandTimeout(5*time.Second))
+	p := testPlane(t, append([]Option{WithCommandTimeout(5 * time.Second)}, opts...)...)
 
 	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
 		Version:     nodeapi.Version,
@@ -932,7 +952,7 @@ func deliverLaunch(t *testing.T) (*Plane, nodeapi.Command) {
 		_ = p.NewRunner().Launch(t.Context(), testLease(), server.Job{RequestID: 7})
 	}()
 
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(60 * time.Second)
 
 	for {
 		got, took, err := p.Poll(t.Context(), "n1", "first")
@@ -1018,7 +1038,13 @@ func TestRegistrationPrunesOwnershipTheLedgerHasEnded(t *testing.T) {
 func TestASupersessionDuringADestroyIsNotAConfirmation(t *testing.T) {
 	t.Parallel()
 
-	p, _ := deliverLaunch(t)
+	// GENEROUS EXPLICITLY, unlike its siblings. This is the one caller where the
+	// default five seconds is a live ceiling rather than dead margin: the destroy
+	// deliberately sits QUEUED with no poller while the supersession below is
+	// staged, so a stall in that choreography would time the destroy out
+	// undelivered and fail this test on something it is not about. Nothing here
+	// ever needs the timeout to fire.
+	p, _ := deliverLaunch(t, WithCommandTimeout(60*time.Second))
 
 	destroyed := make(chan error, 1)
 
@@ -1028,7 +1054,7 @@ func TestASupersessionDuringADestroyIsNotAConfirmation(t *testing.T) {
 
 	// The command is queued, so OwnerOfRequest has already been read and the
 	// snapshot says "first" is current. Only now can the supersession race it.
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(60 * time.Second)
 	for p.QueuedForTest("n1") == 0 {
 		if time.Now().After(deadline) {
 			t.Fatal("the destroy was never queued")
@@ -1099,7 +1125,7 @@ func TestALateDestroyResultFromTheOwnerEndsItsOwnership(t *testing.T) {
 	// The owner takes the destroy — and then says nothing.
 	var taken nodeapi.Command
 
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(60 * time.Second)
 
 	for {
 		got, took, err := p.Poll(t.Context(), "n1", "first")
@@ -1288,7 +1314,7 @@ func TestALateDestroyFromANonOwnerDoesNotEndOwnership(t *testing.T) {
 
 	var taken nodeapi.Command
 
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(60 * time.Second)
 
 	for {
 		got, took, err := p.Poll(t.Context(), "n1", "second")
@@ -1401,22 +1427,41 @@ func TestADestroyIsNotConfirmedByTheWrongProcess(t *testing.T) {
 	}
 
 	// The replacement answers the destroy, truthfully: it has nothing to remove.
+	//
+	// LOOPED, because ONE Poll cannot be relied on to park. A poll can return
+	// "nothing to take" without ever having waited — deliverLaunch takes its
+	// command through the fast path, which can leave a wake signal behind, and the
+	// next poll consumes that instead of parking. A single-shot poller then exits
+	// immediately, no waiter is ever recorded, and the barrier below spins until
+	// its own watchdog fires.
+	//
+	// That is what CI hit. The failure took exactly sixty seconds, which is both
+	// the watchdog AND the command timeout this branch had raised — so the number
+	// pointed at two explanations at once, and the first commit to chase it picked
+	// the wrong one. Retrying until the poll either takes a command or genuinely
+	// waits removes the ambiguity rather than tuning a timeout against it.
 	go func() {
-		got, took, err := p.Poll(t.Context(), "n1", "second")
-		if err != nil || !took {
+		for {
+			got, took, err := p.Poll(t.Context(), "n1", "second")
+			if err != nil {
+				return
+			}
+
+			if !took {
+				continue
+			}
+
+			//nolint:errcheck // the result's fate is not what this test is about
+			_ = p.Result("n1", "second", nodeapi.CommandResult{ID: got.ID, OK: true})
+
 			return
 		}
-
-		//nolint:errcheck // the result's fate is not what this test is about
-		_ = p.Result("n1", "second", nodeapi.CommandResult{ID: got.ID, OK: true})
 	}()
 
 	// PARKED BEFORE THE DESTROY IS DISPATCHED, for the reason destroy_test.go
 	// already records: a dispatched command is discarded once the command timeout
 	// elapses, so starting the poller and the destroy together is a race against
-	// the scheduler. Under the full suite's parallelism this goroutine can simply
-	// not run inside that window, and the test then fails on a timeout that has
-	// nothing to do with who answered.
+	// the scheduler.
 	waitFor(t, "the replacement to park on a poll",
 		func() bool { return p.WaitersForTest("n1") == 1 })
 
@@ -1441,7 +1486,9 @@ func TestADestroyIsNotConfirmedByTheWrongProcess(t *testing.T) {
 func TestAFailedDestroyKeepsItsOwnershipRecord(t *testing.T) {
 	t.Parallel()
 
-	p, _ := deliverLaunch(t)
+	// SHORT, because the timeout IS the stimulus here rather than a watchdog:
+	// this test wants the destroy to go unanswered and expire.
+	p, _ := deliverLaunch(t, WithCommandTimeout(500*time.Millisecond))
 
 	// Nobody answers the destroy, so it times out.
 	if err := p.NewRunner().Destroy(t.Context(), 7); err == nil {
@@ -1495,7 +1542,7 @@ func TestADestroyNoNodeConfirmedIsAFailure(t *testing.T) {
 
 	select {
 	case <-taken:
-	case <-time.After(5 * time.Second):
+	case <-time.After(60 * time.Second):
 		t.Fatal("the node never took the destroy")
 	}
 

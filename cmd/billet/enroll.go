@@ -339,6 +339,12 @@ func recordIssuedCert(
 }
 
 // controlPlaneAllocator opens the ledger for a command that runs on the server.
+//
+// OpenAdmin RATHER THAN Open, because these commands run WHILE the control plane
+// is running — which is the only time most of them are any use. Open takes the
+// exclusive directory lock the server holds for its whole life, so every command
+// reaching the ledger through here failed against a live deployment with
+// "another billet process holds this state directory".
 func controlPlaneAllocator(ctx context.Context, cfgPath string) (*alloc.Allocator, func(), error) {
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
@@ -350,7 +356,7 @@ func controlPlaneAllocator(ctx context.Context, cfgPath string) (*alloc.Allocato
 			"no server section")
 	}
 
-	db, err := state.Open(ctx, cfg.Server.StateDir)
+	db, err := state.OpenAdmin(ctx, cfg.Server.StateDir)
 	if err != nil {
 		return nil, nil, fmt.Errorf("server state: %w", err)
 	}

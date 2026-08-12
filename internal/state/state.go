@@ -36,13 +36,20 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
-	_ "modernc.org/sqlite" // pure-Go driver: keeps billet a single static binary
+	// The pure-Go driver keeps billet a single static binary. Named rather than
+	// blank because contention has to be recognised by SQLite's own error CODE:
+	// "database is locked" is the text for both SQLITE_BUSY and
+	// SQLITE_BUSY_SNAPSHOT, and matching prose would turn a retry into a fatal
+	// error the first time a driver reworded it. depguard confines this import to
+	// this package.
+	"modernc.org/sqlite"
 )
 
 // ErrConflict is returned when a compare-and-swap loses. Callers should re-read
@@ -68,6 +75,24 @@ type DB struct {
 	w    *sql.DB
 	r    *sql.DB
 	lock *dirLock
+
+	// admin marks a handle belonging to a ONE-SHOT OPERATOR COMMAND, whether or
+	// not it managed to take the directory lock. It decides how patient the
+	// handle is: a command has a person waiting on it and gives up, a control
+	// plane never does.
+	admin bool
+
+	// unlocked marks a handle that did NOT take the directory lock, because
+	// something else holds it. Such a handle did not migrate and cannot assume
+	// the schema it verified at open is still the one it is writing against, so
+	// every transaction re-checks. See OpenAdmin and verifySchemaIn.
+	//
+	// SEPARATE FROM admin, and conflating them was a bug: an operator command on
+	// a STOPPED server takes the lock, so a single flag made it a control plane
+	// for the purposes of patience — and it would then retry forever against
+	// another command that had beaten it to SQLite's writer slot, which is
+	// exactly the hang the bound exists to prevent.
+	unlocked bool
 }
 
 // Open prepares the state directory, takes the exclusive process lock, opens the
@@ -75,6 +100,17 @@ type DB struct {
 //
 // The caller's context bounds startup only; it does not own the returned DB.
 func Open(ctx context.Context, stateDir string) (*DB, error) {
+	return openDir(ctx, stateDir, false)
+}
+
+// openDir is the shared body of Open and OpenAdmin.
+//
+// admin says the caller is a ONE-SHOT OPERATOR COMMAND rather than a control
+// plane, which changes exactly two things and nothing else: it may proceed
+// without the exclusive directory lock when a control plane already holds it,
+// and in that case it VERIFIES the schema instead of migrating it. See
+// OpenAdmin for why both halves are necessary.
+func openDir(ctx context.Context, stateDir string, admin bool) (*DB, error) {
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
 		return nil, fmt.Errorf("create state dir %s: %w", stateDir, err)
 	}
@@ -84,8 +120,16 @@ func Open(ctx context.Context, stateDir string) (*DB, error) {
 		return nil, fmt.Errorf("tighten state dir %s: %w", stateDir, err)
 	}
 
+	// A NIL LOCK MEANS "SOMEBODY ELSE IS THE CONTROL PLANE HERE", and it is
+	// reachable only for an admin caller. Everything downstream branches on this
+	// one value rather than re-deriving the situation.
 	lock, err := lockDir(stateDir)
-	if err != nil {
+
+	switch {
+	case err == nil:
+	case admin && errors.Is(err, ErrLocked):
+		lock = nil
+	default:
 		return nil, err
 	}
 
@@ -95,12 +139,39 @@ func Open(ctx context.Context, stateDir string) (*DB, error) {
 	// transactions on power loss, and the capacity ledger is exactly the thing
 	// that must survive an unclean shutdown for restart reconciliation to work.
 	//
-	// busy_timeout is a backstop. With a single writer it should never fire; if
-	// it does, something is holding a write transaction far too long.
-	writerDSN := dsn(path,
+	// busy_timeout covers a writer waiting for another writer, which is now
+	// REACHABLE rather than theoretical: an operator command opens this same
+	// database while the control plane is running. See OpenAdmin.
+	//
+	// _txlock=immediate IS LOAD-BEARING, and it is the reason that is safe.
+	//
+	// database/sql's BeginTx issues a plain BEGIN, which in WAL mode is DEFERRED:
+	// the transaction takes a read snapshot at its first read and only asks for
+	// the write lock later. Every allocation decision here is read-current,
+	// decide, record — so if anything commits in between, SQLite cannot promote
+	// the now-stale snapshot and fails the write with SQLITE_BUSY_SNAPSHOT (517).
+	// busy_timeout does NOT rescue that: waiting cannot make an old snapshot
+	// current, so it fails immediately however long the caller is willing to wait.
+	//
+	// The blast radius is what makes this a correctness rule rather than a tuning
+	// one. Escrow's error reaches refillEscrow, which stops the listener, which
+	// cancels every other listener, whose shutdowns destroy every job on the host.
+	// One badly-timed `billet ca token` would have taken the deployment down.
+	//
+	// BEGIN IMMEDIATE takes the write lock up front, so there is no snapshot to
+	// promote and a second writer simply queues on busy_timeout. It costs nothing
+	// here because there is one writer connection per process already.
+	writerDSN := dsnWith(path, map[string]string{"_txlock": "immediate"},
 		"journal_mode(WAL)",
 		"synchronous(FULL)",
-		"busy_timeout(5000)",
+		// SHORT ON PURPOSE, because beginWrite owns the waiting now. A five-second
+		// timeout inside SQLite made both bounds a fiction: an attempt begun just
+		// under adminBusyLimit could block for another five seconds past it, and a
+		// blocked BEGIN does not observe context cancellation — modernc arms
+		// sqlite3_interrupt but SQLite's busy handler sleeps without consulting it,
+		// so a cancelled caller still waited out the full timeout. Returning
+		// quickly and retrying in Go makes both the deadline and the context real.
+		"busy_timeout(50)",
 		"foreign_keys(ON)",
 	)
 	// The reader stays read-write at the OS level on purpose. mode=ro cannot open
@@ -128,7 +199,7 @@ func Open(ctx context.Context, stateDir string) (*DB, error) {
 	}
 	r.SetMaxOpenConns(4)
 
-	db := &DB{w: w, r: r, lock: lock}
+	db := &DB{w: w, r: r, lock: lock, admin: admin, unlocked: lock == nil}
 
 	startupCtx, cancel := context.WithTimeout(ctx, startupTimeout)
 	defer cancel()
@@ -140,6 +211,34 @@ func Open(ctx context.Context, stateDir string) (*DB, error) {
 	if err := db.PingContext(startupCtx); err != nil {
 		return nil, errors.Join(err, db.Close())
 	}
+
+	// THE SCAN BELONGS TO THE PROCESS THAT WILL SCHEDULE AGAINST THIS LEDGER.
+	//
+	// quick_check reads the whole file, and job_history is unbounded, so its cost
+	// grows with the deployment's age. Running it on every operator command put
+	// that growing scan in front of `nodes approve`, `leases release --force` and
+	// `check` — under the shared thirty-second startup budget, so a large or
+	// loaded deployment could lose EVERY live administration command, including
+	// the emergency one. A control plane opens the ledger once and is about to
+	// make scheduling decisions against it; a command is neither.
+	if !admin {
+		if err := db.integrityCheck(startupCtx); err != nil {
+			return nil, errors.Join(err, db.Close())
+		}
+	}
+
+	// MIGRATING IS THE LOCK HOLDER'S JOB. Without the lock another billet is
+	// already using this schema, and upgrading it underneath a process that is
+	// mid-transaction against it is the one thing an operator command must never
+	// do — so it checks instead, and refuses if it would have had to write.
+	if lock == nil {
+		if err := db.verifySchema(startupCtx); err != nil {
+			return nil, errors.Join(err, db.Close())
+		}
+
+		return db, nil
+	}
+
 	if err := db.migrate(startupCtx); err != nil {
 		return nil, errors.Join(fmt.Errorf("migrate state db: %w", err), db.Close())
 	}
@@ -152,24 +251,46 @@ func Open(ctx context.Context, stateDir string) (*DB, error) {
 const startupTimeout = 30 * time.Second
 
 // PingContext proves the database is reachable AND configured as promised.
+//
+// The integrity SCAN is deliberately not part of this. It is a whole-file read
+// whose cost grows with job_history, and it answers a question only a control
+// plane about to schedule against the ledger has to ask. See IntegrityCheck.
 func (db *DB) PingContext(ctx context.Context) error {
 	if err := db.w.PingContext(ctx); err != nil {
 		return fmt.Errorf("ping state db: %w", err)
 	}
-	if err := db.verifyWriterPragmas(ctx); err != nil {
-		return err
-	}
-	return db.integrityCheck(ctx)
+
+	return db.verifyWriterPragmas(ctx)
 }
+
+// IntegrityCheck refuses to serve from a corrupt ledger.
+//
+// EXPORTED so `billet check` can ask for it explicitly, because that command
+// exists to prove a deployment is sane and this is most of what that means.
+// Nothing else should: it reads the whole file, and doing it on every operator
+// command put a growing scan in front of `leases release --force`, which is the
+// command an operator runs when capacity is already missing.
+func (db *DB) IntegrityCheck(ctx context.Context) error { return db.integrityCheck(ctx) }
 
 // dsn builds a file: URI with the given pragmas, escaping the path so a state
 // directory containing spaces, '?' or '#' does not silently truncate the DSN.
 func dsn(path string, pragmas ...string) string {
+	return dsnWith(path, nil, pragmas...)
+}
+
+// dsnWith is dsn plus driver parameters that are not pragmas — _txlock, which
+// decides whether BeginTx issues BEGIN or BEGIN IMMEDIATE, is one.
+func dsnWith(path string, extra map[string]string, pragmas ...string) string {
 	u := url.URL{Scheme: "file", Path: path}
 	q := url.Values{}
 	for _, p := range pragmas {
 		q.Add("_pragma", p)
 	}
+
+	for k, v := range extra {
+		q.Set(k, v)
+	}
+
 	u.RawQuery = q.Encode()
 	return u.String()
 }
@@ -242,9 +363,9 @@ func (db *DB) Reader() Querier { return db.r }
 // so that an allocation decision — read current usage, decide, record it — is one
 // atomic step rather than a read followed by a hopeful write.
 func (db *DB) Tx(ctx context.Context, fn func(*sql.Tx) error) error {
-	tx, err := db.w.BeginTx(ctx, nil)
+	tx, err := db.beginWrite(ctx)
 	if err != nil {
-		return fmt.Errorf("begin write tx: %w", err)
+		return err
 	}
 	defer func() {
 		// Rollback after a successful Commit is a documented no-op returning
@@ -253,6 +374,18 @@ func (db *DB) Tx(ctx context.Context, fn func(*sql.Tx) error) error {
 		//nolint:errcheck // see above: no-op after Commit, and fn's error wins otherwise.
 		_ = tx.Rollback()
 	}()
+
+	// RE-CHECKED INSIDE THE TRANSACTION, for a handle that never held the lock.
+	// The check at open time is only true of the control plane that was running
+	// then; this one is true of the schema this transaction is actually writing
+	// against, because BEGIN IMMEDIATE already holds the write lock a migration
+	// would need.
+	if db.unlocked {
+		if err := verifySchemaIn(ctx, tx); err != nil {
+			return err
+		}
+	}
+
 	if err := fn(tx); err != nil {
 		return err
 	}
@@ -260,6 +393,274 @@ func (db *DB) Tx(ctx context.Context, fn func(*sql.Tx) error) error {
 		return fmt.Errorf("commit write tx: %w", err)
 	}
 	return nil
+}
+
+// View runs fn inside a READ-ONLY transaction on the query-only pool.
+//
+// THE COMPANION TO Tx, AND NOT AN OPTIMISATION. Every write transaction now
+// begins IMMEDIATE, which takes SQLite's single writer slot at BEGIN — so a
+// read-only operation routed through Tx reserves the right to write while it
+// scans, and can delay a scheduling decision in the control plane. That was
+// harmless when one process wrote; it is not now that operator commands share
+// the ledger, and `billet leases quarantined` scanning a large table is exactly
+// the shape that would do it.
+//
+// The reader pool is query_only, so a write attempted in here fails rather than
+// quietly succeeding on a connection nobody expected to mutate anything — the
+// same reason Reader hands back a Querier rather than the pool.
+//
+// A TRANSACTION rather than bare queries, so a caller issuing several of them
+// sees one consistent snapshot instead of rows from either side of a commit.
+func (db *DB) View(ctx context.Context, fn func(Querier) error) error {
+	// Deferred, deliberately: the reader takes no write lock, which is the whole
+	// point, and nothing here can be promoted.
+	tx, err := db.r.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin read tx: %w", err)
+	}
+
+	defer func() {
+		//nolint:errcheck // a read transaction has nothing to lose on rollback.
+		_ = tx.Rollback()
+	}()
+
+	// Re-checked for the same reason Tx does it, and it matters here too: a read
+	// against a schema a newer billet has since rebuilt would report rows that no
+	// longer mean what this binary thinks they mean.
+	if db.unlocked {
+		if err := verifySchemaIn(ctx, tx); err != nil {
+			return err
+		}
+	}
+
+	return fn(tx)
+}
+
+// busyRetryInterval paces re-attempts at starting a write transaction.
+//
+// Short, because it only ever runs while another process holds the write lock,
+// and the point is to be waiting when that process lets go.
+const busyRetryInterval = 50 * time.Millisecond
+
+// stallWarnAfter is how long a write may wait for the lock before saying so, and
+// stallWarnEvery paces the repeats.
+//
+// WAITING FOREVER IS THE DESIGN; WAITING SILENTLY IS NOT. A control plane never
+// gives up, because an escrow error stops the listener and destroys every job on
+// the host — but that means an operator command stalled inside an open
+// transaction (a suspended shell, a debugger, a wedged disk) takes every
+// scheduling write down with it, indefinitely, with nothing anywhere saying why.
+// The plane just goes quiet.
+//
+// Before this package admitted a second writer that was unreachable. It is the
+// new failure mode the capability brought, so it gets the one thing that makes it
+// diagnosable.
+const (
+	stallWarnAfter = time.Second
+	stallWarnEvery = 15 * time.Second
+)
+
+// onBusyRetry observes a writer about to wait out a busy BEGIN. Nil in
+// production; a test sets it to synchronise on the state it needs.
+var onBusyRetry func()
+
+// adminBusyLimit bounds how long an OPERATOR COMMAND waits for the write lock
+// before reporting that the control plane is busy.
+//
+// A var so a test can shorten it; nothing outside this package writes it. The
+// control plane itself has no such bound — see beginWrite for why the two sides
+// are deliberately asymmetric.
+var adminBusyLimit = 15 * time.Second
+
+// beginWrite starts a write transaction, WAITING OUT a writer in another process
+// rather than failing.
+//
+// CONTENTION IS A RACE, NOT A BROKEN CONTRACT, and this codebase already draws
+// that line: an assignment with no escrow behind it declines and carries on,
+// while a scale-set response that cannot be true stops the listener. SQLITE_BUSY
+// belongs firmly on the first side — it means somebody else is writing right
+// now, which is ordinary once operator commands share the ledger.
+//
+// Treating it as fatal would be severe out of all proportion. Escrow's error
+// reaches refillEscrow, which stops the listener, which cancels every other
+// listener, whose shutdowns destroy every job on the host — so a `billet leases
+// quarantined` that happened to scan for longer than busy_timeout would fail
+// every build on the machine. Retrying costs a delay; not retrying costs the
+// deployment.
+//
+// Bounded by the CALLER'S CONTEXT rather than by an attempt count, because there
+// is no number of attempts that is right for both a poll loop and a one-shot
+// command: each already carries a deadline that says how long it is willing to
+// wait.
+func (db *DB) beginWrite(ctx context.Context) (*sql.Tx, error) {
+	// THE TWO CALLERS DESERVE OPPOSITE ANSWERS, which is why the bound is not a
+	// single number. A control plane must never give up — stopping is the
+	// catastrophe this retry exists to prevent — so it waits as long as its
+	// context allows. An operator command has a HUMAN WAITING AT A TERMINAL, and
+	// a command that hangs silently with no output is its own kind of failure, so
+	// it gives up and says to try again.
+	//
+	// Not expressed as a derived context, deliberately: the transaction that
+	// BeginTx returns stays bound to the context it was given, so cancelling one
+	// here would roll the transaction back the moment this function returned.
+	var errBusy error
+
+	var deadline time.Time
+	if db.admin {
+		deadline = time.Now().Add(adminBusyLimit)
+	}
+
+	started := time.Now()
+	warned := time.Time{}
+
+	for attempt := 0; ; attempt++ {
+		// CHECKED BEFORE STARTING, never only after. An attempt that begins inside
+		// the bound can still block for busy_timeout, so testing afterwards let the
+		// effective wait run past the number this promises. Refusing to START a
+		// late attempt keeps the overshoot to one busy_timeout rather than
+		// unbounded — and a transaction that IS won is never thrown away, because
+		// having the lock is strictly better than reporting that we could not get
+		// it.
+		if attempt > 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, fmt.Errorf("begin write tx: %w", err)
+			}
+
+			if !deadline.IsZero() && time.Now().After(deadline) {
+				// IT DOES NOT PROMISE THAT NOTHING CHANGED, and an earlier draft did.
+				// Several commands commit more than one transaction — `nodes revoke`
+				// records each legacy serial before withdrawing them, `ca issue`
+				// records the serial and the admission separately — so a later one
+				// failing leaves the earlier ones committed. Claiming otherwise would
+				// send an operator away believing a half-done command was a no-op.
+				return nil, fmt.Errorf(
+					"another process held this ledger's write lock for longer than %s, so this "+
+						"command stopped rather than waiting silently. Anything it had already "+
+						"committed stands; run it again in a moment: %w",
+					adminBusyLimit, errBusy)
+			}
+		}
+
+		tx, err := db.w.BeginTx(ctx, nil)
+		if err == nil {
+			return tx, nil
+		}
+
+		if !isBusy(err) {
+			// ONLY AN INTERRUPT IS CANCELLATION WEARING THE DRIVER'S CLOTHES.
+			//
+			// modernc can interrupt a BEGIN and surface SQLITE_INTERRUPT rather
+			// than a context error, so a caller testing for Canceled would see
+			// nothing — that one code is translated.
+			//
+			// NOTHING ELSE IS, and the two rejected alternatives are why. Asking the
+			// context first and returning its error threw away SQLITE_CORRUPT and
+			// SQLITE_IOERR whenever cancellation raced the return. Joining the two
+			// kept both identities structurally and still lost the fault in
+			// practice: callers filter on errors.Is(err, context.Canceled) and treat
+			// a match as a clean shutdown, so a joined error is discarded exactly
+			// like a pure cancellation — by nodeplane's request handler and by the
+			// server's own shutdown classifier.
+			//
+			// A storage fault must stay a storage fault. It is the actionable half.
+			if isInterrupt(err) {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return nil, fmt.Errorf("begin write tx: %w", ctxErr)
+				}
+			}
+
+			return nil, fmt.Errorf("begin write tx: %w", err)
+		}
+
+		errBusy = err
+
+		// SAID OUT LOUD ONCE IT STOPS LOOKING LIKE CONTENTION AND STARTS LOOKING
+		// LIKE A STALL. Rate-limited, because this runs on every writer and a wedged
+		// holder would otherwise produce a line per retry.
+		if waited := time.Since(started); waited > stallWarnAfter &&
+			(warned.IsZero() || time.Since(warned) > stallWarnEvery) {
+			warned = time.Now()
+
+			// THE CONSEQUENCE DEPENDS ON WHO IS WAITING, so it is not asserted for
+			// both. A stalled control plane really does have scheduling queued
+			// behind it; a command waiting its turn proves only that something else
+			// is writing, and telling an operator their `ca token` has stopped the
+			// deployment would send them after the wrong thing.
+			if db.admin {
+				slog.Default().Warn("still waiting for the ledger's write lock; another billet "+
+					"process is holding it", "waited", waited.Round(time.Second))
+			} else {
+				slog.Default().Warn("the control plane is still waiting for the ledger's write "+
+					"lock, so scheduling writes are queued behind it; an operator command is "+
+					"holding it", "waited", waited.Round(time.Second))
+			}
+		}
+
+		// A TEST HOOK, nil in production. The cancellation branch below is only
+		// reachable once a caller is genuinely waiting out a busy BEGIN, and a test
+		// that cancels on a guess exercises it on some runs and not others — which
+		// is indistinguishable from a test that does not exercise it at all.
+		if onBusyRetry != nil {
+			onBusyRetry()
+		}
+
+		// time.After would leak its timer until it fired, and forbidigo bans it
+		// for exactly that reason.
+		wait := time.NewTimer(busyRetryInterval)
+
+		select {
+		case <-ctx.Done():
+			wait.Stop()
+
+			// ctx.Err(), NOT the busy error that happened to be last. Cancellation
+			// is what ended this wait, and a caller testing for context.Canceled or
+			// DeadlineExceeded has to be able to see it — the guarantee two lines up
+			// is worthless if this branch quietly returns something else.
+			return nil, fmt.Errorf("begin write tx: %w", ctx.Err())
+		case <-wait.C:
+		}
+	}
+}
+
+// isBusy reports whether an error is SQLite saying somebody else is writing.
+//
+// MATCHED ON THE CODE, never on the message: "database is locked" is the text
+// for both plain SQLITE_BUSY and SQLITE_BUSY_SNAPSHOT, and a driver or locale
+// that phrases it differently would silently turn a retry into a fatal error.
+// The primary code is the low byte, so this covers the extended forms —
+// BUSY_RECOVERY, BUSY_SNAPSHOT and BUSY_TIMEOUT — without listing them.
+func isBusy(err error) bool {
+	var serr *sqlite.Error
+	if !errors.As(err, &serr) {
+		return false
+	}
+
+	const sqliteBusy = 5
+
+	return serr.Code()&0xff == sqliteBusy
+}
+
+// isInterrupt reports whether an error is SQLite saying the operation was
+// interrupted, which is how a cancelled BEGIN can arrive.
+//
+// Narrow deliberately: this is the ONLY driver code translated into the caller's
+// context error, because every other failure is a fact about the database that
+// must survive being reported.
+// A VAR SO A TEST CAN REACH THE BRANCH IT GUARDS. modernc's *sqlite.Error has
+// unexported fields, so a code-9 error cannot be fabricated from here and the
+// translation below it would otherwise be unreachable from any test — which is
+// how it came to be written on an unverified premise in the first place. The
+// same reason adminBusyLimit is a var; nothing outside this package writes
+// either.
+var isInterrupt = func(err error) bool {
+	var serr *sqlite.Error
+	if !errors.As(err, &serr) {
+		return false
+	}
+
+	const sqliteInterrupt = 9
+
+	return serr.Code()&0xff == sqliteInterrupt
 }
 
 // migration is identified by an explicit, immutable Version. Counting applied
@@ -815,8 +1216,8 @@ const bootstrapSchemaMigrations = `CREATE TABLE IF NOT EXISTS schema_migrations 
 // expects. billet has had no released version, so the only way to hit this is a
 // database left by a development build; the remedy is to delete it rather than
 // to write a migration for the migration table.
-func checkBookkeepingSchema(ctx context.Context, tx *sql.Tx) error {
-	rows, err := tx.QueryContext(ctx, `PRAGMA table_info(schema_migrations)`)
+func checkBookkeepingSchema(ctx context.Context, q Querier) error {
+	rows, err := q.QueryContext(ctx, `PRAGMA table_info(schema_migrations)`)
 	if err != nil {
 		return fmt.Errorf("inspect schema_migrations: %w", err)
 	}
@@ -862,8 +1263,8 @@ type appliedMigration struct {
 // readAppliedMigrations exists as its own function so `defer rows.Close()` is
 // usable: the caller runs inside a transaction and issues further statements, so
 // the cursor has to be closed before it continues.
-func readAppliedMigrations(ctx context.Context, tx *sql.Tx) (map[int]appliedMigration, error) {
-	rows, err := tx.QueryContext(ctx,
+func readAppliedMigrations(ctx context.Context, q Querier) (map[int]appliedMigration, error) {
+	rows, err := q.QueryContext(ctx,
 		`SELECT version, name, checksum FROM schema_migrations ORDER BY version`)
 	if err != nil {
 		// Propagated, not swallowed. A permission, corruption, or locking error must
@@ -915,24 +1316,8 @@ func (db *DB) migrate(ctx context.Context) error {
 			return err
 		}
 
-		applied := make(map[int]struct{}, len(seen))
-		for v := range seen {
-			applied[v] = struct{}{}
-		}
-
-		known := make(map[int]struct{}, len(migrations))
-		for _, m := range migrations {
-			known[m.Version] = struct{}{}
-		}
-		// A version this binary has never heard of means the database was written
-		// by a newer billet. Running an older control plane against a newer schema
-		// corrupts state slowly and confusingly; refuse instead.
-		for v := range applied {
-			if _, ok := known[v]; !ok {
-				return fmt.Errorf(
-					"state database has migration %d, which this billet does not know about; "+
-						"it was written by a newer version", v)
-			}
+		if err := refuseUnknownVersions(seen); err != nil {
+			return err
 		}
 
 		for _, m := range migrations {
