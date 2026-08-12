@@ -93,7 +93,38 @@ type CredentialSource interface {
 
 // StaticCredentials is a fixed set, for a test or for credentials billet was
 // handed directly.
+//
+// A DEFINED TYPE DOES NOT INHERIT THE METHODS OF THE TYPE IT IS DEFINED FROM, so
+// every redaction above has to be restated here. It is not a formality: without
+// them this type carried the same exported secret fields and none of the
+// protection, and `%v` on one printed the secret access key in full — through a
+// type whose whole purpose is to hold a credential. The test covering
+// Credentials said nothing about it, which is why the test is now a table over
+// every credential-carrying type in this package.
 type StaticCredentials Credentials
+
+// String redacts, as on Credentials. See the type's comment for why this is not
+// inherited.
+func (s StaticCredentials) String() string { return Credentials(s).redacted() }
+
+// GoString covers %#v, which does not consult String.
+func (s StaticCredentials) GoString() string { return Credentials(s).redacted() }
+
+// Format catches every verb, so none falls back to the raw struct.
+func (s StaticCredentials) Format(f fmt.State, _ rune) {
+	_, _ = io.WriteString(f, Credentials(s).redacted()) //nolint:errcheck // fmt.State swallows write errors by design
+}
+
+// MarshalJSON keeps the secret out of anything that serializes a struct holding
+// these.
+func (s StaticCredentials) MarshalJSON() ([]byte, error) {
+	return json.Marshal(Credentials(s).redacted())
+}
+
+// LogValue is what slog consults, and slog does not consult fmt.
+func (s StaticCredentials) LogValue() slog.Value {
+	return slog.StringValue(Credentials(s).redacted())
+}
 
 // Credentials satisfies CredentialSource.
 func (s StaticCredentials) Credentials(context.Context) (Credentials, error) {

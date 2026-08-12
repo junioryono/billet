@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strings"
 	"time"
 )
@@ -114,9 +115,30 @@ func (c *client) call(ctx context.Context, params url.Values, out any) error {
 		// REBUILT EVERY ATTEMPT. A signature covers a timestamp and the
 		// credentials, both of which can change between attempts, and the body
 		// reader is consumed by the one before.
-		err := c.attempt(ctx, body, out)
+		payload, err := c.attempt(ctx, body)
 		if err == nil {
-			return nil
+			if out == nil {
+				return nil
+			}
+
+			// ZEROED BEFORE EVERY DECODE, because encoding/xml APPENDS to slices
+			// and this target is shared across attempts.
+			//
+			// A truncated body is worth retrying — it is a transfer that failed
+			// rather than an answer billet disagrees with — but the decoder fills
+			// in what it managed to read before it fails. Without this the retry
+			// appended a full set of rows to the partial ones, and
+			// DescribeInstances reported an instance twice into a list that feeds a
+			// loop that destroys. Measured: two instances came back as four.
+			if v := reflect.ValueOf(out); v.Kind() == reflect.Pointer && !v.IsNil() {
+				v.Elem().SetZero()
+			}
+
+			if err = xml.Unmarshal(payload, out); err == nil {
+				return nil
+			}
+
+			err = fmt.Errorf("ec2: parse the api response: %w", err)
 		}
 
 		lastErr = err
@@ -148,10 +170,12 @@ func (c *client) wait(ctx context.Context, d time.Duration) error {
 	}
 }
 
-func (c *client) attempt(ctx context.Context, body string, out any) error {
+// attempt issues one request and returns its body, leaving the decode to the
+// caller so that a failed attempt cannot contaminate the next one's target.
+func (c *client) attempt(ctx context.Context, body string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, strings.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("ec2: build request: %w", err)
+		return nil, fmt.Errorf("ec2: build request: %w", err)
 	}
 
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=utf-8")
@@ -162,7 +186,7 @@ func (c *client) attempt(ctx context.Context, body string, out any) error {
 
 	creds, err := c.creds.Credentials(ctx)
 	if err != nil {
-		return fmt.Errorf("ec2: resolve aws credentials: %w", err)
+		return nil, fmt.Errorf("ec2: resolve aws credentials: %w", err)
 	}
 
 	now := time.Now
@@ -171,12 +195,12 @@ func (c *client) attempt(ctx context.Context, body string, out any) error {
 	}
 
 	if err := sign(req, []byte(body), creds, c.region, now()); err != nil {
-		return err
+		return nil, err
 	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return fmt.Errorf("ec2: call the api: %w", err)
+		return nil, fmt.Errorf("ec2: call the api: %w", err)
 	}
 
 	defer func() { _ = resp.Body.Close() }()
@@ -185,22 +209,14 @@ func (c *client) attempt(ctx context.Context, body string, out any) error {
 	// unbounded read is an allocation sized by whatever answered.
 	payload, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
-		return fmt.Errorf("ec2: read the api response: %w", err)
+		return nil, fmt.Errorf("ec2: read the api response: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return parseAPIError(payload, resp.StatusCode)
+		return nil, parseAPIError(payload, resp.StatusCode)
 	}
 
-	if out == nil {
-		return nil
-	}
-
-	if err := xml.Unmarshal(payload, out); err != nil {
-		return fmt.Errorf("ec2: parse the api response: %w", err)
-	}
-
-	return nil
+	return payload, nil
 }
 
 // errorResponse is the shape the query API uses for a refusal.

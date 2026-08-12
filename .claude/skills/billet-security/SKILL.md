@@ -175,6 +175,12 @@ The `ec2` backend introduces a credential class billet had not held before: one 
 
 **The credential document never appears in an error.** It IS the credential, and one shared error format string across three call sites is how it reaches a log.
 
+**A DEFINED TYPE DOES NOT INHERIT THE METHODS IT WAS DEFINED FROM, and that is how a redacted type stops being redacted.** `type StaticCredentials Credentials` carried the same exported secret fields and none of the five redaction methods, so `%v` on one printed the secret access key in full — through a type whose entire purpose is holding a credential. The test covering `Credentials` said nothing about it. The redaction test is now a table over EVERY credential-carrying type in the package, so a new one has to be added there to be trusted rather than redacted by whoever remembers.
+
+A second lesson from the same fix: **implementing `Format` means `fmt` never consults `String` or `GoString`**, so a mutation that made `String` return the secret SURVIVED a test that only used fmt verbs — while the method stayed reachable by any caller holding a `fmt.Stringer`. Call them directly as well as through the verbs.
+
+**A signed request must not go out in plaintext.** `node.ec2.endpoint` exists for a VPC interface endpoint or a non-commercial partition and was accepted as anything `url.Parse` tolerates. The secret access key never crosses the wire — SigV4 sends a signature, not a key — but the SESSION TOKEN and a replayable signed `RunInstances` do, so `http://` hands both to anyone on the path. HTTPS is required, with LOOPBACK as the exception, which is billet's existing rule rather than a new one: a loopback wire has no certificates at all because there the trust boundary is the machine. The check is `config.CheckEC2Endpoint`, exported and called from both config validation and the provider's constructor, because the constructor is exported and cannot assume its configuration came through `config.Load`.
+
 ### What the job itself can read
 
 **The runner registration travels in user data, and that is a different trade from the one the container backend refuses.** There, the JIT config must stay out of argv because the host is SHARED — every other job on that machine could read it. On EC2 the instance holds exactly one job, is destroyed with it, and the registration is that job's own, single-use, and consumed before any workflow step runs.

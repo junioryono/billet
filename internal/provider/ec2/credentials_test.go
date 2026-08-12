@@ -81,6 +81,84 @@ func TestCredentialsAreRedactedOnEveryRenderingPath(t *testing.T) {
 	}
 }
 
+// EVERY CREDENTIAL-CARRYING TYPE IN THIS PACKAGE, not just the one.
+//
+// `type StaticCredentials Credentials` is a DEFINED TYPE, and a defined type does
+// not inherit the methods of the type it is defined from — so it had every
+// exported secret field and none of the redaction, and printing one rendered the
+// secret access key in full. The test above covered Credentials and said nothing
+// about it.
+//
+// Written as a table over `any` so that a third type carrying a secret has to be
+// added here to be trusted, rather than being redacted by whoever remembers.
+func TestEveryCredentialTypeIsRedacted(t *testing.T) {
+	const secret = "wJalrXUtnFEMI-thisIsTheSecret"
+
+	full := Credentials{
+		AccessKeyID:     "AKIDEXAMPLE",
+		SecretAccessKey: secret,
+		SessionToken:    "session-token-value",
+	}
+
+	for name, value := range map[string]any{
+		"Credentials":       full,
+		"StaticCredentials": StaticCredentials(full),
+		// A POINTER, because fmt consults a value method through a pointer but not
+		// the reverse, and a caller holding one is ordinary.
+		"a pointer to Credentials":       &full,
+		"a pointer to StaticCredentials": func() *StaticCredentials { s := StaticCredentials(full); return &s }(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			holder := struct {
+				Where string
+				Creds any
+			}{"launching", value}
+
+			encoded, err := json.Marshal(holder)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+
+			var logged bytes.Buffer
+
+			slog.New(slog.NewJSONHandler(&logged, nil)).Info("launching", "creds", value)
+
+			rendered := map[string]string{
+				"%v":            fmt.Sprintf("%v", value),
+				"%s":            fmt.Sprintf("%s", value),
+				"%#v":           fmt.Sprintf("%#v", value),
+				"%+v":           fmt.Sprintf("%+v", value),
+				"%v on a field": fmt.Sprintf("%v", holder),
+				"json":          string(encoded),
+				"slog":          logged.String(),
+			}
+
+			// CALLED DIRECTLY, because the fmt verbs above do not reach them.
+			// Implementing Format means fmt consults Formatter for EVERY verb and
+			// never String or GoString — so a mutation that made String return the
+			// secret survived this test until these two lines existed, while the
+			// method stayed reachable by any caller holding a Stringer.
+			if sv, ok := value.(fmt.Stringer); ok {
+				rendered["String()"] = sv.String()
+			}
+
+			if gv, ok := value.(interface{ GoString() string }); ok {
+				rendered["GoString()"] = gv.GoString()
+			}
+
+			for path, out := range rendered {
+				if strings.Contains(out, secret) {
+					t.Errorf("%s rendered the secret access key: %s", path, out)
+				}
+
+				if strings.Contains(out, "session-token-value") {
+					t.Errorf("%s rendered the session token: %s", path, out)
+				}
+			}
+		})
+	}
+}
+
 // EXPLICIT BEATS AMBIENT. An operator who set AWS_ACCESS_KEY_ID on a machine that
 // also has an instance role meant the key; the other order makes that setting
 // silently do nothing.

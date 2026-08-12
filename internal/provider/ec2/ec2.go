@@ -120,6 +120,16 @@ func New(owner string, cfg config.EC2Config, opts ...Option) (*Provider, error) 
 		endpoint = "https://ec2." + cfg.Region + ".amazonaws.com/"
 	}
 
+	// RE-APPLIED HERE, not merely validated at load. This constructor is exported,
+	// so it cannot assume its configuration came through config.Load — and the
+	// rule it enforces is that a signed request carrying a session token does not
+	// go out in plaintext, which is not a rule worth having one entry point for.
+	if strings.TrimSpace(cfg.Endpoint) != "" {
+		if err := config.CheckEC2Endpoint(strings.TrimSpace(cfg.Endpoint)); err != nil {
+			return nil, fmt.Errorf("ec2: %w", err)
+		}
+	}
+
 	if _, err := url.Parse(endpoint); err != nil {
 		return nil, fmt.Errorf("ec2: node.ec2.endpoint %q is not a url: %w", endpoint, err)
 	}
@@ -536,6 +546,21 @@ func shellCommand(argv []string) (string, error) {
 // Idempotent: an id that is already gone is success. Teardown runs on paths that
 // have already failed once, and erroring there turns recoverable state into stuck
 // state.
+//
+// IT RETURNS WHEN THE REQUEST IS ACCEPTED, NOT WHEN THE MACHINE IS GONE, and that
+// is a real difference from the container backend, where `docker rm --force`
+// finishes the job. An instance sits in `shutting-down` for a while afterwards.
+//
+// What makes that safe is the state filter above: `shutting-down` is one of the
+// states List asks for, and runningState counts it as running — so the instance
+// stays in this host's INVENTORY until EC2 has finished with it, and the control
+// plane goes on charging its capacity to this node. The capacity comes back when
+// the machine is provably gone rather than when billet asked for it to go, which
+// is the rule custody follows everywhere else.
+//
+// Waiting here instead would be worse: a node executes one command at a time, so
+// blocking teardown on a poll would stall every other launch and destroy behind
+// it.
 func (p *Provider) Destroy(ctx context.Context, id string) error {
 	if id == "" {
 		return errors.New("ec2: destroy needs an instance id")
@@ -612,6 +637,12 @@ func (p *Provider) describe(ctx context.Context, extra ...filter) ([]*provider.I
 	}, extra...)
 
 	token := ""
+	// EVERY TOKEN, NOT ONLY THE LAST ONE. Comparing against the immediately
+	// preceding token catches a token that repeats itself and misses a CYCLE —
+	// A, B, A, B — which loops forever. A sweep that never returns stops reporting
+	// this host's inventory, and the capacity of anything quarantined on it is
+	// held until an operator intervenes.
+	seen := map[string]struct{}{}
 
 	for {
 		params := url.Values{}
@@ -639,17 +670,26 @@ func (p *Provider) describe(ctx context.Context, extra ...filter) ([]*provider.I
 		for _, r := range out.Reservations {
 			for _, item := range r.Instances {
 				name, ok := item.tag(nameTag)
-				if !ok {
-					// TAGGED BY BILLET BUT UNNAMED. The owner filter says this is
-					// billet's, so this is a launch whose tags were partially applied
-					// — reported rather than skipped, because the caller's job is to
-					// act on compute nothing accounts for and an unnamed instance is
-					// the least accountable thing there is.
-					p.log.Warn("an instance carries billet's owner tag but no name; it cannot be "+
-						"matched to a lease and will not be cleaned up automatically",
-						"instance", item.InstanceID)
 
-					continue
+				// AN INCOMPLETE INVENTORY IS NOT A SHORTER ONE, and the whole
+				// function fails rather than omitting a row.
+				//
+				// This list is what the control plane reconciles against, and it
+				// frees quarantined capacity for any lease ABSENT from it. So a
+				// silently dropped instance is capacity handed back for a machine
+				// that is still running — the exact failure the inventory exists to
+				// prevent, caused by the report meant to prevent it.
+				//
+				// An owner-tagged instance with no name is billet's compute that
+				// cannot be matched to a lease, and one with no id is compute
+				// nothing can destroy. Both need an operator, and the docker
+				// backend fails its own List for the same reason.
+				if !ok || item.InstanceID == "" {
+					return nil, fmt.Errorf(
+						"ec2: instance %q carries this deployment's owner tag but no usable "+
+							"%s tag, so billet cannot match it to a lease or account for it; "+
+							"refusing to report an inventory it is missing from",
+						item.InstanceID, nameTag)
 				}
 
 				instances = append(instances, &provider.Instance{
@@ -668,11 +708,12 @@ func (p *Provider) describe(ctx context.Context, extra ...filter) ([]*provider.I
 			return instances, nil
 		}
 
-		if out.NextToken == token {
-			return nil, fmt.Errorf("ec2: the api returned the same pagination token twice; "+
-				"refusing to loop (%d instances so far)", len(instances))
+		if _, repeated := seen[out.NextToken]; repeated {
+			return nil, fmt.Errorf("ec2: the api returned a pagination token it had already "+
+				"given; refusing to loop (%d instances so far)", len(instances))
 		}
 
+		seen[out.NextToken] = struct{}{}
 		token = out.NextToken
 	}
 }
@@ -694,4 +735,34 @@ func runningState(state string) bool {
 	default:
 		return true
 	}
+}
+
+// preflightOwner tags nothing. It is the deployment identity CheckReachable
+// filters on, chosen so the query matches no instances: the point of the call is
+// the CALL, not its result.
+const preflightOwner = "billet-preflight"
+
+// CheckReachable proves a set of credentials can reach the EC2 API in a region.
+//
+// WHAT IT PROVES, EXACTLY: that credentials resolve, that the region and endpoint
+// name something that answers, and that this identity is permitted to call
+// DescribeInstances. It issues one read-only request whose filter deliberately
+// matches nothing.
+//
+// WHAT IT DOES NOT PROVE: permission to RunInstances or TerminateInstances, that
+// the subnet and security groups exist, or that the AMI is visible. Those need
+// either a dry-run launch, which is a write-shaped call billet should not make
+// from a diagnostic, or more permissions than a check ought to require. An
+// operator is told the difference rather than left to infer it.
+func CheckReachable(ctx context.Context, cfg config.EC2Config, opts ...Option) error {
+	p, err := New(preflightOwner, cfg, opts...)
+	if err != nil {
+		return err
+	}
+
+	if _, err := p.List(ctx); err != nil {
+		return err
+	}
+
+	return nil
 }

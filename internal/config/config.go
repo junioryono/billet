@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -329,9 +330,11 @@ const (
 	// ProviderTart runs macOS and Linux arm64 guests on Apple Silicon. Requires
 	// Tart, which is FSL-licensed and installed separately.
 	ProviderTart ProviderKind = "tart"
-	// ProviderEC2 launches one spot instance per job. Firecracker is not an
-	// option on EC2 outside .metal instances, so here the instance itself is the
-	// isolation boundary.
+	// ProviderEC2 launches one instance per job — on demand unless node.ec2.spot
+	// says otherwise, because a reclaimed spot instance is a failed build that
+	// GitHub will not requeue. Firecracker is not an option on EC2 outside .metal
+	// instances, so here the instance itself is the isolation boundary, which is
+	// also why this backend may run untrusted work at all.
 	ProviderEC2 ProviderKind = "ec2"
 	// ProviderDocker runs jobs in containers. Isolation is materially weaker than
 	// a VM; this exists so `billet init` works on a laptop and it refuses
@@ -1054,6 +1057,7 @@ func (c *Config) applyDefaults() {
 
 	if c.Node != nil {
 		c.Node.Name = trimNodeName(c.Node.Name)
+		c.Node.EC2.normalize()
 
 		// THE CERTIFICATE DECIDES WHEN THERE IS ONE. The control plane authorises a
 		// node by the name in its certificate, so with a bundle present the config
@@ -1445,6 +1449,10 @@ func (c *Config) validateEC2Node() []error {
 			"which network a runner should be able to reach"))
 	}
 
+	if err := CheckEC2Endpoint(e.Endpoint); err != nil {
+		errs = append(errs, err)
+	}
+
 	// AT LEAST ONE, AND NOT DEFAULTED TO THE VPC'S DEFAULT GROUP. A default
 	// security group in a VPC somebody already had usually permits more than they
 	// are picturing, and this is the field that decides what a job can reach.
@@ -1454,9 +1462,122 @@ func (c *Config) validateEC2Node() []error {
 			"the VPC's default"))
 	}
 
+	// AN EMPTY STRING IS NOT A GROUP, and on the untrusted list it is worse than a
+	// missing key: Accepts admits fork pull-request work as soon as that list is
+	// non-empty, so one empty entry opens this backend to untrusted code with no
+	// network actually described for it.
+	errs = append(errs, emptyGroupErrors("security_group_ids", e.SecurityGroupIDs)...)
+	errs = append(errs,
+		emptyGroupErrors("untrusted_security_group_ids", e.UntrustedSecurityGroupIDs)...)
+
 	errs = append(errs, e.instanceTypeErrors()...)
 
 	return errs
+}
+
+// normalize trims the values billet later uses verbatim.
+//
+// THE SAME REASON NODE NAMES ARE NORMALIZED FIRST. Validation trimmed these to
+// CHECK them and everything else used the raw string, so `region: "  us-west-2  "`
+// passed the shape check and was then signed with its padding — a 403 naming
+// nothing. YAML strips whitespace from a plain scalar but keeps it inside quotes,
+// so this is reachable from an ordinary-looking file.
+func (e *EC2Config) normalize() {
+	if e == nil {
+		return
+	}
+
+	e.Region = strings.TrimSpace(e.Region)
+	e.Endpoint = strings.TrimSpace(e.Endpoint)
+	e.SubnetID = strings.TrimSpace(e.SubnetID)
+	e.InstanceProfile = strings.TrimSpace(e.InstanceProfile)
+
+	for i := range e.SecurityGroupIDs {
+		e.SecurityGroupIDs[i] = strings.TrimSpace(e.SecurityGroupIDs[i])
+	}
+
+	for i := range e.UntrustedSecurityGroupIDs {
+		e.UntrustedSecurityGroupIDs[i] = strings.TrimSpace(e.UntrustedSecurityGroupIDs[i])
+	}
+
+	for i := range e.InstanceTypes {
+		e.InstanceTypes[i].Type = strings.TrimSpace(e.InstanceTypes[i].Type)
+	}
+}
+
+// emptyGroupErrors reports blank entries in a security group list.
+func emptyGroupErrors(field string, groups []string) []error {
+	var errs []error
+
+	for i, g := range groups {
+		if g == "" {
+			errs = append(errs, fmt.Errorf(
+				"node.ec2.%s[%d] is empty; an empty string is not a security group, and on the "+
+					"untrusted list a non-empty list is what admits fork pull-request work",
+				field, i))
+		}
+	}
+
+	return errs
+}
+
+// CheckEC2Endpoint refuses an endpoint that would carry a credential in the clear.
+//
+// EXPORTED AND CALLED FROM BOTH SIDES, the way alloc re-applies the safety rules
+// it cannot assume came through Load. The ec2 provider is constructible directly,
+// so a rule enforced only here has a second entry point that does not enforce it.
+//
+// The secret access key never crosses the wire, but a SESSION TOKEN and a
+// replayable signed request do, so plaintext hands both to anyone on the path.
+//
+// LOOPBACK IS THE EXCEPTION, and it is billet's existing rule rather than a new
+// one: a loopback wire has no certificates at all, because there the trust
+// boundary is the machine itself.
+func CheckEC2Endpoint(endpoint string) error {
+	if endpoint == "" {
+		return nil
+	}
+
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return fmt.Errorf("node.ec2.endpoint %q is not a url: %w", endpoint, err)
+	}
+
+	// THE SCHEME IS CHECKED FIRST, because a bare `ec2.us-west-2.amazonaws.com`
+	// parses as a PATH — so asking about the host first answers "names no host",
+	// which sends an operator looking for a typo in a hostname that is correct.
+	if u.Scheme != "https" && u.Scheme != "http" {
+		return endpointNeedsHTTPS(endpoint)
+	}
+
+	if u.Hostname() == "" {
+		return fmt.Errorf("node.ec2.endpoint %q names no host", endpoint)
+	}
+
+	if u.Scheme == "https" || isLoopbackHost(u.Hostname()) {
+		return nil
+	}
+
+	return endpointNeedsHTTPS(endpoint)
+}
+
+func endpointNeedsHTTPS(endpoint string) error {
+	return fmt.Errorf(
+		"node.ec2.endpoint %q must use https: billet signs each request and sends a session "+
+			"token with it, so plaintext hands an on-path observer a replayable request. Only a "+
+			"loopback address may use http, where the trust boundary is the machine itself",
+		endpoint)
+}
+
+// isLoopbackHost reports whether a host names this machine.
+func isLoopbackHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+
+	ip := net.ParseIP(host)
+
+	return ip != nil && ip.IsLoopback()
 }
 
 // instanceTypeErrors reports everything wrong with the shapes a cloud node may
@@ -1962,10 +2083,11 @@ func (c *Config) validateMacOSHostLimits() []error {
 // the machine will ever allow, which otherwise surfaces as jobs that queue
 // forever with no explanation.
 func (c *Config) validateCapacity() []error {
+	errs := c.validateEC2Shapes()
+
 	if c.Server == nil {
-		return nil
+		return errs
 	}
-	var errs []error
 
 	for i := range c.Tiers {
 		t := &c.Tiers[i]
@@ -1980,6 +2102,74 @@ func (c *Config) validateCapacity() []error {
 				t.Label, t.Memory, c.Server.MaxMemory))
 		}
 	}
+	return errs
+}
+
+// validateEC2Shapes refuses a tier this node could be given and could not buy.
+//
+// A TIER LARGER THAN EVERY DECLARED SHAPE QUEUES FOREVER WITH NOTHING SAYING WHY.
+// The allocator escrows it happily, because the node's budget covers it — the
+// failure appears only after GitHub has assigned the job, as a launch error on
+// one host. billet already refuses a tier pinned to a host that cannot run its
+// guest OS at load time, for exactly this reason.
+//
+// Only checkable when one file holds both the node and the tiers, which is the
+// single-machine shape. In a fleet the node's file has no tiers, and the launch
+// path's error is what remains — it names the size asked for and every shape
+// declared, so it is actionable wherever it is read.
+func (c *Config) validateEC2Shapes() []error {
+	if c.Node == nil || c.Node.Provider != ProviderEC2 || c.Node.EC2 == nil {
+		return nil
+	}
+
+	shapes := c.Node.EC2.InstanceTypes
+	if len(shapes) == 0 {
+		// Already reported as a missing field; saying it twice helps nobody.
+		return nil
+	}
+
+	var errs []error
+
+	for i := range c.Tiers {
+		t := &c.Tiers[i]
+
+		if !t.AcceptsProvider(ProviderEC2) {
+			continue
+		}
+
+		// A TIER PINNED ELSEWHERE IS NOT THIS NODE'S PROBLEM. It names a different
+		// machine, so the shapes this one may buy say nothing about whether it can
+		// run.
+		if t.Node != "" && t.Node != c.Node.Name {
+			continue
+		}
+
+		fits := false
+
+		for _, shape := range shapes {
+			if shape.VCPU >= t.VCPU && shape.Memory >= t.Memory {
+				fits = true
+
+				break
+			}
+		}
+
+		if fits {
+			continue
+		}
+
+		declared := make([]string, 0, len(shapes))
+		for _, shape := range shapes {
+			declared = append(declared,
+				fmt.Sprintf("%s (%d vCPU, %s)", shape.Type, shape.VCPU, shape.Memory))
+		}
+
+		errs = append(errs, fmt.Errorf(
+			"tier %q requests %d vCPU and %s, which no shape in node.ec2.instance_types can "+
+				"hold (%s); a job on this tier would be admitted and then fail to launch",
+			t.Label, t.VCPU, t.Memory, strings.Join(declared, ", ")))
+	}
+
 	return errs
 }
 

@@ -599,11 +599,11 @@ func TestALaunchMissingSomethingEssentialIsRefused(t *testing.T) {
 
 // THE BOOT SCRIPT IS RUN, NOT PATTERN-MATCHED.
 //
-// The registration reaches the runner through a shell heredoc, and every part of
-// that — the quoted delimiter, the export, the command quoting — is a thing that
-// looks right and can be wrong in a way no substring assertion notices. So the
-// script billet generates is executed by a real /bin/sh, with the command
-// replaced by one that prints what the runner would have read.
+// The registration reaches the runner through a single-quoted shell assignment,
+// and every part of that — the quoting, the export, the command's own argv — is a
+// thing that looks right and can be wrong in a way no substring assertion
+// notices. So the script billet generates is executed by a real /bin/sh, with the
+// command replaced by one that prints what the runner would have read.
 //
 // A truncated or expanded credential means a runner that cannot register, which
 // surfaces as a job that stays queued while every signal says the launch worked.
@@ -789,19 +789,46 @@ func TestListFollowsEveryPage(t *testing.T) {
 	}
 }
 
-// A token that repeats itself is refused rather than looped on forever. A node
-// whose sweep never returns stops reporting its inventory, and the capacity of
-// anything quarantined on it is held until an operator intervenes.
-func TestListRefusesToLoopOnARepeatedToken(t *testing.T) {
-	f := newFakeEC2(t)
-	f.respond = func(string, url.Values) (int, string) {
-		return http.StatusOK, describeReply("same", instanceXML("i-1", "billet-lease-1"))
-	}
+// A PAGINATION TOKEN BILLET HAS ALREADY SEEN ENDS THE WALK.
+//
+// A node whose sweep never returns stops reporting its inventory, and the
+// capacity of anything quarantined on it is held until an operator intervenes.
+//
+// The CYCLE case is the one that matters, and it is why this does not simply
+// compare against the previous token: A, B, A, B repeats nothing consecutively
+// and loops forever. The context is bounded so that a regression fails the test
+// rather than hanging the suite.
+func TestListRefusesToLoopOnATokenItHasSeen(t *testing.T) {
+	for name, tokens := range map[string][]string{
+		"the same token twice": {"same", "same"},
+		"a cycle":              {"a", "b", "a", "b"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newFakeEC2(t)
 
-	p := newTestProvider(t, f, nil)
+			var n int
 
-	if _, err := p.List(t.Context()); err == nil {
-		t.Fatal("List followed a repeating pagination token instead of refusing")
+			f.respond = func(string, url.Values) (int, string) {
+				tok := tokens[n%len(tokens)]
+				n++
+
+				return http.StatusOK, describeReply(tok, instanceXML("i-1", "billet-lease-1"))
+			}
+
+			p := newTestProvider(t, f, nil)
+
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+
+			_, err := p.List(ctx)
+			if err == nil {
+				t.Fatal("List followed a pagination token it had already seen instead of refusing")
+			}
+
+			if !strings.Contains(err.Error(), "pagination token") {
+				t.Errorf("List failed for some other reason than the loop it should refuse: %v", err)
+			}
+		})
 	}
 }
 
@@ -969,10 +996,19 @@ func TestACallThatSucceedsAfterAThrottleSucceeds(t *testing.T) {
 	}
 }
 
-// An instance billet tagged but never named cannot be matched to a lease, so it
-// is reported rather than silently dropped from a list whose readers act on what
-// is missing.
-func TestAnInstanceWithNoNameIsNotSilentlyDropped(t *testing.T) {
+// AN INCOMPLETE INVENTORY MUST NOT BE REPORTED AS A COMPLETE ONE.
+//
+// An instance carrying billet's owner tag but no name is billet's compute that
+// cannot be matched to a lease. Dropping it from the list is the worst available
+// answer, because of what the list is FOR: the control plane frees quarantined
+// capacity for any lease absent from a node's inventory, so a silently shortened
+// list hands back capacity for a machine that is still running.
+//
+// This is the docker backend's rule, arrived at for the same reason — a line it
+// cannot parse fails List rather than being skipped. An earlier version of this
+// function logged a warning and continued, while its own comment claimed it
+// reported. Failing closed is what the comment always said.
+func TestAnIncompleteInventoryIsRefusedRatherThanShortened(t *testing.T) {
 	f := newFakeEC2(t)
 	f.respond = func(string, url.Values) (int, string) {
 		return http.StatusOK, `<DescribeInstancesResponse><reservationSet><item><instancesSet>` +
@@ -984,12 +1020,74 @@ func TestAnInstanceWithNoNameIsNotSilentlyDropped(t *testing.T) {
 	p := newTestProvider(t, f, nil)
 
 	got, err := p.List(t.Context())
+	if err == nil {
+		t.Fatalf("an inventory billet knows is incomplete was returned as authoritative: %+v", got)
+	}
+
+	if !strings.Contains(err.Error(), "i-9") {
+		t.Errorf("the error does not name the instance an operator has to go and find: %v", err)
+	}
+}
+
+// An instance with no ID is the same failure one field over, and the same answer.
+func TestAnInstanceWithNoIDIsRefused(t *testing.T) {
+	f := newFakeEC2(t)
+	f.respond = func(string, url.Values) (int, string) {
+		return http.StatusOK, `<DescribeInstancesResponse><reservationSet><item><instancesSet>` +
+			`<item><instanceId></instanceId><instanceState><name>running</name></instanceState>` +
+			`<tagSet><item><key>Name</key><value>billet-lease-1</value></item>` +
+			`<item><key>sh.billet.owner</key><value>dep-1</value></item></tagSet></item>` +
+			`</instancesSet></item></reservationSet></DescribeInstancesResponse>`
+	}
+
+	p := newTestProvider(t, f, nil)
+
+	if got, err := p.List(t.Context()); err == nil {
+		t.Fatalf("an instance with no id was reported as something billet could destroy: %+v", got)
+	}
+}
+
+// A RETRY MUST NOT ACCUMULATE THE PREVIOUS ATTEMPT'S PARTIAL RESPONSE.
+//
+// encoding/xml APPENDS to slices, and the decode target used to be shared across
+// attempts. So a first attempt that failed partway through unmarshalling — a
+// truncated body, a connection cut mid-response — left rows in the target, and
+// the retry appended a full set to them. DescribeInstances would then report an
+// instance twice, and List feeds a loop that destroys.
+func TestARetryDoesNotAccumulateThePreviousAttemptsRows(t *testing.T) {
+	f := newFakeEC2(t)
+
+	var attempts int
+
+	f.respond = func(action string, _ url.Values) (int, string) {
+		if action != "DescribeInstances" {
+			return http.StatusOK, defaultReply(action)
+		}
+
+		attempts++
+		if attempts == 1 {
+			// A 200 whose body stops mid-document: the decoder fills what it has
+			// read and then fails, which is exactly the state that used to persist.
+			return http.StatusOK, `<DescribeInstancesResponse><reservationSet><item><instancesSet>` +
+				instanceXML("i-1", "billet-lease-1") +
+				instanceXML("i-2", "billet-lease-2")
+		}
+
+		return http.StatusOK, describeReply("",
+			instanceXML("i-1", "billet-lease-1"), instanceXML("i-2", "billet-lease-2"))
+	}
+
+	p := newTestProvider(t, f, nil)
+	p.api.sleep = func(context.Context, time.Duration) error { return nil }
+
+	got, err := p.List(t.Context())
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
 
-	if len(got) != 0 {
-		t.Errorf("an unnamed instance was returned as if it could be matched to a lease: %+v", got)
+	if len(got) != 2 {
+		t.Fatalf("List reported %d instances after a retry, want 2; the first attempt's partial "+
+			"rows were kept: %+v", len(got), got)
 	}
 }
 
@@ -1029,5 +1127,27 @@ func TestAProviderWithoutADeploymentIdentityIsRefused(t *testing.T) {
 	if _, err := New("  ", config.EC2Config{Region: "us-west-2"}); err == nil {
 		t.Fatal("a provider with no owner was built; its List would match another billet's " +
 			"instances")
+	}
+}
+
+// THE ENDPOINT RULE IS RE-APPLIED BY THE CONSTRUCTOR, not left to config
+// validation alone.
+//
+// New is exported, so it cannot assume its configuration came through
+// config.Load — and the rule is that a signed request carrying a session token
+// never goes out in plaintext. Loopback is the exception, which is both billet's
+// existing trust-boundary rule and what lets these tests point at an httptest
+// server.
+func TestAProviderRefusesAPlaintextEndpoint(t *testing.T) {
+	cfg := validEC2Config("http://ec2.us-west-2.amazonaws.com/")
+
+	if _, err := New("dep-1", cfg); err == nil {
+		t.Fatal("a provider was built against a plaintext endpoint, which would send a session " +
+			"token in the clear")
+	}
+
+	// And loopback still works, or every test in this file would be impossible.
+	if _, err := New("dep-1", validEC2Config("http://127.0.0.1:9/")); err != nil {
+		t.Errorf("a loopback endpoint was refused: %v", err)
 	}
 }
