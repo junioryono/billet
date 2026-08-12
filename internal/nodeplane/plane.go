@@ -810,12 +810,22 @@ var ErrSuperseded = errors.New("nodeplane: another process is registered as this
 // Fenced by the wire rather than by an epoch: this route refuses a superseded
 // incarnation, which is a stronger statement than the registration epoch — it is
 // about the process, not the registration.
-func (p *Plane) ReconcileInventory(ctx context.Context, node string, running []string) (int, error) {
+func (p *Plane) ReconcileInventory(
+	ctx context.Context, node, incarnation string, running []string,
+) (int, error) {
 	if p.registrar == nil {
 		return 0, nil
 	}
 
-	epoch, err := p.LedgerEpoch(node)
+	// THE INCARNATION IS CHECKED AND THE EPOCH CAPTURED UNDER ONE LOCK.
+	//
+	// The route wrapper checks the incarnation and then this took the mutex
+	// again, which is a check-then-act rather than a fence: a replacement can
+	// register in the gap, and the stale report is then accepted under the
+	// REPLACEMENT's epoch — freeing capacity for a container the newer
+	// incarnation had just vouched for. Reading them together is what makes the
+	// epoch belong to the process that sent the inventory.
+	epoch, err := p.epochFor(node, incarnation)
 	if err != nil {
 		return 0, err
 	}
@@ -823,14 +833,21 @@ func (p *Plane) ReconcileInventory(ctx context.Context, node string, running []s
 	return p.registrar.ResolveQuarantineFor(ctx, node, running, epoch)
 }
 
-// LedgerEpoch is the fencing token the plane last recorded for a node.
-func (p *Plane) LedgerEpoch(node string) (int64, error) {
+// epochFor is the ledger epoch of the node AS SEEN BY one incarnation, refusing
+// a caller that is no longer the current process.
+func (p *Plane) epochFor(node, incarnation string) (int64, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	n, ok := p.nodes[node]
 	if !ok {
 		return 0, fmt.Errorf("%w: %s", ErrUnregistered, node)
+	}
+
+	if n.incarnation != "" && incarnation != "" && n.incarnation != incarnation {
+		return 0, fmt.Errorf(
+			"%w: node %q is registered by process %s and this report came from %s",
+			ErrSuperseded, node, n.incarnation, incarnation)
 	}
 
 	return n.ledgerEpoch, nil

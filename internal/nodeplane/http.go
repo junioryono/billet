@@ -94,6 +94,10 @@ func RequireClientCert() HandlerOption {
 // An interface rather than the allocator, so the wire depends on the two
 // questions it asks rather than on the ledger.
 type Revocations interface {
+	// CertRevokedFor answers by serial AND by the cutoff the node carries, so a
+	// credential billet never recorded — one from before it tracked serials, or
+	// an earlier certificate for a name that was issued twice — is still refused.
+	CertRevokedFor(ctx context.Context, node, serial string, notBefore time.Time) (bool, error)
 	CertRevoked(ctx context.Context, serial string) (bool, error)
 	RecordIssuedCert(ctx context.Context, cert alloc.IssuedCert) error
 
@@ -482,9 +486,10 @@ func (h *handler) notRevoked(w http.ResponseWriter, r *http.Request, name string
 		return true
 	}
 
-	serial := wirecert.Serial(r.TLS.PeerCertificates[0])
+	leaf := r.TLS.PeerCertificates[0]
+	serial := wirecert.Serial(leaf)
 
-	revoked, err := h.revocations.CertRevoked(r.Context(), serial)
+	revoked, err := h.revocations.CertRevokedFor(r.Context(), name, serial, leaf.NotBefore)
 	if err != nil {
 		h.log.Error("could not check whether a node certificate has been revoked; refusing "+
 			"the request rather than assuming it is good",
@@ -1016,7 +1021,8 @@ func (h *handler) reconcile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	freed, err := h.plane.ReconcileInventory(r.Context(), node, req.Instances)
+	freed, err := h.plane.ReconcileInventory(
+		r.Context(), node, r.Header.Get(nodeapi.HeaderIncarnation), req.Instances)
 	if err != nil {
 		writeStoreErr(w, err)
 

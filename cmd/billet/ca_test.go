@@ -701,8 +701,6 @@ func TestRevocationReachesACertificateAdmittedBeforeSerialsWereTracked(t *testin
 		t.Fatalf("allocator: %v", err)
 	}
 
-	defer closeDB()
-
 	// WHAT AN OLDER BILLET LEFT BEHIND: the admission is recorded, the serial is
 	// not.
 	if _, err := a.RecordIssued(t.Context(), "epyc-1",
@@ -720,19 +718,21 @@ func TestRevocationReachesACertificateAdmittedBeforeSerialsWereTracked(t *testin
 			len(live))
 	}
 
-	if err := backfillIssuedCerts(t.Context(), a); err != nil {
-		t.Fatalf("backfill: %v", err)
+	// THROUGH THE COMMAND, not the helper it calls. Driving backfillIssuedCerts
+	// directly would leave this test green with the production call deleted,
+	// which is the wiring it exists to protect.
+	closeDB()
+
+	if err := cmdNodesRevoke(t.Context(), []string{"epyc-1", "--config", cfg}); err != nil {
+		t.Fatalf("billet nodes revoke: %v", err)
 	}
 
-	revoked, err := a.RevokeNode(t.Context(), "epyc-1", "stolen")
+	a, closeDB, err = controlPlaneAllocator(t.Context(), cfg)
 	if err != nil {
-		t.Fatalf("RevokeNode: %v", err)
+		t.Fatalf("reopen: %v", err)
 	}
 
-	if len(revoked) != 1 || revoked[0].Serial != wirecert.Serial(leaf) {
-		t.Fatalf("revoking the node took back %+v; the certificate it is actually holding is "+
-			"serial %s", revoked, wirecert.Serial(leaf))
-	}
+	defer closeDB()
 
 	gone, err := a.CertRevoked(t.Context(), wirecert.Serial(leaf))
 	if err != nil {
@@ -740,7 +740,8 @@ func TestRevocationReachesACertificateAdmittedBeforeSerialsWereTracked(t *testin
 	}
 
 	if !gone {
-		t.Error("the certificate the machine presents is still accepted after its node was revoked")
+		t.Error("the certificate the machine presents is still accepted after `billet nodes " +
+			"revoke`; an upgraded deployment cannot take back what it admitted")
 	}
 }
 

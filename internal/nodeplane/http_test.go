@@ -1116,3 +1116,75 @@ func TestARegistrationPassesOnWhatTheHostReportsRunning(t *testing.T) {
 		})
 	}
 }
+
+// THE RECONCILE ROUTE EXISTS AND CARRIES THE INVENTORY, which the node-side test
+// cannot show: it injects the allocator directly, so removing the HTTP route or
+// making the client method a no-op leaves it green.
+func TestReconcileReachesTheLedgerOverTheWire(t *testing.T) {
+	t.Parallel()
+
+	reg := &fakeRegistrar{}
+
+	log := slog.New(slog.DiscardHandler)
+	p := nodeplane.New(log, deployment, time.Minute, nodeplane.WithRegistrar(reg))
+	srv := httptest.NewServer(nodeplane.Handler(log, p, &fakeStore{}, nil))
+
+	t.Cleanup(srv.Close)
+
+	c := dial(t, srv.URL)
+
+	if _, err := c.Reconcile(t.Context(), "n1", []string{"l1", "l2"}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	called, ids := reg.reconciliation()
+
+	if !called {
+		t.Fatal("the report never reached the ledger, so quarantined capacity is reclaimed " +
+			"only at registration — which is the one moment it cannot work")
+	}
+
+	if !slices.Equal(ids, []string{"l1", "l2"}) {
+		t.Errorf("the ledger was told this host runs %v", ids)
+	}
+
+	// AND AN EMPTY REPORT IS STILL A REPORT: a host running nothing is exactly
+	// the one whose quarantined capacity should come back.
+	if _, err := c.Reconcile(t.Context(), "n1", nil); err != nil {
+		t.Fatalf("empty reconcile: %v", err)
+	}
+
+	_, ids = reg.reconciliation()
+
+	if len(ids) != 0 {
+		t.Errorf("an empty report was recorded as %v", ids)
+	}
+}
+
+// AND A SUPERSEDED PROCESS CANNOT RECONCILE, because its inventory describes a
+// machine somebody else now owns.
+func TestASupersededIncarnationCannotReconcile(t *testing.T) {
+	t.Parallel()
+
+	reg := &fakeRegistrar{}
+
+	log := slog.New(slog.DiscardHandler)
+	p := nodeplane.New(log, deployment, time.Minute, nodeplane.WithRegistrar(reg))
+	srv := httptest.NewServer(nodeplane.Handler(log, p, &fakeStore{}, nil))
+
+	t.Cleanup(srv.Close)
+
+	old := dial(t, srv.URL)
+
+	// A second process takes the name.
+	dial(t, srv.URL)
+
+	if _, err := old.Reconcile(t.Context(), "n1", nil); err == nil {
+		t.Fatal("a superseded process reported an inventory for a node it no longer owns; " +
+			"its stale list can free capacity the current one is using")
+	}
+
+	if called, _ := reg.reconciliation(); called {
+		t.Error("the stale report reached the ledger anyway")
+	}
+}
