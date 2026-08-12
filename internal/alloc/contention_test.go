@@ -128,6 +128,10 @@ func TestEveryReadOnlyOperationRunsWhileTheWriterSlotIsHeld(t *testing.T) {
 		// what makes it a fair test of the read: with the lookup reverted to a
 		// write transaction it contends before answering.
 		{"Reconcile", func() error { _, err := a.Reconcile(read, "no-such-host", nil); return err }},
+		// Unexported and reached only from tests today, but it scans an unbounded
+		// table, so it is exactly the shape that must not hold the writer slot if
+		// anything ever calls it in anger.
+		{"storedJoinTokenKeys", func() error { _, err := a.storedJoinTokenKeys(read); return err }},
 	} {
 		err := tc.run()
 
