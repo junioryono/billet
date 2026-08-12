@@ -2289,19 +2289,41 @@ func (l *Listener) launch(ctx context.Context, lease *alloc.Lease, job Job) erro
 		"tier", l.tier, "request", job.RequestID, "run", job.RunID,
 		"lease", lease.ID, "error", err)
 
-	// Best effort, and deliberately not fatal. The launch already failed; failing
-	// the listener as well would take every tier down over one job that GitHub
-	// will simply reassign.
-	if relErr := l.alloc.Release(ctx, lease.ID, lease.Epoch, alloc.PhaseFailed); relErr != nil {
+	// Not fatal. The launch already failed; failing the listener as well would
+	// take every tier down over one job that GitHub will simply reassign.
+	relErr := l.alloc.Release(ctx, lease.ID, lease.Epoch, alloc.PhaseFailed)
+	if relErr != nil {
 		l.log.Warn("could not release the lease of a job that failed to start",
 			"tier", l.tier, "lease", lease.ID, "error", relErr)
 	}
 
-	l.mu.Lock()
-	delete(l.running, job.RequestID)
-	l.mu.Unlock()
+	// AND THE REFERENCE IS ONLY DROPPED ONCE THE LEASE IS SETTLED.
+	//
+	// This map is the only place the lease is still named. Forgetting it after a
+	// release that did NOT land — the ledger is busy, the context went away —
+	// leaves nothing heartbeating it and nothing that shutdown's releaseAll can
+	// see, so the ledger goes on charging capacity for a container that never
+	// started until the reaper arrives a TTL later. Keeping it costs a retry;
+	// dropping it costs the capacity.
+	if releaseSettled(relErr) {
+		l.mu.Lock()
+		delete(l.running, job.RequestID)
+		l.mu.Unlock()
+	}
 
 	return nil
+}
+
+// releaseSettled reports whether a release attempt ended the lease's claim on
+// capacity, one way or another.
+//
+// A CONCLUSIVE ERROR IS AS GOOD AS SUCCESS, and telling the two apart from an
+// outage is the whole point. ErrFenced means somebody else already reclaimed it
+// and this caller's epoch is stale; ErrLeaseNotFound means it is gone or already
+// terminal. Neither can be improved by holding a reference and trying again —
+// but a busy database or a cancelled context can.
+func releaseSettled(err error) bool {
+	return err == nil || errors.Is(err, alloc.ErrFenced) || errors.Is(err, alloc.ErrLeaseNotFound)
 }
 
 // complete releases the lease a finished job was running on.
@@ -2466,10 +2488,20 @@ func (l *Listener) releaseAll(ctx context.Context, destroyed map[int64]bool) {
 	l.acquiring = make(map[int64]*promise)
 	l.mu.Unlock()
 
+	// WHAT DID NOT LAND IS PUT BACK, rather than dropped on the floor. These were
+	// cleared above so nothing new could take them mid-shutdown; a release that
+	// failed for a reason a retry could fix has to stay somewhere the next pass —
+	// or a supervisor's restart — can still find it.
+	var stuck []*alloc.Lease
+
 	release := func(lease *alloc.Lease) {
 		if err := l.alloc.Release(ctx, lease.ID, lease.Epoch, alloc.PhaseDone); err != nil {
 			l.log.Warn("could not release escrowed capacity",
 				"tier", l.tier, "lease", lease.ID, "error", err)
+
+			if !releaseSettled(err) {
+				stuck = append(stuck, lease)
+			}
 		}
 	}
 
@@ -2514,5 +2546,16 @@ func (l *Listener) releaseAll(ctx context.Context, destroyed map[int64]bool) {
 	// would strand it until the reaper.
 	for _, lease := range promised {
 		release(lease)
+	}
+
+	// WHAT DID NOT LAND GOES BACK, rather than onto the floor. held and acquiring
+	// were cleared above so nothing new could take them mid-shutdown, and a
+	// release that failed for a reason a retry could fix has to stay somewhere
+	// the next pass — or a supervisor's restart — can still find it. Anything
+	// settled is already gone from the ledger's point of view.
+	if len(stuck) > 0 {
+		l.mu.Lock()
+		l.held = append(l.held, stuck...)
+		l.mu.Unlock()
 	}
 }

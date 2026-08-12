@@ -4476,3 +4476,40 @@ func TestRunStartsTheCleanupLoop(t *testing.T) {
 		t.Fatal(failure)
 	}
 }
+
+// A RELEASE THAT DID NOT LAND IS NOT THE SAME AS ONE THAT DID.
+//
+// The lease is dropped from the listener's own map once it is released, and that
+// map is the only place it is still named: nothing else heartbeats it, and
+// shutdown's releaseAll cannot see what is not there. Forgetting it after a
+// release that FAILED therefore leaves the ledger charging capacity for a
+// container that never started, until the reaper arrives a TTL later.
+//
+// Two errors are as good as success and must not be retried forever: ErrFenced
+// means somebody already reclaimed the lease and this caller's epoch is stale,
+// and ErrLeaseNotFound means it is gone or already terminal. Neither improves by
+// holding a reference. A busy ledger or a cancelled context does.
+func TestOnlyASettledReleaseDropsTheLease(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name    string
+		err     error
+		settled bool
+	}{
+		{"released", nil, true},
+		{"already reclaimed by the reaper", alloc.ErrFenced, true},
+		{"gone or already terminal", alloc.ErrLeaseNotFound, true},
+		{"wrapped, because callers wrap", fmt.Errorf("release: %w", alloc.ErrFenced), true},
+		{"the ledger was busy", errors.New("database is locked"), false},
+		{"the context went away", context.Canceled, false},
+	} {
+		if got := releaseSettled(tc.err); got != tc.settled {
+			t.Errorf("%s: releaseSettled = %v, want %v — %s", tc.name, got, tc.settled,
+				map[bool]string{
+					true:  "this lease will be retried forever",
+					false: "this lease is forgotten while the ledger still charges for it",
+				}[got])
+		}
+	}
+}
