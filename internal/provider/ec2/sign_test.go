@@ -109,11 +109,17 @@ func vectorRequest(t *testing.T) *http.Request {
 
 // A RE-SIGN MUST NOT SIGN THE PREVIOUS SIGNATURE.
 //
-// Reachable rather than theoretical: a throttled call is retried, and the retry
-// re-signs a request object that already carries the first attempt's
-// Authorization header. Including it in the canonical headers makes the second
-// attempt fail with a 403 while the first failed with a throttle, so the retry
-// looks like a credential problem and the real cause disappears.
+// NOT A PATH THE CLIENT TAKES TODAY, and saying otherwise would be worse than
+// saying nothing: `call` builds a fresh request for every attempt, precisely
+// because the signature covers a timestamp and credentials that can change
+// between them. So a retry never presents a request that is already signed.
+//
+// This is kept because the property belongs to the SIGNER rather than to its
+// current caller — signing is a general operation and the obvious future caller
+// is one that re-signs in place — and because the failure it prevents is opaque:
+// a request carrying its own previous Authorization header is refused with a bare
+// 403, so a retry after a throttle would look like a credential problem and the
+// real cause would disappear.
 func TestSigningTwiceProducesTheSameSignature(t *testing.T) {
 	creds := Credentials{AccessKeyID: vectorKey, SecretAccessKey: vectorSecret}
 

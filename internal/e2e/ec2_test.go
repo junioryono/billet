@@ -46,8 +46,10 @@ type fakeCloud struct {
 	launched map[string]string
 	// terminated records the ids handed to TerminateInstances.
 	terminated []string
-	// live is what DescribeInstances reports, keyed by id.
+	// live is what DescribeInstances reports as running, keyed by id.
 	live map[string]string
+	// shuttingDown is what has been asked to terminate but has not finished.
+	shuttingDown map[string]string
 	// userData holds the boot script of the last launch, decoded.
 	userData string
 
@@ -57,7 +59,11 @@ type fakeCloud struct {
 func newFakeCloud(t *testing.T) *fakeCloud {
 	t.Helper()
 
-	f := &fakeCloud{launched: map[string]string{}, live: map[string]string{}}
+	f := &fakeCloud{
+		launched:     map[string]string{},
+		live:         map[string]string{},
+		shuttingDown: map[string]string{},
+	}
 
 	f.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
@@ -100,8 +106,14 @@ func newFakeCloud(t *testing.T) *fakeCloud {
 				`</item></instancesSet></RunInstancesResponse>`
 
 		case "TerminateInstances":
+			// ASYNCHRONOUS, LIKE THE REAL ONE. TerminateInstances returns when the
+			// request is ACCEPTED; the instance then sits in shutting-down until
+			// EC2 finishes with it. A fake that deleted the row here would make
+			// billet look synchronous and hide what the inventory reports in the
+			// window that actually exists.
 			id := params.Get("InstanceId.1")
 			f.terminated = append(f.terminated, id)
+			f.shuttingDown[id] = f.live[id]
 			delete(f.live, id)
 
 			reply = `<TerminateInstancesResponse/>`
@@ -114,6 +126,13 @@ func newFakeCloud(t *testing.T) *fakeCloud {
 			for id, name := range f.live {
 				b.WriteString(`<item><instanceId>` + id + `</instanceId>` +
 					`<instanceState><name>running</name></instanceState><tagSet>` +
+					`<item><key>Name</key><value>` + name + `</value></item>` +
+					`</tagSet></item>`)
+			}
+
+			for id, name := range f.shuttingDown {
+				b.WriteString(`<item><instanceId>` + id + `</instanceId>` +
+					`<instanceState><name>shutting-down</name></instanceState><tagSet>` +
 					`<item><key>Name</key><value>` + name + `</value></item>` +
 					`</tagSet></item>`)
 			}
@@ -146,6 +165,14 @@ func (f *fakeCloud) terminatedIDs() []string {
 	defer f.mu.Unlock()
 
 	return append([]string(nil), f.terminated...)
+}
+
+// finishTerminating is EC2 completing a shutdown on its own clock.
+func (f *fakeCloud) finishTerminating() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.shuttingDown = map[string]string{}
 }
 
 func (f *fakeCloud) bootScript() string {
@@ -324,15 +351,34 @@ func TestAJobReachesACloudInstance(t *testing.T) {
 		t.Fatalf("terminated %v, want the instance that was started (%s)", got, id)
 	}
 
-	// AND NOTHING IS LEFT RUNNING, which is the half a terminate call alone does
-	// not prove: an instance still in the inventory holds its lease's capacity.
-	after, err := s.runner.Instances(t.Context())
+	// A TERMINATE IS A REQUEST, NOT A COMPLETION, and the inventory says so.
+	//
+	// Unlike `docker rm --force`, TerminateInstances returns once the request is
+	// accepted and the instance sits in shutting-down for a while afterwards.
+	// billet keeps reporting it for that window — `shutting-down` counts as
+	// running — and that is the SAFE direction: the capacity stays charged to this
+	// host until the machine is provably gone, which is the same rule custody
+	// follows everywhere else.
+	during, err := s.runner.Instances(t.Context())
 	if err != nil {
 		t.Fatalf("Instances after destroy: %v", err)
 	}
 
+	if len(during) != 1 || during[0] != lease.ID {
+		t.Errorf("this host reports %v while its instance is still shutting down, want the "+
+			"lease to stay accounted for until the machine is gone", during)
+	}
+
+	// And once EC2 finishes, it leaves the inventory and the capacity is free.
+	s.cloud.finishTerminating()
+
+	after, err := s.runner.Instances(t.Context())
+	if err != nil {
+		t.Fatalf("Instances after termination completed: %v", err)
+	}
+
 	if len(after) != 0 {
-		t.Errorf("this host still reports %v running after the job finished", after)
+		t.Errorf("this host still reports %v after its instance was gone", after)
 	}
 }
 

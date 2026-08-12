@@ -2,12 +2,38 @@ package main
 
 import (
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
 
 	"github.com/junioryono/billet/internal/config"
 )
+
+// fakeEC2 answers DescribeInstances, so the pre-flight's live call has somewhere
+// to go that is not somebody's AWS account.
+func fakeEC2(t *testing.T, status int) string {
+	t.Helper()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(status)
+
+		body := `<DescribeInstancesResponse><reservationSet/></DescribeInstancesResponse>`
+		if status != http.StatusOK {
+			body = `<Response><Errors><Error><Code>UnauthorizedOperation</Code>` +
+				`<Message>no</Message></Error></Errors></Response>`
+		}
+
+		if _, err := io.WriteString(w, body); err != nil {
+			t.Errorf("write: %v", err)
+		}
+	}))
+
+	t.Cleanup(srv.Close)
+
+	return srv.URL
+}
 
 // capture redirects stdout for the duration of fn and returns what was written.
 //
@@ -60,6 +86,7 @@ func TestTheCloudPreflightNamesTheIdentityAndNotTheSecret(t *testing.T) {
 
 	cfg := &config.EC2Config{
 		Region:           "us-west-2",
+		Endpoint:         fakeEC2(t, http.StatusOK),
 		SubnetID:         "subnet-0abc",
 		SecurityGroupIDs: []string{"sg-0abc"},
 		InstanceTypes:    []config.EC2InstanceType{{Type: "c7i.2xlarge", VCPU: 8, Memory: 16 * config.GiB}},
@@ -98,6 +125,7 @@ func TestTheCloudPreflightSaysWhatSpotCosts(t *testing.T) {
 
 	cfg := &config.EC2Config{
 		Region:                    "us-west-2",
+		Endpoint:                  fakeEC2(t, http.StatusOK),
 		SubnetID:                  "subnet-0abc",
 		SecurityGroupIDs:          []string{"sg-0abc"},
 		UntrustedSecurityGroupIDs: []string{"sg-fork"},
@@ -120,5 +148,36 @@ func TestTheCloudPreflightSaysWhatSpotCosts(t *testing.T) {
 	// warning that never goes away is one nobody reads.
 	if strings.Contains(out, "untrusted work will be refused") {
 		t.Errorf("untrusted work was reported as refused despite having its own group:\n%s", out)
+	}
+}
+
+// RESOLVING A CREDENTIAL IS NOT THE SAME AS BEING ABLE TO USE ONE.
+//
+// An expired key, a key for the wrong account, or a role without ec2 permissions
+// all resolve perfectly and then fail on the first job of the day, with a 403
+// that names neither. The pre-flight uses the credentials it just reported, so
+// what is proved is what was named.
+func TestTheCloudPreflightFailsWhenTheCredentialsCannotBeUsed(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "secret")
+
+	cfg := &config.EC2Config{
+		Region:           "us-west-2",
+		Endpoint:         fakeEC2(t, http.StatusForbidden),
+		SubnetID:         "subnet-0abc",
+		SecurityGroupIDs: []string{"sg-0abc"},
+		InstanceTypes:    []config.EC2InstanceType{{Type: "c7i.2xlarge", VCPU: 8, Memory: 16 * config.GiB}},
+	}
+
+	var err error
+
+	capture(t, func() { err = checkEC2Credentials(t.Context(), cfg) })
+
+	if err == nil {
+		t.Fatal("credentials that the api refuses were reported as usable")
+	}
+
+	if !strings.Contains(err.Error(), "us-west-2") {
+		t.Errorf("the error does not say where the call failed: %v", err)
 	}
 }

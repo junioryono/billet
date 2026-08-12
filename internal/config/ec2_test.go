@@ -253,3 +253,127 @@ func TestAValidCloudNodeLoads(t *testing.T) {
 		t.Errorf("instance type = %+v, want c7i.2xlarge/8/16GiB", got)
 	}
 }
+
+// A CREDENTIAL-BEARING REQUEST MUST NOT GO OUT IN PLAINTEXT.
+//
+// `endpoint` exists for a VPC interface endpoint or a non-commercial partition,
+// and it was accepted as anything url.Parse tolerates — including `http://`. The
+// secret access key never crosses the wire, but a SESSION TOKEN and a replayable
+// signed RunInstances do, so an on-path observer gets both.
+//
+// LOOPBACK IS THE EXCEPTION, and it is billet's existing rule rather than a new
+// one: a loopback wire has no certificates at all, because the trust boundary is
+// the machine. It is also what lets a test point this at an httptest server.
+func TestACloudEndpointMustBeEncryptedUnlessItIsLoopback(t *testing.T) {
+	for name, tc := range map[string]struct{ endpoint, want string }{
+		"plaintext to a host":   {endpoint: "http://ec2.us-west-2.amazonaws.com/", want: "https"},
+		"plaintext to a domain": {endpoint: "http://vpce-abc.ec2.us-west-2.vpce.amazonaws.com/", want: "https"},
+		"no scheme":             {endpoint: "ec2.us-west-2.amazonaws.com", want: "https"},
+		"no host":               {endpoint: "https:///v1", want: "host"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := loadErr(t, cloudConfig(t, "    region: us-west-2\n",
+				"    region: us-west-2\n    endpoint: "+tc.endpoint+"\n"))
+
+			if !strings.Contains(got, tc.want) {
+				t.Errorf("the error does not mention %q: %s", tc.want, got)
+			}
+		})
+	}
+
+	for name, endpoint := range map[string]string{
+		"https":               "https://ec2.us-west-2.amazonaws.com/",
+		"a vpc endpoint":      "https://vpce-abc.ec2.us-west-2.vpce.amazonaws.com/",
+		"loopback by address": "http://127.0.0.1:44301/",
+		"loopback by name":    "http://localhost:44301/",
+		"loopback over ipv6":  "http://[::1]:44301/",
+	} {
+		t.Run(name, func(t *testing.T) {
+			body := cloudConfig(t, "    region: us-west-2\n",
+				"    region: us-west-2\n    endpoint: "+endpoint+"\n")
+
+			if _, err := Load(writeConfig(t, body)); err != nil {
+				t.Errorf("endpoint %q was rejected: %v", endpoint, err)
+			}
+		})
+	}
+}
+
+// AN EMPTY STRING IS NOT A SECURITY GROUP, and on the untrusted list it is worse
+// than a missing key: `Accepts` admits fork pull-request work as soon as the list
+// is non-empty, so a list holding one empty string opens the backend to untrusted
+// code with no network actually described for it.
+func TestACloudNodeRefusesAnEmptySecurityGroup(t *testing.T) {
+	for name, tc := range map[string]struct{ old, replacement string }{
+		"trusted": {
+			old:         "    security_group_ids: [sg-0abc]\n",
+			replacement: "    security_group_ids: [\"\"]\n",
+		},
+		"untrusted": {
+			old:         "    security_group_ids: [sg-0abc]\n",
+			replacement: "    security_group_ids: [sg-0abc]\n    untrusted_security_group_ids: [\"  \"]\n",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := loadErr(t, cloudConfig(t, tc.old, tc.replacement))
+
+			if !strings.Contains(got, "security_group_ids") {
+				t.Errorf("the error does not name the field: %s", got)
+			}
+		})
+	}
+}
+
+// NORMALIZED BEFORE ANYTHING USES THEM, the way node names already are.
+//
+// Validation trimmed these values to CHECK them and the rest of billet then used
+// the raw ones — so `region: "  us-west-2  "` passed the shape check and was
+// signed with the padding, which is a 403 naming nothing. YAML strips whitespace
+// from a plain scalar but keeps it inside quotes, so this is reachable from a
+// perfectly ordinary-looking file.
+func TestCloudValuesAreNormalizedBeforeTheyAreUsed(t *testing.T) {
+	body := cloudConfig(t, "    region: us-west-2\n", "    region: \"  us-west-2  \"\n")
+	body = strings.Replace(body, "    subnet_id: subnet-0abc\n",
+		"    subnet_id: \"  subnet-0abc \"\n", 1)
+	body = strings.Replace(body, "      - type: c7i.2xlarge\n", "      - type: \" c7i.2xlarge \"\n", 1)
+
+	cfg, err := Load(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if got := cfg.Node.EC2.Region; got != "us-west-2" {
+		t.Errorf("region = %q, want it trimmed before it reaches the signer", got)
+	}
+
+	if got := cfg.Node.EC2.SubnetID; got != "subnet-0abc" {
+		t.Errorf("subnet_id = %q, want it trimmed", got)
+	}
+
+	if got := cfg.Node.EC2.InstanceTypes[0].Type; got != "c7i.2xlarge" {
+		t.Errorf("instance type = %q, want it trimmed", got)
+	}
+}
+
+// A TIER THAT NO DECLARED SHAPE CAN HOLD QUEUES FOREVER WITH NOTHING SAYING WHY.
+//
+// The allocator will escrow it happily — the node's budget covers it — and the
+// failure appears only after GitHub has assigned the job, as a launch error on
+// one host. billet already refuses a tier pinned to a host that cannot run its
+// guest OS at load time for exactly this reason.
+func TestATierNoDeclaredShapeCanHoldIsRefusedAtLoad(t *testing.T) {
+	body := cloudConfig(t, "", "")
+	// The tiers in validConfig pin firecracker; make one reachable on this node
+	// and larger than every shape it declares.
+	body = strings.Replace(body,
+		"  - label: billet-8vcpu-ubuntu-2404\n    provider: firecracker\n    vcpu: 8\n",
+		"  - label: billet-8vcpu-ubuntu-2404\n    provider: ec2\n    vcpu: 32\n", 1)
+
+	got := loadErr(t, body)
+
+	for _, want := range []string{"billet-8vcpu-ubuntu-2404", "instance_types"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the error does not mention %q: %s", want, got)
+		}
+	}
+}

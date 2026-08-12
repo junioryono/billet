@@ -1787,12 +1787,32 @@ func checkEC2Credentials(ctx context.Context, cfg *config.EC2Config) error {
 			"launch anything: %w", err)
 	}
 
+	// RESOLVING IS NOT WORKING, so the credentials are then USED. One read-only
+	// DescribeInstances proves the region and endpoint answer and that this
+	// identity is permitted to ask — which is the difference between a config that
+	// parses and a node that can do its job, and the same distinction
+	// checkPrivateKey makes by parsing the key rather than stat-ing it.
+	//
+	// The same credentials that were just reported, so what is proved is what was
+	// named rather than whatever a second resolution might return.
+	if err := ec2.CheckReachable(ctx, *cfg,
+		ec2.WithCredentials(ec2.StaticCredentials(creds))); err != nil {
+		return fmt.Errorf("node.ec2: credentials for %s resolved but could not call the ec2 api "+
+			"in %s: %w", creds.AccessKeyID, cfg.Region, err)
+	}
+
 	// THE ACCESS KEY ID AND NOTHING ELSE. It is an identifier rather than a
 	// secret, and printing it is the difference between "billet is using the wrong
 	// role" and an operator staring at a working config. The secret and the
 	// session token are never rendered anywhere.
-	fmt.Printf("aws      %s in %s, subnet %s, %d instance shape(s), credentials %s\n",
+	fmt.Printf("aws      %s in %s, subnet %s, %d instance shape(s), credentials %s (can describe)\n",
 		spotLabel(cfg.Spot), cfg.Region, cfg.SubnetID, len(cfg.InstanceTypes), creds.AccessKeyID)
+
+	// SAID, BECAUSE THE CHECK IS NARROWER THAN IT LOOKS. A read-only call says
+	// nothing about permission to LAUNCH, and an operator who reads "ok" and then
+	// watches every job fail on an IAM denial has been misled by this line.
+	fmt.Printf("         (describe only — launching also needs ec2:RunInstances, " +
+		"ec2:TerminateInstances and ec2:CreateTags)\n")
 
 	// SAID OUT LOUD RATHER THAN INFERRED FROM AN ABSENT KEY. A deployment that
 	// expected to run fork pull requests on rented machines and finds them queuing

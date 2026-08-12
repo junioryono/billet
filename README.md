@@ -212,11 +212,7 @@ built. What works **today**:
 | Release pipeline | Tagged releases with checksums, `.deb`/`.rpm` with systemd units, and the install script — **built and never yet run: there are no tags, so no release exists to install.** Build from source until there is one |
 | Multi-backend tiers | One label can name several providers, and the preference ORDER decides: the control plane picks the host when the job is admitted, walking the tier's list most-preferred-first. With docker and ec2 both built, `[docker, ec2]` is now a fallback that can actually be taken — on paper. The bare-metal half of the intended pair is still Firecracker ([#32](https://github.com/junioryono/billet/issues/32)) |
 
-**Not built:** Firecracker and Apple Silicon providers; the cache; sticky disks; observability; the
-dashboard. A **cost policy** is now mostly a consequence rather than a feature — an ec2 node has to
-declare `max_vcpu` and `max_memory`, the allocator never buys past them, and provider order decides
-that home fills first — but nothing yet reacts to a PRICE, and nothing drains an instance that AWS is
-about to reclaim.
+**Not built:** Firecracker and Apple Silicon providers; the cache; sticky disks; observability; the dashboard. A **cost policy** is now mostly a consequence rather than a feature — an ec2 node has to declare `max_vcpu` and `max_memory`, the allocator never buys past them, and provider order decides that home fills first — but nothing yet reacts to a PRICE ([#44](https://github.com/junioryono/billet/issues/44)), and nothing drains an instance that AWS is about to reclaim ([#41](https://github.com/junioryono/billet/issues/41)).
 
 **billet runs a fleet, with one thing still missing before it is worth having one.** Capacity is a
 figure per machine, so hosts of different sizes can be described and a tier advertises only what its
@@ -401,12 +397,7 @@ Read this before pointing `billet` at anything.
 **Do not use self-hosted runners with public repositories.** This is
 [GitHub's own guidance](https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/manage-access),
 not ours. Fork pull requests do not receive your secrets, but they *do* get arbitrary code execution
-on your hardware. `billet` is *designed* to isolate jobs in microVMs, which helps — but **on your own
-hardware the only provider is Docker, which shares the host kernel**, so what you actually get is
-container isolation. The `ec2` provider does give each job its own machine, and will run fork
-pull-request work for that reason once you have described a security group for it — that is an
-isolation boundary you are renting, not one you have. Even once Firecracker lands it will not make
-running untrusted code on your own machine safe. Private repos with trusted contributors are the intended use case.
+on your hardware. `billet` is *designed* to isolate jobs in microVMs, which helps — but **on your own hardware the only provider is Docker, which shares the host kernel**, so what you actually get is container isolation. The `ec2` provider does give each job its own machine, and will run fork pull-request work for that reason once you have described a security group for it — that is an isolation boundary you are renting, not one you have. Even once Firecracker lands it will not make running untrusted code on your own machine safe. Private repos with trusted contributors are the intended use case.
 
 **Caches are a deliberate cross-job channel.** A job that writes a secret into a cached directory
 persists it for later jobs to read. Trust classes are *designed* to control who may publish a cache —
