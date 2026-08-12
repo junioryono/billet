@@ -34,22 +34,18 @@ var ErrUnregistered = errors.New("nodeplane: node is not registered")
 
 // ErrRefused means a registration was understood and rejected on its merits.
 //
-// PERMANENT, AND THAT IS THE DISTINCTION THAT MATTERS. A node told this stops
-// rather than retrying, so it must never carry a failure that could heal. A
-// protocol version mismatch and a foreign deployment identity qualify: they will
-// be refused identically forever. A ledger that could not write the node row
-// does NOT — that is an outage, and a node that gave up on it would stay down
-// after the database came back.
+// PERMANENT, which is the distinction that matters: a node told this stops rather
+// than retrying, so it must never carry a failure that could heal. A version
+// mismatch and a foreign deployment qualify; a ledger that could not write the node
+// row does not — that is an outage.
 var ErrRefused = errors.New("nodeplane: registration refused")
 
 // ErrTakeCustody answers a result for a launch the plane stopped waiting for.
 //
-// THE REPORT IS NOT REJECTED, IT IS REDIRECTED. The node did the work and told
-// the truth; it is simply later than the command timeout, and by then the plane
-// had already told the listener that this lease was the node's. Answering 204
-// would leave the container running under a lease NOBODY renews — the listener
-// stopped because it was told custody, and the node never learned it had any.
-// The reaper resells that capacity a TTL later.
+// THE REPORT IS NOT REJECTED, IT IS REDIRECTED. The node did the work and told the
+// truth, just later than the command timeout — by which point the plane had told the
+// listener the lease was the node's. Answering 204 would leave the container running
+// under a lease NOBODY renews, and the reaper resells that capacity a TTL later.
 var ErrTakeCustody = errors.New("nodeplane: this launch's lease is now the node's to hold")
 
 // defaultCommandTimeout bounds how long a launch waits for a node to answer.
@@ -71,14 +67,13 @@ const defaultPollTimeout = 50 * time.Second
 type Plane struct {
 	// owners records which incarnation was given the launch for each lease.
 	//
-	// A SUPERSEDED PROCESS MAY MAINTAIN WHAT IT HOLDS AND NOTHING ELSE. Routing by
-	// node name alone would let a superseded host read the current one's leases and
-	// RELEASE them — same name, same certificate — returning capacity while a
-	// container ran.
+	// A SUPERSEDED PROCESS MAY MAINTAIN WHAT IT HOLDS AND NOTHING ELSE. Routing by node
+	// name alone lets a superseded host release the current one's leases — same name,
+	// same certificate — returning capacity while a container runs.
 	//
-	// HELD ON THE PLANE, NOT ON THE NODE RECORD, because the node record expires. A
-	// draining process outlives its replacement by design, so ownership tied to
-	// liveness would vanish exactly when the drain still needed to renew its lease.
+	// HELD ON THE PLANE, NOT THE NODE RECORD, which expires: a draining process outlives
+	// its replacement by design, so ownership tied to liveness would vanish exactly when
+	// the drain still needed to renew.
 	owners map[string]leaseOwner
 
 	log  *slog.Logger
@@ -109,17 +104,14 @@ type Plane struct {
 	// shape a node needs so that no node keeps a copy of its own.
 	tiers map[string]config.Tier
 
-	// pendingGone holds hosts the plane has forgotten but the ledger has not yet been
-	// told about. Guarded by mu.
+	// pendingGone holds hosts the plane has forgotten but the ledger has not been told
+	// about. Guarded by mu.
 	//
 	// A QUEUE RATHER THAN A RETURN VALUE, because expiry happens in places that cannot
-	// write to a database: most callers reach it incidentally while holding the mutex
-	// and in the middle of something else, so handing them the fact to record means
-	// they drop it — and a node deleted from the map can never be rediscovered, so the
-	// ledger would believe in it forever.
-	//
-	// A write that fails goes back on the queue, because the alternative is the same
-	// permanent lie arriving through a transient database error.
+	// write to a database: callers reach it incidentally while holding the mutex, so
+	// handing them the fact means they drop it — and a node deleted from the map can
+	// never be rediscovered, so the ledger would believe in it forever. A failed write
+	// goes back on the queue.
 	pendingGone []goneNode
 }
 

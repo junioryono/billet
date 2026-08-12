@@ -159,32 +159,16 @@ func Run(ctx context.Context, c *Client, compute Compute, opts LoopOptions) erro
 
 	// STARTED ONCE, AFTER THE FIRST SUCCESSFUL REGISTRATION, and stopped with Run.
 	//
-	// Custody outlives any single registration: a lease the runner is holding
-	// because it could not confirm a container gone must keep being renewed while
-	// the node re-registers, reconnects, or waits out a control plane that is
-	// restarting. Tying the janitor to each registration would stop renewing
-	// exactly when the connection is least reliable, which is when custody is most
-	// likely to exist.
+	// Custody outlives any single registration: a lease held because a container could
+	// not be confirmed gone must keep being renewed while the node re-registers or waits
+	// out a restarting control plane. But it cannot start BEFORE the first one either —
+	// the janitor reads the lease TTL to pick its cadence, and starting first means
+	// reading a zero and renewing on a one-second fallback forever.
 	//
-	// But it cannot start BEFORE the first one either, which is where it began.
-	// The janitor reads the lease TTL to pick its cadence, and that value is
-	// learned during registration — starting first meant reading a zero and
-	// renewing on a one-second fallback for the process's whole life, while
-	// racing the write that would have told it the truth.
-	//
-	// AND IT DOES NOT INHERIT THE CALLER'S CANCELLATION, which is what makes the
-	// drain mean anything at all.
-	//
-	// This was a child of ctx, so the first signal stopped KeepAlive at the exact
-	// moment stopGracefully began waiting on the compute those leases back. The
-	// node would sit there holding containers whose leases nothing was renewing,
-	// the reaper would expire them, and another tier could escrow the same
-	// capacity while the container was still on this host — the double admission
-	// the whole escrow exists to prevent, arrived at through the code meant to
-	// protect the work.
-	//
-	// Cancelled when Run RETURNS instead, by the defer below, so a node that stops
-	// because it was refused still leaves no goroutine heartbeating behind it.
+	// AND IT DOES NOT INHERIT THE CALLER'S CANCELLATION, which is what makes the drain
+	// mean anything: as a child of ctx it would stop renewing at the exact moment the
+	// drain began waiting on that compute, and another tier could escrow capacity while
+	// the container was still here. Cancelled when Run RETURNS instead.
 	janitorCtx, stopJanitor := context.WithCancel(context.WithoutCancel(ctx))
 
 	var (

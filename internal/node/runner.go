@@ -355,26 +355,16 @@ func (r *Runner) Launch(
 		Command: tier.Command,
 	})
 	if err != nil {
-		// A LAUNCH ERROR IS NOT PROOF NOTHING STARTED.
+		// A LAUNCH ERROR IS NOT PROOF NOTHING STARTED. A cancelled context can kill the CLI
+		// after the daemon accepted the create; a remote API can commit and lose the
+		// response. The error says the caller does not KNOW.
 		//
-		// A cancelled context can kill the CLI after the daemon accepted the create;
-		// a remote API can commit and lose the response. The error says the caller
-		// does not KNOW, which is not the same as knowing there is nothing there —
-		// and the difference is a container running a job nobody will ever collect,
-		// holding a runner registration nobody will ever delete.
+		// So ask, and destroy whatever is found rather than adopting it: the lease is about
+		// to be failed, so an instance for it has no future.
 		//
-		// So ask. Whatever is found is destroyed rather than adopted: the lease is
-		// about to be failed, so an instance for it has no future, and an adopted
-		// half-started instance is a worse thing to own than a clean failure.
-		// If the stray could not be confirmed gone, the LEASE STAYS HELD. Returning
-		// an ordinary error here made the listener release the capacity while a
-		// container might still be running on it, which is the over-commitment this
-		// whole subsystem exists to prevent — arrived at by treating "the launch
-		// failed" as "nothing is using the host".
-		// CUSTODY UNLESS THE CLEANUP WAS CAUSAL. A successful Destroy proves the
-		// compute is gone; anything else — an error, or simply not finding it —
-		// does not, because the daemon may still be acting on a create whose
-		// response was lost.
+		// If the stray could not be confirmed gone the LEASE STAYS HELD — releasing it would
+		// hand back capacity a container may still be using. CUSTODY UNLESS THE CLEANUP WAS
+		// CAUSAL: a successful Destroy proves the compute is gone, and nothing else does.
 		if confirmed, cleanupErr := r.destroyStray(ctx, name); !confirmed {
 			r.hold(lease, name, job.RequestID)
 
