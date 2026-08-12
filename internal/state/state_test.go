@@ -690,3 +690,50 @@ func TestMigrationBackfillsASingleProvider(t *testing.T) {
 		}
 	}
 }
+
+// EVERY TABLE IS STRICT, and the ones holding credentials most of all.
+//
+// SQLite's default typing accepts a string where an integer belongs and stores
+// it as one, so a bug that writes the wrong type is found by a later reader
+// rather than by the write that caused it. Three tables added during the trust
+// work were declared without it.
+func TestEveryTableIsStrict(t *testing.T) {
+	dir := t.TempDir()
+
+	db, err := Open(t.Context(), dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	defer db.Close()
+
+	rows, err := db.Reader().QueryContext(t.Context(),
+		`SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`)
+	if err != nil {
+		t.Fatalf("read the schema: %v", err)
+	}
+
+	defer rows.Close()
+
+	for rows.Next() {
+		var name, ddl string
+		if err := rows.Scan(&name, &ddl); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+
+		// schema_migrations is the bootstrap table, created before the migration
+		// machinery it records exists.
+		if name == "schema_migrations" {
+			continue
+		}
+
+		if !strings.Contains(strings.ToUpper(ddl), "STRICT") {
+			t.Errorf("table %s is not STRICT, so a value of the wrong type is stored rather "+
+				"than refused", name)
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+}
