@@ -82,6 +82,7 @@ func commands(lc *lifecycle) []command {
 			func(ctx context.Context, args []string) error { return cmdNode(ctx, lc, args) }},
 		{"nodes", "approve the machines asking to join this deployment", cmdNodes},
 		{"ca", "issue the certificates nodes authenticate with", cmdCA},
+		{"leases", "show capacity held for compute nobody has accounted for", cmdLeases},
 		{"check", "validate the config and state directory, then exit", cmdCheck},
 		{"init", "generate a billet.yaml interactively", cmdInit},
 		{"github-app", "create and install the GitHub App billet uses", cmdGitHubApp},

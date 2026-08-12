@@ -652,12 +652,65 @@ var issuedCertMigration = migration{
 	},
 }
 
+// CAPACITY IS NOT FREED BY A LEASE EXPIRING, only by its compute being gone.
+//
+// The reaper terminalizes anything whose holder stopped heartbeating, which is
+// right for escrow nobody launched and wrong for a lease with a container behind
+// it: terminalizing frees the capacity immediately, while the container keeps
+// running until the node next sweeps. Another tier can escrow that slot in
+// between, and two jobs end up on a machine sized for one.
+//
+// So an expired RUNNING lease moves to a phase that still charges the host, and
+// leaves it only on proof the compute is gone. The phase list is a CHECK
+// constraint and SQLite cannot alter one, so the table is rebuilt.
+var quarantineMigration = migration{
+	Version: 16,
+	Name:    "lease_quarantine",
+	Stmts: []string{
+		// Columns are named rather than SELECT *: the order has to survive every
+		// earlier migration for a star to be correct, and nothing checks that.
+		`CREATE TABLE leases_new (
+			id              TEXT PRIMARY KEY,
+			tier            TEXT NOT NULL,
+			node            TEXT REFERENCES nodes(name) ON DELETE SET NULL,
+			phase           TEXT NOT NULL CHECK (phase IN
+				('capacity','assigned','launching','online','busy','quarantine','done','failed')),
+			vcpu            INTEGER NOT NULL CHECK (vcpu > 0),
+			memory          INTEGER NOT NULL CHECK (memory > 0),
+			run_id          INTEGER,
+			request_id      INTEGER,
+			epoch           INTEGER NOT NULL DEFAULT 0 CHECK (epoch >= 0),
+			created_at      TEXT NOT NULL,
+			heartbeat_at    TEXT NOT NULL,
+			expires_at      TEXT NOT NULL,
+			target_node     TEXT,
+			macos_slot      INTEGER NOT NULL DEFAULT 0 CHECK (macos_slot IN (0, 1)),
+			guest_os        TEXT NOT NULL DEFAULT 'linux',
+			provider        TEXT NOT NULL DEFAULT '',
+			providers       TEXT NOT NULL DEFAULT '',
+			chosen_provider TEXT NOT NULL DEFAULT ''
+		) STRICT`,
+		`INSERT INTO leases_new
+		   (id, tier, node, phase, vcpu, memory, run_id, request_id, epoch, created_at,
+		    heartbeat_at, expires_at, target_node, macos_slot, guest_os, provider,
+		    providers, chosen_provider)
+		 SELECT id, tier, node, phase, vcpu, memory, run_id, request_id, epoch, created_at,
+		        heartbeat_at, expires_at, target_node, macos_slot, guest_os, provider,
+		        providers, chosen_provider
+		   FROM leases`,
+		`DROP TABLE leases`,
+		`ALTER TABLE leases_new RENAME TO leases`,
+		`CREATE INDEX leases_open_idx ON leases(phase) WHERE phase NOT IN ('done','failed')`,
+		`CREATE INDEX leases_node_idx ON leases(node)`,
+	},
+}
+
 func init() {
 	migrations = append(migrations,
 		placementMigration, guestOSMigration, placementFactsMigration, requestIDMigration,
 		providerListMigration, nodeSiteMigration, nodeLivenessMigration,
 		certRevocationMigration, nodeEnrollmentMigration, joinTokenMigration,
-		issuedCertMigration)
+		issuedCertMigration, quarantineMigration)
 }
 
 const bootstrapSchemaMigrations = `CREATE TABLE IF NOT EXISTS schema_migrations (

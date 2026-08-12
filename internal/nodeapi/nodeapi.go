@@ -36,7 +36,7 @@ import (
 // register a host nothing can ever be placed on — silently, because a node with
 // no capacity is indistinguishable from a busy one. Refusing the registration is
 // the correct outcome rather than an inconvenience, which is what this bump buys.
-const Version = 5
+const Version = 6
 
 // CommandKind names what the server is asking a node to do.
 type CommandKind string
@@ -89,6 +89,26 @@ type RegisterRequest struct {
 	// nothing joins the fleet, is never chosen, and produces no error to find.
 	VCPU   int             `json:"vcpu"`
 	Memory config.ByteSize `json:"memory"`
+	// Instances are the lease ids this host is ACTUALLY RUNNING right now, taken
+	// from the provider rather than from anything the plane told it.
+	//
+	// PROOF THAT A CONTAINER IS GONE, which nothing else can supply. A lease
+	// whose holder stopped heartbeating is quarantined rather than terminalized —
+	// its capacity stays charged until the compute is confirmed destroyed —
+	// and the node's sweep only fires for a container that still exists. A host
+	// that rebooted has none, so without this its quarantined capacity would
+	// never come back. A quarantined lease missing from this list has no
+	// container by definition.
+	Instances []string `json:"instances,omitempty"`
+	// InventoryKnown says the list above is complete rather than absent.
+	//
+	// AN EMPTY LIST AND A MISSING ONE MEAN OPPOSITE THINGS. A host that is
+	// genuinely running nothing must be able to free the capacity its quarantined
+	// leases hold — that is the reboot case, and the main reason this exists. A
+	// host whose provider could not be reached knows nothing, and treating its
+	// silence as "running nothing" would free capacity for containers that are
+	// still there. Only a list the node vouches for is acted on.
+	InventoryKnown bool `json:"inventory_known,omitempty"`
 	// Deployment is the identity the node labels its compute with. Sent so the
 	// server can refuse a node that belongs to a different installation rather
 	// than accepting commands it will label unrecognisably.

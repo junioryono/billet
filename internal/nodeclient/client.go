@@ -266,6 +266,11 @@ type Registration struct {
 	// VCPU and Memory are what this host contributes.
 	VCPU   int
 	Memory config.ByteSize
+	// Instances are the lease ids this host is actually running, and
+	// InventoryKnown says the list is complete rather than absent. See
+	// nodeapi.RegisterRequest.
+	Instances      []string
+	InventoryKnown bool
 }
 
 // Register introduces this node and learns the timings it must respect.
@@ -273,15 +278,17 @@ func (c *Client) Register(ctx context.Context, reg Registration) error {
 	var res nodeapi.RegisterResponse
 
 	err := c.do(ctx, http.MethodPost, "/v1/register", nodeapi.RegisterRequest{
-		Version:     nodeapi.Version,
-		Incarnation: c.incarnation,
-		Node:        c.node,
-		Provider:    reg.Provider,
-		GuestOS:     reg.GuestOS,
-		Deployment:  reg.Deployment,
-		Site:        reg.Site,
-		VCPU:        reg.VCPU,
-		Memory:      reg.Memory,
+		Version:        nodeapi.Version,
+		Incarnation:    c.incarnation,
+		Node:           c.node,
+		Provider:       reg.Provider,
+		GuestOS:        reg.GuestOS,
+		Deployment:     reg.Deployment,
+		Instances:      reg.Instances,
+		InventoryKnown: reg.InventoryKnown,
+		Site:           reg.Site,
+		VCPU:           reg.VCPU,
+		Memory:         reg.Memory,
 	}, &res)
 	if err != nil {
 		return err
