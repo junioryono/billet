@@ -85,7 +85,7 @@ func (r *revocations) issuedCerts() []alloc.IssuedCert {
 // CertRevokedFor mirrors the real one: a serial, or a cutoff that reaches
 // credentials this deployment never recorded.
 func (r *revocations) CertRevokedFor(
-	ctx context.Context, node, serial string, notBefore time.Time,
+	ctx context.Context, node, serial string, issuedAt time.Time,
 ) (bool, error) {
 	if revoked, err := r.CertRevoked(ctx, serial); revoked || err != nil {
 		return revoked, err
@@ -96,7 +96,25 @@ func (r *revocations) CertRevokedFor(
 
 	cutoff, ok := r.cutoffs[node]
 
-	return ok && notBefore.Before(cutoff), nil
+	// TRUNCATED THE WAY THE REAL ONE DOES. X.509 carries validity at one-second
+	// resolution, so both sides of this comparison have to be whole seconds or a
+	// replacement minted in the same second as the revocation is refused. A fake
+	// that skipped it would pass a test of the property it breaks.
+	return ok && issuedAt.Truncate(time.Second).Before(cutoff), nil
+}
+
+// revokeBefore records a node cutoff, the way RevokeNode does.
+func (r *revocations) revokeBefore(node string, at time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.cutoffs == nil {
+		r.cutoffs = map[string]time.Time{}
+	}
+
+	// ROUNDED UP, matching RevokeNode: the boundary has to sit between whole
+	// seconds, because that is the finest a certificate can express.
+	r.cutoffs[node] = at.Truncate(time.Second).Add(time.Second)
 }
 
 func (r *revocations) CertRevoked(_ context.Context, serial string) (bool, error) {
@@ -486,5 +504,83 @@ func TestARenewalIsRefusedWhenItCannotBeRecorded(t *testing.T) {
 	if _, _, _, err := c.Renew(t.Context(), "epyc-1"); err == nil {
 		t.Error("a renewal that could not be recorded was handed over anyway, so the node is " +
 			"now presenting a credential nobody can revoke")
+	}
+}
+
+// A REVOKED NODE'S REPLACEMENT CAN STILL CONNECT, with a real certificate.
+//
+// Revocation records a cutoff so it reaches credentials billet never wrote down.
+// Every certificate is valid from an HOUR BEFORE it was minted, for clock skew
+// between two machines — so a replacement issued moments after a revocation
+// carries a NotBefore an hour BEFORE the cutoff. Reading NotBefore as the
+// issuance moment refuses it, turning a revocation into a permanent ban on the
+// node name, and the node's own operator cannot tell why.
+//
+// The dates are the certificate's own here rather than a test's choice, which is
+// the point: a hand-picked timestamp an hour in the future is not something any
+// certificate carries, and a test using one passes against exactly this bug.
+func TestARevokedNodesReplacementStillConnects(t *testing.T) {
+	t.Parallel()
+
+	ca, base, list := revocableWire(t)
+
+	// The compromised machine's certificate, and the cutoff that takes it back.
+	compromised, err := ca.IssueNode("epyc-1")
+	if err != nil {
+		t.Fatalf("issue: %v", err)
+	}
+
+	list.revokeBefore("epyc-1", time.Now())
+
+	conf, err := wirecert.ClientTLS(compromised)
+	if err != nil {
+		t.Fatalf("client tls: %v", err)
+	}
+
+	c, err := nodeclient.New(nodeclient.Options{Base: base, Node: "epyc-1", TLS: conf})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+
+	if err := c.Register(t.Context(), nodeclient.Registration{
+		Provider: config.ProviderDocker, Deployment: wireDeployment,
+		VCPU: 8, Memory: 32 * config.GiB,
+	}); err == nil {
+		t.Fatal("the revoked machine still registered, so the cutoff reaches nothing")
+	}
+
+	// PAST THE SECOND BOUNDARY, because that is the finest a certificate can
+	// express: X.509 carries validity to the second, so a credential minted in
+	// the same second as the revocation cannot be told apart from one minted
+	// just before it — and that ambiguity is resolved toward refusing, because
+	// accepting a compromised certificate is what does not recover.
+	//
+	// Real operators cross this trivially: `billet nodes revoke` and `billet ca
+	// issue` are two commands.
+	time.Sleep(time.Until(time.Now().Truncate(time.Second).Add(1100 * time.Millisecond)))
+
+	// THE REPLACEMENT, minted after the cutoff and carrying a NotBefore an hour
+	// before it.
+	replacement, err := ca.IssueNode("epyc-1")
+	if err != nil {
+		t.Fatalf("issue the replacement: %v", err)
+	}
+
+	freshConf, err := wirecert.ClientTLS(replacement)
+	if err != nil {
+		t.Fatalf("client tls: %v", err)
+	}
+
+	fresh, err := nodeclient.New(nodeclient.Options{Base: base, Node: "epyc-1", TLS: freshConf})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+
+	if err := fresh.Register(t.Context(), nodeclient.Registration{
+		Provider: config.ProviderDocker, Deployment: wireDeployment,
+		VCPU: 8, Memory: 32 * config.GiB,
+	}); err != nil {
+		t.Fatalf("a machine rebuilt after a revocation cannot rejoin under its own name, so "+
+			"revoking it banned the name permanently: %v", err)
 	}
 }

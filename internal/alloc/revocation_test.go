@@ -260,6 +260,17 @@ func TestRevokingANodeRefusesCredentialsItNeverRecorded(t *testing.T) {
 
 // AND A REPLACEMENT ISSUED AFTERWARDS STILL WORKS, which is what keeps the
 // cutoff a revocation rather than a ban on the name.
+//
+// THE DATES HERE ARE THE ONES A REAL CERTIFICATE CARRIES, and that is the whole
+// point. Every certificate billet issues is valid from an HOUR BEFORE it was
+// minted, so a node whose clock is behind the control plane's does not reject
+// what it was just handed. A replacement issued a minute after a revocation
+// therefore has a NotBefore an hour BEFORE the cutoff — and reading NotBefore as
+// the issuance moment refused it, turning a revocation into a permanent ban on
+// the node name.
+//
+// The first version of this test chose a replacement date an hour in the FUTURE,
+// which no certificate ever has, and passed against exactly that bug.
 func TestACertificateIssuedAfterTheCutoffIsAccepted(t *testing.T) {
 	now := time.Now().UTC()
 
@@ -270,10 +281,11 @@ func TestACertificateIssuedAfterTheCutoffIsAccepted(t *testing.T) {
 		t.Fatalf("RevokeNode: %v", err)
 	}
 
-	// The machine is rebuilt and issued a fresh bundle under the same name.
-	replacement := now.Add(time.Hour)
+	// The machine is rebuilt a minute later, so its certificate is MINTED then —
+	// and carries a NotBefore 59 minutes before the revocation.
+	minted := now.Add(time.Minute)
 
-	revoked, err := a.CertRevokedFor(t.Context(), "epyc-1", "fresh", replacement)
+	revoked, err := a.CertRevokedFor(t.Context(), "epyc-1", "fresh", minted)
 	if err != nil {
 		t.Fatalf("CertRevokedFor: %v", err)
 	}
@@ -281,5 +293,16 @@ func TestACertificateIssuedAfterTheCutoffIsAccepted(t *testing.T) {
 	if revoked {
 		t.Error("the replacement machine's certificate was born revoked, so a node name can " +
 			"never be reused after a revocation")
+	}
+
+	// And one minted a minute BEFORE the revocation is still refused, which is
+	// the direction the cutoff exists for.
+	revoked, err = a.CertRevokedFor(t.Context(), "epyc-1", "old", now.Add(-time.Minute))
+	if err != nil {
+		t.Fatalf("CertRevokedFor: %v", err)
+	}
+
+	if !revoked {
+		t.Error("a certificate minted before the revocation is still accepted")
 	}
 }

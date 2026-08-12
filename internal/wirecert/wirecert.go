@@ -32,6 +32,19 @@ import (
 	"time"
 )
 
+// ClockSkew is how far before its issuance a certificate becomes valid.
+//
+// Two machines' clocks disagree, and a node whose clock is a few minutes behind
+// the control plane's would otherwise reject a certificate it was just handed.
+// An hour is far more than any sane deployment drifts and costs nothing.
+//
+// NAMED, because a reader of the certificate has to undo it: NotBefore is an
+// hour BEFORE the moment a certificate was issued, so anything comparing "when
+// was this minted" against a wall clock has to add this back. Revocation by
+// cutoff does exactly that, and reading NotBefore as the issuance time refused
+// every replacement issued within an hour of a revocation.
+const ClockSkew = time.Hour
+
 // CALifetime is how long a deployment's certificate authority is good for.
 //
 // Long, because rotating it means re-issuing every node certificate by hand and
@@ -196,7 +209,7 @@ func createCA(stateDir, dir, certPath, keyPath, deployment string) (*CA, error) 
 			CommonName:   "billet node wire CA",
 			Organization: []string{deployment},
 		},
-		NotBefore:             now.Add(-time.Hour), // clock skew between hosts
+		NotBefore:             now.Add(-ClockSkew),
 		NotAfter:              now.Add(CALifetime),
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign | x509.KeyUsageDigitalSignature,
 		BasicConstraintsValid: true,
@@ -451,7 +464,7 @@ func (c *CA) leafTemplate(cn string) (*x509.Certificate, error) {
 			CommonName:   cn,
 			Organization: []string{c.deployment},
 		},
-		NotBefore: now.Add(-time.Hour),
+		NotBefore: now.Add(-ClockSkew),
 		NotAfter:  notAfter,
 		KeyUsage:  x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
 	}, nil
