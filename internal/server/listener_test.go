@@ -1740,9 +1740,7 @@ func TestACompletionWhoseDestroyFailedIsRetried(t *testing.T) {
 	holdRunning(t, l, a, tiers[0].Label, 7)
 
 	// The first completion cannot destroy, so its capacity is held.
-	if err := l.complete(t.Context(), Job{RequestID: 7}); err != nil {
-		t.Fatalf("complete: %v", err)
-	}
+	l.complete(t.Context(), Job{RequestID: 7})
 
 	l.mu.Lock()
 	held := len(l.cleanup)
@@ -2751,9 +2749,7 @@ func TestAFinishedRetryDoesNotBlockTheShutdownDestroy(t *testing.T) {
 
 	holdRunning(t, l, a, tiers[0].Label, 7)
 
-	if err := l.complete(t.Context(), Job{RequestID: 7}); err != nil {
-		t.Fatalf("complete: %v", err)
-	}
+	l.complete(t.Context(), Job{RequestID: 7})
 
 	// A retry that runs to completion and leaves the obligation in place.
 	l.retryCleanup(t.Context())
@@ -3706,9 +3702,7 @@ func TestAFailedRetryWaitsBeforeTheNextOne(t *testing.T) {
 
 	holdRunning(t, l, a, tiers[0].Label, 7)
 
-	if err := l.complete(t.Context(), Job{RequestID: 7}); err != nil {
-		t.Fatalf("complete: %v", err)
-	}
+	l.complete(t.Context(), Job{RequestID: 7})
 
 	if got := attempts.Load(); got != 1 {
 		t.Fatalf("the completion's own destroy did not run: %d attempts", got)
@@ -4142,9 +4136,7 @@ func TestATransientReleaseFailureKeepsTheRetry(t *testing.T) {
 
 	holdRunning(t, l, a, tiers[0].Label, 7)
 
-	if err := l.complete(t.Context(), Job{RequestID: 7}); err != nil {
-		t.Fatalf("complete: %v", err)
-	}
+	l.complete(t.Context(), Job{RequestID: 7})
 
 	l.mu.Lock()
 	pending := len(l.cleanup)
@@ -4234,9 +4226,7 @@ func TestALostLeaseKeepsItsPendingRetry(t *testing.T) {
 
 	holdRunning(t, l, a, tiers[0].Label, 7)
 
-	if err := l.complete(t.Context(), Job{RequestID: 7}); err != nil {
-		t.Fatalf("complete: %v", err)
-	}
+	l.complete(t.Context(), Job{RequestID: 7})
 
 	if cleanupCount(l) != 1 {
 		t.Fatalf("a completion whose destroy failed was not recorded: %d", cleanupCount(l))
@@ -4345,9 +4335,7 @@ func TestACompletionNotHeldIsNotRecorded(t *testing.T) {
 	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner))
 
 	// No holdRunning: this listener knows nothing about request 7.
-	if err := l.complete(t.Context(), Job{RequestID: 7}); err != nil {
-		t.Fatalf("complete: %v", err)
-	}
+	l.complete(t.Context(), Job{RequestID: 7})
 
 	l.mu.Lock()
 	pending := len(l.cleanup)
@@ -4647,11 +4635,11 @@ func TestACompletionWhoseReleaseFailsDoesNotStopTheListener(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
-	if err := l.complete(ctx, Job{RequestID: 7}); err != nil {
-		t.Fatalf("a completion whose release could not reach the ledger returned an error; on "+
-			"the poll path that stops this listener, cancels every other one, and their "+
-			"shutdowns destroy every job on this host: %v", err)
-	}
+	// NOTHING TO ASSERT ON THE RETURN, and that is the fix: complete has no error
+	// to give. It used to, and on the poll path that error stopped the listener,
+	// cancelled every other listener, and destroyed every job running on this
+	// host. The signature is what keeps that from coming back.
+	l.complete(ctx, Job{RequestID: 7})
 
 	// AND THE OBLIGATION SURVIVES, which is the half that makes returning nil
 	// honest rather than a swallow.

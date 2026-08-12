@@ -272,6 +272,16 @@ func liveCertsForTx(ctx context.Context, tx *sql.Tx, node, now string) ([]Issued
 // A replacement machine under the same name is unaffected: this revokes the
 // serials outstanding right now, and a certificate issued afterwards is not one
 // of them.
+//
+// THE CUTOFF COMPARES TWO CLOCKS, and that is a real if narrow residual. The
+// timestamps come from the certificate's own issuer and from this process, so a
+// CA whose clock runs ahead can mint a credential shortly before a revocation
+// that dates itself after the cutoff and escapes it. It only reaches
+// certificates whose serials were never recorded — everything issued since this
+// release is revoked by serial, where no clock is involved — so it is bounded to
+// the legacy set the cutoff exists for, and a deployment that cannot enumerate
+// its old certificates and does not trust its clocks should rotate the authority
+// instead.
 func (a *Allocator) RevokeNode(ctx context.Context, node, reason string) ([]IssuedCert, error) {
 	var revoked []IssuedCert
 
