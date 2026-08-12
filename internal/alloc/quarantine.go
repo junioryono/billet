@@ -29,7 +29,7 @@ type QuarantinedLease struct {
 func (a *Allocator) Quarantined(ctx context.Context) ([]QuarantinedLease, error) {
 	var out []QuarantinedLease
 
-	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+	err := a.db.View(ctx, func(tx querier) error {
 		out = nil
 
 		rows, err := tx.QueryContext(ctx,
