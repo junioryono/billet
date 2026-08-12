@@ -790,12 +790,14 @@ func TestSweepKeepsAnInstanceWhoseLeaseIsLaunching(t *testing.T) {
 	}
 }
 
-func TestSweepDestroysAnInstanceWhoseLeaseWasReaped(t *testing.T) {
+func TestSweepDestroysAnInstanceWhoseLeaseIsTerminal(t *testing.T) {
 	t.Parallel()
 
-	// The case the sweep exists for. The reaper terminalizes the lease of a
-	// holder that stopped heartbeating; the container it was running under is an
-	// orphan from that moment, and nothing else will ever look at it.
+	// The case the sweep exists for: a lease that has finished while its
+	// container did not. It is named for what it stages — a terminal lease — and
+	// not for the reaper, which no longer terminalizes a lease with compute
+	// behind it. That one is quarantined and adopted; see
+	// TestQuarantinedComputeIsAdoptedRatherThanDestroyed.
 	p := &fakeProvider{kind: config.ProviderDocker}
 	a, host := newAllocatorWithHost(t)
 	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
