@@ -68,23 +68,42 @@ jobs:
       - name: gofmt
         run: make fmt-check
 
-      # A broken release config should fail on the PR that broke it, not at the
-      # moment somebody presses the release button. `check` is cheap — it parses
-      # and validates, it does not build.
-      - name: Validate the release config
-        uses: goreleaser/goreleaser-action@v7
-        with:
-          # Pinned exactly, the way golangci-lint is. "~> v2" downloads whichever
-          # v2 exists at the time, so a release built today and one rebuilt next
-          # month are not the same build.
-          version: "v2.17.1"
-          args: check
-
       - uses: golangci/golangci-lint-action@v9
         with:
           # Pinned, not `latest`: a linter that changes under you turns an
           # unrelated PR red and trains people to ignore the signal.
           version: v2.12.2
+
+  # A broken release config should fail on the PR that broke it, not at the
+  # moment somebody presses the release button. `check` is cheap — it parses and
+  # validates, it does not build.
+  #
+  # ITS OWN JOB, AND INSTALLED FROM THE MODULE PROXY. Both halves of that are a
+  # reaction to the same outage: goreleaser-action downloads a tarball from
+  # GitHub's release CDN, that CDN served 503 to all three of the action's
+  # attempts twice in one day, and because the step lived in `lint` it took
+  # golangci-lint down with it — a red "lint" on runs where nothing had been
+  # linted at all. Separating the job means a CDN blip can only fail the thing
+  # it is actually about, and `go install` fetches through proxy.golang.org,
+  # which is a cache rather than a redirect to the same CDN.
+  release-config:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Version pinned exactly, the way golangci-lint is, and read from the
+      # Makefile so the gate and `make tools` cannot drift to two goreleasers.
+      - name: Validate the release config
+        run: |
+          version=$(make --no-print-directory print-goreleaser-version)
+          go install "github.com/goreleaser/goreleaser/v2@$version"
+          goreleaser check
 
   # The binary must build for every platform a node can run on, since nodes are
   # deployed by copying one static file. Cross-compilation is the cheapest way to
