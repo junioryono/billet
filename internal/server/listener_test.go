@@ -4674,3 +4674,70 @@ func TestACompletionWhoseReleaseFailsDoesNotStopTheListener(t *testing.T) {
 			"ledger, so its request id is refused for the life of the process")
 	}
 }
+
+// A SUCCESSFUL DESTROY IS NOT LOST BECAUSE THE HEARTBEAT MOVED THE LEASE.
+//
+// A remote destroy has no bound and runs outside the mutex, and the heartbeat
+// runs the whole time. If it finds the lease fenced — which is exactly what the
+// reaper quarantining it looks like — it drops the entry and records a cleanup
+// obligation carrying no lease. The destroy then succeeds, PROVING the container
+// is gone, and the code that would resolve the quarantine has nothing left to
+// name: the capacity stays charged until some node happens to report an
+// inventory, or forever if that node never comes back.
+//
+// The lease is noted before the destroy so the proof is not wasted.
+func TestASuccessfulDestroySurvivesTheHeartbeatDroppingItsLease(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, tiers)
+
+	var l *Listener
+
+	// THE INTERLEAVING, staged inside the destroy: the reaper quarantines the
+	// lease and the heartbeat gives up on it while the destroy is still running.
+	runner := &fakeRunner{
+		onDestroy: func(requestID int64) error {
+			lease := l.leaseFor(requestID)
+
+			if err := a.ExpireForTest(t.Context(), lease.ID); err != nil {
+				t.Errorf("expire: %v", err)
+			}
+
+			if _, err := a.Reap(t.Context()); err != nil {
+				t.Errorf("reap: %v", err)
+			}
+
+			l.heartbeatHeld(t.Context())
+
+			return nil
+		},
+	}
+
+	l = NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner))
+
+	lease := holdRunning(t, l, a, tiers[0].Label, 7)
+
+	// Running, so the reaper quarantines rather than terminalizes it.
+	if err := a.Bind(t.Context(), lease.ID, lease.Epoch, lease.TargetNode); err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+
+	for _, to := range []alloc.Phase{alloc.PhaseLaunching, alloc.PhaseOnline, alloc.PhaseBusy} {
+		if err := a.Advance(t.Context(), lease.ID, lease.Epoch, to); err != nil {
+			t.Fatalf("advance to %s: %v", to, err)
+		}
+	}
+
+	l.complete(t.Context(), Job{RequestID: 7})
+
+	// THE CAPACITY IS BACK. Its container is confirmed gone, so nothing should be
+	// holding a slot for it.
+	held, err := a.Quarantined(t.Context())
+	if err != nil {
+		t.Fatalf("Quarantined: %v", err)
+	}
+
+	if len(held) != 0 {
+		t.Errorf("%d lease(s) still hold capacity for a container this listener destroyed and "+
+			"confirmed gone: %+v", len(held), held)
+	}
+}

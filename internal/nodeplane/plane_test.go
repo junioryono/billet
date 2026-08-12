@@ -893,6 +893,11 @@ func TestADestroyEndsALeasesOwnership(t *testing.T) {
 		_ = p.Result("n1", "first", nodeapi.CommandResult{ID: got.ID, OK: true})
 	}()
 
+	// Parked first, for the reason recorded above the other two: a command whose
+	// poller has not run yet is discarded on the command timeout.
+	waitFor(t, "the node to park on a poll",
+		func() bool { return p.WaitersForTest("n1") == 1 })
+
 	if err := p.NewRunner().Destroy(t.Context(), 7); err != nil {
 		t.Fatalf("destroy: %v", err)
 	}
@@ -1173,6 +1178,14 @@ func TestAnOwnersConfirmationClearsTheRecordAndNobodyElseIsAsked(t *testing.T) {
 		_ = p.Result("n1", "first", nodeapi.CommandResult{ID: got.ID, OK: true})
 	}()
 
+	// PARKED FIRST. A dispatched command is discarded once the command timeout
+	// elapses, so starting the poller and the destroy together races the
+	// scheduler — under the full suite's parallelism this goroutine may not run
+	// inside that window, and the test fails on a timeout rather than on what it
+	// is about.
+	waitFor(t, "the owner to park on a poll",
+		func() bool { return p.WaitersForTest("n1") == 1 })
+
 	// ADDRESSED, so a silent bystander is irrelevant. This assertion is the
 	// inverse of what it used to be, and deliberately: the machine that has the
 	// container is the only one asked, so the one that does not have it can no
@@ -1397,6 +1410,15 @@ func TestADestroyIsNotConfirmedByTheWrongProcess(t *testing.T) {
 		//nolint:errcheck // the result's fate is not what this test is about
 		_ = p.Result("n1", "second", nodeapi.CommandResult{ID: got.ID, OK: true})
 	}()
+
+	// PARKED BEFORE THE DESTROY IS DISPATCHED, for the reason destroy_test.go
+	// already records: a dispatched command is discarded once the command timeout
+	// elapses, so starting the poller and the destroy together is a race against
+	// the scheduler. Under the full suite's parallelism this goroutine can simply
+	// not run inside that window, and the test then fails on a timeout that has
+	// nothing to do with who answered.
+	waitFor(t, "the replacement to park on a poll",
+		func() bool { return p.WaitersForTest("n1") == 1 })
 
 	err := p.NewRunner().Destroy(t.Context(), 7)
 	if !errors.Is(err, server.ErrCustody) {
