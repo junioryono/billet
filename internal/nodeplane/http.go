@@ -107,9 +107,14 @@ func WithRevocations(r Revocations) HandlerOption {
 // Enrollments records machines asking to join and what was decided about them,
 // and checks the credential that lets one ask at all.
 type Enrollments interface {
-	RequestEnrollment(ctx context.Context, name, fingerprint, csrPEM string) (alloc.Enrollment, error)
+	// RequestEnrollmentWithToken records the request AND spends the credential
+	// that authorised it in one transaction. Two calls would let a crash between
+	// them burn a single-use token with no request to show for it, stranding the
+	// machine it was minted for.
+	RequestEnrollmentWithToken(
+		ctx context.Context, name, fingerprint, csrPEM, token string,
+	) (alloc.Enrollment, error)
 	LookupEnrollment(ctx context.Context, name string) (alloc.Enrollment, bool, error)
-	SpendJoinToken(ctx context.Context, token string) error
 }
 
 // WithEnrollment lets a machine ask to join without already holding a
@@ -574,24 +579,14 @@ func (h *handler) enroll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// SPENT ONLY WHEN THE REQUEST IS NEW. A node polls this endpoint until an
-	// operator decides, so charging every call would spend a single-use token on
-	// the second poll and strand the machine it was minted for.
-	if !h.knownEnrollment(r.Context(), req.Node, fingerprint) {
-		if err := h.enrollments.SpendJoinToken(r.Context(), req.JoinToken); err != nil {
-			// A LEDGER THAT CANNOT ANSWER IS NOT A BAD CREDENTIAL. Reporting one
-			// as the other sends an operator to mint tokens that cannot help,
-			// because the next one fails the same way — and the error that would
-			// have said so was never written down.
-			if !errors.Is(err, alloc.ErrBadJoinToken) {
-				h.log.Error("could not check a join token", "node", req.Node, "error", err)
-
-				writeErr(w, http.StatusServiceUnavailable, nodeapi.CodeUnavailable,
-					"billet could not check this join token; try again")
-
-				return
-			}
-
+	// THE REQUEST AND THE TOKEN IN ONE CALL, because they have to commit
+	// together. The token is spent only for a request that is NEW: a node polls
+	// this endpoint until a human decides, so charging every call would spend a
+	// single-use token on the second poll.
+	enrollment, err := h.enrollments.RequestEnrollmentWithToken(
+		r.Context(), req.Node, fingerprint, req.CSRPEM, req.JoinToken)
+	if err != nil {
+		if errors.Is(err, alloc.ErrBadJoinToken) {
 			h.log.Warn("an enrollment was attempted without a usable join token",
 				"node", req.Node, "fingerprint", fingerprint)
 
@@ -601,10 +596,7 @@ func (h *handler) enroll(w http.ResponseWriter, r *http.Request) {
 
 			return
 		}
-	}
 
-	enrollment, err := h.enrollments.RequestEnrollment(r.Context(), req.Node, fingerprint, req.CSRPEM)
-	if err != nil {
 		if errors.Is(err, alloc.ErrEnrollmentConflict) {
 			h.log.Warn("a second key asked to join under a name that is already claimed",
 				"node", req.Node, "fingerprint", fingerprint)
@@ -635,16 +627,6 @@ func (h *handler) enroll(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, res)
-}
-
-// knownEnrollment reports whether this exact request has already been recorded,
-// which is what makes a node's repeated polling free.
-//
-// A READ, never a write. Asking the question must not record an answer.
-func (h *handler) knownEnrollment(ctx context.Context, name, fingerprint string) bool {
-	existing, found, err := h.enrollments.LookupEnrollment(ctx, name)
-
-	return err == nil && found && existing.Fingerprint == fingerprint
 }
 
 // trustBundle is every authority a node should accept.
