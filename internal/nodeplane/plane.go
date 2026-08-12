@@ -474,6 +474,10 @@ type Registrar interface {
 	// ForgetEveryNode marks the whole fleet unreachable, for a plane that has just
 	// started and has no judgement about anything yet.
 	ForgetEveryNode(ctx context.Context) error
+
+	// ResolveQuarantineFor frees capacity held for compute a returning host says
+	// it is not running, and reports how many leases it released.
+	ResolveQuarantineFor(ctx context.Context, node string, running []string) (int, error)
 }
 
 // sortedSites lists the declared places in a stable order, so a refusal naming
@@ -638,6 +642,31 @@ func (p *Plane) Register(
 			// down after it recovered.
 			return nodeapi.RegisterResponse{}, fmt.Errorf(
 				"nodeplane: the ledger could not record node %q: %w", req.Node, err)
+		}
+
+		// WHAT THIS HOST SAYS IT IS RUNNING FREES WHAT IT IS NOT.
+		//
+		// A lease whose holder stopped heartbeating is quarantined rather than
+		// terminalized, so its capacity stays charged until the compute is
+		// confirmed gone — and the node's sweep only confirms containers that
+		// still exist. A host that rebooted has none, so its quarantined capacity
+		// would wait forever. This is the other proof.
+		//
+		// ONLY A LIST THE NODE VOUCHES FOR. An absent one means the provider
+		// could not be read, and reading that as "running nothing" would free
+		// capacity for containers that are still there.
+		//
+		// Best effort: failing a registration over it would keep a healthy host
+		// out of the fleet to tidy up an accounting row, and the next
+		// registration or sweep does the same work.
+		if req.InventoryKnown {
+			if freed, err := p.registrar.ResolveQuarantineFor(ctx, req.Node, req.Instances); err != nil {
+				p.log.Warn("could not reconcile quarantined capacity with what this host "+
+					"reports running", "node", req.Node, "error", err)
+			} else if freed > 0 {
+				p.log.Info("freed capacity held for compute this host is no longer running",
+					"node", req.Node, "leases", freed)
+			}
 		}
 	}
 

@@ -61,6 +61,11 @@ type fakeCompute struct {
 	// holding reports compute this node is still responsible for.
 	holding bool
 
+	// instances is what this host reports running at registration, and
+	// instancesErr stands in for a provider that cannot be read.
+	instances    []string
+	instancesErr error
+
 	// supersededCalls counts hand-overs of running work into custody.
 	supersededCalls int
 
@@ -70,6 +75,19 @@ type fakeCompute struct {
 	// follows it microseconds later.
 	launchGate    chan struct{}
 	launchStarted chan struct{}
+}
+
+// Instances is what this fake says it is running, which the loop sends at
+// registration so the plane can free capacity for anything it is not.
+func (f *fakeCompute) Instances(context.Context) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.instancesErr != nil {
+		return nil, f.instancesErr
+	}
+
+	return append([]string(nil), f.instances...), nil
 }
 
 func (f *fakeCompute) KeepAlive(ctx context.Context) {

@@ -33,6 +33,13 @@ const deployment = "0123456789abcdef0123456789abcdef"
 
 // fakeRegistrar stands in for the allocator's node table.
 type fakeRegistrar struct {
+	// reconciled and reportedRunning record the quarantine reconciliation the
+	// plane performs when a host comes back.
+	reconciled      []string
+	reportedRunning []string
+	freed           int
+	resolveErr      error
+
 	mu       sync.Mutex
 	err      error
 	accepted []string
@@ -44,6 +51,20 @@ type fakeRegistrar struct {
 	goneName  string
 	goneEpoch int64
 	forgotten bool
+}
+
+// ResolveQuarantineFor records what a returning host reported running, so a test
+// can assert the plane passed it on.
+func (f *fakeRegistrar) ResolveQuarantineFor(
+	_ context.Context, node string, running []string,
+) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.reconciled = append(f.reconciled, node)
+	f.reportedRunning = running
+
+	return f.freed, f.resolveErr
 }
 
 // gone records which node the plane gave up on, and at which epoch.

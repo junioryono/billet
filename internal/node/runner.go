@@ -712,6 +712,21 @@ func (r *Runner) Sweep(ctx context.Context) error {
 
 			r.log.Error("could not destroy an orphaned instance",
 				"name", inst.Name, "instance", inst.ID, "error", err)
+
+			continue
+		}
+
+		// AND THE PLANE IS TOLD, which is what returns the capacity.
+		//
+		// A lease whose holder stopped heartbeating is quarantined rather than
+		// terminalized: the control plane cannot see this machine's containers,
+		// so it keeps charging for them until somebody who can says they are
+		// gone. This is that somebody. Without it the destroy happens and the
+		// capacity never comes back.
+		if err := r.releaseOrphanedLease(ctx, leaseID); err != nil {
+			r.log.Warn("destroyed an orphaned instance but could not release its lease; its "+
+				"capacity stays charged until this succeeds",
+				"lease", leaseID, "error", err)
 		}
 	}
 
@@ -724,6 +739,27 @@ func (r *Runner) Sweep(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// Instances are the lease ids this host is actually running.
+//
+// FROM THE PROVIDER, never from the ledger: the point of sending it is to tell
+// the control plane something it cannot see for itself.
+func (r *Runner) Instances(ctx context.Context) ([]string, error) {
+	instances, err := r.provider.List(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("node: list what is running here: %w", err)
+	}
+
+	ids := make([]string, 0, len(instances))
+
+	for _, inst := range instances {
+		if leaseID, ours := provider.LeaseOf(inst.Name); ours {
+			ids = append(ids, leaseID)
+		}
+	}
+
+	return ids, nil
 }
 
 // releaseOrphanedLease terminalizes a lease whose compute has just been
