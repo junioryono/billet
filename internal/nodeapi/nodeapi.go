@@ -225,6 +225,13 @@ func TierSpecOf(t config.Tier) *TierSpec {
 type EnrollRequest struct {
 	Node   string `json:"node"`
 	CSRPEM string `json:"csr_pem"`
+	// JoinToken is a short-lived credential from `billet ca token`.
+	//
+	// It admits nothing on its own — the request still waits for an operator to
+	// compare fingerprints — but without one this endpoint is open to anyone who
+	// can reach the port, who could then fill the pending list or take a name
+	// before the machine that should have it.
+	JoinToken string `json:"join_token"`
 }
 
 // EnrollResponse is the decision, or that there is not one yet.

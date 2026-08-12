@@ -112,7 +112,7 @@ Three things about it were wrong on the first attempt and are worth not repeatin
 
 **An operator compares a fingerprint and approves it.** Two ends display the same number; a human checks they match. Everything else is transport.
 
-A machine that has nothing runs `billet node --enroll --ca-fingerprint <value from `billet ca show`>`. It fetches the control plane's authority, checks the fingerprint against the one the operator gave it, generates a key, and asks to join — printing its OWN fingerprint. The request sits as `pending`. The operator runs `billet nodes pending`, compares, and runs `billet nodes approve <node> --fingerprint <the value they compared>`. The node picks up its certificate on the next attempt.
+A machine that has nothing runs `billet node --enroll --ca-fingerprint <value from `billet ca show`> --join-token <value from `billet ca token`>`. It fetches the control plane's authority, checks the fingerprint against the one the operator gave it, generates a key, and asks to join — printing its OWN fingerprint. The request sits as `pending`. The operator runs `billet nodes pending`, compares, and runs `billet nodes approve <node> --fingerprint <the value they compared>`. The node picks up its certificate on the next attempt.
 
 **Both directions are verified, and neither is trust-on-first-use.** The node refuses to enroll without a CA fingerprint, because accepting whatever answered on a network an attacker can reach is just trust: they answer first, the node enrolls with them, and every job it runs afterwards is theirs. The operator refuses to approve without a node fingerprint, because approving by name alone approves whatever currently holds the name.
 
@@ -120,7 +120,15 @@ A machine that has nothing runs `billet node --enroll --ca-fingerprint <value fr
 
 **The listener verifies a certificate if one is given rather than requiring one**, because an unenrolled machine has none and still has to reach `/v1/ca` and `/v1/enroll`. That is a deliberate hole in exactly two routes; every other one is behind a guard that refuses a connection with no verified chain, and `TestAnUnenrolledConnectionCanReachNothingElse` is what says so. A certificate that IS presented is still verified against the deployment's authority.
 
-The older path still works and is right for a machine you are provisioning anyway: `billet ca issue <name>` on the control plane, copy the bundle out of band.
+**A join token is required to ASK.** Approval is still what admits — an operator compares fingerprints — but without a credential in front of the endpoint, anyone who can reach the port can fill the pending list, and can TAKE A NAME before the machine that should have it. "First key claims the name" protects an operator from approving a substitute; unauthenticated, it also lets a stranger deny a machine its own name. Tokens are short-lived, counted, and stored as a SHA-256 digest rather than verbatim, so a copy of the ledger is not a copy of every credential that still works. The check and the decrement are one statement, so two machines racing on a single-use token cannot both win.
+
+The older path still works and is right for a machine you are provisioning anyway — cloud-init can drop a bundle on it, and no human is standing there to compare a fingerprint: `billet ca issue <name>` on the control plane, copy the bundle out of band. It now RECORDS the admission, marked `issued` rather than `enrolled`, so `billet nodes pending --all` is the single answer to "what has been let into this deployment, and when". Before, a fleet built that way was invisible to that list.
+
+## The CA is a slow cliff
+
+A leaf may not outlive its authority, so once the CA has less than a leaf's lifetime left, every certificate it issues is quietly SHORTER than the last. Renewals keep working and come round faster and faster; nothing errors; and then every node expires on the day the authority does. `billet ca show` warns once that starts, because it is invisible otherwise.
+
+Rotating is an overlap, not a switch: issue a new authority, keep trusting the old one while nodes pick the new one up through renewal, retire the old one after. That is why the renewal response carries the CA alongside the certificate. The overlap itself is not built yet.
 
 The control plane is its own CA: on first non-loopback start it creates a per-deployment authority in `server.state_dir`, 10-year life, private key never leaving that machine. `billet ca issue <name>` mints a leaf for that name, 1-year life. The operator copies the bundle to the node out of band. On connect, `tls.RequireAndVerifyClientCert` with that CA as the only client-CA pool means a certificate this deployment did not sign never reaches a handler, and `RequireClientCert` makes the CN authoritative — a request whose PATH names a different node is rejected rather than reconciled. Registration then checks the protocol version, that the deployment id matches, that the site was declared, and that the contribution is non-zero.
 

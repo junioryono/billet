@@ -436,6 +436,12 @@ func (c *CA) leafTemplate(cn string) (*x509.Certificate, error) {
 		// A LEAF MAY NOT OUTLIVE ITS AUTHORITY. Verification fails on the CA's
 		// expiry regardless, so issuing past it would hand an operator a
 		// certificate whose printed dates lie about when their node stops working.
+		//
+		// SILENT UNTIL IT MATTERS, WHICH IS THE TRAP. Once the CA has less than a
+		// leaf's life left, every certificate it issues is quietly shorter than
+		// the last — renewals keep working and keep getting cheaper, until one day
+		// they are hours long and then the whole fleet stops together. Capped is
+		// therefore something to SAY, not just to do; see CA.Capping.
 		notAfter = c.cert.NotAfter
 	}
 
@@ -924,4 +930,21 @@ func NewNodeCSR(name string) ([]byte, []byte, error) {
 
 	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der}),
 		pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), nil
+}
+
+// Capping reports whether this authority is close enough to its own expiry that
+// the certificates it issues are being shortened, and how long it has left.
+//
+// THE FAILURE IT NAMES IS A SLOW ONE. A leaf may not outlive its authority, so
+// from one leaf-lifetime out every certificate issued is shorter than a full
+// life: renewals come round faster and faster, nothing errors, and then the whole
+// fleet expires on the same day the authority does.
+//
+// Rotating is an overlap, not a switch: issue a new authority, keep trusting the
+// old one while nodes pick the new one up through renewal, then retire it. That
+// is why renewal returns the CA alongside the certificate.
+func (c *CA) Capping() (time.Duration, bool) {
+	left := time.Until(c.cert.NotAfter)
+
+	return left, left < LeafLifetime
 }
