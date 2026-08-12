@@ -164,3 +164,23 @@ A node replaces its own certificate when less than a third of its life remains, 
 **The renewal is verified before it is installed**, and written to disk before it is used. A certificate that does not chain to the authority this node trusts leaves the working one in force.
 
 **What this does NOT cover:** a node whose certificate has already expired cannot renew, because renewal is authenticated by that certificate. It has to be re-enrolled by hand. The renewal window is a third of the certificate's life — months — so this only happens to a host that was off for that entire period.
+
+## AWS credentials, and what a cloud node hands to a job
+
+The `ec2` backend introduces a credential class billet had not held before: one that can create and destroy machines, and that is not scoped to a deployment the way the node-wire CA is.
+
+**Redacted on every rendering path, the same way the App key is.** `ec2.Credentials` implements `String`, `GoString`, `Format`, `MarshalJSON` and `LogValue` on a VALUE receiver, because each of those ignores the others — slog's JSON handler never consults `fmt`, `%#v` never consults `String`, and a pointer-receiver `String` is not consulted when a value is formatted. The access key ID is shown deliberately: it is an identifier, and printing it is the difference between "billet used the wrong role" and an unactionable "authentication failed". The secret and the session token are never shown at all, not even a prefix.
+
+**The instance role is preferred over an access key, and IMDSv1 is not a fallback.** A long-lived key in a unit file is a credential that never expires, on a host whose whole job is launching machines. v1 is an unauthenticated GET, so any request-forgery primitive in the process reads the role's credentials out of it; v2 needs a PUT first, which such a primitive generally cannot perform. A host with v2 turned off is refused rather than downgraded — and the test that says so serves credentials to an unauthenticated GET, because a test that merely asserts "an error came back" passes while the error arrives from somewhere else entirely. That exact weakness was found by mutation and fixed.
+
+**The credential document never appears in an error.** It IS the credential, and one shared error format string across three call sites is how it reaches a log.
+
+### What the job itself can read
+
+**The runner registration travels in user data, and that is a different trade from the one the container backend refuses.** There, the JIT config must stay out of argv because the host is SHARED — every other job on that machine could read it. On EC2 the instance holds exactly one job, is destroyed with it, and the registration is that job's own, single-use, and consumed before any workflow step runs.
+
+What user data must not become is a channel to anything else, which is why every launch pins `MetadataOptions.HttpTokens=required` and `HttpPutResponseHopLimit=1`: a container running inside the job cannot reach the metadata service at all. For the same reason `instance_profile` is optional and empty is the right answer — an instance profile is readable from inside the guest, so it is a credential handed to whatever the job runs.
+
+**Untrusted work needs a network of its own or it does not run.** An instance is a real isolation boundary, which is why this backend may run fork pull-request code that docker must refuse. That boundary is the KERNEL and not the VPC: a fork's job in the same security group as everything else reaches whatever that group reaches. So `node.ec2.untrusted_security_group_ids` is what admits untrusted work, and its absence refuses it — rather than defaulting onto the trusted group, which is the direction that cannot be undone once a job has run. `TrustUnknown` is refused whatever the configuration says, because billet could not classify the job at all and there is no basis for choosing either group.
+
+**A boot script is generated, so it is EXECUTED in a test rather than pattern-matched.** The first version carried the registration in a quoted heredoc inside `$( )` — which reads safer than a quoted assignment, and is not: a single quote in the value confuses the shell scanning for the closing paren, and `/bin/sh` dies with "unexpected EOF" on a later line. A boot script that fails to parse is an instance that starts, registers nothing, and reports success. A plain single-quoted assignment is the one construct with no parsing left in it, and the tests run the real script under `/bin/sh` with the command replaced by one that prints what the runner would have read.
