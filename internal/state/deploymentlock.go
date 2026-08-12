@@ -113,23 +113,19 @@ func LockDeployment(id string, opts LockOptions) (*DeploymentLock, error) {
 		return unplaceable(opts, fmt.Sprintf("cannot create %s (%v)", dir, err))
 	}
 
-	// RESOLVED ONCE, THEN HELD — and this is the second attempt at that sentence
-	// being true. MkdirAll, a stat, a chmod and an open are four independent
-	// pathname resolutions, and between any two of them the directory can be
-	// replaced, so the thing checked need not be the thing used. The first fix
-	// used os.Root, which was only most of the way there: it still needed a
-	// separate os.Lstat to ask whether the name was a symlink, and that second
-	// resolution could describe a different directory than the one the handle
-	// held.
+	// RESOLVED ONCE, THEN HELD. MkdirAll, a stat, a chmod and an open are four
+	// independent pathname resolutions, and between any two of them the directory can
+	// be replaced, so the thing checked need not be the thing used.
 	//
-	// O_DIRECTORY|O_NOFOLLOW answers both at once. The name is walked a single
-	// time, a symlinked final component is refused by the kernel rather than
-	// diagnosed afterwards, and the descriptor keeps referring to that inode
-	// however the name is rearranged later.
+	// O_DIRECTORY|O_NOFOLLOW answers both questions at once: the name is walked a
+	// single time, a symlinked final component is refused by the kernel rather than
+	// diagnosed afterwards, and the descriptor keeps referring to that inode however
+	// the name is rearranged later. os.Root is not enough on its own — it still needs
+	// a separate Lstat to ask about symlinks, and that second resolution can describe
+	// a different directory than the handle holds.
 	//
-	// What it does NOT cover is an untrusted-writable ANCESTOR, because MkdirAll
-	// above still walks the path by name. That is a real residual and it is
-	// recorded rather than implied away.
+	// What it does NOT cover is an untrusted-writable ANCESTOR, because MkdirAll above
+	// still walks the path by name. That is a real residual.
 	dirf, err := openLockDir(dir, !operatorChose)
 	if err != nil {
 		return unplaceable(opts, fmt.Sprintf("cannot open %s (%v)", dir, err))

@@ -176,26 +176,16 @@ const DefaultMaxCustody = 0
 // of the TTL — the same cadence and the same reasoning as the listener's own
 // heartbeats. Two renewals may be missed entirely before anything expires.
 func (r *Runner) KeepAlive(ctx context.Context) {
-	// THE CADENCE IS RE-READ EVERY CYCLE, not fixed at the first one.
+	// THE CADENCE IS RE-READ EVERY CYCLE, and the loop wakes on a short fixed tick
+	// rather than a timer armed for the TTL it read last.
 	//
-	// The TTL is negotiated at registration, and a node re-registers whenever the
-	// control plane forgets it or restarts. A plane that comes back advertising a
-	// SHORTER TTL leaves a janitor built on the old one renewing too slowly: the
-	// lease expires between two heartbeats, the reaper resells its capacity, and
-	// the container it was holding is still running. The janitor is started once
-	// on purpose — custody outlives any registration — so re-reading here is the
-	// only place that correction can happen.
-	// WAKES OFTEN, RENEWS ON SCHEDULE, and the two are deliberately separate.
-	//
-	// Re-reading the TTL when the timer fires is not enough: a timer armed for
-	// thirty seconds under a ninety-second TTL stays armed for thirty seconds even
-	// if the plane comes back advertising nine. The lease expires while a correct
-	// cadence sits in a variable nothing has consulted yet.
-	//
-	// So the loop wakes on a short fixed tick and asks whether a renewal is DUE.
-	// The cost is a few no-op wakeups a minute in a background goroutine; the
-	// alternative is a lease reaped between two heartbeats while its container
-	// runs.
+	// The TTL is negotiated at registration, and a plane that restarts advertising a
+	// SHORTER one leaves a janitor renewing too slowly: the lease expires between two
+	// heartbeats, the reaper resells its capacity, and the container it was holding is
+	// still running. A timer armed for thirty seconds does not shorten itself when the
+	// answer becomes nine, so the tick asks whether a renewal is DUE instead. The cost
+	// is a few no-op wakeups a minute. The janitor is started once on purpose —
+	// custody outlives any registration — so this is the only place that can correct.
 	next := time.Now().Add(r.renewEvery())
 
 	timer := time.NewTimer(watchTick)

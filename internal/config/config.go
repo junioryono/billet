@@ -272,20 +272,18 @@ type NodeConfig struct {
 	// LockDir is where this node places the host-wide deployment lock.
 	//
 	// THE LOCK BELONGS TO THE NODE ROLE, because the node is what manages containers
-	// and a control plane manages none. It is exclusive per identity, so a server
-	// that took it would keep a node on the same machine from ever starting.
+	// and a control plane manages none. It is exclusive per identity, so a server that
+	// took it would keep a node on the same machine from ever starting.
 	//
 	// THE LOCK'S SCOPE HAS TO MATCH THE DAEMON'S, and billet cannot derive that: every
-	// process reaching the same container runtime must meet at the same directory.
-	// The per-user default is wrong for a system service and an operator sharing
-	// /var/run/docker.sock, and for containers sharing a socket with private
-	// filesystems — neither collides without this key.
+	// process reaching the same container runtime must meet at the same directory. The
+	// per-user default is wrong for a system service sharing /var/run/docker.sock, and
+	// for containers sharing a socket with private filesystems.
 	//
 	// It must NOT be world-writable, or any local user could hold the file and keep
-	// billet from starting. A directory shared between two accounts must be SETGID,
-	// or the second account cannot open the lock at all; 2770 works everywhere, while
-	// 2730 works only where a directory can be opened for search without reading it
-	// (Linux O_PATH, darwin and FreeBSD O_SEARCH).
+	// billet from starting. A directory shared between two accounts must be SETGID;
+	// 2770 works everywhere, while 2730 works only where a directory can be opened for
+	// search without reading it (Linux O_PATH, darwin and FreeBSD O_SEARCH).
 	LockDir string `yaml:"lock_dir,omitempty"`
 	// AllowUnlockedDeployment starts this node even when the host-wide lock cannot be
 	// placed.
@@ -439,18 +437,14 @@ type Tier struct {
 	// listing `[firecracker, ec2]` may be placed on either, so losing the bare-metal
 	// host does not take the label down with it.
 	//
-	// THE ORDER DECIDES, AT ESCROW. The allocator walks it most-preferred-first over
-	// the hosts that can serve the tier and have room, and records the choice on the
-	// lease — so a job reaches the cloud only when home is full, rather than when a
-	// cloud node polls first. server.placement decides only between hosts this order
-	// cannot separate.
+	// THE ORDER DECIDES, AT ESCROW — the allocator walks it most-preferred-first over
+	// the hosts that can serve the tier and have room, so a job reaches the cloud only
+	// when home is full, rather than when a cloud node polls first. server.placement
+	// decides only between hosts this order cannot separate.
 	//
-	// Setting both this and Provider is an error rather than a merge: they are two
-	// spellings of the same field, and guessing which an operator meant — when the
-	// answer decides where untrusted code runs — is not a kindness.
-	//
-	// Docker is the only provider built, so the fallback half cannot be exercised
-	// yet (#32).
+	// Setting both this and Provider is an error rather than a merge: guessing which
+	// spelling an operator meant, when the answer decides where untrusted code runs,
+	// is not a kindness. Only docker is built (#32).
 	Providers []ProviderKind `yaml:"providers,omitempty"`
 	// GuestOS defaults to linux. Set it explicitly for macOS and Windows tiers —
 	// licensing and capability checks key off this field, not off the label.
@@ -516,21 +510,14 @@ type Tier struct {
 	//
 	// A FLOOR, where MaxConcurrent is a ceiling. Billet shares one budget across every
 	// tier and headroom is whatever is left, so a tier with steady demand can hold all
-	// of it while the others advertise zero and their jobs queue at GitHub — with
-	// nothing behaving incorrectly. On the catalogue in billet.example.yaml the 2 vCPU
-	// tier wins that race simply by fitting more often.
+	// of it while the others advertise zero and their jobs queue at GitHub. A
+	// reservation is deducted from what OTHER tiers may take, only while it is unmet.
 	//
-	// A reservation is deducted from what OTHER tiers may take, only while it is
-	// unmet. A tier already holding its floor competes for the rest on equal terms.
-	//
-	// THE COST IS IDLE CAPACITY, and it is not "the floor sits unclaimed": listeners
-	// refill escrow eagerly and without regard to demand, so the reserved tier CLAIMS
-	// its floor almost immediately and heartbeats those leases for as long as it is
-	// healthy. Reserve 2 slots of an 8 vCPU tier nothing uses and the machine is
-	// permanently 16 vCPU smaller, with no error and no log line.
-	//
-	// So reserve for tiers that have demand and are being crowded out, not for tiers
-	// that might one day want capacity. Zero, the default, means no guarantee.
+	// THE COST IS IDLE CAPACITY. Listeners refill escrow eagerly and without regard to
+	// demand, so a reserved tier CLAIMS its floor almost immediately and holds it for
+	// as long as it is healthy: reserve 2 slots of an 8 vCPU tier nothing uses and the
+	// machine is permanently 16 vCPU smaller, with no error and no log line. Reserve
+	// for tiers that have demand and are being crowded out. Zero is the default.
 	Reserved int `yaml:"reserved,omitempty"`
 }
 

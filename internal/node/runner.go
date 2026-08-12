@@ -220,18 +220,16 @@ func (r *Runner) Launch(
 			lease.ID, lease.Providers, r.provider.Kind())
 	}
 
-	// ASKED BEFORE ANYTHING IRREVERSIBLE HAPPENS.
+	// ASKED BEFORE ANYTHING IRREVERSIBLE HAPPENS. Minting the registration first and
+	// being refused afterwards leaves a runner registered on GitHub with nothing to
+	// consume it — one orphan per pull request, since every PR is refused by a
+	// container backend, accumulating until somebody notices the runner list.
 	//
-	// Minting the registration first and being refused afterwards leaves a runner
-	// registered on GitHub with nothing to consume it — and since every pull
-	// request is refused by a container backend, that is one orphan per PR,
-	// accumulating quietly until somebody notices the runner list.
-	// ALREADY RUNNING SOMEWHERE. A crash before an assignment is acknowledged
-	// means GitHub redelivers it, and the restarted listener has empty maps — so
-	// without this it escrows a second lease and starts a second container for a
-	// job the adopted one is still running. The extra runner is a live
-	// registration that can pick up unrelated work, and the original's completion
-	// may then destroy it.
+	// ALREADY RUNNING SOMEWHERE. A crash before an assignment is acknowledged means
+	// GitHub redelivers it, and the restarted listener has empty maps — so without
+	// this it escrows a second lease and starts a second container for a job the
+	// adopted one is still running. The extra runner is a live registration that can
+	// pick up unrelated work, and the original's completion may then destroy it.
 	//
 	// An ordinary error, deliberately, not ErrCustody: the caller must release the
 	// lease it just took, because the capacity for this job is already held by the
@@ -395,23 +393,19 @@ func (r *Runner) Launch(
 // Idempotent: a request nothing was started for is success, because this runs on
 // redelivered completions, on shutdown, and after a failure.
 func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
-	// BOTH ARE ATTEMPTED, whatever either of them does. A request can have compute
-	// in the running map AND a custody entry — a redelivered assignment after a
-	// crash produces exactly that — and returning on the first error left the
-	// other half running while the listener, which treats this error as
-	// non-fatal, acknowledged the completion. Nothing ever came back for it.
+	// BOTH ARE ATTEMPTED, whatever either of them does. A request can have compute in
+	// the running map AND a custody entry — a redelivered assignment after a crash
+	// produces exactly that — and returning on the first error leaves the other half
+	// running while the listener, which treats this error as non-fatal, acknowledges
+	// the completion.
 	//
-	// THE CUSTODY FAILURE IS NOT RETURNED, and joining it was the mistake that
-	// replaced. The caller is a listener that reads any error as "the compute for
-	// MY lease may still exist" and therefore keeps its lease and heartbeats it —
-	// so a custody-only failure stranded a lease whose compute had just been
-	// destroyed successfully, permanently, until shutdown.
-	//
-	// Custody does not need the listener's help: its entry holds its own lease,
-	// which holds its own capacity, and Tend retries it every tick. What the
-	// listener needs to know is only whether ITS compute is gone. So the custody
-	// failure is logged here, where the context is, and the return value speaks
-	// for the running half alone.
+	// THE CUSTODY FAILURE IS NOT RETURNED. The caller is a listener that reads any
+	// error as "the compute for MY lease may still exist" and therefore keeps its
+	// lease and heartbeats it, so a custody-only failure would strand a lease whose
+	// compute had just been destroyed successfully. Custody does not need the
+	// listener's help: its entry holds its own lease, and Tend retries it every tick.
+	// So it is logged here, where the context is, and the return value speaks for the
+	// running half alone.
 	if err := r.releaseRequest(ctx, requestID); err != nil {
 		r.log.Error("could not finish releasing compute billet was holding for a finished job; "+
 			"its lease still holds the capacity and the next sweep will retry",
