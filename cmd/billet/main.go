@@ -18,6 +18,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -491,7 +492,7 @@ func runServer(ctx context.Context, lc *lifecycle, cfg *config.Config, dryRun bo
 		// no node keeps a copy that can drift from this one.
 		nodeplane.WithTierCatalog(cfg.Tiers))
 
-	stopWire, err := serveNodeWire(ctx, cfg, owner, nodes, allocator,
+	stopWire, err := serveNodeWire(ctx, cfg, nodes, allocator,
 		wiring.NodeJIT{Client: client}, allocator, allocator)
 	if err != nil {
 		return err
@@ -567,14 +568,29 @@ func nodeTLSHosts(cfg *config.Config) ([]string, error) {
 // and requires one back. There is nothing to configure and nothing to install:
 // the CA lives beside the state directory, and `billet ca issue <node>` produces
 // the bundle a node is given.
+// THE DEPLOYMENT IS READ HERE RATHER THAN PASSED IN, because a parameter of
+// that type is one a caller can fill with the wrong string and the compiler
+// cannot tell. It was filled with the hostname, and both boot orders failed
+// silently: minted against a hostname, the authority produces node certificates
+// carrying a deployment no node can parse and the plane refuses forever; minted
+// by `billet ca issue` against the real id, this function refuses to start at
+// all. Neither shows up on loopback, which is every local run.
+//
+// state.DeploymentID reads the file the rest of the process already read, so
+// there is nothing to keep in step.
 func serveNodeWire(
 	ctx context.Context,
-	cfg *config.Config, deployment string,
+	cfg *config.Config,
 	nodes *nodeplane.Plane, store nodeplane.LeaseStore, jit nodeplane.JITSource,
 	revocations nodeplane.Revocations, enrollments nodeplane.Enrollments,
 ) (func(), error) {
 	addr := cfg.Server.Listen
 	loopback := nodeplane.LoopbackOnly(addr)
+
+	deployment, err := state.DeploymentID(cfg.Server.StateDir)
+	if err != nil {
+		return nil, err
+	}
 
 	var handlerOpts []nodeplane.HandlerOption
 
@@ -684,6 +700,31 @@ func serveNodeWire(
 			slog.Default().Warn("the node listener did not shut down cleanly", "error", err)
 		}
 	}, nil
+}
+
+// serverHostname is the name a node checks its control plane's certificate
+// against.
+//
+// Taken from node.server_addr, which is the address the node actually dials, so
+// the certificate is verified against the thing that was reached rather than
+// against whatever the certificate happens to claim.
+func serverHostname(addr string) (string, error) {
+	s := addr
+	if !strings.Contains(s, "://") {
+		s = "https://" + s
+	}
+
+	u, err := url.Parse(s)
+	if err != nil {
+		return "", fmt.Errorf("node.server_addr %q is not an address billet can dial: %w", addr, err)
+	}
+
+	if u.Hostname() == "" {
+		return "", fmt.Errorf("node.server_addr %q names no host, so there is nothing to verify "+
+			"the control plane's certificate against", addr)
+	}
+
+	return u.Hostname(), nil
 }
 
 // newProvider builds the compute backend this host runs.
@@ -842,7 +883,12 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 			return err
 		}
 
-		tlsConf = identity.ClientTLS()
+		host, hostErr := serverHostname(cfg.Node.ServerAddr)
+		if hostErr != nil {
+			return hostErr
+		}
+
+		tlsConf = identity.ClientTLS(host)
 	}
 
 	client, err := nodeclient.New(nodeclient.Options{
@@ -1419,7 +1465,20 @@ func recordIssued(ctx context.Context, cfgPath, name, fingerprint, certPEM strin
 
 	defer closeDB()
 
-	return a.RecordIssued(ctx, name, fingerprint, certPEM)
+	displaced, err := a.RecordIssued(ctx, name, fingerprint, certPEM)
+	if err != nil {
+		return err
+	}
+
+	// SAID OUT LOUD, because this is the one path that can quietly retire a
+	// fingerprint an operator has already compared and trusted.
+	if displaced != "" {
+		fmt.Printf("\nNOTE: %s was already admitted as %s.\nThat key can no longer be used "+
+			"under this name; revoke its certificate if the machine still holds it.\n",
+			name, displaced)
+	}
+
+	return nil
 }
 
 func cmdCAShow(args []string) error {

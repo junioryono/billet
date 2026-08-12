@@ -1,8 +1,15 @@
 package wirecert_test
 
 import (
+	"bytes"
+	"crypto/tls"
 	"crypto/x509"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/internal/wirecert"
 )
@@ -187,5 +194,212 @@ func TestASecondRotationIsRefused(t *testing.T) {
 
 	if _, err := wirecert.Rotate(dir, rotDeployment); err == nil {
 		t.Fatal("a second rotation started while the first was still running")
+	}
+}
+
+// A ROTATION REACHES A CONNECTION THE NODE HAS ALREADY BUILT.
+//
+// Every part of the overlap is on disk and in memory before this matters, and
+// none of it helps if the live transport cannot see it. A node calls ClientTLS
+// exactly once, at startup, and the config it gets is installed in an
+// http.Transport for the life of the process. A renewal that widens the trust
+// bundle is the whole propagation mechanism for a CA rotation — so if that
+// widening does not reach the config already handed out, the rotation is
+// invisible to every node that has not restarted.
+//
+// The failure is the outage the two-phase design exists to prevent, arriving on
+// the operator's schedule: rotate, watch nodes renew, retire, restart the
+// control plane so it presents the new authority, and every node that has been
+// up the whole time cannot verify it. Nothing in the procedure says to restart
+// the fleet, because on paper nothing needs to.
+func TestARenewalWidensTrustForAConfigAlreadyHandedOut(t *testing.T) {
+	t.Parallel()
+
+	// Two independent authorities: what the node starts out trusting, and what a
+	// rotation moves it to.
+	oldDir, newDir := t.TempDir(), t.TempDir()
+
+	oldCA, err := wirecert.LoadOrCreateCA(oldDir, rotDeployment)
+	if err != nil {
+		t.Fatalf("create the old authority: %v", err)
+	}
+
+	newCA, err := wirecert.LoadOrCreateCA(newDir, rotDeployment)
+	if err != nil {
+		t.Fatalf("create the new authority: %v", err)
+	}
+
+	node := writeBundleTo(t, oldCA, "epyc-1")
+
+	id, err := wirecert.NewRotating(node.cert, node.key, node.ca)
+	if err != nil {
+		t.Fatalf("rotating identity: %v", err)
+	}
+
+	// TAKEN ONCE, AT STARTUP, exactly as `billet node` takes it.
+	clientTLS := id.ClientTLS("127.0.0.1")
+
+	// A control plane presenting a certificate from the NEW authority — which is
+	// what it does the moment the old one is retired.
+	srv := serveWith(t, newCA)
+
+	if err := dialWith(t, srv, clientTLS); err == nil {
+		t.Fatal("the node verified an authority it had never been told about")
+	}
+
+	// The renewal: a new leaf from the new authority, and a bundle carrying both.
+	renewed, err := newCA.IssueNode("epyc-1")
+	if err != nil {
+		t.Fatalf("issue the renewed certificate: %v", err)
+	}
+
+	bundle := append(append([]byte(nil), newCA.CertPEM()...), oldCA.CertPEM()...)
+
+	if err := id.Replace(renewed.CertPEM, renewed.KeyPEM, bundle); err != nil {
+		t.Fatalf("replace: %v", err)
+	}
+
+	// THE SAME CONFIG, not a fresh one. A node has no reason to ask for another
+	// and no code path that does.
+	if err := dialWith(t, srv, clientTLS); err != nil {
+		t.Fatalf("the renewal did not reach the connection the node already had: %v", err)
+	}
+}
+
+// nodeBundle is a bundle written to disk, which is what NewRotating reads.
+type nodeBundle struct{ cert, key, ca string }
+
+func writeBundleTo(t *testing.T, ca *wirecert.CA, name string) nodeBundle {
+	t.Helper()
+
+	b, err := ca.IssueNode(name)
+	if err != nil {
+		t.Fatalf("issue %s: %v", name, err)
+	}
+
+	dir := t.TempDir()
+	out := nodeBundle{
+		cert: filepath.Join(dir, "node.crt"),
+		key:  filepath.Join(dir, "node.key"),
+		ca:   filepath.Join(dir, "ca.crt"),
+	}
+
+	for path, body := range map[string][]byte{out.cert: b.CertPEM, out.key: b.KeyPEM, out.ca: b.CAPEM} {
+		if err := os.WriteFile(path, body, 0o600); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+
+	return out
+}
+
+// serveWith starts a TLS server presenting a certificate from ca.
+func serveWith(t *testing.T, ca *wirecert.CA) *httptest.Server {
+	t.Helper()
+
+	b, err := ca.IssueServer([]string{"127.0.0.1"})
+	if err != nil {
+		t.Fatalf("issue the server certificate: %v", err)
+	}
+
+	conf, err := wirecert.ServerTLS(b)
+	if err != nil {
+		t.Fatalf("server tls: %v", err)
+	}
+
+	// Clients here are testing SERVER verification, so a missing client
+	// certificate must not be what fails the handshake.
+	conf.ClientAuth = tls.NoClientCert
+
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(
+		func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }))
+	srv.TLS = conf
+	srv.StartTLS()
+
+	t.Cleanup(srv.Close)
+
+	return srv
+}
+
+// dialWith makes one request through a transport built from conf, the way
+// nodeclient builds one.
+func dialWith(t *testing.T, srv *httptest.Server, conf *tls.Config) error {
+	t.Helper()
+
+	c := &http.Client{Transport: &http.Transport{
+		TLSClientConfig:     conf,
+		TLSHandshakeTimeout: 5 * time.Second,
+		DisableKeepAlives:   true,
+	}}
+	defer c.CloseIdleConnections()
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL, http.NoBody)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+
+	resp, err := c.Do(req)
+	if resp != nil {
+		defer resp.Body.Close()
+	}
+
+	return err
+}
+
+// A RENEWAL THAT DOES NOT CHAIN IS NOT WRITTEN DOWN EITHER.
+//
+// Verifying in memory and persisting first is the wrong order and the failure is
+// delayed: the node keeps running on the certificate it already had, logs that
+// it kept it, and looks healthy — while the bundle on disk is the bad one. It is
+// the restart that fails, and by then nothing on the node can fix it, because
+// renewal is authenticated by the certificate being renewed. The machine has to
+// be re-enrolled by hand, which is exactly what renewal exists to avoid.
+func TestARejectedRenewalLeavesTheBundleOnDiskAlone(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	ca, err := wirecert.LoadOrCreateCA(dir, rotDeployment)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	node := writeBundleTo(t, ca, "epyc-1")
+
+	id, err := wirecert.NewRotating(node.cert, node.key, node.ca)
+	if err != nil {
+		t.Fatalf("rotating identity: %v", err)
+	}
+
+	before, err := os.ReadFile(node.cert)
+	if err != nil {
+		t.Fatalf("read the bundle: %v", err)
+	}
+
+	// A certificate from an authority this node has never heard of, offered
+	// without a bundle that would explain it — a control plane that has gone
+	// wrong, which is the case worth surviving.
+	stranger, err := wirecert.LoadOrCreateCA(t.TempDir(), rotDeployment)
+	if err != nil {
+		t.Fatalf("create the stranger: %v", err)
+	}
+
+	bad, err := stranger.IssueNode("epyc-1")
+	if err != nil {
+		t.Fatalf("issue: %v", err)
+	}
+
+	if err := id.Replace(bad.CertPEM, bad.KeyPEM, nil); err == nil {
+		t.Fatal("a certificate from an unknown authority was accepted")
+	}
+
+	after, err := os.ReadFile(node.cert)
+	if err != nil {
+		t.Fatalf("read the bundle back: %v", err)
+	}
+
+	if !bytes.Equal(before, after) {
+		t.Error("the rejected certificate was written to disk anyway; this node keeps working " +
+			"until it restarts and then cannot start at all")
 	}
 }

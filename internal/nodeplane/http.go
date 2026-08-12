@@ -293,14 +293,65 @@ func (h *handler) forOwnLease(next http.HandlerFunc) http.HandlerFunc {
 		// outlives its replacement on purpose, and once the replacement goes silent
 		// the node is forgotten; requiring membership refused the drain its own
 		// lease at exactly the moment nothing else was renewing it.
-		if err := h.plane.MayMutateLease(node, incarnation, r.PathValue("lease")); err != nil {
+		lease := r.PathValue("lease")
+
+		if err := h.plane.MayMutateLease(node, incarnation, lease); err != nil {
 			writeStoreErr(w, err)
 
 			return
 		}
 
+		// AND THE LEDGER ANSWERS FOR A LEASE NOTHING HAS CLAIMED YET. The owners
+		// map holds only what this process has DELIVERED, so held escrow — and
+		// every lease in the window after a restart, before the fleet re-adopts —
+		// is legitimately missing from it, and MayMutateLease has nothing left to
+		// refuse with but fleet membership, which every registered node passes.
+		if !h.plane.LeaseOwnerRecorded(lease) && !h.ledgerAgrees(w, r, node, lease) {
+			return
+		}
+
 		next(w, r)
 	}
+}
+
+// ledgerAgrees reports whether the ledger places this lease on this node,
+// answering the request itself when it does not.
+//
+// COALESCE(node, target_node), the way the rest of the arithmetic attributes a
+// lease: escrow chose the machine long before a bind fills `node` in, and that
+// choice is what billet advertised against. A lease the ledger has not placed at
+// all is allowed through — that is the recovery path, where a node re-adopts
+// what it is already running.
+func (h *handler) ledgerAgrees(w http.ResponseWriter, r *http.Request, node, leaseID string) bool {
+	lease, err := h.store.Lease(r.Context(), leaseID)
+	if err != nil {
+		writeStoreErr(w, err)
+
+		return false
+	}
+
+	// A LEDGER THAT SAYS NOTHING CONTRADICTS NOTHING. A store may answer with no
+	// lease and no error, and refusing on that would turn a lookup miss into a
+	// node losing the right to maintain compute it is running.
+	if lease == nil {
+		return true
+	}
+
+	placed := lease.Node
+	if placed == "" {
+		placed = lease.TargetNode
+	}
+
+	if placed == "" || placed == node {
+		return true
+	}
+
+	writeStoreErr(w, fmt.Errorf(
+		"%w: the ledger places lease %s on node %q and this request came from %q. A node may "+
+			"change the fate only of work placed on it",
+		ErrSuperseded, leaseID, placed, node))
+
+	return false
 }
 
 // forNewWork wraps a route by which a node ACQUIRES work or capacity.
@@ -520,6 +571,19 @@ func (h *handler) enroll(w http.ResponseWriter, r *http.Request) {
 	// the second poll and strand the machine it was minted for.
 	if !h.knownEnrollment(r.Context(), req.Node, fingerprint) {
 		if err := h.enrollments.SpendJoinToken(r.Context(), req.JoinToken); err != nil {
+			// A LEDGER THAT CANNOT ANSWER IS NOT A BAD CREDENTIAL. Reporting one
+			// as the other sends an operator to mint tokens that cannot help,
+			// because the next one fails the same way — and the error that would
+			// have said so was never written down.
+			if !errors.Is(err, alloc.ErrBadJoinToken) {
+				h.log.Error("could not check a join token", "node", req.Node, "error", err)
+
+				writeErr(w, http.StatusServiceUnavailable, nodeapi.CodeUnavailable,
+					"billet could not check this join token; try again")
+
+				return
+			}
+
 			h.log.Warn("an enrollment was attempted without a usable join token",
 				"node", req.Node, "fingerprint", fingerprint)
 

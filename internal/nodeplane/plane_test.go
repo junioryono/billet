@@ -1521,3 +1521,38 @@ func TestACancelledCallerIsNotStuck(t *testing.T) {
 		t.Fatal("a cancelled launch reported success")
 	}
 }
+
+// A NODE MAY NOT TOUCH ANOTHER NODE'S LEASE, and being registered is not the
+// thing that decides it.
+//
+// MayMutateLease checks ownership first, which is right, and then falls through
+// to fleet membership when the owner does not match — which admitted ANY current
+// node for ANY lease id. Registration proves which host you are; it says nothing
+// about what work you were given. EntitledToLaunch already draws that line for
+// JIT credentials, and this is the same line for the lease's fate.
+//
+// The reachable damage is capacity, not just tidiness. Lease ids are not secret:
+// provider.InstanceName puts them in the runner name, which is visible in the
+// organisation's runner list. A host that reads one and releases it terminalises
+// a lease whose container is still running on somebody else's machine, and the
+// freed vCPU is escrowed to another tier — the double-admission the ledger
+// exists to prevent, caused from outside the ledger.
+func TestANodeCannotReleaseAnotherNodesLease(t *testing.T) {
+	p := New(slog.New(slog.DiscardHandler), deployment, time.Minute)
+
+	register(t, p, "a", config.ProviderDocker)
+	register(t, p, "b", config.ProviderDocker)
+
+	// The launch went to a, so a owns it.
+	p.AdoptOwnership("a", "inc-a", []string{"l1"})
+
+	if err := p.MayMutateLease("a", "inc-a", "l1"); err != nil {
+		t.Fatalf("the node the lease was given to may not maintain it: %v", err)
+	}
+
+	err := p.MayMutateLease("b", "inc-b", "l1")
+	if err == nil {
+		t.Fatal("a registered node was allowed to change the fate of a lease belonging to " +
+			"another node; it can release capacity out from under a running container")
+	}
+}

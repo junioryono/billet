@@ -991,8 +991,26 @@ func (p *Plane) MayMutateLease(node, incarnation, leaseID string) error {
 	// refused the drain the right to renew its own lease at exactly the moment
 	// nothing else could. The lease then expired under compute that was still
 	// running.
-	if owner, ok := p.owners[leaseID]; ok && owner.node == node && owner.incarnation == incarnation {
+	owner, owned := p.owners[leaseID]
+	if owned && owner.node == node && owner.incarnation == incarnation {
 		return nil
+	}
+
+	// AND AN OWNER THAT NAMES ANOTHER HOST ENDS IT HERE, rather than falling
+	// through to the membership check below — which admitted any current node for
+	// any lease id, because being registered proves which host you are and says
+	// nothing about what work you were given. EntitledToLaunch draws that line for
+	// JIT credentials; this is the same line for a lease's fate.
+	//
+	// Lease ids are not secret — provider.InstanceName puts them in the runner
+	// name, which the organisation's runner list shows — so this was reachable by
+	// reading a web page: release somebody else's lease, and the ledger frees vCPU
+	// that a container on another machine is still using.
+	if owned && owner.node != node {
+		return fmt.Errorf(
+			"%w: lease %s was given to node %q and this request came from %q. A node may "+
+				"change the fate only of work it was handed",
+			ErrSuperseded, leaseID, owner.node, node)
 	}
 
 	n, ok := p.nodes[node]
@@ -1567,4 +1585,19 @@ func acceptsGuestOS(n *node, lease *alloc.Lease) bool {
 	}
 
 	return false
+}
+
+// LeaseOwnerRecorded reports whether the plane has a delivery record for a lease.
+//
+// Its absence is what sends the wire to the ledger: the owners map holds only
+// what this process has DELIVERED, so held escrow — and everything at all in the
+// window after a restart, before the fleet re-adopts — is missing from it
+// legitimately.
+func (p *Plane) LeaseOwnerRecorded(leaseID string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	_, ok := p.owners[leaseID]
+
+	return ok
 }
