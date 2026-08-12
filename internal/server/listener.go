@@ -1286,16 +1286,12 @@ func (l *Listener) retryCleanup(ctx context.Context) {
 
 	l.mu.Unlock()
 
+	// NO ERROR BRANCH, because attempt has none to give. A failure records its
+	// own obligation and its own backoff before returning — the pacing lives with
+	// the knowledge of what failed, rather than in a caller that would have to be
+	// told.
 	for _, job := range pending {
-		err := l.attempt(ctx, job)
-		if err == nil {
-			continue
-		}
-
-		l.log.Error("could not finish cleaning up a completed job; will retry",
-			"tier", l.tier, "request", job.RequestID, "error", err)
-
-		l.backOff(job.RequestID)
+		l.attempt(ctx, job)
 	}
 }
 
@@ -1463,7 +1459,7 @@ func (l *Listener) destroyAll(ctx context.Context) map[int64]bool {
 // mark makes the shutdown skip a request, so an entry that outlives its attempt
 // hides that request from teardown permanently — a container nobody destroys and
 // nobody mentions. A panic under complete would do it.
-func (l *Listener) attempt(ctx context.Context, job Job) error {
+func (l *Listener) attempt(ctx context.Context, job Job) {
 	l.mu.Lock()
 
 	// CLAIMED UNDER THE SAME LOCK THAT SEALS, which is what makes the shutdown's
@@ -1475,7 +1471,7 @@ func (l *Listener) attempt(ctx context.Context, job Job) error {
 	if l.sealed {
 		l.mu.Unlock()
 
-		return nil
+		return
 	}
 
 	l.destroying[job.RequestID] = true
@@ -1487,7 +1483,7 @@ func (l *Listener) attempt(ctx context.Context, job Job) error {
 		l.mu.Unlock()
 	}()
 
-	return l.complete(ctx, job)
+	l.complete(ctx, job)
 }
 
 // seal stops the cleanup loop from starting any further destroys.
@@ -1499,19 +1495,6 @@ func (l *Listener) seal() {
 	defer l.mu.Unlock()
 
 	l.sealed = true
-}
-
-// backOff pushes a failed retry's next attempt out.
-//
-// Called for a release failure here and from complete for a destroy failure, so
-// both halves of a retry that could not finish are paced the same way.
-func (l *Listener) backOff(requestID int64) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	if entry, ok := l.cleanup[requestID]; ok {
-		entry.failed(time.Now(), l.retryFirst, l.retryMax)
-	}
 }
 
 // heartbeatInterval is how often held capacity is renewed: a third of the
@@ -1863,9 +1846,7 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 	for _, job := range msg.Completed {
 		finished[job.RequestID] = struct{}{}
 
-		if err := l.complete(ctx, job); err != nil {
-			return err
-		}
+		l.complete(ctx, job)
 	}
 
 	// NO NEW WORK WHILE DRAINING, and the refusal has to be HERE rather than in
@@ -2373,7 +2354,18 @@ func releaseSettled(err error) bool {
 // has already released is simply not in the map. Release with PhaseDone rather
 // than inspecting a conclusion — the lease's job is finished either way, and the
 // outcome belongs to job history rather than to the capacity ledger.
-func (l *Listener) complete(ctx context.Context, job Job) error {
+// IT CANNOT FAIL, and the signature says so.
+//
+// Everything that can go wrong here — a destroy the node refused, a release the
+// ledger could not take — is recorded as a pending obligation and retried on the
+// cleanup clock. Returning an error would be worse than useless: complete runs
+// on the poll path, where an error stops the listener, cancels every other
+// listener, and destroys every job running on this host.
+//
+// Returning nothing keeps that from being re-learned. An error return that is
+// always nil is an invitation to wire the next failure mode through it, and the
+// branch handling it would never run.
+func (l *Listener) complete(ctx context.Context, job Job) {
 	// DESTROYED BEFORE RELEASED, and outside the mutex.
 	//
 	// Releasing first would hand the capacity to another tier while this job's
@@ -2447,7 +2439,7 @@ func (l *Listener) complete(ctx context.Context, job Job) error {
 
 		l.mu.Unlock()
 
-		return nil
+		return
 	}
 
 	l.mu.Lock()
@@ -2490,7 +2482,7 @@ func (l *Listener) complete(ctx context.Context, job Job) error {
 		// in the map being retried for the life of the process.
 		delete(l.cleanup, job.RequestID)
 
-		return nil
+		return
 	}
 
 	relErr := l.alloc.Release(ctx, lease.ID, lease.Epoch, outcome)
@@ -2554,15 +2546,13 @@ func (l *Listener) complete(ctx context.Context, job Job) error {
 		delete(l.running, job.RequestID)
 		delete(l.acquiring, job.RequestID)
 
-		return nil
+		return
 	}
 
 	// RELEASED, so the job is finally over and there is nothing to retry.
 	delete(l.running, job.RequestID)
 	delete(l.acquiring, job.RequestID)
 	delete(l.cleanup, job.RequestID)
-
-	return nil
 }
 
 // releaseAll hands back capacity that was escrowed and never used.
