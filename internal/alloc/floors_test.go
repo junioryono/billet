@@ -193,3 +193,63 @@ func TestAFloorWithNoSuitableMachineDoesNotSpendTheCeiling(t *testing.T) {
 			"still taking the deployment's ceiling away from a tier that can run", got, want)
 	}
 }
+
+// A LEASE ON A MACHINE THAT IS GONE DOES NOT SATISFY A FLOOR.
+//
+// The two halves of the arithmetic disagreed about a dead host. Placement asks
+// `live = 1 AND drained = 0`, so a gone machine offers nothing — but the count
+// that decides whether a floor is already met asked only for a non-terminal
+// lease, wherever it was aimed. So escrow stranded on a machine that has since
+// vanished still read as "the reservation is satisfied", and nothing was held
+// back for it.
+//
+// The window is not narrow: the lease is stranded until its own tier's listener
+// notices and releases it, and any other tier asking for capacity in between is
+// offered the last machine that could have served the floor. Once it takes it,
+// the reserved tier has zero of its promised slots and no machine left to place
+// one on — with nothing having behaved incorrectly.
+func TestAFloorIsNotSatisfiedByEscrowStrandedOnADeadMachine(t *testing.T) {
+	reserved := tier("reserved", 4, 8*config.GiB)
+	reserved.Provider = config.ProviderDocker
+	reserved.Reserved = 1
+
+	greedy := tier("greedy", 4, 8*config.GiB)
+	greedy.Provider = config.ProviderDocker
+
+	a := newBareAllocator(t, Limits{MaxVCPU: 1000, MaxMemory: 4000 * config.GiB},
+		[]config.Tier{reserved, greedy})
+
+	// Two machines, one slot each.
+	epochs := map[string]int64{}
+
+	for _, name := range []string{"a", "b"} {
+		_, epoch := mustRegister(t, a, NodeRegistration{
+			Name: name, Provider: config.ProviderDocker, VCPU: 4, Memory: 64 * config.GiB})
+		epochs[name] = epoch
+	}
+
+	// The reserved tier takes its one slot. Wherever it landed, its floor is met.
+	lease, err := a.Reserve(t.Context(), "reserved")
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	if lease.TargetNode == "" {
+		t.Fatal("escrow did not place the lease on a machine")
+	}
+
+	// That machine goes away. The lease is still in the ledger, still
+	// non-terminal, and now serves nothing.
+	gone := lease.TargetNode
+
+	if err := a.NodeGone(t.Context(), gone, epochs[gone]); err != nil {
+		t.Fatalf("NodeGone: %v", err)
+	}
+
+	// The surviving machine is the only one that could serve the floor, so the
+	// greedy tier may not have it.
+	if got := headroom(t, a, "greedy"); got != 0 {
+		t.Errorf("the unreserved tier was offered %d slots on the only machine left that "+
+			"could serve the reserved tier's floor; the reservation is now unkeepable", got)
+	}
+}

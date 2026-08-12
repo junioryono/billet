@@ -346,3 +346,69 @@ func TestACrashedHostsExpiredEscrowDoesNotLockItOut(t *testing.T) {
 		t.Errorf("a host could not change backend after a crash left expired escrow: %v", err)
 	}
 }
+
+// EXPIRY IS NOT PROOF THAT A CONTAINER IS GONE, and only the idle case may act
+// as though it were.
+//
+// A lease ages out when nothing is heartbeating it, which says the control-plane
+// holder stopped — not that the compute stopped. For escrow nobody ever launched
+// that distinction does not exist, and letting it expire out of the way is what
+// keeps a crashed deployment restartable. For a lease in a RUNNING phase there
+// is, or may be, a container on that host right now.
+//
+// Reading them the same way lets a host change its backend out from under work
+// the new backend cannot see: the Docker container keeps running, Tart
+// reconciliation cannot enumerate it, the reaper frees the lease, and the next
+// escrow puts a second job on a machine that is still running the first.
+//
+// The way out is unchanged and does not deadlock: the reaper lives in the
+// server, the server starts without this node, and a terminalised lease stops
+// counting here.
+func TestAnExpiredRunningLeaseStillPinsTheHostsBackend(t *testing.T) {
+	now := time.Now().UTC()
+
+	a := newBareAllocator(t, Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB},
+		[]config.Tier{{
+			Label: "small", Provider: config.ProviderDocker, GuestOS: config.GuestLinux,
+			VCPU: 2, Memory: 8 * config.GiB, Image: "img",
+		}},
+		WithClock(func() time.Time { return now }),
+		WithLeaseTTL(30*time.Second))
+
+	home := NodeRegistration{
+		Name: "epyc-1", Provider: config.ProviderDocker,
+		VCPU: 64, Memory: 256 * config.GiB,
+	}
+	if _, err := a.RegisterNode(t.Context(), home); err != nil {
+		t.Fatalf("RegisterNode: %v", err)
+	}
+
+	lease, err := a.Reserve(t.Context(), "small")
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	if err := a.Bind(t.Context(), lease.ID, lease.Epoch, "epyc-1"); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	fresh, err := a.Lease(t.Context(), lease.ID)
+	if err != nil {
+		t.Fatalf("Lease: %v", err)
+	}
+
+	// A container is running on this host under the docker backend.
+	advanceTo(t, a, fresh, PhaseBusy)
+
+	// The control plane dies. Nothing heartbeats, and the lease ages out — while
+	// the container carries on.
+	now = now.Add(31 * time.Second)
+
+	moved := home
+	moved.Provider = config.ProviderTart
+
+	if _, err := a.RegisterNode(t.Context(), moved); !errors.Is(err, ErrWrongProvider) {
+		t.Fatalf("a host with a container still running changed its backend because the "+
+			"lease holding that container had aged out: %v", err)
+	}
+}
