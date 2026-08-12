@@ -132,7 +132,15 @@ func (a *Allocator) ResolveQuarantine(ctx context.Context, leaseID string) error
 //
 // Measured from when the lease EXPIRED, so a lease has already gone a full TTL
 // without a heartbeat before this clock starts.
-const quarantineGrace = time.Minute
+//
+// GENEROUS ON PURPOSE, because the two errors are not symmetric. Too short sells
+// a running machine's slot twice, which nothing recovers; too long returns the
+// capacity later than it could have, which the next sweep fixes by itself and an
+// operator can force. So this is sized for the slowest plausible create rather
+// than the typical one: the docker provider launches with `docker run --detach`,
+// which PULLS THE IMAGE INLINE, and a multi-gigabyte runner image on a slow link
+// takes minutes rather than seconds.
+const quarantineGrace = 5 * time.Minute
 
 func (a *Allocator) ResolveQuarantineFor(
 	ctx context.Context, node string, running []string, epoch int64,
