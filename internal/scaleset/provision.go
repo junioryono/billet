@@ -106,28 +106,21 @@ func (c *Client) EnsureScaleSet(ctx context.Context, name, group string, labels 
 //
 // This exists because THERE IS NO OTHER WAY. A scale set created through the API
 // has no delete control in GitHub's UI — the org's runner list shows it with no
-// options menu, and its detail page offers statistics and nothing else. So a
-// tool that creates scale sets and cannot remove them leaves the operator with
-// orphans they are not able to clean up by hand. Verified against a real
-// organization, not inferred.
+// options menu, and its detail page offers statistics and nothing else. Verified
+// against a real organization, not inferred.
 //
-// Looked up by NAME rather than taking an id, because the id is billet's
-// internal handle and the name is what an operator has: it is the tier label
-// from their own billet.yaml.
+// Looked up by NAME rather than by id, because the id is billet's internal handle
+// and the name is what an operator has: the tier label from their own billet.yaml.
 //
 // By default it refuses a scale set whose labels are not this tier's, exactly as
 // adoption does. FORCE exists because that refusal would otherwise be a trap:
-// labels drift — somebody edits them in the UI, or an older billet created the
-// set with a different set — and then billet will not delete it and the UI
-// cannot, which is precisely the stuck state this function exists to prevent.
-// Force is per-invocation and single-tier by construction at the CLI, and the
-// mismatch error names it.
+// labels drift, and then billet will not delete it and the UI cannot, which is
+// precisely the stuck state this function exists to prevent.
 //
-// Returns whether something was actually deleted, so the caller can tell
-// "removed it" from "there was nothing there". Those look identical to an
-// operator otherwise, and they are not: absence is scoped to the runner group
-// being asked about, so a tier that was created under a DIFFERENT group reports
-// absent here while the original survives untouched.
+// Returns whether something was actually deleted. "Removed it" and "there was
+// nothing there" look identical to an operator otherwise, and they are not:
+// absence is scoped to the runner group being asked about, so a tier created under
+// a DIFFERENT group reports absent here while the original survives.
 func (c *Client) DeleteScaleSet(
 	ctx context.Context, name, group string, labels []string, force bool,
 ) (bool, error) {

@@ -195,34 +195,26 @@ func (d *DeploymentLock) Degraded() string {
 // checkLockDir refuses a directory an untrusted party could interfere with, and
 // reports whether it is a SHARED one.
 //
-// MkdirAll IS NOT ENOUGH, which state.Open already knew and this did not: its
-// mode applies only to components it CREATES, so an existing directory keeps
-// whatever permissions it had. That matters more here than it looks, because
-// failing closed made it matter: with degradation gone, a directory an
-// unprivileged user can write is no longer just a way to defeat the lock by
-// unlinking the file — it is a way to hold the filename and keep billet from
-// ever starting. That is precisely the denial of service that ruled out /tmp in
-// the first place, so the two fixes interact and this is where it is paid for.
+// MkdirAll IS NOT ENOUGH: its mode applies only to components it CREATES, so an
+// existing directory keeps whatever permissions it had. Because the lock fails
+// closed, a directory an unprivileged user can write is not merely a way to defeat
+// the lock by unlinking the file — it is a way to hold the filename and keep billet
+// from ever starting, the same denial of service that ruled out /tmp.
 //
-// TWO REGIMES, because the answer genuinely differs:
+// TWO REGIMES. A path BILLET chose (the per-user default) must be ours alone, so
+// group- and world-writable are both refused and the mode is tightened the way
+// state.Open tightens its own. A path the OPERATOR chose may be group-writable,
+// because that is the entire point of server.lock_dir: a setgid directory shared by
+// a service account and an operator who both reach the same docker socket.
+// World-writable is refused under both.
 //
-//   - A path BILLET chose (the per-user default) must be ours alone. Nobody else
-//     has any business writing there, so group- and world-writable are both
-//     refused, and the mode is tightened the way state.Open tightens its own.
-//   - A path the OPERATOR chose is allowed to be group-writable, because that is
-//     the entire point of server.lock_dir: a setgid directory shared by a service
-//     account and an operator who both reach the same docker socket. They are
-//     trusted with each other's compute by construction. World-writable is still
-//     refused under both.
-//
-// A SHARED DIRECTORY MUST BE SETGID, and that requirement is not bureaucracy —
-// it is the only thing that makes the sharing work. Without it a new file takes
-// the CREATOR'S primary group, so a service account whose primary group is
-// `service` and whose supplemental group is `billet` produces a lock file owned
-// by `service`: mode 0660, every permission bit the checks ask for, and still
-// unopenable by the operator it was widened for. Group-writable proves that
-// somebody intended sharing; setgid is what determines WHO. So the directory's
-// gid is returned and the lock file is required to match it.
+// A SHARED DIRECTORY MUST BE SETGID, and that is what makes the sharing work.
+// Without it a new file takes the CREATOR'S primary group, so a service account
+// whose primary group is `service` produces a lock file owned by `service`: mode
+// 0660, every permission bit the checks ask for, and still unopenable by the
+// operator it was widened for. Group-writable proves somebody intended sharing;
+// setgid determines WHO. So the directory's gid is returned and the lock file is
+// required to match it.
 func checkLockDir(dirf *os.File, dir string, operatorChose bool) (bool, fileGroup, error) {
 	// ONE observation, of the descriptor. There is no second Lstat asking whether
 	// the name is a symlink, because O_DIRECTORY|O_NOFOLLOW already refused that

@@ -365,11 +365,9 @@ func claimIdentity(
 // nodeContribution is what this host offers: what it detected, unless its own
 // config said otherwise.
 //
-// ONE DEFINITION, ONE CALLER, now that `billet node` is the only way a host
-// joins. It used to have two: --dev wrote the contribution straight into the
-// ledger while the node sent it over the wire, and if those ever resolved it
-// differently the same file would describe a different machine depending on
-// which process happened to read it.
+// ONE DEFINITION, ONE CALLER, because `billet node` is the only way a host joins.
+// Two paths resolving it independently would let the same file describe a
+// different machine depending on which process read it.
 func nodeContribution(cfg *config.Config) (config.Contribution, error) {
 	vcpu, memory, err := config.DetectHostCapacity()
 	if err != nil {
@@ -507,10 +505,9 @@ func runServer(ctx context.Context, lc *lifecycle, cfg *config.Config, dryRun bo
 	// capacity advertised until somebody happened to need it.
 	go nodes.Watch(ctx)
 
-	// THE REMOTE PLANE DRIVES ALL COMPUTE, and it is now the only thing that can.
-	// Forgetting to attach it — which is exactly what the first version of the
-	// node split did — leaves a control plane that serves the node wire, accepts
-	// registrations, and then never sends a single command.
+	// THE REMOTE PLANE DRIVES ALL COMPUTE, and it is the only thing that can. A
+	// control plane without it serves the node wire, accepts registrations, and then
+	// never sends a single command.
 	opts = append(opts, server.WithNodeRunner(nodes.NewRunner()))
 
 	plane := server.New(allocator, wiring.Provisioner{Client: client}, cfg.Tiers, owner, slog.Default(), opts...)
@@ -983,11 +980,9 @@ func cmdTeardown(ctx context.Context, args []string) error {
 			"delete anything from", *cfgPath)
 	}
 
-	// "Delete everything" is NEVER the default for a destructive command.
-	//
-	// It used to be: an omitted --tier selected every tier, which is
-	// indistinguishable from `--tier "$TIER"` with TIER unset. A script with an
-	// empty variable would have deleted every scale set in the org while looking
+	// "Delete everything" is NEVER the default for a destructive command. An omitted
+	// --tier is indistinguishable from `--tier "$TIER"` with TIER unset, so a script
+	// with an empty variable would delete every scale set in the org while looking
 	// like it asked for one.
 	switch {
 	case *all && *tier != "":
@@ -1379,13 +1374,13 @@ func cmdCAIssue(ctx context.Context, args []string) error {
 		abs = dir
 	}
 
-	// RECORDED, so both ways into a deployment leave the same trail. Issuing
-	// directly used to write nothing down, and a fleet built this way was
-	// invisible to the list that shows what has been admitted.
+	// RECORDED, so both ways into a deployment leave the same trail: a fleet built by
+	// issuing directly would otherwise be invisible to the list that shows what has
+	// been admitted.
 	//
-	// Not fatal if it fails: the bundle is already on disk and the operator has
-	// what they came for. Losing the audit row is worth saying out loud and not
-	// worth throwing the certificate away over.
+	// Not fatal if it fails: the bundle is already on disk and the operator has what
+	// they came for. Losing the audit row is worth saying out loud and not worth
+	// throwing the certificate away over.
 	if leaf, lerr := wirecert.LeafOf(bundle); lerr != nil {
 		fmt.Fprintf(os.Stderr, "could not read back the certificate to record it: %v\n", lerr)
 	} else if rerr := recordIssued(ctx, *cfgPath, name, wirecert.FingerprintOfCert(leaf),
