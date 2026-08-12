@@ -69,6 +69,36 @@ func (a *Allocator) RequestEnrollment(ctx context.Context, name, fingerprint, cs
 			return err
 		}
 
+		// A DENIED ROW HOLDS NOTHING. Denying is the only tool an operator has for
+		// a request that should not proceed, and while it kept the name claimed it
+		// was a one-way door: the enrolling process holds its private key in
+		// memory while it waits for a human, so a reboot loses the key and leaves
+		// the row, and the machine that comes back with a new one is refused
+		// forever. There was no way out short of editing the ledger by hand.
+		//
+		// Pending and approved still hold it, which is the property approval
+		// depends on — an operator who compared a fingerprint yesterday must not
+		// be approving a different machine today under a name they already trust.
+		if existing.State == EnrollDenied && existing.Fingerprint != fingerprint {
+			now := ts(a.now().UTC())
+
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE node_enrollments
+				    SET fingerprint = ?, csr_pem = ?, cert_pem = '', state = ?,
+				        source = 'enrolled', requested_at = ?, decided_at = ''
+				  WHERE name = ?`,
+				fingerprint, csrPEM, EnrollPending, now, name); err != nil {
+				return fmt.Errorf("alloc: record the enrollment of %s: %w", name, err)
+			}
+
+			out = Enrollment{
+				Name: name, Fingerprint: fingerprint, CSRPEM: csrPEM,
+				State: EnrollPending, RequestedAt: now,
+			}
+
+			return nil
+		}
+
 		if existing.Fingerprint != fingerprint {
 			return fmt.Errorf("%w: %s is held by %s", ErrEnrollmentConflict, name, existing.Fingerprint)
 		}

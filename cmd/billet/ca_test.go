@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -548,4 +549,57 @@ func TestTheNodeWireAcceptsTheAuthorityTheCLIMinted(t *testing.T) {
 	}
 
 	t.Cleanup(stop)
+}
+
+// AN INTERRUPTED ENROLLMENT COMES BACK AS THE SAME REQUEST.
+//
+// The name is claimed by the first key to ask, so a machine that loses its key
+// while waiting for a human and generates another is a SECOND key asking for a
+// name that is already taken — and the control plane is right to refuse it. The
+// key therefore has to outlive the process that made it.
+func TestAnInterruptedEnrollmentReusesItsStagedKey(t *testing.T) {
+	dir := t.TempDir()
+	tls := &config.NodeTLS{
+		CertPath: filepath.Join(dir, "node.crt"),
+		KeyPath:  filepath.Join(dir, "node.key"),
+		CAPath:   filepath.Join(dir, "ca.crt"),
+	}
+
+	firstCSR, firstKey, err := pendingIdentity(tls, "epyc-1")
+	if err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+
+	// The process dies here, and the operator starts it again.
+	secondCSR, secondKey, err := pendingIdentity(tls, "epyc-1")
+	if err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+
+	if !bytes.Equal(firstKey, secondKey) {
+		t.Error("a retry generated a new private key, so it is asking for a name the first " +
+			"attempt already claimed and will be refused forever")
+	}
+
+	if !bytes.Equal(firstCSR, secondCSR) {
+		t.Error("a retry presents a different request, so the fingerprint the operator was " +
+			"shown describes nothing")
+	}
+
+	// The staged key is a secret.
+	info, err := os.Stat(filepath.Join(dir, "pending.key"))
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Errorf("the staged private key is mode %04o", got)
+	}
+
+	// And once it becomes a bundle, the spare copy goes.
+	clearPendingIdentity(tls)
+
+	if _, err := os.Stat(filepath.Join(dir, "pending.key")); !os.IsNotExist(err) {
+		t.Error("the staged key outlived the enrollment, leaving a second copy of a private key")
+	}
 }

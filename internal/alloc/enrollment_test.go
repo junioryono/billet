@@ -1,6 +1,7 @@
 package alloc
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/junioryono/billet/internal/config"
@@ -48,5 +49,69 @@ func TestIssuingOverAnExistingEnrollmentReportsWhatItDisplaced(t *testing.T) {
 	if displaced != "SHA256:first" {
 		t.Errorf("issuing under a claimed name reported %q displaced, want SHA256:first; the "+
 			"operator is never told the key they compared has been retired", displaced)
+	}
+}
+
+// A DENIED NAME IS FREE AGAIN, and until now nothing was.
+//
+// The name is claimed by the first key to ask, which is the property approval
+// depends on: an operator who compared a fingerprint yesterday must not find
+// themselves approving a different machine today under a name they already
+// trust. But the conflict applied to a DENIED row too, and denying was the only
+// tool an operator had — so a name, once asked for, could never be used by any
+// other key.
+//
+// That is not a hypothetical. The enrolling process holds its private key in
+// memory while it waits for a human; a reboot or a Ctrl-C loses the key and
+// leaves the row. The machine retries, generates a new key, and is refused
+// forever. There was no way back short of editing the database by hand.
+func TestADeniedEnrollmentFreesTheNameForAnotherKey(t *testing.T) {
+	a := newAllocator(t, Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, nil)
+
+	if _, err := a.RequestEnrollment(t.Context(), "epyc-1", "SHA256:lost", "csr-1"); err != nil {
+		t.Fatalf("first request: %v", err)
+	}
+
+	// The key is gone with the process that made it, so the operator denies it.
+	if err := a.DecideEnrollment(t.Context(), "epyc-1", "SHA256:lost", EnrollDenied, ""); err != nil {
+		t.Fatalf("deny: %v", err)
+	}
+
+	// The machine comes back with a new key.
+	rec, err := a.RequestEnrollment(t.Context(), "epyc-1", "SHA256:fresh", "csr-2")
+	if err != nil {
+		t.Fatalf("a denied name could not be claimed by another key, so it is unusable "+
+			"forever: %v", err)
+	}
+
+	if rec.State != EnrollPending {
+		t.Errorf("the new request is %q, not pending, so no operator will ever see it", rec.State)
+	}
+
+	if rec.Fingerprint != "SHA256:fresh" {
+		t.Errorf("the pending request still shows the lost key %q", rec.Fingerprint)
+	}
+}
+
+// AND A PENDING OR APPROVED NAME IS STILL HELD, which is the property that makes
+// approval mean anything.
+func TestAClaimedNameStillRefusesASecondKey(t *testing.T) {
+	a := newAllocator(t, Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, nil)
+
+	if _, err := a.RequestEnrollment(t.Context(), "epyc-1", "SHA256:first", "csr-1"); err != nil {
+		t.Fatalf("first request: %v", err)
+	}
+
+	if _, err := a.RequestEnrollment(t.Context(), "epyc-1", "SHA256:second", "csr-2"); !errors.Is(err, ErrEnrollmentConflict) {
+		t.Fatalf("a pending name accepted a second key: %v", err)
+	}
+
+	if err := a.DecideEnrollment(t.Context(), "epyc-1", "SHA256:first", EnrollApproved, "cert"); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+
+	if _, err := a.RequestEnrollment(t.Context(), "epyc-1", "SHA256:second", "csr-2"); !errors.Is(err, ErrEnrollmentConflict) {
+		t.Fatalf("an approved name accepted a second key, so a machine an operator already "+
+			"trusts can be displaced by anything that asks: %v", err)
 	}
 }

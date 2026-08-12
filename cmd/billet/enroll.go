@@ -241,6 +241,11 @@ func cmdNodesDecide(ctx context.Context, args []string, decision string) error {
 		alloc.EnrollApproved: "Approved", alloc.EnrollDenied: "Denied",
 	}[decision], name)
 
+	if decision == alloc.EnrollDenied {
+		fmt.Printf("\nThe name is free again: another key may now ask for it. That is the way " +
+			"back\nfor a machine that lost its key while waiting to be approved.\n")
+	}
+
 	if decision == alloc.EnrollApproved {
 		fmt.Printf("\nIt picks up its certificate on its next attempt, within a few seconds.\n")
 	}
@@ -325,7 +330,15 @@ func enrollNode(ctx context.Context, cfg *config.Config, caFingerprint, joinToke
 			"there is nothing to take it from")
 	}
 
-	csrPEM, keyPEM, err := wirecert.NewNodeCSR(name)
+	// KEPT ACROSS ATTEMPTS, because the wait is for a human and this process may
+	// not survive it.
+	//
+	// The key used to exist only in memory. A reboot or a Ctrl-C during the
+	// approval wait lost it while the control plane kept the pending row, so the
+	// machine came back with a NEW key and was refused: the name was claimed by a
+	// fingerprint nothing could present any more. Reusing the staged key makes a
+	// retry the same request rather than a second one.
+	csrPEM, keyPEM, err := pendingIdentity(cfg.Node.TLS, name)
 	if err != nil {
 		return err
 	}
@@ -358,7 +371,15 @@ func enrollNode(ctx context.Context, cfg *config.Config, caFingerprint, joinToke
 					"returned does not verify against itself, so it would not start: %w", verifyErr)
 			}
 
-			return writeBundle(cfg.Node.TLS, certPEM, keyPEM, signedBy)
+			if err := writeBundle(cfg.Node.TLS, certPEM, keyPEM, signedBy); err != nil {
+				return err
+			}
+
+			// The staged request has become a certificate, so the copy of the key
+			// beside it is a second copy of a secret and nothing else.
+			clearPendingIdentity(cfg.Node.TLS)
+
+			return nil
 		case errors.Is(err, nodeclient.ErrDenied):
 			return fmt.Errorf("an operator denied this node; nothing to retry")
 		case errors.Is(err, nodeclient.ErrNotApproved):
@@ -372,6 +393,59 @@ func enrollNode(ctx context.Context, cfg *config.Config, caFingerprint, joinToke
 			return ctx.Err()
 		case <-time.After(enrollPollEvery):
 		}
+	}
+}
+
+// pendingIdentity is the key and request this node is enrolling with, generated
+// once and reused until enrollment finishes.
+//
+// STAGED BESIDE THE BUNDLE, so it survives the process that made it. The name is
+// claimed by the first key to ask; a machine that loses its key mid-wait and
+// generates another is a second key asking for a name that is already taken, and
+// the control plane is right to refuse it.
+//
+// Written 0600 with O_EXCL, so a stale staging file is reused rather than
+// silently replaced — replacing it is the very thing that strands the name.
+func pendingIdentity(tls *config.NodeTLS, name string) ([]byte, []byte, error) {
+	dir := filepath.Dir(tls.KeyPath)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, nil, fmt.Errorf("create %s: %w", dir, err)
+	}
+
+	keyStage := filepath.Join(dir, "pending.key")
+	csrStage := filepath.Join(dir, "pending.csr")
+
+	staged, keyErr := os.ReadFile(keyStage)
+	stagedCSR, csrErr := os.ReadFile(csrStage)
+
+	if keyErr == nil && csrErr == nil {
+		fmt.Printf("Resuming the enrollment already staged in %s.\n\n", dir)
+
+		return stagedCSR, staged, nil
+	}
+
+	csr, key, err := wirecert.NewNodeCSR(name)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if err := wirecert.WriteFileAtomic(keyStage, key, 0o600); err != nil {
+		return nil, nil, err
+	}
+
+	if err := wirecert.WriteFileAtomic(csrStage, csr, 0o644); err != nil {
+		return nil, nil, err
+	}
+
+	return csr, key, nil
+}
+
+// clearPendingIdentity drops the staged request once it has become a bundle.
+func clearPendingIdentity(tls *config.NodeTLS) {
+	dir := filepath.Dir(tls.KeyPath)
+
+	for _, name := range []string{"pending.key", "pending.csr"} {
+		_ = os.Remove(filepath.Join(dir, name))
 	}
 }
 
