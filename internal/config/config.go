@@ -823,6 +823,15 @@ func (c *Config) NodePolicies() map[string]NodePolicy {
 
 var labelRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$`)
 
+// awsRegionRe matches the SHAPE of a region rather than a list of them.
+//
+// An allowlist is a rule about somebody else's product, and it goes stale the
+// next time AWS opens a region — at which point billet refuses a config that is
+// perfectly correct. The shape catches the mistake people actually make, which is
+// dropping the hyphens, and still admits partitions billet has never run in:
+// us-gov-west-1, cn-north-1, ap-southeast-4.
+var awsRegionRe = regexp.MustCompile(`^[a-z]{2,}(-[a-z]+)+-\d+$`)
+
 // runnerGroupUnsafe are the characters that do not survive the scale-set client's
 // handling of a group name.
 //
@@ -1419,8 +1428,16 @@ func (c *Config) validateEC2Node() []error {
 
 	e := c.Node.EC2
 
-	if strings.TrimSpace(e.Region) == "" {
+	switch region := strings.TrimSpace(e.Region); {
+	case region == "":
 		errs = append(errs, errors.New("node.ec2.region is required"))
+
+	case !awsRegionRe.MatchString(region):
+		errs = append(errs, fmt.Errorf(
+			"node.ec2.region %q does not look like an aws region (expected something like "+
+				"us-west-2); it is part of the scope billet signs every request with, so an "+
+				"endpoint override cannot compensate for a typo here — the request reaches the "+
+				"right host and comes back 403", region))
 	}
 
 	if strings.TrimSpace(e.SubnetID) == "" {
