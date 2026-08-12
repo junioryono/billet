@@ -911,16 +911,23 @@ func TestADestroyEndsALeasesOwnership(t *testing.T) {
 // deliverLaunch registers a node and hands it a launch, which is the state every
 // ownership question starts from.
 //
-// The command timeout is a PARAMETER because its callers want opposite things.
-// Most are asking about ownership and need the timeout never to fire, so they
-// take the generous default — a shorter one there is a bet on how quickly a
-// goroutine gets scheduled, which is what made this suite flaky. One caller is
-// asking what an UNANSWERED destroy does, and needs it to fire promptly; sixty
-// seconds there is a minute of waiting for a result the test already knows.
+// The command timeout is a PARAMETER because its callers want different things,
+// and the DEFAULT IS DELIBERATELY SHORT.
+//
+// It was raised to sixty seconds on the reasoning that applies to a watchdog: a
+// short bound is a bet on how quickly a goroutine gets scheduled. That reasoning
+// is wrong here, because this timeout is not a watchdog — it bounds an IN-FLIGHT
+// dispatch, and every caller returns while one is still outstanding. CI then
+// failed TestADestroyIsNotConfirmedByTheWrongProcess after exactly 60.00s,
+// waiting for a replacement incarnation to park on a poll: the wait is bounded by
+// that dispatch clearing, so raising the timeout widened the window twelvefold
+// rather than making anything more patient.
+//
+// A caller that genuinely needs the timeout to FIRE promptly passes its own.
 func deliverLaunch(t *testing.T, opts ...Option) (*Plane, nodeapi.Command) {
 	t.Helper()
 
-	p := testPlane(t, append([]Option{WithCommandTimeout(60 * time.Second)}, opts...)...)
+	p := testPlane(t, append([]Option{WithCommandTimeout(5 * time.Second)}, opts...)...)
 
 	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
 		Version:     nodeapi.Version,
