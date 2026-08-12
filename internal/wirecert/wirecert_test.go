@@ -2,6 +2,7 @@ package wirecert_test
 
 import (
 	"bytes"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
@@ -292,9 +293,16 @@ func TestTheServerConfigRequiresAClientCertificate(t *testing.T) {
 		t.Fatalf("server tls: %v", err)
 	}
 
-	if conf.ClientAuth != 4 { // tls.RequireAndVerifyClientCert
-		t.Errorf("client auth is %v; anything short of require-and-verify lets an "+
-			"unauthenticated connection reach a handler", conf.ClientAuth)
+	// VERIFY IF GIVEN, not require. An unenrolled machine has no certificate and
+	// still has to reach /v1/ca and /v1/enroll; every other route is behind a
+	// handler guard that refuses a connection with no verified chain, which
+	// TestAnUnenrolledConnectionCanReachNothingElse is the proof of.
+	//
+	// What must NOT weaken is the verification of a certificate that IS
+	// presented: ClientCAs below is what keeps a forged one out.
+	if conf.ClientAuth != tls.VerifyClientCertIfGiven {
+		t.Errorf("client auth is %v; want VerifyClientCertIfGiven, so an unenrolled machine "+
+			"can ask to join while a presented certificate is still verified", conf.ClientAuth)
 	}
 
 	if conf.ClientCAs == nil {

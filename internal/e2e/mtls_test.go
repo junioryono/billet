@@ -1502,11 +1502,22 @@ func TestAnAnonymousConnectionIsRefused(t *testing.T) {
 		TLSClientConfig: &tls.Config{RootCAs: pool.RootCAs, MinVersion: tls.VersionTLS13},
 	}}
 
+	// REFUSED BY THE HANDLER, not by the handshake, and that distinction is the
+	// change: an unenrolled machine has no certificate and still has to reach
+	// /v1/ca and /v1/enroll, so the listener verifies a certificate if one is
+	// given rather than demanding one.
+	//
+	// What must not change is the outcome for everything else. 401 here means the
+	// guard refused it; anything 2xx would mean the relaxation opened a route.
 	res, err := anonymous.Get(base + "/v1/nodes/n1/launched") //nolint:noctx // no ctx needed here
-	if err == nil {
-		defer func() { _ = res.Body.Close() }()
+	if err != nil {
+		t.Fatalf("the anonymous connection did not complete: %v", err)
+	}
 
-		t.Fatalf("a connection presenting no certificate reached the wire and got %d",
+	defer func() { _ = res.Body.Close() }()
+
+	if res.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("a connection presenting no certificate got %d from a node route; want 401",
 			res.StatusCode)
 	}
 }

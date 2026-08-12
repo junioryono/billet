@@ -79,6 +79,7 @@ func commands(lc *lifecycle) []command {
 			func(ctx context.Context, args []string) error { return cmdServer(ctx, lc, args) }},
 		{"node", "run a compute host that dials a control plane",
 			func(ctx context.Context, args []string) error { return cmdNode(ctx, lc, args) }},
+		{"nodes", "approve the machines asking to join this deployment", cmdNodes},
 		{"ca", "issue the certificates nodes authenticate with", cmdCA},
 		{"check", "validate the config and state directory, then exit", cmdCheck},
 		{"init", "generate a billet.yaml interactively", cmdInit},
@@ -514,7 +515,7 @@ func runServer(ctx context.Context, lc *lifecycle, cfg *config.Config, dryRun bo
 		nodeplane.WithTierCatalog(cfg.Tiers))
 
 	stopWire, err := serveNodeWire(ctx, cfg, owner, nodes, allocator,
-		wiring.NodeJIT{Client: client}, allocator)
+		wiring.NodeJIT{Client: client}, allocator, allocator)
 	if err != nil {
 		return err
 	}
@@ -594,7 +595,7 @@ func serveNodeWire(
 	ctx context.Context,
 	cfg *config.Config, deployment string,
 	nodes *nodeplane.Plane, store nodeplane.LeaseStore, jit nodeplane.JITSource,
-	revocations nodeplane.Revocations,
+	revocations nodeplane.Revocations, enrollments nodeplane.Enrollments,
 ) (func(), error) {
 	addr := cfg.Server.Listen
 	loopback := nodeplane.LoopbackOnly(addr)
@@ -631,7 +632,11 @@ func serveNodeWire(
 			nodeplane.WithRevocations(revocations),
 			// AND RENEWED BEFORE IT EXPIRES, by the node itself. Without this a
 			// fleet enrolled on one afternoon expires on one afternoon a year later.
-			nodeplane.WithRenewal(ca))
+			nodeplane.WithRenewal(ca),
+			// AND A WAY IN FOR A MACHINE THAT HAS NOTHING YET. Asking grants
+			// nothing: the request waits until an operator compares its fingerprint
+			// against what the node printed.
+			nodeplane.WithEnrollment(enrollments))
 
 		slog.Default().Info("the node wire requires client certificates",
 			"hosts", hosts, "ca_expires", ca.NotAfter().Format(time.DateOnly))
@@ -762,6 +767,11 @@ func nodeBundle(cfg *config.Config) (*wirecert.Bundle, error) {
 func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 	fs := newFlagSet("billet node")
 	cfgPath := addConfigFlag(fs)
+	enroll := fs.Bool("enroll", false,
+		"ask the control plane to admit this machine, then wait for an operator to approve it")
+	caFingerprint := fs.String("ca-fingerprint", "",
+		"the control plane's CA fingerprint, from `billet ca show` (required with --enroll)")
+
 	if err := parse(fs, args); err != nil {
 		return err
 	}
@@ -777,6 +787,12 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 	if cfg.Node.ServerAddr == "" {
 		return fmt.Errorf("%s has no node.server_addr, so this host does not know which "+
 			"control plane to dial", *cfgPath)
+	}
+
+	// BEFORE ANYTHING ELSE, because enrolling is what produces the bundle
+	// everything below reads.
+	if *enroll {
+		return enrollNode(ctx, cfg, *caFingerprint)
 	}
 
 	// LOADED BEFORE THE IDENTITY IS CLAIMED, because the certificate is what
@@ -1384,8 +1400,13 @@ func cmdCAShow(args []string) error {
 		return err
 	}
 
-	fmt.Printf("deployment %s\nauthority   %s\nexpires     %s\n",
-		deployment, wirecert.CADir(cfg.Server.StateDir), ca.NotAfter().Format(time.RFC3339))
+	fmt.Printf("deployment  %s\nauthority   %s\nexpires     %s\nfingerprint %s\n",
+		deployment, wirecert.CADir(cfg.Server.StateDir), ca.NotAfter().Format(time.RFC3339),
+		ca.Fingerprint())
+
+	fmt.Printf("\nGive the fingerprint to a node that is enrolling, so it can tell this control\n")
+	fmt.Printf("plane from anything else that answers:\n\n")
+	fmt.Printf("  billet node --enroll --ca-fingerprint %s\n", ca.Fingerprint())
 
 	return nil
 }

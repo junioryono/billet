@@ -36,7 +36,7 @@ import (
 // register a host nothing can ever be placed on — silently, because a node with
 // no capacity is indistinguishable from a busy one. Refusing the registration is
 // the correct outcome rather than an inconvenience, which is what this bump buys.
-const Version = 4
+const Version = 5
 
 // CommandKind names what the server is asking a node to do.
 type CommandKind string
@@ -112,6 +112,13 @@ type RegisterRequest struct {
 // RegisterResponse tells a node what it needs to behave correctly.
 type RegisterResponse struct {
 	Version int `json:"version"`
+	// Deployment is which installation answered.
+	//
+	// SO THE NODE CAN CHECK TOO. TLS already binds this — the node verifies the
+	// server against a per-deployment CA — but a node that never looks has no way
+	// to say WHICH installation it is working for, and "am I doing work for the
+	// right control plane" is a question an operator asks during an incident.
+	Deployment string `json:"deployment,omitempty"`
 	// LeaseTTLSeconds is how long a lease survives without a heartbeat. The node
 	// needs it to pick its own renewal cadence; it is NOT free to invent one,
 	// because the reaper on the other side is what enforces it.
@@ -207,6 +214,41 @@ func TierSpecOf(t config.Tier) *TierSpec {
 		SHM:         t.SHM,
 		RunnerGroup: t.RunnerGroup,
 	}
+}
+
+// EnrollRequest asks to join a deployment.
+//
+// UNAUTHENTICATED BY DESIGN: a machine that has never been enrolled has no
+// certificate to authenticate with. What makes it safe is that asking grants
+// nothing — the request sits as `pending` until an operator compares its
+// fingerprint against what the node printed and approves it.
+type EnrollRequest struct {
+	Node   string `json:"node"`
+	CSRPEM string `json:"csr_pem"`
+}
+
+// EnrollResponse is the decision, or that there is not one yet.
+type EnrollResponse struct {
+	// State is pending, approved or denied.
+	State string `json:"state"`
+	// Fingerprint is what an operator has to compare, echoed so the node can
+	// print the same value the server will show.
+	Fingerprint string `json:"fingerprint"`
+	// CertPEM and CAPEM are set once approved.
+	CertPEM string `json:"cert_pem,omitempty"`
+	CAPEM   string `json:"ca_pem,omitempty"`
+}
+
+// CAResponse is the authority a node verifies the control plane against.
+//
+// SERVED UNAUTHENTICATED, and that is not a leak: a CA certificate is public by
+// construction — every node already has it and every TLS handshake presents the
+// chain. What matters is that the node checks the FINGERPRINT it was given out
+// of band before trusting what this returns.
+type CAResponse struct {
+	CAPEM       string `json:"ca_pem"`
+	Fingerprint string `json:"fingerprint"`
+	Deployment  string `json:"deployment"`
 }
 
 // RenewRequest asks the control plane to sign a new certificate for the node
