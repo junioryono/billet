@@ -396,8 +396,12 @@ func writeBundle(tls *config.NodeTLS, certPEM, keyPEM, caPEM []byte) error {
 		{tls.CertPath, certPEM, 0o644},
 		{tls.CAPath, caPEM, 0o644},
 	} {
-		if err := os.WriteFile(f.path, f.data, f.mode); err != nil {
-			return fmt.Errorf("write %s: %w", f.path, err)
+		// EXACTLY THIS MODE, whatever was there before. os.WriteFile applies its
+		// mode only when it creates the file, so re-enrolling a machine whose
+		// node.key was already 0644 wrote a fresh secret into a world-readable
+		// file and said it had succeeded.
+		if err := wirecert.WriteFileAtomic(f.path, f.data, f.mode); err != nil {
+			return err
 		}
 	}
 
