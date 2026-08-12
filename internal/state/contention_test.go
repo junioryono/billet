@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -378,6 +379,19 @@ func TestACancelledOperatorWriteReportsCancellation(t *testing.T) {
 
 	cancellable, cancel := context.WithCancel(ctx)
 
+	// CANCELLED ONLY ONCE THE WRITER IS PROVABLY WAITING. Cancelling on a guess
+	// usually lands before the first BeginTx, where database/sql reports the
+	// context itself and neither branch of the retry loop runs — so a regression
+	// in the branch this test exists to pin would pass on most runs.
+	waiting := make(chan struct{})
+
+	var once sync.Once
+
+	restoreHook := onBusyRetry
+	onBusyRetry = func() { once.Do(func() { close(waiting) }) }
+
+	t.Cleanup(func() { onBusyRetry = restoreHook })
+
 	var adminErr error
 
 	// The server holds the slot, so the operator write is stuck retrying — and
@@ -395,6 +409,7 @@ func TestACancelledOperatorWriteReportsCancellation(t *testing.T) {
 			})
 		}()
 
+		<-waiting
 		cancel()
 		<-done
 
