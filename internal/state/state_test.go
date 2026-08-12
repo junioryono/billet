@@ -1037,3 +1037,121 @@ func TestRebuildingMigrationsKeepRowsIndexesAndKeys(t *testing.T) {
 		t.Errorf("the rebuilt table refuses the quarantine phase: %v", err)
 	}
 }
+
+// AN OLDER DATABASE UPGRADES, WITH ITS ROWS INTACT.
+//
+// Everything else about migrations is checked on a database this binary just
+// created, which is the one case that cannot go wrong: an empty table survives
+// any rebuild. The interesting case is a database with DATA written by an
+// earlier billet, and CI never produces one — it starts from an empty directory
+// every time.
+//
+// Staged by removing the newest migrations' bookkeeping and reopening, which is
+// exactly the state an upgrade meets: tables in their old shape, rows in them,
+// and the runner about to rebuild the ones whose declaration changed.
+func TestADatabaseWrittenByAnEarlierBilletUpgrades(t *testing.T) {
+	dir := t.TempDir()
+
+	db, err := Open(t.Context(), dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	// Rows an earlier billet would have left behind, in every table the newest
+	// migrations rebuild.
+	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(t.Context(),
+			`INSERT INTO nodes (name, provider, last_seen_at)
+			 VALUES ('epyc-1', 'docker', '2026-01-01T00:00:00Z')`); err != nil {
+			return err
+		}
+
+		if _, err := tx.ExecContext(t.Context(),
+			`INSERT INTO leases
+			   (id, tier, node, phase, vcpu, memory, epoch, created_at, heartbeat_at,
+			    expires_at, target_node, macos_slot, guest_os, provider, providers,
+			    chosen_provider, run_id, request_id)
+			 VALUES ('l1','small','epyc-1','busy',2,8589934592,3,'t','t','t','epyc-1',
+			         1,'macos','tart','tart,ec2','tart',77,88)`); err != nil {
+			return err
+		}
+
+		if _, err := tx.ExecContext(t.Context(),
+			`INSERT INTO join_tokens (token_sha256, note, uses_remaining, created_at, expires_at)
+			 VALUES ('abc','a note',2,'t','t')`); err != nil {
+			return err
+		}
+
+		_, err := tx.ExecContext(t.Context(),
+			`INSERT INTO node_enrollments (name, fingerprint, csr_pem, state, requested_at)
+			 VALUES ('epyc-1','SHA256:x','csr','approved','t')`)
+
+		return err
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	// WOUND BACK TO WHAT v14 ACTUALLY LOOKED LIKE: the bookkeeping forgotten AND
+	// the tables the newest migrations introduce dropped, because a database from
+	// before them does not have those tables at all.
+	//
+	// What this does not reproduce is the OLD shape of the tables 16 and 17
+	// rebuild — they are already rebuilt here. The valuable half survives: the
+	// copy lists run again, against rows, which is the part that silently loses
+	// data. The declarations themselves are checked structurally elsewhere.
+	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
+		for _, stmt := range []string{
+			`DROP TABLE issued_certs`,
+			`DROP TABLE node_revocations`,
+			`DELETE FROM schema_migrations WHERE version >= 15`,
+		} {
+			if _, err := tx.ExecContext(t.Context(), stmt); err != nil {
+				return fmt.Errorf("%s: %w", stmt, err)
+			}
+		}
+
+		return nil
+	}); err != nil {
+		t.Fatalf("rewind: %v", err)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	upgraded, err := Open(t.Context(), dir)
+	if err != nil {
+		t.Fatalf("an upgrade of a database with rows in it failed: %v", err)
+	}
+
+	defer upgraded.Close()
+
+	// EVERY ROW SURVIVED, in every rebuilt table.
+	for _, tc := range []struct{ what, query, want string }{
+		{"the lease's provider list", `SELECT providers FROM leases WHERE id = 'l1'`, "tart,ec2"},
+		{"the join token's note", `SELECT note FROM join_tokens WHERE token_sha256 = 'abc'`, "a note"},
+		{"the enrollment's fingerprint",
+			`SELECT fingerprint FROM node_enrollments WHERE name = 'epyc-1'`, "SHA256:x"},
+	} {
+		var got string
+		if err := upgraded.Reader().QueryRowContext(t.Context(), tc.query).Scan(&got); err != nil {
+			t.Errorf("%s did not survive the upgrade: %v", tc.what, err)
+
+			continue
+		}
+
+		if got != tc.want {
+			t.Errorf("%s is %q after the upgrade, was %q", tc.what, got, tc.want)
+		}
+	}
+
+	// And the schema the upgrade was for actually arrived.
+	if err := upgraded.Tx(t.Context(), func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(t.Context(),
+			`UPDATE leases SET phase = 'quarantine' WHERE id = 'l1'`)
+
+		return err
+	}); err != nil {
+		t.Errorf("the upgraded database refuses the quarantine phase: %v", err)
+	}
+}
