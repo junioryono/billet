@@ -912,18 +912,24 @@ func TestADestroyEndsALeasesOwnership(t *testing.T) {
 // ownership question starts from.
 //
 // The command timeout is a PARAMETER because its callers want different things,
-// and the DEFAULT IS DELIBERATELY SHORT.
+// and the default is the five seconds these tests were written against.
 //
-// It was raised to sixty seconds on the reasoning that applies to a watchdog: a
-// short bound is a bet on how quickly a goroutine gets scheduled. That reasoning
-// is wrong here, because this timeout is not a watchdog — it bounds an IN-FLIGHT
-// dispatch, and every caller returns while one is still outstanding. CI then
-// failed TestADestroyIsNotConfirmedByTheWrongProcess after exactly 60.00s,
-// waiting for a replacement incarnation to park on a poll: the wait is bounded by
-// that dispatch clearing, so raising the timeout widened the window twelvefold
-// rather than making anything more patient.
+// It was briefly raised to sixty on the reasoning that applies to a WATCHDOG — a
+// short bound is a bet on how quickly a goroutine gets scheduled — and that
+// reasoning does not transfer, because this bounds an in-flight dispatch rather
+// than a wait. Eight of the nine callers resolve their dispatch long before it
+// matters, by an immediate Result, a parked poller, or the re-registration that
+// answers every superseded in-flight command synchronously; the one where it is a
+// live ceiling asks for a generous timeout explicitly, and the one that needs it
+// to FIRE asks for a short one.
 //
-// A caller that genuinely needs the timeout to FIRE promptly passes its own.
+// NOT, AS AN EARLIER VERSION OF THIS COMMENT CLAIMED, because raising it caused
+// the CI failure in TestADestroyIsNotConfirmedByTheWrongProcess. That test failed
+// after exactly 60.00s, which was BOTH this timeout and waitFor's watchdog at the
+// time — two equal constants, so the duration was evidence for neither, and the
+// mechanism written down here on the strength of it was wrong. The real cause was
+// a stale wake signal letting a single-shot poll return without parking, fixed in
+// that test rather than by tuning this number.
 func deliverLaunch(t *testing.T, opts ...Option) (*Plane, nodeapi.Command) {
 	t.Helper()
 
