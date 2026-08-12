@@ -1,13 +1,13 @@
 package wirecert_test
 
 import (
-	"bytes"
 	"crypto/tls"
 	"crypto/x509"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -371,10 +371,11 @@ func TestARejectedRenewalLeavesTheBundleOnDiskAlone(t *testing.T) {
 		t.Fatalf("rotating identity: %v", err)
 	}
 
-	before, err := os.ReadFile(node.cert)
-	if err != nil {
-		t.Fatalf("read the bundle: %v", err)
-	}
+	// ALL THREE FILES AND THEIR MODES. Snapshotting only the certificate would
+	// pass a regression that wrote the key and the authority before discovering
+	// the leaf was bad — the node's identity would be corrupt and this would say
+	// nothing.
+	before := snapshotBundle(t, node)
 
 	// A certificate from an authority this node has never heard of, offered
 	// without a bundle that would explain it — a control plane that has gone
@@ -393,13 +394,42 @@ func TestARejectedRenewalLeavesTheBundleOnDiskAlone(t *testing.T) {
 		t.Fatal("a certificate from an unknown authority was accepted")
 	}
 
-	after, err := os.ReadFile(node.cert)
-	if err != nil {
-		t.Fatalf("read the bundle back: %v", err)
-	}
-
-	if !bytes.Equal(before, after) {
-		t.Error("the rejected certificate was written to disk anyway; this node keeps working " +
+	if after := snapshotBundle(t, node); !reflect.DeepEqual(before, after) {
+		t.Error("the rejected renewal changed the bundle on disk; this node keeps working " +
 			"until it restarts and then cannot start at all")
 	}
+
+	// AND WHAT IS THERE STILL LOADS, which is the property that actually matters.
+	if _, err := wirecert.NewRotating(node.cert, node.key, node.ca); err != nil {
+		t.Errorf("the identity on disk no longer loads after a rejected renewal: %v", err)
+	}
+}
+
+// fileState is a file's contents and mode, which is what "unchanged" has to mean
+// for a bundle holding a private key.
+type fileState struct {
+	body string
+	mode os.FileMode
+}
+
+func snapshotBundle(t *testing.T, node nodeBundle) map[string]fileState {
+	t.Helper()
+
+	out := map[string]fileState{}
+
+	for _, path := range []string{node.cert, node.key, node.ca} {
+		body, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("stat %s: %v", path, err)
+		}
+
+		out[path] = fileState{body: string(body), mode: info.Mode().Perm()}
+	}
+
+	return out
 }
