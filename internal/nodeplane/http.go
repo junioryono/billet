@@ -200,6 +200,7 @@ func Handler(log *slog.Logger, p *Plane, store LeaseStore, jit JITSource, opts .
 	mux.HandleFunc("GET /v1/nodes/{node}/leases/{lease}", h.forOwnLease(h.lease))
 	mux.HandleFunc("GET /v1/nodes/{node}/launched", h.forNewWork(h.launched))
 	mux.HandleFunc("POST /v1/nodes/{node}/describe", h.forNewWork(h.describe))
+	mux.HandleFunc("POST /v1/nodes/{node}/reconcile", h.forNewWork(h.reconcile))
 	mux.HandleFunc("POST /v1/nodes/{node}/jit", h.forNode(h.jitConfig))
 	mux.HandleFunc("POST /v1/nodes/{node}/renew", h.forNode(h.renew))
 
@@ -1004,6 +1005,30 @@ func (h *handler) launched(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, nodeapi.LaunchedResponse{LeaseIDs: ids, Quarantined: held})
+}
+
+// reconcile frees capacity held for compute this host says it is not running.
+func (h *handler) reconcile(w http.ResponseWriter, r *http.Request) {
+	node := r.PathValue("node")
+
+	var req nodeapi.ReconcileRequest
+	if !decode(w, r, &req) {
+		return
+	}
+
+	freed, err := h.plane.ReconcileInventory(r.Context(), node, req.Instances)
+	if err != nil {
+		writeStoreErr(w, err)
+
+		return
+	}
+
+	if freed > 0 {
+		h.log.Info("freed capacity held for compute this host is no longer running",
+			"node", node, "leases", freed)
+	}
+
+	writeJSON(w, http.StatusOK, nodeapi.ReconcileResponse{Freed: freed})
 }
 
 func (h *handler) describe(w http.ResponseWriter, r *http.Request) {

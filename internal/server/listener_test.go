@@ -4513,3 +4513,62 @@ func TestOnlyASettledReleaseDropsTheLease(t *testing.T) {
 		}
 	}
 }
+
+// A LAUNCH WHOSE RELEASE DOES NOT LAND GIVES UP ITS REQUEST ID AND KEEPS THE
+// OBLIGATION.
+//
+// Keeping the lease in `running` was worse than dropping it, and it does not
+// heal. Nothing retries a release from that map — the cleanup loop walks its own
+// — and the heartbeat renews the entry forever, because the lease is still open
+// at the same epoch. Meanwhile the id is WEDGED: GitHub reassigns a job that
+// never started, and assign treats a redelivery for an id already in `running`
+// as its own work and swallows it, every time. The advertisement counts a
+// phantom and a drain waits its full grace for a completion that cannot come.
+//
+// Dropping the reference alone is the other half of the trap: the ledger goes
+// on charging until the reaper. So the obligation moves to the cleanup set,
+// which is the mechanism that already exists for it.
+func TestAnUnsettledReleaseAfterAFailedLaunchBecomesARetry(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, tiers)
+
+	runner := &fakeRunner{onLaunch: func(int64) error { return errors.New("no space left on device") }}
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner))
+
+	lease := holdRunning(t, l, a, tiers[0].Label, 7)
+
+	// THE LEDGER CANNOT ANSWER, which is what releaseSettled calls retryable — as
+	// opposed to a fenced or missing lease, which is settled and correctly drops.
+	// A cancelled context produces exactly that: the launch still fails through
+	// the fake, and the release that follows cannot reach the database.
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	if err := l.launch(ctx, lease, Job{RequestID: 7, RunID: 7}); err != nil {
+		t.Fatalf("launch: %v", err)
+	}
+
+	l.mu.Lock()
+	_, stillRunning := l.running[7]
+	entry, parked := l.cleanup[7]
+	l.mu.Unlock()
+
+	if stillRunning {
+		t.Error("the request id is still held, so a redelivery of this job is swallowed as " +
+			"work this listener is already doing — and nothing will ever complete it")
+	}
+
+	if !parked {
+		t.Fatal("the lease was dropped with its release unlanded; the ledger charges for it " +
+			"until the reaper arrives")
+	}
+
+	if entry.outcome != alloc.PhaseFailed {
+		t.Errorf("the obligation is recorded as %q; a runner that never started did not "+
+			"finish, and the history should not say it did", entry.outcome)
+	}
+
+	if entry.lease == nil {
+		t.Fatal("the cleanup entry carries no lease, so the retry has nothing to release")
+	}
+}

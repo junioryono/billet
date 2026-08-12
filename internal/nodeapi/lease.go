@@ -67,6 +67,27 @@ type LaunchedResponse struct {
 	Quarantined map[string]bool `json:"quarantined,omitempty"`
 }
 
+// ReconcileRequest tells the control plane what this host is actually running.
+//
+// SENT EVERY SWEEP, not only at registration, because quarantine happens on the
+// REAPER's clock rather than the node's. A control plane that restarts sees its
+// nodes re-register within seconds — before the leases they were holding have
+// expired — so the inventory that arrives with a registration almost never
+// covers the quarantine that follows it. Without a recurring report, capacity
+// for a container that finished during the outage is held until an operator
+// intervenes.
+type ReconcileRequest struct {
+	// Instances are the lease ids this host is running right now. An empty list
+	// from a host that could read its provider is meaningful; a host that could
+	// not read it does not send this request at all.
+	Instances []string `json:"instances"`
+}
+
+// ReconcileResponse reports what the control plane let go of.
+type ReconcileResponse struct {
+	Freed int `json:"freed"`
+}
+
 // ErrorResponse is how a refusal crosses the wire.
 //
 // Code is a STABLE STRING the node may branch on; Message is for a human. The

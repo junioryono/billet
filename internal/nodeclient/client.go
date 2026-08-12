@@ -465,6 +465,17 @@ func (c *Client) QuarantinedLeaseIDs(ctx context.Context, nodeName string) (map[
 	return res.Quarantined, nil
 }
 
+// Reconcile tells the control plane what this host is running, so it can free
+// capacity held for compute that is gone.
+func (c *Client) Reconcile(ctx context.Context, nodeName string, running []string) (int, error) {
+	var res nodeapi.ReconcileResponse
+
+	err := c.do(ctx, http.MethodPost, "/v1/nodes/"+url.PathEscape(nodeName)+"/reconcile",
+		nodeapi.ReconcileRequest{Instances: running}, &res)
+
+	return res.Freed, err
+}
+
 func (c *Client) launched(ctx context.Context, nodeName string) (nodeapi.LaunchedResponse, error) {
 	var res nodeapi.LaunchedResponse
 

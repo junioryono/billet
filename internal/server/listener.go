@@ -310,6 +310,15 @@ type promise struct {
 // pendingCleanup is a completion whose destroy has not succeeded yet.
 type pendingCleanup struct {
 	job Job
+	// lease is the capacity this obligation still holds, when the entry was
+	// created for a lease that is NOT in `running` — a launch that failed and
+	// whose release did not land. complete looks here when the running map has
+	// nothing, because the request id has already been given up.
+	lease *alloc.Lease
+	// outcome is how the lease should be archived, or empty for the ordinary
+	// completion. A launch that never started must not be recorded as `done`:
+	// "done" for a runner that never ran is a lie the history keeps.
+	outcome alloc.Phase
 	// Doubles after each failure, up to maxRetryEvery.
 	wait time.Duration
 	// Zero means immediately, which is what a freshly recorded failure wants.
@@ -2297,19 +2306,40 @@ func (l *Listener) launch(ctx context.Context, lease *alloc.Lease, job Job) erro
 			"tier", l.tier, "lease", lease.ID, "error", relErr)
 	}
 
-	// AND THE REFERENCE IS ONLY DROPPED ONCE THE LEASE IS SETTLED.
+	// THE REQUEST ID IS ALWAYS GIVEN UP; THE OBLIGATION MOVES.
 	//
-	// This map is the only place the lease is still named. Forgetting it after a
-	// release that did NOT land — the ledger is busy, the context went away —
-	// leaves nothing heartbeating it and nothing that shutdown's releaseAll can
-	// see, so the ledger goes on charging capacity for a container that never
-	// started until the reaper arrives a TTL later. Keeping it costs a retry;
-	// dropping it costs the capacity.
-	if releaseSettled(relErr) {
-		l.mu.Lock()
-		delete(l.running, job.RequestID)
-		l.mu.Unlock()
+	// Keeping the lease in `running` after a release that did not land was worse
+	// than dropping it, and in a way that does not heal. Nothing retries a
+	// release from that map — the cleanup loop walks its own — and the heartbeat
+	// renews the entry forever, because the lease is still open at the same
+	// epoch. Meanwhile the request id is wedged: GitHub reassigns a job that
+	// never started, and `assign` treats a redelivery for an id already in
+	// `running` as its own work and silently swallows it, every time. The
+	// advertisement counts a phantom and a drain waits its full grace for a
+	// completion that cannot arrive.
+	//
+	// So an unsettled release parks the lease in the cleanup set, which is the
+	// mechanism that already exists for exactly this — retried on its own clock,
+	// backing off, and refusing a re-assignment of that id until it clears.
+	// Archived as FAILED, because nothing ran: recording it as done would put a
+	// lie in the history.
+	l.mu.Lock()
+
+	delete(l.running, job.RequestID)
+
+	if !releaseSettled(relErr) {
+		if l.cleanup == nil {
+			l.cleanup = make(map[int64]*pendingCleanup)
+		}
+
+		if _, pending := l.cleanup[job.RequestID]; !pending {
+			l.cleanup[job.RequestID] = &pendingCleanup{
+				job: job, lease: lease, outcome: alloc.PhaseFailed,
+			}
+		}
 	}
+
+	l.mu.Unlock()
 
 	return nil
 }
@@ -2414,6 +2444,19 @@ func (l *Listener) complete(ctx context.Context, job Job) error {
 
 	lease, ok := l.running[job.RequestID]
 
+	// A RELEASE THAT NEVER LANDED PARKED THE LEASE HERE. The request id was given
+	// up so a redelivery is not swallowed, and this is the only remaining
+	// reference to the capacity it holds.
+	outcome := alloc.PhaseDone
+
+	if entry, parked := l.cleanup[job.RequestID]; parked && entry.lease != nil && !ok {
+		lease, ok = entry.lease, true
+
+		if entry.outcome != "" {
+			outcome = entry.outcome
+		}
+	}
+
 	if !ok {
 		// A job can also complete while it is still only PROMISED — GitHub cancels
 		// an assignment no runner picks up in time, and that cancellation arrives
@@ -2439,7 +2482,7 @@ func (l *Listener) complete(ctx context.Context, job Job) error {
 		return nil
 	}
 
-	if err := l.alloc.Release(ctx, lease.ID, lease.Epoch, alloc.PhaseDone); err != nil {
+	if err := l.alloc.Release(ctx, lease.ID, lease.Epoch, outcome); err != nil {
 		// THE ENTRY STAYS, and that is the whole point of keeping one. Deleting it
 		// when the DESTROY succeeded lost the retry to a transient release failure:
 		// the lease stayed in `running` being renewed forever, GitHub will not
@@ -2548,14 +2591,20 @@ func (l *Listener) releaseAll(ctx context.Context, destroyed map[int64]bool) {
 		release(lease)
 	}
 
-	// WHAT DID NOT LAND GOES BACK, rather than onto the floor. held and acquiring
-	// were cleared above so nothing new could take them mid-shutdown, and a
-	// release that failed for a reason a retry could fix has to stay somewhere
-	// the next pass — or a supervisor's restart — can still find it. Anything
-	// settled is already gone from the ledger's point of view.
+	// WHAT DID NOT LAND IS THE REAPER'S, and saying so is the honest version.
+	//
+	// An earlier attempt put these back on `held` "so the next pass can find
+	// them", which was wrong in a way worth recording: releaseAll runs once, from
+	// Run's teardown, on a listener that is single-use — there is no next pass,
+	// and a restart builds a new listener that has never heard of this map. The
+	// reference was findable by nothing.
+	//
+	// What actually recovers them is the reaper, within a TTL, because nothing is
+	// left to heartbeat them. That is a real mechanism rather than an imagined
+	// one, and it is why this is a warning rather than a failure.
 	if len(stuck) > 0 {
-		l.mu.Lock()
-		l.held = append(l.held, stuck...)
-		l.mu.Unlock()
+		l.log.Warn("shutting down with escrow whose release did not land; the reaper reclaims "+
+			"it once it stops being renewed",
+			"tier", l.tier, "leases", len(stuck))
 	}
 }

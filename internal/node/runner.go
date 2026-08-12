@@ -69,6 +69,7 @@ type LeaseStore interface {
 	Lease(ctx context.Context, leaseID string) (*alloc.Lease, error)
 	LaunchedLeaseIDs(ctx context.Context, node string) (map[string]bool, error)
 	QuarantinedLeaseIDs(ctx context.Context, node string) (map[string]bool, error)
+	Reconcile(ctx context.Context, node string, running []string) (int, error)
 
 	// LeaseTTL is how long a lease survives without a heartbeat, and it sets the
 	// cadence for renewing held ones. READ FROM THE LEDGER, never assumed: the
@@ -684,6 +685,25 @@ func (r *Runner) Sweep(ctx context.Context) error {
 		return fmt.Errorf("node: list running instances: %w", err)
 	}
 
+	// REPORTED EVERY SWEEP, INCLUDING WHEN THERE IS NOTHING TO REPORT.
+	//
+	// Quarantine happens on the REAPER's clock, not this one. A control plane
+	// that restarts sees its nodes re-register within seconds — before the leases
+	// they were holding have expired — so the inventory that arrives with a
+	// registration is taken before the quarantine it would resolve, and nothing
+	// looked again. The capacity of a job that finished during the outage was
+	// then held until an operator ran `billet leases release --force`.
+	//
+	// An EMPTY list is the case that matters most: a host running nothing is
+	// exactly the one whose quarantined capacity should come back, and the early
+	// return for "no instances" is what made that unreachable.
+	if err := r.reportInventory(ctx, instances); err != nil {
+		// Not fatal. The sweep's own work is destroying orphans, and a control
+		// plane that could not be told will be told on the next tick.
+		r.log.Warn("could not tell the control plane what this host is running; capacity for "+
+			"compute it cannot account for stays held until this succeeds", "error", err)
+	}
+
 	if len(instances) == 0 {
 		return nil
 	}
@@ -765,6 +785,21 @@ func (r *Runner) Sweep(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// reportInventory tells the control plane which leases this host is running.
+func (r *Runner) reportInventory(ctx context.Context, instances []*provider.Instance) error {
+	ids := make([]string, 0, len(instances))
+
+	for _, inst := range instances {
+		if leaseID, ours := provider.LeaseOf(inst.Name); ours {
+			ids = append(ids, leaseID)
+		}
+	}
+
+	_, err := r.alloc.Reconcile(ctx, r.node, ids)
+
+	return err
 }
 
 // Instances are the lease ids this host is actually running.
