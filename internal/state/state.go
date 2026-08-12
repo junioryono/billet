@@ -75,6 +75,10 @@ type DB struct {
 	r    *sql.DB
 	lock *dirLock
 
+	// scanned records whether this handle ran the integrity check at open. Only a
+	// control plane does; see openDir.
+	scanned bool
+
 	// admin marks a handle belonging to a ONE-SHOT OPERATOR COMMAND, whether or
 	// not it managed to take the directory lock. It decides how patient the
 	// handle is: a command has a person waiting on it and gives up, a control
@@ -211,6 +215,23 @@ func openDir(ctx context.Context, stateDir string, admin bool) (*DB, error) {
 		return nil, errors.Join(err, db.Close())
 	}
 
+	// THE SCAN BELONGS TO THE PROCESS THAT WILL SCHEDULE AGAINST THIS LEDGER.
+	//
+	// quick_check reads the whole file, and job_history is unbounded, so its cost
+	// grows with the deployment's age. Running it on every operator command put
+	// that growing scan in front of `nodes approve`, `leases release --force` and
+	// `check` — under the shared thirty-second startup budget, so a large or
+	// loaded deployment could lose EVERY live administration command, including
+	// the emergency one. A control plane opens the ledger once and is about to
+	// make scheduling decisions against it; a command is neither.
+	if !admin {
+		if err := db.integrityCheck(startupCtx); err != nil {
+			return nil, errors.Join(err, db.Close())
+		}
+
+		db.scanned = true
+	}
+
 	// MIGRATING IS THE LOCK HOLDER'S JOB. Without the lock another billet is
 	// already using this schema, and upgrading it underneath a process that is
 	// mid-transaction against it is the one thing an operator command must never
@@ -235,15 +256,26 @@ func openDir(ctx context.Context, stateDir string, admin bool) (*DB, error) {
 const startupTimeout = 30 * time.Second
 
 // PingContext proves the database is reachable AND configured as promised.
+//
+// The integrity SCAN is deliberately not part of this. It is a whole-file read
+// whose cost grows with job_history, and it answers a question only a control
+// plane about to schedule against the ledger has to ask. See IntegrityCheck.
 func (db *DB) PingContext(ctx context.Context) error {
 	if err := db.w.PingContext(ctx); err != nil {
 		return fmt.Errorf("ping state db: %w", err)
 	}
-	if err := db.verifyWriterPragmas(ctx); err != nil {
-		return err
-	}
-	return db.integrityCheck(ctx)
+
+	return db.verifyWriterPragmas(ctx)
 }
+
+// IntegrityCheck refuses to serve from a corrupt ledger.
+//
+// EXPORTED so `billet check` can ask for it explicitly, because that command
+// exists to prove a deployment is sane and this is most of what that means.
+// Nothing else should: it reads the whole file, and doing it on every operator
+// command put a growing scan in front of `leases release --force`, which is the
+// command an operator runs when capacity is already missing.
+func (db *DB) IntegrityCheck(ctx context.Context) error { return db.integrityCheck(ctx) }
 
 // dsn builds a file: URI with the given pragmas, escaping the path so a state
 // directory containing spaces, '?' or '#' does not silently truncate the DSN.

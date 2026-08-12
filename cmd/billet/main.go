@@ -1595,7 +1595,15 @@ func cmdCheck(ctx context.Context, args []string) error {
 		}
 		defer db.Close()
 
-		fmt.Printf("state    %s (ok)\n", cfg.Server.StateDir)
+		// ASKED FOR EXPLICITLY, because opening no longer does it. The scan reads
+		// the whole file, so every other operator command skips it — but proving
+		// the deployment is sane is what THIS command is for, and a ledger that
+		// fails it is the thing an operator most needs to be told about.
+		if err := db.IntegrityCheck(ctx); err != nil {
+			return fmt.Errorf("server state: %w", err)
+		}
+
+		fmt.Printf("state    %s (ok, integrity verified)\n", cfg.Server.StateDir)
 	}
 
 	if cfg.Node != nil {

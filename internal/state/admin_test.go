@@ -240,6 +240,48 @@ func TestAnOperatorTransactionRechecksTheSchemaItIsWritingAgainst(t *testing.T) 
 	}
 }
 
+// AN OPERATOR COMMAND DOES NOT RE-SCAN THE WHOLE LEDGER.
+//
+// quick_check reads the entire file and job_history is unbounded, so its cost
+// grows with the deployment. Running it at every open put that growing scan in
+// front of `nodes approve`, `leases release --force` and `check`, under the same
+// thirty-second startup budget — so a large or loaded deployment could lose every
+// live administration command, the emergency one included.
+//
+// The control plane still scans: it is about to schedule against this ledger.
+func TestOnlyTheControlPlaneScansTheLedgerAtOpen(t *testing.T) {
+	dir := t.TempDir()
+	ctx := t.Context()
+
+	server, err := Open(ctx, dir)
+	if err != nil {
+		t.Fatalf("Open (the server): %v", err)
+	}
+
+	t.Cleanup(func() { _ = server.Close() })
+
+	if !server.scanned {
+		t.Error("a control plane must verify the ledger's integrity before scheduling against it")
+	}
+
+	admin, err := OpenAdmin(ctx, dir)
+	if err != nil {
+		t.Fatalf("OpenAdmin: %v", err)
+	}
+
+	t.Cleanup(func() { _ = admin.Close() })
+
+	if admin.scanned {
+		t.Error("an operator command re-scanned the whole ledger; that cost grows with " +
+			"job_history and sits in front of the command an operator runs in an emergency")
+	}
+
+	// AND IT IS STILL AVAILABLE ON DEMAND, which is what `billet check` uses.
+	if err := admin.IntegrityCheck(ctx); err != nil {
+		t.Errorf("IntegrityCheck on a healthy ledger: %v", err)
+	}
+}
+
 // AND A READ RE-CHECKS TOO, for the same reason a write does.
 //
 // Separate from the transaction test above because View has its own code path:
