@@ -27,6 +27,13 @@ import (
 	"github.com/junioryono/billet/internal/state"
 )
 
+// querier is state.Querier under a local name.
+//
+// Aliased so a read-only helper can name it without each file importing the
+// store package — and so Enrollments, whose own parameter is called `state`, can
+// still refer to the type at all.
+type querier = state.Querier
+
 // Phase is a lease's position in its lifecycle. The values are constrained by a
 // CHECK in the schema, so a typo cannot sit in the open-lease index forever.
 type Phase string

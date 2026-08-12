@@ -42,7 +42,13 @@ import (
 	"strings"
 	"time"
 
-	_ "modernc.org/sqlite" // pure-Go driver: keeps billet a single static binary
+	// The pure-Go driver keeps billet a single static binary. Named rather than
+	// blank because contention has to be recognised by SQLite's own error CODE:
+	// "database is locked" is the text for both SQLITE_BUSY and
+	// SQLITE_BUSY_SNAPSHOT, and matching prose would turn a retry into a fatal
+	// error the first time a driver reworded it. depguard confines this import to
+	// this package.
+	"modernc.org/sqlite"
 )
 
 // ErrConflict is returned when a compare-and-swap loses. Callers should re-read
@@ -311,9 +317,9 @@ func (db *DB) Reader() Querier { return db.r }
 // so that an allocation decision — read current usage, decide, record it — is one
 // atomic step rather than a read followed by a hopeful write.
 func (db *DB) Tx(ctx context.Context, fn func(*sql.Tx) error) error {
-	tx, err := db.w.BeginTx(ctx, nil)
+	tx, err := db.beginWrite(ctx)
 	if err != nil {
-		return fmt.Errorf("begin write tx: %w", err)
+		return err
 	}
 	defer func() {
 		// Rollback after a successful Commit is a documented no-op returning
@@ -341,6 +347,146 @@ func (db *DB) Tx(ctx context.Context, fn func(*sql.Tx) error) error {
 		return fmt.Errorf("commit write tx: %w", err)
 	}
 	return nil
+}
+
+// View runs fn inside a READ-ONLY transaction on the query-only pool.
+//
+// THE COMPANION TO Tx, AND NOT AN OPTIMISATION. Every write transaction now
+// begins IMMEDIATE, which takes SQLite's single writer slot at BEGIN — so a
+// read-only operation routed through Tx reserves the right to write while it
+// scans, and can delay a scheduling decision in the control plane. That was
+// harmless when one process wrote; it is not now that operator commands share
+// the ledger, and `billet leases quarantined` scanning a large table is exactly
+// the shape that would do it.
+//
+// The reader pool is query_only, so a write attempted in here fails rather than
+// quietly succeeding on a connection nobody expected to mutate anything — the
+// same reason Reader hands back a Querier rather than the pool.
+//
+// A TRANSACTION rather than bare queries, so a caller issuing several of them
+// sees one consistent snapshot instead of rows from either side of a commit.
+func (db *DB) View(ctx context.Context, fn func(Querier) error) error {
+	// Deferred, deliberately: the reader takes no write lock, which is the whole
+	// point, and nothing here can be promoted.
+	tx, err := db.r.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin read tx: %w", err)
+	}
+
+	defer func() {
+		//nolint:errcheck // a read transaction has nothing to lose on rollback.
+		_ = tx.Rollback()
+	}()
+
+	// Re-checked for the same reason Tx does it, and it matters here too: a read
+	// against a schema a newer billet has since rebuilt would report rows that no
+	// longer mean what this binary thinks they mean.
+	if db.unlocked {
+		if err := verifySchemaIn(ctx, tx); err != nil {
+			return err
+		}
+	}
+
+	return fn(tx)
+}
+
+// busyRetryInterval paces re-attempts at starting a write transaction.
+//
+// Short, because it only ever runs while another process holds the write lock,
+// and the point is to be waiting when that process lets go.
+const busyRetryInterval = 50 * time.Millisecond
+
+// adminBusyLimit bounds how long an OPERATOR COMMAND waits for the write lock
+// before reporting that the control plane is busy.
+//
+// A var so a test can shorten it; nothing outside this package writes it. The
+// control plane itself has no such bound — see beginWrite for why the two sides
+// are deliberately asymmetric.
+var adminBusyLimit = 15 * time.Second
+
+// beginWrite starts a write transaction, WAITING OUT a writer in another process
+// rather than failing.
+//
+// CONTENTION IS A RACE, NOT A BROKEN CONTRACT, and this codebase already draws
+// that line: an assignment with no escrow behind it declines and carries on,
+// while a scale-set response that cannot be true stops the listener. SQLITE_BUSY
+// belongs firmly on the first side — it means somebody else is writing right
+// now, which is ordinary once operator commands share the ledger.
+//
+// Treating it as fatal would be severe out of all proportion. Escrow's error
+// reaches refillEscrow, which stops the listener, which cancels every other
+// listener, whose shutdowns destroy every job on the host — so a `billet leases
+// quarantined` that happened to scan for longer than busy_timeout would fail
+// every build on the machine. Retrying costs a delay; not retrying costs the
+// deployment.
+//
+// Bounded by the CALLER'S CONTEXT rather than by an attempt count, because there
+// is no number of attempts that is right for both a poll loop and a one-shot
+// command: each already carries a deadline that says how long it is willing to
+// wait.
+func (db *DB) beginWrite(ctx context.Context) (*sql.Tx, error) {
+	// THE TWO CALLERS DESERVE OPPOSITE ANSWERS, which is why the bound is not a
+	// single number. A control plane must never give up — stopping is the
+	// catastrophe this retry exists to prevent — so it waits as long as its
+	// context allows. An operator command has a HUMAN WAITING AT A TERMINAL, and
+	// a command that hangs silently with no output is its own kind of failure, so
+	// it gives up and says to try again.
+	//
+	// Not expressed as a derived context, deliberately: the transaction that
+	// BeginTx returns stays bound to the context it was given, so cancelling one
+	// here would roll the transaction back the moment this function returned.
+	var deadline time.Time
+	if db.unlocked {
+		deadline = time.Now().Add(adminBusyLimit)
+	}
+
+	for {
+		tx, err := db.w.BeginTx(ctx, nil)
+		if err == nil {
+			return tx, nil
+		}
+
+		if !isBusy(err) || ctx.Err() != nil {
+			return nil, fmt.Errorf("begin write tx: %w", err)
+		}
+
+		if !deadline.IsZero() && time.Now().After(deadline) {
+			return nil, fmt.Errorf(
+				"the control plane held this ledger's write lock for longer than %s, so this "+
+					"command gave up rather than waiting silently — nothing was changed, so run "+
+					"it again: %w", adminBusyLimit, err)
+		}
+
+		// time.After would leak its timer until it fired, and forbidigo bans it
+		// for exactly that reason.
+		wait := time.NewTimer(busyRetryInterval)
+
+		select {
+		case <-ctx.Done():
+			wait.Stop()
+
+			return nil, fmt.Errorf("begin write tx: %w", err)
+		case <-wait.C:
+		}
+	}
+}
+
+// isBusy reports whether an error is SQLite saying somebody else is writing.
+//
+// MATCHED ON THE CODE, never on the message: "database is locked" is the text
+// for both plain SQLITE_BUSY and SQLITE_BUSY_SNAPSHOT, and a driver or locale
+// that phrases it differently would silently turn a retry into a fatal error.
+// The primary code is the low byte, so this covers the extended forms —
+// BUSY_RECOVERY, BUSY_SNAPSHOT and BUSY_TIMEOUT — without listing them.
+func isBusy(err error) bool {
+	var serr *sqlite.Error
+	if !errors.As(err, &serr) {
+		return false
+	}
+
+	const sqliteBusy = 5
+
+	return serr.Code()&0xff == sqliteBusy
 }
 
 // migration is identified by an explicit, immutable Version. Counting applied

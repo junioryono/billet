@@ -1,6 +1,7 @@
 package main
 
 import (
+	"database/sql"
 	"errors"
 	"os"
 	"path/filepath"
@@ -176,5 +177,61 @@ func TestTheDirectLedgerCommandsRunWhileTheControlPlaneIsRunning(t *testing.T) {
 
 	if revoked != 1 {
 		t.Errorf("revoked_certs for epyc-1 = %d, want 1", revoked)
+	}
+}
+
+// A READ-ONLY COMMAND MUST NOT WAIT ON A SCHEDULING DECISION.
+//
+// Every write transaction begins IMMEDIATE, so a read routed through DB.Tx takes
+// SQLite's single writer slot and queues behind the control plane. These two
+// commands only read, and they are the ones an operator runs while wondering why
+// capacity is missing — exactly when the plane is busy. This drives them with a
+// server transaction genuinely open, which is what a reverted View migration
+// would fail.
+func TestAReadOnlyCommandRunsWhileTheServerHoldsTheWriteLock(t *testing.T) {
+	stateDir := t.TempDir()
+	cfg := writeCAConfig(t, stateDir)
+	ctx := t.Context()
+
+	server, err := state.Open(ctx, stateDir)
+	if err != nil {
+		t.Fatalf("open the server's ledger: %v", err)
+	}
+
+	t.Cleanup(func() { _ = server.Close() })
+
+	holding := make(chan struct{})
+	release := make(chan struct{})
+	held := make(chan error, 1)
+
+	go func() {
+		held <- server.Tx(ctx, func(*sql.Tx) error {
+			// The writer slot is now genuinely taken, and stays taken until this
+			// test says otherwise. That is what makes the ordering deterministic.
+			close(holding)
+			<-release
+
+			return nil
+		})
+	}()
+
+	<-holding
+
+	for _, tc := range []struct {
+		name string
+		run  func() error
+	}{
+		{"leases quarantined", func() error { return cmdLeasesQuarantined(ctx, []string{"--config", cfg}) }},
+		{"ca revocations", func() error { return cmdCARevocations(ctx, []string{"--config", cfg}) }},
+	} {
+		if err := tc.run(); err != nil {
+			t.Errorf("billet %s while the server holds the write lock: %v", tc.name, err)
+		}
+	}
+
+	close(release)
+
+	if err := <-held; err != nil {
+		t.Fatalf("the server's transaction: %v", err)
 	}
 }

@@ -53,7 +53,7 @@ func (a *Allocator) RevokeCert(ctx context.Context, serial, node, reason string)
 func (a *Allocator) CertRevoked(ctx context.Context, serial string) (bool, error) {
 	var revoked bool
 
-	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+	err := a.db.View(ctx, func(tx querier) error {
 		var one int
 
 		switch err := tx.QueryRowContext(ctx,
@@ -76,7 +76,7 @@ func (a *Allocator) CertRevoked(ctx context.Context, serial string) (bool, error
 func (a *Allocator) RevokedCerts(ctx context.Context) ([]RevokedCert, error) {
 	var out []RevokedCert
 
-	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+	err := a.db.View(ctx, func(tx querier) error {
 		out = nil
 
 		rows, err := tx.QueryContext(ctx,
@@ -221,7 +221,7 @@ func (a *Allocator) RecordRenewedCert(
 func (a *Allocator) LiveCertsFor(ctx context.Context, node string) ([]IssuedCert, error) {
 	var out []IssuedCert
 
-	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+	err := a.db.View(ctx, func(tx querier) error {
 		var err error
 
 		out, err = liveCertsForTx(ctx, tx, node, ts(a.now().UTC()))
@@ -234,7 +234,7 @@ func (a *Allocator) LiveCertsFor(ctx context.Context, node string) ([]IssuedCert
 
 // liveCertsForTx is the query, inside a caller's transaction so a revocation can
 // be atomic with the read that decided what to revoke.
-func liveCertsForTx(ctx context.Context, tx *sql.Tx, node, now string) ([]IssuedCert, error) {
+func liveCertsForTx(ctx context.Context, tx querier, node, now string) ([]IssuedCert, error) {
 	rows, err := tx.QueryContext(ctx,
 		`SELECT i.serial, i.node, i.source, i.not_after, i.issued_at
 		   FROM issued_certs i
