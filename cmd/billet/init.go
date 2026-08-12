@@ -54,12 +54,31 @@ func cmdInit(_ context.Context, args []string) error {
 		return fmt.Errorf("provider %q is not one of firecracker, tart, ec2, docker", *provider)
 	}
 
-	// REFUSED RATHER THAN WRITTEN AND THEN REFUSED AT STARTUP. Only docker is
-	// built, and a generated file naming a backend that cannot run is a file the
-	// operator has to debug rather than use.
-	if kind != config.ProviderDocker {
+	// REFUSED RATHER THAN WRITTEN AND THEN REFUSED AT STARTUP. A generated file
+	// naming a backend that cannot run is a file the operator has to debug rather
+	// than use — and there are now two different reasons to refuse one, so they say
+	// different things.
+	switch kind {
+	case config.ProviderDocker:
+		// The one backend that needs nothing but a daemon.
+
+	case config.ProviderEC2:
+		// BUILT, AND STILL NOT SOMETHING THIS COMMAND CAN WRITE. `billet init`
+		// promises a file that runs with nothing hand-edited, and every field this
+		// backend needs is a decision only the operator holds: which subnet, which
+		// security group, which shapes may be bought. A guess at a network is either
+		// a runner that cannot reach GitHub or one that can reach a production
+		// database.
+		return errors.New(
+			"`billet init` cannot write an ec2 config: the backend is built, but a subnet, a " +
+				"security group and the instance shapes billet may buy are decisions only you " +
+				"can make, and this command's whole promise is a file that runs unedited — " +
+				"start from the ec2 block in billet.example.yaml")
+
+	default:
 		return fmt.Errorf("%w: the %s provider is not built yet, so `billet init` cannot write a "+
-			"config that starts; docker is the only backend available today", errNotImplemented, kind)
+			"config that starts; docker runs on any host with a daemon, and ec2 is configured by "+
+			"hand from billet.example.yaml", errNotImplemented, kind)
 	}
 
 	// NEVER OVER AN EXISTING FILE without being asked. A config carries the state
