@@ -97,7 +97,7 @@ type Revocations interface {
 	// CertRevokedFor answers by serial AND by the cutoff the node carries, so a
 	// credential billet never recorded — one from before it tracked serials, or
 	// an earlier certificate for a name that was issued twice — is still refused.
-	CertRevokedFor(ctx context.Context, node, serial string, notBefore time.Time) (bool, error)
+	CertRevokedFor(ctx context.Context, node, serial string, issuedAt time.Time) (bool, error)
 	CertRevoked(ctx context.Context, serial string) (bool, error)
 	RecordIssuedCert(ctx context.Context, cert alloc.IssuedCert) error
 
@@ -489,7 +489,12 @@ func (h *handler) notRevoked(w http.ResponseWriter, r *http.Request, name string
 	leaf := r.TLS.PeerCertificates[0]
 	serial := wirecert.Serial(leaf)
 
-	revoked, err := h.revocations.CertRevokedFor(r.Context(), name, serial, leaf.NotBefore)
+	// THE MOMENT IT WAS MINTED, not the moment it became valid. Certificates are
+	// dated an hour early for clock skew, and reading NotBefore as the issuance
+	// time would place every one of them before a cutoff set within the hour —
+	// refusing the replacement a revocation is supposed to allow.
+	revoked, err := h.revocations.CertRevokedFor(
+		r.Context(), name, serial, leaf.NotBefore.Add(wirecert.ClockSkew))
 	if err != nil {
 		h.log.Error("could not check whether a node certificate has been revoked; refusing "+
 			"the request rather than assuming it is good",

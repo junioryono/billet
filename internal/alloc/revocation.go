@@ -288,6 +288,19 @@ func (a *Allocator) RevokeNode(ctx context.Context, node, reason string) ([]Issu
 		// certificate is unrecoverable. Recording the moment refuses every
 		// certificate for this name minted before it, seen or not, while a
 		// replacement issued afterwards still works.
+		// ROUNDED UP TO THE NEXT SECOND, because a certificate cannot express
+		// anything finer. X.509 stores validity at one-second resolution, so the
+		// issuance moment recovered from a certificate is always truncated — and a
+		// cutoff carrying nanoseconds would sit AFTER a replacement minted in the
+		// same second, refusing it. Rounding up puts the boundary between whole
+		// seconds, where both sides can express it.
+		//
+		// The ambiguity inside the revocation's own second resolves toward
+		// REFUSING: a credential minted in that second is treated as predating the
+		// revocation. Re-issuing a second later is a second's inconvenience;
+		// accepting a compromised certificate is not recoverable.
+		cutoff := ts(a.now().UTC().Truncate(time.Second).Add(time.Second))
+
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO node_revocations (node, revoked_before, reason, revoked_at)
 			 VALUES (?, ?, ?, ?)
@@ -295,7 +308,7 @@ func (a *Allocator) RevokeNode(ctx context.Context, node, reason string) ([]Issu
 			   revoked_before = excluded.revoked_before,
 			   reason         = excluded.reason,
 			   revoked_at     = excluded.revoked_at`,
-			node, now, reason, now); err != nil {
+			node, cutoff, reason, now); err != nil {
 			return fmt.Errorf("alloc: record the revocation cutoff for %s: %w", node, err)
 		}
 
@@ -310,10 +323,17 @@ func (a *Allocator) RevokeNode(ctx context.Context, node, reason string) ([]Issu
 // CertRevokedFor reports whether a certificate has been withdrawn, by serial or
 // by the cutoff its node carries.
 //
-// notBefore IS THE CERTIFICATE'S OWN, not a clock: the question is whether this
-// credential predates the revocation, and only the credential can answer that.
+// issuedAt IS WHEN THE CERTIFICATE WAS MINTED, which is NOT its NotBefore.
+//
+// Every certificate billet issues is valid from an hour before it was created,
+// so that a node whose clock is behind the control plane's does not reject what
+// it was just handed. Reading NotBefore as the issuance moment therefore places
+// every certificate an hour earlier than it really is — and a replacement issued
+// within an hour of a revocation would fall before the cutoff and be refused,
+// which turns a revocation into a permanent ban on the node name. The caller
+// adds wirecert.ClockSkew back before calling.
 func (a *Allocator) CertRevokedFor(
-	ctx context.Context, node, serial string, notBefore time.Time,
+	ctx context.Context, node, serial string, issuedAt time.Time,
 ) (bool, error) {
 	var revoked bool
 
@@ -343,7 +363,9 @@ func (a *Allocator) CertRevokedFor(
 			return fmt.Errorf("alloc: read the revocation cutoff for %s: %w", node, err)
 		}
 
-		revoked = ts(notBefore.UTC()) < cutoff
+		// TRUNCATED TO THE SECOND on this side too, so the comparison is between
+		// two values a certificate can actually carry.
+		revoked = ts(issuedAt.UTC().Truncate(time.Second)) < cutoff
 
 		return nil
 	})
