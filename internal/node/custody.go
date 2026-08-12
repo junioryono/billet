@@ -83,7 +83,7 @@ func (r *Runner) adopt(lease *alloc.Lease, inst *provider.Instance) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	r.custody[lease.ID] = &custody{
+	entry := &custody{
 		leaseID: lease.ID,
 
 		name:      inst.Name,
@@ -94,6 +94,9 @@ func (r *Runner) adopt(lease *alloc.Lease, inst *provider.Instance) {
 		observed: true,
 		since:    r.now(),
 	}
+	entry.epoch.Store(lease.Epoch)
+
+	r.custody[lease.ID] = entry
 }
 
 // hold takes custody of a lease whose compute could not be confirmed gone.
@@ -110,7 +113,7 @@ func (r *Runner) hold(lease *alloc.Lease, name string, requestID int64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	r.custody[lease.ID] = &custody{
+	entry := &custody{
 		leaseID: lease.ID,
 
 		name:      name,
@@ -120,6 +123,9 @@ func (r *Runner) hold(lease *alloc.Lease, name string, requestID int64) {
 		outcome: alloc.PhaseFailed,
 		since:   r.now(),
 	}
+	entry.epoch.Store(lease.Epoch)
+
+	r.custody[lease.ID] = entry
 }
 
 // heldLeases reports the leases currently in custody, so a sweep does not treat
@@ -600,7 +606,7 @@ func (r *Runner) Superseded() {
 			continue
 		}
 
-		r.custody[lease.ID] = &custody{
+		entry := &custody{
 			leaseID: lease.ID,
 
 			name:      inst.Name,
@@ -608,7 +614,17 @@ func (r *Runner) Superseded() {
 			requestID: requestID,
 			outcome:   alloc.PhaseDone,
 			since:     r.now(),
+			// ALREADY SEEN, because this came from the running set: its launch was
+			// observed, so a later absence means it genuinely went away rather than
+			// that a create might still be in flight. Leaving it false made a job
+			// that exits right after supersession hold its host's capacity for the
+			// whole stray grace — five minutes of a machine nobody can use, waiting
+			// for a container that has already finished.
+			observed: true,
 		}
+		entry.epoch.Store(lease.Epoch)
+
+		r.custody[lease.ID] = entry
 	}
 }
 
