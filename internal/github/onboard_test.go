@@ -217,18 +217,14 @@ type browser struct {
 	// authenticated poller as the only route to the installation.
 	skipSetupCallback bool
 	setupCallbacks    atomic.Int32
-	// getFailures counts requests that failed for a reason OTHER than the
-	// connection. A silently-failing request is how the original version of this
-	// test passed without ever reaching /installed — specifically a malformed URL,
-	// which fails while building or resolving the request.
+	// getFailures counts requests that failed for a reason OTHER than the connection.
+	// A silently-failing request — a malformed URL, which fails while building or
+	// resolving — is how the original version of this test passed without ever reaching
+	// /installed.
 	//
-	// The unscoped counter asserted something this file's own comment already
-	// called legitimate: the flow closes its listener when it finishes, so a
-	// request still in flight then is refused correctly. That fired twice, once
-	// loaded and once idle. Classifying the error is what separates the two;
-	// gating on "has the flow returned yet" was the first attempt and was worse
-	// than the flake, because a genuinely malformed URL failing after the flow
-	// returned would have been discarded as well.
+	// An unscoped counter would fire on the flow closing its listener as it finishes,
+	// which refuses an in-flight request correctly. Gating on "has the flow returned"
+	// instead discards a genuinely malformed URL that fails late.
 	getFailures atomic.Int32
 
 	// reached counts requests that got a RESPONSE, whatever became of the body.
@@ -307,32 +303,21 @@ func (b *browser) open(ctx context.Context, target string) error {
 		go func() {
 			defer b.pending.Done()
 
-			// THE INSTALLATION BECOMES VISIBLE ONLY BECAUSE THIS RUNS. It used to
-			// be set as soon as the install page opened, which let the poller
-			// complete the whole flow whether or not a callback was ever issued —
-			// so deleting the callback, or the route it targets, left every
-			// assertion green. Moving it here means an absent callback is an absent
-			// installation: the flow cannot finish by any route, and the test fails
-			// instead of passing by the fallback it was meant to prove unnecessary.
+			// THE INSTALLATION BECOMES VISIBLE ONLY BECAUSE THIS RUNS. Set when the install
+			// page opens instead, the poller completes the whole flow whether or not a callback
+			// is ever issued — so deleting the callback leaves every assertion green.
 			//
-			// AFTER the request, which is the only ordering that makes the callback
-			// necessary. Storing first — either here or back where the install page
-			// opens — lets the flow's immediate installation check succeed on its
-			// own, so the callback's fate stops mattering and every mutation to it
-			// passes. Storing after costs nothing: the handler wakes the flow, the
-			// flow looks the installation up and gets a 404, and it simply keeps
-			// polling until this store lands one interval later.
+			// AFTER the request, which is the only ordering that makes the callback necessary:
+			// storing first lets the flow's immediate installation check succeed on its own.
+			// Storing after costs nothing — the flow gets a 404 and keeps polling.
 			page, ok := b.get(ctx, installedURL)
 
-			// THE BODY IS CHECKED BECAUSE THE STATUS CANNOT BE. The loopback mux
-			// registers root+"/" as a catch-all, so deleting the /installed route
-			// does not produce a 404 — the request falls through to the start page
-			// and answers 200, which every status-based check reads as success.
-			// Only the content distinguishes them.
+			// THE BODY IS CHECKED BECAUSE THE STATUS CANNOT BE. The loopback mux registers
+			// root+"/" as a catch-all, so deleting the /installed route does not produce a 404
+			// — the request falls through to the start page and answers 200.
 			//
-			// Skipped when the request did not arrive at all: a callback refused
-			// because the poller already finished is legitimate, and get has
-			// already accounted for it.
+			// Skipped when the request did not arrive: a callback refused because the poller
+			// already finished is legitimate, and get has accounted for it.
 			if ok && !strings.Contains(page, "Installed") {
 				b.getFailures.Add(1)
 
@@ -399,20 +384,14 @@ func (b *browser) driveRegistration(ctx context.Context, startURL string) {
 
 // validateManifest enforces billet's manifest invariants.
 //
-// Only `url` and — when hook_attributes is present — `hook_attributes.url` are
-// documented by GitHub as REQUIRED. Everything else here is billet's own
-// requirement, held to deliberately: the callback URLs because onboarding
-// depends on them, `public: false` and the OAuth fields because of what billet
-// is for, and the whole hook_attributes object because GitHub documents
-// `active` as defaulting to TRUE, so omitting the object is inferred to leave
-// the webhook enabled. That inference is the conservative reading, not a
-// promise from the parameter table.
+// Only `url` and `hook_attributes.url` are documented by GitHub as required.
+// Everything else is billet's own: the callback URLs because onboarding depends on
+// them, and the whole hook_attributes object because GitHub documents `active` as
+// defaulting to TRUE, so omitting it leaves the webhook enabled.
 //
-// base is the loopback origin the onboarding server is listening on. It is
-// passed in so the callback URLs can be asserted against what billet ACTUALLY
-// serialized: this test drives /callback and /installed by constructing them
-// from the same base, so tagging either field `json:"-"` left the suite green
-// while GitHub would have had nowhere to redirect to.
+// base is passed in so the callback URLs are asserted against what billet ACTUALLY
+// serialized — tagging either field `json:"-"` otherwise leaves the suite green
+// while GitHub has nowhere to redirect to.
 func (b *browser) validateManifest(raw, base string) {
 	b.t.Helper()
 
@@ -560,17 +539,11 @@ func (b *browser) get(ctx context.Context, target string) (string, bool) {
 	}
 
 	if err != nil {
-		// COUNTED BY WHAT WENT WRONG, not by when. Swallowing this is precisely
-		// how the original test reported success while never reaching /installed;
-		// the defect it guards is a MALFORMED URL, which fails while building or
-		// resolving the request and never reaches a socket.
-		//
-		// A connection error is different in kind: the flow closes its listener
-		// as it finishes, so a request still in flight then is refused for a
-		// correct reason. Gating on a flowDone flag instead was the first attempt
-		// and it was worse than the flake it fixed — a genuinely malformed URL
-		// failing after the flow returned would have been discarded too, which is
-		// exactly the regression this counter exists to catch.
+		// COUNTED BY WHAT WENT WRONG, not by when. The defect this guards is a MALFORMED
+		// URL, which fails while building the request and never reaches a socket;
+		// swallowing it is how the original test reported success without reaching
+		// /installed. A connection error is different in kind — the flow closes its listener
+		// as it finishes, so a request in flight then is refused for a correct reason.
 		if !b.benignFailure(target, err) {
 			b.getFailures.Add(1)
 		}
