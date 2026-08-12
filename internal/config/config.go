@@ -957,7 +957,13 @@ func (c *Config) applyDefaults() {
 	if c.Node != nil {
 		c.Node.Name = trimNodeName(c.Node.Name)
 
-		if c.Node.Name == "" {
+		// THE CERTIFICATE DECIDES WHEN THERE IS ONE. The control plane authorises a
+		// node by the name in its certificate, so with a bundle present the config
+		// key is a second place to write the same fact — and the hostname default
+		// actively fights it, because a machine whose hostname is not its node name
+		// gets a name the control plane will refuse. `billet node` fills this in
+		// from the bundle; see cmdNode.
+		if c.Node.Name == "" && c.Node.TLS == nil {
 			lookup := c.hostname
 			if lookup == nil {
 				lookup = os.Hostname
@@ -1238,19 +1244,26 @@ func (c *Config) validateNode() []error {
 	if _, err := c.Node.MaxCustodyDuration(); err != nil {
 		errs = append(errs, err)
 	}
-	if err := ValidateNodeName("node.name", c.Node.Name); err != nil {
-		// Say where the name came from when billet supplied it: a hostname is not
-		// guaranteed to be a legal node name, and "node.name is invalid" sends an
-		// operator who never typed one looking for a field not in their file.
-		if c.nameDefaulted {
-			err = fmt.Errorf(
-				"node.name defaulted to this machine's hostname %q, which is not a usable node name "+
-					"(must match %s); set node.name explicitly",
-				c.nameFromHostname, labelRe)
-		}
+	// AN EMPTY NAME WITH A BUNDLE IS NOT A MISSING NAME. The control plane
+	// authorises a node by the name in its certificate, so the bundle carries it
+	// and `billet node` fills this in once it is read.
+	if c.Node.Name != "" || c.Node.TLS == nil {
+		if err := ValidateNodeName("node.name", c.Node.Name); err != nil {
+			// Say where the name came from when billet supplied it: a hostname is
+			// not guaranteed to be a legal node name, and "node.name is invalid"
+			// sends an operator who never typed one looking for a field not in
+			// their file.
+			if c.nameDefaulted {
+				err = fmt.Errorf(
+					"node.name defaulted to this machine's hostname %q, which is not a usable "+
+						"node name (must match %s); set node.name explicitly",
+					c.nameFromHostname, labelRe)
+			}
 
-		errs = append(errs, err)
+			errs = append(errs, err)
+		}
 	}
+
 	if c.Node.StateDir == "" {
 		errs = append(errs, errors.New("node.state_dir is required"))
 	}

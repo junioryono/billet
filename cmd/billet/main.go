@@ -730,10 +730,21 @@ func nodeBundle(cfg *config.Config) (*wirecert.Bundle, error) {
 		return nil, err
 	}
 
+	// THE CERTIFICATE IS THE NAME, and an absent node.name is filled in from it
+	// rather than defaulted from the hostname. The control plane authorises by
+	// this name, so a machine whose hostname differs from it would otherwise be
+	// refused for a value the operator never chose.
+	if cfg.Node.Name == "" {
+		cfg.Node.Name = name
+
+		return &bundle, nil
+	}
+
 	if name != cfg.Node.Name {
 		return nil, fmt.Errorf(
 			"node.name is %q but %s was issued for %q; the control plane authorises by the "+
-				"name in the certificate, so this node could only ever act as %q",
+				"name in the certificate, so this node could only ever act as %q. Remove "+
+				"node.name to take it from the certificate",
 			cfg.Node.Name, cfg.Node.TLS.CertPath, name, name)
 	}
 

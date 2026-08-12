@@ -373,3 +373,96 @@ func TestAnUnusableBundleLeavesNoIdentityBehind(t *testing.T) {
 			"bundle would now be refused as a conflict")
 	}
 }
+
+// A NODE WITH A CERTIFICATE NEED NOT BE TOLD ITS OWN NAME.
+//
+// The control plane authorises a node by the name in its certificate, so
+// node.name is a second place to write a fact the bundle already carries — and
+// the two can disagree. Worse, the default made them disagree by accident:
+// with node.name absent, config.Load filled it from the HOSTNAME, so a machine
+// whose hostname is not its node name (`ip-10-0-0-5` for a node enrolled as
+// `epyc-1`) got a name the control plane refuses, chosen by nobody.
+//
+// So a config with a bundle and no name loads, and the name comes from the
+// certificate.
+func TestANodeWithABundleNeedsNoName(t *testing.T) {
+	t.Parallel()
+
+	serverCfg := writeCAConfig(t, t.TempDir())
+	out := filepath.Join(t.TempDir(), "bundle")
+
+	if err := cmdCAIssue([]string{"epyc-1", "--config", serverCfg, "--out", out}); err != nil {
+		t.Fatalf("ca issue: %v", err)
+	}
+
+	cfg := nodeConfigWithoutName(t, t.TempDir(), out)
+
+	if cfg.Node.Name != "" {
+		t.Fatalf("config.Load supplied the name %q; with a bundle present the certificate "+
+			"is the authority and the hostname default only ever fights it", cfg.Node.Name)
+	}
+
+	if _, err := nodeBundle(cfg); err != nil {
+		t.Fatalf("loading the bundle: %v", err)
+	}
+
+	if cfg.Node.Name != "epyc-1" {
+		t.Errorf("the node is called %q; the certificate says %q, and that is the name the "+
+			"control plane will authorise", cfg.Node.Name, "epyc-1")
+	}
+}
+
+// AND A NAME THAT CONTRADICTS THE CERTIFICATE IS STILL REFUSED. Deriving the
+// name is not the same as ignoring one: an operator who wrote a name that the
+// bundle disagrees with has made a mistake worth naming, and the message says
+// which way out they have.
+func TestANameThatContradictsTheCertificateIsRefused(t *testing.T) {
+	t.Parallel()
+
+	serverCfg := writeCAConfig(t, t.TempDir())
+	out := filepath.Join(t.TempDir(), "bundle")
+
+	if err := cmdCAIssue([]string{"epyc-1", "--config", serverCfg, "--out", out}); err != nil {
+		t.Fatalf("ca issue: %v", err)
+	}
+
+	cfg := nodeConfigFor(t, "mac-mini-1", t.TempDir(), out)
+
+	_, err := nodeBundle(cfg)
+	if err == nil {
+		t.Fatal("a node claimed a name its certificate does not carry")
+	}
+
+	if !strings.Contains(err.Error(), "Remove node.name") {
+		t.Errorf("the refusal does not say how to resolve it: %v", err)
+	}
+}
+
+// nodeConfigWithoutName is nodeConfigFor with the name left to the certificate.
+func nodeConfigWithoutName(t *testing.T, stateDir, bundleDir string) *config.Config {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), "billet.yaml")
+
+	body := `
+node:
+  server_addr: 10.0.0.4:7717
+  provider: docker
+  state_dir: ` + stateDir + `
+  tls:
+    cert: ` + filepath.Join(bundleDir, "node.crt") + `
+    key: ` + filepath.Join(bundleDir, "node.key") + `
+    ca: ` + filepath.Join(bundleDir, "ca.crt") + `
+`
+
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("a node config that leaves its name to the certificate was refused: %v", err)
+	}
+
+	return cfg
+}
