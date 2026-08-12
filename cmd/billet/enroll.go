@@ -77,6 +77,14 @@ func cmdNodesRevoke(ctx context.Context, args []string) error {
 
 	defer closeDB()
 
+	// EVERY CREDENTIAL THIS DEPLOYMENT EVER HANDED OUT, including the ones
+	// admitted before billet recorded serials. Without this an upgraded
+	// deployment answers "holds no certificate" for a machine that is holding a
+	// working one.
+	if err := backfillIssuedCerts(ctx, a); err != nil {
+		return err
+	}
+
 	revoked, err := a.RevokeNode(ctx, name, *reason)
 	if err != nil {
 		return err
@@ -253,6 +261,60 @@ func cmdNodesDecide(ctx context.Context, args []string, decision string) error {
 	return nil
 }
 
+// backfillIssuedCerts records certificates admitted before billet tracked
+// serials, so revocation can reach them.
+//
+// A CREDENTIAL BILLET DOES NOT KNOW ABOUT CANNOT BE TAKEN BACK, and an upgrade
+// is exactly how one comes to exist: every node admitted before issued_certs
+// existed holds a working certificate whose serial was never written down.
+// `billet nodes revoke` would report that the machine holds nothing and change
+// nothing, which is the worst possible answer to a compromise.
+//
+// The admission trail is what makes this recoverable: both ways in — approval
+// and `billet ca issue` — stored the certificate they handed over, so the serial
+// can be read back out of it. Idempotent, so running it on every revocation
+// costs one query on a deployment that is already complete.
+func backfillIssuedCerts(ctx context.Context, a *alloc.Allocator) error {
+	admitted, err := a.Enrollments(ctx, alloc.EnrollApproved)
+	if err != nil {
+		return err
+	}
+
+	for i := range admitted {
+		rec := &admitted[i]
+		if rec.CertPEM == "" {
+			continue
+		}
+
+		leaf, err := wirecert.LeafOf(wirecert.Bundle{CertPEM: []byte(rec.CertPEM)})
+		if err != nil {
+			// A stored certificate billet cannot read is worth saying out loud —
+			// that node's credential is outside revocation — but it must not stop
+			// the ones that can be read from being recorded.
+			fmt.Fprintf(os.Stderr, "the certificate recorded for node %q cannot be parsed, so "+
+				"it cannot be revoked by serial: %v\n", rec.Name, err)
+
+			continue
+		}
+
+		source := alloc.CertEnrolled
+		if rec.Source == "issued" {
+			source = alloc.CertIssued
+		}
+
+		if err := a.RecordIssuedCert(ctx, alloc.IssuedCert{
+			Serial:   wirecert.Serial(leaf),
+			Node:     rec.Name,
+			Source:   source,
+			NotAfter: leaf.NotAfter.UTC().Format(time.RFC3339),
+		}); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 // recordIssuedCert writes a credential into the list revocation reads.
 //
 // EVERY WAY A CERTIFICATE COMES INTO EXISTENCE GOES THROUGH HERE — approval,
@@ -424,14 +486,32 @@ func pendingIdentity(tls *config.NodeTLS, name string) ([]byte, []byte, error) {
 	stagedCSR, csrErr := os.ReadFile(csrStage)
 	stagedFor, forErr := os.ReadFile(forStage)
 
+	// ALL THREE OR NONE. A partial stage is not "nothing staged": the key may
+	// already have a pending request against it on the control plane, and
+	// generating a fresh one replaces it — after which the name is held by a
+	// fingerprint this machine can no longer present, and only an operator can
+	// free it. So only a complete absence starts over.
+	missing := errors.Is(keyErr, os.ErrNotExist) &&
+		errors.Is(csrErr, os.ErrNotExist) &&
+		errors.Is(forErr, os.ErrNotExist)
+
 	switch {
 	case keyErr == nil && csrErr == nil && forErr == nil && string(stagedFor) == name:
 		fmt.Printf("Resuming the enrollment already staged in %s.\n\n", dir)
 
 		return stagedCSR, staged, nil
 
-	case errors.Is(keyErr, os.ErrNotExist):
+	case missing:
 		// Nothing staged, which is the ordinary first run.
+
+	case keyErr == nil && (csrErr != nil || forErr != nil):
+		// THE KEY SURVIVED AND ITS COMPANIONS DID NOT. Replacing it would abandon
+		// a request the control plane may already be holding under this name.
+		return nil, nil, fmt.Errorf(
+			"%s holds a staged enrollment key without the request that goes with it, so this "+
+				"machine cannot present what it already asked for. Remove pending.key, "+
+				"pending.csr and pending.node to start again, and deny the pending request on "+
+				"the control plane so the name is free", dir)
 
 	case keyErr != nil:
 		// A STAGED KEY THAT FAILS THE CHECKS IS NOT SILENTLY REPLACED. It may be

@@ -33,7 +33,10 @@ type Rotating struct {
 	// staleCopies records a superseded generation that could not be removed. One
 	// of those files is a private key, so it is worth an operator's attention
 	// even though nothing is broken.
-	staleCopies error
+	//
+	// Atomic because Replace writes it from the renewal path while a caller may
+	// be reading it, and a plain field would be a data race.
+	staleCopies atomic.Pointer[error]
 
 	// roots is what this node verifies the control plane against. Replaced by a
 	// renewal that carries a wider bundle, which is how a CA rotation propagates.
@@ -72,7 +75,7 @@ func NewRotating(certPath, keyPath, caPath string) (*Rotating, error) {
 	if err == nil {
 		// The current generation is good, so the predecessor has done its job.
 		if cleanErr := clearPrevious(certPath, keyPath, caPath); cleanErr != nil {
-			r.staleCopies = cleanErr
+			r.staleCopies.Store(&cleanErr)
 		}
 
 		return r, nil
@@ -234,7 +237,13 @@ func (r *Rotating) RolledBack() bool { return r.rolledBack }
 
 // StaleCopies reports a superseded generation that could not be deleted — a
 // second copy of this node's private key, left on disk.
-func (r *Rotating) StaleCopies() error { return r.staleCopies }
+func (r *Rotating) StaleCopies() error {
+	if held := r.staleCopies.Load(); held != nil {
+		return *held
+	}
+
+	return nil
+}
 
 // Leaf is the certificate in force right now.
 func (r *Rotating) Leaf() *x509.Certificate { return r.current.Load().Leaf }
@@ -369,7 +378,7 @@ func (r *Rotating) Replace(certPEM, keyPEM, caPEM []byte) error {
 
 	// Complete and verified — the predecessor has nothing left to protect.
 	if cleanErr := clearPrevious(r.keyPath, r.certPath, r.caPath); cleanErr != nil {
-		r.staleCopies = cleanErr
+		r.staleCopies.Store(&cleanErr)
 	}
 
 	// THE POOL BEFORE THE LEAF. Between the two stores a handshake sees the new
