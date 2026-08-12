@@ -264,6 +264,25 @@ func TestOnlyTheControlPlaneRefusesACorruptedLedger(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 
+	// ENOUGH DATA THAT THE CORRUPTION CAN LAND WELL PAST THE SCHEMA. Both open
+	// paths read sqlite_master and schema_migrations — the admin one still
+	// MIGRATES here, because it takes the free lock — so corrupting a page either
+	// of them reads would fail this test for the wrong reason, with a message
+	// about re-scanning when what actually happened is a malformed page in a table
+	// the open legitimately touched.
+	if err := db.Tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx,
+			`INSERT INTO job_history (lease_id, tier, queued_at)
+			 WITH RECURSIVE rows(x) AS (
+			     SELECT 1 UNION ALL SELECT x + 1 FROM rows WHERE x < 4000
+			 )
+			 SELECT 'lease-' || x, 'padding', '2026-01-01T00:00:00.000000000Z' FROM rows`)
+
+		return err
+	}); err != nil {
+		t.Fatalf("pad the ledger: %v", err)
+	}
+
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -296,11 +315,18 @@ func TestOnlyTheControlPlaneRefusesACorruptedLedger(t *testing.T) {
 	}
 }
 
-// corruptPages overwrites whole pages in the middle of a SQLite file.
+// corruptPages overwrites whole pages in the LAST THIRD of a SQLite file.
 //
 // Whole pages, and several of them: measured, a couple of hundred bytes near the
 // header lands in unused space and quick_check reports nothing, which would make
 // this test pass for the wrong reason.
+//
+// POSITIONED RELATIVE TO THE FILE rather than at fixed page numbers, because a
+// fixed list is coupled to today's schema layout in both directions. The next
+// migration shifts allocation: pages that currently hold padding could come to
+// hold schema_migrations, and this test would then fail on an open that
+// legitimately reads it — with a message about re-scanning, which is not what
+// went wrong. The padding above is what makes "the last third" reliably data.
 func corruptPages(t *testing.T, path string) {
 	t.Helper()
 
@@ -315,14 +341,28 @@ func corruptPages(t *testing.T, path string) {
 		}
 	}()
 
+	info, err := f.Stat()
+	if err != nil {
+		t.Fatalf("size the ledger file: %v", err)
+	}
+
 	const pageSize = 4096
+
+	pages := info.Size() / pageSize
+	if pages < 30 {
+		t.Fatalf("the ledger is only %d pages; the padding above should have grown it far "+
+			"beyond the schema, and without that this test corrupts pages the open path reads",
+			pages)
+	}
 
 	junk := make([]byte, pageSize)
 	for i := range junk {
 		junk[i] = 0xAB
 	}
 
-	for _, page := range []int64{2, 5, 9, 14} {
+	// Spread through the final third, so a single relocated table cannot move all
+	// of them out of the way.
+	for page := pages * 2 / 3; page < pages-1; page += (pages / 12) + 1 {
 		if _, err := f.WriteAt(junk, page*pageSize); err != nil {
 			t.Fatalf("corrupt page %d: %v", page, err)
 		}

@@ -581,9 +581,19 @@ func (db *DB) beginWrite(ctx context.Context) (*sql.Tx, error) {
 			(warned.IsZero() || time.Since(warned) > stallWarnEvery) {
 			warned = time.Now()
 
-			slog.Default().Warn("still waiting for the ledger's write lock; another billet "+
-				"process is holding it. Scheduling writes are queued behind this",
-				"waited", waited.Round(time.Second), "operator_command", db.admin)
+			// THE CONSEQUENCE DEPENDS ON WHO IS WAITING, so it is not asserted for
+			// both. A stalled control plane really does have scheduling queued
+			// behind it; a command waiting its turn proves only that something else
+			// is writing, and telling an operator their `ca token` has stopped the
+			// deployment would send them after the wrong thing.
+			if db.admin {
+				slog.Default().Warn("still waiting for the ledger's write lock; another billet "+
+					"process is holding it", "waited", waited.Round(time.Second))
+			} else {
+				slog.Default().Warn("the control plane is still waiting for the ledger's write "+
+					"lock, so scheduling writes are queued behind it; an operator command is "+
+					"holding it", "waited", waited.Round(time.Second))
+			}
 		}
 
 		// A TEST HOOK, nil in production. The cancellation branch below is only
