@@ -1,0 +1,202 @@
+package ec2
+
+import (
+	"net/http"
+	"strings"
+	"testing"
+	"time"
+)
+
+// The request every vector below signs. Held as constants so the test and the
+// command that regenerates the vectors cannot drift apart in the details that
+// change a signature — and every one of them does.
+const (
+	vectorBody   = "Action=RunInstances&ImageId=ami-0abc&MaxCount=1&MinCount=1&Version=2016-11-15"
+	vectorURL    = "https://ec2.us-west-2.amazonaws.com/"
+	vectorRegion = "us-west-2"
+	vectorKey    = "AKIDEXAMPLE"
+	vectorSecret = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
+	vectorToken  = "FQoGZXIvYXdzEExampleToken=="
+)
+
+func vectorTime() time.Time { return time.Date(2026, 8, 12, 12, 36, 0, 0, time.UTC) }
+
+// THE VECTORS COME FROM AWS'S OWN SIGNER, NOT FROM READING THE SPECIFICATION.
+//
+// billet signs its own requests rather than taking the AWS SDK, because a program
+// that does nothing but construct an EC2 client and call RunInstances once builds
+// to 13.2MB against a whole billet of 21.8MB, and every node in a fleet would
+// carry it — including the bare-metal hosts this backend exists to fall back
+// FROM. That trade is only defensible if the output is known to be identical, and
+// "I implemented the document correctly" is not knowing.
+//
+// So these two strings were produced by aws-sdk-go-v2 signing the exact request
+// above. To regenerate them, in a scratch module with
+// github.com/aws/aws-sdk-go-v2 required:
+//
+//	req, _ := http.NewRequest(http.MethodPost, vectorURL, strings.NewReader(vectorBody))
+//	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=utf-8")
+//	sum := sha256.Sum256([]byte(vectorBody))
+//	v4.NewSigner().SignHTTP(ctx,
+//		aws.Credentials{AccessKeyID: vectorKey, SecretAccessKey: vectorSecret, SessionToken: tok},
+//		req, hex.EncodeToString(sum[:]), "ec2", vectorRegion, vectorTime())
+//	fmt.Println(req.Header.Get("Authorization"))
+//
+// A failure here means billet and AWS disagree about what this request says. The
+// service would answer 403 with nothing about which byte moved, which is the
+// failure this test exists to turn into a diff.
+func TestTheSignatureMatchesAWSsOwnSigner(t *testing.T) {
+	for name, tc := range map[string]struct {
+		token string
+		want  string
+	}{
+		"no session token": {
+			want: "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260812/us-west-2/ec2/aws4_request, " +
+				"SignedHeaders=content-length;content-type;host;x-amz-date, " +
+				"Signature=9b0063ced912747efcb5d254101e12b955e6695f9d08a727db7bf16434e34dfa",
+		},
+		// A session token is signed as well as sent. Sending one that is not in
+		// SignedHeaders is a 403 that reads like a credential problem.
+		"with session token": {
+			token: vectorToken,
+			want: "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260812/us-west-2/ec2/aws4_request, " +
+				"SignedHeaders=content-length;content-type;host;x-amz-date;x-amz-security-token, " +
+				"Signature=0897896168ad393928d15eb9dd1c3bfb9aad43d5a323e91482e02792e860c39a",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			req := vectorRequest(t)
+
+			creds := Credentials{
+				AccessKeyID:     vectorKey,
+				SecretAccessKey: vectorSecret,
+				SessionToken:    tc.token,
+			}
+
+			if err := sign(req, []byte(vectorBody), creds, vectorRegion, vectorTime()); err != nil {
+				t.Fatalf("sign: %v", err)
+			}
+
+			if got := req.Header.Get("Authorization"); got != tc.want {
+				t.Errorf("billet and the aws sdk sign this request differently\n got: %s\nwant: %s",
+					got, tc.want)
+			}
+
+			if got := req.Header.Get("X-Amz-Date"); got != "20260812T123600Z" {
+				t.Errorf("X-Amz-Date = %q, want the signed timestamp", got)
+			}
+
+			if tc.token != "" && req.Header.Get("X-Amz-Security-Token") != tc.token {
+				t.Error("the session token was signed but not sent")
+			}
+		})
+	}
+}
+
+func vectorRequest(t *testing.T) *http.Request {
+	t.Helper()
+
+	req, err := http.NewRequest(http.MethodPost, vectorURL, strings.NewReader(vectorBody)) //nolint:noctx // signing does not issue it
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=utf-8")
+	req.ContentLength = int64(len(vectorBody))
+
+	return req
+}
+
+// A RE-SIGN MUST NOT SIGN THE PREVIOUS SIGNATURE.
+//
+// Reachable rather than theoretical: a throttled call is retried, and the retry
+// re-signs a request object that already carries the first attempt's
+// Authorization header. Including it in the canonical headers makes the second
+// attempt fail with a 403 while the first failed with a throttle, so the retry
+// looks like a credential problem and the real cause disappears.
+func TestSigningTwiceProducesTheSameSignature(t *testing.T) {
+	creds := Credentials{AccessKeyID: vectorKey, SecretAccessKey: vectorSecret}
+
+	req := vectorRequest(t)
+
+	if err := sign(req, []byte(vectorBody), creds, vectorRegion, vectorTime()); err != nil {
+		t.Fatalf("first sign: %v", err)
+	}
+
+	first := req.Header.Get("Authorization")
+
+	if err := sign(req, []byte(vectorBody), creds, vectorRegion, vectorTime()); err != nil {
+		t.Fatalf("second sign: %v", err)
+	}
+
+	if got := req.Header.Get("Authorization"); got != first {
+		t.Errorf("re-signing changed the signature, so the first one was signed into the "+
+			"second\nfirst:  %s\nsecond: %s", first, got)
+	}
+}
+
+// A HEADER BILLET DOES NOT CONTROL MUST NOT BE SIGNED, because the value on the
+// wire is not the value that was hashed. Go's transport sets User-Agent after
+// this runs, so signing it produces a request that is invalid by the time it is
+// sent — and the service says only 403.
+func TestHeadersSomethingElseWritesAreNotSigned(t *testing.T) {
+	creds := Credentials{AccessKeyID: vectorKey, SecretAccessKey: vectorSecret}
+
+	req := vectorRequest(t)
+	req.Header.Set("User-Agent", "something-go-adds/1.0")
+	req.Header.Set("X-Amzn-Trace-Id", "Root=1-abc")
+
+	if err := sign(req, []byte(vectorBody), creds, vectorRegion, vectorTime()); err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+
+	got := req.Header.Get("Authorization")
+
+	for _, name := range []string{"user-agent", "x-amzn-trace-id"} {
+		if strings.Contains(got, name) {
+			t.Errorf("%s was signed, and billet does not control its value on the wire: %s",
+				name, got)
+		}
+	}
+
+	// And the signature is still the one AWS produces for the request without
+	// them, which is what proves they were excluded rather than merely reordered.
+	if !strings.HasSuffix(got,
+		"Signature=9b0063ced912747efcb5d254101e12b955e6695f9d08a727db7bf16434e34dfa") {
+		t.Errorf("adding unsigned headers changed the signature: %s", got)
+	}
+}
+
+// A REQUEST WITH NO CREDENTIALS IS NOT SIGNED WITH AN EMPTY KEY. It is refused,
+// so the failure names the missing credential rather than arriving as a 403.
+func TestSigningWithoutCredentialsIsRefused(t *testing.T) {
+	req := vectorRequest(t)
+
+	err := sign(req, []byte(vectorBody), Credentials{}, vectorRegion, vectorTime())
+	if err == nil {
+		t.Fatal("a request with no credentials was signed")
+	}
+
+	if req.Header.Get("Authorization") != "" {
+		t.Error("a refused signing still set an Authorization header")
+	}
+}
+
+// The whitespace rule is the specification's and it changes the signature, so a
+// value with padding must sign as the value without it.
+func TestAHeaderValueIsTrimmedAndCollapsedBeforeSigning(t *testing.T) {
+	creds := Credentials{AccessKeyID: vectorKey, SecretAccessKey: vectorSecret}
+
+	padded := vectorRequest(t)
+	padded.Header.Set("Content-Type", "  application/x-www-form-urlencoded;    charset=utf-8  ")
+
+	if err := sign(padded, []byte(vectorBody), creds, vectorRegion, vectorTime()); err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+
+	if !strings.HasSuffix(padded.Header.Get("Authorization"),
+		"Signature=9b0063ced912747efcb5d254101e12b955e6695f9d08a727db7bf16434e34dfa") {
+		t.Errorf("a padded header value signed differently from the trimmed one: %s",
+			padded.Header.Get("Authorization"))
+	}
+}
