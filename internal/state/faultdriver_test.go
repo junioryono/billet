@@ -6,6 +6,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"testing"
+	"time"
 )
 
 // errStorageFault stands in for the failures that must never be swallowed —
@@ -91,4 +92,53 @@ func TestACancelledBeginStillReportsAStorageFault(t *testing.T) {
 	if errors.Is(err, context.Canceled) {
 		t.Errorf("a storage fault must not be classified as a cancellation, got: %v", err)
 	}
+}
+
+// A CANCELLED QUERY MUST COME BACK AS SOMETHING beginWrite CAN CLASSIFY.
+//
+// beginWrite translates exactly one driver code into the caller's context error,
+// and 9 was a guess until this measured it. This project's rule is that a claim
+// about somebody else's code is pinned to what that code does, not to what its
+// documentation implies.
+//
+// MEASURED: modernc normalises a cancelled query to context.Canceled itself, so
+// the SQLITE_INTERRUPT branch is belt-and-braces against a case this driver
+// version does not appear to produce. It is kept because the cost is one
+// comparison and the failure it would prevent — a caller testing for
+// context.Canceled seeing a raw driver code — is silent. If a future version
+// stops normalising, this test is what says so, and that is the moment the
+// branch starts earning its place.
+//
+// Either answer passes. Anything else fails, because beginWrite would hand a
+// caller an error it cannot recognise as cancellation at all.
+func TestACancelledQueryIsRecognisableAsCancellation(t *testing.T) {
+	db := open(t)
+
+	ctx, cancel := context.WithCancel(t.Context())
+
+	// Cancelled from outside while the scan is still running, so the timing is
+	// caused rather than hoped for.
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	var n int
+
+	err := db.w.QueryRowContext(ctx,
+		`WITH RECURSIVE counter(x) AS (
+		     SELECT 1 UNION ALL SELECT x + 1 FROM counter WHERE x < 200000000
+		 ) SELECT count(*) FROM counter`).Scan(&n)
+	if err == nil {
+		t.Fatal("the query was expected to be interrupted; if this machine is fast enough " +
+			"to finish 200M rows in 50ms the row count needs raising")
+	}
+
+	if errors.Is(err, context.Canceled) || isInterrupt(err) {
+		return
+	}
+
+	t.Errorf("a cancelled query produced %#v, which is neither a context error nor "+
+		"recognised by isInterrupt — beginWrite would return it to a caller testing "+
+		"for context.Canceled", err)
 }

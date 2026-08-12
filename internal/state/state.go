@@ -75,8 +75,9 @@ type DB struct {
 	r    *sql.DB
 	lock *dirLock
 
-	// scanned records whether this handle ran the integrity check at open. Only a
-	// control plane does; see openDir.
+	// scanned records that integrityCheck actually ran on this handle. Set inside
+	// that function rather than beside its call, so it cannot say yes when the
+	// scan was removed. Only a control plane scans at open; see openDir.
 	scanned bool
 
 	// admin marks a handle belonging to a ONE-SHOT OPERATOR COMMAND, whether or
@@ -228,8 +229,6 @@ func openDir(ctx context.Context, stateDir string, admin bool) (*DB, error) {
 		if err := db.integrityCheck(startupCtx); err != nil {
 			return nil, errors.Join(err, db.Close())
 		}
-
-		db.scanned = true
 	}
 
 	// MIGRATING IS THE LOCK HOLDER'S JOB. Without the lock another billet is
@@ -342,6 +341,12 @@ func (db *DB) verifyWriterPragmas(ctx context.Context) error {
 // enough to run at every startup for a database this size, and scheduling
 // against corrupt capacity data is worse than not starting.
 func (db *DB) integrityCheck(ctx context.Context) error {
+	// RECORDED BY THE SCAN ITSELF. Setting this beside the call instead let the
+	// call be deleted while the bookkeeping stayed — a test asserting the flag
+	// then proves only that a line of bookkeeping ran, which is the shape this
+	// project calls a vacuous assertion.
+	db.scanned = true
+
 	var result string
 	if err := db.w.QueryRowContext(ctx, `PRAGMA quick_check(1)`).Scan(&result); err != nil {
 		return fmt.Errorf("integrity check: %w", err)
