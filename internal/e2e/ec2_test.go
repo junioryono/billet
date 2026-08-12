@@ -1,0 +1,385 @@
+package e2e
+
+import (
+	"context"
+	"encoding/base64"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/node"
+	"github.com/junioryono/billet/internal/nodeapi"
+	"github.com/junioryono/billet/internal/provider"
+	"github.com/junioryono/billet/internal/provider/ec2"
+	"github.com/junioryono/billet/internal/server"
+	"github.com/junioryono/billet/internal/state"
+)
+
+// THE SEAM NOTHING ELSE COVERS: the node runtime driving the cloud backend.
+//
+// The ec2 package is tested thoroughly on its own, against a fake API, and the
+// allocator's placement is tested on its own against every provider kind. Neither
+// can catch a mistake in how the two are WIRED, which is where this project's
+// worst defect so far lived — the launch path agreeing with itself while sending
+// the wrong thing.
+//
+// It needs no Docker, unlike the rest of this package, because the compute it
+// launches is a fake HTTP endpoint rather than a daemon on this machine. So it
+// runs everywhere, including on a machine that has never had Docker installed.
+const ec2Tier = "billet-8vcpu-cloud"
+
+// fakeCloud is an EC2 query API that records what it was asked and answers
+// plausibly.
+type fakeCloud struct {
+	*httptest.Server
+
+	mu sync.Mutex
+	// launched maps the Name tag of every instance started to its id, which is
+	// what a test asserts against — the name is the only durable link between a
+	// running instance and the lease that authorised it.
+	launched map[string]string
+	// terminated records the ids handed to TerminateInstances.
+	terminated []string
+	// live is what DescribeInstances reports, keyed by id.
+	live map[string]string
+	// userData holds the boot script of the last launch, decoded.
+	userData string
+
+	next int
+}
+
+func newFakeCloud(t *testing.T) *fakeCloud {
+	t.Helper()
+
+	f := &fakeCloud{launched: map[string]string{}, live: map[string]string{}}
+
+	f.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read body: %v", err)
+
+			return
+		}
+
+		params, err := url.ParseQuery(string(body))
+		if err != nil {
+			t.Errorf("parse body: %v", err)
+
+			return
+		}
+
+		f.mu.Lock()
+		defer f.mu.Unlock()
+
+		var reply string
+
+		switch params.Get("Action") {
+		case "DescribeImages":
+			reply = `<DescribeImagesResponse><imagesSet><item><imageId>ami-cloud</imageId>` +
+				`<rootDeviceName>/dev/xvda</rootDeviceName></item></imagesSet></DescribeImagesResponse>`
+
+		case "RunInstances":
+			f.next++
+			id := "i-" + strings.Repeat("0", 3) + string(rune('a'+f.next))
+			name := params.Get("TagSpecification.1.Tag.1.Value")
+			f.launched[name] = id
+			f.live[id] = name
+
+			if raw, decErr := base64.StdEncoding.DecodeString(params.Get("UserData")); decErr == nil {
+				f.userData = string(raw)
+			}
+
+			reply = `<RunInstancesResponse><instancesSet><item><instanceId>` + id +
+				`</instanceId><instanceState><name>pending</name></instanceState>` +
+				`</item></instancesSet></RunInstancesResponse>`
+
+		case "TerminateInstances":
+			id := params.Get("InstanceId.1")
+			f.terminated = append(f.terminated, id)
+			delete(f.live, id)
+
+			reply = `<TerminateInstancesResponse/>`
+
+		default: // DescribeInstances
+			var b strings.Builder
+
+			b.WriteString(`<DescribeInstancesResponse><reservationSet><item><instancesSet>`)
+
+			for id, name := range f.live {
+				b.WriteString(`<item><instanceId>` + id + `</instanceId>` +
+					`<instanceState><name>running</name></instanceState><tagSet>` +
+					`<item><key>Name</key><value>` + name + `</value></item>` +
+					`</tagSet></item>`)
+			}
+
+			b.WriteString(`</instancesSet></item></reservationSet></DescribeInstancesResponse>`)
+			reply = b.String()
+		}
+
+		if _, err := io.WriteString(w, reply); err != nil {
+			t.Errorf("write reply: %v", err)
+		}
+	}))
+
+	t.Cleanup(f.Close)
+
+	return f
+}
+
+func (f *fakeCloud) idOf(name string) (string, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	id, ok := f.launched[name]
+
+	return id, ok
+}
+
+func (f *fakeCloud) terminatedIDs() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return append([]string(nil), f.terminated...)
+}
+
+func (f *fakeCloud) bootScript() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return f.userData
+}
+
+// cloudJIT mints registrations without a GitHub organization.
+type cloudJIT struct{}
+
+type cloudRegistration struct{ name string }
+
+func (r cloudRegistration) Config() string     { return "jit-for-" + r.name }
+func (r cloudRegistration) RunnerName() string { return r.name }
+
+func (cloudJIT) Describe(context.Context, string, string) (*node.Set, []string, error) {
+	return &node.Set{ID: 7, Name: ec2Tier}, nil, nil
+}
+
+func (cloudJIT) JITConfig(
+	_ context.Context, _ int, runnerName, _ string,
+) (node.Registration, error) {
+	return cloudRegistration{name: runnerName}, nil
+}
+
+// cloudStack is a control-plane ledger and a node runtime over the cloud backend.
+type cloudStack struct {
+	alloc  *alloc.Allocator
+	runner *node.Runner
+	cloud  *fakeCloud
+	tier   config.Tier
+}
+
+func newCloudStack(t *testing.T) *cloudStack {
+	t.Helper()
+
+	db, err := state.Open(t.Context(), t.TempDir())
+	if err != nil {
+		t.Fatalf("state.Open: %v", err)
+	}
+
+	t.Cleanup(func() { _ = db.Close() })
+
+	tier := config.Tier{
+		Label:    ec2Tier,
+		Provider: config.ProviderEC2,
+		VCPU:     8,
+		Memory:   16 * config.GiB,
+		Disk:     80 * config.GiB,
+		Image:    "ami-cloud",
+		GuestOS:  config.GuestLinux,
+		Command:  []string{"./run.sh"},
+	}
+
+	a, err := alloc.New(db, alloc.Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB},
+		[]config.Tier{tier})
+	if err != nil {
+		t.Fatalf("alloc.New: %v", err)
+	}
+
+	const host = "aws-1"
+
+	// WHAT THE NODE CONTRIBUTES IS A BUDGET, not this machine's hardware — the
+	// whole reason an ec2 node has to declare it.
+	if _, err := a.RegisterNode(t.Context(), alloc.NodeRegistration{
+		Name: host, Provider: config.ProviderEC2, VCPU: 64, Memory: 256 * config.GiB,
+	}); err != nil {
+		t.Fatalf("RegisterNode: %v", err)
+	}
+
+	cloud := newFakeCloud(t)
+
+	prov, err := ec2.New("e2e-deployment", config.EC2Config{
+		Region:           "us-west-2",
+		Endpoint:         cloud.URL,
+		SubnetID:         "subnet-e2e",
+		SecurityGroupIDs: []string{"sg-e2e"},
+		InstanceTypes: []config.EC2InstanceType{
+			{Type: "c7i.2xlarge", VCPU: 8, Memory: 16 * config.GiB},
+		},
+	},
+		ec2.WithHTTPClient(cloud.Client()),
+		ec2.WithCredentials(ec2.StaticCredentials{AccessKeyID: "AKID", SecretAccessKey: "s"}))
+	if err != nil {
+		t.Fatalf("ec2.New: %v", err)
+	}
+
+	return &cloudStack{
+		alloc:  a,
+		runner: node.New(a, host, cloudJIT{}, prov, nil),
+		cloud:  cloud,
+		tier:   tier,
+	}
+}
+
+// assignedLease reserves capacity and moves it to where a launch may begin.
+//
+// A LEASE DOES NOT GO STRAIGHT FROM RESERVED TO LAUNCHING. Reserve leaves it in
+// `capacity`, which is escrow a listener is holding to OFFER GitHub; the
+// assignment is what turns an offer into work, and the state machine refuses the
+// step that skips it. In production the listener does this when GitHub assigns
+// the job, so a test that launched from `capacity` would be exercising a path no
+// deployment can reach.
+func (s *cloudStack) assignedLease(t *testing.T) *alloc.Lease {
+	t.Helper()
+
+	lease, err := s.alloc.Reserve(t.Context(), ec2Tier)
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	if err := s.alloc.Advance(t.Context(), lease.ID, lease.Epoch, alloc.PhaseAssigned); err != nil {
+		t.Fatalf("Advance to assigned: %v", err)
+	}
+
+	return lease
+}
+
+// A JOB REACHES A CLOUD INSTANCE, AND THE LEDGER AND THE INSTANCE AGREE ABOUT
+// WHICH ONE.
+//
+// The chain under test: the allocator reserves against a node whose contribution
+// is a budget rather than hardware, the node runtime binds the lease and refuses
+// to launch anything the lease does not authorise, and the cloud backend starts a
+// machine carrying a name the lease can be recovered from. Every one of those is
+// tested alone elsewhere; none of those tests can see the joins.
+func TestAJobReachesACloudInstance(t *testing.T) {
+	s := newCloudStack(t)
+
+	lease := s.assignedLease(t)
+
+	if err := s.runner.Launch(t.Context(), lease, nodeapi.TierSpecOf(s.tier),
+		server.Job{RequestID: 501, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	// NAMED AFTER THE LEASE. Nothing writes "this instance belongs to that lease"
+	// anywhere, so after a crash the name is all reconciliation has.
+	name := provider.InstanceName(lease.ID)
+
+	id, ok := s.cloud.idOf(name)
+	if !ok {
+		t.Fatalf("no instance was started carrying the lease's name %q", name)
+	}
+
+	// AND THE REGISTRATION REACHED THE GUEST. A machine that boots without one
+	// registers no runner, and the job stays queued while every signal reports
+	// success — the failure this project has already been bitten by once.
+	if script := s.cloud.bootScript(); !strings.Contains(script, "jit-for-"+name) {
+		t.Errorf("the boot script does not carry this runner's registration:\n%s", script)
+	}
+
+	// THE INVENTORY IS WHAT THE CONTROL PLANE RECONCILES AGAINST, and it comes
+	// from the PROVIDER rather than from the ledger — the point of sending it is
+	// to report something the control plane cannot see for itself. Quarantined
+	// capacity is freed on the strength of this list, so a lease missing from it
+	// is capacity handed back while a machine still runs.
+	running, err := s.runner.Instances(t.Context())
+	if err != nil {
+		t.Fatalf("Instances: %v", err)
+	}
+
+	if len(running) != 1 || running[0] != lease.ID {
+		t.Fatalf("this host reports %v as running, want just the lease it launched (%s)",
+			running, lease.ID)
+	}
+
+	// The job finishes, and the instance goes with it.
+	if err := s.runner.Destroy(t.Context(), 501); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+
+	if got := s.cloud.terminatedIDs(); len(got) != 1 || got[0] != id {
+		t.Fatalf("terminated %v, want the instance that was started (%s)", got, id)
+	}
+
+	// AND NOTHING IS LEFT RUNNING, which is the half a terminate call alone does
+	// not prove: an instance still in the inventory holds its lease's capacity.
+	after, err := s.runner.Instances(t.Context())
+	if err != nil {
+		t.Fatalf("Instances after destroy: %v", err)
+	}
+
+	if len(after) != 0 {
+		t.Errorf("this host still reports %v running after the job finished", after)
+	}
+}
+
+// A LEASE THIS HOST'S BACKEND CANNOT SERVE IS REFUSED BEFORE ANYTHING IS MINTED.
+//
+// The lease carries the backends it was reserved for, snapshotted so that editing
+// the config underneath an in-flight lease cannot reclassify it. A cloud node
+// handed a lease that does not name ec2 must refuse rather than launch — and
+// refuse before minting a registration, since one with nothing to consume it is
+// an orphan on GitHub that billet will never clean up.
+func TestACloudNodeRefusesALeaseItWasNotPlacedFor(t *testing.T) {
+	s := newCloudStack(t)
+
+	lease := s.assignedLease(t)
+
+	// As though placement had chosen a bare-metal host for it.
+	lease.Providers = []config.ProviderKind{config.ProviderFirecracker}
+
+	err := s.runner.Launch(t.Context(), lease, nodeapi.TierSpecOf(s.tier),
+		server.Job{RequestID: 502, Event: "push"})
+	if err == nil {
+		t.Fatal("a cloud node launched a lease that does not accept its backend")
+	}
+
+	if _, started := s.cloud.idOf(provider.InstanceName(lease.ID)); started {
+		t.Error("a refused launch still started an instance")
+	}
+}
+
+// FORK PULL-REQUEST WORK IS REFUSED UNTIL IT HAS A NETWORK OF ITS OWN, and the
+// refusal happens before a registration is minted.
+//
+// An instance isolates the kernel, which is why this backend may run untrusted
+// code at all — but not the VPC, so without a security group described for it the
+// work does not run. This asserts the whole path refuses, not just Accepts.
+func TestUntrustedWorkDoesNotReachTheCloudWithoutItsOwnNetwork(t *testing.T) {
+	s := newCloudStack(t)
+
+	lease := s.assignedLease(t)
+
+	err := s.runner.Launch(t.Context(), lease, nodeapi.TierSpecOf(s.tier),
+		server.Job{RequestID: 503, Event: "pull_request"})
+	if err == nil {
+		t.Fatal("a fork pull request reached the cloud with no network described for it")
+	}
+
+	if _, started := s.cloud.idOf(provider.InstanceName(lease.ID)); started {
+		t.Error("a refused launch still started an instance")
+	}
+}
