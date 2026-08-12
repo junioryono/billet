@@ -34,18 +34,27 @@ type revocations struct {
 
 // RecordRenewedCert mirrors the real one: a renewal whose parent has been
 // revoked is refused, in the same step that records it.
+// ONE LOCK ACROSS BOTH, matching the real one's single transaction. Checking the
+// parent, releasing, and then recording is the race this exists to close — a
+// fake shaped that way would let a revocation commit in the gap and pass a test
+// of the very property it breaks.
 func (r *revocations) RecordRenewedCert(
-	ctx context.Context, cert alloc.IssuedCert, parent string,
+	_ context.Context, cert alloc.IssuedCert, parent string,
 ) error {
 	r.mu.Lock()
-	revoked := r.serials[parent]
-	r.mu.Unlock()
+	defer r.mu.Unlock()
 
-	if revoked {
+	if r.serials[parent] {
 		return fmt.Errorf("%w: %s", alloc.ErrParentRevoked, parent)
 	}
 
-	return r.RecordIssuedCert(ctx, cert)
+	if r.recordErr != nil {
+		return r.recordErr
+	}
+
+	r.issued = append(r.issued, cert)
+
+	return nil
 }
 
 func (r *revocations) RecordIssuedCert(_ context.Context, cert alloc.IssuedCert) error {

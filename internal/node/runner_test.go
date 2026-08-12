@@ -1219,3 +1219,72 @@ func TestRecoveryAdoptsQuarantinedCompute(t *testing.T) {
 		t.Errorf("recovery spared %d instances without taking custody of them", got)
 	}
 }
+
+// COMPUTE ALREADY IN CUSTODY SURVIVES ITS LEASE BEING QUARANTINED.
+//
+// This is the case the other quarantine tests do not reach, and it is the one
+// where the two mechanisms meet. The node took custody of a launch whose result
+// was lost — so it holds the lease at some epoch. Heartbeats then fail for
+// longer than the TTL while the container keeps running, the reaper quarantines
+// the lease and BUMPS ITS EPOCH, and the node's next heartbeat is fenced.
+//
+// Reading that fence as "the lease is gone" destroyed the job: quarantine is the
+// one fence that means the opposite — capacity still charged, nobody else
+// holding it, and the container is exactly what the quarantine is protecting.
+func TestCustodySurvivesItsLeaseBeingQuarantined(t *testing.T) {
+	t.Parallel()
+
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
+
+	lease := assignedLease(t, a)
+
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	// The launch's result was lost, so the node holds it at the CURRENT epoch.
+	live, err := a.Lease(t.Context(), lease.ID)
+	if err != nil {
+		t.Fatalf("Lease: %v", err)
+	}
+
+	if err := r.AssumeCustody(t.Context(), live, 11); err != nil {
+		t.Fatalf("AssumeCustody: %v", err)
+	}
+
+	// Nothing heartbeats for a TTL, and the reaper quarantines it — bumping the
+	// epoch out from under the custody entry.
+	if err := a.ExpireForTest(t.Context(), lease.ID); err != nil {
+		t.Fatalf("expire: %v", err)
+	}
+
+	if _, err := a.Reap(t.Context()); err != nil {
+		t.Fatalf("Reap: %v", err)
+	}
+
+	if err := r.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend: %v", err)
+	}
+
+	if len(p.live) != 1 {
+		t.Fatalf("custody destroyed a running job because its lease had been quarantined "+
+			"under it; that is the one fence which means the job must be KEPT: %v", p.live)
+	}
+
+	// AND IT IS STILL HELD, at the new epoch — so the next tick renews rather
+	// than being fenced again forever.
+	if got := len(r.heldLeases()); got != 1 {
+		t.Fatalf("the entry was dropped from custody, so nothing renews the lease it is "+
+			"holding: %d", got)
+	}
+
+	if err := r.Tend(t.Context()); err != nil {
+		t.Fatalf("second Tend: %v", err)
+	}
+
+	if len(p.live) != 1 {
+		t.Errorf("the job survived one tick and not the next: %v", p.live)
+	}
+}

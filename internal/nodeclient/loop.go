@@ -593,6 +593,16 @@ func renewIfDue(ctx context.Context, c *Client, log *slog.Logger, opts LoopOptio
 		return
 	}
 
+	// THE CLEANUP IS SEPARATE FROM THE RENEWAL. Installing succeeded; failing to
+	// delete the generation it replaced leaves a second copy of this node's
+	// private key on disk, which is worth saying now rather than at the next
+	// restart — the process may not restart for months.
+	if stale := opts.Identity.StaleCopies(); stale != nil {
+		log.Warn("renewed this node's certificate, but the generation it replaced could not "+
+			"be removed; a second copy of this node's private key is still on disk. Delete it",
+			"error", stale)
+	}
+
 	log.Info("renewed this node's certificate",
 		"not_after", opts.Identity.Leaf().NotAfter)
 }

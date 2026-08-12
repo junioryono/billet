@@ -330,9 +330,27 @@ func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 			return fmt.Errorf("node: hold the capacity of lease %s: %w", c.leaseID, err)
 		}
 
-		// The lease is gone. Its capacity is already back in the budget, so the
-		// instance is now an orphan whatever it was before.
-		c.discard = true
+		// FENCED IS NOT THE SAME AS GONE, and reading it that way destroyed live
+		// jobs. The reaper bumps the epoch when it QUARANTINES a lease — capacity
+		// still charged, container still running, nobody else holding it — so a
+		// custody entry that predates the quarantine gets ErrFenced from a lease
+		// that very much still wants its compute. Discarding on that destroyed the
+		// job the quarantine exists to protect, and freed nothing, because the
+		// lease was not terminal.
+		//
+		// So the ledger is asked which it is. A lease still quarantined on this
+		// node is re-adopted at its new epoch and stays adopted; only a lease that
+		// is genuinely terminal or missing makes its instance an orphan.
+		quarantined, err := r.requarantined(ctx, c)
+		if err != nil {
+			return err
+		}
+
+		if !quarantined {
+			// The lease is gone. Its capacity is already back in the budget, so the
+			// instance is now an orphan whatever it was before.
+			c.discard = true
+		}
 	}
 
 	inst, found, err := r.provider.Find(ctx, c.name)
@@ -378,6 +396,41 @@ func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 		"held_for", r.now().Sub(c.since).Round(time.Second))
 
 	return r.finish(ctx, c)
+}
+
+// requarantined re-adopts a custody entry whose lease was fenced by a
+// quarantine, reporting whether it did.
+//
+// THE EPOCH MOVES AND NOTHING ELSE DOES. Quarantine is the reaper saying it can
+// no longer account for this compute, which is precisely what custody is for —
+// so the entry keeps its adopted status and picks up the new epoch, and the next
+// tick heartbeats successfully.
+func (r *Runner) requarantined(ctx context.Context, c *custody) (bool, error) {
+	lease, err := r.alloc.Lease(ctx, c.leaseID)
+	if err != nil {
+		if errors.Is(err, alloc.ErrLeaseNotFound) {
+			// Genuinely terminal: its capacity is already back.
+			return false, nil
+		}
+
+		// AMBIGUOUS IS NOT GONE. A read that failed says nothing about the lease,
+		// and discarding on it would destroy a live job over a database blip.
+		return false, fmt.Errorf("node: read the fenced lease %s: %w", c.leaseID, err)
+	}
+
+	if lease.Phase != alloc.PhaseQuarantine {
+		// Somebody else holds it now — a replacement incarnation that re-adopted
+		// this compute. Not ours to renew, and not ours to destroy either.
+		return false, nil
+	}
+
+	r.log.Warn("the lease of compute held here was quarantined; adopting it at its new epoch "+
+		"and keeping the job running",
+		"name", c.name, "lease", c.leaseID, "epoch", lease.Epoch)
+
+	c.epoch = lease.Epoch
+
+	return true, nil
 }
 
 // finish releases a custody entry's lease and forgets it.
