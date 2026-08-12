@@ -4572,3 +4572,55 @@ func TestAnUnsettledReleaseAfterAFailedLaunchBecomesARetry(t *testing.T) {
 		t.Fatal("the cleanup entry carries no lease, so the retry has nothing to release")
 	}
 }
+
+// AND THE PARKED OBLIGATION IS ACTUALLY DISCHARGED, which is the half a test of
+// the predicate alone cannot see.
+//
+// Parking it is only worth anything if something later picks it up, releases the
+// capacity, and stops refusing the request id. The previous version of this fix
+// kept a reference in a map nothing retried and described it as "costing a
+// retry"; that retry did not exist.
+func TestAParkedReleaseIsRetriedAndClears(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, tiers)
+
+	runner := &fakeRunner{onLaunch: func(int64) error { return errors.New("no space left on device") }}
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner))
+
+	lease := holdRunning(t, l, a, tiers[0].Label, 7)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	if err := l.launch(ctx, lease, Job{RequestID: 7, RunID: 7}); err != nil {
+		t.Fatalf("launch: %v", err)
+	}
+
+	// The ledger answers again, and the cleanup loop runs on its own clock.
+	l.retryCleanup(t.Context())
+
+	l.mu.Lock()
+	_, stillPending := l.cleanup[7]
+	l.mu.Unlock()
+
+	if stillPending {
+		t.Fatal("the obligation is still parked after a retry that could reach the ledger; " +
+			"its capacity is held and its request id refused for the life of the process")
+	}
+
+	// THE CAPACITY IS BACK, which is the point of the whole exercise.
+	if _, err := a.Lease(t.Context(), lease.ID); err == nil {
+		t.Error("the lease is still open, so the ledger is still charging for a job that " +
+			"never started")
+	}
+
+	// AND THE HISTORY DOES NOT CLAIM IT FINISHED.
+	outcomes, err := a.HistoryOutcomesForRequest(t.Context(), 7)
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+
+	if len(outcomes) != 1 || outcomes[0] != string(alloc.PhaseFailed) {
+		t.Errorf("job history records %v; a runner that never started did not finish", outcomes)
+	}
+}
