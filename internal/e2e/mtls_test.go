@@ -164,6 +164,33 @@ func mtlsWireWithStore(
 	return ca, base, plane
 }
 
+// awaitQueued blocks until the plane holds a command for a node.
+//
+// EVERY LAUNCH BELOW IS SPAWNED IN A GOROUTINE AND POLLED FOR IMMEDIATELY, which
+// is a race against the scheduler rather than a sequence: the poll can reach the
+// plane before the launch has queued anything, and a poll with nothing to take
+// answers "no command" instead of waiting for one. Locally the goroutine
+// essentially always wins; on a contended CI runner it does not, and this failed
+// exactly that way — `ok=false err=<nil>` in twenty milliseconds, which reads as
+// the plane refusing to deliver rather than as a test that asked too early.
+//
+// Synchronising on the queue makes the ordering caused rather than hoped for. The
+// deadline bounds a stall; it is not a budget for the work, which takes
+// microseconds when it is scheduled at all.
+func awaitQueued(t *testing.T, plane *nodeplane.Plane, node string) {
+	t.Helper()
+
+	deadline := time.Now().Add(60 * time.Second)
+
+	for plane.QueuedForTest(node) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("the launch never reached the plane's queue for %s", node)
+		}
+
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func mtlsWireWithSets(
 	t *testing.T, clock func() time.Time, store mtlsStore,
 ) (*wirecert.CA, string, *nodeplane.Plane, *atomic.Int64) {
@@ -1123,6 +1150,8 @@ func TestARecreatedScaleSetDoesNotWedgeTheTier(t *testing.T) {
 			_ = plane.NewRunner().Launch(t.Context(), lease, server.Job{RequestID: 7})
 		}()
 
+		awaitQueued(t, plane, "epyc-1")
+
 		if _, ok, err := c.Poll(t.Context()); err != nil || !ok {
 			t.Fatalf("the node was not given the launch: ok=%v err=%v", ok, err)
 		}
@@ -1303,6 +1332,8 @@ func TestATierInANonDefaultRunnerGroupCanStillMint(t *testing.T) {
 		launched <- plane.NewRunner().Launch(t.Context(), lease, server.Job{RequestID: 7})
 	}()
 
+	awaitQueued(t, plane, "epyc-1")
+
 	if _, ok, err := c.Poll(t.Context()); err != nil || !ok {
 		t.Fatalf("the node was not given the launch: ok=%v err=%v", ok, err)
 	}
@@ -1353,6 +1384,8 @@ func TestANodeCannotMintIntoAnotherTiersScaleSet(t *testing.T) {
 		// eventual outcome is not what the test is about.
 		launched <- plane.NewRunner().Launch(t.Context(), lease, server.Job{RequestID: 7})
 	}()
+
+	awaitQueued(t, plane, "epyc-1")
 
 	cmd, ok, err := c.Poll(t.Context())
 	if err != nil || !ok {
