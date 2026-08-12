@@ -26,6 +26,10 @@ type Rotating struct {
 	// paths are where the bundle lives, so a renewal survives a restart.
 	certPath, keyPath, caPath string
 
+	// rolledBack records that this identity came from the generation a renewal
+	// replaced, because the one on top of it did not load.
+	rolledBack bool
+
 	// roots is what this node verifies the control plane against. Replaced by a
 	// renewal that carries a wider bundle, which is how a CA rotation propagates.
 	//
@@ -39,9 +43,54 @@ type Rotating struct {
 	roots atomic.Pointer[x509.CertPool]
 }
 
-// NewRotating builds a rotating identity from a bundle on disk.
+// prevSuffix names the generation a renewal replaced, kept until the new one is
+// known to load.
+const prevSuffix = ".prev"
+
+// NewRotating builds a rotating identity from a bundle on disk, falling back to
+// the generation a renewal replaced if the current one is incomplete.
+//
+// A GENERATION IS THREE FILES AND THREE RENAMES, and no amount of care makes
+// that one operation. Between any two of them the process can die, and what is
+// left is a new key beside an old certificate — a pair that verifies as nothing.
+// The node then cannot start, and cannot renew its way out either, because
+// renewal is authenticated by the certificate being renewed and the key that
+// certificate belonged to has already been overwritten. That machine has to be
+// enrolled again by hand, which is the outcome renewal exists to avoid.
+//
+// So the answer is not to make the write atomic — it cannot be — but to keep the
+// predecessor until the successor is known to load, and to come back to it when
+// the successor does not. Recovery is silent to the wire and loud in the log:
+// RolledBack reports it so the caller can say so.
 func NewRotating(certPath, keyPath, caPath string) (*Rotating, error) {
-	b, err := LoadBundle(certPath, keyPath, caPath)
+	r, err := loadRotating(certPath, keyPath, caPath, "")
+	if err == nil {
+		// The current generation is good, so the predecessor has done its job.
+		clearPrevious(certPath, keyPath, caPath)
+
+		return r, nil
+	}
+
+	prev, prevErr := loadRotating(certPath, keyPath, caPath, prevSuffix)
+	if prevErr != nil {
+		return nil, fmt.Errorf(
+			"%w (and the generation it replaced does not load either: %w)", err, prevErr)
+	}
+
+	// PUT BACK, so the next renewal replaces a complete generation rather than
+	// the wreckage of the last one.
+	if err := restorePrevious(certPath, keyPath, caPath); err != nil {
+		return nil, err
+	}
+
+	prev.rolledBack = true
+
+	return prev, nil
+}
+
+// loadRotating reads one generation, optionally the superseded one.
+func loadRotating(certPath, keyPath, caPath, suffix string) (*Rotating, error) {
+	b, err := LoadBundle(certPath+suffix, keyPath+suffix, caPath+suffix)
 	if err != nil {
 		return nil, err
 	}
@@ -56,11 +105,70 @@ func NewRotating(certPath, keyPath, caPath string) (*Rotating, error) {
 		return nil, err
 	}
 
+	// The live paths, never the suffixed ones: a recovered identity must renew
+	// into the real bundle.
 	r := &Rotating{certPath: certPath, keyPath: keyPath, caPath: caPath}
 	r.roots.Store(pool)
 	r.current.Store(cert)
 
 	return r, nil
+}
+
+// savePrevious keeps the generation about to be replaced.
+func savePrevious(paths ...string) error {
+	for _, path := range paths {
+		body, err := os.ReadFile(path)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				// Nothing to keep. A first write has no predecessor.
+				continue
+			}
+
+			return fmt.Errorf("wirecert: read %s before replacing it: %w", path, err)
+		}
+
+		info, err := os.Stat(path)
+		if err != nil {
+			return fmt.Errorf("wirecert: read the mode of %s: %w", path, err)
+		}
+
+		if err := WriteFileAtomic(path+prevSuffix, body, info.Mode().Perm()); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// restorePrevious puts a superseded generation back in place.
+func restorePrevious(paths ...string) error {
+	for _, path := range paths {
+		body, err := os.ReadFile(path + prevSuffix)
+		if err != nil {
+			return fmt.Errorf("wirecert: read %s to recover it: %w", path+prevSuffix, err)
+		}
+
+		info, err := os.Stat(path + prevSuffix)
+		if err != nil {
+			return fmt.Errorf("wirecert: read the mode of %s: %w", path+prevSuffix, err)
+		}
+
+		if err := WriteFileAtomic(path, body, info.Mode().Perm()); err != nil {
+			return err
+		}
+	}
+
+	clearPrevious(paths...)
+
+	return nil
+}
+
+// clearPrevious drops a superseded generation. Best effort: a leftover copy is
+// litter, and the next renewal overwrites it.
+func clearPrevious(paths ...string) {
+	for _, path := range paths {
+		_ = os.Remove(path + prevSuffix)
+	}
 }
 
 // poolFrom builds a verification pool from a PEM bundle.
@@ -100,6 +208,12 @@ func verifiedKeyPair(certPEM, keyPEM []byte, roots *x509.CertPool) (*tls.Certifi
 
 	return &cert, nil
 }
+
+// RolledBack reports whether this identity was recovered from the generation a
+// renewal replaced — which means a renewal was interrupted partway through
+// installing itself, and is worth an operator's attention even though nothing is
+// broken.
+func (r *Rotating) RolledBack() bool { return r.rolledBack }
 
 // Leaf is the certificate in force right now.
 func (r *Rotating) Leaf() *x509.Certificate { return r.current.Load().Leaf }
@@ -211,6 +325,13 @@ func (r *Rotating) Replace(certPEM, keyPEM, caPEM []byte) error {
 		return err
 	}
 
+	// THE GENERATION THIS REPLACES IS KEPT UNTIL THE NEW ONE LOADS. Three files
+	// cannot be renamed as one operation, so a crash partway leaves a new key
+	// beside an old certificate; NewRotating comes back to these.
+	if err := savePrevious(r.keyPath, r.certPath, r.caPath); err != nil {
+		return err
+	}
+
 	if len(caPEM) > 0 {
 		if err := writeAtomic(r.caPath, caPEM, 0o644); err != nil {
 			return err
@@ -224,6 +345,9 @@ func (r *Rotating) Replace(certPEM, keyPEM, caPEM []byte) error {
 	if err := writeAtomic(r.certPath, certPEM, 0o644); err != nil {
 		return err
 	}
+
+	// Complete and verified — the predecessor has nothing left to protect.
+	clearPrevious(r.keyPath, r.certPath, r.caPath)
 
 	// THE POOL BEFORE THE LEAF. Between the two stores a handshake sees the new
 	// roots with the old certificate, which still verifies — the bundle carries

@@ -883,6 +883,16 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 			return err
 		}
 
+		// SAID OUT LOUD, because nothing is broken and something did go wrong. A
+		// renewal was interrupted partway through installing itself and this node
+		// came back on the generation it was replacing — which still works, and
+		// which is closer to expiry than the one that did not land.
+		if identity.RolledBack() {
+			slog.Default().Warn("a certificate renewal was interrupted before it finished "+
+				"installing; this node is running on the one it replaced and will try again",
+				"expires", identity.Leaf().NotAfter.Format(time.DateOnly))
+		}
+
 		host, hostErr := serverHostname(cfg.Node.ServerAddr)
 		if hostErr != nil {
 			return hostErr
