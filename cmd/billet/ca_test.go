@@ -603,3 +603,61 @@ func TestAnInterruptedEnrollmentReusesItsStagedKey(t *testing.T) {
 		t.Error("the staged key outlived the enrollment, leaving a second copy of a private key")
 	}
 }
+
+// A STAGED KEY BELONGS TO ONE NODE NAME.
+//
+// The control plane derives a certificate's subject from the REQUEST, not from
+// the CSR — deliberately, so a node cannot rename itself by editing what it
+// asks for. The consequence is that reusing a staged key after node.name changed
+// would let ONE key collect certificates for two names, and revoking one of them
+// would leave the other working.
+func TestAStagedEnrollmentRefusesADifferentNodeName(t *testing.T) {
+	dir := t.TempDir()
+	tls := &config.NodeTLS{
+		CertPath: filepath.Join(dir, "node.crt"),
+		KeyPath:  filepath.Join(dir, "node.key"),
+		CAPath:   filepath.Join(dir, "ca.crt"),
+	}
+
+	if _, _, err := pendingIdentity(tls, "epyc-1"); err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+
+	_, _, err := pendingIdentity(tls, "epyc-2")
+	if err == nil {
+		t.Fatal("a key staged for epyc-1 was reused to ask for epyc-2; one compromised key " +
+			"would hold two identities and revoking one would not reach the other")
+	}
+
+	if !strings.Contains(err.Error(), "epyc-1") {
+		t.Errorf("the refusal does not name the enrollment in the way: %v", err)
+	}
+}
+
+// AND A STAGED KEY ANYONE CAN READ IS NOT USED.
+//
+// It is the identity this machine is about to be approved for. A backup that
+// restored it 0644, or a directory somebody else can write, means the future
+// node identity is already somebody else's — and quietly continuing with it is
+// how that becomes their runner.
+func TestAStagedEnrollmentRefusesAWorldReadableKey(t *testing.T) {
+	dir := t.TempDir()
+	tls := &config.NodeTLS{
+		CertPath: filepath.Join(dir, "node.crt"),
+		KeyPath:  filepath.Join(dir, "node.key"),
+		CAPath:   filepath.Join(dir, "ca.crt"),
+	}
+
+	if _, _, err := pendingIdentity(tls, "epyc-1"); err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+
+	if err := os.Chmod(filepath.Join(dir, "pending.key"), 0o644); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+
+	if _, _, err := pendingIdentity(tls, "epyc-1"); err == nil {
+		t.Fatal("a world-readable staged key was used to enroll; whoever can read it can be " +
+			"this node once it is approved")
+	}
+}

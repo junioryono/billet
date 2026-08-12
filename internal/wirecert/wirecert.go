@@ -706,6 +706,11 @@ const maxPEM = 1 << 20
 // directory starts billet perfectly happily while any local user copies the
 // authority and mints node identities at will. A symlink is refused for the
 // same reason: the path billet was told to read is the only one it should read.
+// ReadSecret is readSecret for callers outside this package that hold a private
+// key of their own — the staged enrollment key, which is a node identity waiting
+// to be signed and has to meet the same bar as one that already is.
+func ReadSecret(path string) ([]byte, error) { return readSecret(path) }
+
 func readSecret(path string) ([]byte, error) {
 	info, err := os.Lstat(path)
 	if err != nil {

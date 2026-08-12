@@ -414,14 +414,40 @@ func pendingIdentity(tls *config.NodeTLS, name string) ([]byte, []byte, error) {
 
 	keyStage := filepath.Join(dir, "pending.key")
 	csrStage := filepath.Join(dir, "pending.csr")
+	// BOUND TO THE NAME IT WAS MADE FOR. The server derives the certificate
+	// subject from the REQUEST, not from the CSR, so reusing a stage after
+	// node.name changed would let one key collect certificates for two names —
+	// and revoking one of them would leave the other working.
+	forStage := filepath.Join(dir, "pending.node")
 
-	staged, keyErr := os.ReadFile(keyStage)
+	staged, keyErr := wirecert.ReadSecret(keyStage)
 	stagedCSR, csrErr := os.ReadFile(csrStage)
+	stagedFor, forErr := os.ReadFile(forStage)
 
-	if keyErr == nil && csrErr == nil {
+	switch {
+	case keyErr == nil && csrErr == nil && forErr == nil && string(stagedFor) == name:
 		fmt.Printf("Resuming the enrollment already staged in %s.\n\n", dir)
 
 		return stagedCSR, staged, nil
+
+	case errors.Is(keyErr, os.ErrNotExist):
+		// Nothing staged, which is the ordinary first run.
+
+	case keyErr != nil:
+		// A STAGED KEY THAT FAILS THE CHECKS IS NOT SILENTLY REPLACED. It may be
+		// the identity this machine is about to be approved for, and replacing it
+		// strands the name; it may also be readable by somebody else, which is why
+		// it cannot simply be used. Both need an operator.
+		return nil, nil, fmt.Errorf("the enrollment staged in %s cannot be used: %w. Remove "+
+			"those files to start again, and deny the pending request on the control plane "+
+			"so the name is free", dir, keyErr)
+
+	case string(stagedFor) != name:
+		return nil, nil, fmt.Errorf(
+			"%s holds an enrollment staged for node %q and this config says %q. One key must "+
+				"not claim two names: remove those files to start again, and deny the pending "+
+				"request for %q so its name is free",
+			dir, stagedFor, name, stagedFor)
 	}
 
 	csr, key, err := wirecert.NewNodeCSR(name)
@@ -437,6 +463,10 @@ func pendingIdentity(tls *config.NodeTLS, name string) ([]byte, []byte, error) {
 		return nil, nil, err
 	}
 
+	if err := wirecert.WriteFileAtomic(forStage, []byte(name), 0o644); err != nil {
+		return nil, nil, err
+	}
+
 	return csr, key, nil
 }
 
@@ -444,8 +474,15 @@ func pendingIdentity(tls *config.NodeTLS, name string) ([]byte, []byte, error) {
 func clearPendingIdentity(tls *config.NodeTLS) {
 	dir := filepath.Dir(tls.KeyPath)
 
-	for _, name := range []string{"pending.key", "pending.csr"} {
-		_ = os.Remove(filepath.Join(dir, name))
+	for _, name := range []string{"pending.key", "pending.csr", "pending.node"} {
+		if err := os.Remove(filepath.Join(dir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			// SAID OUT LOUD rather than swallowed: what is left behind is a second
+			// copy of a private key, and the enrollment itself succeeded — so this
+			// is a warning, not a failure.
+			fmt.Fprintf(os.Stderr, "the enrollment succeeded but %s could not be removed: %v\n"+
+				"That file is a copy of this node's private key; delete it.\n",
+				filepath.Join(dir, name), err)
+		}
 	}
 }
 

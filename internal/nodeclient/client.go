@@ -438,9 +438,8 @@ func (c *Client) Lease(ctx context.Context, leaseID string) (*alloc.Lease, error
 
 // LaunchedLeaseIDs reports which leases this node is believed to have launched.
 func (c *Client) LaunchedLeaseIDs(ctx context.Context, nodeName string) (map[string]bool, error) {
-	var res nodeapi.LaunchedResponse
-
-	if err := c.do(ctx, http.MethodGet, "/v1/nodes/"+url.PathEscape(nodeName)+"/launched", nil, &res); err != nil {
+	res, err := c.launched(ctx, nodeName)
+	if err != nil {
 		return nil, err
 	}
 
@@ -449,6 +448,29 @@ func (c *Client) LaunchedLeaseIDs(ctx context.Context, nodeName string) (map[str
 	}
 
 	return res.LeaseIDs, nil
+}
+
+// QuarantinedLeaseIDs reports the leases holding capacity for compute the
+// control plane cannot account for on this node.
+func (c *Client) QuarantinedLeaseIDs(ctx context.Context, nodeName string) (map[string]bool, error) {
+	res, err := c.launched(ctx, nodeName)
+	if err != nil {
+		return nil, err
+	}
+
+	if res.Quarantined == nil {
+		return map[string]bool{}, nil
+	}
+
+	return res.Quarantined, nil
+}
+
+func (c *Client) launched(ctx context.Context, nodeName string) (nodeapi.LaunchedResponse, error) {
+	var res nodeapi.LaunchedResponse
+
+	err := c.do(ctx, http.MethodGet, "/v1/nodes/"+url.PathEscape(nodeName)+"/launched", nil, &res)
+
+	return res, err
 }
 
 // Describe finds a tier's scale set, via the control plane.

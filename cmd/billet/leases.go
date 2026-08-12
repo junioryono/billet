@@ -122,7 +122,9 @@ func cmdLeasesRelease(ctx context.Context, args []string) error {
 			fmt.Printf("capacity can be sold to a second job while the first is still running.\n\n")
 			fmt.Printf("Re-run with --force when you know the compute is gone.\n")
 
-			return nil
+			// NON-ZERO, because nothing was released. Automation that reads an exit
+			// status would otherwise carry on believing the capacity came back.
+			return errors.New("refusing to release without --force")
 		}
 
 		return fmt.Errorf("lease %s is not quarantined; `billet leases quarantined` lists what is",

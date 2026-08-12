@@ -888,6 +888,12 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 		// renewal was interrupted partway through installing itself and this node
 		// came back on the generation it was replacing — which still works, and
 		// which is closer to expiry than the one that did not land.
+		if stale := identity.StaleCopies(); stale != nil {
+			slog.Default().Warn("a superseded certificate generation could not be removed, so a "+
+				"second copy of this node's private key is still on disk; delete it",
+				"error", stale)
+		}
+
 		if identity.RolledBack() {
 			slog.Default().Warn("a certificate renewal was interrupted before it finished "+
 				"installing; this node is running on the one it replaced and will try again",

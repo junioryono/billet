@@ -56,7 +56,7 @@ type fakeRegistrar struct {
 // ResolveQuarantineFor records what a returning host reported running, so a test
 // can assert the plane passed it on.
 func (f *fakeRegistrar) ResolveQuarantineFor(
-	_ context.Context, node string, running []string,
+	_ context.Context, node string, running []string, _ int64,
 ) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -134,8 +134,9 @@ type fakeStore struct {
 	releaseErr   error
 	leaseErr     error
 
-	lease    *alloc.Lease
-	launched map[string]bool
+	lease       *alloc.Lease
+	launched    map[string]bool
+	quarantined map[string]bool
 
 	bound    []string
 	advanced []alloc.Phase
@@ -181,6 +182,15 @@ func (f *fakeStore) Lease(context.Context, string) (*alloc.Lease, error) {
 	defer f.mu.Unlock()
 
 	return f.lease, f.leaseErr
+}
+
+// QuarantinedLeaseIDs are the leases this fake says are holding capacity for
+// compute nobody has accounted for.
+func (f *fakeStore) QuarantinedLeaseIDs(context.Context, string) (map[string]bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return f.quarantined, nil
 }
 
 func (f *fakeStore) LaunchedLeaseIDs(context.Context, string) (map[string]bool, error) {

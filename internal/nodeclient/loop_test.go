@@ -260,6 +260,10 @@ func (stubStore) Advance(context.Context, string, int64, alloc.Phase) error { re
 func (stubStore) Heartbeat(context.Context, string, int64) error            { return nil }
 func (stubStore) Release(context.Context, string, int64, alloc.Phase) error { return nil }
 func (stubStore) Lease(context.Context, string) (*alloc.Lease, error)       { return nil, nil }
+func (stubStore) QuarantinedLeaseIDs(context.Context, string) (map[string]bool, error) {
+	return map[string]bool{}, nil
+}
+
 func (stubStore) LaunchedLeaseIDs(context.Context, string) (map[string]bool, error) {
 	return nil, nil
 }

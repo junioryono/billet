@@ -30,6 +30,11 @@ type Rotating struct {
 	// replaced, because the one on top of it did not load.
 	rolledBack bool
 
+	// staleCopies records a superseded generation that could not be removed. One
+	// of those files is a private key, so it is worth an operator's attention
+	// even though nothing is broken.
+	staleCopies error
+
 	// roots is what this node verifies the control plane against. Replaced by a
 	// renewal that carries a wider bundle, which is how a CA rotation propagates.
 	//
@@ -66,7 +71,9 @@ func NewRotating(certPath, keyPath, caPath string) (*Rotating, error) {
 	r, err := loadRotating(certPath, keyPath, caPath, "")
 	if err == nil {
 		// The current generation is good, so the predecessor has done its job.
-		clearPrevious(certPath, keyPath, caPath)
+		if cleanErr := clearPrevious(certPath, keyPath, caPath); cleanErr != nil {
+			r.staleCopies = cleanErr
+		}
 
 		return r, nil
 	}
@@ -158,17 +165,27 @@ func restorePrevious(paths ...string) error {
 		}
 	}
 
-	clearPrevious(paths...)
-
-	return nil
+	return clearPrevious(paths...)
 }
 
-// clearPrevious drops a superseded generation. Best effort: a leftover copy is
-// litter, and the next renewal overwrites it.
-func clearPrevious(paths ...string) {
+// clearPrevious drops a superseded generation, reporting what it could not
+// remove.
+//
+// NOT SWALLOWED, because one of these files is a private key. A removal that
+// fails leaves a second copy of a node's identity on disk while the renewal it
+// belonged to reports success, and nothing else would ever mention it. It is
+// still not a failure of the renewal — the new generation is installed and
+// working — so the caller warns rather than refusing.
+func clearPrevious(paths ...string) error {
+	var failures []error
+
 	for _, path := range paths {
-		_ = os.Remove(path + prevSuffix)
+		if err := os.Remove(path + prevSuffix); err != nil && !errors.Is(err, os.ErrNotExist) {
+			failures = append(failures, err)
+		}
 	}
+
+	return errors.Join(failures...)
 }
 
 // poolFrom builds a verification pool from a PEM bundle.
@@ -214,6 +231,10 @@ func verifiedKeyPair(certPEM, keyPEM []byte, roots *x509.CertPool) (*tls.Certifi
 // installing itself, and is worth an operator's attention even though nothing is
 // broken.
 func (r *Rotating) RolledBack() bool { return r.rolledBack }
+
+// StaleCopies reports a superseded generation that could not be deleted — a
+// second copy of this node's private key, left on disk.
+func (r *Rotating) StaleCopies() error { return r.staleCopies }
 
 // Leaf is the certificate in force right now.
 func (r *Rotating) Leaf() *x509.Certificate { return r.current.Load().Leaf }
@@ -347,7 +368,9 @@ func (r *Rotating) Replace(certPEM, keyPEM, caPEM []byte) error {
 	}
 
 	// Complete and verified — the predecessor has nothing left to protect.
-	clearPrevious(r.keyPath, r.certPath, r.caPath)
+	if cleanErr := clearPrevious(r.keyPath, r.certPath, r.caPath); cleanErr != nil {
+		r.staleCopies = cleanErr
+	}
 
 	// THE POOL BEFORE THE LEAF. Between the two stores a handshake sees the new
 	// roots with the old certificate, which still verifies — the bundle carries

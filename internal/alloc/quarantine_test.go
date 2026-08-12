@@ -26,6 +26,23 @@ func quarantineFleet(t *testing.T, now *time.Time) *Allocator {
 	return a
 }
 
+// nodeEpoch is the fencing token the ledger holds for a host, which a
+// reconciliation has to present.
+func nodeEpoch(t *testing.T, a *Allocator) int64 {
+	t.Helper()
+
+	const name = "epyc-1"
+
+	var epoch int64
+
+	if err := a.db.Reader().QueryRowContext(t.Context(),
+		`SELECT epoch FROM nodes WHERE name = ?`, name).Scan(&epoch); err != nil {
+		t.Fatalf("read the epoch of %s: %v", name, err)
+	}
+
+	return epoch
+}
+
 // busyLease drives a lease all the way to a running container on epyc-1.
 func busyLease(t *testing.T, a *Allocator) *Lease {
 	t.Helper()
@@ -207,8 +224,13 @@ func TestANodeThatComesBackWithoutTheContainerFreesIt(t *testing.T) {
 		t.Fatalf("Reap: %v", err)
 	}
 
+	// PAST THE GRACE, because an absence taken moments after a lost launch is a
+	// snapshot rather than a result — the daemon may still be creating the
+	// container. Its own test is below.
+	now = now.Add(2 * quarantineGrace)
+
 	// It still runs SOMETHING, just not this.
-	resolved, err := a.ResolveQuarantineFor(t.Context(), "epyc-1", []string{"some-other-lease"})
+	resolved, err := a.ResolveQuarantineFor(t.Context(), "epyc-1", []string{"some-other-lease"}, nodeEpoch(t, a))
 	if err != nil {
 		t.Fatalf("ResolveQuarantineFor: %v", err)
 	}
@@ -238,7 +260,9 @@ func TestANodeStillRunningTheContainerKeepsItQuarantined(t *testing.T) {
 		t.Fatalf("Reap: %v", err)
 	}
 
-	resolved, err := a.ResolveQuarantineFor(t.Context(), "epyc-1", []string{lease.ID})
+	now = now.Add(2 * quarantineGrace)
+
+	resolved, err := a.ResolveQuarantineFor(t.Context(), "epyc-1", []string{lease.ID}, nodeEpoch(t, a))
 	if err != nil {
 		t.Fatalf("ResolveQuarantineFor: %v", err)
 	}
@@ -281,5 +305,94 @@ func TestAQuarantinedLeasePinsItsHostsBackend(t *testing.T) {
 
 	if _, err := a.RegisterNode(t.Context(), moved); !errors.Is(err, ErrWrongProvider) {
 		t.Fatalf("a host holding quarantined compute changed its backend: %v", err)
+	}
+}
+
+// AN ABSENCE TAKEN TOO SOON IS NOT PROOF.
+//
+// The rule custody already lives by: when a launch loses its response the daemon
+// may still be creating the container, and a listing issued straight afterwards
+// can overtake it and see nothing. Freeing the capacity on that hands the slot
+// back moments before the container appears, and a second job lands on top of
+// the first.
+func TestAFreshQuarantineIsNotResolvedByAnEmptyInventory(t *testing.T) {
+	now := time.Now().UTC()
+	a := quarantineFleet(t, &now)
+
+	busyLease(t, a)
+
+	now = now.Add(31 * time.Second)
+
+	if _, err := a.Reap(t.Context()); err != nil {
+		t.Fatalf("Reap: %v", err)
+	}
+
+	// The node comes straight back and reports nothing running.
+	resolved, err := a.ResolveQuarantineFor(t.Context(), "epyc-1", nil, nodeEpoch(t, a))
+	if err != nil {
+		t.Fatalf("ResolveQuarantineFor: %v", err)
+	}
+
+	if resolved != 0 {
+		t.Errorf("a listing taken %s after the lease expired freed %d lease(s); the container "+
+			"may not have appeared yet", 31*time.Second, resolved)
+	}
+
+	if got := headroom(t, a, "small"); got != 0 {
+		t.Errorf("the machine offered %d slots on the strength of one early snapshot", got)
+	}
+
+	// Once the container has had time to appear and still has not, the absence
+	// means what it says.
+	now = now.Add(2 * quarantineGrace)
+
+	resolved, err = a.ResolveQuarantineFor(t.Context(), "epyc-1", nil, nodeEpoch(t, a))
+	if err != nil {
+		t.Fatalf("ResolveQuarantineFor: %v", err)
+	}
+
+	if resolved != 1 {
+		t.Errorf("a settled absence freed %d leases; capacity that can never come back is the "+
+			"other half of this failure", resolved)
+	}
+}
+
+// AN OVERTAKEN REGISTRATION CHANGES NOTHING, including this.
+//
+// Two registrations can be in flight — a node restarting twice, or a duplicate
+// host. The one that arrives second is current, and the first must not
+// terminalize a lease the second has just vouched for using a listing taken
+// before that container was visible.
+func TestAnOvertakenRegistrationDoesNotResolveQuarantine(t *testing.T) {
+	now := time.Now().UTC()
+	a := quarantineFleet(t, &now)
+
+	busyLease(t, a)
+
+	now = now.Add(31 * time.Second)
+
+	if _, err := a.Reap(t.Context()); err != nil {
+		t.Fatalf("Reap: %v", err)
+	}
+
+	stale := nodeEpoch(t, a)
+
+	now = now.Add(2 * quarantineGrace)
+
+	// A newer registration supersedes it.
+	if _, err := a.RegisterNode(t.Context(), NodeRegistration{
+		Name: "epyc-1", Provider: config.ProviderDocker, VCPU: 4, Memory: 16 * config.GiB,
+	}); err != nil {
+		t.Fatalf("re-register: %v", err)
+	}
+
+	resolved, err := a.ResolveQuarantineFor(t.Context(), "epyc-1", nil, stale)
+	if err != nil {
+		t.Fatalf("ResolveQuarantineFor: %v", err)
+	}
+
+	if resolved != 0 {
+		t.Errorf("an overtaken registration freed %d lease(s) using its own stale inventory",
+			resolved)
 	}
 }

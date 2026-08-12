@@ -477,7 +477,10 @@ type Registrar interface {
 
 	// ResolveQuarantineFor frees capacity held for compute a returning host says
 	// it is not running, and reports how many leases it released.
-	ResolveQuarantineFor(ctx context.Context, node string, running []string) (int, error)
+	// The epoch fences it: an overtaken registration must not terminalize a lease
+	// a newer one has just vouched for, using a listing taken before that
+	// container was visible.
+	ResolveQuarantineFor(ctx context.Context, node string, running []string, epoch int64) (int, error)
 }
 
 // sortedSites lists the declared places in a stable order, so a refusal naming
@@ -660,7 +663,8 @@ func (p *Plane) Register(
 		// out of the fleet to tidy up an accounting row, and the next
 		// registration or sweep does the same work.
 		if req.InventoryKnown {
-			if freed, err := p.registrar.ResolveQuarantineFor(ctx, req.Node, req.Instances); err != nil {
+			if freed, err := p.registrar.ResolveQuarantineFor(
+				ctx, req.Node, req.Instances, epoch); err != nil {
 				p.log.Warn("could not reconcile quarantined capacity with what this host "+
 					"reports running", "node", req.Node, "error", err)
 			} else if freed > 0 {
