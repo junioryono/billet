@@ -2336,6 +2336,27 @@ func (l *Listener) launch(ctx context.Context, lease *alloc.Lease, job Job) erro
 	return nil
 }
 
+// leaseFor is the lease this listener currently associates with a request, from
+// wherever it is being tracked.
+func (l *Listener) leaseFor(requestID int64) *alloc.Lease {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if lease, ok := l.running[requestID]; ok {
+		return lease
+	}
+
+	if p, ok := l.acquiring[requestID]; ok {
+		return p.lease
+	}
+
+	if entry, ok := l.cleanup[requestID]; ok {
+		return entry.lease
+	}
+
+	return nil
+}
+
 // releaseSettled reports whether a release attempt ended the lease's claim on
 // capacity, one way or another.
 //
@@ -2376,6 +2397,17 @@ func (l *Listener) complete(ctx context.Context, job Job) {
 	// Idempotent by contract, so a redelivered completion, a request this
 	// listener never launched, and a second attempt after a failure all reach
 	// this safely.
+	//
+	// THE LEASE IS NOTED BEFORE THE DESTROY, because the maps can change during
+	// it. A remote destroy has no bound, and the heartbeat runs the whole time:
+	// if it finds this lease fenced — which is what the reaper quarantining it
+	// looks like — it drops the entry and records a cleanup obligation carrying
+	// no lease. The destroy then SUCCEEDS, proving the container is gone, and
+	// the code that would resolve the quarantine has nothing left to name. The
+	// capacity stays charged until a node happens to report an inventory, or
+	// forever if that node never comes back.
+	before := l.leaseFor(job.RequestID)
+
 	if err := l.runner.Destroy(ctx, job.RequestID); err != nil {
 		// NOT released, and NOT fatal. Two separate decisions.
 		//
@@ -2458,6 +2490,14 @@ func (l *Listener) complete(ctx context.Context, job Job) {
 		if entry.outcome != "" {
 			outcome = entry.outcome
 		}
+	}
+
+	// OR THE ONE NOTED BEFORE THE DESTROY, if the heartbeat dropped it while that
+	// was in flight. AFTER the parked branch on purpose: that one carries an
+	// outcome as well as a lease, and taking the bare reference first would
+	// archive a job that never started as `done`.
+	if !ok && before != nil {
+		lease, ok = before, true
 	}
 
 	if !ok {

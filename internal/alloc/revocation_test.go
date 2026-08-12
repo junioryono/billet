@@ -306,3 +306,81 @@ func TestACertificateIssuedAfterTheCutoffIsAccepted(t *testing.T) {
 		t.Error("a certificate minted before the revocation is still accepted")
 	}
 }
+
+// THE CUTOFF ALONE STOPS A RENEWAL, with no serial involved.
+//
+// This is the case the cutoff exists for and the one the other test cannot
+// isolate: RevokeNode both revokes the recorded serials AND installs the cutoff,
+// so a parent that was recorded is stopped by the serial check whether or not
+// the cutoff works at all. Removing the cutoff query leaves that test green.
+//
+// Here the parent was never recorded — the legacy credential the whole mechanism
+// is for — so the serial check has nothing to match and only the cutoff can
+// refuse it.
+func TestAnUnrecordedParentCannotRenewPastTheCutoff(t *testing.T) {
+	now := time.Now().UTC()
+
+	a := newBareAllocator(t, Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, nil,
+		WithClock(func() time.Time { return now }))
+
+	future := now.Add(365 * 24 * time.Hour).Format(time.RFC3339)
+
+	// Nothing recorded this parent: it predates billet tracking serials.
+	if _, err := a.RevokeNode(t.Context(), "epyc-1", "compromised"); err != nil {
+		t.Fatalf("RevokeNode: %v", err)
+	}
+
+	err := a.RecordRenewedCert(t.Context(),
+		IssuedCert{Serial: "child", Node: "epyc-1", Source: CertRenewed, NotAfter: future},
+		"never-recorded", now.Add(-time.Minute))
+	if !errors.Is(err, ErrParentRevoked) {
+		t.Fatalf("a certificate this deployment never recorded renewed itself past its node's "+
+			"revocation: %v", err)
+	}
+
+	// AND THE CHILD WAS NOT WRITTEN, so nothing is left holding a credential the
+	// refusal was supposed to prevent.
+	live, err := a.LiveCertsFor(t.Context(), "epyc-1")
+	if err != nil {
+		t.Fatalf("LiveCertsFor: %v", err)
+	}
+
+	for i := range live {
+		if live[i].Serial == "child" {
+			t.Error("the refused renewal was recorded anyway")
+		}
+	}
+}
+
+// AND THE BOUNDARY IS WHERE THE COMMENT SAYS IT IS. A parent minted in the
+// revocation's own second is refused: a certificate cannot express anything
+// finer, so that second is ambiguous, and the ambiguity resolves toward
+// refusing. One minted in the next second renews normally.
+func TestTheRenewalCutoffBoundaryIsAWholeSecond(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+
+	a := newBareAllocator(t, Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, nil,
+		WithClock(func() time.Time { return now }))
+
+	future := now.Add(365 * 24 * time.Hour).Format(time.RFC3339)
+
+	if _, err := a.RevokeNode(t.Context(), "epyc-1", "compromised"); err != nil {
+		t.Fatalf("RevokeNode: %v", err)
+	}
+
+	sameSecond := a.RecordRenewedCert(t.Context(),
+		IssuedCert{Serial: "same", Node: "epyc-1", Source: CertRenewed, NotAfter: future},
+		"unrecorded", now)
+	if !errors.Is(sameSecond, ErrParentRevoked) {
+		t.Errorf("a parent minted in the revocation's own second was allowed to renew; that "+
+			"second cannot be told apart from the one before it: %v", sameSecond)
+	}
+
+	next := a.RecordRenewedCert(t.Context(),
+		IssuedCert{Serial: "next", Node: "epyc-1", Source: CertRenewed, NotAfter: future},
+		"reissued", now.Add(time.Second))
+	if next != nil {
+		t.Errorf("a certificate issued the second AFTER a revocation could not renew, so the "+
+			"cutoff is a ban on the name rather than a revocation: %v", next)
+	}
+}
