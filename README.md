@@ -168,6 +168,12 @@ the reaper.
 `--kill-whom=main` matters: without it systemctl signals every process in the
 service, including a container CLI billet has in flight.
 
+### Capacity that does not come back
+
+A lease whose holder stops heartbeating is reclaimed by the reaper — but only if nothing was running behind it. If there was, the capacity stays charged to its host and the lease is **quarantined**, because expiry proves the control plane stopped hearing from something, never that the container stopped. Freeing it immediately would let another tier take that slot while the container is still there, and two jobs would land on a machine sized for one.
+
+It resolves itself in the ordinary case: the host destroys the container and says so, or comes back reporting what it is actually running, and a quarantined lease missing from that list has no container by definition. The case that does not resolve is a machine that never returns — its capacity would be missing from the deployment permanently, so `billet leases quarantined` shows what is held and `billet leases release <lease> --force` hands it back. Force, because nothing has confirmed anything: you are asserting the compute is gone, and if you are wrong that slot is sold twice.
+
 ## Status
 
 billet is pre-alpha. **A job runs end to end in a container**, and nothing above that line is
@@ -189,6 +195,8 @@ built. What works **today**:
 | `billet nodes revoke <node>` | Withdraws every credential that machine holds, renewals included |
 | `billet ca revoke <node> --cert <path>` | Withdraws one specific certificate |
 | `billet ca rotate` / `retire` | Replaces the authority as an overlap, so no node is cut off |
+| `billet leases quarantined` | Capacity held for compute nobody has confirmed gone, and which host holds it |
+| `billet leases release <lease> --force` | Hands that capacity back, for a machine that is never coming back |
 | `billet teardown` | Removes the scale sets billet created |
 | Capacity ledger | Lease state machine, fencing epochs, placement enforcement, escrow before advertising |
 | Docker provider | One container per job, JIT registration delivered off argv. **Trials only** — shares the host kernel, so it refuses anything not established as trusted |
