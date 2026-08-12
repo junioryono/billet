@@ -134,6 +134,54 @@ func TestACloudNodeNeedsSomewhereToLaunch(t *testing.T) {
 	}
 }
 
+// A REGION IS CHECKED FOR SHAPE, because it is not only an address.
+//
+// It goes into the SIGNING SCOPE, so a typo cannot be rescued by setting
+// `endpoint` — the request would reach the right host and be refused with a 403
+// that names nothing. Left to be discovered at runtime, that is the first launch
+// of the day failing rather than `billet check` saying so.
+//
+// A SHAPE RATHER THAN A LIST. An allowlist of regions is a rule about somebody
+// else's product that goes stale the next time AWS opens one, and being stale
+// means refusing a config that is perfectly correct. The shape catches the
+// mistake people actually make, which is dropping the hyphens.
+func TestARegionIsCheckedForShape(t *testing.T) {
+	for name, region := range map[string]string{
+		"no hyphens": "uswest2",
+		"no digit":   "us-west",
+		"shouting":   "US-WEST-2",
+		"a hostname": "ec2.us-west-2.amazonaws.com",
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := loadErr(t, cloudConfig(t, "    region: us-west-2\n",
+				"    region: "+region+"\n"))
+
+			if !strings.Contains(got, "region") {
+				t.Errorf("the error does not name the region: %s", got)
+			}
+		})
+	}
+
+	// ACCEPTED, and every one of these is a real region. GovCloud and China are
+	// the reason this is not an allowlist: partitions billet has never been run in
+	// still have to load. The ordinary `us-west-2` is the fixture's own default,
+	// so the happy-path test covers it rather than a no-op substitution here.
+	for name, region := range map[string]string{
+		"four parts":  "ap-southeast-4",
+		"govcloud":    "us-gov-west-1",
+		"china":       "cn-north-1",
+		"a long name": "il-central-1",
+	} {
+		t.Run(name, func(t *testing.T) {
+			body := cloudConfig(t, "    region: us-west-2\n", "    region: "+region+"\n")
+
+			if _, err := Load(writeConfig(t, body)); err != nil {
+				t.Errorf("region %q was rejected: %v", region, err)
+			}
+		})
+	}
+}
+
 // EVERY SHAPE DECLARES WHAT IT HOLDS, because billet ships no table of EC2
 // instance types and the allocator has already escrowed a size by the time one is
 // chosen. A shape that lies about its cores over-commits a machine nobody can see,

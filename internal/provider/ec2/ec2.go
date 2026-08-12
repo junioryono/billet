@@ -305,10 +305,8 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*provider.In
 		params.Set("InstanceMarketOptions.SpotOptions.InstanceInterruptionBehavior", "terminate")
 	}
 
-	if spec.Disk > 0 {
-		if err := p.setRootVolume(ctx, params, spec); err != nil {
-			return nil, err
-		}
+	if err := p.setRootVolume(ctx, params, spec); err != nil {
+		return nil, err
 	}
 
 	var out runInstancesResponse
@@ -379,19 +377,34 @@ func (p *Provider) setTags(params url.Values, name string) {
 	params.Set("TagSpecification.2.Tag.2.Value", p.owner)
 }
 
-// setRootVolume resizes the root disk to what the tier asked for.
+// setRootVolume states what happens to the root disk, and resizes it when the
+// tier asked for a size.
 //
-// THE DEVICE NAME IS ASKED FOR RATHER THAN ASSUMED, and that is the whole reason
-// this costs an API call. A block device mapping naming a device that is not the
-// AMI's root does not fail: EC2 attaches an ADDITIONAL empty volume, the root
-// stays whatever size the image was built at, and the launch reports success. So
-// a tier asking for 300GiB would run out of disk mid-job while an unused 300GiB
-// volume sat beside it, billed. `/dev/sda1` and `/dev/xvda` are both common and
-// neither is safe to guess.
+// IT RUNS ON EVERY LAUNCH, EVEN WITH NO SIZE TO SET, because DeleteOnTermination
+// is the half that always matters. Left unstated, whatever the AMI was built with
+// governs — and an AMI built with it false leaves a root volume behind for every
+// job billet ever runs on it, billed indefinitely, discoverable only by hunting
+// tags. Stating it costs one DescribeImages per AMI, cached for the life of the
+// process.
+//
+// THE DEVICE NAME IS ASKED FOR RATHER THAN ASSUMED, which is what that call buys.
+// A block device mapping naming a device that is not the AMI's root does not
+// fail: EC2 attaches an ADDITIONAL empty volume, the root stays whatever size the
+// image was built at, and the launch reports success. So a tier asking for 300GiB
+// would run out of disk mid-job while an unused 300GiB volume sat beside it,
+// billed. `/dev/sda1` and `/dev/xvda` are both common and neither is safe to
+// guess.
 func (p *Provider) setRootVolume(ctx context.Context, params url.Values, spec provider.Spec) error {
 	device, err := p.rootDevice(ctx, spec.Image)
 	if err != nil {
 		return err
+	}
+
+	params.Set("BlockDeviceMapping.1.DeviceName", device)
+	params.Set("BlockDeviceMapping.1.Ebs.DeleteOnTermination", "true")
+
+	if spec.Disk <= 0 {
+		return nil
 	}
 
 	// ROUNDED UP. EBS sizes in whole GiB, and rounding down would hand a tier that
@@ -399,9 +412,7 @@ func (p *Provider) setRootVolume(ctx context.Context, params url.Values, spec pr
 	// costing a fraction of a cent.
 	gib := (int64(spec.Disk) + int64(config.GiB) - 1) / int64(config.GiB)
 
-	params.Set("BlockDeviceMapping.1.DeviceName", device)
 	params.Set("BlockDeviceMapping.1.Ebs.VolumeSize", strconv.FormatInt(gib, 10))
-	params.Set("BlockDeviceMapping.1.Ebs.DeleteOnTermination", "true")
 
 	return nil
 }

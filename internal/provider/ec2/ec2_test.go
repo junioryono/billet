@@ -516,17 +516,56 @@ func TestAPartialGibibyteRoundsUp(t *testing.T) {
 	}
 }
 
-// A launch with nothing to size does not pay for the extra round trip.
-func TestNoDiskMeansNoImageLookup(t *testing.T) {
+// A ROOT VOLUME IS DISPOSED OF EXPLICITLY, EVEN WITH NO SIZE TO SET.
+//
+// Left unstated, whatever the AMI was built with governs — and an AMI built with
+// DeleteOnTermination false leaves a root volume behind for every job billet ever
+// runs on it, billed indefinitely and discoverable only by hunting tags. This is
+// exactly the case that used to skip the block device mapping entirely, on the
+// reasoning that a launch with nothing to size should not pay for the lookup.
+func TestARootVolumeIsAlwaysDisposedOfEvenWithNoSizeToSet(t *testing.T) {
 	f := newFakeEC2(t)
 	p := newTestProvider(t, f, nil)
 
-	if _, err := p.Launch(t.Context(), validSpec()); err != nil {
+	spec := validSpec()
+	spec.Disk = 0
+
+	if _, err := p.Launch(t.Context(), spec); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 
-	if n := f.countOf("DescribeImages"); n != 0 {
-		t.Errorf("DescribeImages was called %d times for a launch that sizes nothing", n)
+	got := f.paramsFor(t, "RunInstances")
+
+	if v := got.Get("BlockDeviceMapping.1.Ebs.DeleteOnTermination"); v != "true" {
+		t.Errorf("DeleteOnTermination = %q for a launch that sizes nothing; the AMI's own "+
+			"setting would govern, and one built with it false leaks a volume per job", v)
+	}
+
+	if v := got.Get("BlockDeviceMapping.1.DeviceName"); v != "/dev/xvda" {
+		t.Errorf("DeviceName = %q, want the AMI's root device", v)
+	}
+
+	// NO SIZE IS SENT when none was asked for, so the AMI's own size stands.
+	// Sending a zero would be asking EC2 for a zero-byte root volume.
+	if v := got.Get("BlockDeviceMapping.1.Ebs.VolumeSize"); v != "" {
+		t.Errorf("VolumeSize = %q for a tier that asked for no disk", v)
+	}
+}
+
+// THE LOOKUP IS PAID FOR ONCE PER IMAGE, which is what makes asking on every
+// launch affordable. An AMI's root device does not change.
+func TestTheRootDeviceIsAskedForOncePerImage(t *testing.T) {
+	f := newFakeEC2(t)
+	p := newTestProvider(t, f, nil)
+
+	for range 3 {
+		if _, err := p.Launch(t.Context(), validSpec()); err != nil {
+			t.Fatalf("Launch: %v", err)
+		}
+	}
+
+	if n := f.countOf("DescribeImages"); n != 1 {
+		t.Errorf("DescribeImages was called %d times across three launches of one image, want 1", n)
 	}
 }
 
@@ -876,7 +915,14 @@ func TestAThrottleIsRetriedAndARefusalIsNot(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			f := newFakeEC2(t)
-			f.respond = func(string, url.Values) (int, string) {
+			// SCOPED TO THE ACTION UNDER TEST. A launch resolves the AMI's root
+			// device first, so failing every action would exercise the retry on
+			// DescribeImages and never reach RunInstances at all.
+			f.respond = func(action string, _ url.Values) (int, string) {
+				if action != "RunInstances" {
+					return http.StatusOK, defaultReply(action)
+				}
+
 				return http.StatusBadRequest, apiFailure(tc.code)
 			}
 
@@ -900,7 +946,13 @@ func TestACallThatSucceedsAfterAThrottleSucceeds(t *testing.T) {
 
 	var attempts int
 
-	f.respond = func(action string, params url.Values) (int, string) {
+	// Only the launch itself stumbles, so what is being measured is the retry of
+	// the call under test rather than of the image lookup in front of it.
+	f.respond = func(action string, _ url.Values) (int, string) {
+		if action != "RunInstances" {
+			return http.StatusOK, defaultReply(action)
+		}
+
 		attempts++
 		if attempts == 1 {
 			return http.StatusServiceUnavailable, apiFailure("Unavailable")
