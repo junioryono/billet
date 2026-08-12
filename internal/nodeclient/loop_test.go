@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1008,4 +1010,53 @@ func waitFor(t *testing.T, cond func() bool) {
 	}
 
 	t.Fatal("condition never became true")
+}
+
+// breaker makes the control plane stop accepting registrations, which is what a
+// node meets while the plane is restarting.
+type breaker struct {
+	inner http.Handler
+
+	failRegister     atomic.Bool
+	registerAttempts atomic.Int64
+}
+
+func (b *breaker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/v1/register" {
+		b.registerAttempts.Add(1)
+
+		if b.failRegister.Load() {
+			http.Error(w, "the control plane is still starting", http.StatusServiceUnavailable)
+
+			return
+		}
+	}
+
+	b.inner.ServeHTTP(w, r)
+}
+
+// breakableHarness is harness with a control plane a test can take away.
+func breakableHarness(t *testing.T) (*nodeplane.Plane, *nodeclient.Client, *breaker) {
+	t.Helper()
+
+	log := slog.New(slog.DiscardHandler)
+	p := nodeplane.New(log, deployment, time.Minute,
+		nodeplane.WithCommandTimeout(5*time.Second),
+		nodeplane.WithTierCatalog([]config.Tier{{
+			Label: "billet-2vcpu", Provider: config.ProviderDocker, GuestOS: config.GuestLinux,
+			VCPU: 2, Memory: 8 * config.GiB, Image: "ubuntu-2404-x64",
+		}}))
+	p.SetPollWindowForTest(60 * time.Millisecond)
+
+	b := &breaker{inner: nodeplane.Handler(log, p, stubStore{}, stubJIT{})}
+
+	srv := httptest.NewServer(b)
+	t.Cleanup(srv.Close)
+
+	c, err := nodeclient.New(nodeclient.Options{Base: srv.URL, Node: "n1"})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+
+	return p, c, b
 }

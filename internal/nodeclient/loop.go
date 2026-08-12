@@ -199,6 +199,40 @@ func Run(ctx context.Context, c *Client, compute Compute, opts LoopOptions) erro
 		})
 	}
 
+	err := register(ctx, c, compute, log, opts, backoff, startJanitor)
+
+	// ONE PLACE DECIDES THAT A STOP MEANS A DRAIN, and it is here because there
+	// are five ways out of the loop below and only one of them used to.
+	//
+	// A node notices its context has ended wherever it happens to be: inside the
+	// registration call, inside a backoff after one failed, inside the backoff
+	// after Recover failed, inside serve, or in the backoff after serve returned
+	// something else. Only the serve path drained, and the rest are not idle
+	// states — the ordinary route into them is a control plane restarting, which
+	// leaves a node with containers running and a registration it cannot renew.
+	// Stopping there renewed nothing, so the reaper reclaimed those leases at the
+	// TTL and the capacity was sold to a second job while the first still ran.
+	//
+	// Draining when the node is holding nothing costs nothing: stopGracefully
+	// returns immediately.
+	if ctx.Err() != nil {
+		return stopGracefully(ctx, c, compute, log, opts)
+	}
+
+	return err
+}
+
+// register keeps this node registered and serving until its context ends or it
+// meets something no retry can fix.
+func register(
+	ctx context.Context,
+	c *Client,
+	compute Compute,
+	log *slog.Logger,
+	opts LoopOptions,
+	backoff time.Duration,
+	startJanitor func(),
+) error {
 	for {
 		if err := c.Register(ctx, opts.registration()); err != nil {
 			if ctx.Err() != nil {
@@ -247,7 +281,7 @@ func Run(ctx context.Context, c *Client, compute Compute, opts LoopOptions) erro
 
 		err := serve(ctx, c, compute, log, opts, false)
 		if ctx.Err() != nil {
-			return stopGracefully(ctx, c, compute, log, opts)
+			return ctx.Err()
 		}
 
 		// SUPERSEDED IS NOT SOMETHING TO RETRY, and re-registering is the specific
