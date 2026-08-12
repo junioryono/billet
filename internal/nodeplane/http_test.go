@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -55,6 +56,14 @@ type fakeRegistrar struct {
 
 // ResolveQuarantineFor records what a returning host reported running, so a test
 // can assert the plane passed it on.
+// reconciliation reports whether the plane asked, and with what.
+func (f *fakeRegistrar) reconciliation() (bool, []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return len(f.reconciled) > 0, f.reportedRunning
+}
+
 func (f *fakeRegistrar) ResolveQuarantineFor(
 	_ context.Context, node string, running []string, _ int64,
 ) (int, error) {
@@ -1032,5 +1041,78 @@ func TestANodeCannotReleaseALeaseTheLedgerGaveToAnotherHost(t *testing.T) {
 
 	if released != 0 {
 		t.Errorf("the release reached the ledger anyway: %d", released)
+	}
+}
+
+// WHAT A HOST REPORTS RUNNING REACHES THE LEDGER, and an absent report does not.
+//
+// This is the wiring that frees capacity held for compute nobody has accounted
+// for, and it is also the wiring that must NOT free capacity for a container
+// that is still there. Both halves turn on one flag: a node that could read its
+// provider vouches for the list, and one that could not sends nothing rather
+// than an empty list — because an unreadable provider knows nothing, and
+// treating its silence as "running nothing" would hand back a live container's
+// slot.
+func TestARegistrationPassesOnWhatTheHostReportsRunning(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name       string
+		reg        nodeclient.Registration
+		wantCalled bool
+		wantIDs    []string
+	}{
+		{
+			name:       "a host that vouches for what it is running",
+			reg:        nodeclient.Registration{Instances: []string{"l1", "l2"}, InventoryKnown: true},
+			wantCalled: true,
+			wantIDs:    []string{"l1", "l2"},
+		},
+		{
+			name:       "a host that is genuinely running nothing",
+			reg:        nodeclient.Registration{InventoryKnown: true},
+			wantCalled: true,
+		},
+		{
+			name: "a host whose provider could not be read",
+			reg:  nodeclient.Registration{Instances: nil, InventoryKnown: false},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			reg := &fakeRegistrar{}
+
+			log := slog.New(slog.DiscardHandler)
+			p := nodeplane.New(log, deployment, time.Minute, nodeplane.WithRegistrar(reg))
+			srv := httptest.NewServer(nodeplane.Handler(log, p, &fakeStore{}, nil))
+
+			t.Cleanup(srv.Close)
+
+			c, err := nodeclient.New(nodeclient.Options{Base: srv.URL, Node: "n1"})
+			if err != nil {
+				t.Fatalf("new client: %v", err)
+			}
+
+			full := tc.reg
+			full.Provider, full.Deployment = config.ProviderDocker, deployment
+			full.VCPU, full.Memory = testNodeVCPU, testNodeMemory
+
+			if err := c.Register(t.Context(), full); err != nil {
+				t.Fatalf("register: %v", err)
+			}
+
+			called, ids := reg.reconciliation()
+
+			if called != tc.wantCalled {
+				t.Fatalf("the ledger was asked to reconcile: %v, want %v — an unreadable "+
+					"provider must not free capacity, and a host that is running nothing must",
+					called, tc.wantCalled)
+			}
+
+			if tc.wantCalled && !slices.Equal(ids, tc.wantIDs) {
+				t.Errorf("the ledger was told this host runs %v, want %v", ids, tc.wantIDs)
+			}
+		})
 	}
 }
