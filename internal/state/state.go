@@ -624,11 +624,184 @@ var joinTokenMigration = migration{
 	},
 }
 
+// A CREDENTIAL CAN ONLY BE TAKEN BACK IF BILLET KNOWS IT EXISTS.
+//
+// Revocation is by serial, and a serial names one certificate. That is the right
+// granularity — a node name is legitimately re-issued to a replacement machine,
+// so revoking the name would refuse the replacement too — but it only works if
+// every serial in circulation is written down. Renewal minted a fresh key and
+// serial, returned it, and recorded nothing, so a node that had renewed once
+// held a credential the control plane could not name. An operator revoking the
+// bundle they issued took back a serial nobody was presenting, was told it would
+// be refused on its next request, and the host carried on registering, binding
+// leases and asking for JIT runner registrations.
+var issuedCertMigration = migration{
+	Version: 15,
+	Name:    "issued_certs",
+	Stmts: []string{
+		`CREATE TABLE issued_certs (
+			serial     TEXT PRIMARY KEY,
+			node       TEXT NOT NULL,
+			-- enrolled | issued | renewed: how this credential came to exist,
+			-- which is what an operator reads when deciding what to take back.
+			source     TEXT NOT NULL,
+			not_after  TEXT NOT NULL,
+			issued_at  TEXT NOT NULL
+		) STRICT`,
+		`CREATE INDEX idx_issued_certs_node ON issued_certs (node)`,
+	},
+}
+
+// CAPACITY IS NOT FREED BY A LEASE EXPIRING, only by its compute being gone.
+//
+// The reaper terminalizes anything whose holder stopped heartbeating, which is
+// right for escrow nobody launched and wrong for a lease with a container behind
+// it: terminalizing frees the capacity immediately, while the container keeps
+// running until the node next sweeps. Another tier can escrow that slot in
+// between, and two jobs end up on a machine sized for one.
+//
+// So an expired RUNNING lease moves to a phase that still charges the host, and
+// leaves it only on proof the compute is gone. The phase list is a CHECK
+// constraint and SQLite cannot alter one, so the table is rebuilt.
+var quarantineMigration = migration{
+	Version: 16,
+	Name:    "lease_quarantine",
+	Stmts: []string{
+		// Columns are named rather than SELECT *: the order has to survive every
+		// earlier migration for a star to be correct, and nothing checks that.
+		`CREATE TABLE leases_new (
+			id              TEXT PRIMARY KEY,
+			tier            TEXT NOT NULL,
+			node            TEXT REFERENCES nodes(name) ON DELETE SET NULL,
+			phase           TEXT NOT NULL CHECK (phase IN
+				('capacity','assigned','launching','online','busy','quarantine','done','failed')),
+			vcpu            INTEGER NOT NULL CHECK (vcpu > 0),
+			memory          INTEGER NOT NULL CHECK (memory > 0),
+			run_id          INTEGER,
+			request_id      INTEGER,
+			epoch           INTEGER NOT NULL DEFAULT 0 CHECK (epoch >= 0),
+			created_at      TEXT NOT NULL,
+			heartbeat_at    TEXT NOT NULL,
+			expires_at      TEXT NOT NULL,
+			target_node     TEXT,
+			macos_slot      INTEGER NOT NULL DEFAULT 0 CHECK (macos_slot IN (0, 1)),
+			guest_os        TEXT NOT NULL DEFAULT 'linux',
+			provider        TEXT NOT NULL DEFAULT '',
+			providers       TEXT NOT NULL DEFAULT '',
+			chosen_provider TEXT NOT NULL DEFAULT ''
+		) STRICT`,
+		`INSERT INTO leases_new
+		   (id, tier, node, phase, vcpu, memory, run_id, request_id, epoch, created_at,
+		    heartbeat_at, expires_at, target_node, macos_slot, guest_os, provider,
+		    providers, chosen_provider)
+		 SELECT id, tier, node, phase, vcpu, memory, run_id, request_id, epoch, created_at,
+		        heartbeat_at, expires_at, target_node, macos_slot, guest_os, provider,
+		        providers, chosen_provider
+		   FROM leases`,
+		`DROP TABLE leases`,
+		`ALTER TABLE leases_new RENAME TO leases`,
+		// EVERY index the old table carried, not the ones that came to mind. A
+		// rebuild drops them all, and a missing one is invisible until the table is
+		// large enough for the scan to matter — leases_expiry_idx is what keeps the
+		// reaper from scanning the whole lease history on the single writer
+		// connection every listener is waiting for.
+		`CREATE INDEX leases_open_idx ON leases(phase) WHERE phase NOT IN ('done','failed')`,
+		`CREATE INDEX leases_node_idx ON leases(node)`,
+		`CREATE INDEX leases_expiry_idx ON leases(expires_at) WHERE phase NOT IN ('done','failed')`,
+	},
+}
+
+// STRICT, LIKE EVERY OTHER TABLE. SQLite's default typing accepts a string where
+// an integer belongs and stores it as one, so a bug that writes the wrong type
+// is discovered by a later reader rather than by the write. Three tables added
+// during the trust work were declared without it, and consistency here is worth
+// more than the tables are large: they hold credentials and admission decisions,
+// which are exactly the rows worth being strict about.
+//
+// A rebuild, because STRICT is a property of the table declaration.
+var strictTrustTablesMigration = migration{
+	Version: 17,
+	Name:    "strict_trust_tables",
+	Stmts: []string{
+		`CREATE TABLE revoked_certs_new (
+			serial     TEXT PRIMARY KEY,
+			node       TEXT NOT NULL,
+			reason     TEXT NOT NULL DEFAULT '',
+			revoked_at TEXT NOT NULL
+		) STRICT`,
+		`INSERT INTO revoked_certs_new (serial, node, reason, revoked_at)
+		 SELECT serial, node, reason, revoked_at FROM revoked_certs`,
+		`DROP TABLE revoked_certs`,
+		`ALTER TABLE revoked_certs_new RENAME TO revoked_certs`,
+		`CREATE INDEX idx_revoked_certs_node ON revoked_certs (node)`,
+
+		`CREATE TABLE node_enrollments_new (
+			name         TEXT PRIMARY KEY,
+			fingerprint  TEXT NOT NULL,
+			csr_pem      TEXT NOT NULL,
+			cert_pem     TEXT NOT NULL DEFAULT '',
+			state        TEXT NOT NULL CHECK (state IN ('pending','approved','denied')),
+			requested_at TEXT NOT NULL,
+			decided_at   TEXT NOT NULL DEFAULT '',
+			source       TEXT NOT NULL DEFAULT 'enrolled'
+		) STRICT`,
+		`INSERT INTO node_enrollments_new
+		   (name, fingerprint, csr_pem, cert_pem, state, requested_at, decided_at, source)
+		 SELECT name, fingerprint, csr_pem, cert_pem, state, requested_at, decided_at, source
+		   FROM node_enrollments`,
+		`DROP TABLE node_enrollments`,
+		`ALTER TABLE node_enrollments_new RENAME TO node_enrollments`,
+
+		`CREATE TABLE join_tokens_new (
+			token_sha256   TEXT PRIMARY KEY,
+			note           TEXT NOT NULL DEFAULT '',
+			uses_remaining INTEGER NOT NULL,
+			created_at     TEXT NOT NULL,
+			expires_at     TEXT NOT NULL
+		) STRICT`,
+		`INSERT INTO join_tokens_new
+		   (token_sha256, note, uses_remaining, created_at, expires_at)
+		 SELECT token_sha256, note, uses_remaining, created_at, expires_at FROM join_tokens`,
+		`DROP TABLE join_tokens`,
+		`ALTER TABLE join_tokens_new RENAME TO join_tokens`,
+	},
+}
+
+// A NODE CAN BE REVOKED WITHOUT ENUMERATING WHAT IT HOLDS.
+//
+// Revocation by serial reaches only credentials billet wrote down, and there are
+// two ways for one to exist outside that set: a deployment upgraded from a
+// version that did not record serials, and a name that was issued more than once
+// before it did — the admission trail keeps one row per node and overwrites it,
+// so the earlier certificate is unrecoverable.
+//
+// A CUTOFF NEEDS NO LIST. Revoking a node records the moment; any certificate
+// for that name minted before it is refused on sight, whether or not billet has
+// ever seen it. A replacement issued afterwards has a later NotBefore and works,
+// which is what keeps this a revocation rather than a ban on the name.
+var nodeRevocationMigration = migration{
+	Version: 18,
+	Name:    "node_revocations",
+	Stmts: []string{
+		`CREATE TABLE node_revocations (
+			node           TEXT PRIMARY KEY,
+			-- Every certificate for this node valid from before this instant is
+			-- refused. Stored as the certificate's own NotBefore basis, so the
+			-- comparison is against a fact of the credential rather than a clock.
+			revoked_before TEXT NOT NULL,
+			reason         TEXT NOT NULL DEFAULT '',
+			revoked_at     TEXT NOT NULL
+		) STRICT`,
+	},
+}
+
 func init() {
 	migrations = append(migrations,
 		placementMigration, guestOSMigration, placementFactsMigration, requestIDMigration,
 		providerListMigration, nodeSiteMigration, nodeLivenessMigration,
-		certRevocationMigration, nodeEnrollmentMigration, joinTokenMigration)
+		certRevocationMigration, nodeEnrollmentMigration, joinTokenMigration,
+		issuedCertMigration, quarantineMigration, strictTrustTablesMigration,
+		nodeRevocationMigration)
 }
 
 const bootstrapSchemaMigrations = `CREATE TABLE IF NOT EXISTS schema_migrations (

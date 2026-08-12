@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -33,6 +34,13 @@ const deployment = "0123456789abcdef0123456789abcdef"
 
 // fakeRegistrar stands in for the allocator's node table.
 type fakeRegistrar struct {
+	// reconciled and reportedRunning record the quarantine reconciliation the
+	// plane performs when a host comes back.
+	reconciled      []string
+	reportedRunning []string
+	freed           int
+	resolveErr      error
+
 	mu       sync.Mutex
 	err      error
 	accepted []string
@@ -44,6 +52,28 @@ type fakeRegistrar struct {
 	goneName  string
 	goneEpoch int64
 	forgotten bool
+}
+
+// ResolveQuarantineFor records what a returning host reported running, so a test
+// can assert the plane passed it on.
+// reconciliation reports whether the plane asked, and with what.
+func (f *fakeRegistrar) reconciliation() (bool, []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return len(f.reconciled) > 0, f.reportedRunning
+}
+
+func (f *fakeRegistrar) ResolveQuarantineFor(
+	_ context.Context, node string, running []string, _ int64,
+) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.reconciled = append(f.reconciled, node)
+	f.reportedRunning = running
+
+	return f.freed, f.resolveErr
 }
 
 // gone records which node the plane gave up on, and at which epoch.
@@ -113,8 +143,9 @@ type fakeStore struct {
 	releaseErr   error
 	leaseErr     error
 
-	lease    *alloc.Lease
-	launched map[string]bool
+	lease       *alloc.Lease
+	launched    map[string]bool
+	quarantined map[string]bool
 
 	bound    []string
 	advanced []alloc.Phase
@@ -160,6 +191,15 @@ func (f *fakeStore) Lease(context.Context, string) (*alloc.Lease, error) {
 	defer f.mu.Unlock()
 
 	return f.lease, f.leaseErr
+}
+
+// QuarantinedLeaseIDs are the leases this fake says are holding capacity for
+// compute nobody has accounted for.
+func (f *fakeStore) QuarantinedLeaseIDs(context.Context, string) (map[string]bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return f.quarantined, nil
 }
 
 func (f *fakeStore) LaunchedLeaseIDs(context.Context, string) (map[string]bool, error) {
@@ -1001,5 +1041,193 @@ func TestANodeCannotReleaseALeaseTheLedgerGaveToAnotherHost(t *testing.T) {
 
 	if released != 0 {
 		t.Errorf("the release reached the ledger anyway: %d", released)
+	}
+}
+
+// WHAT A HOST REPORTS RUNNING REACHES THE LEDGER, and an absent report does not.
+//
+// This is the wiring that frees capacity held for compute nobody has accounted
+// for, and it is also the wiring that must NOT free capacity for a container
+// that is still there. Both halves turn on one flag: a node that could read its
+// provider vouches for the list, and one that could not sends nothing rather
+// than an empty list — because an unreadable provider knows nothing, and
+// treating its silence as "running nothing" would hand back a live container's
+// slot.
+func TestARegistrationPassesOnWhatTheHostReportsRunning(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name       string
+		reg        nodeclient.Registration
+		wantCalled bool
+		wantIDs    []string
+	}{
+		{
+			name:       "a host that vouches for what it is running",
+			reg:        nodeclient.Registration{Instances: []string{"l1", "l2"}, InventoryKnown: true},
+			wantCalled: true,
+			wantIDs:    []string{"l1", "l2"},
+		},
+		{
+			name:       "a host that is genuinely running nothing",
+			reg:        nodeclient.Registration{InventoryKnown: true},
+			wantCalled: true,
+		},
+		{
+			name: "a host whose provider could not be read",
+			reg:  nodeclient.Registration{Instances: nil, InventoryKnown: false},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			reg := &fakeRegistrar{}
+
+			log := slog.New(slog.DiscardHandler)
+			p := nodeplane.New(log, deployment, time.Minute, nodeplane.WithRegistrar(reg))
+			srv := httptest.NewServer(nodeplane.Handler(log, p, &fakeStore{}, nil))
+
+			t.Cleanup(srv.Close)
+
+			c, err := nodeclient.New(nodeclient.Options{Base: srv.URL, Node: "n1"})
+			if err != nil {
+				t.Fatalf("new client: %v", err)
+			}
+
+			full := tc.reg
+			full.Provider, full.Deployment = config.ProviderDocker, deployment
+			full.VCPU, full.Memory = testNodeVCPU, testNodeMemory
+
+			if err := c.Register(t.Context(), full); err != nil {
+				t.Fatalf("register: %v", err)
+			}
+
+			called, ids := reg.reconciliation()
+
+			if called != tc.wantCalled {
+				t.Fatalf("the ledger was asked to reconcile: %v, want %v — an unreadable "+
+					"provider must not free capacity, and a host that is running nothing must",
+					called, tc.wantCalled)
+			}
+
+			if tc.wantCalled && !slices.Equal(ids, tc.wantIDs) {
+				t.Errorf("the ledger was told this host runs %v, want %v", ids, tc.wantIDs)
+			}
+		})
+	}
+}
+
+// THE RECONCILE ROUTE EXISTS AND CARRIES THE INVENTORY, which the node-side test
+// cannot show: it injects the allocator directly, so removing the HTTP route or
+// making the client method a no-op leaves it green.
+func TestReconcileReachesTheLedgerOverTheWire(t *testing.T) {
+	t.Parallel()
+
+	reg := &fakeRegistrar{}
+
+	log := slog.New(slog.DiscardHandler)
+	p := nodeplane.New(log, deployment, time.Minute, nodeplane.WithRegistrar(reg))
+	srv := httptest.NewServer(nodeplane.Handler(log, p, &fakeStore{}, nil))
+
+	t.Cleanup(srv.Close)
+
+	c := dial(t, srv.URL)
+
+	if _, err := c.Reconcile(t.Context(), "n1", []string{"l1", "l2"}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	called, ids := reg.reconciliation()
+
+	if !called {
+		t.Fatal("the report never reached the ledger, so quarantined capacity is reclaimed " +
+			"only at registration — which is the one moment it cannot work")
+	}
+
+	if !slices.Equal(ids, []string{"l1", "l2"}) {
+		t.Errorf("the ledger was told this host runs %v", ids)
+	}
+
+	// AND AN EMPTY REPORT IS STILL A REPORT: a host running nothing is exactly
+	// the one whose quarantined capacity should come back.
+	if _, err := c.Reconcile(t.Context(), "n1", nil); err != nil {
+		t.Fatalf("empty reconcile: %v", err)
+	}
+
+	_, ids = reg.reconciliation()
+
+	if len(ids) != 0 {
+		t.Errorf("an empty report was recorded as %v", ids)
+	}
+}
+
+// AND A SUPERSEDED PROCESS CANNOT RECONCILE, because its inventory describes a
+// machine somebody else now owns.
+func TestASupersededIncarnationCannotReconcile(t *testing.T) {
+	t.Parallel()
+
+	reg := &fakeRegistrar{}
+
+	log := slog.New(slog.DiscardHandler)
+	p := nodeplane.New(log, deployment, time.Minute, nodeplane.WithRegistrar(reg))
+	srv := httptest.NewServer(nodeplane.Handler(log, p, &fakeStore{}, nil))
+
+	t.Cleanup(srv.Close)
+
+	old := dial(t, srv.URL)
+
+	// A second process takes the name.
+	dial(t, srv.URL)
+
+	if _, err := old.Reconcile(t.Context(), "n1", nil); err == nil {
+		t.Fatal("a superseded process reported an inventory for a node it no longer owns; " +
+			"its stale list can free capacity the current one is using")
+	}
+
+	if called, _ := reg.reconciliation(); called {
+		t.Error("the stale report reached the ledger anyway")
+	}
+}
+
+// THE QUARANTINED SET CROSSES THE WIRE, and dropping it is silent.
+//
+// A remote node reads this to tell an orphan from a job whose listener died. If
+// the field never arrives the node sees an empty set, `open || held` is false
+// for a live container, and it DESTROYS the job the quarantine exists to
+// protect — the round-2 P0, reachable again through a response field nothing
+// asserted.
+func TestQuarantinedLeasesCrossTheWire(t *testing.T) {
+	t.Parallel()
+
+	store := &fakeStore{
+		launched:    map[string]bool{"running": true},
+		quarantined: map[string]bool{"held": true},
+	}
+
+	_, base := serve(t, store)
+	c := dial(t, base)
+
+	held, err := c.QuarantinedLeaseIDs(t.Context(), "n1")
+	if err != nil {
+		t.Fatalf("QuarantinedLeaseIDs: %v", err)
+	}
+
+	if !held["held"] {
+		t.Error("the quarantined set did not reach the node, so it will treat a job whose " +
+			"listener died as an orphan and destroy it")
+	}
+
+	if held["running"] {
+		t.Error("a launched lease was reported as quarantined")
+	}
+
+	// And the launched set is still its own answer.
+	open, err := c.LaunchedLeaseIDs(t.Context(), "n1")
+	if err != nil {
+		t.Fatalf("LaunchedLeaseIDs: %v", err)
+	}
+
+	if !open["running"] || open["held"] {
+		t.Errorf("the launched set is %v; the two answers have been conflated", open)
 	}
 }

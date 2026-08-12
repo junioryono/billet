@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -548,4 +549,246 @@ func TestTheNodeWireAcceptsTheAuthorityTheCLIMinted(t *testing.T) {
 	}
 
 	t.Cleanup(stop)
+}
+
+// AN INTERRUPTED ENROLLMENT COMES BACK AS THE SAME REQUEST.
+//
+// The name is claimed by the first key to ask, so a machine that loses its key
+// while waiting for a human and generates another is a SECOND key asking for a
+// name that is already taken — and the control plane is right to refuse it. The
+// key therefore has to outlive the process that made it.
+func TestAnInterruptedEnrollmentReusesItsStagedKey(t *testing.T) {
+	dir := t.TempDir()
+	tls := &config.NodeTLS{
+		CertPath: filepath.Join(dir, "node.crt"),
+		KeyPath:  filepath.Join(dir, "node.key"),
+		CAPath:   filepath.Join(dir, "ca.crt"),
+	}
+
+	firstCSR, firstKey, err := pendingIdentity(tls, "epyc-1")
+	if err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+
+	// The process dies here, and the operator starts it again.
+	secondCSR, secondKey, err := pendingIdentity(tls, "epyc-1")
+	if err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+
+	if !bytes.Equal(firstKey, secondKey) {
+		t.Error("a retry generated a new private key, so it is asking for a name the first " +
+			"attempt already claimed and will be refused forever")
+	}
+
+	if !bytes.Equal(firstCSR, secondCSR) {
+		t.Error("a retry presents a different request, so the fingerprint the operator was " +
+			"shown describes nothing")
+	}
+
+	// The staged key is a secret.
+	info, err := os.Stat(filepath.Join(dir, "pending.key"))
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Errorf("the staged private key is mode %04o", got)
+	}
+
+	// And once it becomes a bundle, the spare copy goes.
+	clearPendingIdentity(tls)
+
+	if _, err := os.Stat(filepath.Join(dir, "pending.key")); !os.IsNotExist(err) {
+		t.Error("the staged key outlived the enrollment, leaving a second copy of a private key")
+	}
+}
+
+// A STAGED KEY BELONGS TO ONE NODE NAME.
+//
+// The control plane derives a certificate's subject from the REQUEST, not from
+// the CSR — deliberately, so a node cannot rename itself by editing what it
+// asks for. The consequence is that reusing a staged key after node.name changed
+// would let ONE key collect certificates for two names, and revoking one of them
+// would leave the other working.
+func TestAStagedEnrollmentRefusesADifferentNodeName(t *testing.T) {
+	dir := t.TempDir()
+	tls := &config.NodeTLS{
+		CertPath: filepath.Join(dir, "node.crt"),
+		KeyPath:  filepath.Join(dir, "node.key"),
+		CAPath:   filepath.Join(dir, "ca.crt"),
+	}
+
+	if _, _, err := pendingIdentity(tls, "epyc-1"); err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+
+	_, _, err := pendingIdentity(tls, "epyc-2")
+	if err == nil {
+		t.Fatal("a key staged for epyc-1 was reused to ask for epyc-2; one compromised key " +
+			"would hold two identities and revoking one would not reach the other")
+	}
+
+	if !strings.Contains(err.Error(), "epyc-1") {
+		t.Errorf("the refusal does not name the enrollment in the way: %v", err)
+	}
+}
+
+// AND A STAGED KEY ANYONE CAN READ IS NOT USED.
+//
+// It is the identity this machine is about to be approved for. A backup that
+// restored it 0644, or a directory somebody else can write, means the future
+// node identity is already somebody else's — and quietly continuing with it is
+// how that becomes their runner.
+func TestAStagedEnrollmentRefusesAWorldReadableKey(t *testing.T) {
+	dir := t.TempDir()
+	tls := &config.NodeTLS{
+		CertPath: filepath.Join(dir, "node.crt"),
+		KeyPath:  filepath.Join(dir, "node.key"),
+		CAPath:   filepath.Join(dir, "ca.crt"),
+	}
+
+	if _, _, err := pendingIdentity(tls, "epyc-1"); err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+
+	if err := os.Chmod(filepath.Join(dir, "pending.key"), 0o644); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+
+	if _, _, err := pendingIdentity(tls, "epyc-1"); err == nil {
+		t.Fatal("a world-readable staged key was used to enroll; whoever can read it can be " +
+			"this node once it is approved")
+	}
+}
+
+// A NODE ADMITTED BEFORE BILLET TRACKED SERIALS CAN STILL BE REVOKED.
+//
+// Revocation reaches the serials billet wrote down, and issued_certs did not
+// exist until this release — so every node admitted by an older control plane
+// holds a working certificate whose serial was never recorded. `billet nodes
+// revoke` would report that the machine holds nothing and change nothing, which
+// is the worst possible answer to a compromise.
+//
+// The admission trail is what makes it recoverable: both ways in stored the
+// certificate they handed over, so the serial can be read back out of it.
+func TestRevocationReachesACertificateAdmittedBeforeSerialsWereTracked(t *testing.T) {
+	stateDir := t.TempDir()
+	cfg := writeCAConfig(t, stateDir)
+
+	deploymentID, err := state.DeploymentID(stateDir)
+	if err != nil {
+		t.Fatalf("deployment id: %v", err)
+	}
+
+	ca, err := wirecert.LoadOrCreateCA(stateDir, deploymentID)
+	if err != nil {
+		t.Fatalf("authority: %v", err)
+	}
+
+	bundle, err := ca.IssueNode("epyc-1")
+	if err != nil {
+		t.Fatalf("issue: %v", err)
+	}
+
+	leaf, err := wirecert.LeafOf(bundle)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	a, closeDB, err := controlPlaneAllocator(t.Context(), cfg)
+	if err != nil {
+		t.Fatalf("allocator: %v", err)
+	}
+
+	// WHAT AN OLDER BILLET LEFT BEHIND: the admission is recorded, the serial is
+	// not.
+	if _, err := a.RecordIssued(t.Context(), "epyc-1",
+		wirecert.FingerprintOfCert(leaf), string(bundle.CertPEM)); err != nil {
+		t.Fatalf("record the admission: %v", err)
+	}
+
+	live, err := a.LiveCertsFor(t.Context(), "epyc-1")
+	if err != nil {
+		t.Fatalf("LiveCertsFor: %v", err)
+	}
+
+	if len(live) != 0 {
+		t.Fatalf("this test does not stage the pre-upgrade state: %d serial(s) already recorded",
+			len(live))
+	}
+
+	// THROUGH THE COMMAND, not the helper it calls. Driving backfillIssuedCerts
+	// directly would leave this test green with the production call deleted,
+	// which is the wiring it exists to protect.
+	closeDB()
+
+	if err := cmdNodesRevoke(t.Context(), []string{"epyc-1", "--config", cfg}); err != nil {
+		t.Fatalf("billet nodes revoke: %v", err)
+	}
+
+	a, closeDB, err = controlPlaneAllocator(t.Context(), cfg)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+
+	defer closeDB()
+
+	gone, err := a.CertRevoked(t.Context(), wirecert.Serial(leaf))
+	if err != nil {
+		t.Fatalf("CertRevoked: %v", err)
+	}
+
+	if !gone {
+		t.Error("the certificate the machine presents is still accepted after `billet nodes " +
+			"revoke`; an upgraded deployment cannot take back what it admitted")
+	}
+}
+
+// A HALF-PRESENT STAGE IS NOT A MISSING ONE.
+//
+// The key is what the control plane has recorded a pending request against. If
+// its companions are lost but it survives, generating a fresh identity replaces
+// the key that request belongs to — and the name is then held by a fingerprint
+// this machine can no longer present, which no retry can fix and only an
+// operator can free. That is the exact deadlock the staging exists to avoid,
+// reached by the staging itself.
+func TestAPartlyMissingStageDoesNotReplaceTheKey(t *testing.T) {
+	for _, lost := range []string{"pending.csr", "pending.node"} {
+		t.Run("lost "+lost, func(t *testing.T) {
+			dir := t.TempDir()
+			tls := &config.NodeTLS{
+				CertPath: filepath.Join(dir, "node.crt"),
+				KeyPath:  filepath.Join(dir, "node.key"),
+				CAPath:   filepath.Join(dir, "ca.crt"),
+			}
+
+			if _, _, err := pendingIdentity(tls, "epyc-1"); err != nil {
+				t.Fatalf("stage: %v", err)
+			}
+
+			before, err := os.ReadFile(filepath.Join(dir, "pending.key"))
+			if err != nil {
+				t.Fatalf("read the staged key: %v", err)
+			}
+
+			if err := os.Remove(filepath.Join(dir, lost)); err != nil {
+				t.Fatalf("remove %s: %v", lost, err)
+			}
+
+			if _, _, err := pendingIdentity(tls, "epyc-1"); err == nil {
+				t.Error("a partly missing stage was treated as no stage at all")
+			}
+
+			after, err := os.ReadFile(filepath.Join(dir, "pending.key"))
+			if err != nil {
+				t.Fatalf("read the staged key back: %v", err)
+			}
+
+			if !bytes.Equal(before, after) {
+				t.Error("the staged private key was replaced, so the pending request on the " +
+					"control plane now names a key this machine cannot present")
+			}
+		})
+	}
 }

@@ -376,9 +376,18 @@ func TestADrainRefusesNewWorkAndStillHearsCompletions(t *testing.T) {
 	}
 
 	// A launch during the drain would mean the refusal did not hold.
-	var launches atomic.Int32
+	//
+	// EVERY launch is counted, not only the ones that see the flag. Running()
+	// reports 1 as soon as the lease enters the listener's map, which happens
+	// BEFORE the runner is called — so waiting on it and then setting the flag
+	// can set it while the first job's launch is still in flight, and that launch
+	// is then counted as one the drain permitted. The test failed for a reason
+	// with nothing to do with draining.
+	var launches, total atomic.Int32
 
 	runner := &fakeRunner{onLaunch: func(int64) error {
+		total.Add(1)
+
 		if draining.Load() {
 			launches.Add(1)
 		}
@@ -394,6 +403,10 @@ func TestADrainRefusesNewWorkAndStillHearsCompletions(t *testing.T) {
 	run := startRun(ctx, l)
 
 	waitUntil(deadline, t, "the job to be running", func() bool { return l.Running() == 1 })
+
+	// AND FOR ITS LAUNCH TO HAVE FINISHED, which Running() does not imply. The
+	// flag must not be set while the pre-drain launch is still inside the runner.
+	waitUntil(deadline, t, "the first launch to complete", func() bool { return total.Load() == 1 })
 
 	draining.Store(true)
 	cancel()

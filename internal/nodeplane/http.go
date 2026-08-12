@@ -51,6 +51,10 @@ type LeaseStore interface {
 	Release(ctx context.Context, leaseID string, epoch int64, outcome alloc.Phase) error
 	Lease(ctx context.Context, leaseID string) (*alloc.Lease, error)
 	LaunchedLeaseIDs(ctx context.Context, node string) (map[string]bool, error)
+	// QuarantinedLeaseIDs are leases holding capacity for compute nobody has
+	// accounted for. A node needs them to tell an orphan from a job whose
+	// listener died while it was still running.
+	QuarantinedLeaseIDs(ctx context.Context, node string) (map[string]bool, error)
 }
 
 // maxBody bounds a request body.
@@ -78,12 +82,32 @@ func RequireClientCert() HandlerOption {
 	return func(h *handler) { h.requireCert = true }
 }
 
-// Revocations answers whether a certificate has been withdrawn.
+// Revocations answers whether a certificate has been withdrawn, and records the
+// ones this wire hands out.
 //
-// An interface rather than the allocator, so the wire depends on the one
-// question it asks rather than on the ledger.
+// AN ISSUE IS PART OF REVOCATION, not a separate concern. A credential billet
+// never wrote down cannot be taken back: renewal mints a fresh key and serial
+// over this wire, and without recording it the only serials an operator can name
+// are the ones from bundles they issued by hand — which a node that has renewed
+// is no longer presenting.
+//
+// An interface rather than the allocator, so the wire depends on the two
+// questions it asks rather than on the ledger.
 type Revocations interface {
+	// CertRevokedFor answers by serial AND by the cutoff the node carries, so a
+	// credential billet never recorded — one from before it tracked serials, or
+	// an earlier certificate for a name that was issued twice — is still refused.
+	CertRevokedFor(ctx context.Context, node, serial string, issuedAt time.Time) (bool, error)
 	CertRevoked(ctx context.Context, serial string) (bool, error)
+	RecordIssuedCert(ctx context.Context, cert alloc.IssuedCert) error
+
+	// RecordRenewedCert records a renewal and refuses one whose parent has been
+	// revoked since this request began, in one transaction. Two calls would let a
+	// revocation commit between the check and the record and take back a
+	// credential the machine had already stopped presenting.
+	RecordRenewedCert(
+		ctx context.Context, cert alloc.IssuedCert, parent string, parentIssuedAt time.Time,
+	) error
 }
 
 // WithRevocations lets the wire refuse a credential an operator has taken back.
@@ -99,9 +123,14 @@ func WithRevocations(r Revocations) HandlerOption {
 // Enrollments records machines asking to join and what was decided about them,
 // and checks the credential that lets one ask at all.
 type Enrollments interface {
-	RequestEnrollment(ctx context.Context, name, fingerprint, csrPEM string) (alloc.Enrollment, error)
+	// RequestEnrollmentWithToken records the request AND spends the credential
+	// that authorised it in one transaction. Two calls would let a crash between
+	// them burn a single-use token with no request to show for it, stranding the
+	// machine it was minted for.
+	RequestEnrollmentWithToken(
+		ctx context.Context, name, fingerprint, csrPEM, token string,
+	) (alloc.Enrollment, error)
 	LookupEnrollment(ctx context.Context, name string) (alloc.Enrollment, bool, error)
-	SpendJoinToken(ctx context.Context, token string) error
 }
 
 // WithEnrollment lets a machine ask to join without already holding a
@@ -177,6 +206,7 @@ func Handler(log *slog.Logger, p *Plane, store LeaseStore, jit JITSource, opts .
 	mux.HandleFunc("GET /v1/nodes/{node}/leases/{lease}", h.forOwnLease(h.lease))
 	mux.HandleFunc("GET /v1/nodes/{node}/launched", h.forNewWork(h.launched))
 	mux.HandleFunc("POST /v1/nodes/{node}/describe", h.forNewWork(h.describe))
+	mux.HandleFunc("POST /v1/nodes/{node}/reconcile", h.forNewWork(h.reconcile))
 	mux.HandleFunc("POST /v1/nodes/{node}/jit", h.forNode(h.jitConfig))
 	mux.HandleFunc("POST /v1/nodes/{node}/renew", h.forNode(h.renew))
 
@@ -458,9 +488,15 @@ func (h *handler) notRevoked(w http.ResponseWriter, r *http.Request, name string
 		return true
 	}
 
-	serial := wirecert.Serial(r.TLS.PeerCertificates[0])
+	leaf := r.TLS.PeerCertificates[0]
+	serial := wirecert.Serial(leaf)
 
-	revoked, err := h.revocations.CertRevoked(r.Context(), serial)
+	// THE MOMENT IT WAS MINTED, not the moment it became valid. Certificates are
+	// dated an hour early for clock skew, and reading NotBefore as the issuance
+	// time would place every one of them before a cutoff set within the hour —
+	// refusing the replacement a revocation is supposed to allow.
+	revoked, err := h.revocations.CertRevokedFor(
+		r.Context(), name, serial, leaf.NotBefore.Add(wirecert.ClockSkew))
 	if err != nil {
 		h.log.Error("could not check whether a node certificate has been revoked; refusing "+
 			"the request rather than assuming it is good",
@@ -566,24 +602,14 @@ func (h *handler) enroll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// SPENT ONLY WHEN THE REQUEST IS NEW. A node polls this endpoint until an
-	// operator decides, so charging every call would spend a single-use token on
-	// the second poll and strand the machine it was minted for.
-	if !h.knownEnrollment(r.Context(), req.Node, fingerprint) {
-		if err := h.enrollments.SpendJoinToken(r.Context(), req.JoinToken); err != nil {
-			// A LEDGER THAT CANNOT ANSWER IS NOT A BAD CREDENTIAL. Reporting one
-			// as the other sends an operator to mint tokens that cannot help,
-			// because the next one fails the same way — and the error that would
-			// have said so was never written down.
-			if !errors.Is(err, alloc.ErrBadJoinToken) {
-				h.log.Error("could not check a join token", "node", req.Node, "error", err)
-
-				writeErr(w, http.StatusServiceUnavailable, nodeapi.CodeUnavailable,
-					"billet could not check this join token; try again")
-
-				return
-			}
-
+	// THE REQUEST AND THE TOKEN IN ONE CALL, because they have to commit
+	// together. The token is spent only for a request that is NEW: a node polls
+	// this endpoint until a human decides, so charging every call would spend a
+	// single-use token on the second poll.
+	enrollment, err := h.enrollments.RequestEnrollmentWithToken(
+		r.Context(), req.Node, fingerprint, req.CSRPEM, req.JoinToken)
+	if err != nil {
+		if errors.Is(err, alloc.ErrBadJoinToken) {
 			h.log.Warn("an enrollment was attempted without a usable join token",
 				"node", req.Node, "fingerprint", fingerprint)
 
@@ -593,10 +619,7 @@ func (h *handler) enroll(w http.ResponseWriter, r *http.Request) {
 
 			return
 		}
-	}
 
-	enrollment, err := h.enrollments.RequestEnrollment(r.Context(), req.Node, fingerprint, req.CSRPEM)
-	if err != nil {
 		if errors.Is(err, alloc.ErrEnrollmentConflict) {
 			h.log.Warn("a second key asked to join under a name that is already claimed",
 				"node", req.Node, "fingerprint", fingerprint)
@@ -627,16 +650,6 @@ func (h *handler) enroll(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, res)
-}
-
-// knownEnrollment reports whether this exact request has already been recorded,
-// which is what makes a node's repeated polling free.
-//
-// A READ, never a write. Asking the question must not record an answer.
-func (h *handler) knownEnrollment(ctx context.Context, name, fingerprint string) bool {
-	existing, found, err := h.enrollments.LookupEnrollment(ctx, name)
-
-	return err == nil && found && existing.Fingerprint == fingerprint
 }
 
 // trustBundle is every authority a node should accept.
@@ -687,6 +700,57 @@ func (h *handler) renew(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("this certificate request cannot be signed: %v", err))
 
 		return
+	}
+
+	// RECORDED BEFORE IT IS HANDED OVER, because the alternative is a live
+	// credential the control plane cannot name. A failure here refuses the
+	// renewal: the node keeps the certificate it already has — which is recorded,
+	// revocable, and good for months — and tries again on its next pass.
+	if h.revocations != nil {
+		leaf, leafErr := wirecert.LeafOf(bundle)
+		if leafErr != nil {
+			h.log.Error("could not read a renewed certificate back", "node", node, "error", leafErr)
+
+			writeErr(w, http.StatusInternalServerError, nodeapi.CodeUnavailable,
+				"billet could not read the certificate it just signed; the node keeps the one "+
+					"it has")
+
+			return
+		}
+
+		// AGAINST THE CERTIFICATE THAT ASKED, so a revocation racing this request
+		// wins. notRevoked checked at the start of the request and this signs some
+		// milliseconds later; without naming the parent here, a revocation
+		// committing in between takes back a credential the machine has already
+		// stopped presenting and reports success.
+		presented := r.TLS.PeerCertificates[0]
+		parent := wirecert.Serial(presented)
+
+		recErr := h.revocations.RecordRenewedCert(r.Context(), alloc.IssuedCert{
+			Serial:   wirecert.Serial(leaf),
+			Node:     node,
+			Source:   alloc.CertRenewed,
+			NotAfter: leaf.NotAfter.UTC().Format(time.RFC3339),
+		}, parent, presented.NotBefore.Add(wirecert.ClockSkew))
+
+		if errors.Is(recErr, alloc.ErrParentRevoked) {
+			h.log.Warn("a revoked certificate tried to renew itself", "node", node)
+
+			writeErr(w, http.StatusUnauthorized, nodeapi.CodeUnauthenticated,
+				"this certificate has been revoked and cannot renew")
+
+			return
+		}
+
+		if recErr != nil {
+			h.log.Error("could not record a renewed certificate; refusing the renewal so the "+
+				"credential stays one an operator can revoke", "node", node, "error", recErr)
+
+			writeErr(w, http.StatusServiceUnavailable, nodeapi.CodeUnavailable,
+				"billet could not record this renewal; the node keeps the certificate it has")
+
+			return
+		}
 	}
 
 	h.log.Info("renewed a node certificate", "node", node)
@@ -946,7 +1010,39 @@ func (h *handler) launched(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, nodeapi.LaunchedResponse{LeaseIDs: ids})
+	held, err := h.store.QuarantinedLeaseIDs(r.Context(), node)
+	if err != nil {
+		writeStoreErr(w, err)
+
+		return
+	}
+
+	writeJSON(w, http.StatusOK, nodeapi.LaunchedResponse{LeaseIDs: ids, Quarantined: held})
+}
+
+// reconcile frees capacity held for compute this host says it is not running.
+func (h *handler) reconcile(w http.ResponseWriter, r *http.Request) {
+	node := r.PathValue("node")
+
+	var req nodeapi.ReconcileRequest
+	if !decode(w, r, &req) {
+		return
+	}
+
+	freed, err := h.plane.ReconcileInventory(
+		r.Context(), node, r.Header.Get(nodeapi.HeaderIncarnation), req.Instances)
+	if err != nil {
+		writeStoreErr(w, err)
+
+		return
+	}
+
+	if freed > 0 {
+		h.log.Info("freed capacity held for compute this host is no longer running",
+			"node", node, "leases", freed)
+	}
+
+	writeJSON(w, http.StatusOK, nodeapi.ReconcileResponse{Freed: freed})
 }
 
 func (h *handler) describe(w http.ResponseWriter, r *http.Request) {

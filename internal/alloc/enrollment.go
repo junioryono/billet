@@ -46,39 +46,137 @@ func (a *Allocator) RequestEnrollment(ctx context.Context, name, fingerprint, cs
 	var out Enrollment
 
 	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
-		existing, err := readEnrollment(ctx, tx, name)
+		var err error
 
-		switch {
-		case errors.Is(err, sql.ErrNoRows):
-			now := ts(a.now().UTC())
+		out, err = a.requestEnrollmentTx(ctx, tx, name, fingerprint, csrPEM)
 
-			if _, err := tx.ExecContext(ctx,
-				`INSERT INTO node_enrollments (name, fingerprint, csr_pem, state, requested_at)
-				 VALUES (?, ?, ?, ?, ?)`,
-				name, fingerprint, csrPEM, EnrollPending, now); err != nil {
-				return fmt.Errorf("alloc: record the enrollment of %s: %w", name, err)
-			}
-
-			out = Enrollment{
-				Name: name, Fingerprint: fingerprint, CSRPEM: csrPEM,
-				State: EnrollPending, RequestedAt: now,
-			}
-
-			return nil
-		case err != nil:
-			return err
-		}
-
-		if existing.Fingerprint != fingerprint {
-			return fmt.Errorf("%w: %s is held by %s", ErrEnrollmentConflict, name, existing.Fingerprint)
-		}
-
-		out = existing
-
-		return nil
+		return err
 	})
 
 	return out, err
+}
+
+// RequestEnrollmentWithToken records a request and spends the credential that
+// authorised it, in ONE transaction.
+//
+// SEPARATELY THEY ARE A TRAP. The token is single-use and the decrement is
+// atomic on its own, but committing it and then failing to insert the request —
+// a crash, a busy ledger — burns the credential with nothing to show for it. The
+// machine retries, is treated as new because no row exists, and finds its token
+// spent: stranded until an operator mints another and notices why.
+//
+// THE TOKEN IS SPENT ONLY FOR A REQUEST THAT IS NEW. A node polls this endpoint
+// until a human decides, so charging every call would spend a single-use token
+// on the second poll and strand the machine it was minted for.
+func (a *Allocator) RequestEnrollmentWithToken(
+	ctx context.Context, name, fingerprint, csrPEM, token string,
+) (Enrollment, error) {
+	var out Enrollment
+
+	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+		known, err := isKnownEnrollmentTx(ctx, tx, name, fingerprint)
+		if err != nil {
+			return err
+		}
+
+		if !known {
+			if err := a.spendJoinTokenTx(ctx, tx, token); err != nil {
+				return err
+			}
+		}
+
+		out, err = a.requestEnrollmentTx(ctx, tx, name, fingerprint, csrPEM)
+
+		return err
+	})
+
+	return out, err
+}
+
+// isKnownEnrollmentTx reports whether this exact request has already been
+// recorded, which is what makes a poll free.
+func isKnownEnrollmentTx(ctx context.Context, tx *sql.Tx, name, fingerprint string) (bool, error) {
+	existing, err := readEnrollment(ctx, tx, name)
+
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return false, nil
+	case err != nil:
+		return false, err
+	}
+
+	// THE FINGERPRINT ALONE DECIDES, whatever state the row is in.
+	//
+	// A node polls until it learns a decision, and "denied" IS a decision — it is
+	// what stops the node retrying. Treating the same key asking again as a new
+	// request made the poll spend another use of the token that already paid for
+	// it, so a single-use token answered 401 instead of "denied" and the operator
+	// saw a credential problem where there was a verdict.
+	//
+	// A DIFFERENT key against a denied row is a genuinely new request, replacing
+	// one that no longer holds the name, and it pays.
+	return existing.Fingerprint == fingerprint, nil
+}
+
+// requestEnrollmentTx is the body of a request, inside a caller's transaction.
+func (a *Allocator) requestEnrollmentTx(
+	ctx context.Context, tx *sql.Tx, name, fingerprint, csrPEM string,
+) (Enrollment, error) {
+	existing, err := readEnrollment(ctx, tx, name)
+
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		now := ts(a.now().UTC())
+
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO node_enrollments (name, fingerprint, csr_pem, state, requested_at)
+			 VALUES (?, ?, ?, ?, ?)`,
+			name, fingerprint, csrPEM, EnrollPending, now); err != nil {
+			return Enrollment{}, fmt.Errorf("alloc: record the enrollment of %s: %w", name, err)
+		}
+
+		return Enrollment{
+			Name: name, Fingerprint: fingerprint, CSRPEM: csrPEM,
+			State: EnrollPending, RequestedAt: now,
+		}, nil
+	case err != nil:
+		return Enrollment{}, err
+	}
+
+	// A DENIED ROW HOLDS NOTHING. Denying is the only tool an operator has for a
+	// request that should not proceed, and while it kept the name claimed it was
+	// a one-way door: the enrolling process holds its private key in memory while
+	// it waits for a human, so a reboot loses the key and leaves the row, and the
+	// machine that comes back with a new one is refused forever. There was no way
+	// out short of editing the ledger by hand.
+	//
+	// Pending and approved still hold it, which is the property approval depends
+	// on — an operator who compared a fingerprint yesterday must not be approving
+	// a different machine today under a name they already trust.
+	if existing.State == EnrollDenied && existing.Fingerprint != fingerprint {
+		now := ts(a.now().UTC())
+
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE node_enrollments
+			    SET fingerprint = ?, csr_pem = ?, cert_pem = '', state = ?,
+			        source = 'enrolled', requested_at = ?, decided_at = ''
+			  WHERE name = ?`,
+			fingerprint, csrPEM, EnrollPending, now, name); err != nil {
+			return Enrollment{}, fmt.Errorf("alloc: record the enrollment of %s: %w", name, err)
+		}
+
+		return Enrollment{
+			Name: name, Fingerprint: fingerprint, CSRPEM: csrPEM,
+			State: EnrollPending, RequestedAt: now,
+		}, nil
+	}
+
+	if existing.Fingerprint != fingerprint {
+		return Enrollment{}, fmt.Errorf(
+			"%w: %s is held by %s", ErrEnrollmentConflict, name, existing.Fingerprint)
+	}
+
+	return existing, nil
 }
 
 // LookupEnrollment reads a request without creating one.

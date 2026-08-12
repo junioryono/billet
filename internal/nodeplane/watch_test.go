@@ -14,6 +14,11 @@ import (
 
 // ledger is a Registrar that records what the plane told it.
 type ledger struct {
+	// reconciled records the hosts whose quarantined capacity was reconciled
+	// against what they said they were running.
+	reconciled      []string
+	reportedRunning []string
+
 	mu    sync.Mutex
 	epoch int64
 	gone  map[string]int64
@@ -77,6 +82,19 @@ func (l *ledger) NodeGone(_ context.Context, name string, epoch int64) error {
 	l.gone[name] = epoch
 
 	return nil
+}
+
+// ResolveQuarantineFor records what a returning host said it is running.
+func (l *ledger) ResolveQuarantineFor(
+	_ context.Context, node string, running []string, _ int64,
+) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	l.reconciled = append(l.reconciled, node)
+	l.reportedRunning = running
+
+	return 0, nil
 }
 
 func (l *ledger) ForgetEveryNode(context.Context) error { return nil }

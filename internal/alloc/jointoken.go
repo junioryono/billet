@@ -75,30 +75,36 @@ func (a *Allocator) NewJoinToken(ctx context.Context, ttl time.Duration, uses in
 // token cannot both be admitted: the UPDATE matches only while a use remains, and
 // whichever commits second changes no rows.
 func (a *Allocator) SpendJoinToken(ctx context.Context, token string) error {
+	return a.db.Tx(ctx, func(tx *sql.Tx) error {
+		return a.spendJoinTokenTx(ctx, tx, token)
+	})
+}
+
+// spendJoinTokenTx is the check-and-decrement, inside a caller's transaction so
+// it can be made atomic with the request it authorises.
+func (a *Allocator) spendJoinTokenTx(ctx context.Context, tx *sql.Tx, token string) error {
 	if strings.TrimSpace(token) == "" {
 		return ErrBadJoinToken
 	}
 
-	return a.db.Tx(ctx, func(tx *sql.Tx) error {
-		res, err := tx.ExecContext(ctx,
-			`UPDATE join_tokens SET uses_remaining = uses_remaining - 1
-			  WHERE token_sha256 = ? AND uses_remaining > 0 AND expires_at > ?`,
-			hashJoinToken(token), ts(a.now().UTC()))
-		if err != nil {
-			return fmt.Errorf("alloc: spend a join token: %w", err)
-		}
+	res, err := tx.ExecContext(ctx,
+		`UPDATE join_tokens SET uses_remaining = uses_remaining - 1
+		  WHERE token_sha256 = ? AND uses_remaining > 0 AND expires_at > ?`,
+		hashJoinToken(token), ts(a.now().UTC()))
+	if err != nil {
+		return fmt.Errorf("alloc: spend a join token: %w", err)
+	}
 
-		n, err := res.RowsAffected()
-		if err != nil {
-			return fmt.Errorf("alloc: spend a join token: %w", err)
-		}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("alloc: spend a join token: %w", err)
+	}
 
-		if n == 0 {
-			return ErrBadJoinToken
-		}
+	if n == 0 {
+		return ErrBadJoinToken
+	}
 
-		return nil
-	})
+	return nil
 }
 
 // JoinTokens lists what is outstanding, without the secrets.

@@ -1740,9 +1740,7 @@ func TestACompletionWhoseDestroyFailedIsRetried(t *testing.T) {
 	holdRunning(t, l, a, tiers[0].Label, 7)
 
 	// The first completion cannot destroy, so its capacity is held.
-	if err := l.complete(t.Context(), Job{RequestID: 7}); err != nil {
-		t.Fatalf("complete: %v", err)
-	}
+	l.complete(t.Context(), Job{RequestID: 7})
 
 	l.mu.Lock()
 	held := len(l.cleanup)
@@ -2751,9 +2749,7 @@ func TestAFinishedRetryDoesNotBlockTheShutdownDestroy(t *testing.T) {
 
 	holdRunning(t, l, a, tiers[0].Label, 7)
 
-	if err := l.complete(t.Context(), Job{RequestID: 7}); err != nil {
-		t.Fatalf("complete: %v", err)
-	}
+	l.complete(t.Context(), Job{RequestID: 7})
 
 	// A retry that runs to completion and leaves the obligation in place.
 	l.retryCleanup(t.Context())
@@ -3706,9 +3702,7 @@ func TestAFailedRetryWaitsBeforeTheNextOne(t *testing.T) {
 
 	holdRunning(t, l, a, tiers[0].Label, 7)
 
-	if err := l.complete(t.Context(), Job{RequestID: 7}); err != nil {
-		t.Fatalf("complete: %v", err)
-	}
+	l.complete(t.Context(), Job{RequestID: 7})
 
 	if got := attempts.Load(); got != 1 {
 		t.Fatalf("the completion's own destroy did not run: %d attempts", got)
@@ -4142,9 +4136,7 @@ func TestATransientReleaseFailureKeepsTheRetry(t *testing.T) {
 
 	holdRunning(t, l, a, tiers[0].Label, 7)
 
-	if err := l.complete(t.Context(), Job{RequestID: 7}); err != nil {
-		t.Fatalf("complete: %v", err)
-	}
+	l.complete(t.Context(), Job{RequestID: 7})
 
 	l.mu.Lock()
 	pending := len(l.cleanup)
@@ -4234,9 +4226,7 @@ func TestALostLeaseKeepsItsPendingRetry(t *testing.T) {
 
 	holdRunning(t, l, a, tiers[0].Label, 7)
 
-	if err := l.complete(t.Context(), Job{RequestID: 7}); err != nil {
-		t.Fatalf("complete: %v", err)
-	}
+	l.complete(t.Context(), Job{RequestID: 7})
 
 	if cleanupCount(l) != 1 {
 		t.Fatalf("a completion whose destroy failed was not recorded: %d", cleanupCount(l))
@@ -4345,9 +4335,7 @@ func TestACompletionNotHeldIsNotRecorded(t *testing.T) {
 	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner))
 
 	// No holdRunning: this listener knows nothing about request 7.
-	if err := l.complete(t.Context(), Job{RequestID: 7}); err != nil {
-		t.Fatalf("complete: %v", err)
-	}
+	l.complete(t.Context(), Job{RequestID: 7})
 
 	l.mu.Lock()
 	pending := len(l.cleanup)
@@ -4474,5 +4462,282 @@ func TestRunStartsTheCleanupLoop(t *testing.T) {
 
 	if failure != "" {
 		t.Fatal(failure)
+	}
+}
+
+// A RELEASE THAT DID NOT LAND IS NOT THE SAME AS ONE THAT DID.
+//
+// The lease is dropped from the listener's own map once it is released, and that
+// map is the only place it is still named: nothing else heartbeats it, and
+// shutdown's releaseAll cannot see what is not there. Forgetting it after a
+// release that FAILED therefore leaves the ledger charging capacity for a
+// container that never started, until the reaper arrives a TTL later.
+//
+// Two errors are as good as success and must not be retried forever: ErrFenced
+// means somebody already reclaimed the lease and this caller's epoch is stale,
+// and ErrLeaseNotFound means it is gone or already terminal. Neither improves by
+// holding a reference. A busy ledger or a cancelled context does.
+func TestOnlyASettledReleaseDropsTheLease(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name    string
+		err     error
+		settled bool
+	}{
+		{"released", nil, true},
+		{"already reclaimed by the reaper", alloc.ErrFenced, true},
+		{"gone or already terminal", alloc.ErrLeaseNotFound, true},
+		{"wrapped, because callers wrap", fmt.Errorf("release: %w", alloc.ErrFenced), true},
+		{"the ledger was busy", errors.New("database is locked"), false},
+		{"the context went away", context.Canceled, false},
+	} {
+		if got := releaseSettled(tc.err); got != tc.settled {
+			t.Errorf("%s: releaseSettled = %v, want %v — %s", tc.name, got, tc.settled,
+				map[bool]string{
+					true:  "this lease will be retried forever",
+					false: "this lease is forgotten while the ledger still charges for it",
+				}[got])
+		}
+	}
+}
+
+// A LAUNCH WHOSE RELEASE DOES NOT LAND GIVES UP ITS REQUEST ID AND KEEPS THE
+// OBLIGATION.
+//
+// Keeping the lease in `running` was worse than dropping it, and it does not
+// heal. Nothing retries a release from that map — the cleanup loop walks its own
+// — and the heartbeat renews the entry forever, because the lease is still open
+// at the same epoch. Meanwhile the id is WEDGED: GitHub reassigns a job that
+// never started, and assign treats a redelivery for an id already in `running`
+// as its own work and swallows it, every time. The advertisement counts a
+// phantom and a drain waits its full grace for a completion that cannot come.
+//
+// Dropping the reference alone is the other half of the trap: the ledger goes
+// on charging until the reaper. So the obligation moves to the cleanup set,
+// which is the mechanism that already exists for it.
+func TestAnUnsettledReleaseAfterAFailedLaunchBecomesARetry(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, tiers)
+
+	runner := &fakeRunner{onLaunch: func(int64) error { return errors.New("no space left on device") }}
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner))
+
+	lease := holdRunning(t, l, a, tiers[0].Label, 7)
+
+	// THE LEDGER CANNOT ANSWER, which is what releaseSettled calls retryable — as
+	// opposed to a fenced or missing lease, which is settled and correctly drops.
+	// A cancelled context produces exactly that: the launch still fails through
+	// the fake, and the release that follows cannot reach the database.
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	if err := l.launch(ctx, lease, Job{RequestID: 7, RunID: 7}); err != nil {
+		t.Fatalf("launch: %v", err)
+	}
+
+	l.mu.Lock()
+	_, stillRunning := l.running[7]
+	entry, parked := l.cleanup[7]
+	l.mu.Unlock()
+
+	if stillRunning {
+		t.Error("the request id is still held, so a redelivery of this job is swallowed as " +
+			"work this listener is already doing — and nothing will ever complete it")
+	}
+
+	if !parked {
+		t.Fatal("the lease was dropped with its release unlanded; the ledger charges for it " +
+			"until the reaper arrives")
+	}
+
+	if entry.outcome != alloc.PhaseFailed {
+		t.Errorf("the obligation is recorded as %q; a runner that never started did not "+
+			"finish, and the history should not say it did", entry.outcome)
+	}
+
+	if entry.lease == nil {
+		t.Fatal("the cleanup entry carries no lease, so the retry has nothing to release")
+	}
+}
+
+// AND THE PARKED OBLIGATION IS ACTUALLY DISCHARGED, which is the half a test of
+// the predicate alone cannot see.
+//
+// Parking it is only worth anything if something later picks it up, releases the
+// capacity, and stops refusing the request id. The previous version of this fix
+// kept a reference in a map nothing retried and described it as "costing a
+// retry"; that retry did not exist.
+func TestAParkedReleaseIsRetriedAndClears(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, tiers)
+
+	runner := &fakeRunner{onLaunch: func(int64) error { return errors.New("no space left on device") }}
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner))
+
+	lease := holdRunning(t, l, a, tiers[0].Label, 7)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	if err := l.launch(ctx, lease, Job{RequestID: 7, RunID: 7}); err != nil {
+		t.Fatalf("launch: %v", err)
+	}
+
+	// The ledger answers again, and the cleanup loop runs on its own clock.
+	l.retryCleanup(t.Context())
+
+	l.mu.Lock()
+	_, stillPending := l.cleanup[7]
+	l.mu.Unlock()
+
+	if stillPending {
+		t.Fatal("the obligation is still parked after a retry that could reach the ledger; " +
+			"its capacity is held and its request id refused for the life of the process")
+	}
+
+	// THE CAPACITY IS BACK, which is the point of the whole exercise.
+	if _, err := a.Lease(t.Context(), lease.ID); err == nil {
+		t.Error("the lease is still open, so the ledger is still charging for a job that " +
+			"never started")
+	}
+
+	// AND THE HISTORY DOES NOT CLAIM IT FINISHED.
+	outcomes, err := a.HistoryOutcomesForRequest(t.Context(), 7)
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+
+	if len(outcomes) != 1 || outcomes[0] != string(alloc.PhaseFailed) {
+		t.Errorf("job history records %v; a runner that never started did not finish", outcomes)
+	}
+}
+
+// A RELEASE FAILURE DOES NOT KILL THE LISTENER, and the blast radius is why.
+//
+// complete runs on the poll path as well as the cleanup loop, and there a
+// returned error is fatal: it stops the listener, which cancels every other
+// listener, whose shutdowns destroy every job running on this host. So a busy
+// database at the moment GitHub happens to report a completion took the whole
+// deployment down and failed every build on it.
+//
+// It was also self-defeating — the error was returned to preserve the
+// obligation for a retry, and the retry runs in the process the error kills.
+func TestACompletionWhoseReleaseFailsDoesNotStopTheListener(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, tiers)
+
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(&fakeRunner{}))
+
+	holdRunning(t, l, a, tiers[0].Label, 7)
+
+	// The ledger cannot answer, which is what a cancelled context produces.
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	// NOTHING TO ASSERT ON THE RETURN, and that is the fix: complete has no error
+	// to give. It used to, and on the poll path that error stopped the listener,
+	// cancelled every other listener, and destroyed every job running on this
+	// host. The signature is what keeps that from coming back.
+	l.complete(ctx, Job{RequestID: 7})
+
+	// AND THE OBLIGATION SURVIVES, which is the half that makes returning nil
+	// honest rather than a swallow.
+	l.mu.Lock()
+	entry, parked := l.cleanup[7]
+	_, stillRunning := l.running[7]
+	l.mu.Unlock()
+
+	if !parked {
+		t.Fatal("the completion was reported handled and its capacity was dropped on the " +
+			"floor; the ledger charges for it until the reaper arrives")
+	}
+
+	if entry.lease == nil {
+		t.Error("the parked entry carries no lease, so the retry has nothing to release")
+	}
+
+	if stillRunning {
+		t.Error("the request id is still held, so a redelivery is swallowed as work already " +
+			"in flight")
+	}
+
+	// And the retry discharges it once the ledger answers again.
+	l.retryCleanup(t.Context())
+
+	l.mu.Lock()
+	_, stillParked := l.cleanup[7]
+	l.mu.Unlock()
+
+	if stillParked {
+		t.Error("the parked obligation was not discharged by a retry that could reach the " +
+			"ledger, so its request id is refused for the life of the process")
+	}
+}
+
+// A SUCCESSFUL DESTROY IS NOT LOST BECAUSE THE HEARTBEAT MOVED THE LEASE.
+//
+// A remote destroy has no bound and runs outside the mutex, and the heartbeat
+// runs the whole time. If it finds the lease fenced — which is exactly what the
+// reaper quarantining it looks like — it drops the entry and records a cleanup
+// obligation carrying no lease. The destroy then succeeds, PROVING the container
+// is gone, and the code that would resolve the quarantine has nothing left to
+// name: the capacity stays charged until some node happens to report an
+// inventory, or forever if that node never comes back.
+//
+// The lease is noted before the destroy so the proof is not wasted.
+func TestASuccessfulDestroySurvivesTheHeartbeatDroppingItsLease(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, tiers)
+
+	var l *Listener
+
+	// THE INTERLEAVING, staged inside the destroy: the reaper quarantines the
+	// lease and the heartbeat gives up on it while the destroy is still running.
+	runner := &fakeRunner{
+		onDestroy: func(requestID int64) error {
+			lease := l.leaseFor(requestID)
+
+			if err := a.ExpireForTest(t.Context(), lease.ID); err != nil {
+				t.Errorf("expire: %v", err)
+			}
+
+			if _, err := a.Reap(t.Context()); err != nil {
+				t.Errorf("reap: %v", err)
+			}
+
+			l.heartbeatHeld(t.Context())
+
+			return nil
+		},
+	}
+
+	l = NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner))
+
+	lease := holdRunning(t, l, a, tiers[0].Label, 7)
+
+	// Running, so the reaper quarantines rather than terminalizes it.
+	if err := a.Bind(t.Context(), lease.ID, lease.Epoch, lease.TargetNode); err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+
+	for _, to := range []alloc.Phase{alloc.PhaseLaunching, alloc.PhaseOnline, alloc.PhaseBusy} {
+		if err := a.Advance(t.Context(), lease.ID, lease.Epoch, to); err != nil {
+			t.Fatalf("advance to %s: %v", to, err)
+		}
+	}
+
+	l.complete(t.Context(), Job{RequestID: 7})
+
+	// THE CAPACITY IS BACK. Its container is confirmed gone, so nothing should be
+	// holding a slot for it.
+	held, err := a.Quarantined(t.Context())
+	if err != nil {
+		t.Fatalf("Quarantined: %v", err)
+	}
+
+	if len(held) != 0 {
+		t.Errorf("%d lease(s) still hold capacity for a container this listener destroyed and "+
+			"confirmed gone: %+v", len(held), held)
 	}
 }

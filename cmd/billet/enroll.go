@@ -27,7 +27,7 @@ const enrollPollEvery = 5 * time.Second
 func cmdNodes(ctx context.Context, args []string) error {
 	if len(args) == 0 {
 		return errors.New("usage: billet nodes pending | billet nodes approve <node> --fingerprint <fp> | " +
-			"billet nodes deny <node> --fingerprint <fp>")
+			"billet nodes deny <node> --fingerprint <fp> | billet nodes revoke <node>")
 	}
 
 	switch args[0] {
@@ -37,9 +37,76 @@ func cmdNodes(ctx context.Context, args []string) error {
 		return cmdNodesDecide(ctx, args[1:], alloc.EnrollApproved)
 	case "deny":
 		return cmdNodesDecide(ctx, args[1:], alloc.EnrollDenied)
+	case "revoke":
+		return cmdNodesRevoke(ctx, args[1:])
 	}
 
-	return fmt.Errorf("unknown nodes command %q; try pending, approve or deny", args[0])
+	return fmt.Errorf("unknown nodes command %q; try pending, approve, deny or revoke", args[0])
+}
+
+// cmdNodesRevoke takes back every credential a machine currently holds.
+//
+// THE HANDLE AN OPERATOR ACTUALLY HAS. `billet ca revoke` names one serial, read
+// out of the bundle that was issued — and a node renews itself, so after the
+// first renewal that file describes a credential the machine stopped presenting
+// months ago. Revoking it succeeds, says the certificate will be refused on its
+// next request, and changes nothing: the host keeps registering, binding leases
+// and drawing JIT registrations against the organisation.
+//
+// A REPLACEMENT UNDER THE SAME NAME IS UNAFFECTED, which is why this is not the
+// same as banning a name. It revokes the serials outstanding at this moment; a
+// certificate issued afterwards is not one of them.
+func cmdNodesRevoke(ctx context.Context, args []string) error {
+	fs := newFlagSet("billet nodes revoke")
+	cfgPath := addConfigFlag(fs)
+	reason := fs.String("reason", "", "why, recorded alongside it")
+
+	name, err := parseWithName(fs, args)
+	if err != nil {
+		return err
+	}
+
+	if name == "" {
+		return errors.New("usage: billet nodes revoke <node> [--reason why]")
+	}
+
+	a, closeDB, err := controlPlaneAllocator(ctx, *cfgPath)
+	if err != nil {
+		return err
+	}
+
+	defer closeDB()
+
+	// EVERY CREDENTIAL THIS DEPLOYMENT EVER HANDED OUT, including the ones
+	// admitted before billet recorded serials. Without this an upgraded
+	// deployment answers "holds no certificate" for a machine that is holding a
+	// working one.
+	if err := backfillIssuedCerts(ctx, a); err != nil {
+		return err
+	}
+
+	revoked, err := a.RevokeNode(ctx, name, *reason)
+	if err != nil {
+		return err
+	}
+
+	if len(revoked) == 0 {
+		fmt.Printf("%s holds no certificate this deployment issued, so there is nothing to "+
+			"take back.\n", name)
+
+		return nil
+	}
+
+	fmt.Printf("Revoked %d certificate(s) held by %s:\n\n", len(revoked), name)
+
+	for i := range revoked {
+		fmt.Printf("  %s  %s  expires %s\n", revoked[i].Serial, revoked[i].Source, revoked[i].NotAfter)
+	}
+
+	fmt.Printf("\nEach is refused on the next request it makes. Issue a replacement with\n")
+	fmt.Printf("`billet ca issue %s` if the machine is coming back.\n", name)
+
+	return nil
 }
 
 // cmdNodesPending lists machines waiting to be let in.
@@ -164,6 +231,13 @@ func cmdNodesDecide(ctx context.Context, args []string, decision string) error {
 			return err
 		}
 
+		// RECORDED BEFORE IT IS HANDED OVER. Revocation names a serial, so a
+		// credential billet never wrote down cannot be taken back — and this is
+		// the first of the three ways one comes into existence.
+		if err := recordIssuedCert(ctx, a, bundle, name, alloc.CertEnrolled); err != nil {
+			return err
+		}
+
 		certPEM = string(bundle.CertPEM)
 	}
 
@@ -175,11 +249,93 @@ func cmdNodesDecide(ctx context.Context, args []string, decision string) error {
 		alloc.EnrollApproved: "Approved", alloc.EnrollDenied: "Denied",
 	}[decision], name)
 
+	if decision == alloc.EnrollDenied {
+		fmt.Printf("\nThe name is free again: another key may now ask for it. That is the way " +
+			"back\nfor a machine that lost its key while waiting to be approved.\n")
+	}
+
 	if decision == alloc.EnrollApproved {
 		fmt.Printf("\nIt picks up its certificate on its next attempt, within a few seconds.\n")
 	}
 
 	return nil
+}
+
+// backfillIssuedCerts records certificates admitted before billet tracked
+// serials, so revocation can reach them.
+//
+// A CREDENTIAL BILLET DOES NOT KNOW ABOUT CANNOT BE TAKEN BACK, and an upgrade
+// is exactly how one comes to exist: every node admitted before issued_certs
+// existed holds a working certificate whose serial was never written down.
+// `billet nodes revoke` would report that the machine holds nothing and change
+// nothing, which is the worst possible answer to a compromise.
+//
+// The admission trail is what makes this recoverable: both ways in — approval
+// and `billet ca issue` — stored the certificate they handed over, so the serial
+// can be read back out of it. Idempotent, so running it on every revocation
+// costs one query on a deployment that is already complete.
+func backfillIssuedCerts(ctx context.Context, a *alloc.Allocator) error {
+	admitted, err := a.Enrollments(ctx, alloc.EnrollApproved)
+	if err != nil {
+		return err
+	}
+
+	for i := range admitted {
+		rec := &admitted[i]
+		if rec.CertPEM == "" {
+			continue
+		}
+
+		leaf, err := wirecert.LeafOf(wirecert.Bundle{CertPEM: []byte(rec.CertPEM)})
+		if err != nil {
+			// A stored certificate billet cannot read is worth saying out loud —
+			// that node's credential is outside revocation — but it must not stop
+			// the ones that can be read from being recorded.
+			fmt.Fprintf(os.Stderr, "the certificate recorded for node %q cannot be parsed, so "+
+				"it cannot be revoked by serial: %v\n", rec.Name, err)
+
+			continue
+		}
+
+		source := alloc.CertEnrolled
+		if rec.Source == "issued" {
+			source = alloc.CertIssued
+		}
+
+		if err := a.RecordIssuedCert(ctx, alloc.IssuedCert{
+			Serial:   wirecert.Serial(leaf),
+			Node:     rec.Name,
+			Source:   source,
+			NotAfter: leaf.NotAfter.UTC().Format(time.RFC3339),
+		}); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// recordIssuedCert writes a credential into the list revocation reads.
+//
+// EVERY WAY A CERTIFICATE COMES INTO EXISTENCE GOES THROUGH HERE — approval,
+// `billet ca issue`, and renewal over the wire. Revocation is keyed on serial,
+// which is the right granularity because a node name is legitimately re-issued
+// to a replacement machine; the cost is that a serial billet does not know about
+// is a credential it cannot take back.
+func recordIssuedCert(
+	ctx context.Context, a *alloc.Allocator, bundle wirecert.Bundle, node, source string,
+) error {
+	leaf, err := wirecert.LeafOf(bundle)
+	if err != nil {
+		return fmt.Errorf("read back the certificate just issued to %s: %w", node, err)
+	}
+
+	return a.RecordIssuedCert(ctx, alloc.IssuedCert{
+		Serial:   wirecert.Serial(leaf),
+		Node:     node,
+		Source:   source,
+		NotAfter: leaf.NotAfter.UTC().Format(time.RFC3339),
+	})
 }
 
 // controlPlaneAllocator opens the ledger for a command that runs on the server.
@@ -236,7 +392,15 @@ func enrollNode(ctx context.Context, cfg *config.Config, caFingerprint, joinToke
 			"there is nothing to take it from")
 	}
 
-	csrPEM, keyPEM, err := wirecert.NewNodeCSR(name)
+	// KEPT ACROSS ATTEMPTS, because the wait is for a human and this process may
+	// not survive it.
+	//
+	// The key used to exist only in memory. A reboot or a Ctrl-C during the
+	// approval wait lost it while the control plane kept the pending row, so the
+	// machine came back with a NEW key and was refused: the name was claimed by a
+	// fingerprint nothing could present any more. Reusing the staged key makes a
+	// retry the same request rather than a second one.
+	csrPEM, keyPEM, err := pendingIdentity(cfg.Node.TLS, name)
 	if err != nil {
 		return err
 	}
@@ -252,11 +416,32 @@ func enrollNode(ctx context.Context, cfg *config.Config, caFingerprint, joinToke
 	fmt.Printf("  billet nodes approve %s --fingerprint %s\n\n", name, fingerprint)
 
 	for {
-		certPEM, err := nodeclient.Enroll(ctx, "https://"+cfg.Node.ServerAddr, name, joinToken, caPEM, csrPEM)
+		certPEM, signedBy, err := nodeclient.Enroll(
+			ctx, "https://"+cfg.Node.ServerAddr, name, joinToken, caPEM, csrPEM)
 
 		switch {
 		case err == nil:
-			return writeBundle(cfg.Node.TLS, certPEM, keyPEM, caPEM)
+			// THE AUTHORITY THAT SIGNED IT, NOT THE ONE WE STARTED WITH. Waiting
+			// for a human is unbounded, so the deployment's CA can rotate while
+			// this loop is polling and approval then signs with the new one.
+			// Writing the bootstrap authority here left a node whose own
+			// certificate does not chain to its own ca.crt.
+			if _, verifyErr := wirecert.ClientTLS(wirecert.Bundle{
+				CertPEM: certPEM, KeyPEM: keyPEM, CAPEM: signedBy,
+			}); verifyErr != nil {
+				return fmt.Errorf("the control plane approved this node but the bundle it "+
+					"returned does not verify against itself, so it would not start: %w", verifyErr)
+			}
+
+			if err := writeBundle(cfg.Node.TLS, certPEM, keyPEM, signedBy); err != nil {
+				return err
+			}
+
+			// The staged request has become a certificate, so the copy of the key
+			// beside it is a second copy of a secret and nothing else.
+			clearPendingIdentity(cfg.Node.TLS)
+
+			return nil
 		case errors.Is(err, nodeclient.ErrDenied):
 			return fmt.Errorf("an operator denied this node; nothing to retry")
 		case errors.Is(err, nodeclient.ErrNotApproved):
@@ -269,6 +454,114 @@ func enrollNode(ctx context.Context, cfg *config.Config, caFingerprint, joinToke
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(enrollPollEvery):
+		}
+	}
+}
+
+// pendingIdentity is the key and request this node is enrolling with, generated
+// once and reused until enrollment finishes.
+//
+// STAGED BESIDE THE BUNDLE, so it survives the process that made it. The name is
+// claimed by the first key to ask; a machine that loses its key mid-wait and
+// generates another is a second key asking for a name that is already taken, and
+// the control plane is right to refuse it.
+//
+// Written 0600 with O_EXCL, so a stale staging file is reused rather than
+// silently replaced — replacing it is the very thing that strands the name.
+func pendingIdentity(tls *config.NodeTLS, name string) ([]byte, []byte, error) {
+	dir := filepath.Dir(tls.KeyPath)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, nil, fmt.Errorf("create %s: %w", dir, err)
+	}
+
+	keyStage := filepath.Join(dir, "pending.key")
+	csrStage := filepath.Join(dir, "pending.csr")
+	// BOUND TO THE NAME IT WAS MADE FOR. The server derives the certificate
+	// subject from the REQUEST, not from the CSR, so reusing a stage after
+	// node.name changed would let one key collect certificates for two names —
+	// and revoking one of them would leave the other working.
+	forStage := filepath.Join(dir, "pending.node")
+
+	staged, keyErr := wirecert.ReadSecret(keyStage)
+	stagedCSR, csrErr := os.ReadFile(csrStage)
+	stagedFor, forErr := os.ReadFile(forStage)
+
+	// ALL THREE OR NONE. A partial stage is not "nothing staged": the key may
+	// already have a pending request against it on the control plane, and
+	// generating a fresh one replaces it — after which the name is held by a
+	// fingerprint this machine can no longer present, and only an operator can
+	// free it. So only a complete absence starts over.
+	missing := errors.Is(keyErr, os.ErrNotExist) &&
+		errors.Is(csrErr, os.ErrNotExist) &&
+		errors.Is(forErr, os.ErrNotExist)
+
+	switch {
+	case keyErr == nil && csrErr == nil && forErr == nil && string(stagedFor) == name:
+		fmt.Printf("Resuming the enrollment already staged in %s.\n\n", dir)
+
+		return stagedCSR, staged, nil
+
+	case missing:
+		// Nothing staged, which is the ordinary first run.
+
+	case keyErr == nil && (csrErr != nil || forErr != nil):
+		// THE KEY SURVIVED AND ITS COMPANIONS DID NOT. Replacing it would abandon
+		// a request the control plane may already be holding under this name.
+		return nil, nil, fmt.Errorf(
+			"%s holds a staged enrollment key without the request that goes with it, so this "+
+				"machine cannot present what it already asked for. Remove pending.key, "+
+				"pending.csr and pending.node to start again, and deny the pending request on "+
+				"the control plane so the name is free", dir)
+
+	case keyErr != nil:
+		// A STAGED KEY THAT FAILS THE CHECKS IS NOT SILENTLY REPLACED. It may be
+		// the identity this machine is about to be approved for, and replacing it
+		// strands the name; it may also be readable by somebody else, which is why
+		// it cannot simply be used. Both need an operator.
+		return nil, nil, fmt.Errorf("the enrollment staged in %s cannot be used: %w. Remove "+
+			"those files to start again, and deny the pending request on the control plane "+
+			"so the name is free", dir, keyErr)
+
+	case string(stagedFor) != name:
+		return nil, nil, fmt.Errorf(
+			"%s holds an enrollment staged for node %q and this config says %q. One key must "+
+				"not claim two names: remove those files to start again, and deny the pending "+
+				"request for %q so its name is free",
+			dir, stagedFor, name, stagedFor)
+	}
+
+	csr, key, err := wirecert.NewNodeCSR(name)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if err := wirecert.WriteFileAtomic(keyStage, key, 0o600); err != nil {
+		return nil, nil, err
+	}
+
+	if err := wirecert.WriteFileAtomic(csrStage, csr, 0o644); err != nil {
+		return nil, nil, err
+	}
+
+	if err := wirecert.WriteFileAtomic(forStage, []byte(name), 0o644); err != nil {
+		return nil, nil, err
+	}
+
+	return csr, key, nil
+}
+
+// clearPendingIdentity drops the staged request once it has become a bundle.
+func clearPendingIdentity(tls *config.NodeTLS) {
+	dir := filepath.Dir(tls.KeyPath)
+
+	for _, name := range []string{"pending.key", "pending.csr", "pending.node"} {
+		if err := os.Remove(filepath.Join(dir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			// SAID OUT LOUD rather than swallowed: what is left behind is a second
+			// copy of a private key, and the enrollment itself succeeded — so this
+			// is a warning, not a failure.
+			fmt.Fprintf(os.Stderr, "the enrollment succeeded but %s could not be removed: %v\n"+
+				"That file is a copy of this node's private key; delete it.\n",
+				filepath.Join(dir, name), err)
 		}
 	}
 }
@@ -294,8 +587,12 @@ func writeBundle(tls *config.NodeTLS, certPEM, keyPEM, caPEM []byte) error {
 		{tls.CertPath, certPEM, 0o644},
 		{tls.CAPath, caPEM, 0o644},
 	} {
-		if err := os.WriteFile(f.path, f.data, f.mode); err != nil {
-			return fmt.Errorf("write %s: %w", f.path, err)
+		// EXACTLY THIS MODE, whatever was there before. os.WriteFile applies its
+		// mode only when it creates the file, so re-enrolling a machine whose
+		// node.key was already 0644 wrote a fresh secret into a world-readable
+		// file and said it had succeeded.
+		if err := wirecert.WriteFileAtomic(f.path, f.data, f.mode); err != nil {
+			return err
 		}
 	}
 
