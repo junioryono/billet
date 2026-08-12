@@ -498,21 +498,17 @@ func (a *Allocator) Escrow(ctx context.Context, tier string, want int) ([]*Lease
 	var leases []*Lease
 
 	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
-		room, err := a.headroom(ctx, tx, t)
+		// MEASURED ONCE AND SPENT DOWN, because none of these choices is durable until the
+		// transaction commits: asking the ledger again per lease would return the same
+		// fleet every time and aim every reservation at the same machine. The same
+		// measurement answers how much room there is and where to put it.
+		room, place, err := a.headroomWithPlacer(ctx, tx, t)
 		if err != nil {
 			return err
 		}
 
 		take := min(want, room)
 		leases = make([]*Lease, 0, take)
-
-		// MEASURED ONCE AND SPENT DOWN, because none of these choices is durable until the
-		// transaction commits: asking the ledger again per lease would return the same
-		// fleet every time and aim every reservation at the same machine.
-		place, _, _, err := a.placerWithFloors(ctx, tx, t)
-		if err != nil {
-			return err
-		}
 
 		for range take {
 			target, ok := place.next(t)
@@ -664,9 +660,25 @@ func (a *Allocator) allowsGuestOS(node string, os config.GuestOS) bool {
 // smallest wins — capacity is a vector, so "enough cores" says nothing about memory
 // or about the per-host macOS guest limit.
 func (a *Allocator) headroom(ctx context.Context, tx *sql.Tx, t config.Tier) (int, error) {
+	n, _, err := a.headroomWithPlacer(ctx, tx, t)
+
+	return n, err
+}
+
+// headroomWithPlacer is headroom, handing back the fleet it measured.
+//
+// MEASURED ONCE PER TRANSACTION. Escrow asks how much room there is and then
+// asks where to put it, and building the placer twice meant walking the whole
+// fleet twice on the single writer connection every listener is waiting for.
+// total() only reads, so the placer that answered the first question is exactly
+// the one that should answer the second — and reusing it removes any chance of
+// the two disagreeing.
+func (a *Allocator) headroomWithPlacer(
+	ctx context.Context, tx *sql.Tx, t config.Tier,
+) (int, *placer, error) {
 	used, err := a.usage(ctx, tx)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 
 	// FLOORS ARE NOT DEDUCTED HERE. They are held against the machines that could
@@ -679,7 +691,7 @@ func (a *Allocator) headroom(ctx context.Context, tx *sql.Tx, t config.Tier) (in
 	// the ceiling from tiers that are perfectly placeable.
 	place, owedVCPU, owedMemory, err := a.placerWithFloors(ctx, tx, t)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 
 	byVCPU := (a.limits.MaxVCPU - used.VCPU - owedVCPU) / t.VCPU
@@ -690,7 +702,7 @@ func (a *Allocator) headroom(ctx context.Context, tx *sql.Tx, t config.Tier) (in
 	if t.MaxConcurrent > 0 {
 		tierUsed, err := a.countOpenByTier(ctx, tx, t.Label)
 		if err != nil {
-			return 0, err
+			return 0, nil, err
 		}
 
 		n = min(n, t.MaxConcurrent-tierUsed)
@@ -706,7 +718,7 @@ func (a *Allocator) headroom(ctx context.Context, tx *sql.Tx, t config.Tier) (in
 	// operator allowed, which is what keeps a one-box install behaving as before.
 	//
 	// The per-host macOS licence lives in headroomOn.
-	return max(min(n, place.total(t)), 0), nil
+	return max(min(n, place.total(t)), 0), place, nil
 }
 
 // Reserve escrows capacity for one instance of a tier.
@@ -724,18 +736,13 @@ func (a *Allocator) Reserve(ctx context.Context, tier string) (*Lease, error) {
 	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
 		// Headroom and insert in ONE transaction. Checking outside it would be a read
 		// followed by a hopeful write — measured at a 7x overcommit under concurrency.
-		room, err := a.headroom(ctx, tx, t)
+		room, place, err := a.headroomWithPlacer(ctx, tx, t)
 		if err != nil {
 			return err
 		}
 
 		if room < 1 {
 			return fmt.Errorf("%w for tier %q", ErrNoCapacity, t.Label)
-		}
-
-		place, _, _, err := a.placerWithFloors(ctx, tx, t)
-		if err != nil {
-			return err
 		}
 
 		target, ok := place.next(t)

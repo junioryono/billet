@@ -3,6 +3,7 @@ package alloc
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"slices"
 
 	"github.com/junioryono/billet/internal/config"
@@ -67,24 +68,76 @@ func (a *Allocator) fleetResources(ctx context.Context, tx *sql.Tx) (*fleet, err
 		macOS:  make(map[string]int, len(nodes)),
 	}
 
+	// ONE QUERY FOR THE WHOLE FLEET, not two per host.
+	//
+	// This runs inside the allocator's single writer connection, and it runs on
+	// every headroom question and again inside every escrow — so a per-node pair
+	// of statements is O(nodes) round trips holding the one connection every
+	// listener needs. The arithmetic is identical; only the number of statements
+	// changes.
+	used, err := a.usageByNode(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+
 	for _, n := range nodes {
-		used, err := a.usageOn(ctx, tx, n.name)
-		if err != nil {
-			return nil, err
-		}
+		u := used[n.name]
 
-		f.vcpu[n.name] = n.vcpu - used.VCPU
-		f.memory[n.name] = n.memory - used.Memory
-
-		guests, err := a.countOpenMacOSByNode(ctx, tx, n.name)
-		if err != nil {
-			return nil, err
-		}
-
-		f.macOS[n.name] = a.macOSLimit(n.name) - guests
+		f.vcpu[n.name] = n.vcpu - u.VCPU
+		f.memory[n.name] = n.memory - u.Memory
+		f.macOS[n.name] = a.macOSLimit(n.name) - u.MacOS
 	}
 
 	return f, nil
+}
+
+// nodeUsage is what one host has committed, measured in one pass over the fleet.
+type nodeUsage struct {
+	VCPU   int
+	Memory config.ByteSize
+	MacOS  int
+}
+
+// usageByNode is every host's committed capacity, keyed the way the rest of the
+// arithmetic attributes a lease.
+//
+// COALESCE(node, target_node), the same expression usageOn and
+// countOpenMacOSByNode use one host at a time. A lease that has been bound is
+// charged to the host running it; one only AIMED at a host is charged there too,
+// because escrow commits a machine's room before any container starts.
+func (a *Allocator) usageByNode(ctx context.Context, tx *sql.Tx) (map[string]nodeUsage, error) {
+	rows, err := tx.QueryContext(ctx,
+		`SELECT COALESCE(node, target_node, ''),
+		        COALESCE(SUM(vcpu), 0),
+		        COALESCE(SUM(memory), 0),
+		        COALESCE(SUM(macos_slot), 0)
+		   FROM leases
+		  WHERE phase NOT IN ('done','failed')
+		  GROUP BY COALESCE(node, target_node, '')`)
+	if err != nil {
+		return nil, fmt.Errorf("alloc: measure the fleet's committed capacity: %w", err)
+	}
+
+	defer func() { _ = rows.Close() }()
+
+	out := map[string]nodeUsage{}
+
+	for rows.Next() {
+		var (
+			name string
+			u    nodeUsage
+			mem  int64
+		)
+
+		if err := rows.Scan(&name, &u.VCPU, &mem, &u.MacOS); err != nil {
+			return nil, fmt.Errorf("alloc: scan a host's committed capacity: %w", err)
+		}
+
+		u.Memory = config.ByteSize(mem)
+		out[name] = u
+	}
+
+	return out, rows.Err()
 }
 
 // forTier is a placer over the hosts one tier may use, spending the fleet's
