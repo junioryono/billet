@@ -962,3 +962,44 @@ func TestALaunchCarriesTheTierShape(t *testing.T) {
 		t.Fatal("the launch never reached the node")
 	}
 }
+
+// AND THE LEDGER DECIDES FOR A LEASE NOTHING HAS CLAIMED YET.
+//
+// The owners map only holds leases the plane has DELIVERED, so escrow a listener
+// is still holding — and any lease at all in the window after a control-plane
+// restart, before the fleet re-adopts — has no entry, and the ownership check
+// has nothing to refuse with. Fleet membership was all that was left, and every
+// registered node passes that.
+//
+// So the ledger answers instead, the way the rest of the arithmetic does:
+// COALESCE(node, target_node). Escrow chose the machine long before a bind fills
+// `node` in, and that choice is what billet advertised against — releasing it
+// from another host desynchronises the advertisement from the ledger, and the
+// assignment GitHub makes against the difference fails.
+//
+// A lease the ledger has not placed at all is still allowed through, because
+// that is the recovery path: after a restart a node re-adopts what it is running
+// and must be able to maintain it while it does.
+func TestANodeCannotReleaseALeaseTheLedgerGaveToAnotherHost(t *testing.T) {
+	t.Parallel()
+
+	// The ledger says this lease was escrowed for another machine and never bound.
+	store := &fakeStore{lease: &alloc.Lease{ID: "l1", TargetNode: "other", Epoch: 1}}
+
+	_, base := serve(t, store)
+	c := dial(t, base)
+
+	err := c.Release(t.Context(), "l1", 1, alloc.PhaseDone)
+	if err == nil {
+		t.Fatal("a node released a lease the ledger had escrowed for a different machine; " +
+			"the advertisement and the ledger now disagree")
+	}
+
+	store.mu.Lock()
+	released := len(store.released)
+	store.mu.Unlock()
+
+	if released != 0 {
+		t.Errorf("the release reached the ledger anyway: %d", released)
+	}
+}

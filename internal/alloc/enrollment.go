@@ -167,9 +167,33 @@ func fingerprintMatches(recorded, supplied string) bool {
 //
 // Marked as its own source, because the two are not the same fact. One was
 // approved by somebody comparing a fingerprint; this one was issued.
-func (a *Allocator) RecordIssued(ctx context.Context, name, fingerprint, certPEM string) error {
-	return a.db.Tx(ctx, func(tx *sql.Tx) error {
+// It REPORTS WHAT IT DISPLACED, because the wire refuses a second key under a
+// name the first one claimed and this path does not. Overwriting is right here —
+// an operator issuing a certificate is a deliberate act, and refusing would
+// leave a name unusable after a machine was rebuilt — but it must not be silent:
+// the fingerprint an operator compared yesterday stops describing anything, and
+// nothing else would ever tell them.
+func (a *Allocator) RecordIssued(
+	ctx context.Context, name, fingerprint, certPEM string,
+) (string, error) {
+	var displaced string
+
+	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
 		now := ts(a.now().UTC())
+
+		var previous string
+
+		switch scanErr := tx.QueryRowContext(ctx,
+			`SELECT fingerprint FROM node_enrollments WHERE name = ?`, name,
+		).Scan(&previous); {
+		case scanErr == nil:
+			if previous != fingerprint {
+				displaced = previous
+			}
+		case errors.Is(scanErr, sql.ErrNoRows):
+		default:
+			return fmt.Errorf("alloc: read what %s was already admitted as: %w", name, scanErr)
+		}
 
 		_, err := tx.ExecContext(ctx,
 			`INSERT INTO node_enrollments
@@ -188,6 +212,8 @@ func (a *Allocator) RecordIssued(ctx context.Context, name, fingerprint, certPEM
 
 		return nil
 	})
+
+	return displaced, err
 }
 
 // Enrollments lists what has asked to join.

@@ -28,7 +28,15 @@ type Rotating struct {
 
 	// roots is what this node verifies the control plane against. Replaced by a
 	// renewal that carries a wider bundle, which is how a CA rotation propagates.
-	roots *x509.CertPool
+	//
+	// A POINTER READ AT EVERY HANDSHAKE, not a tls.Config field. Config.RootCAs is
+	// captured when the config is built, and a node builds its config once at
+	// startup and keeps it in an http.Transport for the life of the process — so
+	// widening this pool would reach the disk, reach memory, and never reach a
+	// single connection. The rotation would be invisible to every node that had
+	// not restarted, and retiring the old authority would take the fleet down on
+	// the operator's schedule while every check said the overlap had worked.
+	roots atomic.Pointer[x509.CertPool]
 }
 
 // NewRotating builds a rotating identity from a bundle on disk.
@@ -38,62 +46,126 @@ func NewRotating(certPath, keyPath, caPath string) (*Rotating, error) {
 		return nil, err
 	}
 
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(b.CAPEM) {
-		return nil, errors.New("wirecert: the CA certificate could not be parsed for verification")
-	}
-
-	r := &Rotating{certPath: certPath, keyPath: keyPath, caPath: caPath, roots: pool}
-
-	if err := r.set(b.CertPEM, b.KeyPEM); err != nil {
+	pool, err := poolFrom(b.CAPEM)
+	if err != nil {
 		return nil, err
 	}
+
+	cert, err := verifiedKeyPair(b.CertPEM, b.KeyPEM, pool)
+	if err != nil {
+		return nil, err
+	}
+
+	r := &Rotating{certPath: certPath, keyPath: keyPath, caPath: caPath}
+	r.roots.Store(pool)
+	r.current.Store(cert)
 
 	return r, nil
 }
 
-// set parses a keypair and makes it the live one.
-func (r *Rotating) set(certPEM, keyPEM []byte) error {
+// poolFrom builds a verification pool from a PEM bundle.
+func poolFrom(caPEM []byte) (*x509.CertPool, error) {
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caPEM) {
+		return nil, errors.New("wirecert: the CA certificate could not be parsed for verification")
+	}
+
+	return pool, nil
+}
+
+// verifiedKeyPair parses a keypair and refuses one the given authority did not
+// issue.
+//
+// PURE, so a caller can check a renewal before it commits to it anywhere.
+func verifiedKeyPair(certPEM, keyPEM []byte, roots *x509.CertPool) (*tls.Certificate, error) {
 	cert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
-		return fmt.Errorf("wirecert: load the node certificate: %w", err)
+		return nil, fmt.Errorf("wirecert: load the node certificate: %w", err)
 	}
 
 	leaf, err := x509.ParseCertificate(cert.Certificate[0])
 	if err != nil {
-		return fmt.Errorf("wirecert: parse the node certificate: %w", err)
+		return nil, fmt.Errorf("wirecert: parse the node certificate: %w", err)
 	}
 
-	// VERIFIED BEFORE IT IS INSTALLED. A renewal that does not chain to the
-	// authority this node verifies the control plane against would replace a
-	// working identity with one that cannot connect — and the node would discover
-	// that on its next handshake, having already overwritten the good one.
 	if _, err := leaf.Verify(x509.VerifyOptions{
-		Roots:     r.roots,
+		Roots:     roots,
 		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 	}); err != nil {
-		return fmt.Errorf("wirecert: this certificate was not issued by the authority this "+
+		return nil, fmt.Errorf("wirecert: this certificate was not issued by the authority this "+
 			"node trusts, so the control plane would reject it: %w", err)
 	}
 
 	cert.Leaf = leaf
-	r.current.Store(&cert)
 
-	return nil
+	return &cert, nil
 }
 
 // Leaf is the certificate in force right now.
 func (r *Rotating) Leaf() *x509.Certificate { return r.current.Load().Leaf }
 
-// ClientTLS is this identity as a dialable config.
-func (r *Rotating) ClientTLS() *tls.Config {
+// ClientTLS is this identity as a dialable config, verifying the control plane
+// against serverName.
+//
+// BOTH HALVES ARE ANSWERED PER HANDSHAKE, because a node builds this once and
+// keeps it for the life of the process. GetClientCertificate does that for what
+// the node presents; RootCAs cannot, because it is a value captured when the
+// config is built — so verification is done here instead, against the pool as it
+// is at the handshake. That is what lets a renewal widen a running node's trust,
+// which is the entire mechanism by which a CA rotation reaches the fleet.
+//
+// THE NAME IS PASSED IN RATHER THAN READ OFF THE CONNECTION. tls.ConnectionState
+// carries only what went out in SNI, and SNI is not sent for an IP literal — so
+// a node dialling its control plane by address would arrive here with nothing to
+// check the certificate against, and billet supports exactly that.
+func (r *Rotating) ClientTLS(serverName string) *tls.Config {
 	return &tls.Config{
 		GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
 			return r.current.Load(), nil
 		},
-		RootCAs:    r.roots,
+		// The verification below replaces it and is stricter in no way: same roots,
+		// same hostname, same usage. Skipping the built-in check is what makes the
+		// roots late-bound.
+		InsecureSkipVerify: true, //nolint:gosec // VerifyConnection does the full check below
+		VerifyConnection: func(cs tls.ConnectionState) error {
+			return r.verifyServer(serverName, cs)
+		},
 		MinVersion: tls.VersionTLS13,
 	}
+}
+
+// verifyServer is the check crypto/tls would have done, against the authority
+// this node trusts RIGHT NOW.
+func (r *Rotating) verifyServer(serverName string, cs tls.ConnectionState) error {
+	if len(cs.PeerCertificates) == 0 {
+		return errors.New("wirecert: the control plane presented no certificate")
+	}
+
+	// FAILS CLOSED ON A MISSING NAME, because an empty one turns the hostname
+	// check into a no-op — after which any host holding a certificate from this
+	// authority could answer for the control plane.
+	if serverName == "" {
+		return errors.New(
+			"wirecert: this node was given no control-plane name to verify against, so the " +
+				"certificate cannot be checked against the address it dialled")
+	}
+
+	intermediates := x509.NewCertPool()
+	for _, c := range cs.PeerCertificates[1:] {
+		intermediates.AddCert(c)
+	}
+
+	if _, err := cs.PeerCertificates[0].Verify(x509.VerifyOptions{
+		DNSName:       serverName,
+		Roots:         r.roots.Load(),
+		Intermediates: intermediates,
+		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}); err != nil {
+		return fmt.Errorf("wirecert: the control plane's certificate was not issued by the "+
+			"authority this node trusts: %w", err)
+	}
+
+	return nil
 }
 
 // Replace installs a renewed certificate, writing it down before using it.
@@ -109,25 +181,40 @@ func (r *Rotating) ClientTLS() *tls.Config {
 // whoever copies this next.
 func (r *Rotating) Replace(certPEM, keyPEM, caPEM []byte) error {
 	// THE AUTHORITY FIRST, and this is what makes a CA rotation reach a node at
-	// all. A renewal during an overlap carries a trust bundle holding both the
-	// new authority and the old one; adopting the certificate without the bundle
-	// would leave this node trusting only what it already had, so it would keep
-	// working right up until the old authority is retired and then stop.
+	// all. A renewal during an overlap carries a trust bundle holding both the new
+	// authority and the old one; adopting the certificate without the bundle would
+	// leave this node trusting only what it already had, so it would keep working
+	// right up until the old authority is retired and then stop.
 	//
-	// Widened before it is narrowed: the pool is rebuilt from the bundle BEFORE
-	// the new leaf is verified against it, because a leaf issued by the new
-	// authority does not chain to the old one alone.
+	// Widened before it is narrowed: the pool is built from the bundle BEFORE the
+	// new leaf is checked against it, because a leaf issued by the new authority
+	// does not chain to the old one alone.
+	pool := r.roots.Load()
+
 	if len(caPEM) > 0 {
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(caPEM) {
+		widened, err := poolFrom(caPEM)
+		if err != nil {
 			return errors.New("wirecert: the renewed authority could not be parsed")
 		}
 
+		pool = widened
+	}
+
+	// VERIFIED BEFORE ANY OF IT IS WRITTEN DOWN. Installing on disk first and
+	// checking afterwards leaves the node running on the certificate it already
+	// had — correctly, and with a log line saying so — while the bundle on disk is
+	// the bad one. Nothing is wrong until the process restarts, at which point it
+	// cannot start at all and has to be re-enrolled by hand, which is the outcome
+	// renewal exists to avoid.
+	cert, err := verifiedKeyPair(certPEM, keyPEM, pool)
+	if err != nil {
+		return err
+	}
+
+	if len(caPEM) > 0 {
 		if err := writeAtomic(r.caPath, caPEM, 0o644); err != nil {
 			return err
 		}
-
-		r.roots = pool
 	}
 
 	if err := writeAtomic(r.keyPath, keyPEM, 0o600); err != nil {
@@ -138,7 +225,14 @@ func (r *Rotating) Replace(certPEM, keyPEM, caPEM []byte) error {
 		return err
 	}
 
-	return r.set(certPEM, keyPEM)
+	// THE POOL BEFORE THE LEAF. Between the two stores a handshake sees the new
+	// roots with the old certificate, which still verifies — the bundle carries
+	// both authorities. The other order shows the new certificate to a pool that
+	// cannot chain it.
+	r.roots.Store(pool)
+	r.current.Store(cert)
+
+	return nil
 }
 
 // LeafOf parses the leaf certificate out of a bundle.

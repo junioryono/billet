@@ -25,6 +25,10 @@ import (
 type enrollments struct {
 	mu sync.Mutex
 	by map[string]alloc.Enrollment
+
+	// spendErr stands in for a ledger that cannot answer, which is a different
+	// thing from a credential that is not good.
+	spendErr error
 }
 
 func (e *enrollments) RequestEnrollment(
@@ -65,6 +69,10 @@ func (e *enrollments) LookupEnrollment(_ context.Context, name string) (alloc.En
 // SpendJoinToken accepts anything non-empty: what these tests are about is the
 // enrollment handshake, and the token's own rules have their own test.
 func (e *enrollments) SpendJoinToken(_ context.Context, token string) error {
+	if e.spendErr != nil {
+		return e.spendErr
+	}
+
 	if token == "" {
 		return alloc.ErrBadJoinToken
 	}
@@ -379,5 +387,45 @@ func TestEnrollingNeedsAJoinToken(t *testing.T) {
 
 	if !strings.Contains(err.Error(), "join token") {
 		t.Errorf("the refusal does not say what is missing: %v", err)
+	}
+}
+
+// A LEDGER THAT CANNOT ANSWER IS NOT A CREDENTIAL THAT IS NOT GOOD.
+//
+// Both used to come back as "enrolling needs a join token", and the underlying
+// error was not logged at all — the warning carried the node and the fingerprint
+// and nothing about what actually failed. An operator meeting a locked database
+// during a fleet build-out is told to run `billet ca token`, does, watches the
+// fresh token fail the same way, and has nothing anywhere saying why.
+//
+// The node acts on the difference too: unauthenticated is a verdict and stops
+// it, unavailable is an outage and it keeps asking.
+func TestALedgerOutageIsNotReportedAsAMissingJoinToken(t *testing.T) {
+	t.Parallel()
+
+	ca, base, list := enrollableWire(t)
+
+	list.mu.Lock()
+	list.spendErr = errors.New("database is locked")
+	list.mu.Unlock()
+
+	caPEM, _, err := nodeclient.FetchCA(t.Context(), base, ca.Fingerprint())
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+
+	csrPEM, _, err := wirecert.NewNodeCSR("epyc-1")
+	if err != nil {
+		t.Fatalf("csr: %v", err)
+	}
+
+	_, err = nodeclient.Enroll(t.Context(), base, "epyc-1", "a-token", caPEM, csrPEM)
+	if err == nil {
+		t.Fatal("enrolling succeeded while the ledger could not answer")
+	}
+
+	if strings.Contains(err.Error(), "run `billet ca token`") {
+		t.Errorf("a ledger outage was reported as a missing credential, which sends an "+
+			"operator to mint tokens that cannot help: %v", err)
 	}
 }
