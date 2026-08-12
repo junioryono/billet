@@ -38,14 +38,13 @@ const ManifestTTL = time.Hour
 
 // permissions is the complete set billet requests.
 //
-// Unexported and copied on the way out: it is a security claim, and an exported
-// map is one an importing package could rewrite at runtime — changing the
-// manifest, the CLI's own disclosure, and the post-install validation together.
+// Unexported and copied on the way out: it is a security claim, and an exported map
+// is one an importing package could rewrite at runtime — changing the manifest, the
+// CLI's disclosure and the post-install validation together.
 //
 // Deliberately absent: `actions: read`. It would expose workflow runs, logs and
-// artifacts, and billet needs none of them — it is handed jobs by the scale-set
-// API rather than discovering them. Its absence is what makes "billet cannot
-// read your code" true rather than merely reassuring.
+// artifacts, and billet needs none of them. Its absence is what makes "billet
+// cannot read your code" true rather than reassuring.
 var permissions = map[string]string{
 	"metadata":                         "read",
 	"organization_self_hosted_runners": "write",
@@ -170,17 +169,15 @@ func (a App) GoString() string { return a.String() }
 
 // Format makes EVERY verb safe, not just the ones fmt.Stringer covers.
 //
-// fmt consults Stringer only for %v, %s, %q, %x and %X. A verb it does not
-// recognise for a struct — %d is the easy one to reach for — falls back to
-// formatting the fields recursively, and prints the private key inside its own
-// bad-verb diagnostic. Implementing fmt.Formatter takes precedence over
-// Stringer for all verbs, so there is no verb left that renders the raw struct.
+// fmt consults Stringer only for %v, %s, %q, %x and %X. An unrecognised verb for a
+// struct — %d is the easy one to reach for — falls back to formatting the fields
+// recursively and prints the private key inside its own bad-verb diagnostic.
+// fmt.Formatter takes precedence for all verbs, so no verb renders the raw struct.
 //
-// This does NOT cover an App reached through an unexported field of another
-// struct: fmt uses reflection there and cannot call methods on a value it may
-// not interface. That limitation is intrinsic to fmt, so the claim here is
-// "every direct formatting of an App is safe", not "an App can never be
-// printed".
+// It does NOT cover an App reached through an unexported field of another struct:
+// fmt uses reflection there and cannot call methods on a value it may not
+// interface. The claim is "every direct formatting is safe", not "an App can never
+// be printed".
 func (a App) Format(s fmt.State, verb rune) {
 	// verb is deliberately ignored: the whole point is that NO verb renders the
 	// struct's fields. fmt.State swallows write errors for every other
@@ -193,15 +190,13 @@ func (a App) Format(s fmt.State, verb rune) {
 
 // MarshalJSON keeps credentials out of anything that serializes this struct.
 //
-// fmt.Formatter covers direct formatting and nothing else. billet standardizes
-// on log/slog, and slog's JSON handler uses encoding/json — which reads the
-// exported fields and their tags, emitting `pem`, `webhook_secret` and
-// `client_secret` verbatim. `logger.Info("created", "app", app)` was therefore a
-// full private-key disclosure into whatever the logs go to.
+// fmt.Formatter covers direct formatting and nothing else. slog's JSON handler uses
+// encoding/json, which reads the exported fields and emits `pem`, `webhook_secret`
+// and `client_secret` verbatim — so `logger.Info("created", "app", app)` was a full
+// private-key disclosure into wherever the logs go.
 //
-// Only MARSHALING is redirected. Decoding GitHub's conversion response uses the
-// default unmarshaler and still populates every field, which is what the
-// onboarding flow needs.
+// Only MARSHALING is redirected. Decoding GitHub's response still populates every
+// field, which is what onboarding needs.
 func (a App) MarshalJSON() ([]byte, error) {
 	// A distinct type, not App, or this method recurses forever.
 	type redacted struct {
@@ -430,19 +425,13 @@ const maxErrorDepth = 512
 // sanitize rebuilds an error chain so that NO error reachable from the result
 // renders the one-time code — not merely the outermost one.
 //
-// Sanitizing only the outer message was a boundary that leaked through its own
-// back door: Unwrap handed back the original, so
+// Sanitizing only the outer message leaks through Unwrap: an errors.As for a
+// *url.Error hands back the original with the live URL in it, and so does any error
+// reporter that walks causes.
 //
-//	errors.As(err, &urlErr); log("cause", urlErr)
-//
-// printed the live URL, and so did any error reporter that walks causes and
-// serializes them. The test that guarded this performed exactly that errors.As
-// and never looked at what it extracted.
-//
-// Identity is preserved wherever it can be, because errors.Is and errors.As
-// depend on it — but NOT at a node whose own text carries the secret. A leaf
-// that renders the code is replaced even though that costs its type, because a
-// reachable error holding a live credential is the thing this exists to prevent.
+// Identity is preserved wherever it can be, because errors.Is and errors.As depend
+// on it — but NOT at a node whose own text carries the secret. A leaf that renders
+// the code is replaced even though that costs its type.
 func (s scrubber) sanitize(err error, depth int) error {
 	return s.sanitizeSeen(err, depth, nil)
 }
@@ -454,20 +443,14 @@ func (s scrubber) sanitizeSeen(err error, depth int, seen []uintptr) error {
 		return nil
 	}
 
-	// Both cuts fail CLOSED: nothing below an unexplored node may stay
-	// reachable, so the node is replaced by a scrubbed leaf rather than returned
-	// as-is.
-	// Cycles are tracked by POINTER, never by comparing error values.
+	// Both cuts fail CLOSED: nothing below an unexplored node stays reachable, so it is
+	// replaced by a scrubbed leaf rather than returned as-is.
 	//
-	// `ancestor == err` on two interfaces panics at runtime when the dynamic type
-	// is not comparable — an error struct containing a slice or a map, which is
-	// an ordinary thing to write — so the cycle guard could crash the process it
-	// was added to protect. It also conflated two separately-constructed equal
-	// values with one node.
-	//
-	// Only pointer-shaped errors are tracked, which is no loss: a cycle requires
-	// a node that can refer back to itself, and a non-pointer value cannot. Those
-	// still have the depth bound behind them.
+	// Cycles are tracked by POINTER, never by comparing error values. `ancestor == err`
+	// on two interfaces panics when the dynamic type is not comparable — an error
+	// struct containing a slice or a map — so the cycle guard could crash the process
+	// it protects. Only pointer-shaped errors are tracked, which is no loss: a cycle
+	// needs a node that can refer back to itself.
 	if ptr, ok := errorIdentity(err); ok {
 		for _, ancestor := range seen {
 			if ancestor == ptr {
@@ -579,30 +562,22 @@ func redactedConversionURL(raw string) string {
 
 // conversionError renders a failed conversion WITHOUT echoing the response body.
 //
-// This is the one endpoint in GitHub's whole API that returns the App's private
-// key, and apiError prints either the JSON message or 200 raw bytes of whatever
-// arrived. An intermediary that receives the credential-bearing 201 and forwards
-// it under a rewritten status — a proxy turning an upstream hiccup into a 502 —
-// would put the only copy of the private key on the operator's terminal while
-// also reporting the conversion as failed.
-//
-// So nothing here is rendered verbatim. GitHub's own `message` is passed through
-// because it is what explains an expired code, and only after it is checked for
-// credential material; anything else is withheld and the status stands alone.
+// This is the one endpoint in GitHub's API that returns the App's private key, and
+// apiError prints either the JSON message or 200 raw bytes of whatever arrived. An
+// intermediary that receives the credential-bearing 201 and forwards it under a
+// rewritten status would put the only copy of the private key on the operator's
+// terminal while reporting the conversion as failed.
 func conversionError(status int, _ []byte) error {
 	// NOTHING derived from the body, not even a filtered `message`.
 	//
-	// The first attempt passed `message` through after checking it for markers
-	// like "PRIVATE KEY" and "client_secret". That cannot work: a secret is an
-	// opaque string, and once it is out of its field there is nothing left to
-	// recognise it by. A body of {"message":"whsec-<the actual secret>"} carries
-	// no marker at all and would have been printed verbatim.
+	// Filtering cannot work: a secret is an opaque string, and out of its field there
+	// is nothing to recognise it by — {"message":"whsec-<the actual secret>"} carries
+	// no marker at all.
 	//
-	// The asymmetry decides it. A false positive costs GitHub's explanation and
-	// keeps the status; a false negative puts an unrepeatable private key on the
-	// operator's terminal. So the status is mapped to text billet writes itself,
-	// and the body is never read. Every other endpoint still uses apiError —
-	// this is the only one whose 201 carries a credential.
+	// The asymmetry decides it. A false positive costs GitHub's explanation and keeps
+	// the status; a false negative puts an unrepeatable private key on the operator's
+	// terminal. Every other endpoint still uses apiError — this is the only one whose
+	// 201 carries a credential.
 	var rendered error
 
 	switch status {

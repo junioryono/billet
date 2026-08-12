@@ -11,27 +11,22 @@ import (
 	"github.com/junioryono/billet/internal/server"
 )
 
-// custody is a lease whose capacity must keep being held because compute for it
-// may exist, and which nothing else in this process is managing.
+// custody is a lease whose capacity must keep being held because compute for it may
+// exist, and which nothing else in this process is managing.
 //
-// Two situations produce one, and they are the same situation seen from
-// different sides:
+// Two situations produce one:
 //
-//   - ADOPTED. A container survived a restart. The runner inside it is talking
-//     to GitHub directly and may well finish the job successfully, so destroying
-//     it is a deliberate job failure rather than a recovery. Billet cannot manage
-//     it — no request-id mapping, no completion handling — but it can keep the
-//     lease alive so the capacity is not resold, and clean up when the container
-//     stops.
+//   - ADOPTED. A container survived a restart. The runner inside is talking to
+//     GitHub directly and may finish successfully, so destroying it is a deliberate
+//     job failure rather than a recovery. billet cannot manage it, but it can keep
+//     the lease alive so the capacity is not resold.
 //
-//   - DISCARDED. A launch failed ambiguously and the cleanup could not be
-//     confirmed. The container may or may not exist; until billet knows it does
-//     not, its capacity must stay held. This is the case where releasing the
-//     lease on a launch error was quietly over-committing the host.
+//   - DISCARDED. A launch failed ambiguously and cleanup could not be confirmed.
+//     Until billet knows the container does not exist, its capacity stays held.
 //
-// Both need the same two things: a heartbeat so the reaper does not terminalize
-// the lease, and a repeated attempt to find out what happened. The only
-// difference is what a still-running instance means — leave it, or kill it.
+// Both need a heartbeat so the reaper does not terminalize the lease, and a repeated
+// attempt to find out what happened. The only difference is what a still-running
+// instance means — leave it, or kill it.
 type custody struct {
 	leaseID  string
 	epoch    int64
@@ -61,16 +56,13 @@ type custody struct {
 
 	// observed is true once billet has actually seen this instance exist.
 	//
-	// SEPARATE FROM discard, and conflating the two was a bug. The grace period
-	// before an absence is believed exists for compute that may never have
-	// started: a create whose response was lost can still be in flight inside the
-	// daemon. It has nothing to say about an instance billet WATCHED running and
-	// then found gone — that one has genuinely finished, and making it wait out
-	// the grace held its capacity for a minute after its job was over.
+	// SEPARATE FROM discard. The grace before an absence is believed exists for compute
+	// that may never have started — a create whose response was lost can still be in
+	// flight inside the daemon. It says nothing about an instance billet WATCHED
+	// running and then found gone, which has genuinely finished.
 	//
-	// Because discard flips to true when a completion arrives, checking it alone
-	// applied the stray grace to every adopted job at exactly the moment it
-	// finished.
+	// Since discard flips to true when a completion arrives, checking it alone applies
+	// the stray grace to every adopted job at the moment it finishes.
 	observed bool
 
 	// since is when custody was taken, for the diagnostic that matters most: how
@@ -98,21 +90,14 @@ func (r *Runner) adopt(lease *alloc.Lease, inst *provider.Instance) {
 
 // hold takes custody of a lease whose compute could not be confirmed gone.
 //
-// The instance id is not required and usually not known: the whole reason this
-// exists is that Find could not answer. The name is enough, because the name is
-// what identifies the instance to the backend.
+// The instance id is not required and usually not known: the reason this exists is
+// that Find could not answer. The name identifies the instance to the backend.
 //
-// THE REQUEST ID IS PASSED IN, NOT READ OFF THE LEASE, and that is not a style
-// choice. Assign writes the request id to SQLite without touching the caller's
-// in-memory Lease, so the pointer a listener holds still carries RequestID 0 —
-// every discarded entry was being filed under request 0. A later assignment for
-// the real request then walked straight past heldForRequest and started a second
-// runner, and a completion for it could never find the entry at all.
-//
-// The unit tests could not see this because their helper writes the id back onto
-// the struct by hand, which no production path does. The same stale-pointer trap
-// bit a test in this package an hour earlier; I fixed it there and did not think
-// to look for it here.
+// THE REQUEST ID IS PASSED IN, NOT READ OFF THE LEASE. Assign writes it to SQLite
+// without touching the caller's in-memory Lease, so the pointer a listener holds
+// still carries RequestID 0 — every discarded entry filed under request 0. A later
+// assignment for the real request then walks past heldForRequest and starts a
+// second runner, and a completion can never find the entry at all.
 func (r *Runner) hold(lease *alloc.Lease, name string, requestID int64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

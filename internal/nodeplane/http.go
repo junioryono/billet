@@ -66,16 +66,14 @@ type HandlerOption func(*handler)
 
 // RequireClientCert makes a verified certificate the source of a node's name.
 //
-// WITHOUT IT THE PATH IS THE ONLY AUTHORITY, which is not authentication at all:
-// any process that can reach the listener claims to be any node, binds its
-// leases, takes its commands, and asks for a JIT registration — a credential
-// that registers a runner against the organisation. That is why a wire served
-// without this refuses to bind anywhere but loopback.
+// WITHOUT IT THE PATH IS THE ONLY AUTHORITY, which is not authentication: any
+// process that can reach the listener claims to be any node, binds its leases,
+// takes its commands, and asks for a JIT registration — a credential that registers
+// a runner against the organisation. A wire served without this refuses to bind
+// anywhere but loopback.
 //
-// With it, the name in the certificate decides, and a request whose path
-// disagrees is rejected rather than reconciled. Two authorities for one fact is
-// how this codebase's worst bugs have started, and an authenticated identity is
-// the one place it must not happen.
+// With it the certificate decides, and a request whose path disagrees is rejected
+// rather than reconciled.
 func RequireClientCert() HandlerOption {
 	return func(h *handler) { h.requireCert = true }
 }
@@ -264,20 +262,15 @@ func (h *handler) forNode(next http.HandlerFunc) http.HandlerFunc {
 // forOwnLease wraps every route that touches ONE named lease.
 //
 // A superseded process may finish what it was given and nothing else. Between an
-// incarnation and its replacement the node name and the certificate are
-// identical, so a permission keyed on either lets one host act on the other's
-// work: releasing capacity a running container is using, or advancing a lease it
-// never received.
+// incarnation and its replacement the node name and the certificate are identical,
+// so a permission keyed on either lets one host release capacity a running
+// container is using.
 //
-// RENEWAL IS HERE TOO, and the argument for leaving it out was wrong. "A
-// heartbeat only extends a lease" is true of one heartbeat and false of a
-// process that keeps sending them: repeated renewal does not hold capacity
-// slightly longer, it denies it indefinitely. If the current process dies before
-// releasing, the reaper is the mechanism that reclaims — and a superseded
-// process renewing that lease forever is precisely what stops it.
-//
-// Reads are here for the same reason: a lease id and its epoch are what a
-// release needs, and handing them out defeats the check on the release itself.
+// RENEWAL IS HERE TOO: "a heartbeat only extends a lease" is true of one heartbeat
+// and false of a process that keeps sending them. Repeated renewal does not hold
+// capacity slightly longer, it denies it indefinitely, and the reaper is what
+// reclaims when the current process dies. Reads are here for the same reason — a
+// lease id and its epoch are what a release needs.
 func (h *handler) forOwnLease(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		node := r.PathValue("node")
@@ -312,23 +305,18 @@ func (h *handler) forOwnLease(next http.HandlerFunc) http.HandlerFunc {
 
 // forNewWork wraps a route by which a node ACQUIRES work or capacity.
 //
-// SUPERSEDING A NODE MUST NOT SILENCE IT, and treating every route alike was a
-// way to lose a lease outright. A host that is superseded — a copied bundle
-// arriving on a second machine — may well be holding a container right now. It
-// is refused new work, because two hosts under one name cannot both be given
-// work. It is NOT refused the calls that maintain and conclude what it already
-// has: the heartbeat that keeps its lease alive, and the result that hands
-// custody over.
+// SUPERSEDING A NODE MUST NOT SILENCE IT. A superseded host may be holding a
+// container right now: it is refused new work, because two hosts under one name
+// cannot both be given work, but NOT the calls that maintain and conclude what it
+// already has.
 //
-// Fencing those was worse than not fencing at all. Registration tells the
-// listener the node has custody, so the listener stops heartbeating; if the
-// superseded process can then neither renew nor report, the lease expires while
-// its container runs and the capacity is resold. The tombstone recorded for
-// exactly that report becomes unreachable by the only process that could consume
-// it.
+// Fencing those is worse than not fencing at all. Registration tells the listener
+// the node has custody, so the listener stops heartbeating; if the superseded
+// process can then neither renew nor report, the lease expires while its container
+// runs and the capacity is resold.
 //
-// The same distinction the expiry rules needed, one layer over: eligibility for
-// NEW work and permission to maintain EXISTING work have different lifetimes.
+// Eligibility for NEW work and permission to maintain EXISTING work have different
+// lifetimes.
 func (h *handler) forNewWork(next http.HandlerFunc) http.HandlerFunc {
 	return h.guard(next, true)
 }
