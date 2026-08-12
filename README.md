@@ -186,7 +186,8 @@ built. What works **today**:
 | `billet ca token` | Mints the short-lived credential a machine needs to ask |
 | `billet ca show` | The authority's fingerprint, expiry, and whether a rotation is running |
 | `billet ca issue <node>` | Mints a certificate directly, for a machine you are provisioning anyway |
-| `billet ca revoke <node>` | Withdraws a certificate; refused on the next request it makes |
+| `billet nodes revoke <node>` | Withdraws every credential that machine holds, renewals included |
+| `billet ca revoke <node> --cert <path>` | Withdraws one specific certificate |
 | `billet ca rotate` / `retire` | Replaces the authority as an overlap, so no node is cut off |
 | `billet teardown` | Removes the scale sets billet created |
 | Capacity ledger | Lease state machine, fencing epochs, placement enforcement, escrow before advertising |
@@ -266,7 +267,7 @@ The name in the certificate is the only thing that decides which node a request 
 
 **Certificates renew themselves** when less than a third of their life remains, over the wire, with the private key never leaving the node. A certificate that has already expired cannot renew — renewal is authenticated by the certificate being renewed — so that machine has to be re-enrolled; the window is months, so it only happens to a host that was powered off throughout.
 
-**Taking one back:** `billet ca revoke <node>` refuses it on the very next request it makes, rather than at its expiry.
+**Taking one back:** `billet nodes revoke <node>` withdraws every credential that machine currently holds, and each is refused on the very next request it makes rather than at its expiry. Revoke the **node**, not a file — because a node renews itself, the bundle you issued names a serial it stopped presenting months ago, and taking that one back would report success and change nothing. A certificate issued afterwards is unaffected, so a rebuilt machine can keep its name. `billet ca revoke <node> --cert <path>` still withdraws one specific credential when that is what you mean.
 
 **Replacing the authority** is an overlap rather than a switch, because a node trusts what it was given: `billet ca rotate` has the new authority issue node certificates while the old one still signs what the server presents and both stay trusted, nodes adopt the new one as they renew, and `billet ca retire` ends it once they have.
 

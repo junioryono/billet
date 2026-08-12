@@ -624,11 +624,40 @@ var joinTokenMigration = migration{
 	},
 }
 
+// A CREDENTIAL CAN ONLY BE TAKEN BACK IF BILLET KNOWS IT EXISTS.
+//
+// Revocation is by serial, and a serial names one certificate. That is the right
+// granularity — a node name is legitimately re-issued to a replacement machine,
+// so revoking the name would refuse the replacement too — but it only works if
+// every serial in circulation is written down. Renewal minted a fresh key and
+// serial, returned it, and recorded nothing, so a node that had renewed once
+// held a credential the control plane could not name. An operator revoking the
+// bundle they issued took back a serial nobody was presenting, was told it would
+// be refused on its next request, and the host carried on registering, binding
+// leases and asking for JIT runner registrations.
+var issuedCertMigration = migration{
+	Version: 15,
+	Name:    "issued_certs",
+	Stmts: []string{
+		`CREATE TABLE issued_certs (
+			serial     TEXT PRIMARY KEY,
+			node       TEXT NOT NULL,
+			-- enrolled | issued | renewed: how this credential came to exist,
+			-- which is what an operator reads when deciding what to take back.
+			source     TEXT NOT NULL,
+			not_after  TEXT NOT NULL,
+			issued_at  TEXT NOT NULL
+		) STRICT`,
+		`CREATE INDEX idx_issued_certs_node ON issued_certs (node)`,
+	},
+}
+
 func init() {
 	migrations = append(migrations,
 		placementMigration, guestOSMigration, placementFactsMigration, requestIDMigration,
 		providerListMigration, nodeSiteMigration, nodeLivenessMigration,
-		certRevocationMigration, nodeEnrollmentMigration, joinTokenMigration)
+		certRevocationMigration, nodeEnrollmentMigration, joinTokenMigration,
+		issuedCertMigration)
 }
 
 const bootstrapSchemaMigrations = `CREATE TABLE IF NOT EXISTS schema_migrations (

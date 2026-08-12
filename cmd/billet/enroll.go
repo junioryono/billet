@@ -27,7 +27,7 @@ const enrollPollEvery = 5 * time.Second
 func cmdNodes(ctx context.Context, args []string) error {
 	if len(args) == 0 {
 		return errors.New("usage: billet nodes pending | billet nodes approve <node> --fingerprint <fp> | " +
-			"billet nodes deny <node> --fingerprint <fp>")
+			"billet nodes deny <node> --fingerprint <fp> | billet nodes revoke <node>")
 	}
 
 	switch args[0] {
@@ -37,9 +37,68 @@ func cmdNodes(ctx context.Context, args []string) error {
 		return cmdNodesDecide(ctx, args[1:], alloc.EnrollApproved)
 	case "deny":
 		return cmdNodesDecide(ctx, args[1:], alloc.EnrollDenied)
+	case "revoke":
+		return cmdNodesRevoke(ctx, args[1:])
 	}
 
-	return fmt.Errorf("unknown nodes command %q; try pending, approve or deny", args[0])
+	return fmt.Errorf("unknown nodes command %q; try pending, approve, deny or revoke", args[0])
+}
+
+// cmdNodesRevoke takes back every credential a machine currently holds.
+//
+// THE HANDLE AN OPERATOR ACTUALLY HAS. `billet ca revoke` names one serial, read
+// out of the bundle that was issued — and a node renews itself, so after the
+// first renewal that file describes a credential the machine stopped presenting
+// months ago. Revoking it succeeds, says the certificate will be refused on its
+// next request, and changes nothing: the host keeps registering, binding leases
+// and drawing JIT registrations against the organisation.
+//
+// A REPLACEMENT UNDER THE SAME NAME IS UNAFFECTED, which is why this is not the
+// same as banning a name. It revokes the serials outstanding at this moment; a
+// certificate issued afterwards is not one of them.
+func cmdNodesRevoke(ctx context.Context, args []string) error {
+	fs := newFlagSet("billet nodes revoke")
+	cfgPath := addConfigFlag(fs)
+	reason := fs.String("reason", "", "why, recorded alongside it")
+
+	name, err := parseWithName(fs, args)
+	if err != nil {
+		return err
+	}
+
+	if name == "" {
+		return errors.New("usage: billet nodes revoke <node> [--reason why]")
+	}
+
+	a, closeDB, err := controlPlaneAllocator(ctx, *cfgPath)
+	if err != nil {
+		return err
+	}
+
+	defer closeDB()
+
+	revoked, err := a.RevokeNode(ctx, name, *reason)
+	if err != nil {
+		return err
+	}
+
+	if len(revoked) == 0 {
+		fmt.Printf("%s holds no certificate this deployment issued, so there is nothing to "+
+			"take back.\n", name)
+
+		return nil
+	}
+
+	fmt.Printf("Revoked %d certificate(s) held by %s:\n\n", len(revoked), name)
+
+	for i := range revoked {
+		fmt.Printf("  %s  %s  expires %s\n", revoked[i].Serial, revoked[i].Source, revoked[i].NotAfter)
+	}
+
+	fmt.Printf("\nEach is refused on the next request it makes. Issue a replacement with\n")
+	fmt.Printf("`billet ca issue %s` if the machine is coming back.\n", name)
+
+	return nil
 }
 
 // cmdNodesPending lists machines waiting to be let in.
@@ -164,6 +223,13 @@ func cmdNodesDecide(ctx context.Context, args []string, decision string) error {
 			return err
 		}
 
+		// RECORDED BEFORE IT IS HANDED OVER. Revocation names a serial, so a
+		// credential billet never wrote down cannot be taken back — and this is
+		// the first of the three ways one comes into existence.
+		if err := recordIssuedCert(ctx, a, bundle, name, alloc.CertEnrolled); err != nil {
+			return err
+		}
+
 		certPEM = string(bundle.CertPEM)
 	}
 
@@ -180,6 +246,29 @@ func cmdNodesDecide(ctx context.Context, args []string, decision string) error {
 	}
 
 	return nil
+}
+
+// recordIssuedCert writes a credential into the list revocation reads.
+//
+// EVERY WAY A CERTIFICATE COMES INTO EXISTENCE GOES THROUGH HERE — approval,
+// `billet ca issue`, and renewal over the wire. Revocation is keyed on serial,
+// which is the right granularity because a node name is legitimately re-issued
+// to a replacement machine; the cost is that a serial billet does not know about
+// is a credential it cannot take back.
+func recordIssuedCert(
+	ctx context.Context, a *alloc.Allocator, bundle wirecert.Bundle, node, source string,
+) error {
+	leaf, err := wirecert.LeafOf(bundle)
+	if err != nil {
+		return fmt.Errorf("read back the certificate just issued to %s: %w", node, err)
+	}
+
+	return a.RecordIssuedCert(ctx, alloc.IssuedCert{
+		Serial:   wirecert.Serial(leaf),
+		Node:     node,
+		Source:   source,
+		NotAfter: leaf.NotAfter.UTC().Format(time.RFC3339),
+	})
 }
 
 // controlPlaneAllocator opens the ledger for a command that runs on the server.
