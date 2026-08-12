@@ -521,7 +521,7 @@ func renewIfDue(ctx context.Context, c *Client, log *slog.Logger, opts LoopOptio
 		return
 	}
 
-	certPEM, keyPEM, err := c.Renew(ctx, c.node)
+	certPEM, keyPEM, caPEM, err := c.Renew(ctx, c.node)
 	if err != nil {
 		log.Warn("could not renew this node's certificate; will try again",
 			"expires_in", left.Round(time.Hour), "error", err)
@@ -529,7 +529,7 @@ func renewIfDue(ctx context.Context, c *Client, log *slog.Logger, opts LoopOptio
 		return
 	}
 
-	if err := opts.Identity.Replace(certPEM, keyPEM); err != nil {
+	if err := opts.Identity.Replace(certPEM, keyPEM, caPEM); err != nil {
 		// The OLD certificate is still in force: Replace verifies before it
 		// installs, so a bad renewal leaves a working node working.
 		log.Error("the control plane signed a certificate this node cannot use; keeping the "+

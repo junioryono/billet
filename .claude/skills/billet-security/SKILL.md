@@ -128,7 +128,16 @@ The older path still works and is right for a machine you are provisioning anywa
 
 A leaf may not outlive its authority, so once the CA has less than a leaf's lifetime left, every certificate it issues is quietly SHORTER than the last. Renewals keep working and come round faster and faster; nothing errors; and then every node expires on the day the authority does. `billet ca show` warns once that starts, because it is invisible otherwise.
 
-Rotating is an overlap, not a switch: issue a new authority, keep trusting the old one while nodes pick the new one up through renewal, retire the old one after. That is why the renewal response carries the CA alongside the certificate. The overlap itself is not built yet.
+**Rotating is an overlap, not a switch**, and the ordering is the whole design. A node trusts the authority it was given, so the moment the control plane PRESENTS a certificate from a new one, every node that has not yet heard about it fails to verify the server and drops out — over the wire it would need in order to recover. There is no way back from that remotely.
+
+Two phases:
+
+- `billet ca rotate` — the new authority issues node certificates; the OLD one still signs what the control plane presents; both are trusted for clients. Nodes adopt the new one through ordinary renewal, which carries the trust bundle alongside the certificate. Restart the control plane to pick it up.
+- `billet ca retire --force` — once every node has renewed. A node that missed the whole overlap has to be re-enrolled, which is why this is a command an operator runs when they can see the fleet has moved rather than something on a timer.
+
+A second rotation while one is running is refused: there is one previous authority, and starting another would drop the one the un-renewed fleet still trusts.
+
+Two implementation details that are load-bearing. `createCA` writes with `O_EXCL` and falls back to LOADING the existing authority when a key is already there — right for two processes racing to initialise, and it silently makes a rotation a no-op, so `Rotate` mints aside and renames into place. And `Rotate` must not clear the CA files and call `LoadOrCreateCA`: that leaves the authority momentarily missing while its marker says one exists here, which is exactly the state `ErrAuthorityLost` refuses.
 
 The control plane is its own CA: on first non-loopback start it creates a per-deployment authority in `server.state_dir`, 10-year life, private key never leaving that machine. `billet ca issue <name>` mints a leaf for that name, 1-year life. The operator copies the bundle to the node out of band. On connect, `tls.RequireAndVerifyClientCert` with that CA as the only client-CA pool means a certificate this deployment did not sign never reaches a handler, and `RequireClientCert` makes the CN authoritative — a request whose PATH names a different node is rejected rather than reconciled. Registration then checks the protocol version, that the deployment id matches, that the site was declared, and that the contribution is non-zero.
 

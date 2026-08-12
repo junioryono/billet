@@ -615,13 +615,38 @@ func serveNodeWire(
 			return nil, err
 		}
 
-		bundle, err := ca.IssueServer(hosts)
+		// SIGNED BY THE AUTHORITY THE FLEET STILL TRUSTS. During a rotation that
+		// is the PREVIOUS one: a node that has not renewed yet knows only that, and
+		// presenting a certificate from the new authority would make the control
+		// plane unverifiable to it — over the very wire it would need to recover.
+		// The server follows the fleet rather than leading it.
+		serving, err := wirecert.ServingCA(cfg.Server.StateDir, deployment, ca)
 		if err != nil {
 			return nil, err
 		}
 
+		bundle, err := serving.IssueServer(hosts)
+		if err != nil {
+			return nil, err
+		}
+
+		// AND EVERY AUTHORITY IS TRUSTED FOR CLIENTS, so a node holding either an
+		// old or a new certificate is recognised while the overlap runs.
+		trust, err := wirecert.TrustBundle(cfg.Server.StateDir, ca)
+		if err != nil {
+			return nil, err
+		}
+
+		bundle.CAPEM = trust
+
 		if tlsConf, err = wirecert.ServerTLS(bundle); err != nil {
 			return nil, err
+		}
+
+		if age, rotating := wirecert.RotationAge(cfg.Server.StateDir); rotating {
+			slog.Default().Warn("a certificate authority rotation is running; nodes adopt the "+
+				"new one as they renew, and `billet ca retire` finishes it once they all have",
+				"started", age.Round(time.Hour))
 		}
 
 		handlerOpts = append(handlerOpts,
@@ -633,6 +658,7 @@ func serveNodeWire(
 			// AND RENEWED BEFORE IT EXPIRES, by the node itself. Without this a
 			// fleet enrolled on one afternoon expires on one afternoon a year later.
 			nodeplane.WithRenewal(ca),
+			nodeplane.WithTrustBundle(trust),
 			// AND A WAY IN FOR A MACHINE THAT HAS NOTHING YET. Asking grants
 			// nothing: the request waits until an operator compares its fingerprint
 			// against what the node printed.
@@ -1143,7 +1169,8 @@ func confirmOrganization(ctx context.Context, org string) error {
 func cmdCA(ctx context.Context, args []string) error {
 	if len(args) == 0 {
 		return errors.New("usage: billet ca issue <node> [--out <dir>] | billet ca token | " +
-			"billet ca revoke <node> | billet ca revocations | billet ca show")
+			"billet ca rotate | billet ca retire | billet ca revoke <node> | " +
+			"billet ca revocations | billet ca show")
 	}
 
 	switch args[0] {
@@ -1155,11 +1182,17 @@ func cmdCA(ctx context.Context, args []string) error {
 		return cmdCARevocations(ctx, args[1:])
 	case "token":
 		return cmdCAToken(ctx, args[1:])
+	case "rotate":
+		return cmdCARotate(args[1:])
+	case "retire":
+		return cmdCARetire(args[1:])
 	case "show":
 		return cmdCAShow(args[1:])
 	}
 
-	return fmt.Errorf("unknown ca command %q; try issue, token, revoke, revocations or show", args[0])
+	return fmt.Errorf(
+		"unknown ca command %q; try issue, token, rotate, retire, revoke, revocations or show",
+		args[0])
 }
 
 // cmdCARevoke withdraws a node's certificate.

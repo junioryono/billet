@@ -26,6 +26,8 @@ type Rotating struct {
 	// paths are where the bundle lives, so a renewal survives a restart.
 	certPath, keyPath, caPath string
 
+	// roots is what this node verifies the control plane against. Replaced by a
+	// renewal that carries a wider bundle, which is how a CA rotation propagates.
 	roots *x509.CertPool
 }
 
@@ -105,7 +107,29 @@ func (r *Rotating) ClientTLS() *tls.Config {
 // The key is written 0600 and the certificate 0644: one is a secret and the
 // other is public, and giving them the same mode teaches the wrong lesson to
 // whoever copies this next.
-func (r *Rotating) Replace(certPEM, keyPEM []byte) error {
+func (r *Rotating) Replace(certPEM, keyPEM, caPEM []byte) error {
+	// THE AUTHORITY FIRST, and this is what makes a CA rotation reach a node at
+	// all. A renewal during an overlap carries a trust bundle holding both the
+	// new authority and the old one; adopting the certificate without the bundle
+	// would leave this node trusting only what it already had, so it would keep
+	// working right up until the old authority is retired and then stop.
+	//
+	// Widened before it is narrowed: the pool is rebuilt from the bundle BEFORE
+	// the new leaf is verified against it, because a leaf issued by the new
+	// authority does not chain to the old one alone.
+	if len(caPEM) > 0 {
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(caPEM) {
+			return errors.New("wirecert: the renewed authority could not be parsed")
+		}
+
+		if err := writeAtomic(r.caPath, caPEM, 0o644); err != nil {
+			return err
+		}
+
+		r.roots = pool
+	}
+
 	if err := writeAtomic(r.keyPath, keyPEM, 0o600); err != nil {
 		return err
 	}

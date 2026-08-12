@@ -342,3 +342,109 @@ func cmdCAToken(ctx context.Context, args []string) error {
 
 	return nil
 }
+
+// cmdCARotate starts replacing the deployment's authority.
+//
+// PHASE ONE OF TWO. From here the new authority issues node certificates while
+// the OLD one still signs what the control plane presents, and both are trusted.
+// Nodes adopt the new one through ordinary renewal, which carries the trust
+// bundle alongside the certificate.
+//
+// Nothing breaks at this point, and nothing is finished either: `billet ca
+// retire` is what ends it, and running that before the fleet has renewed is what
+// would cut a node off.
+func cmdCARotate(args []string) error {
+	fs := newFlagSet("billet ca rotate")
+	cfgPath := addConfigFlag(fs)
+
+	if err := parse(fs, args); err != nil {
+		return err
+	}
+
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		return err
+	}
+
+	if cfg.Server == nil {
+		return errors.New("rotating is done on the control plane, and this config has no server section")
+	}
+
+	deployment, err := state.DeploymentID(cfg.Server.StateDir)
+	if err != nil {
+		return err
+	}
+
+	ca, err := wirecert.Rotate(cfg.Server.StateDir, deployment)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Rotated. The new authority is %s\n\n", ca.Fingerprint())
+	fmt.Printf("  new node certificates are issued by it\n")
+	fmt.Printf("  the previous authority still signs what the control plane presents\n")
+	fmt.Printf("  both are trusted, so nothing has to be restarted in a hurry\n\n")
+	fmt.Printf("Restart the control plane to pick this up, then let nodes renew. Watch\n")
+	fmt.Printf("`billet ca show` until nothing is left on the old authority, and finish with:\n\n")
+	fmt.Printf("  billet ca retire --config %s\n\n", *cfgPath)
+	fmt.Printf("A node that never renews during the overlap has to be re-enrolled, which is\n")
+	fmt.Printf("why retiring is yours to run rather than something that happens on a timer.\n")
+
+	return nil
+}
+
+// cmdCARetire finishes a rotation by dropping the old authority.
+func cmdCARetire(args []string) error {
+	fs := newFlagSet("billet ca retire")
+	cfgPath := addConfigFlag(fs)
+	force := fs.Bool("force", false, "retire even though a node may not have renewed")
+
+	if err := parse(fs, args); err != nil {
+		return err
+	}
+
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		return err
+	}
+
+	if cfg.Server == nil {
+		return errors.New("retiring is done on the control plane, and this config has no server section")
+	}
+
+	prev, _, err := wirecert.PreviousCA(cfg.Server.StateDir)
+	if err != nil {
+		return err
+	}
+
+	if prev == nil {
+		fmt.Println("No rotation is running; there is nothing to retire.")
+
+		return nil
+	}
+
+	// THE OPERATOR CONFIRMS, because billet cannot see what it needs to. A node
+	// that has not renewed still trusts only the old authority, and retiring it
+	// makes the control plane unverifiable to that node — over the wire it would
+	// need in order to recover.
+	if !*force {
+		age, _ := wirecert.RotationAge(cfg.Server.StateDir)
+
+		fmt.Printf("This rotation started %s ago.\n\n", age.Round(time.Hour))
+		fmt.Printf("Every node has to have renewed since then. A node that has not still trusts\n")
+		fmt.Printf("only the old authority, and retiring it means that node can no longer verify\n")
+		fmt.Printf("this control plane — it would have to be re-enrolled by hand.\n\n")
+		fmt.Printf("Re-run with --force when you have checked.\n")
+
+		return nil
+	}
+
+	if err := wirecert.Retire(cfg.Server.StateDir); err != nil {
+		return err
+	}
+
+	fmt.Println("Retired the previous authority. Restart the control plane to present a")
+	fmt.Println("certificate from the new one.")
+
+	return nil
+}

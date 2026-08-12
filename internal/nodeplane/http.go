@@ -129,6 +129,12 @@ func WithRenewal(ca *wirecert.CA) HandlerOption {
 	return func(h *handler) { h.ca = ca }
 }
 
+// WithTrustBundle sets every authority a node should accept, which during a
+// rotation is more than one.
+func WithTrustBundle(pem []byte) HandlerOption {
+	return func(h *handler) { h.trust = pem }
+}
+
 // Handler serves the node wire.
 //
 // Every route that acts for a node is wrapped in forNode, and that is deliberate
@@ -191,6 +197,7 @@ type handler struct {
 	// All three are nil on a loopback wire, which has no certificates.
 	revocations Revocations
 	ca          *wirecert.CA
+	trust       []byte
 	enrollments Enrollments
 
 	// sets caches the resolved scale set per tier.
@@ -475,7 +482,7 @@ func (h *handler) certificateAuthority(w http.ResponseWriter, _ *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, nodeapi.CAResponse{
-		CAPEM:       string(h.ca.CertPEM()),
+		CAPEM:       string(h.trustBundle()),
 		Fingerprint: h.ca.Fingerprint(),
 		Deployment:  h.plane.deployment,
 	})
@@ -559,7 +566,7 @@ func (h *handler) enroll(w http.ResponseWriter, r *http.Request) {
 
 	if enrollment.State == alloc.EnrollApproved {
 		res.CertPEM = enrollment.CertPEM
-		res.CAPEM = string(h.ca.CertPEM())
+		res.CAPEM = string(h.trustBundle())
 	}
 
 	if enrollment.State == alloc.EnrollPending {
@@ -578,6 +585,19 @@ func (h *handler) knownEnrollment(ctx context.Context, name, fingerprint string)
 	existing, found, err := h.enrollments.LookupEnrollment(ctx, name)
 
 	return err == nil && found && existing.Fingerprint == fingerprint
+}
+
+// trustBundle is every authority a node should accept.
+//
+// Set by the caller, because only it knows where the state directory is. Falls
+// back to the issuing authority alone, which is the ordinary case: no rotation
+// is running and there is nothing else to trust.
+func (h *handler) trustBundle() []byte {
+	if len(h.trust) > 0 {
+		return h.trust
+	}
+
+	return h.ca.CertPEM()
 }
 
 // renew signs a new certificate for a node that already has a valid one.
@@ -619,9 +639,13 @@ func (h *handler) renew(w http.ResponseWriter, r *http.Request) {
 
 	h.log.Info("renewed a node certificate", "node", node)
 
+	// THE BUNDLE, NOT ONE CERTIFICATE. A renewal during a rotation is how the new
+	// authority reaches a node at all: it adopts what this carries, so carrying
+	// only the issuing one would leave it trusting nothing else and it would stop
+	// the moment the old authority is retired.
 	writeJSON(w, http.StatusOK, nodeapi.RenewResponse{
 		CertPEM: string(bundle.CertPEM),
-		CAPEM:   string(bundle.CAPEM),
+		CAPEM:   string(h.trustBundle()),
 	})
 }
 
