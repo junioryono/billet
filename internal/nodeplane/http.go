@@ -98,6 +98,23 @@ func WithRevocations(r Revocations) HandlerOption {
 	return func(h *handler) { h.revocations = r }
 }
 
+// Enrollments records machines asking to join and what was decided about them.
+type Enrollments interface {
+	RequestEnrollment(ctx context.Context, name, fingerprint, csrPEM string) (alloc.Enrollment, error)
+}
+
+// WithEnrollment lets a machine ask to join without already holding a
+// certificate.
+//
+// The alternative — and what billet did before — is that admission happens
+// entirely out of band: an operator runs `billet ca issue` and copies a bundle
+// to the machine. That works, and it is not discoverable: a node that is powered
+// on and pointed at a control plane appears nowhere until somebody already knows
+// it exists.
+func WithEnrollment(e Enrollments) HandlerOption {
+	return func(h *handler) { h.enrollments = e }
+}
+
 // WithRenewal lets a node replace its own certificate before it expires.
 //
 // AUTHENTICATED BY THE CERTIFICATE BEING REPLACED, so this grants nothing: a
@@ -123,6 +140,13 @@ func Handler(log *slog.Logger, p *Plane, store LeaseStore, jit JITSource, opts .
 	}
 
 	mux := http.NewServeMux()
+
+	// UNAUTHENTICATED, both of them, and deliberately outside forNode. A machine
+	// that has never enrolled has no certificate to present, and a node deciding
+	// whether to trust this control plane has to be able to read its authority
+	// before it trusts anything it says.
+	mux.HandleFunc("POST /v1/enroll", h.enroll)
+	mux.HandleFunc("GET /v1/ca", h.certificateAuthority)
 
 	mux.HandleFunc("POST /v1/register", h.register)
 	// THREE CLASSES, and the distinction is what a request can REACH.
@@ -159,10 +183,12 @@ type handler struct {
 	jit         JITSource
 	requireCert bool
 
-	// revocations answers whether a credential has been withdrawn, and ca signs
-	// a renewal. Both are nil on a loopback wire, which has no certificates.
+	// revocations answers whether a credential has been withdrawn, ca signs
+	// renewals and enrollments, and enrollments records who is asking to join.
+	// All three are nil on a loopback wire, which has no certificates.
 	revocations Revocations
 	ca          *wirecert.CA
+	enrollments Enrollments
 
 	// sets caches the resolved scale set per tier.
 	//
@@ -331,12 +357,11 @@ func (h *handler) authorise(w http.ResponseWriter, r *http.Request, claimed stri
 		return true
 	}
 
-	// BELT AND BRACES. tls.RequireAndVerifyClientCert means an unverified
-	// connection never reaches a handler, so this branch should be unreachable —
-	// which is precisely why it is here. If some future wiring serves this mux
-	// over a listener that does not require certificates, the failure must be a
-	// refusal rather than every request silently authenticating as whatever the
-	// path says.
+	// THE LOAD-BEARING CHECK, not a formality. The listener verifies a
+	// certificate IF one is given but does not require one, because an unenrolled
+	// machine has none and still has to reach /v1/enroll and /v1/ca. So this is
+	// what separates those two routes from every other: anything wrapped in a
+	// guard refuses a connection with no verified chain.
 	if r.TLS == nil || len(r.TLS.VerifiedChains) == 0 || len(r.TLS.PeerCertificates) == 0 {
 		writeErr(w, http.StatusUnauthorized, nodeapi.CodeUnauthenticated,
 			"this wire requires a client certificate issued by the deployment's authority")
@@ -427,6 +452,103 @@ func (h *handler) warnIfExpiring(r *http.Request, node string) {
 			"node", node, "expires_in", left.Round(time.Hour),
 			"not_after", r.TLS.PeerCertificates[0].NotAfter)
 	}
+}
+
+// certificateAuthority serves the authority a node verifies this control plane
+// against.
+//
+// PUBLIC BY CONSTRUCTION. A CA certificate is presented in every handshake and
+// already sits on every enrolled node; serving it reveals nothing. The security
+// is entirely in what the NODE does with it: compare the fingerprint against a
+// value an operator read off the server and gave it out of band. A node that
+// skips that comparison has trusted whatever answered, which is why the client
+// refuses to enroll without one.
+func (h *handler) certificateAuthority(w http.ResponseWriter, _ *http.Request) {
+	if h.ca == nil {
+		writeErr(w, http.StatusNotFound, nodeapi.CodeRefused,
+			"this control plane has no certificate authority; it serves a loopback wire")
+
+		return
+	}
+
+	writeJSON(w, http.StatusOK, nodeapi.CAResponse{
+		CAPEM:       string(h.ca.CertPEM()),
+		Fingerprint: h.ca.Fingerprint(),
+		Deployment:  h.plane.deployment,
+	})
+}
+
+// enroll records a machine asking to join, and hands back a certificate once an
+// operator has approved it.
+//
+// ASKING GRANTS NOTHING. The request sits as `pending` until an operator
+// compares the fingerprint it reports against the one the node printed on its
+// own console and approves that exact value. Until then this returns "pending"
+// and the node keeps asking.
+//
+// A NAME IS CLAIMED BY THE FIRST KEY TO ASK. A second key wanting the same name
+// is refused rather than replacing it, because overwriting would mean an
+// operator who compared a fingerprint yesterday is approving a different machine
+// today under a name they already trust.
+func (h *handler) enroll(w http.ResponseWriter, r *http.Request) {
+	if h.ca == nil || h.enrollments == nil {
+		writeErr(w, http.StatusNotFound, nodeapi.CodeRefused,
+			"this control plane does not enroll nodes; it serves a loopback wire, where there "+
+				"are no certificates")
+
+		return
+	}
+
+	var req nodeapi.EnrollRequest
+	if !decode(w, r, &req) {
+		return
+	}
+
+	if err := config.ValidateNodeName("node", req.Node); err != nil {
+		writeErr(w, http.StatusBadRequest, nodeapi.CodeRefused, err.Error())
+
+		return
+	}
+
+	fingerprint, err := wirecert.FingerprintOfCSR([]byte(req.CSRPEM))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, nodeapi.CodeRefused, err.Error())
+
+		return
+	}
+
+	enrollment, err := h.enrollments.RequestEnrollment(r.Context(), req.Node, fingerprint, req.CSRPEM)
+	if err != nil {
+		if errors.Is(err, alloc.ErrEnrollmentConflict) {
+			h.log.Warn("a second key asked to join under a name that is already claimed",
+				"node", req.Node, "fingerprint", fingerprint)
+
+			writeErr(w, http.StatusConflict, nodeapi.CodeRefused, err.Error())
+
+			return
+		}
+
+		h.log.Error("could not record an enrollment request", "node", req.Node, "error", err)
+
+		writeErr(w, http.StatusServiceUnavailable, nodeapi.CodeUnavailable,
+			"billet could not record this request; try again")
+
+		return
+	}
+
+	res := nodeapi.EnrollResponse{State: enrollment.State, Fingerprint: enrollment.Fingerprint}
+
+	if enrollment.State == alloc.EnrollApproved {
+		res.CertPEM = enrollment.CertPEM
+		res.CAPEM = string(h.ca.CertPEM())
+	}
+
+	if enrollment.State == alloc.EnrollPending {
+		h.log.Info("a node is asking to join and is waiting for approval",
+			"node", req.Node, "fingerprint", fingerprint)
+	}
+
+	writeJSON(w, http.StatusOK, res)
 }
 
 // renew signs a new certificate for a node that already has a valid one.

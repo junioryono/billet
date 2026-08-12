@@ -579,9 +579,20 @@ func ServerTLS(b Bundle) (*tls.Config, error) {
 
 	return &tls.Config{
 		Certificates: []tls.Certificate{cert},
-		ClientAuth:   tls.RequireAndVerifyClientCert,
-		ClientCAs:    pool,
-		MinVersion:   tls.VersionTLS13,
+		// VERIFY IF GIVEN, NOT REQUIRE, and the handler is what makes that safe.
+		//
+		// A machine that has never enrolled has no certificate, so requiring one at
+		// the handshake means it cannot reach the two routes that exist for exactly
+		// that case: reading this authority, and asking to join. Neither grants
+		// anything — asking waits for a human — and every other route is wrapped in
+		// a guard that refuses a connection with no verified chain.
+		//
+		// A certificate that IS presented is still verified against this
+		// deployment's authority, so this weakens nothing for an enrolled node: it
+		// only lets an unenrolled one get as far as being told to wait.
+		ClientAuth: tls.VerifyClientCertIfGiven,
+		ClientCAs:  pool,
+		MinVersion: tls.VersionTLS13,
 	}, nil
 }
 

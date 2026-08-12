@@ -110,7 +110,17 @@ Three things about it were wrong on the first attempt and are worth not repeatin
 
 ## Admission: how a server decides to trust a node
 
-An operator issues the node a certificate. That is the whole admission decision — there is no auto-enrollment, no join token, and no approval queue.
+**An operator compares a fingerprint and approves it.** Two ends display the same number; a human checks they match. Everything else is transport.
+
+A machine that has nothing runs `billet node --enroll --ca-fingerprint <value from `billet ca show`>`. It fetches the control plane's authority, checks the fingerprint against the one the operator gave it, generates a key, and asks to join — printing its OWN fingerprint. The request sits as `pending`. The operator runs `billet nodes pending`, compares, and runs `billet nodes approve <node> --fingerprint <the value they compared>`. The node picks up its certificate on the next attempt.
+
+**Both directions are verified, and neither is trust-on-first-use.** The node refuses to enroll without a CA fingerprint, because accepting whatever answered on a network an attacker can reach is just trust: they answer first, the node enrolls with them, and every job it runs afterwards is theirs. The operator refuses to approve without a node fingerprint, because approving by name alone approves whatever currently holds the name.
+
+**A name is claimed by the first key to ask.** A second key wanting it is refused rather than replacing it — otherwise an operator who compared a fingerprint yesterday would be approving a different machine today, under a name they already trust.
+
+**The listener verifies a certificate if one is given rather than requiring one**, because an unenrolled machine has none and still has to reach `/v1/ca` and `/v1/enroll`. That is a deliberate hole in exactly two routes; every other one is behind a guard that refuses a connection with no verified chain, and `TestAnUnenrolledConnectionCanReachNothingElse` is what says so. A certificate that IS presented is still verified against the deployment's authority.
+
+The older path still works and is right for a machine you are provisioning anyway: `billet ca issue <name>` on the control plane, copy the bundle out of band.
 
 The control plane is its own CA: on first non-loopback start it creates a per-deployment authority in `server.state_dir`, 10-year life, private key never leaving that machine. `billet ca issue <name>` mints a leaf for that name, 1-year life. The operator copies the bundle to the node out of band. On connect, `tls.RequireAndVerifyClientCert` with that CA as the only client-CA pool means a certificate this deployment did not sign never reaches a handler, and `RequireClientCert` makes the CN authoritative — a request whose PATH names a different node is rejected rather than reconciled. Registration then checks the protocol version, that the deployment id matches, that the site was declared, and that the contribution is non-zero.
 
@@ -137,4 +147,3 @@ A node replaces its own certificate when less than a third of its life remains, 
 **The renewal is verified before it is installed**, and written to disk before it is used. A certificate that does not chain to the authority this node trusts leaves the working one in force.
 
 **What this does NOT cover:** a node whose certificate has already expired cannot renew, because renewal is authenticated by that certificate. It has to be re-enrolled by hand. The renewal window is a third of the certificate's life — months — so this only happens to a host that was off for that entire period.
-
