@@ -233,7 +233,14 @@ func TestTheServerWaitsOutAnOperatorHoldingTheWriteLock(t *testing.T) {
 		})
 	}()
 
-	<-holding
+	// SELECT, not a bare receive: if the operator transaction fails BEFORE
+	// reaching its callback, nothing closes `holding` and this would block until
+	// the suite timed out, reporting a wedge instead of the cause.
+	select {
+	case <-holding:
+	case err := <-adminDone:
+		t.Fatalf("the operator transaction ended before it took the lock: %v", err)
+	}
 
 	serverDone := make(chan error, 1)
 
@@ -378,15 +385,16 @@ func TestALockOwningOperatorCommandIsStillBounded(t *testing.T) {
 
 	var ownerErr error
 
-	// A BACKSTOP, so a regression fails as an ASSERTION rather than as a suite
-	// timeout. If the bound stops applying to this handle it retries until its
-	// context ends — and the error then carries a deadline rather than the advice
-	// asserted below, which is a clean failure instead of a hang.
-	bounded, cancelBounded := context.WithTimeout(ctx, 2*time.Second)
-	defer cancelBounded()
-
 	// The OTHER command holds the writer slot; the lock owner cannot get in.
 	if err := other.Tx(ctx, func(*sql.Tx) error {
+		// A BACKSTOP, so a regression fails as an ASSERTION rather than as a suite
+		// timeout: without the bound this handle retries until its context ends,
+		// and the error then carries a deadline rather than the advice asserted
+		// below. ARMED HERE rather than during setup, and generously, so a slow
+		// machine cannot spend the budget before the call it is protecting starts.
+		bounded, cancelBounded := context.WithTimeout(ctx, 30*time.Second)
+		defer cancelBounded()
+
 		ownerErr = owner.Tx(bounded, func(otx *sql.Tx) error {
 			_, err := otx.ExecContext(bounded, `DELETE FROM join_tokens`)
 
