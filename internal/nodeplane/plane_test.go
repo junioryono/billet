@@ -1415,22 +1415,41 @@ func TestADestroyIsNotConfirmedByTheWrongProcess(t *testing.T) {
 	}
 
 	// The replacement answers the destroy, truthfully: it has nothing to remove.
+	//
+	// LOOPED, because ONE Poll cannot be relied on to park. A poll can return
+	// "nothing to take" without ever having waited — deliverLaunch takes its
+	// command through the fast path, which can leave a wake signal behind, and the
+	// next poll consumes that instead of parking. A single-shot poller then exits
+	// immediately, no waiter is ever recorded, and the barrier below spins until
+	// its own watchdog fires.
+	//
+	// That is what CI hit. The failure took exactly sixty seconds, which is both
+	// the watchdog AND the command timeout this branch had raised — so the number
+	// pointed at two explanations at once, and the first commit to chase it picked
+	// the wrong one. Retrying until the poll either takes a command or genuinely
+	// waits removes the ambiguity rather than tuning a timeout against it.
 	go func() {
-		got, took, err := p.Poll(t.Context(), "n1", "second")
-		if err != nil || !took {
+		for {
+			got, took, err := p.Poll(t.Context(), "n1", "second")
+			if err != nil {
+				return
+			}
+
+			if !took {
+				continue
+			}
+
+			//nolint:errcheck // the result's fate is not what this test is about
+			_ = p.Result("n1", "second", nodeapi.CommandResult{ID: got.ID, OK: true})
+
 			return
 		}
-
-		//nolint:errcheck // the result's fate is not what this test is about
-		_ = p.Result("n1", "second", nodeapi.CommandResult{ID: got.ID, OK: true})
 	}()
 
 	// PARKED BEFORE THE DESTROY IS DISPATCHED, for the reason destroy_test.go
 	// already records: a dispatched command is discarded once the command timeout
 	// elapses, so starting the poller and the destroy together is a race against
-	// the scheduler. Under the full suite's parallelism this goroutine can simply
-	// not run inside that window, and the test then fails on a timeout that has
-	// nothing to do with who answered.
+	// the scheduler.
 	waitFor(t, "the replacement to park on a poll",
 		func() bool { return p.WaitersForTest("n1") == 1 })
 
