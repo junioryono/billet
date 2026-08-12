@@ -50,12 +50,16 @@ func (c faultConn) BeginTx(context.Context, driver.TxOptions) (driver.Tx, error)
 //
 // beginWrite has to report cancellation with its own identity, because modernc
 // can interrupt a BEGIN and return SQLITE_INTERRUPT rather than a context error,
-// and callers test for context.Canceled. The obvious way to do that — ask the
-// context first and return its error — quietly discarded SQLITE_CORRUPT and
-// SQLITE_IOERR whenever cancellation raced the return, which is the one class of
-// error that must never be hidden behind a routine cancellation.
+// and callers test for context.Canceled. Two ways of doing that were wrong.
 //
-// Both identities, therefore, and this is what pins it.
+// Asking the context first and returning its error discarded SQLITE_CORRUPT and
+// SQLITE_IOERR whenever cancellation raced the return. Joining the two kept both
+// identities structurally and still lost the fault where it counts: callers
+// filter on errors.Is(err, context.Canceled) and treat a match as a clean
+// shutdown, so a joined error is dropped exactly like a pure cancellation.
+//
+// So only a genuine interrupt is translated, and a storage fault arriving
+// alongside cancellation is still reported AS the fault. This pins that.
 func TestACancelledBeginStillReportsAStorageFault(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -76,11 +80,15 @@ func TestACancelledBeginStillReportsAStorageFault(t *testing.T) {
 		t.Fatal("a failed BeginTx must be reported")
 	}
 
-	if !errors.Is(err, context.Canceled) {
-		t.Errorf("cancellation must keep its identity, got: %v", err)
+	if !errors.Is(err, errStorageFault) {
+		t.Errorf("the storage fault must be what is reported, got: %v", err)
 	}
 
-	if !errors.Is(err, errStorageFault) {
-		t.Errorf("the storage fault must survive alongside it, got: %v", err)
+	// AND IT MUST NOT READ AS A CANCELLATION. This is the half that matters:
+	// nodeplane's handler and the server's shutdown classifier both discard an
+	// error that matches context.Canceled, so a fault wearing that identity is a
+	// fault nobody ever sees.
+	if errors.Is(err, context.Canceled) {
+		t.Errorf("a storage fault must not be classified as a cancellation, got: %v", err)
 	}
 }

@@ -910,10 +910,17 @@ func TestADestroyEndsALeasesOwnership(t *testing.T) {
 
 // deliverLaunch registers a node and hands it a launch, which is the state every
 // ownership question starts from.
-func deliverLaunch(t *testing.T) (*Plane, nodeapi.Command) {
+//
+// The command timeout is a PARAMETER because its callers want opposite things.
+// Most are asking about ownership and need the timeout never to fire, so they
+// take the generous default — a shorter one there is a bet on how quickly a
+// goroutine gets scheduled, which is what made this suite flaky. One caller is
+// asking what an UNANSWERED destroy does, and needs it to fire promptly; sixty
+// seconds there is a minute of waiting for a result the test already knows.
+func deliverLaunch(t *testing.T, opts ...Option) (*Plane, nodeapi.Command) {
 	t.Helper()
 
-	p := testPlane(t, WithCommandTimeout(60*time.Second))
+	p := testPlane(t, append([]Option{WithCommandTimeout(60 * time.Second)}, opts...)...)
 
 	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
 		Version:     nodeapi.Version,
@@ -1441,7 +1448,9 @@ func TestADestroyIsNotConfirmedByTheWrongProcess(t *testing.T) {
 func TestAFailedDestroyKeepsItsOwnershipRecord(t *testing.T) {
 	t.Parallel()
 
-	p, _ := deliverLaunch(t)
+	// SHORT, because the timeout IS the stimulus here rather than a watchdog:
+	// this test wants the destroy to go unanswered and expire.
+	p, _ := deliverLaunch(t, WithCommandTimeout(500*time.Millisecond))
 
 	// Nobody answers the destroy, so it times out.
 	if err := p.NewRunner().Destroy(t.Context(), 7); err == nil {

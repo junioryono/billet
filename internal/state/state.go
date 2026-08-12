@@ -495,20 +495,26 @@ func (db *DB) beginWrite(ctx context.Context) (*sql.Tx, error) {
 		}
 
 		if !isBusy(err) {
-			// A REAL FAILURE, AND POSSIBLY A CANCELLATION AS WELL — reported as
-			// both rather than as whichever was looked at first.
+			// ONLY AN INTERRUPT IS CANCELLATION WEARING THE DRIVER'S CLOTHES.
 			//
-			// Cancellation does not always arrive as context.Canceled: modernc can
-			// interrupt a BEGIN and surface SQLITE_INTERRUPT, which is not busy, so
-			// a caller testing for Canceled would see nothing. But asking the
-			// context FIRST and returning only its error was worse in the other
-			// direction: it threw away SQLITE_CORRUPT and SQLITE_IOERR whenever
-			// cancellation happened to race the return, hiding a storage fault
-			// behind a routine cancellation.
+			// modernc can interrupt a BEGIN and surface SQLITE_INTERRUPT rather
+			// than a context error, so a caller testing for Canceled would see
+			// nothing — that one code is translated.
 			//
-			// errors.Join keeps both identities, so errors.Is finds either.
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return nil, fmt.Errorf("begin write tx: %w", errors.Join(ctxErr, err))
+			// NOTHING ELSE IS, and the two rejected alternatives are why. Asking the
+			// context first and returning its error threw away SQLITE_CORRUPT and
+			// SQLITE_IOERR whenever cancellation raced the return. Joining the two
+			// kept both identities structurally and still lost the fault in
+			// practice: callers filter on errors.Is(err, context.Canceled) and treat
+			// a match as a clean shutdown, so a joined error is discarded exactly
+			// like a pure cancellation — by nodeplane's request handler and by the
+			// server's own shutdown classifier.
+			//
+			// A storage fault must stay a storage fault. It is the actionable half.
+			if isInterrupt(err) {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return nil, fmt.Errorf("begin write tx: %w", ctxErr)
+				}
 			}
 
 			return nil, fmt.Errorf("begin write tx: %w", err)
@@ -550,6 +556,23 @@ func isBusy(err error) bool {
 	const sqliteBusy = 5
 
 	return serr.Code()&0xff == sqliteBusy
+}
+
+// isInterrupt reports whether an error is SQLite saying the operation was
+// interrupted, which is how a cancelled BEGIN can arrive.
+//
+// Narrow deliberately: this is the ONLY driver code translated into the caller's
+// context error, because every other failure is a fact about the database that
+// must survive being reported.
+func isInterrupt(err error) bool {
+	var serr *sqlite.Error
+	if !errors.As(err, &serr) {
+		return false
+	}
+
+	const sqliteInterrupt = 9
+
+	return serr.Code()&0xff == sqliteInterrupt
 }
 
 // migration is identified by an explicit, immutable Version. Counting applied
