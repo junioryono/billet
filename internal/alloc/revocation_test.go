@@ -203,3 +203,83 @@ func TestARenewalIsRecordedWhenItsParentIsGood(t *testing.T) {
 		t.Errorf("epyc-1 holds %d certificates, want the original and its renewal", len(live))
 	}
 }
+
+// REVOKING A NODE REACHES CREDENTIALS BILLET NEVER RECORDED.
+//
+// Revocation by serial reaches only what was written down, and there are two
+// ways for a working certificate to exist outside that set: a deployment
+// upgraded from a version that did not record serials, and a name issued more
+// than once before it did — the admission trail keeps one row per node and
+// overwrites it, so the earlier certificate is unrecoverable by any backfill.
+//
+// A cutoff needs no list. Revoking records the moment, and any certificate for
+// that name valid from before it is refused on sight.
+func TestRevokingANodeRefusesCredentialsItNeverRecorded(t *testing.T) {
+	now := time.Now().UTC()
+
+	a := newBareAllocator(t, Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, nil,
+		WithClock(func() time.Time { return now }))
+
+	// A certificate from before billet tracked serials: nothing recorded it, so
+	// nothing can name it.
+	unknown := now.Add(-30 * 24 * time.Hour)
+
+	revoked, err := a.CertRevokedFor(t.Context(), "epyc-1", "never-seen", unknown)
+	if err != nil {
+		t.Fatalf("CertRevokedFor: %v", err)
+	}
+
+	if revoked {
+		t.Fatal("a certificate was refused before its node was revoked")
+	}
+
+	if _, err := a.RevokeNode(t.Context(), "epyc-1", "stolen"); err != nil {
+		t.Fatalf("RevokeNode: %v", err)
+	}
+
+	revoked, err = a.CertRevokedFor(t.Context(), "epyc-1", "never-seen", unknown)
+	if err != nil {
+		t.Fatalf("CertRevokedFor: %v", err)
+	}
+
+	if !revoked {
+		t.Error("a certificate this deployment never recorded is still accepted after its " +
+			"node was revoked; an upgraded deployment cannot take back what it cannot name")
+	}
+
+	// ANOTHER NODE IS UNTOUCHED: this is a revocation, not a purge.
+	other, err := a.CertRevokedFor(t.Context(), "mac-mini-1", "never-seen", unknown)
+	if err != nil {
+		t.Fatalf("CertRevokedFor: %v", err)
+	}
+
+	if other {
+		t.Error("revoking epyc-1 also refused a certificate belonging to mac-mini-1")
+	}
+}
+
+// AND A REPLACEMENT ISSUED AFTERWARDS STILL WORKS, which is what keeps the
+// cutoff a revocation rather than a ban on the name.
+func TestACertificateIssuedAfterTheCutoffIsAccepted(t *testing.T) {
+	now := time.Now().UTC()
+
+	a := newBareAllocator(t, Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, nil,
+		WithClock(func() time.Time { return now }))
+
+	if _, err := a.RevokeNode(t.Context(), "epyc-1", "rebuilt"); err != nil {
+		t.Fatalf("RevokeNode: %v", err)
+	}
+
+	// The machine is rebuilt and issued a fresh bundle under the same name.
+	replacement := now.Add(time.Hour)
+
+	revoked, err := a.CertRevokedFor(t.Context(), "epyc-1", "fresh", replacement)
+	if err != nil {
+		t.Fatalf("CertRevokedFor: %v", err)
+	}
+
+	if revoked {
+		t.Error("the replacement machine's certificate was born revoked, so a node name can " +
+			"never be reused after a revocation")
+	}
+}

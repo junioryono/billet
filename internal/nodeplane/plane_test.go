@@ -1556,3 +1556,61 @@ func TestANodeCannotReleaseAnotherNodesLease(t *testing.T) {
 			"another node; it can release capacity out from under a running container")
 	}
 }
+
+// THE EPOCH BELONGS TO THE PROCESS THAT SENT THE INVENTORY.
+//
+// The route wrapper refuses a superseded incarnation, and then the epoch was
+// captured under a SECOND lock acquisition — a check-then-act rather than a
+// fence. A replacement registering in that gap meant the stale report was
+// accepted under the REPLACEMENT's epoch, freeing capacity for a container the
+// newer incarnation had just vouched for.
+//
+// Tested here rather than through the route, because the route's own check
+// refuses the caller before this one is reached: the window this closes exists
+// only between the two, and only a direct call can stand in it.
+func TestReconcileRefusesAnInventoryFromASupersededProcess(t *testing.T) {
+	p := New(slog.New(slog.DiscardHandler), deployment, time.Minute,
+		WithRegistrar(&countingRegistrar{}))
+
+	// REGISTERED WITH AN INCARNATION, because an empty one means the plane does
+	// not know which process it is talking to and accepts anyone — the same rule
+	// CheckIncarnation follows, and a test that left it empty would assert
+	// nothing.
+	const current = "second"
+
+	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
+		Version: nodeapi.Version, Node: "n1", Provider: config.ProviderDocker,
+		Deployment: deployment, VCPU: 8, Memory: 32 * config.GiB,
+		Incarnation: current,
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	if _, err := p.ReconcileInventory(t.Context(), "n1", "first", nil); err == nil {
+		t.Fatal("an inventory from a process the plane has already replaced was accepted; " +
+			"it can free capacity the current one is using")
+	}
+
+	// And the current process is still able to report.
+	if _, err := p.ReconcileInventory(t.Context(), "n1", current, nil); err != nil {
+		t.Errorf("the current process could not report its inventory: %v", err)
+	}
+}
+
+// countingRegistrar is a Registrar that records nothing and answers everything,
+// so a test can reach the plane's own decisions.
+type countingRegistrar struct{}
+
+func (countingRegistrar) RegisterNode(context.Context, alloc.NodeRegistration) (int64, error) {
+	return 1, nil
+}
+
+func (countingRegistrar) NodeGone(context.Context, string, int64) error { return nil }
+
+func (countingRegistrar) ForgetEveryNode(context.Context) error { return nil }
+
+func (countingRegistrar) ResolveQuarantineFor(
+	context.Context, string, []string, int64,
+) (int, error) {
+	return 0, nil
+}

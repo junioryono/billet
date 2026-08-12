@@ -131,11 +131,20 @@ func (r *Runner) heldLeases() map[string]bool {
 // strayGrace is how long a possible stray is looked for before an absence is
 // believed.
 //
-// The window in which a daemon that accepted a create can still act on it. Sixty
-// seconds is far longer than any container runtime needs and cheap to be wrong
-// about — the cost of waiting is one lease's capacity for a minute, and the cost
-// of not waiting is a container running on capacity billet has already resold.
-const strayGrace = time.Minute
+// The window in which a daemon that accepted a create can still act on it.
+//
+// SIZED FOR A CREATE THAT INCLUDES A PULL, which is what the docker provider
+// actually does: it launches with `docker run --detach`, and an image that is
+// not already local is fetched inline. A multi-gigabyte runner image on a slow
+// link takes minutes, so "far longer than any container runtime needs" was true
+// only of a warm cache.
+//
+// Cheap to be wrong in one direction and not the other. Waiting costs one
+// lease's capacity for a few minutes, which comes back by itself; not waiting
+// puts a container on capacity billet has already resold, which nothing
+// recovers. The same asymmetry sets alloc.quarantineGrace, and the two are
+// deliberately the same size.
+const strayGrace = 5 * time.Minute
 
 // custodyWarnAfter is how long a held lease may go unresolved before every tick
 // says so.

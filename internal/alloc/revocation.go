@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"time"
 )
 
 // RevokedCert is a credential that has been withdrawn.
@@ -262,8 +263,9 @@ func (a *Allocator) RevokeNode(ctx context.Context, node, reason string) ([]Issu
 	// first and the renewal is refused for renewing a revoked certificate.
 	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
 		revoked = nil
+		now := ts(a.now().UTC())
 
-		live, err := liveCertsForTx(ctx, tx, node, ts(a.now().UTC()))
+		live, err := liveCertsForTx(ctx, tx, node, now)
 		if err != nil {
 			return err
 		}
@@ -273,12 +275,75 @@ func (a *Allocator) RevokeNode(ctx context.Context, node, reason string) ([]Issu
 				`INSERT INTO revoked_certs (serial, node, reason, revoked_at)
 				 VALUES (?, ?, ?, ?)
 				 ON CONFLICT (serial) DO NOTHING`,
-				live[i].Serial, node, reason, ts(a.now().UTC())); err != nil {
+				live[i].Serial, node, reason, now); err != nil {
 				return fmt.Errorf("alloc: revoke certificate %s: %w", live[i].Serial, err)
 			}
 		}
 
+		// AND A CUTOFF, which is what reaches the credentials billet cannot name.
+		//
+		// Two ways for one to exist: a deployment upgraded from a version that did
+		// not record serials, and a name issued more than once before it did — the
+		// admission trail keeps one row per node and overwrites it, so an earlier
+		// certificate is unrecoverable. Recording the moment refuses every
+		// certificate for this name minted before it, seen or not, while a
+		// replacement issued afterwards still works.
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO node_revocations (node, revoked_before, reason, revoked_at)
+			 VALUES (?, ?, ?, ?)
+			 ON CONFLICT (node) DO UPDATE SET
+			   revoked_before = excluded.revoked_before,
+			   reason         = excluded.reason,
+			   revoked_at     = excluded.revoked_at`,
+			node, now, reason, now); err != nil {
+			return fmt.Errorf("alloc: record the revocation cutoff for %s: %w", node, err)
+		}
+
 		revoked = live
+
+		return nil
+	})
+
+	return revoked, err
+}
+
+// CertRevokedFor reports whether a certificate has been withdrawn, by serial or
+// by the cutoff its node carries.
+//
+// notBefore IS THE CERTIFICATE'S OWN, not a clock: the question is whether this
+// credential predates the revocation, and only the credential can answer that.
+func (a *Allocator) CertRevokedFor(
+	ctx context.Context, node, serial string, notBefore time.Time,
+) (bool, error) {
+	var revoked bool
+
+	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+		revoked = false
+
+		var one int
+
+		switch err := tx.QueryRowContext(ctx,
+			`SELECT 1 FROM revoked_certs WHERE serial = ?`, serial).Scan(&one); {
+		case errors.Is(err, sql.ErrNoRows):
+		case err != nil:
+			return fmt.Errorf("alloc: read the revocation list: %w", err)
+		default:
+			revoked = true
+
+			return nil
+		}
+
+		var cutoff string
+
+		switch err := tx.QueryRowContext(ctx,
+			`SELECT revoked_before FROM node_revocations WHERE node = ?`, node).Scan(&cutoff); {
+		case errors.Is(err, sql.ErrNoRows):
+			return nil
+		case err != nil:
+			return fmt.Errorf("alloc: read the revocation cutoff for %s: %w", node, err)
+		}
+
+		revoked = ts(notBefore.UTC()) < cutoff
 
 		return nil
 	})

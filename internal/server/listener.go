@@ -1436,7 +1436,18 @@ func (l *Listener) destroyAll(ctx context.Context) map[int64]bool {
 			}
 
 			l.mu.Lock()
-			delete(l.cleanup, requestID)
+
+			// AN ENTRY CARRYING A LEASE IS NOT DISCHARGED BY THE DESTROY ALONE.
+			//
+			// Most cleanup entries exist only to destroy compute, so confirming
+			// that is the end of them. One parked by a failed launch also holds
+			// CAPACITY whose release never landed, and deleting it here dropped the
+			// last reference before releaseAll could see it — leaving the ledger
+			// charging for a job that never started.
+			if entry, ok := l.cleanup[requestID]; !ok || entry.lease == nil {
+				delete(l.cleanup, requestID)
+			}
+
 			l.mu.Unlock()
 		}()
 	}
@@ -2482,12 +2493,19 @@ func (l *Listener) complete(ctx context.Context, job Job) error {
 		return nil
 	}
 
-	if err := l.alloc.Release(ctx, lease.ID, lease.Epoch, outcome); err != nil {
+	if err := l.alloc.Release(ctx, lease.ID, lease.Epoch, outcome); !releaseSettled(err) {
 		// THE ENTRY STAYS, and that is the whole point of keeping one. Deleting it
 		// when the DESTROY succeeded lost the retry to a transient release failure:
 		// the lease stayed in `running` being renewed forever, GitHub will not
 		// redeliver a completion it has already acknowledged, and nothing else was
 		// ever going to try the release again.
+		//
+		// SETTLED IS NOT THE SAME AS SUCCEEDED, and treating every error alike was
+		// its own trap. A parked lease outlives its own epoch: the outage that
+		// stopped the release lasts past the TTL, the reaper moves the lease on and
+		// bumps the epoch, and every retry from here is fenced with the stale one —
+		// forever, while `reserve` and `assign` go on refusing that request id.
+		// Fenced and not-found both mean this claim on capacity is over.
 		return fmt.Errorf("server: release lease %s for finished request %d: %w",
 			lease.ID, job.RequestID, err)
 	}
@@ -2525,6 +2543,17 @@ func (l *Listener) releaseAll(ctx context.Context, destroyed map[int64]bool) {
 	promised := make([]*alloc.Lease, 0, len(l.acquiring))
 	for _, p := range l.acquiring {
 		promised = append(promised, p.lease)
+	}
+
+	// PARKED OBLIGATIONS TOO. A failed launch whose release did not land keeps
+	// its lease here rather than in `running`, and shutdown is the last chance
+	// anything in this process has to hand that capacity back.
+	parked := make(map[int64]*pendingCleanup, len(l.cleanup))
+
+	for id, entry := range l.cleanup {
+		if entry.lease != nil {
+			parked[id] = entry
+		}
 	}
 
 	l.held = nil
@@ -2589,6 +2618,19 @@ func (l *Listener) releaseAll(ctx context.Context, destroyed map[int64]bool) {
 	// would strand it until the reaper.
 	for _, lease := range promised {
 		release(lease)
+	}
+
+	// And the parked ones, with the outcome they were parked with: a launch that
+	// never started did not finish, whatever the ordinary path records.
+	for id, entry := range parked {
+		if err := l.alloc.Release(ctx, entry.lease.ID, entry.lease.Epoch, entry.outcome); err != nil {
+			l.log.Warn("could not release the capacity of a job that failed to start",
+				"tier", l.tier, "request", id, "lease", entry.lease.ID, "error", err)
+
+			if !releaseSettled(err) {
+				stuck = append(stuck, entry.lease)
+			}
+		}
 	}
 
 	// WHAT DID NOT LAND IS THE REAPER'S, and saying so is the honest version.

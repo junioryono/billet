@@ -22,6 +22,9 @@ import (
 type revocations struct {
 	mu      sync.Mutex
 	serials map[string]bool
+	// cutoffs refuse every certificate for a node minted before the instant it
+	// was revoked, whether or not its serial was ever recorded.
+	cutoffs map[string]time.Time
 	err     error
 
 	// issued is every credential the wire has handed out, which is what makes a
@@ -77,6 +80,23 @@ func (r *revocations) issuedCerts() []alloc.IssuedCert {
 	defer r.mu.Unlock()
 
 	return append([]alloc.IssuedCert(nil), r.issued...)
+}
+
+// CertRevokedFor mirrors the real one: a serial, or a cutoff that reaches
+// credentials this deployment never recorded.
+func (r *revocations) CertRevokedFor(
+	ctx context.Context, node, serial string, notBefore time.Time,
+) (bool, error) {
+	if revoked, err := r.CertRevoked(ctx, serial); revoked || err != nil {
+		return revoked, err
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	cutoff, ok := r.cutoffs[node]
+
+	return ok && notBefore.Before(cutoff), nil
 }
 
 func (r *revocations) CertRevoked(_ context.Context, serial string) (bool, error) {
