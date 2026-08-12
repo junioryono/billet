@@ -10,35 +10,23 @@ import (
 // rather than at whatever level it was written with.
 //
 // THE VENDORED CLIENT LOGS EVERY FAILED REQUEST AT ERROR, through billet's own
-// logger — go-retryablehttp's leveled path, which the client reaches because
-// *slog.Logger satisfies its LeveledLogger interface. Stopping billet cancels
-// the long poll in flight, so a perfectly clean shutdown ends with:
+// logger — go-retryablehttp's leveled path, which it reaches because *slog.Logger
+// satisfies its LeveledLogger interface. Stopping billet cancels the long poll in
+// flight, so a clean shutdown ends with:
 //
 //	level=ERROR msg="request failed" error="context canceled" method=GET url=...
 //
-// Under a service manager that is the first thing in the journal after every
-// restart. An error that appears on every single restart is one operators learn
-// to scroll past, and the next one that matters scrolls past with it. The fix is
-// not to hide the record — it is still written, with everything it said — but to
-// stop calling a thing billet did on purpose an error.
+// An error that appears after every single restart is one operators learn to
+// scroll past, and the next one that matters scrolls past with it. The record is
+// still written, with everything it said; it is only no longer called an error.
 //
-// KEYED ON THE ERROR VALUE, NOT THE MESSAGE. A cancellation is always billet's
-// own doing, so it is never something an operator can act on; that is a property
-// of the error, not of the sentence around it. Matching "request failed" would
-// rot the first time upstream reworded it, and would be a rule about a string
-// rather than about a fact.
-//
-// CANCELLATION ONLY, AND NOT DEADLINES. An earlier version demoted
-// context.DeadlineExceeded too, which is a different thing entirely: a request
-// that ran out of time during ordinary operation means GitHub is slow or
-// unreachable, and that is exactly the error an operator needs to see. Only a
-// cancellation is unambiguously billet stopping something on purpose.
-//
-// AND ONLY WHEN THAT IS ALL IT IS. errors.Join(realFailure, context.Canceled)
-// satisfies errors.Is for the cancellation while carrying a genuine failure
-// alongside it, so a rule written as a bare errors.Is would quietly demote the
-// real one. A joined error is demoted only when every branch of it is a
-// cancellation.
+// KEYED ON THE ERROR VALUE, NOT THE MESSAGE — the cancellation being billet's own
+// doing is a property of the error, not of the sentence around it. CANCELLATION
+// ONLY, NOT DEADLINES: a request that ran out of time means GitHub is slow or
+// unreachable, which is exactly what an operator needs to see. AND ONLY WHEN THAT
+// IS ALL IT IS — errors.Join(realFailure, context.Canceled) satisfies errors.Is
+// while carrying a genuine failure, so a joined error is demoted only when every
+// branch of it is a cancellation.
 func quieten(h slog.Handler) slog.Handler {
 	return &quietHandler{Handler: h}
 }

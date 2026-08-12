@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -10,6 +11,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
+
+	"gopkg.in/yaml.v3"
 
 	"github.com/junioryono/billet/internal/github"
 )
@@ -35,6 +39,7 @@ func githubAppCreate(ctx context.Context, args []string) error {
 	org := fs.String("org", "", "GitHub organization to create the App for (required)")
 	name := fs.String("name", "", "suggested App name (GitHub App names are globally unique; you can edit it there)")
 	keyPath := fs.String("key-path", "", "where to write the App private key (default: alongside billet.yaml)")
+	cfgPath := fs.String("config", "", "billet.yaml to write the github block into")
 	noBrowser := fs.Bool("no-browser", false, "print URLs instead of opening a browser")
 	port := fs.Int("port", 0, "fixed loopback callback port (needed for `ssh -L` when onboarding a remote host)")
 
@@ -136,22 +141,65 @@ func githubAppCreate(ctx context.Context, args []string) error {
 
 	fmt.Printf("\nDone.\n\n")
 	fmt.Printf("  private key      %s\n", *keyPath)
+
+	block := githubBlock{
+		Org:            *org,
+		AppID:          result.App.ID,
+		ClientID:       result.App.ClientID,
+		InstallationID: result.Installation.ID,
+		PrivateKeyPath: *keyPath,
+	}
+
+	// WRITTEN INTO THE FILE RATHER THAN PRINTED FOR PASTING. Printing was one
+	// more step to get wrong, and getting it wrong is quiet: an app_id left at 0
+	// is only reported later by `billet check`, and a mistyped one comes back as
+	// an authentication failure that says nothing about which digit moved.
+	if *cfgPath != "" {
+		if err := writeGitHubBlock(*cfgPath, block); err != nil {
+			// NOT FATAL, because the App exists by now and the credential it
+			// issued cannot be re-created. Printing the block is the fallback that
+			// keeps this run recoverable.
+			fmt.Fprintf(os.Stderr, "\ncould not update %s: %v\n", *cfgPath, err)
+			printGitHubBlock(block)
+
+			return nil
+		}
+
+		fmt.Printf("  config           %s (updated)\n", *cfgPath)
+		fmt.Printf("\nThen run: billet check --config %s\n", *cfgPath)
+
+		return nil
+	}
+
 	fmt.Printf("\nAdd this to your billet.yaml:\n\n")
+	printGitHubBlock(block)
+	fmt.Printf("\nOr re-run with --config <path> and billet will write it for you.\n")
+
+	return nil
+}
+
+// githubBlock is the App identity a config needs.
+type githubBlock struct {
+	Org            string
+	AppID          int64
+	ClientID       string
+	InstallationID int64
+	PrivateKeyPath string
+}
+
+func printGitHubBlock(b githubBlock) {
 	fmt.Printf("github:\n")
-	fmt.Printf("  org: %s\n", *org)
-	fmt.Printf("  app_id: %d\n", result.App.ID)
+	fmt.Printf("  org: %s\n", b.Org)
+	fmt.Printf("  app_id: %d\n", b.AppID)
 
 	// Printed when GitHub returned one, because the operator cannot recover it
 	// from anywhere else without going back through the browser.
-	if result.App.ClientID != "" {
-		fmt.Printf("  client_id: %s\n", result.App.ClientID)
+	if b.ClientID != "" {
+		fmt.Printf("  client_id: %s\n", b.ClientID)
 	}
 
-	fmt.Printf("  installation_id: %d\n", result.Installation.ID)
-	fmt.Printf("  private_key_path: %s\n", *keyPath)
-	fmt.Printf("\nThen run: billet check\n")
-
-	return nil
+	fmt.Printf("  installation_id: %d\n", b.InstallationID)
+	fmt.Printf("  private_key_path: %s\n", b.PrivateKeyPath)
 }
 
 // reserveKeyFile creates the App key file 0600, refusing to clobber an existing
@@ -197,31 +245,27 @@ func reserveKeyFile(path string) (*os.File, error) {
 
 	// The destination is refused if anything occupies it, and then LEFT ALONE.
 	//
-	// This is a courtesy check for a clear diagnostic, not the safety property:
-	// it is a snapshot, and the pathname can change immediately afterwards. What
-	// actually protects the destination is that nothing here ever creates,
-	// removes or renames it — the only thing that puts a file at that name is the
-	// os.Link at install time, which refuses atomically when the name is taken.
+	// A courtesy check for a clear diagnostic, not the safety property: it is a
+	// snapshot and the pathname can change immediately after. What protects the
+	// destination is that nothing here creates, removes or renames it — the os.Link
+	// at install time refuses atomically when the name is taken.
 	//
 	// pathPresent, not "not absent": an unstattable destination must not block
-	// onboarding, because the link is what guarantees safety and it does not need
-	// this answer. Only a destination KNOWN to be occupied is worth stopping for.
+	// onboarding, because the link is what guarantees safety.
 	if lookupPath(path) == pathPresent {
 		return nil, destinationOccupiedError(path)
 	}
 
 	// The reservation is a SEPARATE file, and that is the whole design.
 	//
-	// It used to be the destination itself, which forced the install to unlink
-	// the destination before it could link the key into place — and no amount of
-	// checking makes a pathname unlink safe, because the check cannot be atomic
-	// with it. Three rounds of guards were tried and every one of them still had
-	// an ordering where another run's key was deleted on the way to installing
-	// this one.
+	// Reserving the destination itself would force the install to unlink it before
+	// linking the key into place, and no check can be made atomic with a later unlink
+	// by pathname — every guard still has an ordering where another run's key is
+	// deleted on the way to installing this one.
 	//
-	// Reserving elsewhere removes the unlink entirely. The final name is created
-	// exactly once, by a link that fails rather than replaces. It also collapses
-	// two files into one: this descriptor is both the proof that the directory is
+	// Reserving elsewhere removes the unlink entirely: the final name is created
+	// exactly once, by a link that fails rather than replaces. It also collapses two
+	// files into one — this descriptor is both the proof that the directory is
 	// writable and the file the key is written to.
 	f, err := os.OpenFile(staging, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err == nil {
@@ -275,18 +319,16 @@ func destinationOccupiedError(path string) error {
 // re-run", and following that abandons both this key and the App on GitHub it
 // belongs to.
 func stagedKeyFoundError(path, staged string) error {
-	// The `mv` is only offered when the destination is free.
+	// The `mv` is only offered when the destination is free. Unix mv REPLACES, so
+	// recommending it unconditionally would hand the operator a command that destroys
+	// a second App's key — the outcome every other rule here exists to prevent,
+	// reached by following billet's own instructions.
 	//
-	// Unix mv REPLACES, so recommending it unconditionally handed the operator a
-	// command that destroys a second App's key whenever one already sits at the
-	// destination — the precise outcome every other rule here exists to prevent,
-	// arrived at by following billet's own instructions.
 	// The question is whether the destination is OCCUPIED, not whether it holds
-	// something billet recognises. Several states that are not a usable billet key
-	// still hold something worth keeping: a PEM with trailing junk, a key in a
-	// format this build cannot parse, a file a live writer has not finished.
-	// "Not currently a valid key" was never proof that clobbering it is safe —
-	// and neither is "could not tell", which is why this is `!= pathAbsent`.
+	// something billet recognises: a PEM with trailing junk, a key in a format this
+	// build cannot parse, or a file a live writer has not finished are all worth
+	// keeping. "Could not tell" is not proof that clobbering is safe either, which is
+	// why this is `!= pathAbsent`.
 	if lookupPath(path) != pathAbsent {
 		return fmt.Errorf(
 			"two files are present and billet cannot tell which key you want:\n"+
@@ -309,22 +351,15 @@ func stagedKeyFoundError(path, staged string) error {
 
 // writeKeyAtomically installs the key GitHub has just issued.
 //
-// One file, one atomic step. The reservation opened before the browser flow IS
-// the staging file — it lives beside the destination, never at it — so the key
-// is written into a descriptor this process already owns and then linked into
-// place. os.Link creates the final name or fails; it never replaces.
+// One file, one atomic step. The reservation opened before the browser flow IS the
+// staging file — it lives beside the destination, never at it — so the key is
+// written into a descriptor this process already owns and then linked into place.
+// os.Link creates the final name or fails; it never replaces. That is what removes
+// the unlink, and with it every ordering in which another run's key is deleted.
 //
-// That shape is the answer to three rounds of failed patches. While the
-// reservation occupied the destination, installing meant unlinking the
-// destination first, and no check can be made atomic with a later unlink by
-// pathname: every guard still had an ordering where another run's key was
-// deleted on the way to installing this one. Reserving elsewhere removes the
-// unlink entirely, and with it the fallback that existed only because the
-// destination was already occupied.
-//
-// onInstalled fires the instant the key is at its final path, BEFORE durability
-// is confirmed. Everything after that is best-effort reporting: the credential
-// exists and must never be deleted, whatever else fails.
+// onInstalled fires the instant the key is at its final path, BEFORE durability is
+// confirmed. Everything after is best-effort reporting: the credential exists and
+// must never be deleted, whatever else fails.
 func writeKeyAtomically(reserved *os.File, path string, pem []byte, onInstalled func()) error {
 	dir := filepath.Dir(path)
 	staging := stagingPath(path)
@@ -398,16 +433,12 @@ func writeKeyAtomically(reserved *os.File, path string, pem []byte, onInstalled 
 		}
 	}()
 
-	// A FAILED write can still have left a usable key, and that possibility
-	// decides what the operator is told.
+	// A FAILED write can still have left a usable key, and that decides what the
+	// operator is told.
 	//
-	// GitHub's PEM ends in a newline. A write that stops one byte short of it
-	// produces something pem.Decode parses perfectly — so "the write returned an
-	// error" and "there is no credential here" are different facts. What is on
-	// disk is the authority, not the return value.
-	//
-	// (*os.File.Write reports an error for every short write, so the n check is
-	// belt and braces against a future writer that does not.)
+	// GitHub's PEM ends in a newline, so a write stopping one byte short produces
+	// something pem.Decode parses perfectly: "the write returned an error" and "there
+	// is no credential here" are different facts. What is on disk is the authority.
 	if n, writeErr := reserved.Write(pem); writeErr != nil || n != len(pem) {
 		// Flushed so the question below is asked of the filesystem rather than the
 		// page cache. Neither result decides anything on its own.
@@ -416,16 +447,11 @@ func writeKeyAtomically(reserved *os.File, path string, pem []byte, onInstalled 
 		failure := fmt.Errorf("write %s: wrote %d of %d bytes: %w",
 			staging, n, len(pem), errors.Join(writeErr, syncErr))
 
-		// Identity FIRST. inspectKey answers a question about a pathname, and
-		// "there is a valid key at that name" is not "this run's key survived" —
-		// another run's key at the staging name would have been reported as this
-		// one's, and a staging name that was unlinked during the flow would have
-		// been reported as holding a key it no longer has.
+		// Identity FIRST. "There is a valid key at that name" is not "this run's key
+		// survived": another run's key at the staging name would be reported as this one's.
 		//
-		// `!= identityMatches` is NOT good enough here, and writing it that way
-		// undid the three-valued type one line after introducing it: a failed stat
-		// is not a proven mismatch, and treating it as one writes a second copy of
-		// the key for no reason and reports only the copy.
+		// `!= identityMatches` is not good enough — a failed stat is not a proven mismatch,
+		// and treating it as one writes a second copy of the key and reports only the copy.
 		switch verifyInstalled(reserved, staging) {
 		case identityMatches:
 		case identityDiffers:
@@ -654,20 +680,17 @@ func verifyInstalled(reserved *os.File, path string) identity {
 	return identityDiffers
 }
 
-// recoverKey writes the key somewhere new when the ordinary install could not
-// place it, and reports where it landed.
+// recoverKey writes the key somewhere new when the ordinary install could not place
+// it, and reports where it landed.
 //
-// This function exists because the previous version did not: it concluded that a
-// key written into an unlinked inode was unrecoverable — true of that inode, and
-// beside the point, because writeKeyAtomically still holds the complete PEM in
-// memory at every call site that reaches here. Declaring a credential lost while
-// the bytes are in a live variable is the worst outcome in this file, since the
-// advice that follows is "delete the App".
+// A key written into an unlinked inode is not unrecoverable: writeKeyAtomically
+// still holds the complete PEM in memory at every call site that reaches here.
+// Declaring a credential lost while the bytes are in a live variable is the worst
+// outcome in this file, because the advice that follows is "delete the App".
 //
-// The same reasoning applies one level down, which is what the first version got
-// wrong: a recovery write that reports an error may STILL have left a usable key,
-// so the file is inspected rather than assumed empty. Loss is what remains after
-// looking, never what is inferred from a return value.
+// The same applies one level down: a recovery write that reports an error may STILL
+// have left a usable key, so the file is inspected rather than assumed empty. Loss
+// is what remains after looking, never what is inferred from a return value.
 func recoverKey(dir, destination string, pem []byte, cause error) error {
 	return recoverKeyAttempt(dir, destination, pem, cause, 1)
 }
@@ -1107,4 +1130,107 @@ func readPrivateKey(path string) ([]byte, error) {
 	}
 
 	return pemBytes, nil
+}
+
+// writeGitHubBlock sets the App identity in a config, leaving everything else —
+// including the comments — as it was.
+//
+// A YAML NODE TREE RATHER THAN MARSHALLING THE STRUCT BACK. config.Config drops
+// every comment and reorders nothing predictably, so a round trip through it
+// would hand back a file that is technically equivalent and unrecognisable: the
+// operator's own notes gone, and the diff impossible to review. Editing the
+// tree touches five scalars.
+//
+// ATOMIC, because this file is the only record of where the state directory and
+// the App key live. A partial write during a crash would leave a config that
+// does not parse and a deployment that cannot start.
+func writeGitHubBlock(path string, b githubBlock) error {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", path, err)
+	}
+
+	var doc yaml.Node
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		return fmt.Errorf("parse %s: %w", path, err)
+	}
+
+	if doc.Kind != yaml.DocumentNode || len(doc.Content) == 0 {
+		return fmt.Errorf("%s is empty", path)
+	}
+
+	root := doc.Content[0]
+	if root.Kind != yaml.MappingNode {
+		return fmt.Errorf("%s is not a mapping", path)
+	}
+
+	gh := mappingFor(root, "github")
+
+	setScalar(gh, "org", b.Org)
+	setScalar(gh, "app_id", strconv.FormatInt(b.AppID, 10))
+	setScalar(gh, "installation_id", strconv.FormatInt(b.InstallationID, 10))
+	setScalar(gh, "private_key_path", b.PrivateKeyPath)
+
+	// Only when GitHub returned one: writing an empty client_id would be a key
+	// the operator then has to wonder about.
+	if b.ClientID != "" {
+		setScalar(gh, "client_id", b.ClientID)
+	}
+
+	var out bytes.Buffer
+
+	enc := yaml.NewEncoder(&out)
+	enc.SetIndent(2)
+
+	if err := enc.Encode(&doc); err != nil {
+		return fmt.Errorf("render %s: %w", path, err)
+	}
+
+	if err := enc.Close(); err != nil {
+		return fmt.Errorf("render %s: %w", path, err)
+	}
+
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, out.Bytes(), 0o600); err != nil {
+		return fmt.Errorf("write %s: %w", tmp, err)
+	}
+
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("replace %s: %w", path, err)
+	}
+
+	return nil
+}
+
+// mappingFor returns the mapping at a top-level key, creating it if absent.
+func mappingFor(root *yaml.Node, key string) *yaml.Node {
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		if root.Content[i].Value == key {
+			return root.Content[i+1]
+		}
+	}
+
+	k := &yaml.Node{Kind: yaml.ScalarNode, Value: key}
+	v := &yaml.Node{Kind: yaml.MappingNode}
+	root.Content = append(root.Content, k, v)
+
+	return v
+}
+
+// setScalar sets a key in a mapping, replacing the value and keeping the key's
+// comments.
+func setScalar(m *yaml.Node, key, value string) {
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		if m.Content[i].Value == key {
+			m.Content[i+1].Value = value
+			m.Content[i+1].Tag = ""
+			m.Content[i+1].Style = 0
+
+			return
+		}
+	}
+
+	m.Content = append(m.Content,
+		&yaml.Node{Kind: yaml.ScalarNode, Value: key},
+		&yaml.Node{Kind: yaml.ScalarNode, Value: value})
 }

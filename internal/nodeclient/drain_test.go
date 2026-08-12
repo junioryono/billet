@@ -39,6 +39,9 @@ func TestASignalledNodeDrainsWithoutHandingOverCustody(t *testing.T) {
 
 	go func() {
 		done <- nodeclient.Run(ctx, c, compute, nodeclient.LoopOptions{
+			// What this host contributes; the control plane refuses a node offering none.
+			VCPU:         testNodeVCPU,
+			Memory:       testNodeMemory,
 			Provider:     config.ProviderDocker,
 			Deployment:   deployment,
 			Log:          slog.New(slog.DiscardHandler),
@@ -112,6 +115,9 @@ func TestANodeHoldingNothingStopsImmediatelyAndSaysNothingAboutDraining(t *testi
 
 	go func() {
 		done <- nodeclient.Run(ctx, c, compute, nodeclient.LoopOptions{
+			// What this host contributes; the control plane refuses a node offering none.
+			VCPU:       testNodeVCPU,
+			Memory:     testNodeMemory,
 			Provider:   config.ProviderDocker,
 			Deployment: deployment,
 			Log: slog.New(slog.NewTextHandler(&lockedWriter{mu: &logMu, w: &logged},
@@ -186,6 +192,9 @@ func TestANodeDrainIsBounded(t *testing.T) {
 
 	go func() {
 		done <- nodeclient.Run(ctx, c, compute, nodeclient.LoopOptions{
+			// What this host contributes; the control plane refuses a node offering none.
+			VCPU:       testNodeVCPU,
+			Memory:     testNodeMemory,
 			Provider:   config.ProviderDocker,
 			Deployment: deployment,
 			Log: slog.New(slog.NewTextHandler(&lockedWriter{mu: &logMu, w: &logged},
@@ -240,6 +249,9 @@ func TestASecondSignalEndsTheNodesDrain(t *testing.T) {
 
 	go func() {
 		done <- nodeclient.Run(ctx, c, compute, nodeclient.LoopOptions{
+			// What this host contributes; the control plane refuses a node offering none.
+			VCPU:       testNodeVCPU,
+			Memory:     testNodeMemory,
 			Provider:   config.ProviderDocker,
 			Deployment: deployment,
 			Log:        slog.New(slog.DiscardHandler),
@@ -298,6 +310,9 @@ func TestTheJanitorKeepsRenewingForTheWholeDrain(t *testing.T) {
 
 	go func() {
 		done <- nodeclient.Run(ctx, c, compute, nodeclient.LoopOptions{
+			// What this host contributes; the control plane refuses a node offering none.
+			VCPU:         testNodeVCPU,
+			Memory:       testNodeMemory,
 			Provider:     config.ProviderDocker,
 			Deployment:   deployment,
 			Log:          slog.New(slog.DiscardHandler),
@@ -359,6 +374,9 @@ func TestADrainingNodeAcceptsDestroyAndRefusesLaunch(t *testing.T) {
 
 	go func() {
 		done <- nodeclient.Run(ctx, c, compute, nodeclient.LoopOptions{
+			// What this host contributes; the control plane refuses a node offering none.
+			VCPU:         testNodeVCPU,
+			Memory:       testNodeMemory,
 			Provider:     config.ProviderDocker,
 			Deployment:   deployment,
 			Log:          slog.New(slog.DiscardHandler),
@@ -392,6 +410,7 @@ func TestADrainingNodeAcceptsDestroyAndRefusesLaunch(t *testing.T) {
 	// because each new job extends the wait it is trying to finish.
 	lease := &alloc.Lease{
 		ID:        "l1",
+		Tier:      "billet-2vcpu",
 		VCPU:      2,
 		Memory:    8 * config.GiB,
 		GuestOS:   config.GuestLinux,
@@ -408,6 +427,90 @@ func TestADrainingNodeAcceptsDestroyAndRefusesLaunch(t *testing.T) {
 
 	if _, launched, _ := compute.snapshot(); len(launched) != 0 {
 		t.Errorf("a draining node launched %v", launched)
+	}
+
+	compute.mu.Lock()
+	compute.holding = false
+	compute.mu.Unlock()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("a drained node never stopped")
+	}
+}
+
+// A NODE STOPPED WHILE IT IS RE-REGISTERING STILL DRAINS, and only the serve
+// path did.
+//
+// Run reaches stopGracefully from exactly one place: the return out of serve.
+// Every other way the loop notices its context has ended — the registration
+// call itself, the backoff after a registration that failed, the backoff after
+// Recover failed, the backoff after serve returned some other error — returns
+// ctx.Err() directly, and the deferred stopJanitor fires on the way out.
+//
+// A node in that window is not idle. The route into it is the ordinary one: the
+// control plane restarts, serve returns ErrUnregistered, the loop goes back to
+// Register, and Register fails because the plane has not finished coming up. The
+// containers on this host are still running the whole time. Stop the node there
+// and nothing renews their leases — the reaper reclaims the capacity at the TTL,
+// the control plane sells it to somebody else, and a second job lands on a
+// machine still running the first. The containers are never destroyed either,
+// because the process that knew about them is gone.
+//
+// So the assertion is that the node TENDS after being stopped, which is what a
+// drain does and what an immediate return cannot.
+func TestANodeStoppedWhileReRegisteringStillDrains(t *testing.T) {
+	t.Parallel()
+
+	plane, c, breaker := breakableHarness(t)
+
+	compute := &fakeCompute{holding: true}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	done := make(chan error, 1)
+
+	go func() {
+		done <- nodeclient.Run(ctx, c, compute, nodeclient.LoopOptions{
+			VCPU:         testNodeVCPU,
+			Memory:       testNodeMemory,
+			Provider:     config.ProviderDocker,
+			Deployment:   deployment,
+			Log:          slog.New(slog.DiscardHandler),
+			Backoff:      20 * time.Millisecond,
+			SweepEvery:   10 * time.Millisecond,
+			DrainTimeout: 20 * time.Second,
+		})
+	}()
+
+	waitFor(t, func() bool { return len(plane.Nodes()) == 1 })
+
+	// The control plane restarts: it forgets this node, so the poll in flight
+	// comes back unregistered, and registering again does not work yet.
+	breaker.failRegister.Store(true)
+	plane.ForgetForTest("n1")
+
+	// IN THE REGISTRATION RETRY, not merely on the way to it. Cancelling before
+	// the loop gets there would test the serve path, which already drains.
+	waitFor(t, func() bool { return breaker.registerAttempts.Load() >= 2 })
+
+	tendedBefore := compute.tended()
+
+	cancel()
+
+	// A DRAIN TENDS. Nothing else in the loop does once serve has returned, so a
+	// single call after the stop is the whole proof.
+	waitFor(t, func() bool { return compute.tended() > tendedBefore })
+
+	// And it is a real drain rather than one tick: it holds until the compute is
+	// gone, then stops.
+	select {
+	case <-done:
+		t.Fatal("the node stopped while it was still holding compute; its leases are now " +
+			"renewed by nobody and its containers are unaccounted for")
+	case <-time.After(200 * time.Millisecond):
 	}
 
 	compute.mu.Lock()

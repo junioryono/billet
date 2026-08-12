@@ -18,12 +18,6 @@ import (
 	"github.com/junioryono/billet/internal/wirecert"
 )
 
-// LeaseStore is the ledger, as the node wire needs it.
-//
-// Declared here rather than imported from internal/node so the transport does
-// not depend on the runtime it serves — the two are on opposite sides of a
-// process boundary and coupling them would defeat the point of having one. The
-// shapes match because both describe the same allocator.
 // JITSource mints runner registrations. Held by the control plane alone.
 //
 // The same shape internal/node.JITSource has, declared separately for the same
@@ -45,6 +39,11 @@ type JITRegistration interface {
 	RunnerName() string
 }
 
+// LeaseStore is the ledger, as the node wire needs it.
+//
+// Declared here rather than imported from internal/node so the transport does
+// not depend on the runtime it serves — the two are on opposite sides of a
+// process boundary. The shapes match because both describe the same allocator.
 type LeaseStore interface {
 	Bind(ctx context.Context, leaseID string, epoch int64, node string) error
 	Advance(ctx context.Context, leaseID string, epoch int64, to alloc.Phase) error
@@ -65,36 +64,73 @@ const maxBody = 1 << 20
 // HandlerOption configures the wire.
 type HandlerOption func(*handler)
 
-// WithTiers gives the wire the catalogue it needs to check a JIT request.
-//
-// A TIER'S RUNNER GROUP IS PART OF ITS ADDRESS, and resolving a scale set
-// without one silently means "the default group". A tier deliberately placed in
-// another group — which is how an operator stops every repository in the
-// organisation from reaching it — would then have its legitimate registrations
-// refused, because the set looked for is not the set that exists.
-func WithTiers(tiers []config.Tier) HandlerOption {
-	return func(h *handler) {
-		h.tiers = make(map[string]config.Tier, len(tiers))
-		for i := range tiers {
-			h.tiers[tiers[i].Label] = tiers[i]
-		}
-	}
-}
-
 // RequireClientCert makes a verified certificate the source of a node's name.
 //
-// WITHOUT IT THE PATH IS THE ONLY AUTHORITY, which is not authentication at all:
-// any process that can reach the listener claims to be any node, binds its
-// leases, takes its commands, and asks for a JIT registration — a credential
-// that registers a runner against the organisation. That is why a wire served
-// without this refuses to bind anywhere but loopback.
+// WITHOUT IT THE PATH IS THE ONLY AUTHORITY, which is not authentication: any
+// process that can reach the listener claims to be any node, binds its leases,
+// takes its commands, and asks for a JIT registration — a credential that registers
+// a runner against the organisation. A wire served without this refuses to bind
+// anywhere but loopback.
 //
-// With it, the name in the certificate decides, and a request whose path
-// disagrees is rejected rather than reconciled. Two authorities for one fact is
-// how this codebase's worst bugs have started, and an authenticated identity is
-// the one place it must not happen.
+// With it the certificate decides, and a request whose path disagrees is rejected
+// rather than reconciled.
 func RequireClientCert() HandlerOption {
 	return func(h *handler) { h.requireCert = true }
+}
+
+// Revocations answers whether a certificate has been withdrawn.
+//
+// An interface rather than the allocator, so the wire depends on the one
+// question it asks rather than on the ledger.
+type Revocations interface {
+	CertRevoked(ctx context.Context, serial string) (bool, error)
+}
+
+// WithRevocations lets the wire refuse a credential an operator has taken back.
+//
+// Without it a certificate is good until it expires, which for a decommissioned
+// machine or a leaked key means up to a year of a host that can still be handed
+// work — including a JIT credential that registers a runner against the
+// organisation.
+func WithRevocations(r Revocations) HandlerOption {
+	return func(h *handler) { h.revocations = r }
+}
+
+// Enrollments records machines asking to join and what was decided about them,
+// and checks the credential that lets one ask at all.
+type Enrollments interface {
+	RequestEnrollment(ctx context.Context, name, fingerprint, csrPEM string) (alloc.Enrollment, error)
+	LookupEnrollment(ctx context.Context, name string) (alloc.Enrollment, bool, error)
+	SpendJoinToken(ctx context.Context, token string) error
+}
+
+// WithEnrollment lets a machine ask to join without already holding a
+// certificate.
+//
+// The alternative — and what billet did before — is that admission happens
+// entirely out of band: an operator runs `billet ca issue` and copies a bundle
+// to the machine. That works, and it is not discoverable: a node that is powered
+// on and pointed at a control plane appears nowhere until somebody already knows
+// it exists.
+func WithEnrollment(e Enrollments) HandlerOption {
+	return func(h *handler) { h.enrollments = e }
+}
+
+// WithRenewal lets a node replace its own certificate before it expires.
+//
+// AUTHENTICATED BY THE CERTIFICATE BEING REPLACED, so this grants nothing: a
+// host that can already act as a node asks to keep doing so. What it prevents is
+// the cliff — a fleet enrolled on one afternoon whose certificates all expire on
+// the same day a year later, with no warning louder than a log line and no way
+// back except re-enrolling every machine by hand.
+func WithRenewal(ca *wirecert.CA) HandlerOption {
+	return func(h *handler) { h.ca = ca }
+}
+
+// WithTrustBundle sets every authority a node should accept, which during a
+// rotation is more than one.
+func WithTrustBundle(pem []byte) HandlerOption {
+	return func(h *handler) { h.trust = pem }
 }
 
 // Handler serves the node wire.
@@ -111,6 +147,13 @@ func Handler(log *slog.Logger, p *Plane, store LeaseStore, jit JITSource, opts .
 	}
 
 	mux := http.NewServeMux()
+
+	// UNAUTHENTICATED, both of them, and deliberately outside forNode. A machine
+	// that has never enrolled has no certificate to present, and a node deciding
+	// whether to trust this control plane has to be able to read its authority
+	// before it trusts anything it says.
+	mux.HandleFunc("POST /v1/enroll", h.enroll)
+	mux.HandleFunc("GET /v1/ca", h.certificateAuthority)
 
 	mux.HandleFunc("POST /v1/register", h.register)
 	// THREE CLASSES, and the distinction is what a request can REACH.
@@ -135,6 +178,7 @@ func Handler(log *slog.Logger, p *Plane, store LeaseStore, jit JITSource, opts .
 	mux.HandleFunc("GET /v1/nodes/{node}/launched", h.forNewWork(h.launched))
 	mux.HandleFunc("POST /v1/nodes/{node}/describe", h.forNewWork(h.describe))
 	mux.HandleFunc("POST /v1/nodes/{node}/jit", h.forNode(h.jitConfig))
+	mux.HandleFunc("POST /v1/nodes/{node}/renew", h.forNode(h.renew))
 
 	return mux
 }
@@ -146,8 +190,13 @@ type handler struct {
 	jit         JITSource
 	requireCert bool
 
-	// tiers is the catalogue, by label, used to resolve a lease's scale set.
-	tiers map[string]config.Tier
+	// revocations answers whether a credential has been withdrawn, ca signs
+	// renewals and enrollments, and enrollments records who is asking to join.
+	// All three are nil on a loopback wire, which has no certificates.
+	revocations Revocations
+	ca          *wirecert.CA
+	trust       []byte
+	enrollments Enrollments
 
 	// sets caches the resolved scale set per tier.
 	//
@@ -213,20 +262,15 @@ func (h *handler) forNode(next http.HandlerFunc) http.HandlerFunc {
 // forOwnLease wraps every route that touches ONE named lease.
 //
 // A superseded process may finish what it was given and nothing else. Between an
-// incarnation and its replacement the node name and the certificate are
-// identical, so a permission keyed on either lets one host act on the other's
-// work: releasing capacity a running container is using, or advancing a lease it
-// never received.
+// incarnation and its replacement the node name and the certificate are identical,
+// so a permission keyed on either lets one host release capacity a running
+// container is using.
 //
-// RENEWAL IS HERE TOO, and the argument for leaving it out was wrong. "A
-// heartbeat only extends a lease" is true of one heartbeat and false of a
-// process that keeps sending them: repeated renewal does not hold capacity
-// slightly longer, it denies it indefinitely. If the current process dies before
-// releasing, the reaper is the mechanism that reclaims — and a superseded
-// process renewing that lease forever is precisely what stops it.
-//
-// Reads are here for the same reason: a lease id and its epoch are what a
-// release needs, and handing them out defeats the check on the release itself.
+// RENEWAL IS HERE TOO: "a heartbeat only extends a lease" is true of one heartbeat
+// and false of a process that keeps sending them. Repeated renewal does not hold
+// capacity slightly longer, it denies it indefinitely, and the reaper is what
+// reclaims when the current process dies. Reads are here for the same reason — a
+// lease id and its epoch are what a release needs.
 func (h *handler) forOwnLease(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		node := r.PathValue("node")
@@ -249,9 +293,20 @@ func (h *handler) forOwnLease(next http.HandlerFunc) http.HandlerFunc {
 		// outlives its replacement on purpose, and once the replacement goes silent
 		// the node is forgotten; requiring membership refused the drain its own
 		// lease at exactly the moment nothing else was renewing it.
-		if err := h.plane.MayMutateLease(node, incarnation, r.PathValue("lease")); err != nil {
+		lease := r.PathValue("lease")
+
+		if err := h.plane.MayMutateLease(node, incarnation, lease); err != nil {
 			writeStoreErr(w, err)
 
+			return
+		}
+
+		// AND THE LEDGER ANSWERS FOR A LEASE NOTHING HAS CLAIMED YET. The owners
+		// map holds only what this process has DELIVERED, so held escrow — and
+		// every lease in the window after a restart, before the fleet re-adopts —
+		// is legitimately missing from it, and MayMutateLease has nothing left to
+		// refuse with but fleet membership, which every registered node passes.
+		if !h.plane.LeaseOwnerRecorded(lease) && !h.ledgerAgrees(w, r, node, lease) {
 			return
 		}
 
@@ -259,25 +314,60 @@ func (h *handler) forOwnLease(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// ledgerAgrees reports whether the ledger places this lease on this node,
+// answering the request itself when it does not.
+//
+// COALESCE(node, target_node), the way the rest of the arithmetic attributes a
+// lease: escrow chose the machine long before a bind fills `node` in, and that
+// choice is what billet advertised against. A lease the ledger has not placed at
+// all is allowed through — that is the recovery path, where a node re-adopts
+// what it is already running.
+func (h *handler) ledgerAgrees(w http.ResponseWriter, r *http.Request, node, leaseID string) bool {
+	lease, err := h.store.Lease(r.Context(), leaseID)
+	if err != nil {
+		writeStoreErr(w, err)
+
+		return false
+	}
+
+	// A LEDGER THAT SAYS NOTHING CONTRADICTS NOTHING. A store may answer with no
+	// lease and no error, and refusing on that would turn a lookup miss into a
+	// node losing the right to maintain compute it is running.
+	if lease == nil {
+		return true
+	}
+
+	placed := lease.Node
+	if placed == "" {
+		placed = lease.TargetNode
+	}
+
+	if placed == "" || placed == node {
+		return true
+	}
+
+	writeStoreErr(w, fmt.Errorf(
+		"%w: the ledger places lease %s on node %q and this request came from %q. A node may "+
+			"change the fate only of work placed on it",
+		ErrSuperseded, leaseID, placed, node))
+
+	return false
+}
+
 // forNewWork wraps a route by which a node ACQUIRES work or capacity.
 //
-// SUPERSEDING A NODE MUST NOT SILENCE IT, and treating every route alike was a
-// way to lose a lease outright. A host that is superseded — a copied bundle
-// arriving on a second machine — may well be holding a container right now. It
-// is refused new work, because two hosts under one name cannot both be given
-// work. It is NOT refused the calls that maintain and conclude what it already
-// has: the heartbeat that keeps its lease alive, and the result that hands
-// custody over.
+// SUPERSEDING A NODE MUST NOT SILENCE IT. A superseded host may be holding a
+// container right now: it is refused new work, because two hosts under one name
+// cannot both be given work, but NOT the calls that maintain and conclude what it
+// already has.
 //
-// Fencing those was worse than not fencing at all. Registration tells the
-// listener the node has custody, so the listener stops heartbeating; if the
-// superseded process can then neither renew nor report, the lease expires while
-// its container runs and the capacity is resold. The tombstone recorded for
-// exactly that report becomes unreachable by the only process that could consume
-// it.
+// Fencing those is worse than not fencing at all. Registration tells the listener
+// the node has custody, so the listener stops heartbeating; if the superseded
+// process can then neither renew nor report, the lease expires while its container
+// runs and the capacity is resold.
 //
-// The same distinction the expiry rules needed, one layer over: eligibility for
-// NEW work and permission to maintain EXISTING work have different lifetimes.
+// Eligibility for NEW work and permission to maintain EXISTING work have different
+// lifetimes.
 func (h *handler) forNewWork(next http.HandlerFunc) http.HandlerFunc {
 	return h.guard(next, true)
 }
@@ -316,12 +406,11 @@ func (h *handler) authorise(w http.ResponseWriter, r *http.Request, claimed stri
 		return true
 	}
 
-	// BELT AND BRACES. tls.RequireAndVerifyClientCert means an unverified
-	// connection never reaches a handler, so this branch should be unreachable —
-	// which is precisely why it is here. If some future wiring serves this mux
-	// over a listener that does not require certificates, the failure must be a
-	// refusal rather than every request silently authenticating as whatever the
-	// path says.
+	// THE LOAD-BEARING CHECK, not a formality. The listener verifies a
+	// certificate IF one is given but does not require one, because an unenrolled
+	// machine has none and still has to reach /v1/enroll and /v1/ca. So this is
+	// what separates those two routes from every other: anything wrapped in a
+	// guard refuses a connection with no verified chain.
 	if r.TLS == nil || len(r.TLS.VerifiedChains) == 0 || len(r.TLS.PeerCertificates) == 0 {
 		writeErr(w, http.StatusUnauthorized, nodeapi.CodeUnauthenticated,
 			"this wire requires a client certificate issued by the deployment's authority")
@@ -350,6 +439,50 @@ func (h *handler) authorise(w http.ResponseWriter, r *http.Request, claimed stri
 		return false
 	}
 
+	return h.notRevoked(w, r, name)
+}
+
+// notRevoked refuses a credential that has been withdrawn.
+//
+// ON EVERY REQUEST, not only at registration. A node holds one long poll open
+// for the better part of a minute and re-registers rarely, so a check at
+// registration alone would leave a revoked host working until it happened to
+// restart — which for a decommissioned machine an operator has just taken out of
+// service is exactly the case that matters.
+//
+// AND IT FAILS CLOSED. An unreadable revocation list refuses the request rather
+// than assuming nothing is revoked, because the alternative makes a transient
+// database fault equivalent to switching the check off.
+func (h *handler) notRevoked(w http.ResponseWriter, r *http.Request, name string) bool {
+	if h.revocations == nil {
+		return true
+	}
+
+	serial := wirecert.Serial(r.TLS.PeerCertificates[0])
+
+	revoked, err := h.revocations.CertRevoked(r.Context(), serial)
+	if err != nil {
+		h.log.Error("could not check whether a node certificate has been revoked; refusing "+
+			"the request rather than assuming it is good",
+			"node", name, "serial", serial, "error", err)
+
+		writeErr(w, http.StatusServiceUnavailable, nodeapi.CodeUnavailable,
+			"billet cannot reach its revocation list, so it cannot admit this connection")
+
+		return false
+	}
+
+	if revoked {
+		h.log.Warn("a node connected with a certificate that has been revoked",
+			"node", name, "serial", serial, "path", r.URL.Path)
+
+		writeErr(w, http.StatusForbidden, nodeapi.CodeRefused,
+			"this certificate has been revoked; ask an operator to issue a new one with "+
+				"`billet ca issue`")
+
+		return false
+	}
+
 	return true
 }
 
@@ -368,6 +501,204 @@ func (h *handler) warnIfExpiring(r *http.Request, node string) {
 			"node", node, "expires_in", left.Round(time.Hour),
 			"not_after", r.TLS.PeerCertificates[0].NotAfter)
 	}
+}
+
+// certificateAuthority serves the authority a node verifies this control plane
+// against.
+//
+// PUBLIC BY CONSTRUCTION. A CA certificate is presented in every handshake and
+// already sits on every enrolled node; serving it reveals nothing. The security
+// is entirely in what the NODE does with it: compare the fingerprint against a
+// value an operator read off the server and gave it out of band. A node that
+// skips that comparison has trusted whatever answered, which is why the client
+// refuses to enroll without one.
+func (h *handler) certificateAuthority(w http.ResponseWriter, _ *http.Request) {
+	if h.ca == nil {
+		writeErr(w, http.StatusNotFound, nodeapi.CodeRefused,
+			"this control plane has no certificate authority; it serves a loopback wire")
+
+		return
+	}
+
+	writeJSON(w, http.StatusOK, nodeapi.CAResponse{
+		CAPEM:       string(h.trustBundle()),
+		Fingerprint: h.ca.Fingerprint(),
+		Deployment:  h.plane.deployment,
+	})
+}
+
+// enroll records a machine asking to join, and hands back a certificate once an
+// operator has approved it.
+//
+// ASKING GRANTS NOTHING. The request sits as `pending` until an operator
+// compares the fingerprint it reports against the one the node printed on its
+// own console and approves that exact value. Until then this returns "pending"
+// and the node keeps asking.
+//
+// A NAME IS CLAIMED BY THE FIRST KEY TO ASK. A second key wanting the same name
+// is refused rather than replacing it, because overwriting would mean an
+// operator who compared a fingerprint yesterday is approving a different machine
+// today under a name they already trust.
+func (h *handler) enroll(w http.ResponseWriter, r *http.Request) {
+	if h.ca == nil || h.enrollments == nil {
+		writeErr(w, http.StatusNotFound, nodeapi.CodeRefused,
+			"this control plane does not enroll nodes; it serves a loopback wire, where there "+
+				"are no certificates")
+
+		return
+	}
+
+	var req nodeapi.EnrollRequest
+	if !decode(w, r, &req) {
+		return
+	}
+
+	if err := config.ValidateNodeName("node", req.Node); err != nil {
+		writeErr(w, http.StatusBadRequest, nodeapi.CodeRefused, err.Error())
+
+		return
+	}
+
+	fingerprint, err := wirecert.FingerprintOfCSR([]byte(req.CSRPEM))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, nodeapi.CodeRefused, err.Error())
+
+		return
+	}
+
+	// SPENT ONLY WHEN THE REQUEST IS NEW. A node polls this endpoint until an
+	// operator decides, so charging every call would spend a single-use token on
+	// the second poll and strand the machine it was minted for.
+	if !h.knownEnrollment(r.Context(), req.Node, fingerprint) {
+		if err := h.enrollments.SpendJoinToken(r.Context(), req.JoinToken); err != nil {
+			// A LEDGER THAT CANNOT ANSWER IS NOT A BAD CREDENTIAL. Reporting one
+			// as the other sends an operator to mint tokens that cannot help,
+			// because the next one fails the same way — and the error that would
+			// have said so was never written down.
+			if !errors.Is(err, alloc.ErrBadJoinToken) {
+				h.log.Error("could not check a join token", "node", req.Node, "error", err)
+
+				writeErr(w, http.StatusServiceUnavailable, nodeapi.CodeUnavailable,
+					"billet could not check this join token; try again")
+
+				return
+			}
+
+			h.log.Warn("an enrollment was attempted without a usable join token",
+				"node", req.Node, "fingerprint", fingerprint)
+
+			writeErr(w, http.StatusUnauthorized, nodeapi.CodeUnauthenticated,
+				"enrolling needs a join token: run `billet ca token` on the control plane and "+
+					"pass it as --join-token")
+
+			return
+		}
+	}
+
+	enrollment, err := h.enrollments.RequestEnrollment(r.Context(), req.Node, fingerprint, req.CSRPEM)
+	if err != nil {
+		if errors.Is(err, alloc.ErrEnrollmentConflict) {
+			h.log.Warn("a second key asked to join under a name that is already claimed",
+				"node", req.Node, "fingerprint", fingerprint)
+
+			writeErr(w, http.StatusConflict, nodeapi.CodeRefused, err.Error())
+
+			return
+		}
+
+		h.log.Error("could not record an enrollment request", "node", req.Node, "error", err)
+
+		writeErr(w, http.StatusServiceUnavailable, nodeapi.CodeUnavailable,
+			"billet could not record this request; try again")
+
+		return
+	}
+
+	res := nodeapi.EnrollResponse{State: enrollment.State, Fingerprint: enrollment.Fingerprint}
+
+	if enrollment.State == alloc.EnrollApproved {
+		res.CertPEM = enrollment.CertPEM
+		res.CAPEM = string(h.trustBundle())
+	}
+
+	if enrollment.State == alloc.EnrollPending {
+		h.log.Info("a node is asking to join and is waiting for approval",
+			"node", req.Node, "fingerprint", fingerprint)
+	}
+
+	writeJSON(w, http.StatusOK, res)
+}
+
+// knownEnrollment reports whether this exact request has already been recorded,
+// which is what makes a node's repeated polling free.
+//
+// A READ, never a write. Asking the question must not record an answer.
+func (h *handler) knownEnrollment(ctx context.Context, name, fingerprint string) bool {
+	existing, found, err := h.enrollments.LookupEnrollment(ctx, name)
+
+	return err == nil && found && existing.Fingerprint == fingerprint
+}
+
+// trustBundle is every authority a node should accept.
+//
+// Set by the caller, because only it knows where the state directory is. Falls
+// back to the issuing authority alone, which is the ordinary case: no rotation
+// is running and there is nothing else to trust.
+func (h *handler) trustBundle() []byte {
+	if len(h.trust) > 0 {
+		return h.trust
+	}
+
+	return h.ca.CertPEM()
+}
+
+// renew signs a new certificate for a node that already has a valid one.
+//
+// THE AUTHENTICATED NAME IS THE SUBJECT, never the one in the request. A CSR's
+// subject is whatever the requester typed; the wire has already proved who this
+// is. Signing the CSR's own name would let any node with a valid certificate
+// mint one for any other name — every node able to impersonate every other,
+// through the endpoint meant to keep them working.
+//
+// A REVOKED CERTIFICATE CANNOT RENEW, which forNode has already settled by the
+// time this runs: revocation is checked on every authenticated request, so a
+// withdrawn credential cannot extend itself.
+func (h *handler) renew(w http.ResponseWriter, r *http.Request) {
+	node := r.PathValue("node")
+
+	if h.ca == nil {
+		writeErr(w, http.StatusNotImplemented, nodeapi.CodeRefused,
+			"this control plane does not sign renewals; it serves a loopback wire, where "+
+				"there are no certificates")
+
+		return
+	}
+
+	var req nodeapi.RenewRequest
+	if !decode(w, r, &req) {
+		return
+	}
+
+	bundle, err := h.ca.SignNodeCSR(node, []byte(req.CSRPEM))
+	if err != nil {
+		h.log.Warn("could not sign a node's renewal request", "node", node, "error", err)
+
+		writeErr(w, http.StatusBadRequest, nodeapi.CodeRefused,
+			fmt.Sprintf("this certificate request cannot be signed: %v", err))
+
+		return
+	}
+
+	h.log.Info("renewed a node certificate", "node", node)
+
+	// THE BUNDLE, NOT ONE CERTIFICATE. A renewal during a rotation is how the new
+	// authority reaches a node at all: it adopts what this carries, so carrying
+	// only the issuing one would leave it trusting nothing else and it would stop
+	// the moment the old authority is retired.
+	writeJSON(w, http.StatusOK, nodeapi.RenewResponse{
+		CertPEM: string(bundle.CertPEM),
+		CAPEM:   string(h.trustBundle()),
+	})
 }
 
 func (h *handler) register(w http.ResponseWriter, r *http.Request) {
@@ -717,7 +1048,7 @@ func (h *handler) jitConfig(w http.ResponseWriter, r *http.Request) {
 	// would join a tier with different labels, different jobs and possibly
 	// different secrets. The set is resolved here, from the lease's own tier,
 	// rather than taken from the request.
-	known, ok := h.tiers[tier]
+	known, ok := h.plane.tierFor(tier)
 	if !ok {
 		writeErr(w, http.StatusForbidden, nodeapi.CodeRefused, fmt.Sprintf(
 			"lease %s names tier %q, which is not in this control plane's catalogue", leaseID, tier))

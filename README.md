@@ -22,14 +22,13 @@ cloud; the AWS-based projects are AWS-only; the microVM products are commercial.
 [Alternatives](#alternatives) for an honest comparison, including cases where you should use
 something else.
 
-> The failover part is **half built**. A tier can name several backends, and the
-> control plane already picks among registered nodes in the tier's preference
-> order. What is missing is choosing when the job is ADMITTED rather than after —
-> capacity is one deployment-wide budget, so nothing weighs a node's spare room or
-> its cost before accepting the work
-> ([#30](https://github.com/junioryono/billet/issues/30)). And there is no EC2
-> provider to fail over TO ([#32](https://github.com/junioryono/billet/issues/32)),
-> so none of it can be exercised yet. See [Status](#status).
+> The failover MACHINERY is built and has nowhere to fail over to. A tier can name
+> several backends, capacity is measured per machine, and the control plane picks
+> the host when the job is admitted — in the tier's own order of preference, so
+> `[firecracker, ec2]` means the box at home before the cloud. What is missing is
+> the cloud: Docker is the only provider, so today a second machine is a second
+> Docker host ([#32](https://github.com/junioryono/billet/issues/32)). See
+> [Status](#status).
 
 ## What it is
 
@@ -110,9 +109,7 @@ sudo -H -u billet billet check --config /etc/billet/billet.yaml
 sudo systemctl enable --now billet-server
 ```
 
-**A compute host** — runs the containers. It needs a `node:` section naming the
-control plane, and the certificate bundle `billet ca issue <name>` produced
-there (see [Adding a second machine](#adding-a-second-machine)):
+**A compute host** — runs the containers. It needs a `node:` section naming the control plane, and a certificate: either enroll it and approve its fingerprint, or issue one directly (see [Adding a second machine](#adding-a-second-machine)):
 
 ```bash
 sudoedit /etc/billet/billet.yaml     # uncomment and fill in the node: section
@@ -181,46 +178,81 @@ built. What works **today**:
 | `billet github-app create` | Creates and installs the GitHub App via the manifest flow |
 | `billet check` | Validates the config, the App private key, and the state database |
 | `billet server --dry-run` | Connects to a real org, reconciles scale sets, polls — accepts nothing |
-| `billet server` | The control plane on its own, serving the node wire. **Start the nodes first** — capacity is advertised from the budget without checking that any node exists, so a job assigned while none is registered is acquired and fails to launch. billet releases its own capacity, but it has no way to decline the assignment — that stays with GitHub until the pickup deadline, which cancels and requeues it [up to three times](https://github.com/actions/scaleset/blob/v0.4.0/README.md#job-reassignment) |
-| `billet server --dev` | Control plane + node in one process: acquires jobs and runs them in containers |
-| `billet node` | A separate compute host that dials the control plane and never listens |
-| `billet ca issue <node>` | Mints the certificate a node authenticates with, for an operator to copy |
+| `billet server` | The control plane, serving the node wire. It runs no compute of its own — a machine that should also run jobs runs `billet node` beside it. A fleet with no live node advertises zero, so an empty fleet is told to GitHub rather than discovered when a job fails to launch |
+| `billet node` | A compute host: dials the control plane, never listens. One per machine, including the machine the server is on |
+| `billet node --enroll` | Asks a control plane to admit this machine, printing the fingerprint an operator compares |
+| `billet nodes pending` | Shows what is waiting to be let in, with the fingerprint to check |
+| `billet nodes approve <node> --fingerprint <fp>` | Admits the machine whose fingerprint you compared |
+| `billet ca token` | Mints the short-lived credential a machine needs to ask |
+| `billet ca show` | The authority's fingerprint, expiry, and whether a rotation is running |
+| `billet ca issue <node>` | Mints a certificate directly, for a machine you are provisioning anyway |
+| `billet ca revoke <node>` | Withdraws a certificate; refused on the next request it makes |
+| `billet ca rotate` / `retire` | Replaces the authority as an overlap, so no node is cut off |
 | `billet teardown` | Removes the scale sets billet created |
 | Capacity ledger | Lease state machine, fencing epochs, placement enforcement, escrow before advertising |
 | Docker provider | One container per job, JIT registration delivered off argv. **Trials only** — shares the host kernel, so it refuses anything not established as trusted |
 | Crash recovery | A job running when the controller dies is adopted and left to finish, not killed; its capacity stays held |
+| Per-machine capacity | Each node reports what it contributes; a tier advertises the smaller of the deployment ceiling and what its machines can hold. A host nothing can reach stops backing advertisements |
+| Placement | The control plane chooses the machine when the work is admitted, by provider preference, then packing (`placement: spread` to even the load instead), then name. Reserved floors are held against the machines that could keep them |
+| Sites | A node says where it is; a tier may insist on a place. Carries identity today — the storage that will key off it is [#23](https://github.com/junioryono/billet/issues/23) |
 | Graceful drain | SIGTERM stops it taking new work and waits for the jobs already running, so `systemctl restart` does not fail somebody's build. See [Updating](#updating) |
 | Release pipeline | Tagged releases with checksums, `.deb`/`.rpm` with systemd units, and the install script — **built and never yet run: there are no tags, so no release exists to install.** Build from source until there is one |
-| Multi-backend tiers | One label can name several providers and be placed on any of them, and the preference order IS honoured when the control plane picks among registered nodes (`nodeplane.pick` walks it most-preferred-first). What is missing is choosing at escrow time, against per-node capacity and cost ([#30](https://github.com/junioryono/billet/issues/30)) — and Docker is the only provider built, so the ordering cannot be exercised yet |
+| Multi-backend tiers | One label can name several providers, and the preference ORDER decides: the control plane picks the host when the job is admitted, walking the tier's list most-preferred-first. Docker is the only provider built, so the fallback half cannot be exercised yet ([#32](https://github.com/junioryono/billet/issues/32)) |
 
-**Not built:** Firecracker, Apple Silicon and EC2 providers; the cache; sticky disks; admission-time
-placement, which is what would let provider preference and a cost policy govern whether work is taken
-on at all rather than only which registered node runs it; observability; the dashboard.
+**Not built:** Firecracker, Apple Silicon and EC2 providers; the cache; sticky disks; a cost policy,
+which needs a provider that charges money before there is anything to weigh; observability; the
+dashboard.
 
-**billet is a one-machine product today, and the reasons are specific rather than general.** Capacity
-is a single deployment-wide budget rather than a figure per machine, so two hosts of different sizes
-cannot be described ([#21](https://github.com/junioryono/billet/issues/21)); the node is chosen only
-once a job has already been acquired, so nothing weighs capacity or cost when the work is admitted
-([#30](https://github.com/junioryono/billet/issues/30)); a destroy is
-broadcast to every node instead of addressed to the one holding the job
-([#31](https://github.com/junioryono/billet/issues/31)); and a cache lives on the machine that built
-it ([#23](https://github.com/junioryono/billet/issues/23)). Each is invisible with one machine and
-wrong the moment there are two. [#33](https://github.com/junioryono/billet/issues/33) tracks the
-whole plan.
+**billet runs a fleet, with one thing still missing before it is worth having one.** Capacity is a
+figure per machine, so hosts of different sizes can be described and a tier advertises only what its
+machines can actually hold. The control plane chooses the host when the work is ADMITTED — which is
+what finally makes `providers: [firecracker, ec2]` mean "the machine at home first, the cloud if you
+must" — and a destroy goes to the machine holding the container rather than to everyone
+([#21](https://github.com/junioryono/billet/issues/21),
+[#30](https://github.com/junioryono/billet/issues/30),
+[#31](https://github.com/junioryono/billet/issues/31)).
+
+What is still true is that **a cache lives on the machine that built it**
+([#23](https://github.com/junioryono/billet/issues/23)), so a second host is a second cold cache
+until shared storage lands. And there is still only one provider, so a second machine today means a
+second Docker host rather than the cloud fallback the labels can already express
+([#32](https://github.com/junioryono/billet/issues/32)).
+[#33](https://github.com/junioryono/billet/issues/33) tracks the whole plan.
 
 ### Adding a second machine
 
-A control plane bound to a network address requires client certificates, and mints its own authority
-to issue them. There is no CA to run and nothing to install:
+A control plane bound to a network address requires client certificates, and mints its own authority to issue them. There is no CA to run and nothing to install.
+
+**The machine asks, and you approve a fingerprint.** Two ends display the same number and you check they match — that comparison is the trust decision, and everything else is transport.
+
+```bash
+# on the control plane
+billet ca show                      # prints the authority's fingerprint
+billet ca token                     # prints a short-lived join token
+
+# on the new machine
+billet node --enroll \
+  --ca-fingerprint SHA256:...  \
+  --join-token h7q2...              # prints THIS machine's fingerprint, then waits
+
+# back on the control plane
+billet nodes pending                # shows the same fingerprint, if nothing is in the way
+billet nodes approve mac-mini-1 --fingerprint SHA256:...
+```
+
+Neither side accepts on faith. The node refuses to enroll without the authority's fingerprint, because its first connection has nothing to verify against — accepting whatever answered would let anyone who replies first own every job that node runs. And approval refuses without the node's fingerprint, because approving by name alone approves whatever currently holds the name.
+
+The join token is what stops a stranger who can reach the port filling that pending list, or taking a name before the machine that should have it. It is short-lived, counted, and stored as a hash.
+
+**Or issue a certificate directly**, which is right for a machine you are provisioning anyway — cloud-init can drop a bundle on it, and no human is standing there to compare a fingerprint:
 
 ```bash
 # on the control plane
 billet ca issue mac-mini-1          # writes ./mac-mini-1-billet-tls/
 scp -r mac-mini-1-billet-tls mac-mini-1:/etc/billet/tls
 
-# in that host's billet.yaml
+# in that host's billet.yaml — node.name comes from the certificate
 node:
-  name: mac-mini-1
   server_addr: billet.example:7717
   tls:
     cert: /etc/billet/tls/node.crt
@@ -228,10 +260,15 @@ node:
     ca:   /etc/billet/tls/ca.crt
 ```
 
-The name in the certificate is the only thing that decides which node a request is from — a host
-holding this bundle can act as `mac-mini-1` and as nothing else. The certificate also carries which
-**deployment** it belongs to, so the copied bundle is all a fresh host needs; it does not invent an
-identity the control plane would refuse.
+Both paths are recorded, so `billet nodes pending --all` is the single answer to what has been admitted and when.
+
+The name in the certificate is the only thing that decides which node a request is from — a host holding a bundle can act as that node and as nothing else. The certificate also carries which **deployment** it belongs to, so a fresh host does not invent an identity the control plane would refuse.
+
+**Certificates renew themselves** when less than a third of their life remains, over the wire, with the private key never leaving the node. A certificate that has already expired cannot renew — renewal is authenticated by the certificate being renewed — so that machine has to be re-enrolled; the window is months, so it only happens to a host that was powered off throughout.
+
+**Taking one back:** `billet ca revoke <node>` refuses it on the very next request it makes, rather than at its expiry.
+
+**Replacing the authority** is an overlap rather than a switch, because a node trusts what it was given: `billet ca rotate` has the new authority issue node certificates while the old one still signs what the server presents and both stay trusted, nodes adopt the new one as they renew, and `billet ca retire` ends it once they have.
 
 Loopback stays plain HTTP, because there is nothing between the two processes to authenticate
 against. Anything else refuses to start without a certificate rather than serving unauthenticated on
@@ -251,38 +288,24 @@ Everything below describes the intended design. Where a thing is not built, it s
 
 ## Quickstart
 
-> **The example config does not run as shipped**, and the provider is not the only thing to change. It
-> describes the intended Firecracker deployment, and that provider is not built, so `--dev` refuses
-> it. Change `provider: firecracker` to `provider: docker` in the `node:` section and in every tier
-> — **and** change each tier's `image:` to a Docker image containing the GitHub runner, such as
-> `ghcr.io/actions/actions-runner:latest`. The image name is handed straight to `docker run`, so
-> `ubuntu-2404-x64` is a Firecracker golden-image name and will not pull. Making only the first edit
-> gets you a config that validates and a server that starts, and jobs that all fail to launch.
-> Docker shares the host kernel and is for trials rather than for untrusted code. `billet init` is
-> not built either — copy the example.
+> **Use `billet init` rather than copying `billet.example.yaml`.** The example describes the intended Firecracker deployment, and that provider is not built, so it does not run as shipped: the provider has to change in the node section and in every tier, and each tier's `image:` has to become something pullable, because the image name is handed straight to the backend and `ubuntu-2404-x64` is a golden-image name. `billet init` writes a config that runs today.
+>
+> Docker shares the host kernel and is for trials rather than for untrusted code.
 
 ```bash
-billet github-app create --org myorg           # creates + installs the App, PRINTS a github: block
-cp billet.example.yaml ./billet.yaml           # then edit it — see below, three things
-billet check --config ./billet.yaml            # validates config, key, state
-billet server --dry-run --config ./billet.yaml  # first contact: polls, accepts nothing
-billet server --dev --config ./billet.yaml     # runs jobs
+billet init --org myorg --config ./billet.yaml     # writes a config sized to this machine
+billet github-app create --org myorg --config ./billet.yaml   # creates the App, fills the block in
+billet check --config ./billet.yaml                # validates config, key, state
+
+billet server --config ./billet.yaml               # then, in two terminals:
+billet node   --config ./billet.yaml               # the machine that runs the jobs
 ```
 
-**The three edits**, because nothing writes the file for you:
+`billet init` measures this host and writes a ceiling below what it found, leaving room for the kernel, the container runtime and your shell. It picks a runner image that is actually pullable, points the state directories somewhere writable, and describes both roles in one file. Nothing in it has to be hand-edited: `github-app create --config` writes the App ids into the same file rather than printing a block to paste, and it will not overwrite a config you already have without `--force`.
 
-1. **Paste the `github:` block** that `github-app create` printed. It prints; it does not edit your
-   config, so `app_id` and `installation_id` stay `0` and `billet check` says so. The block already
-   carries `private_key_path` pointing at the key it just wrote, so pasting it settles that too.
-2. **`provider: docker` and a runner `image:`**, in the `node:` section and every tier — see the
-   warning above.
-3. **`server.state_dir`** defaults to `/var/lib/billet/server`, which an unprivileged `billet server`
-   cannot create. Point it somewhere you can write (`./state/server`) or pre-create it with the right
-   owner. `node.state_dir` only matters for a standalone `billet node`; `--dev` never reads it.
+**A single machine runs both roles**, as two processes reading that one file. They talk over the loopback address in `server.listen`, so nothing is exposed to the network and no certificates are involved: a control plane listening only on loopback serves plain HTTP, because there is nothing between two processes on one box to authenticate. Certificates start mattering when you add a second machine — `billet ca issue <node>` mints one, the new host's `node.name` comes from it, and the server then has to listen where that machine can reach it.
 
-**And Docker has to be there.** `billet check` never touches it, but `server --dev` calls
-`docker ps` before it polls anything, to re-adopt containers from a previous run. No CLI, no running
-daemon, or no permission on the socket, and it stops there.
+**And Docker has to be there.** `billet check` never touches it, but `billet node` calls `docker ps` before it takes any work, to re-adopt containers from a previous run. No CLI, no running daemon, or no permission on the socket, and it stops there.
 
 `--config` is not optional here. billet deliberately does **not** read a
 `billet.yaml` from the working directory — a server started from a directory
@@ -303,10 +326,11 @@ jobs:
 One binary, two roles (the Nomad/Consul model):
 
 ```
-billet server        control plane — scale-set listeners, capacity allocator, scheduler, state
-billet node          compute host  — runs a provider, launches instances, reports capacity
-billet server --dev  both, on one box
+billet server   control plane — scale-set listeners, capacity allocator, scheduler, state
+billet node     compute host  — runs a provider, launches instances, reports capacity
 ```
+
+One machine runs both as two processes over loopback; there is no combined mode.
 
 ```
                  GitHub  ◄── outbound long-poll only, no inbound

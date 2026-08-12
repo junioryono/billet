@@ -1,8 +1,8 @@
 # billet configuration — copy to billet.yaml and edit.
 #
 # THIS FILE DOES NOT RUN AS SHIPPED. It describes the intended deployment, which
-# is Firecracker, and the Firecracker provider is not built — `billet server
-# --dev` refuses it. Two edits HERE make it start today, and both are needed —
+# is Firecracker, and the Firecracker provider is not built — `billet node`
+# refuses it. Two edits HERE make it start today, and both are needed —
 # the README's quickstart lists what else the file needs (the github: block, a
 # writable server.state_dir) and the Docker daemon it assumes:
 #
@@ -20,10 +20,20 @@
 # warm_pool, and the whole `firecracker:` block is unused. Docker shares the
 # host kernel and is for trials rather than for untrusted code.
 #
-# This example is the single-machine deployment: control plane and compute host
-# in one process, started with `billet server --dev`. Split them by running
-# `billet server` here and `billet node` on each additional machine, with the
-# node's server_addr pointing back at this listen address.
+# This example is the single-machine deployment, which is TWO PROCESSES reading
+# this one file:
+#
+#   billet server --config ./billet.yaml     # the control plane
+#   billet node   --config ./billet.yaml     # the compute host
+#
+# They talk over the loopback address below. Nothing is exposed to the network
+# and no certificates are involved — a control plane listening only on loopback
+# serves plain HTTP, because there is nothing between two processes on one box to
+# authenticate. (Setting node.tls against a loopback server is refused for that
+# reason.) Add machines by running `billet node` on each with its own copy of
+# this file, its server_addr pointing at this one, and a bundle from
+# `billet ca issue` — at which point the server has to listen on an address those
+# machines can reach, and the wire becomes mTLS.
 
 server:
   # Nodes dial the server; the server never dials out except to GitHub. On a
@@ -80,6 +90,30 @@ server:
   max_vcpu: 120
   max_memory: 480GiB
 
+  # WHICH MACHINE A JOB GOES TO, once more than one could take it. Only
+  # meaningful with a fleet; a single-host deployment can ignore it.
+  #
+  #   pack   (default) fill a machine before starting on the next
+  #   spread             keep machines as even as possible
+  #
+  # PACK BECAUSE FRAGMENTS CANNOT HOLD A BIG JOB. Spreading leaves every host
+  # partly used, and six 4 vCPU jobs spread across two 16 vCPU machines leave
+  # four free on each — so an 8 vCPU job fits nowhere while eight vCPU sit idle
+  # in the fleet. A job that cannot be placed is worse than a job that shares a
+  # disk.
+  #
+  # The usual reason to spread is contention, and it is weaker here than it
+  # looks: billet escrows vCPU and memory and the provider enforces both per
+  # container, so two jobs on one host do not take each other's cores or RAM.
+  # What they share is disk, page cache and network — so reach for `spread` if
+  # your builds are IO-heavy and you would rather fit less work than have them
+  # contend.
+  #
+  # Provider preference always wins over this: `providers: [firecracker, ec2]`
+  # means the machine at home before the cloud, whichever policy is set.
+  #
+  # placement: pack
+
 github:
   org: your-org
 
@@ -95,11 +129,56 @@ github:
   installation_id: 0
   private_key_path: /etc/billet/app-private-key.pem
 
+# Read by `billet node`. On a single machine this sits beside the server section
+# above and the two processes share the file.
 node:
+  # OPTIONAL WITH A CERTIFICATE. The control plane authorises a node by the name
+  # in its certificate, so an enrolled host takes its name from there and this
+  # key is a second place to write the same fact. Set it on a loopback node,
+  # which has no certificate to take one from — and if it is set alongside a
+  # certificate, the two must agree.
   name: epyc-1
   server_addr: 127.0.0.1:7717
   provider: firecracker
+
+  # NODE-LOCAL DATA: the generation pointer store, the image cache, and this
+  # host's mTLS identity. It is not the server's state_dir and does not need to
+  # be — a node with no certificate takes its deployment identity from the
+  # `server:` section in this same file, which is what lets the two directories
+  # differ on one machine.
+  #
+  # A node whose file has NO server section (the ordinary multi-machine case)
+  # gets its identity from its certificate instead.
   state_dir: /var/lib/billet/node
+
+  # Where this host takes the deployment lock, which stops two processes managing
+  # the same containers. It belongs to the node because the node is what runs
+  # them; the control plane takes no lock. Leave it unset for the per-user
+  # default. (This key used to be `server.lock_dir` too — it is node-only now.)
+  #
+  # lock_dir: /run/billet/locks
+
+  # WHAT THIS MACHINE CONTRIBUTES, which is not the same as what it has. Unset
+  # means "everything I can detect", which is what a dedicated box wants.
+  #
+  # Declared HERE, on the machine, rather than in the control plane's config,
+  # because the person running this host is the one who knows what else it does.
+  # Setting them above what the machine has is allowed — overcommitting is a
+  # decision you are entitled to make — and warned about at startup.
+  #
+  # A number here is what the allocator escrows against, so it is also the
+  # answer to "why is this host not being given work".
+  #
+  # max_vcpu: 120
+  # max_memory: 480GiB
+
+  # WHERE THIS MACHINE IS, naming one of the control plane's declared sites
+  # below. Optional, and only meaningful once a deployment has more than one
+  # place. A node claiming a site the control plane does not declare is refused
+  # at registration — a typo would otherwise become a place of its own, with a
+  # cache of its own that is always empty.
+  #
+  # site: home
 
   # The bundle `billet ca issue epyc-1` wrote on the control plane, copied here.
   #
@@ -189,13 +268,13 @@ tiers:
   # preference order, so losing the box at home does not take the runs-on label
   # down with it — jobs land on EC2 instead.
   #
-  # The order IS honoured where the control plane picks: it walks this list
-  # most-preferred-first over the registered nodes. What does not exist is
-  # choosing when the job is ADMITTED — capacity is one deployment-wide budget,
-  # so billet can accept work no single machine can host. In `--dev` the node
-  # binds itself and placement can only accept or refuse the host that asked.
-  # And with Docker the only provider built, the EC2 half of this cannot be
-  # exercised at all yet.
+  # THE ORDER DECIDES. The control plane picks the machine when the job is
+  # ADMITTED, walking this list most-preferred-first over the hosts that can
+  # serve the tier and have room — so a job goes to the cloud only when home is
+  # full, rather than to whichever machine happened to ask first.
+  #
+  # What is missing is the cloud itself: Docker is the only provider built, so
+  # the EC2 half of this cannot be exercised yet (#32).
   #
   # - label: billet-8vcpu-ubuntu-2404
   #   providers: [firecracker, ec2]   # instead of `provider: firecracker`
@@ -248,6 +327,11 @@ tiers:
 # macOS guests and native Linux arm64 guests, but whether it does is your
 # decision — see the nodes section below.
 #
+# Apple's licence allows at most 2 concurrent macOS guests per physical Mac, and
+# that is WHY a macOS tier has to name its host: without the name billet cannot
+# tell which Mac to count a guest against, and two macOS tiers on one machine
+# would each believe they had 2.
+#
 # guest_os is what the licence check keys off — not the label — so a macOS tier
 # named anything at all is still capped, and a Linux tier with "macos" in its
 # name is not.
@@ -255,7 +339,7 @@ tiers:
 #  - label: billet-6vcpu-macos-26
 #    provider: tart
 #    guest_os: macos
-#    node: mac-mini-1      # required for macOS: the cap is per physical host
+#    node: mac-mini-1      # required: 2 macOS guests per Mac, counted per host
 #    vcpu: 6
 #    memory: 24GiB
 #    image: macos-26
@@ -313,3 +397,34 @@ tiers:
 # permits per Apple-branded host. billet does not know what agreement you have,
 # so raising it is allowed — but doing so is an assertion about YOUR licence,
 # not a tuning knob.
+
+# The places this deployment has compute in. Optional: a single-machine
+# deployment never writes one.
+#
+# A SITE IS WHERE COMPUTE AND ITS STORAGE SHARE A FAST NETWORK, which is the
+# answer to "which storage" — a question every cache has to have one of, because
+# a cache is fast precisely because it sits next to the machine using it.
+#
+# Declared here rather than inferred from what nodes claim, because a free
+# string cannot tell a typo from a new location: a node that means "home" and
+# types "hom" would get a site of its own, an empty cache, and every job placed
+# there running cold while the fleet looked healthy.
+#
+# Today a site carries identity, which is the half placement needs. The storage
+# backend that will hang off it — Ceph at a bare-metal site, EBS and S3 in a
+# cloud region — arrives with the storage layer (#23, #25).
+#
+# sites:
+#   - name: home
+#   - name: aws-us-west-2
+#
+# A tier may then insist on one, the way it can already pin a node — except a
+# site holds several machines, so it constrains WITHOUT giving up the fallback
+# that having several of them buys:
+#
+#   - label: billet-4vcpu-ubuntu-2404-home
+#     provider: firecracker
+#     site: home
+#     vcpu: 4
+#     memory: 16GiB
+#     image: ubuntu-2404-x64

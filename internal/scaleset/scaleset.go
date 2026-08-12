@@ -187,12 +187,11 @@ func (s *session) Close(ctx context.Context) error {
 //
 // JobStarted is dropped: it duplicates a transition the allocator already owns.
 //
-// JobAvailable is NOT dropped, and an earlier version of this comment confidently
-// explained why it should be. That was a misreading of the protocol. Available is
-// the offer — it is the message whose RunnerRequestID goes to AcquireJobs, which
-// is how a scale set claims work. Assigned is the later confirmation that a claim
-// succeeded. Acquiring from Assigned asks GitHub to claim work it has already
-// handed over, and drops every offer on the floor.
+// JobAvailable is NOT dropped. Available is the offer — the message whose
+// RunnerRequestID goes to AcquireJobs, which is how a scale set claims work.
+// Assigned is the later confirmation that a claim succeeded, so acquiring from
+// Assigned asks GitHub to claim work it has already handed over, and drops every
+// offer on the floor.
 func translate(msg *gh.RunnerScaleSetMessage) *server.Message {
 	out := &server.Message{MessageID: int64(msg.MessageID)}
 

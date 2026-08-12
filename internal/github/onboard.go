@@ -16,17 +16,12 @@ import (
 )
 
 // ErrCredentialPreserved marks a failure in which the App's private key was NOT
-// lost: it exists on disk, and the error that carries this sentinel says where.
+// lost: it exists on disk, and the error carrying this sentinel says where.
 //
-// It exists because the correct recovery advice is the opposite in the two
-// cases. A key that was never stored means the App is unusable and should be
-// deleted on GitHub; a key that was stored somewhere unexpected means the App
-// must be KEPT and the file moved into place. Onboarding cannot tell the two
-// apart from the error text, and the wrong instruction destroys a credential
-// GitHub will not re-issue.
-//
-// Callers that persist the credential wrap their errors with this whenever the
-// key reached durable storage.
+// The correct recovery advice is opposite in the two cases. A key that was never
+// stored means the App is unusable and should be deleted on GitHub; a key stored
+// somewhere unexpected means the App must be KEPT and the file moved. The wrong
+// instruction destroys a credential GitHub will not re-issue.
 var ErrCredentialPreserved = errors.New("the App key was preserved")
 
 // ErrCredentialUncertain marks a failure where billet could not determine
@@ -97,13 +92,11 @@ type OnboardOptions struct {
 	// OnAppCreated is called the moment the app's credentials exist, BEFORE the
 	// installation step. Required.
 	//
-	// This ordering is the whole point. GitHub registers the app during the
-	// browser redirect, and the private key is returned exactly once by the
-	// conversion — so if billet waited until the end of a successful onboarding
-	// to persist it, every failure in the installation phase (a timeout, a
-	// cancelled context, an API error, an operator who walks away) would leave a
-	// real registered app whose only key had been discarded. Returning an error
-	// here aborts, because continuing would produce that same orphan.
+	// The ordering is the point: GitHub registers the app during the browser redirect
+	// and the private key is returned exactly once by the conversion, so persisting it
+	// at the END would let any failure in the installation phase leave a real
+	// registered app whose only key had been discarded. Returning an error here aborts,
+	// because continuing produces that same orphan.
 	OnAppCreated func(*App) error
 
 	// Log receives human-facing progress. Required.
@@ -179,23 +172,17 @@ func Onboard(ctx context.Context, opts OnboardOptions) (*Onboarding, error) {
 
 	// Every route sits under an unguessable prefix.
 	//
-	// The start page carries the state in its form, and it was served from "/"
-	// on loopback — so any local process could fetch it, learn the state, and
-	// then present a valid-looking callback with a bogus code. Refusing invalid
-	// callbacks does not help there: the state IS valid, billet accepts the code,
-	// the exchange fails, and the flow dies with GitHub's App already created.
+	// Served from "/" on loopback, any local process could fetch the start page, learn
+	// the state, and present a valid-looking callback with a bogus code. Refusing
+	// invalid callbacks does not help: the state IS valid, the exchange fails, and the
+	// flow dies with GitHub's App already created.
 	//
-	// A 256-bit path is the same secret the state is, applied one step earlier.
-	//
-	// Its guarantee is narrower than it looks, and worth stating exactly: it
-	// defeats a process that must GUESS the path — port scanning, or walking
-	// loopback for a known route. It does NOT defeat a process that can observe
-	// this one, and on a shared host that is not a high bar: the URL is handed to
-	// `open`/`xdg-open` as a command-line argument, and argv is readable through
-	// /proc or ps. So the path and the state are both treated as knowable, and
-	// what a caller can DO with them is bounded separately — a forged callback
-	// cannot end the flow (handleCallback) and an injected code cannot either
-	// (register).
+	// The guarantee is narrower than it looks. It defeats a process that must GUESS the
+	// path; it does NOT defeat one that can observe this one, and the URL is handed to
+	// `open`/`xdg-open` as a command-line argument, which argv makes readable. So path
+	// and state are both treated as knowable, and what a caller can DO with them is
+	// bounded separately: a forged callback cannot end the flow, and an injected code
+	// cannot either.
 	secretPath, err := randomState()
 	if err != nil {
 		return nil, err
@@ -307,25 +294,18 @@ func (f *onboardFlow) register(ctx context.Context) (*App, error) {
 
 	// A code that does not redeem is DISCARDED, and the flow keeps waiting.
 	//
-	// The state stops a process that has to guess it, but billet passes the
-	// callback URL to `open`/`xdg-open` as a command-line argument, and argv is
-	// readable by other processes on this machine — so both the path and the
-	// state have to be assumed known. Treating the first code to arrive as final
-	// then handed any local process a kill switch: inject a worthless code, watch
-	// the exchange fail, and onboarding ends with GitHub's App already created
+	// Both the path and the state have to be assumed known, because billet passes the
+	// callback URL to `open` as a command-line argument. Treating the first code to
+	// arrive as final therefore hands any local process a kill switch: inject a
+	// worthless code, watch the exchange fail, and onboarding ends with the App created
 	// and its one-time private key unrecoverable.
 	//
-	// Only a 404 DROPS a code. Everything else — every other status, and a
-	// request that could not be completed at all — keeps it and tries again.
+	// Only a 404 DROPS a code. Everything else keeps it and tries again.
 	//
-	// Codes are tried ROUND-ROBIN, and a code that stays ambiguous never blocks
-	// another one.
-	//
-	// Retrying a single code inside a blocking loop reopened the kill switch in
-	// slow motion: a local process submits a malformed code that consistently
-	// draws 422, the retry loop sits on it, and the honest redirect waits in the
-	// queue until GitHub's window closes with the App created and its key
-	// unrecoverable. Nothing is discarded and nothing is allowed to monopolise.
+	// Codes are tried ROUND-ROBIN, so one that stays ambiguous never blocks another.
+	// Retrying a single code in a blocking loop reopens the kill switch in slow motion:
+	// a consistently-422 code monopolises the loop while the honest redirect waits for
+	// GitHub's window to close.
 	pending := make([]string, 0, 1)
 	seen := make(map[string]bool)
 	backoff := initialExchangeBackoff
@@ -333,18 +313,14 @@ func (f *onboardFlow) register(ctx context.Context) (*App, error) {
 	var lastRejection error
 
 	for {
-		// Take everything queued before spending time on any of it, so a code that
-		// arrived during the last round is tried in this one.
+		// Take everything queued before spending time on any of it, so a code that arrived
+		// during the last round is tried in this one.
 		//
-		// Every drained code is admitted. The bound applies to RETRIES, further
-		// down, and that distinction is the whole correctness of this loop.
-		//
-		// Bounding admission instead was strictly worse than not bounding it at
-		// all: eight injected codes that stay ambiguous fill the set permanently,
-		// and the honest redirect — already answered "App created" by the HTTP
-		// handler — is then dropped before it is ever tried. The unbounded version
-		// at least got to it eventually. A callback that was acknowledged must get
-		// at least one exchange attempt.
+		// Every drained code is admitted; the bound applies to RETRIES further down, and
+		// that distinction is the correctness of this loop. Bounding ADMISSION is worse
+		// than not bounding at all — eight ambiguous injected codes fill the set
+		// permanently, and the honest redirect, already answered "App created", is dropped
+		// before it is ever tried.
 		pending = addCodes(pending, seen, f.drainCodes())
 
 		if len(pending) == 0 {

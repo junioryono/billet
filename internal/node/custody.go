@@ -11,27 +11,22 @@ import (
 	"github.com/junioryono/billet/internal/server"
 )
 
-// custody is a lease whose capacity must keep being held because compute for it
-// may exist, and which nothing else in this process is managing.
+// custody is a lease whose capacity must keep being held because compute for it may
+// exist, and which nothing else in this process is managing.
 //
-// Two situations produce one, and they are the same situation seen from
-// different sides:
+// Two situations produce one:
 //
-//   - ADOPTED. A container survived a restart. The runner inside it is talking
-//     to GitHub directly and may well finish the job successfully, so destroying
-//     it is a deliberate job failure rather than a recovery. Billet cannot manage
-//     it — no request-id mapping, no completion handling — but it can keep the
-//     lease alive so the capacity is not resold, and clean up when the container
-//     stops.
+//   - ADOPTED. A container survived a restart. The runner inside is talking to
+//     GitHub directly and may finish successfully, so destroying it is a deliberate
+//     job failure rather than a recovery. billet cannot manage it, but it can keep
+//     the lease alive so the capacity is not resold.
 //
-//   - DISCARDED. A launch failed ambiguously and the cleanup could not be
-//     confirmed. The container may or may not exist; until billet knows it does
-//     not, its capacity must stay held. This is the case where releasing the
-//     lease on a launch error was quietly over-committing the host.
+//   - DISCARDED. A launch failed ambiguously and cleanup could not be confirmed.
+//     Until billet knows the container does not exist, its capacity stays held.
 //
-// Both need the same two things: a heartbeat so the reaper does not terminalize
-// the lease, and a repeated attempt to find out what happened. The only
-// difference is what a still-running instance means — leave it, or kill it.
+// Both need a heartbeat so the reaper does not terminalize the lease, and a repeated
+// attempt to find out what happened. The only difference is what a still-running
+// instance means — leave it, or kill it.
 type custody struct {
 	leaseID  string
 	epoch    int64
@@ -61,16 +56,13 @@ type custody struct {
 
 	// observed is true once billet has actually seen this instance exist.
 	//
-	// SEPARATE FROM discard, and conflating the two was a bug. The grace period
-	// before an absence is believed exists for compute that may never have
-	// started: a create whose response was lost can still be in flight inside the
-	// daemon. It has nothing to say about an instance billet WATCHED running and
-	// then found gone — that one has genuinely finished, and making it wait out
-	// the grace held its capacity for a minute after its job was over.
+	// SEPARATE FROM discard. The grace before an absence is believed exists for compute
+	// that may never have started — a create whose response was lost can still be in
+	// flight inside the daemon. It says nothing about an instance billet WATCHED
+	// running and then found gone, which has genuinely finished.
 	//
-	// Because discard flips to true when a completion arrives, checking it alone
-	// applied the stray grace to every adopted job at exactly the moment it
-	// finished.
+	// Since discard flips to true when a completion arrives, checking it alone applies
+	// the stray grace to every adopted job at the moment it finishes.
 	observed bool
 
 	// since is when custody was taken, for the diagnostic that matters most: how
@@ -98,21 +90,14 @@ func (r *Runner) adopt(lease *alloc.Lease, inst *provider.Instance) {
 
 // hold takes custody of a lease whose compute could not be confirmed gone.
 //
-// The instance id is not required and usually not known: the whole reason this
-// exists is that Find could not answer. The name is enough, because the name is
-// what identifies the instance to the backend.
+// The instance id is not required and usually not known: the reason this exists is
+// that Find could not answer. The name identifies the instance to the backend.
 //
-// THE REQUEST ID IS PASSED IN, NOT READ OFF THE LEASE, and that is not a style
-// choice. Assign writes the request id to SQLite without touching the caller's
-// in-memory Lease, so the pointer a listener holds still carries RequestID 0 —
-// every discarded entry was being filed under request 0. A later assignment for
-// the real request then walked straight past heldForRequest and started a second
-// runner, and a completion for it could never find the entry at all.
-//
-// The unit tests could not see this because their helper writes the id back onto
-// the struct by hand, which no production path does. The same stale-pointer trap
-// bit a test in this package an hour earlier; I fixed it there and did not think
-// to look for it here.
+// THE REQUEST ID IS PASSED IN, NOT READ OFF THE LEASE. Assign writes it to SQLite
+// without touching the caller's in-memory Lease, so the pointer a listener holds
+// still carries RequestID 0 — every discarded entry filed under request 0. A later
+// assignment for the real request then walks past heldForRequest and starts a
+// second runner, and a completion can never find the entry at all.
 func (r *Runner) hold(lease *alloc.Lease, name string, requestID int64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -162,13 +147,12 @@ const strayGrace = time.Minute
 // too late to do anything about it.
 const custodyWarnAfter = time.Hour
 
-// DefaultMaxCustody is OFF, and that is a deliberate reversal.
+// DefaultMaxCustody is OFF, deliberately.
 //
-// I gave this a 24-hour default and it was wrong. Elapsed time is not evidence
-// that a job has stopped making progress: billet imposes no job limit of its
-// own, self-hosted runners are routinely configured past GitHub's six-hour
-// default, and a legitimately long job restarted shortly after it began would be
-// killed a day later for no reason anyone could see in the logs.
+// Elapsed time is not evidence that a job has stopped making progress: billet
+// imposes no job limit of its own, self-hosted runners are routinely configured
+// past GitHub's six-hour default, and a legitimately long job would be killed
+// for no reason anyone could see in the logs.
 //
 // Killing live work must be authorised by something that actually knows — a
 // completion from GitHub, an observed process exit, or an operator. Time drives
@@ -180,39 +164,28 @@ const DefaultMaxCustody = 0
 
 // KeepAlive renews held leases on their own clock until the context ends.
 //
-// SEPARATE FROM Tend, AND THAT SEPARATION IS THE WHOLE POINT. Renewal used to
-// happen inside Tend, which runs after Reap on a shared tick and which makes
-// unbounded provider calls — a slow `docker ps` or a wedged daemon delays the
-// next renewal without delaying the next reap. The interval from a successful
-// heartbeat to the following Reap was therefore unbounded, and anything longer
-// than the lease TTL means the reaper terminalizes a lease that is being held on
-// purpose, hands its capacity back, and lets a listener advertise it while the
-// container is still running.
+// SEPARATE FROM Tend, AND THAT SEPARATION IS THE WHOLE POINT. Tend runs after
+// Reap on a shared tick and makes unbounded provider calls, so renewal inside it
+// would leave the interval from a successful heartbeat to the following Reap
+// unbounded — a slow `docker ps` delays the next renewal without delaying the
+// next reap. Anything longer than the lease TTL and the reaper terminalizes a
+// lease held on purpose, hands its capacity back, and lets a listener advertise
+// it while the container is still running.
 //
 // So this does exactly one thing, touches only the ledger, and ticks at a third
 // of the TTL — the same cadence and the same reasoning as the listener's own
 // heartbeats. Two renewals may be missed entirely before anything expires.
 func (r *Runner) KeepAlive(ctx context.Context) {
-	// THE CADENCE IS RE-READ EVERY CYCLE, not fixed at the first one.
+	// THE CADENCE IS RE-READ EVERY CYCLE, and the loop wakes on a short fixed tick
+	// rather than a timer armed for the TTL it read last.
 	//
-	// The TTL is negotiated at registration, and a node re-registers whenever the
-	// control plane forgets it or restarts. A plane that comes back advertising a
-	// SHORTER TTL leaves a janitor built on the old one renewing too slowly: the
-	// lease expires between two heartbeats, the reaper resells its capacity, and
-	// the container it was holding is still running. The janitor is started once
-	// on purpose — custody outlives any registration — so re-reading here is the
-	// only place that correction can happen.
-	// WAKES OFTEN, RENEWS ON SCHEDULE, and the two are deliberately separate.
-	//
-	// Re-reading the TTL when the timer fires is not enough: a timer armed for
-	// thirty seconds under a ninety-second TTL stays armed for thirty seconds even
-	// if the plane comes back advertising nine. The lease expires while a correct
-	// cadence sits in a variable nothing has consulted yet.
-	//
-	// So the loop wakes on a short fixed tick and asks whether a renewal is DUE.
-	// The cost is a few no-op wakeups a minute in a background goroutine; the
-	// alternative is a lease reaped between two heartbeats while its container
-	// runs.
+	// The TTL is negotiated at registration, and a plane that restarts advertising a
+	// SHORTER one leaves a janitor renewing too slowly: the lease expires between two
+	// heartbeats, the reaper resells its capacity, and the container it was holding is
+	// still running. A timer armed for thirty seconds does not shorten itself when the
+	// answer becomes nine, so the tick asks whether a renewal is DUE instead. The cost
+	// is a few no-op wakeups a minute. The janitor is started once on purpose —
+	// custody outlives any registration — so this is the only place that can correct.
 	next := time.Now().Add(r.renewEvery())
 
 	timer := time.NewTimer(watchTick)

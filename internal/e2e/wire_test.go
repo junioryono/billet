@@ -14,10 +14,12 @@ import (
 // compute. Every other test of the protocol necessarily supplies one of its two
 // sides; this one supplies neither.
 //
-// It exists because `server --dev` deliberately does NOT go over the wire — a
-// single-machine deployment should not send commands to itself through a socket
-// to reach a runner it already holds — so the wire would otherwise have no
-// end-to-end coverage at all, only unit tests against fakes.
+// It exists because the wire is the ONLY way a job reaches a machine. It used to
+// have a rival: `server --dev` ran a node inside the control-plane process and
+// deliberately bypassed the wire, so this test covered a path a single-machine
+// deployment never took. That is inverted now — --dev is gone, a single machine
+// runs `billet server` and `billet node` side by side, and every deployment
+// shape billet has goes through exactly what this test exercises.
 func TestAJobRunsOnANodeAcrossTheWire(t *testing.T) {
 	s := newWireStack(t)
 

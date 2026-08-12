@@ -1,0 +1,450 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"text/tabwriter"
+	"time"
+
+	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/nodeclient"
+	"github.com/junioryono/billet/internal/state"
+	"github.com/junioryono/billet/internal/wirecert"
+)
+
+// enrollPollEvery is how often a waiting node asks again.
+//
+// Slow, because the thing it is waiting for is a HUMAN reading a fingerprint. A
+// tight loop would fill the control plane's log with one line per node per
+// second while somebody walks to another machine to compare a value.
+const enrollPollEvery = 5 * time.Second
+
+// cmdNodes is the operator's side of enrollment.
+func cmdNodes(ctx context.Context, args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: billet nodes pending | billet nodes approve <node> --fingerprint <fp> | " +
+			"billet nodes deny <node> --fingerprint <fp>")
+	}
+
+	switch args[0] {
+	case "pending":
+		return cmdNodesPending(ctx, args[1:])
+	case "approve":
+		return cmdNodesDecide(ctx, args[1:], alloc.EnrollApproved)
+	case "deny":
+		return cmdNodesDecide(ctx, args[1:], alloc.EnrollDenied)
+	}
+
+	return fmt.Errorf("unknown nodes command %q; try pending, approve or deny", args[0])
+}
+
+// cmdNodesPending lists machines waiting to be let in.
+func cmdNodesPending(ctx context.Context, args []string) error {
+	fs := newFlagSet("billet nodes pending")
+	cfgPath := addConfigFlag(fs)
+	all := fs.Bool("all", false, "include decided requests")
+
+	if err := parse(fs, args); err != nil {
+		return err
+	}
+
+	a, closeDB, err := controlPlaneAllocator(ctx, *cfgPath)
+	if err != nil {
+		return err
+	}
+
+	defer closeDB()
+
+	want := alloc.EnrollPending
+	if *all {
+		want = ""
+	}
+
+	pending, err := a.Enrollments(ctx, want)
+	if err != nil {
+		return err
+	}
+
+	if len(pending) == 0 {
+		fmt.Println("No nodes are waiting to be approved.")
+
+		return nil
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "NODE\tFINGERPRINT\tSTATE\tHOW\tASKED")
+
+	for i := range pending {
+		e := &pending[i]
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", e.Name, e.Fingerprint, e.State, e.Source, e.RequestedAt)
+	}
+
+	if err := w.Flush(); err != nil {
+		return err
+	}
+
+	fmt.Printf("\nCompare a fingerprint against what the node printed on its own console, then:\n")
+	fmt.Printf("  billet nodes approve <node> --fingerprint <the value you compared>\n")
+
+	return nil
+}
+
+// cmdNodesDecide approves or denies one machine.
+//
+// THE FINGERPRINT IS REQUIRED, and that is the whole security of this command.
+// Approving by name alone approves whatever currently holds the name; approving
+// by fingerprint approves the machine whose key an operator actually compared.
+func cmdNodesDecide(ctx context.Context, args []string, decision string) error {
+	fs := newFlagSet("billet nodes " + decision)
+	cfgPath := addConfigFlag(fs)
+	fingerprint := fs.String("fingerprint", "",
+		"the fingerprint you compared against the node's console (required)")
+
+	name, err := parseWithName(fs, args)
+	if err != nil {
+		return err
+	}
+
+	if *fingerprint == "" {
+		return errors.New("--fingerprint is required: it names WHICH machine you are deciding " +
+			"about, and without it you would be deciding about whatever currently holds the name")
+	}
+
+	a, closeDB, err := controlPlaneAllocator(ctx, *cfgPath)
+	if err != nil {
+		return err
+	}
+
+	defer closeDB()
+
+	certPEM := ""
+
+	if decision == alloc.EnrollApproved {
+		cfg, err := config.Load(*cfgPath)
+		if err != nil {
+			return err
+		}
+
+		deployment, err := state.DeploymentID(cfg.Server.StateDir)
+		if err != nil {
+			return err
+		}
+
+		ca, err := wirecert.LoadOrCreateCA(cfg.Server.StateDir, deployment)
+		if err != nil {
+			return err
+		}
+
+		requests, err := a.Enrollments(ctx, alloc.EnrollPending)
+		if err != nil {
+			return err
+		}
+
+		var csr string
+
+		for i := range requests {
+			if requests[i].Name == name {
+				csr = requests[i].CSRPEM
+			}
+		}
+
+		if csr == "" {
+			return fmt.Errorf("no pending request from %s", name)
+		}
+
+		// SIGNED FOR THE NAME BEING APPROVED, never for whatever the request
+		// claimed: the operator is deciding about a name, and the CSR's own
+		// subject is only what the requester typed.
+		bundle, err := ca.SignNodeCSR(name, []byte(csr))
+		if err != nil {
+			return err
+		}
+
+		certPEM = string(bundle.CertPEM)
+	}
+
+	if err := a.DecideEnrollment(ctx, name, *fingerprint, decision, certPEM); err != nil {
+		return err
+	}
+
+	fmt.Printf("%s %s\n", map[string]string{
+		alloc.EnrollApproved: "Approved", alloc.EnrollDenied: "Denied",
+	}[decision], name)
+
+	if decision == alloc.EnrollApproved {
+		fmt.Printf("\nIt picks up its certificate on its next attempt, within a few seconds.\n")
+	}
+
+	return nil
+}
+
+// controlPlaneAllocator opens the ledger for a command that runs on the server.
+func controlPlaneAllocator(ctx context.Context, cfgPath string) (*alloc.Allocator, func(), error) {
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if cfg.Server == nil {
+		return nil, nil, errors.New("this command runs on the control plane, and this config has " +
+			"no server section")
+	}
+
+	db, err := state.Open(ctx, cfg.Server.StateDir)
+	if err != nil {
+		return nil, nil, fmt.Errorf("server state: %w", err)
+	}
+
+	a, err := alloc.New(db, alloc.Limits{
+		MaxVCPU:   cfg.Server.MaxVCPU,
+		MaxMemory: cfg.Server.MaxMemory,
+		Nodes:     cfg.NodePolicies(),
+	}, cfg.Tiers)
+	if err != nil {
+		db.Close()
+
+		return nil, nil, fmt.Errorf("capacity allocator: %w", err)
+	}
+
+	return a, func() { db.Close() }, nil
+}
+
+// enrollNode asks a control plane to admit this machine and waits to be let in.
+//
+// IT PRINTS ITS OWN FINGERPRINT AND STOPS THERE. The operator compares that
+// value against what `billet nodes pending` shows on the control plane — two
+// ends displaying the same number, over a channel an attacker on the network
+// does not control. That comparison is the trust decision; everything else here
+// is transport.
+func enrollNode(ctx context.Context, cfg *config.Config, caFingerprint, joinToken string) error {
+	if cfg.Node.TLS == nil {
+		return errors.New("enrolling writes a certificate, so node.tls must say where to put it")
+	}
+
+	caPEM, deployment, err := nodeclient.FetchCA(ctx, "https://"+cfg.Node.ServerAddr, caFingerprint)
+	if err != nil {
+		return err
+	}
+
+	name := cfg.Node.Name
+	if name == "" {
+		return errors.New("enrolling needs node.name: the certificate does not exist yet, so " +
+			"there is nothing to take it from")
+	}
+
+	csrPEM, keyPEM, err := wirecert.NewNodeCSR(name)
+	if err != nil {
+		return err
+	}
+
+	fingerprint, err := wirecert.FingerprintOfCSR(csrPEM)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Asking to join deployment %s as %q.\n\n", deployment, name)
+	fmt.Printf("  this node's fingerprint  %s\n\n", fingerprint)
+	fmt.Printf("On the control plane, check it matches and approve:\n\n")
+	fmt.Printf("  billet nodes approve %s --fingerprint %s\n\n", name, fingerprint)
+
+	for {
+		certPEM, err := nodeclient.Enroll(ctx, "https://"+cfg.Node.ServerAddr, name, joinToken, caPEM, csrPEM)
+
+		switch {
+		case err == nil:
+			return writeBundle(cfg.Node.TLS, certPEM, keyPEM, caPEM)
+		case errors.Is(err, nodeclient.ErrDenied):
+			return fmt.Errorf("an operator denied this node; nothing to retry")
+		case errors.Is(err, nodeclient.ErrNotApproved):
+			// Expected, repeatedly, while a human decides.
+		default:
+			return err
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(enrollPollEvery):
+		}
+	}
+}
+
+// writeBundle puts an enrolled identity on disk, the key first and 0600.
+func writeBundle(tls *config.NodeTLS, certPEM, keyPEM, caPEM []byte) error {
+	for _, dir := range []string{filepath.Dir(tls.KeyPath), filepath.Dir(tls.CertPath),
+		filepath.Dir(tls.CAPath)} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return fmt.Errorf("create %s: %w", dir, err)
+		}
+	}
+
+	// THE KEY FIRST AND 0600. A certificate without its key is useless rather
+	// than dangerous; the other order leaves a window where the secret exists
+	// under a mode nobody has set yet.
+	for _, f := range []struct {
+		path string
+		data []byte
+		mode os.FileMode
+	}{
+		{tls.KeyPath, keyPEM, 0o600},
+		{tls.CertPath, certPEM, 0o644},
+		{tls.CAPath, caPEM, 0o644},
+	} {
+		if err := os.WriteFile(f.path, f.data, f.mode); err != nil {
+			return fmt.Errorf("write %s: %w", f.path, err)
+		}
+	}
+
+	fmt.Printf("Approved. Wrote:\n  %s\n  %s\n  %s\n\n", tls.CertPath, tls.KeyPath, tls.CAPath)
+	fmt.Printf("Start the node normally now: billet node\n")
+
+	return nil
+}
+
+// cmdCAToken mints the credential a machine needs to ASK to enroll.
+//
+// SHOWN ONCE AND STORED AS A HASH, for the same reason a password is: the ledger
+// needs to recognise the token, not to be able to reproduce it.
+//
+// It admits nothing on its own. A request still waits for an operator to compare
+// fingerprints; what the token stops is a stranger who can reach the port filling
+// the pending list, or taking a name before the machine that should have it.
+func cmdCAToken(ctx context.Context, args []string) error {
+	fs := newFlagSet("billet ca token")
+	cfgPath := addConfigFlag(fs)
+	ttl := fs.Duration("ttl", time.Hour, "how long the token may be used for")
+	uses := fs.Int("uses", 1, "how many machines may enroll with it")
+	note := fs.String("note", "", "what it is for, recorded alongside it")
+
+	if err := parse(fs, args); err != nil {
+		return err
+	}
+
+	a, closeDB, err := controlPlaneAllocator(ctx, *cfgPath)
+	if err != nil {
+		return err
+	}
+
+	defer closeDB()
+
+	token, err := a.NewJoinToken(ctx, *ttl, *uses, *note)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Join token (shown once, valid for %s, %d use(s)):\n\n  %s\n\n", *ttl, *uses, token)
+	fmt.Printf("On the machine that should join:\n\n")
+	fmt.Printf("  billet node --enroll --ca-fingerprint <from `billet ca show`> --join-token %s\n", token)
+
+	return nil
+}
+
+// cmdCARotate starts replacing the deployment's authority.
+//
+// PHASE ONE OF TWO. From here the new authority issues node certificates while
+// the OLD one still signs what the control plane presents, and both are trusted.
+// Nodes adopt the new one through ordinary renewal, which carries the trust
+// bundle alongside the certificate.
+//
+// Nothing breaks at this point, and nothing is finished either: `billet ca
+// retire` is what ends it, and running that before the fleet has renewed is what
+// would cut a node off.
+func cmdCARotate(args []string) error {
+	fs := newFlagSet("billet ca rotate")
+	cfgPath := addConfigFlag(fs)
+
+	if err := parse(fs, args); err != nil {
+		return err
+	}
+
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		return err
+	}
+
+	if cfg.Server == nil {
+		return errors.New("rotating is done on the control plane, and this config has no server section")
+	}
+
+	deployment, err := state.DeploymentID(cfg.Server.StateDir)
+	if err != nil {
+		return err
+	}
+
+	ca, err := wirecert.Rotate(cfg.Server.StateDir, deployment)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Rotated. The new authority is %s\n\n", ca.Fingerprint())
+	fmt.Printf("  new node certificates are issued by it\n")
+	fmt.Printf("  the previous authority still signs what the control plane presents\n")
+	fmt.Printf("  both are trusted, so nothing has to be restarted in a hurry\n\n")
+	fmt.Printf("Restart the control plane to pick this up, then let nodes renew. Watch\n")
+	fmt.Printf("`billet ca show` until nothing is left on the old authority, and finish with:\n\n")
+	fmt.Printf("  billet ca retire --config %s\n\n", *cfgPath)
+	fmt.Printf("A node that never renews during the overlap has to be re-enrolled, which is\n")
+	fmt.Printf("why retiring is yours to run rather than something that happens on a timer.\n")
+
+	return nil
+}
+
+// cmdCARetire finishes a rotation by dropping the old authority.
+func cmdCARetire(args []string) error {
+	fs := newFlagSet("billet ca retire")
+	cfgPath := addConfigFlag(fs)
+	force := fs.Bool("force", false, "retire even though a node may not have renewed")
+
+	if err := parse(fs, args); err != nil {
+		return err
+	}
+
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		return err
+	}
+
+	if cfg.Server == nil {
+		return errors.New("retiring is done on the control plane, and this config has no server section")
+	}
+
+	prev, _, err := wirecert.PreviousCA(cfg.Server.StateDir)
+	if err != nil {
+		return err
+	}
+
+	if prev == nil {
+		fmt.Println("No rotation is running; there is nothing to retire.")
+
+		return nil
+	}
+
+	// THE OPERATOR CONFIRMS, because billet cannot see what it needs to. A node
+	// that has not renewed still trusts only the old authority, and retiring it
+	// makes the control plane unverifiable to that node — over the wire it would
+	// need in order to recover.
+	if !*force {
+		age, _ := wirecert.RotationAge(cfg.Server.StateDir)
+
+		fmt.Printf("This rotation started %s ago.\n\n", age.Round(time.Hour))
+		fmt.Printf("Every node has to have renewed since then. A node that has not still trusts\n")
+		fmt.Printf("only the old authority, and retiring it means that node can no longer verify\n")
+		fmt.Printf("this control plane — it would have to be re-enrolled by hand.\n\n")
+		fmt.Printf("Re-run with --force when you have checked.\n")
+
+		return nil
+	}
+
+	if err := wirecert.Retire(cfg.Server.StateDir); err != nil {
+		return err
+	}
+
+	fmt.Println("Retired the previous authority. Restart the control plane to present a")
+	fmt.Println("certificate from the new one.")
+
+	return nil
+}

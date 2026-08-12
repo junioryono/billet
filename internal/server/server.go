@@ -78,11 +78,9 @@ type ControlPlaneOption func(*Server)
 
 // WithReapInterval sets how often abandoned capacity is reclaimed.
 //
-// Exposed so a test can make the reaper actually fire. The default is slow
-// relative to any test, which meant the first version of the reaper/heartbeat
-// interaction test never reached the reaper at all — it passed and proved
-// nothing, which is the same trap as an instant fake finishing before a
-// goroutine runs.
+// Exposed so a test can make the reaper actually fire: the default is slow
+// relative to any test, so a reaper/heartbeat test left on it never reaches the
+// reaper and proves nothing while passing.
 func WithReapInterval(d time.Duration) ControlPlaneOption {
 	return func(s *Server) { s.reapEvery = d }
 }

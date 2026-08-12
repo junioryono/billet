@@ -2,16 +2,16 @@
 //
 // THE PROBLEM IT SOLVES: a node names itself in the request path and, without
 // this, nothing verifies the claim. Anything that could reach the listener could
-// call itself any node, bind leases, take commands, and ask for a JIT
-// registration — a credential that registers a runner against the organisation.
-// That is why the wire refused to serve on anything but loopback until now.
+// call itself any node, bind leases, take commands, and ask for a JIT registration
+// — a credential that registers a runner against the organisation. Without it the
+// wire is safe only on loopback.
 //
 // The design is deliberately small. One CA per deployment, held by the control
-// plane, and one certificate per node. There is no revocation list, no OCSP, and
-// no intermediate: a deployment with a compromised node re-issues its CA and its
-// node certificates, which is a real cost and an honest one at this size. What
-// there IS, and what matters, is that the authenticated name in the certificate
-// is the ONLY thing that decides which node a request is from.
+// plane, and one certificate per node. There is no OCSP and no intermediate: a
+// deployment with a compromised node revokes its certificate or re-issues the CA,
+// which is a real cost and an honest one at this size. What matters is that the
+// authenticated name in the certificate is the ONLY thing that decides which node
+// a request is from.
 package wirecert
 
 import (
@@ -262,10 +262,10 @@ func createCA(stateDir, dir, certPath, keyPath, deployment string) (*CA, error) 
 // markerPath names the file that records an authority once existed here.
 //
 // BESIDE THE CA DIRECTORY, NOT INSIDE IT, because a witness that disappears with
-// the thing it witnesses is not a witness. The failure this whole mechanism
-// exists for — a backup or a provisioning script that omits the ca directory —
-// took the marker with it in the first version, hadAuthority answered false, and
-// a replacement authority was minted exactly as before.
+// the thing it witnesses is not a witness. The failure this exists for — a backup
+// or a provisioning script that omits the ca directory — would otherwise take the
+// marker with it, hadAuthority would answer false, and a replacement authority
+// would be minted exactly as before.
 func markerPath(stateDir string) string {
 	return filepath.Join(stateDir, "authority-created")
 }
@@ -436,6 +436,12 @@ func (c *CA) leafTemplate(cn string) (*x509.Certificate, error) {
 		// A LEAF MAY NOT OUTLIVE ITS AUTHORITY. Verification fails on the CA's
 		// expiry regardless, so issuing past it would hand an operator a
 		// certificate whose printed dates lie about when their node stops working.
+		//
+		// SILENT UNTIL IT MATTERS, WHICH IS THE TRAP. Once the CA has less than a
+		// leaf's life left, every certificate it issues is quietly shorter than
+		// the last — renewals keep working and keep getting cheaper, until one day
+		// they are hours long and then the whole fleet stops together. Capped is
+		// therefore something to SAY, not just to do; see CA.Capping.
 		notAfter = c.cert.NotAfter
 	}
 
@@ -572,6 +578,10 @@ func ServerTLS(b Bundle) (*tls.Config, error) {
 		return nil, fmt.Errorf("wirecert: load the server certificate: %w", err)
 	}
 
+	// A BUNDLE, not one certificate. During a rotation this carries both the new
+	// authority and the one being retired, so a node that has renewed and a node
+	// that has not are both still recognised. AppendCertsFromPEM reads every
+	// certificate in the input.
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(b.CAPEM) {
 		return nil, errors.New("wirecert: the CA certificate could not be parsed for verification")
@@ -579,21 +589,30 @@ func ServerTLS(b Bundle) (*tls.Config, error) {
 
 	return &tls.Config{
 		Certificates: []tls.Certificate{cert},
-		ClientAuth:   tls.RequireAndVerifyClientCert,
-		ClientCAs:    pool,
-		MinVersion:   tls.VersionTLS13,
+		// VERIFY IF GIVEN, NOT REQUIRE, and the handler is what makes that safe.
+		//
+		// A machine that has never enrolled has no certificate, so requiring one at
+		// the handshake means it cannot reach the two routes that exist for exactly
+		// that case: reading this authority, and asking to join. Neither grants
+		// anything — asking waits for a human — and every other route is wrapped in
+		// a guard that refuses a connection with no verified chain.
+		//
+		// A certificate that IS presented is still verified against this
+		// deployment's authority, so this weakens nothing for an enrolled node: it
+		// only lets an unenrolled one get as far as being told to wait.
+		ClientAuth: tls.VerifyClientCertIfGiven,
+		ClientCAs:  pool,
+		MinVersion: tls.VersionTLS13,
 	}, nil
 }
 
 // ClientTLS is a node's side of the wire.
 //
-// VERIFIES THE LEAF AGAINST ITS OWN CA, which the first version did not: it
-// checked that the certificate and key were a pair and separately parsed the
-// root, and never asked whether the two halves belonged together. A bundle whose
-// node.crt came from one deployment and whose ca.crt came from another loaded
-// cleanly — and since the node adopts its DEPLOYMENT from the leaf, it wrote the
-// wrong identity permanently, trusted a server that would reject it, and then
-// refused the correct bundle as a conflict.
+// VERIFIES THE LEAF AGAINST ITS OWN CA, not merely that the certificate and key
+// are a pair. A bundle whose node.crt came from one deployment and whose ca.crt
+// came from another would otherwise load cleanly — and since the node adopts its
+// DEPLOYMENT from the leaf, it would write the wrong identity permanently, trust a
+// server that would reject it, and then refuse the correct bundle as a conflict.
 func ClientTLS(b Bundle) (*tls.Config, error) {
 	cert, err := tls.X509KeyPair(b.CertPEM, b.KeyPEM)
 	if err != nil {
@@ -811,4 +830,123 @@ func syncDir(dir string) error {
 	}
 
 	return nil
+}
+
+// RenewalDue reports whether a certificate is far enough through its life to
+// replace, and how long it has left.
+//
+// AT A THIRD OF THE WAY FROM THE END, deliberately earlier than ExpiryWarning.
+// A warning is for a human who may be on holiday; this is for the node itself,
+// and the window has to be wide enough that a control plane which is down for a
+// week, or a node powered off for a month, still has time to renew when it comes
+// back. A node that lets its certificate expire cannot renew — renewal is
+// authenticated by the certificate being renewed — so it has to be re-enrolled
+// by hand, which is the outcome this width exists to avoid.
+//
+// Computed from the certificate's OWN lifetime rather than from LeafLifetime, so
+// a leaf shortened by the CA's own expiry still renews proportionally rather
+// than being judged against a year it never had.
+func RenewalDue(cert *x509.Certificate) (time.Duration, bool) {
+	left := time.Until(cert.NotAfter)
+	lifetime := cert.NotAfter.Sub(cert.NotBefore)
+
+	return left, left < lifetime/3
+}
+
+// Serial is a certificate's serial number as the ledger stores it.
+//
+// Hex, because a serial is a 128-bit integer and every other rendering of one —
+// decimal, base64 — makes it harder to match against what `openssl x509` prints
+// when somebody is trying to work out which credential they are looking at.
+func Serial(cert *x509.Certificate) string {
+	return fmt.Sprintf("%x", cert.SerialNumber)
+}
+
+// SignNodeCSR issues a node certificate for a key the node generated itself.
+//
+// THE PRIVATE KEY NEVER CROSSES THE WIRE, which is the whole reason renewal
+// takes a CSR rather than returning a fresh bundle. A renewal endpoint that
+// minted the key server-side would put a node's identity on the network once a
+// year, and into the control plane's memory and logs on the way.
+//
+// THE NAME COMES FROM THE CALLER, NOT FROM THE CSR. The subject in a CSR is
+// whatever the requester typed; the authenticated identity is what the wire
+// proved. Signing the former would let any node with a valid certificate mint
+// one for any name it liked — which is every node able to impersonate every
+// other, through the endpoint meant to keep them working.
+func (c *CA) SignNodeCSR(name string, csrPEM []byte) (Bundle, error) {
+	block, _ := pem.Decode(csrPEM)
+	if block == nil || block.Type != "CERTIFICATE REQUEST" {
+		return Bundle{}, errors.New("wirecert: not a PEM certificate request")
+	}
+
+	csr, err := x509.ParseCertificateRequest(block.Bytes)
+	if err != nil {
+		return Bundle{}, fmt.Errorf("wirecert: parse the certificate request: %w", err)
+	}
+
+	// CHECKED, because a CSR carries its own signature over its own public key
+	// and an unverified one proves nothing about who holds the private half.
+	if err := csr.CheckSignature(); err != nil {
+		return Bundle{}, fmt.Errorf("wirecert: the certificate request is not correctly signed: %w", err)
+	}
+
+	tmpl, err := c.leafTemplate(name)
+	if err != nil {
+		return Bundle{}, err
+	}
+
+	tmpl.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}
+
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, c.cert, csr.PublicKey, c.key)
+	if err != nil {
+		return Bundle{}, fmt.Errorf("wirecert: sign the certificate request: %w", err)
+	}
+
+	return Bundle{
+		CertPEM: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}),
+		CAPEM:   c.CertPEM(),
+	}, nil
+}
+
+// NewNodeCSR generates a key and a certificate request for a node name.
+//
+// Returns the request to send and the key to keep. The key is PEM and is written
+// 0600 by the caller; it is the node's identity and never leaves the machine.
+func NewNodeCSR(name string) ([]byte, []byte, error) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, nil, fmt.Errorf("wirecert: generate a key: %w", err)
+	}
+
+	der, err := x509.CreateCertificateRequest(rand.Reader,
+		&x509.CertificateRequest{Subject: pkix.Name{CommonName: name}}, key)
+	if err != nil {
+		return nil, nil, fmt.Errorf("wirecert: create a certificate request: %w", err)
+	}
+
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		return nil, nil, fmt.Errorf("wirecert: encode a key: %w", err)
+	}
+
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der}),
+		pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), nil
+}
+
+// Capping reports whether this authority is close enough to its own expiry that
+// the certificates it issues are being shortened, and how long it has left.
+//
+// THE FAILURE IT NAMES IS A SLOW ONE. A leaf may not outlive its authority, so
+// from one leaf-lifetime out every certificate issued is shorter than a full
+// life: renewals come round faster and faster, nothing errors, and then the whole
+// fleet expires on the same day the authority does.
+//
+// Rotating is an overlap, not a switch: issue a new authority, keep trusting the
+// old one while nodes pick the new one up through renewal, then retire it. That
+// is why renewal returns the CA alongside the certificate.
+func (c *CA) Capping() (time.Duration, bool) {
+	left := time.Until(c.cert.NotAfter)
+
+	return left, left < LeafLifetime
 }

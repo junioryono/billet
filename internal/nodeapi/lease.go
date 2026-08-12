@@ -110,6 +110,11 @@ const (
 	// replaced produces — an operator fixes it, so the node must not treat it as
 	// its own permanent defeat.
 	CodeUnauthenticated = "unauthenticated"
+	// CodeUnavailable means the control plane could not answer, not that it said
+	// no. The node retries: this is a database it could not read or a dependency
+	// that is down, and a node that treated it as a verdict would take itself out
+	// of a fleet that is merely having a bad minute.
+	CodeUnavailable = "unavailable"
 	// CodeUnregistered means the server does not know this node. The node must
 	// register again before anything else it says will be accepted; this is what
 	// a node sees after the server restarts.

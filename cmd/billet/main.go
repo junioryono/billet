@@ -3,19 +3,22 @@
 // One binary, two roles. `billet server` is the control plane: it long-polls
 // GitHub for assigned jobs, owns the capacity ledger, and tells nodes what to
 // launch. `billet node` is a compute host: it runs a provider and launches
-// instances. `billet server --dev` runs both in one process, which is the
-// single-machine deployment.
+// instances. A single-machine deployment runs both, side by side, talking over
+// loopback — there is no combined mode and no flag for one.
 package main
 
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -73,10 +76,11 @@ type command struct {
 // widening every command's signature or, worse, becoming package state.
 func commands(lc *lifecycle) []command {
 	return []command{
-		{"server", "run the control plane (add --dev to also run a node here)",
+		{"server", "run the control plane (run `billet node` alongside it to run jobs here)",
 			func(ctx context.Context, args []string) error { return cmdServer(ctx, lc, args) }},
 		{"node", "run a compute host that dials a control plane",
 			func(ctx context.Context, args []string) error { return cmdNode(ctx, lc, args) }},
+		{"nodes", "approve the machines asking to join this deployment", cmdNodes},
 		{"ca", "issue the certificates nodes authenticate with", cmdCA},
 		{"check", "validate the config and state directory, then exit", cmdCheck},
 		{"init", "generate a billet.yaml interactively", cmdInit},
@@ -98,14 +102,11 @@ func run(args []string) error {
 		return nil
 	}
 
-	// Ctrl-C and SIGTERM cancel the context. Every long-running role drains rather
-	// than dropping jobs on the floor: a runner killed mid-job leaves an orphaned
-	// registration on GitHub that someone has to clean up by hand.
+	// Ctrl-C and SIGTERM cancel the context. Every long-running role drains rather than
+	// dropping jobs: a runner killed mid-job leaves an orphaned registration on GitHub.
 	//
-	// THE FIRST ASKS, THE SECOND INSISTS, THE THIRD GIVES UP — from ONE
-	// registration, because two registrations both receive every signal. See
-	// lifecycle.escalate for what each level does and for the bug the single
-	// registration exists to prevent.
+	// THE FIRST ASKS, THE SECOND INSISTS, THE THIRD GIVES UP — from ONE registration,
+	// because two both receive every signal. See lifecycle.escalate.
 	ctx, cancelGraceful := context.WithCancel(context.Background())
 	defer cancelGraceful()
 
@@ -151,20 +152,17 @@ func newFlagSet(name string) *flag.FlagSet {
 }
 
 // parse rejects leftover positional arguments, so a typo like
-// `billet server --dev extra` fails instead of being silently ignored.
+// `billet server --dry-run extra` fails instead of being silently ignored.
 func parse(fs *flag.FlagSet, args []string) error {
 	return parseWithArgs(fs, args, 0)
 }
 
 // parseWithArgs parses flags for a command that takes positional arguments.
 //
-// A COMMAND MUST SAY HOW MANY IT WANTS. The default of zero is what catches a
-// typo'd flag, which flag.Parse hands back as a positional rather than
-// rejecting: `billet server -dvе` becomes an argument, the flag stays false, and
-// the process runs in a mode nobody asked for. That protection is worth keeping,
-// which is why this is opt-in per command rather than simply removed — `billet
-// ca issue <node>` was written against the strict version and could not run at
-// all.
+// A COMMAND MUST SAY HOW MANY IT WANTS. The default of zero catches a typo'd flag,
+// which flag.Parse hands back as a positional rather than rejecting: `billet server
+// -dvе` becomes an argument, the flag stays false, and the process runs in a mode
+// nobody asked for.
 func parseWithArgs(fs *flag.FlagSet, args []string, want int) error {
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -177,17 +175,13 @@ func parseWithArgs(fs *flag.FlagSet, args []string, want int) error {
 	return nil
 }
 
-// parseWithName parses a command that takes one positional argument, whichever
-// side of the flags it was written on.
+// parseWithName parses a command that takes one positional argument, whichever side
+// of the flags it was written on.
 //
 // GO'S FLAG PACKAGE STOPS AT THE FIRST POSITIONAL, so `billet ca issue epyc-1
-// --config x.yaml` leaves `--config x.yaml` sitting in the argument list: the
-// config path is silently ignored and the command reads the default file. That
-// is the order every operator writes — the subject first, the options after —
-// and it is the order every example in the README uses.
-//
-// So the flags are parsed twice: once to reach the positional, once for whatever
-// followed it.
+// --config x.yaml` leaves the config path sitting in the argument list, silently
+// ignored — and that is the order every operator writes and every README example
+// uses. So the flags are parsed twice.
 func parseWithName(fs *flag.FlagSet, args []string) (string, error) {
 	if err := fs.Parse(args); err != nil {
 		return "", err
@@ -232,7 +226,6 @@ func addConfigFlag(fs *flag.FlagSet) *string {
 func cmdServer(ctx context.Context, lc *lifecycle, args []string) error {
 	fs := newFlagSet("billet server")
 	cfgPath := addConfigFlag(fs)
-	dev := fs.Bool("dev", false, "also run a node in this process (single-machine deployment)")
 	dryRun := fs.Bool("dry-run", false,
 		"connect to GitHub and advertise ZERO capacity: proves the whole path without accepting a job")
 	if err := parse(fs, args); err != nil {
@@ -246,91 +239,84 @@ func cmdServer(ctx context.Context, lc *lifecycle, args []string) error {
 	if cfg.Server == nil {
 		return fmt.Errorf("%s has no server section", *cfgPath)
 	}
-	if *dev && cfg.Node == nil {
-		return fmt.Errorf("--dev needs a node section in %s", *cfgPath)
-	}
-
-	// ONLY --dev RUNS BOTH ROLES, so only --dev needs them to agree. Enforcing it
-	// at load would refuse a shared configuration file on a node-only host merely
-	// because the unused server section names a controller's lock directory.
-	if *dev && !cfg.LockDirsAgree() {
-		return fmt.Errorf(
-			"--dev runs a server and a node in one process, but server.lock_dir (%q) and "+
-				"node.lock_dir (%q) differ; they would take two locks for one deployment "+
-				"identity and both manage the same containers",
-			cfg.Server.LockDir, cfg.Node.LockDir)
-	}
-
 	if cfg.GitHub == nil {
 		return fmt.Errorf("%s has no github section; run `billet github-app create` first", *cfgPath)
 	}
 
-	// STANDALONE `billet server` IS THE POINT OF THE SPLIT, and it used to be
-	// refused. The old guard said "without --dev nothing in this process can
-	// launch a job", which was true until a node could dial in from another
-	// machine. It is false now, and leaving it would have made the whole feature
-	// unreachable from the command line.
+	// THE CONTROL PLANE RUNS NO COMPUTE. A single machine runs `billet server` and
+	// `billet node` as two processes over loopback.
 	//
-	// A control plane with no nodes yet is not an error, but it is not free
-	// either, and the earlier version of this comment said it was: "jobs queue
-	// until one registers". They do not. Capacity is advertised from the budget
-	// without consulting node availability, so a job assigned while the fleet is
-	// empty is ACQUIRED and then fails to launch with ErrNoNode. billet releases
-	// its own lease and has no way to decline the assignment, so it stays with
-	// GitHub until the pickup deadline and is requeued a bounded number of times.
-	// Start the nodes first.
+	// A control plane with no nodes advertises nothing, so an empty fleet is harmless:
+	// GitHub is told zero and assigns nothing.
 	//
 	// --dry-run remains for proving the GitHub path while advertising zero.
 
-	return runServer(ctx, lc, cfg, *dryRun, *dev)
+	return runServer(ctx, lc, cfg, *dryRun)
 }
 
-// runServer starts the control plane and blocks until it is told to stop.
-// claimDeployment reads this installation's identity and takes the host-wide
-// lock on it, returning both.
+// claimNodeDeployment reads this host's identity and takes the host-wide lock on
+// it.
 //
-// MUST BE CALLED BEFORE state.Open AND BEFORE newProvider. state.Open creates
-// files, runs integrity checks and applies migrations, so claiming afterwards
-// let a process that is about to be REFUSED first migrate the database it was
-// refused the right to use — start an old copied backup while the original is
-// live and the copy is silently upgraded on its way to the error. newProvider is
-// the other side of it: nothing may touch a container before the right to manage
-// containers under this identity is established.
+// THE LOCK IS THE NODE'S ALONE, because the node is the role that manages
+// containers. It stops two processes carrying one deployment identity from
+// managing the same compute, and a control plane manages none — so the server
+// takes no lock, and `server.lock_dir` is gone.
 //
-// Split out of runServer to be testable. That covers the logic and NOT the call
-// site: deleting the call from runServer still leaves these tests green, and no
-// test in this repo would notice. Recorded rather than papered over.
-func claimDeployment(cfg *config.Config) (string, *state.DeploymentLock, error) {
-	return claimIdentity(cfg.Server.StateDir, cfg.Server.LockDir, cfg.Server.AllowUnlockedDeployment)
-}
-
-// claimNodeDeployment is the same claim for a standalone node.
+// That is not tidying, it is a requirement. The lock is EXCLUSIVE per identity,
+// so a server that took it would keep a node on the same machine from ever
+// starting — and one machine running both is the single-machine deployment,
+// which is now precisely `billet server` and `billet node` side by side.
 //
-// SHARES claimIdentity with the server rather than repeating it, because the two
-// roles can run on one host and the thing that must not diverge is exactly this:
-// where the lock lands. A second copy of these four lines is how one of them
-// keeps the default while the other honours a configured directory, after which
-// both processes manage the same containers.
+// MUST BE CALLED BEFORE newProvider: nothing may touch a container before the
+// right to manage containers under this identity is established.
 func claimNodeDeployment(cfg *config.Config, bundle *wirecert.Bundle) (string, *state.DeploymentLock, error) {
-	// A NODE JOINS A DEPLOYMENT, IT DOES NOT FOUND ONE. Without a bundle there is
-	// nothing to join — config validation has already established that means a
-	// control plane inside this machine — so minting is correct. With one, the
-	// certificate says which installation this host belongs to, and inventing a
-	// different answer produces a node the control plane refuses forever.
-	if bundle == nil {
-		return claimIdentity(cfg.Node.StateDir, cfg.Node.LockDir, false)
-	}
-
-	deployment, err := bundle.Deployment()
+	// A NODE JOINS A DEPLOYMENT, IT DOES NOT FOUND ONE, and the whole question is what
+	// tells it which one. A certificate answers directly. Without one, the node can
+	// only reach a control plane inside this machine — validation guarantees that,
+	// because a certless node may dial nothing but loopback — and if this file also
+	// describes that control plane, its state directory holds the answer.
+	//
+	// Falling back to the node's OWN directory is not an option, and fails invisibly:
+	// a state directory with no identity MINTS a fresh random one, so the node invents
+	// a deployment nobody has heard of, the plane refuses it for belonging elsewhere,
+	// and that refusal is ErrRefused — which the node loop reads as a verdict rather
+	// than an outage, so the process exits and nothing repairs it.
+	deployment, err := nodeDeploymentID(cfg, bundle)
 	if err != nil {
 		return "", nil, err
 	}
 
-	if _, err := state.AdoptDeploymentID(cfg.Node.StateDir, deployment); err != nil {
-		return "", nil, err
+	if deployment != "" {
+		if _, err := state.AdoptDeploymentID(cfg.Node.StateDir, deployment); err != nil {
+			return "", nil, err
+		}
 	}
 
-	return claimIdentity(cfg.Node.StateDir, cfg.Node.LockDir, false)
+	return claimIdentity(cfg.Node.StateDir, cfg.Node.LockDir, cfg.Node.AllowUnlockedDeployment)
+}
+
+// nodeDeploymentID is the identity this host must claim, or "" when only its own
+// state directory can say.
+//
+// The certificate outranks the config file: a bundle is proof issued BY the
+// control plane, while a `server:` section is merely a description sitting next
+// to the node's own. They agree in every sane deployment, and where they do not,
+// the one the plane will actually check is the certificate.
+func nodeDeploymentID(cfg *config.Config, bundle *wirecert.Bundle) (string, error) {
+	if bundle != nil {
+		return bundle.Deployment()
+	}
+
+	if cfg.Server != nil {
+		// Founding it here is correct if the server has not started yet: whichever
+		// role runs first mints the identity, and the other reads that same file.
+		return state.DeploymentID(cfg.Server.StateDir)
+	}
+
+	// A node whose file says nothing about the control plane it dials. Its own
+	// directory is the only answer available, so it must already hold the right
+	// one — see the node.state_dir note in billet.example.yaml.
+	return "", nil
 }
 
 // claimIdentity reads an installation identity and takes the host-wide lock.
@@ -377,7 +363,23 @@ func claimIdentity(
 	return deployment, lock, nil
 }
 
-func runServer(ctx context.Context, lc *lifecycle, cfg *config.Config, dryRun, dev bool) error {
+// nodeContribution is what this host offers: what it detected, unless its own
+// config said otherwise.
+//
+// ONE DEFINITION, ONE CALLER, because `billet node` is the only way a host joins.
+// Two paths resolving it independently would let the same file describe a
+// different machine depending on which process read it.
+func nodeContribution(cfg *config.Config) (config.Contribution, error) {
+	vcpu, memory, err := config.DetectHostCapacity()
+	if err != nil {
+		return config.Contribution{}, err
+	}
+
+	return cfg.Node.Contribution(vcpu, memory), nil
+}
+
+// runServer starts the control plane and blocks until it is told to stop.
+func runServer(ctx context.Context, lc *lifecycle, cfg *config.Config, dryRun bool) error {
 	// Built by the SHARED constructor, so the server and teardown authenticate
 	// identically. Two near-identical constructions is how one of them ends up
 	// pointed at a different organization than the other.
@@ -386,37 +388,22 @@ func runServer(ctx context.Context, lc *lifecycle, cfg *config.Config, dryRun, d
 		return err
 	}
 
-	// THE IDENTITY IS CLAIMED BEFORE THE DATABASE IS OPENED, and the ordering is
-	// the point rather than tidiness. state.Open creates files, runs integrity
-	// checks and applies migrations — so acquiring the lock afterwards let a
-	// process that is about to be REFUSED first migrate the database it was
-	// refused the right to use. Start an old copied backup while the original is
-	// live and the copy would be silently upgraded on its way to the error.
+	// READ, NOT CLAIMED. The host-wide lock exists to stop two processes managing
+	// one deployment's containers, and a control plane manages none — the node
+	// takes that lock. A server that took it too would be holding the identity a
+	// co-resident node needs, which is the single-machine deployment refusing to
+	// start.
 	//
-	// Nothing here touches a container either: this runs before newProvider.
-	// CLAIMED FOR EVERY SERVER, not only for --dev. The node wire refuses a node
-	// whose deployment identity differs from this control plane's, so a server
-	// that never learned its own would compare every node against "" and refuse
-	// the entire fleet — the feature failing closed for a reason nobody could see.
+	// The identity itself is still required: the node wire refuses a node whose
+	// deployment differs from this plane's, so a server that never learned its
+	// own would compare every node against "" and refuse the entire fleet — the
+	// feature failing closed for a reason nobody could see.
+	//
+	// FOUNDED HERE IN THE ORDINARY CASE, before the database is opened. Whichever
+	// role starts first mints it; the other reads that same file.
 	deployment, err := state.DeploymentID(cfg.Server.StateDir)
 	if err != nil {
 		return err
-	}
-
-	if dev {
-		var deploymentLock *state.DeploymentLock
-
-		deployment, deploymentLock, err = claimDeployment(cfg)
-		if err != nil {
-			return err
-		}
-
-		defer func() {
-			if err := deploymentLock.Release(); err != nil {
-				slog.Default().Warn("could not release the deployment lock; a restart may "+
-					"have to wait for the kernel to drop it", "error", err)
-			}
-		}()
 	}
 
 	db, err := state.Open(ctx, cfg.Server.StateDir)
@@ -430,7 +417,7 @@ func runServer(ctx context.Context, lc *lifecycle, cfg *config.Config, dryRun, d
 		MaxVCPU:   cfg.Server.MaxVCPU,
 		MaxMemory: cfg.Server.MaxMemory,
 		Nodes:     cfg.NodePolicies(),
-	}, cfg.Tiers)
+	}, cfg.Tiers, alloc.WithPlacement(cfg.Server.Placement))
 	if err != nil {
 		return fmt.Errorf("capacity allocator: %w", err)
 	}
@@ -470,48 +457,22 @@ func runServer(ctx context.Context, lc *lifecycle, cfg *config.Config, dryRun, d
 		owner = "billet"
 	}
 
-	if dev {
-		// deployment and its host-wide lock were claimed above, before the database
-		// was opened.
-		p, err := newProvider(cfg, deployment)
-		if err != nil {
-			return err
-		}
-
-		// REGISTERED BEFORE ANYTHING IS PLACED ON IT. A node exists in the ledger
-		// because it said so, and placement compares a lease against the provider
-		// the host REGISTERED rather than one a catalog claims — so Bind refuses
-		// every lease until this row is here.
-		if err := allocator.RegisterNode(ctx, cfg.Node.Name, cfg.Node.Provider); err != nil {
-			return err
-		}
-
-		// Validation already parsed this, so it cannot fail here — but reading it
-		// through the same accessor keeps one definition of what the string means.
-		maxCustody, err := cfg.Node.MaxCustodyDuration()
-		if err != nil {
-			return err
-		}
-
-		runner := node.New(allocator, cfg.Node.Name, wiring.JITSource{Client: client}, p,
-			cfg.Tiers, slog.Default(), node.WithMaxCustody(maxCustody))
-
-		// CLEARED BEFORE A SINGLE JOB IS ADMITTED.
-		//
-		// Everything this backend is running belongs to a process that is gone —
-		// this one has empty maps and can neither heartbeat those leases nor notice
-		// their completion. Left alone, such a container runs forever on capacity
-		// the reaper will shortly hand back out, so the host ends up over-committed
-		// by exactly what the crash leaked.
-		//
-		// Fatal on failure, deliberately. Not knowing what is already running is
-		// not the same as nothing running, and starting anyway turns a recoverable
-		// mess into a compounding one.
-		if err := runner.Recover(ctx); err != nil {
-			return err
-		}
-
-		opts = append(opts, server.WithNodeRunner(runner))
+	// NOTHING IS LIVE UNTIL IT SAYS SO AGAIN, and this has to happen BEFORE
+	// anything registers.
+	//
+	// Liveness is the plane's judgement and this plane has just started, so it has
+	// none: its map is empty. Rows left by the previous process would otherwise
+	// back advertisements for machines this one has never heard from.
+	//
+	// Every node re-registers over the wire within a poll, so the cost is a brief
+	// zero that is also the truth. That was NOT true while --dev ran a node in
+	// this process: it registered straight into the ledger and never dialled the
+	// wire, so a sweep after it registered marked it dead with no second chance —
+	// the colocated runner advertised zero forever, on the one deployment shape
+	// with no other machine to fall back on. Deleting that path deleted the
+	// ordering hazard with it.
+	if err := allocator.ForgetEveryNode(ctx); err != nil {
+		return fmt.Errorf("server: could not clear the fleet's liveness: %w", err)
 	}
 
 	// THE NODE WIRE IS SERVED WHETHER OR NOT ANY NODE EXISTS YET.
@@ -521,27 +482,34 @@ func runServer(ctx context.Context, lc *lifecycle, cfg *config.Config, dryRun, d
 	// nothing to guard: an empty fleet answers every request with "I do not know
 	// you".
 	nodes := nodeplane.New(slog.Default(), deployment, allocator.LeaseTTL(),
-		nodeplane.WithRegistrar(allocator))
+		nodeplane.WithRegistrar(allocator),
+		// The declared places, so a node claiming one nobody declared is refused
+		// here rather than recorded. A node's own config cannot make this check —
+		// sites are the control plane's to declare and the node's file has no
+		// reason to list them.
+		nodeplane.WithSites(cfg.SiteNames()),
+		// The catalogue lives here, and a launch carries the shape a node needs, so
+		// no node keeps a copy that can drift from this one.
+		nodeplane.WithTierCatalog(cfg.Tiers))
 
-	stopWire, err := serveNodeWire(ctx, cfg, owner, nodes, allocator, wiring.NodeJIT{Client: client})
+	stopWire, err := serveNodeWire(ctx, cfg, nodes, allocator,
+		wiring.NodeJIT{Client: client}, allocator, allocator)
 	if err != nil {
 		return err
 	}
 
 	defer stopWire()
 
-	// THE REMOTE PLANE DRIVES COMPUTE WHENEVER THERE IS NO LOCAL NODE.
-	//
-	// --dev already attached an in-process runner above, and it wins for that
-	// process: a single-machine deployment should not send commands to itself
-	// over a loopback socket to reach a runner it already holds. Without --dev
-	// this is the only thing that can launch anything, and forgetting to attach
-	// it — which is exactly what the first version of this branch did — leaves a
-	// control plane that serves the node wire, accepts registrations, and then
+	// A TIMER, BECAUSE NOTHING ELSE ASKS. A node's liveness now decides what its
+	// tier advertises, and an idle deployment never launches, lists or destroys —
+	// so without this a host that crashed on a quiet afternoon would keep its
+	// capacity advertised until somebody happened to need it.
+	go nodes.Watch(ctx)
+
+	// THE REMOTE PLANE DRIVES ALL COMPUTE, and it is the only thing that can. A
+	// control plane without it serves the node wire, accepts registrations, and then
 	// never sends a single command.
-	if !dev {
-		opts = append(opts, server.WithNodeRunner(nodes.NewRunner()))
-	}
+	opts = append(opts, server.WithNodeRunner(nodes.NewRunner()))
 
 	plane := server.New(allocator, wiring.Provisioner{Client: client}, cfg.Tiers, owner, slog.Default(), opts...)
 	if err := plane.Run(ctx); err != nil {
@@ -600,19 +568,31 @@ func nodeTLSHosts(cfg *config.Config) ([]string, error) {
 // and requires one back. There is nothing to configure and nothing to install:
 // the CA lives beside the state directory, and `billet ca issue <node>` produces
 // the bundle a node is given.
+// THE DEPLOYMENT IS READ HERE RATHER THAN PASSED IN, because a parameter of
+// that type is one a caller can fill with the wrong string and the compiler
+// cannot tell. It was filled with the hostname, and both boot orders failed
+// silently: minted against a hostname, the authority produces node certificates
+// carrying a deployment no node can parse and the plane refuses forever; minted
+// by `billet ca issue` against the real id, this function refuses to start at
+// all. Neither shows up on loopback, which is every local run.
+//
+// state.DeploymentID reads the file the rest of the process already read, so
+// there is nothing to keep in step.
 func serveNodeWire(
 	ctx context.Context,
-	cfg *config.Config, deployment string,
+	cfg *config.Config,
 	nodes *nodeplane.Plane, store nodeplane.LeaseStore, jit nodeplane.JITSource,
+	revocations nodeplane.Revocations, enrollments nodeplane.Enrollments,
 ) (func(), error) {
 	addr := cfg.Server.Listen
 	loopback := nodeplane.LoopbackOnly(addr)
 
-	// THE CATALOGUE TRAVELS WITH THE WIRE, because a JIT request is checked
-	// against the tier its lease names — including that tier's runner group,
-	// which is how an operator keeps a tier away from every repository in the
-	// organisation.
-	handlerOpts := []nodeplane.HandlerOption{nodeplane.WithTiers(cfg.Tiers)}
+	deployment, err := state.DeploymentID(cfg.Server.StateDir)
+	if err != nil {
+		return nil, err
+	}
+
+	var handlerOpts []nodeplane.HandlerOption
 
 	var tlsConf *tls.Config
 
@@ -627,16 +607,54 @@ func serveNodeWire(
 			return nil, err
 		}
 
-		bundle, err := ca.IssueServer(hosts)
+		// SIGNED BY THE AUTHORITY THE FLEET STILL TRUSTS. During a rotation that
+		// is the PREVIOUS one: a node that has not renewed yet knows only that, and
+		// presenting a certificate from the new authority would make the control
+		// plane unverifiable to it — over the very wire it would need to recover.
+		// The server follows the fleet rather than leading it.
+		serving, err := wirecert.ServingCA(cfg.Server.StateDir, deployment, ca)
 		if err != nil {
 			return nil, err
 		}
+
+		bundle, err := serving.IssueServer(hosts)
+		if err != nil {
+			return nil, err
+		}
+
+		// AND EVERY AUTHORITY IS TRUSTED FOR CLIENTS, so a node holding either an
+		// old or a new certificate is recognised while the overlap runs.
+		trust, err := wirecert.TrustBundle(cfg.Server.StateDir, ca)
+		if err != nil {
+			return nil, err
+		}
+
+		bundle.CAPEM = trust
 
 		if tlsConf, err = wirecert.ServerTLS(bundle); err != nil {
 			return nil, err
 		}
 
-		handlerOpts = append(handlerOpts, nodeplane.RequireClientCert())
+		if age, rotating := wirecert.RotationAge(cfg.Server.StateDir); rotating {
+			slog.Default().Warn("a certificate authority rotation is running; nodes adopt the "+
+				"new one as they renew, and `billet ca retire` finishes it once they all have",
+				"started", age.Round(time.Hour))
+		}
+
+		handlerOpts = append(handlerOpts,
+			nodeplane.RequireClientCert(),
+			// A CREDENTIAL CAN BE TAKEN BACK, and it is checked on every request
+			// rather than only at registration: a node holds one long poll open for
+			// the better part of a minute and re-registers rarely.
+			nodeplane.WithRevocations(revocations),
+			// AND RENEWED BEFORE IT EXPIRES, by the node itself. Without this a
+			// fleet enrolled on one afternoon expires on one afternoon a year later.
+			nodeplane.WithRenewal(ca),
+			nodeplane.WithTrustBundle(trust),
+			// AND A WAY IN FOR A MACHINE THAT HAS NOTHING YET. Asking grants
+			// nothing: the request waits until an operator compares its fingerprint
+			// against what the node printed.
+			nodeplane.WithEnrollment(enrollments))
 
 		slog.Default().Info("the node wire requires client certificates",
 			"hosts", hosts, "ca_expires", ca.NotAfter().Format(time.DateOnly))
@@ -684,6 +702,31 @@ func serveNodeWire(
 	}, nil
 }
 
+// serverHostname is the name a node checks its control plane's certificate
+// against.
+//
+// Taken from node.server_addr, which is the address the node actually dials, so
+// the certificate is verified against the thing that was reached rather than
+// against whatever the certificate happens to claim.
+func serverHostname(addr string) (string, error) {
+	s := addr
+	if !strings.Contains(s, "://") {
+		s = "https://" + s
+	}
+
+	u, err := url.Parse(s)
+	if err != nil {
+		return "", fmt.Errorf("node.server_addr %q is not an address billet can dial: %w", addr, err)
+	}
+
+	if u.Hostname() == "" {
+		return "", fmt.Errorf("node.server_addr %q names no host, so there is nothing to verify "+
+			"the control plane's certificate against", addr)
+	}
+
+	return u.Hostname(), nil
+}
+
 // newProvider builds the compute backend this host runs.
 //
 // Only docker exists today. firecracker needs Linux and /dev/kvm, tart needs
@@ -700,7 +743,7 @@ func newProvider(cfg *config.Config, deployment string) (provider.Provider, erro
 		return docker.New(deployment, docker.WithLogger(slog.Default())), nil
 
 	case config.ProviderFirecracker, config.ProviderTart, config.ProviderEC2:
-		return nil, fmt.Errorf("%w: the %s provider is not built yet; --dev currently runs the "+
+		return nil, fmt.Errorf("%w: the %s provider is not built yet; billet currently runs the "+
 			"docker backend, which shares the host kernel and is for trials rather than for "+
 			"untrusted work", errNotImplemented, cfg.Node.Provider)
 
@@ -743,10 +786,21 @@ func nodeBundle(cfg *config.Config) (*wirecert.Bundle, error) {
 		return nil, err
 	}
 
+	// THE CERTIFICATE IS THE NAME, and an absent node.name is filled in from it
+	// rather than defaulted from the hostname. The control plane authorises by
+	// this name, so a machine whose hostname differs from it would otherwise be
+	// refused for a value the operator never chose.
+	if cfg.Node.Name == "" {
+		cfg.Node.Name = name
+
+		return &bundle, nil
+	}
+
 	if name != cfg.Node.Name {
 		return nil, fmt.Errorf(
 			"node.name is %q but %s was issued for %q; the control plane authorises by the "+
-				"name in the certificate, so this node could only ever act as %q",
+				"name in the certificate, so this node could only ever act as %q. Remove "+
+				"node.name to take it from the certificate",
 			cfg.Node.Name, cfg.Node.TLS.CertPath, name, name)
 	}
 
@@ -756,6 +810,13 @@ func nodeBundle(cfg *config.Config) (*wirecert.Bundle, error) {
 func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 	fs := newFlagSet("billet node")
 	cfgPath := addConfigFlag(fs)
+	enroll := fs.Bool("enroll", false,
+		"ask the control plane to admit this machine, then wait for an operator to approve it")
+	caFingerprint := fs.String("ca-fingerprint", "",
+		"the control plane's CA fingerprint, from `billet ca show` (required with --enroll)")
+	joinToken := fs.String("join-token", "",
+		"a short-lived token from `billet ca token` (required with --enroll)")
+
 	if err := parse(fs, args); err != nil {
 		return err
 	}
@@ -771,6 +832,12 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 	if cfg.Node.ServerAddr == "" {
 		return fmt.Errorf("%s has no node.server_addr, so this host does not know which "+
 			"control plane to dial", *cfgPath)
+	}
+
+	// BEFORE ANYTHING ELSE, because enrolling is what produces the bundle
+	// everything below reads.
+	if *enroll {
+		return enrollNode(ctx, cfg, *caFingerprint, *joinToken)
 	}
 
 	// LOADED BEFORE THE IDENTITY IS CLAIMED, because the certificate is what
@@ -801,12 +868,27 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 		}
 	}()
 
-	var tlsConf *tls.Config
+	// A ROTATING IDENTITY, so a renewal takes effect without a restart. The
+	// callback is answered per handshake, which is what makes it safe to replace
+	// the certificate under a node holding long-lived connections.
+	var (
+		tlsConf  *tls.Config
+		identity *wirecert.Rotating
+	)
 
 	if bundle != nil {
-		if tlsConf, err = wirecert.ClientTLS(*bundle); err != nil {
+		identity, err = wirecert.NewRotating(
+			cfg.Node.TLS.CertPath, cfg.Node.TLS.KeyPath, cfg.Node.TLS.CAPath)
+		if err != nil {
 			return err
 		}
+
+		host, hostErr := serverHostname(cfg.Node.ServerAddr)
+		if hostErr != nil {
+			return hostErr
+		}
+
+		tlsConf = identity.ClientTLS(host)
 	}
 
 	client, err := nodeclient.New(nodeclient.Options{
@@ -833,7 +915,7 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 	// It satisfies node.LeaseStore and node.JITSource, which is the whole reason
 	// the runner needs no idea it is remote: the interfaces it already took are
 	// the seam the network went through.
-	runner := node.New(client, cfg.Node.Name, client, p, cfg.Tiers, slog.Default(),
+	runner := node.New(client, cfg.Node.Name, client, p, slog.Default(),
 		node.WithMaxCustody(maxCustody))
 
 	fmt.Printf("billet node %s: dialing %s\n", cfg.Node.Name, cfg.Node.ServerAddr)
@@ -850,10 +932,26 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 		return err
 	}
 
+	// RESOLVED ONCE, HERE, rather than on each re-registration. A drain
+	// re-registers, and a node that came back reporting a different contribution
+	// would move the fleet's arithmetic underneath work it is still holding.
+	contribution, err := nodeContribution(cfg)
+	if err != nil {
+		return err
+	}
+
+	for _, w := range contribution.Warnings {
+		slog.Default().Warn(w, "node", cfg.Node.Name)
+	}
+
 	return nodeclient.Run(ctx, client, runner, nodeclient.LoopOptions{
 		Provider:     cfg.Node.Provider,
 		Deployment:   deployment,
+		Site:         cfg.Node.Site,
+		VCPU:         contribution.VCPU,
+		Memory:       contribution.Memory,
 		Log:          slog.Default(),
+		Identity:     identity,
 		SweepEvery:   5 * time.Minute,
 		DrainTimeout: drainTimeout,
 		// The second signal, reaching the wait that honours it.
@@ -861,9 +959,6 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 	})
 }
 
-// cmdCheck is the explicit "is this deployment sane" command. It is the only
-// path that opens — and therefore migrates — the state database, so that
-// mutating durable state is always something the operator asked for.
 // newScaleSetClient builds the GitHub client from config, reading the key with
 // the same hardened reader `billet check` uses.
 //
@@ -931,11 +1026,9 @@ func cmdTeardown(ctx context.Context, args []string) error {
 			"delete anything from", *cfgPath)
 	}
 
-	// "Delete everything" is NEVER the default for a destructive command.
-	//
-	// It used to be: an omitted --tier selected every tier, which is
-	// indistinguishable from `--tier "$TIER"` with TIER unset. A script with an
-	// empty variable would have deleted every scale set in the org while looking
+	// "Delete everything" is NEVER the default for a destructive command. An omitted
+	// --tier is indistinguishable from `--tier "$TIER"` with TIER unset, so a script
+	// with an empty variable would delete every scale set in the org while looking
 	// like it asked for one.
 	switch {
 	case *all && *tier != "":
@@ -1093,22 +1186,180 @@ func confirmOrganization(ctx context.Context, org string) error {
 // is and where it stays. The bundle it writes is copied to the node — the key
 // travels once, by an operator, rather than over a wire that does not yet trust
 // anybody.
-func cmdCA(_ context.Context, args []string) error {
+func cmdCA(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: billet ca issue <node> [--out <dir>] | billet ca show")
+		return errors.New("usage: billet ca issue <node> [--out <dir>] | billet ca token | " +
+			"billet ca rotate | billet ca retire | billet ca revoke <node> | " +
+			"billet ca revocations | billet ca show")
 	}
 
 	switch args[0] {
 	case "issue":
-		return cmdCAIssue(args[1:])
+		return cmdCAIssue(ctx, args[1:])
+	case "revoke":
+		return cmdCARevoke(ctx, args[1:])
+	case "revocations":
+		return cmdCARevocations(ctx, args[1:])
+	case "token":
+		return cmdCAToken(ctx, args[1:])
+	case "rotate":
+		return cmdCARotate(args[1:])
+	case "retire":
+		return cmdCARetire(args[1:])
 	case "show":
 		return cmdCAShow(args[1:])
 	}
 
-	return fmt.Errorf("unknown ca command %q; try issue or show", args[0])
+	return fmt.Errorf(
+		"unknown ca command %q; try issue, token, rotate, retire, revoke, revocations or show",
+		args[0])
 }
 
-func cmdCAIssue(args []string) error {
+// cmdCARevoke withdraws a node's certificate.
+//
+// BY SERIAL, taken from the bundle the operator issued. A name would be the
+// obvious handle and is the wrong one: a name is legitimately re-issued to a
+// replacement machine, so revoking it would refuse the replacement too. The
+// serial names the one credential being taken back.
+//
+// WRITES TO THE LEDGER, so it takes effect on the next request the revoked host
+// makes rather than at the next restart of anything.
+func cmdCARevoke(ctx context.Context, args []string) error {
+	fs := newFlagSet("billet ca revoke")
+	cfgPath := addConfigFlag(fs)
+	certPath := fs.String("cert", "", "the certificate to revoke (default <node>-billet-tls/node.crt)")
+	reason := fs.String("reason", "", "why, recorded alongside it")
+
+	name, err := parseWithName(fs, args)
+	if err != nil {
+		return err
+	}
+
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		return err
+	}
+
+	if cfg.Server == nil {
+		return errors.New("revoking is done on the control plane, and this config has no server section")
+	}
+
+	path := *certPath
+	if path == "" {
+		path = filepath.Join(name+"-billet-tls", "node.crt")
+	}
+
+	serial, err := serialFromCert(path)
+	if err != nil {
+		return err
+	}
+
+	db, err := state.Open(ctx, cfg.Server.StateDir)
+	if err != nil {
+		return fmt.Errorf("server state: %w", err)
+	}
+
+	defer db.Close()
+
+	allocator, err := alloc.New(db, alloc.Limits{
+		MaxVCPU:   cfg.Server.MaxVCPU,
+		MaxMemory: cfg.Server.MaxMemory,
+		Nodes:     cfg.NodePolicies(),
+	}, cfg.Tiers)
+	if err != nil {
+		return fmt.Errorf("capacity allocator: %w", err)
+	}
+
+	if err := allocator.RevokeCert(ctx, serial, name, *reason); err != nil {
+		return err
+	}
+
+	fmt.Printf("Revoked %s (node %s)\n", serial, name)
+	fmt.Printf("\nIt is refused on the next request that certificate makes. Issue a replacement\n")
+	fmt.Printf("with `billet ca issue %s` if the machine is coming back.\n", name)
+
+	return nil
+}
+
+// cmdCARevocations lists what has been withdrawn.
+func cmdCARevocations(ctx context.Context, args []string) error {
+	fs := newFlagSet("billet ca revocations")
+	cfgPath := addConfigFlag(fs)
+
+	if err := parse(fs, args); err != nil {
+		return err
+	}
+
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		return err
+	}
+
+	if cfg.Server == nil {
+		return errors.New("the revocation list lives on the control plane, and this config has no server section")
+	}
+
+	db, err := state.Open(ctx, cfg.Server.StateDir)
+	if err != nil {
+		return fmt.Errorf("server state: %w", err)
+	}
+
+	defer db.Close()
+
+	allocator, err := alloc.New(db, alloc.Limits{
+		MaxVCPU:   cfg.Server.MaxVCPU,
+		MaxMemory: cfg.Server.MaxMemory,
+		Nodes:     cfg.NodePolicies(),
+	}, cfg.Tiers)
+	if err != nil {
+		return fmt.Errorf("capacity allocator: %w", err)
+	}
+
+	revoked, err := allocator.RevokedCerts(ctx)
+	if err != nil {
+		return err
+	}
+
+	if len(revoked) == 0 {
+		fmt.Println("No certificates have been revoked.")
+
+		return nil
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "SERIAL\tNODE\tREVOKED\tREASON")
+
+	for _, r := range revoked {
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", r.Serial, r.Node, r.RevokedAt, r.Reason)
+	}
+
+	return w.Flush()
+}
+
+// serialFromCert reads the serial out of a PEM certificate on disk.
+func serialFromCert(path string) (string, error) {
+	// The path is the operator's own argument on their own machine, naming a
+	// certificate they issued. There is no boundary here to cross: `billet ca
+	// revoke` is already a command that writes to the deployment's ledger.
+	raw, err := os.ReadFile(filepath.Clean(path))
+	if err != nil {
+		return "", fmt.Errorf("read %s: %w", path, err)
+	}
+
+	block, _ := pem.Decode(raw)
+	if block == nil || block.Type != "CERTIFICATE" {
+		return "", fmt.Errorf("%s is not a PEM certificate", path)
+	}
+
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return "", fmt.Errorf("parse %s: %w", path, err)
+	}
+
+	return wirecert.Serial(cert), nil
+}
+
+func cmdCAIssue(ctx context.Context, args []string) error {
 	fs := newFlagSet("billet ca issue")
 	cfgPath := addConfigFlag(fs)
 	out := fs.String("out", "", "directory to write the bundle to (default ./<node>-billet-tls)")
@@ -1169,11 +1420,63 @@ func cmdCAIssue(args []string) error {
 		abs = dir
 	}
 
+	// RECORDED, so both ways into a deployment leave the same trail: a fleet built by
+	// issuing directly would otherwise be invisible to the list that shows what has
+	// been admitted.
+	//
+	// Not fatal if it fails: the bundle is already on disk and the operator has what
+	// they came for. Losing the audit row is worth saying out loud and not worth
+	// throwing the certificate away over.
+	if leaf, lerr := wirecert.LeafOf(bundle); lerr != nil {
+		fmt.Fprintf(os.Stderr, "could not read back the certificate to record it: %v\n", lerr)
+	} else if rerr := recordIssued(ctx, *cfgPath, name, wirecert.FingerprintOfCert(leaf),
+		string(bundle.CertPEM)); rerr != nil {
+		fmt.Fprintf(os.Stderr, "issued the bundle but could not record it: %v\n", rerr)
+	}
+
 	fmt.Printf("billet ca: wrote a bundle for node %q to %s\n\n", name, abs)
+	fmt.Printf("  fingerprint  %s\n\n", wirecert.Fingerprint(mustSPKI(bundle)))
 	fmt.Print("Copy that directory to the node, then point its config at the files:\n\n")
-	fmt.Printf("  node:\n    name: %s\n    tls:\n      cert: /etc/billet/tls/node.crt\n"+
-		"      key:  /etc/billet/tls/node.key\n      ca:   /etc/billet/tls/ca.crt\n\n", name)
+	fmt.Printf("  node:\n    tls:\n      cert: /etc/billet/tls/node.crt\n" +
+		"      key:  /etc/billet/tls/node.key\n      ca:   /etc/billet/tls/ca.crt\n\n")
+	fmt.Print("node.name comes from the certificate, so it does not have to be written.\n")
 	fmt.Print("node.key is a private key: keep it 0600 and do not copy it anywhere else.\n")
+
+	return nil
+}
+
+// mustSPKI is the bundle's public key bytes, or nothing if it cannot be read.
+// Used only for display beside a bundle that has already been written.
+func mustSPKI(b wirecert.Bundle) []byte {
+	leaf, err := wirecert.LeafOf(b)
+	if err != nil {
+		return nil
+	}
+
+	return leaf.RawSubjectPublicKeyInfo
+}
+
+// recordIssued writes a directly-issued certificate into the admission trail.
+func recordIssued(ctx context.Context, cfgPath, name, fingerprint, certPEM string) error {
+	a, closeDB, err := controlPlaneAllocator(ctx, cfgPath)
+	if err != nil {
+		return err
+	}
+
+	defer closeDB()
+
+	displaced, err := a.RecordIssued(ctx, name, fingerprint, certPEM)
+	if err != nil {
+		return err
+	}
+
+	// SAID OUT LOUD, because this is the one path that can quietly retire a
+	// fingerprint an operator has already compared and trusted.
+	if displaced != "" {
+		fmt.Printf("\nNOTE: %s was already admitted as %s.\nThat key can no longer be used "+
+			"under this name; revoke its certificate if the machine still holds it.\n",
+			name, displaced)
+	}
 
 	return nil
 }
@@ -1206,12 +1509,29 @@ func cmdCAShow(args []string) error {
 		return err
 	}
 
-	fmt.Printf("deployment %s\nauthority   %s\nexpires     %s\n",
-		deployment, wirecert.CADir(cfg.Server.StateDir), ca.NotAfter().Format(time.RFC3339))
+	fmt.Printf("deployment  %s\nauthority   %s\nexpires     %s\nfingerprint %s\n",
+		deployment, wirecert.CADir(cfg.Server.StateDir), ca.NotAfter().Format(time.RFC3339),
+		ca.Fingerprint())
+
+	if left, capping := ca.Capping(); capping {
+		fmt.Printf("\nWARNING: this authority expires in %s, which is less than a certificate's\n",
+			left.Round(24*time.Hour))
+		fmt.Printf("full life, so every certificate it issues from now on is SHORTER than the\n")
+		fmt.Printf("last — and when it expires, every node stops at once. Nothing will error\n")
+		fmt.Printf("before that. Plan a rotation: issue a new authority, let nodes pick it up\n")
+		fmt.Printf("through renewal while both are trusted, then retire the old one.\n")
+	}
+
+	fmt.Printf("\nGive the fingerprint to a node that is enrolling, so it can tell this control\n")
+	fmt.Printf("plane from anything else that answers:\n\n")
+	fmt.Printf("  billet node --enroll --ca-fingerprint %s\n", ca.Fingerprint())
 
 	return nil
 }
 
+// cmdCheck is the explicit "is this deployment sane" command. It is the only
+// path that opens — and therefore migrates — the state database, so mutating
+// durable state is always something the operator asked for.
 func cmdCheck(ctx context.Context, args []string) error {
 	fs := newFlagSet("billet check")
 	cfgPath := addConfigFlag(fs)
@@ -1347,14 +1667,6 @@ func cmdCheck(ctx context.Context, args []string) error {
 			reservedVCPU, cfg.Server.MaxVCPU, share, reservedMemory, cfg.Server.MaxMemory)
 	}
 	return nil
-}
-
-func cmdInit(_ context.Context, args []string) error {
-	fs := newFlagSet("billet init")
-	if err := parse(fs, args); err != nil {
-		return err
-	}
-	return fmt.Errorf("%w: writes a billet.yaml after asking for a provider and tier shapes", errNotImplemented)
 }
 
 func cmdStatus(_ context.Context, args []string) error {

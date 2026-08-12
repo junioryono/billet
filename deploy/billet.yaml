@@ -4,23 +4,17 @@
 # a config file, so your edits survive. Nothing starts until this says something
 # true; see billet.example.yaml for every key and why it exists.
 
+# The control plane. It runs no compute — a machine that should also run jobs
+# enables billet-node.service beside billet-server.service, reading this same
+# file. That pair IS the single-machine deployment; there is no combined mode.
 server:
   # Loopback only. Any other address requires client certificates, which billet
   # mints itself — run `billet ca issue <node>` and copy the bundle to that host.
+  # A node on THIS machine needs none: a loopback listener serves plain HTTP,
+  # because there is nothing between two local processes to authenticate.
   listen: 127.0.0.1:7717
 
   state_dir: /var/lib/billet/server
-
-  # THE HOST-WIDE DEPLOYMENT LOCK, and the packaged units depend on this exact
-  # path. It stops two processes carrying one deployment identity from managing
-  # the same containers, so every process that can reach the same container
-  # runtime has to meet at the same directory. billet's own default is derived
-  # from HOME, which a systemd service does not have — so leaving this out means
-  # billet refuses to start rather than quietly running without the protection.
-  #
-  # /run/billet is created by the units' RuntimeDirectory=. It is tmpfs, which is
-  # correct: the lock is meaningful per boot.
-  lock_dir: /run/billet/locks
 
   # ZERO ON PURPOSE, so billet refuses to start until you size it.
   #
@@ -53,19 +47,38 @@ github:
   installation_id: 0
   private_key_path: /etc/billet/app-private-key.pem
 
-# Uncomment on a machine that should run jobs. On a single-machine deployment,
-# run `billet server --dev` instead of the two units.
+# Uncomment on a machine that should run jobs, then
+# `systemctl enable --now billet-node`. On the machine running the control plane
+# this is the single-machine deployment: two units, one file, loopback between
+# them.
+#
+# NO tls BLOCK while server_addr is loopback — billet refuses that pairing,
+# because a control plane listening only on loopback serves plain HTTP and a node
+# configured for https would never connect. A node on ANOTHER machine needs one:
+# run `billet ca issue <node>` on the control plane, copy the bundle here, add
+# the tls block, and point server_addr at an address this host can reach.
 #
 # node:
 #   name: this-host
 #   server_addr: 127.0.0.1:7717
 #   provider: docker
 #   state_dir: /var/lib/billet/node
+#
+#   # THE HOST-WIDE DEPLOYMENT LOCK, and the packaged units depend on this exact
+#   # path. It stops two processes carrying one deployment identity from managing
+#   # the same containers, so every process that can reach the same container
+#   # runtime has to meet at the same directory. billet's own default is derived
+#   # from HOME, which a systemd service does not have — so leaving this out
+#   # means billet refuses to start rather than quietly running without the
+#   # protection.
+#   #
+#   # It belongs to the node because the node is the role that runs containers;
+#   # the control plane takes no lock. (It was `server.lock_dir` before that was
+#   # true, and billet will tell you so if it finds it there.)
+#   #
+#   # /run/billet is created by the units' RuntimeDirectory=. It is tmpfs, which
+#   # is correct: the lock is meaningful per boot.
 #   lock_dir: /run/billet/locks
-#   tls:
-#     cert: /etc/billet/tls/node.crt
-#     key: /etc/billet/tls/node.key
-#     ca: /etc/billet/tls/ca.crt
 
 # Tiers are yours to define. The label is what users put in `runs-on`.
 tiers:

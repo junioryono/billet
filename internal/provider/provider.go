@@ -74,26 +74,21 @@ func Classify(event string) TrustClass {
 	case "pull_request", "pull_request_target":
 		return TrustUntrusted
 
-	// EVENTS THAT CARRY PULL-REQUEST CODE WITHOUT SAYING SO. Each of these was
-	// on the trusted list and each is a way for outside code to arrive under a
-	// name that sounds internal:
+	// EVENTS THAT CARRY PULL-REQUEST CODE WITHOUT SAYING SO. Each is a way for outside
+	// code to arrive under a name that sounds internal:
 	//
-	//   merge_group     runs the candidate MERGE COMMIT, which contains the pull
-	//                   request's code, fork-authored included.
-	//   workflow_run    is triggered BY another workflow — commonly a fork's PR
-	//                   run — and the standard pattern is to download that run's
-	//                   artifacts. This is the well-known artifact-poisoning
-	//                   vector, and it was the worst thing on the old list.
-	//   workflow_call   is a reusable workflow, which a pull-request workflow can
-	//                   call. Whether the scale set reports the caller's event or
-	//                   this one is not established, and an unverified assumption
-	//                   is not a basis for granting trust.
-	//   deployment      can name a PR preview ref. The event says nothing about
-	//   deployment_status  whose code is at that ref.
+	// 	merge_group     runs the candidate MERGE COMMIT, which contains the pull
+	// 	                request's code, fork-authored included.
+	// 	workflow_run    is triggered BY another workflow, commonly a fork's PR run, and
+	// 	                the standard pattern downloads that run's artifacts — the
+	// 	                well-known artifact-poisoning vector.
+	// 	workflow_call   is a reusable workflow a pull-request workflow can call, and
+	// 	                which event the scale set reports is not established.
+	// 	deployment      can name a PR preview ref; the event says nothing about whose
+	// 	deployment_status  code is at that ref.
 	//
-	// They are UNKNOWN rather than untrusted: billet is not asserting they are
-	// hostile, only that the event name does not establish provenance. Unknown
-	// fails closed, which is the same practical outcome and the honest label.
+	// UNKNOWN rather than untrusted: billet is not asserting they are hostile, only that
+	// the event name does not establish provenance. Unknown fails closed.
 	case "merge_group", "workflow_run", "workflow_call",
 		"deployment", "deployment_status":
 		return TrustUnknown
