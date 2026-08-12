@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -75,6 +76,68 @@ func TestInitWritesAConfigThatLoads(t *testing.T) {
 	// has no certificate for the two processes to authenticate with.
 	if cfg.Node.Name == "" {
 		t.Error("the node has no name and no certificate to take one from")
+	}
+}
+
+// ON EVERY SIZE OF MACHINE, NOT JUST THIS ONE.
+//
+// The test above generates for whatever host runs it, so a laptop with plenty of
+// cores proves nothing about the small machines billet is most likely to be tried
+// on first. The ceiling is detected capacity minus headroom while the tiers are
+// billet's own choice, so a generated config is only valid where the tiers happen
+// to fit under the ceiling — and "happen to" is not a property, it is a coin toss
+// decided by the reviewer's hardware.
+func TestInitWritesAConfigThatLoadsOnAnySizeOfMachine(t *testing.T) {
+	hosts := []struct {
+		vcpu   int
+		memory config.ByteSize
+	}{
+		{1, 2 * config.GiB},     // the smallest thing that can boot
+		{2, 4 * config.GiB},     // a small cloud VM
+		{4, 16 * config.GiB},    // a GitHub-hosted runner
+		{8, 16 * config.GiB},    // cores without the memory to match
+		{2, 64 * config.GiB},    // memory without the cores
+		{16, 64 * config.GiB},   // a workstation
+		{128, 512 * config.GiB}, // the reference host
+	}
+
+	for _, h := range hosts {
+		t.Run(fmt.Sprintf("%dvcpu-%s", h.vcpu, h.memory), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "billet.yaml")
+
+			body := generatedConfig("acme", config.ProviderDocker, defaultRunnerImage, h.vcpu, h.memory)
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+
+			if err := writeGitHubBlock(path, githubBlock{
+				Org: "acme", AppID: 1, InstallationID: 2,
+				PrivateKeyPath: filepath.Join(t.TempDir(), "key.pem"),
+			}); err != nil {
+				t.Fatalf("filling in the app: %v", err)
+			}
+
+			cfg, err := config.Load(path)
+			if err != nil {
+				t.Fatalf("a %d vCPU / %s machine gets a config that does not load: %v\n\n%s",
+					h.vcpu, h.memory, err, body)
+			}
+
+			// A config that loads but advertises nothing is the same failure wearing
+			// a different error: the operator starts billet, GitHub queues the job,
+			// and nothing ever picks it up.
+			if len(cfg.Tiers) == 0 {
+				t.Fatal("the generated config has no tiers, so no job can ever be scheduled")
+			}
+
+			for i := range cfg.Tiers {
+				tier := &cfg.Tiers[i]
+				if tier.VCPU > cfg.Server.MaxVCPU || tier.Memory > cfg.Server.MaxMemory {
+					t.Errorf("tier %q is %d vCPU / %s under a ceiling of %d vCPU / %s, so it can never be placed",
+						tier.Label, tier.VCPU, tier.Memory, cfg.Server.MaxVCPU, cfg.Server.MaxMemory)
+				}
+			}
+		})
 	}
 }
 
