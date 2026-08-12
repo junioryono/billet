@@ -234,6 +234,68 @@ node:
     zfs_pool: tank
     bridge: br0
 
+  # THE CLOUD BACKEND, for `provider: ec2`. One instance per job, in one subnet.
+  #
+  # This is the AVAILABILITY story: a tier that lists `providers: [firecracker,
+  # ec2]` may be placed on either, so losing the bare-metal host does not take the
+  # `runs-on` label down with it. A job that fails over runs with a COLD cache, and
+  # that is correct — keeping it warm would mean shipping cache bytes over a WAN,
+  # which is the problem the caching plane exists to remove.
+  #
+  # An ec2 node is an ORCHESTRATOR: it holds credentials and calls an API, and the
+  # compute appears in a region. Nothing runs on the machine billet runs on, so
+  # max_vcpu and max_memory above are REQUIRED here rather than detected — they are
+  # the spending limit, and billet will not choose one on your account. They are
+  # also most of the cost policy: the allocator never buys past them, and the ORDER
+  # of a tier's `providers:` list is what makes home fill first.
+  #
+  # Credentials come from AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / (optionally)
+  # AWS_SESSION_TOKEN, and failing that from this instance's own IAM role over
+  # IMDSv2. The role is preferred: the alternative is a credential that never
+  # expires, in a unit file, on a host that launches machines. Shared-config
+  # profiles and SSO are NOT read — project them into the environment.
+  #
+  # ec2:
+  #   region: us-west-2
+  #
+  #   # Where instances land. Their route to GitHub is yours to arrange: a private
+  #   # subnet needs a NAT gateway, a public one needs assign_public_ip. A runner
+  #   # that cannot reach GitHub registers and then does nothing.
+  #   subnet_id: subnet-0abc123
+  #   security_group_ids: [sg-0trusted]
+  #   # assign_public_ip: true
+  #
+  #   # FORK PULL-REQUEST WORK RUNS ONLY IF THIS IS SET, and it should name a group
+  #   # that reaches only what a stranger's code should reach. An instance isolates
+  #   # the KERNEL, which is why this backend may run untrusted work at all — it
+  #   # does not isolate the VPC. Without this key untrusted work is refused rather
+  #   # than quietly placed on the trusted group.
+  #   # untrusted_security_group_ids: [sg-0fork]
+  #
+  #   # An IAM role handed to whatever the job runs. Empty is the right answer
+  #   # unless a job genuinely needs AWS credentials.
+  #   # instance_profile: billet-runner
+  #
+  #   # THE SHAPES BILLET MAY BUY, each declaring what it holds, because billet
+  #   # ships no table of EC2 instance types — a table would be out of date within a
+  #   # quarter, and being out of date means launching a machine smaller than the
+  #   # lease already escrowed against it. The ORDER is a preference: the first
+  #   # shape that fits is bought.
+  #   instance_types:
+  #     - type: c7i.2xlarge
+  #       vcpu: 8
+  #       memory: 16GiB
+  #     - type: c7i.8xlarge
+  #       vcpu: 32
+  #       memory: 64GiB
+  #
+  #   # SPOT DEFAULTS OFF. GitHub does not requeue a job whose runner vanished
+  #   # mid-execution, so a reclaimed spot instance is a failed build rather than a
+  #   # retry — and defaulting to it would make the failover path the unreliable
+  #   # one, which is the opposite of what a failover is for. Turn it on if you
+  #   # would rather have a cheap build that sometimes dies.
+  #   # spot: true
+
 # Tiers are yours to define — this is not a fixed catalog. The label is what
 # users put in `runs-on`.
 tiers:

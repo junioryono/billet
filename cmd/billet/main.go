@@ -36,6 +36,7 @@ import (
 	"github.com/junioryono/billet/internal/nodeplane"
 	"github.com/junioryono/billet/internal/provider"
 	"github.com/junioryono/billet/internal/provider/docker"
+	"github.com/junioryono/billet/internal/provider/ec2"
 	"github.com/junioryono/billet/internal/scaleset"
 	"github.com/junioryono/billet/internal/server"
 	"github.com/junioryono/billet/internal/state"
@@ -371,6 +372,16 @@ func claimIdentity(
 // Two paths resolving it independently would let the same file describe a
 // different machine depending on which process read it.
 func nodeContribution(cfg *config.Config) (config.Contribution, error) {
+	// NOT MEASURED WHEN THE WORK RUNS SOMEWHERE ELSE. An ec2 node is an
+	// orchestrator: it calls an API and the compute appears in a region, so this
+	// machine's cores are a default for nothing — config validation requires the
+	// numbers outright. Detecting anyway would spend a syscall on an answer whose
+	// only use would be comparing it against a declaration it has no relationship
+	// with.
+	if !cfg.Node.Provider.RunsOnHost() {
+		return cfg.Node.Contribution(0, 0), nil
+	}
+
 	vcpu, memory, err := config.DetectHostCapacity()
 	if err != nil {
 		return config.Contribution{}, err
@@ -730,10 +741,10 @@ func serverHostname(addr string) (string, error) {
 
 // newProvider builds the compute backend this host runs.
 //
-// Only docker exists today. firecracker needs Linux and /dev/kvm, tart needs
-// Apple Silicon, ec2 needs an account — each is a separate implementation of the
-// same interface, and each is refused explicitly rather than falling through to
-// something that happens to compile.
+// docker and ec2 exist. firecracker needs Linux and /dev/kvm and tart needs Apple
+// Silicon — each is a separate implementation of the same interface, and each is
+// refused explicitly rather than falling through to something that happens to
+// compile.
 func newProvider(cfg *config.Config, deployment string) (provider.Provider, error) {
 	switch cfg.Node.Provider {
 	case config.ProviderDocker:
@@ -743,10 +754,23 @@ func newProvider(cfg *config.Config, deployment string) (provider.Provider, erro
 		// enumerate the other's containers and destroy them as orphans.
 		return docker.New(deployment, docker.WithLogger(slog.Default())), nil
 
-	case config.ProviderFirecracker, config.ProviderTart, config.ProviderEC2:
+	case config.ProviderEC2:
+		// Config validation is what guarantees this is non-nil, and the constructor
+		// refuses an empty deployment identity for the same reason docker is
+		// labelled with one: instances are TAGGED with it, and List feeds a loop
+		// that terminates, so two installations sharing a tag is a way for one to
+		// destroy the other's live jobs.
+		if cfg.Node.EC2 == nil {
+			return nil, errors.New("billet: node.ec2 is missing; the provider is ec2")
+		}
+
+		return ec2.New(deployment, *cfg.Node.EC2, ec2.WithLogger(slog.Default()))
+
+	case config.ProviderFirecracker, config.ProviderTart:
 		return nil, fmt.Errorf("%w: the %s provider is not built yet; billet currently runs the "+
 			"docker backend, which shares the host kernel and is for trials rather than for "+
-			"untrusted work", errNotImplemented, cfg.Node.Provider)
+			"untrusted work, and the ec2 backend, which launches one instance per job",
+			errNotImplemented, cfg.Node.Provider)
 
 	default:
 		return nil, fmt.Errorf("billet: unknown provider %q", cfg.Node.Provider)
