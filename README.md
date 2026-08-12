@@ -271,6 +271,16 @@ node:
 
 Both paths are recorded, so `billet nodes pending --all` is the single answer to what has been admitted and when.
 
+**Adding a machine needs no control-plane restart.** A node joins by presenting a certificate and dialling in, and registration never asks whether that host was declared anywhere: it checks the protocol version, the deployment identity, that the contribution is non-zero, and that the site is one this deployment declares. So `nodes:` is policy *about* hosts rather than a roster *of* them, and the fleet is not something you edit. The one config fact registration does enforce is `sites:` — a node claiming a site the control plane has never heard of is refused rather than recorded, because a typo would otherwise become a place of its own with a cache that is always empty.
+
+Two neighbouring changes are different, and the asymmetry is worth knowing before you plan a maintenance window:
+
+| Action | Control-plane restart? |
+|---|---|
+| Add a machine | **No** — it registers itself |
+| Add or change a **tier** | **Yes** — tiers are read at startup, and each becomes one scale set |
+| Change the `nodes:` policy block | **Yes** — it is read only when the config is validated |
+
 The name in the certificate is the only thing that decides which node a request is from — a host holding a bundle can act as that node and as nothing else. The certificate also carries which **deployment** it belongs to, so a fresh host does not invent an identity the control plane would refuse.
 
 **Certificates renew themselves** when less than a third of their life remains, over the wire, with the private key never leaving the node. A certificate that has already expired cannot renew — renewal is authenticated by the certificate being renewed — so that machine has to be re-enrolled; the window is months, so it only happens to a host that was powered off throughout.
@@ -283,11 +293,9 @@ Loopback stays plain HTTP, because there is nothing between the two processes to
 against. Anything else refuses to start without a certificate rather than serving unauthenticated on
 a network, which is the failure that looks like it works.
 
-Two things to know before relying on it. A node certificate lasts a year and its expiry takes that
-host out of the fleet with a handshake error, so the control plane warns for the last thirty days
-while the node is still working — re-issue on that warning, not on the outage. And there is no
-revocation: a compromised node means re-issuing the CA and every node certificate, which is a real
-cost and an honest one at this size.
+Two things to know before relying on it. The **authority** is the cliff, not any single certificate: a leaf may not outlive the CA that signed it, so once the CA has less than a leaf's lifetime left, every certificate it issues is quietly shorter than the last. Renewals keep working and come round faster and faster, nothing errors, and then every node in the fleet expires on the day the authority does. `billet ca show` warns once that starts, because it is invisible otherwise, and `billet ca rotate` is the answer rather than waiting for it.
+
+And a node's identity is its **name**, so two hosts configured with the same one are one host as far as the control plane is concerned. A per-process incarnation value separates a restart from a duplicate well enough to fence commands and refuse a superseded process's writes, but after a restart the plane still cannot say which of two machines sharing a name physically holds a given container. Give each host its own name.
 
 **Not yet run against a real organization.** The end-to-end path is exercised by a test suite that
 drives the real control plane and a real container runtime against a scripted stand-in for GitHub's
