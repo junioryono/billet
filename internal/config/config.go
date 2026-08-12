@@ -298,6 +298,8 @@ type NodeConfig struct {
 	StateDir string `yaml:"state_dir"`
 	// Firecracker is required when Provider is ProviderFirecracker.
 	Firecracker *FirecrackerConfig `yaml:"firecracker,omitempty"`
+	// EC2 is required when Provider is ProviderEC2.
+	EC2 *EC2Config `yaml:"ec2,omitempty"`
 
 	// MaxCustody bounds how long billet holds capacity for compute it cannot account
 	// for — a container adopted from a crashed run, or one an ambiguous launch may
@@ -350,6 +352,31 @@ func (p ProviderKind) Valid() bool {
 	return false
 }
 
+// RunsOnHost reports whether this backend runs jobs on the machine billet is
+// running on, so that machine's cores and memory are what it can offer.
+//
+// Every backend but ec2 does. An ec2 node is an ORCHESTRATOR: it holds
+// credentials and calls an API, and the compute appears somewhere else entirely,
+// so what the box it runs on happens to have says nothing about what it can
+// contribute. Reading the two alike makes a t4g.nano offer two vCPU to a fleet it
+// could buy a hundred of, and makes an honest `max_vcpu: 512` look like a typo
+// worth warning about on every boot.
+//
+// AN ALLOWLIST RATHER THAN `!= ec2`, so a second remote backend that nobody
+// remembers to add here is treated as remote — which loses a warning, where the
+// other direction would invent a contribution out of the wrong machine's
+// hardware.
+func (p ProviderKind) RunsOnHost() bool {
+	switch p {
+	case ProviderDocker, ProviderFirecracker, ProviderTart:
+		return true
+	case ProviderEC2:
+		return false
+	default:
+		return false
+	}
+}
+
 // GuestOS classifies what a tier boots.
 //
 // An explicit field rather than inferred from the label, because Apple's licensing
@@ -392,6 +419,81 @@ type FirecrackerConfig struct {
 	ZFSPool string `yaml:"zfs_pool"`
 	// Bridge is the host bridge guests attach to.
 	Bridge string `yaml:"bridge,omitempty"`
+}
+
+// EC2Config configures the cloud backend: one instance per job, in one subnet.
+//
+// EVERY FIELD HERE IS A PLACEMENT DECISION SOMEBODY HAS TO MAKE, and none of the
+// load-bearing ones is defaulted. billet cannot pick a subnet, and a wrong guess
+// is either a job that cannot reach GitHub or one that can reach a production
+// database.
+type EC2Config struct {
+	// Region is which AWS region to launch in. It also selects the API endpoint,
+	// so an ordinary install configures no host of its own.
+	Region string `yaml:"region"`
+	// Endpoint overrides the API endpoint billet derives from Region — for a VPC
+	// interface endpoint, a non-commercial partition, or a test.
+	Endpoint string `yaml:"endpoint,omitempty"`
+
+	// SubnetID is where instances are launched. Its route to GitHub is the
+	// operator's to arrange: a private subnet needs a NAT gateway, a public one
+	// needs AssignPublicIP.
+	SubnetID string `yaml:"subnet_id"`
+	// SecurityGroupIDs apply to trusted work.
+	SecurityGroupIDs []string `yaml:"security_group_ids"`
+	// UntrustedSecurityGroupIDs apply to fork pull-request work, and their
+	// ABSENCE is what refuses it.
+	//
+	// A whole instance is a real isolation boundary, which is why this backend can
+	// run code billet cannot vouch for at all — but that boundary is the KERNEL,
+	// not the network. A fork's job in the same security group as everything else
+	// reaches whatever that group reaches, which on a subnet somebody already had
+	// is usually more than they are picturing. So untrusted work runs only once
+	// its network has been described separately, rather than defaulting onto the
+	// trusted group because nobody said otherwise.
+	UntrustedSecurityGroupIDs []string `yaml:"untrusted_security_group_ids,omitempty"`
+	// AssignPublicIP gives instances a public address, for a subnet with no NAT
+	// gateway. A runner that cannot reach GitHub registers and then does nothing.
+	AssignPublicIP bool `yaml:"assign_public_ip,omitempty"`
+
+	// InstanceProfile is the IAM role instances receive. OPTIONAL, and empty is
+	// the right answer unless a job genuinely needs AWS credentials: an instance
+	// profile is readable from inside the guest, so it is a credential handed to
+	// whatever the job runs.
+	InstanceProfile string `yaml:"instance_profile,omitempty"`
+
+	// InstanceTypes are the shapes billet may buy, each DECLARING what it holds,
+	// because billet ships no table of EC2 instance types.
+	//
+	// A table would be out of date within a quarter — AWS adds types continuously
+	// — and being out of date here means launching a machine that does not fit a
+	// lease the allocator has already escrowed. Declaring them keeps the fleet's
+	// cost surface in the operator's own file, which is where a spending decision
+	// belongs anyway.
+	InstanceTypes []EC2InstanceType `yaml:"instance_types"`
+
+	// Spot buys interruptible capacity.
+	//
+	// DEFAULTS OFF, which reverses the assumption this backend was filed under.
+	// It exists so one `runs-on` label survives the bare-metal host going away,
+	// and GitHub does not requeue a job whose runner vanished mid-execution — so a
+	// spot reclaim is a FAILED BUILD rather than a retry. Defaulting to spot would
+	// make the failover path the unreliable one, which is the opposite of what a
+	// failover is for. An operator who would rather have a cheap build that
+	// sometimes dies says so here.
+	Spot bool `yaml:"spot,omitempty"`
+}
+
+// EC2InstanceType is one shape billet may buy, and what it holds.
+//
+// The vCPU and memory are DECLARED rather than looked up, because the allocator
+// has already escrowed a size against this node before any of this is consulted:
+// a shape that turns out smaller than the lease it was chosen for over-commits a
+// machine nobody can see.
+type EC2InstanceType struct {
+	Type   string   `yaml:"type"`
+	VCPU   int      `yaml:"vcpu"`
+	Memory ByteSize `yaml:"memory"`
 }
 
 // GitHubConfig holds the App identity used to manage runners.
@@ -1271,6 +1373,123 @@ func (c *Config) validateNode() []error {
 			}
 		}
 	}
+
+	if c.Node.Provider == ProviderEC2 {
+		errs = append(errs, c.validateEC2Node()...)
+	}
+
+	return errs
+}
+
+// validateEC2Node reports everything wrong with a cloud node.
+func (c *Config) validateEC2Node() []error {
+	var errs []error
+
+	// WHAT IT WILL BUY, BECAUSE THERE IS NOTHING TO MEASURE.
+	//
+	// Every other backend runs jobs on this machine, so an unset contribution
+	// means "everything I can detect" and detection answers correctly. An ec2 node
+	// calls an API and the compute appears in a region, so detection would report
+	// whatever small instance holds this process — and billet would advertise that
+	// to GitHub as the capacity of an entire cloud, placing one job and then
+	// looking full. That is the failover this backend exists for, silently not
+	// working.
+	//
+	// Required rather than defaulted: the number is a spending limit, and billet
+	// has no standing to choose one on somebody's account.
+	if c.Node.MaxVCPU <= 0 {
+		errs = append(errs, errors.New(
+			"node.max_vcpu is required when provider is ec2: there is no machine to detect it "+
+				"from, because the compute this node launches runs in a region rather than on "+
+				"this host, and the number is a spending limit billet will not choose for you"))
+	}
+
+	if c.Node.MaxMemory <= 0 {
+		errs = append(errs, errors.New(
+			"node.max_memory is required when provider is ec2: there is no machine to detect it "+
+				"from, because the compute this node launches runs in a region rather than on "+
+				"this host, and the number is a spending limit billet will not choose for you"))
+	}
+
+	if c.Node.EC2 == nil {
+		errs = append(errs, errors.New("node.ec2 is required when provider is ec2"))
+
+		return errs
+	}
+
+	e := c.Node.EC2
+
+	if strings.TrimSpace(e.Region) == "" {
+		errs = append(errs, errors.New("node.ec2.region is required"))
+	}
+
+	if strings.TrimSpace(e.SubnetID) == "" {
+		errs = append(errs, errors.New("node.ec2.subnet_id is required; billet cannot choose "+
+			"which network a runner should be able to reach"))
+	}
+
+	// AT LEAST ONE, AND NOT DEFAULTED TO THE VPC'S DEFAULT GROUP. A default
+	// security group in a VPC somebody already had usually permits more than they
+	// are picturing, and this is the field that decides what a job can reach.
+	if len(e.SecurityGroupIDs) == 0 {
+		errs = append(errs, errors.New("node.ec2.security_group_ids needs at least one group; "+
+			"it is what decides what a running job can reach, so billet will not fall back to "+
+			"the VPC's default"))
+	}
+
+	errs = append(errs, e.instanceTypeErrors()...)
+
+	return errs
+}
+
+// instanceTypeErrors reports everything wrong with the shapes a cloud node may
+// buy.
+//
+// A ZERO IS A FORGOTTEN FIELD, NOT AN UNKNOWN TO BE TOLERATED. These numbers are
+// what billet matches an already-escrowed lease against, so a shape that
+// understates itself launches a machine smaller than the work reserved for it and
+// over-commits a host nobody can inspect.
+func (e *EC2Config) instanceTypeErrors() []error {
+	var errs []error
+
+	if len(e.InstanceTypes) == 0 {
+		errs = append(errs, errors.New("node.ec2.instance_types needs at least one shape; "+
+			"billet ships no table of EC2 instance types, so a shape it may buy has to be "+
+			"declared along with what it holds"))
+
+		return errs
+	}
+
+	seen := make(map[string]struct{}, len(e.InstanceTypes))
+
+	for i := range e.InstanceTypes {
+		it := &e.InstanceTypes[i]
+		where := fmt.Sprintf("node.ec2.instance_types[%d]", i)
+
+		if name := strings.TrimSpace(it.Type); name == "" {
+			errs = append(errs, fmt.Errorf("%s: type is required", where))
+		} else {
+			// A repeat is a typo rather than a stronger preference, exactly as it
+			// is in a tier's provider list: billet picks one shape per launch, so
+			// collapsing a duplicate silently would hide the mistake.
+			if _, dup := seen[name]; dup {
+				errs = append(errs, fmt.Errorf("%s: type %q is listed twice", where, name))
+			}
+
+			seen[name] = struct{}{}
+		}
+
+		if it.VCPU <= 0 {
+			errs = append(errs, fmt.Errorf("%s: vcpu must be more than zero; it is what billet "+
+				"matches an already-reserved lease against", where))
+		}
+
+		if it.Memory <= 0 {
+			errs = append(errs, fmt.Errorf("%s: memory must be more than zero; it is what "+
+				"billet matches an already-reserved lease against", where))
+		}
+	}
+
 	return errs
 }
 
