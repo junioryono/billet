@@ -2,16 +2,16 @@
 //
 // THE PROBLEM IT SOLVES: a node names itself in the request path and, without
 // this, nothing verifies the claim. Anything that could reach the listener could
-// call itself any node, bind leases, take commands, and ask for a JIT
-// registration — a credential that registers a runner against the organisation.
-// That is why the wire refused to serve on anything but loopback until now.
+// call itself any node, bind leases, take commands, and ask for a JIT registration
+// — a credential that registers a runner against the organisation. Without it the
+// wire is safe only on loopback.
 //
 // The design is deliberately small. One CA per deployment, held by the control
-// plane, and one certificate per node. There is no revocation list, no OCSP, and
-// no intermediate: a deployment with a compromised node re-issues its CA and its
-// node certificates, which is a real cost and an honest one at this size. What
-// there IS, and what matters, is that the authenticated name in the certificate
-// is the ONLY thing that decides which node a request is from.
+// plane, and one certificate per node. There is no OCSP and no intermediate: a
+// deployment with a compromised node revokes its certificate or re-issues the CA,
+// which is a real cost and an honest one at this size. What matters is that the
+// authenticated name in the certificate is the ONLY thing that decides which node
+// a request is from.
 package wirecert
 
 import (
@@ -262,10 +262,10 @@ func createCA(stateDir, dir, certPath, keyPath, deployment string) (*CA, error) 
 // markerPath names the file that records an authority once existed here.
 //
 // BESIDE THE CA DIRECTORY, NOT INSIDE IT, because a witness that disappears with
-// the thing it witnesses is not a witness. The failure this whole mechanism
-// exists for — a backup or a provisioning script that omits the ca directory —
-// took the marker with it in the first version, hadAuthority answered false, and
-// a replacement authority was minted exactly as before.
+// the thing it witnesses is not a witness. The failure this exists for — a backup
+// or a provisioning script that omits the ca directory — would otherwise take the
+// marker with it, hadAuthority would answer false, and a replacement authority
+// would be minted exactly as before.
 func markerPath(stateDir string) string {
 	return filepath.Join(stateDir, "authority-created")
 }
@@ -608,13 +608,11 @@ func ServerTLS(b Bundle) (*tls.Config, error) {
 
 // ClientTLS is a node's side of the wire.
 //
-// VERIFIES THE LEAF AGAINST ITS OWN CA, which the first version did not: it
-// checked that the certificate and key were a pair and separately parsed the
-// root, and never asked whether the two halves belonged together. A bundle whose
-// node.crt came from one deployment and whose ca.crt came from another loaded
-// cleanly — and since the node adopts its DEPLOYMENT from the leaf, it wrote the
-// wrong identity permanently, trusted a server that would reject it, and then
-// refused the correct bundle as a conflict.
+// VERIFIES THE LEAF AGAINST ITS OWN CA, not merely that the certificate and key
+// are a pair. A bundle whose node.crt came from one deployment and whose ca.crt
+// came from another would otherwise load cleanly — and since the node adopts its
+// DEPLOYMENT from the leaf, it would write the wrong identity permanently, trust a
+// server that would reject it, and then refuse the correct bundle as a conflict.
 func ClientTLS(b Bundle) (*tls.Config, error) {
 	cert, err := tls.X509KeyPair(b.CertPEM, b.KeyPEM)
 	if err != nil {

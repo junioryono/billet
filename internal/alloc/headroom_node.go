@@ -274,32 +274,24 @@ type strandedCandidate struct {
 // shedOvercommit adds enough of each host's candidates to the stranded list to
 // bring it back inside what it now says it has.
 //
-// THE FEWEST LEASES THAT SETTLE IT, because every one shed is a slot billet
-// stops advertising: giving back two where one would have done costs GitHub two
-// jobs' worth of capacity to recover the same room.
+// THE FEWEST LEASES THAT SETTLE IT, because every one shed is a slot billet stops
+// advertising.
 //
-// SCORED AGAINST WHAT IS STILL MISSING, not against a fixed dimension. A host
-// runs out of vCPU and memory independently, so no single ordering is right for
-// both: the widest lease by vCPU may free almost no memory, and a machine short
-// of one fat reservation would shed several slim ones first, none of which were
-// the problem. Worse when BOTH are short — leading by either one can take a
-// lease that settles half the deficit and then have to take the other anyway.
-//
-// So each step asks what fraction of the REMAINING shortfall a candidate covers,
-// in both dimensions at once, and takes the best answer. A lease that settles
-// everything by itself always outscores one that settles half. The deficits
-// shrink as leases are taken, so the question is re-asked each time rather than
-// answered once up front.
-//
-// The id breaks ties, because Go map iteration is randomised and an
-// advertisement that depends on iteration order cannot be reproduced from a log.
+// SCORED AGAINST WHAT IS STILL MISSING, not against a fixed dimension. A host runs
+// out of vCPU and memory independently, so no single ordering is right for both:
+// the widest lease by vCPU may free almost no memory, and leading by either one
+// when BOTH are short can take a lease that settles half the deficit and then have
+// to take the other anyway. So each step asks what fraction of the REMAINING
+// shortfall a candidate covers in both dimensions at once, re-asked each time as
+// the deficits shrink. The id breaks ties, because Go map iteration is randomised
+// and an advertisement that depends on it cannot be reproduced from a log.
 //
 // IT SEES ONLY ONE LISTENER'S LEASES, and that is safe in the direction that
-// matters. Each tier asks about its own escrow, so a host overcommitted across
-// several tiers may be trimmed by more than one of them and give back a little
-// too much. Over-shedding costs a re-escrow on the next poll; under-shedding
-// leaves billet advertising a slot that will fail on arrival. It also converges:
-// the second caller measures the ledger the first one already corrected.
+// matters: a host overcommitted across several tiers may be trimmed by more than
+// one of them and give back a little too much. Over-shedding costs a re-escrow on
+// the next poll; under-shedding leaves billet advertising a slot that will fail on
+// arrival. It converges — the second caller measures the ledger the first one
+// already corrected.
 func (a *Allocator) shedOvercommit(
 	ctx context.Context, tx *sql.Tx, onNode map[string][]strandedCandidate, out *[]string,
 ) error {
