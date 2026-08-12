@@ -1271,7 +1271,9 @@ func cmdCARevoke(ctx context.Context, args []string) error {
 		return err
 	}
 
-	db, err := state.Open(ctx, cfg.Server.StateDir)
+	// Revoking matters most while the control plane is UP, so it must not need
+	// the directory lock that plane is holding. See state.OpenAdmin.
+	db, err := state.OpenAdmin(ctx, cfg.Server.StateDir)
 	if err != nil {
 		return fmt.Errorf("server state: %w", err)
 	}
@@ -1316,7 +1318,7 @@ func cmdCARevocations(ctx context.Context, args []string) error {
 		return errors.New("the revocation list lives on the control plane, and this config has no server section")
 	}
 
-	db, err := state.Open(ctx, cfg.Server.StateDir)
+	db, err := state.OpenAdmin(ctx, cfg.Server.StateDir)
 	if err != nil {
 		return fmt.Errorf("server state: %w", err)
 	}
@@ -1552,9 +1554,13 @@ func cmdCAShow(args []string) error {
 	return nil
 }
 
-// cmdCheck is the explicit "is this deployment sane" command. It is the only
-// path that opens — and therefore migrates — the state database, so mutating
-// durable state is always something the operator asked for.
+// cmdCheck is the explicit "is this deployment sane" command.
+//
+// It opens the ledger through OpenAdmin, so it answers WHILE the control plane
+// is running — which is exactly when an operator reaches for it, and when
+// opening exclusively made it useless. It still migrates when nothing holds the
+// directory, so a first run sets the schema up; against a live plane it verifies
+// and refuses rather than upgrading a schema that plane is using.
 func cmdCheck(ctx context.Context, args []string) error {
 	fs := newFlagSet("billet check")
 	cfgPath := addConfigFlag(fs)
@@ -1580,13 +1586,24 @@ func cmdCheck(ctx context.Context, args []string) error {
 		fmt.Printf("listen   %s\n", cfg.Server.Listen)
 		fmt.Printf("ceiling  %d vCPU, %s\n", cfg.Server.MaxVCPU, cfg.Server.MaxMemory)
 
-		db, err := state.Open(ctx, cfg.Server.StateDir)
+		// `billet check` is the command an operator reaches for WHEN SOMETHING IS
+		// WRONG, which is exactly when the server is running. Opening the ledger
+		// exclusively made it unusable at that moment.
+		db, err := state.OpenAdmin(ctx, cfg.Server.StateDir)
 		if err != nil {
 			return fmt.Errorf("server state: %w", err)
 		}
 		defer db.Close()
 
-		fmt.Printf("state    %s (ok)\n", cfg.Server.StateDir)
+		// ASKED FOR EXPLICITLY, because opening no longer does it. The scan reads
+		// the whole file, so every other operator command skips it — but proving
+		// the deployment is sane is what THIS command is for, and a ledger that
+		// fails it is the thing an operator most needs to be told about.
+		if err := db.IntegrityCheck(ctx); err != nil {
+			return fmt.Errorf("server state: %w", err)
+		}
+
+		fmt.Printf("state    %s (ok, integrity verified)\n", cfg.Server.StateDir)
 	}
 
 	if cfg.Node != nil {

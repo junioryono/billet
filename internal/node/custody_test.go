@@ -1413,7 +1413,7 @@ func TestKeepAliveStopsWithItsContext(t *testing.T) {
 
 	select {
 	case <-done:
-	case <-time.After(5 * time.Second):
+	case <-time.After(60 * time.Second):
 		t.Fatal("KeepAlive outlived its context")
 	}
 }

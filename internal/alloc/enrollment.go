@@ -191,7 +191,7 @@ func (a *Allocator) LookupEnrollment(ctx context.Context, name string) (Enrollme
 		found bool
 	)
 
-	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+	err := a.db.View(ctx, func(tx querier) error {
 		e, err := readEnrollment(ctx, tx, name)
 
 		switch {
@@ -318,7 +318,7 @@ func (a *Allocator) RecordIssued(
 func (a *Allocator) Enrollments(ctx context.Context, state string) ([]Enrollment, error) {
 	var out []Enrollment
 
-	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+	err := a.db.View(ctx, func(tx querier) error {
 		out = nil
 
 		query := `SELECT name, fingerprint, csr_pem, cert_pem, state, source, requested_at, decided_at
@@ -355,7 +355,7 @@ func (a *Allocator) Enrollments(ctx context.Context, state string) ([]Enrollment
 	return out, err
 }
 
-func readEnrollment(ctx context.Context, tx *sql.Tx, name string) (Enrollment, error) {
+func readEnrollment(ctx context.Context, tx querier, name string) (Enrollment, error) {
 	var e Enrollment
 
 	err := tx.QueryRowContext(ctx,

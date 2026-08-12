@@ -111,7 +111,7 @@ func (a *Allocator) spendJoinTokenTx(ctx context.Context, tx *sql.Tx, token stri
 func (a *Allocator) JoinTokens(ctx context.Context) ([]JoinToken, error) {
 	var out []JoinToken
 
-	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+	err := a.db.View(ctx, func(tx querier) error {
 		out = nil
 
 		rows, err := tx.QueryContext(ctx,
@@ -142,7 +142,7 @@ func (a *Allocator) JoinTokens(ctx context.Context) ([]JoinToken, error) {
 func (a *Allocator) storedJoinTokenKeys(ctx context.Context) ([]string, error) {
 	var out []string
 
-	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+	err := a.db.View(ctx, func(tx querier) error {
 		out = nil
 
 		rows, err := tx.QueryContext(ctx, `SELECT token_sha256 FROM join_tokens`)
