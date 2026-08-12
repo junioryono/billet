@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
@@ -28,8 +29,15 @@ import (
 // attempt to find out what happened. The only difference is what a still-running
 // instance means — leave it, or kill it.
 type custody struct {
-	leaseID  string
-	epoch    int64
+	leaseID string
+	// epoch is the fencing token this entry renews with.
+	//
+	// ATOMIC BECAUSE IT MOVES NOW. It was immutable once an entry existed, so a
+	// plain field was safe; re-adopting a lease the reaper quarantined under us
+	// writes it from Tend while KeepAlive is reading it from its own goroutine —
+	// and that separation is the whole point of the two loops, so the write
+	// cannot simply borrow Tend's lock.
+	epoch    atomic.Int64
 	name     string
 	instance string
 
@@ -75,9 +83,9 @@ func (r *Runner) adopt(lease *alloc.Lease, inst *provider.Instance) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	r.custody[lease.ID] = &custody{
-		leaseID:   lease.ID,
-		epoch:     lease.Epoch,
+	entry := &custody{
+		leaseID: lease.ID,
+
 		name:      inst.Name,
 		instance:  inst.ID,
 		requestID: lease.RequestID,
@@ -86,6 +94,9 @@ func (r *Runner) adopt(lease *alloc.Lease, inst *provider.Instance) {
 		observed: true,
 		since:    r.now(),
 	}
+	entry.epoch.Store(lease.Epoch)
+
+	r.custody[lease.ID] = entry
 }
 
 // hold takes custody of a lease whose compute could not be confirmed gone.
@@ -102,9 +113,9 @@ func (r *Runner) hold(lease *alloc.Lease, name string, requestID int64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	r.custody[lease.ID] = &custody{
-		leaseID:   lease.ID,
-		epoch:     lease.Epoch,
+	entry := &custody{
+		leaseID: lease.ID,
+
 		name:      name,
 		requestID: requestID,
 		discard:   true,
@@ -112,6 +123,9 @@ func (r *Runner) hold(lease *alloc.Lease, name string, requestID int64) {
 		outcome: alloc.PhaseFailed,
 		since:   r.now(),
 	}
+	entry.epoch.Store(lease.Epoch)
+
+	r.custody[lease.ID] = entry
 }
 
 // heldLeases reports the leases currently in custody, so a sweep does not treat
@@ -131,11 +145,20 @@ func (r *Runner) heldLeases() map[string]bool {
 // strayGrace is how long a possible stray is looked for before an absence is
 // believed.
 //
-// The window in which a daemon that accepted a create can still act on it. Sixty
-// seconds is far longer than any container runtime needs and cheap to be wrong
-// about — the cost of waiting is one lease's capacity for a minute, and the cost
-// of not waiting is a container running on capacity billet has already resold.
-const strayGrace = time.Minute
+// The window in which a daemon that accepted a create can still act on it.
+//
+// SIZED FOR A CREATE THAT INCLUDES A PULL, which is what the docker provider
+// actually does: it launches with `docker run --detach`, and an image that is
+// not already local is fetched inline. A multi-gigabyte runner image on a slow
+// link takes minutes, so "far longer than any container runtime needs" was true
+// only of a warm cache.
+//
+// Cheap to be wrong in one direction and not the other. Waiting costs one
+// lease's capacity for a few minutes, which comes back by itself; not waiting
+// puts a container on capacity billet has already resold, which nothing
+// recovers. The same asymmetry sets alloc.quarantineGrace, and the two are
+// deliberately the same size.
+const strayGrace = 5 * time.Minute
 
 // custodyWarnAfter is how long a held lease may go unresolved before every tick
 // says so.
@@ -254,7 +277,7 @@ func (r *Runner) renewEvery() time.Duration {
 // never block.
 func (r *Runner) renewHeld(ctx context.Context) {
 	for _, c := range r.renewSnapshot() {
-		err := r.alloc.Heartbeat(ctx, c.leaseID, c.epoch)
+		err := r.alloc.Heartbeat(ctx, c.leaseID, c.epoch.Load())
 		if err == nil || ctx.Err() != nil {
 			continue
 		}
@@ -325,14 +348,32 @@ func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 			"adopted", !c.discard)
 	}
 
-	if err := r.alloc.Heartbeat(ctx, c.leaseID, c.epoch); err != nil {
+	if err := r.alloc.Heartbeat(ctx, c.leaseID, c.epoch.Load()); err != nil {
 		if !errors.Is(err, alloc.ErrLeaseNotFound) && !errors.Is(err, alloc.ErrFenced) {
 			return fmt.Errorf("node: hold the capacity of lease %s: %w", c.leaseID, err)
 		}
 
-		// The lease is gone. Its capacity is already back in the budget, so the
-		// instance is now an orphan whatever it was before.
-		c.discard = true
+		// FENCED IS NOT THE SAME AS GONE, and reading it that way destroyed live
+		// jobs. The reaper bumps the epoch when it QUARANTINES a lease — capacity
+		// still charged, container still running, nobody else holding it — so a
+		// custody entry that predates the quarantine gets ErrFenced from a lease
+		// that very much still wants its compute. Discarding on that destroyed the
+		// job the quarantine exists to protect, and freed nothing, because the
+		// lease was not terminal.
+		//
+		// So the ledger is asked which it is. A lease still quarantined on this
+		// node is re-adopted at its new epoch and stays adopted; only a lease that
+		// is genuinely terminal or missing makes its instance an orphan.
+		quarantined, err := r.requarantined(ctx, c)
+		if err != nil {
+			return err
+		}
+
+		if !quarantined {
+			// The lease is gone. Its capacity is already back in the budget, so the
+			// instance is now an orphan whatever it was before.
+			c.discard = true
+		}
 	}
 
 	inst, found, err := r.provider.Find(ctx, c.name)
@@ -380,9 +421,44 @@ func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 	return r.finish(ctx, c)
 }
 
+// requarantined re-adopts a custody entry whose lease was fenced by a
+// quarantine, reporting whether it did.
+//
+// THE EPOCH MOVES AND NOTHING ELSE DOES. Quarantine is the reaper saying it can
+// no longer account for this compute, which is precisely what custody is for —
+// so the entry keeps its adopted status and picks up the new epoch, and the next
+// tick heartbeats successfully.
+func (r *Runner) requarantined(ctx context.Context, c *custody) (bool, error) {
+	lease, err := r.alloc.Lease(ctx, c.leaseID)
+	if err != nil {
+		if errors.Is(err, alloc.ErrLeaseNotFound) {
+			// Genuinely terminal: its capacity is already back.
+			return false, nil
+		}
+
+		// AMBIGUOUS IS NOT GONE. A read that failed says nothing about the lease,
+		// and discarding on it would destroy a live job over a database blip.
+		return false, fmt.Errorf("node: read the fenced lease %s: %w", c.leaseID, err)
+	}
+
+	if lease.Phase != alloc.PhaseQuarantine {
+		// Somebody else holds it now — a replacement incarnation that re-adopted
+		// this compute. Not ours to renew, and not ours to destroy either.
+		return false, nil
+	}
+
+	r.log.Warn("the lease of compute held here was quarantined; adopting it at its new epoch "+
+		"and keeping the job running",
+		"name", c.name, "lease", c.leaseID, "epoch", lease.Epoch)
+
+	c.epoch.Store(lease.Epoch)
+
+	return true, nil
+}
+
 // finish releases a custody entry's lease and forgets it.
 func (r *Runner) finish(ctx context.Context, c *custody) error {
-	err := r.alloc.Release(ctx, c.leaseID, c.epoch, c.outcome)
+	err := r.alloc.Release(ctx, c.leaseID, c.epoch.Load(), c.outcome)
 	if err != nil && !errors.Is(err, alloc.ErrLeaseNotFound) && !errors.Is(err, alloc.ErrFenced) {
 		// KEPT in custody. Failing to release means the capacity is still recorded
 		// as held, and dropping the entry now would leave nothing to retry it —
@@ -530,15 +606,25 @@ func (r *Runner) Superseded() {
 			continue
 		}
 
-		r.custody[lease.ID] = &custody{
-			leaseID:   lease.ID,
-			epoch:     lease.Epoch,
+		entry := &custody{
+			leaseID: lease.ID,
+
 			name:      inst.Name,
 			instance:  inst.ID,
 			requestID: requestID,
 			outcome:   alloc.PhaseDone,
 			since:     r.now(),
+			// ALREADY SEEN, because this came from the running set: its launch was
+			// observed, so a later absence means it genuinely went away rather than
+			// that a create might still be in flight. Leaving it false made a job
+			// that exits right after supersession hold its host's capacity for the
+			// whole stray grace — five minutes of a machine nobody can use, waiting
+			// for a container that has already finished.
+			observed: true,
 		}
+		entry.epoch.Store(lease.Epoch)
+
+		r.custody[lease.ID] = entry
 	}
 }
 
@@ -615,11 +701,10 @@ func (r *Runner) holdWhileLaunching(lease *alloc.Lease, name string) func() {
 		r.launching = make(map[string]*custody)
 	}
 
-	r.launching[lease.ID] = &custody{
-		leaseID: lease.ID,
-		epoch:   lease.Epoch,
-		name:    name,
-	}
+	entry := &custody{leaseID: lease.ID, name: name}
+	entry.epoch.Store(lease.Epoch)
+
+	r.launching[lease.ID] = entry
 
 	return func() {
 		r.mu.Lock()

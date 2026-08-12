@@ -17,6 +17,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"sort"
 	"strings"
@@ -42,6 +43,20 @@ const (
 	PhaseOnline Phase = "online"
 	// PhaseBusy means the runner is executing the job.
 	PhaseBusy Phase = "busy"
+	// PhaseQuarantine means a lease that had compute behind it stopped being
+	// heartbeated, and the compute has not been confirmed gone.
+	//
+	// STILL CHARGED TO ITS HOST, which is the whole point. Terminalizing an
+	// expired running lease frees the capacity at once while the container keeps
+	// running until the node next sweeps, so another tier can escrow that slot in
+	// between and two jobs land on a machine sized for one. Capacity reclaimed
+	// late is recoverable; capacity handed out twice is not.
+	//
+	// It leaves only on PROOF: the node destroys the container and says so, or it
+	// re-registers reporting an inventory this lease is not in. An operator can
+	// force it for a machine that is never coming back, which is the one case
+	// proof can never arrive for.
+	PhaseQuarantine Phase = "quarantine"
 	// PhaseDone and PhaseFailed are terminal and release capacity.
 	PhaseDone   Phase = "done"
 	PhaseFailed Phase = "failed"
@@ -55,11 +70,14 @@ const (
 var validTransitions = map[Phase][]Phase{
 	PhaseCapacity:  {PhaseAssigned, PhaseDone, PhaseFailed},
 	PhaseAssigned:  {PhaseLaunching, PhaseDone, PhaseFailed},
-	PhaseLaunching: {PhaseOnline, PhaseDone, PhaseFailed},
-	PhaseOnline:    {PhaseBusy, PhaseDone, PhaseFailed},
-	PhaseBusy:      {PhaseDone, PhaseFailed},
-	PhaseDone:      nil,
-	PhaseFailed:    nil,
+	PhaseLaunching: {PhaseOnline, PhaseQuarantine, PhaseDone, PhaseFailed},
+	PhaseOnline:    {PhaseBusy, PhaseQuarantine, PhaseDone, PhaseFailed},
+	PhaseBusy:      {PhaseQuarantine, PhaseDone, PhaseFailed},
+	// Quarantine ends only in a terminal phase: it is a lease being cleaned up,
+	// never one going back to work.
+	PhaseQuarantine: {PhaseDone, PhaseFailed},
+	PhaseDone:       nil,
+	PhaseFailed:     nil,
 }
 
 // Terminal reports whether a phase releases capacity.
@@ -68,7 +86,20 @@ func (p Phase) Terminal() bool { return p == PhaseDone || p == PhaseFailed }
 // requiresPlacement reports whether a phase presumes a host is running the
 // instance. Entering one without a bound, still-legal placement means something
 // launched work the allocator never authorised.
+//
+// QUARANTINE IS NOT ONE OF THEM. A quarantined lease is being cleaned up rather
+// than placed, and re-checking placement on the way out would refuse the very
+// release that ends it — on a host that is, by definition, in trouble.
 func requiresPlacement(p Phase) bool {
+	return p == PhaseLaunching || p == PhaseOnline || p == PhaseBusy
+}
+
+// hadCompute reports whether a phase means a container may exist for this lease.
+//
+// The line the reaper draws: escrow nobody launched can be terminalized on
+// expiry, and anything past it cannot, because expiry says the holder stopped
+// heartbeating and never that the compute stopped.
+func hadCompute(p Phase) bool {
 	return p == PhaseLaunching || p == PhaseOnline || p == PhaseBusy
 }
 
@@ -467,21 +498,17 @@ func (a *Allocator) Escrow(ctx context.Context, tier string, want int) ([]*Lease
 	var leases []*Lease
 
 	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
-		room, err := a.headroom(ctx, tx, t)
+		// MEASURED ONCE AND SPENT DOWN, because none of these choices is durable until the
+		// transaction commits: asking the ledger again per lease would return the same
+		// fleet every time and aim every reservation at the same machine. The same
+		// measurement answers how much room there is and where to put it.
+		room, place, err := a.headroomWithPlacer(ctx, tx, t)
 		if err != nil {
 			return err
 		}
 
 		take := min(want, room)
 		leases = make([]*Lease, 0, take)
-
-		// MEASURED ONCE AND SPENT DOWN, because none of these choices is durable until the
-		// transaction commits: asking the ledger again per lease would return the same
-		// fleet every time and aim every reservation at the same machine.
-		place, _, _, err := a.placerWithFloors(ctx, tx, t)
-		if err != nil {
-			return err
-		}
 
 		for range take {
 			target, ok := place.next(t)
@@ -633,9 +660,25 @@ func (a *Allocator) allowsGuestOS(node string, os config.GuestOS) bool {
 // smallest wins — capacity is a vector, so "enough cores" says nothing about memory
 // or about the per-host macOS guest limit.
 func (a *Allocator) headroom(ctx context.Context, tx *sql.Tx, t config.Tier) (int, error) {
+	n, _, err := a.headroomWithPlacer(ctx, tx, t)
+
+	return n, err
+}
+
+// headroomWithPlacer is headroom, handing back the fleet it measured.
+//
+// MEASURED ONCE PER TRANSACTION. Escrow asks how much room there is and then
+// asks where to put it, and building the placer twice meant walking the whole
+// fleet twice on the single writer connection every listener is waiting for.
+// total() only reads, so the placer that answered the first question is exactly
+// the one that should answer the second — and reusing it removes any chance of
+// the two disagreeing.
+func (a *Allocator) headroomWithPlacer(
+	ctx context.Context, tx *sql.Tx, t config.Tier,
+) (int, *placer, error) {
 	used, err := a.usage(ctx, tx)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 
 	// FLOORS ARE NOT DEDUCTED HERE. They are held against the machines that could
@@ -648,7 +691,7 @@ func (a *Allocator) headroom(ctx context.Context, tx *sql.Tx, t config.Tier) (in
 	// the ceiling from tiers that are perfectly placeable.
 	place, owedVCPU, owedMemory, err := a.placerWithFloors(ctx, tx, t)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 
 	byVCPU := (a.limits.MaxVCPU - used.VCPU - owedVCPU) / t.VCPU
@@ -659,7 +702,7 @@ func (a *Allocator) headroom(ctx context.Context, tx *sql.Tx, t config.Tier) (in
 	if t.MaxConcurrent > 0 {
 		tierUsed, err := a.countOpenByTier(ctx, tx, t.Label)
 		if err != nil {
-			return 0, err
+			return 0, nil, err
 		}
 
 		n = min(n, t.MaxConcurrent-tierUsed)
@@ -675,7 +718,7 @@ func (a *Allocator) headroom(ctx context.Context, tx *sql.Tx, t config.Tier) (in
 	// operator allowed, which is what keeps a one-box install behaving as before.
 	//
 	// The per-host macOS licence lives in headroomOn.
-	return max(min(n, place.total(t)), 0), nil
+	return max(min(n, place.total(t)), 0), place, nil
 }
 
 // Reserve escrows capacity for one instance of a tier.
@@ -693,18 +736,13 @@ func (a *Allocator) Reserve(ctx context.Context, tier string) (*Lease, error) {
 	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
 		// Headroom and insert in ONE transaction. Checking outside it would be a read
 		// followed by a hopeful write — measured at a 7x overcommit under concurrency.
-		room, err := a.headroom(ctx, tx, t)
+		room, place, err := a.headroomWithPlacer(ctx, tx, t)
 		if err != nil {
 			return err
 		}
 
 		if room < 1 {
 			return fmt.Errorf("%w for tier %q", ErrNoCapacity, t.Label)
-		}
-
-		place, _, _, err := a.placerWithFloors(ctx, tx, t)
-		if err != nil {
-			return err
 		}
 
 		target, ok := place.next(t)
@@ -1109,6 +1147,10 @@ func (a *Allocator) RegisterNode(ctx context.Context, reg NodeRegistration) (int
 		//
 		// A RUNNING LEASE STILL DOES, EXPIRED OR NOT, because expiry proves only that the
 		// control-plane holder stopped heartbeating — never that the container stopped.
+		// QUARANTINE IS THE SAME ANSWER WRITTEN DOWN: the reaper reached exactly that
+		// conclusion about this lease, so it is the LAST phase that should let a host
+		// change its backend. Leaving it out made the reaper's own verdict the thing
+		// that unlocked the move.
 		// Reading the two the same way let a host change its backend out from under work
 		// the new backend cannot see: the docker container keeps running, tart
 		// reconciliation cannot enumerate it, the reaper frees the lease, and the next
@@ -1124,7 +1166,7 @@ func (a *Allocator) RegisterNode(ctx context.Context, reg NodeRegistration) (int
 				`SELECT COUNT(*) FROM leases
 				 WHERE COALESCE(node, target_node) = ?
 				   AND phase NOT IN ('done','failed')
-				   AND (phase IN ('launching','online','busy') OR expires_at > ?)`,
+				   AND (phase IN ('launching','online','busy','quarantine') OR expires_at > ?)`,
 				name, now).Scan(&outstanding); err != nil {
 				return fmt.Errorf("alloc: count the leases on node %s: %w", name, err)
 			}
@@ -1145,7 +1187,7 @@ func (a *Allocator) RegisterNode(ctx context.Context, reg NodeRegistration) (int
 				`SELECT COUNT(*) FROM leases
 				 WHERE COALESCE(node, target_node) = ?
 				   AND phase NOT IN ('done','failed')
-				   AND (phase IN ('launching','online','busy') OR expires_at > ?)`,
+				   AND (phase IN ('launching','online','busy','quarantine') OR expires_at > ?)`,
 				name, now).Scan(&outstanding); err != nil {
 				return fmt.Errorf("alloc: count the leases on node %s: %w", name, err)
 			}
@@ -1241,12 +1283,12 @@ func (a *Allocator) ForgetEveryNode(ctx context.Context) error {
 // paused process, a healed partition — finds its writes refused rather than
 // silently operating on a lease someone else now owns.
 func (a *Allocator) Reap(ctx context.Context) (int, error) {
-	var reaped int
+	var reaped, quarantined int
 
 	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
 		// Reset inside the transaction: a retry or a rollback must not leave a count from a
 		// previous attempt.
-		reaped = 0
+		reaped, quarantined = 0, 0
 
 		now := a.now().UTC()
 
@@ -1257,10 +1299,29 @@ func (a *Allocator) Reap(ctx context.Context) (int, error) {
 
 		for i := range expired {
 			l := &expired[i]
+
+			// A LEASE THAT MAY HAVE A CONTAINER IS NOT TERMINALIZED, it is
+			// quarantined: the capacity stays charged to its host until something
+			// proves the compute is gone. Escrow nobody launched is a different
+			// thing and still ends here.
+			to := PhaseFailed
+			if hadCompute(l.Phase) {
+				to = PhaseQuarantine
+			}
+
 			if _, err := tx.ExecContext(ctx,
-				`UPDATE leases SET phase = 'failed', epoch = epoch + 1 WHERE id = ? AND epoch = ?`,
-				l.ID, l.Epoch); err != nil {
+				`UPDATE leases SET phase = ?, epoch = epoch + 1 WHERE id = ? AND epoch = ?`,
+				string(to), l.ID, l.Epoch); err != nil {
 				return fmt.Errorf("alloc: reap lease %s: %w", l.ID, err)
+			}
+
+			if to == PhaseQuarantine {
+				// NOT ARCHIVED YET. The lease has not finished; the history row is
+				// written when it actually terminalizes, with the outcome it
+				// actually had.
+				quarantined++
+
+				continue
 			}
 
 			if err := a.archive(ctx, tx, l, PhaseFailed); err != nil {
@@ -1279,6 +1340,16 @@ func (a *Allocator) Reap(ctx context.Context) (int, error) {
 		return 0, err
 	}
 
+	// SAID OUT LOUD, because this is capacity that has NOT come back and an
+	// operator watching the advertised number needs to know why. A quarantined
+	// lease is waiting for its host to confirm the container is gone; one that
+	// never will needs `billet leases release --force`.
+	if quarantined > 0 {
+		slog.Default().Warn("leases expired with compute that has not been confirmed gone; their "+
+			"capacity stays charged until the host says it is destroyed",
+			"count", quarantined)
+	}
+
 	return reaped, nil
 }
 
@@ -1295,7 +1366,7 @@ func readExpiredLeases(ctx context.Context, tx *sql.Tx, cutoff string, limit int
 	rows, err := tx.QueryContext(ctx,
 		`SELECT id, tier, node, target_node, macos_slot, phase, vcpu, memory, epoch, run_id, request_id
 		   FROM leases
-		  WHERE phase NOT IN ('done','failed') AND expires_at <= ?
+		  WHERE phase NOT IN ('done','failed','quarantine') AND expires_at <= ?
 		  ORDER BY expires_at
 		  LIMIT ?`, cutoff, limit)
 	if err != nil {

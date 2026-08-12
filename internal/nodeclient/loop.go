@@ -32,6 +32,16 @@ type Compute interface {
 	Launch(ctx context.Context, lease *alloc.Lease, tier *nodeapi.TierSpec, job server.Job) error
 	Destroy(ctx context.Context, requestID int64) error
 	Recover(ctx context.Context) error
+
+	// Instances are the lease ids this host is actually running, read from the
+	// provider rather than from anything the control plane said.
+	//
+	// SENT AT REGISTRATION AS PROOF. A lease whose holder stopped heartbeating is
+	// quarantined rather than terminalized, so its capacity stays charged until
+	// the compute is confirmed gone — and the sweep that would confirm it only
+	// fires for a container that still exists. A host that rebooted has none, so
+	// without this its quarantined capacity would never come back.
+	Instances(ctx context.Context) ([]string, error)
 	Sweep(ctx context.Context) error
 
 	// KeepAlive renews held leases on its own clock until the context ends.
@@ -120,6 +130,33 @@ func (o LoopOptions) registration() Registration {
 		VCPU:       o.VCPU,
 		Memory:     o.Memory,
 	}
+}
+
+// registrationWithInventory is this node's registration, carrying what it is
+// actually running when it can say.
+//
+// AN UNREADABLE PROVIDER SENDS NOTHING RATHER THAN AN EMPTY LIST, because those
+// mean opposite things. A host genuinely running nothing must be able to free
+// the capacity its quarantined leases hold — that is the reboot case. A host
+// that could not reach its provider knows nothing, and letting its silence read
+// as "running nothing" would free capacity for containers that are still there.
+func registrationWithInventory(
+	ctx context.Context, compute Compute, log *slog.Logger, opts LoopOptions,
+) Registration {
+	reg := opts.registration()
+
+	ids, err := compute.Instances(ctx)
+	if err != nil {
+		log.Warn("could not read what this host is running, so the control plane keeps "+
+			"charging for anything it cannot account for here until the next sweep",
+			"error", err)
+
+		return reg
+	}
+
+	reg.Instances, reg.InventoryKnown = ids, true
+
+	return reg
 }
 
 // pollBackoff is how long to wait after a failed poll.
@@ -234,7 +271,7 @@ func register(
 	startJanitor func(),
 ) error {
 	for {
-		if err := c.Register(ctx, opts.registration()); err != nil {
+		if err := c.Register(ctx, registrationWithInventory(ctx, compute, log, opts)); err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
@@ -554,6 +591,16 @@ func renewIfDue(ctx context.Context, c *Client, log *slog.Logger, opts LoopOptio
 			"current one", "expires_in", left.Round(time.Hour), "error", err)
 
 		return
+	}
+
+	// THE CLEANUP IS SEPARATE FROM THE RENEWAL. Installing succeeded; failing to
+	// delete the generation it replaced leaves a second copy of this node's
+	// private key on disk, which is worth saying now rather than at the next
+	// restart — the process may not restart for months.
+	if stale := opts.Identity.StaleCopies(); stale != nil {
+		log.Warn("renewed this node's certificate, but the generation it replaced could not "+
+			"be removed; a second copy of this node's private key is still on disk. Delete it",
+			"error", stale)
 	}
 
 	log.Info("renewed this node's certificate",

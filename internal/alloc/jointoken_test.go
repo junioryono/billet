@@ -155,3 +155,104 @@ func TestAJoinTokenIsNotStored(t *testing.T) {
 		}
 	}
 }
+
+// A REQUEST THAT DOES NOT LAND DOES NOT COST A USE.
+//
+// The decrement is atomic on its own, and that was not enough: it committed in
+// its own transaction, and if recording the request it authorised then failed —
+// a crash, a busy ledger — the credential was gone with nothing to show for it.
+// The machine retries, is treated as new because no row exists, and finds its
+// token spent. It is stranded until an operator mints another and works out why
+// the first one evaporated.
+//
+// The failure is staged with a name already claimed by a different key, which is
+// the one way the insert refuses after the token has been checked.
+func TestAnEnrollmentThatIsRefusedDoesNotSpendTheToken(t *testing.T) {
+	a := newAllocator(t, Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, nil)
+
+	token, err := a.NewJoinToken(t.Context(), time.Hour, 1, "")
+	if err != nil {
+		t.Fatalf("mint: %v", err)
+	}
+
+	// The name is taken by somebody else, so the request cannot be recorded.
+	if _, err := a.RequestEnrollment(t.Context(), "epyc-1", "SHA256:first", "csr-1"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	if _, err := a.RequestEnrollmentWithToken(
+		t.Context(), "epyc-1", "SHA256:second", "csr-2", token,
+	); !errors.Is(err, ErrEnrollmentConflict) {
+		t.Fatalf("expected the name to be held, got: %v", err)
+	}
+
+	// THE USE SURVIVES, so the operator's credential is still good for the
+	// machine it was minted for.
+	if _, err := a.RequestEnrollmentWithToken(
+		t.Context(), "mac-mini-1", "SHA256:other", "csr-3", token,
+	); err != nil {
+		t.Fatalf("the token was consumed by a request that was refused: %v", err)
+	}
+}
+
+// AND A POLL IS FREE. A node asks until a human decides, so charging every call
+// would spend a single-use token on the second one and strand the machine it was
+// minted for.
+func TestPollingAnEnrollmentDoesNotSpendTheToken(t *testing.T) {
+	a := newAllocator(t, Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, nil)
+
+	token, err := a.NewJoinToken(t.Context(), time.Hour, 1, "")
+	if err != nil {
+		t.Fatalf("mint: %v", err)
+	}
+
+	for i := range 3 {
+		if _, err := a.RequestEnrollmentWithToken(
+			t.Context(), "epyc-1", "SHA256:same", "csr-1", token,
+		); err != nil {
+			t.Fatalf("poll %d was refused, so a waiting node gives up before an operator "+
+				"answers: %v", i, err)
+		}
+	}
+}
+
+// A NODE LEARNING IT WAS DENIED DOES NOT PAY AGAIN.
+//
+// "Denied" is a decision, and it is the one that stops a node retrying — so it
+// has to be able to read it. Treating the same key asking again as a NEW request
+// spent another use of the token that already paid for the request being
+// answered: a single-use token returned 401, and the operator saw a credential
+// problem where there was a verdict.
+func TestPollingAfterADecisionDoesNotSpendTheToken(t *testing.T) {
+	for _, decision := range []string{EnrollApproved, EnrollDenied} {
+		t.Run(decision, func(t *testing.T) {
+			a := newAllocator(t, Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, nil)
+
+			token, err := a.NewJoinToken(t.Context(), time.Hour, 1, "")
+			if err != nil {
+				t.Fatalf("mint: %v", err)
+			}
+
+			if _, err := a.RequestEnrollmentWithToken(
+				t.Context(), "epyc-1", "SHA256:same", "csr-1", token,
+			); err != nil {
+				t.Fatalf("first request: %v", err)
+			}
+
+			if err := a.DecideEnrollment(t.Context(), "epyc-1", "SHA256:same", decision, "cert"); err != nil {
+				t.Fatalf("decide: %v", err)
+			}
+
+			rec, err := a.RequestEnrollmentWithToken(
+				t.Context(), "epyc-1", "SHA256:same", "csr-1", token)
+			if err != nil {
+				t.Fatalf("the node could not read its own %s decision because polling for it "+
+					"was charged as a new request: %v", decision, err)
+			}
+
+			if rec.State != decision {
+				t.Errorf("the poll reported %q rather than the recorded %q", rec.State, decision)
+			}
+		})
+	}
+}

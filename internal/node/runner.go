@@ -68,6 +68,8 @@ type LeaseStore interface {
 	Release(ctx context.Context, leaseID string, epoch int64, outcome alloc.Phase) error
 	Lease(ctx context.Context, leaseID string) (*alloc.Lease, error)
 	LaunchedLeaseIDs(ctx context.Context, node string) (map[string]bool, error)
+	QuarantinedLeaseIDs(ctx context.Context, node string) (map[string]bool, error)
+	Reconcile(ctx context.Context, node string, running []string) (int, error)
 
 	// LeaseTTL is how long a lease survives without a heartbeat, and it sets the
 	// cadence for renewing held ones. READ FROM THE LEDGER, never assumed: the
@@ -507,6 +509,17 @@ func (r *Runner) Recover(ctx context.Context) error {
 		return fmt.Errorf("node: list leases still open on %s: %w", r.node, err)
 	}
 
+	// AND THE QUARANTINED ONES, which are the case where a surviving container
+	// matters MOST. A lease is quarantined because its listener stopped
+	// heartbeating — nobody is managing it, and its capacity is still charged
+	// precisely because a container may still be running. Reading only the
+	// launched set saw that job as an orphan and destroyed it, which fails a build
+	// GitHub will not requeue.
+	held, err := r.alloc.QuarantinedLeaseIDs(ctx, r.node)
+	if err != nil {
+		return fmt.Errorf("node: list quarantined leases on %s: %w", r.node, err)
+	}
+
 	var adopted, failed int
 
 	for _, inst := range instances {
@@ -524,7 +537,7 @@ func (r *Runner) Recover(ctx context.Context) error {
 			continue
 		}
 
-		if open[leaseID] && inst.Running {
+		if (open[leaseID] || held[leaseID]) && inst.Running {
 			lease, err := r.alloc.Lease(ctx, leaseID)
 
 			switch {
@@ -672,6 +685,25 @@ func (r *Runner) Sweep(ctx context.Context) error {
 		return fmt.Errorf("node: list running instances: %w", err)
 	}
 
+	// REPORTED EVERY SWEEP, INCLUDING WHEN THERE IS NOTHING TO REPORT.
+	//
+	// Quarantine happens on the REAPER's clock, not this one. A control plane
+	// that restarts sees its nodes re-register within seconds — before the leases
+	// they were holding have expired — so the inventory that arrives with a
+	// registration is taken before the quarantine it would resolve, and nothing
+	// looked again. The capacity of a job that finished during the outage was
+	// then held until an operator ran `billet leases release --force`.
+	//
+	// An EMPTY list is the case that matters most: a host running nothing is
+	// exactly the one whose quarantined capacity should come back, and the early
+	// return for "no instances" is what made that unreachable.
+	if err := r.reportInventory(ctx, instances); err != nil {
+		// Not fatal. The sweep's own work is destroying orphans, and a control
+		// plane that could not be told will be told on the next tick.
+		r.log.Warn("could not tell the control plane what this host is running; capacity for "+
+			"compute it cannot account for stays held until this succeeds", "error", err)
+	}
+
 	if len(instances) == 0 {
 		return nil
 	}
@@ -679,6 +711,15 @@ func (r *Runner) Sweep(ctx context.Context) error {
 	open, err := r.alloc.LaunchedLeaseIDs(ctx, r.node)
 	if err != nil {
 		return fmt.Errorf("node: list leases still open on %s: %w", r.node, err)
+	}
+
+	// A QUARANTINED LEASE IS NOT AN ORPHAN. Its capacity is charged because
+	// something may still be running for it, so its instance is adopted into
+	// custody — where a live job is left to finish, a dead one is destroyed, and
+	// the lease is released afterwards with a retry if that fails.
+	quarantined, err := r.alloc.QuarantinedLeaseIDs(ctx, r.node)
+	if err != nil {
+		return fmt.Errorf("node: list quarantined leases on %s: %w", r.node, err)
 	}
 
 	// Anything in custody is Tend's business, not the sweep's. Both would
@@ -702,6 +743,16 @@ func (r *Runner) Sweep(ctx context.Context) error {
 			continue
 		}
 
+		if quarantined[leaseID] {
+			if err := r.adoptQuarantined(ctx, leaseID, inst); err != nil {
+				r.log.Error("could not take custody of compute whose lease is quarantined; "+
+					"its capacity stays charged until this succeeds",
+					"name", inst.Name, "lease", leaseID, "error", err)
+			}
+
+			continue
+		}
+
 		orphans++
 
 		r.log.Warn("destroying an instance whose lease is gone",
@@ -712,6 +763,16 @@ func (r *Runner) Sweep(ctx context.Context) error {
 
 			r.log.Error("could not destroy an orphaned instance",
 				"name", inst.Name, "instance", inst.ID, "error", err)
+
+			continue
+		}
+
+		// Its lease is already terminal — that is what made this an orphan — so
+		// this is belt and braces for the window where it went terminal between
+		// the two reads.
+		if err := r.releaseOrphanedLease(ctx, leaseID); err != nil {
+			r.log.Warn("destroyed an orphaned instance but could not release its lease",
+				"lease", leaseID, "error", err)
 		}
 	}
 
@@ -724,6 +785,64 @@ func (r *Runner) Sweep(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// reportInventory tells the control plane which leases this host is running.
+func (r *Runner) reportInventory(ctx context.Context, instances []*provider.Instance) error {
+	ids := make([]string, 0, len(instances))
+
+	for _, inst := range instances {
+		if leaseID, ours := provider.LeaseOf(inst.Name); ours {
+			ids = append(ids, leaseID)
+		}
+	}
+
+	_, err := r.alloc.Reconcile(ctx, r.node, ids)
+
+	return err
+}
+
+// Instances are the lease ids this host is actually running.
+//
+// FROM THE PROVIDER, never from the ledger: the point of sending it is to tell
+// the control plane something it cannot see for itself.
+func (r *Runner) Instances(ctx context.Context) ([]string, error) {
+	instances, err := r.provider.List(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("node: list what is running here: %w", err)
+	}
+
+	ids := make([]string, 0, len(instances))
+
+	for _, inst := range instances {
+		if leaseID, ours := provider.LeaseOf(inst.Name); ours {
+			ids = append(ids, leaseID)
+		}
+	}
+
+	return ids, nil
+}
+
+// adoptQuarantined puts a quarantined lease's compute into custody.
+//
+// CUSTODY IS ALREADY THE RIGHT MACHINERY, and this is the same situation it was
+// built for: compute nobody is managing, whose capacity must stay charged until
+// it is provably gone. It renews the lease, leaves a running job alone, destroys
+// what has exited, releases afterwards, and RETRIES a release that fails —
+// which a destroy-then-release here could not, because destroying the instance
+// removes the only thing that would bring the sweep back to it.
+func (r *Runner) adoptQuarantined(ctx context.Context, leaseID string, inst *provider.Instance) error {
+	lease, err := r.alloc.Lease(ctx, leaseID)
+	if err != nil {
+		if errors.Is(err, alloc.ErrLeaseNotFound) {
+			// Terminalized between the two reads, so its capacity is already back.
+			return nil
+		}
+
+		return fmt.Errorf("node: read quarantined lease %s: %w", leaseID, err)
+	}
+
+	return r.takeCustody(ctx, lease, inst)
 }
 
 // releaseOrphanedLease terminalizes a lease whose compute has just been

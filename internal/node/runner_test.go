@@ -790,12 +790,14 @@ func TestSweepKeepsAnInstanceWhoseLeaseIsLaunching(t *testing.T) {
 	}
 }
 
-func TestSweepDestroysAnInstanceWhoseLeaseWasReaped(t *testing.T) {
+func TestSweepDestroysAnInstanceWhoseLeaseIsTerminal(t *testing.T) {
 	t.Parallel()
 
-	// The case the sweep exists for. The reaper terminalizes the lease of a
-	// holder that stopped heartbeating; the container it was running under is an
-	// orphan from that moment, and nothing else will ever look at it.
+	// The case the sweep exists for: a lease that has finished while its
+	// container did not. It is named for what it stages — a terminal lease — and
+	// not for the reaper, which no longer terminalizes a lease with compute
+	// behind it. That one is quarantined and adopted; see
+	// TestQuarantinedComputeIsAdoptedRatherThanDestroyed.
 	p := &fakeProvider{kind: config.ProviderDocker}
 	a, host := newAllocatorWithHost(t)
 	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
@@ -1124,5 +1126,232 @@ func TestLaunchSizesTheGuestFromTheLeaseNotTheCatalogue(t *testing.T) {
 
 	if spec.Memory != 4*config.GiB {
 		t.Errorf("started a %s guest against a 4GiB reservation", spec.Memory)
+	}
+}
+
+// A JOB WHOSE LISTENER DIED IS NOT AN ORPHAN.
+//
+// The reaper quarantines a lease whose holder stopped heartbeating, and the
+// whole reason its capacity stays charged is that a container may still be
+// running for it. But the set the node reads to tell "something is waiting for
+// this" is the LAUNCHED set, which does not include quarantine — so a live job
+// looked like an orphan to both recovery and the sweep, and was destroyed.
+//
+// GitHub does not requeue a job a runner has already started, so that is a
+// failed build for a machine that was working correctly.
+func TestQuarantinedComputeIsAdoptedRatherThanDestroyed(t *testing.T) {
+	t.Parallel()
+
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
+
+	lease := assignedLease(t, a)
+
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	// THE REAL REAPER, on a lease that has genuinely aged out. Staging the phase
+	// by hand would prove nothing about the path this is protecting.
+	if err := a.ExpireForTest(t.Context(), lease.ID); err != nil {
+		t.Fatalf("expire: %v", err)
+	}
+
+	if _, err := a.Reap(t.Context()); err != nil {
+		t.Fatalf("Reap: %v", err)
+	}
+
+	if err := r.Sweep(t.Context()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+
+	if len(p.live) != 1 {
+		t.Fatalf("the sweep destroyed a job whose listener had died; GitHub does not requeue "+
+			"one a runner has already started, so that build is lost: %v", p.live)
+	}
+
+	// AND IT IS HELD, not merely spared: custody renews the lease and releases it
+	// when the container exits. Sparing it without adopting it would leave the
+	// capacity charged with nothing left to resolve it.
+	if got := len(r.heldLeases()); got != 1 {
+		t.Errorf("%d instances are in custody; a spared container nothing is holding is a "+
+			"lease that can never be resolved", got)
+	}
+}
+
+// AND RECOVERY DOES NOT DESTROY IT EITHER, which is the same defect reached by
+// the other path: a node that restarts while the job is still running.
+func TestRecoveryAdoptsQuarantinedCompute(t *testing.T) {
+	t.Parallel()
+
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
+
+	lease := assignedLease(t, a)
+
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	if err := a.ExpireForTest(t.Context(), lease.ID); err != nil {
+		t.Fatalf("expire: %v", err)
+	}
+
+	if _, err := a.Reap(t.Context()); err != nil {
+		t.Fatalf("Reap: %v", err)
+	}
+
+	// A FRESH RUNNER over the same provider: the process restarted, and its maps
+	// are empty.
+	restarted := New(a, host, &fakeJIT{setID: 7}, p, nil)
+
+	if err := restarted.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+
+	if len(p.live) != 1 {
+		t.Fatalf("recovery destroyed a running job whose lease was quarantined: %v", p.live)
+	}
+
+	if got := len(restarted.heldLeases()); got != 1 {
+		t.Errorf("recovery spared %d instances without taking custody of them", got)
+	}
+}
+
+// COMPUTE ALREADY IN CUSTODY SURVIVES ITS LEASE BEING QUARANTINED.
+//
+// This is the case the other quarantine tests do not reach, and it is the one
+// where the two mechanisms meet. The node took custody of a launch whose result
+// was lost — so it holds the lease at some epoch. Heartbeats then fail for
+// longer than the TTL while the container keeps running, the reaper quarantines
+// the lease and BUMPS ITS EPOCH, and the node's next heartbeat is fenced.
+//
+// Reading that fence as "the lease is gone" destroyed the job: quarantine is the
+// one fence that means the opposite — capacity still charged, nobody else
+// holding it, and the container is exactly what the quarantine is protecting.
+func TestCustodySurvivesItsLeaseBeingQuarantined(t *testing.T) {
+	t.Parallel()
+
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
+
+	lease := assignedLease(t, a)
+
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	// The launch's result was lost, so the node holds it at the CURRENT epoch.
+	live, err := a.Lease(t.Context(), lease.ID)
+	if err != nil {
+		t.Fatalf("Lease: %v", err)
+	}
+
+	if err := r.AssumeCustody(t.Context(), live, 11); err != nil {
+		t.Fatalf("AssumeCustody: %v", err)
+	}
+
+	// Nothing heartbeats for a TTL, and the reaper quarantines it — bumping the
+	// epoch out from under the custody entry.
+	if err := a.ExpireForTest(t.Context(), lease.ID); err != nil {
+		t.Fatalf("expire: %v", err)
+	}
+
+	if _, err := a.Reap(t.Context()); err != nil {
+		t.Fatalf("Reap: %v", err)
+	}
+
+	if err := r.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend: %v", err)
+	}
+
+	if len(p.live) != 1 {
+		t.Fatalf("custody destroyed a running job because its lease had been quarantined "+
+			"under it; that is the one fence which means the job must be KEPT: %v", p.live)
+	}
+
+	// AND IT IS STILL HELD, at the new epoch — so the next tick renews rather
+	// than being fenced again forever.
+	if got := len(r.heldLeases()); got != 1 {
+		t.Fatalf("the entry was dropped from custody, so nothing renews the lease it is "+
+			"holding: %d", got)
+	}
+
+	if err := r.Tend(t.Context()); err != nil {
+		t.Fatalf("second Tend: %v", err)
+	}
+
+	if len(p.live) != 1 {
+		t.Errorf("the job survived one tick and not the next: %v", p.live)
+	}
+}
+
+// A HOST RUNNING NOTHING SAYS SO, EVERY SWEEP.
+//
+// Quarantine happens on the REAPER's clock, not the node's. A control plane that
+// restarts sees its nodes re-register within seconds — before the leases they
+// were holding have expired — so the inventory that arrives with a registration
+// is taken BEFORE the quarantine it would resolve, and nothing looked again.
+//
+// The capacity of a job that finished during the outage was then held until an
+// operator ran `billet leases release --force`. Every plane restart permanently
+// shrank the fleet by its already-finished in-flight leases, and the early
+// return for "this host is running nothing" is what made the case unreachable —
+// a host running nothing is exactly the one whose capacity should come back.
+func TestASweepReportsAnEmptyInventory(t *testing.T) {
+	t.Parallel()
+
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
+
+	lease := assignedLease(t, a)
+
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	// The job finishes and its container goes, while the control plane is not
+	// watching.
+	running, err := p.List(t.Context())
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+
+	for _, inst := range running {
+		if err := p.Destroy(t.Context(), inst.ID); err != nil {
+			t.Fatalf("destroy: %v", err)
+		}
+	}
+
+	// The lease ages out and is quarantined, AFTER any registration this node
+	// would have made.
+	if err := a.ExpireForTest(t.Context(), lease.ID); err != nil {
+		t.Fatalf("expire: %v", err)
+	}
+
+	if _, err := a.Reap(t.Context()); err != nil {
+		t.Fatalf("Reap: %v", err)
+	}
+
+	if err := a.AgeQuarantineForTest(t.Context(), lease.ID); err != nil {
+		t.Fatalf("age: %v", err)
+	}
+
+	if err := r.Sweep(t.Context()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+
+	held, err := a.Quarantined(t.Context())
+	if err != nil {
+		t.Fatalf("Quarantined: %v", err)
+	}
+
+	if len(held) != 0 {
+		t.Errorf("%d lease(s) still hold capacity for compute this host says it is not "+
+			"running; nothing else will ever ask again: %+v", len(held), held)
 	}
 }

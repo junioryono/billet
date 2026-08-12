@@ -310,6 +310,15 @@ type promise struct {
 // pendingCleanup is a completion whose destroy has not succeeded yet.
 type pendingCleanup struct {
 	job Job
+	// lease is the capacity this obligation still holds, when the entry was
+	// created for a lease that is NOT in `running` — a launch that failed and
+	// whose release did not land. complete looks here when the running map has
+	// nothing, because the request id has already been given up.
+	lease *alloc.Lease
+	// outcome is how the lease should be archived, or empty for the ordinary
+	// completion. A launch that never started must not be recorded as `done`:
+	// "done" for a runner that never ran is a lie the history keeps.
+	outcome alloc.Phase
 	// Doubles after each failure, up to maxRetryEvery.
 	wait time.Duration
 	// Zero means immediately, which is what a freshly recorded failure wants.
@@ -1277,16 +1286,12 @@ func (l *Listener) retryCleanup(ctx context.Context) {
 
 	l.mu.Unlock()
 
+	// NO ERROR BRANCH, because attempt has none to give. A failure records its
+	// own obligation and its own backoff before returning — the pacing lives with
+	// the knowledge of what failed, rather than in a caller that would have to be
+	// told.
 	for _, job := range pending {
-		err := l.attempt(ctx, job)
-		if err == nil {
-			continue
-		}
-
-		l.log.Error("could not finish cleaning up a completed job; will retry",
-			"tier", l.tier, "request", job.RequestID, "error", err)
-
-		l.backOff(job.RequestID)
+		l.attempt(ctx, job)
 	}
 }
 
@@ -1427,7 +1432,18 @@ func (l *Listener) destroyAll(ctx context.Context) map[int64]bool {
 			}
 
 			l.mu.Lock()
-			delete(l.cleanup, requestID)
+
+			// AN ENTRY CARRYING A LEASE IS NOT DISCHARGED BY THE DESTROY ALONE.
+			//
+			// Most cleanup entries exist only to destroy compute, so confirming
+			// that is the end of them. One parked by a failed launch also holds
+			// CAPACITY whose release never landed, and deleting it here dropped the
+			// last reference before releaseAll could see it — leaving the ledger
+			// charging for a job that never started.
+			if entry, ok := l.cleanup[requestID]; !ok || entry.lease == nil {
+				delete(l.cleanup, requestID)
+			}
+
 			l.mu.Unlock()
 		}()
 	}
@@ -1443,7 +1459,7 @@ func (l *Listener) destroyAll(ctx context.Context) map[int64]bool {
 // mark makes the shutdown skip a request, so an entry that outlives its attempt
 // hides that request from teardown permanently — a container nobody destroys and
 // nobody mentions. A panic under complete would do it.
-func (l *Listener) attempt(ctx context.Context, job Job) error {
+func (l *Listener) attempt(ctx context.Context, job Job) {
 	l.mu.Lock()
 
 	// CLAIMED UNDER THE SAME LOCK THAT SEALS, which is what makes the shutdown's
@@ -1455,7 +1471,7 @@ func (l *Listener) attempt(ctx context.Context, job Job) error {
 	if l.sealed {
 		l.mu.Unlock()
 
-		return nil
+		return
 	}
 
 	l.destroying[job.RequestID] = true
@@ -1467,7 +1483,7 @@ func (l *Listener) attempt(ctx context.Context, job Job) error {
 		l.mu.Unlock()
 	}()
 
-	return l.complete(ctx, job)
+	l.complete(ctx, job)
 }
 
 // seal stops the cleanup loop from starting any further destroys.
@@ -1479,19 +1495,6 @@ func (l *Listener) seal() {
 	defer l.mu.Unlock()
 
 	l.sealed = true
-}
-
-// backOff pushes a failed retry's next attempt out.
-//
-// Called for a release failure here and from complete for a destroy failure, so
-// both halves of a retry that could not finish are paced the same way.
-func (l *Listener) backOff(requestID int64) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	if entry, ok := l.cleanup[requestID]; ok {
-		entry.failed(time.Now(), l.retryFirst, l.retryMax)
-	}
 }
 
 // heartbeatInterval is how often held capacity is renewed: a third of the
@@ -1843,9 +1846,7 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 	for _, job := range msg.Completed {
 		finished[job.RequestID] = struct{}{}
 
-		if err := l.complete(ctx, job); err != nil {
-			return err
-		}
+		l.complete(ctx, job)
 	}
 
 	// NO NEW WORK WHILE DRAINING, and the refusal has to be HERE rather than in
@@ -2289,19 +2290,83 @@ func (l *Listener) launch(ctx context.Context, lease *alloc.Lease, job Job) erro
 		"tier", l.tier, "request", job.RequestID, "run", job.RunID,
 		"lease", lease.ID, "error", err)
 
-	// Best effort, and deliberately not fatal. The launch already failed; failing
-	// the listener as well would take every tier down over one job that GitHub
-	// will simply reassign.
-	if relErr := l.alloc.Release(ctx, lease.ID, lease.Epoch, alloc.PhaseFailed); relErr != nil {
+	// Not fatal. The launch already failed; failing the listener as well would
+	// take every tier down over one job that GitHub will simply reassign.
+	relErr := l.alloc.Release(ctx, lease.ID, lease.Epoch, alloc.PhaseFailed)
+	if relErr != nil {
 		l.log.Warn("could not release the lease of a job that failed to start",
 			"tier", l.tier, "lease", lease.ID, "error", relErr)
 	}
 
+	// THE REQUEST ID IS ALWAYS GIVEN UP; THE OBLIGATION MOVES.
+	//
+	// Keeping the lease in `running` after a release that did not land was worse
+	// than dropping it, and in a way that does not heal. Nothing retries a
+	// release from that map — the cleanup loop walks its own — and the heartbeat
+	// renews the entry forever, because the lease is still open at the same
+	// epoch. Meanwhile the request id is wedged: GitHub reassigns a job that
+	// never started, and `assign` treats a redelivery for an id already in
+	// `running` as its own work and silently swallows it, every time. The
+	// advertisement counts a phantom and a drain waits its full grace for a
+	// completion that cannot arrive.
+	//
+	// So an unsettled release parks the lease in the cleanup set, which is the
+	// mechanism that already exists for exactly this — retried on its own clock,
+	// backing off, and refusing a re-assignment of that id until it clears.
+	// Archived as FAILED, because nothing ran: recording it as done would put a
+	// lie in the history.
 	l.mu.Lock()
+
 	delete(l.running, job.RequestID)
+
+	if !releaseSettled(relErr) {
+		if l.cleanup == nil {
+			l.cleanup = make(map[int64]*pendingCleanup)
+		}
+
+		if _, pending := l.cleanup[job.RequestID]; !pending {
+			l.cleanup[job.RequestID] = &pendingCleanup{
+				job: job, lease: lease, outcome: alloc.PhaseFailed,
+			}
+		}
+	}
+
 	l.mu.Unlock()
 
 	return nil
+}
+
+// leaseFor is the lease this listener currently associates with a request, from
+// wherever it is being tracked.
+func (l *Listener) leaseFor(requestID int64) *alloc.Lease {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if lease, ok := l.running[requestID]; ok {
+		return lease
+	}
+
+	if p, ok := l.acquiring[requestID]; ok {
+		return p.lease
+	}
+
+	if entry, ok := l.cleanup[requestID]; ok {
+		return entry.lease
+	}
+
+	return nil
+}
+
+// releaseSettled reports whether a release attempt ended the lease's claim on
+// capacity, one way or another.
+//
+// A CONCLUSIVE ERROR IS AS GOOD AS SUCCESS, and telling the two apart from an
+// outage is the whole point. ErrFenced means somebody else already reclaimed it
+// and this caller's epoch is stale; ErrLeaseNotFound means it is gone or already
+// terminal. Neither can be improved by holding a reference and trying again —
+// but a busy database or a cancelled context can.
+func releaseSettled(err error) bool {
+	return err == nil || errors.Is(err, alloc.ErrFenced) || errors.Is(err, alloc.ErrLeaseNotFound)
 }
 
 // complete releases the lease a finished job was running on.
@@ -2310,7 +2375,18 @@ func (l *Listener) launch(ctx context.Context, lease *alloc.Lease, job Job) erro
 // has already released is simply not in the map. Release with PhaseDone rather
 // than inspecting a conclusion — the lease's job is finished either way, and the
 // outcome belongs to job history rather than to the capacity ledger.
-func (l *Listener) complete(ctx context.Context, job Job) error {
+// IT CANNOT FAIL, and the signature says so.
+//
+// Everything that can go wrong here — a destroy the node refused, a release the
+// ledger could not take — is recorded as a pending obligation and retried on the
+// cleanup clock. Returning an error would be worse than useless: complete runs
+// on the poll path, where an error stops the listener, cancels every other
+// listener, and destroys every job running on this host.
+//
+// Returning nothing keeps that from being re-learned. An error return that is
+// always nil is an invitation to wire the next failure mode through it, and the
+// branch handling it would never run.
+func (l *Listener) complete(ctx context.Context, job Job) {
 	// DESTROYED BEFORE RELEASED, and outside the mutex.
 	//
 	// Releasing first would hand the capacity to another tier while this job's
@@ -2321,6 +2397,17 @@ func (l *Listener) complete(ctx context.Context, job Job) error {
 	// Idempotent by contract, so a redelivered completion, a request this
 	// listener never launched, and a second attempt after a failure all reach
 	// this safely.
+	//
+	// THE LEASE IS NOTED BEFORE THE DESTROY, because the maps can change during
+	// it. A remote destroy has no bound, and the heartbeat runs the whole time:
+	// if it finds this lease fenced — which is what the reaper quarantining it
+	// looks like — it drops the entry and records a cleanup obligation carrying
+	// no lease. The destroy then SUCCEEDS, proving the container is gone, and
+	// the code that would resolve the quarantine has nothing left to name. The
+	// capacity stays charged until a node happens to report an inventory, or
+	// forever if that node never comes back.
+	before := l.leaseFor(job.RequestID)
+
 	if err := l.runner.Destroy(ctx, job.RequestID); err != nil {
 		// NOT released, and NOT fatal. Two separate decisions.
 		//
@@ -2384,13 +2471,34 @@ func (l *Listener) complete(ctx context.Context, job Job) error {
 
 		l.mu.Unlock()
 
-		return nil
+		return
 	}
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
 	lease, ok := l.running[job.RequestID]
+
+	// A RELEASE THAT NEVER LANDED PARKED THE LEASE HERE. The request id was given
+	// up so a redelivery is not swallowed, and this is the only remaining
+	// reference to the capacity it holds.
+	outcome := alloc.PhaseDone
+
+	if entry, parked := l.cleanup[job.RequestID]; parked && entry.lease != nil && !ok {
+		lease, ok = entry.lease, true
+
+		if entry.outcome != "" {
+			outcome = entry.outcome
+		}
+	}
+
+	// OR THE ONE NOTED BEFORE THE DESTROY, if the heartbeat dropped it while that
+	// was in flight. AFTER the parked branch on purpose: that one carries an
+	// outcome as well as a lease, and taking the bare reference first would
+	// archive a job that never started as `done`.
+	if !ok && before != nil {
+		lease, ok = before, true
+	}
 
 	if !ok {
 		// A job can also complete while it is still only PROMISED — GitHub cancels
@@ -2414,25 +2522,81 @@ func (l *Listener) complete(ctx context.Context, job Job) error {
 		// in the map being retried for the life of the process.
 		delete(l.cleanup, job.RequestID)
 
-		return nil
+		return
 	}
 
-	if err := l.alloc.Release(ctx, lease.ID, lease.Epoch, alloc.PhaseDone); err != nil {
-		// THE ENTRY STAYS, and that is the whole point of keeping one. Deleting it
-		// when the DESTROY succeeded lost the retry to a transient release failure:
-		// the lease stayed in `running` being renewed forever, GitHub will not
-		// redeliver a completion it has already acknowledged, and nothing else was
-		// ever going to try the release again.
-		return fmt.Errorf("server: release lease %s for finished request %d: %w",
-			lease.ID, job.RequestID, err)
+	relErr := l.alloc.Release(ctx, lease.ID, lease.Epoch, outcome)
+
+	// FENCED NO LONGER PROVES THE CAPACITY CAME BACK.
+	//
+	// It used to: the reaper terminalized whatever it took, so a stale epoch
+	// meant the lease was already finished. Quarantine changed that — a lease
+	// with compute behind it is moved aside and KEPT CHARGED, so a release
+	// refused for a stale epoch may be refused by a lease that is still holding
+	// its host's capacity.
+	//
+	// This listener can settle it, because it has the one thing the quarantine is
+	// waiting for: the destroy above SUCCEEDED, so the compute is confirmed gone.
+	// That is the same proof a node offers, and it goes through the same door.
+	// Terminalizing at the current epoch instead would be the dangerous version
+	// of this — it would free the capacity on the strength of the epoch alone,
+	// which says nothing about whether a container exists.
+	if errors.Is(relErr, alloc.ErrFenced) {
+		// WITH THE OUTCOME THIS PATH ALREADY KNOWS. The job finished and its
+		// compute is confirmed gone; archiving it as failed because the reaper got
+		// to the lease first would record a job GitHub reported completed as one
+		// that did not.
+		if err := l.alloc.ResolveQuarantine(ctx, lease.ID, outcome); err == nil {
+			l.log.Warn("a finished job's lease had been quarantined before its release "+
+				"landed; its compute is confirmed gone, so the capacity is back",
+				"tier", l.tier, "request", job.RequestID, "lease", lease.ID)
+
+			relErr = nil
+		} else if !errors.Is(err, alloc.ErrLeaseNotFound) {
+			// Not quarantined, or the ledger could not answer. Either way this is
+			// not settled by us.
+			relErr = err
+		}
+	}
+
+	if err := relErr; !releaseSettled(err) {
+		// PARKED AND NOT RETURNED, because of who is calling.
+		//
+		// complete runs on the poll path as well as the cleanup loop, and there
+		// the returned error is FATAL: it stops the listener, which cancels every
+		// other listener, whose shutdowns destroy every job running on this host.
+		// A busy database while GitHub happens to report a completion would take
+		// the whole deployment down.
+		//
+		// That is also self-defeating. The reason for returning the error was to
+		// keep the obligation alive for a retry — and the retry runs in the
+		// process the error kills. So the obligation is recorded here, where it
+		// will be picked up, and the caller is told the completion was handled.
+		if l.cleanup == nil {
+			l.cleanup = make(map[int64]*pendingCleanup)
+		}
+
+		if entry, pending := l.cleanup[job.RequestID]; pending {
+			entry.lease, entry.outcome = lease, outcome
+			entry.failed(time.Now(), l.retryFirst, l.retryMax)
+		} else {
+			l.cleanup[job.RequestID] = &pendingCleanup{job: job, lease: lease, outcome: outcome}
+		}
+
+		l.log.Error("could not release the lease of a finished job; its capacity is held "+
+			"until this is retried",
+			"tier", l.tier, "request", job.RequestID, "lease", lease.ID, "error", err)
+
+		delete(l.running, job.RequestID)
+		delete(l.acquiring, job.RequestID)
+
+		return
 	}
 
 	// RELEASED, so the job is finally over and there is nothing to retry.
 	delete(l.running, job.RequestID)
 	delete(l.acquiring, job.RequestID)
 	delete(l.cleanup, job.RequestID)
-
-	return nil
 }
 
 // releaseAll hands back capacity that was escrowed and never used.
@@ -2462,14 +2626,35 @@ func (l *Listener) releaseAll(ctx context.Context, destroyed map[int64]bool) {
 		promised = append(promised, p.lease)
 	}
 
+	// PARKED OBLIGATIONS TOO. A failed launch whose release did not land keeps
+	// its lease here rather than in `running`, and shutdown is the last chance
+	// anything in this process has to hand that capacity back.
+	parked := make(map[int64]*pendingCleanup, len(l.cleanup))
+
+	for id, entry := range l.cleanup {
+		if entry.lease != nil {
+			parked[id] = entry
+		}
+	}
+
 	l.held = nil
 	l.acquiring = make(map[int64]*promise)
 	l.mu.Unlock()
+
+	// WHAT DID NOT LAND IS PUT BACK, rather than dropped on the floor. These were
+	// cleared above so nothing new could take them mid-shutdown; a release that
+	// failed for a reason a retry could fix has to stay somewhere the next pass —
+	// or a supervisor's restart — can still find it.
+	var stuck []*alloc.Lease
 
 	release := func(lease *alloc.Lease) {
 		if err := l.alloc.Release(ctx, lease.ID, lease.Epoch, alloc.PhaseDone); err != nil {
 			l.log.Warn("could not release escrowed capacity",
 				"tier", l.tier, "lease", lease.ID, "error", err)
+
+			if !releaseSettled(err) {
+				stuck = append(stuck, lease)
+			}
 		}
 	}
 
@@ -2514,5 +2699,35 @@ func (l *Listener) releaseAll(ctx context.Context, destroyed map[int64]bool) {
 	// would strand it until the reaper.
 	for _, lease := range promised {
 		release(lease)
+	}
+
+	// And the parked ones, with the outcome they were parked with: a launch that
+	// never started did not finish, whatever the ordinary path records.
+	for id, entry := range parked {
+		if err := l.alloc.Release(ctx, entry.lease.ID, entry.lease.Epoch, entry.outcome); err != nil {
+			l.log.Warn("could not release the capacity of a job that failed to start",
+				"tier", l.tier, "request", id, "lease", entry.lease.ID, "error", err)
+
+			if !releaseSettled(err) {
+				stuck = append(stuck, entry.lease)
+			}
+		}
+	}
+
+	// WHAT DID NOT LAND IS THE REAPER'S, and saying so is the honest version.
+	//
+	// An earlier attempt put these back on `held` "so the next pass can find
+	// them", which was wrong in a way worth recording: releaseAll runs once, from
+	// Run's teardown, on a listener that is single-use — there is no next pass,
+	// and a restart builds a new listener that has never heard of this map. The
+	// reference was findable by nothing.
+	//
+	// What actually recovers them is the reaper, within a TTL, because nothing is
+	// left to heartbeat them. That is a real mechanism rather than an imagined
+	// one, and it is why this is a warning rather than a failure.
+	if len(stuck) > 0 {
+		l.log.Warn("shutting down with escrow whose release did not land; the reaper reclaims "+
+			"it once it stops being renewed",
+			"tier", l.tier, "leases", len(stuck))
 	}
 }

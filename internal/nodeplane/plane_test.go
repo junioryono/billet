@@ -893,6 +893,11 @@ func TestADestroyEndsALeasesOwnership(t *testing.T) {
 		_ = p.Result("n1", "first", nodeapi.CommandResult{ID: got.ID, OK: true})
 	}()
 
+	// Parked first, for the reason recorded above the other two: a command whose
+	// poller has not run yet is discarded on the command timeout.
+	waitFor(t, "the node to park on a poll",
+		func() bool { return p.WaitersForTest("n1") == 1 })
+
 	if err := p.NewRunner().Destroy(t.Context(), 7); err != nil {
 		t.Fatalf("destroy: %v", err)
 	}
@@ -1173,6 +1178,14 @@ func TestAnOwnersConfirmationClearsTheRecordAndNobodyElseIsAsked(t *testing.T) {
 		_ = p.Result("n1", "first", nodeapi.CommandResult{ID: got.ID, OK: true})
 	}()
 
+	// PARKED FIRST. A dispatched command is discarded once the command timeout
+	// elapses, so starting the poller and the destroy together races the
+	// scheduler — under the full suite's parallelism this goroutine may not run
+	// inside that window, and the test fails on a timeout rather than on what it
+	// is about.
+	waitFor(t, "the owner to park on a poll",
+		func() bool { return p.WaitersForTest("n1") == 1 })
+
 	// ADDRESSED, so a silent bystander is irrelevant. This assertion is the
 	// inverse of what it used to be, and deliberately: the machine that has the
 	// container is the only one asked, so the one that does not have it can no
@@ -1398,6 +1411,15 @@ func TestADestroyIsNotConfirmedByTheWrongProcess(t *testing.T) {
 		_ = p.Result("n1", "second", nodeapi.CommandResult{ID: got.ID, OK: true})
 	}()
 
+	// PARKED BEFORE THE DESTROY IS DISPATCHED, for the reason destroy_test.go
+	// already records: a dispatched command is discarded once the command timeout
+	// elapses, so starting the poller and the destroy together is a race against
+	// the scheduler. Under the full suite's parallelism this goroutine can simply
+	// not run inside that window, and the test then fails on a timeout that has
+	// nothing to do with who answered.
+	waitFor(t, "the replacement to park on a poll",
+		func() bool { return p.WaitersForTest("n1") == 1 })
+
 	err := p.NewRunner().Destroy(t.Context(), 7)
 	if !errors.Is(err, server.ErrCustody) {
 		t.Errorf("a destroy answered by a process that does not hold the container reported "+
@@ -1555,4 +1577,62 @@ func TestANodeCannotReleaseAnotherNodesLease(t *testing.T) {
 		t.Fatal("a registered node was allowed to change the fate of a lease belonging to " +
 			"another node; it can release capacity out from under a running container")
 	}
+}
+
+// THE EPOCH BELONGS TO THE PROCESS THAT SENT THE INVENTORY.
+//
+// The route wrapper refuses a superseded incarnation, and then the epoch was
+// captured under a SECOND lock acquisition — a check-then-act rather than a
+// fence. A replacement registering in that gap meant the stale report was
+// accepted under the REPLACEMENT's epoch, freeing capacity for a container the
+// newer incarnation had just vouched for.
+//
+// Tested here rather than through the route, because the route's own check
+// refuses the caller before this one is reached: the window this closes exists
+// only between the two, and only a direct call can stand in it.
+func TestReconcileRefusesAnInventoryFromASupersededProcess(t *testing.T) {
+	p := New(slog.New(slog.DiscardHandler), deployment, time.Minute,
+		WithRegistrar(&countingRegistrar{}))
+
+	// REGISTERED WITH AN INCARNATION, because an empty one means the plane does
+	// not know which process it is talking to and accepts anyone — the same rule
+	// CheckIncarnation follows, and a test that left it empty would assert
+	// nothing.
+	const current = "second"
+
+	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
+		Version: nodeapi.Version, Node: "n1", Provider: config.ProviderDocker,
+		Deployment: deployment, VCPU: 8, Memory: 32 * config.GiB,
+		Incarnation: current,
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	if _, err := p.ReconcileInventory(t.Context(), "n1", "first", nil); err == nil {
+		t.Fatal("an inventory from a process the plane has already replaced was accepted; " +
+			"it can free capacity the current one is using")
+	}
+
+	// And the current process is still able to report.
+	if _, err := p.ReconcileInventory(t.Context(), "n1", current, nil); err != nil {
+		t.Errorf("the current process could not report its inventory: %v", err)
+	}
+}
+
+// countingRegistrar is a Registrar that records nothing and answers everything,
+// so a test can reach the plane's own decisions.
+type countingRegistrar struct{}
+
+func (countingRegistrar) RegisterNode(context.Context, alloc.NodeRegistration) (int64, error) {
+	return 1, nil
+}
+
+func (countingRegistrar) NodeGone(context.Context, string, int64) error { return nil }
+
+func (countingRegistrar) ForgetEveryNode(context.Context) error { return nil }
+
+func (countingRegistrar) ResolveQuarantineFor(
+	context.Context, string, []string, int64,
+) (int, error) {
+	return 0, nil
 }

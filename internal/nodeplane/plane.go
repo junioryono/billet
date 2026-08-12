@@ -474,6 +474,13 @@ type Registrar interface {
 	// ForgetEveryNode marks the whole fleet unreachable, for a plane that has just
 	// started and has no judgement about anything yet.
 	ForgetEveryNode(ctx context.Context) error
+
+	// ResolveQuarantineFor frees capacity held for compute a returning host says
+	// it is not running, and reports how many leases it released.
+	// The epoch fences it: an overtaken registration must not terminalize a lease
+	// a newer one has just vouched for, using a listing taken before that
+	// container was visible.
+	ResolveQuarantineFor(ctx context.Context, node string, running []string, epoch int64) (int, error)
 }
 
 // sortedSites lists the declared places in a stable order, so a refusal naming
@@ -639,6 +646,32 @@ func (p *Plane) Register(
 			return nodeapi.RegisterResponse{}, fmt.Errorf(
 				"nodeplane: the ledger could not record node %q: %w", req.Node, err)
 		}
+
+		// WHAT THIS HOST SAYS IT IS RUNNING FREES WHAT IT IS NOT.
+		//
+		// A lease whose holder stopped heartbeating is quarantined rather than
+		// terminalized, so its capacity stays charged until the compute is
+		// confirmed gone — and the node's sweep only confirms containers that
+		// still exist. A host that rebooted has none, so its quarantined capacity
+		// would wait forever. This is the other proof.
+		//
+		// ONLY A LIST THE NODE VOUCHES FOR. An absent one means the provider
+		// could not be read, and reading that as "running nothing" would free
+		// capacity for containers that are still there.
+		//
+		// Best effort: failing a registration over it would keep a healthy host
+		// out of the fleet to tidy up an accounting row, and the next
+		// registration or sweep does the same work.
+		if req.InventoryKnown {
+			if freed, err := p.registrar.ResolveQuarantineFor(
+				ctx, req.Node, req.Instances, epoch); err != nil {
+				p.log.Warn("could not reconcile quarantined capacity with what this host "+
+					"reports running", "node", req.Node, "error", err)
+			} else if freed > 0 {
+				p.log.Info("freed capacity held for compute this host is no longer running",
+					"node", req.Node, "leases", freed)
+			}
+		}
 	}
 
 	p.mu.Lock()
@@ -763,6 +796,62 @@ func (p *Plane) answerLocked(pend *pending, res nodeapi.CommandResult) {
 // "whose compute is this" is whichever host polled last, and each host's
 // reconciliation reasons about leases the other one owns.
 var ErrSuperseded = errors.New("nodeplane: another process is registered as this node")
+
+// ReconcileInventory frees capacity held for compute this host says it is not
+// running.
+//
+// THE SAME PROOF AS REGISTRATION, ON A CADENCE THAT ACTUALLY MEETS IT. A lease
+// is quarantined by the reaper, whose clock is the lease TTL — and a node that
+// reconnects after a control-plane restart does so within seconds, long before
+// the leases it was holding expire. So the inventory that arrives with a
+// registration is almost always taken BEFORE the quarantine it would resolve,
+// and nothing looked again.
+//
+// Fenced by the wire rather than by an epoch: this route refuses a superseded
+// incarnation, which is a stronger statement than the registration epoch — it is
+// about the process, not the registration.
+func (p *Plane) ReconcileInventory(
+	ctx context.Context, node, incarnation string, running []string,
+) (int, error) {
+	if p.registrar == nil {
+		return 0, nil
+	}
+
+	// THE INCARNATION IS CHECKED AND THE EPOCH CAPTURED UNDER ONE LOCK.
+	//
+	// The route wrapper checks the incarnation and then this took the mutex
+	// again, which is a check-then-act rather than a fence: a replacement can
+	// register in the gap, and the stale report is then accepted under the
+	// REPLACEMENT's epoch — freeing capacity for a container the newer
+	// incarnation had just vouched for. Reading them together is what makes the
+	// epoch belong to the process that sent the inventory.
+	epoch, err := p.epochFor(node, incarnation)
+	if err != nil {
+		return 0, err
+	}
+
+	return p.registrar.ResolveQuarantineFor(ctx, node, running, epoch)
+}
+
+// epochFor is the ledger epoch of the node AS SEEN BY one incarnation, refusing
+// a caller that is no longer the current process.
+func (p *Plane) epochFor(node, incarnation string) (int64, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	n, ok := p.nodes[node]
+	if !ok {
+		return 0, fmt.Errorf("%w: %s", ErrUnregistered, node)
+	}
+
+	if n.incarnation != "" && incarnation != "" && n.incarnation != incarnation {
+		return 0, fmt.Errorf(
+			"%w: node %q is registered by process %s and this report came from %s",
+			ErrSuperseded, node, n.incarnation, incarnation)
+	}
+
+	return n.ledgerEpoch, nil
+}
 
 // CheckIncarnation reports whether a request came from the current node process.
 //

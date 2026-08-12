@@ -266,6 +266,11 @@ type Registration struct {
 	// VCPU and Memory are what this host contributes.
 	VCPU   int
 	Memory config.ByteSize
+	// Instances are the lease ids this host is actually running, and
+	// InventoryKnown says the list is complete rather than absent. See
+	// nodeapi.RegisterRequest.
+	Instances      []string
+	InventoryKnown bool
 }
 
 // Register introduces this node and learns the timings it must respect.
@@ -273,15 +278,17 @@ func (c *Client) Register(ctx context.Context, reg Registration) error {
 	var res nodeapi.RegisterResponse
 
 	err := c.do(ctx, http.MethodPost, "/v1/register", nodeapi.RegisterRequest{
-		Version:     nodeapi.Version,
-		Incarnation: c.incarnation,
-		Node:        c.node,
-		Provider:    reg.Provider,
-		GuestOS:     reg.GuestOS,
-		Deployment:  reg.Deployment,
-		Site:        reg.Site,
-		VCPU:        reg.VCPU,
-		Memory:      reg.Memory,
+		Version:        nodeapi.Version,
+		Incarnation:    c.incarnation,
+		Node:           c.node,
+		Provider:       reg.Provider,
+		GuestOS:        reg.GuestOS,
+		Deployment:     reg.Deployment,
+		Instances:      reg.Instances,
+		InventoryKnown: reg.InventoryKnown,
+		Site:           reg.Site,
+		VCPU:           reg.VCPU,
+		Memory:         reg.Memory,
 	}, &res)
 	if err != nil {
 		return err
@@ -431,9 +438,8 @@ func (c *Client) Lease(ctx context.Context, leaseID string) (*alloc.Lease, error
 
 // LaunchedLeaseIDs reports which leases this node is believed to have launched.
 func (c *Client) LaunchedLeaseIDs(ctx context.Context, nodeName string) (map[string]bool, error) {
-	var res nodeapi.LaunchedResponse
-
-	if err := c.do(ctx, http.MethodGet, "/v1/nodes/"+url.PathEscape(nodeName)+"/launched", nil, &res); err != nil {
+	res, err := c.launched(ctx, nodeName)
+	if err != nil {
 		return nil, err
 	}
 
@@ -442,6 +448,40 @@ func (c *Client) LaunchedLeaseIDs(ctx context.Context, nodeName string) (map[str
 	}
 
 	return res.LeaseIDs, nil
+}
+
+// QuarantinedLeaseIDs reports the leases holding capacity for compute the
+// control plane cannot account for on this node.
+func (c *Client) QuarantinedLeaseIDs(ctx context.Context, nodeName string) (map[string]bool, error) {
+	res, err := c.launched(ctx, nodeName)
+	if err != nil {
+		return nil, err
+	}
+
+	if res.Quarantined == nil {
+		return map[string]bool{}, nil
+	}
+
+	return res.Quarantined, nil
+}
+
+// Reconcile tells the control plane what this host is running, so it can free
+// capacity held for compute that is gone.
+func (c *Client) Reconcile(ctx context.Context, nodeName string, running []string) (int, error) {
+	var res nodeapi.ReconcileResponse
+
+	err := c.do(ctx, http.MethodPost, "/v1/nodes/"+url.PathEscape(nodeName)+"/reconcile",
+		nodeapi.ReconcileRequest{Instances: running}, &res)
+
+	return res.Freed, err
+}
+
+func (c *Client) launched(ctx context.Context, nodeName string) (nodeapi.LaunchedResponse, error) {
+	var res nodeapi.LaunchedResponse
+
+	err := c.do(ctx, http.MethodGet, "/v1/nodes/"+url.PathEscape(nodeName)+"/launched", nil, &res)
+
+	return res, err
 }
 
 // Describe finds a tier's scale set, via the control plane.

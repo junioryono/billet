@@ -101,15 +101,30 @@ func FetchCA(ctx context.Context, base, wantFingerprint string) ([]byte, string,
 	return []byte(body.CAPEM), body.Deployment, nil
 }
 
-// Enroll asks a control plane to admit this node, and reports what it said.
+// Enroll asks a control plane to admit this node, and reports what it said: the
+// certificate, and the authority to install beside it.
 //
 // Returns ErrNotApproved while an operator has not decided, which is the
 // ordinary case on the first call: the caller prints the fingerprint, waits, and
 // asks again.
-func Enroll(ctx context.Context, base, name, joinToken string, caPEM, csrPEM []byte) ([]byte, error) {
+//
+// THE AUTHORITY COMES BACK TOO, AND IT NEED NOT BE THE ONE WE BOOTSTRAPPED WITH.
+// The wait for a human is unbounded, so an operator can rotate the deployment's
+// CA in the middle of it and approval then signs with the new one. Returning
+// only the certificate left the caller writing the authority it had been holding
+// since before the rotation, and a node whose own certificate does not chain to
+// its own ca.crt cannot start.
+//
+// Safe to adopt because of what has already happened: this connection was
+// verified against the fingerprint the operator compared out of band, so the
+// bundle is coming from the control plane billet meant, not from whatever
+// answered.
+func Enroll(
+	ctx context.Context, base, name, joinToken string, caPEM, csrPEM []byte,
+) ([]byte, []byte, error) {
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(caPEM) {
-		return nil, errors.New("nodeclient: the authority could not be parsed for verification")
+		return nil, nil, errors.New("nodeclient: the authority could not be parsed for verification")
 	}
 
 	// VERIFIED FROM HERE ON. The fingerprint check has established which
@@ -124,50 +139,59 @@ func Enroll(ctx context.Context, base, name, joinToken string, caPEM, csrPEM []b
 
 	endpoint, err := url.JoinPath(base, "/v1/enroll")
 	if err != nil {
-		return nil, fmt.Errorf("nodeclient: build the enroll url: %w", err)
+		return nil, nil, fmt.Errorf("nodeclient: build the enroll url: %w", err)
 	}
 
 	payload, err := json.Marshal(nodeapi.EnrollRequest{
 		Node: name, CSRPEM: string(csrPEM), JoinToken: joinToken,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("nodeclient: encode the enrollment request: %w", err)
+		return nil, nil, fmt.Errorf("nodeclient: encode the enrollment request: %w", err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(string(payload)))
 	if err != nil {
-		return nil, fmt.Errorf("nodeclient: build the enrollment request: %w", err)
+		return nil, nil, fmt.Errorf("nodeclient: build the enrollment request: %w", err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
 
 	res, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("nodeclient: ask to enroll: %w", err)
+		return nil, nil, fmt.Errorf("nodeclient: ask to enroll: %w", err)
 	}
 
 	defer res.Body.Close()
 
 	if res.StatusCode == http.StatusUnauthorized {
-		return nil, fmt.Errorf("nodeclient: this control plane requires a join token to enroll; " +
+		return nil, nil, fmt.Errorf("nodeclient: this control plane requires a join token to enroll; " +
 			"run `billet ca token` on it and pass the value as --join-token")
 	}
 
 	if res.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("nodeclient: the control plane refused this enrollment: %s", res.Status)
+		return nil, nil, fmt.Errorf("nodeclient: the control plane refused this enrollment: %s", res.Status)
 	}
 
 	var body nodeapi.EnrollResponse
 	if err := json.NewDecoder(io.LimitReader(res.Body, 1<<20)).Decode(&body); err != nil {
-		return nil, fmt.Errorf("nodeclient: decode the enrollment response: %w", err)
+		return nil, nil, fmt.Errorf("nodeclient: decode the enrollment response: %w", err)
 	}
 
 	switch body.State {
 	case "approved":
-		return []byte(body.CertPEM), nil
+		// AN APPROVAL THAT CARRIES NO AUTHORITY IS NOT USABLE, so this refuses
+		// rather than quietly falling back to the bootstrap one — which is the
+		// bug, written down as a default.
+		if body.CAPEM == "" {
+			return nil, nil, errors.New(
+				"nodeclient: the control plane approved this node but sent no authority to " +
+					"install, so the certificate cannot be verified against anything")
+		}
+
+		return []byte(body.CertPEM), []byte(body.CAPEM), nil
 	case "denied":
-		return nil, ErrDenied
+		return nil, nil, ErrDenied
 	default:
-		return nil, fmt.Errorf("%w (fingerprint %s)", ErrNotApproved, body.Fingerprint)
+		return nil, nil, fmt.Errorf("%w (fingerprint %s)", ErrNotApproved, body.Fingerprint)
 	}
 }
