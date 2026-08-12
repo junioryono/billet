@@ -812,3 +812,105 @@ func syncDir(dir string) error {
 
 	return nil
 }
+
+// RenewalDue reports whether a certificate is far enough through its life to
+// replace, and how long it has left.
+//
+// AT A THIRD OF THE WAY FROM THE END, deliberately earlier than ExpiryWarning.
+// A warning is for a human who may be on holiday; this is for the node itself,
+// and the window has to be wide enough that a control plane which is down for a
+// week, or a node powered off for a month, still has time to renew when it comes
+// back. A node that lets its certificate expire cannot renew — renewal is
+// authenticated by the certificate being renewed — so it has to be re-enrolled
+// by hand, which is the outcome this width exists to avoid.
+//
+// Computed from the certificate's OWN lifetime rather than from LeafLifetime, so
+// a leaf shortened by the CA's own expiry still renews proportionally rather
+// than being judged against a year it never had.
+func RenewalDue(cert *x509.Certificate) (time.Duration, bool) {
+	left := time.Until(cert.NotAfter)
+	lifetime := cert.NotAfter.Sub(cert.NotBefore)
+
+	return left, left < lifetime/3
+}
+
+// Serial is a certificate's serial number as the ledger stores it.
+//
+// Hex, because a serial is a 128-bit integer and every other rendering of one —
+// decimal, base64 — makes it harder to match against what `openssl x509` prints
+// when somebody is trying to work out which credential they are looking at.
+func Serial(cert *x509.Certificate) string {
+	return fmt.Sprintf("%x", cert.SerialNumber)
+}
+
+// SignNodeCSR issues a node certificate for a key the node generated itself.
+//
+// THE PRIVATE KEY NEVER CROSSES THE WIRE, which is the whole reason renewal
+// takes a CSR rather than returning a fresh bundle. A renewal endpoint that
+// minted the key server-side would put a node's identity on the network once a
+// year, and into the control plane's memory and logs on the way.
+//
+// THE NAME COMES FROM THE CALLER, NOT FROM THE CSR. The subject in a CSR is
+// whatever the requester typed; the authenticated identity is what the wire
+// proved. Signing the former would let any node with a valid certificate mint
+// one for any name it liked — which is every node able to impersonate every
+// other, through the endpoint meant to keep them working.
+func (c *CA) SignNodeCSR(name string, csrPEM []byte) (Bundle, error) {
+	block, _ := pem.Decode(csrPEM)
+	if block == nil || block.Type != "CERTIFICATE REQUEST" {
+		return Bundle{}, errors.New("wirecert: not a PEM certificate request")
+	}
+
+	csr, err := x509.ParseCertificateRequest(block.Bytes)
+	if err != nil {
+		return Bundle{}, fmt.Errorf("wirecert: parse the certificate request: %w", err)
+	}
+
+	// CHECKED, because a CSR carries its own signature over its own public key
+	// and an unverified one proves nothing about who holds the private half.
+	if err := csr.CheckSignature(); err != nil {
+		return Bundle{}, fmt.Errorf("wirecert: the certificate request is not correctly signed: %w", err)
+	}
+
+	tmpl, err := c.leafTemplate(name)
+	if err != nil {
+		return Bundle{}, err
+	}
+
+	tmpl.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}
+
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, c.cert, csr.PublicKey, c.key)
+	if err != nil {
+		return Bundle{}, fmt.Errorf("wirecert: sign the certificate request: %w", err)
+	}
+
+	return Bundle{
+		CertPEM: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}),
+		CAPEM:   c.CertPEM(),
+	}, nil
+}
+
+// NewNodeCSR generates a key and a certificate request for a node name.
+//
+// Returns the request to send and the key to keep. The key is PEM and is written
+// 0600 by the caller; it is the node's identity and never leaves the machine.
+func NewNodeCSR(name string) ([]byte, []byte, error) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, nil, fmt.Errorf("wirecert: generate a key: %w", err)
+	}
+
+	der, err := x509.CreateCertificateRequest(rand.Reader,
+		&x509.CertificateRequest{Subject: pkix.Name{CommonName: name}}, key)
+	if err != nil {
+		return nil, nil, fmt.Errorf("wirecert: create a certificate request: %w", err)
+	}
+
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		return nil, nil, fmt.Errorf("wirecert: encode a key: %w", err)
+	}
+
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der}),
+		pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), nil
+}

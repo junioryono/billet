@@ -10,6 +10,8 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
@@ -511,7 +513,8 @@ func runServer(ctx context.Context, lc *lifecycle, cfg *config.Config, dryRun bo
 		// no node keeps a copy that can drift from this one.
 		nodeplane.WithTierCatalog(cfg.Tiers))
 
-	stopWire, err := serveNodeWire(ctx, cfg, owner, nodes, allocator, wiring.NodeJIT{Client: client})
+	stopWire, err := serveNodeWire(ctx, cfg, owner, nodes, allocator,
+		wiring.NodeJIT{Client: client}, allocator)
 	if err != nil {
 		return err
 	}
@@ -591,14 +594,11 @@ func serveNodeWire(
 	ctx context.Context,
 	cfg *config.Config, deployment string,
 	nodes *nodeplane.Plane, store nodeplane.LeaseStore, jit nodeplane.JITSource,
+	revocations nodeplane.Revocations,
 ) (func(), error) {
 	addr := cfg.Server.Listen
 	loopback := nodeplane.LoopbackOnly(addr)
 
-	// THE CATALOGUE TRAVELS WITH THE WIRE, because a JIT request is checked
-	// against the tier its lease names — including that tier's runner group,
-	// which is how an operator keeps a tier away from every repository in the
-	// organisation.
 	var handlerOpts []nodeplane.HandlerOption
 
 	var tlsConf *tls.Config
@@ -623,7 +623,15 @@ func serveNodeWire(
 			return nil, err
 		}
 
-		handlerOpts = append(handlerOpts, nodeplane.RequireClientCert())
+		handlerOpts = append(handlerOpts,
+			nodeplane.RequireClientCert(),
+			// A CREDENTIAL CAN BE TAKEN BACK, and it is checked on every request
+			// rather than only at registration: a node holds one long poll open for
+			// the better part of a minute and re-registers rarely.
+			nodeplane.WithRevocations(revocations),
+			// AND RENEWED BEFORE IT EXPIRES, by the node itself. Without this a
+			// fleet enrolled on one afternoon expires on one afternoon a year later.
+			nodeplane.WithRenewal(ca))
 
 		slog.Default().Info("the node wire requires client certificates",
 			"hosts", hosts, "ca_expires", ca.NotAfter().Format(time.DateOnly))
@@ -799,12 +807,22 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 		}
 	}()
 
-	var tlsConf *tls.Config
+	// A ROTATING IDENTITY, so a renewal takes effect without a restart. The
+	// callback is answered per handshake, which is what makes it safe to replace
+	// the certificate under a node holding long-lived connections.
+	var (
+		tlsConf  *tls.Config
+		identity *wirecert.Rotating
+	)
 
 	if bundle != nil {
-		if tlsConf, err = wirecert.ClientTLS(*bundle); err != nil {
+		identity, err = wirecert.NewRotating(
+			cfg.Node.TLS.CertPath, cfg.Node.TLS.KeyPath, cfg.Node.TLS.CAPath)
+		if err != nil {
 			return err
 		}
+
+		tlsConf = identity.ClientTLS()
 	}
 
 	client, err := nodeclient.New(nodeclient.Options{
@@ -867,6 +885,7 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 		VCPU:         contribution.VCPU,
 		Memory:       contribution.Memory,
 		Log:          slog.Default(),
+		Identity:     identity,
 		SweepEvery:   5 * time.Minute,
 		DrainTimeout: drainTimeout,
 		// The second signal, reaching the wait that honours it.
@@ -1103,19 +1122,168 @@ func confirmOrganization(ctx context.Context, org string) error {
 // is and where it stays. The bundle it writes is copied to the node — the key
 // travels once, by an operator, rather than over a wire that does not yet trust
 // anybody.
-func cmdCA(_ context.Context, args []string) error {
+func cmdCA(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: billet ca issue <node> [--out <dir>] | billet ca show")
+		return errors.New("usage: billet ca issue <node> [--out <dir>] | billet ca revoke <node> | " +
+			"billet ca revocations | billet ca show")
 	}
 
 	switch args[0] {
 	case "issue":
 		return cmdCAIssue(args[1:])
+	case "revoke":
+		return cmdCARevoke(ctx, args[1:])
+	case "revocations":
+		return cmdCARevocations(ctx, args[1:])
 	case "show":
 		return cmdCAShow(args[1:])
 	}
 
-	return fmt.Errorf("unknown ca command %q; try issue or show", args[0])
+	return fmt.Errorf("unknown ca command %q; try issue, revoke, revocations or show", args[0])
+}
+
+// cmdCARevoke withdraws a node's certificate.
+//
+// BY SERIAL, taken from the bundle the operator issued. A name would be the
+// obvious handle and is the wrong one: a name is legitimately re-issued to a
+// replacement machine, so revoking it would refuse the replacement too. The
+// serial names the one credential being taken back.
+//
+// WRITES TO THE LEDGER, so it takes effect on the next request the revoked host
+// makes rather than at the next restart of anything.
+func cmdCARevoke(ctx context.Context, args []string) error {
+	fs := newFlagSet("billet ca revoke")
+	cfgPath := addConfigFlag(fs)
+	certPath := fs.String("cert", "", "the certificate to revoke (default <node>-billet-tls/node.crt)")
+	reason := fs.String("reason", "", "why, recorded alongside it")
+
+	name, err := parseWithName(fs, args)
+	if err != nil {
+		return err
+	}
+
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		return err
+	}
+
+	if cfg.Server == nil {
+		return errors.New("revoking is done on the control plane, and this config has no server section")
+	}
+
+	path := *certPath
+	if path == "" {
+		path = filepath.Join(name+"-billet-tls", "node.crt")
+	}
+
+	serial, err := serialFromCert(path)
+	if err != nil {
+		return err
+	}
+
+	db, err := state.Open(ctx, cfg.Server.StateDir)
+	if err != nil {
+		return fmt.Errorf("server state: %w", err)
+	}
+
+	defer db.Close()
+
+	allocator, err := alloc.New(db, alloc.Limits{
+		MaxVCPU:   cfg.Server.MaxVCPU,
+		MaxMemory: cfg.Server.MaxMemory,
+		Nodes:     cfg.NodePolicies(),
+	}, cfg.Tiers)
+	if err != nil {
+		return fmt.Errorf("capacity allocator: %w", err)
+	}
+
+	if err := allocator.RevokeCert(ctx, serial, name, *reason); err != nil {
+		return err
+	}
+
+	fmt.Printf("Revoked %s (node %s)\n", serial, name)
+	fmt.Printf("\nIt is refused on the next request that certificate makes. Issue a replacement\n")
+	fmt.Printf("with `billet ca issue %s` if the machine is coming back.\n", name)
+
+	return nil
+}
+
+// cmdCARevocations lists what has been withdrawn.
+func cmdCARevocations(ctx context.Context, args []string) error {
+	fs := newFlagSet("billet ca revocations")
+	cfgPath := addConfigFlag(fs)
+
+	if err := parse(fs, args); err != nil {
+		return err
+	}
+
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		return err
+	}
+
+	if cfg.Server == nil {
+		return errors.New("the revocation list lives on the control plane, and this config has no server section")
+	}
+
+	db, err := state.Open(ctx, cfg.Server.StateDir)
+	if err != nil {
+		return fmt.Errorf("server state: %w", err)
+	}
+
+	defer db.Close()
+
+	allocator, err := alloc.New(db, alloc.Limits{
+		MaxVCPU:   cfg.Server.MaxVCPU,
+		MaxMemory: cfg.Server.MaxMemory,
+		Nodes:     cfg.NodePolicies(),
+	}, cfg.Tiers)
+	if err != nil {
+		return fmt.Errorf("capacity allocator: %w", err)
+	}
+
+	revoked, err := allocator.RevokedCerts(ctx)
+	if err != nil {
+		return err
+	}
+
+	if len(revoked) == 0 {
+		fmt.Println("No certificates have been revoked.")
+
+		return nil
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "SERIAL\tNODE\tREVOKED\tREASON")
+
+	for _, r := range revoked {
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", r.Serial, r.Node, r.RevokedAt, r.Reason)
+	}
+
+	return w.Flush()
+}
+
+// serialFromCert reads the serial out of a PEM certificate on disk.
+func serialFromCert(path string) (string, error) {
+	// The path is the operator's own argument on their own machine, naming a
+	// certificate they issued. There is no boundary here to cross: `billet ca
+	// revoke` is already a command that writes to the deployment's ledger.
+	raw, err := os.ReadFile(filepath.Clean(path))
+	if err != nil {
+		return "", fmt.Errorf("read %s: %w", path, err)
+	}
+
+	block, _ := pem.Decode(raw)
+	if block == nil || block.Type != "CERTIFICATE" {
+		return "", fmt.Errorf("%s is not a PEM certificate", path)
+	}
+
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return "", fmt.Errorf("parse %s: %w", path, err)
+	}
+
+	return wirecert.Serial(cert), nil
 }
 
 func cmdCAIssue(args []string) error {

@@ -36,7 +36,7 @@ import (
 // register a host nothing can ever be placed on — silently, because a node with
 // no capacity is indistinguishable from a busy one. Refusing the registration is
 // the correct outcome rather than an inconvenience, which is what this bump buys.
-const Version = 3
+const Version = 4
 
 // CommandKind names what the server is asking a node to do.
 type CommandKind string
@@ -207,6 +207,24 @@ func TierSpecOf(t config.Tier) *TierSpec {
 		SHM:         t.SHM,
 		RunnerGroup: t.RunnerGroup,
 	}
+}
+
+// RenewRequest asks the control plane to sign a new certificate for the node
+// that is already authenticated on this connection.
+//
+// A CSR RATHER THAN A REQUEST FOR A BUNDLE, so the private key never crosses the
+// wire: the node generates the key, keeps it, and asks only for a signature.
+type RenewRequest struct {
+	CSRPEM string `json:"csr_pem"`
+}
+
+// RenewResponse is the signed certificate and the authority that signed it.
+//
+// The CA travels too, because a node that renews across a CA rotation needs the
+// new authority to keep verifying the control plane it is talking to.
+type RenewResponse struct {
+	CertPEM string `json:"cert_pem"`
+	CAPEM   string `json:"ca_pem"`
 }
 
 // Job is the scale-set assignment a launch is for.

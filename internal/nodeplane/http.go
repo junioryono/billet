@@ -80,6 +80,35 @@ func RequireClientCert() HandlerOption {
 	return func(h *handler) { h.requireCert = true }
 }
 
+// Revocations answers whether a certificate has been withdrawn.
+//
+// An interface rather than the allocator, so the wire depends on the one
+// question it asks rather than on the ledger.
+type Revocations interface {
+	CertRevoked(ctx context.Context, serial string) (bool, error)
+}
+
+// WithRevocations lets the wire refuse a credential an operator has taken back.
+//
+// Without it a certificate is good until it expires, which for a decommissioned
+// machine or a leaked key means up to a year of a host that can still be handed
+// work — including a JIT credential that registers a runner against the
+// organisation.
+func WithRevocations(r Revocations) HandlerOption {
+	return func(h *handler) { h.revocations = r }
+}
+
+// WithRenewal lets a node replace its own certificate before it expires.
+//
+// AUTHENTICATED BY THE CERTIFICATE BEING REPLACED, so this grants nothing: a
+// host that can already act as a node asks to keep doing so. What it prevents is
+// the cliff — a fleet enrolled on one afternoon whose certificates all expire on
+// the same day a year later, with no warning louder than a log line and no way
+// back except re-enrolling every machine by hand.
+func WithRenewal(ca *wirecert.CA) HandlerOption {
+	return func(h *handler) { h.ca = ca }
+}
+
 // Handler serves the node wire.
 //
 // Every route that acts for a node is wrapped in forNode, and that is deliberate
@@ -118,6 +147,7 @@ func Handler(log *slog.Logger, p *Plane, store LeaseStore, jit JITSource, opts .
 	mux.HandleFunc("GET /v1/nodes/{node}/launched", h.forNewWork(h.launched))
 	mux.HandleFunc("POST /v1/nodes/{node}/describe", h.forNewWork(h.describe))
 	mux.HandleFunc("POST /v1/nodes/{node}/jit", h.forNode(h.jitConfig))
+	mux.HandleFunc("POST /v1/nodes/{node}/renew", h.forNode(h.renew))
 
 	return mux
 }
@@ -128,6 +158,11 @@ type handler struct {
 	store       LeaseStore
 	jit         JITSource
 	requireCert bool
+
+	// revocations answers whether a credential has been withdrawn, and ca signs
+	// a renewal. Both are nil on a loopback wire, which has no certificates.
+	revocations Revocations
+	ca          *wirecert.CA
 
 	// sets caches the resolved scale set per tier.
 	//
@@ -330,6 +365,50 @@ func (h *handler) authorise(w http.ResponseWriter, r *http.Request, claimed stri
 		return false
 	}
 
+	return h.notRevoked(w, r, name)
+}
+
+// notRevoked refuses a credential that has been withdrawn.
+//
+// ON EVERY REQUEST, not only at registration. A node holds one long poll open
+// for the better part of a minute and re-registers rarely, so a check at
+// registration alone would leave a revoked host working until it happened to
+// restart — which for a decommissioned machine an operator has just taken out of
+// service is exactly the case that matters.
+//
+// AND IT FAILS CLOSED. An unreadable revocation list refuses the request rather
+// than assuming nothing is revoked, because the alternative makes a transient
+// database fault equivalent to switching the check off.
+func (h *handler) notRevoked(w http.ResponseWriter, r *http.Request, name string) bool {
+	if h.revocations == nil {
+		return true
+	}
+
+	serial := wirecert.Serial(r.TLS.PeerCertificates[0])
+
+	revoked, err := h.revocations.CertRevoked(r.Context(), serial)
+	if err != nil {
+		h.log.Error("could not check whether a node certificate has been revoked; refusing "+
+			"the request rather than assuming it is good",
+			"node", name, "serial", serial, "error", err)
+
+		writeErr(w, http.StatusServiceUnavailable, nodeapi.CodeUnavailable,
+			"billet cannot reach its revocation list, so it cannot admit this connection")
+
+		return false
+	}
+
+	if revoked {
+		h.log.Warn("a node connected with a certificate that has been revoked",
+			"node", name, "serial", serial, "path", r.URL.Path)
+
+		writeErr(w, http.StatusForbidden, nodeapi.CodeRefused,
+			"this certificate has been revoked; ask an operator to issue a new one with "+
+				"`billet ca issue`")
+
+		return false
+	}
+
 	return true
 }
 
@@ -348,6 +427,51 @@ func (h *handler) warnIfExpiring(r *http.Request, node string) {
 			"node", node, "expires_in", left.Round(time.Hour),
 			"not_after", r.TLS.PeerCertificates[0].NotAfter)
 	}
+}
+
+// renew signs a new certificate for a node that already has a valid one.
+//
+// THE AUTHENTICATED NAME IS THE SUBJECT, never the one in the request. A CSR's
+// subject is whatever the requester typed; the wire has already proved who this
+// is. Signing the CSR's own name would let any node with a valid certificate
+// mint one for any other name — every node able to impersonate every other,
+// through the endpoint meant to keep them working.
+//
+// A REVOKED CERTIFICATE CANNOT RENEW, which forNode has already settled by the
+// time this runs: revocation is checked on every authenticated request, so a
+// withdrawn credential cannot extend itself.
+func (h *handler) renew(w http.ResponseWriter, r *http.Request) {
+	node := r.PathValue("node")
+
+	if h.ca == nil {
+		writeErr(w, http.StatusNotImplemented, nodeapi.CodeRefused,
+			"this control plane does not sign renewals; it serves a loopback wire, where "+
+				"there are no certificates")
+
+		return
+	}
+
+	var req nodeapi.RenewRequest
+	if !decode(w, r, &req) {
+		return
+	}
+
+	bundle, err := h.ca.SignNodeCSR(node, []byte(req.CSRPEM))
+	if err != nil {
+		h.log.Warn("could not sign a node's renewal request", "node", node, "error", err)
+
+		writeErr(w, http.StatusBadRequest, nodeapi.CodeRefused,
+			fmt.Sprintf("this certificate request cannot be signed: %v", err))
+
+		return
+	}
+
+	h.log.Info("renewed a node certificate", "node", node)
+
+	writeJSON(w, http.StatusOK, nodeapi.RenewResponse{
+		CertPEM: string(bundle.CertPEM),
+		CAPEM:   string(bundle.CAPEM),
+	})
 }
 
 func (h *handler) register(w http.ResponseWriter, r *http.Request) {

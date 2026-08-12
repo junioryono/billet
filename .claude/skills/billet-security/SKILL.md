@@ -107,3 +107,34 @@ Three things about it were wrong on the first attempt and are worth not repeatin
 **Claim the identity BEFORE `state.Open`.** It ran after, and `state.Open` applies migrations — so a process about to be refused first migrated the database it was refused the right to use (start an old copied backup beside a live original and the backup is silently upgraded on its way to the error).
 
 **A contention test that runs in one process is not a contention test.** Both of the original ones called `LockDeployment` twice in the same process; a package-level mutex or a PID in the filename satisfies that while two billets start against one daemon. Measured, not assumed — the in-process test really does pass a fake process-local mutex. The real one re-executes the test binary (`deploymentlock_process_test.go`), which is also the only way to assert that SIGKILLing the holder frees the identity.
+
+## Admission: how a server decides to trust a node
+
+An operator issues the node a certificate. That is the whole admission decision — there is no auto-enrollment, no join token, and no approval queue.
+
+The control plane is its own CA: on first non-loopback start it creates a per-deployment authority in `server.state_dir`, 10-year life, private key never leaving that machine. `billet ca issue <name>` mints a leaf for that name, 1-year life. The operator copies the bundle to the node out of band. On connect, `tls.RequireAndVerifyClientCert` with that CA as the only client-CA pool means a certificate this deployment did not sign never reaches a handler, and `RequireClientCert` makes the CN authoritative — a request whose PATH names a different node is rejected rather than reconciled. Registration then checks the protocol version, that the deployment id matches, that the site was declared, and that the contribution is non-zero.
+
+**A loopback wire has no certificates at all.** The trust boundary is the machine. Config validation refuses `node.tls` against a loopback server, and the wire refuses to bind anywhere but loopback without `RequireClientCert`, so there is no way to serve the unauthenticated wire to a network.
+
+## Revocation
+
+`billet ca revoke <node>` writes the certificate's SERIAL to the ledger; `billet ca revocations` lists what has been withdrawn.
+
+**Keyed on serial, not on node name.** A name is legitimately re-issued to a replacement machine, and revoking the name would refuse the replacement too.
+
+**Checked on every authenticated request**, not only at registration: a node holds one long poll open for the better part of a minute and re-registers rarely, so a check at registration alone would leave a revoked host working until it happened to restart.
+
+**It fails closed.** An unreadable revocation list refuses the request rather than assuming nothing is revoked — the alternative makes a transient database fault equivalent to switching the check off, silently, at exactly the moment somebody is relying on a revocation having taken effect.
+
+## Renewal
+
+A node replaces its own certificate when less than a third of its life remains, on the same pass as the sweep. Without it a fleet enrolled on one afternoon expires on one afternoon a year later, all at once, and cannot recover on its own.
+
+**Authenticated by the certificate being replaced**, so it grants nothing: a host that can already act as a node asks to keep doing so. A revoked certificate therefore cannot renew — `forNode` has already refused it.
+
+**The private key never crosses the wire.** The node generates a key and sends a CSR; the control plane returns only a signature. **The subject comes from the authenticated identity, never from the CSR** — a CSR's subject is whatever the requester typed, so signing it would let any node with a valid certificate mint one for any name, which is every node able to impersonate every other through the endpoint meant to keep them working.
+
+**The renewal is verified before it is installed**, and written to disk before it is used. A certificate that does not chain to the authority this node trusts leaves the working one in force.
+
+**What this does NOT cover:** a node whose certificate has already expired cannot renew, because renewal is authenticated by that certificate. It has to be re-enrolled by hand. The renewal window is a third of the certificate's life — months — so this only happens to a host that was off for that entire period.
+
