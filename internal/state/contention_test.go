@@ -334,8 +334,69 @@ func TestAnOperatorWriteGivesUpRatherThanHanging(t *testing.T) {
 
 	// THE MESSAGE IS THE POINT: it has to tell an operator that nothing changed
 	// and that running it again is the answer.
-	if got := adminErr.Error(); !strings.Contains(got, "run it again") {
-		t.Errorf("the diagnostic should tell the operator to run the command again, got: %v", got)
+	if got := adminErr.Error(); !strings.Contains(got, "run it again when the plane is quieter") {
+		t.Errorf("the diagnostic should tell the operator what stands and to run it again, got: %v", got)
+	}
+}
+
+// A CANCELLED COMMAND REPORTS CANCELLATION, not whatever the driver said last.
+//
+// Callers test for context.Canceled and DeadlineExceeded, and the retry loop has
+// two ways to end on a cancelled context — during its wait, and on the attempt
+// itself. Cancellation does not always arrive as a context error either: modernc
+// can interrupt a BEGIN and surface SQLITE_INTERRUPT, so classifying the driver
+// error first loses the identity entirely.
+func TestACancelledOperatorWriteReportsCancellation(t *testing.T) {
+	dir := t.TempDir()
+	ctx := t.Context()
+
+	server, err := Open(ctx, dir)
+	if err != nil {
+		t.Fatalf("open the server's ledger: %v", err)
+	}
+
+	t.Cleanup(func() { _ = server.Close() })
+
+	admin, err := OpenAdmin(ctx, dir)
+	if err != nil {
+		t.Fatalf("OpenAdmin: %v", err)
+	}
+
+	t.Cleanup(func() { _ = admin.Close() })
+
+	if _, err := admin.w.ExecContext(ctx, `PRAGMA busy_timeout = 0`); err != nil {
+		t.Fatalf("disable the operator handle's busy timeout: %v", err)
+	}
+
+	cancellable, cancel := context.WithCancel(ctx)
+
+	var adminErr error
+
+	// The server holds the slot, so the operator write is stuck retrying — and
+	// then the caller gives up on it.
+	if err := server.Tx(ctx, func(*sql.Tx) error {
+		done := make(chan struct{})
+
+		go func() {
+			defer close(done)
+
+			adminErr = admin.Tx(cancellable, func(atx *sql.Tx) error {
+				_, err := atx.ExecContext(cancellable, `DELETE FROM join_tokens`)
+
+				return err
+			})
+		}()
+
+		cancel()
+		<-done
+
+		return nil
+	}); err != nil {
+		t.Fatalf("the server's transaction: %v", err)
+	}
+
+	if !errors.Is(adminErr, context.Canceled) {
+		t.Errorf("a cancelled operator write should report context.Canceled, got: %v", adminErr)
 	}
 }
 
@@ -410,7 +471,7 @@ func TestALockOwningOperatorCommandIsStillBounded(t *testing.T) {
 		t.Fatal("the lock-owning command should not have got in while the other held the slot")
 	}
 
-	if got := ownerErr.Error(); !strings.Contains(got, "run it again") {
+	if got := ownerErr.Error(); !strings.Contains(got, "run it again when the plane is quieter") {
 		t.Errorf("a command that owns the lock must still give up with advice, got: %v", got)
 	}
 }

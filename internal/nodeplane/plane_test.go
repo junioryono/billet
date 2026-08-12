@@ -653,7 +653,7 @@ func TestAForgottenNodeReleasesItsQueuedWork(t *testing.T) {
 
 	// Nobody polls, so the command sits queued. Wait until it is there, or the
 	// expiry below would race the dispatch that creates it.
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(60 * time.Second)
 	for p.QueuedForTest("n1") == 0 {
 		if time.Now().After(deadline) {
 			t.Fatal("the command was never queued")
@@ -787,7 +787,7 @@ func TestAQueuedCommandIsNotGivenToASupersededProcess(t *testing.T) {
 		_ = p.NewRunner().Launch(t.Context(), testLease(), server.Job{RequestID: 7})
 	}()
 
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(60 * time.Second)
 	for p.QueuedForTest("n1") == 0 {
 		if time.Now().After(deadline) {
 			t.Fatal("the command was never queued")
@@ -932,7 +932,7 @@ func deliverLaunch(t *testing.T) (*Plane, nodeapi.Command) {
 		_ = p.NewRunner().Launch(t.Context(), testLease(), server.Job{RequestID: 7})
 	}()
 
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(60 * time.Second)
 
 	for {
 		got, took, err := p.Poll(t.Context(), "n1", "first")
@@ -1028,7 +1028,7 @@ func TestASupersessionDuringADestroyIsNotAConfirmation(t *testing.T) {
 
 	// The command is queued, so OwnerOfRequest has already been read and the
 	// snapshot says "first" is current. Only now can the supersession race it.
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(60 * time.Second)
 	for p.QueuedForTest("n1") == 0 {
 		if time.Now().After(deadline) {
 			t.Fatal("the destroy was never queued")
@@ -1099,7 +1099,7 @@ func TestALateDestroyResultFromTheOwnerEndsItsOwnership(t *testing.T) {
 	// The owner takes the destroy — and then says nothing.
 	var taken nodeapi.Command
 
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(60 * time.Second)
 
 	for {
 		got, took, err := p.Poll(t.Context(), "n1", "first")
@@ -1288,7 +1288,7 @@ func TestALateDestroyFromANonOwnerDoesNotEndOwnership(t *testing.T) {
 
 	var taken nodeapi.Command
 
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(60 * time.Second)
 
 	for {
 		got, took, err := p.Poll(t.Context(), "n1", "second")

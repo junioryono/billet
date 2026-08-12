@@ -315,10 +315,25 @@ func (p *Plane) epochForTest(name string) int64 {
 }
 
 // waitFor polls a condition rather than sleeping a fixed amount.
+//
+// THE DEADLINE IS FAR LARGER THAN ANY OF THESE WAITS NEEDS, deliberately. What is
+// being waited for — a goroutine reaching a poll — takes microseconds when it is
+// scheduled promptly, so this number is not a budget for the work. It is a bound
+// on how long a STALL is tolerated before the test gives up.
+//
+// Five seconds looked ample and was not. Under the full suite these run alongside
+// every other package, with -race and -covermode=atomic both adding scheduling
+// overhead, and a goroutine can go unscheduled for that long on a loaded machine.
+// The failure then names the wait rather than anything the test is about, which
+// is the most expensive kind of red: it reads as a defect in the code under test.
+//
+// A generous deadline costs nothing when the condition holds, because the loop
+// exits the moment it does. A genuine failure still fails, just later. Slow is a
+// better failure mode than false.
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
 
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(60 * time.Second)
 	for !cond() {
 		if time.Now().After(deadline) {
 			t.Fatalf("timed out waiting for %s", what)
