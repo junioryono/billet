@@ -46,8 +46,10 @@ Most of the following does not work yet; see [Status](#status) for what does.
   CI data to a third party.
 
 There is **no hosted control plane and no SaaS component.** You run the whole thing. `billet` talks
-to GitHub over outbound long-poll, so it needs **no public ingress** — no open ports, no public IP,
-no webhook endpoint, no tunnel.
+to GitHub over outbound long-poll, so **GitHub never connects to you** — no public IP, no webhook
+endpoint, no tunnel. A single-box deployment opens nothing at all. A fleet is the one exception, and
+it is a local one: nodes dial the control plane, so it has to listen somewhere they can reach —
+normally a private network or a VPN rather than the internet.
 
 ## What it is not
 
@@ -190,7 +192,7 @@ built. What works **today**:
 | `billet nodes pending` | Shows what is waiting to be let in, with the fingerprint to check |
 | `billet nodes approve <node> --fingerprint <fp>` | Admits the machine whose fingerprint you compared |
 | `billet ca token` | Mints the short-lived credential a machine needs to ask |
-| `billet ca show` | The authority's fingerprint, expiry, and whether a rotation is running |
+| `billet ca show` | The authority's fingerprint and expiry, and a warning once it is close enough to expiry to be shortening every certificate it issues. It does **not** report whether a rotation is running |
 | `billet ca issue <node>` | Mints a certificate directly, for a machine you are provisioning anyway |
 | `billet nodes revoke <node>` | Withdraws every credential that machine holds, renewals included |
 | `billet ca revoke <node> --cert <path>` | Withdraws one specific certificate |
@@ -271,11 +273,24 @@ node:
 
 Both paths are recorded, so `billet nodes pending --all` is the single answer to what has been admitted and when.
 
+**A node registers itself, and the fleet is not something you edit.** Registration is dynamic and never asks whether a host was declared anywhere: it checks the protocol version, a non-empty name, the deployment identity, that the contribution is non-zero, and that the site is one this deployment declares. The allocator then requires a provider, and refuses to move a host to a different provider or site while leases are still outstanding against it. So `nodes:` is policy *about* hosts rather than a roster *of* them. The one config fact registration does enforce is `sites:` — a node claiming a site the control plane has never heard of is refused rather than recorded, because a typo would otherwise become a place of its own with a cache that is always empty.
+
+**But admitting a new machine needs the server stopped today, and that is a defect rather than a design.** `billet nodes pending`, `nodes approve`, `nodes revoke`, `ca token`, `ca issue`, `leases quarantined` and `leases release` all open the control plane's state directory directly, and a running server holds an exclusive lock on it for its whole life — so every one of them fails with `another billet process holds this state directory` until you stop it. Registration needing no restart is therefore true of the protocol and not yet true of the workflow. It bites hardest on `billet leases release --force`, whose entire purpose is reclaiming capacity on a **running** deployment.
+
+| Action | Control-plane restart? |
+|---|---|
+| A registered machine reconnecting | **No** — it re-registers itself |
+| Admitting a **new** machine | **Yes, today** — the admission CLI cannot open the locked ledger |
+| Add or change a **tier** | **Yes** — tiers are read at startup, and each becomes one scale set |
+| Change the `nodes:` policy block | **Yes** — it is snapshotted into the allocator at construction and enforced during placement |
+
 The name in the certificate is the only thing that decides which node a request is from — a host holding a bundle can act as that node and as nothing else. The certificate also carries which **deployment** it belongs to, so a fresh host does not invent an identity the control plane would refuse.
 
-**Certificates renew themselves** when less than a third of their life remains, over the wire, with the private key never leaving the node. A certificate that has already expired cannot renew — renewal is authenticated by the certificate being renewed — so that machine has to be re-enrolled; the window is months, so it only happens to a host that was powered off throughout.
+**Certificates renew themselves** when less than a third of their life remains, over the wire, with the private key never leaving the node. A certificate that has already expired cannot renew — renewal is authenticated by the certificate being renewed — so that machine has to be re-enrolled. For a full-life certificate the window is months, and the usual way to miss it is a host that was powered off throughout. It is not the only way: the window is a third of the certificate's *own* life, so it shrinks as the authority approaches its expiry and starts capping what it issues, and a long control-plane outage or a renewal that keeps failing to install can carry a running node through expiry too.
 
-**Taking one back:** `billet nodes revoke <node>` withdraws every credential that machine currently holds, and each is refused on the very next request it makes rather than at its expiry. Revoke the **node**, not a file — because a node renews itself, the bundle you issued names a serial it stopped presenting months ago, and taking that one back would report success and change nothing. A certificate issued afterwards is unaffected, so a rebuilt machine can keep its name. `billet ca revoke <node> --cert <path>` still withdraws one specific credential when that is what you mean.
+**Taking one back:** `billet nodes revoke <node>` withdraws every credential that machine currently holds, and each is refused on the very next request it makes rather than at its expiry. Revoke the **node**, not a file — because a node renews itself, the bundle you issued names a serial it stopped presenting months ago, and taking that one back would report success and change nothing. A certificate issued in a later second is unaffected, so a rebuilt machine can keep its name — the cutoff is whole-second and resolves its own second toward refusing, so mint the replacement a second later rather than instantly. `billet ca revoke <node> --cert <path>` still withdraws one specific credential when that is what you mean.
+
+One residual, because it is the kind of thing that should not be found out during an incident: everything issued since the credential ledger existed is revoked by **serial**, where no clock is involved, but a legacy certificate whose serial was never recorded is caught by the cutoff instead — and a cutoff is a comparison between two clocks. A certificate minted by an authority running ahead of the control plane can carry a date after the cutoff and survive it. If you cannot enumerate what a compromised host holds, or you do not trust the clocks, rotate the authority rather than relying on the cutoff.
 
 **Replacing the authority** is an overlap rather than a switch, because a node trusts what it was given: `billet ca rotate` has the new authority issue node certificates while the old one still signs what the server presents and both stay trusted, nodes adopt the new one as they renew, and `billet ca retire` ends it once they have.
 
@@ -283,11 +298,9 @@ Loopback stays plain HTTP, because there is nothing between the two processes to
 against. Anything else refuses to start without a certificate rather than serving unauthenticated on
 a network, which is the failure that looks like it works.
 
-Two things to know before relying on it. A node certificate lasts a year and its expiry takes that
-host out of the fleet with a handshake error, so the control plane warns for the last thirty days
-while the node is still working — re-issue on that warning, not on the outage. And there is no
-revocation: a compromised node means re-issuing the CA and every node certificate, which is a real
-cost and an honest one at this size.
+Two things to know before relying on it. The **authority** is the cliff, not any single certificate: a leaf may not outlive the CA that signed it, so once the CA has less than a leaf's lifetime left, every certificate it issues is quietly shorter than the last. Renewals keep working and come round faster and faster, nothing errors, and then every node in the fleet expires on the day the authority does. `billet ca show` warns once that starts, because it is invisible otherwise, and `billet ca rotate` is the answer rather than waiting for it.
+
+And a node's identity is its **name**, so two hosts configured with the same one are one host as far as the control plane is concerned. A per-process incarnation value is what routes new commands to the newest registration and stops a superseded process acting on work it was never given — but it does not tell a restart from a duplicate, and it deliberately lets a superseded process go on maintaining and reporting the work it already holds, because a draining process has to outlive its replacement. After a restart the plane still cannot say which of two machines sharing a name physically holds a given container. Give each host its own name.
 
 **Not yet run against a real organization.** The end-to-end path is exercised by a test suite that
 drives the real control plane and a real container runtime against a scripted stand-in for GitHub's
@@ -452,7 +465,7 @@ rewriting placement at the same time.
 | P6 — observability, SSH-into-a-job | ⬜ |
 | P7 — Apple Silicon provider (macOS + Linux arm64) | ⬜ |
 | P8 — EC2 provider, cloud-hosted control plane, provider failover | ⬜ [#32](https://github.com/junioryono/billet/issues/32) |
-| P9 — per-node capacity, admission-time placement, addressed teardown. **A prerequisite of P8**, not a sequel: picking among registered nodes already works, but failover needs the decision made before the work is accepted | ⬜ [#21](https://github.com/junioryono/billet/issues/21) [#30](https://github.com/junioryono/billet/issues/30) [#31](https://github.com/junioryono/billet/issues/31) |
+| P9 — per-node capacity, admission-time placement, addressed teardown. **A prerequisite of P8**, not a sequel: failover needs the decision made before the work is accepted | ✅ [#21](https://github.com/junioryono/billet/issues/21) [#30](https://github.com/junioryono/billet/issues/30) [#31](https://github.com/junioryono/billet/issues/31) |
 | P10 — dashboard, signed releases, public launch | 🚧 releases and packages done; signing and the dashboard are not |
 | P11 — AWS Terraform | ⬜ |
 
