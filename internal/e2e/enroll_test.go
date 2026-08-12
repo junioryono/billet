@@ -31,7 +31,25 @@ type enrollments struct {
 	spendErr error
 }
 
-func (e *enrollments) RequestEnrollment(
+// RequestEnrollmentWithToken mirrors the real one: the token is charged only for
+// a request that is new, and both facts land together.
+func (e *enrollments) RequestEnrollmentWithToken(
+	ctx context.Context, name, fingerprint, csrPEM, token string,
+) (alloc.Enrollment, error) {
+	e.mu.Lock()
+	existing, known := e.by[name]
+	e.mu.Unlock()
+
+	if !known || existing.Fingerprint != fingerprint {
+		if err := e.spendJoinToken(token); err != nil {
+			return alloc.Enrollment{}, err
+		}
+	}
+
+	return e.requestEnrollment(ctx, name, fingerprint, csrPEM)
+}
+
+func (e *enrollments) requestEnrollment(
 	_ context.Context, name, fingerprint, csrPEM string,
 ) (alloc.Enrollment, error) {
 	e.mu.Lock()
@@ -68,7 +86,7 @@ func (e *enrollments) LookupEnrollment(_ context.Context, name string) (alloc.En
 
 // SpendJoinToken accepts anything non-empty: what these tests are about is the
 // enrollment handshake, and the token's own rules have their own test.
-func (e *enrollments) SpendJoinToken(_ context.Context, token string) error {
+func (e *enrollments) spendJoinToken(token string) error {
 	if e.spendErr != nil {
 		return e.spendErr
 	}
