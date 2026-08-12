@@ -449,15 +449,12 @@ func TestAnIdlePollIsNotAnError(t *testing.T) {
 
 // ONE WEDGED NODE MUST NOT HOLD UP A DESTROY ON THE OTHERS.
 //
-// Destroy broadcasts, and the first version asked each node in turn — so a
-// single host that never answers would block the whole call for the command
-// timeout before the next node was even asked. Destroy runs on shutdown and on
-// completion paths, where minutes of that turns one bad host into a stalled
+// Asking each node in turn lets a single host that never answers block the whole
+// call for the command timeout before the next is asked — and Destroy runs on
+// shutdown and completion paths, where that turns one bad host into a stalled
 // control plane.
 //
-// The timing assertion is deliberately loose: what is being proved is
-// "concurrent, not serial", and a threshold near the timeout distinguishes those
-// two without being sensitive to how fast the machine is.
+// The timing assertion is deliberately loose: it proves "concurrent, not serial".
 func TestOneWedgedNodeDoesNotStallADestroy(t *testing.T) {
 	t.Parallel()
 
@@ -591,15 +588,11 @@ func TestADestroySkipsAForgottenNode(t *testing.T) {
 
 // A NODE WITH WORK IN FLIGHT IS BUSY, NOT SILENT.
 //
-// The node loop executes commands synchronously, so a host pulling a
-// five-minute image does not poll while it works. Expiring it there was actively
-// harmful: expiry answers an in-flight launch with custody, the listener stops
-// heartbeating on that, and the lease is reaped before the provider has even
-// returned — after which the launch starts a runner on capacity already sold to
-// somebody else.
-//
-// The command timeout bounds this instead, which is the instrument that already
-// decides how long an unanswered command may run before its outcome is unknown.
+// The node loop executes commands synchronously, so a host pulling a five-minute
+// image does not poll while it works. Expiring it answers an in-flight launch with
+// custody, the listener stops heartbeating, and the lease is reaped before the
+// provider has returned — after which the launch starts a runner on capacity already
+// sold. The command timeout bounds this instead.
 func TestABusyNodeIsNotForgotten(t *testing.T) {
 	t.Parallel()
 
@@ -690,17 +683,13 @@ func TestAForgottenNodeReleasesItsQueuedWork(t *testing.T) {
 
 // A RESULT THAT LANDS AS THE TIMER FIRES IS STILL A RESULT.
 //
-// Both branches of dispatch's select are live at once. The timer fires, and
-// Result takes the plane's mutex first: it deletes the inflight entry, delivers
-// the answer, and replies 204 to a node that is now certain its report landed.
-// The timeout branch used to declare custody anyway, and the listener stopped
-// heartbeating on the strength of it. Nobody held the lease, the container was
-// running, and each side believed the other had it.
+// Both branches of dispatch's select are live at once. Result takes the mutex first,
+// deletes the inflight entry, and replies 204 to a node now certain its report
+// landed; a timeout branch that declared custody anyway left nobody holding the
+// lease while the container ran.
 //
-// Written against settle directly rather than raced, because a test that merely
-// runs the race proves whichever ordering it happened to get. This reproduces
-// the losing ordering exactly: the result is already delivered and the inflight
-// entry already gone, which is the state Result leaves behind.
+// Written against settle directly rather than raced, because a test that runs the
+// race proves whichever ordering it happened to get.
 func TestAResultThatLandedBeforeTheTimeoutIsTaken(t *testing.T) {
 	t.Parallel()
 
@@ -768,16 +757,13 @@ func TestATimedOutLaunchWithNoResultStillMeansCustody(t *testing.T) {
 
 // A QUEUED COMMAND IS NOT HANDED TO A PROCESS THAT HAS LOST THE NAME.
 //
-// The HTTP guard checks the incarnation before this function takes the mutex, so
-// a supersession landing in between reaches a fast path that never looked again.
-// The command would be handed over, that process recorded as the lease's owner,
-// and — since the JIT entitlement follows the command — it would hold a genuine
-// right to mint that runner's registration.
+// The HTTP guard checks the incarnation before this function takes the mutex, so a
+// supersession landing in between reaches a fast path that never looked again — and
+// since the JIT entitlement follows the command, that process would hold a genuine
+// right to mint the runner's registration.
 //
-// Driven against Plane.Poll directly, because the race it guards cannot be
-// produced from outside: the guard would refuse the request long before the
-// window opens. Calling the function the window exists inside is the only way to
-// stand in it.
+// Driven against Plane.Poll directly: the guard would refuse the request long before
+// the window opens.
 func TestAQueuedCommandIsNotGivenToASupersededProcess(t *testing.T) {
 	t.Parallel()
 

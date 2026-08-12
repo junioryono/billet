@@ -1079,15 +1079,13 @@ func TestFinishingAStaleEntryDoesNotDropItsReplacement(t *testing.T) {
 
 // A completion arriving while the periodic tick runs must not race it.
 //
-// These are genuinely different goroutines in production: completions come from
-// a listener, the tick from the reaper. Both end up in tendOne, which mutates
-// the entry in place and issues backend calls between reads — so two of them on
-// one entry destroy the same instance twice, and a delete can drop an entry that
-// was just replaced.
+// These are different goroutines in production — completions from a listener, the
+// tick from the reaper — and both reach tendOne, which mutates the entry in place
+// and issues backend calls between reads. Two of them destroy the same instance
+// twice, and a delete can drop an entry that was just replaced.
 //
-// Serializing only the FLAG WRITE was not enough, which is what this exists to
-// catch: it is the same bug the serialization was added for, moved one line
-// down. Run under -race, which is how the suite runs.
+// Serializing only the FLAG WRITE is the same bug moved one line down, which is
+// what this catches. Run under -race.
 func TestACompletionDoesNotRaceTheTick(t *testing.T) {
 	t.Parallel()
 
@@ -1234,16 +1232,14 @@ func TestKeepAliveRenewsHeldLeasesWhileTendIsBlocked(t *testing.T) {
 	}
 }
 
-// A LAUNCH IN PROGRESS IS RENEWED, because for its whole duration nobody else
-// is doing it.
+// A LAUNCH IN PROGRESS IS RENEWED, because for its whole duration nobody else is
+// doing it.
 //
 // Across the wire the control plane stops waiting after its command timeout and
-// hands the listener custody, which stops the listener heartbeating. The node is
-// meanwhile still inside provider.Launch — pulling a large image, say — and does
-// not adopt anything until that call returns. Between those two moments the
-// lease had no owner: the reaper released its capacity, the allocator sold it to
-// another job, and then the launch completed and started a second workload on
-// hardware that was already spoken for.
+// hands the listener custody, which stops the listener heartbeating — while the node
+// is still inside provider.Launch and adopts nothing until it returns. Between
+// those moments the lease has no owner: the reaper releases its capacity and the
+// allocator sells it to another job.
 func TestALaunchInProgressKeepsItsLeaseRenewed(t *testing.T) {
 	t.Parallel()
 
@@ -1299,15 +1295,11 @@ func TestALaunchInProgressKeepsItsLeaseRenewed(t *testing.T) {
 
 // THE JANITOR FOLLOWS A RENEGOTIATED TTL, because the plane can shorten it.
 //
-// The TTL is agreed at registration, and a node re-registers whenever the
-// control plane forgets it or restarts. A plane that comes back advertising a
-// SHORTER TTL leaves a janitor built on the old one renewing too slowly: the
-// lease expires between two heartbeats, the reaper resells its capacity, and the
-// container it was holding is still running.
-//
-// The janitor is deliberately started once — custody outlives any single
-// registration — so re-reading the value each cycle is the only place that
-// correction can happen.
+// The TTL is agreed at registration, and a node re-registers whenever the control
+// plane forgets it. A plane advertising a SHORTER one leaves a janitor built on the
+// old value renewing too slowly, so the lease expires between heartbeats while its
+// container runs. The janitor starts once — custody outlives any registration — so
+// re-reading each cycle is the only place that correction can happen.
 func TestKeepAliveFollowsAShortenedLeaseTTL(t *testing.T) {
 	t.Parallel()
 
@@ -1353,16 +1345,14 @@ func TestKeepAliveFollowsAShortenedLeaseTTL(t *testing.T) {
 
 	go r.KeepAlive(ctx)
 
-	// WAIT UNTIL THE JANITOR HAS READ THE LONG TTL, which is the moment it is
-	// committed to that cadence, and the only thing that makes shortening it a
-	// test of adaptation rather than of scheduling order.
+	// WAIT UNTIL THE JANITOR HAS READ THE LONG TTL, which is the moment it commits to
+	// that cadence and the only thing that makes shortening it a test of adaptation
+	// rather than of scheduling order.
 	//
-	// This took three attempts. The first stored the short value immediately
-	// after starting the goroutine, so the goroutine usually read the SHORT one on
-	// its first pass. The second waited for a heartbeat — and Recover had already
-	// heartbeated while adopting, so the wait returned instantly and the race was
-	// exactly as before. Counting the janitor's own reads is the signal that
-	// cannot be satisfied by anything else.
+	// Storing the short value straight after starting the goroutine lets it read the
+	// SHORT one first; waiting for a heartbeat returns instantly because Recover already
+	// heartbeated while adopting. Counting the janitor's own reads is the only signal
+	// nothing else satisfies.
 	armedBy := time.Now().Add(15 * time.Second)
 	for reads.Load() == 0 {
 		if time.Now().After(armedBy) {
@@ -1478,16 +1468,13 @@ func TestKeepAliveDoesNotActOnARenewalFailure(t *testing.T) {
 
 // A custody failure does not strand the listener's own lease.
 //
-// A completion for a request that has BOTH — which a redelivered assignment
-// after a crash produces — has to answer the listener's question, which is only
-// ever "is MY compute gone". The listener reads any error as "it may still
-// exist", so it keeps its lease and heartbeats it: returning a custody-only
-// failure stranded a lease whose compute had just been destroyed successfully,
-// permanently, until shutdown.
+// A completion for a request that has BOTH — which a redelivered assignment after a
+// crash produces — answers only "is MY compute gone". The listener reads any error
+// as "it may still exist" and keeps heartbeating, so a custody-only failure strands
+// a lease whose compute was just destroyed successfully.
 //
-// Custody does not need the listener's help. Its entry holds its own lease,
-// which holds its own capacity, and Tend retries every tick. So the custody
-// failure is logged and the return value speaks for the running half alone.
+// Custody does not need the help: its entry holds its own lease, and Tend retries
+// every tick.
 func TestACustodyFailureDoesNotStrandTheListenersLease(t *testing.T) {
 	t.Parallel()
 

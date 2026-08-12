@@ -119,12 +119,9 @@ func TestRunnerGroupMustBeQueryable(t *testing.T) {
 // this asserts the PROPERTY rather than the list: every name checkRunnerGroup
 // accepts must arrive at GitHub unchanged.
 //
-// It reproduces actions/scaleset v0.4.0's handling — client.go:351 interpolates
-// the name unescaped into a path, and newActionsServiceRequest then parses that
-// path, copies its query, and re-encodes it. The first version of this rule was
-// derived by reasoning about which characters are "URL-safe" and was wrong in
-// both directions: it rejected = ? and every non-ASCII name, and it would have
-// missed ; entirely.
+// It reproduces actions/scaleset v0.4.0's handling. Deriving the rule by reasoning
+// about which characters are "URL-safe" was wrong in both directions — it rejected
+// = ? and every non-ASCII name, and would have missed ; entirely.
 func TestAcceptedRunnerGroupsSurviveTheClientsURLHandling(t *testing.T) {
 	roundTrip := func(t *testing.T, group string) string {
 		t.Helper()
@@ -2006,20 +2003,16 @@ tiers:
 	}
 }
 
-// A CONTROL PLANE THAT LISTENS ONLY ON LOOPBACK SERVES PLAINTEXT, so a bundle
-// aimed at it can never be presented.
+// A CONTROL PLANE THAT LISTENS ONLY ON LOOPBACK SERVES PLAINTEXT, so a bundle aimed
+// at it can never be presented.
 //
-// Two authorities for one fact, and this is the configuration where they
-// disagreed: the server chooses transport security from its LISTEN address —
-// loopback needs none, because there is nothing between the two processes — and
-// the node chose it from whether it held a certificate. The result loaded
-// cleanly and looped forever, with nothing in either log naming the setting.
+// Two authorities for one fact: the server chooses transport security from its
+// LISTEN address, and the node chose it from whether it held a certificate. The
+// result loaded cleanly and looped forever, with nothing in either log naming the
+// setting.
 //
 // Note what is NOT refused. A server on 0.0.0.0 serves mTLS on every interface
-// including loopback, so a node colocated with it dials 127.0.0.1 and needs its
-// certificate — the first version of this rule refused that, which is the
-// ordinary production shape. The listener's address is the authority, and a
-// node's destination cannot stand in for it.
+// including loopback, so a colocated node dials 127.0.0.1 AND needs its certificate.
 func TestACertificateAimedAtALoopbackOnlyControlPlaneIsRefused(t *testing.T) {
 	t.Parallel()
 

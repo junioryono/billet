@@ -289,17 +289,13 @@ func TestANodeWithItsOwnCertificateRegisters(t *testing.T) {
 
 // ENROLLMENT GIVES A NEW NODE THE DEPLOYMENT IT IS JOINING.
 //
-// The defect this pins is one nothing in the bundle could have fixed by hand. A
-// node's state directory MINTS a random deployment identity when it has none —
-// correct for a control plane, which is where an installation begins, and wrong
-// for a node, which joins one. So a freshly enrolled host invented an identity,
-// the control plane compared it with its own, and refused the registration
-// forever. The documented enrollment steps produced a node that could never
-// connect.
+// A node's state directory MINTS a random identity when it has none — correct for a
+// control plane, which is where an installation begins, and wrong for a node, which
+// joins one. So a freshly enrolled host invented an identity and was refused
+// forever: the documented steps produced a node that could never connect.
 //
-// The certificate carries the identity, so the bundle an operator copies is
-// sufficient on its own — and it is one authority rather than two, since the
-// same certificate already decides which deployment may connect at all.
+// The certificate carries the identity, so the bundle is sufficient on its own, and
+// it is one authority rather than two.
 func TestAFreshlyEnrolledNodeJoinsTheDeploymentItWasIssuedFor(t *testing.T) {
 	t.Parallel()
 
@@ -413,16 +409,11 @@ func TestACertificateCannotActForAnotherNode(t *testing.T) {
 // A WIRE THAT REQUIRES CERTIFICATES REFUSES A CONNECTION THAT CARRIES NONE, even
 // when the listener under it did not ask for one.
 //
-// Belt and braces, and the reason it is worth a test rather than a comment: the
-// listener normally makes this branch unreachable, since RequireAndVerifyClientCert
-// rejects an anonymous connection before any handler runs. That is exactly what
-// makes it fragile. If some future wiring serves this mux over a plain listener
-// — a debug endpoint, a proxy, a loopback path that grew a network address — every
-// request would authenticate as whatever the URL said, and nothing else in the
-// system would notice.
-//
-// So the handler is served here over ordinary HTTP, which is the mistake being
-// guarded against, and it must still refuse.
+// Worth a test rather than a comment precisely because the listener normally makes
+// the branch unreachable. If some future wiring serves this mux over a plain
+// listener — a debug endpoint, a proxy — every request would authenticate as
+// whatever the URL said. So it is served here over ordinary HTTP, which is the
+// mistake being guarded against.
 func TestAWireRequiringCertificatesRefusesAPlainConnection(t *testing.T) {
 	t.Parallel()
 
@@ -469,16 +460,14 @@ func TestAWireRequiringCertificatesRefusesAPlainConnection(t *testing.T) {
 
 // A COPIED BUNDLE ON TWO HOSTS IS CAUGHT, and mTLS alone cannot catch it.
 //
-// The certificate is genuine on both machines — that is what copying it means —
-// so both authenticate as the same node and the control plane's answer to
-// "whose compute is this" becomes whichever host polled last. Each host's
-// reconciliation then reasons about leases the other one owns.
+// The certificate is genuine on both machines — that is what copying means — so both
+// authenticate as the same node and "whose compute is this" becomes whichever host
+// polled last.
 //
-// The node name is configuration and the certificate is copyable, so neither can
-// distinguish a restart from a duplicate. A per-PROCESS incarnation can: a
-// restart brings a new value and the old process is gone, while a duplicate
-// brings a new value and the old process keeps talking. Only the second produces
-// requests carrying an incarnation that is no longer current.
+// The node name is configuration and the certificate is copyable, so neither
+// distinguishes a restart from a duplicate. A per-PROCESS incarnation does: a restart
+// brings a new value and the old process is gone, while a duplicate brings a new
+// value and the old process keeps talking.
 func TestTwoHostsSharingOneNodeNameAreCaught(t *testing.T) {
 	t.Parallel()
 
@@ -551,15 +540,13 @@ func TestTwoHostsSharingOneNodeNameAreCaught(t *testing.T) {
 
 // AN OLDER NODE CANNOT SLIP PAST THE FENCE BY SAYING NOTHING.
 //
-// Compatibility has to be scoped to nodes that have not CLAIMED an incarnation,
-// and the first version scoped it to the REQUEST instead: an absent header
-// returned early and accepted everything. A billet predating the field, running
-// beside a current one with a copied bundle, would simply never send it — and
-// both would take work as the same node forever. The fence was disabled by
-// exactly the situation it exists to catch.
+// Compatibility is scoped to nodes that have not CLAIMED an incarnation, not to the
+// REQUEST: scoped to the request, an absent header returns early and accepts
+// everything, so a billet predating the field would never send it and both processes
+// would take work as the same node forever.
 //
-// The same hole existed through registration: an empty claim overwrote a live
-// incarnation, after which every process passed.
+// The same hole existed through registration, where an empty claim overwrote a live
+// incarnation.
 func TestAnOlderNodeCannotSlipPastTheFence(t *testing.T) {
 	t.Parallel()
 
