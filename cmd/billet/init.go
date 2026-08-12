@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/junioryono/billet/internal/config"
 )
@@ -113,6 +114,51 @@ func cmdInit(_ context.Context, args []string) error {
 // than about the config.
 const defaultRunnerImage = "ghcr.io/actions/actions-runner:latest"
 
+// generatedTier is one entry in the catalogue init writes.
+type generatedTier struct {
+	label  string
+	vcpu   int
+	memory config.ByteSize
+}
+
+// generatedTiers is a catalogue that FITS UNDER THE CEILING it is generated with.
+//
+// A tier larger than server.max_vcpu or server.max_memory is refused by
+// validation — correctly, because a job on it could never be placed — so a fixed
+// catalogue makes the generated config load on some machines and not others. Two
+// 4 vCPU tiers under a ceiling of 2 is not a smaller deployment, it is a file
+// that does not start, and which machines it happens to work on is decided by
+// whoever ran it last.
+//
+// Shapes are 4GiB per vCPU, keeping those the ceiling can hold. A machine too
+// small for any of them still gets ONE tier, sized to the ceiling itself, because
+// a config with no tiers loads and then schedules nothing — the same failure with
+// no error attached.
+func generatedTiers(ceilVCPU int, ceilMemory config.ByteSize) []generatedTier {
+	var fit []generatedTier
+
+	for _, vcpu := range []int{2, 4, 8} {
+		memory := config.ByteSize(vcpu) * 4 * config.GiB
+		if vcpu <= ceilVCPU && memory <= ceilMemory {
+			fit = append(fit, generatedTier{
+				label:  fmt.Sprintf("billet-%dvcpu", vcpu),
+				vcpu:   vcpu,
+				memory: memory,
+			})
+		}
+	}
+
+	if len(fit) > 0 {
+		return fit
+	}
+
+	return []generatedTier{{
+		label:  fmt.Sprintf("billet-%dvcpu", ceilVCPU),
+		vcpu:   ceilVCPU,
+		memory: min(ceilMemory, config.ByteSize(ceilVCPU)*4*config.GiB),
+	}}
+}
+
 // ceilingVCPU and ceilingMemory are what billet may spend, leaving the host
 // enough to keep working.
 func ceilingVCPU(detected int) int {
@@ -196,19 +242,12 @@ node:
 # Tiers are yours to define. The label is what users put in `+"`runs-on`"+`, and the
 # server is the only role that reads them — a node is told the shape of what it
 # is launching with each job.
+#
+# These are sized to fit the ceiling above, so they are what this machine can
+# actually place. A tier larger than the ceiling is refused at load rather than
+# quietly never scheduled.
 tiers:
-  - label: billet-2vcpu
-    provider: %s
-    vcpu: 2
-    memory: 8GiB
-    image: %s
-
-  - label: billet-4vcpu
-    provider: %s
-    vcpu: 4
-    memory: 16GiB
-    image: %s
-`,
+%s`,
 		filepath.Join(stateBase, "server"),
 		vcpu, memory, ceilingVCPU(vcpu), ceilingMemory(memory),
 		vcpu-ceilingVCPU(vcpu), memory-ceilingMemory(memory),
@@ -218,7 +257,22 @@ tiers:
 		kind,
 		filepath.Join(stateBase, "node"),
 		ceilingVCPU(vcpu), ceilingMemory(memory),
-		kind, image,
-		kind, image,
+		renderTiers(generatedTiers(ceilingVCPU(vcpu), ceilingMemory(memory)), kind, image),
 	)
+}
+
+// renderTiers writes the catalogue as YAML entries, one blank line apart.
+func renderTiers(tiers []generatedTier, kind config.ProviderKind, image string) string {
+	var b strings.Builder
+
+	for i, tier := range tiers {
+		if i > 0 {
+			b.WriteString("\n")
+		}
+
+		fmt.Fprintf(&b, "  - label: %s\n    provider: %s\n    vcpu: %d\n    memory: %s\n    image: %s\n",
+			tier.label, kind, tier.vcpu, tier.memory, image)
+	}
+
+	return b.String()
 }
