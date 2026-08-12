@@ -89,6 +89,10 @@ Report what happened, not what should have happened: if a test fails, say so and
 
 The fact that resized that decision: **GitHub queues a job for 24 hours when no matching runner is available.** A dead controller delays CI rather than failing it, so the requirement is "recovers in minutes", not HA.
 
+`docs/adr-002-cloud-compute-backend.md` — which AWS service runs a job, and why billet signs its own requests. EC2 instance-per-job, because a GitHub Actions job runs Docker and Fargate cannot (*"privileged containers or access are currently unavailable on Fargate"* — so no Docker-in-Docker, and no block device for the caching plane either). Lambda is capped at 15 minutes against a 6-hour job; CodeBuild would replace billet rather than serve it. The SDK was rejected on a measurement: 13.2MB and 15 modules for one `RunInstances`, against a whole billet of 21.8MB and 4 direct dependencies, carried by every node including the bare-metal ones this exists to fall back from.
+
+**An ec2 node is a serial launch queue.** The node runtime executes one command at a time (`Poll` → `execute` → `Report`), which is unremarkable for a backend where one node is one machine's worth of jobs and very visible for one where a single node can represent 64. The command timeout is 10 minutes, ample at normal latencies and tighter under throttling-plus-retries. Run several ec2 nodes if that binds; each is separately registered with its own budget.
+
 `docs/upstream-references.md` records what billet takes from other people's code and what it deliberately does not. Read it before reimplementing anything that touches the scale-set protocol. Two things from it that come up constantly:
 
 - **`github.com/actions/scaleset` is the answer to most protocol questions**, and usually the only answer, because the API is not documented elsewhere.
