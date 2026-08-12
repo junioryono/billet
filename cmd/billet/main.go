@@ -1632,6 +1632,15 @@ func cmdCheck(ctx context.Context, args []string) error {
 
 	if cfg.Node != nil {
 		fmt.Printf("node     %s via %s -> %s\n", cfg.Node.Name, cfg.Node.Provider, cfg.Node.ServerAddr)
+
+		// Config validation proves the ec2 block is COHERENT. It cannot prove this
+		// machine can act on it, and the difference is a deployment that validates
+		// and then fails on the first job of the day.
+		if cfg.Node.Provider == config.ProviderEC2 && cfg.Node.EC2 != nil {
+			if err := checkEC2Credentials(ctx, cfg.Node.EC2); err != nil {
+				return err
+			}
+		}
 	}
 
 	// Per-host policy decides what each machine may run and how many macOS
@@ -1757,4 +1766,50 @@ func cmdVersion(_ context.Context, args []string) error {
 	}
 
 	return nil
+}
+
+// checkEC2Credentials proves this machine can act on its ec2 configuration.
+//
+// THE SAME DISTINCTION checkPrivateKey MAKES, one credential over: config
+// validation proves the block is coherent, and coherence is not the question an
+// operator running `billet check` is asking. A node whose credentials do not
+// resolve validates perfectly and then fails on the first job of the day, with a
+// 403 that names neither the missing environment variable nor the absent instance
+// role.
+//
+// It costs a link-local request on a machine with no AWS environment variables,
+// bounded by the metadata client's own short timeout, because the common failure
+// is that this is not an EC2 instance at all.
+func checkEC2Credentials(ctx context.Context, cfg *config.EC2Config) error {
+	creds, err := ec2.DefaultCredentials().Credentials(ctx)
+	if err != nil {
+		return fmt.Errorf("node.ec2: this host cannot resolve aws credentials, so it could not "+
+			"launch anything: %w", err)
+	}
+
+	// THE ACCESS KEY ID AND NOTHING ELSE. It is an identifier rather than a
+	// secret, and printing it is the difference between "billet is using the wrong
+	// role" and an operator staring at a working config. The secret and the
+	// session token are never rendered anywhere.
+	fmt.Printf("aws      %s in %s, subnet %s, %d instance shape(s), credentials %s\n",
+		spotLabel(cfg.Spot), cfg.Region, cfg.SubnetID, len(cfg.InstanceTypes), creds.AccessKeyID)
+
+	// SAID OUT LOUD RATHER THAN INFERRED FROM AN ABSENT KEY. A deployment that
+	// expected to run fork pull requests on rented machines and finds them queuing
+	// forever has no other way to see why.
+	if len(cfg.UntrustedSecurityGroupIDs) == 0 {
+		fmt.Printf("         untrusted work will be refused: no untrusted_security_group_ids\n")
+	}
+
+	return nil
+}
+
+// spotLabel names the market a node buys in, because it decides whether a build
+// can be killed by somebody else.
+func spotLabel(spot bool) string {
+	if spot {
+		return "spot (a reclaim fails the build; github does not requeue it)"
+	}
+
+	return "on-demand"
 }
