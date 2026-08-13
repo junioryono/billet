@@ -483,15 +483,24 @@ func readIMDS(client *http.Client, req *http.Request) (string, error) {
 // meant the key. The reverse order makes that setting silently do nothing.
 type ChainCredentials []CredentialSource
 
-// ChainCredentials renders as its sources, each of which redacts itself. Without
-// this, printing the chain prints the slice, and printing the slice prints each
-// element through its own methods — which is fine today and stops being fine the
-// moment a source is added that has none. Stating it here means the chain does
-// not depend on that.
+// ChainCredentials renders as the TYPES of its sources. Printing the slice would
+// print each element through its own methods, which is fine only while every
+// source has them — and a CredentialSource can be implemented outside this
+// package.
 func (c ChainCredentials) String() string {
+	// THE TYPES, NOT THE VALUES, and both halves of that matter.
+	//
+	// Formatting each source with %v recursed forever on a chain that contained
+	// itself, and — worse — made this type's safety depend on every source
+	// redacting, including one implemented outside this package. The comment here
+	// used to claim the opposite: that stating it meant the chain did NOT depend on
+	// that. It did.
+	//
+	// A type name says everything a reader needs from a chain (which sources, in
+	// which order) and can carry nothing.
 	parts := make([]string, 0, len(c))
 	for _, src := range c {
-		parts = append(parts, fmt.Sprintf("%v", src))
+		parts = append(parts, fmt.Sprintf("%T", src))
 	}
 
 	return "ec2.ChainCredentials[" + strings.Join(parts, " ") + "]"
