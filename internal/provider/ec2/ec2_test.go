@@ -2718,9 +2718,9 @@ func TestTheRootIsNotAnnouncedWhenTheImageDidNotAskToKeepIt(t *testing.T) {
 //
 // Every root parameter billet sends is EBS-shaped, so such an image would reach
 // RunInstances describing a volume that does not exist. The failure would land
-// after the lease was escrowed and the job placed, as an AWS parameter error
-// deferring the decision to AWS after the escrow, once per job, for every job on
-// that tier. What AWS actually answers was never observed.
+// after the lease was escrowed and the job placed — deferring to AWS whatever it
+// makes of an EBS-shaped mapping for a non-EBS root, once per job, for every job
+// on that tier. What AWS actually answers was never observed.
 //
 // AN OMITTED TYPE IS SETTLED FROM THE SAME RESPONSE, which is what the table is
 // really for. rootDeviceType is optional, so absence is reachable and proves
@@ -2790,17 +2790,39 @@ func TestAnInstanceStoreBackedImageIsRefused(t *testing.T) {
 			// EBS volume — the child attributes are optional.
 			name: "silent, corroborated awkwardly",
 			root: "/dev/sda1",
-			// THE ROOT SITS IN THE MIDDLE, between two non-EBS devices, which is what
-			// it took to close BOTH positional shortcuts. Each previous version of
-			// this row closed one and left the other: with the root last, a
-			// mappings[len-1] read passed; before that, with an EBS data volume
-			// first, a mappings[0] read passed. Neither shortcut checks the name at
-			// all — they get the right answer off the wrong entry — and the negative
-			// rows cannot catch either, because they put the non-EBS root first.
+			// THE PRINCIPLE, so this row stops being patched one boundary per round:
+			// the root must be strictly INTERIOR in the raw order AND in the
+			// EBS-filtered order, with a non-EBS device at each raw end.
+			//
+			// Three rounds each closed one boundary and reopened another, because
+			// the shortcuts come in a family — {raw list, EBS-only sublist} x
+			// {first, last}, plus "the only EBS entry". Root last let mappings[len-1]
+			// pass; an EBS data volume first let mappings[0] pass; flanking the root
+			// with two instance-store devices made it the ONLY EBS entry, which
+			// revived every EBS-filtered read. No row with fewer than five mappings
+			// can violate all five conditions at once.
+			//
+			// That last family is not a contrivance: an EBS-backed image listing a
+			// data volume before its root is the ordinary shape — the measured corpus
+			// has 9,775 non-root EBS mappings — so "the first EBS entry must be the
+			// root" would falsely refuse real images whose type is omitted.
+			//
+			// Six entries, not five, so the root is not at len/2 either — that exact
+			// midpoint read was the next thing a reviewer constructed. The honest
+			// bound remains: this closes the natural family and the midpoint, but
+			// some index arithmetic survives ANY finite row, and the only real
+			// defence against it is that nobody writes it. A full search is the one
+			// implementation that survives this row for the right reason.
 			mappings: `<item><deviceName>/dev/sdb</deviceName>` +
 				`<virtualName>ephemeral0</virtualName></item>` +
+				`<item><deviceName>/dev/sdc</deviceName><ebs>` +
+				`<deleteOnTermination>true</deleteOnTermination></ebs></item>` +
 				`<item><deviceName>/dev/sda1</deviceName><ebs></ebs></item>` +
-				`<item><deviceName>/dev/sdc</deviceName>` +
+				`<item><deviceName>/dev/sdd</deviceName><ebs>` +
+				`<deleteOnTermination>true</deleteOnTermination></ebs></item>` +
+				`<item><deviceName>/dev/sdf</deviceName><ebs>` +
+				`<deleteOnTermination>true</deleteOnTermination></ebs></item>` +
+				`<item><deviceName>/dev/sde</deviceName>` +
 				`<virtualName>ephemeral1</virtualName></item>`,
 		},
 		{

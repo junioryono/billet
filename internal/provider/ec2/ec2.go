@@ -781,18 +781,13 @@ func (p *Provider) setBlockDevices(ctx context.Context, params url.Values, spec 
 // since every one reports both — but "cannot refuse a healthy image" would be a
 // stronger claim than the code earns.
 //
-// REFUSED RATHER THAN SUPPORTED, and the reason is narrower than it first looks: a
-// zero-disk tier would not need the resize, so what rules it out is the wider
-// request shape — the volume tag specification billet always sends describes a
-// resource an instance-store launch never creates. Supporting it means a second,
-// conditional request shape on the one path a live measurement blessed.
-//
-// An earlier version of this comment blamed the volume tag specification billet
-// always sends, claiming it describes a resource such a launch never creates.
-// That is wrong: an instance-store-ROOT instance can still be given EBS data
-// volumes, so the tag has something to attach to. The unconditional
-// incompatibility is narrower and sits in setBlockDevices — the EBS-shaped ROOT
-// mapping, written on every launch.
+// REFUSED RATHER THAN SUPPORTED, and the reason is narrower than two earlier
+// versions of this paragraph claimed. Not the resize: a zero-disk tier does not
+// need one. And not the volume tag specification either — an instance-store-ROOT
+// instance can still be given EBS data volumes, so that tag has something to
+// attach to. What is unconditional is the EBS-shaped ROOT mapping setBlockDevices
+// writes on every launch. Supporting such an image means a second, conditional
+// request shape on the one path a live measurement blessed.
 //
 // And the population it would serve is narrower than "instance-store AMIs": AWS
 // lists the instance types that can boot one at all — C1, C3, D2, I2, M1, M2, M3,
