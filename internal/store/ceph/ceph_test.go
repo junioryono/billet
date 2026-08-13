@@ -1732,3 +1732,69 @@ func TestARenderedValueIsBoundedAfterQuoting(t *testing.T) {
 		t.Errorf("bounded passed a raw newline through: %q", got)
 	}
 }
+
+// A REFUSAL ALWAYS NAMES A REASON.
+//
+// The cause list re-derives what EffectiveCloneFormat already decided, and two
+// functions applying one rule is how they come to disagree. If they ever do, the
+// operator must get a sentence rather than a colon with nothing after it — so
+// this drives every combination that refuses and asserts the message says
+// something.
+func TestARefusalAlwaysNamesAReason(t *testing.T) {
+	t.Parallel()
+
+	for _, release := range []string{"luminous", "unknown", "mimic", "tentacle"} {
+		for _, image := range []string{"auto", "1", "2"} {
+			for _, cache := range []string{"auto", "1", "2"} {
+				rec := answer()
+				rec.minCompat = release
+				rec.cloneFormat = image
+				rec.cacheCloneFormat = cache
+
+				_, err := client(t, valid(), rec).CheckReachable(t.Context())
+				if err == nil || !errors.Is(err, ErrCloneV1) {
+					continue
+				}
+
+				// Everything after the sentinel's own sentence is the reason.
+				reason := strings.TrimPrefix(err.Error(), ErrCloneV1.Error())
+				if len(strings.TrimSpace(strings.TrimPrefix(reason, ":"))) < 20 {
+					t.Errorf("release %q, pools %q/%q: refused with no reason: %v",
+						release, image, cache, err)
+				}
+			}
+		}
+	}
+}
+
+// A TRUNCATED RENDERING IS STILL TERMINATED.
+//
+// The cut can land inside an escape — `"aaa\x0` — and an odd number of trailing
+// backslashes escapes the quote billet appends, so the value reads as though it
+// were never closed. Probed rather than reasoned: two of five sample cuts
+// produced one.
+func TestATruncatedRenderingDoesNotEscapeItsOwnQuote(t *testing.T) {
+	t.Parallel()
+
+	for _, v := range []string{
+		strings.Repeat("a", 296) + "\x00\x00",
+		strings.Repeat("a", 297) + "\x00\x00",
+		strings.Repeat("a", 298) + "\x00\x00",
+		strings.Repeat(`\`, 200),
+		strings.Repeat("\x00", 100),
+	} {
+		got := bounded(v)
+
+		body := strings.TrimSuffix(got, "…\"")
+
+		trailing := 0
+		for i := len(body) - 1; i >= 0 && body[i] == '\\'; i-- {
+			trailing++
+		}
+
+		if trailing%2 == 1 {
+			t.Errorf("bounded(%d bytes) ends in an odd run of backslashes, so the closing quote "+
+				"is escaped: %q", len(v), got[len(got)-16:])
+		}
+	}
+}

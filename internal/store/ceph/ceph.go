@@ -386,7 +386,14 @@ func bounded(v string) string {
 	// become 1,200 characters of `\x00` — so capping what goes in leaves what comes
 	// out four times the bound it was supposed to have.
 	if len(quoted) > maxDiagnostic {
-		return sanitize(quoted[:maxDiagnostic]) + "…\""
+		// TRAILING BACKSLASHES ARE TRIMMED BEFORE THE CLOSING QUOTE IS ADDED. The cut
+		// can land inside an escape — `"aaa\x0` — and an odd number of trailing
+		// backslashes escapes the quote billet appends, so the value reads as though
+		// it were never terminated. Probed rather than assumed: two of five sample
+		// cuts produced one.
+		cut := strings.TrimRight(sanitize(quoted[:maxDiagnostic]), `\`)
+
+		return cut + "…\""
 	}
 
 	return quoted
@@ -530,6 +537,18 @@ func (c *Client) poolSizes(ctx context.Context) (map[string]poolSpec, error) {
 // naming one of them is the same failure.
 func cloneV1Causes(release string, report Report) []string {
 	var causes []string
+
+	// A REFUSAL WITH NO REASON IS THE ONE OUTCOME THIS MUST NOT PRODUCE. The list
+	// below re-derives what EffectiveCloneFormat already decided, and two functions
+	// applying one rule is exactly how they come to disagree — so if they ever do,
+	// the operator gets a sentence rather than a colon and nothing after it.
+	defer func() {
+		if len(causes) == 0 {
+			causes = []string{fmt.Sprintf("its pools resolve to the old clone format from "+
+				"require-min-compat-client %s and their rbd_default_clone_format settings, "+
+				"which `billet check` lists above", bounded(release))}
+		}
+	}()
 
 	for _, p := range report.Pools {
 		if p.CloneFormat == "1" {
