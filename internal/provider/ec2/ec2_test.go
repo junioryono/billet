@@ -196,24 +196,35 @@ func blockDevices(t *testing.T, got url.Values) map[string]string {
 
 	out := map[string]string{}
 
-	// SCANNED PAST THE FIRST GAP, by a few, because stopping at it would make the
-	// contract above a lie: a mapping stranded after a hole is exactly what EC2
-	// would ignore, and a reader that cannot see it cannot report it.
-	gap := 0
+	// THE HORIZON COMES FROM THE KEYS, not from a scan that gives up after a few
+	// holes. Stopping at the first gap would make the contract above a lie, and
+	// stopping after N gaps just moves the lie further out — a mapping stranded at
+	// index 40 is exactly the kind a mutant would add.
+	highest := 0
 
-	for i := 1; gap < 4; i++ {
+	for key := range got {
+		var n int
+
+		if _, err := fmt.Sscanf(key, "BlockDeviceMapping.%d.", &n); err == nil && n > highest {
+			highest = n
+		}
+	}
+
+	gap := false
+
+	for i := 1; i <= highest; i++ {
 		n := strconv.Itoa(i)
 
 		device := got.Get("BlockDeviceMapping." + n + ".DeviceName")
 		if device == "" {
-			gap++
+			gap = true
 
 			continue
 		}
 
-		if gap > 0 {
-			t.Errorf("%s was sent at index %s, after a gap; EC2 reads these as a list and "+
-				"stops at the hole", device, n)
+		if gap {
+			t.Errorf("%s was sent at index %s, after a gap; these are a list and billet's own "+
+				"comment says a dense one is the only shape it can rely on", device, n)
 		}
 
 		if _, seen := out[device]; seen {
@@ -2633,7 +2644,8 @@ func TestAMappingWithNoDeviceNameIsSkipped(t *testing.T) {
 			`<imageId>ami-0abc</imageId><rootDeviceName>/dev/xvda</rootDeviceName>` +
 			`<blockDeviceMapping>` +
 			`<item><ebs><deleteOnTermination>false</deleteOnTermination></ebs></item>` +
-			`<item><deviceName>/dev/sdb</deviceName><ebs></ebs></item>` +
+			`<item><deviceName>/dev/sdb</deviceName><ebs>` +
+			`<deleteOnTermination>true</deleteOnTermination></ebs></item>` +
 			`</blockDeviceMapping></item></imagesSet></DescribeImagesResponse>`
 	}
 
@@ -2667,20 +2679,22 @@ func TestAMappingWithNoDeviceNameIsSkipped(t *testing.T) {
 	}
 }
 
-// A RESPONSE THAT OMITS DeleteOnTermination IS NOT WARNED ABOUT — because there
-// is nothing left to warn about.
+// A RESPONSE THAT OMITS DeleteOnTermination IS REPORTED AS AN ANOMALY.
 //
-// This assertion used to rest on an argument, and #53 replaced the argument with
-// a fact. Silence in the response no longer means billet does not know what will
-// happen to the volume; billet is about to state the answer itself, and
-// TestEveryImageDeviceLaunchesWithAnExplicitTerminationFlag is where that is
-// pinned. So the case that once forced a judgement call now has none in it.
+// THIS ASSERTION IS INVERTED FROM WHAT IT WAS, and the measurement is why. It used
+// to pin silence, on the reasoning that billet could not tell what an omission
+// meant and a warning fired on an uninterpretable state is noise.
 //
-// Note also what the name does NOT say: not that the image sets no attribute,
-// only that the response carried none. The distinction stopped being load-bearing
-// when billet stopped inferring anything from it, which is the better reason for
-// the distinction to have gone quiet than the one it had before.
-func TestAResponseOmittingTerminationIsNotWarnedAbout(t *testing.T) {
+// A live account then showed a registered image reading back with the value
+// present, and no image in a 26,044-image corpus omitting it. So an omission is no
+// longer an ordinary state to be guessed at — it is a response that does not look
+// like the ones that were observed, which is worth exactly one line per image.
+//
+// The launch is NOT refused: billet states delete and carries on, because turning
+// a missing optional field into a failed CI job is worse than deleting a volume
+// created fresh for that job. What is not acceptable is doing that quietly, which
+// is how a policy applied to an unmeasured state stops being visible.
+func TestAResponseOmittingTerminationIsReportedAsAnomalous(t *testing.T) {
 	f := newFakeEC2(t)
 	f.respond = func(action string, params url.Values) (int, string) {
 		if action != "DescribeImages" {
@@ -2706,8 +2720,20 @@ func TestAResponseOmittingTerminationIsNotWarnedAbout(t *testing.T) {
 		t.Fatalf("Launch: %v", err)
 	}
 
-	if strings.Contains(logged.String(), "/dev/sdq") {
-		t.Errorf("a response carrying no termination flag was warned about, though billet "+
-			"states that device's flag itself: %s", logged.String())
+	got := logged.String()
+
+	if !strings.Contains(got, "/dev/sdq") {
+		t.Errorf("a response omitting the termination flag was not reported: %s", got)
+	}
+
+	if !strings.Contains(got, "level=WARN") {
+		t.Errorf("the anomaly was not reported as a warning: %s", got)
+	}
+
+	// AND THE LAUNCH STILL HAPPENED, stating delete. Reporting the oddity must not
+	// become refusing the job.
+	if v := f.paramsFor(t, "RunInstances").Get("BlockDeviceMapping.2.Ebs.DeleteOnTermination"); v != "true" {
+		t.Errorf("the device went out as %q, want true — billet should state delete rather "+
+			"than refuse or guess", v)
 	}
 }
