@@ -1054,7 +1054,6 @@ func TestAnAnswerThatIsNotAReleaseIsRefused(t *testing.T) {
 	t.Parallel()
 
 	for _, answer := range []string{
-		"unknown",
 		"",
 		"  ",
 		"mimic luminous",          // two tokens
@@ -1073,45 +1072,106 @@ func TestAnAnswerThatIsNotAReleaseIsRefused(t *testing.T) {
 			t.Errorf("EffectiveCloneFormat(%.20q) failed with %v, not ErrUnclassifiedRelease",
 				answer, err)
 		}
+
+		// AND THE ANSWER IS NOT ECHOED WHOLE. It came from a binary billet did not
+		// write, so the same rule that refuses to render unparseable output applies
+		// to rendering a rejected one — the 4096-byte case is what a wrong program
+		// at that path looks like.
+		if len(err.Error()) > maxDiagnostic+200 {
+			t.Errorf("EffectiveCloneFormat rendered a %d-byte answer", len(err.Error()))
+		}
 	}
 }
 
-// AND `unknown` IS REFUSED AT THE BOUNDARY, not only on the path that consumes it.
+// A CLUSTER THAT WAS NEVER TOLD CLONES THE OLD WAY, and gets the remedy for it.
 //
-// EffectiveCloneFormat returns early when rbd_default_clone_format is set
-// explicitly, which is correct — the override really does decide — and it meant
-// the release was never looked at on that path. So a cluster with the format
-// forced and `unknown` as its floor skipped the check entirely, and `unknown` was
-// stored and printed as though billet had recognised it. A value validated in one
-// of its two consumers is a value that is not validated, so the refusal moved to
-// where the value enters.
-func TestAnUnknownReleaseIsRefusedWhateverTheCloneFormat(t *testing.T) {
+// `unknown` is the zero value of Ceph's release enum and the setter refuses it —
+// measured — so it can only arrive from Ceph, meaning nobody has run
+// set-require-min-compat-client. That is not an answer billet fails to
+// understand; it is an answer that means clone v1, and the operator needs the
+// same one command as a cluster that says `luminous`. Routing it through
+// "billet could not classify your cluster" fails closed and sends them nowhere
+// useful.
+//
+// The override still wins where it is set, because it genuinely does: a cluster
+// with rbd_default_clone_format forced to 2 clones the new way whatever its floor
+// says, and refusing it would be billet being wrong about a working cluster.
+func TestAClusterThatWasNeverToldTakesTheOldCloneFormat(t *testing.T) {
 	t.Parallel()
 
-	for _, format := range []string{"auto", "1", "2", ""} {
+	for _, tc := range []struct {
+		format  string
+		refused bool
+	}{
+		{"auto", true}, // the floor decides, and it was never set
+		{"", true},     // absent means auto
+		{"1", true},    // forced, and forced to the old one
+		{"2", false},   // forced to the new one, which really does win
+	} {
 		rec := answer()
 		rec.minCompat = "unknown"
-		rec.cloneFormat = format
-		rec.cacheCloneFormat = format
+		rec.cloneFormat = tc.format
+		rec.cacheCloneFormat = tc.format
 
 		report, err := client(t, valid(), rec).CheckReachable(t.Context())
-		if err == nil {
-			t.Errorf("clone format %q: CheckReachable accepted a cluster that was never told "+
-				"which clients it admits", format)
+
+		if !tc.refused {
+			if err != nil {
+				t.Errorf("clone format %q: refused a cluster whose override forces clone v2: %v",
+					tc.format, err)
+			}
 
 			continue
 		}
 
-		if !errors.Is(err, ErrUnclassifiedRelease) {
-			t.Errorf("clone format %q: the failure is %v, not ErrUnclassifiedRelease", format, err)
+		if err == nil {
+			t.Errorf("clone format %q: accepted a cluster that clones the old way", tc.format)
+
+			continue
 		}
 
-		// AND NOTHING IS RENDERED FROM IT. The report is what the CLI prints, so a
-		// populated one here would put `unknown` on the terminal beside a refusal
-		// that says billet could not classify it.
-		if report.MinCompatClient != "" {
-			t.Errorf("clone format %q: the report carries %q", format, report.MinCompatClient)
+		if !errors.Is(err, ErrCloneV1) {
+			t.Errorf("clone format %q: the failure is %v, not ErrCloneV1", tc.format, err)
 		}
+
+		// THE REPORT SURVIVES, so the CLI prints what it found beside the refusal —
+		// and on the `auto` path the remedy is the floor, which is the one command
+		// this operator is missing.
+		if len(report.Pools) != 2 {
+			t.Errorf("clone format %q: the refusal discarded the report: %+v", tc.format, report)
+		}
+
+		if tc.format == "auto" && !strings.Contains(err.Error(), "set-require-min-compat-client") {
+			t.Errorf("clone format %q: the error does not give the remedy for a cluster that was "+
+				"never told: %v", tc.format, err)
+		}
+	}
+}
+
+// A CONFIGURED VALUE BILLET DOES NOT MODEL REACHES THE PIPELINE, and is refused
+// there rather than only by the rule in isolation.
+//
+// Dropping the error from EffectiveCloneFormat at its call site — `format, _ :=`
+// — leaves format 0, which reads as "not v2" and falls into the generic clone-v1
+// refusal with the wrong remedy. Every direct test of the rule stays green,
+// because none of them drives a bad value through CheckReachable.
+func TestAnUnmodelledCloneFormatIsRefusedThroughThePipeline(t *testing.T) {
+	t.Parallel()
+
+	rec := answer()
+	rec.cloneFormat = "3"
+
+	_, err := client(t, valid(), rec).CheckReachable(t.Context())
+	if err == nil {
+		t.Fatal("CheckReachable accepted a clone format billet does not model")
+	}
+
+	if errors.Is(err, ErrCloneV1) {
+		t.Errorf("an unmodelled value was reported as clone v1, which gives the wrong remedy: %v", err)
+	}
+
+	if !strings.Contains(err.Error(), "not auto, 1 or 2") {
+		t.Errorf("the error does not say what billet could not make sense of: %v", err)
 	}
 }
 

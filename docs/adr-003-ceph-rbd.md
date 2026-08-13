@@ -265,7 +265,17 @@ The rule is stated as **"not one of the releases older than mimic"** rather than
 
 **And the floor alone is a proxy, which one config key defeats.** `rbd_default_clone_format` overrides what the minimum client release implies, and billet reads it too. Measured: with the floor at mimic and the format forced to `1`, cloning an unprotected snapshot fails with `rbd: clone error: (22) Invalid argument` — a green preflight beside the exact failure the preflight exists to prevent. The two settings are resolved together, and each cause gets its own remedy, because "raise require-min-compat-client" is wrong advice when the floor is already high enough.
 
-**That key is settable PER POOL, so both pools are read.** `rbd config pool set billet-cache rbd_default_clone_format 1` leaves the image pool reporting `auto` while a clone of an unprotected snapshot in the cache pool fails — measured. Both pools hold clones: root clones in one, cache generations in the other, and the cache pool is where an undeletable generation actually costs something. Reading one pool and calling it the cluster's answer would have been the same proxy mistake one level down, which is worth recording because it was made twice — once as the floor standing in for the format, and once as one pool standing in for both.
+**That key is settable PER POOL, and the DESTINATION pool is the one that governs.** Measured, cloning `billet-images/src@s` into `billet-cache/dst`:
+
+| image pool | cache pool | result |
+|---|---|---|
+| auto | auto | cloned |
+| auto | forced to 1 | `rbd: clone error: (22) Invalid argument` |
+| forced to 1 | auto | cloned |
+
+So the pool a clone lands in decides, and both of billet's pools are landing places — root clones in one, cache generations in the other. Reading one pool and calling it the cluster's answer would have been the same proxy mistake one level down.
+
+That mistake has now been made three times in this one check, which is why it is worth naming rather than just fixing: the floor standing in for the format, one pool standing in for both, and a value validated in one of its two consumers. **The question to ask of any check is not "is this setting right" but "is this the thing that decides".**
 
 rbd also reports WHERE an effective value came from — `pool` for an override set on the pool, `config` for one set cluster-wide — and the two take different commands. Discarding that meant half the refusals recommended `ceph config rm client …`, which does not remove a pool-level override: an operator would run it, see nothing change, and conclude billet was wrong about their cluster. The source decides the remedy.
 
@@ -295,7 +305,7 @@ raise it with `ceph osd set-require-min-compat-client mimic` (which refuses whil
 mimic are connected — `ceph features` lists them)
 ```
 
-Both facts come from `ceph`, which ships in the same package as `rbd`, and both are readable by the scoped `client.billet` identity — verified, because a check that needs admin rights to run is a check that will be run as admin.
+The release floor and the pool replication come from `ceph`; the clone-format override comes from `rbd`, because the scoped identity can read it there and not through `ceph config get`, which answers `EACCES` for a `profile rbd` key. Both binaries ship in ceph-common, so a host that has one has the other. All three reads work as `client.billet` — verified, because a check that needs admin rights to run is a check that will be run as admin.
 
 `billet check` proves the configuration rather than parsing it: it lists both pools as the configured identity, which establishes that the monitors answered, the keyring authenticated and the pools exist. It says out loud that this is a **read** and that launching also needs create, clone, snapshot and remove — the same honesty the ec2 preflight owes about `DescribeInstances` not implying `RunInstances`. A host with no `rbd` command fails the check rather than being reported: only a firecracker node may carry a `node.ceph` block, so this file always describes a machine that is meant to run jobs, and a control plane is unaffected because it has no node section to check.
 
