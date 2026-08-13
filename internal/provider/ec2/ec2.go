@@ -791,6 +791,12 @@ func (p *Provider) imageLayout(ctx context.Context, image string) (imageLayout, 
 	// tier's disk contract could not be met on such an image even if the request
 	// were shaped correctly.
 	//
+	// AN ABSENT TYPE IS ALLOWED THROUGH, and silently, unlike the absent termination
+	// flag a few lines down — billet takes the same action for absent as for "ebs",
+	// so there is no resolved decision to surface, and refusing on absence would
+	// fail every launch fleet-wide the moment any path omits the field. The test
+	// header carries the full argument.
+	//
 	// NOT MEASURED, unlike the block-device behaviour above, and the population is
 	// thin enough that it may stay that way: Amazon publishes ZERO instance-store
 	// AMIs in the region that was measured. So this is a refusal written from the
