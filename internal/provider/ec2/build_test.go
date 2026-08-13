@@ -1,6 +1,8 @@
 package ec2
 
 import (
+	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -38,6 +40,7 @@ func TestTheProvisionScriptContainsWhatAnImageNeeds(t *testing.T) {
 		{"/usr/local/bin/billet-runner", "the entry point a tier names in command:"},
 		{jitEnvVar, "the one variable billet's boot script exports"},
 		{"Runner.Listener --version", "an arch mismatch is otherwise invisible until a job"},
+		{"setpriv --reuid=runner --regid=runner --init-groups \\\n  env HOME=/home/runner", "the check has to take the path a job takes"},
 		{"poweroff", "the only signal that provisioning succeeded"},
 	} {
 		if !strings.Contains(got, want.fragment) {
@@ -66,6 +69,15 @@ func TestNothingRunsAfterTheSuccessSignal(t *testing.T) {
 	// happily on x64, so without this the script reaches poweroff and billet
 	// registers an image whose runner cannot exec — surfacing on somebody's first
 	// job as a machine that booted and registered nothing.
+	// THROUGH THE ENTRY POINT'S OWN INVOCATION, not around it. Using `sudo -u
+	// runner` proved the binary runs and proved nothing about the path a job takes:
+	// a base image with sudo but no setpriv would pass, be imaged, and fail every
+	// job before the runner started.
+	if strings.Contains(got, "sudo -u runner") {
+		t.Error("the validation uses sudo rather than the entry point's own setpriv, so a base " +
+			"image lacking setpriv would build successfully and fail every job")
+	}
+
 	version := strings.Index(got, "Runner.Listener --version")
 	power := strings.LastIndex(got, "poweroff")
 
@@ -208,4 +220,176 @@ func mustScript(t *testing.T) string {
 	}
 
 	return got
+}
+
+// buildFake answers the four calls a build makes, with the stop reason and image
+// state a test wants to see.
+type buildFake struct {
+	stopReason string
+	imageState string
+	describes  int
+}
+
+func (b *buildFake) reply(action string, params url.Values) (int, string) {
+	switch action {
+	case "DescribeImages":
+		// The base-image lookup comes first and must look like a real EBS root; the
+		// later calls are asking whether the NEW image is ready.
+		if params.Get("ImageId.1") == "ami-base" {
+			return http.StatusOK, `<DescribeImagesResponse><imagesSet><item>` +
+				`<imageId>ami-base</imageId><rootDeviceName>/dev/xvda</rootDeviceName>` +
+				`<rootDeviceType>ebs</rootDeviceType><blockDeviceMapping>` +
+				`<item><deviceName>/dev/xvda</deviceName><ebs>` +
+				`<deleteOnTermination>true</deleteOnTermination></ebs></item>` +
+				`<item><deviceName>/dev/sdb</deviceName><ebs>` +
+				`<deleteOnTermination>false</deleteOnTermination></ebs></item>` +
+				`</blockDeviceMapping></item></imagesSet></DescribeImagesResponse>`
+		}
+
+		return http.StatusOK, `<DescribeImagesResponse><imagesSet><item>` +
+			`<imageId>ami-new</imageId><rootDeviceName>/dev/xvda</rootDeviceName>` +
+			`<rootDeviceType>ebs</rootDeviceType>` +
+			`<imageState>` + b.imageState + `</imageState>` +
+			`</item></imagesSet></DescribeImagesResponse>`
+
+	case "RunInstances":
+		return http.StatusOK, `<RunInstancesResponse><instancesSet><item>` +
+			`<instanceId>i-builder</instanceId>` +
+			`<instanceState><name>pending</name></instanceState>` +
+			`</item></instancesSet></RunInstancesResponse>`
+
+	case "DescribeInstances":
+		b.describes++
+
+		return http.StatusOK, `<DescribeInstancesResponse><reservationSet><item>` +
+			`<instancesSet><item><instanceId>i-builder</instanceId>` +
+			`<instanceState><name>stopped</name></instanceState>` +
+			`<stateReason><code>` + b.stopReason + `</code></stateReason>` +
+			`</item></instancesSet></item></reservationSet></DescribeInstancesResponse>`
+
+	case "CreateImage":
+		return http.StatusOK, `<CreateImageResponse><imageId>ami-new</imageId></CreateImageResponse>`
+
+	default:
+		return http.StatusOK, defaultReply(action)
+	}
+}
+
+// ONLY THE GUEST STOPPING ITSELF COUNTS AS SUCCESS.
+//
+// The whole build protocol is "provisioning finished" == "the instance stopped
+// itself". Any other stop — an operator, a cost scheduler on a tag, a host
+// failure — means the disk is whatever provisioning had reached, and imaging it
+// produces a runner image that is not one.
+//
+// An ABSENT reason is refused too, and that is the half the first fix got wrong:
+// AWS marks the code optional, so "" is not "the guest did it", it is "nobody
+// said".
+func TestOnlyAGuestInitiatedStopIsTreatedAsASuccessfulBuild(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		reason string
+		wantOK bool
+	}{
+		{name: "the guest powered itself off", reason: "Client.InstanceInitiatedShutdown", wantOK: true},
+		{name: "somebody called StopInstances", reason: "Client.UserInitiatedShutdown"},
+		{name: "the host stopped it", reason: "Server.ScheduledStop"},
+		{name: "nobody said", reason: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := &buildFake{stopReason: tc.reason, imageState: "available"}
+
+			f := newFakeEC2(t)
+			f.respond = b.reply
+
+			p := newTestProvider(t, f, nil)
+
+			image, err := p.BuildImage(t.Context(), BuildSpec{
+				BaseImage: "ami-base", InstanceType: "c7i.xlarge",
+				Arch: "x64", RunnerVersion: "2.328.0", Name: "test-image",
+			})
+
+			if tc.wantOK {
+				if err != nil {
+					t.Fatalf("a guest-initiated stop was not accepted: %v", err)
+				}
+
+				if image != "ami-new" {
+					t.Errorf("built %q, want ami-new", image)
+				}
+
+				return
+			}
+
+			if err == nil {
+				t.Fatalf("a stop with reason %q produced an image; whatever was on that disk "+
+					"is not a finished runner image", tc.reason)
+			}
+		})
+	}
+}
+
+// EVERY DEVICE THE BASE IMAGE DECLARES IS RESTATED, not just the root.
+//
+// Restating only the root leaves a worse hole than it closes: a base AMI with a
+// non-root device marked to survive leaks a volume on every build, AND
+// CreateImage copies that mapping into the produced image — so every JOB launched
+// from it leaks one too. One careless base image becomes a per-job leak.
+func TestTheBuilderRestatesEveryDeviceTheBaseImageDeclares(t *testing.T) {
+	b := &buildFake{stopReason: "Client.InstanceInitiatedShutdown", imageState: "available"}
+
+	f := newFakeEC2(t)
+	f.respond = b.reply
+
+	p := newTestProvider(t, f, nil)
+
+	if _, err := p.BuildImage(t.Context(), BuildSpec{
+		BaseImage: "ami-base", InstanceType: "c7i.xlarge",
+		Arch: "x64", RunnerVersion: "2.328.0", Name: "test-image",
+	}); err != nil {
+		t.Fatalf("BuildImage: %v", err)
+	}
+
+	got := f.paramsFor(t, "RunInstances")
+
+	// The base image declares /dev/sdb with DeleteOnTermination=false. The builder
+	// must override it, or that disk outlives every build.
+	seen := blockDevices(t, got)
+
+	for _, device := range []string{"/dev/xvda", "/dev/sdb"} {
+		if seen[device] != "true" {
+			t.Errorf("%s went out as %q, want true: the base image asks to keep it, and this "+
+				"client cannot delete volumes", device, seen[device])
+		}
+	}
+
+	// AND THE LAUNCH IS IDEMPOTENT, so a lost response is a recovery rather than a
+	// second billable builder.
+	if got.Get("ClientToken") == "" {
+		t.Error("the builder launch carries no ClientToken; a lost response would buy a " +
+			"second machine on retry")
+	}
+}
+
+// A REGISTERED IMAGE THAT NEVER BECOMES USABLE IS NAMED, because nothing here
+// deletes it and the retry collides on the duplicate name.
+func TestAnImageThatFailsToBecomeAvailableIsNamedInTheError(t *testing.T) {
+	b := &buildFake{stopReason: "Client.InstanceInitiatedShutdown", imageState: "failed"}
+
+	f := newFakeEC2(t)
+	f.respond = b.reply
+
+	p := newTestProvider(t, f, nil)
+
+	_, err := p.BuildImage(t.Context(), BuildSpec{
+		BaseImage: "ami-base", InstanceType: "c7i.xlarge",
+		Arch: "x64", RunnerVersion: "2.328.0", Name: "test-image",
+	})
+	if err == nil {
+		t.Fatal("an image that ended in state \"failed\" was returned as a success")
+	}
+
+	if !strings.Contains(err.Error(), "ami-new") {
+		t.Errorf("the error does not name the image that was left behind: %v", err)
+	}
 }
