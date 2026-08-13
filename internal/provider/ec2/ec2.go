@@ -197,11 +197,25 @@ func New(owner string, cfg config.EC2Config, opts ...Option) (*Provider, error) 
 		opt(p)
 	}
 
-	// AN OPTION MUST NOT BE ABLE TO PRODUCE A PANIC. WithHTTPClient(nil) reaches
-	// the dereference below, and billet bans panic outright — a control plane that
-	// panics drops every in-flight lease.
-	if p.api.http == nil {
+	// AN OPTION MUST NOT BE ABLE TO PRODUCE A PANIC — and this guarded ONE option
+	// while claiming the invariant, which is the shape of mistake this repository
+	// keeps finding: the rule was stated and then applied to the case that
+	// prompted it.
+	//
+	// WithHTTPClient(nil) reaches a dereference here. WithLogger(nil) survives
+	// construction and panics at the first line Launch or Destroy logs, and
+	// WithCredentials(nil) at the first signed call — later, further from the
+	// cause, and on a path holding leases. billet bans panic outright, because a
+	// control plane that panics drops every one of them.
+	switch {
+	case p.api.http == nil:
 		return nil, errors.New("ec2: WithHTTPClient was given no client")
+
+	case p.log == nil:
+		return nil, errors.New("ec2: WithLogger was given no logger")
+
+	case p.api.creds == nil:
+		return nil, errors.New("ec2: WithCredentials was given no credential source")
 	}
 
 	// AFTER THE OPTIONS, so a client supplied by a caller is covered too.

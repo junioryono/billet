@@ -5,11 +5,12 @@
 // machine with no hypervisor — it is not the production story, and it must
 // refuse untrusted pull-request work outright rather than warn about it.
 //
-// It exists now because it is the only backend this project can execute today.
+// It exists because it was the only backend this project could execute at all,
+// and it remains the only one that runs on the machine billet is running on.
 // Firecracker needs Linux and /dev/kvm; tart needs Apple Silicon and a licence
-// carve-out; ec2 needs an account and a network. Writing the whole launch path
-// with nothing able to run it is how the launch path ends up wrong in ways no
-// test notices.
+// carve-out; ec2 exists now but launches somewhere else and needs an account.
+// Writing the whole launch path with nothing able to run it is how the launch
+// path ends up wrong in ways no test notices.
 package docker
 
 import (

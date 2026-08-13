@@ -217,8 +217,19 @@ func (c *client) attempt(ctx context.Context, body string) ([]byte, error) {
 		// a refused redirect that is the TARGET, chosen by whatever answered, with
 		// its query string intact. The sentinel already says everything billet is
 		// willing to say about it.
+		// THE SENTINEL'S OWN MESSAGE, not the bare sentinel. The CheckRedirect
+		// closure names the host it refused — safe by the same rule that governs
+		// everything else here — and returning errRedirected alone threw that away,
+		// so an operator whose VPC endpoint sits behind a redirecting proxy was told
+		// only that a redirect happened. What must not survive is net/http's
+		// *url.Error wrapper, which renders the whole target including its query.
+		var uerr *url.Error
+		if errors.As(err, &uerr) && errors.Is(err, errRedirected) {
+			return nil, uerr.Err
+		}
+
 		if errors.Is(err, errRedirected) {
-			return nil, errRedirected
+			return nil, err
 		}
 
 		return nil, fmt.Errorf("ec2: call the api: %w", err)

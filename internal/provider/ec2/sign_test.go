@@ -2,6 +2,7 @@ package ec2
 
 import (
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -204,5 +205,30 @@ func TestAHeaderValueIsTrimmedAndCollapsedBeforeSigning(t *testing.T) {
 		"Signature=9b0063ced912747efcb5d254101e12b955e6695f9d08a727db7bf16434e34dfa") {
 		t.Errorf("a padded header value signed differently from the trimmed one: %s",
 			padded.Header.Get("Authorization"))
+	}
+}
+
+// SIGV4 CANONICALIZES A SPACE AS %20 AND Go's url.Values.Encode WRITES `+`.
+//
+// Latent for this client, which puts every parameter in the POST body where the
+// payload hash covers the exact bytes — and worth pinning anyway, because the
+// signer is a general thing and the previous comment claimed Go's normalization
+// and the specification "happen to agree". They agree on sorting and on most
+// escapes. On space they do not, and the failure is a 403 that names nothing.
+func TestAQueryStringSpaceIsCanonicalizedTheWayAWSReadsIt(t *testing.T) {
+	u, err := url.Parse("https://ec2.us-west-2.amazonaws.com/?Name=two+words&Other=a%20b")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	got := canonicalQuery(u)
+
+	if strings.Contains(got, "+") {
+		t.Errorf("canonical query %q encodes a space as +, which AWS canonicalizes as %%20 — "+
+			"the signature would cover bytes the service never reconstructs", got)
+	}
+
+	if want := "Name=two%20words&Other=a%20b"; got != want {
+		t.Errorf("canonical query = %q, want %q", got, want)
 	}
 }

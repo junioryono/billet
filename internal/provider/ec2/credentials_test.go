@@ -101,6 +101,14 @@ func TestEveryCredentialTypeIsRedacted(t *testing.T) {
 		SessionToken:    "session-token-value",
 	}
 
+	// A SOURCE THAT HAS FETCHED, which is the case the type-level redaction does
+	// not cover: `cached` is unexported, and fmt cannot call methods on an
+	// unexported field — so `%+v` on this printed the secret in full while every
+	// test here passed, because they all rendered the field's TYPE rather than a
+	// struct holding it privately.
+	fetched := &IMDSCredentials{}
+	fetched.cached = full
+
 	for name, value := range map[string]any{
 		"Credentials":       full,
 		"StaticCredentials": StaticCredentials(full),
@@ -108,6 +116,11 @@ func TestEveryCredentialTypeIsRedacted(t *testing.T) {
 		// the reverse, and a caller holding one is ordinary.
 		"a pointer to Credentials":       &full,
 		"a pointer to StaticCredentials": func() *StaticCredentials { s := StaticCredentials(full); return &s }(),
+
+		// THE SOURCES, not only the credential. Each of these holds one.
+		"a fetched IMDSCredentials": fetched,
+		"a chain holding one":       ChainCredentials{EnvCredentials{}, fetched},
+		"DefaultCredentials":        DefaultCredentials(),
 	} {
 		t.Run(name, func(t *testing.T) {
 			holder := struct {

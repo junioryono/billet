@@ -240,6 +240,39 @@ type IMDSCredentials struct {
 	cached Credentials
 }
 
+// REDACTED LIKE THE CREDENTIAL IT HOLDS, and for a reason that is not obvious:
+// `cached` is UNEXPORTED, and fmt cannot call methods on an unexported field. So
+// without these, `%+v` on a fetched source printed the secret access key and the
+// session token in full — through a struct whose whole job is holding one, and
+// past a redaction that looked complete because the field's TYPE redacts.
+//
+// That is the "struct CONTAINING Credentials" hole the security skill names,
+// found by a reviewer after the type-level redaction was already in place. A type
+// that stores a credential needs its own methods; inheriting the field's is not a
+// thing Go does.
+func (i *IMDSCredentials) String() string { return i.redacted() }
+
+// GoString covers %#v, which does not consult String.
+func (i *IMDSCredentials) GoString() string { return i.redacted() }
+
+// Format catches every verb, so none falls back to the raw struct.
+func (i *IMDSCredentials) Format(f fmt.State, _ rune) {
+	_, _ = io.WriteString(f, i.redacted()) //nolint:errcheck // fmt.State swallows write errors by design
+}
+
+// MarshalJSON keeps the cached secret out of anything that serializes this.
+func (i *IMDSCredentials) MarshalJSON() ([]byte, error) { return json.Marshal(i.redacted()) }
+
+// LogValue is what slog consults, and slog does not consult fmt.
+func (i *IMDSCredentials) LogValue() slog.Value { return slog.StringValue(i.redacted()) }
+
+func (i *IMDSCredentials) redacted() string {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	return "ec2.IMDSCredentials{" + i.cached.redacted() + "}"
+}
+
 // imdsTimeout bounds the metadata lookup.
 //
 // SHORT, because the common failure is that billet is NOT on EC2 at all: the
@@ -433,6 +466,34 @@ func readIMDS(client *http.Client, req *http.Request) (string, error) {
 // because an operator who set AWS_ACCESS_KEY_ID on a machine that also has a role
 // meant the key. The reverse order makes that setting silently do nothing.
 type ChainCredentials []CredentialSource
+
+// ChainCredentials renders as its sources, each of which redacts itself. Without
+// this, printing the chain prints the slice, and printing the slice prints each
+// element through its own methods — which is fine today and stops being fine the
+// moment a source is added that has none. Stating it here means the chain does
+// not depend on that.
+func (c ChainCredentials) String() string {
+	parts := make([]string, 0, len(c))
+	for _, src := range c {
+		parts = append(parts, fmt.Sprintf("%v", src))
+	}
+
+	return "ec2.ChainCredentials[" + strings.Join(parts, " ") + "]"
+}
+
+// GoString covers %#v.
+func (c ChainCredentials) GoString() string { return c.String() }
+
+// Format catches every verb.
+func (c ChainCredentials) Format(f fmt.State, _ rune) {
+	_, _ = io.WriteString(f, c.String()) //nolint:errcheck // fmt.State swallows write errors by design
+}
+
+// MarshalJSON keeps a chain out of anything that serializes it structurally.
+func (c ChainCredentials) MarshalJSON() ([]byte, error) { return json.Marshal(c.String()) }
+
+// LogValue is what slog consults.
+func (c ChainCredentials) LogValue() slog.Value { return slog.StringValue(c.String()) }
 
 // Credentials satisfies CredentialSource.
 func (c ChainCredentials) Credentials(ctx context.Context) (Credentials, error) {
