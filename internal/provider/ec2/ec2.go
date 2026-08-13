@@ -672,27 +672,43 @@ func (p *Provider) warnAboutSurvivingVolumes(image string, out describeImagesRes
 		//
 		// The image is the right place to be looking. AWS states that an EBS volume's
 		// launch-time default is determined by the DeleteOnTermination attribute set
-		// on the AMI, overridable per launch [1] — so the flag read out of
-		// DescribeImages is the one that will actually govern.
+		// on the AMI, overridable per launch [1] — so a flag that IS present in
+		// DescribeImages is the one that will actually govern, and worth reporting.
 		//
-		// Which is also precisely why silence has no answer: the attribute that
-		// decides is the one this image declined to set, and the documentation stops
-		// there. The console-versus-CLI default table on the same page does not fill
-		// the gap — that is about volumes named in a launch REQUEST, not about what a
-		// stored image means by omitting one. Nothing in this package has ever spoken
-		// to a real account either, so there is no observation to fall back on.
+		// ABSENT IS A DIFFERENT QUESTION, AND AWS ANSWERS IT TWICE, DIFFERENTLY.
 		//
-		// So a missing field reads as UNKNOWN, and unknown does not earn a warning: a
-		// warning that fires on innocent images is how an operator learns to ignore
-		// the one that is about something their image really said. A DescribeImages
-		// response recorded from a live account would settle it — a measurement,
-		// which is the only thing that gets to settle a question about somebody
-		// else's API.
+		//   - [2] documents a complete inheritance model: the default is true for the
+		//     root volume and false for ATTACHED volumes, an AMI inherits the setting
+		//     from the instance it was created from, and a launch inherits it from the
+		//     AMI. Followed literally, a non-root mapping that says nothing defaults to
+		//     false — it survives — and every silent mapping here is a leak.
+		//   - [1] carries a table of launch-time defaults whose "data volume, at
+		//     launch, CLI" row says Delete. billet launches through the API. Followed
+		//     literally, the same silent mapping is harmless.
+		//
+		// Both are current AWS documentation. Neither is obviously the more specific
+		// rule, and nothing in this package has ever spoken to a real account to break
+		// the tie — so this is not a gap that a more careful reading closes.
+		//
+		// SILENCE IS THEREFORE A CHOICE, not a conclusion, and it is worth naming which
+		// way it can be wrong: if [2] governs, billet misses a real per-job leak on an
+		// image that never stated the flag. What makes that acceptable for now is that
+		// the case is close to hypothetical — AWS's own DescribeImages examples
+		// materialize the field on EBS mappings — while the opposite error is not: a
+		// warning that fires on every silent image is one operators learn to ignore,
+		// including on the images that DID say false. #53 tracks the real fix, which is
+		// to stop depending on the answer at all by restating every mapping at launch.
+		//
+		// AND NOTE WHAT IS BEING OBSERVED. An omitted element means the RESPONSE
+		// omitted it. Whether the image "sets no attribute" is an inference on top of
+		// that, about a system billet has not measured — the distinction that makes
+		// this whole paragraph "unknown" rather than merely "unspecified".
 		//
 		// Keeping absent distinguishable is what forces the string decode; see
 		// survivesTermination for why that is not free.
 		//
 		// [1]: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/preserving-volumes-on-termination.html
+		// [2]: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/block-device-mapping-concepts.html
 		if bd.DeviceName == root || !survivesTermination(bd.EBS.DeleteOnTermination) {
 			continue
 		}
