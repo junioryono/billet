@@ -3,6 +3,7 @@ package ec2
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -1423,5 +1424,42 @@ func TestARefusedRedirectDoesNotRenderTheTarget(t *testing.T) {
 
 	if strings.Contains(err.Error(), marker) {
 		t.Errorf("the refusal carried the redirect target's query string: %v", err)
+	}
+
+	// AND THE IDENTITY SURVIVES THE WRAPPING, which is what lets retryable tell a
+	// redirect from a transport failure rather than repeating a verdict.
+	if !errors.Is(err, errRedirected) {
+		t.Errorf("the refusal lost its identity on the way out: %v", err)
+	}
+}
+
+// A REFUSED REDIRECT IS NOT "NOT NOW", so it is not retried.
+//
+// retryable treats anything that is not an apiError as a transport failure worth
+// repeating, which is right for a connection that dropped and wrong for this: an
+// endpoint that answers with a redirect will answer with one again, so the retries
+// are three round trips that cannot change the outcome — and each is a signed
+// request handed to whatever is answering.
+func TestARefusedRedirectIsNotRetried(t *testing.T) {
+	elsewhere := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+
+	t.Cleanup(elsewhere.Close)
+
+	f := newFakeEC2(t)
+	f.respond = func(string, url.Values) (int, string) {
+		return http.StatusTemporaryRedirect, ""
+	}
+	f.redirectTo = elsewhere.URL
+
+	p := newTestProvider(t, f, nil)
+	p.api.sleep = func(context.Context, time.Duration) error { return nil }
+
+	if _, err := p.List(t.Context()); err == nil {
+		t.Fatal("a signed request followed a redirect")
+	}
+
+	if got := f.countOf("DescribeInstances"); got != 1 {
+		t.Errorf("a redirecting endpoint was asked %d times; a redirect will not become a "+
+			"non-redirect, so each retry is another signed request for nothing", got)
 	}
 }
