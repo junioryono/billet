@@ -19,6 +19,46 @@ import (
 	"github.com/junioryono/billet/internal/state"
 )
 
+// cancelWhen cancels a running listener once cond holds, rather than after a
+// fixed sleep.
+//
+// A SLEEP IS NOT A SYNCHRONISATION PRIMITIVE, and this is exactly where that bit.
+// Three tests here slept 150-200ms and then cancelled, assuming the listener had
+// finished the work being asserted. That is true on an idle laptop and was not
+// true on a loaded CI runner: two of them failed there while passing twelve
+// consecutive local runs under -race and coverage, which is the shape of a defect
+// that trains you to re-run CI instead of reading it.
+//
+// The watchdog is long on purpose. It bounds a HANG rather than the work — if the
+// condition is ever going to hold it holds in milliseconds, so a generous ceiling
+// costs nothing on a healthy run and still turns a genuine deadlock into a failure
+// with a message instead of a package timeout.
+func cancelWhen(t *testing.T, cancel context.CancelFunc, what string, cond func() bool) {
+	t.Helper()
+
+	go func() {
+		deadline := time.After(30 * time.Second)
+
+		for {
+			if cond() {
+				cancel()
+
+				return
+			}
+
+			select {
+			case <-deadline:
+				t.Errorf("gave up waiting for %s; cancelling anyway so the assertion below "+
+					"reports what actually happened", what)
+				cancel()
+
+				return
+			case <-time.After(time.Millisecond):
+			}
+		}
+	}()
+}
+
 // notDrainingHere is the drain grace for tests that are NOT about draining.
 //
 // Cancelling with a job still running means a drain, and these fake sessions never
@@ -153,10 +193,15 @@ func TestAdvertisingNothingAlsoRefusesWork(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 
-	var delivered atomic.Bool
+	var (
+		delivered atomic.Bool
+		gets      atomic.Int32
+	)
 
 	session := &fakeSession{}
 	session.onGet = func() (*Message, error) {
+		gets.Add(1)
+
 		if delivered.Swap(true) {
 			return nil, ErrNoMessage
 		}
@@ -171,10 +216,11 @@ func TestAdvertisingNothingAlsoRefusesWork(t *testing.T) {
 
 	l := NewListener(a, tiers[0].Label, session, WithMaxCapacity(0))
 
-	go func() {
-		time.Sleep(150 * time.Millisecond)
-		cancel()
-	}()
+	// The delivery has been handed over AND the session has been asked again, so
+	// whatever the listener was going to do with it, it has done.
+	cancelWhen(t, cancel, "the queued delivery to be consumed", func() bool {
+		return delivered.Load() && gets.Load() > 1
+	})
 
 	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) &&
 		!errors.Is(err, context.DeadlineExceeded) {
@@ -325,10 +371,11 @@ func TestRedeliveredAssignmentDoesNotConsumeASecondLease(t *testing.T) {
 
 	session.onPoll = func(int) { running.Store(int32(l.Running())) }
 
-	go func() {
-		time.Sleep(150 * time.Millisecond)
-		cancel()
-	}()
+	// BOTH deliveries consumed and a poll taken after them, which is what makes
+	// `running` an observation rather than a coin flip.
+	cancelWhen(t, cancel, "both deliveries to be consumed and observed", func() bool {
+		return deliveries.Load() > 2 && running.Load() > 0
+	})
 
 	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) &&
 		!errors.Is(err, context.DeadlineExceeded) {
@@ -372,10 +419,9 @@ func TestCompletionReleasesTheLease(t *testing.T) {
 
 	session.onPoll = func(int) { running.Store(int32(l.Running())) }
 
-	go func() {
-		time.Sleep(200 * time.Millisecond)
-		cancel()
-	}()
+	cancelWhen(t, cancel, "the assignment and its completion to be consumed", func() bool {
+		return stage.Load() > 2
+	})
 
 	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) &&
 		!errors.Is(err, context.DeadlineExceeded) {
@@ -2614,8 +2660,12 @@ func TestAStuckCleanupRetryDoesNotStarveTheDestroys(t *testing.T) {
 	t.Parallel()
 
 	const (
-		ttl   = 300 * time.Millisecond
-		grace = 300 * time.Millisecond
+		ttl = 300 * time.Millisecond
+		// GENEROUS ON PURPOSE. The stuck retry below blocks FOREVER, so if it did
+		// consume the destroy budget no grace would rescue this — the assertion is
+		// about which work the budget is spent on, not how much there is. At 300ms
+		// it was racing the machine instead, and lost on a loaded CI runner.
+		grace = 3 * time.Second
 	)
 
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
