@@ -183,7 +183,15 @@ ubuntu-01   $ cat /mnt/fromhost/vm-note
 
 Both directions, on a clone neither machine created alone. **ZFS cannot do this at all** — a `zfs clone` is a dataset on one pool on one host, and there is no operation that hands it to another kernel. That difference is the whole of #23.
 
-It is one physical machine, so this proves the *sharing*, not cross-machine network performance; the second real host will have to be measured when there is one.
+It is one physical machine, so this proves the *sharing*, not cross-machine network performance; the second real host will have to be measured when there is one. `rbd-second` was an LXD VM rather than a container, and the distinction is the whole test: a container shares the host kernel, so `rbd map` inside one would be the host's client under another name. Recreate it with
+
+```bash
+lxc launch ubuntu:26.04 rbd-second --vm -c limits.cpu=4 -c limits.memory=4GiB
+lxc exec rbd-second -- apt-get install -y ceph-common
+# copy /etc/ceph/ceph.conf and the client.billet keyring in, 0600
+```
+
+and delete it again when the property has been re-checked; nothing depends on it existing.
 
 The scoped identity holds on both: `rbd --id billet -p .mgr ls` answers `Operation not permitted` from the host and from the VM. A node that is compromised reaches the two pools it was granted and nothing else.
 
@@ -203,7 +211,20 @@ node:
 
 billet drives Ceph through the `rbd` **command** rather than through librados. The Go binding is cgo, which would end the single static binary and the cross-build matrix in one move — the same reason `mattn/go-sqlite3` is banned — and billet already treats Ceph the way it treats Docker and Tart: an external dependency an operator installs. The cost is a process per call, so `internal/store/ceph` is for operations measured in tens per job and never per block.
 
-`billet check` now proves the configuration rather than parsing it: it lists both pools as the configured identity, which establishes that the monitors answered, the keyring authenticated and the pools exist. It says out loud that this is a **read** and that launching also needs create, clone, snapshot and remove — the same honesty the ec2 preflight owes about `DescribeInstances` not implying `RunInstances`.
+`billet check` now proves the configuration rather than parsing it: it lists both pools as the configured identity, which establishes that the monitors answered, the keyring authenticated and the pools exist. It says out loud that this is a **read** and that launching also needs create, clone, snapshot and remove — the same honesty the ec2 preflight owes about `DescribeInstances` not implying `RunInstances`. A host with no `rbd` command fails the check rather than being reported: only a firecracker node may carry a `node.ceph` block, so this file always describes a machine that is meant to run jobs, and a control plane is unaffected because it has no node section to check.
+
+The failure paths are worth showing, because they are most of the value:
+
+```
+$ billet check --config billet.yaml      # a pool that does not exist
+node.ceph: this host could not read the pools it is configured with, so it could not launch
+anything: ceph: pool "billet-typo" could not be listed as client.billet: exit status 2:
+rbd: listing images failed: (2) No such file or directory
+
+$ billet check --config billet.yaml      # an identity the cluster does not know
+… could not be listed as client.nosuchuser: exit status 13: rbd: listing images failed:
+(13) Permission denied
+```
 
 ## What is still open
 

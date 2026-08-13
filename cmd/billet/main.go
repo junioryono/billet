@@ -1841,19 +1841,19 @@ func checkEC2Credentials(ctx context.Context, cfg *config.EC2Config) error {
 // node that is wrong about any of those validates perfectly and then fails on the
 // first job of the day, with a librados error naming none of them.
 //
-// A MISSING rbd IS REPORTED RATHER THAN FATAL. `billet check` is run on the
-// control plane as often as on a compute host, and on a machine that only holds
-// the ledger the client package is genuinely not needed — refusing there would
-// make the one command an operator reaches for unusable on half the fleet.
+// A MISSING rbd IS FATAL, and the reason is which configs reach here. Only a
+// firecracker node may carry a ceph block, so this file describes a machine that
+// is meant to run jobs — and one without the client package cannot map a single
+// volume. A control plane is not affected: with no node section there is nothing
+// to check. Reporting it and exiting zero would make `billet check` say a host is
+// fine when nothing on it can launch.
 func checkCephCluster(ctx context.Context, cfg *config.CephConfig) error {
 	client, err := ceph.New(*cfg)
 	if err != nil {
 		if errors.Is(err, ceph.ErrNoRBD) {
-			fmt.Printf("ceph     %s + %s, unverified: the rbd command is not installed here, so "+
-				"billet could not reach the cluster (install ceph-common on a host that will "+
-				"run jobs)\n", cfg.ImagePool, cfg.CachePool)
-
-			return nil
+			return fmt.Errorf("node.ceph names %s and %s, but this host has no rbd command, so it "+
+				"cannot map a volume: install the ceph client package (ceph-common on debian and "+
+				"ubuntu): %w", cfg.ImagePool, cfg.CachePool, err)
 		}
 
 		return err

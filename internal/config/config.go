@@ -1540,6 +1540,25 @@ const DefaultCephUser = "billet"
 func CheckCeph(p CephConfig) []error {
 	var errs []error
 
+	// PADDING IS REFUSED HERE RATHER THAN TRIMMED, because this function decides
+	// and the CALLER executes. Load has already normalized, so a padded value
+	// reaching this point came from a caller that did not — and trimming only for
+	// the decision is the exact defect the ec2 block shipped with: `region: "  x  "`
+	// passed the shape check and was then signed with its padding. Every field is
+	// listed, so adding one to the struct without adding it here is visible.
+	for _, f := range []struct{ field, value string }{
+		{"user", p.User},
+		{"image_pool", p.ImagePool},
+		{"cache_pool", p.CachePool},
+		{"conf_path", p.ConfPath},
+		{"keyring_path", p.KeyringPath},
+	} {
+		if f.value != strings.TrimSpace(f.value) {
+			errs = append(errs, fmt.Errorf("node.ceph.%s %q has leading or trailing whitespace; "+
+				"billet passes it to the rbd client exactly as written", f.field, f.value))
+		}
+	}
+
 	// admin IS THE DEFAULT THE rbd COMMAND WOULD PICK, which is what makes naming
 	// it here worth an error rather than a comment. An admin key can delete a pool;
 	// a node holding one turns "this host was compromised" into "the site's storage
@@ -1555,6 +1574,8 @@ func CheckCeph(p CephConfig) []error {
 			"needs to read and clone; create a scoped identity with `ceph auth get-or-create "+
 			"client.%s mon 'profile rbd' osd 'profile rbd pool=<images>, profile rbd "+
 			"pool=<cache>'`", p.User, DefaultCephUser))
+	} else {
+		errs = append(errs, checkCephIdentity(user)...)
 	}
 
 	errs = append(errs, checkCephPool("image_pool", p.ImagePool)...)
@@ -1576,6 +1597,36 @@ func CheckCeph(p CephConfig) []error {
 	return errs
 }
 
+// checkCephIdentity refuses a RADOS identity that would not survive being placed
+// in an argv.
+//
+// THE SAME RULE AS A POOL NAME, and it exists because the first version had it
+// only for pools. The identity is passed as the value of `--id`, so one beginning
+// with a dash is read by rbd as an option rather than as a name — and billet execs
+// rbd directly, where nothing quotes a value out of being a flag. `client.` is
+// refused as a prefix because rbd adds it: `--id client.billet` authenticates as
+// `client.client.billet`, which fails with a permission error naming an entity the
+// operator never created.
+func checkCephIdentity(user string) []error {
+	if strings.HasPrefix(user, "-") {
+		return []error{fmt.Errorf("node.ceph.user %q begins with a dash, which the rbd client "+
+			"reads as a flag rather than as an identity", user)}
+	}
+
+	if strings.HasPrefix(user, "client.") {
+		return []error{fmt.Errorf("node.ceph.user %q carries the `client.` prefix, which rbd adds "+
+			"itself: billet would authenticate as client.%s, which is not an entity your cluster "+
+			"has", user, user)}
+	}
+
+	if strings.ContainsFunc(user, unicode.IsSpace) || strings.Contains(user, "/") {
+		return []error{fmt.Errorf("node.ceph.user %q contains whitespace or a slash, which is not "+
+			"part of a ceph entity name and will not round-trip through the client", user)}
+	}
+
+	return nil
+}
+
 // checkCephPool refuses a pool name billet cannot address.
 //
 // PINNED TO WHAT THE rbd CLIENT DOES, not to a reading of Ceph's naming rules.
@@ -1595,11 +1646,18 @@ func checkCephPool(field, pool string) []error {
 	}{
 		{"/", "billet addresses an image as pool/image, so a slash points at a different pool"},
 		{"@", "rbd reads @ as the start of a snapshot name"},
-		{" ", "a space is not part of a pool name and will not round-trip through the client"},
 	} {
 		if strings.Contains(pool, bad.what) {
 			return []error{fmt.Errorf("node.ceph.%s %q contains %q: %s", field, pool, bad.what, bad.reason)}
 		}
+	}
+
+	// ANY WHITESPACE, not the ASCII space alone. A tab inside a quoted YAML scalar
+	// survives the parser and would be passed to rbd verbatim, and checking for
+	// " " admits it.
+	if strings.ContainsFunc(pool, unicode.IsSpace) {
+		return []error{fmt.Errorf("node.ceph.%s %q contains whitespace, which is not part of a "+
+			"pool name and will not round-trip through the client", field, pool)}
 	}
 
 	if strings.HasPrefix(pool, ".") {
