@@ -159,7 +159,7 @@ func New(owner string, cfg config.EC2Config, opts ...Option) (*Provider, error) 
 
 	endpoint := cfg.Endpoint
 	if endpoint == "" {
-		endpoint = "https://ec2." + cfg.Region + ".amazonaws.com/"
+		endpoint = defaultEndpointFor(cfg.Region)
 	}
 
 	// THE EFFECTIVE ENDPOINT, whether it was configured or derived. Checking only
@@ -625,19 +625,32 @@ func shellCommand(argv []string) (string, error) {
 // state.
 //
 // IT RETURNS WHEN THE REQUEST IS ACCEPTED, NOT WHEN THE MACHINE IS GONE, and that
-// is a real difference from the container backend, where `docker rm --force`
-// finishes the job. An instance sits in `shutting-down` for a while afterwards.
+// is a real difference from the container backend where `docker rm --force`
+// finishes the job. An instance sits in `shutting-down` for a minute or two
+// afterwards, and the listener treats a successful Destroy as its proof that the
+// compute is gone before it releases the lease.
 //
-// What makes that safe is the state filter above: `shutting-down` is one of the
-// states List asks for, and runningState counts it as running — so the instance
-// stays in this host's INVENTORY until EC2 has finished with it. What the control
-// plane does with that inventory is Reconcile's business, and the rule it applies
-// there is the one custody follows everywhere else: capacity comes back when the
-// compute is provably gone, not when billet asked for it to go.
+// SO THE LETTER OF THAT CONTRACT IS NOT MET HERE, AND ITS PURPOSE IS. The rule
+// exists so a second job is not placed on a machine the first is still running
+// on — the listener's own words are that the budget would otherwise be "satisfied
+// on paper and overcommitted in fact". On a shared host that is a physical
+// hazard: an undestroyed container really is still holding CPU and memory that
+// something else has just been promised. Here there is no shared host. Terminate
+// is irreversible, the instance will never execute another instruction of that
+// job, and the next launch is a different machine entirely — so nothing is
+// double-booked. What briefly exceeds the node's declared budget is the BILL, by
+// one instance for the length of a shutdown, which is a cost artifact rather than
+// a capacity one (see #44).
 //
-// Waiting here instead would be worse: a node executes one command at a time, so
-// blocking teardown on a poll would stall every other launch and destroy behind
-// it.
+// WAITING WOULD BE WORSE, and that is why this is not simply fixed: a node
+// executes one command at a time, so blocking teardown on a poll for the minute
+// or two AWS takes would stall every launch queued behind it — trading a bounded
+// cost overshoot for a bounded outage.
+//
+// The instance stays in this host's inventory throughout, because `shutting-down`
+// is one of the states List asks for and runningState counts it as running. That
+// does not un-release the lease, which is already terminal; it means the sweep
+// sees the instance, calls Destroy again, and finds it idempotent.
 func (p *Provider) Destroy(ctx context.Context, id string) error {
 	if id == "" {
 		return errors.New("ec2: destroy needs an instance id")
@@ -841,6 +854,25 @@ func runningState(state string) bool {
 	default:
 		return true
 	}
+}
+
+// defaultEndpointFor derives the regional endpoint when none was configured.
+//
+// THE SUFFIX IS NOT THE SAME IN EVERY PARTITION. The region rule deliberately
+// admits partitions billet has never run in, so it accepts `cn-north-1` — and the
+// commercial suffix would then derive `ec2.cn-north-1.amazonaws.com`, a host that
+// does not exist. AWS China is reached at `amazonaws.com.cn`. GovCloud is not a
+// special case: it uses the commercial suffix.
+//
+// A config can always override this outright, and one in a partition billet has
+// not been taught about should.
+func defaultEndpointFor(region string) string {
+	suffix := "amazonaws.com"
+	if strings.HasPrefix(region, "cn-") {
+		suffix = "amazonaws.com.cn"
+	}
+
+	return "https://ec2." + region + "." + suffix + "/"
 }
 
 // errRedirected marks a refusal to follow a redirect, so the api boundary can
