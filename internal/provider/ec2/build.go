@@ -404,6 +404,24 @@ func sleepFor(ctx context.Context, d time.Duration) error {
 	}
 }
 
+// privilegeDrop is how the runner stops being root, written ONCE.
+//
+// The build validation and the job entry point both need this exact invocation,
+// and writing it twice is how a change to one silently stops being true of the
+// other. That is not hypothetical: a hand-written second copy meant deleting
+// --init-groups from the entry point left the validation passing and every job
+// failing.
+//
+// --init-groups is load-bearing rather than decorative — setpriv requires a
+// supplementary-group option when it sets the primary GID, and without it the
+// runner never gets the docker group either.
+//
+// The environment belongs to the same contract: setpriv does not reset it, so
+// without HOME the runner inherits cloud-init's HOME=/root, registers fine, and
+// then fails every job step that writes to $HOME.
+const privilegeDrop = "setpriv --reuid=runner --regid=runner --init-groups \\\n" +
+	"  env HOME=/home/runner USER=runner LOGNAME=runner"
+
 // provisionScript is what the builder runs, and it is the whole definition of
 // what a billet runner image contains.
 //
@@ -485,21 +503,16 @@ func provisionScript(spec BuildSpec) (string, error) {
 	b.WriteString("  i=$((i+1)); sleep 1\n")
 	b.WriteString("done\n")
 
-	b.WriteString("exec setpriv --reuid=runner --regid=runner --init-groups \\\n")
-	// THE CONSTANT, NOT THE STRING. The boot script that exports this uses
-	// jitEnvVar; if this side spelled it out and somebody renamed the constant,
-	// build.go and its tests would stay green while producing the failure this
-	// whole issue exists to prevent — a runner that starts, finds no registration,
-	// exits, and leaves a machine looking perfectly healthy.
+	// ONE INVOCATION, SHARED WITH THE VALIDATION BELOW, so a change here cannot
+	// leave the check passing while every job fails. See privilegeDrop.
 	//
-	// HOME IS SET TOO, and it is a separate silent failure. setpriv does not reset
-	// the environment, so the runner would inherit cloud-init's HOME=/root — a
-	// directory the runner user cannot write. Registration succeeds, because the
-	// runner's own directory is owned correctly; then job steps fail oddly on
-	// anything that touches $HOME, which is the docker CLI's config, ~/.gitconfig,
-	// and a large fraction of the actions ecosystem.
-	b.WriteString("  env " + jitEnvVar + "=\"$" + jitEnvVar + "\" \\\n")
-	b.WriteString("  HOME=/home/runner USER=runner LOGNAME=runner \\\n")
+	// THE JIT VARIABLE IS THE CONSTANT, NOT A STRING. The boot script that exports
+	// it uses jitEnvVar; spelled out here, a rename would leave this file and its
+	// tests green while producing the failure this whole issue exists to prevent —
+	// a runner that starts, finds no registration, exits, and leaves a machine
+	// looking perfectly healthy.
+	b.WriteString("exec " + privilegeDrop + " \\\n")
+	b.WriteString("  " + jitEnvVar + "=\"$" + jitEnvVar + "\" \\\n")
 	b.WriteString("  /opt/actions-runner/run.sh\n")
 	b.WriteString("BILLETEOF\n")
 	b.WriteString("chmod 0755 /usr/local/bin/billet-runner\n")
