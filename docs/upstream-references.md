@@ -123,3 +123,13 @@ Two rules learned building it:
   is why that phase carries a conformance suite.
 - `github-aws-runners/terraform-aws-github-runner` (MIT) — the proven shape for webhook-mode,
   instance-per-job runners on AWS. Reference for P12 if `JobSource` webhook mode is ever built.
+- **Ceph (LGPL-2.1) — a service billet drives, not code it takes.** The interface is the `rbd`
+  COMMAND, deliberately: `go-ceph` is cgo over librados, which would end the single static binary and
+  the cross-build matrix in one move — the same reason `mattn/go-sqlite3` is banned. So Ceph is an
+  external dependency an operator installs, like Docker and Tart, and `internal/store/ceph` builds an
+  argv. What that costs is a process per call, which is why it is for operations measured in tens per
+  job and never per block. **Two behaviours are pinned to measurement rather than to the docs**, and
+  both are in `docs/adr-003-ceph-rbd.md`: Ceph's own snapshot page still tells you to
+  `rbd snap protect`, which on a clone-v2 cluster is unnecessary and on a clone-v1 one makes the
+  snapshot undeletable while any clone is live; and the `rbd` man page lists `journaling` among the
+  features the kernel client supports, while `rbd device map` refuses an image that has it.

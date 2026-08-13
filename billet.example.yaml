@@ -2,23 +2,27 @@
 #
 # THIS FILE DOES NOT RUN AS SHIPPED. It describes the intended deployment, which
 # is Firecracker, and the Firecracker provider is not built — `billet node`
-# refuses it. Two edits HERE make it start today, and both are needed —
+# refuses it. THREE edits HERE make it start today, and all three are needed —
 # the README's quickstart lists what else the file needs (the github: block, a
 # writable server.state_dir) and the Docker daemon it assumes:
 #
 #   1. `provider: firecracker` -> `provider: docker`, in the node section and in
 #      every tier.
-#   2. `image:` -> a Docker image that contains the GitHub runner, for example
+#   2. Delete the `ceph:` block below. It is REFUSED rather than ignored on any
+#      backend that cannot attach a block device, so leaving it in place means
+#      the config does not load at all — see the block's own comment for why a
+#      storage section nothing will read is an error.
+#   3. `image:` -> a Docker image that contains the GitHub runner, for example
 #      `ghcr.io/actions/actions-runner:latest`. The image name is passed
 #      straight to `docker run`, so `ubuntu-2404-x64` below is a golden-image
 #      name for Firecracker and is not pullable.
 #
-# The first edit alone gets you a config that validates and a server that
-# starts, and every job then fails to launch — which is why the second is here.
+# Edits 1 and 2 together get you a config that validates and a server that
+# starts, and every job then fails to launch — which is why the third is here.
 #
 # The Docker provider reads vcpu, memory and shm; it ignores disk and
-# warm_pool, and the whole `firecracker:` block is unused. Docker shares the
-# host kernel and is for trials rather than for untrusted code.
+# warm_pool, and the whole `firecracker:` block is unused — UNUSED, not refused,
+# which is the difference between it and `ceph:`.
 #
 # This example is the single-machine deployment, which is TWO PROCESSES reading
 # this one file:
@@ -83,8 +87,8 @@ server:
   # this is what stops concurrent tiers from collectively overcommitting the box.
   #
   # Sizing: leave headroom for the host. On a 64-core/128-thread, 512 GB machine,
-  # 120 vCPU and 480GiB reserves 8 threads and 32 GB for the OS, ZFS ARC, and
-  # billet itself. Note that 128 SMT threads are not 128 core-equivalents —
+  # 120 vCPU and 480GiB reserves 8 threads and 32 GB for the OS, the Ceph OSDs,
+  # and billet itself. Note that 128 SMT threads are not 128 core-equivalents —
   # measure real per-job-class throughput before raising this.
   # See docs/reference-hardware.md for how tier shapes map onto a real topology.
   max_vcpu: 120
@@ -224,15 +228,45 @@ node:
     # docs/reference-hardware.md — billet pins to the version the host has,
     # rather than asking a host to match a version billet prefers.
     kernel_image: /var/lib/billet/images/vmlinux
-    # Backs golden images, per-job root clones, and cache volumes via CoW.
-    #
-    # BEING REPLACED BY CEPH RBD (#23). A ZFS snapshot exists only on this
-    # machine, so a cache written here belongs to this host and to no other —
-    # which is the storage-specific reason billet is a one-machine product —
-    # capacity, placement and teardown are the others. Set it today; expect this key
-    # to change once the storage layer lands.
-    zfs_pool: tank
     bridge: br0
+
+  # THE SITE'S STORAGE. Golden images, the per-job root clone taken from one, and
+  # every cache in the plane are RBD images in a Ceph cluster on the nodes' own
+  # NVMe.
+  #
+  # A SIBLING OF firecracker RATHER THAN A FIELD IN IT, because storage belongs to
+  # the SITE: two hosts in one place map the same pool, which is the whole point of
+  # replacing ZFS. A ZFS clone exists only on the machine that took it, so a cache
+  # written to one pinned every repository to the host that first built it.
+  #
+  # Required for `provider: firecracker` and refused for every other backend — a
+  # container has nowhere to attach a block device, and an ec2 node's compute runs
+  # in a region that cannot reach this cluster. docs/adr-003-ceph-rbd.md is how the
+  # cluster is built and why it is not in the cloud.
+  ceph:
+    # Where the monitors are. Omit for Ceph's own search path, which finds
+    # /etc/ceph/ceph.conf — what `cephadm bootstrap` writes.
+    #
+    # conf_path: /etc/ceph/ceph.conf
+
+    # WHO THIS MACHINE IS, without the `client.` prefix. Defaults to `billet`, and
+    # `admin` is REFUSED: an admin key can delete a pool, so a node holding one
+    # turns a compromised host into a deleted site. Create a scoped identity:
+    #
+    #   ceph auth get-or-create client.billet \
+    #     mon 'profile rbd' \
+    #     osd 'profile rbd pool=billet-images, profile rbd pool=billet-cache'
+    #
+    # user: billet
+    # keyring_path: /etc/ceph/ceph.client.billet.keyring
+
+    # TWO POOLS, and one name for both is refused. Not for tuning — RBD's object
+    # size is a per-IMAGE property, so the reason ZFS wanted two datasets with
+    # different recordsizes does not survive the move. It is blast radius: a cache
+    # is thrown away and a golden image is not, so eviction has to be able to walk
+    # one pool without being able to reach the other.
+    image_pool: billet-images
+    cache_pool: billet-cache
 
   # THE CLOUD BACKEND, for `provider: ec2`. One instance per job, in one subnet.
   #

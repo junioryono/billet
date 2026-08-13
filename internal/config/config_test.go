@@ -185,7 +185,9 @@ node:
   state_dir: /var/lib/billet/node
   firecracker:
     kernel_image: /var/lib/billet/vmlinux
-    zfs_pool: tank
+  ceph:
+    image_pool: billet-images
+    cache_pool: billet-cache
 tiers:
   - label: billet-4vcpu-ubuntu-2404
     provider: firecracker
@@ -494,11 +496,28 @@ func TestDuplicateTierLabelRejected(t *testing.T) {
 	}
 }
 
-func TestFirecrackerNodeRequiresKernelAndPool(t *testing.T) {
+func TestFirecrackerNodeRequiresItsOwnSection(t *testing.T) {
 	body := strings.Replace(validConfig,
-		"  firecracker:\n    kernel_image: /var/lib/billet/vmlinux\n    zfs_pool: tank\n", "", 1)
+		"  firecracker:\n    kernel_image: /var/lib/billet/vmlinux\n", "", 1)
 	if _, err := Load(writeConfig(t, body)); err == nil {
 		t.Fatal("Load accepted a firecracker node with no firecracker section")
+	}
+
+	// AND THE SECTION IS NOT ENOUGH ON ITS OWN. Deleting the kernel_image check
+	// leaves the case above green, because a missing section fails for a different
+	// reason — and a firecracker node with no kernel has nothing to boot. The field
+	// is EMPTIED rather than removed: removing it leaves the mapping with no keys,
+	// which yaml decodes as a nil section and takes the branch above.
+	empty := strings.Replace(validConfig,
+		"    kernel_image: /var/lib/billet/vmlinux\n", "    kernel_image: \"\"\n", 1)
+
+	_, err := Load(writeConfig(t, empty))
+	if err == nil {
+		t.Fatal("Load accepted a firecracker section naming no kernel image")
+	}
+
+	if !strings.Contains(err.Error(), "kernel_image is required") {
+		t.Errorf("the error does not name the missing field: %v", err)
 	}
 }
 
