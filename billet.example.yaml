@@ -335,11 +335,11 @@ tiers:
   # serve the tier and have room — so a job goes to the cloud only when home is
   # full, rather than to whichever machine happened to ask first.
   #
-  # Both halves of this example are now buildable — `ec2` launches one instance
-  # per job (see the ec2: block above), and `firecracker` is the one still
-  # missing. What has NOT happened is anybody running it against a real account:
-  # every test drives a fake EC2 API, so treat the fallback as written rather
-  # than proven (#32).
+  # `ec2` is built and `firecracker` is not, so this exact pair cannot be used
+  # yet — swap firecracker for docker to try the shape. And nobody has run the
+  # cloud half against a real account: every test drives a fake EC2 API, and
+  # nothing builds the AMI it needs (#42), so treat the fallback as written
+  # rather than proven (#32).
   #
   # - label: billet-8vcpu-ubuntu-2404
   #   providers: [firecracker, ec2]   # instead of `provider: firecracker`

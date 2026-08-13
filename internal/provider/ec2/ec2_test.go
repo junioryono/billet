@@ -1490,3 +1490,124 @@ func TestTheDerivedEndpointFollowsThePartition(t *testing.T) {
 		})
 	}
 }
+
+// AN INSTANCE PROFILE IS A CREDENTIAL, AND UNTRUSTED WORK MUST NOT BE HANDED ONE.
+//
+// This backend may run fork pull-request code because an instance is a real
+// isolation boundary. That boundary does not extend to IMDS: a workflow step runs
+// directly ON the instance, not in a container, so the one-hop metadata limit —
+// which stops a container reaching it — stops nothing here. A fork's job with an
+// instance profile attached can read the role's temporary credentials straight
+// out of the metadata service and take them away.
+func TestUntrustedWorkIsNotHandedAnInstanceProfile(t *testing.T) {
+	f := newFakeEC2(t)
+	p := newTestProvider(t, f, func(c *config.EC2Config) {
+		c.InstanceProfile = "billet-runner"
+		c.UntrustedSecurityGroupIDs = []string{"sg-fork"}
+	})
+
+	spec := validSpec()
+	spec.Trust = provider.TrustUntrusted
+
+	if _, err := p.Launch(t.Context(), spec); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	if got := f.paramsFor(t, "RunInstances").Get("IamInstanceProfile.Name"); got != "" {
+		t.Errorf("a fork's job was given the %q instance profile; its steps can read the "+
+			"role's credentials out of IMDS", got)
+	}
+}
+
+// And trusted work still gets it, or the option would mean nothing.
+func TestTrustedWorkStillGetsTheInstanceProfile(t *testing.T) {
+	f := newFakeEC2(t)
+	p := newTestProvider(t, f, func(c *config.EC2Config) { c.InstanceProfile = "billet-runner" })
+
+	if _, err := p.Launch(t.Context(), validSpec()); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	if got := f.paramsFor(t, "RunInstances").Get("IamInstanceProfile.Name"); got != "billet-runner" {
+		t.Errorf("IamInstanceProfile.Name = %q, want the configured profile", got)
+	}
+}
+
+// THE SERVICE'S OWN MESSAGE IS NOT BILLET'S TO REPEAT WHEN IT MIGHT CARRY THE
+// REGISTRATION.
+//
+// RunInstances sends the JIT config as UserData, and an API error renders the
+// service's <Message> verbatim into an error that travels back through the node's
+// command result and into logs. AWS is unlikely to echo a rejected parameter that
+// large — but the endpoint is configurable, a proxy sits in some deployments, and
+// the JIT config is a live runner registration until it is consumed. Whether the
+// echo is likely is not the question; whether the credential can travel is.
+func TestALaunchErrorCannotCarryTheRegistration(t *testing.T) {
+	f := newFakeEC2(t)
+	spec := validSpec()
+
+	f.respond = func(action string, params url.Values) (int, string) {
+		if action != "RunInstances" {
+			return http.StatusOK, defaultReply(action)
+		}
+
+		// The service echoes the parameter it rejected, user data included.
+		return http.StatusBadRequest, `<Response><Errors><Error>` +
+			`<Code>InvalidParameterValue</Code><Message>Invalid value '` +
+			params.Get("UserData") + `' for parameter UserData</Message>` +
+			`</Error></Errors></Response>`
+	}
+
+	p := newTestProvider(t, f, nil)
+	p.api.sleep = func(context.Context, time.Duration) error { return nil }
+
+	_, err := p.Launch(t.Context(), spec)
+	if err == nil {
+		t.Fatal("a rejected launch reported success")
+	}
+
+	// BOTH FORMS. The first version looked only for the raw registration and
+	// passed while the error carried the BASE64 user data containing it — which is
+	// a disclosure with one decode step in front of it, and exactly the kind of
+	// pass-for-the-wrong-reason this project keeps finding.
+	script, err2 := p.userData(spec)
+	if err2 != nil {
+		t.Fatalf("userData: %v", err2)
+	}
+
+	for name, secret := range map[string]string{
+		"the registration": spec.JITConfig,
+		"the boot script":  base64.StdEncoding.EncodeToString([]byte(script)),
+	} {
+		if strings.Contains(err.Error(), secret) {
+			t.Errorf("the launch error carries %s: %v", name, err)
+		}
+	}
+
+	// The diagnosis still has to survive, or this trade is a bad one.
+	if !strings.Contains(err.Error(), "InvalidParameterValue") {
+		t.Errorf("the error lost the api's own code, which is what an operator acts on: %v", err)
+	}
+}
+
+// EC2 CAPS USER DATA AT 16 KiB, and a tier's command has no bound of its own.
+//
+// Refused BEFORE the launch, because by the time RunInstances rejects it a JIT
+// registration has already been minted against GitHub — and a launch that fails
+// ambiguously holds the lease in custody, since absence from one Find is not proof
+// nothing started. A local size check turns all of that into an ordinary refusal.
+func TestABootScriptTooLargeForEC2IsRefusedLocally(t *testing.T) {
+	f := newFakeEC2(t)
+	p := newTestProvider(t, f, nil)
+
+	spec := validSpec()
+	spec.Command = []string{"/bin/sh", "-c", strings.Repeat("x", 17<<10)}
+
+	if _, err := p.Launch(t.Context(), spec); err == nil {
+		t.Fatal("a boot script larger than EC2 accepts was sent anyway")
+	}
+
+	if n := f.countOf("RunInstances"); n != 0 {
+		t.Errorf("a launch that cannot succeed still called RunInstances %d times", n)
+	}
+}

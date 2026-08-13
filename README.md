@@ -205,7 +205,7 @@ built. What works **today**:
 | Release pipeline | Tagged releases with checksums, `.deb`/`.rpm` with systemd units, and the install script — **built and never yet run: there are no tags, so no release exists to install.** Build from source until there is one |
 | Multi-backend tiers | One label can name several providers, and the preference ORDER decides: the control plane picks the host when the job is admitted, walking the tier's list most-preferred-first. With docker and ec2 both built, `[docker, ec2]` is now a fallback that can actually be taken — on paper. The bare-metal half of the intended pair is still Firecracker ([#32](https://github.com/junioryono/billet/issues/32)) |
 
-**Not built:** Firecracker and Apple Silicon providers; the cache; sticky disks; observability; the dashboard. A **cost policy** is now mostly a consequence rather than a feature — an ec2 node has to declare `max_vcpu` and `max_memory`, the allocator never buys past them, and provider order decides that home fills first — but nothing yet reacts to a PRICE ([#44](https://github.com/junioryono/billet/issues/44)), and nothing drains an instance that AWS is about to reclaim ([#41](https://github.com/junioryono/billet/issues/41)).
+**Not built:** Firecracker and Apple Silicon providers; the cache; sticky disks; observability; the dashboard. A **cost policy** is closer to a consequence than a feature — an ec2 node declares `max_vcpu` and `max_memory`, and provider order decides that home fills first — but it is not yet a spending limit: the allocator charges a job the size its TIER asked for, while the backend buys the first declared shape that fits, so a 2-vCPU tier backed by an 8-vCPU shape can spend four times the declared budget ([#47](https://github.com/junioryono/billet/issues/47)). Nothing reacts to a price either ([#44](https://github.com/junioryono/billet/issues/44)), and nothing drains an instance AWS is about to reclaim ([#41](https://github.com/junioryono/billet/issues/41)).
 
 **billet runs a fleet, with one thing still missing before it is worth having one.** Capacity is a
 figure per machine, so hosts of different sizes can be described and a tier advertises only what its
@@ -461,7 +461,7 @@ rewriting placement at the same time.
 | P5 — Docker layer cache, registry mirrors, container baseline | ⬜ [#27](https://github.com/junioryono/billet/issues/27) [#28](https://github.com/junioryono/billet/issues/28) |
 | P6 — observability, SSH-into-a-job | ⬜ |
 | P7 — Apple Silicon provider (macOS + Linux arm64) | ⬜ |
-| P8 — EC2 provider, cloud-hosted control plane, provider failover | ⬜ [#32](https://github.com/junioryono/billet/issues/32) |
+| P8 — EC2 provider, cloud-hosted control plane, provider failover | 🚧 the provider is built and has never run against a real account; nothing builds the AMI it needs ([#42](https://github.com/junioryono/billet/issues/42)) [#32](https://github.com/junioryono/billet/issues/32) |
 | P9 — per-node capacity, admission-time placement, addressed teardown. **A prerequisite of P8**, not a sequel: failover needs the decision made before the work is accepted | ✅ [#21](https://github.com/junioryono/billet/issues/21) [#30](https://github.com/junioryono/billet/issues/30) [#31](https://github.com/junioryono/billet/issues/31) |
 | P10 — dashboard, signed releases, public launch | 🚧 releases and packages done; signing and the dashboard are not |
 | P11 — AWS Terraform | ⬜ |

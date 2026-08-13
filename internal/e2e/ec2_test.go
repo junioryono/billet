@@ -234,21 +234,41 @@ func (f *fakeCloud) bootScript() string {
 	return f.userData
 }
 
-// cloudJIT mints registrations without a GitHub organization.
-type cloudJIT struct{}
+// cloudJIT mints registrations without a GitHub organization, and COUNTS them.
+//
+// The count is the point. Both refusal tests below assert that nothing was
+// launched, and that alone would stay green if the refusal moved to AFTER the
+// registration was minted — which is the failure their comments claim to prevent:
+// a live runner registration on GitHub with nothing to consume it, one per
+// refused pull request, accumulating quietly.
+type cloudJIT struct {
+	mu     sync.Mutex
+	minted int
+}
+
+func (j *cloudJIT) count() int {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+
+	return j.minted
+}
 
 type cloudRegistration struct{ name string }
 
 func (r cloudRegistration) Config() string     { return "jit-for-" + r.name }
 func (r cloudRegistration) RunnerName() string { return r.name }
 
-func (cloudJIT) Describe(context.Context, string, string) (*node.Set, []string, error) {
+func (*cloudJIT) Describe(context.Context, string, string) (*node.Set, []string, error) {
 	return &node.Set{ID: 7, Name: ec2Tier}, nil, nil
 }
 
-func (cloudJIT) JITConfig(
+func (j *cloudJIT) JITConfig(
 	_ context.Context, _ int, runnerName, _ string,
 ) (node.Registration, error) {
+	j.mu.Lock()
+	j.minted++
+	j.mu.Unlock()
+
 	return cloudRegistration{name: runnerName}, nil
 }
 
@@ -257,6 +277,7 @@ type cloudStack struct {
 	alloc  *alloc.Allocator
 	runner *node.Runner
 	cloud  *fakeCloud
+	jit    *cloudJIT
 	tier   config.Tier
 }
 
@@ -314,10 +335,13 @@ func newCloudStack(t *testing.T) *cloudStack {
 		t.Fatalf("ec2.New: %v", err)
 	}
 
+	jit := &cloudJIT{}
+
 	return &cloudStack{
 		alloc:  a,
-		runner: node.New(a, host, cloudJIT{}, prov, nil),
+		runner: node.New(a, host, jit, prov, nil),
 		cloud:  cloud,
+		jit:    jit,
 		tier:   tier,
 	}
 }
@@ -472,6 +496,12 @@ func TestACloudNodeRefusesALeaseItWasNotPlacedFor(t *testing.T) {
 	if _, started := s.cloud.idOf(provider.InstanceName(lease.ID)); started {
 		t.Error("a refused launch still started an instance")
 	}
+
+	// AND BEFORE ANYTHING WAS MINTED. A registration with nothing to consume it is
+	// an orphan on GitHub that billet never cleans up.
+	if n := s.jit.count(); n != 0 {
+		t.Errorf("a refused launch minted %d runner registration(s)", n)
+	}
 }
 
 // FORK PULL-REQUEST WORK IS REFUSED UNTIL IT HAS A NETWORK OF ITS OWN, and the
@@ -493,5 +523,11 @@ func TestUntrustedWorkDoesNotReachTheCloudWithoutItsOwnNetwork(t *testing.T) {
 
 	if _, started := s.cloud.idOf(provider.InstanceName(lease.ID)); started {
 		t.Error("a refused launch still started an instance")
+	}
+
+	// AND BEFORE ANYTHING WAS MINTED, which is the half that matters most for a
+	// pull request: every refused one would otherwise leave a live registration.
+	if n := s.jit.count(); n != 0 {
+		t.Errorf("a refused launch minted %d runner registration(s)", n)
 	}
 }

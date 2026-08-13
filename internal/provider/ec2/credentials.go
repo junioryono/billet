@@ -147,8 +147,27 @@ func (EnvCredentials) Credentials(context.Context) (Credentials, error) {
 	id := strings.TrimSpace(os.Getenv("AWS_ACCESS_KEY_ID"))
 	secret := strings.TrimSpace(os.Getenv("AWS_SECRET_ACCESS_KEY"))
 
-	if id == "" || secret == "" {
+	// NOTHING SET IS AN ABSENCE; HALF SET IS A MISTAKE, and the difference decides
+	// which AWS account billet acts as.
+	//
+	// Reporting an absence for a half-configured environment lets the chain fall
+	// through to the instance role — so a typo in one variable silently switches
+	// billet to a DIFFERENT and often more privileged identity, and it launches and
+	// terminates machines as that one. An operator who set these had said which
+	// identity they meant, so the answer is to stop and say which half is missing.
+	switch {
+	case id == "" && secret == "":
 		return Credentials{}, errNoCredentials
+
+	case id == "":
+		return Credentials{}, errors.New("ec2: AWS_SECRET_ACCESS_KEY is set and " +
+			"AWS_ACCESS_KEY_ID is not; refusing to fall back to this instance's role, which " +
+			"would run billet as a different aws identity than the one you configured")
+
+	case secret == "":
+		return Credentials{}, errors.New("ec2: AWS_ACCESS_KEY_ID is set and " +
+			"AWS_SECRET_ACCESS_KEY is not; refusing to fall back to this instance's role, which " +
+			"would run billet as a different aws identity than the one you configured")
 	}
 
 	return Credentials{
@@ -375,6 +394,20 @@ func (c ChainCredentials) Credentials(ctx context.Context) (Credentials, error) 
 		creds, err := src.Credentials(ctx)
 		if err == nil {
 			return creds, nil
+		}
+
+		// A CHAIN CONTINUES PAST A SOURCE THAT HAS NOTHING, NOT PAST ONE THAT IS
+		// WRONG. Anything other than "there are none here" is a source that was
+		// configured and could not be used — a half-set environment, a metadata
+		// service that answered with something that is not a credential — and
+		// carrying on past it is how billet ends up acting as an identity nobody
+		// chose.
+		if !errors.Is(err, errNoCredentials) {
+			// JOINED WITH WHAT CAME BEFORE, not returned alone. Stopping here is the
+			// point; discarding the earlier sources' reasons while doing it would
+			// undo the other half of this function, which exists so an operator is
+			// not sent to whichever source happened to be tried last.
+			return Credentials{}, errors.Join(append(errs, err)...)
 		}
 
 		errs = append(errs, err)
