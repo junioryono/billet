@@ -29,6 +29,16 @@ type fakeEC2 struct {
 	respond func(action string, params url.Values) (int, string)
 	// redirectTo, when set, is sent as the Location of any non-200 reply.
 	redirectTo string
+	// auth is the Authorization header of the last request, so a test can read
+	// the credential scope billet actually signed with.
+	auth string
+}
+
+func (f *fakeEC2) lastAuthorization() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return f.auth
 }
 
 func newFakeEC2(t *testing.T) *fakeEC2 {
@@ -60,6 +70,7 @@ func newFakeEC2(t *testing.T) *fakeEC2 {
 
 		f.mu.Lock()
 		f.calls = append(f.calls, params)
+		f.auth = r.Header.Get("Authorization")
 		respond := f.respond
 		f.mu.Unlock()
 
@@ -1314,8 +1325,11 @@ func TestAProviderKeepsItsOwnCopyOfTheNetwork(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
-	// The caller widens what it still holds.
+	// EVERY MUTABLE FIELD, not just the one that first suggested the rule —
+	// removing any single clone would otherwise leave this green.
 	cfg.UntrustedSecurityGroupIDs[0] = "sg-privileged"
+	cfg.SecurityGroupIDs[0] = "sg-privileged"
+	cfg.InstanceTypes[0].Type = "m7i.metal-48xl"
 
 	spec := validSpec()
 	spec.Trust = provider.TrustUntrusted
@@ -1324,8 +1338,90 @@ func TestAProviderKeepsItsOwnCopyOfTheNetwork(t *testing.T) {
 		t.Fatalf("Launch: %v", err)
 	}
 
-	if got := f.paramsFor(t, "RunInstances").Get("SecurityGroupId.1"); got != "sg-fork" {
+	got := f.paramsFor(t, "RunInstances")
+
+	if g := got.Get("SecurityGroupId.1"); g != "sg-fork" {
 		t.Errorf("a fork's job was placed on %q, which the caller substituted after the "+
-			"provider had validated the network", got)
+			"provider had validated the network", g)
+	}
+
+	if g := got.Get("InstanceType"); g != "c7i.2xlarge" {
+		t.Errorf("instance type = %q, which the caller substituted after construction", g)
+	}
+
+	// And the trusted list too, through a launch that uses it.
+	trusted := validSpec()
+
+	if _, err := p.Launch(t.Context(), trusted); err != nil {
+		t.Fatalf("Launch (trusted): %v", err)
+	}
+
+	f.mu.Lock()
+	last := f.calls[len(f.calls)-1]
+	f.mu.Unlock()
+
+	if g := last.Get("SecurityGroupId.1"); g != "sg-trusted" {
+		t.Errorf("a trusted job was placed on %q, which the caller substituted", g)
+	}
+}
+
+// A PADDED REGION MUST NOT BE VALIDATED AS ONE THING AND SIGNED AS ANOTHER.
+//
+// config.Load normalizes; a direct caller does not, and this constructor exists
+// precisely for the caller who never went through Load. Trimming a local copy to
+// validate it and then signing with the original produced a request that dialled
+// the right host with spaces in its credential scope — which AWS answers with a
+// 403 naming nothing.
+func TestAPaddedRegionIsSignedAsTheTrimmedOne(t *testing.T) {
+	f := newFakeEC2(t)
+
+	cfg := validEC2Config(f.URL)
+	cfg.Region = "  us-west-2  "
+
+	p, err := New("dep-1", cfg,
+		WithHTTPClient(f.Client()),
+		WithCredentials(StaticCredentials{AccessKeyID: "AKID", SecretAccessKey: "s"}))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	if _, err := p.List(t.Context()); err != nil {
+		t.Fatalf("List: %v", err)
+	}
+
+	auth := f.lastAuthorization()
+	if !strings.Contains(auth, "/us-west-2/ec2/aws4_request") {
+		t.Errorf("the credential scope is %q, want the trimmed region", auth)
+	}
+}
+
+// A REFUSED REDIRECT MUST NOT CARRY THE TARGET'S QUERY STRING INTO AN ERROR.
+//
+// The callback names only the host, and that is not enough on its own:
+// net/http wraps whatever it returns in a *url.Error, and THAT renders the whole
+// target url. So the refusal is a sentinel the call boundary recognises and
+// replaces, rather than one it wraps again.
+func TestARefusedRedirectDoesNotRenderTheTarget(t *testing.T) {
+	const marker = "hunter2hunter2"
+
+	elsewhere := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+
+	t.Cleanup(elsewhere.Close)
+
+	f := newFakeEC2(t)
+	f.respond = func(string, url.Values) (int, string) {
+		return http.StatusTemporaryRedirect, ""
+	}
+	f.redirectTo = elsewhere.URL + "/?token=" + marker
+
+	p := newTestProvider(t, f, nil)
+
+	_, err := p.List(t.Context())
+	if err == nil {
+		t.Fatal("a signed request followed a redirect")
+	}
+
+	if strings.Contains(err.Error(), marker) {
+		t.Errorf("the refusal carried the redirect target's query string: %v", err)
 	}
 }

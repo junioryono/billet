@@ -200,6 +200,15 @@ func (c *client) attempt(ctx context.Context, body string) ([]byte, error) {
 
 	resp, err := c.http.Do(req)
 	if err != nil {
+		// THE WRAPPER IS DISCARDED, NOT WRAPPED AGAIN. net/http returns a
+		// *url.Error whose message contains the whole URL it was working on — for
+		// a refused redirect that is the TARGET, chosen by whatever answered, with
+		// its query string intact. The sentinel already says everything billet is
+		// willing to say about it.
+		if errors.Is(err, errRedirected) {
+			return nil, errRedirected
+		}
+
 		return nil, fmt.Errorf("ec2: call the api: %w", err)
 	}
 
