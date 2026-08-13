@@ -1432,6 +1432,21 @@ func TestARefusedRedirectDoesNotRenderTheTarget(t *testing.T) {
 	if !errors.Is(err, errRedirected) {
 		t.Errorf("the refusal lost its identity on the way out: %v", err)
 	}
+
+	// AND IT NAMES THE HOST. The closure formats one deliberately — a bare
+	// hostname is safe by the same rule that refuses the query — and the call
+	// boundary used to discard the whole message in favour of the bare sentinel,
+	// so an operator whose endpoint sits behind a redirecting proxy was told only
+	// that a redirect had happened.
+	host := strings.TrimPrefix(elsewhere.URL, "http://")
+	if h, _, ok := strings.Cut(host, ":"); ok {
+		host = h
+	}
+
+	if !strings.Contains(err.Error(), host) {
+		t.Errorf("the refusal does not name the host it refused, so there is nothing to act "+
+			"on: %v", err)
+	}
 }
 
 // A REFUSED REDIRECT IS NOT "NOT NOW", so it is not retried.
@@ -1747,5 +1762,112 @@ func TestALaunchErrorCannotCarryTheRegistrationInItsCode(t *testing.T) {
 		if strings.Contains(err.Error(), secret) {
 			t.Errorf("the launch error carries the registration in its code: %v", err)
 		}
+	}
+}
+
+// THE OWNER TAG IS THE ONLY THING BETWEEN TWO DEPLOYMENTS SHARING AN AWS ACCOUNT,
+// AND NOTHING ASSERTED IT.
+//
+// Instance names do not distinguish deployments: another billet's instances are
+// also called `billet-<leaseID>`, so `provider.LeaseOf` calls them ours, their
+// lease ids are absent from THIS ledger, and the sweep destroys them as orphans —
+// while they run live jobs. The filter is what makes that unreachable, and
+// deleting it from describe() used to pass this entire package's suite and the
+// e2e suite as well. Measured, not assumed.
+//
+// Asserted on EVERY DescribeInstances, and for Find as well as List, because a
+// filter present on one path and missing on the other is the same hazard.
+func TestEveryDescribeIsScopedToThisDeployment(t *testing.T) {
+	f := newFakeEC2(t)
+	p := newTestProvider(t, f, nil)
+
+	if _, err := p.List(t.Context()); err != nil {
+		t.Fatalf("List: %v", err)
+	}
+
+	if _, _, err := p.Find(t.Context(), "billet-lease-1"); err != nil {
+		t.Fatalf("Find: %v", err)
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	var describes int
+
+	for i, call := range f.calls {
+		if call.Get("Action") != "DescribeInstances" {
+			continue
+		}
+
+		describes++
+		owned := false
+
+		// Walked from 1, the way the api reads them, so a filter stranded beyond a
+		// gap counts as absent here exactly as it would there.
+		for n := 1; ; n++ {
+			name := call.Get(fmt.Sprintf("Filter.%d.Name", n))
+			if name == "" {
+				break
+			}
+
+			if name != "tag:"+ownerTag {
+				continue
+			}
+
+			if got := call.Get(fmt.Sprintf("Filter.%d.Value.1", n)); got != "dep-1" {
+				t.Errorf("call %d scopes to owner %q, want this deployment", i, got)
+			}
+
+			owned = true
+		}
+
+		if !owned {
+			t.Errorf("call %d has no %s filter, so it would return another deployment's "+
+				"instances and the sweep would destroy their live jobs: %v", i, ownerTag, call)
+		}
+	}
+
+	if describes < 2 {
+		t.Fatalf("only %d DescribeInstances calls were made; this test is meant to cover both "+
+			"List and Find", describes)
+	}
+}
+
+// EVERY OPTION, not only the one that prompted the rule.
+//
+// WithHTTPClient(nil) reached a dereference in the constructor and was guarded;
+// the other two survived construction and panicked LATER — the logger at the
+// first line a launch writes, the credentials at the first signed call — further
+// from the cause and on a path that is holding leases. billet bans panic because
+// a control plane that panics drops every one of them.
+func TestNoOptionCanProduceANilThatPanicsLater(t *testing.T) {
+	cfg := validEC2Config("https://ec2.us-west-2.amazonaws.com/")
+
+	for name, opt := range map[string]Option{
+		"no http client": WithHTTPClient(nil),
+		"no logger":      WithLogger(nil),
+		"no credentials": WithCredentials(nil),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := New("dep-1", cfg, opt); err == nil {
+				t.Fatal("a provider was built with a nil the constructor's own invariant " +
+					"says must not reach a later call")
+			}
+		})
+	}
+}
+
+// A TYPED NIL IS STILL A NIL, and it is the one an interface hides.
+//
+// `p.api.creds == nil` is FALSE for (*IMDSCredentials)(nil) — the interface holds
+// a type — so it passed the guard and dereferenced at the first signed call,
+// which is precisely the later panic that guard exists to prevent.
+func TestATypedNilCredentialSourceIsRefused(t *testing.T) {
+	cfg := validEC2Config("https://ec2.us-west-2.amazonaws.com/")
+
+	var typed *IMDSCredentials
+
+	if _, err := New("dep-1", cfg, WithCredentials(typed)); err == nil {
+		t.Fatal("a typed-nil credential source was accepted; the first signed call would panic")
 	}
 }

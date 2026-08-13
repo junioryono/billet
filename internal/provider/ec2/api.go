@@ -2,10 +2,12 @@ package ec2
 
 import (
 	"context"
+	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"reflect"
@@ -27,6 +29,8 @@ const apiVersion = "2016-11-15"
 const maxAttempts = 3
 
 // client talks the EC2 query API over signed HTTPS.
+//
+//nolint:recvcheck // The redaction methods MUST take a value receiver: a pointer-receiver String is not consulted when a VALUE is formatted, so %+v on a dereferenced client would print the secret out of its unexported creds field. Every other method needs the pointer. The mix is deliberate and the safety property is the reason — github.App carries the identical exception for the identical reason.
 type client struct {
 	http     *http.Client
 	endpoint string
@@ -38,6 +42,43 @@ type client struct {
 	// sleep waits between attempts, replaceable so a test does not.
 	sleep func(ctx context.Context, d time.Duration) error
 }
+
+// REDACTED, BECAUSE IT HOLDS A CREDENTIAL SOURCE IN AN UNEXPORTED FIELD.
+//
+// fmt cannot invoke methods through an unexported field — reflect refuses — so a
+// source's own redaction is never consulted when the struct AROUND it is printed
+// structurally. `%+v` on a client holding a value-typed source printed the secret
+// access key in full, past three layers of redaction that all worked in
+// isolation.
+//
+// This is the fourth type in this package to need its own methods for that
+// reason, which is the tell that method-based redaction cannot be made absolute:
+// see the note in the billet-security skill, where the same residual is recorded
+// for the GitHub App key.
+// ON A VALUE RECEIVER, which is the rule this package's own skill states and
+// which the first version of these methods broke: a pointer receiver is not
+// consulted when a VALUE is formatted, so `%+v` on a dereferenced client
+// structurally rendered the unexported creds field and printed the secret. A
+// value receiver serves both forms.
+//
+// `Credentials` and `StaticCredentials` take value receivers for the same reason.
+// `IMDSCredentials` cannot — it holds a sync.Mutex, so a value copy is a vet
+// error and the pointer receiver is the only correct choice there.
+func (c client) String() string { return "ec2.client{endpoint=" + c.endpoint + "}" }
+
+// GoString covers %#v.
+func (c client) GoString() string { return c.String() }
+
+// Format catches every verb.
+func (c client) Format(f fmt.State, _ rune) {
+	_, _ = io.WriteString(f, c.String()) //nolint:errcheck // fmt.State swallows write errors by design
+}
+
+// MarshalJSON keeps a client out of anything that serializes it structurally.
+func (c client) MarshalJSON() ([]byte, error) { return json.Marshal(c.String()) }
+
+// LogValue is what slog consults.
+func (c client) LogValue() slog.Value { return slog.StringValue(c.String()) }
 
 // apiError is a refusal the EC2 API described.
 //
@@ -217,8 +258,19 @@ func (c *client) attempt(ctx context.Context, body string) ([]byte, error) {
 		// a refused redirect that is the TARGET, chosen by whatever answered, with
 		// its query string intact. The sentinel already says everything billet is
 		// willing to say about it.
+		// THE SENTINEL'S OWN MESSAGE, not the bare sentinel. The CheckRedirect
+		// closure names the host it refused — safe by the same rule that governs
+		// everything else here — and returning errRedirected alone threw that away,
+		// so an operator whose VPC endpoint sits behind a redirecting proxy was told
+		// only that a redirect happened. What must not survive is net/http's
+		// *url.Error wrapper, which renders the whole target including its query.
+		var uerr *url.Error
+		if errors.As(err, &uerr) && errors.Is(err, errRedirected) {
+			return nil, uerr.Err
+		}
+
 		if errors.Is(err, errRedirected) {
-			return nil, errRedirected
+			return nil, err
 		}
 
 		return nil, fmt.Errorf("ec2: call the api: %w", err)
