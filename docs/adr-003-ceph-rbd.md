@@ -160,7 +160,32 @@ Three things follow.
 
 **Queue depth 1 is a latency measurement wearing a throughput measurement's clothes**, and it is easy to publish by accident. The identical sequential read is 364 MB/s at qd1 and 4.5 GB/s at qd32 — a 12× difference from one flag. A `dd` benchmark is qd1 by construction, which is how the first pass at this table nearly recorded "246 MB/s" as Ceph's sequential write speed. (The pass before *that* recorded 5.8 GB/s, because `dd if=/dev/zero` writes zeros and librbd turns an all-zero write into a cheap zero op. Both numbers were wrong, in opposite directions, for different reasons. Benchmark with incompressible data at a realistic depth or do not benchmark.)
 
-**Small synchronous writes are where this costs you, and that is the open risk.** 4k random writes are 14× slower than the same disks locally at qd64, and 3.85 ms each at qd1 — a replicated round trip is simply not free. A build writing thousands of small files into a sticky disk is exactly that shape. Two things soften it and neither is proof: the guest's page cache absorbs buffered writes and flushes them deeper and larger than O_DIRECT ever does, and a job's *reads* — the part a cache exists to accelerate — are on the fast side of this table. **#26 must measure a real build against a mounted sticky disk before this is called settled**, and the fallback if it is not is a writeback layer in the guest rather than a different cluster.
+The build benchmark below made the same class of mistake twice more before it produced anything: its first pass ran `go build ./...` outside the source tree, which returned in 76 ms having built nothing, and wrote and read its 40,000 files inside one run, so every read came from the page cache it had just filled. Both defects reported that RBD costs nothing — which is the answer a benchmark gives when it never reaches the storage. **A suspiciously equal result is a bug until proven otherwise.**
+
+**Small synchronous writes look alarming here, and the next section is why that reading was wrong.** 4k random writes are 14× slower than the same disks locally at qd64, and 3.85 ms each at qd1 — a replicated round trip is not free, and a build writing thousands of small files is that shape. That was recorded as the open risk, with the expectation that a guest's page cache would absorb most of it. Expectations of that kind are what this document exists to replace, so it was measured.
+
+## What a real build costs, which is not what fio implies
+
+Three workloads on a mounted RBD volume against the same tree on the mdraid NVMe root, caches dropped before every phase, median of three. All times in milliseconds. **The whole table was taken twice**, and the two passes agree within 1% on every figure that carries an argument — `go build` 15379/15350 locally and 15738/15641 on RBD, the cold read 13077/12969, fsync-per-file 23364/23298. A single benchmark pass is a sample, and the ratios below are only worth quoting because the second pass reproduced them.
+
+| | go build, cold cache | 40k files write+sync | 40k files read COLD | 40k delete | 2k files, fsync each | git clone | git status |
+|---|---|---|---|---|---|---|---|
+| local NVMe | 15379 | 2274 | 3214 | 888 | 9885 | 100 | 49 |
+| RBD | 15738 | 3180 | **13077** | 888 | 23364 | 177 | 108 |
+| RBD tuned | 15776 | 3298 | 12540 | 904 | 23173 | 180 | 98 |
+| **cost** | **1.02×** | 1.40× | **4.07×** | 1.00× | 2.36× | 1.77× | 2.20× |
+
+**A real compile is 2% slower.** That is the headline and it is the workload CI is mostly made of: `go build` with a cold build cache is CPU-bound, its writes are buffered, and the storage underneath it barely shows. The fio table above cannot tell you that, because a benchmark that does nothing but IO measures a machine that does nothing but IO.
+
+**fsync-per-file costs 2.4×, not 14×.** Package managers that fsync every file are the worst realistic case, and even they land nowhere near what the synthetic number implies — a real workload has work between its fsyncs, and the round trip overlaps with it.
+
+**The expensive one is a COLD READ of many small files, at 4×**, and it is worth noticing that this is the opposite of what the fio table predicted: reads were "on the fast side" there. They are, sequentially. Reading 40,000 small files is not a sequential read — it is 40,000 round trips, IOPS-bound, and no amount of readahead helps because nothing is being read ahead *of*.
+
+**That is also the cache-restore path, so it needs the right baseline.** 13 s to hydrate 40,000 files from RBD is four times what the local disk costs and a small fraction of what NOT having the cache costs — re-running an install over the network is tens of seconds to minutes. The comparison that decides whether a sticky disk is worth having is against re-fetching, not against a disk the second machine cannot see.
+
+**Tuning did nothing, and that is a finding rather than a gap.** `read_ahead_kb` at 32 MB and an ext4 stride/stripe aligned to the 4 MiB object size moved nothing outside noise on any workload. A 64 KiB object size (measured in the earlier pass) did not either. So this ADR ships no tuning advice: the honest answer is that the defaults are what these numbers were taken on, and the shape that costs — small scattered reads — is not one those knobs address.
+
+**What #26 still has to establish** is narrower than it was: not whether RBD is viable for build workloads, which it is, but whether the *hydrate* step of a sticky disk holding a real `node_modules` stays acceptable at 4×, and whether it is better served by streaming the volume than by walking it as files.
 
 ## The property this was all for
 
@@ -228,7 +253,61 @@ An option that requires a value consumes the next token whatever it starts with,
 
 billet drives Ceph through the `rbd` **command** rather than through librados. The Go binding is cgo, which would end the single static binary and the cross-build matrix in one move — the same reason `mattn/go-sqlite3` is banned — and billet already treats Ceph the way it treats Docker and Tart: an external dependency an operator installs. The cost is a process per call, so `internal/store/ceph` is for operations measured in tens per job and never per block.
 
-`billet check` now proves the configuration rather than parsing it: it lists both pools as the configured identity, which establishes that the monitors answered, the keyring authenticated and the pools exist. It says out loud that this is a **read** and that launching also needs create, clone, snapshot and remove — the same honesty the ec2 preflight owes about `DescribeInstances` not implying `RunInstances`. A host with no `rbd` command fails the check rather than being reported: only a firecracker node may carry a `node.ceph` block, so this file always describes a machine that is meant to run jobs, and a control plane is unaffected because it has no node section to check.
+### The cluster is a precondition, and billet checks it
+
+Clone v2 is a requirement of billet's storage rather than a preference, and a requirement nothing verifies is a hope. `billet check` therefore **refuses** a cluster whose `require-min-compat-client` predates mimic, naming the one command that fixes it.
+
+Refusing now rather than warning is a judgement about when the cost lands. Nothing in billet clones yet, so a clone-v1 cluster works perfectly today and the fix is one command on an empty cluster; the same fix after a fleet has been built on it is a pool that cannot be reclaimed and a debugging session that starts nowhere near the storage. The failure this prevents is invisible right up until it is expensive.
+
+The rule is stated as **"not one of the releases older than mimic"** rather than "one of the releases at or after mimic", and the direction is the point: a list of recent releases goes stale on the next Ceph release and starts refusing correct clusters, while the set of releases older than mimic can never grow. Measured against 20.2.3 rather than remembered — every name in that set is one this cluster accepts, and one it does not know is refused with `is not recognized`, so the list is complete.
+
+**That direction is fail-open, so what bounds it matters.** "Anything I do not recognise is newer" admits whatever the binary at that path printed, so the answer must first be a release-shaped token — a short lowercase word — and `unknown` is refused by name, at the boundary where the value enters rather than inside the rule that consumes it. That distinction was itself a defect: the refusal lived only on the path where the release decides the clone format, so a cluster with the format set explicitly skipped it and `unknown` was stored and printed as though billet had recognised it. **A value validated in one of its two consumers is a value that is not validated.** `unknown` is not hypothetical: it is the zero value of Ceph's release enum, and `osd set-require-min-compat-client unknown` is *refused* (measured), so it can only arrive from Ceph itself. It means the cluster was never told which clients it admits, and a cluster that was never told clones the old way. Reading it as "some release newer than mimic" is exactly the mistake the shape check exists to prevent.
+
+**And the floor alone is a proxy, which one config key defeats.** `rbd_default_clone_format` overrides what the minimum client release implies, and billet reads it too. Measured: with the floor at mimic and the format forced to `1`, cloning an unprotected snapshot fails with `rbd: clone error: (22) Invalid argument` — a green preflight beside the exact failure the preflight exists to prevent. The two settings are resolved together, and each cause gets its own remedy, because "raise require-min-compat-client" is wrong advice when the floor is already high enough.
+
+**That key is settable PER POOL, and the DESTINATION pool is the one that governs.** Measured, cloning `billet-images/src@s` into `billet-cache/dst`:
+
+| image pool | cache pool | result |
+|---|---|---|
+| auto | auto | cloned |
+| auto | forced to 1 | `rbd: clone error: (22) Invalid argument` |
+| forced to 1 | auto | cloned |
+
+So the pool a clone lands in decides, and both of billet's pools are landing places — root clones in one, cache generations in the other. Reading one pool and calling it the cluster's answer would have been the same proxy mistake one level down.
+
+That mistake has now been made three times in this one check, which is why it is worth naming rather than just fixing: the floor standing in for the format, one pool standing in for both, and a value validated in one of its two consumers. **The question to ask of any check is not "is this setting right" but "is this the thing that decides".**
+
+rbd also reports WHERE an effective value came from — `pool` for an override set on the pool, `config` for one set cluster-wide — and the two take different commands. Discarding that meant half the refusals recommended `ceph config rm client …`, which does not remove a pool-level override: an operator would run it, see nothing change, and conclude billet was wrong about their cluster. The source decides the remedy.
+
+Reading that option is itself a small lesson in not reasoning about someone else's grammar: `rbd config pool list` takes its pool as a **positional** argument, so `rbd --format json -p <pool> config pool list` answers `unrecognised option '-p'` — and the unit test asserted billet's own mistake, exactly, and passed, until the real cluster refused it. An argv assertion pins what the code does; only running it says whether the tool agrees.
+
+Pool replication is **reported and not judged**. How many copies a pool keeps is the operator's decision, and billet has no standing to refuse it — but it is invisible from the config file, so `billet check` prints `size` and `min_size` for both pools and says plainly when a pool keeps one copy. An operator who believes their golden images are mirrored should find out there rather than after a drive dies.
+
+```
+ceph     client.billet -> /etc/ceph/ceph.conf
+         billet-images      0 image(s)  size 2, min_size 1       golden images and per-job root clones
+         billet-cache       0 image(s)  size 2, min_size 1       cache volumes
+         clone v2 (require-min-compat-client mimic, rbd_default_clone_format auto), so a cache generation can be reclaimed while a job still holds a clone of it
+         (read only — launching also needs create, clone, snapshot and remove in both pools; …)
+```
+
+and the two ways it refuses, each verified by putting the live cluster into that state and restoring it:
+
+```
+$ ceph config set client rbd_default_clone_format 1
+node.ceph: this cluster would clone snapshots the old way…: rbd_default_clone_format is set to 1,
+which overrides the cluster's minimum client release (mimic); unset it with
+`ceph config rm client rbd_default_clone_format`
+
+$ ceph osd set-require-min-compat-client luminous
+node.ceph: this cluster would clone snapshots the old way…: require-min-compat-client is "luminous";
+raise it with `ceph osd set-require-min-compat-client mimic` (which refuses while clients older than
+mimic are connected — `ceph features` lists them)
+```
+
+The release floor and the pool replication come from `ceph`; the clone-format override comes from `rbd`, because the scoped identity can read it there and not through `ceph config get`, which answers `EACCES` for a `profile rbd` key. Both binaries ship in ceph-common, so a host that has one has the other. All three reads work as `client.billet` — verified, because a check that needs admin rights to run is a check that will be run as admin.
+
+`billet check` proves the configuration rather than parsing it: it lists both pools as the configured identity, which establishes that the monitors answered, the keyring authenticated and the pools exist. It says out loud that this is a **read** and that launching also needs create, clone, snapshot and remove — the same honesty the ec2 preflight owes about `DescribeInstances` not implying `RunInstances`. A host with no `rbd` command fails the check rather than being reported: only a firecracker node may carry a `node.ceph` block, so this file always describes a machine that is meant to run jobs, and a control plane is unaffected because it has no node section to check.
 
 The failure paths are worth showing, because they are most of the value:
 
@@ -246,6 +325,6 @@ $ billet check --config billet.yaml      # an identity the cluster does not know
 ## What is still open
 
 - **The cluster is degenerate on one host and always was.** One mon is not a quorum. The mgr has a standby, the OSDs mirror across two drives, and the machine is still a single point of failure. This is the accepted cost recorded in #23, restated here because "HEALTH_OK" makes it easy to forget.
-- **Nothing mounts any of this yet.** #24 boots a microVM from a mapped clone; #25 builds the `Store` interface, the commit protocol and eviction on top; #26 puts a real build's writes through it, which is the measurement that decides whether the 4k write cost above matters.
+- **Nothing mounts any of this yet.** #24 boots a microVM from a mapped clone; #25 builds the `Store` interface, the commit protocol and eviction on top; #26 wires a sticky disk into a job. The question #26 inherits is no longer whether RBD can carry a build — it can, at 2% — but whether hydrating a real `node_modules` at 4× is better served by walking it as files or by streaming the volume.
 - **The monitoring stack and dashboard were skipped** (`--skip-monitoring-stack --skip-dashboard`) to keep the daemon count down on a machine that is also a compute host. `ceph health detail` reports a failing disk without either. Add them with `ceph orch apply prometheus` and `ceph mgr module enable dashboard` if the graphs are wanted.
 - **The cache pool has no quota.** Eviction is #25's, and until it exists a runaway cache fills the same 7.3 TiB the golden images live in. `ceph osd pool set-quota billet-cache max_bytes <n>` is the stopgap if that becomes real before #25 does.

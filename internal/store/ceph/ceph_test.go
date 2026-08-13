@@ -2,10 +2,13 @@ package ceph
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -27,42 +30,130 @@ func valid() config.CephConfig {
 	}
 }
 
-// recorder captures the invocations billet builds and answers each with a
-// canned result. Keyed by call order, because the two pools are listed in a
-// fixed order and a check that lost one would otherwise look identical.
+// recorder captures the invocations billet builds and answers each one.
+//
+// IT DISPATCHES ON WHAT IT WAS ASKED, not on call order. A fake keyed on
+// position agrees with whatever sequence the code happens to make, so reordering
+// two calls — or dropping one and adding another — leaves it green while the
+// invocations have changed completely. Answering by binary and subcommand makes
+// the fake state what it believes billet asks for, which is the thing under test.
 type recorder struct {
 	calls [][]string
-	out   [][]byte
-	err   error
+	bins  []string
+
+	rawImages string   // raw bytes for the image pool, overriding images
+	images    []string // what `rbd -p <image pool> ls` returns
+	caches    []string // what `rbd -p <cache pool> ls` returns
+	minCompat string   // what `ceph osd get-require-min-compat-client` returns
+	pools     string   // what `ceph osd pool ls detail` returns, as json
+
+	cloneFormat      string // the rbd_default_clone_format `rbd config pool list` reports
+	cacheCloneFormat string // ...for the cache pool, when it differs from the image pool
+	cloneSource      string // where rbd says that value came from: "pool" or "config"
+	rawConfig        string // raw bytes for that listing, overriding both
+
+	err error // if set, every invocation fails with it
 }
 
-func (r *recorder) run(_ context.Context, _ string, args []string) ([]byte, error) {
+// answer is the default cluster: clone v2, both pools mirrored.
+func answer() *recorder {
+	return &recorder{
+		minCompat:   "mimic",
+		cloneFormat: "auto",
+		pools: `[{"pool_name":"billet-images","size":2,"min_size":1},
+		         {"pool_name":"billet-cache","size":2,"min_size":1}]`,
+	}
+}
+
+func (r *recorder) run(_ context.Context, bin string, args []string) ([]byte, error) {
 	r.calls = append(r.calls, args)
+	r.bins = append(r.bins, bin)
+
 	if r.err != nil {
 		return nil, r.err
 	}
 
-	if len(r.out) == 0 {
-		return []byte(`[]`), nil
+	joined := strings.Join(args, " ")
+
+	switch {
+	case strings.Contains(joined, "get-require-min-compat-client"):
+		return []byte(r.minCompat + "\n"), nil
+
+	case strings.Contains(joined, "pool ls detail"):
+		if r.pools == "" {
+			return []byte(`[]`), nil
+		}
+
+		return []byte(r.pools), nil
+
+	case strings.Contains(joined, "config pool list"):
+		if r.rawConfig != "" {
+			return []byte(r.rawConfig), nil
+		}
+
+		format := r.cloneFormat
+		if strings.Contains(joined, "billet-cache") && r.cacheCloneFormat != "" {
+			format = r.cacheCloneFormat
+		}
+
+		source := r.cloneSource
+		if source == "" {
+			source = "config"
+		}
+
+		return []byte(`[{"name":"rbd_default_clone_format","value":"` + format +
+			`","source":"` + source + `"}]`), nil
+
+	case strings.Contains(joined, "-p billet-images"):
+		if r.rawImages != "" {
+			return []byte(r.rawImages), nil
+		}
+
+		return jsonList(r.images), nil
+
+	case strings.Contains(joined, "-p billet-cache"):
+		return jsonList(r.caches), nil
 	}
 
-	out := r.out[0]
-	if len(r.out) > 1 {
-		r.out = r.out[1:]
+	return []byte(`[]`), nil
+}
+
+func jsonList(names []string) []byte {
+	out, err := json.Marshal(names)
+	if err != nil || names == nil {
+		return []byte(`[]`)
 	}
 
-	return out, nil
+	return out
 }
 
 func client(t *testing.T, cfg config.CephConfig, rec *recorder) *Client {
 	t.Helper()
 
-	c, err := New(cfg, WithBinary("/usr/bin/rbd"), withRunner(rec.run))
+	c, err := New(cfg, WithBinary("/usr/bin/rbd"), WithCephBinary("/usr/bin/ceph"), withRunner(rec.run))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 
 	return c
+}
+
+// rbdCalls and cephCalls split the invocations by binary, because each has its
+// own flag parsing and its own argv to get right.
+func (r *recorder) rbdCalls() [][]string { return r.callsTo("rbd") }
+
+func (r *recorder) cephCalls() [][]string { return r.callsTo("ceph") }
+
+func (r *recorder) callsTo(name string) [][]string {
+	var out [][]string
+
+	for i, bin := range r.bins {
+		if filepath.Base(bin) == name {
+			out = append(out, r.calls[i])
+		}
+	}
+
+	return out
 }
 
 // THE ARGUMENTS ARE THE PART WITH MISTAKES IN IT.
@@ -73,15 +164,17 @@ func client(t *testing.T, cfg config.CephConfig, rec *recorder) *Client {
 func TestTheInvocationNamesTheIdentityAndThePool(t *testing.T) {
 	t.Parallel()
 
-	rec := &recorder{out: [][]byte{[]byte(`["ubuntu-2404-x64"]`), []byte(`["job-1","job-2"]`)}}
+	rec := answer()
+	rec.images = []string{"ubuntu-2404-x64"}
+	rec.caches = []string{"job-1", "job-2"}
 
 	report, err := client(t, valid(), rec).CheckReachable(t.Context())
 	if err != nil {
 		t.Fatalf("CheckReachable: %v", err)
 	}
 
-	if len(rec.calls) != 2 {
-		t.Fatalf("rbd was invoked %d times, want one per pool", len(rec.calls))
+	if got := len(rec.rbdCalls()); got != 4 {
+		t.Fatalf("rbd was invoked %d times, want a listing and a clone-format read per pool", got)
 	}
 
 	// THE EXACT ARGV, not a joined substring match. Joining loses token
@@ -91,20 +184,54 @@ func TestTheInvocationNamesTheIdentityAndThePool(t *testing.T) {
 	for i, want := range [][]string{
 		{"--id", "site-reader", "--format", "json", "-p", "billet-images", "ls"},
 		{"--id", "site-reader", "--format", "json", "-p", "billet-cache", "ls"},
+		// THE POOL IS POSITIONAL for this subcommand. The first version of this
+		// assertion carried `-p billet-images` — billet's own mistake, asserted
+		// exactly, and green — until the real cluster answered
+		// `rbd: unrecognised option '-p'`. An argv assertion pins what the code
+		// does, which is only the same as what the tool accepts if somebody ran it.
+		//
+		// BOTH POOLS, because the clone format can be set on one and not the other.
+		{"--id", "site-reader", "--format", "json", "config", "pool", "list", "billet-images"},
+		{"--id", "site-reader", "--format", "json", "config", "pool", "list", "billet-cache"},
 	} {
-		if !slices.Equal(rec.calls[i], want) {
-			t.Errorf("call %d = %q, want %q", i, rec.calls[i], want)
+		if got := rec.rbdCalls()[i]; !slices.Equal(got, want) {
+			t.Errorf("call %d = %q, want %q", i, got, want)
+		}
+	}
+
+	// AND THE ceph INVOCATIONS, EXACTLY. Nothing asserted them, so deleting
+	// `--format json` from the ceph call shipped green while breaking the pool
+	// listing on every real cluster — the JSON parse fails and a healthy cluster is
+	// reported as unreadable. The release query deliberately does NOT ask for json,
+	// because the mon answers it as a bare string regardless.
+	for i, want := range [][]string{
+		{"--id", "site-reader", "osd", "get-require-min-compat-client"},
+		{"--id", "site-reader", "--format", "json", "osd", "pool", "ls", "detail"},
+	} {
+		if got := rec.cephCalls()[i]; !slices.Equal(got, want) {
+			t.Errorf("ceph call %d = %q, want %q", i, got, want)
 		}
 	}
 
 	// The counts are the point of the report, and a check that returned zeroes
 	// alongside a nil error would pass every other assertion here.
-	if report.ImagePool != 1 || report.CachePool != 2 {
-		t.Errorf("report = %+v, want 1 image and 2 caches", report)
+	if len(report.Pools) != 2 || report.Pools[0].Images != 1 || report.Pools[1].Images != 2 {
+		t.Errorf("report = %+v, want 1 image and 2 caches", report.Pools)
+	}
+
+	// IN THE ORDER THE CONFIG NAMES THEM, because the two are printed with
+	// different purposes beside them and a swap would attribute each to the other.
+	if report.Pools[0].Name != "billet-images" || report.Pools[1].Name != "billet-cache" {
+		t.Errorf("the pools are reported as %q then %q", report.Pools[0].Name, report.Pools[1].Name)
 	}
 
 	if report.User != "site-reader" {
 		t.Errorf("report names %q rather than the identity that answered", report.User)
+	}
+
+	if report.MinCompatClient != "mimic" || !report.CloneV2 {
+		t.Errorf("the cluster answered mimic and the report says %q / clone v2 %v",
+			report.MinCompatClient, report.CloneV2)
 	}
 }
 
@@ -117,7 +244,7 @@ func TestTheInvocationNamesTheIdentityAndThePool(t *testing.T) {
 func TestAnOptionalPathIsOmittedRatherThanEmpty(t *testing.T) {
 	t.Parallel()
 
-	rec := &recorder{}
+	rec := answer()
 	if _, err := client(t, valid(), rec).CheckReachable(t.Context()); err != nil {
 		t.Fatalf("CheckReachable: %v", err)
 	}
@@ -144,7 +271,7 @@ func TestAConfiguredPathIsPassed(t *testing.T) {
 	cfg.ConfPath = "/etc/billet/ceph.conf"
 	cfg.KeyringPath = "/etc/billet/billet.keyring"
 
-	rec := &recorder{}
+	rec := answer()
 	if _, err := client(t, cfg, rec).CheckReachable(t.Context()); err != nil {
 		t.Fatalf("CheckReachable: %v", err)
 	}
@@ -159,9 +286,52 @@ func TestAConfiguredPathIsPassed(t *testing.T) {
 			"--keyring", "/etc/billet/billet.keyring",
 			"--format", "json", "-p", pool, "ls",
 		}
-		if !slices.Equal(rec.calls[i], want) {
-			t.Errorf("call %d = %q, want %q", i, rec.calls[i], want)
+		if got := rec.rbdCalls()[i]; !slices.Equal(got, want) {
+			t.Errorf("call %d = %q, want %q", i, got, want)
 		}
+	}
+}
+
+// EVERY COMMAND AUTHENTICATES AS THE SAME CLIENT.
+//
+// rbd and ceph are separate binaries with separate flag parsing, and the identity
+// is what confines both to the pools this node was granted. A ceph call that
+// dropped --id would fall back to client.admin — which is the one answer the whole
+// identity rule exists to prevent, arriving through the command nobody was
+// watching.
+func TestBothCommandsCarryTheSameIdentity(t *testing.T) {
+	t.Parallel()
+
+	cfg := valid()
+	cfg.ConfPath = "/etc/billet/ceph.conf"
+	cfg.KeyringPath = "/etc/billet/billet.keyring"
+
+	rec := answer()
+	if _, err := client(t, cfg, rec).CheckReachable(t.Context()); err != nil {
+		t.Fatalf("CheckReachable: %v", err)
+	}
+
+	var sawCeph bool
+
+	for i, call := range rec.calls {
+		joined := strings.Join(call, " ")
+		for _, must := range []string{
+			"--id site-reader",
+			"--conf /etc/billet/ceph.conf",
+			"--keyring /etc/billet/billet.keyring",
+		} {
+			if !strings.Contains(joined, must) {
+				t.Errorf("%s call %d does not carry %q: %s", rec.bins[i], i, must, joined)
+			}
+		}
+
+		if strings.HasSuffix(rec.bins[i], "ceph") {
+			sawCeph = true
+		}
+	}
+
+	if !sawCeph {
+		t.Error("no ceph invocation was made, so this asserts nothing about the second binary")
 	}
 }
 
@@ -208,7 +378,7 @@ func TestTheConstructorRefusesWhatTheConfigWould(t *testing.T) {
 			cfg := valid()
 			tc.mutate(&cfg)
 
-			c, err := New(cfg, WithBinary("/usr/bin/rbd"))
+			c, err := New(cfg, WithBinary("/usr/bin/rbd"), WithCephBinary("/usr/bin/ceph"))
 			if err == nil {
 				t.Fatalf("New accepted %s", tc.name)
 			}
@@ -232,7 +402,8 @@ func TestTheConstructorRefusesWhatTheConfigWould(t *testing.T) {
 func TestAFailedListNamesThePoolAndTheIdentity(t *testing.T) {
 	t.Parallel()
 
-	rec := &recorder{err: errors.New("exit status 1: rbd: listing images failed: (1) Operation not permitted")}
+	rec := answer()
+	rec.err = errors.New("exit status 1: rbd: listing images failed: (1) Operation not permitted")
 
 	_, err := client(t, valid(), rec).CheckReachable(t.Context())
 	if err == nil {
@@ -264,7 +435,8 @@ func TestUnparseableOutputIsNotRendered(t *testing.T) {
 
 	const secretish = "AQDH631qo1CfBxAA9ZsjJleBiq9V2OqUCfIn9Q=="
 
-	rec := &recorder{out: [][]byte{[]byte("key = " + secretish)}}
+	rec := answer()
+	rec.rawImages = "key = " + secretish
 
 	_, err := client(t, valid(), rec).CheckReachable(t.Context())
 	if err == nil {
@@ -297,7 +469,8 @@ func TestAnInvocationIsBounded(t *testing.T) {
 	//
 	// time.NewTimer rather than time.After, which forbidigo bans for leaking its
 	// timer until it fires.
-	c, err := New(valid(), WithBinary("/usr/bin/rbd"), WithTimeout(20*time.Millisecond),
+	c, err := New(valid(), WithBinary("/usr/bin/rbd"), WithCephBinary("/usr/bin/ceph"),
+		WithTimeout(20*time.Millisecond),
 		withRunner(func(ctx context.Context, _ string, _ []string) ([]byte, error) {
 			safety := time.NewTimer(5 * time.Second)
 			defer safety.Stop()
@@ -509,8 +682,8 @@ func TestAMissingBinaryIsDistinguishable(t *testing.T) {
 		t.Error("New returned a client alongside an error")
 	}
 
-	if !errors.Is(err, ErrNoRBD) {
-		t.Errorf("the error is not ErrNoRBD, so a caller cannot tell it from an unreachable "+
+	if !errors.Is(err, ErrNoClient) {
+		t.Errorf("the error is not ErrNoClient, so a caller cannot tell it from an unreachable "+
 			"cluster: %v", err)
 	}
 
@@ -526,7 +699,7 @@ func TestAMissingBinaryIsDistinguishable(t *testing.T) {
 func TestAnExplicitBinaryNeedsNoPath(t *testing.T) {
 	t.Setenv("PATH", filepath.Join(t.TempDir(), "empty"))
 
-	var ran string
+	var ran []string
 
 	// NOT os.Args[0], not absolute, and with no separator: a WithBinary that
 	// honoured only the test's own executable, only an absolute path, or only
@@ -534,9 +707,15 @@ func TestAnExplicitBinaryNeedsNoPath(t *testing.T) {
 	// job is naming an rbd that is not the one on PATH.
 	const elsewhere = "rbd-from-the-vendor"
 
-	c, err := New(valid(), WithBinary(elsewhere),
-		withRunner(func(_ context.Context, bin string, _ []string) ([]byte, error) {
-			ran = bin
+	c, err := New(valid(), WithBinary(elsewhere), WithCephBinary("ceph-from-the-vendor"),
+		withRunner(func(_ context.Context, bin string, args []string) ([]byte, error) {
+			ran = append(ran, bin)
+
+			// Enough of a cluster to reach the end of the check; what this test is
+			// about is which binaries were run, not what they said.
+			if strings.Contains(strings.Join(args, " "), "get-require-min-compat-client") {
+				return []byte("mimic\n"), nil
+			}
 
 			return []byte(`[]`), nil
 		}))
@@ -550,8 +729,14 @@ func TestAnExplicitBinaryNeedsNoPath(t *testing.T) {
 
 	// THE ONE THAT WAS SUPPLIED, because a constructor that stored the option and
 	// then ran something else would satisfy every other assertion here.
-	if ran != elsewhere {
-		t.Errorf("ran %q, want the binary the option named (%q)", ran, elsewhere)
+	// BOTH NAMES, because two options set two binaries and honouring one while
+	// falling back to PATH for the other is exactly the half-done implementation
+	// this asserts against — and PATH is empty, so the fallback would fail loudly
+	// only if it were reached at construction rather than here.
+	for _, want := range []string{elsewhere, "ceph-from-the-vendor"} {
+		if !slices.Contains(ran, want) {
+			t.Errorf("ran %q, want the binaries the options named (%q missing)", ran, want)
+		}
 	}
 }
 
@@ -807,5 +992,966 @@ func TestASuccessfulExitSurvivesAHeldPipe(t *testing.T) {
 
 	if strings.TrimSpace(string(got.out)) != `["a","b"]` {
 		t.Errorf("the answer was discarded: %q", got.out)
+	}
+}
+
+// THE CLUSTER'S CLONE FORMAT IS A PRECONDITION, and the rule is stated in the
+// direction that stays true.
+//
+// A set of releases at-or-after mimic goes stale on the next Ceph release and
+// starts refusing correct clusters. The set BEFORE mimic can never grow — Ceph is
+// not going to ship a release older than one from 2018 — so an unrecognised name
+// is treated as newer, and the table below asserts both halves of that.
+//
+// The pre-mimic names are measured rather than remembered: every one is a value
+// Ceph 20.2.3 accepts for `osd set-require-min-compat-client`, and a name it does
+// not know is refused with "is not recognized".
+func TestClonesV2(t *testing.T) {
+	t.Parallel()
+
+	for _, release := range []string{
+		"argonaut", "bobtail", "cuttlefish", "dumpling", "emperor", "firefly",
+		"giant", "hammer", "infernalis", "jewel", "kraken", "luminous",
+	} {
+		if got, err := EffectiveCloneFormat(release, "auto"); err != nil || got != 1 {
+			t.Errorf("%s predates clone v2 and resolved to %d (err %v)", release, got, err)
+		}
+	}
+
+	for _, release := range []string{
+		"mimic", "nautilus", "octopus", "pacific", "quincy", "reef", "squid", "tentacle",
+		// A release that does not exist yet. Refusing it would be the failure mode
+		// this rule is written to avoid: billet going stale and refusing a cluster
+		// that is newer than billet is.
+		"someday",
+	} {
+		if got, err := EffectiveCloneFormat(release, "auto"); err != nil || got != 2 {
+			t.Errorf("%s is at or after mimic and resolved to %d (err %v)", release, got, err)
+		}
+	}
+
+	// Whatever the cluster's formatting happens to be.
+	for _, release := range []string{"  mimic\n", "MIMIC", " Luminous "} {
+		want := 2
+		if strings.Contains(strings.ToLower(release), "luminous") {
+			want = 1
+		}
+
+		if got, err := EffectiveCloneFormat(release, "auto"); err != nil || got != want {
+			t.Errorf("EffectiveCloneFormat(%q) = %d (err %v), want %d", release, got, err, want)
+		}
+	}
+}
+
+// AN ANSWER THAT IS NOT A RELEASE MUST NOT BE READ AS ONE.
+//
+// "anything I do not recognise is newer than mimic" is a fail-OPEN rule, so what
+// bounds it is the shape check. `unknown` is the case that matters and it is not
+// hypothetical: it is the zero value of Ceph's release enum, and
+// `osd set-require-min-compat-client unknown` is REFUSED — measured — so it can
+// only arrive from Ceph itself. It means the cluster was never told, and a cluster
+// that was never told clones the old way.
+func TestAnAnswerThatIsNotAReleaseIsRefused(t *testing.T) {
+	t.Parallel()
+
+	for _, answer := range []string{
+		"",
+		"  ",
+		"mimic luminous",          // two tokens
+		"12",                      // a number, not a name
+		"Mimic-RC1",               // punctuation
+		strings.Repeat("x", 4096), // a binary that printed something else entirely
+	} {
+		got, err := EffectiveCloneFormat(answer, "auto")
+		if err == nil {
+			t.Errorf("EffectiveCloneFormat(%.20q) accepted it as format %d", answer, got)
+
+			continue
+		}
+
+		if !errors.Is(err, ErrUnclassifiedRelease) {
+			t.Errorf("EffectiveCloneFormat(%.20q) failed with %v, not ErrUnclassifiedRelease",
+				answer, err)
+		}
+
+		// AND THE ANSWER IS NOT ECHOED WHOLE. It came from a binary billet did not
+		// write, so the same rule that refuses to render unparseable output applies
+		// to rendering a rejected one — the 4096-byte case is what a wrong program
+		// at that path looks like.
+		if len(err.Error()) > maxDiagnostic+200 {
+			t.Errorf("EffectiveCloneFormat rendered a %d-byte answer", len(err.Error()))
+		}
+	}
+}
+
+// A CLUSTER THAT WAS NEVER TOLD CLONES THE OLD WAY, and gets the remedy for it.
+//
+// `unknown` is the zero value of Ceph's release enum and the setter refuses it —
+// measured — so it can only arrive from Ceph, meaning nobody has run
+// set-require-min-compat-client. That is not an answer billet fails to
+// understand; it is an answer that means clone v1, and the operator needs the
+// same one command as a cluster that says `luminous`. Routing it through
+// "billet could not classify your cluster" fails closed and sends them nowhere
+// useful.
+//
+// The override still wins where it is set, because it genuinely does: a cluster
+// with rbd_default_clone_format forced to 2 clones the new way whatever its floor
+// says, and refusing it would be billet being wrong about a working cluster.
+func TestAClusterThatWasNeverToldTakesTheOldCloneFormat(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		format  string
+		refused bool
+	}{
+		{"auto", true}, // the floor decides, and it was never set
+		{"", true},     // absent means auto
+		{"1", true},    // forced, and forced to the old one
+		{"2", false},   // forced to the new one, which really does win
+	} {
+		rec := answer()
+		rec.minCompat = "unknown"
+		rec.cloneFormat = tc.format
+		rec.cacheCloneFormat = tc.format
+
+		report, err := client(t, valid(), rec).CheckReachable(t.Context())
+
+		if !tc.refused {
+			if err != nil {
+				t.Errorf("clone format %q: refused a cluster whose override forces clone v2: %v",
+					tc.format, err)
+			}
+
+			continue
+		}
+
+		if err == nil {
+			t.Errorf("clone format %q: accepted a cluster that clones the old way", tc.format)
+
+			continue
+		}
+
+		if !errors.Is(err, ErrCloneV1) {
+			t.Errorf("clone format %q: the failure is %v, not ErrCloneV1", tc.format, err)
+		}
+
+		// THE REPORT SURVIVES, so the CLI prints what it found beside the refusal —
+		// and on the `auto` path the remedy is the floor, which is the one command
+		// this operator is missing.
+		if len(report.Pools) != 2 {
+			t.Errorf("clone format %q: the refusal discarded the report: %+v", tc.format, report)
+		}
+
+		// THE FLOOR REMEDY IS GIVEN WHATEVER ELSE IS WRONG, because unsetting a
+		// forced format leaves the pool on `auto`, where the floor decides — an
+		// operator told only about the override fixes it, re-runs, and is refused
+		// again for a reason nobody mentioned.
+		if !strings.Contains(err.Error(), "set-require-min-compat-client") {
+			t.Errorf("clone format %q: the error does not give the remedy for a cluster that was "+
+				"never told: %v", tc.format, err)
+		}
+
+		// AND IT SAYS WHAT `unknown` MEANS. Printing `require-min-compat-client is
+		// "unknown"` reads as a value somebody chose; what it means is that nobody
+		// has, which is the sentence that leads to the fix.
+		if !strings.Contains(err.Error(), "never been told") {
+			t.Errorf("clone format %q: the error renders unknown as though it were a release "+
+				"the operator set: %v", tc.format, err)
+		}
+	}
+}
+
+// A CONFIGURED VALUE BILLET DOES NOT MODEL REACHES THE PIPELINE, and is refused
+// there rather than only by the rule in isolation.
+//
+// Dropping the error from EffectiveCloneFormat at its call site — `format, _ :=`
+// — leaves format 0, which reads as "not v2" and falls into the generic clone-v1
+// refusal with the wrong remedy. Every direct test of the rule stays green,
+// because none of them drives a bad value through CheckReachable.
+func TestAnUnmodelledCloneFormatIsRefusedThroughThePipeline(t *testing.T) {
+	t.Parallel()
+
+	rec := answer()
+	rec.cloneFormat = "3"
+
+	_, err := client(t, valid(), rec).CheckReachable(t.Context())
+	if err == nil {
+		t.Fatal("CheckReachable accepted a clone format billet does not model")
+	}
+
+	if errors.Is(err, ErrCloneV1) {
+		t.Errorf("an unmodelled value was reported as clone v1, which gives the wrong remedy: %v", err)
+	}
+
+	if !strings.Contains(err.Error(), "not auto, 1 or 2") {
+		t.Errorf("the error does not say what billet could not make sense of: %v", err)
+	}
+}
+
+// THE FLOOR IS A PROXY, AND ONE CONFIG KEY DEFEATS IT.
+//
+// `rbd_default_clone_format` overrides what the cluster's minimum client release
+// implies. Measured: a cluster whose floor is mimic and whose clone format is
+// forced to 1 refuses to clone an unprotected snapshot with
+// `rbd: clone error: (22) Invalid argument`. Checking only the floor would have
+// been a green preflight beside the exact failure it exists to prevent.
+func TestTheConfiguredCloneFormatOverridesTheFloor(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		release, configured string
+		want                int
+	}{
+		{"mimic", "1", 1},    // the floor says v2 and the override says otherwise
+		{"luminous", "2", 2}, // and the other way round
+		{"mimic", "auto", 2}, // the default, where the floor decides
+		{"mimic", "", 2},     // absent means auto
+		{"luminous", "", 1},  // ...and the floor still decides
+	} {
+		got, err := EffectiveCloneFormat(tc.release, tc.configured)
+		if err != nil {
+			t.Errorf("EffectiveCloneFormat(%q, %q): %v", tc.release, tc.configured, err)
+
+			continue
+		}
+
+		if got != tc.want {
+			t.Errorf("EffectiveCloneFormat(%q, %q) = %d, want %d",
+				tc.release, tc.configured, got, tc.want)
+		}
+	}
+
+	// AN OVERRIDE BILLET CANNOT READ IS NOT ASSUMED TO BE THE DEFAULT. A value that
+	// is neither auto nor 1 nor 2 means the cluster is configured in a way this
+	// rule does not model, and guessing "auto" there is the fail-open direction.
+	if _, err := EffectiveCloneFormat("mimic", "3"); err == nil {
+		t.Error("an unrecognised rbd_default_clone_format was accepted")
+	}
+}
+
+// A FORCED CLONE FORMAT IS REFUSED WITH ITS OWN REMEDY, because "raise
+// require-min-compat-client" is the wrong advice when the floor is already high
+// enough and a config key is what is overriding it.
+func TestAForcedCloneFormatIsRefusedWithTheRightRemedy(t *testing.T) {
+	t.Parallel()
+
+	rec := answer()
+	rec.cloneFormat = "1"
+
+	report, err := client(t, valid(), rec).CheckReachable(t.Context())
+	if err == nil {
+		t.Fatal("CheckReachable accepted a cluster forced to clone format 1")
+	}
+
+	if !errors.Is(err, ErrCloneV1) {
+		t.Errorf("the failure is not ErrCloneV1: %v", err)
+	}
+
+	if !strings.Contains(err.Error(), "ceph config rm client rbd_default_clone_format") {
+		t.Errorf("the error does not name the setting that is overriding the floor: %v", err)
+	}
+
+	if strings.Contains(err.Error(), "set-require-min-compat-client") {
+		t.Errorf("the error gives the remedy for the other cause, which is already satisfied: %v", err)
+	}
+
+	// THE REPORT SURVIVES THIS REFUSAL TOO, with the replication the CLI prints
+	// beside it — the same property the release-refusal path has, and one a
+	// refusal moved earlier would silently drop.
+	if len(report.Pools) != 2 || report.Pools[0].Size == 0 {
+		t.Errorf("the refusal discarded what the check had established: %+v", report.Pools)
+	}
+}
+
+// THE REMEDY MATCHES WHERE THE OVERRIDE LIVES.
+//
+// rbd reports whether an effective value came from the pool or from the cluster
+// config, and the two take different commands: `ceph config rm client …` does not
+// remove an override set on a pool. Naming the wrong one sends an operator to a
+// setting that is already absent, and leaves them believing billet is wrong about
+// their cluster.
+func TestTheRemedyMatchesWhereTheOverrideLives(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct{ source, want, avoid string }{
+		{"pool", "rbd config pool rm 'billet-images' rbd_default_clone_format", "ceph config rm"},
+		{"config", "ceph config rm client rbd_default_clone_format", "rbd config pool rm"},
+	} {
+		rec := answer()
+		rec.cloneFormat = "1"
+		rec.cloneSource = tc.source
+
+		_, err := client(t, valid(), rec).CheckReachable(t.Context())
+		if err == nil {
+			t.Fatalf("source %q: CheckReachable accepted a forced clone format", tc.source)
+		}
+
+		if !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("source %q: the error does not give %q: %v", tc.source, tc.want, err)
+		}
+
+		if strings.Contains(err.Error(), tc.avoid) {
+			t.Errorf("source %q: the error gives %q, which would not remove it: %v",
+				tc.source, tc.avoid, err)
+		}
+	}
+}
+
+// OUTPUT THE ceph COMMANDS CANNOT BE PARSED FROM IS NOT ECHOED EITHER.
+//
+// The image listing has followed this rule since the package existed; the cluster
+// reads were added later and did not. A wrong binary at that path prints whatever
+// it prints, and the release query in particular would have stored it, failed the
+// pre-mimic lookup, passed the check, and printed it unbounded on the terminal.
+func TestUnparseableClusterOutputIsNotRendered(t *testing.T) {
+	t.Parallel()
+
+	const secretish = "AQDH631qo1CfBxAA9ZsjJleBiq9V2OqUCfIn9Q=="
+
+	t.Run("the release query", func(t *testing.T) {
+		t.Parallel()
+
+		rec := answer()
+		rec.minCompat = "key = " + secretish
+
+		_, err := client(t, valid(), rec).CheckReachable(t.Context())
+		if err == nil {
+			t.Fatal("CheckReachable accepted output that is not a release name")
+		}
+
+		if strings.Contains(err.Error(), secretish) {
+			t.Errorf("the error rendered the command's output: %v", err)
+		}
+
+		if !strings.Contains(err.Error(), "is it the ceph command") {
+			t.Errorf("the error does not say what billet concluded: %v", err)
+		}
+	})
+
+	t.Run("the clone format listing", func(t *testing.T) {
+		t.Parallel()
+
+		rec := answer()
+		rec.rawConfig = "key = " + secretish
+
+		_, err := client(t, valid(), rec).CheckReachable(t.Context())
+		if err == nil {
+			t.Fatal("CheckReachable accepted output that is not a configuration list")
+		}
+
+		if strings.Contains(err.Error(), secretish) {
+			t.Errorf("the error rendered the command's output: %v", err)
+		}
+	})
+
+	t.Run("a json null pool listing", func(t *testing.T) {
+		t.Parallel()
+
+		// `null` unmarshals into a slice happily and would be read as "the cluster
+		// described no pools" — reported as replication unknown beside a green check.
+		rec := answer()
+		rec.pools = "null"
+
+		if _, err := client(t, valid(), rec).CheckReachable(t.Context()); err == nil {
+			t.Fatal("CheckReachable accepted a null pool listing as an empty one")
+		}
+	})
+}
+
+// A CLUSTER THAT WOULD CLONE THE OLD WAY IS REFUSED, NOT NOTED.
+//
+// On clone v1 a snapshot must be protected before it can be cloned, and a
+// protected snapshot with a live clone can be neither unprotected nor removed —
+// so a cache generation any running job holds a clone of is undeletable and
+// eviction is blocked by ordinary traffic. Nothing in billet clones yet, which is
+// exactly why this is the moment: the fix is one command on an empty cluster.
+func TestAClusterThatClonesTheOldWayIsRefused(t *testing.T) {
+	t.Parallel()
+
+	rec := answer()
+	rec.minCompat = "luminous"
+
+	report, err := client(t, valid(), rec).CheckReachable(t.Context())
+	if err == nil {
+		t.Fatal("CheckReachable accepted a cluster that would clone the old way")
+	}
+
+	if !errors.Is(err, ErrCloneV1) {
+		t.Errorf("the failure is not ErrCloneV1, so a caller cannot tell it from an unreachable "+
+			"cluster: %v", err)
+	}
+
+	// The state it found and the command that fixes it. An operator told only
+	// "refused" has to go and learn what require-min-compat-client is.
+	for _, want := range []string{"luminous", "ceph osd set-require-min-compat-client mimic"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the error does not carry %q: %v", want, err)
+		}
+	}
+
+	// AND THE REPORT SURVIVES THE REFUSAL. What billet learned before the last
+	// question — which pools exist, how they are replicated — is what an operator
+	// needs beside the refusal, and returning a zero value here would throw it away.
+	if report.User == "" || len(report.Pools) != 2 {
+		t.Fatalf("the refusal discarded what the check had already established: %+v", report)
+	}
+
+	// INCLUDING THE REPLICATION, which is the half the CLI prints beside the
+	// refusal. Moving the refusal above the pool read would leave the assertions
+	// above green and quietly drop it.
+	for _, p := range report.Pools {
+		if p.Size == 0 || p.MinSize == 0 {
+			t.Errorf("%s reached the refusal with no replication: %+v", p.Name, p)
+		}
+	}
+
+	if report.CloneV2 {
+		t.Error("the report claims clone v2 on a cluster that was refused for not having it")
+	}
+
+	// THE RELEASE THE CLUSTER NAMED, not a constant. It is what `billet check`
+	// prints beside the refusal, and hard-coding it would leave an operator
+	// comparing their cluster against a value billet made up.
+	if report.MinCompatClient != "luminous" {
+		t.Errorf("the report names %q rather than what the cluster answered", report.MinCompatClient)
+	}
+}
+
+// WHAT THE OPERATOR CHOSE IS REPORTED, because it is invisible from the config.
+//
+// billet does not refuse a pool that keeps one copy — how many copies to keep is
+// the operator's decision and billet has no standing to overrule it — but an
+// operator who believes their golden images are mirrored should find out here
+// rather than after a drive dies.
+func TestThePoolReplicationIsReported(t *testing.T) {
+	t.Parallel()
+
+	rec := answer()
+	rec.pools = `[{"pool_name":"billet-images","size":1,"min_size":1},
+	              {"pool_name":"billet-cache","size":3,"min_size":2},
+	              {"pool_name":".mgr","size":2,"min_size":1}]`
+
+	report, err := client(t, valid(), rec).CheckReachable(t.Context())
+	if err != nil {
+		t.Fatalf("CheckReachable: %v", err)
+	}
+
+	if got := report.Pools[0]; got.Size != 1 || got.MinSize != 1 {
+		t.Errorf("image pool = %+v, want the size the cluster reported", got)
+	}
+
+	if got := report.Pools[1]; got.Size != 3 || got.MinSize != 2 {
+		t.Errorf("cache pool = %+v, want the size the cluster reported", got)
+	}
+
+	// THE PURPOSE TOO, because it is printed beside the pool and swapping the two
+	// strings would tell an operator their golden images are cache volumes — a
+	// mutation nothing else here would notice.
+	if !strings.Contains(report.Pools[0].Purpose, "golden images") {
+		t.Errorf("the image pool's purpose is %q", report.Pools[0].Purpose)
+	}
+
+	if !strings.Contains(report.Pools[1].Purpose, "cache") {
+		t.Errorf("the cache pool's purpose is %q", report.Pools[1].Purpose)
+	}
+
+	// A pool billet does not use must not be attributed to one it does.
+	for _, p := range report.Pools {
+		if p.Name == ".mgr" {
+			t.Error("a pool billet was not pointed at is in the report")
+		}
+	}
+}
+
+// A CLUSTER THAT DID NOT SAY IS NOT GUESSED AT.
+//
+// The pool listing is a separate call from the image listing, and a cluster that
+// answers one and not the other is a real state — a pool created between them, or
+// caps that permit `rbd ls` and not `osd pool ls`. Reporting "size 0" would read
+// as a pool with no copies; reporting nothing reads as what it is.
+func TestAPoolTheClusterDidNotDescribeIsNotInvented(t *testing.T) {
+	t.Parallel()
+
+	rec := answer()
+	rec.pools = `[{"pool_name":"something-else","size":2,"min_size":1}]`
+
+	report, err := client(t, valid(), rec).CheckReachable(t.Context())
+	if err != nil {
+		t.Fatalf("CheckReachable: %v", err)
+	}
+
+	for _, p := range report.Pools {
+		if p.Size != 0 || p.MinSize != 0 {
+			t.Errorf("%s was given a replication the cluster never reported: %+v", p.Name, p)
+		}
+	}
+}
+
+// EACH BINARY IS LOOKED UP ON ITS OWN, so a host with one and not the other is
+// refused rather than failing later.
+//
+// Every other missing-client test empties PATH, which fails on `rbd` first and
+// proves nothing about the second lookup — deleting it entirely leaves them all
+// green. This puts a real rbd on PATH and no ceph.
+func TestAMissingCephIsRefusedEvenWhenRBDIsPresent(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "rbd"), []byte("#!/bin/sh\necho '[]'\n"), 0o700); err != nil {
+		t.Fatalf("write the rbd stub: %v", err)
+	}
+
+	t.Setenv("PATH", dir)
+
+	c, err := New(valid())
+	if err == nil {
+		t.Fatal("New succeeded with rbd present and ceph missing")
+	}
+
+	if c != nil {
+		t.Error("New returned a client alongside an error")
+	}
+
+	if !errors.Is(err, ErrNoClient) {
+		t.Errorf("the failure is not ErrNoClient: %v", err)
+	}
+
+	if !strings.Contains(err.Error(), "ceph") {
+		t.Errorf("the error does not name the command that is missing: %v", err)
+	}
+}
+
+// THE ceph CALLS ARE BOUNDED TOO, and the rbd ones cannot prove it.
+//
+// TestAnInvocationIsBounded stalls the first invocation, which is always an rbd
+// list — so removing the timeout from the ceph path alone leaves it green while
+// `billet check` can hang on a cluster that answers `rbd` and not `ceph`, which is
+// the one thing the command must never do.
+func TestACephInvocationIsBoundedToo(t *testing.T) {
+	t.Parallel()
+
+	c, err := New(valid(), WithBinary("/usr/bin/rbd"), WithCephBinary("/usr/bin/ceph"),
+		WithTimeout(20*time.Millisecond),
+		withRunner(func(ctx context.Context, bin string, args []string) ([]byte, error) {
+			// The rbd half answers immediately, and so does the release query — so
+			// what stalls is the JSON pool listing specifically. Stalling the FIRST
+			// ceph call would leave "apply the timeout only to non-json ceph calls"
+			// alive, which is a real one-line regression.
+			if filepath.Base(bin) != "ceph" {
+				return []byte(`[]`), nil
+			}
+
+			if strings.Contains(strings.Join(args, " "), "get-require-min-compat-client") {
+				return []byte("mimic\n"), nil
+			}
+
+			safety := time.NewTimer(5 * time.Second)
+			defer safety.Stop()
+
+			select {
+			case <-ctx.Done():
+				return nil, fmt.Errorf("ceph: %w", ctx.Err())
+			case <-safety.C:
+				return nil, errors.New("nothing bounded the ceph invocation")
+			}
+		}))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	start := time.Now()
+
+	if _, err := c.CheckReachable(t.Context()); err == nil {
+		t.Fatal("CheckReachable waited out a cluster that never answered and reported success")
+	} else if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("the failure is not the deadline: %v", err)
+	}
+
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("the configured timeout did not apply to the ceph call; it took %s", elapsed)
+	}
+}
+
+// THE CLONE FORMAT IS PER POOL, and both of these hold clones.
+//
+// Measured: `rbd config pool set billet-cache rbd_default_clone_format 1` leaves
+// the image pool reporting `auto` while a clone of an unprotected snapshot in the
+// cache pool fails with `(22) Invalid argument`. Reading one pool and calling it
+// the cluster's answer is the same proxy mistake the round-one fix was about, one
+// level down — and the cache pool is the one cache generations live in, so it is
+// the pool where an undeletable generation actually costs something.
+func TestTheCloneFormatIsCheckedOnEveryPool(t *testing.T) {
+	t.Parallel()
+
+	rec := answer()
+	rec.cloneFormat = "auto" // the image pool is fine
+	rec.cacheCloneFormat = "1"
+	rec.cloneSource = "pool" // which is how a per-pool override reports itself
+
+	report, err := client(t, valid(), rec).CheckReachable(t.Context())
+	if err == nil {
+		t.Fatal("CheckReachable accepted a cluster whose CACHE pool is forced to clone v1")
+	}
+
+	if !errors.Is(err, ErrCloneV1) {
+		t.Errorf("the failure is not ErrCloneV1: %v", err)
+	}
+
+	// WHICH POOL, because the remedy is per pool and naming the wrong one sends an
+	// operator to a setting that is already correct.
+	if !strings.Contains(err.Error(), "billet-cache") {
+		t.Errorf("the error does not name the pool that is forced: %v", err)
+	}
+
+	if !strings.Contains(err.Error(), "rbd config pool rm 'billet-cache'") {
+		t.Errorf("the error does not give the per-pool remedy: %v", err)
+	}
+
+	// The report still carries what each pool said, so the CLI can show it.
+	if report.Pools[0].CloneFormat != "auto" || report.Pools[1].CloneFormat != "1" {
+		t.Errorf("the per-pool clone formats were not reported: %+v", report.Pools)
+	}
+}
+
+// A VALUE IS NORMALISED ONCE, AND EVERY CONSUMER SEES THE SAME ONE.
+//
+// This is the fourth time in this one check that a value was normalised for a
+// DECISION while a consumer acted on the raw one. `"\n 1 \r"` resolved to clone
+// v1 correctly, then failed a `== "1"` comparison — so billet refused the cluster
+// and recommended raising a floor that was already high enough, and printed the
+// raw bytes on the terminal. The fix that generalises is not another TrimSpace at
+// the comparison; it is having one value.
+func TestACloneFormatIsCanonicalisedOnce(t *testing.T) {
+	t.Parallel()
+
+	rec := answer()
+	// BOTH FIELDS PADDED, because both are canonicalised and a fixture that pads
+	// only the value leaves the source's trim untested.
+	rec.rawConfig = "[{\"name\":\"rbd_default_clone_format\",\"value\":\"\\n  1  \\r\"," +
+		"\"source\":\"\\t pool \\r\"}]"
+
+	report, err := client(t, valid(), rec).CheckReachable(t.Context())
+	if err == nil {
+		t.Fatal("CheckReachable accepted a padded clone format of 1")
+	}
+
+	// The remedy must be the one for a forced format, not for the floor — which is
+	// already high enough, and is what a raw comparison would have sent them to.
+	// Its presence also proves the SOURCE was canonicalised: a padded source falls
+	// through to the unrecognised branch, which gives a different sentence.
+	if !strings.Contains(err.Error(), "rbd config pool rm") {
+		t.Errorf("the error does not give the remedy for the forced format: %v", err)
+	}
+
+	// And the stored value is the canonical one, so nothing downstream — including
+	// what the CLI prints — carries the padding.
+	for _, p := range report.Pools {
+		if p.CloneFormat != "1" {
+			t.Errorf("%s stored the raw value %q rather than the canonical one", p.Name, p.CloneFormat)
+		}
+	}
+}
+
+// A POOL NAME IS NOT A WORD, and every remedy billet prints is something an
+// operator will paste.
+//
+// Ceph creates pools called `a b` and `a/b` — measured, which is why billet's own
+// validation stopped refusing interior whitespace — so concatenating one into a
+// suggested command yields `rbd config pool rm billet cache …`, which addresses
+// two arguments and neither of them the pool.
+func TestAPoolNameInARemedyIsShellQuoted(t *testing.T) {
+	t.Parallel()
+
+	// A BRACE, not a space. A metacharacter allowlist covered POSIX sh exactly and
+	// still let `billet-{images,cache}` through, which bash and zsh brace-expand
+	// into two arguments — so the remedy addressed neither the pool nor either
+	// argument. A fixture with a space would not have noticed.
+	cfg := valid()
+	cfg.ImagePool = "billet-{images,cache}"
+
+	rec := answer()
+	rec.cloneFormat = "1"
+	rec.cloneSource = "pool"
+	rec.rawImages = `[]`
+
+	c, err := New(cfg, WithBinary("/usr/bin/rbd"), WithCephBinary("/usr/bin/ceph"),
+		withRunner(rec.run))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	_, err = c.CheckReachable(t.Context())
+	if err == nil {
+		t.Fatal("CheckReachable accepted a forced clone format")
+	}
+
+	if !strings.Contains(err.Error(), `'billet-{images,cache}'`) {
+		t.Errorf("the remedy does not quote a pool name a shell would expand, so pasting it "+
+			"would address something else: %v", err)
+	}
+
+	// EVERY NAME, not the ones a list happened to enumerate. "Safe to paste into a
+	// shell" is a claim about shells people use, and the list that covered sh
+	// exactly is the one that let a brace through.
+	for _, name := range []string{"plain", "with space", "with'quote", "$HOME", "a;b", "a*b"} {
+		got := shellQuote(name)
+		if !strings.HasPrefix(got, "'") || !strings.HasSuffix(got, "'") {
+			t.Errorf("shellQuote(%q) = %s, which is not quoted", name, got)
+		}
+	}
+
+	// And the single-quote escape is the one that actually works in sh.
+	if got := shellQuote("a'b"); got != `'a'\''b'` {
+		t.Errorf("shellQuote of an embedded quote = %s", got)
+	}
+}
+
+// EVERY CAUSE IS NAMED, because they are independent and fixing one can leave
+// another. Both pools forced, plus a floor that predates mimic, is three reasons
+// and three commands.
+func TestEveryReasonTheClusterClonesTheOldWayIsNamed(t *testing.T) {
+	t.Parallel()
+
+	rec := answer()
+	rec.minCompat = "luminous"
+	rec.cloneFormat = "1"
+	rec.cacheCloneFormat = "1"
+	rec.cloneSource = "pool"
+
+	_, err := client(t, valid(), rec).CheckReachable(t.Context())
+	if err == nil {
+		t.Fatal("CheckReachable accepted a cluster with three reasons to clone the old way")
+	}
+
+	for _, want := range []string{
+		"rbd config pool rm 'billet-images'",
+		"rbd config pool rm 'billet-cache'",
+		"set-require-min-compat-client",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the error does not carry %q, so fixing what it names leaves the cluster "+
+				"refused: %v", want, err)
+		}
+	}
+}
+
+// A SOURCE BILLET DOES NOT RECOGNISE IS SAID, NOT GUESSED AT.
+//
+// Treating every non-`pool` source as cluster-wide hands the operator a command
+// billet has no reason to believe removes anything. A command that changes
+// nothing is worse than an honest "look here": they run it, see no change, and
+// conclude billet is wrong about their cluster.
+func TestAnUnrecognisedOverrideSourceIsNotGuessedAt(t *testing.T) {
+	t.Parallel()
+
+	rec := answer()
+	rec.cloneFormat = "1"
+	rec.cloneSource = "somewhere-else"
+
+	_, err := client(t, valid(), rec).CheckReachable(t.Context())
+	if err == nil {
+		t.Fatal("CheckReachable accepted a forced clone format")
+	}
+
+	if strings.Contains(err.Error(), "ceph config rm client") {
+		t.Errorf("an unrecognised source was reported as cluster-wide: %v", err)
+	}
+
+	if !strings.Contains(err.Error(), "somewhere-else") {
+		t.Errorf("the error does not say what the cluster called the source: %v", err)
+	}
+}
+
+// THE RENDERED LENGTH IS WHAT REACHES A TERMINAL, and quoting expands.
+//
+// Capping the input leaves the output four times the bound it was supposed to
+// have: 300 NUL bytes render as 1,200 characters of `\x00`. The all-`x` fixture
+// that came with the cap could not see this, because ascii quotes one-for-one.
+func TestARenderedValueIsBoundedAfterQuoting(t *testing.T) {
+	t.Parallel()
+
+	for _, v := range []string{
+		strings.Repeat("\x00", 4096),
+		strings.Repeat("\t", 4096),
+		strings.Repeat("x", 4096),
+		strings.Repeat("é", 4096),
+
+		// THE WINDOW WHERE THE TWO BOUNDS DIFFER, which is the only place the
+		// mutation is visible: 100 NUL bytes are well under the cap as INPUT and
+		// four times over it once quoted. Fixtures that are all far above the cap
+		// truncate identically either way.
+		strings.Repeat("\x00", 100),
+		strings.Repeat("\t", 120),
+	} {
+		if got := bounded(v); len(got) > maxDiagnostic+8 {
+			t.Errorf("bounded rendered %d bytes for a %d-byte value", len(got), len(v))
+		}
+	}
+
+	// THE EXACT FIT, which decides `<=` against `<` and which no other fixture
+	// reaches: a value whose quoted form is exactly the budget must come back whole,
+	// with no ellipsis.
+	exact := strings.Repeat("a", maxDiagnostic-2)
+	if got := bounded(exact); len(got) != maxDiagnostic || strings.Contains(got, "…") {
+		t.Errorf("a value quoting to exactly %d bytes was truncated: len %d", maxDiagnostic, len(got))
+	}
+
+	// AND A SHORT VALUE IS STILL QUOTED, so a control byte cannot become a live
+	// terminal control on its way through an error message.
+	if got := bounded("a\nb"); strings.Contains(got, "\n") {
+		t.Errorf("bounded passed a raw newline through: %q", got)
+	}
+}
+
+// A TRUNCATED RENDERING IS STILL A VALID QUOTED VALUE.
+//
+// Length and "no raw newline" do not establish that: slicing the finished quoted
+// string cuts inside an escape — 100 NUL bytes truncate to `"\x00\x00…\x0` — and
+// trimming a trailing backslash only repairs the subset of cuts that landed on
+// one. What proves it is unquoting the result, which fails on a partial escape.
+func TestATruncatedRenderingIsStillValidlyQuoted(t *testing.T) {
+	t.Parallel()
+
+	for _, v := range []string{
+		strings.Repeat("\x00", 100),
+		strings.Repeat("\x00", 4096),
+		strings.Repeat("\t", 120),
+		strings.Repeat("a", 296) + "\x00\x00",
+		strings.Repeat("a", 297) + "\x00\x00",
+		strings.Repeat("a", 298) + "\x00\x00",
+		strings.Repeat(`\`, 200),
+		strings.Repeat("é", 4096),
+		strings.Repeat("☃", 4096),
+		strings.Repeat("a\nb", 200),
+		strings.Repeat("\x1b[31m", 200), // an ansi escape, which a terminal would obey
+	} {
+		got := bounded(v)
+
+		// The ellipsis marks the truncation and is not part of the value, so it
+		// comes off before the result is unquoted.
+		candidate := got
+		if strings.HasSuffix(got, "…\"") {
+			candidate = strings.TrimSuffix(got, "…\"") + `"`
+		}
+
+		if _, err := strconv.Unquote(candidate); err != nil {
+			t.Errorf("bounded(%d bytes) is not a valid quoted value (%v): %q",
+				len(v), err, got[max(0, len(got)-24):])
+		}
+
+		// AND NO CONTROL BYTE SURVIVES THE TRUNCATING PATH. Unquoting alone does not
+		// establish it — Go's unquote tolerates a raw NUL or tab inside a literal —
+		// so a truncation that stopped escaping would still parse. What must not
+		// happen is a byte from another program reaching a terminal as a live
+		// control, which is what the quoting is for.
+		for _, r := range got {
+			if r < 0x20 || r == 0x7f {
+				t.Errorf("bounded(%d bytes) passed a raw control byte %q through", len(v), r)
+
+				break
+			}
+		}
+	}
+}
+
+// A REFUSAL ALWAYS NAMES A REASON.
+//
+// The cause list re-derives what EffectiveCloneFormat already decided, and two
+// functions applying one rule is how they come to disagree. If they ever do, the
+// operator must get a sentence rather than a colon with nothing after it — so
+// this drives every combination that refuses and asserts the message says
+// something.
+func TestARefusalAlwaysNamesAReason(t *testing.T) {
+	t.Parallel()
+
+	for _, release := range []string{"luminous", "unknown", "mimic", "tentacle"} {
+		for _, image := range []string{"auto", "1", "2"} {
+			for _, cache := range []string{"auto", "1", "2"} {
+				rec := answer()
+				rec.minCompat = release
+				rec.cloneFormat = image
+				rec.cacheCloneFormat = cache
+
+				_, err := client(t, valid(), rec).CheckReachable(t.Context())
+				if err == nil || !errors.Is(err, ErrCloneV1) {
+					continue
+				}
+
+				// Everything after the sentinel's own sentence is the reason.
+				reason := strings.TrimPrefix(err.Error(), ErrCloneV1.Error())
+				if len(strings.TrimSpace(strings.TrimPrefix(reason, ":"))) < 20 {
+					t.Errorf("release %q, pools %q/%q: refused with no reason: %v",
+						release, image, cache, err)
+				}
+			}
+		}
+	}
+}
+
+// A TRUNCATED RENDERING IS STILL TERMINATED.
+//
+// The cut can land inside an escape — `"aaa\x0` — and an odd number of trailing
+// backslashes escapes the quote billet appends, so the value reads as though it
+// were never closed. Probed rather than reasoned: two of five sample cuts
+// produced one.
+func TestATruncatedRenderingDoesNotEscapeItsOwnQuote(t *testing.T) {
+	t.Parallel()
+
+	for _, v := range []string{
+		strings.Repeat("a", 296) + "\x00\x00",
+		strings.Repeat("a", 297) + "\x00\x00",
+		strings.Repeat("a", 298) + "\x00\x00",
+		strings.Repeat(`\`, 200),
+		strings.Repeat("\x00", 100),
+	} {
+		got := bounded(v)
+
+		body := strings.TrimSuffix(got, "…\"")
+
+		trailing := 0
+		for i := len(body) - 1; i >= 0 && body[i] == '\\'; i-- {
+			trailing++
+		}
+
+		if trailing%2 == 1 {
+			t.Errorf("bounded(%d bytes) ends in an odd run of backslashes, so the closing quote "+
+				"is escaped: %q", len(v), got[len(got)-16:])
+		}
+	}
+}
+
+// THE FLOOR CLAUSE NAMES ONLY THE POOLS THAT WOULD ACTUALLY FALL BACK TO IT.
+//
+// A pool forced to 2 never takes the floor's answer, before or after the other
+// overrides are removed — so "its pools would" describes the aggregate rather
+// than what happens. The remedy still converges either way; the sentence has to
+// be true as well as useful.
+func TestTheFloorClauseNamesOnlyThePoolsThatWouldFallBackToIt(t *testing.T) {
+	t.Parallel()
+
+	rec := answer()
+	rec.minCompat = "luminous"
+	rec.cloneFormat = "1"      // billet-images: forced old, so it would fall back
+	rec.cacheCloneFormat = "2" // billet-cache: pinned new, so it never does
+	rec.cloneSource = "config"
+
+	_, err := client(t, valid(), rec).CheckReachable(t.Context())
+	if err == nil {
+		t.Fatal("CheckReachable accepted a cluster with a pool forced to the old format")
+	}
+
+	// Cut rather than Index-and-slice: Index returns -1 when the clause is absent,
+	// and slicing from there PANICS — which a test reports as a crash rather than
+	// as the assertion that the floor clause was missing.
+	_, floor, found := strings.Cut(err.Error(), "require-min-compat-client")
+	if !found {
+		t.Fatalf("the refusal names no floor clause at all: %v", err)
+	}
+
+	if !strings.Contains(floor, "billet-images") {
+		t.Errorf("the floor clause does not name the pool that would fall back to it: %s", floor)
+	}
+
+	if strings.Contains(floor, "billet-cache") {
+		t.Errorf("the floor clause names a pool pinned to the new format, which never takes it: %s",
+			floor)
 	}
 }

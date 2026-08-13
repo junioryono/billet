@@ -44,8 +44,8 @@ func TestAHostWithNoRBDFailsTheCheck(t *testing.T) {
 		t.Fatal("checkCephCluster reported success on a host with no rbd command")
 	}
 
-	if !errors.Is(err, ceph.ErrNoRBD) {
-		t.Errorf("the failure is not ErrNoRBD, so a caller cannot tell it from an unreachable "+
+	if !errors.Is(err, ceph.ErrNoClient) {
+		t.Errorf("the failure is not ErrNoClient, so a caller cannot tell it from an unreachable "+
 			"cluster: %v", err)
 	}
 
@@ -84,7 +84,7 @@ func TestTheCheckRefusesAnAdministratorBeforeItLooksForRBD(t *testing.T) {
 		t.Fatal("checkCephCluster accepted an admin identity")
 	}
 
-	if errors.Is(err, ceph.ErrNoRBD) {
+	if errors.Is(err, ceph.ErrNoClient) {
 		t.Errorf("the refusal was about the missing binary rather than the identity: %v", err)
 	}
 
@@ -155,7 +155,7 @@ tiers:
 		t.Fatal("billet check passed a firecracker host with no rbd command")
 	}
 
-	if !errors.Is(err, ceph.ErrNoRBD) {
+	if !errors.Is(err, ceph.ErrNoClient) {
 		t.Errorf("the failure is not the missing client, so `billet check` may have stopped for "+
 			"some other reason and never reached the cluster at all: %v", err)
 	}
@@ -171,13 +171,15 @@ func TestAClusterThatRefusesFailsTheCheck(t *testing.T) {
 	// Not parallel: PATH is process-global.
 	dir := t.TempDir()
 
-	// A stand-in rbd that answers the way a real one does when the identity is not
-	// permitted. The preflight shells out, so this is the whole seam.
-	stub := filepath.Join(dir, "rbd")
+	// Stand-ins for both commands, answering the way a real cluster does when the
+	// identity is not permitted. The preflight shells out, so this is the whole
+	// seam — and BOTH are needed, or the check fails on the missing binary instead
+	// and this test passes for the wrong reason.
 	script := "#!/bin/sh\necho 'rbd: listing images failed: (1) Operation not permitted' >&2\nexit 1\n"
-
-	if err := os.WriteFile(stub, []byte(script), 0o700); err != nil {
-		t.Fatalf("write the stub: %v", err)
+	for _, name := range []string{"rbd", "ceph"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(script), 0o700); err != nil {
+			t.Fatalf("write the %s stub: %v", name, err)
+		}
 	}
 
 	t.Setenv("PATH", dir)
@@ -191,7 +193,7 @@ func TestAClusterThatRefusesFailsTheCheck(t *testing.T) {
 		t.Fatal("checkCephCluster reported success against a cluster that refused it")
 	}
 
-	if errors.Is(err, ceph.ErrNoRBD) {
+	if errors.Is(err, ceph.ErrNoClient) {
 		t.Errorf("the stub was not used; the failure is a missing binary: %v", err)
 	}
 
@@ -201,5 +203,77 @@ func TestAClusterThatRefusesFailsTheCheck(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("the error does not carry %q: %v", want, err)
 		}
+	}
+}
+
+// stubCluster puts a fake rbd and ceph on PATH, answering as a cluster would.
+//
+// The preflight shells out, so this is the whole seam — and BOTH commands have to
+// exist, or the check fails on the missing binary and every case here passes for
+// the wrong reason.
+func stubCluster(t *testing.T, minCompat string) {
+	t.Helper()
+
+	dir := t.TempDir()
+
+	// rbd answers an empty pool; ceph answers the release, and a pool listing for
+	// anything else it is asked.
+	scripts := map[string]string{
+		"rbd": "#!/bin/sh\necho '[]'\n",
+		"ceph": "#!/bin/sh\n" +
+			"for a in \"$@\"; do\n" +
+			"  if [ \"$a\" = get-require-min-compat-client ]; then printf '%s\\n' '" + minCompat + "'; exit 0; fi\n" +
+			"done\n" +
+			"echo '[{\"pool_name\":\"billet-images\",\"size\":2,\"min_size\":1}," +
+			"{\"pool_name\":\"billet-cache\",\"size\":2,\"min_size\":1}]'\n",
+	}
+
+	for name, body := range scripts {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o700); err != nil {
+			t.Fatalf("write the %s stub: %v", name, err)
+		}
+	}
+
+	t.Setenv("PATH", dir)
+}
+
+// A CLUSTER THAT WOULD CLONE THE OLD WAY FAILS THE CHECK.
+//
+// The refusal lives in the ceph package; this is the assertion that the CLI acts
+// on it rather than printing it and carrying on — the same gap the missing-binary
+// branch had, one branch down.
+func TestACloneV1ClusterFailsTheCheck(t *testing.T) {
+	stubCluster(t, "luminous")
+
+	err := checkCephCluster(t.Context(), &config.CephConfig{
+		User:      config.DefaultCephUser,
+		ImagePool: "billet-images",
+		CachePool: "billet-cache",
+	})
+	if err == nil {
+		t.Fatal("checkCephCluster accepted a cluster that would clone the old way")
+	}
+
+	if !errors.Is(err, ceph.ErrCloneV1) {
+		t.Errorf("the failure is not ErrCloneV1: %v", err)
+	}
+
+	if !strings.Contains(err.Error(), "set-require-min-compat-client mimic") {
+		t.Errorf("the error does not carry the command that fixes it: %v", err)
+	}
+}
+
+// ...AND ONE THAT WOULD NOT, PASSES. The other direction, because a check that
+// refused every cluster would satisfy the case above while making the storage
+// unusable everywhere.
+func TestACloneV2ClusterPassesTheCheck(t *testing.T) {
+	stubCluster(t, "mimic")
+
+	if err := checkCephCluster(t.Context(), &config.CephConfig{
+		User:      config.DefaultCephUser,
+		ImagePool: "billet-images",
+		CachePool: "billet-cache",
+	}); err != nil {
+		t.Fatalf("checkCephCluster refused a cluster configured for clone v2: %v", err)
 	}
 }
