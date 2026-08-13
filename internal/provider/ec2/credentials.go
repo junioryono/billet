@@ -128,8 +128,20 @@ func (s StaticCredentials) LogValue() slog.Value {
 
 // Credentials satisfies CredentialSource.
 func (s StaticCredentials) Credentials(context.Context) (Credentials, error) {
-	if s.AccessKeyID == "" || s.SecretAccessKey == "" {
+	// THE SAME DISTINCTION THE ENVIRONMENT SOURCE MAKES, because ChainCredentials
+	// now relies on it: errNoCredentials means "nothing here, try the next one",
+	// and anything else stops the chain. A half-filled source reporting an absence
+	// would fall through to a different AWS identity, which is the failure that
+	// distinction exists to prevent — so it has to hold for EVERY source rather
+	// than the one where it was noticed.
+	switch {
+	case s.AccessKeyID == "" && s.SecretAccessKey == "":
 		return Credentials{}, errNoCredentials
+
+	case s.AccessKeyID == "" || s.SecretAccessKey == "":
+		return Credentials{}, errors.New("ec2: these credentials have only one half of an " +
+			"access key and a secret; refusing to fall through to another source, which would " +
+			"run billet as a different aws identity")
 	}
 
 	return Credentials(s), nil
@@ -304,9 +316,13 @@ func (i *IMDSCredentials) fetch(ctx context.Context) (Credentials, error) {
 			name, payload.Code)
 	}
 
+	// NOT errNoCredentials. A role that answered with half a credential is
+	// MALFORMED, not absent, and wrapping the sentinel would let the chain carry
+	// on to another source — running billet as an identity nobody chose, which is
+	// exactly what the sentinel's meaning was tightened to prevent.
 	if payload.AccessKeyID == "" || payload.SecretAccessKey == "" {
 		return Credentials{}, fmt.Errorf("ec2: imds returned an incomplete credential document "+
-			"for instance profile %s: %w", name, errNoCredentials)
+			"for instance profile %s", name)
 	}
 
 	return Credentials{

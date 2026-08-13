@@ -244,10 +244,12 @@ node:
   #
   # An ec2 node is an ORCHESTRATOR: it holds credentials and calls an API, and the
   # compute appears in a region. Nothing runs on the machine billet runs on, so
-  # max_vcpu and max_memory above are REQUIRED here rather than detected — they are
-  # the spending limit, and billet will not choose one on your account. They are
-  # also most of the cost policy: the allocator never buys past them, and the ORDER
-  # of a tier's `providers:` list is what makes home fill first.
+  # max_vcpu and max_memory above are REQUIRED here rather than detected — billet
+  # will not choose how much to buy on your account. They are NOT yet a spending
+  # limit, and reading them as one is a mistake: the allocator charges a job the
+  # size its TIER asked for, while this backend buys the first shape below that
+  # FITS, so shapes larger than their tiers multiply the real spend (#47). The
+  # ORDER of a tier's `providers:` list does make home fill first.
   #
   # Credentials come from AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / (optionally)
   # AWS_SESSION_TOKEN, and failing that from this instance's own IAM role over
@@ -272,8 +274,13 @@ node:
   #   # than quietly placed on the trusted group.
   #   # untrusted_security_group_ids: [sg-0fork]
   #
-  #   # An IAM role handed to whatever the job runs. Empty is the right answer
-  #   # unless a job genuinely needs AWS credentials.
+  #   # An IAM role handed to whatever a TRUSTED job runs. Empty is the right
+  #   # answer unless a job genuinely needs AWS credentials.
+  #   #
+  #   # UNTRUSTED WORK NEVER RECEIVES IT. A fork's pull request runs its steps
+  #   # directly on the instance, so it could read the role's temporary
+  #   # credentials out of the metadata service — straight past the isolation
+  #   # that lets this backend run untrusted work at all.
   #   # instance_profile: billet-runner
   #
   #   # THE SHAPES BILLET MAY BUY, each declaring what it holds, because billet

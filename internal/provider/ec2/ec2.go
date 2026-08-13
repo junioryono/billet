@@ -12,8 +12,10 @@
 // The node running it is an ORCHESTRATOR. It holds credentials and calls an API;
 // nothing runs on the machine billet is running on. So what that machine has is
 // not what this node can offer, and `node.max_vcpu` / `node.max_memory` are
-// required rather than detected — they are a spending limit, and billet has no
-// standing to choose one.
+// required rather than detected. They are NOT a spending limit, though it is easy
+// to read them as one: the allocator charges a job the size its tier asked for
+// while this backend buys the first declared shape that FITS, so shapes larger
+// than their tiers multiply the real spend (#47).
 //
 // And the instance IS the isolation boundary, so this backend can run fork
 // pull-request code that the docker backend must refuse. That boundary is the
@@ -357,11 +359,14 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*provider.In
 
 	// REFUSED HERE RATHER THAN BY EC2. A tier's command has no bound of its own and
 	// the registration is appended to it, so a config that validates can still
-	// produce a script the service will always reject — and by then a JIT
-	// registration has been minted against GitHub, and a launch that fails
-	// ambiguously holds the lease in custody, because absence from one Find is not
-	// proof nothing started. A local check turns all of that into an ordinary
-	// refusal that hands the capacity straight back.
+	// produce a script the service will always reject.
+	//
+	// IT DOES NOT SAVE THE REGISTRATION, and an earlier version of this comment
+	// claimed it did: the runner mints one before it ever calls Launch, so by here
+	// it exists whatever this decides. What a local refusal buys is that NOTHING
+	// WAS SENT — so the failure is unambiguous, `destroyStray` has nothing to look
+	// for, and the lease is released instead of being held in custody because
+	// absence from one Find is not proof nothing started.
 	//
 	// THE RAW SCRIPT IS WHAT IS MEASURED. EC2 documents the 16 KiB limit against
 	// the data before encoding.
@@ -428,17 +433,27 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*provider.In
 	var out runInstancesResponse
 
 	if err := p.api.call(ctx, params, &out); err != nil {
-		// SCRUBBED, because the service's own message is rendered verbatim and this
-		// is the one request that carries a credential. RunInstances sends the
-		// registration as user data, and an endpoint that echoes a rejected
+		// THE SERVICE'S MESSAGE IS DROPPED FOR THIS ONE ACTION, not filtered.
+		//
+		// RunInstances is the only request that carries a credential: the
+		// registration travels as user data. An endpoint that echoes a rejected
 		// parameter — AWS is unlikely to, a proxy or a configured endpoint might —
-		// puts a live runner registration into an error that travels back through
+		// would put a live runner registration into an error that goes back through
 		// the node's command result and into logs.
 		//
-		// The api's own code and the rest of the message survive, because that is
-		// what an operator acts on.
-		return nil, fmt.Errorf("ec2: launch %s: %w", spec.Name,
-			scrubSecrets(err, encodedUserData, spec.JITConfig))
+		// SUBSTITUTING THE SECRET OUT WAS TRIED FIRST AND IS NOT ENOUGH. What
+		// travels on the wire is the base64 script inside a form-encoded body, so a
+		// body echoed verbatim contains neither the raw registration nor the raw
+		// base64 — it contains `%3D` where the padding was. Any list of encodings
+		// is a guess at what an intermediary did, and billet already learned this
+		// on the GitHub onboarding code: a secret out of its field is an opaque
+		// string, so the fix is to write the message yourself rather than to filter
+		// somebody else's.
+		//
+		// The CODE survives, because it comes from AWS's own fixed enumeration and
+		// is the actionable half — InvalidParameterValue, UnauthorizedOperation,
+		// InsufficientInstanceCapacity. Every other action keeps its message.
+		return nil, fmt.Errorf("ec2: launch %s: %w", spec.Name, withoutMessage(err))
 	}
 
 	if len(out.Instances) == 0 {
@@ -928,34 +943,20 @@ func defaultEndpointFor(region string) string {
 // maxUserData is what EC2 accepts, measured before base64 encoding.
 const maxUserData = 16 * 1024
 
-// scrubSecrets replaces anything in an error's message that must not be logged.
+// withoutMessage strips the service's own prose from an API error, keeping its
+// code.
 //
-// A LAST LINE RATHER THAN THE ONLY ONE. Nothing billet writes puts a credential
-// in an error; what this covers is a message billet did not write — the API's,
-// repeated verbatim because it is usually the most useful part — coming back with
-// a parameter billet sent echoed inside it.
-//
-// The identity of the error is deliberately NOT preserved: this is a leaf whose
-// whole text is suspect, and the same trade is already made for the GitHub
-// onboarding code, where safety beats identity at a node that carries a secret.
-// Callers of Launch branch on nothing but success.
-func scrubSecrets(err error, secrets ...string) error {
-	msg := err.Error()
-	cleaned := msg
-
-	for _, secret := range secrets {
-		if secret == "" {
-			continue
-		}
-
-		cleaned = strings.ReplaceAll(cleaned, secret, "[REDACTED]")
-	}
-
-	if cleaned == msg {
+// For the one action that sends a credential. The code is from AWS's fixed
+// enumeration and is what an operator acts on; the message is free text billet
+// did not write, on a request whose body contains a live runner registration.
+func withoutMessage(err error) error {
+	var apiErr *apiError
+	if !errors.As(err, &apiErr) {
 		return err
 	}
 
-	return errors.New(cleaned)
+	return &apiError{Code: apiErr.Code, Status: apiErr.Status,
+		Message: "(message withheld: this request carries a runner registration)"}
 }
 
 // errRedirected marks a refusal to follow a redirect, so the api boundary can

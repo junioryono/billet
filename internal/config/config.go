@@ -459,10 +459,15 @@ type EC2Config struct {
 	// gateway. A runner that cannot reach GitHub registers and then does nothing.
 	AssignPublicIP bool `yaml:"assign_public_ip,omitempty"`
 
-	// InstanceProfile is the IAM role instances receive. OPTIONAL, and empty is
-	// the right answer unless a job genuinely needs AWS credentials: an instance
-	// profile is readable from inside the guest, so it is a credential handed to
-	// whatever the job runs.
+	// InstanceProfile is the IAM role TRUSTED instances receive. OPTIONAL, and
+	// empty is the right answer unless a job genuinely needs AWS credentials: an
+	// instance profile is readable from inside the guest, so it is a credential
+	// handed to whatever the job runs.
+	//
+	// UNTRUSTED WORK NEVER GETS IT, whatever this says. A fork's pull request runs
+	// its steps directly on the instance, so it could read the role's temporary
+	// credentials out of the metadata service — past the isolation that lets this
+	// backend run untrusted work at all.
 	InstanceProfile string `yaml:"instance_profile,omitempty"`
 
 	// InstanceTypes are the shapes billet may buy, each DECLARING what it holds,
@@ -1414,14 +1419,14 @@ func (c *Config) validateEC2Node() []error {
 		errs = append(errs, errors.New(
 			"node.max_vcpu is required when provider is ec2: there is no machine to detect it "+
 				"from, because the compute this node launches runs in a region rather than on "+
-				"this host, and the number is a spending limit billet will not choose for you"))
+				"this host, and billet will not choose how much to buy on your behalf"))
 	}
 
 	if c.Node.MaxMemory <= 0 {
 		errs = append(errs, errors.New(
 			"node.max_memory is required when provider is ec2: there is no machine to detect it "+
 				"from, because the compute this node launches runs in a region rather than on "+
-				"this host, and the number is a spending limit billet will not choose for you"))
+				"this host, and billet will not choose how much to buy on your behalf"))
 	}
 
 	if c.Node.EC2 == nil {
