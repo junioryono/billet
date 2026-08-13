@@ -29,7 +29,7 @@ The mdraid RAID1 root on `nvme1n1`/`nvme2n1` is untouched and still holds `/`, `
 
 ```bash
 cephadm bootstrap --mon-ip 192.168.1.126 --single-host-defaults \
-  --skip-dashboard --skip-monitoring-stack --ssh-user junior
+  --skip-dashboard --skip-monitoring-stack --ssh-user <account-with-passwordless-sudo>
 ceph orch daemon add osd ubuntu-01:/dev/nvme0n1
 ceph orch daemon add osd ubuntu-01:/dev/nvme3n1
 ceph osd pool create billet-images && rbd pool init billet-images
@@ -60,7 +60,7 @@ useradd  --system --uid 167 --gid 167 --home-dir /var/lib/ceph \
 
 That is one host account, not a PATH override, because cephadm re-runs the same command on every daemon start. (GNU coreutils is installed alongside as `gnu-coreutils`, with every binary prefixed `gnu`: `/usr/bin/gnuinstall`, `/usr/bin/gnudd`. Reach for those when a tool disagrees with its documentation — `dd iflag=direct` is another one that does.)
 
-**cephadm drives every host over SSH as root, and this host has `PermitRootLogin no`.** Enabling root login to satisfy an orchestrator is the wrong trade; `--ssh-user <user>` with passwordless sudo is supported and leaves the hardening in place. The user chosen already had passwordless sudo, so nothing new was granted.
+**cephadm drives every host over SSH as root, and this host has `PermitRootLogin no`.** Enabling root login to satisfy an orchestrator is the wrong trade; `--ssh-user <user>` with passwordless sudo is supported and leaves the hardening in place. The account chosen already had passwordless sudo, so no new privileged account was created.
 
 Neither of these is a Ceph bug, and neither is findable by reading. They are the reason this section exists.
 
