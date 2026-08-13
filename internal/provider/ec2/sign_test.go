@@ -309,3 +309,42 @@ func TestAQueryThatCannotBeReadFaithfullyIsRefused(t *testing.T) {
 		t.Errorf("an ordinary query was refused: %v", err)
 	}
 }
+
+// A REPEATED KEY'S VALUES ARE SORTED, AND AWS'S OWN SIGNER SAYS SO.
+//
+// url.Values.Encode sorts KEYS and preserves the order each key's values arrived
+// in; AWS's signer sorts the values as well. So `a=z&a=a` signed as itself here
+// and as `a=a&a=z` there — the same opaque 403 the rest of this file exists to
+// prevent, in a signer described as general.
+//
+// This vector was generated the same way as the ones at the top of the file, by
+// aws-sdk-go-v2 signing the identical request, and billet disagreed with it until
+// the values were sorted. Regenerate it with the snippet in that comment, adding
+// the raw query below to the request URL.
+func TestARepeatedQueryKeySignsTheWayAWSSignsIt(t *testing.T) {
+	const rawQuery = "a=z&a=a&b=two+words"
+
+	req, err := http.NewRequest(http.MethodPost, //nolint:noctx // signing does not issue it
+		vectorURL+"?"+rawQuery, strings.NewReader(vectorBody))
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=utf-8")
+	req.ContentLength = int64(len(vectorBody))
+
+	creds := Credentials{AccessKeyID: vectorKey, SecretAccessKey: vectorSecret}
+
+	if err := sign(req, []byte(vectorBody), creds, vectorRegion, vectorTime()); err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+
+	const want = "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260812/us-west-2/ec2/aws4_request, " +
+		"SignedHeaders=content-length;content-type;host;x-amz-date, " +
+		"Signature=0422a3211d9dba286b81a067de282f65d915eafbb7d54fc2099674ea38406f28"
+
+	if got := req.Header.Get("Authorization"); got != want {
+		t.Errorf("billet and the aws sdk sign a repeated query key differently\n got: %s\nwant: %s",
+			got, want)
+	}
+}

@@ -1931,3 +1931,42 @@ func TestAnImageWhoseVolumesOutliveItIsReported(t *testing.T) {
 		t.Errorf("a volume that is already deleted on termination was reported: %s", got)
 	}
 }
+
+// AN IMAGE THAT SAYS NOTHING ABOUT DeleteOnTermination IS NOT WARNED ABOUT.
+//
+// Only an explicit "false" is worth naming: a mapping that omits the flag gets
+// EC2's own default for however the image was registered, which billet has no
+// standing to second-guess. Pinned separately because the main test asserts what
+// IS reported, and a warning that fires on silence would be the noise that trains
+// an operator to ignore all of them.
+func TestAnImageSilentAboutTerminationIsNotWarnedAbout(t *testing.T) {
+	f := newFakeEC2(t)
+	f.respond = func(action string, params url.Values) (int, string) {
+		if action != "DescribeImages" {
+			return http.StatusOK, defaultReply(action)
+		}
+
+		return http.StatusOK, `<DescribeImagesResponse><imagesSet><item>` +
+			`<imageId>ami-0abc</imageId><rootDeviceName>/dev/xvda</rootDeviceName>` +
+			`<blockDeviceMapping>` +
+			`<item><deviceName>/dev/sdq</deviceName><ebs></ebs></item>` +
+			`</blockDeviceMapping></item></imagesSet></DescribeImagesResponse>`
+	}
+
+	var logged bytes.Buffer
+
+	p := newTestProvider(t, f, nil)
+	p.log = slog.New(slog.NewTextHandler(&logged, nil))
+
+	spec := validSpec()
+	spec.Disk = 80 * config.GiB
+
+	if _, err := p.Launch(t.Context(), spec); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	if strings.Contains(logged.String(), "/dev/sdq") {
+		t.Errorf("a mapping that says nothing about termination was warned about: %s",
+			logged.String())
+	}
+}
