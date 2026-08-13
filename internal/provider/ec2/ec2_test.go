@@ -1463,3 +1463,30 @@ func TestARefusedRedirectIsNotRetried(t *testing.T) {
 			"non-redirect, so each retry is another signed request for nothing", got)
 	}
 }
+
+// THE SUFFIX IS NOT THE SAME IN EVERY PARTITION, and the region rule deliberately
+// admits partitions billet has never run in — so deriving the commercial suffix
+// for all of them produces a host that does not exist, and a config that loads
+// cleanly and fails at the first API call.
+func TestTheDerivedEndpointFollowsThePartition(t *testing.T) {
+	for region, want := range map[string]string{
+		"us-west-2":      "https://ec2.us-west-2.amazonaws.com/",
+		"us-gov-west-1":  "https://ec2.us-gov-west-1.amazonaws.com/",
+		"cn-north-1":     "https://ec2.cn-north-1.amazonaws.com.cn/",
+		"cn-northwest-1": "https://ec2.cn-northwest-1.amazonaws.com.cn/",
+	} {
+		t.Run(region, func(t *testing.T) {
+			cfg := validEC2Config("")
+			cfg.Region = region
+
+			p, err := New("dep-1", cfg)
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+
+			if got := p.api.endpoint; got != want {
+				t.Errorf("endpoint = %q, want %q", got, want)
+			}
+		})
+	}
+}

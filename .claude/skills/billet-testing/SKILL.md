@@ -73,7 +73,7 @@ case active:
 
 - `t.Context()` and `t.TempDir()`, never `context.Background()` or a hand-made temp dir. Enforced by `usetesting`.
 - `t.Cleanup` for teardown, so it runs on the `t.Fatal` path too.
-- No `t.Parallel()`. `paralleltest` is deliberately disabled: these tests open real SQLite files, and parallelism buys nothing while inviting flakes.
+- **`t.Parallel()` only where nothing touches the disk.** `paralleltest` is deliberately disabled rather than enforced either way, because the answer differs by package: anything opening real SQLite files (`internal/state`, `internal/alloc`, `internal/e2e`) gains nothing from parallelism and invites flakes, while the pure-function suites — `internal/config` above all — have used it from the start and should keep matching the file they are added to. The rule is the reason, not the keyword: if a test owns a file, a port or a daemon, it runs alone.
 - Table tests for pure functions (`ParseByteSize`); named functions for anything asserting an invariant, so a failure names the invariant.
 
 ## Testing the state store

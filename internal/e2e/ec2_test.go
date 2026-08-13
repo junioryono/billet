@@ -208,6 +208,17 @@ func (f *fakeCloud) terminatedIDs() []string {
 	return append([]string(nil), f.terminated...)
 }
 
+// stillShuttingDown reports whether an instance has been asked to terminate and
+// has not finished.
+func (f *fakeCloud) stillShuttingDown(id string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	_, ok := f.shuttingDown[id]
+
+	return ok
+}
+
 // finishTerminating is EC2 completing a shutdown on its own clock.
 func (f *fakeCloud) finishTerminating() {
 	f.mu.Lock()
@@ -404,6 +415,15 @@ func TestAJobReachesACloudInstance(t *testing.T) {
 	// still reported — is Reconcile's, and is tested against the ledger in
 	// internal/alloc. Claiming the capacity half here would be claiming something
 	// these lines do not observe.
+	// DESTROY REPORTED SUCCESS WHILE THE MACHINE IS STILL SHUTTING DOWN, which is
+	// the divergence from the container backend stated in ec2.Destroy's comment.
+	// Pinned by a test so it is a documented property rather than something the
+	// next reader discovers.
+	if !s.cloud.stillShuttingDown(id) {
+		t.Fatal("the fake finished the termination synchronously, so this test can no longer " +
+			"observe the window Destroy returns inside")
+	}
+
 	during, err := s.runner.Instances(t.Context())
 	if err != nil {
 		t.Fatalf("Instances after destroy: %v", err)
