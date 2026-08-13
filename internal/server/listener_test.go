@@ -413,19 +413,43 @@ func TestCompletionReleasesTheLease(t *testing.T) {
 		}
 	}
 
-	l := NewListener(a, tiers[0].Label, session)
+	// A RUNNER THAT STARTS THINGS, without which this test could not fail. The
+	// default runner fails CLOSED — it declines the job and hands the capacity back
+	// inside the same handle() call — so the lease was released before the
+	// completion message ever arrived, `running` was never observably 1, and the
+	// final assertion of 0 held whether or not completion released anything at all.
+	// Deleting the release outright left it green.
+	l := NewListener(a, tiers[0].Label, session,
+		WithRunner(&fakeRunner{}), WithDrainGrace(notDrainingHere))
 
-	var running atomic.Int32
+	var (
+		running atomic.Int32
+		held    atomic.Bool
+	)
 
-	session.onPoll = func(int) { running.Store(int32(l.Running())) }
+	session.onPoll = func(int) {
+		n := int32(l.Running())
+		running.Store(n)
 
-	cancelWhen(t, cancel, "the assignment and its completion to be consumed", func() bool {
-		return stage.Load() > 2
+		if n > 0 {
+			held.Store(true)
+		}
+	}
+
+	// THE LEASE MUST BE SEEN HELD FIRST, which is the other half: a final count of
+	// zero only means the completion released something if something was there.
+	cancelWhen(t, cancel, "the lease to be held and then completed", func() bool {
+		return held.Load() && stage.Load() > 2
 	})
 
 	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) &&
 		!errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Run: %v", err)
+	}
+
+	if !held.Load() {
+		t.Fatal("the lease was never observed running, so a final count of zero proves " +
+			"nothing about completion releasing it")
 	}
 
 	if got := running.Load(); got != 0 {
