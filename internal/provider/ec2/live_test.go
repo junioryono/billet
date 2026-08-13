@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"log/slog"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -84,6 +85,22 @@ func TestLiveSmoke(t *testing.T) {
 	// 2. LAUNCH.
 	t.Log("=== 2. does the RunInstances request billet builds actually launch? ===")
 
+	// REFUSED IF THE IMAGE WOULD LEAVE A VOLUME BEHIND. Destroy terminates the
+	// instance; it does not delete volumes, and this client cannot. An AMI whose
+	// non-root mapping says DeleteOnTermination=false would leave a tagged,
+	// billable disk behind even on a completely successful run — a leak with no
+	// failure attached to notice it by.
+	if layout, err := p.imageLayout(ctx, image); err != nil {
+		t.Fatalf("inspect %s before launching it: %v", image, err)
+	} else {
+		for _, d := range layout.devices {
+			if d.keep == "false" {
+				t.Fatalf("%s keeps %s past termination, and this test cannot delete volumes; "+
+					"pick an image whose devices are all deleted on termination", image, d.name)
+			}
+		}
+	}
+
 	// A FRESH LEASE ID PER RUN, and the first attempt at this test taught why. A
 	// fixed one made the second run fail with IdempotentParameterMismatch: the
 	// lease id IS the ClientToken, and the same token with different parameters is
@@ -112,33 +129,82 @@ func TestLiveSmoke(t *testing.T) {
 		JITConfig: "not-a-real-jit-config",
 	}
 
-	inst, err := p.Launch(ctx, spec)
+	// REGISTERED BEFORE THE LAUNCH, AND KEYED ON THE NAME, because the id is not
+	// the only way an instance can exist.
+	//
+	// Launch can return (nil, error) after AWS has already accepted RunInstances —
+	// a context expiring mid-reply, a response that will not parse, a read that
+	// fails. The instance is then real, billable, and has no id this test ever saw.
+	// The name is knowable BEFORE the call, though, and the provider offers Find
+	// for exactly this ambiguity, so cleanup does not depend on Launch having
+	// returned anything.
+	//
+	// IT RETRIES until its own deadline rather than reporting one failure and
+	// exiting, since a single failed Destroy leaves a machine running indefinitely.
+	t.Cleanup(func() {
+		//nolint:usetesting // t.Context() is already cancelled when cleanup runs.
+		clean, stop := context.WithTimeout(context.Background(), 3*time.Minute)
+		defer stop()
 
-	if inst != nil {
-		t.Cleanup(func() {
-			// UNCONDITIONAL, because a test failure must not leave an instance
-			// running.
-			//
-			// A FRESH CONTEXT, AND NOT t.Context(), which the linter asks for and
-			// which would be wrong here: Go cancels the test context just BEFORE
-			// running cleanup functions, so using it would hand a cancelled context
-			// to the one call whose whole job is to stop a machine that costs money.
-			// The failure mode is a running instance and a passing test.
-			//nolint:usetesting // t.Context() is already cancelled when cleanup runs.
-			clean, stop := context.WithTimeout(context.Background(), 2*time.Minute)
-			defer stop()
-
-			if err := p.Destroy(clean, inst.ID); err != nil {
-				t.Errorf("CLEANUP FAILED, instance %s may still be running: %v", inst.ID, err)
+		for {
+			found, ok, err := p.Find(clean, spec.Name)
+			if err == nil && !ok {
+				return
 			}
-		})
-	}
+
+			if err == nil && ok {
+				if err = p.Destroy(clean, found.ID); err == nil {
+					return
+				}
+			}
+
+			select {
+			case <-clean.Done():
+				t.Errorf("CLEANUP EXHAUSTED ITS DEADLINE. An instance named %q, tagged "+
+					"owner=%q, may still be running and billing: %v", spec.Name, owner, err)
+
+				return
+			case <-time.After(5 * time.Second):
+			}
+		}
+	})
+
+	inst, err := p.Launch(ctx, spec)
 
 	if err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 
 	t.Logf("    launched %s", inst.ID)
+
+	// 2b. THE SAME LEASE CANNOT BUY A SECOND INSTANCE, which was previously
+	// established by accident — a fixed lease id across two manual runs — and so
+	// was not exercised by anything committed.
+	//
+	// The lease id IS the ClientToken. Relaunching the same lease with DIFFERENT
+	// parameters is what AWS refuses, so this asks for a different disk size and
+	// expects to be turned down. That is the property the whole
+	// escrow-before-advertisement design leans on: a retried launch must not
+	// quietly produce a second billable machine for one job.
+	t.Log("=== 2b. does the lease id actually prevent a second instance? ===")
+
+	again := spec
+	again.Disk = 30 * config.GiB
+
+	dup, dupErr := p.Launch(ctx, again)
+
+	switch {
+	case dupErr == nil && dup != nil && dup.ID == inst.ID:
+		t.Errorf("    relaunching with different parameters returned the SAME instance (%s); "+
+			"expected AWS to refuse the token reuse", dup.ID)
+	case dupErr == nil:
+		t.Errorf("    relaunching the same lease with different parameters SUCCEEDED and "+
+			"produced %v — one job, two machines", dup)
+	case strings.Contains(dupErr.Error(), "IdempotentParameterMismatch"):
+		t.Log("    refused with IdempotentParameterMismatch, which is the token doing its job")
+	default:
+		t.Errorf("    relaunch was refused, but not for the reason expected: %v", dupErr)
+	}
 
 	// 3. LIST FINDS IT, which exercises the owner tag and the name-to-lease
 	// mapping that is the only durable link between compute and a lease.
@@ -227,9 +293,20 @@ func TestLiveSmoke(t *testing.T) {
 		t.Log("    immediately after Destroy, List no longer reports it")
 	}
 
-	// HOW LONG THE WINDOW ACTUALLY IS. The ADR says the guest "keeps running for a
-	// minute or two" and cites nothing; this measures it. The number is the length
-	// of time billet's listener believes the compute is gone while it is not.
+	// WHAT THIS MEASURES, EXACTLY, because the first version of this comment claimed
+	// more than the code can see.
+	//
+	// Instance.Running is true for every EC2 state except stopped and terminated —
+	// including shutting-down, which the provider reports as running on purpose,
+	// since a backend that cannot tell must not report a live job as finished. So
+	// this measures HOW LONG LIST KEEPS CLASSIFYING THE INSTANCE AS POTENTIALLY
+	// EXECUTING, which is not the same as the guest executing work. The command
+	// here is /bin/true; there is no workload to observe.
+	//
+	// That is still the number that matters for #46, because billet's listener
+	// reads exactly this signal: it treats a successful Destroy as proof the
+	// compute is gone. The window is the interval in which that belief is wrong by
+	// the provider's own account of the world.
 	t.Log("=== 4b. how long does the guest keep running after Destroy returned? ===")
 
 	deadline := time.Now().Add(3 * time.Minute)
@@ -249,7 +326,9 @@ func TestLiveSmoke(t *testing.T) {
 		}
 
 		if !running {
-			t.Logf("    the guest stopped being reported as running %s after Destroy returned",
+			// MEASURED FROM BEFORE THE CALL, and said so: start is taken before
+			// Destroy, so this includes Destroy's own ~410ms.
+			t.Logf("    List stopped classifying it as running %s after Destroy was CALLED",
 				time.Since(start).Round(time.Second))
 
 			break
