@@ -441,14 +441,17 @@ licensed FSL-1.1-ALv2; each release converts to Apache-2.0 after two years, and 
 use is restricted. `billet` treats it as an optional external dependency you install yourself, the
 same as Docker or Ceph. `billet` itself is Apache-2.0 throughout.
 
-**The cache will need Ceph, on the nodes' own NVMe.** A snapshot on one machine cannot be mounted on
+**A compute host needs Ceph, on the nodes' own NVMe.** A snapshot on one machine cannot be mounted on
 another, so a cache kept in local storage is a cache that pins every repository to the host that
-first built it. Ceph RBD gives the same snapshot-and-clone primitive from a pool any node can map,
-which is what makes a cache a property of a *place* rather than of a machine — and it is what the
-commercial products run. It replaces ZFS rather than sitting beside it
-([#23](https://github.com/junioryono/billet/issues/23)); on a single box it is honestly more moving
-parts than ZFS, and the reason to adopt it anyway is that retrofitting shared storage later means
-rewriting placement at the same time.
+first built it. Ceph RBD gives the same snapshot-and-clone primitive from a pool any node at the site
+can map, which is what makes a cache a property of a *place* rather than of a machine — and it is
+what the commercial products run. billet installs nothing: you run `cephadm bootstrap`, create two
+pools, and point `node.ceph` at them, the same way you install Docker or Tart yourself. On a single
+box it is honestly more moving parts than the ZFS pool it replaced ([#23](https://github.com/junioryono/billet/issues/23)),
+and the reason to adopt it anyway is that retrofitting shared storage later means rewriting placement
+at the same time. [`docs/adr-003-ceph-rbd.md`](docs/adr-003-ceph-rbd.md) is how the reference cluster
+was built and what it measured — including the two things about Ubuntu 26.04 that break `cephadm
+bootstrap`, and why clone v2 is a requirement rather than a preference.
 
 ## Roadmap
 
@@ -457,7 +460,7 @@ rewriting placement at the same time.
 | P0 — scaffolding, GitHub App onboarding, host prep | ✅ mostly |
 | P1 — runner plane: scale sets, allocator, providers | 🚧 listeners, allocator, Docker and the drain done; Firecracker next ([#24](https://github.com/junioryono/billet/issues/24)) |
 | P2 — guest images, node split, user-defined tiers | 🚧 node split + mTLS done; guest images need the machine ([#24](https://github.com/junioryono/billet/issues/24)) |
-| P3 — Ceph, the storage layer, sticky disks, trust classes | ⬜ [#20](https://github.com/junioryono/billet/issues/20) [#23](https://github.com/junioryono/billet/issues/23) [#25](https://github.com/junioryono/billet/issues/25) [#26](https://github.com/junioryono/billet/issues/26) |
+| P3 — Ceph, the storage layer, sticky disks, trust classes | 🚧 Ceph replaces ZFS and the reference cluster is built ([#23](https://github.com/junioryono/billet/issues/23)); the storage layer is not ⬜ [#20](https://github.com/junioryono/billet/issues/20) [#25](https://github.com/junioryono/billet/issues/25) [#26](https://github.com/junioryono/billet/issues/26) |
 | P4 — colocated Actions cache | ⬜ [#29](https://github.com/junioryono/billet/issues/29) |
 | P5 — Docker layer cache, registry mirrors, container baseline | ⬜ [#27](https://github.com/junioryono/billet/issues/27) [#28](https://github.com/junioryono/billet/issues/28) |
 | P6 — observability, SSH-into-a-job | ⬜ |

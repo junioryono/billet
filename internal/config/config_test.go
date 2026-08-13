@@ -185,7 +185,9 @@ node:
   state_dir: /var/lib/billet/node
   firecracker:
     kernel_image: /var/lib/billet/vmlinux
-    zfs_pool: tank
+  ceph:
+    image_pool: billet-images
+    cache_pool: billet-cache
 tiers:
   - label: billet-4vcpu-ubuntu-2404
     provider: firecracker
@@ -496,7 +498,7 @@ func TestDuplicateTierLabelRejected(t *testing.T) {
 
 func TestFirecrackerNodeRequiresKernelAndPool(t *testing.T) {
 	body := strings.Replace(validConfig,
-		"  firecracker:\n    kernel_image: /var/lib/billet/vmlinux\n    zfs_pool: tank\n", "", 1)
+		"  firecracker:\n    kernel_image: /var/lib/billet/vmlinux\n", "", 1)
 	if _, err := Load(writeConfig(t, body)); err == nil {
 		t.Fatal("Load accepted a firecracker node with no firecracker section")
 	}

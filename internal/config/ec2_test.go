@@ -14,7 +14,9 @@ const firecrackerNode = `node:
   state_dir: /var/lib/billet/node
   firecracker:
     kernel_image: /var/lib/billet/vmlinux
-    zfs_pool: tank
+  ceph:
+    image_pool: billet-images
+    cache_pool: billet-cache
 `
 
 // ec2Node is a complete, valid cloud node.
