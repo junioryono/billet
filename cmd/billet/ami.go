@@ -76,7 +76,13 @@ func cmdAMI(ctx context.Context, args []string) error {
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 
-	p, err := ec2.New("billet-ami-build", cfg, ec2.WithLogger(log))
+	// AN OWNER PER BUILD, not a constant. The owner tag is what separates one
+	// deployment's compute from another's in a shared account, and a fixed string
+	// would put every build anyone ever runs under the same identity — so the
+	// recovery story this tag exists for ("find the builder that leaked") would
+	// return other people's machines. The image name is already unique per account
+	// and region, which is exactly the property needed.
+	p, err := ec2.New("billet-ami-build-"+*name, cfg, ec2.WithLogger(log))
 	if err != nil {
 		return fmt.Errorf("configure the ec2 client: %w", err)
 	}
