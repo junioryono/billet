@@ -549,7 +549,7 @@ type Tier struct {
 	//
 	// Setting both this and Provider is an error rather than a merge: guessing which
 	// spelling an operator meant, when the answer decides where untrusted code runs,
-	// is not a kindness. Only docker is built (#32).
+	// is not a kindness. docker and ec2 are built; firecracker and tart are not.
 	Providers []ProviderKind `yaml:"providers,omitempty"`
 	// GuestOS defaults to linux. Set it explicitly for macOS and Windows tiers —
 	// licensing and capability checks key off this field, not off the label.

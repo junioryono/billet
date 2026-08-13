@@ -353,13 +353,30 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*provider.In
 		return nil, err
 	}
 
+	encodedUserData := base64.StdEncoding.EncodeToString([]byte(userData))
+
+	// REFUSED HERE RATHER THAN BY EC2. A tier's command has no bound of its own and
+	// the registration is appended to it, so a config that validates can still
+	// produce a script the service will always reject — and by then a JIT
+	// registration has been minted against GitHub, and a launch that fails
+	// ambiguously holds the lease in custody, because absence from one Find is not
+	// proof nothing started. A local check turns all of that into an ordinary
+	// refusal that hands the capacity straight back.
+	//
+	// THE RAW SCRIPT IS WHAT IS MEASURED. EC2 documents the 16 KiB limit against
+	// the data before encoding.
+	if len(userData) > maxUserData {
+		return nil, fmt.Errorf("ec2: the boot script for %s is %d bytes and ec2 accepts %d; "+
+			"the tier's command is too long to carry", spec.Name, len(userData), maxUserData)
+	}
+
 	params := url.Values{}
 	params.Set("Action", "RunInstances")
 	params.Set("ImageId", spec.Image)
 	params.Set("InstanceType", instanceType.Type)
 	params.Set("MinCount", "1")
 	params.Set("MaxCount", "1")
-	params.Set("UserData", base64.StdEncoding.EncodeToString([]byte(userData)))
+	params.Set("UserData", encodedUserData)
 
 	// THE NAME IS THE IDEMPOTENCY KEY, and this is what makes an ambiguous launch
 	// safe. A RunInstances that commits and loses its response is the exact case
@@ -378,7 +395,19 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*provider.In
 	params.Set("MetadataOptions.HttpTokens", "required")
 	params.Set("MetadataOptions.HttpPutResponseHopLimit", "1")
 
-	if p.cfg.InstanceProfile != "" {
+	// AN INSTANCE PROFILE IS A CREDENTIAL, AND UNTRUSTED WORK DOES NOT GET ONE.
+	//
+	// The one-hop metadata limit above stops a container inside the job reaching
+	// IMDS. It does not stop the job: a workflow step runs directly on the
+	// instance, so a fork's pull request could read the role's temporary
+	// credentials out of the metadata service and take them away. The isolation
+	// this backend offers untrusted work is the kernel and the machine, and an
+	// instance profile reaches straight past both.
+	//
+	// A deployment that genuinely needs untrusted jobs to hold AWS credentials has
+	// to say so with something that does not exist yet, which is the right amount
+	// of friction for that decision.
+	if p.cfg.InstanceProfile != "" && spec.Trust == provider.TrustTrusted {
 		params.Set("IamInstanceProfile.Name", p.cfg.InstanceProfile)
 	}
 
@@ -399,7 +428,17 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*provider.In
 	var out runInstancesResponse
 
 	if err := p.api.call(ctx, params, &out); err != nil {
-		return nil, fmt.Errorf("ec2: launch %s: %w", spec.Name, err)
+		// SCRUBBED, because the service's own message is rendered verbatim and this
+		// is the one request that carries a credential. RunInstances sends the
+		// registration as user data, and an endpoint that echoes a rejected
+		// parameter — AWS is unlikely to, a proxy or a configured endpoint might —
+		// puts a live runner registration into an error that travels back through
+		// the node's command result and into logs.
+		//
+		// The api's own code and the rest of the message survive, because that is
+		// what an operator acts on.
+		return nil, fmt.Errorf("ec2: launch %s: %w", spec.Name,
+			scrubSecrets(err, encodedUserData, spec.JITConfig))
 	}
 
 	if len(out.Instances) == 0 {
@@ -884,6 +923,39 @@ func defaultEndpointFor(region string) string {
 	}
 
 	return "https://ec2." + region + "." + suffix + "/"
+}
+
+// maxUserData is what EC2 accepts, measured before base64 encoding.
+const maxUserData = 16 * 1024
+
+// scrubSecrets replaces anything in an error's message that must not be logged.
+//
+// A LAST LINE RATHER THAN THE ONLY ONE. Nothing billet writes puts a credential
+// in an error; what this covers is a message billet did not write — the API's,
+// repeated verbatim because it is usually the most useful part — coming back with
+// a parameter billet sent echoed inside it.
+//
+// The identity of the error is deliberately NOT preserved: this is a leaf whose
+// whole text is suspect, and the same trade is already made for the GitHub
+// onboarding code, where safety beats identity at a node that carries a secret.
+// Callers of Launch branch on nothing but success.
+func scrubSecrets(err error, secrets ...string) error {
+	msg := err.Error()
+	cleaned := msg
+
+	for _, secret := range secrets {
+		if secret == "" {
+			continue
+		}
+
+		cleaned = strings.ReplaceAll(cleaned, secret, "[REDACTED]")
+	}
+
+	if cleaned == msg {
+		return err
+	}
+
+	return errors.New(cleaned)
 }
 
 // errRedirected marks a refusal to follow a redirect, so the api boundary can

@@ -215,14 +215,72 @@ func TestTheEnvironmentIsReadEachTimeAndTheTokenIsNotTrimmed(t *testing.T) {
 	}
 }
 
-// Half a credential is not a credential, and reporting it as one produces a 403
-// rather than a sentence naming the missing variable.
-func TestHalfAnEnvironmentCredentialIsNone(t *testing.T) {
+// HALF A CREDENTIAL IS A MISTAKE, NOT AN ABSENCE, AND THE DIFFERENCE DECIDES
+// WHICH AWS ACCOUNT BILLET ACTS AS.
+//
+// Reporting "no credentials" for a partial environment let the chain fall through
+// to the instance role — so a typo in AWS_SECRET_ACCESS_KEY silently switched
+// billet to a DIFFERENT and often more privileged identity, and it launched and
+// terminated machines as that one. The operator who set those variables had said
+// which identity they meant.
+//
+// An earlier version of this test asserted errNoCredentials here and therefore
+// enshrined the fallthrough.
+func TestHalfAnEnvironmentCredentialIsAnErrorRatherThanAnAbsence(t *testing.T) {
+	for name, env := range map[string]map[string]string{
+		"no secret": {"AWS_ACCESS_KEY_ID": "AKID", "AWS_SECRET_ACCESS_KEY": ""},
+		"no key id": {"AWS_ACCESS_KEY_ID": "", "AWS_SECRET_ACCESS_KEY": "s"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			for k, v := range env {
+				t.Setenv(k, v)
+			}
+
+			err := func() error {
+				_, err := (EnvCredentials{}).Credentials(t.Context())
+
+				return err
+			}()
+
+			if err == nil {
+				t.Fatal("half an environment credential was accepted")
+			}
+
+			if errors.Is(err, errNoCredentials) {
+				t.Errorf("a partial environment reported ABSENCE, which lets the chain fall "+
+					"through to the instance role: %v", err)
+			}
+
+			// The message has to name the variable that is missing, or an operator
+			// is told only that something is wrong with credentials they can see.
+			for _, want := range []string{"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("the error does not name %s: %v", want, err)
+				}
+			}
+		})
+	}
+}
+
+// AND THE CHAIN STOPS THERE. It continues past a source that has NOTHING, which
+// is what a chain is for; it must not continue past one that is misconfigured, or
+// the fallthrough happens one layer up instead.
+func TestTheChainDoesNotFallPastAMisconfiguredSource(t *testing.T) {
 	t.Setenv("AWS_ACCESS_KEY_ID", "AKID")
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "")
 
-	if _, err := (EnvCredentials{}).Credentials(t.Context()); !errors.Is(err, errNoCredentials) {
-		t.Errorf("err = %v, want errNoCredentials", err)
+	imds := newFakeIMDS(t, "AKID-FROM-ROLE", time.Now().Add(time.Hour))
+
+	chain := ChainCredentials{EnvCredentials{}, &IMDSCredentials{Endpoint: imds.URL}}
+
+	got, err := chain.Credentials(t.Context())
+	if err == nil {
+		t.Fatalf("the chain fell through a half-configured environment to %v", got)
+	}
+
+	if imds.tokens != 0 {
+		t.Error("the chain contacted the instance metadata service despite an environment " +
+			"credential being half set; billet would act as a different aws identity")
 	}
 }
 
