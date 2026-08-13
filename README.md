@@ -22,13 +22,7 @@ cloud; the AWS-based projects are AWS-only; the microVM products are commercial.
 [Alternatives](#alternatives) for an honest comparison, including cases where you should use
 something else.
 
-> The failover MACHINERY is built and has nowhere to fail over to. A tier can name
-> several backends, capacity is measured per machine, and the control plane picks
-> the host when the job is admitted — in the tier's own order of preference, so
-> `[firecracker, ec2]` means the box at home before the cloud. What is missing is
-> the cloud: Docker is the only provider, so today a second machine is a second
-> Docker host ([#32](https://github.com/junioryono/billet/issues/32)). See
-> [Status](#status).
+> Failover is built the whole way down and has never been pointed at a real AWS account. A tier can name several backends, capacity is measured per machine, and the control plane picks the host when the job is admitted — in the tier's own order of preference, so `[firecracker, ec2]` means the box at home before the cloud. The ec2 backend now exists to BE that cloud: it is exercised against a fake EC2 API, and its request signing is checked byte-for-byte against Amazon's own signer, but nobody has yet watched a job run on an instance it started ([#32](https://github.com/junioryono/billet/issues/32)). See [Status](#status).
 
 ## What it is
 
@@ -202,17 +196,16 @@ built. What works **today**:
 | `billet teardown` | Removes the scale sets billet created |
 | Capacity ledger | Lease state machine, fencing epochs, placement enforcement, escrow before advertising |
 | Docker provider | One container per job, JIT registration delivered off argv. **Trials only** — shares the host kernel, so it refuses anything not established as trusted |
+| EC2 provider | One instance per job, in one subnet. The instance IS the isolation boundary, so unlike Docker it may run fork pull-request code — but only once `untrusted_security_group_ids` describes a network for it, because an instance isolates the kernel and not the VPC. A launch is idempotent by lease id, so an ambiguous retry cannot start two machines for one job. **Never yet run against a real account** — every test drives a fake EC2 API |
 | Crash recovery | A job running when the controller dies is adopted and left to finish, not killed; its capacity stays held |
 | Per-machine capacity | Each node reports what it contributes; a tier advertises the smaller of the deployment ceiling and what its machines can hold. A host nothing can reach stops backing advertisements |
 | Placement | The control plane chooses the machine when the work is admitted, by provider preference, then packing (`placement: spread` to even the load instead), then name. Reserved floors are held against the machines that could keep them |
 | Sites | A node says where it is; a tier may insist on a place. Carries identity today — the storage that will key off it is [#23](https://github.com/junioryono/billet/issues/23) |
 | Graceful drain | SIGTERM stops it taking new work and waits for the jobs already running, so `systemctl restart` does not fail somebody's build. See [Updating](#updating) |
 | Release pipeline | Tagged releases with checksums, `.deb`/`.rpm` with systemd units, and the install script — **built and never yet run: there are no tags, so no release exists to install.** Build from source until there is one |
-| Multi-backend tiers | One label can name several providers, and the preference ORDER decides: the control plane picks the host when the job is admitted, walking the tier's list most-preferred-first. Docker is the only provider built, so the fallback half cannot be exercised yet ([#32](https://github.com/junioryono/billet/issues/32)) |
+| Multi-backend tiers | One label can name several providers, and the preference ORDER decides: the control plane picks the host when the job is admitted, walking the tier's list most-preferred-first. With docker and ec2 both built, `[docker, ec2]` is now a fallback that can actually be taken — on paper. The bare-metal half of the intended pair is still Firecracker ([#32](https://github.com/junioryono/billet/issues/32)) |
 
-**Not built:** Firecracker, Apple Silicon and EC2 providers; the cache; sticky disks; a cost policy,
-which needs a provider that charges money before there is anything to weigh; observability; the
-dashboard.
+**Not built:** Firecracker and Apple Silicon providers; the cache; sticky disks; observability; the dashboard. A **cost policy** is closer to a consequence than a feature — an ec2 node declares `max_vcpu` and `max_memory`, and provider order decides that home fills first — but it is not yet a spending limit: the allocator charges a job the size its TIER asked for, while the backend buys the first declared shape that fits, so a 2-vCPU tier backed by an 8-vCPU shape can spend four times the declared budget ([#47](https://github.com/junioryono/billet/issues/47)). Nothing reacts to a price either ([#44](https://github.com/junioryono/billet/issues/44)), and nothing drains an instance AWS is about to reclaim ([#41](https://github.com/junioryono/billet/issues/41)).
 
 **billet runs a fleet, with one thing still missing before it is worth having one.** Capacity is a
 figure per machine, so hosts of different sizes can be described and a tier advertises only what its
@@ -225,10 +218,14 @@ must" — and a destroy goes to the machine holding the container rather than to
 
 What is still true is that **a cache lives on the machine that built it**
 ([#23](https://github.com/junioryono/billet/issues/23)), so a second host is a second cold cache
-until shared storage lands. And there is still only one provider, so a second machine today means a
-second Docker host rather than the cloud fallback the labels can already express
-([#32](https://github.com/junioryono/billet/issues/32)).
-[#33](https://github.com/junioryono/billet/issues/33) tracks the whole plan.
+until shared storage lands — and a job that fails over to the cloud runs cold by design, since
+keeping it warm would mean shipping cache bytes over a WAN.
+
+**A terminate request is not a stopped guest**, and that is the one known correctness gap in this backend ([#46](https://github.com/junioryono/billet/issues/46)). `TerminateInstances` returns when the request is accepted while the machine keeps running for a minute or two, and billet releases the lease on that success — so on a drain or a forced teardown a new job can start while the old guest is still finishing a deploy. Waiting inside the teardown is not the fix, because a node runs one command at a time and it would stall every launch behind it.
+
+**One ec2 node is a serial launch queue**, because a node executes one command at a time. That is invisible for a backend where a node is one machine's worth of jobs and visible for one where a single node can stand for sixty — so a large cloud fleet wants several ec2 nodes, each registered separately with its own budget, rather than one with a large one.
+
+**The cloud half is written and unproven.** `provider: ec2` launches one instance per job and the labels can already express the fallback, but the whole backend has only ever talked to a fake EC2 API. Until somebody stops the bare-metal host mid-workflow and watches the same `runs-on` label finish in a region, treat it as untested against the thing it is for ([#32](https://github.com/junioryono/billet/issues/32)). [#33](https://github.com/junioryono/billet/issues/33) tracks the whole plan.
 
 ### Adding a second machine
 
@@ -390,10 +387,7 @@ Read this before pointing `billet` at anything.
 **Do not use self-hosted runners with public repositories.** This is
 [GitHub's own guidance](https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/manage-access),
 not ours. Fork pull requests do not receive your secrets, but they *do* get arbitrary code execution
-on your hardware. `billet` is *designed* to isolate jobs in microVMs, which helps — but **today the
-only provider is Docker, which shares the host kernel**, so what you actually get is container
-isolation. Even once Firecracker lands it will not make running untrusted code on your own machine
-safe. Private repos with trusted contributors are the intended use case.
+on your hardware. `billet` is *designed* to isolate jobs in microVMs, which helps — but **on your own hardware the only provider is Docker, which shares the host kernel**, so what you actually get is container isolation. The `ec2` provider does give each job its own machine, and will run fork pull-request work for that reason once you have described a security group for it — that is an isolation boundary you are renting, not one you have. Even once Firecracker lands it will not make running untrusted code on your own machine safe. Private repos with trusted contributors are the intended use case.
 
 **Caches are a deliberate cross-job channel.** A job that writes a secret into a cached directory
 persists it for later jobs to read. Trust classes are *designed* to control who may publish a cache —
@@ -467,7 +461,7 @@ rewriting placement at the same time.
 | P5 — Docker layer cache, registry mirrors, container baseline | ⬜ [#27](https://github.com/junioryono/billet/issues/27) [#28](https://github.com/junioryono/billet/issues/28) |
 | P6 — observability, SSH-into-a-job | ⬜ |
 | P7 — Apple Silicon provider (macOS + Linux arm64) | ⬜ |
-| P8 — EC2 provider, cloud-hosted control plane, provider failover | ⬜ [#32](https://github.com/junioryono/billet/issues/32) |
+| P8 — EC2 provider, cloud-hosted control plane, provider failover | 🚧 the provider is built and has never run against a real account; nothing builds the AMI it needs ([#42](https://github.com/junioryono/billet/issues/42)) [#32](https://github.com/junioryono/billet/issues/32) |
 | P9 — per-node capacity, admission-time placement, addressed teardown. **A prerequisite of P8**, not a sequel: failover needs the decision made before the work is accepted | ✅ [#21](https://github.com/junioryono/billet/issues/21) [#30](https://github.com/junioryono/billet/issues/30) [#31](https://github.com/junioryono/billet/issues/31) |
 | P10 — dashboard, signed releases, public launch | 🚧 releases and packages done; signing and the dashboard are not |
 | P11 — AWS Terraform | ⬜ |

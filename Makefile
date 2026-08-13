@@ -105,6 +105,12 @@ tools: ## Install the pinned linter and goreleaser
 	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_VERSION)
 	go install github.com/goreleaser/goreleaser/v2@$(GORELEASER_VERSION)
 
+# CI installs goreleaser itself and reads the pinned version from here, so the
+# gate and `make tools` cannot drift to two different goreleasers.
+.PHONY: print-goreleaser-version
+print-goreleaser-version:
+	@echo $(GORELEASER_VERSION)
+
 .PHONY: clean
 clean:
 	rm -rf bin $(COVERPROFILE)

@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -298,6 +299,8 @@ type NodeConfig struct {
 	StateDir string `yaml:"state_dir"`
 	// Firecracker is required when Provider is ProviderFirecracker.
 	Firecracker *FirecrackerConfig `yaml:"firecracker,omitempty"`
+	// EC2 is required when Provider is ProviderEC2.
+	EC2 *EC2Config `yaml:"ec2,omitempty"`
 
 	// MaxCustody bounds how long billet holds capacity for compute it cannot account
 	// for — a container adopted from a crashed run, or one an ambiguous launch may
@@ -327,9 +330,11 @@ const (
 	// ProviderTart runs macOS and Linux arm64 guests on Apple Silicon. Requires
 	// Tart, which is FSL-licensed and installed separately.
 	ProviderTart ProviderKind = "tart"
-	// ProviderEC2 launches one spot instance per job. Firecracker is not an
-	// option on EC2 outside .metal instances, so here the instance itself is the
-	// isolation boundary.
+	// ProviderEC2 launches one instance per job — on demand unless node.ec2.spot
+	// says otherwise, because a reclaimed spot instance is a failed build that
+	// GitHub will not requeue. Firecracker is not an option on EC2 outside .metal
+	// instances, so here the instance itself is the isolation boundary, which is
+	// also why this backend may run untrusted work at all.
 	ProviderEC2 ProviderKind = "ec2"
 	// ProviderDocker runs jobs in containers. Isolation is materially weaker than
 	// a VM; this exists so `billet init` works on a laptop and it refuses
@@ -348,6 +353,31 @@ func (p ProviderKind) Valid() bool {
 		}
 	}
 	return false
+}
+
+// RunsOnHost reports whether this backend runs jobs on the machine billet is
+// running on, so that machine's cores and memory are what it can offer.
+//
+// Every backend but ec2 does. An ec2 node is an ORCHESTRATOR: it holds
+// credentials and calls an API, and the compute appears somewhere else entirely,
+// so what the box it runs on happens to have says nothing about what it can
+// contribute. Reading the two alike makes a t4g.nano offer two vCPU to a fleet it
+// could buy a hundred of, and makes an honest `max_vcpu: 512` look like a typo
+// worth warning about on every boot.
+//
+// AN ALLOWLIST RATHER THAN `!= ec2`, so a second remote backend that nobody
+// remembers to add here is treated as remote — which loses a warning, where the
+// other direction would invent a contribution out of the wrong machine's
+// hardware.
+func (p ProviderKind) RunsOnHost() bool {
+	switch p {
+	case ProviderDocker, ProviderFirecracker, ProviderTart:
+		return true
+	case ProviderEC2:
+		return false
+	default:
+		return false
+	}
 }
 
 // GuestOS classifies what a tier boots.
@@ -392,6 +422,86 @@ type FirecrackerConfig struct {
 	ZFSPool string `yaml:"zfs_pool"`
 	// Bridge is the host bridge guests attach to.
 	Bridge string `yaml:"bridge,omitempty"`
+}
+
+// EC2Config configures the cloud backend: one instance per job, in one subnet.
+//
+// EVERY FIELD HERE IS A PLACEMENT DECISION SOMEBODY HAS TO MAKE, and none of the
+// load-bearing ones is defaulted. billet cannot pick a subnet, and a wrong guess
+// is either a job that cannot reach GitHub or one that can reach a production
+// database.
+type EC2Config struct {
+	// Region is which AWS region to launch in. It also selects the API endpoint,
+	// so an ordinary install configures no host of its own.
+	Region string `yaml:"region"`
+	// Endpoint overrides the API endpoint billet derives from Region — for a VPC
+	// interface endpoint, a non-commercial partition, or a test.
+	Endpoint string `yaml:"endpoint,omitempty"`
+
+	// SubnetID is where instances are launched. Its route to GitHub is the
+	// operator's to arrange: a private subnet needs a NAT gateway, a public one
+	// needs AssignPublicIP.
+	SubnetID string `yaml:"subnet_id"`
+	// SecurityGroupIDs apply to trusted work.
+	SecurityGroupIDs []string `yaml:"security_group_ids"`
+	// UntrustedSecurityGroupIDs apply to fork pull-request work, and their
+	// ABSENCE is what refuses it.
+	//
+	// A whole instance is a real isolation boundary, which is why this backend can
+	// run code billet cannot vouch for at all — but that boundary is the KERNEL,
+	// not the network. A fork's job in the same security group as everything else
+	// reaches whatever that group reaches, which on a subnet somebody already had
+	// is usually more than they are picturing. So untrusted work runs only once
+	// its network has been described separately, rather than defaulting onto the
+	// trusted group because nobody said otherwise.
+	UntrustedSecurityGroupIDs []string `yaml:"untrusted_security_group_ids,omitempty"`
+	// AssignPublicIP gives instances a public address, for a subnet with no NAT
+	// gateway. A runner that cannot reach GitHub registers and then does nothing.
+	AssignPublicIP bool `yaml:"assign_public_ip,omitempty"`
+
+	// InstanceProfile is the IAM role TRUSTED instances receive. OPTIONAL, and
+	// empty is the right answer unless a job genuinely needs AWS credentials: an
+	// instance profile is readable from inside the guest, so it is a credential
+	// handed to whatever the job runs.
+	//
+	// UNTRUSTED WORK NEVER GETS IT, whatever this says. A fork's pull request runs
+	// its steps directly on the instance, so it could read the role's temporary
+	// credentials out of the metadata service — past the isolation that lets this
+	// backend run untrusted work at all.
+	InstanceProfile string `yaml:"instance_profile,omitempty"`
+
+	// InstanceTypes are the shapes billet may buy, each DECLARING what it holds,
+	// because billet ships no table of EC2 instance types.
+	//
+	// A table would be out of date within a quarter — AWS adds types continuously
+	// — and being out of date here means launching a machine that does not fit a
+	// lease the allocator has already escrowed. Declaring them keeps the fleet's
+	// cost surface in the operator's own file, which is where a spending decision
+	// belongs anyway.
+	InstanceTypes []EC2InstanceType `yaml:"instance_types"`
+
+	// Spot buys interruptible capacity.
+	//
+	// DEFAULTS OFF, which reverses the assumption this backend was filed under.
+	// It exists so one `runs-on` label survives the bare-metal host going away,
+	// and GitHub does not requeue a job whose runner vanished mid-execution — so a
+	// spot reclaim is a FAILED BUILD rather than a retry. Defaulting to spot would
+	// make the failover path the unreliable one, which is the opposite of what a
+	// failover is for. An operator who would rather have a cheap build that
+	// sometimes dies says so here.
+	Spot bool `yaml:"spot,omitempty"`
+}
+
+// EC2InstanceType is one shape billet may buy, and what it holds.
+//
+// The vCPU and memory are DECLARED rather than looked up, because the allocator
+// has already escrowed a size against this node before any of this is consulted:
+// a shape that turns out smaller than the lease it was chosen for over-commits a
+// machine nobody can see.
+type EC2InstanceType struct {
+	Type   string   `yaml:"type"`
+	VCPU   int      `yaml:"vcpu"`
+	Memory ByteSize `yaml:"memory"`
 }
 
 // GitHubConfig holds the App identity used to manage runners.
@@ -444,7 +554,7 @@ type Tier struct {
 	//
 	// Setting both this and Provider is an error rather than a merge: guessing which
 	// spelling an operator meant, when the answer decides where untrusted code runs,
-	// is not a kindness. Only docker is built (#32).
+	// is not a kindness. docker and ec2 are built; firecracker and tart are not.
 	Providers []ProviderKind `yaml:"providers,omitempty"`
 	// GuestOS defaults to linux. Set it explicitly for macOS and Windows tiers —
 	// licensing and capability checks key off this field, not off the label.
@@ -721,6 +831,15 @@ func (c *Config) NodePolicies() map[string]NodePolicy {
 
 var labelRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$`)
 
+// awsRegionRe matches the SHAPE of a region rather than a list of them.
+//
+// An allowlist is a rule about somebody else's product, and it goes stale the
+// next time AWS opens a region — at which point billet refuses a config that is
+// perfectly correct. The shape catches the mistake people actually make, which is
+// dropping the hyphens, and still admits partitions billet has never run in:
+// us-gov-west-1, cn-north-1, ap-southeast-4.
+var awsRegionRe = regexp.MustCompile(`^[a-z]{2,}(-[a-z]+)+-\d+$`)
+
 // runnerGroupUnsafe are the characters that do not survive the scale-set client's
 // handling of a group name.
 //
@@ -943,6 +1062,7 @@ func (c *Config) applyDefaults() {
 
 	if c.Node != nil {
 		c.Node.Name = trimNodeName(c.Node.Name)
+		c.Node.EC2.normalize()
 
 		// THE CERTIFICATE DECIDES WHEN THERE IS ONE. The control plane authorises a
 		// node by the name in its certificate, so with a bundle present the config
@@ -1271,6 +1391,303 @@ func (c *Config) validateNode() []error {
 			}
 		}
 	}
+
+	if c.Node.Provider == ProviderEC2 {
+		errs = append(errs, c.validateEC2Node()...)
+	}
+
+	return errs
+}
+
+// validateEC2Node reports everything wrong with a cloud node.
+func (c *Config) validateEC2Node() []error {
+	var errs []error
+
+	// WHAT IT WILL BUY, BECAUSE THERE IS NOTHING TO MEASURE.
+	//
+	// Every other backend runs jobs on this machine, so an unset contribution
+	// means "everything I can detect" and detection answers correctly. An ec2 node
+	// calls an API and the compute appears in a region, so detection would report
+	// whatever small instance holds this process — and billet would advertise that
+	// to GitHub as the capacity of an entire cloud, placing one job and then
+	// looking full. That is the failover this backend exists for, silently not
+	// working.
+	//
+	// Required rather than defaulted: billet has no standing to choose how much to
+	// buy on somebody's account. It is NOT a spending limit — see #47, and the
+	// package comment on internal/provider/ec2.
+	if c.Node.MaxVCPU <= 0 {
+		errs = append(errs, errors.New(
+			"node.max_vcpu is required when provider is ec2: there is no machine to detect it "+
+				"from, because the compute this node launches runs in a region rather than on "+
+				"this host, and billet will not choose how much to buy on your behalf"))
+	}
+
+	if c.Node.MaxMemory <= 0 {
+		errs = append(errs, errors.New(
+			"node.max_memory is required when provider is ec2: there is no machine to detect it "+
+				"from, because the compute this node launches runs in a region rather than on "+
+				"this host, and billet will not choose how much to buy on your behalf"))
+	}
+
+	if c.Node.EC2 == nil {
+		errs = append(errs, errors.New("node.ec2 is required when provider is ec2"))
+
+		return errs
+	}
+
+	e := c.Node.EC2
+
+	if err := CheckEC2Region(e.Region); err != nil {
+		errs = append(errs, err)
+	}
+
+	if strings.TrimSpace(e.SubnetID) == "" {
+		errs = append(errs, errors.New("node.ec2.subnet_id is required; billet cannot choose "+
+			"which network a runner should be able to reach"))
+	}
+
+	if err := CheckEC2Endpoint(e.Endpoint); err != nil {
+		errs = append(errs, err)
+	}
+
+	errs = append(errs, CheckEC2SecurityGroups("security_group_ids", e.SecurityGroupIDs, true)...)
+	errs = append(errs, CheckEC2SecurityGroups(
+		"untrusted_security_group_ids", e.UntrustedSecurityGroupIDs, false)...)
+
+	errs = append(errs, e.instanceTypeErrors()...)
+
+	return errs
+}
+
+// normalize trims the values billet later uses verbatim.
+//
+// THE SAME REASON NODE NAMES ARE NORMALIZED FIRST. Validation trimmed these to
+// CHECK them and everything else used the raw string, so `region: "  us-west-2  "`
+// passed the shape check and was then signed with its padding — a 403 naming
+// nothing. YAML strips whitespace from a plain scalar but keeps it inside quotes,
+// so this is reachable from an ordinary-looking file.
+func (e *EC2Config) normalize() {
+	if e == nil {
+		return
+	}
+
+	e.Region = strings.TrimSpace(e.Region)
+	e.Endpoint = strings.TrimSpace(e.Endpoint)
+	e.SubnetID = strings.TrimSpace(e.SubnetID)
+	e.InstanceProfile = strings.TrimSpace(e.InstanceProfile)
+
+	for i := range e.SecurityGroupIDs {
+		e.SecurityGroupIDs[i] = strings.TrimSpace(e.SecurityGroupIDs[i])
+	}
+
+	for i := range e.UntrustedSecurityGroupIDs {
+		e.UntrustedSecurityGroupIDs[i] = strings.TrimSpace(e.UntrustedSecurityGroupIDs[i])
+	}
+
+	for i := range e.InstanceTypes {
+		e.InstanceTypes[i].Type = strings.TrimSpace(e.InstanceTypes[i].Type)
+	}
+}
+
+// CheckEC2SecurityGroups refuses a list billet cannot safely launch against.
+//
+// EXPORTED AND CALLED FROM BOTH SIDES, like CheckEC2Endpoint and for the same
+// reason: the provider's constructor is exported and cannot assume its
+// configuration came through Load.
+//
+// BOTH HALVES OF THE RULE LIVE HERE. An earlier version exported only the
+// blank-entry half, so the constructor accepted a config with NO trusted group at
+// all — and RunInstances without a group lets EC2 pick the VPC's default, which in
+// a VPC somebody already had usually permits a good deal more than they are
+// picturing. A rule split across two places has an entry point that does not
+// enforce it, which is the thing exporting it was meant to fix.
+//
+// `required` is false for the untrusted list, where EMPTY IS MEANINGFUL: its
+// absence is what refuses fork pull-request work.
+func CheckEC2SecurityGroups(field string, groups []string, required bool) []error {
+	var errs []error
+
+	if required && len(groups) == 0 {
+		errs = append(errs, fmt.Errorf("node.ec2.%s needs at least one group; it is what decides "+
+			"what a running job can reach, so billet will not fall back to the VPC's default",
+			field))
+	}
+
+	// EVERY BLANK, not the first: an operator fixing one and re-running to find
+	// the next is the failure mode Validate exists to avoid.
+	for i, g := range groups {
+		if strings.TrimSpace(g) == "" {
+			errs = append(errs, fmt.Errorf(
+				"node.ec2.%s[%d] is empty; an empty string is not a security group, and on the "+
+					"untrusted list a non-empty list is what admits fork pull-request work",
+				field, i))
+		}
+	}
+
+	return errs
+}
+
+// CheckEC2Region refuses a region that is not one.
+//
+// EXPORTED, because a region is not only an address: it is interpolated into the
+// DEFAULT ENDPOINT HOST, and it is part of the scope every request is signed with.
+// The first of those is why the provider's constructor re-applies it — measured,
+// a region of `x@attacker.example/?` produces a default endpoint whose host is
+// `attacker.example`, and the signed request and its session token go there.
+//
+// A SHAPE RATHER THAN A LIST. An allowlist goes stale the next time AWS opens a
+// region, and being stale means refusing a config that is correct. The shape
+// catches the mistake people make, which is dropping the hyphens, and still
+// admits partitions billet has never run in.
+func CheckEC2Region(region string) error {
+	region = strings.TrimSpace(region)
+
+	if region == "" {
+		return errors.New("node.ec2.region is required")
+	}
+
+	if !awsRegionRe.MatchString(region) {
+		return fmt.Errorf(
+			"node.ec2.region %q does not look like an aws region (expected something like "+
+				"us-west-2); it is signed into every request and interpolated into the default "+
+				"endpoint, so an endpoint override cannot compensate for a typo here", region)
+	}
+
+	return nil
+}
+
+// CheckEC2Endpoint refuses an endpoint that would carry a credential in the clear
+// or send a signed request somewhere billet did not mean.
+//
+// NOTHING HERE RENDERS THE ENDPOINT, and that is the rule rather than an
+// oversight. Every attempt to render it safely was wrong in a new way:
+// interpolating it printed a password; wrapping url.Parse's error printed one too,
+// because *url.Error embeds the whole URL; and url.Redacted masks only a
+// HIERARCHICAL url's password, so it leaves an opaque one
+// (`http:alice:secret@host`) and any `?token=` query completely intact. Both
+// measured. Naming the field and the failed component tells an operator
+// everything they can act on and cannot leak anything.
+//
+// LOOPBACK IS THE EXCEPTION to https, and it is billet's existing rule rather than
+// a new one: a loopback wire has no certificates at all, because there the trust
+// boundary is the machine itself.
+func CheckEC2Endpoint(endpoint string) error {
+	if strings.TrimSpace(endpoint) == "" {
+		return nil
+	}
+
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return errors.New("node.ec2.endpoint is not a url")
+	}
+
+	if u.Opaque != "" {
+		return errors.New("node.ec2.endpoint is not a url billet can dial: it has no // and " +
+			"therefore no host, so nothing says which machine to sign a request for")
+	}
+
+	if u.User != nil {
+		return errors.New("node.ec2.endpoint must not carry a username or password: billet " +
+			"authenticates with a request signature, so one would be a credential in a string " +
+			"that gets logged and nothing else")
+	}
+
+	if u.RawQuery != "" || u.Fragment != "" {
+		return errors.New("node.ec2.endpoint must not carry a query string or fragment: billet " +
+			"builds every request itself, so anything there is either ignored or a secret in a " +
+			"value that gets logged")
+	}
+
+	if u.Scheme != "https" && u.Scheme != "http" {
+		return errEndpointNeedsHTTPS
+	}
+
+	if u.Hostname() == "" {
+		return errors.New("node.ec2.endpoint names no host")
+	}
+
+	// THE QUERY API LIVES AT THE ROOT. A path here would be signed and posted to,
+	// so `https://vpce.example/v1` sends every call somewhere that is not the
+	// service — and no AWS regional, VPC-interface or non-commercial-partition
+	// endpoint needs one. Absent and "/" are both the root.
+	if path := u.EscapedPath(); path != "" && path != "/" {
+		return errors.New("node.ec2.endpoint must name a host with no path: billet posts the " +
+			"ec2 query api at the root, and signs whatever path it is given")
+	}
+
+	if u.Scheme == "https" || isLoopbackHost(u.Hostname()) {
+		return nil
+	}
+
+	return errEndpointNeedsHTTPS
+}
+
+// errEndpointNeedsHTTPS names the rule without naming the value.
+var errEndpointNeedsHTTPS = errors.New(
+	"node.ec2.endpoint must use https: billet signs each request and sends a session token with " +
+		"it, so plaintext hands an on-path observer a replayable request. Only a loopback " +
+		"address may use http, where the trust boundary is the machine itself")
+
+// isLoopbackHost reports whether a host names this machine.
+func isLoopbackHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+
+	ip := net.ParseIP(host)
+
+	return ip != nil && ip.IsLoopback()
+}
+
+// instanceTypeErrors reports everything wrong with the shapes a cloud node may
+// buy.
+//
+// A ZERO IS A FORGOTTEN FIELD, NOT AN UNKNOWN TO BE TOLERATED. These numbers are
+// what billet matches an already-escrowed lease against, so a shape that
+// understates itself launches a machine smaller than the work reserved for it and
+// over-commits a host nobody can inspect.
+func (e *EC2Config) instanceTypeErrors() []error {
+	var errs []error
+
+	if len(e.InstanceTypes) == 0 {
+		errs = append(errs, errors.New("node.ec2.instance_types needs at least one shape; "+
+			"billet ships no table of EC2 instance types, so a shape it may buy has to be "+
+			"declared along with what it holds"))
+
+		return errs
+	}
+
+	seen := make(map[string]struct{}, len(e.InstanceTypes))
+
+	for i := range e.InstanceTypes {
+		it := &e.InstanceTypes[i]
+		where := fmt.Sprintf("node.ec2.instance_types[%d]", i)
+
+		if name := strings.TrimSpace(it.Type); name == "" {
+			errs = append(errs, fmt.Errorf("%s: type is required", where))
+		} else {
+			// A repeat is a typo rather than a stronger preference, exactly as it
+			// is in a tier's provider list: billet picks one shape per launch, so
+			// collapsing a duplicate silently would hide the mistake.
+			if _, dup := seen[name]; dup {
+				errs = append(errs, fmt.Errorf("%s: type %q is listed twice", where, name))
+			}
+
+			seen[name] = struct{}{}
+		}
+
+		if it.VCPU <= 0 {
+			errs = append(errs, fmt.Errorf("%s: vcpu must be more than zero; it is what billet "+
+				"matches an already-reserved lease against", where))
+		}
+
+		if it.Memory <= 0 {
+			errs = append(errs, fmt.Errorf("%s: memory must be more than zero; it is what "+
+				"billet matches an already-reserved lease against", where))
+		}
+	}
+
 	return errs
 }
 
@@ -1726,10 +2143,11 @@ func (c *Config) validateMacOSHostLimits() []error {
 // the machine will ever allow, which otherwise surfaces as jobs that queue
 // forever with no explanation.
 func (c *Config) validateCapacity() []error {
+	errs := c.validateEC2Shapes()
+
 	if c.Server == nil {
-		return nil
+		return errs
 	}
-	var errs []error
 
 	for i := range c.Tiers {
 		t := &c.Tiers[i]
@@ -1744,6 +2162,91 @@ func (c *Config) validateCapacity() []error {
 				t.Label, t.Memory, c.Server.MaxMemory))
 		}
 	}
+	return errs
+}
+
+// validateEC2Shapes refuses a tier this node could be given and could not buy.
+//
+// A TIER LARGER THAN EVERY DECLARED SHAPE QUEUES FOREVER WITH NOTHING SAYING WHY.
+// The allocator escrows it happily, because the node's budget covers it — the
+// failure appears only after GitHub has assigned the job, as a launch error on
+// one host. billet already refuses a tier pinned to a host that cannot run its
+// guest OS at load time, for exactly this reason.
+//
+// Only checkable when one file holds both the node and the tiers, which is the
+// single-machine shape. In a fleet the node's file has no tiers, and the launch
+// path's error is what remains — it names the size asked for and every shape
+// declared, so it is actionable wherever it is read.
+func (c *Config) validateEC2Shapes() []error {
+	if c.Node == nil || c.Node.Provider != ProviderEC2 || c.Node.EC2 == nil {
+		return nil
+	}
+
+	shapes := c.Node.EC2.InstanceTypes
+	if len(shapes) == 0 {
+		// Already reported as a missing field; saying it twice helps nobody.
+		return nil
+	}
+
+	var errs []error
+
+	for i := range c.Tiers {
+		t := &c.Tiers[i]
+
+		if !t.AcceptsProvider(ProviderEC2) {
+			continue
+		}
+
+		// A TIER PINNED ELSEWHERE IS NOT THIS NODE'S PROBLEM. It names a different
+		// machine, so the shapes this one may buy say nothing about whether it can
+		// run.
+		if t.Node != "" && t.Node != c.Node.Name {
+			continue
+		}
+
+		// NOR IS A TIER THIS NODE COULD NEVER BE GIVEN. Every node in a fleet reads
+		// the same tier catalogue, so a small cloud node sees the tiers meant for a
+		// large one — and refusing them would make one deployment's config
+		// unloadable on half its machines. The allocator will never place work here
+		// that exceeds this node's own contribution, so a shape that cannot hold it
+		// is not a contradiction.
+		//
+		// What remains refused is the case that really is broken: a tier this node
+		// IS eligible for, and no declared shape can buy.
+		// A PINNED TIER IS NOT LET THROUGH BY THAT, and the distinction is the
+		// whole point: pinned means this node or nowhere, so oversize is not
+		// "another machine's job" — it is a tier that can never run at all.
+		if t.Node == "" && ((c.Node.MaxVCPU > 0 && t.VCPU > c.Node.MaxVCPU) ||
+			(c.Node.MaxMemory > 0 && t.Memory > c.Node.MaxMemory)) {
+			continue
+		}
+
+		fits := false
+
+		for _, shape := range shapes {
+			if shape.VCPU >= t.VCPU && shape.Memory >= t.Memory {
+				fits = true
+
+				break
+			}
+		}
+
+		if fits {
+			continue
+		}
+
+		declared := make([]string, 0, len(shapes))
+		for _, shape := range shapes {
+			declared = append(declared,
+				fmt.Sprintf("%s (%d vCPU, %s)", shape.Type, shape.VCPU, shape.Memory))
+		}
+
+		errs = append(errs, fmt.Errorf(
+			"tier %q requests %d vCPU and %s, which no shape in node.ec2.instance_types can "+
+				"hold (%s); a job on this tier would be admitted and then fail to launch",
+			t.Label, t.VCPU, t.Memory, strings.Join(declared, ", ")))
+	}
+
 	return errs
 }
 

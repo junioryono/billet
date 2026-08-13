@@ -38,6 +38,21 @@ func (n *NodeConfig) Contribution(detectedVCPU int, detectedMemory ByteSize) Con
 		c.Memory = n.MaxMemory
 	}
 
+	// NOTHING TO COMPARE AGAINST WHEN THE WORK RUNS SOMEWHERE ELSE.
+	//
+	// An ec2 node is an orchestrator: it holds credentials and calls an API, and
+	// the compute appears in a region rather than in this box. So the hardware
+	// underneath it is unrelated to what it can offer, and every warning below
+	// would fire on every boot of a correctly configured cloud node — which costs
+	// more than it sounds, because this is the one warning that means something
+	// real on a bare-metal host, and an operator who sees it daily on the cloud
+	// node stops reading it on the EPYC box.
+	//
+	// What the node DECLARED still governs; only the comparison is dropped.
+	if !n.Provider.RunsOnHost() {
+		return c
+	}
+
 	// ALLOWED, AND SAID OUT LOUD. An operator may know something billet does not
 	// — that the workload is IO-bound, or that this host is deliberately
 	// oversubscribed — so a number above the hardware is a decision billet has no
