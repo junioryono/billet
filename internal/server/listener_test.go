@@ -19,6 +19,145 @@ import (
 	"github.com/junioryono/billet/internal/state"
 )
 
+// cancelWhen cancels a running listener once cond holds, rather than after a
+// fixed sleep. The returned function stops the watcher and JOINS it; call it with
+// defer.
+//
+// A SLEEP IS NOT A SYNCHRONISATION PRIMITIVE, and this is exactly where that bit.
+// Three tests here slept 150-200ms and then cancelled, assuming the listener had
+// finished the work being asserted. That is true on an idle laptop and was not
+// true on a loaded CI runner: two of them failed there while passing twelve
+// consecutive local runs under -race and coverage, which is the shape of a defect
+// that trains you to re-run CI instead of reading it.
+//
+// NOTHING IN THE GOROUTINE TOUCHES t, and the join is why. The first version of
+// this helper carried its own 30-second watchdog and called t.Errorf from inside
+// the goroutine — while every caller uses a 10-second context. So a condition that
+// never held meant Run returned at 10s, the test finished, and twenty seconds
+// later a dead test's Errorf panicked the whole process. Go fails hard on exactly
+// that, and this repository's own testing rules forbid a goroutine outliving its
+// test. The caller's context deadline is the watchdog now; the watcher only ever
+// calls cancel, and the report happens on the test's own goroutine at defer time.
+func cancelWhen(t *testing.T, ctx context.Context, cancel context.CancelFunc,
+	what string, cond func() bool,
+) func() {
+	t.Helper()
+
+	var fired atomic.Bool
+
+	done := make(chan struct{})
+	stopped := make(chan struct{})
+
+	go func() {
+		defer close(stopped)
+
+		for {
+			if cond() {
+				fired.Store(true)
+				cancel()
+
+				return
+			}
+
+			select {
+			case <-ctx.Done():
+				return
+			case <-done:
+				return
+			case <-time.After(time.Millisecond):
+			}
+		}
+	}()
+
+	return func() {
+		close(done)
+		<-stopped
+
+		if !fired.Load() {
+			t.Errorf("%s never happened, so the assertions above ran against a listener "+
+				"stopped by its context deadline rather than by finishing the work", what)
+		}
+	}
+}
+
+// cancelWhen must actually cancel, and must actually join.
+//
+// A HELPER THAT SILENTLY DOES NEITHER IS WORSE THAN NO HELPER, and neither half is
+// observable from the tests that use it: with the condition satisfied they cancel
+// promptly, and with cancel() deleted they simply stop at their own ten-second
+// deadline against already-stable state and pass. So both halves are pinned here,
+// where a failure is a failure rather than a slower green.
+func TestCancelWhenCancelsAndJoins(t *testing.T) {
+	t.Parallel()
+
+	t.Run("cancels once the condition holds", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+		defer cancel()
+
+		var ready atomic.Bool
+
+		stop := cancelWhen(t, ctx, cancel, "the condition", ready.Load)
+		defer stop()
+
+		select {
+		case <-ctx.Done():
+			t.Fatal("the context was cancelled before the condition held")
+		case <-time.After(20 * time.Millisecond):
+		}
+
+		ready.Store(true)
+
+		select {
+		case <-ctx.Done():
+		case <-time.After(5 * time.Second):
+			t.Fatal("the condition held and the context was never cancelled")
+		}
+	})
+
+	t.Run("stop waits for the watcher to finish", func(t *testing.T) {
+		t.Parallel()
+
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+		defer cancel()
+
+		// THE WATCHER IS HELD INSIDE THE CONDITION while stop is called, which is
+		// the only way to see the difference between joining and merely asking. It
+		// returns true when released, so the helper's own never-happened diagnostic
+		// stays quiet and this measures the join alone.
+		release := make(chan struct{})
+
+		stop := cancelWhen(t, ctx, cancel, "the condition", func() bool {
+			<-release
+
+			return true
+		})
+
+		returned := make(chan struct{})
+
+		go func() {
+			stop()
+			close(returned)
+		}()
+
+		select {
+		case <-returned:
+			t.Fatal("stop returned while the watcher was still inside the condition, so a " +
+				"watcher can outlive the test that started it")
+		case <-time.After(50 * time.Millisecond):
+		}
+
+		close(release)
+
+		select {
+		case <-returned:
+		case <-time.After(5 * time.Second):
+			t.Fatal("stop never returned after the watcher was released")
+		}
+	})
+}
+
 // notDrainingHere is the drain grace for tests that are NOT about draining.
 //
 // Cancelling with a job still running means a drain, and these fake sessions never
@@ -146,52 +285,102 @@ func TestAdvertisedCapacityNeverExceedsTheBudget(t *testing.T) {
 // — so a dry run that only sets the header would still acquire a job nothing can
 // launch, which is the exact outcome it exists to prevent.
 func TestAdvertisingNothingAlsoRefusesWork(t *testing.T) {
-	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	// EACH ARM ON ITS OWN, because the refusal is announced for an offer OR an
+	// assignment and a fixture carrying both cannot tell that from AND. Under AND,
+	// a message with only one of them is refused safely and SILENTLY — the same
+	// safe outcome, with the operator no longer told that GitHub is still sending
+	// work to a runner advertising none.
+	for _, tc := range []struct {
+		name string
+		msg  Message
+	}{
+		{
+			name: "an offer",
+			msg:  Message{MessageID: 1, Available: []Job{{RequestID: 11, RunID: 101}}},
+		},
+		{
+			name: "an assignment",
+			msg:  Message{MessageID: 1, Assigned: []Job{{RequestID: 11, RunID: 101}}},
+		},
+		{
+			name: "both",
+			msg: Message{
+				MessageID: 1,
+				Available: []Job{{RequestID: 11, RunID: 101}},
+				Assigned:  []Job{{RequestID: 11, RunID: 101}},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tiers := []config.Tier{tier("billet-4vcpu-a")}
 
-	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+			a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
 
-	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
-	defer cancel()
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
 
-	var delivered atomic.Bool
+			var (
+				delivered atomic.Bool
+				gets      atomic.Int32
+			)
 
-	session := &fakeSession{}
-	session.onGet = func() (*Message, error) {
-		if delivered.Swap(true) {
-			return nil, ErrNoMessage
-		}
+			session := &fakeSession{}
+			session.onGet = func() (*Message, error) {
+				gets.Add(1)
 
-		// Queued before the dry run started, which GitHub can legitimately do.
-		return &Message{
-			MessageID: 1,
-			Available: []Job{{RequestID: 11, RunID: 101}},
-			Assigned:  []Job{{RequestID: 11, RunID: 101}},
-		}, nil
-	}
+				if delivered.Swap(true) {
+					return nil, ErrNoMessage
+				}
 
-	l := NewListener(a, tiers[0].Label, session, WithMaxCapacity(0))
+				// Queued before the dry run started, which GitHub can legitimately do.
+				msg := tc.msg
 
-	go func() {
-		time.Sleep(150 * time.Millisecond)
-		cancel()
-	}()
+				return &msg, nil
+			}
 
-	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) &&
-		!errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("Run: %v", err)
-	}
+			var logged bytes.Buffer
 
-	if got := session.acquiredIDs(); len(got) != 0 {
-		t.Errorf("a run advertising zero capacity acquired %v", got)
-	}
+			l := NewListener(a, tiers[0].Label, session, WithMaxCapacity(0),
+				WithLogger(slog.New(slog.NewTextHandler(&logged, nil))))
 
-	usage, err := a.Usage(t.Context())
-	if err != nil {
-		t.Fatalf("Usage: %v", err)
-	}
+			// The second get proves the first delivery was fully handled, which is
+			// when a wrongful acquisition would have happened. The old sleep could
+			// cancel before handle() even started, passing without exercising the
+			// case at all.
+			defer cancelWhen(t, ctx, cancel, "the queued delivery being consumed", func() bool {
+				return gets.Load() > 1
+			})()
 
-	if usage.Leases != 0 {
-		t.Errorf("%d leases escrowed while advertising nothing", usage.Leases)
+			if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) &&
+				!errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("Run: %v", err)
+			}
+
+			if got := session.acquiredIDs(); len(got) != 0 {
+				t.Errorf("a run advertising zero capacity acquired %v", got)
+			}
+
+			usage, err := a.Usage(t.Context())
+			if err != nil {
+				t.Fatalf("Usage: %v", err)
+			}
+
+			if usage.Leases != 0 {
+				t.Errorf("%d leases escrowed while advertising nothing", usage.Leases)
+			}
+
+			// AND IT SAID SO. Without this the refusal branch can be deleted and
+			// every other assertion still passes: with a zero ceiling the escrow
+			// refill clamps room to nothing, offers reserve nothing, and assignments
+			// are declined for lacking escrow — so the SAFE OUTCOME is
+			// over-determined and the branch that exists to make the refusal
+			// explicit is invisible. Its value is the message, so the message is
+			// what is pinned.
+			if !strings.Contains(logged.String(), "declining work while advertising no capacity") {
+				t.Errorf("work arrived under a zero ceiling and nothing said so: %s",
+					logged.String())
+			}
+		})
 	}
 }
 
@@ -314,21 +503,28 @@ func TestRedeliveredAssignmentDoesNotConsumeASecondLease(t *testing.T) {
 		return nil, ErrNoMessage
 	}
 
+	var launches atomic.Int32
+
 	l := NewListener(a, tiers[0].Label, session,
 		// A runner that starts things, because these assertions are about escrow
 		// rather than launching. The default fails closed, which correctly hands
-		// the capacity back and would empty every count below.
-		WithRunner(&fakeRunner{}),
+		// the capacity back and would empty every count below. It COUNTS them
+		// because Running() cannot: see the second assertion.
+		WithRunner(&fakeRunner{onLaunch: func(int64) error {
+			launches.Add(1)
+
+			return nil
+		}}),
 		WithDrainGrace(notDrainingHere))
 
 	var running atomic.Int32
 
 	session.onPoll = func(int) { running.Store(int32(l.Running())) }
 
-	go func() {
-		time.Sleep(150 * time.Millisecond)
-		cancel()
-	}()
+	// BOTH deliveries consumed and a poll taken after them, which is what makes
+	// `running` an observation rather than a coin flip.
+	defer cancelWhen(t, ctx, cancel, "both deliveries being consumed and observed",
+		func() bool { return deliveries.Load() > 2 && running.Load() > 0 })()
 
 	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) &&
 		!errors.Is(err, context.DeadlineExceeded) {
@@ -337,6 +533,15 @@ func TestRedeliveredAssignmentDoesNotConsumeASecondLease(t *testing.T) {
 
 	if got := running.Load(); got != 1 {
 		t.Errorf("%d leases running after the same assignment twice, want 1", got)
+	}
+
+	// AND ONLY ONE LAUNCH, which is what actually proves the second delivery took
+	// no second lease. Running() counts a map keyed by REQUEST id, so two leases
+	// bound to request 11 would have the second overwrite the first and leave the
+	// count at one — the first lease then unreachable until the reaper, which is
+	// precisely the capacity leak this test is named for.
+	if got := launches.Load(); got != 1 {
+		t.Errorf("the runner was asked to launch %d times for one job, want 1", got)
 	}
 }
 
@@ -366,24 +571,65 @@ func TestCompletionReleasesTheLease(t *testing.T) {
 		}
 	}
 
-	l := NewListener(a, tiers[0].Label, session)
+	// A RUNNER THAT STARTS THINGS, without which this test could not fail. The
+	// default runner fails CLOSED — it declines the job and hands the capacity back
+	// inside the same handle() call — so the lease was released before the
+	// completion message ever arrived, `running` was never observably 1, and the
+	// final assertion of 0 held whether or not completion released anything at all.
+	// Deleting the release outright left it green.
+	l := NewListener(a, tiers[0].Label, session,
+		WithRunner(&fakeRunner{}), WithDrainGrace(notDrainingHere))
 
-	var running atomic.Int32
+	var (
+		running atomic.Int32
+		held    atomic.Bool
+	)
 
-	session.onPoll = func(int) { running.Store(int32(l.Running())) }
+	session.onPoll = func(int) {
+		n := int32(l.Running())
+		running.Store(n)
 
-	go func() {
-		time.Sleep(200 * time.Millisecond)
-		cancel()
-	}()
+		if n > 0 {
+			held.Store(true)
+		}
+	}
+
+	// THE LEASE MUST BE SEEN HELD FIRST, which is the other half: a final count of
+	// zero only means the map entry was REMOVED if something was there to remove.
+	// Removal is not release — the completion path deletes that entry in a separate
+	// statement from the allocator call — so the assertion that matches this test's
+	// name is the ledger check at the end, not this one.
+	defer cancelWhen(t, ctx, cancel, "the lease being held and then completed",
+		func() bool { return held.Load() && stage.Load() > 2 })()
 
 	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) &&
 		!errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Run: %v", err)
 	}
 
+	if !held.Load() {
+		t.Fatal("the lease was never observed running, so a final count of zero proves " +
+			"nothing about completion releasing it")
+	}
+
 	if got := running.Load(); got != 0 {
 		t.Errorf("%d leases still running after the job completed, want 0", got)
+	}
+
+	// AND THE LEDGER AGREES, which is the assertion that matches this test's name.
+	// Running() is the length of an in-memory map, and the completion path deletes
+	// that entry independently of releasing the lease — so a release that silently
+	// did nothing would empty the map, satisfy every count above, and leave the
+	// allocator charging for a job that finished. That is the leak, and only the
+	// allocator can see it.
+	usage, err := a.Usage(t.Context())
+	if err != nil {
+		t.Fatalf("Usage: %v", err)
+	}
+
+	if usage.Leases != 0 {
+		t.Errorf("%d leases still charged after the job completed; the map was emptied but "+
+			"the capacity was never handed back", usage.Leases)
 	}
 }
 
@@ -2614,8 +2860,12 @@ func TestAStuckCleanupRetryDoesNotStarveTheDestroys(t *testing.T) {
 	t.Parallel()
 
 	const (
-		ttl   = 300 * time.Millisecond
-		grace = 300 * time.Millisecond
+		ttl = 300 * time.Millisecond
+		// GENEROUS ON PURPOSE. The stuck retry below blocks FOREVER, so if it did
+		// consume the destroy budget no grace would rescue this — the assertion is
+		// about which work the budget is spent on, not how much there is. At 300ms
+		// it was racing the machine instead, and lost on a loaded CI runner.
+		grace = 3 * time.Second
 	)
 
 	tiers := []config.Tier{tier("billet-4vcpu-a")}

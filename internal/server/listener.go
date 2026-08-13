@@ -289,8 +289,13 @@ func NewListener(a *alloc.Allocator, tier string, session Session, opts ...Optio
 	return l
 }
 
-// WithRunner sets what turns assigned leases into running compute. The default
-// accounts for capacity and launches nothing.
+// WithRunner sets what turns assigned leases into running compute.
+//
+// THE DEFAULT DECLINES THE JOB, which is the opposite of what this comment used to
+// claim. noRunner fails closed: it returns an error, the ordinary failed-launch
+// path hands the capacity back, and GitHub reassigns. It does not hold capacity
+// and it does not quietly succeed — see noRunner's own documentation, which said
+// so correctly while this said the reverse.
 func WithRunner(r Runner) Option {
 	return func(l *Listener) { l.runner = r }
 }

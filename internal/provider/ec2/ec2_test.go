@@ -9,10 +9,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -132,6 +134,114 @@ func (f *fakeEC2) paramsFor(t *testing.T, action string) url.Values {
 	}
 
 	return found[0]
+}
+
+// allParamsFor returns the parameters of every call to an action, in order.
+//
+// For the case where the interesting request is neither the first nor the last —
+// checking the MIDDLE launch is what catches a value that was hardcoded to the
+// one every other fixture happens to use.
+func (f *fakeEC2) allParamsFor(action string) []url.Values {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	var found []url.Values
+
+	for _, c := range f.calls {
+		if c.Get("Action") == action {
+			found = append(found, c)
+		}
+	}
+
+	return found
+}
+
+// lastParamsFor returns the parameters of the MOST RECENT call to an action.
+//
+// paramsFor deliberately refuses when there was more than one call, which is the
+// right default — a test that means to inspect "the" request should say so. This
+// is for the case where repetition IS the subject: proving that the third launch
+// of an image still carries what the first lookup found.
+func (f *fakeEC2) lastParamsFor(t *testing.T, action string) url.Values {
+	t.Helper()
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	for i := len(f.calls) - 1; i >= 0; i-- {
+		if f.calls[i].Get("Action") == action {
+			return f.calls[i]
+		}
+	}
+
+	t.Fatalf("%s was never called", action)
+
+	return nil
+}
+
+// blockDevices reads the numbered BlockDeviceMapping parameters back by device
+// name, and refuses to hide the two things a name-keyed map otherwise hides.
+//
+// A DUPLICATE IS AN ERROR, NOT AN OVERWRITE. Reducing numbered entries by name is
+// the natural way to assert them, and it is exactly how a mutant that sends one
+// device TWICE stays invisible: the second entry replaces the first, the map still
+// has the expected keys, and EC2 would have received two mappings for one device
+// disagreeing about its flag.
+//
+// AND AN EMPTY FLAG IS AN ERROR ANYWHERE, since a device leaving without one is
+// the whole defect #53 closed — worth checking wherever the request is read rather
+// than only in the test that happens to be about it.
+func blockDevices(t *testing.T, got url.Values) map[string]string {
+	t.Helper()
+
+	out := map[string]string{}
+
+	// THE HORIZON COMES FROM THE KEYS, not from a scan that gives up after a few
+	// holes. Stopping at the first gap would make the contract above a lie, and
+	// stopping after N gaps just moves the lie further out — a mapping stranded at
+	// index 40 is exactly the kind a mutant would add.
+	highest := 0
+
+	for key := range got {
+		var n int
+
+		if _, err := fmt.Sscanf(key, "BlockDeviceMapping.%d.", &n); err == nil && n > highest {
+			highest = n
+		}
+	}
+
+	gap := false
+
+	for i := 1; i <= highest; i++ {
+		n := strconv.Itoa(i)
+
+		device := got.Get("BlockDeviceMapping." + n + ".DeviceName")
+		if device == "" {
+			gap = true
+
+			continue
+		}
+
+		if gap {
+			t.Errorf("%s was sent at index %s, after a gap; these are a list and billet's own "+
+				"comment says a dense one is the only shape it can rely on", device, n)
+		}
+
+		if _, seen := out[device]; seen {
+			t.Errorf("%s was sent more than once, so EC2 would receive two mappings for one "+
+				"device", device)
+		}
+
+		flag := got.Get("BlockDeviceMapping." + n + ".Ebs.DeleteOnTermination")
+		if flag == "" {
+			t.Errorf("device %s left with no DeleteOnTermination, which is the whole defect "+
+				"#53 exists to close", device)
+		}
+
+		out[device] = flag
+	}
+
+	return out
 }
 
 func (f *fakeEC2) countOf(action string) int {
@@ -574,19 +684,151 @@ func TestARootVolumeIsAlwaysDisposedOfEvenWithNoSizeToSet(t *testing.T) {
 }
 
 // THE LOOKUP IS PAID FOR ONCE PER IMAGE, which is what makes asking on every
-// launch affordable. An AMI's root device does not change.
-func TestTheRootDeviceIsAskedForOncePerImage(t *testing.T) {
-	f := newFakeEC2(t)
-	p := newTestProvider(t, f, nil)
+// launch affordable. An AMI's block devices do not change.
+//
+// AND WHAT IS CACHED HAS TO BE THE WHOLE ANSWER. Counting the calls proves only
+// that billet stopped asking — it says nothing about what it kept, so caching just
+// the root device name passed this test while every launch AFTER the first
+// silently dropped its non-root overrides and went back to depending on the
+// default this entire change exists to stop depending on. A defect visible only
+// from the SECOND launch of an AMI onward — nearly every launch in a steady state,
+// and none at all in a test that launches once.
+func TestAnImageIsLookedUpOncePerImage(t *testing.T) {
+	// TWO IMAGES WITH DIFFERENT ROOTS, launched A, B, A. One image cannot tell a
+	// per-image cache from a single global slot, and cannot tell a cached root from
+	// a hardcoded /dev/xvda — every fixture in this file happens to use that name.
+	// Interleaving is what makes the second A launch answer both: it must come from
+	// A's entry, which B's lookup must not have replaced.
+	const (
+		imageA = "ami-0abc"
+		imageB = "ami-0def"
+	)
 
-	for range 3 {
-		if _, err := p.Launch(t.Context(), validSpec()); err != nil {
-			t.Fatalf("Launch: %v", err)
+	f := newFakeEC2(t)
+	f.respond = func(action string, params url.Values) (int, string) {
+		if action != "DescribeImages" {
+			return http.StatusOK, defaultReply(action)
+		}
+
+		if params.Get("ImageId.1") == imageB {
+			return http.StatusOK, `<DescribeImagesResponse><imagesSet><item>` +
+				`<imageId>` + imageB + `</imageId>` +
+				`<rootDeviceName>/dev/sda1</rootDeviceName>` +
+				`<blockDeviceMapping>` +
+				`<item><deviceName>/dev/sda1</deviceName><ebs></ebs></item>` +
+				`<item><deviceName>/dev/sdz</deviceName><ebs></ebs></item>` +
+				`</blockDeviceMapping></item></imagesSet></DescribeImagesResponse>`
+		}
+
+		return http.StatusOK, `<DescribeImagesResponse><imagesSet><item>` +
+			`<imageId>` + imageA + `</imageId><rootDeviceName>/dev/xvda</rootDeviceName>` +
+			`<blockDeviceMapping>` +
+			`<item><deviceName>/dev/sdb</deviceName><ebs></ebs></item>` +
+			`<item><deviceName>/dev/sdc</deviceName><ebs>` +
+			`<deleteOnTermination>false</deleteOnTermination></ebs></item>` +
+			`</blockDeviceMapping></item></imagesSet></DescribeImagesResponse>`
+	}
+
+	var logged bytes.Buffer
+
+	p := newTestProvider(t, f, nil)
+	p.log = slog.New(slog.NewTextHandler(&logged, nil))
+
+	// THE THIRD LAUNCH DIFFERS ON PURPOSE. Launches one and three are both image A,
+	// so without this they are byte-identical and lastParamsFor could be returning
+	// either with nothing to notice. Asking the LAST one for a disk makes the two
+	// distinguishable in the only direction that matters.
+	for i, image := range []string{imageA, imageB, imageA} {
+		spec := validSpec()
+		spec.Image = image
+
+		if i == 2 {
+			spec.Disk = 80 * config.GiB
+		}
+
+		if _, err := p.Launch(t.Context(), spec); err != nil {
+			t.Fatalf("Launch %s: %v", image, err)
 		}
 	}
 
-	if n := f.countOf("DescribeImages"); n != 1 {
-		t.Errorf("DescribeImages was called %d times across three launches of one image, want 1", n)
+	if n := f.countOf("DescribeImages"); n != 2 {
+		t.Errorf("DescribeImages was called %d times for two images launched three times, "+
+			"want 2", n)
+	}
+
+	// THE THIRD LAUNCH — image A again, built entirely from cache, and the only
+	// request that can show the cache dropping or confusing what it held.
+	got := f.lastParamsFor(t, "RunInstances")
+
+	if v := got.Get("BlockDeviceMapping.1.Ebs.VolumeSize"); v != "80" {
+		t.Errorf("the last request carries a volume size of %q, want 80 — only the third "+
+			"launch asked for a disk, so lastParamsFor is not reading the last request", v)
+	}
+
+	want := map[string]string{
+		"/dev/xvda": "true",
+		"/dev/sdb":  "true",
+		"/dev/sdc":  "false",
+	}
+
+	seen := blockDevices(t, got)
+
+	for device, flag := range want {
+		if seen[device] != flag {
+			t.Errorf("on the third launch %s went out as %q, want %q — the cache did not keep "+
+				"what the lookup found", device, seen[device], flag)
+		}
+	}
+
+	if len(seen) != len(want) {
+		t.Errorf("the third launch sent %v, want exactly %v — a device from the other image "+
+			"leaked across the cache", seen, want)
+	}
+
+	// AND THE OTHER IMAGE GOT ITS OWN ROOT. This is the assertion that catches a
+	// root hardcoded to /dev/xvda — the name every other fixture in this file uses,
+	// including image A's, so A's own request cannot show it. Image B's root is
+	// deliberately /dev/sda1, and it is the MIDDLE request.
+	runs := f.allParamsFor("RunInstances")
+	if len(runs) != 3 {
+		t.Fatalf("RunInstances was called %d times, want 3", len(runs))
+	}
+
+	if d := runs[1].Get("BlockDeviceMapping.1.DeviceName"); d != "/dev/sda1" {
+		t.Errorf("the second image launched with root %q, want /dev/sda1 — its root came from "+
+			"somewhere other than its own lookup", d)
+	}
+
+	wantB := map[string]string{"/dev/sda1": "true", "/dev/sdz": "true"}
+
+	if b := blockDevices(t, runs[1]); !maps.Equal(b, wantB) {
+		t.Errorf("the second image sent %v, want %v — counting them would let any name or "+
+			"flag through", b, wantB)
+	}
+
+	// AND THE ORDER OF allParamsFor IS PINNED, which the A/B/A shape alone cannot do:
+	// reversing it leaves B in the middle either way. Only the two A launches differ,
+	// and only in the disk the third one asked for.
+	if v := runs[0].Get("BlockDeviceMapping.1.Ebs.VolumeSize"); v != "" {
+		t.Errorf("the first request carries a volume size of %q; allParamsFor is not in "+
+			"call order", v)
+	}
+
+	if v := runs[2].Get("BlockDeviceMapping.1.Ebs.VolumeSize"); v != "80" {
+		t.Errorf("the third request carries a volume size of %q, want 80; allParamsFor is "+
+			"not in call order", v)
+	}
+
+	// SAID ONCE, not once per launch. The warning lives behind the cache precisely
+	// so a busy tier does not repeat it for every job.
+	if n := strings.Count(logged.String(), "/dev/sdc"); n != 1 {
+		t.Errorf("the kept volume was reported %d times across three launches, want 1", n)
+	}
+
+	// AT WARN, not Info. A leak reported at the level the routine "launched instance"
+	// line uses is one nobody filters for and nobody sees.
+	if !strings.Contains(logged.String(), "level=WARN") {
+		t.Errorf("the kept volume was not reported as a warning: %s", logged.String())
 	}
 }
 
@@ -1874,13 +2116,20 @@ func TestATypedNilCredentialSourceIsRefused(t *testing.T) {
 	}
 }
 
-// A CONTRACT NOTHING ENFORCES FAILS SILENTLY.
+// BILLET SPEAKS WHENEVER IT CONTRADICTS THE IMAGE OR CHARGES FOR OBEYING IT, and
+// those are different things, so they say different things.
 //
-// billet sets DeleteOnTermination for the ROOT device and cannot set it for the
-// others without restating every mapping — so an image declaring an extra EBS
-// volume with the flag false leaks one volume PER JOB, tagged and billed and
-// discoverable only by somebody going to look. The AMI documentation can say not
-// to; only this says it at the moment it matters.
+// A NON-ROOT volume the image marks as surviving is honoured — billet passes the
+// flag back — and warned about, because it leaks one volume PER JOB, tagged and
+// billed and discoverable only by somebody going to look. The ROOT marked the same
+// way is OVERRIDDEN to delete, and warned about for the opposite reason: a stated
+// intent is being reversed, and finding that out from a missing volume is worse
+// than reading it once.
+//
+// What billet does NOT warn about on THIS channel is filling a gap: a mapping
+// that stated nothing gets billet's answer without an override notice, because
+// there was no intent to contradict. It does get a line on the other channel, for
+// carrying a value billet could not read — a different subject.
 func TestAnImageWhoseVolumesOutliveItIsReported(t *testing.T) {
 	f := newFakeEC2(t)
 	f.respond = func(action string, params url.Values) (int, string) {
@@ -1891,9 +2140,11 @@ func TestAnImageWhoseVolumesOutliveItIsReported(t *testing.T) {
 		return http.StatusOK, `<DescribeImagesResponse><imagesSet><item>` +
 			`<imageId>ami-0abc</imageId><rootDeviceName>/dev/xvda</rootDeviceName>` +
 			`<blockDeviceMapping>` +
-			// The root, which billet sets itself — not worth a warning.
+			// The root, which billet overrides — and says so. Spelled "0" rather
+			// than "false" so the root branch has to go through readTermination like
+			// every other device; reading only the word here left a mutant alive.
 			`<item><deviceName>/dev/xvda</deviceName><ebs>` +
-			`<deleteOnTermination>false</deleteOnTermination></ebs></item>` +
+			`<deleteOnTermination>0</deleteOnTermination></ebs></item>` +
 			// A second volume the image keeps. This is the one.
 			`<item><deviceName>/dev/sdb</deviceName><ebs>` +
 			`<deleteOnTermination>false</deleteOnTermination></ebs></item>` +
@@ -1918,13 +2169,39 @@ func TestAnImageWhoseVolumesOutliveItIsReported(t *testing.T) {
 	got := logged.String()
 
 	if !strings.Contains(got, "/dev/sdb") {
-		t.Errorf("the volume that outlives its instance was not reported: %s", got)
+		t.Errorf("the volume the image asks to keep was not reported: %s", got)
 	}
 
-	// THE ROOT IS NOT REPORTED, because billet sets that one itself — a warning
-	// about something already handled is how an operator learns to ignore them.
-	if strings.Contains(got, "/dev/xvda") {
-		t.Errorf("the root device was reported despite billet setting its flag: %s", got)
+	// THE ROOT IS REPORTED, and differently. billet is reversing what this image
+	// asked for rather than honouring it, so the one case it must not do quietly is
+	// the one where it wins the disagreement.
+	//
+	// CHECKED LINE BY LINE RATHER THAN OVER THE WHOLE BUFFER, because a buffer-level
+	// Contains proves only that both words appear somewhere — it would pass if the
+	// root marker leaked into the non-root message, which is the confusion the two
+	// messages exist to prevent.
+	root, other := "", ""
+
+	for _, line := range strings.Split(strings.TrimSpace(got), "\n") {
+		switch {
+		case strings.Contains(line, "/dev/xvda"):
+			root = line
+		case strings.Contains(line, "/dev/sdb"):
+			other = line
+		}
+	}
+
+	if root == "" {
+		t.Fatalf("billet overrode the image's root flag without saying so: %s", got)
+	}
+
+	if !strings.Contains(root, "ROOT") || !strings.Contains(root, "overriding") {
+		t.Errorf("the root line does not say billet overrode it: %q", root)
+	}
+
+	if strings.Contains(other, "ROOT") || strings.Contains(other, "overriding") {
+		t.Errorf("the honoured volume's line reads like an override, so an operator cannot "+
+			"tell which way billet went: %q", other)
 	}
 
 	if strings.Contains(got, "/dev/sdc") {
@@ -1932,14 +2209,607 @@ func TestAnImageWhoseVolumesOutliveItIsReported(t *testing.T) {
 	}
 }
 
-// AN IMAGE THAT SAYS NOTHING ABOUT DeleteOnTermination IS NOT WARNED ABOUT.
+// XML BOOLEANS HAVE TWO SPELLINGS, and an image using the other one describes the
+// same leak.
 //
-// Only an explicit "false" is worth naming: a mapping that omits the flag gets
-// EC2's own default for however the image was registered, which billet has no
-// standing to second-guess. Pinned separately because the main test asserts what
-// IS reported, and a warning that fires on silence would be the noise that trains
-// an operator to ignore all of them.
-func TestAnImageSilentAboutTerminationIsNotWarnedAbout(t *testing.T) {
+// `xs:boolean` admits "1" and "0" alongside the words. EC2 emits lowercase words
+// in every image measured against a real account — but the digits are in
+// xs:boolean's lexical space and cost one case arm, so both are read.
+func TestAVolumeMarkedWithTheOtherBooleanSpellingIsStillReported(t *testing.T) {
+	f := newFakeEC2(t)
+	f.respond = func(action string, params url.Values) (int, string) {
+		if action != "DescribeImages" {
+			return http.StatusOK, defaultReply(action)
+		}
+
+		return http.StatusOK, `<DescribeImagesResponse><imagesSet><item>` +
+			`<imageId>ami-0abc</imageId><rootDeviceName>/dev/xvda</rootDeviceName>` +
+			`<blockDeviceMapping>` +
+			`<item><deviceName>/dev/sdz</deviceName><ebs>` +
+			`<deleteOnTermination>0</deleteOnTermination></ebs></item>` +
+			`<item><deviceName>/dev/sdy</deviceName><ebs>` +
+			`<deleteOnTermination>1</deleteOnTermination></ebs></item>` +
+			`</blockDeviceMapping></item></imagesSet></DescribeImagesResponse>`
+	}
+
+	var logged bytes.Buffer
+
+	p := newTestProvider(t, f, nil)
+	p.log = slog.New(slog.NewTextHandler(&logged, nil))
+
+	spec := validSpec()
+	spec.Disk = 80 * config.GiB
+
+	if _, err := p.Launch(t.Context(), spec); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	got := logged.String()
+
+	if !strings.Contains(got, "/dev/sdz") {
+		t.Errorf("a volume marked with \"0\" was not reported: %s", got)
+	}
+
+	if strings.Contains(got, "/dev/sdy") {
+		t.Errorf("a volume marked with \"1\" — which is deleted — was reported: %s", got)
+	}
+}
+
+// EVERY EBS DEVICE THE IMAGE DECLARES LEAVES WITH AN EXPLICIT FLAG (#53).
+//
+// This is the test that makes the argument about EC2's default irrelevant rather
+// than resolved. AWS documents that default two ways that careful readers READ
+// differently for this case, so billet stops depending on it: whatever it says or
+// does not say, the RunInstances request states DeleteOnTermination for every
+// device it launches.
+//
+// The three cases differ in what billet is entitled to decide. A mapping that
+// said nothing is billet's to decide, and it decides delete. A NON-ROOT mapping
+// that said false is the OPERATOR talking about their own AMI, so it is passed
+// back unchanged — quietly deleting a volume somebody deliberately marked to keep
+// would be data loss dressed as tidiness. A mapping that said true is restated as
+// true, which changes nothing and costs nothing.
+//
+// The root is not one of the three: it is always sent true whatever it said, and
+// TestTheRootIsDeletedEvenWhenTheImageAsksToKeepIt is where that is pinned. This
+// fixture's root says NOTHING, so the exception never shows here — which is
+// exactly why the sentence above has to name it.
+//
+// AND THE ROOT OVERRIDE WARNING MUST STAY SILENT, which is the half nothing
+// asserted until a reviewer went looking for a surviving mutant: billet speaks
+// when it contradicts the image's intent and is silent when it merely fills a gap
+// in it. This fixture's root states nothing, so there is no intent to contradict.
+//
+// THAT IS NOT THE SAME AS SAYING NOTHING. Two of these mappings carry a flag
+// billet cannot read, and each gets a line on the OTHER channel — not a statement
+// about what the image meant, but about a response outside everything measured.
+// Both are asserted below, because a warning nothing checks is a warning that can
+// silently stop happening.
+func TestEveryImageDeviceLaunchesWithAnExplicitTerminationFlag(t *testing.T) {
+	f := newFakeEC2(t)
+	f.respond = func(action string, params url.Values) (int, string) {
+		if action != "DescribeImages" {
+			return http.StatusOK, defaultReply(action)
+		}
+
+		return http.StatusOK, `<DescribeImagesResponse><imagesSet><item>` +
+			`<imageId>ami-0abc</imageId><rootDeviceName>/dev/xvda</rootDeviceName>` +
+			`<blockDeviceMapping>` +
+			// THE ROOT IS DELIBERATELY NOT FIRST. AWS does not promise an order for
+			// response elements, and classifying "the first EBS mapping" as the root
+			// passed every test while this fixture led with it — a data volume
+			// arriving first would then be swallowed as the root and never restated.
+			`<item><deviceName>/dev/sdb</deviceName><ebs></ebs></item>` +
+			// AND THE ROOT SAYS NOTHING. billet states true for it without any
+			// OVERRIDE warning, having contradicted no stated intent — while still
+			// reporting, on the other channel, that it could not read the value.
+			`<item><deviceName>/dev/xvda</deviceName><ebs></ebs></item>` +
+			`<item><deviceName>/dev/sdc</deviceName><ebs>` +
+			`<deleteOnTermination>false</deleteOnTermination></ebs></item>` +
+			`<item><deviceName>/dev/sdd</deviceName><ebs>` +
+			`<deleteOnTermination>true</deleteOnTermination></ebs></item>` +
+			// PADDED, because xs:boolean collapses whitespace and this is the one
+			// place the string decode could be strictly worse than the bool it
+			// replaced: untrimmed, " false " reads as delete and billet overrides a
+			// preservation the image did ask for.
+			`<item><deviceName>/dev/sde</deviceName><ebs>` +
+			`<deleteOnTermination> false </deleteOnTermination></ebs></item>` +
+			`</blockDeviceMapping></item></imagesSet></DescribeImagesResponse>`
+	}
+
+	var logged bytes.Buffer
+
+	p := newTestProvider(t, f, nil)
+	p.log = slog.New(slog.NewTextHandler(&logged, nil))
+
+	if _, err := p.Launch(t.Context(), validSpec()); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	if strings.Contains(logged.String(), "ROOT") {
+		t.Errorf("billet announced a root override on an image whose root asked for nothing "+
+			"of the kind: %s", logged.String())
+	}
+
+	got := f.paramsFor(t, "RunInstances")
+
+	// Order is whatever DescribeImages returned, so this reads by name rather than
+	// by position; the root took index 1 regardless.
+	want := map[string]string{
+		"/dev/xvda": "true",  // root, stated by billet itself, and it said nothing
+		"/dev/sdb":  "true",  // said nothing -> billet decides delete
+		"/dev/sdc":  "false", // said keep -> honoured
+		"/dev/sdd":  "true",  // said delete -> restated
+		"/dev/sde":  "false", // said keep, padded -> still honoured
+	}
+
+	seen := blockDevices(t, got)
+
+	for device, flag := range want {
+		if seen[device] != flag {
+			t.Errorf("%s went out with DeleteOnTermination=%q, want %q", device, seen[device], flag)
+		}
+	}
+
+	if len(seen) != len(want) {
+		t.Errorf("sent %d devices, want %d: %v", len(seen), len(want), seen)
+	}
+
+	// EVERY KEPT VOLUME IS ANNOUNCED, both spellings of it. Honouring the flag and
+	// saying so are separate code paths, so a regression that reads the RAW value
+	// for the warning while the request uses the trimmed one would honour the padded
+	// device and never mention it — a volume billet knowingly leaves behind, silently.
+	for _, device := range []string{"/dev/sdc", "/dev/sde"} {
+		if !strings.Contains(logged.String(), device) {
+			t.Errorf("%s is being kept and was not reported: %s", device, logged.String())
+		}
+	}
+
+	// AT WARN. Reported at Info it sits beside the routine launch line and is seen
+	// by nobody.
+	if !strings.Contains(logged.String(), "level=WARN") {
+		t.Errorf("kept volumes were not reported as warnings: %s", logged.String())
+	}
+
+	// AND EVERY UNREADABLE FLAG IS REPORTED, root included. The root's line is the
+	// one a mutant could drop for free until this existed: it is emitted before the
+	// root branch, so moving the branch above it silences the root alone and every
+	// other assertion here still passes.
+	for _, device := range []string{"/dev/xvda", "/dev/sdb"} {
+		if !strings.Contains(logged.String(), `device=`+device) {
+			t.Errorf("%s carries a flag billet cannot read and was not reported: %s",
+				device, logged.String())
+		}
+	}
+
+	if n := strings.Count(logged.String(), "cannot read"); n != 2 {
+		t.Errorf("%d unreadable flags were reported, want 2 — one per affected device", n)
+	}
+}
+
+// A MAPPING THAT IS NOT AN EBS VOLUME IS NOT GIVEN AN EBS PARAMETER.
+//
+// An instance-store or suppressed mapping has no <ebs> child, and sending
+// Ebs.DeleteOnTermination for one asks EC2 about a volume that does not exist.
+// The response type models this with a POINTER for exactly this reason: a value
+// type would decode "no <ebs> element" and "<ebs></ebs>" to the same zero struct,
+// and this test would be impossible to write.
+func TestANonEBSMappingIsNotRestated(t *testing.T) {
+	f := newFakeEC2(t)
+	f.respond = func(action string, params url.Values) (int, string) {
+		if action != "DescribeImages" {
+			return http.StatusOK, defaultReply(action)
+		}
+
+		return http.StatusOK, `<DescribeImagesResponse><imagesSet><item>` +
+			`<imageId>ami-0abc</imageId><rootDeviceName>/dev/xvda</rootDeviceName>` +
+			`<blockDeviceMapping>` +
+			`<item><deviceName>/dev/sdb</deviceName><virtualName>ephemeral0</virtualName></item>` +
+			`</blockDeviceMapping></item></imagesSet></DescribeImagesResponse>`
+	}
+
+	p := newTestProvider(t, f, nil)
+
+	if _, err := p.Launch(t.Context(), validSpec()); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	got := f.paramsFor(t, "RunInstances")
+
+	for i := 1; ; i++ {
+		n := strconv.Itoa(i)
+
+		device := got.Get("BlockDeviceMapping." + n + ".DeviceName")
+		if device == "" {
+			break
+		}
+
+		if device == "/dev/sdb" {
+			t.Errorf("an instance-store mapping was sent as an EBS device: %s=%q",
+				"BlockDeviceMapping."+n+".Ebs.DeleteOnTermination",
+				got.Get("BlockDeviceMapping."+n+".Ebs.DeleteOnTermination"))
+		}
+	}
+}
+
+// THE INDICES ARE CONTIGUOUS FROM 1, which is what every official SDK emits for a
+// query-API list.
+//
+// What EC2 does with a GAP is not documented anywhere billet can point at, and
+// this test does not depend on knowing: a dense list is correct under every
+// possible gap semantics. What it pins is that a skipped device (the root, or a
+// non-EBS mapping) CLOSES the hole rather than leaving one — numbering by position
+// in the image's list would put a gap wherever billet declined to restate, and
+// then the answer would depend on that undocumented behaviour.
+func TestBlockDeviceIndicesAreContiguous(t *testing.T) {
+	f := newFakeEC2(t)
+	f.respond = func(action string, params url.Values) (int, string) {
+		if action != "DescribeImages" {
+			return http.StatusOK, defaultReply(action)
+		}
+
+		// The root and an instance-store device are both skipped, and they sit
+		// BEFORE the two real volumes so a positional bug cannot hide.
+		return http.StatusOK, `<DescribeImagesResponse><imagesSet><item>` +
+			`<imageId>ami-0abc</imageId><rootDeviceName>/dev/xvda</rootDeviceName>` +
+			`<blockDeviceMapping>` +
+			`<item><deviceName>/dev/xvda</deviceName><ebs></ebs></item>` +
+			`<item><deviceName>/dev/sda</deviceName><virtualName>ephemeral0</virtualName></item>` +
+			`<item><deviceName>/dev/sdb</deviceName><ebs></ebs></item>` +
+			`<item><deviceName>/dev/sdc</deviceName><ebs></ebs></item>` +
+			`</blockDeviceMapping></item></imagesSet></DescribeImagesResponse>`
+	}
+
+	p := newTestProvider(t, f, nil)
+
+	if _, err := p.Launch(t.Context(), validSpec()); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	got := f.paramsFor(t, "RunInstances")
+
+	for _, want := range []struct {
+		index  string
+		device string
+	}{
+		{"1", "/dev/xvda"},
+		{"2", "/dev/sdb"},
+		{"3", "/dev/sdc"},
+	} {
+		if d := got.Get("BlockDeviceMapping." + want.index + ".DeviceName"); d != want.device {
+			t.Errorf("BlockDeviceMapping.%s.DeviceName = %q, want %q", want.index, d, want.device)
+		}
+	}
+
+	if d := got.Get("BlockDeviceMapping.4.DeviceName"); d != "" {
+		t.Errorf("a fourth device was sent (%q); only three should have been", d)
+	}
+}
+
+// THE ROOT LEAVES AS true EVEN WHEN THE IMAGE ASKED TO KEEP IT.
+//
+// The one explicit false billet knowingly overrides, pinned so the asymmetry is a
+// decision on the record rather than something a later reader has to infer from
+// setBlockDevices writing index 1 before the loop runs. Two reviewers found this
+// gap by reading the prose against the code; this is what makes the code answer
+// for itself.
+func TestTheRootIsDeletedEvenWhenTheImageAsksToKeepIt(t *testing.T) {
+	f := newFakeEC2(t)
+	f.respond = func(action string, params url.Values) (int, string) {
+		if action != "DescribeImages" {
+			return http.StatusOK, defaultReply(action)
+		}
+
+		return http.StatusOK, `<DescribeImagesResponse><imagesSet><item>` +
+			`<imageId>ami-0abc</imageId><rootDeviceName>/dev/xvda</rootDeviceName>` +
+			`<blockDeviceMapping>` +
+			`<item><deviceName>/dev/xvda</deviceName><ebs>` +
+			`<deleteOnTermination>false</deleteOnTermination></ebs></item>` +
+			`</blockDeviceMapping></item></imagesSet></DescribeImagesResponse>`
+	}
+
+	var logged bytes.Buffer
+
+	p := newTestProvider(t, f, nil)
+	p.log = slog.New(slog.NewTextHandler(&logged, nil))
+
+	if _, err := p.Launch(t.Context(), validSpec()); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	got := f.paramsFor(t, "RunInstances")
+
+	if d := got.Get("BlockDeviceMapping.1.DeviceName"); d != "/dev/xvda" {
+		t.Fatalf("BlockDeviceMapping.1.DeviceName = %q, want the root", d)
+	}
+
+	if v := got.Get("BlockDeviceMapping.1.Ebs.DeleteOnTermination"); v != "true" {
+		t.Errorf("the root went out as %q; a boot disk kept per job leaks on every job billet "+
+			"launches from this image", v)
+	}
+
+	// AND IT IS NOT ALSO RESTATED AS A SECOND DEVICE, which is what would happen if
+	// the root were ever dropped from the skip list — EC2 would receive two entries
+	// for one device, disagreeing.
+	if d := got.Get("BlockDeviceMapping.2.DeviceName"); d != "" {
+		t.Errorf("the root was sent twice: index 2 is %q", d)
+	}
+
+	// AND IT SAID SO. The override is only half the promise; the ADR commits to
+	// announcing it in the same breath. This fixture spells the flag as the WORD,
+	// and the announcement was pinned only for the digit elsewhere — the one cell of
+	// the matrix nothing covered.
+	if !strings.Contains(logged.String(), "ROOT") {
+		t.Errorf("billet overrode a root marked keep without announcing it: %s", logged.String())
+	}
+
+	if !strings.Contains(logged.String(), "level=WARN") {
+		t.Errorf("the root override was not announced as a warning: %s", logged.String())
+	}
+}
+
+// A FLAG THAT IS NOT A BOOLEAN AT ALL IS REPORTED, NOT QUIETLY OBEYED.
+//
+// The companion to the absent case, and it arrived the same way: a reviewer asked
+// why a response outside everything measured earns a line when it is MISSING but
+// not when it is nonsense. There was no answer, only an accident of how the check
+// was written — every unrecognised value fell through to delete in silence, which
+// is the destructive direction.
+//
+// "False" is the sharp one. It is what a hand-rolled client or a proxy that
+// re-serialises XML would plausibly emit, it is not in xs:boolean's lexical space,
+// and it means the opposite of what billet would have silently done with it.
+func TestAFlagBilletCannotReadIsReported(t *testing.T) {
+	for _, value := range []string{"False", "TRUE", "yes", "  ", "2", "null"} {
+		t.Run(value, func(t *testing.T) {
+			f := newFakeEC2(t)
+			f.respond = func(action string, params url.Values) (int, string) {
+				if action != "DescribeImages" {
+					return http.StatusOK, defaultReply(action)
+				}
+
+				return http.StatusOK, `<DescribeImagesResponse><imagesSet><item>` +
+					`<imageId>ami-0abc</imageId><rootDeviceName>/dev/xvda</rootDeviceName>` +
+					`<blockDeviceMapping>` +
+					`<item><deviceName>/dev/xvda</deviceName><ebs>` +
+					`<deleteOnTermination>true</deleteOnTermination></ebs></item>` +
+					`<item><deviceName>/dev/sdb</deviceName><ebs>` +
+					`<deleteOnTermination>` + value + `</deleteOnTermination></ebs></item>` +
+					`</blockDeviceMapping></item></imagesSet></DescribeImagesResponse>`
+			}
+
+			var logged bytes.Buffer
+
+			p := newTestProvider(t, f, nil)
+			p.log = slog.New(slog.NewTextHandler(&logged, nil))
+
+			if _, err := p.Launch(t.Context(), validSpec()); err != nil {
+				t.Fatalf("Launch: %v", err)
+			}
+
+			got := logged.String()
+
+			if !strings.Contains(got, "cannot read") || !strings.Contains(got, "/dev/sdb") {
+				t.Errorf("%q was resolved without a word: %s", value, got)
+			}
+
+			// AND THE OFFENDING VALUE IS IN THE LINE. Without it an operator is told
+			// something is wrong with a device and left to go fetch the AMI to find
+			// out what — which is the difference between a warning and an errand.
+			// EITHER FORM, because slog quotes an attribute only when it has to — the
+			// whitespace row comes out quoted and the rest do not.
+			plain := strings.Contains(got, "value="+value)
+			quoted := strings.Contains(got, "value="+strconv.Quote(value))
+
+			if !plain && !quoted {
+				t.Errorf("the line does not carry the value it could not read (%q): %s",
+					value, got)
+			}
+
+			// AND IT STILL LAUNCHED, stating delete. Reporting the oddity must not
+			// become refusing the job over a field EC2 marks optional.
+			if v := f.paramsFor(t, "RunInstances").Get("BlockDeviceMapping.2.Ebs.DeleteOnTermination"); v != "true" {
+				t.Errorf("the device went out as %q, want true", v)
+			}
+		})
+	}
+}
+
+// THE FOUR TOKENS THAT ARE READABLE ARE READ, and nothing else is.
+//
+// The positive half, so the anomaly channel cannot creep onto ordinary values —
+// a warning that fires on "true" is one an operator stops reading.
+func TestTheFourBooleanTokensAreReadWithoutComplaint(t *testing.T) {
+	for value, want := range map[string]terminationIntent{
+		"true":    intentDelete,
+		"1":       intentDelete,
+		"false":   intentKeep,
+		"0":       intentKeep,
+		" true ":  intentDelete,
+		" false ": intentKeep,
+		"\t0\r\n": intentKeep,
+		// NBSP is whitespace to Go and not to XML, so this is not a boolean.
+		"\u00a0false\u00a0": intentUnreadable,
+		"":                  intentUnreadable,
+		"False":             intentUnreadable,
+		"yes":               intentUnreadable,
+	} {
+		if got := readTermination(value); got != want {
+			t.Errorf("readTermination(%q) = %v, want %v", value, got, want)
+		}
+	}
+}
+
+// A ROOT THAT ASKED TO BE DELETED IS RESTATED IN SILENCE.
+//
+// The other half of "speak only when billet contradicts the image", swept across
+// every spelling that means keep-nothing. The comprehensive test covers the absent
+// case; these cover the two ways an image can say delete, so no narrower reading
+// of the root flag can start announcing an override that is not happening.
+func TestTheRootIsNotAnnouncedWhenTheImageDidNotAskToKeepIt(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ebs  string
+	}{
+		{name: "said delete in words", ebs: `<deleteOnTermination>true</deleteOnTermination>`},
+		{name: "said delete as a digit", ebs: `<deleteOnTermination>1</deleteOnTermination>`},
+		{name: "said delete padded", ebs: `<deleteOnTermination> true </deleteOnTermination>`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeEC2(t)
+			f.respond = func(action string, params url.Values) (int, string) {
+				if action != "DescribeImages" {
+					return http.StatusOK, defaultReply(action)
+				}
+
+				return http.StatusOK, `<DescribeImagesResponse><imagesSet><item>` +
+					`<imageId>ami-0abc</imageId><rootDeviceName>/dev/xvda</rootDeviceName>` +
+					`<blockDeviceMapping>` +
+					`<item><deviceName>/dev/xvda</deviceName><ebs>` + tc.ebs + `</ebs></item>` +
+					`</blockDeviceMapping></item></imagesSet></DescribeImagesResponse>`
+			}
+
+			var logged bytes.Buffer
+
+			p := newTestProvider(t, f, nil)
+			p.log = slog.New(slog.NewTextHandler(&logged, nil))
+
+			if _, err := p.Launch(t.Context(), validSpec()); err != nil {
+				t.Fatalf("Launch: %v", err)
+			}
+
+			if strings.Contains(logged.String(), "ROOT") {
+				t.Errorf("billet announced overriding a root that asked for no such thing: %s",
+					logged.String())
+			}
+		})
+	}
+}
+
+// THE TWO WAYS AN IMAGE LOOKUP CAN BE UNUSABLE BOTH REFUSE THE LAUNCH.
+//
+// Both guards predate this work and both were unkillable: no fixture returned an
+// empty imagesSet or omitted rootDeviceName, so deleting either left the suite
+// green. The second is the one with teeth — without it a rootless image reaches
+// RunInstances with an EMPTY DeviceName, which is the "second disk by mistake"
+// hazard the guard's own message warns about.
+func TestAnImageBilletCannotReadIsRefusedBeforeLaunching(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		reply string
+		want  string
+	}{
+		{
+			name:  "no such image",
+			reply: `<DescribeImagesResponse><imagesSet></imagesSet></DescribeImagesResponse>`,
+			want:  "does not exist",
+		},
+		{
+			name: "no root device name",
+			reply: `<DescribeImagesResponse><imagesSet><item>` +
+				`<imageId>ami-0abc</imageId>` +
+				`</item></imagesSet></DescribeImagesResponse>`,
+			want: "no root device name",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeEC2(t)
+			f.respond = func(action string, params url.Values) (int, string) {
+				if action != "DescribeImages" {
+					return http.StatusOK, defaultReply(action)
+				}
+
+				return http.StatusOK, tc.reply
+			}
+
+			p := newTestProvider(t, f, nil)
+
+			_, err := p.Launch(t.Context(), validSpec())
+			if err == nil {
+				t.Fatal("Launch succeeded on an image billet cannot read")
+			}
+
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error does not name the problem: %v", err)
+			}
+
+			// AND NOTHING WAS BOUGHT. The refusal has to happen before RunInstances,
+			// or billet has paid for an instance it then reports as a failure.
+			if n := f.countOf("RunInstances"); n != 0 {
+				t.Errorf("%d instances were launched from an image billet could not read", n)
+			}
+		})
+	}
+}
+
+// A MAPPING WITH NO DEVICE NAME IS SKIPPED RATHER THAN SENT NAMELESS.
+//
+// A guard against a malformed response, and it exists as a test because a reviewer
+// found that deleting the guard left every other test green: no fixture had a
+// nameless mapping, so nothing noticed. An unkillable mutant is a guard nobody is
+// maintaining.
+func TestAMappingWithNoDeviceNameIsSkipped(t *testing.T) {
+	f := newFakeEC2(t)
+	f.respond = func(action string, params url.Values) (int, string) {
+		if action != "DescribeImages" {
+			return http.StatusOK, defaultReply(action)
+		}
+
+		return http.StatusOK, `<DescribeImagesResponse><imagesSet><item>` +
+			`<imageId>ami-0abc</imageId><rootDeviceName>/dev/xvda</rootDeviceName>` +
+			`<blockDeviceMapping>` +
+			`<item><ebs><deleteOnTermination>false</deleteOnTermination></ebs></item>` +
+			`<item><deviceName>/dev/sdb</deviceName><ebs>` +
+			`<deleteOnTermination>true</deleteOnTermination></ebs></item>` +
+			`</blockDeviceMapping></item></imagesSet></DescribeImagesResponse>`
+	}
+
+	var logged bytes.Buffer
+
+	p := newTestProvider(t, f, nil)
+	p.log = slog.New(slog.NewTextHandler(&logged, nil))
+
+	if _, err := p.Launch(t.Context(), validSpec()); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	// THE NAMELESS MAPPING SAYS "KEEP", so a guard that ran after the warning rather
+	// than before it would announce a volume that has no name to announce. Nothing
+	// at all should be said here.
+	if strings.Contains(logged.String(), "level=WARN") {
+		t.Errorf("a nameless mapping produced a warning naming no device: %s", logged.String())
+	}
+
+	got := f.paramsFor(t, "RunInstances")
+
+	// The named device takes index 2 — the nameless one consumed no slot at all.
+	if d := got.Get("BlockDeviceMapping.2.DeviceName"); d != "/dev/sdb" {
+		t.Errorf("BlockDeviceMapping.2.DeviceName = %q, want /dev/sdb; a nameless mapping "+
+			"either took a slot or was sent as an empty device", d)
+	}
+
+	if d := got.Get("BlockDeviceMapping.3.DeviceName"); d != "" {
+		t.Errorf("a third device was sent (%q); the nameless mapping should have been "+
+			"dropped entirely", d)
+	}
+}
+
+// A RESPONSE THAT OMITS DeleteOnTermination IS REPORTED AS AN ANOMALY.
+//
+// THIS ASSERTION IS INVERTED FROM WHAT IT WAS, and the measurement is why. It used
+// to pin silence, on the reasoning that billet could not tell what an omission
+// meant and a warning fired on an uninterpretable state is noise.
+//
+// A live account then showed a registered image reading back with the value
+// present, and no image in a 26,044-image corpus omitting it. So an omission is no
+// longer an ordinary state to be guessed at — it is a response that does not look
+// like the ones that were observed, which is worth one line per affected device.
+//
+// The launch is NOT refused: billet states delete and carries on, because turning
+// a missing optional field into a failed CI job is worse than deleting a volume
+// created fresh for that job. What is not acceptable is doing that quietly, which
+// is how a policy applied to an unmeasured state stops being visible.
+func TestAResponseOmittingTerminationIsReportedAsAnomalous(t *testing.T) {
 	f := newFakeEC2(t)
 	f.respond = func(action string, params url.Values) (int, string) {
 		if action != "DescribeImages" {
@@ -1965,8 +2835,20 @@ func TestAnImageSilentAboutTerminationIsNotWarnedAbout(t *testing.T) {
 		t.Fatalf("Launch: %v", err)
 	}
 
-	if strings.Contains(logged.String(), "/dev/sdq") {
-		t.Errorf("a mapping that says nothing about termination was warned about: %s",
-			logged.String())
+	got := logged.String()
+
+	if !strings.Contains(got, "/dev/sdq") {
+		t.Errorf("a response omitting the termination flag was not reported: %s", got)
+	}
+
+	if !strings.Contains(got, "level=WARN") {
+		t.Errorf("the anomaly was not reported as a warning: %s", got)
+	}
+
+	// AND THE LAUNCH STILL HAPPENED, stating delete. Reporting the oddity must not
+	// become refusing the job.
+	if v := f.paramsFor(t, "RunInstances").Get("BlockDeviceMapping.2.Ebs.DeleteOnTermination"); v != "true" {
+		t.Errorf("the device went out as %q, want true — billet should state delete rather "+
+			"than refuse or guess", v)
 	}
 }
