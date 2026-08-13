@@ -765,10 +765,16 @@ func (p *Provider) setBlockDevices(ctx context.Context, params url.Values, spec 
 // answer. So absence is settled by looking rather than by choosing, and only an
 // image that proves EBS by NEITHER route is refused.
 //
-// That is strictly better than the coin flip it replaced. It cannot admit an
-// instance-store root that omitted its type, and it cannot refuse a healthy image
-// over a field EC2 declined to send — where the previous rule had to lose one of
-// those two.
+// That is strictly better than the coin flip it replaced: it cannot admit an
+// instance-store root that omitted its type, where the previous rule could.
+//
+// It is NOT proof against a false refusal, though, and the difference is worth
+// keeping. Both the type and the mappings are optional in AWS's response model, so
+// an EBS-backed image that reported NEITHER would be refused here. That is
+// fail-closed on a response carrying no evidence at all rather than a guess about
+// a missing field — and no image in the 26,052 measured below is anywhere near it,
+// since every one reports both — but "cannot refuse a healthy image" would be a
+// stronger claim than the code earns.
 //
 // REFUSED RATHER THAN SUPPORTED, and the reason is narrower than it first looks: a
 // zero-disk tier would not need the resize, so what rules it out is the wider
@@ -821,10 +827,20 @@ func requireEBSRoot(image, rootType, rootDevice string, mappings []imageMapping)
 			"for a disk", image, rootDevice)
 	}
 
-	return fmt.Errorf("ec2: image %s is %s-backed, and billet's ec2 backend requires an "+
-		"EBS-backed AMI: it states what becomes of the root volume on every launch and resizes "+
-		"it when a tier asks for a disk, neither of which an instance-store root can do",
-		image, rootType)
+	if rootType == "instance-store" {
+		return fmt.Errorf("ec2: image %s is instance-store-backed, and billet's ec2 backend "+
+			"requires an EBS-backed AMI: it states what becomes of the root volume on every "+
+			"launch and resizes it when a tier asks for a disk, neither of which an "+
+			"instance-store root can do", image)
+	}
+
+	// A TYPE BILLET HAS NEVER HEARD OF gets its own sentence, because the one above
+	// would be asserting limitations of instance-store storage about something that
+	// may not be instance-store at all. AWS documents exactly two values; a third
+	// means the API grew and billet has not.
+	return fmt.Errorf("ec2: image %s reports root device type %q, which billet does not "+
+		"recognise — this backend requires an EBS-backed AMI, and it will not write EBS "+
+		"parameters for a root whose storage it cannot identify", image, rootType)
 }
 
 // imageLayout reports an AMI's root device and the mappings billet will restate,

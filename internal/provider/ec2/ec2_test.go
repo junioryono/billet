@@ -274,6 +274,13 @@ func defaultReply(action string) string {
 		// requiring evidence that a root is EBS-backed, at which point this fixture
 		// described an image billet correctly refuses — and six unrelated tests went
 		// red for the right reason.
+		//
+		// THE OTHER FIXTURES IN THIS FILE CARRY ONLY THE TYPE, deliberately, and a
+		// commit message of mine claiming otherwise was wrong. Adding the type is
+		// the minimal edit that makes them launchable, it is read by exactly one
+		// function so no other behaviour moves, and leaving them thin is worth
+		// something on its own: a requireEBSRoot that demanded BOTH signals would
+		// fail on every one of them.
 		return `<DescribeImagesResponse><imagesSet><item>` +
 			`<imageId>ami-0abc</imageId><rootDeviceName>/dev/xvda</rootDeviceName>` +
 			`<rootDeviceType>ebs</rootDeviceType>` +
@@ -2733,7 +2740,10 @@ func TestAnInstanceStoreBackedImageIsRefused(t *testing.T) {
 		`<virtualName>ephemeral0</virtualName></item>`
 
 	for _, tc := range []struct {
-		name     string
+		name string
+		// root overrides the device name for rows that need an unusual one; empty
+		// means the package's canonical rootDevice.
+		root     string
 		rootType string
 		mappings string
 		wantErr  string
@@ -2758,6 +2768,21 @@ func TestAnInstanceStoreBackedImageIsRefused(t *testing.T) {
 			name: "silent, corroborated by the mapping", mappings: ebsRoot,
 		},
 		{
+			// THE SAME CASE, BUILT TO BE AWKWARD, because the row above is too
+			// comfortable to prove much: it uses the package's canonical root name,
+			// as the only mapping, carrying a non-empty flag. Three wrong
+			// implementations survive it — matching a hardcoded "/dev/xvda" instead
+			// of the root argument, reading mappings[0] instead of searching, and
+			// requiring a non-empty DeleteOnTermination rather than merely an <ebs>
+			// child. This row has an unusual root name, a data volume FIRST, and an
+			// EMPTY <ebs> on the root, which is all AWS requires as evidence of an
+			// EBS volume — the child attributes are optional.
+			name: "silent, corroborated awkwardly",
+			root: "/dev/sda1",
+			mappings: `<item><deviceName>/dev/sdb</deviceName><ebs></ebs></item>` +
+				`<item><deviceName>/dev/sda1</deviceName><ebs></ebs></item>`,
+		},
+		{
 			// Silent, and the root is an instance-store device — the case the first
 			// version admitted, straight back into the late AWS failure.
 			name: "silent, root is instance store", mappings: storeRoot,
@@ -2780,6 +2805,11 @@ func TestAnInstanceStoreBackedImageIsRefused(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			name := rootDevice
+			if tc.root != "" {
+				name = tc.root
+			}
+
 			f := newFakeEC2(t)
 			f.respond = func(action string, params url.Values) (int, string) {
 				if action != "DescribeImages" {
@@ -2793,7 +2823,7 @@ func TestAnInstanceStoreBackedImageIsRefused(t *testing.T) {
 
 				return http.StatusOK, `<DescribeImagesResponse><imagesSet><item>` +
 					`<imageId>ami-0abc</imageId>` +
-					`<rootDeviceName>` + rootDevice + `</rootDeviceName>` + root +
+					`<rootDeviceName>` + name + `</rootDeviceName>` + root +
 					`<blockDeviceMapping>` + tc.mappings + `</blockDeviceMapping>` +
 					`</item></imagesSet></DescribeImagesResponse>`
 			}
@@ -2814,7 +2844,11 @@ func TestAnInstanceStoreBackedImageIsRefused(t *testing.T) {
 				t.Fatal("a launch from an image billet cannot use succeeded")
 			}
 
-			for _, want := range []string{"ami-0abc", tc.wantErr} {
+			// "EBS-backed" IS ASSERTED SEPARATELY, because it is the actionable half
+			// — the reason names what is wrong, this names what would be right. The
+			// rewrite that built this table dropped it, and a mutant deleting the
+			// remedy from both error paths survived until a reviewer noticed.
+			for _, want := range []string{"ami-0abc", "EBS-backed", tc.wantErr} {
 				if !strings.Contains(err.Error(), want) {
 					t.Errorf("the error does not name %q: %v", want, err)
 				}
