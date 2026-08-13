@@ -778,3 +778,35 @@ type cancelledSource struct{}
 func (cancelledSource) Credentials(ctx context.Context) (Credentials, error) {
 	return Credentials{}, fmt.Errorf("ec2: read credentials: %w", ctx.Err())
 }
+
+// PRINTING A SOURCE MUST NOT BE ABLE TO WEDGE THE NODE.
+//
+// The reason this type has a String at all is so somebody can print it — and
+// Credentials() holds i.mu across the whole fetch, so a redaction that read the
+// cached value under the same lock would deadlock the first time anyone logged
+// the source from inside that critical section. Which is exactly where a person
+// debugging credential resolution would put it.
+//
+// Rendering it while the lock is held is the shape of that mistake, and it must
+// simply return.
+func TestPrintingACredentialSourceCannotDeadlock(t *testing.T) {
+	src := &IMDSCredentials{Endpoint: "http://127.0.0.1:1"}
+
+	src.mu.Lock()
+
+	done := make(chan string, 1)
+
+	go func() { done <- fmt.Sprintf("%v|%+v|%s", src, src, src) }()
+
+	select {
+	case got := <-done:
+		if strings.Contains(got, "SecretAccessKey") {
+			t.Errorf("the source rendered its cached credential's fields: %s", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("rendering a credential source blocked on the lock its own resolution holds; " +
+			"one log line inside Credentials() would wedge the node")
+	}
+
+	src.mu.Unlock()
+}
