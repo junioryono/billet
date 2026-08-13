@@ -1850,10 +1850,12 @@ func checkEC2Credentials(ctx context.Context, cfg *config.EC2Config) error {
 func checkCephCluster(ctx context.Context, cfg *config.CephConfig) error {
 	client, err := ceph.New(*cfg)
 	if err != nil {
+		// WHAT THE CONFIG NAMES, and nothing the sentinel already says. Every
+		// wrapper renders the message beneath it, so repeating the remedy here put
+		// "install ceph-common" on the operator's terminal twice in one sentence.
 		if errors.Is(err, ceph.ErrNoRBD) {
-			return fmt.Errorf("node.ceph names %s and %s, but this host has no rbd command, so it "+
-				"cannot map a volume: install the ceph client package (ceph-common on debian and "+
-				"ubuntu): %w", cfg.ImagePool, cfg.CachePool, err)
+			return fmt.Errorf("node.ceph names %s and %s, so this host is meant to run jobs and "+
+				"cannot map a volume: %w", cfg.ImagePool, cfg.CachePool, err)
 		}
 
 		return err
