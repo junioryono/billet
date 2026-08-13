@@ -186,6 +186,18 @@ func (p *Provider) launchBuilder(ctx context.Context, spec BuildSpec, script str
 	params.Set("BlockDeviceMapping.1.DeviceName", rootDevice)
 	params.Set("BlockDeviceMapping.1.Ebs.DeleteOnTermination", "true")
 
+	// AND EVERY OTHER DEVICE THE BASE IMAGE DECLARES. Restating only the root left
+	// a worse hole than the one it closed: a base AMI with a non-root device marked
+	// to survive leaks a volume on every build, AND CreateImage copies that mapping
+	// into the produced image — so every JOB launched from it leaks one too. One
+	// careless base image would have become a per-job leak in somebody's account.
+	for i, d := range layout.devices {
+		n := strconv.Itoa(i + 2)
+
+		params.Set("BlockDeviceMapping."+n+".DeviceName", d.name)
+		params.Set("BlockDeviceMapping."+n+".Ebs.DeleteOnTermination", "true")
+	}
+
 	// AND THE VOLUME CARRIES THE TAG TOO, so anything that does survive is
 	// attributable rather than an anonymous disk in somebody's account.
 	params.Set("TagSpecification.2.ResourceType", "volume")
@@ -227,10 +239,15 @@ func (p *Provider) awaitStopped(ctx context.Context, id string) error {
 			// say that. A cost scheduler calling StopInstances on a tag, or a host
 			// failure, stops a half-provisioned builder just as convincingly, and
 			// imaging that is the exact outcome this design exists to prevent.
-			if out.reason != "" && out.reason != "Client.InstanceInitiatedShutdown" {
-				return fmt.Errorf("ec2: the builder %s was stopped by something other than its "+
-					"own provisioning script (%s), so whatever is on its disk is not a "+
-					"finished image", id, out.reason)
+			// EXACT EQUALITY, INCLUDING REJECTING EMPTY. AWS marks the reason code
+			// optional, so "" is not "the guest did it" — it is "nobody said". The
+			// first version of this accepted it, which left the whole door open that
+			// the check was added to close.
+			if out.reason != "Client.InstanceInitiatedShutdown" {
+				return fmt.Errorf("ec2: the builder %s stopped for reason %q rather than "+
+					"Client.InstanceInitiatedShutdown, so this is not its provisioning script "+
+					"finishing and whatever is on its disk is not a finished image",
+					id, out.reason)
 			}
 
 			return nil
@@ -309,7 +326,15 @@ func (p *Provider) createImage(ctx context.Context, instance, name string) (stri
 	var out createImageResponse
 
 	if err := p.api.call(ctx, params, &out); err != nil {
-		return "", fmt.Errorf("ec2: register an image from the builder %s: %w", instance, err)
+		// AMBIGUOUS, AND SAID SO. CreateImage accepts no client token — it is in
+		// neither AWS's idempotent-by-default list nor its token list — so a request
+		// that commits and loses its response leaves an AMI and its snapshots behind
+		// with billet holding no id. Naming what to search for is the only thing
+		// available; inventing a mechanism the API does not offer is not.
+		return "", fmt.Errorf("ec2: register an image from the builder %s: %w\n\nthis request "+
+			"may have COMMITTED before failing, and CreateImage has no idempotency token: "+
+			"search for an image named %q before retrying, or the retry will fail on a "+
+			"duplicate name", instance, err, name)
 	}
 
 	if out.ImageID == "" {
@@ -488,7 +513,20 @@ func provisionScript(spec BuildSpec) (string, error) {
 	// booted, registered nothing, and left the job queued — the exact silent class
 	// this whole issue exists to close. An earlier version of this comment claimed
 	// nothing here could check that. The guest can, by running it.
-	b.WriteString("sudo -u runner /opt/actions-runner/bin/Runner.Listener --version\n")
+	// RUN IT THE WAY A JOB WILL, which is the difference between validating the
+	// binary and validating the image.
+	//
+	// An earlier version used `sudo -u runner`, which proved the runner executes and
+	// proved nothing about the path a job actually takes. A dnf base image carrying
+	// sudo but NOT setpriv would have passed that check, powered off, been imaged —
+	// and then failed on every job before the runner ever started. So the check goes
+	// through the same setpriv invocation the entry point uses, which proves in one
+	// command that setpriv exists, that the user switch works, that the runner user
+	// can reach and execute the binary, and that .NET starts (a missing libicu dies
+	// here rather than at registration).
+	b.WriteString("setpriv --reuid=runner --regid=runner --init-groups \\\n")
+	b.WriteString("  env HOME=/home/runner USER=runner LOGNAME=runner \\\n")
+	b.WriteString("  /opt/actions-runner/bin/Runner.Listener --version\n")
 
 	// THE SUCCESS SIGNAL. Reaching this line is the only thing that tells billet
 	// the image is worth making; set -e means a failure anywhere above never
