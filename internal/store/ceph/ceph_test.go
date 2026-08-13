@@ -48,6 +48,7 @@ type recorder struct {
 
 	cloneFormat      string // the rbd_default_clone_format `rbd config pool list` reports
 	cacheCloneFormat string // ...for the cache pool, when it differs from the image pool
+	cloneSource      string // where rbd says that value came from: "pool" or "config"
 	rawConfig        string // raw bytes for that listing, overriding both
 
 	err error // if set, every invocation fails with it
@@ -94,8 +95,13 @@ func (r *recorder) run(_ context.Context, bin string, args []string) ([]byte, er
 			format = r.cacheCloneFormat
 		}
 
+		source := r.cloneSource
+		if source == "" {
+			source = "config"
+		}
+
 		return []byte(`[{"name":"rbd_default_clone_format","value":"` + format +
-			`","source":"config"}]`), nil
+			`","source":"` + source + `"}]`), nil
 
 	case strings.Contains(joined, "-p billet-images"):
 		if r.rawImages != "" {
@@ -1070,6 +1076,45 @@ func TestAnAnswerThatIsNotAReleaseIsRefused(t *testing.T) {
 	}
 }
 
+// AND `unknown` IS REFUSED AT THE BOUNDARY, not only on the path that consumes it.
+//
+// EffectiveCloneFormat returns early when rbd_default_clone_format is set
+// explicitly, which is correct — the override really does decide — and it meant
+// the release was never looked at on that path. So a cluster with the format
+// forced and `unknown` as its floor skipped the check entirely, and `unknown` was
+// stored and printed as though billet had recognised it. A value validated in one
+// of its two consumers is a value that is not validated, so the refusal moved to
+// where the value enters.
+func TestAnUnknownReleaseIsRefusedWhateverTheCloneFormat(t *testing.T) {
+	t.Parallel()
+
+	for _, format := range []string{"auto", "1", "2", ""} {
+		rec := answer()
+		rec.minCompat = "unknown"
+		rec.cloneFormat = format
+		rec.cacheCloneFormat = format
+
+		report, err := client(t, valid(), rec).CheckReachable(t.Context())
+		if err == nil {
+			t.Errorf("clone format %q: CheckReachable accepted a cluster that was never told "+
+				"which clients it admits", format)
+
+			continue
+		}
+
+		if !errors.Is(err, ErrUnclassifiedRelease) {
+			t.Errorf("clone format %q: the failure is %v, not ErrUnclassifiedRelease", format, err)
+		}
+
+		// AND NOTHING IS RENDERED FROM IT. The report is what the CLI prints, so a
+		// populated one here would put `unknown` on the terminal beside a refusal
+		// that says billet could not classify it.
+		if report.MinCompatClient != "" {
+			t.Errorf("clone format %q: the report carries %q", format, report.MinCompatClient)
+		}
+	}
+}
+
 // THE FLOOR IS A PROXY, AND ONE CONFIG KEY DEFEATS IT.
 //
 // `rbd_default_clone_format` overrides what the cluster's minimum client release
@@ -1120,7 +1165,7 @@ func TestAForcedCloneFormatIsRefusedWithTheRightRemedy(t *testing.T) {
 	rec := answer()
 	rec.cloneFormat = "1"
 
-	_, err := client(t, valid(), rec).CheckReachable(t.Context())
+	report, err := client(t, valid(), rec).CheckReachable(t.Context())
 	if err == nil {
 		t.Fatal("CheckReachable accepted a cluster forced to clone format 1")
 	}
@@ -1135,6 +1180,47 @@ func TestAForcedCloneFormatIsRefusedWithTheRightRemedy(t *testing.T) {
 
 	if strings.Contains(err.Error(), "set-require-min-compat-client") {
 		t.Errorf("the error gives the remedy for the other cause, which is already satisfied: %v", err)
+	}
+
+	// THE REPORT SURVIVES THIS REFUSAL TOO, with the replication the CLI prints
+	// beside it — the same property the release-refusal path has, and one a
+	// refusal moved earlier would silently drop.
+	if len(report.Pools) != 2 || report.Pools[0].Size == 0 {
+		t.Errorf("the refusal discarded what the check had established: %+v", report.Pools)
+	}
+}
+
+// THE REMEDY MATCHES WHERE THE OVERRIDE LIVES.
+//
+// rbd reports whether an effective value came from the pool or from the cluster
+// config, and the two take different commands: `ceph config rm client …` does not
+// remove an override set on a pool. Naming the wrong one sends an operator to a
+// setting that is already absent, and leaves them believing billet is wrong about
+// their cluster.
+func TestTheRemedyMatchesWhereTheOverrideLives(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct{ source, want, avoid string }{
+		{"pool", "rbd config pool rm billet-images rbd_default_clone_format", "ceph config rm"},
+		{"config", "ceph config rm client rbd_default_clone_format", "rbd config pool rm"},
+	} {
+		rec := answer()
+		rec.cloneFormat = "1"
+		rec.cloneSource = tc.source
+
+		_, err := client(t, valid(), rec).CheckReachable(t.Context())
+		if err == nil {
+			t.Fatalf("source %q: CheckReachable accepted a forced clone format", tc.source)
+		}
+
+		if !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("source %q: the error does not give %q: %v", tc.source, tc.want, err)
+		}
+
+		if strings.Contains(err.Error(), tc.avoid) {
+			t.Errorf("source %q: the error gives %q, which would not remove it: %v",
+				tc.source, tc.avoid, err)
+		}
 	}
 }
 
@@ -1241,7 +1327,7 @@ func TestAClusterThatClonesTheOldWayIsRefused(t *testing.T) {
 	// refusal. Moving the refusal above the pool read would leave the assertions
 	// above green and quietly drop it.
 	for _, p := range report.Pools {
-		if p.Size == 0 {
+		if p.Size == 0 || p.MinSize == 0 {
 			t.Errorf("%s reached the refusal with no replication: %+v", p.Name, p)
 		}
 	}
@@ -1372,9 +1458,16 @@ func TestACephInvocationIsBoundedToo(t *testing.T) {
 	c, err := New(valid(), WithBinary("/usr/bin/rbd"), WithCephBinary("/usr/bin/ceph"),
 		WithTimeout(20*time.Millisecond),
 		withRunner(func(ctx context.Context, bin string, args []string) ([]byte, error) {
-			// The rbd half answers immediately; only ceph stalls.
+			// The rbd half answers immediately, and so does the release query — so
+			// what stalls is the JSON pool listing specifically. Stalling the FIRST
+			// ceph call would leave "apply the timeout only to non-json ceph calls"
+			// alive, which is a real one-line regression.
 			if filepath.Base(bin) != "ceph" {
 				return []byte(`[]`), nil
+			}
+
+			if strings.Contains(strings.Join(args, " "), "get-require-min-compat-client") {
+				return []byte("mimic\n"), nil
 			}
 
 			safety := time.NewTimer(5 * time.Second)
@@ -1418,6 +1511,7 @@ func TestTheCloneFormatIsCheckedOnEveryPool(t *testing.T) {
 	rec := answer()
 	rec.cloneFormat = "auto" // the image pool is fine
 	rec.cacheCloneFormat = "1"
+	rec.cloneSource = "pool" // which is how a per-pool override reports itself
 
 	report, err := client(t, valid(), rec).CheckReachable(t.Context())
 	if err == nil {
