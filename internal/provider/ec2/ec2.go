@@ -77,10 +77,11 @@ type Provider struct {
 	cfg   config.EC2Config
 	api   *client
 
-	// rootDevices caches an AMI's root device name, which billet has to ask for
-	// before it can resize a root volume. It does not change for a given AMI.
-	mu          sync.Mutex
-	rootDevices map[string]string
+	// images caches what one DescribeImages lookup says about an AMI: its root
+	// device, and every non-root EBS mapping billet will restate at launch. Asked
+	// once per image because it cannot change under a given AMI id.
+	mu     sync.Mutex
+	images map[string]imageLayout
 }
 
 // Option configures a Provider.
@@ -191,7 +192,7 @@ func New(owner string, cfg config.EC2Config, opts ...Option) (*Provider, error) 
 			region:   cfg.Region,
 			creds:    DefaultCredentials(),
 		},
-		rootDevices: make(map[string]string),
+		images: make(map[string]imageLayout),
 	}
 
 	for _, opt := range opts {
@@ -446,7 +447,7 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*provider.In
 		params.Set("InstanceMarketOptions.SpotOptions.InstanceInterruptionBehavior", "terminate")
 	}
 
-	if err := p.setRootVolume(ctx, params, spec); err != nil {
+	if err := p.setBlockDevices(ctx, params, spec); err != nil {
 		return nil, err
 	}
 
@@ -538,50 +539,128 @@ func (p *Provider) setTags(params url.Values, name string) {
 	params.Set("TagSpecification.2.Tag.2.Value", p.owner)
 }
 
-// setRootVolume states what happens to the root disk, and resizes it when the
-// tier asked for a size.
+// survivesTermination reports whether a mapping SAYS its volume outlives the
+// instance.
 //
-// IT RUNS ON EVERY LAUNCH, EVEN WITH NO SIZE TO SET, because DeleteOnTermination
-// is the half that always matters. Left unstated, whatever the AMI was built with
-// governs — and an AMI built with it false leaves a root volume behind for every
-// job billet ever runs on it, billed indefinitely, discoverable only by hunting
-// tags. Stating it costs one DescribeImages per AMI, cached for the life of the
-// process.
+// BOTH SPELLINGS, because XML booleans have two: xs:boolean's lexical space is
+// "true"/"false"/"1"/"0". Whether EC2 ever emits the digits is not something this
+// package can answer — nothing in it has spoken to a real AWS account — so the
+// choice is between handling a form that may never arrive and misreading the
+// operator's intent if it does. One comparison, and it fails toward honouring
+// what the image said.
 //
-// THE DEVICE NAME IS ASKED FOR RATHER THAN ASSUMED, which is what that call buys.
-// A block device mapping naming a device that is not the AMI's root does not
-// fail: EC2 attaches an ADDITIONAL empty volume, the root stays whatever size the
-// image was built at, and the launch reports success. So a tier asking for 300GiB
-// would run out of disk mid-job while an unused 300GiB volume sat beside it,
-// billed. `/dev/sda1` and `/dev/xvda` are both common and neither is safe to
-// guess.
-func (p *Provider) setRootVolume(ctx context.Context, params url.Values, spec provider.Spec) error {
-	device, err := p.rootDevice(ctx, spec.Image)
+// SPELLING THEM OUT IS THE COST OF DECODING THIS AS A STRING, which is the part
+// worth knowing before someone "simplifies" it. encoding/xml runs a bool field
+// through strconv.ParseBool, so a bool would have understood all four lexemes for
+// free — but it also decodes an ABSENT element into the zero value, making absent
+// and "false" indistinguishable. Those two get opposite treatment now (absent is
+// billet's to decide, false is the operator's to keep), so the string decode is
+// forced, and this function puts back the leniency that decision threw away.
+//
+// That much is measured rather than assumed, and it is measurable precisely
+// because it is Go's behaviour rather than AWS's:
+//
+//	<ebs></ebs>                       bool=false  string=""
+//	<ebs><d>false</d></ebs>           bool=false  string="false"
+//	<ebs><d>0</d></ebs>               bool=false  string="0"
+//	<ebs><d>1</d></ebs>               bool=true   string="1"
+func survivesTermination(flag string) bool {
+	return flag == "false" || flag == "0"
+}
+
+// imageDevice is one block device billet will state explicitly at launch.
+type imageDevice struct {
+	name string
+	// keep is the literal DeleteOnTermination billet will send for this device.
+	// NEVER EMPTY — that is the entire point of the type.
+	keep string
+}
+
+// imageLayout is what one DescribeImages lookup tells billet about an AMI.
+type imageLayout struct {
+	root string
+	// devices are the non-root EBS mappings, in the order the image declared
+	// them, each carrying the flag billet will send for it.
+	devices []imageDevice
+}
+
+// setBlockDevices states what happens to EVERY volume the instance launches with.
+//
+// NOTHING HERE IS LEFT TO A DEFAULT, and that is the whole design. An unstated
+// DeleteOnTermination is not a small ambiguity: AWS documents the answer twice,
+// and the two answers disagree for exactly the case billet is in — a non-root
+// volume, attached at launch, through the API.
+//
+//   - [2] gives a complete inheritance model — the default is true for the root
+//     volume and false for ATTACHED volumes, an AMI inherits the setting from the
+//     instance it was made from, and a launch inherits it from the AMI. Read
+//     literally, a silent non-root mapping PRESERVES its volume, and billet leaks
+//     one disk per job forever.
+//   - [1] carries a launch-time defaults table whose "data volume, at launch, CLI"
+//     row says Delete. Read literally, the same mapping is harmless.
+//
+// Reviewers split on whether those genuinely conflict or can be reconciled, which
+// is itself the argument for this function: the disagreement was about somebody
+// else's undocumented edge, neither reading was measurable from here, and the bill
+// for guessing wrong arrives monthly and silently. So billet stops having an
+// opinion. Every device it launches carries an explicit flag, and no default —
+// documented, contradictory, or discovered later — governs anything billet
+// launches. #53.
+//
+// AN EXPLICIT false IS PASSED THROUGH, NOT OVERRIDDEN. Only the mappings that say
+// nothing are decided here. Where the image DID state the flag, that is the
+// operator talking about their own AMI, and silently deleting a volume somebody
+// deliberately marked to keep is a data-loss bug wearing a tidiness costume. Those
+// are warned about instead, once per image.
+//
+// THE DEVICE NAME IS ASKED FOR RATHER THAN ASSUMED, which is what the lookup buys
+// beyond this. A block device mapping naming a device that is not the AMI's root
+// does not fail: EC2 attaches an ADDITIONAL empty volume, the root stays whatever
+// size the image was built at, and the launch reports success. So a tier asking
+// for 300GiB would run out of disk mid-job while an unused 300GiB volume sat
+// beside it, billed. `/dev/sda1` and `/dev/xvda` are both common and neither is
+// safe to guess.
+//
+// [1]: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/preserving-volumes-on-termination.html
+// [2]: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/block-device-mapping-concepts.html
+func (p *Provider) setBlockDevices(ctx context.Context, params url.Values, spec provider.Spec) error {
+	layout, err := p.imageLayout(ctx, spec.Image)
 	if err != nil {
 		return err
 	}
 
-	params.Set("BlockDeviceMapping.1.DeviceName", device)
+	params.Set("BlockDeviceMapping.1.DeviceName", layout.root)
 	params.Set("BlockDeviceMapping.1.Ebs.DeleteOnTermination", "true")
 
-	if spec.Disk <= 0 {
-		return nil
+	if spec.Disk > 0 {
+		// ROUNDED UP. EBS sizes in whole GiB, and rounding down would hand a tier
+		// that asked for 80GiB a 79GiB disk — the direction that fails a job rather
+		// than costing a fraction of a cent.
+		gib := (int64(spec.Disk) + int64(config.GiB) - 1) / int64(config.GiB)
+
+		params.Set("BlockDeviceMapping.1.Ebs.VolumeSize", strconv.FormatInt(gib, 10))
 	}
 
-	// ROUNDED UP. EBS sizes in whole GiB, and rounding down would hand a tier that
-	// asked for 80GiB a 79GiB disk — the direction that fails a job rather than
-	// costing a fraction of a cent.
-	gib := (int64(spec.Disk) + int64(config.GiB) - 1) / int64(config.GiB)
+	// FROM 2, because the root took 1. The indices are positional rather than
+	// meaningful, but they must be contiguous — EC2 stops reading at the first gap.
+	for i, d := range layout.devices {
+		n := strconv.Itoa(i + 2)
 
-	params.Set("BlockDeviceMapping.1.Ebs.VolumeSize", strconv.FormatInt(gib, 10))
+		params.Set("BlockDeviceMapping."+n+".DeviceName", d.name)
+		params.Set("BlockDeviceMapping."+n+".Ebs.DeleteOnTermination", d.keep)
+	}
 
 	return nil
 }
 
-// rootDevice reports an AMI's root device name, asking once per image.
-func (p *Provider) rootDevice(ctx context.Context, image string) (string, error) {
+// imageLayout reports an AMI's root device and the mappings billet will restate,
+// asking once per image.
+//
+// The warning about volumes the image asks to keep is emitted HERE rather than at
+// launch, so it is said once per image like the lookup, instead of once per job.
+func (p *Provider) imageLayout(ctx context.Context, image string) (imageLayout, error) {
 	p.mu.Lock()
-	cached, ok := p.rootDevices[image]
+	cached, ok := p.images[image]
 	p.mu.Unlock()
 
 	if ok {
@@ -595,129 +674,50 @@ func (p *Provider) rootDevice(ctx context.Context, image string) (string, error)
 	var out describeImagesResponse
 
 	if err := p.api.call(ctx, params, &out); err != nil {
-		return "", fmt.Errorf("ec2: describe image %s to size its root volume: %w", image, err)
+		return imageLayout{}, fmt.Errorf("ec2: describe image %s to state its block devices: %w",
+			image, err)
 	}
 
 	if len(out.Images) == 0 {
-		return "", fmt.Errorf("ec2: image %s does not exist in %s, or this deployment cannot "+
-			"see it", image, p.cfg.Region)
+		return imageLayout{}, fmt.Errorf("ec2: image %s does not exist in %s, or this deployment "+
+			"cannot see it", image, p.cfg.Region)
 	}
 
-	device := out.Images[0].RootDeviceName
-	if device == "" {
-		return "", fmt.Errorf("ec2: image %s reports no root device name, so billet cannot size "+
-			"its root volume without attaching a second disk by mistake", image)
+	layout := imageLayout{root: out.Images[0].RootDeviceName}
+	if layout.root == "" {
+		return imageLayout{}, fmt.Errorf("ec2: image %s reports no root device name, so billet "+
+			"cannot size its root volume without attaching a second disk by mistake", image)
 	}
-
-	p.warnAboutSurvivingVolumes(image, out)
-
-	p.mu.Lock()
-	p.rootDevices[image] = device
-	p.mu.Unlock()
-
-	return device, nil
-}
-
-// survivesTermination reports whether a mapping SAYS its volume outlives the
-// instance.
-//
-// BOTH SPELLINGS, because XML booleans have two: xs:boolean's lexical space is
-// "true"/"false"/"1"/"0". Whether EC2 ever emits the digits is not something this
-// package can answer — nothing in it has spoken to a real AWS account — so the
-// choice is between handling a form that may never arrive and missing a leak if
-// it does. One comparison, and it fails toward saying something.
-//
-// SPELLING THEM OUT IS THE COST OF DECODING THIS AS A STRING, which is the part
-// worth knowing before someone "simplifies" it. encoding/xml runs a bool field
-// through strconv.ParseBool, so a bool would have understood all four lexemes for
-// free — but it also decodes an ABSENT element into the zero value, making absent
-// and "false" indistinguishable. Absent has to stay visible (see the call site),
-// so the string decode is forced, and this function is what puts back the leniency
-// that decision threw away.
-//
-// That much is measured rather than assumed, and it is measurable precisely
-// because it is Go's behaviour rather than AWS's:
-//
-//	<ebs></ebs>                       bool=false  string=""
-//	<ebs><d>false</d></ebs>           bool=false  string="false"
-//	<ebs><d>0</d></ebs>               bool=false  string="0"
-//	<ebs><d>1</d></ebs>               bool=true   string="1"
-func survivesTermination(flag string) bool {
-	return flag == "false" || flag == "0"
-}
-
-// warnAboutSurvivingVolumes reports image volumes that outlive their instance.
-//
-// A CONTRACT NOTHING ENFORCES FAILS SILENTLY, which is why this is code rather
-// than a sentence in the AMI documentation. billet sets DeleteOnTermination for
-// the ROOT device and cannot set it for the others without restating every
-// mapping — so an image that declares an extra EBS volume with the flag false
-// leaks one volume PER JOB, tagged and billed and discoverable only by somebody
-// going to look.
-//
-// A WARNING RATHER THAN A REFUSAL, because an operator may have meant it: a
-// deliberately persistent volume is a strange thing to attach to an ephemeral
-// runner, and it is their AMI. It is said once per image, since the lookup is
-// cached, which is also what keeps it from becoming noise.
-func (p *Provider) warnAboutSurvivingVolumes(image string, out describeImagesResponse) {
-	if len(out.Images) == 0 {
-		return
-	}
-
-	root := out.Images[0].RootDeviceName
 
 	for _, bd := range out.Images[0].BlockDevices {
-		// AN ABSENT FLAG IS NOT A FALSE ONE — because billet cannot tell what absent
-		// means here, not because it is probably fine.
-		//
-		// The image is the right place to be looking. AWS states that an EBS volume's
-		// launch-time default is determined by the DeleteOnTermination attribute set
-		// on the AMI, overridable per launch [1] — so a flag that IS present in
-		// DescribeImages is the one that will actually govern, and worth reporting.
-		//
-		// ABSENT IS A DIFFERENT QUESTION, AND AWS ANSWERS IT TWICE, DIFFERENTLY.
-		//
-		//   - [2] documents a complete inheritance model: the default is true for the
-		//     root volume and false for ATTACHED volumes, an AMI inherits the setting
-		//     from the instance it was created from, and a launch inherits it from the
-		//     AMI. Followed literally, a non-root mapping that says nothing defaults to
-		//     false — it survives — and every silent mapping here is a leak.
-		//   - [1] carries a table of launch-time defaults whose "data volume, at
-		//     launch, CLI" row says Delete. billet launches through the API. Followed
-		//     literally, the same silent mapping is harmless.
-		//
-		// Both are current AWS documentation. Neither is obviously the more specific
-		// rule, and nothing in this package has ever spoken to a real account to break
-		// the tie — so this is not a gap that a more careful reading closes.
-		//
-		// SILENCE IS THEREFORE A CHOICE, not a conclusion, and it is worth naming which
-		// way it can be wrong: if [2] governs, billet misses a real per-job leak on an
-		// image that never stated the flag. What makes that acceptable for now is that
-		// the case is close to hypothetical — AWS's own DescribeImages examples
-		// materialize the field on EBS mappings — while the opposite error is not: a
-		// warning that fires on every silent image is one operators learn to ignore,
-		// including on the images that DID say false. #53 tracks the real fix, which is
-		// to stop depending on the answer at all by restating every mapping at launch.
-		//
-		// AND NOTE WHAT IS BEING OBSERVED. An omitted element means the RESPONSE
-		// omitted it. Whether the image "sets no attribute" is an inference on top of
-		// that, about a system billet has not measured — the distinction that makes
-		// this whole paragraph "unknown" rather than merely "unspecified".
-		//
-		// Keeping absent distinguishable is what forces the string decode; see
-		// survivesTermination for why that is not free.
-		//
-		// [1]: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/preserving-volumes-on-termination.html
-		// [2]: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/block-device-mapping-concepts.html
-		if bd.DeviceName == root || !survivesTermination(bd.EBS.DeleteOnTermination) {
+		// NOT EVERY MAPPING IS AN EBS VOLUME. A mapping with no <ebs> child is an
+		// instance-store or suppressed device, and sending Ebs.DeleteOnTermination
+		// for one asks EC2 about a volume that does not exist. A device with no name
+		// cannot be restated at all.
+		if bd.DeviceName == "" || bd.DeviceName == layout.root || bd.EBS == nil {
 			continue
 		}
 
-		p.log.Warn("this image attaches a volume that outlives its instance; billet sets "+
-			"DeleteOnTermination for the root device only, so every job on this tier will "+
-			"leave one behind",
-			"image", image, "device", bd.DeviceName)
+		keep := "true"
+
+		if survivesTermination(bd.EBS.DeleteOnTermination) {
+			// THE IMAGE SAID SO, so billet says it back rather than overruling it.
+			keep = "false"
+
+			p.log.Warn("this image attaches a volume that outlives its instance, and billet is "+
+				"launching it that way because the image asked; every job on this tier will "+
+				"leave one behind, billed until somebody goes looking",
+				"image", image, "device", bd.DeviceName)
+		}
+
+		layout.devices = append(layout.devices, imageDevice{name: bd.DeviceName, keep: keep})
 	}
+
+	p.mu.Lock()
+	p.images[image] = layout
+	p.mu.Unlock()
+
+	return layout, nil
 }
 
 // userData is the boot script that starts the runner.
