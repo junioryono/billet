@@ -193,6 +193,7 @@ built. What works **today**:
 | `billet ca rotate` / `retire` | Replaces the authority as an overlap, so no node is cut off |
 | `billet leases quarantined` | Capacity held for compute nobody has confirmed gone, and which host holds it |
 | `billet leases release <lease> --force` | Hands that capacity back, for a machine that is never coming back |
+| `billet ami build` | Builds the AWS machine image the `ec2` backend launches: the GitHub Actions runner, Docker, git. Deliberately minimal — `actions/setup-*` downloads toolchains at runtime and works, while a workflow assuming a preinstalled toolchain fails loudly. **An AMI id is region-scoped**, so a tier's `image:` only works in the region it was built for |
 | `billet teardown` | Removes the scale sets billet created |
 | Capacity ledger | Lease state machine, fencing epochs, placement enforcement, escrow before advertising |
 | Docker provider | One container per job, JIT registration delivered off argv. **Trials only** — shares the host kernel, so it refuses anything not established as trusted |

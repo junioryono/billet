@@ -344,6 +344,11 @@ func (i instanceItem) tag(key string) (string, bool) {
 }
 
 // runInstancesResponse is what a launch answers with.
+// createImageResponse carries the id of the AMI a build produced.
+type createImageResponse struct {
+	ImageID string `xml:"imageId"`
+}
+
 type runInstancesResponse struct {
 	Instances []instanceItem `xml:"instancesSet>item"`
 }
@@ -372,6 +377,10 @@ type describeImagesResponse struct {
 		// and refuses the second up front (#54), because every root parameter it
 		// sends is EBS-shaped.
 		RootDeviceType string `xml:"rootDeviceType"`
+		// State is "pending" until an image can be launched from, then "available".
+		// A build that hands back an id before that produces a tier whose first
+		// launch fails with an error about the image rather than about the config.
+		State string `xml:"imageState"`
 		// BlockDevices are the image's own mappings. billet states
 		// DeleteOnTermination at launch for the EBS ones (#53), so these are read to
 		// BUILD that request — and to warn about the ones the image asks to keep.
