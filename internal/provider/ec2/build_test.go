@@ -73,6 +73,35 @@ func TestNothingRunsAfterTheSuccessSignal(t *testing.T) {
 	// runner` proved the binary runs and proved nothing about the path a job takes:
 	// a base image with sudo but no setpriv would pass, be imaged, and fail every
 	// job before the runner started.
+	// BOTH USES COME FROM ONE STRING. Two hand-matched copies of a privilege drop
+	// is how deleting --init-groups from the entry point left the validation
+	// passing and every job failing — the check proved a COPY of the thing it was
+	// meant to prove.
+	// WHAT THE STRING CONTAINS, not only that both uses share it. Counting
+	// occurrences of the constant proves the copies match and says nothing about
+	// whether the invocation is right — deleting --init-groups from the constant
+	// changes both consistently and the count stays 2. My own harness caught that.
+	for _, required := range []struct {
+		fragment string
+		why      string
+	}{
+		{"--reuid=runner", "the runner refuses to run as root and untrusted jobs must not"},
+		{"--init-groups", "setpriv requires a supplementary-group option when it sets the " +
+			"primary GID, and without it the runner never gets the docker group"},
+		{"HOME=/home/runner", "setpriv does not reset the environment, so without this the " +
+			"runner inherits an unwritable HOME=/root and fails jobs, not registration"},
+	} {
+		if !strings.Contains(privilegeDrop, required.fragment) {
+			t.Errorf("the privilege drop is missing %q — %s", required.fragment, required.why)
+		}
+	}
+
+	if n := strings.Count(got, privilegeDrop); n != 2 {
+		t.Errorf("the privilege drop appears %d times as the shared constant, want 2 (the "+
+			"entry point and the validation that proves it); a hand-written second copy "+
+			"means a change to one silently stops being true of the other", n)
+	}
+
 	if strings.Contains(got, "sudo -u runner") {
 		t.Error("the validation uses sudo rather than the entry point's own setpriv, so a base " +
 			"image lacking setpriv would build successfully and fail every job")
@@ -228,6 +257,9 @@ type buildFake struct {
 	stopReason string
 	imageState string
 	describes  int
+	// notFoundFirst makes the first DescribeInstances answer as EC2 really did on
+	// the first live build: the instance does not exist yet.
+	notFoundFirst bool
 }
 
 func (b *buildFake) reply(action string, params url.Values) (int, string) {
@@ -242,6 +274,8 @@ func (b *buildFake) reply(action string, params url.Values) (int, string) {
 				`<item><deviceName>/dev/xvda</deviceName><ebs>` +
 				`<deleteOnTermination>true</deleteOnTermination></ebs></item>` +
 				`<item><deviceName>/dev/sdb</deviceName><ebs>` +
+				`<deleteOnTermination>false</deleteOnTermination></ebs></item>` +
+				`<item><deviceName>/dev/sdc</deviceName><ebs>` +
 				`<deleteOnTermination>false</deleteOnTermination></ebs></item>` +
 				`</blockDeviceMapping></item></imagesSet></DescribeImagesResponse>`
 		}
@@ -260,6 +294,17 @@ func (b *buildFake) reply(action string, params url.Values) (int, string) {
 
 	case "DescribeInstances":
 		b.describes++
+
+		// NOT VISIBLE YET, ON THE FIRST ASK. This is the only bug in this PR that a
+		// real machine demonstrated: the first live build called DescribeInstances
+		// the instant RunInstances returned an id, got InvalidInstanceID.NotFound,
+		// and shot a builder that was starting perfectly normally. Without this the
+		// tolerance can be deleted and every test here stays green.
+		if b.notFoundFirst && b.describes == 1 {
+			return http.StatusBadRequest, `<Response><Errors><Error>` +
+				`<Code>InvalidInstanceID.NotFound</Code><Message>nope</Message>` +
+				`</Error></Errors></Response>`
+		}
 
 		return http.StatusOK, `<DescribeInstancesResponse><reservationSet><item>` +
 			`<instancesSet><item><instanceId>i-builder</instanceId>` +
@@ -325,6 +370,14 @@ func TestOnlyAGuestInitiatedStopIsTreatedAsASuccessfulBuild(t *testing.T) {
 				t.Fatalf("a stop with reason %q produced an image; whatever was on that disk "+
 					"is not a finished runner image", tc.reason)
 			}
+
+			// AND NOTHING WAS IMAGED, which the error alone does not say. A
+			// warn-and-proceed edit is entirely plausible in a codebase whose own
+			// two-channel pattern is warn-and-proceed, and it would leave this test
+			// green while registering an image from a half-provisioned disk.
+			if n := f.countOf("CreateImage"); n != 0 {
+				t.Errorf("%d images were registered from a builder stopped by %q", n, tc.reason)
+			}
 		})
 	}
 }
@@ -356,11 +409,24 @@ func TestTheBuilderRestatesEveryDeviceTheBaseImageDeclares(t *testing.T) {
 	// must override it, or that disk outlives every build.
 	seen := blockDevices(t, got)
 
-	for _, device := range []string{"/dev/xvda", "/dev/sdb"} {
+	// TWO non-root devices, so a mutant emitting only layout.devices[0] dies. One
+	// would have passed it.
+	for _, device := range []string{"/dev/xvda", "/dev/sdb", "/dev/sdc"} {
 		if seen[device] != "true" {
 			t.Errorf("%s went out as %q, want true: the base image asks to keep it, and this "+
 				"client cannot delete volumes", device, seen[device])
 		}
+	}
+
+	if len(seen) != 3 {
+		t.Errorf("sent %d devices, want 3: %v", len(seen), seen)
+	}
+
+	// AND THE BUILDER IS DESTROYED. Deleting the defer entirely passed every test
+	// in this file until this line existed — the one property that burns money by
+	// the hour.
+	if n := f.countOf("TerminateInstances"); n != 1 {
+		t.Errorf("the builder was terminated %d times, want 1", n)
 	}
 
 	// AND THE LAUNCH IS IDEMPOTENT, so a lost response is a recovery rather than a
@@ -368,6 +434,38 @@ func TestTheBuilderRestatesEveryDeviceTheBaseImageDeclares(t *testing.T) {
 	if got.Get("ClientToken") == "" {
 		t.Error("the builder launch carries no ClientToken; a lost response would buy a " +
 			"second machine on retry")
+	}
+}
+
+// AN INSTANCE THAT IS NOT VISIBLE YET IS NOT AN INSTANCE THAT DIED.
+//
+// DescribeInstances is eventually consistent, so it can answer
+// InvalidInstanceID.NotFound for an instance RunInstances has already returned an
+// id for. The first live build of this feature did exactly that and terminated a
+// healthy builder — the only bug here a real machine demonstrated, and until this
+// test existed the tolerance could be deleted with every other test still green.
+func TestABuilderThatIsNotVisibleYetIsNotTreatedAsGone(t *testing.T) {
+	b := &buildFake{
+		stopReason:    "Client.InstanceInitiatedShutdown",
+		imageState:    "available",
+		notFoundFirst: true,
+	}
+
+	f := newFakeEC2(t)
+	f.respond = b.reply
+
+	p := newTestProvider(t, f, nil)
+
+	image, err := p.BuildImage(t.Context(), BuildSpec{
+		BaseImage: "ami-base", InstanceType: "c7i.xlarge",
+		Arch: "x64", RunnerVersion: "2.328.0", Name: "test-image",
+	})
+	if err != nil {
+		t.Fatalf("a builder that was not visible on the first ask was treated as gone: %v", err)
+	}
+
+	if image != "ami-new" {
+		t.Errorf("built %q, want ami-new", image)
 	}
 }
 
