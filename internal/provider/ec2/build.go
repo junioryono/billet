@@ -122,6 +122,16 @@ func (p *Provider) BuildImage(ctx context.Context, spec BuildSpec) (string, erro
 // It DOES keep the two things that matter: the owner tag, so `billet ami build`
 // cannot see or destroy another deployment's compute, and IMDSv2 with one hop.
 func (p *Provider) launchBuilder(ctx context.Context, spec BuildSpec, script string) (string, error) {
+	// THE BASE IMAGE IS INSPECTED FIRST, which also refuses one billet cannot use:
+	// imageLayout is where an instance-store root is turned down (#54), and a build
+	// from such an image would fail at RunInstances with a parameter error instead.
+	layout, err := p.imageLayout(ctx, spec.BaseImage)
+	if err != nil {
+		return "", err
+	}
+
+	rootDevice := layout.root
+
 	if len(script) > maxUserData {
 		return "", fmt.Errorf("ec2: the provisioning script is %d bytes, over EC2's %d limit",
 			len(script), maxUserData)
@@ -168,6 +178,20 @@ func (p *Provider) launchBuilder(ctx context.Context, spec BuildSpec, script str
 	// THE BUILDER CARRIES THE OWNER TAG TOO. Without it, a build in an account
 	// running billet produces an instance this deployment cannot recognise as its
 	// own — which is the same reason every launched job carries one.
+	// THE BUILDER'S DISK GOES WITH IT. Terminating an instance does not delete a
+	// volume the AMI asked to preserve, and this client cannot delete volumes at
+	// all — so a base image with DeleteOnTermination=false would leave a disk
+	// behind on every build, untagged and unfindable. Restating it is the same
+	// thing the job path does for the same reason.
+	params.Set("BlockDeviceMapping.1.DeviceName", rootDevice)
+	params.Set("BlockDeviceMapping.1.Ebs.DeleteOnTermination", "true")
+
+	// AND THE VOLUME CARRIES THE TAG TOO, so anything that does survive is
+	// attributable rather than an anonymous disk in somebody's account.
+	params.Set("TagSpecification.2.ResourceType", "volume")
+	params.Set("TagSpecification.2.Tag.1.Key", ownerTag)
+	params.Set("TagSpecification.2.Tag.1.Value", p.owner)
+
 	params.Set("TagSpecification.1.ResourceType", "instance")
 	params.Set("TagSpecification.1.Tag.1.Key", ownerTag)
 	params.Set("TagSpecification.1.Tag.1.Value", p.owner)
@@ -176,7 +200,7 @@ func (p *Provider) launchBuilder(ctx context.Context, spec BuildSpec, script str
 
 	var out runInstancesResponse
 
-	if err := p.api.call(ctx, params, &out); err != nil {
+	if err = p.api.call(ctx, params, &out); err != nil {
 		return "", fmt.Errorf("ec2: launch a builder from %s: %w", spec.BaseImage, err)
 	}
 
@@ -305,6 +329,20 @@ func (p *Provider) awaitImage(ctx context.Context, image string) error {
 		var out describeImagesResponse
 
 		if err := p.api.call(ctx, params, &out); err != nil {
+			// NOT VISIBLE YET IS NOT FAILED. DescribeImages is eventually consistent
+			// like the rest of them, so an AMI CreateImage has just returned an id
+			// for can answer InvalidAMIID.NotFound on the next call. This package
+			// has now made that mistake twice — once against instances, in code
+			// written the same day it was measured — so it is worth naming as a
+			// class rather than patching per call site.
+			if code, ok := codeOf(err); ok && code == "InvalidAMIID.NotFound" {
+				if err := sleepFor(ctx, 15*time.Second); err != nil {
+					return fmt.Errorf("ec2: image %s never became visible: %w", image, err)
+				}
+
+				continue
+			}
+
 			return fmt.Errorf("ec2: ask whether %s is ready: %w", image, err)
 		}
 
@@ -441,9 +479,20 @@ func provisionScript(spec BuildSpec) (string, error) {
 	b.WriteString("BILLETEOF\n")
 	b.WriteString("chmod 0755 /usr/local/bin/billet-runner\n")
 
+	// THE RUNNER HAS TO RUN BEFORE THIS COUNTS AS SUCCESS.
+	//
+	// An architecture mismatch is otherwise INVISIBLE to the build: an arm64
+	// tarball extracts perfectly well on x64, every command above succeeds, the
+	// script reaches poweroff, and billet registers an image whose runner cannot
+	// exec. The failure then surfaces on somebody's first job as a machine that
+	// booted, registered nothing, and left the job queued — the exact silent class
+	// this whole issue exists to close. An earlier version of this comment claimed
+	// nothing here could check that. The guest can, by running it.
+	b.WriteString("sudo -u runner /opt/actions-runner/bin/Runner.Listener --version\n")
+
 	// THE SUCCESS SIGNAL. Reaching this line is the only thing that tells billet
 	// the image is worth making; set -e means a failure anywhere above never
-	// arrives here.
+	// arrives here — including the version check.
 	b.WriteString("poweroff\n")
 
 	return b.String(), nil

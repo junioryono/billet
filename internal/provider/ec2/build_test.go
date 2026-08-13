@@ -37,6 +37,7 @@ func TestTheProvisionScriptContainsWhatAnImageNeeds(t *testing.T) {
 		{"libicu", "the runner is a .NET app and dies on globalization without ICU"},
 		{"/usr/local/bin/billet-runner", "the entry point a tier names in command:"},
 		{jitEnvVar, "the one variable billet's boot script exports"},
+		{"Runner.Listener --version", "an arch mismatch is otherwise invisible until a job"},
 		{"poweroff", "the only signal that provisioning succeeded"},
 	} {
 		if !strings.Contains(got, want.fragment) {
@@ -60,6 +61,18 @@ func TestNothingRunsAfterTheSuccessSignal(t *testing.T) {
 	}
 
 	lines := strings.Split(strings.TrimSpace(got), "\n")
+
+	// AND THE RUNNER IS PROVEN TO EXECUTE BEFORE IT. An arm64 tarball extracts
+	// happily on x64, so without this the script reaches poweroff and billet
+	// registers an image whose runner cannot exec — surfacing on somebody's first
+	// job as a machine that booted and registered nothing.
+	version := strings.Index(got, "Runner.Listener --version")
+	power := strings.LastIndex(got, "poweroff")
+
+	if version < 0 || version > power {
+		t.Error("the runner is not executed before the success signal, so an architecture " +
+			"mismatch would produce a registered image that cannot run a job")
+	}
 
 	if last := lines[len(lines)-1]; last != "poweroff" {
 		t.Errorf("the script ends with %q, not poweroff: billet would wait for a stop that "+
