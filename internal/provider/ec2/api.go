@@ -77,9 +77,21 @@ func codeOf(err error) (string, bool) {
 // becomes two instances — which is why the launch also carries a client token,
 // so that even a retry AWS itself performs cannot double-launch.
 func retryable(err error) bool {
+	// A REFUSED REDIRECT IS A VERDICT, NOT A BLIP. An endpoint that answers with a
+	// redirect will answer with one again, so the retries cannot change the
+	// outcome — and each one is another signed request handed to whatever is
+	// answering. It has to be named here because it is not an apiError, and the
+	// default for those is the opposite.
+	if errors.Is(err, errRedirected) {
+		return false
+	}
+
 	var apiErr *apiError
 	if !errors.As(err, &apiErr) {
-		// A transport error: the request may never have arrived.
+		// Anything else that is not the API answering: a connection that dropped, a
+		// body that would not parse. The request may never have arrived, so it is
+		// worth making again — unlike the refusal above, which is billet's own
+		// verdict and will not change.
 		return true
 	}
 
