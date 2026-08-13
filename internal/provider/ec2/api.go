@@ -29,6 +29,8 @@ const apiVersion = "2016-11-15"
 const maxAttempts = 3
 
 // client talks the EC2 query API over signed HTTPS.
+//
+//nolint:recvcheck // The redaction methods MUST take a value receiver: a pointer-receiver String is not consulted when a VALUE is formatted, so %+v on a dereferenced client would print the secret out of its unexported creds field. Every other method needs the pointer. The mix is deliberate and the safety property is the reason — github.App carries the identical exception for the identical reason.
 type client struct {
 	http     *http.Client
 	endpoint string
@@ -53,21 +55,30 @@ type client struct {
 // reason, which is the tell that method-based redaction cannot be made absolute:
 // see the note in the billet-security skill, where the same residual is recorded
 // for the GitHub App key.
-func (c *client) String() string { return "ec2.client{endpoint=" + c.endpoint + "}" }
+// ON A VALUE RECEIVER, which is the rule this package's own skill states and
+// which the first version of these methods broke: a pointer receiver is not
+// consulted when a VALUE is formatted, so `%+v` on a dereferenced client
+// structurally rendered the unexported creds field and printed the secret. A
+// value receiver serves both forms.
+//
+// `Credentials` and `StaticCredentials` take value receivers for the same reason.
+// `IMDSCredentials` cannot — it holds a sync.Mutex, so a value copy is a vet
+// error and the pointer receiver is the only correct choice there.
+func (c client) String() string { return "ec2.client{endpoint=" + c.endpoint + "}" }
 
 // GoString covers %#v.
-func (c *client) GoString() string { return c.String() }
+func (c client) GoString() string { return c.String() }
 
 // Format catches every verb.
-func (c *client) Format(f fmt.State, _ rune) {
+func (c client) Format(f fmt.State, _ rune) {
 	_, _ = io.WriteString(f, c.String()) //nolint:errcheck // fmt.State swallows write errors by design
 }
 
 // MarshalJSON keeps a client out of anything that serializes it structurally.
-func (c *client) MarshalJSON() ([]byte, error) { return json.Marshal(c.String()) }
+func (c client) MarshalJSON() ([]byte, error) { return json.Marshal(c.String()) }
 
 // LogValue is what slog consults.
-func (c *client) LogValue() slog.Value { return slog.StringValue(c.String()) }
+func (c client) LogValue() slog.Value { return slog.StringValue(c.String()) }
 
 // apiError is a refusal the EC2 API described.
 //

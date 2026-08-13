@@ -840,15 +840,33 @@ func TestAStructHoldingACredentialSourceRedactsToo(t *testing.T) {
 
 	slog.New(slog.NewJSONHandler(&logged, nil)).Info("calling", "client", c)
 
+	encodedValue, err := json.Marshal(*c)
+	if err != nil {
+		t.Fatalf("marshal value: %v", err)
+	}
+
+	// BOTH FORMS. A pointer receiver is not consulted when a VALUE is formatted —
+	// the rule this package's skill states — so the first version of these methods
+	// left `%+v` on a dereferenced client printing the secret, and a test that
+	// rendered only the pointer could not see it.
 	for path, out := range map[string]string{
-		"%v":   fmt.Sprintf("%v", c), //nolint:gocritic // the verb path is the subject
-		"%+v":  fmt.Sprintf("%+v", c),
-		"%#v":  fmt.Sprintf("%#v", c),
-		"json": string(encoded),
-		"slog": logged.String(),
+		"%v":              fmt.Sprintf("%v", c), //nolint:gocritic // the verb path is the subject
+		"%+v":             fmt.Sprintf("%+v", c),
+		"%#v":             fmt.Sprintf("%#v", c),
+		"json":            string(encoded),
+		"slog":            logged.String(),
+		"%v on a value":   fmt.Sprintf("%v", *c), //nolint:gocritic // the verb path is the subject
+		"%+v on a value":  fmt.Sprintf("%+v", *c),
+		"%#v on a value":  fmt.Sprintf("%#v", *c),
+		"json of a value": string(encodedValue),
 	} {
-		if strings.Contains(out, secret) {
-			t.Errorf("%s rendered the secret access key through the client: %s", path, out)
+		for name, leaked := range map[string]string{
+			"secret access key": secret,
+			"session token":     "tok",
+		} {
+			if strings.Contains(out, leaked) {
+				t.Errorf("%s rendered the %s through the client: %s", path, name, out)
+			}
 		}
 	}
 }
