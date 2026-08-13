@@ -261,14 +261,34 @@ Refusing now rather than warning is a judgement about when the cost lands. Nothi
 
 The rule is stated as **"not one of the releases older than mimic"** rather than "one of the releases at or after mimic", and the direction is the point: a list of recent releases goes stale on the next Ceph release and starts refusing correct clusters, while the set of releases older than mimic can never grow. Measured against 20.2.3 rather than remembered — every name in that set is one this cluster accepts, and one it does not know is refused with `is not recognized`, so the list is complete.
 
+**That direction is fail-open, so what bounds it matters.** "Anything I do not recognise is newer" admits whatever the binary at that path printed, so the answer must first be a release-shaped token — a short lowercase word — and `unknown` is refused by name. `unknown` is not hypothetical: it is the zero value of Ceph's release enum, and `osd set-require-min-compat-client unknown` is *refused* (measured), so it can only arrive from Ceph itself. It means the cluster was never told which clients it admits, and a cluster that was never told clones the old way. Reading it as "some release newer than mimic" is exactly the mistake the shape check exists to prevent.
+
+**And the floor alone is a proxy, which one config key defeats.** `rbd_default_clone_format` overrides what the minimum client release implies, and billet reads it too. Measured: with the floor at mimic and the format forced to `1`, cloning an unprotected snapshot fails with `rbd: clone error: (22) Invalid argument` — a green preflight beside the exact failure the preflight exists to prevent. The two settings are resolved together, and each cause gets its own remedy, because "raise require-min-compat-client" is wrong advice when the floor is already high enough.
+
+Reading that option is itself a small lesson in not reasoning about someone else's grammar: `rbd config pool list` takes its pool as a **positional** argument, so `rbd --format json -p <pool> config pool list` answers `unrecognised option '-p'` — and the unit test asserted billet's own mistake, exactly, and passed, until the real cluster refused it. An argv assertion pins what the code does; only running it says whether the tool agrees.
+
 Pool replication is **reported and not judged**. How many copies a pool keeps is the operator's decision, and billet has no standing to refuse it — but it is invisible from the config file, so `billet check` prints `size` and `min_size` for both pools and says plainly when a pool keeps one copy. An operator who believes their golden images are mirrored should find out there rather than after a drive dies.
 
 ```
 ceph     client.billet -> /etc/ceph/ceph.conf
          billet-images      0 image(s)  size 2, min_size 1       golden images and per-job root clones
          billet-cache       0 image(s)  size 2, min_size 1       cache volumes
-         clone v2 (require-min-compat-client mimic), so a cache generation can be reclaimed while a job still holds a clone of it
+         clone v2 (require-min-compat-client mimic, rbd_default_clone_format auto), so a cache generation can be reclaimed while a job still holds a clone of it
          (read only — launching also needs create, clone, snapshot and remove in both pools; …)
+```
+
+and the two ways it refuses, each verified by putting the live cluster into that state and restoring it:
+
+```
+$ ceph config set client rbd_default_clone_format 1
+node.ceph: this cluster would clone snapshots the old way…: rbd_default_clone_format is set to 1,
+which overrides the cluster's minimum client release (mimic); unset it with
+`ceph config rm client rbd_default_clone_format`
+
+$ ceph osd set-require-min-compat-client luminous
+node.ceph: this cluster would clone snapshots the old way…: require-min-compat-client is "luminous";
+raise it with `ceph osd set-require-min-compat-client mimic` (which refuses while clients older than
+mimic are connected — `ceph features` lists them)
 ```
 
 Both facts come from `ceph`, which ships in the same package as `rbd`, and both are readable by the scoped `client.billet` identity — verified, because a check that needs admin rights to run is a check that will be run as admin.

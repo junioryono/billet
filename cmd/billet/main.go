@@ -1908,8 +1908,13 @@ func printCephReport(cfg *config.CephConfig, report ceph.Report) {
 	}
 
 	if report.CloneV2 {
-		fmt.Printf("         clone v2 (require-min-compat-client %s), so a cache generation can "+
-			"be reclaimed while a job still holds a clone of it\n", report.MinCompatClient)
+		// BOTH SETTINGS, because either can be the one making it true. A cluster on
+		// luminous with rbd_default_clone_format forced to 2 clones the new way, and
+		// printing only the release would have an operator reading "luminous" beside
+		// "clone v2" with no way to see why they agree.
+		fmt.Printf("         clone v2 (require-min-compat-client %s, rbd_default_clone_format "+
+			"%s), so a cache generation can be reclaimed while a job still holds a clone of "+
+			"it\n", report.MinCompatClient, report.CloneFormat)
 	}
 
 	// SAID, BECAUSE THE CHECK IS NARROWER THAN IT LOOKS. Listing a pool proves the
