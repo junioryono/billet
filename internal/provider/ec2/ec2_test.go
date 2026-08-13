@@ -710,14 +710,15 @@ func TestAnImageIsLookedUpOncePerImage(t *testing.T) {
 	p := newTestProvider(t, f, nil)
 	p.log = slog.New(slog.NewTextHandler(&logged, nil))
 
-	for _, image := range []string{imageA, imageB, imageA} {
+	// THE THIRD LAUNCH DIFFERS ON PURPOSE. Launches one and three are both image A,
+	// so without this they are byte-identical and lastParamsFor could be returning
+	// either with nothing to notice. Asking the LAST one for a disk makes the two
+	// distinguishable in the only direction that matters.
+	for i, image := range []string{imageA, imageB, imageA} {
 		spec := validSpec()
 		spec.Image = image
 
-		// THE LAST LAUNCH DIFFERS ON PURPOSE. With three identical requests the
-		// first and the last are byte-identical, so lastParamsFor could be reading
-		// either and nothing would notice.
-		if image == imageB {
+		if i == 2 {
 			spec.Disk = 80 * config.GiB
 		}
 
@@ -735,9 +736,9 @@ func TestAnImageIsLookedUpOncePerImage(t *testing.T) {
 	// request that can show the cache dropping or confusing what it held.
 	got := f.lastParamsFor(t, "RunInstances")
 
-	if v := got.Get("BlockDeviceMapping.1.Ebs.VolumeSize"); v != "" {
-		t.Errorf("the last request carries a volume size of %q, but only the middle launch "+
-			"asked for one — lastParamsFor is not reading the last request", v)
+	if v := got.Get("BlockDeviceMapping.1.Ebs.VolumeSize"); v != "80" {
+		t.Errorf("the last request carries a volume size of %q, want 80 — only the third "+
+			"launch asked for a disk, so lastParamsFor is not reading the last request", v)
 	}
 
 	want := map[string]string{
