@@ -1707,3 +1707,45 @@ func mustUserData(t *testing.T, p *Provider, spec provider.Spec) string {
 
 	return script
 }
+
+// THE ERROR CODE IS A CHANNEL TOO, and "AWS's enumeration is fixed" is an
+// assumption about somebody else's response rather than a property billet can
+// rely on. The endpoint is configurable, so a reply that puts the echoed request
+// body in <Code> instead of <Message> would walk through the function whose whole
+// job is to stop exactly that.
+func TestALaunchErrorCannotCarryTheRegistrationInItsCode(t *testing.T) {
+	spec := validSpec()
+
+	f := newFakeEC2(t)
+	f.respond = func(action string, params url.Values) (int, string) {
+		if action != "RunInstances" {
+			return http.StatusOK, defaultReply(action)
+		}
+
+		var escaped strings.Builder
+		if err := xml.EscapeText(&escaped, []byte(params.Get("UserData"))); err != nil {
+			t.Errorf("escape: %v", err)
+
+			return http.StatusInternalServerError, ""
+		}
+
+		return http.StatusBadRequest, `<Response><Errors><Error><Code>` + escaped.String() +
+			`</Code><Message>no</Message></Error></Errors></Response>`
+	}
+
+	p := newTestProvider(t, f, nil)
+	p.api.sleep = func(context.Context, time.Duration) error { return nil }
+
+	_, err := p.Launch(t.Context(), spec)
+	if err == nil {
+		t.Fatal("a rejected launch reported success")
+	}
+
+	encoded := base64.StdEncoding.EncodeToString([]byte(mustUserData(t, p, spec)))
+
+	for _, secret := range []string{spec.JITConfig, encoded} {
+		if strings.Contains(err.Error(), secret) {
+			t.Errorf("the launch error carries the registration in its code: %v", err)
+		}
+	}
+}

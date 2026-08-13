@@ -135,7 +135,7 @@ func (s StaticCredentials) Credentials(context.Context) (Credentials, error) {
 	// distinction exists to prevent — so it has to hold for EVERY source rather
 	// than the one where it was noticed.
 	switch {
-	case s.AccessKeyID == "" && s.SecretAccessKey == "":
+	case s.AccessKeyID == "" && s.SecretAccessKey == "" && s.SessionToken == "":
 		return Credentials{}, errNoCredentials
 
 	case s.AccessKeyID == "" || s.SecretAccessKey == "":
@@ -167,8 +167,13 @@ func (EnvCredentials) Credentials(context.Context) (Credentials, error) {
 	// billet to a DIFFERENT and often more privileged identity, and it launches and
 	// terminates machines as that one. An operator who set these had said which
 	// identity they meant, so the answer is to stop and say which half is missing.
+	// A SESSION TOKEN ON ITS OWN IS NOT AN ABSENCE EITHER. It is half a credential
+	// like any other, and reading it as "nothing set" lets the chain move on to a
+	// different identity than the one somebody configured.
+	token := os.Getenv("AWS_SESSION_TOKEN")
+
 	switch {
-	case id == "" && secret == "":
+	case id == "" && secret == "" && strings.TrimSpace(token) == "":
 		return Credentials{}, errNoCredentials
 
 	case id == "":
@@ -189,7 +194,7 @@ func (EnvCredentials) Credentials(context.Context) (Credentials, error) {
 		// byte-for-byte; trimming is safe for the two above because an access key
 		// id and a secret are both from a restricted alphabet, and it is exactly
 		// what rescues a value pasted into a unit file with a trailing space.
-		SessionToken: os.Getenv("AWS_SESSION_TOKEN"),
+		SessionToken: token,
 	}, nil
 }
 
@@ -320,9 +325,24 @@ func (i *IMDSCredentials) fetch(ctx context.Context) (Credentials, error) {
 	// MALFORMED, not absent, and wrapping the sentinel would let the chain carry
 	// on to another source — running billet as an identity nobody chose, which is
 	// exactly what the sentinel's meaning was tightened to prevent.
-	if payload.AccessKeyID == "" || payload.SecretAccessKey == "" {
+	// ALL FOUR FIELDS, because the two that were missing fail in ways that do not
+	// look like a credential problem. A document with no Token cannot authenticate
+	// at all — temporary credentials are only valid with one — and a document with
+	// no Expiration is treated as never expiring, so it is cached for the life of
+	// the process and every call starts failing the moment AWS rotates it.
+	switch {
+	case payload.AccessKeyID == "" || payload.SecretAccessKey == "":
 		return Credentials{}, fmt.Errorf("ec2: imds returned an incomplete credential document "+
-			"for instance profile %s", name)
+			"for instance profile %s: no access key", name)
+
+	case payload.Token == "":
+		return Credentials{}, fmt.Errorf("ec2: imds returned a credential document with no "+
+			"session token for instance profile %s, which cannot authenticate anything", name)
+
+	case payload.Expiration.IsZero():
+		return Credentials{}, fmt.Errorf("ec2: imds returned a credential document with no "+
+			"expiry for instance profile %s; billet would cache it for the life of the process "+
+			"and start failing the moment aws rotates it", name)
 	}
 
 	return Credentials{
@@ -419,11 +439,21 @@ func (c ChainCredentials) Credentials(ctx context.Context) (Credentials, error) 
 		// carrying on past it is how billet ends up acting as an identity nobody
 		// chose.
 		if !errors.Is(err, errNoCredentials) {
-			// JOINED WITH WHAT CAME BEFORE, not returned alone. Stopping here is the
-			// point; discarding the earlier sources' reasons while doing it would
-			// undo the other half of this function, which exists so an operator is
-			// not sent to whichever source happened to be tried last.
-			return Credentials{}, errors.Join(append(errs, err)...)
+			// THE REASONS ARE CARRIED AS TEXT, NOT JOINED, and that distinction is
+			// the whole fix rather than a stylistic one.
+			//
+			// errors.Join keeps every branch reachable by errors.Is — so a chain that
+			// stopped at a terminal source still MATCHED errNoCredentials, because an
+			// earlier source had reported an absence. ChainCredentials is itself a
+			// CredentialSource and DefaultCredentials returns one, so an outer chain
+			// read that as "nothing here" and carried on to another AWS identity:
+			// exactly the fallthrough this was tightened to prevent, one level up.
+			reasons := make([]string, 0, len(errs)+1)
+			for _, e := range append(errs, err) {
+				reasons = append(reasons, e.Error())
+			}
+
+			return Credentials{}, errors.New(strings.Join(reasons, "; "))
 		}
 
 		errs = append(errs, err)

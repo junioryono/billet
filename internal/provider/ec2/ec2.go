@@ -31,6 +31,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -955,9 +956,23 @@ func withoutMessage(err error) error {
 		return err
 	}
 
-	return &apiError{Code: apiErr.Code, Status: apiErr.Status,
+	// AND THE CODE IS CHECKED RATHER THAN TRUSTED. "AWS's fixed enumeration" is an
+	// assumption about somebody else's response, and the endpoint is configurable —
+	// so a reply that puts the echoed request body in <Code> instead of <Message>
+	// would walk straight through a function whose whole job is to stop that. A
+	// real code is a short identifier; anything else is not one, whatever it is.
+	code := apiErr.Code
+	if !awsErrorCode.MatchString(code) {
+		code = "(unrecognised error code)"
+	}
+
+	return &apiError{Code: code, Status: apiErr.Status,
 		Message: "(message withheld: this request carries a runner registration)"}
 }
+
+// awsErrorCode is the shape of an EC2 error code — a short identifier, never
+// prose and never a payload.
+var awsErrorCode = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9._-]{0,63}$`)
 
 // errRedirected marks a refusal to follow a redirect, so the api boundary can
 // discard net/http's *url.Error wrapper — which renders the whole redirect
