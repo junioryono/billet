@@ -1875,13 +1875,18 @@ func TestATypedNilCredentialSourceIsRefused(t *testing.T) {
 	}
 }
 
-// A CONTRACT NOTHING ENFORCES FAILS SILENTLY.
+// BILLET SPEAKS WHENEVER IT DISAGREES WITH THE IMAGE, and the two disagreements
+// are different, so they say different things.
 //
-// billet sets DeleteOnTermination for the ROOT device and cannot set it for the
-// others without restating every mapping — so an image declaring an extra EBS
-// volume with the flag false leaks one volume PER JOB, tagged and billed and
-// discoverable only by somebody going to look. The AMI documentation can say not
-// to; only this says it at the moment it matters.
+// A NON-ROOT volume the image marks as surviving is honoured — billet passes the
+// flag back — and warned about, because it leaks one volume PER JOB, tagged and
+// billed and discoverable only by somebody going to look. The ROOT marked the same
+// way is OVERRIDDEN to delete, and warned about for the opposite reason: a stated
+// intent is being reversed, and finding that out from a missing volume is worse
+// than reading it once.
+//
+// What billet does NOT warn about is filling a gap. A mapping that stated nothing
+// gets billet's answer in silence, because there was no intent to contradict.
 func TestAnImageWhoseVolumesOutliveItIsReported(t *testing.T) {
 	f := newFakeEC2(t)
 	f.respond = func(action string, params url.Values) (int, string) {
@@ -1892,7 +1897,7 @@ func TestAnImageWhoseVolumesOutliveItIsReported(t *testing.T) {
 		return http.StatusOK, `<DescribeImagesResponse><imagesSet><item>` +
 			`<imageId>ami-0abc</imageId><rootDeviceName>/dev/xvda</rootDeviceName>` +
 			`<blockDeviceMapping>` +
-			// The root, which billet sets itself — not worth a warning.
+			// The root, which billet overrides — and says so.
 			`<item><deviceName>/dev/xvda</deviceName><ebs>` +
 			`<deleteOnTermination>false</deleteOnTermination></ebs></item>` +
 			// A second volume the image keeps. This is the one.
@@ -1922,10 +1927,16 @@ func TestAnImageWhoseVolumesOutliveItIsReported(t *testing.T) {
 		t.Errorf("the volume the image asks to keep was not reported: %s", got)
 	}
 
-	// THE ROOT IS NOT REPORTED, because billet sets that one itself — a warning
-	// about something already handled is how an operator learns to ignore them.
-	if strings.Contains(got, "/dev/xvda") {
-		t.Errorf("the root device was reported despite billet setting its flag: %s", got)
+	// THE ROOT IS REPORTED, and differently. billet is reversing what this image
+	// asked for rather than honouring it, so the one case it must not do quietly is
+	// the one where it wins the disagreement.
+	if !strings.Contains(got, "/dev/xvda") {
+		t.Errorf("billet overrode the image's root flag without saying so: %s", got)
+	}
+
+	if !strings.Contains(got, "ROOT") {
+		t.Errorf("the root override was not distinguished from an honoured volume, so an "+
+			"operator cannot tell which way billet went: %s", got)
 	}
 
 	if strings.Contains(got, "/dev/sdc") {
@@ -2104,11 +2115,15 @@ func TestANonEBSMappingIsNotRestated(t *testing.T) {
 	}
 }
 
-// THE INDICES ARE CONTIGUOUS FROM 1, because EC2 stops reading at the first gap.
+// THE INDICES ARE CONTIGUOUS FROM 1, which is what every official SDK emits for a
+// query-API list.
 //
-// A skipped device (the root, or a non-EBS mapping) must close the hole rather
-// than leave one: numbering by position in the image's list would silently drop
-// every device after the first thing billet declined to restate.
+// What EC2 does with a GAP is not documented anywhere billet can point at, and
+// this test does not depend on knowing: a dense list is correct under every
+// possible gap semantics. What it pins is that a skipped device (the root, or a
+// non-EBS mapping) CLOSES the hole rather than leaving one — numbering by position
+// in the image's list would put a gap wherever billet declined to restate, and
+// then the answer would depend on that undocumented behaviour.
 func TestBlockDeviceIndicesAreContiguous(t *testing.T) {
 	f := newFakeEC2(t)
 	f.respond = func(action string, params url.Values) (int, string) {
@@ -2151,6 +2166,94 @@ func TestBlockDeviceIndicesAreContiguous(t *testing.T) {
 
 	if d := got.Get("BlockDeviceMapping.4.DeviceName"); d != "" {
 		t.Errorf("a fourth device was sent (%q); only three should have been", d)
+	}
+}
+
+// THE ROOT LEAVES AS true EVEN WHEN THE IMAGE ASKED TO KEEP IT.
+//
+// The one explicit false billet knowingly overrides, pinned so the asymmetry is a
+// decision on the record rather than something a later reader has to infer from
+// setBlockDevices writing index 1 before the loop runs. Two reviewers found this
+// gap by reading the prose against the code; this is what makes the code answer
+// for itself.
+func TestTheRootIsDeletedEvenWhenTheImageAsksToKeepIt(t *testing.T) {
+	f := newFakeEC2(t)
+	f.respond = func(action string, params url.Values) (int, string) {
+		if action != "DescribeImages" {
+			return http.StatusOK, defaultReply(action)
+		}
+
+		return http.StatusOK, `<DescribeImagesResponse><imagesSet><item>` +
+			`<imageId>ami-0abc</imageId><rootDeviceName>/dev/xvda</rootDeviceName>` +
+			`<blockDeviceMapping>` +
+			`<item><deviceName>/dev/xvda</deviceName><ebs>` +
+			`<deleteOnTermination>false</deleteOnTermination></ebs></item>` +
+			`</blockDeviceMapping></item></imagesSet></DescribeImagesResponse>`
+	}
+
+	p := newTestProvider(t, f, nil)
+
+	if _, err := p.Launch(t.Context(), validSpec()); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	got := f.paramsFor(t, "RunInstances")
+
+	if d := got.Get("BlockDeviceMapping.1.DeviceName"); d != "/dev/xvda" {
+		t.Fatalf("BlockDeviceMapping.1.DeviceName = %q, want the root", d)
+	}
+
+	if v := got.Get("BlockDeviceMapping.1.Ebs.DeleteOnTermination"); v != "true" {
+		t.Errorf("the root went out as %q; a root volume kept per job is the largest leak "+
+			"this backend can produce", v)
+	}
+
+	// AND IT IS NOT ALSO RESTATED AS A SECOND DEVICE, which is what would happen if
+	// the root were ever dropped from the skip list — EC2 would receive two entries
+	// for one device, disagreeing.
+	if d := got.Get("BlockDeviceMapping.2.DeviceName"); d != "" {
+		t.Errorf("the root was sent twice: index 2 is %q", d)
+	}
+}
+
+// A MAPPING WITH NO DEVICE NAME IS SKIPPED RATHER THAN SENT NAMELESS.
+//
+// A guard against a malformed response, and it exists as a test because a reviewer
+// found that deleting the guard left every other test green: no fixture had a
+// nameless mapping, so nothing noticed. An unkillable mutant is a guard nobody is
+// maintaining.
+func TestAMappingWithNoDeviceNameIsSkipped(t *testing.T) {
+	f := newFakeEC2(t)
+	f.respond = func(action string, params url.Values) (int, string) {
+		if action != "DescribeImages" {
+			return http.StatusOK, defaultReply(action)
+		}
+
+		return http.StatusOK, `<DescribeImagesResponse><imagesSet><item>` +
+			`<imageId>ami-0abc</imageId><rootDeviceName>/dev/xvda</rootDeviceName>` +
+			`<blockDeviceMapping>` +
+			`<item><ebs><deleteOnTermination>false</deleteOnTermination></ebs></item>` +
+			`<item><deviceName>/dev/sdb</deviceName><ebs></ebs></item>` +
+			`</blockDeviceMapping></item></imagesSet></DescribeImagesResponse>`
+	}
+
+	p := newTestProvider(t, f, nil)
+
+	if _, err := p.Launch(t.Context(), validSpec()); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	got := f.paramsFor(t, "RunInstances")
+
+	// The named device takes index 2 — the nameless one consumed no slot at all.
+	if d := got.Get("BlockDeviceMapping.2.DeviceName"); d != "/dev/sdb" {
+		t.Errorf("BlockDeviceMapping.2.DeviceName = %q, want /dev/sdb; a nameless mapping "+
+			"either took a slot or was sent as an empty device", d)
+	}
+
+	if d := got.Get("BlockDeviceMapping.3.DeviceName"); d != "" {
+		t.Errorf("a third device was sent (%q); the nameless mapping should have been "+
+			"dropped entirely", d)
 	}
 }
 
