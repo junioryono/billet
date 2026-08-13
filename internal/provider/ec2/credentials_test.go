@@ -841,7 +841,7 @@ func TestAStructHoldingACredentialSourceRedactsToo(t *testing.T) {
 	slog.New(slog.NewJSONHandler(&logged, nil)).Info("calling", "client", c)
 
 	for path, out := range map[string]string{
-		"%v":   fmt.Sprintf("%v", c),
+		"%v":   fmt.Sprintf("%v", c), //nolint:gocritic // the verb path is the subject
 		"%+v":  fmt.Sprintf("%+v", c),
 		"%#v":  fmt.Sprintf("%#v", c),
 		"json": string(encoded),
@@ -861,6 +861,8 @@ func TestAStructHoldingACredentialSourceRedactsToo(t *testing.T) {
 func TestAChainRendersTypesRatherThanTrustingItsSources(t *testing.T) {
 	leaky := leakySource{secret: "wJalrXUtnFEMI-thisIsTheSecret"}
 
+	//nolint:gocritic // the verb path is the subject: String() being safe says nothing
+	// about what fmt does with the slice.
 	got := fmt.Sprintf("%v", ChainCredentials{EnvCredentials{}, leaky})
 
 	if strings.Contains(got, leaky.secret) {
