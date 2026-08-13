@@ -565,7 +565,9 @@ const (
 // ask for, irreversibly.
 //
 // EVERYTHING ELSE IS UNREADABLE RATHER THAN DELETE, which is the half that needed
-// a reviewer to see. Decoding this as a string is what makes absent expressible at
+// a reviewer to see. "Everything else" includes padding XML does not recognise:
+// an NBSP-wrapped "false" is not a boolean, and reporting it beats guessing which
+// way somebody's serialiser was broken. Decoding this as a string is what makes absent expressible at
 // all — encoding/xml folds an absent element into a bool's zero value, so absent
 // and "false" would have been one state — but the string decode also threw away
 // ParseBool's rejection of values that are not booleans, and this had quietly
@@ -583,7 +585,11 @@ const (
 // field to ParseBool(TrimSpace(src)), so a string path that does not trim is
 // strictly less correct than the type it replaced.
 func readTermination(flag string) terminationIntent {
-	switch strings.TrimSpace(flag) {
+	// TRIMMED TO XML'S FOUR WHITESPACE CHARACTERS, not Go's idea of whitespace.
+	// strings.TrimSpace also strips NBSP and friends, which `collapse` does not — so
+	// it would have read "\u00a0false\u00a0" as a valid false, and this comment
+	// would have been describing a facet the code did not implement.
+	switch strings.Trim(flag, " \t\r\n") {
 	case "true", "1":
 		return intentDelete
 	case "false", "0":
@@ -795,13 +801,13 @@ func (p *Provider) imageLayout(ctx context.Context, image string) (imageLayout, 
 		// ordinary state billet is guessing about, it is a response that does not
 		// look like the ones that were observed.
 		//
-		// billet still sends true for it. Refusing the launch would convert a missing
-		// optional field into a failed CI job, which is worse than deleting a volume
-		// created fresh for that job — and an omission is emphatically NOT the
-		// operator asking to keep anything, since the run found EC2 does not produce
-		// false by omission. But it is resolved by policy on an unmeasured state, and
+		// billet still sends true for it. Refusing the launch would convert a field
+		// AWS marks optional into a failed CI job, which is worse than deleting a
+		// volume created fresh for that job — and an unreadable value is emphatically
+		// NOT the operator asking to keep anything, since nothing measured produced a
+		// keep by omission. But it is resolved by policy on an unmeasured state, and
 		// resolving that quietly is how an assumption stops being visible. Once per
-		// image, like the others.
+		// affected device, and once per image overall, since the lookup is cached.
 		if intent == intentUnreadable {
 			p.log.Warn("billet cannot read this device's DeleteOnTermination, and is stating "+
 				"delete for it, so this job is unaffected; the value is either absent or not "+
