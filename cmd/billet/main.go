@@ -1897,7 +1897,16 @@ func printCephReport(cfg *config.CephConfig, report ceph.Report) {
 			replication = fmt.Sprintf("size %d, min_size %d", p.Size, p.MinSize)
 		}
 
-		fmt.Printf("         %-16s %3d image(s)  %-24s %s\n", p.Name, p.Images, replication, p.Purpose)
+		// THE CLONE FORMAT ONLY WHEN SOMEBODY HAS OVERRIDDEN IT. `auto` is the
+		// default and the common case, and a column that says `auto` on every line
+		// of every healthy deployment is a column nobody reads.
+		override := ""
+		if p.CloneFormat != "" && p.CloneFormat != "auto" {
+			override = fmt.Sprintf("  clone format forced to %s", p.CloneFormat)
+		}
+
+		fmt.Printf("         %-16s %3d image(s)  %-24s %s%s\n",
+			p.Name, p.Images, replication, p.Purpose, override)
 	}
 
 	for _, p := range report.Pools {
@@ -1912,9 +1921,8 @@ func printCephReport(cfg *config.CephConfig, report ceph.Report) {
 		// luminous with rbd_default_clone_format forced to 2 clones the new way, and
 		// printing only the release would have an operator reading "luminous" beside
 		// "clone v2" with no way to see why they agree.
-		fmt.Printf("         clone v2 (require-min-compat-client %s, rbd_default_clone_format "+
-			"%s), so a cache generation can be reclaimed while a job still holds a clone of "+
-			"it\n", report.MinCompatClient, report.CloneFormat)
+		fmt.Printf("         clone v2 (require-min-compat-client %s), so a cache generation can "+
+			"be reclaimed while a job still holds a clone of it\n", report.MinCompatClient)
 	}
 
 	// SAID, BECAUSE THE CHECK IS NARROWER THAN IT LOOKS. Listing a pool proves the

@@ -46,8 +46,9 @@ type recorder struct {
 	minCompat string   // what `ceph osd get-require-min-compat-client` returns
 	pools     string   // what `ceph osd pool ls detail` returns, as json
 
-	cloneFormat string // the rbd_default_clone_format `rbd config pool list` reports
-	rawConfig   string // raw bytes for that listing, overriding cloneFormat
+	cloneFormat      string // the rbd_default_clone_format `rbd config pool list` reports
+	cacheCloneFormat string // ...for the cache pool, when it differs from the image pool
+	rawConfig        string // raw bytes for that listing, overriding both
 
 	err error // if set, every invocation fails with it
 }
@@ -88,7 +89,12 @@ func (r *recorder) run(_ context.Context, bin string, args []string) ([]byte, er
 			return []byte(r.rawConfig), nil
 		}
 
-		return []byte(`[{"name":"rbd_default_clone_format","value":"` + r.cloneFormat +
+		format := r.cloneFormat
+		if strings.Contains(joined, "billet-cache") && r.cacheCloneFormat != "" {
+			format = r.cacheCloneFormat
+		}
+
+		return []byte(`[{"name":"rbd_default_clone_format","value":"` + format +
 			`","source":"config"}]`), nil
 
 	case strings.Contains(joined, "-p billet-images"):
@@ -160,8 +166,8 @@ func TestTheInvocationNamesTheIdentityAndThePool(t *testing.T) {
 		t.Fatalf("CheckReachable: %v", err)
 	}
 
-	if got := len(rec.rbdCalls()); got != 3 {
-		t.Fatalf("rbd was invoked %d times, want one per pool plus the clone-format read", got)
+	if got := len(rec.rbdCalls()); got != 4 {
+		t.Fatalf("rbd was invoked %d times, want a listing and a clone-format read per pool", got)
 	}
 
 	// THE EXACT ARGV, not a joined substring match. Joining loses token
@@ -176,7 +182,10 @@ func TestTheInvocationNamesTheIdentityAndThePool(t *testing.T) {
 		// exactly, and green — until the real cluster answered
 		// `rbd: unrecognised option '-p'`. An argv assertion pins what the code
 		// does, which is only the same as what the tool accepts if somebody ran it.
+		//
+		// BOTH POOLS, because the clone format can be set on one and not the other.
 		{"--id", "site-reader", "--format", "json", "config", "pool", "list", "billet-images"},
+		{"--id", "site-reader", "--format", "json", "config", "pool", "list", "billet-cache"},
 	} {
 		if got := rec.rbdCalls()[i]; !slices.Equal(got, want) {
 			t.Errorf("call %d = %q, want %q", i, got, want)
@@ -1392,5 +1401,45 @@ func TestACephInvocationIsBoundedToo(t *testing.T) {
 
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Errorf("the configured timeout did not apply to the ceph call; it took %s", elapsed)
+	}
+}
+
+// THE CLONE FORMAT IS PER POOL, and both of these hold clones.
+//
+// Measured: `rbd config pool set billet-cache rbd_default_clone_format 1` leaves
+// the image pool reporting `auto` while a clone of an unprotected snapshot in the
+// cache pool fails with `(22) Invalid argument`. Reading one pool and calling it
+// the cluster's answer is the same proxy mistake the round-one fix was about, one
+// level down — and the cache pool is the one cache generations live in, so it is
+// the pool where an undeletable generation actually costs something.
+func TestTheCloneFormatIsCheckedOnEveryPool(t *testing.T) {
+	t.Parallel()
+
+	rec := answer()
+	rec.cloneFormat = "auto" // the image pool is fine
+	rec.cacheCloneFormat = "1"
+
+	report, err := client(t, valid(), rec).CheckReachable(t.Context())
+	if err == nil {
+		t.Fatal("CheckReachable accepted a cluster whose CACHE pool is forced to clone v1")
+	}
+
+	if !errors.Is(err, ErrCloneV1) {
+		t.Errorf("the failure is not ErrCloneV1: %v", err)
+	}
+
+	// WHICH POOL, because the remedy is per pool and naming the wrong one sends an
+	// operator to a setting that is already correct.
+	if !strings.Contains(err.Error(), "billet-cache") {
+		t.Errorf("the error does not name the pool that is forced: %v", err)
+	}
+
+	if !strings.Contains(err.Error(), "rbd config pool rm billet-cache") {
+		t.Errorf("the error does not give the per-pool remedy: %v", err)
+	}
+
+	// The report still carries what each pool said, so the CLI can show it.
+	if report.Pools[0].CloneFormat != "auto" || report.Pools[1].CloneFormat != "1" {
+		t.Errorf("the per-pool clone formats were not reported: %+v", report.Pools)
 	}
 }

@@ -142,11 +142,10 @@ type Report struct {
 	// prefix. It comes from the configuration rather than from the cluster — Ceph
 	// does not echo it back — so it says who billet asked AS, not who answered.
 	User string
-	// MinCompatClient is the oldest client release the cluster admits, and
-	// CloneFormat is the rbd_default_clone_format that can override it. Together
-	// they decide CloneFormat below.
+	// MinCompatClient is the oldest client release the cluster admits. It is one
+	// half of what decides the clone format; the other half is per pool, in
+	// Pool.CloneFormat.
 	MinCompatClient string
-	CloneFormat     string
 	// CloneV2 reports whether a snapshot can be cloned WITHOUT being protected —
 	// and, the half that matters, removed while a clone of it is still live.
 	CloneV2 bool
@@ -166,6 +165,15 @@ type Pool struct {
 	// cluster did not say, which is reported rather than guessed at.
 	Size    int
 	MinSize int
+	// CloneFormat is rbd_default_clone_format AS THIS POOL SEES IT.
+	//
+	// PER POOL, because it can be set per pool: `rbd config pool set billet-cache
+	// rbd_default_clone_format 1` leaves the image pool reporting `auto` while
+	// clones in the cache pool fail with `(22) Invalid argument` — measured. Both
+	// pools hold clones (root clones in one, cache generations in the other), so
+	// reading one and calling it the cluster's answer is the same proxy mistake one
+	// level down.
+	CloneFormat string
 }
 
 // ErrCloneV1 is returned when the cluster would clone a snapshot the old way.
@@ -221,18 +229,31 @@ func (c *Client) CheckReachable(ctx context.Context) (Report, error) {
 
 	report.MinCompatClient = release
 
-	configured, err := c.cloneFormat(ctx, c.cfg.ImagePool)
-	if err != nil {
-		return Report{}, err
+	// EVERY POOL, not the first one. The clone format can be set per pool, and both
+	// of these hold clones — root clones in one, cache generations in the other —
+	// so a cluster where only the cache pool is forced to v1 has exactly the
+	// undeletable-generation problem this check exists to catch.
+	var v1 []string
+
+	for i := range report.Pools {
+		configured, err := c.cloneFormat(ctx, report.Pools[i].Name)
+		if err != nil {
+			return Report{}, err
+		}
+
+		report.Pools[i].CloneFormat = configured
+
+		format, err := EffectiveCloneFormat(release, configured)
+		if err != nil {
+			return Report{}, fmt.Errorf("ceph: %w", err)
+		}
+
+		if format == 1 {
+			v1 = append(v1, report.Pools[i].Name)
+		}
 	}
 
-	format, err := EffectiveCloneFormat(release, configured)
-	if err != nil {
-		return Report{}, fmt.Errorf("ceph: %w", err)
-	}
-
-	report.CloneFormat = configured
-	report.CloneV2 = format == 2
+	report.CloneV2 = len(v1) == 0
 
 	sizes, err := c.poolSizes(ctx)
 	if err != nil {
@@ -249,15 +270,23 @@ func (c *Client) CheckReachable(ctx context.Context) (Report, error) {
 	}
 
 	if !report.CloneV2 {
-		if configured == "1" {
-			return report, fmt.Errorf("%w: rbd_default_clone_format is set to 1, which overrides "+
-				"the cluster's minimum client release (%s); unset it with `ceph config rm client "+
-				"rbd_default_clone_format`", ErrCloneV1, release)
+		// WHICH CAUSE, because the remedies are different and giving the wrong one
+		// sends an operator to a setting that is already correct. A forced format is
+		// named per pool, since it can be set on one and not the other.
+		for _, p := range report.Pools {
+			if p.CloneFormat == "1" {
+				return report, fmt.Errorf("%w: pool %s has rbd_default_clone_format set to 1, "+
+					"which overrides the cluster's minimum client release (%s); unset it with "+
+					"`rbd config pool rm %s rbd_default_clone_format`, or `ceph config rm client "+
+					"rbd_default_clone_format` if it was set cluster-wide",
+					ErrCloneV1, p.Name, release, p.Name)
+			}
 		}
 
-		return report, fmt.Errorf("%w: require-min-compat-client is %q; raise it with "+
-			"`ceph osd set-require-min-compat-client mimic` (which refuses while clients older "+
-			"than mimic are connected — `ceph features` lists them)", ErrCloneV1, release)
+		return report, fmt.Errorf("%w: require-min-compat-client is %q, and pools %s take their "+
+			"clone format from it; raise it with `ceph osd set-require-min-compat-client mimic` "+
+			"(which refuses while clients older than mimic are connected — `ceph features` lists "+
+			"them)", ErrCloneV1, release, strings.Join(v1, " and "))
 	}
 
 	return report, nil
