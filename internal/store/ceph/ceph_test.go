@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -78,13 +81,16 @@ func TestTheInvocationNamesTheIdentityAndThePool(t *testing.T) {
 		t.Fatalf("rbd was invoked %d times, want one per pool", len(rec.calls))
 	}
 
-	for i, want := range []string{"billet-images", "billet-cache"} {
-		args := strings.Join(rec.calls[i], " ")
-
-		for _, must := range []string{"--id billet", "--format json", "-p " + want, "ls"} {
-			if !strings.Contains(args, must) {
-				t.Errorf("call %d is missing %q: %s", i, must, args)
-			}
+	// THE EXACT ARGV, not a joined substring match. Joining loses token
+	// boundaries, so a client that built one argument reading
+	// "--id billet --format json -p billet-images ls" would satisfy every
+	// Contains check and produce an invocation rbd cannot parse.
+	for i, want := range [][]string{
+		{"--id", "billet", "--format", "json", "-p", "billet-images", "ls"},
+		{"--id", "billet", "--format", "json", "-p", "billet-cache", "ls"},
+	} {
+		if !slices.Equal(rec.calls[i], want) {
+			t.Errorf("call %d = %q, want %q", i, rec.calls[i], want)
 		}
 	}
 
@@ -290,9 +296,11 @@ func TestAnInvocationIsBounded(t *testing.T) {
 	}
 
 	start := time.Now()
+	// errors.Is, not a substring: a %v somewhere in the wrapping chain would
+	// leave the text intact and break every caller that asks what went wrong.
 	if _, err := c.CheckReachable(t.Context()); err == nil {
 		t.Fatal("CheckReachable waited out an unreachable cluster and reported success")
-	} else if !strings.Contains(err.Error(), context.DeadlineExceeded.Error()) {
+	} else if !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("the failure is not the deadline: %v", err)
 	}
 
@@ -340,5 +348,152 @@ func TestAFailureKeepsTheLineThatExplainsIt(t *testing.T) {
 
 	if strings.Contains(err.Error(), "hunting for new mon") {
 		t.Errorf("the error carries the connection log in front of the reason: %v", err)
+	}
+}
+
+// THE REAL RUNNER MUST BE BOUNDED TOO, and the fake cannot say so.
+//
+// TestAnInvocationIsBounded proves the client derives a deadline; it says nothing
+// about exec, so swapping exec.CommandContext for exec.Command would leave it
+// green. This drives execRunner against a program that never exits.
+//
+// WaitDelay is what makes it terminate rather than merely be killed: Output reads
+// through pipes and Wait blocks until they see EOF, so a process that leaves a
+// descendant holding the write end keeps the CALL open after the process is dead.
+// The subprocess here does exactly that.
+// THE TEST BOUNDS ITSELF, and that is not belt-and-braces. A test for "this call
+// returns" cannot wait for the call to return, or removing the bound makes it HANG
+// until the whole package times out — which reads as a broken suite rather than as
+// a missing guard. That mistake was made once already, one test up.
+func TestTheRealRunnerIsBounded(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	defer cancel()
+
+	type result struct {
+		out []byte
+		err error
+	}
+
+	// Buffered, so the goroutine finishes even when this test has already given
+	// up: on the failure path it is waiting out the subprocess and must not be
+	// left blocked on a send nobody will receive.
+	done := make(chan result, 1)
+	start := time.Now()
+
+	go func() {
+		// `sleep` in a subshell inherits stdout, so killing the shell leaves the
+		// pipe open — which is the condition WaitDelay exists for.
+		out, err := execRunner(ctx, "/bin/sh", []string{"-c", "sleep 30 & sleep 30"})
+		done <- result{out, err}
+	}()
+
+	guard := time.NewTimer(15 * time.Second)
+	defer guard.Stop()
+
+	var got result
+
+	select {
+	case got = <-done:
+	case <-guard.C:
+		t.Fatal("execRunner had not returned 15s after a 200ms deadline: the process may have " +
+			"been killed, but the call is not bounded")
+	}
+
+	if got.err == nil {
+		t.Fatal("execRunner returned success for a command that never finished")
+	}
+
+	if !errors.Is(got.err, context.DeadlineExceeded) {
+		t.Errorf("the failure is not the deadline: %v", got.err)
+	}
+
+	// Generous, because it must not be flaky: the point is that it returned at
+	// all, far inside the half-minute the subprocess would otherwise have run.
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Errorf("execRunner took %s to give up on a process it had killed", elapsed)
+	}
+}
+
+// A DIAGNOSTIC IS ONE LINE AND IT IS BOUNDED.
+//
+// rbd's stderr is another program's output, so what reaches a terminal or a log
+// has to be limited by policy rather than by trust. Only the final line survives —
+// librados prints a paragraph of connection logging in front of the sentence that
+// matters — and it is capped, so a program that dumps a file cannot dump it
+// through billet.
+func TestOnlyTheLastDiagnosticLineSurvivesAndItIsCapped(t *testing.T) {
+	t.Parallel()
+
+	const secretish = "AQDH631qo1CfBxAA9ZsjJleBiq9V2OqUCfIn9Q=="
+
+	script := "echo 'key = " + secretish + "' >&2; echo 'rbd: listing images failed: (1) Operation not permitted' >&2; exit 1"
+
+	_, err := execRunner(t.Context(), "/bin/sh", []string{"-c", script})
+	if err == nil {
+		t.Fatal("execRunner reported success for a command that exited 1")
+	}
+
+	if strings.Contains(err.Error(), secretish) {
+		t.Errorf("an earlier stderr line reached the error: %v", err)
+	}
+
+	if !strings.Contains(err.Error(), "Operation not permitted") {
+		t.Errorf("the line that explains the failure was dropped: %v", err)
+	}
+
+	long, err := execRunner(t.Context(),
+		"/bin/sh", []string{"-c", "head -c 5000 /dev/zero | tr '\\0' 'x' >&2; exit 1"})
+	if long != nil {
+		t.Errorf("execRunner returned output alongside an error: %q", long)
+	}
+
+	if err == nil {
+		t.Fatal("execRunner reported success for a command that exited 1")
+	}
+
+	if n := len(err.Error()); n > maxDiagnostic+100 {
+		t.Errorf("a %d-byte diagnostic reached the caller; it is meant to be capped at %d",
+			n, maxDiagnostic)
+	}
+}
+
+// A MISSING rbd IS ITS OWN ANSWER, so a caller can tell "this host has no client"
+// from "this host cannot reach the cluster" — the first is an install, the second
+// is a network or a keyring.
+func TestAMissingBinaryIsDistinguishable(t *testing.T) {
+	// Not parallel: it edits the environment, which t.Setenv refuses to do in a
+	// parallel test for exactly the reason it would be wrong here.
+	t.Setenv("PATH", filepath.Join(t.TempDir(), "empty"))
+
+	c, err := New(valid())
+	if err == nil {
+		t.Fatal("New found an rbd on an empty PATH")
+	}
+
+	if c != nil {
+		t.Error("New returned a client alongside an error")
+	}
+
+	if !errors.Is(err, ErrNoRBD) {
+		t.Errorf("the error is not ErrNoRBD, so a caller cannot tell it from an unreachable "+
+			"cluster: %v", err)
+	}
+
+	if !strings.Contains(err.Error(), "ceph-common") {
+		t.Errorf("the error does not say what to install: %v", err)
+	}
+}
+
+// AN EXPLICIT BINARY SKIPS THE LOOKUP, which is what makes the tests above able to
+// run on a machine with no ceph installed — and is worth asserting, because a
+// constructor that looked the binary up anyway would make the whole suite depend
+// on the developer's laptop.
+func TestAnExplicitBinaryNeedsNoPath(t *testing.T) {
+	t.Setenv("PATH", filepath.Join(t.TempDir(), "empty"))
+
+	if _, err := New(valid(), WithBinary(os.Args[0])); err != nil {
+		t.Fatalf("New refused an explicit binary on an empty PATH: %v", err)
 	}
 }

@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -193,6 +194,16 @@ func (c *Client) args(pool string, command ...string) []string {
 	return append(args, command...)
 }
 
+// waitDelay bounds how long the pipes may outlive the process.
+//
+// KILLING THE PROCESS IS NOT THE SAME AS THE CALL RETURNING. exec.CommandContext
+// kills the direct child when the deadline passes, but Output reads through pipes
+// and Wait blocks until they reach EOF — so a descendant holding the write end
+// keeps the call open after the process billet started is already dead. WaitDelay
+// closes them anyway; without it "this call is bounded" is true of the process and
+// false of the function.
+const waitDelay = 2 * time.Second
+
 // execRunner runs rbd and returns its standard output.
 //
 // STDERR IS DROPPED INTO THE ERROR, not into the result. librados logs to stderr
@@ -200,28 +211,55 @@ func (c *Client) args(pool string, command ...string) []string {
 // — so folding the two together makes valid JSON unparseable.
 func execRunner(ctx context.Context, bin string, args []string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd.WaitDelay = waitDelay
 
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
 
 	out, err := cmd.Output()
-	if err != nil {
-		if msg := strings.TrimSpace(stderr.String()); msg != "" {
-			return nil, fmt.Errorf("%w: %s", err, lastLine(msg))
-		}
-
-		return nil, err
+	if err == nil {
+		return out, nil
 	}
 
-	return out, nil
+	// THE DEADLINE IS REPORTED AS THE DEADLINE. A killed process comes back as
+	// `signal: killed`, so a caller asking errors.Is(err, context.DeadlineExceeded)
+	// — the only way to tell "the cluster never answered" from "rbd said no" — gets
+	// false unless the context is consulted here.
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, fmt.Errorf("%s did not answer: %w", filepath.Base(bin), ctxErr)
+	}
+
+	if msg := strings.TrimSpace(stderr.String()); msg != "" {
+		return nil, fmt.Errorf("%w: %s", err, lastLine(msg))
+	}
+
+	return nil, err
 }
 
-// lastLine keeps the line rbd ended on.
+// maxDiagnostic bounds how much of rbd's output reaches a terminal or a log.
+const maxDiagnostic = 300
+
+// lastLine keeps the line rbd ended on, bounded.
 //
-// librados prints a paragraph of connection logging before the sentence that says
-// what went wrong, and the last line is the one an operator can act on.
+// librados prints a paragraph of connection logging in front of the sentence that
+// says what went wrong, and that last line is the one an operator can act on:
+// `rbd: listing images failed: (2) No such file or directory` is the difference
+// between a mistyped pool and `exit status 2`. Dropping it costs most of what the
+// preflight is for.
+//
+// RENDERING ANOTHER PROGRAM'S OUTPUT IS A CREDENTIAL RISK, so what makes it
+// admissible is a measurement rather than an argument. Probed against Ceph 20.2.3:
+// an unparseable keyring, a syntactically valid keyring holding the wrong key, and
+// a corrupt ceph.conf each produce a structural diagnostic, and none of them
+// echoes the file's contents. The residual is that this is one version's behaviour
+// — which is why only the final line survives, and why it is capped.
 func lastLine(s string) string {
 	lines := strings.Split(strings.TrimSpace(s), "\n")
+	line := strings.TrimSpace(lines[len(lines)-1])
 
-	return strings.TrimSpace(lines[len(lines)-1])
+	if len(line) > maxDiagnostic {
+		return line[:maxDiagnostic] + "…"
+	}
+
+	return line
 }

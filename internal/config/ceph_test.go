@@ -65,21 +65,32 @@ func TestAFirecrackerNodeWithoutStorageIsRefused(t *testing.T) {
 func TestStorageOnABackendThatCannotAttachOneIsRefused(t *testing.T) {
 	t.Parallel()
 
-	// The node's provider only, not every tier's: a tier declaring a backend no
-	// host runs is a deployment that has not finished being written, and the
-	// refusal under test is about the NODE section.
-	body := strings.Replace(validConfig, "  provider: firecracker\n", "  provider: docker\n", 1)
-	if !strings.Contains(body, "  provider: docker\n") || !strings.Contains(body, cephBlock) {
-		t.Fatal("the node block in validConfig has changed, so this case patches nothing")
-	}
+	// EVERY BACKEND THAT IS NOT FIRECRACKER, not just docker. A guard written as
+	// `provider == docker` would pass a single-case test while leaving ec2 — the
+	// one whose compute is in another region entirely — accepting a cluster it can
+	// never reach.
+	for _, provider := range []string{"docker", "ec2", "tart"} {
+		t.Run(provider, func(t *testing.T) {
+			t.Parallel()
 
-	_, err := Load(writeConfig(t, body))
-	if err == nil {
-		t.Fatal("Load accepted a docker node carrying a ceph section")
-	}
+			// The node's provider only, not every tier's: a tier declaring a backend
+			// no host runs is a deployment that has not finished being written, and
+			// the refusal under test is about the NODE section.
+			body := strings.Replace(validConfig,
+				"  provider: firecracker\n", "  provider: "+provider+"\n", 1)
+			if !strings.Contains(body, "  provider: "+provider+"\n") || !strings.Contains(body, cephBlock) {
+				t.Fatal("the node block in validConfig has changed, so this case patches nothing")
+			}
 
-	if !strings.Contains(err.Error(), "node.ceph is set") {
-		t.Errorf("the error does not name the field: %v", err)
+			_, err := Load(writeConfig(t, body))
+			if err == nil {
+				t.Fatalf("Load accepted a %s node carrying a ceph section", provider)
+			}
+
+			if !strings.Contains(err.Error(), "node.ceph is set") {
+				t.Errorf("the error does not name the field: %v", err)
+			}
+		})
 	}
 }
 
@@ -297,6 +308,7 @@ func TestCephValuesAreTrimmed(t *testing.T) {
     image_pool: "  billet-images  "
     cache_pool: "  billet-cache  "
     conf_path: "  /etc/ceph/ceph.conf  "
+    keyring_path: "  /etc/ceph/ceph.client.billet.keyring  "
 `)
 
 	cfg, err := Load(writeConfig(t, body))
@@ -309,6 +321,7 @@ func TestCephValuesAreTrimmed(t *testing.T) {
 		{"image_pool", cfg.Node.Ceph.ImagePool, "billet-images"},
 		{"cache_pool", cfg.Node.Ceph.CachePool, "billet-cache"},
 		{"conf_path", cfg.Node.Ceph.ConfPath, "/etc/ceph/ceph.conf"},
+		{"keyring_path", cfg.Node.Ceph.KeyringPath, "/etc/ceph/ceph.client.billet.keyring"},
 	} {
 		if tc.got != tc.want {
 			t.Errorf("%s = %q, want %q", tc.field, tc.got, tc.want)
@@ -414,5 +427,94 @@ func TestAHintIsNotOfferedForADifferentSectionsKey(t *testing.T) {
 
 	if strings.Contains(err.Error(), "has moved to node.lock_dir") {
 		t.Errorf("a key in an unrelated section drew the server.lock_dir advice: %v", err)
+	}
+}
+
+// AN IDENTITY IS PLACED IN AN ARGV TOO, and the first version of this rule guarded
+// only pool names.
+//
+// billet execs rbd directly, so the user is the value of `--id` and nothing quotes
+// it out of being an option. `client.` is refused as a prefix because rbd adds it
+// itself: `--id client.billet` authenticates as `client.client.billet` and fails
+// with a permission error naming an entity the operator never created.
+func TestAnIdentityBilletCannotPassIsRefused(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct{ name, user, want string }{
+		{name: "something rbd reads as a flag", user: "-p", want: "as a flag"},
+		{name: "the prefix rbd adds itself", user: "client.billet", want: "rbd adds"},
+		{name: "a space", user: "bil let", want: "whitespace or a slash"},
+		{name: "a slash", user: "billet/node", want: "whitespace or a slash"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			errs := CheckCeph(CephConfig{
+				User:      tc.user,
+				ImagePool: "billet-images",
+				CachePool: "billet-cache",
+			})
+			if len(errs) == 0 {
+				t.Fatalf("CheckCeph accepted user %q", tc.user)
+			}
+
+			joined := joinErrors(errs)
+			if !strings.Contains(joined, tc.want) {
+				t.Errorf("the error does not say why %q is refused: %s", tc.user, joined)
+			}
+		})
+	}
+}
+
+// WHAT WAS VALIDATED AND WHAT IS EXECUTED MUST BE THE SAME STRING, and the
+// exported entry point is where they can differ.
+//
+// Load normalizes before validating, so padding never survives that path. A caller
+// that builds a CephConfig itself has not normalized, and trimming only for the
+// decision is exactly the defect the ec2 block shipped with: the check passed and
+// the padded value was used. So CheckCeph refuses padding rather than tolerating
+// it, and a tab inside a pool name is refused too — checking for " " admits one.
+func TestCheckCephRefusesWhatItWouldOtherwiseHaveToTrim(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		cfg  CephConfig
+		want string
+	}{
+		{
+			name: "a padded identity",
+			cfg:  CephConfig{User: " billet ", ImagePool: "billet-images", CachePool: "billet-cache"},
+			want: "node.ceph.user",
+		},
+		{
+			name: "a padded pool",
+			cfg:  CephConfig{User: "billet", ImagePool: " billet-images ", CachePool: "billet-cache"},
+			want: "node.ceph.image_pool",
+		},
+		{
+			name: "a padded path",
+			cfg: CephConfig{User: "billet", ImagePool: "billet-images", CachePool: "billet-cache",
+				ConfPath: "/etc/ceph/ceph.conf "},
+			want: "node.ceph.conf_path",
+		},
+		{
+			name: "a tab inside a pool name",
+			cfg:  CephConfig{User: "billet", ImagePool: "billet\timages", CachePool: "billet-cache"},
+			want: "contains whitespace",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			errs := CheckCeph(tc.cfg)
+			if len(errs) == 0 {
+				t.Fatalf("CheckCeph accepted %s", tc.name)
+			}
+
+			if joined := joinErrors(errs); !strings.Contains(joined, tc.want) {
+				t.Errorf("the error does not name what is wrong: %s", joined)
+			}
+		})
 	}
 }
