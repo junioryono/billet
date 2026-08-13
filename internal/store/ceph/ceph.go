@@ -21,6 +21,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -310,6 +311,16 @@ var beforeMimic = map[string]bool{
 	"argonaut": true, "bobtail": true, "cuttlefish": true, "dumpling": true,
 	"emperor": true, "firefly": true, "giant": true, "hammer": true,
 	"infernalis": true, "jewel": true, "kraken": true, "luminous": true,
+
+	// NOT A RELEASE, AND NOT GARBAGE EITHER. `unknown` is the zero value of Ceph's
+	// release enum, and `osd set-require-min-compat-client unknown` is refused —
+	// measured — so it can only arrive from Ceph, meaning the cluster was never
+	// told which clients it admits. A cluster that was never told takes the old
+	// clone format, so it belongs here rather than in an error: the operator gets
+	// the same one-command remedy as a cluster that was told `luminous`, which is
+	// the thing they actually need. Refusing it as unclassifiable instead sent them
+	// to a diagnostic about billet not understanding their cluster.
+	"unknown": true,
 }
 
 // releaseName is the shape of a Ceph release: a short lowercase word. Every
@@ -355,12 +366,17 @@ func EffectiveCloneFormat(minCompatClient, configured string) (int, error) {
 	case "", "auto":
 		// The default, and the case where the floor decides.
 	default:
-		return 0, fmt.Errorf("rbd_default_clone_format is %q, which is not auto, 1 or 2", configured)
+		// BOUNDED, because this arrived as a value inside successfully-parsed JSON
+		// from a binary billet did not write. Parsing something does not make its
+		// contents safe to put on a terminal, and the package refuses to echo
+		// unparseable output for exactly the same reason.
+		return 0, fmt.Errorf("rbd_default_clone_format is %s, which is not auto, 1 or 2",
+			bounded(configured))
 	}
 
 	release := strings.ToLower(strings.TrimSpace(minCompatClient))
-	if !releaseName.MatchString(release) || release == "unknown" {
-		return 0, fmt.Errorf("%w: %q", ErrUnclassifiedRelease, release)
+	if !releaseName.MatchString(release) {
+		return 0, fmt.Errorf("%w: %s", ErrUnclassifiedRelease, bounded(release))
 	}
 
 	if beforeMimic[release] {
@@ -368,6 +384,19 @@ func EffectiveCloneFormat(minCompatClient, configured string) (int, error) {
 	}
 
 	return 2, nil
+}
+
+// bounded renders a value that came from another program, capped and quoted.
+//
+// The package's rule is that output billet cannot parse is never echoed. A value
+// that DID parse is not thereby safe: it arrived inside json a binary billet does
+// not control, and a megabyte of it in an error string reaches the same terminal.
+func bounded(v string) string {
+	if len(v) > maxDiagnostic {
+		return strconv.Quote(sanitize(v[:maxDiagnostic])) + "…"
+	}
+
+	return strconv.Quote(v)
 }
 
 // minCompatClient asks the cluster which client releases it admits.
@@ -396,17 +425,6 @@ func (c *Client) minCompatClient(ctx context.Context) (string, error) {
 	if !releaseName.MatchString(strings.ToLower(release)) {
 		return "", fmt.Errorf("ceph: %s did not answer with a release name when asked which "+
 			"client releases the cluster admits; is it the ceph command?", c.ceph)
-	}
-
-	// AT THE BOUNDARY, not inside the rule that consumes it. `unknown` was refused
-	// only on the path where the release decides the clone format — so a cluster
-	// with rbd_default_clone_format set explicitly skipped the check entirely, and
-	// `unknown` was stored and printed as though it were a release billet had
-	// recognised. A value validated in one of its two consumers is a value that is
-	// not validated.
-	if strings.EqualFold(release, "unknown") {
-		return "", fmt.Errorf("ceph: %w: the cluster has not been told which client releases it "+
-			"admits, so it takes the old clone format by default", ErrUnclassifiedRelease)
 	}
 
 	return release, nil
