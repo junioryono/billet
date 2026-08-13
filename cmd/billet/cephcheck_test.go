@@ -160,3 +160,46 @@ tiers:
 			"some other reason and never reached the cluster at all: %v", err)
 	}
 }
+
+// A CLUSTER THAT ANSWERS "NO" FAILS THE CHECK TOO.
+//
+// The sibling of TestAHostWithNoRBDFailsTheCheck, and it exists for the same
+// reason: `fmt.Println(err); return nil` on this branch leaves every other test
+// here green while `billet check` reports a healthy host whose pools it could not
+// read. One branch being guarded says nothing about the one below it.
+func TestAClusterThatRefusesFailsTheCheck(t *testing.T) {
+	// Not parallel: PATH is process-global.
+	dir := t.TempDir()
+
+	// A stand-in rbd that answers the way a real one does when the identity is not
+	// permitted. The preflight shells out, so this is the whole seam.
+	stub := filepath.Join(dir, "rbd")
+	script := "#!/bin/sh\necho 'rbd: listing images failed: (1) Operation not permitted' >&2\nexit 1\n"
+
+	if err := os.WriteFile(stub, []byte(script), 0o700); err != nil {
+		t.Fatalf("write the stub: %v", err)
+	}
+
+	t.Setenv("PATH", dir)
+
+	err := checkCephCluster(t.Context(), &config.CephConfig{
+		User:      config.DefaultCephUser,
+		ImagePool: "billet-images",
+		CachePool: "billet-cache",
+	})
+	if err == nil {
+		t.Fatal("checkCephCluster reported success against a cluster that refused it")
+	}
+
+	if errors.Is(err, ceph.ErrNoRBD) {
+		t.Errorf("the stub was not used; the failure is a missing binary: %v", err)
+	}
+
+	// Which pool, as whom, and what the cluster actually said — an operator with
+	// "the check failed" and none of those three has nowhere to start.
+	for _, want := range []string{"billet-images", "client.billet", "Operation not permitted"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the error does not carry %q: %v", want, err)
+		}
+	}
+}

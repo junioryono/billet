@@ -528,9 +528,10 @@ func TestAnExplicitBinaryNeedsNoPath(t *testing.T) {
 
 	var ran string
 
-	// NOT os.Args[0]: a WithBinary that only honoured the test's own executable
-	// would pass, and the option's whole job is naming an rbd somewhere else.
-	const elsewhere = "/opt/ceph/bin/rbd"
+	// NOT os.Args[0], and not absolute: a WithBinary that honoured only the test's
+	// own executable, or only an absolute path, would pass either way — and the
+	// option's whole job is naming an rbd somewhere else.
+	const elsewhere = "ceph/bin/rbd"
 
 	c, err := New(valid(), WithBinary(elsewhere),
 		withRunner(func(_ context.Context, bin string, _ []string) ([]byte, error) {
@@ -568,6 +569,7 @@ func TestARealFailureSurvivesAnExpiredContext(t *testing.T) {
 	// rather than "the process exited at all", and that mutation would report every
 	// other failure as a timeout.
 	for _, tc := range []struct{ code, message string }{
+		{code: "1", message: "rbd: listing images failed: (1) Operation not permitted"},
 		{code: "2", message: "rbd: listing images failed: (2) No such file or directory"},
 		{code: "13", message: "rbd: listing images failed: (13) Permission denied"},
 	} {
@@ -681,10 +683,20 @@ func TestStderrIsBoundedAsItArrives(t *testing.T) {
 	// zero-limit test — but the slice indexes from the END, so a negative limit is
 	// a runtime panic, and a control plane must not carry one waiting for the next
 	// caller who constructs this type.
-	for _, limit := range []int{0, -1} {
+	for _, limit := range []int{0, -1, -2} {
 		none := &tailWriter{limit: limit}
-		if _, err := none.Write([]byte("anything at all")); err != nil {
+
+		const payload = "anything at all"
+
+		n, err := none.Write([]byte(payload))
+		if err != nil {
 			t.Fatalf("Write(limit %d): %v", limit, err)
+		}
+
+		// THE COUNT TOO. Returning 0 here is a short write, which io.Writer's
+		// contract makes an error — exec would conclude the pipe broke.
+		if n != len(payload) {
+			t.Errorf("Write(limit %d) reported %d of %d bytes", limit, n, len(payload))
 		}
 
 		if got := none.String(); got != "" {
@@ -717,5 +729,75 @@ func TestACappedDiagnosticIsValidUTF8(t *testing.T) {
 
 	if len(got) > maxDiagnostic+8 {
 		t.Errorf("the diagnostic was not capped: %d bytes", len(got))
+	}
+
+	// AND THROUGH THE REAL COMPOSITION, which is where the first version of this
+	// repair was unreachable: tailWriter cuts the tail to exactly maxDiagnostic
+	// bytes, so lastLine's own length branch is false and the input arrives
+	// already split. Testing lastLine alone proved a path production never takes.
+	//
+	// The payload is 100 three-byte runes followed by ONE ascii byte: 301 bytes, so
+	// the 300-byte tail begins one byte into the first rune. A plain repetition is
+	// not enough — 300 is a multiple of both 2 and 3, so "éé…" and "☃☃…" both cut
+	// cleanly and the mutation survived.
+	_, err := execRunner(t.Context(), "/bin/sh", []string{"-c",
+		"for i in $(seq 1 100); do printf '\xe2\x98\x83' >&2; done; printf 'x' >&2; exit 1"})
+	if err == nil {
+		t.Fatal("execRunner reported success for a command that exited 1")
+	}
+
+	if !utf8.ValidString(err.Error()) {
+		t.Errorf("the error is not valid utf-8 through tailWriter -> lastLine: %q", err.Error())
+	}
+}
+
+// A PROCESS THAT EXITED ZERO ANSWERED, whatever else is holding the pipe.
+//
+// The successful half of the race the test above covers, and the half the first
+// fix missed: an exit of zero never produces an *exec.ExitError at all — Wait
+// returns ErrWaitDelay — so the completed-exit branch cannot see it and the call
+// would be reported as a timeout with rbd's answer thrown away.
+func TestASuccessfulExitSurvivesAHeldPipe(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 400*time.Millisecond)
+	defer cancel()
+
+	type result struct {
+		out []byte
+		err error
+	}
+
+	done := make(chan result, 1)
+
+	go func() {
+		// The listing is written and the shell exits 0; the background `sleep`
+		// inherits stdout and holds the pipe well past both the deadline and the
+		// WaitDelay that follows it.
+		out, err := execRunner(ctx, "/bin/sh", []string{"-c", `echo '["a","b"]'; sleep 30 & sleep 0.05`})
+		done <- result{out, err}
+	}()
+
+	guard := time.NewTimer(15 * time.Second)
+	defer guard.Stop()
+
+	var got result
+
+	select {
+	case got = <-done:
+	case <-guard.C:
+		t.Fatal("execRunner never returned")
+	}
+
+	if ctx.Err() == nil {
+		t.Fatal("the context had not expired, so this case did not stage the race it is about")
+	}
+
+	if got.err != nil {
+		t.Fatalf("a command that exited 0 was reported as a failure: %v", got.err)
+	}
+
+	if strings.TrimSpace(string(got.out)) != `["a","b"]` {
+		t.Errorf("the answer was discarded: %q", got.out)
 	}
 }

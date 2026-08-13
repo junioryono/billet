@@ -2,23 +2,27 @@
 #
 # THIS FILE DOES NOT RUN AS SHIPPED. It describes the intended deployment, which
 # is Firecracker, and the Firecracker provider is not built — `billet node`
-# refuses it. Two edits HERE make it start today, and both are needed —
+# refuses it. THREE edits HERE make it start today, and all three are needed —
 # the README's quickstart lists what else the file needs (the github: block, a
 # writable server.state_dir) and the Docker daemon it assumes:
 #
 #   1. `provider: firecracker` -> `provider: docker`, in the node section and in
 #      every tier.
-#   2. `image:` -> a Docker image that contains the GitHub runner, for example
+#   2. Delete the `ceph:` block below. It is REFUSED rather than ignored on any
+#      backend that cannot attach a block device, so leaving it in place means
+#      the config does not load at all — see the block's own comment for why a
+#      storage section nothing will read is an error.
+#   3. `image:` -> a Docker image that contains the GitHub runner, for example
 #      `ghcr.io/actions/actions-runner:latest`. The image name is passed
 #      straight to `docker run`, so `ubuntu-2404-x64` below is a golden-image
 #      name for Firecracker and is not pullable.
 #
-# The first edit alone gets you a config that validates and a server that
-# starts, and every job then fails to launch — which is why the second is here.
+# Edits 1 and 2 together get you a config that validates and a server that
+# starts, and every job then fails to launch — which is why the third is here.
 #
 # The Docker provider reads vcpu, memory and shm; it ignores disk and
-# warm_pool, and the whole `firecracker:` block is unused. Docker shares the
-# host kernel and is for trials rather than for untrusted code.
+# warm_pool, and the whole `firecracker:` block is unused — UNUSED, not refused,
+# which is the difference between it and `ceph:`.
 #
 # This example is the single-machine deployment, which is TWO PROCESSES reading
 # this one file:

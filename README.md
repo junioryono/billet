@@ -311,7 +311,7 @@ Everything below describes the intended design. Where a thing is not built, it s
 
 ## Quickstart
 
-> **Use `billet init` rather than copying `billet.example.yaml`.** The example describes the intended Firecracker deployment, and that provider is not built, so it does not run as shipped: the provider has to change in the node section and in every tier, and each tier's `image:` has to become something pullable, because the image name is handed straight to the backend and `ubuntu-2404-x64` is a golden-image name. `billet init` writes a config that runs today.
+> **Use `billet init` rather than copying `billet.example.yaml`.** The example describes the intended Firecracker deployment, and that provider is not built, so it does not run as shipped: the provider has to change in the node section and in every tier, the `ceph:` block has to be deleted (it is *refused* rather than ignored on a backend that cannot attach a block device, so a config that keeps it does not load), and each tier's `image:` has to become something pullable, because the image name is handed straight to the backend and `ubuntu-2404-x64` is a golden-image name. `billet init` writes a config that runs today.
 >
 > Docker shares the host kernel and is for trials rather than for untrusted code.
 

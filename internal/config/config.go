@@ -1491,12 +1491,24 @@ func (c *Config) validateNode() []error {
 // storage that was never configured. A node of any other backend WITH one has
 // written down a cluster nothing will ever read.
 func (c *Config) validateCephNode() []error {
+	// A PROVIDER THAT IS NOT A PROVIDER GETS ONE DIAGNOSTIC, not two. validateNode
+	// already refuses an unknown backend by name, and a second error telling the
+	// operator that their typo "cannot attach a block device" is billet asserting
+	// something about a string it does not recognise. validateGuestOSRules skips
+	// its relational checks on an invalid enum for the same reason.
+	if !c.Node.Provider.Valid() {
+		return nil
+	}
+
 	if c.Node.Provider != ProviderFirecracker {
 		if c.Node.Ceph != nil {
-			return []error{fmt.Errorf("node.ceph is set but this node's provider is %s, which "+
-				"cannot attach a block device: a container has nowhere to put one and an ec2 "+
-				"node's compute runs in a region that cannot reach this cluster, so nothing "+
-				"would ever read these settings", c.Node.Provider)}
+			// NAMED, NOT CHARACTERISED. Firecracker is the only backend that reads
+			// this block, so anything else would carry a cluster nothing consults —
+			// and the reasons differ per backend, so the message gives the one that
+			// applies rather than a sentence about containers that is untrue of tart.
+			return []error{fmt.Errorf("node.ceph is set but this node's provider is %s, and only "+
+				"firecracker reads it (%s), so this host would carry a cluster nothing "+
+				"consults", c.Node.Provider, cephRefusalReason(c.Node.Provider))}
 		}
 
 		return nil
@@ -1509,6 +1521,25 @@ func (c *Config) validateCephNode() []error {
 	}
 
 	return CheckCeph(*c.Node.Ceph)
+}
+
+// cephRefusalReason says why THIS backend has no use for a storage block.
+//
+// One clause per backend rather than one sentence covering all of them: a
+// container really does have nowhere to attach a block device, an ec2 node's
+// compute really is in a region that cannot reach the cluster, and neither is
+// true of tart, which simply does not read this yet.
+func cephRefusalReason(p ProviderKind) string {
+	switch p {
+	case ProviderDocker:
+		return "a container has nowhere to attach a block device"
+	case ProviderEC2:
+		return "an ec2 node's compute runs in a region that cannot reach this cluster"
+	case ProviderTart, ProviderFirecracker:
+		return "nothing in that backend reads it"
+	default:
+		return "nothing in that backend reads it"
+	}
 }
 
 // normalize fills in the identity billet authenticates as and trims what it later
