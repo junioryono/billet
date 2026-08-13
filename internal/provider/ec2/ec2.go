@@ -621,11 +621,27 @@ func (p *Provider) rootDevice(ctx context.Context, image string) (string, error)
 // survivesTermination reports whether a mapping SAYS its volume outlives the
 // instance.
 //
-// Both spellings, because XML booleans have two: `xs:boolean` admits "1" and "0"
-// alongside "true" and "false". EC2 emits lowercase words in practice — and
-// nothing here has ever run against a real account, so "in practice" is somebody
-// else's observation rather than a measurement of this code's actual counterpart.
-// Accepting both costs a comparison and errs toward saying something.
+// BOTH SPELLINGS, because XML booleans have two: xs:boolean's lexical space is
+// "true"/"false"/"1"/"0". Whether EC2 ever emits the digits is not something this
+// package can answer — nothing in it has spoken to a real AWS account — so the
+// choice is between handling a form that may never arrive and missing a leak if
+// it does. One comparison, and it fails toward saying something.
+//
+// SPELLING THEM OUT IS THE COST OF DECODING THIS AS A STRING, which is the part
+// worth knowing before someone "simplifies" it. encoding/xml runs a bool field
+// through strconv.ParseBool, so a bool would have understood all four lexemes for
+// free — but it also decodes an ABSENT element into the zero value, making absent
+// and "false" indistinguishable. Absent has to stay visible (see the call site),
+// so the string decode is forced, and this function is what puts back the leniency
+// that decision threw away.
+//
+// That much is measured rather than assumed, and it is measurable precisely
+// because it is Go's behaviour rather than AWS's:
+//
+//	<ebs></ebs>                       bool=false  string=""
+//	<ebs><d>false</d></ebs>           bool=false  string="false"
+//	<ebs><d>0</d></ebs>               bool=false  string="0"
+//	<ebs><d>1</d></ebs>               bool=true   string="1"
 func survivesTermination(flag string) bool {
 	return flag == "false" || flag == "0"
 }
@@ -651,26 +667,32 @@ func (p *Provider) warnAboutSurvivingVolumes(image string, out describeImagesRes
 	root := out.Images[0].RootDeviceName
 
 	for _, bd := range out.Images[0].BlockDevices {
-		// AN ABSENT FLAG IS NOT A FALSE ONE, and the reason is that billet does not
-		// know what absent means here rather than that it is probably fine.
+		// AN ABSENT FLAG IS NOT A FALSE ONE — because billet cannot tell what absent
+		// means here, not because it is probably fine.
 		//
-		// AWS's own documentation gives DIFFERENT defaults for a non-root volume
-		// attached at launch depending on how the instance was launched — the
-		// console preserves it, the CLI deletes it — so there is no single answer to
-		// substitute. In practice the question barely arises: a real AMI carries the
-		// value, because CreateImage snapshots the live attachment and RegisterImage
-		// stores what it was given, so an EBS mapping with the field missing is
-		// closer to a fake-API artifact than a state an image reaches.
+		// The image is the right place to be looking. AWS states that an EBS volume's
+		// launch-time default is determined by the DeleteOnTermination attribute set
+		// on the AMI, overridable per launch [1] — so the flag read out of
+		// DescribeImages is the one that will actually govern.
 		//
-		// Warning on it would therefore be guessing, and a guess that fires on
-		// innocent images is how an operator learns to ignore the one warning that
-		// is about something their image actually said.
+		// Which is also precisely why silence has no answer: the attribute that
+		// decides is the one this image declined to set, and the documentation stops
+		// there. The console-versus-CLI default table on the same page does not fill
+		// the gap — that is about volumes named in a launch REQUEST, not about what a
+		// stored image means by omitting one. Nothing in this package has ever spoken
+		// to a real account either, so there is no observation to fall back on.
 		//
-		// PARSED AS A STRING RATHER THAN A BOOL, which is what makes the distinction
-		// expressible at all: a Go bool decodes an absent element as false, so this
-		// check would have silently become "absent or false" whatever the comment
-		// claimed — the same zero-value trap that let a credential type look
-		// redacted because its field's type was.
+		// So a missing field reads as UNKNOWN, and unknown does not earn a warning: a
+		// warning that fires on innocent images is how an operator learns to ignore
+		// the one that is about something their image really said. A DescribeImages
+		// response recorded from a live account would settle it — a measurement,
+		// which is the only thing that gets to settle a question about somebody
+		// else's API.
+		//
+		// Keeping absent distinguishable is what forces the string decode; see
+		// survivesTermination for why that is not free.
+		//
+		// [1]: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/preserving-volumes-on-termination.html
 		if bd.DeviceName == root || !survivesTermination(bd.EBS.DeleteOnTermination) {
 			continue
 		}

@@ -1980,11 +1980,13 @@ func TestAVolumeMarkedWithTheOtherBooleanSpellingIsStillReported(t *testing.T) {
 
 // AN IMAGE THAT SAYS NOTHING ABOUT DeleteOnTermination IS NOT WARNED ABOUT.
 //
-// Only an explicit "false" is worth naming: a mapping that omits the flag gets
-// EC2's own default for however the image was registered, which billet has no
-// standing to second-guess. Pinned separately because the main test asserts what
-// IS reported, and a warning that fires on silence would be the noise that trains
-// an operator to ignore all of them.
+// Not because silence is safe — because billet cannot tell. AWS says the
+// launch-time default comes from the AMI's own attribute, so an image that sets
+// none leaves the documentation with nothing further to say, and this package has
+// never spoken to a real account to find out. Warning on unknown would fire on
+// innocent images, and a warning an operator has learned to ignore protects
+// nothing. The reasoning lives at the call site in ec2.go; this pins the
+// behaviour, separately from the test that asserts what IS reported.
 func TestAnImageSilentAboutTerminationIsNotWarnedAbout(t *testing.T) {
 	f := newFakeEC2(t)
 	f.respond = func(action string, params url.Values) (int, string) {
