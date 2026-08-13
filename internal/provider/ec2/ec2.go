@@ -588,8 +588,8 @@ type imageLayout struct {
 //
 // NOTHING HERE IS LEFT TO A DEFAULT, and that is the whole design. An unstated
 // DeleteOnTermination is not a small ambiguity: AWS documents the answer twice,
-// and the two answers disagree for exactly the case billet is in — a non-root
-// volume, attached at launch, through the API.
+// and those two answers are READ differently for exactly the case billet is in —
+// a non-root volume, attached at launch, through the API.
 //
 //   - [2] gives an inheritance model — true for the root, false for ATTACHED
 //     volumes, an AMI inherits the setting from the instance it was made from, and
@@ -600,10 +600,18 @@ type imageLayout struct {
 //     default comes from the AMI's own attribute.
 //
 // TWO CAREFUL REVIEWERS READ THOSE DIFFERENTLY — one as an outright contradiction,
-// one as reconcilable with the AMI attribute governing — and neither reading is
-// measurable from here. Note that even the reconciled reading does not answer the
-// question: it says the AMI's attribute decides, about an AMI that set no
-// attribute.
+// one as reconcilable with the AMI's own attribute governing — and neither reading
+// is measurable from here.
+//
+// The reconciled reading is not empty, and it is worth being exact about where it
+// runs out, because its own proponent reached the alarming end of it. Taken whole
+// it CAN answer the question: the unstated mapping took [2]'s creation-time
+// default of false, the AMI stored that, the launch inherits it — preserve, and
+// billet leaks. It stops at one further unmeasurable step, whether that
+// creation-time default is materialised into the stored mapping at all. So the
+// choice is not between an answer and a gap; it is between two readings that
+// disagree about whether billet is leaking right now, resting on a fact nobody
+// here can check.
 //
 // That is the argument for this function. The dispute was about somebody else's
 // undocumented edge, it could not be settled by reading more, and the bill for
@@ -729,7 +737,8 @@ func (p *Provider) imageLayout(ctx context.Context, image string) (imageLayout, 
 		if bd.DeviceName == layout.root {
 			if stated {
 				p.log.Warn("this image asks to keep its ROOT volume, and billet is overriding "+
-					"that to delete: the root is the disk billet sizes and boots for one job, "+
+					"that to delete: the root is the disk this instance boots and discards with "+
+					"the job, and the one billet resizes when a tier asks for a size, "+
 					"and keeping it would leave a full OS disk behind for every job on this tier",
 					"image", image, "device", bd.DeviceName)
 			}

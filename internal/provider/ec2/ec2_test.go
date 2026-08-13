@@ -2047,9 +2047,14 @@ func TestEveryImageDeviceLaunchesWithAnExplicitTerminationFlag(t *testing.T) {
 		return http.StatusOK, `<DescribeImagesResponse><imagesSet><item>` +
 			`<imageId>ami-0abc</imageId><rootDeviceName>/dev/xvda</rootDeviceName>` +
 			`<blockDeviceMapping>` +
-			`<item><deviceName>/dev/xvda</deviceName><ebs>` +
-			`<deleteOnTermination>true</deleteOnTermination></ebs></item>` +
+			// THE ROOT IS DELIBERATELY NOT FIRST. AWS does not promise an order for
+			// response elements, and classifying "the first EBS mapping" as the root
+			// passed every test while this fixture led with it — a data volume
+			// arriving first would then be swallowed as the root and never restated.
 			`<item><deviceName>/dev/sdb</deviceName><ebs></ebs></item>` +
+			// AND THE ROOT SAYS NOTHING, which is the gap-filling case: billet states
+			// true for it and must do so SILENTLY, having contradicted nothing.
+			`<item><deviceName>/dev/xvda</deviceName><ebs></ebs></item>` +
 			`<item><deviceName>/dev/sdc</deviceName><ebs>` +
 			`<deleteOnTermination>false</deleteOnTermination></ebs></item>` +
 			`<item><deviceName>/dev/sdd</deviceName><ebs>` +
@@ -2075,7 +2080,7 @@ func TestEveryImageDeviceLaunchesWithAnExplicitTerminationFlag(t *testing.T) {
 
 	// The device order is the image's, after the root took index 1.
 	want := map[string]string{
-		"/dev/xvda": "true",  // root, stated by billet itself
+		"/dev/xvda": "true",  // root, stated by billet itself, and it said nothing
 		"/dev/sdb":  "true",  // said nothing -> billet decides delete
 		"/dev/sdc":  "false", // said keep -> honoured
 		"/dev/sdd":  "true",  // said delete -> restated
@@ -2245,8 +2250,8 @@ func TestTheRootIsDeletedEvenWhenTheImageAsksToKeepIt(t *testing.T) {
 	}
 
 	if v := got.Get("BlockDeviceMapping.1.Ebs.DeleteOnTermination"); v != "true" {
-		t.Errorf("the root went out as %q; a root volume kept per job is the largest leak "+
-			"this backend can produce", v)
+		t.Errorf("the root went out as %q; a boot disk kept per job is a leak on every job "+
+			"this tier ever runs", v)
 	}
 
 	// AND IT IS NOT ALSO RESTATED AS A SECOND DEVICE, which is what would happen if
@@ -2254,6 +2259,107 @@ func TestTheRootIsDeletedEvenWhenTheImageAsksToKeepIt(t *testing.T) {
 	// for one device, disagreeing.
 	if d := got.Get("BlockDeviceMapping.2.DeviceName"); d != "" {
 		t.Errorf("the root was sent twice: index 2 is %q", d)
+	}
+}
+
+// A ROOT THAT DID NOT ASK TO BE KEPT IS OVERRIDDEN IN SILENCE.
+//
+// The other half of "speak only when billet contradicts the image", swept across
+// every spelling that means keep-nothing. The comprehensive test covers the absent
+// case; these cover the two ways an image can say delete, so no narrower reading
+// of the root flag can start announcing an override that is not happening.
+func TestTheRootIsNotAnnouncedWhenTheImageDidNotAskToKeepIt(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ebs  string
+	}{
+		{name: "said delete in words", ebs: `<deleteOnTermination>true</deleteOnTermination>`},
+		{name: "said delete as a digit", ebs: `<deleteOnTermination>1</deleteOnTermination>`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeEC2(t)
+			f.respond = func(action string, params url.Values) (int, string) {
+				if action != "DescribeImages" {
+					return http.StatusOK, defaultReply(action)
+				}
+
+				return http.StatusOK, `<DescribeImagesResponse><imagesSet><item>` +
+					`<imageId>ami-0abc</imageId><rootDeviceName>/dev/xvda</rootDeviceName>` +
+					`<blockDeviceMapping>` +
+					`<item><deviceName>/dev/xvda</deviceName><ebs>` + tc.ebs + `</ebs></item>` +
+					`</blockDeviceMapping></item></imagesSet></DescribeImagesResponse>`
+			}
+
+			var logged bytes.Buffer
+
+			p := newTestProvider(t, f, nil)
+			p.log = slog.New(slog.NewTextHandler(&logged, nil))
+
+			if _, err := p.Launch(t.Context(), validSpec()); err != nil {
+				t.Fatalf("Launch: %v", err)
+			}
+
+			if strings.Contains(logged.String(), "ROOT") {
+				t.Errorf("billet announced overriding a root that asked for no such thing: %s",
+					logged.String())
+			}
+		})
+	}
+}
+
+// THE TWO WAYS AN IMAGE LOOKUP CAN BE UNUSABLE BOTH REFUSE THE LAUNCH.
+//
+// Both guards predate this work and both were unkillable: no fixture returned an
+// empty imagesSet or omitted rootDeviceName, so deleting either left the suite
+// green. The second is the one with teeth — without it a rootless image reaches
+// RunInstances with an EMPTY DeviceName, which is the "second disk by mistake"
+// hazard the guard's own message warns about.
+func TestAnImageBilletCannotReadIsRefusedBeforeLaunching(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		reply string
+		want  string
+	}{
+		{
+			name:  "no such image",
+			reply: `<DescribeImagesResponse><imagesSet></imagesSet></DescribeImagesResponse>`,
+			want:  "does not exist",
+		},
+		{
+			name: "no root device name",
+			reply: `<DescribeImagesResponse><imagesSet><item>` +
+				`<imageId>ami-0abc</imageId>` +
+				`</item></imagesSet></DescribeImagesResponse>`,
+			want: "no root device name",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeEC2(t)
+			f.respond = func(action string, params url.Values) (int, string) {
+				if action != "DescribeImages" {
+					return http.StatusOK, defaultReply(action)
+				}
+
+				return http.StatusOK, tc.reply
+			}
+
+			p := newTestProvider(t, f, nil)
+
+			_, err := p.Launch(t.Context(), validSpec())
+			if err == nil {
+				t.Fatal("Launch succeeded on an image billet cannot read")
+			}
+
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error does not name the problem: %v", err)
+			}
+
+			// AND NOTHING WAS BOUGHT. The refusal has to happen before RunInstances,
+			// or billet has paid for an instance it then reports as a failure.
+			if n := f.countOf("RunInstances"); n != 0 {
+				t.Errorf("%d instances were launched from an image billet could not read", n)
+			}
+		})
 	}
 }
 
