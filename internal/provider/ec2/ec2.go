@@ -564,7 +564,19 @@ func (p *Provider) setTags(params url.Values, name string) {
 //	<ebs><d>false</d></ebs>           bool=false  string="false"
 //	<ebs><d>0</d></ebs>               bool=false  string="0"
 //	<ebs><d>1</d></ebs>               bool=true   string="1"
+//
+// The bool column is also where the trimming below comes from: encoding/xml runs
+// it through ParseBool(TrimSpace(src)), so the string path has to trim by hand or
+// it is strictly less correct than the type it replaced.
 func survivesTermination(flag string) bool {
+	// TRIMMED, because the whitespace is not part of the value. xs:boolean carries
+	// the `collapse` whitespace facet, so " false " IS false — and this is the one
+	// place the string decode could quietly diverge from the bool it replaced, since
+	// encoding/xml hands a bool field to ParseBool(TrimSpace(src)) and would have
+	// trimmed for free. Untrimmed, a padded "false" read as delete, and billet would
+	// have overridden a preservation the image did ask for, irreversibly.
+	flag = strings.TrimSpace(flag)
+
 	return flag == "false" || flag == "0"
 }
 
@@ -579,8 +591,10 @@ type imageDevice struct {
 // imageLayout is what one DescribeImages lookup tells billet about an AMI.
 type imageLayout struct {
 	root string
-	// devices are the non-root EBS mappings, in the order the image declared
-	// them, each carrying the flag billet will send for it.
+	// devices are the non-root EBS mappings, each carrying the flag billet will
+	// send for it, in whatever order DescribeImages returned them. AWS does not
+	// promise that order is stable and nothing here depends on it: every entry
+	// carries its own device name, so the position is only an index.
 	devices []imageDevice
 }
 
@@ -715,7 +729,8 @@ func (p *Provider) imageLayout(ctx context.Context, image string) (imageLayout, 
 	layout := imageLayout{root: out.Images[0].RootDeviceName}
 	if layout.root == "" {
 		return imageLayout{}, fmt.Errorf("ec2: image %s reports no root device name, so billet "+
-			"cannot size its root volume without attaching a second disk by mistake", image)
+			"cannot say what becomes of its root volume, and naming the wrong device would "+
+			"attach a second disk rather than fail", image)
 	}
 
 	for _, bd := range out.Images[0].BlockDevices {
@@ -739,7 +754,8 @@ func (p *Provider) imageLayout(ctx context.Context, image string) (imageLayout, 
 				p.log.Warn("this image asks to keep its ROOT volume, and billet is overriding "+
 					"that to delete: the root is the disk this instance boots and discards with "+
 					"the job, and the one billet resizes when a tier asks for a size, "+
-					"and keeping it would leave a full OS disk behind for every job on this tier",
+					"and keeping it would leave a full boot disk behind for every job billet "+
+					"launches from this image",
 					"image", image, "device", bd.DeviceName)
 			}
 
@@ -753,8 +769,8 @@ func (p *Provider) imageLayout(ctx context.Context, image string) (imageLayout, 
 			keep = "false"
 
 			p.log.Warn("this image attaches a volume that outlives its instance, and billet is "+
-				"launching it that way because the image asked; every job on this tier will "+
-				"leave one behind, billed until somebody goes looking",
+				"launching it that way because the image asked; every job billet launches "+
+				"from this image will leave one behind, billed until somebody goes looking",
 				"image", image, "device", bd.DeviceName)
 		}
 
