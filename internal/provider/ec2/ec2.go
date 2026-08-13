@@ -778,12 +778,23 @@ func (p *Provider) setBlockDevices(ctx context.Context, params url.Values, spec 
 // documents these AMIs as legacy and confined to previous-generation instance
 // types, so this is a declined legacy path rather than an impossibility.
 //
-// NOT MEASURED, unlike the block-device behaviour this backend settled against a
-// live account, and the population is thin enough that it may stay that way:
-// Amazon publishes ZERO instance-store AMIs in the region that was measured. So
-// this is written from the documented existence of the root type, not from an
-// observed failure — which is also why it refuses rather than launching and
-// interpreting whatever comes back.
+// THE FALLBACK IS NOT THEORETICAL, which was worth checking rather than assuming
+// since the whole rule rests on it. Across 26,052 Amazon-owned AMIs in us-west-2
+// (measured Aug 2026): every one reports rootDeviceType, every one reports "ebs",
+// and every one describes its root device in its own block device mapping with an
+// <ebs> child — zero missing, zero without. So the corroborating route holds
+// universally in that population, and the case it exists for (a silent type) was
+// not reached there at all.
+//
+// THE FAILURE ITSELF IS STILL UNMEASURED, unlike the block-device behaviour this
+// backend settled against a live account. Amazon publishes ZERO instance-store
+// AMIs in that region, so what such a launch actually does was never observed —
+// this is written from the documented existence of the root type, which is also
+// why it refuses rather than launching and interpreting whatever comes back.
+//
+// And the scope is the usual one: Amazon-owned, one region, one day. An
+// operator-built or imported image is not in that population, which is precisely
+// the case the corroborating route exists to serve.
 func requireEBSRoot(image, rootType, rootDevice string, mappings []imageMapping) error {
 	if rootType == "ebs" {
 		return nil
