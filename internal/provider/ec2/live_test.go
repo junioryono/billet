@@ -30,8 +30,11 @@ import (
 //
 // IT DESTROYS WHAT IT LAUNCHES, in a cleanup that runs even on failure, and it
 // launches exactly one instance of the smallest shape it is given. What it cannot
-// do is prove the absence of a leak: if the process dies between RunInstances and
-// the cleanup, an instance survives, tagged with this provider's owner.
+// do is prove the absence of a leak: if the process is killed between RunInstances
+// and the cleanup, OR if Launch itself fails after RunInstances has already
+// committed — a response that will not parse, a context expiring mid-reply — an
+// instance survives and this test never learns its id. It is findable by the
+// per-run owner tag.
 func TestLiveSmoke(t *testing.T) {
 	region := os.Getenv("BILLET_LIVE_EC2_REGION")
 	if region == "" {
@@ -83,10 +86,16 @@ func TestLiveSmoke(t *testing.T) {
 
 	// A FRESH LEASE ID PER RUN, and the first attempt at this test taught why. A
 	// fixed one made the second run fail with IdempotentParameterMismatch: the
-	// lease id IS the ClientToken, AWS remembers it for 24 hours, and the same
-	// token with different parameters is refused. That is the launch-idempotency
-	// design working — confirmed by EC2 rather than by reading — and it means a
-	// retried launch cannot quietly buy a second instance for one job.
+	// lease id IS the ClientToken, and the same token with different parameters is
+	// refused. That is the launch-idempotency design working — confirmed by EC2
+	// rather than by reading — and it means a retried launch cannot quietly buy a
+	// second instance for one job.
+	//
+	// HOW LONG EC2 REMEMBERS A TOKEN IS NOT STATED HERE, because I do not know it.
+	// The runs that produced the mismatch were MINUTES apart, so minutes is what
+	// was observed; AWS's current idempotency page and RunInstances reference both
+	// document the mismatch behaviour and neither gives a duration. An earlier
+	// version of this comment said 24 hours, which came from nowhere I can cite.
 	sum := sha256.Sum256([]byte(owner))
 	lease := hex.EncodeToString(sum[:])[:32]
 
@@ -175,6 +184,16 @@ func TestLiveSmoke(t *testing.T) {
 	} else {
 		t.Logf("    List first saw it %s after Launch returned; name = %q",
 			visible.Round(100*time.Millisecond), seen.Name)
+
+		// ASSERTED, NOT JUST LOGGED. The name is the ONLY durable link between a
+		// running instance and the lease that paid for it — recovery reads it back
+		// out — and the first version of this test logged it and checked nothing,
+		// so a tag round-trip that mangled the name would have passed while the
+		// coverage notes claimed this was covered.
+		if seen.Name != spec.Name {
+			t.Errorf("    the name came back as %q, want %q: the lease id cannot be "+
+				"recovered from a running instance", seen.Name, spec.Name)
+		}
 	}
 
 	// 4. DESTROY, and what it means. This is #46: billet treats a successful
