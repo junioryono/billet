@@ -174,6 +174,10 @@ type Pool struct {
 	// reading one and calling it the cluster's answer is the same proxy mistake one
 	// level down.
 	CloneFormat string
+	// CloneFormatSource is where that value came from — `pool` for an override on
+	// the pool, `config` for one set cluster-wide — because it decides which
+	// command removes it.
+	CloneFormatSource string
 }
 
 // ErrCloneV1 is returned when the cluster would clone a snapshot the old way.
@@ -236,12 +240,12 @@ func (c *Client) CheckReachable(ctx context.Context) (Report, error) {
 	var v1 []string
 
 	for i := range report.Pools {
-		configured, err := c.cloneFormat(ctx, report.Pools[i].Name)
+		configured, source, err := c.cloneFormat(ctx, report.Pools[i].Name)
 		if err != nil {
 			return Report{}, err
 		}
 
-		report.Pools[i].CloneFormat = configured
+		report.Pools[i].CloneFormat, report.Pools[i].CloneFormatSource = configured, source
 
 		format, err := EffectiveCloneFormat(release, configured)
 		if err != nil {
@@ -277,9 +281,7 @@ func (c *Client) CheckReachable(ctx context.Context) (Report, error) {
 			if p.CloneFormat == "1" {
 				return report, fmt.Errorf("%w: pool %s has rbd_default_clone_format set to 1, "+
 					"which overrides the cluster's minimum client release (%s); unset it with "+
-					"`rbd config pool rm %s rbd_default_clone_format`, or `ceph config rm client "+
-					"rbd_default_clone_format` if it was set cluster-wide",
-					ErrCloneV1, p.Name, release, p.Name)
+					"`%s`", ErrCloneV1, p.Name, release, unsetCloneFormat(p))
 			}
 		}
 
@@ -396,6 +398,17 @@ func (c *Client) minCompatClient(ctx context.Context) (string, error) {
 			"client releases the cluster admits; is it the ceph command?", c.ceph)
 	}
 
+	// AT THE BOUNDARY, not inside the rule that consumes it. `unknown` was refused
+	// only on the path where the release decides the clone format — so a cluster
+	// with rbd_default_clone_format set explicitly skipped the check entirely, and
+	// `unknown` was stored and printed as though it were a release billet had
+	// recognised. A value validated in one of its two consumers is a value that is
+	// not validated.
+	if strings.EqualFold(release, "unknown") {
+		return "", fmt.Errorf("ceph: %w: the cluster has not been told which client releases it "+
+			"admits, so it takes the old clone format by default", ErrUnclassifiedRelease)
+	}
+
 	return release, nil
 }
 
@@ -405,7 +418,7 @@ func (c *Client) minCompatClient(ctx context.Context) (string, error) {
 // can do the first and not the second — measured, `ceph config get client
 // rbd_default_clone_format` answers EACCES for a `profile rbd` key, while
 // `rbd config pool list` answers with the effective value and where it came from.
-func (c *Client) cloneFormat(ctx context.Context, pool string) (string, error) {
+func (c *Client) cloneFormat(ctx context.Context, pool string) (string, string, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.wait)
 	defer cancel()
 
@@ -419,29 +432,35 @@ func (c *Client) cloneFormat(ctx context.Context, pool string) (string, error) {
 
 	out, err := c.run(ctx, c.bin, args)
 	if err != nil {
-		return "", fmt.Errorf("ceph: the rbd configuration for pool %q could not be read as "+
+		return "", "", fmt.Errorf("ceph: the rbd configuration for pool %q could not be read as "+
 			"client.%s: %w", pool, c.cfg.User, err)
 	}
 
 	var options []struct {
-		Name  string `json:"name"`
-		Value string `json:"value"`
+		Name   string `json:"name"`
+		Value  string `json:"value"`
+		Source string `json:"source"`
 	}
 
 	if err := json.Unmarshal(bytes.TrimSpace(out), &options); err != nil || options == nil {
-		return "", fmt.Errorf("ceph: %s did not answer with a json configuration list for pool "+
-			"%q; is it the rbd command?", c.bin, pool)
+		return "", "", fmt.Errorf("ceph: %s did not answer with a json configuration list for "+
+			"pool %q; is it the rbd command?", c.bin, pool)
 	}
 
 	for _, o := range options {
 		if o.Name == "rbd_default_clone_format" {
-			return o.Value, nil
+			// THE SOURCE IS KEPT, because it decides the remedy. rbd reports
+			// `pool` for an override set on the pool and `config` for one set
+			// cluster-wide, and `ceph config rm client …` does not remove the first
+			// — so discarding it means half the refusals recommend a command that
+			// changes nothing.
+			return o.Value, o.Source, nil
 		}
 	}
 
 	// ABSENT MEANS THE DEFAULT, which is `auto`. A cluster that does not list the
 	// option has not overridden it.
-	return "auto", nil
+	return "auto", "", nil
 }
 
 // poolSpec is the half of `ceph osd pool ls detail` billet reads.
@@ -479,6 +498,20 @@ func (c *Client) poolSizes(ctx context.Context) (map[string]poolSpec, error) {
 	}
 
 	return byName, nil
+}
+
+// unsetCloneFormat is the command that removes THIS override.
+//
+// rbd reports where an effective value came from, and the two places take
+// different commands — `ceph config rm client …` does not remove an override set
+// on a pool. Naming the wrong one sends an operator to a setting that is already
+// absent and leaves them believing billet is wrong about their cluster.
+func unsetCloneFormat(p Pool) string {
+	if p.CloneFormatSource == "pool" {
+		return "rbd config pool rm " + p.Name + " rbd_default_clone_format"
+	}
+
+	return "ceph config rm client rbd_default_clone_format"
 }
 
 // cephCmd runs one `ceph` invocation, bounded like every other.
