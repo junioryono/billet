@@ -789,19 +789,27 @@ func (p *Provider) setBlockDevices(ctx context.Context, params url.Values, spec 
 // image. This is a declined legacy path rather than an impossibility, and a very
 // quiet one.
 //
-// THE FALLBACK IS NOT THEORETICAL, which was worth checking rather than assuming
-// since the whole rule rests on it. Across 26,052 Amazon-owned AMIs in us-west-2
-// (measured Aug 2026): every one reports rootDeviceType, every one reports "ebs",
-// and every one describes its root device in its own block device mapping with an
-// <ebs> child — zero missing, zero without. So the corroborating route holds
-// universally in that population, and the case it exists for (a silent type) was
-// not reached there at all.
+// THE CORROBORATING SIGNAL IS ALWAYS AVAILABLE, which was worth checking rather
+// than assuming since the fallback rests on it. Across 26,052 Amazon-owned AMIs
+// RETURNED BY DescribeImages in us-west-2 (Aug 2026): every one reports
+// rootDeviceType, every one reports "ebs", and every one describes its root device
+// in its own block device mapping with an <ebs> child — zero missing, zero
+// without.
+//
+// NOTE WHAT THAT DOES AND DOES NOT SHOW, because the first version of this comment
+// called the fallback "not theoretical" and that was the wrong word. It shows the
+// corroborating route would have an answer whenever it is consulted. It does NOT
+// show the fallback being consulted, since nothing in that population omitted the
+// type — the case this branch exists for was not reached there at all.
 //
 // THE FAILURE ITSELF IS STILL UNMEASURED, unlike the block-device behaviour this
-// backend settled against a live account. Amazon publishes ZERO instance-store
-// AMIs in that region, so what such a launch actually does was never observed —
-// this is written from the documented existence of the root type, which is also
-// why it refuses rather than launching and interpreting whatever comes back.
+// backend settled against a live account. Those 26,052 responses contained zero
+// instance-store AMIs — and DescribeImages omits deprecated and disabled images by
+// default, so that is a statement about what the call returned rather than about
+// everything Amazon has ever published. What such a launch actually does was never
+// observed. This is written from the documented existence of the root type, which
+// is also why it refuses rather than launching and interpreting whatever comes
+// back.
 //
 // And the scope is the usual one: Amazon-owned, one region, one day. An
 // operator-built or imported image is not in that population, which is precisely
