@@ -609,11 +609,48 @@ func (p *Provider) rootDevice(ctx context.Context, image string) (string, error)
 			"its root volume without attaching a second disk by mistake", image)
 	}
 
+	p.warnAboutSurvivingVolumes(image, out)
+
 	p.mu.Lock()
 	p.rootDevices[image] = device
 	p.mu.Unlock()
 
 	return device, nil
+}
+
+// warnAboutSurvivingVolumes reports image volumes that outlive their instance.
+//
+// A CONTRACT NOTHING ENFORCES FAILS SILENTLY, which is why this is code rather
+// than a sentence in the AMI documentation. billet sets DeleteOnTermination for
+// the ROOT device and cannot set it for the others without restating every
+// mapping — so an image that declares an extra EBS volume with the flag false
+// leaks one volume PER JOB, tagged and billed and discoverable only by somebody
+// going to look.
+//
+// A WARNING RATHER THAN A REFUSAL, because an operator may have meant it: a
+// deliberately persistent volume is a strange thing to attach to an ephemeral
+// runner, and it is their AMI. It is said once per image, since the lookup is
+// cached, which is also what keeps it from becoming noise.
+func (p *Provider) warnAboutSurvivingVolumes(image string, out describeImagesResponse) {
+	if len(out.Images) == 0 {
+		return
+	}
+
+	root := out.Images[0].RootDeviceName
+
+	for _, bd := range out.Images[0].BlockDevices {
+		// EMPTY IS NOT FALSE. An image that says nothing about the flag gets EC2's
+		// own default, which for a mapping billet does not restate is what the
+		// image was registered with — so only an explicit "false" is worth naming.
+		if bd.DeviceName == root || bd.EBS.DeleteOnTermination != "false" {
+			continue
+		}
+
+		p.log.Warn("this image attaches a volume that outlives its instance; billet sets "+
+			"DeleteOnTermination for the root device only, so every job on this tier will "+
+			"leave one behind",
+			"image", image, "device", bd.DeviceName)
+	}
 }
 
 // userData is the boot script that starts the runner.

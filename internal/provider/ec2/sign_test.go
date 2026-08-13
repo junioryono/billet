@@ -221,7 +221,10 @@ func TestAQueryStringSpaceIsCanonicalizedTheWayAWSReadsIt(t *testing.T) {
 		t.Fatalf("parse: %v", err)
 	}
 
-	got := canonicalQuery(u)
+	got, err := canonicalQuery(u)
+	if err != nil {
+		t.Fatalf("canonicalQuery: %v", err)
+	}
 
 	if strings.Contains(got, "+") {
 		t.Errorf("canonical query %q encodes a space as +, which AWS canonicalizes as %%20 — "+
@@ -261,5 +264,48 @@ func TestACallerSetHostOrContentLengthIsNotSignedInsteadOfWhatIsSent(t *testing.
 	if got := req.Header.Get("Authorization"); got != want {
 		t.Errorf("a header the transport ignores was signed in place of the value it sends\n "+
 			"got: %s\nwant: %s", got, want)
+	}
+}
+
+// A QUERY BILLET CANNOT READ THE SAME WAY IT WILL BE SENT IS REFUSED, NOT SIGNED
+// PARTIALLY.
+//
+// url.URL.Query discards ParseQuery's error, so a query Go dislikes is silently
+// reduced rather than rejected — measured, `a=1;b=2` parses to an EMPTY map,
+// because Go has refused the semicolon as a separator since 1.17, and a bad
+// escape quietly drops its pair. Signing what is left covers a query the wire
+// does not send, and the service answers 403 naming nothing.
+//
+// Latent for this client, which sends every parameter in the body. Fixed because
+// the signer is general, which is the same reason the space encoding was.
+func TestAQueryThatCannotBeReadFaithfullyIsRefused(t *testing.T) {
+	creds := Credentials{AccessKeyID: vectorKey, SecretAccessKey: vectorSecret}
+
+	for name, raw := range map[string]string{
+		"a semicolon separator": "a=1;b=2",
+		"a bad escape":          "a=1&b=%zz",
+	} {
+		t.Run(name, func(t *testing.T) {
+			req := vectorRequest(t)
+			req.URL.RawQuery = raw
+
+			err := sign(req, []byte(vectorBody), creds, vectorRegion, vectorTime())
+			if err == nil {
+				t.Fatal("a query billet cannot reproduce was signed anyway; the signature " +
+					"would cover something the wire does not send")
+			}
+
+			if req.Header.Get("Authorization") != "" {
+				t.Error("a refused signing still set an Authorization header")
+			}
+		})
+	}
+
+	// And an ordinary query still signs, or this would be a refusal of everything.
+	req := vectorRequest(t)
+	req.URL.RawQuery = "b=2&a=1"
+
+	if err := sign(req, []byte(vectorBody), creds, vectorRegion, vectorTime()); err != nil {
+		t.Errorf("an ordinary query was refused: %v", err)
 	}
 }

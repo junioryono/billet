@@ -1,12 +1,14 @@
 package ec2
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -1869,5 +1871,63 @@ func TestATypedNilCredentialSourceIsRefused(t *testing.T) {
 
 	if _, err := New("dep-1", cfg, WithCredentials(typed)); err == nil {
 		t.Fatal("a typed-nil credential source was accepted; the first signed call would panic")
+	}
+}
+
+// A CONTRACT NOTHING ENFORCES FAILS SILENTLY.
+//
+// billet sets DeleteOnTermination for the ROOT device and cannot set it for the
+// others without restating every mapping — so an image declaring an extra EBS
+// volume with the flag false leaks one volume PER JOB, tagged and billed and
+// discoverable only by somebody going to look. The AMI documentation can say not
+// to; only this says it at the moment it matters.
+func TestAnImageWhoseVolumesOutliveItIsReported(t *testing.T) {
+	f := newFakeEC2(t)
+	f.respond = func(action string, params url.Values) (int, string) {
+		if action != "DescribeImages" {
+			return http.StatusOK, defaultReply(action)
+		}
+
+		return http.StatusOK, `<DescribeImagesResponse><imagesSet><item>` +
+			`<imageId>ami-0abc</imageId><rootDeviceName>/dev/xvda</rootDeviceName>` +
+			`<blockDeviceMapping>` +
+			// The root, which billet sets itself — not worth a warning.
+			`<item><deviceName>/dev/xvda</deviceName><ebs>` +
+			`<deleteOnTermination>false</deleteOnTermination></ebs></item>` +
+			// A second volume the image keeps. This is the one.
+			`<item><deviceName>/dev/sdb</deviceName><ebs>` +
+			`<deleteOnTermination>false</deleteOnTermination></ebs></item>` +
+			// And one that is fine.
+			`<item><deviceName>/dev/sdc</deviceName><ebs>` +
+			`<deleteOnTermination>true</deleteOnTermination></ebs></item>` +
+			`</blockDeviceMapping></item></imagesSet></DescribeImagesResponse>`
+	}
+
+	var logged bytes.Buffer
+
+	p := newTestProvider(t, f, nil)
+	p.log = slog.New(slog.NewTextHandler(&logged, nil))
+
+	spec := validSpec()
+	spec.Disk = 80 * config.GiB
+
+	if _, err := p.Launch(t.Context(), spec); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	got := logged.String()
+
+	if !strings.Contains(got, "/dev/sdb") {
+		t.Errorf("the volume that outlives its instance was not reported: %s", got)
+	}
+
+	// THE ROOT IS NOT REPORTED, because billet sets that one itself — a warning
+	// about something already handled is how an operator learns to ignore them.
+	if strings.Contains(got, "/dev/xvda") {
+		t.Errorf("the root device was reported despite billet setting its flag: %s", got)
+	}
+
+	if strings.Contains(got, "/dev/sdc") {
+		t.Errorf("a volume that is already deleted on termination was reported: %s", got)
 	}
 }
