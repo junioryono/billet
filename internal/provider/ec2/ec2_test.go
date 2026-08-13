@@ -2273,11 +2273,16 @@ func TestAVolumeMarkedWithTheOtherBooleanSpellingIsStillReported(t *testing.T) {
 // fixture's root says NOTHING, so the exception never shows here — which is
 // exactly why the sentence above has to name it.
 //
-// AND THE ROOT WARNING MUST STAY SILENT, which is the other half of the rule and
-// the half nothing asserted until a reviewer went looking for a mutant that
-// survives: billet speaks when it contradicts the image and is silent when it
-// merely fills a gap. This fixture contradicts nothing, so nothing should be
-// said.
+// AND THE ROOT OVERRIDE WARNING MUST STAY SILENT, which is the half nothing
+// asserted until a reviewer went looking for a surviving mutant: billet speaks
+// when it contradicts the image's intent and is silent when it merely fills a gap
+// in it. This fixture's root states nothing, so there is no intent to contradict.
+//
+// THAT IS NOT THE SAME AS SAYING NOTHING. Two of these mappings carry a flag
+// billet cannot read, and each gets a line on the OTHER channel — not a statement
+// about what the image meant, but about a response outside everything measured.
+// Both are asserted below, because a warning nothing checks is a warning that can
+// silently stop happening.
 func TestEveryImageDeviceLaunchesWithAnExplicitTerminationFlag(t *testing.T) {
 	f := newFakeEC2(t)
 	f.respond = func(action string, params url.Values) (int, string) {
@@ -2293,8 +2298,9 @@ func TestEveryImageDeviceLaunchesWithAnExplicitTerminationFlag(t *testing.T) {
 			// passed every test while this fixture led with it — a data volume
 			// arriving first would then be swallowed as the root and never restated.
 			`<item><deviceName>/dev/sdb</deviceName><ebs></ebs></item>` +
-			// AND THE ROOT SAYS NOTHING, which is the gap-filling case: billet states
-			// true for it and must do so SILENTLY, having contradicted nothing.
+			// AND THE ROOT SAYS NOTHING. billet states true for it without any
+			// OVERRIDE warning, having contradicted no stated intent — while still
+			// reporting, on the other channel, that it could not read the value.
 			`<item><deviceName>/dev/xvda</deviceName><ebs></ebs></item>` +
 			`<item><deviceName>/dev/sdc</deviceName><ebs>` +
 			`<deleteOnTermination>false</deleteOnTermination></ebs></item>` +
@@ -2361,6 +2367,21 @@ func TestEveryImageDeviceLaunchesWithAnExplicitTerminationFlag(t *testing.T) {
 	// by nobody.
 	if !strings.Contains(logged.String(), "level=WARN") {
 		t.Errorf("kept volumes were not reported as warnings: %s", logged.String())
+	}
+
+	// AND EVERY UNREADABLE FLAG IS REPORTED, root included. The root's line is the
+	// one a mutant could drop for free until this existed: it is emitted before the
+	// root branch, so moving the branch above it silences the root alone and every
+	// other assertion here still passes.
+	for _, device := range []string{"/dev/xvda", "/dev/sdb"} {
+		if !strings.Contains(logged.String(), `device=`+device) {
+			t.Errorf("%s carries a flag billet cannot read and was not reported: %s",
+				device, logged.String())
+		}
+	}
+
+	if n := strings.Count(logged.String(), "cannot read"); n != 2 {
+		t.Errorf("%d unreadable flags were reported, want 2 — one per affected device", n)
 	}
 }
 
@@ -2522,6 +2543,82 @@ func TestTheRootIsDeletedEvenWhenTheImageAsksToKeepIt(t *testing.T) {
 
 	if !strings.Contains(logged.String(), "level=WARN") {
 		t.Errorf("the root override was not announced as a warning: %s", logged.String())
+	}
+}
+
+// A FLAG THAT IS NOT A BOOLEAN AT ALL IS REPORTED, NOT QUIETLY OBEYED.
+//
+// The companion to the absent case, and it arrived the same way: a reviewer asked
+// why a response outside everything measured earns a line when it is MISSING but
+// not when it is nonsense. There was no answer, only an accident of how the check
+// was written — every unrecognised value fell through to delete in silence, which
+// is the destructive direction.
+//
+// "False" is the sharp one. It is what a hand-rolled client or a proxy that
+// re-serialises XML would plausibly emit, it is not in xs:boolean's lexical space,
+// and it means the opposite of what billet would have silently done with it.
+func TestAFlagBilletCannotReadIsReported(t *testing.T) {
+	for _, value := range []string{"False", "TRUE", "yes", "  ", "2", "null"} {
+		t.Run(value, func(t *testing.T) {
+			f := newFakeEC2(t)
+			f.respond = func(action string, params url.Values) (int, string) {
+				if action != "DescribeImages" {
+					return http.StatusOK, defaultReply(action)
+				}
+
+				return http.StatusOK, `<DescribeImagesResponse><imagesSet><item>` +
+					`<imageId>ami-0abc</imageId><rootDeviceName>/dev/xvda</rootDeviceName>` +
+					`<blockDeviceMapping>` +
+					`<item><deviceName>/dev/xvda</deviceName><ebs>` +
+					`<deleteOnTermination>true</deleteOnTermination></ebs></item>` +
+					`<item><deviceName>/dev/sdb</deviceName><ebs>` +
+					`<deleteOnTermination>` + value + `</deleteOnTermination></ebs></item>` +
+					`</blockDeviceMapping></item></imagesSet></DescribeImagesResponse>`
+			}
+
+			var logged bytes.Buffer
+
+			p := newTestProvider(t, f, nil)
+			p.log = slog.New(slog.NewTextHandler(&logged, nil))
+
+			if _, err := p.Launch(t.Context(), validSpec()); err != nil {
+				t.Fatalf("Launch: %v", err)
+			}
+
+			got := logged.String()
+
+			if !strings.Contains(got, "cannot read") || !strings.Contains(got, "/dev/sdb") {
+				t.Errorf("%q was resolved without a word: %s", value, got)
+			}
+
+			// AND IT STILL LAUNCHED, stating delete. Reporting the oddity must not
+			// become refusing the job over a field EC2 marks optional.
+			if v := f.paramsFor(t, "RunInstances").Get("BlockDeviceMapping.2.Ebs.DeleteOnTermination"); v != "true" {
+				t.Errorf("the device went out as %q, want true", v)
+			}
+		})
+	}
+}
+
+// THE FOUR TOKENS THAT ARE READABLE ARE READ, and nothing else is.
+//
+// The positive half, so the anomaly channel cannot creep onto ordinary values —
+// a warning that fires on "true" is one an operator stops reading.
+func TestTheFourBooleanTokensAreReadWithoutComplaint(t *testing.T) {
+	for value, want := range map[string]terminationIntent{
+		"true":    intentDelete,
+		"1":       intentDelete,
+		"false":   intentKeep,
+		"0":       intentKeep,
+		" true ":  intentDelete,
+		" false ": intentKeep,
+		"":        intentUnreadable,
+		"False":   intentUnreadable,
+		"yes":     intentUnreadable,
+	} {
+		if got := readTermination(value); got != want {
+			t.Errorf("readTermination(%q) = %v, want %v", value, got, want)
+		}
 	}
 }
 

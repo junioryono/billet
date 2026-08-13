@@ -539,55 +539,58 @@ func (p *Provider) setTags(params url.Values, name string) {
 	params.Set("TagSpecification.2.Tag.2.Value", p.owner)
 }
 
-// survivesTermination reports whether a mapping SAYS its volume outlives the
-// instance.
+// terminationIntent is what one mapping's DeleteOnTermination says, read once.
 //
-// BOTH SPELLINGS, because XML booleans have two: xs:boolean's lexical space is
-// "true"/"false"/"1"/"0". Whether EC2 ever emits the digits is not something this
-// package can answer — nothing in it has spoken to a real AWS account — so the
-// choice is between handling a form that may never arrive and misreading the
-// operator's intent if it does. One comparison, and it fails toward honouring
-// what the image said.
+// THREE STATES, NOT TWO, because "billet cannot read this" is a different thing
+// from "the image said delete" and they were the same value until a reviewer
+// noticed the second was absorbing the first. Absent, whitespace, "False", "yes"
+// and outright garbage all used to become delete in silence.
+type terminationIntent int
+
+const (
+	// intentDelete is "true" or "1": the volume goes when the instance does.
+	intentDelete terminationIntent = iota
+	// intentKeep is "false" or "0": the image asks for the volume to outlive it.
+	intentKeep
+	// intentUnreadable is everything else, including absent.
+	intentUnreadable
+)
+
+// readTermination classifies a mapping's flag.
 //
-// SPELLING THEM OUT IS THE COST OF DECODING THIS AS A STRING, which is the part
-// worth knowing before someone "simplifies" it. encoding/xml runs a bool field
-// through strconv.ParseBool, so a bool would have understood all four lexemes for
-// free — but it also decodes an ABSENT element into the zero value, making absent
-// and "false" indistinguishable. Those two get opposite treatment now (absent is
-// billet's to decide, false is the operator's to keep), so the string decode is
-// forced, and this function puts back the leniency that decision threw away.
+// THE LEXICAL SPACE IS EXACTLY FOUR TOKENS: xs:boolean is "true"/"false"/"1"/"0",
+// and the type carries the `collapse` whitespace facet, so " false " is false and
+// the trim is a correction rather than a courtesy. Untrimmed, a padded "false"
+// read as delete and billet would have overridden a preservation the image did
+// ask for, irreversibly.
 //
-// ABSENT WAS NOT SEEN, which is not the same as impossible — one RegisterImage
-// call in one region on one day read back with the value present, and no image in
-// a 26,044-image Amazon-owned EBS-backed corpus from that same region omitted it.
-// CreateImage, ImportImage, CopyImage, older images and anybody else's images are
-// unmeasured, and the response schema still marks the field optional. This
-// function keeps distinguishing absent for that reason: a decode that cannot tell
-// absent from false is one odd response away from silently honouring a
-// preservation nobody asked for, and the call site treats absent as the anomaly
-// the measurement says it is.
+// EVERYTHING ELSE IS UNREADABLE RATHER THAN DELETE, which is the half that needed
+// a reviewer to see. Decoding this as a string is what makes absent expressible at
+// all — encoding/xml folds an absent element into a bool's zero value, so absent
+// and "false" would have been one state — but the string decode also threw away
+// ParseBool's rejection of values that are not booleans, and this had quietly
+// resolved every one of them in the destructive direction.
 //
-// The rest is measured rather than assumed, and it is measurable precisely
-// because it is Go's behaviour rather than AWS's:
+// That much is measured rather than assumed, and measurable precisely because it
+// is Go's behaviour rather than AWS's:
 //
 //	<ebs></ebs>                       bool=false  string=""
 //	<ebs><d>false</d></ebs>           bool=false  string="false"
 //	<ebs><d>0</d></ebs>               bool=false  string="0"
 //	<ebs><d>1</d></ebs>               bool=true   string="1"
 //
-// The bool column is also where the trimming below comes from: encoding/xml runs
-// it through ParseBool(TrimSpace(src)), so the string path has to trim by hand or
-// it is strictly less correct than the type it replaced.
-func survivesTermination(flag string) bool {
-	// TRIMMED, because the whitespace is not part of the value. xs:boolean carries
-	// the `collapse` whitespace facet, so " false " IS false — and this is the one
-	// place the string decode could quietly diverge from the bool it replaced, since
-	// encoding/xml hands a bool field to ParseBool(TrimSpace(src)) and would have
-	// trimmed for free. Untrimmed, a padded "false" read as delete, and billet would
-	// have overridden a preservation the image did ask for, irreversibly.
-	flag = strings.TrimSpace(flag)
-
-	return flag == "false" || flag == "0"
+// The bool column is also where the trimming comes from: encoding/xml hands a bool
+// field to ParseBool(TrimSpace(src)), so a string path that does not trim is
+// strictly less correct than the type it replaced.
+func readTermination(flag string) terminationIntent {
+	switch strings.TrimSpace(flag) {
+	case "true", "1":
+		return intentDelete
+	case "false", "0":
+		return intentKeep
+	default:
+		return intentUnreadable
+	}
 }
 
 // imageDevice is one block device billet will state explicitly at launch.
@@ -627,7 +630,7 @@ type imageLayout struct {
 //     CopyImage, images registered years ago and images owned by anybody else are
 //     all unobserved. So absent is not proven impossible, only unreached here and
 //     unseen in (3); the code still distinguishes it.
-//  2. AND THE NORMALISED VALUE IS true, INCLUDING FOR A NON-ROOT DEVICE. This is
+//  2. AND THE VALUE SHOWN IS true, INCLUDING FOR A NON-ROOT DEVICE. This is
 //     the reading that lost: [2] says the default is "false for attached volumes",
 //     and under that reading a silent mapping preserves its volume and billet
 //     leaks one disk per job. It does not, on this path. billet sending true for a
@@ -677,12 +680,18 @@ type imageLayout struct {
 // for a size it is the one billet resizes — AWS permits only size, type and this
 // flag to be modified on a root volume, which is very nearly the list of things
 // billet touches. An image whose root says "keep" leaves a full boot disk behind
-// for every job billet launches from it — and since EC2 never produces that flag
-// by omission, somebody meant it, just for a machine that outlives its work rather
+// for every job billet launches from it — and since nothing measured produced that
+// flag by omission, somebody likely meant it, just for a machine that outlives its work rather
 // than for a one-job runner.
-// billet overrides it and SAYS SO, which is the difference that makes
-// the asymmetry honest: billet is silent when it merely fills a gap the image left,
-// and speaks whenever it contradicts something the image actually said.
+// billet overrides it and SAYS SO, which is the difference that makes the asymmetry
+// honest.
+//
+// TWO CHANNELS, WHICH IS WHAT KEEPS THAT RULE TRUE NOW THAT AN UNREADABLE FLAG
+// ALSO WARNS. One channel is about the IMAGE'S INTENT: billet fills a gap in it
+// silently and contradicts it out loud. The other is about the RESPONSE'S
+// EVIDENCE: a value billet cannot read is not a statement of intent at all, it is
+// a response outside everything measured, and it gets one line for that reason
+// rather than for anything the image meant.
 //
 // THE DEVICE NAME IS ASKED FOR RATHER THAN ASSUMED, which is what the lookup buys
 // beyond this. A block device mapping naming a device that is not the AMI's root
@@ -774,7 +783,7 @@ func (p *Provider) imageLayout(ctx context.Context, image string) (imageLayout, 
 			continue
 		}
 
-		stated := survivesTermination(bd.EBS.DeleteOnTermination)
+		intent := readTermination(bd.EBS.DeleteOnTermination)
 
 		// AN OMITTED RESPONSE FLAG IS NOW ANOMALOUS, and that is a change the
 		// measurement bought rather than an old rule reversed.
@@ -793,12 +802,12 @@ func (p *Provider) imageLayout(ctx context.Context, image string) (imageLayout, 
 		// false by omission. But it is resolved by policy on an unmeasured state, and
 		// resolving that quietly is how an assumption stops being visible. Once per
 		// image, like the others.
-		if bd.EBS.DeleteOnTermination == "" {
-			p.log.Warn("this image's block device mapping omits DeleteOnTermination, which no "+
-				"image observed against real EC2 does; billet is stating delete for it, so this "+
-				"job is unaffected, but the response does not look like the ones that were "+
-				"measured",
-				"image", image, "device", bd.DeviceName)
+		if intent == intentUnreadable {
+			p.log.Warn("billet cannot read this device's DeleteOnTermination, and is stating "+
+				"delete for it, so this job is unaffected; the value is either absent or not "+
+				"one of the four an xs:boolean can be, and nothing measured against real EC2 "+
+				"produced that shape",
+				"image", image, "device", bd.DeviceName, "value", bd.EBS.DeleteOnTermination)
 		}
 
 		// THE ROOT IS OVERRIDDEN, AND THAT IS THE ONE CASE BILLET ANNOUNCES ITSELF
@@ -807,7 +816,7 @@ func (p *Provider) imageLayout(ctx context.Context, image string) (imageLayout, 
 		// stated intent reversed, and finding that out from a missing volume is
 		// worse than reading it once.
 		if bd.DeviceName == layout.root {
-			if stated {
+			if intent == intentKeep {
 				p.log.Warn("this image asks to keep its ROOT volume, and billet is overriding "+
 					"that to delete: the root is the disk this instance boots and discards with "+
 					"the job, and the one billet resizes when a tier asks for a size, "+
@@ -821,7 +830,7 @@ func (p *Provider) imageLayout(ctx context.Context, image string) (imageLayout, 
 
 		keep := "true"
 
-		if stated {
+		if intent == intentKeep {
 			// THE IMAGE SAID SO, so billet says it back rather than overruling it.
 			keep = "false"
 
