@@ -228,13 +228,43 @@ func TestTheEnvironmentIsReadEachTimeAndTheTokenIsNotTrimmed(t *testing.T) {
 // An earlier version of this test asserted errNoCredentials here and therefore
 // enshrined the fallthrough.
 func TestHalfAnEnvironmentCredentialIsAnErrorRatherThanAnAbsence(t *testing.T) {
-	for name, env := range map[string]map[string]string{
-		"no secret": {"AWS_ACCESS_KEY_ID": "AKID", "AWS_SECRET_ACCESS_KEY": ""},
-		"no key id": {"AWS_ACCESS_KEY_ID": "", "AWS_SECRET_ACCESS_KEY": "s"},
+	for name, tc := range map[string]struct {
+		env  map[string]string
+		want string
+	}{
+		"no secret": {
+			env:  map[string]string{"AWS_ACCESS_KEY_ID": "AKID", "AWS_SECRET_ACCESS_KEY": ""},
+			want: "AWS_SECRET_ACCESS_KEY",
+		},
+		"no key id": {
+			env:  map[string]string{"AWS_ACCESS_KEY_ID": "", "AWS_SECRET_ACCESS_KEY": "s"},
+			want: "AWS_ACCESS_KEY_ID",
+		},
+		// A session token alone is half a credential too, and reading it as an
+		// absence let the chain move on to a different identity.
+		"only a session token": {
+			env: map[string]string{
+				"AWS_ACCESS_KEY_ID": "", "AWS_SECRET_ACCESS_KEY": "", "AWS_SESSION_TOKEN": "tok",
+			},
+			want: "AWS_SESSION_TOKEN",
+		},
+		// AND A BLANK ONE COUNTS AS SET. The token is opaque and presented byte for
+		// byte, so billet has no basis for deciding spaces were not meant.
+		"a blank session token": {
+			env: map[string]string{
+				"AWS_ACCESS_KEY_ID": "", "AWS_SECRET_ACCESS_KEY": "", "AWS_SESSION_TOKEN": " ",
+			},
+			want: "AWS_SESSION_TOKEN",
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			for k, v := range env {
-				t.Setenv(k, v)
+			// EVERY VARIABLE IS SET EXPLICITLY, including the ones a case leaves
+			// empty: these read the real environment, so a developer's own
+			// AWS_SESSION_TOKEN would otherwise decide the outcome.
+			for _, k := range []string{
+				"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
+			} {
+				t.Setenv(k, tc.env[k])
 			}
 
 			err := func() error {
@@ -252,12 +282,11 @@ func TestHalfAnEnvironmentCredentialIsAnErrorRatherThanAnAbsence(t *testing.T) {
 					"through to the instance role: %v", err)
 			}
 
-			// The message has to name the variable that is missing, or an operator
-			// is told only that something is wrong with credentials they can see.
-			for _, want := range []string{"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"} {
-				if !strings.Contains(err.Error(), want) {
-					t.Errorf("the error does not name %s: %v", want, err)
-				}
+			// The message has to name the variable this case is about, or an
+			// operator is told only that something is wrong with credentials they
+			// can see.
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("the error does not name %s: %v", tc.want, err)
 			}
 		})
 	}
@@ -292,6 +321,9 @@ type fakeIMDS struct {
 	// tokens counts how many session tokens were issued, which is how a test can
 	// see whether a value was served from cache.
 	tokens int
+	// attempts counts every request, so a test can tell "IMDS refused" from
+	// "IMDS was never reached".
+	attempts int
 	// noRole models an instance with no instance profile attached: IMDS works
 	// perfectly and simply has nothing to give, which is an ABSENCE rather than a
 	// failure and is the only thing a chain may continue past.
@@ -317,6 +349,8 @@ func newFakeIMDS(t *testing.T, keyID string, expires time.Time) *fakeIMDS {
 	f := &fakeIMDS{}
 
 	f.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.attempts++
+
 		switch {
 		case r.Method == http.MethodPut && r.URL.Path == "/latest/api/token":
 			if f.v1Only {
@@ -478,8 +512,14 @@ func TestAChainWithNothingReportsWhatEachSourceSaid(t *testing.T) {
 		t.Errorf("a chain whose every source was empty did not report an absence: %v", err)
 	}
 
-	if !strings.Contains(err.Error(), "imds") {
-		t.Errorf("the instance role's reason was lost from the chain's error: %v", err)
+	// BOTH REASONS, named distinguishably. Asserting only the last one is satisfied
+	// by an implementation that returns just the last one, which is the thing this
+	// test exists to refuse.
+	for _, want := range []string{"no aws credentials", "instance profile"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("a source's reason was lost from the chain's error (%q missing): %v",
+				want, err)
+		}
 	}
 }
 
@@ -492,8 +532,13 @@ func TestAChainWithNothingReportsWhatEachSourceSaid(t *testing.T) {
 // here" and carried on to a different AWS identity: the same fallthrough, one
 // level up, through the very function that was supposed to have closed it.
 func TestANestedChainDoesNotLaunderATerminalFailureIntoAnAbsence(t *testing.T) {
-	t.Setenv("AWS_ACCESS_KEY_ID", "")
-	t.Setenv("AWS_SECRET_ACCESS_KEY", "")
+	// ALL THREE, because these read the real environment: a developer with an
+	// AWS_SESSION_TOKEN in their shell would make EnvCredentials fail terminally
+	// before IMDS was reached, and this test would then pass against the very
+	// implementation it exists to refuse.
+	for _, k := range []string{"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"} {
+		t.Setenv(k, "")
+	}
 
 	broken := newFakeIMDS(t, "", time.Time{})
 	broken.v1Only = true
@@ -503,6 +548,13 @@ func TestANestedChainDoesNotLaunderATerminalFailureIntoAnAbsence(t *testing.T) {
 
 	if _, err := inner.Credentials(t.Context()); errors.Is(err, errNoCredentials) {
 		t.Fatalf("a chain that stopped at a broken source reported an absence: %v", err)
+	}
+
+	// AND THE BREAKAGE REALLY CAME FROM IMDS. If the environment had failed
+	// terminally instead, the assertion above would hold for the wrong reason.
+	if broken.attempts == 0 {
+		t.Fatal("the inner chain never reached the metadata service, so the terminal failure " +
+			"under test never happened")
 	}
 
 	// And an outer chain therefore stops rather than reaching the fallback.
@@ -607,4 +659,96 @@ func TestNoSourceReportsAbsenceWhenItIsMerelyHalfConfigured(t *testing.T) {
 	if _, err := (StaticCredentials{}).Credentials(t.Context()); !errors.Is(err, errNoCredentials) {
 		t.Errorf("an empty source did not report absence, so a chain would stop at it: %v", err)
 	}
+}
+
+// A CREDENTIAL DOCUMENT MISSING A FIELD FAILS IN WAYS THAT DO NOT LOOK LIKE A
+// CREDENTIAL PROBLEM, which is why each one is refused rather than tolerated.
+//
+// No Token: temporary credentials cannot authenticate without one, so every call
+// comes back 403 and nothing says why. No Expiration: billet reads the zero time
+// as "never expires", caches the document for the life of the process, and starts
+// failing the moment AWS rotates it — hours later, with nothing having changed.
+func TestAnIncompleteIMDSDocumentIsRefusedRatherThanCached(t *testing.T) {
+	for name, doc := range map[string]map[string]any{
+		"no session token": {
+			"Code": "Success", "AccessKeyId": "AKID", "SecretAccessKey": "s",
+			"Expiration": time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+		},
+		"no expiry": {
+			"Code": "Success", "AccessKeyId": "AKID", "SecretAccessKey": "s", "Token": "tok",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodPut:
+					write(t, w, "t")
+				case strings.HasSuffix(r.URL.Path, "security-credentials/"):
+					write(t, w, "role\n")
+				default:
+					body, err := json.Marshal(doc)
+					if err != nil {
+						t.Errorf("marshal: %v", err)
+
+						return
+					}
+
+					write(t, w, string(body))
+				}
+			}))
+
+			t.Cleanup(srv.Close)
+
+			_, err := (&IMDSCredentials{Endpoint: srv.URL}).Credentials(t.Context())
+			if err == nil {
+				t.Fatal("an incomplete credential document was accepted")
+			}
+
+			// AND IT IS NOT AN ABSENCE, or a chain would carry on past a metadata
+			// service that answered with something malformed.
+			if errors.Is(err, errNoCredentials) {
+				t.Errorf("a malformed document reported an absence: %v", err)
+			}
+		})
+	}
+}
+
+// A CANCELLED LOOKUP MUST STILL LOOK CANCELLED.
+//
+// Closing the sentinel-laundering by flattening every error to text also flattened
+// context.Canceled and context.DeadlineExceeded, which callers filter on — a rule
+// this project already wrote down for the GitHub onboarding chain: identity is
+// preserved wherever it can be, and only the node whose own text carries a secret
+// is replaced. Here only the earlier ABSENCES need to leave the unwrap graph.
+func TestATerminalFailureKeepsItsIdentityThroughTheChain(t *testing.T) {
+	for _, k := range []string{"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"} {
+		t.Setenv(k, "")
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	// Env reports an absence, then a cancelled lookup fails terminally behind it.
+	chain := ChainCredentials{EnvCredentials{}, cancelledSource{}}
+
+	_, err := chain.Credentials(ctx)
+	if err == nil {
+		t.Fatal("a cancelled chain reported success")
+	}
+
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("the chain lost the cancellation, so a caller filtering on it sees an "+
+			"ordinary failure: %v", err)
+	}
+
+	// And it still is not an absence, or the laundering would be back.
+	if errors.Is(err, errNoCredentials) {
+		t.Errorf("a cancelled chain reported an absence: %v", err)
+	}
+}
+
+type cancelledSource struct{}
+
+func (cancelledSource) Credentials(ctx context.Context) (Credentials, error) {
+	return Credentials{}, fmt.Errorf("ec2: read credentials: %w", ctx.Err())
 }

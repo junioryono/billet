@@ -139,9 +139,9 @@ func (s StaticCredentials) Credentials(context.Context) (Credentials, error) {
 		return Credentials{}, errNoCredentials
 
 	case s.AccessKeyID == "" || s.SecretAccessKey == "":
-		return Credentials{}, errors.New("ec2: these credentials have only one half of an " +
-			"access key and a secret; refusing to fall through to another source, which would " +
-			"run billet as a different aws identity")
+		return Credentials{}, errors.New("ec2: these credentials are missing an access key id " +
+			"or a secret access key; a session token signs nothing on its own, and falling " +
+			"through to another source would run billet as a different aws identity")
 	}
 
 	return Credentials(s), nil
@@ -172,18 +172,30 @@ func (EnvCredentials) Credentials(context.Context) (Credentials, error) {
 	// different identity than the one somebody configured.
 	token := os.Getenv("AWS_SESSION_TOKEN")
 
+	// PRESENCE IS NON-EMPTY, NOT NON-BLANK, for the token alone. It is opaque and
+	// presented byte for byte, so billet has no basis for deciding that a value
+	// made of spaces was not meant — and treating it as absent would let the chain
+	// move on to a different identity, which is what all of this is about. The two
+	// beside it are from restricted alphabets, so trimming them is a rescue rather
+	// than a guess.
 	switch {
-	case id == "" && secret == "" && strings.TrimSpace(token) == "":
+	case id == "" && secret == "" && token == "":
 		return Credentials{}, errNoCredentials
 
+	case id == "" && secret == "":
+		return Credentials{}, errors.New("ec2: AWS_SESSION_TOKEN is set and neither " +
+			"AWS_ACCESS_KEY_ID nor AWS_SECRET_ACCESS_KEY is; a session token signs nothing on " +
+			"its own, and billet will not fall back to this instance's role, which would run " +
+			"it as a different aws identity than the one you configured")
+
 	case id == "":
-		return Credentials{}, errors.New("ec2: AWS_SECRET_ACCESS_KEY is set and " +
-			"AWS_ACCESS_KEY_ID is not; refusing to fall back to this instance's role, which " +
+		return Credentials{}, errors.New("ec2: AWS_ACCESS_KEY_ID is not set while another " +
+			"AWS_ credential variable is; refusing to fall back to this instance's role, which " +
 			"would run billet as a different aws identity than the one you configured")
 
 	case secret == "":
-		return Credentials{}, errors.New("ec2: AWS_ACCESS_KEY_ID is set and " +
-			"AWS_SECRET_ACCESS_KEY is not; refusing to fall back to this instance's role, which " +
+		return Credentials{}, errors.New("ec2: AWS_SECRET_ACCESS_KEY is not set while another " +
+			"AWS_ credential variable is; refusing to fall back to this instance's role, which " +
 			"would run billet as a different aws identity than the one you configured")
 	}
 
@@ -448,12 +460,25 @@ func (c ChainCredentials) Credentials(ctx context.Context) (Credentials, error) 
 			// CredentialSource and DefaultCredentials returns one, so an outer chain
 			// read that as "nothing here" and carried on to another AWS identity:
 			// exactly the fallthrough this was tightened to prevent, one level up.
-			reasons := make([]string, 0, len(errs)+1)
-			for _, e := range append(errs, err) {
+			// THE TERMINAL ERROR IS WRAPPED; ONLY THE EARLIER ABSENCES BECOME TEXT.
+			//
+			// Flattening everything to a string closed the laundering and broke a
+			// rule this project already wrote down: identity is preserved wherever it
+			// can be, because errors.Is against context.Canceled and
+			// context.DeadlineExceeded depends on it — and a cancelled credential
+			// lookup is an ordinary way for this to fail. Only the absences need to
+			// leave the unwrap graph, and this branch has already established the
+			// terminal error is not one.
+			if len(errs) == 0 {
+				return Credentials{}, err
+			}
+
+			reasons := make([]string, 0, len(errs))
+			for _, e := range errs {
 				reasons = append(reasons, e.Error())
 			}
 
-			return Credentials{}, errors.New(strings.Join(reasons, "; "))
+			return Credentials{}, fmt.Errorf("%s; %w", strings.Join(reasons, "; "), err)
 		}
 
 		errs = append(errs, err)
