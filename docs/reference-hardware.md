@@ -113,7 +113,9 @@ page](https://www.supermicro.com/en/products/motherboard/h12ssl-ct), the board
 carries **8× SATA3**, **2× M.2** (PCIe 4.0 ×4, M-key, 2280/22110), and a
 **Broadcom 3008 SAS3** controller. The two M.2 sockets are real and confirmed —
 useful, because a mirrored pair of NVMe drives is the natural home for the
-control-plane database and golden images.
+control-plane database, which is the one thing here that is not disposable.
+Golden images do not live on the mirror: they are RBD images in the Ceph pools
+below, so that a second machine can map them rather than be sent a copy.
 
 The SAS3008 provides **eight SAS device ports through two Mini-SAS HD
 connectors** — each connector breaks out to four drives. The product page counts
