@@ -266,11 +266,27 @@ func (i *IMDSCredentials) MarshalJSON() ([]byte, error) { return json.Marshal(i.
 // LogValue is what slog consults, and slog does not consult fmt.
 func (i *IMDSCredentials) LogValue() slog.Value { return slog.StringValue(i.redacted()) }
 
+// redacted TOUCHES NOTHING GUARDED BY THE MUTEX, deliberately.
+//
+// The obvious implementation reads `cached` under `i.mu` so it can name the key
+// id it holds. That builds a deadlock and hands somebody the loaded gun: the
+// whole reason this type has a String is so it can be printed, and
+// `Credentials()` holds `i.mu` across the entire fetch — so the first
+// `log.Warn("...", "source", i)` added inside that critical section wedges the
+// node, at the moment credentials are being resolved. Reading the field without
+// the lock instead is a data race.
+//
+// So it says nothing about the cached value at all. Which key is held is a
+// question for the resolved Credentials, which redacts and shows its own key id;
+// the SOURCE only has to be safe to print. Endpoint is written once at
+// construction and never after.
 func (i *IMDSCredentials) redacted() string {
-	i.mu.Lock()
-	defer i.mu.Unlock()
+	endpoint := i.Endpoint
+	if endpoint == "" {
+		endpoint = defaultIMDSEndpoint
+	}
 
-	return "ec2.IMDSCredentials{" + i.cached.redacted() + "}"
+	return "ec2.IMDSCredentials{endpoint=" + endpoint + ", cached=REDACTED}"
 }
 
 // imdsTimeout bounds the metadata lookup.
