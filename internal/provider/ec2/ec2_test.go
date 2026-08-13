@@ -3,6 +3,7 @@ package ec2
 import (
 	"context"
 	"encoding/base64"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -1610,4 +1611,99 @@ func TestABootScriptTooLargeForEC2IsRefusedLocally(t *testing.T) {
 	if n := f.countOf("RunInstances"); n != 0 {
 		t.Errorf("a launch that cannot succeed still called RunInstances %d times", n)
 	}
+}
+
+// THE THREAT IS AN ECHO OF THE RAW BODY, WHICH IS NOT THE SECRET IN ANY FORM
+// BILLET HOLDS.
+//
+// The registration travels as base64 inside a form-encoded body, so an
+// intermediary that repeats what it received contains neither the raw
+// registration nor the raw base64 — it contains the URL-escaped version of the
+// second. Substituting known forms out of the message was tried first and could
+// not cover that: any list of encodings is a guess at what somebody else did.
+//
+// This fake echoes the body EXACTLY as it arrived, which is the case the earlier
+// fake could not produce because it parsed the form before echoing.
+func TestALaunchErrorCannotCarryTheRegistrationInAnyEncoding(t *testing.T) {
+	spec := validSpec()
+
+	var raw string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read body: %v", err)
+
+			return
+		}
+
+		if strings.Contains(string(body), "RunInstances") {
+			raw = string(body)
+
+			// ESCAPED, so the document PARSES and the code is available. An
+			// unescaped body breaks the XML, billet falls back to reporting the
+			// status alone, and the test would pass without the message ever having
+			// been rendered — proving nothing about the thing under test.
+			var escaped strings.Builder
+			if err := xml.EscapeText(&escaped, body); err != nil {
+				t.Errorf("escape: %v", err)
+
+				return
+			}
+
+			w.WriteHeader(http.StatusBadRequest)
+			write(t, w, `<Response><Errors><Error><Code>InvalidParameterValue</Code>`+
+				`<Message>rejected: `+escaped.String()+`</Message></Error></Errors></Response>`)
+
+			return
+		}
+
+		write(t, w, defaultReply("DescribeImages"))
+	}))
+
+	t.Cleanup(srv.Close)
+
+	p := newTestProvider(t, newFakeEC2(t), func(c *config.EC2Config) { c.Endpoint = srv.URL })
+	p.api.sleep = func(context.Context, time.Duration) error { return nil }
+
+	_, err := p.Launch(t.Context(), spec)
+	if err == nil {
+		t.Fatal("a rejected launch reported success")
+	}
+
+	if raw == "" {
+		t.Fatal("the fake never saw a RunInstances body, so this proves nothing")
+	}
+
+	// The body really did contain the registration, or the test would be vacuous.
+	if !strings.Contains(raw, url.QueryEscape(base64.StdEncoding.EncodeToString(
+		[]byte(mustUserData(t, p, spec))))) {
+		t.Fatal("the request body did not carry the encoded boot script, so this test is not " +
+			"exercising the case it names")
+	}
+
+	for _, secret := range []string{
+		spec.JITConfig,
+		base64.StdEncoding.EncodeToString([]byte(mustUserData(t, p, spec))),
+		url.QueryEscape(base64.StdEncoding.EncodeToString([]byte(mustUserData(t, p, spec)))),
+	} {
+		if strings.Contains(err.Error(), secret) {
+			t.Errorf("the launch error carries the registration: %v", err)
+		}
+	}
+
+	if !strings.Contains(err.Error(), "InvalidParameterValue") {
+		t.Errorf("the error lost the api's own code, which is what an operator acts on: %v", err)
+	}
+}
+
+func mustUserData(t *testing.T, p *Provider, spec provider.Spec) string {
+	t.Helper()
+
+	script, err := p.userData(spec)
+	if err != nil {
+		t.Fatalf("userData: %v", err)
+	}
+
+	return script
 }

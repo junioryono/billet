@@ -518,3 +518,31 @@ func TestAnInstanceWithNoRoleSaysSo(t *testing.T) {
 		t.Errorf("the error does not say what to do instead: %v", err)
 	}
 }
+
+// THE SENTINEL'S MEANING HAS TO HOLD FOR EVERY SOURCE, not just the one where it
+// was noticed. errNoCredentials means "nothing here, try the next"; anything else
+// stops the chain. A half-filled source reporting an absence falls through to a
+// different AWS identity, which is the whole failure the distinction prevents.
+func TestNoSourceReportsAbsenceWhenItIsMerelyHalfConfigured(t *testing.T) {
+	for name, src := range map[string]CredentialSource{
+		"static with no secret": StaticCredentials{AccessKeyID: "AKID"},
+		"static with no key id": StaticCredentials{SecretAccessKey: "s"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := src.Credentials(t.Context())
+			if err == nil {
+				t.Fatal("half a credential was accepted")
+			}
+
+			if errors.Is(err, errNoCredentials) {
+				t.Errorf("a half-configured source reported ABSENCE, so a chain would fall "+
+					"through it to another identity: %v", err)
+			}
+		})
+	}
+
+	// And genuinely empty still means "try the next one", or a chain stops working.
+	if _, err := (StaticCredentials{}).Credentials(t.Context()); !errors.Is(err, errNoCredentials) {
+		t.Errorf("an empty source did not report absence, so a chain would stop at it: %v", err)
+	}
+}
