@@ -213,28 +213,83 @@ func execRunner(ctx context.Context, bin string, args []string) ([]byte, error) 
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.WaitDelay = waitDelay
 
-	var stderr strings.Builder
-	cmd.Stderr = &stderr
+	stderr := &tailWriter{limit: maxDiagnostic}
+	cmd.Stderr = stderr
 
 	out, err := cmd.Output()
 	if err == nil {
 		return out, nil
 	}
 
-	// THE DEADLINE IS REPORTED AS THE DEADLINE. A killed process comes back as
-	// `signal: killed`, so a caller asking errors.Is(err, context.DeadlineExceeded)
-	// — the only way to tell "the cluster never answered" from "rbd said no" — gets
-	// false unless the context is consulted here.
+	// WHAT THE PROCESS SAID WINS OVER WHAT THE CLOCK SAYS, and the order here is
+	// the whole point. A process the context killed comes back as `signal: killed`,
+	// which has no exit code — but a process that EXITED on its own has one, and
+	// the context can still expire afterwards while WaitDelay drains a pipe a
+	// descendant is holding. Consulting the clock first would replace `(2) No such
+	// file or directory` with a timeout, throwing away the sentence this whole
+	// function exists to carry.
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() >= 0 {
+		if msg := stderr.String(); msg != "" {
+			return nil, fmt.Errorf("%w: %s", err, lastLine(msg))
+		}
+
+		return nil, err
+	}
+
+	// THE DEADLINE IS REPORTED AS THE DEADLINE. Without this a caller asking
+	// errors.Is(err, context.DeadlineExceeded) — the only way to tell "the cluster
+	// never answered" from "rbd said no" — gets false for the one condition it
+	// exists to name.
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return nil, fmt.Errorf("%s did not answer: %w", filepath.Base(bin), ctxErr)
 	}
 
-	if msg := strings.TrimSpace(stderr.String()); msg != "" {
+	if msg := stderr.String(); msg != "" {
 		return nil, fmt.Errorf("%w: %s", err, lastLine(msg))
 	}
 
 	return nil, err
 }
+
+// tailWriter keeps the last limit bytes written to it and discards the rest.
+//
+// STDERR IS ANOTHER PROGRAM'S OUTPUT AND ITS SIZE IS ITS OWN CHOICE. Collecting it
+// into a strings.Builder bounds the time an invocation may take and not the memory
+// it may take, so a wrong or broken executable can allocate for the whole timeout.
+// Keeping the TAIL rather than the head is what makes the bound compatible with
+// lastLine: librados prints its connection logging first and the sentence that
+// matters last.
+type tailWriter struct {
+	limit int
+	buf   []byte
+}
+
+func (w *tailWriter) Write(p []byte) (int, error) {
+	n := len(p)
+
+	// TWO TRIMS, AND THE FIRST ONE IS NOT REDUNDANT even though deleting it leaves
+	// every observable behaviour identical — which is why its mutation survives, and
+	// the redundancy is said out loud here rather than assumed. It bounds the PEAK
+	// allocation of a single write: without it a lone 10GB write is appended in full
+	// and only then trimmed, which is the allocation this type exists to prevent.
+	// The second trim bounds what ACCUMULATES across writes, which the first cannot.
+	if len(p) > w.limit {
+		p = p[len(p)-w.limit:]
+	}
+
+	w.buf = append(w.buf, p...)
+	if len(w.buf) > w.limit {
+		w.buf = w.buf[len(w.buf)-w.limit:]
+	}
+
+	// The length WRITTEN TO US, never the length kept: io.Writer's contract makes a
+	// short count an error, so reporting what survived the trim would make exec
+	// conclude the pipe broke and abandon a healthy command.
+	return n, nil
+}
+
+func (w *tailWriter) String() string { return strings.TrimSpace(string(w.buf)) }
 
 // maxDiagnostic bounds how much of rbd's output reaches a terminal or a log.
 const maxDiagnostic = 300

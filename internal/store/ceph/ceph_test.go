@@ -17,8 +17,11 @@ import (
 // valid is a storage block that passes config.CheckCeph, so a case can change
 // exactly the field it is about.
 func valid() config.CephConfig {
+	// DELIBERATELY NOT DefaultCephUser: a client that hard-coded the default
+	// instead of reading the configured identity would pass every assertion that
+	// used "billet" as the fixture.
 	return config.CephConfig{
-		User:      "billet",
+		User:      "site-reader",
 		ImagePool: "billet-images",
 		CachePool: "billet-cache",
 	}
@@ -86,8 +89,8 @@ func TestTheInvocationNamesTheIdentityAndThePool(t *testing.T) {
 	// "--id billet --format json -p billet-images ls" would satisfy every
 	// Contains check and produce an invocation rbd cannot parse.
 	for i, want := range [][]string{
-		{"--id", "billet", "--format", "json", "-p", "billet-images", "ls"},
-		{"--id", "billet", "--format", "json", "-p", "billet-cache", "ls"},
+		{"--id", "site-reader", "--format", "json", "-p", "billet-images", "ls"},
+		{"--id", "site-reader", "--format", "json", "-p", "billet-cache", "ls"},
 	} {
 		if !slices.Equal(rec.calls[i], want) {
 			t.Errorf("call %d = %q, want %q", i, rec.calls[i], want)
@@ -100,7 +103,7 @@ func TestTheInvocationNamesTheIdentityAndThePool(t *testing.T) {
 		t.Errorf("report = %+v, want 1 image and 2 caches", report)
 	}
 
-	if report.User != "billet" {
+	if report.User != "site-reader" {
 		t.Errorf("report names %q rather than the identity that answered", report.User)
 	}
 }
@@ -157,11 +160,11 @@ func TestAConfiguredPathIsPassed(t *testing.T) {
 // THE CONSTRUCTOR RE-APPLIES THE CONFIG RULES, because it is exported and cannot
 // assume its argument came through config.Load.
 //
-// Two of them are load-bearing in this package specifically. A pool name is the
-// value of `-p`, so one beginning with a dash is read by rbd as a flag — billet
-// builds an argv rather than a shell command, and nothing in exec quotes a value
-// out of being an option. And `admin` would put a key that can delete a pool in
-// the hands of a process whose whole job is reading two of them.
+// Two of them are load-bearing in this package specifically. A pool name is half
+// of the positional `pool/image` specs billet builds, where rbd reads a leading
+// dash as an option it does not recognise — measured, and NOT true of `-p`, which
+// consumes whatever token follows it. And `admin` would put a key that can delete
+// a pool in the hands of a process whose whole job is reading two of them.
 func TestTheConstructorRefusesWhatTheConfigWould(t *testing.T) {
 	t.Parallel()
 
@@ -176,9 +179,9 @@ func TestTheConstructorRefusesWhatTheConfigWould(t *testing.T) {
 			want:   "can delete the pools",
 		},
 		{
-			name:   "a pool rbd would read as a flag",
+			name:   "a pool rbd would read as an option",
 			mutate: func(c *config.CephConfig) { c.ImagePool = "-p" },
-			want:   "as a flag",
+			want:   "starting with a dash",
 		},
 		{
 			name:   "no identity at all",
@@ -228,10 +231,17 @@ func TestAFailedListNamesThePoolAndTheIdentity(t *testing.T) {
 		t.Fatal("CheckReachable reported success against a failing rbd")
 	}
 
-	for _, want := range []string{"billet-images", "client.billet", "Operation not permitted"} {
+	for _, want := range []string{"billet-images", "client.site-reader", "Operation not permitted"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("the error does not carry %q: %v", want, err)
 		}
+	}
+
+	// AND IT IS NOT A TIMEOUT. Reporting every failure as a deadline would satisfy
+	// the bounded-invocation test while telling an operator their cluster is
+	// unreachable when rbd answered them clearly.
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("a permission failure was reported as a deadline: %v", err)
 	}
 }
 
@@ -409,10 +419,13 @@ func TestTheRealRunnerIsBounded(t *testing.T) {
 		t.Errorf("the failure is not the deadline: %v", got.err)
 	}
 
-	// Generous, because it must not be flaky: the point is that it returned at
-	// all, far inside the half-minute the subprocess would otherwise have run.
-	if elapsed := time.Since(start); elapsed > 10*time.Second {
-		t.Errorf("execRunner took %s to give up on a process it had killed", elapsed)
+	// AGAINST THE CONFIGURED BOUND, not a round number: a WaitDelay raised to nine
+	// seconds would slip under a flat ten-second assertion while making every
+	// unreachable cluster take nine seconds longer than it should. The slack is for
+	// scheduling, not for a different constant.
+	if budget := waitDelay + 3*time.Second; time.Since(start) > budget {
+		t.Errorf("execRunner took %s to give up on a process it had killed; WaitDelay is %s",
+			time.Since(start), waitDelay)
 	}
 }
 
@@ -453,9 +466,14 @@ func TestOnlyTheLastDiagnosticLineSurvivesAndItIsCapped(t *testing.T) {
 		t.Fatal("execRunner reported success for a command that exited 1")
 	}
 
+	// BOTH BOUNDS, because deriving the threshold from the production constant
+	// alone means raising that constant to 5000 leaves this green.
 	if n := len(err.Error()); n > maxDiagnostic+100 {
 		t.Errorf("a %d-byte diagnostic reached the caller; it is meant to be capped at %d",
 			n, maxDiagnostic)
+	} else if n > 600 {
+		t.Errorf("a %d-byte diagnostic reached the caller; whatever maxDiagnostic says, this is "+
+			"another program's output on an operator's terminal", n)
 	}
 }
 
@@ -493,7 +511,133 @@ func TestAMissingBinaryIsDistinguishable(t *testing.T) {
 func TestAnExplicitBinaryNeedsNoPath(t *testing.T) {
 	t.Setenv("PATH", filepath.Join(t.TempDir(), "empty"))
 
-	if _, err := New(valid(), WithBinary(os.Args[0])); err != nil {
+	var ran string
+
+	c, err := New(valid(), WithBinary(os.Args[0]),
+		withRunner(func(_ context.Context, bin string, _ []string) ([]byte, error) {
+			ran = bin
+
+			return []byte(`[]`), nil
+		}))
+	if err != nil {
 		t.Fatalf("New refused an explicit binary on an empty PATH: %v", err)
+	}
+
+	if _, err := c.CheckReachable(t.Context()); err != nil {
+		t.Fatalf("CheckReachable: %v", err)
+	}
+
+	// THE ONE THAT WAS SUPPLIED, because a constructor that stored the option and
+	// then ran something else would satisfy every other assertion here.
+	if ran != os.Args[0] {
+		t.Errorf("ran %q, want the binary the option named (%q)", ran, os.Args[0])
+	}
+}
+
+// A PROCESS THAT ANSWERED KEEPS ITS ANSWER, even when the clock ran out while the
+// pipes were still draining.
+//
+// The shape: rbd exits non-zero with the sentence that explains why, but a
+// descendant is holding stdout, so Output waits out WaitDelay and the context
+// expires during that wait. Consulting ctx.Err() first would replace
+// `(2) No such file or directory` with a timeout — throwing away exactly what
+// lastLine exists to carry, on the path where an operator most needs it.
+func TestARealFailureSurvivesAnExpiredContext(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 400*time.Millisecond)
+	defer cancel()
+
+	type result struct {
+		out []byte
+		err error
+	}
+
+	done := make(chan result, 1)
+
+	go func() {
+		// The shell writes its diagnostic and exits 2 immediately; the background
+		// `sleep` inherits stdout and holds the pipe open well past the deadline.
+		out, err := execRunner(ctx, "/bin/sh", []string{"-c",
+			"sleep 30 & echo 'rbd: listing images failed: (2) No such file or directory' >&2; exit 2"})
+		done <- result{out, err}
+	}()
+
+	guard := time.NewTimer(15 * time.Second)
+	defer guard.Stop()
+
+	var got result
+
+	select {
+	case got = <-done:
+	case <-guard.C:
+		t.Fatal("execRunner never returned")
+	}
+
+	if got.err == nil {
+		t.Fatal("execRunner reported success for a command that exited 2")
+	}
+
+	if !strings.Contains(got.err.Error(), "No such file or directory") {
+		t.Errorf("the process exited with an explanation and the error does not carry it: %v", got.err)
+	}
+
+	// The context DID expire — that is the whole setup — so this is the assertion
+	// that the ordering is right rather than that the race did not happen.
+	if ctx.Err() == nil {
+		t.Fatal("the context had not expired, so this test did not stage the race it is about")
+	}
+
+	if errors.Is(got.err, context.DeadlineExceeded) {
+		t.Errorf("a process that exited on its own was reported as a timeout: %v", got.err)
+	}
+}
+
+// THE TAIL, NOT THE HEAD, and bounded as it is written rather than afterwards.
+//
+// Collecting all of another program's stderr bounds the time an invocation takes
+// and not the memory, so a broken executable can allocate for the whole timeout.
+// Keeping the tail is what makes the bound compatible with lastLine: librados
+// prints its connection logging first and the sentence that matters last.
+func TestStderrIsBoundedAsItArrives(t *testing.T) {
+	t.Parallel()
+
+	w := &tailWriter{limit: 8}
+
+	for _, chunk := range []string{"aaaa", "bbbb", "cccc"} {
+		n, err := w.Write([]byte(chunk))
+		if err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+
+		// io.Writer's contract: a short count IS an error, and reporting one would
+		// make exec conclude the pipe broke.
+		if n != len(chunk) {
+			t.Errorf("Write reported %d of %d bytes", n, len(chunk))
+		}
+	}
+
+	if got := w.String(); got != "bbbbcccc" {
+		t.Errorf("tail = %q, want the last 8 bytes", got)
+	}
+
+	// One write larger than the whole budget must not grow the buffer either.
+	big := &tailWriter{limit: 4}
+	oversized := []byte(strings.Repeat("x", 10000) + "END")
+
+	n, err := big.Write(oversized)
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	// THE LENGTH WRITTEN, not the length kept. Reporting what survived the trim is
+	// a short count, and io.Writer's contract makes that an error — exec would
+	// conclude the pipe broke and abandon a command that was answering fine.
+	if n != len(oversized) {
+		t.Errorf("Write reported %d of %d bytes for an oversized write", n, len(oversized))
+	}
+
+	if got := big.String(); got != "xEND" {
+		t.Errorf("tail = %q, want the last 4 bytes of one oversized write", got)
 	}
 }

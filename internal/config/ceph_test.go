@@ -65,11 +65,17 @@ func TestAFirecrackerNodeWithoutStorageIsRefused(t *testing.T) {
 func TestStorageOnABackendThatCannotAttachOneIsRefused(t *testing.T) {
 	t.Parallel()
 
-	// EVERY BACKEND THAT IS NOT FIRECRACKER, not just docker. A guard written as
-	// `provider == docker` would pass a single-case test while leaving ec2 — the
-	// one whose compute is in another region entirely — accepting a cluster it can
-	// never reach.
-	for _, provider := range []string{"docker", "ec2", "tart"} {
+	// DERIVED FROM THE PROVIDER LIST, not written out. A guard listing the
+	// backends that exist today passes a test that lists the same ones, and the
+	// next backend added would inherit acceptance from a switch written before it
+	// existed — which is the mistake provider.Classify already exists to avoid.
+	for _, kind := range allProviders {
+		if kind == ProviderFirecracker {
+			continue
+		}
+
+		provider := string(kind)
+
 		t.Run(provider, func(t *testing.T) {
 			t.Parallel()
 
@@ -165,13 +171,14 @@ func TestImagesAndCachesCannotShareAPool(t *testing.T) {
 	}
 }
 
-// A POOL NAME IS PART OF A STRING BILLET BUILDS, so what matters is whether it
-// survives being placed in one.
+// A POOL NAME IS HALF OF A STRING BILLET BUILDS, so what matters is whether the
+// whole string still addresses what it meant to.
 //
-// billet addresses an image as `pool/image`, so the characters worth refusing are
-// the ones that change how that parses. Every case here names a real failure: a
-// slash points at a different pool, an `@` starts a snapshot, `.mgr` is Ceph's
-// own, and a leading dash is read by rbd as a flag.
+// Every case is measured rather than reasoned: Ceph will happily create `a/b`,
+// `a@b` and `a b`, so the refusals are about billet's own `pool/image` and
+// `pool/image@snap` specs — plus a leading dot, which Ceph itself refuses, and a
+// leading dash, which rbd reads as an unrecognised option when the spec is
+// positional.
 func TestAPoolNameBilletCannotAddressIsRefused(t *testing.T) {
 	t.Parallel()
 
@@ -183,9 +190,8 @@ func TestAPoolNameBilletCannotAddressIsRefused(t *testing.T) {
 		{name: "empty", pool: "", want: "is required"},
 		{name: "a slash", pool: "billet/images", want: "different pool"},
 		{name: "a snapshot separator", pool: "billet@images", want: "snapshot name"},
-		{name: "a space", pool: "billet images", want: "round-trip"},
 		{name: "ceph's own namespace", pool: ".mgr", want: "reserves for its"},
-		{name: "something rbd reads as a flag", pool: "-p", want: "as a flag"},
+		{name: "something rbd reads as an option", pool: "-p", want: "starting with a dash"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -305,7 +311,7 @@ func TestCephValuesAreTrimmed(t *testing.T) {
 
 	body := withCeph(t, `  ceph:
     user: "  billet  "
-    image_pool: "  billet-images  "
+    image_pool: "\tbillet-images\t"
     cache_pool: "  billet-cache  "
     conf_path: "  /etc/ceph/ceph.conf  "
     keyring_path: "  /etc/ceph/ceph.client.billet.keyring  "
@@ -430,23 +436,45 @@ func TestAHintIsNotOfferedForADifferentSectionsKey(t *testing.T) {
 	}
 }
 
-// AN IDENTITY IS PLACED IN AN ARGV TOO, and the first version of this rule guarded
-// only pool names.
+// AN IDENTITY THAT WOULD AUTHENTICATE AS SOMETHING ELSE IS REFUSED — and only
+// that, because it is the only shape that survived being measured.
 //
-// billet execs rbd directly, so the user is the value of `--id` and nothing quotes
-// it out of being an option. `client.` is refused as a prefix because rbd adds it
-// itself: `--id client.billet` authenticates as `client.client.billet` and fails
-// with a permission error naming an entity the operator never created.
+// rbd prefixes the value of --id with `client.` itself, so `--id client.billet`
+// asks about `client.client.billet`: against a working cluster it answers
+// `(13) Permission denied` while the plain form lists the pool.
+//
+// The second half of this test is the more important one. A leading dash, a space
+// and a slash were ALSO refused, on the reasoning that they would not survive an
+// argv — and running it says otherwise: --id consumes the next token whatever it
+// starts with, and `ceph auth get-or-create` accepts `client.a/b` and `client.a b`.
+// A rule whose stated reason is untrue is worse than no rule, so those are gone,
+// and this asserts they stay gone.
 func TestAnIdentityBilletCannotPassIsRefused(t *testing.T) {
 	t.Parallel()
 
-	for _, tc := range []struct{ name, user, want string }{
-		{name: "something rbd reads as a flag", user: "-p", want: "as a flag"},
-		{name: "the prefix rbd adds itself", user: "client.billet", want: "rbd adds"},
-		{name: "a space", user: "bil let", want: "whitespace or a slash"},
-		{name: "a slash", user: "billet/node", want: "whitespace or a slash"},
+	t.Run("the prefix rbd adds itself", func(t *testing.T) {
+		t.Parallel()
+
+		errs := CheckCeph(CephConfig{
+			User:      "client.billet",
+			ImagePool: "billet-images",
+			CachePool: "billet-cache",
+		})
+		if len(errs) == 0 {
+			t.Fatal("CheckCeph accepted an identity carrying the client. prefix")
+		}
+
+		if joined := joinErrors(errs); !strings.Contains(joined, "rbd adds") {
+			t.Errorf("the error does not say why it is refused: %s", joined)
+		}
+	})
+
+	for _, tc := range []struct{ name, user string }{
+		{name: "a leading dash, which --id consumes as a value", user: "-weird"},
+		{name: "a slash, which ceph auth accepts", user: "billet/node"},
+		{name: "a space, which ceph auth accepts", user: "bil let"},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
+		t.Run("addressable: "+tc.name, func(t *testing.T) {
 			t.Parallel()
 
 			errs := CheckCeph(CephConfig{
@@ -454,13 +482,58 @@ func TestAnIdentityBilletCannotPassIsRefused(t *testing.T) {
 				ImagePool: "billet-images",
 				CachePool: "billet-cache",
 			})
+			if len(errs) != 0 {
+				t.Errorf("CheckCeph refused %q, which is addressable: %s", tc.user, joinErrors(errs))
+			}
+		})
+	}
+}
+
+// A VALUE exec CANNOT CARRY AT ALL is refused before it can produce a failure that
+// names neither the field nor the byte.
+//
+// YAML can encode a NUL, and one passes every other shape check here — including
+// filepath.IsAbs — while exec rejects the argument before rbd starts.
+func TestANulByteIsRefused(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name  string
+		cfg   CephConfig
+		field string
+	}{
+		{
+			name:  "in the identity",
+			cfg:   CephConfig{User: "bil\x00let", ImagePool: "billet-images", CachePool: "billet-cache"},
+			field: "node.ceph.user",
+		},
+		{
+			name:  "in a pool",
+			cfg:   CephConfig{User: "billet", ImagePool: "billet\x00images", CachePool: "billet-cache"},
+			field: "node.ceph.image_pool",
+		},
+		{
+			name: "in a path",
+			cfg: CephConfig{User: "billet", ImagePool: "billet-images", CachePool: "billet-cache",
+				KeyringPath: "/etc/ceph/k\x00.keyring"},
+			field: "node.ceph.keyring_path",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			errs := CheckCeph(tc.cfg)
 			if len(errs) == 0 {
-				t.Fatalf("CheckCeph accepted user %q", tc.user)
+				t.Fatalf("CheckCeph accepted a NUL %s", tc.name)
 			}
 
 			joined := joinErrors(errs)
-			if !strings.Contains(joined, tc.want) {
-				t.Errorf("the error does not say why %q is refused: %s", tc.user, joined)
+			if !strings.Contains(joined, tc.field) {
+				t.Errorf("the error does not name the field: %s", joined)
+			}
+
+			if !strings.Contains(joined, "NUL") {
+				t.Errorf("the error does not say what is wrong: %s", joined)
 			}
 		})
 	}
@@ -499,9 +572,17 @@ func TestCheckCephRefusesWhatItWouldOtherwiseHaveToTrim(t *testing.T) {
 			want: "node.ceph.conf_path",
 		},
 		{
-			name: "a tab inside a pool name",
-			cfg:  CephConfig{User: "billet", ImagePool: "billet\timages", CachePool: "billet-cache"},
-			want: "contains whitespace",
+			name: "a padded keyring path",
+			cfg: CephConfig{User: "billet", ImagePool: "billet-images", CachePool: "billet-cache",
+				KeyringPath: " /etc/ceph/billet.keyring"},
+			want: "node.ceph.keyring_path",
+		},
+		{
+			// The cache pool is the field a loop written from the image pool
+			// forgets, and it is the one billet writes to on every job.
+			name: "a padded cache pool",
+			cfg:  CephConfig{User: "billet", ImagePool: "billet-images", CachePool: "billet-cache\t"},
+			want: "node.ceph.cache_pool",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -516,5 +597,38 @@ func TestCheckCephRefusesWhatItWouldOtherwiseHaveToTrim(t *testing.T) {
 				t.Errorf("the error does not name what is wrong: %s", joined)
 			}
 		})
+	}
+}
+
+// EVERY REMOVED KEY IS ANSWERED AT ONCE.
+//
+// KnownFields reports all the unknown fields it found in one error, and validation
+// exists to stop an operator fixing one field and re-running to find the next. A
+// hint loop that returns on its first match sends them round again.
+func TestEveryRemovedKeyIsExplainedInOnePass(t *testing.T) {
+	t.Parallel()
+
+	body := strings.Replace(withoutCeph(t), "  state_dir: /var/lib/billet/server\n",
+		"  state_dir: /var/lib/billet/server\n  lock_dir: /run/billet/locks\n", 1)
+	body = strings.Replace(body, "    kernel_image: /var/lib/billet/vmlinux\n",
+		"    kernel_image: /var/lib/billet/vmlinux\n    zfs_pool: tank\n", 1)
+
+	for _, must := range []string{"lock_dir: /run/billet/locks", "zfs_pool: tank"} {
+		if !strings.Contains(body, must) {
+			t.Fatalf("the fixture does not carry %q, so this case patches nothing", must)
+		}
+	}
+
+	_, err := Load(writeConfig(t, body))
+	if err == nil {
+		t.Fatal("Load accepted a config naming two removed keys")
+	}
+
+	if !strings.Contains(err.Error(), "node.lock_dir") {
+		t.Errorf("the error does not say where lock_dir went: %v", err)
+	}
+
+	if !strings.Contains(err.Error(), "node.ceph") {
+		t.Errorf("the error does not say what replaced zfs_pool: %v", err)
 	}
 }
