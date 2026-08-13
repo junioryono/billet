@@ -1569,6 +1569,24 @@ func (p *CephConfig) normalize() {
 // names none. Deliberately not `admin` — see CephConfig.User.
 const DefaultCephUser = "billet"
 
+// DefaultCephConf is where Ceph's own search path finds a cluster's monitors, and
+// therefore where billet is talking to when node.ceph.conf_path says nothing.
+const DefaultCephConf = "/etc/ceph/ceph.conf"
+
+// ConfPathOrDefault names the file this configuration reaches the cluster
+// through, so an operator reading `billet check` can see WHICH cluster answered.
+//
+// An empty conf_path is not "no file" — it is Ceph's search path, which finds
+// DefaultCephConf. Printing the empty string there tells an operator with two
+// clusters nothing at all.
+func (p *CephConfig) ConfPathOrDefault() string {
+	if p == nil || p.ConfPath == "" {
+		return DefaultCephConf
+	}
+
+	return p.ConfPath
+}
+
 // CheckCeph refuses a storage block billet cannot safely act on.
 //
 // EXPORTED AND CALLED FROM BOTH SIDES, like CheckEC2Endpoint and for the same

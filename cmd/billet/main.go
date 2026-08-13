@@ -1853,7 +1853,7 @@ func checkCephCluster(ctx context.Context, cfg *config.CephConfig) error {
 		// WHAT THE CONFIG NAMES, and nothing the sentinel already says. Every
 		// wrapper renders the message beneath it, so repeating the remedy here put
 		// "install ceph-common" on the operator's terminal twice in one sentence.
-		if errors.Is(err, ceph.ErrNoRBD) {
+		if errors.Is(err, ceph.ErrNoClient) {
 			return fmt.Errorf("node.ceph names %s and %s, so this host is meant to run jobs and "+
 				"cannot map a volume: %w", cfg.ImagePool, cfg.CachePool, err)
 		}
@@ -1861,14 +1861,56 @@ func checkCephCluster(ctx context.Context, cfg *config.CephConfig) error {
 		return err
 	}
 
+	// THE REPORT IS PRINTED EVEN WHEN THE CHECK FAILS, when there is one. A cluster
+	// billet reached and then refused has told the operator something — which pools
+	// it found, how they are replicated — and throwing that away because the last
+	// question answered badly makes the diagnostic harder to act on, not easier.
 	report, err := client.CheckReachable(ctx)
+	if report.User != "" {
+		printCephReport(cfg, report)
+	}
+
 	if err != nil {
+		if errors.Is(err, ceph.ErrCloneV1) {
+			return fmt.Errorf("node.ceph: %w", err)
+		}
+
 		return fmt.Errorf("node.ceph: this host could not read the pools it is configured with, "+
 			"so it could not launch anything: %w", err)
 	}
 
-	fmt.Printf("ceph     client.%s -> %s (%d image(s)), %s (%d volume(s))\n",
-		report.User, cfg.ImagePool, report.ImagePool, cfg.CachePool, report.CachePool)
+	return nil
+}
+
+// printCephReport puts what the cluster said on the operator's terminal.
+func printCephReport(cfg *config.CephConfig, report ceph.Report) {
+	fmt.Printf("ceph     client.%s -> %s\n", report.User, cfg.ConfPathOrDefault())
+
+	for _, p := range report.Pools {
+		// THE REPLICATION IS SHOWN RATHER THAN JUDGED, with one exception below.
+		// How many copies a pool keeps is the operator's decision and billet has no
+		// standing to refuse it — but it is invisible from the config file, and an
+		// operator who believes their golden images are mirrored deserves to find
+		// out here rather than after a drive dies.
+		replication := "replication unknown"
+		if p.Size > 0 {
+			replication = fmt.Sprintf("size %d, min_size %d", p.Size, p.MinSize)
+		}
+
+		fmt.Printf("         %-16s %3d image(s)  %-24s %s\n", p.Name, p.Images, replication, p.Purpose)
+	}
+
+	for _, p := range report.Pools {
+		if p.Size == 1 {
+			fmt.Printf("         %s keeps ONE copy: a single drive failure loses everything in "+
+				"it\n", p.Name)
+		}
+	}
+
+	if report.CloneV2 {
+		fmt.Printf("         clone v2 (require-min-compat-client %s), so a cache generation can "+
+			"be reclaimed while a job still holds a clone of it\n", report.MinCompatClient)
+	}
 
 	// SAID, BECAUSE THE CHECK IS NARROWER THAN IT LOOKS. Listing a pool proves the
 	// monitors answered and the keyring authenticated; it proves nothing about
@@ -1876,8 +1918,6 @@ func checkCephCluster(ctx context.Context, cfg *config.CephConfig) error {
 	fmt.Printf("         (read only — launching also needs create, clone, snapshot and remove in " +
 		"both pools; `ceph auth get-or-create client.<user> mon 'profile rbd' osd 'profile rbd " +
 		"pool=<images>, profile rbd pool=<cache>'` grants exactly that)\n")
-
-	return nil
 }
 
 // spotLabel names the market a node buys in, because it decides whether a build
