@@ -144,13 +144,41 @@ func TestNoListenerStartsUntilEveryScaleSetExists(t *testing.T) {
 		},
 	}
 
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 
+	// CANCELLED ON THE CONDITION, NOT ON A CLOCK, and that is what makes this test
+	// deterministic rather than usually-true.
+	//
+	// It used to sleep 200ms and then cancel. Reconciliation deliberately takes
+	// 40ms per tier — three tiers, 120ms — so a listener had roughly 80ms to be
+	// scheduled and poll once. Under the full suite with -race and
+	// -covermode=atomic on a loaded machine that margin disappears, `polled` stays
+	// false, and the test fails with "no listener ever polled; this test proves
+	// nothing" — a red that names the test's own guard rather than anything about
+	// the code. Observed on CI; it is the transient that had been appearing
+	// unattributed.
+	//
+	// Waiting for the poll instead keeps every property: `early` is still recorded
+	// by onPoll the moment it happens, and the deadline below is a WATCHDOG on a
+	// stall rather than a budget for the work, so a genuine failure to poll still
+	// fails — just later.
 	go func() {
-		// Long enough for several poll rounds, short enough not to slow the suite.
-		time.Sleep(200 * time.Millisecond)
-		cancel()
+		defer cancel()
+
+		deadline := time.Now().Add(20 * time.Second)
+
+		for {
+			mu.Lock()
+			done := polled
+			mu.Unlock()
+
+			if done || time.Now().After(deadline) {
+				return
+			}
+
+			time.Sleep(time.Millisecond)
+		}
 	}()
 
 	if err := New(a, prov, tiers, "test-owner", nil).Run(ctx); err != nil {

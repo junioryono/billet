@@ -240,6 +240,55 @@ type IMDSCredentials struct {
 	cached Credentials
 }
 
+// REDACTED LIKE THE CREDENTIAL IT HOLDS, and for a reason that is not obvious:
+// `cached` is UNEXPORTED, and fmt cannot call methods on an unexported field. So
+// without these, `%+v` on a fetched source printed the secret access key and the
+// session token in full — through a struct whose whole job is holding one, and
+// past a redaction that looked complete because the field's TYPE redacts.
+//
+// That is the "struct CONTAINING Credentials" hole the security skill names,
+// found by a reviewer after the type-level redaction was already in place. A type
+// that stores a credential needs its own methods; inheriting the field's is not a
+// thing Go does.
+func (i *IMDSCredentials) String() string { return i.redacted() }
+
+// GoString covers %#v, which does not consult String.
+func (i *IMDSCredentials) GoString() string { return i.redacted() }
+
+// Format catches every verb, so none falls back to the raw struct.
+func (i *IMDSCredentials) Format(f fmt.State, _ rune) {
+	_, _ = io.WriteString(f, i.redacted()) //nolint:errcheck // fmt.State swallows write errors by design
+}
+
+// MarshalJSON keeps the cached secret out of anything that serializes this.
+func (i *IMDSCredentials) MarshalJSON() ([]byte, error) { return json.Marshal(i.redacted()) }
+
+// LogValue is what slog consults, and slog does not consult fmt.
+func (i *IMDSCredentials) LogValue() slog.Value { return slog.StringValue(i.redacted()) }
+
+// redacted TOUCHES NOTHING GUARDED BY THE MUTEX, deliberately.
+//
+// The obvious implementation reads `cached` under `i.mu` so it can name the key
+// id it holds. That builds a deadlock and hands somebody the loaded gun: the
+// whole reason this type has a String is so it can be printed, and
+// `Credentials()` holds `i.mu` across the entire fetch — so the first
+// `log.Warn("...", "source", i)` added inside that critical section wedges the
+// node, at the moment credentials are being resolved. Reading the field without
+// the lock instead is a data race.
+//
+// So it says nothing about the cached value at all. Which key is held is a
+// question for the resolved Credentials, which redacts and shows its own key id;
+// the SOURCE only has to be safe to print. Endpoint is written once at
+// construction and never after.
+func (i *IMDSCredentials) redacted() string {
+	endpoint := i.Endpoint
+	if endpoint == "" {
+		endpoint = defaultIMDSEndpoint
+	}
+
+	return "ec2.IMDSCredentials{endpoint=" + endpoint + ", cached=REDACTED}"
+}
+
 // imdsTimeout bounds the metadata lookup.
 //
 // SHORT, because the common failure is that billet is NOT on EC2 at all: the
@@ -433,6 +482,43 @@ func readIMDS(client *http.Client, req *http.Request) (string, error) {
 // because an operator who set AWS_ACCESS_KEY_ID on a machine that also has a role
 // meant the key. The reverse order makes that setting silently do nothing.
 type ChainCredentials []CredentialSource
+
+// ChainCredentials renders as the TYPES of its sources. Printing the slice would
+// print each element through its own methods, which is fine only while every
+// source has them — and a CredentialSource can be implemented outside this
+// package.
+func (c ChainCredentials) String() string {
+	// THE TYPES, NOT THE VALUES, and both halves of that matter.
+	//
+	// Formatting each source with %v recursed forever on a chain that contained
+	// itself, and — worse — made this type's safety depend on every source
+	// redacting, including one implemented outside this package. The comment here
+	// used to claim the opposite: that stating it meant the chain did NOT depend on
+	// that. It did.
+	//
+	// A type name says everything a reader needs from a chain (which sources, in
+	// which order) and can carry nothing.
+	parts := make([]string, 0, len(c))
+	for _, src := range c {
+		parts = append(parts, fmt.Sprintf("%T", src))
+	}
+
+	return "ec2.ChainCredentials[" + strings.Join(parts, " ") + "]"
+}
+
+// GoString covers %#v.
+func (c ChainCredentials) GoString() string { return c.String() }
+
+// Format catches every verb.
+func (c ChainCredentials) Format(f fmt.State, _ rune) {
+	_, _ = io.WriteString(f, c.String()) //nolint:errcheck // fmt.State swallows write errors by design
+}
+
+// MarshalJSON keeps a chain out of anything that serializes it structurally.
+func (c ChainCredentials) MarshalJSON() ([]byte, error) { return json.Marshal(c.String()) }
+
+// LogValue is what slog consults.
+func (c ChainCredentials) LogValue() slog.Value { return slog.StringValue(c.String()) }
 
 // Credentials satisfies CredentialSource.
 func (c ChainCredentials) Credentials(ctx context.Context) (Credentials, error) {

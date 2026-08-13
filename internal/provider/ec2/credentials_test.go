@@ -101,6 +101,14 @@ func TestEveryCredentialTypeIsRedacted(t *testing.T) {
 		SessionToken:    "session-token-value",
 	}
 
+	// A SOURCE THAT HAS FETCHED, which is the case the type-level redaction does
+	// not cover: `cached` is unexported, and fmt cannot call methods on an
+	// unexported field — so `%+v` on this printed the secret in full while every
+	// test here passed, because they all rendered the field's TYPE rather than a
+	// struct holding it privately.
+	fetched := &IMDSCredentials{}
+	fetched.cached = full
+
 	for name, value := range map[string]any{
 		"Credentials":       full,
 		"StaticCredentials": StaticCredentials(full),
@@ -108,6 +116,11 @@ func TestEveryCredentialTypeIsRedacted(t *testing.T) {
 		// the reverse, and a caller holding one is ordinary.
 		"a pointer to Credentials":       &full,
 		"a pointer to StaticCredentials": func() *StaticCredentials { s := StaticCredentials(full); return &s }(),
+
+		// THE SOURCES, not only the credential. Each of these holds one.
+		"a fetched IMDSCredentials": fetched,
+		"a chain holding one":       ChainCredentials{EnvCredentials{}, fetched},
+		"DefaultCredentials":        DefaultCredentials(),
 	} {
 		t.Run(name, func(t *testing.T) {
 			holder := struct {
@@ -764,4 +777,126 @@ type cancelledSource struct{}
 
 func (cancelledSource) Credentials(ctx context.Context) (Credentials, error) {
 	return Credentials{}, fmt.Errorf("ec2: read credentials: %w", ctx.Err())
+}
+
+// PRINTING A SOURCE MUST NOT BE ABLE TO WEDGE THE NODE.
+//
+// The reason this type has a String at all is so somebody can print it — and
+// Credentials() holds i.mu across the whole fetch, so a redaction that read the
+// cached value under the same lock would deadlock the first time anyone logged
+// the source from inside that critical section. Which is exactly where a person
+// debugging credential resolution would put it.
+//
+// Rendering it while the lock is held is the shape of that mistake, and it must
+// simply return.
+func TestPrintingACredentialSourceCannotDeadlock(t *testing.T) {
+	src := &IMDSCredentials{Endpoint: "http://127.0.0.1:1"}
+
+	src.mu.Lock()
+
+	done := make(chan string, 1)
+
+	go func() { done <- fmt.Sprintf("%v|%+v|%s", src, src, src) }()
+
+	select {
+	case got := <-done:
+		if strings.Contains(got, "SecretAccessKey") {
+			t.Errorf("the source rendered its cached credential's fields: %s", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("rendering a credential source blocked on the lock its own resolution holds; " +
+			"one log line inside Credentials() would wedge the node")
+	}
+
+	src.mu.Unlock()
+}
+
+// THE STRUCT AROUND A CREDENTIAL IS A BOUNDARY TOO, and it is the one method-based
+// redaction cannot cross on its own: fmt refuses to invoke methods through an
+// UNEXPORTED field, so a source's own String is never consulted when the thing
+// holding it is printed structurally.
+//
+// This is the fourth type in this package to need its own methods for that reason
+// — Credentials, StaticCredentials, IMDSCredentials, and now the client that
+// holds a source. That is the tell that this cannot be made absolute by adding
+// methods, which is why the residual is written down rather than claimed away.
+func TestAStructHoldingACredentialSourceRedactsToo(t *testing.T) {
+	const secret = "wJalrXUtnFEMI-thisIsTheSecret"
+
+	c := &client{
+		endpoint: "https://ec2.us-west-2.amazonaws.com/",
+		region:   "us-west-2",
+		creds: StaticCredentials{
+			AccessKeyID: "AKIDEXAMPLE", SecretAccessKey: secret, SessionToken: "tok",
+		},
+	}
+
+	encoded, err := json.Marshal(c)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var logged bytes.Buffer
+
+	slog.New(slog.NewJSONHandler(&logged, nil)).Info("calling", "client", c)
+
+	encodedValue, err := json.Marshal(*c)
+	if err != nil {
+		t.Fatalf("marshal value: %v", err)
+	}
+
+	// BOTH FORMS. A pointer receiver is not consulted when a VALUE is formatted —
+	// the rule this package's skill states — so the first version of these methods
+	// left `%+v` on a dereferenced client printing the secret, and a test that
+	// rendered only the pointer could not see it.
+	for path, out := range map[string]string{
+		"%v":              fmt.Sprintf("%v", c), //nolint:gocritic // the verb path is the subject
+		"%+v":             fmt.Sprintf("%+v", c),
+		"%#v":             fmt.Sprintf("%#v", c),
+		"json":            string(encoded),
+		"slog":            logged.String(),
+		"%v on a value":   fmt.Sprintf("%v", *c), //nolint:gocritic // the verb path is the subject
+		"%+v on a value":  fmt.Sprintf("%+v", *c),
+		"%#v on a value":  fmt.Sprintf("%#v", *c),
+		"json of a value": string(encodedValue),
+	} {
+		for name, leaked := range map[string]string{
+			"secret access key": secret,
+			"session token":     "tok",
+		} {
+			if strings.Contains(out, leaked) {
+				t.Errorf("%s rendered the %s through the client: %s", path, name, out)
+			}
+		}
+	}
+}
+
+// A CHAIN RENDERS THE TYPES OF ITS SOURCES, not their values.
+//
+// Formatting each source recursed forever on a chain containing itself, and made
+// this type's safety depend on every source redacting — including one implemented
+// outside this package, which nothing here controls.
+func TestAChainRendersTypesRatherThanTrustingItsSources(t *testing.T) {
+	leaky := leakySource{secret: "wJalrXUtnFEMI-thisIsTheSecret"}
+
+	//nolint:gocritic // the verb path is the subject: String() being safe says nothing
+	// about what fmt does with the slice.
+	got := fmt.Sprintf("%v", ChainCredentials{EnvCredentials{}, leaky})
+
+	if strings.Contains(got, leaky.secret) {
+		t.Errorf("the chain rendered a source that does not redact itself: %s", got)
+	}
+
+	if !strings.Contains(got, "EnvCredentials") {
+		t.Errorf("the chain does not say which sources it holds, which is the whole use of "+
+			"printing one: %s", got)
+	}
+}
+
+// leakySource is a CredentialSource implemented without redaction, which is what
+// anything outside this package would be.
+type leakySource struct{ secret string }
+
+func (leakySource) Credentials(context.Context) (Credentials, error) {
+	return Credentials{}, errNoCredentials
 }

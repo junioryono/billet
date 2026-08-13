@@ -166,6 +166,15 @@ func canonicalizeHeaders(h http.Header, host string, contentLength int64) (strin
 			continue
 		}
 
+		// HOST AND CONTENT-LENGTH ARE ALREADY SET ABOVE, from the Request rather
+		// than from this map, because that is where Go keeps the values it actually
+		// sends. A caller who also put them in Header would otherwise overwrite the
+		// sent value with one the transport ignores — a signature over a request
+		// nobody made.
+		if lower == "host" || lower == "content-length" {
+			continue
+		}
+
 		trimmed := make([]string, 0, len(vs))
 		for _, v := range vs {
 			trimmed = append(trimmed, collapseSpace(v))
@@ -202,16 +211,26 @@ func canonicalURI(u *url.URL) string {
 	return u.EscapedPath()
 }
 
-// canonicalQuery is the query sorted by name and re-encoded.
+// canonicalQuery is the query sorted by name and re-encoded the way SigV4 wants.
 //
-// url.Values.Encode already sorts by key and escapes the way AWS wants, which is
-// the one place Go's normalization and the specification happen to agree.
+// NOT url.Values.Encode ALONE, which was the previous implementation and was
+// described as "the one place Go's normalization and the specification happen to
+// agree". They agree on sorting and on most escapes and they disagree on SPACE:
+// Encode writes `+` and SigV4 canonicalization requires `%20`, so any parameter
+// containing a space would be signed over bytes AWS canonicalizes differently and
+// come back as a 403 naming nothing.
+//
+// Latent rather than live — this client puts every parameter in the POST body,
+// where the payload hash covers the exact bytes — which is precisely why it is
+// worth fixing now: the signer is a general thing, and the next caller to put
+// something in a query string would pay for a comment that was confident and
+// wrong.
 func canonicalQuery(u *url.URL) string {
 	if u.RawQuery == "" {
 		return ""
 	}
 
-	return u.Query().Encode()
+	return strings.ReplaceAll(u.Query().Encode(), "+", "%20")
 }
 
 // collapseSpace trims a header value and squeezes internal runs of spaces to
