@@ -40,6 +40,7 @@ import (
 	"github.com/junioryono/billet/internal/scaleset"
 	"github.com/junioryono/billet/internal/server"
 	"github.com/junioryono/billet/internal/state"
+	"github.com/junioryono/billet/internal/store/ceph"
 	"github.com/junioryono/billet/internal/version"
 	"github.com/junioryono/billet/internal/wirecert"
 	"github.com/junioryono/billet/internal/wiring"
@@ -1642,6 +1643,12 @@ func cmdCheck(ctx context.Context, args []string) error {
 				return err
 			}
 		}
+
+		if cfg.Node.Ceph != nil {
+			if err := checkCephCluster(ctx, cfg.Node.Ceph); err != nil {
+				return err
+			}
+		}
 	}
 
 	// Per-host policy decides what each machine may run and how many macOS
@@ -1822,6 +1829,53 @@ func checkEC2Credentials(ctx context.Context, cfg *config.EC2Config) error {
 	if len(cfg.UntrustedSecurityGroupIDs) == 0 {
 		fmt.Printf("         untrusted work will be refused: no untrusted_security_group_ids\n")
 	}
+
+	return nil
+}
+
+// checkCephCluster proves this machine can act on its storage configuration.
+//
+// THE SAME DISTINCTION checkPrivateKey AND checkEC2Credentials MAKE, one backend
+// over. Config validation proves the block is coherent; it cannot prove the
+// monitors answer, the keyring authenticates, or the pools were ever created. A
+// node that is wrong about any of those validates perfectly and then fails on the
+// first job of the day, with a librados error naming none of them.
+//
+// A MISSING rbd IS FATAL, and the reason is which configs reach here. Only a
+// firecracker node may carry a ceph block, so this file describes a machine that
+// is meant to run jobs — and one without the client package cannot map a single
+// volume. A control plane is not affected: with no node section there is nothing
+// to check. Reporting it and exiting zero would make `billet check` say a host is
+// fine when nothing on it can launch.
+func checkCephCluster(ctx context.Context, cfg *config.CephConfig) error {
+	client, err := ceph.New(*cfg)
+	if err != nil {
+		// WHAT THE CONFIG NAMES, and nothing the sentinel already says. Every
+		// wrapper renders the message beneath it, so repeating the remedy here put
+		// "install ceph-common" on the operator's terminal twice in one sentence.
+		if errors.Is(err, ceph.ErrNoRBD) {
+			return fmt.Errorf("node.ceph names %s and %s, so this host is meant to run jobs and "+
+				"cannot map a volume: %w", cfg.ImagePool, cfg.CachePool, err)
+		}
+
+		return err
+	}
+
+	report, err := client.CheckReachable(ctx)
+	if err != nil {
+		return fmt.Errorf("node.ceph: this host could not read the pools it is configured with, "+
+			"so it could not launch anything: %w", err)
+	}
+
+	fmt.Printf("ceph     client.%s -> %s (%d image(s)), %s (%d volume(s))\n",
+		report.User, cfg.ImagePool, report.ImagePool, cfg.CachePool, report.CachePool)
+
+	// SAID, BECAUSE THE CHECK IS NARROWER THAN IT LOOKS. Listing a pool proves the
+	// monitors answered and the keyring authenticated; it proves nothing about
+	// permission to create, clone or remove an image, which is what a launch does.
+	fmt.Printf("         (read only — launching also needs create, clone, snapshot and remove in " +
+		"both pools; `ceph auth get-or-create client.<user> mon 'profile rbd' osd 'profile rbd " +
+		"pool=<images>, profile rbd pool=<cache>'` grants exactly that)\n")
 
 	return nil
 }

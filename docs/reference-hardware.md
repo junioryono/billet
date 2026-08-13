@@ -72,9 +72,11 @@ The board tops out at 2 TB, but only by replacing these modules with larger ones
 — every slot is already populated, so there is no incremental upgrade path.
 
 Scheduled guest memory should stay meaningfully below the physical total. The OS,
-ZFS ARC, and billet itself are not free, and a host that OOMs mid-job fails every
-lease it is holding at once. Cap the ARC explicitly rather than letting it size
-itself against a number that assumes it owns the machine.
+the Ceph OSDs, and billet itself are not free, and a host that OOMs mid-job fails
+every lease it is holding at once. Each OSD sizes itself against
+`osd_memory_target`, 4 GiB by default and worth setting explicitly on a machine
+that is also running guests — the default assumes the daemon has the box to
+itself.
 
 ## What still has to be measured
 
@@ -111,7 +113,9 @@ page](https://www.supermicro.com/en/products/motherboard/h12ssl-ct), the board
 carries **8× SATA3**, **2× M.2** (PCIe 4.0 ×4, M-key, 2280/22110), and a
 **Broadcom 3008 SAS3** controller. The two M.2 sockets are real and confirmed —
 useful, because a mirrored pair of NVMe drives is the natural home for the
-control-plane database and golden images.
+control-plane database, which is the one thing here that is not disposable.
+Golden images do not live on the mirror: they are RBD images in the Ceph pools
+below, so that a second machine can map them rather than be sent a copy.
 
 The SAS3008 provides **eight SAS device ports through two Mini-SAS HD
 connectors** — each connector breaks out to four drives. The product page counts
@@ -124,15 +128,17 @@ are not shared with the SAS lanes.
 One detail worth knowing before planning a layout:
 
 - **The 3008 advertises RAID 0/1/10**, so it is not unconditionally a plain HBA.
-  ZFS wants direct, unabstracted access to each disk: confirm the controller is
-  presenting drives individually (IT/JBOD-style) rather than through a RAID
-  volume. Handing ZFS a RAID volume hides exactly the per-disk errors it exists
-  to detect and repair.
+  Ceph wants direct, unabstracted access to each disk — one OSD per drive is what
+  makes a drive a failure domain — so confirm the controller is presenting drives
+  individually (IT/JBOD-style) rather than through a RAID volume. Handing Ceph a
+  RAID volume gives it one device where it thinks it has several, and the
+  redundancy it reports is not the redundancy you have.
 
-Golden images and control-plane state should be **mirrored**. A single SSD lets
-ZFS detect corruption but not repair it, and the control-plane database is the
-one thing in a billet deployment that is not disposable. Cache data and sticky
-disks are disposable by design and do not need the same treatment.
+Golden images and control-plane state should be **replicated**. The control-plane
+database is the one thing in a billet deployment that is not disposable; cache
+data and sticky disks are disposable by design. Here the two are protected by
+different mechanisms — mdraid RAID1 for the root and the ledger, Ceph `size=2`
+across two OSDs for the pools — which is described below.
 
 
 ## The reference host as actually built (verified, not assumed)
@@ -145,19 +151,29 @@ behind stable symlinks so `firecracker --version` always matches what is on disk
 reversible. Billet pins to what the host has rather than the other way round: the provider is
 written against a version known to be installed, not against a version someone hopes is.
 
-**ZFS pool `tank`**, a mirror of the two bare NVMe, with `tank/images` at 128K recordsize and
-`tank/cache` at 1M, lz4 on both. The name matches `billet.example.yaml` so nothing has to be edited
-to match a machine.
+**A Ceph cluster on the two bare NVMe**, deployed with `cephadm` — Ceph 20.2.3 Tentacle, one mon, two
+mgr, one OSD per drive, and two pools at `size=2 min_size=1`: `billet-images` for golden images and
+per-job root clones, `billet-cache` for everything the caching plane keeps. The pool names match
+`billet.example.yaml` so nothing has to be edited to match a machine.
 
-> **Provisional: Ceph RBD replaces ZFS ([#23](https://github.com/junioryono/billet/issues/23)).**
-> A snapshot here exists only on this machine, so any cache written to it belongs to this host and to
-> no other — the storage-specific reason billet is a one-machine product, alongside global rather
-> than per-node capacity (#21), escrow-time placement (#30) and broadcast teardown (#31). Ceph runs
-> on these same NVMe and
-> presents them as a pool every node can map. Provision ZFS today; expect to re-provision.
+It replaced a ZFS pool called `tank`, and the reason is one sentence: a ZFS clone exists only on the
+machine that took it, so a cache written to one belongs to that host and to no other — the storage
+half of billet being a one-machine product, alongside global rather than per-node capacity (#21),
+escrow-time placement (#30) and broadcast teardown (#31). RBD presents the same drives as a pool any
+node at the site can map, which was verified from a second kernel client before this document was
+changed. **How it was built, what it measured, and the two things about Ubuntu 26.04 that break
+`cephadm bootstrap` are in [`adr-003-ceph-rbd.md`](adr-003-ceph-rbd.md).**
+
+Redundancy is not lost in the move, which was the open question when it was planned. `cephadm
+bootstrap --single-host-defaults` sets the CRUSH failure domain to the OSD rather than the host, so
+`size=2` on two OSDs places the two replicas on **two different drives** — the same protection the
+ZFS mirror gave, on the same disks — and `min_size=1` keeps the pool writable while one of them is
+dead. What a single machine still cannot provide is redundancy against losing the machine: one mon is
+not a quorum.
 
 `/var/lib/billet/node` exists at 0750 on local disk — the mdraid root, never NFS, because the state
-directory holds SQLite and the deployment identity.
+directory holds SQLite and the deployment identity. The Ceph pools are not a candidate for it either:
+the state directory must be local storage, and RBD is a network block device.
 
 **The host kernel is newer than Firecracker's CI is likely to cover.** A 7.0 host kernel is well past
 anything a 2026-07 release was tested against, and the interface that matters is the KVM ioctl
@@ -165,17 +181,17 @@ surface the VMM uses plus the jailer's cgroup v2 handling. This is not something
 reading: boot one microVM on the box before designing around it. It is a cheap check now and an
 expensive surprise during P2.
 
-## An inherited machine can arrive with ZFS's worst case already set up
+## An inherited machine can arrive with the worst case already set up
 
 The four NVMe drives arrived configured as a **4-way RAID 0** — no redundancy, and exactly the
-"handing ZFS a RAID volume" shape this document warns against. It was destroyed and rebuilt as
-mdraid RAID1 for root plus two bare disks for the pool.
+"handing a storage system a RAID volume" shape this document warns against. It was destroyed and
+rebuilt as mdraid RAID1 for root plus two bare disks for the cluster.
 
-Worth stating because the failure is SILENT. ZFS on top of a RAID volume still imports, still
-scrubs, and still reports healthy; what it loses is the per-disk visibility that lets it identify
-and repair the bad copy, which is the entire reason it was chosen. Nothing warns you, and the day
-you find out is the day a disk starts lying. On any inherited or vendor-configured machine, check
-what the disks actually are before building a pool on them.
+Worth stating because the failure is SILENT. Neither ZFS nor Ceph objects to being handed a RAID
+volume: the pool imports, the cluster reports `HEALTH_OK`, and what has been lost is the per-disk
+visibility that lets either of them say which copy is the bad one. Nothing warns you, and the day you
+find out is the day a disk starts lying. On any inherited or vendor-configured machine, check what
+the disks actually are before building on them.
 
 ## Guest egress: what this host in particular must block
 
