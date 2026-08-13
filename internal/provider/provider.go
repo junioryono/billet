@@ -7,9 +7,12 @@
 // kill, network policy, volume attach and quiesce, image preparation, spot
 // interruption, capability negotiation. All of that is true and none of it is
 // here, because every one of those shapes is a guess until a second backend
-// needs it. Firecracker and EC2 will force the generalisation, and an interface
-// designed against one implementation is usually wrong in ways only the second
-// one reveals.
+// needs it. EC2 has now landed as that second backend and forced NO change to
+// this interface — which is worth recording, because the prediction here was that
+// it would. What it did force was a distinction this interface still does not
+// make: its Destroy returns when the request is accepted rather than when the
+// compute has stopped (#46), and the callers assume the latter. Firecracker,
+// which attaches block devices, is the next one likely to widen this.
 //
 // What IS here is the part every backend must agree on: launch one instance for
 // one job, destroy it, and never let the credential reach a place it can be
