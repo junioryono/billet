@@ -13,6 +13,7 @@
 package ceph
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -33,10 +34,15 @@ import (
 // which pool it could not read.
 const DefaultTimeout = 15 * time.Second
 
-// Client runs rbd against one site's pools.
+// Client runs the ceph client commands against one site's pools.
+//
+// TWO BINARIES, ONE PACKAGE. `rbd` addresses images and `ceph` answers for the
+// cluster itself, and ceph-common ships both — so a host that has one has the
+// other, and a missing binary is one diagnostic rather than two.
 type Client struct {
 	cfg  config.CephConfig
-	bin  string
+	bin  string // rbd
+	ceph string
 	run  runner
 	wait time.Duration
 }
@@ -77,8 +83,17 @@ func WithBinary(path string) Option {
 	}
 }
 
-// ErrNoRBD is returned when the rbd command is not installed.
-var ErrNoRBD = errors.New("the rbd command is not on PATH")
+// WithCephBinary names the ceph executable, skipping the PATH lookup.
+func WithCephBinary(path string) Option {
+	return func(c *Client) {
+		if strings.TrimSpace(path) != "" {
+			c.ceph = strings.TrimSpace(path)
+		}
+	}
+}
+
+// ErrNoClient is returned when the ceph client commands are not installed.
+var ErrNoClient = errors.New("the ceph client commands are not on PATH")
 
 // New returns a client for the pools this configuration names.
 //
@@ -99,15 +114,22 @@ func New(cfg config.CephConfig, opts ...Option) (*Client, error) {
 		opt(c)
 	}
 
-	if c.bin == "" {
-		bin, err := exec.LookPath("rbd")
-		if err != nil {
-			return nil, fmt.Errorf("%w: billet drives ceph through it rather than linking librados, "+
-				"so a node needs the ceph client package installed (ceph-common on debian and "+
-				"ubuntu): %w", ErrNoRBD, err)
+	for _, want := range []struct {
+		name string
+		into *string
+	}{{"rbd", &c.bin}, {"ceph", &c.ceph}} {
+		if *want.into != "" {
+			continue
 		}
 
-		c.bin = bin
+		bin, err := exec.LookPath(want.name)
+		if err != nil {
+			return nil, fmt.Errorf("%w: billet drives ceph through them rather than linking "+
+				"librados, so a node needs the ceph client package installed (ceph-common on "+
+				"debian and ubuntu): %w", ErrNoClient, err)
+		}
+
+		*want.into = bin
 	}
 
 	return c, nil
@@ -117,12 +139,43 @@ func New(cfg config.CephConfig, opts ...Option) (*Client, error) {
 type Report struct {
 	// User is the identity that answered, without the `client.` prefix.
 	User string
-	// ImagePool and CachePool are how many images each pool holds. A count rather
-	// than the names: this goes on an operator's terminal, and a site with a
-	// thousand cache volumes should not print a thousand lines.
-	ImagePool int
-	CachePool int
+	// MinCompatClient is the oldest client release the cluster admits, which is
+	// what decides the clone format below.
+	MinCompatClient string
+	// CloneV2 reports whether a snapshot can be cloned WITHOUT being protected —
+	// and, the half that matters, removed while a clone of it is still live.
+	CloneV2 bool
+	// Pools describes each pool billet was pointed at, in the order it names them.
+	Pools []Pool
 }
+
+// Pool is one pool billet uses, and what the cluster says about it.
+type Pool struct {
+	// Name and Purpose are what the config called it and what billet keeps there.
+	Name    string
+	Purpose string
+	// Images is a count rather than a list: this goes on an operator's terminal,
+	// and a site with a thousand cache volumes should not print a thousand lines.
+	Images int
+	// Size and MinSize are the replication the operator chose. Zero means the
+	// cluster did not say, which is reported rather than guessed at.
+	Size    int
+	MinSize int
+}
+
+// ErrCloneV1 is returned when the cluster would clone a snapshot the old way.
+//
+// IT IS A REFUSAL RATHER THAN A NOTE, and the reason is when the cost lands. On a
+// clone-v1 cluster a snapshot must be PROTECTED before it can be cloned, and a
+// protected snapshot with a live clone can be neither unprotected nor removed —
+// so a cache generation that any running job holds a clone of is undeletable, and
+// eviction is blocked by ordinary traffic rather than by anything wrong. Nothing
+// in billet clones yet, which is exactly why this is the moment to say so: the fix
+// is one command on an empty cluster, and the same fix after a fleet has been
+// built on it is a full pool and a debugging session that starts nowhere near
+// here.
+var ErrCloneV1 = errors.New("this cluster would clone snapshots the old way, which makes a cache " +
+	"generation undeletable while any job holds a clone of it")
 
 // CheckReachable proves this host can act on its ceph configuration.
 //
@@ -138,17 +191,139 @@ type Report struct {
 // permission to CREATE, clone or remove an image, which is what a launch actually
 // does.
 func (c *Client) CheckReachable(ctx context.Context) (Report, error) {
-	images, err := c.list(ctx, c.cfg.ImagePool)
+	report := Report{User: c.cfg.User}
+
+	for _, p := range []Pool{
+		{Name: c.cfg.ImagePool, Purpose: "golden images and per-job root clones"},
+		{Name: c.cfg.CachePool, Purpose: "cache volumes"},
+	} {
+		images, err := c.list(ctx, p.Name)
+		if err != nil {
+			return Report{}, err
+		}
+
+		p.Images = images
+		report.Pools = append(report.Pools, p)
+	}
+
+	// THE CLUSTER'S OWN CONFIGURATION, which is a different question from whether
+	// this host can reach it — and the one that decides whether the storage layer
+	// can ever reclaim anything.
+	release, err := c.minCompatClient(ctx)
 	if err != nil {
 		return Report{}, err
 	}
 
-	caches, err := c.list(ctx, c.cfg.CachePool)
+	report.MinCompatClient = release
+	report.CloneV2 = ClonesV2(release)
+
+	sizes, err := c.poolSizes(ctx)
 	if err != nil {
 		return Report{}, err
 	}
 
-	return Report{User: c.cfg.User, ImagePool: images, CachePool: caches}, nil
+	// NO PRESENCE CHECK, because the zero value already means what absence means. A
+	// pool the cluster did not describe comes back size 0, which the report renders
+	// as "replication unknown" — writing `if ok` around it would be a guard whose
+	// mutation survives, because both branches produce the same answer.
+	for i := range report.Pools {
+		s := sizes[report.Pools[i].Name]
+		report.Pools[i].Size, report.Pools[i].MinSize = s.Size, s.MinSize
+	}
+
+	if !report.CloneV2 {
+		return report, fmt.Errorf("%w: require-min-compat-client is %q; raise it with "+
+			"`ceph osd set-require-min-compat-client mimic`", ErrCloneV1, release)
+	}
+
+	return report, nil
+}
+
+// beforeMimic is every Ceph release older than the one that introduced clone v2.
+//
+// THE CLOSED HALF OF THE LIST, deliberately. A set of releases at-or-after mimic
+// would go stale on the next Ceph release and start refusing correct clusters,
+// while the set BEFORE mimic can never grow — Ceph is not going to ship a release
+// older than one from 2018. So an unrecognised name is treated as newer, which is
+// the only direction that stays true without maintenance.
+//
+// Measured against Ceph 20.2.3 rather than remembered: every name here is one the
+// cluster accepts for `osd set-require-min-compat-client`, and a name it does not
+// know is refused with "is not recognized", so this is the complete set of answers
+// that can mean "older than mimic".
+var beforeMimic = map[string]bool{
+	"argonaut": true, "bobtail": true, "cuttlefish": true, "dumpling": true,
+	"emperor": true, "firefly": true, "giant": true, "hammer": true,
+	"infernalis": true, "jewel": true, "kraken": true, "luminous": true,
+}
+
+// ClonesV2 reports whether a cluster admitting this client release clones the new
+// way: an unprotected snapshot can be cloned, and removed while a clone is live.
+//
+// Exported because it is the rule, and a rule with one caller is still worth
+// naming — the alternative is a string comparison at a call site where nobody can
+// see why "luminous" is the answer that breaks eviction.
+func ClonesV2(minCompatClient string) bool {
+	return !beforeMimic[strings.ToLower(strings.TrimSpace(minCompatClient))]
+}
+
+// minCompatClient asks the cluster which client releases it admits.
+func (c *Client) minCompatClient(ctx context.Context) (string, error) {
+	out, err := c.cephCmd(ctx, "osd", "get-require-min-compat-client")
+	if err != nil {
+		return "", fmt.Errorf("ceph: the cluster would not say which client releases it admits, "+
+			"so billet cannot tell whether a cache generation could ever be reclaimed: %w", err)
+	}
+
+	release := strings.TrimSpace(string(out))
+	if release == "" {
+		return "", errors.New("ceph: the cluster named no minimum client release")
+	}
+
+	return release, nil
+}
+
+// poolSpec is the half of `ceph osd pool ls detail` billet reads.
+type poolSpec struct {
+	Name    string `json:"pool_name"`
+	Size    int    `json:"size"`
+	MinSize int    `json:"min_size"`
+}
+
+// poolSizes reads the replication the operator chose, for every pool at once.
+//
+// ONE CALL RATHER THAN ONE PER FIELD. `osd pool get <pool> size` answers a single
+// parameter, so the targeted form is four invocations for two pools; the detail
+// listing is one, and billet already knows which names it cares about.
+func (c *Client) poolSizes(ctx context.Context) (map[string]poolSpec, error) {
+	out, err := c.cephCmd(ctx, "osd", "pool", "ls", "detail")
+	if err != nil {
+		return nil, fmt.Errorf("ceph: the pool listing could not be read as client.%s: %w",
+			c.cfg.User, err)
+	}
+
+	var pools []poolSpec
+	if err := json.Unmarshal(bytes.TrimSpace(out), &pools); err != nil {
+		return nil, fmt.Errorf("ceph: %s did not answer with a json pool listing; is it the ceph "+
+			"command?", c.ceph)
+	}
+
+	byName := make(map[string]poolSpec, len(pools))
+	for _, p := range pools {
+		byName[p.Name] = p
+	}
+
+	return byName, nil
+}
+
+// cephCmd runs one `ceph` invocation, bounded like every other.
+func (c *Client) cephCmd(ctx context.Context, command ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.wait)
+	defer cancel()
+
+	args := append(c.identity(), "--format", "json")
+
+	return c.run(ctx, c.ceph, append(args, command...))
 }
 
 // list counts the images in one pool.
@@ -180,6 +355,14 @@ func (c *Client) list(ctx context.Context, pool string) (int, error) {
 // search path is what finds /etc/ceph/ceph.conf and the matching keyring, and
 // passing an empty --conf overrides that search with a file that does not exist.
 func (c *Client) args(pool string, command ...string) []string {
+	args := append(c.identity(), "--format", "json", "-p", pool)
+
+	return append(args, command...)
+}
+
+// identity is the half of an invocation that says who billet is, shared by both
+// commands so they cannot come to authenticate as different clients.
+func (c *Client) identity() []string {
 	args := []string{"--id", c.cfg.User}
 
 	if c.cfg.ConfPath != "" {
@@ -190,9 +373,7 @@ func (c *Client) args(pool string, command ...string) []string {
 		args = append(args, "--keyring", c.cfg.KeyringPath)
 	}
 
-	args = append(args, "--format", "json", "-p", pool)
-
-	return append(args, command...)
+	return args
 }
 
 // waitDelay bounds how long the pipes may outlive the process.

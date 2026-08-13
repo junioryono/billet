@@ -2,6 +2,7 @@ package ceph
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -27,42 +28,102 @@ func valid() config.CephConfig {
 	}
 }
 
-// recorder captures the invocations billet builds and answers each with a
-// canned result. Keyed by call order, because the two pools are listed in a
-// fixed order and a check that lost one would otherwise look identical.
+// recorder captures the invocations billet builds and answers each one.
+//
+// IT DISPATCHES ON WHAT IT WAS ASKED, not on call order. A fake keyed on
+// position agrees with whatever sequence the code happens to make, so reordering
+// two calls — or dropping one and adding another — leaves it green while the
+// invocations have changed completely. Answering by binary and subcommand makes
+// the fake state what it believes billet asks for, which is the thing under test.
 type recorder struct {
 	calls [][]string
-	out   [][]byte
-	err   error
+	bins  []string
+
+	rawImages string   // raw bytes for the image pool, overriding images
+	images    []string // what `rbd -p <image pool> ls` returns
+	caches    []string // what `rbd -p <cache pool> ls` returns
+	minCompat string   // what `ceph osd get-require-min-compat-client` returns
+	pools     string   // what `ceph osd pool ls detail` returns, as json
+
+	err error // if set, every invocation fails with it
 }
 
-func (r *recorder) run(_ context.Context, _ string, args []string) ([]byte, error) {
+// answer is the default cluster: clone v2, both pools mirrored.
+func answer() *recorder {
+	return &recorder{
+		minCompat: "mimic",
+		pools: `[{"pool_name":"billet-images","size":2,"min_size":1},
+		         {"pool_name":"billet-cache","size":2,"min_size":1}]`,
+	}
+}
+
+func (r *recorder) run(_ context.Context, bin string, args []string) ([]byte, error) {
 	r.calls = append(r.calls, args)
+	r.bins = append(r.bins, bin)
+
 	if r.err != nil {
 		return nil, r.err
 	}
 
-	if len(r.out) == 0 {
-		return []byte(`[]`), nil
+	joined := strings.Join(args, " ")
+
+	switch {
+	case strings.Contains(joined, "get-require-min-compat-client"):
+		return []byte(r.minCompat + "\n"), nil
+
+	case strings.Contains(joined, "pool ls detail"):
+		if r.pools == "" {
+			return []byte(`[]`), nil
+		}
+
+		return []byte(r.pools), nil
+
+	case strings.Contains(joined, "-p billet-images"):
+		if r.rawImages != "" {
+			return []byte(r.rawImages), nil
+		}
+
+		return jsonList(r.images), nil
+
+	case strings.Contains(joined, "-p billet-cache"):
+		return jsonList(r.caches), nil
 	}
 
-	out := r.out[0]
-	if len(r.out) > 1 {
-		r.out = r.out[1:]
+	return []byte(`[]`), nil
+}
+
+func jsonList(names []string) []byte {
+	out, err := json.Marshal(names)
+	if err != nil || names == nil {
+		return []byte(`[]`)
 	}
 
-	return out, nil
+	return out
 }
 
 func client(t *testing.T, cfg config.CephConfig, rec *recorder) *Client {
 	t.Helper()
 
-	c, err := New(cfg, WithBinary("/usr/bin/rbd"), withRunner(rec.run))
+	c, err := New(cfg, WithBinary("/usr/bin/rbd"), WithCephBinary("/usr/bin/ceph"), withRunner(rec.run))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 
 	return c
+}
+
+// rbdCalls is the invocations that went to rbd, which is what the argv
+// assertions are about — the ceph ones interleave and are asserted separately.
+func (r *recorder) rbdCalls() [][]string {
+	var out [][]string
+
+	for i, bin := range r.bins {
+		if strings.HasSuffix(bin, "rbd") {
+			out = append(out, r.calls[i])
+		}
+	}
+
+	return out
 }
 
 // THE ARGUMENTS ARE THE PART WITH MISTAKES IN IT.
@@ -73,15 +134,17 @@ func client(t *testing.T, cfg config.CephConfig, rec *recorder) *Client {
 func TestTheInvocationNamesTheIdentityAndThePool(t *testing.T) {
 	t.Parallel()
 
-	rec := &recorder{out: [][]byte{[]byte(`["ubuntu-2404-x64"]`), []byte(`["job-1","job-2"]`)}}
+	rec := answer()
+	rec.images = []string{"ubuntu-2404-x64"}
+	rec.caches = []string{"job-1", "job-2"}
 
 	report, err := client(t, valid(), rec).CheckReachable(t.Context())
 	if err != nil {
 		t.Fatalf("CheckReachable: %v", err)
 	}
 
-	if len(rec.calls) != 2 {
-		t.Fatalf("rbd was invoked %d times, want one per pool", len(rec.calls))
+	if got := len(rec.rbdCalls()); got != 2 {
+		t.Fatalf("rbd was invoked %d times, want one per pool", got)
 	}
 
 	// THE EXACT ARGV, not a joined substring match. Joining loses token
@@ -92,19 +155,30 @@ func TestTheInvocationNamesTheIdentityAndThePool(t *testing.T) {
 		{"--id", "site-reader", "--format", "json", "-p", "billet-images", "ls"},
 		{"--id", "site-reader", "--format", "json", "-p", "billet-cache", "ls"},
 	} {
-		if !slices.Equal(rec.calls[i], want) {
-			t.Errorf("call %d = %q, want %q", i, rec.calls[i], want)
+		if got := rec.rbdCalls()[i]; !slices.Equal(got, want) {
+			t.Errorf("call %d = %q, want %q", i, got, want)
 		}
 	}
 
 	// The counts are the point of the report, and a check that returned zeroes
 	// alongside a nil error would pass every other assertion here.
-	if report.ImagePool != 1 || report.CachePool != 2 {
-		t.Errorf("report = %+v, want 1 image and 2 caches", report)
+	if len(report.Pools) != 2 || report.Pools[0].Images != 1 || report.Pools[1].Images != 2 {
+		t.Errorf("report = %+v, want 1 image and 2 caches", report.Pools)
+	}
+
+	// IN THE ORDER THE CONFIG NAMES THEM, because the two are printed with
+	// different purposes beside them and a swap would attribute each to the other.
+	if report.Pools[0].Name != "billet-images" || report.Pools[1].Name != "billet-cache" {
+		t.Errorf("the pools are reported as %q then %q", report.Pools[0].Name, report.Pools[1].Name)
 	}
 
 	if report.User != "site-reader" {
 		t.Errorf("report names %q rather than the identity that answered", report.User)
+	}
+
+	if report.MinCompatClient != "mimic" || !report.CloneV2 {
+		t.Errorf("the cluster answered mimic and the report says %q / clone v2 %v",
+			report.MinCompatClient, report.CloneV2)
 	}
 }
 
@@ -117,7 +191,7 @@ func TestTheInvocationNamesTheIdentityAndThePool(t *testing.T) {
 func TestAnOptionalPathIsOmittedRatherThanEmpty(t *testing.T) {
 	t.Parallel()
 
-	rec := &recorder{}
+	rec := answer()
 	if _, err := client(t, valid(), rec).CheckReachable(t.Context()); err != nil {
 		t.Fatalf("CheckReachable: %v", err)
 	}
@@ -144,7 +218,7 @@ func TestAConfiguredPathIsPassed(t *testing.T) {
 	cfg.ConfPath = "/etc/billet/ceph.conf"
 	cfg.KeyringPath = "/etc/billet/billet.keyring"
 
-	rec := &recorder{}
+	rec := answer()
 	if _, err := client(t, cfg, rec).CheckReachable(t.Context()); err != nil {
 		t.Fatalf("CheckReachable: %v", err)
 	}
@@ -159,9 +233,52 @@ func TestAConfiguredPathIsPassed(t *testing.T) {
 			"--keyring", "/etc/billet/billet.keyring",
 			"--format", "json", "-p", pool, "ls",
 		}
-		if !slices.Equal(rec.calls[i], want) {
-			t.Errorf("call %d = %q, want %q", i, rec.calls[i], want)
+		if got := rec.rbdCalls()[i]; !slices.Equal(got, want) {
+			t.Errorf("call %d = %q, want %q", i, got, want)
 		}
+	}
+}
+
+// EVERY COMMAND AUTHENTICATES AS THE SAME CLIENT.
+//
+// rbd and ceph are separate binaries with separate flag parsing, and the identity
+// is what confines both to the pools this node was granted. A ceph call that
+// dropped --id would fall back to client.admin — which is the one answer the whole
+// identity rule exists to prevent, arriving through the command nobody was
+// watching.
+func TestBothCommandsCarryTheSameIdentity(t *testing.T) {
+	t.Parallel()
+
+	cfg := valid()
+	cfg.ConfPath = "/etc/billet/ceph.conf"
+	cfg.KeyringPath = "/etc/billet/billet.keyring"
+
+	rec := answer()
+	if _, err := client(t, cfg, rec).CheckReachable(t.Context()); err != nil {
+		t.Fatalf("CheckReachable: %v", err)
+	}
+
+	var sawCeph bool
+
+	for i, call := range rec.calls {
+		joined := strings.Join(call, " ")
+		for _, must := range []string{
+			"--id site-reader",
+			"--conf /etc/billet/ceph.conf",
+			"--keyring /etc/billet/billet.keyring",
+		} {
+			if !strings.Contains(joined, must) {
+				t.Errorf("%s call %d does not carry %q: %s", rec.bins[i], i, must, joined)
+			}
+		}
+
+		if strings.HasSuffix(rec.bins[i], "ceph") {
+			sawCeph = true
+		}
+	}
+
+	if !sawCeph {
+		t.Error("no ceph invocation was made, so this asserts nothing about the second binary")
 	}
 }
 
@@ -208,7 +325,7 @@ func TestTheConstructorRefusesWhatTheConfigWould(t *testing.T) {
 			cfg := valid()
 			tc.mutate(&cfg)
 
-			c, err := New(cfg, WithBinary("/usr/bin/rbd"))
+			c, err := New(cfg, WithBinary("/usr/bin/rbd"), WithCephBinary("/usr/bin/ceph"))
 			if err == nil {
 				t.Fatalf("New accepted %s", tc.name)
 			}
@@ -232,7 +349,8 @@ func TestTheConstructorRefusesWhatTheConfigWould(t *testing.T) {
 func TestAFailedListNamesThePoolAndTheIdentity(t *testing.T) {
 	t.Parallel()
 
-	rec := &recorder{err: errors.New("exit status 1: rbd: listing images failed: (1) Operation not permitted")}
+	rec := answer()
+	rec.err = errors.New("exit status 1: rbd: listing images failed: (1) Operation not permitted")
 
 	_, err := client(t, valid(), rec).CheckReachable(t.Context())
 	if err == nil {
@@ -264,7 +382,8 @@ func TestUnparseableOutputIsNotRendered(t *testing.T) {
 
 	const secretish = "AQDH631qo1CfBxAA9ZsjJleBiq9V2OqUCfIn9Q=="
 
-	rec := &recorder{out: [][]byte{[]byte("key = " + secretish)}}
+	rec := answer()
+	rec.rawImages = "key = " + secretish
 
 	_, err := client(t, valid(), rec).CheckReachable(t.Context())
 	if err == nil {
@@ -297,7 +416,8 @@ func TestAnInvocationIsBounded(t *testing.T) {
 	//
 	// time.NewTimer rather than time.After, which forbidigo bans for leaking its
 	// timer until it fires.
-	c, err := New(valid(), WithBinary("/usr/bin/rbd"), WithTimeout(20*time.Millisecond),
+	c, err := New(valid(), WithBinary("/usr/bin/rbd"), WithCephBinary("/usr/bin/ceph"),
+		WithTimeout(20*time.Millisecond),
 		withRunner(func(ctx context.Context, _ string, _ []string) ([]byte, error) {
 			safety := time.NewTimer(5 * time.Second)
 			defer safety.Stop()
@@ -509,8 +629,8 @@ func TestAMissingBinaryIsDistinguishable(t *testing.T) {
 		t.Error("New returned a client alongside an error")
 	}
 
-	if !errors.Is(err, ErrNoRBD) {
-		t.Errorf("the error is not ErrNoRBD, so a caller cannot tell it from an unreachable "+
+	if !errors.Is(err, ErrNoClient) {
+		t.Errorf("the error is not ErrNoClient, so a caller cannot tell it from an unreachable "+
 			"cluster: %v", err)
 	}
 
@@ -526,7 +646,7 @@ func TestAMissingBinaryIsDistinguishable(t *testing.T) {
 func TestAnExplicitBinaryNeedsNoPath(t *testing.T) {
 	t.Setenv("PATH", filepath.Join(t.TempDir(), "empty"))
 
-	var ran string
+	var ran []string
 
 	// NOT os.Args[0], not absolute, and with no separator: a WithBinary that
 	// honoured only the test's own executable, only an absolute path, or only
@@ -534,9 +654,15 @@ func TestAnExplicitBinaryNeedsNoPath(t *testing.T) {
 	// job is naming an rbd that is not the one on PATH.
 	const elsewhere = "rbd-from-the-vendor"
 
-	c, err := New(valid(), WithBinary(elsewhere),
-		withRunner(func(_ context.Context, bin string, _ []string) ([]byte, error) {
-			ran = bin
+	c, err := New(valid(), WithBinary(elsewhere), WithCephBinary("ceph-from-the-vendor"),
+		withRunner(func(_ context.Context, bin string, args []string) ([]byte, error) {
+			ran = append(ran, bin)
+
+			// Enough of a cluster to reach the end of the check; what this test is
+			// about is which binaries were run, not what they said.
+			if strings.Contains(strings.Join(args, " "), "get-require-min-compat-client") {
+				return []byte("mimic\n"), nil
+			}
 
 			return []byte(`[]`), nil
 		}))
@@ -550,8 +676,14 @@ func TestAnExplicitBinaryNeedsNoPath(t *testing.T) {
 
 	// THE ONE THAT WAS SUPPLIED, because a constructor that stored the option and
 	// then ran something else would satisfy every other assertion here.
-	if ran != elsewhere {
-		t.Errorf("ran %q, want the binary the option named (%q)", ran, elsewhere)
+	// BOTH NAMES, because two options set two binaries and honouring one while
+	// falling back to PATH for the other is exactly the half-done implementation
+	// this asserts against — and PATH is empty, so the fallback would fail loudly
+	// only if it were reached at construction rather than here.
+	for _, want := range []string{elsewhere, "ceph-from-the-vendor"} {
+		if !slices.Contains(ran, want) {
+			t.Errorf("ran %q, want the binaries the options named (%q missing)", ran, want)
+		}
 	}
 }
 
@@ -807,5 +939,158 @@ func TestASuccessfulExitSurvivesAHeldPipe(t *testing.T) {
 
 	if strings.TrimSpace(string(got.out)) != `["a","b"]` {
 		t.Errorf("the answer was discarded: %q", got.out)
+	}
+}
+
+// THE CLUSTER'S CLONE FORMAT IS A PRECONDITION, and the rule is stated in the
+// direction that stays true.
+//
+// A set of releases at-or-after mimic goes stale on the next Ceph release and
+// starts refusing correct clusters. The set BEFORE mimic can never grow — Ceph is
+// not going to ship a release older than one from 2018 — so an unrecognised name
+// is treated as newer, and the table below asserts both halves of that.
+//
+// The pre-mimic names are measured rather than remembered: every one is a value
+// Ceph 20.2.3 accepts for `osd set-require-min-compat-client`, and a name it does
+// not know is refused with "is not recognized".
+func TestClonesV2(t *testing.T) {
+	t.Parallel()
+
+	for _, release := range []string{
+		"argonaut", "bobtail", "cuttlefish", "dumpling", "emperor", "firefly",
+		"giant", "hammer", "infernalis", "jewel", "kraken", "luminous",
+	} {
+		if ClonesV2(release) {
+			t.Errorf("%s predates clone v2 and was accepted", release)
+		}
+	}
+
+	for _, release := range []string{
+		"mimic", "nautilus", "octopus", "pacific", "quincy", "reef", "squid", "tentacle",
+		// A release that does not exist yet. Refusing it would be the failure mode
+		// this rule is written to avoid: billet going stale and refusing a cluster
+		// that is newer than billet is.
+		"someday",
+	} {
+		if !ClonesV2(release) {
+			t.Errorf("%s is at or after mimic and was refused", release)
+		}
+	}
+
+	// Whatever the cluster's formatting happens to be.
+	for _, release := range []string{"  mimic\n", "MIMIC", " Luminous "} {
+		want := !strings.Contains(strings.ToLower(release), "luminous")
+		if got := ClonesV2(release); got != want {
+			t.Errorf("ClonesV2(%q) = %v, want %v", release, got, want)
+		}
+	}
+}
+
+// A CLUSTER THAT WOULD CLONE THE OLD WAY IS REFUSED, NOT NOTED.
+//
+// On clone v1 a snapshot must be protected before it can be cloned, and a
+// protected snapshot with a live clone can be neither unprotected nor removed —
+// so a cache generation any running job holds a clone of is undeletable and
+// eviction is blocked by ordinary traffic. Nothing in billet clones yet, which is
+// exactly why this is the moment: the fix is one command on an empty cluster.
+func TestAClusterThatClonesTheOldWayIsRefused(t *testing.T) {
+	t.Parallel()
+
+	rec := answer()
+	rec.minCompat = "luminous"
+
+	report, err := client(t, valid(), rec).CheckReachable(t.Context())
+	if err == nil {
+		t.Fatal("CheckReachable accepted a cluster that would clone the old way")
+	}
+
+	if !errors.Is(err, ErrCloneV1) {
+		t.Errorf("the failure is not ErrCloneV1, so a caller cannot tell it from an unreachable "+
+			"cluster: %v", err)
+	}
+
+	// The state it found and the command that fixes it. An operator told only
+	// "refused" has to go and learn what require-min-compat-client is.
+	for _, want := range []string{"luminous", "ceph osd set-require-min-compat-client mimic"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the error does not carry %q: %v", want, err)
+		}
+	}
+
+	// AND THE REPORT SURVIVES THE REFUSAL. What billet learned before the last
+	// question — which pools exist, how they are replicated — is what an operator
+	// needs beside the refusal, and returning a zero value here would throw it away.
+	if report.User == "" || len(report.Pools) != 2 {
+		t.Errorf("the refusal discarded what the check had already established: %+v", report)
+	}
+
+	if report.CloneV2 {
+		t.Error("the report claims clone v2 on a cluster that was refused for not having it")
+	}
+
+	// THE RELEASE THE CLUSTER NAMED, not a constant. It is what `billet check`
+	// prints beside the refusal, and hard-coding it would leave an operator
+	// comparing their cluster against a value billet made up.
+	if report.MinCompatClient != "luminous" {
+		t.Errorf("the report names %q rather than what the cluster answered", report.MinCompatClient)
+	}
+}
+
+// WHAT THE OPERATOR CHOSE IS REPORTED, because it is invisible from the config.
+//
+// billet does not refuse a pool that keeps one copy — how many copies to keep is
+// the operator's decision and billet has no standing to overrule it — but an
+// operator who believes their golden images are mirrored should find out here
+// rather than after a drive dies.
+func TestThePoolReplicationIsReported(t *testing.T) {
+	t.Parallel()
+
+	rec := answer()
+	rec.pools = `[{"pool_name":"billet-images","size":1,"min_size":1},
+	              {"pool_name":"billet-cache","size":3,"min_size":2},
+	              {"pool_name":".mgr","size":2,"min_size":1}]`
+
+	report, err := client(t, valid(), rec).CheckReachable(t.Context())
+	if err != nil {
+		t.Fatalf("CheckReachable: %v", err)
+	}
+
+	if got := report.Pools[0]; got.Size != 1 || got.MinSize != 1 {
+		t.Errorf("image pool = %+v, want the size the cluster reported", got)
+	}
+
+	if got := report.Pools[1]; got.Size != 3 || got.MinSize != 2 {
+		t.Errorf("cache pool = %+v, want the size the cluster reported", got)
+	}
+
+	// A pool billet does not use must not be attributed to one it does.
+	for _, p := range report.Pools {
+		if p.Name == ".mgr" {
+			t.Error("a pool billet was not pointed at is in the report")
+		}
+	}
+}
+
+// A CLUSTER THAT DID NOT SAY IS NOT GUESSED AT.
+//
+// The pool listing is a separate call from the image listing, and a cluster that
+// answers one and not the other is a real state — a pool created between them, or
+// caps that permit `rbd ls` and not `osd pool ls`. Reporting "size 0" would read
+// as a pool with no copies; reporting nothing reads as what it is.
+func TestAPoolTheClusterDidNotDescribeIsNotInvented(t *testing.T) {
+	t.Parallel()
+
+	rec := answer()
+	rec.pools = `[{"pool_name":"something-else","size":2,"min_size":1}]`
+
+	report, err := client(t, valid(), rec).CheckReachable(t.Context())
+	if err != nil {
+		t.Fatalf("CheckReachable: %v", err)
+	}
+
+	for _, p := range report.Pools {
+		if p.Size != 0 || p.MinSize != 0 {
+			t.Errorf("%s was given a replication the cluster never reported: %+v", p.Name, p)
+		}
 	}
 }
