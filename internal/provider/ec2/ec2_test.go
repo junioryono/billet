@@ -576,7 +576,7 @@ func TestARootVolumeIsAlwaysDisposedOfEvenWithNoSizeToSet(t *testing.T) {
 
 // THE LOOKUP IS PAID FOR ONCE PER IMAGE, which is what makes asking on every
 // launch affordable. An AMI's root device does not change.
-func TestTheRootDeviceIsAskedForOncePerImage(t *testing.T) {
+func TestAnImageIsLookedUpOncePerImage(t *testing.T) {
 	f := newFakeEC2(t)
 	p := newTestProvider(t, f, nil)
 
@@ -1875,8 +1875,8 @@ func TestATypedNilCredentialSourceIsRefused(t *testing.T) {
 	}
 }
 
-// BILLET SPEAKS WHENEVER IT DISAGREES WITH THE IMAGE, and the two disagreements
-// are different, so they say different things.
+// BILLET SPEAKS WHENEVER IT CONTRADICTS THE IMAGE OR CHARGES FOR OBEYING IT, and
+// those are different things, so they say different things.
 //
 // A NON-ROOT volume the image marks as surviving is honoured — billet passes the
 // flag back — and warned about, because it leaks one volume PER JOB, tagged and
@@ -1897,9 +1897,11 @@ func TestAnImageWhoseVolumesOutliveItIsReported(t *testing.T) {
 		return http.StatusOK, `<DescribeImagesResponse><imagesSet><item>` +
 			`<imageId>ami-0abc</imageId><rootDeviceName>/dev/xvda</rootDeviceName>` +
 			`<blockDeviceMapping>` +
-			// The root, which billet overrides — and says so.
+			// The root, which billet overrides — and says so. Spelled "0" rather
+			// than "false" so the root branch has to go through survivesTermination
+			// like every other device; reading only the word here left a mutant alive.
 			`<item><deviceName>/dev/xvda</deviceName><ebs>` +
-			`<deleteOnTermination>false</deleteOnTermination></ebs></item>` +
+			`<deleteOnTermination>0</deleteOnTermination></ebs></item>` +
 			// A second volume the image keeps. This is the one.
 			`<item><deviceName>/dev/sdb</deviceName><ebs>` +
 			`<deleteOnTermination>false</deleteOnTermination></ebs></item>` +
@@ -1930,13 +1932,33 @@ func TestAnImageWhoseVolumesOutliveItIsReported(t *testing.T) {
 	// THE ROOT IS REPORTED, and differently. billet is reversing what this image
 	// asked for rather than honouring it, so the one case it must not do quietly is
 	// the one where it wins the disagreement.
-	if !strings.Contains(got, "/dev/xvda") {
-		t.Errorf("billet overrode the image's root flag without saying so: %s", got)
+	//
+	// CHECKED LINE BY LINE RATHER THAN OVER THE WHOLE BUFFER, because a buffer-level
+	// Contains proves only that both words appear somewhere — it would pass if the
+	// root marker leaked into the non-root message, which is the confusion the two
+	// messages exist to prevent.
+	root, other := "", ""
+
+	for _, line := range strings.Split(strings.TrimSpace(got), "\n") {
+		switch {
+		case strings.Contains(line, "/dev/xvda"):
+			root = line
+		case strings.Contains(line, "/dev/sdb"):
+			other = line
+		}
 	}
 
-	if !strings.Contains(got, "ROOT") {
-		t.Errorf("the root override was not distinguished from an honoured volume, so an "+
-			"operator cannot tell which way billet went: %s", got)
+	if root == "" {
+		t.Fatalf("billet overrode the image's root flag without saying so: %s", got)
+	}
+
+	if !strings.Contains(root, "ROOT") || !strings.Contains(root, "overriding") {
+		t.Errorf("the root line does not say billet overrode it: %q", root)
+	}
+
+	if strings.Contains(other, "ROOT") || strings.Contains(other, "overriding") {
+		t.Errorf("the honoured volume's line reads like an override, so an operator cannot "+
+			"tell which way billet went: %q", other)
 	}
 
 	if strings.Contains(got, "/dev/sdc") {
@@ -1999,11 +2021,22 @@ func TestAVolumeMarkedWithTheOtherBooleanSpellingIsStillReported(t *testing.T) {
 // device it launches.
 //
 // The three cases differ in what billet is entitled to decide. A mapping that
-// said nothing is billet's to decide, and it decides delete. A mapping that said
-// false is the OPERATOR talking about their own AMI, so it is passed back
-// unchanged — quietly deleting a volume somebody deliberately marked to keep
+// said nothing is billet's to decide, and it decides delete. A NON-ROOT mapping
+// that said false is the OPERATOR talking about their own AMI, so it is passed
+// back unchanged — quietly deleting a volume somebody deliberately marked to keep
 // would be data loss dressed as tidiness. A mapping that said true is restated as
 // true, which changes nothing and costs nothing.
+//
+// The root is not one of the three: it is always sent true whatever it said, and
+// TestTheRootIsDeletedEvenWhenTheImageAsksToKeepIt is where that is pinned. This
+// fixture's root says true, so the exception never shows here — which is exactly
+// why the sentence above has to name it.
+//
+// AND THE ROOT WARNING MUST STAY SILENT, which is the other half of the rule and
+// the half nothing asserted until a reviewer went looking for a mutant that
+// survives: billet speaks when it contradicts the image and is silent when it
+// merely fills a gap. This fixture contradicts nothing, so nothing should be
+// said.
 func TestEveryImageDeviceLaunchesWithAnExplicitTerminationFlag(t *testing.T) {
 	f := newFakeEC2(t)
 	f.respond = func(action string, params url.Values) (int, string) {
@@ -2024,10 +2057,18 @@ func TestEveryImageDeviceLaunchesWithAnExplicitTerminationFlag(t *testing.T) {
 			`</blockDeviceMapping></item></imagesSet></DescribeImagesResponse>`
 	}
 
+	var logged bytes.Buffer
+
 	p := newTestProvider(t, f, nil)
+	p.log = slog.New(slog.NewTextHandler(&logged, nil))
 
 	if _, err := p.Launch(t.Context(), validSpec()); err != nil {
 		t.Fatalf("Launch: %v", err)
+	}
+
+	if strings.Contains(logged.String(), "ROOT") {
+		t.Errorf("billet announced a root override on an image whose root asked for nothing "+
+			"of the kind: %s", logged.String())
 	}
 
 	got := f.paramsFor(t, "RunInstances")

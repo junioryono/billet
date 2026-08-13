@@ -367,10 +367,11 @@ type describeImagesResponse struct {
 	Images []struct {
 		ImageID        string `xml:"imageId"`
 		RootDeviceName string `xml:"rootDeviceName"`
-		// BlockDevices are the image's own mappings. billet restates
-		// DeleteOnTermination for every one of them at launch (#53), so these are
-		// read to BUILD that request — and to warn about the ones the image asks
-		// to keep.
+		// BlockDevices are the image's own mappings. billet states
+		// DeleteOnTermination at launch for the EBS ones (#53), so these are read to
+		// BUILD that request — and to warn about the ones the image asks to keep.
+		// Mappings with no <ebs> child, and any with no device name, are not
+		// restated; the root is stated by setBlockDevices rather than from here.
 		BlockDevices []struct {
 			DeviceName string `xml:"deviceName"`
 			// A POINTER BECAUSE ABSENCE IS MEANINGFUL. A mapping with no <ebs>
