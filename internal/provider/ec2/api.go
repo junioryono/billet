@@ -367,13 +367,18 @@ type describeImagesResponse struct {
 	Images []struct {
 		ImageID        string `xml:"imageId"`
 		RootDeviceName string `xml:"rootDeviceName"`
-		// BlockDevices are the image's own mappings. billet sets
-		// DeleteOnTermination for the ROOT and cannot for the rest without
-		// restating each one — so these are read to WARN, because a mapping the
-		// image marks as surviving termination leaks a volume per job.
+		// BlockDevices are the image's own mappings. billet restates
+		// DeleteOnTermination for every one of them at launch (#53), so these are
+		// read to BUILD that request — and to warn about the ones the image asks
+		// to keep.
 		BlockDevices []struct {
 			DeviceName string `xml:"deviceName"`
-			EBS        struct {
+			// A POINTER BECAUSE ABSENCE IS MEANINGFUL. A mapping with no <ebs>
+			// child is an instance-store or suppressed device, and handing EC2 an
+			// Ebs.DeleteOnTermination for one is a request about a volume that does
+			// not exist. A value type cannot express that: an absent <ebs> and a
+			// present-but-empty one would both decode to the zero struct.
+			EBS *struct {
 				DeleteOnTermination string `xml:"deleteOnTermination"`
 			} `xml:"ebs"`
 		} `xml:"blockDeviceMapping>item"`

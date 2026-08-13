@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1918,7 +1919,7 @@ func TestAnImageWhoseVolumesOutliveItIsReported(t *testing.T) {
 	got := logged.String()
 
 	if !strings.Contains(got, "/dev/sdb") {
-		t.Errorf("the volume that outlives its instance was not reported: %s", got)
+		t.Errorf("the volume the image asks to keep was not reported: %s", got)
 	}
 
 	// THE ROOT IS NOT REPORTED, because billet sets that one itself — a warning
@@ -1978,17 +1979,194 @@ func TestAVolumeMarkedWithTheOtherBooleanSpellingIsStillReported(t *testing.T) {
 	}
 }
 
-// A RESPONSE THAT OMITS DeleteOnTermination IS NOT WARNED ABOUT.
+// EVERY EBS DEVICE THE IMAGE DECLARES LEAVES WITH AN EXPLICIT FLAG (#53).
 //
-// Note what the name does NOT say: not that the image sets no attribute, only
-// that the response carried none. Everything past that is inference about a
-// system this package has never spoken to.
+// This is the test that makes the argument about EC2's default irrelevant rather
+// than resolved. AWS documents that default two ways and the two disagree for
+// exactly this case, so billet stops depending on it: whatever the image says or
+// does not say, the RunInstances request states DeleteOnTermination for every
+// device it launches.
 //
-// And silence here is a choice rather than a conclusion — AWS documents two
-// conflicting defaults for this case, so it can be wrong in the direction of
-// missing a leak. The reasoning, both citations and what would settle it live at
-// the call site in ec2.go; this pins the behaviour, separately from the test that
-// asserts what IS reported.
+// The three cases differ in what billet is entitled to decide. A mapping that
+// said nothing is billet's to decide, and it decides delete. A mapping that said
+// false is the OPERATOR talking about their own AMI, so it is passed back
+// unchanged — quietly deleting a volume somebody deliberately marked to keep
+// would be data loss dressed as tidiness. A mapping that said true is restated as
+// true, which changes nothing and costs nothing.
+func TestEveryImageDeviceLaunchesWithAnExplicitTerminationFlag(t *testing.T) {
+	f := newFakeEC2(t)
+	f.respond = func(action string, params url.Values) (int, string) {
+		if action != "DescribeImages" {
+			return http.StatusOK, defaultReply(action)
+		}
+
+		return http.StatusOK, `<DescribeImagesResponse><imagesSet><item>` +
+			`<imageId>ami-0abc</imageId><rootDeviceName>/dev/xvda</rootDeviceName>` +
+			`<blockDeviceMapping>` +
+			`<item><deviceName>/dev/xvda</deviceName><ebs>` +
+			`<deleteOnTermination>true</deleteOnTermination></ebs></item>` +
+			`<item><deviceName>/dev/sdb</deviceName><ebs></ebs></item>` +
+			`<item><deviceName>/dev/sdc</deviceName><ebs>` +
+			`<deleteOnTermination>false</deleteOnTermination></ebs></item>` +
+			`<item><deviceName>/dev/sdd</deviceName><ebs>` +
+			`<deleteOnTermination>true</deleteOnTermination></ebs></item>` +
+			`</blockDeviceMapping></item></imagesSet></DescribeImagesResponse>`
+	}
+
+	p := newTestProvider(t, f, nil)
+
+	if _, err := p.Launch(t.Context(), validSpec()); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	got := f.paramsFor(t, "RunInstances")
+
+	// The device order is the image's, after the root took index 1.
+	want := map[string]string{
+		"/dev/xvda": "true",  // root, stated by billet itself
+		"/dev/sdb":  "true",  // said nothing -> billet decides delete
+		"/dev/sdc":  "false", // said keep -> honoured
+		"/dev/sdd":  "true",  // said delete -> restated
+	}
+
+	seen := map[string]string{}
+
+	for i := 1; ; i++ {
+		n := strconv.Itoa(i)
+
+		device := got.Get("BlockDeviceMapping." + n + ".DeviceName")
+		if device == "" {
+			break
+		}
+
+		flag := got.Get("BlockDeviceMapping." + n + ".Ebs.DeleteOnTermination")
+		if flag == "" {
+			t.Errorf("device %s left with no DeleteOnTermination, which is the whole "+
+				"defect #53 exists to close", device)
+		}
+
+		seen[device] = flag
+	}
+
+	for device, flag := range want {
+		if seen[device] != flag {
+			t.Errorf("%s went out with DeleteOnTermination=%q, want %q", device, seen[device], flag)
+		}
+	}
+
+	if len(seen) != len(want) {
+		t.Errorf("sent %d devices, want %d: %v", len(seen), len(want), seen)
+	}
+}
+
+// A MAPPING THAT IS NOT AN EBS VOLUME IS NOT GIVEN AN EBS PARAMETER.
+//
+// An instance-store or suppressed mapping has no <ebs> child, and sending
+// Ebs.DeleteOnTermination for one asks EC2 about a volume that does not exist.
+// The response type models this with a POINTER for exactly this reason: a value
+// type would decode "no <ebs> element" and "<ebs></ebs>" to the same zero struct,
+// and this test would be impossible to write.
+func TestANonEBSMappingIsNotRestated(t *testing.T) {
+	f := newFakeEC2(t)
+	f.respond = func(action string, params url.Values) (int, string) {
+		if action != "DescribeImages" {
+			return http.StatusOK, defaultReply(action)
+		}
+
+		return http.StatusOK, `<DescribeImagesResponse><imagesSet><item>` +
+			`<imageId>ami-0abc</imageId><rootDeviceName>/dev/xvda</rootDeviceName>` +
+			`<blockDeviceMapping>` +
+			`<item><deviceName>/dev/sdb</deviceName><virtualName>ephemeral0</virtualName></item>` +
+			`</blockDeviceMapping></item></imagesSet></DescribeImagesResponse>`
+	}
+
+	p := newTestProvider(t, f, nil)
+
+	if _, err := p.Launch(t.Context(), validSpec()); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	got := f.paramsFor(t, "RunInstances")
+
+	for i := 1; ; i++ {
+		n := strconv.Itoa(i)
+
+		device := got.Get("BlockDeviceMapping." + n + ".DeviceName")
+		if device == "" {
+			break
+		}
+
+		if device == "/dev/sdb" {
+			t.Errorf("an instance-store mapping was sent as an EBS device: %s=%q",
+				"BlockDeviceMapping."+n+".Ebs.DeleteOnTermination",
+				got.Get("BlockDeviceMapping."+n+".Ebs.DeleteOnTermination"))
+		}
+	}
+}
+
+// THE INDICES ARE CONTIGUOUS FROM 1, because EC2 stops reading at the first gap.
+//
+// A skipped device (the root, or a non-EBS mapping) must close the hole rather
+// than leave one: numbering by position in the image's list would silently drop
+// every device after the first thing billet declined to restate.
+func TestBlockDeviceIndicesAreContiguous(t *testing.T) {
+	f := newFakeEC2(t)
+	f.respond = func(action string, params url.Values) (int, string) {
+		if action != "DescribeImages" {
+			return http.StatusOK, defaultReply(action)
+		}
+
+		// The root and an instance-store device are both skipped, and they sit
+		// BEFORE the two real volumes so a positional bug cannot hide.
+		return http.StatusOK, `<DescribeImagesResponse><imagesSet><item>` +
+			`<imageId>ami-0abc</imageId><rootDeviceName>/dev/xvda</rootDeviceName>` +
+			`<blockDeviceMapping>` +
+			`<item><deviceName>/dev/xvda</deviceName><ebs></ebs></item>` +
+			`<item><deviceName>/dev/sda</deviceName><virtualName>ephemeral0</virtualName></item>` +
+			`<item><deviceName>/dev/sdb</deviceName><ebs></ebs></item>` +
+			`<item><deviceName>/dev/sdc</deviceName><ebs></ebs></item>` +
+			`</blockDeviceMapping></item></imagesSet></DescribeImagesResponse>`
+	}
+
+	p := newTestProvider(t, f, nil)
+
+	if _, err := p.Launch(t.Context(), validSpec()); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	got := f.paramsFor(t, "RunInstances")
+
+	for _, want := range []struct {
+		index  string
+		device string
+	}{
+		{"1", "/dev/xvda"},
+		{"2", "/dev/sdb"},
+		{"3", "/dev/sdc"},
+	} {
+		if d := got.Get("BlockDeviceMapping." + want.index + ".DeviceName"); d != want.device {
+			t.Errorf("BlockDeviceMapping.%s.DeviceName = %q, want %q", want.index, d, want.device)
+		}
+	}
+
+	if d := got.Get("BlockDeviceMapping.4.DeviceName"); d != "" {
+		t.Errorf("a fourth device was sent (%q); only three should have been", d)
+	}
+}
+
+// A RESPONSE THAT OMITS DeleteOnTermination IS NOT WARNED ABOUT — because there
+// is nothing left to warn about.
+//
+// This assertion used to rest on an argument, and #53 replaced the argument with
+// a fact. Silence in the response no longer means billet does not know what will
+// happen to the volume; billet is about to state the answer itself, and
+// TestEveryImageDeviceLaunchesWithAnExplicitTerminationFlag is where that is
+// pinned. So the case that once forced a judgement call now has none in it.
+//
+// Note also what the name does NOT say: not that the image sets no attribute,
+// only that the response carried none. The distinction stopped being load-bearing
+// when billet stopped inferring anything from it, which is the better reason for
+// the distinction to have gone quiet than the one it had before.
 func TestAResponseOmittingTerminationIsNotWarnedAbout(t *testing.T) {
 	f := newFakeEC2(t)
 	f.respond = func(action string, params url.Values) (int, string) {
@@ -2016,7 +2194,7 @@ func TestAResponseOmittingTerminationIsNotWarnedAbout(t *testing.T) {
 	}
 
 	if strings.Contains(logged.String(), "/dev/sdq") {
-		t.Errorf("a mapping that says nothing about termination was warned about: %s",
-			logged.String())
+		t.Errorf("a response carrying no termination flag was warned about, though billet "+
+			"states that device's flag itself: %s", logged.String())
 	}
 }
