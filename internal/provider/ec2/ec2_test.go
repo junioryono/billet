@@ -2126,8 +2126,10 @@ func TestATypedNilCredentialSourceIsRefused(t *testing.T) {
 // intent is being reversed, and finding that out from a missing volume is worse
 // than reading it once.
 //
-// What billet does NOT warn about is filling a gap. A mapping that stated nothing
-// gets billet's answer in silence, because there was no intent to contradict.
+// What billet does NOT warn about on THIS channel is filling a gap: a mapping
+// that stated nothing gets billet's answer without an override notice, because
+// there was no intent to contradict. It does get a line on the other channel, for
+// carrying a value billet could not read — a different subject.
 func TestAnImageWhoseVolumesOutliveItIsReported(t *testing.T) {
 	f := newFakeEC2(t)
 	f.respond = func(action string, params url.Values) (int, string) {
@@ -2139,8 +2141,8 @@ func TestAnImageWhoseVolumesOutliveItIsReported(t *testing.T) {
 			`<imageId>ami-0abc</imageId><rootDeviceName>/dev/xvda</rootDeviceName>` +
 			`<blockDeviceMapping>` +
 			// The root, which billet overrides — and says so. Spelled "0" rather
-			// than "false" so the root branch has to go through survivesTermination
-			// like every other device; reading only the word here left a mutant alive.
+			// than "false" so the root branch has to go through readTermination like
+			// every other device; reading only the word here left a mutant alive.
 			`<item><deviceName>/dev/xvda</deviceName><ebs>` +
 			`<deleteOnTermination>0</deleteOnTermination></ebs></item>` +
 			// A second volume the image keeps. This is the one.
@@ -2211,8 +2213,8 @@ func TestAnImageWhoseVolumesOutliveItIsReported(t *testing.T) {
 // same leak.
 //
 // `xs:boolean` admits "1" and "0" alongside the words. EC2 emits lowercase words
-// in practice — which is somebody else's observation, since nothing here has run
-// against a real account — so accepting both errs toward saying something.
+// in every image measured against a real account — but the digits are in
+// xs:boolean's lexical space and cost one case arm, so both are read.
 func TestAVolumeMarkedWithTheOtherBooleanSpellingIsStillReported(t *testing.T) {
 	f := newFakeEC2(t)
 	f.respond = func(action string, params url.Values) (int, string) {
@@ -2591,6 +2593,19 @@ func TestAFlagBilletCannotReadIsReported(t *testing.T) {
 				t.Errorf("%q was resolved without a word: %s", value, got)
 			}
 
+			// AND THE OFFENDING VALUE IS IN THE LINE. Without it an operator is told
+			// something is wrong with a device and left to go fetch the AMI to find
+			// out what — which is the difference between a warning and an errand.
+			// EITHER FORM, because slog quotes an attribute only when it has to — the
+			// whitespace row comes out quoted and the rest do not.
+			plain := strings.Contains(got, "value="+value)
+			quoted := strings.Contains(got, "value="+strconv.Quote(value))
+
+			if !plain && !quoted {
+				t.Errorf("the line does not carry the value it could not read (%q): %s",
+					value, got)
+			}
+
 			// AND IT STILL LAUNCHED, stating delete. Reporting the oddity must not
 			// become refusing the job over a field EC2 marks optional.
 			if v := f.paramsFor(t, "RunInstances").Get("BlockDeviceMapping.2.Ebs.DeleteOnTermination"); v != "true" {
@@ -2612,9 +2627,12 @@ func TestTheFourBooleanTokensAreReadWithoutComplaint(t *testing.T) {
 		"0":       intentKeep,
 		" true ":  intentDelete,
 		" false ": intentKeep,
-		"":        intentUnreadable,
-		"False":   intentUnreadable,
-		"yes":     intentUnreadable,
+		"\t0\r\n": intentKeep,
+		// NBSP is whitespace to Go and not to XML, so this is not a boolean.
+		"\u00a0false\u00a0": intentUnreadable,
+		"":                  intentUnreadable,
+		"False":             intentUnreadable,
+		"yes":               intentUnreadable,
 	} {
 		if got := readTermination(value); got != want {
 			t.Errorf("readTermination(%q) = %v, want %v", value, got, want)
@@ -2622,7 +2640,7 @@ func TestTheFourBooleanTokensAreReadWithoutComplaint(t *testing.T) {
 	}
 }
 
-// A ROOT THAT DID NOT ASK TO BE KEPT IS OVERRIDDEN IN SILENCE.
+// A ROOT THAT ASKED TO BE DELETED IS RESTATED IN SILENCE.
 //
 // The other half of "speak only when billet contradicts the image", swept across
 // every spelling that means keep-nothing. The comprehensive test covers the absent
@@ -2785,7 +2803,7 @@ func TestAMappingWithNoDeviceNameIsSkipped(t *testing.T) {
 // A live account then showed a registered image reading back with the value
 // present, and no image in a 26,044-image corpus omitting it. So an omission is no
 // longer an ordinary state to be guessed at — it is a response that does not look
-// like the ones that were observed, which is worth exactly one line per image.
+// like the ones that were observed, which is worth one line per affected device.
 //
 // The launch is NOT refused: billet states delete and carries on, because turning
 // a missing optional field into a failed CI job is worse than deleting a volume
