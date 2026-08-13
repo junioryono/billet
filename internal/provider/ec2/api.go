@@ -368,21 +368,31 @@ type describeImagesResponse struct {
 	Images []struct {
 		ImageID        string `xml:"imageId"`
 		RootDeviceName string `xml:"rootDeviceName"`
+		// RootDeviceType is "ebs" or "instance-store". billet requires the first
+		// and refuses the second up front (#54), because every root parameter it
+		// sends is EBS-shaped.
+		RootDeviceType string `xml:"rootDeviceType"`
 		// BlockDevices are the image's own mappings. billet states
 		// DeleteOnTermination at launch for the EBS ones (#53), so these are read to
 		// BUILD that request — and to warn about the ones the image asks to keep.
 		// Mappings with no <ebs> child, and any with no device name, are not
 		// restated; the root is stated by setBlockDevices rather than from here.
-		BlockDevices []struct {
-			DeviceName string `xml:"deviceName"`
-			// A POINTER BECAUSE ABSENCE IS MEANINGFUL. A mapping with no <ebs>
-			// child is an instance-store or suppressed device, and handing EC2 an
-			// Ebs.DeleteOnTermination for one is a request about a volume that does
-			// not exist. A value type cannot express that: an absent <ebs> and a
-			// present-but-empty one would both decode to the zero struct.
-			EBS *struct {
-				DeleteOnTermination string `xml:"deleteOnTermination"`
-			} `xml:"ebs"`
-		} `xml:"blockDeviceMapping>item"`
+		BlockDevices []imageMapping `xml:"blockDeviceMapping>item"`
 	} `xml:"imagesSet>item"`
+}
+
+// imageMapping is one entry of an image's block device mapping.
+type imageMapping struct {
+	DeviceName string `xml:"deviceName"`
+	// A POINTER BECAUSE ABSENCE IS MEANINGFUL. A mapping with no <ebs> child is an
+	// instance-store or suppressed device, and handing EC2 an
+	// Ebs.DeleteOnTermination for one is a request about a volume that does not
+	// exist. A value type cannot express that: an absent <ebs> and a
+	// present-but-empty one would both decode to the zero struct.
+	//
+	// It is also how billet establishes that a root is EBS-backed when the image
+	// does not report its root device type: see requireEBSRoot.
+	EBS *struct {
+		DeleteOnTermination string `xml:"deleteOnTermination"`
+	} `xml:"ebs"`
 }
