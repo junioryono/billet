@@ -86,6 +86,7 @@ func commands(lc *lifecycle) []command {
 		{"leases", "show capacity held for compute nobody has accounted for", cmdLeases},
 		{"check", "validate the config and state directory, then exit", cmdCheck},
 		{"init", "generate a billet.yaml interactively", cmdInit},
+		{"ami", "build the machine image the ec2 backend launches", cmdAMI},
 		{"github-app", "create and install the GitHub App billet uses", cmdGitHubApp},
 		{"teardown", "delete the scale sets billet created on GitHub", cmdTeardown},
 		{"status", "show cluster status", cmdStatus},
