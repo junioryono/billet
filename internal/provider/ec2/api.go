@@ -362,7 +362,8 @@ type describeInstancesResponse struct {
 }
 
 // describeImagesResponse carries what billet needs from an AMI: which device is
-// root, and every OTHER volume the image would attach.
+// root, and EVERY mapping the image declares — the root included, because whether
+// billet says anything about overriding it depends on what that entry said.
 type describeImagesResponse struct {
 	Images []struct {
 		ImageID        string `xml:"imageId"`
