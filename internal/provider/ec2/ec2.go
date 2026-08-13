@@ -774,9 +774,14 @@ func (p *Provider) setBlockDevices(ctx context.Context, params url.Values, spec 
 // zero-disk tier would not need the resize, so what rules it out is the wider
 // request shape — the volume tag specification billet always sends describes a
 // resource an instance-store launch never creates. Supporting it means a second,
-// conditional request shape on the one path a live measurement blessed. AWS
-// documents these AMIs as legacy and confined to previous-generation instance
-// types, so this is a declined legacy path rather than an impossibility.
+// conditional request shape on the one path a live measurement blessed.
+//
+// And the population it would serve is narrower than "instance-store AMIs": AWS
+// lists the instance types that can boot one at all — C1, C3, D2, I2, M1, M2, M3,
+// R3 and X1 [3] — every one previous-generation. So the question only arises for a
+// deployment that has pinned one of those nine families AND supplied such an
+// image. This is a declined legacy path rather than an impossibility, and a very
+// quiet one.
 //
 // THE FALLBACK IS NOT THEORETICAL, which was worth checking rather than assuming
 // since the whole rule rests on it. Across 26,052 Amazon-owned AMIs in us-west-2
@@ -795,6 +800,8 @@ func (p *Provider) setBlockDevices(ctx context.Context, params url.Values, spec 
 // And the scope is the usual one: Amazon-owned, one region, one day. An
 // operator-built or imported image is not in that population, which is precisely
 // the case the corroborating route exists to serve.
+//
+// [3]: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/RootDeviceStorage.html
 func requireEBSRoot(image, rootType, rootDevice string, mappings []imageMapping) error {
 	if rootType == "ebs" {
 		return nil

@@ -277,7 +277,6 @@ func defaultReply(action string) string {
 		return `<DescribeImagesResponse><imagesSet><item>` +
 			`<imageId>ami-0abc</imageId><rootDeviceName>/dev/xvda</rootDeviceName>` +
 			`<rootDeviceType>ebs</rootDeviceType>` +
-			`<rootDeviceType>ebs</rootDeviceType>` +
 			`<blockDeviceMapping><item><deviceName>/dev/xvda</deviceName><ebs>` +
 			`<deleteOnTermination>true</deleteOnTermination></ebs></item>` +
 			`</blockDeviceMapping>` +
