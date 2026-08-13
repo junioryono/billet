@@ -742,6 +742,73 @@ func (p *Provider) setBlockDevices(ctx context.Context, params url.Values, spec 
 	return nil
 }
 
+// requireEBSRoot refuses an image whose root is not an EBS volume (#54).
+//
+// EC2 supports both root types, and every root parameter billet sends is
+// EBS-shaped: setBlockDevices writes Ebs.DeleteOnTermination unconditionally and
+// Ebs.VolumeSize when a tier asks for a disk. An instance-store root has no EBS
+// volume behind it, so those describe a device that does not exist.
+//
+// WITHOUT THIS THE FAILURE ARRIVES LATE AND WEARING THE WRONG NAME. The lease is
+// already escrowed and the job already placed on this node by the time Launch
+// runs, so the operator gets an AWS parameter error naming a device they never
+// wrote — once per job, for every job on that tier — rather than one sentence
+// saying this backend needs an EBS-backed AMI.
+//
+// AN OMITTED TYPE IS ANSWERED FROM THE SAME RESPONSE rather than guessed at, and
+// that is the part worth reading. The field is optional, so its absence is
+// reachable and proves nothing either way — and the first version of this took
+// that as licence to allow it through, on an argument about which error was worse.
+// A reviewer pointed out that the evidence was sitting in the reply the whole
+// time: if the mapping whose device name equals rootDeviceName carries an <ebs>
+// child, the root IS EBS-backed, said by EC2 in a different sentence of the same
+// answer. So absence is settled by looking rather than by choosing, and only an
+// image that proves EBS by NEITHER route is refused.
+//
+// That is strictly better than the coin flip it replaced. It cannot admit an
+// instance-store root that omitted its type, and it cannot refuse a healthy image
+// over a field EC2 declined to send — where the previous rule had to lose one of
+// those two.
+//
+// REFUSED RATHER THAN SUPPORTED, and the reason is narrower than it first looks: a
+// zero-disk tier would not need the resize, so what rules it out is the wider
+// request shape — the volume tag specification billet always sends describes a
+// resource an instance-store launch never creates. Supporting it means a second,
+// conditional request shape on the one path a live measurement blessed. AWS
+// documents these AMIs as legacy and confined to previous-generation instance
+// types, so this is a declined legacy path rather than an impossibility.
+//
+// NOT MEASURED, unlike the block-device behaviour this backend settled against a
+// live account, and the population is thin enough that it may stay that way:
+// Amazon publishes ZERO instance-store AMIs in the region that was measured. So
+// this is written from the documented existence of the root type, not from an
+// observed failure — which is also why it refuses rather than launching and
+// interpreting whatever comes back.
+func requireEBSRoot(image, rootType, rootDevice string, mappings []imageMapping) error {
+	if rootType == "ebs" {
+		return nil
+	}
+
+	if rootType == "" {
+		for _, bd := range mappings {
+			if bd.DeviceName == rootDevice && bd.EBS != nil {
+				return nil
+			}
+		}
+
+		return fmt.Errorf("ec2: image %s does not report a root device type, and its block "+
+			"device mapping does not describe %s as an EBS volume either, so billet cannot "+
+			"establish that it is EBS-backed — which this backend requires, because it states "+
+			"what becomes of the root volume on every launch and resizes it when a tier asks "+
+			"for a disk", image, rootDevice)
+	}
+
+	return fmt.Errorf("ec2: image %s is %s-backed, and billet's ec2 backend requires an "+
+		"EBS-backed AMI: it states what becomes of the root volume on every launch and resizes "+
+		"it when a tier asks for a disk, neither of which an instance-store root can do",
+		image, rootType)
+}
+
 // imageLayout reports an AMI's root device and the mappings billet will restate,
 // asking once per image.
 //
@@ -772,51 +839,17 @@ func (p *Provider) imageLayout(ctx context.Context, image string) (imageLayout, 
 			"cannot see it", image, p.cfg.Region)
 	}
 
-	// AN INSTANCE-STORE ROOT IS REFUSED HERE, where the lookup already fails closed
-	// on an image billet cannot use.
-	//
-	// EC2 supports both root types, and every root parameter billet sends is
-	// EBS-shaped: setBlockDevices writes Ebs.DeleteOnTermination unconditionally and
-	// Ebs.VolumeSize when a tier asks for a disk. An instance-store root has no EBS
-	// volume behind it, so those describe a device that does not exist.
-	//
-	// WITHOUT THIS THE FAILURE ARRIVES LATE AND WEARING THE WRONG NAME. The lease is
-	// already escrowed and the job already placed on this node by the time Launch
-	// runs, so the operator gets an AWS parameter error naming a device they never
-	// wrote, once per job, for every job on that tier — rather than one sentence
-	// saying this backend needs an EBS-backed AMI.
-	//
-	// It is also not supportable rather than merely unimplemented: billet resizes
-	// the root for the tier, and an instance-store root cannot be resized, so a
-	// tier's disk contract could not be met on such an image even if the request
-	// were shaped correctly.
-	//
-	// AN ABSENT TYPE IS ALLOWED THROUGH, and silently, unlike the absent termination
-	// flag a few lines down — billet takes the same action for absent as for "ebs",
-	// so there is no resolved decision to surface, and refusing on absence would
-	// fail every launch fleet-wide the moment any path omits the field. The test
-	// header carries the full argument.
-	//
-	// NOT MEASURED, unlike the block-device behaviour above, and the population is
-	// thin enough that it may stay that way: Amazon publishes ZERO instance-store
-	// AMIs in the region that was measured. So this is a refusal written from the
-	// documented existence of the root type, not from an observed failure — which
-	// is also why it refuses rather than trying to launch and interpret whatever
-	// comes back.
 	layout := imageLayout{root: out.Images[0].RootDeviceName}
-
-	if rootType := out.Images[0].RootDeviceType; rootType != "" && rootType != "ebs" {
-		return imageLayout{}, fmt.Errorf("ec2: image %s is %s-backed, and billet's ec2 backend "+
-			"requires an EBS-backed AMI: it states what becomes of the root volume on every "+
-			"launch and resizes it when a tier asks for a disk, neither of which an "+
-			"instance-store root can do", image, rootType)
-	}
-
 	if layout.root == "" {
 		return imageLayout{}, fmt.Errorf("ec2: image %s reports no root device name, so billet "+
 			"cannot say what becomes of its root volume, and guessing one is not an option: a "+
 			"wrong name describes a device that is not the root either way, silently attaching "+
 			"a second disk when the tier set a size and refused outright when it did not", image)
+	}
+
+	if err := requireEBSRoot(image, out.Images[0].RootDeviceType, layout.root,
+		out.Images[0].BlockDevices); err != nil {
+		return imageLayout{}, err
 	}
 
 	for _, bd := range out.Images[0].BlockDevices {

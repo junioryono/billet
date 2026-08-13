@@ -267,8 +267,20 @@ func defaultReply(action string) string {
 			`</item></instancesSet></RunInstancesResponse>`
 
 	case "DescribeImages":
+		// SHAPED LIKE A REAL RESPONSE, which this did not used to be. It reported a
+		// root device NAME and nothing else; every image measured against a live
+		// account reports its root device TYPE and describes that device in its
+		// block device mapping. The gap did not matter until billet started
+		// requiring evidence that a root is EBS-backed, at which point this fixture
+		// described an image billet correctly refuses — and six unrelated tests went
+		// red for the right reason.
 		return `<DescribeImagesResponse><imagesSet><item>` +
 			`<imageId>ami-0abc</imageId><rootDeviceName>/dev/xvda</rootDeviceName>` +
+			`<rootDeviceType>ebs</rootDeviceType>` +
+			`<rootDeviceType>ebs</rootDeviceType>` +
+			`<blockDeviceMapping><item><deviceName>/dev/xvda</deviceName><ebs>` +
+			`<deleteOnTermination>true</deleteOnTermination></ebs></item>` +
+			`</blockDeviceMapping>` +
 			`</item></imagesSet></DescribeImagesResponse>`
 
 	case "TerminateInstances":
@@ -714,6 +726,7 @@ func TestAnImageIsLookedUpOncePerImage(t *testing.T) {
 			return http.StatusOK, `<DescribeImagesResponse><imagesSet><item>` +
 				`<imageId>` + imageB + `</imageId>` +
 				`<rootDeviceName>/dev/sda1</rootDeviceName>` +
+				`<rootDeviceType>ebs</rootDeviceType>` +
 				`<blockDeviceMapping>` +
 				`<item><deviceName>/dev/sda1</deviceName><ebs></ebs></item>` +
 				`<item><deviceName>/dev/sdz</deviceName><ebs></ebs></item>` +
@@ -722,6 +735,7 @@ func TestAnImageIsLookedUpOncePerImage(t *testing.T) {
 
 		return http.StatusOK, `<DescribeImagesResponse><imagesSet><item>` +
 			`<imageId>` + imageA + `</imageId><rootDeviceName>/dev/xvda</rootDeviceName>` +
+			`<rootDeviceType>ebs</rootDeviceType>` +
 			`<blockDeviceMapping>` +
 			`<item><deviceName>/dev/sdb</deviceName><ebs></ebs></item>` +
 			`<item><deviceName>/dev/sdc</deviceName><ebs>` +
@@ -2139,6 +2153,7 @@ func TestAnImageWhoseVolumesOutliveItIsReported(t *testing.T) {
 
 		return http.StatusOK, `<DescribeImagesResponse><imagesSet><item>` +
 			`<imageId>ami-0abc</imageId><rootDeviceName>/dev/xvda</rootDeviceName>` +
+			`<rootDeviceType>ebs</rootDeviceType>` +
 			`<blockDeviceMapping>` +
 			// The root, which billet overrides — and says so. Spelled "0" rather
 			// than "false" so the root branch has to go through readTermination like
@@ -2224,6 +2239,7 @@ func TestAVolumeMarkedWithTheOtherBooleanSpellingIsStillReported(t *testing.T) {
 
 		return http.StatusOK, `<DescribeImagesResponse><imagesSet><item>` +
 			`<imageId>ami-0abc</imageId><rootDeviceName>/dev/xvda</rootDeviceName>` +
+			`<rootDeviceType>ebs</rootDeviceType>` +
 			`<blockDeviceMapping>` +
 			`<item><deviceName>/dev/sdz</deviceName><ebs>` +
 			`<deleteOnTermination>0</deleteOnTermination></ebs></item>` +
@@ -2294,6 +2310,7 @@ func TestEveryImageDeviceLaunchesWithAnExplicitTerminationFlag(t *testing.T) {
 
 		return http.StatusOK, `<DescribeImagesResponse><imagesSet><item>` +
 			`<imageId>ami-0abc</imageId><rootDeviceName>/dev/xvda</rootDeviceName>` +
+			`<rootDeviceType>ebs</rootDeviceType>` +
 			`<blockDeviceMapping>` +
 			// THE ROOT IS DELIBERATELY NOT FIRST. AWS does not promise an order for
 			// response elements, and classifying "the first EBS mapping" as the root
@@ -2403,6 +2420,7 @@ func TestANonEBSMappingIsNotRestated(t *testing.T) {
 
 		return http.StatusOK, `<DescribeImagesResponse><imagesSet><item>` +
 			`<imageId>ami-0abc</imageId><rootDeviceName>/dev/xvda</rootDeviceName>` +
+			`<rootDeviceType>ebs</rootDeviceType>` +
 			`<blockDeviceMapping>` +
 			`<item><deviceName>/dev/sdb</deviceName><virtualName>ephemeral0</virtualName></item>` +
 			`</blockDeviceMapping></item></imagesSet></DescribeImagesResponse>`
@@ -2452,6 +2470,7 @@ func TestBlockDeviceIndicesAreContiguous(t *testing.T) {
 		// BEFORE the two real volumes so a positional bug cannot hide.
 		return http.StatusOK, `<DescribeImagesResponse><imagesSet><item>` +
 			`<imageId>ami-0abc</imageId><rootDeviceName>/dev/xvda</rootDeviceName>` +
+			`<rootDeviceType>ebs</rootDeviceType>` +
 			`<blockDeviceMapping>` +
 			`<item><deviceName>/dev/xvda</deviceName><ebs></ebs></item>` +
 			`<item><deviceName>/dev/sda</deviceName><virtualName>ephemeral0</virtualName></item>` +
@@ -2502,6 +2521,7 @@ func TestTheRootIsDeletedEvenWhenTheImageAsksToKeepIt(t *testing.T) {
 
 		return http.StatusOK, `<DescribeImagesResponse><imagesSet><item>` +
 			`<imageId>ami-0abc</imageId><rootDeviceName>/dev/xvda</rootDeviceName>` +
+			`<rootDeviceType>ebs</rootDeviceType>` +
 			`<blockDeviceMapping>` +
 			`<item><deviceName>/dev/xvda</deviceName><ebs>` +
 			`<deleteOnTermination>false</deleteOnTermination></ebs></item>` +
@@ -2570,6 +2590,7 @@ func TestAFlagBilletCannotReadIsReported(t *testing.T) {
 
 				return http.StatusOK, `<DescribeImagesResponse><imagesSet><item>` +
 					`<imageId>ami-0abc</imageId><rootDeviceName>/dev/xvda</rootDeviceName>` +
+					`<rootDeviceType>ebs</rootDeviceType>` +
 					`<blockDeviceMapping>` +
 					`<item><deviceName>/dev/xvda</deviceName><ebs>` +
 					`<deleteOnTermination>true</deleteOnTermination></ebs></item>` +
@@ -2664,6 +2685,7 @@ func TestTheRootIsNotAnnouncedWhenTheImageDidNotAskToKeepIt(t *testing.T) {
 
 				return http.StatusOK, `<DescribeImagesResponse><imagesSet><item>` +
 					`<imageId>ami-0abc</imageId><rootDeviceName>/dev/xvda</rootDeviceName>` +
+					`<rootDeviceType>ebs</rootDeviceType>` +
 					`<blockDeviceMapping>` +
 					`<item><deviceName>/dev/xvda</deviceName><ebs>` + tc.ebs + `</ebs></item>` +
 					`</blockDeviceMapping></item></imagesSet></DescribeImagesResponse>`
@@ -2694,36 +2716,69 @@ func TestTheRootIsNotAnnouncedWhenTheImageDidNotAskToKeepIt(t *testing.T) {
 // naming a device the operator never wrote — once per job, for every job on that
 // tier.
 //
-// THE ABSENT CASE IS ALLOWED THROUGH, deliberately, and SILENTLY — which is where
-// it parts company with the termination flag, so the difference is worth stating
-// rather than gesturing at.
+// AN OMITTED TYPE IS SETTLED FROM THE SAME RESPONSE, which is what the table is
+// really for. rootDeviceType is optional, so absence is reachable and proves
+// nothing on its own — but the block device mapping answers the same question in
+// a different sentence of the same reply: a root device carrying an <ebs> child
+// IS an EBS root. So absence is not itself a verdict, and the three silent rows
+// below differ only in whether that corroboration is there.
 //
-// That field's absent case warns, on the argument that a policy applied to an
-// unmeasured state and resolved quietly is how an assumption stops being visible.
-// Both halves of that argument fail here. billet takes the IDENTICAL action for
-// absent and for "ebs" — it launches — so there is no decision being resolved to
-// surface, whereas an unreadable termination flag picks delete over keep. And
-// absence here is common locally while unobserved in reality: every fake response
-// in this package predates the field, so a warning would fire in nearly every test
-// and almost never in production, which is the trained-ignorable noise the other
-// case was careful not to build.
-//
-// What carries the decision is the error asymmetry rather than either precedent.
-// Refusing on absence fails EVERY launch fleet-wide the moment any path or API
-// change omits the field — a false refusal with unbounded blast radius. Allowing
-// it fails only where an instance-store image ALSO omits its type, and fails there
-// exactly as it did before this change: late, at AWS. One arm risks everything on
-// a field being present; the other risks nothing that was not already broken.
+// The first version allowed EVERY absent case through, on an argument about which
+// error was worse. It was reviewed into this one, which needs no such argument.
 func TestAnInstanceStoreBackedImageIsRefused(t *testing.T) {
+	const rootDevice = "/dev/xvda"
+
+	ebsRoot := `<item><deviceName>` + rootDevice + `</deviceName><ebs>` +
+		`<deleteOnTermination>true</deleteOnTermination></ebs></item>`
+	storeRoot := `<item><deviceName>` + rootDevice + `</deviceName>` +
+		`<virtualName>ephemeral0</virtualName></item>`
+
 	for _, tc := range []struct {
 		name     string
 		rootType string
-		wantErr  bool
+		mappings string
+		wantErr  string
 	}{
-		{name: "instance store", rootType: "instance-store", wantErr: true},
-		{name: "something new", rootType: "some-future-type", wantErr: true},
-		{name: "ebs", rootType: "ebs"},
-		{name: "unreported", rootType: ""},
+		{name: "says ebs", rootType: "ebs", mappings: ebsRoot},
+		{
+			name: "says instance store", rootType: "instance-store", mappings: storeRoot,
+			wantErr: "instance-store",
+		},
+		{
+			// LEXICALLY BELOW "ebs", which a comparison written as > rather than !=
+			// would admit. That mutant survived the first version of this table.
+			name: "says something below ebs", rootType: "aaa-future-type", mappings: ebsRoot,
+			wantErr: "aaa-future-type",
+		},
+		{
+			name: "says something above ebs", rootType: "zzz-future-type", mappings: ebsRoot,
+			wantErr: "zzz-future-type",
+		},
+		{
+			// Silent, but the mapping says the root is an EBS volume.
+			name: "silent, corroborated by the mapping", mappings: ebsRoot,
+		},
+		{
+			// Silent, and the root is an instance-store device — the case the first
+			// version admitted, straight back into the late AWS failure.
+			name: "silent, root is instance store", mappings: storeRoot,
+			wantErr: "does not report a root device type",
+		},
+		{
+			// Silent, and no mapping mentions the root at all.
+			name: "silent, uncorroborated", mappings: "",
+			wantErr: "does not report a root device type",
+		},
+		{
+			// Silent, root is instance-store, and a DIFFERENT device is EBS. The
+			// corroboration has to come from the root's own mapping — looking for
+			// any EBS volume anywhere would read this image as EBS-backed on the
+			// strength of a data volume.
+			name: "silent, EBS elsewhere but not the root",
+			mappings: storeRoot + `<item><deviceName>/dev/sdb</deviceName><ebs>` +
+				`<deleteOnTermination>true</deleteOnTermination></ebs></item>`,
+			wantErr: "does not report a root device type",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFakeEC2(t)
@@ -2738,19 +2793,17 @@ func TestAnInstanceStoreBackedImageIsRefused(t *testing.T) {
 				}
 
 				return http.StatusOK, `<DescribeImagesResponse><imagesSet><item>` +
-					`<imageId>ami-0abc</imageId><rootDeviceName>/dev/xvda</rootDeviceName>` +
-					root +
-					`<blockDeviceMapping>` +
-					`<item><deviceName>/dev/xvda</deviceName><ebs>` +
-					`<deleteOnTermination>true</deleteOnTermination></ebs></item>` +
-					`</blockDeviceMapping></item></imagesSet></DescribeImagesResponse>`
+					`<imageId>ami-0abc</imageId>` +
+					`<rootDeviceName>` + rootDevice + `</rootDeviceName>` + root +
+					`<blockDeviceMapping>` + tc.mappings + `</blockDeviceMapping>` +
+					`</item></imagesSet></DescribeImagesResponse>`
 			}
 
 			p := newTestProvider(t, f, nil)
 
 			_, err := p.Launch(t.Context(), validSpec())
 
-			if !tc.wantErr {
+			if tc.wantErr == "" {
 				if err != nil {
 					t.Fatalf("Launch: %v", err)
 				}
@@ -2762,7 +2815,7 @@ func TestAnInstanceStoreBackedImageIsRefused(t *testing.T) {
 				t.Fatal("a launch from an image billet cannot use succeeded")
 			}
 
-			for _, want := range []string{"ami-0abc", tc.rootType, "EBS-backed"} {
+			for _, want := range []string{"ami-0abc", tc.wantErr} {
 				if !strings.Contains(err.Error(), want) {
 					t.Errorf("the error does not name %q: %v", want, err)
 				}
@@ -2848,6 +2901,7 @@ func TestAMappingWithNoDeviceNameIsSkipped(t *testing.T) {
 
 		return http.StatusOK, `<DescribeImagesResponse><imagesSet><item>` +
 			`<imageId>ami-0abc</imageId><rootDeviceName>/dev/xvda</rootDeviceName>` +
+			`<rootDeviceType>ebs</rootDeviceType>` +
 			`<blockDeviceMapping>` +
 			`<item><ebs><deleteOnTermination>false</deleteOnTermination></ebs></item>` +
 			`<item><deviceName>/dev/sdb</deviceName><ebs>` +
@@ -2909,6 +2963,7 @@ func TestAResponseOmittingTerminationIsReportedAsAnomalous(t *testing.T) {
 
 		return http.StatusOK, `<DescribeImagesResponse><imagesSet><item>` +
 			`<imageId>ami-0abc</imageId><rootDeviceName>/dev/xvda</rootDeviceName>` +
+			`<rootDeviceType>ebs</rootDeviceType>` +
 			`<blockDeviceMapping>` +
 			`<item><deviceName>/dev/sdq</deviceName><ebs></ebs></item>` +
 			`</blockDeviceMapping></item></imagesSet></DescribeImagesResponse>`
