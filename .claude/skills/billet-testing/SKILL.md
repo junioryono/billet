@@ -146,7 +146,7 @@ A related habit that paid off repeatedly: when a platform behaviour matters (`os
 - **A test must fail when the code is wrong.** Two of the original state tests did not: one read pragmas through the *reader* pool, where `journal_mode` reports `wal` from persistent file state regardless of the writer's DSN; the other exercised only the single-connection writer, which makes serialization tautological. If a test asserts an invariant, break the invariant once and confirm the test fails.
 - **Assert the diagnostic, not the shape.** Counting error lines passes for the wrong reasons; asserting the specific messages does not.
 - Tests use `t.Context()` and `t.TempDir()` (enforced by `usetesting`).
-- `paralleltest` is deliberately off: these tests open real SQLite files, and `t.Parallel()` everywhere buys nothing and invites flakes.
+- `paralleltest` is deliberately off, in both directions: what decides is whether a test SHARES process-global state — one SQLite file two tests open, a fixed port, a daemon, the environment — not whether it touches a disk. See the rule above; tests with resources of their own parallelize happily and many here do.
 
 ## Tests that could not have failed
 

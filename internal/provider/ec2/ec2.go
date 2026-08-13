@@ -636,7 +636,7 @@ func shellCommand(argv []string) (string, error) {
 // An earlier version of this comment argued the purpose was still served, because
 // terminate is irreversible and the next launch is a different machine, so the
 // only thing briefly exceeded was the BILL. That argument is wrong, and this file
-// contradicts it twelve lines from here: runningState documents `shutting-down`
+// contradicts it further down: runningState documents `shutting-down`
 // as a state where "the job may still be executing", which is exactly why List
 // asks for it. A terminate request proves EVENTUAL termination. It does not prove
 // the guest has stopped, and an instance takes a minute or two to get there.
@@ -680,7 +680,10 @@ func (p *Provider) Destroy(ctx context.Context, id string) error {
 		return fmt.Errorf("ec2: destroy %s: %w", id, err)
 	}
 
-	p.log.Info("terminated instance", "instance", id)
+	// "REQUESTED", because that is what happened. Logging "terminated" here is the
+	// same conflation this function's comment exists to correct — the machine is
+	// still running for a minute or two afterwards.
+	p.log.Info("requested instance termination", "instance", id)
 
 	return nil
 }
