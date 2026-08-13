@@ -584,28 +584,33 @@ type imageLayout struct {
 	devices []imageDevice
 }
 
-// setBlockDevices states what happens to EVERY volume the instance launches with.
+// setBlockDevices states what happens to every EBS volume the instance launches with.
 //
 // NOTHING HERE IS LEFT TO A DEFAULT, and that is the whole design. An unstated
 // DeleteOnTermination is not a small ambiguity: AWS documents the answer twice,
 // and the two answers disagree for exactly the case billet is in — a non-root
 // volume, attached at launch, through the API.
 //
-//   - [2] gives a complete inheritance model — the default is true for the root
-//     volume and false for ATTACHED volumes, an AMI inherits the setting from the
-//     instance it was made from, and a launch inherits it from the AMI. Read
-//     literally, a silent non-root mapping PRESERVES its volume, and billet leaks
-//     one disk per job forever.
+//   - [2] gives an inheritance model — true for the root, false for ATTACHED
+//     volumes, an AMI inherits the setting from the instance it was made from, and
+//     a launch inherits it from the AMI. Read literally, a silent non-root mapping
+//     PRESERVES its volume, and billet leaks one disk per job forever.
 //   - [1] carries a launch-time defaults table whose "data volume, at launch, CLI"
-//     row says Delete. Read literally, the same mapping is harmless.
+//     row says Delete, and elsewhere on the same page says an AMI volume's launch
+//     default comes from the AMI's own attribute.
 //
-// Reviewers split on whether those genuinely conflict or can be reconciled, which
-// is itself the argument for this function: the disagreement was about somebody
-// else's undocumented edge, neither reading was measurable from here, and the bill
-// for guessing wrong arrives monthly and silently. So billet stops having an
-// opinion. Every device it launches carries an explicit flag, and no default —
-// documented, contradictory, or discovered later — governs anything billet
-// launches. #53.
+// TWO CAREFUL REVIEWERS READ THOSE DIFFERENTLY — one as an outright contradiction,
+// one as reconcilable with the AMI attribute governing — and neither reading is
+// measurable from here. Note that even the reconciled reading does not answer the
+// question: it says the AMI's attribute decides, about an AMI that set no
+// attribute.
+//
+// That is the argument for this function. The dispute was about somebody else's
+// undocumented edge, it could not be settled by reading more, and the bill for
+// guessing wrong arrives monthly and silently. So billet stops needing an answer:
+// every EBS device it launches carries an explicit flag, and no default —
+// documented, disputed, or discovered later — governs anything billet launches.
+// #53.
 //
 // AN EXPLICIT false IS PASSED THROUGH ON EVERY DEVICE EXCEPT THE ROOT. Where a
 // NON-ROOT mapping stated the flag, that is the operator talking about their own
@@ -616,13 +621,13 @@ type imageLayout struct {
 // instead, once per image.
 //
 // THE ROOT IS BILLET'S, AND IS ALWAYS SENT true. That is not an exception carved
-// out to be convenient; it is the one device billet already owns. billet chooses
-// its size for the tier, it is the disk the runner boots, and it exists only for
-// the length of one job — AWS itself only permits size, type and this flag to be
-// modified for a root volume, which is very nearly the list of things billet sets.
-// An image whose root says "keep" would leave a full OS disk behind for EVERY job
-// on the tier, which is the largest leak available here and the least likely to be
-// deliberate. billet overrides it and SAYS SO, which is the difference that makes
+// out to be convenient; it is the one device billet already owns. It is the disk
+// the runner boots, it exists only for the length of one job, and when a tier asks
+// for a size it is the one billet resizes — AWS permits only size, type and this
+// flag to be modified on a root volume, which is very nearly the list of things
+// billet touches. An image whose root says "keep" leaves a full boot disk behind
+// for EVERY job on the tier, and is the least likely of these to be deliberate.
+// billet overrides it and SAYS SO, which is the difference that makes
 // the asymmetry honest: billet is silent when it merely fills a gap the image left,
 // and speaks whenever it contradicts something the image actually said.
 //
