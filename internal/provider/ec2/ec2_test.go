@@ -2746,22 +2746,33 @@ func TestAnInstanceStoreBackedImageIsRefused(t *testing.T) {
 		root     string
 		rootType string
 		mappings string
-		wantErr  string
+		// wantErr are substrings the refusal must contain, empty for a launch that
+		// should succeed. More than one because the messages have to stay DISTINCT:
+		// "instance-store" alone appears in both refusal paths, so asserting it
+		// proves only that something was refused, not that the right sentence was
+		// chosen.
+		wantErr []string
 	}{
 		{name: "says ebs", rootType: "ebs", mappings: ebsRoot},
 		{
 			name: "says instance store", rootType: "instance-store", mappings: storeRoot,
-			wantErr: "instance-store",
+			// "instance-store-backed" is unique to the dedicated message. Asserting
+			// the bare type instead let a mutant collapse the two paths and tell an
+			// operator with a genuine instance-store image that billet "does not
+			// recognise" the one non-EBS value it emphatically does.
+			wantErr: []string{"instance-store-backed"},
 		},
 		{
 			// LEXICALLY BELOW "ebs", which a comparison written as > rather than !=
 			// would admit. That mutant survived the first version of this table.
 			name: "says something below ebs", rootType: "aaa-future-type", mappings: ebsRoot,
-			wantErr: "aaa-future-type",
+			// "does not recognise" is unique to the unknown-type message, so this
+			// row and the one above pin the split from both sides.
+			wantErr: []string{"aaa-future-type", "does not recognise"},
 		},
 		{
 			name: "says something above ebs", rootType: "zzz-future-type", mappings: ebsRoot,
-			wantErr: "zzz-future-type",
+			wantErr: []string{"zzz-future-type"},
 		},
 		{
 			// Silent, but the mapping says the root is an EBS volume.
@@ -2786,12 +2797,12 @@ func TestAnInstanceStoreBackedImageIsRefused(t *testing.T) {
 			// Silent, and the root is an instance-store device — the case the first
 			// version admitted, straight back into the late AWS failure.
 			name: "silent, root is instance store", mappings: storeRoot,
-			wantErr: "does not report a root device type",
+			wantErr: []string{"does not report a root device type"},
 		},
 		{
 			// Silent, and no mapping mentions the root at all.
 			name: "silent, uncorroborated", mappings: "",
-			wantErr: "does not report a root device type",
+			wantErr: []string{"does not report a root device type"},
 		},
 		{
 			// Silent, root is instance-store, and a DIFFERENT device is EBS. The
@@ -2801,7 +2812,7 @@ func TestAnInstanceStoreBackedImageIsRefused(t *testing.T) {
 			name: "silent, EBS elsewhere but not the root",
 			mappings: storeRoot + `<item><deviceName>/dev/sdb</deviceName><ebs>` +
 				`<deleteOnTermination>true</deleteOnTermination></ebs></item>`,
-			wantErr: "does not report a root device type",
+			wantErr: []string{"does not report a root device type"},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -2832,7 +2843,7 @@ func TestAnInstanceStoreBackedImageIsRefused(t *testing.T) {
 
 			_, err := p.Launch(t.Context(), validSpec())
 
-			if tc.wantErr == "" {
+			if len(tc.wantErr) == 0 {
 				if err != nil {
 					t.Fatalf("Launch: %v", err)
 				}
@@ -2848,7 +2859,7 @@ func TestAnInstanceStoreBackedImageIsRefused(t *testing.T) {
 			// — the reason names what is wrong, this names what would be right. The
 			// rewrite that built this table dropped it, and a mutant deleting the
 			// remedy from both error paths survived until a reviewer noticed.
-			for _, want := range []string{"ami-0abc", "EBS-backed", tc.wantErr} {
+			for _, want := range append([]string{"ami-0abc", "EBS-backed"}, tc.wantErr...) {
 				if !strings.Contains(err.Error(), want) {
 					t.Errorf("the error does not name %q: %v", want, err)
 				}
