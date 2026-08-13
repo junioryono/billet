@@ -557,11 +557,15 @@ func (p *Provider) setTags(params url.Values, name string) {
 // billet's to decide, false is the operator's to keep), so the string decode is
 // forced, and this function puts back the leniency that decision threw away.
 //
-// ABSENT IS UNREACHABLE IN PRACTICE, incidentally — a live account showed EC2
-// normalising an omitted flag to true at RegisterImage, and zero omissions across
-// 9,775 non-root mappings. This function still distinguishes it, because a decode
-// that cannot tell absent from false is one bad response away from silently
-// honouring a preservation nobody asked for.
+// ABSENT WAS NOT SEEN, which is not the same as impossible — one RegisterImage
+// call in one region on one day read back with the value present, and no image in
+// a 26,044-image Amazon-owned EBS-backed corpus from that same region omitted it.
+// CreateImage, ImportImage, CopyImage, older images and anybody else's images are
+// unmeasured, and the response schema still marks the field optional. This
+// function keeps distinguishing absent for that reason: a decode that cannot tell
+// absent from false is one odd response away from silently honouring a
+// preservation nobody asked for, and the call site treats absent as the anomaly
+// the measurement says it is.
 //
 // The rest is measured rather than assumed, and it is measurable precisely
 // because it is Go's behaviour rather than AWS's:
@@ -614,18 +618,27 @@ type imageLayout struct {
 // and two careful reviewers reached opposite conclusions about whether billet was
 // leaking a disk on every job. What the run found, in order:
 //
-//  1. AN ABSENT FLAG IS NOT REACHABLE. RegisterImage was handed a mapping that
-//     omitted DeleteOnTermination on BOTH the root and a non-root device.
-//     DescribeImages returned true on both. AWS normalises at registration; the
-//     value is not stored as given.
+//  1. AN IMAGE REGISTERED WITHOUT THE FLAG SHOWS true. RegisterImage was handed a
+//     mapping that omitted DeleteOnTermination on BOTH the root and a non-root
+//     device, and DescribeImages returned true on both. Stated as the observable
+//     on purpose: this cannot tell normalisation-at-write from materialisation-at
+//     -read, both produce identical output, and billet only ever sees the output.
+//     Nor does it reach past the ONE path measured — CreateImage, ImportImage,
+//     CopyImage, images registered years ago and images owned by anybody else are
+//     all unobserved. So absent is not proven impossible, only unreached here and
+//     unseen in (3); the code still distinguishes it.
 //  2. AND THE NORMALISED VALUE IS true, INCLUDING FOR A NON-ROOT DEVICE. This is
 //     the reading that lost: [2] says the default is "false for attached volumes",
 //     and under that reading a silent mapping preserves its volume and billet
-//     leaks one disk per job. It does not. billet sending true for a mapping that
-//     said nothing is what EC2 would have done anyway.
-//  3. NOTHING OMITS IT IN PRACTICE EITHER. 26,044 Amazon-owned EBS-backed AMIs in
-//     one region carry 9,775 non-root EBS mappings between them, and ZERO omit the
-//     flag — consistent with (1) being how it gets there.
+//     leaks one disk per job. It does not, on this path. billet sending true for a
+//     mapping that said nothing agrees with what was observed — which is a reason
+//     to be less worried, not a reason to stop sending it.
+//  3. NOTHING OMITS IT IN THE MOST CURATED POPULATION THERE IS. 26,044
+//     Amazon-owned EBS-backed AMIs in us-west-2, measured Aug 2026, carry 9,775
+//     non-root EBS mappings
+//     between them, and ZERO omit the flag. Consistent with (1) — and weak
+//     evidence about operator-built or imported images, since Amazon's own build
+//     pipelines are the ones least likely to omit anything.
 //  4. THE PARTIAL OVERRIDE WORKS, which is the part every job depends on. A launch
 //     sending only DeviceName and Ebs.DeleteOnTermination for devices declared by
 //     the AMI was accepted; the AMI's snapshot and size were preserved on each,
@@ -635,9 +648,10 @@ type imageLayout struct {
 //
 // So the ambiguity that motivated stating every flag is gone, and the code that
 // came out of it is unchanged — which is the useful shape for a fix to have. What
-// remains is that billet no longer depends on ANY of the above being stable: an
-// explicit request cannot be reinterpreted by a future default, and (4) is the
-// only measured fact this function still leans on.
+// remains is that billet depends on exactly ONE of the above staying true — (4),
+// the merge — and on none of the defaults. An explicit request cannot be
+// reinterpreted by a future default; a merge that stopped preserving snapshots
+// would break this, and nothing here would notice.
 //
 // The two readings, kept because the reasoning is why the code looks like this:
 //
@@ -663,8 +677,9 @@ type imageLayout struct {
 // for a size it is the one billet resizes — AWS permits only size, type and this
 // flag to be modified on a root volume, which is very nearly the list of things
 // billet touches. An image whose root says "keep" leaves a full boot disk behind
-// for every job billet launches from it, and is the least likely of these to be
-// deliberate.
+// for every job billet launches from it — and since EC2 never produces that flag
+// by omission, somebody meant it, just for a machine that outlives its work rather
+// than for a one-job runner.
 // billet overrides it and SAYS SO, which is the difference that makes
 // the asymmetry honest: billet is silent when it merely fills a gap the image left,
 // and speaks whenever it contradicts something the image actually said.
@@ -760,6 +775,31 @@ func (p *Provider) imageLayout(ctx context.Context, image string) (imageLayout, 
 		}
 
 		stated := survivesTermination(bd.EBS.DeleteOnTermination)
+
+		// AN OMITTED RESPONSE FLAG IS NOW ANOMALOUS, and that is a change the
+		// measurement bought rather than an old rule reversed.
+		//
+		// The reason this was silent before is that billet could not tell what an
+		// omission meant, and a warning fired on a state nobody could interpret is
+		// noise. The run says a registered image reads back with the value present,
+		// and no image in the corpus omits it — so an omission is no longer an
+		// ordinary state billet is guessing about, it is a response that does not
+		// look like the ones that were observed.
+		//
+		// billet still sends true for it. Refusing the launch would convert a missing
+		// optional field into a failed CI job, which is worse than deleting a volume
+		// created fresh for that job — and an omission is emphatically NOT the
+		// operator asking to keep anything, since the run found EC2 does not produce
+		// false by omission. But it is resolved by policy on an unmeasured state, and
+		// resolving that quietly is how an assumption stops being visible. Once per
+		// image, like the others.
+		if bd.EBS.DeleteOnTermination == "" {
+			p.log.Warn("this image's block device mapping omits DeleteOnTermination, which no "+
+				"image observed against real EC2 does; billet is stating delete for it, so this "+
+				"job is unaffected, but the response does not look like the ones that were "+
+				"measured",
+				"image", image, "device", bd.DeviceName)
+		}
 
 		// THE ROOT IS OVERRIDDEN, AND THAT IS THE ONE CASE BILLET ANNOUNCES ITSELF
 		// FOR. setBlockDevices always sends true for it, so nothing is collected
