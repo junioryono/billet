@@ -326,6 +326,13 @@ type instanceItem struct {
 	State      struct {
 		Name string `xml:"name"`
 	} `xml:"instanceState"`
+	// StateReason says WHO stopped it, which "stopped" alone does not.
+	// Client.InstanceInitiatedShutdown is the guest powering itself off;
+	// Client.UserInitiatedShutdown is somebody calling StopInstances; Server.* is
+	// the host. An image build treats only the first as a success signal.
+	StateReason struct {
+		Code string `xml:"code"`
+	} `xml:"stateReason"`
 	Tags []struct {
 		Key   string `xml:"key"`
 		Value string `xml:"value"`

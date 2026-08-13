@@ -2,7 +2,9 @@ package ec2
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"net/url"
 	"strconv"
@@ -44,8 +46,20 @@ type BuildSpec struct {
 // its console log — which is the state you want to debug from, rather than an
 // image made from a half-provisioned disk.
 //
-// THE BUILDER IS ALWAYS TERMINATED, including on every failure path, because it is
-// the one thing here that costs money for as long as it exists.
+// THE BUILDER IS TERMINATED ON EVERY FAILURE PATH THAT HAS AN ID, which is not the
+// same as always, and the difference is worth stating because this is the one
+// thing here that costs money for as long as it exists.
+//
+// If RunInstances commits and its response is lost — a transport failure, a
+// context expiring mid-reply — launchBuilder returns an error and no id, so there
+// is nothing to terminate and the builder runs until somebody notices. It carries
+// the owner tag, which is how it is found.
+//
+// A CLIENT TOKEN NARROWS THAT TO A RECOVERY rather than a leak: the token is
+// derived from the image name, which is already unique per account and region, so
+// re-running the same build returns the SAME builder instead of buying a second
+// one. That behaviour is not assumed — a live run measured EC2 refusing a reused
+// token with IdempotentParameterMismatch, which is the same machinery.
 func (p *Provider) BuildImage(ctx context.Context, spec BuildSpec) (string, error) {
 	script, err := provisionScript(spec)
 	if err != nil {
@@ -84,7 +98,15 @@ func (p *Provider) BuildImage(ctx context.Context, spec BuildSpec) (string, erro
 	p.log.Info("image registered, waiting for it to become launchable", "image", image)
 
 	if err := p.awaitImage(ctx, image); err != nil {
-		return "", err
+		// THE IMAGE OUTLIVES THIS FAILURE, and nothing here deletes it. billet
+		// speaks no DeregisterImage and no DeleteSnapshot, so a registered AMI and
+		// whatever snapshots AWS made for it persist — and because CreateImage
+		// requires the name to be unique, re-running the same build fails on a
+		// duplicate name pointing at nothing the operator can see. Naming it is the
+		// difference between a puzzle and a chore.
+		return "", fmt.Errorf("%w\n\nthe image %s was registered before this failed and still "+
+			"exists, along with any snapshots behind it: deregister it before re-running a "+
+			"build with the same name", err, image)
 	}
 
 	return image, nil
@@ -117,6 +139,14 @@ func (p *Provider) launchBuilder(ctx context.Context, spec BuildSpec, script str
 	// mechanism: `poweroff` inside the guest has to leave a stopped instance for
 	// CreateImage to snapshot, not a terminated one with no disk.
 	params.Set("InstanceInitiatedShutdownBehavior", "stop")
+
+	// THE TOKEN TURNS A LOST RESPONSE INTO A RECOVERY. AWS honours it and returns
+	// the instance the first call created rather than starting a second, so
+	// re-running a build whose response went missing costs nothing. The image name
+	// is already required to be unique per account and region, which is exactly the
+	// property a token needs.
+	sum := sha256.Sum256([]byte("billet-ami-build:" + spec.Name))
+	params.Set("ClientToken", hex.EncodeToString(sum[:])[:32])
 
 	params.Set("MetadataOptions.HttpTokens", "required")
 	params.Set("MetadataOptions.HttpPutResponseHopLimit", "1")
@@ -166,8 +196,19 @@ func (p *Provider) awaitStopped(ctx context.Context, id string) error {
 			return err
 		}
 
-		switch out {
+		switch out.state {
 		case "stopped":
+			// STOPPED BY WHOM. The signal this build relies on is the guest powering
+			// ITSELF off at the end of provisioning — and "stopped" alone does not
+			// say that. A cost scheduler calling StopInstances on a tag, or a host
+			// failure, stops a half-provisioned builder just as convincingly, and
+			// imaging that is the exact outcome this design exists to prevent.
+			if out.reason != "" && out.reason != "Client.InstanceInitiatedShutdown" {
+				return fmt.Errorf("ec2: the builder %s was stopped by something other than its "+
+					"own provisioning script (%s), so whatever is on its disk is not a "+
+					"finished image", id, out.reason)
+			}
+
 			return nil
 
 		case "terminated", "shutting-down":
@@ -185,8 +226,14 @@ func (p *Provider) awaitStopped(ctx context.Context, id string) error {
 	}
 }
 
-// describeRaw reports one instance's state name.
-func (p *Provider) describeRaw(ctx context.Context, id string) (string, error) {
+// builderState is what an instance is doing, and who made it do that.
+type builderState struct {
+	state  string
+	reason string
+}
+
+// describeRaw reports one instance's state and the reason for it.
+func (p *Provider) describeRaw(ctx context.Context, id string) (builderState, error) {
 	params := url.Values{}
 	params.Set("Action", "DescribeInstances")
 	params.Set("InstanceId.1", id)
@@ -205,21 +252,21 @@ func (p *Provider) describeRaw(ctx context.Context, id string) (string, error) {
 		// The caller's own timeout is what bounds an id that never appears — an
 		// absence here is never proof.
 		if code, ok := codeOf(err); ok && code == "InvalidInstanceID.NotFound" {
-			return "", nil
+			return builderState{}, nil
 		}
 
-		return "", fmt.Errorf("ec2: ask what the builder %s is doing: %w", id, err)
+		return builderState{}, fmt.Errorf("ec2: ask what the builder %s is doing: %w", id, err)
 	}
 
 	for _, r := range out.Reservations {
 		for _, i := range r.Instances {
 			if i.InstanceID == id {
-				return i.State.Name, nil
+				return builderState{state: i.State.Name, reason: i.StateReason.Code}, nil
 			}
 		}
 	}
 
-	return "", nil
+	return builderState{}, nil
 }
 
 // createImage snapshots the stopped builder.
@@ -376,7 +423,20 @@ func provisionScript(spec BuildSpec) (string, error) {
 	b.WriteString("done\n")
 
 	b.WriteString("exec setpriv --reuid=runner --regid=runner --init-groups \\\n")
-	b.WriteString("  env ACTIONS_RUNNER_INPUT_JITCONFIG=\"$ACTIONS_RUNNER_INPUT_JITCONFIG\" \\\n")
+	// THE CONSTANT, NOT THE STRING. The boot script that exports this uses
+	// jitEnvVar; if this side spelled it out and somebody renamed the constant,
+	// build.go and its tests would stay green while producing the failure this
+	// whole issue exists to prevent — a runner that starts, finds no registration,
+	// exits, and leaves a machine looking perfectly healthy.
+	//
+	// HOME IS SET TOO, and it is a separate silent failure. setpriv does not reset
+	// the environment, so the runner would inherit cloud-init's HOME=/root — a
+	// directory the runner user cannot write. Registration succeeds, because the
+	// runner's own directory is owned correctly; then job steps fail oddly on
+	// anything that touches $HOME, which is the docker CLI's config, ~/.gitconfig,
+	// and a large fraction of the actions ecosystem.
+	b.WriteString("  env " + jitEnvVar + "=\"$" + jitEnvVar + "\" \\\n")
+	b.WriteString("  HOME=/home/runner USER=runner LOGNAME=runner \\\n")
 	b.WriteString("  /opt/actions-runner/run.sh\n")
 	b.WriteString("BILLETEOF\n")
 	b.WriteString("chmod 0755 /usr/local/bin/billet-runner\n")
