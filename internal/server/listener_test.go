@@ -595,7 +595,10 @@ func TestCompletionReleasesTheLease(t *testing.T) {
 	}
 
 	// THE LEASE MUST BE SEEN HELD FIRST, which is the other half: a final count of
-	// zero only means the completion released something if something was there.
+	// zero only means the map entry was REMOVED if something was there to remove.
+	// Removal is not release — the completion path deletes that entry in a separate
+	// statement from the allocator call — so the assertion that matches this test's
+	// name is the ledger check at the end, not this one.
 	defer cancelWhen(t, ctx, cancel, "the lease being held and then completed",
 		func() bool { return held.Load() && stage.Load() > 2 })()
 
