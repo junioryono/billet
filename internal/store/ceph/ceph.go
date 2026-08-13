@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -137,11 +138,15 @@ func New(cfg config.CephConfig, opts ...Option) (*Client, error) {
 
 // Report is what a reachability check learned.
 type Report struct {
-	// User is the identity that answered, without the `client.` prefix.
+	// User is the identity the invocations authenticated as, without the `client.`
+	// prefix. It comes from the configuration rather than from the cluster — Ceph
+	// does not echo it back — so it says who billet asked AS, not who answered.
 	User string
-	// MinCompatClient is the oldest client release the cluster admits, which is
-	// what decides the clone format below.
+	// MinCompatClient is the oldest client release the cluster admits, and
+	// CloneFormat is the rbd_default_clone_format that can override it. Together
+	// they decide CloneFormat below.
 	MinCompatClient string
+	CloneFormat     string
 	// CloneV2 reports whether a snapshot can be cloned WITHOUT being protected —
 	// and, the half that matters, removed while a clone of it is still live.
 	CloneV2 bool
@@ -215,7 +220,19 @@ func (c *Client) CheckReachable(ctx context.Context) (Report, error) {
 	}
 
 	report.MinCompatClient = release
-	report.CloneV2 = ClonesV2(release)
+
+	configured, err := c.cloneFormat(ctx, c.cfg.ImagePool)
+	if err != nil {
+		return Report{}, err
+	}
+
+	format, err := EffectiveCloneFormat(release, configured)
+	if err != nil {
+		return Report{}, fmt.Errorf("ceph: %w", err)
+	}
+
+	report.CloneFormat = configured
+	report.CloneV2 = format == 2
 
 	sizes, err := c.poolSizes(ctx)
 	if err != nil {
@@ -232,8 +249,15 @@ func (c *Client) CheckReachable(ctx context.Context) (Report, error) {
 	}
 
 	if !report.CloneV2 {
+		if configured == "1" {
+			return report, fmt.Errorf("%w: rbd_default_clone_format is set to 1, which overrides "+
+				"the cluster's minimum client release (%s); unset it with `ceph config rm client "+
+				"rbd_default_clone_format`", ErrCloneV1, release)
+		}
+
 		return report, fmt.Errorf("%w: require-min-compat-client is %q; raise it with "+
-			"`ceph osd set-require-min-compat-client mimic`", ErrCloneV1, release)
+			"`ceph osd set-require-min-compat-client mimic` (which refuses while clients older "+
+			"than mimic are connected — `ceph features` lists them)", ErrCloneV1, release)
 	}
 
 	return report, nil
@@ -244,7 +268,7 @@ func (c *Client) CheckReachable(ctx context.Context) (Report, error) {
 // THE CLOSED HALF OF THE LIST, deliberately. A set of releases at-or-after mimic
 // would go stale on the next Ceph release and start refusing correct clusters,
 // while the set BEFORE mimic can never grow — Ceph is not going to ship a release
-// older than one from 2018. So an unrecognised name is treated as newer, which is
+// older than one from 2018. So an unrecognised NAME is treated as newer, which is
 // the only direction that stays true without maintenance.
 //
 // Measured against Ceph 20.2.3 rather than remembered: every name here is one the
@@ -257,19 +281,73 @@ var beforeMimic = map[string]bool{
 	"infernalis": true, "jewel": true, "kraken": true, "luminous": true,
 }
 
-// ClonesV2 reports whether a cluster admitting this client release clones the new
-// way: an unprotected snapshot can be cloned, and removed while a clone is live.
+// releaseName is the shape of a Ceph release: a short lowercase word. Every
+// release from argonaut to tentacle is one, and the naming convention has not
+// varied in fifteen years.
 //
-// Exported because it is the rule, and a rule with one caller is still worth
-// naming — the alternative is a string comparison at a call site where nobody can
-// see why "luminous" is the answer that breaks eviction.
-func ClonesV2(minCompatClient string) bool {
-	return !beforeMimic[strings.ToLower(strings.TrimSpace(minCompatClient))]
+// A SHAPE CHECK IS NOT PEDANTRY HERE, because "anything I do not recognise is
+// newer than mimic" is a fail-OPEN rule and this is what bounds what can walk
+// through it. Without it, whatever the binary at that path happened to print —
+// a megabyte of output, a usage message, an error from a different program — is
+// read as a release newer than mimic and the check passes.
+var releaseName = regexp.MustCompile(`^[a-z]{3,20}$`)
+
+// ErrUnclassifiedRelease is returned when the cluster's answer is not a release
+// billet can place relative to mimic.
+//
+// `unknown` is the case that matters and it is not hypothetical: it is the zero
+// value of Ceph's release enum, and `osd set-require-min-compat-client unknown` is
+// REFUSED — measured — so it is a value that can only arrive from Ceph itself,
+// never from an operator who chose it. Which is exactly why it must not be read as
+// "some release newer than mimic": it means the cluster has not been told, and a
+// cluster that has not been told defaults to the old clone format.
+var ErrUnclassifiedRelease = errors.New("the cluster's minimum client release is not one billet " +
+	"can place relative to mimic")
+
+// EffectiveCloneFormat resolves what rbd will ACTUALLY do from the two settings
+// that decide it.
+//
+// THE FLOOR ALONE IS A PROXY, AND IT IS DEFEATED BY ONE CONFIG KEY. `auto` — the
+// default — means "v2 if the cluster admits mimic or later", which is where the
+// release rule applies. But `rbd_default_clone_format` can be set outright, and
+// then it wins: measured, a cluster whose floor is mimic and whose clone format is
+// forced to 1 refuses to clone an unprotected snapshot with
+// `rbd: clone error: (22) Invalid argument`. Checking the floor and calling it
+// "this cluster clones the new way" would have been a green preflight beside the
+// exact failure the preflight exists to prevent.
+func EffectiveCloneFormat(minCompatClient, configured string) (int, error) {
+	switch strings.TrimSpace(configured) {
+	case "1":
+		return 1, nil
+	case "2":
+		return 2, nil
+	case "", "auto":
+		// The default, and the case where the floor decides.
+	default:
+		return 0, fmt.Errorf("rbd_default_clone_format is %q, which is not auto, 1 or 2", configured)
+	}
+
+	release := strings.ToLower(strings.TrimSpace(minCompatClient))
+	if !releaseName.MatchString(release) || release == "unknown" {
+		return 0, fmt.Errorf("%w: %q", ErrUnclassifiedRelease, release)
+	}
+
+	if beforeMimic[release] {
+		return 1, nil
+	}
+
+	return 2, nil
 }
 
 // minCompatClient asks the cluster which client releases it admits.
+//
+// NO --format json FOR THIS ONE. The mon answers it as a bare string whatever the
+// formatter says — measured — so asking for json buys nothing and would make a mon
+// that DID honour it answer `"luminous"` with quotes, which the release shape then
+// refuses. Refusing is the safe direction, but not asking is better than relying
+// on it.
 func (c *Client) minCompatClient(ctx context.Context) (string, error) {
-	out, err := c.cephCmd(ctx, "osd", "get-require-min-compat-client")
+	out, err := c.cephCmd(ctx, false, "osd", "get-require-min-compat-client")
 	if err != nil {
 		return "", fmt.Errorf("ceph: the cluster would not say which client releases it admits, "+
 			"so billet cannot tell whether a cache generation could ever be reclaimed: %w", err)
@@ -280,7 +358,61 @@ func (c *Client) minCompatClient(ctx context.Context) (string, error) {
 		return "", errors.New("ceph: the cluster named no minimum client release")
 	}
 
+	// NOT RENDERED IF IT IS NOT A RELEASE NAME, the same rule the image listing
+	// follows: output billet cannot parse means it is talking to something that is
+	// not the ceph it expects, and echoing that onto a terminal is how another
+	// program's output — or a file it printed — becomes billet's error message.
+	if !releaseName.MatchString(strings.ToLower(release)) {
+		return "", fmt.Errorf("ceph: %s did not answer with a release name when asked which "+
+			"client releases the cluster admits; is it the ceph command?", c.ceph)
+	}
+
 	return release, nil
+}
+
+// cloneFormat reads the setting that can override the cluster's floor.
+//
+// Read through `rbd` rather than `ceph config get`, because the scoped identity
+// can do the first and not the second — measured, `ceph config get client
+// rbd_default_clone_format` answers EACCES for a `profile rbd` key, while
+// `rbd config pool list` answers with the effective value and where it came from.
+func (c *Client) cloneFormat(ctx context.Context, pool string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.wait)
+	defer cancel()
+
+	// THE POOL IS POSITIONAL HERE, not the value of -p, and that is not a detail
+	// this could be reasoned to: `rbd --format json -p <pool> config pool list`
+	// answers `unrecognised option '-p'`, while `rbd config pool list <pool>`
+	// works. `rbd help config pool list` states the grammar — `<pool-name>` as a
+	// positional — and the unit test asserted billet's own mistake until the real
+	// cluster refused it.
+	args := append(c.identity(), "--format", "json", "config", "pool", "list", pool)
+
+	out, err := c.run(ctx, c.bin, args)
+	if err != nil {
+		return "", fmt.Errorf("ceph: the rbd configuration for pool %q could not be read as "+
+			"client.%s: %w", pool, c.cfg.User, err)
+	}
+
+	var options []struct {
+		Name  string `json:"name"`
+		Value string `json:"value"`
+	}
+
+	if err := json.Unmarshal(bytes.TrimSpace(out), &options); err != nil || options == nil {
+		return "", fmt.Errorf("ceph: %s did not answer with a json configuration list for pool "+
+			"%q; is it the rbd command?", c.bin, pool)
+	}
+
+	for _, o := range options {
+		if o.Name == "rbd_default_clone_format" {
+			return o.Value, nil
+		}
+	}
+
+	// ABSENT MEANS THE DEFAULT, which is `auto`. A cluster that does not list the
+	// option has not overridden it.
+	return "auto", nil
 }
 
 // poolSpec is the half of `ceph osd pool ls detail` billet reads.
@@ -296,14 +428,18 @@ type poolSpec struct {
 // parameter, so the targeted form is four invocations for two pools; the detail
 // listing is one, and billet already knows which names it cares about.
 func (c *Client) poolSizes(ctx context.Context) (map[string]poolSpec, error) {
-	out, err := c.cephCmd(ctx, "osd", "pool", "ls", "detail")
+	out, err := c.cephCmd(ctx, true, "osd", "pool", "ls", "detail")
 	if err != nil {
 		return nil, fmt.Errorf("ceph: the pool listing could not be read as client.%s: %w",
 			c.cfg.User, err)
 	}
 
+	// `pools == nil` CATCHES A JSON `null`, which unmarshals into a slice happily
+	// and would be read as "the cluster described no pools" — reported as
+	// "replication unknown" beside a successful check. A cluster that answered
+	// `null` is not one billet understood.
 	var pools []poolSpec
-	if err := json.Unmarshal(bytes.TrimSpace(out), &pools); err != nil {
+	if err := json.Unmarshal(bytes.TrimSpace(out), &pools); err != nil || pools == nil {
 		return nil, fmt.Errorf("ceph: %s did not answer with a json pool listing; is it the ceph "+
 			"command?", c.ceph)
 	}
@@ -317,11 +453,19 @@ func (c *Client) poolSizes(ctx context.Context) (map[string]poolSpec, error) {
 }
 
 // cephCmd runs one `ceph` invocation, bounded like every other.
-func (c *Client) cephCmd(ctx context.Context, command ...string) ([]byte, error) {
+//
+// `asJSON` is a parameter rather than always true because one of the two commands
+// billet runs does not answer in JSON whatever the formatter says — see
+// minCompatClient — and asking anyway would make a mon that DID honour it return
+// a quoted string the release shape then refuses.
+func (c *Client) cephCmd(ctx context.Context, asJSON bool, command ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.wait)
 	defer cancel()
 
-	args := append(c.identity(), "--format", "json")
+	args := c.identity()
+	if asJSON {
+		args = append(args, "--format", "json")
+	}
 
 	return c.run(ctx, c.ceph, append(args, command...))
 }
