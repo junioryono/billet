@@ -648,7 +648,8 @@ type imageLayout struct {
 // for a size it is the one billet resizes — AWS permits only size, type and this
 // flag to be modified on a root volume, which is very nearly the list of things
 // billet touches. An image whose root says "keep" leaves a full boot disk behind
-// for EVERY job on the tier, and is the least likely of these to be deliberate.
+// for every job billet launches from it, and is the least likely of these to be
+// deliberate.
 // billet overrides it and SAYS SO, which is the difference that makes
 // the asymmetry honest: billet is silent when it merely fills a gap the image left,
 // and speaks whenever it contradicts something the image actually said.
@@ -729,8 +730,9 @@ func (p *Provider) imageLayout(ctx context.Context, image string) (imageLayout, 
 	layout := imageLayout{root: out.Images[0].RootDeviceName}
 	if layout.root == "" {
 		return imageLayout{}, fmt.Errorf("ec2: image %s reports no root device name, so billet "+
-			"cannot say what becomes of its root volume, and naming the wrong device would "+
-			"attach a second disk rather than fail", image)
+			"cannot say what becomes of its root volume, and guessing one is not an option: a "+
+			"wrong name describes a device that is not the root either way, silently attaching "+
+			"a second disk when the tier set a size and refused outright when it did not", image)
 	}
 
 	for _, bd := range out.Images[0].BlockDevices {
