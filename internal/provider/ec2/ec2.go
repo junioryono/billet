@@ -567,11 +567,11 @@ const (
 // EVERYTHING ELSE IS UNREADABLE RATHER THAN DELETE, which is the half that needed
 // a reviewer to see. "Everything else" includes padding XML does not recognise:
 // an NBSP-wrapped "false" is not a boolean, and reporting it beats guessing which
-// way somebody's serialiser was broken. Decoding this as a string is what makes absent expressible at
-// all — encoding/xml folds an absent element into a bool's zero value, so absent
-// and "false" would have been one state — but the string decode also threw away
-// ParseBool's rejection of values that are not booleans, and this had quietly
-// resolved every one of them in the destructive direction.
+// way somebody's serialiser was broken. Decoding this as a string is what makes
+// absent expressible at all — encoding/xml folds an absent element into a bool's
+// zero value, so absent and "false" would have been one state — but the string
+// decode also threw away ParseBool's rejection of values that are not booleans,
+// and this had quietly resolved every one of them in the destructive direction.
 //
 // That much is measured rather than assumed, and measurable precisely because it
 // is Go's behaviour rather than AWS's:
@@ -687,8 +687,8 @@ type imageLayout struct {
 // flag to be modified on a root volume, which is very nearly the list of things
 // billet touches. An image whose root says "keep" leaves a full boot disk behind
 // for every job billet launches from it — and since nothing measured produced that
-// flag by omission, somebody likely meant it, just for a machine that outlives its work rather
-// than for a one-job runner.
+// flag by omission, somebody likely meant it, just for a machine that outlives
+// its work rather than for a one-job runner.
 // billet overrides it and SAYS SO, which is the difference that makes the asymmetry
 // honest.
 //
@@ -749,11 +749,16 @@ func (p *Provider) setBlockDevices(ctx context.Context, params url.Values, spec 
 // Ebs.VolumeSize when a tier asks for a disk. An instance-store root has no EBS
 // volume behind it, so those describe a device that does not exist.
 //
-// WITHOUT THIS THE FAILURE ARRIVES LATE AND WEARING THE WRONG NAME. The lease is
+// WITHOUT THIS THE DECISION IS DEFERRED TO AWS, AND DEFERRED LATE. The lease is
 // already escrowed and the job already placed on this node by the time Launch
-// runs, so the operator gets an AWS parameter error naming a device they never
-// wrote — once per job, for every job on that tier — rather than one sentence
-// saying this backend needs an EBS-backed AMI.
+// runs, so whatever EC2 makes of an EBS-shaped mapping for a non-EBS root
+// arrives once per job, for every job on that tier, instead of one sentence up
+// front saying this backend needs an EBS-backed AMI.
+//
+// What EC2 actually answers is NOT KNOWN HERE — see the measurement note below,
+// which is why this says "deferred" rather than naming the error. An earlier
+// version predicted a parameter error, contradicting its own paragraph five
+// screens down admitting the launch was never observed.
 //
 // AN OMITTED TYPE IS ANSWERED FROM THE SAME RESPONSE rather than guessed at, and
 // that is the part worth reading. The field is optional, so its absence is
@@ -782,6 +787,13 @@ func (p *Provider) setBlockDevices(ctx context.Context, params url.Values, spec 
 // resource an instance-store launch never creates. Supporting it means a second,
 // conditional request shape on the one path a live measurement blessed.
 //
+// An earlier version of this comment blamed the volume tag specification billet
+// always sends, claiming it describes a resource such a launch never creates.
+// That is wrong: an instance-store-ROOT instance can still be given EBS data
+// volumes, so the tag has something to attach to. The unconditional
+// incompatibility is narrower and sits in setBlockDevices — the EBS-shaped ROOT
+// mapping, written on every launch.
+//
 // And the population it would serve is narrower than "instance-store AMIs": AWS
 // lists the instance types that can boot one at all — C1, C3, D2, I2, M1, M2, M3,
 // R3 and X1 [3] — every one previous-generation. So the question only arises for a
@@ -790,7 +802,8 @@ func (p *Provider) setBlockDevices(ctx context.Context, params url.Values, spec 
 // quiet one.
 //
 // THE CORROBORATING SIGNAL WAS NEVER MISSING WHERE IT WAS MEASURED, which was
-// worth checking rather than assuming since the fallback rests on it. Across 26,052 Amazon-owned AMIs
+// worth checking rather than assuming since the fallback rests on it. Across
+// 26,052 Amazon-owned AMIs
 // RETURNED BY DescribeImages in us-west-2 (Aug 2026): every one reports
 // rootDeviceType, every one reports "ebs", and every one describes its root device
 // in its own block device mapping with an <ebs> child — zero missing, zero

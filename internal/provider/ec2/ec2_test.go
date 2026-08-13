@@ -2719,8 +2719,8 @@ func TestTheRootIsNotAnnouncedWhenTheImageDidNotAskToKeepIt(t *testing.T) {
 // Every root parameter billet sends is EBS-shaped, so such an image would reach
 // RunInstances describing a volume that does not exist. The failure would land
 // after the lease was escrowed and the job placed, as an AWS parameter error
-// naming a device the operator never wrote — once per job, for every job on that
-// tier.
+// deferring the decision to AWS after the escrow, once per job, for every job on
+// that tier. What AWS actually answers was never observed.
 //
 // AN OMITTED TYPE IS SETTLED FROM THE SAME RESPONSE, which is what the table is
 // really for. rootDeviceType is optional, so absence is reachable and proves
@@ -2790,14 +2790,18 @@ func TestAnInstanceStoreBackedImageIsRefused(t *testing.T) {
 			// EBS volume — the child attributes are optional.
 			name: "silent, corroborated awkwardly",
 			root: "/dev/sda1",
-			// THE LEADING DEVICE IS NOT EBS, which is the fourth thing this row has
-			// to be awkward about. With an EBS data volume first, a bare
-			// mappings[0].EBS != nil shortcut still passed — it read the right
-			// answer off the wrong entry, and the negative rows could not catch it
-			// because they put the non-EBS root first.
+			// THE ROOT SITS IN THE MIDDLE, between two non-EBS devices, which is what
+			// it took to close BOTH positional shortcuts. Each previous version of
+			// this row closed one and left the other: with the root last, a
+			// mappings[len-1] read passed; before that, with an EBS data volume
+			// first, a mappings[0] read passed. Neither shortcut checks the name at
+			// all — they get the right answer off the wrong entry — and the negative
+			// rows cannot catch either, because they put the non-EBS root first.
 			mappings: `<item><deviceName>/dev/sdb</deviceName>` +
 				`<virtualName>ephemeral0</virtualName></item>` +
-				`<item><deviceName>/dev/sda1</deviceName><ebs></ebs></item>`,
+				`<item><deviceName>/dev/sda1</deviceName><ebs></ebs></item>` +
+				`<item><deviceName>/dev/sdc</deviceName>` +
+				`<virtualName>ephemeral1</virtualName></item>`,
 		},
 		{
 			// Silent, and the root is an instance-store device — the case the first
