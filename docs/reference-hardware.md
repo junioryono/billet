@@ -164,6 +164,12 @@ node at the site can map, which was verified from a second kernel client before 
 changed. **How it was built, what it measured, and the two things about Ubuntu 26.04 that break
 `cephadm bootstrap` are in [`adr-003-ceph-rbd.md`](adr-003-ceph-rbd.md).**
 
+The cluster also runs `ceph osd set-require-min-compat-client mimic`, which `cephadm` does not: without
+it a snapshot must be protected before it can be cloned, and a protected snapshot with a live clone can
+be neither unprotected nor removed — so a cache generation any running job holds would be undeletable.
+`billet check` refuses a cluster that would clone the old way, for either of the two settings that
+decide it, so this is enforced rather than remembered.
+
 Redundancy is not lost in the move, which was the open question when it was planned. `cephadm
 bootstrap --single-host-defaults` sets the CRUSH failure domain to the OSD rather than the host, so
 `size=2` on two OSDs places the two replicas on **two different drives** — the same protection the

@@ -1,6 +1,6 @@
 module github.com/junioryono/billet
 
-go 1.26.5
+go 1.26.6
 
 require (
 	github.com/actions/scaleset v0.4.0

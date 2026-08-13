@@ -260,6 +260,24 @@ node:
     # user: billet
     # keyring_path: /etc/ceph/ceph.client.billet.keyring
 
+    # THE CLUSTER MUST CLONE THE NEW WAY, and `billet check` refuses one that
+    # would not. On clone v1 a snapshot must be PROTECTED before it can be cloned,
+    # and a protected snapshot with a live clone can be neither unprotected nor
+    # removed — so a cache generation that any running job holds a clone of would
+    # be undeletable, and eviction would be blocked by ordinary traffic rather than
+    # by anything wrong. Nothing in billet clones yet, which is why it is checked
+    # now: the fix is one command on an empty cluster, and the same fix after a
+    # fleet is built on it is a full pool.
+    #
+    # TWO settings decide it, and either one can be the problem:
+    #
+    #   ceph osd set-require-min-compat-client mimic   # cephadm leaves this at luminous
+    #   ceph config rm client rbd_default_clone_format # if it has been forced to 1
+    #   rbd config pool rm <pool> rbd_default_clone_format   # ...or forced per pool
+    #
+    # The second overrides the first, so satisfying only the floor is not enough.
+    # billet reads both, for both pools, and names whichever one is the cause.
+
     # TWO POOLS, and one name for both is refused. Not for tuning — RBD's object
     # size is a per-IMAGE property, so the reason ZFS wanted two datasets with
     # different recordsizes does not survive the move. It is blast radius: a cache
