@@ -772,7 +772,40 @@ func (p *Provider) imageLayout(ctx context.Context, image string) (imageLayout, 
 			"cannot see it", image, p.cfg.Region)
 	}
 
+	// AN INSTANCE-STORE ROOT IS REFUSED HERE, where the lookup already fails closed
+	// on an image billet cannot use.
+	//
+	// EC2 supports both root types, and every root parameter billet sends is
+	// EBS-shaped: setBlockDevices writes Ebs.DeleteOnTermination unconditionally and
+	// Ebs.VolumeSize when a tier asks for a disk. An instance-store root has no EBS
+	// volume behind it, so those describe a device that does not exist.
+	//
+	// WITHOUT THIS THE FAILURE ARRIVES LATE AND WEARING THE WRONG NAME. The lease is
+	// already escrowed and the job already placed on this node by the time Launch
+	// runs, so the operator gets an AWS parameter error naming a device they never
+	// wrote, once per job, for every job on that tier — rather than one sentence
+	// saying this backend needs an EBS-backed AMI.
+	//
+	// It is also not supportable rather than merely unimplemented: billet resizes
+	// the root for the tier, and an instance-store root cannot be resized, so a
+	// tier's disk contract could not be met on such an image even if the request
+	// were shaped correctly.
+	//
+	// NOT MEASURED, unlike the block-device behaviour above, and the population is
+	// thin enough that it may stay that way: Amazon publishes ZERO instance-store
+	// AMIs in the region that was measured. So this is a refusal written from the
+	// documented existence of the root type, not from an observed failure — which
+	// is also why it refuses rather than trying to launch and interpret whatever
+	// comes back.
 	layout := imageLayout{root: out.Images[0].RootDeviceName}
+
+	if rootType := out.Images[0].RootDeviceType; rootType != "" && rootType != "ebs" {
+		return imageLayout{}, fmt.Errorf("ec2: image %s is %s-backed, and billet's ec2 backend "+
+			"requires an EBS-backed AMI: it states what becomes of the root volume on every "+
+			"launch and resizes it when a tier asks for a disk, neither of which an "+
+			"instance-store root can do", image, rootType)
+	}
+
 	if layout.root == "" {
 		return imageLayout{}, fmt.Errorf("ec2: image %s reports no root device name, so billet "+
 			"cannot say what becomes of its root volume, and guessing one is not an option: a "+
