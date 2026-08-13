@@ -135,6 +135,29 @@ func (f *fakeEC2) paramsFor(t *testing.T, action string) url.Values {
 	return found[0]
 }
 
+// lastParamsFor returns the parameters of the MOST RECENT call to an action.
+//
+// paramsFor deliberately refuses when there was more than one call, which is the
+// right default — a test that means to inspect "the" request should say so. This
+// is for the case where repetition IS the subject: proving that the third launch
+// of an image still carries what the first lookup found.
+func (f *fakeEC2) lastParamsFor(t *testing.T, action string) url.Values {
+	t.Helper()
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	for i := len(f.calls) - 1; i >= 0; i-- {
+		if f.calls[i].Get("Action") == action {
+			return f.calls[i]
+		}
+	}
+
+	t.Fatalf("%s was never called", action)
+
+	return nil
+}
+
 func (f *fakeEC2) countOf(action string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -575,9 +598,31 @@ func TestARootVolumeIsAlwaysDisposedOfEvenWithNoSizeToSet(t *testing.T) {
 }
 
 // THE LOOKUP IS PAID FOR ONCE PER IMAGE, which is what makes asking on every
-// launch affordable. An AMI's root device does not change.
+// launch affordable. An AMI's block devices do not change.
+//
+// AND WHAT IS CACHED HAS TO BE THE WHOLE ANSWER. Counting the calls proves only
+// that billet stopped asking — it says nothing about what it kept, so caching just
+// the root device name passed this test while every launch AFTER the first
+// silently dropped its non-root overrides and went back to depending on the
+// default this entire change exists to stop depending on. A defect visible only on
+// the second job of an AMI, which is every job in production and none in a test
+// that launches once.
 func TestAnImageIsLookedUpOncePerImage(t *testing.T) {
 	f := newFakeEC2(t)
+	f.respond = func(action string, params url.Values) (int, string) {
+		if action != "DescribeImages" {
+			return http.StatusOK, defaultReply(action)
+		}
+
+		return http.StatusOK, `<DescribeImagesResponse><imagesSet><item>` +
+			`<imageId>ami-0abc</imageId><rootDeviceName>/dev/xvda</rootDeviceName>` +
+			`<blockDeviceMapping>` +
+			`<item><deviceName>/dev/sdb</deviceName><ebs></ebs></item>` +
+			`<item><deviceName>/dev/sdc</deviceName><ebs>` +
+			`<deleteOnTermination>false</deleteOnTermination></ebs></item>` +
+			`</blockDeviceMapping></item></imagesSet></DescribeImagesResponse>`
+	}
+
 	p := newTestProvider(t, f, nil)
 
 	for range 3 {
@@ -588,6 +633,36 @@ func TestAnImageIsLookedUpOncePerImage(t *testing.T) {
 
 	if n := f.countOf("DescribeImages"); n != 1 {
 		t.Errorf("DescribeImages was called %d times across three launches of one image, want 1", n)
+	}
+
+	// THE LAST LAUNCH, not the first — a request built entirely from the cache,
+	// which is the only one that can show the cache dropping what it held.
+	got := f.lastParamsFor(t, "RunInstances")
+
+	for _, want := range []struct{ device, flag string }{
+		{"/dev/xvda", "true"},
+		{"/dev/sdb", "true"},
+		{"/dev/sdc", "false"},
+	} {
+		found := ""
+
+		for i := 1; ; i++ {
+			n := strconv.Itoa(i)
+
+			d := got.Get("BlockDeviceMapping." + n + ".DeviceName")
+			if d == "" {
+				break
+			}
+
+			if d == want.device {
+				found = got.Get("BlockDeviceMapping." + n + ".Ebs.DeleteOnTermination")
+			}
+		}
+
+		if found != want.flag {
+			t.Errorf("on the third launch %s went out as %q, want %q — the cache did not keep "+
+				"what the lookup found", want.device, found, want.flag)
+		}
 	}
 }
 
@@ -2059,6 +2134,12 @@ func TestEveryImageDeviceLaunchesWithAnExplicitTerminationFlag(t *testing.T) {
 			`<deleteOnTermination>false</deleteOnTermination></ebs></item>` +
 			`<item><deviceName>/dev/sdd</deviceName><ebs>` +
 			`<deleteOnTermination>true</deleteOnTermination></ebs></item>` +
+			// PADDED, because xs:boolean collapses whitespace and this is the one
+			// place the string decode could be strictly worse than the bool it
+			// replaced: untrimmed, " false " reads as delete and billet overrides a
+			// preservation the image did ask for.
+			`<item><deviceName>/dev/sde</deviceName><ebs>` +
+			`<deleteOnTermination> false </deleteOnTermination></ebs></item>` +
 			`</blockDeviceMapping></item></imagesSet></DescribeImagesResponse>`
 	}
 
@@ -2078,12 +2159,14 @@ func TestEveryImageDeviceLaunchesWithAnExplicitTerminationFlag(t *testing.T) {
 
 	got := f.paramsFor(t, "RunInstances")
 
-	// The device order is the image's, after the root took index 1.
+	// Order is whatever DescribeImages returned, so this reads by name rather than
+	// by position; the root took index 1 regardless.
 	want := map[string]string{
 		"/dev/xvda": "true",  // root, stated by billet itself, and it said nothing
 		"/dev/sdb":  "true",  // said nothing -> billet decides delete
 		"/dev/sdc":  "false", // said keep -> honoured
 		"/dev/sdd":  "true",  // said delete -> restated
+		"/dev/sde":  "false", // said keep, padded -> still honoured
 	}
 
 	seen := map[string]string{}
@@ -2237,7 +2320,10 @@ func TestTheRootIsDeletedEvenWhenTheImageAsksToKeepIt(t *testing.T) {
 			`</blockDeviceMapping></item></imagesSet></DescribeImagesResponse>`
 	}
 
+	var logged bytes.Buffer
+
 	p := newTestProvider(t, f, nil)
+	p.log = slog.New(slog.NewTextHandler(&logged, nil))
 
 	if _, err := p.Launch(t.Context(), validSpec()); err != nil {
 		t.Fatalf("Launch: %v", err)
@@ -2250,8 +2336,8 @@ func TestTheRootIsDeletedEvenWhenTheImageAsksToKeepIt(t *testing.T) {
 	}
 
 	if v := got.Get("BlockDeviceMapping.1.Ebs.DeleteOnTermination"); v != "true" {
-		t.Errorf("the root went out as %q; a boot disk kept per job is a leak on every job "+
-			"this tier ever runs", v)
+		t.Errorf("the root went out as %q; a boot disk kept per job leaks on every job billet "+
+			"launches from this image", v)
 	}
 
 	// AND IT IS NOT ALSO RESTATED AS A SECOND DEVICE, which is what would happen if
@@ -2259,6 +2345,14 @@ func TestTheRootIsDeletedEvenWhenTheImageAsksToKeepIt(t *testing.T) {
 	// for one device, disagreeing.
 	if d := got.Get("BlockDeviceMapping.2.DeviceName"); d != "" {
 		t.Errorf("the root was sent twice: index 2 is %q", d)
+	}
+
+	// AND IT SAID SO. The override is only half the promise; the ADR commits to
+	// announcing it in the same breath. This fixture spells the flag as the WORD,
+	// and the announcement was pinned only for the digit elsewhere — the one cell of
+	// the matrix nothing covered.
+	if !strings.Contains(logged.String(), "ROOT") {
+		t.Errorf("billet overrode a root marked keep without announcing it: %s", logged.String())
 	}
 }
 
@@ -2275,6 +2369,7 @@ func TestTheRootIsNotAnnouncedWhenTheImageDidNotAskToKeepIt(t *testing.T) {
 	}{
 		{name: "said delete in words", ebs: `<deleteOnTermination>true</deleteOnTermination>`},
 		{name: "said delete as a digit", ebs: `<deleteOnTermination>1</deleteOnTermination>`},
+		{name: "said delete padded", ebs: `<deleteOnTermination> true </deleteOnTermination>`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFakeEC2(t)
