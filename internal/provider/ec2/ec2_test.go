@@ -135,6 +135,26 @@ func (f *fakeEC2) paramsFor(t *testing.T, action string) url.Values {
 	return found[0]
 }
 
+// allParamsFor returns the parameters of every call to an action, in order.
+//
+// For the case where the interesting request is neither the first nor the last —
+// checking the MIDDLE launch is what catches a value that was hardcoded to the
+// one every other fixture happens to use.
+func (f *fakeEC2) allParamsFor(action string) []url.Values {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	var found []url.Values
+
+	for _, c := range f.calls {
+		if c.Get("Action") == action {
+			found = append(found, c)
+		}
+	}
+
+	return found
+}
+
 // lastParamsFor returns the parameters of the MOST RECENT call to an action.
 //
 // paramsFor deliberately refuses when there was more than one call, which is the
@@ -156,6 +176,48 @@ func (f *fakeEC2) lastParamsFor(t *testing.T, action string) url.Values {
 	t.Fatalf("%s was never called", action)
 
 	return nil
+}
+
+// blockDevices reads the numbered BlockDeviceMapping parameters back by device
+// name, and refuses to hide the two things a name-keyed map otherwise hides.
+//
+// A DUPLICATE IS AN ERROR, NOT AN OVERWRITE. Reducing numbered entries by name is
+// the natural way to assert them, and it is exactly how a mutant that sends one
+// device TWICE stays invisible: the second entry replaces the first, the map still
+// has the expected keys, and EC2 would have received two mappings for one device
+// disagreeing about its flag.
+//
+// AND AN EMPTY FLAG IS AN ERROR ANYWHERE, since a device leaving without one is
+// the whole defect #53 closed — worth checking wherever the request is read rather
+// than only in the test that happens to be about it.
+func blockDevices(t *testing.T, got url.Values) map[string]string {
+	t.Helper()
+
+	out := map[string]string{}
+
+	for i := 1; ; i++ {
+		n := strconv.Itoa(i)
+
+		device := got.Get("BlockDeviceMapping." + n + ".DeviceName")
+		if device == "" {
+			break
+		}
+
+		if _, seen := out[device]; seen {
+			t.Errorf("%s was sent more than once, so EC2 would receive two mappings for one "+
+				"device", device)
+		}
+
+		flag := got.Get("BlockDeviceMapping." + n + ".Ebs.DeleteOnTermination")
+		if flag == "" {
+			t.Errorf("device %s left with no DeleteOnTermination, which is the whole defect "+
+				"#53 exists to close", device)
+		}
+
+		out[device] = flag
+	}
+
+	return out
 }
 
 func (f *fakeEC2) countOf(action string) int {
@@ -604,18 +666,38 @@ func TestARootVolumeIsAlwaysDisposedOfEvenWithNoSizeToSet(t *testing.T) {
 // that billet stopped asking — it says nothing about what it kept, so caching just
 // the root device name passed this test while every launch AFTER the first
 // silently dropped its non-root overrides and went back to depending on the
-// default this entire change exists to stop depending on. A defect visible only on
-// the second job of an AMI, which is every job in production and none in a test
-// that launches once.
+// default this entire change exists to stop depending on. A defect visible only
+// from the SECOND launch of an AMI onward — nearly every launch in a steady state,
+// and none at all in a test that launches once.
 func TestAnImageIsLookedUpOncePerImage(t *testing.T) {
+	// TWO IMAGES WITH DIFFERENT ROOTS, launched A, B, A. One image cannot tell a
+	// per-image cache from a single global slot, and cannot tell a cached root from
+	// a hardcoded /dev/xvda — every fixture in this file happens to use that name.
+	// Interleaving is what makes the second A launch answer both: it must come from
+	// A's entry, which B's lookup must not have replaced.
+	const (
+		imageA = "ami-0abc"
+		imageB = "ami-0def"
+	)
+
 	f := newFakeEC2(t)
 	f.respond = func(action string, params url.Values) (int, string) {
 		if action != "DescribeImages" {
 			return http.StatusOK, defaultReply(action)
 		}
 
+		if params.Get("ImageId.1") == imageB {
+			return http.StatusOK, `<DescribeImagesResponse><imagesSet><item>` +
+				`<imageId>` + imageB + `</imageId>` +
+				`<rootDeviceName>/dev/sda1</rootDeviceName>` +
+				`<blockDeviceMapping>` +
+				`<item><deviceName>/dev/sda1</deviceName><ebs></ebs></item>` +
+				`<item><deviceName>/dev/sdz</deviceName><ebs></ebs></item>` +
+				`</blockDeviceMapping></item></imagesSet></DescribeImagesResponse>`
+		}
+
 		return http.StatusOK, `<DescribeImagesResponse><imagesSet><item>` +
-			`<imageId>ami-0abc</imageId><rootDeviceName>/dev/xvda</rootDeviceName>` +
+			`<imageId>` + imageA + `</imageId><rootDeviceName>/dev/xvda</rootDeviceName>` +
 			`<blockDeviceMapping>` +
 			`<item><deviceName>/dev/sdb</deviceName><ebs></ebs></item>` +
 			`<item><deviceName>/dev/sdc</deviceName><ebs>` +
@@ -623,46 +705,83 @@ func TestAnImageIsLookedUpOncePerImage(t *testing.T) {
 			`</blockDeviceMapping></item></imagesSet></DescribeImagesResponse>`
 	}
 
-	p := newTestProvider(t, f, nil)
+	var logged bytes.Buffer
 
-	for range 3 {
-		if _, err := p.Launch(t.Context(), validSpec()); err != nil {
-			t.Fatalf("Launch: %v", err)
+	p := newTestProvider(t, f, nil)
+	p.log = slog.New(slog.NewTextHandler(&logged, nil))
+
+	for _, image := range []string{imageA, imageB, imageA} {
+		spec := validSpec()
+		spec.Image = image
+
+		// THE LAST LAUNCH DIFFERS ON PURPOSE. With three identical requests the
+		// first and the last are byte-identical, so lastParamsFor could be reading
+		// either and nothing would notice.
+		if image == imageB {
+			spec.Disk = 80 * config.GiB
+		}
+
+		if _, err := p.Launch(t.Context(), spec); err != nil {
+			t.Fatalf("Launch %s: %v", image, err)
 		}
 	}
 
-	if n := f.countOf("DescribeImages"); n != 1 {
-		t.Errorf("DescribeImages was called %d times across three launches of one image, want 1", n)
+	if n := f.countOf("DescribeImages"); n != 2 {
+		t.Errorf("DescribeImages was called %d times for two images launched three times, "+
+			"want 2", n)
 	}
 
-	// THE LAST LAUNCH, not the first — a request built entirely from the cache,
-	// which is the only one that can show the cache dropping what it held.
+	// THE THIRD LAUNCH — image A again, built entirely from cache, and the only
+	// request that can show the cache dropping or confusing what it held.
 	got := f.lastParamsFor(t, "RunInstances")
 
-	for _, want := range []struct{ device, flag string }{
-		{"/dev/xvda", "true"},
-		{"/dev/sdb", "true"},
-		{"/dev/sdc", "false"},
-	} {
-		found := ""
+	if v := got.Get("BlockDeviceMapping.1.Ebs.VolumeSize"); v != "" {
+		t.Errorf("the last request carries a volume size of %q, but only the middle launch "+
+			"asked for one — lastParamsFor is not reading the last request", v)
+	}
 
-		for i := 1; ; i++ {
-			n := strconv.Itoa(i)
+	want := map[string]string{
+		"/dev/xvda": "true",
+		"/dev/sdb":  "true",
+		"/dev/sdc":  "false",
+	}
 
-			d := got.Get("BlockDeviceMapping." + n + ".DeviceName")
-			if d == "" {
-				break
-			}
+	seen := blockDevices(t, got)
 
-			if d == want.device {
-				found = got.Get("BlockDeviceMapping." + n + ".Ebs.DeleteOnTermination")
-			}
-		}
-
-		if found != want.flag {
+	for device, flag := range want {
+		if seen[device] != flag {
 			t.Errorf("on the third launch %s went out as %q, want %q — the cache did not keep "+
-				"what the lookup found", want.device, found, want.flag)
+				"what the lookup found", device, seen[device], flag)
 		}
+	}
+
+	if len(seen) != len(want) {
+		t.Errorf("the third launch sent %v, want exactly %v — a device from the other image "+
+			"leaked across the cache", seen, want)
+	}
+
+	// AND THE OTHER IMAGE GOT ITS OWN ROOT. This is the assertion that catches a
+	// root hardcoded to /dev/xvda — the name every other fixture in this file uses,
+	// including image A's, so A's own request cannot show it. Image B's root is
+	// deliberately /dev/sda1, and it is the MIDDLE request.
+	runs := f.allParamsFor("RunInstances")
+	if len(runs) != 3 {
+		t.Fatalf("RunInstances was called %d times, want 3", len(runs))
+	}
+
+	if d := runs[1].Get("BlockDeviceMapping.1.DeviceName"); d != "/dev/sda1" {
+		t.Errorf("the second image launched with root %q, want /dev/sda1 — its root came from "+
+			"somewhere other than its own lookup", d)
+	}
+
+	if b := blockDevices(t, runs[1]); len(b) != 2 {
+		t.Errorf("the second image sent %v, want exactly its own two devices", b)
+	}
+
+	// SAID ONCE, not once per launch. The warning lives behind the cache precisely
+	// so a busy tier does not repeat it for every job.
+	if n := strings.Count(logged.String(), "/dev/sdc"); n != 1 {
+		t.Errorf("the kept volume was reported %d times across three launches, want 1", n)
 	}
 }
 
@@ -2090,8 +2209,8 @@ func TestAVolumeMarkedWithTheOtherBooleanSpellingIsStillReported(t *testing.T) {
 // EVERY EBS DEVICE THE IMAGE DECLARES LEAVES WITH AN EXPLICIT FLAG (#53).
 //
 // This is the test that makes the argument about EC2's default irrelevant rather
-// than resolved. AWS documents that default two ways and the two disagree for
-// exactly this case, so billet stops depending on it: whatever the image says or
+// than resolved. AWS documents that default two ways that careful readers READ
+// differently for this case, so billet stops depending on it: whatever it says or
 // does not say, the RunInstances request states DeleteOnTermination for every
 // device it launches.
 //
@@ -2104,8 +2223,8 @@ func TestAVolumeMarkedWithTheOtherBooleanSpellingIsStillReported(t *testing.T) {
 //
 // The root is not one of the three: it is always sent true whatever it said, and
 // TestTheRootIsDeletedEvenWhenTheImageAsksToKeepIt is where that is pinned. This
-// fixture's root says true, so the exception never shows here — which is exactly
-// why the sentence above has to name it.
+// fixture's root says NOTHING, so the exception never shows here — which is
+// exactly why the sentence above has to name it.
 //
 // AND THE ROOT WARNING MUST STAY SILENT, which is the other half of the rule and
 // the half nothing asserted until a reviewer went looking for a mutant that
@@ -2169,24 +2288,7 @@ func TestEveryImageDeviceLaunchesWithAnExplicitTerminationFlag(t *testing.T) {
 		"/dev/sde":  "false", // said keep, padded -> still honoured
 	}
 
-	seen := map[string]string{}
-
-	for i := 1; ; i++ {
-		n := strconv.Itoa(i)
-
-		device := got.Get("BlockDeviceMapping." + n + ".DeviceName")
-		if device == "" {
-			break
-		}
-
-		flag := got.Get("BlockDeviceMapping." + n + ".Ebs.DeleteOnTermination")
-		if flag == "" {
-			t.Errorf("device %s left with no DeleteOnTermination, which is the whole "+
-				"defect #53 exists to close", device)
-		}
-
-		seen[device] = flag
-	}
+	seen := blockDevices(t, got)
 
 	for device, flag := range want {
 		if seen[device] != flag {
@@ -2196,6 +2298,16 @@ func TestEveryImageDeviceLaunchesWithAnExplicitTerminationFlag(t *testing.T) {
 
 	if len(seen) != len(want) {
 		t.Errorf("sent %d devices, want %d: %v", len(seen), len(want), seen)
+	}
+
+	// EVERY KEPT VOLUME IS ANNOUNCED, both spellings of it. Honouring the flag and
+	// saying so are separate code paths, so a regression that reads the RAW value
+	// for the warning while the request uses the trimmed one would honour the padded
+	// device and never mention it — a volume billet knowingly leaves behind, silently.
+	for _, device := range []string{"/dev/sdc", "/dev/sde"} {
+		if !strings.Contains(logged.String(), device) {
+			t.Errorf("%s is being kept and was not reported: %s", device, logged.String())
+		}
 	}
 }
 
@@ -2479,10 +2591,20 @@ func TestAMappingWithNoDeviceNameIsSkipped(t *testing.T) {
 			`</blockDeviceMapping></item></imagesSet></DescribeImagesResponse>`
 	}
 
+	var logged bytes.Buffer
+
 	p := newTestProvider(t, f, nil)
+	p.log = slog.New(slog.NewTextHandler(&logged, nil))
 
 	if _, err := p.Launch(t.Context(), validSpec()); err != nil {
 		t.Fatalf("Launch: %v", err)
+	}
+
+	// THE NAMELESS MAPPING SAYS "KEEP", so a guard that ran after the warning rather
+	// than before it would announce a volume that has no name to announce. Nothing
+	// at all should be said here.
+	if strings.Contains(logged.String(), "level=WARN") {
+		t.Errorf("a nameless mapping produced a warning naming no device: %s", logged.String())
 	}
 
 	got := f.paramsFor(t, "RunInstances")
