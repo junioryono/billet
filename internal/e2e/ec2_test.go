@@ -88,8 +88,18 @@ func newFakeCloud(t *testing.T) *fakeCloud {
 
 		switch params.Get("Action") {
 		case "DescribeImages":
+			// SHAPED LIKE A REAL RESPONSE. This reported a root device name and
+			// nothing else, which no image measured against a live account does —
+			// they report the root device TYPE and describe that device in the block
+			// device mapping. billet now requires evidence that a root is EBS-backed
+			// (#54), and this fixture described an image it correctly refuses.
 			reply = `<DescribeImagesResponse><imagesSet><item><imageId>ami-cloud</imageId>` +
-				`<rootDeviceName>/dev/xvda</rootDeviceName></item></imagesSet></DescribeImagesResponse>`
+				`<rootDeviceName>/dev/xvda</rootDeviceName>` +
+				`<rootDeviceType>ebs</rootDeviceType>` +
+				`<blockDeviceMapping><item><deviceName>/dev/xvda</deviceName><ebs>` +
+				`<deleteOnTermination>true</deleteOnTermination></ebs></item>` +
+				`</blockDeviceMapping>` +
+				`</item></imagesSet></DescribeImagesResponse>`
 
 		case "RunInstances":
 			f.next++
