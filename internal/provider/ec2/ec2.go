@@ -607,11 +607,24 @@ type imageLayout struct {
 // documented, contradictory, or discovered later — governs anything billet
 // launches. #53.
 //
-// AN EXPLICIT false IS PASSED THROUGH, NOT OVERRIDDEN. Only the mappings that say
-// nothing are decided here. Where the image DID state the flag, that is the
-// operator talking about their own AMI, and silently deleting a volume somebody
-// deliberately marked to keep is a data-loss bug wearing a tidiness costume. Those
-// are warned about instead, once per image.
+// AN EXPLICIT false IS PASSED THROUGH ON EVERY DEVICE EXCEPT THE ROOT. Where a
+// NON-ROOT mapping stated the flag, that is the operator talking about their own
+// AMI, and silently deleting a volume somebody deliberately marked to keep would
+// destroy whatever the job wrote to it — irreversibly, against a leak that is
+// tagged, warned about, and deletable any month you like. When one arm is
+// reversible and the other is not, take the reversible one. Those are warned about
+// instead, once per image.
+//
+// THE ROOT IS BILLET'S, AND IS ALWAYS SENT true. That is not an exception carved
+// out to be convenient; it is the one device billet already owns. billet chooses
+// its size for the tier, it is the disk the runner boots, and it exists only for
+// the length of one job — AWS itself only permits size, type and this flag to be
+// modified for a root volume, which is very nearly the list of things billet sets.
+// An image whose root says "keep" would leave a full OS disk behind for EVERY job
+// on the tier, which is the largest leak available here and the least likely to be
+// deliberate. billet overrides it and SAYS SO, which is the difference that makes
+// the asymmetry honest: billet is silent when it merely fills a gap the image left,
+// and speaks whenever it contradicts something the image actually said.
 //
 // THE DEVICE NAME IS ASKED FOR RATHER THAN ASSUMED, which is what the lookup buys
 // beyond this. A block device mapping naming a device that is not the AMI's root
@@ -641,8 +654,11 @@ func (p *Provider) setBlockDevices(ctx context.Context, params url.Values, spec 
 		params.Set("BlockDeviceMapping.1.Ebs.VolumeSize", strconv.FormatInt(gib, 10))
 	}
 
-	// FROM 2, because the root took 1. The indices are positional rather than
-	// meaningful, but they must be contiguous — EC2 stops reading at the first gap.
+	// FROM 2, because the root took 1, and CONTIGUOUS because that is what every
+	// official SDK emits for a query-API list. What EC2 does with a GAP is not
+	// documented anywhere billet can point at — so this does not rely on knowing:
+	// a dense list is correct under every possible gap semantics, which is the
+	// cheaper thing to depend on than a claim about somebody else's parser.
 	for i, d := range layout.devices {
 		n := strconv.Itoa(i + 2)
 
@@ -694,13 +710,31 @@ func (p *Provider) imageLayout(ctx context.Context, image string) (imageLayout, 
 		// instance-store or suppressed device, and sending Ebs.DeleteOnTermination
 		// for one asks EC2 about a volume that does not exist. A device with no name
 		// cannot be restated at all.
-		if bd.DeviceName == "" || bd.DeviceName == layout.root || bd.EBS == nil {
+		if bd.DeviceName == "" || bd.EBS == nil {
+			continue
+		}
+
+		stated := survivesTermination(bd.EBS.DeleteOnTermination)
+
+		// THE ROOT IS OVERRIDDEN, AND THAT IS THE ONE CASE BILLET ANNOUNCES ITSELF
+		// FOR. setBlockDevices always sends true for it, so nothing is collected
+		// here — but an image that explicitly asked to keep its root is having a
+		// stated intent reversed, and finding that out from a missing volume is
+		// worse than reading it once.
+		if bd.DeviceName == layout.root {
+			if stated {
+				p.log.Warn("this image asks to keep its ROOT volume, and billet is overriding "+
+					"that to delete: the root is the disk billet sizes and boots for one job, "+
+					"and keeping it would leave a full OS disk behind for every job on this tier",
+					"image", image, "device", bd.DeviceName)
+			}
+
 			continue
 		}
 
 		keep := "true"
 
-		if survivesTermination(bd.EBS.DeleteOnTermination) {
+		if stated {
 			// THE IMAGE SAID SO, so billet says it back rather than overruling it.
 			keep = "false"
 
