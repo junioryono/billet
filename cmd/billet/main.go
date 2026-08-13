@@ -40,6 +40,7 @@ import (
 	"github.com/junioryono/billet/internal/scaleset"
 	"github.com/junioryono/billet/internal/server"
 	"github.com/junioryono/billet/internal/state"
+	"github.com/junioryono/billet/internal/store/ceph"
 	"github.com/junioryono/billet/internal/version"
 	"github.com/junioryono/billet/internal/wirecert"
 	"github.com/junioryono/billet/internal/wiring"
@@ -1642,6 +1643,12 @@ func cmdCheck(ctx context.Context, args []string) error {
 				return err
 			}
 		}
+
+		if cfg.Node.Ceph != nil {
+			if err := checkCephCluster(ctx, cfg.Node.Ceph); err != nil {
+				return err
+			}
+		}
 	}
 
 	// Per-host policy decides what each machine may run and how many macOS
@@ -1822,6 +1829,51 @@ func checkEC2Credentials(ctx context.Context, cfg *config.EC2Config) error {
 	if len(cfg.UntrustedSecurityGroupIDs) == 0 {
 		fmt.Printf("         untrusted work will be refused: no untrusted_security_group_ids\n")
 	}
+
+	return nil
+}
+
+// checkCephCluster proves this machine can act on its storage configuration.
+//
+// THE SAME DISTINCTION checkPrivateKey AND checkEC2Credentials MAKE, one backend
+// over. Config validation proves the block is coherent; it cannot prove the
+// monitors answer, the keyring authenticates, or the pools were ever created. A
+// node that is wrong about any of those validates perfectly and then fails on the
+// first job of the day, with a librados error naming none of them.
+//
+// A MISSING rbd IS REPORTED RATHER THAN FATAL. `billet check` is run on the
+// control plane as often as on a compute host, and on a machine that only holds
+// the ledger the client package is genuinely not needed — refusing there would
+// make the one command an operator reaches for unusable on half the fleet.
+func checkCephCluster(ctx context.Context, cfg *config.CephConfig) error {
+	client, err := ceph.New(*cfg)
+	if err != nil {
+		if errors.Is(err, ceph.ErrNoRBD) {
+			fmt.Printf("ceph     %s + %s, unverified: the rbd command is not installed here, so "+
+				"billet could not reach the cluster (install ceph-common on a host that will "+
+				"run jobs)\n", cfg.ImagePool, cfg.CachePool)
+
+			return nil
+		}
+
+		return err
+	}
+
+	report, err := client.CheckReachable(ctx)
+	if err != nil {
+		return fmt.Errorf("node.ceph: this host could not read the pools it is configured with, "+
+			"so it could not launch anything: %w", err)
+	}
+
+	fmt.Printf("ceph     client.%s -> %s (%d image(s)), %s (%d volume(s))\n",
+		report.User, cfg.ImagePool, report.ImagePool, cfg.CachePool, report.CachePool)
+
+	// SAID, BECAUSE THE CHECK IS NARROWER THAN IT LOOKS. Listing a pool proves the
+	// monitors answered and the keyring authenticated; it proves nothing about
+	// permission to create, clone or remove an image, which is what a launch does.
+	fmt.Printf("         (read only — launching also needs create, clone, snapshot and remove in " +
+		"both pools; `ceph auth get-or-create client.<user> mon 'profile rbd' osd 'profile rbd " +
+		"pool=<images>, profile rbd pool=<cache>'` grants exactly that)\n")
 
 	return nil
 }
