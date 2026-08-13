@@ -361,10 +361,21 @@ type describeInstancesResponse struct {
 	NextToken string `xml:"nextToken"`
 }
 
-// describeImagesResponse carries the one field billet needs from an AMI.
+// describeImagesResponse carries what billet needs from an AMI: which device is
+// root, and every OTHER volume the image would attach.
 type describeImagesResponse struct {
 	Images []struct {
 		ImageID        string `xml:"imageId"`
 		RootDeviceName string `xml:"rootDeviceName"`
+		// BlockDevices are the image's own mappings. billet sets
+		// DeleteOnTermination for the ROOT and cannot for the rest without
+		// restating each one — so these are read to WARN, because a mapping the
+		// image marks as surviving termination leaks a volume per job.
+		BlockDevices []struct {
+			DeviceName string `xml:"deviceName"`
+			EBS        struct {
+				DeleteOnTermination string `xml:"deleteOnTermination"`
+			} `xml:"ebs"`
+		} `xml:"blockDeviceMapping>item"`
 	} `xml:"imagesSet>item"`
 }

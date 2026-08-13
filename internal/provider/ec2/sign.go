@@ -82,10 +82,15 @@ func sign(req *http.Request, body []byte, creds Credentials, region string, now 
 
 	canonicalHeaders, signedHeaders := canonicalizeHeaders(req.Header, host, req.ContentLength)
 
+	query, err := canonicalQuery(req.URL)
+	if err != nil {
+		return err
+	}
+
 	canonicalRequest := strings.Join([]string{
 		req.Method,
 		canonicalURI(req.URL),
-		canonicalQuery(req.URL),
+		query,
 		canonicalHeaders,
 		signedHeaders,
 		payloadHash,
@@ -213,24 +218,38 @@ func canonicalURI(u *url.URL) string {
 
 // canonicalQuery is the query sorted by name and re-encoded the way SigV4 wants.
 //
-// NOT url.Values.Encode ALONE, which was the previous implementation and was
-// described as "the one place Go's normalization and the specification happen to
-// agree". They agree on sorting and on most escapes and they disagree on SPACE:
-// Encode writes `+` and SigV4 canonicalization requires `%20`, so any parameter
-// containing a space would be signed over bytes AWS canonicalizes differently and
-// come back as a 403 naming nothing.
+// IT REFUSES A QUERY IT CANNOT PARSE FAITHFULLY, which is the half that is not
+// about encoding. url.Values.Encode is reached through url.Query(), and Query
+// DISCARDS ParseQuery's error — so a query Go dislikes is silently reduced rather
+// than rejected. Measured: `a=1;b=2` parses to an EMPTY map, because Go has
+// refused the semicolon as a separator since 1.17, and `a=1&b=%zz` quietly loses
+// b. Either way the signature covers a query the wire does not send, and the
+// service answers 403 naming nothing.
 //
-// Latent rather than live — this client puts every parameter in the POST body,
-// where the payload hash covers the exact bytes — which is precisely why it is
-// worth fixing now: the signer is a general thing, and the next caller to put
-// something in a query string would pay for a comment that was confident and
-// wrong.
-func canonicalQuery(u *url.URL) string {
+// NOT url.Values.Encode ALONE for the escaping either, which the previous
+// implementation was, described as "the one place Go's normalization and the
+// specification happen to agree". They agree on sorting and on most escapes and
+// they disagree on SPACE: Encode writes `+` and SigV4 requires `%20`. A literal
+// plus is unaffected — Encode has already written it as `%2B` — so replacing
+// after the fact can only ever touch an encoded space.
+//
+// Both faults are latent for this client, which puts every parameter in the POST
+// body where the payload hash covers the exact bytes. They are fixed because the
+// signer is a general thing, and the next caller to use a query string would
+// otherwise inherit a confident comment and an unexplainable 403.
+func canonicalQuery(u *url.URL) (string, error) {
 	if u.RawQuery == "" {
-		return ""
+		return "", nil
 	}
 
-	return strings.ReplaceAll(u.Query().Encode(), "+", "%20")
+	values, err := url.ParseQuery(u.RawQuery)
+	if err != nil {
+		return "", fmt.Errorf("ec2: refusing to sign a request whose query billet cannot read "+
+			"the same way it will be sent, because the signature would cover something else: %w",
+			err)
+	}
+
+	return strings.ReplaceAll(values.Encode(), "+", "%20"), nil
 }
 
 // collapseSpace trims a header value and squeezes internal runs of spaces to
