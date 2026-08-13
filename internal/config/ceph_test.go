@@ -317,7 +317,7 @@ func TestCephValuesAreTrimmed(t *testing.T) {
 	body := withCeph(t, `  ceph:
     user: "  billet  "
     image_pool: "\tbillet-images \n"
-    cache_pool: "  billet-cache\r"
+    cache_pool: "\t billet-cache \r\n"
     conf_path: "  /etc/ceph/ceph.conf  "
     keyring_path: "  /etc/ceph/ceph.client.billet.keyring  "
 `)
@@ -689,6 +689,23 @@ func TestTheDocumentedDockerConversionLoads(t *testing.T) {
 	}
 
 	text := string(body)
+
+	// THE HEADER IS PART OF WHAT IS UNDER TEST. Applying three hard-coded edits
+	// proves the conversion loads; it says nothing about whether the file still
+	// TELLS an operator to make them, which is the half that went stale. Each
+	// instruction is asserted to still be written down, so deleting one from the
+	// prose fails here rather than silently leaving the docs wrong again.
+	for _, instruction := range []string{
+		"THREE edits HERE make it start today",
+		"`provider: firecracker` -> `provider: docker`, in the node section and in",
+		"Delete the `ceph:` block below",
+		"`image:` -> a Docker image that contains the GitHub runner",
+	} {
+		if !strings.Contains(text, instruction) {
+			t.Errorf("the example no longer tells an operator to %q, so the conversion below is "+
+				"tested against instructions nobody is given", instruction)
+		}
+	}
 
 	// Edit 1: the provider, in the node section and in every tier. ANCHORED ON THE
 	// NEWLINE, because the node's two-space form is a substring of a tier's
