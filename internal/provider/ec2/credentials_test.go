@@ -2,6 +2,7 @@ package ec2
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -291,6 +292,10 @@ type fakeIMDS struct {
 	// tokens counts how many session tokens were issued, which is how a test can
 	// see whether a value was served from cache.
 	tokens int
+	// noRole models an instance with no instance profile attached: IMDS works
+	// perfectly and simply has nothing to give, which is an ABSENCE rather than a
+	// failure and is the only thing a chain may continue past.
+	noRole bool
 	// v1Only models a host with IMDSv2 turned off: the PUT that obtains a session
 	// token fails, AND an unauthenticated GET succeeds.
 	//
@@ -331,6 +336,12 @@ func newFakeIMDS(t *testing.T, keyID string, expires time.Time) *fakeIMDS {
 			w.WriteHeader(http.StatusUnauthorized)
 
 		case r.URL.Path == "/latest/meta-data/iam/security-credentials/":
+			if f.noRole {
+				write(t, w, "\n")
+
+				return
+			}
+
 			write(t, w, "billet-node-role\n")
 
 		case r.URL.Path == "/latest/meta-data/iam/security-credentials/billet-node-role":
@@ -447,8 +458,14 @@ func TestAChainWithNothingReportsWhatEachSourceSaid(t *testing.T) {
 	t.Setenv("AWS_ACCESS_KEY_ID", "")
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "")
 
+	// AN INSTANCE WITH NO ROLE, not one whose metadata service is broken. The
+	// difference is the point: a chain continues past a source that HAS nothing and
+	// stops at one that failed, so a broken source here would be testing the
+	// opposite property. An earlier version used a v1-only host — a terminal
+	// failure — and asserted the sentinel anyway, which enshrined the meaning this
+	// distinction was introduced to remove.
 	imds := newFakeIMDS(t, "", time.Time{})
-	imds.v1Only = true
+	imds.noRole = true
 
 	chain := ChainCredentials{EnvCredentials{}, &IMDSCredentials{Endpoint: imds.URL}}
 
@@ -458,12 +475,57 @@ func TestAChainWithNothingReportsWhatEachSourceSaid(t *testing.T) {
 	}
 
 	if !errors.Is(err, errNoCredentials) {
-		t.Errorf("the environment's reason was lost from the chain's error: %v", err)
+		t.Errorf("a chain whose every source was empty did not report an absence: %v", err)
 	}
 
 	if !strings.Contains(err.Error(), "imds") {
 		t.Errorf("the instance role's reason was lost from the chain's error: %v", err)
 	}
+}
+
+// A CHAIN IS ITSELF A SOURCE, SO ITS ANSWER HAS TO MEAN THE SAME THING.
+//
+// DefaultCredentials returns a ChainCredentials, so one can be nested inside
+// another — and errors.Join keeps every branch reachable by errors.Is, so an inner
+// chain that STOPPED at a broken source still matched errNoCredentials because an
+// earlier source had reported an absence. The outer chain read that as "nothing
+// here" and carried on to a different AWS identity: the same fallthrough, one
+// level up, through the very function that was supposed to have closed it.
+func TestANestedChainDoesNotLaunderATerminalFailureIntoAnAbsence(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", "")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "")
+
+	broken := newFakeIMDS(t, "", time.Time{})
+	broken.v1Only = true
+
+	// Empty, then broken: the inner chain must report the BREAKAGE.
+	inner := ChainCredentials{EnvCredentials{}, &IMDSCredentials{Endpoint: broken.URL}}
+
+	if _, err := inner.Credentials(t.Context()); errors.Is(err, errNoCredentials) {
+		t.Fatalf("a chain that stopped at a broken source reported an absence: %v", err)
+	}
+
+	// And an outer chain therefore stops rather than reaching the fallback.
+	fallback := &countingSource{}
+	outer := ChainCredentials{inner, fallback}
+
+	if _, err := outer.Credentials(t.Context()); err == nil {
+		t.Fatal("the outer chain fell through a broken inner chain")
+	}
+
+	if fallback.calls != 0 {
+		t.Errorf("the outer chain consulted its fallback %d time(s) after an inner chain "+
+			"failed terminally; billet would run as an identity nobody chose", fallback.calls)
+	}
+}
+
+// countingSource records whether a chain reached it.
+type countingSource struct{ calls int }
+
+func (c *countingSource) Credentials(context.Context) (Credentials, error) {
+	c.calls++
+
+	return Credentials{AccessKeyID: "AKID-FALLBACK", SecretAccessKey: "s"}, nil
 }
 
 // THE CREDENTIAL DOCUMENT IS NEVER IN AN ERROR. It is the credential, and one

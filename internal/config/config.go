@@ -1413,8 +1413,9 @@ func (c *Config) validateEC2Node() []error {
 	// looking full. That is the failover this backend exists for, silently not
 	// working.
 	//
-	// Required rather than defaulted: the number is a spending limit, and billet
-	// has no standing to choose one on somebody's account.
+	// Required rather than defaulted: billet has no standing to choose how much to
+	// buy on somebody's account. It is NOT a spending limit — see #47, and the
+	// package comment on internal/provider/ec2.
 	if c.Node.MaxVCPU <= 0 {
 		errs = append(errs, errors.New(
 			"node.max_vcpu is required when provider is ec2: there is no machine to detect it "+
