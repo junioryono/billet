@@ -695,15 +695,19 @@ func TestTheDocumentedDockerConversionLoads(t *testing.T) {
 	// TELLS an operator to make them, which is the half that went stale. Each
 	// instruction is asserted to still be written down, so deleting one from the
 	// prose fails here rather than silently leaving the docs wrong again.
+	// SHORT ANCHORS, deliberately. The point is that each instruction is still
+	// GIVEN, not that its sentence is unchanged — matching a whole line would fail
+	// on a reflow and train the next person to delete this loop.
 	for _, instruction := range []string{
-		"THREE edits HERE make it start today",
-		"`provider: firecracker` -> `provider: docker`, in the node section and in",
-		"Delete the `ceph:` block below",
-		"`image:` -> a Docker image that contains the GitHub runner",
+		"THREE edits",
+		"`provider: firecracker` -> `provider: docker`",
+		"Delete the `ceph:` block",
+		"`image:` -> a Docker image",
 	} {
 		if !strings.Contains(text, instruction) {
-			t.Errorf("the example no longer tells an operator to %q, so the conversion below is "+
-				"tested against instructions nobody is given", instruction)
+			t.Errorf("the example's header no longer says %q, so the conversion below is tested "+
+				"against instructions nobody is given; reword freely, but keep telling an operator "+
+				"to make each edit", instruction)
 		}
 	}
 
