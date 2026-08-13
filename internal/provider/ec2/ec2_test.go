@@ -2686,6 +2686,82 @@ func TestTheRootIsNotAnnouncedWhenTheImageDidNotAskToKeepIt(t *testing.T) {
 	}
 }
 
+// AN INSTANCE-STORE-BACKED AMI IS REFUSED, AND REFUSED EARLY (#54).
+//
+// Every root parameter billet sends is EBS-shaped, so such an image would reach
+// RunInstances describing a volume that does not exist. The failure would land
+// after the lease was escrowed and the job placed, as an AWS parameter error
+// naming a device the operator never wrote — once per job, for every job on that
+// tier.
+//
+// THE ABSENT CASE IS ALLOWED THROUGH, deliberately. Every fake response in this
+// file predates the field, and an image that does not report its root type is not
+// evidence of an instance-store root — the same "absent is not false" rule the
+// termination flag taught, applied to a field billet has even less reason to
+// second-guess.
+func TestAnInstanceStoreBackedImageIsRefused(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		rootType string
+		wantErr  bool
+	}{
+		{name: "instance store", rootType: "instance-store", wantErr: true},
+		{name: "something new", rootType: "some-future-type", wantErr: true},
+		{name: "ebs", rootType: "ebs"},
+		{name: "unreported", rootType: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeEC2(t)
+			f.respond = func(action string, params url.Values) (int, string) {
+				if action != "DescribeImages" {
+					return http.StatusOK, defaultReply(action)
+				}
+
+				root := ""
+				if tc.rootType != "" {
+					root = `<rootDeviceType>` + tc.rootType + `</rootDeviceType>`
+				}
+
+				return http.StatusOK, `<DescribeImagesResponse><imagesSet><item>` +
+					`<imageId>ami-0abc</imageId><rootDeviceName>/dev/xvda</rootDeviceName>` +
+					root +
+					`<blockDeviceMapping>` +
+					`<item><deviceName>/dev/xvda</deviceName><ebs>` +
+					`<deleteOnTermination>true</deleteOnTermination></ebs></item>` +
+					`</blockDeviceMapping></item></imagesSet></DescribeImagesResponse>`
+			}
+
+			p := newTestProvider(t, f, nil)
+
+			_, err := p.Launch(t.Context(), validSpec())
+
+			if !tc.wantErr {
+				if err != nil {
+					t.Fatalf("Launch: %v", err)
+				}
+
+				return
+			}
+
+			if err == nil {
+				t.Fatal("a launch from an image billet cannot use succeeded")
+			}
+
+			for _, want := range []string{"ami-0abc", tc.rootType, "EBS-backed"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("the error does not name %q: %v", want, err)
+				}
+			}
+
+			// AND NOTHING WAS BOUGHT. A refusal that happens after billet has paid
+			// for an instance is not a refusal.
+			if n := f.countOf("RunInstances"); n != 0 {
+				t.Errorf("%d instances were launched from an unusable image", n)
+			}
+		})
+	}
+}
+
 // THE TWO WAYS AN IMAGE LOOKUP CAN BE UNUSABLE BOTH REFUSE THE LAUNCH.
 //
 // Both guards predate this work and both were unkillable: no fixture returned an

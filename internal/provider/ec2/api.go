@@ -368,6 +368,10 @@ type describeImagesResponse struct {
 	Images []struct {
 		ImageID        string `xml:"imageId"`
 		RootDeviceName string `xml:"rootDeviceName"`
+		// RootDeviceType is "ebs" or "instance-store". billet requires the first
+		// and refuses the second up front (#54), because every root parameter it
+		// sends is EBS-shaped.
+		RootDeviceType string `xml:"rootDeviceType"`
 		// BlockDevices are the image's own mappings. billet states
 		// DeleteOnTermination at launch for the EBS ones (#53), so these are read to
 		// BUILD that request — and to warn about the ones the image asks to keep.
