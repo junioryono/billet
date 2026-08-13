@@ -234,6 +234,75 @@ node:
     zfs_pool: tank
     bridge: br0
 
+  # THE CLOUD BACKEND, for `provider: ec2`. One instance per job, in one subnet.
+  #
+  # This is the AVAILABILITY story: a tier that lists `providers: [firecracker,
+  # ec2]` may be placed on either, so losing the bare-metal host does not take the
+  # `runs-on` label down with it. A job that fails over runs with a COLD cache, and
+  # that is correct — keeping it warm would mean shipping cache bytes over a WAN,
+  # which is the problem the caching plane exists to remove.
+  #
+  # An ec2 node is an ORCHESTRATOR: it holds credentials and calls an API, and the
+  # compute appears in a region. Nothing runs on the machine billet runs on, so
+  # max_vcpu and max_memory above are REQUIRED here rather than detected — billet
+  # will not choose how much to buy on your account. They are NOT yet a spending
+  # limit, and reading them as one is a mistake: the allocator charges a job the
+  # size its TIER asked for, while this backend buys the first shape below that
+  # FITS, so shapes larger than their tiers multiply the real spend (#47). The
+  # ORDER of a tier's `providers:` list does make home fill first.
+  #
+  # Credentials come from AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / (optionally)
+  # AWS_SESSION_TOKEN, and failing that from this instance's own IAM role over
+  # IMDSv2. The role is preferred: the alternative is a credential that never
+  # expires, in a unit file, on a host that launches machines. Shared-config
+  # profiles and SSO are NOT read — project them into the environment.
+  #
+  # ec2:
+  #   region: us-west-2
+  #
+  #   # Where instances land. Their route to GitHub is yours to arrange: a private
+  #   # subnet needs a NAT gateway, a public one needs assign_public_ip. A runner
+  #   # that cannot reach GitHub registers and then does nothing.
+  #   subnet_id: subnet-0abc123
+  #   security_group_ids: [sg-0trusted]
+  #   # assign_public_ip: true
+  #
+  #   # FORK PULL-REQUEST WORK RUNS ONLY IF THIS IS SET, and it should name a group
+  #   # that reaches only what a stranger's code should reach. An instance isolates
+  #   # the KERNEL, which is why this backend may run untrusted work at all — it
+  #   # does not isolate the VPC. Without this key untrusted work is refused rather
+  #   # than quietly placed on the trusted group.
+  #   # untrusted_security_group_ids: [sg-0fork]
+  #
+  #   # An IAM role handed to whatever a TRUSTED job runs. Empty is the right
+  #   # answer unless a job genuinely needs AWS credentials.
+  #   #
+  #   # UNTRUSTED WORK NEVER RECEIVES IT. A fork's pull request runs its steps
+  #   # directly on the instance, so it could read the role's temporary
+  #   # credentials out of the metadata service — straight past the isolation
+  #   # that lets this backend run untrusted work at all.
+  #   # instance_profile: billet-runner
+  #
+  #   # THE SHAPES BILLET MAY BUY, each declaring what it holds, because billet
+  #   # ships no table of EC2 instance types — a table would be out of date within a
+  #   # quarter, and being out of date means launching a machine smaller than the
+  #   # lease already escrowed against it. The ORDER is a preference: the first
+  #   # shape that fits is bought.
+  #   instance_types:
+  #     - type: c7i.2xlarge
+  #       vcpu: 8
+  #       memory: 16GiB
+  #     - type: c7i.8xlarge
+  #       vcpu: 32
+  #       memory: 64GiB
+  #
+  #   # SPOT DEFAULTS OFF. GitHub does not requeue a job whose runner vanished
+  #   # mid-execution, so a reclaimed spot instance is a failed build rather than a
+  #   # retry — and defaulting to it would make the failover path the unreliable
+  #   # one, which is the opposite of what a failover is for. Turn it on if you
+  #   # would rather have a cheap build that sometimes dies.
+  #   # spot: true
+
 # Tiers are yours to define — this is not a fixed catalog. The label is what
 # users put in `runs-on`.
 tiers:
@@ -273,8 +342,11 @@ tiers:
   # serve the tier and have room — so a job goes to the cloud only when home is
   # full, rather than to whichever machine happened to ask first.
   #
-  # What is missing is the cloud itself: Docker is the only provider built, so
-  # the EC2 half of this cannot be exercised yet (#32).
+  # `ec2` is built and `firecracker` is not, so this exact pair cannot be used
+  # yet — swap firecracker for docker to try the shape. And nobody has run the
+  # cloud half against a real account: every test drives a fake EC2 API, and
+  # nothing builds the AMI it needs (#42), so treat the fallback as written
+  # rather than proven (#32).
   #
   # - label: billet-8vcpu-ubuntu-2404
   #   providers: [firecracker, ec2]   # instead of `provider: firecracker`

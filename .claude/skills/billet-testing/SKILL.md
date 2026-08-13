@@ -73,7 +73,7 @@ case active:
 
 - `t.Context()` and `t.TempDir()`, never `context.Background()` or a hand-made temp dir. Enforced by `usetesting`.
 - `t.Cleanup` for teardown, so it runs on the `t.Fatal` path too.
-- No `t.Parallel()`. `paralleltest` is deliberately disabled: these tests open real SQLite files, and parallelism buys nothing while inviting flakes.
+- **`t.Parallel()` turns on the SHARING, not the disk.** `paralleltest` is deliberately disabled rather than enforced either way, because the distinction is what a test shares with its neighbours rather than what it touches. A test with resources of its own runs in parallel happily and many here do — `internal/wirecert` writes into `t.TempDir`, `internal/state` opens its own database per test, and `httptest` allocates its own port. What must run alone is a test sharing process-global state: one SQLite file two tests both open, a fixed port, a daemon, the environment (`t.Setenv` already refuses to run in a parallel test), or a package-level variable one of them mutates. Match the file you are adding to, and when in doubt ask what two copies of this test would fight over.
 - Table tests for pure functions (`ParseByteSize`); named functions for anything asserting an invariant, so a failure names the invariant.
 
 ## Testing the state store
@@ -146,7 +146,7 @@ A related habit that paid off repeatedly: when a platform behaviour matters (`os
 - **A test must fail when the code is wrong.** Two of the original state tests did not: one read pragmas through the *reader* pool, where `journal_mode` reports `wal` from persistent file state regardless of the writer's DSN; the other exercised only the single-connection writer, which makes serialization tautological. If a test asserts an invariant, break the invariant once and confirm the test fails.
 - **Assert the diagnostic, not the shape.** Counting error lines passes for the wrong reasons; asserting the specific messages does not.
 - Tests use `t.Context()` and `t.TempDir()` (enforced by `usetesting`).
-- `paralleltest` is deliberately off: these tests open real SQLite files, and `t.Parallel()` everywhere buys nothing and invites flakes.
+- `paralleltest` is deliberately off, in both directions: what decides is whether a test SHARES process-global state — one SQLite file two tests open, a fixed port, a daemon, the environment — not whether it touches a disk. See the rule above; tests with resources of their own parallelize happily and many here do.
 
 ## Tests that could not have failed
 
