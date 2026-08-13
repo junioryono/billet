@@ -1274,7 +1274,7 @@ func TestTheRemedyMatchesWhereTheOverrideLives(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range []struct{ source, want, avoid string }{
-		{"pool", "rbd config pool rm billet-images rbd_default_clone_format", "ceph config rm"},
+		{"pool", "rbd config pool rm 'billet-images' rbd_default_clone_format", "ceph config rm"},
 		{"config", "ceph config rm client rbd_default_clone_format", "rbd config pool rm"},
 	} {
 		rec := answer()
@@ -1601,7 +1601,7 @@ func TestTheCloneFormatIsCheckedOnEveryPool(t *testing.T) {
 		t.Errorf("the error does not name the pool that is forced: %v", err)
 	}
 
-	if !strings.Contains(err.Error(), "rbd config pool rm billet-cache") {
+	if !strings.Contains(err.Error(), "rbd config pool rm 'billet-cache'") {
 		t.Errorf("the error does not give the per-pool remedy: %v", err)
 	}
 
@@ -1626,7 +1626,7 @@ func TestACloneFormatIsCanonicalisedOnce(t *testing.T) {
 	// BOTH FIELDS PADDED, because both are canonicalised and a fixture that pads
 	// only the value leaves the source's trim untested.
 	rec.rawConfig = "[{\"name\":\"rbd_default_clone_format\",\"value\":\"\\n  1  \\r\"," +
-		"\"source\":\"  pool\\n\"}]"
+		"\"source\":\"\\t pool \\r\"}]"
 
 	report, err := client(t, valid(), rec).CheckReachable(t.Context())
 	if err == nil {
@@ -1660,8 +1660,12 @@ func TestACloneFormatIsCanonicalisedOnce(t *testing.T) {
 func TestAPoolNameInARemedyIsShellQuoted(t *testing.T) {
 	t.Parallel()
 
+	// A BRACE, not a space. A metacharacter allowlist covered POSIX sh exactly and
+	// still let `billet-{images,cache}` through, which bash and zsh brace-expand
+	// into two arguments — so the remedy addressed neither the pool nor either
+	// argument. A fixture with a space would not have noticed.
 	cfg := valid()
-	cfg.ImagePool = "billet images"
+	cfg.ImagePool = "billet-{images,cache}"
 
 	rec := answer()
 	rec.cloneFormat = "1"
@@ -1679,9 +1683,24 @@ func TestAPoolNameInARemedyIsShellQuoted(t *testing.T) {
 		t.Fatal("CheckReachable accepted a forced clone format")
 	}
 
-	if !strings.Contains(err.Error(), `'billet images'`) {
-		t.Errorf("the remedy does not quote a pool name containing a space, so pasting it would "+
-			"address something else: %v", err)
+	if !strings.Contains(err.Error(), `'billet-{images,cache}'`) {
+		t.Errorf("the remedy does not quote a pool name a shell would expand, so pasting it "+
+			"would address something else: %v", err)
+	}
+
+	// EVERY NAME, not the ones a list happened to enumerate. "Safe to paste into a
+	// shell" is a claim about shells people use, and the list that covered sh
+	// exactly is the one that let a brace through.
+	for _, name := range []string{"plain", "with space", "with'quote", "$HOME", "a;b", "a*b"} {
+		got := shellQuote(name)
+		if !strings.HasPrefix(got, "'") || !strings.HasSuffix(got, "'") {
+			t.Errorf("shellQuote(%q) = %s, which is not quoted", name, got)
+		}
+	}
+
+	// And the single-quote escape is the one that actually works in sh.
+	if got := shellQuote("a'b"); got != `'a'\''b'` {
+		t.Errorf("shellQuote of an embedded quote = %s", got)
 	}
 }
 
@@ -1703,8 +1722,8 @@ func TestEveryReasonTheClusterClonesTheOldWayIsNamed(t *testing.T) {
 	}
 
 	for _, want := range []string{
-		"rbd config pool rm billet-images",
-		"rbd config pool rm billet-cache",
+		"rbd config pool rm 'billet-images'",
+		"rbd config pool rm 'billet-cache'",
 		"set-require-min-compat-client",
 	} {
 		if !strings.Contains(err.Error(), want) {
@@ -1765,6 +1784,14 @@ func TestARenderedValueIsBoundedAfterQuoting(t *testing.T) {
 		if got := bounded(v); len(got) > maxDiagnostic+8 {
 			t.Errorf("bounded rendered %d bytes for a %d-byte value", len(got), len(v))
 		}
+	}
+
+	// THE EXACT FIT, which decides `<=` against `<` and which no other fixture
+	// reaches: a value whose quoted form is exactly the budget must come back whole,
+	// with no ellipsis.
+	exact := strings.Repeat("a", maxDiagnostic-2)
+	if got := bounded(exact); len(got) != maxDiagnostic || strings.Contains(got, "…") {
+		t.Errorf("a value quoting to exactly %d bytes was truncated: len %d", maxDiagnostic, len(got))
 	}
 
 	// AND A SHORT VALUE IS STILL QUOTED, so a control byte cannot become a live
@@ -1888,5 +1915,43 @@ func TestATruncatedRenderingDoesNotEscapeItsOwnQuote(t *testing.T) {
 			t.Errorf("bounded(%d bytes) ends in an odd run of backslashes, so the closing quote "+
 				"is escaped: %q", len(v), got[len(got)-16:])
 		}
+	}
+}
+
+// THE FLOOR CLAUSE NAMES ONLY THE POOLS THAT WOULD ACTUALLY FALL BACK TO IT.
+//
+// A pool forced to 2 never takes the floor's answer, before or after the other
+// overrides are removed — so "its pools would" describes the aggregate rather
+// than what happens. The remedy still converges either way; the sentence has to
+// be true as well as useful.
+func TestTheFloorClauseNamesOnlyThePoolsThatWouldFallBackToIt(t *testing.T) {
+	t.Parallel()
+
+	rec := answer()
+	rec.minCompat = "luminous"
+	rec.cloneFormat = "1"      // billet-images: forced old, so it would fall back
+	rec.cacheCloneFormat = "2" // billet-cache: pinned new, so it never does
+	rec.cloneSource = "config"
+
+	_, err := client(t, valid(), rec).CheckReachable(t.Context())
+	if err == nil {
+		t.Fatal("CheckReachable accepted a cluster with a pool forced to the old format")
+	}
+
+	// Cut rather than Index-and-slice: Index returns -1 when the clause is absent,
+	// and slicing from there PANICS — which a test reports as a crash rather than
+	// as the assertion that the floor clause was missing.
+	_, floor, found := strings.Cut(err.Error(), "require-min-compat-client")
+	if !found {
+		t.Fatalf("the refusal names no floor clause at all: %v", err)
+	}
+
+	if !strings.Contains(floor, "billet-images") {
+		t.Errorf("the floor clause does not name the pool that would fall back to it: %s", floor)
+	}
+
+	if strings.Contains(floor, "billet-cache") {
+		t.Errorf("the floor clause names a pool pinned to the new format, which never takes it: %s",
+			floor)
 	}
 }

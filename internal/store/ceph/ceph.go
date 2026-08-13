@@ -565,11 +565,20 @@ func cloneV1Causes(release string, report Report) []string {
 
 	// WHICH POOLS ACTUALLY TAKE THE FLOOR'S ANSWER — the ones with no override of
 	// their own. A pool forced to 2 does not, however old the floor is.
-	var fromFloor []string
+	//
+	// `wouldTakeFloor` is the same question after the other clauses are acted on: a
+	// pool forced to 1 falls back to the floor once that override is removed, and a
+	// pool forced to 2 never does. Saying "its pools would" when one of them is
+	// pinned to the new format describes the aggregate rather than what happens.
+	var fromFloor, wouldTakeFloor []string
 
 	for _, p := range report.Pools {
-		if p.CloneFormat == "" || p.CloneFormat == "auto" {
+		switch p.CloneFormat {
+		case "", "auto":
 			fromFloor = append(fromFloor, p.Name)
+
+		case "1":
+			wouldTakeFloor = append(wouldTakeFloor, p.Name)
 		}
 	}
 
@@ -593,8 +602,9 @@ func cloneV1Causes(release string, report Report) []string {
 		effect := fmt.Sprintf("so %s take%s the old clone format from it",
 			poolList(fromFloor), plural(len(fromFloor)))
 		if len(fromFloor) == 0 {
-			effect = "so its pools would take the old clone format from it once the overrides " +
-				"above are removed"
+			effect = fmt.Sprintf("so %s would take the old clone format from it once the "+
+				"override%s above %s removed", poolList(wouldTakeFloor),
+				nounPlural(len(wouldTakeFloor)), isAre(len(wouldTakeFloor)))
 		}
 
 		causes = append(causes, fmt.Sprintf("%s, %s (raise it with `ceph osd "+
@@ -635,6 +645,25 @@ func plural(n int) string {
 	}
 
 	return ""
+}
+
+// nounPlural is the opposite agreement to plural, which reads as a mistake until
+// you see both: a VERB takes its "s" for one subject ("pool X takes") and a NOUN
+// takes its "s" for several ("two overrides").
+func nounPlural(n int) string {
+	if n == 1 {
+		return ""
+	}
+
+	return "s"
+}
+
+func isAre(n int) string {
+	if n == 1 {
+		return "is"
+	}
+
+	return "are"
 }
 
 // unsetCloneFormat is the command that removes THIS override.
@@ -678,10 +707,12 @@ func unsetCloneFormat(p Pool) string {
 // cache …`, which addresses two arguments and neither of them the pool. Every
 // remedy billet prints is something an operator will paste.
 func shellQuote(s string) string {
-	if s != "" && !strings.ContainsAny(s, " \t\n'\"\\$`&;|<>()*?[]#~!") {
-		return s
-	}
-
+	// UNCONDITIONALLY, because the claim is "safe to paste into a shell" and the
+	// shells people paste into are not POSIX sh. A metacharacter allowlist covered
+	// sh exactly and still let `billet-{images,cache}` through, which bash and zsh
+	// brace-expand into two arguments — a remedy addressing neither the pool nor
+	// either argument. Quoting everything makes the claim true instead of true for
+	// the shell the list was written against.
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
