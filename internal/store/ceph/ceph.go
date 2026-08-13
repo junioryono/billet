@@ -275,21 +275,7 @@ func (c *Client) CheckReachable(ctx context.Context) (Report, error) {
 	}
 
 	if !report.CloneV2 {
-		// WHICH CAUSE, because the remedies are different and giving the wrong one
-		// sends an operator to a setting that is already correct. A forced format is
-		// named per pool, since it can be set on one and not the other.
-		for _, p := range report.Pools {
-			if p.CloneFormat == "1" {
-				return report, fmt.Errorf("%w: pool %s has rbd_default_clone_format set to 1, "+
-					"which overrides the cluster's minimum client release (%s); unset it with "+
-					"`%s`", ErrCloneV1, p.Name, release, unsetCloneFormat(p))
-			}
-		}
-
-		return report, fmt.Errorf("%w: require-min-compat-client is %q, and pools %s take their "+
-			"clone format from it; raise it with `ceph osd set-require-min-compat-client mimic` "+
-			"(which refuses while clients older than mimic are connected — `ceph features` lists "+
-			"them)", ErrCloneV1, release, strings.Join(v1, " and "))
+		return report, fmt.Errorf("%w: %s", ErrCloneV1, strings.Join(cloneV1Causes(release, report), "; and "))
 	}
 
 	return report, nil
@@ -392,11 +378,18 @@ func EffectiveCloneFormat(minCompatClient, configured string) (int, error) {
 // that DID parse is not thereby safe: it arrived inside json a binary billet does
 // not control, and a megabyte of it in an error string reaches the same terminal.
 func bounded(v string) string {
-	if len(v) > maxDiagnostic {
-		return strconv.Quote(sanitize(v[:maxDiagnostic])) + "…"
+	// QUOTED, so a control byte in another program's output cannot become a live
+	// terminal control when billet prints it.
+	quoted := strconv.Quote(sanitize(v))
+
+	// THE RENDERED LENGTH, not the input length. Quoting EXPANDS — 300 NUL bytes
+	// become 1,200 characters of `\x00` — so capping what goes in leaves what comes
+	// out four times the bound it was supposed to have.
+	if len(quoted) > maxDiagnostic {
+		return sanitize(quoted[:maxDiagnostic]) + "…\""
 	}
 
-	return strconv.Quote(v)
+	return quoted
 }
 
 // minCompatClient asks the cluster which client releases it admits.
@@ -466,14 +459,23 @@ func (c *Client) cloneFormat(ctx context.Context, pool string) (string, string, 
 	}
 
 	for _, o := range options {
-		if o.Name == "rbd_default_clone_format" {
-			// THE SOURCE IS KEPT, because it decides the remedy. rbd reports
-			// `pool` for an override set on the pool and `config` for one set
-			// cluster-wide, and `ceph config rm client …` does not remove the first
-			// — so discarding it means half the refusals recommend a command that
-			// changes nothing.
-			return o.Value, o.Source, nil
+		if o.Name != "rbd_default_clone_format" {
+			continue
 		}
+
+		// CANONICALISED HERE, ONCE, and everything downstream sees the canonical
+		// value. This is the fourth time in this one check that a value was
+		// normalised for a DECISION while a consumer acted on the raw one: a value
+		// of "\n 1 \r" resolved to clone v1 correctly and then failed a `== "1"`
+		// comparison, so billet refused the cluster and recommended raising a floor
+		// that was already high enough — and printed the raw bytes through %s. The
+		// fix that generalises is not another TrimSpace at the comparison; it is
+		// having one value.
+		//
+		// THE SOURCE IS KEPT, because it decides the remedy: rbd reports `pool` for
+		// an override set on the pool and `config` for one set cluster-wide, and
+		// `ceph config rm client …` does not remove the first.
+		return strings.TrimSpace(o.Value), strings.TrimSpace(o.Source), nil
 	}
 
 	// ABSENT MEANS THE DEFAULT, which is `auto`. A cluster that does not list the
@@ -518,6 +520,42 @@ func (c *Client) poolSizes(ctx context.Context) (map[string]poolSpec, error) {
 	return byName, nil
 }
 
+// cloneV1Causes names every reason this cluster would clone the old way, each
+// with the command that removes it.
+//
+// EVERY REASON, NOT THE FIRST. They are independent and a cluster can have
+// several: unsetting a forced format leaves the pool on `auto`, where the floor
+// decides — so an operator told only about the override fixes it, re-runs, and is
+// refused again for a reason nobody mentioned. Both pools can be forced, too, and
+// naming one of them is the same failure.
+func cloneV1Causes(release string, report Report) []string {
+	var causes []string
+
+	for _, p := range report.Pools {
+		if p.CloneFormat == "1" {
+			causes = append(causes, fmt.Sprintf("pool %s has rbd_default_clone_format set to 1, "+
+				"which overrides the cluster's minimum client release (unset it with `%s`)",
+				p.Name, unsetCloneFormat(p)))
+		}
+	}
+
+	if beforeMimic[strings.ToLower(strings.TrimSpace(release))] {
+		floor := fmt.Sprintf("require-min-compat-client is %q", release)
+		if strings.EqualFold(strings.TrimSpace(release), "unknown") {
+			// NOT A RELEASE THE OPERATOR CHOSE. Printing `require-min-compat-client
+			// is "unknown"` reads as a value somebody set; what it means is that
+			// nobody has, which is the sentence that leads to the fix.
+			floor = "the cluster has never been told which client releases it admits"
+		}
+
+		causes = append(causes, floor+", so its pools take the old clone format (raise it with "+
+			"`ceph osd set-require-min-compat-client mimic`, which refuses while clients older "+
+			"than mimic are connected — `ceph features` lists them)")
+	}
+
+	return causes
+}
+
 // unsetCloneFormat is the command that removes THIS override.
 //
 // rbd reports where an effective value came from, and the two places take
@@ -525,11 +563,23 @@ func (c *Client) poolSizes(ctx context.Context) (map[string]poolSpec, error) {
 // on a pool. Naming the wrong one sends an operator to a setting that is already
 // absent and leaves them believing billet is wrong about their cluster.
 func unsetCloneFormat(p Pool) string {
-	if p.CloneFormatSource == "pool" {
+	switch p.CloneFormatSource {
+	case "pool":
 		return "rbd config pool rm " + p.Name + " rbd_default_clone_format"
-	}
 
-	return "ceph config rm client rbd_default_clone_format"
+	case "config":
+		return "ceph config rm client rbd_default_clone_format"
+
+	default:
+		// SAID, NOT GUESSED. Treating an unrecognised source as cluster-wide hands
+		// the operator a command billet has no reason to believe removes anything,
+		// and a command that changes nothing is worse than an honest "look here":
+		// they run it, see no change, and conclude billet is wrong about their
+		// cluster.
+		return "ceph config get client rbd_default_clone_format` and `rbd config pool get " +
+			p.Name + " rbd_default_clone_format` to find where " + bounded(p.CloneFormatSource) +
+			" set it"
+	}
 }
 
 // cephCmd runs one `ceph` invocation, bounded like every other.

@@ -1875,8 +1875,14 @@ func checkCephCluster(ctx context.Context, cfg *config.CephConfig) error {
 			return fmt.Errorf("node.ceph: %w", err)
 		}
 
-		return fmt.Errorf("node.ceph: this host could not read the pools it is configured with, "+
-			"so it could not launch anything: %w", err)
+		// HONEST ABOUT WHAT FAILED, which is not always the pools. This wrapper said
+		// "could not read the pools" for every failure, including ones where both
+		// pools listed perfectly and it was a later cluster fact that billet could
+		// not make sense of — telling an operator to go and look at the one thing
+		// that worked. The inner error already names the step; this one says only
+		// what the CLI knows, which is that the preflight did not finish.
+		return fmt.Errorf("node.ceph: the ceph preflight did not complete, so billet cannot say "+
+			"this host could launch anything: %w", err)
 	}
 
 	return nil

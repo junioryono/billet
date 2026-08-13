@@ -1141,9 +1141,21 @@ func TestAClusterThatWasNeverToldTakesTheOldCloneFormat(t *testing.T) {
 			t.Errorf("clone format %q: the refusal discarded the report: %+v", tc.format, report)
 		}
 
-		if tc.format == "auto" && !strings.Contains(err.Error(), "set-require-min-compat-client") {
+		// THE FLOOR REMEDY IS GIVEN WHATEVER ELSE IS WRONG, because unsetting a
+		// forced format leaves the pool on `auto`, where the floor decides — an
+		// operator told only about the override fixes it, re-runs, and is refused
+		// again for a reason nobody mentioned.
+		if !strings.Contains(err.Error(), "set-require-min-compat-client") {
 			t.Errorf("clone format %q: the error does not give the remedy for a cluster that was "+
 				"never told: %v", tc.format, err)
+		}
+
+		// AND IT SAYS WHAT `unknown` MEANS. Printing `require-min-compat-client is
+		// "unknown"` reads as a value somebody chose; what it means is that nobody
+		// has, which is the sentence that leads to the fix.
+		if !strings.Contains(err.Error(), "never been told") {
+			t.Errorf("clone format %q: the error renders unknown as though it were a release "+
+				"the operator set: %v", tc.format, err)
 		}
 	}
 }
@@ -1595,5 +1607,128 @@ func TestTheCloneFormatIsCheckedOnEveryPool(t *testing.T) {
 	// The report still carries what each pool said, so the CLI can show it.
 	if report.Pools[0].CloneFormat != "auto" || report.Pools[1].CloneFormat != "1" {
 		t.Errorf("the per-pool clone formats were not reported: %+v", report.Pools)
+	}
+}
+
+// A VALUE IS NORMALISED ONCE, AND EVERY CONSUMER SEES THE SAME ONE.
+//
+// This is the fourth time in this one check that a value was normalised for a
+// DECISION while a consumer acted on the raw one. `"\n 1 \r"` resolved to clone
+// v1 correctly, then failed a `== "1"` comparison — so billet refused the cluster
+// and recommended raising a floor that was already high enough, and printed the
+// raw bytes on the terminal. The fix that generalises is not another TrimSpace at
+// the comparison; it is having one value.
+func TestACloneFormatIsCanonicalisedOnce(t *testing.T) {
+	t.Parallel()
+
+	rec := answer()
+	rec.rawConfig = "[{\"name\":\"rbd_default_clone_format\",\"value\":\"\\n  1  \\r\",\"source\":\"pool\"}]"
+
+	report, err := client(t, valid(), rec).CheckReachable(t.Context())
+	if err == nil {
+		t.Fatal("CheckReachable accepted a padded clone format of 1")
+	}
+
+	// The remedy must be the one for a forced format, not for the floor — which is
+	// already high enough, and is what a raw comparison would have sent them to.
+	if !strings.Contains(err.Error(), "rbd config pool rm") {
+		t.Errorf("the error does not give the remedy for the forced format: %v", err)
+	}
+
+	// And the stored value is the canonical one, so nothing downstream — including
+	// what the CLI prints — carries the padding.
+	for _, p := range report.Pools {
+		if p.CloneFormat != "1" {
+			t.Errorf("%s stored the raw value %q rather than the canonical one", p.Name, p.CloneFormat)
+		}
+	}
+}
+
+// EVERY CAUSE IS NAMED, because they are independent and fixing one can leave
+// another. Both pools forced, plus a floor that predates mimic, is three reasons
+// and three commands.
+func TestEveryReasonTheClusterClonesTheOldWayIsNamed(t *testing.T) {
+	t.Parallel()
+
+	rec := answer()
+	rec.minCompat = "luminous"
+	rec.cloneFormat = "1"
+	rec.cacheCloneFormat = "1"
+	rec.cloneSource = "pool"
+
+	_, err := client(t, valid(), rec).CheckReachable(t.Context())
+	if err == nil {
+		t.Fatal("CheckReachable accepted a cluster with three reasons to clone the old way")
+	}
+
+	for _, want := range []string{
+		"rbd config pool rm billet-images",
+		"rbd config pool rm billet-cache",
+		"set-require-min-compat-client",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the error does not carry %q, so fixing what it names leaves the cluster "+
+				"refused: %v", want, err)
+		}
+	}
+}
+
+// A SOURCE BILLET DOES NOT RECOGNISE IS SAID, NOT GUESSED AT.
+//
+// Treating every non-`pool` source as cluster-wide hands the operator a command
+// billet has no reason to believe removes anything. A command that changes
+// nothing is worse than an honest "look here": they run it, see no change, and
+// conclude billet is wrong about their cluster.
+func TestAnUnrecognisedOverrideSourceIsNotGuessedAt(t *testing.T) {
+	t.Parallel()
+
+	rec := answer()
+	rec.cloneFormat = "1"
+	rec.cloneSource = "somewhere-else"
+
+	_, err := client(t, valid(), rec).CheckReachable(t.Context())
+	if err == nil {
+		t.Fatal("CheckReachable accepted a forced clone format")
+	}
+
+	if strings.Contains(err.Error(), "ceph config rm client") {
+		t.Errorf("an unrecognised source was reported as cluster-wide: %v", err)
+	}
+
+	if !strings.Contains(err.Error(), "somewhere-else") {
+		t.Errorf("the error does not say what the cluster called the source: %v", err)
+	}
+}
+
+// THE RENDERED LENGTH IS WHAT REACHES A TERMINAL, and quoting expands.
+//
+// Capping the input leaves the output four times the bound it was supposed to
+// have: 300 NUL bytes render as 1,200 characters of `\x00`. The all-`x` fixture
+// that came with the cap could not see this, because ascii quotes one-for-one.
+func TestARenderedValueIsBoundedAfterQuoting(t *testing.T) {
+	t.Parallel()
+
+	for _, v := range []string{
+		strings.Repeat("\x00", 4096),
+		strings.Repeat("\t", 4096),
+		strings.Repeat("x", 4096),
+		strings.Repeat("é", 4096),
+
+		// THE WINDOW WHERE THE TWO BOUNDS DIFFER, which is the only place the
+		// mutation is visible: 100 NUL bytes are well under the cap as INPUT and
+		// four times over it once quoted. Fixtures that are all far above the cap
+		// truncate identically either way.
+		strings.Repeat("\x00", 100),
+		strings.Repeat("\t", 120),
+	} {
+		if got := bounded(v); len(got) > maxDiagnostic+8 {
+			t.Errorf("bounded rendered %d bytes for a %d-byte value", len(got), len(v))
+		}
+	}
+
+	// AND A SHORT VALUE IS STILL QUOTED, so a control byte cannot become a live
+	// terminal control on its way through an error message.
+	if got := bounded("a\nb"); strings.Contains(got, "\n") {
+		t.Errorf("bounded passed a raw newline through: %q", got)
 	}
 }
