@@ -192,6 +192,8 @@ func TestAPoolNameBilletCannotAddressIsRefused(t *testing.T) {
 		{name: "a snapshot separator", pool: "billet@images", want: "snapshot name"},
 		{name: "ceph's own namespace", pool: ".mgr", want: "reserves for its"},
 		{name: "something rbd reads as an option", pool: "-p", want: "starting with a dash"},
+		{name: "any leading dash, not the fixture", pool: "-billet-images", want: "starting with a dash"},
+		{name: "any of ceph's own namespace", pool: ".billet", want: "reserves for its"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -311,7 +313,7 @@ func TestCephValuesAreTrimmed(t *testing.T) {
 
 	body := withCeph(t, `  ceph:
     user: "  billet  "
-    image_pool: "\tbillet-images\t"
+    image_pool: "\tbillet-images \n"
     cache_pool: "  billet-cache  "
     conf_path: "  /etc/ceph/ceph.conf  "
     keyring_path: "  /etc/ceph/ceph.client.billet.keyring  "
@@ -452,22 +454,24 @@ func TestAHintIsNotOfferedForADifferentSectionsKey(t *testing.T) {
 func TestAnIdentityBilletCannotPassIsRefused(t *testing.T) {
 	t.Parallel()
 
-	t.Run("the prefix rbd adds itself", func(t *testing.T) {
-		t.Parallel()
+	for _, user := range []string{"client.billet", "client.anything-at-all"} {
+		t.Run("the prefix rbd adds itself: "+user, func(t *testing.T) {
+			t.Parallel()
 
-		errs := CheckCeph(CephConfig{
-			User:      "client.billet",
-			ImagePool: "billet-images",
-			CachePool: "billet-cache",
+			errs := CheckCeph(CephConfig{
+				User:      user,
+				ImagePool: "billet-images",
+				CachePool: "billet-cache",
+			})
+			if len(errs) == 0 {
+				t.Fatalf("CheckCeph accepted %q, which carries the client. prefix", user)
+			}
+
+			if joined := joinErrors(errs); !strings.Contains(joined, "rbd adds") {
+				t.Errorf("the error does not say why it is refused: %s", joined)
+			}
 		})
-		if len(errs) == 0 {
-			t.Fatal("CheckCeph accepted an identity carrying the client. prefix")
-		}
-
-		if joined := joinErrors(errs); !strings.Contains(joined, "rbd adds") {
-			t.Errorf("the error does not say why it is refused: %s", joined)
-		}
-	})
+	}
 
 	for _, tc := range []struct{ name, user string }{
 		{name: "a leading dash, which --id consumes as a value", user: "-weird"},
@@ -513,10 +517,22 @@ func TestANulByteIsRefused(t *testing.T) {
 			field: "node.ceph.image_pool",
 		},
 		{
-			name: "in a path",
+			name: "in the keyring path",
 			cfg: CephConfig{User: "billet", ImagePool: "billet-images", CachePool: "billet-cache",
 				KeyringPath: "/etc/ceph/k\x00.keyring"},
 			field: "node.ceph.keyring_path",
+		},
+		{
+			// The two a loop written from the first three forgets.
+			name:  "in the cache pool",
+			cfg:   CephConfig{User: "billet", ImagePool: "billet-images", CachePool: "cache\x00pool"},
+			field: "node.ceph.cache_pool",
+		},
+		{
+			name: "in the conf path",
+			cfg: CephConfig{User: "billet", ImagePool: "billet-images", CachePool: "billet-cache",
+				ConfPath: "/etc/ceph/\x00ceph.conf"},
+			field: "node.ceph.conf_path",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -630,5 +646,13 @@ func TestEveryRemovedKeyIsExplainedInOnePass(t *testing.T) {
 
 	if !strings.Contains(err.Error(), "node.ceph") {
 		t.Errorf("the error does not say what replaced zfs_pool: %v", err)
+	}
+
+	// ONCE EACH. A loop that appended every match twice would satisfy presence
+	// while handing the operator the same paragraph over and over.
+	for _, once := range []string{"has moved to node.lock_dir", "node.firecracker.zfs_pool is gone"} {
+		if n := strings.Count(err.Error(), once); n != 1 {
+			t.Errorf("%q appears %d times: %v", once, n, err)
+		}
 	}
 }

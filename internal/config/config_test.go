@@ -496,7 +496,7 @@ func TestDuplicateTierLabelRejected(t *testing.T) {
 	}
 }
 
-func TestFirecrackerNodeRequiresKernelAndPool(t *testing.T) {
+func TestFirecrackerNodeRequiresItsOwnSection(t *testing.T) {
 	body := strings.Replace(validConfig,
 		"  firecracker:\n    kernel_image: /var/lib/billet/vmlinux\n", "", 1)
 	if _, err := Load(writeConfig(t, body)); err == nil {
