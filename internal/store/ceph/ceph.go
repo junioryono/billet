@@ -84,10 +84,11 @@ var ErrNoRBD = errors.New("the rbd command is not on PATH")
 //
 // IT RE-APPLIES config.CheckCeph, because this constructor is exported and cannot
 // assume its configuration came through config.Load. Two of those rules are load
-// bearing HERE and not only there: a pool name is passed to rbd as the value of
-// -p, so one beginning with a dash would be read as a flag, and an identity of
-// `admin` would hand this process a key that can delete the pools it is only
-// meant to read.
+// bearing HERE and not only there. A pool name is half of the POSITIONAL
+// `pool/image` specs billet builds, where rbd reads a leading dash as an option it
+// does not recognise — measured, and NOT true of `-p`, which consumes whatever
+// token follows it. And an identity of `admin` would hand this process a key that
+// can delete the pools it is only meant to read.
 func New(cfg config.CephConfig, opts ...Option) (*Client, error) {
 	if errs := config.CheckCeph(cfg); len(errs) > 0 {
 		return nil, fmt.Errorf("ceph: %w", errors.Join(errs...))
@@ -213,9 +214,21 @@ func execRunner(ctx context.Context, bin string, args []string) ([]byte, error) 
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.WaitDelay = waitDelay
 
+	// BOUNDED AS IT ARRIVES, not capped afterwards. A strings.Builder here would
+	// bound the TIME an invocation may take and not the MEMORY, so a wrong or broken
+	// executable could allocate for the whole timeout. Note that no test can observe
+	// the difference — lastLine caps the rendered result either way — so this
+	// wiring is covered by review rather than by an assertion.
 	stderr := &tailWriter{limit: maxDiagnostic}
 	cmd.Stderr = stderr
 
+	// STDOUT IS NOT BOUNDED, and that is a decision. Its size is proportional to how
+	// many images the pool holds — billet's own data — so a cap would turn a large
+	// site into a failure, and truncating a JSON array yields something that does
+	// not parse rather than something partial. What is unbounded is therefore the
+	// memory a WRONG executable at this path could make billet allocate inside one
+	// timeout, which is a narrower risk than it first reads: c.bin is either what
+	// exec.LookPath found for "rbd" or a path a caller passed deliberately.
 	out, err := cmd.Output()
 	if err == nil {
 		return out, nil
@@ -268,6 +281,16 @@ type tailWriter struct {
 func (w *tailWriter) Write(p []byte) (int, error) {
 	n := len(p)
 
+	// A LIMIT OF ZERO KEEPS NOTHING rather than panicking. Nothing constructs one
+	// today, but the slice arithmetic below indexes from the end and a negative
+	// limit would be a runtime panic in a control plane — a guard is cheaper than
+	// the next caller having to know that.
+	if w.limit <= 0 {
+		w.buf = nil
+
+		return n, nil
+	}
+
 	// TWO TRIMS, AND THE FIRST ONE IS NOT REDUNDANT even though deleting it leaves
 	// every observable behaviour identical — which is why its mutation survives, and
 	// the redundancy is said out loud here rather than assumed. It bounds the PEAK
@@ -313,7 +336,11 @@ func lastLine(s string) string {
 	line := strings.TrimSpace(lines[len(lines)-1])
 
 	if len(line) > maxDiagnostic {
-		return line[:maxDiagnostic] + "…"
+		// AT A RUNE BOUNDARY. rbd's diagnostics are not guaranteed to be ASCII —
+		// a pool name is whatever the operator typed — and cutting a byte slice
+		// mid-rune puts invalid UTF-8 into an error string that is then printed,
+		// logged and marshalled.
+		return strings.ToValidUTF8(line[:maxDiagnostic], "") + "…"
 	}
 
 	return line

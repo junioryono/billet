@@ -209,6 +209,23 @@ node:
 
 `user` defaults to `billet` and **`admin` is refused**, which is worth more than it looks: `admin` is what the `rbd` command picks for itself when nothing names an identity, and an admin key can delete a pool. Defaulting to it would quietly make every node able to destroy the site's storage, with nothing about the deployment looking different until the day one is compromised.
 
+### Ceph is more permissive than a validator expects, so every name rule is measured
+
+The first version of `CheckCeph` refused a pool or an identity beginning with `-`, on the reasoning that billet builds an argv and nothing quotes a value out of being a flag. Running it says otherwise, and the correction is worth recording because this repository has the rule written down already — *a rule about someone else's API is pinned to measured behaviour, not to reasoning* — and walked into it anyway.
+
+| probe | result |
+|---|---|
+| `rbd --id -weird -p billet-images ls` | `-weird` is used as the identity; librados looks for a keyring for it |
+| `rbd -p -weirdpool ls` | `rbd: error opening pool '-weirdpool'` — consumed as the pool |
+| `rbd info -weirdpool/nothing` | **`rbd: unrecognised option '-weirdpool/nothing'`** |
+| `ceph osd pool create -weirdpool` | `pool '-weirdpool' created` |
+| `ceph osd pool create a/b`, `a@b`, `a b`, `a<TAB>b` | all four created |
+| `ceph osd pool create .weirdpool` | `pool names beginning with . are not allowed` |
+| `ceph auth get-or-create client.a/b`, `client.a b` | both created |
+| `rbd --id client.billet -p billet-images ls` | `(13) Permission denied`, where `--id billet` lists the pool |
+
+An option that requires a value consumes the next token whatever it starts with, so the argv argument was simply false — for the *value* of a flag. It is true for a **positional**, which is what a `pool/image` spec is, and that is the rule billet kept. The identity is never positional, so its dash rule was removed along with the whitespace and slash rules beside it; what survives there is the `client.` prefix, which measurably authenticates as `client.client.billet`. "Is this a legal Ceph name" turned out never to be the question, because Ceph accepts nearly anything; "does billet address it correctly" is.
+
 billet drives Ceph through the `rbd` **command** rather than through librados. The Go binding is cgo, which would end the single static binary and the cross-build matrix in one move — the same reason `mattn/go-sqlite3` is banned — and billet already treats Ceph the way it treats Docker and Tart: an external dependency an operator installs. The cost is a process per call, so `internal/store/ceph` is for operations measured in tens per job and never per block.
 
 `billet check` now proves the configuration rather than parsing it: it lists both pools as the configured identity, which establishes that the monitors answered, the keyring authenticated and the pools exist. It says out loud that this is a **read** and that launching also needs create, clone, snapshot and remove — the same honesty the ec2 preflight owes about `DescribeInstances` not implying `RunInstances`. A host with no `rbd` command fails the check rather than being reported: only a firecracker node may carry a `node.ceph` block, so this file always describes a machine that is meant to run jobs, and a control plane is unaffected because it has no node section to check.

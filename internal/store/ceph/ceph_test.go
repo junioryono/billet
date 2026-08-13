@@ -4,12 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/junioryono/billet/internal/config"
 )
@@ -149,10 +149,18 @@ func TestAConfiguredPathIsPassed(t *testing.T) {
 		t.Fatalf("CheckReachable: %v", err)
 	}
 
-	args := strings.Join(rec.calls[0], " ")
-	for _, want := range []string{"--conf /etc/billet/ceph.conf", "--keyring /etc/billet/billet.keyring"} {
-		if !strings.Contains(args, want) {
-			t.Errorf("the invocation does not carry %q: %s", want, args)
+	// BOTH INVOCATIONS. Asserting only the first leaves a client that dropped the
+	// flags from the second call green — and the second call is the cache pool,
+	// which is the one billet writes to on every job.
+	for i, pool := range []string{"billet-images", "billet-cache"} {
+		want := []string{
+			"--id", "site-reader",
+			"--conf", "/etc/billet/ceph.conf",
+			"--keyring", "/etc/billet/billet.keyring",
+			"--format", "json", "-p", pool, "ls",
+		}
+		if !slices.Equal(rec.calls[i], want) {
+			t.Errorf("call %d = %q, want %q", i, rec.calls[i], want)
 		}
 	}
 }
@@ -423,9 +431,16 @@ func TestTheRealRunnerIsBounded(t *testing.T) {
 	// seconds would slip under a flat ten-second assertion while making every
 	// unreachable cluster take nine seconds longer than it should. The slack is for
 	// scheduling, not for a different constant.
-	if budget := waitDelay + 3*time.Second; time.Since(start) > budget {
-		t.Errorf("execRunner took %s to give up on a process it had killed; WaitDelay is %s",
-			time.Since(start), waitDelay)
+	// AN INDEPENDENT THRESHOLD. Deriving the budget from waitDelay means raising
+	// waitDelay raises the budget with it, so the mutation the comment claims to
+	// catch stays green; the policy is asserted separately, below.
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("execRunner took %s to give up on a process it had killed", elapsed)
+	}
+
+	if waitDelay > 3*time.Second {
+		t.Errorf("waitDelay is %s: it bounds how long a dead process's pipes may hold `billet "+
+			"check` open, and it is meant to be a couple of seconds", waitDelay)
 	}
 }
 
@@ -471,7 +486,7 @@ func TestOnlyTheLastDiagnosticLineSurvivesAndItIsCapped(t *testing.T) {
 	if n := len(err.Error()); n > maxDiagnostic+100 {
 		t.Errorf("a %d-byte diagnostic reached the caller; it is meant to be capped at %d",
 			n, maxDiagnostic)
-	} else if n > 600 {
+	} else if n > 400 {
 		t.Errorf("a %d-byte diagnostic reached the caller; whatever maxDiagnostic says, this is "+
 			"another program's output on an operator's terminal", n)
 	}
@@ -513,7 +528,11 @@ func TestAnExplicitBinaryNeedsNoPath(t *testing.T) {
 
 	var ran string
 
-	c, err := New(valid(), WithBinary(os.Args[0]),
+	// NOT os.Args[0]: a WithBinary that only honoured the test's own executable
+	// would pass, and the option's whole job is naming an rbd somewhere else.
+	const elsewhere = "/opt/ceph/bin/rbd"
+
+	c, err := New(valid(), WithBinary(elsewhere),
 		withRunner(func(_ context.Context, bin string, _ []string) ([]byte, error) {
 			ran = bin
 
@@ -529,8 +548,8 @@ func TestAnExplicitBinaryNeedsNoPath(t *testing.T) {
 
 	// THE ONE THAT WAS SUPPLIED, because a constructor that stored the option and
 	// then ran something else would satisfy every other assertion here.
-	if ran != os.Args[0] {
-		t.Errorf("ran %q, want the binary the option named (%q)", ran, os.Args[0])
+	if ran != elsewhere {
+		t.Errorf("ran %q, want the binary the option named (%q)", ran, elsewhere)
 	}
 }
 
@@ -545,51 +564,67 @@ func TestAnExplicitBinaryNeedsNoPath(t *testing.T) {
 func TestARealFailureSurvivesAnExpiredContext(t *testing.T) {
 	t.Parallel()
 
-	ctx, cancel := context.WithTimeout(t.Context(), 400*time.Millisecond)
-	defer cancel()
+	// TWO EXIT CODES, because one fixture lets the discriminator be `ExitCode() == 2`
+	// rather than "the process exited at all", and that mutation would report every
+	// other failure as a timeout.
+	for _, tc := range []struct{ code, message string }{
+		{code: "2", message: "rbd: listing images failed: (2) No such file or directory"},
+		{code: "13", message: "rbd: listing images failed: (13) Permission denied"},
+	} {
+		t.Run("exit "+tc.code, func(t *testing.T) {
+			t.Parallel()
 
-	type result struct {
-		out []byte
-		err error
-	}
+			ctx, cancel := context.WithTimeout(t.Context(), 400*time.Millisecond)
+			defer cancel()
 
-	done := make(chan result, 1)
+			type result struct {
+				out []byte
+				err error
+			}
 
-	go func() {
-		// The shell writes its diagnostic and exits 2 immediately; the background
-		// `sleep` inherits stdout and holds the pipe open well past the deadline.
-		out, err := execRunner(ctx, "/bin/sh", []string{"-c",
-			"sleep 30 & echo 'rbd: listing images failed: (2) No such file or directory' >&2; exit 2"})
-		done <- result{out, err}
-	}()
+			done := make(chan result, 1)
 
-	guard := time.NewTimer(15 * time.Second)
-	defer guard.Stop()
+			go func() {
+				// The shell writes its diagnostic and exits immediately; the
+				// background `sleep` inherits stdout and holds the pipe open well
+				// past the deadline.
+				out, err := execRunner(ctx, "/bin/sh", []string{"-c",
+					"sleep 30 & echo '" + tc.message + "' >&2; exit " + tc.code})
+				done <- result{out, err}
+			}()
 
-	var got result
+			guard := time.NewTimer(15 * time.Second)
+			defer guard.Stop()
 
-	select {
-	case got = <-done:
-	case <-guard.C:
-		t.Fatal("execRunner never returned")
-	}
+			var got result
 
-	if got.err == nil {
-		t.Fatal("execRunner reported success for a command that exited 2")
-	}
+			select {
+			case got = <-done:
+			case <-guard.C:
+				t.Fatal("execRunner never returned")
+			}
 
-	if !strings.Contains(got.err.Error(), "No such file or directory") {
-		t.Errorf("the process exited with an explanation and the error does not carry it: %v", got.err)
-	}
+			if got.err == nil {
+				t.Fatalf("execRunner reported success for a command that exited %s", tc.code)
+			}
 
-	// The context DID expire — that is the whole setup — so this is the assertion
-	// that the ordering is right rather than that the race did not happen.
-	if ctx.Err() == nil {
-		t.Fatal("the context had not expired, so this test did not stage the race it is about")
-	}
+			if !strings.Contains(got.err.Error(), tc.message) {
+				t.Errorf("the process exited with an explanation and the error does not carry "+
+					"it: %v", got.err)
+			}
 
-	if errors.Is(got.err, context.DeadlineExceeded) {
-		t.Errorf("a process that exited on its own was reported as a timeout: %v", got.err)
+			// The context DID expire — that is the whole setup — so this is the
+			// assertion that the ordering is right rather than that the race did
+			// not happen.
+			if ctx.Err() == nil {
+				t.Fatal("the context had not expired, so this case did not stage the race it " +
+					"is about")
+			}
+
+			if errors.Is(got.err, context.DeadlineExceeded) {
+				t.Errorf("a process that exited on its own was reported as a timeout: %v", got.err)
+			}
+		})
 	}
 }
 
@@ -639,5 +674,48 @@ func TestStderrIsBoundedAsItArrives(t *testing.T) {
 
 	if got := big.String(); got != "xEND" {
 		t.Errorf("tail = %q, want the last 4 bytes of one oversized write", got)
+	}
+
+	// A NON-POSITIVE LIMIT KEEPS NOTHING rather than panicking. Zero falls out of
+	// the arithmetic on its own — which is why the guard's mutation survived a
+	// zero-limit test — but the slice indexes from the END, so a negative limit is
+	// a runtime panic, and a control plane must not carry one waiting for the next
+	// caller who constructs this type.
+	for _, limit := range []int{0, -1} {
+		none := &tailWriter{limit: limit}
+		if _, err := none.Write([]byte("anything at all")); err != nil {
+			t.Fatalf("Write(limit %d): %v", limit, err)
+		}
+
+		if got := none.String(); got != "" {
+			t.Errorf("a tail with limit %d kept %q", limit, got)
+		}
+	}
+}
+
+// A CAPPED DIAGNOSTIC IS STILL TEXT.
+//
+// rbd's output is not guaranteed to be ASCII — a pool name is whatever the
+// operator typed — and cutting a byte slice at a fixed offset splits a multi-byte
+// rune, putting invalid UTF-8 into an error that is then printed, logged and
+// marshalled.
+func TestACappedDiagnosticIsValidUTF8(t *testing.T) {
+	t.Parallel()
+
+	// Repeated three-byte runes, so some cut offset inside maxDiagnostic must land
+	// mid-rune whatever that constant is.
+	// CONSTRUCTED SO THE CUT SPLITS A RUNE. A repeated multi-byte string is not
+	// enough on its own: "é☃" is five bytes and maxDiagnostic is a multiple of it,
+	// so the naive slice happened to land on a boundary and the mutation survived.
+	// One filler byte short of the cap puts the boundary inside the next rune.
+	noisy := strings.Repeat("x", maxDiagnostic-1) + strings.Repeat("é", 40)
+
+	got := lastLine(noisy)
+	if !utf8.ValidString(got) {
+		t.Errorf("the capped diagnostic is not valid utf-8: %q", got)
+	}
+
+	if len(got) > maxDiagnostic+8 {
+		t.Errorf("the diagnostic was not capped: %d bytes", len(got))
 	}
 }
