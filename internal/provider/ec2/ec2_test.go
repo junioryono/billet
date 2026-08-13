@@ -275,8 +275,8 @@ func defaultReply(action string) string {
 		// described an image billet correctly refuses — and six unrelated tests went
 		// red for the right reason.
 		//
-		// THE OTHER FIXTURES IN THIS FILE CARRY ONLY THE TYPE, deliberately, and a
-		// commit message of mine claiming otherwise was wrong. Adding the type is
+		// FIVE INLINE FIXTURES IN THIS FILE CARRY ONLY THE TYPE, deliberately, and a
+		// commit message of mine claiming they all report both was wrong. Adding the type is
 		// the minimal edit that makes them launchable, it is read by exactly one
 		// function so no other behaviour moves, and leaving them thin is worth
 		// something on its own: a requireEBSRoot that demanded BOTH signals would
@@ -2726,8 +2726,8 @@ func TestTheRootIsNotAnnouncedWhenTheImageDidNotAskToKeepIt(t *testing.T) {
 // really for. rootDeviceType is optional, so absence is reachable and proves
 // nothing on its own — but the block device mapping answers the same question in
 // a different sentence of the same reply: a root device carrying an <ebs> child
-// IS an EBS root. So absence is not itself a verdict, and the three silent rows
-// below differ only in whether that corroboration is there.
+// IS an EBS root. So absence is not itself a verdict, and the silent rows below
+// differ only in whether that corroboration is there.
 //
 // The first version allowed EVERY absent case through, on an argument about which
 // error was worse. It was reviewed into this one, which needs no such argument.
@@ -2790,7 +2790,13 @@ func TestAnInstanceStoreBackedImageIsRefused(t *testing.T) {
 			// EBS volume — the child attributes are optional.
 			name: "silent, corroborated awkwardly",
 			root: "/dev/sda1",
-			mappings: `<item><deviceName>/dev/sdb</deviceName><ebs></ebs></item>` +
+			// THE LEADING DEVICE IS NOT EBS, which is the fourth thing this row has
+			// to be awkward about. With an EBS data volume first, a bare
+			// mappings[0].EBS != nil shortcut still passed — it read the right
+			// answer off the wrong entry, and the negative rows could not catch it
+			// because they put the non-EBS root first.
+			mappings: `<item><deviceName>/dev/sdb</deviceName>` +
+				`<virtualName>ephemeral0</virtualName></item>` +
 				`<item><deviceName>/dev/sda1</deviceName><ebs></ebs></item>`,
 		},
 		{
