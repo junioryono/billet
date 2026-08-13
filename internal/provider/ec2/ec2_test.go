@@ -1932,6 +1932,52 @@ func TestAnImageWhoseVolumesOutliveItIsReported(t *testing.T) {
 	}
 }
 
+// XML BOOLEANS HAVE TWO SPELLINGS, and an image using the other one describes the
+// same leak.
+//
+// `xs:boolean` admits "1" and "0" alongside the words. EC2 emits lowercase words
+// in practice — which is somebody else's observation, since nothing here has run
+// against a real account — so accepting both errs toward saying something.
+func TestAVolumeMarkedWithTheOtherBooleanSpellingIsStillReported(t *testing.T) {
+	f := newFakeEC2(t)
+	f.respond = func(action string, params url.Values) (int, string) {
+		if action != "DescribeImages" {
+			return http.StatusOK, defaultReply(action)
+		}
+
+		return http.StatusOK, `<DescribeImagesResponse><imagesSet><item>` +
+			`<imageId>ami-0abc</imageId><rootDeviceName>/dev/xvda</rootDeviceName>` +
+			`<blockDeviceMapping>` +
+			`<item><deviceName>/dev/sdz</deviceName><ebs>` +
+			`<deleteOnTermination>0</deleteOnTermination></ebs></item>` +
+			`<item><deviceName>/dev/sdy</deviceName><ebs>` +
+			`<deleteOnTermination>1</deleteOnTermination></ebs></item>` +
+			`</blockDeviceMapping></item></imagesSet></DescribeImagesResponse>`
+	}
+
+	var logged bytes.Buffer
+
+	p := newTestProvider(t, f, nil)
+	p.log = slog.New(slog.NewTextHandler(&logged, nil))
+
+	spec := validSpec()
+	spec.Disk = 80 * config.GiB
+
+	if _, err := p.Launch(t.Context(), spec); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	got := logged.String()
+
+	if !strings.Contains(got, "/dev/sdz") {
+		t.Errorf("a volume marked with \"0\" was not reported: %s", got)
+	}
+
+	if strings.Contains(got, "/dev/sdy") {
+		t.Errorf("a volume marked with \"1\" — which is deleted — was reported: %s", got)
+	}
+}
+
 // AN IMAGE THAT SAYS NOTHING ABOUT DeleteOnTermination IS NOT WARNED ABOUT.
 //
 // Only an explicit "false" is worth naming: a mapping that omits the flag gets

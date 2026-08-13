@@ -618,6 +618,18 @@ func (p *Provider) rootDevice(ctx context.Context, image string) (string, error)
 	return device, nil
 }
 
+// survivesTermination reports whether a mapping SAYS its volume outlives the
+// instance.
+//
+// Both spellings, because XML booleans have two: `xs:boolean` admits "1" and "0"
+// alongside "true" and "false". EC2 emits lowercase words in practice — and
+// nothing here has ever run against a real account, so "in practice" is somebody
+// else's observation rather than a measurement of this code's actual counterpart.
+// Accepting both costs a comparison and errs toward saying something.
+func survivesTermination(flag string) bool {
+	return flag == "false" || flag == "0"
+}
+
 // warnAboutSurvivingVolumes reports image volumes that outlive their instance.
 //
 // A CONTRACT NOTHING ENFORCES FAILS SILENTLY, which is why this is code rather
@@ -639,10 +651,27 @@ func (p *Provider) warnAboutSurvivingVolumes(image string, out describeImagesRes
 	root := out.Images[0].RootDeviceName
 
 	for _, bd := range out.Images[0].BlockDevices {
-		// EMPTY IS NOT FALSE. An image that says nothing about the flag gets EC2's
-		// own default, which for a mapping billet does not restate is what the
-		// image was registered with — so only an explicit "false" is worth naming.
-		if bd.DeviceName == root || bd.EBS.DeleteOnTermination != "false" {
+		// AN ABSENT FLAG IS NOT A FALSE ONE, and the reason is that billet does not
+		// know what absent means here rather than that it is probably fine.
+		//
+		// AWS's own documentation gives DIFFERENT defaults for a non-root volume
+		// attached at launch depending on how the instance was launched — the
+		// console preserves it, the CLI deletes it — so there is no single answer to
+		// substitute. In practice the question barely arises: a real AMI carries the
+		// value, because CreateImage snapshots the live attachment and RegisterImage
+		// stores what it was given, so an EBS mapping with the field missing is
+		// closer to a fake-API artifact than a state an image reaches.
+		//
+		// Warning on it would therefore be guessing, and a guess that fires on
+		// innocent images is how an operator learns to ignore the one warning that
+		// is about something their image actually said.
+		//
+		// PARSED AS A STRING RATHER THAN A BOOL, which is what makes the distinction
+		// expressible at all: a Go bool decodes an absent element as false, so this
+		// check would have silently become "absent or false" whatever the comment
+		// claimed — the same zero-value trap that let a credential type look
+		// redacted because its field's type was.
+		if bd.DeviceName == root || !survivesTermination(bd.EBS.DeleteOnTermination) {
 			continue
 		}
 
