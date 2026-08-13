@@ -557,7 +557,13 @@ func (p *Provider) setTags(params url.Values, name string) {
 // billet's to decide, false is the operator's to keep), so the string decode is
 // forced, and this function puts back the leniency that decision threw away.
 //
-// That much is measured rather than assumed, and it is measurable precisely
+// ABSENT IS UNREACHABLE IN PRACTICE, incidentally — a live account showed EC2
+// normalising an omitted flag to true at RegisterImage, and zero omissions across
+// 9,775 non-root mappings. This function still distinguishes it, because a decode
+// that cannot tell absent from false is one bad response away from silently
+// honouring a preservation nobody asked for.
+//
+// The rest is measured rather than assumed, and it is measurable precisely
 // because it is Go's behaviour rather than AWS's:
 //
 //	<ebs></ebs>                       bool=false  string=""
@@ -600,39 +606,48 @@ type imageLayout struct {
 
 // setBlockDevices states what happens to every EBS volume the instance launches with.
 //
-// NOTHING HERE IS LEFT TO A DEFAULT, and that is the whole design. An unstated
-// DeleteOnTermination is not a small ambiguity: AWS documents the answer twice,
-// and those two answers are READ differently for exactly the case billet is in —
-// a non-root volume, attached at launch, through the API.
+// NOTHING HERE IS LEFT TO A DEFAULT, and that is the whole design.
+//
+// THIS IS THE ONE THING IN THIS PACKAGE THAT HAS BEEN MEASURED AGAINST REAL EC2.
+// Everything else here is pinned to documentation and a fake API; this was run in
+// a live account because eight rounds of review could not settle it by reading,
+// and two careful reviewers reached opposite conclusions about whether billet was
+// leaking a disk on every job. What the run found, in order:
+//
+//  1. AN ABSENT FLAG IS NOT REACHABLE. RegisterImage was handed a mapping that
+//     omitted DeleteOnTermination on BOTH the root and a non-root device.
+//     DescribeImages returned true on both. AWS normalises at registration; the
+//     value is not stored as given.
+//  2. AND THE NORMALISED VALUE IS true, INCLUDING FOR A NON-ROOT DEVICE. This is
+//     the reading that lost: [2] says the default is "false for attached volumes",
+//     and under that reading a silent mapping preserves its volume and billet
+//     leaks one disk per job. It does not. billet sending true for a mapping that
+//     said nothing is what EC2 would have done anyway.
+//  3. NOTHING OMITS IT IN PRACTICE EITHER. 26,044 Amazon-owned EBS-backed AMIs in
+//     one region carry 9,775 non-root EBS mappings between them, and ZERO omit the
+//     flag — consistent with (1) being how it gets there.
+//  4. THE PARTIAL OVERRIDE WORKS, which is the part every job depends on. A launch
+//     sending only DeviceName and Ebs.DeleteOnTermination for devices declared by
+//     the AMI was accepted; the AMI's snapshot and size were preserved on each,
+//     and both flags landed exactly as sent.
+//  5. AND THE LEAK IS REAL. The device launched with false outlived the terminated
+//     instance and sat there "available", billed, exactly as this code warns.
+//
+// So the ambiguity that motivated stating every flag is gone, and the code that
+// came out of it is unchanged — which is the useful shape for a fix to have. What
+// remains is that billet no longer depends on ANY of the above being stable: an
+// explicit request cannot be reinterpreted by a future default, and (4) is the
+// only measured fact this function still leans on.
+//
+// The two readings, kept because the reasoning is why the code looks like this:
 //
 //   - [2] gives an inheritance model — true for the root, false for ATTACHED
-//     volumes, an AMI inherits the setting from the instance it was made from, and
-//     a launch inherits it from the AMI. Read literally, a silent non-root mapping
-//     PRESERVES its volume, and billet leaks one disk per job forever.
+//     volumes, an AMI inherits from the instance it was made from, a launch
+//     inherits from the AMI. Measurement (1) and (2) show this does not describe
+//     what RegisterImage stores.
 //   - [1] carries a launch-time defaults table whose "data volume, at launch, CLI"
-//     row says Delete, and elsewhere on the same page says an AMI volume's launch
-//     default comes from the AMI's own attribute.
-//
-// TWO CAREFUL REVIEWERS READ THOSE DIFFERENTLY — one as an outright contradiction,
-// one as reconcilable with the AMI's own attribute governing — and neither reading
-// is measurable from here.
-//
-// The reconciled reading is not empty, and it is worth being exact about where it
-// runs out, because its own proponent reached the alarming end of it. Taken whole
-// it CAN answer the question: the unstated mapping took [2]'s creation-time
-// default of false, the AMI stored that, the launch inherits it — preserve, and
-// billet leaks. It stops at one further unmeasurable step, whether that
-// creation-time default is materialised into the stored mapping at all. So the
-// choice is not between an answer and a gap; it is between two readings that
-// disagree about whether billet is leaking right now, resting on a fact nobody
-// here can check.
-//
-// That is the argument for this function. The dispute was about somebody else's
-// undocumented edge, it could not be settled by reading more, and the bill for
-// guessing wrong arrives monthly and silently. So billet stops needing an answer:
-// every EBS device it launches carries an explicit flag, and no default —
-// documented, disputed, or discovered later — governs anything billet launches.
-// #53.
+//     row says Delete, and elsewhere says an AMI volume's launch default comes
+//     from the AMI's own attribute. Consistent with what was measured.
 //
 // AN EXPLICIT false IS PASSED THROUGH ON EVERY DEVICE EXCEPT THE ROOT. Where a
 // NON-ROOT mapping stated the flag, that is the operator talking about their own

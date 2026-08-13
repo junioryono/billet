@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -195,12 +196,24 @@ func blockDevices(t *testing.T, got url.Values) map[string]string {
 
 	out := map[string]string{}
 
-	for i := 1; ; i++ {
+	// SCANNED PAST THE FIRST GAP, by a few, because stopping at it would make the
+	// contract above a lie: a mapping stranded after a hole is exactly what EC2
+	// would ignore, and a reader that cannot see it cannot report it.
+	gap := 0
+
+	for i := 1; gap < 4; i++ {
 		n := strconv.Itoa(i)
 
 		device := got.Get("BlockDeviceMapping." + n + ".DeviceName")
 		if device == "" {
-			break
+			gap++
+
+			continue
+		}
+
+		if gap > 0 {
+			t.Errorf("%s was sent at index %s, after a gap; EC2 reads these as a list and "+
+				"stops at the hole", device, n)
 		}
 
 		if _, seen := out[device]; seen {
@@ -775,14 +788,36 @@ func TestAnImageIsLookedUpOncePerImage(t *testing.T) {
 			"somewhere other than its own lookup", d)
 	}
 
-	if b := blockDevices(t, runs[1]); len(b) != 2 {
-		t.Errorf("the second image sent %v, want exactly its own two devices", b)
+	wantB := map[string]string{"/dev/sda1": "true", "/dev/sdz": "true"}
+
+	if b := blockDevices(t, runs[1]); !maps.Equal(b, wantB) {
+		t.Errorf("the second image sent %v, want %v — counting them would let any name or "+
+			"flag through", b, wantB)
+	}
+
+	// AND THE ORDER OF allParamsFor IS PINNED, which the A/B/A shape alone cannot do:
+	// reversing it leaves B in the middle either way. Only the two A launches differ,
+	// and only in the disk the third one asked for.
+	if v := runs[0].Get("BlockDeviceMapping.1.Ebs.VolumeSize"); v != "" {
+		t.Errorf("the first request carries a volume size of %q; allParamsFor is not in "+
+			"call order", v)
+	}
+
+	if v := runs[2].Get("BlockDeviceMapping.1.Ebs.VolumeSize"); v != "80" {
+		t.Errorf("the third request carries a volume size of %q, want 80; allParamsFor is "+
+			"not in call order", v)
 	}
 
 	// SAID ONCE, not once per launch. The warning lives behind the cache precisely
 	// so a busy tier does not repeat it for every job.
 	if n := strings.Count(logged.String(), "/dev/sdc"); n != 1 {
 		t.Errorf("the kept volume was reported %d times across three launches, want 1", n)
+	}
+
+	// AT WARN, not Info. A leak reported at the level the routine "launched instance"
+	// line uses is one nobody filters for and nobody sees.
+	if !strings.Contains(logged.String(), "level=WARN") {
+		t.Errorf("the kept volume was not reported as a warning: %s", logged.String())
 	}
 }
 
@@ -2310,6 +2345,12 @@ func TestEveryImageDeviceLaunchesWithAnExplicitTerminationFlag(t *testing.T) {
 			t.Errorf("%s is being kept and was not reported: %s", device, logged.String())
 		}
 	}
+
+	// AT WARN. Reported at Info it sits beside the routine launch line and is seen
+	// by nobody.
+	if !strings.Contains(logged.String(), "level=WARN") {
+		t.Errorf("kept volumes were not reported as warnings: %s", logged.String())
+	}
 }
 
 // A MAPPING THAT IS NOT AN EBS VOLUME IS NOT GIVEN AN EBS PARAMETER.
@@ -2466,6 +2507,10 @@ func TestTheRootIsDeletedEvenWhenTheImageAsksToKeepIt(t *testing.T) {
 	// the matrix nothing covered.
 	if !strings.Contains(logged.String(), "ROOT") {
 		t.Errorf("billet overrode a root marked keep without announcing it: %s", logged.String())
+	}
+
+	if !strings.Contains(logged.String(), "level=WARN") {
+		t.Errorf("the root override was not announced as a warning: %s", logged.String())
 	}
 }
 
