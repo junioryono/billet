@@ -630,27 +630,35 @@ func shellCommand(argv []string) (string, error) {
 // afterwards, and the listener treats a successful Destroy as its proof that the
 // compute is gone before it releases the lease.
 //
-// SO THE LETTER OF THAT CONTRACT IS NOT MET HERE, AND ITS PURPOSE IS. The rule
-// exists so a second job is not placed on a machine the first is still running
-// on — the listener's own words are that the budget would otherwise be "satisfied
-// on paper and overcommitted in fact". On a shared host that is a physical
-// hazard: an undestroyed container really is still holding CPU and memory that
-// something else has just been promised. Here there is no shared host. Terminate
-// is irreversible, the instance will never execute another instruction of that
-// job, and the next launch is a different machine entirely — so nothing is
-// double-booked. What briefly exceeds the node's declared budget is the BILL, by
-// one instance for the length of a shutdown, which is a cost artifact rather than
-// a capacity one (see #44).
+// SO THE CONTRACT IS NOT MET HERE, AND THE GAP IS AN EXECUTION OVERLAP RATHER
+// THAN A ROUNDING ERROR (#46).
 //
-// WAITING WOULD BE WORSE, and that is why this is not simply fixed: a node
-// executes one command at a time, so blocking teardown on a poll for the minute
-// or two AWS takes would stall every launch queued behind it — trading a bounded
-// cost overshoot for a bounded outage.
+// An earlier version of this comment argued the purpose was still served, because
+// terminate is irreversible and the next launch is a different machine, so the
+// only thing briefly exceeded was the BILL. That argument is wrong, and this file
+// contradicts it twelve lines from here: runningState documents `shutting-down`
+// as a state where "the job may still be executing", which is exactly why List
+// asks for it. A terminate request proves EVENTUAL termination. It does not prove
+// the guest has stopped, and an instance takes a minute or two to get there.
 //
-// The instance stays in this host's inventory throughout, because `shutting-down`
-// is one of the states List asks for and runningState counts it as running. That
-// does not un-release the lease, which is already terminal; it means the sweep
-// sees the instance, calls Destroy again, and finds it idempotent.
+// The consequence is not money. Destroy is reached on paths where the guest IS
+// still working — a drain, a custody teardown, an operator killing a job — and
+// the listener releases the lease on success, so another job can start while the
+// old guest is still finishing a deploy, a migration, or an artifact upload. Two
+// concurrent effects on something outside billet, which is worse than the
+// over-commit the rule was written to prevent.
+//
+// WAITING HERE IS NOT THE FIX EITHER: a node executes one command at a time, so
+// blocking teardown for the minute or two AWS takes would stall every launch
+// queued behind it. The fix is to keep the capacity charged in a terminating
+// state while something confirms quiescence out of band — which is what custody
+// already does for compute billet cannot account for, and is a change to shared
+// node machinery rather than to this backend. #46 carries it.
+//
+// Until then the instance does at least stay in this host's inventory, because
+// `shutting-down` is one of the states List asks for. That does not un-release
+// the lease, which is already terminal; it means the sweep sees the instance,
+// calls Destroy again, and finds it idempotent.
 func (p *Provider) Destroy(ctx context.Context, id string) error {
 	if id == "" {
 		return errors.New("ec2: destroy needs an instance id")
