@@ -380,23 +380,40 @@ func EffectiveCloneFormat(minCompatClient, configured string) (int, error) {
 func bounded(v string) string {
 	// QUOTED, so a control byte in another program's output cannot become a live
 	// terminal control when billet prints it.
-	quoted := strconv.Quote(sanitize(v))
+	clean := sanitize(v)
+	quoted := strconv.Quote(clean)
 
 	// THE RENDERED LENGTH, not the input length. Quoting EXPANDS — 300 NUL bytes
 	// become 1,200 characters of `\x00` — so capping what goes in leaves what comes
 	// out four times the bound it was supposed to have.
-	if len(quoted) > maxDiagnostic {
-		// TRAILING BACKSLASHES ARE TRIMMED BEFORE THE CLOSING QUOTE IS ADDED. The cut
-		// can land inside an escape — `"aaa\x0` — and an odd number of trailing
-		// backslashes escapes the quote billet appends, so the value reads as though
-		// it were never terminated. Probed rather than assumed: two of five sample
-		// cuts produced one.
-		cut := strings.TrimRight(sanitize(quoted[:maxDiagnostic]), `\`)
-
-		return cut + "…\""
+	if len(quoted) <= maxDiagnostic {
+		return quoted
 	}
 
-	return quoted
+	// THE LARGEST PREFIX WHOSE QUOTED FORM FITS, built up escape by escape rather
+	// than sliced out of the finished string. Slicing cuts inside an escape — 100
+	// NUL bytes truncate to `"\x00\x00…\x0` — and trimming the trailing backslash
+	// only fixes the subset where the cut landed on one. Assembling it cannot
+	// produce a partial escape at all, which is the difference between a rule and a
+	// patch for the case somebody noticed.
+	var b strings.Builder
+
+	b.WriteByte('"')
+
+	for _, r := range clean {
+		piece := strconv.Quote(string(r))
+		piece = piece[1 : len(piece)-1]
+
+		if b.Len()+len(piece)+len("…\"") > maxDiagnostic {
+			break
+		}
+
+		b.WriteString(piece)
+	}
+
+	b.WriteString("…\"")
+
+	return b.String()
 }
 
 // minCompatClient asks the cluster which client releases it admits.
@@ -538,23 +555,21 @@ func (c *Client) poolSizes(ctx context.Context) (map[string]poolSpec, error) {
 func cloneV1Causes(release string, report Report) []string {
 	var causes []string
 
-	// A REFUSAL WITH NO REASON IS THE ONE OUTCOME THIS MUST NOT PRODUCE. The list
-	// below re-derives what EffectiveCloneFormat already decided, and two functions
-	// applying one rule is exactly how they come to disagree — so if they ever do,
-	// the operator gets a sentence rather than a colon and nothing after it.
-	defer func() {
-		if len(causes) == 0 {
-			causes = []string{fmt.Sprintf("its pools resolve to the old clone format from "+
-				"require-min-compat-client %s and their rbd_default_clone_format settings, "+
-				"which `billet check` lists above", bounded(release))}
-		}
-	}()
-
 	for _, p := range report.Pools {
 		if p.CloneFormat == "1" {
 			causes = append(causes, fmt.Sprintf("pool %s has rbd_default_clone_format set to 1, "+
-				"which overrides the cluster's minimum client release (unset it with `%s`)",
-				p.Name, unsetCloneFormat(p)))
+				"which overrides the cluster's minimum client release (%s)", p.Name,
+				unsetCloneFormat(p)))
+		}
+	}
+
+	// WHICH POOLS ACTUALLY TAKE THE FLOOR'S ANSWER — the ones with no override of
+	// their own. A pool forced to 2 does not, however old the floor is.
+	var fromFloor []string
+
+	for _, p := range report.Pools {
+		if p.CloneFormat == "" || p.CloneFormat == "auto" {
+			fromFloor = append(fromFloor, p.Name)
 		}
 	}
 
@@ -567,12 +582,59 @@ func cloneV1Causes(release string, report Report) []string {
 			floor = "the cluster has never been told which client releases it admits"
 		}
 
-		causes = append(causes, floor+", so its pools take the old clone format (raise it with "+
-			"`ceph osd set-require-min-compat-client mimic`, which refuses while clients older "+
-			"than mimic are connected — `ceph features` lists them)")
+		// WHICH POOLS, not "its pools". With the floor at luminous and one pool forced
+		// to 2, only the other one takes the floor's answer — and saying both do
+		// describes the aggregate rather than what is actually wrong.
+		//
+		// AND IT IS STILL A CAUSE WHEN NO POOL TAKES IT TODAY, because removing the
+		// overrides is what the other clauses tell the operator to do, and it lands
+		// them right back here. Remedies have to converge: an operator who fixes
+		// everything billet names must not be refused again for something it knew.
+		effect := fmt.Sprintf("so %s take%s the old clone format from it",
+			poolList(fromFloor), plural(len(fromFloor)))
+		if len(fromFloor) == 0 {
+			effect = "so its pools would take the old clone format from it once the overrides " +
+				"above are removed"
+		}
+
+		causes = append(causes, fmt.Sprintf("%s, %s (raise it with `ceph osd "+
+			"set-require-min-compat-client mimic`, which refuses while clients older than mimic "+
+			"are connected — `ceph features` lists them)", floor, effect))
+	}
+
+	// A REFUSAL WITH NO REASON IS THE ONE OUTCOME THIS MUST NOT PRODUCE. This list
+	// re-derives what EffectiveCloneFormat already decided, and two functions
+	// applying one rule is how they come to disagree — so if they ever do, the
+	// operator gets a sentence rather than a colon with nothing after it.
+	//
+	// A PLAIN CONDITIONAL, NOT A DEFER. The first version deferred an assignment to
+	// `causes`, which does nothing at all: the result is unnamed, so its value was
+	// copied at `return` before the deferred function ran. The fallback read as
+	// though it were future-proofing and was dead code.
+	if len(causes) == 0 {
+		return []string{fmt.Sprintf("its pools resolve to the old clone format from "+
+			"require-min-compat-client %s and their rbd_default_clone_format settings, which "+
+			"`billet check` lists above", bounded(release))}
 	}
 
 	return causes
+}
+
+// poolList renders pool names for a sentence.
+func poolList(names []string) string {
+	if len(names) == 0 {
+		return "its pools"
+	}
+
+	return "pool " + strings.Join(names, " and ")
+}
+
+func plural(n int) string {
+	if n == 1 {
+		return "s"
+	}
+
+	return ""
 }
 
 // unsetCloneFormat is the command that removes THIS override.
@@ -581,13 +643,19 @@ func cloneV1Causes(release string, report Report) []string {
 // different commands — `ceph config rm client …` does not remove an override set
 // on a pool. Naming the wrong one sends an operator to a setting that is already
 // absent and leaves them believing billet is wrong about their cluster.
+// EACH BRANCH WRITES ITS WHOLE CLAUSE, rather than a command slotted into a fixed
+// "unset it with" wrapper. The unknown-source branch has no unsetting command to
+// give — it has two READS — and passing those through a wrapper that says "unset
+// it with" is the same class of defect as everything else this check has produced:
+// a sentence claiming one thing while supplying an adjacent one.
 func unsetCloneFormat(p Pool) string {
 	switch p.CloneFormatSource {
 	case "pool":
-		return "rbd config pool rm " + p.Name + " rbd_default_clone_format"
+		return "unset it with `rbd config pool rm " + shellQuote(p.Name) +
+			" rbd_default_clone_format`"
 
 	case "config":
-		return "ceph config rm client rbd_default_clone_format"
+		return "unset it with `ceph config rm client rbd_default_clone_format`"
 
 	default:
 		// SAID, NOT GUESSED. Treating an unrecognised source as cluster-wide hands
@@ -595,10 +663,26 @@ func unsetCloneFormat(p Pool) string {
 		// and a command that changes nothing is worse than an honest "look here":
 		// they run it, see no change, and conclude billet is wrong about their
 		// cluster.
-		return "ceph config get client rbd_default_clone_format` and `rbd config pool get " +
-			p.Name + " rbd_default_clone_format` to find where " + bounded(p.CloneFormatSource) +
-			" set it"
+		return "the cluster reports it came from " + bounded(p.CloneFormatSource) +
+			", which billet does not recognise, so find it with `ceph config get client " +
+			"rbd_default_clone_format` or `rbd config pool get " + shellQuote(p.Name) +
+			" rbd_default_clone_format`"
 	}
+}
+
+// shellQuote makes a value safe to paste into a shell.
+//
+// A POOL NAME IS NOT A WORD. Ceph creates pools called `a b` and `a/b` — measured,
+// which is why billet's own validation stopped refusing interior whitespace — so
+// concatenating one into a suggested command produces `rbd config pool rm billet
+// cache …`, which addresses two arguments and neither of them the pool. Every
+// remedy billet prints is something an operator will paste.
+func shellQuote(s string) string {
+	if s != "" && !strings.ContainsAny(s, " \t\n'\"\\$`&;|<>()*?[]#~!") {
+		return s
+	}
+
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // cephCmd runs one `ceph` invocation, bounded like every other.

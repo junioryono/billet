@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1622,7 +1623,10 @@ func TestACloneFormatIsCanonicalisedOnce(t *testing.T) {
 	t.Parallel()
 
 	rec := answer()
-	rec.rawConfig = "[{\"name\":\"rbd_default_clone_format\",\"value\":\"\\n  1  \\r\",\"source\":\"pool\"}]"
+	// BOTH FIELDS PADDED, because both are canonicalised and a fixture that pads
+	// only the value leaves the source's trim untested.
+	rec.rawConfig = "[{\"name\":\"rbd_default_clone_format\",\"value\":\"\\n  1  \\r\"," +
+		"\"source\":\"  pool\\n\"}]"
 
 	report, err := client(t, valid(), rec).CheckReachable(t.Context())
 	if err == nil {
@@ -1631,6 +1635,8 @@ func TestACloneFormatIsCanonicalisedOnce(t *testing.T) {
 
 	// The remedy must be the one for a forced format, not for the floor — which is
 	// already high enough, and is what a raw comparison would have sent them to.
+	// Its presence also proves the SOURCE was canonicalised: a padded source falls
+	// through to the unrecognised branch, which gives a different sentence.
 	if !strings.Contains(err.Error(), "rbd config pool rm") {
 		t.Errorf("the error does not give the remedy for the forced format: %v", err)
 	}
@@ -1641,6 +1647,41 @@ func TestACloneFormatIsCanonicalisedOnce(t *testing.T) {
 		if p.CloneFormat != "1" {
 			t.Errorf("%s stored the raw value %q rather than the canonical one", p.Name, p.CloneFormat)
 		}
+	}
+}
+
+// A POOL NAME IS NOT A WORD, and every remedy billet prints is something an
+// operator will paste.
+//
+// Ceph creates pools called `a b` and `a/b` — measured, which is why billet's own
+// validation stopped refusing interior whitespace — so concatenating one into a
+// suggested command yields `rbd config pool rm billet cache …`, which addresses
+// two arguments and neither of them the pool.
+func TestAPoolNameInARemedyIsShellQuoted(t *testing.T) {
+	t.Parallel()
+
+	cfg := valid()
+	cfg.ImagePool = "billet images"
+
+	rec := answer()
+	rec.cloneFormat = "1"
+	rec.cloneSource = "pool"
+	rec.rawImages = `[]`
+
+	c, err := New(cfg, WithBinary("/usr/bin/rbd"), WithCephBinary("/usr/bin/ceph"),
+		withRunner(rec.run))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	_, err = c.CheckReachable(t.Context())
+	if err == nil {
+		t.Fatal("CheckReachable accepted a forced clone format")
+	}
+
+	if !strings.Contains(err.Error(), `'billet images'`) {
+		t.Errorf("the remedy does not quote a pool name containing a space, so pasting it would "+
+			"address something else: %v", err)
 	}
 }
 
@@ -1730,6 +1771,57 @@ func TestARenderedValueIsBoundedAfterQuoting(t *testing.T) {
 	// terminal control on its way through an error message.
 	if got := bounded("a\nb"); strings.Contains(got, "\n") {
 		t.Errorf("bounded passed a raw newline through: %q", got)
+	}
+}
+
+// A TRUNCATED RENDERING IS STILL A VALID QUOTED VALUE.
+//
+// Length and "no raw newline" do not establish that: slicing the finished quoted
+// string cuts inside an escape — 100 NUL bytes truncate to `"\x00\x00…\x0` — and
+// trimming a trailing backslash only repairs the subset of cuts that landed on
+// one. What proves it is unquoting the result, which fails on a partial escape.
+func TestATruncatedRenderingIsStillValidlyQuoted(t *testing.T) {
+	t.Parallel()
+
+	for _, v := range []string{
+		strings.Repeat("\x00", 100),
+		strings.Repeat("\x00", 4096),
+		strings.Repeat("\t", 120),
+		strings.Repeat("a", 296) + "\x00\x00",
+		strings.Repeat("a", 297) + "\x00\x00",
+		strings.Repeat("a", 298) + "\x00\x00",
+		strings.Repeat(`\`, 200),
+		strings.Repeat("é", 4096),
+		strings.Repeat("☃", 4096),
+		strings.Repeat("a\nb", 200),
+		strings.Repeat("\x1b[31m", 200), // an ansi escape, which a terminal would obey
+	} {
+		got := bounded(v)
+
+		// The ellipsis marks the truncation and is not part of the value, so it
+		// comes off before the result is unquoted.
+		candidate := got
+		if strings.HasSuffix(got, "…\"") {
+			candidate = strings.TrimSuffix(got, "…\"") + `"`
+		}
+
+		if _, err := strconv.Unquote(candidate); err != nil {
+			t.Errorf("bounded(%d bytes) is not a valid quoted value (%v): %q",
+				len(v), err, got[max(0, len(got)-24):])
+		}
+
+		// AND NO CONTROL BYTE SURVIVES THE TRUNCATING PATH. Unquoting alone does not
+		// establish it — Go's unquote tolerates a raw NUL or tab inside a literal —
+		// so a truncation that stopped escaping would still parse. What must not
+		// happen is a byte from another program reaching a terminal as a live
+		// control, which is what the quoting is for.
+		for _, r := range got {
+			if r < 0x20 || r == 0x7f {
+				t.Errorf("bounded(%d bytes) passed a raw control byte %q through", len(v), r)
+
+				break
+			}
+		}
 	}
 }
 
