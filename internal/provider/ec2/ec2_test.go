@@ -2694,11 +2694,26 @@ func TestTheRootIsNotAnnouncedWhenTheImageDidNotAskToKeepIt(t *testing.T) {
 // naming a device the operator never wrote — once per job, for every job on that
 // tier.
 //
-// THE ABSENT CASE IS ALLOWED THROUGH, deliberately. Every fake response in this
-// file predates the field, and an image that does not report its root type is not
-// evidence of an instance-store root — the same "absent is not false" rule the
-// termination flag taught, applied to a field billet has even less reason to
-// second-guess.
+// THE ABSENT CASE IS ALLOWED THROUGH, deliberately, and SILENTLY — which is where
+// it parts company with the termination flag, so the difference is worth stating
+// rather than gesturing at.
+//
+// That field's absent case warns, on the argument that a policy applied to an
+// unmeasured state and resolved quietly is how an assumption stops being visible.
+// Both halves of that argument fail here. billet takes the IDENTICAL action for
+// absent and for "ebs" — it launches — so there is no decision being resolved to
+// surface, whereas an unreadable termination flag picks delete over keep. And
+// absence here is common locally while unobserved in reality: every fake response
+// in this package predates the field, so a warning would fire in nearly every test
+// and almost never in production, which is the trained-ignorable noise the other
+// case was careful not to build.
+//
+// What carries the decision is the error asymmetry rather than either precedent.
+// Refusing on absence fails EVERY launch fleet-wide the moment any path or API
+// change omits the field — a false refusal with unbounded blast radius. Allowing
+// it fails only where an instance-store image ALSO omits its type, and fails there
+// exactly as it did before this change: late, at AWS. One arm risks everything on
+// a field being present; the other risks nothing that was not already broken.
 func TestAnInstanceStoreBackedImageIsRefused(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
