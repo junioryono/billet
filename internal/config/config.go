@@ -1601,6 +1601,15 @@ func CheckEC2Endpoint(endpoint string) error {
 		return errors.New("node.ec2.endpoint names no host")
 	}
 
+	// THE QUERY API LIVES AT THE ROOT. A path here would be signed and posted to,
+	// so `https://vpce.example/v1` sends every call somewhere that is not the
+	// service — and no AWS regional, VPC-interface or non-commercial-partition
+	// endpoint needs one. Absent and "/" are both the root.
+	if path := u.EscapedPath(); path != "" && path != "/" {
+		return errors.New("node.ec2.endpoint must name a host with no path: billet posts the " +
+			"ec2 query api at the root, and signs whatever path it is given")
+	}
+
 	if u.Scheme == "https" || isLoopbackHost(u.Hostname()) {
 		return nil
 	}

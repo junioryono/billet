@@ -116,9 +116,22 @@ func New(owner string, cfg config.EC2Config, opts ...Option) (*Provider, error) 
 			"instances, or it cannot tell its own compute from another billet's")
 	}
 
-	// EVERY SAFETY RULE IS RE-APPLIED HERE, not merely validated at load. This
+	// NORMALIZED ONCE, BEFORE ANYTHING READS IT, which config.applyDefaults does
+	// for a config that came through Load and nothing does for one that did not.
+	// Validating a trimmed copy and then SIGNING with the original is the exact
+	// shape of the bug this constructor exists to prevent: ` us-west-2 ` passed
+	// the region rule, dialled the right host, and put the spaces in the credential
+	// scope of every request, which AWS answers with a 403 naming nothing.
+	cfg.Region = strings.TrimSpace(cfg.Region)
+	cfg.Endpoint = strings.TrimSpace(cfg.Endpoint)
+
+	// THE SAFETY RULES CONFIG VALIDATION APPLIES TO THIS BACKEND'S NETWORK AND
+	// IDENTITY ARE RE-APPLIED HERE — region, endpoint and security groups. This
 	// constructor is exported, so it cannot assume its configuration came through
-	// config.Load — the same reason alloc.New re-applies its own.
+	// config.Load, the same reason alloc.New re-applies its own. It is not every
+	// rule Load enforces: the subnet and the instance shapes are still only checked
+	// there, because getting them wrong fails a launch loudly rather than sending a
+	// credential somewhere.
 	//
 	// THE REGION IS ONE OF THEM, which is not obvious: it is interpolated into the
 	// default endpoint below, so an unvalidated one is a way to choose the HOST a
@@ -144,9 +157,9 @@ func New(owner string, cfg config.EC2Config, opts ...Option) (*Provider, error) 
 		}
 	}
 
-	endpoint := strings.TrimSpace(cfg.Endpoint)
+	endpoint := cfg.Endpoint
 	if endpoint == "" {
-		endpoint = "https://ec2." + strings.TrimSpace(cfg.Region) + ".amazonaws.com/"
+		endpoint = "https://ec2." + cfg.Region + ".amazonaws.com/"
 	}
 
 	// THE EFFECTIVE ENDPOINT, whether it was configured or derived. Checking only
@@ -202,12 +215,15 @@ func New(owner string, cfg config.EC2Config, opts ...Option) (*Provider, error) 
 	client := *p.api.http
 	client.CheckRedirect = func(req *http.Request, _ []*http.Request) error {
 		// THE HOST AND NOTHING ELSE. A redirect target is chosen by whatever
-		// answered, so its query and userinfo are not billet's to render — the
-		// same rule CheckEC2Endpoint follows, and net/http wraps this in a
-		// *url.Error that embeds the URL regardless, so the message must not add
-		// to it.
-		return fmt.Errorf("ec2: refusing to follow a redirect to host %q: a signed request "+
-			"carries a session token, and the ec2 api does not redirect", req.URL.Hostname())
+		// answered, so its query and fragment are not billet's to render — the same
+		// rule CheckEC2Endpoint follows.
+		//
+		// AND THE ERROR IS A SENTINEL, because naming the host here is not enough
+		// on its own: net/http wraps whatever this returns in a *url.Error, and
+		// THAT type renders the whole redirect target including its query. The call
+		// boundary recognises the sentinel and replaces the wrapper rather than
+		// wrapping it further.
+		return fmt.Errorf("%w to host %q", errRedirected, req.URL.Hostname())
 	}
 
 	p.api.http = &client
@@ -826,6 +842,12 @@ func runningState(state string) bool {
 		return true
 	}
 }
+
+// errRedirected marks a refusal to follow a redirect, so the api boundary can
+// discard net/http's *url.Error wrapper — which renders the whole redirect
+// target, query included — instead of passing it on.
+var errRedirected = errors.New("ec2: refusing to follow a redirect: a signed request carries a " +
+	"session token, and the ec2 api does not redirect")
 
 // preflightOwner tags nothing. It is the deployment identity CheckReachable
 // filters on, chosen so the query matches no instances: the point of the call is

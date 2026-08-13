@@ -468,21 +468,33 @@ func TestAnEndpointRefusalNeverRendersTheEndpoint(t *testing.T) {
 	// A TOKEN THAT CANNOT APPEAR IN PROSE. The first version searched for the word
 	// "secret", which the refusal messages themselves contain — so it failed on
 	// their own explanation rather than on a leak.
-	const leaked = "hunter2hunter2"
+	//
+	// TWO MARKERS, in the secret AND in the host, because asserting only the first
+	// would pass against an implementation that rendered scheme, host and path and
+	// stripped nothing but the password — which is not what "never renders the
+	// endpoint" says.
+	const (
+		leaked = "hunter2hunter2"
+		host   = "markerhost9zz"
+	)
 
 	for name, endpoint := range map[string]string{
-		"opaque, with a password": "http:alice:" + leaked + "@example.com",
-		"a secret in the query":   "https://example.com/?token=" + leaked,
-		"a secret in a fragment":  "https://example.com/#" + leaked,
-		"userinfo":                "https://alice:" + leaked + "@example.com/",
-		"unparseable":             "https://alice:" + leaked + "@exa mple.com/",
+		"opaque, with a password": "http:alice:" + leaked + "@" + host + ".example",
+		"a secret in the query":   "https://" + host + ".example/?token=" + leaked,
+		"a secret in a fragment":  "https://" + host + ".example/#" + leaked,
+		"userinfo":                "https://alice:" + leaked + "@" + host + ".example/",
+		"unparseable":             "https://alice:" + leaked + "@exa mple." + host,
+		"a path":                  "https://" + host + ".example/" + leaked,
 	} {
 		t.Run(name, func(t *testing.T) {
 			got := loadErr(t, cloudConfig(t, "    region: us-west-2\n",
 				"    region: us-west-2\n    endpoint: \""+endpoint+"\"\n"))
 
-			if strings.Contains(got, leaked) {
-				t.Errorf("the refusal rendered the value it is refusing: %s", got)
+			for _, marker := range []string{leaked, host} {
+				if strings.Contains(got, marker) {
+					t.Errorf("the refusal rendered %q from the value it is refusing: %s",
+						marker, got)
+				}
 			}
 		})
 	}
@@ -514,5 +526,39 @@ func TestEveryBlankSecurityGroupIsReported(t *testing.T) {
 
 	if strings.Count(got, "security_group_ids[") < 2 {
 		t.Errorf("only some of the blank entries were reported: %s", got)
+	}
+}
+
+// THE QUERY API LIVES AT THE ROOT, so a path would be signed and posted to
+// somewhere that is not the service. No AWS regional, VPC-interface or
+// non-commercial-partition endpoint needs one.
+func TestACloudEndpointMustNameAHostWithNoPath(t *testing.T) {
+	for name, endpoint := range map[string]string{
+		"a versioned path": "https://vpce-abc.ec2.us-west-2.vpce.amazonaws.com/v1",
+		"a trailing name":  "https://ec2.us-west-2.amazonaws.com/ec2",
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := loadErr(t, cloudConfig(t, "    region: us-west-2\n",
+				"    region: us-west-2\n    endpoint: "+endpoint+"\n"))
+
+			if !strings.Contains(got, "path") {
+				t.Errorf("the error does not name the problem: %s", got)
+			}
+		})
+	}
+
+	// Absent and "/" are both the root, and both are ordinary.
+	for name, endpoint := range map[string]string{
+		"no path":      "https://ec2.us-west-2.amazonaws.com",
+		"a root slash": "https://ec2.us-west-2.amazonaws.com/",
+	} {
+		t.Run(name, func(t *testing.T) {
+			body := cloudConfig(t, "    region: us-west-2\n",
+				"    region: us-west-2\n    endpoint: "+endpoint+"\n")
+
+			if _, err := Load(writeConfig(t, body)); err != nil {
+				t.Errorf("endpoint %q was rejected: %v", endpoint, err)
+			}
+		})
 	}
 }
