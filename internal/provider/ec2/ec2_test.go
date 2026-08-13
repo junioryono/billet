@@ -1978,16 +1978,18 @@ func TestAVolumeMarkedWithTheOtherBooleanSpellingIsStillReported(t *testing.T) {
 	}
 }
 
-// AN IMAGE THAT SAYS NOTHING ABOUT DeleteOnTermination IS NOT WARNED ABOUT.
+// A RESPONSE THAT OMITS DeleteOnTermination IS NOT WARNED ABOUT.
 //
-// Not because silence is safe — because billet cannot tell. AWS says the
-// launch-time default comes from the AMI's own attribute, so an image that sets
-// none leaves the documentation with nothing further to say, and this package has
-// never spoken to a real account to find out. Warning on unknown would fire on
-// innocent images, and a warning an operator has learned to ignore protects
-// nothing. The reasoning lives at the call site in ec2.go; this pins the
-// behaviour, separately from the test that asserts what IS reported.
-func TestAnImageSilentAboutTerminationIsNotWarnedAbout(t *testing.T) {
+// Note what the name does NOT say: not that the image sets no attribute, only
+// that the response carried none. Everything past that is inference about a
+// system this package has never spoken to.
+//
+// And silence here is a choice rather than a conclusion — AWS documents two
+// conflicting defaults for this case, so it can be wrong in the direction of
+// missing a leak. The reasoning, both citations and what would settle it live at
+// the call site in ec2.go; this pins the behaviour, separately from the test that
+// asserts what IS reported.
+func TestAResponseOmittingTerminationIsNotWarnedAbout(t *testing.T) {
 	f := newFakeEC2(t)
 	f.respond = func(action string, params url.Values) (int, string) {
 		if action != "DescribeImages" {
