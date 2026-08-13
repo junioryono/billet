@@ -1856,3 +1856,18 @@ func TestNoOptionCanProduceANilThatPanicsLater(t *testing.T) {
 		})
 	}
 }
+
+// A TYPED NIL IS STILL A NIL, and it is the one an interface hides.
+//
+// `p.api.creds == nil` is FALSE for (*IMDSCredentials)(nil) — the interface holds
+// a type — so it passed the guard and dereferenced at the first signed call,
+// which is precisely the later panic that guard exists to prevent.
+func TestATypedNilCredentialSourceIsRefused(t *testing.T) {
+	cfg := validEC2Config("https://ec2.us-west-2.amazonaws.com/")
+
+	var typed *IMDSCredentials
+
+	if _, err := New("dep-1", cfg, WithCredentials(typed)); err == nil {
+		t.Fatal("a typed-nil credential source was accepted; the first signed call would panic")
+	}
+}

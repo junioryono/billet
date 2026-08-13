@@ -31,6 +31,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"reflect"
 	"regexp"
 	"slices"
 	"strconv"
@@ -214,7 +215,11 @@ func New(owner string, cfg config.EC2Config, opts ...Option) (*Provider, error) 
 	case p.log == nil:
 		return nil, errors.New("ec2: WithLogger was given no logger")
 
-	case p.api.creds == nil:
+	// A TYPED NIL IS STILL A NIL, and it is the one an interface hides. A plain
+	// `== nil` is false for (*IMDSCredentials)(nil) — the interface has a type — so
+	// it passed here and dereferenced at the first signed call, which is exactly
+	// the later panic this switch exists to prevent.
+	case p.api.creds == nil || isNilValue(p.api.creds):
 		return nil, errors.New("ec2: WithCredentials was given no credential source")
 	}
 
@@ -993,6 +998,20 @@ var awsErrorCode = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9._-]{0,63}$`)
 // target, query included — instead of passing it on.
 var errRedirected = errors.New("ec2: refusing to follow a redirect: a signed request carries a " +
 	"session token, and the ec2 api does not redirect")
+
+// isNilValue reports whether an interface holds a nil pointer, map, slice, func
+// or channel — the values that satisfy an interface and then panic on use.
+func isNilValue(v any) bool {
+	rv := reflect.ValueOf(v)
+
+	switch rv.Kind() {
+	case reflect.Pointer, reflect.Map, reflect.Slice, reflect.Func,
+		reflect.Chan, reflect.UnsafePointer, reflect.Interface:
+		return rv.IsNil()
+	default:
+		return false
+	}
+}
 
 // preflightOwner tags nothing. It is the deployment identity CheckReachable
 // filters on, chosen so the query matches no instances: the point of the call is

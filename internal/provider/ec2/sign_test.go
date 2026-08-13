@@ -232,3 +232,34 @@ func TestAQueryStringSpaceIsCanonicalizedTheWayAWSReadsIt(t *testing.T) {
 		t.Errorf("canonical query = %q, want %q", got, want)
 	}
 }
+
+// HOST AND CONTENT-LENGTH COME FROM THE REQUEST, NEVER FROM THE HEADER MAP.
+//
+// Go keeps both on the Request itself and writes them onto the wire from there,
+// ignoring anything a caller put in Header. So signing the map's version produces
+// a signature over a request nobody sent — a 403 naming nothing.
+//
+// The pinned AWS vectors cannot catch this: their Host and Content-Length exist
+// only on the Request, so the branch that skips the map is never reached by them.
+// This sets both in the map to something else and asserts the signature is
+// unchanged from the vector.
+func TestACallerSetHostOrContentLengthIsNotSignedInsteadOfWhatIsSent(t *testing.T) {
+	creds := Credentials{AccessKeyID: vectorKey, SecretAccessKey: vectorSecret}
+
+	req := vectorRequest(t)
+	req.Header.Set("Host", "attacker.example")
+	req.Header.Set("Content-Length", "99999")
+
+	if err := sign(req, []byte(vectorBody), creds, vectorRegion, vectorTime()); err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+
+	const want = "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260812/us-west-2/ec2/aws4_request, " +
+		"SignedHeaders=content-length;content-type;host;x-amz-date, " +
+		"Signature=9b0063ced912747efcb5d254101e12b955e6695f9d08a727db7bf16434e34dfa"
+
+	if got := req.Header.Get("Authorization"); got != want {
+		t.Errorf("a header the transport ignores was signed in place of the value it sends\n "+
+			"got: %s\nwant: %s", got, want)
+	}
+}

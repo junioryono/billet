@@ -810,3 +810,73 @@ func TestPrintingACredentialSourceCannotDeadlock(t *testing.T) {
 
 	src.mu.Unlock()
 }
+
+// THE STRUCT AROUND A CREDENTIAL IS A BOUNDARY TOO, and it is the one method-based
+// redaction cannot cross on its own: fmt refuses to invoke methods through an
+// UNEXPORTED field, so a source's own String is never consulted when the thing
+// holding it is printed structurally.
+//
+// This is the fourth type in this package to need its own methods for that reason
+// — Credentials, StaticCredentials, IMDSCredentials, and now the client that
+// holds a source. That is the tell that this cannot be made absolute by adding
+// methods, which is why the residual is written down rather than claimed away.
+func TestAStructHoldingACredentialSourceRedactsToo(t *testing.T) {
+	const secret = "wJalrXUtnFEMI-thisIsTheSecret"
+
+	c := &client{
+		endpoint: "https://ec2.us-west-2.amazonaws.com/",
+		region:   "us-west-2",
+		creds: StaticCredentials{
+			AccessKeyID: "AKIDEXAMPLE", SecretAccessKey: secret, SessionToken: "tok",
+		},
+	}
+
+	encoded, err := json.Marshal(c)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var logged bytes.Buffer
+
+	slog.New(slog.NewJSONHandler(&logged, nil)).Info("calling", "client", c)
+
+	for path, out := range map[string]string{
+		"%v":   fmt.Sprintf("%v", c),
+		"%+v":  fmt.Sprintf("%+v", c),
+		"%#v":  fmt.Sprintf("%#v", c),
+		"json": string(encoded),
+		"slog": logged.String(),
+	} {
+		if strings.Contains(out, secret) {
+			t.Errorf("%s rendered the secret access key through the client: %s", path, out)
+		}
+	}
+}
+
+// A CHAIN RENDERS THE TYPES OF ITS SOURCES, not their values.
+//
+// Formatting each source recursed forever on a chain containing itself, and made
+// this type's safety depend on every source redacting — including one implemented
+// outside this package, which nothing here controls.
+func TestAChainRendersTypesRatherThanTrustingItsSources(t *testing.T) {
+	leaky := leakySource{secret: "wJalrXUtnFEMI-thisIsTheSecret"}
+
+	got := fmt.Sprintf("%v", ChainCredentials{EnvCredentials{}, leaky})
+
+	if strings.Contains(got, leaky.secret) {
+		t.Errorf("the chain rendered a source that does not redact itself: %s", got)
+	}
+
+	if !strings.Contains(got, "EnvCredentials") {
+		t.Errorf("the chain does not say which sources it holds, which is the whole use of "+
+			"printing one: %s", got)
+	}
+}
+
+// leakySource is a CredentialSource implemented without redaction, which is what
+// anything outside this package would be.
+type leakySource struct{ secret string }
+
+func (leakySource) Credentials(context.Context) (Credentials, error) {
+	return Credentials{}, errNoCredentials
+}

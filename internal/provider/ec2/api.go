@@ -2,10 +2,12 @@ package ec2
 
 import (
 	"context"
+	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"reflect"
@@ -38,6 +40,34 @@ type client struct {
 	// sleep waits between attempts, replaceable so a test does not.
 	sleep func(ctx context.Context, d time.Duration) error
 }
+
+// REDACTED, BECAUSE IT HOLDS A CREDENTIAL SOURCE IN AN UNEXPORTED FIELD.
+//
+// fmt cannot invoke methods through an unexported field — reflect refuses — so a
+// source's own redaction is never consulted when the struct AROUND it is printed
+// structurally. `%+v` on a client holding a value-typed source printed the secret
+// access key in full, past three layers of redaction that all worked in
+// isolation.
+//
+// This is the fourth type in this package to need its own methods for that
+// reason, which is the tell that method-based redaction cannot be made absolute:
+// see the note in the billet-security skill, where the same residual is recorded
+// for the GitHub App key.
+func (c *client) String() string { return "ec2.client{endpoint=" + c.endpoint + "}" }
+
+// GoString covers %#v.
+func (c *client) GoString() string { return c.String() }
+
+// Format catches every verb.
+func (c *client) Format(f fmt.State, _ rune) {
+	_, _ = io.WriteString(f, c.String()) //nolint:errcheck // fmt.State swallows write errors by design
+}
+
+// MarshalJSON keeps a client out of anything that serializes it structurally.
+func (c *client) MarshalJSON() ([]byte, error) { return json.Marshal(c.String()) }
+
+// LogValue is what slog consults.
+func (c *client) LogValue() slog.Value { return slog.StringValue(c.String()) }
 
 // apiError is a refusal the EC2 API described.
 //
