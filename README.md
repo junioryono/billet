@@ -221,6 +221,8 @@ What is still true is that **a cache lives on the machine that built it**
 until shared storage lands — and a job that fails over to the cloud runs cold by design, since
 keeping it warm would mean shipping cache bytes over a WAN.
 
+**A terminate request is not a stopped guest**, and that is the one known correctness gap in this backend ([#46](https://github.com/junioryono/billet/issues/46)). `TerminateInstances` returns when the request is accepted while the machine keeps running for a minute or two, and billet releases the lease on that success — so on a drain or a forced teardown a new job can start while the old guest is still finishing a deploy. Waiting inside the teardown is not the fix, because a node runs one command at a time and it would stall every launch behind it.
+
 **One ec2 node is a serial launch queue**, because a node executes one command at a time. That is invisible for a backend where a node is one machine's worth of jobs and visible for one where a single node can stand for sixty — so a large cloud fleet wants several ec2 nodes, each registered separately with its own budget, rather than one with a large one.
 
 **The cloud half is written and unproven.** `provider: ec2` launches one instance per job and the labels can already express the fallback, but the whole backend has only ever talked to a fake EC2 API. Until somebody stops the bare-metal host mid-workflow and watches the same `runs-on` label finish in a region, treat it as untested against the thing it is for ([#32](https://github.com/junioryono/billet/issues/32)). [#33](https://github.com/junioryono/billet/issues/33) tracks the whole plan.

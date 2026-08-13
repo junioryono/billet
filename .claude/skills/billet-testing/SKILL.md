@@ -73,7 +73,7 @@ case active:
 
 - `t.Context()` and `t.TempDir()`, never `context.Background()` or a hand-made temp dir. Enforced by `usetesting`.
 - `t.Cleanup` for teardown, so it runs on the `t.Fatal` path too.
-- **`t.Parallel()` only where nothing touches the disk.** `paralleltest` is deliberately disabled rather than enforced either way, because the answer differs by package: anything opening real SQLite files (`internal/state`, `internal/alloc`, `internal/e2e`) gains nothing from parallelism and invites flakes, while the pure-function suites — `internal/config` above all — have used it from the start and should keep matching the file they are added to. The rule is the reason, not the keyword: if a test owns a file, a port or a daemon, it runs alone.
+- **`t.Parallel()` turns on the SHARING, not the disk.** `paralleltest` is deliberately disabled rather than enforced either way, because the distinction is what a test shares with its neighbours rather than what it touches. A test with resources of its own runs in parallel happily and many here do — `internal/wirecert` writes into `t.TempDir`, `internal/state` opens its own database per test, and `httptest` allocates its own port. What must run alone is a test sharing process-global state: one SQLite file two tests both open, a fixed port, a daemon, the environment (`t.Setenv` already refuses to run in a parallel test), or a package-level variable one of them mutates. Match the file you are adding to, and when in doubt ask what two copies of this test would fight over.
 - Table tests for pure functions (`ParseByteSize`); named functions for anything asserting an invariant, so a failure names the invariant.
 
 ## Testing the state store
