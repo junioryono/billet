@@ -29,6 +29,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -115,37 +116,53 @@ func New(owner string, cfg config.EC2Config, opts ...Option) (*Provider, error) 
 			"instances, or it cannot tell its own compute from another billet's")
 	}
 
+	// EVERY SAFETY RULE IS RE-APPLIED HERE, not merely validated at load. This
+	// constructor is exported, so it cannot assume its configuration came through
+	// config.Load — the same reason alloc.New re-applies its own.
+	//
+	// THE REGION IS ONE OF THEM, which is not obvious: it is interpolated into the
+	// default endpoint below, so an unvalidated one is a way to choose the HOST a
+	// signed request is sent to. Measured: `x@attacker.example/?` yields a url
+	// whose host is `attacker.example`.
+	//
+	// IN A FIXED ORDER, so a config with two problems always reports the same one
+	// first. A map here made the message depend on iteration order.
+	if err := config.CheckEC2Region(cfg.Region); err != nil {
+		return nil, fmt.Errorf("ec2: %w", err)
+	}
+
+	for _, check := range []struct {
+		field    string
+		groups   []string
+		required bool
+	}{
+		{"security_group_ids", cfg.SecurityGroupIDs, true},
+		{"untrusted_security_group_ids", cfg.UntrustedSecurityGroupIDs, false},
+	} {
+		if errs := config.CheckEC2SecurityGroups(check.field, check.groups, check.required); len(errs) > 0 {
+			return nil, fmt.Errorf("ec2: %w", errors.Join(errs...))
+		}
+	}
+
 	endpoint := strings.TrimSpace(cfg.Endpoint)
 	if endpoint == "" {
-		endpoint = "https://ec2." + cfg.Region + ".amazonaws.com/"
+		endpoint = "https://ec2." + strings.TrimSpace(cfg.Region) + ".amazonaws.com/"
 	}
 
-	// RE-APPLIED HERE, not merely validated at load. This constructor is exported,
-	// so it cannot assume its configuration came through config.Load — and the
-	// rule it enforces is that a signed request carrying a session token does not
-	// go out in plaintext, which is not a rule worth having one entry point for.
-	if strings.TrimSpace(cfg.Endpoint) != "" {
-		if err := config.CheckEC2Endpoint(strings.TrimSpace(cfg.Endpoint)); err != nil {
-			return nil, fmt.Errorf("ec2: %w", err)
-		}
+	// THE EFFECTIVE ENDPOINT, whether it was configured or derived. Checking only
+	// the configured one left the derived path — the one almost every deployment
+	// takes — unchecked.
+	if err := config.CheckEC2Endpoint(endpoint); err != nil {
+		return nil, fmt.Errorf("ec2: %w", err)
 	}
 
-	if _, err := url.Parse(endpoint); err != nil {
-		return nil, fmt.Errorf("ec2: node.ec2.endpoint is not a url: %w", err)
-	}
-
-	// THE SAME RE-APPLICATION, one field over. Accepts admits fork pull-request
-	// work as soon as the untrusted list is non-empty, so a list holding one blank
-	// entry would open this backend to untrusted code with no network described
-	// for it — through a constructor that never saw config.Load.
-	for field, groups := range map[string][]string{
-		"security_group_ids":           cfg.SecurityGroupIDs,
-		"untrusted_security_group_ids": cfg.UntrustedSecurityGroupIDs,
-	} {
-		if err := config.CheckEC2SecurityGroups(field, groups); err != nil {
-			return nil, fmt.Errorf("ec2: %w", err)
-		}
-	}
+	// CLONED, because the caller keeps the slices otherwise. `NodePolicy.Clone`
+	// exists for exactly this: a caller that can widen a security group after
+	// construction can move a fork's job onto a privileged network AFTER the
+	// validation that was supposed to prevent it.
+	cfg.SecurityGroupIDs = slices.Clone(cfg.SecurityGroupIDs)
+	cfg.UntrustedSecurityGroupIDs = slices.Clone(cfg.UntrustedSecurityGroupIDs)
+	cfg.InstanceTypes = slices.Clone(cfg.InstanceTypes)
 
 	p := &Provider{
 		log:   slog.Default(),
@@ -164,6 +181,13 @@ func New(owner string, cfg config.EC2Config, opts ...Option) (*Provider, error) 
 		opt(p)
 	}
 
+	// AN OPTION MUST NOT BE ABLE TO PRODUCE A PANIC. WithHTTPClient(nil) reaches
+	// the dereference below, and billet bans panic outright — a control plane that
+	// panics drops every in-flight lease.
+	if p.api.http == nil {
+		return nil, errors.New("ec2: WithHTTPClient was given no client")
+	}
+
 	// AFTER THE OPTIONS, so a client supplied by a caller is covered too.
 	//
 	// A REDIRECT MUST NOT CARRY A SIGNED REQUEST SOMEWHERE ELSE. The endpoint is
@@ -177,8 +201,13 @@ func New(owner string, cfg config.EC2Config, opts ...Option) (*Provider, error) 
 	// policy: a redirect from this endpoint is not the API answering.
 	client := *p.api.http
 	client.CheckRedirect = func(req *http.Request, _ []*http.Request) error {
-		return fmt.Errorf("ec2: refusing to follow a redirect to %s: a signed request carries a "+
-			"session token, and the ec2 api does not redirect", req.URL.Redacted())
+		// THE HOST AND NOTHING ELSE. A redirect target is chosen by whatever
+		// answered, so its query and userinfo are not billet's to render — the
+		// same rule CheckEC2Endpoint follows, and net/http wraps this in a
+		// *url.Error that embeds the URL regardless, so the message must not add
+		// to it.
+		return fmt.Errorf("ec2: refusing to follow a redirect to host %q: a signed request "+
+			"carries a session token, and the ec2 api does not redirect", req.URL.Hostname())
 	}
 
 	p.api.http = &client
@@ -585,10 +614,10 @@ func shellCommand(argv []string) (string, error) {
 //
 // What makes that safe is the state filter above: `shutting-down` is one of the
 // states List asks for, and runningState counts it as running — so the instance
-// stays in this host's INVENTORY until EC2 has finished with it, and the control
-// plane goes on charging its capacity to this node. The capacity comes back when
-// the machine is provably gone rather than when billet asked for it to go, which
-// is the rule custody follows everywhere else.
+// stays in this host's INVENTORY until EC2 has finished with it. What the control
+// plane does with that inventory is Reconcile's business, and the rule it applies
+// there is the one custody follows everywhere else: capacity comes back when the
+// compute is provably gone, not when billet asked for it to go.
 //
 // Waiting here instead would be worse: a node executes one command at a time, so
 // blocking teardown on a poll would stall every other launch and destroy behind
@@ -738,6 +767,12 @@ func (p *Provider) describe(ctx context.Context, extra ...filter) ([]*provider.I
 				// twice, silently — but only if an operator is told which instance
 				// and what to do about it. Both remedies are named, and either takes
 				// a minute.
+				// A WELL-FORMED NAME NAMING A LEASE THAT NO LONGER EXISTS IS
+				// DELIBERATELY ACCEPTED. That is an ORPHAN, which is a state the
+				// callers already handle — Sweep destroys it and releases nothing,
+				// because there is nothing to release. What this refuses is a name
+				// that identifies no lease AT ALL, which is unattributable rather
+				// than merely stale.
 				if _, ours := provider.LeaseOf(name); !ours {
 					return nil, fmt.Errorf(
 						"ec2: instance %s carries this deployment's owner tag (%s=%s) but its "+

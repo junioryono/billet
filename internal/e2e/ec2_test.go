@@ -119,29 +119,44 @@ func newFakeCloud(t *testing.T) *fakeCloud {
 
 			reply = `<TerminateInstancesResponse/>`
 
-		default: // DescribeInstances
+		case "DescribeInstances":
 			// HONOURING THE STATE FILTER, so the fake cannot flatter billet by
-			// returning rows it never asked for.
+			// returning rows it never asked for — and finding that filter BY NAME,
+			// because assuming its position is the same class of mistake billet
+			// itself made when it hard-coded Filter.2.
 			wanted := map[string]bool{}
 
-			for i := 1; ; i++ {
-				v := params.Get(fmt.Sprintf("Filter.2.Value.%d", i))
-				if v == "" {
+			for n := 1; ; n++ {
+				name := params.Get(fmt.Sprintf("Filter.%d.Name", n))
+				if name == "" {
 					break
 				}
 
-				wanted[v] = true
+				if name != "instance-state-name" {
+					continue
+				}
+
+				for i := 1; ; i++ {
+					v := params.Get(fmt.Sprintf("Filter.%d.Value.%d", n, i))
+					if v == "" {
+						break
+					}
+
+					wanted[v] = true
+				}
 			}
 
 			var b strings.Builder
 
 			b.WriteString(`<DescribeInstancesResponse><reservationSet><item><instancesSet>`)
 
-			for id, name := range f.live {
-				b.WriteString(`<item><instanceId>` + id + `</instanceId>` +
-					`<instanceState><name>running</name></instanceState><tagSet>` +
-					`<item><key>Name</key><value>` + name + `</value></item>` +
-					`</tagSet></item>`)
+			if wanted["running"] {
+				for id, name := range f.live {
+					b.WriteString(`<item><instanceId>` + id + `</instanceId>` +
+						`<instanceState><name>running</name></instanceState><tagSet>` +
+						`<item><key>Name</key><value>` + name + `</value></item>` +
+						`</tagSet></item>`)
+				}
 			}
 
 			if wanted["shutting-down"] {
@@ -155,6 +170,16 @@ func newFakeCloud(t *testing.T) *fakeCloud {
 
 			b.WriteString(`</instancesSet></item></reservationSet></DescribeInstancesResponse>`)
 			reply = b.String()
+
+		default:
+			// REFUSED RATHER THAN ANSWERED AS A DESCRIBE. A fake that treats an
+			// unrecognised action as the harmless one hides a caller asking for
+			// something nobody meant it to ask for.
+			t.Errorf("the fake was asked for an action it does not implement: %q",
+				params.Get("Action"))
+			w.WriteHeader(http.StatusBadRequest)
+
+			return
 		}
 
 		if _, err := io.WriteString(w, reply); err != nil {
@@ -389,7 +414,8 @@ func TestAJobReachesACloudInstance(t *testing.T) {
 			"lease to stay accounted for until the machine is gone", during)
 	}
 
-	// And once EC2 finishes, it leaves the inventory and the capacity is free.
+	// And once EC2 finishes, it leaves the inventory — which is what frees the
+	// capacity a step later, in Reconcile, where the ledger is what gets asserted.
 	s.cloud.finishTerminating()
 
 	after, err := s.runner.Instances(t.Context())

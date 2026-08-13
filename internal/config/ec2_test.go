@@ -414,17 +414,19 @@ func TestTheLoopbackExceptionIsNotResolved(t *testing.T) {
 // rejected by a message that rendered the password — a validation rule creating
 // the exposure it exists to prevent.
 func TestNoEndpointRefusalRendersAPassword(t *testing.T) {
+	const leaked = "hunter2hunter2"
+
 	for name, endpoint := range map[string]string{
-		"an odd scheme": "ftp://alice:secret@example.com/",
-		"plaintext":     "http://alice:secret@example.com/",
-		"unparseable":   "https://alice:secret@exa mple.com/",
-		"no host":       "https://alice:secret@/v1",
+		"an odd scheme": "ftp://alice:" + leaked + "@example.com/",
+		"plaintext":     "http://alice:" + leaked + "@example.com/",
+		"unparseable":   "https://alice:" + leaked + "@exa mple.com/",
+		"no host":       "https://alice:" + leaked + "@/v1",
 	} {
 		t.Run(name, func(t *testing.T) {
 			got := loadErr(t, cloudConfig(t, "    region: us-west-2\n",
 				"    region: us-west-2\n    endpoint: \""+endpoint+"\"\n"))
 
-			if strings.Contains(got, "secret") {
+			if strings.Contains(got, leaked) {
 				t.Errorf("the refusal rendered the password: %s", got)
 			}
 		})
@@ -450,5 +452,67 @@ func TestATierThisNodeCouldNeverBeGivenIsNotItsProblem(t *testing.T) {
 
 	if _, err := Load(writeConfig(t, body)); err != nil {
 		t.Errorf("a tier too large for this node to be given was refused: %v", err)
+	}
+}
+
+// AN ENDPOINT REFUSAL NEVER RENDERS THE ENDPOINT, whatever shape it is.
+//
+// Three attempts to render it safely were each wrong in a new way: interpolating
+// it printed a password; wrapping url.Parse's error printed one too, because
+// *url.Error embeds the whole URL; and url.Redacted masks only a HIERARCHICAL
+// url's password, leaving an opaque one and any query string intact. Both of those
+// last two were measured rather than reasoned about. So the rule is that the value
+// is never rendered at all, and these are the shapes that defeated the previous
+// rules.
+func TestAnEndpointRefusalNeverRendersTheEndpoint(t *testing.T) {
+	// A TOKEN THAT CANNOT APPEAR IN PROSE. The first version searched for the word
+	// "secret", which the refusal messages themselves contain — so it failed on
+	// their own explanation rather than on a leak.
+	const leaked = "hunter2hunter2"
+
+	for name, endpoint := range map[string]string{
+		"opaque, with a password": "http:alice:" + leaked + "@example.com",
+		"a secret in the query":   "https://example.com/?token=" + leaked,
+		"a secret in a fragment":  "https://example.com/#" + leaked,
+		"userinfo":                "https://alice:" + leaked + "@example.com/",
+		"unparseable":             "https://alice:" + leaked + "@exa mple.com/",
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := loadErr(t, cloudConfig(t, "    region: us-west-2\n",
+				"    region: us-west-2\n    endpoint: \""+endpoint+"\"\n"))
+
+			if strings.Contains(got, leaked) {
+				t.Errorf("the refusal rendered the value it is refusing: %s", got)
+			}
+		})
+	}
+}
+
+// A TIER PINNED TO THIS NODE AND TOO BIG FOR IT CAN NEVER RUN ANYWHERE.
+//
+// The skip that lets a fleet's oversized tiers load is for UNPINNED ones, which
+// belong to another machine. A pinned tier means this node or nowhere, so the same
+// skip applied to it would accept a configuration that queues forever.
+func TestATierPinnedHereAndTooBigForHereIsRefused(t *testing.T) {
+	body := cloudConfig(t, "", "")
+	body = strings.Replace(body,
+		"  - label: billet-8vcpu-ubuntu-2404\n    provider: firecracker\n    vcpu: 8\n",
+		"  - label: billet-8vcpu-ubuntu-2404\n    provider: ec2\n    node: aws-1\n    vcpu: 96\n", 1)
+
+	got := loadErr(t, body)
+
+	if !strings.Contains(got, "billet-8vcpu-ubuntu-2404") {
+		t.Errorf("the error does not name the tier: %s", got)
+	}
+}
+
+// EVERY BLANK IS REPORTED, not the first. An operator fixing one and re-running to
+// find the next is the failure mode Validate exists to avoid.
+func TestEveryBlankSecurityGroupIsReported(t *testing.T) {
+	got := loadErr(t, cloudConfig(t, "    security_group_ids: [sg-0abc]\n",
+		"    security_group_ids: [\"\", \"\"]\n"))
+
+	if strings.Count(got, "security_group_ids[") < 2 {
+		t.Errorf("only some of the blank entries were reported: %s", got)
 	}
 }

@@ -1432,16 +1432,8 @@ func (c *Config) validateEC2Node() []error {
 
 	e := c.Node.EC2
 
-	switch region := strings.TrimSpace(e.Region); {
-	case region == "":
-		errs = append(errs, errors.New("node.ec2.region is required"))
-
-	case !awsRegionRe.MatchString(region):
-		errs = append(errs, fmt.Errorf(
-			"node.ec2.region %q does not look like an aws region (expected something like "+
-				"us-west-2); it is part of the scope billet signs every request with, so an "+
-				"endpoint override cannot compensate for a typo here — the request reaches the "+
-				"right host and comes back 403", region))
+	if err := CheckEC2Region(e.Region); err != nil {
+		errs = append(errs, err)
 	}
 
 	if strings.TrimSpace(e.SubnetID) == "" {
@@ -1453,22 +1445,9 @@ func (c *Config) validateEC2Node() []error {
 		errs = append(errs, err)
 	}
 
-	// AT LEAST ONE, AND NOT DEFAULTED TO THE VPC'S DEFAULT GROUP. A default
-	// security group in a VPC somebody already had usually permits more than they
-	// are picturing, and this is the field that decides what a job can reach.
-	if len(e.SecurityGroupIDs) == 0 {
-		errs = append(errs, errors.New("node.ec2.security_group_ids needs at least one group; "+
-			"it is what decides what a running job can reach, so billet will not fall back to "+
-			"the VPC's default"))
-	}
-
-	// AN EMPTY STRING IS NOT A GROUP, and on the untrusted list it is worse than a
-	// missing key: Accepts admits fork pull-request work as soon as that list is
-	// non-empty, so one empty entry opens this backend to untrusted code with no
-	// network actually described for it.
-	errs = append(errs, emptyGroupErrors("security_group_ids", e.SecurityGroupIDs)...)
-	errs = append(errs,
-		emptyGroupErrors("untrusted_security_group_ids", e.UntrustedSecurityGroupIDs)...)
+	errs = append(errs, CheckEC2SecurityGroups("security_group_ids", e.SecurityGroupIDs, true)...)
+	errs = append(errs, CheckEC2SecurityGroups(
+		"untrusted_security_group_ids", e.UntrustedSecurityGroupIDs, false)...)
 
 	errs = append(errs, e.instanceTypeErrors()...)
 
@@ -1505,112 +1484,135 @@ func (e *EC2Config) normalize() {
 	}
 }
 
-// emptyGroupErrors reports blank entries in a security group list.
-func emptyGroupErrors(field string, groups []string) []error {
-	if err := CheckEC2SecurityGroups(field, groups); err != nil {
-		return []error{err}
-	}
-
-	return nil
-}
-
-// CheckEC2SecurityGroups refuses a list holding a blank entry.
+// CheckEC2SecurityGroups refuses a list billet cannot safely launch against.
 //
 // EXPORTED AND CALLED FROM BOTH SIDES, like CheckEC2Endpoint and for the same
 // reason: the provider's constructor is exported and cannot assume its
-// configuration came through Load. It matters most on the untrusted list, where
-// Accepts admits fork pull-request work as soon as the list is non-empty — so a
-// list holding one empty string opens the backend to untrusted code with no
-// network actually described for it.
-func CheckEC2SecurityGroups(field string, groups []string) error {
+// configuration came through Load.
+//
+// BOTH HALVES OF THE RULE LIVE HERE. An earlier version exported only the
+// blank-entry half, so the constructor accepted a config with NO trusted group at
+// all — and RunInstances without a group lets EC2 pick the VPC's default, which in
+// a VPC somebody already had usually permits a good deal more than they are
+// picturing. A rule split across two places has an entry point that does not
+// enforce it, which is the thing exporting it was meant to fix.
+//
+// `required` is false for the untrusted list, where EMPTY IS MEANINGFUL: its
+// absence is what refuses fork pull-request work.
+func CheckEC2SecurityGroups(field string, groups []string, required bool) []error {
+	var errs []error
+
+	if required && len(groups) == 0 {
+		errs = append(errs, fmt.Errorf("node.ec2.%s needs at least one group; it is what decides "+
+			"what a running job can reach, so billet will not fall back to the VPC's default",
+			field))
+	}
+
+	// EVERY BLANK, not the first: an operator fixing one and re-running to find
+	// the next is the failure mode Validate exists to avoid.
 	for i, g := range groups {
 		if strings.TrimSpace(g) == "" {
-			return fmt.Errorf(
+			errs = append(errs, fmt.Errorf(
 				"node.ec2.%s[%d] is empty; an empty string is not a security group, and on the "+
 					"untrusted list a non-empty list is what admits fork pull-request work",
-				field, i)
+				field, i))
 		}
+	}
+
+	return errs
+}
+
+// CheckEC2Region refuses a region that is not one.
+//
+// EXPORTED, because a region is not only an address: it is interpolated into the
+// DEFAULT ENDPOINT HOST, and it is part of the scope every request is signed with.
+// The first of those is why the provider's constructor re-applies it — measured,
+// a region of `x@attacker.example/?` produces a default endpoint whose host is
+// `attacker.example`, and the signed request and its session token go there.
+//
+// A SHAPE RATHER THAN A LIST. An allowlist goes stale the next time AWS opens a
+// region, and being stale means refusing a config that is correct. The shape
+// catches the mistake people make, which is dropping the hyphens, and still
+// admits partitions billet has never run in.
+func CheckEC2Region(region string) error {
+	region = strings.TrimSpace(region)
+
+	if region == "" {
+		return errors.New("node.ec2.region is required")
+	}
+
+	if !awsRegionRe.MatchString(region) {
+		return fmt.Errorf(
+			"node.ec2.region %q does not look like an aws region (expected something like "+
+				"us-west-2); it is signed into every request and interpolated into the default "+
+				"endpoint, so an endpoint override cannot compensate for a typo here", region)
 	}
 
 	return nil
 }
 
-// CheckEC2Endpoint refuses an endpoint that would carry a credential in the clear.
+// CheckEC2Endpoint refuses an endpoint that would carry a credential in the clear
+// or send a signed request somewhere billet did not mean.
 //
-// EXPORTED AND CALLED FROM BOTH SIDES, the way alloc re-applies the safety rules
-// it cannot assume came through Load. The ec2 provider is constructible directly,
-// so a rule enforced only here has a second entry point that does not enforce it.
+// NOTHING HERE RENDERS THE ENDPOINT, and that is the rule rather than an
+// oversight. Every attempt to render it safely was wrong in a new way:
+// interpolating it printed a password; wrapping url.Parse's error printed one too,
+// because *url.Error embeds the whole URL; and url.Redacted masks only a
+// HIERARCHICAL url's password, so it leaves an opaque one
+// (`http:alice:secret@host`) and any `?token=` query completely intact. Both
+// measured. Naming the field and the failed component tells an operator
+// everything they can act on and cannot leak anything.
 //
-// The secret access key never crosses the wire, but a SESSION TOKEN and a
-// replayable signed request do, so plaintext hands both to anyone on the path.
-//
-// LOOPBACK IS THE EXCEPTION, and it is billet's existing rule rather than a new
-// one: a loopback wire has no certificates at all, because there the trust
+// LOOPBACK IS THE EXCEPTION to https, and it is billet's existing rule rather than
+// a new one: a loopback wire has no certificates at all, because there the trust
 // boundary is the machine itself.
 func CheckEC2Endpoint(endpoint string) error {
-	if endpoint == "" {
+	if strings.TrimSpace(endpoint) == "" {
 		return nil
 	}
 
 	u, err := url.Parse(endpoint)
 	if err != nil {
-		// NEITHER THE STRING NOR THE PARSE ERROR IS RENDERED. url.Parse fails with
-		// a *url.Error, and that type EMBEDS THE WHOLE URL in its own message — so
-		// wrapping it verbatim prints the password just as surely as printing the
-		// endpoint would. Only the reason underneath it is safe, and it is the only
-		// part that says anything an operator can act on.
-		reason := err
-
-		var uerr *url.Error
-		if errors.As(err, &uerr) {
-			reason = uerr.Err
-		}
-
-		return fmt.Errorf("node.ec2.endpoint is not a url: %w", reason)
+		return errors.New("node.ec2.endpoint is not a url")
 	}
 
-	// USERINFO IS CHECKED BEFORE ANYTHING ELSE CAN RENDER THE URL, and that
-	// ordering is the whole point rather than a style choice. Checking the scheme
-	// first meant `ftp://alice:secret@example.com` was refused by a message that
-	// printed the password it was refusing — a validation rule that creates the
-	// exposure it exists to prevent.
-	//
-	// billet authenticates with SigV4, so a username and password in the endpoint
-	// authenticate nothing. They are pure exposure.
+	if u.Opaque != "" {
+		return errors.New("node.ec2.endpoint is not a url billet can dial: it has no // and " +
+			"therefore no host, so nothing says which machine to sign a request for")
+	}
+
 	if u.User != nil {
-		return fmt.Errorf("node.ec2.endpoint must not carry a username or password: billet "+
-			"authenticates with a request signature, so it would be a credential in a string "+
-			"that gets logged and nothing else (host %s)", u.Hostname())
+		return errors.New("node.ec2.endpoint must not carry a username or password: billet " +
+			"authenticates with a request signature, so one would be a credential in a string " +
+			"that gets logged and nothing else")
 	}
 
-	// THE SCHEME IS CHECKED NEXT, because a bare `ec2.us-west-2.amazonaws.com`
-	// parses as a PATH — so asking about the host first answers "names no host",
-	// which sends an operator looking for a typo in a hostname that is correct.
+	if u.RawQuery != "" || u.Fragment != "" {
+		return errors.New("node.ec2.endpoint must not carry a query string or fragment: billet " +
+			"builds every request itself, so anything there is either ignored or a secret in a " +
+			"value that gets logged")
+	}
+
 	if u.Scheme != "https" && u.Scheme != "http" {
-		return endpointNeedsHTTPS(u)
+		return errEndpointNeedsHTTPS
 	}
 
 	if u.Hostname() == "" {
-		return fmt.Errorf("node.ec2.endpoint %q names no host", u.Redacted())
+		return errors.New("node.ec2.endpoint names no host")
 	}
 
 	if u.Scheme == "https" || isLoopbackHost(u.Hostname()) {
 		return nil
 	}
 
-	return endpointNeedsHTTPS(u)
+	return errEndpointNeedsHTTPS
 }
 
-// endpointNeedsHTTPS renders the refusal through url.Redacted, which replaces a
-// password with "xxxxx" — belt and braces, since userinfo is already refused
-// above, and the cheaper habit to keep than remembering which paths are safe.
-func endpointNeedsHTTPS(u *url.URL) error {
-	return fmt.Errorf(
-		"node.ec2.endpoint %q must use https: billet signs each request and sends a session "+
-			"token with it, so plaintext hands an on-path observer a replayable request. Only a "+
-			"loopback address may use http, where the trust boundary is the machine itself",
-		u.Redacted())
-}
+// errEndpointNeedsHTTPS names the rule without naming the value.
+var errEndpointNeedsHTTPS = errors.New(
+	"node.ec2.endpoint must use https: billet signs each request and sends a session token with " +
+		"it, so plaintext hands an on-path observer a replayable request. Only a loopback " +
+		"address may use http, where the trust boundary is the machine itself")
 
 // isLoopbackHost reports whether a host names this machine.
 func isLoopbackHost(host string) bool {
@@ -2196,8 +2198,11 @@ func (c *Config) validateEC2Shapes() []error {
 		//
 		// What remains refused is the case that really is broken: a tier this node
 		// IS eligible for, and no declared shape can buy.
-		if (c.Node.MaxVCPU > 0 && t.VCPU > c.Node.MaxVCPU) ||
-			(c.Node.MaxMemory > 0 && t.Memory > c.Node.MaxMemory) {
+		// A PINNED TIER IS NOT LET THROUGH BY THAT, and the distinction is the
+		// whole point: pinned means this node or nowhere, so oversize is not
+		// "another machine's job" — it is a tier that can never run at all.
+		if t.Node == "" && ((c.Node.MaxVCPU > 0 && t.VCPU > c.Node.MaxVCPU) ||
+			(c.Node.MaxMemory > 0 && t.Memory > c.Node.MaxMemory)) {
 			continue
 		}
 
