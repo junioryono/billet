@@ -250,6 +250,17 @@ func execRunner(ctx context.Context, bin string, args []string) ([]byte, error) 
 		return nil, err
 	}
 
+	// THE SUCCESSFUL HALF OF THE SAME RACE. A process that exits ZERO with a
+	// descendant still holding the pipe never produces an ExitError at all — Wait
+	// returns ErrWaitDelay — so the branch above cannot see it, and it would fall
+	// through to be reported as a timeout with its output discarded. rbd had
+	// already written the listing and said it was fine; the only thing that went
+	// wrong is that something else kept a file descriptor. If the bytes are short,
+	// the caller's json.Unmarshal says so in a sentence naming the pool.
+	if errors.Is(err, exec.ErrWaitDelay) && cmd.ProcessState != nil && cmd.ProcessState.ExitCode() == 0 {
+		return out, nil
+	}
+
 	// THE DEADLINE IS REPORTED AS THE DEADLINE. Without this a caller asking
 	// errors.Is(err, context.DeadlineExceeded) — the only way to tell "the cluster
 	// never answered" from "rbd said no" — gets false for the one condition it
@@ -336,12 +347,22 @@ func lastLine(s string) string {
 	line := strings.TrimSpace(lines[len(lines)-1])
 
 	if len(line) > maxDiagnostic {
-		// AT A RUNE BOUNDARY. rbd's diagnostics are not guaranteed to be ASCII —
-		// a pool name is whatever the operator typed — and cutting a byte slice
-		// mid-rune puts invalid UTF-8 into an error string that is then printed,
-		// logged and marshalled.
-		return strings.ToValidUTF8(line[:maxDiagnostic], "") + "…"
+		return sanitize(line[:maxDiagnostic]) + "…"
 	}
 
-	return line
+	// UNCONDITIONALLY, NOT ONLY WHEN THIS FUNCTION TRUNCATES. tailWriter has
+	// already cut the tail to exactly maxDiagnostic bytes by the time this runs, so
+	// the branch above is FALSE on the real path and a repair that lived only there
+	// would never execute — the input arrives already split mid-rune. Found by
+	// review after the first fix, which was correct and unreachable.
+	return sanitize(line)
 }
+
+// sanitize drops the bytes that are not text.
+//
+// rbd's diagnostics are not guaranteed to be ASCII — a pool name is whatever the
+// operator typed — and a byte-level truncation anywhere upstream can leave half a
+// rune, which then reaches an error string that is printed, logged and marshalled.
+// Dropping is right rather than replacing: the replacement character would be
+// billet adding a glyph to somebody else's message.
+func sanitize(s string) string { return strings.ToValidUTF8(s, "") }

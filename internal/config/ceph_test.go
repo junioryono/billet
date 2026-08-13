@@ -1,6 +1,7 @@
 package config
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
@@ -194,6 +195,8 @@ func TestAPoolNameBilletCannotAddressIsRefused(t *testing.T) {
 		{name: "something rbd reads as an option", pool: "-p", want: "starting with a dash"},
 		{name: "any leading dash, not the fixture", pool: "-billet-images", want: "starting with a dash"},
 		{name: "any of ceph's own namespace", pool: ".billet", want: "reserves for its"},
+		{name: "a lone dash", pool: "-", want: "starting with a dash"},
+		{name: "a lone dot", pool: ".", want: "reserves for its"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -314,7 +317,7 @@ func TestCephValuesAreTrimmed(t *testing.T) {
 	body := withCeph(t, `  ceph:
     user: "  billet  "
     image_pool: "\tbillet-images \n"
-    cache_pool: "  billet-cache  "
+    cache_pool: "  billet-cache\r"
     conf_path: "  /etc/ceph/ceph.conf  "
     keyring_path: "  /etc/ceph/ceph.client.billet.keyring  "
 `)
@@ -454,7 +457,7 @@ func TestAHintIsNotOfferedForADifferentSectionsKey(t *testing.T) {
 func TestAnIdentityBilletCannotPassIsRefused(t *testing.T) {
 	t.Parallel()
 
-	for _, user := range []string{"client.billet", "client.anything-at-all"} {
+	for _, user := range []string{"client.billet", "client.anything-at-all", "client."} {
 		t.Run("the prefix rbd adds itself: "+user, func(t *testing.T) {
 			t.Parallel()
 
@@ -476,6 +479,7 @@ func TestAnIdentityBilletCannotPassIsRefused(t *testing.T) {
 	for _, tc := range []struct{ name, user string }{
 		{name: "a leading dash, which --id consumes as a value", user: "-weird"},
 		{name: "a slash, which ceph auth accepts", user: "billet/node"},
+		{name: "client. somewhere other than the front", user: "a.client.b"},
 		{name: "a space, which ceph auth accepts", user: "bil let"},
 	} {
 		t.Run("addressable: "+tc.name, func(t *testing.T) {
@@ -509,6 +513,12 @@ func TestANulByteIsRefused(t *testing.T) {
 		{
 			name:  "in the identity",
 			cfg:   CephConfig{User: "bil\x00let", ImagePool: "billet-images", CachePool: "billet-cache"},
+			field: "node.ceph.user",
+		},
+		{
+			// LEADING, so a check written as IndexByte(...) > 0 does not survive.
+			name:  "at the very front",
+			cfg:   CephConfig{User: "\x00billet", ImagePool: "billet-images", CachePool: "billet-cache"},
 			field: "node.ceph.user",
 		},
 		{
@@ -655,4 +665,108 @@ func TestEveryRemovedKeyIsExplainedInOnePass(t *testing.T) {
 			t.Errorf("%q appears %d times: %v", once, n, err)
 		}
 	}
+}
+
+// THE DOCUMENTED DOCKER CONVERSION MUST ACTUALLY LOAD.
+//
+// billet.example.yaml describes the Firecracker deployment and says which edits
+// turn it into one that runs today. TestExampleConfigIsValid proves the file
+// parses as shipped; nothing proved the CONVERSION does — and it stopped working
+// the moment `node.ceph` became a refusal rather than an inert block, because the
+// header still listed two edits. An operator following the instructions got
+// "node.ceph is set but this node's provider is docker" and no clue that the
+// example's own header was out of date.
+//
+// The edits here are the ones the header lists, in the same order, and each is
+// asserted to have changed something — an instruction that silently matches
+// nothing is how this file and its documentation drift apart again.
+func TestTheDocumentedDockerConversionLoads(t *testing.T) {
+	t.Parallel()
+
+	body, err := os.ReadFile("../../billet.example.yaml")
+	if err != nil {
+		t.Fatalf("read the example: %v", err)
+	}
+
+	text := string(body)
+
+	// Edit 1: the provider, in the node section and in every tier. ANCHORED ON THE
+	// NEWLINE, because the node's two-space form is a substring of a tier's
+	// four-space one — replacing it first consumed both and left the second
+	// instruction matching nothing.
+	for _, from := range []string{"\n    provider: firecracker\n", "\n  provider: firecracker\n"} {
+		if !strings.Contains(text, from) {
+			t.Fatalf("the example no longer contains %q, so edit 1 patches nothing", from)
+		}
+
+		text = strings.ReplaceAll(text, from, strings.Replace(from, "firecracker", "docker", 1))
+	}
+
+	// Edit 2: delete the ceph block — everything from its key to the next line at
+	// the same indentation.
+	text = deleteBlock(t, text, "  ceph:")
+
+	// Edit 3: a pullable image.
+	if !strings.Contains(text, "image: ubuntu-2404-x64") {
+		t.Fatal("the example no longer names a golden image, so edit 3 patches nothing")
+	}
+
+	text = strings.ReplaceAll(text, "image: ubuntu-2404-x64", "image: ghcr.io/actions/actions-runner:latest")
+
+	// And what the README's quickstart supplies rather than the file: `billet
+	// github-app create` fills these in.
+	text = strings.Replace(text, "app_id: 0", "app_id: 12345", 1)
+	text = strings.Replace(text, "installation_id: 0", "installation_id: 67890", 1)
+
+	cfg, err := Load(writeConfig(t, text))
+	if err != nil {
+		t.Fatalf("the conversion billet.example.yaml documents does not load: %v", err)
+	}
+
+	if cfg.Node.Provider != ProviderDocker {
+		t.Errorf("node.provider = %q after edit 1", cfg.Node.Provider)
+	}
+
+	if cfg.Node.Ceph != nil {
+		t.Error("the ceph block survived edit 2")
+	}
+}
+
+// deleteBlock removes a YAML mapping key and everything indented under it.
+func deleteBlock(t *testing.T, text, key string) string {
+	t.Helper()
+
+	lines := strings.Split(text, "\n")
+	indent := len(key) - len(strings.TrimLeft(key, " "))
+
+	start := -1
+
+	for i, l := range lines {
+		if l == key {
+			start = i
+
+			break
+		}
+	}
+
+	if start < 0 {
+		t.Fatalf("the example has no %q block, so this edit removes nothing", strings.TrimSpace(key))
+	}
+
+	end := len(lines)
+
+	for i := start + 1; i < len(lines); i++ {
+		l := lines[i]
+		if strings.TrimSpace(l) == "" {
+			continue
+		}
+
+		if len(l)-len(strings.TrimLeft(l, " ")) <= indent {
+			end = i
+
+			break
+		}
+	}
+
+	return strings.Join(append(append([]string{}, lines[:start]...), lines[end:]...), "\n")
 }
