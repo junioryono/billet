@@ -1064,29 +1064,55 @@ func Load(path string) (*Config, error) {
 //
 // KnownFields cannot tell a typo from a removal. For a typo that is the whole
 // story; for a setting that was correct when the operator wrote it and has since
-// moved roles, the message names the key they already know about and says nothing
-// about what to do.
+// moved or been replaced, the message names the key they already know about and
+// says nothing about what to do.
+//
+// Pre-1.0 billet may break an existing config. It may NOT break one confusingly,
+// and `field zfs_pool not found in type config.FirecrackerConfig` is exactly that:
+// it names the key the operator wrote and nothing about the storage that replaced
+// it.
 func relocatedKeyHint(err error) error {
-	moved := map[string]string{
-		"lock_dir":                  "node.lock_dir",
-		"allow_unlocked_deployment": "node.allow_unlocked_deployment",
-	}
-
 	msg := err.Error()
 
-	for key, home := range moved {
-		if !strings.Contains(msg, "field "+key+" not found in type config.ServerConfig") {
-			continue
+	for _, hint := range keyHints {
+		if strings.Contains(msg, hint.needle) {
+			return fmt.Errorf("%w\n\n%s", err, hint.advice)
 		}
-
-		return fmt.Errorf("%w\n\nserver.%s has moved to %s. The host-wide deployment lock "+
-			"stops two processes managing one deployment's containers, and a control plane "+
-			"manages none — the node takes it. A server that held it too would keep a node on "+
-			"the same machine from ever starting, which is the single-machine deployment: "+
-			"`billet server` and `billet node` side by side", err, key, home)
 	}
 
 	return err
+}
+
+// keyHints maps the exact text KnownFields produces onto what to do about it.
+//
+// MATCHED ON THE WHOLE "field X not found in type Y" STRING rather than on the
+// key alone, because the same key name can legitimately exist in another section
+// and the advice for server.lock_dir is wrong for anything else called lock_dir.
+var keyHints = []struct{ needle, advice string }{
+	{
+		needle: "field lock_dir not found in type config.ServerConfig",
+		advice: "server.lock_dir has moved to node.lock_dir. The host-wide deployment lock stops " +
+			"two processes managing one deployment's containers, and a control plane manages " +
+			"none — the node takes it. A server that held it too would keep a node on the same " +
+			"machine from ever starting, which is the single-machine deployment: `billet server` " +
+			"and `billet node` side by side",
+	},
+	{
+		needle: "field allow_unlocked_deployment not found in type config.ServerConfig",
+		advice: "server.allow_unlocked_deployment has moved to node.allow_unlocked_deployment, " +
+			"for the same reason server.lock_dir did: the lock belongs to the role that manages " +
+			"containers",
+	},
+	{
+		needle: "field zfs_pool not found in type config.FirecrackerConfig",
+		advice: "node.firecracker.zfs_pool is gone. billet's storage is a Ceph cluster now, " +
+			"configured as node.ceph with image_pool and cache_pool — a sibling of the " +
+			"firecracker block, because storage belongs to the site rather than to the compute " +
+			"backend. A ZFS clone exists only on the machine that took it, so a cache written to " +
+			"one belonged to that host and to no other, which is the storage half of billet " +
+			"being a one-machine product. docs/adr-003-ceph-rbd.md is how to build the cluster; " +
+			"billet.example.yaml has the block to copy",
+	},
 }
 
 func (c *Config) applyDefaults() {

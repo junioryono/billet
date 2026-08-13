@@ -365,3 +365,54 @@ func joinErrors(errs []error) string {
 
 	return strings.Join(parts, "\n")
 }
+
+// A CONFIG THAT WAS CORRECT LAST WEEK MUST NOT FAIL BAFFLINGLY.
+//
+// Pre-1.0 billet is allowed to break an existing config; it is not allowed to
+// break one with `field zfs_pool not found in type config.FirecrackerConfig`,
+// which names the key the operator wrote and nothing about what replaced it.
+// KnownFields cannot tell a removal from a typo, so the removal is listed.
+func TestTheOldZFSKeyExplainsWhatReplacedIt(t *testing.T) {
+	t.Parallel()
+
+	body := strings.Replace(withoutCeph(t),
+		"    kernel_image: /var/lib/billet/vmlinux\n",
+		"    kernel_image: /var/lib/billet/vmlinux\n    zfs_pool: tank\n", 1)
+	if !strings.Contains(body, "zfs_pool: tank") {
+		t.Fatal("the firecracker block has changed, so this case adds nothing")
+	}
+
+	_, err := Load(writeConfig(t, body))
+	if err == nil {
+		t.Fatal("Load accepted a config still naming zfs_pool")
+	}
+
+	for _, want := range []string{"node.ceph", "image_pool", "cache_pool", "adr-003"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the error does not point at %s: %v", want, err)
+		}
+	}
+}
+
+// THE HINT IS KEYED ON THE WHOLE "field X not found in type Y" STRING, not on the
+// key alone.
+//
+// The same key name can legitimately exist in another section, and advice about
+// the deployment lock attached to an unrelated `lock_dir` is worse than no advice:
+// it sends an operator to a field they did not touch.
+func TestAHintIsNotOfferedForADifferentSectionsKey(t *testing.T) {
+	t.Parallel()
+
+	// node.lock_dir is where lock_dir actually lives, so a bogus one under
+	// `github:` must draw the plain unknown-field error.
+	body := strings.Replace(validConfig, "  org: acme\n", "  org: acme\n  lock_dir: /run/billet\n", 1)
+
+	_, err := Load(writeConfig(t, body))
+	if err == nil {
+		t.Fatal("Load accepted an unknown field under github")
+	}
+
+	if strings.Contains(err.Error(), "has moved to node.lock_dir") {
+		t.Errorf("a key in an unrelated section drew the server.lock_dir advice: %v", err)
+	}
+}
