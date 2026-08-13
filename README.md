@@ -446,7 +446,11 @@ another, so a cache kept in local storage is a cache that pins every repository 
 first built it. Ceph RBD gives the same snapshot-and-clone primitive from a pool any node at the site
 can map, which is what makes a cache a property of a *place* rather than of a machine — and it is
 what the commercial products run. billet installs nothing: you run `cephadm bootstrap`, create two
-pools, and point `node.ceph` at them, the same way you install Docker or Tart yourself. On a single
+pools, run `ceph osd set-require-min-compat-client mimic`, and point `node.ceph` at them, the same way
+you install Docker or Tart yourself. That last command is not optional and `billet check` refuses a
+cluster without it: `cephadm` leaves a cluster cloning the old way, where a snapshot must be protected
+before it can be cloned and a protected snapshot with a live clone can be neither unprotected nor
+removed — so a cache generation any running job holds would be undeletable. On a single
 box it is honestly more moving parts than the ZFS pool it replaced ([#23](https://github.com/junioryono/billet/issues/23)),
 and the reason to adopt it anyway is that retrofitting shared storage later means rewriting placement
 at the same time. [`docs/adr-003-ceph-rbd.md`](docs/adr-003-ceph-rbd.md) is how the reference cluster
