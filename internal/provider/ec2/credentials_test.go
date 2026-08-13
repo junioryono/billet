@@ -489,8 +489,13 @@ func TestRoleCredentialsAreCachedAndReplacedBeforeTheyLapse(t *testing.T) {
 // final failure sends an operator to a link-local timeout when what they actually
 // did was forget an environment variable.
 func TestAChainWithNothingReportsWhatEachSourceSaid(t *testing.T) {
-	t.Setenv("AWS_ACCESS_KEY_ID", "")
-	t.Setenv("AWS_SECRET_ACCESS_KEY", "")
+	// ALL THREE, because these read the real environment: an ambient
+	// AWS_SESSION_TOKEN makes the environment source fail TERMINALLY, so the chain
+	// stops before IMDS and this test passes or fails depending on whose machine it
+	// runs on.
+	for _, k := range []string{"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"} {
+		t.Setenv(k, "")
+	}
 
 	// AN INSTANCE WITH NO ROLE, not one whose metadata service is broken. The
 	// difference is the point: a chain continues past a source that HAS nothing and
@@ -512,14 +517,22 @@ func TestAChainWithNothingReportsWhatEachSourceSaid(t *testing.T) {
 		t.Errorf("a chain whose every source was empty did not report an absence: %v", err)
 	}
 
-	// BOTH REASONS, named distinguishably. Asserting only the last one is satisfied
-	// by an implementation that returns just the last one, which is the thing this
-	// test exists to refuse.
-	for _, want := range []string{"no aws credentials", "instance profile"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("a source's reason was lost from the chain's error (%q missing): %v",
-				want, err)
-		}
+	// COUNTED, NOT MERELY PRESENT, and that distinction is the assertion.
+	//
+	// Both sources here report an absence, and the IMDS one WRAPS the sentinel — so
+	// its message alone contains "instance profile" and "no aws credentials"
+	// together, and asking whether each string appears is satisfied by returning
+	// only the last reason. That is exactly the implementation this test exists to
+	// refuse, and an earlier version of it could not.
+	//
+	// Two occurrences means two sources answered.
+	if got := strings.Count(err.Error(), errNoCredentials.Error()); got != 2 {
+		t.Errorf("the chain's error carries %d source reasons, want one from each of its two: %v",
+			got, err)
+	}
+
+	if !strings.Contains(err.Error(), "instance profile") {
+		t.Errorf("the instance role's own reason was lost: %v", err)
 	}
 }
 
