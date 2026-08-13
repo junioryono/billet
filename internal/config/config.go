@@ -1074,13 +1074,23 @@ func Load(path string) (*Config, error) {
 func relocatedKeyHint(err error) error {
 	msg := err.Error()
 
+	// EVERY MATCH, not the first. KnownFields reports all the unknown fields it
+	// found in one error, so a file carrying both `server.lock_dir` and
+	// `node.firecracker.zfs_pool` gets both answers — returning inside the loop
+	// sent the operator round again for the second one.
+	var advice []string
+
 	for _, hint := range keyHints {
 		if strings.Contains(msg, hint.needle) {
-			return fmt.Errorf("%w\n\n%s", err, hint.advice)
+			advice = append(advice, hint.advice)
 		}
 	}
 
-	return err
+	if len(advice) == 0 {
+		return err
+	}
+
+	return fmt.Errorf("%w\n\n%s", err, strings.Join(advice, "\n\n"))
 }
 
 // keyHints maps the exact text KnownFields produces onto what to do about it.
@@ -1557,6 +1567,15 @@ func CheckCeph(p CephConfig) []error {
 			errs = append(errs, fmt.Errorf("node.ceph.%s %q has leading or trailing whitespace; "+
 				"billet passes it to the rbd client exactly as written", f.field, f.value))
 		}
+
+		// A NUL CANNOT BE CARRIED BY AN ARGV AT ALL. YAML can encode one, and it
+		// passes every shape check here — including filepath.IsAbs — so without this
+		// billet accepts a configuration that exec refuses before rbd ever starts,
+		// with an error naming neither the field nor the byte.
+		if strings.IndexByte(f.value, 0) >= 0 {
+			errs = append(errs, fmt.Errorf("node.ceph.%s contains a NUL byte, which cannot be "+
+				"passed to a command at all", f.field))
+		}
 	}
 
 	// admin IS THE DEFAULT THE rbd COMMAND WOULD PICK, which is what makes naming
@@ -1597,31 +1616,27 @@ func CheckCeph(p CephConfig) []error {
 	return errs
 }
 
-// checkCephIdentity refuses a RADOS identity that would not survive being placed
-// in an argv.
+// checkCephIdentity refuses an identity that would authenticate as something else.
 //
-// THE SAME RULE AS A POOL NAME, and it exists because the first version had it
-// only for pools. The identity is passed as the value of `--id`, so one beginning
-// with a dash is read by rbd as an option rather than as a name — and billet execs
-// rbd directly, where nothing quotes a value out of being a flag. `client.` is
-// refused as a prefix because rbd adds it: `--id client.billet` authenticates as
-// `client.client.billet`, which fails with a permission error naming an entity the
-// operator never created.
+// ONE RULE, AND IT IS THE ONLY ONE THAT SURVIVED BEING MEASURED. rbd prefixes the
+// value of --id with `client.` itself, so `--id client.billet` asks the cluster
+// about `client.client.billet`: run against a working deployment it answers
+// `(13) Permission denied` while the plain form lists the pool, and the error names
+// an entity the operator never created.
+//
+// The shapes that were refused alongside it are not refused any more, because the
+// reasons given for them were reasoning rather than measurement — the mistake this
+// repo has already made once, with the runner-group validator. `rbd --id -weird`
+// does NOT read the value as an option: --id requires a value and program_options
+// consumes the next token whatever it starts with, so a leading dash is addressable.
+// Whitespace and slashes are addressable too — `ceph auth get-or-create` accepts
+// `client.a/b` and `client.a b`, and each is a single argv element. A pool name is
+// different, and checkCephPool says why.
 func checkCephIdentity(user string) []error {
-	if strings.HasPrefix(user, "-") {
-		return []error{fmt.Errorf("node.ceph.user %q begins with a dash, which the rbd client "+
-			"reads as a flag rather than as an identity", user)}
-	}
-
 	if strings.HasPrefix(user, "client.") {
 		return []error{fmt.Errorf("node.ceph.user %q carries the `client.` prefix, which rbd adds "+
 			"itself: billet would authenticate as client.%s, which is not an entity your cluster "+
 			"has", user, user)}
-	}
-
-	if strings.ContainsFunc(user, unicode.IsSpace) || strings.Contains(user, "/") {
-		return []error{fmt.Errorf("node.ceph.user %q contains whitespace or a slash, which is not "+
-			"part of a ceph entity name and will not round-trip through the client", user)}
 	}
 
 	return nil
@@ -1629,12 +1644,26 @@ func checkCephIdentity(user string) []error {
 
 // checkCephPool refuses a pool name billet cannot address.
 //
-// PINNED TO WHAT THE rbd CLIENT DOES, not to a reading of Ceph's naming rules.
-// billet addresses an image as `pool/image`, so the characters that matter are
-// the ones that change how that string parses — a `/` splits it somewhere else
-// and a `@` starts a snapshot. Ceph reserves a leading `.` for its own pools
-// (`.mgr`), and `rbd` reads a leading `-` as a flag. Everything else is Ceph's to
-// accept or refuse, and it says so plainly when it refuses.
+// EVERY RULE HERE IS PINNED TO MEASURED BEHAVIOUR, because Ceph is more permissive
+// than it looks: it creates pools named `a/b`, `a@b`, `a b` and `a\tb` without
+// complaint. So the question is never "is this a legal pool name", it is "does
+// billet address it correctly", and the answers came from running rbd rather than
+// from reading it.
+//
+//   - `/` and `@` — a pool name is only half of what billet builds. Images are
+//     addressed as `pool/image` and snapshots as `pool/image@snap`, so either
+//     character makes the spec parse somewhere else.
+//   - a leading `-` — and NOT because of `-p`, which consumes the next token
+//     whatever it starts with. Those specs are POSITIONAL arguments:
+//     `rbd info -weirdpool/nothing` answers `unrecognised option
+//     '-weirdpool/nothing'` where the same call on an ordinary pool reaches the
+//     image.
+//   - a leading `.` — refused by Ceph itself ("pool names beginning with . are not
+//     allowed"), so this is billet saying so at load rather than at first launch.
+//
+// Interior whitespace was refused too and is not any more: it is addressable at
+// every layer measured, and a rule whose stated reason is untrue is worse than no
+// rule. Padding is a different matter and CheckCeph refuses it.
 func checkCephPool(field, pool string) []error {
 	if pool == "" {
 		return []error{fmt.Errorf("node.ceph.%s is required", field)}
@@ -1645,29 +1674,22 @@ func checkCephPool(field, pool string) []error {
 		reason string
 	}{
 		{"/", "billet addresses an image as pool/image, so a slash points at a different pool"},
-		{"@", "rbd reads @ as the start of a snapshot name"},
+		{"@", "billet addresses a snapshot as pool/image@snap, so an @ starts a snapshot name"},
 	} {
 		if strings.Contains(pool, bad.what) {
 			return []error{fmt.Errorf("node.ceph.%s %q contains %q: %s", field, pool, bad.what, bad.reason)}
 		}
 	}
 
-	// ANY WHITESPACE, not the ASCII space alone. A tab inside a quoted YAML scalar
-	// survives the parser and would be passed to rbd verbatim, and checking for
-	// " " admits it.
-	if strings.ContainsFunc(pool, unicode.IsSpace) {
-		return []error{fmt.Errorf("node.ceph.%s %q contains whitespace, which is not part of a "+
-			"pool name and will not round-trip through the client", field, pool)}
-	}
-
 	if strings.HasPrefix(pool, ".") {
 		return []error{fmt.Errorf("node.ceph.%s %q begins with a dot, which ceph reserves for its "+
-			"own pools such as .mgr", field, pool)}
+			"own pools such as .mgr and refuses to create", field, pool)}
 	}
 
 	if strings.HasPrefix(pool, "-") {
-		return []error{fmt.Errorf("node.ceph.%s %q begins with a dash, which the rbd client reads "+
-			"as a flag rather than as a pool", field, pool)}
+		return []error{fmt.Errorf("node.ceph.%s %q begins with a dash: billet addresses images as "+
+			"positional pool/image arguments, and rbd reads one starting with a dash as an "+
+			"option it does not recognise", field, pool)}
 	}
 
 	return nil
