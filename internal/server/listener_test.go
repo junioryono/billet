@@ -20,7 +20,8 @@ import (
 )
 
 // cancelWhen cancels a running listener once cond holds, rather than after a
-// fixed sleep.
+// fixed sleep. The returned function stops the watcher and JOINS it; call it with
+// defer.
 //
 // A SLEEP IS NOT A SYNCHRONISATION PRIMITIVE, and this is exactly where that bit.
 // Three tests here slept 150-200ms and then cancelled, assuming the listener had
@@ -29,34 +30,54 @@ import (
 // consecutive local runs under -race and coverage, which is the shape of a defect
 // that trains you to re-run CI instead of reading it.
 //
-// The watchdog is long on purpose. It bounds a HANG rather than the work — if the
-// condition is ever going to hold it holds in milliseconds, so a generous ceiling
-// costs nothing on a healthy run and still turns a genuine deadlock into a failure
-// with a message instead of a package timeout.
-func cancelWhen(t *testing.T, cancel context.CancelFunc, what string, cond func() bool) {
+// NOTHING IN THE GOROUTINE TOUCHES t, and the join is why. The first version of
+// this helper carried its own 30-second watchdog and called t.Errorf from inside
+// the goroutine — while every caller uses a 10-second context. So a condition that
+// never held meant Run returned at 10s, the test finished, and twenty seconds
+// later a dead test's Errorf panicked the whole process. Go fails hard on exactly
+// that, and this repository's own testing rules forbid a goroutine outliving its
+// test. The caller's context deadline is the watchdog now; the watcher only ever
+// calls cancel, and the report happens on the test's own goroutine at defer time.
+func cancelWhen(t *testing.T, ctx context.Context, cancel context.CancelFunc,
+	what string, cond func() bool,
+) func() {
 	t.Helper()
 
+	var fired atomic.Bool
+
+	done := make(chan struct{})
+	stopped := make(chan struct{})
+
 	go func() {
-		deadline := time.After(30 * time.Second)
+		defer close(stopped)
 
 		for {
 			if cond() {
+				fired.Store(true)
 				cancel()
 
 				return
 			}
 
 			select {
-			case <-deadline:
-				t.Errorf("gave up waiting for %s; cancelling anyway so the assertion below "+
-					"reports what actually happened", what)
-				cancel()
-
+			case <-ctx.Done():
+				return
+			case <-done:
 				return
 			case <-time.After(time.Millisecond):
 			}
 		}
 	}()
+
+	return func() {
+		close(done)
+		<-stopped
+
+		if !fired.Load() {
+			t.Errorf("%s never happened, so the assertions above ran against a listener "+
+				"stopped by its context deadline rather than by finishing the work", what)
+		}
+	}
 }
 
 // notDrainingHere is the drain grace for tests that are NOT about draining.
@@ -214,13 +235,19 @@ func TestAdvertisingNothingAlsoRefusesWork(t *testing.T) {
 		}, nil
 	}
 
-	l := NewListener(a, tiers[0].Label, session, WithMaxCapacity(0))
+	var logged bytes.Buffer
+
+	l := NewListener(a, tiers[0].Label, session, WithMaxCapacity(0),
+		WithLogger(slog.New(slog.NewTextHandler(&logged, nil))))
 
 	// The delivery has been handed over AND the session has been asked again, so
 	// whatever the listener was going to do with it, it has done.
-	cancelWhen(t, cancel, "the queued delivery to be consumed", func() bool {
-		return delivered.Load() && gets.Load() > 1
-	})
+	// The second get proves the first delivery was fully handled, which is when a
+	// wrongful acquisition would have happened. The old sleep could cancel before
+	// handle() even started, passing without exercising the case at all.
+	defer cancelWhen(t, ctx, cancel, "the queued delivery being consumed", func() bool {
+		return gets.Load() > 1
+	})()
 
 	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) &&
 		!errors.Is(err, context.DeadlineExceeded) {
@@ -238,6 +265,16 @@ func TestAdvertisingNothingAlsoRefusesWork(t *testing.T) {
 
 	if usage.Leases != 0 {
 		t.Errorf("%d leases escrowed while advertising nothing", usage.Leases)
+	}
+
+	// AND IT SAID SO. Without this the local refusal branch can be deleted and
+	// every other assertion still passes: with a zero ceiling the escrow refill
+	// clamps room to nothing, offers reserve nothing, and assignments are declined
+	// for lacking escrow — so the SAFE OUTCOME is over-determined and the branch
+	// that exists to make the refusal explicit is invisible to the test. Its value
+	// is the message, so the message is what is pinned.
+	if !strings.Contains(logged.String(), "declining work while advertising no capacity") {
+		t.Errorf("work arrived under a zero ceiling and nothing said so: %s", logged.String())
 	}
 }
 
@@ -360,11 +397,18 @@ func TestRedeliveredAssignmentDoesNotConsumeASecondLease(t *testing.T) {
 		return nil, ErrNoMessage
 	}
 
+	var launches atomic.Int32
+
 	l := NewListener(a, tiers[0].Label, session,
 		// A runner that starts things, because these assertions are about escrow
 		// rather than launching. The default fails closed, which correctly hands
-		// the capacity back and would empty every count below.
-		WithRunner(&fakeRunner{}),
+		// the capacity back and would empty every count below. It COUNTS them
+		// because Running() cannot: see the second assertion.
+		WithRunner(&fakeRunner{onLaunch: func(int64) error {
+			launches.Add(1)
+
+			return nil
+		}}),
 		WithDrainGrace(notDrainingHere))
 
 	var running atomic.Int32
@@ -373,9 +417,8 @@ func TestRedeliveredAssignmentDoesNotConsumeASecondLease(t *testing.T) {
 
 	// BOTH deliveries consumed and a poll taken after them, which is what makes
 	// `running` an observation rather than a coin flip.
-	cancelWhen(t, cancel, "both deliveries to be consumed and observed", func() bool {
-		return deliveries.Load() > 2 && running.Load() > 0
-	})
+	defer cancelWhen(t, ctx, cancel, "both deliveries being consumed and observed",
+		func() bool { return deliveries.Load() > 2 && running.Load() > 0 })()
 
 	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) &&
 		!errors.Is(err, context.DeadlineExceeded) {
@@ -384,6 +427,15 @@ func TestRedeliveredAssignmentDoesNotConsumeASecondLease(t *testing.T) {
 
 	if got := running.Load(); got != 1 {
 		t.Errorf("%d leases running after the same assignment twice, want 1", got)
+	}
+
+	// AND ONLY ONE LAUNCH, which is what actually proves the second delivery took
+	// no second lease. Running() counts a map keyed by REQUEST id, so two leases
+	// bound to request 11 would have the second overwrite the first and leave the
+	// count at one — the first lease then unreachable until the reaper, which is
+	// precisely the capacity leak this test is named for.
+	if got := launches.Load(); got != 1 {
+		t.Errorf("the runner was asked to launch %d times for one job, want 1", got)
 	}
 }
 
@@ -438,9 +490,8 @@ func TestCompletionReleasesTheLease(t *testing.T) {
 
 	// THE LEASE MUST BE SEEN HELD FIRST, which is the other half: a final count of
 	// zero only means the completion released something if something was there.
-	cancelWhen(t, cancel, "the lease to be held and then completed", func() bool {
-		return held.Load() && stage.Load() > 2
-	})
+	defer cancelWhen(t, ctx, cancel, "the lease being held and then completed",
+		func() bool { return held.Load() && stage.Load() > 2 })()
 
 	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) &&
 		!errors.Is(err, context.DeadlineExceeded) {
