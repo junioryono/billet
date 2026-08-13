@@ -36,7 +36,7 @@ func TestTheProvisionScriptContainsWhatAnImageNeeds(t *testing.T) {
 		{"actions-runner-linux-x64-2.328.0.tar.gz", "the release being installed"},
 		{"libicu", "the runner is a .NET app and dies on globalization without ICU"},
 		{"/usr/local/bin/billet-runner", "the entry point a tier names in command:"},
-		{"ACTIONS_RUNNER_INPUT_JITCONFIG", "the one variable billet's boot script exports"},
+		{jitEnvVar, "the one variable billet's boot script exports"},
 		{"poweroff", "the only signal that provisioning succeeded"},
 	} {
 		if !strings.Contains(got, want.fragment) {
@@ -154,9 +154,21 @@ func TestTheEntryPointCarriesTheRegistrationAcrossTheUserChange(t *testing.T) {
 		t.Error("the entry point does not drop privileges, so the runner would run as root")
 	}
 
-	if !strings.Contains(entry, `ACTIONS_RUNNER_INPUT_JITCONFIG="$ACTIONS_RUNNER_INPUT_JITCONFIG"`) {
+	// ASSERTED THROUGH THE CONSTANT, so a rename cannot leave this green while the
+	// image stops working. The boot script that exports this name uses jitEnvVar;
+	// spelling it out on both sides made the two independently editable.
+	if !strings.Contains(entry, jitEnvVar+`="$`+jitEnvVar+`"`) {
 		t.Error("the entry point does not forward the JIT config across the user change; the " +
 			"runner would start with no registration and exit, looking like a healthy boot")
+	}
+
+	// AND A WRITABLE HOME. setpriv does not reset the environment, so without this
+	// the runner inherits cloud-init's HOME=/root, registers fine, and then fails
+	// job steps that touch $HOME — the docker CLI's config, ~/.gitconfig, much of
+	// the actions ecosystem.
+	if !strings.Contains(entry, "HOME=/home/runner") {
+		t.Error("the entry point does not give the runner a writable HOME; it would register " +
+			"successfully and then fail jobs on anything that writes to $HOME")
 	}
 
 	if !strings.Contains(entry, "/opt/actions-runner/run.sh") {
