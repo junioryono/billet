@@ -1248,3 +1248,84 @@ func TestAProviderRefusesABlankSecurityGroup(t *testing.T) {
 		})
 	}
 }
+
+// THE REGION CHOOSES THE HOST WHEN NO ENDPOINT IS SET, so an unvalidated one is a
+// way to send a signed request and its session token somewhere else entirely.
+//
+// Measured: `x@attacker.example/?` interpolated into the default endpoint yields
+// a url whose host is attacker.example. The constructor re-applies the region
+// rule for that reason and not merely for tidiness.
+func TestAProviderRefusesARegionThatWouldChooseTheHost(t *testing.T) {
+	for name, region := range map[string]string{
+		"userinfo and query": "x@attacker.example/?",
+		"a whole url":        "x.amazonaws.com/../..",
+		"empty":              "",
+		"a typo":             "uswest2",
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := validEC2Config("")
+			cfg.Region = region
+
+			if _, err := New("dep-1", cfg); err == nil {
+				t.Fatal("a provider was built with a region billet cannot trust to name a host")
+			}
+		})
+	}
+}
+
+// A config with NO trusted group at all reaches RunInstances without one, and EC2
+// then picks the VPC's default — which in a VPC somebody already had usually
+// permits a good deal more than they are picturing.
+func TestAProviderRefusesAConfigWithNoTrustedGroup(t *testing.T) {
+	cfg := validEC2Config("https://ec2.us-west-2.amazonaws.com/")
+	cfg.SecurityGroupIDs = nil
+
+	if _, err := New("dep-1", cfg); err == nil {
+		t.Fatal("a provider was built with no security group, so EC2 would choose the VPC default")
+	}
+}
+
+// AN OPTION MUST NOT PRODUCE A PANIC. billet bans panic outright: a control plane
+// that panics drops every in-flight lease.
+func TestAProviderRefusesANilHTTPClient(t *testing.T) {
+	cfg := validEC2Config("https://ec2.us-west-2.amazonaws.com/")
+
+	if _, err := New("dep-1", cfg, WithHTTPClient(nil)); err == nil {
+		t.Fatal("a provider was built with no http client")
+	}
+}
+
+// THE CONFIGURATION IS THE PROVIDER'S ONCE IT IS BUILT.
+//
+// A caller keeps the slices it passed, so without a copy it can widen a security
+// group after construction — moving a fork's job onto a privileged network after
+// the validation meant to prevent exactly that. NodePolicy.Clone exists for the
+// same reason one layer up.
+func TestAProviderKeepsItsOwnCopyOfTheNetwork(t *testing.T) {
+	f := newFakeEC2(t)
+
+	cfg := validEC2Config(f.URL)
+	cfg.UntrustedSecurityGroupIDs = []string{"sg-fork"}
+
+	p, err := New("dep-1", cfg,
+		WithHTTPClient(f.Client()),
+		WithCredentials(StaticCredentials{AccessKeyID: "AKID", SecretAccessKey: "s"}))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// The caller widens what it still holds.
+	cfg.UntrustedSecurityGroupIDs[0] = "sg-privileged"
+
+	spec := validSpec()
+	spec.Trust = provider.TrustUntrusted
+
+	if _, err := p.Launch(t.Context(), spec); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	if got := f.paramsFor(t, "RunInstances").Get("SecurityGroupId.1"); got != "sg-fork" {
+		t.Errorf("a fork's job was placed on %q, which the caller substituted after the "+
+			"provider had validated the network", got)
+	}
+}
