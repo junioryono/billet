@@ -789,8 +789,8 @@ func (p *Provider) setBlockDevices(ctx context.Context, params url.Values, spec 
 // image. This is a declined legacy path rather than an impossibility, and a very
 // quiet one.
 //
-// THE CORROBORATING SIGNAL IS ALWAYS AVAILABLE, which was worth checking rather
-// than assuming since the fallback rests on it. Across 26,052 Amazon-owned AMIs
+// THE CORROBORATING SIGNAL WAS NEVER MISSING WHERE IT WAS MEASURED, which was
+// worth checking rather than assuming since the fallback rests on it. Across 26,052 Amazon-owned AMIs
 // RETURNED BY DescribeImages in us-west-2 (Aug 2026): every one reports
 // rootDeviceType, every one reports "ebs", and every one describes its root device
 // in its own block device mapping with an <ebs> child — zero missing, zero
