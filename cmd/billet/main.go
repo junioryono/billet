@@ -55,13 +55,38 @@ import (
 // job is ever picked up. Failing loudly is the honest behaviour for pre-alpha.
 var errNotImplemented = errors.New("not implemented yet")
 
+// exitError carries a specific exit status out of a command.
+//
+// MOST FAILURES ARE JUST FAILURES and exit 1. A few are ANSWERS rather than errors:
+// `billet runner check` reporting that the runner image is due to be rebuilt is a
+// fact a monitor acts on differently from "billet could not run", and differently
+// again from "GitHub has already stopped queueing jobs". Collapsing those into one
+// status means a cron entry cannot tell a task from an outage, and will end up
+// treating both like whichever it saw first.
+type exitError struct {
+	code int
+	msg  string
+}
+
+func (e *exitError) Error() string { return e.msg }
+
+// ExitCode is what the process should exit with.
+func (e *exitError) ExitCode() int { return e.code }
+
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			// Explicit -h is a successful request for help, not a usage error.
 			os.Exit(0)
 		}
+
 		fmt.Fprintf(os.Stderr, "billet: %v\n", err)
+
+		var coded interface{ ExitCode() int }
+		if errors.As(err, &coded) {
+			os.Exit(coded.ExitCode())
+		}
+
 		os.Exit(1)
 	}
 }
@@ -89,6 +114,7 @@ func commands(lc *lifecycle) []command {
 		{"check", "validate the config and state directory, then exit", cmdCheck},
 		{"init", "generate a billet.yaml interactively", cmdInit},
 		{"ami", "build the machine image the ec2 backend launches", cmdAMI},
+		{"runner", "report how close the pinned actions/runner is to being refused", cmdRunner},
 		{"github-app", "create and install the GitHub App billet uses", cmdGitHubApp},
 		{"teardown", "delete the scale sets billet created on GitHub", cmdTeardown},
 		{"status", "show cluster status", cmdStatus},
