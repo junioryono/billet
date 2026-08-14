@@ -27,7 +27,8 @@ SIZE_MB="${SIZE_MB:-4096}"
 IMAGE_POOL="${IMAGE_POOL:-billet-images}"
 IMAGE_NAME="${IMAGE_NAME:-ubuntu-2404-x64}"
 CEPH_USER="${CEPH_USER:-billet}"
-WORK="${WORK:-/var/tmp/billet-guest}"
+WORK_DEFAULT=/var/tmp/billet-guest
+WORK="${WORK:-$WORK_DEFAULT}"
 PUBLISH="${PUBLISH:-yes}"
 
 # PINNED, NOT "LATEST", for the reason cmd/billet/ami.go gives about the AMI: an
@@ -94,9 +95,15 @@ main() {
 			;;
 	esac
 
-	if [ -e "$WORK" ] && [ ! -e "$WORK/.billet-guest-workspace" ]; then
-		echo "$WORK exists and was not created by this script; refusing to delete it." >&2
-		echo "Remove it yourself, or set WORK to a directory this script may own." >&2
+	# THE DEFAULT PATH IS OURS BY CONSTRUCTION and needs no marker: it is this
+	# script's own directory, named right here, and requiring proof of ownership for
+	# it would mean every first run after this check was added fails on a workspace
+	# an earlier run left behind. The check is about an OVERRIDE, which is where a
+	# typo can name something that matters.
+	if [ "$WORK" != "$WORK_DEFAULT" ] &&
+		[ -e "$WORK" ] && [ ! -e "$WORK/.billet-guest-workspace" ]; then
+		echo "WORK=$WORK exists and was not created by this script; refusing to delete it." >&2
+		echo "Remove it yourself, or point WORK at a path this script may own." >&2
 		exit 1
 	fi
 
