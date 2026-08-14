@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -43,15 +45,33 @@ func verificationSecret() (string, error) {
 // probe and can be nothing else, and it is idempotent — so residue from a previous
 // run is cleared by the same call that would have cleared it anyway.
 func probeLeaseID() (string, error) {
-	host, err := os.Hostname()
+	// THE MACHINE ID, NOT THE HOSTNAME. Hostnames are not unique: cloned VMs and
+	// default images share them routinely, and hashing the SAME hostname yields the
+	// SAME id — so two such machines on one Ceph cluster would derive one probe name,
+	// and the clone lives in a pool they share. One host's pre-launch cleanup would
+	// then try to remove the other's live disk. (An earlier comment here claimed a
+	// hash prevented that collision, which had it exactly backwards.)
+	//
+	// /etc/machine-id is per INSTALLATION and survives a rename, which is the
+	// property wanted: the same machine derives the same probe every time, and no
+	// other machine derives it at all.
+	id, err := os.ReadFile("/etc/machine-id")
 	if err != nil {
-		return "", fmt.Errorf("billet images verify: read this host's name, which is what makes "+
-			"the probe's id stable: %w", err)
+		// Falling back rather than refusing: a machine without one can still verify
+		// an image, it just relies on not sharing a hostname with a cluster peer.
+		host, hostErr := os.Hostname()
+		if hostErr != nil {
+			return "", fmt.Errorf("billet images verify: this host has neither a machine id "+
+				"nor a name, and the probe needs one of them to be nameable: %w",
+				errors.Join(err, hostErr))
+		}
+
+		id = []byte(host)
 	}
 
-	// Hashed rather than truncated, so that two hosts under one deployment cannot
-	// collide on a shared prefix, and so the id is the fixed length a lease is.
-	sum := sha256.Sum256([]byte("billet-images-verify\x00" + host))
+	// Hashed so the id is the fixed length a lease is, and so nothing about the
+	// machine is legible in a name that appears in `rbd ls`.
+	sum := sha256.Sum256(append([]byte("billet-images-verify\x00"), bytes.TrimSpace(id)...))
 
 	return hex.EncodeToString(sum[:16]), nil
 }

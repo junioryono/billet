@@ -42,12 +42,20 @@ if [ -z "${BILLET_REFRESH_LOCKED:-}" ]; then
 	# this script the instant flock returns 1 -- before the line that explains why.
 	# The first version of this fix printed nothing for exactly that reason, which is
 	# the same trap the guest agent carries a paragraph about.
+	# -E 200 SO THAT "COULD NOT LOCK" HAS ITS OWN STATUS. Without it flock exits 1 on
+	# contention -- and so does every `die` in this script, whose status passes
+	# straight through. A failed verification, a missing tool, an unreachable GitHub:
+	# all exited 1, and the wrapper then appended "another refresh is already running"
+	# as the LAST lines in the journal. The real error was above it, and the sentence
+	# after it was false.
 	status=0
-	flock -n /var/lock/billet-image-refresh.lock "$0" "$@" || status=$?
+	flock -n -E 200 /var/lock/billet-image-refresh.lock "$0" "$@" || status=$?
 
-	if [ "$status" -eq 1 ]; then
+	if [ "$status" -eq 200 ]; then
 		echo "refresh-guest-image: another refresh is already running on this machine; this" >&2
 		echo "run is skipping rather than building into the same workspace" >&2
+
+		exit 1
 	fi
 
 	exit "$status"
@@ -60,17 +68,8 @@ IMAGE_NAME="${IMAGE_NAME:-ubuntu-2404-x64}"
 IMAGE_POOL="${IMAGE_POOL:-billet-images}"
 CEPH_USER="${CEPH_USER:-billet}"
 
-# THE CLUSTER-WIDE LOCK LIVES IN THE CLUSTER, which is the only place that can see
-# both contenders. The per-machine flock above stops two runs on ONE node; two NODES
-# sharing a pool would still map and write the same head image concurrently and
-# snapshot the interleaving as a "generation".
-#
-# A dedicated 1MB image rather than a lock on the golden image itself: mapping an
-# image takes an automatic exclusive-lock on it (measured -- the head carries an
-# `auto <id>` locker while it is mapped), so locking the thing being written would
-# collide with the write.
-LOCK_IMAGE="${LOCK_IMAGE:-$IMAGE_POOL/.publish-lock}"
-LOCK_COOKIE="billet-refresh-$(hostname -s 2>/dev/null || echo unknown)-$$"
+# The cluster lock lives in build-guest-image.sh, with the write it protects, so a
+# hand-run build takes it too.
 
 log() { echo "refresh-guest-image: $*"; }
 
@@ -125,69 +124,6 @@ latest_release() {
 	printf '%s %s\n' "$version" "$sha"
 }
 
-# take_publish_lock keeps two NODES from publishing a generation at once.
-#
-# MEASURED SEMANTICS, because the whole design rests on them:
-#
-#   rbd lock add   0 when taken, 16 (EBUSY) when anyone already holds it -- including
-#                  when the SAME cookie holds it, so it is not re-entrant
-#   rbd lock rm    0 when released, 2 when there was nothing to release
-#   the lock       is NOT a lease. It outlives the process that took it and is held
-#                  until somebody removes it, and breaking it FENCES NOTHING -- the
-#                  old holder can wake up and keep writing.
-#
-# That last property is why this refuses rather than breaking a lock it finds. A
-# stale lock costs one skipped week, which the weekly cadence and `billet runner
-# check` both cover; breaking a live one costs two concurrent writers on one image,
-# which is the failure this exists to prevent. The message carries the command.
-take_publish_lock() {
-	# CREATED WITH `layering` ALONE, and that is not minimalism.
-	#
-	# Ceph documents the `exclusive-lock` FEATURE as "incompatible with RBD advisory
-	# locks (the `rbd lock add` and `rbd lock rm` commands)" -- and it is on by
-	# default. Measured, the two do coexist on an image that is never mapped, because
-	# the automatic lock the feature takes is only taken when a client opens the image
-	# for writing, which nothing ever does to this one.
-	#
-	# Depending on that would be depending on a combination the vendor says does not
-	# work, for a reason that happens to be true today. Creating the image without the
-	# feature removes the question instead of answering it.
-	#
-	# Idempotent, and its failure is not interesting: the next command says whether
-	# there is a lock image to lock.
-	rbd --id "$CEPH_USER" create "$LOCK_IMAGE" --size 1 --image-feature layering \
-		>/dev/null 2>&1 || true
-
-	if rbd --id "$CEPH_USER" lock add "$LOCK_IMAGE" "$LOCK_COOKIE" >/dev/null 2>&1; then
-		trap release_publish_lock EXIT
-
-		log "holding the cluster publish lock as $LOCK_COOKIE"
-
-		return 0
-	fi
-
-	local holder
-	holder=$(rbd --id "$CEPH_USER" lock ls "$LOCK_IMAGE" --format json 2>/dev/null |
-		jq -r '.[0] | "\(.id) (client \(.locker) at \(.address))"' 2>/dev/null || true)
-
-	die "another node is already publishing to $IMAGE_POOL/$IMAGE_NAME: ${holder:-unknown holder}. This run is skipping rather than writing the same image concurrently. If that holder is gone, break it with: rbd --id $CEPH_USER lock rm $LOCK_IMAGE '<id>' '<locker>'"
-}
-
-# release_publish_lock gives the lock back, however this script is leaving.
-#
-# Best-effort on purpose: it runs from an EXIT trap, where the useful message is the
-# one about what actually went wrong rather than a second one about the lock. A lock
-# that survives says so at the next run, with the command to clear it.
-release_publish_lock() {
-	local locker
-	locker=$(rbd --id "$CEPH_USER" lock ls "$LOCK_IMAGE" --format json 2>/dev/null |
-		jq -r --arg c "$LOCK_COOKIE" '.[] | select(.id == $c) | .locker' 2>/dev/null || true)
-
-	if [ -n "$locker" ]; then
-		rbd --id "$CEPH_USER" lock rm "$LOCK_IMAGE" "$LOCK_COOKIE" "$locker" >/dev/null 2>&1 || true
-	fi
-}
-
 # newest_generation is the most recently published snapshot of the image.
 newest_generation() {
 	rbd --id "$CEPH_USER" -p "$IMAGE_POOL" snap ls "$IMAGE_NAME" --format json |
@@ -224,11 +160,6 @@ main() {
 		"$REPO/internal/runnerrelease/pinned.txt" 2>/dev/null || echo unknown))"
 
 	export RUNNER_VERSION="$version" RUNNER_SHA256="$sha"
-
-	# BEFORE THE BUILD, not before the bump: asking GitHub what it has published is
-	# read-only and costs nothing to do twice, while writing the image is what must
-	# not overlap.
-	take_publish_lock
 
 	"$REPO/scripts/build-guest-image.sh"
 

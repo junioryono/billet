@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/junioryono/billet/internal/config"
@@ -139,21 +141,18 @@ var (
 	errExpiredRunner = &exitError{code: 3, msg: "github is no longer queueing jobs to this runner"}
 )
 
-// fleetRunnerVersion reports the runner the published guest image carries.
+// fleetRunnerVersion reports the OLDEST runner any tier's image boots.
 //
-// EVERY FAILURE HERE IS A "CANNOT TELL" RATHER THAN A VERDICT, which is why it
-// returns a bool instead of an error: no config, no cluster, a config for a machine
-// that does not run microVMs, an image published before this was recorded. None of
-// those say anything about whether a fleet is expiring, and the caller has a fallback
-// that is honest about being one.
+// THE OLDEST, NOT THE FIRST FOUND. A deployment can have several tiers on several
+// images, and the deadline belongs to whichever is furthest behind: answering with
+// the first one that happened to carry metadata would leave a stale tier expiring
+// unwatched while the check stayed green about a current one.
+//
+// EVERY FAILURE HERE IS "CANNOT TELL" RATHER THAN A VERDICT, which is why the caller
+// gets a bool: no config, no cluster, a machine that runs no microVMs, a generation
+// published before this was recorded. None of those say anything about whether a
+// fleet is expiring, and the caller has a fallback that is honest about being one.
 func fleetRunnerVersion(ctx context.Context, cfgPath string) (string, bool, error) {
-	// A CONFIG THIS COMMAND CANNOT READ IS NOT A VERDICT ABOUT A FLEET. `billet
-	// runner check` is useful on a laptop with no billet config at all — it answers
-	// "is the release this build would install still accepted" — so a missing or
-	// unreadable config means "ask the compiled-in pin instead", not "something is
-	// wrong". Returning the error here would turn every run outside a deployment
-	// into a failure.
-	//
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		//nolint:nilerr // an unreadable config means "cannot tell", which the caller handles
@@ -169,26 +168,60 @@ func fleetRunnerVersion(ctx context.Context, cfgPath string) (string, bool, erro
 		return "", false, err
 	}
 
-	// THE IMAGE A TIER ACTUALLY NAMES, because that is the one jobs boot. A default
-	// name would answer confidently about an image this deployment does not use.
-	var failures []error
+	var (
+		failures []error
+		oldest   string
+		found    bool
+	)
 
 	for i := range cfg.Tiers {
-		if cfg.Tiers[i].Image == "" {
+		image := cfg.Tiers[i].Image
+		if image == "" || cfg.Tiers[i].Provider != config.ProviderFirecracker {
 			continue
 		}
 
-		version, found, err := store.RunnerVersion(ctx, cfg.Tiers[i].Image)
+		version, ok, err := store.RunnerVersion(ctx, image)
 
 		switch {
 		case err != nil:
 			failures = append(failures, err)
-		case found:
-			return version, true, nil
+		case !ok:
+			continue
+		case !found || olderRunner(version, oldest):
+			oldest, found = version, true
 		}
 	}
 
-	// An image with nothing recorded is silent rather than broken: it was published
-	// before billet wrote this, or by hand.
+	if found {
+		return oldest, true, errors.Join(failures...)
+	}
+
 	return "", false, errors.Join(failures...)
+}
+
+// olderRunner reports whether a is an earlier release than b.
+//
+// COMPARED NUMERICALLY, PART BY PART, because these are versions rather than
+// strings: "2.9.0" sorts after "2.10.0" lexically and is older in fact, and picking
+// the wrong one here means watching the tier that is fine while the stale one
+// expires.
+func olderRunner(a, b string) bool {
+	as, bs := strings.Split(a, "."), strings.Split(b, ".")
+
+	for i := 0; i < len(as) && i < len(bs); i++ {
+		an, aerr := strconv.Atoi(as[i])
+		bn, berr := strconv.Atoi(bs[i])
+
+		if aerr != nil || berr != nil {
+			// Not a number on one side: fall back to comparing what is there, which
+			// is at least stable, rather than guessing.
+			return a < b
+		}
+
+		if an != bn {
+			return an < bn
+		}
+	}
+
+	return len(as) < len(bs)
 }

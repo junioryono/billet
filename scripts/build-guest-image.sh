@@ -472,6 +472,101 @@ NET
 	publish "$img"
 }
 
+# THE CLUSTER-WIDE PUBLISH LOCK, held by whatever is about to write the image.
+#
+# IT LIVES HERE RATHER THAN IN THE SCHEDULED WRAPPER, because this is the script that
+# writes. A lock in the wrapper protected the timer's path and left the documented
+# normal use -- running this by hand -- writing into the same head image with no
+# coordination at all, which is exactly the corruption it was added to prevent.
+#
+# A dedicated 1MB image rather than a lock on the golden image itself: mapping an
+# image takes an automatic exclusive-lock on it (measured -- the head carries an
+# `auto <id>` locker while mapped), so locking the thing being written collides with
+# the write. It is created with `layering` alone because Ceph documents the
+# `exclusive-lock` FEATURE as incompatible with these advisory lock commands.
+#
+# MEASURED SEMANTICS: `lock add` returns 0 when taken and 16 when anyone holds it,
+# including the same cookie, so it is not re-entrant; `lock rm` returns 0, or 2 when
+# there was nothing to release; and the lock is NOT a lease -- it outlives the process
+# that took it, and breaking it fences nothing.
+LOCK_IMAGE="${LOCK_IMAGE:-$IMAGE_POOL/.publish-lock}"
+LOCK_COOKIE="billet-build-$(hostname -s 2>/dev/null || echo unknown)-$$-$(date -u +%s)"
+
+# STALE_AFTER is when a held lock stops being believed.
+#
+# BECAUSE A LEAKED LOCK IS OTHERWISE PERMANENT, and that is the failure this bound
+# exists for rather than a tidiness setting. Bash does not run an EXIT trap when it is
+# killed by an untrapped signal, so a systemd timeout, a `kill`, or a power loss
+# leaves the lock held by a process that no longer exists -- and since a refusal never
+# breaks a lock, EVERY later build on EVERY node refuses too. Forever. The fleet then
+# stops being rebuilt, and thirty days after a runner release it stops being sent
+# jobs, which is precisely the outage this whole mechanism exists to prevent.
+#
+# Six hours is chosen against the unit that runs this: TimeoutStartSec is two, so no
+# scheduled build can still be alive at six, and a hand-run build that has taken six
+# hours has failed in some other way. Breaking one that IS alive would put two writers
+# on one image, so the bound is deliberately far past any real run.
+STALE_AFTER="${STALE_AFTER:-21600}"
+
+take_publish_lock() {
+	rbd --id "$CEPH_USER" create "$LOCK_IMAGE" --size 1 --image-feature layering \
+		>/dev/null 2>&1 || true
+
+	if rbd --id "$CEPH_USER" lock add "$LOCK_IMAGE" "$LOCK_COOKIE" >/dev/null 2>&1; then
+		# TERM AND INT AS WELL AS EXIT. A systemd timeout sends SIGTERM, and bash runs
+		# no EXIT trap for an untrapped signal -- which is the common way this lock
+		# was going to be leaked.
+		trap release_publish_lock EXIT TERM INT
+
+		echo "holding the cluster publish lock as $LOCK_COOKIE"
+
+		return 0
+	fi
+
+	local held age
+	held=$(rbd --id "$CEPH_USER" lock ls "$LOCK_IMAGE" --format json 2>/dev/null || echo '[]')
+	age=$(printf '%s' "$held" | jq -r --argjson now "$(date -u +%s)" \
+		'.[0].id // "" | capture("-(?<t>[0-9]+)$") | ($now - (.t | tonumber))' 2>/dev/null || echo "")
+
+	if [ -n "$age" ] && [ "$age" -gt "$STALE_AFTER" ] 2>/dev/null; then
+		local id locker
+		id=$(printf '%s' "$held" | jq -r '.[0].id')
+		locker=$(printf '%s' "$held" | jq -r '.[0].locker')
+
+		echo "the publish lock has been held by $id for ${age}s, which is longer than any" >&2
+		echo "build can run; breaking it and taking it" >&2
+
+		rbd --id "$CEPH_USER" lock rm "$LOCK_IMAGE" "$id" "$locker" >/dev/null 2>&1 || true
+
+		if rbd --id "$CEPH_USER" lock add "$LOCK_IMAGE" "$LOCK_COOKIE" >/dev/null 2>&1; then
+			trap release_publish_lock EXIT TERM INT
+
+			return 0
+		fi
+	fi
+
+	local holder
+	holder=$(printf '%s' "$held" |
+		jq -r '.[0] | "\(.id) (client \(.locker) at \(.address))"' 2>/dev/null || true)
+
+	echo "another node is already publishing to $IMAGE_POOL/$IMAGE_NAME: ${holder:-unknown holder}." >&2
+	echo "This build is stopping rather than writing the same image concurrently. If that" >&2
+	echo "holder is gone and this persists, clear it with:" >&2
+	echo "  rbd --id $CEPH_USER lock rm $LOCK_IMAGE '<id>' '<locker>'" >&2
+
+	exit 1
+}
+
+release_publish_lock() {
+	local locker
+	locker=$(rbd --id "$CEPH_USER" lock ls "$LOCK_IMAGE" --format json 2>/dev/null |
+		jq -r --arg c "$LOCK_COOKIE" '.[] | select(.id == $c) | .locker' 2>/dev/null || true)
+
+	if [ -n "$locker" ]; then
+		rbd --id "$CEPH_USER" lock rm "$LOCK_IMAGE" "$LOCK_COOKIE" "$locker" >/dev/null 2>&1 || true
+	fi
+}
+
 # unmap_image releases a mapping on the way out, however this script is leaving.
 #
 # Best-effort by design: it runs on the failure path, where the useful message is the
@@ -491,6 +586,10 @@ unmap_image() {
 publish() {
 	local img="$1" gen dev
 	gen="g$(date -u +%Y%m%d%H%M%S)"
+
+	# BEFORE THE FIRST WRITE, which is what must not overlap. The build up to here
+	# happens in a per-machine workspace and coordinates with nothing.
+	take_publish_lock
 
 	local rbd=(rbd --id "$CEPH_USER")
 
@@ -548,9 +647,25 @@ publish() {
 	# than what the running fleet HAS -- and the moment a scheduled rebuild takes up a
 	# newer release, an alarm reading the compiled-in value reports an expiry that is
 	# not happening, or misses one that is. The image is the only thing that knows.
-	"${rbd[@]}" -p "$IMAGE_POOL" image-meta set "$IMAGE_NAME" billet.runner_version \
+	# KEYED BY GENERATION, because a tier boots a generation rather than the head.
+	#
+	# A single `billet.runner_version` described the LAST BUILD, which is not what any
+	# job runs: generations are immutable and promotion is a deliberate act, so a
+	# fleet can sit on last month's generation while the head advances every week. An
+	# alarm reading the head then reports the newest build as though it were the
+	# fleet, says everything is current, and stays green right through the expiry it
+	# exists to catch. It is also written BEFORE verification, so a generation that
+	# fails to boot would have advanced it too.
+	#
+	# Per generation, the value describes exactly the thing a tier can name.
+	"${rbd[@]}" -p "$IMAGE_POOL" image-meta set "$IMAGE_NAME" "billet.runner_version.$gen" \
 		"$RUNNER_VERSION"
-	"${rbd[@]}" -p "$IMAGE_POOL" image-meta set "$IMAGE_NAME" billet.generation "$gen"
+
+	# The head keys stay as a record of the most recent build. Nothing reads them for
+	# a verdict; they are there so `image-meta list` says what happened last.
+	"${rbd[@]}" -p "$IMAGE_POOL" image-meta set "$IMAGE_NAME" billet.last_build_runner \
+		"$RUNNER_VERSION"
+	"${rbd[@]}" -p "$IMAGE_POOL" image-meta set "$IMAGE_NAME" billet.last_build_generation "$gen"
 
 	echo
 	echo "published $IMAGE_POOL/$IMAGE_NAME@$gen"
