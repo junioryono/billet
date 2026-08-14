@@ -170,6 +170,83 @@ A lease whose holder stops heartbeating is reclaimed by the reaper — but only 
 
 It resolves itself in the ordinary case: the host destroys the container and says so, or reports what it is actually running — every sweep, not only when it reconnects, because quarantine happens on the reaper's clock and a node that reconnects after an outage usually does so before the leases it was holding have expired. A quarantined lease missing from that report has no container by definition. The case that does not resolve is a machine that never returns — its capacity would be missing from the deployment permanently, so `billet leases quarantined` shows what is held and `billet leases release <lease> --force` hands it back. Force, because nothing has confirmed anything: you are asserting the compute is gone, and if you are wrong that slot is sold twice.
 
+## Guest images
+
+A Firecracker job boots a **golden image**: an Ubuntu 24.04 rootfs carrying Docker, the
+GitHub Actions runner, and a small agent that reads the runner registration out of the
+metadata service and starts the runner with it. It lives in Ceph as an RBD image with
+immutable named snapshots called **generations**, and every job gets a copy-on-write
+clone of one, discarded when the guest is.
+
+```bash
+sudo scripts/build-guest-image.sh          # build and publish a new generation
+billet images verify <image>@<generation>  # boot one and make the guest prove it works
+billet runner check                        # how close the runner is to being refused
+```
+
+### Why this is a schedule and not a chore
+
+**GitHub stops sending jobs to a runner that is more than 30 days behind a release.** The
+service refuses the message rather than asking the runner to update, so nothing on the
+runner's side recovers: the fleet looks healthy and jobs simply queue.
+
+An ordinary self-hosted runner updates itself in place, so a stale image would only be
+slow. billet's cannot — a JIT configuration from GitHub's API carries
+`DisableUpdate = True` (measured; there is no parameter to ask otherwise), so **the runner
+baked into an image is the runner forever** and republishing is the only way past the
+deadline.
+
+So enable the timer:
+
+```bash
+sudo cp deploy/billet-image-refresh.{service,timer} /etc/systemd/system/
+sudo systemctl enable --now billet-image-refresh.timer   # the TIMER, not the service
+```
+
+Weekly, against a 30-day deadline, because the run itself can fail — on a package mirror,
+on a verification, on a full disk — and a monthly cadence leaves no room for the retry.
+
+**It is safe to enable on every node.** Two runs on one machine are kept apart by a file
+lock; two nodes sharing a pool are kept apart by an `rbd lock` taken in the cluster before
+anything is written. The second one refuses and names the holder rather than interleaving
+a write into the same image.
+
+### What it does, and what it deliberately does not
+
+Each run rebuilds, publishes a new generation, and then **verifies it by booting it** —
+the guest itself reports that it dropped to the unprivileged account, that the
+registration arrived intact, that the runner binary executes, that Docker is up on
+billet's kernel, and that a container ran. Nothing the host can check on its own is
+enough: an image that boots perfectly and runs no job passes every host-side signal there
+is.
+
+It **does not promote**. Publishing is safe by construction — a generation is immutable
+and nothing boots it until a tier names it — while promotion puts a new image in front of
+every job at once. So a run leaves a verified generation and prints it, and pointing a
+tier at it stays a decision you make:
+
+```yaml
+tiers:
+  - label: billet-2vcpu
+    image: ubuntu-2404-x64@g20260814143405
+```
+
+A failed verification therefore leaves the running fleet untouched by construction rather
+than by care.
+
+### Taking up a new runner release
+
+`billet runner check` exits **0** while there is nothing to do, **2** once a rebuild is
+due, and **3** once GitHub is already refusing — distinct because the second is a task and
+the third is an outage. Failing to *reach* GitHub is none of the three: it is an error,
+because a machine with no egress cannot find out, and reporting that as an expiring fleet
+is the false alarm that teaches people to ignore the true one.
+
+The version and its checksum live on one line in `internal/runnerrelease/pinned.txt`,
+because a checksum is only true of its version. Bump it in source and deploy, or run the
+refresh with `BUMP=yes` on a node that has Go — it rebuilds the binary from the same
+checkout so the file and the version embedded in `billet` cannot disagree.
+
 ## Status
 
 billet is pre-alpha. **A job runs end to end in a container**, and nothing above that line is
@@ -205,9 +282,9 @@ built. What works **today**:
 | Graceful drain | SIGTERM stops it taking new work and waits for the jobs already running, so `systemctl restart` does not fail somebody's build. See [Updating](#updating) |
 | Release pipeline | Tagged releases with checksums, `.deb`/`.rpm` with systemd units, and the install script — **built and never yet run: there are no tags, so no release exists to install.** Build from source until there is one |
 | Multi-backend tiers | One label can name several providers, and the preference ORDER decides: the control plane picks the host when the job is admitted, walking the tier's list most-preferred-first. Both halves of the intended pair now exist — `[firecracker, ec2]` means the bare-metal box before the cloud — though nobody has watched a job fail over between them ([#32](https://github.com/junioryono/billet/issues/32)) |
-| Firecracker microVMs | One job, one guest kernel, on bare metal. Under the jailer always: chrooted, dropped to an unprivileged uid, in a cgroup, with a seccomp filter. The root disk is a copy-on-write RBD clone of a golden image, discarded with the guest, and the runner registration is delivered through the metadata service so it is never in argv and never on a disk. **The provider works; the guest image it boots does not exist yet** ([#24](https://github.com/junioryono/billet/issues/24)) |
+| Firecracker microVMs | One job, one guest kernel, on bare metal. Under the jailer always: chrooted, dropped to its own unprivileged uid, in a cgroup, with a seccomp filter. The root disk is a copy-on-write RBD clone of a golden image, discarded with the guest, and the runner registration is delivered through the metadata service so it is never in argv and never on a disk. The guest image exists too: `scripts/build-guest-image.sh` builds and publishes it, and a guest boots, takes its registration and runs a container in about ten seconds. See [Guest images](#guest-images) |
 
-**Not built:** the Apple Silicon provider; the cache; sticky disks; observability; the dashboard. The **Firecracker guest image** is not built either — the provider that boots one is ([#24](https://github.com/junioryono/billet/issues/24)), and it has launched, found and destroyed a real microVM on the reference host, but the Ubuntu rootfs with Docker and the runner inside it is a separate artifact nobody has built yet, the way `billet ami` is for ec2 ([#42](https://github.com/junioryono/billet/issues/42)). A **cost policy** is closer to a consequence than a feature — an ec2 node declares `max_vcpu` and `max_memory`, and provider order decides that home fills first — but it is not yet a spending limit: the allocator charges a job the size its TIER asked for, while the backend buys the first declared shape that fits, so a 2-vCPU tier backed by an 8-vCPU shape can spend four times the declared budget ([#47](https://github.com/junioryono/billet/issues/47)). Nothing reacts to a price either ([#44](https://github.com/junioryono/billet/issues/44)), and nothing drains an instance AWS is about to reclaim ([#41](https://github.com/junioryono/billet/issues/41)).
+**Not built:** the Apple Silicon provider; the cache; sticky disks; observability; the dashboard. The **Firecracker guest image** now exists and boots — what it is missing is breadth: it carries Docker and the runner, against the ~50GB of preinstalled software a GitHub-hosted runner has, and the sharpest consequence is that `actions/cache` silently produces caches that can never match one written on a hosted runner ([#66](https://github.com/junioryono/billet/issues/66)). A **cost policy** is closer to a consequence than a feature — an ec2 node declares `max_vcpu` and `max_memory`, and provider order decides that home fills first — but it is not yet a spending limit: the allocator charges a job the size its TIER asked for, while the backend buys the first declared shape that fits, so a 2-vCPU tier backed by an 8-vCPU shape can spend four times the declared budget ([#47](https://github.com/junioryono/billet/issues/47)). Nothing reacts to a price either ([#44](https://github.com/junioryono/billet/issues/44)), and nothing drains an instance AWS is about to reclaim ([#41](https://github.com/junioryono/billet/issues/41)).
 
 **billet runs a fleet, with one thing still missing before it is worth having one.** Capacity is a
 figure per machine, so hosts of different sizes can be described and a tier advertises only what its
@@ -464,7 +541,7 @@ bootstrap`, and why clone v2 is a requirement rather than a preference.
 |---|---|
 | P0 — scaffolding, GitHub App onboarding, host prep | ✅ mostly |
 | P1 — runner plane: scale sets, allocator, providers | ✅ listeners, allocator, the drain, and the Docker, EC2 and Firecracker providers |
-| P2 — guest images, node split, user-defined tiers | 🚧 node split + mTLS done; the microVM that boots a guest image is done, the image itself is not ([#24](https://github.com/junioryono/billet/issues/24)) |
+| P2 — guest images, node split, user-defined tiers | 🚧 node split + mTLS done; the microVM and the guest image it boots are both done, and the image keeps itself current ([Guest images](#guest-images)). What is left is breadth: ours carries Docker and the runner against a hosted runner's ~50GB ([#66](https://github.com/junioryono/billet/issues/66)) |
 | P3 — Ceph, the storage layer, sticky disks, trust classes | 🚧 Ceph replaces ZFS and the reference cluster is built ([#23](https://github.com/junioryono/billet/issues/23)); the storage layer is not ⬜ [#20](https://github.com/junioryono/billet/issues/20) [#25](https://github.com/junioryono/billet/issues/25) [#26](https://github.com/junioryono/billet/issues/26) |
 | P4 — colocated Actions cache | ⬜ [#29](https://github.com/junioryono/billet/issues/29) |
 | P5 — Docker layer cache, registry mirrors, container baseline | ⬜ [#27](https://github.com/junioryono/billet/issues/27) [#28](https://github.com/junioryono/billet/issues/28) |
