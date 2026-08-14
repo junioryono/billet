@@ -39,6 +39,8 @@ func cmdImages(ctx context.Context, args []string) error {
 		return cmdImagesVerify(ctx, args[1:])
 	case "due":
 		return cmdImagesDue(ctx, args[1:])
+	case "reap":
+		return cmdImagesReap(ctx, args[1:])
 	case "promote":
 		return cmdImagesPromote(ctx, args[1:], true)
 	case "unpromote":
@@ -673,4 +675,105 @@ func cmdImagesPromote(ctx context.Context, args []string, verified bool) error {
 		"nothing to boot\n", rest, ceph.Verified)
 
 	return nil
+}
+
+// cmdImagesReap removes generations nothing needs.
+//
+// SAFE FOR RUNNING JOBS BY CONSTRUCTION, which is the measurement the whole design
+// rests on: clone v2 removes a snapshot with a live child, returns 0, and the child
+// stays usable. So this never has to ask whether a generation is in use — retention
+// is only about what might still be BOOTED, and there is no liveness check here to
+// get wrong.
+//
+// THE PLAN AND THE ACTION SHARE ONE FUNCTION. A `--dry-run` computed by different
+// code than the operation is a preview that eventually stops describing it, which
+// for an irreversible command against a cluster is the property most worth having.
+func cmdImagesReap(ctx context.Context, args []string) error {
+	fs := newFlagSet("billet images reap")
+	cfgPath := addConfigFlag(fs)
+	keep := fs.Int("keep", 3, "how many VERIFIED generations to leave, newest first")
+	dryRun := fs.Bool("dry-run", false, "print what would be removed and remove nothing")
+
+	rest, err := parseWithName(fs, args)
+	if err != nil {
+		return err
+	}
+
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		return err
+	}
+
+	if cfg.Node == nil || cfg.Node.Ceph == nil {
+		return errors.New("billet images reap: this config names no ceph cluster")
+	}
+
+	image := rest
+	if image == "" {
+		image = firecrackerTierImage(cfg)
+	}
+
+	if image == "" {
+		return errors.New("billet images reap: no image given and no firecracker tier names one")
+	}
+
+	store, err := ceph.New(*cfg.Node.Ceph)
+	if err != nil {
+		return err
+	}
+
+	all, err := store.Generations(ctx, image)
+	if err != nil {
+		return err
+	}
+
+	verified, err := store.VerifiedGenerations(ctx, image)
+	if err != nil {
+		return err
+	}
+
+	// EVERY TIER'S IMAGE, not just the one being reaped: a deployment can pin
+	// several, and a generation kept for one tier is kept.
+	pinned := make([]string, 0, len(cfg.Tiers))
+	for i := range cfg.Tiers {
+		if cfg.Tiers[i].Image != "" {
+			pinned = append(pinned, cfg.Tiers[i].Image)
+		}
+	}
+
+	plan := ceph.PlanReap(all, verified, ceph.Retention{Keep: *keep, Pinned: pinned})
+
+	for _, item := range plan {
+		if item.Reason != "" {
+			fmt.Printf("  keep    %s  (%s)\n", item.Generation.Name, item.Reason)
+		}
+	}
+
+	removing := 0
+
+	for _, item := range plan {
+		if item.Reason == "" {
+			removing++
+
+			fmt.Printf("  remove  %s\n", item.Generation.Name)
+		}
+	}
+
+	if removing == 0 {
+		fmt.Println("nothing to reap")
+
+		return nil
+	}
+
+	if *dryRun {
+		fmt.Printf("\n%d generation(s) would be removed; this was a dry run\n", removing)
+
+		return nil
+	}
+
+	removed, err := store.Reap(ctx, image, plan)
+
+	fmt.Printf("\nremoved %d generation(s)\n", len(removed))
+
+	return err
 }
