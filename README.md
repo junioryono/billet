@@ -206,10 +206,15 @@ sudo systemctl enable --now billet-image-refresh.timer   # the TIMER, not the se
 Weekly, against a 30-day deadline, because the run itself can fail — on a package mirror,
 on a verification, on a full disk — and a monthly cadence leaves no room for the retry.
 
-**It is safe to enable on every node.** Two runs on one machine are kept apart by a file
-lock; two nodes sharing a pool are kept apart by an `rbd lock` taken in the cluster before
-anything is written. The second one refuses and names the holder rather than interleaving
-a write into the same image.
+**Enable it on every node — that is the redundancy.** A timer on one machine stops when
+that machine does, and GitHub's thirty days do not pause while it is down. With every node
+carrying it, the rebuild happens as long as *any* node is up.
+
+They cooperate rather than duplicate. Whichever starts second asks `billet images due`,
+finds a recent generation, and stands down with exit 0 — a machine standing by has
+succeeded, and a unit that reported failure every week on every node but one would teach
+you to ignore it. If two genuinely overlap, an `rbd lock` taken in the cluster stops the
+writes interleaving, and a run on one machine is kept single by a file lock.
 
 ### What it does, and what it deliberately does not
 

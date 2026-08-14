@@ -68,6 +68,14 @@ IMAGE_NAME="${IMAGE_NAME:-ubuntu-2404-x64}"
 IMAGE_POOL="${IMAGE_POOL:-billet-images}"
 CEPH_USER="${CEPH_USER:-billet}"
 
+# MAX_AGE is how fresh a generation has to be for this node to stand down.
+#
+# Six days against a weekly timer: long enough that the node whose jitter puts it
+# second does not rebuild what the first just built, short enough that a genuinely
+# missed week still triggers one. It is not the expiry bound -- that is thirty days
+# from a runner release, and `billet runner check` watches it.
+MAX_AGE="${MAX_AGE:-144h}"
+
 # The cluster lock lives in build-guest-image.sh, with the write it protects, so a
 # hand-run build takes it too.
 
@@ -153,6 +161,32 @@ main() {
 	# business. The version is passed to the build instead, and the build records what
 	# it installed on the image itself, which is what `billet runner check` reads.
 	# Source stays the default for a hand-run build and is bumped by a human.
+	# IS ANYONE ELSE'S RECENT BUILD GOOD ENOUGH? This is what makes it safe -- and
+	# useful -- to run this timer on EVERY node.
+	#
+	# A schedule on one machine stops when that machine does, and GitHub's thirty days
+	# do not pause while a node is down. So every node should carry it. But the
+	# cluster lock alone only stops builds OVERLAPPING: with the timer's jitter, the
+	# second node usually starts after the first has finished, takes the lock, and
+	# publishes a second identical generation. N nodes, N builds.
+	#
+	# Asking first turns that into one build and N-1 machines standing by, and a node
+	# that stands down exits 0 rather than reporting a failure nobody should act on.
+	local due=0
+	"$BILLET" images due --config "$CONFIG" --max-age "$MAX_AGE" || due=$?
+
+	case "$due" in
+		0) ;;
+		2)
+			log "another node has already published a recent generation; standing by"
+
+			exit 0
+			;;
+		*)
+			die "could not tell whether a rebuild is due"
+			;;
+	esac
+
 	local version sha
 	read -r version sha <<<"$(latest_release)"
 

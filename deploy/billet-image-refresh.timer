@@ -23,10 +23,15 @@ Persistent=true
 # SPREAD, because a fleet that all rebuilds at 03:00 hits the archive and the cluster
 # together.
 #
-# THE SPREAD IS A COURTESY, NOT THE SAFETY. Two nodes overlapping is prevented in the
-# cluster itself: the refresh takes an `rbd lock` on a dedicated image before it
-# builds, so the second one refuses and says who holds it. The spread just keeps a
-# fleet from queueing on that lock -- and from hitting the archive together.
+# THE SPREAD IS A COURTESY, NOT THE SAFETY, and two nodes are prevented from
+# colliding twice over: whichever starts second asks whether a recent generation
+# already exists and stands down, and if two genuinely overlap, an `rbd lock` taken in
+# the cluster stops the writes interleaving.
+#
+# ENABLE THIS ON EVERY NODE. A timer on one machine stops when that machine does, and
+# GitHub's thirty days do not pause while it is down. Every node carrying it means the
+# rebuild happens as long as ANY node is up; the freshness check means it happens
+# once.
 RandomizedDelaySec=2h
 
 [Install]

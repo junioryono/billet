@@ -13,6 +13,7 @@ import (
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/provider"
 	"github.com/junioryono/billet/internal/state"
+	"github.com/junioryono/billet/internal/store/ceph"
 )
 
 // cmdImages works on the golden images microVM guests boot from.
@@ -36,9 +37,108 @@ func cmdImages(ctx context.Context, args []string) error {
 	switch args[0] {
 	case "verify":
 		return cmdImagesVerify(ctx, args[1:])
+	case "due":
+		return cmdImagesDue(ctx, args[1:])
 	default:
 		return fmt.Errorf("billet images: unknown subcommand %q", args[0])
 	}
+}
+
+// cmdImagesDue reports whether the golden image is old enough to rebuild.
+//
+// THIS IS WHAT LETS EVERY NODE CARRY THE TIMER. A schedule on one machine is a
+// schedule that stops when that machine does, and the thing it protects against --
+// GitHub refusing jobs to a runner thirty days behind a release -- does not pause
+// while a node is down. So the timer belongs on every node.
+//
+// THE CLUSTER LOCK ALONE DOES NOT MAKE THAT WORK, which is the part that is easy to
+// get wrong. The lock stops two builds OVERLAPPING, and the second node then waits
+// and rebuilds the same thing: with the timer's jitter, node B usually starts after
+// node A has finished and released, and publishes a second identical generation. N
+// nodes do N builds. This question is what turns them into one build with N-1
+// machines standing by.
+//
+// AGE COMES FROM THE GENERATION'S NAME, which billet writes in UTC, rather than from
+// the cluster's own timestamp, which `rbd snap ls` prints as a local-time string with
+// no offset -- two nodes in different zones would otherwise disagree about the age of
+// the same snapshot.
+//
+// EXIT 2 MEANS "NOTHING TO DO" RATHER THAN FAILURE. A node that finds a fresh
+// generation has succeeded at its job, and a unit reporting failure every week on
+// every machine but one teaches an operator to ignore it.
+func cmdImagesDue(ctx context.Context, args []string) error {
+	fs := newFlagSet("billet images due")
+	cfgPath := addConfigFlag(fs)
+	maxAge := fs.Duration("max-age", 6*24*time.Hour,
+		"rebuild when the newest generation is older than this")
+
+	rest, err := parseWithName(fs, args)
+	if err != nil {
+		return err
+	}
+
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		return err
+	}
+
+	if cfg.Node == nil || cfg.Node.Ceph == nil {
+		return errors.New("billet images due: this config names no ceph cluster, so there are " +
+			"no published generations to date")
+	}
+
+	image := rest
+	if image == "" {
+		image = firecrackerTierImage(cfg)
+	}
+
+	if image == "" {
+		return errors.New("billet images due: no image given and no firecracker tier names one")
+	}
+
+	store, err := ceph.New(*cfg.Node.Ceph)
+	if err != nil {
+		return err
+	}
+
+	newest, found, err := store.NewestGeneration(ctx, image)
+	if err != nil {
+		return err
+	}
+
+	if !found {
+		fmt.Printf("no generation of %s has been published; a build is due\n", image)
+
+		return nil
+	}
+
+	age := time.Since(newest.Built)
+	if age < *maxAge {
+		fmt.Printf("%s was published %s ago, which is inside %s; nothing to do\n",
+			newest.Name, age.Round(time.Minute), *maxAge)
+
+		return errNothingToBuild
+	}
+
+	fmt.Printf("the newest generation %s is %s old; a build is due\n",
+		newest.Name, age.Round(time.Minute))
+
+	return nil
+}
+
+// errNothingToBuild says a rebuild is not due. It is an ANSWER rather than a
+// failure, which is why it carries a status of its own.
+var errNothingToBuild = &exitError{code: 2, msg: "a recent generation already exists"}
+
+// firecrackerTierImage is the image this deployment's microVM tiers boot.
+func firecrackerTierImage(cfg *config.Config) string {
+	for i := range cfg.Tiers {
+		if cfg.Tiers[i].Provider == config.ProviderFirecracker && cfg.Tiers[i].Image != "" {
+			return cfg.Tiers[i].Image
+		}
+	}
+
+	return ""
 }
 
 // cmdImagesVerify boots one microVM from an image and makes the guest prove it works.
