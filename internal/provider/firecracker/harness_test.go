@@ -8,7 +8,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -325,12 +327,43 @@ func (h *harness) record(_ context.Context, bin string, args []string) ([]byte, 
 			return nil, err
 		}
 
+		// THE REAL JAILER WRITES A PID FILE, so the fake does too. Without one, a
+		// jail with an API socket and no pid file is the state billet refuses to
+		// act on — it cannot tell whether a VMM is running — and every teardown in
+		// the suite would stop there. The default points at a process that has
+		// already exited, which is what a stopped VMM looks like; a test that needs
+		// a live one writes its own over the top.
+		h.writeExitedPID(idOf(args))
+
 		if jailer != nil {
 			jailer(idOf(args))
 		}
 	}
 
 	return nil, nil
+}
+
+// writeExitedPID puts a pid that has certainly exited into a jail's pid file.
+//
+// The honest default: a VMM that has stopped. It is a REAL pid rather than a made-up
+// one, so the check billet performs — is this pid still the microVM — runs against
+// the kernel rather than against a number chosen to please it.
+func (h *harness) writeExitedPID(id string) {
+	if id == "" {
+		return
+	}
+
+	pid := os.Getpid()
+
+	//nolint:noctx // a process that exists only to exit needs no cancellation
+	if cmd := exec.Command("true"); cmd.Run() == nil && cmd.Process != nil {
+		pid = cmd.Process.Pid
+	}
+
+	j := h.p.jailFor(id)
+
+	//nolint:errcheck // a jail that has not been built yet has nowhere for this to go
+	_ = os.WriteFile(j.pidFile(), []byte(strconv.Itoa(pid)+"\n"), 0o600)
 }
 
 // idOf reads the --id out of a recorded jailer invocation.

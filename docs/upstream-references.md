@@ -123,6 +123,22 @@ Two rules learned building it:
   is why that phase carries a conformance suite.
 - `github-aws-runners/terraform-aws-github-runner` (MIT) — the proven shape for webhook-mode,
   instance-per-job runners on AWS. Reference for P12 if `JobSource` webhook mode is ever built.
+- **Firecracker (Apache-2.0) — a service billet drives, not code it takes.** The interface is the VMM's own HTTP API over a unix socket plus the `jailer` binary, both installed by an operator, exactly as Ceph and Docker are. There is no Go SDK dependency and there does not need to be: the API is six PUTs and a GET.
+
+  **Four claims this backend's design rests on were checked against upstream after being measured**, because each of them is a rule about somebody else's software and the repo's own rule is that those are pinned to measured behaviour. Three agree with the docs and two of those are worth stating anyway; two DISAGREE, and the disagreement is the interesting part.
+
+  | Claim | Upstream says | Measured on v1.16.1 |
+  |---|---|---|
+  | There is no way to kill a microVM through the API | `action_type` is exactly `FlushMetrics`, `InstanceStart`, `SendCtrlAltDel` ([swagger](https://github.com/firecracker-microvm/firecracker/blob/main/src/firecracker/swagger/firecracker.yaml)) | agrees — a real guest ignored `SendCtrlAltDel` for twenty seconds, which is what sent billet to signalling the VMM process |
+  | MMDS **V1 is the default**, and only V2 requires a session token before a GET returns anything | agrees ([mmds user guide](https://github.com/firecracker-microvm/firecracker/blob/main/docs/mmds/mmds-user-guide.md)) | agrees — the guest read the credential only after `PUT /latest/api/token` |
+  | Seccomp is on by default and is compiled into the **firecracker binary**, not installed by the jailer | agrees, and notes debug builds and experimental GNU targets carry no filters ([seccomp](https://github.com/firecracker-microvm/firecracker/blob/main/docs/seccomp.md)) | not separately measured; the attribution in billet's own comment was wrong until this check |
+  | The jailer builds its chroot at `<base>/<exec-file-name>/<id>/root` | agrees on the shape, and says it **does not resolve symlinks** ([jailer](https://github.com/firecracker-microvm/firecracker/blob/main/docs/jailer.md)) | **DISAGREES**: passing `/usr/local/bin/firecracker`, a symlink to `firecracker-v1.16.1`, produced `/srv/jailer/firecracker-v1.16.1/<id>/root` |
+  | The jailer writes `<exec-file-name>.pid` | says only when `--new-pid-ns` is passed | **DISAGREES**: written either way |
+
+  **Neither disagreement is left to be right about.** billet passes the RESOLVED path as `--exec-file`, so the name the jailer derives is the same one billet pinned whether or not it resolves symlinks — the behaviours converge instead of having to be predicted. And it passes `--new-pid-ns`, so the pid file is the documented contract rather than an observed courtesy, while teardown still treats "an API socket with no pid file" as a state it cannot interpret rather than as proof the VMM has stopped. Both are cheap, and both fail in the direction that does not unmap a running guest's disk.
+
+  The general shape is the one this file exists for: **measurement beats documentation about what a tool DOES, and documentation beats measurement about what a tool PROMISES.** Where they differ, build so the answer does not matter.
+
 - **Ceph (LGPL-2.1) — a service billet drives, not code it takes.** The interface is the `rbd`
   COMMAND, deliberately: `go-ceph` is cgo over librados, which would end the single static binary and
   the cross-build matrix in one move — the same reason `mattn/go-sqlite3` is banned. So Ceph is an

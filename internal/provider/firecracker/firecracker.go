@@ -8,11 +8,13 @@
 // does.
 //
 // EVERY GUEST RUNS UNDER THE JAILER, never under bare firecracker. The jailer
-// chroots the VMM, drops it to an unprivileged uid, puts it in a cgroup and
-// installs a seccomp filter before the VMM has parsed anything an operator wrote.
-// Running firecracker directly would leave a process with the whole host
-// filesystem and every syscall available, in front of a guest whose job is running
-// somebody's CI.
+// chroots the VMM, drops it to an unprivileged uid, puts it in a cgroup and gives
+// it a pid namespace of its own before the VMM has parsed anything an operator
+// wrote. Running firecracker directly would leave a process with the whole host
+// filesystem in front of a guest whose job is running somebody's CI. (The seccomp
+// filter is not the jailer's: it is compiled into the firecracker binary and on by
+// default, which is worth knowing because it means it is present either way and
+// absent from a debug build either way.)
 //
 // FOUR THINGS HERE WERE MEASURED ON THE REFERENCE HOST rather than read, and each
 // of them is a way this package could have looked correct and not been:
@@ -74,9 +76,17 @@ type Provider struct {
 	cfg   config.FirecrackerConfig
 	disk  RootDisk
 
-	// execName is the directory name the jailer will use, resolved once at
-	// construction because it cannot change while the process runs and because
-	// getting it wrong must fail loudly at startup rather than quietly per launch.
+	// execPath and execName are the firecracker binary with its symlinks already
+	// followed, and the directory name the jailer derives from it.
+	//
+	// RESOLVED ONCE, AND THE RESOLVED PATH IS WHAT THE JAILER IS GIVEN. Passing the
+	// configured symlink instead would let the two disagree the moment an operator
+	// retargeted it: billet would build, enumerate and clean up under the name it
+	// pinned at startup while the jailer chrooted into the new one — so the VMM
+	// would boot into an empty directory, and a launch that failed that way would
+	// leave a jail nothing lists. That is not hypothetical; it is what the first
+	// manual smoke test did, and firecracker aborted with no message at all.
+	execPath string
 	execName string
 
 	// uid and gid are what the jailer drops the VMM to.
@@ -177,7 +187,14 @@ const DefaultBootWait = 30 * time.Second
 // New builds a firecracker provider. owner names this billet deployment and is
 // written into every jail it creates.
 func New(owner string, cfg config.FirecrackerConfig, disk RootDisk, opts ...Option) (*Provider, error) {
-	if strings.TrimSpace(owner) == "" {
+	// NORMALIZED BEFORE IT IS STORED, not merely to be checked. ownerOf trims what
+	// it reads back, so an identity kept with its padding would never equal the
+	// marker it wrote — and a provider that fails to recognise its OWN jails
+	// reports an empty inventory, which frees the capacity of every lease it is
+	// running. The ec2 and ceph blocks each shipped this defect once, in the other
+	// direction.
+	owner = strings.TrimSpace(owner)
+	if owner == "" {
 		return nil, errors.New("firecracker: a provider needs the deployment identity that marks " +
 			"its jails, or it cannot tell its own microVMs from another billet's")
 	}
@@ -228,7 +245,7 @@ func New(owner string, cfg config.FirecrackerConfig, disk RootDisk, opts ...Opti
 
 	p.uid, p.gid = uid, gid
 
-	if p.execName, err = resolveExecName(cfg.BinaryPath); err != nil {
+	if p.execPath, p.execName, err = resolveExec(cfg.BinaryPath); err != nil {
 		return nil, err
 	}
 
@@ -348,7 +365,7 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*Instance, e
 	// launch failed with the reason a cleanup failed.
 	inst, err := p.launch(ctx, j, spec, device)
 	if err != nil {
-		return nil, errors.Join(err, p.unwind(ctx, j, spec))
+		return nil, errors.Join(err, p.unwind(ctx, j, spec, err))
 	}
 
 	p.log.Info("launched a microVM", "runner", spec.Name, "vcpu", spec.VCPU,
@@ -507,11 +524,13 @@ func (p *Provider) configure(
 			"iface_id":      guestInterface,
 			"host_dev_name": tap,
 		}},
-		// V2, WHICH IS A SECURITY PROPERTY RATHER THAN A VERSION. Under V1 any
-		// process in the guest can read the metadata with a bare GET, so a workflow
-		// step could take the runner registration; V2 requires a PUT to mint a
-		// session token first, which is the same reason billet insists on IMDSv2 for
-		// the instances the ec2 backend launches.
+		// V2, WHICH IS A SECURITY PROPERTY RATHER THAN A VERSION, AND V1 IS THE
+		// DEFAULT. Under V1 any process in the guest reads the metadata with a bare
+		// GET, so a workflow step could take the runner registration; V2 requires a
+		// PUT to mint a session token first. Since the service defaults to V1,
+		// naming the version here is what makes the credential safe rather than a
+		// belt-and-braces restatement — the same reason billet pins IMDSv2 on the
+		// instances its ec2 backend launches.
 		{"/mmds/config", map[string]any{
 			"version":            "V2",
 			"network_interfaces": []string{guestInterface},
@@ -597,12 +616,24 @@ func (p *Provider) startVMM(ctx context.Context, j jail) error {
 func (p *Provider) jailerArgs(j jail) []string {
 	return []string{
 		"--id", j.id,
-		"--exec-file", p.cfg.BinaryPath,
+		"--exec-file", p.execPath,
 		"--uid", strconv.Itoa(p.uid),
 		"--gid", strconv.Itoa(p.gid),
 		"--chroot-base-dir", p.cfg.ChrootBase,
 		"--cgroup-version", "2",
 		"--cgroup", "cpu.weight=100",
+		// A PID NAMESPACE OF ITS OWN, and the reason is a pid FILE rather than the
+		// isolation — though the isolation is worth having, since a VMM that cannot
+		// see a host process cannot signal one.
+		//
+		// The jailer's documentation says it writes `<exec-name>.pid` only when
+		// this is passed. Measured against v1.16.1 it writes one either way, and
+		// billet's teardown reads that file to find the process it must stop — so
+		// depending on the undocumented behaviour means a future version could stop
+		// writing it and billet would read "no pid file" as "nothing is running",
+		// then unmap the block device of a guest in the middle of a job. Asking for
+		// the documented contract costs nothing and removes that.
+		"--new-pid-ns",
 		// DETACHED, so billet is not the VMM's parent. A node that restarts must
 		// leave running jobs running — that is what restart recovery adopts — and a
 		// VMM that died with its launcher would fail every build on the host every
@@ -862,6 +893,22 @@ func (p *Provider) vmmPID(j jail) (int, error) {
 	raw, err := os.ReadFile(j.pidFile())
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
+			// NO PID FILE IS ONLY "NOTHING IS RUNNING" IF NO VMM EVER STARTED, and
+			// the API socket is what distinguishes the two. billet creates the jail
+			// before it runs the jailer, so a jail with neither is a launch that
+			// failed early and has nothing to stop. A jail with a SOCKET and no pid
+			// file is a VMM that got far enough to bind one — reading that as
+			// "nothing is running" would take the block device out from under a
+			// guest in the middle of a job.
+			//
+			// Not reachable on the measured version, which writes the file either
+			// way; reachable if a future one honours its own documentation, where
+			// the file appears only with --new-pid-ns.
+			if _, statErr := os.Stat(j.socket()); statErr == nil {
+				return 0, fmt.Errorf("firecracker: %s has an api socket and no pid file, so "+
+					"billet cannot tell whether its vmm is running", j.dir())
+			}
+
 			return 0, nil
 		}
 
@@ -941,7 +988,7 @@ const exitWait = 5 * time.Second
 // and dropped: a root disk that could not be discarded is pool space nothing will
 // reclaim, and a caller deciding whether to hold a lease in custody needs to know
 // the difference between "nothing started" and "something may still be here".
-func (p *Provider) unwind(ctx context.Context, j jail, spec provider.Spec) error {
+func (p *Provider) unwind(ctx context.Context, j jail, spec provider.Spec, cause error) error {
 	// A FRESH CONTEXT, because the usual reason a launch failed is that the
 	// caller's was cancelled — and asking a cancelled context to clean up
 	// guarantees the cleanup fails too.
@@ -951,11 +998,19 @@ func (p *Provider) unwind(ctx context.Context, j jail, spec provider.Spec) error
 	var failures []error
 
 	if err := p.stopVMM(ctx, j); err != nil {
-		failures = append(failures, err)
+		// THE SAME GATE Destroy HAS, and for the same reason: everything below
+		// destroys the evidence needed to ever stop this VMM. A launch that failed
+		// after starting one is exactly the case where that matters.
+		return err
 	}
 
-	if err := p.deleteTap(ctx, tapName(spec.Name)); err != nil {
-		failures = append(failures, err)
+	// NOT THE TAP THIS LAUNCH DID NOT CREATE. A collision on the truncated name
+	// belongs to another lease's running guest, and removing it would cut that
+	// guest's network over a launch failure somewhere else.
+	if !errors.Is(cause, errTapTaken) {
+		if err := p.deleteTap(ctx, tapName(spec.Name)); err != nil {
+			failures = append(failures, err)
+		}
 	}
 
 	if err := j.remove(); err != nil {
@@ -991,7 +1046,12 @@ func (p *Provider) Find(ctx context.Context, name string) (*Instance, bool, erro
 			// A jail with no marker is a launch interrupted between claiming the
 			// directory and writing the marker into it. It is billet's, and it may
 			// have a mapped root disk behind it.
-			return &Instance{ID: name, Name: name, Running: p.running(ctx, j)}, true, nil
+			running, runErr := p.running(ctx, j)
+			if runErr != nil {
+				return nil, false, runErr
+			}
+
+			return &Instance{ID: name, Name: name, Running: running}, true, nil
 		}
 
 		// NOT "NOT FOUND". The caller's next move on a miss is to conclude nothing
@@ -1005,7 +1065,12 @@ func (p *Provider) Find(ctx context.Context, name string) (*Instance, bool, erro
 		return nil, false, nil
 	}
 
-	return &Instance{ID: name, Name: name, Running: p.running(ctx, j)}, true, nil
+	running, err := p.running(ctx, j)
+	if err != nil {
+		return nil, false, err
+	}
+
+	return &Instance{ID: name, Name: name, Running: running}, true, nil
 }
 
 // List reports every microVM this backend is running for billet.
@@ -1073,8 +1138,13 @@ func (p *Provider) List(ctx context.Context) ([]*Instance, error) {
 					// false reads as "safe to destroy", and a partial teardown can
 					// remove a marker while the VMM behind it is still running —
 					// which is exactly the guest that must not be destroyed.
+					running, runErr := p.running(ctx, j)
+					if runErr != nil {
+						return nil, runErr
+					}
+
 					instances = append(instances, &Instance{
-						ID: name, Name: name, Running: p.running(ctx, j),
+						ID: name, Name: name, Running: running,
 					})
 
 					continue
@@ -1088,8 +1158,13 @@ func (p *Provider) List(ctx context.Context) ([]*Instance, error) {
 				continue
 			}
 
+			running, err := p.running(ctx, j)
+			if err != nil {
+				return nil, err
+			}
+
 			instances = append(instances, &Instance{
-				ID: name, Name: name, Running: p.running(ctx, j),
+				ID: name, Name: name, Running: running,
 			})
 		}
 	}
@@ -1109,19 +1184,25 @@ func (p *Provider) List(ctx context.Context) ([]*Instance, error) {
 // configured and never started has a socket, a pid and a jail, and will never run
 // anything, because whatever would have started it is gone. It is this backend's
 // `created` container.
-func (p *Provider) running(ctx context.Context, j jail) bool {
+func (p *Provider) running(ctx context.Context, j jail) (bool, error) {
 	info, err := p.apiFor(j.socket()).info(ctx)
 	if err != nil {
-		return !gone(err)
+		return !gone(err), nil
 	}
 
-	// A DIFFERENT VMM ON THIS SOCKET IS NOT THIS ONE RUNNING. Reporting true would
-	// hold a lease open for a guest that belongs to another lease entirely.
+	// A DIFFERENT VMM ON THIS SOCKET IS AN ERROR, NOT A "NO".
+	//
+	// Answering false would say this microVM has stopped, and the caller destroys
+	// what has stopped — so billet would tear down a lease's jail and disk on the
+	// strength of a socket it has just established belongs to something else. It
+	// cannot say the guest is running either. Neither answer is available, which is
+	// what an error is for.
 	if info.ID != j.id {
-		return false
+		return false, fmt.Errorf("firecracker: the vmm answering for %s calls itself %s, so "+
+			"billet cannot say whether %s is running", j.id, bounded(info.ID), j.id)
 	}
 
-	return info.State == stateRunning
+	return info.State == stateRunning, nil
 }
 
 // execRunner runs the jailer or ip, and returns standard output.

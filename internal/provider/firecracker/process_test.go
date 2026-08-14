@@ -168,23 +168,62 @@ func TestAPidFileThatIsNotAPidStopsTeardown(t *testing.T) {
 	}
 }
 
-// AND AN ABSENT PID FILE IS "NOTHING IS RUNNING", which is the idempotent case
-// teardown runs into constantly — a second Destroy, or one after a launch that
-// never got as far as starting a VMM.
-func TestAnAbsentPidFileIsNotAnError(t *testing.T) {
+// A JAIL WITH NEITHER A PID FILE NOR A SOCKET HAS NOTHING TO STOP.
+//
+// That is a launch that failed before the jailer ever ran — billet claims the jail
+// first, so the directory can exist with nothing behind it — and it is the ordinary
+// idempotent case teardown runs into. It is distinguished from a jail that HAS a
+// socket and no pid file, which is a VMM that got far enough to bind one and whose
+// state billet therefore cannot claim to know.
+func TestAJailWithNoVMMBehindItHasNothingToStop(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+
+	j := h.p.jailFor(theInstance)
+	if err := h.p.claim(j); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+
+	if err := h.p.Destroy(t.Context(), theInstance); err != nil {
+		t.Errorf("Destroy refused a jail with no vmm behind it: %v", err)
+	}
+}
+
+// AND ONE WITH A SOCKET AND NO PID FILE IS INDETERMINATE, NOT EMPTY.
+//
+// The measured jailer writes a pid file whether or not it is asked to, but its own
+// documentation says the file appears only with --new-pid-ns. billet asks for that
+// flag so the contract is the documented one — and still refuses to guess here, so a
+// version that honoured the docs differently could not make billet unmap the block
+// device of a guest in the middle of a job.
+func TestASocketWithNoPidFileIsNotReadAsStopped(t *testing.T) {
 	t.Parallel()
 
 	h := newHarness(t)
 	h.launch(t)
 
-	// The ordinary harness never writes one — only the jailer does, and this
-	// harness's jailer is a recorder.
-	if _, err := os.Stat(h.p.jailFor(theInstance).pidFile()); err == nil {
-		t.Fatal("the harness wrote a pid file, so its absence is not what is being tested")
+	j := h.p.jailFor(theInstance)
+
+	if err := os.Remove(j.pidFile()); err != nil {
+		t.Fatalf("remove the pid file: %v", err)
 	}
 
-	if err := h.p.Destroy(t.Context(), theInstance); err != nil {
-		t.Errorf("Destroy refused a jail with no vmm behind it: %v", err)
+	err := h.p.Destroy(t.Context(), theInstance)
+	if err == nil {
+		t.Fatal("Destroy treated a vmm it could not account for as already stopped")
+	}
+
+	if !strings.Contains(err.Error(), "cannot tell") {
+		t.Errorf("the error does not say that billet could not tell: %v", err)
+	}
+
+	if _, err := os.Stat(j.dir()); err != nil {
+		t.Errorf("the jail was removed although the vmm's state was unknown: %v", err)
+	}
+
+	if got := h.disk.discards(); len(got) != 0 {
+		t.Errorf("the root disk was discarded although the vmm's state was unknown: %v", got)
 	}
 }
 

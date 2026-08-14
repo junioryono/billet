@@ -2,6 +2,7 @@ package firecracker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -65,6 +66,19 @@ func (p *Provider) addTap(ctx context.Context, tap, bridge string) error {
 	if _, err := p.run(ctx, ipBinary, []string{
 		"tuntap", "add", "dev", tap, "mode", "tap", "user", fmt.Sprint(p.uid),
 	}); err != nil {
+		// A NAME THAT IS TAKEN IS SOMEBODY ELSE'S DEVICE, AND ITS OWN ERROR.
+		//
+		// The tap name truncates the lease id to fit the kernel's limit, so a
+		// collision between two live leases is possible and is deliberately loud —
+		// `ip tuntap add` refuses a name that exists. But the launch that loses
+		// must not then unwind it: deleting the device would cut the network out
+		// from under the OTHER lease's running guest, turning a refused launch into
+		// a broken job somewhere else.
+		if isDeviceExists(err) {
+			return fmt.Errorf("%w: %s is already a device on this host, so another lease's "+
+				"microVM is using it", errTapTaken, tap)
+		}
+
 		return fmt.Errorf("firecracker: create the network device %s: %w", tap, err)
 	}
 
@@ -102,8 +116,19 @@ func (p *Provider) deleteTap(ctx context.Context, tap string) error {
 	return nil
 }
 
+// errTapTaken marks a collision on the truncated tap name, so the unwind leaves the
+// device alone: it belongs to a microVM this launch did not start.
+var errTapTaken = errors.New("the network device name is already taken")
+
 // ipBinary is iproute2, which every distribution billet targets installs.
 const ipBinary = "ip"
+
+// isDeviceExists reports whether `ip` refused because the name was already taken.
+func isDeviceExists(err error) bool {
+	msg := strings.ToLower(err.Error())
+
+	return strings.Contains(msg, "file exists") || strings.Contains(msg, "already exists")
+}
 
 // isNoSuchDevice reports whether an `ip` failure was "there was nothing there".
 func isNoSuchDevice(err error) bool {

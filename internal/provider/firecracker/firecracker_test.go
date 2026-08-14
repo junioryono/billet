@@ -679,7 +679,12 @@ func TestAVMMBilletCannotReachIsReportedAsRunning(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 250*time.Millisecond)
 	defer cancel()
 
-	if !h.p.running(ctx, j) {
+	running, err := h.p.running(ctx, j)
+	if err != nil {
+		t.Fatalf("running: %v", err)
+	}
+
+	if !running {
 		t.Error("a microVM billet could not get an answer from was reported as not running, " +
 			"which is what makes the caller destroy it")
 	}
@@ -717,8 +722,14 @@ func TestASocketAnsweringForAnotherMicroVMIsNotThisOne(t *testing.T) {
 	vmm.id = provider.InstanceName("0000000000000000000000000000dead")
 	vmm.mu.Unlock()
 
-	if h.p.running(t.Context(), h.p.jailFor(theInstance)) {
-		t.Error("a socket answering for a different microVM was read as this one running")
+	// NEITHER ANSWER IS AVAILABLE HERE, which is what an error is for: saying the
+	// guest has stopped would make the caller destroy this lease's jail and disk on
+	// the strength of a socket billet has just established belongs to something
+	// else.
+	running, err := h.p.running(t.Context(), h.p.jailFor(theInstance))
+	if err == nil {
+		t.Errorf("a socket answering for a different microVM produced a verdict (running=%v) "+
+			"rather than a refusal", running)
 	}
 }
 
@@ -735,7 +746,12 @@ func TestAConfiguredButUnstartedGuestIsNotRunning(t *testing.T) {
 	vmm.state = "Not started"
 	vmm.mu.Unlock()
 
-	if h.p.running(t.Context(), h.p.jailFor(theInstance)) {
+	running, err := h.p.running(t.Context(), h.p.jailFor(theInstance))
+	if err != nil {
+		t.Fatalf("running: %v", err)
+	}
+
+	if running {
 		t.Error("a guest that was never started is reported as running, which holds its lease " +
 			"open for a job that cannot begin")
 	}
