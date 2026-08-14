@@ -671,8 +671,30 @@ func checkBridge(field, name string, required bool) []error {
 			"dash is read as an option", field, name)}
 	}
 
+	// NOT A NAME BILLET ALLOCATES FOR ITSELF. Guest devices are named bt-0, bt-1 and
+	// so on, taken lowest-first, so a bridge called bt-3 is a name a launch will
+	// eventually try to create — and `ip tuntap add` refuses it because the kernel
+	// already has it. That launch fails, hands the name back, and the next one draws
+	// the same name and fails identically: the host stops being able to start a
+	// microVM, for a reason that names a device rather than this setting.
+	if strings.HasPrefix(name, TapPrefix) {
+		return []error{fmt.Errorf("node.firecracker.%s %q starts with %q, which is how billet "+
+			"names the device it creates for each guest; a launch would eventually try to create "+
+			"this exact name and be refused, and every launch after it the same way. Rename the "+
+			"bridge", field, name, TapPrefix)}
+	}
+
 	return nil
 }
+
+// TapPrefix is how the firecracker backend names the network device it creates for
+// each guest.
+//
+// DECLARED HERE AND USED THERE, rather than the other way round, because config may
+// not import a provider — and a second copy in this file would be a constant that can
+// drift from the thing it is validating against, which is the whole failure this
+// check exists to prevent.
+const TapPrefix = "bt-"
 
 // CephConfig points this host at the Ceph cluster its site keeps.
 //
@@ -1713,12 +1735,24 @@ func (c *Config) validateNode() []error {
 	}
 
 	errs = append(errs, c.validateNodeTLS()...)
-	if c.Node.Provider == ProviderFirecracker {
-		if c.Node.Firecracker == nil {
-			errs = append(errs, errors.New("node.firecracker is required when provider is firecracker"))
-		} else {
-			errs = append(errs, CheckFirecracker(*c.Node.Firecracker)...)
-		}
+
+	switch {
+	case c.Node.Provider == ProviderFirecracker && c.Node.Firecracker == nil:
+		errs = append(errs, errors.New("node.firecracker is required when provider is firecracker"))
+
+	case c.Node.Provider == ProviderFirecracker:
+		errs = append(errs, CheckFirecracker(*c.Node.Firecracker)...)
+
+	// REFUSED RATHER THAN IGNORED, exactly as node.ceph is a few lines below. Only
+	// firecracker reads this block, so on any other provider it is a jail directory,
+	// a uid range and a bridge that look configured and are consulted by nothing —
+	// and the shape that produces it is somebody switching a node's provider and
+	// leaving the old block behind, which is precisely when a silent acceptance is
+	// most expensive.
+	case c.Node.Firecracker != nil:
+		errs = append(errs, fmt.Errorf("node.firecracker is set but this node's provider is %s, "+
+			"and only firecracker reads it, so this host would carry a jail directory, a uid "+
+			"range and a bridge that nothing consults", c.Node.Provider))
 	}
 
 	errs = append(errs, c.validateCephNode()...)
