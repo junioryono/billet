@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -39,6 +40,8 @@ func cmdImages(ctx context.Context, args []string) error {
 		return cmdImagesVerify(ctx, args[1:])
 	case "due":
 		return cmdImagesDue(ctx, args[1:])
+	case "list":
+		return cmdImagesList(ctx, args[1:])
 	case "reap":
 		return cmdImagesReap(ctx, args[1:])
 	case "promote":
@@ -776,4 +779,150 @@ func cmdImagesReap(ctx context.Context, args []string) error {
 	fmt.Printf("\nremoved %d generation(s)\n", len(removed))
 
 	return err
+}
+
+// cmdImagesList shows what the fleet's image state actually is.
+//
+// THE QUESTION THIS ANSWERS IS "WHAT IS MY FLEET BOOTING", and until now answering
+// it took three rbd commands and knowing which metadata keys billet writes. That is
+// the first thing somebody wants when a job boots the wrong image, and the last
+// thing they should have to reconstruct.
+//
+// A TIER SAYING `@verified` IS NOT AN ANSWER to what it boots, so this resolves it.
+func cmdImagesList(ctx context.Context, args []string) error {
+	fs := newFlagSet("billet images list")
+	cfgPath := addConfigFlag(fs)
+
+	rest, err := parseWithName(fs, args)
+	if err != nil {
+		return err
+	}
+
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		return err
+	}
+
+	if cfg.Node == nil || cfg.Node.Ceph == nil {
+		return errors.New("billet images list: this config names no ceph cluster, so there is " +
+			"nothing to list")
+	}
+
+	image := rest
+	if image == "" {
+		image = firecrackerTierImage(cfg)
+	}
+
+	if image == "" {
+		return errors.New("billet images list: no image given and no firecracker tier names one")
+	}
+
+	store, err := ceph.New(*cfg.Node.Ceph)
+	if err != nil {
+		return err
+	}
+
+	name, _, _ := strings.Cut(image, "@")
+
+	all, err := store.Generations(ctx, image)
+	if err != nil {
+		return err
+	}
+
+	verified, err := store.VerifiedGenerations(ctx, image)
+	if err != nil {
+		return err
+	}
+
+	current, hasCurrent, err := store.NewestVerified(ctx, image)
+	if err != nil {
+		return err
+	}
+
+	sort.Slice(all, func(i, j int) bool { return all[i].Built.After(all[j].Built) })
+
+	fmt.Println(name)
+
+	if len(all) == 0 {
+		fmt.Println("  (no generations published)")
+	}
+
+	for _, gen := range all {
+		runner, known, err := store.RunnerVersion(ctx, name+"@"+gen.Name)
+		if err != nil {
+			return err
+		}
+
+		// UNKNOWN RATHER THAN BLANK. A generation published before billet recorded
+		// this, or by hand, has nothing to say — and an empty column reads as though
+		// the question had been asked and answered.
+		runnerText := "runner unknown"
+		if known {
+			runnerText = "runner " + runner
+		}
+
+		marks := ""
+		if verified[gen.Name] {
+			marks = "  verified"
+		}
+
+		if hasCurrent && gen.Name == current.Name {
+			marks += "  <- @" + ceph.Verified
+		}
+
+		fmt.Printf("  %s  %-8s  %-16s%s\n", gen.Name,
+			shortAge(time.Since(gen.Built)), runnerText, marks)
+	}
+
+	return listTierImages(ctx, store, cfg)
+}
+
+// listTierImages says which generation each tier will actually boot.
+func listTierImages(ctx context.Context, store *ceph.Client, cfg *config.Config) error {
+	shown := false
+
+	for i := range cfg.Tiers {
+		tier := cfg.Tiers[i]
+		if tier.Image == "" || tier.Provider != config.ProviderFirecracker {
+			continue
+		}
+
+		if !shown {
+			fmt.Println("\ntiers")
+
+			shown = true
+		}
+
+		resolved, err := store.ResolveGeneration(ctx, tier.Image)
+		if err != nil {
+			// NOT FATAL, and printed rather than returned: a tier that cannot resolve
+			// is exactly what somebody is running this command to find out about, and
+			// stopping at the first one would hide the others.
+			fmt.Printf("  %-20s %s -> cannot resolve: %v\n", tier.Label, tier.Image, err)
+
+			continue
+		}
+
+		if resolved == tier.Image {
+			fmt.Printf("  %-20s %s\n", tier.Label, tier.Image)
+
+			continue
+		}
+
+		fmt.Printf("  %-20s %s -> %s\n", tier.Label, tier.Image, resolved)
+	}
+
+	return nil
+}
+
+// shortAge renders a duration the way somebody reads it aloud.
+func shortAge(d time.Duration) string {
+	switch {
+	case d < time.Hour:
+		return fmt.Sprintf("%dm ago", int(d.Minutes()))
+	case d < 48*time.Hour:
+		return fmt.Sprintf("%dh ago", int(d.Hours()))
+	default:
+		return fmt.Sprintf("%dd ago", int(d.Hours()/24))
+	}
 }

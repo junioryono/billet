@@ -180,9 +180,35 @@ clone of one, discarded when the guest is.
 
 ```bash
 sudo scripts/build-guest-image.sh          # build and publish a new generation
-billet images verify <image>@<generation>  # boot one and make the guest prove it works
+billet images verify <image>@<generation>  # boot one, make the guest prove it, record it
+billet images list                         # what exists, what is verified, what tiers boot
+billet images reap                         # remove generations nothing needs
 billet runner check                        # how close the runner is to being refused
 ```
+
+### Promotion, and why a tier should say `@verified`
+
+A tier names one of two things:
+
+```yaml
+image: ubuntu-2404-x64@g20260814145813   # exactly this, forever
+image: ubuntu-2404-x64@verified          # the newest one proved to boot
+```
+
+`@verified` is what lets a fleet take up a new image with **no config edit and no
+restart**: verification records itself, and the next launch resolves to it. Rollback is
+`billet images unpromote <image>@<generation>`, one command against the cluster rather
+than an edit on every node — which matters because it is what you reach for while a bad
+image is in front of every job.
+
+A bare image name stays refused. Choosing a generation for somebody who did not choose one
+is how a job boots something nobody decided on; naming `@verified` *is* the decision. And
+a launch resolves the alias before it does anything, so the log line names the generation
+rather than the word — "which image did this job actually run" has to be answerable
+afterwards.
+
+If nothing has passed verification, `@verified` **refuses** rather than booting something
+unproven.
 
 ### Why this is a schedule and not a chore
 
