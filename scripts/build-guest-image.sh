@@ -242,6 +242,17 @@ fi
 # changed silently, which is the one outcome this whole path exists to prevent. billet
 # refuses these before sending; the guest refuses them again because the argv it runs
 # should depend on what it can actually carry, not on the sender being careful.
+#
+# THIS CATCHES THE JSON ESCAPE AND NOT A LITERAL NUL BYTE, and that limit is deliberate
+# rather than overlooked. `raw` was read with a command substitution too, so bash has
+# already dropped any literal NUL before this line runs; catching those would mean
+# never letting the metadata touch a shell variable at all, which is a different agent.
+#
+# It is not worth being a different agent. A literal NUL can only arrive if something
+# other than billet is writing this microVM's metadata, and whatever can do that can
+# simply write `["/bin/whatever"]` instead — the NUL wins it nothing it did not already
+# have. So this refuses what a WRONG billet could send, which is the threat that is
+# real, and does not pretend to defend against a REPLACED one, which it cannot.
 if ! printf '%s' "$raw" | jq -e --slurp '
 	length == 1 and (.[0] | type == "array" and length > 0
 		and all(.[]; type == "string" and (contains("\u0000") | not)))' >/dev/null; then
