@@ -475,6 +475,16 @@ func checkSpec(spec provider.Spec) error {
 	//
 	// Refusing is the whole point. Neither of these is a command somebody meant to
 	// write, and a launch that stops here names the tier that has to be fixed.
+	// AND THE FIRST ARGUMENT NAMES SOMETHING. An empty argv[0] passes every check
+	// above — it is a non-empty command, valid UTF-8, no NUL — and then costs a jail,
+	// a uid, a tap and a cloned disk before the guest fails to exec it. Refusing here
+	// spends nothing, and says which tier to fix instead of leaving a launch that
+	// failed inside a machine nobody can see into.
+	if spec.Command[0] == "" {
+		return fmt.Errorf("firecracker: %s has an empty program in its command, so there is "+
+			"nothing for the guest to exec", spec.Name)
+	}
+
 	for i, arg := range spec.Command {
 		if !utf8.ValidString(arg) {
 			return fmt.Errorf("firecracker: %s has argument %d with bytes that are not valid "+
@@ -642,7 +652,7 @@ func (p *Provider) metadata(spec provider.Spec) (map[string]any, error) {
 // Republishing is safe precisely because generations are immutable: a job holding a
 // clone of the old generation keeps the agent it booted with, and clone v2 lets the
 // old generation be removed once nothing holds it.
-const GuestContract = "1"
+const GuestContract = "2"
 
 // bootArgs is the guest kernel command line.
 //

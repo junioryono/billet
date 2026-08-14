@@ -341,6 +341,8 @@ func TestASpecThatCannotRunAJobIsRefused(t *testing.T) {
 		// `json.Marshal` does not fail on invalid UTF-8 — it substitutes U+FFFD and
 		// reports success, so without this the guest would silently run a different
 		// command than the one it was given.
+		{"an empty program", func(s *provider.Spec) { s.Command = []string{"", "-c", "x"} },
+			"empty program"},
 		{"an argument that is not valid utf-8",
 			func(s *provider.Spec) { s.Command = []string{"/bin/sh", "-c", "echo \xff\xfe"} },
 			"not valid UTF-8"},
