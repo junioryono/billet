@@ -55,8 +55,11 @@ func TestThePreflightReportsTheDerivedJailDirectory(t *testing.T) {
 		t.Errorf("the report names %q, not the directory the jailer derives", report.JailDir)
 	}
 
-	if report.UID != 1000 || report.GID != 1000 {
-		t.Errorf("the report names uid %d gid %d", report.UID, report.GID)
+	// THE RANGE, because a host that has run out of uids stops being able to launch
+	// and the number is otherwise invisible.
+	if report.JailUIDMin != h.p.cfg.JailUIDMin || report.JailUIDCount != h.p.cfg.JailUIDCount {
+		t.Errorf("the report names the uid range %d+%d, want %d+%d",
+			report.JailUIDMin, report.JailUIDCount, h.p.cfg.JailUIDMin, h.p.cfg.JailUIDCount)
 	}
 }
 

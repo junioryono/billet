@@ -43,7 +43,7 @@ func TestAPidIsOnlyTheMicroVMIfItsCommandLineSaysSo(t *testing.T) {
 	}
 
 	if !owns {
-		t.Error("a process carrying the jail id in its argv was not recognised as the microVM")
+		t.Error("a process carrying `--id <jail id>` in its argv was not recognised as the microVM")
 	}
 
 	// AND A DIFFERENT ID IS NOT THIS ONE. Without this the check passes for every
@@ -277,7 +277,12 @@ func standIn(t *testing.T, jailID string, ignoreTerm bool) int {
 		script = "trap '' TERM; " + script
 	}
 
-	cmd := exec.CommandContext(t.Context(), "sh", "-c", script, jailID)
+	// THE PAIR `--id <jail id>`, BECAUSE THAT IS WHAT pidIsVMM LOOKS FOR. An earlier
+	// version put the id in $0 alone; when the check was tightened from "the id
+	// anywhere in argv" to the pair, every test using this helper began failing on
+	// Linux and was invisible on darwin, where they all skip. Arguments after $0 are
+	// inert to the script and present in argv, which is exactly what is needed.
+	cmd := exec.CommandContext(t.Context(), "sh", "-c", script, "billet-standin", "--id", jailID)
 
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start a stand-in vmm: %v", err)

@@ -19,9 +19,10 @@ type HostReport struct {
 	// binary's name — rather than configured, and an operator looking for a running
 	// guest will not find it under the path they wrote.
 	JailDir string
-	// JailUser, UID and GID are the account the VMM is dropped to.
-	JailUser string
-	UID, GID int
+	// JailUIDMin and JailUIDCount are the range of uids microVMs run as, one per
+	// guest. Reported because a range that is too small is a host that stops being
+	// able to launch, and the number is otherwise invisible.
+	JailUIDMin, JailUIDCount int
 	// Bridges are the networks guests attach to, trusted first. An empty untrusted
 	// entry means fork pull-request work is refused.
 	Bridge          string
@@ -46,9 +47,8 @@ var ErrNoKVM = errors.New("/dev/kvm is not available, so this host cannot run a 
 func (p *Provider) CheckHost(ctx context.Context) (HostReport, error) {
 	report := HostReport{
 		JailDir:         p.cfg.ChrootBase + "/" + p.execName,
-		JailUser:        p.cfg.JailUser,
-		UID:             p.uid,
-		GID:             p.gid,
+		JailUIDMin:      p.cfg.JailUIDMin,
+		JailUIDCount:    p.cfg.JailUIDCount,
 		Bridge:          p.cfg.Bridge,
 		UntrustedBridge: p.cfg.UntrustedBridge,
 	}
@@ -121,6 +121,19 @@ func (p *Provider) checkKernelImage() error {
 
 	if info.Size() == 0 {
 		return fmt.Errorf("firecracker: the guest kernel %s is empty", p.cfg.KernelImage)
+	}
+
+	// READABLE WITHOUT BEING OWNED, which is the other half of not chowning it.
+	// billet hard-links this file into every jail and deliberately leaves it owned by
+	// whoever installed it, so the unprivileged account the VMM runs as has to be
+	// able to open it on the strength of its mode alone. A root-owned 0600 kernel
+	// produces a VMM that starts, accepts its boot source, and fails to start the
+	// guest — which under --daemonize is a launch reporting success.
+	if info.Mode().Perm()&0o004 == 0 {
+		return fmt.Errorf("firecracker: the guest kernel %s is mode %04o, so the unprivileged "+
+			"account each microVM runs as cannot read it; billet does not take ownership of it "+
+			"(that would hand every vmm on this host the power to rewrite it), so `chmod a+r %s`",
+			p.cfg.KernelImage, info.Mode().Perm(), p.cfg.KernelImage)
 	}
 
 	return nil

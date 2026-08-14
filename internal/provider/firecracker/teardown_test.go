@@ -2,6 +2,7 @@ package firecracker
 
 import (
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -145,7 +146,7 @@ func TestAMicroVMSurvivesTheBinaryBeingUpgradedUnderIt(t *testing.T) {
 	}
 
 	upgraded, err := New("deployment-a", h.p.cfg, h.disk,
-		withRunner(h.record), withJailUser(1000, 1000))
+		withRunner(h.record))
 	if err != nil {
 		t.Fatalf("New after the upgrade: %v", err)
 	}
@@ -224,8 +225,7 @@ func TestDestroyRefusesAnotherDeploymentsMicroVM(t *testing.T) {
 	h := newHarness(t)
 	h.launch(t)
 
-	stranger, err := New("deployment-b", h.p.cfg, &fakeDisk{device: "/dev/rbd1"},
-		withJailUser(1000, 1000))
+	stranger, err := New("deployment-b", h.p.cfg, &fakeDisk{device: "/dev/rbd1"})
 	if err != nil {
 		t.Fatalf("New for the second deployment: %v", err)
 	}
@@ -340,11 +340,17 @@ func TestAPidBilletCannotVerifyIsNeverKilled(t *testing.T) {
 
 // THE GUEST KERNEL IS NOT HANDED TO THE ACCOUNT THE VMM RUNS AS.
 //
-// It is placed as a HARD LINK, so it is the same inode as the operator's only copy
-// on the host — chowning the name inside the jail chowns that file. Every VMM on the
-// machine runs as this account, and the owner of a file may chmod and write it, so
-// one VMM escape would rewrite the kernel every later microVM boots. Nothing needs
-// to leave the chroot for that: the link is inside it.
+// It is placed as a HARD LINK, so it is the same inode as the operator's only copy on
+// the host — chowning the name inside the jail chowns that file. Every VMM on the
+// machine could then chmod and rewrite the kernel every later microVM boots, without
+// ever leaving the chroot, because the link is inside it.
+//
+// THE FAKE WALKS THE TREE, WHICH IS THE WHOLE POINT OF THIS VERSION. The first one
+// recorded the PATH chown was called with and asserted it was the chroot rather than
+// the jail — on the premise that the kernel lived above the chroot. It does not: the
+// VMM opens it by a path under its own root, so narrowing the argument protected the
+// owner marker and left the kernel exactly as exposed. A fake that models the
+// argument agrees with whatever billet passes; one that models the WALK cannot.
 func TestTheGuestKernelIsNotGivenToTheJailedAccount(t *testing.T) {
 	t.Parallel()
 
@@ -355,9 +361,15 @@ func TestTheGuestKernelIsNotGivenToTheJailedAccount(t *testing.T) {
 			return os.WriteFile(path, []byte("device node"), 0o600)
 		},
 		func(root string, _, _ int) error {
-			chowned = append(chowned, root)
+			return filepath.WalkDir(root, func(path string, _ fs.DirEntry, err error) error {
+				if err != nil {
+					return err
+				}
 
-			return nil
+				chowned = append(chowned, path)
+
+				return nil
+			})
 		},
 	))
 
@@ -365,18 +377,78 @@ func TestTheGuestKernelIsNotGivenToTheJailedAccount(t *testing.T) {
 
 	j := h.p.jailFor(theInstance)
 
-	for _, root := range chowned {
-		// The kernel and the owner marker both live ABOVE root/: the kernel because
-		// giving away a hard link gives away the inode, and the marker because it is
-		// the fact List and Find trust when they decide whose microVM this is.
-		if root == j.dir() {
-			t.Errorf("the whole jail was given to the jailed account, which hands it the "+
-				"operator's kernel inode and the owner marker: %s", root)
+	for _, path := range chowned {
+		if path == j.kernelPath() {
+			t.Errorf("the guest kernel was chowned, which chowns the operator's only copy on "+
+				"the host: %s", path)
+		}
+
+		if path == j.ownerFile() {
+			t.Errorf("the owner marker was chowned; it is the fact List and Find trust when "+
+				"they decide whose microVM a jail holds: %s", path)
 		}
 	}
 
-	if len(chowned) != 1 || chowned[0] != j.root() {
-		t.Errorf("the chroot was not the thing given to the jailed account: %v", chowned)
+	// AND THE CHROOT ITSELF WAS, or the VMM cannot write its log or bind its socket.
+	if len(chowned) == 0 || chowned[0] != j.root() {
+		t.Errorf("the chroot was not given to the jailed account: %v", chowned)
+	}
+}
+
+// A LEASE CANNOT ACQUIRE A SECOND JAIL ACROSS A BINARY UPGRADE.
+//
+// The claim's Mkdir is atomic and settles a race between two launches — but only
+// within the CURRENT exec directory. After a version bump, a jail left under the old
+// binary's directory by a failed teardown would not block a relaunch of the same
+// lease, and the lease would then own two jails sharing one clone name and one
+// device: Find and Destroy act on whichever sorts first, so a Destroy can delete the
+// live guest's tap while stopping the stale jail's nothing, and List reports the id
+// twice.
+func TestALeaseCannotHoldTwoJailsAcrossAnUpgrade(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.launch(t)
+
+	// The upgrade: the stable symlink retargeted, billet restarted. The existing
+	// jail stays where the old jailer put it.
+	dir := filepath.Dir(h.p.cfg.BinaryPath)
+	next := filepath.Join(dir, "firecracker-v1.17.0")
+
+	if err := os.WriteFile(next, []byte("#!/bin/true\n"), 0o600); err != nil {
+		t.Fatalf("stage the new binary: %v", err)
+	}
+
+	if err := os.Remove(h.p.cfg.BinaryPath); err != nil {
+		t.Fatalf("clear the symlink: %v", err)
+	}
+
+	if err := os.Symlink(next, h.p.cfg.BinaryPath); err != nil {
+		t.Fatalf("retarget the symlink: %v", err)
+	}
+
+	upgraded, err := New("deployment-a", h.p.cfg, h.disk, withRunner(h.record))
+	if err != nil {
+		t.Fatalf("New after the upgrade: %v", err)
+	}
+
+	if upgraded.execName == h.p.execName {
+		t.Fatal("the upgraded provider resolved the same name, so this case stages nothing")
+	}
+
+	err = upgraded.claim(upgraded.jailFor(theInstance))
+	if err == nil {
+		t.Fatal("a lease with a jail under the old binary's directory was given a second one")
+	}
+
+	if !errors.Is(err, ErrJailExists) {
+		t.Errorf("the refusal is not the one that says a jail is in the way: %v", err)
+	}
+
+	// AND IT NAMES THE ONE THAT IS ACTUALLY THERE, which is under the OTHER
+	// directory — an operator told to look in the new one finds nothing.
+	if !strings.Contains(err.Error(), h.p.execName) {
+		t.Errorf("the error does not name the jail that exists: %v", err)
 	}
 }
 

@@ -277,12 +277,13 @@ func newHarness(t *testing.T, opts ...Option) *harness {
 	h := &harness{disk: &fakeDisk{device: "/dev/rbd0"}}
 
 	cfg := config.FirecrackerConfig{
-		BinaryPath:  link,
-		JailerPath:  filepath.Join(base, "jailer"),
-		KernelImage: kernel,
-		ChrootBase:  shortDir(t),
-		JailUser:    "billet",
-		Bridge:      "br0",
+		BinaryPath:   link,
+		JailerPath:   filepath.Join(base, "jailer"),
+		KernelImage:  kernel,
+		ChrootBase:   shortDir(t),
+		JailUIDMin:   900000,
+		JailUIDCount: 8,
+		Bridge:       "br0",
 	}
 
 	fixed := []Option{
@@ -290,7 +291,6 @@ func newHarness(t *testing.T, opts ...Option) *harness {
 		// its own success messages.
 		WithLogger(slog.New(slog.DiscardHandler)),
 		withRunner(h.record),
-		withJailUser(1000, 1000),
 		// mknod and chown need root and a real device; what matters for these tests
 		// is that they were CALLED with the right arguments, which the jail
 		// assertions check by the file the fake creates.
