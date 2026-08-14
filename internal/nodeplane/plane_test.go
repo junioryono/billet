@@ -883,15 +883,7 @@ func TestADestroyEndsALeasesOwnership(t *testing.T) {
 	}
 
 	// The node answers the destroy, as it would when the job completes.
-	go func() {
-		got, took, err := p.Poll(t.Context(), "n1", "first")
-		if err != nil || !took {
-			return
-		}
-
-		//nolint:errcheck // the result's fate is not what this test is about
-		_ = p.Result("n1", "first", nodeapi.CommandResult{ID: got.ID, OK: true})
-	}()
+	answerOneCommand(t, p, "first")
 
 	// Parked first, for the reason recorded above the other two: a command whose
 	// poller has not run yet is discarded on the command timeout.
@@ -1077,15 +1069,7 @@ func TestASupersessionDuringADestroyIsNotAConfirmation(t *testing.T) {
 
 	// The replacement takes the destroy and answers it truthfully: it has nothing
 	// to remove, because it does not have it.
-	go func() {
-		got, took, err := p.Poll(t.Context(), "n1", "second")
-		if err != nil || !took {
-			return
-		}
-
-		//nolint:errcheck // the result's fate is not what this test is about
-		_ = p.Result("n1", "second", nodeapi.CommandResult{ID: got.ID, OK: true})
-	}()
+	answerOneCommand(t, p, "second")
 
 	select {
 	case err := <-destroyed:
@@ -1194,15 +1178,7 @@ func TestAnOwnersConfirmationClearsTheRecordAndNobodyElseIsAsked(t *testing.T) {
 	register(t, p, "n2", config.ProviderDocker)
 
 	// The owner answers its own leg.
-	go func() {
-		got, took, err := p.Poll(t.Context(), "n1", "first")
-		if err != nil || !took {
-			return
-		}
-
-		//nolint:errcheck // the result's fate is not what this test is about
-		_ = p.Result("n1", "first", nodeapi.CommandResult{ID: got.ID, OK: true})
-	}()
+	answerOneCommand(t, p, "first")
 
 	// PARKED FIRST. A dispatched command is discarded once the command timeout
 	// elapses, so starting the poller and the destroy together races the
@@ -1682,4 +1658,51 @@ func (countingRegistrar) ResolveQuarantineFor(
 	context.Context, string, []string, int64,
 ) (int, error) {
 	return 0, nil
+}
+
+// answerOneCommand runs a node's polling loop until it has answered one command.
+//
+// A LOOP, BECAUSE A REAL NODE POLLS AGAIN. `Poll` long-polls for a bounded window
+// and returns "nothing for you" when it expires, and a helper that RETURNED there
+// stopped being a node at all: the parked state existed for one short window, and a
+// test waiting to observe it had to be scheduled inside that window or wait forever.
+//
+// That is what made three tests here fail together under load and pass ten times in
+// isolation. The symptom was a 60-second `waitFor` timeout naming the thing it was
+// waiting for, which is the least informative place for the cause to surface — the
+// helper had already given up, silently, seconds earlier.
+//
+// It also stops swallowing what went wrong. An error that is not the test ending is
+// reported, so a plane that refuses the poll says so instead of presenting as a
+// timeout somewhere else.
+func answerOneCommand(t *testing.T, p *Plane, incarnation string) {
+	t.Helper()
+
+	go func() {
+		for {
+			got, took, err := p.Poll(t.Context(), "n1", incarnation)
+
+			switch {
+			case t.Context().Err() != nil:
+				// The test finished. Not a failure, and reporting it after the test
+				// has ended would panic rather than inform.
+				return
+
+			case err != nil:
+				t.Errorf("the node could not poll: %v", err)
+
+				return
+
+			case !took:
+				// The long poll expired with nothing queued, which is the ordinary
+				// answer. A node parks again; so does this.
+				continue
+			}
+
+			//nolint:errcheck // the result's fate is not what these tests are about
+			_ = p.Result("n1", incarnation, nodeapi.CommandResult{ID: got.ID, OK: true})
+
+			return
+		}
+	}()
 }
