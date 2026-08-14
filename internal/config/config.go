@@ -2937,6 +2937,24 @@ const PollInterval = 15 * time.Second
 // Defaulted here rather than in each backend so every provider agrees, and so
 // the default is stated once in a place an operator reads. `./run.sh` is
 // relative because the stock image's working directory is the runner's home.
+//
+// `./run.sh` RATHER THAN `bin/Runner.Listener`, AND THE DIFFERENCE IS NOT STYLE.
+// A self-hosted runner updates itself, and it does that by EXITING: the listener
+// returns 3 for "updating", and `run.sh` is the loop that notices and re-execs it
+// with the same arguments — including the JIT registration, which is what lets the
+// restarted runner go on to take the job it was created for.
+//
+// Execing the listener directly removes that loop, and on a backend where each job
+// gets its own machine the result is not a slower job, it is a job that never runs:
+// the listener exits 3, the machine is destroyed as though the work were finished,
+// the job is redelivered, and the next machine does exactly the same thing. It
+// spends one guest per attempt and looks like a runner that starts and quietly
+// stops — which is this repo's most expensive failure shape, arrived at from a
+// direction no test here was watching.
+//
+// So a tier that overrides this should override it with something that still has
+// the loop. Read from the runner's own source: the `RunnerUpdating` return code,
+// and the `exit 2` retry in `run-helper.sh`.
 func (t Tier) RunnerCommand() []string {
 	if len(t.Command) > 0 {
 		return t.Command
