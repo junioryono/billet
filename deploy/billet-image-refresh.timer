@@ -3,7 +3,15 @@ Description=billet: keep the guest image inside GitHub's 30-day runner window
 Documentation=https://github.com/junioryono/billet
 
 [Timer]
-# WEEKLY, AGAINST A 30-DAY DEADLINE, and the margin is the point. GitHub stops
+# WEEKLY, AGAINST A 30-DAY DEADLINE THAT NOTHING ELSE CAN SAVE US FROM.
+#
+# An ordinary self-hosted runner updates itself in place, so a stale image costs a
+# download and keeps working. billet's cannot: a JIT configuration from GitHub's REST
+# API carries DisableUpdate = True, measured, with no parameter to ask otherwise. The
+# runner in the image is the runner forever, and rebuilding is the only way past the
+# deadline -- which makes this timer load-bearing rather than housekeeping.
+#
+# The margin is the point. GitHub stops
 # queueing jobs to a runner 30 days after a release it has not taken up, so a monthly
 # schedule leaves no room for the run that fails -- and this run CAN fail, on a
 # package mirror, on a verification, on a full disk. Weekly means four chances inside

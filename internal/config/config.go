@@ -2938,23 +2938,31 @@ const PollInterval = 15 * time.Second
 // the default is stated once in a place an operator reads. `./run.sh` is
 // relative because the stock image's working directory is the runner's home.
 //
-// `./run.sh` RATHER THAN `bin/Runner.Listener`, AND THE DIFFERENCE IS NOT STYLE.
-// A self-hosted runner updates itself, and it does that by EXITING: the listener
-// returns 3 for "updating", and `run.sh` is the loop that notices and re-execs it
-// with the same arguments — including the JIT registration, which is what lets the
-// restarted runner go on to take the job it was created for.
+// `./run.sh` RATHER THAN `bin/Runner.Listener`, and the reason is a loop the
+// listener does not have.
 //
-// Execing the listener directly removes that loop, and on a backend where each job
-// gets its own machine the result is not a slower job, it is a job that never runs:
-// the listener exits 3, the machine is destroyed as though the work were finished,
-// the job is redelivered, and the next machine does exactly the same thing. It
-// spends one guest per attempt and looks like a runner that starts and quietly
-// stops — which is this repo's most expensive failure shape, arrived at from a
-// direction no test here was watching.
+// A self-hosted runner updates itself by EXITING: the listener returns "updating"
+// and `run.sh` notices and re-execs it with the same arguments — including the JIT
+// registration, which is what lets the restarted runner go on to take the job it was
+// created for. Exec the listener directly and there is no loop: on a backend where
+// each job gets its own machine, the listener exits, the machine is destroyed as
+// though the work were finished, the job is redelivered, and the next machine does
+// the same thing.
 //
-// So a tier that overrides this should override it with something that still has
-// the loop. Read from the runner's own source: the `RunnerUpdating` return code,
-// and the `exit 2` retry in `run-helper.sh`.
+// MEASURED, AND NOT CURRENTLY REACHABLE: a JIT configuration minted by GitHub's REST
+// API carries `DisableUpdate = True` (and `Ephemeral = True`), so the service never
+// sends these runners an update in the first place. The loop above is therefore
+// insurance rather than a live requirement.
+//
+// It is worth keeping as the default anyway. It costs nothing, it is what GitHub
+// documents as the way to start a runner, and the setting it depends on is theirs to
+// change — while the failure it prevents is silent and spends a guest per attempt.
+//
+// THE REAL CONSEQUENCE OF THAT MEASUREMENT IS ELSEWHERE, and it is larger: because
+// these runners never self-update, GitHub's 30-day rule is a HARD EXPIRY for billet.
+// A runner more than 30 days behind a release is refused work outright, and nothing
+// on the guest can rescue it — only republishing the image can. See
+// internal/runnerrelease.
 func (t Tier) RunnerCommand() []string {
 	if len(t.Command) > 0 {
 		return t.Command
