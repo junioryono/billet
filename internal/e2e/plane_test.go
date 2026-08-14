@@ -453,16 +453,32 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 	// to register per incarnation: it runs after the test body, so nothing it
 	// destroys is still under assertion.
 	t.Cleanup(func() {
-		ctx := context.WithoutCancel(t.Context())
+		// BOUNDED, BECAUSE THIS TALKS TO A REAL CONTAINER RUNTIME. Every wait in
+		// these tests carries a deadline, but this does not wait — it CALLS, and a
+		// loaded or wedged Docker daemon answers whenever it feels like it. With no
+		// deadline the call blocks until the whole test binary is killed, which
+		// reports as a package that ran for six minutes and a goroutine dump,
+		// rather than as one sweep that could not reach the daemon.
+		//
+		// WithoutCancel is still right — cleanup has to outlive the test's own
+		// context — but WithoutCancel alone removes the deadline as well, which is
+		// how something that only ever waits a moment became something that can
+		// wait forever.
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 90*time.Second)
+		defer cancel()
 
 		instances, err := prov.List(ctx)
 		if err != nil {
+			t.Logf("the container sweep could not list what this test left behind, so some "+
+				"may survive it: %v", err)
+
 			return
 		}
 
 		for _, inst := range instances {
-			//nolint:errcheck // best-effort sweep; the test is already over
-			_ = prov.Destroy(ctx, inst.ID)
+			if err := prov.Destroy(ctx, inst.ID); err != nil {
+				t.Logf("the container sweep could not remove %s: %v", inst.ID, err)
+			}
 		}
 	})
 

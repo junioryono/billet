@@ -23,10 +23,10 @@ Persistent=true
 # SPREAD, because a fleet that all rebuilds at 03:00 hits the archive and the cluster
 # together.
 #
-# NOTE THE LIMIT OF THIS: the spread is per machine and the lock is per machine, so
-# two NODES sharing one Ceph cluster can still overlap -- a build writes into the one
-# head image before snapshotting it, so two at once interleave. Until publishing is
-# serialised cluster-wide, enable this timer on ONE node per cluster.
+# THE SPREAD IS A COURTESY, NOT THE SAFETY. Two nodes overlapping is prevented in the
+# cluster itself: the refresh takes an `rbd lock` on a dedicated image before it
+# builds, so the second one refuses and says who holds it. The spread just keeps a
+# fleet from queueing on that lock -- and from hitting the archive together.
 RandomizedDelaySec=2h
 
 [Install]
