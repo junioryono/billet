@@ -61,7 +61,11 @@ need_root() {
 bump_pin() {
 	local pin="$REPO/internal/runnerrelease/pinned.txt" body version sha current
 
-	body=$(curl -sSf -H "Accept: application/vnd.github+json" \
+	# BOUNDED, because this runs unattended. A blackholed endpoint would otherwise
+	# hold the whole job until systemd killed it two hours later, and the operator
+	# would see a build timeout rather than "github did not answer".
+	body=$(curl -sSf --connect-timeout 10 --max-time 60 --retry 2 --retry-delay 5 \
+		-H "Accept: application/vnd.github+json" \
 		https://api.github.com/repos/actions/runner/releases/latest) ||
 		die "could not ask github for the latest runner release"
 
@@ -70,14 +74,27 @@ bump_pin() {
 		sed -n 's/.*<!-- BEGIN SHA linux-x64 -->\([0-9a-f]\{64\}\)<!-- END SHA linux-x64 -->.*/\1/p' |
 		head -1)
 
-	if [ -z "$version" ] || [ -z "$sha" ]; then
-		die "github's answer did not carry a version and a linux-x64 checksum; refusing to pin
-	something unverified"
-	fi
+	# CHECKED FOR SHAPE, NOT ONLY FOR EMPTINESS. `jq -r` prints the STRING `null` for
+	# a field that is not there, which is not empty and would be pinned as a version
+	# — producing a download URL for a release called null.
+	case "$version" in
+		[0-9]*.[0-9]*.[0-9]*) ;;
+		*) die "github's answer named the release '$version', which is not a version" ;;
+	esac
+
+	case "$sha" in
+		[0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ;;
+		*) die "github's answer carried no linux-x64 checksum; refusing to pin something unverified" ;;
+	esac
 
 	current=$(awk 'NR==1{print $1}' "$pin" 2>/dev/null || true)
+	current_sha=$(awk 'NR==1{print $2}' "$pin" 2>/dev/null || true)
 
-	if [ "$current" = "$version" ]; then
+	# BOTH FIELDS, because a pin whose version matches and whose checksum is missing
+	# or stale is one every build fails on — and comparing the version alone would
+	# never rewrite it, so the failure would repeat every week until GitHub happened
+	# to publish something new.
+	if [ "$current" = "$version" ] && [ "$current_sha" = "$sha" ]; then
 		log "runner $version is already pinned"
 
 		return 1
@@ -105,9 +122,7 @@ bump_pin() {
 # check will keep saying, rather than on two runners and a monitor that lies.
 reinstall_billet() {
 	if ! command -v go >/dev/null 2>&1; then
-		die "the pin moved but go is not installed here, so $BILLET cannot be rebuilt from it.
-	Bump internal/runnerrelease/pinned.txt in source and deploy a new billet instead, or run
-	this with BUMP=no to keep rebuilding at the pinned release"
+		die "the pin moved but go is not installed here, so $BILLET cannot be rebuilt from it; bump internal/runnerrelease/pinned.txt in source and deploy a new billet, or run with BUMP=no to keep rebuilding at the pinned release"
 	fi
 
 	log "rebuilding $BILLET so its embedded pin matches"
@@ -166,8 +181,7 @@ main() {
 	# container is one no tier should ever be pointed at, and the whole value of
 	# publishing automatically is that this runs before anybody could.
 	if ! "$BILLET" images verify --config "$CONFIG" "$IMAGE_NAME@$generation"; then
-		die "$IMAGE_NAME@$generation was published and does NOT work; nothing has been pointed
-	at it, so the fleet is unaffected — but the next rebuild will not fix it by itself"
+		die "$IMAGE_NAME@$generation was published and does NOT work; nothing has been pointed at it, so the fleet is unaffected -- but the next rebuild will not fix it by itself"
 	fi
 
 	log "verified $IMAGE_NAME@$generation"

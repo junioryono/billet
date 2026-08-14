@@ -70,6 +70,27 @@ type exitError struct {
 
 func (e *exitError) Error() string { return e.msg }
 
+// exitStatus is what the process exits with for an error.
+//
+// THE CONCRETE TYPE, NOT AN ANONYMOUS INTERFACE. `interface{ ExitCode() int }` also
+// matches *exec.ExitError, which every failed subprocess in this program produces —
+// so `rbd` exiting 2 made BILLET exit 2, which is the status `billet runner check`
+// documents as "the runner image is due to be rebuilt". A monitor reading that would
+// act on a storage error as though it were a scheduled task. Measured: a verify
+// against a missing image exited 2, carrying rbd's status.
+//
+// A FUNCTION RATHER THAN FOUR LINES IN main, because the first test written for this
+// replicated the decision instead of exercising it, and passed against the very bug
+// it described.
+func exitStatus(err error) int {
+	var coded *exitError
+	if errors.As(err, &coded) {
+		return coded.code
+	}
+
+	return 1
+}
+
 // ExitCode is what the process should exit with.
 func (e *exitError) ExitCode() int { return e.code }
 
@@ -81,13 +102,7 @@ func main() {
 		}
 
 		fmt.Fprintf(os.Stderr, "billet: %v\n", err)
-
-		var coded interface{ ExitCode() int }
-		if errors.As(err, &coded) {
-			os.Exit(coded.ExitCode())
-		}
-
-		os.Exit(1)
+		os.Exit(exitStatus(err))
 	}
 }
 

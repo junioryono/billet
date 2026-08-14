@@ -126,7 +126,7 @@ func verifyGuestImage(
 		return err
 	}
 
-	srv, addr, err := listenForGuestReport(ctx, bridge, secret, report)
+	srv, addr, serveErr, err := listenForGuestReport(ctx, bridge, secret, report)
 	if err != nil {
 		return err
 	}
@@ -184,23 +184,46 @@ func verifyGuestImage(
 	fmt.Printf("verifying %s\n", image)
 
 	if _, err := prov.Launch(ctx, spec); err != nil {
-		return fmt.Errorf("billet images verify: %s did not launch: %w", image, err)
+		// A LAUNCH ERROR IS NOT PROOF THAT NOTHING STARTED, which the provider says
+		// in as many words: a cancelled context can kill this process after the work
+		// was accepted, and the backend's own unwind can itself fail. So the probe is
+		// reconciled rather than assumed away — otherwise a failed verification is
+		// also a leaked uid, device name and cloned disk.
+		return errors.Join(
+			fmt.Errorf("billet images verify: %s did not launch: %w", image, err),
+			destroyProbe(ctx, prov, name),
+		)
 	}
 
-	// DESTROYED WHATEVER HAPPENS, including on the failure path, because a
-	// verification that leaves a microVM behind holds a uid, a device name and a
-	// cloned disk — and the next verification draws the same lowest-free name.
-	defer func() {
-		if err := prov.Destroy(context.WithoutCancel(ctx), name); err != nil {
-			fmt.Printf("warning: the probe microVM was not cleaned up: %v\n", err)
-		}
-	}()
+	verdict := awaitGuestReport(ctx, report, serveErr, image, secret, wait)
+
+	// CLEANUP IS PART OF THE RESULT, NOT A WARNING BESIDE IT. As a bare defer this
+	// printed a line and returned success, so the weekly job would announce a
+	// verified image while probes accumulated — each holding a uid, a device name
+	// and a cloned disk, and each invisible to the node's sweep by design.
+	return errors.Join(verdict, destroyProbe(ctx, prov, name))
+}
+
+// awaitGuestReport waits for the guest to say something, or for a reason it cannot.
+func awaitGuestReport(
+	ctx context.Context, report <-chan string, serveErr <-chan error,
+	image, secret string, wait time.Duration,
+) error {
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
 
 	select {
 	case body := <-report:
 		return checkGuestReport(body, secret)
 
-	case <-time.After(wait):
+	case err := <-serveErr:
+		// THE LISTENER DIED, WHICH IS NOT THE IMAGE'S FAULT. Without this the wait
+		// runs to its deadline and the verdict blames a guest that was reporting to
+		// a socket nobody was reading.
+		return fmt.Errorf("billet images verify: the listener the guest reports to failed, so "+
+			"nothing here can say whether %s works: %w", image, err)
+
+	case <-timer.C:
 		return fmt.Errorf("billet images verify: %s booted and never reported back within %s, "+
 			"so it cannot be shown to run a job; boot it by hand with a console "+
 			"(console=ttyS0 systemd.journald.forward_to_console=1) to read the agent's own "+
@@ -211,10 +234,39 @@ func verifyGuestImage(
 	}
 }
 
+// destroyProbe removes a verification's microVM, asking first whether there is one.
+//
+// A BOUNDED CONTEXT OF ITS OWN. Cleanup has to outlive a cancelled or expired parent
+// — that is the whole reason it does not inherit one — but WithoutCancel alone
+// removes the deadline as well, so a teardown that wedges would hang a scheduled job
+// until systemd killed it two hours later.
+func destroyProbe(ctx context.Context, prov provider.Provider, name string) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
+	defer cancel()
+
+	inst, found, err := prov.Find(ctx, name)
+	if err != nil {
+		return fmt.Errorf("billet images verify: could not tell whether the probe %s is still "+
+			"running, so it may be holding a uid, a device name and a cloned disk: %w", name, err)
+	}
+
+	if !found {
+		return nil
+	}
+
+	if err := prov.Destroy(ctx, inst.ID); err != nil {
+		return fmt.Errorf("billet images verify: the probe %s was not cleaned up and holds a "+
+			"uid, a device name and a cloned disk; nothing else will reap it, because it is "+
+			"deliberately not owned by the node: %w", name, err)
+	}
+
+	return nil
+}
+
 // listenForGuestReport serves the address the guest posts its report to.
 func listenForGuestReport(
 	ctx context.Context, bridge, secret string, report chan<- string,
-) (*http.Server, string, error) {
+) (*http.Server, string, <-chan error, error) {
 	// ON THE BRIDGE'S OWN ADDRESS AND AN ARBITRARY PORT. The guest reaches this
 	// over the bridge, so loopback would be a listener it cannot see — and binding
 	// every interface would expose a port that accepts an unauthenticated report to
@@ -222,19 +274,28 @@ func listenForGuestReport(
 	// whatever else the operator runs.
 	host, err := hostAddrOnBridge(bridge, 0)
 	if err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
 
 	var lc net.ListenConfig
 
 	ln, err := lc.Listen(ctx, "tcp", host)
 	if err != nil {
-		return nil, "", fmt.Errorf("billet images verify: listen for the guest's report on %s: %w",
-			host, err)
+		return nil, "", nil, fmt.Errorf("billet images verify: listen for the guest's report on "+
+			"%s: %w", host, err)
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/report", func(w http.ResponseWriter, r *http.Request) {
+		// A REPORT IS A POST. Anything else on this bridge poking the port is not
+		// the guest, and reading a body from it is work done on somebody else's
+		// behalf.
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+
+			return
+		}
+
 		// BOUNDED, because this is a report from a guest running somebody's image
 		// and the alternative is letting it decide how much this process allocates.
 		body, err := io.ReadAll(io.LimitReader(r.Body, 64<<10))
@@ -270,12 +331,18 @@ func listenForGuestReport(
 
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 
+	// SERVE'S FAILURE IS REPORTED RATHER THAN DISCARDED. Swallowed, a listener that
+	// died on startup left the verification waiting out its full deadline and then
+	// blaming the image for not reporting to a socket nobody was reading.
+	failed := make(chan error, 1)
+
 	go func() {
-		//nolint:errcheck // the caller closes this and reports what the guest said
-		_ = srv.Serve(ln)
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			failed <- err
+		}
 	}()
 
-	return srv, ln.Addr().String(), nil
+	return srv, ln.Addr().String(), failed, nil
 }
 
 // checkGuestReport turns what the guest said into a verdict.
