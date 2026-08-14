@@ -87,6 +87,11 @@ type Provider struct {
 	chown    chownFunc
 	apiFor   func(socket string) *vmmAPI
 	jailUser func(name string) (int, int, error)
+	// pidOwner reports whether a pid is still a jail's VMM. A seam because it
+	// reads /proc, and because the rule it enforces — never signal a pid billet
+	// could not tie to this microVM — is only testable if "could not tell" can be
+	// staged.
+	pidOwner func(pid int, jailID string) (bool, error)
 
 	// bootWait bounds how long Launch waits for a VMM to answer its own API.
 	bootWait time.Duration
@@ -129,6 +134,16 @@ func withPrivileged(m mknodFunc, c chownFunc) Option {
 
 		if c != nil {
 			p.chown = c
+		}
+	}
+}
+
+// withPidOwner replaces the pid-to-microVM check, so a test can stage the answer
+// billet must refuse to act on: "could not tell".
+func withPidOwner(f func(pid int, jailID string) (bool, error)) Option {
+	return func(p *Provider) {
+		if f != nil {
+			p.pidOwner = f
 		}
 	}
 }
@@ -192,6 +207,7 @@ func New(owner string, cfg config.FirecrackerConfig, disk RootDisk, opts ...Opti
 		chown:    chownTree,
 		apiFor:   newVMMAPI,
 		jailUser: lookupJailUser,
+		pidOwner: pidIsVMM,
 		bootWait: DefaultBootWait,
 	}
 
@@ -302,9 +318,27 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*Instance, e
 
 	j := p.jailFor(spec.Name)
 
+	// THE JAIL IS CLAIMED BEFORE ANYTHING IS CLONED, and the order is not tidiness.
+	// A clone exists in the cluster and a mapping exists in the kernel the instant
+	// CloneRoot returns; if billet died between that and creating the jail, nothing
+	// on this host would carry the lease's name — List would report nothing, Find
+	// would say "not found", the caller would conclude nothing started and free the
+	// lease, and the clone would hold pool space with no way left to attribute it.
+	// A jail that exists first is a jail List reports and whose Destroy discards
+	// the disk.
+	//
+	// IT IS ALSO THE ONLY STEP WHOSE FAILURE MUST NOT UNWIND. Refusing a jail that
+	// already exists is a refusal to touch a previous microVM's state, so tearing
+	// it down would destroy exactly what the error says was left alone.
+	if err := p.claim(j); err != nil {
+		return nil, err
+	}
+
 	device, err := p.disk.CloneRoot(ctx, spec.Image, spec.Name)
 	if err != nil {
-		return nil, fmt.Errorf("firecracker: root disk for %s: %w", spec.Name, err)
+		return nil, errors.Join(
+			fmt.Errorf("firecracker: root disk for %s: %w", spec.Name, err),
+			j.remove())
 	}
 
 	// FROM HERE EVERY FAILURE UNWINDS WHAT IT MADE, in reverse order, and says so if
@@ -675,27 +709,72 @@ func (p *Provider) Destroy(ctx context.Context, id string) error {
 			"started", bounded(id))
 	}
 
-	j := p.jailFor(id)
+	j, found, err := p.findJail(id)
+	if err != nil {
+		return err
+	}
+
+	if !found {
+		// No jail under any of this host's chroot directories. There is nothing to
+		// stop and nothing to unlink — but the root disk is named after the lease
+		// rather than after the jail, so it is still discarded. That is the case
+		// where a launch died between cloning and claiming, and the clone is the
+		// only thing it left.
+		return p.discardWith(ctx, id, nil)
+	}
+
+	// NOT THIS DEPLOYMENT'S IS NOT THIS DEPLOYMENT'S TO DESTROY. Find refuses to
+	// even report another billet's microVM; this is the same rule at the layer that
+	// ACTS rather than the one that reports, which is where it actually protects
+	// anything.
+	owner, err := ownerOf(j)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("firecracker: read which deployment owns %s: %w", j.dir(), err)
+	}
+
+	if err == nil && owner != p.owner {
+		return fmt.Errorf("firecracker: %s belongs to deployment %s, not to this one",
+			j.dir(), bounded(owner))
+	}
+
+	// STOPPING COMES FIRST AND NOTHING PROCEEDS WITHOUT IT.
+	//
+	// Everything below destroys evidence: the jail holds the pid file, which is the
+	// only handle for ever stopping this VMM, and the tap is the guest's network. A
+	// teardown that removed them while the VMM was still running — or while billet
+	// merely could not TELL whether it was — would leave a guest executing a job
+	// that nothing can find, nothing can kill, and that List no longer reports, so
+	// its capacity is handed back and sold to another job. That is the exact failure
+	// this backend's inventory exists to prevent, reached through its teardown.
+	if err := p.stopVMM(ctx, j); err != nil {
+		return err
+	}
 
 	var failures []error
-
-	if err := p.stopVMM(ctx, j); err != nil {
-		failures = append(failures, err)
-	}
 
 	if err := p.deleteTap(ctx, tapName(id)); err != nil {
 		failures = append(failures, err)
 	}
 
+	// PAST A FAILED TAP REMOVAL, deliberately, unlike the stop above. The VMM is
+	// already gone by here, so the remaining steps are reclaiming things rather than
+	// acting on live compute — and stopping at the first would leave a mapped block
+	// device behind because a network device would not go.
 	if err := j.remove(); err != nil {
 		failures = append(failures, err)
 	}
 
-	// LAST, BECAUSE THE VMM HOLDS IT OPEN. Unmapping a device a running VMM has
-	// open fails, so the root disk goes only once the process that was reading it
-	// is gone.
+	return p.discardWith(ctx, id, failures)
+}
+
+// discardWith releases the root disk and reports it alongside whatever else failed.
+//
+// LAST, BECAUSE THE VMM HOLDS IT OPEN. Unmapping a device a running VMM has open
+// fails, so the root disk goes only once the process that was reading it is gone.
+func (p *Provider) discardWith(ctx context.Context, id string, failures []error) error {
 	if err := p.disk.DiscardRoot(ctx, id); err != nil {
-		failures = append(failures, fmt.Errorf("firecracker: discard the root disk of %s: %w", id, err))
+		failures = append(failures,
+			fmt.Errorf("firecracker: discard the root disk of %s: %w", id, err))
 	}
 
 	if len(failures) > 0 {
@@ -742,11 +821,29 @@ func (p *Provider) stopVMM(ctx context.Context, j jail) error {
 		return fmt.Errorf("firecracker: stop the microVM %s: %w", j.id, err)
 	}
 
-	if err := p.awaitExit(ctx, j, pid); err == nil {
+	err = p.awaitExit(ctx, j, pid)
+	if err == nil {
 		return nil
 	}
 
-	// AND SIGKILL IF IT WILL NOT, because the alternative is a microVM holding a
+	// ESCALATION NEEDS A CONFIRMED PID, NOT MERELY A FAILED WAIT.
+	//
+	// awaitExit fails for two unlike reasons: the VMM outlived its grace, or billet
+	// could not TELL whether the pid is still the VMM. Killing on the second is the
+	// act process.go refuses by name — signalling, as root, a number nothing ties to
+	// this jail. So the pid is checked once more, and a check that cannot answer
+	// propagates rather than escalating.
+	owns, checkErr := p.pidOwner(pid, j.id)
+	if checkErr != nil {
+		return errors.Join(err, checkErr)
+	}
+
+	if !owns {
+		// It exited while billet was deciding, which is the outcome that was wanted.
+		return nil
+	}
+
+	// AND SIGKILL IF IT WILL NOT GO, because the alternative is a microVM holding a
 	// mapped block device open forever while its capacity stays charged.
 	if err := signalVMM(pid, syscall.SIGKILL); err != nil {
 		return fmt.Errorf("firecracker: kill the microVM %s, which did not stop when asked: %w",
@@ -780,7 +877,7 @@ func (p *Provider) vmmPID(j jail) (int, error) {
 	// THE DISCRIMINATOR AGAINST PID REUSE. The jailer execs the VMM with
 	// `--id <jail id>`, so the command line is proof that this number is still the
 	// process the file was written for.
-	owns, err := pidIsVMM(pid, j.id)
+	owns, err := p.pidOwner(pid, j.id)
 	if err != nil {
 		return 0, err
 	}
@@ -809,7 +906,7 @@ func (p *Provider) awaitExit(ctx context.Context, j jail, pid int) error {
 		// A pid that no longer belongs to this microVM is one that has exited —
 		// including the case where the number has already been reused, which is
 		// equally proof that the VMM billet signalled is gone.
-		owns, err := pidIsVMM(pid, j.id)
+		owns, err := p.pidOwner(pid, j.id)
 		if err != nil {
 			return err
 		}
@@ -879,12 +976,22 @@ func (p *Provider) Find(ctx context.Context, name string) (*Instance, bool, erro
 		return nil, false, nil
 	}
 
-	j := p.jailFor(name)
+	j, found, err := p.findJail(name)
+	if err != nil {
+		return nil, false, err
+	}
+
+	if !found {
+		return nil, false, nil
+	}
 
 	owner, err := ownerOf(j)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil, false, nil
+			// A jail with no marker is a launch interrupted between claiming the
+			// directory and writing the marker into it. It is billet's, and it may
+			// have a mapped root disk behind it.
+			return &Instance{ID: name, Name: name, Running: p.running(ctx, j)}, true, nil
 		}
 
 		// NOT "NOT FOUND". The caller's next move on a miss is to conclude nothing
@@ -913,56 +1020,78 @@ func (p *Provider) Find(ctx context.Context, name string) (*Instance, bool, erro
 // has never launched anything has no such directory, and refusing there would make
 // the first sweep on a fresh host a failure.
 func (p *Provider) List(ctx context.Context) ([]*Instance, error) {
-	dir := filepath.Join(p.cfg.ChrootBase, p.execName)
-
-	entries, err := os.ReadDir(dir)
+	dirs, err := p.execDirs()
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, nil
-		}
-
-		return nil, fmt.Errorf("firecracker: list the microVMs under %s: %w", dir, err)
+		return nil, err
 	}
 
 	var instances []*Instance
 
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-
-		name := entry.Name()
-
-		if _, ours := provider.LeaseOf(name); !ours {
-			// A jail billet did not name. Nothing else writes into this directory
-			// today, but the action this list feeds is destruction, so a name that
-			// does not encode a lease is left alone rather than reported.
-			continue
-		}
-
-		j := p.jailFor(name)
-
-		owner, err := ownerOf(j)
+	// EVERY DIRECTORY A JAILER HAS BUILT IN, not just this binary's — see execDirs.
+	// A version bump behind the stable symlink the reference host uses would
+	// otherwise make every guest started before it vanish from the inventory, and a
+	// vanished lease is one whose capacity is handed back while its job runs.
+	for _, dir := range dirs {
+		entries, err := os.ReadDir(filepath.Join(p.cfg.ChrootBase, dir))
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
-				// A JAIL WITH NO MARKER IS REPORTED, NOT SKIPPED, and it is the case
-				// this distinction exists for: build writes the marker before anything
-				// else, so a jail without one is a launch that was interrupted between
-				// the mkdir and the first write. It is billet's, it may have a mapped
-				// root disk behind it, and skipping it would leave that unreclaimable.
-				instances = append(instances, &Instance{ID: name, Name: name, Running: false})
-
 				continue
 			}
 
-			return nil, fmt.Errorf("firecracker: read which deployment owns %s: %w", j.dir(), err)
+			return nil, fmt.Errorf("firecracker: list the microVMs under %s: %w",
+				filepath.Join(p.cfg.ChrootBase, dir), err)
 		}
 
-		if owner != p.owner {
-			continue
-		}
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
 
-		instances = append(instances, &Instance{ID: name, Name: name, Running: p.running(ctx, j)})
+			name := entry.Name()
+
+			if _, ours := provider.LeaseOf(name); !ours {
+				// A jail billet did not name. Nothing else writes into this
+				// directory today, but the action this list feeds is destruction,
+				// so a name that does not encode a lease is left alone rather than
+				// reported.
+				continue
+			}
+
+			j := jail{base: p.cfg.ChrootBase, execName: dir, id: name}
+
+			owner, err := ownerOf(j)
+			if err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					// A JAIL WITH NO MARKER IS REPORTED, NOT SKIPPED, and it is the
+					// case this distinction exists for: claim writes the marker as
+					// it creates the directory, so a jail without one is a launch
+					// interrupted between the two. It is billet's, it may have a
+					// mapped root disk behind it, and skipping it would leave that
+					// unreclaimable.
+					//
+					// ITS LIVENESS IS ASKED FOR RATHER THAN ASSUMED. Hard-coding
+					// false reads as "safe to destroy", and a partial teardown can
+					// remove a marker while the VMM behind it is still running —
+					// which is exactly the guest that must not be destroyed.
+					instances = append(instances, &Instance{
+						ID: name, Name: name, Running: p.running(ctx, j),
+					})
+
+					continue
+				}
+
+				return nil, fmt.Errorf("firecracker: read which deployment owns %s: %w",
+					j.dir(), err)
+			}
+
+			if owner != p.owner {
+				continue
+			}
+
+			instances = append(instances, &Instance{
+				ID: name, Name: name, Running: p.running(ctx, j),
+			})
+		}
 	}
 
 	return instances, nil
