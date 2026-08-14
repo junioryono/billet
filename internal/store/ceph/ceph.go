@@ -734,6 +734,28 @@ func (c *Client) cephCmd(ctx context.Context, asJSON bool, command ...string) ([
 	return c.run(ctx, c.ceph, append(args, command...))
 }
 
+// rbdCmd runs one `rbd` invocation, bounded like every other.
+//
+// The counterpart to cephCmd, and `asJSON` is a parameter for the same reason: the
+// commands that ACT — clone, map, unmap, rm — answer in prose or in nothing at
+// all, and asking them for json buys an empty object where the caller wants the
+// device path rbd printed.
+//
+// NO `-p`, and that is the measured half. These commands take POSITIONAL
+// `pool/image` specs, which is also why the pool and image names either side of
+// this are checked for a leading dash rather than assumed to be quotable.
+func (c *Client) rbdCmd(ctx context.Context, asJSON bool, command ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.wait)
+	defer cancel()
+
+	args := c.identity()
+	if asJSON {
+		args = append(args, "--format", "json")
+	}
+
+	return c.run(ctx, c.bin, append(args, command...))
+}
+
 // list counts the images in one pool.
 func (c *Client) list(ctx context.Context, pool string) (int, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.wait)

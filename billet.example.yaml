@@ -1,9 +1,23 @@
 # billet configuration — copy to billet.yaml and edit.
 #
-# THIS FILE DOES NOT RUN AS SHIPPED. It describes the intended deployment, which
-# is Firecracker, and the Firecracker provider is not built — `billet node`
-# refuses it. THREE edits HERE make it start today, and all three are needed —
-# the README's quickstart lists what else the file needs (the github: block, a
+# THIS FILE DESCRIBES A MACHINE, NOT A LAPTOP. It is the intended deployment —
+# Firecracker microVMs on bare metal, backed by a Ceph cluster — and that provider
+# is built and runs. What it needs is a HOST that can serve it, which is four
+# things a laptop does not have:
+#
+#   * /dev/kvm, with firecracker and jailer installed (see
+#     docs/reference-hardware.md for the versions billet is developed against).
+#   * A Ceph cluster with the two pools below, holding a golden image. Building
+#     one is docs/adr-003-ceph-rbd.md.
+#   * An unprivileged account for the jailer to drop the VMM to — `useradd
+#     --system --no-create-home --shell /usr/sbin/nologin billet`.
+#   * A bridge for guests to attach to.
+#
+# `billet check` proves all four before a job ever arrives, and names whichever
+# one is missing.
+#
+# TO RUN IT ON A LAPTOP INSTEAD, FOUR edits HERE, and all four are needed — the
+# README's quickstart lists what else the file needs (the github: block, a
 # writable server.state_dir) and the Docker daemon it assumes:
 #
 #   1. `provider: firecracker` -> `provider: docker`, in the node section and in
@@ -12,10 +26,14 @@
 #      backend that cannot attach a block device, so leaving it in place means
 #      the config does not load at all — see the block's own comment for why a
 #      storage section nothing will read is an error.
-#   3. `image:` -> a Docker image that contains the GitHub runner, for example
+#   3. Delete the `firecracker:` block below, for the same reason as the `ceph:`
+#      one: only the firecracker backend reads it, so on any other provider it is
+#      a jail directory, a uid range and a bridge that nothing consults, and it is
+#      REFUSED rather than ignored.
+#   4. `image:` -> a Docker image that contains the GitHub runner, for example
 #      `ghcr.io/actions/actions-runner:latest`. The image name is passed
-#      straight to `docker run`, so `ubuntu-2404-x64` below is a golden-image
-#      name for Firecracker and is not pullable.
+#      straight to `docker run`, so `ubuntu-2404-x64@g1` below is a golden-image
+#      reference for Firecracker and is not pullable.
 #
 # Edits 1 and 2 together get you a config that validates and a server that
 # starts, and every job then fails to launch — which is why the third is here.
@@ -223,12 +241,44 @@ node:
     # The guest kernel must include everything Docker needs, or service
     # containers fail in ways that are hard to read. Validate with moby's
     # contrib/check-config.sh rather than a hand-written list.
-    # Pinned to what the reference host runs: firecracker and jailer v1.16.1,
-    # installed as versioned filenames behind stable symlinks. See
-    # docs/reference-hardware.md — billet pins to the version the host has,
-    # rather than asking a host to match a version billet prefers.
     kernel_image: /var/lib/billet/images/vmlinux
+
+    # THE BRIDGE EVERY GUEST ATTACHES TO. Required: a runner with no network
+    # registers and then does nothing, which looks like a healthy tier running no
+    # jobs. billet creates one tap per microVM and attaches it here.
     bridge: br0
+
+    # AND A SEPARATE ONE FOR FORK PULL REQUESTS, whose ABSENCE is what refuses
+    # them. A microVM isolates the KERNEL, not the bridge it is attached to — a
+    # guest on the line above reaches whatever that bridge reaches, which on a
+    # machine that also holds the Ceph cluster and the control-plane database is
+    # everything that matters. Naming a network for untrusted work is how you say
+    # what a stranger's code may reach; until then billet will not run it at all.
+    # This is the same rule as node.ec2.untrusted_security_group_ids.
+    #
+    # untrusted_bridge: br-untrusted
+
+    # WHERE THE BINARIES ARE, defaulted to where their own instructions put them
+    # and where the reference host has them. The reference host installs them as
+    # versioned filenames behind stable symlinks, so `firecracker --version`
+    # always matches what is on disk — and note that the JAILER NAMES ITS CHROOT
+    # AFTER THE RESOLVED PATH, so with the layout below every microVM lives under
+    # /srv/jailer/firecracker-v1.16.1/ rather than /srv/jailer/firecracker/.
+    # `billet check` prints the directory it derives, because it is not the one
+    # written here.
+    #
+    # binary_path: /usr/local/bin/firecracker
+    # jailer_path: /usr/local/bin/jailer
+    # chroot_base: /srv/jailer
+
+    # THE ACCOUNT THE JAILER DROPS THE VMM TO, before it reads anything an
+    # operator or a job wrote. Defaults to `billet`, and root is REFUSED: dropping
+    # privileges is the whole reason to use the jailer, so running the VMM as root
+    # removes the point of it. Create one with
+    #
+    #   useradd --system --no-create-home --shell /usr/sbin/nologin billet
+    #
+    # jail_user: billet
 
   # THE SITE'S STORAGE. Golden images, the per-job root clone taken from one, and
   # every cache in the plane are RBD images in a Ceph cluster on the nodes' own
@@ -405,21 +455,21 @@ tiers:
   #   vcpu: 8
   #   memory: 32GiB
   #   disk: 160GiB
-  #   image: ubuntu-2404-x64
+  #   image: ubuntu-2404-x64@g1
 
   - label: billet-2vcpu-ubuntu-2404
     provider: firecracker
     vcpu: 2
     memory: 8GiB
     disk: 80GiB
-    image: ubuntu-2404-x64
+    image: ubuntu-2404-x64@g1
 
   - label: billet-4vcpu-ubuntu-2404
     provider: firecracker
     vcpu: 4
     memory: 16GiB
     disk: 80GiB
-    image: ubuntu-2404-x64
+    image: ubuntu-2404-x64@g1
     # Serve actions/cache from this machine instead of over the internet.
     # Off by default, and it should stay off for any tier that publishes release
     # artifacts or holds deployment secrets: interception terminates TLS in front
@@ -431,7 +481,7 @@ tiers:
     vcpu: 8
     memory: 32GiB
     disk: 160GiB
-    image: ubuntu-2404-x64
+    image: ubuntu-2404-x64@g1
     # Chromium and Postgres both misbehave on the default /dev/shm.
     shm: 1GiB
     intercept: true
@@ -445,7 +495,7 @@ tiers:
     vcpu: 4
     memory: 16GiB
     disk: 80GiB
-    image: ubuntu-2404-x64
+    image: ubuntu-2404-x64@g1
 
 # Apple Silicon, once a Mac mini joins the fleet. Such a host CAN serve both
 # macOS guests and native Linux arm64 guests, but whether it does is your
@@ -551,4 +601,4 @@ tiers:
 #     site: home
 #     vcpu: 4
 #     memory: 16GiB
-#     image: ubuntu-2404-x64
+#     image: ubuntu-2404-x64@g1

@@ -400,8 +400,8 @@ func TestTheOldZFSKeyExplainsWhatReplacedIt(t *testing.T) {
 	t.Parallel()
 
 	body := strings.Replace(withoutCeph(t),
-		"    kernel_image: /var/lib/billet/vmlinux\n",
-		"    kernel_image: /var/lib/billet/vmlinux\n    zfs_pool: tank\n", 1)
+		"    kernel_image: /var/lib/billet/vmlinux\n    bridge: br0\n",
+		"    kernel_image: /var/lib/billet/vmlinux\n    bridge: br0\n    zfs_pool: tank\n", 1)
 	if !strings.Contains(body, "zfs_pool: tank") {
 		t.Fatal("the firecracker block has changed, so this case adds nothing")
 	}
@@ -636,8 +636,8 @@ func TestEveryRemovedKeyIsExplainedInOnePass(t *testing.T) {
 
 	body := strings.Replace(withoutCeph(t), "  state_dir: /var/lib/billet/server\n",
 		"  state_dir: /var/lib/billet/server\n  lock_dir: /run/billet/locks\n", 1)
-	body = strings.Replace(body, "    kernel_image: /var/lib/billet/vmlinux\n",
-		"    kernel_image: /var/lib/billet/vmlinux\n    zfs_pool: tank\n", 1)
+	body = strings.Replace(body, "    kernel_image: /var/lib/billet/vmlinux\n    bridge: br0\n",
+		"    kernel_image: /var/lib/billet/vmlinux\n    bridge: br0\n    zfs_pool: tank\n", 1)
 
 	for _, must := range []string{"lock_dir: /run/billet/locks", "zfs_pool: tank"} {
 		if !strings.Contains(body, must) {
@@ -699,9 +699,10 @@ func TestTheDocumentedDockerConversionLoads(t *testing.T) {
 	// GIVEN, not that its sentence is unchanged — matching a whole line would fail
 	// on a reflow and train the next person to delete this loop.
 	for _, instruction := range []string{
-		"THREE edits",
+		"FOUR edits",
 		"`provider: firecracker` -> `provider: docker`",
 		"Delete the `ceph:` block",
+		"Delete the `firecracker:` block",
 		"`image:` -> a Docker image",
 	} {
 		if !strings.Contains(text, instruction) {
@@ -727,7 +728,11 @@ func TestTheDocumentedDockerConversionLoads(t *testing.T) {
 	// the same indentation.
 	text = deleteBlock(t, text, "  ceph:")
 
-	// Edit 3: a pullable image.
+	// Edit 3: delete the firecracker block, for the same reason — only that backend
+	// reads it, and a block nothing consults is refused rather than ignored.
+	text = deleteBlock(t, text, "  firecracker:")
+
+	// Edit 4: a pullable image.
 	if !strings.Contains(text, "image: ubuntu-2404-x64") {
 		t.Fatal("the example no longer names a golden image, so edit 3 patches nothing")
 	}
@@ -750,6 +755,10 @@ func TestTheDocumentedDockerConversionLoads(t *testing.T) {
 
 	if cfg.Node.Ceph != nil {
 		t.Error("the ceph block survived edit 2")
+	}
+
+	if cfg.Node.Firecracker != nil {
+		t.Error("the firecracker block survived edit 3")
 	}
 }
 
