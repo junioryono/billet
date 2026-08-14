@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -31,7 +32,15 @@ func mknodBlock(path, hostDevice string, uid, gid int) error {
 		return fmt.Errorf("firecracker: stat the root disk %s: %w", hostDevice, err)
 	}
 
-	stat, ok := info.Sys().(*unix.Stat_t)
+	// syscall.Stat_t, NOT unix.Stat_t. The two are structurally identical and are
+	// DIFFERENT TYPES, so asserting to the x/sys one always fails — os.Stat fills
+	// Sys() with the standard library's. Every launch then failed with "does not
+	// report a device number", about a device that reports one perfectly well.
+	//
+	// No unit test could reach this: mknod needs root and a real block device, so
+	// it is stubbed everywhere except against a live host. Found on the first real
+	// launch, which is the argument for having one.
+	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {
 		return fmt.Errorf("firecracker: %s does not report a device number", hostDevice)
 	}

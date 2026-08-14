@@ -59,6 +59,10 @@ func (j jail) socket() string { return filepath.Join(j.root(), "run", "firecrack
 // place this backend has to write one.
 func (j jail) ownerFile() string { return filepath.Join(j.dir(), "billet-owner") }
 
+// pidFile is where the jailer records the VMM's process id. Named after the
+// resolved binary, like the chroot directory, and for the same reason.
+func (j jail) pidFile() string { return filepath.Join(j.root(), j.execName+".pid") }
+
 // kernelPath is where the guest kernel lands inside the chroot.
 func (j jail) kernelPath() string { return filepath.Join(j.root(), guestKernel) }
 
