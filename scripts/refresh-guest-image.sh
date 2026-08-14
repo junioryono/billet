@@ -20,6 +20,16 @@
 # makes.
 set -euo pipefail
 
+# ONE AT A TIME, AND THE LOCK IS HELD FOR THE WHOLE RUN. A systemd ExecStartPre of
+# `flock ... true` acquires and releases in the same millisecond and protects
+# nothing; holding it here covers the hand-run case too, which is the one a unit file
+# cannot reach. Two of these overlapping would debootstrap into one workspace and,
+# worse, `dd` into the same head image concurrently.
+if [ -z "${BILLET_REFRESH_LOCKED:-}" ]; then
+	export BILLET_REFRESH_LOCKED=1
+	exec flock -n /var/lock/billet-image-refresh.lock "$0" "$@"
+fi
+
 BILLET="${BILLET:-billet}"
 CONFIG="${CONFIG:-/etc/billet/billet.yaml}"
 REPO="${REPO:-$(cd "$(dirname "$0")/.." && pwd)}"
@@ -74,9 +84,36 @@ bump_pin() {
 	fi
 
 	log "runner $current -> $version"
-	printf '%s %s\n' "$version" "$sha" >"$pin"
+
+	# WRITTEN WITH ITS OWN CHECK, because this whole function runs as an `if`
+	# condition -- which suspends `set -e` for every command in it. A failed write on
+	# a full or read-only filesystem would otherwise be ignored and the run would go
+	# on to log a bump that did not happen and build the old release.
+	if ! printf '%s %s\n' "$version" "$sha" >"$pin"; then
+		die "could not write the pin at $pin"
+	fi
 
 	return 0
+}
+
+# reinstall_billet rebuilds the binary so its embedded pin matches the file.
+#
+# THE PIN IS EMBEDDED, so bumping the file alone splits it in two: the guest image
+# would install the new runner while `billet runner check` kept reporting the old one
+# and `billet ami` kept building the ec2 image from it. Refusing here is better than
+# leaving that split in place -- the operator ends up on the old runner, which the
+# check will keep saying, rather than on two runners and a monitor that lies.
+reinstall_billet() {
+	if ! command -v go >/dev/null 2>&1; then
+		die "the pin moved but go is not installed here, so $BILLET cannot be rebuilt from it.
+	Bump internal/runnerrelease/pinned.txt in source and deploy a new billet instead, or run
+	this with BUMP=no to keep rebuilding at the pinned release"
+	fi
+
+	log "rebuilding $BILLET so its embedded pin matches"
+
+	( cd "$REPO" && go build -o "$BILLET" ./cmd/billet ) ||
+		die "could not rebuild $BILLET from $REPO"
 }
 
 # newest_generation is the most recently published snapshot of the image.
@@ -94,12 +131,24 @@ main() {
 
 	# A BUMP IS NOT REQUIRED FOR A REBUILD. Even on the current release the image
 	# accumulates unpatched packages, and a build script nobody runs is one that has
-	# quietly broken — so the schedule rebuilds regardless and the bump is just the
-	# reason it is urgent.
-	if bump_pin; then
-		log "the pin moved; rebuilding"
+	# quietly broken — so the schedule rebuilds regardless, and a bump is only what
+	# makes a given week's rebuild urgent.
+	#
+	# BUMPING IS OFF BY DEFAULT, AND THAT IS THE HONEST DEFAULT. The pinned version
+	# is SOURCE: it is embedded into the billet binary, so a script that rewrote the
+	# file without rebuilding and reinstalling that binary would leave `billet runner
+	# check` alarming about a fleet that is current, and `billet ami` building the ec2
+	# image from the old release — which is precisely the two-pin drift the pin file
+	# exists to prevent. With BUMP=yes this rebuilds the binary from the same checkout
+	# so the two cannot disagree, and refuses if it cannot.
+	if [ "${BUMP:-no}" = "yes" ]; then
+		if bump_pin; then
+			reinstall_billet
+			log "the pin moved and $BILLET was rebuilt from it"
+		fi
 	else
-		log "rebuilding anyway, for the package updates and to prove the build still works"
+		log "rebuilding at the pinned runner ($(awk 'NR==1{print $1}' \
+			"$REPO/internal/runnerrelease/pinned.txt")); set BUMP=yes to take up a new release"
 	fi
 
 	"$REPO/scripts/build-guest-image.sh"

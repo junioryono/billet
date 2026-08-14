@@ -210,7 +210,7 @@ func (c *Client) unmapDevice(ctx context.Context, device, name string) error {
 // the errno rather than a code of its own — measured, like every other exit status
 // this package discriminates on.
 func isDeviceBusy(err error) bool {
-	return strings.Contains(err.Error(), "(16)") ||
+	return strings.Contains(err.Error(), "(16) Device or resource busy") ||
 		strings.Contains(strings.ToLower(err.Error()), "device or resource busy")
 }
 

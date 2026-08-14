@@ -27,9 +27,12 @@ ExecStart=/opt/billet/scripts/refresh-guest-image.sh
 # generation half written into the pool.
 TimeoutStartSec=2h
 
-# ONE AT A TIME. Two of these racing would both debootstrap into the same workspace.
-# The timer cannot start a second while the first runs, but a hand-run one could.
-ExecStartPre=/usr/bin/flock -n /run/billet-image-refresh.lock true
+# ONE AT A TIME IS THE SCRIPT'S OWN JOB, and deliberately not a unit setting here.
+# An ExecStartPre of `flock ... true` takes the lock, runs true, and releases it in
+# the same millisecond -- it holds nothing for the two hours that follow. The script
+# re-execs itself under flock instead, which also covers the case a unit file cannot
+# reach: somebody running the script by hand while the timer's copy is going.
 
-[Install]
-WantedBy=multi-user.target
+# NO [Install] SECTION, ON PURPOSE. Enable the TIMER, not this. `systemctl enable
+# billet-image-refresh.service` is an easy neighbouring mistake and would run a
+# two-hour root build at every boot.

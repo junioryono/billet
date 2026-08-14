@@ -14,6 +14,11 @@ OnCalendar=Sun 03:00
 Persistent=true
 # SPREAD, because a fleet that all rebuilds at 03:00 hits the archive and the cluster
 # together.
+#
+# NOTE THE LIMIT OF THIS: the spread is per machine and the lock is per machine, so
+# two NODES sharing one Ceph cluster can still overlap -- a build writes into the one
+# head image before snapshotting it, so two at once interleave. Until publishing is
+# serialised cluster-wide, enable this timer on ONE node per cluster.
 RandomizedDelaySec=2h
 
 [Install]

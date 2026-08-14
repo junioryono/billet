@@ -81,8 +81,29 @@ func cmdImagesVerify(ctx context.Context, args []string) error {
 		return err
 	}
 
-	prov, err := newProvider(cfg, deployment)
+	// AN IDENTITY OF ITS OWN, AND THIS IS NOT TIDINESS.
+	//
+	// A probe's lease is invented here and the allocator has never heard of it. Run
+	// under the node's identity, the node daemon's sweep — which lists every
+	// instance this deployment owns and destroys any whose lease it cannot account
+	// for — finds the probe, correctly concludes it is an orphan, and kills it. On a
+	// five-minute tick against a boot-to-report window of a minute or so, that lands
+	// inside the window often enough to matter, and what an operator sees is the
+	// weekly gate reporting that a perfectly good image "does NOT work".
+	//
+	// A separate identity puts the probe outside what that sweep will touch: a jail
+	// whose owner marker is another billet's is "not ours to report and emphatically
+	// not ours to destroy". This command cleans up its own, below and on the way out.
+	prov, err := newProvider(cfg, probeDeployment(deployment))
 	if err != nil {
+		return err
+	}
+
+	// AND ANYTHING AN EARLIER RUN LEFT BEHIND GOES FIRST. The separate identity is
+	// what keeps the node's sweep off these, which also means nothing else will ever
+	// reap one — so a run that was killed between Launch and Destroy would otherwise
+	// hold a uid, a device name and a cloned disk until somebody noticed.
+	if err := reapEarlierProbes(ctx, prov); err != nil {
 		return err
 	}
 
@@ -98,7 +119,14 @@ func verifyGuestImage(
 	// no job at all.
 	report := make(chan string, 1)
 
-	srv, addr, err := listenForGuestReport(ctx, bridge, report)
+	// THE SECRET IS MINTED BEFORE THE LISTENER, because the listener uses it to
+	// decide what is even worth keeping.
+	secret, err := verificationSecret()
+	if err != nil {
+		return err
+	}
+
+	srv, addr, err := listenForGuestReport(ctx, bridge, secret, report)
 	if err != nil {
 		return err
 	}
@@ -108,14 +136,6 @@ func verifyGuestImage(
 			fmt.Printf("warning: the report listener did not close: %v\n", err)
 		}
 	}()
-
-	// A SECRET THIS RUN INVENTED, so that a report proves THIS guest read THIS
-	// registration. A fixed string would be satisfied by a stale process, an earlier
-	// microVM somebody forgot to destroy, or a cached anything.
-	secret, err := verificationSecret()
-	if err != nil {
-		return err
-	}
 
 	lease, err := probeLeaseID()
 	if err != nil {
@@ -150,8 +170,13 @@ func verifyGuestImage(
 		Image:  image,
 		VCPU:   2,
 		Memory: 2 * config.GiB,
+		// RUN ONCE AND POSTED, rather than run for a console that does not exist and
+		// then run again to be sent: billet passes no console= to a guest, so the
+		// first copy's output went nowhere while doubling the time to report and
+		// pulling the test container twice.
 		Command: []string{"/bin/sh", "-c",
-			probe + `; curl -sf --max-time 20 --data-binary "$(` + probe + `)" http://` + addr + `/report`},
+			`report=$(` + probe + `); curl -sf --max-time 20 --data-binary "$report" http://` +
+				addr + `/report`},
 		Trust:     provider.TrustTrusted,
 		JITConfig: secret,
 	}
@@ -188,7 +213,7 @@ func verifyGuestImage(
 
 // listenForGuestReport serves the address the guest posts its report to.
 func listenForGuestReport(
-	ctx context.Context, bridge string, report chan<- string,
+	ctx context.Context, bridge, secret string, report chan<- string,
 ) (*http.Server, string, error) {
 	// ON THE BRIDGE'S OWN ADDRESS AND AN ARBITRARY PORT. The guest reaches this
 	// over the bridge, so loopback would be a listener it cannot see — and binding
@@ -215,6 +240,22 @@ func listenForGuestReport(
 		body, err := io.ReadAll(io.LimitReader(r.Body, 64<<10))
 		if err != nil {
 			http.Error(w, "could not read the report", http.StatusBadRequest)
+
+			return
+		}
+
+		// THE SECRET IS CHECKED HERE, NOT ONLY IN THE VERDICT, because the channel
+		// holds ONE report and the first arrival wins it. The bridge this listens on
+		// is carrying other guests running somebody's CI, so a stray POST — or a
+		// scanner — would take the slot, the real report would be dropped by the
+		// non-blocking send, and the verdict would be a confident FAIL saying the
+		// registration never arrived. Wrong, and misdiagnosed.
+		//
+		// A false PASS is not reachable either way: the secret travels only in MMDS
+		// V2, which is session-token gated and per-interface, so nothing else on the
+		// bridge can learn it.
+		if !strings.Contains(string(body), "jit="+secret) {
+			w.WriteHeader(http.StatusNoContent)
 
 			return
 		}
@@ -260,13 +301,13 @@ func checkGuestReport(body, secret string) error {
 		failures = append(failures, "the command did not run as the unprivileged runner account")
 	}
 
-	if !strings.Contains(body, "runner=2.") {
+	if !hasVersion(body, "runner=") {
 		failures = append(failures, "the actions runner binary did not report a version, so a "+
 			"job would fail at startup (a debootstrap rootfs missing libicu looks exactly "+
 			"like this)")
 	}
 
-	if !strings.Contains(body, "docker=2") && !strings.Contains(body, "docker=1") {
+	if !hasVersion(body, "docker=") {
 		failures = append(failures, "the docker daemon did not answer on this kernel")
 	}
 
@@ -284,4 +325,55 @@ func checkGuestReport(body, secret string) error {
 	fmt.Println("actions runner and runs a container.")
 
 	return nil
+}
+
+// reapEarlierProbes destroys any microVM a previous verification left behind.
+//
+// These are only ever this command's own: the provider is built with an identity
+// nothing else uses, so List reports exactly the probes of earlier runs and never a
+// real job's guest.
+func reapEarlierProbes(ctx context.Context, prov provider.Provider) error {
+	leftovers, err := prov.List(ctx)
+	if err != nil {
+		return fmt.Errorf("billet images verify: look for microVMs an earlier verification left "+
+			"behind: %w", err)
+	}
+
+	for _, inst := range leftovers {
+		fmt.Printf("cleaning up %s, left by an earlier verification\n", inst.Name)
+
+		if err := prov.Destroy(ctx, inst.ID); err != nil {
+			return fmt.Errorf("billet images verify: an earlier verification left %s behind and "+
+				"it could not be removed; it holds a uid, a device name and a cloned disk: %w",
+				inst.Name, err)
+		}
+	}
+
+	return nil
+}
+
+// hasVersion reports whether a field of the guest's report starts with a digit.
+//
+// NOT A PREFIX MATCH ON TODAY'S MAJOR. `runner=2.` and `docker=2` were both true of
+// the versions in front of me and would turn the first runner 3.x or Docker 30.x
+// into a weekly gate that fails until somebody edits this file — a false alarm about
+// a healthy image, which is the failure this whole command exists to avoid producing.
+//
+// What actually distinguishes a working answer from a broken one is that the program
+// ANSWERED: a missing binary or a missing shared library leaves the field empty or
+// carrying an error message, and neither begins with a digit.
+func hasVersion(body, field string) bool {
+	_, after, found := strings.Cut(body, field)
+	if !found {
+		return false
+	}
+
+	value, _, _ := strings.Cut(after, "\n")
+
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+
+	return value[0] >= '0' && value[0] <= '9'
 }

@@ -76,3 +76,19 @@ func hostAddrOnBridge(bridge string, port int) (string, error) {
 		"on it has no way to reach this host; give the bridge an address, or verify on a "+
 		"machine whose bridge has one", bridge)
 }
+
+// probeDeployment is the identity a verification's microVM is owned by.
+//
+// NOT THE NODE'S, AND THAT IS THE WHOLE POINT. A probe's lease is invented rather
+// than allocated, so the node daemon's sweep — which lists every instance this
+// deployment owns and destroys any whose lease it cannot account for — is correct to
+// call it an orphan, and would kill it mid-verification. On a five-minute sweep
+// against a boot-to-report window of about a minute, that lands inside the window
+// often enough to matter, and what an operator sees is the weekly gate reporting
+// that a perfectly good image does not work.
+//
+// A distinct identity puts the probe outside what that sweep will touch: a jail
+// whose owner marker is another billet's is "not ours to report and emphatically not
+// ours to destroy". The cost is that nothing else will reap one either, which is why
+// the command clears its own leftovers before it launches.
+func probeDeployment(deployment string) string { return deployment + "-imageverify" }
