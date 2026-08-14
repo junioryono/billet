@@ -3,6 +3,7 @@ package firecracker
 import (
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -269,20 +270,53 @@ func TestSignallingAnAlreadyExitedProcessIsSuccess(t *testing.T) {
 //
 // `trap ” TERM` is what makes it a wedged VMM rather than a cooperative one, so the
 // SIGTERM-then-SIGKILL escalation is actually exercised.
+// standInEnv turns this test binary into a stand-in VMM instead of a test run.
+const standInEnv = "BILLET_STANDIN_VMM"
+
+// TestMain lets this binary re-execute itself as a long-lived process whose argv the
+// test chooses.
+//
+// THE STAND-IN USED TO BE A SHELL, AND CI SAID OTHERWISE. `sh -c 'while :; do sleep
+// 1; done' billet-standin --id <id>` works on both machines this was developed on and
+// failed all five pid tests on the CI runner, where the stand-in never appeared in
+// /proc carrying its id within the second it was given. Re-executing this binary
+// removes the shell, the fork of `sleep`, and every assumption about which /bin/sh a
+// machine has: there is one process, its argv is exactly what was passed, and it is
+// there the moment exec returns.
+//
+// m.Run is never reached in that mode, so the testing flags are never parsed and
+// `--id` is inert — which is the point, since it has to be in argv without meaning
+// anything.
+func TestMain(m *testing.M) {
+	switch os.Getenv(standInEnv) {
+	case "":
+	case "ignore-term":
+		signal.Ignore(syscall.SIGTERM)
+
+		select {}
+	default:
+		select {}
+	}
+
+	os.Exit(m.Run())
+}
+
+// standIn starts a process that stands in for a jailed VMM, carrying jailID the way a
+// real one does, and returns its pid once /proc agrees.
 func standIn(t *testing.T, jailID string, ignoreTerm bool) int {
 	t.Helper()
 
-	script := "while :; do sleep 1; done"
+	mode := "run"
 	if ignoreTerm {
-		script = "trap '' TERM; " + script
+		mode = "ignore-term"
 	}
 
 	// THE PAIR `--id <jail id>`, BECAUSE THAT IS WHAT pidIsVMM LOOKS FOR. An earlier
 	// version put the id in $0 alone; when the check was tightened from "the id
 	// anywhere in argv" to the pair, every test using this helper began failing on
-	// Linux and was invisible on darwin, where they all skip. Arguments after $0 are
-	// inert to the script and present in argv, which is exactly what is needed.
-	cmd := exec.CommandContext(t.Context(), "sh", "-c", script, "billet-standin", "--id", jailID)
+	// Linux and was invisible on darwin, where they all skip.
+	cmd := exec.CommandContext(t.Context(), os.Args[0], "--id", jailID)
+	cmd.Env = append(os.Environ(), standInEnv+"="+mode)
 
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start a stand-in vmm: %v", err)
@@ -305,7 +339,13 @@ func standIn(t *testing.T, jailID string, ignoreTerm bool) int {
 	// ESTABLISHED BEFORE THE TEST USES IT. A stand-in that has not reached /proc
 	// yet is indistinguishable from one that exited, and both make an assertion
 	// about pid identity pass or fail for the wrong reason.
-	for range 200 {
+	//
+	// The budget is generous because the cost of it being too small is a failure
+	// that looks like a defect in the thing under test rather than in the fixture --
+	// which is exactly how this presented on CI, five tests at once.
+	deadline := time.Now().Add(30 * time.Second)
+
+	for time.Now().Before(deadline) {
 		if owns, err := pidIsVMM(pid, jailID); err == nil && owns {
 			return pid
 		}
@@ -313,7 +353,12 @@ func standIn(t *testing.T, jailID string, ignoreTerm bool) int {
 		time.Sleep(5 * time.Millisecond)
 	}
 
-	t.Fatalf("the stand-in vmm never appeared in /proc carrying %q", jailID)
+	// AND IT SAYS WHAT IT ACTUALLY SAW. "never appeared" is not something anyone can
+	// act on from a CI log; the argv it did find, or the reason it could not be read,
+	// is.
+	raw, err := os.ReadFile(procCmdline(pid))
+	t.Fatalf("the stand-in vmm never appeared in /proc carrying %q: cmdline %q (read error: %v)",
+		jailID, strings.ReplaceAll(string(raw), "\x00", " "), err)
 
 	return 0
 }

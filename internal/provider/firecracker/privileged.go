@@ -53,6 +53,17 @@ func mknodBlock(path, hostDevice string, uid, gid int) error {
 			"can attach", hostDevice)
 	}
 
+	// REQUIRED ON ONE PLATFORM AND REDUNDANT ON THE OTHER, which is why the
+	// conversion below is suppressed rather than deleted: Rdev is uint64 on linux
+	// and int32 on darwin, and this package must COMPILE for darwin because the
+	// cross-build matrix includes it. Deleting the conversion satisfies the linter
+	// on linux and breaks `make cross`.
+	//
+	// Two linters are suppressed because each platform provokes a different one: on
+	// linux the conversion is redundant, and on darwin it is real — which makes the
+	// suppression itself unused there, and an unused suppression is its own error.
+
+	//nolint:unconvert,nolintlint // Rdev is uint64 on linux and int32 on darwin
 	dev := uint64(stat.Rdev)
 
 	if err := unix.Mknod(path, unix.S_IFBLK|0o600, int(dev)); err != nil {

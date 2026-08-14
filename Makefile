@@ -61,8 +61,18 @@ tests-kept: ## Report Test functions that HEAD has and the working tree does not
 	python3 scripts/check-tests-kept.py
 
 .PHONY: lint
-lint: ## golangci-lint (pinned version)
+lint: ## golangci-lint (pinned version), for this platform AND linux
 	golangci-lint run --timeout=5m
+	@# AND AGAIN FOR LINUX, because a linter only analyses the files it would
+	@# compile. billet is developed on darwin and RUNS on linux, so every linux-only
+	@# file, and every branch of a platform-dependent type, is unexamined by the pass
+	@# above. Not theoretical: `uint64(stat.Rdev)` in the firecracker backend is a
+	@# redundant conversion on linux and a required one on darwin, so it passed here
+	@# and failed CI. Three defects on one branch had exactly this shape.
+	@#
+	@# It costs one more pass, and it is the only way this gate speaks for the
+	@# platform the thing actually runs on.
+	GOOS=linux golangci-lint run --timeout=5m
 
 .PHONY: lint-fix
 lint-fix:
