@@ -71,12 +71,25 @@ func cmdImagesVerify(ctx context.Context, args []string) error {
 		return err
 	}
 
+	// BOTH SECTIONS ARE OPTIONAL, and a remote microVM node is exactly the shape
+	// that has one and not the other: it dials a control plane it does not run, so
+	// it carries `node:` and no `server:` at all. Dereferencing either without
+	// asking turned the ordinary case into a panic.
+	if cfg.Node == nil {
+		return errors.New("billet images verify: this config has no node section, so it " +
+			"describes no machine that could boot a guest image")
+	}
+
 	if cfg.Node.Provider != config.ProviderFirecracker {
 		return fmt.Errorf("billet images verify: this node's provider is %s, and only firecracker "+
 			"boots a guest image; run this on a machine that runs microVMs", cfg.Node.Provider)
 	}
 
-	deployment, err := state.DeploymentID(cfg.Server.StateDir)
+	// THE SAME DERIVATION `billet node` USES, rather than a second one that agrees
+	// with it by luck. The identity decides which jails this command can see, so a
+	// verification that derived it differently would either see nothing of its own
+	// or, worse, claim someone else's.
+	deployment, err := verifyDeploymentID(cfg)
 	if err != nil {
 		return err
 	}
@@ -99,20 +112,26 @@ func cmdImagesVerify(ctx context.Context, args []string) error {
 		return err
 	}
 
-	// AND ANYTHING AN EARLIER RUN LEFT BEHIND GOES FIRST. The separate identity is
-	// what keeps the node's sweep off these, which also means nothing else will ever
-	// reap one — so a run that was killed between Launch and Destroy would otherwise
-	// hold a uid, a device name and a cloned disk until somebody noticed.
-	if err := reapEarlierProbes(ctx, prov); err != nil {
+	lease, err := probeLeaseID()
+	if err != nil {
 		return err
 	}
 
-	return verifyGuestImage(ctx, prov, cfg.Node.Firecracker.Bridge, rest, *wait)
+	// AND ANYTHING AN EARLIER RUN LEFT BEHIND GOES FIRST. The probe's name is the
+	// same on this host every time, so this is one idempotent Destroy of one name
+	// rather than a sweep of whatever happened to be there — which could not be made
+	// safe, because the provider deliberately reports jails with no owner marker and
+	// those are indistinguishable from a real node launch caught mid-creation.
+	if err := destroyProbe(ctx, prov, provider.InstanceName(lease)); err != nil {
+		return err
+	}
+
+	return verifyGuestImage(ctx, prov, cfg.Node.Firecracker.Bridge, rest, lease, *wait)
 }
 
 // verifyGuestImage launches one microVM and waits for the guest to report on itself.
 func verifyGuestImage(
-	ctx context.Context, prov provider.Provider, bridge, image string, wait time.Duration,
+	ctx context.Context, prov provider.Provider, bridge, image, lease string, wait time.Duration,
 ) error {
 	// A LISTENER ON THIS MACHINE, because the assertion has to be made BY THE GUEST.
 	// Anything the host can check on its own was already green for an image that ran
@@ -136,11 +155,6 @@ func verifyGuestImage(
 			fmt.Printf("warning: the report listener did not close: %v\n", err)
 		}
 	}()
-
-	lease, err := probeLeaseID()
-	if err != nil {
-		return err
-	}
 
 	name := provider.InstanceName(lease)
 
@@ -244,17 +258,16 @@ func destroyProbe(ctx context.Context, prov provider.Provider, name string) erro
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
 	defer cancel()
 
-	inst, found, err := prov.Find(ctx, name)
-	if err != nil {
-		return fmt.Errorf("billet images verify: could not tell whether the probe %s is still "+
-			"running, so it may be holding a uid, a device name and a cloned disk: %w", name, err)
-	}
-
-	if !found {
-		return nil
-	}
-
-	if err := prov.Destroy(ctx, inst.ID); err != nil {
+	// DESTROYED WITHOUT ASKING FIRST, because "there is no jail" is not "there is
+	// nothing left". The firecracker backend handles exactly that state: it releases
+	// the uid and device-name claims and discards the root disk for a launch that got
+	// far enough to take them and then lost its jail. A Find-then-skip returned
+	// success over precisely that residue, and since the probe is deliberately not
+	// owned by the node, nothing else would ever collect it.
+	//
+	// Destroy is idempotent, so this is also what clears anything an earlier run
+	// left: the probe's name is the same on this host every time.
+	if err := prov.Destroy(ctx, name); err != nil {
 		return fmt.Errorf("billet images verify: the probe %s was not cleaned up and holds a "+
 			"uid, a device name and a cloned disk; nothing else will reap it, because it is "+
 			"deliberately not owned by the node: %w", name, err)
@@ -394,31 +407,6 @@ func checkGuestReport(body, secret string) error {
 	return nil
 }
 
-// reapEarlierProbes destroys any microVM a previous verification left behind.
-//
-// These are only ever this command's own: the provider is built with an identity
-// nothing else uses, so List reports exactly the probes of earlier runs and never a
-// real job's guest.
-func reapEarlierProbes(ctx context.Context, prov provider.Provider) error {
-	leftovers, err := prov.List(ctx)
-	if err != nil {
-		return fmt.Errorf("billet images verify: look for microVMs an earlier verification left "+
-			"behind: %w", err)
-	}
-
-	for _, inst := range leftovers {
-		fmt.Printf("cleaning up %s, left by an earlier verification\n", inst.Name)
-
-		if err := prov.Destroy(ctx, inst.ID); err != nil {
-			return fmt.Errorf("billet images verify: an earlier verification left %s behind and "+
-				"it could not be removed; it holds a uid, a device name and a cloned disk: %w",
-				inst.Name, err)
-		}
-	}
-
-	return nil
-}
-
 // hasVersion reports whether a field of the guest's report starts with a digit.
 //
 // NOT A PREFIX MATCH ON TODAY'S MAJOR. `runner=2.` and `docker=2` were both true of
@@ -443,4 +431,39 @@ func hasVersion(body, field string) bool {
 	}
 
 	return value[0] >= '0' && value[0] <= '9'
+}
+
+// verifyDeploymentID is the identity this machine's microVMs are owned by.
+//
+// THE SAME RULE `billet node` FOLLOWS, deliberately reusing it rather than agreeing
+// with it by luck: the certificate outranks the config file, a `server:` section
+// answers when there is no certificate, and a node that has neither can only be
+// speaking for its own state directory.
+//
+// It decides which jails this command can see, so a verification that derived it
+// differently would either find nothing of its own or claim somebody else's.
+func verifyDeploymentID(cfg *config.Config) (string, error) {
+	// A bundle is proof issued BY the control plane. Loading it is best-effort here:
+	// a machine that has not enrolled yet can still verify an image, and refusing on
+	// that would make this command need a control plane to check a local artifact.
+	bundle, err := nodeBundle(cfg)
+	if err != nil {
+		// A machine that has not enrolled yet can still verify an image, and refusing
+		// here would make a local check depend on a control plane. The next rule
+		// answers instead.
+		bundle = nil
+	}
+
+	deployment, err := nodeDeploymentID(cfg, bundle)
+	if err != nil {
+		return "", err
+	}
+
+	if deployment != "" {
+		return deployment, nil
+	}
+
+	// Its own directory is the only answer available — the same fallback the node
+	// documents at node.state_dir.
+	return state.DeploymentID(cfg.Node.StateDir)
 }

@@ -540,6 +540,18 @@ publish() {
 
 	"${rbd[@]}" -p "$IMAGE_POOL" snap create "$IMAGE_NAME@$gen"
 
+	# WHAT THIS IMAGE ACTUALLY INSTALLED, recorded where anything with cluster access
+	# can read it.
+	#
+	# THE ALTERNATIVE WAS A LIE WAITING TO HAPPEN. The pinned runner version is
+	# compiled into the billet binary, so it says what a build WOULD install rather
+	# than what the running fleet HAS -- and the moment a scheduled rebuild takes up a
+	# newer release, an alarm reading the compiled-in value reports an expiry that is
+	# not happening, or misses one that is. The image is the only thing that knows.
+	"${rbd[@]}" -p "$IMAGE_POOL" image-meta set "$IMAGE_NAME" billet.runner_version \
+		"$RUNNER_VERSION"
+	"${rbd[@]}" -p "$IMAGE_POOL" image-meta set "$IMAGE_NAME" billet.generation "$gen"
+
 	echo
 	echo "published $IMAGE_POOL/$IMAGE_NAME@$gen"
 	echo

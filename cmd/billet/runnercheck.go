@@ -4,9 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"time"
 
+	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/runnerrelease"
+	"github.com/junioryono/billet/internal/store/ceph"
 )
 
 // cmdRunner reports how close billet's runner is to being refused by GitHub.
@@ -36,10 +39,38 @@ func cmdRunner(ctx context.Context, args []string) error {
 	}
 
 	fs := newFlagSet("billet runner check")
+	cfgPath := addConfigFlag(fs)
 	quiet := fs.Bool("quiet", false, "print nothing unless something needs doing")
 
 	if err := parse(fs, args[1:]); err != nil {
 		return err
+	}
+
+	// WHAT THE FLEET ACTUALLY RUNS, WHEN THIS MACHINE CAN FIND OUT.
+	//
+	// The compiled-in pin says what a build WOULD install, and the two part company
+	// the moment a scheduled rebuild takes up a newer release — after which an alarm
+	// reading the binary reports an expiry that is not happening, or misses one that
+	// is. The published image records what it installed; that is the fleet's answer.
+	//
+	// Falling back to the pin rather than refusing, because a machine with no cluster
+	// config is still entitled to be told that the source it builds from is behind.
+	// Which source was used is printed, so the number is never unattributed.
+	installed, source := runnerrelease.Pinned(), "the version this billet would build"
+
+	fleet, ok, why := fleetRunnerVersion(ctx, *cfgPath)
+
+	switch {
+	case ok:
+		installed, source = fleet, "the version the published guest image carries"
+
+	case why != nil:
+		// A CLUSTER THAT WAS CONFIGURED AND COULD NOT BE READ IS WORTH SAYING, quietly
+		// and on stderr, because it is not a verdict. Swallowing it is how a broken
+		// lookup came to look exactly like an image with no metadata recorded — which
+		// is what happened when this asked rbd for json output it does not accept.
+		fmt.Fprintf(os.Stderr, "note: could not read what the published image carries, so this "+
+			"is about the version billet would build: %v\n", why)
 	}
 
 	status, err := runnerrelease.Latest(ctx, nil)
@@ -51,19 +82,21 @@ func cmdRunner(ctx context.Context, args []string) error {
 			"nothing about whether %s is still accepted: %w", runnerrelease.Pinned(), err)
 	}
 
+	status.Pinned = installed
+
 	now := time.Now()
 
 	switch {
 	case status.Current():
 		if !*quiet {
-			fmt.Printf("runner  %s, which is the current release\n", status.Pinned)
+			fmt.Printf("runner  %s, which is the current release (%s)\n", status.Pinned, source)
 		}
 
 		return nil
 
 	case status.Expired(now):
-		fmt.Printf("runner  %s, and GitHub stopped queueing jobs to it on %s\n",
-			status.Pinned, status.Deadline.Format(time.DateOnly))
+		fmt.Printf("runner  %s (%s), and GitHub stopped queueing jobs to it on %s\n",
+			status.Pinned, source, status.Deadline.Format(time.DateOnly))
 		fmt.Printf("        %s was published %s, and a runner has 30 days to take up a release\n",
 			status.Latest, status.Published.Format(time.DateOnly))
 		fmt.Println()
@@ -76,8 +109,8 @@ func cmdRunner(ctx context.Context, args []string) error {
 		return errExpiredRunner
 
 	case status.Due(now):
-		fmt.Printf("runner  %s, and GitHub stops queueing jobs to it on %s (%d days)\n",
-			status.Pinned, status.Deadline.Format(time.DateOnly),
+		fmt.Printf("runner  %s (%s), and GitHub stops queueing jobs to it on %s (%d days)\n",
+			status.Pinned, source, status.Deadline.Format(time.DateOnly),
 			int(status.Remaining(now).Hours()/24))
 		fmt.Printf("        %s was published %s\n",
 			status.Latest, status.Published.Format(time.DateOnly))
@@ -105,3 +138,57 @@ var (
 	errRunnerDue     = &exitError{code: 2, msg: "the runner image is due to be rebuilt"}
 	errExpiredRunner = &exitError{code: 3, msg: "github is no longer queueing jobs to this runner"}
 )
+
+// fleetRunnerVersion reports the runner the published guest image carries.
+//
+// EVERY FAILURE HERE IS A "CANNOT TELL" RATHER THAN A VERDICT, which is why it
+// returns a bool instead of an error: no config, no cluster, a config for a machine
+// that does not run microVMs, an image published before this was recorded. None of
+// those say anything about whether a fleet is expiring, and the caller has a fallback
+// that is honest about being one.
+func fleetRunnerVersion(ctx context.Context, cfgPath string) (string, bool, error) {
+	// A CONFIG THIS COMMAND CANNOT READ IS NOT A VERDICT ABOUT A FLEET. `billet
+	// runner check` is useful on a laptop with no billet config at all — it answers
+	// "is the release this build would install still accepted" — so a missing or
+	// unreadable config means "ask the compiled-in pin instead", not "something is
+	// wrong". Returning the error here would turn every run outside a deployment
+	// into a failure.
+	//
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		//nolint:nilerr // an unreadable config means "cannot tell", which the caller handles
+		return "", false, nil
+	}
+
+	if cfg.Node == nil || cfg.Node.Ceph == nil {
+		return "", false, nil
+	}
+
+	store, err := ceph.New(*cfg.Node.Ceph)
+	if err != nil {
+		return "", false, err
+	}
+
+	// THE IMAGE A TIER ACTUALLY NAMES, because that is the one jobs boot. A default
+	// name would answer confidently about an image this deployment does not use.
+	var failures []error
+
+	for i := range cfg.Tiers {
+		if cfg.Tiers[i].Image == "" {
+			continue
+		}
+
+		version, found, err := store.RunnerVersion(ctx, cfg.Tiers[i].Image)
+
+		switch {
+		case err != nil:
+			failures = append(failures, err)
+		case found:
+			return version, true, nil
+		}
+	}
+
+	// An image with nothing recorded is silent rather than broken: it was published
+	// before billet wrote this, or by hand.
+	return "", false, errors.Join(failures...)
+}

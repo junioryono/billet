@@ -67,7 +67,7 @@ need_root() {
 	fi
 }
 
-# bump_pin writes the newest release into the pin, and says whether it changed.
+# latest_release prints the newest published runner and its linux-x64 checksum.
 #
 # THE CHECKSUM COMES FROM THE MARKERS, NOT FROM A REGEX OVER THE BODY. GitHub's
 # release notes carry one per platform between `<!-- BEGIN SHA linux-x64 -->` and
@@ -75,8 +75,8 @@ need_root() {
 # strings — a greedy pattern picks up the wrong one, which was measured while writing
 # this and would produce a build that fails its own integrity check for a reason
 # nobody could see.
-bump_pin() {
-	local pin="$REPO/internal/runnerrelease/pinned.txt" body version sha current
+latest_release() {
+	local body version sha
 
 	# BOUNDED, because this runs unattended. A blackholed endpoint would otherwise
 	# hold the whole job until systemd killed it two hours later, and the operator
@@ -92,8 +92,8 @@ bump_pin() {
 		head -1)
 
 	# CHECKED FOR SHAPE, NOT ONLY FOR EMPTINESS. `jq -r` prints the STRING `null` for
-	# a field that is not there, which is not empty and would be pinned as a version
-	# — producing a download URL for a release called null.
+	# a field that is not there, which is not empty and would be built as a version —
+	# producing a download URL for a release called null.
 	case "$version" in
 		[0-9]*.[0-9]*.[0-9]*) ;;
 		*) die "github's answer named the release '$version', which is not a version" ;;
@@ -101,51 +101,10 @@ bump_pin() {
 
 	case "$sha" in
 		[0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ;;
-		*) die "github's answer carried no linux-x64 checksum; refusing to pin something unverified" ;;
+		*) die "github's answer carried no linux-x64 checksum; refusing to build something unverified" ;;
 	esac
 
-	current=$(awk 'NR==1{print $1}' "$pin" 2>/dev/null || true)
-	current_sha=$(awk 'NR==1{print $2}' "$pin" 2>/dev/null || true)
-
-	# BOTH FIELDS, because a pin whose version matches and whose checksum is missing
-	# or stale is one every build fails on — and comparing the version alone would
-	# never rewrite it, so the failure would repeat every week until GitHub happened
-	# to publish something new.
-	if [ "$current" = "$version" ] && [ "$current_sha" = "$sha" ]; then
-		log "runner $version is already pinned"
-
-		return 1
-	fi
-
-	log "runner $current -> $version"
-
-	# WRITTEN WITH ITS OWN CHECK, because this whole function runs as an `if`
-	# condition -- which suspends `set -e` for every command in it. A failed write on
-	# a full or read-only filesystem would otherwise be ignored and the run would go
-	# on to log a bump that did not happen and build the old release.
-	if ! printf '%s %s\n' "$version" "$sha" >"$pin"; then
-		die "could not write the pin at $pin"
-	fi
-
-	return 0
-}
-
-# reinstall_billet rebuilds the binary so its embedded pin matches the file.
-#
-# THE PIN IS EMBEDDED, so bumping the file alone splits it in two: the guest image
-# would install the new runner while `billet runner check` kept reporting the old one
-# and `billet ami` kept building the ec2 image from it. Refusing here is better than
-# leaving that split in place -- the operator ends up on the old runner, which the
-# check will keep saying, rather than on two runners and a monitor that lies.
-reinstall_billet() {
-	if ! command -v go >/dev/null 2>&1; then
-		die "the pin moved but go is not installed here, so $BILLET cannot be rebuilt from it; bump internal/runnerrelease/pinned.txt in source and deploy a new billet, or run with BUMP=no to keep rebuilding at the pinned release"
-	fi
-
-	log "rebuilding $BILLET so its embedded pin matches"
-
-	( cd "$REPO" && go build -o "$BILLET" ./cmd/billet ) ||
-		die "could not rebuild $BILLET from $REPO"
+	printf '%s %s\n' "$version" "$sha"
 }
 
 # take_publish_lock keeps two NODES from publishing a generation at once.
@@ -156,16 +115,30 @@ reinstall_billet() {
 #                  when the SAME cookie holds it, so it is not re-entrant
 #   rbd lock rm    0 when released, 2 when there was nothing to release
 #   the lock       is NOT a lease. It outlives the process that took it and is held
-#                  until somebody removes it.
+#                  until somebody removes it, and breaking it FENCES NOTHING -- the
+#                  old holder can wake up and keep writing.
 #
 # That last property is why this refuses rather than breaking a lock it finds. A
 # stale lock costs one skipped week, which the weekly cadence and `billet runner
 # check` both cover; breaking a live one costs two concurrent writers on one image,
 # which is the failure this exists to prevent. The message carries the command.
 take_publish_lock() {
+	# CREATED WITH `layering` ALONE, and that is not minimalism.
+	#
+	# Ceph documents the `exclusive-lock` FEATURE as "incompatible with RBD advisory
+	# locks (the `rbd lock add` and `rbd lock rm` commands)" -- and it is on by
+	# default. Measured, the two do coexist on an image that is never mapped, because
+	# the automatic lock the feature takes is only taken when a client opens the image
+	# for writing, which nothing ever does to this one.
+	#
+	# Depending on that would be depending on a combination the vendor says does not
+	# work, for a reason that happens to be true today. Creating the image without the
+	# feature removes the question instead of answering it.
+	#
 	# Idempotent, and its failure is not interesting: the next command says whether
 	# there is a lock image to lock.
-	rbd --id "$CEPH_USER" create "$LOCK_IMAGE" --size 1 >/dev/null 2>&1 || true
+	rbd --id "$CEPH_USER" create "$LOCK_IMAGE" --size 1 --image-feature layering \
+		>/dev/null 2>&1 || true
 
 	if rbd --id "$CEPH_USER" lock add "$LOCK_IMAGE" "$LOCK_COOKIE" >/dev/null 2>&1; then
 		trap release_publish_lock EXIT
@@ -210,27 +183,29 @@ main() {
 		command -v "$t" >/dev/null 2>&1 || die "missing: $t"
 	done
 
-	# A BUMP IS NOT REQUIRED FOR A REBUILD. Even on the current release the image
-	# accumulates unpatched packages, and a build script nobody runs is one that has
-	# quietly broken — so the schedule rebuilds regardless, and a bump is only what
-	# makes a given week's rebuild urgent.
+	# THE WHOLE POINT IS TO TAKE UP NEW RELEASES, so this builds at whatever GitHub
+	# has published rather than at whatever the checkout pins.
 	#
-	# BUMPING IS OFF BY DEFAULT, AND THAT IS THE HONEST DEFAULT. The pinned version
-	# is SOURCE: it is embedded into the billet binary, so a script that rewrote the
-	# file without rebuilding and reinstalling that binary would leave `billet runner
-	# check` alarming about a fleet that is current, and `billet ami` building the ec2
-	# image from the old release — which is precisely the two-pin drift the pin file
-	# exists to prevent. With BUMP=yes this rebuilds the binary from the same checkout
-	# so the two cannot disagree, and refuses if it cannot.
-	if [ "${BUMP:-no}" = "yes" ]; then
-		if bump_pin; then
-			reinstall_billet
-			log "the pin moved and $BILLET was rebuilt from it"
-		fi
-	else
-		log "rebuilding at the pinned runner ($(awk 'NR==1{print $1}' \
-			"$REPO/internal/runnerrelease/pinned.txt")); set BUMP=yes to take up a new release"
-	fi
+	# An earlier version defaulted to the pinned release and offered a BUMP=yes flag.
+	# That was wrong in the way that matters: the schedule would rebuild the same
+	# runner every week forever, and thirty days after a release the fleet would stop
+	# being sent jobs -- which is the exact failure this timer exists to prevent. A
+	# safety mechanism that runs weekly and never advances anything is worse than
+	# none, because it looks like the problem is handled.
+	#
+	# IT DOES NOT WRITE THE CHECKOUT. The pinned version is compiled into the billet
+	# binary, so rewriting the file here without rebuilding that binary would split
+	# the two -- and rebuilding a binary on a production node is not this script's
+	# business. The version is passed to the build instead, and the build records what
+	# it installed on the image itself, which is what `billet runner check` reads.
+	# Source stays the default for a hand-run build and is bumped by a human.
+	local version sha
+	read -r version sha <<<"$(latest_release)"
+
+	log "building at runner $version (the checkout pins $(awk 'NR==1{print $1}' \
+		"$REPO/internal/runnerrelease/pinned.txt" 2>/dev/null || echo unknown))"
+
+	export RUNNER_VERSION="$version" RUNNER_SHA256="$sha"
 
 	# BEFORE THE BUILD, not before the bump: asking GitHub what it has published is
 	# read-only and costs nothing to do twice, while writing the image is what must

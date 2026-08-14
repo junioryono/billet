@@ -243,9 +243,16 @@ because a machine with no egress cannot find out, and reporting that as an expir
 is the false alarm that teaches people to ignore the true one.
 
 The version and its checksum live on one line in `internal/runnerrelease/pinned.txt`,
-because a checksum is only true of its version. Bump it in source and deploy, or run the
-refresh with `BUMP=yes` on a node that has Go — it rebuilds the binary from the same
-checkout so the file and the version embedded in `billet` cannot disagree.
+because a checksum is only true of its version — and a daily workflow watches
+`actions/runner` and opens a pull request when a release lands, so keeping source current
+is a review rather than a reminder. Merging is deliberately the gate: a bad runner release
+should not reach a fleet without somebody agreeing to it.
+
+The scheduled refresh does not wait for that. It builds at **whatever GitHub has
+published**, and records the version it installed on the image itself — which is what
+`billet runner check` reads, because the image is the only thing that knows what the fleet
+is actually running. The compiled-in pin says what a build *would* install, and the two
+part company the moment a scheduled rebuild takes up a newer release.
 
 ## Status
 

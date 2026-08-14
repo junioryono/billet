@@ -2,9 +2,11 @@ package main
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"net"
+	"os"
 	"strconv"
 )
 
@@ -22,18 +24,36 @@ func verificationSecret() (string, error) {
 	return "billet-verify-" + hex.EncodeToString(raw), nil
 }
 
-// probeLeaseID mints an id of the shape the allocator hands out.
+// probeLeaseID is this host's probe, and it is the SAME id every time.
 //
-// THE SAME SHAPE, because everything downstream reads it as one: the instance name
-// encodes it, the jail is named after it, and the socket-path budget is measured
-// against its length. A short id would verify a path no real job takes.
+// THE SAME SHAPE AS A REAL LEASE, because everything downstream reads it as one: the
+// instance name encodes it, the jail is named after it, and the socket-path budget is
+// measured against its length. A short id would verify a path no real job takes.
+//
+// BUT DELIBERATELY NOT RANDOM, and that is what makes cleaning up safe. A random id
+// leaves residue nothing can name afterwards, so the only way to find it is to
+// enumerate — and enumeration cannot be made safe here: the provider deliberately
+// REPORTS jails with no owner marker, because a marker-less jail is a launch
+// interrupted between creating the directory and writing the marker and may have a
+// mapped disk behind it. Those are indistinguishable from a real node launch caught
+// in the same instant, so a reaper that destroyed what it enumerated would
+// eventually destroy somebody's actual job.
+//
+// A fixed id removes the question. Cleanup destroys ONE name, which is this host's
+// probe and can be nothing else, and it is idempotent — so residue from a previous
+// run is cleared by the same call that would have cleared it anyway.
 func probeLeaseID() (string, error) {
-	raw := make([]byte, 16)
-	if _, err := rand.Read(raw); err != nil {
-		return "", fmt.Errorf("billet images verify: mint a lease id for the probe: %w", err)
+	host, err := os.Hostname()
+	if err != nil {
+		return "", fmt.Errorf("billet images verify: read this host's name, which is what makes "+
+			"the probe's id stable: %w", err)
 	}
 
-	return hex.EncodeToString(raw), nil
+	// Hashed rather than truncated, so that two hosts under one deployment cannot
+	// collide on a shared prefix, and so the id is the fixed length a lease is.
+	sum := sha256.Sum256([]byte("billet-images-verify\x00" + host))
+
+	return hex.EncodeToString(sum[:16]), nil
 }
 
 // hostAddrOnBridge is where a guest can reach this machine.
