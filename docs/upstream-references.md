@@ -134,6 +134,30 @@ Two rules learned building it:
   | Seccomp is on by default and is compiled into the **firecracker binary**, not installed by the jailer | agrees, and notes debug builds and experimental GNU targets carry no filters ([seccomp](https://github.com/firecracker-microvm/firecracker/blob/main/docs/seccomp.md)) | not separately measured; the attribution in billet's own comment was wrong until this check |
   | The jailer builds its chroot at `<base>/<exec-file-name>/<id>/root` | agrees on the shape, and says it **does not resolve symlinks** ([jailer](https://github.com/firecracker-microvm/firecracker/blob/main/docs/jailer.md)) | **DISAGREES**: passing `/usr/local/bin/firecracker`, a symlink to `firecracker-v1.16.1`, produced `/srv/jailer/firecracker-v1.16.1/<id>/root` |
   | The jailer writes `<exec-file-name>.pid` | says only when `--new-pid-ns` is passed | **DISAGREES**: written either way |
+  | A guest's plain GET can retrieve **only** a JSON `string` or an `object` | agrees, in one sentence: *"Retrieving MMDS resources in IMDS format, other than JSON `string` and `object` types, is not supported"* ([mmds user guide](https://github.com/firecracker-microvm/firecracker/blob/main/docs/mmds/mmds-user-guide.md)) | agrees — and cost a day before it was read |
+
+  **The MMDS row is the expensive lesson in this table**, and the only one where upstream was right,
+  unread, and the failure it produced pointed somewhere else entirely. billet put a tier's command in
+  the metadata as the `[]string` it is. The guest booted, took a DHCP lease, minted its session
+  token, read the contract and read the registration — and then its fetch of `command` came back
+  **501 Not Implemented**, `Cannot retrieve value. The value has an unsupported type.` (`format_imds`
+  in `src/vmm/src/mmds/data_store.rs` returns `UnsupportedValueType`; `respond_to_get_request` in
+  `src/vmm/src/mmds/mod.rs` maps it to the 501). The agent stopped, and a microVM that had booted
+  perfectly ran nothing.
+
+  Three things kept it hidden. `PUT /mmds` validates **nothing** — it accepts any JSON at all and
+  checks only the size, so the host is told the tree is fine. The failure is **per-key**, so every
+  other field kept working and exactly one was missing. And in a directory listing an array key is
+  printed **without** the trailing slash that marks an object, so it reads as a fetchable leaf right
+  up until it 501s.
+
+  billet now sends a command as its JSON encoding in a string, and the guest agent parses it back —
+  keeping the property worth having (billet never word-splits somebody's argv) inside what the
+  service can actually serve. Having the agent send `Accept: application/json` would also work today
+  and was rejected: `imds_compat: true` on `/mmds/config` makes Firecracker ignore that header, so it
+  is a fix a later configuration change could silently undo.
+  `TestEveryMetadataValueIsSomethingTheServiceCanServe` walks the whole tree and fails on any leaf
+  that is not a string, so a field added later cannot fall into the same hole.
 
   **Neither disagreement is left to be right about.** billet passes the RESOLVED path as `--exec-file`, so the name the jailer derives is the same one billet pinned whether or not it resolves symlinks — the behaviours converge instead of having to be predicted. And it passes `--new-pid-ns`, so the pid file is the documented contract rather than an observed courtesy, while teardown still treats "an API socket with no pid file" as a state it cannot interpret rather than as proof the VMM has stopped. Both are cheap, and both fail in the direction that does not unmap a running guest's disk.
 

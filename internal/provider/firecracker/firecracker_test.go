@@ -2,10 +2,13 @@ package firecracker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -1149,4 +1152,137 @@ func TestAProviderWithoutADeploymentIsRefused(t *testing.T) {
 	if _, err := New("  ", config.FirecrackerConfig{}, &fakeDisk{}); err == nil {
 		t.Fatal("New accepted a provider with no deployment identity")
 	}
+}
+
+// BILLET SAYS WHICH METADATA CONTRACT IT SPEAKS, so a guest image that predates a
+// change can refuse instead of half-working.
+//
+// The agent that reads this lives in the IMAGE, which is published once and booted
+// for months while billet is upgraded independently. Without a version in the
+// payload, a billet that renamed a key would hand an older agent metadata it does not
+// recognise — and the guest would boot, find no registration, and start no runner. A
+// microVM that runs perfectly and runs nothing is the failure this backend exists to
+// make impossible.
+func TestTheMetadataSaysWhichContractBilletSpeaks(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	_, vmm := h.launch(t)
+
+	body, called := vmm.bodyPut("/mmds")
+	if !called {
+		t.Fatal("the metadata service was never given anything")
+	}
+
+	latest, isMap := body["latest"].(map[string]any)
+	if !isMap {
+		t.Fatalf("the metadata has no `latest` section: %v", body)
+	}
+
+	meta, isMap := latest["meta-data"].(map[string]any)
+	if !isMap {
+		t.Fatalf("the metadata has no `meta-data` section: %v", body)
+	}
+
+	billet, ok := meta["billet"].(map[string]any)
+	if !ok {
+		t.Fatalf("the metadata does not carry billet's own section: %v", body)
+	}
+
+	contract, ok := billet["contract"].(string)
+	if !ok || contract == "" {
+		t.Fatalf("the metadata names no contract version, so a guest cannot tell whether it "+
+			"understands the rest of it: %v", billet)
+	}
+
+	if contract != GuestContract {
+		t.Errorf("the metadata says contract %q, the package says %q", contract, GuestContract)
+	}
+
+	// AND EVERY FIELD THE AGENT READS IS THERE UNDER THAT CONTRACT. A version is only
+	// worth having if the shape it names is the shape that was sent.
+	for _, field := range []string{"runner-name", "jit-config", "command"} {
+		if _, present := billet[field]; !present {
+			t.Errorf("contract %s promises %s and the metadata does not carry it", contract, field)
+		}
+	}
+}
+
+// NOTHING IN THE METADATA IS ANYTHING BUT A STRING, because the service cannot hand
+// the guest anything else.
+//
+// Firecracker answers a guest's plain GET in IMDS format, and that format renders a
+// JSON string or lists the keys of a JSON object — nothing else. Its own guide says
+// so ("Retrieving MMDS resources in IMDS format, other than JSON `string` and
+// `object` types, is not supported"), and `format_imds` in `mmds/data_store.rs`
+// returns `UnsupportedValueType`, which the API turns into a 501.
+//
+// THIS IS A REGRESSION TEST FOR A BUG THAT COST A DAY. `command` was a []string
+// here. Everything about the guest looked right — it booted, took its lease, minted
+// its session token, read the contract, read the registration — and then its fetch of
+// `command` got a 501, so the agent stopped and the microVM ran nothing. Nothing on
+// the host said so: the PUT that stores the tree accepts any JSON at all, so the only
+// report was a job that never started.
+//
+// It is written as a WALK rather than as an assertion about `command` on purpose. The
+// bug was not really about that field, it was about what this tree is allowed to
+// contain, and a field added later would land in exactly the same hole. The trap is
+// well hidden: an array key even appears in a directory listing without the trailing
+// slash that marks an object, so it reads as a fetchable leaf right up until it 501s.
+func TestEveryMetadataValueIsSomethingTheServiceCanServe(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	_, vmm := h.launch(t)
+
+	body, called := vmm.bodyPut("/mmds")
+	if !called {
+		t.Fatal("the metadata service was never given anything")
+	}
+
+	leaves := metadataLeaves(t, "", body)
+	if len(leaves) == 0 {
+		t.Fatal("the metadata tree has no leaves at all")
+	}
+
+	// AND THE COMMAND SURVIVES THE ENCODING. Carrying it as a string is only correct
+	// if the agent can get the original argv back out; a command that arrives as one
+	// word would be billet word-splitting somebody's argv, which is the thing sending
+	// it as JSON exists to avoid.
+	raw, ok := leaves["/latest/meta-data/billet/command"]
+	if !ok {
+		t.Fatal("the metadata carries no command")
+	}
+
+	var command []string
+	if err := json.Unmarshal([]byte(raw), &command); err != nil {
+		t.Fatalf("the command is a string the agent cannot parse back into an argv: %q: %v", raw, err)
+	}
+
+	if want := aSpec().Command; !slices.Equal(command, want) {
+		t.Errorf("the command arrives as %q and was %q", command, want)
+	}
+}
+
+// metadataLeaves walks the metadata tree and returns every leaf by path, failing the
+// test on any value the metadata service could not serve in IMDS format.
+func metadataLeaves(t *testing.T, path string, node any) map[string]string {
+	t.Helper()
+
+	leaves := map[string]string{}
+
+	switch value := node.(type) {
+	case map[string]any:
+		for key, child := range value {
+			maps.Copy(leaves, metadataLeaves(t, path+"/"+key, child))
+		}
+	case string:
+		leaves[path] = value
+	default:
+		t.Errorf("the metadata holds %T at %s, and the service serves only strings and "+
+			"objects in IMDS format — the guest's fetch of it would fail with a 501 and the "+
+			"runner would never start: %v", node, path, node)
+	}
+
+	return leaves
 }

@@ -33,6 +33,7 @@ package firecracker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -493,6 +494,11 @@ func (p *Provider) configure(
 			"the vmm counts in", spec.Name, spec.Memory)
 	}
 
+	metadata, err := p.metadata(spec)
+	if err != nil {
+		return err
+	}
+
 	for _, step := range []struct {
 		path string
 		body any
@@ -532,7 +538,7 @@ func (p *Provider) configure(
 			"network_interfaces": []string{guestInterface},
 			"ipv4_address":       mmdsAddress,
 		}},
-		{"/mmds", p.metadata(spec)},
+		{"/mmds", metadata},
 	} {
 		if err := api.put(ctx, step.path, step.body); err != nil {
 			return fmt.Errorf("firecracker: configure %s for %s: %w", step.path, spec.Name, err)
@@ -552,19 +558,66 @@ func (p *Provider) configure(
 //
 // It is written BEFORE InstanceStart, so there is no window in which the guest is
 // running and the answer is not there yet.
-func (p *Provider) metadata(spec provider.Spec) map[string]any {
+// EVERY LEAF IS A STRING, AND THAT IS A CONSTRAINT OF THE SERVICE RATHER THAN A
+// STYLE. Firecracker answers a guest's plain GET in IMDS format, which can render a
+// string and can list the keys of an object — and nothing else. A leaf that is an
+// array, a number or a boolean is not served: the guest's request fails, and it fails
+// per-key, so the rest of the tree keeps working and only the one field is missing.
+//
+// MEASURED, because it is the failure this cost the most time to see. `command` was
+// a []string here. The guest booted, got its address, minted its session token, read
+// the contract and read the registration — and then its fetch of `command` failed, so
+// the agent stopped with "no command in the metadata" and the microVM ran nothing. A
+// job that could not start looked exactly like a guest image that would not boot.
+//
+// So a command is carried as its JSON encoding, and the agent parses it back. That
+// keeps the one property worth having — billet never word-splits somebody's argv —
+// while staying inside what the service can actually hand over. `metadataLeaves` in
+// the tests walks this tree and fails on any leaf that is not a string, so a field
+// added later cannot reintroduce it.
+func (p *Provider) metadata(spec provider.Spec) (map[string]any, error) {
+	command, err := json.Marshal(spec.Command)
+	if err != nil {
+		return nil, fmt.Errorf("firecracker: encode command for %s: %w", spec.Name, err)
+	}
+
 	return map[string]any{
 		"latest": map[string]any{
 			"meta-data": map[string]any{
 				"billet": map[string]any{
+					"contract":    GuestContract,
 					"runner-name": spec.Name,
 					"jit-config":  spec.JITConfig,
-					"command":     spec.Command,
+					"command":     string(command),
 				},
 			},
 		},
-	}
+	}, nil
 }
+
+// GuestContract is the version of this layout the guest agent must understand.
+//
+// THE AGENT LIVES IN THE IMAGE, NOT IN THIS BINARY, AND THAT IS THE PROBLEM IT
+// SOLVES. A guest image is published once and booted for months; billet is upgraded
+// independently. So the two can drift, and the drift is silent in the worst
+// direction: a billet that renamed a key here would hand an older agent metadata it
+// does not recognise, and the guest would boot, find nothing it could use, and
+// register no runner — a microVM that starts perfectly and runs nothing, which is
+// the failure this whole backend is built to make impossible.
+//
+// billet cannot inspect an image to find out what it understands. What it CAN do is
+// say what it is speaking, so the guest can refuse loudly instead of half-working.
+// The agent compares this against what it was built for and stops with a message
+// naming both if they differ.
+//
+// BUMP IT WHEN THE SHAPE CHANGES — a renamed key, a new required field, a different
+// encoding — and republish the image in the same change. Adding an OPTIONAL key that
+// an older agent can ignore is not a change to the shape and does not need one.
+//
+// Republishing is safe precisely because generations are immutable: a job holding a
+// clone of the old generation keeps the agent it booted with, and clone v2 lets the
+// old generation be removed once nothing holds it.
+const GuestContract = "1"
 
 // bootArgs is the guest kernel command line.
 //
