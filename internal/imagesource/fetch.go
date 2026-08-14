@@ -41,6 +41,25 @@ type Client struct {
 // part that hangs when a host is blackholed.
 func defaultHTTP() *http.Client {
 	return &http.Client{
+		// A REDIRECT MUST NOT DOWNGRADE THE TRANSPORT. Go's default client happily
+		// follows https to http, so a source verified as https at configuration
+		// time can be moved onto plaintext by whoever answers the first request --
+		// and the whole reason ParseSource insists on https is that plaintext lets
+		// somebody pin a node to an older-but-genuine manifest indefinitely, which
+		// passes every digest check and walks the fleet into github's thirty-day
+		// expiry.
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return fmt.Errorf("imagesource: stopped after 10 redirects")
+			}
+
+			if req.URL.Scheme != "https" {
+				return fmt.Errorf("imagesource: %s redirected to %s, which is not https",
+					via[len(via)-1].URL.Host, req.URL.Scheme)
+			}
+
+			return nil
+		},
 		Transport: &http.Transport{
 			Proxy:                 http.ProxyFromEnvironment,
 			TLSHandshakeTimeout:   15 * time.Second,

@@ -96,3 +96,70 @@ func TestDefaultBaseURLIsDerivedFromTheOneRepoConstant(t *testing.T) {
 		t.Fatalf("the built-in default is not a valid source: %v", err)
 	}
 }
+
+// `/releases/latest/` RESOLVES ACROSS THE WHOLE REPOSITORY, and this repository
+// also publishes billet's own binaries. Pointing the image channel at it would
+// have a binary release silently take the channel over -- and not as a 404: the
+// node fetches a manifest that is simply absent and reports a source with no
+// images, on a source that has them.
+func TestDefaultBaseURLDoesNotUseTheRepoWideLatestAlias(t *testing.T) {
+	if strings.Contains(DefaultBaseURL, "/releases/latest/") {
+		t.Fatalf("DefaultBaseURL %q resolves across every release in the repository, "+
+			"including billet's own binary releases", DefaultBaseURL)
+	}
+
+	if !strings.Contains(DefaultBaseURL, LatestTag) {
+		t.Errorf("DefaultBaseURL %q does not name the guest-image tag %q",
+			DefaultBaseURL, LatestTag)
+	}
+}
+
+// url.Parse REPORTS AN EMPTY RawQuery FOR "host/p?" AND AN EMPTY Fragment FOR
+// "host/p#", so checking the parsed fields let both through -- and since asset
+// names are appended to the RAW string, the result fetched the directory with a
+// query rather than the file. Trimming trailing slashes made it worse: "p#/"
+// became "p#", which then passed.
+func TestParseSourceRefusesEmptyQueryAndFragmentDelimiters(t *testing.T) {
+	for _, raw := range []string{
+		"https://example.test/download?",
+		"https://example.test/download#",
+		"https://example.test/download#/",
+		"https://example.test/download?/",
+		"https://example.test/dow?nload",
+	} {
+		if _, err := ParseSource(raw); err == nil {
+			t.Errorf("%q was accepted; appending an asset name to it does not produce a path", raw)
+		}
+	}
+}
+
+// CREDENTIALS WOULD RIDE IN EVERY ASSET URL and therefore into every error
+// message and log line naming one.
+func TestParseSourceRefusesCredentialsInTheURL(t *testing.T) {
+	for _, raw := range []string{
+		"https://user:secret@example.test/download",
+		"https://user@example.test/download",
+	} {
+		_, err := ParseSource(raw)
+		if err == nil {
+			t.Fatalf("%q was accepted, and the credentials would be repeated in every asset url", raw)
+		}
+
+		if strings.Contains(err.Error(), "secret") {
+			t.Errorf("the refusal for %q repeats the credential: %v", raw, err)
+		}
+	}
+}
+
+// "https://:443/path" PARSES WITH A NON-EMPTY Host OF ":443" and no hostname,
+// which is not something to send a request to.
+func TestParseSourceRequiresARealHostname(t *testing.T) {
+	for _, raw := range []string{
+		"https://:443/download",
+		"https:///download",
+	} {
+		if _, err := ParseSource(raw); err == nil {
+			t.Errorf("%q was accepted as a source", raw)
+		}
+	}
+}

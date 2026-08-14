@@ -1,6 +1,7 @@
 package imagesource
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -150,9 +151,26 @@ func TestParseManifestRefusesTrailingContent(t *testing.T) {
 	}
 }
 
+// PADDED WITH JSON WHITESPACE, NOT NUL BYTES. The first version of this test
+// filled the buffer with zeroes, which is invalid JSON -- so the decoder
+// rejected it whether or not the size bound existed, and the test agreed with
+// the bug it was written to prevent. Leading whitespace is legal JSON, so this
+// document is refused ONLY by the bound.
 func TestParseManifestRefusesAnOversizeDocument(t *testing.T) {
-	if _, err := ParseManifest(make([]byte, MaxManifestBytes+1)); err == nil {
+	body := mustJSON(t, validManifest())
+
+	padded := append(bytes.Repeat([]byte(" "), MaxManifestBytes+1), body...)
+
+	if _, err := ParseManifest(padded); err == nil {
 		t.Fatal("an oversize document was parsed")
+	}
+
+	// AND THE SAME DOCUMENT UNDER THE BOUND IS ACCEPTED, which is what proves the
+	// refusal above came from the size and not from the padding.
+	small := append(bytes.Repeat([]byte(" "), 16), body...)
+
+	if _, err := ParseManifest(small); err != nil {
+		t.Fatalf("a whitespace-padded manifest within the bound was refused: %v", err)
 	}
 }
 
@@ -265,5 +283,144 @@ func TestUsableDoesNotTreatANewerContractAsCompatible(t *testing.T) {
 
 	if err := m.Usable("2", "x86_64"); err == nil {
 		t.Fatal("a newer guest contract was accepted by a build that speaks an older one")
+	}
+}
+
+// `Decoder.More()` REPORTS ON ELEMENTS INSIDE AN ARRAY OR OBJECT, not on a
+// second top-level value. Measured: it returns false for `{...}}` and `{...}]`,
+// so the first version of this check accepted both. Only a second COMPLETE
+// value made it true.
+func TestParseManifestRefusesEveryKindOfTrailingContent(t *testing.T) {
+	body := string(mustJSON(t, validManifest()))
+
+	for _, suffix := range []string{
+		"}",
+		"]",
+		body,
+		"null",
+		"\n{",
+		",",
+	} {
+		t.Run(fmt.Sprintf("%q", suffix), func(t *testing.T) {
+			if _, err := ParseManifest([]byte(body + suffix)); err == nil {
+				t.Fatalf("a manifest followed by %q was accepted as one document", suffix)
+			}
+		})
+	}
+
+	// Trailing whitespace is not content and must still be accepted.
+	if _, err := ParseManifest([]byte(body + "\n  \t\n")); err != nil {
+		t.Errorf("trailing whitespace was treated as content: %v", err)
+	}
+}
+
+// encoding/json TAKES THE LAST OF A DUPLICATED KEY AND MATCHES FIELD NAMES
+// CASE-INSENSITIVELY, and DisallowUnknownFields raises nothing for either. For a
+// document whose purpose is to be signed and agreed upon, that is a parser
+// differential: one signed byte string reads as two different manifests.
+func TestParseManifestRefusesAmbiguousKeys(t *testing.T) {
+	body := string(mustJSON(t, validManifest()))
+
+	dup := strings.Replace(body, `{"schema"`, `{"schema":99,"schema"`, 1)
+	if dup == body {
+		t.Fatal("could not duplicate a key in the fixture")
+	}
+
+	if _, err := ParseManifest([]byte(dup)); err == nil {
+		t.Error("a manifest carrying one key twice was accepted")
+	}
+
+	// THE CASE THAT DisallowUnknownFields CANNOT SEE.
+	miscased := strings.Replace(body, `"runner_version"`, `"Runner_Version"`, 1)
+	if miscased == body {
+		t.Fatal("could not recase a key in the fixture")
+	}
+
+	if _, err := ParseManifest([]byte(miscased)); err == nil {
+		t.Error("a manifest whose key differs only in case was accepted; json would " +
+			"match it onto the real field and a second reader might not")
+	}
+
+	// A VALUE that happens to equal a field name is not a key and must be fine.
+	valued := strings.Replace(body, `"arch": "x86_64"`, `"arch": "schema"`, 1)
+	if valued != body {
+		if _, err := ParseManifest([]byte(valued)); err == nil {
+			t.Error("a value equal to a field name should not be usable, but it should be " +
+				"refused as an arch, not as a duplicate key")
+		}
+	}
+}
+
+// APFS's DEFAULT IS CASE-FOLDING, so "ROOTFS" and "rootfs" are one file in the
+// staging directory: the second download replaces the first, and each digest
+// check then passes against whichever landed last.
+func TestParseManifestRefusesNamesThatCollideOnACaseFoldingFilesystem(t *testing.T) {
+	m := validManifest()
+	m.Rootfs.Name = "guest.img"
+	m.Kernel.Name = "GUEST.IMG"
+
+	if _, err := ParseManifest(mustJSON(t, m)); err == nil {
+		t.Fatal("two asset names differing only in case were accepted; on a case-folding " +
+			"filesystem they are one file")
+	}
+}
+
+// THE FIELD REACHES OPERATOR-FACING ERRORS, so an unbounded string from the
+// network can carry newlines and terminal control sequences into a console.
+func TestParseManifestConstrainsTheIdentityStrings(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*Manifest)
+	}{
+		{"contract with a newline", func(m *Manifest) { m.GuestContract = "2\nrm -rf /" }},
+		{"contract with an escape", func(m *Manifest) { m.GuestContract = "2\x1b[2J" }},
+		{"contract that is not a number", func(m *Manifest) { m.GuestContract = "two" }},
+		{"runner version that is prose", func(m *Manifest) { m.RunnerVersion = "recent" }},
+		{"runner version with a newline", func(m *Manifest) { m.RunnerVersion = "2.336.0\nx" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := validManifest()
+			tc.mutate(&m)
+
+			if _, err := ParseManifest(mustJSON(t, m)); err == nil {
+				t.Fatalf("%s was accepted", tc.name)
+			}
+		})
+	}
+}
+
+// UTC, AS THE FIELD CLAIMS. Ages are computed from this across machines in
+// different zones, and an offset that survives into those comparisons is the bug
+// that shows up once at a daylight-saving boundary and never reproduces.
+func TestParseManifestRefusesANonUTCBuildTime(t *testing.T) {
+	m := validManifest()
+	m.BuiltAt = time.Date(2026, 8, 14, 6, 18, 44, 0, time.FixedZone("somewhere", 5*3600))
+
+	if _, err := ParseManifest(mustJSON(t, m)); err == nil {
+		t.Fatal("a build time carrying a zone offset was accepted")
+	}
+}
+
+// Usable IS A GATE, and a gate that assumes somebody else validated is not one.
+// Manifest is exported with exported fields, so a caller can build one as a
+// literal or mutate the one ParseManifest returned.
+func TestUsableRevalidatesRatherThanTrustingItsCaller(t *testing.T) {
+	hand := &Manifest{GuestContract: "2", Arch: "x86_64"}
+
+	if err := hand.Usable("2", "x86_64"); err == nil {
+		t.Fatal("a hand-built manifest with no assets passed the usability gate")
+	}
+
+	m := validManifest()
+
+	if err := (&m).Usable("2", "x86_64"); err != nil {
+		t.Fatalf("a valid manifest was refused: %v", err)
+	}
+
+	// Mutated after parsing, which is the other way a caller gets here.
+	m.Rootfs.SHA256 = "not a digest"
+
+	if err := (&m).Usable("2", "x86_64"); err == nil {
+		t.Fatal("a manifest mutated after validation passed the gate")
 	}
 }

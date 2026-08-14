@@ -21,15 +21,28 @@ import (
 // registry in and then needed a second.
 const DefaultRepo = "junioryono/billet"
 
+// LatestTag is the release whose assets are replaced by each guest-image build.
+//
+// A FIXED TAG, NOT `/releases/latest/`. GitHub resolves `latest` across the WHOLE
+// repository, and this repository also publishes billet's own binaries — so
+// `/releases/latest/download/manifest.json` would resolve to whichever release
+// was cut most recently, and a binary release would silently take over the image
+// channel. The failure is not a 404 either: a node would fetch a manifest that
+// is simply absent and report a source with no images, on a source that has
+// them.
+//
+// Dated releases are still published for history and for pinning; this tag is
+// the moving pointer, which is what an unattended puller needs.
+const LatestTag = "guest-latest"
+
 // DefaultBaseURL is where this build looks for published guest images.
 //
-// `/releases/latest/download/<name>` RATHER THAN THE API. It redirects straight
-// to the asset with no token and no api.github.com call. That matters because
-// unauthenticated GitHub API requests are limited to sixty an hour PER
-// ORIGINATING ADDRESS, so deployments sharing an egress address would spend each
-// other's budget merely asking what the latest version is. Asset downloads are
-// not on that limiter.
-const DefaultBaseURL = "https://github.com/" + DefaultRepo + "/releases/latest/download"
+// A DOWNLOAD URL RATHER THAN THE API. It redirects straight to the asset with no
+// token and no api.github.com call. That matters because unauthenticated GitHub
+// API requests are limited to sixty an hour PER ORIGINATING ADDRESS, so
+// deployments sharing an egress address would spend each other's budget merely
+// asking what the current version is. Asset downloads are not on that limiter.
+const DefaultBaseURL = "https://github.com/" + DefaultRepo + "/releases/download/" + LatestTag
 
 // ManifestName is the index document within a release.
 const ManifestName = "manifest.json"
@@ -55,6 +68,23 @@ func ParseSource(raw string) (Source, error) {
 		return Source{}, fmt.Errorf("imagesource: no image source configured")
 	}
 
+	// THE DELIMITERS ARE REFUSED BEFORE PARSING, not after.
+	//
+	// url.Parse reports an EMPTY RawQuery for "https://host/p?" and an EMPTY
+	// Fragment for "https://host/p#", so checking the parsed fields let both
+	// through -- and because the raw string is what asset names are appended to,
+	// the result was "https://host/p?/manifest.json", which fetches /p with a
+	// query rather than the manifest. Trimming trailing slashes made it worse:
+	// "https://host/p#/" became "https://host/p#", which then passed.
+	//
+	// Neither character can appear in a legitimate base url here, so they are
+	// refused by inspecting the string itself, where an empty delimiter is still
+	// a delimiter.
+	if strings.ContainsAny(trimmed, "?#") {
+		return Source{}, fmt.Errorf("imagesource: the image source %q carries a query or a "+
+			"fragment delimiter, and asset names are appended to it as path", raw)
+	}
+
 	trimmed = strings.TrimRight(trimmed, "/")
 
 	u, err := url.Parse(trimmed)
@@ -67,16 +97,20 @@ func ParseSource(raw string) (Source, error) {
 			"that nobody on the path can choose which version this deployment sees", raw)
 	}
 
-	if u.Host == "" {
+	// Hostname(), NOT Host. "https://:443/path" parses with a non-empty Host of
+	// ":443" and no hostname at all, which is not something to send a request to.
+	if u.Hostname() == "" {
 		return Source{}, fmt.Errorf("imagesource: the image source %q names no host", raw)
 	}
 
-	// A QUERY OR A FRAGMENT MEANS THE ASSET NAME WOULD BE APPENDED PAST IT.
-	// Refused here rather than producing a URL that fetches the directory and
-	// ignores the file.
-	if u.RawQuery != "" || u.Fragment != "" {
-		return Source{}, fmt.Errorf("imagesource: the image source %q carries a query or a "+
-			"fragment, and asset names are appended to it as path", raw)
+	// CREDENTIALS ARE REFUSED RATHER THAN CARRIED. A userinfo section would ride
+	// in every asset url this builds, and those urls are printed in error
+	// messages and logs -- so a password configured once here would be copied
+	// wherever a download failed. Artifact fetching is anonymous by design; a
+	// source that needs credentials wants a different mechanism, not this one.
+	if u.User != nil {
+		return Source{}, fmt.Errorf("imagesource: the image source carries credentials in its " +
+			"url; they would be repeated in every asset url and in any error naming one")
 	}
 
 	return Source{BaseURL: trimmed}, nil

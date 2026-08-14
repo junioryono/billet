@@ -16,8 +16,11 @@
 package imagesource
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"regexp"
 	"strings"
 	"time"
@@ -128,6 +131,14 @@ var (
 	digestPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 	namePattern   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 	archPattern   = regexp.MustCompile(`^[A-Za-z0-9_]{1,32}$`)
+
+	// The guest contract is a small integer today. Bounded rather than free text
+	// because it reaches operator-facing errors.
+	contractPattern = regexp.MustCompile(`^\d{1,8}$`)
+
+	// A runner version as github publishes them: 2.336.0, occasionally with a
+	// suffix. Bounded, and parseable enough to compare.
+	versionPattern = regexp.MustCompile(`^\d{1,6}\.\d{1,6}\.\d{1,6}([-+][0-9A-Za-z.-]{1,32})?$`)
 )
 
 // knownCompression is the set a reader will act on.
@@ -157,22 +168,38 @@ func (m *Manifest) Validate() error {
 			"it cannot describe", SchemaVersion, m.Schema)
 	}
 
-	if strings.TrimSpace(m.GuestContract) == "" {
-		return fmt.Errorf("imagesource: the manifest names no guest contract, so nothing " +
-			"can tell whether this image's agent speaks to this billet")
+	// CONSTRAINED, NOT MERELY NON-EMPTY. This value is interpolated into operator-
+	// facing errors, and an unbounded string from the network can carry newlines
+	// and terminal control sequences -- which is how a refusal message becomes a
+	// place to write whatever the publisher likes on somebody's console.
+	if !contractPattern.MatchString(m.GuestContract) {
+		return fmt.Errorf("imagesource: %q is not a guest contract version", m.GuestContract)
 	}
 
 	if !archPattern.MatchString(m.Arch) {
 		return fmt.Errorf("imagesource: %q is not an architecture name", m.Arch)
 	}
 
-	if strings.TrimSpace(m.RunnerVersion) == "" {
-		return fmt.Errorf("imagesource: the manifest names no runner version, so nothing " +
-			"can tell whether the baked runner is still inside github's thirty days")
+	// A REAL VERSION, because it is compared against github's published releases
+	// to decide whether the baked runner is still inside the thirty days. "recent"
+	// is not something that comparison can do anything with.
+	if !versionPattern.MatchString(m.RunnerVersion) {
+		return fmt.Errorf("imagesource: %q is not a runner version, so nothing can tell "+
+			"whether the baked runner is still inside github's thirty days", m.RunnerVersion)
 	}
 
 	if m.BuiltAt.IsZero() {
 		return fmt.Errorf("imagesource: the manifest carries no build time")
+	}
+
+	// UTC, AS THE FIELD SAYS. Ages and orderings are computed from this across
+	// machines in different zones, and an offset that survives into those
+	// comparisons is the kind of bug that appears once at a daylight-saving
+	// boundary and never reproduces. The generation names in the cluster are UTC
+	// by construction for the same reason.
+	if _, offset := m.BuiltAt.Zone(); offset != 0 {
+		return fmt.Errorf("imagesource: the manifest's build time carries a %+d-second offset "+
+			"and must be UTC", offset)
 	}
 
 	if err := m.Rootfs.validate("rootfs"); err != nil {
@@ -186,7 +213,12 @@ func (m *Manifest) Validate() error {
 	// TWO ASSETS, TWO NAMES. They are staged side by side in one directory, so
 	// equal names would have the second overwrite the first and the digest check
 	// would then pass against whichever landed last.
-	if m.Rootfs.Name == m.Kernel.Name {
+	// EqualFold, NOT ==. The staging directory may be on a case-folding filesystem
+	// -- APFS's default, and the machine a developer runs this on -- where
+	// "ROOTFS" and "rootfs" are one file. A byte-wise comparison passes and the
+	// second download silently replaces the first, after which each digest check
+	// passes against whichever landed last.
+	if strings.EqualFold(m.Rootfs.Name, m.Kernel.Name) {
 		return fmt.Errorf("imagesource: the rootfs and the kernel are both published as %q, "+
 			"and staging them together would leave one overwriting the other", m.Rootfs.Name)
 	}
@@ -239,7 +271,18 @@ func ParseManifest(data []byte) (*Manifest, error) {
 			len(data), MaxManifestBytes)
 	}
 
-	dec := json.NewDecoder(strings.NewReader(string(data)))
+	// KEYS ARE CHECKED BEFORE THE DOCUMENT IS DECODED, because encoding/json
+	// cannot express what this needs. It matches field names CASE-INSENSITIVELY
+	// and silently takes the LAST of a duplicated key, so `{"schema":1,
+	// "Schema":99}` decodes to 99 with DisallowUnknownFields raising nothing.
+	// For a document whose whole purpose is to be signed and agreed upon by
+	// several readers, that is a parser differential: two implementations can
+	// read one signed byte string as two different manifests.
+	if err := checkStrictKeys(data); err != nil {
+		return nil, err
+	}
+
+	dec := json.NewDecoder(bytes.NewReader(data))
 
 	// UNKNOWN FIELDS ARE REFUSED. A manifest written by a newer publisher may
 	// carry a field this build would need in order to import safely — a new
@@ -253,9 +296,19 @@ func ParseManifest(data []byte) (*Manifest, error) {
 		return nil, fmt.Errorf("imagesource: could not read the manifest: %w", err)
 	}
 
-	if dec.More() {
+	// A SECOND DECODE REQUIRING EOF, NOT Decoder.More().
+	//
+	// More() reports whether another element follows INSIDE an array or object
+	// being parsed. At the top level it answers by peeking for `]` or `}` — so
+	// `{...}}` and `{...}]` both make it return false, and this accepted them.
+	// Measured, not reasoned about: only a second complete value made More() true.
+	//
+	// Decoding again and demanding io.EOF is the check that was meant: anything
+	// at all after the manifest, well formed or not, is refused.
+	var trailing json.RawMessage
+	if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("imagesource: the manifest is followed by more content, so it is " +
-			"not a single document and this refuses to guess which half is authoritative")
+			"not a single document and this refuses to guess which part is authoritative")
 	}
 
 	if err := m.Validate(); err != nil {
@@ -263,6 +316,128 @@ func ParseManifest(data []byte) (*Manifest, error) {
 	}
 
 	return &m, nil
+}
+
+// knownKeys is every field name a manifest may carry, spelled exactly.
+//
+// FLAT RATHER THAN PER-LEVEL because the names happen to be distinct across
+// levels, and a flat set is one thing to keep right instead of three. If a
+// future field collides with one at another level, split this.
+var knownKeys = map[string]bool{
+	"schema": true, "guest_contract": true, "arch": true,
+	"runner_version": true, "built_at": true, "rootfs": true, "kernel": true,
+	"name": true, "sha256": true, "size": true,
+	"compression": true, "version": true,
+}
+
+// checkStrictKeys refuses duplicate or misspelled object keys anywhere in the
+// document.
+//
+// A RECURSIVE DESCENT RATHER THAN A FLAT TOKEN SCAN, because the flat version
+// cannot tell a key from a string value -- and the case it must catch,
+// `{"Schema": 99}`, is precisely a key. Walking the structure means every string
+// this inspects is known to be a name.
+//
+// WALKS TOKENS RATHER THAN UNMARSHALLING, because unmarshalling into a map is
+// what loses the information: a map cannot hold a duplicate, so by the time
+// there is a map the ambiguity has already been resolved in silence.
+func checkStrictKeys(data []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+
+	tok, err := dec.Token()
+	if err != nil {
+		// Malformed input is reported by the real decode, whose message is far
+		// better than anything a token walk can produce.
+		return nil //nolint:nilerr // the decode that follows reports the parse error
+	}
+
+	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
+		// Not an object at the top level. The decode refuses it on its own terms.
+		return nil
+	}
+
+	return walkObject(dec)
+}
+
+// walkObject consumes an object whose opening brace has already been read.
+func walkObject(dec *json.Decoder) error {
+	seen := map[string]bool{}
+
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return nil //nolint:nilerr // reported by the real decode
+		}
+
+		if delim, ok := tok.(json.Delim); ok && delim == '}' {
+			return nil
+		}
+
+		// Positioned on a name: inside an object, anything that is not the closing
+		// brace is a key, and json guarantees it is a string.
+		key, ok := tok.(string)
+		if !ok {
+			return nil
+		}
+
+		if seen[key] {
+			return fmt.Errorf("imagesource: the manifest carries the key %q more than once; "+
+				"json decoders differ on which one wins, so a single signed document would "+
+				"read as two different manifests", key)
+		}
+
+		seen[key] = true
+
+		// EXACT SPELLING. encoding/json matches field names case-insensitively, so
+		// `{"Schema": 99}` decodes into Schema and DisallowUnknownFields raises
+		// nothing. Two readers of one signed document would then disagree about
+		// what it says.
+		if !knownKeys[key] {
+			return fmt.Errorf("imagesource: the manifest carries the key %q, which is not a "+
+				"field of a manifest; json would match it case-insensitively onto one, and a "+
+				"document that reads differently to different readers cannot be signed for", key)
+		}
+
+		if err := walkValue(dec); err != nil {
+			return err
+		}
+	}
+}
+
+// walkValue consumes exactly one value.
+func walkValue(dec *json.Decoder) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return nil //nolint:nilerr // reported by the real decode
+	}
+
+	delim, ok := tok.(json.Delim)
+	if !ok {
+		return nil
+	}
+
+	switch delim {
+	case '{':
+		return walkObject(dec)
+	case '[':
+		for dec.More() {
+			if err := walkValue(dec); err != nil {
+				return err
+			}
+		}
+
+		// Consume the closing bracket. Inside an array More() is exactly what it
+		// was designed for, so it is correct here in a way it is not at the top
+		// level. A failure here is reported by the real decode, whose message is
+		// better than anything this walk could produce.
+		if _, err := dec.Token(); err != nil {
+			return nil //nolint:nilerr // the decode that follows reports the parse error
+		}
+
+		return nil
+	}
+
+	return nil
 }
 
 // Usable reports whether this build can import the image the manifest names.
@@ -273,14 +448,22 @@ func ParseManifest(data []byte) (*Manifest, error) {
 // use what it describes. A well-formed manifest for another architecture is not
 // a defect to report to anyone — it is simply not for this host.
 func (m *Manifest) Usable(contract, arch string) error {
+	// REVALIDATED HERE. Manifest is an exported struct with exported fields, so a
+	// caller can build one as a literal or mutate the one ParseManifest returned.
+	// This method is a gate, and a gate that assumes somebody else checked is not
+	// one.
+	if err := m.Validate(); err != nil {
+		return err
+	}
+
 	if m.GuestContract != contract {
-		return fmt.Errorf("imagesource: this image's agent speaks guest contract %s and this "+
-			"billet speaks %s; importing it would produce microVMs that boot and never report",
+		return fmt.Errorf("imagesource: this image's agent speaks guest contract %q and this "+
+			"billet speaks %q; importing it would produce microVMs that boot and never report",
 			m.GuestContract, contract)
 	}
 
 	if m.Arch != arch {
-		return fmt.Errorf("imagesource: this image was built for %s and this host is %s",
+		return fmt.Errorf("imagesource: this image was built for %q and this host is %q",
 			m.Arch, arch)
 	}
 
