@@ -115,6 +115,7 @@ func commands(lc *lifecycle) []command {
 		{"init", "generate a billet.yaml interactively", cmdInit},
 		{"ami", "build the machine image the ec2 backend launches", cmdAMI},
 		{"runner", "report how close the pinned actions/runner is to being refused", cmdRunner},
+		{"images", "verify the golden image a microVM guest boots from", cmdImages},
 		{"github-app", "create and install the GitHub App billet uses", cmdGitHubApp},
 		{"teardown", "delete the scale sets billet created on GitHub", cmdTeardown},
 		{"status", "show cluster status", cmdStatus},

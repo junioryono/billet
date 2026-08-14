@@ -38,9 +38,10 @@
 # Edits 1 and 2 together get you a config that validates and a server that
 # starts, and every job then fails to launch — which is why the third is here.
 #
-# The Docker provider reads vcpu, memory and shm; it ignores disk and
-# warm_pool, and the whole `firecracker:` block is unused — UNUSED, not refused,
-# which is the difference between it and `ceph:`.
+# The Docker provider reads vcpu, memory and shm; it ignores disk and warm_pool.
+# Both the `ceph:` and `firecracker:` blocks are REFUSED on it rather than
+# ignored, which is why deleting them is edits 2 and 3 above: a block only
+# firecracker reads is, on any other provider, configuration nothing consults.
 #
 # This example is the single-machine deployment, which is TWO PROCESSES reading
 # this one file:

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 )
 
 // ErrNoSuchImage is returned when a golden image or its snapshot is not there.
@@ -136,12 +137,81 @@ func (c *Client) DiscardRoot(ctx context.Context, name string) error {
 	}
 
 	for _, device := range devices {
-		if _, err := c.rbdCmd(ctx, false, "device", "unmap", device); err != nil {
-			return fmt.Errorf("ceph: unmap %s, which is a root disk for %s: %w", device, name, err)
+		if err := c.unmapDevice(ctx, device, name); err != nil {
+			return err
 		}
 	}
 
 	return c.removeClone(ctx, name)
+}
+
+// unmapDevice releases one mapping, waiting out the moment after a VMM exits when
+// the kernel still holds it.
+//
+// EBUSY HERE IS A RACE, NOT A REFUSAL, and it is one billet loses by construction.
+// Teardown stops the VMM and waits for the process to be GONE — but a process
+// exiting is not the same as its descriptors being closed, and for a moment after
+// the last reference drops the kernel client still holds the device. `rbd device
+// unmap` then answers `(16) Device or resource busy`.
+//
+// MEASURED, by running the thing: `billet images verify` destroys its probe the
+// instant the guest reports back, which is the tightest this gap ever gets, and it
+// failed there while the same teardown driven by a test that polled every two
+// seconds never did. Treating it as a hard failure means a teardown that is correct
+// in every observable way still reports an error and leaves a mapped device pinning
+// an image nothing can remove.
+//
+// SO IT IS RETRIED, BRIEFLY, AND ONLY FOR THIS. Every other reason unmap can fail is
+// a real one and is returned immediately: retrying those would turn a clear error
+// into a slow one. The budget is short because the condition is the tail of a close
+// rather than any kind of work.
+func (c *Client) unmapDevice(ctx context.Context, device, name string) error {
+	const (
+		attempts = 20
+		pause    = 250 * time.Millisecond
+	)
+
+	var err error
+
+	for attempt := range attempts {
+		if _, err = c.rbdCmd(ctx, false, "device", "unmap", device); err == nil {
+			return nil
+		}
+
+		if !isDeviceBusy(err) {
+			break
+		}
+
+		if attempt == attempts-1 {
+			break
+		}
+
+		// AN EXPLICIT TIMER, STOPPED, because time.After leaves its timer alive
+		// until it fires — and this is inside a loop inside a teardown that runs
+		// per job.
+		timer := time.NewTimer(pause)
+
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+
+			return fmt.Errorf("ceph: unmap %s, which is a root disk for %s: %w", device, name,
+				errors.Join(err, ctx.Err()))
+		case <-timer.C:
+		}
+	}
+
+	return fmt.Errorf("ceph: unmap %s, which is a root disk for %s: %w", device, name, err)
+}
+
+// isDeviceBusy reports whether the kernel client still holds a device.
+//
+// MATCHED ON THE ERRNO IT PRINTS, because `rbd` exits 16 for this and the number is
+// the errno rather than a code of its own — measured, like every other exit status
+// this package discriminates on.
+func isDeviceBusy(err error) bool {
+	return strings.Contains(err.Error(), "(16)") ||
+		strings.Contains(strings.ToLower(err.Error()), "device or resource busy")
 }
 
 // removeClone deletes a cache-pool image, treating an absent one as success.
