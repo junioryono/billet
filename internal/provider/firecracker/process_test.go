@@ -9,6 +9,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 )
 
 // The pid checks read /proc, so they can only be exercised where /proc is — which
@@ -34,25 +35,7 @@ func TestAPidIsOnlyTheMicroVMIfItsCommandLineSaysSo(t *testing.T) {
 
 	marker := "billet-" + strings.Repeat("a", leaseIDLength)
 
-	// A REAL PROCESS CARRYING THE MARKER IN ITS ARGV, which is exactly the shape
-	// the jailer produces.
-	cmd := exec.CommandContext(t.Context(), "sleep", "30")
-	cmd.Args = []string{"sleep", "--id", marker, "30"}
-
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start a stand-in vmm: %v", err)
-	}
-
-	t.Cleanup(func() {
-		if err := cmd.Process.Kill(); err != nil && !strings.Contains(err.Error(), "finished") {
-			t.Errorf("kill the stand-in: %v", err)
-		}
-
-		//nolint:errcheck // the wait is only here so the child is reaped
-		_ = cmd.Wait()
-	})
-
-	pid := cmd.Process.Pid
+	pid := standIn(t, marker, false)
 
 	owns, err := pidIsVMM(pid, marker)
 	if err != nil {
@@ -84,23 +67,9 @@ func TestAJailIdMustMatchAWholeArgument(t *testing.T) {
 
 	full := "billet-" + strings.Repeat("c", leaseIDLength)
 
-	cmd := exec.CommandContext(t.Context(), "sleep", "30")
-	cmd.Args = []string{"sleep", "--id", full, "30"}
+	pid := standIn(t, full, false)
 
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start a stand-in vmm: %v", err)
-	}
-
-	t.Cleanup(func() {
-		if err := cmd.Process.Kill(); err != nil && !strings.Contains(err.Error(), "finished") {
-			t.Errorf("kill the stand-in: %v", err)
-		}
-
-		//nolint:errcheck // the wait is only here so the child is reaped
-		_ = cmd.Wait()
-	})
-
-	owns, err := pidIsVMM(cmd.Process.Pid, full[:len(full)-4])
+	owns, err := pidIsVMM(pid, full[:len(full)-4])
 	if err != nil {
 		t.Fatalf("pidIsVMM: %v", err)
 	}
@@ -149,24 +118,10 @@ func TestDestroySignalsTheVMMItself(t *testing.T) {
 		// THE JAILER WRITES THIS, so the fake does too — and it points at a real
 		// process carrying the jail id, which is what Destroy has to be able to
 		// prove before it signals anything.
-		cmd := exec.CommandContext(t.Context(), "sleep", "60")
-		cmd.Args = []string{"sleep", "--id", id, "60"}
+		pid = standIn(t, id, false)
 
-		if err := cmd.Start(); err != nil {
-			t.Errorf("start a stand-in vmm: %v", err)
-
-			return
-		}
-
-		pid = cmd.Process.Pid
-
-		go func() {
-			//nolint:errcheck // reaping the child; the assertion is on whether it died
-			_ = cmd.Wait()
-		}()
-
-		j := h.p.jailFor(id)
-		if err := os.WriteFile(j.pidFile(), []byte(strconv.Itoa(pid)+"\n"), 0o600); err != nil {
+		if err := os.WriteFile(h.p.jailFor(id).pidFile(),
+			[]byte(strconv.Itoa(pid)+"\n"), 0o600); err != nil {
 			t.Errorf("write the pid file: %v", err)
 		}
 	}
@@ -262,4 +217,59 @@ func TestSignallingAnAlreadyExitedProcessIsSuccess(t *testing.T) {
 	if err := signalVMM(cmd.Process.Pid, syscall.SIGTERM); err != nil {
 		t.Errorf("signalling an exited process was reported as a failure: %v", err)
 	}
+}
+
+// standIn starts a process that carries a jail id in its argv and stays alive.
+//
+// THE ID GOES IN $0, which is what `sh -c <script> <name>` sets — NOT in a flag.
+// The first attempt passed `--id <id>` to `sleep` and to `sh`, and both reject an
+// unknown option and exit immediately: one test then asserted a process was NOT the
+// microVM and passed because there was no process at all, and another asserted a
+// process WAS one and passed only by racing its exit. A stand-in that cannot stay
+// alive cannot stand in for a VMM.
+//
+// `trap ” TERM` is what makes it a wedged VMM rather than a cooperative one, so the
+// SIGTERM-then-SIGKILL escalation is actually exercised.
+func standIn(t *testing.T, jailID string, ignoreTerm bool) int {
+	t.Helper()
+
+	script := "while :; do sleep 1; done"
+	if ignoreTerm {
+		script = "trap '' TERM; " + script
+	}
+
+	cmd := exec.CommandContext(t.Context(), "sh", "-c", script, jailID)
+
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start a stand-in vmm: %v", err)
+	}
+
+	pid := cmd.Process.Pid
+
+	go func() {
+		//nolint:errcheck // reaping the child; every assertion is on whether it died
+		_ = cmd.Wait()
+	}()
+
+	t.Cleanup(func() {
+		if proc, err := os.FindProcess(pid); err == nil {
+			//nolint:errcheck // best-effort teardown of a test fixture
+			_ = proc.Kill()
+		}
+	})
+
+	// ESTABLISHED BEFORE THE TEST USES IT. A stand-in that has not reached /proc
+	// yet is indistinguishable from one that exited, and both make an assertion
+	// about pid identity pass or fail for the wrong reason.
+	for range 200 {
+		if owns, err := pidIsVMM(pid, jailID); err == nil && owns {
+			return pid
+		}
+
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	t.Fatalf("the stand-in vmm never appeared in /proc carrying %q", jailID)
+
+	return 0
 }

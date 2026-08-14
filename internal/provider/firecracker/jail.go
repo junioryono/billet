@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"golang.org/x/sys/unix"
@@ -153,26 +154,55 @@ const maxSocketPath = len(unix.RawSockaddrUnix{}.Path) - 1
 // /dev/net/tun, /dev/userfaultfd and /dev/urandom. The kernel image and the root
 // disk are billet's to place, and a chroot means placing them INSIDE it: a path
 // that is correct from the host is meaningless to a process whose root has moved.
-func (p *Provider) build(j jail, device string) error {
-	// THE JAIL MUST NOT ALREADY EXIST. Reusing an id whose chroot survived a
-	// previous run fails inside the jailer with `Failed to create /dev/net/tun via
-	// mknod inside the jail: File exists` — measured — which names a device rather
-	// than the leftover that caused it. Billet names a jail after a lease, so this
-	// is reachable exactly when a launch is retried for a lease whose teardown did
-	// not finish, and saying so is more useful than passing the jailer's message on.
-	if _, err := os.Stat(j.dir()); err == nil {
-		return fmt.Errorf("firecracker: %s already exists, so a previous microVM for this lease "+
-			"was not cleaned up; the jailer cannot reuse it", j.dir())
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("firecracker: check whether %s is free: %w", j.dir(), err)
+// ErrJailExists is returned when a lease's chroot survived a previous run.
+//
+// A SENTINEL BECAUSE THE UNWIND MUST NOT TOUCH IT. Every other launch failure
+// unwinds what the launch MADE; this one is a refusal to touch what was already
+// there, so tearing it down would destroy the state of a microVM this launch never
+// created — and the error would still be telling the operator it had been left
+// alone.
+var ErrJailExists = errors.New("a previous microVM for this lease was not cleaned up")
+
+// claim creates the jail directory and marks it as this deployment's, before
+// anything else exists.
+//
+// FIRST, AND SEPARATE FROM THE REST, because the marker is what makes a half-built
+// jail findable. A crash between the clone and the marker leaves a mapped device and
+// a cache-pool image that NOTHING can attribute: no jail carries the name, so List
+// reports nothing, Find says "not found", the caller concludes nothing started, and
+// the lease is freed while the clone holds pool space forever. Creating the jail
+// first inverts that — a crash leaves a jail List reports and whose Destroy discards
+// the disk.
+func (p *Provider) claim(j jail) error {
+	// os.Mkdir RATHER THAN Stat-THEN-MkdirAll. The check and the create have to be
+	// one operation or two concurrent launches of one lease both pass the check:
+	// MkdirAll tolerates an existing directory, so both would proceed and the race
+	// would surface later and messily, as the jailer's mknod refusing an existing
+	// /dev/net/tun. EEXIST here is exactly the refusal wanted, atomically.
+	if err := os.MkdirAll(filepath.Dir(j.dir()), 0o755); err != nil {
+		return fmt.Errorf("firecracker: create the chroot base at %s: %w",
+			filepath.Dir(j.dir()), err)
 	}
 
+	if err := os.Mkdir(j.dir(), 0o755); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			// Reusing an id whose chroot survived fails inside the jailer with
+			// `Failed to create /dev/net/tun via mknod inside the jail: File
+			// exists` — measured — which names a device rather than the leftover
+			// that caused it.
+			return fmt.Errorf("firecracker: %w: %s already exists, and the jailer cannot reuse it",
+				ErrJailExists, j.dir())
+		}
+
+		return fmt.Errorf("firecracker: create the jail at %s: %w", j.dir(), err)
+	}
+
+	return p.writeOwner(j)
+}
+
+func (p *Provider) build(j jail, device string) error {
 	if err := os.MkdirAll(j.root(), 0o700); err != nil {
 		return fmt.Errorf("firecracker: create the jail at %s: %w", j.root(), err)
-	}
-
-	if err := p.writeOwner(j); err != nil {
-		return err
 	}
 
 	if err := p.placeKernel(j); err != nil {
@@ -183,11 +213,17 @@ func (p *Provider) build(j jail, device string) error {
 		return err
 	}
 
-	// EVERYTHING, AFTER EVERYTHING IS IN PLACE. The jailer drops to this uid before
-	// exec, so a file it cannot open is a boot failure — and chowning as each file
-	// appears would leave a window where a partly-built jail is already writable by
-	// the unprivileged account.
-	return p.chown(j.dir(), p.uid, p.gid)
+	// THE CHROOT, AFTER EVERYTHING IN IT IS IN PLACE. The jailer drops to this uid
+	// before exec and the VMM writes its log and its socket in here, so the
+	// directory has to be the account's — and chowning as each file appeared would
+	// leave a window where a partly-built jail is already writable by it.
+	//
+	// THE CHROOT, NOT THE JAIL. Two things above it stay owned by the account that
+	// installed them: the guest kernel, because it is a hard LINK to the operator's
+	// only copy and giving away a link gives away the inode; and the owner marker,
+	// which is the fact List and Find trust when they decide whose microVM this is.
+	// Neither is something a VMM has any reason to write to.
+	return p.chown(j.root(), p.uid, p.gid)
 }
 
 // writeOwner records the deployment this jail belongs to.
@@ -221,6 +257,17 @@ func ownerOf(j jail) (string, error) {
 // writes and 44MB of page cache for a file that never changes. A link across
 // filesystems is impossible rather than slow, so a copy is the fallback and not an
 // error.
+//
+// AND THE LINK IS NEVER GIVEN AWAY. A hard link is the SAME INODE, so chowning the
+// name inside the jail would chown the operator's one and only kernel on the host —
+// handing it to the account every VMM on the machine runs as. The owner of a file
+// may chmod it and write to it, and a VMM is precisely the process the jailer exists
+// to contain: one escape would rewrite the kernel that every later microVM boots,
+// persistently, without ever leaving the chroot. build's chown covers root/ and this
+// stays owned by whoever installed it; the VMM only ever reads it.
+//
+// WORLD-READABLE, because that is what the jailed account needs and all it needs.
+// The file is a kernel image rather than a secret.
 func (p *Provider) placeKernel(j jail) error {
 	if err := os.Link(p.cfg.KernelImage, j.kernelPath()); err == nil {
 		return nil
@@ -233,7 +280,7 @@ func (p *Provider) placeKernel(j jail) error {
 
 	defer src.Close()
 
-	dst, err := os.OpenFile(j.kernelPath(), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	dst, err := os.OpenFile(j.kernelPath(), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o444)
 	if err != nil {
 		return fmt.Errorf("firecracker: create %s: %w", j.kernelPath(), err)
 	}
@@ -249,6 +296,78 @@ func (p *Provider) placeKernel(j jail) error {
 	}
 
 	return nil
+}
+
+// execDirs lists every directory under the chroot base a jailer has ever built in.
+//
+// EVERY ONE, NOT JUST THIS BINARY'S, AND THAT IS THE POINT. The chroot is named
+// after the RESOLVED --exec-file, and the reference host installs firecracker as a
+// versioned filename behind a stable symlink precisely so a version can be bumped
+// and rolled back. Retarget that symlink and restart billet — which is a documented
+// flow, and which billet promises leaves running jobs running — and every guest
+// started before the bump sits under the OLD name.
+//
+// Reading only the current one would then return an inventory that is empty, short
+// and error-free, and the control plane frees the capacity of every lease absent
+// from it. A binary upgrade would silently resell every running job's machine. So
+// billet looks in all of them, and the owner marker is what keeps that safe: it is
+// what decides whose microVM a jail holds, not the directory it happens to be in.
+func (p *Provider) execDirs() ([]string, error) {
+	entries, err := os.ReadDir(p.cfg.ChrootBase)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			// A host that has never launched anything has no such directory, and
+			// refusing there would make the first sweep on a fresh host a failure.
+			return nil, nil
+		}
+
+		return nil, fmt.Errorf("firecracker: list the chroot base %s: %w", p.cfg.ChrootBase, err)
+	}
+
+	var dirs []string
+
+	for _, entry := range entries {
+		// THE JAILER'S OWN RULE, which is what bounds this to directories it made:
+		// it refuses an --exec-file whose name does not contain `firecracker`, so
+		// nothing else it built is here. Anything else under the base belongs to
+		// something that is not billet and is left alone.
+		if entry.IsDir() && strings.Contains(entry.Name(), "firecracker") {
+			dirs = append(dirs, entry.Name())
+		}
+	}
+
+	// THE CURRENT BINARY'S DIRECTORY IS ALWAYS ONE OF THEM, even before it exists,
+	// so a caller looking for a jail this process is about to create finds the same
+	// answer as one looking for a jail it already made.
+	if !slices.Contains(dirs, p.execName) {
+		dirs = append(dirs, p.execName)
+	}
+
+	return dirs, nil
+}
+
+// findJail locates an existing jail for an instance, wherever a jailer put it.
+func (p *Provider) findJail(name string) (jail, bool, error) {
+	dirs, err := p.execDirs()
+	if err != nil {
+		return jail{}, false, err
+	}
+
+	for _, dir := range dirs {
+		j := jail{base: p.cfg.ChrootBase, execName: dir, id: name}
+
+		if _, err := os.Stat(j.dir()); err == nil {
+			return j, true, nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			// NOT "NOT FOUND". A directory billet could not stat is not evidence
+			// that no microVM is there, and the caller's next move on a miss is to
+			// conclude nothing started.
+			return jail{}, false, fmt.Errorf("firecracker: look for a microVM at %s: %w",
+				j.dir(), err)
+		}
+	}
+
+	return jail{}, false, nil
 }
 
 // remove takes a jail and everything in it away.

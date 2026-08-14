@@ -184,11 +184,18 @@ type fakeDisk struct {
 	discarded  []string
 	cloned     []string
 	discardErr error
+	// onClone runs inside CloneRoot, so a test can observe what the host looked
+	// like at the moment the disk was cloned rather than afterwards.
+	onClone func()
 }
 
 func (d *fakeDisk) CloneRoot(_ context.Context, image, name string) (string, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+
+	if d.onClone != nil {
+		d.onClone()
+	}
 
 	if d.cloneErr != nil {
 		return "", d.cloneErr
