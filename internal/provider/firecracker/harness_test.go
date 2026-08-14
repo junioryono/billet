@@ -142,12 +142,6 @@ func (v *fakeVMM) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		case isString && action == "InstanceStart":
 			v.state = stateRunning
-
-		case isString && action == "SendCtrlAltDel":
-			// A REAL VMM EXITS, and a fake that answered 204 and kept listening
-			// would make every teardown look like a microVM refusing to stop —
-			// hiding whether billet waits for one at all.
-			go v.stop()
 		}
 	}
 

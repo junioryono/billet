@@ -39,6 +39,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/junioryono/billet/internal/config"
@@ -706,59 +707,136 @@ func (p *Provider) Destroy(ctx context.Context, id string) error {
 	return nil
 }
 
-// stopVMM asks a VMM to stop and waits for it to.
+// stopVMM stops a microVM, and waits until it has stopped.
 //
-// THROUGH THE API, not with a signal, and the difference is which pid is being
-// acted on. A pid file is a number a stale file can hold after the process it
-// named has exited and the number has been reused, and this backend runs as root —
-// so a signal sent on that evidence can land anywhere. The socket cannot be
-// mistaken: it answers only for the VMM that is listening on it, and the shutdown
-// action is one the VMM performs on itself.
+// BY SIGNALLING THE VMM, BECAUSE THE API HAS NO WAY TO KILL ONE. Its only shutdown
+// action is SendCtrlAltDel, which is a keyboard event the GUEST has to choose to
+// act on — measured against a real guest, the VMM was still answering twenty
+// seconds later. billet destroys a microVM because the job is over or its lease is
+// gone, and neither of those is something the guest gets a say in. The container
+// backend's `docker rm --force` is the same judgement.
+//
+// THE PID IS PROVEN TO BE THIS MICROVM'S BEFORE ANYTHING IS SIGNALLED. A pid file
+// is a number, and a stale one holds a number the kernel has since given to
+// something else — while this backend runs as root, so a signal sent on that
+// evidence lands wherever the number now points. /proc/<pid>/cmdline carries the
+// jailer's `--id`, measured, so it is checked first and a pid that cannot be
+// verified is not signalled at all. Failing closed there costs a jail that has to
+// be cleaned up by hand; failing open costs an arbitrary process on the host.
 func (p *Provider) stopVMM(ctx context.Context, j jail) error {
-	api := p.apiFor(j.socket())
-
-	// A GUEST IS NOT ASKED POLITELY. SendCtrlAltDel would let a guest that ignores
-	// it run on with its capacity released, and billet is destroying this microVM
-	// because the job is over or the lease is gone — neither of which the guest gets
-	// a say in.
-	err := api.put(ctx, "/actions", map[string]string{"action_type": "SendCtrlAltDel"})
-	if err == nil {
-		return p.awaitExit(ctx, api)
+	pid, err := p.vmmPID(j)
+	if err != nil {
+		return err
 	}
 
-	if gone(err) {
-		// Already stopped, which is the idempotent case this runs into constantly.
+	if pid == 0 {
+		// No pid file, or no process answering to it. Either way there is nothing
+		// running — the idempotent case this runs into constantly.
 		return nil
 	}
 
-	return fmt.Errorf("firecracker: stop the microVM %s: %w", j.id, err)
+	// SIGTERM FIRST, because firecracker exits cleanly on it — measured — and a
+	// clean exit closes the guest's disk rather than leaving the mapped device to
+	// be torn out from under it.
+	if err := signalVMM(pid, syscall.SIGTERM); err != nil {
+		return fmt.Errorf("firecracker: stop the microVM %s: %w", j.id, err)
+	}
+
+	if err := p.awaitExit(ctx, j, pid); err == nil {
+		return nil
+	}
+
+	// AND SIGKILL IF IT WILL NOT, because the alternative is a microVM holding a
+	// mapped block device open forever while its capacity stays charged.
+	if err := signalVMM(pid, syscall.SIGKILL); err != nil {
+		return fmt.Errorf("firecracker: kill the microVM %s, which did not stop when asked: %w",
+			j.id, err)
+	}
+
+	return p.awaitExit(ctx, j, pid)
 }
 
-// awaitExit waits for a stopping VMM to stop answering.
-func (p *Provider) awaitExit(ctx context.Context, api *vmmAPI) error {
-	ctx, cancel := context.WithTimeout(ctx, p.bootWait)
+// vmmPID is the process id of this jail's VMM, or zero when there is none.
+//
+// ZERO IS "NOTHING IS RUNNING" AND AN ERROR IS "BILLET COULD NOT TELL", which the
+// caller must not confuse: the first permits teardown to continue and the second
+// must stop it, because the next steps unmap a block device the VMM may still hold.
+func (p *Provider) vmmPID(j jail) (int, error) {
+	raw, err := os.ReadFile(j.pidFile())
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, nil
+		}
+
+		return 0, fmt.Errorf("firecracker: read the pid of the microVM %s: %w", j.id, err)
+	}
+
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil || pid <= 0 {
+		return 0, fmt.Errorf("firecracker: %s holds %s, which is not a process id",
+			j.pidFile(), bounded(strings.TrimSpace(string(raw))))
+	}
+
+	// THE DISCRIMINATOR AGAINST PID REUSE. The jailer execs the VMM with
+	// `--id <jail id>`, so the command line is proof that this number is still the
+	// process the file was written for.
+	owns, err := pidIsVMM(pid, j.id)
+	if err != nil {
+		return 0, err
+	}
+
+	if !owns {
+		return 0, nil
+	}
+
+	return pid, nil
+}
+
+// awaitExit waits for a signalled VMM to actually be gone.
+//
+// IT WATCHES THE PROCESS, not the API socket. A VMM that is mid-exit can stop
+// answering while its file descriptors are still open — and what the next step
+// needs is not "it stopped serving" but "it has released the block device", which
+// only the process ending establishes.
+func (p *Provider) awaitExit(ctx context.Context, j jail, pid int) error {
+	ctx, cancel := context.WithTimeout(ctx, exitWait)
 	defer cancel()
 
 	ticker := time.NewTicker(bootPoll)
 	defer ticker.Stop()
 
 	for {
-		if _, err := api.info(ctx); gone(err) {
+		// A pid that no longer belongs to this microVM is one that has exited —
+		// including the case where the number has already been reused, which is
+		// equally proof that the VMM billet signalled is gone.
+		owns, err := pidIsVMM(pid, j.id)
+		if err != nil {
+			return err
+		}
+
+		if !owns {
 			return nil
 		}
 
 		select {
 		case <-ctx.Done():
 			// REPORTED, NOT SWALLOWED. A VMM that will not stop is holding a mapped
-			// device open, so the discard below it is going to fail too — and the
+			// device open, so the discard after it is going to fail too — and the
 			// caller reads any error here as "the compute may still exist", which is
 			// exactly right.
-			return fmt.Errorf("firecracker: the microVM at %s was asked to stop and is still "+
-				"answering: %w", api.socket, ctx.Err())
+			return fmt.Errorf("firecracker: the microVM %s (pid %d) was signalled and is still "+
+				"running: %w", j.id, pid, ctx.Err())
 		case <-ticker.C:
 		}
 	}
 }
+
+// exitWait bounds how long a signalled VMM is given to go.
+//
+// SHORT, because SIGTERM to a firecracker process is not a graceful guest shutdown
+// — the VMM exits, taking the guest with it, and measured that is immediate. What
+// this is really bounding is the window before billet escalates to SIGKILL.
+const exitWait = 5 * time.Second
 
 // unwind removes what a failed launch made.
 //
