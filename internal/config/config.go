@@ -418,14 +418,187 @@ func (g GuestOS) Valid() bool {
 // FirecrackerConfig configures the bare-metal microVM backend.
 type FirecrackerConfig struct {
 	// BinaryPath and JailerPath locate the firecracker and jailer binaries.
+	//
+	// BinaryPath IS NOT ONLY AN EXECUTABLE. The jailer names its chroot after this
+	// file AFTER RESOLVING SYMLINKS, so it also decides the directory billet
+	// enumerates to find out what is running here — see the firecracker provider's
+	// jail type, where getting it wrong reads as an empty inventory.
 	BinaryPath string `yaml:"binary_path,omitempty"`
 	JailerPath string `yaml:"jailer_path,omitempty"`
 	// KernelImage is the uncompressed guest kernel. It must be built with
 	// everything Docker needs; validate with moby's contrib/check-config.sh
 	// rather than a hand-maintained list.
 	KernelImage string `yaml:"kernel_image"`
-	// Bridge is the host bridge guests attach to.
-	Bridge string `yaml:"bridge,omitempty"`
+	// ChrootBase is where the jailer builds each microVM's chroot. It defaults to
+	// the jailer's own default, and it must be on local storage with room for a
+	// hard link to the guest kernel per running job.
+	ChrootBase string `yaml:"chroot_base,omitempty"`
+	// JailUser is the account the jailer drops the VMM to before it reads
+	// anything. Defaults to billet, and root is REFUSED: dropping privileges is
+	// what the jailer is for, so running the VMM as root removes the reason to use
+	// it at all.
+	JailUser string `yaml:"jail_user,omitempty"`
+	// Bridge is the host bridge trusted guests attach to.
+	Bridge string `yaml:"bridge"`
+	// UntrustedBridge is the bridge fork pull-request guests attach to, and its
+	// ABSENCE is what refuses them.
+	//
+	// A microVM is a real isolation boundary, which is why this backend can run
+	// code billet cannot vouch for at all — but that boundary is the KERNEL, not
+	// the network. A guest on the ordinary bridge reaches whatever that bridge
+	// reaches, which on a machine that also holds the Ceph cluster and the
+	// control-plane database is everything that matters. So untrusted work runs
+	// only once its network has been described separately, rather than defaulting
+	// onto the trusted bridge because nobody said otherwise. This is the same rule,
+	// and the same reasoning, as node.ec2.untrusted_security_group_ids.
+	UntrustedBridge string `yaml:"untrusted_bridge,omitempty"`
+}
+
+// DefaultFirecrackerBinary and friends are where the reference host installs
+// these, which is also where each project's own instructions put them.
+const (
+	DefaultFirecrackerBinary = "/usr/local/bin/firecracker"
+	DefaultJailerBinary      = "/usr/local/bin/jailer"
+	// DefaultChrootBase is the jailer's own default, so billet and a hand-run
+	// jailer agree about where a microVM lives.
+	DefaultChrootBase = "/srv/jailer"
+	// DefaultJailUser is deliberately not root — see FirecrackerConfig.JailUser.
+	DefaultJailUser = "billet"
+)
+
+// Normalize fills in the defaults and trims what billet later passes verbatim.
+//
+// EXPORTED FOR THE SAME REASON CheckFirecracker IS. The provider's constructor is
+// exported and cannot assume its configuration came through Load, and a value that
+// was trimmed for a CHECK while the caller used the raw one is the exact defect the
+// ec2 and ceph blocks each shipped with once.
+func (f *FirecrackerConfig) Normalize() {
+	if f == nil {
+		return
+	}
+
+	f.BinaryPath = strings.TrimSpace(f.BinaryPath)
+	f.JailerPath = strings.TrimSpace(f.JailerPath)
+	f.KernelImage = strings.TrimSpace(f.KernelImage)
+	f.ChrootBase = strings.TrimSpace(f.ChrootBase)
+	f.JailUser = strings.TrimSpace(f.JailUser)
+	f.Bridge = strings.TrimSpace(f.Bridge)
+	f.UntrustedBridge = strings.TrimSpace(f.UntrustedBridge)
+
+	for _, d := range []struct {
+		into  *string
+		value string
+	}{
+		{&f.BinaryPath, DefaultFirecrackerBinary},
+		{&f.JailerPath, DefaultJailerBinary},
+		{&f.ChrootBase, DefaultChrootBase},
+		{&f.JailUser, DefaultJailUser},
+	} {
+		if *d.into == "" {
+			*d.into = d.value
+		}
+	}
+}
+
+// CheckFirecracker refuses a microVM block billet cannot safely act on.
+//
+// EXPORTED AND CALLED FROM BOTH SIDES, like CheckCeph and CheckEC2Endpoint: the
+// provider's constructor is exported, so a rule enforced only in Load has a second
+// entry point that does not enforce it.
+//
+// It takes a VALUE, so a caller cannot hand it a nil pointer and read the empty
+// result as approval.
+func CheckFirecracker(f FirecrackerConfig) []error {
+	var errs []error
+
+	// EVERY PATH IS ABSOLUTE, because a node is a service whose working directory
+	// is whatever started it — the same rule node.ceph.conf_path follows. A relative
+	// chroot base resolves against `/` under systemd, so a jail an operator built by
+	// hand while testing is not the one billet enumerates in production.
+	for _, f := range []struct{ field, value string }{
+		{"binary_path", f.BinaryPath},
+		{"jailer_path", f.JailerPath},
+		{"kernel_image", f.KernelImage},
+		{"chroot_base", f.ChrootBase},
+	} {
+		switch {
+		case f.value == "":
+			errs = append(errs, fmt.Errorf("node.firecracker.%s is required", f.field))
+		case f.value != strings.TrimSpace(f.value):
+			errs = append(errs, fmt.Errorf("node.firecracker.%s %q has leading or trailing "+
+				"whitespace; billet passes it to the jailer exactly as written", f.field, f.value))
+		case !filepath.IsAbs(f.value):
+			errs = append(errs, fmt.Errorf("node.firecracker.%s %q is relative; a node runs as a "+
+				"service, whose working directory is not where you wrote this file",
+				f.field, f.value))
+		}
+	}
+
+	errs = append(errs, checkBridge("bridge", f.Bridge, true)...)
+	errs = append(errs, checkBridge("untrusted_bridge", f.UntrustedBridge, false)...)
+
+	// THE TWO BRIDGES MUST DIFFER, or the setting that admits untrusted work admits
+	// it onto the trusted network — which is the one outcome
+	// node.firecracker.untrusted_bridge exists to prevent, reached by a
+	// configuration that looks like it took the precaution.
+	if f.Bridge != "" && f.Bridge == f.UntrustedBridge {
+		errs = append(errs, fmt.Errorf("node.firecracker.bridge and "+
+			"node.firecracker.untrusted_bridge are both %q: a fork's pull request would run on "+
+			"the same network as everything else, which is what naming a separate bridge is for",
+			f.Bridge))
+	}
+
+	if user := strings.TrimSpace(f.JailUser); user == "" || user == "root" {
+		errs = append(errs, fmt.Errorf("node.firecracker.jail_user is %q: the jailer exists to "+
+			"drop privileges before the vmm reads anything an operator or a job wrote, so running "+
+			"it as root would leave the guest's vmm with all of them; create an unprivileged "+
+			"account (`useradd --system --no-create-home --shell /usr/sbin/nologin %s`)",
+			f.JailUser, DefaultJailUser))
+	}
+
+	return errs
+}
+
+// maxBridgeName is the kernel's IFNAMSIZ limit, less the terminator.
+const maxBridgeName = 15
+
+// bridgeName is what the kernel accepts as a network device name.
+//
+// A SHAPE RATHER THAN A LIST, and narrow because billet builds an `ip link set dev
+// <tap> master <bridge>` argv from it. There is no shell, so this is not about
+// quoting; it is that a leading dash is read by `ip` as an option, and a name over
+// IFNAMSIZ is refused by the kernel with an error that names neither the field nor
+// the limit.
+var bridgeName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
+
+// checkBridge refuses a bridge name that would not reach the kernel intact.
+func checkBridge(field, name string, required bool) []error {
+	if name == "" {
+		if required {
+			return []error{fmt.Errorf("node.firecracker.%s is required: every guest gets one "+
+				"network device, and billet attaches it to this bridge", field)}
+		}
+
+		return nil
+	}
+
+	if name != strings.TrimSpace(name) {
+		return []error{fmt.Errorf("node.firecracker.%s %q has leading or trailing whitespace; "+
+			"billet passes it to `ip` exactly as written", field, name)}
+	}
+
+	if len(name) > maxBridgeName {
+		return []error{fmt.Errorf("node.firecracker.%s %q is %d characters; the kernel's limit "+
+			"for a network device name is %d", field, name, len(name), maxBridgeName)}
+	}
+
+	if !bridgeName.MatchString(name) {
+		return []error{fmt.Errorf("node.firecracker.%s %q is not a network device name (expected "+
+			"something like br0); billet builds an `ip link` argument from it, where a leading "+
+			"dash is read as an option", field, name)}
+	}
+
+	return nil
 }
 
 // CephConfig points this host at the Ceph cluster its site keeps.
@@ -1150,6 +1323,7 @@ func (c *Config) applyDefaults() {
 		c.Node.Name = trimNodeName(c.Node.Name)
 		c.Node.EC2.normalize()
 		c.Node.Ceph.normalize()
+		c.Node.Firecracker.Normalize()
 
 		// THE CERTIFICATE DECIDES WHEN THERE IS ONE. The control plane authorises a
 		// node by the name in its certificate, so with a bundle present the config
@@ -1469,8 +1643,8 @@ func (c *Config) validateNode() []error {
 	if c.Node.Provider == ProviderFirecracker {
 		if c.Node.Firecracker == nil {
 			errs = append(errs, errors.New("node.firecracker is required when provider is firecracker"))
-		} else if c.Node.Firecracker.KernelImage == "" {
-			errs = append(errs, errors.New("node.firecracker.kernel_image is required"))
+		} else {
+			errs = append(errs, CheckFirecracker(*c.Node.Firecracker)...)
 		}
 	}
 

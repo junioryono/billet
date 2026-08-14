@@ -400,8 +400,8 @@ func TestTheOldZFSKeyExplainsWhatReplacedIt(t *testing.T) {
 	t.Parallel()
 
 	body := strings.Replace(withoutCeph(t),
-		"    kernel_image: /var/lib/billet/vmlinux\n",
-		"    kernel_image: /var/lib/billet/vmlinux\n    zfs_pool: tank\n", 1)
+		"    kernel_image: /var/lib/billet/vmlinux\n    bridge: br0\n",
+		"    kernel_image: /var/lib/billet/vmlinux\n    bridge: br0\n    zfs_pool: tank\n", 1)
 	if !strings.Contains(body, "zfs_pool: tank") {
 		t.Fatal("the firecracker block has changed, so this case adds nothing")
 	}
@@ -636,8 +636,8 @@ func TestEveryRemovedKeyIsExplainedInOnePass(t *testing.T) {
 
 	body := strings.Replace(withoutCeph(t), "  state_dir: /var/lib/billet/server\n",
 		"  state_dir: /var/lib/billet/server\n  lock_dir: /run/billet/locks\n", 1)
-	body = strings.Replace(body, "    kernel_image: /var/lib/billet/vmlinux\n",
-		"    kernel_image: /var/lib/billet/vmlinux\n    zfs_pool: tank\n", 1)
+	body = strings.Replace(body, "    kernel_image: /var/lib/billet/vmlinux\n    bridge: br0\n",
+		"    kernel_image: /var/lib/billet/vmlinux\n    bridge: br0\n    zfs_pool: tank\n", 1)
 
 	for _, must := range []string{"lock_dir: /run/billet/locks", "zfs_pool: tank"} {
 		if !strings.Contains(body, must) {

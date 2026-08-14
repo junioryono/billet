@@ -185,6 +185,7 @@ node:
   state_dir: /var/lib/billet/node
   firecracker:
     kernel_image: /var/lib/billet/vmlinux
+    bridge: br0
   ceph:
     image_pool: billet-images
     cache_pool: billet-cache
@@ -497,8 +498,16 @@ func TestDuplicateTierLabelRejected(t *testing.T) {
 }
 
 func TestFirecrackerNodeRequiresItsOwnSection(t *testing.T) {
-	body := strings.Replace(validConfig,
-		"  firecracker:\n    kernel_image: /var/lib/billet/vmlinux\n", "", 1)
+	const block = "  firecracker:\n    kernel_image: /var/lib/billet/vmlinux\n    bridge: br0\n"
+
+	// ASSERTED, because a fixture that has moved on turns every replacement below
+	// into a no-op that still produces an error — for a reason that has nothing to
+	// do with what this test is named for.
+	if !strings.Contains(validConfig, block) {
+		t.Fatal("the firecracker block has changed, so this case patches nothing")
+	}
+
+	body := strings.Replace(validConfig, block, "", 1)
 	if _, err := Load(writeConfig(t, body)); err == nil {
 		t.Fatal("Load accepted a firecracker node with no firecracker section")
 	}
