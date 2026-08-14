@@ -161,6 +161,29 @@ done
 
 fetch() { curl -sf -H "X-metadata-token: $token" "http://$MMDS/latest/meta-data/billet/$1"; }
 
+# THE CONTRACT FIRST, BEFORE ANYTHING IS READ FROM IT.
+#
+# This agent is baked into a guest image that is published once and booted for
+# months, while billet is upgraded independently — so the two CAN drift, and a
+# billet that renamed a key would otherwise hand this script metadata it does not
+# recognise. It would then find no registration, start no runner, and leave a microVM
+# that booted perfectly and ran nothing.
+#
+# Refusing out loud is the whole point: the message names both versions, so the
+# answer ("republish the image") is in the failure rather than in somebody's memory.
+WANT_CONTRACT=1
+
+if ! contract=$(fetch contract); then
+	log "this billet did not say which metadata contract it speaks; it is older than this image"
+	exit 1
+fi
+
+if [ "$contract" != "$WANT_CONTRACT" ]; then
+	log "billet speaks metadata contract $contract and this image understands $WANT_CONTRACT"
+	log "rebuild and republish the guest image with scripts/build-guest-image.sh"
+	exit 1
+fi
+
 if ! jit=$(fetch jit-config); then
 	log "no registration in the metadata"
 	exit 1
@@ -170,12 +193,26 @@ if ! name=$(fetch runner-name); then
 	name=unknown
 fi
 
-# The command is a JSON array, because a tier's command is one and word-splitting it
-# here would be billet guessing at somebody's argv.
+# THE COMMAND ARRIVES AS JSON IN A STRING, and both halves of that are deliberate.
+#
+# JSON, because a tier's command is an argv, and word-splitting it here would be
+# billet guessing at somebody's quoting.
+#
+# In a STRING, because the metadata service cannot hand over anything else. A plain
+# GET is answered in IMDS format, which renders a JSON string or lists the keys of a
+# JSON object — and nothing else. An array comes back 501, "Cannot retrieve value. The
+# value has an unsupported type." billet sent one as a real array once: the guest
+# reached this exact line, got the 501, and stopped. Everything before it had worked,
+# so what an operator saw was a microVM that booted perfectly and ran no job.
+#
+# `Accept: application/json` would fetch an array correctly today, and is deliberately
+# NOT used: setting `imds_compat` on the service makes firecracker ignore that header,
+# which would make this a guest that stops working because of a change on the host.
 cmd=()
 
 if ! raw=$(fetch command); then
-	log "no command in the metadata"
+	log "no command in the metadata; billet may be sending it in a form the service "
+	log "cannot serve — only strings and objects can be fetched in IMDS format"
 	exit 1
 fi
 
