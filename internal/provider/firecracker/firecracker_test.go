@@ -352,6 +352,16 @@ func TestASpecThatCannotRunAJobIsRefused(t *testing.T) {
 		{"an argument containing a nul",
 			func(s *provider.Spec) { s.Command = []string{"/bin/sh", "-c", "echo\x00rest"} },
 			"containing a NUL"},
+		// TOO BIG FOR THE SERVICE THAT HAS TO HOLD IT. The metadata service takes
+		// 51200 bytes, and without this check a command over it passed every other
+		// one, claimed a jail, a uid, a tap and a cloned disk, started a VMM, and
+		// failed on the PUT that fills the metadata — paying for a whole launch, on
+		// every job, to reach a refusal that named an HTTP request instead of the
+		// tier to fix.
+		{"a command too large for the metadata service",
+			func(s *provider.Spec) {
+				s.Command = []string{"/bin/sh", "-c", strings.Repeat("x", mmdsSizeLimit)}
+			}, "the service holds"},
 		{"no vcpu", func(s *provider.Spec) { s.VCPU = 0 }, "vCPU"},
 		{"no memory", func(s *provider.Spec) { s.Memory = 0 }, "of memory"},
 	} {
@@ -376,6 +386,13 @@ func TestASpecThatCannotRunAJobIsRefused(t *testing.T) {
 			// run the jailer is not a refusal, it is a leak with an error attached.
 			if cmds := h.commands(); len(cmds) != 0 {
 				t.Errorf("a refused spec still ran %v", cmds)
+			}
+
+			// Nothing to discard either, which is the same property from the other
+			// side: a clone that was never made needs no cleaning up, and a refusal
+			// that discarded one had already spent the pool space it is refusing.
+			if got := h.disk.discards(); len(got) != 0 {
+				t.Errorf("a refused spec cloned a root disk and then discarded it: %v", got)
 			}
 		})
 	}
