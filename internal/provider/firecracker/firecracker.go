@@ -44,6 +44,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/provider"
@@ -460,6 +461,30 @@ func checkSpec(spec provider.Spec) error {
 	if len(spec.Command) == 0 {
 		return fmt.Errorf("firecracker: %s has no command, so the guest would boot without ever "+
 			"starting a runner and the job would stay queued", spec.Name)
+	}
+
+	// AND EVERY ARGUMENT IS SOMETHING THAT CAN ARRIVE UNCHANGED, because the one
+	// promise this path makes about a command is that the guest runs the argv it was
+	// given. The command travels as JSON, and `json.Marshal` does not fail on a Go
+	// string holding invalid UTF-8 — it substitutes U+FFFD and returns success. So a
+	// byte billet cannot carry would otherwise be REWRITTEN in flight and the guest
+	// would run a subtly different command, silently, with nothing anywhere saying so.
+	//
+	// A NUL cannot be in an argv at all: execve's arguments are NUL-terminated, so an
+	// argument containing one is a request the kernel has no way to honour.
+	//
+	// Refusing is the whole point. Neither of these is a command somebody meant to
+	// write, and a launch that stops here names the tier that has to be fixed.
+	for i, arg := range spec.Command {
+		if !utf8.ValidString(arg) {
+			return fmt.Errorf("firecracker: %s has argument %d with bytes that are not valid "+
+				"UTF-8, and they cannot reach the guest unchanged", spec.Name, i)
+		}
+
+		if strings.ContainsRune(arg, 0) {
+			return fmt.Errorf("firecracker: %s has argument %d containing a NUL, which no "+
+				"argv can carry", spec.Name, i)
+		}
 	}
 
 	if spec.VCPU <= 0 {

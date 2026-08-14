@@ -216,9 +216,43 @@ if ! raw=$(fetch command); then
 	exit 1
 fi
 
-while IFS= read -r arg; do
-	cmd+=("$arg")
-done < <(printf '%s' "$raw" | jq -r '.[]')
+# ONE BASE64 LINE PER ARGUMENT, so an argument may contain anything an argument is
+# allowed to contain. Reading `jq -r '.[]'` directly is newline-delimited, which
+# silently splits an argument containing a newline into two — billet quietly editing
+# somebody's argv, which is the exact thing carrying this as JSON exists to prevent.
+# Measured: `["/bin/sh","-c","echo one\ntwo","tail arg"]` came back as five arguments.
+#
+# BILLET_AGENT_DECODE_BEGIN — the block between these markers is extracted verbatim
+# and exercised by TestTheGuestAgentReconstructsAnArgvExactly. Reading `raw` and
+# leaving `cmd` is the whole contract; keep it that way or the test will say so.
+
+# AND JQ'S STATUS IS CHECKED BEFORE ANYTHING IS BUILT FROM ITS OUTPUT, because a
+# `while read` fed by process substitution cannot see it — neither `set -e` nor
+# `pipefail` reaches across that redirect. A jq that emitted three arguments and then
+# failed would hand the runner a TRUNCATED argv, which is worse than no argv at all:
+# `sh -c 'rm -rf x' extra` and `sh -c 'rm -rf x'` are different commands and only one
+# of them was asked for.
+if ! printf '%s' "$raw" |
+	jq -e 'type == "array" and length > 0 and all(.[]; type == "string")' >/dev/null; then
+	log "the command in the metadata is not a non-empty array of strings"
+	exit 1
+fi
+
+if ! encoded=$(printf '%s' "$raw" | jq -r '.[] | @base64'); then
+	log "the command in the metadata could not be decoded"
+	exit 1
+fi
+
+while IFS= read -r line; do
+	# THE SENTINEL EXISTS BECAUSE $() STRIPS TRAILING NEWLINES and an argument is
+	# allowed to end in one. Append a byte inside the substitution and take it off
+	# outside — and do both in ONE step, because a decode helper that RETURNED the
+	# value would have it stripped a second time by the substitution that called it.
+	decoded=$(printf '%s' "$line" | base64 -d; printf X)
+	cmd+=("${decoded%X}")
+done <<<"$encoded"
+
+# BILLET_AGENT_DECODE_END
 
 if [ "${#cmd[@]}" -eq 0 ]; then
 	log "the command in the metadata is empty"
