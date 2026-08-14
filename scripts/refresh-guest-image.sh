@@ -32,7 +32,25 @@ set -euo pipefail
 # worse, `dd` into the same head image concurrently.
 if [ -z "${BILLET_REFRESH_LOCKED:-}" ]; then
 	export BILLET_REFRESH_LOCKED=1
-	exec flock -n /var/lock/billet-image-refresh.lock "$0" "$@"
+
+	# NOT `exec`, SO THAT LOSING THE LOCK CAN BE EXPLAINED. `flock -n` prints nothing
+	# at all when it cannot acquire -- measured: exit 1, no output -- so an exec'd
+	# version left a second run dying in total silence. Under systemd that is a failed
+	# unit with an empty journal, which is the least diagnosable failure this script
+	# has, and it happens exactly when somebody is already fixing something by hand.
+	# `|| status=$?` RATHER THAN A BARE CALL, because `set -e` would otherwise kill
+	# this script the instant flock returns 1 -- before the line that explains why.
+	# The first version of this fix printed nothing for exactly that reason, which is
+	# the same trap the guest agent carries a paragraph about.
+	status=0
+	flock -n /var/lock/billet-image-refresh.lock "$0" "$@" || status=$?
+
+	if [ "$status" -eq 1 ]; then
+		echo "refresh-guest-image: another refresh is already running on this machine; this" >&2
+		echo "run is skipping rather than building into the same workspace" >&2
+	fi
+
+	exit "$status"
 fi
 
 BILLET="${BILLET:-billet}"
