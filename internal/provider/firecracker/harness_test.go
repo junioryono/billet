@@ -240,6 +240,7 @@ type harness struct {
 	// onJailer runs when the jailer is invoked, which is where a test starts the
 	// fake VMM — the same ordering the real thing has.
 	onJailer func(id string)
+	refuse   func(bin string, args []string) error
 	// jailerErr makes the jailer fail.
 	jailerErr error
 }
@@ -335,7 +336,17 @@ func (h *harness) record(_ context.Context, bin string, args []string) ([]byte, 
 	h.runs = append(h.runs, recordedRun{bin: bin, args: append([]string(nil), args...)})
 	jailer := h.onJailer
 	err := h.jailerErr
+	refuse := h.refuse
 	h.mu.Unlock()
+
+	// A SEAM FOR "THE HOST SAID NO". Several teardown properties are only about what
+	// billet does when a command it issued FAILS, and a fake that always succeeds
+	// cannot express them.
+	if refuse != nil {
+		if err := refuse(bin, args); err != nil {
+			return nil, err
+		}
+	}
 
 	if strings.HasSuffix(bin, "jailer") {
 		if err != nil {

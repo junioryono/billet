@@ -940,7 +940,7 @@ func TestAUIDIsReusedOnceItsMicroVMIsGone(t *testing.T) {
 		t.Fatalf("claimResources: %v", err)
 	}
 
-	if err := errors.Join(first.remove(), h.p.releaseResources(res)); err != nil {
+	if err := errors.Join(first.remove(), h.p.releaseResources(res, first.id)); err != nil {
 		t.Fatalf("release: %v", err)
 	}
 

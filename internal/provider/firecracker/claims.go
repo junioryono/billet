@@ -75,8 +75,23 @@ func (p *Provider) claimUID(j jail) (int, error) {
 
 // take claims one name for a jail, reporting whether it got it.
 //
-// THE MKDIR IS THE ALLOCATION. Two launches racing for the same name both call it and
-// exactly one succeeds, which is the property a scan-then-take cannot have.
+// THE LINK IS THE ALLOCATION, AND THE CONTENT EXISTS BEFORE THE NAME DOES. The claim
+// is staged as a file holding the jail id and then `link`ed into place: link is
+// atomic and fails with EEXIST if the name is taken, so two launches racing for one
+// name have exactly one winner, and the winner's claim is COMPLETE the instant it is
+// visible.
+//
+// THAT SECOND HALF IS THE WHOLE FIX. This used to be `Mkdir` followed by a separate
+// write of the jail file, which left a window where a claim existed with nothing
+// recorded in it — and the reaper, correctly, frees claims in exactly that state. So
+// two ordinary concurrent launches could both win: B created the directory, A found
+// it empty and reaped it, B recreated it, A's write landed in B's directory, and both
+// returned success holding one uid. Two VMMs then ran as one account, silently
+// dissolving the isolation the per-guest uid exists to provide, with nothing anywhere
+// able to detect it. Both reviewers found this independently.
+//
+// The lowest free name is always tried first, so concurrent launches contend on the
+// SAME name systematically rather than occasionally — this was not a narrow race.
 //
 // A CLAIM WHOSE JAIL IS GONE IS REAPED AND THEN RETRIED — once, in that order, and
 // the retry is the part a first version got wrong. Reaping and moving on frees the
@@ -84,18 +99,29 @@ func (p *Provider) claimUID(j jail) (int, error) {
 // one could never be reused at all. Retrying is bounded to a single attempt because
 // losing the race twice means another launch genuinely holds it now.
 func (p *Provider) take(claim, jailID string) (bool, error) {
+	staged, err := os.CreateTemp(filepath.Dir(claim), ".staging-")
+	if err != nil {
+		return false, fmt.Errorf("firecracker: stage a claim beside %s: %w", claim, err)
+	}
+
+	// The staging name is never the claim, so removing it is unconditional: on the
+	// winning path the link has already given the content a second name.
+	defer os.Remove(staged.Name())
+
+	if _, err := staged.WriteString(jailID + "\n"); err != nil {
+		return false, errors.Join(fmt.Errorf("firecracker: write a staged claim: %w", err),
+			staged.Close())
+	}
+
+	if err := staged.Close(); err != nil {
+		return false, fmt.Errorf("firecracker: close a staged claim: %w", err)
+	}
+
 	for attempt := range 2 {
-		err := os.Mkdir(claim, 0o700)
+		err := os.Link(staged.Name(), claim)
 
 		switch {
 		case err == nil:
-			if err := os.WriteFile(filepath.Join(claim, "jail"), []byte(jailID+"\n"), 0o600); err != nil {
-				// THE CLAIM IS ABANDONED, and its own removal failing adds nothing a
-				// caller could act on — the reaper frees a claim with no jail
-				// recorded in it, which is exactly the state this would leave.
-				return false, errors.Join(err, os.RemoveAll(claim))
-			}
-
 			return true, nil
 
 		case !errors.Is(err, os.ErrExist):
@@ -122,14 +148,15 @@ func (p *Provider) take(claim, jailID string) (bool, error) {
 // It reads the jail's own existence rather than a timestamp: a claim is free exactly
 // when the thing it was taken for is gone, which is a fact rather than a heuristic.
 func (p *Provider) reapClaim(claim string) bool {
-	raw, err := os.ReadFile(filepath.Join(claim, "jail"))
+	raw, err := os.ReadFile(claim)
 	if err != nil {
-		// A claim with no jail recorded in it was interrupted between the mkdir and
-		// the write. Nothing is using it, and leaving it would leak a uid forever.
-		if errors.Is(err, os.ErrNotExist) {
-			return os.RemoveAll(claim) == nil
-		}
-
+		// GONE ALREADY IS NOT REAPED BY THIS CALL. Reporting true here would say a
+		// name was freed that somebody else may have just taken, and the caller acts
+		// on that by trying to take it.
+		//
+		// There is no longer a "claim with nothing recorded in it" to handle: a claim
+		// is linked into place with its content already written, so it is never
+		// visible in a half-made state.
 		return false
 	}
 
@@ -137,20 +164,50 @@ func (p *Provider) reapClaim(claim string) bool {
 		return false
 	}
 
-	return os.RemoveAll(claim) == nil
+	return os.Remove(claim) == nil
 }
 
-// releaseUID gives a microVM's uid back.
-func (p *Provider) releaseUID(uid int) error {
+// releaseClaim gives one name back, but only if it is still this jail's.
+//
+// COMPARE BEFORE DELETING, because a claim can legitimately belong to somebody else
+// by the time teardown reaches it. Teardown removes the jail BEFORE releasing claims
+// — deliberately, so that no claim is freed while a VMM might still be using it — and
+// in that gap another launch may reap this very claim (its jail is gone, which is
+// exactly the reaper's condition) and take the name for itself. A blind delete then
+// removes a LIVE claim, and the next launch takes a uid a running microVM is using.
+//
+// So the name alone is not enough to authorise a delete; the claim has to still say
+// it is ours.
+func (p *Provider) releaseClaim(claim, jailID string) error {
+	raw, err := os.ReadFile(claim)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+
+		return fmt.Errorf("firecracker: read the claim %s: %w", claim, err)
+	}
+
+	if strings.TrimSpace(string(raw)) != jailID {
+		// Somebody else's now. Leaving it is the only safe answer, and it is not an
+		// error: the resource this teardown was responsible for is already released.
+		return nil
+	}
+
+	if err := os.Remove(claim); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("firecracker: release the claim %s: %w", claim, err)
+	}
+
+	return nil
+}
+
+// releaseUID gives a microVM's uid back, if it is still that microVM's.
+func (p *Provider) releaseUID(uid int, jailID string) error {
 	if uid <= 0 {
 		return nil
 	}
 
-	if err := os.RemoveAll(filepath.Join(p.claimsDir("uids"), strconv.Itoa(uid))); err != nil {
-		return fmt.Errorf("firecracker: release uid %d: %w", uid, err)
-	}
-
-	return nil
+	return p.releaseClaim(filepath.Join(p.claimsDir("uids"), strconv.Itoa(uid)), jailID)
 }
 
 // claimTap takes a network device name for one microVM.
@@ -187,17 +244,13 @@ func (p *Provider) claimTap(j jail) (string, error) {
 		"running microVM", tapPrefix, maxTaps-1)
 }
 
-// releaseTap gives a device name back.
-func (p *Provider) releaseTap(name string) error {
+// releaseTap gives a device name back, if it is still that microVM's.
+func (p *Provider) releaseTap(name, jailID string) error {
 	if name == "" {
 		return nil
 	}
 
-	if err := os.RemoveAll(filepath.Join(p.claimsDir("taps"), name)); err != nil {
-		return fmt.Errorf("firecracker: release the network device name %s: %w", name, err)
-	}
-
-	return nil
+	return p.releaseClaim(filepath.Join(p.claimsDir("taps"), name), jailID)
 }
 
 // maxTaps bounds how many microVMs one host may run at once, as far as naming goes.
@@ -240,7 +293,7 @@ func (p *Provider) claimResources(j jail) (resources, error) {
 	// the uid would be held by a claim directory whose jail exists but whose resource
 	// file never mentioned it, and only the reaper would ever free it.
 	if err := p.writeResources(j, res); err != nil {
-		return resources{}, errors.Join(err, p.releaseUID(uid))
+		return resources{}, errors.Join(err, p.releaseUID(uid, j.id))
 	}
 
 	tap, err := p.claimTap(j)
@@ -261,8 +314,8 @@ func (p *Provider) claimResources(j jail) (resources, error) {
 //
 // BOTH, WHATEVER EITHER DOES. Stopping at the first failure would leak the other,
 // and these are the two things a host runs out of.
-func (p *Provider) releaseResources(res resources) error {
-	return errors.Join(p.releaseUID(res.UID), p.releaseTap(res.Tap))
+func (p *Provider) releaseResources(res resources, jailID string) error {
+	return errors.Join(p.releaseUID(res.UID, jailID), p.releaseTap(res.Tap, jailID))
 }
 
 // claimedBy finds what a microVM still holds when its jail is already gone.
@@ -294,7 +347,7 @@ func (p *Provider) claimedBy(jailID string) (resources, error) {
 		}
 
 		for _, entry := range entries {
-			raw, err := os.ReadFile(filepath.Join(p.claimsDir(kind), entry.Name(), "jail"))
+			raw, err := os.ReadFile(filepath.Join(p.claimsDir(kind), entry.Name()))
 			if err != nil || strings.TrimSpace(string(raw)) != jailID {
 				continue
 			}
@@ -318,7 +371,7 @@ func (p *Provider) claimedBy(jailID string) (resources, error) {
 }
 
 // releaseOrphaned takes back what a microVM held after its jail is gone.
-func (p *Provider) releaseOrphaned(ctx context.Context, res resources) error {
+func (p *Provider) releaseOrphaned(ctx context.Context, res resources, jailID string) error {
 	if res == (resources{}) {
 		return nil
 	}
@@ -326,7 +379,19 @@ func (p *Provider) releaseOrphaned(ctx context.Context, res resources) error {
 	// THE DEVICE FIRST, because releasing the NAME while the device still exists
 	// would let another microVM claim a name the kernel already has — and `ip tuntap
 	// add` would then refuse a launch for a reason that names nothing billet did.
-	return errors.Join(p.deleteTap(ctx, res.Tap), p.releaseResources(res))
+	//
+	// AND THE NAME IS KEPT WHEN THE DEVICE WOULD NOT GO. Releasing it anyway is how
+	// a host wedges itself permanently: the device stays attached to the bridge,
+	// nothing enumerates orphan devices, the next launch draws the same lowest-free
+	// name, `ip tuntap add` refuses it, that launch fails and hands the name back —
+	// and every launch after it fails the same way until an operator deletes the
+	// device by hand. Keeping the claim is what lets a later teardown find the device
+	// and finish the job.
+	if err := p.deleteTap(ctx, res.Tap); err != nil {
+		return errors.Join(err, p.releaseUID(res.UID, jailID))
+	}
+
+	return p.releaseResources(res, jailID)
 }
 
 // cgroupDir is where the jailer put this microVM's cgroup.
