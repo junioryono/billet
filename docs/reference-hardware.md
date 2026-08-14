@@ -181,11 +181,38 @@ not a quorum.
 directory holds SQLite and the deployment identity. The Ceph pools are not a candidate for it either:
 the state directory must be local storage, and RBD is a network block device.
 
-**The host kernel is newer than Firecracker's CI is likely to cover.** A 7.0 host kernel is well past
-anything a 2026-07 release was tested against, and the interface that matters is the KVM ioctl
-surface the VMM uses plus the jailer's cgroup v2 handling. This is not something to settle by
-reading: boot one microVM on the box before designing around it. It is a cheap check now and an
-expensive surprise during P2.
+**The host kernel is newer than Firecracker's CI is likely to cover, and it works.** A 7.0 host kernel
+is well past anything a 2026-07 release was tested against, and the interfaces that matter are the KVM
+ioctl surface the VMM uses and the jailer's cgroup v2 handling. That was not settled by reading: a
+microVM was booted on the box before anything was designed around it, and then billet's own provider
+launched, found, listed and destroyed one. Both halves work — the VMM on this kernel, and the jailer's
+chroot, uid drop and cgroup v2 placement.
+
+**An account for the jailer to drop the VMM to.** `billet`, uid 994, created with `useradd --system
+--no-create-home --shell /usr/sbin/nologin billet`. The jailer takes a uid and a gid rather than a
+name, so billet resolves it once at startup and refuses root — dropping privileges is the entire
+reason the jailer is used, and `--uid 0` keeps every one of them in front of a process whose input is
+somebody's CI job.
+
+**Four things about this host decide how the provider is written**, and each was measured here rather
+than read:
+
+- **The jailer names its chroot after the RESOLVED `--exec-file`.** Because the binaries are installed
+  as versioned filenames behind stable symlinks — which is what makes `firecracker --version` honest —
+  every microVM lives under `/srv/jailer/firecracker-v1.16.1/`, not `/srv/jailer/firecracker/`. That
+  directory is the one billet enumerates to find out what is running, so reading the wrong one reports
+  an empty inventory, and an empty inventory is capacity freed for guests that are still running.
+- **`jailer --daemonize` exits 0 for a VM that died during startup**, leaving a pid file and an API
+  socket behind. Its exit code proves nothing; the VMM's own API is what billet believes.
+- **The jailer creates a per-VM cgroup only when given at least one `--cgroup`**, and the two forms
+  cannot coexist: once any VM on the host has been started with one, a VM started without one fails
+  with `CgroupMove … Resource busy`.
+- **There is no API action that kills a microVM.** `SendCtrlAltDel` is a keyboard event the guest
+  decides what to do with, and a real guest here ignored it for twenty seconds. billet signals the VMM
+  process, after proving the pid is still that microVM's by the `--id` in `/proc/<pid>/cmdline`.
+
+A `br0`-style bridge for guests is the one thing this machine does NOT have configured for billet yet;
+the live provider tests were run against `lxdbr0`, which was already there.
 
 ## An inherited machine can arrive with the worst case already set up
 
