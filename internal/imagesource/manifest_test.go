@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/junioryono/billet/internal/runnerrelease"
 )
 
 // validManifest is the shape everything else deviates from by one field, so a
@@ -422,5 +424,78 @@ func TestUsableRevalidatesRatherThanTrustingItsCaller(t *testing.T) {
 
 	if err := (&m).Usable("2", "x86_64"); err == nil {
 		t.Fatal("a manifest mutated after validation passed the gate")
+	}
+}
+
+// THE CHECK IS ONE-DIRECTIONAL ON PURPOSE. It cannot prove a runner is current
+// -- the manifest names a version, not the date that version shipped -- but it
+// can prove the opposite from the build time alone, because a runner baked N
+// days ago was already published when it was baked.
+func TestStaleProvesAgeWithoutANetworkCall(t *testing.T) {
+	m := validManifest()
+
+	built := m.BuiltAt
+
+	for _, tc := range []struct {
+		name  string
+		now   time.Time
+		stale bool
+		aging bool
+	}{
+		{"fresh", built.Add(24 * time.Hour), false, false},
+		{"just before the warning", built.Add(runnerrelease.Warn - time.Hour), false, false},
+		{"warning", built.Add(runnerrelease.Warn), false, true},
+		{"just before expiry", built.Add(runnerrelease.Grace - time.Hour), false, true},
+		{"expired", built.Add(runnerrelease.Grace), true, false},
+		{"long expired", built.Add(90 * 24 * time.Hour), true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := m.Stale(tc.now)
+
+			if tc.stale && err == nil {
+				t.Errorf("an image built %v ago was not reported stale", tc.now.Sub(built))
+			}
+
+			if !tc.stale && err != nil {
+				t.Errorf("an image built %v ago was reported stale: %v", tc.now.Sub(built), err)
+			}
+
+			if got := m.Aging(tc.now); got != tc.aging {
+				t.Errorf("Aging = %v, want %v at %v", got, tc.aging, tc.now.Sub(built))
+			}
+		})
+	}
+}
+
+// AGING AND STALE ARE DIFFERENT ACTIONS -- one is a thing to say, the other a
+// thing to refuse -- so an expired image must not also report as merely aging,
+// which would have a caller warn about something it should be rejecting.
+func TestAgingAndStaleDoNotOverlap(t *testing.T) {
+	m := validManifest()
+
+	for d := time.Duration(0); d < 60*24*time.Hour; d += 12 * time.Hour {
+		now := m.BuiltAt.Add(d)
+
+		if m.Aging(now) && m.Stale(now) != nil {
+			t.Fatalf("at %v the image reports both aging and stale", d)
+		}
+	}
+}
+
+// THE MESSAGE HAS TO SAY WHAT TO DO ABOUT IT. A refusal that names neither the
+// age nor the rule leaves an operator with a node that will not import and no
+// idea that github's clock is the reason.
+func TestStaleExplainsItself(t *testing.T) {
+	m := validManifest()
+
+	err := m.Stale(m.BuiltAt.Add(45 * 24 * time.Hour))
+	if err == nil {
+		t.Fatal("a 45-day-old image was accepted")
+	}
+
+	for _, want := range []string{"45 days", "30 days"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not mention %q: %v", want, err)
+		}
 	}
 }

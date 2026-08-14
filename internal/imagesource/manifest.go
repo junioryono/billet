@@ -24,6 +24,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/junioryono/billet/internal/runnerrelease"
 )
 
 // SchemaVersion is the manifest layout this build writes and can read.
@@ -468,4 +470,50 @@ func (m *Manifest) Usable(contract, arch string) error {
 	}
 
 	return nil
+}
+
+// Age is how long ago the image was built, as of now.
+func (m *Manifest) Age(now time.Time) time.Duration { return now.Sub(m.BuiltAt) }
+
+// Stale reports that the baked runner is certainly past GitHub's grace period.
+//
+// A ONE-DIRECTIONAL CHECK, AND THAT IS THE POINT. GitHub stops handing jobs to a
+// runner more than thirty days past its release, and this cannot prove a runner
+// is CURRENT — the manifest names a version, not the date that version shipped,
+// and settling that needs a network call this package deliberately does not
+// make. What it CAN prove, from the build time alone, is the opposite: a runner
+// baked into an image N days ago is at least N days old, because it was already
+// published when it was baked. So an image older than the grace period contains
+// a runner past it, with no lookup and no ambiguity.
+//
+// That asymmetry is worth keeping rather than papering over. A caller that can
+// reach GitHub should ALSO compare the manifest's runner version against the
+// published release, which is the check that catches a fresh image built around
+// an old runner. This one is the floor: it is always available, it never gives a
+// false positive, and it is what stops a node importing something already dead
+// on arrival when nothing else can be consulted.
+func (m *Manifest) Stale(now time.Time) error {
+	age := m.Age(now)
+
+	if age < runnerrelease.Grace {
+		return nil
+	}
+
+	return fmt.Errorf("imagesource: this image was built %d days ago, so the runner baked "+
+		"into it is at least that old and github stops handing jobs to a runner more than "+
+		"%d days past its release; importing it would produce microVMs that register and "+
+		"are never given work",
+		int(age.Hours()/24), int(runnerrelease.Grace.Hours()/24))
+}
+
+// Aging reports that the image is old enough to be worth rebuilding, without
+// being past the point of uselessness.
+//
+// SEPARATE FROM Stale BECAUSE THE ACTIONS DIFFER: this is a thing to say, and
+// Stale is a thing to refuse. Conflating them either blocks on an image that
+// still works or stays silent until the fleet has already stopped.
+func (m *Manifest) Aging(now time.Time) bool {
+	age := m.Age(now)
+
+	return age >= runnerrelease.Warn && age < runnerrelease.Grace
 }
