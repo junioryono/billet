@@ -21,7 +21,20 @@
 # of must not change underneath it.
 set -euo pipefail
 
-RUNNER_VERSION="${RUNNER_VERSION:-2.328.0}"
+# ONE PIN FOR EVERY IMAGE BILLET BUILDS, read from the file the Go code embeds.
+# It was a shell default here and a constant in `billet ami`, so bumping the runner
+# was two edits in two languages -- and doing one of them leaves a fleet where one
+# backend is current and the other is not, found on the day GitHub stops queueing to
+# the stale half.
+PINNED_RUNNER_FILE="$(dirname "$0")/../internal/runnerrelease/pinned.txt"
+
+if [ -z "${RUNNER_VERSION:-}" ] && [ ! -r "$PINNED_RUNNER_FILE" ]; then
+	echo "cannot read the pinned runner version at $PINNED_RUNNER_FILE, and RUNNER_VERSION" >&2
+	echo "was not set; run this from a checkout, or say which release to install" >&2
+	exit 1
+fi
+
+RUNNER_VERSION="${RUNNER_VERSION:-$(awk "NR==1{print \$1}" "$PINNED_RUNNER_FILE")}"
 SUITE="${SUITE:-noble}"
 SIZE_MB="${SIZE_MB:-4096}"
 IMAGE_POOL="${IMAGE_POOL:-billet-images}"
@@ -35,7 +48,18 @@ PUBLISH="${PUBLISH:-yes}"
 # image is a thing you reproduce, and a build that silently tracked the newest
 # release would make two runs of the same command produce different images — a
 # difference that surfaces as a job failing on one generation and not another.
-RUNNER_SHA256="${RUNNER_SHA256:-01066fad3a2893e63e6ca880ae3a1fad5bf9329d60e77ee15f2b97c148c3cd4e}"
+#
+# THE CHECKSUM COMES FROM THE SAME LINE AS THE VERSION, because it is only true of
+# that version. Held apart, a bump updates one of them: either the build fails its
+# own integrity check, or -- worse -- the checksum is updated alone and the download
+# is verified against a number belonging to a different release.
+RUNNER_SHA256="${RUNNER_SHA256:-$(awk "NR==1{print \$2}" "$PINNED_RUNNER_FILE")}"
+
+if [ -z "$RUNNER_SHA256" ]; then
+	echo "no checksum for runner $RUNNER_VERSION in $PINNED_RUNNER_FILE; the format is" >&2
+	echo "one line: '<version> <sha256 of the linux-x64 tarball>'" >&2
+	exit 1
+fi
 
 need_root() {
 	if [ "$(id -u)" -ne 0 ]; then

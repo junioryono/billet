@@ -10,6 +10,7 @@ import (
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/provider/ec2"
+	"github.com/junioryono/billet/internal/runnerrelease"
 )
 
 // defaultRunnerVersion is the actions/runner release a build installs unless told
@@ -19,7 +20,12 @@ import (
 // silently tracked the newest release would make two runs of the same command
 // produce different images, and the difference would surface as a job failing on
 // one AMI and not another.
-const defaultRunnerVersion = "2.328.0"
+//
+// ONE PIN FOR EVERY IMAGE BILLET BUILDS. This was a constant here and a shell
+// default in the guest image script, so bumping the runner was two edits in two
+// languages — and doing one of them leaves a fleet where the ec2 backend is current
+// and the microVM backend is not, found on the day GitHub stops queueing to the
+// stale half.
 
 // cmdAMI builds the machine image the ec2 backend launches.
 //
@@ -38,7 +44,7 @@ func cmdAMI(ctx context.Context, args []string) error {
 	base := fs.String("base-image", "", "AMI to provision from (an EBS-backed, dnf-based image)")
 	shape := fs.String("instance-type", "c7i.xlarge", "shape of the BUILDER, not of your jobs")
 	arch := fs.String("arch", "x64", "runner build to install: x64 or arm64")
-	version := fs.String("runner-version", defaultRunnerVersion, "actions/runner release")
+	version := fs.String("runner-version", runnerrelease.Pinned(), "actions/runner release")
 	name := fs.String("name", "", "name for the produced AMI (default: billet-runner-<timestamp>)")
 	region := fs.String("region", "", "override the region from the config")
 	subnet := fs.String("subnet", "", "override the subnet from the config")
