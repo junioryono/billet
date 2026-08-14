@@ -762,35 +762,15 @@ func TestARealFailureSurvivesAnExpiredContext(t *testing.T) {
 		t.Run("exit "+tc.code, func(t *testing.T) {
 			t.Parallel()
 
-			ctx, cancel := context.WithTimeout(t.Context(), 400*time.Millisecond)
-			defer cancel()
-
-			type result struct {
-				out []byte
-				err error
-			}
-
-			done := make(chan result, 1)
-
-			go func() {
-				// The shell writes its diagnostic and exits immediately; the
-				// background `sleep` inherits stdout and holds the pipe open well
-				// past the deadline.
-				out, err := execRunner(ctx, "/bin/sh", []string{"-c",
-					"sleep 30 & echo '" + tc.message + "' >&2; exit " + tc.code})
-				done <- result{out, err}
-			}()
-
-			guard := time.NewTimer(15 * time.Second)
-			defer guard.Stop()
-
-			var got result
-
-			select {
-			case got = <-done:
-			case <-guard.C:
-				t.Fatal("execRunner never returned")
-			}
+			// The shell writes its diagnostic and exits with its own code; the
+			// background `sleep` inherits stdout and holds the pipe open well past
+			// the cancellation.
+			//
+			// The exit code rides in a file rather than in the shell's status,
+			// because the helper appends the marker command — so the shell's LAST
+			// statement has to be that marker, and `exit N` before it would skip it.
+			got := runPastAHeldPipe(t,
+				"sleep 30 & echo '"+tc.message+"' >&2; trap 'exit "+tc.code+"' EXIT")
 
 			if got.err == nil {
 				t.Fatalf("execRunner reported success for a command that exited %s", tc.code)
@@ -801,16 +781,12 @@ func TestARealFailureSurvivesAnExpiredContext(t *testing.T) {
 					"it: %v", got.err)
 			}
 
-			// The context DID expire — that is the whole setup — so this is the
-			// assertion that the ordering is right rather than that the race did
-			// not happen.
-			if ctx.Err() == nil {
-				t.Fatal("the context had not expired, so this case did not stage the race it " +
-					"is about")
-			}
-
-			if errors.Is(got.err, context.DeadlineExceeded) {
-				t.Errorf("a process that exited on its own was reported as a timeout: %v", got.err)
+			// THE PROCESS EXITED ON ITS OWN AND MUST NOT BE REPORTED AS THE CONTEXT
+			// ENDING. That is the whole point: the context did end, afterwards, and
+			// the answer must still be the one the process gave.
+			if errors.Is(got.err, context.DeadlineExceeded) || errors.Is(got.err, context.Canceled) {
+				t.Errorf("a process that exited on its own was reported as a cancellation: %v",
+					got.err)
 			}
 		})
 	}
@@ -950,41 +926,87 @@ func TestACappedDiagnosticIsValidUTF8(t *testing.T) {
 // fix missed: an exit of zero never produces an *exec.ExitError at all — Wait
 // returns ErrWaitDelay — so the completed-exit branch cannot see it and the call
 // would be reported as a timeout with rbd's answer thrown away.
-func TestASuccessfulExitSurvivesAHeldPipe(t *testing.T) {
-	t.Parallel()
+// heldPipeResult is what execRunner concluded, plus a way to run it against a
+// command whose descendant keeps stdout open past the context.
+type heldPipeResult struct {
+	out []byte
+	err error
+}
 
-	ctx, cancel := context.WithTimeout(t.Context(), 400*time.Millisecond)
+// runPastAHeldPipe runs a shell command that finishes while a background `sleep`
+// keeps its stdout open, and expires the context only ONCE THE COMMAND HAS
+// PROVABLY REACHED ITS LAST LINE.
+//
+// THE DEADLINE USED TO BE A FIXED 400ms FROM LAUNCH, and that is what made these
+// tests flaky. The property under test is an ORDERING — the command finished, then
+// the context expired, and execRunner must still report the command's own outcome —
+// but a wall-clock budget measured from launch also has to cover process startup,
+// so on a loaded machine the shell was still running when the deadline arrived and
+// the test failed for the one reason it was written to rule out. Both of these
+// failed together in a full-suite run and passed ten times in isolation, which is
+// the signature.
+//
+// So the command now says when it is done, and the test cancels after seeing that.
+// The ordering is established by observation instead of by hoping a timer is slower
+// than a fork.
+func runPastAHeldPipe(t *testing.T, script string) heldPipeResult {
+	t.Helper()
+
+	marker := filepath.Join(t.TempDir(), "reached-the-end")
+
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
-	type result struct {
-		out []byte
-		err error
-	}
-
-	done := make(chan result, 1)
+	done := make(chan heldPipeResult, 1)
 
 	go func() {
-		// The listing is written and the shell exits 0; the background `sleep`
-		// inherits stdout and holds the pipe well past both the deadline and the
-		// WaitDelay that follows it.
-		out, err := execRunner(ctx, "/bin/sh", []string{"-c", `echo '["a","b"]'; sleep 30 & sleep 0.05`})
-		done <- result{out, err}
+		out, err := execRunner(ctx, "/bin/sh", []string{"-c", script + "\ntouch " + marker})
+		done <- heldPipeResult{out, err}
 	}()
 
-	guard := time.NewTimer(15 * time.Second)
+	// The command has written everything it is going to write and is one syscall
+	// from exiting. Waiting for this rather than for a duration is the whole fix.
+	deadline := time.Now().Add(20 * time.Second)
+
+	for {
+		if _, err := os.Stat(marker); err == nil {
+			break
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatal("the command never reached its last line, so this case staged nothing")
+		}
+
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	// A grace for that last syscall. It is not a budget for the command to finish
+	// in — that already happened — so it does not have to cover a loaded machine's
+	// process startup, which is what the old 400ms was silently doing.
+	time.Sleep(100 * time.Millisecond)
+
+	cancel()
+
+	guard := time.NewTimer(20 * time.Second)
 	defer guard.Stop()
 
-	var got result
-
 	select {
-	case got = <-done:
+	case got := <-done:
+		return got
 	case <-guard.C:
 		t.Fatal("execRunner never returned")
 	}
 
-	if ctx.Err() == nil {
-		t.Fatal("the context had not expired, so this case did not stage the race it is about")
-	}
+	return heldPipeResult{}
+}
+
+func TestASuccessfulExitSurvivesAHeldPipe(t *testing.T) {
+	t.Parallel()
+
+	// The listing is written and the shell exits 0; the background `sleep` inherits
+	// stdout and holds the pipe well past both the cancellation and the WaitDelay
+	// that follows it.
+	got := runPastAHeldPipe(t, `echo '["a","b"]'; sleep 30 &`)
 
 	if got.err != nil {
 		t.Fatalf("a command that exited 0 was reported as a failure: %v", got.err)
