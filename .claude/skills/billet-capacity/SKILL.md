@@ -72,6 +72,18 @@ Both heartbeat the lease so the reaper leaves it alone; both release only when t
 - **An OPTIONAL capability cannot carry a safety invariant.** The reversed change above was defended with "both shipped runners implement `Sweeper`, which destroys compute no lease is holding." True, and irrelevant: `Sweeper` is a type assertion on `Runner`, so that reasoning makes correctness depend on which implementation is plugged in, and billet is meant to be extended by strangers. If safety rests on a capability, the interface must require it — otherwise assume the implementation without it, and let the capability be a backstop rather than the mechanism.
 - **Time warns; it does not authorise a teardown.** Held compute has NO bound by default (`DefaultMaxCustody = 0`) and warns hourly. Elapsed time is not evidence that a job stopped making progress — billet imposes no job limit and self-hosted runners run past GitHub's six-hour default — so killing live work must be authorised by a completion, an observed exit, or an operator. An operator who knows their longest job can set one with `node.WithMaxCustody`; a job killed by it is archived as FAILED, not done.
 
+### An inventory that shrinks is capacity that gets resold
+
+A node's `List` is what the control plane reconciles against, and it frees the capacity of every lease ABSENT from it. So the dangerous failure of a provider's `List` is not an error — an error stops reconciliation — it is an answer that is short, empty and successful.
+
+Three ways the firecracker backend could have produced one, all found in review rather than by a test:
+
+- **A path derived at startup from something an operator can change.** The jailer names its chroot after the resolved firecracker binary, and the reference host installs that binary as a versioned filename behind a stable symlink precisely so a version can be bumped. Retarget it, restart billet — which is documented, and which billet promises leaves running jobs running — and every guest started before the bump sits in a directory the new process does not read. Billet now enumerates every directory a jailer has built in, and the owner marker is what keeps that safe.
+- **Teardown removing the evidence.** `Destroy` continued past a VMM it could not stop, removing the jail — which holds the pid file, the only handle for ever stopping it. The guest then runs a job nothing can find, nothing can kill, and that `List` no longer reports.
+- **An identity mismatch collapsed into a verdict.** A socket answering for a DIFFERENT microVM was read as "this one is not running", and the caller destroys what is not running. Neither answer was available; that is what an error is for.
+
+The general form, and it applies to any backend: **ask what makes a row appear in the inventory, then ask what could make that thing stop being true while the compute keeps running.**
+
 ### GitHub does not requeue a job whose runner vanished mid-execution
 
 Checked against the vendored `scaleset` README, after I asserted the opposite in a commit message and had to retract it. Reassignment is documented for a job *"assigned to your scale set but not acquired by a runner in time"* — GitHub cancels and requeues that, up to 3 times. It says **nothing** about a job a runner has already started.

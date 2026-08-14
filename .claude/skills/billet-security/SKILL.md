@@ -165,6 +165,26 @@ A node replaces its own certificate when less than a third of its life remains, 
 
 **What this does NOT cover:** a node whose certificate has already expired cannot renew, because renewal is authenticated by that certificate. It has to be re-enrolled by hand. The renewal window is a third of the certificate's life — months — so this only happens to a host that was off for that entire period.
 
+## Giving away a hard link gives away the inode
+
+`chown` on a hard link changes the FILE, not the name. The firecracker provider places the guest kernel into each jail with `os.Link` — the kernel is tens of megabytes and identical for every microVM, so a copy per job is pure waste — and then chowned the jail tree to the unprivileged account the jailer drops the VMM to. That chowned the operator's one and only kernel on the host, to an account every VMM on the machine shares.
+
+The owner of a file may `chmod` it and write to it. A VMM is precisely the process the jailer exists to contain, so one escape rewrites the kernel that every later microVM boots — persistently, and **without leaving the chroot**, because the link is inside it. The copy fallback does not have the defect, which is what makes it easy to miss: the same function is safe on one path and not the other.
+
+The rule that generalises: **before chowning anything, ask what else refers to that inode.** What a jailed process needs is usually to READ, and a file it reads can stay owned by whoever installed it. Billet now chowns the chroot alone, and the kernel and the deployment-owner marker stay root-owned — the marker for a second reason, that it is the fact `List` and `Find` trust when they decide whose compute a jail holds.
+
+## Never signal a pid you have not proved is still yours
+
+A pid file holds a NUMBER, and the kernel reuses numbers. A node runs as root, so "the file said 4321" is not grounds to signal 4321 — the process that answered to it may have exited hours ago and something else may hold it now.
+
+The firecracker provider stops a microVM by signalling its VMM, because the API has no kill action at all (`FlushMetrics`, `InstanceStart`, `SendCtrlAltDel`, and nothing else — checked against the vendor's own spec, and a real guest ignored the third for twenty seconds). What makes that safe is the check in front of it: the jailer execs the VMM with `--id <jail id>`, so `/proc/<pid>/cmdline` carries proof, and it is matched as the **pair** `--id` followed by the value rather than as the id appearing anywhere in the line. A lone match would claim any process that happens to mention the lease.
+
+Three rules fell out of it, and each is the difference between a signal and an accident:
+
+- **"Could not tell" is not "gone".** An unreadable `/proc` entry means billet does not know; a missing one means the process ended. Only the second permits teardown to continue, because everything after it — unmapping a block device, removing the jail — acts on the assumption that nothing is using them.
+- **Escalation needs its own check.** SIGKILL followed any failed wait, and a failed wait includes "billet could not verify this pid" — so the guard was bypassed by the very path it was written for. The pid is re-checked immediately before the kill.
+- **Ask for the documented contract, not the observed one.** The jailer writes its pid file unconditionally on the measured version and only with `--new-pid-ns` per its documentation. Billet passes the flag, so a future version honouring its own docs cannot make billet read "no pid file" as "nothing is running" and unmap a live guest's disk.
+
 ## AWS credentials, and what a cloud node hands to a job
 
 The `ec2` backend introduces a credential class billet had not held before: one that can create and destroy machines, and that is not scoped to a deployment the way the node-wire CA is.
