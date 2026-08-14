@@ -44,6 +44,38 @@ var snapshotSpec = regexp.MustCompile(`^[^-/@][^/@]*@[^/@]+$`)
 // IT REMOVES THE CLONE IF THE MAP FAILS. A clone that exists and is not mapped is
 // invisible to everything above — no jail carries its name, so the sweep never
 // looks for it — and it holds pool space until an operator finds it by hand.
+// ResolveGeneration turns a tier's image reference into one exact generation.
+//
+// THE ONLY PLACE THAT KNOWS WHAT `@verified` MEANS, and it answers with a concrete
+// reference so that everything downstream — the log line naming what a job booted,
+// the clone, the metadata — is about a generation somebody can go and look at. A
+// caller that passed the alias through would leave "which image did this job
+// actually run?" unanswerable after the fact.
+//
+// AN EXPLICIT GENERATION IS RETURNED UNCHANGED, including one that was never
+// verified: pinning is a decision, and second-guessing it would make a pinned tier
+// mean something other than what it says.
+func (c *Client) ResolveGeneration(ctx context.Context, image string) (string, error) {
+	name, generation, found := strings.Cut(strings.TrimSpace(image), "@")
+	if !found || generation != Verified {
+		return image, nil
+	}
+
+	newest, ok, err := c.NewestVerified(ctx, image)
+	if err != nil {
+		return "", err
+	}
+
+	if !ok {
+		return "", fmt.Errorf("ceph: %s names @%s and no generation of %s has passed "+
+			"verification, so there is nothing proved to boot; publish one with "+
+			"scripts/build-guest-image.sh and `billet images verify`, or pin a generation",
+			image, Verified, name)
+	}
+
+	return name + "@" + newest.Name, nil
+}
+
 func (c *Client) CloneRoot(ctx context.Context, image, name string) (string, error) {
 	if !snapshotSpec.MatchString(image) {
 		return "", fmt.Errorf("ceph: %s is not a golden image reference: billet clones a "+

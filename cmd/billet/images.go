@@ -39,6 +39,10 @@ func cmdImages(ctx context.Context, args []string) error {
 		return cmdImagesVerify(ctx, args[1:])
 	case "due":
 		return cmdImagesDue(ctx, args[1:])
+	case "promote":
+		return cmdImagesPromote(ctx, args[1:], true)
+	case "unpromote":
+		return cmdImagesPromote(ctx, args[1:], false)
 	default:
 		return fmt.Errorf("billet images: unknown subcommand %q", args[0])
 	}
@@ -146,6 +150,8 @@ func cmdImagesVerify(ctx context.Context, args []string) error {
 	fs := newFlagSet("billet images verify")
 	cfgPath := addConfigFlag(fs)
 	wait := fs.Duration("wait", 3*time.Minute, "how long to give the guest to report back")
+	record := fs.Bool("record", true,
+		"on success, mark this generation verified so `@verified` resolves to it")
 
 	rest, err := parseWithName(fs, args)
 	if err != nil {
@@ -226,7 +232,35 @@ func cmdImagesVerify(ctx context.Context, args []string) error {
 		return err
 	}
 
-	return verifyGuestImage(ctx, prov, cfg.Node.Firecracker.Bridge, rest, lease, *wait)
+	if err := verifyGuestImage(ctx, prov, cfg.Node.Firecracker.Bridge, rest, lease, *wait); err != nil {
+		return err
+	}
+
+	// RECORDED, WHICH IS WHAT MAKES THIS A PROMOTION RATHER THAN A REPORT.
+	//
+	// Without it the whole schedule ends in a sentence on a terminal nobody is
+	// watching: build, verify, print "point a tier at it when you are ready", and
+	// then nothing happens. A fleet goes on booting whatever generation somebody last
+	// typed into a config file, while a verified image is published every week beside
+	// it. That is the state this command existed in until now.
+	//
+	// A tier naming `@verified` takes it up from here with no config edit and no
+	// restart, and one that pins a generation is unaffected.
+	if *record {
+		store, err := ceph.New(*cfg.Node.Ceph)
+		if err != nil {
+			return err
+		}
+
+		if err := store.MarkVerified(ctx, rest, time.Now()); err != nil {
+			return err
+		}
+
+		fmt.Printf("\nrecorded %s as verified; a tier naming @%s will boot it\n",
+			rest, ceph.Verified)
+	}
+
+	return nil
 }
 
 // verifyGuestImage launches one microVM and waits for the guest to report on itself.
@@ -566,4 +600,77 @@ func verifyDeploymentID(cfg *config.Config) (string, error) {
 	// Its own directory is the only answer available — the same fallback the node
 	// documents at node.state_dir.
 	return state.DeploymentID(cfg.Node.StateDir)
+}
+
+// cmdImagesPromote and cmdImagesUnpromote are the manual half of promotion.
+//
+// THE AUTOMATIC PATH IS `verify --record`, and this exists for the two moments it
+// cannot cover: adopting a generation that was verified before this recorded
+// anything, and taking one back. Rollback is the important one — it is what somebody
+// reaches for at the moment a bad image is in front of every job, so it is one
+// command against the cluster rather than an edit on every node.
+func cmdImagesPromote(ctx context.Context, args []string, verified bool) error {
+	name := "billet images promote"
+	if !verified {
+		name = "billet images unpromote"
+	}
+
+	fs := newFlagSet(name)
+	cfgPath := addConfigFlag(fs)
+
+	rest, err := parseWithName(fs, args)
+	if err != nil {
+		return err
+	}
+
+	if rest == "" {
+		return fmt.Errorf("usage: %s <image@generation>", name)
+	}
+
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		return err
+	}
+
+	if cfg.Node == nil || cfg.Node.Ceph == nil {
+		return errors.New(name + ": this config names no ceph cluster")
+	}
+
+	store, err := ceph.New(*cfg.Node.Ceph)
+	if err != nil {
+		return err
+	}
+
+	if verified {
+		if err := store.MarkVerified(ctx, rest, time.Now()); err != nil {
+			return err
+		}
+
+		fmt.Printf("%s is verified; a tier naming @%s will boot it\n", rest, ceph.Verified)
+
+		return nil
+	}
+
+	if err := store.UnmarkVerified(ctx, rest); err != nil {
+		return err
+	}
+
+	newest, found, err := store.NewestVerified(ctx, rest)
+	if err != nil {
+		return err
+	}
+
+	// SAYING WHAT HAPPENS NEXT, because withdrawing a verification is done in a hurry
+	// and the question immediately after it is "so what boots now".
+	if found {
+		fmt.Printf("%s is no longer verified; @%s now resolves to %s\n",
+			rest, ceph.Verified, newest.Name)
+
+		return nil
+	}
+
+	fmt.Printf("%s is no longer verified, and NO generation is — a tier naming @%s now has "+
+		"nothing to boot\n", rest, ceph.Verified)
+
+	return nil
 }

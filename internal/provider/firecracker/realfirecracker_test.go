@@ -252,6 +252,12 @@ func (d rbdDisk) args(rest ...string) []string {
 	return append([]string{"--id", d.id}, rest...)
 }
 
+// The real host test always names an explicit generation, which is what a resolver
+// returns unchanged — so this stands in for the store without needing one.
+func (d rbdDisk) ResolveGeneration(_ context.Context, image string) (string, error) {
+	return image, nil
+}
+
 func (d rbdDisk) CloneRoot(ctx context.Context, image, name string) (string, error) {
 	if err := exec.CommandContext(ctx, "rbd", d.args("clone",
 		d.images+"/"+image, d.cache+"/"+name)...).Run(); err != nil {

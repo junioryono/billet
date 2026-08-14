@@ -63,6 +63,13 @@ type Instance = provider.Instance
 // that performs them; internal/store/ceph satisfies this today by having the
 // methods, with no adapter and no shared type.
 type RootDisk interface {
+	// ResolveGeneration turns a tier's image reference into one exact generation.
+	//
+	// SEPARATE FROM THE CLONE so that the concrete generation is known BEFORE
+	// anything is done with it: it is what the launch logs, and "which image did
+	// this job actually boot" has to be answerable from that line afterwards. A
+	// reference that already names a generation comes back unchanged.
+	ResolveGeneration(ctx context.Context, image string) (string, error)
 	// CloneRoot makes a per-job copy-on-write clone of a golden image and maps it,
 	// returning the host device path.
 	CloneRoot(ctx context.Context, image, name string) (string, error)
@@ -343,6 +350,18 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*Instance, e
 	if err != nil {
 		return nil, errors.Join(err, j.remove())
 	}
+
+	// RESOLVED HERE, SO EVERYTHING AFTER IT NAMES ONE GENERATION. A tier may say
+	// `@verified`, which means "the newest one proved to boot" — a moving target by
+	// design. Passing that through would leave the launch log, and therefore any
+	// later question about which image a job actually ran, pointing at a word rather
+	// than at an artifact somebody can go and look at.
+	image, err := p.disk.ResolveGeneration(ctx, spec.Image)
+	if err != nil {
+		return nil, errors.Join(err, j.remove())
+	}
+
+	spec.Image = image
 
 	device, err := p.disk.CloneRoot(ctx, spec.Image, spec.Name)
 	if err != nil {

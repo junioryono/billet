@@ -1974,6 +1974,10 @@ const deploymentForCheck = "billet-preflight"
 // than about microVMs.
 type noRootDisk struct{}
 
+func (noRootDisk) ResolveGeneration(_ context.Context, image string) (string, error) {
+	return image, nil
+}
+
 func (noRootDisk) CloneRoot(context.Context, string, string) (string, error) {
 	return "", errors.New("billet: the preflight does not clone a root disk")
 }
