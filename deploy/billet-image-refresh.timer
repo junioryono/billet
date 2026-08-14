@@ -1,0 +1,20 @@
+[Unit]
+Description=billet: keep the guest image inside GitHub's 30-day runner window
+Documentation=https://github.com/junioryono/billet
+
+[Timer]
+# WEEKLY, AGAINST A 30-DAY DEADLINE, and the margin is the point. GitHub stops
+# queueing jobs to a runner 30 days after a release it has not taken up, so a monthly
+# schedule leaves no room for the run that fails -- and this run CAN fail, on a
+# package mirror, on a verification, on a full disk. Weekly means four chances inside
+# every window, and a rebuild that changes nothing is cheap.
+OnCalendar=Sun 03:00
+# SO A MACHINE THAT WAS OFF STILL CATCHES UP. A node rebooted on Sunday morning would
+# otherwise skip a whole week, and the deadline does not skip with it.
+Persistent=true
+# SPREAD, because a fleet that all rebuilds at 03:00 hits the archive and the cluster
+# together.
+RandomizedDelaySec=2h
+
+[Install]
+WantedBy=timers.target

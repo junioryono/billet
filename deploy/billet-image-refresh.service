@@ -1,0 +1,35 @@
+[Unit]
+Description=billet: rebuild and verify the guest image microVMs boot from
+Documentation=https://github.com/junioryono/billet
+# AFTER THE NETWORK, because it asks GitHub which runner release is current and
+# pulls a base system from the archive.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+
+# ROOT, because it runs debootstrap, chroots, maps a block device and launches a
+# microVM under the jailer. There is no smaller privilege that does those.
+User=root
+
+# THE CHECKOUT IS WHERE THE PIN LIVES. The build reads the pinned runner version and
+# checksum out of the tree, and the refresh writes a new one there when GitHub has
+# published a release -- so this is a working copy rather than an installed artifact.
+Environment=REPO=/opt/billet
+Environment=CONFIG=/etc/billet/billet.yaml
+Environment=BILLET=/usr/local/bin/billet
+
+ExecStart=/opt/billet/scripts/refresh-guest-image.sh
+
+# GENEROUS, because this is debootstrap plus apt plus a 4GB filesystem written into
+# Ceph plus a real microVM boot. A timeout that fired mid-publish would leave a
+# generation half written into the pool.
+TimeoutStartSec=2h
+
+# ONE AT A TIME. Two of these racing would both debootstrap into the same workspace.
+# The timer cannot start a second while the first runs, but a hand-run one could.
+ExecStartPre=/usr/bin/flock -n /run/billet-image-refresh.lock true
+
+[Install]
+WantedBy=multi-user.target
