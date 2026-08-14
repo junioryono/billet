@@ -337,6 +337,19 @@ func TestASpecThatCannotRunAJobIsRefused(t *testing.T) {
 		{"no image", func(s *provider.Spec) { s.Image = "" }, "has no image"},
 		{"no registration", func(s *provider.Spec) { s.JITConfig = "" }, "no JIT config"},
 		{"no command", func(s *provider.Spec) { s.Command = nil }, "has no command"},
+		// REFUSED RATHER THAN REWRITTEN. The command travels as JSON, and
+		// `json.Marshal` does not fail on invalid UTF-8 — it substitutes U+FFFD and
+		// reports success, so without this the guest would silently run a different
+		// command than the one it was given.
+		{"an argument that is not valid utf-8",
+			func(s *provider.Spec) { s.Command = []string{"/bin/sh", "-c", "echo \xff\xfe"} },
+			"not valid UTF-8"},
+		// AND A NUL CANNOT BE IN AN ARGV AT ALL: execve's arguments are
+		// NUL-terminated, so this is a request the kernel could not honour even if
+		// every layer above it carried the byte faithfully.
+		{"an argument containing a nul",
+			func(s *provider.Spec) { s.Command = []string{"/bin/sh", "-c", "echo\x00rest"} },
+			"containing a NUL"},
 		{"no vcpu", func(s *provider.Spec) { s.VCPU = 0 }, "vCPU"},
 		{"no memory", func(s *provider.Spec) { s.Memory = 0 }, "of memory"},
 	} {
