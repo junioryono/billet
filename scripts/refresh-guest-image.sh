@@ -187,8 +187,25 @@ main() {
 			;;
 	esac
 
+	# ASSIGNED ON ITS OWN LINE, THEN READ. `die` inside `$( )` exits the SUBSHELL, so
+	# `read ... <<<"$(latest_release)"` left the script running with empty values --
+	# which were then exported, and build-guest-image.sh's own `${VAR:-<pin>}`
+	# fallbacks quietly built the PINNED runner instead. The weekly job would have
+	# reported success while doing the one thing it exists to prevent.
+	#
+	# A bare assignment propagates the failure under `set -e`; `local x=$(...)` would
+	# NOT, because the status becomes local's.
+	local release
+	release=$(latest_release)
+
 	local version sha
-	read -r version sha <<<"$(latest_release)"
+	read -r version sha <<<"$release"
+
+	# AND EMPTY IS REFUSED, because that is what every remaining way to get here
+	# looks like: the build must not fall back to a pin nobody asked for.
+	if [ -z "$version" ] || [ -z "$sha" ]; then
+		die "github did not name a runner release and a checksum; refusing to build a version nobody chose"
+	fi
 
 	log "building at runner $version (the checkout pins $(awk 'NR==1{print $1}' \
 		"$REPO/internal/runnerrelease/pinned.txt" 2>/dev/null || echo unknown))"

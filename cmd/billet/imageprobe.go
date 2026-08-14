@@ -44,7 +44,7 @@ func verificationSecret() (string, error) {
 // A fixed id removes the question. Cleanup destroys ONE name, which is this host's
 // probe and can be nothing else, and it is idempotent — so residue from a previous
 // run is cleared by the same call that would have cleared it anyway.
-func probeLeaseID() (string, error) {
+func probeLeaseID(deployment string) (string, error) {
 	// THE MACHINE ID, NOT THE HOSTNAME. Hostnames are not unique: cloned VMs and
 	// default images share them routinely, and hashing the SAME hostname yields the
 	// SAME id — so two such machines on one Ceph cluster would derive one probe name,
@@ -71,7 +71,12 @@ func probeLeaseID() (string, error) {
 
 	// Hashed so the id is the fixed length a lease is, and so nothing about the
 	// machine is legible in a name that appears in `rbd ls`.
-	sum := sha256.Sum256(append([]byte("billet-images-verify\x00"), bytes.TrimSpace(id)...))
+	// THE DEPLOYMENT IS IN THE HASH TOO. Two billets on one machine — which is a
+	// shape this project supports and tests for — would otherwise derive one probe
+	// name, and the clone lives in a pool they may share, so one deployment's
+	// cleanup would remove the other's live disk.
+	seed := append([]byte("billet-images-verify\x00"+deployment+"\x00"), bytes.TrimSpace(id)...)
+	sum := sha256.Sum256(seed)
 
 	return hex.EncodeToString(sum[:16]), nil
 }

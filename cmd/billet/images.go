@@ -223,10 +223,23 @@ func cmdImagesVerify(ctx context.Context, args []string) error {
 		return err
 	}
 
-	lease, err := probeLeaseID()
+	lease, err := probeLeaseID(deployment)
 	if err != nil {
 		return err
 	}
+
+	// ONE VERIFICATION AT A TIME ON THIS MACHINE. The probe's name is the same every
+	// run, so two at once are two names for one microVM.
+	lock, err := takeProbeLock(cfg.Node.LockDir, probeDeployment(deployment))
+	if err != nil {
+		return err
+	}
+
+	defer func() {
+		if err := lock.release(); err != nil {
+			fmt.Printf("warning: the verification lock was not released: %v\n", err)
+		}
+	}()
 
 	// AND ANYTHING AN EARLIER RUN LEFT BEHIND GOES FIRST. The probe's name is the
 	// same on this host every time, so this is one idempotent Destroy of one name
