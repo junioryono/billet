@@ -878,7 +878,7 @@ func (p *Provider) Destroy(ctx context.Context, id string) error {
 
 		if orphan, err := p.claimedBy(id); err != nil {
 			failures = append(failures, err)
-		} else if err := p.releaseOrphaned(ctx, orphan); err != nil {
+		} else if err := p.releaseOrphaned(ctx, orphan, id); err != nil {
 			failures = append(failures, err)
 		}
 
@@ -919,8 +919,18 @@ func (p *Provider) Destroy(ctx context.Context, id string) error {
 
 	var failures []error
 
+	// THE NAME IS ONLY GIVEN BACK IF THE DEVICE ACTUALLY WENT. A device that would
+	// not delete is still attached to the bridge, and nothing enumerates orphan
+	// devices — so handing the name back wedges the host: the next launch draws the
+	// same lowest-free name, `ip tuntap add` refuses it because the kernel already
+	// has it, that launch fails and releases the name, and every launch after it
+	// fails identically until an operator intervenes. Keeping the claim is what lets
+	// a later teardown find this device and finish removing it.
+	tapGone := true
+
 	if err := p.deleteTap(ctx, res.Tap); err != nil {
 		failures = append(failures, err)
+		tapGone = false
 	}
 
 	if err := p.removeCgroup(j); err != nil {
@@ -937,7 +947,18 @@ func (p *Provider) Destroy(ctx context.Context, id string) error {
 
 	// AFTER THE JAIL. Releasing a claim while the jail still names it would let
 	// another launch take the uid a VMM may still be running as.
-	if err := p.releaseResources(res); err != nil {
+	//
+	// Each release checks that the claim STILL names this jail: the jail is gone by
+	// now, which is precisely the reaper's condition, so a concurrent launch may have
+	// legitimately taken this uid or device name in the gap. Deleting it by name
+	// alone would then free a live claim and hand a running microVM's uid to the
+	// launch after it.
+	held := res
+	if !tapGone {
+		held.Tap = ""
+	}
+
+	if err := p.releaseResources(held, j.id); err != nil {
 		failures = append(failures, err)
 	}
 
@@ -1155,9 +1176,20 @@ func (p *Provider) unwind(
 	// NOT A DEVICE THIS LAUNCH DID NOT CREATE. billet allocates the name, so a
 	// collision means something outside billet holds it — and removing it would cut
 	// the network out from under whatever that is, over a launch failure elsewhere.
+	//
+	// THE NAME GOES BACK ONLY IF THE DEVICE DID. Same reasoning as Destroy: a device
+	// left attached while its name returns to the pool makes every later launch that
+	// draws that name fail, permanently, because nothing enumerates orphan devices.
+	// The errTapTaken case keeps the name for the opposite reason — the device is not
+	// billet's to delete, so the name must stay out of the pool rather than be handed
+	// to a launch that would fail on it too.
+	tapGone := false
+
 	if !errors.Is(cause, errTapTaken) {
 		if err := p.deleteTap(ctx, res.Tap); err != nil {
 			failures = append(failures, err)
+		} else {
+			tapGone = true
 		}
 	}
 
@@ -1170,8 +1202,15 @@ func (p *Provider) unwind(
 	}
 
 	// AFTER THE JAIL, because releasing a claim while the jail still names it would
-	// let another launch take the uid a live VMM is running as.
-	if err := p.releaseResources(res); err != nil {
+	// let another launch take the uid a live VMM is running as — and each release
+	// checks the claim still names THIS jail, since the jail is gone by now and a
+	// concurrent launch may have legitimately reaped and re-taken it.
+	held := res
+	if !tapGone {
+		held.Tap = ""
+	}
+
+	if err := p.releaseResources(held, j.id); err != nil {
 		failures = append(failures, err)
 	}
 
