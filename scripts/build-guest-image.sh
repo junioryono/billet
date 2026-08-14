@@ -45,7 +45,7 @@ need_root() {
 
 need_tools() {
 	local missing=()
-	for t in debootstrap mkfs.ext4 rbd chroot; do
+	for t in debootstrap mkfs.ext4 rbd chroot jq; do
 		command -v "$t" >/dev/null 2>&1 || missing+=("$t")
 	done
 
@@ -136,26 +136,59 @@ log() { echo "billet-agent: $*" >&2; }
 # down rather than like the guest never asked.
 ip route replace "$MMDS/32" dev eth0 2>/dev/null || true
 
-for attempt in $(seq 1 60); do
+# NOT `[ x ] && { ... }` AS A STATEMENT, ANYWHERE BELOW. Under `set -e` an `&&` list
+# whose left side is FALSE returns 1, and a compound command returning 1 outside a
+# condition is exactly what `set -e` exits on — so the guard fires when the thing it
+# guards against did NOT happen. The first version of this agent used that idiom
+# twice: it exited silently at the line before it would have started the runner, and
+# systemd still reported `Started billet-agent.service`, because Type=exec only means
+# the process was executed. Every branch here is a full if/then/fi for that reason.
+token=""
+
+for attempt in $(seq 1 120); do
 	if token=$(curl -sf -X PUT "http://$MMDS/latest/api/token" \
-		-H "X-metadata-token-ttl-seconds: 60" 2>/dev/null); then
+		-H "X-metadata-token-ttl-seconds: 300" 2>/dev/null); then
 		break
 	fi
-	[ "$attempt" = 60 ] && { log "the metadata service never answered"; exit 1; }
+
+	if [ "$attempt" -ge 120 ]; then
+		log "the metadata service never answered"
+		exit 1
+	fi
+
 	sleep 0.5
 done
 
 fetch() { curl -sf -H "X-metadata-token: $token" "http://$MMDS/latest/meta-data/billet/$1"; }
 
-jit=$(fetch jit-config) || { log "no registration in the metadata"; exit 1; }
-name=$(fetch runner-name || echo unknown)
+if ! jit=$(fetch jit-config); then
+	log "no registration in the metadata"
+	exit 1
+fi
+
+if ! name=$(fetch runner-name); then
+	name=unknown
+fi
 
 # The command is a JSON array, because a tier's command is one and word-splitting it
 # here would be billet guessing at somebody's argv.
-mapfile -t cmd < <(fetch command | jq -r '.[]')
-[ "${#cmd[@]}" -eq 0 ] && { log "no command in the metadata"; exit 1; }
+cmd=()
 
-log "starting $name"
+if ! raw=$(fetch command); then
+	log "no command in the metadata"
+	exit 1
+fi
+
+while IFS= read -r arg; do
+	cmd+=("$arg")
+done < <(printf '%s' "$raw" | jq -r '.[]')
+
+if [ "${#cmd[@]}" -eq 0 ]; then
+	log "the command in the metadata is empty"
+	exit 1
+fi
+
+log "starting $name with ${#cmd[@]} argument(s)"
 
 export ACTIONS_RUNNER_INPUT_JITCONFIG="$jit"
 
@@ -246,9 +279,26 @@ publish() {
 
 	local rbd=(rbd --id "$CEPH_USER")
 
+	local want=$((SIZE_MB + 512))
+
 	if ! "${rbd[@]}" -p "$IMAGE_POOL" info "$IMAGE_NAME" >/dev/null 2>&1; then
-		"${rbd[@]}" -p "$IMAGE_POOL" create "$IMAGE_NAME" \
-			--size "$((SIZE_MB + 512))M" --object-size 4M
+		"${rbd[@]}" -p "$IMAGE_POOL" create "$IMAGE_NAME" --size "${want}M" --object-size 4M
+	else
+		# GROWN IF IT HAS TO BE, because an image that already exists was sized for
+		# whatever the last generation needed. Writing a larger filesystem into it
+		# fails partway through with `No space left on device` — a corrupt image with
+		# a successful-looking build behind it, since the write is the only step that
+		# would have said so.
+		#
+		# EXISTING SNAPSHOTS KEEP THEIR OWN SIZE, so growing the head does not touch a
+		# generation a running job holds a clone of.
+		local have
+		have=$("${rbd[@]}" -p "$IMAGE_POOL" info "$IMAGE_NAME" --format json | jq -r '.size / 1048576 | floor')
+
+		if [ "$have" -lt "$want" ]; then
+			echo "growing $IMAGE_POOL/$IMAGE_NAME from ${have}M to ${want}M"
+			"${rbd[@]}" -p "$IMAGE_POOL" resize "$IMAGE_NAME" --size "${want}M"
+		fi
 	fi
 
 	dev=$("${rbd[@]}" device map "$IMAGE_POOL/$IMAGE_NAME")
