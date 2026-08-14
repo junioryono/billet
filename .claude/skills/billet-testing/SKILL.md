@@ -177,6 +177,20 @@ Every one of these passed against the exact bug it existed to catch. Mutation te
 - **A mutant that applies but changes no behaviour reports SURVIVED, and that is indistinguishable from a real gap.** Inserting `_ = id` next to a `delete` left the delete in place; the harness verified the file hash changed, so every existing guard passed, and the output said the property was uncovered when it was not. Hash-verification catches an edit that did not apply, not an edit that did nothing. A mutant must remove or invert behaviour — if you cannot say which assertion it should break, it is not a mutant.
 - **Run the suite the way CI runs it, instrumented.** `-covermode=atomic` is not a reporting flag; the counters change timing enough to reorder goroutines that a plain `-race` build schedules identically every time. A launch in progress being handed to teardown was invisible under `make check` and reliable under coverage. `make check` now carries the flags, because a local gate weaker than CI trains you to trust it.
 
+## A stand-in that cannot stay alive cannot stand in
+
+The firecracker tests needed a process carrying a jail id in its argv, so they ran `sleep --id <id> 30` and `sh --id <id> -c '…'`. Real coreutils and real dash both reject an unknown option and exit immediately. One test then asserted a process was NOT the microVM and passed because there was no process at all; another asserted one WAS and passed only by racing its own subject's exit. Neither failure was visible on macOS, where a different `sh` tolerated it — so the suite was green on the machine it was written on and wrong on the machine it runs on.
+
+Two rules. **Put the marker where the program will keep it** — `sh -c <script> <name>` sets `$0`, which needs no cooperation from the program's option parser. And **wait until the fixture is observable before the test proceeds**: the helper polls `/proc` until the stand-in is there, so "the process has not appeared yet" and "the process exited" stop being the same observation.
+
+## A test that asserts only "an error came back" agrees with the bug
+
+`TestAPidFileThatIsNotAPidStopsTeardown` was written to prove teardown STOPS when it cannot tell whether a VMM is running. It asserted that `Destroy` returned an error. `Destroy` did return an error — and then removed the jail, deleted the tap and discarded the root disk anyway, which is the whole failure the test was named for.
+
+An error value is the cheapest thing a function produces and usually the least of what it does. When the property is "and therefore nothing else happened", the assertions have to be about the things that must still exist. Three lines — the jail is still there, the disk was not discarded, no `ip link del` ran — turned a test that passed against the defect into one that fails against it.
+
+The same shape caught a second one: the package had four `List` tests, all about what it must NOT report, and none that listed an ordinary owned running microVM. A `List` that dropped every jail it owned passed all four.
+
 ## Four ways silence has looked like success, and the guards for each
 
 Every one of these produced a green gate and an untrue conclusion. They are the same failure wearing different clothes, and the pattern is worth recognising before the fifth one: **the thing that would have objected was itself missing.**
