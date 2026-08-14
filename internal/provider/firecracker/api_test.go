@@ -5,7 +5,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/user"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -192,57 +191,5 @@ func TestAnAnswerThatIsNotThisAPIIsRefused(t *testing.T) {
 
 	if _, err := newVMMAPI(socket).info(t.Context()); err == nil {
 		t.Error("a non-json answer was decoded rather than refused")
-	}
-}
-
-// THE JAIL USER IS RESOLVED ONCE, AND ROOT IS REFUSED. The jailer's whole purpose
-// is to drop privileges before the VMM parses anything, so --uid 0 keeps every one
-// of them in front of a process whose input is somebody's CI job.
-func TestRootIsRefusedAsTheJailUser(t *testing.T) {
-	t.Parallel()
-
-	if _, _, err := lookupJailUser("root"); err == nil {
-		t.Fatal("root was accepted as the account to drop the vmm to")
-	} else if !strings.Contains(err.Error(), "drop privileges") {
-		t.Errorf("the refusal does not say why: %v", err)
-	}
-}
-
-// AND AN ACCOUNT THAT IS NOT THERE IS TOLD HOW TO CREATE ONE, once at startup,
-// rather than failing per launch in a message about a number.
-func TestAMissingJailAccountSaysHowToCreateOne(t *testing.T) {
-	t.Parallel()
-
-	_, _, err := lookupJailUser("no-such-account-billet-test")
-	if err == nil {
-		t.Skip("this machine has an account by that name")
-	}
-
-	if !strings.Contains(err.Error(), "useradd") {
-		t.Errorf("the error does not say how to create the account: %v", err)
-	}
-}
-
-// AND AN ORDINARY ACCOUNT RESOLVES. Without this the two cases above pass against a
-// lookup that refuses everything.
-func TestAnOrdinaryAccountResolves(t *testing.T) {
-	t.Parallel()
-
-	me, err := user.Current()
-	if err != nil {
-		t.Skipf("no current user: %v", err)
-	}
-
-	if me.Uid == "0" {
-		t.Skip("running as root, whose uid this function refuses by design")
-	}
-
-	uid, gid, err := lookupJailUser(me.Username)
-	if err != nil {
-		t.Fatalf("lookupJailUser(%q): %v", me.Username, err)
-	}
-
-	if uid == 0 || gid == 0 {
-		t.Errorf("resolved to uid %d gid %d", uid, gid)
 	}
 }

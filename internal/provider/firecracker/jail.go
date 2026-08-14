@@ -279,7 +279,43 @@ func (p *Provider) writeResources(j jail, res resources) error {
 		return fmt.Errorf("firecracker: encode the resources of %s: %w", j.id, err)
 	}
 
-	if err := os.WriteFile(j.resourceFile(), append(encoded, '\n'), 0o600); err != nil {
+	// WRITTEN BESIDE AND RENAMED, never truncated in place. This file is the only
+	// record of what a microVM holds, and `resourcesOf` treats a file that is THERE
+	// and unreadable as an error rather than as nothing — deliberately, because
+	// releasing a guess is worse than releasing nothing.
+	//
+	// Those two together mean a crash midway through a plain write leaves invalid
+	// JSON that makes EVERY later Destroy of that jail fail, permanently, with only
+	// an operator able to clear it. A rename is atomic, so the file is either the
+	// previous content or the new content and never half of either.
+	staged, err := os.CreateTemp(j.dir(), ".resources-")
+	if err != nil {
+		return fmt.Errorf("firecracker: stage the resources of %s: %w", j.id, err)
+	}
+
+	defer os.Remove(staged.Name())
+
+	if _, err := staged.Write(append(encoded, '\n')); err != nil {
+		return errors.Join(fmt.Errorf("firecracker: write the resources of %s: %w", j.id, err),
+			staged.Close())
+	}
+
+	// SYNCED BEFORE THE RENAME. A rename that lands before the bytes do leaves the
+	// name pointing at a file the crash emptied, which is the state this is avoiding.
+	if err := staged.Sync(); err != nil {
+		return errors.Join(fmt.Errorf("firecracker: sync the resources of %s: %w", j.id, err),
+			staged.Close())
+	}
+
+	if err := staged.Close(); err != nil {
+		return fmt.Errorf("firecracker: close the staged resources of %s: %w", j.id, err)
+	}
+
+	if err := os.Chmod(staged.Name(), 0o600); err != nil {
+		return fmt.Errorf("firecracker: set the mode of the resources of %s: %w", j.id, err)
+	}
+
+	if err := os.Rename(staged.Name(), j.resourceFile()); err != nil {
 		return fmt.Errorf("firecracker: record what %s was allocated: %w", j.id, err)
 	}
 

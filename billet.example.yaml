@@ -16,7 +16,7 @@
 # `billet check` proves all four before a job ever arrives, and names whichever
 # one is missing.
 #
-# TO RUN IT ON A LAPTOP INSTEAD, THREE edits HERE, and all three are needed — the
+# TO RUN IT ON A LAPTOP INSTEAD, FOUR edits HERE, and all four are needed — the
 # README's quickstart lists what else the file needs (the github: block, a
 # writable server.state_dir) and the Docker daemon it assumes:
 #
@@ -26,7 +26,11 @@
 #      backend that cannot attach a block device, so leaving it in place means
 #      the config does not load at all — see the block's own comment for why a
 #      storage section nothing will read is an error.
-#   3. `image:` -> a Docker image that contains the GitHub runner, for example
+#   3. Delete the `firecracker:` block below, for the same reason as the `ceph:`
+#      one: only the firecracker backend reads it, so on any other provider it is
+#      a jail directory, a uid range and a bridge that nothing consults, and it is
+#      REFUSED rather than ignored.
+#   4. `image:` -> a Docker image that contains the GitHub runner, for example
 #      `ghcr.io/actions/actions-runner:latest`. The image name is passed
 #      straight to `docker run`, so `ubuntu-2404-x64@g1` below is a golden-image
 #      reference for Firecracker and is not pullable.

@@ -4,10 +4,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
-	"os/user"
 	"path/filepath"
-	"strconv"
-	"strings"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -114,60 +111,4 @@ func chownTree(root string, uid, gid int) error {
 
 		return nil
 	})
-}
-
-// lookupJailUser resolves the account the jailer drops the VMM to.
-//
-// RESOLVED AT CONSTRUCTION, so a deployment whose account does not exist is told
-// once at startup rather than on every launch — and told what to do about it. A
-// jailer that cannot resolve the uid fails per job, in a message about a number.
-//
-// ROOT IS REFUSED, and that is the point of the setting rather than a hardening
-// detail. The jailer's whole purpose is to drop privileges before the VMM parses
-// anything; --uid 0 keeps every one of them, in front of a process whose input is
-// somebody's CI job.
-func lookupJailUser(name string) (int, int, error) {
-	u, err := user.Lookup(name)
-	if err != nil {
-		var unknown user.UnknownUserError
-		if strings.Contains(err.Error(), "unknown user") || asUnknownUser(err, &unknown) {
-			return 0, 0, fmt.Errorf("firecracker: there is no %q account on this host for the "+
-				"jailer to drop the vmm to; create one with `useradd --system --no-create-home "+
-				"--shell /usr/sbin/nologin %s`, or name another with "+
-				"node.firecracker.jail_user: %w", name, name, err)
-		}
-
-		return 0, 0, fmt.Errorf("firecracker: look up the %q account: %w", name, err)
-	}
-
-	uid, err := strconv.Atoi(u.Uid)
-	if err != nil {
-		return 0, 0, fmt.Errorf("firecracker: the %q account's uid %q is not a number: %w",
-			name, u.Uid, err)
-	}
-
-	gid, err := strconv.Atoi(u.Gid)
-	if err != nil {
-		return 0, 0, fmt.Errorf("firecracker: the %q account's gid %q is not a number: %w",
-			name, u.Gid, err)
-	}
-
-	if uid == 0 || gid == 0 {
-		return 0, 0, fmt.Errorf("firecracker: node.firecracker.jail_user is %q, which is uid %d "+
-			"and gid %d; the jailer exists to drop privileges before the vmm reads anything, so "+
-			"running it as root would leave the guest's vmm with all of them", name, uid, gid)
-	}
-
-	return uid, gid, nil
-}
-
-// asUnknownUser reports whether an error is os/user's unknown-user error.
-func asUnknownUser(err error, target *user.UnknownUserError) bool {
-	if e, ok := err.(user.UnknownUserError); ok { //nolint:errorlint // the stdlib returns it unwrapped
-		*target = e
-
-		return true
-	}
-
-	return false
 }

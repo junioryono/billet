@@ -53,6 +53,22 @@ need_tools() {
 		echo "missing: ${missing[*]} (apt-get install debootstrap e2fsprogs ceph-common)" >&2
 		exit 1
 	fi
+
+	# THE GUEST'S ARCHITECTURE IS THE HOST'S, AND THE RUNNER IS PINNED TO x64.
+	# debootstrap takes the host architecture unless told otherwise, so on an arm64
+	# machine this would build an arm64 userspace and drop an x86-64 runner into it.
+	# That combination boots perfectly and fails at the moment the agent execs the
+	# runner, with an executable-format error inside a guest nobody has a console for
+	# -- the exact shape of failure this whole image is built to make impossible.
+	local arch
+	arch=$(uname -m)
+
+	if [ "$arch" != "x86_64" ]; then
+		echo "this builds an x86-64 guest (the pinned runner is linux-x64) and this host is" >&2
+		echo "$arch; build it on an x86-64 machine, or teach this script to select the" >&2
+		echo "runner and debootstrap architecture together" >&2
+		exit 1
+	fi
 }
 
 main() {
@@ -60,8 +76,33 @@ main() {
 	need_tools
 
 	local rootfs="$WORK/rootfs" img="$WORK/$IMAGE_NAME.ext4"
+
+	# THE WORKSPACE IS PROVED TO BE A WORKSPACE BEFORE IT IS DELETED. This runs as
+	# root and WORK is an environment override, so `WORK=/var/lib/billet` -- or an
+	# empty WORK, which makes this `rm -rf /rootfs` -- destroys unrelated state before
+	# the build has done anything. A build script is not worth a recursive delete of
+	# a directory nobody checked.
+	#
+	# The marker is what makes it safe on the SECOND run: a directory this script
+	# created carries it, and anything else does not, so a typo names a directory
+	# without one and stops here rather than being wiped.
+	case "$WORK" in
+		/*/*) ;;
+		*)
+			echo "WORK must be an absolute path at least two levels deep, not '$WORK'" >&2
+			exit 1
+			;;
+	esac
+
+	if [ -e "$WORK" ] && [ ! -e "$WORK/.billet-guest-workspace" ]; then
+		echo "$WORK exists and was not created by this script; refusing to delete it." >&2
+		echo "Remove it yourself, or set WORK to a directory this script may own." >&2
+		exit 1
+	fi
+
 	rm -rf "$WORK"
 	mkdir -p "$rootfs"
+	touch "$WORK/.billet-guest-workspace"
 
 	echo "=== 1/6 base system ($SUITE) ==="
 	# --variant=minbase, then systemd on top: the guest needs an init that can run
@@ -400,6 +441,16 @@ NET
 	publish "$img"
 }
 
+# unmap_image releases a mapping on the way out, however this script is leaving.
+#
+# Best-effort by design: it runs on the failure path, where the useful message is the
+# one about what actually went wrong rather than a second one about the cleanup.
+unmap_image() {
+	if [ -n "${1:-}" ]; then
+		rbd --id "$CEPH_USER" device unmap "$1" 2>/dev/null || true
+	fi
+}
+
 # publish writes the image into the pool as a NEW generation.
 #
 # A NEW SNAPSHOT EVERY TIME, never a moved one. A generation is what running jobs hold
@@ -435,7 +486,14 @@ publish() {
 	fi
 
 	dev=$("${rbd[@]}" device map "$IMAGE_POOL/$IMAGE_NAME")
-	trap '"${rbd[@]}" device unmap "$dev" 2>/dev/null || true' RETURN
+
+	# EXIT, NOT RETURN. A RETURN trap fires when a function RETURNS, and `set -e`
+	# aborting the script is not a return — so the one case this trap exists for, a
+	# failed write partway through, was exactly the case it did not fire in. The
+	# golden image then stayed mapped on the build host, and the next run's `device
+	# map` added a second mapping of the same image rather than failing, which is how
+	# a build host ends up with a dozen of them.
+	trap 'unmap_image "$dev"' EXIT
 
 	# gnudd, NOT dd: Ubuntu 26.04's uutils coreutils does not implement
 	# `iflag=direct`, which is the same class of difference that broke `cephadm
@@ -446,7 +504,8 @@ publish() {
 	"$ddbin" if="$img" of="$dev" bs=4M conv=fsync status=progress
 
 	"${rbd[@]}" device unmap "$dev"
-	trap - RETURN
+	dev=""
+	trap - EXIT
 
 	"${rbd[@]}" -p "$IMAGE_POOL" snap create "$IMAGE_NAME@$gen"
 

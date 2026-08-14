@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/junioryono/billet/internal/config"
 )
 
 // A microVM needs two things that are scarce on a host rather than derivable from
@@ -263,7 +265,11 @@ const maxTaps = 4096
 // tapPrefix marks a device as billet's on a host that may have others, and leaves
 // room for a number inside the kernel's 15-character limit — `bt-` plus four digits
 // is seven, against a limit of fifteen.
-const tapPrefix = "bt-"
+//
+// IT LIVES IN config BECAUSE THE CONFIG HAS TO KNOW IT: a bridge named `bt-3` is a
+// name a launch will eventually try to create and be refused for, so validation
+// rejects it — and that check is only as good as the two names being the same one.
+const tapPrefix = config.TapPrefix
 
 // resources are what one microVM holds that the HOST allocated, rather than what its
 // lease implies. Recorded in the jail, because teardown after a crash has nothing
