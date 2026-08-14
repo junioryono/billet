@@ -1,0 +1,233 @@
+package ceph
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"regexp"
+	"strings"
+)
+
+// ErrNoSuchImage is returned when a golden image or its snapshot is not there.
+//
+// A SENTINEL BECAUSE THE CALLER'S NEXT MOVE DIFFERS. A missing golden image is a
+// deployment that has not published one — an operator action — while a cluster
+// that could not be reached is a transient the node should keep retrying. Both
+// arrive as `(2) No such file or directory` on stderr, so without this the launch
+// path cannot tell "publish an image" from "the monitors are down".
+var ErrNoSuchImage = errors.New("the golden image or its snapshot is not in the image pool")
+
+// snapshotSpec is a golden image reference: an image name, an `@`, a snapshot.
+//
+// BOTH HALVES ARE REQUIRED, and that is a decision rather than a validation
+// convenience. Choosing a generation when a caller names only an image is #25's
+// job — it is the whole subject of that issue — so #24 refuses to invent a rule
+// that would then have to be unpicked. An operator naming `ubuntu-2404-x64` gets
+// a message pointing at the snapshot they meant.
+//
+// The character rules are the ones billet already applies to a pool, for the same
+// measured reason: these become POSITIONAL `pool/image@snap` arguments, where rbd
+// reads a leading dash as an option it does not recognise.
+var snapshotSpec = regexp.MustCompile(`^[^-/@][^/@]*@[^/@]+$`)
+
+// CloneRoot clones a golden image's snapshot into the cache pool, maps it, and
+// returns the host device the kernel client gave it.
+//
+// NO `snap protect`, WHICH IS THE WHOLE POINT OF THE CLONE-V2 PRECONDITION. On a
+// clone-v1 cluster the protect step is mandatory and a protected snapshot with a
+// live clone can be neither unprotected nor removed, so a generation any running
+// job holds would be undeletable. CheckReachable refuses such a cluster, which is
+// what lets this function be three commands instead of five.
+//
+// IT REMOVES THE CLONE IF THE MAP FAILS. A clone that exists and is not mapped is
+// invisible to everything above — no jail carries its name, so the sweep never
+// looks for it — and it holds pool space until an operator finds it by hand.
+func (c *Client) CloneRoot(ctx context.Context, image, name string) (string, error) {
+	if !snapshotSpec.MatchString(image) {
+		return "", fmt.Errorf("ceph: %s is not a golden image reference: billet clones a "+
+			"named SNAPSHOT, written image@snapshot (for example ubuntu-2404-x64@g1), because "+
+			"choosing a generation for you is the storage layer's job and it does not exist yet",
+			bounded(image))
+	}
+
+	if err := checkCloneName(name); err != nil {
+		return "", err
+	}
+
+	src := c.cfg.ImagePool + "/" + image
+	dst := c.cfg.CachePool + "/" + name
+
+	if _, err := c.rbdCmd(ctx, false, "clone", src, dst); err != nil {
+		if isNoSuchFile(err) {
+			return "", fmt.Errorf("%w: %s could not be cloned as client.%s: %w",
+				ErrNoSuchImage, src, c.cfg.User, err)
+		}
+
+		return "", fmt.Errorf("ceph: clone %s to %s as client.%s: %w", src, dst, c.cfg.User, err)
+	}
+
+	device, err := c.mapRoot(ctx, name)
+	if err != nil {
+		// BEST EFFORT, AND ITS FAILURE IS REPORTED RATHER THAN REPLACING THE CAUSE.
+		// The caller needs to know why the map failed; a second failure here is a
+		// clone left in the pool, which is worth saying and is not the headline.
+		if rmErr := c.removeClone(ctx, name); rmErr != nil {
+			return "", fmt.Errorf("%w (and the clone it made could not be removed, so %s is "+
+				"holding pool space: %w)", err, dst, rmErr)
+		}
+
+		return "", err
+	}
+
+	return device, nil
+}
+
+// mapRoot maps a cache-pool image and returns the device the kernel gave it.
+//
+// MAPPING IS NOT IDEMPOTENT — measured. A second `rbd device map` of the same
+// image warns `image already mapped as /dev/rbd1` on stderr and then maps it
+// AGAIN, at /dev/rbd2. So this is never retried blindly: a retry does not
+// converge, it accumulates devices that nothing will unmap because DiscardRoot
+// would have to know how many to expect.
+func (c *Client) mapRoot(ctx context.Context, name string) (string, error) {
+	spec := c.cfg.CachePool + "/" + name
+
+	out, err := c.rbdCmd(ctx, false, "device", "map", spec)
+	if err != nil {
+		return "", fmt.Errorf("ceph: map %s as client.%s: %w", spec, c.cfg.User, err)
+	}
+
+	device := strings.TrimSpace(string(out))
+
+	// THE SHAPE IS CHECKED BECAUSE THIS VALUE BECOMES A mknod TARGET. It is passed
+	// to the caller, which stats it for a major and minor number and creates a
+	// device node inside a jail from the answer. A value that is not a path rbd
+	// just produced has no business reaching that.
+	if !strings.HasPrefix(device, "/dev/rbd") {
+		return "", fmt.Errorf("ceph: %s answered %s when asked to map %s, which is not a device "+
+			"path; is it the rbd command?", c.bin, bounded(device), spec)
+	}
+
+	return device, nil
+}
+
+// DiscardRoot unmaps every mapping of a per-job clone and removes it.
+//
+// IDEMPOTENT, because it runs on teardown paths that have already failed once.
+// Neither underlying command is idempotent on its own: unmapping a spec nothing
+// has mapped answers `(22) Invalid argument`, and removing an image that is not
+// there answers `(2) No such file or directory` — both measured, and both mean
+// "already done" here.
+//
+// EVERY MAPPING, NOT ONE. `rbd device unmap <spec>` on an image mapped twice
+// reports `mapped more than once, unmapping /dev/rbd1 only` and leaves the other
+// in place — so this reads the mapping table and unmaps by DEVICE, which names
+// exactly one. An unmapped device left behind pins the image, and the remove then
+// fails for a reason that names neither.
+func (c *Client) DiscardRoot(ctx context.Context, name string) error {
+	if err := checkCloneName(name); err != nil {
+		return err
+	}
+
+	devices, err := c.mappedDevices(ctx, name)
+	if err != nil {
+		return err
+	}
+
+	for _, device := range devices {
+		if _, err := c.rbdCmd(ctx, false, "device", "unmap", device); err != nil {
+			return fmt.Errorf("ceph: unmap %s, which is a root disk for %s: %w", device, name, err)
+		}
+	}
+
+	return c.removeClone(ctx, name)
+}
+
+// removeClone deletes a cache-pool image, treating an absent one as success.
+func (c *Client) removeClone(ctx context.Context, name string) error {
+	spec := c.cfg.CachePool + "/" + name
+
+	if _, err := c.rbdCmd(ctx, false, "rm", spec); err != nil {
+		if isNoSuchFile(err) {
+			return nil
+		}
+
+		return fmt.Errorf("ceph: remove %s as client.%s: %w", spec, c.cfg.User, err)
+	}
+
+	return nil
+}
+
+// mappedDevice is one row of the kernel client's mapping table.
+//
+// THE IMAGE FIELD IS `name` IN JSON, though the human-readable table heading for
+// the same column reads `image`. Measured against 20.2.3; decoding the heading
+// instead yields an empty string for every row, which reads as "nothing is
+// mapped" and silently skips the unmap.
+type mappedDevice struct {
+	Pool   string `json:"pool"`
+	Name   string `json:"name"`
+	Device string `json:"device"`
+}
+
+// mappedDevices lists the host devices a cache-pool image is mapped to.
+func (c *Client) mappedDevices(ctx context.Context, name string) ([]string, error) {
+	out, err := c.rbdCmd(ctx, true, "device", "list")
+	if err != nil {
+		return nil, fmt.Errorf("ceph: list the mapped rbd devices: %w", err)
+	}
+
+	// A `null` UNMARSHALS INTO A SLICE HAPPILY and would read as "nothing is
+	// mapped" — which here means "skip the unmap and remove an image the kernel is
+	// still holding". An empty table is `[]`, so nil is not a shape rbd produces.
+	var devices []mappedDevice
+	if err := json.Unmarshal(trimSpace(out), &devices); err != nil || devices == nil {
+		return nil, fmt.Errorf("ceph: %s did not answer with a json device list; is it the rbd "+
+			"command?", c.bin)
+	}
+
+	var found []string
+
+	for _, d := range devices {
+		if d.Pool == c.cfg.CachePool && d.Name == name && d.Device != "" {
+			found = append(found, d.Device)
+		}
+	}
+
+	return found, nil
+}
+
+// checkCloneName refuses a clone name billet cannot address.
+//
+// The same measured rules as a pool name, and for the same reason: this is half
+// of a POSITIONAL `pool/image` argument. `/` and `@` would point the spec at
+// another pool or a snapshot, and a leading dash is read by rbd as an option it
+// does not recognise.
+func checkCloneName(name string) error {
+	if name == "" {
+		return errors.New("ceph: a root disk needs a name")
+	}
+
+	if strings.ContainsAny(name, "/@") || strings.HasPrefix(name, "-") ||
+		strings.TrimSpace(name) != name {
+		return fmt.Errorf("ceph: %s is not a usable image name: billet addresses an image as a "+
+			"positional pool/image argument", bounded(name))
+	}
+
+	return nil
+}
+
+// isNoSuchFile reports whether rbd failed because the thing was not there.
+//
+// MATCHED ON THE ERRNO rbd PRINTS, not on prose, because that number is what the
+// tool is actually reporting and it is stable across the phrasings — `clone
+// error`, `delete error` and `error opening image` all carry `(2)`. Both an
+// absent image and an absent snapshot produce it, which is what the caller wants:
+// either way there is nothing there.
+func isNoSuchFile(err error) bool {
+	return strings.Contains(err.Error(), "(2) No such file or directory")
+}
+
+// trimSpace is bytes.TrimSpace without the import, kept beside its one caller.
+func trimSpace(b []byte) []byte { return []byte(strings.TrimSpace(string(b))) }
