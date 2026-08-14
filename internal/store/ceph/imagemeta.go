@@ -55,6 +55,20 @@ func (c *Client) RunnerVersion(ctx context.Context, image string) (string, bool,
 		// the caller's fallback swallowed that silently, so the wrong answer looked
 		// exactly like a generation with no metadata.
 		if isNoSuchFile(err) {
+			// ENOENT MEANS TWO THINGS HERE AND THEY ARE NOT THE SAME. `rbd` exits 2
+			// both for "that key is not set" — ordinary, for a generation published
+			// before billet recorded this — and for "no such image or pool", which
+			// is a deployment pointing at storage that is not there.
+			//
+			// Reporting the second as the first sends the caller down its "cannot
+			// tell, use the compiled-in pin" path, so a mistyped pool reads as an
+			// image with no metadata and the operator is told a version that
+			// describes nothing. Asking whether the image exists separates them.
+			if _, existsErr := c.rbdCmd(ctx, true, "-p", c.cfg.ImagePool, "info", name); existsErr != nil {
+				return "", false, fmt.Errorf("ceph: %s/%s is not there to read a runner version "+
+					"from: %w", c.cfg.ImagePool, name, existsErr)
+			}
+
 			return "", false, nil
 		}
 

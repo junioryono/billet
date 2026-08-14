@@ -222,12 +222,19 @@ slow. billet's cannot — a JIT configuration from GitHub's API carries
 baked into an image is the runner forever** and republishing is the only way past the
 deadline.
 
-So enable the timer:
+So enable the timer. **It runs the build scripts from a checkout**, which the packages do
+not install — the unit's `REPO` must point at one, and at a path that will still be there
+next Sunday:
 
 ```bash
+sudo git clone https://github.com/junioryono/billet /opt/billet   # what REPO points at
 sudo cp deploy/billet-image-refresh.{service,timer} /etc/systemd/system/
-sudo systemctl enable --now billet-image-refresh.timer   # the TIMER, not the service
+sudoedit /etc/systemd/system/billet-image-refresh.service          # REPO, CONFIG, BILLET
+sudo systemctl enable --now billet-image-refresh.timer             # the TIMER, not the service
 ```
+
+Enabling the *service* instead of the timer would run a two-hour root build at every boot,
+which is why it deliberately carries no `[Install]` section.
 
 Weekly, against a 30-day deadline, because the run itself can fail — on a package mirror,
 on a verification, on a full disk — and a monthly cadence leaves no room for the retry.
