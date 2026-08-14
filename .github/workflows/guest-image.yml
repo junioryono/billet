@@ -1,0 +1,236 @@
+# Build the guest image centrally and publish it, so no deployment has to.
+#
+# WHY THIS EXISTS AT ALL. Every billet deployment needs the same microVM guest:
+# Ubuntu, Docker, the Actions runner, billet's agent. Nothing in it is specific to
+# an organisation. Having each operator build it means each of them needs root,
+# debootstrap and an hour, and each of them independently discovers that GitHub
+# stops handing jobs to a runner more than thirty days past a release. Building it
+# once here makes that expiry one project's problem instead of everyone's.
+#
+# WHY IT DOES NOT NAME THE REPOSITORY. This project expects to move between
+# accounts. `github.repository` is whatever repository this file is in, so the
+# workflow publishes to its own home wherever that turns out to be, and the move
+# is a `git push` rather than an edit here that somebody has to remember.
+name: Guest image
+
+on:
+  schedule:
+    # Weekly, well inside github's thirty days from a runner release, and at an
+    # hour nobody is watching. Not Sunday-into-Monday: a build that fails wants a
+    # working day in front of it, not a weekend.
+    - cron: "17 4 * * 1"
+
+  workflow_dispatch:
+    inputs:
+      runner_version:
+        description: "Actions runner version to bake in (blank: whatever github has published)"
+        required: false
+        type: string
+
+      publish:
+        description: "Publish a release. Off builds and checks without publishing."
+        required: false
+        default: true
+        type: boolean
+
+# LEAST PRIVILEGE, NAMED PER JOB BELOW rather than here, so a step added to a
+# future job does not silently inherit the ability to write releases.
+permissions: {}
+
+concurrency:
+  # ONE BUILD AT A TIME, AND A SCHEDULED RUN DOES NOT CANCEL A MANUAL ONE it
+  # overlapped with. cancel-in-progress would let the weekly timer kill a build
+  # somebody started deliberately, which is the run most likely to matter.
+  group: guest-image
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build and publish
+    runs-on: ubuntu-24.04
+
+    permissions:
+      # To create the release and replace the rolling tag's assets.
+      contents: write
+      # For keyless signing: the OIDC token is what binds the signature to this
+      # workflow in this repository, which is the fact a consumer verifies.
+      id-token: write
+
+    env:
+      IMAGE_NAME: ubuntu-2404-x64
+      # The raw image and the kernel are built here; PUBLISH=no keeps
+      # build-guest-image.sh from wanting a Ceph cluster it cannot have.
+      WORK: /var/tmp/billet-guest
+      PUBLISH: "no"
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v5
+
+      # A HOSTED RUNNER HAS ABOUT 14 GB FREE and this build wants most of it: a
+      # debootstrapped tree, a 4 GB ext4 image on top of it, a kernel source tree
+      # and the compressed outputs. Removing toolchains this build will never use
+      # buys back more than twenty, and doing it FIRST means a disk-full failure
+      # cannot happen halfway through an hour-long build.
+      - name: Reclaim runner disk
+        run: |
+          set -euo pipefail
+
+          before=$(df --output=avail -BG / | tail -1 | tr -dc '0-9')
+
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /usr/local/lib/node_modules \
+            "$AGENT_TOOLSDIRECTORY" || true
+
+          sudo apt-get clean
+
+          after=$(df --output=avail -BG / | tail -1 | tr -dc '0-9')
+
+          echo "reclaimed $((after - before))GB; ${after}GB free"
+
+          # REFUSED EARLY RATHER THAN AT 90%. A build that runs out of disk while
+          # writing the filesystem produces a corrupt image with a successful-
+          # looking build behind it, because the write is the only step that would
+          # have complained.
+          if [ "$after" -lt 20 ]; then
+            echo "only ${after}GB free; this build needs about 20" >&2
+            exit 1
+          fi
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            debootstrap e2fsprogs jq zstd \
+            build-essential flex bison libelf-dev libssl-dev bc
+
+      # THE KERNEL IS CACHED ON ITS OWN INPUTS, not rebuilt weekly. It changes
+      # when its config or its version changes and at no other time, so keying the
+      # cache on exactly those two makes a normal week's build twenty minutes
+      # shorter — and makes the kernel a bit-for-bit constant across the
+      # generations that share it, rather than a fresh build each time whose
+      # differences nobody can account for.
+      - name: Kernel cache
+        id: kernel-cache
+        uses: actions/cache@v4
+        with:
+          path: out/vmlinux
+          key: guest-kernel-${{ hashFiles('scripts/guest-kernel.config', 'scripts/build-guest-kernel.sh') }}
+
+      - name: Build the guest kernel
+        if: steps.kernel-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+
+          mkdir -p out
+          sudo --preserve-env=OUT scripts/build-guest-kernel.sh
+        env:
+          OUT: ${{ github.workspace }}/out/vmlinux
+
+      - name: Build the root filesystem
+        run: |
+          set -euo pipefail
+
+          sudo --preserve-env=IMAGE_NAME,WORK,PUBLISH,RUNNER_VERSION \
+            scripts/build-guest-image.sh
+        env:
+          RUNNER_VERSION: ${{ inputs.runner_version }}
+
+      # COMPRESSED AFTER THE BUILD, NOT DURING. The digest a consumer checks is of
+      # the published bytes, so the compressed file is the artifact and its hash is
+      # computed once, here, over exactly what will be uploaded.
+      - name: Pack and describe
+        id: pack
+        run: |
+          set -euo pipefail
+
+          mkdir -p out
+
+          sudo chown "$(id -u):$(id -g)" "$WORK/$IMAGE_NAME.ext4"
+
+          # --long=27 matches the window the reader must use to decompress. Left
+          # at the default, a 4 GB input compresses fine and then needs a
+          # decompressor willing to allocate the same window — which is exactly the
+          # kind of asymmetry that works on the machine that made it.
+          zstd -19 --long=27 -T0 --force \
+            -o out/rootfs.img.zst "$WORK/$IMAGE_NAME.ext4"
+
+          scripts/write-image-manifest.sh > out/manifest.json
+
+          cat out/manifest.json
+
+          {
+            echo "tag=guest-$(date -u +%Y%m%d-%H%M%S)"
+          } >> "$GITHUB_OUTPUT"
+        env:
+          KERNEL: ${{ github.workspace }}/out/vmlinux
+          ROOTFS: ${{ github.workspace }}/out/rootfs.img.zst
+
+      # THE MANIFEST IS THE ONLY THING SIGNED, and that is sufficient: it carries a
+      # digest for every asset, so one signature transitively covers the four
+      # hundred megabytes without anybody doing public-key arithmetic over them.
+      - name: Sign the manifest
+        if: inputs.publish != false
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign
+        if: inputs.publish != false
+        run: cosign sign-blob --yes --bundle out/manifest.json.bundle out/manifest.json
+
+      # TWO RELEASES, DELIBERATELY. The dated one is history and the thing to pin
+      # to when a rollback is needed; the rolling tag is what an unattended puller
+      # follows. `/releases/latest/` is NOT used for either, because it resolves
+      # across the whole repository and billet's own binary releases would take the
+      # channel over.
+      - name: Publish the dated release
+        if: inputs.publish != false
+        run: |
+          set -euo pipefail
+
+          gh release create "${{ steps.pack.outputs.tag }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Guest image ${{ steps.pack.outputs.tag }}" \
+            --notes-file out/release-notes.md \
+            out/manifest.json out/manifest.json.bundle out/rootfs.img.zst out/vmlinux
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Move the rolling tag
+        if: inputs.publish != false
+        run: |
+          set -euo pipefail
+
+          # CREATED ONCE, THEN ITS ASSETS ARE REPLACED. `--clobber` is what makes
+          # this idempotent; without it the second week's upload fails on a name
+          # that already exists, and the rolling tag silently stops moving while
+          # the dated releases keep appearing — a fleet pinned to an image nobody
+          # noticed had stopped advancing.
+          gh release view guest-latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
+            gh release create guest-latest \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Guest image (current)" \
+              --notes "The image a billet deployment pulls by default. Assets are replaced by each build; see the dated releases for history."
+
+          gh release upload guest-latest \
+            --repo "$GITHUB_REPOSITORY" --clobber \
+            out/manifest.json out/manifest.json.bundle out/rootfs.img.zst out/vmlinux
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      # KEPT EVEN WHEN NOT PUBLISHING, because the reason to run this without
+      # publishing is to inspect what it produced.
+      - name: Upload for inspection
+        if: inputs.publish == false
+        uses: actions/upload-artifact@v4
+        with:
+          name: guest-image
+          path: |
+            out/manifest.json
+            out/rootfs.img.zst
+            out/vmlinux
+          # SHORT, because these are hundreds of megabytes and the default is
+          # ninety days. On a private repository that is billed storage against a
+          # quota this would exhaust within a month.
+          retention-days: 3
