@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -60,9 +61,7 @@ func TestTheGuestAgentReconstructsAnArgvExactly(t *testing.T) {
 			spec := aSpec()
 			spec.Command = tc.command
 
-			p := &Provider{}
-
-			md, err := p.metadata(spec)
+			md, err := metadata(spec)
 			if err != nil {
 				t.Fatalf("metadata: %v", err)
 			}
@@ -104,6 +103,14 @@ func TestTheGuestAgentRefusesMetadataThatIsNotAnArgv(t *testing.T) {
 		{"an array holding a number", `["/bin/sh",7]`},
 		{"an array holding null", `["/bin/sh",null]`},
 		{"an array holding an array", `["/bin/sh",["-c"]]`},
+		// TWO DOCUMENTS, WHICH `jq -e` USED TO ACCEPT. It reads a STREAM and reports
+		// only the last result, so both arrays validated, the records of both were
+		// encoded, and the guest built one argv out of two commands nobody sent.
+		{"two json documents", `["/bin/printf","%s"] ["extra"]`},
+		{"three json documents", `["/a"] ["/b"] ["/c"]`},
+		// A NUL SURVIVES JSON AND DOES NOT SURVIVE BASH. A command substitution
+		// cannot hold one, so the argument would arrive shorter than it was sent.
+		{"an argument carrying a nul", `["/bin/printf","safe\u0000danger"]`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -173,7 +180,7 @@ func agentDecodeBlock(t *testing.T) string {
 
 // runAgentDecode runs the extracted block over one metadata value and returns the argv
 // it built.
-func runAgentDecode(t *testing.T, decode, raw string) ([]string, error) {
+func runAgentDecode(t *testing.T, decode, raw string, pathPrefix ...string) ([]string, error) {
 	t.Helper()
 
 	// MISSING TOOLS FAIL RATHER THAN SKIP. A skip here is indistinguishable from a
@@ -207,6 +214,12 @@ printf '%s\0' "${cmd[@]}"
 	run := exec.CommandContext(t.Context(), "bash", "-c", script)
 	run.Env = append(os.Environ(), "BILLET_AGENT_TEST_RAW="+raw)
 
+	// A SHADOW DIRECTORY IN FRONT OF PATH, so a test can stage a tool that fails the
+	// way a real broken one does.
+	if len(pathPrefix) > 0 {
+		run.Env = append(run.Env, "PATH="+strings.Join(pathPrefix, ":")+":"+os.Getenv("PATH"))
+	}
+
 	var out, errs bytes.Buffer
 
 	run.Stdout = &out
@@ -227,4 +240,58 @@ printf '%s\0' "${cmd[@]}"
 	}
 
 	return argv, nil
+}
+
+// AND A DECODER THAT FAILS STOPS THE AGENT, rather than contributing an empty
+// argument to a command that then runs.
+//
+// `decoded=$(… | base64 -d; printf X)` reports the status of the FINAL printf, which
+// is always 0, so base64 could fail and nothing would notice. `&&` makes the status
+// base64's. Nothing in the ordinary tests can catch that, because jq only ever
+// produces base64 that decodes — so this puts a base64 on PATH that behaves the way a
+// broken one does: some output, then a non-zero exit.
+func TestTheGuestAgentStopsWhenTheDecoderFails(t *testing.T) {
+	t.Parallel()
+
+	decode := agentDecodeBlock(t)
+
+	shadow := t.TempDir()
+
+	stub := "#!/bin/sh\nprintf 'partial'\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(shadow, "base64"), []byte(stub), 0o755); err != nil {
+		t.Fatalf("stage a failing base64: %v", err)
+	}
+
+	got, err := runAgentDecode(t, decode, `["/bin/sh","-c","echo hello"]`, shadow)
+	if err == nil {
+		t.Errorf("the agent ran %q despite its decoder failing", got)
+	}
+}
+
+// AND THE TWO HALVES OF THE CONTRACT ARE THE SAME NUMBER.
+//
+// billet states the contract and the guest agent checks it, and they live in
+// different files in different languages. Bumping one alone is the failure the
+// contract exists to prevent, turned on itself: every guest would refuse every
+// launch, and no test would have said so.
+func TestBothSidesOfTheGuestContractAgree(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join("..", "..", "..", "scripts", "build-guest-image.sh")
+
+	source, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read the guest image build script: %v", err)
+	}
+
+	match := regexp.MustCompile(`(?m)^WANT_CONTRACT=(\S+)$`).FindSubmatch(source)
+	if match == nil {
+		t.Fatalf("%s no longer declares WANT_CONTRACT, so nothing pins the guest to "+
+			"billet's contract", path)
+	}
+
+	if got := string(match[1]); got != GuestContract {
+		t.Errorf("the guest image understands contract %s and billet speaks %s, so every "+
+			"guest built from this script would refuse every launch", got, GuestContract)
+	}
 }

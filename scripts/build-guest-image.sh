@@ -232,9 +232,20 @@ fi
 # failed would hand the runner a TRUNCATED argv, which is worse than no argv at all:
 # `sh -c 'rm -rf x' extra` and `sh -c 'rm -rf x'` are different commands and only one
 # of them was asked for.
-if ! printf '%s' "$raw" |
-	jq -e 'type == "array" and length > 0 and all(.[]; type == "string")' >/dev/null; then
-	log "the command in the metadata is not a non-empty array of strings"
+#
+# --slurp SO THAT "ONE ARGV" MEANS ONE. Without it jq reads a STREAM of documents and
+# `-e` reports only the last one's result, so `["/bin/printf","%s"] ["extra"]` passed
+# validation, encoded the records of BOTH, and produced a command nobody sent.
+#
+# AND NO ARGUMENT MAY CONTAIN A NUL, because a command substitution cannot hold one:
+# bash drops it, so an argument carrying one would arrive SHORTER than it was sent --
+# changed silently, which is the one outcome this whole path exists to prevent. billet
+# refuses these before sending; the guest refuses them again because the argv it runs
+# should depend on what it can actually carry, not on the sender being careful.
+if ! printf '%s' "$raw" | jq -e --slurp '
+	length == 1 and (.[0] | type == "array" and length > 0
+		and all(.[]; type == "string" and (contains("\u0000") | not)))' >/dev/null; then
+	log "the command in the metadata is not a single non-empty array of NUL-free strings"
 	exit 1
 fi
 
@@ -245,7 +256,7 @@ fi
 # reached the guest as `sh -c '…' arg`. That is a different command: `$#` is 1 instead
 # of 2, and a script that tests its argument count takes a different branch. A constant
 # byte in front means the final record always has content for `$()` to keep.
-if ! encoded=$(printf '%s' "$raw" | jq -r '.[] | @base64 | "x" + .'); then
+if ! encoded=$(printf '%s' "$raw" | jq -r --slurp '.[0][] | @base64 | "x" + .'); then
 	log "the command in the metadata could not be encoded for transfer"
 	exit 1
 fi
@@ -274,7 +285,17 @@ done <<<"$encoded"
 # changes the NUMBER of arguments, and the number is something the metadata states
 # independently — so comparing them turns the whole class into a loud failure at the
 # one moment somebody can still act on it.
-want=$(printf '%s' "$raw" | jq 'length')
+want=$(printf '%s' "$raw" | jq --slurp '.[0] | length')
+
+# AND `want` IS PROVED TO BE A NUMBER FIRST. `[ x -ne y ]` on a non-number is an
+# ERROR, not a false -- and an error inside an `if` condition is simply a branch not
+# taken, so the guard would wave through exactly the input it was added to catch.
+case "$want" in
+	'' | *[!0-9]*)
+		log "the command in the metadata does not have a countable number of arguments"
+		exit 1
+		;;
+esac
 
 if [ "${#cmd[@]}" -ne "$want" ]; then
 	log "the command has $want arguments and ${#cmd[@]} came back; refusing to run a"

@@ -485,6 +485,30 @@ func checkSpec(spec provider.Spec) error {
 			"nothing for the guest to exec", spec.Name)
 	}
 
+	// AND THE WHOLE PAYLOAD FITS IN THE SERVICE THAT HAS TO HOLD IT, checked here
+	// rather than discovered at the end of a launch.
+	//
+	// Without this a command large enough to overflow the data store passes every
+	// check, and billet then claims a jail, a uid, a tap and a cloned disk, starts a
+	// VMM, and fails on the PUT that fills the metadata. It unwinds correctly — but a
+	// tier configured that way pays for a full launch on every job to reach the same
+	// refusal, and the refusal names an HTTP request rather than the tier.
+	payload, err := metadata(spec)
+	if err != nil {
+		return err
+	}
+
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("firecracker: encode the metadata for %s: %w", spec.Name, err)
+	}
+
+	if len(encoded) > mmdsSizeLimit {
+		return fmt.Errorf("firecracker: %s needs %d bytes of metadata and the service holds "+
+			"%d, so the guest could never be told what to run", spec.Name, len(encoded),
+			mmdsSizeLimit)
+	}
+
 	for i, arg := range spec.Command {
 		if !utf8.ValidString(arg) {
 			return fmt.Errorf("firecracker: %s has argument %d with bytes that are not valid "+
@@ -529,7 +553,7 @@ func (p *Provider) configure(
 			"the vmm counts in", spec.Name, spec.Memory)
 	}
 
-	metadata, err := p.metadata(spec)
+	md, err := metadata(spec)
 	if err != nil {
 		return err
 	}
@@ -573,7 +597,7 @@ func (p *Provider) configure(
 			"network_interfaces": []string{guestInterface},
 			"ipv4_address":       mmdsAddress,
 		}},
-		{"/mmds", metadata},
+		{"/mmds", md},
 	} {
 		if err := api.put(ctx, step.path, step.body); err != nil {
 			return fmt.Errorf("firecracker: configure %s for %s: %w", step.path, spec.Name, err)
@@ -610,7 +634,7 @@ func (p *Provider) configure(
 // while staying inside what the service can actually hand over. `metadataLeaves` in
 // the tests walks this tree and fails on any leaf that is not a string, so a field
 // added later cannot reintroduce it.
-func (p *Provider) metadata(spec provider.Spec) (map[string]any, error) {
+func metadata(spec provider.Spec) (map[string]any, error) {
 	command, err := json.Marshal(spec.Command)
 	if err != nil {
 		return nil, fmt.Errorf("firecracker: encode command for %s: %w", spec.Name, err)
@@ -653,6 +677,20 @@ func (p *Provider) metadata(spec provider.Spec) (map[string]any, error) {
 // clone of the old generation keeps the agent it booted with, and clone v2 lets the
 // old generation be removed once nothing holds it.
 const GuestContract = "2"
+
+// mmdsSizeLimit is how much the metadata service will hold.
+//
+// MEASURED FROM THE BINARY, not assumed: `firecracker --help` documents
+// `--http-api-max-payload-size` as `[default: "51200"]` and `--mmds-size-limit` as
+// taking that same default when it is not given. billet passes NEITHER flag, so both
+// are in force at 51200 bytes — which is why this is a constant here rather than
+// something read from the configuration.
+//
+// It bounds a runner registration plus a tier's command, and a JIT registration is
+// hundreds of bytes, so nothing ordinary comes close. It exists for the case that is
+// not ordinary, where the alternative is a launch that spends everything and then
+// fails on an HTTP request.
+const mmdsSizeLimit = 51200
 
 // bootArgs is the guest kernel command line.
 //
