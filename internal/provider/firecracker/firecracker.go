@@ -1012,10 +1012,29 @@ func (p *Provider) stopVMM(ctx context.Context, j jail) error {
 		return nil
 	}
 
+	// A REFERENCE TO THE PROCESS, TAKEN BEFORE IT IS CHECKED AND USED FOR EVERY
+	// SIGNAL BELOW.
+	//
+	// vmmPID has already confirmed this pid is the VMM, but confirming and signalling
+	// are two operations: in between, the VMM can exit and the kernel can hand its
+	// number to something else, and this backend signals as root. The handle refers
+	// to the process rather than to the number, so a recycled pid gets ESRCH instead
+	// of a signal meant for a microVM.
+	handle, alive, err := openVMM(pid)
+	if err != nil {
+		return fmt.Errorf("firecracker: stop the microVM %s: %w", j.id, err)
+	}
+
+	if !alive {
+		return nil
+	}
+
+	defer handle.close()
+
 	// SIGTERM FIRST, because firecracker exits cleanly on it — measured — and a
 	// clean exit closes the guest's disk rather than leaving the mapped device to
 	// be torn out from under it.
-	if err := signalVMM(pid, syscall.SIGTERM); err != nil {
+	if err := handle.signal(syscall.SIGTERM); err != nil {
 		return fmt.Errorf("firecracker: stop the microVM %s: %w", j.id, err)
 	}
 
@@ -1043,7 +1062,7 @@ func (p *Provider) stopVMM(ctx context.Context, j jail) error {
 
 	// AND SIGKILL IF IT WILL NOT GO, because the alternative is a microVM holding a
 	// mapped block device open forever while its capacity stays charged.
-	if err := signalVMM(pid, syscall.SIGKILL); err != nil {
+	if err := handle.signal(syscall.SIGKILL); err != nil {
 		return fmt.Errorf("firecracker: kill the microVM %s, which did not stop when asked: %w",
 			j.id, err)
 	}
