@@ -41,12 +41,19 @@ func pidIsVMM(pid int, jailID string) (bool, error) {
 		return false, fmt.Errorf("firecracker: read the command line of pid %d: %w", pid, err)
 	}
 
-	// ARGUMENTS ARE NUL-SEPARATED, so this compares whole ones. A substring match
-	// over the raw bytes would also match a jail id that merely CONTAINS this one —
-	// and lease ids are hex of a fixed length, so that is a prefix relationship
-	// rather than an exotic one.
-	for _, arg := range bytes.Split(raw, []byte{0}) {
-		if string(arg) == jailID {
+	// THE PAIR `--id <jail id>`, NOT THE ID ANYWHERE IN THE LINE. Matching a lone
+	// argument would claim any process that happens to mention this lease — one of
+	// billet's own subprocesses, a shell an operator left open — and what follows a
+	// true answer here is a signal sent as root.
+	//
+	// ARGUMENTS ARE NUL-SEPARATED, so these are whole ones. A substring match over
+	// the raw bytes would also match a jail id that merely CONTAINS this one, and
+	// lease ids are fixed-length hex, so that is a prefix relationship rather than
+	// an exotic one.
+	args := bytes.Split(raw, []byte{0})
+
+	for i, arg := range args {
+		if string(arg) == "--id" && i+1 < len(args) && string(args[i+1]) == jailID {
 			return true, nil
 		}
 	}

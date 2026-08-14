@@ -77,23 +77,29 @@ const (
 	guestRootDisk = "rootdisk"
 )
 
-// resolveExecName is the directory name the jailer will choose for this binary.
+// resolveExec follows a binary's symlinks, returning the real path and the
+// directory name the jailer will derive from it.
 //
-// It follows symlinks, because the jailer does. A path that cannot be resolved is
-// an error rather than a fallback to the basename: the fallback would be silently
-// wrong for exactly the installation layout the reference host uses, and the
-// failure it produces — an empty inventory — is the expensive one.
-func resolveExecName(execFile string) (string, error) {
+// BOTH, AND THE RESOLVED PATH IS WHAT THE JAILER IS GIVEN. The jailer canonicalises
+// --exec-file itself, so handing it the configured symlink would leave billet's
+// pinned name and the jailer's chosen one free to disagree the moment an operator
+// retargeted it mid-run.
+//
+// A path that cannot be resolved is an error rather than a fallback to the
+// basename: the fallback would be silently wrong for exactly the installation
+// layout the reference host uses, and the failure it produces — an empty inventory
+// — is the expensive one.
+func resolveExec(execFile string) (string, string, error) {
 	resolved, err := filepath.EvalSymlinks(execFile)
 	if err != nil {
-		return "", fmt.Errorf("firecracker: resolve %s, which is what the jailer names its "+
+		return "", "", fmt.Errorf("firecracker: resolve %s, which is what the jailer names its "+
 			"chroot after: %w", execFile, err)
 	}
 
 	name := filepath.Base(resolved)
 	if name == "" || name == "." || name == string(filepath.Separator) {
-		return "", fmt.Errorf("firecracker: %s resolves to %s, which has no file name for the "+
-			"jailer to name a chroot after", execFile, resolved)
+		return "", "", fmt.Errorf("firecracker: %s resolves to %s, which has no file name for "+
+			"the jailer to name a chroot after", execFile, resolved)
 	}
 
 	// THE JAILER REQUIRES IT, and finding out at launch is finding out per job. It
@@ -101,11 +107,11 @@ func resolveExecName(execFile string) (string, error) {
 	// deployment that renamed the binary gets one sentence at construction instead
 	// of a failure on every launch.
 	if !strings.Contains(name, "firecracker") {
-		return "", fmt.Errorf("firecracker: %s resolves to %s, and the jailer refuses an "+
+		return "", "", fmt.Errorf("firecracker: %s resolves to %s, and the jailer refuses an "+
 			"--exec-file whose name does not contain \"firecracker\"", execFile, name)
 	}
 
-	return name, nil
+	return resolved, name, nil
 }
 
 // checkSocketPath refuses a layout whose API socket billet could not dial.
