@@ -116,7 +116,7 @@ jobs:
         id: kernel-cache
         uses: actions/cache@v4
         with:
-          path: out/vmlinux
+          path: out/vmlinux-billet
           key: guest-kernel-${{ hashFiles('scripts/guest-kernel.config', 'scripts/build-guest-kernel.sh') }}
 
       - name: Build the guest kernel
@@ -125,9 +125,14 @@ jobs:
           set -euo pipefail
 
           mkdir -p out
+
+          # OUT IS A DIRECTORY, and the script writes $OUT/vmlinux-billet into
+          # it alongside the config it was built from. Passing a FILE path here
+          # would create a directory of that name and hide the kernel inside it,
+          # which the cache would then happily preserve.
           sudo --preserve-env=OUT scripts/build-guest-kernel.sh
         env:
-          OUT: ${{ github.workspace }}/out/vmlinux
+          OUT: ${{ github.workspace }}/out
 
       - name: Build the root filesystem
         run: |
@@ -150,33 +155,66 @@ jobs:
 
           sudo chown "$(id -u):$(id -g)" "$WORK/$IMAGE_NAME.ext4"
 
-          # --long=27 matches the window the reader must use to decompress. Left
-          # at the default, a 4 GB input compresses fine and then needs a
-          # decompressor willing to allocate the same window — which is exactly the
-          # kind of asymmetry that works on the machine that made it.
-          zstd -19 --long=27 -T0 --force \
+          # THE DEFAULT WINDOW, DELIBERATELY. `--long=27` compresses a little
+          # better and requires every DECOMPRESSOR to allocate a 128 MB window --
+          # a constraint on every future reader, including Go libraries that cap
+          # the window by default and would fail on an image that packed fine on
+          # the machine that made it. The few percent is not worth an asymmetry
+          # that only shows up on somebody else's node.
+          zstd -19 -T0 --force \
             -o out/rootfs.img.zst "$WORK/$IMAGE_NAME.ext4"
 
           scripts/write-image-manifest.sh > out/manifest.json
 
           cat out/manifest.json
 
+          # THE NOTES ARE BUILT FROM THE MANIFEST, so they cannot describe an
+          # image other than the one being published. An earlier version passed
+          # --notes-file for a file nothing wrote, which fails the publish step
+          # after the whole build has already run.
+          {
+            echo "Guest image for billet's firecracker backend."
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Runner | \`$(jq -r .runner_version out/manifest.json)\` |"
+            echo "| Kernel | \`$(jq -r .kernel.version out/manifest.json)\` |"
+            echo "| Guest contract | \`$(jq -r .guest_contract out/manifest.json)\` |"
+            echo "| Architecture | \`$(jq -r .arch out/manifest.json)\` |"
+            echo "| Built | $(jq -r .built_at out/manifest.json) |"
+            echo
+            echo "Pulled by \`billet images pull\`, which verifies the manifest"
+            echo "signature and each asset's digest before anything reaches the cluster."
+            echo
+            echo "Assets are also published to the rolling \`guest-latest\` tag."
+          } > out/release-notes.md
+
           {
             echo "tag=guest-$(date -u +%Y%m%d-%H%M%S)"
           } >> "$GITHUB_OUTPUT"
         env:
-          KERNEL: ${{ github.workspace }}/out/vmlinux
+          KERNEL: ${{ github.workspace }}/out/vmlinux-billet
           ROOTFS: ${{ github.workspace }}/out/rootfs.img.zst
 
       # THE MANIFEST IS THE ONLY THING SIGNED, and that is sufficient: it carries a
       # digest for every asset, so one signature transitively covers the four
       # hundred megabytes without anybody doing public-key arithmetic over them.
-      - name: Sign the manifest
-        if: inputs.publish != false
+      - name: Install cosign
+        # NOT `inputs.publish != false`. On a SCHEDULED run `inputs` is undefined,
+        # so `inputs.publish` is the empty string -- and github casts both '' and
+        # false to 0 when comparing across types, making the condition FALSE. The
+        # weekly build would have run for an hour and published nothing, silently,
+        # which is the one failure this workflow exists to prevent.
+        if: github.event_name != 'workflow_dispatch' || inputs.publish
         uses: sigstore/cosign-installer@v3
 
-      - name: Sign
-        if: inputs.publish != false
+      - name: Sign the manifest
+        # NOT `inputs.publish != false`. On a SCHEDULED run `inputs` is undefined,
+        # so `inputs.publish` is the empty string -- and github casts both '' and
+        # false to 0 when comparing across types, making the condition FALSE. The
+        # weekly build would have run for an hour and published nothing, silently,
+        # which is the one failure this workflow exists to prevent.
+        if: github.event_name != 'workflow_dispatch' || inputs.publish
         run: cosign sign-blob --yes --bundle out/manifest.json.bundle out/manifest.json
 
       # TWO RELEASES, DELIBERATELY. The dated one is history and the thing to pin
@@ -185,7 +223,12 @@ jobs:
       # across the whole repository and billet's own binary releases would take the
       # channel over.
       - name: Publish the dated release
-        if: inputs.publish != false
+        # NOT `inputs.publish != false`. On a SCHEDULED run `inputs` is undefined,
+        # so `inputs.publish` is the empty string -- and github casts both '' and
+        # false to 0 when comparing across types, making the condition FALSE. The
+        # weekly build would have run for an hour and published nothing, silently,
+        # which is the one failure this workflow exists to prevent.
+        if: github.event_name != 'workflow_dispatch' || inputs.publish
         run: |
           set -euo pipefail
 
@@ -193,12 +236,17 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --title "Guest image ${{ steps.pack.outputs.tag }}" \
             --notes-file out/release-notes.md \
-            out/manifest.json out/manifest.json.bundle out/rootfs.img.zst out/vmlinux
+            out/manifest.json out/manifest.json.bundle out/rootfs.img.zst out/vmlinux-billet
         env:
           GH_TOKEN: ${{ github.token }}
 
       - name: Move the rolling tag
-        if: inputs.publish != false
+        # NOT `inputs.publish != false`. On a SCHEDULED run `inputs` is undefined,
+        # so `inputs.publish` is the empty string -- and github casts both '' and
+        # false to 0 when comparing across types, making the condition FALSE. The
+        # weekly build would have run for an hour and published nothing, silently,
+        # which is the one failure this workflow exists to prevent.
+        if: github.event_name != 'workflow_dispatch' || inputs.publish
         run: |
           set -euo pipefail
 
@@ -215,21 +263,22 @@ jobs:
 
           gh release upload guest-latest \
             --repo "$GITHUB_REPOSITORY" --clobber \
-            out/manifest.json out/manifest.json.bundle out/rootfs.img.zst out/vmlinux
+            out/manifest.json out/manifest.json.bundle out/rootfs.img.zst out/vmlinux-billet
         env:
           GH_TOKEN: ${{ github.token }}
 
       # KEPT EVEN WHEN NOT PUBLISHING, because the reason to run this without
       # publishing is to inspect what it produced.
       - name: Upload for inspection
-        if: inputs.publish == false
+        # The mirror of the condition above, spelled the same explicit way.
+        if: github.event_name == 'workflow_dispatch' && !inputs.publish
         uses: actions/upload-artifact@v4
         with:
           name: guest-image
           path: |
             out/manifest.json
             out/rootfs.img.zst
-            out/vmlinux
+            out/vmlinux-billet
           # SHORT, because these are hundreds of megabytes and the default is
           # ninety days. On a private repository that is billed storage against a
           # quota this would exhaust within a month.
