@@ -37,6 +37,7 @@ import (
 	"github.com/junioryono/billet/internal/provider"
 	"github.com/junioryono/billet/internal/provider/docker"
 	"github.com/junioryono/billet/internal/provider/ec2"
+	"github.com/junioryono/billet/internal/provider/firecracker"
 	"github.com/junioryono/billet/internal/scaleset"
 	"github.com/junioryono/billet/internal/server"
 	"github.com/junioryono/billet/internal/state"
@@ -743,8 +744,8 @@ func serverHostname(addr string) (string, error) {
 
 // newProvider builds the compute backend this host runs.
 //
-// docker and ec2 exist. firecracker needs Linux and /dev/kvm and tart needs Apple
-// Silicon — each is a separate implementation of the same interface, and each is
+// docker, ec2 and firecracker exist. tart needs Apple Silicon and a licence
+// carve-out — each is a separate implementation of the same interface, and it is
 // refused explicitly rather than falling through to something that happens to
 // compile.
 func newProvider(cfg *config.Config, deployment string) (provider.Provider, error) {
@@ -768,11 +769,35 @@ func newProvider(cfg *config.Config, deployment string) (provider.Provider, erro
 
 		return ec2.New(deployment, *cfg.Node.EC2, ec2.WithLogger(slog.Default()))
 
-	case config.ProviderFirecracker, config.ProviderTart:
-		return nil, fmt.Errorf("%w: the %s provider is not built yet; billet currently runs the "+
-			"docker backend, which shares the host kernel and is for trials rather than for "+
-			"untrusted work, and the ec2 backend, which launches one instance per job",
-			errNotImplemented, cfg.Node.Provider)
+	case config.ProviderFirecracker:
+		// BOTH BLOCKS ARE GUARANTEED BY VALIDATION — node.ceph is required for this
+		// backend and refused for every other, and node.firecracker likewise — so
+		// these are the guards that keep that true rather than cases that happen.
+		if cfg.Node.Firecracker == nil {
+			return nil, errors.New("billet: node.firecracker is missing; the provider is firecracker")
+		}
+
+		if cfg.Node.Ceph == nil {
+			return nil, errors.New("billet: node.ceph is missing; every guest boots from a clone " +
+				"of a golden image in the site's cluster")
+		}
+
+		// THE STORAGE IS BUILT HERE AND HANDED IN, because a provider and a store
+		// are siblings that may not import each other. This is the one place that
+		// knows about both.
+		store, err := ceph.New(*cfg.Node.Ceph)
+		if err != nil {
+			return nil, err
+		}
+
+		return firecracker.New(deployment, *cfg.Node.Firecracker, store,
+			firecracker.WithLogger(slog.Default()))
+
+	case config.ProviderTart:
+		return nil, fmt.Errorf("%w: the tart provider is not built yet; billet currently runs the "+
+			"firecracker backend on bare metal, the ec2 backend, which launches one instance per "+
+			"job, and the docker backend, which shares the host kernel and is for trials",
+			errNotImplemented)
 
 	default:
 		return nil, fmt.Errorf("billet: unknown provider %q", cfg.Node.Provider)
@@ -1649,6 +1674,17 @@ func cmdCheck(ctx context.Context, args []string) error {
 				return err
 			}
 		}
+
+		// AFTER THE STORAGE, because the storage belongs to the SITE and this belongs
+		// to the machine: a cluster a host cannot reach is wrong for every node there,
+		// while a missing /dev/kvm is wrong for this one. An operator reading a wall
+		// of output acts on the first thing it names, and the shared fault is the more
+		// useful one to name first.
+		if cfg.Node.Provider == config.ProviderFirecracker && cfg.Node.Firecracker != nil {
+			if err := checkFirecrackerHost(ctx, cfg); err != nil {
+				return err
+			}
+		}
 	}
 
 	// Per-host policy decides what each machine may run and how many macOS
@@ -1832,6 +1868,75 @@ func checkEC2Credentials(ctx context.Context, cfg *config.EC2Config) error {
 
 	return nil
 }
+
+// checkFirecrackerHost proves this machine can act on its microVM configuration.
+//
+// THE SAME DISTINCTION checkPrivateKey AND checkEC2Credentials MAKE. Config
+// validation proves the block is coherent; it cannot prove firecracker is
+// installed, that /dev/kvm can be opened, that the jail account exists or that the
+// bridge does. A node that is wrong about any of those validates perfectly and
+// then fails on the first job of the day.
+//
+// FATAL, because only a firecracker node reaches here, so this file describes a
+// machine that is meant to run jobs and cannot. Reporting it and exiting zero would
+// make `billet check` say a host is fine when nothing on it can launch.
+func checkFirecrackerHost(ctx context.Context, cfg *config.Config) error {
+	// A PROVIDER BUILT PURELY TO ASK, so the preflight exercises the constructor an
+	// operator's node will use — including the two rules that are easiest to get
+	// wrong and invisible afterwards: which directory the jailer will name after
+	// this binary, and whether a socket under it would fit in a unix address.
+	//
+	// The storage is not consulted here; checkCephCluster does that on its own, and
+	// a nil disk would make this refuse for the wrong reason.
+	p, err := firecracker.New(deploymentForCheck, *cfg.Node.Firecracker, noRootDisk{})
+	if err != nil {
+		return err
+	}
+
+	report, err := p.CheckHost(ctx)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("microvm  %s, %s\n", report.Firecracker, report.Jailer)
+	fmt.Printf("         jails in %s, as %s (uid %d)\n",
+		report.JailDir, report.JailUser, report.UID)
+
+	untrusted := "untrusted work will be refused: no untrusted_bridge"
+	if report.UntrustedBridge != "" {
+		untrusted = "untrusted work runs on " + report.UntrustedBridge
+	}
+
+	fmt.Printf("         guests on %s; %s\n", report.Bridge, untrusted)
+
+	// SAID, BECAUSE THE CHECK IS NARROWER THAN IT LOOKS. Opening /dev/kvm says
+	// nothing about the jailer's ability to chroot, mknod or place a cgroup, all of
+	// which need root — and an operator who reads "ok" and then watches every
+	// launch fail has been misled by this line.
+	fmt.Printf("         (read only — launching also needs root, to chroot, to create the root " +
+		"disk's device node inside the jail, and to attach a tap to the bridge)\n")
+
+	return nil
+}
+
+// deploymentForCheck identifies nothing. The provider requires a deployment because
+// it marks the jails it creates with one, and this constructs a provider only to
+// ask it questions about the host.
+const deploymentForCheck = "billet-preflight"
+
+// noRootDisk stands in for the storage a preflight does not use.
+//
+// The provider refuses a nil one — every guest boots from a clone, so a nil
+// interface would panic on the first job — and `billet check` proves the cluster
+// separately, through the ceph client, where the diagnostic is about storage rather
+// than about microVMs.
+type noRootDisk struct{}
+
+func (noRootDisk) CloneRoot(context.Context, string, string) (string, error) {
+	return "", errors.New("billet: the preflight does not clone a root disk")
+}
+
+func (noRootDisk) DiscardRoot(context.Context, string) error { return nil }
 
 // checkCephCluster proves this machine can act on its storage configuration.
 //

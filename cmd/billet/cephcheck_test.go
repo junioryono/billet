@@ -135,6 +135,7 @@ node:
   state_dir: %s
   firecracker:
     kernel_image: /var/lib/billet/vmlinux
+    bridge: br0
   ceph:
     image_pool: billet-images
     cache_pool: billet-cache
