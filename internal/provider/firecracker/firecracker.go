@@ -89,14 +89,10 @@ type Provider struct {
 	execPath string
 	execName string
 
-	// uid and gid are what the jailer drops the VMM to.
-	uid, gid int
-
-	run      runner
-	mknod    mknodFunc
-	chown    chownFunc
-	apiFor   func(socket string) *vmmAPI
-	jailUser func(name string) (int, int, error)
+	run    runner
+	mknod  mknodFunc
+	chown  chownFunc
+	apiFor func(socket string) *vmmAPI
 	// pidOwner reports whether a pid is still a jail's VMM. A seam because it
 	// reads /proc, and because the rule it enforces — never signal a pid billet
 	// could not tie to this microVM — is only testable if "could not tell" can be
@@ -158,14 +154,6 @@ func withPidOwner(f func(pid int, jailID string) (bool, error)) Option {
 	}
 }
 
-// withJailUser replaces the account lookup, for a test that has no such account
-// and must not need root to run.
-func withJailUser(uid, gid int) Option {
-	return func(p *Provider) {
-		p.jailUser = func(string) (int, int, error) { return uid, gid, nil }
-	}
-}
-
 // WithBootWait bounds how long Launch waits for a new VMM to answer.
 func WithBootWait(d time.Duration) Option {
 	return func(p *Provider) {
@@ -223,7 +211,6 @@ func New(owner string, cfg config.FirecrackerConfig, disk RootDisk, opts ...Opti
 		mknod:    mknodBlock,
 		chown:    chownTree,
 		apiFor:   newVMMAPI,
-		jailUser: lookupJailUser,
 		pidOwner: pidIsVMM,
 		bootWait: DefaultBootWait,
 	}
@@ -238,12 +225,7 @@ func New(owner string, cfg config.FirecrackerConfig, disk RootDisk, opts ...Opti
 		return nil, errors.New("firecracker: WithLogger was given no logger")
 	}
 
-	uid, gid, err := p.jailUser(cfg.JailUser)
-	if err != nil {
-		return nil, err
-	}
-
-	p.uid, p.gid = uid, gid
+	var err error
 
 	if p.execPath, p.execName, err = resolveExec(cfg.BinaryPath); err != nil {
 		return nil, err
@@ -351,11 +333,27 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*Instance, e
 		return nil, err
 	}
 
+	// THE HOST'S SCARCE THINGS, TAKEN AND WRITTEN DOWN BEFORE ANYTHING USES THEM.
+	// A uid and a device name are allocated rather than derived, so teardown can only
+	// find them again by reading what this recorded — and it has to be readable
+	// before the first thing that would need releasing exists.
+	res, err := p.claimResources(j)
+	if err != nil {
+		return nil, errors.Join(err, j.remove())
+	}
+
 	device, err := p.disk.CloneRoot(ctx, spec.Image, spec.Name)
 	if err != nil {
+		// A CLONE ERROR DOES NOT PROVE NO CLONE EXISTS. `rbd clone` can be killed by
+		// a cancelled context after the cluster has already created the image, and
+		// the map-failure path says outright that it may leave one behind. Removing
+		// the jail without discarding would then leave a cache-pool image with
+		// nothing on the host carrying its name — which is the unattributable orphan
+		// claiming the jail first exists to prevent, reached through a caller's
+		// timeout instead of a crash.
 		return nil, errors.Join(
 			fmt.Errorf("firecracker: root disk for %s: %w", spec.Name, err),
-			j.remove())
+			p.unwind(ctx, j, spec, res, err))
 	}
 
 	// FROM HERE EVERY FAILURE UNWINDS WHAT IT MADE, in reverse order, and says so if
@@ -363,9 +361,9 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*Instance, e
 	// something started" and asks Find — so this is not the safety net, it is the
 	// ordinary case being tidy. What it must never do is replace the reason the
 	// launch failed with the reason a cleanup failed.
-	inst, err := p.launch(ctx, j, spec, device)
+	inst, err := p.launch(ctx, j, spec, device, res)
 	if err != nil {
-		return nil, errors.Join(err, p.unwind(ctx, j, spec, err))
+		return nil, errors.Join(err, p.unwind(ctx, j, spec, res, err))
 	}
 
 	p.log.Info("launched a microVM", "runner", spec.Name, "vcpu", spec.VCPU,
@@ -376,19 +374,17 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*Instance, e
 
 // launch does the work Launch unwinds on failure.
 func (p *Provider) launch(
-	ctx context.Context, j jail, spec provider.Spec, device string,
+	ctx context.Context, j jail, spec provider.Spec, device string, res resources,
 ) (*Instance, error) {
-	if err := p.build(j, device); err != nil {
+	if err := p.build(j, device, res); err != nil {
 		return nil, err
 	}
 
-	tap := tapName(spec.Name)
-
-	if err := p.addTap(ctx, tap, p.bridgeFor(spec.Trust)); err != nil {
+	if err := p.addTap(ctx, res.Tap, p.bridgeFor(spec.Trust), res.UID); err != nil {
 		return nil, err
 	}
 
-	if err := p.startVMM(ctx, j); err != nil {
+	if err := p.startVMM(ctx, j, res); err != nil {
 		return nil, err
 	}
 
@@ -397,7 +393,7 @@ func (p *Provider) launch(
 		return nil, err
 	}
 
-	if err := p.configure(ctx, api, spec, tap); err != nil {
+	if err := p.configure(ctx, api, spec, res.Tap); err != nil {
 		return nil, err
 	}
 
@@ -591,8 +587,8 @@ const guestInterface = "eth0"
 const mmdsAddress = "169.254.169.254"
 
 // startVMM runs the jailer, which chroots, drops privileges and execs the VMM.
-func (p *Provider) startVMM(ctx context.Context, j jail) error {
-	if _, err := p.run(ctx, p.cfg.JailerPath, p.jailerArgs(j)); err != nil {
+func (p *Provider) startVMM(ctx context.Context, j jail, res resources) error {
+	if _, err := p.run(ctx, p.cfg.JailerPath, p.jailerArgs(j, res)); err != nil {
 		return fmt.Errorf("firecracker: start the jailer for %s: %w", j.id, err)
 	}
 
@@ -613,12 +609,12 @@ func (p *Provider) startVMM(ctx context.Context, j jail) error {
 // The value is cpu.weight at its default of 100, which changes nothing. The vCPU
 // and memory a guest gets are set on the VMM itself, where the ledger's numbers
 // belong; this is about the cgroup EXISTING.
-func (p *Provider) jailerArgs(j jail) []string {
+func (p *Provider) jailerArgs(j jail, res resources) []string {
 	return []string{
 		"--id", j.id,
 		"--exec-file", p.execPath,
-		"--uid", strconv.Itoa(p.uid),
-		"--gid", strconv.Itoa(p.gid),
+		"--uid", strconv.Itoa(res.UID),
+		"--gid", strconv.Itoa(res.GID),
 		"--chroot-base-dir", p.cfg.ChrootBase,
 		"--cgroup-version", "2",
 		"--cgroup", "cpu.weight=100",
@@ -746,12 +742,21 @@ func (p *Provider) Destroy(ctx context.Context, id string) error {
 	}
 
 	if !found {
-		// No jail under any of this host's chroot directories. There is nothing to
-		// stop and nothing to unlink — but the root disk is named after the lease
-		// rather than after the jail, so it is still discarded. That is the case
-		// where a launch died between cloning and claiming, and the clone is the
-		// only thing it left.
-		return p.discardWith(ctx, id, nil)
+		// NO JAIL, BUT NOT NECESSARILY NOTHING. The root disk is named after the
+		// lease rather than after the jail, and a device name is recorded in a claim
+		// that outlives the jail it named — so a Destroy that removed the jail and
+		// then failed its discard would otherwise converge to "success" with a tap
+		// still attached to the bridge and a uid still held. Nothing enumerates
+		// network devices looking for orphans, so it would stay there.
+		var failures []error
+
+		if orphan, err := p.claimedBy(id); err != nil {
+			failures = append(failures, err)
+		} else if err := p.releaseOrphaned(ctx, orphan); err != nil {
+			failures = append(failures, err)
+		}
+
+		return p.discardWith(ctx, id, failures)
 	}
 
 	// NOT THIS DEPLOYMENT'S IS NOT THIS DEPLOYMENT'S TO DESTROY. Find refuses to
@@ -781,9 +786,18 @@ func (p *Provider) Destroy(ctx context.Context, id string) error {
 		return err
 	}
 
+	res, err := resourcesOf(j)
+	if err != nil {
+		return err
+	}
+
 	var failures []error
 
-	if err := p.deleteTap(ctx, tapName(id)); err != nil {
+	if err := p.deleteTap(ctx, res.Tap); err != nil {
+		failures = append(failures, err)
+	}
+
+	if err := p.removeCgroup(j); err != nil {
 		failures = append(failures, err)
 	}
 
@@ -792,6 +806,12 @@ func (p *Provider) Destroy(ctx context.Context, id string) error {
 	// acting on live compute — and stopping at the first would leave a mapped block
 	// device behind because a network device would not go.
 	if err := j.remove(); err != nil {
+		failures = append(failures, err)
+	}
+
+	// AFTER THE JAIL. Releasing a claim while the jail still names it would let
+	// another launch take the uid a VMM may still be running as.
+	if err := p.releaseResources(res); err != nil {
 		failures = append(failures, err)
 	}
 
@@ -988,7 +1008,9 @@ const exitWait = 5 * time.Second
 // and dropped: a root disk that could not be discarded is pool space nothing will
 // reclaim, and a caller deciding whether to hold a lease in custody needs to know
 // the difference between "nothing started" and "something may still be here".
-func (p *Provider) unwind(ctx context.Context, j jail, spec provider.Spec, cause error) error {
+func (p *Provider) unwind(
+	ctx context.Context, j jail, spec provider.Spec, res resources, cause error,
+) error {
 	// A FRESH CONTEXT, because the usual reason a launch failed is that the
 	// caller's was cancelled — and asking a cancelled context to clean up
 	// guarantees the cleanup fails too.
@@ -1004,16 +1026,26 @@ func (p *Provider) unwind(ctx context.Context, j jail, spec provider.Spec, cause
 		return err
 	}
 
-	// NOT THE TAP THIS LAUNCH DID NOT CREATE. A collision on the truncated name
-	// belongs to another lease's running guest, and removing it would cut that
-	// guest's network over a launch failure somewhere else.
+	// NOT A DEVICE THIS LAUNCH DID NOT CREATE. billet allocates the name, so a
+	// collision means something outside billet holds it — and removing it would cut
+	// the network out from under whatever that is, over a launch failure elsewhere.
 	if !errors.Is(cause, errTapTaken) {
-		if err := p.deleteTap(ctx, tapName(spec.Name)); err != nil {
+		if err := p.deleteTap(ctx, res.Tap); err != nil {
 			failures = append(failures, err)
 		}
 	}
 
+	if err := p.removeCgroup(j); err != nil {
+		failures = append(failures, err)
+	}
+
 	if err := j.remove(); err != nil {
+		failures = append(failures, err)
+	}
+
+	// AFTER THE JAIL, because releasing a claim while the jail still names it would
+	// let another launch take the uid a live VMM is running as.
+	if err := p.releaseResources(res); err != nil {
 		failures = append(failures, err)
 	}
 

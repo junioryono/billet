@@ -1899,8 +1899,8 @@ func checkFirecrackerHost(ctx context.Context, cfg *config.Config) error {
 	}
 
 	fmt.Printf("microvm  %s, %s\n", report.Firecracker, report.Jailer)
-	fmt.Printf("         jails in %s, as %s (uid %d)\n",
-		report.JailDir, report.JailUser, report.UID)
+	fmt.Printf("         jails in %s, one uid per guest from %d (%d available)\n",
+		report.JailDir, report.JailUIDMin, report.JailUIDCount)
 
 	untrusted := "untrusted work will be refused: no untrusted_bridge"
 	if report.UntrustedBridge != "" {

@@ -1,6 +1,7 @@
 package firecracker
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -59,6 +60,18 @@ func (j jail) socket() string { return filepath.Join(j.root(), "run", "firecrack
 // docker backend's owner LABEL and the ec2 backend's owner TAG do, in the only
 // place this backend has to write one.
 func (j jail) ownerFile() string { return filepath.Join(j.dir(), "billet-owner") }
+
+// resourceFile records what the HOST allocated for this microVM — its uid, its gid
+// and its network device — as opposed to what its lease implies.
+//
+// OUTSIDE THE CHROOT, like the owner marker, and for a sharper reason: the uid in it
+// is the account the VMM runs as, so a VMM that could rewrite this file could make
+// teardown release somebody else's uid or delete somebody else's device.
+//
+// WRITTEN DOWN BECAUSE IT CANNOT BE DERIVED. A device name that fits the kernel's
+// 15-character limit cannot encode a 32-character lease id, so it is ALLOCATED — and
+// an allocated name is one teardown can only find again by having recorded it.
+func (j jail) resourceFile() string { return filepath.Join(j.dir(), "billet-resources") }
 
 // pidFile is where the jailer records the VMM's process id. Named after the
 // resolved binary, like the chroot directory, and for the same reason.
@@ -190,6 +203,18 @@ func (p *Provider) claim(j jail) error {
 			filepath.Dir(j.dir()), err)
 	}
 
+	// EVERY DIRECTORY A JAILER HAS BUILT IN, not just this binary's. The Mkdir below
+	// is atomic and is what settles a race between two launches of one lease, but it
+	// only sees the CURRENT exec directory — so after a binary bump a lease whose
+	// old jail survived would be allowed a second one, and then two jails share one
+	// clone name and one device while Find and Destroy act on whichever sorts first.
+	if existing, found, err := p.findJail(j.id); err != nil {
+		return err
+	} else if found {
+		return fmt.Errorf("firecracker: %w: %s already exists, and the jailer cannot reuse it",
+			ErrJailExists, existing.dir())
+	}
+
 	if err := os.Mkdir(j.dir(), 0o755); err != nil {
 		if errors.Is(err, os.ErrExist) {
 			// Reusing an id whose chroot survived fails inside the jailer with
@@ -206,30 +231,36 @@ func (p *Provider) claim(j jail) error {
 	return p.writeOwner(j)
 }
 
-func (p *Provider) build(j jail, device string) error {
+func (p *Provider) build(j jail, device string, res resources) error {
 	if err := os.MkdirAll(j.root(), 0o700); err != nil {
 		return fmt.Errorf("firecracker: create the jail at %s: %w", j.root(), err)
 	}
 
-	if err := p.placeKernel(j); err != nil {
+	if err := p.mknod(j.rootDiskPath(), device, res.UID, res.GID); err != nil {
 		return err
 	}
 
-	if err := p.mknod(j.rootDiskPath(), device, p.uid, p.gid); err != nil {
-		return err
-	}
-
-	// THE CHROOT, AFTER EVERYTHING IN IT IS IN PLACE. The jailer drops to this uid
-	// before exec and the VMM writes its log and its socket in here, so the
+	// THE CHROOT, AFTER EVERYTHING IN IT THAT THE VMM MUST OWN. The jailer drops to
+	// this uid before exec and the VMM writes its log and its socket in here, so the
 	// directory has to be the account's — and chowning as each file appeared would
 	// leave a window where a partly-built jail is already writable by it.
+	if err := p.chown(j.root(), res.UID, res.GID); err != nil {
+		return err
+	}
+
+	// AND THE KERNEL LAST, AFTER THE CHOWN, WHICH IS THE WHOLE REASON FOR THE ORDER.
 	//
-	// THE CHROOT, NOT THE JAIL. Two things above it stay owned by the account that
-	// installed them: the guest kernel, because it is a hard LINK to the operator's
-	// only copy and giving away a link gives away the inode; and the owner marker,
-	// which is the fact List and Find trust when they decide whose microVM this is.
-	// Neither is something a VMM has any reason to write to.
-	return p.chown(j.root(), p.uid, p.gid)
+	// It is placed as a hard LINK to the operator's only copy, so it is the same
+	// inode — and chowning a link chowns the file. Handing it to the jail uid would
+	// give the account every VMM runs as the power to chmod and rewrite the kernel
+	// that every later microVM on the host boots, persistently, without ever leaving
+	// the chroot.
+	//
+	// An earlier version narrowed the chown from the jail to the chroot believing
+	// that protected it. It did not: the kernel lives INSIDE the chroot, because the
+	// VMM has to open it by a path under its own root. Placing it afterwards is what
+	// actually keeps it, and the preflight proves it is readable without being owned.
+	return p.placeKernel(j)
 }
 
 // writeOwner records the deployment this jail belongs to.
@@ -239,6 +270,46 @@ func (p *Provider) writeOwner(j jail) error {
 	}
 
 	return nil
+}
+
+// writeResources records what a microVM was allocated.
+func (p *Provider) writeResources(j jail, res resources) error {
+	encoded, err := json.Marshal(res)
+	if err != nil {
+		return fmt.Errorf("firecracker: encode the resources of %s: %w", j.id, err)
+	}
+
+	if err := os.WriteFile(j.resourceFile(), append(encoded, '\n'), 0o600); err != nil {
+		return fmt.Errorf("firecracker: record what %s was allocated: %w", j.id, err)
+	}
+
+	return nil
+}
+
+// resourcesOf reads what a microVM was allocated.
+//
+// AN ABSENT FILE IS THE ZERO VALUE AND NOT AN ERROR, because a launch is interrupted
+// between claiming a jail and filling it far more easily than the file is corrupted —
+// and teardown must still be able to remove a jail that never got that far. A file
+// that is THERE and unreadable is an error: something was allocated and billet cannot
+// tell what, so releasing nothing is better than releasing a guess.
+func resourcesOf(j jail) (resources, error) {
+	raw, err := os.ReadFile(j.resourceFile())
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return resources{}, nil
+		}
+
+		return resources{}, fmt.Errorf("firecracker: read what %s was allocated: %w", j.id, err)
+	}
+
+	var res resources
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return resources{}, fmt.Errorf("firecracker: %s does not hold a resource record billet "+
+			"wrote", j.resourceFile())
+	}
+
+	return res, nil
 }
 
 // ownerOf reads the deployment a jail belongs to.

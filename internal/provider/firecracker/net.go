@@ -4,45 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
-
-	"github.com/junioryono/billet/internal/provider"
 )
 
-// tapName is the host network device a microVM's interface is backed by.
-//
-// DERIVED FROM THE LEASE RATHER THAN STORED, for the same reason the instance name
-// is: teardown has to find it again after a crash with nothing but the id, and a
-// side table that has to survive that is a side table that will not.
-//
-// TRUNCATED, BECAUSE A NETWORK DEVICE NAME CANNOT HOLD A LEASE ID. The kernel's
-// limit is 15 characters and `billet-` plus 32 hex digits is 39, so this keeps a
-// prefix. That trades a guarantee for a probability: two concurrent leases sharing
-// their first 13 hex digits would collide, which is 52 bits, and the collision is
-// LOUD rather than silent — `ip tuntap add` refuses a name that exists, so the
-// second launch fails instead of quietly attaching two guests to one device.
-func tapName(instance string) string {
-	lease, ours := provider.LeaseOf(instance)
-	if !ours {
-		// Not reachable through Launch, which refuses such a name outright. Kept
-		// total anyway: this function is also called on the teardown path, where
-		// returning something derived from whatever it was given beats a panic in a
-		// control plane that bans them.
-		lease = instance
-	}
-
-	name := tapPrefix + lease
-	if len(name) > maxIfName {
-		name = name[:maxIfName]
-	}
-
-	return name
-}
-
-// tapPrefix marks a device as billet's on a host that may have others.
-const tapPrefix = "bt"
-
-// maxIfName is the kernel's IFNAMSIZ limit, less the terminator.
+// maxIfName is the kernel's IFNAMSIZ limit, less the terminator. Every device name
+// billet allocates has to fit inside it.
 const maxIfName = 15
 
 // addTap creates the host end of a guest's network and attaches it to a bridge.
@@ -55,7 +22,7 @@ const maxIfName = 15
 // `user` HANDS IT TO THE JAILED ACCOUNT. Without it the device belongs to root and
 // the dropped VMM cannot open it, which produces the identical error from the
 // opposite cause.
-func (p *Provider) addTap(ctx context.Context, tap, bridge string) error {
+func (p *Provider) addTap(ctx context.Context, tap, bridge string, uid int) error {
 	if bridge == "" {
 		// Unreachable via Launch — Accepts refuses untrusted work with no bridge and
 		// config validation requires the trusted one — so this is the guard that
@@ -64,19 +31,18 @@ func (p *Provider) addTap(ctx context.Context, tap, bridge string) error {
 	}
 
 	if _, err := p.run(ctx, ipBinary, []string{
-		"tuntap", "add", "dev", tap, "mode", "tap", "user", fmt.Sprint(p.uid),
+		"tuntap", "add", "dev", tap, "mode", "tap", "user", strconv.Itoa(uid),
 	}); err != nil {
 		// A NAME THAT IS TAKEN IS SOMEBODY ELSE'S DEVICE, AND ITS OWN ERROR.
 		//
-		// The tap name truncates the lease id to fit the kernel's limit, so a
-		// collision between two live leases is possible and is deliberately loud —
-		// `ip tuntap add` refuses a name that exists. But the launch that loses
-		// must not then unwind it: deleting the device would cut the network out
-		// from under the OTHER lease's running guest, turning a refused launch into
-		// a broken job somewhere else.
+		// billet ALLOCATES this name rather than deriving it, so two of its own
+		// microVMs cannot contend for one — reaching here means something outside
+		// billet holds the name, or a claim outlived the device it named. Either
+		// way the launch that loses must not unwind it: deleting the device would
+		// cut the network out from under whatever is using it.
 		if isDeviceExists(err) {
-			return fmt.Errorf("%w: %s is already a device on this host, so another lease's "+
-				"microVM is using it", errTapTaken, tap)
+			return fmt.Errorf("%w: %s is already a device on this host, so it is not billet's "+
+				"to use", errTapTaken, tap)
 		}
 
 		return fmt.Errorf("firecracker: create the network device %s: %w", tap, err)

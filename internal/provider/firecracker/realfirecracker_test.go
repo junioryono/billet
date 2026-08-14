@@ -140,10 +140,12 @@ func TestRealFirecrackerDestroyLeavesNothing(t *testing.T) {
 	}
 
 	// THE TAP TOO. Nothing enumerates network devices looking for orphans, so one
-	// left attached is invisible until the next launch for this lease collides.
-	if err := exec.CommandContext(t.Context(), "ip", "link", "show", "dev",
-		tapName(name)).Run(); err == nil {
-		t.Errorf("the tap device %s survived the destroy", tapName(name))
+	// left attached is invisible — and its NAME is allocated rather than derived, so
+	// the claim directory is what says whether it came back.
+	if left, err := p.claimedBy(name); err != nil {
+		t.Errorf("read what %s still holds: %v", name, err)
+	} else if left != (resources{}) {
+		t.Errorf("%s still holds %+v after its destroy", name, left)
 	}
 
 	// AND DESTROYING AGAIN IS STILL SUCCESS.
@@ -190,7 +192,6 @@ func requireRealHost(t *testing.T) realHost {
 	cfg := config.FirecrackerConfig{
 		KernelImage: os.Getenv("BILLET_TEST_KERNEL"),
 		Bridge:      bridge,
-		JailUser:    os.Getenv("BILLET_TEST_JAIL_USER"),
 	}
 	cfg.Normalize()
 

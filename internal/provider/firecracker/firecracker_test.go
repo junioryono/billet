@@ -3,8 +3,10 @@ package firecracker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -55,13 +57,14 @@ func TestABinaryTheJailerWouldRefuseIsCaughtAtConstruction(t *testing.T) {
 	}
 
 	_, err := New("deployment-a", config.FirecrackerConfig{
-		BinaryPath:  renamed,
-		JailerPath:  filepath.Join(dir, "jailer"),
-		KernelImage: renamed,
-		ChrootBase:  dir,
-		JailUser:    "billet",
-		Bridge:      "br0",
-	}, &fakeDisk{}, withJailUser(1000, 1000))
+		BinaryPath:   renamed,
+		JailerPath:   filepath.Join(dir, "jailer"),
+		KernelImage:  renamed,
+		ChrootBase:   dir,
+		JailUIDMin:   900000,
+		JailUIDCount: 8,
+		Bridge:       "br0",
+	}, &fakeDisk{})
 	if err == nil {
 		t.Fatal("New accepted a binary whose name the jailer will not exec")
 	}
@@ -96,8 +99,8 @@ func TestAChrootBaseThatWouldNotFitASocketIsRefused(t *testing.T) {
 
 	_, err := New("deployment-a", config.FirecrackerConfig{
 		BinaryPath: bin, JailerPath: bin, KernelImage: bin,
-		ChrootBase: deep, JailUser: "billet", Bridge: "br0",
-	}, &fakeDisk{}, withJailUser(1000, 1000))
+		ChrootBase: deep, JailUIDMin: 900000, JailUIDCount: 8, Bridge: "br0",
+	}, &fakeDisk{})
 	if err == nil {
 		t.Fatal("New accepted a chroot base whose api socket billet could never dial")
 	}
@@ -560,7 +563,7 @@ func TestAnotherDeploymentsMicroVMIsInvisible(t *testing.T) {
 	// The same chroot base, a different deployment.
 	other := &fakeDisk{device: "/dev/rbd1"}
 
-	stranger, err := New("deployment-b", h.p.cfg, other, withJailUser(1000, 1000))
+	stranger, err := New("deployment-b", h.p.cfg, other)
 	if err != nil {
 		t.Fatalf("New for the second deployment: %v", err)
 	}
@@ -776,33 +779,181 @@ func TestARelaunchOverALeftoverJailSaysWhatIsInTheWay(t *testing.T) {
 	}
 }
 
-// A TAP NAME FITS IN A NETWORK DEVICE NAME, and it is derived from the lease so
-// teardown can find it again with nothing but the id.
-func TestATapNameFitsTheKernelsLimit(t *testing.T) {
+// A DEVICE NAME IS ALLOCATED, NOT DERIVED, AND TWO MICROVMS NEVER SHARE ONE.
+//
+// The first version truncated the lease id to fit the kernel's 15-character limit,
+// which turns a guarantee into a probability — and the failure it produces is two
+// live guests contending for one device. Counting makes the name short by
+// construction and unique by the syscall that takes it.
+func TestEveryMicroVMGetsADeviceNameOfItsOwn(t *testing.T) {
 	t.Parallel()
 
-	name := tapName(theInstance)
+	h := newHarness(t)
 
-	if len(name) > maxIfName {
-		t.Errorf("the tap name %q is %d characters; the kernel's limit is %d",
-			name, len(name), maxIfName)
+	seen := map[string]string{}
+
+	for i := range 8 {
+		id := provider.InstanceName(fmt.Sprintf("%032x", i))
+		j := h.p.jailFor(id)
+
+		if err := h.p.claim(j); err != nil {
+			t.Fatalf("claim %d: %v", i, err)
+		}
+
+		res, err := h.p.claimResources(j)
+		if err != nil {
+			t.Fatalf("claimResources %d: %v", i, err)
+		}
+
+		if len(res.Tap) > maxIfName {
+			t.Errorf("the device name %q is %d characters; the kernel's limit is %d",
+				res.Tap, len(res.Tap), maxIfName)
+		}
+
+		if other, taken := seen[res.Tap]; taken {
+			t.Fatalf("%s and %s were both given the device %q", other, id, res.Tap)
+		}
+
+		seen[res.Tap] = id
+	}
+}
+
+// AND A UID OF ITS OWN. A shared account means every VMM on the host is one user to
+// the kernel, so a VMM that escapes its chroot reaches every other jail's files and
+// every other guest's root disk.
+func TestEveryMicroVMGetsAUIDOfItsOwn(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+
+	seen := map[int]string{}
+
+	for i := range 8 {
+		id := provider.InstanceName(fmt.Sprintf("%032x", i))
+		j := h.p.jailFor(id)
+
+		if err := h.p.claim(j); err != nil {
+			t.Fatalf("claim %d: %v", i, err)
+		}
+
+		res, err := h.p.claimResources(j)
+		if err != nil {
+			t.Fatalf("claimResources %d: %v", i, err)
+		}
+
+		if res.UID < h.p.cfg.JailUIDMin {
+			t.Errorf("%s was given uid %d, below the configured range", id, res.UID)
+		}
+
+		if other, taken := seen[res.UID]; taken {
+			t.Fatalf("%s and %s were both given uid %d", other, id, res.UID)
+		}
+
+		seen[res.UID] = id
+	}
+}
+
+// A HOST THAT HAS RUN OUT SAYS SO, rather than handing a second microVM a uid that
+// is already running one.
+func TestAHostOutOfUIDsRefusesRatherThanReusingOne(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.p.cfg.JailUIDCount = 2
+
+	for i := range 3 {
+		id := provider.InstanceName(fmt.Sprintf("%032x", i))
+		j := h.p.jailFor(id)
+
+		if err := h.p.claim(j); err != nil {
+			t.Fatalf("claim %d: %v", i, err)
+		}
+
+		_, err := h.p.claimResources(j)
+
+		if i < 2 && err != nil {
+			t.Fatalf("claimResources %d: %v", i, err)
+		}
+
+		if i == 2 {
+			if err == nil {
+				t.Fatal("a third microVM was given a uid from a range of two")
+			}
+
+			if !strings.Contains(err.Error(), "jail_uid_count") {
+				t.Errorf("the error does not say which field to widen: %v", err)
+			}
+		}
+	}
+}
+
+// AND A UID COMES BACK WHEN ITS MICROVM GOES, or a host that has run for a week
+// stops being able to launch.
+func TestAUIDIsReusedOnceItsMicroVMIsGone(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.p.cfg.JailUIDCount = 1
+
+	first := h.p.jailFor(provider.InstanceName(fmt.Sprintf("%032x", 1)))
+	if err := h.p.claim(first); err != nil {
+		t.Fatalf("claim: %v", err)
 	}
 
-	if !strings.HasPrefix(name, tapPrefix) {
-		t.Errorf("the tap name %q does not mark the device as billet's", name)
+	res, err := h.p.claimResources(first)
+	if err != nil {
+		t.Fatalf("claimResources: %v", err)
 	}
 
-	// DERIVED, NOT RANDOM: Destroy recomputes it from the id alone.
-	if again := tapName(theInstance); again != name {
-		t.Errorf("tapName is not deterministic: %q then %q", name, again)
+	if err := errors.Join(first.remove(), h.p.releaseResources(res)); err != nil {
+		t.Fatalf("release: %v", err)
 	}
 
-	// AND TWO LEASES DO NOT SHARE ONE. The truncation makes that a probability
-	// rather than a guarantee, so this pins the part that is guaranteed: the name
-	// varies with the lease.
-	other := tapName(provider.InstanceName("0000000000000000000000000000beef"))
-	if other == name {
-		t.Errorf("two leases produced the same tap name %q", name)
+	second := h.p.jailFor(provider.InstanceName(fmt.Sprintf("%032x", 2)))
+	if err := h.p.claim(second); err != nil {
+		t.Fatalf("claim the second: %v", err)
+	}
+
+	again, err := h.p.claimResources(second)
+	if err != nil {
+		t.Fatalf("the only uid was not reused after its microVM went: %v", err)
+	}
+
+	if again.UID != res.UID {
+		t.Errorf("expected the freed uid %d, got %d", res.UID, again.UID)
+	}
+}
+
+// A CLAIM WHOSE JAIL IS GONE IS REAPED. Teardown releases both, so a claim naming a
+// jail that is not there is what a node that died mid-launch leaves — and without
+// reaping, the range shrinks by one on every such crash until the host cannot launch.
+func TestAClaimOrphanedByACrashIsReaped(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.p.cfg.JailUIDCount = 1
+
+	j := h.p.jailFor(theInstance)
+	if err := h.p.claim(j); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+
+	if _, err := h.p.claimResources(j); err != nil {
+		t.Fatalf("claimResources: %v", err)
+	}
+
+	// The crash: the jail goes, the claim does not.
+	if err := j.remove(); err != nil {
+		t.Fatalf("remove the jail: %v", err)
+	}
+
+	next := h.p.jailFor(provider.InstanceName(fmt.Sprintf("%032x", 9)))
+	if err := h.p.claim(next); err != nil {
+		t.Fatalf("claim the next: %v", err)
+	}
+
+	if _, err := h.p.claimResources(next); err != nil {
+		t.Errorf("a uid held by a claim whose jail is gone was never reaped: %v", err)
 	}
 }
 
@@ -859,22 +1010,48 @@ func TestAMissingGoldenImageStartsNothing(t *testing.T) {
 		t.Fatal("Launch continued without a root disk")
 	}
 
-	if cmds := h.commands(); len(cmds) != 0 {
-		t.Errorf("billet ran %v although there was no disk to boot from", cmds)
+	// NO JAILER, which is the property: nothing was started. Commands DO run — the
+	// unwind gives back the device name and the uid this launch had already claimed,
+	// which is the point of claiming them before the clone.
+	for _, r := range h.commands() {
+		if strings.HasSuffix(r.bin, "jailer") {
+			t.Errorf("billet started a microVM although there was no disk to boot from: %v", r)
+		}
+	}
+
+	// AND THE CLAIMS CAME BACK. A launch that failed while holding a uid and a
+	// device name shrinks the host by one of each, permanently.
+	if left, err := h.p.claimedBy(theInstance); err != nil {
+		t.Errorf("claimedBy: %v", err)
+	} else if left != (resources{}) {
+		t.Errorf("a failed launch kept %+v", left)
 	}
 }
 
-// THE VMM IS DROPPED TO THE ACCOUNT THE CONFIGURATION NAMED, and the numbers are
-// the ones resolved from it. The jailer takes a uid and a gid rather than a name,
-// so a backend that passed the wrong pair would run every guest's VMM as somebody
-// else — which for uid 0 is the whole reason the jailer is used at all.
-func TestTheJailerIsToldToDropToTheResolvedAccount(t *testing.T) {
+// THE JAILER IS TOLD TO DROP TO THE UID THIS MICROVM CLAIMED, and the tap is given
+// to the same one.
+//
+// The jailer takes a uid and a gid rather than a name, so a backend that passed the
+// wrong pair would run a guest's VMM as somebody else — and the VMM opens its tap
+// AFTER dropping privileges, so a device left owned by anyone else produces `Open tap
+// device failed: Operation not permitted`, which reads like a bug in the VMM and is
+// not.
+func TestTheJailerAndTheTapGetThisMicroVMsOwnUID(t *testing.T) {
 	t.Parallel()
 
-	h := newHarness(t, withJailUser(4242, 4343))
+	h := newHarness(t)
 	h.launch(t)
 
-	var uid, gid string
+	res, err := resourcesOf(h.p.jailFor(theInstance))
+	if err != nil {
+		t.Fatalf("resourcesOf: %v", err)
+	}
+
+	if res.UID < h.p.cfg.JailUIDMin {
+		t.Fatalf("the microVM was allocated uid %d, outside the configured range", res.UID)
+	}
+
+	var uid, gid, tapUser string
 
 	for _, r := range h.commands() {
 		for i, a := range r.args {
@@ -887,20 +1064,22 @@ func TestTheJailerIsToldToDropToTheResolvedAccount(t *testing.T) {
 				uid = r.args[i+1]
 			case "--gid":
 				gid = r.args[i+1]
+			case "user":
+				tapUser = r.args[i+1]
 			}
 		}
 	}
 
-	if uid != "4242" || gid != "4343" {
-		t.Errorf("the jailer was told to drop to uid %q gid %q, not to the resolved account: %s",
-			uid, gid, h.everyArgument())
+	want := strconv.Itoa(res.UID)
+
+	if uid != want || gid != strconv.Itoa(res.GID) {
+		t.Errorf("the jailer was told to drop to uid %q gid %q, not to the claimed %d/%d: %s",
+			uid, gid, res.UID, res.GID, h.everyArgument())
 	}
 
-	// AND THE TAP IS HANDED TO THE SAME ACCOUNT. The VMM opens it after dropping
-	// privileges, so a device left owned by root produces `Open tap device failed:
-	// Operation not permitted` — which reads like a bug in the VMM and is not.
-	if !h.ranWith("4242") {
-		t.Errorf("the tap device was not given to the jailed account: %s", h.everyArgument())
+	if tapUser != want {
+		t.Errorf("the tap device was given to %q rather than to this microVM's uid %d: %s",
+			tapUser, res.UID, h.everyArgument())
 	}
 }
 
@@ -952,7 +1131,7 @@ func TestAProviderWithoutStorageIsRefused(t *testing.T) {
 
 	_, err := New("deployment-a", config.FirecrackerConfig{
 		BinaryPath: filepath.Join(dir, "firecracker"), ChrootBase: dir,
-	}, nil, withJailUser(1000, 1000))
+	}, nil)
 	if err == nil {
 		t.Fatal("New accepted a provider with no root disk source")
 	}

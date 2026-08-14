@@ -433,11 +433,22 @@ type FirecrackerConfig struct {
 	// the jailer's own default, and it must be on local storage with room for a
 	// hard link to the guest kernel per running job.
 	ChrootBase string `yaml:"chroot_base,omitempty"`
-	// JailUser is the account the jailer drops the VMM to before it reads
-	// anything. Defaults to billet, and root is REFUSED: dropping privileges is
-	// what the jailer is for, so running the VMM as root removes the reason to use
-	// it at all.
-	JailUser string `yaml:"jail_user,omitempty"`
+	// JailUIDMin and JailUIDCount are the range of uids microVMs run as, ONE PER
+	// GUEST.
+	//
+	// NOT ONE ACCOUNT FOR ALL OF THEM. The jailer drops each VMM to a uid, and a
+	// shared one means every VMM on the host is the same user to the kernel — so a
+	// VMM that escapes its chroot can reach every other jail's files, signal every
+	// other VMM, and open every other guest's root disk. The chroot is what
+	// separates them while it holds; a uid of its own is what separates them when
+	// it does not.
+	//
+	// THEY ARE NUMBERS, NOT ACCOUNTS, and deliberately: an account a person could
+	// log in as is a bigger thing than an integer the kernel uses to keep two
+	// processes apart, and creating one per job is a deployment step per job. The
+	// default range is far above anything a distribution allocates.
+	JailUIDMin   int `yaml:"jail_uid_min,omitempty"`
+	JailUIDCount int `yaml:"jail_uid_count,omitempty"`
 	// Bridge is the host bridge trusted guests attach to.
 	Bridge string `yaml:"bridge"`
 	// UntrustedBridge is the bridge fork pull-request guests attach to, and its
@@ -462,8 +473,23 @@ const (
 	// DefaultChrootBase is the jailer's own default, so billet and a hand-run
 	// jailer agree about where a microVM lives.
 	DefaultChrootBase = "/srv/jailer"
-	// DefaultJailUser is deliberately not root — see FirecrackerConfig.JailUser.
-	DefaultJailUser = "billet"
+	// DefaultJailUIDMin is where the per-microVM uid range starts.
+	//
+	// ABOVE EVERYTHING A DISTRIBUTION USES. Regular accounts stop at 60000 on
+	// Debian and Ubuntu, systemd's DynamicUser range is 61184-65519, and the
+	// subordinate-uid ranges `useradd` hands out for user namespaces start at
+	// 100000 and are allocated 65536 at a time. Starting at 900000 sits clear of
+	// all of it, and clear of the 65534 `nobody` that a truncated or overflowed
+	// value would otherwise land on.
+	DefaultJailUIDMin = 900000
+	// DefaultJailUIDCount is how many microVMs one host may run at once, as far as
+	// uids go. Far above what any machine can hold, so it is a guard rather than a
+	// capacity limit — the allocator's budget is the real one.
+	DefaultJailUIDCount = 1024
+	// MinJailUID is the lowest start billet will accept. Below this a range starts
+	// overlapping accounts that belong to somebody, and a microVM would run as a
+	// user with a home directory and a login shell.
+	MinJailUID = 100000
 )
 
 // Normalize fills in the defaults and trims what billet later passes verbatim.
@@ -481,7 +507,6 @@ func (f *FirecrackerConfig) Normalize() {
 	f.JailerPath = strings.TrimSpace(f.JailerPath)
 	f.KernelImage = strings.TrimSpace(f.KernelImage)
 	f.ChrootBase = strings.TrimSpace(f.ChrootBase)
-	f.JailUser = strings.TrimSpace(f.JailUser)
 	f.Bridge = strings.TrimSpace(f.Bridge)
 	f.UntrustedBridge = strings.TrimSpace(f.UntrustedBridge)
 
@@ -492,11 +517,18 @@ func (f *FirecrackerConfig) Normalize() {
 		{&f.BinaryPath, DefaultFirecrackerBinary},
 		{&f.JailerPath, DefaultJailerBinary},
 		{&f.ChrootBase, DefaultChrootBase},
-		{&f.JailUser, DefaultJailUser},
 	} {
 		if *d.into == "" {
 			*d.into = d.value
 		}
+	}
+
+	if f.JailUIDMin == 0 {
+		f.JailUIDMin = DefaultJailUIDMin
+	}
+
+	if f.JailUIDCount == 0 {
+		f.JailUIDCount = DefaultJailUIDCount
 	}
 }
 
@@ -548,16 +580,57 @@ func CheckFirecracker(f FirecrackerConfig) []error {
 			f.Bridge))
 	}
 
-	if user := strings.TrimSpace(f.JailUser); user == "" || user == "root" {
-		errs = append(errs, fmt.Errorf("node.firecracker.jail_user is %q: the jailer exists to "+
-			"drop privileges before the vmm reads anything an operator or a job wrote, so running "+
-			"it as root would leave the guest's vmm with all of them; create an unprivileged "+
-			"account (`useradd --system --no-create-home --shell /usr/sbin/nologin %s`)",
-			f.JailUser, DefaultJailUser))
+	errs = append(errs, checkJailUIDs(f.JailUIDMin, f.JailUIDCount)...)
+
+	return errs
+}
+
+// checkJailUIDs refuses a uid range billet will not run microVMs as.
+//
+// THE FLOOR IS THE POINT. A range that starts low overlaps accounts that belong to
+// somebody — root at 0, the distribution's system accounts, the operator's own login
+// — and the jailer drops a VMM to whatever number it is given without asking whether
+// a person owns it. Running a guest's VMM as an existing user is strictly worse than
+// running it as root would be honest about.
+func checkJailUIDs(minUID, count int) []error {
+	var errs []error
+
+	if minUID < MinJailUID {
+		errs = append(errs, fmt.Errorf("node.firecracker.jail_uid_min is %d, and billet will not "+
+			"run a microVM as a uid below %d: the jailer drops each vmm to one of these numbers, "+
+			"and below that they belong to root, to the distribution's own accounts, or to a "+
+			"person", minUID, MinJailUID))
+	}
+
+	if count <= 0 {
+		errs = append(errs, fmt.Errorf("node.firecracker.jail_uid_count is %d, so no microVM "+
+			"could ever be given a uid", count))
+	}
+
+	// A RANGE THAT WRAPS IS NOT A RANGE. These are added together to find the end,
+	// and a large enough pair overflows to a negative one — which every "is this uid
+	// in range" comparison then passes, including for uid 0.
+	if count > 0 && minUID > 0 && minUID+count < minUID {
+		errs = append(errs, fmt.Errorf("node.firecracker.jail_uid_min %d plus jail_uid_count %d "+
+			"overflows", minUID, count))
+	}
+
+	// LINUX UIDS STOP AT 2^32-2, and the kernel refuses (uid_t)-1 outright. Staying
+	// inside a signed 32-bit range keeps every number here representable everywhere
+	// billet passes it — an argv value to the jailer, an argument to `ip tuntap`,
+	// and a Go int on a 32-bit host.
+	if end := minUID + count - 1; count > 0 && minUID >= MinJailUID && end > maxJailUID {
+		errs = append(errs, fmt.Errorf("node.firecracker.jail_uid_min %d plus jail_uid_count %d "+
+			"ends at %d, past the highest uid billet will use (%d)", minUID, count, end, maxJailUID))
 	}
 
 	return errs
 }
+
+// maxJailUID is the highest uid billet will hand a microVM. Well inside the
+// kernel's own limit, and inside a signed 32-bit integer on every host billet
+// builds for.
+const maxJailUID = 2_000_000
 
 // maxBridgeName is the kernel's IFNAMSIZ limit, less the terminator.
 const maxBridgeName = 15

@@ -42,11 +42,15 @@ func TestTheFirecrackerDefaultsPointAtARealInstallation(t *testing.T) {
 		{"binary_path", f.BinaryPath, DefaultFirecrackerBinary},
 		{"jailer_path", f.JailerPath, DefaultJailerBinary},
 		{"chroot_base", f.ChrootBase, DefaultChrootBase},
-		{"jail_user", f.JailUser, DefaultJailUser},
 	} {
 		if tc.got != tc.want {
 			t.Errorf("%s defaulted to %q, want %q", tc.field, tc.got, tc.want)
 		}
+	}
+
+	if f.JailUIDMin != DefaultJailUIDMin || f.JailUIDCount != DefaultJailUIDCount {
+		t.Errorf("the uid range defaulted to %d+%d, want %d+%d",
+			f.JailUIDMin, f.JailUIDCount, DefaultJailUIDMin, DefaultJailUIDCount)
 	}
 
 	if errs := CheckFirecracker(f); len(errs) != 0 {
@@ -54,24 +58,58 @@ func TestTheFirecrackerDefaultsPointAtARealInstallation(t *testing.T) {
 	}
 }
 
-// THE JAILER EXISTS TO DROP PRIVILEGES, so running the VMM as root removes the
-// reason to use it. Refused in both spellings a config can reach it by.
-func TestAJailUserOfRootIsRefused(t *testing.T) {
+// A UID RANGE THAT REACHES A REAL ACCOUNT IS REFUSED.
+//
+// The jailer drops each VMM to whichever number it is given, without asking whether
+// a person owns it. Below the floor these belong to root, to the distribution's own
+// system accounts, or to somebody's login — and running a guest's VMM as an existing
+// user is worse than running it as root would at least be honest about.
+func TestAJailUIDRangeThatReachesARealAccountIsRefused(t *testing.T) {
 	t.Parallel()
 
-	f := validFirecracker()
-	f.JailUser = "root"
+	for _, tc := range []struct {
+		name   string
+		minUID int
+		count  int
+		says   string
+	}{
+		{"root", 0, 16, "below"},
+		{"a system account", 100, 16, "below"},
+		{"an ordinary login", 1000, 16, "below"},
+		{"just under the floor", MinJailUID - 1, 16, "below"},
+		{"no uids at all", DefaultJailUIDMin, 0, "no microVM"},
+		{"a negative count", DefaultJailUIDMin, -5, "no microVM"},
+		{"past the top", maxJailUID - 4, 1000, "past the highest"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-	if got := firecrackerErrors(f); !strings.Contains(got, "drop privileges") {
-		t.Errorf("root was accepted as the jail user, or refused without saying why: %s", got)
+			f := validFirecracker()
+			f.JailUIDMin, f.JailUIDCount = tc.minUID, tc.count
+
+			if got := firecrackerErrors(f); !strings.Contains(got, tc.says) {
+				t.Errorf("expected an error saying %q, got: %s", tc.says, got)
+			}
+		})
 	}
+}
 
-	// AN EMPTY ONE TOO, because a caller that skipped Normalize would hand the
-	// jailer no account at all.
-	f.JailUser = ""
+// AND AN ORDINARY RANGE IS ACCEPTED, without which the rule above is
+// indistinguishable from one that refuses everything.
+func TestAnOrdinaryJailUIDRangeIsAccepted(t *testing.T) {
+	t.Parallel()
 
-	if got := firecrackerErrors(f); !strings.Contains(got, "jail_user") {
-		t.Errorf("an empty jail user was accepted: %s", got)
+	for _, tc := range []struct{ minUID, count int }{
+		{MinJailUID, 1},
+		{DefaultJailUIDMin, DefaultJailUIDCount},
+		{500000, 4096},
+	} {
+		f := validFirecracker()
+		f.JailUIDMin, f.JailUIDCount = tc.minUID, tc.count
+
+		if errs := CheckFirecracker(f); len(errs) != 0 {
+			t.Errorf("the range %d+%d was refused: %v", tc.minUID, tc.count, errs)
+		}
 	}
 }
 
@@ -202,12 +240,12 @@ func TestEveryFirecrackerProblemIsReportedTogether(t *testing.T) {
 		JailerPath:  "",
 		KernelImage: "",
 		ChrootBase:  "also/relative",
-		JailUser:    "root",
+		JailUIDMin:  0,
 		Bridge:      "",
 	})
 
 	for _, must := range []string{"binary_path", "jailer_path", "kernel_image", "chroot_base",
-		"jail_user", "bridge"} {
+		"jail_uid_min", "bridge"} {
 		if !strings.Contains(got, must) {
 			t.Errorf("the report does not name %s:\n%s", must, got)
 		}
@@ -225,7 +263,6 @@ func TestFirecrackerValuesAreTrimmed(t *testing.T) {
 		KernelImage:     "  /k  ",
 		Bridge:          "  br0  ",
 		UntrustedBridge: "  br1  ",
-		JailUser:        "  billet  ",
 	}
 	f.Normalize()
 
@@ -234,7 +271,6 @@ func TestFirecrackerValuesAreTrimmed(t *testing.T) {
 		{"kernel_image", f.KernelImage},
 		{"bridge", f.Bridge},
 		{"untrusted_bridge", f.UntrustedBridge},
-		{"jail_user", f.JailUser},
 	} {
 		if tc.got != strings.TrimSpace(tc.got) {
 			t.Errorf("%s is still padded: %q", tc.field, tc.got)
