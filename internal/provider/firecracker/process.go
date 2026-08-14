@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"strconv"
-	"syscall"
 )
 
 // pidIsVMM reports whether a process id is still this jail's VMM.
@@ -69,25 +68,4 @@ func pidIsVMM(pid int, jailID string) (bool, error) {
 // signalling a pid on a system where billet cannot check what it points at.
 func procCmdline(pid int) string {
 	return "/proc/" + strconv.Itoa(pid) + "/cmdline"
-}
-
-// signalVMM sends one signal to a process that has already been proven to be a VMM.
-//
-// An ESRCH is success: the process exited between the check and the signal, which is
-// the outcome the caller wanted.
-func signalVMM(pid int, sig syscall.Signal) error {
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		return fmt.Errorf("firecracker: find pid %d: %w", pid, err)
-	}
-
-	if err := proc.Signal(sig); err != nil {
-		if errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.ESRCH) {
-			return nil
-		}
-
-		return fmt.Errorf("firecracker: signal pid %d: %w", pid, err)
-	}
-
-	return nil
 }

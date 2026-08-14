@@ -242,10 +242,17 @@ func TestThePidFileIsNamedAfterTheResolvedBinary(t *testing.T) {
 	}
 }
 
-// A SIGNAL TO A PROCESS THAT HAS ALREADY EXITED IS SUCCESS. It is the outcome the
-// caller wanted, and losing that race is the ordinary case rather than an unusual
-// one — the check and the signal cannot be atomic.
-func TestSignallingAnAlreadyExitedProcessIsSuccess(t *testing.T) {
+// A PROCESS THAT HAS ALREADY EXITED IS NOTHING TO STOP, rather than an error.
+//
+// Losing that race is the ordinary case rather than an unusual one — checking and
+// signalling cannot be atomic — and teardown depends on the distinction: "nothing is
+// running" lets it continue, and an error must halt it, because the steps after this
+// unmap a block device the VMM may still hold open.
+//
+// (Renamed from TestSignallingAnAlreadyExitedProcessIsSuccess: the property is the
+// same one and it now belongs to taking the process reference, since that is where an
+// exited process is first noticed.)
+func TestAProcessThatHasAlreadyExitedIsNothingToStop(t *testing.T) {
 	t.Parallel()
 	requireProc(t)
 
@@ -254,8 +261,61 @@ func TestSignallingAnAlreadyExitedProcessIsSuccess(t *testing.T) {
 		t.Fatalf("run a process that exits: %v", err)
 	}
 
-	if err := signalVMM(cmd.Process.Pid, syscall.SIGTERM); err != nil {
-		t.Errorf("signalling an exited process was reported as a failure: %v", err)
+	handle, alive, err := openVMM(cmd.Process.Pid)
+	if err != nil {
+		t.Fatalf("taking a reference to an exited process was reported as a failure: %v", err)
+	}
+
+	if alive {
+		handle.close()
+		t.Fatal("a process that has exited was reported as still running, so teardown would " +
+			"wait for something that is already gone")
+	}
+}
+
+// AND A REFERENCE, ONCE TAKEN, CANNOT COME TO MEAN A DIFFERENT PROCESS.
+//
+// This is the whole reason the signal goes through a handle rather than a number.
+// Verifying a pid and signalling it are two operations, and in between the VMM can
+// exit and the kernel can give its number to something else — which this backend
+// would then signal, as root, on evidence that was true when it was gathered.
+//
+// The handle is opened on a process that then exits. Sending through it must report
+// the process as gone rather than reaching whatever holds that pid afterwards.
+func TestAReferenceToAnExitedProcessSignalsNothing(t *testing.T) {
+	t.Parallel()
+	requireProc(t)
+
+	pid := standIn(t, "billet-"+strings.Repeat("c", leaseIDLength), false)
+
+	handle, alive, err := openVMM(pid)
+	if err != nil {
+		t.Fatalf("openVMM: %v", err)
+	}
+
+	if !alive {
+		t.Fatal("the stand-in was reported as already gone")
+	}
+
+	defer handle.close()
+
+	if err := handle.signal(syscall.SIGKILL); err != nil {
+		t.Fatalf("signal: %v", err)
+	}
+
+	// Once it is gone, the same handle must be inert rather than dangerous.
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		if owns, err := pidIsVMM(pid, "billet-"+strings.Repeat("c", leaseIDLength)); err == nil && !owns {
+			break
+		}
+
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if err := handle.signal(syscall.SIGKILL); err != nil {
+		t.Errorf("signalling through a reference to an exited process was reported as a "+
+			"failure rather than as nothing to do: %v", err)
 	}
 }
 
