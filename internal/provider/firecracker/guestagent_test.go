@@ -38,6 +38,13 @@ func TestTheGuestAgentReconstructsAnArgvExactly(t *testing.T) {
 		{"a newline inside an argument", []string{"/bin/sh", "-c", "echo one\necho two", "tail"}},
 		{"an argument ending in a newline", []string{"/bin/sh", "-c", "trailing\n"}},
 		{"an empty argument", []string{"/bin/sh", "-c", "", "after"}},
+		// THE TRAILING ONES ARE THE DANGEROUS ONES. An empty argument encodes to an
+		// empty line and `$()` strips every trailing newline, so a command ending in
+		// one lost it — `sh -c '…' arg ''` arriving as `sh -c '…' arg` is a different
+		// command with a different $#, and nothing anywhere said so.
+		{"a trailing empty argument", []string{"/bin/sh", "-c", "echo", ""}},
+		{"several trailing empty arguments", []string{"/bin/sh", "-c", "echo", "", "", ""}},
+		{"nothing but empty arguments after the program", []string{"/bin/echo", "", ""}},
 		{"quotes and dollars", []string{"/bin/sh", "-c", `echo "$HOME" 'single' $(id)`}},
 		{"backslashes", []string{"/bin/sh", "-c", `printf 'a\\b\tc'`}},
 		{"a tab", []string{"/bin/sh", "-c", "echo\tone"}},
@@ -129,6 +136,18 @@ func agentDecodeBlock(t *testing.T) string {
 		t.Fatalf("the guest image build script is not where this test expects it: %v", err)
 	}
 
+	// EXACTLY ONE PAIR. A second pair — left behind by a copied block, or by an
+	// agent that grew a second decode — would leave this test silently exercising
+	// whichever came first while the guest ran the other.
+	if n := strings.Count(string(source), begin); n != 1 {
+		t.Fatalf("%s appears %d times in %s and this test can only stand for one decode",
+			begin, n, path)
+	}
+
+	if n := strings.Count(string(source), end); n != 1 {
+		t.Fatalf("%s appears %d times in %s", end, n, path)
+	}
+
 	_, after, found := strings.Cut(string(source), begin)
 	if !found {
 		t.Fatalf("%s no longer marks the start of the agent's decode in %s, so this test "+
@@ -157,9 +176,15 @@ func agentDecodeBlock(t *testing.T) string {
 func runAgentDecode(t *testing.T, decode, raw string) ([]string, error) {
 	t.Helper()
 
+	// MISSING TOOLS FAIL RATHER THAN SKIP. A skip here is indistinguishable from a
+	// pass in the one place it matters — CI, where nobody reads the log of a green
+	// run — and it would hide every case below. All three are on the CI image and on
+	// any machine that can run scripts/build-guest-image.sh, which requires jq for
+	// exactly this reason.
 	for _, tool := range []string{"bash", "jq", "base64"} {
 		if _, err := exec.LookPath(tool); err != nil {
-			t.Skipf("%s is not installed, and it is what the guest uses", tool)
+			t.Fatalf("%s is not installed, and it is what the guest uses to rebuild the argv; "+
+				"install it rather than letting this test stop checking (apt-get install jq)", tool)
 		}
 	}
 

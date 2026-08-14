@@ -171,7 +171,7 @@ fetch() { curl -sf -H "X-metadata-token: $token" "http://$MMDS/latest/meta-data/
 #
 # Refusing out loud is the whole point: the message names both versions, so the
 # answer ("republish the image") is in the failure rather than in somebody's memory.
-WANT_CONTRACT=1
+WANT_CONTRACT=2
 
 if ! contract=$(fetch contract); then
 	log "this billet did not say which metadata contract it speaks; it is older than this image"
@@ -238,8 +238,15 @@ if ! printf '%s' "$raw" |
 	exit 1
 fi
 
-if ! encoded=$(printf '%s' "$raw" | jq -r '.[] | @base64'); then
-	log "the command in the metadata could not be decoded"
+# EVERY RECORD CARRIES A BYTE IN FRONT, SO NO RECORD IS EVER AN EMPTY LINE.
+#
+# `$()` strips ALL trailing newlines, and an EMPTY argument encodes to an empty line —
+# so a command whose last argument was empty simply lost it, and `sh -c '…' arg ''`
+# reached the guest as `sh -c '…' arg`. That is a different command: `$#` is 1 instead
+# of 2, and a script that tests its argument count takes a different branch. A constant
+# byte in front means the final record always has content for `$()` to keep.
+if ! encoded=$(printf '%s' "$raw" | jq -r '.[] | @base64 | "x" + .'); then
+	log "the command in the metadata could not be encoded for transfer"
 	exit 1
 fi
 
@@ -248,9 +255,32 @@ while IFS= read -r line; do
 	# allowed to end in one. Append a byte inside the substitution and take it off
 	# outside — and do both in ONE step, because a decode helper that RETURNED the
 	# value would have it stripped a second time by the substitution that called it.
-	decoded=$(printf '%s' "$line" | base64 -d; printf X)
+	#
+	# `&&` RATHER THAN `;`, so the status is base64's. With a `;` the substitution
+	# reports the status of the final `printf`, which is always 0 — so a decoder that
+	# failed would contribute an empty argument and `set -e` would never see it.
+	if ! decoded=$(printf '%s' "${line#x}" | base64 -d && printf X); then
+		log "an argument in the command could not be decoded"
+		exit 1
+	fi
+
 	cmd+=("${decoded%X}")
 done <<<"$encoded"
+
+# AND THE COUNT IS PROVED RATHER THAN ASSUMED.
+#
+# Every framing bug this decode has had was a silent one: an argument split in two, an
+# argument dropped, a truncated argv from a failure nothing observed. Each of them
+# changes the NUMBER of arguments, and the number is something the metadata states
+# independently — so comparing them turns the whole class into a loud failure at the
+# one moment somebody can still act on it.
+want=$(printf '%s' "$raw" | jq 'length')
+
+if [ "${#cmd[@]}" -ne "$want" ]; then
+	log "the command has $want arguments and ${#cmd[@]} came back; refusing to run a"
+	log "command that is not the one billet sent"
+	exit 1
+fi
 
 # BILLET_AGENT_DECODE_END
 
