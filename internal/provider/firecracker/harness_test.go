@@ -269,9 +269,24 @@ func newHarness(t *testing.T, opts ...Option) *harness {
 		t.Fatalf("link the stub binary: %v", err)
 	}
 
+	// 0644 BECAUSE THAT IS WHAT A REAL ONE MUST BE. The preflight requires the guest
+	// kernel to be readable by the unprivileged account each microVM runs as, since
+	// billet hard-links it into a jail it does not own and deliberately does not take
+	// ownership of it. A fixture at 0600 is a kernel no microVM could boot.
+	//
+	// This mattered rather than being tidiness: these tests only run where /dev/kvm
+	// exists, so a 0600 fixture was green on the machine this was written on and
+	// failed on the one the backend actually runs on.
 	kernel := filepath.Join(base, "vmlinux")
-	if err := os.WriteFile(kernel, []byte("not really a kernel"), 0o600); err != nil {
+	if err := os.WriteFile(kernel, []byte("not really a kernel"), 0o644); err != nil {
 		t.Fatalf("write the stub kernel: %v", err)
+	}
+
+	// CHMOD RATHER THAN TRUSTING THE MODE ABOVE, because os.WriteFile applies it
+	// through the umask — so on a machine with a stricter one the fixture would come
+	// out 0600 again and this would fail somewhere else entirely.
+	if err := os.Chmod(kernel, 0o644); err != nil {
+		t.Fatalf("make the stub kernel readable: %v", err)
 	}
 
 	h := &harness{disk: &fakeDisk{device: "/dev/rbd0"}}
