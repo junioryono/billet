@@ -13,6 +13,15 @@ import (
 	"time"
 )
 
+// MaxBundleBytes bounds a signature bundle.
+//
+// A real one is around ten kilobytes -- certificate, signature, and a transparency
+// log entry. The bound is generous against that and exists for the same reason the
+// manifest's does: it is fetched over the network before anything about the far end
+// has been proven, and an unbounded read of an untrusted stream is how a fetch
+// becomes a memory exhaustion.
+const MaxBundleBytes = 512 << 10
+
 // ErrNotFound is returned when the source has no such artifact.
 //
 // DISTINGUISHED FROM EVERY OTHER FAILURE because the callers act on it
@@ -79,15 +88,39 @@ func (c *Client) httpClient() *http.Client {
 	return defaultHTTP()
 }
 
-// Manifest fetches and validates the index for the current release.
+// Manifest fetches the index for the current release, proves it, and validates it.
 //
-// THE ONLY WAY A Manifest IS PRODUCED FROM THE NETWORK. ParseManifest validates
-// before returning, so no caller can hold an unvalidated one — which is what
-// makes it safe for the download path to treat the digests and names as
-// constrained.
-func (c *Client) Manifest(ctx context.Context) (*Manifest, error) {
+// THE ONLY WAY A Manifest IS PRODUCED FROM THE NETWORK, and it takes a policy for
+// that reason: a caller cannot obtain one without having said what would make it
+// trustworthy. ParseManifest validates before returning, so no caller can hold an
+// unvalidated one either — which is what lets the download path treat the digests
+// and names as constrained.
+//
+// THE SIGNATURE IS CHECKED OVER THE BYTES THAT ARRIVED, before anything is parsed
+// out of them. Verifying a re-serialised manifest would verify a document this
+// program produced rather than the one that was signed, and the two can differ in
+// whitespace, key order, or any field a future reader drops.
+func (c *Client) Manifest(ctx context.Context, p Policy) (*Manifest, error) {
 	body, err := c.get(ctx, c.Source.ManifestURL(), MaxManifestBytes)
 	if err != nil {
+		return nil, err
+	}
+
+	var signature []byte
+
+	if p.Required {
+		signature, err = c.get(ctx, c.Source.BaseURL+"/"+BundleName, MaxBundleBytes)
+		if err != nil {
+			if errors.Is(err, ErrNotFound) {
+				return nil, fmt.Errorf("imagesource: this source requires a signature and %s "+
+					"publishes none: %w", c.Source.BaseURL, err)
+			}
+
+			return nil, err
+		}
+	}
+
+	if err := VerifySignature(body, signature, p); err != nil {
 		return nil, err
 	}
 

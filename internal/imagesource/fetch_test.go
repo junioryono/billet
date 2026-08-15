@@ -204,7 +204,7 @@ func TestManifestFetchValidates(t *testing.T) {
 
 	c := serve(t, map[string][]byte{ManifestName: good})
 
-	m, err := c.Manifest(t.Context())
+	m, err := c.Manifest(t.Context(), Policy{})
 	if err != nil {
 		t.Fatalf("a valid manifest was refused: %v", err)
 	}
@@ -217,7 +217,7 @@ func TestManifestFetchValidates(t *testing.T) {
 func TestManifestFetchRefusesAnOversizeDocument(t *testing.T) {
 	c := serve(t, map[string][]byte{ManifestName: make([]byte, MaxManifestBytes+1)})
 
-	if _, err := c.Manifest(t.Context()); err == nil {
+	if _, err := c.Manifest(t.Context(), Policy{}); err == nil {
 		t.Fatal("an oversize manifest was read whole")
 	}
 }
@@ -225,7 +225,7 @@ func TestManifestFetchRefusesAnOversizeDocument(t *testing.T) {
 func TestManifestFetchReportsAbsenceDistinctly(t *testing.T) {
 	c := serve(t, map[string][]byte{})
 
-	if _, err := c.Manifest(t.Context()); !errors.Is(err, ErrNotFound) {
+	if _, err := c.Manifest(t.Context(), Policy{}); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("a source with no manifest reported %v", err)
 	}
 }
@@ -242,7 +242,7 @@ func TestFetchHonoursContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
 	defer cancel()
 
-	if _, err := c.Manifest(ctx); err == nil {
+	if _, err := c.Manifest(ctx, Policy{}); err == nil {
 		t.Fatal("a hung source did not surface as an error")
 	}
 }
@@ -256,12 +256,82 @@ func TestFetchSurfacesAServerError(t *testing.T) {
 
 	c := &Client{HTTP: srv.Client(), Source: Source{BaseURL: srv.URL}}
 
-	_, err := c.Manifest(t.Context())
+	_, err := c.Manifest(t.Context(), Policy{})
 	if err == nil {
 		t.Fatal("a 500 was treated as a manifest")
 	}
 
 	if errors.Is(err, ErrNotFound) {
 		t.Error("a 500 was reported as an absent artifact, which callers treat as normal")
+	}
+}
+
+// A REQUIRED SIGNATURE IS FETCHED AND ENFORCED BY THE FETCH PATH ITSELF.
+//
+// This is the wiring that matters: Manifest takes a policy precisely so a caller
+// cannot obtain a manifest without having said what would make it trustworthy. A
+// source that serves a manifest and no bundle must not produce one.
+func TestManifestRefusesWhenTheRequiredSignatureIsNotPublished(t *testing.T) {
+	good, err := json.Marshal(validManifest())
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	// The manifest is served; the bundle is not.
+	c := serve(t, map[string][]byte{ManifestName: good})
+
+	src, err := ParseSource(DefaultBaseURL)
+	if err != nil {
+		t.Fatalf("source: %v", err)
+	}
+
+	policy, err := PolicyFor(src, "", "", false)
+	if err != nil {
+		t.Fatalf("policy: %v", err)
+	}
+
+	if _, err := c.Manifest(t.Context(), policy); err == nil {
+		t.Fatal("a manifest with no published signature was returned under a policy that " +
+			"requires one; every digest it names is its own")
+	}
+}
+
+// AND THE SIGNATURE IS CHECKED OVER THE BYTES THAT ARRIVED. A manifest that parses
+// is not the question; a manifest somebody vouched for is.
+func TestManifestRefusesAManifestWhoseSignatureDoesNotVerify(t *testing.T) {
+	good, err := json.Marshal(validManifest())
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	legacy, err := os.ReadFile("testdata/legacy-bundle.json")
+	if err != nil {
+		t.Skipf("no legacy fixture: %v", err)
+	}
+
+	c := serve(t, map[string][]byte{ManifestName: good, BundleName: legacy})
+
+	src, err := ParseSource(DefaultBaseURL)
+	if err != nil {
+		t.Fatalf("source: %v", err)
+	}
+
+	policy, err := PolicyFor(src, "", "", false)
+	if err != nil {
+		t.Fatalf("policy: %v", err)
+	}
+
+	_, err = c.Manifest(t.Context(), policy)
+	if err == nil {
+		t.Fatal("a manifest whose signature cannot be verified was returned")
+	}
+
+	// AND THE MANIFEST WAS NOT PARSED INTO SOMETHING USABLE FIRST. Order matters:
+	// verifying after parsing would mean the program had already acted on fields
+	// from a document nothing vouched for.
+	if !strings.Contains(strings.ToLower(err.Error()), "signature") &&
+		!strings.Contains(strings.ToLower(err.Error()), "bundle") {
+		t.Errorf("the failure is not about the signature, so something else rejected it "+
+			"first: %v", err)
 	}
 }

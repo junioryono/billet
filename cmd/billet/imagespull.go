@@ -64,6 +64,12 @@ func cmdImagesPull(ctx context.Context, args []string) error {
 		"where to keep the kernel this image is paired with")
 	allowStale := fs.Bool("allow-stale", false,
 		"import even if the baked runner is past github's thirty days")
+	signingIdentity := fs.String("signing-identity", "",
+		"certificate SAN pattern a valid signature must carry (for a non-default source)")
+	signingIssuer := fs.String("signing-issuer", "",
+		"OIDC issuer that certificate must come from")
+	skipSignature := fs.Bool("skip-signature-verification", false,
+		"import without proving who published the manifest; for a source trusted by other means")
 
 	rest, err := parseWithName(fs, args)
 	if err != nil {
@@ -98,7 +104,14 @@ func cmdImagesPull(ctx context.Context, args []string) error {
 			"own; give the image name alone", image)
 	}
 
-	manifest, dir, cleanup, err := stageImage(ctx, cfg, *from, *source, *staging)
+	manifest, dir, cleanup, err := stageImage(ctx, cfg, stageOptions{
+		from:     *from,
+		source:   *source,
+		staging:  *staging,
+		identity: *signingIdentity,
+		issuer:   *signingIssuer,
+		skipSig:  *skipSignature,
+	})
 	if err != nil {
 		return err
 	}
@@ -178,11 +191,25 @@ func cmdImagesPull(ctx context.Context, args []string) error {
 }
 
 // stageImage puts the manifest and its assets on local disk, verified.
+// stageOptions is what stageImage needs, as a struct because the list had reached
+// the length where a caller can transpose two strings and get a working call that
+// does the wrong thing.
+type stageOptions struct {
+	from     string
+	source   string
+	staging  string
+	identity string
+	issuer   string
+	skipSig  bool
+}
+
 func stageImage(
 	ctx context.Context,
 	cfg *config.Config,
-	from, sourceFlag, staging string,
+	opts stageOptions,
 ) (*imagesource.Manifest, string, func(), error) {
+	from, staging := opts.from, opts.staging
+
 	if err := os.MkdirAll(staging, 0o700); err != nil {
 		return nil, "", nil, fmt.Errorf("billet images pull: cannot use %s: %w", staging, err)
 	}
@@ -213,7 +240,24 @@ func stageImage(
 		return manifest, from, func() {}, nil
 	}
 
-	src, err := resolveSource(cfg, sourceFlag)
+	src, err := resolveSource(cfg, opts.source)
+	if err != nil {
+		return nil, "", nil, err
+	}
+
+	identity, issuer := opts.identity, opts.issuer
+
+	if cfg.Images != nil {
+		if identity == "" {
+			identity = cfg.Images.SigningIdentity
+		}
+
+		if issuer == "" {
+			issuer = cfg.Images.SigningIssuer
+		}
+	}
+
+	policy, err := imagesource.PolicyFor(src, identity, issuer, opts.skipSig)
 	if err != nil {
 		return nil, "", nil, err
 	}
@@ -222,7 +266,13 @@ func stageImage(
 
 	fmt.Printf("fetching %s\n", src.ManifestURL())
 
-	manifest, err := client.Manifest(ctx)
+	if policy.Required {
+		fmt.Printf("requiring a signature from %s\n", policy.Identity)
+	} else {
+		fmt.Println("WARNING: importing without verifying who published this manifest")
+	}
+
+	manifest, err := client.Manifest(ctx, policy)
 	if err != nil {
 		return nil, "", nil, err
 	}
