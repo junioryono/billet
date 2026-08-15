@@ -171,7 +171,19 @@ EOF
 	"
 
 	local tarball="actions-runner-linux-x64-$RUNNER_VERSION.tar.gz"
-	curl -fsSL -o "$WORK/$tarball" \
+
+	# RETRIED, FOR THE REASON THE KERNEL FETCH IS. A sibling download of comparable
+	# size died six minutes into a CI run with `curl: (92) HTTP/2 stream 1 was not
+	# closed cleanly` and took an hour-long build with it. This one is a couple of
+	# hundred megabytes over the same kind of link and had the same absence of
+	# retries; it simply had not been unlucky yet.
+	#
+	# --retry-all-errors is the load-bearing flag: plain --retry covers http statuses
+	# and timeouts but NOT curl-level transport faults, which is exactly what 92 is.
+	curl -fsSL --http1.1 \
+		--connect-timeout 20 --max-time 900 \
+		--retry 5 --retry-delay 5 --retry-all-errors \
+		-o "$WORK/$tarball" \
 		"https://github.com/actions/runner/releases/download/v$RUNNER_VERSION/$tarball"
 
 	# VERIFIED BEFORE IT IS UNPACKED. This is a binary fetched over the network that

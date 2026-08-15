@@ -38,8 +38,51 @@ apt-get install -y -qq build-essential flex bison libelf-dev libssl-dev bc dwarv
 
 cd "$WORK"
 V="${KERNEL_VERSION:-6.1.155}"
+
+# THE CHECKSUM OF THE KERNEL THIS BUILDS, taken from kernel.org's sha256sums.asc.
+#
+# PINNED RATHER THAN FETCHED ALONGSIDE THE TARBALL, because a checksum downloaded
+# over the same connection from the same host proves only that the two agree. This
+# is the kernel every guest boots, so it is worth a line in the repository.
+KERNEL_SHA256="${KERNEL_SHA256:-}"
+
+if [ -z "$KERNEL_SHA256" ]; then
+  case "$V" in
+    6.1.155) KERNEL_SHA256=c29387aeee085fbcbd91236224b9df805063bac43615e75cea2c6b29604a5c73 ;;
+    *)
+      echo "no pinned checksum for kernel $V. Take it from" >&2
+      echo "https://cdn.kernel.org/pub/linux/kernel/v6.x/sha256sums.asc and either add it" >&2
+      echo "here or pass KERNEL_SHA256; this refuses to build an unverified kernel." >&2
+      exit 1
+      ;;
+  esac
+fi
+
 [ -d "linux-$V" ] || {
-  curl -sS -o "linux-$V.tar.xz" "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$V.tar.xz"
+  # MEASURED FAILURE, AND WHY EACH FLAG IS HERE. The first CI run of this died six
+  # minutes in with `curl: (92) HTTP/2 stream 1 was not closed cleanly:
+  # PROTOCOL_ERROR` -- a transient fault partway through a 140MB transfer that took
+  # the whole build with it, because the original invocation had no retries at all.
+  #
+  # --http1.1 because that error IS an HTTP/2 framing fault; there is nothing to
+  #   gain from multiplexing one large download and it removes the whole class.
+  # --retry-all-errors because plain --retry covers http statuses and timeouts but
+  #   NOT curl-level transport faults like 92, so it would not have retried this.
+  # -f so an error page is a failure rather than a few hundred bytes of html saved
+  #   under the name of a kernel tarball, which tar then reports as a corrupt
+  #   archive -- an error nobody connects to the http status nobody printed.
+  # -L because kernel.org redirects to its CDN.
+  curl -fL -sS --http1.1 \
+    --connect-timeout 20 --max-time 900 \
+    --retry 5 --retry-delay 5 --retry-all-errors \
+    -o "linux-$V.tar.xz" \
+    "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$V.tar.xz"
+
+  # CHECKED BEFORE IT IS UNPACKED. A truncated download that happens to end on a
+  # frame boundary unpacks far enough to start a build, and the build then fails
+  # somewhere deep in the tree with an error about a missing header.
+  echo "$KERNEL_SHA256  linux-$V.tar.xz" | sha256sum -c -
+
   tar xf "linux-$V.tar.xz"
 }
 cd "linux-$V"
