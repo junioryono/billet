@@ -210,67 +210,64 @@ afterwards.
 If nothing has passed verification, `@verified` **refuses** rather than booting something
 unproven.
 
-### Why this is a schedule and not a chore
+### Where images come from
 
-**GitHub stops sending jobs to a runner that is more than 30 days behind a release.** The
-service refuses the message rather than asking the runner to update, so nothing on the
-runner's side recovers: the fleet looks healthy and jobs simply queue.
+Every deployment needs the same guest: Ubuntu, Docker, the Actions runner, billet's agent.
+Nothing in it is specific to an organisation, so billet builds it **once, centrally**, and
+a deployment pulls it:
 
-An ordinary self-hosted runner updates itself in place, so a stale image would only be
-slow. billet's cannot — a JIT configuration from GitHub's API carries
-`DisableUpdate = True` (measured; there is no parameter to ask otherwise), so **the runner
-baked into an image is the runner forever** and republishing is the only way past the
-deadline.
-
-So enable the timer. **It runs the build scripts from a checkout**, which the packages do
-not install — the unit's `REPO` must point at one, and at a path that will still be there
-next Sunday:
-
-```bash
-sudo git clone https://github.com/junioryono/billet /opt/billet   # what REPO points at
-sudo cp deploy/billet-image-refresh.{service,timer} /etc/systemd/system/
-sudoedit /etc/systemd/system/billet-image-refresh.service          # REPO, CONFIG, BILLET
-sudo systemctl enable --now billet-image-refresh.timer             # the TIMER, not the service
+```
+billet images pull ubuntu-2404-x64
+billet images verify ubuntu-2404-x64@<generation>
 ```
 
-Enabling the *service* instead of the timer would run a two-hour root build at every boot,
-which is why it deliberately carries no `[Install]` section.
+The pull fetches a signed manifest, refuses anything this build cannot use, checks each
+asset against the digest the manifest names, unpacks, and publishes the result as a
+generation. It stages to disk and verifies **before** importing — streaming straight into
+the cluster would put unverified bytes into shared storage, where undoing it is a cluster
+operation rather than deleting a file.
 
-Weekly, against a 30-day deadline, because the run itself can fail — on a package mirror,
-on a verification, on a full disk — and a monthly cadence leaves no room for the retry.
+**This used to be a per-node timer that rebuilt the image on every machine.** That is
+gone. It required root, debootstrap and an hour on every node, it had every operator
+independently discover GitHub's thirty-day rule, and it made N machines do N builds of a
+byte-identical artifact. Building centrally makes the expiry one project's problem instead
+of everybody's.
 
-**Enable it on every node — that is the redundancy.** A timer on one machine stops when
-that machine does, and GitHub's thirty days do not pause while it is down. With every node
-carrying it, the rebuild happens as long as *any* node is up.
+`scripts/build-guest-image.sh` remains, for a custom image or an air-gapped build. It is
+no longer the normal path.
 
-They cooperate rather than duplicate. Whichever starts second asks `billet images due`,
-finds a recent generation, and stands down with exit 0 — a machine standing by has
-succeeded, and a unit that reported failure every week on every node but one would teach
-you to ignore it. If two genuinely overlap, an `rbd lock` taken in the cluster stops the
-writes interleaving, and a run on one machine is kept single by a file lock.
+### What is checked before an image is published
 
-### What it does, and what it deliberately does not
+Nothing reaches a release without passing both halves of a gate, because an image that
+reaches a release is one every deployment pulls — a bad one fans out to everybody on the
+next refresh, and the thing that would rebuild it is itself a guest booting the image.
 
-Each run rebuilds, publishes a new generation, and then **verifies it by booting it** —
-the guest itself reports that it dropped to the unprivileged account, that the
-registration arrived intact, that the runner binary executes, that Docker is up on
-billet's kernel, and that a container ran. Nothing the host can check on its own is
-enough: an image that boots perfectly and runs no job passes every host-side signal there
-is.
+**Its contents**, by loop-mounting the filesystem read-only: the runner is installed and
+is the version the manifest claims, Docker is there, the agent's contract matches what the
+manifest advertises, the units that must start are *enabled* rather than merely present,
+and root is locked rather than passwordless.
 
-It **does not promote**. Publishing is safe by construction — a generation is immutable
-and nothing boots it until a tier names it — while promotion puts a new image in front of
-every job at once. So a run leaves a verified generation and prints it, and pointing a
-tier at it stays a decision you make:
+**That it boots**, under Firecracker, on the runner that built it. The guest is served a
+metadata contract it is required to refuse, and its refusal on the console proves the
+whole chain: the kernel booted this filesystem, systemd reached its target, the network
+came up, the metadata service answered, and the agent ran and parsed what it got. A pass
+is that sentence — not a clean exit, because Firecracker exits 0 on some guest-side
+failures.
 
-```yaml
-tiers:
-  - label: billet-2vcpu
-    image: ubuntu-2404-x64@g20260814143405
-```
+The two catch different things and neither replaces the other. Contents cannot see an
+integration failure; a boot cannot see that a unit was installed but never enabled.
 
-A failed verification therefore leaves the running fleet untouched by construction rather
-than by care.
+### The kernel and the filesystem are a matched pair
+
+A guest booted with a different kernel fails in the middle of somebody's job, so they are
+published together and the generation records which kernel it was paired with. A pull
+keeps the kernel it fetched in `/var/lib/billet/kernels`, named by version *and* digest —
+version alone does not identify a file, since two builds can produce the same version from
+different sources.
+
+`billet images reap` collects kernels no surviving generation names. It refuses while any
+generation's kernel is unknown: such a generation still boots something on disk, unnamed
+and indistinguishable from an orphan, and deleting it breaks the generation that boots it.
 
 ### Taking up a new runner release
 

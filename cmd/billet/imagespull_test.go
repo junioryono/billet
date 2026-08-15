@@ -398,3 +398,72 @@ func TestKernelFileNameIdentifiesTheFileOnDisk(t *testing.T) {
 			filepath.Base(installed), name)
 	}
 }
+
+// THE NAME CARRIES THE DIGEST, SO A FILE AT THAT NAME MUST *BE* THAT KERNEL.
+//
+// installKernel returned success whenever the destination existed, treating the
+// name as proof of content. But the name is only proof if something checked it,
+// and nothing did: a truncated copy from an interrupted earlier run, or a file an
+// operator dropped in, would be booted by every generation paired with that digest
+// -- silently, because the whole point of putting the digest in the name is that
+// it identifies the bytes.
+func TestInstallKernelRefusesAnExistingFileThatIsNotThatKernel(t *testing.T) {
+	staging := t.TempDir()
+	kernels := t.TempDir()
+
+	_, m := stageDir(t, []byte("rootfs"), []byte("the real kernel"))
+
+	if err := os.WriteFile(filepath.Join(staging, m.Kernel.Name),
+		[]byte("the real kernel"), 0o600); err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+
+	// Something else already occupies the name this kernel would take.
+	impostor := filepath.Join(kernels, kernelFileName(m))
+	if err := os.WriteFile(impostor, []byte("not the real kernel"), 0o644); err != nil {
+		t.Fatalf("stage impostor: %v", err)
+	}
+
+	_, err := installKernel(m, staging, kernels)
+	if err == nil {
+		t.Fatal("a file whose content does not match the digest in its own name was " +
+			"accepted; every generation paired with that digest would boot it")
+	}
+
+	if !strings.Contains(err.Error(), "digest") && !strings.Contains(err.Error(), "content") {
+		t.Errorf("the refusal does not say what is wrong: %v", err)
+	}
+}
+
+// AND A FILE THAT *IS* THAT KERNEL is still accepted without recopying, which is
+// what makes re-pulling the same image cheap.
+func TestInstallKernelAcceptsAnExistingFileThatMatches(t *testing.T) {
+	staging := t.TempDir()
+	kernels := t.TempDir()
+
+	_, m := stageDir(t, []byte("rootfs"), []byte("the real kernel"))
+
+	if err := os.WriteFile(filepath.Join(staging, m.Kernel.Name),
+		[]byte("the real kernel"), 0o600); err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+
+	first, err := installKernel(m, staging, kernels)
+	if err != nil {
+		t.Fatalf("first install: %v", err)
+	}
+
+	// Remove the source: a second install must succeed from what is already there.
+	if err := os.Remove(filepath.Join(staging, m.Kernel.Name)); err != nil {
+		t.Fatalf("remove source: %v", err)
+	}
+
+	second, err := installKernel(m, staging, kernels)
+	if err != nil {
+		t.Fatalf("installing an already-present matching kernel failed: %v", err)
+	}
+
+	if first != second {
+		t.Errorf("the same kernel resolved to %q then %q", first, second)
+	}
+}

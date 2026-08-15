@@ -378,10 +378,22 @@ func installKernel(manifest *imagesource.Manifest, from, dir string) (string, er
 
 	final := filepath.Join(dir, kernelFileName(manifest))
 
-	// ALREADY THERE IS SUCCESS, NOT A CONFLICT. The name carries the digest, so a
-	// file at this path is this kernel -- re-pulling the same image, or pulling two
-	// images that share a kernel, must not fail or copy again.
+	// ALREADY THERE IS SUCCESS ONLY IF IT IS ACTUALLY THAT KERNEL.
+	//
+	// The name carries the digest, so re-pulling the same image or pulling two
+	// images that share a kernel must not copy again. But the name is proof of
+	// content only if something checks it, and the first version of this checked
+	// nothing: a truncated copy from an interrupted run, or a file an operator
+	// dropped in, would then be booted by every generation paired with that digest
+	// -- silently, because putting the digest in the name is precisely the claim
+	// that it identifies the bytes.
 	if _, err := os.Stat(final); err == nil {
+		if err := imagesource.VerifyFile(final, manifest.Kernel.SHA256); err != nil {
+			return "", fmt.Errorf("%s already exists and its content does not match the "+
+				"digest its own name carries; refusing to boot generations against it. Remove "+
+				"it if it is a partial copy from an interrupted pull: %w", final, err)
+		}
+
 		return final, nil
 	}
 

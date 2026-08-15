@@ -125,10 +125,11 @@ jobs:
           update themselves out of it: a JIT configuration carries \`DisableUpdate = True\`, so
           the runner baked into an image is the runner forever.
 
-          Merging this moves the pin, which is the default a hand-run build uses and what
-          \`billet ami\` installs. The scheduled \`billet-image-refresh.timer\` already builds at
-          whatever GitHub has published, so a fleet running that is current either way — this
-          keeps the source honest and the two backends in step.
+          Merging this moves the pin, which is what the guest-image workflow bakes in and
+          what \`billet ami\` installs. Merging is deliberately the gate: a bad runner release
+          should not reach a fleet without somebody agreeing to it.
 
-          Nothing is verified by opening this. \`billet images verify\` runs a real guest on a
-          node with \`/dev/kvm\`, which no hosted runner can do."
+          Nothing is verified by opening this. The guest-image workflow builds the image and
+          proves it boots — under Firecracker, on a hosted runner, which does have
+          \`/dev/kvm\`. \`billet images verify\` then proves it against a real cluster, which is
+          the half a hosted runner genuinely cannot do."
