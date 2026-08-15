@@ -1,7 +1,6 @@
 package firecracker
 
 import (
-	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -20,7 +19,7 @@ func TestKernelForGenerationPrefersWhatTheGenerationRecorded(t *testing.T) {
 		t.Fatalf("resolve: %v", err)
 	}
 
-	want := filepath.Join("/var/lib/billet/kernels", "vmlinux-6.1.155-ea1d42638d13")
+	want := "/var/lib/billet/kernels/vmlinux-6.1.155-ea1d42638d13"
 
 	if got != want {
 		t.Errorf("resolved %q, want %q; the configured kernel won over the one this "+
@@ -47,6 +46,19 @@ func TestKernelForGenerationFallsBackWhenNothingIsRecorded(t *testing.T) {
 // A RECORDED VALUE THAT IS NOT A PLAIN FILE NAME IS REFUSED. It comes from cluster
 // metadata, which any client with write access to the pool can set, and it is
 // about to be joined to a path this process opens.
+// THE MANAGED DIRECTORY IS CONFIGURABLE, so nothing may assume where it is.
+func TestKernelForGenerationHonoursTheDirectoryItIsGiven(t *testing.T) {
+	got, err := kernelForGeneration("vmlinux-6.1.155-ea1d42638d13",
+		"/srv/billet/kernels", "/srv/configured")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+
+	if got != "/srv/billet/kernels/vmlinux-6.1.155-ea1d42638d13" {
+		t.Errorf("resolved %q; the managed directory was ignored", got)
+	}
+}
+
 func TestKernelForGenerationRefusesARecordedValueThatIsNotAFileName(t *testing.T) {
 	for _, recorded := range []string{
 		"../../etc/shadow",
