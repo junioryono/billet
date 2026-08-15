@@ -28,10 +28,11 @@ type importFake struct {
 	// lockHeld is what `rbd lock ls` reports. Empty means the fake tracks the
 	// lock itself: `lock add` succeeds and the listing then names this cookie,
 	// which is what lets Release find and remove it.
-	lockHeld   string
-	lockTaken  string
-	lockAddErr error
-	unmapErr   error
+	lockHeld    string
+	lockTaken   string
+	lockAddErr  error
+	unmapErr    error
+	poolMissing bool
 }
 
 func (f *importFake) run(_ context.Context, _ string, args []string) ([]byte, error) {
@@ -68,6 +69,14 @@ func (f *importFake) run(_ context.Context, _ string, args []string) ([]byte, er
 	case "device map":
 		return []byte(f.device + "\n"), nil
 	case "device list":
+		return []byte("[]"), nil
+	case "ls":
+		// The pool listing, which the importer uses to tell an absent IMAGE from an
+		// absent POOL -- rbd answers ENOENT for both.
+		if f.poolMissing {
+			return nil, errors.New("rbd: error opening pool 'billet-images': (2) No such file or directory")
+		}
+
 		return []byte("[]"), nil
 	case "create", "resize", "snap", "image-meta":
 		return []byte(""), nil
@@ -621,5 +630,145 @@ func TestWriteImageRefusesASourceThatShrankUnderIt(t *testing.T) {
 
 	if !strings.Contains(err.Error(), "changed underneath") {
 		t.Errorf("the failure does not explain what happened: %v", err)
+	}
+}
+
+// rbd ANSWERS ENOENT FOR AN ABSENT POOL AND AN ABSENT IMAGE ALIKE, so reaching
+// the create path proves only that one of the two is missing. Creating into a
+// pool that is not there fails for a second reason, and that second reason is
+// what the operator would otherwise be shown.
+func TestImportGenerationSaysWhenItIsThePoolThatIsMissing(t *testing.T) {
+	raw, device := stageRaw(t, "content")
+
+	f := &importFake{device: device, poolMissing: true}
+
+	_, err := importClient(t, f).ImportGeneration(
+		t.Context(), "ubuntu-2404-x64", raw, "2.336.0", importAt)
+	if err == nil {
+		t.Fatal("an import into a pool that does not exist reported success")
+	}
+
+	if !strings.Contains(err.Error(), "neither does the pool") {
+		t.Errorf("the failure blames the image rather than the pool: %v", err)
+	}
+
+	if f.ranWith("create", "ubuntu-2404-x64") {
+		t.Error("billet tried to create an image in a pool that does not exist")
+	}
+}
+
+// THE SIZE IS ROUNDED UP TO WHOLE MEGABYTES. Rounding down truncates the end of
+// the filesystem, which on ext4 is data rather than slack.
+func TestImportGenerationRoundsUpToWholeMegabytes(t *testing.T) {
+	for _, tc := range []struct {
+		bytes int
+		want  string
+	}{
+		{1, "513M"},                // a single byte still needs one megabyte
+		{bytesPerMB, "513M"},       // exactly one
+		{bytesPerMB + 1, "514M"},   // one byte over rounds up
+		{3*bytesPerMB - 1, "515M"}, // just under three
+		{3 * bytesPerMB, "515M"},   // exactly three
+	} {
+		t.Run(tc.want, func(t *testing.T) {
+			raw, device := stageRaw(t, strings.Repeat("x", tc.bytes))
+
+			f := &importFake{device: device}
+
+			if _, err := importClient(t, f).ImportGeneration(
+				t.Context(), "ubuntu-2404-x64", raw, "2.336.0", importAt); err != nil {
+				t.Fatalf("import: %v", err)
+			}
+
+			if !f.ranWith("create", "ubuntu-2404-x64", "--size", tc.want) {
+				t.Errorf("%d bytes was not sized as %s; billet ran %v", tc.bytes, tc.want, f.calls)
+			}
+		})
+	}
+}
+
+// TWO IMPORTS IN ONE SECOND PRODUCE ONE NAME. The publish lock makes this
+// unreachable in practice, but the failure has to be safe rather than merely
+// unlikely: the existing generation is immutable and must not be replaced, and
+// its recorded runner version must not be overwritten with the new one.
+func TestImportGenerationRefusesToRepublishAnExistingGenerationName(t *testing.T) {
+	raw, device := stageRaw(t, "content")
+
+	f := &importFake{device: device, failOn: "snap"}
+
+	_, err := importClient(t, f).ImportGeneration(
+		t.Context(), "ubuntu-2404-x64", raw, "2.336.0", importAt)
+	if err == nil {
+		t.Fatal("a colliding snapshot name was reported as a successful publish")
+	}
+
+	if f.ranWith("image-meta", "set") {
+		t.Error("the runner version was recorded against a snapshot that was not created; " +
+			"on a real collision that would overwrite the existing generation's version")
+	}
+}
+
+// THE HEAD IS UNMAPPED EVEN WHEN THE WRITE FAILED AND THE UNMAP ALSO FAILS, and
+// the reported error is the write's -- a head left mapped is a consequence of the
+// failure, not its cause, so substituting it sends an operator after the wrong
+// thing.
+func TestImportGenerationReportsTheWriteFailureNotTheCleanupFailure(t *testing.T) {
+	raw, device := stageRaw(t, "content")
+
+	f := &importFake{
+		device:   filepath.Dir(device), // a directory: the write fails
+		unmapErr: errors.New("exit status 16"),
+	}
+
+	_, err := importClient(t, f).ImportGeneration(
+		t.Context(), "ubuntu-2404-x64", raw, "2.336.0", importAt)
+	if err == nil {
+		t.Fatal("writing to a directory was reported as a successful import")
+	}
+
+	// THE WRITE'S FAILURE COMES FIRST. Opening a directory fails at OpenFile rather
+	// than at the copy, so the message is "cannot write to" -- asserting on the
+	// copy's wording instead made this test fail against correct behaviour.
+	if !strings.HasPrefix(err.Error(), "ceph: cannot write to") {
+		t.Errorf("the cleanup's failure replaced the real one: %v", err)
+	}
+
+	if !strings.Contains(err.Error(), "left mapped") {
+		t.Errorf("the failed cleanup is not mentioned at all: %v", err)
+	}
+}
+
+// THE KEY IS `billet.runner_version.<generation>`, so a malformed generation
+// writes a key nothing reads -- every reader arrives holding a name that came
+// from `rbd snap ls` and therefore parses -- and nothing reaps it, because
+// reaping walks generations and a key whose suffix is not one is invisible.
+func TestSetRunnerVersionRefusesAGenerationBilletDidNotPublish(t *testing.T) {
+	for _, generation := range []string{
+		"",
+		"   ",
+		"latest",
+		"20260815041709", // no prefix
+		"gnotatimestamp",
+		"g2026",
+	} {
+		f := &importFake{}
+
+		err := importClient(t, f).SetRunnerVersion(
+			t.Context(), "ubuntu-2404-x64", generation, "2.336.0")
+		if err == nil {
+			t.Errorf("%q was accepted as a generation", generation)
+		}
+
+		if f.ranWith("image-meta", "set") {
+			t.Errorf("a key was written against %q", generation)
+		}
+	}
+
+	// And the shape billet actually publishes is accepted.
+	f := &importFake{}
+
+	if err := importClient(t, f).SetRunnerVersion(
+		t.Context(), "ubuntu-2404-x64", "g20260815041709", "2.336.0"); err != nil {
+		t.Errorf("a real generation was refused: %v", err)
 	}
 }

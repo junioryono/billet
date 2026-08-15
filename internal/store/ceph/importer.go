@@ -127,7 +127,16 @@ func (c *Client) ImportGeneration( //nolint:nonamedreturns // the deferred unmap
 			return
 		}
 
-		unmapErr := c.unmapDevice(ctx, device, image)
+		// THE CLEANUP OUTLIVES THE DEADLINE THAT KILLED THE IMPORT. The raw write is
+		// deliberately unbounded and moves gigabytes, so a caller's deadline can
+		// easily expire during it -- and running the unmap on that dead context
+		// fails immediately, leaving the head mapped for exactly the reason the
+		// cleanup exists. WithoutCancel keeps the credentials and the values while
+		// dropping the cancellation.
+		unmapCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.wait)
+		defer cancel()
+
+		unmapErr := c.unmapDevice(unmapCtx, device, image)
 		if unmapErr == nil {
 			return
 		}
@@ -234,12 +243,20 @@ func (c *Client) ensureHead(ctx context.Context, image string, wantMB int64) err
 		// resize. --object-size is pinned because Ceph's default is configurable per
 		// cluster, so leaving it unset makes the layout depend on the operator's
 		// ceph.conf.
+		// AN ABSENT POOL LOOKS EXACTLY LIKE AN ABSENT IMAGE. `rbd info` answers ENOENT
+		// for both, so reaching here proves only that one of the two is missing --
+		// and creating an image in a pool that does not exist fails for a second
+		// reason, which is the one the operator would then be shown. Asking the pool
+		// directly is what separates "first run" from "that pool is not there".
+		if _, listErr := c.list(ctx, c.cfg.ImagePool); listErr != nil {
+			return fmt.Errorf("ceph: %s/%s does not exist, and neither does the pool: %w",
+				c.cfg.ImagePool, image, listErr)
+		}
+
 		if _, err := c.rbdCmd(ctx, false, "-p", c.cfg.ImagePool, "create", image,
 			"--size", fmt.Sprintf("%dM", wantMB+headSlackMB),
 			"--object-size", "4M"); err != nil {
-			return fmt.Errorf("ceph: could not create %s/%s (if the pool does not exist, rbd "+
-				"reports the same ENOENT as a missing image and this is where it surfaces): %w",
-				c.cfg.ImagePool, image, err)
+			return fmt.Errorf("ceph: could not create %s/%s: %w", c.cfg.ImagePool, image, err)
 		}
 
 		return nil
