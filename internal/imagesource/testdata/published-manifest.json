@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "guest_contract": "2",
+  "arch": "x86_64",
+  "runner_version": "2.336.0",
+  "built_at": "2026-08-15T02:06:39Z",
+  "rootfs": {
+    "name": "rootfs.img.zst",
+    "sha256": "85f3540e553d7f785322a61ab9d94927c8b7e6ba694f8dd8c64c58eaf226cae6",
+    "size": 313481597,
+    "compression": "zstd"
+  },
+  "kernel": {
+    "name": "vmlinux-billet",
+    "sha256": "d584d0433d9cf42094d023d297364bcbf5bbfec2dc04b5900bc35ce247628c1c",
+    "size": 45974528,
+    "version": "6.1.155"
+  }
+}
