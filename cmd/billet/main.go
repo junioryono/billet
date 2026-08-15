@@ -1984,6 +1984,13 @@ func (noRootDisk) CloneRoot(context.Context, string, string) (string, error) {
 
 func (noRootDisk) DiscardRoot(context.Context, string) error { return nil }
 
+// KernelFor answers "nothing recorded", which is the truthful answer from a node
+// with no cluster to have recorded anything in — and the caller treats it as the
+// fallback case rather than an error.
+func (noRootDisk) KernelFor(context.Context, string, string) (string, bool, error) {
+	return "", false, nil
+}
+
 // checkCephCluster proves this machine can act on its storage configuration.
 //
 // THE SAME DISTINCTION checkPrivateKey AND checkEC2Credentials MAKE, one backend

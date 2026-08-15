@@ -283,6 +283,14 @@ func (d rbdDisk) DiscardRoot(ctx context.Context, name string) error {
 	return nil
 }
 
+// KernelFor answers "nothing recorded". This harness boots against a real cluster
+// with the kernel the test configures, which is exactly the unpaired case -- and
+// pretending otherwise would have the launch look for a kernel this test never
+// installed.
+func (d rbdDisk) KernelFor(_ context.Context, _, _ string) (string, bool, error) {
+	return "", false, nil
+}
+
 // freshLease is a lease id of the shape alloc mints, unique per run so a previous
 // failed run's leftovers cannot be mistaken for this one's.
 func freshLease(t *testing.T) string {

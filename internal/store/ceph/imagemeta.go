@@ -247,3 +247,12 @@ func (c *Client) Images(ctx context.Context) ([]string, error) {
 
 	return kept, nil
 }
+
+// KernelFor reports which kernel file a generation was paired with.
+//
+// THE NAME THE PROVIDER'S INTERFACE ASKS FOR. Kernel() is the same lookup; this
+// exists so the provider can declare the operation it needs without the store
+// having to rename a method that other callers already use.
+func (c *Client) KernelFor(ctx context.Context, image, generation string) (string, bool, error) {
+	return c.Kernel(ctx, image, generation)
+}

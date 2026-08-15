@@ -231,7 +231,7 @@ func (p *Provider) claim(j jail) error {
 	return p.writeOwner(j)
 }
 
-func (p *Provider) build(j jail, device string, res resources) error {
+func (p *Provider) build(j jail, device, kernel string, res resources) error {
 	if err := os.MkdirAll(j.root(), 0o700); err != nil {
 		return fmt.Errorf("firecracker: create the jail at %s: %w", j.root(), err)
 	}
@@ -260,7 +260,7 @@ func (p *Provider) build(j jail, device string, res resources) error {
 	// that protected it. It did not: the kernel lives INSIDE the chroot, because the
 	// VMM has to open it by a path under its own root. Placing it afterwards is what
 	// actually keeps it, and the preflight proves it is readable without being owned.
-	return p.placeKernel(j)
+	return p.placeKernel(j, kernel)
 }
 
 // writeOwner records the deployment this jail belongs to.
@@ -381,14 +381,14 @@ func ownerOf(j jail) (string, error) {
 //
 // WORLD-READABLE, because that is what the jailed account needs and all it needs.
 // The file is a kernel image rather than a secret.
-func (p *Provider) placeKernel(j jail) error {
-	if err := os.Link(p.cfg.KernelImage, j.kernelPath()); err == nil {
+func (p *Provider) placeKernel(j jail, kernel string) error {
+	if err := os.Link(kernel, j.kernelPath()); err == nil {
 		return nil
 	}
 
-	src, err := os.Open(p.cfg.KernelImage)
+	src, err := os.Open(kernel)
 	if err != nil {
-		return fmt.Errorf("firecracker: open the guest kernel %s: %w", p.cfg.KernelImage, err)
+		return fmt.Errorf("firecracker: open the guest kernel %s: %w", kernel, err)
 	}
 
 	defer src.Close()

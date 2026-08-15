@@ -76,6 +76,18 @@ type RootDisk interface {
 	// DiscardRoot unmaps and removes a clone. It must be idempotent: teardown runs
 	// on paths that have already failed once.
 	DiscardRoot(ctx context.Context, name string) error
+	// KernelFor reports which kernel file a generation was paired with, if any.
+	//
+	// THE PAIRING IS AN INVARIANT, NOT BOOKKEEPING. A guest booted with a different
+	// kernel than the one its filesystem was verified against does not fail to
+	// start -- it fails in the middle of somebody's job, which is why the two are
+	// published together. Recording which kernel a generation needs means nothing
+	// unless the launch asks.
+	//
+	// NOT FOUND IS NORMAL AND NOT AN ERROR: generations published by
+	// build-guest-image.sh record no kernel, because that script installs none and
+	// genuinely does not know which will be used.
+	KernelFor(ctx context.Context, image, generation string) (string, bool, error)
 }
 
 // Provider launches one Firecracker microVM per job.
@@ -363,6 +375,16 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*Instance, e
 
 	spec.Image = image
 
+	// WHICH KERNEL THIS GENERATION WAS VERIFIED AGAINST, resolved before anything
+	// is placed in the jail. A node-wide kernel is a default, not a decision: an
+	// operator who points one config at two generations that need different kernels
+	// has no way to be right, and the resulting failure lands inside a job rather
+	// than at launch.
+	kernel, err := p.kernelFor(ctx, spec.Image)
+	if err != nil {
+		return nil, errors.Join(err, j.remove())
+	}
+
 	device, err := p.disk.CloneRoot(ctx, spec.Image, spec.Name)
 	if err != nil {
 		// A CLONE ERROR DOES NOT PROVE NO CLONE EXISTS. `rbd clone` can be killed by
@@ -382,7 +404,7 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*Instance, e
 	// something started" and asks Find — so this is not the safety net, it is the
 	// ordinary case being tidy. What it must never do is replace the reason the
 	// launch failed with the reason a cleanup failed.
-	inst, err := p.launch(ctx, j, spec, device, res)
+	inst, err := p.launch(ctx, j, spec, device, kernel, res)
 	if err != nil {
 		return nil, errors.Join(err, p.unwind(ctx, j, spec, res, err))
 	}
@@ -395,9 +417,9 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*Instance, e
 
 // launch does the work Launch unwinds on failure.
 func (p *Provider) launch(
-	ctx context.Context, j jail, spec provider.Spec, device string, res resources,
+	ctx context.Context, j jail, spec provider.Spec, device, kernel string, res resources,
 ) (*Instance, error) {
-	if err := p.build(j, device, res); err != nil {
+	if err := p.build(j, device, kernel, res); err != nil {
 		return nil, err
 	}
 
@@ -1484,4 +1506,46 @@ func lastLine(s string) string {
 	lines := strings.Split(strings.TrimSpace(s), "\n")
 
 	return strings.TrimSpace(lines[len(lines)-1])
+}
+
+// kernelFor resolves which kernel file a generation must boot.
+//
+// THE GENERATION'S OWN KERNEL WINS OVER THE NODE'S CONFIGURATION, because the two
+// are published together and a mismatch fails inside somebody's job rather than at
+// launch. A generation that records none falls back, since build-guest-image.sh
+// installs no kernel and its generations arrive unpaired.
+//
+// A RECORDED KERNEL THAT IS NOT ON THIS HOST IS A HARD FAILURE, not a fallback.
+// Quietly booting the node's default instead is exactly the mismatch this exists
+// to prevent, and it would do it while reporting success.
+func (p *Provider) kernelFor(ctx context.Context, image string) (string, error) {
+	name, generation, found := strings.Cut(image, "@")
+	if !found {
+		return "", fmt.Errorf("firecracker: %q names no generation", image)
+	}
+
+	recorded, ok, err := p.disk.KernelFor(ctx, name, generation)
+	if err != nil {
+		return "", err
+	}
+
+	if !ok {
+		recorded = ""
+	}
+
+	kernel, err := kernelForGeneration(recorded, p.cfg.KernelDir, p.cfg.KernelImage)
+	if err != nil {
+		return "", err
+	}
+
+	if recorded != "" {
+		if _, err := os.Stat(kernel); err != nil {
+			return "", fmt.Errorf("firecracker: %s was verified against kernel %s, which is "+
+				"not on this host. Pull the image on this node so its kernel is installed; "+
+				"booting the configured kernel instead is the mismatch that fails inside a "+
+				"job rather than at launch: %w", image, recorded, err)
+		}
+	}
+
+	return kernel, nil
 }
