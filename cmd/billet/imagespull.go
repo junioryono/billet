@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -259,14 +261,24 @@ func stageImage(
 			return nil, "", nil, err
 		}
 
-		if err := verifyLocal(from, manifest); err != nil {
+		// COPIED INTO PRIVATE STAGING WHILE BEING HASHED, rather than verified where
+		// they sit and read again later.
+		//
+		// verifyLocal hashes each asset BY PATH, and the import reopens it BY PATH
+		// some minutes later -- so whoever owns the directory can swap a file, or
+		// retarget a symlink, in between. The bytes that reach the cluster would then
+		// be bytes nothing checked, without anybody forging a signature. That is the
+		// same shape as verifying a download after renaming it, which the network
+		// path is careful not to do.
+		//
+		// The copy is what makes the digest binding, so it is not an optimisation to
+		// remove later.
+		staged, cleanup, err := copyStagedAssets(from, staging, manifest)
+		if err != nil {
 			return nil, "", nil, err
 		}
 
-		// NOTHING TO CLEAN UP: these are the operator's files, sitting where the
-		// operator put them, and removing them would be a surprising thing for a
-		// pull to do.
-		return manifest, from, func() {}, nil
+		return manifest, staged, cleanup, nil
 	}
 
 	src, err := resolveSource(cfg, opts.source)
@@ -568,4 +580,73 @@ func installKernel(manifest *imagesource.Manifest, from, dir string) (string, er
 // on version alone removes a kernel some generation is verified against.
 func kernelFileName(manifest *imagesource.Manifest) string {
 	return fmt.Sprintf("vmlinux-%s-%s", manifest.Kernel.Version, manifest.Kernel.SHA256[:12])
+}
+
+// copyStagedAssets copies a sideloaded directory's assets into private staging,
+// verifying each as it goes.
+//
+// HASHED FROM THE COPY, NOT FROM THE SOURCE. Hashing the operator's file and then
+// reading it again later leaves a window in which it can be replaced; hashing what
+// was actually written closes it, because that copy is what the import reads and
+// nothing else can reach it.
+func copyStagedAssets(
+	from, staging string,
+	manifest *imagesource.Manifest,
+) (string, func(), error) {
+	dir, err := os.MkdirTemp(staging, "sideload-*")
+	if err != nil {
+		return "", nil, fmt.Errorf("billet images pull: cannot stage in %s: %w", staging, err)
+	}
+
+	cleanup := func() { _ = os.RemoveAll(dir) }
+
+	for _, asset := range []imagesource.Asset{manifest.Rootfs, manifest.Kernel} {
+		if err := copyVerified(filepath.Join(from, asset.Name),
+			filepath.Join(dir, asset.Name), asset); err != nil {
+			cleanup()
+
+			return "", nil, err
+		}
+	}
+
+	return dir, cleanup, nil
+}
+
+// copyVerified copies one asset and proves the copy is what the manifest named.
+func copyVerified(src, dst string, asset imagesource.Asset) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("billet images pull: the manifest names %s and it cannot be read: %w",
+			asset.Name, err)
+	}
+
+	defer func() { _ = in.Close() }()
+
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return fmt.Errorf("billet images pull: cannot stage %s: %w", asset.Name, err)
+	}
+
+	defer func() { _ = out.Close() }()
+
+	sum := sha256.New()
+
+	// SIZE+1 SO A LONGER FILE IS AN ERROR rather than a truncation to the promised
+	// length, which would let a digest match a prefix of something larger.
+	written, err := io.Copy(io.MultiWriter(out, sum), io.LimitReader(in, asset.Size+1))
+	if err != nil {
+		return fmt.Errorf("billet images pull: cannot copy %s: %w", asset.Name, err)
+	}
+
+	if written != asset.Size {
+		return fmt.Errorf("billet images pull: %s is %d bytes and the manifest says %d",
+			asset.Name, written, asset.Size)
+	}
+
+	if got := hex.EncodeToString(sum.Sum(nil)); got != asset.SHA256 {
+		return fmt.Errorf("billet images pull: %s hashes to %s and the manifest published %s; "+
+			"it is not the file that was signed", asset.Name, got, asset.SHA256)
+	}
+
+	return out.Close()
 }

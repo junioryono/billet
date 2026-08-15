@@ -286,27 +286,33 @@ func cmdImagesVerify(ctx context.Context, args []string) error {
 		// So a failure here stops the generation becoming @verified. A generation that
 		// is verified but unpaired is worse than one that is neither: every node takes
 		// it up, and each boots it against its own kernel.
-		name := configuredKernelName(cfg, *kernelDir)
+		// `rest` is `<image>@<generation>`, which the check above proved.
+		imageName, generation, _ := strings.Cut(rest, "@")
 
-		if name != "" {
-			// `rest` is `<image>@<generation>`, which the check above proved.
-			imageName, generation, _ := strings.Cut(rest, "@")
+		// WHAT THE LAUNCH ACTUALLY BOOTED, not what this node is configured with.
+		//
+		// The provider resolves a generation's recorded kernel in preference to the
+		// configuration, so on a normally-pulled generation the thing that just
+		// booted is the thing already recorded. Overwriting it here would prove one
+		// kernel and record another -- and then publish that through @verified.
+		existing, _, err := store.Kernel(ctx, imageName, generation)
+		if err != nil {
+			return err
+		}
 
-			if err := store.SetKernel(ctx, imageName, generation, name); err != nil {
+		record, note := kernelToRecord(existing, configuredKernelName(cfg, *kernelDir))
+
+		if record != "" {
+			if err := store.SetKernel(ctx, imageName, generation, record); err != nil {
 				return fmt.Errorf("%s booted and ran a container, but the kernel that proved "+
 					"it could not be recorded, so it has NOT been marked verified: %w", rest, err)
 			}
 
-			fmt.Printf("\nrecorded %s as the kernel this generation was proved against\n", name)
-		} else {
-			// SAID OUT LOUD RATHER THAN RECORDED WRONG. Recording a basename for a
-			// kernel outside the managed directory would have every launch look for it
-			// in a directory it is not in, turning a working configuration into a hard
-			// failure on the next job.
-			fmt.Printf("\nnote: %s is not in %s, so this generation stays unpaired and every\n",
-				cfg.Node.Firecracker.KernelImage, *kernelDir)
-			fmt.Println("      node will boot it with whatever kernel it is configured with.")
-			fmt.Println("      `billet images pull` installs a kernel there and records the pairing.")
+			fmt.Printf("\nrecorded %s as the kernel this generation was proved against\n", record)
+		}
+
+		if note != "" {
+			fmt.Printf("\nnote: %s\n", note)
 		}
 
 		if err := store.MarkVerified(ctx, rest, time.Now()); err != nil {
