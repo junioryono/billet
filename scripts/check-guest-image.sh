@@ -124,6 +124,40 @@ else
 	fail "no docker client"
 fi
 
+# --- what workflows assume is there ----------------------------------------
+
+# CHECKED HERE BECAUSE THE FAILURE IS OTHERWISE INVISIBLE (#66).
+#
+# zstd is the one that matters most and the one a human would never notice
+# missing: actions/cache picks its compression by shelling out to it, falls back
+# to gzip when it is absent, and folds the choice into the CACHE VERSION HASH. An
+# image without it produces caches that can never match one from a github-hosted
+# runner -- same key, permanent miss, no error anywhere. Nothing about a running
+# job says so, which is exactly why it belongs in a gate.
+#
+# unzip and tar throw from inside @actions/tool-cache rather than reporting
+# anything about the image, so a missing one surfaces as "this action is broken".
+for tool in zstd unzip zip tar wget rsync gcc make; do
+	found=""
+
+	for dir in usr/bin usr/sbin bin sbin usr/local/bin; do
+		if [ -x "$MNT/$dir/$tool" ]; then
+			found="/$dir/$tool"
+
+			break
+		fi
+	done
+
+	if [ -n "$found" ]; then
+		pass "$tool is installed"
+	else
+		fail "no $tool. Workflows assume it: without zstd every actions/cache entry this
+        fleet writes has a different version hash from a github-hosted one and can never
+        be restored, and without unzip or tar the setup-* actions throw from inside
+        @actions/tool-cache"
+	fi
+done
+
 # --- billet's agent --------------------------------------------------------
 
 AGENT="$MNT/usr/local/bin/billet-agent"

@@ -167,10 +167,39 @@ EOF
 		apt-get update -qq
 		apt-get install -y --no-install-recommends \
 			ca-certificates curl iproute2 iptables jq git sudo \
-			docker.io systemd-resolved netplan.io libicu74
+			docker.io systemd-resolved netplan.io libicu74 \
+			unzip zip zstd tar wget rsync build-essential
 		apt-get clean
 		rm -rf /var/lib/apt/lists/*
 	'
+
+	# WHY THESE SIX, AND WHY THEY ARE NOT OPTIONAL (#66).
+	#
+	# zstd IS THE ONE THAT LOOKS LIKE IT WORKS. actions/cache chooses its
+	# compression by shelling out to `zstd --version`, falls back to gzip when it is
+	# absent, AND FOLDS THE CHOSEN TOOL INTO THE CACHE VERSION HASH. Without it,
+	# every cache this fleet saves has a different version from one saved on a
+	# github-hosted runner: same key, permanent miss, no error and no log line. A
+	# cache that silently never hits is worse than no cache, because the workflow
+	# still pays to save it.
+	#
+	# unzip and tar ARE HARD REQUIREMENTS OF THE setup-* FAMILY.
+	# @actions/tool-cache's extractZip calls io.which('unzip', true), which THROWS
+	# when it is missing -- so any action that downloads a tool fails outright, which
+	# is most of them.
+	#
+	# build-essential IS FOR THE SOURCE BUILD THAT HAS NO WHEEL. node-gyp, a native
+	# ruby gem, a pip install with no matching wheel: all fail without a compiler,
+	# and the error arrives from inside the package manager rather than from
+	# anything that mentions the image.
+	#
+	# NOT build-essential FOR setup-python, which is folklore. That action needs the
+	# distro to match its published manifest -- which is why this image is ubuntu
+	# 24.04 and not something smaller -- and a compiler only when it falls back to
+	# building from source.
+	#
+	# wget and rsync are cheap and assumed by enough workflows to be worth the few
+	# megabytes.
 
 	echo "=== 3/6 the actions runner ==="
 	# A DEDICATED, UNPRIVILEGED ACCOUNT. The runner refuses to run as root outright,
