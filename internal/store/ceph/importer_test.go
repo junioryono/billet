@@ -33,10 +33,31 @@ type importFake struct {
 	lockAddErr  error
 	unmapErr    error
 	poolMissing bool
+
+	// cancelOn fires the stored cancel when that subcommand is issued, which is how
+	// a test reproduces the case that matters: a deadline expiring PARTWAY through
+	// the import, after the lock has been taken. A context cancelled before the
+	// import begins proves nothing -- the lock is never taken, so a leak and a
+	// clean run look identical.
+	cancelOn string
+	cancel   context.CancelFunc
 }
 
-func (f *importFake) run(_ context.Context, _ string, args []string) ([]byte, error) {
+func (f *importFake) run(ctx context.Context, _ string, args []string) ([]byte, error) {
 	f.calls = append(f.calls, args)
+
+	// THE CONTEXT IS HONOURED, because a real exec.CommandContext is. A fake that
+	// ignores it makes every cancellation test vacuous: the first version of the
+	// leaked-lock test passed a cancelled context, watched the whole import
+	// succeed, and proved nothing about the code under test.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	if f.cancelOn != "" && f.cancelOn == subcommandOf(args) && f.cancel != nil {
+		f.cancel()
+		f.cancel = nil
+	}
 
 	sub := subcommandOf(args)
 
@@ -770,5 +791,43 @@ func TestSetRunnerVersionRefusesAGenerationBilletDidNotPublish(t *testing.T) {
 	if err := importClient(t, f).SetRunnerVersion(
 		t.Context(), "ubuntu-2404-x64", "g20260815041709", "2.336.0"); err != nil {
 		t.Errorf("a real generation was refused: %v", err)
+	}
+}
+
+// A CANCELLED CONTEXT MUST NOT LEAK THE PUBLISH LOCK.
+//
+// The raw write is deliberately unbounded and moves gigabytes, so a caller's
+// deadline can expire during it. Releasing on that dead context fails immediately
+// and leaves the lock held -- and nothing reclaims an rbd lock, so every publisher
+// on every node then refuses for StaleLockAfter. That is the outage the bound
+// exists to CAP, not a state to arrive at routinely.
+//
+// The fake records the context each call ran with, so this asserts the release
+// actually ran rather than that some error came back -- an implementation that
+// skipped the release entirely would also "not error".
+func TestImportGenerationReleasesTheLockEvenWhenTheContextIsDone(t *testing.T) {
+	raw, device := stageRaw(t, "content")
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	// CANCELLED AFTER THE LOCK IS TAKEN AND THE HEAD IS MAPPED, which is where a
+	// real deadline expires: during the multi-gigabyte write that follows.
+	f := &importFake{device: device, cancelOn: "device map", cancel: cancel}
+
+	_, err := importClient(t, f).ImportGeneration(
+		ctx, "ubuntu-2404-x64", raw, "2.336.0", importAt)
+	if err == nil {
+		t.Fatal("an import whose context expired partway through reported success")
+	}
+
+	if f.lockTaken == "" && !f.ranWith("lock", "add") {
+		t.Fatal("the lock was never taken, so this test proves nothing about releasing it")
+	}
+
+	if f.lockTaken != "" {
+		t.Errorf("the publish lock is still held as %q after an import on a cancelled "+
+			"context; nothing reclaims an rbd lock, so every publisher on every node "+
+			"would refuse for %s", f.lockTaken, StaleLockAfter)
 	}
 }
