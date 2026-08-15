@@ -36,6 +36,13 @@ fi
 
 RUNNER_VERSION="${RUNNER_VERSION:-$(awk "NR==1{print \$1}" "$PINNED_RUNNER_FILE")}"
 SUITE="${SUITE:-noble}"
+# 4096MB AGAINST ROUGHLY 2.6GB USED once the toolcache is in (#66): the base system
+# and runner are about 1.4GB, and node, go and python together add about 1.2GB.
+#
+# GROWING THIS IS NOT FREE. The head image is resized to fit, and every generation
+# already published keeps its own size -- so a larger number here costs disk on
+# every node from the next publish onward, and a number too small fails the build
+# partway through mkfs with a message about space rather than about the toolcache.
 SIZE_MB="${SIZE_MB:-4096}"
 IMAGE_POOL="${IMAGE_POOL:-billet-images}"
 IMAGE_NAME="${IMAGE_NAME:-ubuntu-2404-x64}"
@@ -106,6 +113,218 @@ need_tools() {
 		echo "runner and debootstrap architecture together" >&2
 		exit 1
 	fi
+}
+
+# TOOLCACHE_DIR IS NOT A CHOICE (#66).
+#
+# The python builds from actions/python-versions are configured with
+# `--enable-shared` and an RPATH pointing at this exact path, and their console
+# scripts carry it as a hardcoded shebang. They are NOT relocatable: extracted
+# anywhere else, `bin/python3` still loads its libraries from here, and every
+# entry point in bin/ points at a path that does not exist. setup-python papers
+# over half of that at runtime by exporting LD_LIBRARY_PATH and leaves the
+# shebangs broken.
+#
+# It is also what github's own image uses, which is why every published tarball
+# assumes it.
+TOOLCACHE_DIR=/opt/hostedtoolcache
+
+# install_toolcache bakes language runtimes in so `setup-*` is a PATH change.
+#
+# WITHOUT THIS, EVERY JOB PAYS A DOWNLOAD PER LANGUAGE. GitHub's image ships these
+# pre-extracted and `setup-node` finds them in about a second; on an image without
+# them the same step fetches a couple of hundred megabytes, every job, every time.
+# That is the difference between "works" and "as fast as github's".
+#
+# LATEST RESOLVED AT BUILD TIME, NOT PINNED. A toolcache is a cache, not a
+# contract: a workflow asking for `node-version: 20` does not care which patch it
+# finds, and pinning would buy a reproducibility nobody wants at the cost of
+# shipping stale runtimes. Every download is still checksum-verified against what
+# the vendor published for the version resolved, because this image runs other
+# people's code.
+install_toolcache() {
+	local rootfs="$1"
+	local tc="$rootfs$TOOLCACHE_DIR"
+
+	mkdir -p "$tc"
+
+	# PYTHON'S EXTENSION MODULES LINK LIBRARIES THE TARBALL DOES NOT BUNDLE.
+	# Without these, the interpreter starts and `import sqlite3` fails with a
+	# loader error naming a .so, which reads as a broken workflow rather than a
+	# missing package.
+	chroot "$rootfs" /bin/bash -euxc '
+		export DEBIAN_FRONTEND=noninteractive
+		apt-get update -qq
+		apt-get install -y --no-install-recommends \
+			libsqlite3-0 libreadline8t64 libgdbm6t64 libgdbm-compat4t64 \
+			libbz2-1.0 liblzma5 libffi8 libuuid1 libncursesw6
+		apt-get clean
+		rm -rf /var/lib/apt/lists/*
+	'
+
+	install_node_toolcache "$tc"
+	install_go_toolcache "$tc"
+	install_python_toolcache "$tc"
+
+	# READ AND WRITTEN BY EVERY JOB, which runs as the unprivileged runner account.
+	chmod -R 0777 "$tc"
+
+	echo "toolcache: $(du -sh "$tc" | cut -f1)"
+}
+
+# fetch_verified downloads a file and checks it against a digest.
+fetch_verified() {
+	local url="$1" out="$2" want="$3"
+
+	curl -fL -sS --http1.1 --connect-timeout 20 --max-time 900 \
+		--retry 5 --retry-delay 5 --retry-all-errors -o "$out" "$url"
+
+	echo "$want  $out" | sha256sum -c - >/dev/null
+}
+
+# install_node_toolcache bakes in the two newest LTS lines.
+#
+# THE VERSION DIRECTORY MUST BE A FULL SEMVER. @actions/tool-cache resolves a range
+# by listing the version directories and keeping only those that parse as explicit
+# semver, so a directory named `20` is invisible to `node-version: 20` -- it does
+# not match loosely, it is skipped entirely.
+install_node_toolcache() {
+	local tc="$1"
+
+	local versions
+	versions=$(curl -fsSL --retry 3 --retry-all-errors https://nodejs.org/dist/index.json |
+		jq -r '[.[] | select(.lts != false)] | group_by(.version | split(".")[0])
+			| map(max_by(.version)) | sort_by(.date) | reverse | .[0:2] | .[].version')
+
+	local v
+	for v in $versions; do
+		local bare="${v#v}"
+		local file="node-$v-linux-x64.tar.gz"
+		local want
+
+		# THE CHECKSUM COMES FROM THE RELEASE ITSELF, published beside the tarball.
+		want=$(curl -fsSL --retry 3 --retry-all-errors "https://nodejs.org/dist/$v/SHASUMS256.txt" |
+			awk -v f="$file" '$2 == f {print $1}')
+
+		if [ -z "$want" ]; then
+			echo "no published checksum for node $v; refusing to bake an unverified runtime" >&2
+			exit 1
+		fi
+
+		fetch_verified "https://nodejs.org/dist/$v/$file" "$WORK/node.tgz" "$want"
+
+		local dir="$tc/node/$bare/x64"
+		mkdir -p "$dir"
+
+		# STRIPPED, because setup-node adds `<dir>/bin` to PATH and the tarball has
+		# everything under a `node-vX-linux-x64/` component.
+		tar -xzf "$WORK/node.tgz" -C "$dir" --strip-components=1
+		rm -f "$WORK/node.tgz"
+
+		# THE MARKER IS A SIBLING OF THE ARCH DIRECTORY, not inside it, and its
+		# absence makes the entry invisible however complete it is: tool-cache stats
+		# `<version>/<arch>.complete` and treats a missing one as a half-extracted
+		# download.
+		touch "$tc/node/$bare/x64.complete"
+
+		echo "toolcache: node $bare"
+	done
+}
+
+install_go_toolcache() {
+	local tc="$1"
+
+	local meta
+	meta=$(curl -fsSL --retry 3 --retry-all-errors 'https://go.dev/dl/?mode=json')
+
+	local version want
+	version=$(printf '%s' "$meta" | jq -r '.[0].version')
+	want=$(printf '%s' "$meta" | jq -r --arg v "$version" \
+		'.[0].files[] | select(.filename == ($v + ".linux-amd64.tar.gz")) | .sha256')
+
+	if [ -z "$want" ] || [ "$want" = "null" ]; then
+		echo "go published no checksum for $version; refusing to bake an unverified runtime" >&2
+		exit 1
+	fi
+
+	fetch_verified "https://go.dev/dl/$version.linux-amd64.tar.gz" "$WORK/go.tgz" "$want"
+
+	# THE DIRECTORY IS A BARE SEMVER WITH NO `go` PREFIX. setup-go coerces its
+	# version through semver before looking, so `go1.26.6` on disk is never found.
+	local bare="${version#go}"
+	local dir="$tc/go/$bare/x64"
+
+	mkdir -p "$dir"
+	tar -xzf "$WORK/go.tgz" -C "$dir" --strip-components=1
+	rm -f "$WORK/go.tgz"
+	touch "$tc/go/$bare/x64.complete"
+
+	echo "toolcache: go $bare"
+}
+
+# install_python_toolcache bakes in the two newest stable minors.
+#
+# THE TOOL NAME IS CAPITALISED. setup-python looks for `Python`, while setup-node
+# and setup-go look for `node` and `go` -- an inconsistency in the actions
+# themselves, and one that fails silently on a case-sensitive filesystem: the
+# directory exists, nothing finds it, and the job downloads a runtime anyway.
+install_python_toolcache() {
+	local tc="$1"
+
+	local manifest
+	manifest=$(curl -fsSL --retry 3 --retry-all-errors \
+		https://raw.githubusercontent.com/actions/python-versions/main/versions-manifest.json)
+
+	# STABLE ONLY, AND NOT THE FREE-THREADED BUILD. The free-threaded interpreter is
+	# published as a separate arch (`x64-freethreaded`) beside the ordinary one, and
+	# baking it in would give workflows an interpreter with different semantics and
+	# nothing in the logs to explain why.
+	local versions
+	versions=$(printf '%s' "$manifest" | jq -r '
+		[.[] | select(.stable == true)
+		     | select(any(.files[]; .platform == "linux"
+		                        and .platform_version == "24.04"
+		                        and .arch == "x64"))]
+		| group_by(.version | split(".")[0:2] | join("."))
+		| map(max_by(.version | split(".") | map(tonumber)))
+		| sort_by(.version | split(".") | map(tonumber)) | reverse | .[0:2] | .[].version')
+
+	local v
+	for v in $versions; do
+		local url
+		url=$(printf '%s' "$manifest" | jq -r --arg v "$v" '
+			.[] | select(.version == $v) | .files[]
+			| select(.platform == "linux" and .platform_version == "24.04" and .arch == "x64")
+			| .download_url')
+
+		fetch_verified "$url" "$WORK/python.tgz" \
+			"$(curl -fsSL --retry 3 --retry-all-errors "$url" | sha256sum | cut -d" " -f1)"
+
+		local dir="$tc/Python/$v/x64"
+		mkdir -p "$dir"
+
+		# NOT STRIPPED. This tarball's root already holds bin/, lib/ and setup.sh.
+		tar -xzf "$WORK/python.tgz" -C "$dir"
+		rm -f "$WORK/python.tgz"
+
+		# WHAT setup.sh WOULD HAVE DONE, minus the parts that need a network.
+		#
+		# The tarball ships NO `python` or `pip` entry point -- only `python3.12` and
+		# friends -- because its setup script creates them. Skipping it leaves an
+		# interpreter that works when addressed by full version and is missing every
+		# name a workflow actually types.
+		local minor="${v%.*}"
+
+		ln -sf "./bin/python$minor" "$dir/python"
+		ln -sf "python$minor" "$dir/bin/python"
+		ln -sf "python$minor" "$dir/bin/python${minor/./}"
+
+		rm -f "$dir/setup.sh" "$dir/build_output.txt" "$dir/tools_structure.txt"
+
+		touch "$tc/Python/$v/x64.complete"
+
+		echo "toolcache: python $v"
+	done
 }
 
 main() {
@@ -235,6 +454,8 @@ EOF
 	mkdir -p "$rootfs/home/runner/runner"
 	tar -xzf "$WORK/$tarball" -C "$rootfs/home/runner/runner"
 	chroot "$rootfs" chown -R runner:runner /home/runner
+
+	install_toolcache "$rootfs"
 
 	# WHAT THIS IMAGE ACTUALLY CONTAINS, WRITTEN INTO THE IMAGE.
 	#
@@ -471,8 +692,19 @@ log "starting $name with ${#cmd[@]} argument(s)"
 export ACTIONS_RUNNER_INPUT_JITCONFIG="$jit"
 
 cd /home/runner/runner
+# RUNNER_TOOL_CACHE IS PASSED THROUGH THE exec, not left to the environment.
+#
+# /etc/environment is read by PAM for login sessions and does NOT apply to systemd
+# services, and this agent IS one -- so setting it there alone would leave every
+# job looking in the runner's default _work/_tool, finding nothing, and downloading
+# a runtime the image already contains. Nothing would report that: the job would
+# simply be slower.
+#
+# setpriv does not preserve it either, which is why it is named here explicitly.
 exec setpriv --reuid=runner --regid=runner --init-groups --inh-caps=-all -- \
-	env ACTIONS_RUNNER_INPUT_JITCONFIG="$ACTIONS_RUNNER_INPUT_JITCONFIG" "${cmd[@]}"
+	env ACTIONS_RUNNER_INPUT_JITCONFIG="$ACTIONS_RUNNER_INPUT_JITCONFIG" \
+	RUNNER_TOOL_CACHE=/opt/hostedtoolcache \
+	AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache "${cmd[@]}"
 AGENT
 
 	install -m 0644 /dev/stdin "$rootfs/etc/systemd/system/billet-agent.service" <<'UNIT'
@@ -491,6 +723,12 @@ ExecStart=/usr/local/bin/billet-agent
 # destroyed with it, so a restart would register a second runner against a
 # registration that has already been consumed.
 Restart=no
+# BOTH NAMES, SAME VALUE, which is what github's own image does. The toolkit reads
+# only RUNNER_TOOL_CACHE; the runner itself also honours AGENT_TOOLSDIRECTORY, an
+# azure-pipelines inheritance -- and an image that sets one but not the other
+# behaves differently depending on which layer resolves the path first.
+Environment=RUNNER_TOOL_CACHE=/opt/hostedtoolcache
+Environment=AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache
 # journal+console, NOT journal ALONE, AND THIS IS A DEBUGGABILITY DECISION.
 #
 # A microVM has no console anybody normally reads and no way in: if the agent
@@ -536,6 +774,7 @@ NET
 		# the guest, so a getty on ttyS0 would spin against a device nothing reads.
 		systemctl mask getty@tty1.service serial-getty@ttyS0.service
 		systemctl mask systemd-resolved-monitor.service 2>/dev/null || true
+		printf "RUNNER_TOOL_CACHE=/opt/hostedtoolcache\nAGENT_TOOLSDIRECTORY=/opt/hostedtoolcache\n" >>/etc/environment
 		echo billet-guest >/etc/hostname
 		printf "127.0.0.1 localhost\n127.0.1.1 billet-guest\n" >/etc/hosts
 		# ROOT CANNOT LOG IN. Nothing should be logging into a guest that exists for
