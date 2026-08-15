@@ -196,6 +196,34 @@ jobs:
           KERNEL: ${{ github.workspace }}/out/vmlinux-billet
           ROOTFS: ${{ github.workspace }}/out/rootfs.img.zst
 
+      # THE RELEASE GATE. Nothing below this runs against an image that fails it.
+      #
+      # AN IMAGE THAT REACHES A RELEASE IS ONE EVERY DEPLOYMENT PULLS, and a bad one
+      # is not a local problem: it fans out to everybody on the next refresh, and
+      # the thing that would rebuild it is itself a guest booting the image. So the
+      # question "is this fit to publish" is asked here, before the upload, rather
+      # than discovered afterwards by somebody whose jobs stopped working.
+      #
+      # IT CHECKS CONTENTS, NOT BOOT. It cannot see an integration failure -- a
+      # kernel missing an option the userspace needs, systemd failing to bring up
+      # the network. What it catches is the silent class: a build step that failed
+      # in a way `set -e` did not notice, a tarball unpacked to the wrong place, an
+      # agent never installed, a unit present but not enabled. Those produce an
+      # image that boots perfectly and then does nothing, which is the hardest kind
+      # to diagnose from outside.
+      #
+      # The manifest is passed so the two can be cross-checked: an image whose agent
+      # speaks a different contract than the manifest advertises would be accepted
+      # by a node on the manifest's word and then produce microVMs that boot and
+      # never report.
+      - name: Check the image is fit to publish
+        run: |
+          set -euo pipefail
+
+          sudo scripts/check-guest-image.sh \
+            "$WORK/$IMAGE_NAME.ext4" \
+            "${{ github.workspace }}/out/manifest.json"
+
       # THE MANIFEST IS THE ONLY THING SIGNED, and that is sufficient: it carries a
       # digest for every asset, so one signature transitively covers the four
       # hundred megabytes without anybody doing public-key arithmetic over them.
@@ -270,8 +298,10 @@ jobs:
       # KEPT EVEN WHEN NOT PUBLISHING, because the reason to run this without
       # publishing is to inspect what it produced.
       - name: Upload for inspection
-        # The mirror of the condition above, spelled the same explicit way.
-        if: github.event_name == 'workflow_dispatch' && !inputs.publish
+        # always() SO A FAILED GATE STILL HANDS OVER THE ARTIFACT. Without it, the
+        # one run where somebody most wants to open the image -- the one that just
+        # refused to publish it -- is the run that uploads nothing.
+        if: always() && github.event_name == 'workflow_dispatch' && !inputs.publish
         uses: actions/upload-artifact@v4
         with:
           name: guest-image
