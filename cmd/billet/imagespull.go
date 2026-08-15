@@ -158,7 +158,7 @@ func cmdImagesPull(ctx context.Context, args []string) error {
 	// kernel a generation needs is a property of that generation rather than of the
 	// image. Two generations can want different kernels, and an operator pointing
 	// one config at both has no other way to know.
-	if err := store.SetKernelVersion(ctx, image, generation, manifest.Kernel.Version); err != nil {
+	if err := store.SetKernel(ctx, image, generation, kernelFileName(manifest)); err != nil {
 		return fmt.Errorf("%s@%s was published, but the kernel it needs could not be "+
 			"recorded: %w", image, generation, err)
 	}
@@ -376,8 +376,7 @@ func installKernel(manifest *imagesource.Manifest, from, dir string) (string, er
 		return "", fmt.Errorf("cannot use %s: %w", dir, err)
 	}
 
-	name := fmt.Sprintf("vmlinux-%s-%s", manifest.Kernel.Version, manifest.Kernel.SHA256[:12])
-	final := filepath.Join(dir, name)
+	final := filepath.Join(dir, kernelFileName(manifest))
 
 	// ALREADY THERE IS SUCCESS, NOT A CONFLICT. The name carries the digest, so a
 	// file at this path is this kernel -- re-pulling the same image, or pulling two
@@ -436,4 +435,19 @@ func installKernel(manifest *imagesource.Manifest, from, dir string) (string, er
 	committed = true
 
 	return final, nil
+}
+
+// kernelFileName is what a pulled kernel is called on disk.
+//
+// ONE FUNCTION, BECAUSE TWO THINGS DEPEND ON THE ANSWER AGREEING: installKernel
+// writes this name, and the generation records it so the reaper can decide what is
+// still needed. Computed separately, the reaper would compare a value nothing on
+// disk is called -- and a reaper that matches nothing either deletes everything or
+// nothing, depending on which way it fails.
+//
+// VERSION AND DIGEST, because the version alone does not identify a file: two
+// builds can produce the same kernel version from different sources, and reaping
+// on version alone removes a kernel some generation is verified against.
+func kernelFileName(manifest *imagesource.Manifest) string {
+	return fmt.Sprintf("vmlinux-%s-%s", manifest.Kernel.Version, manifest.Kernel.SHA256[:12])
 }

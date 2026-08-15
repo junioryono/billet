@@ -17,14 +17,21 @@ import (
 // The full key is this plus "." plus the generation.
 const RunnerVersionKey = "billet.runner_version"
 
-// KernelVersionKey records which kernel a generation is paired with.
+// KernelKey records WHICH KERNEL FILE a generation is paired with.
 //
 // PER GENERATION, FOR THE SAME REASON THE RUNNER VERSION IS. The kernel and the
 // root filesystem are a matched pair -- a guest booted with a different kernel
 // fails in the middle of somebody's job -- and two generations of one image can
 // want different kernels. An operator pointing one config at both has no other way
 // to know which.
-const KernelVersionKey = "billet.kernel_version"
+//
+// THE FILE NAME, NOT THE VERSION, and that distinction is load-bearing. The reaper
+// decides what to delete by comparing this against the names on disk, so a version
+// matches nothing: files are called `vmlinux-6.1.155-ea1d42638d13`. And a version
+// does not identify a kernel anyway -- two builds can produce the same version
+// from different sources, and reaping on it would remove a kernel a generation is
+// verified against.
+const KernelKey = "billet.kernel"
 
 // RunnerVersion reports which actions/runner a specific generation carries.
 //
@@ -142,13 +149,40 @@ func (c *Client) setGenerationMeta(
 	return nil
 }
 
-// SetKernelVersion records which kernel a generation is paired with.
-func (c *Client) SetKernelVersion(ctx context.Context, image, generation, version string) error {
-	return c.setGenerationMeta(ctx, KernelVersionKey, image, generation, version)
+// SetKernel records which kernel FILE a generation is paired with.
+func (c *Client) SetKernel(ctx context.Context, image, generation, file string) error {
+	return c.setGenerationMeta(ctx, KernelKey, image, generation, file)
 }
 
-// KernelVersion reports which kernel a generation is paired with.
-func (c *Client) KernelVersion(ctx context.Context, image, generation string) (string, bool, error) {
+// NeededKernels reports every kernel file the given generations still name.
+//
+// THE INPUT TO THE REAPER, assembled here because only this side can read the
+// metadata. A generation with nothing recorded contributes nothing, which is
+// exactly why PlanKernelReap refuses to act on an empty set while generations
+// exist: that is what a failed read looks like.
+func (c *Client) NeededKernels(
+	ctx context.Context,
+	image string,
+	generations []Generation,
+) (map[string]bool, error) {
+	needed := map[string]bool{}
+
+	for _, generation := range generations {
+		file, found, err := c.Kernel(ctx, image, generation.Name)
+		if err != nil {
+			return nil, err
+		}
+
+		if found && file != "" {
+			needed[file] = true
+		}
+	}
+
+	return needed, nil
+}
+
+// Kernel reports which kernel file a generation is paired with.
+func (c *Client) Kernel(ctx context.Context, image, generation string) (string, bool, error) {
 	if err := checkCloneName(image); err != nil {
 		return "", false, err
 	}
@@ -158,14 +192,14 @@ func (c *Client) KernelVersion(ctx context.Context, image, generation string) (s
 	}
 
 	out, err := c.rbdCmd(ctx, false, "-p", c.cfg.ImagePool, "image-meta", "get", image,
-		KernelVersionKey+"."+generation)
+		KernelKey+"."+generation)
 	if err != nil {
 		if isNoSuchFile(err) {
 			return "", false, nil
 		}
 
 		return "", false, fmt.Errorf("ceph: could not read %s for %s@%s: %w",
-			KernelVersionKey, image, generation, err)
+			KernelKey, image, generation, err)
 	}
 
 	return strings.TrimSpace(string(out)), true, nil

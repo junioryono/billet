@@ -357,3 +357,44 @@ func TestInstallKernelIsIdempotent(t *testing.T) {
 		t.Errorf("the same kernel installed to two paths: %s and %s", first, second)
 	}
 }
+
+// WHAT IS RECORDED AGAINST A GENERATION MUST IDENTIFY A FILE, not merely describe
+// one. The reaper decides what to delete by comparing the recorded value against
+// the names on disk, so recording "6.1.155" while the file is
+// "vmlinux-6.1.155-ea1d42638d13" leaves it unable to match anything -- and a
+// reaper that matches nothing either deletes everything or nothing, depending on
+// which way it fails.
+func TestKernelFileNameIdentifiesTheFileOnDisk(t *testing.T) {
+	_, m := stageDir(t, []byte("rootfs"), []byte("a kernel"))
+
+	name := kernelFileName(m)
+
+	if !strings.Contains(name, m.Kernel.Version) {
+		t.Errorf("%q does not carry the version an operator reads", name)
+	}
+
+	if !strings.Contains(name, m.Kernel.SHA256[:12]) {
+		t.Errorf("%q does not carry the digest, so two kernels of one version would "+
+			"collide on it", name)
+	}
+
+	// AND IT IS THE NAME installKernel ACTUALLY WRITES. If the two ever computed it
+	// separately, the reaper would compare a value nothing on disk is called.
+	staging := t.TempDir()
+	kernels := t.TempDir()
+
+	if err := os.WriteFile(filepath.Join(staging, m.Kernel.Name), []byte("a kernel"), 0o600); err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+
+	installed, err := installKernel(m, staging, kernels)
+	if err != nil {
+		t.Fatalf("install: %v", err)
+	}
+
+	if filepath.Base(installed) != name {
+		t.Fatalf("installKernel wrote %q and the recorded name is %q; the reaper would "+
+			"compare a value nothing on disk is called",
+			filepath.Base(installed), name)
+	}
+}
