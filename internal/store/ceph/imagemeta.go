@@ -17,6 +17,15 @@ import (
 // The full key is this plus "." plus the generation.
 const RunnerVersionKey = "billet.runner_version"
 
+// KernelVersionKey records which kernel a generation is paired with.
+//
+// PER GENERATION, FOR THE SAME REASON THE RUNNER VERSION IS. The kernel and the
+// root filesystem are a matched pair -- a guest booted with a different kernel
+// fails in the middle of somebody's job -- and two generations of one image can
+// want different kernels. An operator pointing one config at both has no other way
+// to know which.
+const KernelVersionKey = "billet.kernel_version"
+
 // RunnerVersion reports which actions/runner a specific generation carries.
 //
 // THE GENERATION, NOT THE HEAD, AND THAT DISTINCTION IS THE WHOLE POINT. Generations
@@ -95,35 +104,69 @@ func (c *Client) RunnerVersion(ctx context.Context, image string) (string, bool,
 // generation, so recording it against one that was never published leaves a key
 // nothing will ever read and nothing will ever clean up.
 func (c *Client) SetRunnerVersion(ctx context.Context, image, generation, version string) error {
+	// THE VALIDATION LIVES IN setGenerationMeta, shared with every other
+	// generation-keyed value, so it cannot drift between them: a key written against
+	// a malformed generation is one nothing reads and nothing reaps, and that has to
+	// be true of all of them or none.
+	return c.setGenerationMeta(ctx, RunnerVersionKey, image, generation, version)
+}
+
+// setGenerationMeta writes one generation-keyed metadata value.
+//
+// SHARED BY EVERY CALLER, so the validation cannot drift between them: a key
+// written against a malformed generation is one nothing reads and nothing reaps,
+// and that has to be true of all of them or none.
+func (c *Client) setGenerationMeta(
+	ctx context.Context,
+	key, image, generation, value string,
+) error {
 	if err := checkCloneName(image); err != nil {
 		return err
 	}
 
-	// PARSED, NOT MERELY NON-BLANK. The key is `billet.runner_version.<generation>`,
-	// so a malformed generation writes a key nothing will ever read: every reader
-	// arrives holding a name that came from `rbd snap ls` and therefore parses.
-	// Worse, nothing cleans it up -- reaping walks generations, and a key whose
-	// suffix is not one is invisible to it. MarkVerified already parses for exactly
-	// this reason; this did not, and the two guard the same thing.
 	if _, ok := ParseGeneration(generation); !ok {
-		return fmt.Errorf("ceph: %q is not a generation billet published, so recording a runner "+
-			"version against it would write a key nothing reads and nothing reaps", generation)
+		return fmt.Errorf("ceph: %q is not a generation billet published, so recording %s "+
+			"against it would write a key nothing reads and nothing reaps", generation, key)
 	}
 
-	// REFUSED RATHER THAN RECORDED EMPTY. An empty value is indistinguishable from
-	// an absent key when it is read back, and the reader treats absent as "cannot
-	// tell" — so writing one produces a generation that silently opts out of every
-	// staleness check.
-	if strings.TrimSpace(version) == "" {
-		return fmt.Errorf("ceph: refusing to record an empty runner version for %s@%s, which "+
-			"reads back as though nothing was recorded", image, generation)
+	if strings.TrimSpace(value) == "" {
+		return fmt.Errorf("ceph: refusing to record an empty %s for %s@%s, which reads back "+
+			"as though nothing was recorded", key, image, generation)
 	}
 
 	if _, err := c.rbdCmd(ctx, false, "-p", c.cfg.ImagePool, "image-meta", "set", image,
-		RunnerVersionKey+"."+generation, version); err != nil {
-		return fmt.Errorf("ceph: could not record the runner version for %s@%s: %w",
-			image, generation, err)
+		key+"."+generation, value); err != nil {
+		return fmt.Errorf("ceph: could not record %s for %s@%s: %w", key, image, generation, err)
 	}
 
 	return nil
+}
+
+// SetKernelVersion records which kernel a generation is paired with.
+func (c *Client) SetKernelVersion(ctx context.Context, image, generation, version string) error {
+	return c.setGenerationMeta(ctx, KernelVersionKey, image, generation, version)
+}
+
+// KernelVersion reports which kernel a generation is paired with.
+func (c *Client) KernelVersion(ctx context.Context, image, generation string) (string, bool, error) {
+	if err := checkCloneName(image); err != nil {
+		return "", false, err
+	}
+
+	if _, ok := ParseGeneration(generation); !ok {
+		return "", false, fmt.Errorf("ceph: %q is not a generation billet published", generation)
+	}
+
+	out, err := c.rbdCmd(ctx, false, "-p", c.cfg.ImagePool, "image-meta", "get", image,
+		KernelVersionKey+"."+generation)
+	if err != nil {
+		if isNoSuchFile(err) {
+			return "", false, nil
+		}
+
+		return "", false, fmt.Errorf("ceph: could not read %s for %s@%s: %w",
+			KernelVersionKey, image, generation, err)
+	}
+
+	return strings.TrimSpace(string(out)), true, nil
 }
