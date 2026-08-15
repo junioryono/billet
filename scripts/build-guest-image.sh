@@ -70,9 +70,21 @@ need_root() {
 
 need_tools() {
 	local missing=()
-	for t in debootstrap mkfs.ext4 rbd chroot jq; do
+	for t in debootstrap mkfs.ext4 chroot jq; do
 		command -v "$t" >/dev/null 2>&1 || missing+=("$t")
 	done
+
+	# rbd IS REQUIRED ONLY WHEN THIS PUBLISHES.
+	#
+	# PUBLISH=no builds the filesystem and stops, which is exactly what a CI runner
+	# does -- it has no Ceph cluster to publish into and no reason to install a
+	# client for one. Requiring it unconditionally made the hosted build fail after
+	# the kernel had already been built, on a tool it was never going to use, with a
+	# message telling the operator to install ceph-common on a machine that has no
+	# cluster.
+	if [ "$PUBLISH" = "yes" ]; then
+		command -v rbd >/dev/null 2>&1 || missing+=("rbd")
+	fi
 
 	if [ ${#missing[@]} -ne 0 ]; then
 		echo "missing: ${missing[*]} (apt-get install debootstrap e2fsprogs ceph-common)" >&2
