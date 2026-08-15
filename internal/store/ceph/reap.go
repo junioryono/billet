@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 )
 
 // Retention says which generations survive a reap.
@@ -94,6 +95,31 @@ func (c *Client) Reap(ctx context.Context, image string, plan []Reapable) ([]str
 	if name == "" {
 		return nil, fmt.Errorf("ceph: no image to reap generations of")
 	}
+
+	// THE SAME LOCK VERIFICATION TAKES, and taking it here is what makes that one
+	// mean anything: exclusion has to be mutual. A verify that holds the lock while
+	// it proves a generation exists and records the result is only safe if nothing
+	// can remove that generation meanwhile -- and removing generations is precisely
+	// what this does.
+	//
+	// It is also the lock a publish takes, so a reap cannot run while an image is
+	// being written either.
+	lock, err := c.TakePublishLock(ctx, time.Now())
+	if err != nil {
+		return nil, fmt.Errorf("ceph: could not reap %s because the publish lock is held; a "+
+			"publish or a verification is in progress and removing generations now could "+
+			"delete one it is recording: %w", name, err)
+	}
+
+	defer func() {
+		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.wait)
+		defer cancel()
+
+		if releaseErr := lock.Release(releaseCtx); releaseErr != nil {
+			// Bounded by StaleLockAfter; the reap's own result is the useful one.
+			_ = releaseErr
+		}
+	}()
 
 	doomed := make([]Generation, 0, len(plan))
 

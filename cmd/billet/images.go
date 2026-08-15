@@ -302,21 +302,22 @@ func cmdImagesVerify(ctx context.Context, args []string) error {
 
 		record, note := kernelToRecord(existing, configuredKernelName(cfg, *kernelDir))
 
-		if record != "" {
-			if err := store.SetKernel(ctx, imageName, generation, record); err != nil {
-				return fmt.Errorf("%s booted and ran a container, but the kernel that proved "+
-					"it could not be recorded, so it has NOT been marked verified: %w", rest, err)
-			}
+		// ONE CALL, UNDER THE PUBLISH LOCK, having proved the generation still
+		// exists. The pairing and the verification were two unordered writes, and a
+		// reap landing between them leaves a generation verified but unpaired --
+		// every node takes it up and each boots it against its own kernel.
+		if err := store.RecordVerification(ctx, imageName, generation, record,
+			time.Now()); err != nil {
+			return fmt.Errorf("%s booted and ran a container, but the result could not be "+
+				"recorded, so it has NOT been marked verified: %w", rest, err)
+		}
 
+		if record != "" {
 			fmt.Printf("\nrecorded %s as the kernel this generation was proved against\n", record)
 		}
 
 		if note != "" {
 			fmt.Printf("\nnote: %s\n", note)
-		}
-
-		if err := store.MarkVerified(ctx, rest, time.Now()); err != nil {
-			return err
 		}
 
 		fmt.Printf("\nrecorded %s as verified; a tier naming @%s will boot it\n",

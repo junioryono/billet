@@ -96,6 +96,24 @@ func (c *Client) NewestVerified(ctx context.Context, image string) (Generation, 
 			c.cfg.ImagePool, name, err)
 	}
 
+	// INTERSECTED WITH THE SNAPSHOTS THAT ACTUALLY EXIST.
+	//
+	// A verification key is not proof the generation is still there. A reap that
+	// removed a snapshot and failed to remove its key, or one that raced a verify,
+	// leaves a key describing nothing -- and resolving `@verified` from metadata
+	// alone then points every launch at a generation that is gone. The clone fails,
+	// and the message is about a missing snapshot rather than about the alias that
+	// chose it.
+	existing, err := c.Generations(ctx, name)
+	if err != nil {
+		return Generation{}, false, err
+	}
+
+	live := make(map[string]bool, len(existing))
+	for _, gen := range existing {
+		live[gen.Name] = true
+	}
+
 	var (
 		newest Generation
 		found  bool
@@ -120,10 +138,101 @@ func (c *Client) NewestVerified(ctx context.Context, image string) (Generation, 
 			continue
 		}
 
+		if !live[gen.Name] {
+			continue
+		}
+
 		if !found || gen.Built.After(newest.Built) {
 			newest, found = gen, true
 		}
 	}
 
 	return newest, found, nil
+}
+
+// RecordVerification records a generation's kernel pairing and its verification
+// together, under the publish lock, having proved the generation still exists.
+//
+// THREE THINGS THAT WERE SEPARATE AND HAD TO STOP BEING.
+//
+// The two writes were unordered against reaping. A reap landing between them
+// leaves a generation VERIFIED BUT UNPAIRED -- every node takes it up through
+// `@verified` and each boots it against its own kernel -- which is the exact state
+// the write order was chosen to prevent. Holding the publish lock is what makes
+// the pair indivisible with respect to the only thing that removes generations.
+//
+// And neither write proved the generation was still there. Both validate the NAME
+// and nothing else, so a reap completing first left both keys recreated for a
+// snapshot that no longer exists. The existence check happens under the lock, so
+// it cannot go stale between the check and the writes.
+//
+// An empty kernel means "record no pairing" -- the generation already had one, or
+// this node's kernel is outside the managed directory -- and is not an error.
+func (c *Client) RecordVerification(
+	ctx context.Context,
+	image, generation, kernel string,
+	at time.Time,
+) error {
+	if err := checkCloneName(image); err != nil {
+		return err
+	}
+
+	if _, ok := ParseGeneration(generation); !ok {
+		return fmt.Errorf("ceph: %q is not a generation billet published", generation)
+	}
+
+	lock, err := c.TakePublishLock(ctx, at)
+	if err != nil {
+		return fmt.Errorf("ceph: could not record the verification of %s@%s because the "+
+			"publish lock is held; a reap or a publish is in progress and recording now "+
+			"could describe a generation it is removing: %w", image, generation, err)
+	}
+
+	defer func() {
+		// ON A CONTEXT STRIPPED OF CANCELLATION, because a leaked publish lock blocks
+		// every publisher on every node for hours.
+		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.wait)
+		defer cancel()
+
+		if releaseErr := lock.Release(releaseCtx); releaseErr != nil {
+			// BEST EFFORT AND NOT SUBSTITUTED FOR THE REAL RESULT. If the recording
+			// succeeded, a failed release is a leaked lock that StaleLockAfter bounds;
+			// if it failed, that failure is the one worth reporting.
+			_ = releaseErr
+		}
+	}()
+
+	// PROVED UNDER THE LOCK. Checked before taking it, this would be a fact about a
+	// moment that has passed.
+	generations, err := c.Generations(ctx, image)
+	if err != nil {
+		return err
+	}
+
+	present := false
+
+	for _, gen := range generations {
+		if gen.Name == generation {
+			present = true
+
+			break
+		}
+	}
+
+	if !present {
+		return fmt.Errorf("ceph: %s@%s no longer exists, so there is nothing to record a "+
+			"verification against. It was removed while it was being verified -- the probe "+
+			"still booted because a clone outlives the snapshot it came from", image, generation)
+	}
+
+	// THE PAIRING FIRST, so a failure between the two leaves the generation
+	// unverified rather than verified-and-unpaired. Unverified is a state nothing
+	// acts on; verified-and-unpaired is one every node acts on wrongly.
+	if kernel != "" {
+		if err := c.SetKernel(ctx, image, generation, kernel); err != nil {
+			return err
+		}
+	}
+
+	return c.MarkVerified(ctx, image+"@"+generation, at)
 }

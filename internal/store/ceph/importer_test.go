@@ -42,6 +42,11 @@ type importFake struct {
 	cancelOn string
 	cancel   context.CancelFunc
 
+	// snapshots is what `rbd snap ls` reports. Empty means the image has none,
+	// which is a real answer and not a broken one -- the existence check depends
+	// on telling those apart.
+	snapshots []string
+
 	// heartbeat, if non-nil, is what `image-meta get` answers for a liveness key,
 	// and it is called once per read so a test can make the counter move.
 	heartbeat func() (string, bool)
@@ -118,7 +123,21 @@ func (f *importFake) run(ctx context.Context, _ string, args []string) ([]byte, 
 		}
 
 		return []byte(""), nil
-	case "create", "resize", "snap":
+	case "snap":
+		// `snap ls` is asked for json; `snap create` and `snap rm` are not.
+		for _, a := range args {
+			if a == "ls" {
+				entries := make([]string, 0, len(f.snapshots))
+				for i, name := range f.snapshots {
+					entries = append(entries, fmt.Sprintf(`{"id":%d,"name":%q}`, i+1, name))
+				}
+
+				return []byte("[" + strings.Join(entries, ",") + "]"), nil
+			}
+		}
+
+		return []byte(""), nil
+	case "create", "resize":
 		return []byte(""), nil
 	default:
 		return []byte(""), nil
@@ -926,5 +945,72 @@ func TestImportGenerationStillBreaksASilentLockPastTheBound(t *testing.T) {
 
 	if !f.ranWith("lock", "rm", "billet-build-deadhost-9") {
 		t.Errorf("the silent lock was not broken; billet ran %v", f.calls)
+	}
+}
+
+// VERIFICATION AND REAPING EXCLUDE EACH OTHER, and the exclusion has to be mutual
+// or neither is safe.
+//
+// Verification proves a generation exists and then records against it; reaping
+// removes generations. Without a shared lock a reap landing between those two
+// steps leaves a generation VERIFIED BUT UNPAIRED -- every node takes it up
+// through `@verified` and each boots it against its own kernel, which is the state
+// the write order exists to prevent.
+func TestRecordVerificationTakesThePublishLock(t *testing.T) {
+	f := &importFake{}
+
+	err := importClient(t, f).RecordVerification(t.Context(), "ubuntu-2404-x64",
+		"g20260815033431", "vmlinux-6.1.155-ea1d42638d13", importAt)
+
+	// The fake has no snapshots, so this fails on the existence check -- which is
+	// itself the point of the next assertion.
+	if err == nil {
+		t.Fatal("recorded a verification for a generation with no snapshot")
+	}
+
+	if !f.ranWith("lock", "add") {
+		t.Errorf("recording did not take the publish lock, so a reap could remove the "+
+			"generation between the existence check and the writes; billet ran %v", f.calls)
+	}
+}
+
+// AND IT PROVES THE GENERATION IS STILL THERE. Both writes validate only the NAME,
+// so without this a reap that completed first left both keys recreated for a
+// snapshot that no longer exists -- and `@verified` then names it.
+func TestRecordVerificationRefusesAGenerationThatIsGone(t *testing.T) {
+	f := &importFake{}
+
+	err := importClient(t, f).RecordVerification(t.Context(), "ubuntu-2404-x64",
+		"g20260815033431", "", importAt)
+	if err == nil {
+		t.Fatal("recorded a verification against a generation with no snapshot")
+	}
+
+	if !strings.Contains(err.Error(), "no longer exists") {
+		t.Errorf("the refusal does not say the generation is gone: %v", err)
+	}
+
+	if f.ranWith("image-meta", "set") {
+		t.Error("metadata was written for a generation that does not exist")
+	}
+}
+
+// REAPING TAKES THE SAME LOCK. One-sided exclusion is not exclusion.
+func TestReapTakesThePublishLock(t *testing.T) {
+	f := &importFake{}
+
+	plan := []Reapable{{Generation: Generation{Name: "g20260814072427"}}}
+
+	if _, err := importClient(t, f).Reap(t.Context(), "ubuntu-2404-x64", plan); err != nil {
+		t.Fatalf("reap: %v", err)
+	}
+
+	if !f.ranWith("lock", "add") {
+		t.Errorf("reaping did not take the publish lock, so it could remove a generation a "+
+			"verification was in the middle of recording; billet ran %v", f.calls)
+	}
+
+	if f.lockTaken != "" {
+		t.Errorf("the reap left the publish lock held as %q", f.lockTaken)
 	}
 }
