@@ -124,6 +124,141 @@ else
 	fail "no docker client"
 fi
 
+# --- what workflows assume is there ----------------------------------------
+
+# CHECKED HERE BECAUSE THE FAILURE IS OTHERWISE INVISIBLE (#66).
+#
+# zstd is the one that matters most and the one a human would never notice
+# missing: actions/cache picks its compression by shelling out to it, falls back
+# to gzip when it is absent, and folds the choice into the CACHE VERSION HASH. An
+# image without it produces caches that can never match one from a github-hosted
+# runner -- same key, permanent miss, no error anywhere. Nothing about a running
+# job says so, which is exactly why it belongs in a gate.
+#
+# unzip and tar throw from inside @actions/tool-cache rather than reporting
+# anything about the image, so a missing one surfaces as "this action is broken".
+for tool in zstd unzip zip tar wget rsync gcc make; do
+	found=""
+
+	for dir in usr/bin usr/sbin bin sbin usr/local/bin; do
+		if [ -x "$MNT/$dir/$tool" ]; then
+			found="/$dir/$tool"
+
+			break
+		fi
+	done
+
+	if [ -n "$found" ]; then
+		pass "$tool is installed"
+	else
+		fail "no $tool. Workflows assume it: without zstd every actions/cache entry this
+        fleet writes has a different version hash from a github-hosted one and can never
+        be restored, and without unzip or tar the setup-* actions throw from inside
+        @actions/tool-cache"
+	fi
+done
+
+# --- the toolcache ---------------------------------------------------------
+
+# EVERY ONE OF THESE FAILS SILENTLY, WHICH IS WHY THEY ARE ASSERTED (#66).
+#
+# A toolcache entry that is subtly wrong does not break a job. `setup-node` simply
+# does not find it, downloads a couple of hundred megabytes, and succeeds -- so the
+# only symptom is that jobs are as slow as they were before the toolcache existed,
+# and nothing anywhere says why. Four separate mistakes produce exactly that:
+#
+#   - the marker file missing, or written INSIDE the arch directory rather than
+#     beside it, which is where tool-cache stats for it
+#   - a version directory that is not a full semver, which the range resolver skips
+#     entirely rather than matching loosely
+#   - `x86_64` instead of `x64`
+#   - `python` instead of `Python`, which the actions spell inconsistently
+TOOLCACHE="$MNT/opt/hostedtoolcache"
+
+if [ ! -d "$TOOLCACHE" ]; then
+	fail "no toolcache at /opt/hostedtoolcache; every job would download a runtime the
+        image was supposed to contain, and nothing would report it"
+else
+	toolcache_entries=0
+
+	for tool in node go Python; do
+		for versiondir in "$TOOLCACHE/$tool"/*; do
+			[ -d "$versiondir" ] || continue
+
+			version=$(basename "$versiondir")
+
+			# A FULL SEMVER OR IT IS INVISIBLE. tool-cache keeps only directories that
+			# parse as an explicit version when resolving a range, so `20` is skipped
+			# rather than matched by `node-version: 20`.
+			case "$version" in
+				[0-9]*.[0-9]*.[0-9]*) ;;
+				*)
+					fail "$tool/$version is not a full semver, so a workflow asking for a
+        range will never match it"
+					continue
+					;;
+			esac
+
+			if [ ! -d "$versiondir/x64" ]; then
+				fail "$tool/$version has no x64 directory"
+				continue
+			fi
+
+			# THE MARKER IS A SIBLING, and its absence makes the entry invisible however
+			# complete it is.
+			if [ ! -f "$versiondir/x64.complete" ]; then
+				fail "$tool/$version has no x64.complete marker beside its arch directory,
+        so tool-cache treats it as a half-finished download and ignores it"
+				continue
+			fi
+
+			pass "toolcache $tool $version"
+			toolcache_entries=$((toolcache_entries + 1))
+		done
+	done
+
+	if [ "$toolcache_entries" -eq 0 ]; then
+		fail "the toolcache directory exists and holds nothing usable"
+	fi
+
+	# THE RUNTIME ANSWERS TO ITS OWN DIRECTORY NAME.
+	#
+	# setup-node runs `node --version` after finding a cached entry and FAILS THE JOB
+	# if it does not exactly equal the version directory it came from. A typo in that
+	# name therefore ships a green image whose every node job dies, so the same check
+	# happens here where it is cheap.
+	for versiondir in "$TOOLCACHE/node"/*; do
+		[ -d "$versiondir/x64" ] || continue
+
+		version=$(basename "$versiondir")
+		reported=$(chroot "$MNT" "/opt/hostedtoolcache/node/$version/x64/bin/node" --version 2>/dev/null || true)
+
+		if [ "$reported" = "v$version" ]; then
+			pass "node $version reports itself as $reported"
+		else
+			fail "node in $version reports \"$reported\"; setup-node compares exactly this
+        against the directory name and fails the job when they differ"
+		fi
+	done
+
+	# PYTHON'S ENTRY POINTS ARE MADE BY ITS setup.sh, WHICH THIS IMAGE DOES NOT RUN.
+	# The tarball ships python3.12 and nothing called `python`, so an image that
+	# skipped recreating them has an interpreter nobody can invoke by the name they
+	# type.
+	for versiondir in "$TOOLCACHE/Python"/*; do
+		[ -d "$versiondir/x64" ] || continue
+
+		version=$(basename "$versiondir")
+
+		if [ -e "$versiondir/x64/bin/python" ] && [ -e "$versiondir/x64/python" ]; then
+			pass "python $version has the entry points setup.sh would have made"
+		else
+			fail "python $version is missing bin/python or the root python symlink, which
+        its setup.sh creates and this build has to recreate"
+		fi
+	done
+fi
+
 # --- billet's agent --------------------------------------------------------
 
 AGENT="$MNT/usr/local/bin/billet-agent"
