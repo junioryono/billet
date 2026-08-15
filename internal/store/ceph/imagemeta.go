@@ -99,8 +99,15 @@ func (c *Client) SetRunnerVersion(ctx context.Context, image, generation, versio
 		return err
 	}
 
-	if strings.TrimSpace(generation) == "" {
-		return fmt.Errorf("ceph: no generation to record %s against", RunnerVersionKey)
+	// PARSED, NOT MERELY NON-BLANK. The key is `billet.runner_version.<generation>`,
+	// so a malformed generation writes a key nothing will ever read: every reader
+	// arrives holding a name that came from `rbd snap ls` and therefore parses.
+	// Worse, nothing cleans it up -- reaping walks generations, and a key whose
+	// suffix is not one is invisible to it. MarkVerified already parses for exactly
+	// this reason; this did not, and the two guard the same thing.
+	if _, ok := ParseGeneration(generation); !ok {
+		return fmt.Errorf("ceph: %q is not a generation billet published, so recording a runner "+
+			"version against it would write a key nothing reads and nothing reaps", generation)
 	}
 
 	// REFUSED RATHER THAN RECORDED EMPTY. An empty value is indistinguishable from

@@ -70,6 +70,27 @@ type Config struct {
 	// its own site, with its own empty cache, and every job placed there would run
 	// cold while looking perfectly healthy.
 	Sites []SiteConfig `yaml:"sites,omitempty"`
+
+	// Images says where published guest images are fetched from. Optional: a
+	// deployment that omits it pulls from where billet publishes.
+	Images *ImagesConfig `yaml:"images,omitempty"`
+}
+
+// ImagesConfig points a deployment at a source of published guest images.
+//
+// CONFIGURABLE FROM THE FIRST RELEASE, AND THAT IS DELIBERATE. Retrofitting a
+// second source onto a client that hardcoded one is the specific thing that hurt
+// other projects distributing artifacts this way: when the single origin they
+// baked in started rate-limiting, every consumer needed a new binary before any
+// of them could point elsewhere. A deployment that mirrors internally, or is not
+// on the public internet at all, must be able to say so in configuration.
+type ImagesConfig struct {
+	// Source is the directory the manifest and its assets sit in.
+	//
+	// Empty means billet's own published images. The default lives in
+	// internal/imagesource, next to the one constant naming this project, so a
+	// move does not have to be remembered in two places.
+	Source string `yaml:"source,omitempty"`
 }
 
 // SiteConfig declares one place compute runs.

@@ -239,3 +239,37 @@ func (c *Client) Download(ctx context.Context, asset Asset, dir string) (string,
 
 	return final, nil
 }
+
+// VerifyFile checks a file on disk against a published digest.
+//
+// THE SIDELOAD PATH'S EQUIVALENT OF WHAT Download DOES INLINE. A file that arrived
+// on a USB stick is no more trustworthy than one that arrived over http — less,
+// arguably, since nothing about its journey is even in principle observable — so
+// it is checked against the same manifest with the same digest before anything
+// imports it.
+func VerifyFile(path, want string) error {
+	if !digestPattern.MatchString(want) {
+		return fmt.Errorf("imagesource: %q is not a sha256 digest", want)
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("imagesource: cannot read %s: %w", path, err)
+	}
+
+	defer func() { _ = f.Close() }()
+
+	sum := sha256.New()
+
+	if _, err := io.Copy(sum, f); err != nil {
+		return fmt.Errorf("imagesource: could not read %s: %w", path, err)
+	}
+
+	got := hex.EncodeToString(sum.Sum(nil))
+	if got != want {
+		return fmt.Errorf("imagesource: %s hashes to %s and the manifest published %s; it is "+
+			"not the file that was signed", path, got, want)
+	}
+
+	return nil
+}

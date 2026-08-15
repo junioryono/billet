@@ -70,9 +70,21 @@ need_root() {
 
 need_tools() {
 	local missing=()
-	for t in debootstrap mkfs.ext4 rbd chroot jq; do
+	for t in debootstrap mkfs.ext4 chroot jq; do
 		command -v "$t" >/dev/null 2>&1 || missing+=("$t")
 	done
+
+	# rbd IS REQUIRED ONLY WHEN THIS PUBLISHES.
+	#
+	# PUBLISH=no builds the filesystem and stops, which is exactly what a CI runner
+	# does -- it has no Ceph cluster to publish into and no reason to install a
+	# client for one. Requiring it unconditionally made the hosted build fail after
+	# the kernel had already been built, on a tool it was never going to use, with a
+	# message telling the operator to install ceph-common on a machine that has no
+	# cluster.
+	if [ "$PUBLISH" = "yes" ]; then
+		command -v rbd >/dev/null 2>&1 || missing+=("rbd")
+	fi
 
 	if [ ${#missing[@]} -ne 0 ]; then
 		echo "missing: ${missing[*]} (apt-get install debootstrap e2fsprogs ceph-common)" >&2
@@ -171,7 +183,19 @@ EOF
 	"
 
 	local tarball="actions-runner-linux-x64-$RUNNER_VERSION.tar.gz"
-	curl -fsSL -o "$WORK/$tarball" \
+
+	# RETRIED, FOR THE REASON THE KERNEL FETCH IS. A sibling download of comparable
+	# size died six minutes into a CI run with `curl: (92) HTTP/2 stream 1 was not
+	# closed cleanly` and took an hour-long build with it. This one is a couple of
+	# hundred megabytes over the same kind of link and had the same absence of
+	# retries; it simply had not been unlucky yet.
+	#
+	# --retry-all-errors is the load-bearing flag: plain --retry covers http statuses
+	# and timeouts but NOT curl-level transport faults, which is exactly what 92 is.
+	curl -fsSL --http1.1 \
+		--connect-timeout 20 --max-time 900 \
+		--retry 5 --retry-delay 5 --retry-all-errors \
+		-o "$WORK/$tarball" \
 		"https://github.com/actions/runner/releases/download/v$RUNNER_VERSION/$tarball"
 
 	# VERIFIED BEFORE IT IS UNPACKED. This is a binary fetched over the network that
@@ -182,6 +206,26 @@ EOF
 	mkdir -p "$rootfs/home/runner/runner"
 	tar -xzf "$WORK/$tarball" -C "$rootfs/home/runner/runner"
 	chroot "$rootfs" chown -R runner:runner /home/runner
+
+	# WHAT THIS IMAGE ACTUALLY CONTAINS, WRITTEN INTO THE IMAGE.
+	#
+	# The runner tarball ships no version file of its own -- measured: the release
+	# gate reported "no .runner-version in the image; cannot cross-check the
+	# manifest", which meant the manifest's runner version was taken entirely on
+	# trust. A manifest is free to claim any version; nothing was checking that the
+	# claim matched the binary.
+	#
+	# That gap matters because the version drives the thirty-day expiry check. An
+	# image whose manifest says 2.336.0 while the disk carries something older would
+	# be judged fresh and would stop being sent jobs on a date derived from the wrong
+	# number.
+	#
+	# Written here rather than derived later, because this is the only point where
+	# what-was-downloaded and what-was-installed are the same fact.
+	cat >"$rootfs/etc/billet-image" <<IMAGEINFO
+RUNNER_VERSION=$RUNNER_VERSION
+BUILT_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+IMAGEINFO
 
 	echo "=== 4/6 the agent that reads the registration ==="
 	install -m 0755 /dev/stdin "$rootfs/usr/local/bin/billet-agent" <<'AGENT'
@@ -418,8 +462,21 @@ ExecStart=/usr/local/bin/billet-agent
 # destroyed with it, so a restart would register a second runner against a
 # registration that has already been consumed.
 Restart=no
-StandardOutput=journal
-StandardError=journal
+# journal+console, NOT journal ALONE, AND THIS IS A DEBUGGABILITY DECISION.
+#
+# A microVM has no console anybody normally reads and no way in: if the agent
+# refuses its metadata, or cannot reach the service, the explanation lands in a
+# journal inside a guest that is about to be destroyed. What an operator sees is a
+# VM that started and ran nothing, with the reason already deleted.
+#
+# Sending it to the console costs nothing in production -- billet passes no
+# console= to the guest, so there is nowhere for it to go -- and it is the entire
+# difference between a boot test that can read the agent's verdict and one that
+# can only observe that systemd executed something. Type=exec reports Started for
+# a process that exits immediately, which the agent itself carries a paragraph
+# about, so "Started billet-agent.service" is not evidence of anything.
+StandardOutput=journal+console
+StandardError=journal+console
 
 [Install]
 WantedBy=multi-user.target

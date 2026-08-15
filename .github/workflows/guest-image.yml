@@ -104,7 +104,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             debootstrap e2fsprogs jq zstd \
-            build-essential flex bison libelf-dev libssl-dev bc
+            build-essential flex bison libelf-dev libssl-dev bc \
+            dnsmasq
 
       # THE KERNEL IS CACHED ON ITS OWN INPUTS, not rebuilt weekly. It changes
       # when its config or its version changes and at no other time, so keying the
@@ -196,6 +197,80 @@ jobs:
           KERNEL: ${{ github.workspace }}/out/vmlinux-billet
           ROOTFS: ${{ github.workspace }}/out/rootfs.img.zst
 
+      # THE RELEASE GATE. Nothing below this runs against an image that fails it.
+      #
+      # AN IMAGE THAT REACHES A RELEASE IS ONE EVERY DEPLOYMENT PULLS, and a bad one
+      # is not a local problem: it fans out to everybody on the next refresh, and
+      # the thing that would rebuild it is itself a guest booting the image. So the
+      # question "is this fit to publish" is asked here, before the upload, rather
+      # than discovered afterwards by somebody whose jobs stopped working.
+      #
+      # IT CHECKS CONTENTS, NOT BOOT. It cannot see an integration failure -- a
+      # kernel missing an option the userspace needs, systemd failing to bring up
+      # the network. What it catches is the silent class: a build step that failed
+      # in a way `set -e` did not notice, a tarball unpacked to the wrong place, an
+      # agent never installed, a unit present but not enabled. Those produce an
+      # image that boots perfectly and then does nothing, which is the hardest kind
+      # to diagnose from outside.
+      #
+      # The manifest is passed so the two can be cross-checked: an image whose agent
+      # speaks a different contract than the manifest advertises would be accepted
+      # by a node on the manifest's word and then produce microVMs that boot and
+      # never report.
+      - name: Check the image is fit to publish
+        run: |
+          set -euo pipefail
+
+          sudo scripts/check-guest-image.sh \
+            "$WORK/$IMAGE_NAME.ext4" \
+            "${{ github.workspace }}/out/manifest.json"
+
+      # THE SECOND HALF OF THE GATE: it has to BOOT.
+      #
+      # The check above reads the filesystem and can prove the agent is installed
+      # and the units enabled. It cannot prove the kernel boots this userspace,
+      # that systemd reaches its target, that the network comes up, or that the
+      # guest can reach the metadata service -- and those are precisely the
+      # failures that produce a microVM which starts and then does nothing.
+      #
+      # THIS IS POSSIBLE AT ALL BECAUSE HOSTED RUNNERS HAVE KVM. GitHub extended it
+      # to 2-vCPU runners in April 2024, and a Firecracker microVM manager runs its
+      # end-to-end suite on stock ubuntu-latest today. GitHub documents it only as
+      # an Android-emulator feature and never as a general guarantee, so the script
+      # asserts /dev/kvm itself and says plainly that its absence is not the
+      # image's fault.
+      #
+      # firecracker is fetched pinned rather than built: it is a released binary
+      # with a published checksum, and building it would add a rust toolchain to a
+      # job that has no other use for one.
+      - name: Install firecracker
+        run: |
+          set -euo pipefail
+
+          curl -fL -sS --http1.1 --retry 5 --retry-delay 5 --retry-all-errors \
+            --connect-timeout 20 --max-time 300 \
+            -o /tmp/fc.tgz \
+            "https://github.com/firecracker-microvm/firecracker/releases/download/v${FC_VERSION}/firecracker-v${FC_VERSION}-x86_64.tgz"
+
+          tar xf /tmp/fc.tgz -C /tmp
+
+          sudo install -m 0755 \
+            "/tmp/release-v${FC_VERSION}-x86_64/firecracker-v${FC_VERSION}-x86_64" \
+            /usr/local/bin/firecracker
+
+          firecracker --version
+        env:
+          FC_VERSION: "1.13.1"
+
+      - name: Boot the image and prove it came up
+        run: |
+          set -euo pipefail
+
+          sudo --preserve-env=KERNEL,ROOTFS scripts/boot-guest-image.sh
+        env:
+          KERNEL: ${{ github.workspace }}/out/vmlinux-billet
+          ROOTFS: /var/tmp/billet-guest/ubuntu-2404-x64.ext4
+
       # THE MANIFEST IS THE ONLY THING SIGNED, and that is sufficient: it carries a
       # digest for every asset, so one signature transitively covers the four
       # hundred megabytes without anybody doing public-key arithmetic over them.
@@ -270,8 +345,10 @@ jobs:
       # KEPT EVEN WHEN NOT PUBLISHING, because the reason to run this without
       # publishing is to inspect what it produced.
       - name: Upload for inspection
-        # The mirror of the condition above, spelled the same explicit way.
-        if: github.event_name == 'workflow_dispatch' && !inputs.publish
+        # always() SO A FAILED GATE STILL HANDS OVER THE ARTIFACT. Without it, the
+        # one run where somebody most wants to open the image -- the one that just
+        # refused to publish it -- is the run that uploads nothing.
+        if: always() && github.event_name == 'workflow_dispatch' && !inputs.publish
         uses: actions/upload-artifact@v4
         with:
           name: guest-image
