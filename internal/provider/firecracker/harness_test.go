@@ -187,6 +187,12 @@ type fakeDisk struct {
 	resolved   string
 	resolveErr error
 	cloneErr   error
+
+	// kernel is what a generation records as its paired kernel, and kernelErr is
+	// what the lookup refuses with. An empty kernel means the generation records
+	// none, which is the ordinary case for an image built by hand.
+	kernel     string
+	kernelErr  error
 	discarded  []string
 	cloned     []string
 	discardErr error
@@ -237,6 +243,21 @@ func (d *fakeDisk) DiscardRoot(_ context.Context, name string) error {
 	d.discarded = append(d.discarded, name)
 
 	return d.discardErr
+}
+
+func (d *fakeDisk) KernelFor(_ context.Context, _, _ string) (string, bool, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if d.kernelErr != nil {
+		return "", false, d.kernelErr
+	}
+
+	if d.kernel == "" {
+		return "", false, nil
+	}
+
+	return d.kernel, true, nil
 }
 
 // clonedFrom is the image reference the last clone was made from, which is how a

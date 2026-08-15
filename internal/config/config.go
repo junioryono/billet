@@ -465,6 +465,18 @@ type FirecrackerConfig struct {
 	// everything Docker needs; validate with moby's contrib/check-config.sh
 	// rather than a hand-maintained list.
 	KernelImage string `yaml:"kernel_image"`
+
+	// KernelDir is where `billet images pull` keeps the kernels it fetches.
+	//
+	// SEPARATE FROM KernelImage BECAUSE THEY ANSWER DIFFERENT QUESTIONS. KernelImage
+	// is the fallback for a generation that records no kernel of its own — a
+	// hand-built image, whose builder installs none. This is where a PAIRED kernel is
+	// looked up, and a generation that names one boots that one instead: the two are
+	// published together and a mismatch fails inside somebody's job rather than at
+	// launch.
+	//
+	// Empty means the default, which is where a pull puts them.
+	KernelDir string `yaml:"kernel_dir,omitempty"`
 	// ChrootBase is where the jailer builds each microVM's chroot. It defaults to
 	// the jailer's own default, and it must be on local storage with room for a
 	// hard link to the guest kernel per running job.
