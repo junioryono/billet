@@ -225,6 +225,35 @@ func stageImage(
 				from, err)
 		}
 
+		// THE SIGNATURE IS CHECKED HERE TOO, AND THIS WAS MISSING.
+		//
+		// A sideloaded directory is not more trustworthy than a download -- it is
+		// less, because nothing about how it arrived is even in principle
+		// observable. And the digests inside a manifest prove nothing about the
+		// manifest: whoever supplied the directory chose them. Skipping the
+		// signature here left the whole verification chain bypassable by putting
+		// files in a folder.
+		policy, err := sideloadPolicy(cfg, opts)
+		if err != nil {
+			return nil, "", nil, err
+		}
+
+		var signature []byte
+
+		if policy.Required {
+			signature, err = os.ReadFile(filepath.Join(from, imagesource.BundleName))
+			if err != nil {
+				return nil, "", nil, fmt.Errorf("billet images pull: %s holds no %s, and this "+
+					"source requires a signature. Copy it from the release alongside the "+
+					"manifest, or pass --skip-signature-verification if this directory is "+
+					"trusted by other means: %w", from, imagesource.BundleName, err)
+			}
+		}
+
+		if err := imagesource.VerifySignature(data, signature, policy); err != nil {
+			return nil, "", nil, err
+		}
+
 		manifest, err := imagesource.ParseManifest(data)
 		if err != nil {
 			return nil, "", nil, err
@@ -295,6 +324,33 @@ func stageImage(
 	}
 
 	return manifest, dir, cleanup, nil
+}
+
+// sideloadPolicy decides what a directory on disk must prove.
+//
+// THE SAME POLICY THE NETWORK PATH USES, resolved against the source the operator
+// would otherwise have pulled from -- because a sideloaded copy of billet's own
+// image is still billet's own image, and should have to prove it. An operator
+// distributing their own builds says so the same way they would for a mirror.
+func sideloadPolicy(cfg *config.Config, opts stageOptions) (imagesource.Policy, error) {
+	src, err := resolveSource(cfg, opts.source)
+	if err != nil {
+		return imagesource.Policy{}, err
+	}
+
+	identity, issuer := opts.identity, opts.issuer
+
+	if cfg.Images != nil {
+		if identity == "" {
+			identity = cfg.Images.SigningIdentity
+		}
+
+		if issuer == "" {
+			issuer = cfg.Images.SigningIssuer
+		}
+	}
+
+	return imagesource.PolicyFor(src, identity, issuer, opts.skipSig)
 }
 
 // resolveSource decides where to fetch from.
