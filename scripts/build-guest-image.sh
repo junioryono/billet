@@ -606,10 +606,7 @@ take_publish_lock() {
 		>/dev/null 2>&1 || true
 
 	if rbd --id "$CEPH_USER" lock add "$LOCK_IMAGE" "$LOCK_COOKIE" >/dev/null 2>&1; then
-		# TERM AND INT AS WELL AS EXIT. A systemd timeout sends SIGTERM, and bash runs
-		# no EXIT trap for an untrapped signal -- which is the common way this lock
-		# was going to be leaked.
-		trap release_publish_lock EXIT TERM INT
+		install_publish_traps
 
 		echo "holding the cluster publish lock as $LOCK_COOKIE"
 
@@ -632,7 +629,7 @@ take_publish_lock() {
 		rbd --id "$CEPH_USER" lock rm "$LOCK_IMAGE" "$id" "$locker" >/dev/null 2>&1 || true
 
 		if rbd --id "$CEPH_USER" lock add "$LOCK_IMAGE" "$LOCK_COOKIE" >/dev/null 2>&1; then
-			trap release_publish_lock EXIT TERM INT
+			install_publish_traps
 
 			return 0
 		fi
@@ -648,6 +645,50 @@ take_publish_lock() {
 	echo "  rbd --id $CEPH_USER lock rm $LOCK_IMAGE '<id>' '<locker>'" >&2
 
 	exit 1
+}
+
+# ONE HANDLER FOR EVERYTHING THIS HAS TO UNDO, and one place that installs it.
+#
+# THE BUG THIS REPLACES LEAKED THE LOCK ON EVERY SUCCESSFUL PUBLISH. take_publish_lock
+# installed `trap release_publish_lock EXIT`, and then publish() installed
+# `trap 'unmap_image "$dev"' EXIT` -- which REPLACES it, because bash keeps one
+# action per signal -- and finally ran `trap - EXIT`, removing that too.
+# release_publish_lock was never called explicitly, so the lock survived every
+# normal run. It is not a lease, so every publisher on every node then refused for
+# six hours, and the operator's only clue was a message about a holder that had
+# finished successfully hours earlier.
+#
+# Two traps for one signal is the trap, so to speak: there is now one handler, it
+# does everything, and nothing is allowed to install a second.
+publish_cleanup() {
+	local status=$?
+
+	if [ -n "${MAPPED_DEV:-}" ]; then
+		unmap_image "$MAPPED_DEV"
+		MAPPED_DEV=""
+	fi
+
+	release_publish_lock
+
+	return "$status"
+}
+
+# A SIGNAL HANDLER THAT DOES NOT EXIT LETS THE SCRIPT CARRY ON WITHOUT THE LOCK.
+#
+# A bash TERM or INT trap does not terminate the shell by itself. The previous
+# version returned from release_publish_lock and execution resumed -- so a build
+# that was signalled mid-publish would release the lock, keep writing the image,
+# and let a second publisher take the lock and write it too. Concurrent writers,
+# which is the one thing this lock exists to prevent, reached by way of the
+# cleanup.
+#
+# Re-raising with the default handler is what makes the exit status honest to
+# whatever is watching, which for the scheduled path is systemd.
+install_publish_traps() {
+	trap publish_cleanup EXIT
+
+	trap 'publish_cleanup; trap - TERM; kill -TERM $$' TERM
+	trap 'publish_cleanup; trap - INT; kill -INT $$' INT
 }
 
 release_publish_lock() {
@@ -716,7 +757,9 @@ publish() {
 	# golden image then stayed mapped on the build host, and the next run's `device
 	# map` added a second mapping of the same image rather than failing, which is how
 	# a build host ends up with a dozen of them.
-	trap 'unmap_image "$dev"' EXIT
+	# RECORDED, NOT TRAPPED. Installing a second EXIT trap here is what silently
+	# discarded the lock release; publish_cleanup unmaps whatever this names.
+	MAPPED_DEV="$dev"
 
 	# gnudd, NOT dd: Ubuntu 26.04's uutils coreutils does not implement
 	# `iflag=direct`, which is the same class of difference that broke `cephadm
@@ -728,7 +771,7 @@ publish() {
 
 	"${rbd[@]}" device unmap "$dev"
 	dev=""
-	trap - EXIT
+	MAPPED_DEV=""
 
 	"${rbd[@]}" -p "$IMAGE_POOL" snap create "$IMAGE_NAME@$gen"
 

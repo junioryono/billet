@@ -2,6 +2,8 @@ package ceph
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -48,6 +50,39 @@ const StaleLockAfter = 6 * time.Hour
 // exists to handle.
 var cookieAge = regexp.MustCompile(`-(\d+)$`)
 
+// publishCookie is the identity a publisher takes the lock under.
+//
+// A NONCE, BECAUSE HOST AND PID AND SECOND ARE NOT A UNIQUE IDENTITY. Release
+// finds its own lock by matching this string, so two publishers that generate the
+// same one -- the same hostname on cloned images, the same pid in two pid
+// namespaces, inside the same second -- would each find the OTHER's locker id and
+// be able to remove the other's lock. That is the one thing a lock must not
+// permit, and it costs eight random bytes to make impossible.
+//
+// THE TRAILING UNIX TIME IS THE INTEROP SURFACE and must stay last.
+// build-guest-image.sh ages out a stale lock by reading it with `-(?<t>[0-9]+)$`,
+// so a nonce appended AFTER the timestamp would make every lock this side takes
+// unreclaimable by a shell build -- and only under the failure that mechanism
+// exists to handle, which is the worst possible time to discover it.
+func publishCookie(now time.Time) string {
+	host, err := os.Hostname()
+	if err != nil || strings.TrimSpace(host) == "" {
+		host = "unknown"
+	}
+
+	var nonce [8]byte
+
+	if _, err := rand.Read(nonce[:]); err != nil {
+		// UNREACHABLE IN PRACTICE, and the fallback still has to be a plausible
+		// cookie rather than an empty one: a lock taken under "" is a lock nothing
+		// can release.
+		return fmt.Sprintf("billet-import-%s-%d-%d", host, os.Getpid(), now.UTC().Unix())
+	}
+
+	return fmt.Sprintf("billet-import-%s-%d-%s-%d",
+		host, os.Getpid(), hex.EncodeToString(nonce[:]), now.UTC().Unix())
+}
+
 // PublishLock is a held cluster-wide publish lock.
 type PublishLock struct {
 	client *Client
@@ -59,14 +94,7 @@ type PublishLock struct {
 func (c *Client) TakePublishLock(ctx context.Context, now time.Time) (*PublishLock, error) {
 	image := c.cfg.ImagePool + "/" + LockImageName
 
-	host, err := os.Hostname()
-	if err != nil || strings.TrimSpace(host) == "" {
-		host = "unknown"
-	}
-
-	// THE TRAILING UNIX TIME IS LOAD-BEARING, not decoration: it is how both this
-	// package and the build script decide whether a held lock is stale.
-	cookie := fmt.Sprintf("billet-import-%s-%d-%d", host, os.Getpid(), now.UTC().Unix())
+	cookie := publishCookie(now)
 
 	// CREATED IF ABSENT, AND A FAILURE HERE IS NOT FATAL. The ordinary case is that
 	// it already exists, which `rbd create` reports as an error; distinguishing
