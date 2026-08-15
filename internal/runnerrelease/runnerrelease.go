@@ -8,6 +8,18 @@
 // the runner's side can rescue it. A fleet that was working perfectly stops taking
 // work, and the visible symptom is jobs queueing against runners that look healthy.
 //
+// AND BILLET'S RUNNERS CANNOT UPDATE THEMSELVES OUT OF IT, which is what turns this
+// from a slow-job problem into an outage. A self-hosted runner ordinarily updates
+// itself in place — so a stale image would cost a large download per job and keep
+// working. billet's do not: a JIT configuration minted by GitHub's REST API carries
+// `DisableUpdate = True` alongside `Ephemeral = True`, measured against the live API,
+// and there is no parameter to ask for anything else. So the version baked into the
+// image is the version forever, and republishing is the only way past the deadline.
+//
+// That is the same posture actions-runner-controller runs in, deliberately, and the
+// same one it gets its `Outdated` scale-set failure from. The difference this package
+// makes is being told before it happens rather than after.
+//
 // billet bakes the runner into an image, so "update the runner" means "rebuild and
 // republish the image". That is a thing somebody has to do on a schedule, and a
 // thing somebody will forget — so it needs to be something a machine notices.

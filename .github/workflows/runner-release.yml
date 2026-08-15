@@ -1,0 +1,134 @@
+# Watch actions/runner for a release, and open a pull request bumping the pin.
+#
+# WHY A PULL REQUEST AND NOT A BUILD. GitHub stops sending jobs to a self-hosted
+# runner more than 30 days behind a release, and billet's runners cannot update
+# themselves out of that — a JIT config carries DisableUpdate=True, so the runner in
+# an image is the runner forever. Something has to notice a release.
+#
+# But a runner release should not reach a fleet unattended. Merging is the gate, and
+# it is deliberate: actions-runner-controller reached the same design and wrote down
+# the reason — "since images won't be built until the generated PR is merged we still
+# have room to wait before triggering a build should there be any problems with the
+# runner release."
+#
+# WHY POLLING RATHER THAN BEING TOLD. A `repository_dispatch` from actions/runner
+# would need a token with write access to this repository held by somebody else, and
+# a dependency pointing the wrong way. Polling costs one unauthenticated request a
+# day.
+name: Runner release
+
+on:
+  schedule:
+    # Daily. The window is thirty days, so this is not about speed — it is about not
+    # depending on somebody remembering to look.
+    - cron: "17 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Read the newest release and the current pin
+        id: read
+        run: |
+          set -euo pipefail
+
+          body=$(curl -sSf --connect-timeout 10 --max-time 60 --retry 2 \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/actions/runner/releases/latest)
+
+          version=$(printf '%s' "$body" | jq -r '.tag_name' | sed 's/^v//')
+
+          # THE MARKERS, NOT A REGEX OVER THE BODY. The notes carry one checksum per
+          # platform between `<!-- BEGIN SHA linux-x64 -->` and its END, and they also
+          # contain OTHER 64-character hex strings — a greedy pattern takes the wrong
+          # one, which was measured, and would pin a checksum belonging to another
+          # architecture.
+          sha=$(printf '%s' "$body" | jq -r '.body' \
+            | sed -n 's/.*<!-- BEGIN SHA linux-x64 -->\([0-9a-f]\{64\}\)<!-- END SHA linux-x64 -->.*/\1/p' \
+            | head -1)
+
+          case "$version" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "github named the release '$version', which is not a version" >&2; exit 1 ;;
+          esac
+
+          case "$sha" in
+            [0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ;;
+            *) echo "no linux-x64 checksum in the release notes" >&2; exit 1 ;;
+          esac
+
+          current=$(awk 'NR==1{print $1}' internal/runnerrelease/pinned.txt)
+
+          {
+            echo "version=$version"
+            echo "sha=$sha"
+            echo "current=$current"
+            echo "published=$(printf '%s' "$body" | jq -r '.published_at')"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Open a pull request
+        if: steps.read.outputs.version != steps.read.outputs.current
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.read.outputs.version }}
+          SHA: ${{ steps.read.outputs.sha }}
+          CURRENT: ${{ steps.read.outputs.current }}
+          PUBLISHED: ${{ steps.read.outputs.published }}
+        run: |
+          set -euo pipefail
+
+          branch="runner-release/$VERSION"
+
+          # ALREADY OPEN IS NOT A FAILURE. This runs daily and a release stands for
+          # weeks, so most days there is a pull request sitting there already —
+          # opening a second one every morning would train everybody to ignore them.
+          if gh pr list --head "$branch" --state open --json number --jq 'length' | grep -qv '^0$'; then
+            echo "a pull request for $VERSION is already open"
+            exit 0
+          fi
+
+          printf '%s %s\n' "$VERSION" "$SHA" > internal/runnerrelease/pinned.txt
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add internal/runnerrelease/pinned.txt
+          git commit --file - <<COMMIT
+          Runner: take up actions/runner $VERSION
+
+          Published $PUBLISHED; the pin was $CURRENT.
+
+          GitHub stops sending jobs to a self-hosted runner more than 30 days after a
+          release, and billet's runners cannot update themselves out of it -- a JIT
+          config carries DisableUpdate=True, so the runner baked into an image is the
+          runner forever.
+
+          Opened by the daily poll rather than applied automatically, so a bad runner
+          release does not reach a fleet without somebody agreeing to it.
+          COMMIT
+
+          git push origin "$branch"
+
+          gh pr create --head "$branch" --title "Runner: take up actions/runner $VERSION" --body "\
+          \`actions/runner\` **$VERSION** was published on $PUBLISHED. The pin was \`$CURRENT\`.
+
+          **The clock starts at the release, not at merge.** GitHub stops sending jobs to a
+          self-hosted runner more than 30 days behind a release, and billet's runners cannot
+          update themselves out of it: a JIT configuration carries \`DisableUpdate = True\`, so
+          the runner baked into an image is the runner forever.
+
+          Merging this moves the pin, which is the default a hand-run build uses and what
+          \`billet ami\` installs. The scheduled \`billet-image-refresh.timer\` already builds at
+          whatever GitHub has published, so a fleet running that is current either way — this
+          keeps the source honest and the two backends in step.
+
+          Nothing is verified by opening this. \`billet images verify\` runs a real guest on a
+          node with \`/dev/kvm\`, which no hosted runner can do."

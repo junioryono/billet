@@ -181,7 +181,11 @@ func (v *fakeVMM) bodyPut(path string) (map[string]any, bool) {
 type fakeDisk struct {
 	mu sync.Mutex
 
-	device     string
+	device string
+	// resolved is what ResolveGeneration answers, and resolveErr is what it refuses
+	// with — the two halves of a tier naming `@verified`.
+	resolved   string
+	resolveErr error
 	cloneErr   error
 	discarded  []string
 	cloned     []string
@@ -189,6 +193,24 @@ type fakeDisk struct {
 	// onClone runs inside CloneRoot, so a test can observe what the host looked
 	// like at the moment the disk was cloned rather than afterwards.
 	onClone func()
+}
+
+// resolve stands in for the store turning `@verified` into a generation. The fake
+// answers with whatever it is given unless a test says otherwise, because almost
+// every test is about something else.
+func (d *fakeDisk) ResolveGeneration(_ context.Context, image string) (string, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if d.resolveErr != nil {
+		return "", d.resolveErr
+	}
+
+	if d.resolved != "" {
+		return d.resolved, nil
+	}
+
+	return image, nil
 }
 
 func (d *fakeDisk) CloneRoot(_ context.Context, image, name string) (string, error) {
@@ -215,6 +237,19 @@ func (d *fakeDisk) DiscardRoot(_ context.Context, name string) error {
 	d.discarded = append(d.discarded, name)
 
 	return d.discardErr
+}
+
+// clonedFrom is the image reference the last clone was made from, which is how a
+// test tells a resolved generation from the alias that named it.
+func (d *fakeDisk) clonedFrom() string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if len(d.cloned) == 0 {
+		return ""
+	}
+
+	return d.cloned[len(d.cloned)-1]
 }
 
 func (d *fakeDisk) discards() []string {
