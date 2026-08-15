@@ -154,31 +154,40 @@ func (c *Client) SetKernel(ctx context.Context, image, generation, file string) 
 	return c.setGenerationMeta(ctx, KernelKey, image, generation, file)
 }
 
-// NeededKernels reports every kernel file the given generations still name.
+// NeededKernels reports every kernel file the given generations name, and how many
+// of them name none.
 //
-// THE INPUT TO THE REAPER, assembled here because only this side can read the
-// metadata. A generation with nothing recorded contributes nothing, which is
-// exactly why PlanKernelReap refuses to act on an empty set while generations
-// exist: that is what a failed read looks like.
+// THE UNKNOWN COUNT IS RETURNED SEPARATELY BECAUSE IT CANNOT BE INFERRED FROM THE
+// SET. Two generations sharing a kernel collapse into one entry, so a caller
+// cannot compare len(needed) against the number of generations to find out whether
+// anything is unaccounted for -- and "unaccounted for" is the one fact that
+// decides whether reaping is safe at all. A generation that names no kernel still
+// boots one, and that file on disk is indistinguishable from an orphan.
 func (c *Client) NeededKernels(
 	ctx context.Context,
 	image string,
 	generations []Generation,
-) (map[string]bool, error) {
+) (map[string]bool, int, error) {
 	needed := map[string]bool{}
+
+	unknown := 0
 
 	for _, generation := range generations {
 		file, found, err := c.Kernel(ctx, image, generation.Name)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 
-		if found && file != "" {
-			needed[file] = true
+		if !found || file == "" {
+			unknown++
+
+			continue
 		}
+
+		needed[file] = true
 	}
 
-	return needed, nil
+	return needed, unknown, nil
 }
 
 // Kernel reports which kernel file a generation is paired with.

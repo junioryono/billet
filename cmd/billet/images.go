@@ -711,6 +711,8 @@ func cmdImagesReap(ctx context.Context, args []string) error {
 	cfgPath := addConfigFlag(fs)
 	keep := fs.Int("keep", 3, "how many VERIFIED generations to leave, newest first")
 	dryRun := fs.Bool("dry-run", false, "print what would be removed and remove nothing")
+	kernelDir := fs.String("kernel-dir", DefaultKernelDir,
+		"where pulled kernels are kept; orphans there are reaped too")
 
 	rest, err := parseWithName(fs, args)
 	if err != nil {
@@ -777,23 +779,75 @@ func cmdImagesReap(ctx context.Context, args []string) error {
 		}
 	}
 
-	if removing == 0 {
-		fmt.Println("nothing to reap")
-
-		return nil
-	}
-
-	if *dryRun {
+	switch {
+	case removing == 0:
+		fmt.Println("no generation needs reaping")
+	case *dryRun:
 		fmt.Printf("\n%d generation(s) would be removed; this was a dry run\n", removing)
+	default:
+		removed, reapErr := store.Reap(ctx, image, plan)
 
+		fmt.Printf("\nremoved %d generation(s)\n", len(removed))
+
+		if reapErr != nil {
+			return reapErr
+		}
+	}
+
+	// KERNELS ARE REAPED WHETHER OR NOT A GENERATION WAS.
+	//
+	// An orphaned kernel does not require a generation to have been removed just
+	// now: one reaped on an earlier run, or a pull whose generation was never kept,
+	// leaves a kernel behind. Returning early when no generation needs reaping --
+	// which is the common case -- would mean the kernels were never collected at
+	// all, and the directory grows by 46MB a week regardless.
+	return reapKernels(ctx, store, image, *kernelDir, *dryRun)
+}
+
+// reapKernels removes pulled kernels no surviving generation is paired with.
+//
+// READ AFTER THE GENERATIONS ARE REAPED, deliberately. The needed set has to
+// describe what SURVIVES: computing it before would keep the kernel of a
+// generation that is about to be removed, and the orphan would then never be
+// collected because the next run would see it as already unreferenced by a
+// generation that no longer exists to name it.
+func reapKernels(
+	ctx context.Context,
+	store *ceph.Client,
+	image, kernelDir string,
+	dryRun bool,
+) error {
+	surviving, err := store.Generations(ctx, image)
+	if err != nil {
+		return err
+	}
+
+	needed, unknown, err := store.NeededKernels(ctx, image, surviving)
+	if err != nil {
+		return err
+	}
+
+	removed, err := reapKernelDir(kernelDir, needed, len(surviving), unknown, dryRun)
+	if err != nil {
+		return err
+	}
+
+	if len(removed) == 0 {
 		return nil
 	}
 
-	removed, err := store.Reap(ctx, image, plan)
+	verb := "removed"
+	if dryRun {
+		verb = "would remove"
+	}
 
-	fmt.Printf("\nremoved %d generation(s)\n", len(removed))
+	fmt.Printf("\n%s %d kernel(s) no generation is paired with:\n", verb, len(removed))
 
-	return err
+	for _, name := range removed {
+		fmt.Printf("  %s\n", name)
+	}
+
+	return nil
 }
 
 // cmdImagesList shows what the fleet's image state actually is.

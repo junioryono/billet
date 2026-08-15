@@ -26,20 +26,36 @@ var kernelFilePattern = regexp.MustCompile(`^vmlinux-\d[0-9.]*\d-[0-9a-f]{12}$`)
 // TAKES WHAT IS NEEDED RATHER THAN COMPUTING IT, so the decision is a pure
 // function of two lists and can be tested without a cluster. The caller reads the
 // needed set out of the generations' metadata.
-func PlanKernelReap(onDisk []string, needed map[string]bool, generations int) ([]string, error) {
-	// NOTHING NEEDED WHILE GENERATIONS EXIST IS A FAILED READ, NOT A DIRECTORY OF
-	// ORPHANS.
+func PlanKernelReap(
+	onDisk []string,
+	needed map[string]bool,
+	generations, unknown int,
+) ([]string, error) {
+	// ONE GENERATION WITH AN UNKNOWN KERNEL MAKES EVERY KERNEL UNSAFE TO DELETE.
 	//
-	// The needed set is assembled from per-generation metadata, and a generation
-	// published before billet recorded it -- or by the build script, which does not
-	// -- contributes nothing. Acting on an empty set would delete the kernel every
-	// running tier boots, and the first symptom would be every microVM failing to
-	// start, with no obvious connection to a reap that reported success.
-	if generations > 0 && len(needed) == 0 {
-		return nil, fmt.Errorf("ceph: no kernel is recorded against any of the %d generations "+
-			"of this image, so every kernel on disk looks orphaned. That is far more likely to "+
-			"be metadata this could not read than a directory of orphans, and acting on it "+
-			"would delete the kernel every running tier boots. Refusing", generations)
+	// A generation that records no kernel still boots one, and that kernel is on
+	// disk -- unnamed, and therefore indistinguishable from an orphan. Deleting it
+	// breaks the generation that boots it, and the first symptom is every microVM
+	// on that generation failing to start, with no obvious connection to a reap
+	// that reported success.
+	//
+	// AN EARLIER VERSION REFUSED ONLY WHEN *NO* GENERATION NAMED A KERNEL, which is
+	// the same mistake one step down: three generations naming kernels and a fourth
+	// naming none would have reaped the fourth's. This was found by running a dry
+	// run against a real cluster whose generations predated the metadata -- the
+	// weaker rule happened to refuse there, for the wrong reason.
+	//
+	// Generations published by build-guest-image.sh always arrive here unknown; it
+	// records no kernel. So a deployment that builds by hand does not reap kernels
+	// automatically, which is the correct outcome: nothing can tell which of its
+	// kernels are still needed.
+	if unknown > 0 {
+		return nil, fmt.Errorf("ceph: %d of %d generations record no kernel, so each of them "+
+			"boots something on disk that nothing here can name. Any of those files is "+
+			"indistinguishable from an orphan, and deleting one breaks the generation that "+
+			"boots it. Refusing to reap kernels until every generation names one -- a fresh "+
+			"`billet images pull` records it, and reaping the unnamed generations also clears "+
+			"this", unknown, generations)
 	}
 
 	var reapable []string

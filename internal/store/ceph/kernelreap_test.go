@@ -17,7 +17,7 @@ func TestPlanKernelReapRemovesOnlyWhatNothingNeeds(t *testing.T) {
 
 	needed := map[string]bool{"vmlinux-6.1.155-ea1d42638d13": true}
 
-	got, err := PlanKernelReap(onDisk, needed, 3)
+	got, err := PlanKernelReap(onDisk, needed, 3, 0)
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
@@ -50,7 +50,7 @@ func TestPlanKernelReapDistinguishesKernelsSharingAVersion(t *testing.T) {
 
 	needed := map[string]bool{"vmlinux-6.1.155-ffffffffffff": true}
 
-	got, err := PlanKernelReap(onDisk, needed, 1)
+	got, err := PlanKernelReap(onDisk, needed, 1, 0)
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
@@ -72,7 +72,7 @@ func TestPlanKernelReapIgnoresFilesItDoesNotRecognise(t *testing.T) {
 		"vmlinux-6.1.155",
 	}
 
-	got, err := PlanKernelReap(onDisk, map[string]bool{}, 0)
+	got, err := PlanKernelReap(onDisk, map[string]bool{}, 0, 0)
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
@@ -84,16 +84,20 @@ func TestPlanKernelReapIgnoresFilesItDoesNotRecognise(t *testing.T) {
 	}
 }
 
-// NO GENERATION NEEDS ANYTHING, BUT GENERATIONS EXIST -- that is far more likely to
-// mean the metadata could not be read than that every kernel is orphaned, and
-// acting on it deletes the kernel every running tier boots.
-func TestPlanKernelReapRefusesToReapEverythingWhenGenerationsExist(t *testing.T) {
+// NO GENERATION NAMES A KERNEL, BUT GENERATIONS EXIST. Each of them boots
+// something on disk that nothing here can identify, so every file looks like an
+// orphan and none of them is.
+//
+// This is the shape a real cluster was in: its generations predated the metadata
+// entirely, and a dry run correctly refused rather than deleting the kernel the
+// verified generation boots.
+func TestPlanKernelReapRefusesWhenNoGenerationNamesAKernel(t *testing.T) {
 	onDisk := []string{"vmlinux-6.1.155-ea1d42638d13"}
 
-	_, err := PlanKernelReap(onDisk, map[string]bool{}, 4)
+	_, err := PlanKernelReap(onDisk, map[string]bool{}, 4, 4)
 	if err == nil {
-		t.Fatal("planned to remove every kernel while four generations exist; that is a " +
-			"metadata read that failed, not a directory of orphans")
+		t.Fatal("planned to remove every kernel while four generations exist and none " +
+			"names one; that is metadata this could not read, not a directory of orphans")
 	}
 
 	if !strings.Contains(err.Error(), "4") {
@@ -105,12 +109,61 @@ func TestPlanKernelReapRefusesToReapEverythingWhenGenerationsExist(t *testing.T)
 func TestPlanKernelReapReapsAllWhenThereAreNoGenerations(t *testing.T) {
 	onDisk := []string{"vmlinux-6.1.155-ea1d42638d13", "vmlinux-6.1.140-bbbbbbbbbbbb"}
 
-	got, err := PlanKernelReap(onDisk, map[string]bool{}, 0)
+	got, err := PlanKernelReap(onDisk, map[string]bool{}, 0, 0)
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
 
 	if len(got) != 2 {
 		t.Fatalf("planned %v, want both removed", got)
+	}
+}
+
+// A GENERATION WHOSE KERNEL IS UNKNOWN MAKES EVERY KERNEL UNSAFE TO DELETE.
+//
+// The first rule refused only when NO generation named a kernel. That is not
+// enough: if three generations name kernels and a fourth names none, the fourth's
+// kernel is on disk, unnamed, and looks exactly like an orphan. Deleting it breaks
+// the generation that boots it.
+//
+// This is not hypothetical -- it is what a real cluster looked like. Generations
+// published before billet recorded the kernel, or published by the build script,
+// which never does, both arrive here unknown.
+func TestPlanKernelReapRefusesWhileAnyGenerationsKernelIsUnknown(t *testing.T) {
+	onDisk := []string{
+		"vmlinux-6.1.155-ea1d42638d13",
+		"vmlinux-6.1.140-bbbbbbbbbbbb",
+	}
+
+	// Three generations name a kernel; one does not.
+	needed := map[string]bool{"vmlinux-6.1.155-ea1d42638d13": true}
+
+	_, err := PlanKernelReap(onDisk, needed, 4, 1)
+	if err == nil {
+		t.Fatal("planned a reap while one generation's kernel is unknown; that generation's " +
+			"kernel is on disk, unnamed, and indistinguishable from an orphan")
+	}
+
+	if !strings.Contains(err.Error(), "1") {
+		t.Errorf("the refusal does not say how many are unknown: %v", err)
+	}
+}
+
+// AND WITH EVERY GENERATION ACCOUNTED FOR, the reap proceeds.
+func TestPlanKernelReapProceedsWhenEveryGenerationNamesItsKernel(t *testing.T) {
+	onDisk := []string{
+		"vmlinux-6.1.155-ea1d42638d13",
+		"vmlinux-6.1.140-bbbbbbbbbbbb",
+	}
+
+	needed := map[string]bool{"vmlinux-6.1.155-ea1d42638d13": true}
+
+	got, err := PlanKernelReap(onDisk, needed, 2, 0)
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+
+	if len(got) != 1 || got[0] != "vmlinux-6.1.140-bbbbbbbbbbbb" {
+		t.Fatalf("planned %v, want only the orphan", got)
 	}
 }
