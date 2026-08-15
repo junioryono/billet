@@ -51,6 +51,14 @@ func TestPolicyForTheDefaultSourceRequiresBilletsOwnIdentity(t *testing.T) {
 	for _, wrong := range []string{
 		"https://github.com/junioryono/billet/.github/workflows/ci.yml@refs/heads/main",
 		"https://github.com/junioryono/billet/.github/workflows/attacker.yml@refs/pull/1/head",
+		// THE ONE THAT SLIPPED THROUGH. The publishing workflow's own name, signed
+		// from a PULL REQUEST ref. A contributor who opens a pr modifying
+		// guest-image.yml gets a certificate with exactly this SAN, and a pattern
+		// ending `@refs/.+` accepts it -- which is a far lower bar to clear than
+		// compromising the release process.
+		"https://github.com/junioryono/billet/.github/workflows/guest-image.yml@refs/pull/1/head",
+		"https://github.com/junioryono/billet/.github/workflows/guest-image.yml@refs/heads/attacker",
+		"https://github.com/junioryono/billet/.github/workflows/guest-image.yml@refs/tags/v1",
 		"https://github.com/someoneelse/billet/.github/workflows/guest-image.yml@refs/heads/main",
 		"https://github.com/junioryono/billet-evil/.github/workflows/guest-image.yml@refs/heads/main",
 		"https://evil.test/junioryono/billet/.github/workflows/guest-image.yml@refs/heads/main",

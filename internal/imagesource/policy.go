@@ -17,18 +17,32 @@ const GitHubOIDCIssuer = "https://token.actions.githubusercontent.com"
 // lower bar to clear than compromising the release process.
 const PublishWorkflow = ".github/workflows/guest-image.yml"
 
+// PublishRef is the git ref images may be signed from.
+//
+// PINNED, AND THE FIRST VERSION OF THIS WAS NOT. It ended `@refs/.+`, reasoning
+// that a release cut from another branch should fail review rather than fail
+// verification. That reasoning was wrong in a way that matters: a certificate's
+// ref is whatever ref the workflow RAN on, so a contributor who opens a pull
+// request modifying guest-image.yml gets a certificate reading
+// `.../guest-image.yml@refs/pull/N/head` -- which that pattern accepted. Opening a
+// pull request is a far lower bar than compromising the release process.
+const PublishRef = "refs/heads/main"
+
 // DefaultSigningIdentity is the certificate SAN a manifest from billet must carry.
 //
 // DERIVED FROM THE ONE CONSTANT NAMING THIS PROJECT, like the fetch URL, because a
 // project that moves between accounts and forgets one of them gets a signature
 // mismatch that reads exactly like an attack.
 //
-// The ref is deliberately open: images are published from main today, and pinning
-// the branch here would make a release cut from anywhere else fail verification
-// rather than fail review.
+// ANCHORED AT BOTH ENDS AND FULLY ESCAPED. Unanchored, `guest-image\.yml` also
+// matches `guest-image.yml.evil`; unescaped, `github.com` matches `githubXcom`.
+// Every literal here goes through QuoteMeta for that reason rather than being
+// trusted to contain no metacharacters today.
 var DefaultSigningIdentity = fmt.Sprintf(
-	`^https://github\.com/%s/%s@refs/.+$`,
-	regexp.QuoteMeta(DefaultRepo), regexp.QuoteMeta(PublishWorkflow))
+	`^https://github\.com/%s/%s@%s$`,
+	regexp.QuoteMeta(DefaultRepo),
+	regexp.QuoteMeta(PublishWorkflow),
+	regexp.QuoteMeta(PublishRef))
 
 // Policy says what a source demands before its manifest may be trusted.
 type Policy struct {
