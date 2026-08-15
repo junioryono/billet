@@ -79,26 +79,35 @@ else
 	fail "no runner at /home/runner/runner/run.sh; every job would fail to start"
 fi
 
-# THE VERSION IS READ FROM THE IMAGE, not from the environment that built it.
-# .runner-version is what the runner tarball ships; if the manifest and the image
-# disagree, the manifest is describing something else.
-if [ -r "$RUNNER_DIR/.runner-version" ]; then
-	installed=$(tr -d '[:space:]' <"$RUNNER_DIR/.runner-version")
+# READ FROM WHAT THE BUILD RECORDED, not from the runner tarball. The tarball
+# ships no version file of its own -- this gate reported exactly that on its first
+# real run -- so the build writes /etc/billet-image at the moment it unpacks the
+# runner, which is the only point where what-was-downloaded and what-was-installed
+# are the same fact.
+if [ -r "$MNT/etc/billet-image" ]; then
+	installed=$(sed -n 's/^RUNNER_VERSION=\(.*\)$/\1/p' "$MNT/etc/billet-image" |
+		tr -d '[:space:]')
 
-	pass "runner version $installed"
+	if [ -z "$installed" ]; then
+		fail "/etc/billet-image records no runner version"
+	else
+		pass "runner version $installed"
+	fi
 
 	if [ -n "$MANIFEST" ] && [ -r "$MANIFEST" ]; then
 		claimed=$(jq -r '.runner_version' "$MANIFEST")
 
 		if [ "$installed" != "$claimed" ]; then
-			fail "the manifest claims runner $claimed and the image carries $installed"
+			fail "the manifest claims runner $claimed and the image carries $installed; the
+        thirty-day expiry is judged from the manifest, so the fleet would stop being
+        sent jobs on a date derived from the wrong number"
 		else
 			pass "the manifest agrees with the image"
 		fi
 	fi
 else
-	# Not fatal on its own: older runner tarballs did not ship this file.
-	echo "  note  no .runner-version in the image; cannot cross-check the manifest"
+	fail "no /etc/billet-image, so nothing records which runner this image carries and
+        the manifest's claim cannot be checked against the disk"
 fi
 
 # --- docker ----------------------------------------------------------------

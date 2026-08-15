@@ -207,6 +207,26 @@ EOF
 	tar -xzf "$WORK/$tarball" -C "$rootfs/home/runner/runner"
 	chroot "$rootfs" chown -R runner:runner /home/runner
 
+	# WHAT THIS IMAGE ACTUALLY CONTAINS, WRITTEN INTO THE IMAGE.
+	#
+	# The runner tarball ships no version file of its own -- measured: the release
+	# gate reported "no .runner-version in the image; cannot cross-check the
+	# manifest", which meant the manifest's runner version was taken entirely on
+	# trust. A manifest is free to claim any version; nothing was checking that the
+	# claim matched the binary.
+	#
+	# That gap matters because the version drives the thirty-day expiry check. An
+	# image whose manifest says 2.336.0 while the disk carries something older would
+	# be judged fresh and would stop being sent jobs on a date derived from the wrong
+	# number.
+	#
+	# Written here rather than derived later, because this is the only point where
+	# what-was-downloaded and what-was-installed are the same fact.
+	cat >"$rootfs/etc/billet-image" <<IMAGEINFO
+RUNNER_VERSION=$RUNNER_VERSION
+BUILT_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+IMAGEINFO
+
 	echo "=== 4/6 the agent that reads the registration ==="
 	install -m 0755 /dev/stdin "$rootfs/usr/local/bin/billet-agent" <<'AGENT'
 #!/bin/bash
