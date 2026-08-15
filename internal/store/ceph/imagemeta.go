@@ -83,3 +83,40 @@ func (c *Client) RunnerVersion(ctx context.Context, image string) (string, bool,
 
 	return version, true, nil
 }
+
+// SetRunnerVersion records which actions/runner a generation carries.
+//
+// THE COUNTERPART TO RunnerVersion, KEYED THE SAME WAY. A single head-level key
+// would describe the last thing published rather than what any job runs, and an
+// alarm reading it reports the newest image as though it were the fleet — staying
+// green right through the expiry it exists to catch.
+//
+// WRITTEN AFTER THE SNAPSHOT EXISTS, by every caller. The value describes a
+// generation, so recording it against one that was never published leaves a key
+// nothing will ever read and nothing will ever clean up.
+func (c *Client) SetRunnerVersion(ctx context.Context, image, generation, version string) error {
+	if err := checkCloneName(image); err != nil {
+		return err
+	}
+
+	if strings.TrimSpace(generation) == "" {
+		return fmt.Errorf("ceph: no generation to record %s against", RunnerVersionKey)
+	}
+
+	// REFUSED RATHER THAN RECORDED EMPTY. An empty value is indistinguishable from
+	// an absent key when it is read back, and the reader treats absent as "cannot
+	// tell" — so writing one produces a generation that silently opts out of every
+	// staleness check.
+	if strings.TrimSpace(version) == "" {
+		return fmt.Errorf("ceph: refusing to record an empty runner version for %s@%s, which "+
+			"reads back as though nothing was recorded", image, generation)
+	}
+
+	if _, err := c.rbdCmd(ctx, false, "-p", c.cfg.ImagePool, "image-meta", "set", image,
+		RunnerVersionKey+"."+generation, version); err != nil {
+		return fmt.Errorf("ceph: could not record the runner version for %s@%s: %w",
+			image, generation, err)
+	}
+
+	return nil
+}
