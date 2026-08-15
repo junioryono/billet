@@ -17,7 +17,7 @@ func TestPlanKernelReapRemovesOnlyWhatNothingNeeds(t *testing.T) {
 
 	needed := map[string]bool{"vmlinux-6.1.155-ea1d42638d13": true}
 
-	got, err := PlanKernelReap(onDisk, needed, 3, 0)
+	got, err := PlanKernelReap(onDisk, needed, 3, 0, "")
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
@@ -50,7 +50,7 @@ func TestPlanKernelReapDistinguishesKernelsSharingAVersion(t *testing.T) {
 
 	needed := map[string]bool{"vmlinux-6.1.155-ffffffffffff": true}
 
-	got, err := PlanKernelReap(onDisk, needed, 1, 0)
+	got, err := PlanKernelReap(onDisk, needed, 1, 0, "")
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
@@ -72,7 +72,7 @@ func TestPlanKernelReapIgnoresFilesItDoesNotRecognise(t *testing.T) {
 		"vmlinux-6.1.155",
 	}
 
-	got, err := PlanKernelReap(onDisk, map[string]bool{}, 0, 0)
+	got, err := PlanKernelReap(onDisk, map[string]bool{}, 0, 0, "")
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
@@ -94,7 +94,7 @@ func TestPlanKernelReapIgnoresFilesItDoesNotRecognise(t *testing.T) {
 func TestPlanKernelReapRefusesWhenNoGenerationNamesAKernel(t *testing.T) {
 	onDisk := []string{"vmlinux-6.1.155-ea1d42638d13"}
 
-	_, err := PlanKernelReap(onDisk, map[string]bool{}, 4, 4)
+	_, err := PlanKernelReap(onDisk, map[string]bool{}, 4, 4, "")
 	if err == nil {
 		t.Fatal("planned to remove every kernel while four generations exist and none " +
 			"names one; that is metadata this could not read, not a directory of orphans")
@@ -109,7 +109,7 @@ func TestPlanKernelReapRefusesWhenNoGenerationNamesAKernel(t *testing.T) {
 func TestPlanKernelReapReapsAllWhenThereAreNoGenerations(t *testing.T) {
 	onDisk := []string{"vmlinux-6.1.155-ea1d42638d13", "vmlinux-6.1.140-bbbbbbbbbbbb"}
 
-	got, err := PlanKernelReap(onDisk, map[string]bool{}, 0, 0)
+	got, err := PlanKernelReap(onDisk, map[string]bool{}, 0, 0, "")
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
@@ -138,7 +138,7 @@ func TestPlanKernelReapRefusesWhileAnyGenerationsKernelIsUnknown(t *testing.T) {
 	// Three generations name a kernel; one does not.
 	needed := map[string]bool{"vmlinux-6.1.155-ea1d42638d13": true}
 
-	_, err := PlanKernelReap(onDisk, needed, 4, 1)
+	_, err := PlanKernelReap(onDisk, needed, 4, 1, "")
 	if err == nil {
 		t.Fatal("planned a reap while one generation's kernel is unknown; that generation's " +
 			"kernel is on disk, unnamed, and indistinguishable from an orphan")
@@ -158,12 +158,62 @@ func TestPlanKernelReapProceedsWhenEveryGenerationNamesItsKernel(t *testing.T) {
 
 	needed := map[string]bool{"vmlinux-6.1.155-ea1d42638d13": true}
 
-	got, err := PlanKernelReap(onDisk, needed, 2, 0)
+	got, err := PlanKernelReap(onDisk, needed, 2, 0, "")
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
 
 	if len(got) != 1 || got[0] != "vmlinux-6.1.140-bbbbbbbbbbbb" {
 		t.Fatalf("planned %v, want only the orphan", got)
+	}
+}
+
+// THE KERNEL THE NODE IS CONFIGURED TO BOOT IS NEVER REAPED, even when no
+// generation's metadata names it.
+//
+// The two are not the same claim. Metadata says which kernel a generation was
+// PAIRED with; node.firecracker.kernel_image says which one the next launch will
+// actually use. A node whose configured kernel is not yet recorded against
+// anything -- freshly pulled, or verified but not yet paired -- would otherwise
+// have it deleted, and the failure lands on the next job to start rather than on
+// the reap that caused it.
+func TestPlanKernelReapNeverReapsTheConfiguredKernel(t *testing.T) {
+	onDisk := []string{
+		"vmlinux-6.1.155-ea1d42638d13",
+		"vmlinux-6.1.140-bbbbbbbbbbbb",
+	}
+
+	// Nothing is recorded against a generation, and there are no generations, so
+	// under the ordinary rule both are orphans.
+	got, err := PlanKernelReap(onDisk, map[string]bool{}, 0, 0,
+		"vmlinux-6.1.155-ea1d42638d13")
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+
+	for _, name := range got {
+		if name == "vmlinux-6.1.155-ea1d42638d13" {
+			t.Fatal("planned to remove the kernel this node is configured to boot; the next " +
+				"launch would fail, and nothing would connect that to the reap")
+		}
+	}
+
+	if len(got) != 1 || got[0] != "vmlinux-6.1.140-bbbbbbbbbbbb" {
+		t.Errorf("planned %v, want only the genuine orphan", got)
+	}
+}
+
+// A CONFIGURED KERNEL OUTSIDE THE MANAGED DIRECTORY is not this reaper's business
+// and must not suppress reaping of everything else.
+func TestPlanKernelReapIgnoresAConfiguredKernelItDoesNotManage(t *testing.T) {
+	onDisk := []string{"vmlinux-6.1.140-bbbbbbbbbbbb"}
+
+	got, err := PlanKernelReap(onDisk, map[string]bool{}, 0, 0, "")
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+
+	if len(got) != 1 {
+		t.Fatalf("planned %v; an unmanaged configured kernel should not protect others", got)
 	}
 }

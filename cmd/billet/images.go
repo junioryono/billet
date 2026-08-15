@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -801,33 +802,56 @@ func cmdImagesReap(ctx context.Context, args []string) error {
 	// leaves a kernel behind. Returning early when no generation needs reaping --
 	// which is the common case -- would mean the kernels were never collected at
 	// all, and the directory grows by 46MB a week regardless.
-	return reapKernels(ctx, store, image, *kernelDir, *dryRun)
+	return reapKernels(ctx, store, cfg, *kernelDir, *dryRun)
 }
 
 // reapKernels removes pulled kernels no surviving generation is paired with.
 //
+// EVERY IMAGE IN THE POOL IS CONSULTED, not just the one being reaped. The kernel
+// directory is shared and the pool is not one image, so gathering from a single
+// image would let `billet images reap ubuntu-2404-x64` delete a kernel that some
+// other image's generations are paired with -- and the failure lands on the next
+// job that boots the other image, with nothing connecting it to the reap.
+//
 // READ AFTER THE GENERATIONS ARE REAPED, deliberately. The needed set has to
-// describe what SURVIVES: computing it before would keep the kernel of a
-// generation that is about to be removed, and the orphan would then never be
-// collected because the next run would see it as already unreferenced by a
-// generation that no longer exists to name it.
+// describe what SURVIVES: computed first, it would keep the kernel of a generation
+// that is about to be removed.
 func reapKernels(
 	ctx context.Context,
 	store *ceph.Client,
-	image, kernelDir string,
+	cfg *config.Config,
+	kernelDir string,
 	dryRun bool,
 ) error {
-	surviving, err := store.Generations(ctx, image)
+	images, err := store.Images(ctx)
 	if err != nil {
 		return err
 	}
 
-	needed, unknown, err := store.NeededKernels(ctx, image, surviving)
-	if err != nil {
-		return err
+	needed := map[string]bool{}
+	total, unknown := 0, 0
+
+	for _, name := range images {
+		generations, err := store.Generations(ctx, name)
+		if err != nil {
+			return err
+		}
+
+		imageNeeded, imageUnknown, err := store.NeededKernels(ctx, name, generations)
+		if err != nil {
+			return err
+		}
+
+		for kernel := range imageNeeded {
+			needed[kernel] = true
+		}
+
+		total += len(generations)
+		unknown += imageUnknown
 	}
 
-	removed, err := reapKernelDir(kernelDir, needed, len(surviving), unknown, dryRun)
+	removed, err := reapKernelDir(kernelDir, needed, total, unknown,
+		configuredKernelName(cfg, kernelDir), dryRun)
 	if err != nil {
 		return err
 	}
@@ -848,6 +872,43 @@ func reapKernels(
 	}
 
 	return nil
+}
+
+// configuredKernelName is the managed kernel this node is set to boot, if it is
+// one this reaper is responsible for.
+//
+// EMPTY WHEN THE CONFIGURED KERNEL LIVES OUTSIDE THE MANAGED DIRECTORY, because
+// then it is outside this reaper's authority entirely -- and treating an unrelated
+// path as "protected" would silently protect a file of the same base name that IS
+// managed.
+func configuredKernelName(cfg *config.Config, kernelDir string) string {
+	if cfg.Node == nil || cfg.Node.Firecracker == nil {
+		return ""
+	}
+
+	configured := strings.TrimSpace(cfg.Node.Firecracker.KernelImage)
+	if configured == "" {
+		return ""
+	}
+
+	// RESOLVED ON BOTH SIDES, so a configured path written with a symlink, a
+	// trailing slash or a relative segment still matches the directory it is
+	// actually in.
+	resolvedDir, err := filepath.Abs(kernelDir)
+	if err != nil {
+		return ""
+	}
+
+	resolved, err := filepath.Abs(configured)
+	if err != nil {
+		return ""
+	}
+
+	if filepath.Dir(resolved) != resolvedDir {
+		return ""
+	}
+
+	return filepath.Base(resolved)
 }
 
 // cmdImagesList shows what the fleet's image state actually is.

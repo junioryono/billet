@@ -18,6 +18,7 @@ func reapKernelDir(
 	dir string,
 	needed map[string]bool,
 	generations, unknown int,
+	configured string,
 	dryRun bool,
 ) ([]string, error) {
 	entries, err := os.ReadDir(dir)
@@ -44,7 +45,7 @@ func reapKernelDir(
 		onDisk = append(onDisk, entry.Name())
 	}
 
-	reapable, err := ceph.PlanKernelReap(onDisk, needed, generations, unknown)
+	reapable, err := ceph.PlanKernelReap(onDisk, needed, generations, unknown, configured)
 	if err != nil {
 		return nil, err
 	}
@@ -70,9 +71,8 @@ func reapKernelDir(
 		}
 
 		// The guard above establishes that name is a plain base name, which is what
-		// makes this join safe; the taint analyser cannot follow that and reports a
-		// traversal it has already been prevented from having.
-		if err := os.Remove(filepath.Join(dir, name)); err != nil { //nolint:gosec // guarded directly above
+		// makes this join safe.
+		if err := os.Remove(filepath.Join(dir, name)); err != nil {
 			// REPORTS WHAT WENT BEFORE IT FAILS, so a partial reap is legible: the
 			// caller has already been told which files are gone.
 			return removed, fmt.Errorf("billet images reap: could not remove %s: %w", name, err)
