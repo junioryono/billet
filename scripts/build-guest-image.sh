@@ -462,8 +462,21 @@ ExecStart=/usr/local/bin/billet-agent
 # destroyed with it, so a restart would register a second runner against a
 # registration that has already been consumed.
 Restart=no
-StandardOutput=journal
-StandardError=journal
+# journal+console, NOT journal ALONE, AND THIS IS A DEBUGGABILITY DECISION.
+#
+# A microVM has no console anybody normally reads and no way in: if the agent
+# refuses its metadata, or cannot reach the service, the explanation lands in a
+# journal inside a guest that is about to be destroyed. What an operator sees is a
+# VM that started and ran nothing, with the reason already deleted.
+#
+# Sending it to the console costs nothing in production -- billet passes no
+# console= to the guest, so there is nowhere for it to go -- and it is the entire
+# difference between a boot test that can read the agent's verdict and one that
+# can only observe that systemd executed something. Type=exec reports Started for
+# a process that exits immediately, which the agent itself carries a paragraph
+# about, so "Started billet-agent.service" is not evidence of anything.
+StandardOutput=journal+console
+StandardError=journal+console
 
 [Install]
 WantedBy=multi-user.target

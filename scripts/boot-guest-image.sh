@@ -163,17 +163,24 @@ api PUT /mmds "$(jq -n --arg c "$REFUSED_CONTRACT" '{billet:{contract:$c}}')"
 echo "booting"
 api PUT /actions '{"action_type":"InstanceStart"}'
 
-# THE PASS CONDITION IS A SENTENCE ON THE CONSOLE, polled with a hard bound.
-# Firecracker exits 0 on some guest-side failures, so waiting on the process would
-# report success for a guest that never started.
-found=""
+# THREE THINGS ARE WATCHED FOR, NOT ONE, so a failure says which half of the boot
+# worked. The first version waited only for the agent's verdict, and when that did
+# not appear it reported that the guest "never came up" -- while the console showed
+# it reaching multi-user.target with docker running. The test was wrong and its
+# message sent the reader after the image.
+#
+# Firecracker exits 0 on some guest-side failures, so none of this waits on the
+# process.
+saw_multiuser=0
+saw_docker=0
+saw_agent=0
 
 for _ in $(seq 1 "$BOOT_TIMEOUT"); do
-	if grep -q "metadata contract $REFUSED_CONTRACT" "$CONSOLE" 2>/dev/null; then
-		found=agent
+	grep -q "Reached target.*[Mm]ulti-[Uu]ser" "$CONSOLE" 2>/dev/null && saw_multiuser=1
+	grep -q "Started.*docker.service" "$CONSOLE" 2>/dev/null && saw_docker=1
+	grep -q "metadata contract $REFUSED_CONTRACT" "$CONSOLE" 2>/dev/null && saw_agent=1
 
-		break
-	fi
+	[ "$saw_agent" -eq 1 ] && break
 
 	if ! kill -0 "$FCPID" 2>/dev/null; then
 		break
@@ -188,33 +195,38 @@ cat "$CONSOLE"
 echo "=== end console ==="
 echo
 
-if [ "$found" != "agent" ]; then
-	echo "the guest never reported refusing contract $REFUSED_CONTRACT within ${BOOT_TIMEOUT}s." >&2
-	echo "That sentence is what proves the kernel booted, systemd started, the network" >&2
-	echo "came up, MMDS was reachable and the agent ran. Its absence means one of those" >&2
-	echo "did not happen; the console above says which." >&2
+report() {
+	if [ "$1" -eq 1 ]; then
+		echo "  ok    $2"
+	else
+		echo "  FAIL  $2" >&2
+	fi
+}
+
+report "$saw_multiuser" "systemd reached multi-user.target"
+report "$saw_docker" "docker started"
+report "$saw_agent" "the agent fetched its metadata and refused contract $REFUSED_CONTRACT"
+
+echo
+
+if [ "$saw_multiuser" -ne 1 ] || [ "$saw_docker" -ne 1 ] || [ "$saw_agent" -ne 1 ]; then
+	echo "this image did not boot into a working guest." >&2
+	echo >&2
+
+	if [ "$saw_multiuser" -eq 1 ] && [ "$saw_agent" -ne 1 ]; then
+		echo "systemd came up but the agent never reported its verdict. Either it could not" >&2
+		echo "reach the metadata service, or its output is not reaching the console --" >&2
+		echo "billet-agent.service must set StandardOutput=journal+console, or its messages" >&2
+		echo "go to a journal inside a guest that is about to be destroyed." >&2
+	fi
 
 	exit 1
 fi
 
-echo "the agent fetched its metadata and refused contract $REFUSED_CONTRACT, which proves:"
+echo "the agent's refusal proves the whole chain:"
 echo "  - the kernel booted this filesystem"
-echo "  - systemd reached the point of starting the agent"
+echo "  - systemd reached its target and docker started"
 echo "  - the network came up and the route to the metadata service works"
 echo "  - MMDS answered and the agent parsed what it got"
-echo
-
-# DOCKER IS CHECKED SEPARATELY AND IS NOT FATAL HERE. The agent refuses early, so
-# it may exit before docker has finished starting -- absence at this instant is not
-# evidence of a broken docker, and failing on it would make this test flaky for a
-# reason that has nothing to do with the image.
-if grep -qi "docker" "$CONSOLE" 2>/dev/null; then
-	echo "note: docker appears in the console"
-else
-	echo "note: docker did not appear in the console before the agent refused; this test"
-	echo "      does not wait for it, and check-guest-image.sh asserts it is installed"
-	echo "      and enabled"
-fi
-
 echo
 echo "BOOT VERIFIED"
