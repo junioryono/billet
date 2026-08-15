@@ -290,7 +290,25 @@ jobs:
         # weekly build would have run for an hour and published nothing, silently,
         # which is the one failure this workflow exists to prevent.
         if: github.event_name != 'workflow_dispatch' || inputs.publish
-        run: cosign sign-blob --yes --bundle out/manifest.json.bundle out/manifest.json
+        run: |
+          set -euo pipefail
+
+          # --new-bundle-format IS NOT OPTIONAL FOR US.
+          #
+          # Without it cosign v2 writes its legacy shape -- base64Signature, cert,
+          # rekorBundle -- and sigstore-go, which is what verifies this on a node,
+          # rejects that outright: it parses only the protobuf Sigstore bundle. The
+          # first release published the legacy form, so nothing could have verified
+          # it even though the signature was real.
+          #
+          # The new format also carries the inclusion proof that makes OFFLINE
+          # verification possible. The legacy rekorBundle carries only a signed
+          # entry timestamp, which is why air-gapped verification needed a network
+          # call that an air-gapped node cannot make.
+          cosign sign-blob --yes \
+            --new-bundle-format \
+            --bundle out/manifest.sigstore.json \
+            out/manifest.json
 
       # TWO RELEASES, DELIBERATELY. The dated one is history and the thing to pin
       # to when a rollback is needed; the rolling tag is what an unattended puller
@@ -311,7 +329,7 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --title "Guest image ${{ steps.pack.outputs.tag }}" \
             --notes-file out/release-notes.md \
-            out/manifest.json out/manifest.json.bundle out/rootfs.img.zst out/vmlinux-billet
+            out/manifest.json out/manifest.sigstore.json out/rootfs.img.zst out/vmlinux-billet
         env:
           GH_TOKEN: ${{ github.token }}
 
@@ -338,7 +356,7 @@ jobs:
 
           gh release upload guest-latest \
             --repo "$GITHUB_REPOSITORY" --clobber \
-            out/manifest.json out/manifest.json.bundle out/rootfs.img.zst out/vmlinux-billet
+            out/manifest.json out/manifest.sigstore.json out/rootfs.img.zst out/vmlinux-billet
         env:
           GH_TOKEN: ${{ github.token }}
 

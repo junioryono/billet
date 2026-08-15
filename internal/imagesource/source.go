@@ -47,6 +47,20 @@ const DefaultBaseURL = "https://github.com/" + DefaultRepo + "/releases/download
 // ManifestName is the index document within a release.
 const ManifestName = "manifest.json"
 
+// BundleName is the signature over the manifest.
+//
+// A SIGSTORE BUNDLE, NOT COSIGN'S LEGACY SHAPE. The two are different documents:
+// the legacy one carries base64Signature, cert and rekorBundle, and the library
+// that verifies this on a node parses only the protobuf bundle -- it rejects the
+// other outright. The first release published the legacy form, so nothing could
+// have verified it even though the signature was real. The extension is part of
+// how they are told apart.
+//
+// The new format also carries the transparency-log inclusion proof, which is what
+// makes verification possible without reaching Rekor -- and a node that may be air
+// gapped cannot reach Rekor.
+const BundleName = "manifest.sigstore.json"
+
 // Source names where images are fetched from.
 type Source struct {
 	// BaseURL is the directory the manifest and its assets sit in, without a

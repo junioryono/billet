@@ -97,7 +97,17 @@ func (c *Client) ImportGeneration( //nolint:nonamedreturns // the deferred unmap
 	}
 
 	defer func() {
-		if releaseErr := lock.Release(ctx); releaseErr != nil && err == nil {
+		// ON A CONTEXT STRIPPED OF CANCELLATION, for the same reason the unmap is --
+		// and it matters more here. The raw write is deliberately unbounded and moves
+		// gigabytes, so a caller's deadline can expire during it; releasing on that
+		// dead context fails immediately and LEAVES THE LOCK HELD. Nothing reclaims
+		// an rbd lock, so every publisher on every node then refuses for six hours,
+		// which is precisely the outage StaleLockAfter exists to bound rather than to
+		// be relied upon.
+		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.wait)
+		defer cancel()
+
+		if releaseErr := lock.Release(releaseCtx); releaseErr != nil && err == nil {
 			err = releaseErr
 		}
 	}()

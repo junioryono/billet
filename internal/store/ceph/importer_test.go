@@ -33,10 +33,35 @@ type importFake struct {
 	lockAddErr  error
 	unmapErr    error
 	poolMissing bool
+
+	// cancelOn fires the stored cancel when that subcommand is issued, which is how
+	// a test reproduces the case that matters: a deadline expiring PARTWAY through
+	// the import, after the lock has been taken. A context cancelled before the
+	// import begins proves nothing -- the lock is never taken, so a leak and a
+	// clean run look identical.
+	cancelOn string
+	cancel   context.CancelFunc
+
+	// heartbeat, if non-nil, is what `image-meta get` answers for a liveness key,
+	// and it is called once per read so a test can make the counter move.
+	heartbeat func() (string, bool)
 }
 
-func (f *importFake) run(_ context.Context, _ string, args []string) ([]byte, error) {
+func (f *importFake) run(ctx context.Context, _ string, args []string) ([]byte, error) {
 	f.calls = append(f.calls, args)
+
+	// THE CONTEXT IS HONOURED, because a real exec.CommandContext is. A fake that
+	// ignores it makes every cancellation test vacuous: the first version of the
+	// leaked-lock test passed a cancelled context, watched the whole import
+	// succeed, and proved nothing about the code under test.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	if f.cancelOn != "" && f.cancelOn == subcommandOf(args) && f.cancel != nil {
+		f.cancel()
+		f.cancel = nil
+	}
 
 	sub := subcommandOf(args)
 
@@ -78,7 +103,22 @@ func (f *importFake) run(_ context.Context, _ string, args []string) ([]byte, er
 		}
 
 		return []byte("[]"), nil
-	case "create", "resize", "snap", "image-meta":
+	case "image-meta":
+		// A LIVENESS READ IS ANSWERED SEPARATELY from a write, because the break path
+		// distinguishes "no counter" from "a counter that did not move" and a fake
+		// that answered both with success would collapse the two.
+		if f.heartbeat != nil && len(args) > 2 && args[len(args)-2] != "" &&
+			strings.Contains(args[len(args)-1], "billet.heartbeat.") {
+			value, present := f.heartbeat()
+			if !present {
+				return nil, errors.New("rbd: (2) No such file or directory")
+			}
+
+			return []byte(value + "\n"), nil
+		}
+
+		return []byte(""), nil
+	case "create", "resize", "snap":
 		return []byte(""), nil
 	default:
 		return []byte(""), nil
@@ -213,8 +253,12 @@ func stageRaw(t *testing.T, content string) (raw, device string) {
 func importClient(t *testing.T, f *importFake) *Client {
 	t.Helper()
 
+	// THE LIVENESS WINDOW IS SHORTENED, NOT SKIPPED. Ninety seconds is right in
+	// production and unusable here, but a decision that is only ever exercised with
+	// the window stubbed to zero is one nobody has tested -- so this still waits,
+	// briefly, and the fake still has to answer the two observations.
 	c, err := New(valid(), WithBinary("/usr/bin/rbd"), WithCephBinary("/usr/bin/ceph"),
-		withRunner(f.run))
+		withRunner(f.run), withObservation(10*time.Millisecond))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -770,5 +814,117 @@ func TestSetRunnerVersionRefusesAGenerationBilletDidNotPublish(t *testing.T) {
 	if err := importClient(t, f).SetRunnerVersion(
 		t.Context(), "ubuntu-2404-x64", "g20260815041709", "2.336.0"); err != nil {
 		t.Errorf("a real generation was refused: %v", err)
+	}
+}
+
+// A CANCELLED CONTEXT MUST NOT LEAK THE PUBLISH LOCK.
+//
+// The raw write is deliberately unbounded and moves gigabytes, so a caller's
+// deadline can expire during it. Releasing on that dead context fails immediately
+// and leaves the lock held -- and nothing reclaims an rbd lock, so every publisher
+// on every node then refuses for StaleLockAfter. That is the outage the bound
+// exists to CAP, not a state to arrive at routinely.
+//
+// The fake records the context each call ran with, so this asserts the release
+// actually ran rather than that some error came back -- an implementation that
+// skipped the release entirely would also "not error".
+func TestImportGenerationReleasesTheLockEvenWhenTheContextIsDone(t *testing.T) {
+	raw, device := stageRaw(t, "content")
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	// CANCELLED AFTER THE LOCK IS TAKEN AND THE HEAD IS MAPPED, which is where a
+	// real deadline expires: during the multi-gigabyte write that follows.
+	f := &importFake{device: device, cancelOn: "device map", cancel: cancel}
+
+	_, err := importClient(t, f).ImportGeneration(
+		ctx, "ubuntu-2404-x64", raw, "2.336.0", importAt)
+	if err == nil {
+		t.Fatal("an import whose context expired partway through reported success")
+	}
+
+	if f.lockTaken == "" && !f.ranWith("lock", "add") {
+		t.Fatal("the lock was never taken, so this test proves nothing about releasing it")
+	}
+
+	if f.lockTaken != "" {
+		t.Errorf("the publish lock is still held as %q after an import on a cancelled "+
+			"context; nothing reclaims an rbd lock, so every publisher on every node "+
+			"would refuse for %s", f.lockTaken, StaleLockAfter)
+	}
+}
+
+// THE WHOLE POINT OF THE HEARTBEAT: a holder that is still counting keeps its lock
+// no matter how old the lock looks.
+//
+// Age alone cannot tell an abandoned lock from a publish that is genuinely taking
+// a long time, or from an observer whose clock is ahead. The raw write is
+// unbounded and imports up to a terabyte, so an old-but-live holder is not
+// hypothetical -- and breaking its lock puts two writers on one image.
+func TestImportGenerationWillNotBreakALockWhoseHolderIsStillAlive(t *testing.T) {
+	raw, device := stageRaw(t, "content")
+
+	var reads int
+
+	f := &importFake{
+		device: device,
+		// Held far longer than the bound -- under the old rule this was breakable on
+		// sight.
+		lockHeld: fmt.Sprintf("billet-build-slowhost-9-%d",
+			importAt.Add(-100*StaleLockAfter).Unix()),
+		heartbeat: func() (string, bool) {
+			reads++
+
+			// The counter moves between the two observations, which is what a live
+			// holder looks like.
+			return fmt.Sprintf("%d", reads), true
+		},
+	}
+
+	_, err := importClient(t, f).ImportGeneration(
+		t.Context(), "ubuntu-2404-x64", raw, "2.336.0", importAt)
+	if err == nil {
+		t.Fatal("an import broke the lock of a holder that was still heartbeating; that " +
+			"puts two writers on one head image")
+	}
+
+	if !strings.Contains(err.Error(), "moved") {
+		t.Errorf("the refusal does not name the evidence of life: %v", err)
+	}
+
+	if reads < 2 {
+		t.Errorf("the heartbeat was read %d times; the decision needs two observations "+
+			"separated by a window, and one reading cannot show movement", reads)
+	}
+
+	if f.ranWith("lock", "rm") {
+		t.Error("billet broke a live holder's lock")
+	}
+
+	if f.ranWith("device", "map") {
+		t.Error("billet mapped the head despite standing down")
+	}
+}
+
+// AND A HOLDER THAT HAS STOPPED COUNTING, past the bound, is still reclaimable --
+// otherwise a leaked lock is permanent and every publisher refuses forever.
+func TestImportGenerationStillBreaksASilentLockPastTheBound(t *testing.T) {
+	raw, device := stageRaw(t, "content")
+
+	f := &importFake{
+		device: device,
+		lockHeld: fmt.Sprintf("billet-build-deadhost-9-%d",
+			importAt.Add(-StaleLockAfter-time.Hour).Unix()),
+		heartbeat: func() (string, bool) { return "42", true }, // frozen: not counting
+	}
+
+	if _, err := importClient(t, f).ImportGeneration(
+		t.Context(), "ubuntu-2404-x64", raw, "2.336.0", importAt); err != nil {
+		t.Fatalf("a silent lock past the bound was not reclaimed: %v", err)
+	}
+
+	if !f.ranWith("lock", "rm", "billet-build-deadhost-9") {
+		t.Errorf("the silent lock was not broken; billet ran %v", f.calls)
 	}
 }

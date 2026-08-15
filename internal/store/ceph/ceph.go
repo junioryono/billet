@@ -47,6 +47,10 @@ type Client struct {
 	ceph string
 	run  runner
 	wait time.Duration
+
+	// observation shortens the publish-lock liveness window. Zero means the real
+	// one; only a test sets it, for the reason withRunner exists.
+	observation time.Duration
 }
 
 // runner executes one rbd invocation. A seam, so a test can assert the ARGUMENTS
@@ -55,6 +59,12 @@ type runner func(ctx context.Context, bin string, args []string) ([]byte, error)
 
 // Option configures a Client.
 type Option func(*Client)
+
+// withObservation shortens how long TakePublishLock watches a held lock for signs
+// of life. Unexported for the same reason withRunner is.
+func withObservation(d time.Duration) Option {
+	return func(c *Client) { c.observation = d }
+}
 
 // withRunner replaces process execution. Unexported because its parameter is:
 // an exported option nothing outside this package can construct is a worse API
