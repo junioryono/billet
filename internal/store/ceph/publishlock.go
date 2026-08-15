@@ -83,11 +83,113 @@ func publishCookie(now time.Time) string {
 		host, os.Getpid(), hex.EncodeToString(nonce[:]), now.UTC().Unix())
 }
 
+// HeartbeatInterval is how often a holder proves it is still alive.
+//
+// The counter is written to the lock image's metadata rather than into the lock
+// itself, because an rbd lock's id IS the cookie and cannot be updated: refreshing
+// it would mean removing and re-adding, which opens exactly the window this is
+// meant to close.
+const HeartbeatInterval = 30 * time.Second
+
+// HeartbeatObservation is how long a would-be breaker watches before concluding
+// silence.
+//
+// SEVERAL INTERVALS, because one is a race: a holder that beat just before the
+// first observation and is due to beat just after the second would look silent.
+// This only runs on the break path, which by definition is already looking at a
+// lock older than StaleLockAfter, so ninety seconds more costs nothing and buys
+// certainty.
+const HeartbeatObservation = 3 * HeartbeatInterval
+
+// heartbeatObservation is how long this client watches before concluding silence.
+//
+// A METHOD SO A TEST CAN SHORTEN IT. Ninety seconds is right in production and
+// unusable in a test suite, and a decision that is only ever exercised with the
+// window stubbed out is one nobody has tested.
+func (c *Client) heartbeatObservation() time.Duration {
+	if c.observation > 0 {
+		return c.observation
+	}
+
+	return HeartbeatObservation
+}
+
 // PublishLock is a held cluster-wide publish lock.
 type PublishLock struct {
 	client *Client
 	cookie string
 	image  string
+
+	stop    context.CancelFunc
+	stopped chan struct{}
+}
+
+// heartbeatKey is where a holder's liveness counter lives.
+func heartbeatKey(cookie string) string { return "billet.heartbeat." + cookie }
+
+// beat starts the goroutine that proves this holder is alive.
+//
+// ON A CONTEXT STRIPPED OF THE CALLER'S CANCELLATION, because the heartbeat has to
+// outlive a deadline that expires mid-import: that is precisely the case where the
+// holder is still writing and must not be declared dead. It stops when the lock is
+// released, which is the only thing that should stop it.
+func (l *PublishLock) beat(ctx context.Context) {
+	beatCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+
+	l.stop = cancel
+	l.stopped = make(chan struct{})
+
+	go func() {
+		defer close(l.stopped)
+
+		ticker := time.NewTicker(HeartbeatInterval)
+		defer ticker.Stop()
+
+		var counter uint64
+
+		for {
+			select {
+			case <-beatCtx.Done():
+				return
+			case <-ticker.C:
+				counter++
+
+				// BEST EFFORT, AND SILENT. A failed beat is not a reason to abort an
+				// import that is otherwise working; its only consequence is that a
+				// breaker may fall back to the age bound, which is the behaviour that
+				// existed before heartbeats at all.
+				writeCtx, done := context.WithTimeout(beatCtx, l.client.wait)
+
+				if _, beatErr := l.client.rbdCmd(writeCtx, false, "image-meta", "set", l.image,
+					heartbeatKey(l.cookie), strconv.FormatUint(counter, 10)); beatErr != nil {
+					// SILENT AND BEST EFFORT. A failed beat is not a reason to abort an
+					// import that is otherwise working; its only consequence is that a
+					// breaker falls back to the age bound, which is the behaviour that
+					// existed before heartbeats at all.
+					_ = beatErr
+				}
+
+				done()
+			}
+		}
+	}()
+}
+
+// observeHeartbeat reads a holder's liveness counter.
+func (c *Client) observeHeartbeat(ctx context.Context, image, cookie string) heartbeat {
+	out, err := c.rbdCmd(ctx, false, "image-meta", "get", image, heartbeatKey(cookie))
+	if err != nil {
+		// ABSENT IS A VALID OBSERVATION, not an error: the build script writes no
+		// counter at all, and its locks must still be judged.
+		return heartbeat{}
+	}
+
+	value, err := strconv.ParseUint(strings.TrimSpace(string(out)), 10, 64)
+	if err != nil {
+		return heartbeat{}
+	}
+
+	return heartbeat{counter: value, present: true}
 }
 
 // TakePublishLock claims the right to write the golden image.
@@ -115,7 +217,10 @@ func (c *Client) TakePublishLock(ctx context.Context, now time.Time) (*PublishLo
 	}
 
 	if _, err := c.rbdCmd(ctx, false, "lock", "add", image, cookie); err == nil {
-		return &PublishLock{client: c, cookie: cookie, image: image}, nil
+		lock := &PublishLock{client: c, cookie: cookie, image: image}
+		lock.beat(ctx)
+
+		return lock, nil
 	}
 
 	// SOMEBODY HOLDS IT. Whether that is a live build or a corpse is the only
@@ -133,19 +238,44 @@ func (c *Client) TakePublishLock(ctx context.Context, now time.Time) (*PublishLo
 			"another publisher is contending for it right now", image)
 	}
 
-	if age < StaleLockAfter {
-		return nil, fmt.Errorf("ceph: %s is held by %s and has been for %s; another publisher is "+
-			"writing the golden image, so this one is standing down rather than writing into "+
-			"the same image", image, holder.ID, age.Round(time.Second))
+	// LIVENESS IS OBSERVED, NOT INFERRED FROM THE CLOCK.
+	//
+	// Age alone cannot tell an abandoned lock from a publish that is genuinely
+	// taking a long time, or from an observer whose clock is ahead. The raw write
+	// is deliberately unbounded and imports up to a terabyte, so a publish running
+	// past the bound is not hypothetical -- and breaking a live holder's lock puts
+	// two writers on one image, which is the one thing this exists to prevent.
+	//
+	// So the holder's counter is read twice, separated by a window. A counter that
+	// MOVED is proof of life that needs no agreement about the time between the two
+	// machines.
+	before := c.observeHeartbeat(ctx, image, holder.ID)
+
+	// A TIMER THAT IS STOPPED, not time.After, which holds its timer until it fires
+	// however the select ends. Ninety seconds of leaked timer per contended publish
+	// is small, and it is also exactly the kind of thing that is invisible until
+	// something calls this in a loop.
+	timer := time.NewTimer(c.heartbeatObservation())
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return nil, fmt.Errorf("ceph: gave up waiting to see whether %s is still alive: %w",
+			holder.ID, ctx.Err())
+	case <-timer.C:
 	}
 
-	// BROKEN ONLY PAST THE BOUND. Breaking a lock whose holder is alive puts two
-	// writers on one image, which is the corruption this exists to prevent — so
-	// the bound is deliberately far past any real run rather than tuned close to
-	// one.
+	after := c.observeHeartbeat(ctx, image, holder.ID)
+
+	mayBreak, why := breakable(before, after, age)
+	if !mayBreak {
+		return nil, fmt.Errorf("ceph: %s is held by %s and %s; this publisher is standing down "+
+			"rather than writing into the same image", image, holder.ID, why)
+	}
+
 	if _, err := c.rbdCmd(ctx, false, "lock", "rm", image, holder.ID, holder.Locker); err != nil {
-		return nil, fmt.Errorf("ceph: %s has been held by %s for %s, longer than any publish can "+
-			"run, and it could not be broken: %w", image, holder.ID, age.Round(time.Second), err)
+		return nil, fmt.Errorf("ceph: %s has been held by %s for %s and showed no sign of life, "+
+			"and it could not be broken: %w", image, holder.ID, age.Round(time.Second), err)
 	}
 
 	if _, err := c.rbdCmd(ctx, false, "lock", "add", image, cookie); err != nil {
@@ -153,7 +283,18 @@ func (c *Client) TakePublishLock(ctx context.Context, now time.Time) (*PublishLo
 			"another publisher took it first: %w", image, age.Round(time.Second), err)
 	}
 
-	return &PublishLock{client: c, cookie: cookie, image: image}, nil
+	// THE BROKEN HOLDER'S COUNTER IS REMOVED, so a future breaker does not read a
+	// dead publisher's number and mistake it for this one's. Best effort: failing
+	// to tidy it costs one fallback to the age bound, not correctness.
+	if _, rmErr := c.rbdCmd(ctx, false, "image-meta", "remove", image,
+		heartbeatKey(holder.ID)); rmErr != nil {
+		_ = rmErr
+	}
+
+	lock := &PublishLock{client: c, cookie: cookie, image: image}
+	lock.beat(ctx)
+
+	return lock, nil
 }
 
 // lockEntry is the half of `rbd lock ls --format json` this needs.
@@ -223,6 +364,22 @@ func (c *Client) heldLock(
 func (l *PublishLock) Release(ctx context.Context) error {
 	if l == nil {
 		return nil
+	}
+
+	// THE HEARTBEAT STOPS FIRST AND IS WAITED FOR. Releasing while a beat is in
+	// flight would leave the counter behind after the key was removed, and the next
+	// holder's breaker would then read a number belonging to nobody.
+	if l.stop != nil {
+		l.stop()
+		<-l.stopped
+		l.stop = nil
+	}
+
+	// Best effort, for the reason above: a counter left behind makes the next
+	// breaker fall back to age, which is what it did before heartbeats existed.
+	if _, rmErr := l.client.rbdCmd(ctx, false, "image-meta", "remove", l.image,
+		heartbeatKey(l.cookie)); rmErr != nil {
+		_ = rmErr
 	}
 
 	// THE LOCKER IS READ BACK RATHER THAN REMEMBERED. `rbd lock rm` takes both the
