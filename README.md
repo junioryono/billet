@@ -227,6 +227,43 @@ generation. It stages to disk and verifies **before** importing — streaming st
 the cluster would put unverified bytes into shared storage, where undoing it is a cluster
 operation rather than deleting a file.
 
+### Who published this, and why the signature is the load-bearing check
+
+Every asset is verified against a digest **the manifest names**. That is worth nothing on
+its own: a manifest somebody else serves names digests of bytes they chose, and every one
+of those checks passes. The signature is the only thing binding the manifest to the
+workflow that produced it, so without it the rest is a checksum against itself.
+
+So a pull verifies the signature over the bytes that arrived, before parsing anything out
+of them, against a pinned identity:
+
+```
+https://github.com/junioryono/billet/.github/workflows/guest-image.yml@refs/heads/main
+```
+
+Pinned to the **workflow and the ref**, not the repository. A certificate's identity is
+whatever workflow requested it on whatever ref it ran on, so pinning the repository alone
+would accept a signature from any workflow in it — including one added by a pull request,
+which is a far lower bar to clear than compromising the release process.
+
+Sigstore's trust root is embedded in the binary rather than fetched. A node that may be
+air-gapped cannot reach sigstore's CDN, and the verification library refreshes its TUF
+cache whenever it expires — so relying on TUF at verification time means depending on the
+one thing an air-gapped node does not have.
+
+**A source that is not billet's own must say what would make it trustworthy.** Pointing at
+your own mirror and configuring nothing is refused rather than silently unverified:
+
+```yaml
+images:
+  source: https://mirror.internal/billet
+  signing_identity: ^https://github\.com/acme/images/.*$
+  signing_issuer: https://token.actions.githubusercontent.com
+```
+
+or `--skip-signature-verification`, which is deliberate rather than what happens by
+default.
+
 **This used to be a per-node timer that rebuilt the image on every machine.** That is
 gone. It required root, debootstrap and an hour on every node, it had every operator
 independently discover GitHub's thirty-day rule, and it made N machines do N builds of a
