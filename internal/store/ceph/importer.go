@@ -48,7 +48,7 @@ const MaxImageBytes = 1 << 40
 // could descend from.
 func (c *Client) ImportGeneration( //nolint:nonamedreturns // the deferred unmap reports through the return value; a local set inside a defer is read after the return value has already been computed, which is the dead-code bug this shape replaced
 	ctx context.Context,
-	image, rawPath, runnerVersion string,
+	image, rawPath, runnerVersion, kernel string,
 	now time.Time,
 ) (generation string, err error) {
 	if err := checkCloneName(image); err != nil {
@@ -199,6 +199,27 @@ func (c *Client) ImportGeneration( //nolint:nonamedreturns // the deferred unmap
 	// any job runs: generations are immutable and promotion is deliberate, so a
 	// fleet can sit on last month's generation while the head advances. An alarm
 	// reading the head then reports the newest import as though it were the fleet.
+	// THE KERNEL IS RECORDED INSIDE THE LOCK THIS ALREADY HOLDS.
+	//
+	// It used to be written by the caller after this returned, which put it outside
+	// the lock -- so a reap could remove the generation between the publish and the
+	// pairing, leaving a kernel recorded against nothing, or the generation
+	// published with no pairing at all. Everything that describes a generation is
+	// written while the thing that removes generations is excluded.
+	if kernel != "" {
+		if setErr := c.SetKernel(ctx, image, generation, kernel); setErr != nil {
+			if _, rmErr := c.rbdCmd(ctx, false, "-p", c.cfg.ImagePool, "snap", "rm",
+				image+"@"+generation); rmErr != nil {
+				return "", fmt.Errorf("ceph: %s@%s was published, its kernel could not be "+
+					"recorded (%w), and it could not be withdrawn (%w)",
+					image, generation, setErr, rmErr)
+			}
+
+			return "", fmt.Errorf("ceph: %s could not be published because its kernel could "+
+				"not be recorded; the snapshot has been withdrawn: %w", image, setErr)
+		}
+	}
+
 	if setErr := c.SetRunnerVersion(ctx, image, generation, runnerVersion); setErr != nil {
 		// ROLLED BACK RATHER THAN LEFT HALF-PUBLISHED. A snapshot with no recorded
 		// runner version is worse than no snapshot at all: NewestGeneration finds

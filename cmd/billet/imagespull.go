@@ -154,28 +154,21 @@ func cmdImagesPull(ctx context.Context, args []string) error {
 		return err
 	}
 
-	fmt.Printf("importing %s into %s/%s\n", filepath.Base(raw), cfg.Node.Ceph.ImagePool, image)
-
-	generation, err := store.ImportGeneration(ctx, image, raw, manifest.RunnerVersion, time.Now())
-	if err != nil {
-		return err
-	}
-
-	// INSTALLED BEFORE THE STAGING DIRECTORY IS REMOVED, which is the whole point:
-	// the deferred cleanup runs on the way out of this function.
+	// INSTALLED BEFORE THE IMPORT, so its name can be recorded inside the lock the
+	// import holds. Done afterwards, as it was, the pairing is written while a reap
+	// is free to run -- and a generation published without one is taken up by every
+	// node and booted against whatever each is configured with.
 	kernel, err := installKernel(manifest, dir, *kernelDir)
 	if err != nil {
-		return fmt.Errorf("%s@%s was published, but its kernel could not be kept: %w",
-			image, generation, err)
+		return fmt.Errorf("billet images pull: the kernel could not be kept: %w", err)
 	}
 
-	// RECORDED AGAINST THE GENERATION, like the runner version, because which
-	// kernel a generation needs is a property of that generation rather than of the
-	// image. Two generations can want different kernels, and an operator pointing
-	// one config at both has no other way to know.
-	if err := store.SetKernel(ctx, image, generation, kernelFileName(manifest)); err != nil {
-		return fmt.Errorf("%s@%s was published, but the kernel it needs could not be "+
-			"recorded: %w", image, generation, err)
+	fmt.Printf("importing %s into %s/%s\n", filepath.Base(raw), cfg.Node.Ceph.ImagePool, image)
+
+	generation, err := store.ImportGeneration(ctx, image, raw, manifest.RunnerVersion,
+		kernelFileName(manifest), time.Now())
+	if err != nil {
+		return err
 	}
 
 	fmt.Printf("\npublished %s@%s (runner %s, kernel %s)\n",
