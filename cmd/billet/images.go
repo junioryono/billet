@@ -160,6 +160,8 @@ func cmdImagesVerify(ctx context.Context, args []string) error {
 	wait := fs.Duration("wait", 3*time.Minute, "how long to give the guest to report back")
 	record := fs.Bool("record", true,
 		"on success, mark this generation verified so `@verified` resolves to it")
+	kernelDir := fs.String("kernel-dir", DefaultKernelDir,
+		"where managed kernels live; a kernel here is recorded as this generation's")
 
 	rest, err := parseWithName(fs, args)
 	if err != nil {
@@ -271,6 +273,40 @@ func cmdImagesVerify(ctx context.Context, args []string) error {
 		store, err := ceph.New(*cfg.Node.Ceph)
 		if err != nil {
 			return err
+		}
+
+		// THE KERNEL IS RECORDED BEFORE THE VERIFICATION, AND THAT ORDER IS THE POINT.
+		//
+		// This boot is the only evidence anywhere that a particular kernel runs a
+		// particular filesystem -- it just did. Marking the generation verified
+		// without recording which kernel proved it publishes a claim the fleet acts
+		// on while discarding the fact that makes the claim true, and the next launch
+		// falls back to whatever this node happens to be configured with.
+		//
+		// So a failure here stops the generation becoming @verified. A generation that
+		// is verified but unpaired is worse than one that is neither: every node takes
+		// it up, and each boots it against its own kernel.
+		name := configuredKernelName(cfg, *kernelDir)
+
+		if name != "" {
+			// `rest` is `<image>@<generation>`, which the check above proved.
+			imageName, generation, _ := strings.Cut(rest, "@")
+
+			if err := store.SetKernel(ctx, imageName, generation, name); err != nil {
+				return fmt.Errorf("%s booted and ran a container, but the kernel that proved "+
+					"it could not be recorded, so it has NOT been marked verified: %w", rest, err)
+			}
+
+			fmt.Printf("\nrecorded %s as the kernel this generation was proved against\n", name)
+		} else {
+			// SAID OUT LOUD RATHER THAN RECORDED WRONG. Recording a basename for a
+			// kernel outside the managed directory would have every launch look for it
+			// in a directory it is not in, turning a working configuration into a hard
+			// failure on the next job.
+			fmt.Printf("\nnote: %s is not in %s, so this generation stays unpaired and every\n",
+				cfg.Node.Firecracker.KernelImage, *kernelDir)
+			fmt.Println("      node will boot it with whatever kernel it is configured with.")
+			fmt.Println("      `billet images pull` installs a kernel there and records the pairing.")
 		}
 
 		if err := store.MarkVerified(ctx, rest, time.Now()); err != nil {
@@ -875,7 +911,12 @@ func reapKernels(
 }
 
 // configuredKernelName is the managed kernel this node is set to boot, if it is
-// one this reaper is responsible for.
+// one billet is responsible for.
+//
+// SHARED BY THE REAPER AND BY VERIFICATION, because the two must agree about what
+// "managed" means. The reaper protects this file from deletion; verification
+// records it as a generation's pairing. If they disagreed, one would record a name
+// the other would happily delete.
 //
 // EMPTY WHEN THE CONFIGURED KERNEL LIVES OUTSIDE THE MANAGED DIRECTORY, because
 // then it is outside this reaper's authority entirely -- and treating an unrelated

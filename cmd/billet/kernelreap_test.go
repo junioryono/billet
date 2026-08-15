@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/junioryono/billet/internal/config"
 )
 
 func kernelDirWith(t *testing.T, names ...string) string {
@@ -146,5 +148,63 @@ func TestReapKernelDirReportsWhatItRemoved(t *testing.T) {
 		if !strings.Contains(joined, want) {
 			t.Errorf("the report does not name %q", want)
 		}
+	}
+}
+
+// ONE ANSWER, SHARED BY THE REAPER AND BY VERIFICATION, because they must agree
+// about what "managed" means. The reaper protects this file from deletion;
+// verification records it as a generation's pairing. If they disagreed, one would
+// record a name the other would happily delete.
+func TestConfiguredKernelNameIdentifiesOnlyManagedKernels(t *testing.T) {
+	managed := "/var/lib/billet/kernels"
+
+	withKernel := func(path string) *config.Config {
+		return &config.Config{Node: &config.NodeConfig{
+			Firecracker: &config.FirecrackerConfig{KernelImage: path},
+		}}
+	}
+
+	got := configuredKernelName(withKernel(managed+"/vmlinux-6.1.155-ea1d42638d13"), managed)
+	if got != "vmlinux-6.1.155-ea1d42638d13" {
+		t.Errorf("a kernel inside the managed directory resolved to %q", got)
+	}
+
+	// OUTSIDE THE DIRECTORY IS NOT THIS CODE'S BUSINESS, and answering with a bare
+	// base name would be actively wrong: the reaper would protect a same-named file
+	// it does manage, and verification would record a pairing every launch resolves
+	// to the wrong path.
+	for _, outside := range []string{
+		"/home/junior/fc-smoke/vmlinux-billet",
+		"/opt/other/vmlinux-6.1.155-ea1d42638d13",
+		managed + "/nested/vmlinux-6.1.155-ea1d42638d13",
+		"",
+	} {
+		if got := configuredKernelName(withKernel(outside), managed); got != "" {
+			t.Errorf("%q resolved to %q; it is not in the managed directory", outside, got)
+		}
+	}
+
+	// A NODE WITH NO FIRECRACKER SECTION AT ALL must not panic; a server-only
+	// config reaches the reaper through the same command.
+	if got := configuredKernelName(&config.Config{}, managed); got != "" {
+		t.Errorf("a config with no node section resolved to %q", got)
+	}
+
+	if got := configuredKernelName(&config.Config{Node: &config.NodeConfig{}}, managed); got != "" {
+		t.Errorf("a node with no firecracker section resolved to %q", got)
+	}
+}
+
+// PATHS ARE COMPARED AFTER RESOLUTION, so a trailing slash or a relative segment
+// in either the configured path or the directory still matches.
+func TestConfiguredKernelNameResolvesBothSides(t *testing.T) {
+	cfg := &config.Config{Node: &config.NodeConfig{
+		Firecracker: &config.FirecrackerConfig{
+			KernelImage: "/var/lib/billet/kernels/../kernels/vmlinux-6.1.155-ea1d42638d13",
+		},
+	}}
+
+	if got := configuredKernelName(cfg, "/var/lib/billet/kernels/"); got != "vmlinux-6.1.155-ea1d42638d13" {
+		t.Errorf("a path with a relative segment resolved to %q", got)
 	}
 }
