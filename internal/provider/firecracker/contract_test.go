@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"testing"
+
+	"github.com/junioryono/billet/internal/provider"
 )
 
 // THE GUEST CONTRACT IS WRITTEN IN TWO PLACES AND NOTHING ELSE CHECKS THEY
@@ -61,5 +63,53 @@ func TestGuestContractMatchesTheAgentInTheBuildScript(t *testing.T) {
 			"number.\n\n"+
 			"Change both, and bump the manifest's guest_contract with them.",
 			GuestContract, got)
+	}
+}
+
+// THE METADATA PATH IS HARDCODED IN TWO PLACES AND NOTHING ELSE CHECKS THEY AGREE.
+//
+// metadata() builds the data store here, in Go. scripts/boot-guest-image.sh serves
+// a stand-in payload in shell, so the boot gate can drive the agent to a refusal
+// without a control plane. The guest agent fetches a fixed path, and all three
+// have to describe the same tree.
+//
+// This was found the way these things are found: the boot gate served the payload
+// flat, the guest 404'd on it, and the agent reported that billet had not said
+// which contract it speaks -- which reads exactly like a broken image and was a
+// broken test.
+func TestMetadataNestsUnderThePathTheGuestFetches(t *testing.T) {
+	m, err := metadata(provider.Spec{Name: "probe", JITConfig: "x", Command: []string{"./run.sh"}})
+	if err != nil {
+		t.Fatalf("metadata: %v", err)
+	}
+
+	// The agent fetches http://<mmds>/latest/meta-data/billet/<key>, so the store
+	// must be nested exactly this way.
+	latest, ok := m["latest"].(map[string]any)
+	if !ok {
+		t.Fatalf("no `latest` in the data store; the agent fetches /latest/meta-data/... "+
+			"and would 404. Store: %v", m)
+	}
+
+	meta, ok := latest["meta-data"].(map[string]any)
+	if !ok {
+		t.Fatalf("no `meta-data` under `latest`; the agent would 404. Store: %v", m)
+	}
+
+	billet, ok := meta["billet"].(map[string]any)
+	if !ok {
+		t.Fatalf("no `billet` under `meta-data`; the agent would 404. Store: %v", m)
+	}
+
+	if got := billet["contract"]; got != GuestContract {
+		t.Errorf("contract in the data store = %v, want %s", got, GuestContract)
+	}
+
+	// EVERY KEY THE AGENT READS. A renamed key produces a guest that boots, fetches,
+	// finds nothing, and runs no job -- with no error naming the key.
+	for _, key := range []string{"contract", "runner-name", "jit-config", "command"} {
+		if _, present := billet[key]; !present {
+			t.Errorf("the data store carries no %q, which the agent fetches by name", key)
+		}
 	}
 }

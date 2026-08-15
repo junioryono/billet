@@ -155,10 +155,22 @@ api PUT /network-interfaces/eth0 "$(jq -n --arg t "$TAP" \
 
 api PUT /mmds/config "$(jq -n '{version:"V2", network_interfaces:["eth0"]}')"
 
-# THE PAYLOAD THE AGENT WILL REFUSE. Its shape matters as much as its contents:
-# the agent reads the contract FIRST, before anything else, so a payload carrying
-# only a contract is enough to drive it to the refusal.
-api PUT /mmds "$(jq -n --arg c "$REFUSED_CONTRACT" '{billet:{contract:$c}}')"
+# THE PAYLOAD THE AGENT WILL REFUSE, IN THE SHAPE BILLET ACTUALLY SERVES.
+#
+# The nesting is load-bearing and this got it wrong: the agent fetches
+# /latest/meta-data/billet/contract, so the data store has to be nested under
+# `latest` and `meta-data`. Served flat, the fetch 404s and the agent reports "this
+# billet did not say which metadata contract it speaks" -- which reads as a broken
+# image and was a broken test.
+#
+# Worth noting that this is precisely the class of failure the boot gate exists to
+# catch: a host serving a shape the guest does not expect. The test made the same
+# mistake a buggy billet would, and the guest caught it.
+#
+# The shape is duplicated from metadata() in internal/provider/firecracker; a Go
+# test asserts the two agree, because nothing else can.
+api PUT /mmds "$(jq -n --arg c "$REFUSED_CONTRACT" \
+	'{latest:{"meta-data":{billet:{contract:$c}}}}')"
 
 echo "booting"
 api PUT /actions '{"action_type":"InstanceStart"}'
