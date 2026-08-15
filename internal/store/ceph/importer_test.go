@@ -1,0 +1,625 @@
+package ceph
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+// importFake answers the commands an import issues, keyed on subcommand rather
+// than on call order — the same rule the clone fake follows, for the same reason.
+//
+// THE DEVICE IT HANDS BACK IS A REAL FILE, which is what makes this test worth
+// having: the write is exercised for real, so a test can assert the bytes that
+// landed rather than merely that some command was issued.
+type importFake struct {
+	calls [][]string
+
+	device   string // what `rbd device map` prints; a temp file here
+	infoJSON string // what `rbd info` answers, or "" for an absent image
+	failOn   string
+	failErr  error
+
+	// lockHeld is what `rbd lock ls` reports. Empty means the fake tracks the
+	// lock itself: `lock add` succeeds and the listing then names this cookie,
+	// which is what lets Release find and remove it.
+	lockHeld   string
+	lockTaken  string
+	lockAddErr error
+	unmapErr   error
+}
+
+func (f *importFake) run(_ context.Context, _ string, args []string) ([]byte, error) {
+	f.calls = append(f.calls, args)
+
+	sub := subcommandOf(args)
+
+	if f.failOn != "" && f.failOn == sub {
+		err := f.failErr
+		if err == nil {
+			err = errors.New("exit status 1")
+		}
+
+		return nil, err
+	}
+
+	switch sub {
+	case "lock":
+		return f.lock(args)
+	case "device unmap":
+		if f.unmapErr != nil {
+			return nil, f.unmapErr
+		}
+
+		return []byte(""), nil
+	case "info":
+		if f.infoJSON == "" {
+			// What rbd says for an image that is not there, which the importer must
+			// read as "first run" and not as a broken cluster.
+			return nil, errors.New("rbd: error opening image nope: (2) No such file or directory")
+		}
+
+		return []byte(f.infoJSON), nil
+	case "device map":
+		return []byte(f.device + "\n"), nil
+	case "device list":
+		return []byte("[]"), nil
+	case "create", "resize", "snap", "image-meta":
+		return []byte(""), nil
+	default:
+		return []byte(""), nil
+	}
+}
+
+// lock models the three lock verbs against a single in-memory holder, so a test
+// can assert that a lock taken is a lock released rather than merely that some
+// lock command was issued.
+func (f *importFake) lock(args []string) ([]byte, error) {
+	verb, cookie := "", ""
+
+	for i, a := range args {
+		if a != "lock" {
+			continue
+		}
+
+		if i+1 < len(args) {
+			verb = args[i+1]
+		}
+
+		if i+3 < len(args) {
+			cookie = args[i+3]
+		}
+
+		break
+	}
+
+	switch verb {
+	case "add":
+		if f.lockAddErr != nil {
+			return nil, f.lockAddErr
+		}
+
+		if f.lockTaken != "" || f.lockHeld != "" {
+			return nil, errors.New("exit status 16")
+		}
+
+		f.lockTaken = cookie
+
+		return []byte(""), nil
+	case "ls":
+		held := f.lockTaken
+		if f.lockHeld != "" {
+			held = f.lockHeld
+		}
+
+		if held == "" {
+			return []byte("[]"), nil
+		}
+
+		return []byte(fmt.Sprintf(`[{"id":%q,"locker":"client.4242"}]`, held)), nil
+	case "rm":
+		if cookie == f.lockTaken {
+			f.lockTaken = ""
+		}
+
+		if cookie == f.lockHeld {
+			f.lockHeld = ""
+		}
+
+		return []byte(""), nil
+	default:
+		return []byte(""), nil
+	}
+}
+
+// ranWith reports whether any invocation carried every fragment as a WHOLE
+// ARGUMENT, or as a prefix of one.
+//
+// NOT strings.Contains OVER THE JOINED LINE, which is the trap the clone fake
+// documents and which this helper walked straight into: "rm" is a substring of
+// "--format", so every assertion that billet did NOT run `lock rm` passed
+// against the `--format json` on the listing call and reported that a live
+// holder's lock had been broken. Two tests failed for a reason that was entirely
+// the test's.
+//
+// Prefix matching is kept for the one case that needs it -- naming a lock cookie
+// by its stable leading portion, since the trailing timestamp is not knowable.
+func (f *importFake) ranWith(fragments ...string) bool {
+	for _, call := range f.calls {
+		matched := true
+
+		for _, fragment := range fragments {
+			found := false
+
+			for _, arg := range call {
+				if arg == fragment || strings.HasPrefix(arg, fragment) {
+					found = true
+
+					break
+				}
+			}
+
+			if !found {
+				matched = false
+
+				break
+			}
+		}
+
+		if matched {
+			return true
+		}
+	}
+
+	return false
+}
+
+// stageRaw writes a stand-in filesystem image and the file the "device" maps to.
+func stageRaw(t *testing.T, content string) (raw, device string) {
+	t.Helper()
+
+	dir := t.TempDir()
+
+	raw = filepath.Join(dir, "rootfs.img")
+	if err := os.WriteFile(raw, []byte(content), 0o600); err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+
+	device = filepath.Join(dir, "rbd0")
+
+	// PRE-CREATED, because the real destination is a block device that already
+	// exists — which is exactly why the importer opens it without O_CREATE.
+	if err := os.WriteFile(device, nil, 0o600); err != nil {
+		t.Fatalf("stage device: %v", err)
+	}
+
+	return raw, device
+}
+
+func importClient(t *testing.T, f *importFake) *Client {
+	t.Helper()
+
+	c, err := New(valid(), WithBinary("/usr/bin/rbd"), WithCephBinary("/usr/bin/ceph"),
+		withRunner(f.run))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	return c
+}
+
+var importAt = time.Date(2026, 8, 15, 4, 17, 9, 0, time.UTC)
+
+func TestImportGenerationWritesTheImageAndPublishesIt(t *testing.T) {
+	raw, device := stageRaw(t, "a filesystem, in spirit")
+
+	f := &importFake{device: device}
+
+	gen, err := importClient(t, f).ImportGeneration(
+		t.Context(), "ubuntu-2404-x64", raw, "2.336.0", importAt)
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+
+	if gen != "g20260815041709" {
+		t.Errorf("generation = %q", gen)
+	}
+
+	// THE BYTES ACTUALLY LANDED, not merely that a command was issued.
+	got, err := os.ReadFile(device)
+	if err != nil {
+		t.Fatalf("read device: %v", err)
+	}
+
+	if string(got) != "a filesystem, in spirit" {
+		t.Errorf("device holds %q", got)
+	}
+
+	if !f.ranWith("snap", "create", "ubuntu-2404-x64@"+gen) {
+		t.Errorf("no snapshot was taken; billet ran %v", f.calls)
+	}
+
+	if !f.ranWith("image-meta", "set", RunnerVersionKey+"."+gen, "2.336.0") {
+		t.Errorf("the runner version was not recorded per generation; billet ran %v", f.calls)
+	}
+}
+
+// AN ABSENT HEAD IS THE FIRST RUN, and must be created rather than reported.
+func TestImportGenerationCreatesTheHeadWhenItIsAbsent(t *testing.T) {
+	raw, device := stageRaw(t, strings.Repeat("x", 3*1024*1024))
+
+	f := &importFake{device: device} // infoJSON empty: rbd answers ENOENT
+
+	if _, err := importClient(t, f).ImportGeneration(
+		t.Context(), "ubuntu-2404-x64", raw, "2.336.0", importAt); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+
+	// THE HEAD, NOT THE LOCK IMAGE. The publish lock is also created with
+	// `create --size`, so an assertion that does not name the image matches the
+	// lock and passes even when the head was never created -- which is how the
+	// first version of this test agreed with a bug.
+	if !f.ranWith("create", "ubuntu-2404-x64", "--size", "515M", "--object-size", "4M") {
+		t.Errorf("the head was not created at the image's size plus slack, with the object "+
+			"size pinned; billet ran %v", f.calls)
+	}
+}
+
+// A CLUSTER THAT CANNOT BE REACHED IS NOT AN ABSENT IMAGE. Treating every info
+// failure as "first run" would answer an unreachable cluster with `rbd create`,
+// which fails for a second reason and reports that one instead — so the operator
+// is told the image could not be created rather than that the cluster is down.
+func TestImportGenerationSeparatesAnAbsentImageFromABrokenCluster(t *testing.T) {
+	raw, device := stageRaw(t, "content")
+
+	f := &importFake{
+		device:  device,
+		failOn:  "info",
+		failErr: errors.New("rbd: couldn't connect to the cluster"),
+	}
+
+	_, err := importClient(t, f).ImportGeneration(
+		t.Context(), "ubuntu-2404-x64", raw, "2.336.0", importAt)
+	if err == nil {
+		t.Fatal("an unreachable cluster was treated as an absent image")
+	}
+
+	if f.ranWith("create", "ubuntu-2404-x64") {
+		t.Error("billet tried to create the head against a cluster it could not reach")
+	}
+}
+
+// GROWN, NEVER SHRUNK. Writing a larger filesystem into a head sized for the last
+// one fails partway with ENOSPC — a corrupt image behind a successful-looking
+// import, because the write is the only step that would have complained.
+func TestImportGenerationGrowsAHeadThatIsTooSmall(t *testing.T) {
+	raw, device := stageRaw(t, strings.Repeat("x", 5*1024*1024))
+
+	f := &importFake{device: device, infoJSON: `{"size": 2097152}`} // 2 MiB
+
+	if _, err := importClient(t, f).ImportGeneration(
+		t.Context(), "ubuntu-2404-x64", raw, "2.336.0", importAt); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+
+	if !f.ranWith("resize", "--size", "517M") {
+		t.Errorf("a head smaller than the image was not grown; billet ran %v", f.calls)
+	}
+}
+
+// EXISTING SNAPSHOTS KEEP THEIR OWN SIZE, so shrinking reclaims nothing a
+// generation still holds and would truncate the next write.
+func TestImportGenerationLeavesALargerHeadAlone(t *testing.T) {
+	raw, device := stageRaw(t, "small")
+
+	f := &importFake{device: device, infoJSON: fmt.Sprintf(`{"size": %d}`, 8*1024*1024)}
+
+	if _, err := importClient(t, f).ImportGeneration(
+		t.Context(), "ubuntu-2404-x64", raw, "2.336.0", importAt); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+
+	if f.ranWith("resize") {
+		t.Errorf("a head larger than the image was resized; billet ran %v", f.calls)
+	}
+}
+
+// UNMAPPED BEFORE THE SNAPSHOT. A mapped device can still hold dirty pages, so
+// snapshotting first captures the image as of a moment nobody chose — and the
+// generation boots, or does not, on timing that never reproduces.
+func TestImportGenerationUnmapsBeforeItSnapshots(t *testing.T) {
+	raw, device := stageRaw(t, "content")
+
+	f := &importFake{device: device}
+
+	if _, err := importClient(t, f).ImportGeneration(
+		t.Context(), "ubuntu-2404-x64", raw, "2.336.0", importAt); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+
+	unmapAt, snapAt := -1, -1
+
+	for i, call := range f.calls {
+		joined := strings.Join(call, " ")
+
+		if unmapAt < 0 && strings.Contains(joined, "device unmap") {
+			unmapAt = i
+		}
+
+		if snapAt < 0 && strings.Contains(joined, "snap create") {
+			snapAt = i
+		}
+	}
+
+	if unmapAt < 0 {
+		t.Fatalf("the head was never unmapped; billet ran %v", f.calls)
+	}
+
+	if snapAt < 0 {
+		t.Fatalf("no snapshot was taken; billet ran %v", f.calls)
+	}
+
+	if unmapAt > snapAt {
+		t.Errorf("billet snapshotted at step %d and unmapped at step %d; the snapshot can "+
+			"capture pages the kernel has not written back", snapAt, unmapAt)
+	}
+}
+
+// A HEAD LEFT MAPPED IS NOT UNTIDINESS. The next import maps it a SECOND time
+// rather than failing, which is how a host accumulates a dozen mappings of one
+// image.
+func TestImportGenerationUnmapsEvenWhenTheWriteFails(t *testing.T) {
+	raw, device := stageRaw(t, "content")
+
+	// A directory cannot be opened for writing, so the write fails after the map.
+	f := &importFake{device: filepath.Dir(device)}
+
+	if _, err := importClient(t, f).ImportGeneration(
+		t.Context(), "ubuntu-2404-x64", raw, "2.336.0", importAt); err == nil {
+		t.Fatal("writing to a directory was reported as a successful import")
+	}
+
+	if !f.ranWith("device", "unmap") {
+		t.Errorf("the head was left mapped after a failed write; billet ran %v", f.calls)
+	}
+}
+
+func TestImportGenerationRefusesAnEmptyImage(t *testing.T) {
+	raw, device := stageRaw(t, "")
+
+	f := &importFake{device: device}
+
+	_, err := importClient(t, f).ImportGeneration(
+		t.Context(), "ubuntu-2404-x64", raw, "2.336.0", importAt)
+	if err == nil {
+		t.Fatal("an empty file was published as a generation")
+	}
+
+	if f.ranWith("snap", "create") {
+		t.Error("a snapshot was taken of nothing")
+	}
+}
+
+// AN EMPTY VERSION READS BACK AS AN ABSENT KEY, so recording one produces a
+// generation that silently opts out of every staleness check.
+func TestSetRunnerVersionRefusesAnEmptyVersion(t *testing.T) {
+	f := &importFake{}
+
+	err := importClient(t, f).SetRunnerVersion(
+		t.Context(), "ubuntu-2404-x64", "g20260815041709", "  ")
+	if err == nil {
+		t.Fatal("an empty runner version was recorded")
+	}
+
+	if f.ranWith("image-meta", "set") {
+		t.Error("billet wrote the empty value anyway")
+	}
+}
+
+// THE IMAGE NAME IS HALF OF A POSITIONAL pool/image ARGUMENT, so a name carrying
+// a separator or a leading dash addresses something else entirely.
+func TestImportGenerationRefusesAnUnaddressableImageName(t *testing.T) {
+	raw, device := stageRaw(t, "content")
+
+	for _, name := range []string{"", "other-pool/image", "image@gen", "-rf", " leading"} {
+		f := &importFake{device: device}
+
+		if _, err := importClient(t, f).ImportGeneration(
+			t.Context(), name, raw, "2.336.0", importAt); err == nil {
+			t.Errorf("%q was accepted as an image name", name)
+		}
+	}
+}
+
+// TWO PUBLISHERS WRITING ONE HEAD interleave their writes, and the first to
+// finish unmaps and snapshots a filesystem that is half the other one. A
+// same-second generation-name collision does not protect against this: the
+// corruption happens before either `snap create`.
+func TestImportGenerationStandsDownWhileAnotherPublisherHoldsTheLock(t *testing.T) {
+	raw, device := stageRaw(t, "content")
+
+	// Held by somebody else, taken one minute ago.
+	f := &importFake{
+		device:   device,
+		lockHeld: fmt.Sprintf("billet-build-otherhost-123-%d", importAt.Add(-time.Minute).Unix()),
+	}
+
+	_, err := importClient(t, f).ImportGeneration(
+		t.Context(), "ubuntu-2404-x64", raw, "2.336.0", importAt)
+	if err == nil {
+		t.Fatal("an import proceeded while another publisher held the lock")
+	}
+
+	if !strings.Contains(err.Error(), "otherhost") {
+		t.Errorf("the refusal does not name the holder: %v", err)
+	}
+
+	if f.ranWith("device", "map") {
+		t.Error("billet mapped the head despite standing down; two writers would have been " +
+			"on one image")
+	}
+}
+
+// A LEAKED LOCK IS OTHERWISE PERMANENT: rbd locks are not leases, so a killed
+// publisher holds one forever and every later publish on every node refuses.
+func TestImportGenerationBreaksALockNoRunCouldStillBeHolding(t *testing.T) {
+	raw, device := stageRaw(t, "content")
+
+	f := &importFake{
+		device: device,
+		lockHeld: fmt.Sprintf("billet-build-deadhost-9-%d",
+			importAt.Add(-StaleLockAfter-time.Hour).Unix()),
+	}
+
+	if _, err := importClient(t, f).ImportGeneration(
+		t.Context(), "ubuntu-2404-x64", raw, "2.336.0", importAt); err != nil {
+		t.Fatalf("a lock older than any run could be was not broken: %v", err)
+	}
+
+	if !f.ranWith("lock", "rm", "billet-build-deadhost-9") {
+		t.Errorf("the stale lock was not broken; billet ran %v", f.calls)
+	}
+}
+
+// BREAKING A LIVE HOLDER'S LOCK PUTS TWO WRITERS ON ONE IMAGE, so the bound is
+// deliberately far past any real run. This pins the boundary.
+func TestImportGenerationDoesNotBreakALockJustUnderTheBound(t *testing.T) {
+	raw, device := stageRaw(t, "content")
+
+	f := &importFake{
+		device: device,
+		lockHeld: fmt.Sprintf("billet-build-livehost-9-%d",
+			importAt.Add(-StaleLockAfter+time.Minute).Unix()),
+	}
+
+	if _, err := importClient(t, f).ImportGeneration(
+		t.Context(), "ubuntu-2404-x64", raw, "2.336.0", importAt); err == nil {
+		t.Fatal("a lock just inside the bound was broken")
+	}
+
+	if f.ranWith("lock", "rm") {
+		t.Error("billet broke a lock whose holder could still be alive")
+	}
+}
+
+// A COOKIE OF UNKNOWN SHAPE IS NEVER BROKEN. Something else took the lock, and
+// breaking it because its name was unfamiliar is how two writers meet.
+func TestImportGenerationNeverBreaksALockItCannotDate(t *testing.T) {
+	raw, device := stageRaw(t, "content")
+
+	f := &importFake{device: device, lockHeld: "somebody-elses-tool"}
+
+	if _, err := importClient(t, f).ImportGeneration(
+		t.Context(), "ubuntu-2404-x64", raw, "2.336.0", importAt); err == nil {
+		t.Fatal("a lock of unknown age was broken")
+	}
+
+	if f.ranWith("lock", "rm") {
+		t.Error("billet broke a lock it could not date")
+	}
+}
+
+// THE LOCK IS RELEASED ON THE WAY OUT, including when the import failed -- a held
+// lock outlives the process, so leaking one blocks every later publish for six
+// hours.
+func TestImportGenerationReleasesTheLockOnBothPaths(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		content string
+		wantErr bool
+	}{
+		{"success", "content", false},
+		{"failure", "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, device := stageRaw(t, tc.content)
+
+			f := &importFake{device: device}
+
+			_, err := importClient(t, f).ImportGeneration(
+				t.Context(), "ubuntu-2404-x64", raw, "2.336.0", importAt)
+
+			if tc.wantErr && err == nil {
+				t.Fatal("expected a failure")
+			}
+
+			if !tc.wantErr && err != nil {
+				t.Fatalf("import: %v", err)
+			}
+
+			if f.lockTaken != "" {
+				t.Errorf("the publish lock was still held as %q after the import; every later "+
+					"publish on every node would refuse for %s", f.lockTaken, StaleLockAfter)
+			}
+		})
+	}
+}
+
+// A DEFERRED FUNCTION RUNS AFTER THE RETURN VALUE IS COMPUTED. An earlier version
+// set a local in the deferred cleanup and read it at the return site, so it was
+// always nil and the branch that looked like error handling was dead code.
+func TestImportGenerationReportsAnUnmapThatFailedAfterAGoodWrite(t *testing.T) {
+	raw, device := stageRaw(t, "content")
+
+	f := &importFake{device: device, unmapErr: errors.New("exit status 16")}
+
+	_, err := importClient(t, f).ImportGeneration(
+		t.Context(), "ubuntu-2404-x64", raw, "2.336.0", importAt)
+	if err == nil {
+		t.Fatal("an import whose head could not be unmapped was reported as a success; the " +
+			"next import would map the same head a second time")
+	}
+
+	if !strings.Contains(err.Error(), "still mapped") {
+		t.Errorf("the failure does not say the head is still mapped: %v", err)
+	}
+
+	if f.ranWith("snap", "create") {
+		t.Error("a snapshot was taken of a head that was never unmapped, so it can capture " +
+			"pages the kernel has not written back")
+	}
+}
+
+// A SNAPSHOT WITH NO RECORDED RUNNER VERSION IS WORSE THAN NO SNAPSHOT:
+// NewestGeneration finds it, so `billet images due` reports nothing needs
+// rebuilding, while every staleness check reads its version as absent.
+func TestImportGenerationWithdrawsASnapshotItCannotDescribe(t *testing.T) {
+	raw, device := stageRaw(t, "content")
+
+	f := &importFake{device: device, failOn: "image-meta"}
+
+	gen, err := importClient(t, f).ImportGeneration(
+		t.Context(), "ubuntu-2404-x64", raw, "2.336.0", importAt)
+	if err == nil {
+		t.Fatal("a generation whose runner version could not be recorded was published")
+	}
+
+	if gen != "" {
+		t.Errorf("a withdrawn generation was still returned as %q", gen)
+	}
+
+	if !f.ranWith("snap", "rm", "ubuntu-2404-x64@g20260815041709") {
+		t.Errorf("the snapshot was not withdrawn; billet ran %v", f.calls)
+	}
+}
+
+// STATTED EARLY, OPENED LATER. If the file is truncated in between, io.Copy
+// reports a clean EOF and a partial filesystem would be snapshotted as a
+// published generation.
+func TestWriteImageRefusesASourceThatShrankUnderIt(t *testing.T) {
+	raw, device := stageRaw(t, "twelve bytes")
+
+	err := writeImage(raw, device, 999)
+	if err == nil {
+		t.Fatal("a short copy was reported as a complete write")
+	}
+
+	if !strings.Contains(err.Error(), "changed underneath") {
+		t.Errorf("the failure does not explain what happened: %v", err)
+	}
+}

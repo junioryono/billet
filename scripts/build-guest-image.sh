@@ -464,6 +464,42 @@ NET
 
 	echo "built $img ($(du -h "$img" | cut -f1))"
 
+	# WHAT WAS ACTUALLY BUILT, WRITTEN WHERE SOMETHING ELSE CAN READ IT.
+	#
+	# RUNNER_VERSION may have arrived empty and been resolved from the pinned file
+	# a hundred lines above, so the caller's environment does not necessarily say
+	# what this image contains — only this process knows. A publisher describing
+	# the image from its own inputs would put the REQUESTED version in the manifest
+	# and the INSTALLED one on the disk, and those differ exactly when the request
+	# was blank, which is the normal scheduled case.
+	#
+	# THE CONTRACT IS READ BACK OUT OF THE AGENT THAT WAS INSTALLED, not restated
+	# here. The agent is embedded in a QUOTED heredoc — deliberately, so nothing in
+	# it is interpolated — which means its `WANT_CONTRACT=` is a literal the outer
+	# script cannot see. Restating it here would create a second copy that drifts
+	# silently, and the drift is invisible in the worst way: the manifest would
+	# advertise a contract the image does not speak, a node would accept the image
+	# on that basis, and the guests would boot and never report.
+	local contract
+	contract=$(sed -n 's/^WANT_CONTRACT=\([0-9][0-9]*\)$/\1/p' \
+		"$rootfs/usr/local/bin/billet-agent" | head -1)
+
+	if [ -z "$contract" ]; then
+		echo "could not read the guest contract out of the agent that was just installed;" >&2
+		echo "refusing to describe an image whose protocol version is unknown" >&2
+		exit 1
+	fi
+
+	cat >"$WORK/build-info.env" <<INFO
+RUNNER_VERSION=$RUNNER_VERSION
+GUEST_CONTRACT=$contract
+ARCH=$(uname -m)
+IMAGE_NAME=$IMAGE_NAME
+IMAGE_FILE=$img
+INFO
+
+	echo "recorded $WORK/build-info.env"
+
 	if [ "$PUBLISH" != "yes" ]; then
 		echo "PUBLISH=no, so it was not written to ceph"
 		return
