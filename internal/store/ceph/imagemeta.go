@@ -2,6 +2,7 @@ package ceph
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 )
@@ -212,4 +213,37 @@ func (c *Client) Kernel(ctx context.Context, image, generation string) (string, 
 	}
 
 	return strings.TrimSpace(string(out)), true, nil
+}
+
+// Images lists the images in the pool billet publishes to.
+//
+// NEEDED BECAUSE THE KERNEL DIRECTORY IS SHARED AND THE POOL IS NOT ONE IMAGE.
+// Reaping was scoped to the image named on the command line while the kernels of
+// every image sit in one directory, so reaping one image could delete a kernel
+// another image's generations are paired with -- and the failure lands on the next
+// job that boots the other image, with nothing connecting it to the reap.
+func (c *Client) Images(ctx context.Context) ([]string, error) {
+	out, err := c.rbdCmd(ctx, true, "-p", c.cfg.ImagePool, "ls")
+	if err != nil {
+		return nil, fmt.Errorf("ceph: could not list the images in %s: %w", c.cfg.ImagePool, err)
+	}
+
+	var names []string
+	if err := json.Unmarshal(out, &names); err != nil {
+		return nil, fmt.Errorf("ceph: %s did not list %s as json", c.bin, c.cfg.ImagePool)
+	}
+
+	// THE LOCK IMAGE IS NOT A GUEST IMAGE. It carries no generations, and asking
+	// about its snapshots is a wasted round trip that also reads oddly in an error.
+	kept := names[:0]
+
+	for _, name := range names {
+		if name == LockImageName {
+			continue
+		}
+
+		kept = append(kept, name)
+	}
+
+	return kept, nil
 }

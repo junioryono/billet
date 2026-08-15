@@ -192,3 +192,30 @@ func TestTheVerifiedAliasIsNotTreatedAsAPin(t *testing.T) {
 		t.Errorf("`@%s` was treated as a pinned generation: %v", Verified, kept(plan))
 	}
 }
+
+// EVERY KEY GOES WITH THE GENERATION, not just the two that existed when this loop
+// was written.
+//
+// KernelKey was added later and the cleanup was not updated, so a reaped
+// generation left its kernel pairing behind -- and the kernel reaper reads exactly
+// those keys to decide what is still needed. A dead generation's key would keep
+// its kernel alive forever, which is the opposite of what reaping is for.
+func TestReapRemovesEveryMetadataKeyOfTheGenerationsItRemoves(t *testing.T) {
+	f := &importFake{}
+
+	plan := []Reapable{{Generation: Generation{Name: "g20260814072427"}}}
+
+	if _, err := importClient(t, f).Reap(t.Context(), "ubuntu-2404-x64", plan); err != nil {
+		t.Fatalf("reap: %v", err)
+	}
+
+	for _, key := range []string{VerifiedKey, RunnerVersionKey, KernelKey} {
+		want := key + ".g20260814072427"
+
+		if !f.ranWith("image-meta", "remove", want) {
+			t.Errorf("the reap left %s behind; the kernel reaper reads these keys to decide "+
+				"what is still needed, so a dead generation's key keeps its kernel alive "+
+				"forever", want)
+		}
+	}
+}

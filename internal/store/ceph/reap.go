@@ -119,10 +119,20 @@ func (c *Client) Reap(ctx context.Context, image string, plan []Reapable) ([]str
 			return removed, fmt.Errorf("ceph: remove the generation %s@%s: %w", name, gen.Name, err)
 		}
 
-		// AND ITS METADATA, or the keys outlive the thing they describe: a
+		// AND ALL OF ITS METADATA, or the keys outlive the thing they describe: a
 		// verification claim for a generation nothing can boot would keep answering
 		// `@verified` with a name that is gone.
-		for _, key := range []string{VerifiedKey + "." + gen.Name, RunnerVersionKey + "." + gen.Name} {
+		//
+		// EVERY KEY, WHICH IS WHY THIS IS A LIST AND NOT TWO LINES. KernelKey was
+		// added later and this loop was not, so a reaped generation left its kernel
+		// pairing behind -- and the kernel reaper reads exactly those keys to decide
+		// what is still needed. A dead generation's key would have kept its kernel
+		// alive forever, which is the opposite of what reaping is for.
+		for _, key := range []string{
+			VerifiedKey + "." + gen.Name,
+			RunnerVersionKey + "." + gen.Name,
+			KernelKey + "." + gen.Name,
+		} {
 			//nolint:errcheck // the generation is already gone; a stale key is not worth failing on
 			_, _ = c.rbdCmd(ctx, false, "-p", c.cfg.ImagePool, "image-meta", "remove", name, key)
 		}

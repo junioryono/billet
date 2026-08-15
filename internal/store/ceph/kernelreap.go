@@ -30,6 +30,7 @@ func PlanKernelReap(
 	onDisk []string,
 	needed map[string]bool,
 	generations, unknown int,
+	configured string,
 ) ([]string, error) {
 	// ONE GENERATION WITH AN UNKNOWN KERNEL MAKES EVERY KERNEL UNSAFE TO DELETE.
 	//
@@ -69,6 +70,20 @@ func PlanKernelReap(
 		}
 
 		if needed[name] {
+			continue
+		}
+
+		// THE KERNEL THIS NODE IS CONFIGURED TO BOOT IS NEVER REAPED, and that is a
+		// different claim from the metadata above. Metadata says which kernel a
+		// generation was PAIRED with; the configured one is what the next launch will
+		// actually use. A node whose configured kernel is not yet recorded against
+		// anything -- freshly pulled, or verified but not yet paired -- would
+		// otherwise have it deleted, and the failure lands on the next job to start
+		// rather than on the reap that caused it.
+		//
+		// An empty value means the configured kernel is outside the managed directory,
+		// which puts it outside this reaper's authority entirely.
+		if configured != "" && name == configured {
 			continue
 		}
 

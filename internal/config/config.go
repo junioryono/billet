@@ -91,6 +91,21 @@ type ImagesConfig struct {
 	// internal/imagesource, next to the one constant naming this project, so a
 	// move does not have to be remembered in two places.
 	Source string `yaml:"source,omitempty"`
+
+	// SigningIdentity is the certificate SAN pattern a valid signature must carry.
+	//
+	// REQUIRED FOR A SOURCE THAT IS NOT BILLET'S OWN, because billet's identity
+	// cannot vouch for what somebody else's mirror serves — and the alternative to
+	// requiring it is silently not verifying, which is the failure this exists to
+	// prevent.
+	SigningIdentity string `yaml:"signing_identity,omitempty"`
+
+	// SigningIssuer is the OIDC issuer that certificate must come from.
+	//
+	// A SAN says who a certificate is FOR; the issuer says who vouched for it.
+	// Without this, any authority able to mint a certificate carrying that name
+	// satisfies the policy.
+	SigningIssuer string `yaml:"signing_issuer,omitempty"`
 }
 
 // SiteConfig declares one place compute runs.

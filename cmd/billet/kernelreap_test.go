@@ -37,7 +37,7 @@ func TestReapKernelDirRemovesOnlyOrphans(t *testing.T) {
 	)
 
 	removed, err := reapKernelDir(dir,
-		map[string]bool{"vmlinux-6.1.155-ea1d42638d13": true}, 2, 0, false)
+		map[string]bool{"vmlinux-6.1.155-ea1d42638d13": true}, 2, 0, "", false)
 	if err != nil {
 		t.Fatalf("reap: %v", err)
 	}
@@ -61,7 +61,7 @@ func TestReapKernelDirRemovesOnlyOrphans(t *testing.T) {
 func TestReapKernelDirDryRunDeletesNothing(t *testing.T) {
 	dir := kernelDirWith(t, "vmlinux-6.1.140-bbbbbbbbbbbb")
 
-	removed, err := reapKernelDir(dir, map[string]bool{}, 0, 0, true)
+	removed, err := reapKernelDir(dir, map[string]bool{}, 0, 0, "", true)
 	if err != nil {
 		t.Fatalf("reap: %v", err)
 	}
@@ -81,7 +81,7 @@ func TestReapKernelDirDryRunDeletesNothing(t *testing.T) {
 func TestReapKernelDirRefusesWhenNothingIsNeededButGenerationsExist(t *testing.T) {
 	dir := kernelDirWith(t, "vmlinux-6.1.155-ea1d42638d13")
 
-	_, err := reapKernelDir(dir, map[string]bool{}, 3, 3, false)
+	_, err := reapKernelDir(dir, map[string]bool{}, 3, 3, "", false)
 	if err == nil {
 		t.Fatal("reaped every kernel while three generations exist")
 	}
@@ -96,7 +96,7 @@ func TestReapKernelDirRefusesWhenNothingIsNeededButGenerationsExist(t *testing.T
 // deployment.
 func TestReapKernelDirToleratesAMissingDirectory(t *testing.T) {
 	removed, err := reapKernelDir(filepath.Join(t.TempDir(), "never-created"),
-		map[string]bool{}, 0, 0, false)
+		map[string]bool{}, 0, 0, "", false)
 	if err != nil {
 		t.Fatalf("a node that has never pulled reported an error: %v", err)
 	}
@@ -115,7 +115,7 @@ func TestReapKernelDirLeavesForeignFilesAlone(t *testing.T) {
 		t.Fatalf("mkdir: %v", err)
 	}
 
-	if _, err := reapKernelDir(dir, map[string]bool{}, 0, 0, false); err != nil {
+	if _, err := reapKernelDir(dir, map[string]bool{}, 0, 0, "", false); err != nil {
 		t.Fatalf("reap: %v", err)
 	}
 
@@ -135,7 +135,7 @@ func TestReapKernelDirLeavesForeignFilesAlone(t *testing.T) {
 func TestReapKernelDirReportsWhatItRemoved(t *testing.T) {
 	dir := kernelDirWith(t, "vmlinux-6.1.140-bbbbbbbbbbbb", "vmlinux-6.1.130-cccccccccccc")
 
-	removed, err := reapKernelDir(dir, map[string]bool{}, 0, 0, false)
+	removed, err := reapKernelDir(dir, map[string]bool{}, 0, 0, "", false)
 	if err != nil {
 		t.Fatalf("reap: %v", err)
 	}
