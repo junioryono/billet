@@ -1,7 +1,9 @@
 package imagesource
 
 import (
+	"bytes"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -105,5 +107,90 @@ func TestTheEmbeddedTrustRootLoads(t *testing.T) {
 
 	if tr == nil {
 		t.Fatal("the embedded trust root is nil")
+	}
+}
+
+// A REAL SIGNATURE, OVER A REAL MANIFEST, FROM THE REAL WORKFLOW.
+//
+// Every other test here asserts that verification REFUSES something, and a
+// verifier that refuses everything passes all of them. This is the one that proves
+// the policy accepts what it is supposed to: the manifest and bundle from a
+// genuine publish, checked against the built-in identity with nothing relaxed.
+//
+// The fixture does not expire. A Fulcio certificate lives about ten minutes, but
+// verification judges it as-of the timestamp in the transparency log entry, which
+// is what makes an old signature over unchanged bytes verifiable indefinitely.
+func TestARealSignatureFromThisProjectVerifies(t *testing.T) {
+	manifest, err := os.ReadFile("testdata/signed-manifest.json")
+	if err != nil {
+		t.Skipf("no signed fixture: %v", err)
+	}
+
+	bundle, err := os.ReadFile("testdata/signed-manifest.sigstore.json")
+	if err != nil {
+		t.Skipf("no bundle fixture: %v", err)
+	}
+
+	if err := VerifySignature(manifest, bundle, defaultPolicy(t)); err != nil {
+		t.Fatalf("a genuine signature from this project's publishing workflow was "+
+			"refused by the built-in policy, so no node could pull anything: %v", err)
+	}
+}
+
+// AND THE SAME SIGNATURE OVER CHANGED BYTES IS REFUSED. Without this the test
+// above proves only that the code runs.
+func TestARealSignatureDoesNotCoverAChangedManifest(t *testing.T) {
+	manifest, err := os.ReadFile("testdata/signed-manifest.json")
+	if err != nil {
+		t.Skipf("no signed fixture: %v", err)
+	}
+
+	bundle, err := os.ReadFile("testdata/signed-manifest.sigstore.json")
+	if err != nil {
+		t.Skipf("no bundle fixture: %v", err)
+	}
+
+	// One field, of the kind an attacker would change: the architecture a node
+	// checks before deciding the image is for it.
+	tampered := []byte(strings.Replace(string(manifest), `"x86_64"`, `"aarch64"`, 1))
+
+	if bytes.Equal(tampered, manifest) {
+		t.Fatal("could not tamper with the fixture")
+	}
+
+	if err := VerifySignature(tampered, bundle, defaultPolicy(t)); err == nil {
+		t.Fatal("a genuine signature covered a manifest that had been changed under it")
+	}
+}
+
+// A SIGNATURE FROM ANOTHER WORKFLOW IN THIS SAME REPOSITORY IS REFUSED, which is
+// the attack the identity pins the workflow and ref against: opening a pull
+// request is a far lower bar than compromising the release process.
+func TestARealSignatureDoesNotSatisfyAnotherWorkflowsPolicy(t *testing.T) {
+	manifest, err := os.ReadFile("testdata/signed-manifest.json")
+	if err != nil {
+		t.Skipf("no signed fixture: %v", err)
+	}
+
+	bundle, err := os.ReadFile("testdata/signed-manifest.sigstore.json")
+	if err != nil {
+		t.Skipf("no bundle fixture: %v", err)
+	}
+
+	src, err := ParseSource(DefaultBaseURL)
+	if err != nil {
+		t.Fatalf("source: %v", err)
+	}
+
+	other, err := PolicyFor(src,
+		`^https://github\.com/`+regexp.QuoteMeta(DefaultRepo)+`/\.github/workflows/ci\.yml@refs/heads/main$`,
+		GitHubOIDCIssuer, false)
+	if err != nil {
+		t.Fatalf("policy: %v", err)
+	}
+
+	if err := VerifySignature(manifest, bundle, other); err == nil {
+		t.Fatal("a signature from the guest-image workflow satisfied a policy naming a " +
+			"different workflow in the same repository")
 	}
 }

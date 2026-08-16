@@ -1991,6 +1991,10 @@ func (noRootDisk) KernelFor(context.Context, string, string) (string, bool, erro
 	return "", false, nil
 }
 
+// GenerationGone is false: a node with no cluster has no generations to lose, and
+// answering true would have the launch re-resolve an alias forever.
+func (noRootDisk) GenerationGone(error) bool { return false }
+
 // checkCephCluster proves this machine can act on its storage configuration.
 //
 // THE SAME DISTINCTION checkPrivateKey AND checkEC2Credentials MAKE, one backend

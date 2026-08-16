@@ -207,8 +207,9 @@ a launch resolves the alias before it does anything, so the log line names the g
 rather than the word — "which image did this job actually run" has to be answerable
 afterwards.
 
-If nothing has passed verification, `@verified` **refuses** rather than booting something
-unproven.
+If nothing has passed verification, `@verified` **refuses** rather than booting something unproven. It also refuses a generation whose snapshot is gone: the alias is resolved from verification records *intersected with the generations that still exist*, so a record that outlived its snapshot names nothing rather than pointing every launch at a corpse.
+
+Verification records **which kernel proved it**, and does so under the same cluster lock that reaping takes. The two have to exclude each other: a reap landing between "this booted" and "this is verified" would leave a generation the whole fleet takes up with no kernel recorded, and each node would boot it against whatever it happens to be configured with. Note that a probe boots either way — a clone outlives the snapshot it came from — so a verification can genuinely succeed against a generation somebody deleted while it ran.
 
 ### Where images come from
 
@@ -263,6 +264,8 @@ images:
 
 or `--skip-signature-verification`, which is deliberate rather than what happens by
 default.
+
+**Sideloading is verified the same way.** `--from <dir>` exists for a deployment with no route to the internet, and it applies the same policy to the same signature — a directory is not more trustworthy than a download, it is less, because nothing about how it arrived is even in principle observable. Its assets are copied into billet's own staging *while being hashed*, rather than checked where they sit: a file verified in place can be replaced before it is read, and then the bytes reaching the cluster are bytes nothing checked.
 
 **This used to be a per-node timer that rebuilt the image on every machine.** That is
 gone. It required root, debootstrap and an hour on every node, it had every operator

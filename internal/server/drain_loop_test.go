@@ -102,6 +102,18 @@ const outlivesTheDrain = 30 * time.Second
 // rather than making them quietly stop distinguishing the two endings.
 const gaveUp = "giving up on the jobs"
 
+// finishedEarly is the OTHER way a drain ends: everything it was waiting on left
+// `running`, so it stopped because it believed there was nothing left rather than
+// because its budget expired.
+//
+// KEPT SO A FAILURE CAN SAY WHICH HAPPENED. A test that only knows "gaveUp was not
+// logged" reports that the drain did not run out of budget, which is true and
+// useless -- the two exits want opposite fixes, and telling them apart is the
+// whole diagnosis. This became a real cost once: the flake in #74 was reproduced
+// on CI, and the run's logs were replaced by a re-run before anyone read which
+// line the drain had written.
+const finishedEarly = "everything running here has finished"
+
 // runResult is Run's outcome, observable without being taken.
 //
 // A plain `chan error` cannot be both watched and waited on: awaitDrainStart has
@@ -512,7 +524,21 @@ func TestADrainThatOverrunsItsBudgetDestroysWhatIsLeft(t *testing.T) {
 	// named for. A drain that ended for any other reason would satisfy everything
 	// above.
 	if !dl.saw(gaveUp) {
-		t.Errorf("the drain did not report giving up on its budget:\n%s", dl.String())
+		// WHICH EXIT IT TOOK, NAMED, because the two want opposite fixes: a drain
+		// that believed everything had finished means a lease left `running` while
+		// its job was still going -- listener.go moves one there when a renewal
+		// comes back unadvertisable -- and a drain that logged neither means it
+		// never reached either branch.
+		switch {
+		case dl.saw(finishedEarly):
+			t.Errorf("the drain ended because it believed everything had finished, not "+
+				"because its budget ran out. A lease left `running` while its job was "+
+				"still going, which listener.go does when a renewal comes back "+
+				"unadvertisable -- see #74:\n%s", dl.String())
+		default:
+			t.Errorf("the drain reported neither exit, so it never reached the branch "+
+				"that decides:\n%s", dl.String())
+		}
 	}
 
 	if n := destroyed.Load(); n == 0 {

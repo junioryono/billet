@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -465,5 +466,94 @@ func TestInstallKernelAcceptsAnExistingFileThatMatches(t *testing.T) {
 
 	if first != second {
 		t.Errorf("the same kernel resolved to %q then %q", first, second)
+	}
+}
+
+// THE COPY IS WHAT MAKES THE DIGEST BINDING.
+//
+// verifyLocal hashed each asset BY PATH and the import reopened it BY PATH some
+// minutes later, so whoever owns a sideload directory could swap a file in
+// between and the bytes reaching the cluster would be bytes nothing checked --
+// without forging a signature. Copying while hashing closes that, because the
+// copy is what the import reads and nothing else can reach it.
+func TestCopyVerifiedRefusesContentThatDoesNotMatchTheManifest(t *testing.T) {
+	dir := t.TempDir()
+
+	src := filepath.Join(dir, "rootfs.img")
+	if err := os.WriteFile(src, []byte("substituted"), 0o600); err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+
+	sum := sha256.Sum256([]byte("what was published"))
+
+	asset := imagesource.Asset{
+		Name:   "rootfs.img",
+		SHA256: hex.EncodeToString(sum[:]),
+		Size:   int64(len("substituted")),
+	}
+
+	dst := filepath.Join(dir, "staged.img")
+
+	if err := copyVerified(src, dst, asset); err == nil {
+		t.Fatal("content that does not match the manifest was staged for import")
+	}
+}
+
+func TestCopyVerifiedAcceptsAndCopiesWhatMatches(t *testing.T) {
+	dir := t.TempDir()
+
+	content := []byte("the published bytes")
+	src := filepath.Join(dir, "rootfs.img")
+
+	if err := os.WriteFile(src, content, 0o600); err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+
+	sum := sha256.Sum256(content)
+
+	asset := imagesource.Asset{
+		Name:   "rootfs.img",
+		SHA256: hex.EncodeToString(sum[:]),
+		Size:   int64(len(content)),
+	}
+
+	dst := filepath.Join(dir, "staged.img")
+
+	if err := copyVerified(src, dst, asset); err != nil {
+		t.Fatalf("a matching asset was refused: %v", err)
+	}
+
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+
+	if !bytes.Equal(got, content) {
+		t.Errorf("the staged copy holds %q", got)
+	}
+}
+
+// A LONGER FILE IS NOT TRUNCATED TO THE PROMISED LENGTH, which would let a digest
+// match a prefix of something larger.
+func TestCopyVerifiedRefusesAFileLongerThanTheManifestSays(t *testing.T) {
+	dir := t.TempDir()
+
+	prefix := []byte("the published bytes")
+	src := filepath.Join(dir, "rootfs.img")
+
+	if err := os.WriteFile(src, append(prefix, []byte(" plus a tail")...), 0o600); err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+
+	sum := sha256.Sum256(prefix)
+
+	asset := imagesource.Asset{
+		Name:   "rootfs.img",
+		SHA256: hex.EncodeToString(sum[:]),
+		Size:   int64(len(prefix)),
+	}
+
+	if err := copyVerified(src, filepath.Join(dir, "staged.img"), asset); err == nil {
+		t.Fatal("a file longer than the manifest says was truncated and accepted")
 	}
 }
