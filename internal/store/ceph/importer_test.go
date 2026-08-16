@@ -938,7 +938,7 @@ func TestRecordVerificationTakesThePublishLock(t *testing.T) {
 	f := &importFake{}
 
 	err := importClient(t, f).RecordVerification(t.Context(), "ubuntu-2404-x64",
-		"g20260815033431", "vmlinux-6.1.155-ea1d42638d13", importAt)
+		"g20260815033431", "vmlinux-6.1.155-ea1d42638d13", false, false, importAt)
 
 	// The fake has no snapshots, so this fails on the existence check -- which is
 	// itself the point of the next assertion.
@@ -959,7 +959,7 @@ func TestRecordVerificationRefusesAGenerationThatIsGone(t *testing.T) {
 	f := &importFake{}
 
 	err := importClient(t, f).RecordVerification(t.Context(), "ubuntu-2404-x64",
-		"g20260815033431", "", importAt)
+		"g20260815033431", "", true, false, importAt)
 	if err == nil {
 		t.Fatal("recorded a verification against a generation with no snapshot")
 	}

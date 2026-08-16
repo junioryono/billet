@@ -160,8 +160,8 @@ func cmdImagesVerify(ctx context.Context, args []string) error {
 	wait := fs.Duration("wait", 3*time.Minute, "how long to give the guest to report back")
 	record := fs.Bool("record", true,
 		"on success, mark this generation verified so `@verified` resolves to it")
-	kernelDir := fs.String("kernel-dir", DefaultKernelDir,
-		"where managed kernels live; a kernel here is recorded as this generation's")
+	allowUnpaired := fs.Bool("allow-unpaired", false,
+		"mark verified even when the kernel that proved it is not one billet manages")
 
 	rest, err := parseWithName(fs, args)
 	if err != nil {
@@ -300,14 +300,18 @@ func cmdImagesVerify(ctx context.Context, args []string) error {
 			return err
 		}
 
-		record, note := kernelToRecord(existing, configuredKernelName(cfg, *kernelDir))
+		// THE SAME DIRECTORY THE LAUNCH WILL USE, taken from the node's config rather
+		// than a flag of this command's own. Two sources for one path means verify can
+		// classify a kernel as managed while the launch looks somewhere else, and the
+		// pairing then names a file the launch will never find.
+		record, note := kernelToRecord(existing, configuredKernelName(cfg, nodeKernelDir(cfg)))
 
 		// ONE CALL, UNDER THE PUBLISH LOCK, having proved the generation still
 		// exists. The pairing and the verification were two unordered writes, and a
 		// reap landing between them leaves a generation verified but unpaired --
 		// every node takes it up and each boots it against its own kernel.
 		if err := store.RecordVerification(ctx, imageName, generation, record,
-			time.Now()); err != nil {
+			existing != "", *allowUnpaired, time.Now()); err != nil {
 			return fmt.Errorf("%s booted and ran a container, but the result could not be "+
 				"recorded, so it has NOT been marked verified: %w", rest, err)
 		}
@@ -755,8 +759,8 @@ func cmdImagesReap(ctx context.Context, args []string) error {
 	cfgPath := addConfigFlag(fs)
 	keep := fs.Int("keep", 3, "how many VERIFIED generations to leave, newest first")
 	dryRun := fs.Bool("dry-run", false, "print what would be removed and remove nothing")
-	kernelDir := fs.String("kernel-dir", DefaultKernelDir,
-		"where pulled kernels are kept; orphans there are reaped too")
+	kernelDir := fs.String("kernel-dir", "",
+		"where pulled kernels are kept; orphans there are reaped too (default: node config)")
 
 	rest, err := parseWithName(fs, args)
 	if err != nil {
@@ -845,7 +849,12 @@ func cmdImagesReap(ctx context.Context, args []string) error {
 	// leaves a kernel behind. Returning early when no generation needs reaping --
 	// which is the common case -- would mean the kernels were never collected at
 	// all, and the directory grows by 46MB a week regardless.
-	return reapKernels(ctx, store, cfg, *kernelDir, *dryRun)
+	dir := *kernelDir
+	if dir == "" {
+		dir = nodeKernelDir(cfg)
+	}
+
+	return reapKernels(ctx, store, cfg, dir, *dryRun)
 }
 
 // reapKernels removes pulled kernels no surviving generation is paired with.
@@ -917,6 +926,22 @@ func reapKernels(
 	return nil
 }
 
+// nodeKernelDir is where this node keeps managed kernels.
+//
+// ONE ANSWER FOR THE WHOLE PROCESS. The launch resolves a generation's recorded
+// kernel against this directory, so anything that RECORDS a pairing has to
+// classify against the same one -- otherwise verify calls a kernel managed while
+// the launch looks elsewhere, and the pairing names a file nothing will find.
+func nodeKernelDir(cfg *config.Config) string {
+	if cfg.Node != nil && cfg.Node.Firecracker != nil {
+		if dir := strings.TrimSpace(cfg.Node.Firecracker.KernelDir); dir != "" {
+			return dir
+		}
+	}
+
+	return DefaultKernelDir
+}
+
 // configuredKernelName is the managed kernel this node is set to boot, if it is
 // one billet is responsible for.
 //
@@ -939,15 +964,21 @@ func configuredKernelName(cfg *config.Config, kernelDir string) string {
 		return ""
 	}
 
-	// RESOLVED ON BOTH SIDES, so a configured path written with a symlink, a
-	// trailing slash or a relative segment still matches the directory it is
-	// actually in.
-	resolvedDir, err := filepath.Abs(kernelDir)
+	// SYMLINKS ARE RESOLVED, NOT JUST CLEANED. filepath.Abs makes a path absolute
+	// and does NOT follow links, which an earlier comment here claimed it did -- so
+	// a stable `current` symlink pointing at one kernel could be recorded as the
+	// pairing and then retargeted, proving kernel A and booting kernel B. The
+	// pairing has to name the file, not a name that points at a file.
+	//
+	// A path that cannot be resolved is not managed: EvalSymlinks fails when the
+	// target does not exist, and a configured kernel that is not there is a launch
+	// failure rather than something to record.
+	resolvedDir, err := filepath.EvalSymlinks(kernelDir)
 	if err != nil {
 		return ""
 	}
 
-	resolved, err := filepath.Abs(configured)
+	resolved, err := filepath.EvalSymlinks(configured)
 	if err != nil {
 		return ""
 	}

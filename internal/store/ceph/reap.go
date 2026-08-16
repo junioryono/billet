@@ -90,7 +90,11 @@ func PlanReap(all []Generation, verified map[string]bool, keep Retention) []Reap
 //
 // OLDEST FIRST, so that an interrupted reap has removed the least useful things
 // rather than a random half.
-func (c *Client) Reap(ctx context.Context, image string, plan []Reapable) ([]string, error) {
+func (c *Client) Reap( //nolint:nonamedreturns // the deferred release reports through the return value; a local assigned inside a defer is read after the return has been computed
+	ctx context.Context,
+	image string,
+	plan []Reapable,
+) (removed []string, err error) {
 	name, _, _ := strings.Cut(strings.TrimSpace(image), "@")
 	if name == "" {
 		return nil, fmt.Errorf("ceph: no image to reap generations of")
@@ -115,23 +119,50 @@ func (c *Client) Reap(ctx context.Context, image string, plan []Reapable) ([]str
 		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.wait)
 		defer cancel()
 
-		if releaseErr := lock.Release(releaseCtx); releaseErr != nil {
-			// Bounded by StaleLockAfter; the reap's own result is the useful one.
-			_ = releaseErr
+		// REPORTED WHEN NOTHING ELSE FAILED. Release stops the heartbeat before
+		// removing the lock, so a transient failure blocks every publish,
+		// verification and reap on every node until StaleLockAfter -- six hours --
+		// while the command that caused it printed success.
+		if releaseErr := lock.Release(releaseCtx); releaseErr != nil && err == nil {
+			err = releaseErr
 		}
 	}()
+
+	// REVALIDATED UNDER THE LOCK, because the plan was made without it.
+	//
+	// cmdImagesReap reads the verification state, decides what to remove, and only
+	// then calls this -- so a verification can acquire the lock, mark a previously
+	// unverified generation, and release it in the window between. Acting on the
+	// plan as given would then delete a generation that became @verified while this
+	// was deciding, which is the newest thing every node is about to boot.
+	//
+	// Re-reading here is cheap against the cost of being wrong, and it is the only
+	// place the answer cannot go stale before it is used.
+	verifiedNow, err := c.VerifiedGenerations(ctx, name)
+	if err != nil {
+		return nil, err
+	}
 
 	doomed := make([]Generation, 0, len(plan))
 
 	for _, item := range plan {
-		if item.Reason == "" {
-			doomed = append(doomed, item.Generation)
+		if item.Reason != "" {
+			continue
 		}
+
+		if verifiedNow[item.Generation.Name] {
+			// VERIFIED SINCE THE PLAN WAS MADE. Skipped rather than reported as an
+			// error: the reap did the right thing with what it knew, and the operator
+			// asked for generations nothing needs -- this one is now needed.
+			continue
+		}
+
+		doomed = append(doomed, item.Generation)
 	}
 
 	sort.Slice(doomed, func(i, j int) bool { return doomed[i].Built.Before(doomed[j].Built) })
 
-	removed := make([]string, 0, len(doomed))
+	removed = make([]string, 0, len(doomed))
 
 	for _, gen := range doomed {
 		if _, err := c.rbdCmd(ctx, false, "snap", "rm",

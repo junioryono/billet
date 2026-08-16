@@ -155,8 +155,22 @@ func TestReapKernelDirReportsWhatItRemoved(t *testing.T) {
 // about what "managed" means. The reaper protects this file from deletion;
 // verification records it as a generation's pairing. If they disagreed, one would
 // record a name the other would happily delete.
+//
+// AGAINST A REAL FILESYSTEM, because the answer depends on resolving symlinks and
+// a path that does not exist cannot be resolved at all.
 func TestConfiguredKernelNameIdentifiesOnlyManagedKernels(t *testing.T) {
-	managed := "/var/lib/billet/kernels"
+	managed := t.TempDir()
+	elsewhere := t.TempDir()
+
+	kernel := filepath.Join(managed, "vmlinux-6.1.155-ea1d42638d13")
+	if err := os.WriteFile(kernel, []byte("kernel"), 0o644); err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+
+	outside := filepath.Join(elsewhere, "vmlinux-6.1.155-ea1d42638d13")
+	if err := os.WriteFile(outside, []byte("other"), 0o644); err != nil {
+		t.Fatalf("stage: %v", err)
+	}
 
 	withKernel := func(path string) *config.Config {
 		return &config.Config{Node: &config.NodeConfig{
@@ -164,28 +178,23 @@ func TestConfiguredKernelNameIdentifiesOnlyManagedKernels(t *testing.T) {
 		}}
 	}
 
-	got := configuredKernelName(withKernel(managed+"/vmlinux-6.1.155-ea1d42638d13"), managed)
-	if got != "vmlinux-6.1.155-ea1d42638d13" {
+	if got := configuredKernelName(withKernel(kernel), managed); got != "vmlinux-6.1.155-ea1d42638d13" {
 		t.Errorf("a kernel inside the managed directory resolved to %q", got)
 	}
 
-	// OUTSIDE THE DIRECTORY IS NOT THIS CODE'S BUSINESS, and answering with a bare
-	// base name would be actively wrong: the reaper would protect a same-named file
-	// it does manage, and verification would record a pairing every launch resolves
-	// to the wrong path.
-	for _, outside := range []string{
-		"/home/junior/fc-smoke/vmlinux-billet",
-		"/opt/other/vmlinux-6.1.155-ea1d42638d13",
-		managed + "/nested/vmlinux-6.1.155-ea1d42638d13",
-		"",
-	} {
-		if got := configuredKernelName(withKernel(outside), managed); got != "" {
-			t.Errorf("%q resolved to %q; it is not in the managed directory", outside, got)
+	// OUTSIDE IS NOT THIS CODE'S BUSINESS, and answering with a bare base name would
+	// be actively wrong: the reaper would protect a same-named file it does manage,
+	// and verification would record a pairing every launch resolves elsewhere. Note
+	// this file has the SAME NAME as the managed one, which is the case a base-name
+	// comparison gets wrong.
+	for _, other := range []string{outside, "", filepath.Join(managed, "missing")} {
+		if got := configuredKernelName(withKernel(other), managed); got != "" {
+			t.Errorf("%q resolved to %q; it is not a kernel in the managed directory", other, got)
 		}
 	}
 
-	// A NODE WITH NO FIRECRACKER SECTION AT ALL must not panic; a server-only
-	// config reaches the reaper through the same command.
+	// A NODE WITH NO FIRECRACKER SECTION must not panic; a server-only config reaches
+	// the reaper through the same command.
 	if got := configuredKernelName(&config.Config{}, managed); got != "" {
 		t.Errorf("a config with no node section resolved to %q", got)
 	}
@@ -195,16 +204,59 @@ func TestConfiguredKernelNameIdentifiesOnlyManagedKernels(t *testing.T) {
 	}
 }
 
-// PATHS ARE COMPARED AFTER RESOLUTION, so a trailing slash or a relative segment
-// in either the configured path or the directory still matches.
+// A SYMLINK IS RESOLVED TO WHAT IT POINTS AT, which is the whole reason this uses
+// EvalSymlinks rather than Abs.
+//
+// A stable name like `current` pointing at one kernel could otherwise be recorded
+// as a generation's pairing and then retargeted -- proving kernel A and booting
+// kernel B, silently, which is precisely the mismatch the pairing exists to
+// prevent.
+func TestConfiguredKernelNameResolvesSymlinksToTheirTarget(t *testing.T) {
+	managed := t.TempDir()
+
+	target := filepath.Join(managed, "vmlinux-6.1.155-ea1d42638d13")
+	if err := os.WriteFile(target, []byte("kernel"), 0o644); err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+
+	link := filepath.Join(managed, "current")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	cfg := &config.Config{Node: &config.NodeConfig{
+		Firecracker: &config.FirecrackerConfig{KernelImage: link},
+	}}
+
+	got := configuredKernelName(cfg, managed)
+
+	if got == "current" {
+		t.Fatal("the symlink was recorded by its own name; retargeting it later would " +
+			"prove one kernel and boot another")
+	}
+
+	if got != "vmlinux-6.1.155-ea1d42638d13" {
+		t.Errorf("resolved to %q, want the file the link points at", got)
+	}
+}
+
+// A TRAILING SLASH OR A RELATIVE SEGMENT IN EITHER PATH still matches.
 func TestConfiguredKernelNameResolvesBothSides(t *testing.T) {
+	managed := t.TempDir()
+
+	kernel := filepath.Join(managed, "vmlinux-6.1.155-ea1d42638d13")
+	if err := os.WriteFile(kernel, []byte("kernel"), 0o644); err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+
 	cfg := &config.Config{Node: &config.NodeConfig{
 		Firecracker: &config.FirecrackerConfig{
-			KernelImage: "/var/lib/billet/kernels/../kernels/vmlinux-6.1.155-ea1d42638d13",
+			KernelImage: filepath.Join(managed, "..", filepath.Base(managed),
+				"vmlinux-6.1.155-ea1d42638d13"),
 		},
 	}}
 
-	if got := configuredKernelName(cfg, "/var/lib/billet/kernels/"); got != "vmlinux-6.1.155-ea1d42638d13" {
+	if got := configuredKernelName(cfg, managed+"/"); got != "vmlinux-6.1.155-ea1d42638d13" {
 		t.Errorf("a path with a relative segment resolved to %q", got)
 	}
 }
