@@ -333,3 +333,14 @@ func isNoSuchFile(err error) bool {
 
 // trimSpace is bytes.TrimSpace without the import, kept beside its one caller.
 func trimSpace(b []byte) []byte { return []byte(strings.TrimSpace(string(b))) }
+
+// GenerationGone reports whether a CloneRoot failure means the generation is no
+// longer there.
+//
+// THE STORE ANSWERS QUESTIONS ABOUT ITS OWN ERRORS, because the provider may not
+// import this package -- so a caller that needs to distinguish "that generation
+// was deleted" from "the cluster is unreachable" asks rather than matching a
+// sentinel it would have to import.
+func (c *Client) GenerationGone(err error) bool {
+	return errors.Is(err, ErrNoSuchImage)
+}

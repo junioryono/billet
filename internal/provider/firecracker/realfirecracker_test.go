@@ -291,6 +291,10 @@ func (d rbdDisk) KernelFor(_ context.Context, _, _ string) (string, bool, error)
 	return "", false, nil
 }
 
+// GenerationGone is false: this harness boots against a real cluster and does not
+// exercise the alias re-resolve.
+func (d rbdDisk) GenerationGone(error) bool { return false }
+
 // freshLease is a lease id of the shape alloc mints, unique per run so a previous
 // failed run's leftovers cannot be mistaken for this one's.
 func freshLease(t *testing.T) string {

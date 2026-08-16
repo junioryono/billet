@@ -88,6 +88,14 @@ type RootDisk interface {
 	// build-guest-image.sh record no kernel, because that script installs none and
 	// genuinely does not know which will be used.
 	KernelFor(ctx context.Context, image, generation string) (string, bool, error)
+	// GenerationGone reports whether a CloneRoot failure means the generation is no
+	// longer there.
+	//
+	// A METHOD RATHER THAN A SENTINEL THIS PACKAGE IMPORTS, because the provider may
+	// not import the store -- depguard enforces it, and the reason is that either
+	// direction makes one of them unsubstitutable. The store knows what its own
+	// errors mean; this package only needs to ask.
+	GenerationGone(err error) bool
 }
 
 // Provider launches one Firecracker microVM per job.
@@ -363,6 +371,12 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*Instance, e
 		return nil, errors.Join(err, j.remove())
 	}
 
+	// KEPT SO A VANISHED GENERATION CAN BE RE-RESOLVED. A tier naming `@verified` is
+	// asking for "whichever is newest and proved", and if that one is deleted
+	// between resolving it and cloning it, the right answer is the next one -- not a
+	// failed job.
+	requested := spec.Image
+
 	// RESOLVED HERE, SO EVERYTHING AFTER IT NAMES ONE GENERATION. A tier may say
 	// `@verified`, which means "the newest one proved to boot" — a moving target by
 	// design. Passing that through would leave the launch log, and therefore any
@@ -385,7 +399,7 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*Instance, e
 		return nil, errors.Join(err, j.remove())
 	}
 
-	device, err := p.disk.CloneRoot(ctx, spec.Image, spec.Name)
+	device, err := p.cloneResolved(ctx, requested, &spec)
 	if err != nil {
 		// A CLONE ERROR DOES NOT PROVE NO CLONE EXISTS. `rbd clone` can be killed by
 		// a cancelled context after the cluster has already created the image, and
@@ -1548,4 +1562,77 @@ func (p *Provider) kernelFor(ctx context.Context, image string) (string, error) 
 	}
 
 	return kernel, nil
+}
+
+// VerifiedAlias is the reference a tier uses to mean "the newest proved one".
+//
+// SPELLED HERE RATHER THAN IMPORTED, because the provider may not import the
+// store. A test asserts the two agree, since a drift would make every alias look
+// like a pinned generation and quietly disable the re-resolve below.
+const VerifiedAlias = "verified"
+
+// aliasResolveAttempts bounds the re-resolve loop.
+//
+// SMALL, BECAUSE THE THING IT SURVIVES IS A RACE AND NOT AN OUTAGE. A reap
+// removing several generations at once could invalidate two answers in a row; one
+// removing every generation is not a race this should paper over, and the second
+// failure should be reported rather than retried into a loop nobody bounded.
+const aliasResolveAttempts = 3
+
+// cloneResolved clones the resolved generation, re-resolving if it vanishes.
+//
+// THE WINDOW THIS CLOSES. `@verified` is resolved, then cloned; a reap landing
+// between those two deletes the generation that was just chosen. Without this the
+// job fails on a missing snapshot -- and the message names the snapshot rather
+// than the alias that chose it, which is what makes it hard to read.
+//
+// HOLDING THE PUBLISH LOCK ACROSS THE PAIR WOULD BE WORSE. That lock is held for
+// the length of a publish, which writes gigabytes, so every launch would queue
+// behind image builds. A launch is on the path to starting somebody's job; a
+// publish is not.
+//
+// A REFERENCE THAT NAMED A GENERATION IS NOT RETRIED. It asked for one exact
+// thing, and answering with a different one is precisely what naming a generation
+// exists to prevent.
+func (p *Provider) cloneResolved(
+	ctx context.Context,
+	requested string,
+	spec *provider.Spec,
+) (string, error) {
+	for attempt := 1; ; attempt++ {
+		device, err := p.disk.CloneRoot(ctx, spec.Image, spec.Name)
+		if err == nil {
+			return device, nil
+		}
+
+		if !p.disk.GenerationGone(err) || !isAlias(requested) || attempt >= aliasResolveAttempts {
+			return "", err
+		}
+
+		resolved, resolveErr := p.disk.ResolveGeneration(ctx, requested)
+		if resolveErr != nil {
+			// THE ORIGINAL FAILURE IS THE HEADLINE. Failing to re-resolve is a
+			// consequence of the generation being gone, not a separate problem.
+			return "", errors.Join(err, resolveErr)
+		}
+
+		if resolved == spec.Image {
+			// THE SAME ANSWER, SO RETRYING WOULD LOOP. The generation is gone and the
+			// alias still names it, which is a state a retry cannot improve.
+			return "", err
+		}
+
+		p.log.Warn("the generation this alias resolved to was removed before it could be "+
+			"cloned; taking the next one",
+			"requested", requested, "was", spec.Image, "now", resolved)
+
+		spec.Image = resolved
+	}
+}
+
+// isAlias reports whether a tier's image reference names a moving target.
+func isAlias(image string) bool {
+	_, generation, found := strings.Cut(image, "@")
+
+	return !found || generation == VerifiedAlias
 }

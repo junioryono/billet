@@ -191,11 +191,17 @@ type fakeDisk struct {
 	// kernel is what a generation records as its paired kernel, and kernelErr is
 	// what the lookup refuses with. An empty kernel means the generation records
 	// none, which is the ordinary case for an image built by hand.
-	kernel     string
-	kernelErr  error
-	discarded  []string
-	cloned     []string
-	discardErr error
+	kernel    string
+	kernelErr error
+
+	// cloneGone makes the next N clones fail as though the generation had been
+	// removed, which is the race the launch re-resolves around.
+	cloneGone int
+	// resolvedAfter is what ResolveGeneration answers once cloneGone has fired.
+	resolvedAfter string
+	discarded     []string
+	cloned        []string
+	discardErr    error
 	// onClone runs inside CloneRoot, so a test can observe what the host looked
 	// like at the moment the disk was cloned rather than afterwards.
 	onClone func()
@@ -231,6 +237,18 @@ func (d *fakeDisk) CloneRoot(_ context.Context, image, name string) (string, err
 		return "", d.cloneErr
 	}
 
+	// THE GENERATION WAS REMOVED BETWEEN RESOLVING IT AND CLONING IT, which is the
+	// race the launch re-resolves around.
+	if d.cloneGone > 0 {
+		d.cloneGone--
+
+		if d.resolvedAfter != "" {
+			d.resolved = d.resolvedAfter
+		}
+
+		return "", errGenerationGone
+	}
+
 	d.cloned = append(d.cloned, image+" -> "+name)
 
 	return d.device, nil
@@ -259,6 +277,11 @@ func (d *fakeDisk) KernelFor(_ context.Context, _, _ string) (string, bool, erro
 
 	return d.kernel, true, nil
 }
+
+// errGenerationGone stands in for the store's missing-snapshot error.
+var errGenerationGone = errors.New("no such image")
+
+func (d *fakeDisk) GenerationGone(err error) bool { return errors.Is(err, errGenerationGone) }
 
 // clonedFrom is the image reference the last clone was made from, which is how a
 // test tells a resolved generation from the alias that named it.
