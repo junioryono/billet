@@ -489,7 +489,7 @@ func TestDestroyRemovesEverythingAGuestLeavesBehind(t *testing.T) {
 		t.Fatalf("the jail was not built: %v", err)
 	}
 
-	if err := h.p.Destroy(t.Context(), theInstance); err != nil {
+	if _, err := h.p.Destroy(t.Context(), theInstance); err != nil {
 		t.Fatalf("Destroy: %v", err)
 	}
 
@@ -526,11 +526,11 @@ func TestDestroyingTwiceIsNotAnError(t *testing.T) {
 
 	vmm.stop()
 
-	if err := h.p.Destroy(t.Context(), theInstance); err != nil {
+	if _, err := h.p.Destroy(t.Context(), theInstance); err != nil {
 		t.Fatalf("the first Destroy: %v", err)
 	}
 
-	if err := h.p.Destroy(t.Context(), theInstance); err != nil {
+	if _, err := h.p.Destroy(t.Context(), theInstance); err != nil {
 		t.Errorf("the second Destroy: %v", err)
 	}
 }
@@ -543,11 +543,11 @@ func TestDestroyRefusesANameBilletDidNotAssign(t *testing.T) {
 
 	h := newHarness(t)
 
-	if err := h.p.Destroy(t.Context(), "somebody-elses-vm"); err == nil {
+	if _, err := h.p.Destroy(t.Context(), "somebody-elses-vm"); err == nil {
 		t.Fatal("Destroy acted on a name billet never assigned")
 	}
 
-	if err := h.p.Destroy(t.Context(), ""); err == nil {
+	if _, err := h.p.Destroy(t.Context(), ""); err == nil {
 		t.Fatal("Destroy acted on an empty id")
 	}
 }
@@ -1141,7 +1141,7 @@ func TestLaunchReturnsAnInstanceTheCallerCanActOn(t *testing.T) {
 
 	// AND THE ID IS WHAT Destroy TAKES, which is the property that makes the two
 	// composable at all.
-	if err := h.p.Destroy(t.Context(), inst.ID); err != nil {
+	if _, err := h.p.Destroy(t.Context(), inst.ID); err != nil {
 		t.Errorf("Destroy could not act on the id Launch returned: %v", err)
 	}
 }

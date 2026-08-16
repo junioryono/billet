@@ -1023,7 +1023,7 @@ func TestDestroyingSomethingAlreadyGoneIsSuccess(t *testing.T) {
 
 	p := newTestProvider(t, f, nil)
 
-	if err := p.Destroy(t.Context(), "i-0abc"); err != nil {
+	if _, err := p.Destroy(t.Context(), "i-0abc"); err != nil {
 		t.Errorf("destroying an instance that is already gone failed: %v", err)
 	}
 }
@@ -1038,8 +1038,65 @@ func TestDestroyDoesNotSwallowARealFailure(t *testing.T) {
 
 	p := newTestProvider(t, f, nil)
 
-	if err := p.Destroy(t.Context(), "i-0abc"); err == nil {
+	if _, err := p.Destroy(t.Context(), "i-0abc"); err == nil {
 		t.Error("a destroy that was refused for a reason billet cannot act on reported success")
+	}
+}
+
+// #46. A TERMINATE REQUEST IS NOT A STOPPED GUEST, and this backend must not
+// claim otherwise.
+//
+// TerminateInstances returns when the request is ACCEPTED. The instance then
+// moves through `shutting-down` for a minute or two, and this backend's own
+// runningState classifies that as a state where the job may still be executing —
+// which is exactly why List asks for it. A caller that read the accepted request
+// as proof would release the lease, and another job could start while the old
+// guest was still finishing a deploy.
+//
+// The assertion is on the Teardown, not on the error: the teardown has not
+// FAILED, so reporting an error would be wrong in the other direction — callers
+// read a destroy error as "retry this" and would keep asking AWS to terminate an
+// instance that is already terminating.
+func TestDestroyDoesNotClaimTheGuestHasStopped(t *testing.T) {
+	f := newFakeEC2(t)
+	p := newTestProvider(t, f, nil)
+
+	state, err := p.Destroy(t.Context(), "i-0abc")
+	if err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+
+	if state == provider.TeardownStopped {
+		t.Error("a terminate request AWS merely accepted was reported as a guest that has stopped; " +
+			"the lease is released on that and the guest keeps running for a minute or two")
+	}
+}
+
+// #48. NOT-FOUND IS NOT PROOF EITHER, because DescribeInstances is eventually
+// consistent and AWS documents that an id RunInstances just returned may not be
+// visible to the very next call.
+//
+// So a terminate issued shortly after a launch — destroyStray is exactly that
+// path, and the one where billet is least sure what exists — can be answered
+// NotFound for an instance that exists and is booting. Idempotent success is
+// still the right ERROR outcome (erroring turns recoverable state into stuck
+// state), but it must not be dressed up as confirmation.
+func TestDestroyDoesNotTreatNotFoundAsProofTheInstanceIsGone(t *testing.T) {
+	f := newFakeEC2(t)
+	f.respond = func(string, url.Values) (int, string) {
+		return http.StatusBadRequest, apiFailure("InvalidInstanceID.NotFound")
+	}
+
+	p := newTestProvider(t, f, nil)
+
+	state, err := p.Destroy(t.Context(), "i-0abc")
+	if err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+
+	if state == provider.TeardownStopped {
+		t.Error("an eventually-consistent NotFound was reported as proof the instance is gone; " +
+			"a destroy shortly after a launch gets that answer for an instance that is booting")
 	}
 }
 

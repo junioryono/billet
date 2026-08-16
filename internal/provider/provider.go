@@ -7,12 +7,13 @@
 // kill, network policy, volume attach and quiesce, image preparation, spot
 // interruption, capability negotiation. All of that is true and none of it is
 // here, because every one of those shapes is a guess until a second backend
-// needs it. EC2 has now landed as that second backend and forced NO change to
-// this interface — which is worth recording, because the prediction here was that
-// it would. What it did force was a distinction this interface still does not
-// make: its Destroy returns when the request is accepted rather than when the
-// compute has stopped (#46), and the callers assume the latter. Firecracker,
-// which attaches block devices, is the next one likely to widen this.
+// needs it. EC2 landed as that second backend and appeared to force NO change to
+// this interface. That reading was wrong rather than merely early: it did force
+// one, and Destroy carries it now. A teardown that has been REQUESTED is not a
+// guest that has STOPPED (#46), and every caller assumed the latter because the
+// only backend in existence when they were written could promise it. The
+// prediction that a second backend would widen this was right; what was wrong
+// was concluding otherwise before anything had ever run on it.
 //
 // What IS here is the part every backend must agree on: launch one instance for
 // one job, destroy it, and never let the credential reach a place it can be
@@ -201,6 +202,51 @@ func LeaseOf(instanceName string) (string, bool) {
 	return instanceName[len(prefix):], true
 }
 
+// Teardown says how far a Destroy actually got.
+//
+// THE DISTINCTION EXISTS BECAUSE ONE BACKEND CANNOT MAKE THE PROMISE THE OTHERS
+// CAN. `docker rm --force` returns when the container is gone, so its caller may
+// treat a successful Destroy as proof. EC2's TerminateInstances returns when the
+// request is ACCEPTED — the guest keeps running for a minute or two while the
+// instance moves through `shutting-down`, which billet's own runningState
+// classifies as a state where the job may still be executing.
+//
+// Callers used to read every Destroy the docker way, and the consequence was not
+// money (#46). Destroy is reached on paths where the guest is still working — a
+// drain, a custody teardown, an operator killing a job — and the listener
+// releases the lease on success. So a new job could start while the old guest was
+// still finishing a deploy or a migration: two concurrent effects on something
+// outside billet, which is worse than the over-commit the destroy-then-release
+// ordering was written to prevent, and not bounded by anything.
+//
+// THE ZERO VALUE IS THE SAFE ONE, deliberately, exactly as TrustClass's is. A
+// backend that forgets to say, or a new one written against this interface
+// without reading it, reports "I could not prove it stopped" — and the caller
+// holds the capacity until something else proves it. The opposite default frees
+// capacity for a guest that is still running, and nothing recovers from that.
+type Teardown int
+
+const (
+	// TeardownRequested means the backend accepted the request and the compute
+	// may still be running. The capacity stays charged until something else —
+	// a Find that misses, a List that no longer reports it — proves otherwise.
+	TeardownRequested Teardown = iota
+	// TeardownStopped means the compute is CONFIRMED gone. Only a backend whose
+	// teardown is synchronous may return this.
+	TeardownStopped
+)
+
+func (t Teardown) String() string {
+	switch t {
+	case TeardownStopped:
+		return "stopped"
+	case TeardownRequested:
+		return "requested"
+	default:
+		return "requested"
+	}
+}
+
 // Provider launches and destroys the compute for one job at a time.
 type Provider interface {
 	// Accepts reports whether this backend may run work of that trust class.
@@ -248,5 +294,11 @@ type Provider interface {
 	// MUST be idempotent: destroying an id that is already gone is success, not
 	// an error. Teardown runs on paths that have already failed once, and an
 	// error there turns a recoverable state into a stuck one.
-	Destroy(ctx context.Context, id string) error
+	//
+	// The Teardown says whether the compute is CONFIRMED gone or merely asked to
+	// go, and the two are not the same fact — see Teardown. A backend must not
+	// report TeardownStopped on the strength of an API accepting the request, and
+	// must not report it on the strength of an absence its own service is allowed
+	// to be wrong about (#48).
+	Destroy(ctx context.Context, id string) (Teardown, error)
 }

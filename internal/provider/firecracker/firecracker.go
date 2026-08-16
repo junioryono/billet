@@ -907,7 +907,20 @@ const vmmLogLines = 3
 // step tolerates its subject being absent, and the errors are joined rather than
 // returned at the first one — stopping early would leave a mapped device behind
 // because a directory was already gone.
-func (p *Provider) Destroy(ctx context.Context, id string) error {
+//
+// CONFIRMING, and the reason is stopVMM below: nothing proceeds until the VMM is
+// stopped, so a Destroy that returns nil has already established the guest is not
+// executing. That is the same promise docker makes and the one EC2 cannot (#46) —
+// so a success here may be read as proof, and a failure may not.
+func (p *Provider) Destroy(ctx context.Context, id string) (provider.Teardown, error) {
+	if err := p.destroy(ctx, id); err != nil {
+		return provider.TeardownRequested, err
+	}
+
+	return provider.TeardownStopped, nil
+}
+
+func (p *Provider) destroy(ctx context.Context, id string) error {
 	if id == "" {
 		return errors.New("firecracker: destroy needs a microVM id")
 	}

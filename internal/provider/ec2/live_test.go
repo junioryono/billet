@@ -153,7 +153,7 @@ func TestLiveSmoke(t *testing.T) {
 			}
 
 			if err == nil && ok {
-				if err = p.Destroy(clean, found.ID); err == nil {
+				if _, err = p.Destroy(clean, found.ID); err == nil {
 					return
 				}
 			}
@@ -262,14 +262,21 @@ func TestLiveSmoke(t *testing.T) {
 		}
 	}
 
-	// 4. DESTROY, and what it means. This is #46: billet treats a successful
-	// Destroy as proof the compute is gone before releasing the lease.
+	// 4. DESTROY, and what it means. This is #46, and it is now the assertion
+	// rather than the finding: this backend must report the teardown as REQUESTED,
+	// because that is all TerminateInstances establishes.
 	t.Log("=== 4. what is true at the moment Destroy returns? (#46) ===")
 
 	start := time.Now()
 
-	if err := p.Destroy(ctx, inst.ID); err != nil {
+	state, err := p.Destroy(ctx, inst.ID)
+	if err != nil {
 		t.Fatalf("Destroy: %v", err)
+	}
+
+	if state == provider.TeardownStopped {
+		t.Error("    Destroy claimed the guest had STOPPED on the strength of an accepted " +
+			"terminate request; the measurement below is how long that claim is false for")
 	}
 
 	t.Logf("    Destroy returned after %s", time.Since(start).Round(time.Millisecond))
@@ -340,7 +347,7 @@ func TestLiveSmoke(t *testing.T) {
 	// 5. DESTROY IS IDEMPOTENT, which the listener relies on across retries.
 	t.Log("=== 5. is a second Destroy safe? ===")
 
-	if err := p.Destroy(ctx, inst.ID); err != nil {
+	if _, err := p.Destroy(ctx, inst.ID); err != nil {
 		t.Errorf("    second Destroy returned an error, so a retry would read as "+
 			"'the compute may still exist': %v", err)
 	} else {

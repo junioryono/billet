@@ -119,7 +119,7 @@ func TestDestroyIsIdempotent(t *testing.T) {
 
 	p := New("billet-test")
 
-	if err := p.Destroy(t.Context(), "billet-nonexistent-container-name"); err != nil {
+	if _, err := p.Destroy(t.Context(), "billet-nonexistent-container-name"); err != nil {
 		t.Errorf("destroying a container that does not exist reported an error: %v", err)
 	}
 }

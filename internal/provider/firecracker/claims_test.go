@@ -230,7 +230,7 @@ func TestADeviceNameIsHeldUntilTheDeviceIsActuallyGone(t *testing.T) {
 	}
 	h.mu.Unlock()
 
-	if err := h.p.Destroy(t.Context(), inst.Name); err == nil {
+	if _, err := h.p.Destroy(t.Context(), inst.Name); err == nil {
 		t.Fatal("Destroy reported success though it could not remove the network device")
 	}
 

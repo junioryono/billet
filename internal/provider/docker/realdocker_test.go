@@ -54,7 +54,7 @@ func TestRealDockerLaunchAndDestroy(t *testing.T) {
 	t.Cleanup(func() {
 		// WithoutCancel: the test context is already done by the time cleanup
 		// runs, and a cleanup that cannot run leaves a container behind.
-		if err := p.Destroy(context.WithoutCancel(t.Context()), inst.ID); err != nil {
+		if _, err := p.Destroy(context.WithoutCancel(t.Context()), inst.ID); err != nil {
 			t.Logf("cleanup: %v", err)
 		}
 	})
@@ -82,12 +82,12 @@ func TestRealDockerLaunchAndDestroy(t *testing.T) {
 		t.Errorf("owner label is %q; orphans could not be found after a crash", label)
 	}
 
-	if err := p.Destroy(t.Context(), inst.ID); err != nil {
+	if _, err := p.Destroy(t.Context(), inst.ID); err != nil {
 		t.Fatalf("Destroy: %v", err)
 	}
 
 	// Gone, and destroying again is still success.
-	if err := p.Destroy(t.Context(), inst.ID); err != nil {
+	if _, err := p.Destroy(t.Context(), inst.ID); err != nil {
 		t.Errorf("second Destroy reported an error: %v", err)
 	}
 }

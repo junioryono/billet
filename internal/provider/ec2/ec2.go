@@ -1095,9 +1095,9 @@ func shellCommand(argv []string) (string, error) {
 // `shutting-down` is one of the states List asks for. That does not un-release
 // the lease, which is already terminal; it means the sweep sees the instance,
 // calls Destroy again, and finds it idempotent.
-func (p *Provider) Destroy(ctx context.Context, id string) error {
+func (p *Provider) Destroy(ctx context.Context, id string) (provider.Teardown, error) {
 	if id == "" {
-		return errors.New("ec2: destroy needs an instance id")
+		return provider.TeardownRequested, errors.New("ec2: destroy needs an instance id")
 	}
 
 	params := url.Values{}
@@ -1109,11 +1109,30 @@ func (p *Provider) Destroy(ctx context.Context, id string) error {
 		// already gone is the idempotent case, and it is the one thing here that
 		// must not be reported as a failure — a caller reads a destroy error as
 		// "the compute may still exist" and keeps holding the capacity.
+		// NOT AN ERROR, AND NOT PROOF EITHER — the two are separate answers and
+		// this used to give only one of them (#48).
+		//
+		// Not an error, because a caller reads a destroy error as "the compute may
+		// still exist, retry this", and retrying a terminate against an id AWS has
+		// forgotten accomplishes nothing forever.
+		//
+		// Not proof, because DescribeInstances is EVENTUALLY CONSISTENT: AWS
+		// documents that an instance id returned by RunInstances may not be visible
+		// to a subsequent call for a short time. A terminate issued shortly after a
+		// launch can therefore be answered NotFound for an instance that exists and
+		// is booting — and destroyStray, the cleanup after an ambiguous launch
+		// failure, is exactly that path and the one where billet is least sure what
+		// exists. Reading this as "already gone" released the lease while the
+		// machine came up and ran.
+		//
+		// The caller holds the capacity and finds out from List, which is
+		// authoritative in the direction that matters: an instance it does not
+		// report over a sustained window is one that is not there.
 		if code, ok := codeOf(err); ok && code == "InvalidInstanceID.NotFound" {
-			return nil
+			return provider.TeardownRequested, nil
 		}
 
-		return fmt.Errorf("ec2: destroy %s: %w", id, err)
+		return provider.TeardownRequested, fmt.Errorf("ec2: destroy %s: %w", id, err)
 	}
 
 	// "REQUESTED", because that is what happened. Logging "terminated" here is the
@@ -1121,7 +1140,10 @@ func (p *Provider) Destroy(ctx context.Context, id string) error {
 	// still running for a minute or two afterwards.
 	p.log.Info("requested instance termination", "instance", id)
 
-	return nil
+	// AND THE RETURN NOW SAYS SO TOO. The log line has been honest about this
+	// since the backend landed while the return value was not, and a caller reads
+	// the return.
+	return provider.TeardownRequested, nil
 }
 
 // Find reports the instance with that name, and whether there was one.

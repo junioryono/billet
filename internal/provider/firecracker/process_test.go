@@ -135,7 +135,7 @@ func TestDestroySignalsTheVMMItself(t *testing.T) {
 		t.Fatal("no stand-in vmm was started")
 	}
 
-	if err := h.p.Destroy(t.Context(), theInstance); err != nil {
+	if _, err := h.p.Destroy(t.Context(), theInstance); err != nil {
 		t.Fatalf("Destroy: %v", err)
 	}
 
@@ -164,7 +164,7 @@ func TestAPidFileThatIsNotAPidStopsTeardown(t *testing.T) {
 		t.Fatalf("stage a corrupt pid file: %v", err)
 	}
 
-	if err := h.p.Destroy(t.Context(), theInstance); err == nil {
+	if _, err := h.p.Destroy(t.Context(), theInstance); err == nil {
 		t.Error("Destroy proceeded although it could not tell whether the vmm was running")
 	}
 }
@@ -186,7 +186,7 @@ func TestAJailWithNoVMMBehindItHasNothingToStop(t *testing.T) {
 		t.Fatalf("claim: %v", err)
 	}
 
-	if err := h.p.Destroy(t.Context(), theInstance); err != nil {
+	if _, err := h.p.Destroy(t.Context(), theInstance); err != nil {
 		t.Errorf("Destroy refused a jail with no vmm behind it: %v", err)
 	}
 }
@@ -210,7 +210,7 @@ func TestASocketWithNoPidFileIsNotReadAsStopped(t *testing.T) {
 		t.Fatalf("remove the pid file: %v", err)
 	}
 
-	err := h.p.Destroy(t.Context(), theInstance)
+	_, err := h.p.Destroy(t.Context(), theInstance)
 	if err == nil {
 		t.Fatal("Destroy treated a vmm it could not account for as already stopped")
 	}

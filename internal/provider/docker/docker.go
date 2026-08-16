@@ -221,9 +221,16 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*provider.In
 // Idempotent: an id that is already gone is success. Teardown runs on paths that
 // have already failed once, and erroring there turns recoverable state into
 // stuck state.
-func (p *Provider) Destroy(ctx context.Context, id string) error {
+//
+// CONFIRMING, which is a promise most backends cannot make and this one can:
+// `docker rm --force` kills the container and removes it before it returns, so
+// by the time this reports success there is nothing left running. EC2 cannot say
+// the same (#46), which is why the return distinguishes them at all — and why
+// the confirmation here is worth stating rather than left to be assumed by a
+// caller that has no way to check.
+func (p *Provider) Destroy(ctx context.Context, id string) (provider.Teardown, error) {
 	if id == "" {
-		return errors.New("docker: destroy needs a container id")
+		return provider.TeardownRequested, errors.New("docker: destroy needs a container id")
 	}
 
 	// --force kills it if running; --volumes takes the anonymous volumes with
@@ -232,7 +239,7 @@ func (p *Provider) Destroy(ctx context.Context, id string) error {
 	if err == nil {
 		p.log.Info("destroyed container", "container", short(id))
 
-		return nil
+		return provider.TeardownStopped, nil
 	}
 
 	// "Already gone" is the idempotent case and the CLI reports it as a failure,
@@ -245,11 +252,15 @@ func (p *Provider) Destroy(ctx context.Context, id string) error {
 	// that phrases it a third way fails LOUDLY, which is the right direction to
 	// be wrong in — a swallowed teardown failure is a container nobody knows is
 	// running.
+	// ALSO CONFIRMING. Unlike EC2's InvalidInstanceID.NotFound (#48), which comes
+	// from an eventually-consistent control plane that may be describing an
+	// instance it has simply not seen yet, the docker daemon is authoritative
+	// about its own containers: "no such container" means there is not one.
 	if isAlreadyGone(err) {
-		return nil
+		return provider.TeardownStopped, nil
 	}
 
-	return fmt.Errorf("docker: destroy %s: %w", short(id), err)
+	return provider.TeardownRequested, fmt.Errorf("docker: destroy %s: %w", short(id), err)
 }
 
 // Find reports the container with that name, and whether there was one.

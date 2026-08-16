@@ -1423,15 +1423,41 @@ func (l *Listener) destroyAll(ctx context.Context) map[int64]bool {
 
 			err := l.runner.Destroy(ctx, requestID)
 
+			// CUSTODY DISCHARGES THE OBLIGATION RATHER THAN FAILING IT (#46).
+			//
+			// The node asked its backend to stop the guest, the backend accepted,
+			// and the node is holding the lease until the compute is provably gone.
+			// Nothing here can improve on that: retrying re-issues a terminate
+			// against a guest already shutting down, and keeping the entry — lease
+			// and all — has this listener releasing capacity the node's janitor is
+			// about to release itself.
+			//
+			// Counted as done for exactly that reason. It is not a confirmed
+			// destroy, but it IS a request that no longer needs anything from this
+			// listener, which is what the caller reads this map for.
+			held := errors.Is(err, ErrCustody)
+
 			mu.Lock()
-			done[requestID] = err == nil
+			done[requestID] = err == nil || held
 			mu.Unlock()
 
-			if err != nil {
+			if err != nil && !held {
 				l.log.Error("could not destroy the compute for a job before stopping; it is "+
 					"still running on its host, and if no lease accounts for it nothing will "+
 					"reclaim it until that host is swept or restarted",
 					"tier", l.tier, "request", requestID, "error", err)
+
+				return
+			}
+
+			if held {
+				l.log.Info("the compute for this job was asked to stop and has not been "+
+					"confirmed gone; the runner is holding its capacity until it is",
+					"tier", l.tier, "request", requestID)
+
+				l.mu.Lock()
+				delete(l.cleanup, requestID)
+				l.mu.Unlock()
 
 				return
 			}
@@ -2414,6 +2440,35 @@ func (l *Listener) complete(ctx context.Context, job Job) {
 	before := l.leaseFor(job.RequestID)
 
 	if err := l.runner.Destroy(ctx, job.RequestID); err != nil {
+		// THE RUNNER IS HOLDING IT, SO THIS LISTENER LETS GO (#46).
+		//
+		// A backend whose teardown is asynchronous — EC2's terminate returns when
+		// the request is ACCEPTED, and the guest runs on through `shutting-down`
+		// for a minute or two — cannot answer this call with proof. The node takes
+		// the lease into its own janitor instead, keeps heartbeating it, and
+		// releases it once the compute is provably gone.
+		//
+		// So there is nothing here to release and nothing to retry. Recording a
+		// cleanup obligation would re-issue a terminate on every pass for the life
+		// of the process, against a guest already on its way out, and keeping the
+		// lease in `running` would have two parties heartbeating one lease.
+		//
+		// The request id is given up either way: GitHub has been told this job is
+		// finished, and a redelivered completion must not find this listener still
+		// claiming the job.
+		if errors.Is(err, ErrCustody) {
+			l.log.Info("the compute for a finished job was asked to stop and has not been "+
+				"confirmed gone; the runner is holding its capacity until it is",
+				"tier", l.tier, "request", job.RequestID)
+
+			l.mu.Lock()
+			delete(l.running, job.RequestID)
+			delete(l.cleanup, job.RequestID)
+			l.mu.Unlock()
+
+			return
+		}
+
 		// NOT released, and NOT fatal. Two separate decisions.
 		//
 		// Not released, because the compute may still be running and freeing the

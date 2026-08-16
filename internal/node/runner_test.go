@@ -13,6 +13,7 @@ import (
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/provider"
+	"github.com/junioryono/billet/internal/server"
 	"github.com/junioryono/billet/internal/state"
 )
 
@@ -191,6 +192,142 @@ func TestDestroyRemovesWhatWasStarted(t *testing.T) {
 	}
 }
 
+// #46. A TEARDOWN THAT WAS MERELY ACCEPTED DOES NOT RELEASE THE CAPACITY.
+//
+// The listener releases a lease when Destroy returns nil, and its comment says
+// why the order is destroy-then-release: freeing first would hand the capacity to
+// another tier while this job's guest is still running on the host. That
+// reasoning is sound and it silently assumed a synchronous backend. EC2's
+// terminate returns on ACCEPTANCE, so "Destroy returned nil" stopped meaning
+// "the guest has stopped" the day that backend landed.
+//
+// What makes it worse than an over-commit is the paths Destroy is reached on — a
+// drain, a custody teardown, an operator killing a job — where the guest is still
+// working. A new job for the same repository could then start while the old one
+// was still finishing a deploy or applying a migration. Two concurrent effects on
+// something outside billet, bounded by nothing.
+//
+// So the node answers ErrCustody, which already means exactly this: I am holding
+// this lease's capacity and will release it when the compute is provably gone.
+func TestAnAcceptedTeardownHoldsTheCapacityUntilTheComputeIsProvablyGone(t *testing.T) {
+	p := &fakeProvider{kind: config.ProviderDocker, asyncTeardown: true}
+
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
+
+	lease := assignedLease(t, a)
+
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	err := r.Destroy(t.Context(), 11)
+	if !errors.Is(err, server.ErrCustody) {
+		t.Fatalf("Destroy answered %v; a teardown the backend only ACCEPTED must answer "+
+			"ErrCustody, or the listener releases the lease and another job starts while "+
+			"this guest is still running", err)
+	}
+
+	// THE TERMINATE WAS STILL ISSUED. Holding the capacity is not a substitute for
+	// asking the backend to stop; a version of this that took custody without
+	// destroying would hold the lease forever against a guest nobody had told to
+	// go.
+	if len(p.destroyed) != 1 {
+		t.Fatalf("issued %d terminate requests, want 1", len(p.destroyed))
+	}
+
+	// AND THE CAPACITY IS STILL CHARGED. This is the assertion the whole issue is
+	// about: the lease must not be terminal while the guest may still be working.
+	held, err := a.Lease(t.Context(), lease.ID)
+	if err != nil {
+		t.Fatalf("read the lease after an accepted teardown: %v", err)
+	}
+
+	if held.Phase.Terminal() {
+		t.Fatalf("the lease went terminal at phase %s while the guest was still running; "+
+			"its capacity is now available to another tier", held.Phase)
+	}
+
+	// A tend while the guest is still shutting down changes nothing: the instance
+	// is still there, so there is still nothing to prove.
+	if err := r.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend while the guest was still shutting down: %v", err)
+	}
+
+	switch held, err = a.Lease(t.Context(), lease.ID); {
+	case errors.Is(err, alloc.ErrLeaseNotFound), err == nil && held.Phase.Terminal():
+		t.Fatal("a tend released the capacity while the backend was still reporting the " +
+			"instance; the guest is shutting down and another tier can now take its slot")
+	case err != nil:
+		t.Fatalf("read the lease after a tend: %v", err)
+	}
+
+	// The guest finally stops. NOW the capacity comes back, and only now.
+	p.settle(provider.InstanceName(lease.ID))
+
+	if err := r.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend after the guest stopped: %v", err)
+	}
+
+	switch held, err = a.Lease(t.Context(), lease.ID); {
+	case errors.Is(err, alloc.ErrLeaseNotFound):
+		// Terminalized and gone from the open set, which is the outcome wanted.
+	case err != nil:
+		t.Fatalf("read the lease after the guest stopped: %v", err)
+	case !held.Phase.Terminal():
+		t.Errorf("the guest is provably gone and the lease is still at %s; its capacity is "+
+			"held for compute that no longer exists", held.Phase)
+	}
+}
+
+// AND IT IS RECORDED AS A JOB THAT FINISHED, not as one that failed.
+//
+// custody's other discard path is a launch that never started, which is a
+// failure — and reusing it wholesale would write "failed" into the durable
+// history for every job that completed normally on an EC2 host. An investigation
+// reading job_history would see a fleet where nothing ever succeeded.
+func TestAnAcceptedTeardownRecordsTheJobAsDone(t *testing.T) {
+	p := &fakeProvider{kind: config.ProviderDocker, asyncTeardown: true}
+
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
+
+	lease := assignedLease(t, a)
+
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	if err := r.Destroy(t.Context(), 11); !errors.Is(err, server.ErrCustody) {
+		t.Fatalf("Destroy: %v", err)
+	}
+
+	// A TEND WHILE IT IS STILL SHUTTING DOWN COMES FIRST, because that is the real
+	// sequence and because it is load-bearing: an entry whose instance has never
+	// been seen holds its absence for strayGrace before believing it (#48), so
+	// settling before any observation would test the grace rather than the
+	// outcome.
+	if err := r.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend while the guest was shutting down: %v", err)
+	}
+
+	p.settle(provider.InstanceName(lease.ID))
+
+	if err := r.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend after the guest stopped: %v", err)
+	}
+
+	outcome, err := a.HistoryOutcome(t.Context(), lease.ID)
+	if err != nil {
+		t.Fatalf("nothing was archived for a lease whose compute is gone: %v", err)
+	}
+
+	if outcome == string(alloc.PhaseFailed) {
+		t.Error("a job that ran to completion on an asynchronous backend was archived as " +
+			"failed, because its teardown reused the path built for a launch that never started")
+	}
+}
+
 // An instance that will not die stays tracked.
 //
 // Forgetting it is how it becomes an orphan nobody can find by request id — and
@@ -292,6 +429,12 @@ type fakeProvider struct {
 	launched   []provider.Spec
 	destroyed  []string
 	destroyErr error
+
+	// asyncTeardown models EC2 rather than docker: Destroy is ACCEPTED and the
+	// instance keeps existing until settle is called. This is the shape #46 is
+	// about, and no other fake in this suite has it — every one of them destroys
+	// synchronously, which is why the gap survived so long.
+	asyncTeardown bool
 
 	// live is what the backend is actually running, keyed by name. A map rather
 	// than a counter because Find and List have to agree with Launch and Destroy:
@@ -444,16 +587,26 @@ func (f *fakeProvider) List(ctx context.Context) ([]*provider.Instance, error) {
 	return out, nil
 }
 
-func (f *fakeProvider) Destroy(ctx context.Context, id string) error {
+func (f *fakeProvider) Destroy(ctx context.Context, id string) (provider.Teardown, error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return provider.TeardownRequested, err
 	}
 
 	if f.destroyErr != nil {
-		return f.destroyErr
+		return provider.TeardownRequested, f.destroyErr
 	}
 
 	f.destroyed = append(f.destroyed, id)
+
+	// AN ASYNCHRONOUS BACKEND LEAVES THE INSTANCE EXACTLY WHERE IT WAS, which is
+	// the whole point of modelling one: EC2's TerminateInstances returns on
+	// acceptance and the guest keeps running through `shutting-down` — a state
+	// List reports as running on purpose. A fake that deleted the instance here
+	// and merely returned a different enum would agree with the bug, because
+	// every later observation would say "gone" no matter what the code believed.
+	if f.asyncTeardown {
+		return provider.TeardownRequested, nil
+	}
 
 	for name, inst := range f.live {
 		if inst.ID == id {
@@ -461,8 +614,15 @@ func (f *fakeProvider) Destroy(ctx context.Context, id string) error {
 		}
 	}
 
-	return nil
+	return provider.TeardownStopped, nil
 }
+
+// settle is the guest finally stopping, some time after the terminate request
+// was accepted. Named rather than by id, because that is what a test holds: the
+// name is derived from the lease and the id is the backend's own.
+//
+// Only meaningful with asyncTeardown.
+func (f *fakeProvider) settle(name string) { delete(f.live, name) }
 
 // stop marks an instance finished without removing it, which is what a
 // container that ran its job and exited looks like: still there, still holding
@@ -1322,7 +1482,7 @@ func TestASweepReportsAnEmptyInventory(t *testing.T) {
 	}
 
 	for _, inst := range running {
-		if err := p.Destroy(t.Context(), inst.ID); err != nil {
+		if _, err := p.Destroy(t.Context(), inst.ID); err != nil {
 			t.Fatalf("destroy: %v", err)
 		}
 	}

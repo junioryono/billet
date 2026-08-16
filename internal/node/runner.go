@@ -424,16 +424,60 @@ func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
 		return nil
 	}
 
-	if err := r.provider.Destroy(ctx, inst.ID); err != nil {
+	state, err := r.provider.Destroy(ctx, inst.ID)
+	if err != nil {
 		// KEPT in the map. The instance may still be running, and forgetting it
 		// here is how it becomes an orphan nobody can find by request id.
 		return fmt.Errorf("node: stop %s for request %d: %w", inst.Name, requestID, err)
 	}
 
 	r.mu.Lock()
+	lease := r.runningLease[requestID]
 	delete(r.running, requestID)
 	delete(r.runningLease, requestID)
 	r.mu.Unlock()
+
+	// THE BACKEND ACCEPTED THE REQUEST; IT DID NOT SAY THE GUEST HAD STOPPED (#46).
+	//
+	// The caller is a listener that releases the lease the moment this returns
+	// nil, and its own comment explains why it destroys first: freeing the
+	// capacity while a guest is still on the host over-commits the machine. That
+	// reasoning was written against a backend whose teardown is synchronous.
+	// EC2's is not — TerminateInstances returns on acceptance and the instance
+	// runs on through `shutting-down` for a minute or two.
+	//
+	// And Destroy is reached on paths where the guest is genuinely still working:
+	// a drain, a custody teardown, an operator killing a job. So the failure is
+	// not a bigger bill, it is a second job starting for the same repository while
+	// the first is still finishing a deploy.
+	//
+	// Custody is the machinery for precisely this and it already exists: hold the
+	// lease, keep heartbeating it so the reaper leaves it alone, look again every
+	// tick, and release only once the compute is provably gone. ErrCustody is how
+	// the listener is told to stand down — the same answer an ambiguous launch
+	// gives, for the same reason.
+	if state != provider.TeardownStopped {
+		if lease == nil {
+			// NOTHING TO HOLD THE CAPACITY WITH. The lease reference is written
+			// beside the instance at launch, so this means an incarnation that did
+			// not launch this job is destroying it — its capacity belongs to
+			// whoever does hold the lease, and the sweep will find the instance.
+			r.log.Warn("a teardown was accepted rather than confirmed and there is no lease "+
+				"here to hold the capacity with; the next sweep will account for it",
+				"name", inst.Name, "request", requestID)
+
+			return nil
+		}
+
+		r.holdWithOutcome(lease, inst.Name, requestID, alloc.PhaseDone)
+
+		r.log.Info("the backend accepted the teardown but did not confirm the guest had stopped; "+
+			"holding the capacity until it is provably gone",
+			"name", inst.Name, "lease", lease.ID, "request", requestID)
+
+		return fmt.Errorf("%w: %s was asked to stop and has not been confirmed gone",
+			server.ErrCustody, inst.Name)
+	}
 
 	return nil
 }
@@ -468,8 +512,20 @@ func (r *Runner) destroyStray(ctx context.Context, name string) (bool, error) {
 	r.log.Warn("a failed launch had in fact started something; removing it",
 		"name", name, "instance", inst.ID)
 
-	if err := r.provider.Destroy(ctx, inst.ID); err != nil {
+	state, err := r.provider.Destroy(ctx, inst.ID)
+	if err != nil {
 		return false, fmt.Errorf("could not remove %s, which a failed launch had started: %w", name, err)
+	}
+
+	// THE BOOL ALREADY MEANT "CONFIRMED", which is what makes this fit without
+	// changing anything above it: the caller keeps the capacity in custody when
+	// this is false, and that is the correct treatment of a teardown the backend
+	// has only accepted (#46). It is also the right answer for #48 — this is the
+	// path most likely to be destroying an instance EC2 launched moments ago, so
+	// it is the one whose "already gone" is least trustworthy.
+	if state != provider.TeardownStopped {
+		return false, fmt.Errorf("%s was asked to stop but the backend did not confirm it had, "+
+			"so it may still be running", name)
 	}
 
 	return true, nil
@@ -573,7 +629,14 @@ func (r *Runner) Recover(ctx context.Context) error {
 		r.log.Warn("destroying an instance nothing is waiting for",
 			"name", inst.Name, "instance", inst.ID, "lease", leaseID, "running", inst.Running)
 
-		if err := r.provider.Destroy(ctx, inst.ID); err != nil {
+		// NOT COUNTED AS A FAILURE IF THE BACKEND MERELY ACCEPTED IT. The
+		// difference matters here only for the message: this instance's lease is
+		// already terminal, so its capacity is back whatever happens next, and the
+		// host stays over-committed by its size until it actually goes. Reporting
+		// that as a failed destroy would make every startup on an EC2 host refuse
+		// to admit work for something that is on its way out; the sweep sees it
+		// again in seconds and finishes the job.
+		if _, err := r.provider.Destroy(ctx, inst.ID); err != nil {
 			failed++
 
 			r.log.Error("could not destroy an instance left by an earlier run",
@@ -758,12 +821,28 @@ func (r *Runner) Sweep(ctx context.Context) error {
 		r.log.Warn("destroying an instance whose lease is gone",
 			"name", inst.Name, "instance", inst.ID, "lease", leaseID)
 
-		if err := r.provider.Destroy(ctx, inst.ID); err != nil {
+		state, err := r.provider.Destroy(ctx, inst.ID)
+		if err != nil {
 			failed++
 
 			r.log.Error("could not destroy an orphaned instance",
 				"name", inst.Name, "instance", inst.ID, "error", err)
 
+			continue
+		}
+
+		// THE RELEASE IS SKIPPED UNLESS THE GUEST IS CONFIRMED GONE (#46).
+		//
+		// The comment below is right that this lease is normally already terminal,
+		// which is what made the instance an orphan — and in that case the release
+		// does nothing and skipping it costs nothing. The case it exists for is the
+		// other one: the lease went terminal between the two reads, so this call
+		// really would be the thing that hands the capacity back. Doing that on an
+		// accepted-but-unconfirmed teardown frees the machine for another tier
+		// while the guest is still shutting down.
+		//
+		// The next sweep sees the instance again and finishes the job.
+		if state != provider.TeardownStopped {
 			continue
 		}
 
