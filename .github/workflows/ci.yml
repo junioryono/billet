@@ -121,6 +121,9 @@ jobs:
       - name: Exercise alert ownership migration and teardown
         run: make alert-lifecycle
 
+      - name: Exercise development-host check mode
+        run: make development-check-mode
+
   package-lifecycle:
     runs-on: ubuntu-latest
     timeout-minutes: 20

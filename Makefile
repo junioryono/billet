@@ -115,6 +115,10 @@ dist: ## Build the release artifacts locally, exactly as a tag would
 alert-lifecycle: ## Exercise alert ownership migration and teardown through the Ansible role
 	ANSIBLE_COLLECTIONS_PATH=$(CURDIR)/ansible_collections ansible-playbook ansible_collections/junioryono/billet/tests/alert-lifecycle.yml
 
+.PHONY: development-check-mode
+development-check-mode: ## Exercise a first Linux development-host dry run before tools exist
+	ANSIBLE_COLLECTIONS_PATH=$(CURDIR)/ansible_collections ansible-playbook --check ansible_collections/junioryono/billet/tests/development-check-mode.yml
+
 .PHONY: package-lifecycle
 package-lifecycle: dist ## Install and remove both Linux packages without losing operator state
 	scripts/test-package-lifecycle.sh
