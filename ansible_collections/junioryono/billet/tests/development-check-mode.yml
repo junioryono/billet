@@ -12,7 +12,7 @@
     billet_development_proxy_config_dir: "{{ lookup('env', 'TMPDIR') | default('/tmp', true) }}/billet-development-host-check-mode/proxy"
     billet_development_proxy_log_path: "{{ lookup('env', 'TMPDIR') | default('/tmp', true) }}/billet-development-host-check-mode/logs/caddy.log"
   pre_tasks:
-    - name: Model an interrupted package setup
+    - name: Model an interrupted package setup directory
       ansible.builtin.file:
         path: "{{ billet_development_apt_stage }}"
         state: directory
@@ -32,12 +32,45 @@
           - billet_development_proxy_files_prediction is changed
       when: ansible_facts["system"] == "Linux"
   post_tasks:
-    - name: Remove the interrupted package setup fixture
+    - name: Remove the interrupted package setup fixtures
       ansible.builtin.file:
         path: "{{ billet_development_apt_stage }}"
         state: absent
       check_mode: false
       when: ansible_facts["system"] == "Linux"
+
+- name: Verify stale repositories defer Linux package probing
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    billet_development_install_terraform: false
+  tasks:
+    - name: Model present artifacts with a stale repository
+      ansible.builtin.set_fact:
+        billet_development_deb822_support:
+          rc: 0
+        billet_development_apt_artifacts:
+          results:
+            - { stat: { exists: true } }
+            - { stat: { exists: true } }
+            - { stat: { exists: true } }
+            - { stat: { exists: true } }
+            - { stat: { exists: true } }
+            - { stat: { exists: true } }
+        billet_development_caddy_repository:
+          changed: true
+        billet_development_hashicorp_repository:
+          changed: false
+
+    - name: Exercise Linux package readiness
+      ansible.builtin.include_role:
+        name: junioryono.billet.development_host
+        tasks_from: package-readiness
+
+    - name: Require stale repository repair before package probing
+      ansible.builtin.assert:
+        that: not billet_development_linux_packages_ready
 
 - name: Verify development tool probes run in check mode
   hosts: localhost

@@ -147,17 +147,14 @@
       billet_development_hashicorp_repository is changed
   become: true
 
+- name: Decide whether Linux package metadata is ready
+  ansible.builtin.import_tasks: package-readiness.yml
+
 - name: Install Caddy and Terraform
   ansible.builtin.apt:
     name: "{{ ['caddy'] + (['terraform'] if billet_development_install_terraform else []) }}"
     state: latest
-  when: >-
-    not ansible_check_mode or
-    (billet_development_apt_artifacts.results[2].stat.exists and
-    billet_development_apt_artifacts.results[4].stat.exists and
-    (not billet_development_install_terraform or
-    (billet_development_apt_artifacts.results[3].stat.exists and
-    billet_development_apt_artifacts.results[5].stat.exists)))
+  when: billet_development_linux_packages_ready
   become: true
 
 - name: Predict first-run Linux repository and package installation
@@ -168,14 +165,10 @@
     - ansible_check_mode
     - >-
       not billet_development_apt_stage_stat.stat.exists or
-      billet_development_deb822_support.rc != 0 or
       not billet_development_apt_artifacts.results[0].stat.exists or
-      not billet_development_apt_artifacts.results[2].stat.exists or
-      not billet_development_apt_artifacts.results[4].stat.exists or
+      not billet_development_linux_packages_ready or
       (billet_development_install_terraform and
-      (not billet_development_apt_artifacts.results[1].stat.exists or
-      not billet_development_apt_artifacts.results[3].stat.exists or
-      not billet_development_apt_artifacts.results[5].stat.exists))
+      not billet_development_apt_artifacts.results[1].stat.exists)
   changed_when: true
 
 - name: Inspect installed Linux services
