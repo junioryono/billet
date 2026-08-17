@@ -11,6 +11,8 @@
 #
 # POSIX sh, not bash: this runs on whatever a fresh host happens to have.
 set -eu
+LC_ALL=C
+export LC_ALL
 
 REPO="junioryono/billet"
 BIN="billet"

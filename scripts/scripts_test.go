@@ -349,17 +349,26 @@ func TestInstallerRefusesAChecksumMismatch(t *testing.T) {
 func TestInstallerRefusesUnsafeArchiveNames(t *testing.T) {
 	t.Parallel()
 
-	run := runInstallerExpectingFailure(t, installerFixture{
-		hostOS:            "Darwin",
-		hostArch:          "arm64",
-		binary:            "unused\n",
-		darwinArchiveName: "../escape_darwin_arm64.tar.gz",
-	})
-	if !strings.Contains(run.output, "unsafe archive name") {
-		t.Fatalf("output = %q; want unsafe archive refusal", run.output)
-	}
-	if strings.Contains(run.requests, "escape_darwin_arm64.tar.gz") {
-		t.Fatalf("requests = %q; unsafe archive must not be downloaded", run.requests)
+	for _, archive := range []string{
+		"../escape_darwin_arm64.tar.gz",
+		"billét_darwin_arm64.tar.gz",
+	} {
+		t.Run(archive, func(t *testing.T) {
+			t.Parallel()
+
+			run := runInstallerExpectingFailure(t, installerFixture{
+				hostOS:            "Darwin",
+				hostArch:          "arm64",
+				binary:            "unused\n",
+				darwinArchiveName: archive,
+			})
+			if !strings.Contains(run.output, "unsafe archive name") {
+				t.Fatalf("output = %q; want unsafe archive refusal", run.output)
+			}
+			if strings.Contains(run.requests, archive) {
+				t.Fatalf("requests = %q; unsafe archive must not be downloaded", run.requests)
+			}
+		})
 	}
 }
 
