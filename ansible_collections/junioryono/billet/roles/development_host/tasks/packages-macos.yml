@@ -21,6 +21,7 @@
   register: billet_development_homebrew_formulae
   changed_when: false
   failed_when: false
+  check_mode: false
 
 - name: Install missing macOS development formulae
   ansible.builtin.command:
@@ -40,6 +41,7 @@
   register: billet_development_homebrew_outdated
   changed_when: false
   failed_when: false
+  check_mode: false
 
 - name: Upgrade outdated macOS development formulae
   ansible.builtin.command:
@@ -55,6 +57,7 @@
     argv: ["{{ billet_development_brew_bin }}", --prefix]
   register: billet_development_homebrew_prefix
   changed_when: false
+  check_mode: false
 
 - name: Record macOS development tool paths
   ansible.builtin.set_fact:

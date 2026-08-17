@@ -1,0 +1,15 @@
+---
+- name: Verify a first development-host dry run tolerates planned tools
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    billet_development_caddy_bin: /billet-test/not-yet-installed/caddy
+    billet_development_mkcert_bin: /billet-test/not-yet-installed/mkcert
+    billet_development_terraform_bin: /billet-test/not-yet-installed/terraform
+    billet_development_install_terraform: true
+  tasks:
+    - name: Exercise development tool verification in check mode
+      ansible.builtin.include_role:
+        name: junioryono.billet.development_host
+        tasks_from: verify-tools
