@@ -168,11 +168,31 @@ func retryable(err error) bool {
 // rejected, so nothing was started and another shape is a fresh question.
 //
 //	InsufficientInstanceCapacity  AWS has none of that shape in that AZ right now.
-//	InsufficientHostCapacity      the dedicated-host variant of the same.
+//	UnfulfillableCapacity         the SPOT form of the same, and this backend
+//	                              launches spot through RunInstances — so leaving
+//	                              it out defeated the fallback for the mode a
+//	                              cost-conscious deployment actually runs in.
+//	InsufficientHostCapacity      the dedicated-host variant. Not requested by this
+//	                              backend today; listed so it does not have to be
+//	                              rediscovered when it is.
 //	Unsupported                   that shape is not offered in that AZ at all.
+//	                              BROADER THAN THE OTHERS: AWS also uses it for an
+//	                              unsupported request or configuration, so a config
+//	                              that is simply wrong will be refused once per
+//	                              declared shape rather than once. Wasteful, never
+//	                              unsafe — it is still a synchronous rejection —
+//	                              and the error names every shape it tried.
+//
+// THE NON-RETRY APPLIES EVERYWHERE, INCLUDING THE AMI BUILDER, which has no
+// fallback loop of its own: retryable takes no action parameter. That is
+// deliberate rather than overlooked. The retries here are 200ms and 400ms apart,
+// and AWS's own guidance for a capacity refusal is to wait — so what the builder
+// loses is three attempts inside half a second that were never going to differ,
+// and what it gains is failing immediately with the actual reason instead.
 func capacityRefusal(code string) bool {
 	switch code {
-	case "InsufficientInstanceCapacity", "InsufficientHostCapacity", "Unsupported":
+	case "InsufficientInstanceCapacity", "UnfulfillableCapacity",
+		"InsufficientHostCapacity", "Unsupported":
 		return true
 	}
 

@@ -46,11 +46,12 @@ import (
 //	                         accepted, so the server has nothing to infer custody
 //	                         from and releases the lease while the guest is still
 //	                         running. The bug this version exists to fix, intact.
-//	new node -> old server   The node sets Custody; the old server's destroy path
-//	                         does not read it, treats the answer as an ordinary
-//	                         failure, and retries — and the retry is answered by a
-//	                         node that now holds the lease in custody, which the
-//	                         old server again cannot see.
+//	new node -> old server   The node sets Custody; a server built before this
+//	                         change does not read it on a DESTROY result — it read
+//	                         it only on a launch — so it treats the answer as an
+//	                         ordinary failure and retries, and the retry is
+//	                         answered by a node that now holds the lease in
+//	                         custody, which that server again cannot see.
 //
 // A silent wrong answer is the case a version refusal is for. Two builds that
 // disagree about what a result MEANS are as incompatible as two that disagree

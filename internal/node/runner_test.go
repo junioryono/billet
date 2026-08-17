@@ -331,6 +331,101 @@ func TestASecondDestroyForHeldComputeStillReportsCustody(t *testing.T) {
 	}
 }
 
+// A REQUEST WITH BOTH A CUSTODY ENTRY AND A RUNNING INSTANCE DESTROYS THE
+// RUNNING ONE.
+//
+// Found by review. Checking custody BEFORE looking at `running` skipped the
+// running instance entirely — and the listener reads ErrCustody as "the node
+// holds MY lease" and drops its record, so the custody entry (which may hold a
+// DIFFERENT lease) keeps its own capacity while the running instance is left
+// alive with no owner and nothing that will come back for it.
+//
+// A redelivered assignment after a crash produces exactly this shape, which is
+// the same one TestACustodyFailureDoesNotStrandTheListenersLease covers from the
+// other side.
+func TestARequestWithBothCustodyAndARunningInstanceStillDestroysTheRunningOne(t *testing.T) {
+	p := &fakeProvider{kind: config.ProviderDocker, asyncTeardown: true}
+
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
+
+	// The custody half: a lease held here whose compute is not confirmed gone.
+	adopted := assignedLease(t, a)
+	r.holdWithOutcome(adopted, provider.InstanceName(adopted.ID), 11, alloc.PhaseDone)
+
+	// The running half: a different lease, for the same request.
+	second := assignedLease(t, a)
+	running := &provider.Instance{
+		ID: "running-" + second.ID, Name: provider.InstanceName(second.ID), Running: true,
+	}
+	p.add(running)
+
+	r.mu.Lock()
+	r.running[11] = running
+	r.runningLease[11] = second
+	r.mu.Unlock()
+
+	// The ANSWER is not what this asserts — on an asynchronous backend the running
+	// half ends in custody too, so ErrCustody is the correct return either way.
+	// What separates the fix from the bug is whether the running instance was
+	// asked to stop before that answer was given.
+	if err := r.Destroy(t.Context(), 11); err != nil && !errors.Is(err, server.ErrCustody) {
+		t.Fatalf("Destroy: %v", err)
+	}
+
+	if len(p.destroyed) == 0 {
+		t.Fatal("the running instance was never asked to stop; custody for a DIFFERENT lease " +
+			"answered for it, and the listener drops its record on that answer — so this " +
+			"container is left running with no owner")
+	}
+
+	if p.destroyed[len(p.destroyed)-1] != running.ID {
+		t.Errorf("destroyed %v, want the running instance %s", p.destroyed, running.ID)
+	}
+}
+
+// AN ACCEPTED TEARDOWN WITH NO LEASE TO HOLD IT KEEPS THE INSTANCE, so the retry
+// asks again.
+//
+// Found by review. The first call returned an error correctly, and then the
+// SECOND arrived to maps that had already been cleared, took the idempotent
+// branch, and reported success without reissuing the terminate or proving
+// anything — the same release hole, one call later.
+func TestATeardownWithNoLeaseToHoldIsRetriedRatherThanForgotten(t *testing.T) {
+	p := &fakeProvider{kind: config.ProviderDocker, asyncTeardown: true}
+
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
+
+	lease := assignedLease(t, a)
+
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	// The state this branch exists for: an instance with no lease recorded beside
+	// it, so custody — which is keyed on a lease — has nothing to hold.
+	r.mu.Lock()
+	delete(r.runningLease, 11)
+	r.mu.Unlock()
+
+	if err := r.Destroy(t.Context(), 11); err == nil {
+		t.Fatal("an unconfirmed teardown with no lease to hold the capacity reported success")
+	}
+
+	before := len(p.destroyed)
+
+	if err := r.Destroy(t.Context(), 11); err == nil {
+		t.Error("the retry reported success without reissuing the terminate or proving the " +
+			"guest was gone; the caller releases the capacity on that")
+	}
+
+	if len(p.destroyed) == before {
+		t.Error("the retry did not ask the backend to stop the guest again, so nothing was " +
+			"holding the obligation and nothing was acting on it either")
+	}
+}
+
 // AND IT IS RECORDED AS A JOB THAT FINISHED, not as one that failed.
 //
 // custody's other discard path is a launch that never started, which is a

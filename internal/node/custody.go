@@ -100,7 +100,12 @@ type custody struct {
 	// Set when a teardown could not be confirmed, cleared when it is. An entry
 	// that reaches a confirmed teardown is normally deleted by finish, so a
 	// surviving entry with this false is one whose release did not land.
-	unconfirmed bool
+	//
+	// ATOMIC FOR THE SAME REASON epoch IS. tendOne writes it while holding
+	// `tending`; the Destroy path reads it while holding `mu`. Those are different
+	// locks by design — Tend must not block on the map mutex — so the field cannot
+	// borrow either one's protection.
+	unconfirmed atomic.Bool
 
 	// since is when custody was taken, for the diagnostic that matters most: how
 	// long capacity has been held for something nobody is watching.
@@ -124,6 +129,14 @@ func (r *Runner) adopt(lease *alloc.Lease, inst *provider.Instance) {
 		since:    r.now(),
 	}
 	entry.epoch.Store(lease.Epoch)
+
+	// UNCONFIRMED, BECAUSE AN ADOPTED GUEST IS RUNNING RIGHT NOW. The zero value
+	// says "the compute is gone and only the bookkeeping is outstanding", which is
+	// the exact opposite of what an adoption is — and a Destroy for this request
+	// would then report success on the strength of it, letting the caller release
+	// capacity underneath a live job. It is cleared the moment a tend proves the
+	// instance gone, which is the ordinary way an adoption ends.
+	entry.unconfirmed.Store(true)
 
 	r.custody[lease.ID] = entry
 }
@@ -164,12 +177,6 @@ func (r *Runner) holdWithOutcome(lease *alloc.Lease, name string, requestID int6
 		discard:   true,
 		outcome:   outcome,
 		since:     r.now(),
-		// UNCONFIRMED BY CONSTRUCTION. Both routes here exist because billet could
-		// not establish that a piece of compute is gone — a launch whose cleanup
-		// Find could not confirm, or a teardown a backend merely accepted. Until
-		// something proves otherwise, a Destroy for this request must not report
-		// success.
-		unconfirmed: true,
 		// NOT observed, even for a teardown of an instance billet launched and
 		// holds an id for. The grace before an absence is believed is what stops an
 		// eventually-consistent DescribeInstances (#48) from proving the guest is
@@ -178,6 +185,12 @@ func (r *Runner) holdWithOutcome(lease *alloc.Lease, name string, requestID int6
 		// this on the first tick and costs nothing.
 	}
 	entry.epoch.Store(lease.Epoch)
+
+	// UNCONFIRMED BY CONSTRUCTION. Both routes here exist because billet could not
+	// establish that a piece of compute is gone — a launch whose cleanup Find could
+	// not confirm, or a teardown a backend merely accepted. Until something proves
+	// otherwise, a Destroy for this request must not report success.
+	entry.unconfirmed.Store(true)
 
 	r.custody[lease.ID] = entry
 }
@@ -452,7 +465,7 @@ func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 
 		// PROVED GONE, by a sustained absence rather than by a backend saying so —
 		// which is the only proof an asynchronous teardown ever offers.
-		c.unconfirmed = false
+		c.unconfirmed.Store(false)
 
 		return r.finish(ctx, c)
 	}
@@ -483,7 +496,7 @@ func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 	// gone. That path is already written above and already applies the grace an
 	// unobserved absence needs.
 	if state != provider.TeardownStopped {
-		c.unconfirmed = true
+		c.unconfirmed.Store(true)
 
 		// SAID ONCE, THOUGH THE REQUEST IS RE-ISSUED EVERY TICK. Re-asking is the
 		// safety net for a teardown that was accepted and did not take, and it is
@@ -504,7 +517,7 @@ func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 	// PROVED GONE. What is left for this entry is bookkeeping — releasing the
 	// lease — so a Destroy arriving for its request is answerable with the truth
 	// rather than with custody.
-	c.unconfirmed = false
+	c.unconfirmed.Store(false)
 
 	r.log.Info("released compute that was being held",
 		"name", c.name, "lease", c.leaseID, "adopted", !c.discard,
@@ -605,7 +618,7 @@ func (r *Runner) unconfirmedForRequest(requestID int64) (string, bool) {
 	defer r.mu.Unlock()
 
 	for _, c := range r.custody {
-		if c.requestID == requestID && c.unconfirmed {
+		if c.requestID == requestID && c.unconfirmed.Load() {
 			return c.leaseID, true
 		}
 	}
@@ -737,6 +750,14 @@ func (r *Runner) Superseded() {
 			observed: true,
 		}
 		entry.epoch.Store(lease.Epoch)
+
+		// UNCONFIRMED, FOR THE SAME REASON AS AN ADOPTION: this entry was built
+		// from an instance in the RUNNING set, so its guest is executing a job
+		// right now. Left at the zero value it would read as "the compute is gone
+		// and only the release is outstanding", and a Destroy for this request
+		// would report success on it — releasing the capacity of a superseded
+		// process's live job, which is the one thing supersession exists to hold.
+		entry.unconfirmed.Store(true)
 
 		r.custody[lease.ID] = entry
 	}

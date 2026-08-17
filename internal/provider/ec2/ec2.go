@@ -25,7 +25,9 @@ package ec2
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -365,8 +367,22 @@ func (p *Provider) instanceTypesFor(spec provider.Spec) ([]config.EC2InstanceTyp
 // So the key is (lease name, shape): stable for the request it identifies,
 // different for a request that differs. The name already encodes the lease and
 // is never reused, so this is unique by construction.
+//
+// THE SHAPE IS HASHED RATHER THAN APPENDED, because a client token is capped at
+// 64 ASCII characters and an instance name is already 39 of them — `billet-` plus
+// a 32-hex lease id. Concatenating left 24 characters for the type, which every
+// EC2 shape in existence fits inside today and which is a cliff nothing guards:
+// this package deliberately keeps NO table of instance types, so that shapes AWS
+// adds later work with no code change — and a 25-character one would have made
+// every launch fail outright, before the fallback could help. A fixed-width
+// digest removes the question rather than bounding it.
+//
+// The lease stays legible in the clear, because the token is what an operator has
+// to work with when they find a stray instance in CloudTrail.
 func clientTokenFor(name, instanceType string) string {
-	return name + "-" + instanceType
+	sum := sha256.Sum256([]byte(instanceType))
+
+	return name + "-" + hex.EncodeToString(sum[:])[:12]
 }
 
 // Launch starts one instance running the job its JIT config names.
