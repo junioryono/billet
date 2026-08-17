@@ -34,6 +34,7 @@ if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
 fi
 
 series="$(echo "$tag" | awk -F. '{ print $1 "." $2 }')"
+collection_version="${tag#v}"
 series_newest="$(git tag --list "$series.*" | grep -E "$semver" | sort -V | tail -n1 || true)"
 
 # Existing minor lines may receive hotfixes after a newer line exists. A brand-new
@@ -51,4 +52,5 @@ branch="release/$series"
 {
 	echo "tag=$tag"
 	echo "branch=$branch"
+	echo "collection_version=$collection_version"
 } >> "$output"
