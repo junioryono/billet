@@ -98,3 +98,26 @@
           - billet_development_caddy_version_command.stdout == 'v2.7.0'
           - billet_development_mkcert_version_command.stdout == 'v1.4.4'
           - (billet_development_terraform_version_command.stdout | from_json).terraform_version == '1.12.0'
+
+- name: Verify configured guest networks are not retired
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    billet_managed_network_files:
+      files:
+        - path: /etc/billet/network/billet0.conf
+        - path: /etc/billet/network/billet1.conf
+        - path: /etc/billet/network/retired.conf
+    billet_networks:
+      - name: billet0
+      - name: billet1
+  tasks:
+    - name: Exercise managed guest network normalization
+      ansible.builtin.include_role:
+        name: junioryono.billet.host
+        tasks_from: network-stale
+
+    - name: Require only the absent network to be retired
+      ansible.builtin.assert:
+        that: billet_stale_network_names == ['retired']
