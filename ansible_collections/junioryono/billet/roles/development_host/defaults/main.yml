@@ -35,4 +35,4 @@ billet_development_proxy_environment:
 billet_development_proxy_systemd_unit: billet-development-proxy.service
 billet_development_proxy_launchd_label: io.billet.development-proxy
 
-billet_development_brew_bin: "{{ '/opt/homebrew/bin/brew' if ansible_architecture in ['arm64', 'aarch64'] else '/usr/local/bin/brew' }}"
+billet_development_brew_bin: "{{ '/opt/homebrew/bin/brew' if ansible_facts['architecture'] in ['arm64', 'aarch64'] else '/usr/local/bin/brew' }}"
