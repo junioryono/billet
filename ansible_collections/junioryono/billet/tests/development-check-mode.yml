@@ -4,6 +4,7 @@
   connection: local
   gather_facts: true
   vars:
+    ansible_python_interpreter: /usr/bin/python3
     billet_development_apt_stage: "{{ lookup('env', 'TMPDIR') | default('/tmp', true) }}/billet-development-host-check-mode"
     billet_development_tls_caroot: "{{ lookup('env', 'TMPDIR') | default('/tmp', true) }}/billet-development-host-check-mode/caroot"
     billet_development_tls_dir: "{{ lookup('env', 'TMPDIR') | default('/tmp', true) }}/billet-development-host-check-mode/tls"
@@ -11,6 +12,14 @@
     billet_development_proxy_log_path: "{{ lookup('env', 'TMPDIR') | default('/tmp', true) }}/billet-development-host-check-mode/logs/caddy.log"
   roles:
     - role: junioryono.billet.development_host
+      when: ansible_facts["system"] == "Linux"
+  tasks:
+    - name: Require first-run changes to be predicted
+      ansible.builtin.assert:
+        that:
+          - billet_development_linux_package_prediction is changed
+          - billet_development_certificate_prediction is changed
+          - billet_development_proxy_files_prediction is changed
       when: ansible_facts["system"] == "Linux"
 
 - name: Verify development tool probes run in check mode
