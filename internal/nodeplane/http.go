@@ -48,6 +48,9 @@ type LeaseStore interface {
 	Bind(ctx context.Context, leaseID string, epoch int64, node string) error
 	Advance(ctx context.Context, leaseID string, epoch int64, to alloc.Phase) error
 	Heartbeat(ctx context.Context, leaseID string, epoch int64) error
+	MarkFailure(ctx context.Context, leaseID string, epoch int64, reason string) error
+	Resize(ctx context.Context, leaseID string, epoch int64, instanceType string,
+		vcpu int, memory config.ByteSize) error
 	Release(ctx context.Context, leaseID string, epoch int64, outcome alloc.Phase) error
 	Lease(ctx context.Context, leaseID string) (*alloc.Lease, error)
 	LaunchedLeaseIDs(ctx context.Context, node string) (map[string]bool, error)
@@ -202,6 +205,8 @@ func Handler(log *slog.Logger, p *Plane, store LeaseStore, jit JITSource, opts .
 	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/bind", h.forNewWork(h.bind))
 	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/advance", h.forOwnLease(h.advance))
 	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/heartbeat", h.forOwnLease(h.heartbeat))
+	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/failure", h.forOwnLease(h.markFailure))
+	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/resize", h.forOwnLease(h.resize))
 	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/release", h.forOwnLease(h.release))
 	mux.HandleFunc("GET /v1/nodes/{node}/leases/{lease}", h.forOwnLease(h.lease))
 	mux.HandleFunc("GET /v1/nodes/{node}/launched", h.forNewWork(h.launched))
@@ -942,6 +947,21 @@ func (h *handler) heartbeat(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (h *handler) markFailure(w http.ResponseWriter, r *http.Request) {
+	var req nodeapi.MarkFailureRequest
+	if !decode(w, r, &req) {
+		return
+	}
+
+	if err := h.store.MarkFailure(r.Context(), r.PathValue("lease"), req.Epoch, req.Reason); err != nil {
+		writeStoreErr(w, err)
+
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (h *handler) release(w http.ResponseWriter, r *http.Request) {
 	var req nodeapi.ReleaseRequest
 	if !decode(w, r, &req) {
@@ -976,6 +996,22 @@ func (h *handler) release(w http.ResponseWriter, r *http.Request) {
 	// THE OWNERSHIP RECORD ENDS WITH THE LEASE. Kept only while somebody might
 	// still need to prove they hold it.
 	h.plane.ForgetLease(r.PathValue("node"), r.PathValue("lease"))
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *handler) resize(w http.ResponseWriter, r *http.Request) {
+	var req nodeapi.ResizeRequest
+	if !decode(w, r, &req) {
+		return
+	}
+
+	if err := h.store.Resize(r.Context(), r.PathValue("lease"), req.Epoch,
+		req.InstanceType, req.VCPU, req.Memory); err != nil {
+		writeStoreErr(w, err)
+
+		return
+	}
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -1292,6 +1328,10 @@ func writeStoreErr(w http.ResponseWriter, err error) {
 		writeErr(w, http.StatusConflict, nodeapi.CodeFenced, err.Error())
 	case errors.Is(err, alloc.ErrLeaseNotFound):
 		writeErr(w, http.StatusNotFound, nodeapi.CodeNotFound, err.Error())
+	case errors.Is(err, alloc.ErrNoCapacity):
+		writeErr(w, http.StatusConflict, nodeapi.CodeNoCapacity, err.Error())
+	case errors.Is(err, alloc.ErrForceRelease):
+		writeErr(w, http.StatusConflict, nodeapi.CodeForceRelease, err.Error())
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		// The node hung up or the poll window closed. Nothing to say, and saying
 		// it into a closed connection achieves nothing.

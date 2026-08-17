@@ -1,0 +1,59 @@
+---
+- name: Verify alert ownership migrations and teardown
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    billet_alert_test_root: "{{ lookup('env', 'TMPDIR') | default('/tmp', true) }}/billet-alert-lifecycle"
+    billet_alert_cases:
+      - name: legacy-headerless
+        managed: false
+        removed: true
+        content: |
+          defaults
+          auth on
+          tls on
+          tls_starttls on
+          tls_trust_file /etc/ssl/certs/ca-certificates.crt
+          logfile /var/log/msmtp.log
+
+          account default
+          host email-smtp.example.com
+          port 587
+          from alerts@example.com
+          user example-user
+          password example-password
+      - name: current-header
+        managed: false
+        removed: true
+        content: |
+          # Managed by junioryono.billet.host. Disable billet_alert_email to remove this file.
+          account default
+      - name: ownership-marker
+        managed: true
+        removed: true
+        content: |
+          account default
+          host smtp.operator.example
+      - name: operator-owned
+        managed: false
+        removed: false
+        content: |
+          account default
+          host smtp.operator.example
+  tasks:
+    - name: Reset the alert lifecycle fixture
+      ansible.builtin.file:
+        path: "{{ billet_alert_test_root }}"
+        state: absent
+
+    - name: Exercise each SMTP ownership shape
+      ansible.builtin.include_tasks: alert-lifecycle-case.yml
+      loop: "{{ billet_alert_cases }}"
+      loop_control:
+        loop_var: billet_alert_case
+
+    - name: Remove the alert lifecycle fixture
+      ansible.builtin.file:
+        path: "{{ billet_alert_test_root }}"
+        state: absent

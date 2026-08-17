@@ -1,0 +1,116 @@
+---
+- name: Apply unit changes before billet validation
+  ansible.builtin.meta: flush_handlers
+
+- name: Validate the finished billet host
+  ansible.builtin.command: /usr/bin/billet check --config /etc/billet/billet.yaml
+  register: billet_check
+  changed_when: false
+  when: not ansible_check_mode
+  become: true
+
+- name: Return server state created by validation to the control-plane account
+  ansible.builtin.file:
+    path: /var/lib/billet/server
+    state: directory
+    owner: "{{ billet_service_user }}"
+    group: "{{ billet_service_group }}"
+    recurse: true
+  when:
+    - billet_enable_server
+    - not ansible_check_mode
+  become: true
+
+- name: Inspect control-plane state files
+  ansible.builtin.find:
+    paths: /var/lib/billet/server
+    file_type: file
+    recurse: false
+  register: billet_server_state_files
+  when:
+    - billet_enable_server
+    - not ansible_check_mode
+  become: true
+
+- name: Protect control-plane state files
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    owner: "{{ billet_service_user }}"
+    group: "{{ billet_service_group }}"
+    mode: "0600"
+  loop: "{{ billet_server_state_files.files | default([]) }}"
+  loop_control:
+    label: "{{ item.path }}"
+  when:
+    - billet_enable_server
+    - not ansible_check_mode
+  become: true
+
+- name: Restart the billet server after its installed inputs change
+  ansible.builtin.systemd_service:
+    name: billet-server.service
+    state: restarted
+  when:
+    - billet_enable_server
+    - not ansible_check_mode
+    - >-
+      billet_binary_install.changed | default(false) or
+      billet_config_install.changed | default(false) or
+      billet_private_key_install.changed | default(false) or
+      billet_systemd_units.changed | default(false)
+  become: true
+
+- name: Restart the billet node after its installed inputs change
+  ansible.builtin.systemd_service:
+    name: billet-node.service
+    state: restarted
+  when:
+    - billet_enable_node
+    - not ansible_check_mode
+    - >-
+      billet_binary_install.changed | default(false) or
+      billet_config_install.changed | default(false) or
+      billet_firecracker_install.changed | default(false) or
+      billet_firecracker_links.changed | default(false) or
+      billet_systemd_units.changed | default(false)
+  become: true
+
+- name: Enable and start the billet server
+  ansible.builtin.systemd_service:
+    name: billet-server.service
+    enabled: true
+    state: started
+  when:
+    - billet_enable_server
+    - not ansible_check_mode
+  become: true
+
+- name: Enable and start the billet node
+  ansible.builtin.systemd_service:
+    name: billet-node.service
+    enabled: true
+    state: started
+  when:
+    - billet_enable_node
+    - not ansible_check_mode
+  become: true
+
+- name: Stop and disable the billet server when this host no longer owns that role
+  ansible.builtin.systemd_service:
+    name: billet-server.service
+    enabled: false
+    state: stopped
+  when:
+    - not billet_enable_server
+    - not ansible_check_mode
+  become: true
+
+- name: Stop and disable the billet node when this host no longer owns that role
+  ansible.builtin.systemd_service:
+    name: billet-node.service
+    enabled: false
+    state: stopped
+  when:
+    - not billet_enable_node
+    - not ansible_check_mode
+  become: true

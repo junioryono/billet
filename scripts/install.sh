@@ -4,10 +4,6 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/junioryono/billet/main/scripts/install.sh | sh
 #
-# NO RELEASE HAS BEEN CUT YET, so that command currently stops at the checksum
-# fetch with "is latest a release that exists?". Build from source until there
-# is a tag; this script is tested and waiting for one.
-#
 # Downloads the latest release for this platform, VERIFIES ITS CHECKSUM, and
 # installs the binary to /usr/local/bin. It does not create users, write config,
 # or start anything — use the .deb or .rpm if you want the systemd units.

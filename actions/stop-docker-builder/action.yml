@@ -1,0 +1,20 @@
+name: billet stop Docker builder
+description: Internal post hook that quiesces BuildKit before its sticky disk commits.
+inputs:
+  container:
+    required: true
+  builder:
+    required: true
+  state-path:
+    required: true
+  mount-limit-bytes:
+    required: false
+    default: "21474836480"
+  discard-marker:
+    description: Runner-local publication guard removed only after the cache-mount policy is enforced.
+    required: true
+runs:
+  using: node20
+  main: index.js
+  post: cleanup.js
+  post-if: always()

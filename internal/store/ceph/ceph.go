@@ -8,8 +8,8 @@
 // an operator installs. What it costs is that every call is a process, so this
 // package is for operations measured in tens per job, never per block.
 //
-// Nothing here mounts anything yet. #23 built the cluster and the configuration
-// that names it; the Store interface, the commit protocol and eviction are #25.
+// The same client owns golden-image roots and cache generations. Cache publication
+// is fenced and pointer-based; a failed commit leaves the old generation readable.
 package ceph
 
 import (
@@ -51,6 +51,7 @@ type Client struct {
 	// observation shortens the publish-lock liveness window. Zero means the real
 	// one; only a test sets it, for the reason withRunner exists.
 	observation time.Duration
+	verify      filesystemVerifier
 }
 
 // runner executes one rbd invocation. A seam, so a test can assert the ARGUMENTS
@@ -121,7 +122,7 @@ func New(cfg config.CephConfig, opts ...Option) (*Client, error) {
 		return nil, fmt.Errorf("ceph: %w", errors.Join(errs...))
 	}
 
-	c := &Client{cfg: cfg, run: execRunner, wait: DefaultTimeout}
+	c := &Client{cfg: cfg, run: execRunner, wait: DefaultTimeout, verify: verifyFilesystem}
 	for _, opt := range opts {
 		opt(c)
 	}

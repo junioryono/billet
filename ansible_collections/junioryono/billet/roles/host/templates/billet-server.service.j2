@@ -1,0 +1,37 @@
+[Unit]
+Description=billet control plane
+Documentation=https://github.com/junioryono/billet
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User={{ billet_service_user }}
+Group={{ billet_service_group }}
+UMask=0077
+ExecStart=/usr/bin/billet server --config /etc/billet/billet.yaml
+StateDirectory=billet/server
+StateDirectoryMode=0700
+TimeoutStopSec=88200
+KillSignal=SIGTERM
+KillMode=mixed
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+ReadOnlyPaths=/etc/billet
+
+[Install]
+WantedBy=multi-user.target

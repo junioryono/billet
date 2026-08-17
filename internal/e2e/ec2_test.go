@@ -320,11 +320,15 @@ func newCloudStack(t *testing.T) *cloudStack {
 	}
 
 	const host = "aws-1"
+	shapes := []config.EC2InstanceType{
+		{Type: "c7i.2xlarge", VCPU: 8, Memory: 16 * config.GiB},
+	}
 
 	// WHAT THE NODE CONTRIBUTES IS A BUDGET, not this machine's hardware — the
 	// whole reason an ec2 node has to declare it.
 	if _, err := a.RegisterNode(t.Context(), alloc.NodeRegistration{
 		Name: host, Provider: config.ProviderEC2, VCPU: 64, Memory: 256 * config.GiB,
+		EC2Shapes: shapes,
 	}); err != nil {
 		t.Fatalf("RegisterNode: %v", err)
 	}
@@ -336,9 +340,7 @@ func newCloudStack(t *testing.T) *cloudStack {
 		Endpoint:         cloud.URL,
 		SubnetID:         "subnet-e2e",
 		SecurityGroupIDs: []string{"sg-e2e"},
-		InstanceTypes: []config.EC2InstanceType{
-			{Type: "c7i.2xlarge", VCPU: 8, Memory: 16 * config.GiB},
-		},
+		InstanceTypes:    shapes,
 	},
 		ec2.WithHTTPClient(cloud.Client()),
 		ec2.WithCredentials(ec2.StaticCredentials{AccessKeyID: "AKID", SecretAccessKey: "s"}))

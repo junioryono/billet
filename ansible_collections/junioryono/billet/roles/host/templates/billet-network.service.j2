@@ -1,0 +1,13 @@
+[Unit]
+Description=billet guest network policy and NAT
+After=network-pre.target systemd-networkd.service
+Before=billet-node.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/billet/network.nft
+ExecReload=/usr/sbin/nft -f /etc/billet/network.nft
+
+[Install]
+WantedBy=multi-user.target

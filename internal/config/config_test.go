@@ -202,7 +202,6 @@ tiers:
     memory: 32GiB
     shm: 1GiB
     image: ubuntu-2404-x64
-    intercept: true
 `
 
 func TestLoadValid(t *testing.T) {
@@ -223,9 +222,6 @@ func TestLoadValid(t *testing.T) {
 	if tier.SHM != GiB {
 		t.Errorf("shm = %s, want 1GiB", tier.SHM)
 	}
-	if !tier.Intercept {
-		t.Error("intercept should be true where set")
-	}
 	if tier.GuestOS != GuestLinux {
 		t.Errorf("guest_os = %q, want linux by default", tier.GuestOS)
 	}
@@ -234,6 +230,29 @@ func TestLoadValid(t *testing.T) {
 	first, _ := cfg.TierByLabel("billet-4vcpu-ubuntu-2404")
 	if first.Intercept {
 		t.Error("intercept defaulted to true; it must default to false")
+	}
+}
+
+func TestUnimplementedTierAcceleratorsAreRefusedRatherThanIgnored(t *testing.T) {
+	t.Parallel()
+
+	for field, insertion := range map[string]string{
+		"intercept": "    intercept: true\n",
+		"warm_pool": "    warm_pool: 2\n",
+	} {
+		t.Run(field, func(t *testing.T) {
+			t.Parallel()
+
+			body := strings.Replace(validConfig, "    image: ubuntu-2404-x64\n",
+				"    image: ubuntu-2404-x64\n"+insertion, 1)
+			_, err := Load(writeConfig(t, body))
+			if err == nil {
+				t.Fatalf("Load accepted inert %s configuration", field)
+			}
+			if !strings.Contains(err.Error(), "not implemented") {
+				t.Errorf("error does not explain the unavailable setting: %v", err)
+			}
+		})
 	}
 }
 

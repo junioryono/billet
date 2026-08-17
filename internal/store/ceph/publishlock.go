@@ -64,7 +64,7 @@ var cookieAge = regexp.MustCompile(`-(\d+)$`)
 // so a nonce appended AFTER the timestamp would make every lock this side takes
 // unreclaimable by a shell build -- and only under the failure that mechanism
 // exists to handle, which is the worst possible time to discover it.
-func publishCookie(now time.Time) string {
+func publishCookie(now time.Time) (string, error) {
 	host, err := os.Hostname()
 	if err != nil || strings.TrimSpace(host) == "" {
 		host = "unknown"
@@ -73,14 +73,11 @@ func publishCookie(now time.Time) string {
 	var nonce [8]byte
 
 	if _, err := rand.Read(nonce[:]); err != nil {
-		// UNREACHABLE IN PRACTICE, and the fallback still has to be a plausible
-		// cookie rather than an empty one: a lock taken under "" is a lock nothing
-		// can release.
-		return fmt.Sprintf("billet-import-%s-%d-%d", host, os.Getpid(), now.UTC().Unix())
+		return "", fmt.Errorf("ceph: make a unique publish-lock identity: %w", err)
 	}
 
 	return fmt.Sprintf("billet-import-%s-%d-%s-%d",
-		host, os.Getpid(), hex.EncodeToString(nonce[:]), now.UTC().Unix())
+		host, os.Getpid(), hex.EncodeToString(nonce[:]), now.UTC().Unix()), nil
 }
 
 // HeartbeatInterval is how often a holder proves it is still alive.
@@ -195,9 +192,20 @@ func (c *Client) observeHeartbeat(ctx context.Context, image, cookie string) hea
 // TakePublishLock claims the right to write the golden image.
 func (c *Client) TakePublishLock(ctx context.Context, now time.Time) (*PublishLock, error) {
 	image := c.cfg.ImagePool + "/" + LockImageName
+	cookie, err := publishCookie(now)
+	if err != nil {
+		return nil, err
+	}
 
-	cookie := publishCookie(now)
+	return c.takeLock(ctx, image, cookie, now)
+}
 
+// takeLock claims an advisory lock on one dedicated image.
+func (c *Client) takeLock(
+	ctx context.Context,
+	image, cookie string,
+	now time.Time,
+) (*PublishLock, error) {
 	// CREATED IF ABSENT, AND A FAILURE HERE IS NOT FATAL. The ordinary case is that
 	// it already exists, which `rbd create` reports as an error; distinguishing
 	// that from a real failure is what `lock add` does a line later, and far more
@@ -236,6 +244,12 @@ func (c *Client) TakePublishLock(ctx context.Context, now time.Time) (*PublishLo
 		// beats retrying in a loop nobody bounded.
 		return nil, fmt.Errorf("ceph: the publish lock on %s could not be taken and is not held; "+
 			"another publisher is contending for it right now", image)
+	}
+	if holder.ID == cookie {
+		lock := &PublishLock{client: c, cookie: cookie, image: image}
+		lock.beat(ctx)
+
+		return lock, nil
 	}
 
 	// LIVENESS IS OBSERVED, NOT INFERRED FROM THE CLOCK.

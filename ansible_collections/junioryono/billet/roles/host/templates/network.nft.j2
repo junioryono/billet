@@ -1,0 +1,48 @@
+table inet billet_guard
+delete table inet billet_guard
+
+table inet billet_guard {
+  set guest_ifaces {
+    type ifname
+    elements = { {{ billet_networks | map(attribute='name') | map('to_json') | join(', ') }} }
+  }
+
+  set internal_v4 {
+    type ipv4_addr
+    flags interval
+    elements = { {{ billet_guest_denied_ipv4 | join(', ') }} }
+  }
+
+  set internal_v6 {
+    type ipv6_addr
+    flags interval
+    elements = { {{ billet_guest_denied_ipv6 | join(', ') }} }
+  }
+
+  chain input {
+    type filter hook input priority filter; policy accept;
+    iifname @guest_ifaces tcp dport { {{ billet_guest_host_tcp_ports | join(', ') }} } accept
+    iifname @guest_ifaces udp dport { {{ billet_guest_host_udp_ports | join(', ') }} } accept
+    iifname {{ billet_config.node.firecracker.bridge | to_json }} tcp dport {{ billet_image_verify_port }} accept comment "billet image verification"
+    iifname @guest_ifaces counter drop comment "billet guest -> host"
+  }
+
+  chain forward {
+    type filter hook forward priority filter; policy accept;
+    ct state established,related accept
+    iifname @guest_ifaces ip daddr @internal_v4 counter drop comment "billet guest -> internal v4"
+    iifname @guest_ifaces ip6 daddr @internal_v6 counter drop comment "billet guest -> internal v6"
+  }
+}
+
+table ip billet_nat
+delete table ip billet_nat
+
+table ip billet_nat {
+  chain postrouting {
+    type nat hook postrouting priority srcnat; policy accept;
+{% for network in billet_networks %}
+    ip saddr {{ network.address }}/{{ network.prefix }} oifname != {{ network.name | to_json }} masquerade
+{% endfor %}
+  }
+}

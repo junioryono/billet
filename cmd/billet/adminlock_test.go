@@ -93,6 +93,8 @@ func TestOperatorCommandsRunWhileTheControlPlaneIsRunning(t *testing.T) {
 		{"nodes pending", func() error { return cmdNodesPending(ctx, []string{"--config", cfg}) }},
 		{"ca token", func() error { return cmdCAToken(ctx, []string{"--config", cfg}) }},
 		{"ca revocations", func() error { return cmdCARevocations(ctx, []string{"--config", cfg}) }},
+		{"status", func() error { return cmdStatus(ctx, []string{"--config", cfg}) }},
+		{"leases", func() error { return cmdLeases(ctx, []string{"held", "--config", cfg}) }},
 		{"leases quarantined", func() error { return cmdLeasesQuarantined(ctx, []string{"--config", cfg}) }},
 	} {
 		if err := tc.run(); err != nil {

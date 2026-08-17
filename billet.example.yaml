@@ -16,7 +16,7 @@
 # `billet check` proves all four before a job ever arrives, and names whichever
 # one is missing.
 #
-# TO RUN IT ON A LAPTOP INSTEAD, FOUR edits HERE, and all four are needed — the
+# TO RUN IT ON A LAPTOP INSTEAD, FIVE edits HERE, and all five are needed — the
 # README's quickstart lists what else the file needs (the github: block, a
 # writable server.state_dir) and the Docker daemon it assumes:
 #
@@ -30,18 +30,20 @@
 #      one: only the firecracker backend reads it, so on any other provider it is
 #      a jail directory, a uid range and a bridge that nothing consults, and it is
 #      REFUSED rather than ignored.
-#   4. `image:` -> a Docker image that contains the GitHub runner, for example
+#   4. Delete the `cache:` block. Docker guests cannot attach its block volumes,
+#      so it is refused on that provider rather than ignored.
+#   5. `image:` -> a Docker image that contains the GitHub runner, for example
 #      `ghcr.io/actions/actions-runner:latest`. The image name is passed
 #      straight to `docker run`, so `ubuntu-2404-x64@g1` below is a golden-image
 #      reference for Firecracker and is not pullable.
 #
-# Edits 1 and 2 together get you a config that validates and a server that
+# Edits 1 through 3 together get you a config that validates and a server that
 # starts, and every job then fails to launch — which is why the third is here.
 #
 # The Docker provider reads vcpu, memory and shm; it ignores disk and warm_pool.
-# Both the `ceph:` and `firecracker:` blocks are REFUSED on it rather than
-# ignored, which is why deleting them is edits 2 and 3 above: a block only
-# firecracker reads is, on any other provider, configuration nothing consults.
+# The `ceph:`, `firecracker:` and `cache:` blocks are REFUSED on it rather than
+# ignored: a block only firecracker reads is, on any other provider,
+# configuration nothing consults.
 #
 # This example is the single-machine deployment, which is TWO PROCESSES reading
 # this one file:
@@ -259,6 +261,13 @@ node:
     #
     # untrusted_bridge: br-untrusted
 
+    # WHERE `billet images verify` briefly listens for the probe guest's signed
+    # report. A fixed port lets host policy admit exactly this callback instead of
+    # opening arbitrary high ports. The verification lock permits only one probe
+    # per host. Defaults to 7719.
+    #
+    # image_verify_port: 7719
+
     # WHERE THE BINARIES ARE, defaulted to where their own instructions put them
     # and where the reference host has them. The reference host installs them as
     # versioned filenames behind stable symlinks, so `firecracker --version`
@@ -270,6 +279,7 @@ node:
     #
     # binary_path: /usr/local/bin/firecracker
     # jailer_path: /usr/local/bin/jailer
+    # kernel_dir: /var/lib/billet/kernels
     # chroot_base: /srv/jailer
 
     # THE ACCOUNT THE JAILER DROPS THE VMM TO, before it reads anything an
@@ -337,22 +347,53 @@ node:
     image_pool: billet-images
     cache_pool: billet-cache
 
+  # THE PER-JOB CACHE API, bound to one literal address on the Firecracker guest
+  # bridge. It is optional; without it guests still boot from Ceph but workflows
+  # receive no sticky disks and Docker pulls cold. A wildcard, loopback address,
+  # hostname, or endpoint different from listen is refused so a bearer-token API
+  # cannot quietly appear on another host interface.
+  #
+  # Docker image-store attachment is disabled until the runner supplies an
+  # authoritative job result that makes publication safe. Docker and service
+  # container pulls therefore remain cold unless a registry mirror serves them;
+  # workflow-managed sticky disks and the BuildKit action use this API now.
+  cache:
+    listen: 172.20.0.1:7718
+    guest_endpoint: http://172.20.0.1:7718
+
+  # THREE SITE-LOCAL PULL-THROUGH CACHES, one Distribution instance per
+  # upstream because proxy mode accepts one remote URL. Every endpoint is an
+  # HTTPS origin reachable from both trusted and untrusted guest bridges, so it
+  # must serve PUBLIC content only: configuring an upstream credential would
+  # expose everything that credential can read to every guest at the site.
+  # Repeat this exact block on every Firecracker node in the site.
+  #
+  # BuildKit uses all three mappings. Docker Engine's registry-mirrors setting
+  # supports Docker Hub only, so service-container and ordinary daemon pulls
+  # use the docker.io instance; ghcr.io and quay.io remain warm through the
+  # architecture-scoped /var/lib/docker disk above and still check upstream
+  # when a tag is pulled.
+  #
+  # registry_mirrors:
+  #   docker.io: https://docker-cache.home.example
+  #   ghcr.io: https://ghcr-cache.home.example
+  #   quay.io: https://quay-cache.home.example
+
   # THE CLOUD BACKEND, for `provider: ec2`. One instance per job, in one subnet.
   #
   # This is the AVAILABILITY story: a tier that lists `providers: [firecracker,
   # ec2]` may be placed on either, so losing the bare-metal host does not take the
-  # `runs-on` label down with it. A job that fails over runs with a COLD cache, and
-  # that is correct — keeping it warm would mean shipping cache bytes over a WAN,
-  # which is the problem the caching plane exists to remove.
+  # `runs-on` label down with it. The first job that fails over runs with a COLD
+  # cache because sites never copy bytes over a WAN; an AWS-local EBS/S3 store can
+  # warm later jobs at that site.
   #
   # An ec2 node is an ORCHESTRATOR: it holds credentials and calls an API, and the
   # compute appears in a region. Nothing runs on the machine billet runs on, so
   # max_vcpu and max_memory above are REQUIRED here rather than detected — billet
-  # will not choose how much to buy on your account. They are NOT yet a spending
-  # limit, and reading them as one is a mistake: the allocator charges a job the
-  # size its TIER asked for, while this backend buys the first shape below that
-  # FITS, so shapes larger than their tiers multiply the real spend (#47). The
-  # ORDER of a tier's `providers:` list does make home fill first.
+  # will not choose how much to buy on your account. They are hard resource
+  # budgets: placement charges the declared EC2 shape it will actually buy, not
+  # the usually smaller tier request. A fallback shape is charged before its AWS
+  # request is sent. The ORDER of a tier's `providers:` list makes home fill first.
   #
   # Credentials come from AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / (optionally)
   # AWS_SESSION_TOKEN, and failing that from this instance's own IAM role over
@@ -389,22 +430,70 @@ node:
   #   # THE SHAPES BILLET MAY BUY, each declaring what it holds, because billet
   #   # ships no table of EC2 instance types — a table would be out of date within a
   #   # quarter, and being out of date means launching a machine smaller than the
-  #   # lease already escrowed against it. The ORDER is a preference: the first
-  #   # shape that fits is bought.
+  #   # lease already escrowed against it. The ORDER is a preference: placement
+  #   # charges the first shape that fits, and a capacity refusal from AWS may move
+  #   # to a later shape only after billet confirms that shape still fits the node
+  #   # and deployment budgets.
   #   instance_types:
   #     - type: c7i.2xlarge
   #       vcpu: 8
   #       memory: 16GiB
+  #       price_usd_per_hour: 0.357
   #     - type: c7i.8xlarge
   #       vcpu: 32
   #       memory: 64GiB
+  #       price_usd_per_hour: 1.428
   #
   #   # SPOT DEFAULTS OFF. GitHub does not requeue a job whose runner vanished
   #   # mid-execution, so a reclaimed spot instance is a failed build rather than a
   #   # retry — and defaulting to it would make the failover path the unreliable
   #   # one, which is the opposite of what a failover is for. Turn it on if you
   #   # would rather have a cheap build that sometimes dies.
+  #   # Enabling it also requires one SQS queue PER NODE. An EventBridge router
+  #   # must look up the warned instance's sh.billet.node tag and deliver the
+  #   # warning only to that node's queue; several nodes consuming one queue can
+  #   # hide a two-minute warning from its owner for the entire visibility timeout.
+  #   # billet records the failure reason before teardown and deletes a message
+  #   # only after that record is durable. The node role needs sqs:ReceiveMessage
+  #   # and sqs:DeleteMessage on its queue.
   #   # spot: true
+  #   # interruption_queue_url: https://sqs.us-west-2.amazonaws.com/123456789012/aws-1
+
+  # THE AWS-LOCAL CACHE STORE, for an EC2 node in an `ebs-s3` site. EBS carries
+  # encrypted block generations and S3 carries the small fenced pointer. The
+  # bucket is not a data path: cache bytes never leave the availability zone.
+  # Every resource is tagged with this deployment identity, and orphan cleanup
+  # refuses anything it does not own.
+  #
+  # The node role needs ec2:CreateVolume, ec2:DeleteVolume, ec2:CreateSnapshot,
+  # ec2:DeleteSnapshot, ec2:DescribeVolumes, ec2:DescribeSnapshots, ec2:CreateTags,
+  # ec2:AttachVolume and ec2:DetachVolume. It also needs s3:GetObject and
+  # s3:PutObject for the prefix, plus s3:ListBucket constrained to that prefix.
+  # Constrain EBS deletion by sh.billet.owner and sh.billet.cache-owner tag
+  # conditions too; billet rechecks them in code, while IAM is the account-level
+  # boundary if state is corrupted or a future caller supplies the wrong id.
+  #
+  # ebs_s3:
+  #   region: us-west-2
+  #   # Must be the availability zone of node.ec2.subnet_id; EBS cannot attach
+  #   # a volume across zones.
+  #   availability_zone: us-west-2a
+  #   bucket: billet-cache-example
+  #   prefix: production
+  #   # Encrypt EBS volumes and snapshots with this customer-managed key. Empty
+  #   # uses the account's default EBS key. S3 pointer objects use SSE-S3.
+  #   # kms_key_id: arn:aws:kms:us-west-2:123456789012:key/...
+  #
+  # The EC2 guest reaches the same per-job API over HTTPS. The certificate must
+  # name cache.aws.example and its issuer must already be trusted by the AMI.
+  # Restrict the listener to the runner security groups: the bearer is scoped to
+  # one instance and five slots, but it is still a credential.
+  #
+  # cache:
+  #   listen: 10.0.1.10:7718
+  #   guest_endpoint: https://cache.aws.example:7718
+  #   tls_cert: /etc/billet/cache/tls.crt
+  #   tls_key: /etc/billet/cache/tls.key
 
 # Tiers are yours to define — this is not a fixed catalog. The label is what
 # users put in `runs-on`.
@@ -464,6 +553,9 @@ tiers:
     memory: 8GiB
     disk: 80GiB
     image: ubuntu-2404-x64@g1
+    # Each persistent BuildKit RUN --mount=type=cache record is reset when it
+    # grows past this size. Defaults to 20GiB; at most 100GiB.
+    buildkit_cache_mount_limit: 20GiB
 
   - label: billet-4vcpu-ubuntu-2404
     provider: firecracker
@@ -471,11 +563,11 @@ tiers:
     memory: 16GiB
     disk: 80GiB
     image: ubuntu-2404-x64@g1
-    # Serve actions/cache from this machine instead of over the internet.
-    # Off by default, and it should stay off for any tier that publishes release
-    # artifacts or holds deployment secrets: interception terminates TLS in front
-    # of the GitHub service that also carries artifact metadata.
-    intercept: true
+    # Reserved for transparent actions/cache interception. It is refused until
+    # the live conformance suite proves CacheService handling and ArtifactService
+    # passthrough; ACTIONS_RESULTS_URL carries both, so a partial implementation
+    # can break a release rather than merely miss a cache.
+    # intercept: true
 
   - label: billet-8vcpu-ubuntu-2404
     provider: firecracker
@@ -485,10 +577,9 @@ tiers:
     image: ubuntu-2404-x64@g1
     # Chromium and Postgres both misbehave on the default /dev/shm.
     shm: 1GiB
-    intercept: true
-    # Pre-boot idle VMs to hide cold start. Start small: Firecracker boots in
-    # ~125 ms, so a large warm pool may be spending memory on a non-problem.
-    warm_pool: 2
+    # Pre-booted idle VMs are likewise refused until a provider owns and accounts
+    # for them. No accepted key is allowed to be an inert cost setting.
+    # warm_pool: 2
 
   # A tier that produces release artifacts. Interception is deliberately absent.
   - label: billet-4vcpu-ubuntu-2404-release
@@ -585,13 +676,13 @@ tiers:
 # types "hom" would get a site of its own, an empty cache, and every job placed
 # there running cold while the fleet looked healthy.
 #
-# Today a site carries identity, which is the half placement needs. The storage
-# backend that will hang off it — Ceph at a bare-metal site, EBS and S3 in a
-# cloud region — arrives with the storage layer (#23, #25).
-#
 # sites:
 #   - name: home
-#   - name: aws-us-west-2
+#     store: ceph
+#
+# `store: ebs-s3` selects the AWS-local EBS snapshot and S3 pointer backend. A
+# cache key never crosses sites: the first AWS failover runs cold, and later jobs
+# at the same AWS site can reuse the generation it publishes.
 #
 # A tier may then insist on one, the way it can already pin a node — except a
 # site holds several machines, so it constrains WITHOUT giving up the fallback

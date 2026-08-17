@@ -54,6 +54,10 @@ type custody struct {
 	// investigation would have to unpick.
 	outcome alloc.Phase
 
+	// phase is the durable, operator-visible kind of hold this entry reports.
+	// Custody preserves adopted work; teardown is actively trying to remove it.
+	phase alloc.Phase
+
 	// discard is true when the instance must go as soon as it can be found, and
 	// false when it is running work that should be allowed to finish.
 	//
@@ -114,6 +118,15 @@ type custody struct {
 
 // adopt takes custody of an instance that survived a restart.
 func (r *Runner) adopt(lease *alloc.Lease, inst *provider.Instance) {
+	outcome := alloc.PhaseDone
+	discard := false
+	phase := alloc.PhaseCustody
+	if lease.FailureReason != "" {
+		outcome = alloc.PhaseFailed
+		discard = true
+		phase = alloc.PhaseTeardown
+	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -123,7 +136,9 @@ func (r *Runner) adopt(lease *alloc.Lease, inst *provider.Instance) {
 		name:      inst.Name,
 		instance:  inst.ID,
 		requestID: lease.RequestID,
-		outcome:   alloc.PhaseDone,
+		outcome:   outcome,
+		phase:     phase,
+		discard:   discard,
 		// Adoption starts from a container billet just watched running.
 		observed: true,
 		since:    r.now(),
@@ -176,6 +191,7 @@ func (r *Runner) holdWithOutcome(lease *alloc.Lease, name string, requestID int6
 		requestID: requestID,
 		discard:   true,
 		outcome:   outcome,
+		phase:     alloc.PhaseTeardown,
 		since:     r.now(),
 		// NOT observed, even for a teardown of an instance billet launched and
 		// holds an id for. The grace before an absence is believed is what stops an
@@ -349,7 +365,8 @@ func (r *Runner) renewHeld(ctx context.Context) {
 			continue
 		}
 
-		if errors.Is(err, alloc.ErrLeaseNotFound) || errors.Is(err, alloc.ErrFenced) {
+		if errors.Is(err, alloc.ErrLeaseNotFound) || errors.Is(err, alloc.ErrFenced) ||
+			errors.Is(err, alloc.ErrForceRelease) {
 			// Expected once a job finishes: the listener released the lease and Tend
 			// is about to clean up the compute. Not worth a line every few seconds.
 			continue
@@ -409,13 +426,28 @@ func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 
 		c.discard = true
 		c.outcome = alloc.PhaseFailed
+		if c.phase != "" {
+			c.phase = alloc.PhaseTeardown
+		}
 	} else if held > custodyWarnAfter {
 		r.log.Warn("still holding capacity for compute billet is not managing",
 			"name", c.name, "lease", c.leaseID, "held_for", held.Round(time.Minute),
 			"adopted", !c.discard)
 	}
 
+	heartbeatOK := false
 	if err := r.alloc.Heartbeat(ctx, c.leaseID, c.epoch.Load()); err != nil {
+		if errors.Is(err, alloc.ErrForceRelease) {
+			r.log.Warn("an operator forced the release of compute held here; dropping custody",
+				"name", c.name, "lease", c.leaseID)
+			c.discard = true
+			c.outcome = alloc.PhaseFailed
+			c.unconfirmed.Store(false)
+			r.cleanupCache(ctx, c.name)
+
+			return r.finish(ctx, c)
+		}
+
 		if !errors.Is(err, alloc.ErrLeaseNotFound) && !errors.Is(err, alloc.ErrFenced) {
 			return fmt.Errorf("node: hold the capacity of lease %s: %w", c.leaseID, err)
 		}
@@ -440,6 +472,17 @@ func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 			// The lease is gone. Its capacity is already back in the budget, so the
 			// instance is now an orphan whatever it was before.
 			c.discard = true
+		}
+	} else {
+		heartbeatOK = true
+	}
+
+	// REPORTED ONLY WHILE THIS EPOCH IS CURRENT. A fenced entry may have become
+	// quarantine, and writing an older in-memory classification over that would
+	// erase the control plane's more conservative verdict.
+	if heartbeatOK && c.phase != "" {
+		if err := r.alloc.Advance(ctx, c.leaseID, c.epoch.Load(), c.phase); err != nil {
+			return fmt.Errorf("node: report %s for held lease %s: %w", c.phase, c.leaseID, err)
 		}
 	}
 
@@ -466,6 +509,7 @@ func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 		// PROVED GONE, by a sustained absence rather than by a backend saying so —
 		// which is the only proof an asynchronous teardown ever offers.
 		c.unconfirmed.Store(false)
+		r.cleanupCache(ctx, c.name)
 
 		return r.finish(ctx, c)
 	}
@@ -518,6 +562,7 @@ func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 	// lease — so a Destroy arriving for its request is answerable with the truth
 	// rather than with custody.
 	c.unconfirmed.Store(false)
+	r.cleanupCache(ctx, c.name)
 
 	r.log.Info("released compute that was being held",
 		"name", c.name, "lease", c.leaseID, "adopted", !c.discard,
@@ -557,6 +602,10 @@ func (r *Runner) requarantined(ctx context.Context, c *custody) (bool, error) {
 		"name", c.name, "lease", c.leaseID, "epoch", lease.Epoch)
 
 	c.epoch.Store(lease.Epoch)
+	// Quarantine is already the durable, more conservative visibility state. Do
+	// not transition it back to custody or teardown merely because its node came
+	// back and resumed tending the same proof obligation.
+	c.phase = ""
 
 	return true, nil
 }
@@ -673,6 +722,9 @@ func (r *Runner) releaseRequest(ctx context.Context, requestID int64) error {
 
 	for _, c := range held {
 		c.discard = true
+		if c.phase != "" {
+			c.phase = alloc.PhaseTeardown
+		}
 
 		r.log.Info("a job billet adopted has been reported finished; releasing its compute",
 			"lease", c.leaseID, "request", requestID)
@@ -740,6 +792,7 @@ func (r *Runner) Superseded() {
 			instance:  inst.ID,
 			requestID: requestID,
 			outcome:   alloc.PhaseDone,
+			phase:     alloc.PhaseCustody,
 			since:     r.now(),
 			// ALREADY SEEN, because this came from the running set: its launch was
 			// observed, so a later absence means it genuinely went away rather than

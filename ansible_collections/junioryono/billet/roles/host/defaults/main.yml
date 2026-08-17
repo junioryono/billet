@@ -1,0 +1,70 @@
+---
+billet_binary_src: "{{ lookup('env', 'BILLET_BINARY_PATH') }}"
+billet_config: {}
+billet_github_private_key_src: "{{ lookup('env', 'BILLET_GITHUB_PRIVATE_KEY_PATH') }}"
+
+billet_service_user: billet
+billet_service_group: billet
+billet_service_home: /var/lib/billet
+billet_adopt_existing_service_account: false
+billet_enable_server: true
+billet_enable_node: true
+
+billet_firecracker_enabled: true
+billet_firecracker_version: v1.16.1
+billet_firecracker_checksums:
+  x86_64: 382a02a869e4d6d5cb14c40577f9545e8458021ea8b0b2d3fc10ec14d9c242e6
+  aarch64: 8d0e69f6d6f9a1724551f607f18504052c16c1828ee3d4d7b6e6c73380871e0e
+billet_firecracker_stage: /var/cache/billet-provision
+
+billet_networks:
+  - name: billet0
+    address: 172.31.0.1
+    prefix: 24
+    netmask: 255.255.255.0
+    dhcp_start: 172.31.0.10
+    dhcp_end: 172.31.0.250
+  - name: billet1
+    address: 172.31.1.1
+    prefix: 24
+    netmask: 255.255.255.0
+    dhcp_start: 172.31.1.10
+    dhcp_end: 172.31.1.250
+billet_guest_dns_servers:
+  - 1.1.1.1
+  - 1.0.0.1
+billet_guest_denied_ipv4:
+  - 10.0.0.0/8
+  - 100.64.0.0/10
+  - 169.254.0.0/16
+  - 172.16.0.0/12
+  - 192.168.0.0/16
+billet_guest_denied_ipv6:
+  - fc00::/7
+  - fe80::/10
+billet_guest_host_tcp_ports:
+  - 53
+  - 7718
+billet_guest_host_udp_ports:
+  - 53
+  - 67
+billet_image_verify_port: "{{ billet_config.node.firecracker.image_verify_port | default(7719, true) }}"
+
+billet_ceph_enabled: true
+billet_ceph_bootstrap: false
+billet_ceph_mon_ip: ""
+billet_ceph_ssh_user: "{{ ansible_user }}"
+billet_ceph_devices: []
+billet_ceph_image_pool: billet-images
+billet_ceph_cache_pool: billet-cache
+billet_ceph_pool_size: 2
+billet_ceph_pool_min_size: 1
+billet_ceph_user: billet
+billet_ceph_keyring_path: /etc/ceph/ceph.client.billet.keyring
+
+billet_alert_email: ""
+billet_alert_from: ""
+billet_smtp_host: email-smtp.us-west-2.amazonaws.com
+billet_smtp_port: 587
+billet_smtp_username: "{{ lookup('env', 'SES_SMTP_USERNAME') }}"
+billet_smtp_password: "{{ lookup('env', 'SES_SMTP_PASSWORD') }}"

@@ -86,7 +86,7 @@ const beganDraining = "draining: not taking new work"
 func slowPoll() { time.Sleep(2 * time.Millisecond) }
 
 // outlivesTheDrain is a lease TTL long enough that no lease can expire while a drain
-// is being timed out.
+// is being staged or timed out.
 //
 // A TEST THAT ASSERTS THE DRAIN RAN OUT OF BUDGET MUST OUTLIVE ITS OWN LEASES. The
 // drain ends on whichever comes first — everything finished, or the budget gone —
@@ -94,8 +94,15 @@ func slowPoll() { time.Sleep(2 * time.Millisecond) }
 // never writes the line those tests assert on. At the 300ms TTL the other drain
 // tests use that happened about one run in four under -race.
 //
+// LONGER THAN THIS FILE'S 30-SECOND SETUP DEADLINES, not merely longer than the
+// 200ms drain itself. Making the TTL and the setup deadline both 30 seconds left
+// the assertion dependent on which one a delayed CI worker reached first: a lease
+// could expire while the test was still waiting for the job to enter `running`,
+// then make the drain truthfully report that everything had finished. That is the
+// rare ordering recorded in #74.
+//
 // Tests asserting the drain finished its work do not need this.
-const outlivesTheDrain = 30 * time.Second
+const outlivesTheDrain = time.Minute
 
 // gaveUp is the drain giving up on its budget, as opposed to finishing. Kept as
 // a constant so a reworded message breaks the tests that depend on it here
@@ -459,6 +466,16 @@ func TestADrainRefusesNewWorkAndStillHearsCompletions(t *testing.T) {
 // the ordinary teardown destroys what is left — which is exactly what every
 // shutdown did before a drain existed, so an overrun degrades rather than fails.
 func TestADrainThatOverrunsItsBudgetDestroysWhatIsLeft(t *testing.T) {
+	const (
+		setupBudget = 30 * time.Second
+		drainBudget = 200 * time.Millisecond
+	)
+
+	if outlivesTheDrain <= setupBudget+drainBudget {
+		t.Fatalf("lease TTL %s does not outlive the test's %s setup and %s drain budgets",
+			outlivesTheDrain, setupBudget, drainBudget)
+	}
+
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
 	// A lease TTL longer than the drain budget — see outlivesTheDrain.
 	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
@@ -467,7 +484,7 @@ func TestADrainThatOverrunsItsBudgetDestroysWhatIsLeft(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
-	deadline, cancelDeadline := context.WithTimeout(t.Context(), 30*time.Second)
+	deadline, cancelDeadline := context.WithTimeout(t.Context(), setupBudget)
 	defer cancelDeadline()
 
 	var assigned atomic.Bool
@@ -505,7 +522,7 @@ func TestADrainThatOverrunsItsBudgetDestroysWhatIsLeft(t *testing.T) {
 	var dl drainLog
 
 	l := NewListener(a, "billet-4vcpu-a", session,
-		WithRunner(runner), WithDrainGrace(200*time.Millisecond), dl.option())
+		WithRunner(runner), WithDrainGrace(drainBudget), dl.option())
 
 	run := startRun(ctx, l)
 

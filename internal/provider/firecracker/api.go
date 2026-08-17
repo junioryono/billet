@@ -96,6 +96,11 @@ func (a *vmmAPI) put(ctx context.Context, path string, body any) error {
 	return a.call(ctx, http.MethodPut, path, body, nil)
 }
 
+// patch replaces the backing path of a drive the guest has left unmounted.
+func (a *vmmAPI) patch(ctx context.Context, path string, body any) error {
+	return a.call(ctx, http.MethodPatch, path, body, nil)
+}
+
 // call issues one request and decodes the answer.
 func (a *vmmAPI) call(ctx context.Context, method, path string, body, out any) error {
 	var payload io.Reader

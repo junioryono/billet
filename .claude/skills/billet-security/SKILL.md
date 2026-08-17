@@ -7,6 +7,10 @@ description: "billet's credential and identity rules — the GitHub App private 
 
 billet holds an App private key that can mint tokens for an entire GitHub organization. These rules exist because a quiet mistake here is expensive and invisible.
 
+### The server is unprivileged; the node is a root custodian
+
+The packaged server unit runs as `billet`, but the node unit runs as root. This is not optional for the Firecracker backend: it creates TAP devices and block-device nodes, enters cgroups and chroots, and signals a VMM after proving the pid still names that lease. Docker's rootful socket is already equivalent to host root. The isolation boundary is downstream: the jailer drops every VMM to its own numeric uid before Firecracker reads guest-controlled state, and runner guests never receive the Docker socket. `ProtectSystem=strict` stays on the node unit, with only `/srv/jailer`, the systemd-managed state directory and runtime directory writable.
+
 ### A credential GitHub issued once is never deleted, and never rendered
 
 GitHub returns the App private key **exactly once**, from the manifest conversion. There is no re-issue. Every rule here exists because a review found a way to lose or leak it, and several were introduced by the fix for the previous one.
@@ -63,6 +67,18 @@ The structural fix is to keep the URL out of argv — write it to a 0600 file wi
 Four review rounds went into scheduling around this before anyone noticed it was downstream of argv. That is the lesson worth keeping: when fixes keep producing adjacent bugs, look for the premise they all share.
 
 **`App` is redacted on every rendering path billet can reach.** `String`/`GoString` on a **value** receiver (a pointer receiver is not consulted when a value is formatted), `Format` so no verb falls back to the raw fields — `%d` printed the key before it existed — and `MarshalJSON` plus `LogValue`, because billet standardizes on `log/slog` and its JSON handler ignores `fmt` entirely. Only marshaling is redirected; decoding GitHub's response still populates every field. Not absolute, and the gaps are known: an `App` reached through an unexported field of another struct, and any serializer that is neither `fmt` nor `encoding/json` nor `slog` — reflection-based dumpers read the fields directly.
+
+### A cache bearer lives exactly as long as the compute it belongs to
+
+The Firecracker cache endpoint is reachable only on the guest bridge, but reachability is not identity: every microVM gets its own 32-byte random bearer and may act only on the five drive slots in that session. EC2 carries the same bearer in one-job instance user data and sends it back only over HTTPS; the AMI must trust the configured endpoint certificate, the listener must be restricted to the runner security groups, and config refuses a plaintext cloud endpoint. The token is guest metadata and a node-local credential, never a cache key, never a log field, and never a deployment-wide secret. Custody records live under the node state directory in mode 0600 files inside a 0700 directory so a node process restart preserves the token-to-instance-to-volume relationship rather than either orphaning mapped storage or granting a recovered guest a fresh identity.
+
+**The bearer stops authorising new work before cleanup starts, and its custody is removed only after every clone is released.** `Cleanup` is called only after the provider has proved the compute gone; it first durably marks the session closed, making every later guest request return gone, then performs idempotent discards. A transient discard failure retains the closed session and its remaining volume handles for the retry sweep. Eviction is not a substitute for custody because a mapped orphan is deliberately protected from eviction.
+
+**Trust gates publication, not reads.** An untrusted job may hydrate from the trusted baseline but its clone is discarded without publishing and without changing the job result. This makes the cached bytes a deployment-and-site trust boundary: exact sticky-disk keys may deliberately cross repositories, and the transparent Docker image store is shared by deployment, site and architecture, so neither may contain secrets. A private image pulled by one trusted job can be readable by a later job in that same boundary; operators who cannot accept that boundary must leave the cache disabled.
+
+**EBS/S3 destruction is scoped by an ownership tag, not by a name or an AWS account.** Every volume and snapshot carries the deployment identity; attach rediscovery and orphan cleanup filter on it, and a missing or unreadable tag is not ownership. The S3 object contains only fenced metadata, while cache bytes remain in encrypted EBS snapshots. Conditional publication may succeed while its response is lost, so the generation stores a writer, fence, and previous-pointer receipt: a retry recognizes exactly its own committed write, while any different ETag is a lost race rather than permission to overwrite it.
+
+**Registry mirrors are public site infrastructure, never credential stores.** The configured Docker Hub, GHCR and Quay endpoints are reachable from every guest bridge, trusted and untrusted, and Distribution proxy mode makes anything its upstream credential can read available to its clients. Each endpoint therefore serves public content without an upstream credential. There are three distinct instances because one proxy process accepts one upstream; BuildKit consumes all three, while Docker Engine's supported mirror setting applies only to Docker Hub.
 
 ### A registration proves who you are; only a command proves what you may do
 

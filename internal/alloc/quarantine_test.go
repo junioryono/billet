@@ -108,6 +108,58 @@ func TestAnExpiredRunningLeaseKeepsItsCapacityCharged(t *testing.T) {
 	}
 }
 
+// Custody and teardown still mean compute may exist. If their holder vanishes,
+// expiry must become quarantine rather than returning the same capacity twice.
+func TestExpiredHeldPhasesBecomeQuarantine(t *testing.T) {
+	for _, phase := range []Phase{PhaseCustody, PhaseTeardown} {
+		t.Run(string(phase), func(t *testing.T) {
+			now := time.Now().UTC()
+			a := quarantineFleet(t, &now)
+			lease := busyLease(t, a)
+
+			if err := a.Advance(t.Context(), lease.ID, lease.Epoch, phase); err != nil {
+				t.Fatalf("Advance: %v", err)
+			}
+			now = now.Add(31 * time.Second)
+
+			if reaped, err := a.Reap(t.Context()); err != nil || reaped != 0 {
+				t.Fatalf("Reap = %d, %v; held compute must not be terminalized", reaped, err)
+			}
+			got, err := a.Lease(t.Context(), lease.ID)
+			if err != nil || got.Phase != PhaseQuarantine {
+				t.Fatalf("expired %s lease = %+v, %v; want quarantine", phase, got, err)
+			}
+		})
+	}
+}
+
+// Quarantine has no live holder to notify, so an operator's force assertion
+// resolves it immediately rather than leaving a request nobody can observe.
+func TestForceReleaseResolvesQuarantineWithoutALiveHolder(t *testing.T) {
+	now := time.Now().UTC()
+	a := quarantineFleet(t, &now)
+	lease := busyLease(t, a)
+
+	now = now.Add(31 * time.Second)
+	if _, err := a.Reap(t.Context()); err != nil {
+		t.Fatalf("Reap: %v", err)
+	}
+
+	result, err := a.ForceRelease(t.Context(), lease.ID)
+	if err != nil {
+		t.Fatalf("ForceRelease: %v", err)
+	}
+	if result.Pending {
+		t.Fatalf("ForceRelease = %+v; quarantine has no holder to wait for", result)
+	}
+	if _, err := a.Lease(t.Context(), lease.ID); !errors.Is(err, ErrLeaseNotFound) {
+		t.Fatalf("forced quarantine is still open: %v", err)
+	}
+	if got := headroom(t, a, "small"); got != 1 {
+		t.Fatalf("Headroom = %d, want the quarantined capacity returned", got)
+	}
+}
+
 // AND THE REAPER DOES NOT KEEP RE-REAPING IT. A quarantined lease is expired by
 // definition and stays that way until it is resolved, so a reaper that counted
 // it again would spin on the same rows forever and bump their epochs each pass.

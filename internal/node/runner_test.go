@@ -192,6 +192,105 @@ func TestDestroyRemovesWhatWasStarted(t *testing.T) {
 	}
 }
 
+func TestASpotWarningFailsTheRightLeaseWithItsReason(t *testing.T) {
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
+	lease := assignedLease(t, a)
+
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	notice := &provider.InterruptionNotice{
+		InstanceID: "instance-" + provider.InstanceName(lease.ID),
+		Action:     "terminate",
+	}
+	if err := r.handleInterruption(t.Context(), notice); err != nil {
+		t.Fatalf("handleInterruption: %v", err)
+	}
+
+	if got, err := a.HistoryOutcome(t.Context(), lease.ID); err != nil {
+		t.Fatalf("HistoryOutcome: %v", err)
+	} else if got != string(alloc.PhaseFailed) {
+		t.Errorf("outcome = %q, want failed", got)
+	}
+	if got, err := a.HistoryFailureReason(t.Context(), lease.ID); err != nil {
+		t.Fatalf("HistoryFailureReason: %v", err)
+	} else if got != "ec2 spot interruption: terminate" {
+		t.Errorf("failure reason = %q", got)
+	}
+	if len(p.destroyed) != 1 {
+		t.Errorf("destroyed %d instances, want the warned one", len(p.destroyed))
+	}
+}
+
+func TestAnInterruptionMessageIsAcknowledgedAfterTheFailureIsDurable(t *testing.T) {
+	p := &interruptingProvider{
+		fakeProvider: &fakeProvider{kind: config.ProviderDocker},
+		notices:      make(chan *provider.InterruptionNotice, 1),
+		acked:        make(chan *provider.InterruptionNotice, 1),
+	}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
+	lease := assignedLease(t, a)
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r.WatchInterruptions(ctx)
+	}()
+	p.notices <- &provider.InterruptionNotice{
+		InstanceID: "instance-" + provider.InstanceName(lease.ID),
+		Action:     "terminate",
+		Receipt:    "secret-receipt",
+	}
+
+	select {
+	case <-p.acked:
+	case <-time.After(time.Second):
+		t.Fatal("the handled warning was not acknowledged")
+	}
+	if reason, err := a.HistoryFailureReason(t.Context(), lease.ID); err != nil {
+		t.Fatalf("the message was acknowledged before its history was durable: %v", err)
+	} else if reason == "" {
+		t.Fatal("the message was acknowledged with no durable failure reason")
+	}
+
+	cancel()
+	<-done
+}
+
+func TestASharedQueueWarningIsNotAcknowledgedByTheWrongNode(t *testing.T) {
+	p := &interruptingProvider{
+		fakeProvider: &fakeProvider{kind: config.ProviderDocker},
+		notices:      make(chan *provider.InterruptionNotice, 1),
+		acked:        make(chan *provider.InterruptionNotice, 1),
+	}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r.WatchInterruptions(ctx)
+	}()
+	p.notices <- &provider.InterruptionNotice{InstanceID: "instance-owned-by-sibling", Action: "terminate"}
+
+	select {
+	case <-p.acked:
+		t.Fatal("a node acknowledged its sibling's interruption warning")
+	case <-time.After(100 * time.Millisecond):
+	}
+	cancel()
+	<-done
+}
+
 // #46. A TEARDOWN THAT WAS MERELY ACCEPTED DOES NOT RELEASE THE CAPACITY.
 //
 // The listener releases a lease when Destroy returns nil, and its comment says
@@ -280,6 +379,92 @@ func TestAnAcceptedTeardownHoldsTheCapacityUntilTheComputeIsProvablyGone(t *test
 	}
 }
 
+// A held teardown is visible in the ledger, and a force release is delivered to
+// the live node through its heartbeat. The node drops custody before the lease
+// becomes terminal; it does not need a working provider read after an operator
+// supplies the missing proof.
+func TestAnOperatorCanForceAVisibleTeardownThroughItsLiveNode(t *testing.T) {
+	p := &fakeProvider{kind: config.ProviderDocker, asyncTeardown: true}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
+
+	lease := assignedLease(t, a)
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 81, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	if err := r.Destroy(t.Context(), 81); !errors.Is(err, server.ErrCustody) {
+		t.Fatalf("Destroy = %v, want ErrCustody", err)
+	}
+	if err := r.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend: %v", err)
+	}
+
+	held, err := a.Held(t.Context())
+	if err != nil {
+		t.Fatalf("Held: %v", err)
+	}
+	if len(held) != 1 || held[0].ID != lease.ID || held[0].Node != host ||
+		held[0].State != alloc.PhaseTeardown || held[0].Since == "" {
+		t.Fatalf("visible held leases = %+v, want this teardown with node and time", held)
+	}
+
+	result, err := a.ForceRelease(t.Context(), lease.ID)
+	if err != nil {
+		t.Fatalf("ForceRelease: %v", err)
+	}
+	if !result.Pending || result.Node != host {
+		t.Fatalf("ForceRelease = %+v, want a request addressed to the live holder", result)
+	}
+
+	// The operator has independently established that the guest is gone. Make the
+	// provider unreadable to prove this path acts on that assertion rather than
+	// accidentally requiring the same observation that was stuck.
+	delete(p.live, provider.InstanceName(lease.ID))
+	p.findErr = errors.New("credentials are broken")
+
+	if err := r.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend after force request: %v", err)
+	}
+	if len(r.heldLeases()) != 0 {
+		t.Fatal("the node kept its local custody record after accepting the force request")
+	}
+	if _, err := a.Lease(t.Context(), lease.ID); !errors.Is(err, alloc.ErrLeaseNotFound) {
+		t.Fatalf("forced lease is still open: %v", err)
+	}
+}
+
+func TestRecoveryConsumesAForceReleaseRequestedBeforeRestart(t *testing.T) {
+	p := &fakeProvider{kind: config.ProviderDocker, asyncTeardown: true}
+	a, host := newAllocatorWithHost(t)
+	first := New(a, host, &fakeJIT{setID: 7}, p, nil)
+	lease := assignedLease(t, a)
+	if err := first.Launch(t.Context(), lease, dockerSpec(), Job{
+		RequestID: 81, Event: "push",
+	}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	if err := first.Destroy(t.Context(), 81); !errors.Is(err, server.ErrCustody) {
+		t.Fatalf("Destroy = %v, want ErrCustody", err)
+	}
+	if err := first.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend: %v", err)
+	}
+	if _, err := a.ForceRelease(t.Context(), lease.ID); err != nil {
+		t.Fatalf("ForceRelease: %v", err)
+	}
+
+	restarted := New(a, host, &fakeJIT{setID: 7}, p, nil)
+	if err := restarted.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	if len(restarted.heldLeases()) != 0 {
+		t.Fatal("recovery retained custody after consuming the pending force release")
+	}
+	if _, err := a.Lease(t.Context(), lease.ID); !errors.Is(err, alloc.ErrLeaseNotFound) {
+		t.Fatalf("forced lease is still open after recovery: %v", err)
+	}
+}
+
 // AND IT KEEPS SAYING SO. The SECOND destroy for the same request must answer
 // ErrCustody too, not success.
 //
@@ -351,6 +536,12 @@ func TestARequestWithBothCustodyAndARunningInstanceStillDestroysTheRunningOne(t 
 
 	// The custody half: a lease held here whose compute is not confirmed gone.
 	adopted := assignedLease(t, a)
+	if err := a.Bind(t.Context(), adopted.ID, adopted.Epoch, host); err != nil {
+		t.Fatalf("Bind adopted lease: %v", err)
+	}
+	if err := a.Advance(t.Context(), adopted.ID, adopted.Epoch, alloc.PhaseLaunching); err != nil {
+		t.Fatalf("Advance adopted lease: %v", err)
+	}
 	r.holdWithOutcome(adopted, provider.InstanceName(adopted.ID), 11, alloc.PhaseDone)
 
 	// The running half: a different lease, for the same request.
@@ -621,6 +812,32 @@ type fakeProvider struct {
 	// enteredLaunch receives once Launch has begun waiting, so a test can act
 	// while the provider is genuinely mid-launch rather than sleeping and hoping.
 	enteredLaunch chan struct{}
+}
+
+type interruptingProvider struct {
+	*fakeProvider
+	notices chan *provider.InterruptionNotice
+	acked   chan *provider.InterruptionNotice
+}
+
+func (p *interruptingProvider) NextInterruption(ctx context.Context) (*provider.InterruptionNotice, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case notice := <-p.notices:
+		return notice, nil
+	}
+}
+
+func (p *interruptingProvider) AcknowledgeInterruption(
+	ctx context.Context, notice *provider.InterruptionNotice,
+) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case p.acked <- notice:
+		return nil
+	}
 }
 
 func (f *fakeProvider) Kind() config.ProviderKind { return f.kind }

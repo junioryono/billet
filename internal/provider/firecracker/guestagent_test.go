@@ -2,6 +2,7 @@ package firecracker
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -9,6 +10,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/junioryono/billet/internal/config"
 )
 
 // THE GUEST AGENT'S DECODE IS RUN HERE, not described here.
@@ -120,6 +123,72 @@ func TestTheGuestAgentRefusesMetadataThatIsNotAnArgv(t *testing.T) {
 				t.Errorf("the agent accepted %s and would run %q", tc.raw, got)
 			}
 		})
+	}
+}
+
+func TestTheGuestMountsDockerStateBeforeStartingTheDaemon(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join("..", "..", "..", "scripts", "build-guest-image.sh")
+	source, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read guest image builder: %v", err)
+	}
+	text := string(source)
+
+	mountAt := strings.Index(text, "mount -t ext4 -o noatime /dev/vdb /var/lib/docker")
+	startAt := strings.Index(text, "systemctl start docker.service")
+	if mountAt < 0 || startAt < 0 || mountAt >= startAt {
+		t.Fatalf("Docker cache mount/start order is not encoded in the guest agent")
+	}
+	if strings.Contains(text, "After=network-online.target docker.service") ||
+		strings.Contains(text, "Requires=docker.service") {
+		t.Fatal("systemd can start Docker before the guest agent mounts its image store")
+	}
+	if !strings.Contains(text, "systemctl disable docker.service docker.socket") {
+		t.Fatal("the image still permits Docker to autostart before its cache is mounted")
+	}
+	if strings.Contains(text, "operation=commit") ||
+		!strings.Contains(text, `"$cache_endpoint/v1/volumes/0/discard"`) {
+		t.Fatal("the guest can publish Docker state without an authoritative job result")
+	}
+	if !strings.Contains(text, "BILLET_BUILDKIT_CACHE_MOUNT_LIMIT_BYTES") ||
+		!strings.Contains(text, "fetch buildkit-cache-mount-limit-bytes") {
+		t.Fatal("the tier's BuildKit cache-mount ceiling never reaches workflow actions")
+	}
+	configureAt := strings.Index(text, "registry-mirrors")
+	if configureAt < 0 || configureAt >= startAt {
+		t.Fatal("the guest does not configure its Docker Hub mirror before Docker starts")
+	}
+	if !strings.Contains(text, "fetch registry-mirrors") ||
+		!strings.Contains(text, "BILLET_REGISTRY_MIRRORS_JSON") {
+		t.Fatal("the three registry mirrors do not reach the guest's BuildKit actions")
+	}
+}
+
+func TestRegistryMirrorsRemainAStringLeafInGuestMetadata(t *testing.T) {
+	t.Parallel()
+
+	spec := aSpec()
+	spec.RegistryMirrors = config.RegistryMirrors{
+		DockerIO: "https://docker-cache.home.example",
+		GHCRIO:   "https://ghcr-cache.home.example",
+		QuayIO:   "https://quay-cache.home.example",
+	}
+	md, err := metadata(spec)
+	if err != nil {
+		t.Fatalf("metadata: %v", err)
+	}
+	raw, ok := md["latest"].(map[string]any)["meta-data"].(map[string]any)["billet"].(map[string]any)["registry-mirrors"].(string)
+	if !ok {
+		t.Fatalf("registry mirrors are not an MMDS string leaf: %v", md)
+	}
+	var got config.RegistryMirrors
+	if err := json.Unmarshal([]byte(raw), &got); err != nil {
+		t.Fatalf("decode registry mirrors: %v", err)
+	}
+	if got != spec.RegistryMirrors {
+		t.Errorf("registry mirrors = %+v, want %+v", got, spec.RegistryMirrors)
 	}
 }
 

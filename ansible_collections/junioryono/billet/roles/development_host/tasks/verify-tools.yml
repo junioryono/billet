@@ -1,0 +1,29 @@
+---
+- name: Read the Caddy version
+  ansible.builtin.command:
+    argv: ["{{ billet_development_caddy_bin }}", version]
+  register: billet_development_caddy_version_command
+  changed_when: false
+
+- name: Read the mkcert version
+  ansible.builtin.command:
+    argv: ["{{ billet_development_mkcert_bin }}", -version]
+  register: billet_development_mkcert_version_command
+  changed_when: false
+
+- name: Read the Terraform version
+  ansible.builtin.command:
+    argv: ["{{ billet_development_terraform_bin }}", version, -json]
+  register: billet_development_terraform_version_command
+  changed_when: false
+  when: billet_development_install_terraform
+
+- name: Validate installed development tool versions
+  ansible.builtin.assert:
+    that:
+      - billet_development_caddy_version_command.stdout | regex_replace('^v', '') is version(billet_development_caddy_min_version, '>=')
+      - not billet_development_install_terraform or (billet_development_terraform_version_command.stdout | from_json).terraform_version is version(billet_development_terraform_min_version, '>=')
+    fail_msg: >-
+      The installed Caddy or Terraform is older than this role supports. Caddy
+      must be at least {{ billet_development_caddy_min_version }} and Terraform
+      must be at least {{ billet_development_terraform_min_version }}.

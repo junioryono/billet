@@ -1,0 +1,20 @@
+---
+namespace: junioryono
+name: billet
+version: 0.1.0
+readme: README.md
+authors:
+  - junioryono
+description: Provision Billet runner hosts and reusable development gateways.
+license:
+  - Apache-2.0
+repository: https://github.com/junioryono/billet
+issues: https://github.com/junioryono/billet/issues
+tags:
+  - ci
+  - github
+  - firecracker
+  - ceph
+  - development
+dependencies:
+  ansible.posix: ">=1.5.4,<3.0.0"

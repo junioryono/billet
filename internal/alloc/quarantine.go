@@ -20,6 +20,123 @@ type QuarantinedLease struct {
 	Since  string
 }
 
+// HeldLease is capacity retained while compute has not been confirmed gone.
+// State distinguishes a live node tending it from a lease whose holder vanished.
+type HeldLease struct {
+	ID             string
+	Tier           string
+	Node           string
+	State          Phase
+	VCPU           int
+	Memory         config.ByteSize
+	Since          string
+	ForceRequested bool
+}
+
+// Held lists every operator-visible proof obligation, oldest first.
+func (a *Allocator) Held(ctx context.Context) ([]HeldLease, error) {
+	var out []HeldLease
+
+	err := a.db.View(ctx, func(tx querier) error {
+		rows, err := tx.QueryContext(ctx,
+			`SELECT id, tier, COALESCE(node, target_node, ''), phase, vcpu, memory,
+			        held_at, force_release
+			   FROM leases
+			  WHERE phase IN (?,?,?)
+			  ORDER BY held_at, id`, PhaseCustody, PhaseTeardown, PhaseQuarantine)
+		if err != nil {
+			return fmt.Errorf("alloc: list held leases: %w", err)
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var (
+				h     HeldLease
+				state string
+				mem   int64
+				force int
+			)
+
+			if err := rows.Scan(&h.ID, &h.Tier, &h.Node, &state, &h.VCPU, &mem,
+				&h.Since, &force); err != nil {
+				return fmt.Errorf("alloc: scan a held lease: %w", err)
+			}
+
+			h.State = Phase(state)
+			h.Memory = config.ByteSize(mem)
+			h.ForceRequested = force == 1
+			out = append(out, h)
+		}
+
+		return rows.Err()
+	})
+
+	return out, err
+}
+
+// ForceReleaseResult says whether capacity was returned immediately or the
+// request was handed to a live custody holder.
+type ForceReleaseResult struct {
+	Node    string
+	Pending bool
+}
+
+// ForceRelease records an operator's assertion that held compute is gone.
+//
+// A quarantined lease has no live holder, so it is resolved here. Custody and
+// teardown do have one: setting force_release makes its next heartbeat return
+// ErrForceRelease, after which that node drops the local custody record and
+// releases the lease. This ordering avoids changing the ledger underneath a
+// process that still believes it owns the proof obligation.
+func (a *Allocator) ForceRelease(ctx context.Context, leaseID string) (ForceReleaseResult, error) {
+	var result ForceReleaseResult
+
+	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+		var epoch int64
+		if err := tx.QueryRowContext(ctx, `SELECT epoch FROM leases WHERE id = ?`, leaseID).
+			Scan(&epoch); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("%w: %s", ErrLeaseNotFound, leaseID)
+			}
+
+			return fmt.Errorf("alloc: read held lease %s: %w", leaseID, err)
+		}
+
+		lease, err := a.loadAny(ctx, tx, leaseID, epoch)
+		if err != nil {
+			return err
+		}
+		result.Node = lease.Node
+
+		switch lease.Phase {
+		case PhaseQuarantine:
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE leases SET phase = ?, epoch = epoch + 1 WHERE id = ? AND epoch = ?`,
+				string(PhaseFailed), leaseID, epoch); err != nil {
+				return fmt.Errorf("alloc: force-release quarantined lease %s: %w", leaseID, err)
+			}
+
+			return a.archive(ctx, tx, lease, PhaseFailed)
+
+		case PhaseCustody, PhaseTeardown:
+			result.Pending = true
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE leases SET force_release = 1 WHERE id = ? AND epoch = ?`,
+				leaseID, epoch); err != nil {
+				return fmt.Errorf("alloc: request force-release of lease %s: %w", leaseID, err)
+			}
+
+			return nil
+
+		default:
+			return fmt.Errorf("%w: lease %s is %s, not held in custody, teardown, or quarantine",
+				ErrBadTransition, leaseID, lease.Phase)
+		}
+	})
+
+	return result, err
+}
+
 // Quarantined lists the leases holding capacity for compute nobody has accounted
 // for, oldest first.
 //

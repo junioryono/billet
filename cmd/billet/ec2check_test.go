@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -177,6 +178,8 @@ func TestTheCloudPreflightSaysWhatSpotCosts(t *testing.T) {
 		UntrustedSecurityGroupIDs: []string{"sg-fork"},
 		InstanceTypes:             []config.EC2InstanceType{{Type: "c7i.2xlarge", VCPU: 8, Memory: 16 * config.GiB}},
 		Spot:                      true,
+		InterruptionQueueURL:      "https://sqs.us-west-2.amazonaws.com/123456789012/billet",
+		NodeName:                  "billet",
 	}
 
 	var err error
@@ -194,6 +197,57 @@ func TestTheCloudPreflightSaysWhatSpotCosts(t *testing.T) {
 	// warning that never goes away is one nobody reads.
 	if strings.Contains(out, "untrusted work will be refused") {
 		t.Errorf("untrusted work was reported as refused despite having its own group:\n%s", out)
+	}
+}
+
+func TestCheckResolvesASpotNodesCertificateIdentity(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "secret")
+
+	serverCfg := writeCAConfig(t, t.TempDir())
+	bundleDir := filepath.Join(t.TempDir(), "bundle")
+	if err := cmdCAIssue(t.Context(), []string{
+		"aws-1", "--config", serverCfg, "--out", bundleDir,
+	}); err != nil {
+		t.Fatalf("ca issue: %v", err)
+	}
+
+	configPath := filepath.Join(t.TempDir(), "billet.yaml")
+	body := `
+node:
+  server_addr: 10.0.0.4:7717
+  provider: ec2
+  state_dir: ` + t.TempDir() + `
+  max_vcpu: 64
+  max_memory: 256GiB
+  tls:
+    cert: ` + filepath.Join(bundleDir, "node.crt") + `
+    key: ` + filepath.Join(bundleDir, "node.key") + `
+    ca: ` + filepath.Join(bundleDir, "ca.crt") + `
+  ec2:
+    region: us-west-2
+    endpoint: ` + fakeEC2(t, "AKIDEXAMPLE") + `
+    subnet_id: subnet-0abc
+    security_group_ids: [sg-0abc]
+    spot: true
+    interruption_queue_url: https://sqs.us-west-2.amazonaws.com/123456789012/aws-1
+    instance_types:
+      - type: c7i.2xlarge
+        vcpu: 8
+        memory: 16GiB
+        price_usd_per_hour: 0.34
+`
+	if err := os.WriteFile(configPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var err error
+	out := capture(t, func() { err = cmdCheck(t.Context(), []string{"--config", configPath}) })
+	if err != nil {
+		t.Fatalf("billet check: %v", err)
+	}
+	if !strings.Contains(out, "node     aws-1") {
+		t.Fatalf("check did not report the certificate-derived node identity:\n%s", out)
 	}
 }
 

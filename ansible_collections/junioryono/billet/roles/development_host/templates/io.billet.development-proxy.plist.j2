@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{{ billet_development_proxy_launchd_label }}</string>
+  <key>UserName</key>
+  <string>{{ billet_development_user }}</string>
+  <key>GroupName</key>
+  <string>{{ billet_development_group_result.stdout }}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{{ billet_development_caddy_bin }}</string>
+    <string>run</string>
+    <string>--config</string>
+    <string>{{ billet_development_proxy_config_path }}</string>
+    <string>--adapter</string>
+    <string>caddyfile</string>
+    <string>--envfile</string>
+    <string>{{ billet_development_proxy_env_path }}</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>{{ billet_development_proxy_config_dir }}</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>{{ billet_development_home }}</string>
+    <key>XDG_CONFIG_HOME</key>
+    <string>{{ billet_development_proxy_config_dir }}/state</string>
+    <key>XDG_DATA_HOME</key>
+    <string>{{ billet_development_proxy_config_dir }}/data</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>{{ billet_development_proxy_log_path }}</string>
+  <key>StandardErrorPath</key>
+  <string>{{ billet_development_proxy_log_path }}</string>
+  <key>SoftResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>1048576</integer>
+  </dict>
+</dict>
+</plist>

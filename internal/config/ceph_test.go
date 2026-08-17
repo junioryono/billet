@@ -690,7 +690,7 @@ func TestTheDocumentedDockerConversionLoads(t *testing.T) {
 
 	text := string(body)
 
-	// THE HEADER IS PART OF WHAT IS UNDER TEST. Applying three hard-coded edits
+	// THE HEADER IS PART OF WHAT IS UNDER TEST. Applying five hard-coded edits
 	// proves the conversion loads; it says nothing about whether the file still
 	// TELLS an operator to make them, which is the half that went stale. Each
 	// instruction is asserted to still be written down, so deleting one from the
@@ -699,10 +699,11 @@ func TestTheDocumentedDockerConversionLoads(t *testing.T) {
 	// GIVEN, not that its sentence is unchanged — matching a whole line would fail
 	// on a reflow and train the next person to delete this loop.
 	for _, instruction := range []string{
-		"FOUR edits",
+		"FIVE edits",
 		"`provider: firecracker` -> `provider: docker`",
 		"Delete the `ceph:` block",
 		"Delete the `firecracker:` block",
+		"Delete the `cache:` block",
 		"`image:` -> a Docker image",
 	} {
 		if !strings.Contains(text, instruction) {
@@ -732,7 +733,10 @@ func TestTheDocumentedDockerConversionLoads(t *testing.T) {
 	// reads it, and a block nothing consults is refused rather than ignored.
 	text = deleteBlock(t, text, "  firecracker:")
 
-	// Edit 4: a pullable image.
+	// Edit 4: delete the guest cache listener.
+	text = deleteBlock(t, text, "  cache:")
+
+	// Edit 5: a pullable image.
 	if !strings.Contains(text, "image: ubuntu-2404-x64") {
 		t.Fatal("the example no longer names a golden image, so edit 3 patches nothing")
 	}
@@ -759,6 +763,9 @@ func TestTheDocumentedDockerConversionLoads(t *testing.T) {
 
 	if cfg.Node.Firecracker != nil {
 		t.Error("the firecracker block survived edit 3")
+	}
+	if cfg.Node.Cache != nil {
+		t.Error("the cache block survived edit 4")
 	}
 }
 

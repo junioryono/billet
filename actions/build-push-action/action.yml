@@ -1,0 +1,64 @@
+name: billet Docker build and push
+description: Run docker/build-push-action against a per-job BuildKit daemon backed by a sticky disk.
+inputs:
+  cache-key:
+    required: false
+    default: Dockerfile
+  cache-size-gb:
+    required: false
+    default: "100"
+  context:
+    required: false
+    default: "{{defaultContext}}"
+  file:
+    required: false
+  tags:
+    required: false
+  push:
+    required: false
+    default: "false"
+  load:
+    required: false
+    default: "false"
+  platforms:
+    required: false
+  target:
+    required: false
+  build-args:
+    required: false
+  secrets:
+    required: false
+  labels:
+    required: false
+  outputs:
+    required: false
+outputs:
+  imageid:
+    value: ${{ steps.build.outputs.imageid }}
+  digest:
+    value: ${{ steps.build.outputs.digest }}
+  metadata:
+    value: ${{ steps.build.outputs.metadata }}
+runs:
+  using: composite
+  steps:
+    - id: setup
+      uses: junioryono/billet/actions/setup-docker-builder@main
+      with:
+        cache-key: ${{ inputs.cache-key }}
+        cache-size-gb: ${{ inputs.cache-size-gb }}
+    - id: build
+      uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+      with:
+        builder: ${{ steps.setup.outputs.name }}
+        context: ${{ inputs.context }}
+        file: ${{ inputs.file }}
+        tags: ${{ inputs.tags }}
+        push: ${{ inputs.push }}
+        load: ${{ inputs.load }}
+        platforms: ${{ inputs.platforms }}
+        target: ${{ inputs.target }}
+        build-args: ${{ inputs.build-args }}
+        secrets: ${{ inputs.secrets }}
+        labels: ${{ inputs.labels }}
+        outputs: ${{ inputs.outputs }}

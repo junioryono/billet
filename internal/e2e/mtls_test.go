@@ -48,6 +48,12 @@ func (mtlsStore) Advance(context.Context, string, int64, alloc.Phase) error { re
 
 func (mtlsStore) Heartbeat(context.Context, string, int64) error { return nil }
 
+func (mtlsStore) MarkFailure(context.Context, string, int64, string) error { return nil }
+
+func (mtlsStore) Resize(context.Context, string, int64, string, int, config.ByteSize) error {
+	return nil
+}
+
 func (mtlsStore) Release(context.Context, string, int64, alloc.Phase) error { return nil }
 
 func (mtlsStore) Lease(context.Context, string) (*alloc.Lease, error) {

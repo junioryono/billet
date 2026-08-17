@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"text/tabwriter"
+	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
 )
@@ -13,17 +14,84 @@ import (
 // cmdLeases is the operator's view of capacity that has not come back.
 func cmdLeases(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: billet leases quarantined | billet leases release <lease> --force")
+		return cmdLeasesHeld(ctx, nil)
 	}
 
 	switch args[0] {
+	case "held":
+		return cmdLeasesHeld(ctx, args[1:])
 	case "quarantined":
 		return cmdLeasesQuarantined(ctx, args[1:])
 	case "release":
 		return cmdLeasesRelease(ctx, args[1:])
 	}
 
-	return fmt.Errorf("unknown leases command %q; try quarantined or release", args[0])
+	return fmt.Errorf("unknown leases command %q; try held, quarantined, or release", args[0])
+}
+
+// cmdLeasesHeld shows every lease whose compute has not been confirmed gone,
+// including proof obligations a healthy node is actively tending.
+func cmdLeasesHeld(ctx context.Context, args []string) error {
+	fs := newFlagSet("billet leases held")
+	cfgPath := addConfigFlag(fs)
+	if err := parse(fs, args); err != nil {
+		return err
+	}
+
+	a, closeDB, err := controlPlaneAllocator(ctx, *cfgPath)
+	if err != nil {
+		return err
+	}
+	defer closeDB()
+
+	held, err := a.Held(ctx)
+	if err != nil {
+		return err
+	}
+
+	if len(held) == 0 {
+		fmt.Println("Nothing is held: no lease is waiting for compute to be confirmed gone.")
+
+		return nil
+	}
+
+	printHeld(held)
+	fmt.Printf("\nCustody preserves adopted work; teardown is a live node waiting for its backend\n")
+	fmt.Printf("to confirm removal; quarantine has no current holder. When you have independent\n")
+	fmt.Printf("proof the compute is gone:\n\n  billet leases release <lease> --force\n")
+
+	return nil
+}
+
+func printHeld(held []alloc.HeldLease) {
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
+	fmt.Fprintln(w, "LEASE\tTIER\tNODE\tSTATE\tVCPU\tMEMORY\tHELD FOR\tFORCE")
+
+	for i := range held {
+		h := &held[i]
+		force := ""
+		if h.ForceRequested {
+			force = "requested"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\n", h.ID, h.Tier, h.Node,
+			h.State, h.VCPU, h.Memory, heldFor(h.Since), force)
+	}
+
+	_ = w.Flush()
+}
+
+func heldFor(since string) string {
+	t, err := time.Parse(time.RFC3339Nano, since)
+	if err != nil {
+		return since
+	}
+
+	d := time.Since(t)
+	if d < time.Minute {
+		return "<1m"
+	}
+
+	return d.Round(time.Minute).String()
 }
 
 // cmdLeasesQuarantined shows capacity held for compute nobody has accounted for.
@@ -107,7 +175,7 @@ func cmdLeasesRelease(ctx context.Context, args []string) error {
 	defer closeDB()
 
 	if !*force {
-		held, err := a.Quarantined(ctx)
+		held, err := a.Held(ctx)
 		if err != nil {
 			return err
 		}
@@ -117,8 +185,9 @@ func cmdLeasesRelease(ctx context.Context, args []string) error {
 				continue
 			}
 
-			fmt.Printf("Lease %s has been holding %d vCPU and %s on node %q since %s.\n\n",
-				leaseID, held[i].VCPU, held[i].Memory, held[i].Node, held[i].Since)
+			fmt.Printf("Lease %s has been holding %d vCPU and %s on node %q as %s for %s.\n\n",
+				leaseID, held[i].VCPU, held[i].Memory, held[i].Node, held[i].State,
+				heldFor(held[i].Since))
 			fmt.Printf("Nothing has confirmed that its container is gone. If that machine is\n")
 			fmt.Printf("coming back it will free this by itself, and releasing it now means the\n")
 			fmt.Printf("capacity can be sold to a second job while the first is still running.\n\n")
@@ -129,17 +198,21 @@ func cmdLeasesRelease(ctx context.Context, args []string) error {
 			return errors.New("refusing to release without --force")
 		}
 
-		return fmt.Errorf("lease %s is not quarantined; `billet leases quarantined` lists what is",
+		return fmt.Errorf("lease %s is not held; `billet leases` lists what is",
 			leaseID)
 	}
 
-	// FAILED, because an operator forcing this is asserting the machine is not
-	// coming back — whatever the job was doing, it did not finish.
-	if err := a.ResolveQuarantine(ctx, leaseID, alloc.PhaseFailed); err != nil {
+	result, err := a.ForceRelease(ctx, leaseID)
+	if err != nil {
 		return err
 	}
 
-	fmt.Printf("Released %s. Its capacity is available again.\n", leaseID)
+	if result.Pending {
+		fmt.Printf("Asked node %q to release %s. The node will drop its local custody record and "+
+			"return the capacity on its next tend.\n", result.Node, leaseID)
+	} else {
+		fmt.Printf("Released %s. Its capacity is available again.\n", leaseID)
+	}
 
 	return nil
 }

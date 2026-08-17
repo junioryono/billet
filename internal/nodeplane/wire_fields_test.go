@@ -26,18 +26,22 @@ func TestWhatTheNodeReportsArrivesAtTheLedger(t *testing.T) {
 	)
 
 	reg := &fakeRegistrar{}
+	wantShapes := []config.EC2InstanceType{{
+		Type: "c7i.2xlarge", VCPU: 8, Memory: 16 * config.GiB,
+	}}
 
 	_, base := serve(t, &fakeStore{}, nodeplane.WithRegistrar(reg),
-		nodeplane.WithSites([]string{wantSite}))
+		nodeplane.WithSites([]config.SiteConfig{{Name: wantSite, Store: config.SiteStoreEBSS3}}))
 
 	c := dial(t, base)
 
 	if err := c.Register(t.Context(), nodeclient.Registration{
-		Provider:   config.ProviderDocker,
+		Provider:   config.ProviderEC2,
 		Deployment: deployment,
 		Site:       wantSite,
 		VCPU:       wantVCPU,
 		Memory:     wantMemory,
+		EC2Shapes:  wantShapes,
 	}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
@@ -56,7 +60,11 @@ func TestWhatTheNodeReportsArrivesAtTheLedger(t *testing.T) {
 		t.Errorf("site reached the ledger as %q, want %q", got.Site, wantSite)
 	}
 
-	if got.Provider != config.ProviderDocker {
-		t.Errorf("provider reached the ledger as %q, want %q", got.Provider, config.ProviderDocker)
+	if got.Provider != config.ProviderEC2 {
+		t.Errorf("provider reached the ledger as %q, want %q", got.Provider, config.ProviderEC2)
+	}
+
+	if len(got.EC2Shapes) != 1 || got.EC2Shapes[0] != wantShapes[0] {
+		t.Errorf("EC2 shapes reached the ledger as %+v, want %+v", got.EC2Shapes, wantShapes)
 	}
 }

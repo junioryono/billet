@@ -140,6 +140,8 @@ type fakeStore struct {
 	bindErr      error
 	advanceErr   error
 	heartbeatErr error
+	failureErr   error
+	resizeErr    error
 	releaseErr   error
 	leaseErr     error
 
@@ -150,6 +152,7 @@ type fakeStore struct {
 	bound    []string
 	advanced []alloc.Phase
 	released []alloc.Phase
+	failures []string
 }
 
 func (f *fakeStore) Bind(_ context.Context, leaseID string, _ int64, node string) error {
@@ -175,6 +178,22 @@ func (f *fakeStore) Heartbeat(context.Context, string, int64) error {
 	defer f.mu.Unlock()
 
 	return f.heartbeatErr
+}
+
+func (f *fakeStore) MarkFailure(_ context.Context, _ string, _ int64, reason string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.failures = append(f.failures, reason)
+
+	return f.failureErr
+}
+
+func (f *fakeStore) Resize(context.Context, string, int64, string, int, config.ByteSize) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return f.resizeErr
 }
 
 func (f *fakeStore) Release(_ context.Context, _ string, _ int64, outcome alloc.Phase) error {
@@ -391,6 +410,22 @@ func TestLedgerErrorsKeepTheirKind(t *testing.T) {
 			},
 		},
 		{
+			name:  "fallback exceeds capacity",
+			store: &fakeStore{resizeErr: alloc.ErrNoCapacity},
+			want:  alloc.ErrNoCapacity,
+			call: func(ctx context.Context, c *nodeclient.Client) error {
+				return c.Resize(ctx, "l1", 1, "large", 16, 32*config.GiB)
+			},
+		},
+		{
+			name:  "operator force release",
+			store: &fakeStore{heartbeatErr: alloc.ErrForceRelease},
+			want:  alloc.ErrForceRelease,
+			call: func(ctx context.Context, c *nodeclient.Client) error {
+				return c.Heartbeat(ctx, "l1", 1)
+			},
+		},
+		{
 			name:  "missing lease",
 			store: &fakeStore{leaseErr: alloc.ErrLeaseNotFound},
 			want:  alloc.ErrLeaseNotFound,
@@ -496,6 +531,7 @@ func TestEveryPhaseCanBeAdvancedTo(t *testing.T) {
 
 	want := []alloc.Phase{
 		alloc.PhaseAssigned, alloc.PhaseLaunching, alloc.PhaseOnline, alloc.PhaseBusy,
+		alloc.PhaseCustody, alloc.PhaseTeardown,
 	}
 
 	for _, p := range want {
@@ -509,6 +545,23 @@ func TestEveryPhaseCanBeAdvancedTo(t *testing.T) {
 
 	if len(store.advanced) != len(want) {
 		t.Errorf("the ledger saw %v, want %v", store.advanced, want)
+	}
+}
+
+func TestAFailureReasonCrossesTheNodeWire(t *testing.T) {
+	store := &fakeStore{}
+	_, base := serve(t, store)
+	c := dial(t, base)
+
+	const reason = "ec2 spot interruption: terminate"
+	if err := c.MarkFailure(t.Context(), "l1", 7, reason); err != nil {
+		t.Fatalf("MarkFailure: %v", err)
+	}
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if len(store.failures) != 1 || store.failures[0] != reason {
+		t.Errorf("failure reasons = %v, want %q", store.failures, reason)
 	}
 }
 

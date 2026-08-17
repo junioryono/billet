@@ -19,6 +19,17 @@ CONF="${CONF_DIR}/billet.yaml"
 # `path-exclude=/usr/share/doc/*`, which silently drops anything kept there.
 TEMPLATE=/usr/share/billet/billet.yaml
 KEY="${CONF_DIR}/app-private-key.pem"
+JAILER_DIR=/srv/jailer
+
+# THE NODE UNIT CANNOT LOAD MODULES. ProtectKernelModules is intentional service
+# hardening, so the host prepares the RBD client before the unit can start. The
+# package also installs a modules-load.d entry for reboots. A kernel without RBD
+# is allowed here because an EC2 or Docker-only node does not use Ceph; `billet
+# check` remains the place that rejects an enabled Ceph configuration whose host
+# cannot satisfy it.
+if command -v modprobe >/dev/null 2>&1 && modprobe -n rbd >/dev/null 2>&1; then
+    modprobe rbd
+fi
 
 if ! getent group billet >/dev/null 2>&1; then
     groupadd --system billet
@@ -62,6 +73,14 @@ fi
 mkdir -p "${STATE_DIR}"
 chown billet:billet "${STATE_DIR}"
 chmod 0700 "${STATE_DIR}"
+
+# CREATED RATHER THAN PACKAGED, so removing the package cannot erase a jail that
+# still holds guest state. The node unit makes this path writable through its
+# otherwise read-only filesystem view; a fresh Firecracker install therefore
+# needs it before the service starts.
+mkdir -p "${JAILER_DIR}"
+chown root:root "${JAILER_DIR}"
+chmod 0755 "${JAILER_DIR}"
 
 mkdir -p "${CONF_DIR}"
 chown root:billet "${CONF_DIR}"

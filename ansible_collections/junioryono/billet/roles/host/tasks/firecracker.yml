@@ -1,0 +1,79 @@
+---
+- name: Select the Firecracker release architecture
+  ansible.builtin.set_fact:
+    billet_firecracker_arch: "{{ {'x86_64': 'x86_64', 'aarch64': 'aarch64'}.get(ansible_facts['architecture'], '') }}"
+
+- name: Refuse an unsupported Firecracker architecture
+  ansible.builtin.assert:
+    that: billet_firecracker_arch | length > 0
+    fail_msg: "Firecracker is supported here only on x86_64 and aarch64, not {{ ansible_facts['architecture'] }}."
+
+- name: Check the exact Firecracker binaries
+  ansible.builtin.stat:
+    path: "/usr/local/bin/{{ item }}-{{ billet_firecracker_version }}"
+  register: billet_firecracker_binaries
+  loop:
+    - firecracker
+    - jailer
+  check_mode: false
+
+- name: Record whether Firecracker is already installed
+  ansible.builtin.set_fact:
+    billet_firecracker_present: "{{ billet_firecracker_binaries.results | map(attribute='stat.exists') | min }}"
+
+- name: Create the private Firecracker staging directory
+  ansible.builtin.file:
+    path: "{{ billet_firecracker_stage }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+  become: true
+  when: not billet_firecracker_present
+
+- name: Download the verified Firecracker release
+  ansible.builtin.get_url:
+    url: "https://github.com/firecracker-microvm/firecracker/releases/download/{{ billet_firecracker_version }}/firecracker-{{ billet_firecracker_version }}-{{ billet_firecracker_arch }}.tgz"
+    dest: "{{ billet_firecracker_stage }}/firecracker-{{ billet_firecracker_version }}-{{ billet_firecracker_arch }}.tgz"
+    checksum: "sha256:{{ billet_firecracker_checksums[billet_firecracker_arch] }}"
+    owner: root
+    group: root
+    mode: "0600"
+  become: true
+  when: not billet_firecracker_present
+
+- name: Unpack Firecracker
+  ansible.builtin.unarchive:
+    src: "{{ billet_firecracker_stage }}/firecracker-{{ billet_firecracker_version }}-{{ billet_firecracker_arch }}.tgz"
+    dest: "{{ billet_firecracker_stage }}"
+    remote_src: true
+    creates: "{{ billet_firecracker_stage }}/release-{{ billet_firecracker_version }}-{{ billet_firecracker_arch }}"
+  become: true
+  when: not billet_firecracker_present
+
+- name: Install the versioned Firecracker binaries
+  ansible.builtin.copy:
+    src: "{{ billet_firecracker_stage }}/release-{{ billet_firecracker_version }}-{{ billet_firecracker_arch }}/{{ item }}-{{ billet_firecracker_version }}-{{ billet_firecracker_arch }}"
+    dest: "/usr/local/bin/{{ item }}-{{ billet_firecracker_version }}"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - firecracker
+    - jailer
+  register: billet_firecracker_install
+  become: true
+  when: not billet_firecracker_present
+
+- name: Link the selected Firecracker version onto PATH
+  ansible.builtin.file:
+    src: "/usr/local/bin/{{ item }}-{{ billet_firecracker_version }}"
+    dest: "/usr/local/bin/{{ item }}"
+    state: link
+    force: true
+  loop:
+    - firecracker
+    - jailer
+  register: billet_firecracker_links
+  become: true

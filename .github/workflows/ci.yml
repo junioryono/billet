@@ -105,6 +105,41 @@ jobs:
           go install "github.com/goreleaser/goreleaser/v2@$version"
           goreleaser check
 
+  host-lifecycle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install the pinned Ansible runtime
+        run: python -m pip install ansible-core==2.19.4
+
+      - name: Exercise alert ownership migration and teardown
+        run: make alert-lifecycle
+
+  package-lifecycle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install the pinned release builder
+        run: |
+          version=$(make --no-print-directory print-goreleaser-version)
+          go install "github.com/goreleaser/goreleaser/v2@$version"
+
+      - name: Exercise package installation and removal
+        run: make package-lifecycle
+
   # The binary must build for every platform a node can run on, since nodes are
   # deployed by copying one static file. Cross-compilation is the cheapest way to
   # catch a build-tag mistake before someone hits it on a Mac mini.

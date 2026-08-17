@@ -3,6 +3,7 @@ package alloc
 import (
 	"context"
 	"fmt"
+	"maps"
 	"slices"
 
 	"github.com/junioryono/billet/internal/config"
@@ -31,6 +32,12 @@ type placer struct {
 	// rather than a resource: Apple's limit is per machine and does not care how
 	// large the guests are.
 	freeMacOS map[string]int
+	// cost is what one lease really consumes on each candidate. For EC2 this is
+	// the first declared shape that fits, not the smaller tier request.
+	cost map[string]placementCost
+	// deploymentFree applies the deployment-wide ceiling to the same real cost.
+	deploymentVCPU   int
+	deploymentMemory config.ByteSize
 	// rank is a host's position in the current tier's provider preference.
 	rank map[string]int
 	// policy decides between hosts that preference cannot separate.
@@ -49,6 +56,28 @@ type fleet struct {
 	vcpu   map[string]int
 	memory map[string]config.ByteSize
 	macOS  map[string]int
+}
+
+type placementCost struct {
+	vcpu         int
+	memory       config.ByteSize
+	instanceType string
+}
+
+func (n nodeRow) cost(t config.Tier) (placementCost, bool) {
+	if n.provider != config.ProviderEC2 {
+		return placementCost{vcpu: t.VCPU, memory: t.Memory}, true
+	}
+
+	for _, shape := range n.shapes {
+		if shape.VCPU >= t.VCPU && shape.Memory >= t.Memory {
+			return placementCost{
+				vcpu: shape.VCPU, memory: shape.Memory, instanceType: shape.Type,
+			}, true
+		}
+	}
+
+	return placementCost{}, false
 }
 
 // fleetResources measures every reachable machine, inside the caller's
@@ -153,12 +182,22 @@ func (f *fleet) forTier(
 	}
 
 	p := &placer{
-		order:      nodes,
-		freeVCPU:   f.vcpu,
-		freeMemory: f.memory,
-		freeMacOS:  f.macOS,
-		rank:       make(map[string]int, len(nodes)),
-		policy:     a.placement.Or(),
+		order:            nodes,
+		freeVCPU:         f.vcpu,
+		freeMemory:       f.memory,
+		freeMacOS:        f.macOS,
+		cost:             make(map[string]placementCost, len(nodes)),
+		deploymentVCPU:   int(^uint(0) >> 1),
+		deploymentMemory: config.ByteSize(1<<63 - 1),
+		rank:             make(map[string]int, len(nodes)),
+		policy:           a.placement.Or(),
+	}
+
+	for _, n := range nodes {
+		cost, ok := n.cost(t)
+		if ok {
+			p.cost[n.name] = cost
+		}
 	}
 
 	p.rankBy(t)
@@ -205,7 +244,14 @@ func (p *placer) rankBy(t config.Tier) {
 
 // roomFor is how many more of a tier a host can still take.
 func (p *placer) roomFor(node string, t config.Tier) int {
-	room := min(p.freeVCPU[node]/t.VCPU, int(p.freeMemory[node]/t.Memory))
+	cost, ok := p.cost[node]
+	if !ok {
+		return 0
+	}
+
+	room := min(p.freeVCPU[node]/cost.vcpu, int(p.freeMemory[node]/cost.memory))
+	room = min(room, p.deploymentVCPU/cost.vcpu)
+	room = min(room, int(p.deploymentMemory/cost.memory))
 
 	if t.GuestOS == config.GuestMacOS {
 		room = min(room, p.freeMacOS[node])
@@ -216,12 +262,14 @@ func (p *placer) roomFor(node string, t config.Tier) int {
 
 // total is how many of a tier the candidate set can hold between them.
 func (p *placer) total(t config.Tier) int {
+	clone := p.clone()
 	sum := 0
-	for _, n := range p.order {
-		sum += p.roomFor(n.name, t)
+	for {
+		if _, _, ok := clone.next(t); !ok {
+			return sum
+		}
+		sum++
 	}
-
-	return sum
 }
 
 // next picks the machine a reservation should be aimed at, and spends it.
@@ -238,7 +286,7 @@ func (p *placer) total(t config.Tier) int {
 // and it is not cosmetic — Go map iteration is randomised, so without a total
 // order one fleet gives different answers on different runs, which cannot be
 // reproduced from a log or tested at all.
-func (p *placer) next(t config.Tier) (string, bool) {
+func (p *placer) next(t config.Tier) (string, placementCost, bool) {
 	best := ""
 
 	for _, n := range p.order {
@@ -252,22 +300,37 @@ func (p *placer) next(t config.Tier) (string, bool) {
 	}
 
 	if best == "" {
-		return "", false
+		return "", placementCost{}, false
 	}
 
+	cost := p.cost[best]
 	p.spend(best, t)
 
-	return best, true
+	return best, cost, true
 }
 
 // spend takes one instance of a tier off a host.
 func (p *placer) spend(node string, t config.Tier) {
-	p.freeVCPU[node] -= t.VCPU
-	p.freeMemory[node] -= t.Memory
+	cost := p.cost[node]
+	p.freeVCPU[node] -= cost.vcpu
+	p.freeMemory[node] -= cost.memory
+	p.deploymentVCPU -= cost.vcpu
+	p.deploymentMemory -= cost.memory
 
 	if t.GuestOS == config.GuestMacOS {
 		p.freeMacOS[node]--
 	}
+}
+
+func (p *placer) clone() *placer {
+	clone := *p
+	clone.freeVCPU = maps.Clone(p.freeVCPU)
+	clone.freeMemory = maps.Clone(p.freeMemory)
+	clone.freeMacOS = maps.Clone(p.freeMacOS)
+	clone.cost = maps.Clone(p.cost)
+	clone.rank = maps.Clone(p.rank)
+
+	return &clone
 }
 
 // better reports whether a should be chosen over b for this tier.

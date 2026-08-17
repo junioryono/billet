@@ -16,6 +16,7 @@ Wants=network-online.target
 Type=exec
 User=billet
 Group=billet
+UMask=0077
 
 # EXPLICIT, AND NOT OPTIONAL. billet's default config path is per-user — it
 # resolves through os.UserConfigDir() and only falls back to /etc — and it
@@ -24,26 +25,15 @@ Group=billet
 # directory, the App key path and every tier's resources from an attacker.
 ExecStart=/usr/bin/billet server --config /etc/billet/billet.yaml
 
-# /var/lib/billet, which billet then chmods to 0700 itself: it holds the SQLite
-# capacity ledger, the deployment identity, and the mTLS CA's private key.
-# Declaring the mode here means the two agree rather than one silently correcting
-# the other on every start.
-StateDirectory=billet
+# /var/lib/billet/server holds the SQLite capacity ledger, the deployment
+# identity, and the mTLS CA's private key. The sibling node runs as root, so the
+# two roles must not race to change ownership of their common parent.
+StateDirectory=billet/server
 StateDirectoryMode=0700
 
-# /run/billet, which is where the host-wide deployment lock goes.
+# TWENTY-FOUR AND A HALF HOURS, AND THE ARITHMETIC IS THE POINT.
 #
-# THE LOCK NEEDS A DIRECTORY BILLET CAN NAME. Its default is derived from HOME,
-# and a service has none — so without this the lock cannot be placed, and billet
-# refuses to start rather than quietly running without the thing that stops two
-# processes managing one host's containers. The shipped billet.yaml points
-# lock_dir here.
-RuntimeDirectory=billet
-RuntimeDirectoryMode=0750
-
-# SIX AND A HALF HOURS, AND THE ARITHMETIC IS THE POINT.
-#
-#   drain_timeout   6h     — how long billet waits for the jobs already running
+#   drain_timeout  24h     — the largest value billet accepts
 #   teardown       ~25m    — destroy (12m) + destroy (12m) + close (30s) + release (30s)
 #   margin           5m
 #
@@ -55,7 +45,7 @@ RuntimeDirectoryMode=0750
 #
 # LOWER drain_timeout FIRST if this is too long for you, then lower this to
 # match. Do not lower this alone.
-TimeoutStopSec=23400
+TimeoutStopSec=88200
 KillSignal=SIGTERM
 
 # A second SIGTERM stops billet waiting for its running jobs and tears down

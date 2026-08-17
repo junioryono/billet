@@ -22,9 +22,37 @@ package provider
 
 import (
 	"context"
+	"strconv"
 
 	"github.com/junioryono/billet/internal/config"
 )
+
+// MaxVolumes is the maximum number of cache disks one job can attach.
+const MaxVolumes = 5
+
+// VolumeSlotID is the stable Firecracker drive id and in-jail path for one slot.
+func VolumeSlotID(slot int) string { return "cache" + strconv.Itoa(slot) }
+
+// VolumeMount is a block device a backend attaches to one instance.
+type VolumeMount struct {
+	// Device is the mapped host block-device path.
+	Device string
+	// Path is where the cooperative guest mounts it.
+	Path string
+}
+
+// VolumeAttacher replaces pre-reserved block-device slots on a running instance.
+type VolumeAttacher interface {
+	AttachVolume(ctx context.Context, instanceID string, slot int, device string) error
+	DetachVolume(ctx context.Context, instanceID string, slot int, device string) error
+}
+
+// GuestVolumeLocator translates a storage handle into the stable device name a
+// guest sees. Firecracker has fixed virtio slots; EC2's NVMe name follows the
+// EBS volume identity instead of the attachment name requested from its API.
+type GuestVolumeLocator interface {
+	GuestVolumeDevice(slot int, device string) string
+}
 
 // TrustClass says how much the workload is trusted, which decides what may run
 // it. The zero value is UNKNOWN and every backend must treat it as untrusted.
@@ -128,11 +156,31 @@ type Spec struct {
 
 	VCPU   int
 	Memory config.ByteSize
-	Disk   config.ByteSize
+	// InstanceType is the EC2 shape selected and charged at escrow. Empty for
+	// host-backed providers.
+	InstanceType string
+	// AuthorizeShape atomically changes that charge before EC2 attempts a
+	// fallback. ok=false means the shape would exceed a budget; err means the
+	// ledger could not make the decision and the launch must stop.
+	AuthorizeShape func(context.Context, string, int, config.ByteSize) (ok bool, err error)
+	Disk           config.ByteSize
 	// SHM sizes /dev/shm. It is a tier parameter rather than a constant because
 	// Postgres service containers and Chromium both fail on the default 64MB in
 	// ways that look like unrelated crashes.
 	SHM config.ByteSize
+	// Volumes are cache devices known before boot. A cache endpoint reserves the
+	// remaining slots so a cooperative guest can request them at runtime.
+	Volumes []VolumeMount
+	// CacheEndpoint and CacheToken let the guest request runtime volumes from its
+	// node. They are paired, and the token is unique to this one microVM.
+	CacheEndpoint string
+	CacheToken    string
+	// BuildKitCacheMountLimit is the tier's byte ceiling for each persistent
+	// BuildKit cache-mount record. It is meaningful only with CacheEndpoint.
+	BuildKitCacheMountLimit config.ByteSize
+	// RegistryMirrors are site-local public pull-through caches made available to
+	// a managed guest. The zero value sends the guest directly upstream.
+	RegistryMirrors config.RegistryMirrors
 
 	// Command starts the runner inside the instance.
 	//
@@ -181,6 +229,25 @@ type Instance struct {
 	// cannot tell should report true: treating an unknown state as finished would
 	// destroy live work, and treating it as running only delays a cleanup.
 	Running bool
+}
+
+// InterruptionNotice is an external warning that a provider will take compute
+// away. Receipt is opaque acknowledgement state and must never be logged.
+type InterruptionNotice struct {
+	InstanceID string
+	Action     string
+	Receipt    string
+	// Problem is set when the queue delivered something that was not a usable
+	// interruption event. It is safe diagnostic prose, never the message body.
+	Problem string
+}
+
+// InterruptionSource is implemented by a backend that can observe external
+// reclaim warnings. It is deliberately optional: host-backed providers have no
+// remote service that can take their compute away.
+type InterruptionSource interface {
+	NextInterruption(ctx context.Context) (*InterruptionNotice, error)
+	AcknowledgeInterruption(ctx context.Context, notice *InterruptionNotice) error
 }
 
 // InstanceName is billet's handle for the compute backing a lease.

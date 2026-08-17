@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"syscall"
 )
 
 // pidIsVMM reports whether a process id is still this jail's VMM.
@@ -24,9 +25,11 @@ import (
 func pidIsVMM(pid int, jailID string) (bool, error) {
 	raw, err := os.ReadFile(procCmdline(pid))
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ESRCH) {
 			// The process is gone. On Linux this is the ordinary answer for an
-			// exited pid, and it is the one this function exists to give.
+			// exited pid, and it is the one this function exists to give. /proc can
+			// return ESRCH when the pid disappears after cmdline was opened but
+			// before it was read, which is the same definite absence as ENOENT.
 			return false, nil
 		}
 

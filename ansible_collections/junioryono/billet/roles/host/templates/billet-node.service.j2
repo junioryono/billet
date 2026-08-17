@@ -1,0 +1,38 @@
+[Unit]
+Description=billet compute host
+Documentation=https://github.com/junioryono/billet
+After=network-online.target billet-network.service
+Requires=billet-network.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=root
+Group=root
+ExecStart=/usr/bin/billet node --config /etc/billet/billet.yaml
+StateDirectory=billet/node
+StateDirectoryMode=0700
+RuntimeDirectory=billet/locks
+RuntimeDirectoryMode=0750
+TimeoutStopSec=88200
+KillSignal=SIGTERM
+KillMode=mixed
+Restart=on-failure
+RestartSec=5s
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# The node maps RBD devices and the jailer creates per-guest cgroups through
+# sysfs. ProtectKernelTunables would remount those required interfaces read-only.
+ProtectKernelModules=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+ReadOnlyPaths=/etc/billet
+# The node atomically replaces its own TLS bundle during renewal. ProtectSystem
+# keeps the rest of /etc read-only; only this rotating credential directory is
+# writable.
+ReadWritePaths=-/etc/billet/tls -/srv/jailer
+
+[Install]
+WantedBy=multi-user.target

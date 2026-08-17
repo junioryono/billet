@@ -1,0 +1,19 @@
+[Unit]
+Description=billet DHCP and DNS on %i
+After=network-online.target systemd-networkd.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/sbin/dnsmasq --no-daemon --conf-file=/etc/billet/network/%i.conf
+StateDirectory=billet-dnsmasq/%i
+StateDirectoryMode=0750
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

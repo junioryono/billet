@@ -2,6 +2,7 @@ package alloc
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -16,12 +17,29 @@ import (
 // capacity keeps measuring exactly what it measured before. A test that wants
 // per-node capacity to bite says so by registering a specific size.
 func testRegistration(name string, kind config.ProviderKind) NodeRegistration {
-	return NodeRegistration{
+	reg := NodeRegistration{
 		Name:     name,
 		Provider: kind,
 		VCPU:     1 << 20,
 		Memory:   1 << 20 * config.GiB,
 	}
+
+	if kind == config.ProviderEC2 {
+		for _, vcpu := range []int{1, 2, 4, 6, 8, 16, 32, 64, 1 << 20} {
+			for _, memory := range []config.ByteSize{
+				config.GiB, 2 * config.GiB, 4 * config.GiB, 8 * config.GiB,
+				16 * config.GiB, 24 * config.GiB, 32 * config.GiB,
+				64 * config.GiB, 128 * config.GiB, 1 << 20 * config.GiB,
+			} {
+				reg.EC2Shapes = append(reg.EC2Shapes, config.EC2InstanceType{
+					Type: fmt.Sprintf("test-%d-%d", vcpu, memory),
+					VCPU: vcpu, Memory: memory,
+				})
+			}
+		}
+	}
+
+	return reg
 }
 
 // A HOST IS THE AUTHORITY ON ITSELF, and until now the only thing it was the

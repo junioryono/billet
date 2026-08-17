@@ -111,6 +111,14 @@ dist: ## Build the release artifacts locally, exactly as a tag would
 	@# before every commit. Run it when touching .goreleaser.yaml.
 	goreleaser release --snapshot --clean --skip=publish
 
+.PHONY: alert-lifecycle
+alert-lifecycle: ## Exercise alert ownership migration and teardown through the Ansible role
+	ANSIBLE_COLLECTIONS_PATH=$(CURDIR)/ansible_collections ansible-playbook ansible_collections/junioryono/billet/tests/alert-lifecycle.yml
+
+.PHONY: package-lifecycle
+package-lifecycle: dist ## Install and remove both Linux packages without losing operator state
+	scripts/test-package-lifecycle.sh
+
 tools: ## Install the pinned linter and goreleaser
 	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_VERSION)
 	go install github.com/goreleaser/goreleaser/v2@$(GORELEASER_VERSION)

@@ -16,55 +16,53 @@ Wants=network-online.target
 
 [Service]
 Type=exec
-User=billet
-Group=billet
-
-# THE ONLY DIFFERENCE FROM THE SERVER'S UNIT THAT MATTERS, and it is a trust
-# boundary rather than a permission.
+# THE NODE IS A PRIVILEGED HOST AGENT. Docker needs a rootful socket, and the
+# Firecracker backend additionally creates TAP devices and block-device nodes,
+# enters cgroups and chroots, and signals a VMM only after tying its pid to the
+# lease. Running this unit as the server's unprivileged account makes the
+# Firecracker configuration pass schema validation and fail on its first job.
 #
-# ACCESS TO A ROOTFUL DOCKER SOCKET IS ROOT ON THIS HOST. Anything that can talk
-# to it can start a privileged container or bind-mount /, so a compromise of the
-# billet node process is a compromise of the machine — and none of the hardening
-# below contains that. It is stated plainly because it is easy to read
-# "SupplementaryGroups=docker" as a detail about permissions.
-#
-# Prefer rootless Docker where the workload allows it. The runner containers
-# billet launches are not themselves given the socket.
-SupplementaryGroups=docker
+# The VMM does NOT remain root: the jailer drops each guest to its own uid before
+# Firecracker reads guest-controlled state. This root process is the custodian
+# that creates and later destroys those boundaries.
+User=root
+Group=root
 
 ExecStart=/usr/bin/billet node --config /etc/billet/billet.yaml
 
-StateDirectory=billet
+StateDirectory=billet/node
 StateDirectoryMode=0700
 
-# THE SAME LOCK DIRECTORY AS THE SERVER'S, and that is load-bearing when both run
-# on one host. The lock stops two processes carrying one deployment identity from
-# managing the same containers, so they have to meet at the same path — billet
-# only checks that they agree when it is running both roles in one process.
-RuntimeDirectory=billet
+# /run/billet/locks is the host-wide collision domain for node invocations that
+# carry one deployment identity. The server no longer takes this lock; its
+# authoritative state store serializes the control plane instead.
+RuntimeDirectory=billet/locks
 RuntimeDirectoryMode=0750
 
-# See the note in billet-server.service: drain (6h) + teardown (~25m) + margin.
+# Sized for billet's maximum configurable drain (24h) + teardown (~25m) + margin.
 # A node's drain waits for the containers it is holding, and a SIGKILL through
 # the middle of it leaves them running with their leases renewed by nobody.
-TimeoutStopSec=23400
+TimeoutStopSec=88200
 KillSignal=SIGTERM
 KillMode=mixed
 
 Restart=on-failure
 RestartSec=5s
 
-NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ProtectKernelTunables=true
+# The node maps RBD devices and the jailer creates per-guest cgroups through
+# sysfs. ProtectKernelTunables would remount those required interfaces read-only.
 ProtectKernelModules=true
 RestrictSUIDSGID=true
 LockPersonality=true
 SystemCallArchitectures=native
 
 ReadOnlyPaths=/etc/billet
+# Certificate renewal installs a new key, leaf and CA bundle atomically while
+# the process is running. Keep the rest of /etc immutable to the node.
+ReadWritePaths=-/etc/billet/tls -/srv/jailer
 
 [Install]
 WantedBy=multi-user.target

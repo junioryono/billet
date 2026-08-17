@@ -56,7 +56,16 @@ import (
 // A silent wrong answer is the case a version refusal is for. Two builds that
 // disagree about what a result MEANS are as incompatible as two that disagree
 // about its fields, and only one of those is visible to a decoder.
-const Version = 7
+//
+// VERSION 8 ADDS THE ORDERED EC2 SHAPES TO REGISTRATION AND MAKES A LEASE
+// explicitly carry its requested size, charged size, and selected instance
+// type. An older control plane would account only the tier while the node buys
+// the shape, recreating #47 silently, so mixed versions are refused.
+//
+// VERSION 9 ADDS THE BUILDKIT CACHE-MOUNT CEILING TO A LAUNCH. Silently dropping
+// it would publish state outside the tier's storage policy, so mixed versions
+// are refused rather than treating the field as an optional optimisation.
+const Version = 9
 
 // CommandKind names what the server is asking a node to do.
 type CommandKind string
@@ -109,6 +118,9 @@ type RegisterRequest struct {
 	// nothing joins the fleet, is never chosen, and produces no error to find.
 	VCPU   int             `json:"vcpu"`
 	Memory config.ByteSize `json:"memory"`
+	// EC2Shapes are the ordered purchasable shapes. Empty for every other
+	// provider; an EC2 registration without them cannot back an advertisement.
+	EC2Shapes []config.EC2InstanceType `json:"ec2_shapes,omitempty"`
 	// Instances are the lease ids this host is ACTUALLY RUNNING right now, taken
 	// from the provider rather than from anything the plane told it.
 	//
@@ -242,6 +254,9 @@ type TierSpec struct {
 	// silently means "the default group", so a tier deliberately placed elsewhere
 	// would have its registrations refused.
 	RunnerGroup string `json:"runner_group,omitempty"`
+	// BuildKitCacheMountLimit is the operator's ceiling for each persistent
+	// BuildKit cache-mount record in this tier.
+	BuildKitCacheMountLimit config.ByteSize `json:"buildkit_cache_mount_limit"`
 }
 
 // TierSpecOf renders the parts of a tier that travel to a node.
@@ -253,6 +268,13 @@ func TierSpecOf(t config.Tier) *TierSpec {
 		Disk:        t.Disk,
 		SHM:         t.SHM,
 		RunnerGroup: t.RunnerGroup,
+		BuildKitCacheMountLimit: func() config.ByteSize {
+			if t.BuildKitCacheMountLimit > 0 {
+				return t.BuildKitCacheMountLimit
+			}
+
+			return config.DefaultBuildKitCacheMountLimit
+		}(),
 	}
 }
 
