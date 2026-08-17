@@ -80,7 +80,7 @@ jobs:
           # A COLLECTION INSTALLED FROM A GIT TAG STILL READS galaxy.yml. The
           # tag and that metadata must describe the same artifact, or Ansible
           # reports a different version from the one the operator pinned.
-          sed -E -i "s#^version: [0-9]+\.[0-9]+\.[0-9]+$#version: ${COLLECTION_VERSION}#" ansible_collections/junioryono/billet/galaxy.yml
+          sed -E -i "s#^version: [0-9]+\.[0-9]+\.[0-9]+\$#version: ${COLLECTION_VERSION}#" ansible_collections/junioryono/billet/galaxy.yml
           RELEASE_TAG="${TAG}" scripts/check-release-metadata.sh
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
