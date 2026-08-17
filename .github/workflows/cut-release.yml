@@ -105,14 +105,18 @@ jobs:
             exit 1
           fi
 
-          # Refuse to go backwards. With pre-releases excluded, `sort -V` and
-          # semver agree on ordering, so the newest of the two sorts last.
-          if [ -n "${newest}" ] && [ "$(printf '%s\n%s\n' "${newest}" "${tag}" | sort -V | tail -n1)" != "${tag}" ]; then
-            echo "::error::${tag} is not newer than ${newest}" >&2
+          series="$(echo "${tag}" | awk -F. '{ print $1 "." $2 }')"
+          series_newest="$(git tag --list "${series}.*" | grep -E "${semver}" | sort -V | tail -n1 || true)"
+
+          # A maintained release branch advances within its own minor series.
+          # Comparing an explicit patch with the newest tag globally would make
+          # v0.4.1 impossible after v0.5.0, defeating the branch shape above.
+          if [ -n "${series_newest}" ] && [ "$(printf '%s\n%s\n' "${series_newest}" "${tag}" | sort -V | tail -n1)" != "${tag}" ]; then
+            echo "::error::${tag} is not newer than ${series_newest} in ${series}" >&2
             exit 1
           fi
 
-          branch="release/$(echo "${tag}" | awk -F. '{ print $1 "." $2 }')"
+          branch="release/${series}"
 
           # Both values are now validated single lines, computed here rather than
           # supplied.

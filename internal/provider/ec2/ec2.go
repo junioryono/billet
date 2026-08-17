@@ -13,7 +13,7 @@
 // nothing runs on the machine billet is running on. So what that machine has is
 // not what this node can offer, and `node.max_vcpu` / `node.max_memory` are
 // required rather than detected. They are NOT a spending limit, though it is easy
-// to read them as one: the allocator charges a job the size its tier asked for
+// to read them as one: the allocator charges a job the selected shape's size
 // while this backend buys the first declared shape that FITS, so shapes larger
 // than their tiers multiply the real spend (#47).
 //

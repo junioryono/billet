@@ -372,6 +372,40 @@ func TestAnUntrustedCallerCanDiscardWithoutPublishing(t *testing.T) {
 	}
 }
 
+func TestDiscardResolvesTheCurrentMappingInsteadOfTrustingAStoredDevice(t *testing.T) {
+	t.Parallel()
+
+	f := newCacheFake()
+	c := cacheClient(t, f)
+	const (
+		handle        = "billet-cache/cache-v-lease-17"
+		currentDevice = "/dev/rbd8"
+		reusedDevice  = "/dev/rbd7"
+	)
+	f.images[handle] = true
+	f.mappings[currentDevice] = handle
+	f.mappings[reusedDevice] = "billet-cache/cache-v-another-job"
+
+	volume := storecontract.Volume{Handle: handle, Device: reusedDevice}
+	if err := c.Discard(t.Context(), volume); err != nil {
+		t.Fatalf("Discard: %v", err)
+	}
+
+	if _, ok := f.mappings[currentDevice]; ok {
+		t.Fatal("Discard left the volume's current mapping in place")
+	}
+	if got := f.mappings[reusedDevice]; got != "billet-cache/cache-v-another-job" {
+		t.Fatalf("Discard touched a reused device: mapping = %q", got)
+	}
+	if f.images[handle] {
+		t.Fatal("Discard left the cache image in place")
+	}
+
+	if err := c.Discard(t.Context(), volume); err != nil {
+		t.Fatalf("idempotent Discard: %v", err)
+	}
+}
+
 func TestAPointerWriteFailureLeavesThePreviousPointerUntouched(t *testing.T) {
 	t.Parallel()
 

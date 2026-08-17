@@ -1,12 +1,36 @@
 ---
+- name: Inspect the Linux development proxy definition
+  ansible.builtin.stat:
+    path: "/etc/systemd/system/{{ billet_development_proxy_systemd_unit }}"
+  register: billet_development_proxy_disabled_linux_definition
+  when: ansible_facts["system"] == "Linux"
+  become: true
+
 - name: Stop and disable the Linux development proxy
   ansible.builtin.systemd_service:
     name: "{{ billet_development_proxy_systemd_unit }}"
     enabled: false
     state: stopped
-  failed_when: false
   when:
     - ansible_facts["system"] == "Linux"
+    - billet_development_proxy_disabled_linux_definition.stat.exists
+    - not ansible_check_mode
+  become: true
+
+- name: Remove the disabled Linux development proxy definition
+  ansible.builtin.file:
+    path: "/etc/systemd/system/{{ billet_development_proxy_systemd_unit }}"
+    state: absent
+  register: billet_development_proxy_disabled_linux_removal
+  when: ansible_facts["system"] == "Linux"
+  become: true
+
+- name: Reload systemd after removing the development proxy
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  when:
+    - ansible_facts["system"] == "Linux"
+    - billet_development_proxy_disabled_linux_removal is changed
     - not ansible_check_mode
   become: true
 
@@ -23,15 +47,15 @@
   ansible.builtin.command:
     argv: [launchctl, bootout, "system/{{ billet_development_proxy_launchd_label }}"]
   changed_when: true
-  failed_when: false
   when:
     - ansible_facts["system"] == "Darwin"
     - billet_development_proxy_disabled_macos_status.rc == 0
     - not ansible_check_mode
   become: true
 
-- name: Remove the disabled development proxy service definition
+- name: Remove the disabled macOS development proxy definition
   ansible.builtin.file:
-    path: "{{ '/Library/LaunchDaemons/' ~ billet_development_proxy_launchd_label ~ '.plist' if ansible_facts['system'] == 'Darwin' else '/etc/systemd/system/' ~ billet_development_proxy_systemd_unit }}"
+    path: "/Library/LaunchDaemons/{{ billet_development_proxy_launchd_label }}.plist"
     state: absent
+  when: ansible_facts["system"] == "Darwin"
   become: true

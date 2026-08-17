@@ -692,8 +692,13 @@ func (c *Client) Discard(ctx context.Context, volume storecontract.Volume) error
 		return errors.New("ceph: refusing to discard a cache volume outside the configured pool")
 	}
 
-	if volume.Device != "" {
-		if err := c.unmapDevice(ctx, volume.Device, name); err != nil {
+	devices, err := c.mappedDevices(ctx, name)
+	if err != nil {
+		return err
+	}
+
+	for _, device := range devices {
+		if err := c.unmapDevice(ctx, device, name); err != nil {
 			return err
 		}
 	}
