@@ -81,6 +81,27 @@ type custody struct {
 	// recovers a teardown a backend accepted and then did not perform.
 	asked bool
 
+	// unconfirmed is true while this entry's COMPUTE has not been proved gone.
+	//
+	// THE DIFFERENCE BETWEEN AN ENTRY THAT MUST SILENCE THE LISTENER AND ONE THAT
+	// MUST NOT, which is a distinction a bare "is anything held for this request"
+	// cannot make — and getting it wrong breaks a case in either direction:
+	//
+	//	unconfirmed   a teardown was accepted and the guest may still be running.
+	//	              A Destroy for this request must answer ErrCustody, or the
+	//	              caller releases the capacity underneath a live guest (#46).
+	//	confirmed     the compute is gone and only the RELEASE failed — the shape a
+	//	              redelivered assignment after a crash produces, where custody
+	//	              holds one lease and the listener holds another for the same
+	//	              request. Answering ErrCustody there strands the listener's own
+	//	              lease, whose container really was destroyed, because the
+	//	              listener drops the reference without releasing it.
+	//
+	// Set when a teardown could not be confirmed, cleared when it is. An entry
+	// that reaches a confirmed teardown is normally deleted by finish, so a
+	// surviving entry with this false is one whose release did not land.
+	unconfirmed bool
+
 	// since is when custody was taken, for the diagnostic that matters most: how
 	// long capacity has been held for something nobody is watching.
 	since time.Time
@@ -143,6 +164,12 @@ func (r *Runner) holdWithOutcome(lease *alloc.Lease, name string, requestID int6
 		discard:   true,
 		outcome:   outcome,
 		since:     r.now(),
+		// UNCONFIRMED BY CONSTRUCTION. Both routes here exist because billet could
+		// not establish that a piece of compute is gone — a launch whose cleanup
+		// Find could not confirm, or a teardown a backend merely accepted. Until
+		// something proves otherwise, a Destroy for this request must not report
+		// success.
+		unconfirmed: true,
 		// NOT observed, even for a teardown of an instance billet launched and
 		// holds an id for. The grace before an absence is believed is what stops an
 		// eventually-consistent DescribeInstances (#48) from proving the guest is
@@ -423,6 +450,10 @@ func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 			return nil
 		}
 
+		// PROVED GONE, by a sustained absence rather than by a backend saying so —
+		// which is the only proof an asynchronous teardown ever offers.
+		c.unconfirmed = false
+
 		return r.finish(ctx, c)
 	}
 
@@ -452,6 +483,8 @@ func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 	// gone. That path is already written above and already applies the grace an
 	// unobserved absence needs.
 	if state != provider.TeardownStopped {
+		c.unconfirmed = true
+
 		// SAID ONCE, THOUGH THE REQUEST IS RE-ISSUED EVERY TICK. Re-asking is the
 		// safety net for a teardown that was accepted and did not take, and it is
 		// idempotent and cheap; saying so on every tick for the minute or two an
@@ -467,6 +500,11 @@ func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 
 		return nil
 	}
+
+	// PROVED GONE. What is left for this entry is bookkeeping — releasing the
+	// lease — so a Destroy arriving for its request is answerable with the truth
+	// rather than with custody.
+	c.unconfirmed = false
 
 	r.log.Info("released compute that was being held",
 		"name", c.name, "lease", c.leaseID, "adopted", !c.discard,
@@ -546,6 +584,28 @@ func (r *Runner) heldForRequest(requestID int64) (string, bool) {
 
 	for _, c := range r.custody {
 		if c.requestID == requestID {
+			return c.leaseID, true
+		}
+	}
+
+	return "", false
+}
+
+// unconfirmedForRequest reports a lease held for a request whose COMPUTE has not
+// been proved gone.
+//
+// NARROWER THAN heldForRequest ON PURPOSE, and the narrowness is the point. A
+// Destroy has to answer ErrCustody while this request's compute might still be
+// running, and must NOT answer it merely because some entry exists — an entry
+// whose container was destroyed and whose release failed belongs to the caller's
+// ordinary path, and silencing that one strands a lease nothing else will
+// release. See custody.unconfirmed.
+func (r *Runner) unconfirmedForRequest(requestID int64) (string, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for _, c := range r.custody {
+		if c.requestID == requestID && c.unconfirmed {
 			return c.leaseID, true
 		}
 	}

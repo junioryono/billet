@@ -1441,7 +1441,31 @@ func (l *Listener) destroyAll(ctx context.Context) map[int64]bool {
 			done[requestID] = err == nil || held
 			mu.Unlock()
 
-			if err != nil && !held {
+			if held {
+				// AND THE LEASE LEAVES `running`, WHICH IS THE HALF THAT MATTERS AT
+				// SHUTDOWN.
+				//
+				// releaseAll releases every lease still in `running` whose request
+				// this map marks destroyed — so marking a custody answer "done" and
+				// leaving the lease behind would have shutdown release the very
+				// capacity the node just took responsibility for, seconds after the
+				// handoff. It has to be both or neither, and dropping it is correct:
+				// the node's janitor holds this lease now, heartbeats it, and
+				// releases it once the guest is provably gone. That janitor outlives
+				// this listener.
+				l.log.Info("the compute for this job was asked to stop and has not been "+
+					"confirmed gone; the runner is holding its capacity until it is",
+					"tier", l.tier, "request", requestID)
+
+				l.mu.Lock()
+				delete(l.running, requestID)
+				delete(l.cleanup, requestID)
+				l.mu.Unlock()
+
+				return
+			}
+
+			if err != nil {
 				l.log.Error("could not destroy the compute for a job before stopping; it is "+
 					"still running on its host, and if no lease accounts for it nothing will "+
 					"reclaim it until that host is swept or restarted",

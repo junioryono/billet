@@ -414,6 +414,26 @@ func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
 			"request", requestID, "error", err)
 	}
 
+	// STILL HELD? THEN SAY SO, EVERY TIME — not only on the destroy that took
+	// custody (#46).
+	//
+	// releaseRequest above has just tended any custody entry for this request. If
+	// one SURVIVED that, its compute is not confirmed gone and its capacity is
+	// still charged, so this call must answer ErrCustody exactly as the first one
+	// did.
+	//
+	// Returning nil here instead was a hole with no floor under it. The first
+	// destroy on an asynchronous backend moves the request out of `running` and
+	// into custody; a SECOND destroy — a redelivered completion, a cleanup retry,
+	// a shutdown, or a broadcast leg whose sibling failed — then found `running`
+	// empty, read that as "nothing was ever started here", and returned success.
+	// The caller released the lease on it, which is precisely the release this
+	// whole change exists to prevent, reached one call later.
+	if leaseID, held := r.unconfirmedForRequest(requestID); held {
+		return fmt.Errorf("%w: lease %s is held here until its compute is confirmed gone",
+			server.ErrCustody, leaseID)
+	}
+
 	r.mu.Lock()
 	inst, ok := r.running[requestID]
 	r.mu.Unlock()
@@ -458,15 +478,23 @@ func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
 	// gives, for the same reason.
 	if state != provider.TeardownStopped {
 		if lease == nil {
-			// NOTHING TO HOLD THE CAPACITY WITH. The lease reference is written
-			// beside the instance at launch, so this means an incarnation that did
-			// not launch this job is destroying it — its capacity belongs to
-			// whoever does hold the lease, and the sweep will find the instance.
-			r.log.Warn("a teardown was accepted rather than confirmed and there is no lease "+
-				"here to hold the capacity with; the next sweep will account for it",
+			// NOTHING TO HOLD THE CAPACITY WITH, SO THE CALLER MUST KEEP HOLDING IT.
+			//
+			// The lease reference is written beside the instance at launch and
+			// removed with it, so reaching here means something took one without the
+			// other. Custody is unavailable — it is keyed on a lease — and returning
+			// nil would tell the caller the guest is gone, which is the one thing
+			// that is not known.
+			//
+			// An ERROR is the honest answer and the safe one: the caller reads it as
+			// "the compute may still exist", keeps the capacity, and retries. A
+			// retry is harmless, because a terminate is idempotent.
+			r.log.Error("a teardown was accepted rather than confirmed and there is no lease "+
+				"recorded here to hold the capacity with",
 				"name", inst.Name, "request", requestID)
 
-			return nil
+			return fmt.Errorf("node: %s was asked to stop and has not been confirmed gone, "+
+				"and no lease is recorded here to hold its capacity", inst.Name)
 		}
 
 		r.holdWithOutcome(lease, inst.Name, requestID, alloc.PhaseDone)
@@ -636,12 +664,29 @@ func (r *Runner) Recover(ctx context.Context) error {
 		// that as a failed destroy would make every startup on an EC2 host refuse
 		// to admit work for something that is on its way out; the sweep sees it
 		// again in seconds and finishes the job.
-		if _, err := r.provider.Destroy(ctx, inst.ID); err != nil {
+		state, err := r.provider.Destroy(ctx, inst.ID)
+		if err != nil {
 			failed++
 
 			r.log.Error("could not destroy an instance left by an earlier run",
 				"name", inst.Name, "instance", inst.ID, "error", err)
 
+			continue
+		}
+
+		// THE RELEASE WAITS FOR CONFIRMATION, exactly as Sweep's does (#46).
+		//
+		// The comment on the release below assumes the lease is already terminal,
+		// which is what made this look safe. It is not always: the adoption branch
+		// above requires an open or quarantined lease AND inst.Running, and EC2
+		// reports a `stopped` instance as NOT running on purpose — so an OPEN
+		// lease whose instance is stopped falls through to here, and this call is
+		// then the thing that actually hands its capacity back. Doing that on a
+		// teardown AWS has only accepted frees the machine before the instance is
+		// gone.
+		//
+		// Nothing is stranded by waiting: the first sweep sees the instance again.
+		if state != provider.TeardownStopped {
 			continue
 		}
 

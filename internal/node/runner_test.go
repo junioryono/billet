@@ -280,6 +280,57 @@ func TestAnAcceptedTeardownHoldsTheCapacityUntilTheComputeIsProvablyGone(t *test
 	}
 }
 
+// AND IT KEEPS SAYING SO. The SECOND destroy for the same request must answer
+// ErrCustody too, not success.
+//
+// Found by review. The first destroy moves the request out of `running` and into
+// custody, so a later one — a redelivered completion, a cleanup retry, a
+// shutdown, or a broadcast leg whose sibling failed — found `running` empty, read
+// that as "nothing was ever started here", and returned nil. The caller released
+// the lease on it, which is the exact release this whole change exists to
+// prevent, reached one call later and by a path no test covered.
+func TestASecondDestroyForHeldComputeStillReportsCustody(t *testing.T) {
+	p := &fakeProvider{kind: config.ProviderDocker, asyncTeardown: true}
+
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
+
+	lease := assignedLease(t, a)
+
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	if err := r.Destroy(t.Context(), 11); !errors.Is(err, server.ErrCustody) {
+		t.Fatalf("the first Destroy answered %v, want ErrCustody", err)
+	}
+
+	// The guest is STILL shutting down, so nothing has changed about what is
+	// known — and the answer must not change either.
+	err := r.Destroy(t.Context(), 11)
+	if !errors.Is(err, server.ErrCustody) {
+		t.Fatalf("a second Destroy answered %v while the guest was still shutting down; the "+
+			"caller reads that as proof and releases the capacity", err)
+	}
+
+	held, err := a.Lease(t.Context(), lease.ID)
+	if err != nil {
+		t.Fatalf("read the lease: %v", err)
+	}
+
+	if held.Phase.Terminal() {
+		t.Errorf("the lease went terminal at %s after a repeated destroy", held.Phase)
+	}
+
+	// AND ONCE THE GUEST IS GONE THE ANSWER FLIPS, or the request could never be
+	// finished and the capacity would be held for good.
+	p.settle(provider.InstanceName(lease.ID))
+
+	if err := r.Destroy(t.Context(), 11); err != nil {
+		t.Errorf("a destroy after the guest was provably gone still reported custody: %v", err)
+	}
+}
+
 // AND IT IS RECORDED AS A JOB THAT FINISHED, not as one that failed.
 //
 // custody's other discard path is a launch that never started, which is a

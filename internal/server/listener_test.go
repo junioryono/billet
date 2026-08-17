@@ -3470,6 +3470,75 @@ func TestASlowDestroyDoesNotCostTheReleaseItsBudget(t *testing.T) {
 	}
 }
 
+// SHUTDOWN DOES NOT RELEASE A LEASE THE RUNNER HAS TAKEN INTO CUSTODY.
+//
+// Found by review of the fix for #46, and it undid that fix at exactly the moment
+// it mattered most. destroyAll marks a custody answer "done" — correctly, since
+// nothing more is owed by this listener — and releaseAll then releases every
+// lease still in `running` whose request is marked done. So the handoff was
+// completed and reversed within the same shutdown: the node's janitor took
+// responsibility for a guest that was still shutting down, and the listener
+// handed its capacity back seconds later.
+//
+// A shutdown is the WORST time for it. The listener is going away, so nothing
+// here will notice the double-booking; the node's janitor outlives it and is the
+// only thing left that can release the lease honestly.
+func TestShutdownDoesNotReleaseALeaseTheRunnerIsHolding(t *testing.T) {
+	t.Parallel()
+
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+
+	// The shape an asynchronous backend produces: the terminate was accepted, the
+	// guest may still be running, and the node is holding the lease until it is
+	// provably gone.
+	runner := &fakeRunner{onDestroy: func(int64) error {
+		return fmt.Errorf("%w: the guest was asked to stop and has not been confirmed gone",
+			ErrCustody)
+	}}
+
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner),
+		WithDrainGrace(notDrainingHere))
+
+	holdRunning(t, l, a, tiers[0].Label, 7)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	defer cancel()
+
+	runDone := make(chan struct{})
+
+	go func() {
+		defer close(runDone)
+
+		if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("Run: %v", err)
+		}
+	}()
+
+	cancel()
+
+	select {
+	case <-runDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("Run never returned")
+	}
+
+	// ONE SLOT SHORT, DELIBERATELY. The escrowed leases come back; the running
+	// one does not, because a guest may still be on that machine. Full headroom
+	// here would mean another tier can now be placed on capacity billet cannot
+	// account for.
+	room, err := a.Headroom(t.Context(), tiers[0].Label)
+	if err != nil {
+		t.Fatalf("headroom: %v", err)
+	}
+
+	if room == 2 {
+		t.Error("shutdown released a lease the runner had taken into custody; its guest may " +
+			"still be running, and the janitor holding it is now the only thing that could " +
+			"have released it honestly")
+	}
+}
+
 // A SLOW CLOSE DOES NOT COST THE RELEASE ITS BUDGET EITHER.
 //
 // Giving the local half its own budget fixed the remote half starving it and

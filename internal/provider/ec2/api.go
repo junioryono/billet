@@ -142,7 +142,41 @@ func retryable(err error) bool {
 		return true
 	}
 
+	// A CAPACITY VERDICT IS A 500 THAT IS NOT A BLIP, and it has to be named here
+	// because the line below reads the status alone (#49).
+	//
+	// AWS returns InsufficientInstanceCapacity with HTTP 500 — it is classified as
+	// a server error — so it landed in "not now" and was retried against the same
+	// shape in the same availability zone, milliseconds apart. That cannot change
+	// the answer. The recovery is a DIFFERENT SHAPE, which Launch now walks to,
+	// and every retry here is time spent before that begins.
+	if capacityRefusal(apiErr.Code) {
+		return false
+	}
+
 	return apiErr.Status >= http.StatusInternalServerError
+}
+
+// capacityRefusal reports whether a code means "not this shape, here, now" —
+// AWS refusing synchronously, having started nothing.
+//
+// WHAT MAKES A FALLBACK SAFE, and the whole reason it is a named list rather
+// than a status range. Trying a second shape after an AMBIGUOUS failure — a
+// dropped connection, an unparseable body — could leave two instances carrying
+// one lease's name, both registered with GitHub, one of them free to pick up
+// unrelated work. These codes are AWS's own verdict that the request was
+// rejected, so nothing was started and another shape is a fresh question.
+//
+//	InsufficientInstanceCapacity  AWS has none of that shape in that AZ right now.
+//	InsufficientHostCapacity      the dedicated-host variant of the same.
+//	Unsupported                   that shape is not offered in that AZ at all.
+func capacityRefusal(code string) bool {
+	switch code {
+	case "InsufficientInstanceCapacity", "InsufficientHostCapacity", "Unsupported":
+		return true
+	}
+
+	return false
 }
 
 // call issues one action and unmarshals the response into out.
