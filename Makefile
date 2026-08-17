@@ -116,7 +116,7 @@ alert-lifecycle: ## Exercise alert ownership migration and teardown through the 
 	ANSIBLE_COLLECTIONS_PATH=$(CURDIR)/ansible_collections ansible-playbook ansible_collections/junioryono/billet/tests/alert-lifecycle.yml
 
 .PHONY: development-check-mode
-development-check-mode: ## Exercise a first development-host dry run before tools exist
+development-check-mode: ## Exercise a first Linux development-host dry run before tools exist
 	ANSIBLE_COLLECTIONS_PATH=$(CURDIR)/ansible_collections ansible-playbook --check ansible_collections/junioryono/billet/tests/development-check-mode.yml
 
 .PHONY: package-lifecycle

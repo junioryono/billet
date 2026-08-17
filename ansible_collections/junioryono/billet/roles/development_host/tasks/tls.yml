@@ -99,7 +99,18 @@
   become: true
   become_user: "{{ billet_development_user }}"
   register: billet_development_certificate_mint
-  when: billet_development_tls_needs_certificate
+  when:
+    - billet_development_tls_needs_certificate
+    - not ansible_check_mode
+  changed_when: true
+
+- name: Predict development certificate renewal
+  ansible.builtin.debug:
+    msg: Would mint and install a matching development certificate and private key.
+  register: billet_development_certificate_prediction
+  when:
+    - billet_development_tls_needs_certificate
+    - ansible_check_mode
   changed_when: true
 
 - name: Read the staged development certificate public key

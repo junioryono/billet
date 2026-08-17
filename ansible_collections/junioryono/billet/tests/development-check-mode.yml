@@ -1,15 +1,38 @@
 ---
-- name: Verify a first development-host dry run tolerates planned tools
+- name: Verify a first Linux development-host dry run
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars:
+    billet_development_apt_stage: "{{ lookup('env', 'TMPDIR') | default('/tmp', true) }}/billet-development-host-check-mode"
+    billet_development_tls_caroot: "{{ lookup('env', 'TMPDIR') | default('/tmp', true) }}/billet-development-host-check-mode/caroot"
+    billet_development_tls_dir: "{{ lookup('env', 'TMPDIR') | default('/tmp', true) }}/billet-development-host-check-mode/tls"
+    billet_development_proxy_config_dir: "{{ lookup('env', 'TMPDIR') | default('/tmp', true) }}/billet-development-host-check-mode/proxy"
+    billet_development_proxy_log_path: "{{ lookup('env', 'TMPDIR') | default('/tmp', true) }}/billet-development-host-check-mode/logs/caddy.log"
+  roles:
+    - role: junioryono.billet.development_host
+      when: ansible_facts["system"] == "Linux"
+
+- name: Verify development tool probes run in check mode
   hosts: localhost
   connection: local
   gather_facts: false
   vars:
-    billet_development_caddy_bin: /billet-test/not-yet-installed/caddy
-    billet_development_mkcert_bin: /billet-test/not-yet-installed/mkcert
-    billet_development_terraform_bin: /billet-test/not-yet-installed/terraform
+    billet_development_caddy_bin: "{{ playbook_dir }}/fixtures/fake-development-tool.sh"
+    billet_development_mkcert_bin: "{{ playbook_dir }}/fixtures/fake-development-tool.sh"
+    billet_development_terraform_bin: "{{ playbook_dir }}/fixtures/fake-development-tool.sh"
     billet_development_install_terraform: true
+    billet_development_caddy_min_version: "2.7.0"
+    billet_development_terraform_min_version: "1.12.0"
   tasks:
-    - name: Exercise development tool verification in check mode
+    - name: Exercise development tool verification
       ansible.builtin.include_role:
         name: junioryono.billet.development_host
         tasks_from: verify-tools
+
+    - name: Require every read-only version probe to execute
+      ansible.builtin.assert:
+        that:
+          - billet_development_caddy_version_command.stdout == 'v2.7.0'
+          - billet_development_mkcert_version_command.stdout == 'v1.4.4'
+          - (billet_development_terraform_version_command.stdout | from_json).terraform_version == '1.12.0'

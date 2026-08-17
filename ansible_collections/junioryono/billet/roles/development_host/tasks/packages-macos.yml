@@ -31,12 +31,27 @@
   loop: "{{ billet_development_homebrew_formulae.results }}"
   loop_control:
     label: "{{ item.item }}"
-  when: item.rc != 0
+  when:
+    - item.rc != 0
+    - not ansible_check_mode
+  changed_when: true
+
+- name: Predict missing macOS development formula installations
+  ansible.builtin.debug:
+    msg: "Would install {{ item.item }}."
+  loop: "{{ billet_development_homebrew_formulae.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when:
+    - item.rc != 0
+    - ansible_check_mode
   changed_when: true
 
 - name: Inspect outdated macOS development formulae
   ansible.builtin.command:
     argv: ["{{ billet_development_brew_bin }}", outdated, --quiet, "{{ item }}"]
+  environment:
+    HOMEBREW_NO_AUTO_UPDATE: "1"
   loop: "{{ ['caddy', 'mkcert', 'nss'] + (['hashicorp/tap/terraform'] if billet_development_install_terraform else []) }}"
   register: billet_development_homebrew_outdated
   changed_when: false
@@ -49,7 +64,20 @@
   loop: "{{ billet_development_homebrew_outdated.results }}"
   loop_control:
     label: "{{ item.item }}"
-  when: item.stdout | trim | length > 0
+  when:
+    - item.stdout | trim | length > 0
+    - not ansible_check_mode
+  changed_when: true
+
+- name: Predict outdated macOS development formula upgrades
+  ansible.builtin.debug:
+    msg: "Would upgrade {{ item.item }}."
+  loop: "{{ billet_development_homebrew_outdated.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when:
+    - item.stdout | trim | length > 0
+    - ansible_check_mode
   changed_when: true
 
 - name: Resolve the Homebrew prefix

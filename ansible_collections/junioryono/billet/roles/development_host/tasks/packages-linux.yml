@@ -1,4 +1,10 @@
 ---
+- name: Inspect the development package staging directory
+  ansible.builtin.stat:
+    path: "{{ billet_development_apt_stage }}"
+  register: billet_development_apt_stage_stat
+  become: true
+
 - name: Create the development package staging directory
   ansible.builtin.file:
     path: "{{ billet_development_apt_stage }}"
@@ -32,6 +38,7 @@
   loop:
     - { name: caddy, url: "https://dl.cloudsmith.io/public/caddy/stable/gpg.key" }
     - { name: hashicorp, url: "https://apt.releases.hashicorp.com/gpg" }
+  when: not ansible_check_mode or billet_development_apt_stage_stat.stat.exists
   become: true
 
 - name: Install the repository key verifier
@@ -41,6 +48,7 @@
     owner: root
     group: root
     mode: "0700"
+  when: not ansible_check_mode or billet_development_apt_stage_stat.stat.exists
   become: true
 
 - name: Verify development repository primary signing fingerprints
@@ -115,11 +123,16 @@
     state: latest
   become: true
 
+- name: Inspect installed Linux services
+  ansible.builtin.service_facts:
+
 - name: Stop the package's default Caddy service
   ansible.builtin.systemd_service:
     name: caddy.service
     enabled: false
     state: stopped
+  when:
+    - not ansible_check_mode or 'caddy.service' in ansible_facts.services
   become: true
 
 - name: Record Linux development tool paths

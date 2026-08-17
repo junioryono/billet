@@ -34,6 +34,8 @@
 - name: Read the Terraform version
   ansible.builtin.command:
     argv: ["{{ billet_development_terraform_bin }}", version, -json]
+  environment:
+    CHECKPOINT_DISABLE: "1"
   register: billet_development_terraform_version_command
   changed_when: false
   check_mode: false
