@@ -1,0 +1,8 @@
+---
+- name: Record guest networks removed from configuration
+  ansible.builtin.set_fact:
+    billet_stale_network_names: >-
+      {{
+        (billet_managed_network_files.files | map(attribute='path') | map('basename') | map('regex_replace', '[.]conf$', '') | list) |
+        difference(billet_networks | map(attribute='name') | list) | list
+      }}
