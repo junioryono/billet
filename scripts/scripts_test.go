@@ -69,6 +69,8 @@ func TestProductionSurfacesUseTheTestedSecurityHelpers(t *testing.T) {
 		"ansible_collections/junioryono/billet/galaxy.yml")
 	assertContains(t, filepath.Join("..", ".github", "workflows", "cut-release.yml"),
 		"scripts/check-release-metadata.sh")
+	assertContains(t, filepath.Join("..", ".github", "workflows", "cut-release.yml"),
+		`[0-9]+\$#version: ${COLLECTION_VERSION}#`)
 	assertContains(t, filepath.Join("..", ".github", "workflows", "release.yml"),
 		"run: scripts/check-release-metadata.sh")
 }
