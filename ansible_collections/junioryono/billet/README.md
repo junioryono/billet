@@ -4,7 +4,7 @@
 
 The role can bootstrap a new single-host Ceph cluster only when `billet_ceph_bootstrap` is explicitly true and `billet_ceph_devices` names every device to consume. That path is destructive by definition and is never inferred from available disks.
 
-Until billet has a release, set `billet_binary_src` to a Linux binary built from the same checkout as the collection. After releases exist, package installation will become the default path; the source-built binary input is deliberately explicit while the project is pre-alpha.
+Set `billet_binary_src` to the Linux binary the role should install. A repository can pin the collection and binary to one release by fetching the tagged `scripts/install.sh` with `BILLET_VERSION` and `BILLET_INSTALL_DIR` set, then passing the verified result through `BILLET_BINARY_PATH`; a Billet contributor can instead build the binary from the same checkout as the collection. Keeping the binary input explicit prevents a host converge from silently upgrading the process that owns running jobs.
 
 See `roles/host/defaults/main.yml` for the complete input surface.
 

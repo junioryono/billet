@@ -55,21 +55,6 @@ normally a private network or a VPN rather than the internet.
 
 ## Install
 
-> **There is no release yet, so build from source.** The repository has no tags,
-> which means the two paths below — the install script and the packages — have
-> nothing to download and will fail. They are documented because the pipeline
-> that produces them is built and tested; the first tag has simply not been cut.
-
-```bash
-git clone https://github.com/junioryono/billet && cd billet && go build ./cmd/billet
-sudo mkdir -p /usr/local/bin && sudo install -m 0755 billet /usr/local/bin/billet
-```
-
-That second line is what makes the bare `billet` in every command below work; `go build` leaves the
-binary in the current directory and installs nothing.
-
-Once a release exists:
-
 ```bash
 curl -fsSL https://raw.githubusercontent.com/junioryono/billet/main/scripts/install.sh | sh
 ```
@@ -367,7 +352,7 @@ built. What works **today**:
 | Placement | The control plane chooses the machine when the work is admitted, by provider preference, then packing (`placement: spread` to even the load instead), then name. Reserved floors are held against the machines that could keep them |
 | Sites | A node says where it is; a tier may insist on a place. Cache implementations namespace data by site, but the control plane does not yet enforce that a split-config node's selected store matches the store declared for that site, and the cross-node/cross-site behavior still needs a real integration proof ([#20](https://github.com/junioryono/billet/issues/20)) |
 | Graceful drain | SIGTERM stops it taking new work and waits for the jobs already running, so `systemctl restart` does not fail somebody's build. See [Updating](#updating) |
-| Release pipeline | Tagged releases with checksums, `.deb`/`.rpm` with systemd units, and the install script — **built and never yet run: there are no tags, so no release exists to install.** Build from source until there is one |
+| Release pipeline | Tagged releases with checksums, `.deb`/`.rpm` packages with systemd units, an install script that verifies the published checksum, and immutable internal action references on every release tag |
 | Multi-backend tiers | One label can name several providers, and the preference ORDER decides: the control plane picks the host when the job is admitted, walking the tier's list most-preferred-first. Both halves of the intended pair now exist — `[firecracker, ec2]` means the bare-metal box before the cloud — though nobody has watched a job fail over between them ([#32](https://github.com/junioryono/billet/issues/32)) |
 | Firecracker microVMs | One job, one guest kernel, on bare metal. Under the jailer always: chrooted, dropped to its own unprivileged uid, in a cgroup, with a seccomp filter. The root disk is a copy-on-write RBD clone of a golden image, discarded with the guest, and the runner registration is delivered through the metadata service so it is never in argv and never on a disk. The guest image exists too: `scripts/build-guest-image.sh` builds and publishes it, and a guest boots, takes its registration and runs a container in about ten seconds. See [Guest images](#guest-images) |
 
