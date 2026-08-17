@@ -1,0 +1,13 @@
+defaults
+auth on
+tls on
+tls_starttls on
+tls_trust_file /etc/ssl/certs/ca-certificates.crt
+logfile /var/log/msmtp.log
+
+account default
+host {{ billet_smtp_host }}
+port {{ billet_smtp_port }}
+from {{ billet_alert_from }}
+user {{ billet_smtp_username }}
+password {{ billet_smtp_password }}

@@ -1,0 +1,134 @@
+---
+- name: Create the development package staging directory
+  ansible.builtin.file:
+    path: "{{ billet_development_apt_stage }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+  become: true
+
+- name: Install development package prerequisites
+  ansible.builtin.apt:
+    name:
+      - ca-certificates
+      - curl
+      - debian-keyring
+      - debian-archive-keyring
+      - gnupg
+      - libnss3-tools
+      - mkcert
+    state: present
+    update_cache: true
+  become: true
+
+- name: Download development repository signing keys
+  ansible.builtin.get_url:
+    url: "{{ item.url }}"
+    dest: "{{ billet_development_apt_stage }}/{{ item.name }}.asc"
+    owner: root
+    group: root
+    mode: "0600"
+  loop:
+    - { name: caddy, url: "https://dl.cloudsmith.io/public/caddy/stable/gpg.key" }
+    - { name: hashicorp, url: "https://apt.releases.hashicorp.com/gpg" }
+  become: true
+
+- name: Read development repository signing keys
+  ansible.builtin.command:
+    argv:
+      - gpg
+      - --show-keys
+      - --with-colons
+      - "{{ billet_development_apt_stage }}/{{ item }}.asc"
+  loop:
+    - caddy
+    - hashicorp
+  register: billet_development_repository_keys
+  changed_when: false
+  check_mode: false
+  become: true
+
+- name: Verify development repository signing keys
+  ansible.builtin.assert:
+    that:
+      - "('fpr:::::::::' ~ item.fingerprint ~ ':') in (item.key.stdout | default(''))"
+    fail_msg: >-
+      The {{ item.name }} repository key does not contain the pinned fingerprint
+      {{ item.fingerprint }}. Refusing to trust the repository.
+  loop:
+    - name: Caddy
+      fingerprint: "{{ billet_development_caddy_signing_fingerprint }}"
+      key: "{{ billet_development_repository_keys.results[0] }}"
+    - name: HashiCorp
+      fingerprint: "{{ billet_development_hashicorp_signing_fingerprint }}"
+      key: "{{ billet_development_repository_keys.results[1] }}"
+  when: not ansible_check_mode
+
+- name: Install verified development repository keys
+  ansible.builtin.copy:
+    src: "{{ billet_development_apt_stage }}/{{ item }}.asc"
+    dest: "/etc/apt/keyrings/{{ item }}.asc"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - caddy
+    - hashicorp
+  when: not ansible_check_mode
+  become: true
+
+- name: Add the Caddy repository
+  ansible.builtin.deb822_repository:
+    name: caddy-stable
+    types: [deb]
+    uris: https://dl.cloudsmith.io/public/caddy/stable/deb/debian
+    suites: [any-version]
+    components: [main]
+    signed_by: /etc/apt/keyrings/caddy.asc
+    state: present
+    enabled: true
+  register: billet_development_caddy_repository
+  become: true
+
+- name: Add the HashiCorp repository
+  ansible.builtin.deb822_repository:
+    name: hashicorp
+    types: [deb]
+    uris: https://apt.releases.hashicorp.com
+    suites: ["{{ ansible_facts['distribution_release'] }}"]
+    components: [main]
+    signed_by: /etc/apt/keyrings/hashicorp.asc
+    state: present
+    enabled: true
+  register: billet_development_hashicorp_repository
+  when: billet_development_install_terraform
+  become: true
+
+- name: Refresh apt for development repositories
+  ansible.builtin.apt:
+    update_cache: true
+  when: >-
+    billet_development_caddy_repository is changed or
+    billet_development_hashicorp_repository is changed
+  become: true
+
+- name: Install Caddy and Terraform
+  ansible.builtin.apt:
+    name: "{{ ['caddy'] + (['terraform'] if billet_development_install_terraform else []) }}"
+    state: present
+  become: true
+
+- name: Stop the package's default Caddy service
+  ansible.builtin.systemd_service:
+    name: caddy.service
+    enabled: false
+    state: stopped
+  become: true
+
+- name: Record Linux development tool paths
+  ansible.builtin.set_fact:
+    billet_development_caddy_bin: /usr/bin/caddy
+    billet_development_mkcert_bin: /usr/bin/mkcert
+    billet_development_terraform_bin: /usr/bin/terraform

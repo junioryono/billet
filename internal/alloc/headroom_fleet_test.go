@@ -251,7 +251,10 @@ func TestThePreferredBackendIsChosenWhenBothAreAvailable(t *testing.T) {
 				VCPU: 64, Memory: 512 * config.GiB})
 			mustRegister(t, a, NodeRegistration{
 				Name: "ec2-spot-1", Provider: config.ProviderEC2,
-				VCPU: 64, Memory: 512 * config.GiB})
+				VCPU: 64, Memory: 512 * config.GiB,
+				EC2Shapes: []config.EC2InstanceType{{
+					Type: "test", VCPU: 4, Memory: 8 * config.GiB,
+				}}})
 
 			lease, err := a.Reserve(t.Context(), "spanning")
 			if err != nil {
@@ -351,7 +354,10 @@ func TestPlacementPolicyDoesNotOverrulePreference(t *testing.T) {
 				VCPU: 64, Memory: 640 * config.GiB})
 			mustRegister(t, a, NodeRegistration{
 				Name: "ec2-spot-1", Provider: config.ProviderEC2,
-				VCPU: 8, Memory: 640 * config.GiB})
+				VCPU: 8, Memory: 640 * config.GiB,
+				EC2Shapes: []config.EC2InstanceType{{
+					Type: "test", VCPU: 4, Memory: 8 * config.GiB,
+				}}})
 
 			lease, err := a.Reserve(t.Context(), "spanning")
 			if err != nil {

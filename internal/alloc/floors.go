@@ -65,7 +65,7 @@ func (a *Allocator) reserveFloors(
 			continue
 		}
 
-		kept, err := a.holdFloor(ctx, tx, t, missing, free)
+		_, cost, err := a.holdFloor(ctx, tx, t, missing, free)
 		if err != nil {
 			return 0, 0, err
 		}
@@ -76,8 +76,8 @@ func (a *Allocator) reserveFloors(
 		// no suitable host anywhere took the ceiling away from tiers that were
 		// perfectly placeable — a Tart floor on a fleet of Docker boxes left an
 		// entirely healthy deployment advertising nothing.
-		heldVCPU += kept * t.VCPU
-		heldMemory += config.ByteSize(kept) * t.Memory
+		heldVCPU += cost.vcpu
+		heldMemory += cost.memory
 	}
 
 	return heldVCPU, heldMemory, nil
@@ -92,7 +92,7 @@ func (a *Allocator) reserveFloors(
 // exactly the contention a floor is meant to survive.
 func (a *Allocator) holdFloor(
 	ctx context.Context, tx querier, t config.Tier, missing int, free *fleet,
-) (int, error) {
+) (int, placementCost, error) {
 	// ITS OWN CANDIDATES, SPENDING THE SHARED FLEET. A floor on a macOS tier is
 	// kept on the Mac; holding it against whichever machines the ASKING tier
 	// happens to use is wrong twice — it denies them room to protect a
@@ -100,20 +100,26 @@ func (a *Allocator) holdFloor(
 	// matters untouched.
 	held, err := free.forTier(ctx, tx, a, t)
 	if err != nil {
-		return 0, err
+		return 0, placementCost{}, err
 	}
 
-	kept := 0
+	var (
+		kept int
+		cost placementCost
+	)
 
 	for range missing {
-		if _, ok := held.next(t); !ok {
+		_, one, ok := held.next(t)
+		if !ok {
 			// The fleet cannot keep the rest of this floor. Stopping here is what
 			// keeps an impossible reservation from freezing everyone else.
 			break
 		}
 
 		kept++
+		cost.vcpu += one.vcpu
+		cost.memory += one.memory
 	}
 
-	return kept, nil
+	return kept, cost, nil
 }

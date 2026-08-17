@@ -255,7 +255,8 @@ func cmdImagesVerify(ctx context.Context, args []string) error {
 		return err
 	}
 
-	if err := verifyGuestImage(ctx, prov, cfg.Node.Firecracker.Bridge, rest, lease, *wait); err != nil {
+	if err := verifyGuestImage(ctx, prov, cfg.Node.Firecracker.Bridge,
+		cfg.Node.Firecracker.ImageVerifyPort, rest, lease, *wait); err != nil {
 		return err
 	}
 
@@ -333,7 +334,8 @@ func cmdImagesVerify(ctx context.Context, args []string) error {
 
 // verifyGuestImage launches one microVM and waits for the guest to report on itself.
 func verifyGuestImage(
-	ctx context.Context, prov provider.Provider, bridge, image, lease string, wait time.Duration,
+	ctx context.Context, prov provider.Provider, bridge string, port int,
+	image, lease string, wait time.Duration,
 ) error {
 	// A LISTENER ON THIS MACHINE, because the assertion has to be made BY THE GUEST.
 	// Anything the host can check on its own was already green for an image that ran
@@ -347,7 +349,7 @@ func verifyGuestImage(
 		return err
 	}
 
-	srv, addr, serveErr, err := listenForGuestReport(ctx, bridge, secret, report)
+	srv, addr, serveErr, err := listenForGuestReport(ctx, bridge, port, secret, report)
 	if err != nil {
 		return err
 	}
@@ -484,14 +486,14 @@ func destroyProbe(ctx context.Context, prov provider.Provider, name string) erro
 
 // listenForGuestReport serves the address the guest posts its report to.
 func listenForGuestReport(
-	ctx context.Context, bridge, secret string, report chan<- string,
+	ctx context.Context, bridge string, port int, secret string, report chan<- string,
 ) (*http.Server, string, <-chan error, error) {
-	// ON THE BRIDGE'S OWN ADDRESS AND AN ARBITRARY PORT. The guest reaches this
-	// over the bridge, so loopback would be a listener it cannot see — and binding
-	// every interface would expose a port that accepts an unauthenticated report to
-	// networks that have no business reaching it. A fixed port would collide with
-	// whatever else the operator runs.
-	host, err := hostAddrOnBridge(bridge, 0)
+	// ON THE BRIDGE'S OWN ADDRESS AND THE DECLARED PORT. The guest reaches this over
+	// the bridge, so loopback would be a listener it cannot see — and binding every
+	// interface would expose it to networks that have no business reaching it. The
+	// port is fixed because host policy must be able to admit exactly this callback;
+	// the verification lock guarantees there cannot be two of these listeners here.
+	host, err := hostAddrOnBridge(bridge, port)
 	if err != nil {
 		return nil, "", nil, err
 	}

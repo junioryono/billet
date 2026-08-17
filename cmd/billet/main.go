@@ -23,6 +23,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime/debug"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -30,6 +31,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/awssig"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/node"
 	"github.com/junioryono/billet/internal/nodeclient"
@@ -41,7 +43,9 @@ import (
 	"github.com/junioryono/billet/internal/scaleset"
 	"github.com/junioryono/billet/internal/server"
 	"github.com/junioryono/billet/internal/state"
+	storecontract "github.com/junioryono/billet/internal/store"
 	"github.com/junioryono/billet/internal/store/ceph"
+	"github.com/junioryono/billet/internal/store/ebss3"
 	"github.com/junioryono/billet/internal/version"
 	"github.com/junioryono/billet/internal/wirecert"
 	"github.com/junioryono/billet/internal/wiring"
@@ -1015,6 +1019,12 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 		return err
 	}
 
+	cacheService, stopCache, err := startNodeCache(ctx, cfg, p, deployment)
+	if err != nil {
+		return err
+	}
+	defer stopCache()
+
 	maxCustody, err := cfg.Node.MaxCustodyDuration()
 	if err != nil {
 		return err
@@ -1025,8 +1035,14 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 	// It satisfies node.LeaseStore and node.JITSource, which is the whole reason
 	// the runner needs no idea it is remote: the interfaces it already took are
 	// the seam the network went through.
-	runner := node.New(client, cfg.Node.Name, client, p, slog.Default(),
-		node.WithMaxCustody(maxCustody))
+	runnerOpts := []node.Option{node.WithMaxCustody(maxCustody)}
+	if cacheService != nil {
+		runnerOpts = append(runnerOpts, node.WithCacheService(cacheService))
+	}
+	if cfg.Node.RegistryMirrors != nil {
+		runnerOpts = append(runnerOpts, node.WithRegistryMirrors(*cfg.Node.RegistryMirrors))
+	}
+	runner := node.New(client, cfg.Node.Name, client, p, slog.Default(), runnerOpts...)
 
 	fmt.Printf("billet node %s: dialing %s\n", cfg.Node.Name, cfg.Node.ServerAddr)
 
@@ -1060,6 +1076,7 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 		Site:         cfg.Node.Site,
 		VCPU:         contribution.VCPU,
 		Memory:       contribution.Memory,
+		EC2Shapes:    ec2Shapes(cfg),
 		Log:          slog.Default(),
 		Identity:     identity,
 		SweepEvery:   5 * time.Minute,
@@ -1067,6 +1084,171 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 		// The second signal, reaching the wait that honours it.
 		Hurry: lc.hurry,
 	})
+}
+
+const cacheEvictionAge = 7 * 24 * time.Hour
+
+// startNodeCache exposes the site's clone store to its managed guests.
+func startNodeCache(
+	ctx context.Context,
+	cfg *config.Config,
+	p provider.Provider,
+	deployment string,
+) (*node.CacheService, func(), error) {
+	if cfg.Node.Cache == nil {
+		return nil, func() {}, nil
+	}
+
+	attacher, ok := p.(provider.VolumeAttacher)
+	if !ok {
+		return nil, nil, fmt.Errorf("billet: provider %s cannot attach node.cache volumes",
+			cfg.Node.Provider)
+	}
+	var storage storecontract.Store
+	switch cfg.Node.Provider {
+	case config.ProviderFirecracker:
+		if cfg.Node.Ceph == nil {
+			return nil, nil, errors.New("billet: a Firecracker node.cache needs node.ceph")
+		}
+		var err error
+		storage, err = ceph.New(*cfg.Node.Ceph)
+		if err != nil {
+			return nil, nil, err
+		}
+	case config.ProviderEC2:
+		if cfg.Node.EBSS3 == nil {
+			return nil, nil, errors.New("billet: an EC2 node.cache needs node.ebs_s3")
+		}
+		credentials := ec2.DefaultCredentials()
+		awsCredentials := ebss3.CredentialSourceFunc(func(ctx context.Context) (awssig.Credentials, error) {
+			resolved, err := credentials.Credentials(ctx)
+			if err != nil {
+				return awssig.Credentials{}, err
+			}
+
+			return awssig.Credentials{
+				AccessKeyID: resolved.AccessKeyID, SecretAccessKey: resolved.SecretAccessKey,
+				SessionToken: resolved.SessionToken,
+			}, nil
+		})
+		var err error
+		storage, err = ebss3.New(*cfg.Node.EBSS3,
+			cacheNamespace(deployment, cfg.Node.Site), awsCredentials)
+		if err != nil {
+			return nil, nil, err
+		}
+	default:
+		return nil, nil, fmt.Errorf("billet: provider %s has no cache store", cfg.Node.Provider)
+	}
+
+	service, err := node.NewCacheService(cfg.Node.Cache.GuestEndpoint,
+		cacheNamespace(deployment, cfg.Node.Site), cfg.Node.StateDir, storage, attacher, slog.Default())
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var lc net.ListenConfig
+	ln, err := lc.Listen(ctx, "tcp", cfg.Node.Cache.Listen)
+	if err != nil {
+		return nil, nil, fmt.Errorf("listen for guest cache requests on %s: %w",
+			cfg.Node.Cache.Listen, err)
+	}
+
+	srv := &http.Server{
+		Handler:           service,
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       time.Minute,
+	}
+	serveListener := ln
+	if cfg.Node.Provider == config.ProviderEC2 {
+		certificate, err := tls.LoadX509KeyPair(cfg.Node.Cache.TLSCert, cfg.Node.Cache.TLSKey)
+		if err != nil {
+			_ = ln.Close()
+
+			return nil, nil, fmt.Errorf("load the EC2 cache listener certificate: %w", err)
+		}
+		srv.TLSConfig = &tls.Config{
+			Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS13,
+		}
+		serveListener = tls.NewListener(ln, srv.TLSConfig)
+	}
+	go func() {
+		if err := srv.Serve(serveListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Default().Error("the guest cache listener stopped; jobs will continue cold",
+				"error", err)
+		}
+	}()
+
+	// Eviction is intentionally best effort. A cache outage may slow a job, but it
+	// must never change that job's result or stop the node from serving compute.
+	go func() {
+		cleanupTicker := time.NewTicker(5 * time.Minute)
+		evictionTicker := time.NewTicker(6 * time.Hour)
+		defer cleanupTicker.Stop()
+		defer evictionTicker.Stop()
+
+		retryClosed := func() {
+			if err := service.RetryClosed(ctx); err != nil && ctx.Err() == nil {
+				slog.Default().Warn("could not finish closed cache sessions; will retry",
+					"error", err)
+			}
+		}
+		renewActive := func() {
+			if err := service.RenewActive(ctx, time.Now().Add(7*time.Hour)); err != nil && ctx.Err() == nil {
+				slog.Default().Warn("could not renew active cache generations; will retry",
+					"error", err)
+			}
+		}
+		evict := func() {
+			if err := storage.Evict(ctx, cacheEvictionAge); err != nil && ctx.Err() == nil {
+				slog.Default().Warn("could not evict expired cache generations; will retry",
+					"error", err)
+			}
+		}
+
+		retryClosed()
+		renewActive()
+		evict()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-cleanupTicker.C:
+				retryClosed()
+				renewActive()
+			case <-evictionTicker.C:
+				evict()
+			}
+		}
+	}()
+
+	slog.Default().Info("serving guest cache requests", "provider", cfg.Node.Provider,
+		"addr", ln.Addr().String())
+
+	return service, func() {
+		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			slog.Default().Warn("the guest cache listener did not shut down cleanly", "error", err)
+		}
+	}, nil
+}
+
+func cacheNamespace(deployment, site string) string {
+	if site == "" {
+		site = "local"
+	}
+
+	return deployment + "/" + site
+}
+
+func ec2Shapes(cfg *config.Config) []config.EC2InstanceType {
+	if cfg.Node.EC2 == nil {
+		return nil
+	}
+
+	return slices.Clone(cfg.Node.EC2.InstanceTypes)
 }
 
 // newScaleSetClient builds the GitHub client from config, reading the key with
@@ -1700,12 +1882,20 @@ func cmdCheck(ctx context.Context, args []string) error {
 	}
 
 	if cfg.Node != nil {
-		fmt.Printf("node     %s via %s -> %s\n", cfg.Node.Name, cfg.Node.Provider, cfg.Node.ServerAddr)
+		site := cfg.Node.Site
+		if site == "" {
+			site = "local (implicit)"
+		}
+		fmt.Printf("node     %s at %s via %s -> %s\n", cfg.Node.Name, site,
+			cfg.Node.Provider, cfg.Node.ServerAddr)
 
 		// Config validation proves the ec2 block is COHERENT. It cannot prove this
 		// machine can act on it, and the difference is a deployment that validates
 		// and then fails on the first job of the day.
 		if cfg.Node.Provider == config.ProviderEC2 && cfg.Node.EC2 != nil {
+			if err := printEC2Cost(cfg); err != nil {
+				return err
+			}
 			if err := checkEC2Credentials(ctx, cfg.Node.EC2); err != nil {
 				return err
 			}
@@ -1727,6 +1917,10 @@ func cmdCheck(ctx context.Context, args []string) error {
 				return err
 			}
 		}
+	}
+
+	for i := range cfg.Sites {
+		fmt.Printf("site     %-24s %s\n", cfg.Sites[i].Name, cfg.Sites[i].Store)
 	}
 
 	// Per-host policy decides what each machine may run and how many macOS
@@ -1828,12 +2022,74 @@ func cmdCheck(ctx context.Context, args []string) error {
 	return nil
 }
 
-func cmdStatus(_ context.Context, args []string) error {
+func printEC2Cost(cfg *config.Config) error {
+	maxVCPU := cfg.Node.MaxVCPU
+	maxMemory := cfg.Node.MaxMemory
+	if cfg.Server != nil {
+		maxVCPU = min(maxVCPU, cfg.Server.MaxVCPU)
+		maxMemory = min(maxMemory, cfg.Server.MaxMemory)
+	}
+
+	peak, err := config.EC2PeakHourlyExposure(maxVCPU, maxMemory,
+		cfg.Node.EC2.InstanceTypes)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("ec2 max  <= %s compute (%s/month at 730h), from declared shape prices\n",
+		&peak, peak.ForHours(730))
+
+	return nil
+}
+
+func cmdStatus(ctx context.Context, args []string) error {
 	fs := newFlagSet("billet status")
+	cfgPath := addConfigFlag(fs)
 	if err := parse(fs, args); err != nil {
 		return err
 	}
-	return fmt.Errorf("%w: needs the capacity ledger to report against", errNotImplemented)
+
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		return err
+	}
+
+	a, closeDB, err := controlPlaneAllocator(ctx, *cfgPath)
+	if err != nil {
+		return err
+	}
+	defer closeDB()
+
+	usage, err := a.Usage(ctx)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("capacity  %d of %d vCPU, %s of %s, %d open leases\n",
+		usage.VCPU, cfg.Server.MaxVCPU, usage.Memory, cfg.Server.MaxMemory, usage.Leases)
+
+	for i := range cfg.Tiers {
+		t := &cfg.Tiers[i]
+		headroom, err := a.Headroom(ctx, t.Label)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("tier      %-24s %d available\n", t.Label, headroom)
+	}
+
+	held, err := a.Held(ctx)
+	if err != nil {
+		return err
+	}
+	if len(held) == 0 {
+		fmt.Println("held      none")
+
+		return nil
+	}
+
+	fmt.Printf("held      %d lease(s) waiting for compute to be confirmed gone\n", len(held))
+	printHeld(held)
+
+	return nil
 }
 
 func cmdVersion(_ context.Context, args []string) error {
@@ -1900,6 +2156,10 @@ func checkEC2Credentials(ctx context.Context, cfg *config.EC2Config) error {
 	fmt.Printf("         (describe only — launching also needs at least ec2:RunInstances, " +
 		"ec2:TerminateInstances, ec2:CreateTags and ec2:DescribeImages, plus iam:PassRole " +
 		"if node.ec2.instance_profile is set)\n")
+	if cfg.Spot {
+		fmt.Printf("         spot warnings are consumed from interruption_queue_url; the role also " +
+			"needs sqs:ReceiveMessage and sqs:DeleteMessage on that queue\n")
+	}
 
 	// SAID OUT LOUD RATHER THAN INFERRED FROM AN ABSENT KEY. A deployment that
 	// expected to run fork pull requests on rented machines and finds them queuing

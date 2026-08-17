@@ -116,6 +116,24 @@ type ImagesConfig struct {
 type SiteConfig struct {
 	// Name is what a node and a tier refer to this site by.
 	Name string `yaml:"name"`
+	// Store is the storage local to this site. Ceph serves host-backed compute;
+	// EBS snapshots and S3 serve AWS without exposing the home cluster over a WAN.
+	Store SiteStoreKind `yaml:"store"`
+}
+
+// SiteStoreKind selects the storage implementation local to one site.
+type SiteStoreKind string
+
+const (
+	// SiteStoreCeph is an RBD cluster on the site's own storage network.
+	SiteStoreCeph SiteStoreKind = "ceph"
+	// SiteStoreEBSS3 stores block generations in EBS and fenced state in S3.
+	SiteStoreEBSS3 SiteStoreKind = "ebs-s3"
+)
+
+// Valid reports whether this is a recognized storage backend name.
+func (s SiteStoreKind) Valid() bool {
+	return s == SiteStoreCeph || s == SiteStoreEBSS3
 }
 
 // NodePolicy is what one compute host is permitted to run.
@@ -337,6 +355,9 @@ type NodeConfig struct {
 	Firecracker *FirecrackerConfig `yaml:"firecracker,omitempty"`
 	// EC2 is required when Provider is ProviderEC2.
 	EC2 *EC2Config `yaml:"ec2,omitempty"`
+	// EBSS3 is the cache store local to an EC2 site's instances. EBS carries
+	// block generations and S3 carries the fenced per-key state.
+	EBSS3 *EBSS3Config `yaml:"ebs_s3,omitempty"`
 	// Ceph is the site's storage, required when Provider is ProviderFirecracker
 	// and refused for every other backend.
 	//
@@ -347,6 +368,13 @@ type NodeConfig struct {
 	// refuses elsewhere — it reads as a working cache right up to the first job
 	// that expected one.
 	Ceph *CephConfig `yaml:"ceph,omitempty"`
+	// Cache exposes the per-job sticky-volume API on a Firecracker guest bridge or
+	// over TLS to EC2 guests. Optional: a node without it offers no dynamic cache
+	// volumes to workflows.
+	Cache *NodeCacheConfig `yaml:"cache,omitempty"`
+	// RegistryMirrors are three site-local Distribution pull-through caches. One
+	// instance per upstream is required because proxy mode has one remote URL.
+	RegistryMirrors *RegistryMirrors `yaml:"registry_mirrors,omitempty"`
 
 	// MaxCustody bounds how long billet holds capacity for compute it cannot account
 	// for — a container adopted from a crashed run, or one an ambiguous launch may
@@ -364,6 +392,78 @@ type NodeConfig struct {
 	// Separate from the control plane's key: the two are restarted for different
 	// reasons and need not wait the same amount of time.
 	DrainTimeout string `yaml:"drain_timeout,omitempty"`
+}
+
+// NodeCacheConfig exposes storage to one guest through short-lived credentials.
+type NodeCacheConfig struct {
+	// Listen is one literal, non-loopback address guests can reach. Wildcards are
+	// refused because they can expose the bearer-token API on another interface.
+	Listen string `yaml:"listen"`
+	// GuestEndpoint is the HTTP origin placed in guest metadata. It must name the
+	// same address as Listen; the per-instance bearer token authorizes every call.
+	GuestEndpoint string `yaml:"guest_endpoint"`
+	// TLSCert and TLSKey terminate the HTTPS endpoint an EC2 guest reaches across
+	// the VPC. Firecracker's isolated bridge uses HTTP and refuses these fields.
+	TLSCert string `yaml:"tls_cert,omitempty"`
+	TLSKey  string `yaml:"tls_key,omitempty"`
+}
+
+// RegistryMirrors names the independent public-registry caches visible at a site.
+type RegistryMirrors struct {
+	DockerIO string `yaml:"docker.io" json:"docker.io"`
+	GHCRIO   string `yaml:"ghcr.io" json:"ghcr.io"`
+	QuayIO   string `yaml:"quay.io" json:"quay.io"`
+}
+
+var registryMirrorOriginRe = regexp.MustCompile(`^https://[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?::([1-9][0-9]{0,4}))?$`)
+
+// Empty reports whether no mirror was configured.
+func (r *RegistryMirrors) Empty() bool {
+	return r.DockerIO == "" && r.GHCRIO == "" && r.QuayIO == ""
+}
+
+func (r *RegistryMirrors) normalize() {
+	if r == nil {
+		return
+	}
+
+	for _, value := range []*string{&r.DockerIO, &r.GHCRIO, &r.QuayIO} {
+		*value = strings.TrimSpace(*value)
+		*value = strings.TrimSuffix(*value, "/")
+	}
+}
+
+// CheckRegistryMirrors refuses a set that cannot be three separate HTTPS origins.
+func CheckRegistryMirrors(r RegistryMirrors) []error {
+	var errs []error
+	seen := make(map[string]string, 3)
+
+	for _, mirror := range []struct{ upstream, endpoint string }{
+		{"docker.io", r.DockerIO},
+		{"ghcr.io", r.GHCRIO},
+		{"quay.io", r.QuayIO},
+	} {
+		where := "node.registry_mirrors." + mirror.upstream
+		match := registryMirrorOriginRe.FindStringSubmatch(mirror.endpoint)
+		if match == nil {
+			errs = append(errs, fmt.Errorf("%s must be an HTTPS origin", where))
+
+			continue
+		}
+		if match[1] != "" {
+			port, err := strconv.Atoi(match[1])
+			if err != nil || port > 65535 {
+				errs = append(errs, fmt.Errorf("%s has an invalid port", where))
+			}
+		}
+		if previous, exists := seen[mirror.endpoint]; exists {
+			errs = append(errs, fmt.Errorf("%s and node.registry_mirrors.%s both use %s; Distribution proxy mode permits one upstream per instance", where, previous, mirror.endpoint))
+		} else {
+			seen[mirror.endpoint] = mirror.upstream
+		}
+	}
+
+	return errs
 }
 
 // ProviderKind names a compute backend.
@@ -511,6 +611,11 @@ type FirecrackerConfig struct {
 	// onto the trusted bridge because nobody said otherwise. This is the same rule,
 	// and the same reasoning, as node.ec2.untrusted_security_group_ids.
 	UntrustedBridge string `yaml:"untrusted_bridge,omitempty"`
+	// ImageVerifyPort is the host port a verification guest reports to. It is
+	// fixed so host policy can admit exactly this service instead of opening an
+	// arbitrary high port to every guest. Only one verification runs per host,
+	// enforced by the verification lock.
+	ImageVerifyPort int `yaml:"image_verify_port,omitempty"`
 }
 
 // DefaultFirecrackerBinary and friends are where the reference host installs
@@ -518,6 +623,9 @@ type FirecrackerConfig struct {
 const (
 	DefaultFirecrackerBinary = "/usr/local/bin/firecracker"
 	DefaultJailerBinary      = "/usr/local/bin/jailer"
+	// DefaultKernelDir is where managed kernels are installed and where a
+	// generation's recorded kernel name is resolved at launch.
+	DefaultKernelDir = "/var/lib/billet/kernels"
 	// DefaultChrootBase is the jailer's own default, so billet and a hand-run
 	// jailer agree about where a microVM lives.
 	DefaultChrootBase = "/srv/jailer"
@@ -534,6 +642,9 @@ const (
 	// uids go. Far above what any machine can hold, so it is a guard rather than a
 	// capacity limit — the allocator's budget is the real one.
 	DefaultJailUIDCount = 1024
+	// DefaultImageVerifyPort is adjacent to the control plane and guest cache
+	// ports, and is reserved for the short-lived `billet images verify` listener.
+	DefaultImageVerifyPort = 7719
 	// MinJailUID is the lowest start billet will accept. Below this a range starts
 	// overlapping accounts that belong to somebody, and a microVM would run as a
 	// user with a home directory and a login shell.
@@ -554,6 +665,7 @@ func (f *FirecrackerConfig) Normalize() {
 	f.BinaryPath = strings.TrimSpace(f.BinaryPath)
 	f.JailerPath = strings.TrimSpace(f.JailerPath)
 	f.KernelImage = strings.TrimSpace(f.KernelImage)
+	f.KernelDir = strings.TrimSpace(f.KernelDir)
 	f.ChrootBase = strings.TrimSpace(f.ChrootBase)
 	f.Bridge = strings.TrimSpace(f.Bridge)
 	f.UntrustedBridge = strings.TrimSpace(f.UntrustedBridge)
@@ -564,6 +676,7 @@ func (f *FirecrackerConfig) Normalize() {
 	}{
 		{&f.BinaryPath, DefaultFirecrackerBinary},
 		{&f.JailerPath, DefaultJailerBinary},
+		{&f.KernelDir, DefaultKernelDir},
 		{&f.ChrootBase, DefaultChrootBase},
 	} {
 		if *d.into == "" {
@@ -577,6 +690,10 @@ func (f *FirecrackerConfig) Normalize() {
 
 	if f.JailUIDCount == 0 {
 		f.JailUIDCount = DefaultJailUIDCount
+	}
+
+	if f.ImageVerifyPort == 0 {
+		f.ImageVerifyPort = DefaultImageVerifyPort
 	}
 }
 
@@ -599,6 +716,7 @@ func CheckFirecracker(f FirecrackerConfig) []error {
 		{"binary_path", f.BinaryPath},
 		{"jailer_path", f.JailerPath},
 		{"kernel_image", f.KernelImage},
+		{"kernel_dir", f.KernelDir},
 		{"chroot_base", f.ChrootBase},
 	} {
 		switch {
@@ -629,6 +747,11 @@ func CheckFirecracker(f FirecrackerConfig) []error {
 	}
 
 	errs = append(errs, checkJailUIDs(f.JailUIDMin, f.JailUIDCount)...)
+
+	if f.ImageVerifyPort < 1 || f.ImageVerifyPort > 65535 {
+		errs = append(errs, fmt.Errorf("node.firecracker.image_verify_port is %d; expected 1-65535",
+			f.ImageVerifyPort))
+	}
 
 	return errs
 }
@@ -790,6 +913,37 @@ type CephConfig struct {
 	CachePool string `yaml:"cache_pool"`
 }
 
+// EBSS3Config points a cloud node at its site's EBS and S3 cache storage.
+type EBSS3Config struct {
+	// Region is the signing region for both services and must match node.ec2.
+	Region string `yaml:"region"`
+	// AvailabilityZone is where cache volumes are created. EBS volumes and the
+	// instances consuming them must be in the same zone.
+	AvailabilityZone string `yaml:"availability_zone"`
+	// Bucket holds the atomic pointer, lease and fencing state objects.
+	Bucket string `yaml:"bucket"`
+	// Prefix isolates one deployment and site inside a bucket.
+	Prefix string `yaml:"prefix,omitempty"`
+	// KMSKeyID optionally selects one customer-managed key for EBS volumes and
+	// snapshots. Empty uses the account's EBS encryption default key.
+	KMSKeyID string `yaml:"kms_key_id,omitempty"`
+}
+
+func (e *EBSS3Config) normalize() {
+	if e == nil {
+		return
+	}
+
+	e.Region = strings.TrimSpace(e.Region)
+	e.AvailabilityZone = strings.TrimSpace(e.AvailabilityZone)
+	e.Bucket = strings.TrimSpace(e.Bucket)
+	e.Prefix = strings.TrimSpace(e.Prefix)
+	e.KMSKeyID = strings.TrimSpace(e.KMSKeyID)
+	if e.Prefix == "" {
+		e.Prefix = "billet-cache"
+	}
+}
+
 // EC2Config configures the cloud backend: one instance per job, in one subnet.
 //
 // EVERY FIELD HERE IS A PLACEMENT DECISION SOMEBODY HAS TO MAKE, and none of the
@@ -856,6 +1010,9 @@ type EC2Config struct {
 	// failover is for. An operator who would rather have a cheap build that
 	// sometimes dies says so here.
 	Spot bool `yaml:"spot,omitempty"`
+	// InterruptionQueueURL receives EventBridge's EC2 Spot interruption warnings.
+	// Required with Spot: without it a reclaim is an unexplained failed build.
+	InterruptionQueueURL string `yaml:"interruption_queue_url,omitempty"`
 }
 
 // EC2InstanceType is one shape billet may buy, and what it holds.
@@ -865,9 +1022,15 @@ type EC2Config struct {
 // a shape that turns out smaller than the lease it was chosen for over-commits a
 // machine nobody can see.
 type EC2InstanceType struct {
-	Type   string   `yaml:"type"`
-	VCPU   int      `yaml:"vcpu"`
-	Memory ByteSize `yaml:"memory"`
+	Type   string   `yaml:"type" json:"type"`
+	VCPU   int      `yaml:"vcpu" json:"vcpu"`
+	Memory ByteSize `yaml:"memory" json:"memory"`
+	// PriceUSDPerHour is the operator-audited compute rate used to report the
+	// maximum configured exposure. It is required because the answer has to be in
+	// the config, not fetched from a mutable service when a job arrives. It is not
+	// sent to the allocator and cannot make an already-accepted job wait because a
+	// copied price went stale.
+	PriceUSDPerHour USDPerHour `yaml:"price_usd_per_hour" json:"-"`
 }
 
 // GitHubConfig holds the App identity used to manage runners.
@@ -963,18 +1126,22 @@ type Tier struct {
 	// SHM sizes /dev/shm. Chromium and Postgres both misbehave on the default,
 	// so this is a tier knob rather than an image constant.
 	SHM ByteSize `yaml:"shm,omitempty"`
+	// BuildKitCacheMountLimit bounds each persistent RUN --mount=type=cache
+	// record. BuildKit's ordinary GC bounds the whole worker; this catches one
+	// active mount that never becomes old enough for that policy to trim.
+	BuildKitCacheMountLimit ByteSize `yaml:"buildkit_cache_mount_limit,omitempty"`
 
 	Image string `yaml:"image"`
 
-	// WarmPool pre-boots idle VMs to hide cold-start latency. Warm guests count
-	// against MaxConcurrent, because a warm macOS guest is still a running macOS guest
-	// as far as Apple's licence is concerned.
+	// WarmPool is reserved for pre-booted idle VMs. Validation refuses a non-zero
+	// value until a provider implements it, because accepting an inert cost setting
+	// would tell an operator cold-start capacity exists when it does not.
 	WarmPool int `yaml:"warm_pool,omitempty"`
 
-	// Intercept enables the colocated Actions cache for this tier. Off by default:
-	// cache interception terminates TLS in front of GitHub's results service, which
-	// also carries artifact metadata. Leave it off for tiers that publish release
-	// artifacts or hold deployment secrets.
+	// Intercept is reserved for the colocated Actions cache. Validation refuses it
+	// until the artifact-passthrough conformance suite exists; the results service
+	// also carries release artifacts, so an inert or partial implementation cannot
+	// be treated as a harmless future setting.
 	Intercept bool `yaml:"intercept,omitempty"`
 
 	// MaxConcurrent caps simultaneous instances of this tier, counting warm ones.
@@ -1008,6 +1175,15 @@ type Tier struct {
 // holds a host-wide count of running plus warm macOS guests at runtime, because
 // two separately-valid tiers on one node share one physical Mac.
 const DefaultMacOSVMLimit = 2
+
+const (
+	// DefaultBuildKitCacheMountLimit bounds one BuildKit cache mount when a tier
+	// does not choose a tighter policy.
+	DefaultBuildKitCacheMountLimit ByteSize = 20 * GiB
+	// MaxBuildKitCacheMountLimit is the largest volume the sticky-disk API can
+	// create, so a larger per-mount number could never constrain anything.
+	MaxBuildKitCacheMountLimit ByteSize = 100 * GiB
+)
 
 // NodePolicyFor returns the policy for a named host, and whether one was
 // declared. The zero NodePolicy is the documented default — unconstrained guest
@@ -1465,7 +1641,10 @@ func (c *Config) applyDefaults() {
 	if c.Node != nil {
 		c.Node.Name = trimNodeName(c.Node.Name)
 		c.Node.EC2.normalize()
+		c.Node.EBSS3.normalize()
 		c.Node.Ceph.normalize()
+		c.Node.Cache.normalize()
+		c.Node.RegistryMirrors.normalize()
 		c.Node.Firecracker.Normalize()
 
 		// THE CERTIFICATE DECIDES WHEN THERE IS ONE. The control plane authorises a
@@ -1525,6 +1704,9 @@ func (c *Config) applyDefaults() {
 		}
 		if t.GuestOS == "" {
 			t.GuestOS = GuestLinux
+		}
+		if t.BuildKitCacheMountLimit == 0 {
+			t.BuildKitCacheMountLimit = DefaultBuildKitCacheMountLimit
 		}
 		// A macOS tier with no explicit cap inherits its host's limit rather than
 		// "unlimited", so forgetting the field fails safe, and lowering a Mac's limit
@@ -1804,9 +1986,168 @@ func (c *Config) validateNode() []error {
 	}
 
 	errs = append(errs, c.validateCephNode()...)
+	errs = append(errs, c.validateEBSS3Node()...)
+	errs = append(errs, c.validateCacheNode()...)
+	if c.Node.RegistryMirrors != nil {
+		if c.Node.Provider != ProviderFirecracker {
+			errs = append(errs, fmt.Errorf("node.registry_mirrors is set but this node's provider is %s, and only the managed Firecracker guest consumes it", c.Node.Provider))
+		} else {
+			errs = append(errs, CheckRegistryMirrors(*c.Node.RegistryMirrors)...)
+		}
+	}
 
 	if c.Node.Provider == ProviderEC2 {
 		errs = append(errs, c.validateEC2Node()...)
+	}
+
+	return errs
+}
+
+// validateCacheNode keeps the bearer-token service on an isolated Firecracker
+// bridge or an authenticated TLS connection from an EC2 guest.
+func (c *Config) validateCacheNode() []error {
+	if c.Node.Cache == nil {
+		return nil
+	}
+
+	if c.Node.Provider != ProviderFirecracker && c.Node.Provider != ProviderEC2 {
+		return []error{fmt.Errorf("node.cache is set but this node's provider is %s, and only "+
+			"firecracker and ec2 can hot-attach their block volumes", c.Node.Provider)}
+	}
+
+	cache := c.Node.Cache
+	var errs []error
+	if err := validateHostPort("node.cache.listen", cache.Listen); err != nil {
+		errs = append(errs, err)
+	} else {
+		host, _, splitErr := net.SplitHostPort(cache.Listen)
+		if splitErr != nil {
+			errs = append(errs, fmt.Errorf("node.cache.listen: %w", splitErr))
+
+			return errs
+		}
+		ip := net.ParseIP(host)
+		if ip == nil || ip.IsLoopback() || ip.IsUnspecified() {
+			errs = append(errs, errors.New("node.cache.listen must use one literal, non-loopback "+
+				"address guests can reach; wildcards and hostnames could expose the bearer-token "+
+				"API on another interface"))
+		}
+	}
+
+	u, err := url.Parse(cache.GuestEndpoint)
+	if err != nil || u.Opaque != "" || u.Host == "" {
+		errs = append(errs, errors.New("node.cache.guest_endpoint must be an HTTP origin the guest can reach"))
+
+		return errs
+	}
+	if u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {
+		errs = append(errs, errors.New("node.cache.guest_endpoint must be an origin without "+
+			"credentials, a path, a query, or a fragment"))
+	}
+
+	listenHost, listenPort, listenErr := net.SplitHostPort(cache.Listen)
+	if c.Node.Provider == ProviderFirecracker {
+		if u.Scheme != "http" {
+			errs = append(errs, errors.New("node.cache.guest_endpoint must use http on the isolated Firecracker bridge"))
+		}
+		if cache.TLSCert != "" || cache.TLSKey != "" {
+			errs = append(errs, errors.New("node.cache.tls_cert and tls_key are only used by an EC2 HTTPS listener"))
+		}
+		endpointIP := net.ParseIP(u.Hostname())
+		if listenErr == nil && (endpointIP == nil || !endpointIP.Equal(net.ParseIP(listenHost)) ||
+			u.Port() != listenPort) {
+			errs = append(errs, errors.New("node.cache.guest_endpoint must name exactly the address in "+
+				"node.cache.listen, so metadata cannot direct a guest to a different host"))
+		}
+	} else {
+		if c.Node.EBSS3 == nil {
+			errs = append(errs, errors.New("node.cache on an EC2 node needs node.ebs_s3"))
+		}
+		if u.Scheme != "https" {
+			errs = append(errs, errors.New("node.cache.guest_endpoint must use https for an EC2 guest; its bearer token crosses the VPC"))
+		}
+		if cache.TLSCert == "" || cache.TLSKey == "" || !filepath.IsAbs(cache.TLSCert) ||
+			!filepath.IsAbs(cache.TLSKey) {
+			errs = append(errs, errors.New("node.cache.tls_cert and tls_key must be absolute paths for an EC2 HTTPS listener"))
+		}
+		if listenErr == nil && u.Port() != listenPort {
+			errs = append(errs, errors.New("node.cache.guest_endpoint must use the port in node.cache.listen"))
+		}
+	}
+
+	return errs
+}
+
+func (c *NodeCacheConfig) normalize() {
+	if c == nil {
+		return
+	}
+
+	c.Listen = strings.TrimSpace(c.Listen)
+	c.GuestEndpoint = strings.TrimSpace(c.GuestEndpoint)
+	c.TLSCert = strings.TrimSpace(c.TLSCert)
+	c.TLSKey = strings.TrimSpace(c.TLSKey)
+}
+
+var (
+	s3BucketName       = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9.-]{1,61}[a-z0-9])$`)
+	availabilityZoneID = regexp.MustCompile(`^[a-z0-9-]+$`)
+)
+
+func (c *Config) validateEBSS3Node() []error {
+	if c.Node.EBSS3 == nil {
+		return nil
+	}
+	if c.Node.Provider != ProviderEC2 {
+		return []error{fmt.Errorf("node.ebs_s3 is set but this node's provider is %s; EBS volumes can attach only to EC2 instances in their availability zone", c.Node.Provider)}
+	}
+
+	e := c.Node.EBSS3
+	var errs []error
+	if c.Node.Site == "" {
+		errs = append(errs, errors.New("node.site is required with node.ebs_s3 because cache keys are scoped by site"))
+	}
+	errs = append(errs, CheckEBSS3(*e)...)
+	if c.Node.EC2 != nil && e.Region != c.Node.EC2.Region {
+		errs = append(errs, fmt.Errorf("node.ebs_s3.region %q differs from node.ec2.region %q; a cache volume and the instance using it must be in one region", e.Region, c.Node.EC2.Region))
+	}
+	if c.Node.Site != "" {
+		for _, site := range c.Sites {
+			if site.Name == c.Node.Site && site.Store != SiteStoreEBSS3 {
+				errs = append(errs, fmt.Errorf("node.site %q selects %s storage but node.ebs_s3 is configured", site.Name, site.Store))
+			}
+		}
+	}
+
+	return errs
+}
+
+// CheckEBSS3 applies the safety rules needed by both config loading and the
+// exported cloud-store constructor.
+func CheckEBSS3(e EBSS3Config) []error {
+	var errs []error
+	if err := CheckEC2Region(e.Region); err != nil {
+		errs = append(errs, fmt.Errorf("node.ebs_s3.region: %w", err))
+	}
+	if e.AvailabilityZone == e.Region || !strings.HasPrefix(e.AvailabilityZone, e.Region) ||
+		!availabilityZoneID.MatchString(e.AvailabilityZone) {
+		errs = append(errs, fmt.Errorf("node.ebs_s3.availability_zone %q is not a zone in region %q", e.AvailabilityZone, e.Region))
+	}
+	if !s3BucketName.MatchString(e.Bucket) || net.ParseIP(e.Bucket) != nil ||
+		strings.Contains(e.Bucket, "..") || strings.Contains(e.Bucket, ".-") ||
+		strings.Contains(e.Bucket, "-.") {
+		errs = append(errs, fmt.Errorf("node.ebs_s3.bucket %q is not a DNS-compatible S3 bucket name", e.Bucket))
+	}
+	if strings.HasPrefix(e.Prefix, "/") || strings.HasSuffix(e.Prefix, "/") ||
+		strings.ContainsRune(e.Prefix, 0) {
+		errs = append(errs, errors.New("node.ebs_s3.prefix must be a relative object prefix without a trailing slash or NUL"))
+	}
+	for _, segment := range strings.Split(e.Prefix, "/") {
+		if segment == "" || segment == "." || segment == ".." {
+			errs = append(errs, errors.New("node.ebs_s3.prefix contains an empty, dot, or dot-dot segment"))
+
+			break
+		}
 	}
 
 	return errs
@@ -2108,8 +2449,9 @@ func (c *Config) validateEC2Node() []error {
 	// working.
 	//
 	// Required rather than defaulted: billet has no standing to choose how much to
-	// buy on somebody's account. It is NOT a spending limit — see #47, and the
-	// package comment on internal/provider/ec2.
+	// buy on somebody's account. Placement charges the declared shape that will be
+	// purchased, including a fallback, so these are hard resource budgets rather
+	// than estimates made from the smaller tier request.
 	if c.Node.MaxVCPU <= 0 {
 		errs = append(errs, errors.New(
 			"node.max_vcpu is required when provider is ec2: there is no machine to detect it "+
@@ -2151,6 +2493,18 @@ func (c *Config) validateEC2Node() []error {
 
 	errs = append(errs, e.instanceTypeErrors()...)
 
+	if e.Spot && e.InterruptionQueueURL == "" {
+		errs = append(errs, errors.New("node.ec2.interruption_queue_url is required when spot is "+
+			"enabled, so a reclaim is recorded before the instance disappears"))
+	}
+	if !e.Spot && e.InterruptionQueueURL != "" {
+		errs = append(errs, errors.New("node.ec2.interruption_queue_url is set while spot is off; "+
+			"the queue would be consumed for compute this node never buys"))
+	}
+	if err := CheckSQSQueueURL(e.InterruptionQueueURL); err != nil {
+		errs = append(errs, err)
+	}
+
 	return errs
 }
 
@@ -2170,6 +2524,7 @@ func (e *EC2Config) normalize() {
 	e.Endpoint = strings.TrimSpace(e.Endpoint)
 	e.SubnetID = strings.TrimSpace(e.SubnetID)
 	e.InstanceProfile = strings.TrimSpace(e.InstanceProfile)
+	e.InterruptionQueueURL = strings.TrimSpace(e.InterruptionQueueURL)
 
 	for i := range e.SecurityGroupIDs {
 		e.SecurityGroupIDs[i] = strings.TrimSpace(e.SecurityGroupIDs[i])
@@ -2182,6 +2537,31 @@ func (e *EC2Config) normalize() {
 	for i := range e.InstanceTypes {
 		e.InstanceTypes[i].Type = strings.TrimSpace(e.InstanceTypes[i].Type)
 	}
+}
+
+// CheckSQSQueueURL refuses a warning queue that cannot be signed safely.
+func CheckSQSQueueURL(raw string) error {
+	if raw == "" {
+		return nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Opaque != "" {
+		return errors.New("node.ec2.interruption_queue_url is not a url billet can dial")
+	}
+	if u.User != nil {
+		return errors.New("node.ec2.interruption_queue_url must not carry a username or password")
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return errors.New("node.ec2.interruption_queue_url must not carry a query or fragment")
+	}
+	if u.Hostname() == "" || u.EscapedPath() == "" || u.EscapedPath() == "/" {
+		return errors.New("node.ec2.interruption_queue_url must name a queue path")
+	}
+	if u.Scheme != "https" && (u.Scheme != "http" || !isLoopbackHost(u.Hostname())) {
+		return errors.New("node.ec2.interruption_queue_url must use https; only loopback may use http")
+	}
+
+	return nil
 }
 
 // CheckEC2SecurityGroups refuses a list billet cannot safely launch against.
@@ -2342,9 +2722,25 @@ func isLoopbackHost(host string) bool {
 // understates itself launches a machine smaller than the work reserved for it and
 // over-commits a host nobody can inspect.
 func (e *EC2Config) instanceTypeErrors() []error {
+	errs := CheckEC2InstanceTypes(e.InstanceTypes)
+	for i := range e.InstanceTypes {
+		if e.InstanceTypes[i].PriceUSDPerHour <= 0 {
+			errs = append(errs, fmt.Errorf("node.ec2.instance_types[%d]: "+
+				"price_usd_per_hour must be more than zero", i))
+		}
+	}
+
+	return errs
+}
+
+// CheckEC2InstanceTypes validates an ordered EC2 shape catalogue.
+//
+// Exported because the allocator receives the same catalogue over node
+// registration and cannot assume it came through Config.Load.
+func CheckEC2InstanceTypes(types []EC2InstanceType) []error {
 	var errs []error
 
-	if len(e.InstanceTypes) == 0 {
+	if len(types) == 0 {
 		errs = append(errs, errors.New("node.ec2.instance_types needs at least one shape; "+
 			"billet ships no table of EC2 instance types, so a shape it may buy has to be "+
 			"declared along with what it holds"))
@@ -2352,10 +2748,10 @@ func (e *EC2Config) instanceTypeErrors() []error {
 		return errs
 	}
 
-	seen := make(map[string]struct{}, len(e.InstanceTypes))
+	seen := make(map[string]struct{}, len(types))
 
-	for i := range e.InstanceTypes {
-		it := &e.InstanceTypes[i]
+	for i := range types {
+		it := &types[i]
 		where := fmt.Sprintf("node.ec2.instance_types[%d]", i)
 
 		if name := strings.TrimSpace(it.Type); name == "" {
@@ -2426,11 +2822,24 @@ func (c *Config) validateTiers() []error {
 		if t.SHM < 0 {
 			errs = append(errs, fmt.Errorf("%s: shm must not be negative", where))
 		}
+		if t.BuildKitCacheMountLimit <= 0 ||
+			t.BuildKitCacheMountLimit > MaxBuildKitCacheMountLimit {
+			errs = append(errs, fmt.Errorf("%s: buildkit_cache_mount_limit must be more than zero "+
+				"and no larger than 100GiB", where))
+		}
 		if t.Image == "" {
 			errs = append(errs, fmt.Errorf("%s: image is required", where))
 		}
 		if t.WarmPool < 0 {
 			errs = append(errs, fmt.Errorf("%s: warm_pool must not be negative", where))
+		} else if t.WarmPool > 0 {
+			errs = append(errs, fmt.Errorf("%s: warm_pool is not implemented; accepting it would "+
+				"report pre-booted capacity while every job still pays a cold launch", where))
+		}
+		if t.Intercept {
+			errs = append(errs, fmt.Errorf("%s: intercept is not implemented; ACTIONS_RESULTS_URL "+
+				"also carries release-artifact metadata, so billet will not claim interception "+
+				"until cache conformance and artifact passthrough are proved", where))
 		}
 		if t.MaxConcurrent < 0 {
 			errs = append(errs, fmt.Errorf("%s: max_concurrent must not be negative", where))
@@ -2693,6 +3102,12 @@ func (c *Config) validateSites() []error {
 		}
 
 		declared[name] = true
+
+		if !s.Store.Valid() {
+			errs = append(errs, fmt.Errorf("sites[%d] (%s): store %q is not one of ceph or "+
+				"ebs-s3; storage is selected per site and cannot be inferred from whichever "+
+				"node registered first", i, name, s.Store))
+		}
 	}
 
 	// NODE.SITE IS NOT CHECKED HERE, and that is not an omission.

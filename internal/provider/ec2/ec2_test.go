@@ -435,6 +435,36 @@ func TestAShapeAWSHasNoneOfFallsThroughToTheNextDeclaredOne(t *testing.T) {
 	}
 }
 
+// A fallback shape is not attempted until the capacity ledger authorises its
+// real size. A denied shape is skipped without sending RunInstances at all.
+func TestABudgetRefusalSkipsTheShapeBeforeBuyingIt(t *testing.T) {
+	f := newFakeEC2(t)
+	p := newTestProvider(t, f, nil)
+	spec := validSpec()
+
+	var authorised []string
+	spec.AuthorizeShape = func(_ context.Context, name string, _ int,
+		_ config.ByteSize,
+	) (bool, error) {
+		authorised = append(authorised, name)
+
+		return name == "c7i.8xlarge", nil
+	}
+
+	if _, err := p.Launch(t.Context(), spec); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	if got := strings.Join(authorised, ","); got != "c7i.2xlarge,c7i.8xlarge" {
+		t.Errorf("shape authorisations = %q, want both shapes in order", got)
+	}
+
+	runs := f.runInstancesCalls()
+	if len(runs) != 1 || runs[0].Get("InstanceType") != "c7i.8xlarge" {
+		t.Fatalf("RunInstances calls = %v; the refused shape must not reach AWS", runs)
+	}
+}
+
 // AND THE CLIENT TOKEN CHANGES WITH THE SHAPE, which is the half of #49 that is
 // easy to get wrong and impossible to see afterwards.
 //
@@ -691,7 +721,10 @@ func TestSpotIsOffUnlessAsked(t *testing.T) {
 // until something reaps it.
 func TestSpotIsRequestedOneTimeSoNothingRelaunchesIntoAnEmptyJob(t *testing.T) {
 	f := newFakeEC2(t)
-	p := newTestProvider(t, f, func(c *config.EC2Config) { c.Spot = true })
+	p := newTestProvider(t, f, func(c *config.EC2Config) {
+		c.Spot = true
+		c.InterruptionQueueURL = f.URL + "/queue"
+	})
 
 	if _, err := p.Launch(t.Context(), validSpec()); err != nil {
 		t.Fatalf("Launch: %v", err)
@@ -788,6 +821,46 @@ func TestTheFirstDeclaredShapeThatFitsIsBought(t *testing.T) {
 
 	if got := f.paramsFor(t, "RunInstances").Get("InstanceType"); got != "c7i.8xlarge" {
 		t.Errorf("InstanceType = %q, want the first declared shape that holds 16 vCPU", got)
+	}
+}
+
+// Placement already selected and charged a shape. A fallback-capable provider
+// starts at that exact entry rather than reconsidering earlier preferences.
+func TestLaunchStartsAtTheShapeTheAllocatorSelected(t *testing.T) {
+	f := newFakeEC2(t)
+	p := newTestProvider(t, f, nil)
+
+	spec := validSpec()
+	spec.InstanceType = "c7i.8xlarge"
+
+	if _, err := p.Launch(t.Context(), spec); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	runs := f.runInstancesCalls()
+	if len(runs) != 1 || runs[0].Get("InstanceType") != spec.InstanceType {
+		t.Fatalf("RunInstances calls = %v, want only allocator-selected %q", runs,
+			spec.InstanceType)
+	}
+}
+
+// The selected name is not enough: if this node now describes that name as too
+// small, skipping to another shape would conceal registration drift.
+func TestASelectedShapeThatNoLongerFitsIsRefused(t *testing.T) {
+	f := newFakeEC2(t)
+	p := newTestProvider(t, f, nil)
+
+	spec := validSpec()
+	spec.InstanceType = "c7i.2xlarge"
+	spec.VCPU = 16
+	spec.Memory = 32 * config.GiB
+
+	if _, err := p.Launch(t.Context(), spec); err == nil ||
+		!strings.Contains(err.Error(), "allocator selected") {
+		t.Fatalf("Launch with a drifted selected shape = %v, want an explicit refusal", err)
+	}
+	if got := f.countOf("RunInstances"); got != 0 {
+		t.Fatalf("drifted selection still sent %d RunInstances request(s)", got)
 	}
 }
 
@@ -1221,6 +1294,32 @@ func TestTheBootScriptIsWhatIsSent(t *testing.T) {
 
 	if !strings.Contains(string(decoded), spec.JITConfig) {
 		t.Error("the registration did not reach the user data")
+	}
+}
+
+// THE REQUEST EPOCH IS IN THE SUCCESSFUL ATTEMPT'S OWN USER DATA. Taking it
+// before DescribeImages would count API setup as instance provisioning, and
+// reusing one timestamp across fallback shapes would charge a successful shape
+// for the refusal that preceded it.
+func TestTheSuccessfulRunInstancesAttemptCarriesItsColdStartEpoch(t *testing.T) {
+	f := newFakeEC2(t)
+	p := newTestProvider(t, f, nil)
+	started := time.Date(2026, time.August, 16, 20, 1, 2, 345678901, time.UTC)
+	p.api.now = func() time.Time { return started }
+
+	if _, err := p.Launch(t.Context(), validSpec()); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	encoded := f.paramsFor(t, "RunInstances").Get("UserData")
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		t.Fatalf("UserData is not base64: %v", err)
+	}
+
+	want := "BILLET_LAUNCH_EPOCH_NS='" + strconv.FormatInt(started.UnixNano(), 10) + "'"
+	if !strings.Contains(string(decoded), want) {
+		t.Errorf("the successful launch did not carry %q in its user data:\n%s", want, decoded)
 	}
 }
 
@@ -2095,6 +2194,7 @@ func TestTrustedWorkStillGetsTheInstanceProfile(t *testing.T) {
 func TestALaunchErrorCannotCarryTheRegistration(t *testing.T) {
 	f := newFakeEC2(t)
 	spec := validSpec()
+	var encodedUserData string
 
 	f.respond = func(action string, params url.Values) (int, string) {
 		if action != "RunInstances" {
@@ -2102,6 +2202,7 @@ func TestALaunchErrorCannotCarryTheRegistration(t *testing.T) {
 		}
 
 		// The service echoes the parameter it rejected, user data included.
+		encodedUserData = params.Get("UserData")
 		return http.StatusBadRequest, `<Response><Errors><Error>` +
 			`<Code>InvalidParameterValue</Code><Message>Invalid value '` +
 			params.Get("UserData") + `' for parameter UserData</Message>` +
@@ -2111,8 +2212,8 @@ func TestALaunchErrorCannotCarryTheRegistration(t *testing.T) {
 	p := newTestProvider(t, f, nil)
 	p.api.sleep = func(context.Context, time.Duration) error { return nil }
 
-	_, err := p.Launch(t.Context(), spec)
-	if err == nil {
+	_, launchErr := p.Launch(t.Context(), spec)
+	if launchErr == nil {
 		t.Fatal("a rejected launch reported success")
 	}
 
@@ -2120,23 +2221,18 @@ func TestALaunchErrorCannotCarryTheRegistration(t *testing.T) {
 	// passed while the error carried the BASE64 user data containing it — which is
 	// a disclosure with one decode step in front of it, and exactly the kind of
 	// pass-for-the-wrong-reason this project keeps finding.
-	script, err2 := p.userData(spec)
-	if err2 != nil {
-		t.Fatalf("userData: %v", err2)
-	}
-
 	for name, secret := range map[string]string{
 		"the registration": spec.JITConfig,
-		"the boot script":  base64.StdEncoding.EncodeToString([]byte(script)),
+		"the boot script":  encodedUserData,
 	} {
-		if strings.Contains(err.Error(), secret) {
-			t.Errorf("the launch error carries %s: %v", name, err)
+		if strings.Contains(launchErr.Error(), secret) {
+			t.Errorf("the launch error carries %s: %v", name, launchErr)
 		}
 	}
 
 	// The diagnosis still has to survive, or this trade is a bad one.
-	if !strings.Contains(err.Error(), "InvalidParameterValue") {
-		t.Errorf("the error lost the api's own code, which is what an operator acts on: %v", err)
+	if !strings.Contains(launchErr.Error(), "InvalidParameterValue") {
+		t.Errorf("the error lost the api's own code, which is what an operator acts on: %v", launchErr)
 	}
 }
 
@@ -2215,8 +2311,8 @@ func TestALaunchErrorCannotCarryTheRegistrationInAnyEncoding(t *testing.T) {
 	p := newTestProvider(t, newFakeEC2(t), func(c *config.EC2Config) { c.Endpoint = srv.URL })
 	p.api.sleep = func(context.Context, time.Duration) error { return nil }
 
-	_, err := p.Launch(t.Context(), spec)
-	if err == nil {
+	_, launchErr := p.Launch(t.Context(), spec)
+	if launchErr == nil {
 		t.Fatal("a rejected launch reported success")
 	}
 
@@ -2224,25 +2320,33 @@ func TestALaunchErrorCannotCarryTheRegistrationInAnyEncoding(t *testing.T) {
 		t.Fatal("the fake never saw a RunInstances body, so this proves nothing")
 	}
 
+	form, err := url.ParseQuery(raw)
+	if err != nil {
+		t.Fatalf("parse the RunInstances body: %v", err)
+	}
+	encodedUserData := form.Get("UserData")
+	decodedUserData, err := base64.StdEncoding.DecodeString(encodedUserData)
+	if err != nil {
+		t.Fatalf("the request body did not carry base64 user data: %v", err)
+	}
 	// The body really did contain the registration, or the test would be vacuous.
-	if !strings.Contains(raw, url.QueryEscape(base64.StdEncoding.EncodeToString(
-		[]byte(mustUserData(t, p, spec))))) {
-		t.Fatal("the request body did not carry the encoded boot script, so this test is not " +
+	if !strings.Contains(string(decodedUserData), spec.JITConfig) {
+		t.Fatal("the request body did not carry the registration, so this test is not " +
 			"exercising the case it names")
 	}
 
 	for _, secret := range []string{
 		spec.JITConfig,
-		base64.StdEncoding.EncodeToString([]byte(mustUserData(t, p, spec))),
-		url.QueryEscape(base64.StdEncoding.EncodeToString([]byte(mustUserData(t, p, spec)))),
+		encodedUserData,
+		url.QueryEscape(encodedUserData),
 	} {
-		if strings.Contains(err.Error(), secret) {
-			t.Errorf("the launch error carries the registration: %v", err)
+		if strings.Contains(launchErr.Error(), secret) {
+			t.Errorf("the launch error carries the registration: %v", launchErr)
 		}
 	}
 
-	if !strings.Contains(err.Error(), "InvalidParameterValue") {
-		t.Errorf("the error lost the api's own code, which is what an operator acts on: %v", err)
+	if !strings.Contains(launchErr.Error(), "InvalidParameterValue") {
+		t.Errorf("the error lost the api's own code, which is what an operator acts on: %v", launchErr)
 	}
 }
 
@@ -2255,6 +2359,31 @@ func mustUserData(t *testing.T, p *Provider, spec provider.Spec) string {
 	}
 
 	return script
+}
+
+func TestCloudBootExportsItsOneJobCacheSession(t *testing.T) {
+	t.Parallel()
+
+	p := newTestProvider(t, newFakeEC2(t), nil)
+	spec := validSpec()
+	spec.CacheEndpoint = "https://cache.aws.example:7718"
+	spec.CacheToken = "secret-cache-session"
+	spec.BuildKitCacheMountLimit = 4 * config.GiB
+	script := mustUserData(t, p, spec)
+	for _, want := range []string{
+		"BILLET_CACHE_ENDPOINT='https://cache.aws.example:7718'",
+		"BILLET_CACHE_TOKEN='secret-cache-session'",
+		"BILLET_BUILDKIT_CACHE_MOUNT_LIMIT_BYTES='4294967296'",
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("boot script does not contain %q: %s", want, script)
+		}
+	}
+
+	spec.CacheToken = ""
+	if _, err := p.userData(spec); err == nil {
+		t.Fatal("userData accepted half a cache credential")
+	}
 }
 
 // THE ERROR CODE IS A CHANNEL TOO, and "AWS's enumeration is fixed" is an

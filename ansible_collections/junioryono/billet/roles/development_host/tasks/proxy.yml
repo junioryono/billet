@@ -1,0 +1,89 @@
+---
+- name: Create development proxy directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ billet_development_user }}"
+    group: "{{ billet_development_group_result.stdout }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ billet_development_proxy_config_dir }}", mode: "0700" }
+    - { path: "{{ billet_development_proxy_config_dir }}/state", mode: "0700" }
+    - { path: "{{ billet_development_proxy_config_dir }}/data", mode: "0700" }
+    - { path: "{{ billet_development_proxy_log_path | dirname }}", mode: "0700" }
+  become: true
+
+- name: Install the caller's development proxy configuration
+  ansible.builtin.copy:
+    src: "{{ billet_development_proxy_config_src }}"
+    dest: "{{ billet_development_proxy_config_path }}"
+    owner: "{{ billet_development_user }}"
+    group: "{{ billet_development_group_result.stdout }}"
+    mode: "0644"
+  register: billet_development_proxy_config_copy
+  when: billet_development_proxy_config_src | length > 0
+  become: true
+
+- name: Install the default development proxy configuration
+  ansible.builtin.template:
+    src: Caddyfile.j2
+    dest: "{{ billet_development_proxy_config_path }}"
+    owner: "{{ billet_development_user }}"
+    group: "{{ billet_development_group_result.stdout }}"
+    mode: "0644"
+  register: billet_development_proxy_config_template
+  when: billet_development_proxy_config_src | length == 0
+  become: true
+
+- name: Create the development proxy routes file
+  ansible.builtin.copy:
+    dest: "{{ billet_development_proxy_routes_path }}"
+    content: ""
+    force: false
+    owner: "{{ billet_development_user }}"
+    group: "{{ billet_development_group_result.stdout }}"
+    mode: "0644"
+  become: true
+
+- name: Render the development proxy environment
+  ansible.builtin.template:
+    src: proxy.env.j2
+    dest: "{{ billet_development_proxy_env_path }}"
+    owner: "{{ billet_development_user }}"
+    group: "{{ billet_development_group_result.stdout }}"
+    mode: "0600"
+  register: billet_development_proxy_environment_file
+  no_log: true
+  become: true
+
+- name: Validate the development proxy configuration
+  ansible.builtin.command:
+    argv:
+      - "{{ billet_development_caddy_bin }}"
+      - validate
+      - --config
+      - "{{ billet_development_proxy_config_path }}"
+      - --adapter
+      - caddyfile
+      - --envfile
+      - "{{ billet_development_proxy_env_path }}"
+  become: true
+  become_user: "{{ billet_development_user }}"
+  changed_when: false
+
+- name: Configure the Linux development proxy service
+  ansible.builtin.import_tasks: proxy-linux.yml
+  when: ansible_facts["system"] == "Linux"
+
+- name: Configure the macOS development proxy service
+  ansible.builtin.import_tasks: proxy-macos.yml
+  when: ansible_facts["system"] == "Darwin"
+
+- name: Wait for the development proxy admin API
+  ansible.builtin.uri:
+    url: "http://{{ billet_development_proxy_admin }}/config/"
+    status_code: 200
+  register: billet_development_proxy_ready
+  until: billet_development_proxy_ready.status == 200
+  retries: 10
+  delay: 1

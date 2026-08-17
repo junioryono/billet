@@ -192,7 +192,7 @@ the state directory must be local storage, and RBD is a network block device.
 - **The jailer creates a per-VM cgroup only when given at least one `--cgroup`**, and the two forms cannot coexist: once any VM on the host has been started with one, a VM started without one fails with `CgroupMove … Resource busy`.
 - **There is no API action that kills a microVM.** `SendCtrlAltDel` is a keyboard event the guest decides what to do with, and a real guest here ignored it for twenty seconds. billet signals the VMM process, after proving the pid is still that microVM's by the `--id` in `/proc/<pid>/cmdline`.
 
-A `br0`-style bridge for guests is the one thing this machine does NOT have configured for billet yet; the live provider tests were run against `lxdbr0`, which was already there.
+The `junioryono.billet.host` Ansible role owns the guest network rather than an application repository: `billet0` is the trusted DHCP/NAT bridge and `billet1` is the separate untrusted bridge. Its nftables table permits DHCP, DNS and the node cache endpoint on the host, blocks every other guest-to-host connection, and blocks forwarded traffic to private, link-local and CGNAT destinations. The live provider tests originally ran against `lxdbr0`; deployment uses the two billet-owned bridges so removing LXD cannot take CI networking with it.
 
 ## An inherited machine can arrive with the worst case already set up
 

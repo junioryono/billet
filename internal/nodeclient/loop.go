@@ -86,7 +86,9 @@ type LoopOptions struct {
 	// produces no error for anyone to find.
 	VCPU   int
 	Memory config.ByteSize
-	Log    *slog.Logger
+	// EC2Shapes are the ordered purchasable shapes. Empty for other providers.
+	EC2Shapes []config.EC2InstanceType
+	Log       *slog.Logger
 	// SweepEvery bounds how often the node looks for compute nothing is asking
 	// about. Zero disables it.
 	SweepEvery time.Duration
@@ -129,6 +131,7 @@ func (o LoopOptions) registration() Registration {
 		Site:       o.Site,
 		VCPU:       o.VCPU,
 		Memory:     o.Memory,
+		EC2Shapes:  o.EC2Shapes,
 	}
 }
 
@@ -211,6 +214,7 @@ func Run(ctx context.Context, c *Client, compute Compute, opts LoopOptions) erro
 	var (
 		janitor     sync.WaitGroup
 		startedOnce sync.Once
+		watcherOnce sync.Once
 	)
 
 	// ONE DEFER, IN ONE ORDER, because two were silently the wrong way round.
@@ -236,7 +240,22 @@ func Run(ctx context.Context, c *Client, compute Compute, opts LoopOptions) erro
 		})
 	}
 
-	err := register(ctx, c, compute, log, opts, backoff, startJanitor)
+	startWatcher := func() {
+		watcher, ok := compute.(interface{ WatchInterruptions(context.Context) })
+		if !ok {
+			return
+		}
+		watcherOnce.Do(func() {
+			janitor.Add(1)
+
+			go func() {
+				defer janitor.Done()
+				watcher.WatchInterruptions(janitorCtx)
+			}()
+		})
+	}
+
+	err := register(ctx, c, compute, log, opts, backoff, startJanitor, startWatcher)
 
 	// ONE PLACE DECIDES THAT A STOP MEANS A DRAIN, and it is here because there
 	// are five ways out of the loop below and only one of them used to.
@@ -269,6 +288,7 @@ func register(
 	opts LoopOptions,
 	backoff time.Duration,
 	startJanitor func(),
+	startWatcher func(),
 ) error {
 	for {
 		if err := c.Register(ctx, registrationWithInventory(ctx, compute, log, opts)); err != nil {
@@ -315,6 +335,10 @@ func register(
 
 			continue
 		}
+		// Only after recovery: before this point an interruption for an instance
+		// left by an earlier process has no in-memory owner and would be discarded
+		// as unrelated.
+		startWatcher()
 
 		err := serve(ctx, c, compute, log, opts, false)
 		if ctx.Err() != nil {
@@ -662,9 +686,23 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 			continue
 		}
 
-		res := execute(ctx, compute, cmd, draining)
+		// A COMMAND CAN WIN THE SAME SELECT AS CANCELLATION. The HTTP server may
+		// wake an already-parked poll while the caller is stopping; net/http then
+		// returns the command even though this context has just become cancelled.
+		// Treat that boundary as part of the drain: refuse a launch, but let a
+		// destroy run under a fresh, bounded context so shutdown can still converge.
+		res := executePolled(ctx, compute, cmd, draining, c.reqTimeout)
 
-		if err := c.Report(ctx, res); err != nil {
+		// REPORT AN OUTCOME EVEN IF SHUTDOWN LANDED WHILE THE COMMAND RAN. Using
+		// the cancelled polling context here made a successful destroy disappear;
+		// the plane waited its whole command timeout while the node had already done
+		// exactly what it asked. Report applies its own ordinary request deadline.
+		reportCtx := ctx
+		if ctx.Err() != nil {
+			reportCtx = context.WithoutCancel(ctx)
+		}
+
+		if err := c.Report(reportCtx, res); err != nil {
 			// THE WORK IS DONE AND THE ANSWER DID NOT LAND. The report was lost and the
 			// plane timed the command out, or it arrived late and was answered with
 			// ErrCustody — either way the plane has stopped heartbeating the lease while
@@ -707,7 +745,25 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 // staging either over a real wire would mean building a deliberately wrong
 // control plane to test a node.
 func ExecuteForTest(ctx context.Context, compute Compute, cmd nodeapi.Command) nodeapi.CommandResult {
-	return execute(ctx, compute, cmd, false)
+	return executePolled(ctx, compute, cmd, false, requestTimeout)
+}
+
+// executePolled settles the shutdown boundary before a command starts.
+func executePolled(
+	ctx context.Context,
+	compute Compute,
+	cmd nodeapi.Command,
+	draining bool,
+	shutdownTimeout time.Duration,
+) nodeapi.CommandResult {
+	if ctx.Err() == nil {
+		return execute(ctx, compute, cmd, draining)
+	}
+
+	commandCtx, finishCommand := context.WithTimeout(context.WithoutCancel(ctx), shutdownTimeout)
+	defer finishCommand()
+
+	return execute(commandCtx, compute, cmd, true)
 }
 
 // execute runs one command and describes what happened.

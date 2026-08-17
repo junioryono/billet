@@ -12,6 +12,7 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/nodeclient"
 	"github.com/junioryono/billet/internal/server"
 )
@@ -437,6 +438,41 @@ func TestADrainingNodeAcceptsDestroyAndRefusesLaunch(t *testing.T) {
 	case <-done:
 	case <-time.After(10 * time.Second):
 		t.Fatal("a drained node never stopped")
+	}
+}
+
+// A POLL AND A SIGNAL CAN WAKE TOGETHER. The command has already crossed the
+// wire, so dropping it is not a shutdown policy: a launch must be refused as
+// draining, while a destroy must run and produce the result that lets the plane
+// release the machine.
+func TestACommandDeliveredAtTheShutdownBoundaryUsesDrainSemantics(t *testing.T) {
+	t.Parallel()
+
+	compute := &fakeCompute{rejectCanceledDestroy: true}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	lease := &alloc.Lease{ID: "l1"}
+	launch := nodeapi.Command{
+		ID: "launch", Kind: nodeapi.CommandLaunch, Lease: lease,
+		Job: &nodeapi.Job{RequestID: 7},
+	}
+	res := nodeclient.ExecuteForTest(ctx, compute, launch)
+	if res.OK || !strings.Contains(res.Error, "draining") {
+		t.Fatalf("launch result at shutdown = %+v, want a draining refusal", res)
+	}
+	if _, launched, _ := compute.snapshot(); len(launched) != 0 {
+		t.Fatalf("shutdown-boundary launch reached compute: %v", launched)
+	}
+
+	destroy := nodeapi.Command{ID: "destroy", Kind: nodeapi.CommandDestroy,
+		RequestID: 42}
+	res = nodeclient.ExecuteForTest(ctx, compute, destroy)
+	if !res.OK {
+		t.Fatalf("destroy at shutdown = %+v, want success under a fresh context", res)
+	}
+	if _, _, destroyed := compute.snapshot(); len(destroyed) != 1 || destroyed[0] != 42 {
+		t.Fatalf("shutdown-boundary destroy calls = %v, want [42]", destroyed)
 	}
 }
 

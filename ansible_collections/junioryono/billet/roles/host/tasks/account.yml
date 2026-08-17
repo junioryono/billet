@@ -1,0 +1,135 @@
+---
+- name: Inspect an existing billet account
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ billet_service_user }}"
+    fail_key: false
+
+- name: Refuse to adopt an unrelated existing account
+  ansible.builtin.assert:
+    that:
+      - billet_adopt_existing_service_account or ansible_facts.getent_passwd[billet_service_user][4] == billet_service_home
+    fail_msg: >-
+      The account {{ billet_service_user }} already exists with home
+      {{ ansible_facts.getent_passwd[billet_service_user][4] }}, not
+      {{ billet_service_home }}. Refusing to hand an unrelated identity the
+      deployment credentials. Set billet_adopt_existing_service_account only
+      after verifying it is the old nologin billet account.
+  when: billet_service_user in ansible_facts.getent_passwd
+
+- name: Check for processes owned by an adopted account
+  ansible.builtin.command: "pgrep -u {{ billet_service_user }}"
+  register: billet_account_processes
+  changed_when: false
+  failed_when: billet_account_processes.rc not in [0, 1]
+  check_mode: false
+  when:
+    - billet_service_user in ansible_facts.getent_passwd
+    - ansible_facts.getent_passwd[billet_service_user][4] != billet_service_home
+    - billet_adopt_existing_service_account
+
+- name: Refuse to change the home of a running account
+  ansible.builtin.assert:
+    that: billet_account_processes.rc == 1
+    fail_msg: >-
+      {{ billet_service_user }} still owns a running process. Stop it before
+      adopting this legacy account; changing its home while it runs could split
+      one deployment across two state directories.
+  when: billet_account_processes.rc is defined
+
+- name: Create the billet service group
+  ansible.builtin.group:
+    name: "{{ billet_service_group }}"
+    system: true
+    state: present
+  become: true
+
+- name: Create or adopt the billet service account
+  ansible.builtin.user:
+    name: "{{ billet_service_user }}"
+    group: "{{ billet_service_group }}"
+    home: "{{ billet_service_home }}"
+    create_home: false
+    shell: /usr/sbin/nologin
+    system: true
+    state: present
+  become: true
+
+- name: Install billet host dependencies
+  ansible.builtin.apt:
+    name:
+      - ca-certificates
+      - ceph-common
+      - dnsmasq-base
+      - iproute2
+      - nftables
+    state: present
+    update_cache: true
+  become: true
+
+- name: Create billet directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ item.group }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: /etc/billet, owner: root, group: "{{ billet_service_group }}", mode: "0750" }
+    - { path: /etc/billet/network, owner: root, group: root, mode: "0755" }
+    - { path: /var/lib/billet, owner: root, group: root, mode: "0755" }
+    - { path: /var/lib/billet/server, owner: "{{ billet_service_user }}", group: "{{ billet_service_group }}", mode: "0700" }
+    - { path: /var/lib/billet/node, owner: root, group: root, mode: "0700" }
+    - { path: /var/lib/billet/health, owner: root, group: root, mode: "0750" }
+    - { path: /srv/jailer, owner: root, group: root, mode: "0755" }
+    - { path: /usr/local/libexec, owner: root, group: root, mode: "0755" }
+  become: true
+
+- name: Install the billet binary
+  ansible.builtin.copy:
+    src: "{{ billet_binary_src }}"
+    dest: /usr/bin/billet
+    owner: root
+    group: root
+    mode: "0755"
+  register: billet_binary_install
+  become: true
+  when: billet_binary_src | length > 0
+
+- name: Install the billet systemd units
+  ansible.builtin.template:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - { src: billet-server.service.j2, dest: /etc/systemd/system/billet-server.service }
+    - { src: billet-node.service.j2, dest: /etc/systemd/system/billet-node.service }
+  register: billet_systemd_units
+  become: true
+  notify: Reload systemd
+
+- name: Install the GitHub App private key
+  ansible.builtin.copy:
+    src: "{{ billet_github_private_key_src }}"
+    dest: /etc/billet/app-private-key.pem
+    owner: "{{ billet_service_user }}"
+    group: "{{ billet_service_group }}"
+    mode: "0600"
+  become: true
+  register: billet_private_key_install
+  no_log: true
+  when:
+    - billet_enable_server
+    - billet_github_private_key_src | length > 0
+
+- name: Render billet configuration
+  ansible.builtin.template:
+    src: billet.yaml.j2
+    dest: /etc/billet/billet.yaml
+    owner: root
+    group: "{{ billet_service_group }}"
+    mode: "0640"
+  register: billet_config_install
+  become: true

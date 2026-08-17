@@ -41,6 +41,7 @@ func TestTheFirecrackerDefaultsPointAtARealInstallation(t *testing.T) {
 	for _, tc := range []struct{ field, got, want string }{
 		{"binary_path", f.BinaryPath, DefaultFirecrackerBinary},
 		{"jailer_path", f.JailerPath, DefaultJailerBinary},
+		{"kernel_dir", f.KernelDir, DefaultKernelDir},
 		{"chroot_base", f.ChrootBase, DefaultChrootBase},
 	} {
 		if tc.got != tc.want {
@@ -53,8 +54,29 @@ func TestTheFirecrackerDefaultsPointAtARealInstallation(t *testing.T) {
 			f.JailUIDMin, f.JailUIDCount, DefaultJailUIDMin, DefaultJailUIDCount)
 	}
 
+	if f.ImageVerifyPort != DefaultImageVerifyPort {
+		t.Errorf("image_verify_port defaulted to %d, want %d",
+			f.ImageVerifyPort, DefaultImageVerifyPort)
+	}
+
 	if errs := CheckFirecracker(f); len(errs) != 0 {
 		t.Errorf("a normalized block with only a kernel and a bridge was refused: %v", errs)
+	}
+}
+
+// THE REPORT PORT IS A FIREWALL CONTRACT. Zero receives the documented default,
+// while any explicit value outside the TCP port range must fail at config load
+// rather than after a guest has booted and has nowhere to report.
+func TestTheImageVerificationPortMustBeUsable(t *testing.T) {
+	t.Parallel()
+
+	for _, port := range []int{-1, 65536} {
+		f := validFirecracker()
+		f.ImageVerifyPort = port
+
+		if got := firecrackerErrors(f); !strings.Contains(got, "image_verify_port") {
+			t.Errorf("port %d was accepted: %s", port, got)
+		}
 	}
 }
 
@@ -169,6 +191,7 @@ func TestAFirecrackerPathMustBeAbsoluteAndUnpadded(t *testing.T) {
 		{"relative binary", func(f *FirecrackerConfig) { f.BinaryPath = "bin/firecracker" }, "relative"},
 		{"relative jailer", func(f *FirecrackerConfig) { f.JailerPath = "bin/jailer" }, "relative"},
 		{"relative kernel", func(f *FirecrackerConfig) { f.KernelImage = "images/vmlinux" }, "relative"},
+		{"relative kernel directory", func(f *FirecrackerConfig) { f.KernelDir = "images" }, "relative"},
 		{"relative chroot", func(f *FirecrackerConfig) { f.ChrootBase = "jails" }, "relative"},
 		{"padded kernel", func(f *FirecrackerConfig) { f.KernelImage = " /k " }, "whitespace"},
 		{"empty kernel", func(f *FirecrackerConfig) { f.KernelImage = "" }, "required"},
@@ -261,6 +284,7 @@ func TestFirecrackerValuesAreTrimmed(t *testing.T) {
 	f := FirecrackerConfig{
 		BinaryPath:      "  /usr/local/bin/firecracker  ",
 		KernelImage:     "  /k  ",
+		KernelDir:       "  /var/lib/billet/kernels  ",
 		Bridge:          "  br0  ",
 		UntrustedBridge: "  br1  ",
 	}
@@ -269,6 +293,7 @@ func TestFirecrackerValuesAreTrimmed(t *testing.T) {
 	for _, tc := range []struct{ field, got string }{
 		{"binary_path", f.BinaryPath},
 		{"kernel_image", f.KernelImage},
+		{"kernel_dir", f.KernelDir},
 		{"bridge", f.Bridge},
 		{"untrusted_bridge", f.UntrustedBridge},
 	} {

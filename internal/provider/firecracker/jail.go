@@ -83,6 +83,11 @@ func (j jail) kernelPath() string { return filepath.Join(j.root(), guestKernel) 
 // rootDiskPath is where the root disk's device node lands inside the chroot.
 func (j jail) rootDiskPath() string { return filepath.Join(j.root(), guestRootDisk) }
 
+// volumePath is a replaceable cache-drive backing path inside the chroot.
+func (j jail) volumePath(slot int) string {
+	return filepath.Join(j.root(), provider.VolumeSlotID(slot))
+}
+
 // The names a jailed VMM sees. They are paths inside the chroot, so they are
 // absolute from the guest VMM's point of view and relative to root() from ours.
 const (
@@ -231,13 +236,43 @@ func (p *Provider) claim(j jail) error {
 	return p.writeOwner(j)
 }
 
-func (p *Provider) build(j jail, device, kernel string, res resources) error {
+func (p *Provider) build(
+	j jail,
+	device, kernel string,
+	res resources,
+	volumes []provider.VolumeMount,
+	cacheEnabled bool,
+) error {
 	if err := os.MkdirAll(j.root(), 0o700); err != nil {
 		return fmt.Errorf("firecracker: create the jail at %s: %w", j.root(), err)
 	}
 
 	if err := p.mknod(j.rootDiskPath(), device, res.UID, res.GID); err != nil {
 		return err
+	}
+
+	slots := len(volumes)
+	if cacheEnabled {
+		slots = provider.MaxVolumes
+	}
+
+	for slot := range slots {
+		path := j.volumePath(slot)
+		if slot < len(volumes) {
+			if err := p.mknod(path, volumes[slot].Device, res.UID, res.GID); err != nil {
+				return err
+			}
+
+			continue
+		}
+
+		// A ZERO-LENGTH PLACEHOLDER IS FIRECRACKER'S SUPPORTED RUNTIME-SWAP
+		// CONTRACT. The guest must not mount or access it before PATCH /drives
+		// replaces the path; the cache action is the cooperative guest that enforces
+		// that half.
+		if err := os.WriteFile(path, nil, 0o600); err != nil {
+			return fmt.Errorf("firecracker: reserve cache drive slot %d for %s: %w", slot, j.id, err)
+		}
 	}
 
 	// THE CHROOT, AFTER EVERYTHING IN IT THAT THE VMM MUST OWN. The jailer drops to

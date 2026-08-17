@@ -195,9 +195,17 @@ func (c *Client) observeHeartbeat(ctx context.Context, image, cookie string) hea
 // TakePublishLock claims the right to write the golden image.
 func (c *Client) TakePublishLock(ctx context.Context, now time.Time) (*PublishLock, error) {
 	image := c.cfg.ImagePool + "/" + LockImageName
-
 	cookie := publishCookie(now)
 
+	return c.takeLock(ctx, image, cookie, now)
+}
+
+// takeLock claims an advisory lock on one dedicated image.
+func (c *Client) takeLock(
+	ctx context.Context,
+	image, cookie string,
+	now time.Time,
+) (*PublishLock, error) {
 	// CREATED IF ABSENT, AND A FAILURE HERE IS NOT FATAL. The ordinary case is that
 	// it already exists, which `rbd create` reports as an error; distinguishing
 	// that from a real failure is what `lock add` does a line later, and far more

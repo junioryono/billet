@@ -1,0 +1,44 @@
+---
+- name: Inspect persisted billet installation inputs
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  register: billet_persisted_inputs
+  loop:
+    - /usr/bin/billet
+    - /etc/billet/app-private-key.pem
+  check_mode: false
+  become: true
+
+- name: Validate billet host inputs
+  ansible.builtin.assert:
+    that:
+      - ansible_facts["system"] == "Linux"
+      - ansible_facts["service_mgr"] == "systemd"
+      - billet_binary_src | length > 0 or billet_persisted_inputs.results[0].stat.exists
+      - billet_config | length > 0
+      - not billet_enable_server or billet_github_private_key_src | length > 0 or billet_persisted_inputs.results[1].stat.exists
+      - not billet_ceph_bootstrap or billet_ceph_mon_ip | length > 0
+      - not billet_ceph_bootstrap or billet_ceph_devices | length > 0
+    fail_msg: >-
+      A billet host needs Linux/systemd, a Linux billet binary, a complete
+      billet_config, and the GitHub App key when the server is enabled. The
+      binary and key may already be installed, so an ordinary converging run
+      needs neither secret input. Ceph bootstrap additionally requires an
+      explicit monitor address and device list; disks are never inferred.
+
+- name: Configure billet account and files
+  ansible.builtin.import_tasks: account.yml
+
+- name: Configure Firecracker
+  ansible.builtin.import_tasks: firecracker.yml
+  when: billet_firecracker_enabled
+
+- name: Configure guest networking
+  ansible.builtin.import_tasks: network.yml
+
+- name: Configure Ceph
+  ansible.builtin.import_tasks: ceph.yml
+  when: billet_ceph_enabled
+
+- name: Configure billet services
+  ansible.builtin.import_tasks: services.yml

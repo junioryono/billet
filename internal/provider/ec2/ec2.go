@@ -78,6 +78,7 @@ type Provider struct {
 	owner string
 	cfg   config.EC2Config
 	api   *client
+	sqs   *sqsClient
 
 	// images caches what one DescribeImages lookup says about an AMI: its root
 	// device, and every non-root EBS mapping billet will restate at launch. Asked
@@ -150,6 +151,12 @@ func New(owner string, cfg config.EC2Config, opts ...Option) (*Provider, error) 
 	if err := config.CheckEC2Region(cfg.Region); err != nil {
 		return nil, fmt.Errorf("ec2: %w", err)
 	}
+	if err := config.CheckSQSQueueURL(cfg.InterruptionQueueURL); err != nil {
+		return nil, fmt.Errorf("ec2: %w", err)
+	}
+	if cfg.Spot != (cfg.InterruptionQueueURL != "") {
+		return nil, errors.New("ec2: spot and interruption_queue_url must be configured together")
+	}
 
 	for _, check := range []struct {
 		field    string
@@ -195,6 +202,9 @@ func New(owner string, cfg config.EC2Config, opts ...Option) (*Provider, error) 
 			creds:    DefaultCredentials(),
 		},
 		images: make(map[string]imageLayout),
+	}
+	if cfg.InterruptionQueueURL != "" {
+		p.sqs = &sqsClient{api: p.api, queueURL: cfg.InterruptionQueueURL}
 	}
 
 	for _, opt := range opts {
@@ -254,6 +264,29 @@ func New(owner string, cfg config.EC2Config, opts ...Option) (*Provider, error) 
 	p.api.http = &client
 
 	return p, nil
+}
+
+// NextInterruption blocks for one warning from the configured SQS queue.
+func (p *Provider) NextInterruption(ctx context.Context) (*provider.InterruptionNotice, error) {
+	if p.sqs == nil {
+		<-ctx.Done()
+
+		return nil, ctx.Err()
+	}
+
+	return p.sqs.receive(ctx)
+}
+
+// AcknowledgeInterruption removes a warning only after the runner has durably
+// recorded and acted on it.
+func (p *Provider) AcknowledgeInterruption(
+	ctx context.Context, notice *provider.InterruptionNotice,
+) error {
+	if p.sqs == nil {
+		return errors.New("ec2: no interruption queue is configured")
+	}
+
+	return p.sqs.delete(ctx, notice.Receipt)
 }
 
 // Kind reports the backend this is.
@@ -324,11 +357,30 @@ func (p *Provider) securityGroups(trust provider.TrustClass) []string {
 // failure it exists to prevent.
 func (p *Provider) instanceTypesFor(spec provider.Spec) ([]config.EC2InstanceType, error) {
 	var fits []config.EC2InstanceType
+	selected := spec.InstanceType == ""
 
 	for _, it := range p.cfg.InstanceTypes {
+		if !selected {
+			if it.Type != spec.InstanceType {
+				continue
+			}
+
+			selected = true
+			if it.VCPU < spec.VCPU || it.Memory < spec.Memory {
+				return nil, fmt.Errorf("ec2: the allocator selected instance type %q, but this "+
+					"node now declares it as %d vCPU and %s, which does not hold %d vCPU and %s",
+					it.Type, it.VCPU, it.Memory, spec.VCPU, spec.Memory)
+			}
+		}
+
 		if it.VCPU >= spec.VCPU && it.Memory >= spec.Memory {
 			fits = append(fits, it)
 		}
+	}
+
+	if !selected {
+		return nil, fmt.Errorf("ec2: the allocator selected instance type %q, which this node "+
+			"did not register", spec.InstanceType)
 	}
 
 	if len(fits) > 0 {
@@ -425,8 +477,6 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*provider.In
 		return nil, err
 	}
 
-	encodedUserData := base64.StdEncoding.EncodeToString([]byte(userData))
-
 	// REFUSED HERE RATHER THAN BY EC2. A tier's command has no bound of its own and
 	// the registration is appended to it, so a config that validates can still
 	// produce a script the service will always reject.
@@ -456,7 +506,24 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*provider.In
 	refusals := make([]string, 0, len(instanceTypes))
 
 	for _, instanceType := range instanceTypes {
-		inst, err := p.runOne(ctx, spec, instanceType, encodedUserData)
+		if spec.AuthorizeShape != nil {
+			ok, err := spec.AuthorizeShape(ctx, instanceType.Type, instanceType.VCPU,
+				instanceType.Memory)
+			if err != nil {
+				return nil, fmt.Errorf("ec2: authorize shape %s for %s: %w",
+					instanceType.Type, spec.Name, err)
+			}
+
+			if !ok {
+				refusals = append(refusals, instanceType.Type+": budget")
+				p.log.Warn("this fallback shape would exceed the node or deployment budget; "+
+					"trying the next declared one", "runner", spec.Name, "type", instanceType.Type)
+
+				continue
+			}
+		}
+
+		inst, err := p.runOne(ctx, spec, instanceType)
 		if err == nil {
 			return inst, nil
 		}
@@ -484,7 +551,6 @@ func (p *Provider) runOne(
 	ctx context.Context,
 	spec provider.Spec,
 	instanceType config.EC2InstanceType,
-	encodedUserData string,
 ) (*provider.Instance, error) {
 	params := url.Values{}
 	params.Set("Action", "RunInstances")
@@ -492,7 +558,6 @@ func (p *Provider) runOne(
 	params.Set("InstanceType", instanceType.Type)
 	params.Set("MinCount", "1")
 	params.Set("MaxCount", "1")
-	params.Set("UserData", encodedUserData)
 
 	// THE IDEMPOTENCY KEY IS THE LEASE AND THE SHAPE, and this is what makes an
 	// ambiguous launch safe. A RunInstances that commits and loses its response is
@@ -543,6 +608,23 @@ func (p *Provider) runOne(
 	if err := p.setBlockDevices(ctx, params, spec); err != nil {
 		return nil, err
 	}
+
+	// STAMP THE ATTEMPT IMMEDIATELY BEFORE RUNINSTANCES. imageLayout may make a
+	// DescribeImages call and fallback shapes may follow synchronous refusals;
+	// neither is time spent provisioning the instance that eventually ran the job.
+	now := time.Now
+	if p.api.now != nil {
+		now = p.api.now
+	}
+	userData, err := p.userDataAt(spec, now().UTC().UnixNano())
+	if err != nil {
+		return nil, err
+	}
+	if len(userData) > maxUserData {
+		return nil, fmt.Errorf("ec2: the boot script for %s is %d bytes and ec2 accepts %d; "+
+			"the tier's command is too long to carry", spec.Name, len(userData), maxUserData)
+	}
+	params.Set("UserData", base64.StdEncoding.EncodeToString([]byte(userData)))
 
 	var out runInstancesResponse
 
@@ -1088,6 +1170,16 @@ func (p *Provider) imageLayout(ctx context.Context, image string) (imageLayout, 
 // why the metadata service is pinned to IMDSv2 with a one-hop limit: a container
 // inside the job cannot reach it at all.
 func (p *Provider) userData(spec provider.Spec) (string, error) {
+	// A 20-byte signed placeholder makes this the maximum-size preflight script
+	// Launch checks before it authorizes any shape. Production clocks are positive;
+	// covering the full int64 spelling also keeps a substituted test clock honest.
+	return p.userDataAt(spec, -9_000_000_000_000_000_000)
+}
+
+func (p *Provider) userDataAt(spec provider.Spec, launchEpochNS int64) (string, error) {
+	if (spec.CacheEndpoint == "") != (spec.CacheToken == "") {
+		return "", fmt.Errorf("ec2: the cache endpoint and token for %s must be supplied together", spec.Name)
+	}
 	// A PLAIN SINGLE-QUOTED ASSIGNMENT, which is the one construct with no
 	// parsing left in it. Inside single quotes a POSIX shell expands nothing at
 	// all, and the only character that needs handling is the quote itself.
@@ -1112,8 +1204,28 @@ func (p *Provider) userData(spec provider.Spec) (string, error) {
 	var b strings.Builder
 
 	b.WriteString("#!/bin/sh\nset -eu\numask 077\n")
+	b.WriteString("BILLET_LAUNCH_EPOCH_NS='" + strconv.FormatInt(launchEpochNS, 10) + "'\n")
+	b.WriteString("export BILLET_LAUNCH_EPOCH_NS\n")
 	b.WriteString(jitEnvVar + "=" + jit + "\n")
 	b.WriteString("export " + jitEnvVar + "\n")
+	if spec.CacheEndpoint != "" {
+		endpoint, err := shellQuote(spec.CacheEndpoint)
+		if err != nil {
+			return "", fmt.Errorf("ec2: cache endpoint for %s: %w", spec.Name, err)
+		}
+		token, err := shellQuote(spec.CacheToken)
+		if err != nil {
+			return "", fmt.Errorf("ec2: cache token for %s: %w", spec.Name, err)
+		}
+		limit, err := shellQuote(strconv.FormatInt(int64(spec.BuildKitCacheMountLimit), 10))
+		if err != nil {
+			return "", err
+		}
+		b.WriteString("BILLET_CACHE_ENDPOINT=" + endpoint + "\n")
+		b.WriteString("BILLET_CACHE_TOKEN=" + token + "\n")
+		b.WriteString("BILLET_BUILDKIT_CACHE_MOUNT_LIMIT_BYTES=" + limit + "\n")
+		b.WriteString("export BILLET_CACHE_ENDPOINT BILLET_CACHE_TOKEN BILLET_BUILDKIT_CACHE_MOUNT_LIMIT_BYTES\n")
+	}
 	b.WriteString("exec " + command + "\n")
 
 	return b.String(), nil

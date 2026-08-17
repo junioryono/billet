@@ -1,0 +1,103 @@
+---
+- name: Enable IP forwarding for guest bridges
+  ansible.posix.sysctl:
+    name: net.ipv4.ip_forward
+    value: "1"
+    sysctl_file: /etc/sysctl.d/99-billet-node.conf
+    reload: true
+  become: true
+
+- name: Configure billet guest bridge devices
+  ansible.builtin.template:
+    src: bridge.netdev.j2
+    dest: "/etc/systemd/network/80-{{ item.name }}.netdev"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ billet_networks }}"
+  become: true
+  notify: Reload billet guest networking
+
+- name: Configure billet guest bridge addresses
+  ansible.builtin.template:
+    src: bridge.network.j2
+    dest: "/etc/systemd/network/81-{{ item.name }}.network"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ billet_networks }}"
+  become: true
+  notify: Reload billet guest networking
+
+- name: Install dnsmasq configuration for each billet bridge
+  ansible.builtin.template:
+    src: dnsmasq.conf.j2
+    dest: "/etc/billet/network/{{ item.name }}.conf"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ billet_networks }}"
+  become: true
+  notify: Restart billet dnsmasq
+
+- name: Install the billet dnsmasq unit
+  ansible.builtin.template:
+    src: billet-dnsmasq@.service.j2
+    dest: /etc/systemd/system/billet-dnsmasq@.service
+    owner: root
+    group: root
+    mode: "0644"
+  become: true
+  notify: Reload systemd
+
+- name: Install the billet guest firewall
+  ansible.builtin.template:
+    src: network.nft.j2
+    dest: /etc/billet/network.nft
+    owner: root
+    group: root
+    mode: "0600"
+    validate: /usr/sbin/nft -c -f %s
+  become: true
+  notify: Reload billet firewall
+
+- name: Install the billet network service
+  ansible.builtin.template:
+    src: billet-network.service.j2
+    dest: /etc/systemd/system/billet-network.service
+    owner: root
+    group: root
+    mode: "0644"
+  become: true
+  notify: Reload systemd
+
+- name: Apply service and network handlers before validation
+  ansible.builtin.meta: flush_handlers
+
+- name: Wait for billet bridges to exist
+  ansible.builtin.command: "ip link show dev {{ item.name }}"
+  register: billet_bridge_wait
+  changed_when: false
+  retries: 10
+  delay: 1
+  until: billet_bridge_wait.rc == 0
+  loop: "{{ billet_networks }}"
+  when: not ansible_check_mode
+  become: true
+
+- name: Enable billet guest firewall and NAT
+  ansible.builtin.systemd_service:
+    name: billet-network.service
+    enabled: true
+    state: started
+  when: not ansible_check_mode
+  become: true
+
+- name: Enable DHCP and DNS on billet guest bridges
+  ansible.builtin.systemd_service:
+    name: "billet-dnsmasq@{{ item.name }}.service"
+    enabled: true
+    state: started
+  loop: "{{ billet_networks }}"
+  when: not ansible_check_mode
+  become: true

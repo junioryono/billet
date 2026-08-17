@@ -1,0 +1,14 @@
+interface={{ item.name }}
+except-interface=lo
+bind-dynamic
+dhcp-authoritative
+dhcp-range={{ item.dhcp_start }},{{ item.dhcp_end }},{{ item.netmask }},1h
+dhcp-leasefile=/var/lib/billet-dnsmasq/{{ item.name }}/dnsmasq.leases
+dhcp-option=option:router,{{ item.address }}
+dhcp-option=option:dns-server,{{ item.address }}
+domain-needed
+bogus-priv
+no-resolv
+{% for server in billet_guest_dns_servers %}
+server={{ server }}
+{% endfor %}

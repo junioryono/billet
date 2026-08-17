@@ -118,10 +118,11 @@ type Provider struct {
 	execPath string
 	execName string
 
-	run    runner
-	mknod  mknodFunc
-	chown  chownFunc
-	apiFor func(socket string) *vmmAPI
+	run      runner
+	mknod    mknodFunc
+	chown    chownFunc
+	chownOne chownFunc
+	apiFor   func(socket string) *vmmAPI
 	// pidOwner reports whether a pid is still a jail's VMM. A seam because it
 	// reads /proc, and because the rule it enforces — never signal a pid billet
 	// could not tie to this microVM — is only testable if "could not tell" can be
@@ -169,6 +170,7 @@ func withPrivileged(m mknodFunc, c chownFunc) Option {
 
 		if c != nil {
 			p.chown = c
+			p.chownOne = c
 		}
 	}
 }
@@ -239,6 +241,7 @@ func New(owner string, cfg config.FirecrackerConfig, disk RootDisk, opts ...Opti
 		run:      execRunner,
 		mknod:    mknodBlock,
 		chown:    chownTree,
+		chownOne: os.Chown,
 		apiFor:   newVMMAPI,
 		pidOwner: pidIsVMM,
 		bootWait: DefaultBootWait,
@@ -433,7 +436,7 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*Instance, e
 func (p *Provider) launch(
 	ctx context.Context, j jail, spec provider.Spec, device, kernel string, res resources,
 ) (*Instance, error) {
-	if err := p.build(j, device, kernel, res); err != nil {
+	if err := p.build(j, device, kernel, res, spec.Volumes, spec.CacheEndpoint != ""); err != nil {
 		return nil, err
 	}
 
@@ -584,6 +587,34 @@ func checkSpec(spec provider.Spec) error {
 		return fmt.Errorf("firecracker: %s asks for %s of memory", spec.Name, spec.Memory)
 	}
 
+	if len(spec.Volumes) > provider.MaxVolumes {
+		return fmt.Errorf("firecracker: %s asks for %d cache volumes; at most %d drive slots are "+
+			"reserved per guest", spec.Name, len(spec.Volumes), provider.MaxVolumes)
+	}
+
+	for i := range spec.Volumes {
+		if strings.TrimSpace(spec.Volumes[i].Device) == "" {
+			return fmt.Errorf("firecracker: %s cache volume %d has no mapped device", spec.Name, i)
+		}
+	}
+
+	if (spec.CacheEndpoint == "") != (spec.CacheToken == "") {
+		return fmt.Errorf("firecracker: %s needs both a cache endpoint and its per-guest token", spec.Name)
+	}
+	if spec.CacheEndpoint != "" && spec.BuildKitCacheMountLimit <= 0 {
+		return fmt.Errorf("firecracker: %s needs a positive BuildKit cache-mount ceiling", spec.Name)
+	}
+	if spec.CacheEndpoint == "" && spec.BuildKitCacheMountLimit != 0 {
+		return fmt.Errorf("firecracker: %s has a BuildKit cache-mount ceiling but no cache endpoint",
+			spec.Name)
+	}
+	if !spec.RegistryMirrors.Empty() {
+		if errs := config.CheckRegistryMirrors(spec.RegistryMirrors); len(errs) > 0 {
+			return fmt.Errorf("firecracker: %s has unusable registry mirrors: %w",
+				spec.Name, errors.Join(errs...))
+		}
+	}
+
 	return nil
 }
 
@@ -613,7 +644,7 @@ func (p *Provider) configure(
 		return err
 	}
 
-	for _, step := range []struct {
+	steps := []struct {
 		path string
 		body any
 	}{
@@ -653,7 +684,27 @@ func (p *Provider) configure(
 			"ipv4_address":       mmdsAddress,
 		}},
 		{"/mmds", md},
-	} {
+	}
+
+	slots := len(spec.Volumes)
+	if spec.CacheEndpoint != "" {
+		slots = provider.MaxVolumes
+	}
+
+	for slot := range slots {
+		id := provider.VolumeSlotID(slot)
+		steps = append(steps, struct {
+			path string
+			body any
+		}{"/drives/" + id, map[string]any{
+			"drive_id":       id,
+			"path_on_host":   "/" + id,
+			"is_root_device": false,
+			"is_read_only":   false,
+		}})
+	}
+
+	for _, step := range steps {
 		if err := api.put(ctx, step.path, step.body); err != nil {
 			return fmt.Errorf("firecracker: configure %s for %s: %w", step.path, spec.Name, err)
 		}
@@ -695,18 +746,34 @@ func metadata(spec provider.Spec) (map[string]any, error) {
 		return nil, fmt.Errorf("firecracker: encode command for %s: %w", spec.Name, err)
 	}
 
-	return map[string]any{
+	billet := map[string]any{
+		"contract":    GuestContract,
+		"runner-name": spec.Name,
+		"jit-config":  spec.JITConfig,
+		"command":     string(command),
+	}
+	result := map[string]any{
 		"latest": map[string]any{
 			"meta-data": map[string]any{
-				"billet": map[string]any{
-					"contract":    GuestContract,
-					"runner-name": spec.Name,
-					"jit-config":  spec.JITConfig,
-					"command":     string(command),
-				},
+				"billet": billet,
 			},
 		},
-	}, nil
+	}
+	if spec.CacheEndpoint != "" {
+		billet["cache-endpoint"] = spec.CacheEndpoint
+		billet["cache-token"] = spec.CacheToken
+		billet["buildkit-cache-mount-limit-bytes"] =
+			strconv.FormatInt(int64(spec.BuildKitCacheMountLimit), 10)
+	}
+	if !spec.RegistryMirrors.Empty() {
+		mirrors, err := json.Marshal(spec.RegistryMirrors)
+		if err != nil {
+			return nil, fmt.Errorf("firecracker: encode registry mirrors for %s: %w", spec.Name, err)
+		}
+		billet["registry-mirrors"] = string(mirrors)
+	}
+
+	return result, nil
 }
 
 // GuestContract is the version of this layout the guest agent must understand.
@@ -731,7 +798,7 @@ func metadata(spec provider.Spec) (map[string]any, error) {
 // Republishing is safe precisely because generations are immutable: a job holding a
 // clone of the old generation keeps the agent it booted with, and clone v2 lets the
 // old generation be removed once nothing holds it.
-const GuestContract = "2"
+const GuestContract = "4"
 
 // mmdsSizeLimit is how much the metadata service will hold.
 //

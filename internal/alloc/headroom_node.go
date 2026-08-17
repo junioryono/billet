@@ -18,6 +18,7 @@ type nodeRow struct {
 	site     string
 	vcpu     int
 	memory   config.ByteSize
+	shapes   []config.EC2InstanceType
 }
 
 // eligibleNodes lists the live hosts a tier could actually be placed on.
@@ -31,7 +32,7 @@ type nodeRow struct {
 // answers on different runs, which is untestable and unexplainable in a log.
 func (a *Allocator) eligibleNodes(ctx context.Context, tx querier, t config.Tier) ([]nodeRow, error) {
 	rows, err := tx.QueryContext(ctx,
-		`SELECT name, provider, site, total_vcpu, total_memory
+		`SELECT name, provider, site, total_vcpu, total_memory, ec2_shapes
 		   FROM nodes
 		  WHERE live = 1 AND drained = 0
 		  ORDER BY name`)
@@ -50,13 +51,18 @@ func (a *Allocator) eligibleNodes(ctx context.Context, tx querier, t config.Tier
 			n        nodeRow
 			provider string
 			memory   int64
+			shapes   string
 		)
 
-		if err := rows.Scan(&n.name, &provider, &n.site, &n.vcpu, &memory); err != nil {
+		if err := rows.Scan(&n.name, &provider, &n.site, &n.vcpu, &memory, &shapes); err != nil {
 			return nil, fmt.Errorf("alloc: read a node row: %w", err)
 		}
 
 		n.provider, n.memory = config.ProviderKind(provider), config.ByteSize(memory)
+		n.shapes, err = decodeEC2Shapes(shapes)
+		if err != nil {
+			return nil, fmt.Errorf("alloc: read EC2 shapes for node %s: %w", n.name, err)
+		}
 
 		// A PIN IS AN ALLOWLIST OF ONE, and it is checked first because it is the
 		// operator's explicit instruction rather than an inference.
@@ -77,6 +83,10 @@ func (a *Allocator) eligibleNodes(ctx context.Context, tx querier, t config.Tier
 		}
 
 		if !a.allowsGuestOS(n.name, t.GuestOS) {
+			continue
+		}
+
+		if _, ok := n.cost(t); !ok {
 			continue
 		}
 
@@ -387,7 +397,7 @@ func (c strandedCandidate) covers(overVCPU int, overMemory config.ByteSize) floa
 // machine it cannot use, so another tier's reservation had nowhere correct to go.
 func (a *Allocator) liveNodes(ctx context.Context, tx querier) ([]nodeRow, error) {
 	rows, err := tx.QueryContext(ctx,
-		`SELECT name, provider, site, total_vcpu, total_memory
+		`SELECT name, provider, site, total_vcpu, total_memory, ec2_shapes
 		   FROM nodes
 		  WHERE live = 1 AND drained = 0
 		  ORDER BY name`)
@@ -404,13 +414,18 @@ func (a *Allocator) liveNodes(ctx context.Context, tx querier) ([]nodeRow, error
 			n        nodeRow
 			provider string
 			memory   int64
+			shapes   string
 		)
 
-		if err := rows.Scan(&n.name, &provider, &n.site, &n.vcpu, &memory); err != nil {
+		if err := rows.Scan(&n.name, &provider, &n.site, &n.vcpu, &memory, &shapes); err != nil {
 			return nil, fmt.Errorf("alloc: read a node row: %w", err)
 		}
 
 		n.provider, n.memory = config.ProviderKind(provider), config.ByteSize(memory)
+		n.shapes, err = decodeEC2Shapes(shapes)
+		if err != nil {
+			return nil, fmt.Errorf("alloc: read EC2 shapes for node %s: %w", n.name, err)
+		}
 		out = append(out, n)
 	}
 

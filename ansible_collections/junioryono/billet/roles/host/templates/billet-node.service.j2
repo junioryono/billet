@@ -1,0 +1,33 @@
+[Unit]
+Description=billet compute host
+Documentation=https://github.com/junioryono/billet
+After=network-online.target billet-network.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=root
+Group=root
+ExecStart=/usr/bin/billet node --config /etc/billet/billet.yaml
+StateDirectory=billet/node
+StateDirectoryMode=0700
+RuntimeDirectory=billet/locks
+RuntimeDirectoryMode=0750
+TimeoutStopSec=23400
+KillSignal=SIGTERM
+KillMode=mixed
+Restart=on-failure
+RestartSec=5s
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+ReadOnlyPaths=/etc/billet
+ReadWritePaths=/srv/jailer
+
+[Install]
+WantedBy=multi-user.target

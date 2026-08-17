@@ -422,6 +422,34 @@ func sleepFor(ctx context.Context, d time.Duration) error {
 const privilegeDrop = "setpriv --reuid=runner --regid=runner --init-groups \\\n" +
 	"  env HOME=/home/runner USER=runner LOGNAME=runner"
 
+// jobTimingHook is invoked by the runner after it accepts a job and before it
+// starts any job steps. It deliberately has no `set -e`: timing is observation,
+// and a missing or malformed timestamp must never turn into a failed workflow.
+func jobTimingHook() string {
+	return `#!/bin/sh
+launch=${BILLET_LAUNCH_EPOCH_NS:-}
+runner=${BILLET_RUNNER_START_EPOCH_NS:-}
+
+case "$launch:$runner" in
+  *[!0-9:]*|:*|*:) exit 0 ;;
+esac
+
+now=$(date +%s%N 2>/dev/null) || exit 0
+case "$now" in
+  ''|*[!0-9]*) exit 0 ;;
+esac
+
+[ "$launch" -le "$runner" ] 2>/dev/null || exit 0
+[ "$runner" -le "$now" ] 2>/dev/null || exit 0
+
+printf 'billet timing: launch_to_job_start_ms=%s launch_to_runner_ms=%s runner_to_job_start_ms=%s\n' \
+  "$(((now-launch)/1000000))" \
+  "$(((runner-launch)/1000000))" \
+  "$(((now-runner)/1000000))"
+exit 0
+`
+}
+
 // provisionScript is what the builder runs, and it is the whole definition of
 // what a billet runner image contains.
 //
@@ -479,6 +507,14 @@ func provisionScript(spec BuildSpec) (string, error) {
 	b.WriteString("rm runner.tar.gz\n")
 	b.WriteString("chown -R runner:runner /opt/actions-runner\n")
 
+	// THE SUPPORTED RUNNER HOOK, rather than an edit to run.sh. GitHub invokes it
+	// after assigning the job and before running any job steps, which is the first
+	// instant that separates registration/pickup from the workflow itself.
+	b.WriteString("cat > /usr/local/bin/billet-job-started <<'BILLETJOBEOF'\n")
+	b.WriteString(jobTimingHook())
+	b.WriteString("BILLETJOBEOF\n")
+	b.WriteString("chmod 0755 /usr/local/bin/billet-job-started\n")
+
 	// THE ENTRY POINT A TIER NAMES. billet's boot script exports the JIT config and
 	// execs the tier's command AS ROOT, so something has to drop privileges without
 	// losing that variable. setpriv does it in one process with no shell in between.
@@ -502,6 +538,7 @@ func provisionScript(spec BuildSpec) (string, error) {
 	b.WriteString("while [ $i -lt 60 ] && ! docker info >/dev/null 2>&1; do\n")
 	b.WriteString("  i=$((i+1)); sleep 1\n")
 	b.WriteString("done\n")
+	b.WriteString("runner_started=$(date +%s%N 2>/dev/null || true)\n")
 
 	// ONE INVOCATION, SHARED WITH THE VALIDATION BELOW, so a change here cannot
 	// leave the check passing while every job fails. See privilegeDrop.
@@ -512,6 +549,9 @@ func provisionScript(spec BuildSpec) (string, error) {
 	// a runner that starts, finds no registration, exits, and leaves a machine
 	// looking perfectly healthy.
 	b.WriteString("exec " + privilegeDrop + " \\\n")
+	b.WriteString("  BILLET_LAUNCH_EPOCH_NS=\"${BILLET_LAUNCH_EPOCH_NS:-}\" \\\n")
+	b.WriteString("  BILLET_RUNNER_START_EPOCH_NS=\"$runner_started\" \\\n")
+	b.WriteString("  ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/bin/billet-job-started \\\n")
 	b.WriteString("  " + jitEnvVar + "=\"$" + jitEnvVar + "\" \\\n")
 	b.WriteString("  /opt/actions-runner/run.sh\n")
 	b.WriteString("BILLETEOF\n")

@@ -3,6 +3,9 @@ package ec2
 import (
 	"net/http"
 	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -236,6 +239,57 @@ func TestTheEntryPointCarriesTheRegistrationAcrossTheUserChange(t *testing.T) {
 	if !strings.Contains(entry, "docker info") {
 		t.Error("the entry point starts the runner without waiting for the Docker daemon; " +
 			"the first job on a fresh instance can lose a race it will never lose again")
+	}
+
+	for fragment, why := range map[string]string{
+		`ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/bin/billet-job-started`: "the runner would not invoke the cold-start measurement hook",
+		`BILLET_LAUNCH_EPOCH_NS="${BILLET_LAUNCH_EPOCH_NS:-}"`:              "the launch timestamp would be lost across the user change",
+		`BILLET_RUNNER_START_EPOCH_NS="$runner_started"`:                    "the hook could not split boot from registration and pickup",
+	} {
+		if !strings.Contains(entry, fragment) {
+			t.Errorf("the entry point is missing %q — %s", fragment, why)
+		}
+	}
+}
+
+// THE HOOK IS EXECUTED, not pattern-matched. It is part of the runner's job-start
+// path, so malformed arithmetic or a non-zero exit would make the measurement
+// alter the job it is supposed to observe.
+func TestTheJobStartHookReportsColdStartPhasesWithoutFailingTheJob(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	date := filepath.Join(dir, "date")
+	if err := os.WriteFile(date, []byte("#!/bin/sh\nprintf '%s\\n' 3000000000\n"), 0o755); err != nil {
+		t.Fatalf("write fake date: %v", err)
+	}
+
+	run := func(t *testing.T, launch, runner string) string {
+		t.Helper()
+
+		cmd := exec.CommandContext(t.Context(), "/bin/sh", "-c", jobTimingHook())
+		cmd.Env = append(os.Environ(),
+			"PATH="+dir,
+			"BILLET_LAUNCH_EPOCH_NS="+launch,
+			"BILLET_RUNNER_START_EPOCH_NS="+runner,
+		)
+
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("the hook failed the job: %v\n%s", err, out)
+		}
+
+		return string(out)
+	}
+
+	want := "billet timing: launch_to_job_start_ms=2000 launch_to_runner_ms=1000 " +
+		"runner_to_job_start_ms=1000\n"
+	if got := run(t, "1000000000", "2000000000"); got != want {
+		t.Errorf("hook output = %q, want %q", got, want)
+	}
+
+	if got := run(t, "not-a-time", "2000000000"); got != "" {
+		t.Errorf("an invalid timestamp produced %q; instrumentation should fail open", got)
 	}
 }
 

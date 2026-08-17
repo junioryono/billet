@@ -15,6 +15,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -50,6 +51,12 @@ const (
 	PhaseOnline Phase = "online"
 	// PhaseBusy means the runner is executing the job.
 	PhaseBusy Phase = "busy"
+	// PhaseCustody means the node is preserving compute it inherited or can no
+	// longer manage as an ordinary running command. The capacity stays charged.
+	PhaseCustody Phase = "custody"
+	// PhaseTeardown means the node asked its backend to remove compute but has not
+	// confirmed it stopped. It is the operator-visible proof obligation from #46.
+	PhaseTeardown Phase = "teardown"
 	// PhaseQuarantine means a lease that had compute behind it stopped being
 	// heartbeated, and the compute has not been confirmed gone.
 	//
@@ -77,9 +84,11 @@ const (
 var validTransitions = map[Phase][]Phase{
 	PhaseCapacity:  {PhaseAssigned, PhaseDone, PhaseFailed},
 	PhaseAssigned:  {PhaseLaunching, PhaseDone, PhaseFailed},
-	PhaseLaunching: {PhaseOnline, PhaseQuarantine, PhaseDone, PhaseFailed},
-	PhaseOnline:    {PhaseBusy, PhaseQuarantine, PhaseDone, PhaseFailed},
-	PhaseBusy:      {PhaseQuarantine, PhaseDone, PhaseFailed},
+	PhaseLaunching: {PhaseOnline, PhaseCustody, PhaseTeardown, PhaseQuarantine, PhaseDone, PhaseFailed},
+	PhaseOnline:    {PhaseBusy, PhaseCustody, PhaseTeardown, PhaseQuarantine, PhaseDone, PhaseFailed},
+	PhaseBusy:      {PhaseCustody, PhaseTeardown, PhaseQuarantine, PhaseDone, PhaseFailed},
+	PhaseCustody:   {PhaseTeardown, PhaseQuarantine, PhaseDone, PhaseFailed},
+	PhaseTeardown:  {PhaseQuarantine, PhaseDone, PhaseFailed},
 	// Quarantine ends only in a terminal phase: it is a lease being cleaned up,
 	// never one going back to work.
 	PhaseQuarantine: {PhaseDone, PhaseFailed},
@@ -107,7 +116,8 @@ func requiresPlacement(p Phase) bool {
 // expiry, and anything past it cannot, because expiry says the holder stopped
 // heartbeating and never that the compute stopped.
 func hadCompute(p Phase) bool {
-	return p == PhaseLaunching || p == PhaseOnline || p == PhaseBusy
+	return p == PhaseLaunching || p == PhaseOnline || p == PhaseBusy ||
+		p == PhaseCustody || p == PhaseTeardown
 }
 
 func (p Phase) canMoveTo(next Phase) bool {
@@ -158,6 +168,9 @@ var (
 	// information to verify a host is legal for it — a row predating the
 	// columns the checks read. It fails closed rather than skipping the checks.
 	ErrNotPlaceable = errors.New("alloc: lease cannot be placed safely")
+	// ErrForceRelease means an operator asserted that custody's compute is gone.
+	// The node must drop its local proof obligation and terminalize the lease.
+	ErrForceRelease = errors.New("alloc: operator requested forced release")
 )
 
 // Limits is the global ceiling the allocator escrows against.
@@ -207,11 +220,29 @@ type Lease struct {
 	// open, and a placement decision has to be answerable from the lease itself.
 	Providers []config.ProviderKind
 	Phase     Phase
-	VCPU      int
-	Memory    config.ByteSize
-	Epoch     int64
-	RunID     int64
-	RequestID int64
+	// VCPU and Memory are what the lease is CHARGED. For an EC2 lease this is
+	// the selected purchasable shape, which may be larger than the tier asked for.
+	VCPU   int
+	Memory config.ByteSize
+	// RequestedVCPU and RequestedMemory are the tier's requirement. They stay
+	// fixed while EC2 fallback may resize the charged shape around them.
+	RequestedVCPU   int
+	RequestedMemory config.ByteSize
+	// InstanceType is the EC2 shape currently authorised for purchase. Empty for
+	// backends whose charged resources are the requested resources.
+	InstanceType string
+	// HeldSince is set when the lease enters custody or an unconfirmed teardown.
+	HeldSince string
+	// ForceRelease asks the node holding custody to relinquish it. It is carried
+	// by Heartbeat as ErrForceRelease rather than acted on behind the node's back.
+	ForceRelease bool
+	// FailureReason is an external fact that decided a running job cannot finish,
+	// such as an EC2 Spot interruption warning. It is written before teardown so
+	// recovery preserves why the lease will fail.
+	FailureReason string
+	Epoch         int64
+	RunID         int64
+	RequestID     int64
 }
 
 // Usage is the vector of what is currently held.
@@ -518,7 +549,7 @@ func (a *Allocator) Escrow(ctx context.Context, tier string, want int) ([]*Lease
 		leases = make([]*Lease, 0, take)
 
 		for range take {
-			target, ok := place.next(t)
+			target, cost, ok := place.next(t)
 			if !ok {
 				// The fleet ran out before the ceiling did. Headroom is the smaller of the two, so
 				// this should not happen — but returning what was placed is the safe reading, and
@@ -526,7 +557,7 @@ func (a *Allocator) Escrow(ctx context.Context, tier string, want int) ([]*Lease
 				break
 			}
 
-			lease, err := a.insertLease(ctx, tx, t, target)
+			lease, err := a.insertLease(ctx, tx, t, target, cost)
 			if err != nil {
 				return err
 			}
@@ -581,6 +612,36 @@ func decodeProviders(s string) []config.ProviderKind {
 	}
 
 	return out
+}
+
+func encodeEC2Shapes(shapes []config.EC2InstanceType) (string, error) {
+	if len(shapes) == 0 {
+		return "", nil
+	}
+
+	b, err := json.Marshal(shapes)
+	if err != nil {
+		return "", fmt.Errorf("alloc: encode EC2 shapes: %w", err)
+	}
+
+	return string(b), nil
+}
+
+func decodeEC2Shapes(s string) ([]config.EC2InstanceType, error) {
+	if s == "" {
+		return nil, nil
+	}
+
+	var shapes []config.EC2InstanceType
+	if err := json.Unmarshal([]byte(s), &shapes); err != nil {
+		return nil, fmt.Errorf("alloc: decode EC2 shapes: %w", err)
+	}
+
+	if errs := config.CheckEC2InstanceTypes(shapes); len(errs) > 0 {
+		return nil, fmt.Errorf("alloc: invalid registered EC2 shapes: %w", errors.Join(errs...))
+	}
+
+	return shapes, nil
 }
 
 // checkPlacement reports whether a lease may run on a node, under the policy in
@@ -701,10 +762,10 @@ func (a *Allocator) headroomWithPlacer(
 		return 0, nil, err
 	}
 
-	byVCPU := (a.limits.MaxVCPU - used.VCPU - owedVCPU) / t.VCPU
-	byMemory := int((a.limits.MaxMemory - used.Memory - owedMemory) / t.Memory)
+	place.deploymentVCPU = max(a.limits.MaxVCPU-used.VCPU-owedVCPU, 0)
+	place.deploymentMemory = max(a.limits.MaxMemory-used.Memory-owedMemory, 0)
 
-	n := min(byVCPU, byMemory)
+	n := place.total(t)
 
 	if t.MaxConcurrent > 0 {
 		tierUsed, err := a.countOpenByTier(ctx, tx, t.Label)
@@ -725,7 +786,7 @@ func (a *Allocator) headroomWithPlacer(
 	// operator allowed, which is what keeps a one-box install behaving as before.
 	//
 	// The per-host macOS licence lives in headroomOn.
-	return max(min(n, place.total(t)), 0), place, nil
+	return max(n, 0), place, nil
 }
 
 // Reserve escrows capacity for one instance of a tier.
@@ -752,12 +813,12 @@ func (a *Allocator) Reserve(ctx context.Context, tier string) (*Lease, error) {
 			return fmt.Errorf("%w for tier %q", ErrNoCapacity, t.Label)
 		}
 
-		target, ok := place.next(t)
+		target, cost, ok := place.next(t)
 		if !ok {
 			return fmt.Errorf("%w for tier %q", ErrNoCapacity, t.Label)
 		}
 
-		lease, err = a.insertLease(ctx, tx, t, target)
+		lease, err = a.insertLease(ctx, tx, t, target, cost)
 
 		return err
 	})
@@ -771,7 +832,7 @@ func (a *Allocator) Reserve(ctx context.Context, tier string) (*Lease, error) {
 // insertLease writes one escrowed lease. Callers must already hold a transaction
 // in which they have confirmed headroom.
 func (a *Allocator) insertLease(
-	ctx context.Context, tx *sql.Tx, t config.Tier, target string,
+	ctx context.Context, tx *sql.Tx, t config.Tier, target string, cost placementCost,
 ) (*Lease, error) {
 	id, err := newLeaseID()
 	if err != nil {
@@ -804,26 +865,31 @@ func (a *Allocator) insertLease(
 
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO leases
-		   (id, tier, node, target_node, macos_slot, guest_os, providers, phase, vcpu, memory, epoch,
-		    created_at, heartbeat_at, expires_at)
-		 VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
+		   (id, tier, node, target_node, macos_slot, guest_os, providers, phase, vcpu, memory,
+		    requested_vcpu, requested_memory, instance_type, epoch, created_at, heartbeat_at,
+		    expires_at)
+		 VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
 		id, t.Label, targetNode, macSlot, string(t.GuestOS), encodeProviders(t.AcceptableProviders()),
-		string(PhaseCapacity), t.VCPU, int64(t.Memory),
+		string(PhaseCapacity), cost.vcpu, int64(cost.memory), t.VCPU, int64(t.Memory),
+		cost.instanceType,
 		ts(now), ts(now), ts(now.Add(a.leaseTTL))); err != nil {
 		return nil, fmt.Errorf("alloc: insert lease: %w", err)
 	}
 
 	return &Lease{
-		ID:         id,
-		Tier:       t.Label,
-		TargetNode: target,
-		MacOSSlot:  macSlot == 1,
-		GuestOS:    t.GuestOS,
-		Providers:  t.AcceptableProviders(),
-		Phase:      PhaseCapacity,
-		VCPU:       t.VCPU,
-		Memory:     t.Memory,
-		Epoch:      0,
+		ID:              id,
+		Tier:            t.Label,
+		TargetNode:      target,
+		MacOSSlot:       macSlot == 1,
+		GuestOS:         t.GuestOS,
+		Providers:       t.AcceptableProviders(),
+		Phase:           PhaseCapacity,
+		VCPU:            cost.vcpu,
+		Memory:          cost.memory,
+		RequestedVCPU:   t.VCPU,
+		RequestedMemory: t.Memory,
+		InstanceType:    cost.instanceType,
+		Epoch:           0,
 	}, nil
 }
 
@@ -907,6 +973,102 @@ func (a *Allocator) recordAssignment(ctx context.Context, tx *sql.Tx, l *Lease, 
 // does not allow.
 func (a *Allocator) Advance(ctx context.Context, leaseID string, epoch int64, to Phase) error {
 	return a.transition(ctx, leaseID, epoch, to, nil)
+}
+
+// Resize authorises one EC2 shape before the node asks AWS to buy it.
+//
+// The first fitting shape is charged at escrow. A later fallback is a new
+// purchase decision, so its larger resource vector must fit atomically before
+// RunInstances is allowed onto the wire.
+func (a *Allocator) Resize(
+	ctx context.Context, leaseID string, epoch int64, instanceType string,
+	vcpu int, memory config.ByteSize,
+) error {
+	return a.db.Tx(ctx, func(tx *sql.Tx) error {
+		lease, err := a.load(ctx, tx, leaseID, epoch)
+		if err != nil {
+			return err
+		}
+
+		if lease.Phase != PhaseLaunching {
+			return fmt.Errorf("%w: lease %s is %s; an EC2 shape may change only while launching",
+				ErrBadTransition, leaseID, lease.Phase)
+		}
+
+		if lease.Provider != config.ProviderEC2 || lease.Node == "" {
+			return fmt.Errorf("%w: lease %s is on %q, not a bound EC2 node",
+				ErrWrongProvider, leaseID, lease.Provider)
+		}
+
+		var (
+			nodeVCPU   int
+			nodeMemory int64
+			encoded    string
+		)
+
+		if err := tx.QueryRowContext(ctx,
+			`SELECT total_vcpu, total_memory, ec2_shapes FROM nodes WHERE name = ?`, lease.Node).
+			Scan(&nodeVCPU, &nodeMemory, &encoded); err != nil {
+			return fmt.Errorf("alloc: read EC2 shapes for node %s: %w", lease.Node, err)
+		}
+
+		shapes, err := decodeEC2Shapes(encoded)
+		if err != nil {
+			return err
+		}
+
+		declared := false
+		for _, shape := range shapes {
+			if shape.Type == instanceType && shape.VCPU == vcpu && shape.Memory == memory {
+				declared = true
+				break
+			}
+		}
+
+		if !declared {
+			return fmt.Errorf("%w: node %s did not register EC2 shape %q (%d vCPU, %s)",
+				ErrNotPlaceable, lease.Node, instanceType, vcpu, memory)
+		}
+
+		if vcpu < lease.RequestedVCPU || memory < lease.RequestedMemory {
+			return fmt.Errorf("%w: EC2 shape %q (%d vCPU, %s) does not hold lease %s's "+
+				"requested %d vCPU and %s", ErrNotPlaceable, instanceType, vcpu, memory,
+				leaseID, lease.RequestedVCPU, lease.RequestedMemory)
+		}
+
+		if lease.InstanceType == instanceType && lease.VCPU == vcpu && lease.Memory == memory {
+			return nil
+		}
+
+		deltaVCPU := vcpu - lease.VCPU
+		deltaMemory := memory - lease.Memory
+
+		fleetUsed, err := a.usage(ctx, tx)
+		if err != nil {
+			return err
+		}
+
+		nodeUsed, err := a.usageOn(ctx, tx, lease.Node)
+		if err != nil {
+			return err
+		}
+
+		if fleetUsed.VCPU+deltaVCPU > a.limits.MaxVCPU ||
+			fleetUsed.Memory+deltaMemory > a.limits.MaxMemory ||
+			nodeUsed.VCPU+deltaVCPU > nodeVCPU ||
+			nodeUsed.Memory+deltaMemory > config.ByteSize(nodeMemory) {
+			return fmt.Errorf("%w: EC2 fallback %q needs %d vCPU and %s, which would exceed "+
+				"the node or deployment budget", ErrNoCapacity, instanceType, vcpu, memory)
+		}
+
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE leases SET vcpu = ?, memory = ?, instance_type = ? WHERE id = ? AND epoch = ?`,
+			vcpu, int64(memory), instanceType, leaseID, epoch); err != nil {
+			return fmt.Errorf("alloc: resize lease %s for EC2 shape %s: %w", leaseID, instanceType, err)
+		}
+
+		return nil
+	})
 }
 
 // Bind records which node is running a lease.
@@ -1004,17 +1166,52 @@ func (a *Allocator) Bind(ctx context.Context, leaseID string, epoch int64, node 
 // lease to Reap.
 func (a *Allocator) Heartbeat(ctx context.Context, leaseID string, epoch int64) error {
 	return a.db.Tx(ctx, func(tx *sql.Tx) error {
-		if _, err := a.load(ctx, tx, leaseID, epoch); err != nil {
+		lease, err := a.load(ctx, tx, leaseID, epoch)
+		if err != nil {
 			return err
+		}
+		if lease.ForceRelease {
+			return fmt.Errorf("%w: lease %s on node %s", ErrForceRelease, leaseID, lease.Node)
 		}
 
 		now := a.now().UTC()
 
-		_, err := tx.ExecContext(ctx,
+		_, err = tx.ExecContext(ctx,
 			`UPDATE leases SET heartbeat_at = ?, expires_at = ? WHERE id = ? AND epoch = ?`,
 			ts(now), ts(now.Add(a.leaseTTL)), leaseID, epoch)
 
 		return err
+	})
+}
+
+// MarkFailure records why a still-open lease is destined to fail.
+//
+// Separate from Release because the fact often arrives before compute is gone,
+// and capacity must remain charged throughout that interval.
+func (a *Allocator) MarkFailure(ctx context.Context, leaseID string, epoch int64, reason string) error {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return errors.New("alloc: a failure reason must not be empty")
+	}
+
+	return a.db.Tx(ctx, func(tx *sql.Tx) error {
+		lease, err := a.load(ctx, tx, leaseID, epoch)
+		if err != nil {
+			return err
+		}
+		if lease.FailureReason != "" && lease.FailureReason != reason {
+			return fmt.Errorf("%w: lease %s already records failure reason %q, cannot replace it with %q",
+				ErrConflict, leaseID, lease.FailureReason, reason)
+		}
+
+		_, err = tx.ExecContext(ctx,
+			`UPDATE leases SET failure_reason = ? WHERE id = ? AND epoch = ?`,
+			reason, leaseID, epoch)
+		if err != nil {
+			return fmt.Errorf("alloc: record failure reason for lease %s: %w", leaseID, err)
+		}
+
+		return nil
 	})
 }
 
@@ -1074,6 +1271,9 @@ type NodeRegistration struct {
 	// what it has — see config.NodeConfig.Contribution.
 	VCPU   int
 	Memory config.ByteSize
+	// EC2Shapes are the ordered shapes this node may buy. Empty for a backend
+	// that runs work on its own host.
+	EC2Shapes []config.EC2InstanceType
 }
 
 // RegisterNode records a host and what it runs, so leases can be placed on it.
@@ -1114,9 +1314,31 @@ func (a *Allocator) RegisterNode(ctx context.Context, reg NodeRegistration) (int
 			"can never be given work", name, reg.Memory)
 	}
 
+	shapes := slices.Clone(reg.EC2Shapes)
+	for i := range shapes {
+		shapes[i].Type = strings.TrimSpace(shapes[i].Type)
+	}
+
+	switch kind {
+	case config.ProviderEC2:
+		if errs := config.CheckEC2InstanceTypes(shapes); len(errs) > 0 {
+			return 0, fmt.Errorf("alloc: node %s reported an invalid EC2 shape catalogue: %w",
+				name, errors.Join(errs...))
+		}
+	default:
+		if len(shapes) > 0 {
+			return 0, fmt.Errorf("alloc: node %s runs %s but reported EC2 shapes", name, kind)
+		}
+	}
+
+	encodedShapes, err := encodeEC2Shapes(shapes)
+	if err != nil {
+		return 0, err
+	}
+
 	var epoch int64
 
-	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+	err = a.db.Tx(ctx, func(tx *sql.Tx) error {
 		now := ts(a.now().UTC())
 
 		// A HOST MAY NOT CHANGE ITS BACKEND WHILE IT IS RUNNING WORK.
@@ -1129,12 +1351,15 @@ func (a *Allocator) RegisterNode(ctx context.Context, reg NodeRegistration) (int
 		// Rewriting chosen_provider instead would be worse: it relabels compute
 		// that is already running. So this is refused, and the operator's route is
 		// to drain the host and re-register it. An unbound node changes freely.
-		var current, currentSite string
+		var current, currentSite, currentShapes string
+		existed := true
 
 		switch err := tx.QueryRowContext(ctx,
-			`SELECT provider, site FROM nodes WHERE name = ?`, name).Scan(&current, &currentSite); {
+			`SELECT provider, site, ec2_shapes FROM nodes WHERE name = ?`, name).
+			Scan(&current, &currentSite, &currentShapes); {
 		case errors.Is(err, sql.ErrNoRows):
 			// First registration; nothing to contradict.
+			existed = false
 		case err != nil:
 			return fmt.Errorf("alloc: read node %s: %w", name, err)
 
@@ -1173,7 +1398,7 @@ func (a *Allocator) RegisterNode(ctx context.Context, reg NodeRegistration) (int
 				`SELECT COUNT(*) FROM leases
 				 WHERE COALESCE(node, target_node) = ?
 				   AND phase NOT IN ('done','failed')
-				   AND (phase IN ('launching','online','busy','quarantine') OR expires_at > ?)`,
+				   AND (phase IN ('launching','online','busy','custody','teardown','quarantine') OR expires_at > ?)`,
 				name, now).Scan(&outstanding); err != nil {
 				return fmt.Errorf("alloc: count the leases on node %s: %w", name, err)
 			}
@@ -1194,7 +1419,7 @@ func (a *Allocator) RegisterNode(ctx context.Context, reg NodeRegistration) (int
 				`SELECT COUNT(*) FROM leases
 				 WHERE COALESCE(node, target_node) = ?
 				   AND phase NOT IN ('done','failed')
-				   AND (phase IN ('launching','online','busy','quarantine') OR expires_at > ?)`,
+				   AND (phase IN ('launching','online','busy','custody','teardown','quarantine') OR expires_at > ?)`,
 				name, now).Scan(&outstanding); err != nil {
 				return fmt.Errorf("alloc: count the leases on node %s: %w", name, err)
 			}
@@ -1215,6 +1440,26 @@ func (a *Allocator) RegisterNode(ctx context.Context, reg NodeRegistration) (int
 			}
 		}
 
+		if existed && currentShapes != encodedShapes {
+			var outstanding int
+
+			if err := tx.QueryRowContext(ctx,
+				`SELECT COUNT(*) FROM leases
+				 WHERE COALESCE(node, target_node) = ?
+				   AND phase NOT IN ('done','failed')
+				   AND (phase IN ('launching','online','busy','custody','teardown','quarantine') OR expires_at > ?)`,
+				name, now).Scan(&outstanding); err != nil {
+				return fmt.Errorf("alloc: count the leases on node %s: %w", name, err)
+			}
+
+			if outstanding > 0 {
+				return fmt.Errorf(
+					"alloc: node %s changed its EC2 shape catalogue while %d lease(s) are still "+
+						"outstanding; restore the old ordered instance_types until they finish",
+					name, outstanding)
+			}
+		}
+
 		// CAPACITY AND SITE ARE OVERWRITTEN ON EVERY REGISTRATION, unlike the provider
 		// above: a host that comes back offering less has been reconfigured, and leases
 		// already open keep their capacity charged, so the only effect is that no new work
@@ -1225,18 +1470,21 @@ func (a *Allocator) RegisterNode(ctx context.Context, reg NodeRegistration) (int
 		// actually went. RETURNING makes that one statement rather than a write and a
 		// hopeful read.
 		if err := tx.QueryRowContext(ctx,
-			`INSERT INTO nodes (name, provider, site, total_vcpu, total_memory, last_seen_at, live)
-			 VALUES (?, ?, ?, ?, ?, ?, 1)
+			`INSERT INTO nodes
+			   (name, provider, site, total_vcpu, total_memory, ec2_shapes, last_seen_at, live)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, 1)
 			 ON CONFLICT (name) DO UPDATE SET
 			   provider     = excluded.provider,
 			   site         = excluded.site,
 			   total_vcpu   = excluded.total_vcpu,
 			   total_memory = excluded.total_memory,
+			   ec2_shapes   = excluded.ec2_shapes,
 			   last_seen_at = excluded.last_seen_at,
 			   live         = 1,
 			   epoch        = nodes.epoch + 1
 			 RETURNING epoch`,
-			name, string(kind), reg.Site, reg.VCPU, int64(reg.Memory), now).Scan(&epoch); err != nil {
+			name, string(kind), reg.Site, reg.VCPU, int64(reg.Memory), encodedShapes, now).
+			Scan(&epoch); err != nil {
 			return fmt.Errorf("alloc: register node %s: %w", name, err)
 		}
 
@@ -1317,8 +1565,11 @@ func (a *Allocator) Reap(ctx context.Context) (int, error) {
 			}
 
 			if _, err := tx.ExecContext(ctx,
-				`UPDATE leases SET phase = ?, epoch = epoch + 1 WHERE id = ? AND epoch = ?`,
-				string(to), l.ID, l.Epoch); err != nil {
+				`UPDATE leases
+				    SET phase = ?, epoch = epoch + 1,
+				        held_at = CASE WHEN ? = ? AND held_at = '' THEN ? ELSE held_at END
+				  WHERE id = ? AND epoch = ?`,
+				string(to), string(to), string(PhaseQuarantine), ts(now), l.ID, l.Epoch); err != nil {
 				return fmt.Errorf("alloc: reap lease %s: %w", l.ID, err)
 			}
 
@@ -1371,7 +1622,9 @@ func readExpiredLeases(ctx context.Context, tx *sql.Tx, cutoff string, limit int
 	// Ordered and LIMITed so one transaction cannot hold the single writer connection
 	// while it drains an arbitrarily large backlog.
 	rows, err := tx.QueryContext(ctx,
-		`SELECT id, tier, node, target_node, macos_slot, phase, vcpu, memory, epoch, run_id, request_id
+		`SELECT id, tier, node, target_node, macos_slot, phase, vcpu, memory,
+		        requested_vcpu, requested_memory, instance_type, held_at, force_release,
+		        failure_reason, epoch, run_id, request_id
 		   FROM leases
 		  WHERE phase NOT IN ('done','failed','quarantine') AND expires_at <= ?
 		  ORDER BY expires_at
@@ -1385,23 +1638,29 @@ func readExpiredLeases(ctx context.Context, tx *sql.Tx, cutoff string, limit int
 
 	for rows.Next() {
 		var (
-			l          Lease
-			node       sql.NullString
-			targetNode sql.NullString
-			macSlot    int
-			mem        int64
-			ph         string
-			runID      sql.NullInt64
-			requestID  sql.NullInt64
+			l               Lease
+			node            sql.NullString
+			targetNode      sql.NullString
+			macSlot         int
+			mem             int64
+			requestedMemory int64
+			ph              string
+			runID           sql.NullInt64
+			requestID       sql.NullInt64
+			forceRelease    int
 		)
 
 		if err := rows.Scan(&l.ID, &l.Tier, &node, &targetNode, &macSlot, &ph,
-			&l.VCPU, &mem, &l.Epoch, &runID, &requestID); err != nil {
+			&l.VCPU, &mem, &l.RequestedVCPU, &requestedMemory, &l.InstanceType,
+			&l.HeldSince, &forceRelease, &l.FailureReason,
+			&l.Epoch, &runID, &requestID); err != nil {
 			return nil, fmt.Errorf("alloc: scan expired lease: %w", err)
 		}
 
 		l.Node, l.TargetNode = node.String, targetNode.String
 		l.MacOSSlot, l.Phase, l.Memory = macSlot == 1, Phase(ph), config.ByteSize(mem)
+		l.RequestedMemory = config.ByteSize(requestedMemory)
+		l.ForceRelease = forceRelease == 1
 		l.RunID, l.RequestID = runID.Int64, requestID.Int64
 		expired = append(expired, l)
 	}
@@ -1496,10 +1755,15 @@ func (a *Allocator) transition(ctx context.Context, leaseID string, epoch int64,
 		}
 
 		now := a.now().UTC()
+		heldAt := lease.HeldSince
+		if heldAt == "" && (to == PhaseCustody || to == PhaseTeardown) {
+			heldAt = ts(now)
+		}
 
 		if _, err := tx.ExecContext(ctx,
-			`UPDATE leases SET phase = ?, heartbeat_at = ?, expires_at = ? WHERE id = ? AND epoch = ?`,
-			string(to), ts(now), ts(now.Add(a.leaseTTL)), leaseID, epoch); err != nil {
+			`UPDATE leases SET phase = ?, held_at = ?, heartbeat_at = ?, expires_at = ?
+			  WHERE id = ? AND epoch = ?`,
+			string(to), heldAt, ts(now), ts(now.Add(a.leaseTTL)), leaseID, epoch); err != nil {
 			return fmt.Errorf("alloc: advance lease %s: %w", leaseID, err)
 		}
 
@@ -1539,26 +1803,31 @@ func (a *Allocator) load(ctx context.Context, tx *sql.Tx, leaseID string, epoch 
 // idempotency — they must be able to see that a lease already finished, and how.
 func (a *Allocator) loadAny(ctx context.Context, tx querier, leaseID string, epoch int64) (*Lease, error) {
 	var (
-		l          Lease
-		node       sql.NullString
-		targetNode sql.NullString
-		macSlot    int
-		guestOS    string
-		providers  string
-		chosen     string
-		mem        int64
-		ph         string
-		runID      sql.NullInt64
-		requestID  sql.NullInt64
-		curEpoch   int64
+		l               Lease
+		node            sql.NullString
+		targetNode      sql.NullString
+		macSlot         int
+		guestOS         string
+		providers       string
+		chosen          string
+		mem             int64
+		requestedMemory int64
+		ph              string
+		runID           sql.NullInt64
+		requestID       sql.NullInt64
+		curEpoch        int64
+		forceRelease    int
 	)
 
 	err := tx.QueryRowContext(ctx,
 		`SELECT id, tier, node, target_node, macos_slot, guest_os, providers, chosen_provider,
-		        phase, vcpu, memory, epoch, run_id, request_id
+		        phase, vcpu, memory, requested_vcpu, requested_memory, instance_type,
+		        held_at, force_release, failure_reason, epoch, run_id, request_id
 		   FROM leases WHERE id = ?`, leaseID).
 		Scan(&l.ID, &l.Tier, &node, &targetNode, &macSlot, &guestOS, &providers, &chosen,
-			&ph, &l.VCPU, &mem, &curEpoch, &runID, &requestID)
+			&ph, &l.VCPU, &mem, &l.RequestedVCPU, &requestedMemory, &l.InstanceType,
+			&l.HeldSince, &forceRelease, &l.FailureReason,
+			&curEpoch, &runID, &requestID)
 
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
@@ -1575,6 +1844,8 @@ func (a *Allocator) loadAny(ctx context.Context, tx querier, leaseID string, epo
 
 	l.Node, l.TargetNode = node.String, targetNode.String
 	l.MacOSSlot, l.Phase, l.Memory = macSlot == 1, Phase(ph), config.ByteSize(mem)
+	l.RequestedMemory = config.ByteSize(requestedMemory)
+	l.ForceRelease = forceRelease == 1
 	l.GuestOS = config.GuestOS(guestOS)
 	l.Providers, l.Provider = decodeProviders(providers), config.ProviderKind(chosen)
 	l.Epoch, l.RunID, l.RequestID = curEpoch, runID.Int64, requestID.Int64
@@ -1664,7 +1935,7 @@ func (a *Allocator) Lease(ctx context.Context, leaseID string) (*Lease, error) {
 // does not own, and a set containing every node's leases would let a bug on one
 // host spare an orphan on another.
 //
-// LAUNCHING, ONLINE and BUSY — not merely "not terminal". A lease in the
+// LAUNCHING, ONLINE, BUSY, CUSTODY and TEARDOWN — not merely "not terminal". A lease in the
 // capacity or assigned phase has nothing running for it by construction, because
 // the launch path commits Bind and Advance(launching) before it asks a provider
 // to create anything. Including those phases would spare an instance that no
@@ -1679,8 +1950,8 @@ func (a *Allocator) LaunchedLeaseIDs(ctx context.Context, node string) (map[stri
 
 	err := a.db.View(ctx, func(tx querier) error {
 		rows, err := tx.QueryContext(ctx,
-			`SELECT id FROM leases WHERE node = ? AND phase IN (?,?,?)`,
-			node, PhaseLaunching, PhaseOnline, PhaseBusy)
+			`SELECT id FROM leases WHERE node = ? AND phase IN (?,?,?,?,?)`,
+			node, PhaseLaunching, PhaseOnline, PhaseBusy, PhaseCustody, PhaseTeardown)
 		if err != nil {
 			return fmt.Errorf("alloc: list open leases on %s: %w", node, err)
 		}
@@ -1952,6 +2223,27 @@ func (a *Allocator) HistoryOutcome(ctx context.Context, leaseID string) (string,
 	return conclusion, nil
 }
 
+// HistoryFailureReason reports the durable explanation attached to a finished
+// lease. An empty string means no external failure was recorded.
+func (a *Allocator) HistoryFailureReason(ctx context.Context, leaseID string) (string, error) {
+	var reason string
+
+	err := a.db.View(ctx, func(tx querier) error {
+		err := tx.QueryRowContext(ctx,
+			`SELECT failure_reason FROM job_history WHERE lease_id = ?`, leaseID).Scan(&reason)
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: %s has not been archived", ErrLeaseNotFound, leaseID)
+		}
+		if err != nil {
+			return fmt.Errorf("alloc: read job history reason for %s: %w", leaseID, err)
+		}
+
+		return nil
+	})
+
+	return reason, err
+}
+
 // archive copies a finished lease into job_history before its row stops being
 // interesting, so "why did this queue" is answerable after the fact.
 func (a *Allocator) archive(ctx context.Context, tx *sql.Tx, l *Lease, outcome Phase) error {
@@ -1963,15 +2255,17 @@ func (a *Allocator) archive(ctx context.Context, tx *sql.Tx, l *Lease, outcome P
 	// A caller that does not select the ids — Reap — would otherwise arrive with
 	// NULLs and wipe real attribution from the leases most worth investigating.
 	_, err := tx.ExecContext(ctx,
-		`INSERT INTO job_history (lease_id, tier, node, run_id, request_id, conclusion, queued_at, finished_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO job_history (lease_id, tier, node, run_id, request_id, conclusion, failure_reason, queued_at, finished_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT (lease_id) DO UPDATE SET
 		   conclusion  = excluded.conclusion,
+		   failure_reason = excluded.failure_reason,
 		   finished_at = excluded.finished_at,
 		   node        = COALESCE(excluded.node, job_history.node),
 		   run_id      = COALESCE(excluded.run_id, job_history.run_id),
 		   request_id      = COALESCE(excluded.request_id, job_history.request_id)`,
-		l.ID, l.Tier, node, nullableID(l.RunID), nullableID(l.RequestID), string(outcome), ts(now), ts(now))
+		l.ID, l.Tier, node, nullableID(l.RunID), nullableID(l.RequestID), string(outcome),
+		l.FailureReason, ts(now), ts(now))
 	if err != nil {
 		return fmt.Errorf("alloc: archive lease %s: %w", l.ID, err)
 	}

@@ -264,8 +264,9 @@ type Registration struct {
 	Deployment string
 	Site       string
 	// VCPU and Memory are what this host contributes.
-	VCPU   int
-	Memory config.ByteSize
+	VCPU      int
+	Memory    config.ByteSize
+	EC2Shapes []config.EC2InstanceType
 	// Instances are the lease ids this host is actually running, and
 	// InventoryKnown says the list is complete rather than absent. See
 	// nodeapi.RegisterRequest.
@@ -289,6 +290,7 @@ func (c *Client) Register(ctx context.Context, reg Registration) error {
 		Site:           reg.Site,
 		VCPU:           reg.VCPU,
 		Memory:         reg.Memory,
+		EC2Shapes:      reg.EC2Shapes,
 	}, &res)
 	if err != nil {
 		return err
@@ -413,6 +415,23 @@ func (c *Client) Advance(ctx context.Context, leaseID string, epoch int64, to al
 func (c *Client) Heartbeat(ctx context.Context, leaseID string, epoch int64) error {
 	return c.do(ctx, http.MethodPost, c.leasePath(leaseID, "/heartbeat"),
 		nodeapi.HeartbeatRequest{Epoch: epoch}, nil)
+}
+
+// MarkFailure records why a running lease is destined to fail before teardown.
+func (c *Client) MarkFailure(ctx context.Context, leaseID string, epoch int64, reason string) error {
+	return c.do(ctx, http.MethodPost, c.leasePath(leaseID, "/failure"),
+		nodeapi.MarkFailureRequest{Epoch: epoch, Reason: reason}, nil)
+}
+
+// Resize changes an EC2 lease's charged shape before the provider attempts it.
+func (c *Client) Resize(
+	ctx context.Context, leaseID string, epoch int64, instanceType string,
+	vcpu int, memory config.ByteSize,
+) error {
+	return c.do(ctx, http.MethodPost, c.leasePath(leaseID, "/resize"),
+		nodeapi.ResizeRequest{
+			Epoch: epoch, InstanceType: instanceType, VCPU: vcpu, Memory: memory,
+		}, nil)
 }
 
 // Release ends a lease with a terminal outcome.
@@ -667,6 +686,10 @@ func (c *Client) decodeErr(resp *http.Response) error {
 		return fmt.Errorf("%w: %s", alloc.ErrFenced, body.Message)
 	case nodeapi.CodeNotFound:
 		return fmt.Errorf("%w: %s", alloc.ErrLeaseNotFound, body.Message)
+	case nodeapi.CodeNoCapacity:
+		return fmt.Errorf("%w: %s", alloc.ErrNoCapacity, body.Message)
+	case nodeapi.CodeForceRelease:
+		return fmt.Errorf("%w: %s", alloc.ErrForceRelease, body.Message)
 	case nodeapi.CodeUnregistered:
 		return fmt.Errorf("%w: %s", ErrUnregistered, body.Message)
 	default:

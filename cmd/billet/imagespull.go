@@ -30,7 +30,8 @@ import (
 // is also what the FHS says it is for.
 const DefaultStagingDir = "/var/tmp/billet-images"
 
-// DefaultKernelDir is where pulled kernels are kept.
+// DefaultKernelDir is kept as the CLI package's name for the shared config
+// default. Image pull, verification, and provider launch must resolve one place.
 //
 // DURABLE, UNLIKE THE STAGING DIRECTORY. The kernel and the root filesystem are a
 // matched pair -- a generation booted with a different kernel fails in the middle
@@ -41,7 +42,7 @@ const DefaultStagingDir = "/var/tmp/billet-images"
 // directory, which is removed when the pull finishes. It told the operator to
 // point node.firecracker.kernel_image at a file it had just deleted. Found by
 // running it against a real cluster; nothing in the code could have said so.
-const DefaultKernelDir = "/var/lib/billet/kernels"
+const DefaultKernelDir = config.DefaultKernelDir
 
 // cmdImagesPull fetches a published guest image and publishes it as a generation.
 //

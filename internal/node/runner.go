@@ -12,11 +12,13 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"runtime"
 	"slices"
 	"sync"
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/provider"
 	"github.com/junioryono/billet/internal/server"
@@ -65,6 +67,9 @@ type LeaseStore interface {
 	Bind(ctx context.Context, leaseID string, epoch int64, node string) error
 	Advance(ctx context.Context, leaseID string, epoch int64, to alloc.Phase) error
 	Heartbeat(ctx context.Context, leaseID string, epoch int64) error
+	MarkFailure(ctx context.Context, leaseID string, epoch int64, reason string) error
+	Resize(ctx context.Context, leaseID string, epoch int64, instanceType string,
+		vcpu int, memory config.ByteSize) error
 	Release(ctx context.Context, leaseID string, epoch int64, outcome alloc.Phase) error
 	Lease(ctx context.Context, leaseID string) (*alloc.Lease, error)
 	LaunchedLeaseIDs(ctx context.Context, node string) (map[string]bool, error)
@@ -81,15 +86,20 @@ type LeaseStore interface {
 
 // Runner starts and stops the compute for assigned leases.
 type Runner struct {
-	jit      JITSource
-	provider provider.Provider
-	alloc    LeaseStore
-	log      *slog.Logger
+	jit             JITSource
+	provider        provider.Provider
+	alloc           LeaseStore
+	log             *slog.Logger
+	cache           *CacheService
+	registryMirrors config.RegistryMirrors
 
 	// tending serializes Tend, which mutates custody entries in place and issues
 	// backend calls between reads. Separate from mu, which guards the map itself
 	// for the brief moments it is read or written.
 	tending sync.Mutex
+	// lifecycle serializes a normal completion with an external interruption for
+	// the same instance. Whichever records the outcome first owns it.
+	lifecycle sync.Mutex
 
 	// custody holds leases whose compute is unaccounted for, keyed by lease id.
 	// See custody.go — it is what stops a launch failure or a restart from
@@ -157,6 +167,16 @@ type Option func(*Runner)
 // worse than one that was never claimed.
 func WithMaxCustody(d time.Duration) Option {
 	return func(r *Runner) { r.maxCustody = d }
+}
+
+// WithCacheService gives Firecracker guests the node-local sticky-disk endpoint.
+func WithCacheService(cache *CacheService) Option {
+	return func(r *Runner) { r.cache = cache }
+}
+
+// WithRegistryMirrors gives managed guests their site's public pull-through caches.
+func WithRegistryMirrors(mirrors config.RegistryMirrors) Option {
+	return func(r *Runner) { r.registryMirrors = mirrors }
 }
 
 // New builds a runner over a provider.
@@ -311,6 +331,28 @@ func (r *Runner) Launch(
 		return fmt.Errorf("node: mint a registration for %s: %w", name, err)
 	}
 
+	cacheEndpoint, cacheToken := "", ""
+	var buildKitCacheMountLimit config.ByteSize
+	var cacheVolumes []provider.VolumeMount
+	if r.cache != nil {
+		cacheToken, err = r.cache.Prepare(name, trust)
+		if err != nil {
+			return fmt.Errorf("node: prepare cache access for %s: %w", name, err)
+		}
+
+		cacheEndpoint = r.cache.Endpoint()
+		buildKitCacheMountLimit = tier.BuildKitCacheMountLimit
+		if r.provider.Kind() == config.ProviderFirecracker {
+			volume, cacheErr := r.cache.PrepareDockerStore(ctx, name, runtime.GOARCH)
+			if cacheErr != nil {
+				r.log.Warn("the Docker image cache is unavailable; this job will continue cold",
+					"instance", name, "error", cacheErr)
+			} else {
+				cacheVolumes = []provider.VolumeMount{volume}
+			}
+		}
+	}
+
 	inst, err := r.provider.Launch(ctx, provider.Spec{
 		// BILLET's name, not GitHub's. reg.RunnerName() is what GitHub called the
 		// runner, and using it here would have left the instance carrying a name
@@ -328,8 +370,19 @@ func (r *Runner) Launch(
 		// from 2 vCPU to 16 would start a 16-vCPU guest against 2 vCPU of
 		// reservation, and enough of those physically over-commit the machine
 		// while every ledger total still balances.
-		VCPU:   lease.VCPU,
-		Memory: lease.Memory,
+		VCPU:         lease.RequestedVCPU,
+		Memory:       lease.RequestedMemory,
+		InstanceType: lease.InstanceType,
+		AuthorizeShape: func(ctx context.Context, instanceType string, vcpu int,
+			memory config.ByteSize,
+		) (bool, error) {
+			err := r.alloc.Resize(ctx, lease.ID, lease.Epoch, instanceType, vcpu, memory)
+			if errors.Is(err, alloc.ErrNoCapacity) {
+				return false, nil
+			}
+
+			return err == nil, err
+		},
 
 		// Disk, SHM and image come from the CATALOGUE, deliberately, and the
 		// distinction is what the ledger accounts for. Billet's budget is vCPU and
@@ -347,7 +400,12 @@ func (r *Runner) Launch(
 		// recognise cannot run anywhere weak by default.
 		Trust: trust,
 
-		JITConfig: reg.Config(),
+		JITConfig:               reg.Config(),
+		CacheEndpoint:           cacheEndpoint,
+		CacheToken:              cacheToken,
+		BuildKitCacheMountLimit: buildKitCacheMountLimit,
+		RegistryMirrors:         r.registryMirrors,
+		Volumes:                 cacheVolumes,
 
 		// What actually starts the runner. Backends refuse an empty command
 		// because a container image's default is a shell, which exits at once and
@@ -370,6 +428,8 @@ func (r *Runner) Launch(
 
 			return errCustody(name, errors.Join(err, cleanupErr))
 		}
+
+		r.cleanupCache(ctx, name)
 
 		return fmt.Errorf("node: start %s: %w", name, err)
 	}
@@ -395,6 +455,13 @@ func (r *Runner) Launch(
 // Idempotent: a request nothing was started for is success, because this runs on
 // redelivered completions, on shutdown, and after a failure.
 func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
+	r.lifecycle.Lock()
+	defer r.lifecycle.Unlock()
+
+	return r.destroy(ctx, requestID)
+}
+
+func (r *Runner) destroy(ctx context.Context, requestID int64) error {
 	// BOTH ARE ATTEMPTED, whatever either of them does. A request can have compute in
 	// the running map AND a custody entry — a redelivered assignment after a crash
 	// produces exactly that — and returning on the first error leaves the other half
@@ -524,6 +591,140 @@ func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
 		return fmt.Errorf("%w: %s was asked to stop and has not been confirmed gone",
 			server.ErrCustody, inst.Name)
 	}
+
+	r.cleanupCache(ctx, inst.Name)
+
+	return nil
+}
+
+func (r *Runner) cleanupCache(ctx context.Context, instance string) {
+	if r.cache == nil {
+		return
+	}
+
+	if err := r.cache.Cleanup(ctx, instance); err != nil {
+		r.log.Warn("compute stopped but its cache clones could not all be discarded; cleanup will retry",
+			"instance", instance, "error", err)
+	}
+}
+
+// WatchInterruptions consumes provider reclaim warnings until the context ends.
+func (r *Runner) WatchInterruptions(ctx context.Context) {
+	source, ok := r.provider.(provider.InterruptionSource)
+	if !ok {
+		return
+	}
+
+	for ctx.Err() == nil {
+		notice, err := source.NextInterruption(ctx)
+		if err != nil {
+			if ctx.Err() == nil {
+				r.log.Error("could not read provider interruption warnings; retrying", "error", err)
+				timer := time.NewTimer(time.Second)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+				case <-timer.C:
+				}
+			}
+			continue
+		}
+		if notice == nil {
+			continue
+		}
+
+		if err := r.handleInterruption(ctx, notice); err != nil {
+			r.log.Error("could not act on a provider interruption warning; leaving it for retry",
+				"instance", notice.InstanceID, "action", notice.Action, "error", err)
+			continue
+		}
+		if err := source.AcknowledgeInterruption(ctx, notice); err != nil && ctx.Err() == nil {
+			r.log.Warn("acted on a provider interruption warning but could not acknowledge it; "+
+				"a duplicate is harmless", "instance", notice.InstanceID, "error", err)
+		}
+	}
+}
+
+func (r *Runner) handleInterruption(ctx context.Context, notice *provider.InterruptionNotice) error {
+	if notice.Problem != "" {
+		r.log.Error("discarding an unusable provider interruption message", "problem", notice.Problem)
+
+		return nil
+	}
+
+	r.lifecycle.Lock()
+	defer r.lifecycle.Unlock()
+
+	r.mu.Lock()
+	var (
+		requestID int64
+		lease     *alloc.Lease
+		inst      *provider.Instance
+	)
+	for id, candidate := range r.running {
+		if candidate.ID == notice.InstanceID {
+			requestID, inst, lease = id, candidate, r.runningLease[id]
+			break
+		}
+	}
+	r.mu.Unlock()
+
+	reason := "ec2 spot interruption: " + notice.Action
+	if lease != nil {
+		if err := r.alloc.MarkFailure(ctx, lease.ID, lease.Epoch, reason); err != nil {
+			return fmt.Errorf("node: record interruption of lease %s: %w", lease.ID, err)
+		}
+
+		r.mu.Lock()
+		delete(r.running, requestID)
+		delete(r.runningLease, requestID)
+		entry := &custody{
+			leaseID:  lease.ID,
+			name:     inst.Name,
+			instance: inst.ID,
+
+			requestID: requestID,
+			outcome:   alloc.PhaseFailed,
+			phase:     alloc.PhaseTeardown,
+			discard:   true,
+			observed:  true,
+			since:     r.now(),
+		}
+		entry.epoch.Store(lease.Epoch)
+		entry.unconfirmed.Store(true)
+		r.custody[lease.ID] = entry
+		r.mu.Unlock()
+
+		r.log.Warn("provider will reclaim a running job; recording the reason and starting teardown",
+			"instance", notice.InstanceID, "lease", lease.ID, "request", requestID,
+			"action", notice.Action)
+
+		return r.Tend(ctx)
+	}
+
+	// Recovery may already have moved the instance into custody. A warning for a
+	// normal teardown must not rewrite a completed job as failed.
+	r.tending.Lock()
+	defer r.tending.Unlock()
+
+	for _, entry := range r.custodySnapshot() {
+		if entry.instance != notice.InstanceID || entry.discard {
+			continue
+		}
+		if err := r.alloc.MarkFailure(ctx, entry.leaseID, entry.epoch.Load(), reason); err != nil {
+			return fmt.Errorf("node: record interruption of held lease %s: %w", entry.leaseID, err)
+		}
+		entry.discard = true
+		entry.outcome = alloc.PhaseFailed
+		if entry.phase != "" {
+			entry.phase = alloc.PhaseTeardown
+		}
+
+		return r.tendOne(ctx, entry)
+	}
+
+	r.log.Info("ignoring an interruption warning for compute this node does not hold",
+		"instance", notice.InstanceID, "action", notice.Action)
 
 	return nil
 }

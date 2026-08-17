@@ -1,0 +1,49 @@
+name: billet setup Docker builder
+description: Start an isolated BuildKit daemon whose complete state lives on a billet sticky disk.
+inputs:
+  cache-key:
+    description: Cache identity, normally the Dockerfile path prefixed by github.repository.
+    required: false
+    default: Dockerfile
+  cache-size-gb:
+    description: Sticky-disk size on first creation.
+    required: false
+    default: "100"
+  buildkit-image:
+    description: Pinned BuildKit image to run inside the microVM.
+    required: false
+    default: moby/buildkit:buildx-stable-1
+  reset:
+    description: Delete this key's existing BuildKit state before starting and publish a fresh baseline.
+    required: false
+    default: "false"
+outputs:
+  name:
+    description: Name of the selected buildx builder.
+    value: ${{ steps.start.outputs.name }}
+runs:
+  using: composite
+  steps:
+    - name: Attach persistent BuildKit state
+      uses: junioryono/billet/actions/stickydisk@v1
+      with:
+        key: ${{ github.repository }}-buildkit-${{ inputs.cache-key }}-${{ runner.arch }}
+        path: ${{ runner.temp }}/billet-buildkit-state
+        size-gb: ${{ inputs.cache-size-gb }}
+        publication: last-write-wins
+        discard-marker: ${{ runner.temp }}/billet-buildkit-discard
+    - name: Start isolated BuildKit
+      id: start
+      shell: bash
+      env:
+        BILLET_BUILDKIT_IMAGE: ${{ inputs.buildkit-image }}
+        BILLET_BUILDKIT_RESET: ${{ inputs.reset }}
+      run: "${{ github.action_path }}/start.sh"
+    - name: Register BuildKit cleanup
+      uses: junioryono/billet/actions/stop-docker-builder@v1
+      with:
+        container: ${{ steps.start.outputs.container }}
+        builder: ${{ steps.start.outputs.name }}
+        state-path: ${{ runner.temp }}/billet-buildkit-state
+        mount-limit-bytes: ${{ env.BILLET_BUILDKIT_CACHE_MOUNT_LIMIT_BYTES }}
+        discard-marker: ${{ runner.temp }}/billet-buildkit-discard

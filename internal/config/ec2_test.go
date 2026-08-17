@@ -44,6 +44,7 @@ const ec2Block = `  ec2:
       - type: c7i.2xlarge
         vcpu: 8
         memory: 16GiB
+        price_usd_per_hour: 0.34
 `
 
 // cloudConfig is validConfig with its node replaced by a cloud one, optionally
@@ -193,7 +194,8 @@ func TestARegionIsCheckedForShape(t *testing.T) {
 func TestACloudNodeMustDeclareTheShapesItMayBuy(t *testing.T) {
 	for name, tc := range map[string]struct{ old, new, want string }{
 		"no types at all": {
-			old:  "    instance_types:\n      - type: c7i.2xlarge\n        vcpu: 8\n        memory: 16GiB\n",
+			old: "    instance_types:\n      - type: c7i.2xlarge\n        vcpu: 8\n" +
+				"        memory: 16GiB\n        price_usd_per_hour: 0.34\n",
 			want: "instance_types",
 		},
 		"a shape with no name": {
@@ -209,9 +211,12 @@ func TestACloudNodeMustDeclareTheShapesItMayBuy(t *testing.T) {
 			want: "memory",
 		},
 		"the same shape twice": {
-			old: "      - type: c7i.2xlarge\n        vcpu: 8\n        memory: 16GiB\n",
+			old: "      - type: c7i.2xlarge\n        vcpu: 8\n        memory: 16GiB\n" +
+				"        price_usd_per_hour: 0.34\n",
 			new: "      - type: c7i.2xlarge\n        vcpu: 8\n        memory: 16GiB\n" +
-				"      - type: c7i.2xlarge\n        vcpu: 8\n        memory: 16GiB\n",
+				"        price_usd_per_hour: 0.34\n" +
+				"      - type: c7i.2xlarge\n        vcpu: 8\n        memory: 16GiB\n" +
+				"        price_usd_per_hour: 0.34\n",
 			want: "listed twice",
 		},
 	} {
@@ -252,8 +257,130 @@ func TestAValidCloudNodeLoads(t *testing.T) {
 	}
 
 	if got := cfg.Node.EC2.InstanceTypes[0]; got.Type != "c7i.2xlarge" ||
-		got.VCPU != 8 || got.Memory != 16*GiB {
-		t.Errorf("instance type = %+v, want c7i.2xlarge/8/16GiB", got)
+		got.VCPU != 8 || got.Memory != 16*GiB || got.PriceUSDPerHour != 340_000 {
+		t.Errorf("instance type = %+v, want c7i.2xlarge/8/16GiB/$0.34", got)
+	}
+}
+
+func TestACloudNodeMayConfigureItsSitesEBSAndS3Store(t *testing.T) {
+	t.Parallel()
+
+	body := cloudConfig(t, "  provider: ec2\n", `  provider: ec2
+  site: aws-us-west-2
+  ebs_s3:
+    region: us-west-2
+    availability_zone: us-west-2a
+    bucket: billet-cache-example
+    prefix: deployments/example/aws-us-west-2
+`)
+	cfg, err := Load(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Node.EBSS3 == nil || cfg.Node.EBSS3.AvailabilityZone != "us-west-2a" ||
+		cfg.Node.EBSS3.Bucket != "billet-cache-example" {
+		t.Fatalf("node ebs-s3 config = %+v", cfg.Node.EBSS3)
+	}
+}
+
+func TestACloudNodeExposesItsCacheOnlyThroughTLS(t *testing.T) {
+	t.Parallel()
+
+	cache := `  site: aws-us-west-2
+  ebs_s3:
+    region: us-west-2
+    availability_zone: us-west-2a
+    bucket: billet-cache-example
+  cache:
+    listen: 10.0.2.10:7718
+    guest_endpoint: https://cache.aws.example:7718
+    tls_cert: /etc/billet/cache.crt
+    tls_key: /etc/billet/cache.key
+`
+	body := cloudConfig(t, "  provider: ec2\n", "  provider: ec2\n"+cache)
+	cfg, err := Load(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Node.Cache == nil || cfg.Node.Cache.TLSCert != "/etc/billet/cache.crt" {
+		t.Fatalf("cloud cache config = %+v", cfg.Node.Cache)
+	}
+
+	for name, replacement := range map[string]string{
+		"plaintext":      strings.Replace(cache, "https://cache.aws.example", "http://cache.aws.example", 1),
+		"no certificate": strings.Replace(cache, "    tls_cert: /etc/billet/cache.crt\n", "", 1),
+		"different port": strings.Replace(cache, "cache.aws.example:7718", "cache.aws.example:8443", 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			bad := cloudConfig(t, "  provider: ec2\n", "  provider: ec2\n"+replacement)
+			if _, err := Load(writeConfig(t, bad)); err == nil {
+				t.Fatal("Load accepted a cloud cache endpoint that could expose its bearer token")
+			}
+		})
+	}
+}
+
+func TestAnEBSAndS3StoreMustBeUsableByThisCloudNode(t *testing.T) {
+	t.Parallel()
+
+	valid := `  site: aws-us-west-2
+  ebs_s3:
+    region: us-west-2
+    availability_zone: us-west-2a
+    bucket: billet-cache-example
+    prefix: deployments/example/aws-us-west-2
+`
+	for name, replacement := range map[string]string{
+		"no site":             strings.Replace(valid, "  site: aws-us-west-2\n", "", 1),
+		"other region":        strings.Replace(valid, "    region: us-west-2\n", "    region: us-east-1\n", 1),
+		"other region's zone": strings.Replace(valid, "    availability_zone: us-west-2a\n", "    availability_zone: us-east-1a\n", 1),
+		"non-DNS bucket":      strings.Replace(valid, "    bucket: billet-cache-example\n", "    bucket: Billet_Cache\n", 1),
+		"absolute prefix":     strings.Replace(valid, "    prefix: deployments/example/aws-us-west-2\n", "    prefix: /absolute\n", 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			body := cloudConfig(t, "  provider: ec2\n", "  provider: ec2\n"+replacement)
+			if _, err := Load(writeConfig(t, body)); err == nil {
+				t.Fatal("Load accepted an EBS/S3 store the node cannot address safely")
+			}
+		})
+	}
+
+	body := strings.Replace(validConfig, "  provider: firecracker\n",
+		"  provider: firecracker\n"+valid, 1)
+	if _, err := Load(writeConfig(t, body)); err == nil {
+		t.Fatal("Load accepted EBS/S3 storage on a host-backed provider")
+	}
+}
+
+func TestSpotNeedsAnInterruptionQueue(t *testing.T) {
+	got := loadErr(t, cloudConfig(t, "    region: us-west-2\n",
+		"    region: us-west-2\n    spot: true\n"))
+	if !strings.Contains(got, "interruption_queue_url") {
+		t.Errorf("the error does not name the missing warning channel: %s", got)
+	}
+}
+
+func TestAValidSpotInterruptionQueueLoads(t *testing.T) {
+	body := cloudConfig(t, "    region: us-west-2\n", "    region: us-west-2\n"+
+		"    spot: true\n"+
+		"    interruption_queue_url: https://sqs.us-west-2.amazonaws.com/123456789012/billet\n")
+
+	if _, err := Load(writeConfig(t, body)); err != nil {
+		t.Fatalf("a valid interruption queue was refused: %v", err)
+	}
+}
+
+func TestAnInterruptionQueueCannotReceiveCredentialsOverPlaintext(t *testing.T) {
+	body := cloudConfig(t, "    region: us-west-2\n", "    region: us-west-2\n"+
+		"    spot: true\n"+
+		"    interruption_queue_url: http://sqs.us-west-2.amazonaws.com/123456789012/billet\n")
+
+	got := loadErr(t, body)
+	if !strings.Contains(got, "https") {
+		t.Errorf("the error does not explain that the signed queue request needs https: %s", got)
 	}
 }
 

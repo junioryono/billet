@@ -160,6 +160,29 @@ func TestReserveHoldsCapacity(t *testing.T) {
 	}
 }
 
+func TestAFailureReasonSurvivesUntilJobHistory(t *testing.T) {
+	a := newAllocator(t,
+		Limits{MaxVCPU: 4, MaxMemory: 16 * config.GiB},
+		[]config.Tier{tier("small", 2, 8*config.GiB)})
+	lease := reserve(t, a, "small")
+
+	const reason = "ec2 spot interruption: terminate"
+	if err := a.MarkFailure(t.Context(), lease.ID, lease.Epoch, reason); err != nil {
+		t.Fatalf("MarkFailure: %v", err)
+	}
+	if err := a.Release(t.Context(), lease.ID, lease.Epoch, PhaseFailed); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+
+	got, err := a.HistoryFailureReason(t.Context(), lease.ID)
+	if err != nil {
+		t.Fatalf("HistoryFailureReason: %v", err)
+	}
+	if got != reason {
+		t.Errorf("failure reason = %q, want %q", got, reason)
+	}
+}
+
 // Capacity is a vector. A tier can be blocked by memory while cores are free,
 // and treating either as "the" limit overcommits the other.
 func TestMemoryCanBindBeforeVCPU(t *testing.T) {

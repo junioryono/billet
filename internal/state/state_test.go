@@ -741,8 +741,8 @@ func TestEveryTableIsStrict(t *testing.T) {
 
 // A REBUILDING MIGRATION COPIES EVERY COLUMN IT DECLARES.
 //
-// Migrations 16 and 17 rebuild tables, because a CHECK constraint and STRICT are
-// both properties of the declaration and SQLite cannot alter either. A rebuild
+// Migrations 16, 17 and 20 rebuild tables, because CHECK constraints and STRICT
+// are properties of the declaration and SQLite cannot alter either. A rebuild
 // is the one migration shape that silently loses things: a column left out of
 // the copy list keeps its DEFAULT in the new table and nothing complains.
 //
@@ -756,7 +756,9 @@ func TestEveryTableIsStrict(t *testing.T) {
 // So the statements themselves are read: every column the new table declares
 // must appear in both halves of the INSERT ... SELECT that fills it.
 func TestRebuildingMigrationsCopyEveryColumn(t *testing.T) {
-	for _, m := range []migration{quarantineMigration, strictTrustTablesMigration} {
+	for _, m := range []migration{
+		quarantineMigration, strictTrustTablesMigration, custodyVisibilityMigration,
+	} {
 		declared := map[string][]string{}
 		inserted := map[string][]string{}
 		selected := map[string][]string{}
@@ -1027,14 +1029,16 @@ func TestRebuildingMigrationsKeepRowsIndexesAndKeys(t *testing.T) {
 		}
 	}
 
-	// AND THE NEW PHASE IS ACCEPTED, which is what migration 16 was for.
-	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(t.Context(),
-			`UPDATE leases SET phase = 'quarantine' WHERE id = 'l1'`)
+	// AND EVERY PHASE A REBUILD ADDED IS ACCEPTED.
+	for _, phase := range []string{"quarantine", "custody", "teardown"} {
+		if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
+			_, err := tx.ExecContext(t.Context(),
+				`UPDATE leases SET phase = ? WHERE id = 'l1'`, phase)
 
-		return err
-	}); err != nil {
-		t.Errorf("the rebuilt table refuses the quarantine phase: %v", err)
+			return err
+		}); err != nil {
+			t.Errorf("the rebuilt table refuses the %s phase: %v", phase, err)
+		}
 	}
 }
 
@@ -1103,6 +1107,14 @@ func TestADatabaseWrittenByAnEarlierBilletUpgrades(t *testing.T) {
 		for _, stmt := range []string{
 			`DROP TABLE issued_certs`,
 			`DROP TABLE node_revocations`,
+			`ALTER TABLE nodes DROP COLUMN ec2_shapes`,
+			`ALTER TABLE leases DROP COLUMN force_release`,
+			`ALTER TABLE leases DROP COLUMN held_at`,
+			`ALTER TABLE leases DROP COLUMN requested_vcpu`,
+			`ALTER TABLE leases DROP COLUMN requested_memory`,
+			`ALTER TABLE leases DROP COLUMN instance_type`,
+			`ALTER TABLE leases DROP COLUMN failure_reason`,
+			`ALTER TABLE job_history DROP COLUMN failure_reason`,
 			`DELETE FROM schema_migrations WHERE version >= 15`,
 		} {
 			if _, err := tx.ExecContext(t.Context(), stmt); err != nil {

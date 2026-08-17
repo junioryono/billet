@@ -1,6 +1,9 @@
 package nodeapi
 
-import "github.com/junioryono/billet/internal/alloc"
+import (
+	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/config"
+)
 
 // The lease half of the wire.
 //
@@ -41,6 +44,22 @@ type AdvanceRequest struct {
 // HeartbeatRequest renews a lease.
 type HeartbeatRequest struct {
 	Epoch int64 `json:"epoch"`
+}
+
+// MarkFailureRequest records an external reason a running job cannot finish.
+type MarkFailureRequest struct {
+	Epoch  int64  `json:"epoch"`
+	Reason string `json:"reason"`
+}
+
+// ResizeRequest changes what an EC2 lease is charged before the node attempts
+// a fallback shape. The allocator verifies the shape came from this node's
+// registration and still fits both the host and deployment ceilings.
+type ResizeRequest struct {
+	Epoch        int64           `json:"epoch"`
+	InstanceType string          `json:"instance_type"`
+	VCPU         int             `json:"vcpu"`
+	Memory       config.ByteSize `json:"memory"`
 }
 
 // ReleaseRequest ends a lease with a terminal outcome.
@@ -107,6 +126,12 @@ const (
 	CodeFenced = "fenced"
 	// CodeNotFound means the lease is gone. Terminal for the node's purposes.
 	CodeNotFound = "not_found"
+	// CodeNoCapacity means a requested EC2 fallback shape would exceed a
+	// configured budget. The node may try a later, smaller declared shape.
+	CodeNoCapacity = "no_capacity"
+	// CodeForceRelease means an operator asserted that custody's compute is gone.
+	// The node drops its local hold and terminalizes the lease itself.
+	CodeForceRelease = "force_release"
 	// CodeRefused means the request was understood and rejected — a placement
 	// the server will not allow. Retrying it unchanged cannot help.
 	CodeRefused = "refused"
@@ -165,6 +190,8 @@ func ParsePhase(s string) (alloc.Phase, bool) {
 		alloc.PhaseLaunching,
 		alloc.PhaseOnline,
 		alloc.PhaseBusy,
+		alloc.PhaseCustody,
+		alloc.PhaseTeardown,
 		alloc.PhaseDone,
 		alloc.PhaseFailed:
 		return alloc.Phase(s), true

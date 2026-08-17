@@ -52,8 +52,9 @@ type fakeVMM struct {
 }
 
 type recordedPut struct {
-	path string
-	body map[string]any
+	method string
+	path   string
+	body   map[string]any
 }
 
 // startFakeVMM serves a VMM's API on the socket path a jail would put it at.
@@ -131,7 +132,7 @@ func (v *fakeVMM) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		body = nil
 	}
 
-	v.puts = append(v.puts, recordedPut{path: r.URL.Path, body: body})
+	v.puts = append(v.puts, recordedPut{method: r.Method, path: r.URL.Path, body: body})
 
 	if r.URL.Path == "/actions" {
 		action, isString := body["action_type"].(string)

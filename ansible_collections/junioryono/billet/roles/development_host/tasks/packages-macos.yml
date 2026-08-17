@@ -1,0 +1,46 @@
+---
+- name: Check for Homebrew
+  ansible.builtin.stat:
+    path: "{{ billet_development_brew_bin }}"
+  register: billet_development_homebrew
+
+- name: Require Homebrew on macOS
+  ansible.builtin.assert:
+    that:
+      - billet_development_homebrew.stat.exists
+    fail_msg: >-
+      Homebrew is required on macOS. Install it from https://brew.sh, then rerun
+      this role; Billet will install and manage the development tools after that.
+
+- name: Inspect macOS development formulae
+  ansible.builtin.command:
+    argv: ["{{ billet_development_brew_bin }}", list, --versions, "{{ item }}"]
+  environment:
+    HOMEBREW_NO_AUTO_UPDATE: "1"
+  loop: "{{ ['caddy', 'mkcert', 'nss'] + (['hashicorp/tap/terraform'] if billet_development_install_terraform else []) }}"
+  register: billet_development_homebrew_formulae
+  changed_when: false
+  failed_when: false
+
+- name: Install missing macOS development formulae
+  ansible.builtin.command:
+    argv: ["{{ billet_development_brew_bin }}", install, "{{ item.item }}"]
+  environment:
+    HOMEBREW_NO_AUTO_UPDATE: "1"
+  loop: "{{ billet_development_homebrew_formulae.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: item.rc != 0
+  changed_when: true
+
+- name: Resolve the Homebrew prefix
+  ansible.builtin.command:
+    argv: ["{{ billet_development_brew_bin }}", --prefix]
+  register: billet_development_homebrew_prefix
+  changed_when: false
+
+- name: Record macOS development tool paths
+  ansible.builtin.set_fact:
+    billet_development_caddy_bin: "{{ billet_development_homebrew_prefix.stdout }}/bin/caddy"
+    billet_development_mkcert_bin: "{{ billet_development_homebrew_prefix.stdout }}/bin/mkcert"
+    billet_development_terraform_bin: "{{ billet_development_homebrew_prefix.stdout }}/bin/terraform"

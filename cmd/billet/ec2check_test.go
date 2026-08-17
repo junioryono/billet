@@ -177,6 +177,7 @@ func TestTheCloudPreflightSaysWhatSpotCosts(t *testing.T) {
 		UntrustedSecurityGroupIDs: []string{"sg-fork"},
 		InstanceTypes:             []config.EC2InstanceType{{Type: "c7i.2xlarge", VCPU: 8, Memory: 16 * config.GiB}},
 		Spot:                      true,
+		InterruptionQueueURL:      "https://sqs.us-west-2.amazonaws.com/123456789012/billet",
 	}
 
 	var err error

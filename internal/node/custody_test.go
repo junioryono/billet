@@ -1557,6 +1557,12 @@ func TestACompletionClearsEveryEntryForItsRequest(t *testing.T) {
 
 	for range 2 {
 		lease := assignedLease(t, a)
+		if err := a.Bind(t.Context(), lease.ID, lease.Epoch, host); err != nil {
+			t.Fatalf("Bind: %v", err)
+		}
+		if err := a.Advance(t.Context(), lease.ID, lease.Epoch, alloc.PhaseLaunching); err != nil {
+			t.Fatalf("Advance: %v", err)
+		}
 
 		inst := &provider.Instance{
 			ID: "inst-" + lease.ID, Name: provider.InstanceName(lease.ID), Running: true,

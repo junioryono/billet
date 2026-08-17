@@ -90,10 +90,33 @@ func TestADuplicateSiteIsRefused(t *testing.T) {
 
 // An unnamed site cannot be referred to, so it can only be a mistake.
 func TestASiteMustHaveAName(t *testing.T) {
-	body := validConfig + "\nsites:\n  - name: \"\"\n"
+	body := validConfig + "\nsites:\n  - name: \"\"\n    store: ceph\n"
 
 	if _, err := Load(writeConfig(t, body)); err == nil {
 		t.Fatal("Load accepted a site with no name")
+	}
+}
+
+func TestASiteMustSelectAStorageBackend(t *testing.T) {
+	t.Parallel()
+
+	for name, storage := range map[string]string{
+		"missing": "",
+		"unknown": "magic-disk",
+	} {
+		body := validConfig + "\nsites:\n  - name: home\n    store: " + storage + "\n"
+		if _, err := Load(writeConfig(t, body)); err == nil {
+			t.Errorf("%s site storage was accepted", name)
+		}
+	}
+}
+
+func TestAnAWSSiteMaySelectEBSAndS3Storage(t *testing.T) {
+	t.Parallel()
+
+	body := validConfig + "\nsites:\n  - name: somewhere\n    store: ebs-s3\n"
+	if _, err := Load(writeConfig(t, body)); err != nil {
+		t.Fatalf("Load rejected the implemented ebs-s3 site store: %v", err)
 	}
 }
 
@@ -105,7 +128,7 @@ func withSites(names ...string) string {
 	b.WriteString("\nsites:\n")
 
 	for _, n := range names {
-		b.WriteString("  - name: " + n + "\n")
+		b.WriteString("  - name: " + n + "\n    store: ceph\n")
 	}
 
 	return b.String()

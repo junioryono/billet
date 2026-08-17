@@ -1,0 +1,43 @@
+---
+- name: Validate development-host inputs
+  ansible.builtin.assert:
+    that:
+      - ansible_facts["system"] in ["Linux", "Darwin"]
+      - ansible_facts["system"] != "Linux" or ansible_facts["os_family"] == "Debian"
+      - ansible_facts["system"] != "Linux" or ansible_facts["service_mgr"] == "systemd"
+      - billet_development_user | length > 0
+      - billet_development_home | length > 1
+      - not billet_development_tls_enabled or billet_development_tls_sans | length > 0
+      - not billet_development_proxy_enabled or billet_development_proxy_admin | length > 0
+      - not billet_development_proxy_enabled or billet_development_tls_enabled
+      - billet_development_proxy_environment.keys() | select('match', '^[A-Za-z_][A-Za-z0-9_]*$') | list | length == billet_development_proxy_environment | length
+      - billet_development_proxy_environment.values() | select('search', '[\r\n]') | list | length == 0
+    fail_msg: >-
+      The development_host role supports Debian-family systemd hosts and macOS.
+      TLS needs at least one explicit SAN, the proxy requires TLS and an admin
+      address, and proxy environment entries must be single-line shell names.
+
+- name: Resolve the development user's primary group
+  ansible.builtin.command:
+    argv: [id, -gn, "{{ billet_development_user }}"]
+  register: billet_development_group_result
+  changed_when: false
+
+- name: Configure Linux development packages
+  ansible.builtin.import_tasks: packages-linux.yml
+  when: ansible_facts["system"] == "Linux"
+
+- name: Configure macOS development packages
+  ansible.builtin.import_tasks: packages-macos.yml
+  when: ansible_facts["system"] == "Darwin"
+
+- name: Verify installed development tool versions
+  ansible.builtin.import_tasks: verify-tools.yml
+
+- name: Configure the local development CA and certificate
+  ansible.builtin.import_tasks: tls.yml
+  when: billet_development_tls_enabled
+
+- name: Configure the local development reverse proxy
+  ansible.builtin.import_tasks: proxy.yml
+  when: billet_development_proxy_enabled

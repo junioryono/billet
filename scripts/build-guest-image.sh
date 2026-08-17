@@ -369,10 +369,28 @@ main() {
 	echo "=== 1/6 base system ($SUITE) ==="
 	# --variant=minbase, then systemd on top: the guest needs an init that can run
 	# Docker's unit, and the alternative is hand-writing service supervision.
-	debootstrap --variant=minbase --include=systemd,systemd-sysv,dbus \
+	#
+	# GNU Wget does not race address families. On the reference host it selected an
+	# established but black-holed IPv6 connection to archive.ubuntu.com and waited
+	# for its 900-second default timeout, while the same object answered immediately
+	# over IPv4. Keep IPv6 as a fallback, but prefer IPv4 and bound each attempt so a
+	# weekly rebuild cannot spend most of its service timeout on one package.
+	local download_bin="$WORK/download-bin"
+	mkdir -p "$download_bin"
+	cat >"$download_bin/wget" <<'EOF'
+#!/bin/sh
+exec /usr/bin/wget --prefer-family=IPv4 --timeout=30 --tries=5 "$@"
+EOF
+	chmod 0755 "$download_bin/wget"
+	PATH="$download_bin:$PATH" debootstrap \
+		--variant=minbase --include=systemd,systemd-sysv,dbus \
 		"$SUITE" "$rootfs" http://archive.ubuntu.com/ubuntu/
 
 	echo "=== 2/6 packages ==="
+	# debootstrap writes a one-line legacy source for the base suite. Replace it
+	# rather than layering the deb822 source beside it, which asks apt for the same
+	# index twice and hides useful warnings in duplicate-target noise.
+	rm -f "$rootfs/etc/apt/sources.list"
 	cat >"$rootfs/etc/apt/sources.list.d/ubuntu.sources" <<EOF
 Types: deb
 URIs: http://archive.ubuntu.com/ubuntu/
@@ -386,7 +404,7 @@ EOF
 		apt-get update -qq
 		apt-get install -y --no-install-recommends \
 			ca-certificates curl iproute2 iptables jq git sudo \
-			docker.io systemd-resolved netplan.io libicu74 \
+			docker.io e2fsprogs util-linux systemd-resolved netplan.io libicu74 \
 			unzip zip zstd tar wget rsync build-essential
 		apt-get clean
 		rm -rf /var/lib/apt/lists/*
@@ -537,7 +555,7 @@ fetch() { curl -sf -H "X-metadata-token: $token" "http://$MMDS/latest/meta-data/
 #
 # Refusing out loud is the whole point: the message names both versions, so the
 # answer ("republish the image") is in the failure rather than in somebody's memory.
-WANT_CONTRACT=2
+WANT_CONTRACT=4
 
 if ! contract=$(fetch contract); then
 	log "this billet did not say which metadata contract it speaks; it is older than this image"
@@ -557,6 +575,90 @@ fi
 
 if ! name=$(fetch runner-name); then
 	name=unknown
+fi
+
+# PULL-THROUGH CACHES ARE SITE-LOCAL AND PUBLIC. The Docker daemon can redirect
+# Docker Hub through its supported registry-mirrors setting. BuildKit consumes
+# all three upstream mappings later through the runner environment; Docker Engine
+# has no equivalent per-registry setting for ghcr.io or quay.io.
+registry_mirrors_json=""
+if candidate=$(fetch registry-mirrors 2>/dev/null); then
+	if jq -e '
+		def origin:
+			type == "string" and
+			test("^https://[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?::[1-9][0-9]{0,4})?$") and
+			(if test(":[0-9]+$") then (split(":")[-1] | tonumber) <= 65535 else true end);
+		type == "object" and
+		keys == ["docker.io", "ghcr.io", "quay.io"] and
+		all(.[]; origin) and
+		([.[]] | unique | length) == 3
+	' >/dev/null 2>&1 <<<"$candidate"; then
+		registry_mirrors_json=$candidate
+		docker_mirror=$(jq -r '.["docker.io"]' <<<"$registry_mirrors_json")
+		daemon_base='{}'
+		if [ -f /etc/docker/daemon.json ]; then
+			daemon_base=$(cat /etc/docker/daemon.json)
+		fi
+		if rendered=$(jq -c --arg mirror "$docker_mirror" \
+			'if type == "object" then . + {"registry-mirrors": [$mirror]} else error("not an object") end' \
+			<<<"$daemon_base") && printf '%s\n' "$rendered" >/run/billet-docker-daemon.json &&
+			install -m 0644 /run/billet-docker-daemon.json /etc/docker/daemon.json; then
+			:
+		else
+			log "the Docker Hub mirror could not be configured; this job will pull directly upstream"
+		fi
+	else
+		log "billet supplied invalid registry-mirror metadata; this job will pull directly upstream"
+	fi
+fi
+
+# THE DOCKER IMAGE STORE IS ATTACHED BEFORE BOOT, because service containers are
+# pulled before the first workflow step and an action is therefore too late. Slot
+# zero is reserved for it; ordinary sticky disks hot-attach in the remaining four.
+# Every error here degrades to the root disk and a cold pull rather than preventing
+# the runner from starting.
+cache_endpoint=""
+cache_token=""
+buildkit_cache_mount_limit_bytes=""
+docker_cache=0
+docker_images_before=""
+
+if cache_endpoint=$(fetch cache-endpoint 2>/dev/null) &&
+	cache_token=$(fetch cache-token 2>/dev/null) &&
+	buildkit_cache_mount_limit_bytes=$(fetch buildkit-cache-mount-limit-bytes 2>/dev/null) &&
+	[ -n "$cache_endpoint" ] && [ -n "$cache_token" ] &&
+	[[ "$buildkit_cache_mount_limit_bytes" =~ ^[1-9][0-9]*$ ]] &&
+	[ -b /dev/vdb ] && [ "$(blockdev --getsize64 /dev/vdb 2>/dev/null || echo 0)" -gt 0 ]; then
+	cache_type=$(blkid -o value -s TYPE /dev/vdb 2>/dev/null || true)
+	if [ -z "$cache_type" ]; then
+		if ! mkfs.ext4 -q -F /dev/vdb; then
+			log "the Docker image cache could not be formatted; this job will pull cold"
+		elif mount -t ext4 -o noatime /dev/vdb /var/lib/docker; then
+			docker_cache=1
+		fi
+	elif [ "$cache_type" != ext4 ]; then
+		log "the Docker image cache contains $cache_type rather than ext4; this job will pull cold"
+	elif mount -t ext4 -o noatime /dev/vdb /var/lib/docker; then
+		docker_cache=1
+	fi
+fi
+
+if [ "$docker_cache" -eq 0 ] && [ -n "$cache_endpoint" ] && [ -n "$cache_token" ]; then
+	curl -sf -X POST -H "Authorization: Bearer $cache_token" \
+		"$cache_endpoint/v1/volumes/0/discard" >/dev/null 2>&1 || true
+fi
+
+# Docker is deliberately not enabled at boot. Starting it only after the cache
+# device is mounted is what makes /var/lib/docker transparent to service
+# containers rather than a volume that hides a daemon's already-open files.
+if ! systemctl start docker.service; then
+	log "Docker did not start"
+	exit 1
+fi
+
+if [ "$docker_cache" -eq 1 ]; then
+	docker_images_before=$(docker image ls --no-trunc --digests \
+		--format '{{.Repository}} {{.Digest}} {{.ID}}' 2>/dev/null | sort || true)
 fi
 
 # THE COMMAND ARRIVES AS JSON IN A STRING, and both halves of that are deliberate.
@@ -701,10 +803,56 @@ cd /home/runner/runner
 # simply be slower.
 #
 # setpriv does not preserve it either, which is why it is named here explicitly.
-exec setpriv --reuid=runner --regid=runner --init-groups --inh-caps=-all -- \
-	env ACTIONS_RUNNER_INPUT_JITCONFIG="$ACTIONS_RUNNER_INPUT_JITCONFIG" \
-	RUNNER_TOOL_CACHE=/opt/hostedtoolcache \
-	AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache "${cmd[@]}"
+runner_env=(
+	"ACTIONS_RUNNER_INPUT_JITCONFIG=$ACTIONS_RUNNER_INPUT_JITCONFIG"
+	"RUNNER_TOOL_CACHE=/opt/hostedtoolcache"
+	"AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache"
+)
+if [ -n "$cache_endpoint" ] && [ -n "$cache_token" ]; then
+	runner_env+=("BILLET_CACHE_ENDPOINT=$cache_endpoint" "BILLET_CACHE_TOKEN=$cache_token"
+		"BILLET_BUILDKIT_CACHE_MOUNT_LIMIT_BYTES=$buildkit_cache_mount_limit_bytes")
+fi
+if [ -n "$registry_mirrors_json" ]; then
+	runner_env+=("BILLET_REGISTRY_MIRRORS_JSON=$registry_mirrors_json")
+fi
+
+set +e
+setpriv --reuid=runner --regid=runner --init-groups --inh-caps=-all -- \
+	env "${runner_env[@]}" "${cmd[@]}"
+job_status=$?
+set -e
+
+if [ "$docker_cache" -eq 1 ]; then
+	docker_images_after=$(docker image ls --no-trunc --digests \
+		--format '{{.Repository}} {{.Digest}} {{.ID}}' 2>/dev/null | sort || true)
+	if ! systemctl stop docker.service docker.socket; then
+		log "Docker did not stop cleanly; discarding its cache writes"
+	elif sync -f /var/lib/docker && umount /var/lib/docker; then
+		operation=commit
+		commit_args=()
+		if [ "$docker_images_before" = "$docker_images_after" ]; then
+			operation=discard
+		else
+			filesystem_type=$(blkid -o value -s TYPE /dev/vdb 2>/dev/null || true)
+			filesystem_uuid=$(blkid -o value -s UUID /dev/vdb 2>/dev/null || true)
+			filesystem_clean=false
+			if e2fsck -f -n /dev/vdb >/dev/null 2>&1; then
+				filesystem_clean=true
+			fi
+			commit_body=$(printf '{"filesystem":{"type":"%s","uuid":"%s","clean":%s}}' \
+				"$filesystem_type" "$filesystem_uuid" "$filesystem_clean")
+			commit_args=(-H "Content-Type: application/json" --data-binary "$commit_body")
+		fi
+		if ! curl -sf -X POST -H "Authorization: Bearer $cache_token" \
+			"${commit_args[@]}" "$cache_endpoint/v1/volumes/0/$operation" >/dev/null; then
+			log "the Docker image cache could not $operation; the job result is unchanged"
+		fi
+	else
+		log "the Docker image cache could not be unmounted; its writes will be discarded"
+	fi
+fi
+
+exit "$job_status"
 AGENT
 
 	install -m 0644 /dev/stdin "$rootfs/etc/systemd/system/billet-agent.service" <<'UNIT'
@@ -712,9 +860,8 @@ AGENT
 Description=billet: start the GitHub Actions runner from the metadata service
 # AFTER THE NETWORK, because the registration is read over it. A guest that started
 # this first would exhaust its retries before eth0 had an address.
-After=network-online.target docker.service
+After=network-online.target
 Wants=network-online.target
-Requires=docker.service
 
 [Service]
 Type=exec
@@ -769,7 +916,8 @@ Scope=link
 NET
 
 	chroot "$rootfs" /bin/bash -euxc '
-		systemctl enable systemd-networkd systemd-resolved docker billet-agent
+		systemctl disable docker.service docker.socket 2>/dev/null || true
+		systemctl enable systemd-networkd systemd-resolved billet-agent
 		# A CONSOLE THAT GOES NOWHERE COSTS BOOT TIME. billet passes no console= to
 		# the guest, so a getty on ttyS0 would spin against a device nothing reads.
 		systemctl mask getty@tty1.service serial-getty@ttyS0.service

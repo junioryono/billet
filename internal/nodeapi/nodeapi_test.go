@@ -26,6 +26,8 @@ func TestEveryPhaseSurvivesTheWire(t *testing.T) {
 		alloc.PhaseLaunching,
 		alloc.PhaseOnline,
 		alloc.PhaseBusy,
+		alloc.PhaseCustody,
+		alloc.PhaseTeardown,
 		alloc.PhaseDone,
 		alloc.PhaseFailed,
 	} {
@@ -75,7 +77,8 @@ func TestALaunchCommandCarriesWhatALaunchNeeds(t *testing.T) {
 			Epoch:     3,
 			RequestID: 77,
 		},
-		Job: &Job{RequestID: 77, RunID: 88, Event: "push"},
+		Tier: TierSpecOf(config.Tier{BuildKitCacheMountLimit: 7 * config.GiB}),
+		Job:  &Job{RequestID: 77, RunID: 88, Event: "push"},
 	}
 
 	raw, err := json.Marshal(cmd)
@@ -111,6 +114,9 @@ func TestALaunchCommandCarriesWhatALaunchNeeds(t *testing.T) {
 	if got.Job == nil || got.Job.Event != "push" {
 		t.Errorf("the job's event was lost, and it is the only thing that says how far the "+
 			"workload can be trusted: %+v", got.Job)
+	}
+	if got.Tier == nil || got.Tier.BuildKitCacheMountLimit != 7*config.GiB {
+		t.Errorf("the tier's BuildKit cache-mount ceiling was lost: %+v", got.Tier)
 	}
 }
 
@@ -150,7 +156,10 @@ func TestErrorCodesAreDistinct(t *testing.T) {
 
 	seen := map[string]bool{}
 
-	for _, c := range []string{CodeFenced, CodeNotFound, CodeRefused, CodeUnregistered} {
+	for _, c := range []string{
+		CodeFenced, CodeNotFound, CodeNoCapacity, CodeForceRelease, CodeRefused,
+		CodeUnregistered,
+	} {
 		if c == "" {
 			t.Error("an empty error code cannot be branched on")
 		}

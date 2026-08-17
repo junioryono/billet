@@ -1,0 +1,111 @@
+name: Cache and artifact conformance
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_label:
+        description: A billet runner label whose image and cache path are under test
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  save-host:
+    runs-on: ${{ inputs.runner_label }}
+    steps:
+      - name: Establish a unique cache miss
+        id: cache
+        uses: actions/cache@v5
+        with:
+          path: conformance/cache
+          key: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-host
+      - name: Refuse a stale cache
+        if: steps.cache.outputs.cache-hit == 'true'
+        run: exit 1
+      - name: Create cache and artifact payloads
+        run: |
+          mkdir -p conformance/cache conformance/artifact
+          printf '%s\n' 'billet-${{ github.run_id }}-${{ github.run_attempt }}-host' > conformance/cache/payload
+          cp conformance/cache/payload conformance/artifact/payload
+      - name: Upload artifact metadata and content
+        uses: actions/upload-artifact@v7
+        with:
+          name: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-host
+          path: conformance/artifact/payload
+          if-no-files-found: error
+
+  restore-host:
+    needs: save-host
+    runs-on: ${{ inputs.runner_label }}
+    steps:
+      - name: Restore the cache written by the previous runner
+        id: cache
+        uses: actions/cache@v5
+        with:
+          path: conformance/cache
+          key: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-host
+          fail-on-cache-miss: true
+      - name: Verify the restored cache payload
+        run: |
+          test '${{ steps.cache.outputs.cache-hit }}' = true
+          printf '%s\n' 'billet-${{ github.run_id }}-${{ github.run_attempt }}-host' > expected
+          cmp expected conformance/cache/payload
+      - name: Download the artifact through the shared results origin
+        uses: actions/download-artifact@v8
+        with:
+          name: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-host
+          path: conformance/download
+      - name: Verify the downloaded artifact payload
+        run: cmp expected conformance/download/payload
+
+  save-container:
+    runs-on: ${{ inputs.runner_label }}
+    container: node:24-bookworm
+    steps:
+      - name: Establish a unique cache miss inside a job container
+        id: cache
+        uses: actions/cache@v5
+        with:
+          path: conformance/cache
+          key: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-container
+      - name: Refuse a stale cache
+        if: steps.cache.outputs.cache-hit == 'true'
+        run: exit 1
+      - name: Create cache and artifact payloads
+        run: |
+          mkdir -p conformance/cache conformance/artifact
+          printf '%s\n' 'billet-${{ github.run_id }}-${{ github.run_attempt }}-container' > conformance/cache/payload
+          cp conformance/cache/payload conformance/artifact/payload
+      - name: Upload artifact metadata and content
+        uses: actions/upload-artifact@v7
+        with:
+          name: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-container
+          path: conformance/artifact/payload
+          if-no-files-found: error
+
+  restore-container:
+    needs: save-container
+    runs-on: ${{ inputs.runner_label }}
+    container: node:24-bookworm
+    steps:
+      - name: Restore the cache written by the previous containerized runner
+        id: cache
+        uses: actions/cache@v5
+        with:
+          path: conformance/cache
+          key: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-container
+          fail-on-cache-miss: true
+      - name: Verify the restored cache payload
+        run: |
+          test '${{ steps.cache.outputs.cache-hit }}' = true
+          printf '%s\n' 'billet-${{ github.run_id }}-${{ github.run_attempt }}-container' > expected
+          cmp expected conformance/cache/payload
+      - name: Download the artifact through the shared results origin
+        uses: actions/download-artifact@v8
+        with:
+          name: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-container
+          path: conformance/download
+      - name: Verify the downloaded artifact payload
+        run: cmp expected conformance/download/payload

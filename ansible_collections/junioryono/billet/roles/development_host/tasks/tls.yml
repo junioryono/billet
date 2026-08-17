@@ -1,0 +1,97 @@
+---
+- name: Create development TLS directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ billet_development_user }}"
+    group: "{{ billet_development_group_result.stdout }}"
+    mode: "0700"
+  loop:
+    - "{{ billet_development_tls_caroot }}"
+    - "{{ billet_development_tls_dir }}"
+  become: true
+
+- name: Create and trust the local development CA
+  ansible.builtin.command:
+    argv: ["{{ billet_development_mkcert_bin }}", -install]
+  environment:
+    CAROOT: "{{ billet_development_tls_caroot }}"
+    HOME: "{{ billet_development_home }}"
+  become: true
+  register: billet_development_mkcert_install
+  changed_when: "'Created a new local CA' in billet_development_mkcert_install.stdout"
+
+- name: Return the local development CA to its user
+  ansible.builtin.file:
+    path: "{{ billet_development_tls_caroot }}"
+    state: directory
+    owner: "{{ billet_development_user }}"
+    group: "{{ billet_development_group_result.stdout }}"
+    recurse: true
+  become: true
+
+- name: Protect the local development CA directory
+  ansible.builtin.file:
+    path: "{{ billet_development_tls_caroot }}"
+    state: directory
+    owner: "{{ billet_development_user }}"
+    group: "{{ billet_development_group_result.stdout }}"
+    mode: "0700"
+  become: true
+
+- name: Inspect the development certificate inputs
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - "{{ billet_development_tls_cert_path }}"
+    - "{{ billet_development_tls_key_path }}"
+    - "{{ billet_development_tls_dir }}/sans.json"
+  register: billet_development_tls_inputs
+
+- name: Read the recorded development certificate SANs
+  ansible.builtin.slurp:
+    src: "{{ billet_development_tls_dir }}/sans.json"
+  register: billet_development_tls_sans_recorded
+  when: billet_development_tls_inputs.results[2].stat.exists
+
+- name: Decide whether to mint the development certificate
+  ansible.builtin.set_fact:
+    billet_development_tls_needs_certificate: >-
+      {{
+        not billet_development_tls_inputs.results[0].stat.exists or
+        not billet_development_tls_inputs.results[1].stat.exists or
+        not billet_development_tls_inputs.results[2].stat.exists or
+        ((billet_development_tls_sans_recorded.content | default('') | b64decode | trim) != (billet_development_tls_sans | to_json))
+      }}
+
+- name: Mint the development certificate
+  ansible.builtin.command:
+    argv: "{{ [billet_development_mkcert_bin, '-cert-file', billet_development_tls_cert_path, '-key-file', billet_development_tls_key_path] + billet_development_tls_sans }}"
+  environment:
+    CAROOT: "{{ billet_development_tls_caroot }}"
+    HOME: "{{ billet_development_home }}"
+  become: true
+  become_user: "{{ billet_development_user }}"
+  when: billet_development_tls_needs_certificate
+  changed_when: true
+
+- name: Record the development certificate SANs
+  ansible.builtin.copy:
+    dest: "{{ billet_development_tls_dir }}/sans.json"
+    content: "{{ billet_development_tls_sans | to_json }}\n"
+    owner: "{{ billet_development_user }}"
+    group: "{{ billet_development_group_result.stdout }}"
+    mode: "0600"
+  when: billet_development_tls_needs_certificate
+  become: true
+
+- name: Protect development certificate material
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    owner: "{{ billet_development_user }}"
+    group: "{{ billet_development_group_result.stdout }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ billet_development_tls_cert_path }}", mode: "0644" }
+    - { path: "{{ billet_development_tls_key_path }}", mode: "0600" }
+  become: true

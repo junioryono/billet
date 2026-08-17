@@ -1,0 +1,28 @@
+name: billet sticky disk
+description: Mount a copy-on-write cache volume for one job and publish it without changing the job result.
+inputs:
+  key:
+    description: Cache identity. Include github.repository unless deliberate cross-repository sharing is intended.
+    required: true
+  path:
+    description: Directory where the ext4 cache volume is mounted.
+    required: true
+  size-gb:
+    description: Size of a cache on first creation. Existing generations keep their original size.
+    required: false
+    default: "10"
+  publication:
+    description: Publication conflict policy. Use last-write-wins only for mergeable caches such as BuildKit state.
+    required: false
+    default: cas
+  discard-marker:
+    description: Optional runner-local publication guard. Its consumer must remove the file before this action publishes the update.
+    required: false
+outputs:
+  cache-hit:
+    description: true when the disk was cloned from a committed generation.
+runs:
+  using: node20
+  main: index.js
+  post: cleanup.js
+  post-if: success()

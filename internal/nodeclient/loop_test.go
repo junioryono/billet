@@ -35,6 +35,9 @@ type fakeCompute struct {
 	launchErr  error
 	destroyErr error
 	recoverErr error
+	// rejectCanceledDestroy makes the fake enforce the same context contract as
+	// a real provider call, for shutdown-boundary tests.
+	rejectCanceledDestroy bool
 
 	launched  []int64
 	destroyed []int64
@@ -199,9 +202,12 @@ func (f *fakeCompute) Launch(
 	return err
 }
 
-func (f *fakeCompute) Destroy(_ context.Context, requestID int64) error {
+func (f *fakeCompute) Destroy(ctx context.Context, requestID int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.rejectCanceledDestroy && ctx.Err() != nil {
+		return ctx.Err()
+	}
 
 	f.destroyed = append(f.destroyed, requestID)
 	f.order = append(f.order, "destroy")
@@ -252,6 +258,10 @@ type stubStore struct{}
 func (stubStore) Bind(context.Context, string, int64, string) error         { return nil }
 func (stubStore) Advance(context.Context, string, int64, alloc.Phase) error { return nil }
 func (stubStore) Heartbeat(context.Context, string, int64) error            { return nil }
+func (stubStore) MarkFailure(context.Context, string, int64, string) error  { return nil }
+func (stubStore) Resize(context.Context, string, int64, string, int, config.ByteSize) error {
+	return nil
+}
 func (stubStore) Release(context.Context, string, int64, alloc.Phase) error { return nil }
 func (stubStore) Lease(context.Context, string) (*alloc.Lease, error)       { return nil, nil }
 func (stubStore) QuarantinedLeaseIDs(context.Context, string) (map[string]bool, error) {

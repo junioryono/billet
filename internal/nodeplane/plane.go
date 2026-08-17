@@ -628,11 +628,12 @@ func (p *Plane) Register(
 
 	if p.registrar != nil {
 		reg := alloc.NodeRegistration{
-			Name:     req.Node,
-			Provider: req.Provider,
-			Site:     req.Site,
-			VCPU:     req.VCPU,
-			Memory:   req.Memory,
+			Name:      req.Node,
+			Provider:  req.Provider,
+			Site:      req.Site,
+			VCPU:      req.VCPU,
+			Memory:    req.Memory,
+			EC2Shapes: req.EC2Shapes,
 		}
 
 		var err error
@@ -1051,7 +1052,7 @@ func (p *Plane) AdoptOwnership(node, incarnation string, leaseIDs []string) {
 	//
 	// A record created by DELIVERY is a different thing and must not be touched
 	// here. Absence from the snapshot does not prove terminality: LaunchedLeaseIDs
-	// reports only launching, online and busy, so a lease that was delivered and is
+	// reports only phases that may have compute, so a lease that was delivered and is
 	// still `assigned` is legitimately missing — and deleting its owner would let
 	// somebody else answer a destroy for a container that is about to exist.
 	//

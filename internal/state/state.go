@@ -1196,13 +1196,99 @@ var nodeRevocationMigration = migration{
 	},
 }
 
+// AN EC2 BUDGET IS CHARGED FOR WHAT THE NODE MAY BUY, not merely what a tier
+// requested. The ordered shape list belongs to the node row because placement
+// happens on the control plane, while requested_* stays immutable on the lease
+// so a fallback can change the charged size without forgetting what must fit.
+var ec2ShapeAccountingMigration = migration{
+	Version: 19,
+	Name:    "ec2_shape_accounting",
+	Stmts: []string{
+		`ALTER TABLE nodes ADD COLUMN ec2_shapes TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE leases ADD COLUMN requested_vcpu INTEGER NOT NULL DEFAULT 0 CHECK (requested_vcpu >= 0)`,
+		`ALTER TABLE leases ADD COLUMN requested_memory INTEGER NOT NULL DEFAULT 0 CHECK (requested_memory >= 0)`,
+		`ALTER TABLE leases ADD COLUMN instance_type TEXT NOT NULL DEFAULT ''`,
+		`UPDATE leases SET requested_vcpu = vcpu, requested_memory = memory
+		  WHERE requested_vcpu = 0 OR requested_memory = 0`,
+	},
+}
+
+// Custody is durable operator-visible state even though the node's detailed
+// tending record remains local. force_release is a request TO that holder: the
+// node observes it through heartbeat, drops its local proof obligation, and
+// terminalizes the lease itself rather than having the control plane release
+// capacity underneath a process that still believes it owns it.
+var custodyVisibilityMigration = migration{
+	Version: 20,
+	Name:    "custody_visibility",
+	Stmts: []string{
+		`ALTER TABLE leases ADD COLUMN held_at TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE leases ADD COLUMN force_release INTEGER NOT NULL DEFAULT 0 CHECK (force_release IN (0,1))`,
+		`CREATE TABLE leases_new (
+			id               TEXT PRIMARY KEY,
+			tier             TEXT NOT NULL,
+			node             TEXT REFERENCES nodes(name) ON DELETE SET NULL,
+			phase            TEXT NOT NULL CHECK (phase IN
+				('capacity','assigned','launching','online','busy','custody','teardown','quarantine','done','failed')),
+			vcpu             INTEGER NOT NULL CHECK (vcpu > 0),
+			memory           INTEGER NOT NULL CHECK (memory > 0),
+			run_id           INTEGER,
+			request_id       INTEGER,
+			epoch            INTEGER NOT NULL DEFAULT 0 CHECK (epoch >= 0),
+			created_at       TEXT NOT NULL,
+			heartbeat_at     TEXT NOT NULL,
+			expires_at       TEXT NOT NULL,
+			target_node      TEXT,
+			macos_slot       INTEGER NOT NULL DEFAULT 0 CHECK (macos_slot IN (0, 1)),
+			guest_os         TEXT NOT NULL DEFAULT 'linux',
+			provider         TEXT NOT NULL DEFAULT '',
+			providers        TEXT NOT NULL DEFAULT '',
+			chosen_provider  TEXT NOT NULL DEFAULT '',
+			requested_vcpu   INTEGER NOT NULL DEFAULT 0 CHECK (requested_vcpu >= 0),
+			requested_memory INTEGER NOT NULL DEFAULT 0 CHECK (requested_memory >= 0),
+			instance_type    TEXT NOT NULL DEFAULT '',
+			held_at          TEXT NOT NULL DEFAULT '',
+			force_release    INTEGER NOT NULL DEFAULT 0 CHECK (force_release IN (0,1))
+		) STRICT`,
+		`INSERT INTO leases_new
+		   (id, tier, node, phase, vcpu, memory, run_id, request_id, epoch, created_at,
+		    heartbeat_at, expires_at, target_node, macos_slot, guest_os, provider,
+		    providers, chosen_provider, requested_vcpu, requested_memory, instance_type,
+		    held_at, force_release)
+		 SELECT id, tier, node, phase, vcpu, memory, run_id, request_id, epoch, created_at,
+		        heartbeat_at, expires_at, target_node, macos_slot, guest_os, provider,
+		        providers, chosen_provider, requested_vcpu, requested_memory, instance_type,
+		        held_at, force_release
+		   FROM leases`,
+		`DROP TABLE leases`,
+		`ALTER TABLE leases_new RENAME TO leases`,
+		`UPDATE leases SET held_at = heartbeat_at WHERE phase = 'quarantine'`,
+		`CREATE INDEX leases_open_idx ON leases(phase) WHERE phase NOT IN ('done','failed')`,
+		`CREATE INDEX leases_node_idx ON leases(node)`,
+		`CREATE INDEX leases_expiry_idx ON leases(expires_at) WHERE phase NOT IN ('done','failed')`,
+	},
+}
+
+// An external reclaim is known before the guest disappears. Record that fact on
+// the live lease so a node restart between the warning and teardown cannot turn
+// a known failed build into an unattributed completion.
+var leaseFailureReasonMigration = migration{
+	Version: 21,
+	Name:    "lease_failure_reason",
+	Stmts: []string{
+		`ALTER TABLE leases ADD COLUMN failure_reason TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE job_history ADD COLUMN failure_reason TEXT NOT NULL DEFAULT ''`,
+	},
+}
+
 func init() {
 	migrations = append(migrations,
 		placementMigration, guestOSMigration, placementFactsMigration, requestIDMigration,
 		providerListMigration, nodeSiteMigration, nodeLivenessMigration,
 		certRevocationMigration, nodeEnrollmentMigration, joinTokenMigration,
 		issuedCertMigration, quarantineMigration, strictTrustTablesMigration,
-		nodeRevocationMigration)
+		nodeRevocationMigration, ec2ShapeAccountingMigration, custodyVisibilityMigration,
+		leaseFailureReasonMigration)
 }
 
 const bootstrapSchemaMigrations = `CREATE TABLE IF NOT EXISTS schema_migrations (

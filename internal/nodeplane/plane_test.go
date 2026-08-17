@@ -1205,7 +1205,7 @@ func TestAnOwnersConfirmationClearsTheRecordAndNobodyElseIsAsked(t *testing.T) {
 
 // A DELIVERED LAUNCH IS NOT PRUNED BY A SNAPSHOT THAT PREDATES IT.
 //
-// LaunchedLeaseIDs reports only launching, online and busy — so a lease that has
+// LaunchedLeaseIDs omits assigned — so a lease that has
 // been delivered and is still `assigned` is legitimately absent, and treating
 // absence as terminality deletes the owner of a container that is about to
 // exist. Only records adopted FROM a snapshot, which carry no request id, are

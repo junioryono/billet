@@ -1,0 +1,45 @@
+---
+- name: Validate the host role syntax
+  hosts: all
+  gather_facts: true
+  roles:
+    - role: junioryono.billet.host
+      billet_binary_src: /tmp/billet
+      billet_github_private_key_src: /tmp/app-private-key.pem
+      billet_config:
+        server:
+          listen: 127.0.0.1:7717
+          state_dir: /var/lib/billet/server
+          max_vcpu: 2
+          max_memory: 2GiB
+        github:
+          org: example
+          app_id: 1
+          installation_id: 2
+          private_key_path: /etc/billet/app-private-key.pem
+        node:
+          name: example
+          server_addr: 127.0.0.1:7717
+          provider: firecracker
+          state_dir: /var/lib/billet/node
+          lock_dir: /run/billet/locks
+          firecracker:
+            kernel_image: /var/lib/billet/kernels/vmlinux
+            bridge: billet0
+            untrusted_bridge: billet1
+          ceph:
+            image_pool: billet-images
+            cache_pool: billet-cache
+        tiers:
+          - label: billet-2vcpu-ubuntu-2404
+            provider: firecracker
+            vcpu: 2
+            memory: 2GiB
+            disk: 20GiB
+            image: ubuntu-2404-x64@verified
+    - role: junioryono.billet.development_host
+      billet_development_proxy_config_src: ""
+      billet_development_tls_sans:
+        - localhost
+        - 127.0.0.1
+        - "::1"
