@@ -1,15 +1,24 @@
 ---
-- name: Verify a first Linux development-host dry run
+- name: Verify an interrupted first Linux development-host dry run
   hosts: localhost
   connection: local
   gather_facts: true
   vars:
     ansible_python_interpreter: /usr/bin/python3
+    billet_development_install_terraform: false
     billet_development_apt_stage: "{{ lookup('env', 'TMPDIR') | default('/tmp', true) }}/billet-development-host-check-mode"
     billet_development_tls_caroot: "{{ lookup('env', 'TMPDIR') | default('/tmp', true) }}/billet-development-host-check-mode/caroot"
     billet_development_tls_dir: "{{ lookup('env', 'TMPDIR') | default('/tmp', true) }}/billet-development-host-check-mode/tls"
     billet_development_proxy_config_dir: "{{ lookup('env', 'TMPDIR') | default('/tmp', true) }}/billet-development-host-check-mode/proxy"
     billet_development_proxy_log_path: "{{ lookup('env', 'TMPDIR') | default('/tmp', true) }}/billet-development-host-check-mode/logs/caddy.log"
+  pre_tasks:
+    - name: Model an interrupted package setup
+      ansible.builtin.file:
+        path: "{{ billet_development_apt_stage }}"
+        state: directory
+        mode: "0700"
+      check_mode: false
+      when: ansible_facts["system"] == "Linux"
   roles:
     - role: junioryono.billet.development_host
       when: ansible_facts["system"] == "Linux"
@@ -18,8 +27,16 @@
       ansible.builtin.assert:
         that:
           - billet_development_linux_package_prediction is changed
+          - billet_development_linux_package_prediction.msg == 'Would verify the publisher repositories and install Caddy, mkcert.'
           - billet_development_certificate_prediction is changed
           - billet_development_proxy_files_prediction is changed
+      when: ansible_facts["system"] == "Linux"
+  post_tasks:
+    - name: Remove the interrupted package setup fixture
+      ansible.builtin.file:
+        path: "{{ billet_development_apt_stage }}"
+        state: absent
+      check_mode: false
       when: ansible_facts["system"] == "Linux"
 
 - name: Verify development tool probes run in check mode
