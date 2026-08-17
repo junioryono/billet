@@ -76,25 +76,12 @@ jobs:
           # release surface on the minor branch, and tag the resulting commit.
           sed -E -i "s#junioryono/billet/actions/setup-docker-builder@(main|v[0-9]+\\.[0-9]+\\.[0-9]+)#junioryono/billet/actions/setup-docker-builder@${TAG}#" actions/build-push-action/action.yml
           sed -E -i "s#junioryono/billet/actions/(stickydisk|stop-docker-builder)@(main|v[0-9]+\\.[0-9]+\\.[0-9]+)#junioryono/billet/actions/\\1@${TAG}#" actions/setup-docker-builder/action.yml
-          mapfile -t internal_refs < <(grep -RhE --include='action.yml' '^[[:space:]]+uses: junioryono/billet/actions/[^[:space:]@]+@' actions)
-          refs_are_exact=true
-          for ref in "${internal_refs[@]}"; do
-            [[ "${ref}" == *"@${TAG}" ]] || refs_are_exact=false
-          done
-          if [[ ${#internal_refs[@]} -ne 3 || "${refs_are_exact}" != true ]]; then
-            printf 'release action references did not all resolve exactly to %s:\n%s\n' "${TAG}" "${internal_refs[*]}" >&2
-            exit 1
-          fi
 
           # A COLLECTION INSTALLED FROM A GIT TAG STILL READS galaxy.yml. The
           # tag and that metadata must describe the same artifact, or Ansible
           # reports a different version from the one the operator pinned.
           sed -E -i "s#^version: [0-9]+\.[0-9]+\.[0-9]+$#version: ${COLLECTION_VERSION}#" ansible_collections/junioryono/billet/galaxy.yml
-          actual_collection_version="$(sed -n 's/^version: //p' ansible_collections/junioryono/billet/galaxy.yml)"
-          if [[ "${actual_collection_version}" != "${COLLECTION_VERSION}" ]]; then
-            printf 'Ansible collection version is %s, expected %s\n' "${actual_collection_version}" "${COLLECTION_VERSION}" >&2
-            exit 1
-          fi
+          RELEASE_TAG="${TAG}" scripts/check-release-metadata.sh
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add actions/build-push-action/action.yml actions/setup-docker-builder/action.yml ansible_collections/junioryono/billet/galaxy.yml
