@@ -65,6 +65,61 @@ func TestProductionSurfacesUseTheTestedSecurityHelpers(t *testing.T) {
 		`- "{{ billet_development_apt_stage }}/verify-repository-key.sh"`)
 	assertContains(t, filepath.Join("..", ".github", "workflows", "cut-release.yml"),
 		"run: scripts/plan-release.sh")
+	assertContains(t, filepath.Join("..", ".github", "workflows", "cut-release.yml"),
+		"ansible_collections/junioryono/billet/galaxy.yml")
+	assertContains(t, filepath.Join("..", ".github", "workflows", "cut-release.yml"),
+		"scripts/check-release-metadata.sh")
+	assertContains(t, filepath.Join("..", ".github", "workflows", "release.yml"),
+		"run: scripts/check-release-metadata.sh")
+}
+
+func TestReleaseMetadataMustMatchTheTag(t *testing.T) {
+	t.Parallel()
+
+	checker, err := filepath.Abs("check-release-metadata.sh")
+	if err != nil {
+		t.Fatalf("absolute metadata checker path: %v", err)
+	}
+	for _, tc := range []struct {
+		name              string
+		tag               string
+		collectionVersion string
+		actionVersion     string
+		wantSuccess       bool
+	}{
+		{name: "matching release", tag: "v0.4.3", collectionVersion: "0.4.3", actionVersion: "v0.4.3", wantSuccess: true},
+		{name: "stale collection", tag: "v0.4.3", collectionVersion: "0.4.2", actionVersion: "v0.4.3"},
+		{name: "stale action", tag: "v0.4.3", collectionVersion: "0.4.3", actionVersion: "v0.4.2"},
+		{name: "invalid tag", tag: "release-4", collectionVersion: "4.0.0", actionVersion: "release-4"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			repository := t.TempDir()
+			collection := filepath.Join(repository, "ansible_collections", "junioryono", "billet")
+			actions := filepath.Join(repository, "actions")
+			if err := os.MkdirAll(collection, 0o755); err != nil {
+				t.Fatalf("create collection directory: %v", err)
+			}
+			if err := os.MkdirAll(actions, 0o755); err != nil {
+				t.Fatalf("create actions directory: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(collection, "galaxy.yml"), []byte("version: "+tc.collectionVersion+"\n"), 0o600); err != nil {
+				t.Fatalf("write galaxy metadata: %v", err)
+			}
+			actionBody := fmt.Sprintf("  uses: junioryono/billet/actions/one@%s\n  uses: junioryono/billet/actions/two@%s\n  uses: junioryono/billet/actions/three@%s\n", tc.actionVersion, tc.actionVersion, tc.actionVersion)
+			if err := os.WriteFile(filepath.Join(actions, "action.yml"), []byte(actionBody), 0o600); err != nil {
+				t.Fatalf("write action metadata: %v", err)
+			}
+			cmd := exec.CommandContext(t.Context(), checker)
+			cmd.Dir = repository
+			cmd.Env = append(os.Environ(), "RELEASE_TAG="+tc.tag)
+			output, err := cmd.CombinedOutput()
+			if (err == nil) != tc.wantSuccess {
+				t.Fatalf("metadata check error = %v; want success %t\n%s", err, tc.wantSuccess, output)
+			}
+		})
+	}
 }
 
 func TestReleasePlannerOrdersNewSeriesWithoutBlockingMaintainedHotfixes(t *testing.T) {
@@ -89,8 +144,8 @@ func TestReleasePlannerOrdersNewSeriesWithoutBlockingMaintainedHotfixes(t *testi
 		wantSuccess bool
 	}{
 		{name: "backward new series", requested: "v0.3.0"},
-		{name: "forward new series", requested: "v0.6.0", wantOutput: "tag=v0.6.0\nbranch=release/v0.6\n", wantSuccess: true},
-		{name: "maintained older series hotfix", requested: "v0.4.3", wantOutput: "tag=v0.4.3\nbranch=release/v0.4\n", wantSuccess: true},
+		{name: "forward new series", requested: "v0.6.0", wantOutput: "tag=v0.6.0\nbranch=release/v0.6\ncollection_version=0.6.0\n", wantSuccess: true},
+		{name: "maintained older series hotfix", requested: "v0.4.3", wantOutput: "tag=v0.4.3\nbranch=release/v0.4\ncollection_version=0.4.3\n", wantSuccess: true},
 		{name: "backward older series patch", requested: "v0.4.1"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
