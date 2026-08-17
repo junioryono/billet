@@ -24,7 +24,7 @@ VERSION="${BILLET_VERSION:-latest}"
 CURL="curl -fsSL --proto =https --proto-redir =https"
 
 die() {
-    echo "install: $*" >&2
+    printf 'install: %s\n' "$*" >&2
     exit 1
 }
 
@@ -69,47 +69,14 @@ normalize_platform() {
     echo "${os}_${arch}"
 }
 
-detect_host_platform() {
-    mode="${1:-fatal}"
-    os="$(uname -s)" || {
-        [ "${mode}" = "quiet" ] && return 1
-        die "could not detect the host operating system with uname"
-    }
-    arch="$(uname -m)" || {
-        [ "${mode}" = "quiet" ] && return 1
-        die "could not detect the host architecture with uname"
-    }
-    normalize_platform "${os}" "${arch}" "${mode}"
-}
-
-detect_platform() {
+detect_target_platform() {
     os_set="${BILLET_OS+x}"
     arch_set="${BILLET_ARCH+x}"
-    if [ "${os_set}" = "x" ] || [ "${arch_set}" = "x" ]; then
-        [ "${os_set}" = "x" ] && [ "${arch_set}" = "x" ] ||
-            die "BILLET_OS and BILLET_ARCH must be set together"
-        [ -n "${BILLET_OS}" ] && [ -n "${BILLET_ARCH}" ] ||
-            die "BILLET_OS and BILLET_ARCH must not be empty"
-        normalize_platform "${BILLET_OS}" "${BILLET_ARCH}"
-        return
-    fi
-
-    detect_host_platform
-}
-
-report_install() {
-    installed="$1"
-    platform="$2"
-
-    if host_platform="$(detect_host_platform quiet)" && [ "${platform}" = "${host_platform}" ]; then
-        version_output="$("${installed}" version)" ||
-            die "the installed ${platform} binary could not run on this host"
-        version="$(printf '%s\n' "${version_output}" | sed -n '1p')"
-        [ -n "${version}" ] || die "the installed ${platform} binary reported no version"
-        printf 'Installed: %s\n' "${version}"
-    else
-        printf 'Installed %s billet to %s\n' "${platform}" "${installed}"
-    fi
+    [ "${os_set}" = "x" ] && [ "${arch_set}" = "x" ] ||
+        die "BILLET_OS and BILLET_ARCH must be set together"
+    [ -n "${BILLET_OS}" ] && [ -n "${BILLET_ARCH}" ] ||
+        die "BILLET_OS and BILLET_ARCH must not be empty"
+    normalize_platform "${BILLET_OS}" "${BILLET_ARCH}"
 }
 
 # sha256 has three spellings across the platforms billet supports.
@@ -127,7 +94,26 @@ main() {
     need curl
     need tar
 
-    platform="$(detect_platform)"
+    host_os="$(uname -s)" || die "could not detect the host operating system with uname"
+    host_arch="$(uname -m)" || die "could not detect the host architecture with uname"
+    if host_platform="$(normalize_platform "${host_os}" "${host_arch}" quiet)"; then
+        host_supported=true
+    else
+        host_supported=false
+        host_platform=
+    fi
+
+    if [ "${BILLET_OS+x}" = "x" ] || [ "${BILLET_ARCH+x}" = "x" ]; then
+        platform="$(detect_target_platform)"
+        native=false
+        if [ "${host_supported}" = true ] && [ "${platform}" = "${host_platform}" ]; then
+            native=true
+        fi
+    else
+        [ "${host_supported}" = true ] || normalize_platform "${host_os}" "${host_arch}"
+        platform="${host_platform}"
+        native=true
+    fi
 
     if [ "${VERSION}" = "latest" ]; then
         base="https://github.com/${REPO}/releases/latest/download"
@@ -136,7 +122,15 @@ main() {
     fi
 
     tmp="$(mktemp -d)"
-    trap 'rm -rf "${tmp}"' EXIT INT TERM
+    staged=
+    install_prefix=
+    cleanup() {
+        rm -rf "${tmp}"
+        if [ -n "${staged}" ]; then
+            ${install_prefix} rm -f "${staged}" >/dev/null 2>&1 || true
+        fi
+    }
+    trap cleanup EXIT INT TERM
 
     echo "Fetching the checksums..."
     ${CURL} "${base}/checksums.txt" -o "${tmp}/checksums.txt" ||
@@ -191,26 +185,41 @@ to somewhere that does."
     # interruption or a full disk in the middle of that leaves a truncated
     # executable where a working billet used to be, which is a worse outcome than
     # any failure this script is trying to avoid.
-    staged="${INSTALL_DIR}/.${BIN}.incoming"
-
-    install_with() {
-        $1 cp "${tmp}/${BIN}" "${staged}" &&
-            $1 chmod 0755 "${staged}" &&
-            $1 mv "${staged}" "${INSTALL_DIR}/${BIN}"
-    }
-
     if [ -w "${INSTALL_DIR}" ]; then
-        install_with "" || die "could not install to ${INSTALL_DIR}"
+        install_prefix=
     elif command -v sudo >/dev/null 2>&1; then
         echo "Installing to ${INSTALL_DIR} (needs sudo)..."
-        install_with sudo || die "could not install to ${INSTALL_DIR}"
+        install_prefix=sudo
     else
         die "${INSTALL_DIR} is not writable and sudo is not available.
 Set BILLET_INSTALL_DIR to somewhere you can write."
     fi
 
+    staged="$(${install_prefix} mktemp "${INSTALL_DIR}/.${BIN}.incoming.XXXXXX")" ||
+        die "could not create a staging file in ${INSTALL_DIR}"
+    ${install_prefix} cp "${tmp}/${BIN}" "${staged}" &&
+        ${install_prefix} chmod 0755 "${staged}" ||
+        die "could not stage billet in ${INSTALL_DIR}"
+
+    installed_version=
+    if [ "${native}" = true ]; then
+        version_output="$("${staged}" version)" ||
+            die "the staged ${platform} binary could not run on this host; the existing billet was not replaced"
+        installed_version="$(printf '%s\n' "${version_output}" | sed -n '1p')"
+        [ -n "${installed_version}" ] ||
+            die "the staged ${platform} binary reported no version; the existing billet was not replaced"
+    fi
+
+    ${install_prefix} mv "${staged}" "${INSTALL_DIR}/${BIN}" ||
+        die "could not install to ${INSTALL_DIR}"
+    staged=
+
     echo
-    report_install "${INSTALL_DIR}/${BIN}" "${platform}"
+    if [ "${native}" = true ]; then
+        printf 'Installed: %s\n' "${installed_version}"
+    else
+        printf 'Installed %s billet to %s\n' "${platform}" "${INSTALL_DIR}/${BIN}"
+    fi
     echo
     echo "Next:"
     echo "  billet github-app create --org YOUR-ORG"
