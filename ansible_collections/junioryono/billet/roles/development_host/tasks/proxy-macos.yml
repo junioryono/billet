@@ -52,7 +52,9 @@
       billet_development_proxy_config_template is changed or
       billet_development_proxy_environment_file is changed or
       billet_development_certificate_mint is changed or
-      billet_development_certificate_permissions is changed
+      billet_development_certificate_permissions is changed or
+      billet_development_certificate_prediction is changed or
+      billet_development_proxy_files_prediction is changed
     )
   changed_when: true
   become: true

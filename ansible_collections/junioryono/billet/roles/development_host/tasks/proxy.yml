@@ -1,4 +1,9 @@
 ---
+- name: Inspect the development proxy configuration directory
+  ansible.builtin.stat:
+    path: "{{ billet_development_proxy_config_dir }}"
+  register: billet_development_proxy_config_dir_stat
+
 - name: Create development proxy directories
   ansible.builtin.file:
     path: "{{ item.path }}"
@@ -21,7 +26,9 @@
     group: "{{ billet_development_group_result.stdout }}"
     mode: "0644"
   register: billet_development_proxy_config_copy
-  when: billet_development_proxy_config_src | length > 0
+  when:
+    - billet_development_proxy_config_src | length > 0
+    - not ansible_check_mode or billet_development_proxy_config_dir_stat.stat.exists
   become: true
 
 - name: Install the default development proxy configuration
@@ -32,7 +39,9 @@
     group: "{{ billet_development_group_result.stdout }}"
     mode: "0644"
   register: billet_development_proxy_config_template
-  when: billet_development_proxy_config_src | length == 0
+  when:
+    - billet_development_proxy_config_src | length == 0
+    - not ansible_check_mode or billet_development_proxy_config_dir_stat.stat.exists
   become: true
 
 - name: Create the development proxy routes file
@@ -43,6 +52,7 @@
     owner: "{{ billet_development_user }}"
     group: "{{ billet_development_group_result.stdout }}"
     mode: "0644"
+  when: not ansible_check_mode or billet_development_proxy_config_dir_stat.stat.exists
   become: true
 
 - name: Render the development proxy environment
@@ -54,7 +64,17 @@
     mode: "0600"
   register: billet_development_proxy_environment_file
   no_log: true
+  when: not ansible_check_mode or billet_development_proxy_config_dir_stat.stat.exists
   become: true
+
+- name: Predict development proxy file installation
+  ansible.builtin.debug:
+    msg: Would install the development proxy configuration, routes and environment.
+  register: billet_development_proxy_files_prediction
+  when:
+    - ansible_check_mode
+    - not billet_development_proxy_config_dir_stat.stat.exists
+  changed_when: true
 
 - name: Validate the development proxy configuration
   ansible.builtin.command:
