@@ -43,6 +43,11 @@ jobs:
           # changelog. A shallow clone gives it neither.
           fetch-depth: 0
 
+      - name: Verify release metadata matches the tag
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: scripts/check-release-metadata.sh
+
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
