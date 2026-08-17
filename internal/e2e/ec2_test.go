@@ -3,6 +3,7 @@ package e2e
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -428,35 +429,41 @@ func TestAJobReachesACloudInstance(t *testing.T) {
 			running, lease.ID)
 	}
 
-	// The job finishes, and the instance goes with it.
-	if err := s.runner.Destroy(t.Context(), 501); err != nil {
-		t.Fatalf("Destroy: %v", err)
+	// The job finishes, and the instance is ASKED to go.
+	//
+	// A TERMINATE IS A REQUEST, NOT A COMPLETION. Unlike `docker rm --force`,
+	// TerminateInstances returns once the request is accepted and the instance sits
+	// in shutting-down for a while afterwards. So the node answers ErrCustody: it
+	// is holding this lease's capacity until the machine is provably gone, and the
+	// listener must not release it.
+	//
+	// THIS TEST USED TO PIN THE OPPOSITE, and called it a documented property —
+	// Destroy reported plain success inside that window and the listener released
+	// on it. That is #46, and the reason it is worse than an over-commit is that
+	// Destroy is reached while the guest is still working: a drain, a custody
+	// teardown, an operator killing a job. A second job could start for the same
+	// repository while the first was still finishing a deploy.
+	err = s.runner.Destroy(t.Context(), 501)
+	if !errors.Is(err, server.ErrCustody) {
+		t.Fatalf("Destroy answered %v; while the machine is still shutting down it must "+
+			"answer ErrCustody, or the listener releases the capacity underneath it", err)
 	}
 
 	if got := s.cloud.terminatedIDs(); len(got) != 1 || got[0] != id {
 		t.Fatalf("terminated %v, want the instance that was started (%s)", got, id)
 	}
 
-	// A TERMINATE IS A REQUEST, NOT A COMPLETION, and the inventory says so.
-	//
-	// Unlike `docker rm --force`, TerminateInstances returns once the request is
-	// accepted and the instance sits in shutting-down for a while afterwards.
-	// billet keeps reporting it for that window, because `shutting-down` is one of
-	// the states it asks for and counts as running.
-	//
-	// WHAT THIS ASSERTS IS THE INVENTORY, WHICH IS THIS PACKAGE'S HALF. What the
-	// control plane then does with it — holding quarantined capacity for anything
-	// still reported — is Reconcile's, and is tested against the ledger in
-	// internal/alloc. Claiming the capacity half here would be claiming something
-	// these lines do not observe.
-	// DESTROY REPORTED SUCCESS WHILE THE MACHINE IS STILL SHUTTING DOWN, which is
-	// the divergence from the container backend stated in ec2.Destroy's comment.
-	// Pinned by a test so it is a documented property rather than something the
-	// next reader discovers.
+	// AND THE WINDOW IS REAL IN THIS FAKE, which is what makes the assertion above
+	// mean anything: a fake that finished the termination synchronously would let
+	// a Destroy that claimed confirmation pass.
 	if !s.cloud.stillShuttingDown(id) {
 		t.Fatal("the fake finished the termination synchronously, so this test can no longer " +
 			"observe the window Destroy returns inside")
 	}
+
+	// WHAT THE INVENTORY ASSERTS IS THIS PACKAGE'S HALF. What the control plane
+	// then does with it — holding quarantined capacity for anything still reported
+	// — is Reconcile's, and is tested against the ledger in internal/alloc.
 
 	during, err := s.runner.Instances(t.Context())
 	if err != nil {

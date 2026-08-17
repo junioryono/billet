@@ -136,12 +136,15 @@ func (f *fakeEC2) paramsFor(t *testing.T, action string) url.Values {
 	return found[0]
 }
 
-// allParamsFor returns the parameters of every call to an action, in order.
+// runInstancesCalls returns the parameters of every launch, in order.
 //
 // For the case where the interesting request is neither the first nor the last —
 // checking the MIDDLE launch is what catches a value that was hardcoded to the
-// one every other fixture happens to use.
-func (f *fakeEC2) allParamsFor(action string) []url.Values {
+// one every other fixture happens to use. Since #49 a single Launch can make
+// several of these, walking the operator's declared shapes.
+func (f *fakeEC2) runInstancesCalls() []url.Values {
+	const action = "RunInstances"
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -380,6 +383,191 @@ func validSpec() provider.Spec {
 	}
 }
 
+// #49. A SHAPE AWS HAS NONE OF FALLS THROUGH TO THE NEXT DECLARED ONE.
+//
+// InsufficientInstanceCapacity is the single most likely way a cloud launch fails
+// for a reason retrying the same call cannot fix — AWS has none of that shape in
+// that availability zone right now. And this is the AVAILABILITY backend: it
+// exists so one runs-on label survives the bare-metal host going away, which it
+// does not do if it gives up while the operator's own second choice was sitting
+// in the list unused.
+//
+// The operator already wrote an ordered list of what they are willing to buy.
+// Walking it is the same idea as a tier's provider preference, one level down.
+func TestAShapeAWSHasNoneOfFallsThroughToTheNextDeclaredOne(t *testing.T) {
+	f := newFakeEC2(t)
+
+	var refused int
+
+	f.respond = func(action string, params url.Values) (int, string) {
+		if action == "RunInstances" && params.Get("InstanceType") == "c7i.2xlarge" {
+			refused++
+
+			return http.StatusInternalServerError, apiFailure("InsufficientInstanceCapacity")
+		}
+
+		return http.StatusOK, defaultReply(action)
+	}
+
+	p := newTestProvider(t, f, nil)
+
+	inst, err := p.Launch(t.Context(), validSpec())
+	if err != nil {
+		t.Fatalf("Launch gave up while a larger declared shape was still untried: %v", err)
+	}
+
+	if inst == nil {
+		t.Fatal("Launch reported no error and no instance")
+	}
+
+	runs := f.runInstancesCalls()
+	if len(runs) != 2 {
+		t.Fatalf("made %d RunInstances calls, want 2 (the refused shape, then the next)", len(runs))
+	}
+
+	if got := runs[1].Get("InstanceType"); got != "c7i.8xlarge" {
+		t.Errorf("the second attempt asked for %q, want the next declared shape that fits", got)
+	}
+
+	if refused != 1 {
+		t.Errorf("the exhausted shape was asked for %d times; retrying the same shape cannot "+
+			"change the answer", refused)
+	}
+}
+
+// AND THE CLIENT TOKEN CHANGES WITH THE SHAPE, which is the half of #49 that is
+// easy to get wrong and impossible to see afterwards.
+//
+// The token is the idempotency key that makes an ambiguous launch safe: AWS
+// honours it and returns the SAME instance rather than starting a second. It was
+// the instance name, which is unique per lease — so a fallback to a different
+// shape would have reused it, and AWS answers a reused token either with the
+// first attempt's outcome or with IdempotentParameterMismatch. Either way the
+// fallback could never launch anything, and the feature would be dead code that
+// looked implemented.
+//
+// It stays STABLE PER SHAPE, though, because that is what the token is for: a
+// RunInstances whose response is lost must be re-sendable without launching a
+// second machine.
+func TestEachShapeAttemptCarriesItsOwnIdempotencyKey(t *testing.T) {
+	f := newFakeEC2(t)
+	f.respond = func(action string, params url.Values) (int, string) {
+		if action == "RunInstances" && params.Get("InstanceType") == "c7i.2xlarge" {
+			return http.StatusInternalServerError, apiFailure("InsufficientInstanceCapacity")
+		}
+
+		return http.StatusOK, defaultReply(action)
+	}
+
+	p := newTestProvider(t, f, nil)
+
+	if _, err := p.Launch(t.Context(), validSpec()); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	runs := f.runInstancesCalls()
+	if len(runs) != 2 {
+		t.Fatalf("made %d RunInstances calls, want 2", len(runs))
+	}
+
+	first, second := runs[0].Get("ClientToken"), runs[1].Get("ClientToken")
+
+	if first == "" || second == "" {
+		t.Fatal("a launch went out with no idempotency key, so a retry AWS performs itself " +
+			"could start a second instance for one job")
+	}
+
+	if first == second {
+		t.Error("both shapes were requested under the same idempotency key; AWS answers a " +
+			"reused token with the first attempt's outcome, so the fallback could never launch")
+	}
+
+	// STABLE, not merely unique: a token that varied per call would defeat the
+	// purpose it exists for.
+	f2 := newFakeEC2(t)
+	p2 := newTestProvider(t, f2, nil)
+
+	if _, err := p2.Launch(t.Context(), validSpec()); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	if got := f2.paramsFor(t, "RunInstances").Get("ClientToken"); got != first {
+		t.Errorf("the same lease and shape produced two different idempotency keys (%q and %q); "+
+			"a lost response could then launch a second instance for one job", first, got)
+	}
+}
+
+// A FALLBACK IS ONLY SAFE AFTER A REFUSAL THAT PROVES NOTHING STARTED.
+//
+// This is the constraint that makes the whole feature safe, and getting it wrong
+// is how one job becomes two runners. InsufficientInstanceCapacity is a
+// synchronous verdict from AWS: the request was rejected and no instance exists.
+// A TRANSPORT failure is the opposite — the request may have arrived and
+// committed while the response was lost — so trying a different shape after one
+// could leave two instances carrying the same name, both registered, one of them
+// picking up unrelated work.
+func TestAnAmbiguousFailureDoesNotFallThroughToAnotherShape(t *testing.T) {
+	f := newFakeEC2(t)
+
+	// A body that is not an answer at all: the request reached AWS, and what
+	// happened next is unknowable from here.
+	f.respond = func(action string, params url.Values) (int, string) {
+		if action == "RunInstances" && params.Get("InstanceType") == "c7i.2xlarge" {
+			return http.StatusOK, "<html>not an ec2 response</html>"
+		}
+
+		return http.StatusOK, defaultReply(action)
+	}
+
+	p := newTestProvider(t, f, nil)
+
+	if _, err := p.Launch(t.Context(), validSpec()); err == nil {
+		t.Fatal("an ambiguous launch failure was followed by another attempt; the first " +
+			"instance may exist, and a second would be a duplicate runner for one job")
+	}
+
+	for _, run := range f.runInstancesCalls() {
+		if run.Get("InstanceType") != "c7i.2xlarge" {
+			t.Errorf("after an ambiguous failure billet asked for %q as well; two instances "+
+				"can now carry the same name", run.Get("InstanceType"))
+		}
+	}
+}
+
+// AND WHEN EVERY DECLARED SHAPE IS EXHAUSTED, the error names all of them.
+//
+// An operator reading "insufficient capacity" needs to know billet tried the
+// whole list rather than giving up on the first — those call for different
+// actions (wait, or declare another shape).
+func TestExhaustingEveryShapeSaysSo(t *testing.T) {
+	f := newFakeEC2(t)
+	f.respond = func(action string, params url.Values) (int, string) {
+		if action == "RunInstances" {
+			return http.StatusInternalServerError, apiFailure("InsufficientInstanceCapacity")
+		}
+
+		return http.StatusOK, defaultReply(action)
+	}
+
+	p := newTestProvider(t, f, nil)
+
+	_, err := p.Launch(t.Context(), validSpec())
+	if err == nil {
+		t.Fatal("every declared shape was refused and the launch reported success")
+	}
+
+	if n := len(f.runInstancesCalls()); n != 2 {
+		t.Errorf("tried %d shapes, want both declared ones that fit", n)
+	}
+
+	for _, want := range []string{"c7i.2xlarge", "c7i.8xlarge"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the error does not mention %s, so an operator cannot tell whether "+
+				"billet tried the whole list: %v", want, err)
+		}
+	}
+}
+
 // A launch has to say every one of these, and each was chosen rather than
 // defaulted.
 func TestALaunchTellsEC2WhatToStart(t *testing.T) {
@@ -431,13 +619,21 @@ func TestALaunchTellsEC2WhatToStart(t *testing.T) {
 	}
 }
 
-// THE NAME IS THE IDEMPOTENCY KEY, and this is the assertion that keeps it one.
+// EVERY LAUNCH CARRIES AN IDEMPOTENCY KEY DERIVED FROM ITS LEASE, and this is
+// the assertion that keeps it one.
 //
 // A RunInstances that commits and loses its response is the case the Provider
 // interface warns about, and it is the one where a retry starts a second machine
 // for one job — two runners, one of which nothing will ever tear down. AWS honours
 // a client token by returning the SAME instance, and billet's instance name
 // encodes a lease id, so it is unique by construction and never reused.
+//
+// ASSERTED AS A PROPERTY RATHER THAN A SPELLING. This used to require the token
+// to equal the instance name exactly, and then #49 gave each shape attempt its
+// own token — a change that is correct and that a literal comparison reports as
+// a regression. What has to hold is that the token is derived from this lease
+// and from nothing outside it, so no two leases can ever collide and a re-send
+// of the same request reproduces it.
 func TestALaunchCannotStartTwoMachinesForOneJob(t *testing.T) {
 	f := newFakeEC2(t)
 	p := newTestProvider(t, f, nil)
@@ -448,9 +644,26 @@ func TestALaunchCannotStartTwoMachinesForOneJob(t *testing.T) {
 		t.Fatalf("Launch: %v", err)
 	}
 
-	if got := f.paramsFor(t, "RunInstances").Get("ClientToken"); got != spec.Name {
-		t.Errorf("ClientToken = %q, want the instance name %q; without it a retried launch "+
-			"starts a second machine for one job", got, spec.Name)
+	got := f.paramsFor(t, "RunInstances").Get("ClientToken")
+
+	if !strings.Contains(got, spec.Name) {
+		t.Errorf("ClientToken = %q, which is not derived from the lease's instance name %q; "+
+			"two leases could collide on it, and a retried launch could start a second "+
+			"machine for one job", got, spec.Name)
+	}
+
+	// AND IT IS REPRODUCIBLE. A token that varied between two identical requests
+	// would satisfy the check above and defeat the purpose it exists for.
+	f2 := newFakeEC2(t)
+	p2 := newTestProvider(t, f2, nil)
+
+	if _, err := p2.Launch(t.Context(), spec); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	if again := f2.paramsFor(t, "RunInstances").Get("ClientToken"); again != got {
+		t.Errorf("the same request produced two tokens (%q, %q); a re-send after a lost "+
+			"response would start a second machine", got, again)
 	}
 }
 
@@ -809,7 +1022,7 @@ func TestAnImageIsLookedUpOncePerImage(t *testing.T) {
 	// root hardcoded to /dev/xvda — the name every other fixture in this file uses,
 	// including image A's, so A's own request cannot show it. Image B's root is
 	// deliberately /dev/sda1, and it is the MIDDLE request.
-	runs := f.allParamsFor("RunInstances")
+	runs := f.runInstancesCalls()
 	if len(runs) != 3 {
 		t.Fatalf("RunInstances was called %d times, want 3", len(runs))
 	}
@@ -1023,7 +1236,7 @@ func TestDestroyingSomethingAlreadyGoneIsSuccess(t *testing.T) {
 
 	p := newTestProvider(t, f, nil)
 
-	if err := p.Destroy(t.Context(), "i-0abc"); err != nil {
+	if _, err := p.Destroy(t.Context(), "i-0abc"); err != nil {
 		t.Errorf("destroying an instance that is already gone failed: %v", err)
 	}
 }
@@ -1038,8 +1251,65 @@ func TestDestroyDoesNotSwallowARealFailure(t *testing.T) {
 
 	p := newTestProvider(t, f, nil)
 
-	if err := p.Destroy(t.Context(), "i-0abc"); err == nil {
+	if _, err := p.Destroy(t.Context(), "i-0abc"); err == nil {
 		t.Error("a destroy that was refused for a reason billet cannot act on reported success")
+	}
+}
+
+// #46. A TERMINATE REQUEST IS NOT A STOPPED GUEST, and this backend must not
+// claim otherwise.
+//
+// TerminateInstances returns when the request is ACCEPTED. The instance then
+// moves through `shutting-down` for a minute or two, and this backend's own
+// runningState classifies that as a state where the job may still be executing —
+// which is exactly why List asks for it. A caller that read the accepted request
+// as proof would release the lease, and another job could start while the old
+// guest was still finishing a deploy.
+//
+// The assertion is on the Teardown, not on the error: the teardown has not
+// FAILED, so reporting an error would be wrong in the other direction — callers
+// read a destroy error as "retry this" and would keep asking AWS to terminate an
+// instance that is already terminating.
+func TestDestroyDoesNotClaimTheGuestHasStopped(t *testing.T) {
+	f := newFakeEC2(t)
+	p := newTestProvider(t, f, nil)
+
+	state, err := p.Destroy(t.Context(), "i-0abc")
+	if err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+
+	if state == provider.TeardownStopped {
+		t.Error("a terminate request AWS merely accepted was reported as a guest that has stopped; " +
+			"the lease is released on that and the guest keeps running for a minute or two")
+	}
+}
+
+// #48. NOT-FOUND IS NOT PROOF EITHER, because DescribeInstances is eventually
+// consistent and AWS documents that an id RunInstances just returned may not be
+// visible to the very next call.
+//
+// So a terminate issued shortly after a launch — destroyStray is exactly that
+// path, and the one where billet is least sure what exists — can be answered
+// NotFound for an instance that exists and is booting. Idempotent success is
+// still the right ERROR outcome (erroring turns recoverable state into stuck
+// state), but it must not be dressed up as confirmation.
+func TestDestroyDoesNotTreatNotFoundAsProofTheInstanceIsGone(t *testing.T) {
+	f := newFakeEC2(t)
+	f.respond = func(string, url.Values) (int, string) {
+		return http.StatusBadRequest, apiFailure("InvalidInstanceID.NotFound")
+	}
+
+	p := newTestProvider(t, f, nil)
+
+	state, err := p.Destroy(t.Context(), "i-0abc")
+	if err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+
+	if state == provider.TeardownStopped {
+		t.Error("an eventually-consistent NotFound was reported as proof the instance is gone; " +
+			"a destroy shortly after a launch gets that answer for an instance that is booting")
 	}
 }
 

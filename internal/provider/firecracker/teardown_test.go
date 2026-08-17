@@ -32,7 +32,7 @@ func TestTeardownStopsBeforeItDestroysAnything(t *testing.T) {
 		t.Fatalf("stage a corrupt pid file: %v", err)
 	}
 
-	if err := h.p.Destroy(t.Context(), theInstance); err == nil {
+	if _, err := h.p.Destroy(t.Context(), theInstance); err == nil {
 		t.Fatal("Destroy proceeded although it could not tell whether the vmm was running")
 	}
 
@@ -68,7 +68,7 @@ func TestAMicroVMThatCouldNotBeStoppedStaysInTheInventory(t *testing.T) {
 	}
 
 	//nolint:errcheck // the refusal itself is asserted by the test above
-	_ = h.p.Destroy(t.Context(), theInstance)
+	_, _ = h.p.Destroy(t.Context(), theInstance)
 
 	found, err := h.p.List(t.Context())
 	if err != nil {
@@ -172,7 +172,7 @@ func TestAMicroVMSurvivesTheBinaryBeingUpgradedUnderIt(t *testing.T) {
 		t.Errorf("Find after the upgrade: found=%v err=%v", ok, err)
 	}
 
-	if err := upgraded.Destroy(t.Context(), theInstance); err != nil {
+	if _, err := upgraded.Destroy(t.Context(), theInstance); err != nil {
 		t.Errorf("Destroy after the upgrade: %v", err)
 	}
 
@@ -230,7 +230,7 @@ func TestDestroyRefusesAnotherDeploymentsMicroVM(t *testing.T) {
 		t.Fatalf("New for the second deployment: %v", err)
 	}
 
-	if err := stranger.Destroy(t.Context(), theInstance); err == nil {
+	if _, err := stranger.Destroy(t.Context(), theInstance); err == nil {
 		t.Fatal("a second billet on this machine destroyed the first's microVM")
 	}
 
@@ -271,7 +271,7 @@ func TestAVMMThatIgnoresSIGTERMIsKilled(t *testing.T) {
 		t.Fatal("no stand-in vmm was started")
 	}
 
-	if err := h.p.Destroy(t.Context(), theInstance); err != nil {
+	if _, err := h.p.Destroy(t.Context(), theInstance); err != nil {
 		t.Fatalf("Destroy: %v", err)
 	}
 
@@ -322,7 +322,7 @@ func TestAPidBilletCannotVerifyIsNeverKilled(t *testing.T) {
 		t.Fatalf("Launch: %v", err)
 	}
 
-	if err := h.p.Destroy(t.Context(), theInstance); err == nil {
+	if _, err := h.p.Destroy(t.Context(), theInstance); err == nil {
 		t.Fatal("Destroy reported success although it could not verify the vmm's pid")
 	}
 

@@ -761,6 +761,19 @@ func execute(ctx context.Context, compute Compute, cmd nodeapi.Command, draining
 		if err := compute.Destroy(ctx, cmd.RequestID); err != nil {
 			res.Error = err.Error()
 
+			// CUSTODY IS CARRIED HERE TOO, and its absence was #46's other half.
+			//
+			// A teardown a backend only ACCEPTED leaves the node holding the lease
+			// — the guest is still shutting down and its capacity must stay charged
+			// until it is provably gone. Without this flag the plane reads a plain
+			// failure, which it treats as "the compute may still exist, keep the
+			// lease and retry the destroy". That is safe in the same direction, but
+			// it is wrong about who owns the lease: BOTH sides then hold it, the
+			// listener heartbeats a lease the node's janitor is also renewing and
+			// will release, and the retry re-issues a terminate on every pass for
+			// the life of the process.
+			res.Custody = errors.Is(err, server.ErrCustody)
+
 			return res
 		}
 

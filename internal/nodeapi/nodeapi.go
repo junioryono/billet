@@ -36,7 +36,27 @@ import (
 // register a host nothing can ever be placed on — silently, because a node with
 // no capacity is indistinguishable from a busy one. Refusing the registration is
 // the correct outcome rather than an inconvenience, which is what this bump buys.
-const Version = 6
+//
+// VERSION 7 CHANGED WHAT A DESTROY RESULT MEANS, WITHOUT CHANGING ITS SHAPE, and
+// that is exactly why it needs a bump (#46). CommandResult.Custody is an old
+// field that decodes fine in every direction; what is new is that a DESTROY may
+// now set it. Both mixed pairings are unsafe, and neither produces an error:
+//
+//	old node -> new server   The old node reports OK on a terminate AWS merely
+//	                         accepted, so the server has nothing to infer custody
+//	                         from and releases the lease while the guest is still
+//	                         running. The bug this version exists to fix, intact.
+//	new node -> old server   The node sets Custody; a server built before this
+//	                         change does not read it on a DESTROY result — it read
+//	                         it only on a launch — so it treats the answer as an
+//	                         ordinary failure and retries, and the retry is
+//	                         answered by a node that now holds the lease in
+//	                         custody, which that server again cannot see.
+//
+// A silent wrong answer is the case a version refusal is for. Two builds that
+// disagree about what a result MEANS are as incompatible as two that disagree
+// about its fields, and only one of those is visible to a decoder.
+const Version = 7
 
 // CommandKind names what the server is asking a node to do.
 type CommandKind string

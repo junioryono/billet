@@ -77,7 +77,7 @@ func (p *Provider) BuildImage(ctx context.Context, spec BuildSpec) (string, erro
 		stop, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
 		defer cancel()
 
-		if err := p.Destroy(stop, id); err != nil {
+		if _, err := p.Destroy(stop, id); err != nil {
 			p.log.Error("the builder instance could not be terminated and is still costing "+
 				"money; terminate it by hand",
 				"instance", id, "error", err)

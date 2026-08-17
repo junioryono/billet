@@ -40,7 +40,7 @@ func TestRealFirecrackerLaunchAndDestroy(t *testing.T) {
 	t.Cleanup(func() {
 		// WithoutCancel: the test context is done by the time cleanup runs, and a
 		// cleanup that cannot run leaves a microVM, a jail, a tap and a mapped disk.
-		if err := p.Destroy(context.WithoutCancel(t.Context()), name); err != nil {
+		if _, err := p.Destroy(context.WithoutCancel(t.Context()), name); err != nil {
 			t.Errorf("cleanup: %v", err)
 		}
 	})
@@ -129,7 +129,7 @@ func TestRealFirecrackerDestroyLeavesNothing(t *testing.T) {
 		t.Fatalf("Launch: %v", err)
 	}
 
-	if err := p.Destroy(t.Context(), name); err != nil {
+	if _, err := p.Destroy(t.Context(), name); err != nil {
 		t.Fatalf("Destroy: %v", err)
 	}
 
@@ -149,7 +149,7 @@ func TestRealFirecrackerDestroyLeavesNothing(t *testing.T) {
 	}
 
 	// AND DESTROYING AGAIN IS STILL SUCCESS.
-	if err := p.Destroy(t.Context(), name); err != nil {
+	if _, err := p.Destroy(t.Context(), name); err != nil {
 		t.Errorf("the second Destroy: %v", err)
 	}
 }

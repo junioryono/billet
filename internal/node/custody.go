@@ -73,6 +73,40 @@ type custody struct {
 	// the stray grace to every adopted job at the moment it finishes.
 	observed bool
 
+	// asked is true once a teardown has been requested and not confirmed, so the
+	// log line saying so is written once rather than on every tick.
+	//
+	// NOT A GUARD AGAINST RE-REQUESTING. The request is re-issued every tick on
+	// purpose: it is idempotent, it costs one call, and it is the only thing that
+	// recovers a teardown a backend accepted and then did not perform.
+	asked bool
+
+	// unconfirmed is true while this entry's COMPUTE has not been proved gone.
+	//
+	// THE DIFFERENCE BETWEEN AN ENTRY THAT MUST SILENCE THE LISTENER AND ONE THAT
+	// MUST NOT, which is a distinction a bare "is anything held for this request"
+	// cannot make — and getting it wrong breaks a case in either direction:
+	//
+	//	unconfirmed   a teardown was accepted and the guest may still be running.
+	//	              A Destroy for this request must answer ErrCustody, or the
+	//	              caller releases the capacity underneath a live guest (#46).
+	//	confirmed     the compute is gone and only the RELEASE failed — the shape a
+	//	              redelivered assignment after a crash produces, where custody
+	//	              holds one lease and the listener holds another for the same
+	//	              request. Answering ErrCustody there strands the listener's own
+	//	              lease, whose container really was destroyed, because the
+	//	              listener drops the reference without releasing it.
+	//
+	// Set when a teardown could not be confirmed, cleared when it is. An entry
+	// that reaches a confirmed teardown is normally deleted by finish, so a
+	// surviving entry with this false is one whose release did not land.
+	//
+	// ATOMIC FOR THE SAME REASON epoch IS. tendOne writes it while holding
+	// `tending`; the Destroy path reads it while holding `mu`. Those are different
+	// locks by design — Tend must not block on the map mutex — so the field cannot
+	// borrow either one's protection.
+	unconfirmed atomic.Bool
+
 	// since is when custody was taken, for the diagnostic that matters most: how
 	// long capacity has been held for something nobody is watching.
 	since time.Time
@@ -96,6 +130,14 @@ func (r *Runner) adopt(lease *alloc.Lease, inst *provider.Instance) {
 	}
 	entry.epoch.Store(lease.Epoch)
 
+	// UNCONFIRMED, BECAUSE AN ADOPTED GUEST IS RUNNING RIGHT NOW. The zero value
+	// says "the compute is gone and only the bookkeeping is outstanding", which is
+	// the exact opposite of what an adoption is — and a Destroy for this request
+	// would then report success on the strength of it, letting the caller release
+	// capacity underneath a live job. It is cleared the moment a tend proves the
+	// instance gone, which is the ordinary way an adoption ends.
+	entry.unconfirmed.Store(true)
+
 	r.custody[lease.ID] = entry
 }
 
@@ -110,6 +152,20 @@ func (r *Runner) adopt(lease *alloc.Lease, inst *provider.Instance) {
 // assignment for the real request then walks past heldForRequest and starts a
 // second runner, and a completion can never find the entry at all.
 func (r *Runner) hold(lease *alloc.Lease, name string, requestID int64) {
+	// FAILED, not done. This lease's job never started.
+	r.holdWithOutcome(lease, name, requestID, alloc.PhaseFailed)
+}
+
+// holdWithOutcome is hold for a job whose outcome is already known.
+//
+// THE OUTCOME IS A PARAMETER BECAUSE THERE ARE NOW TWO WAYS TO REACH THIS, and
+// they are recorded differently. A launch that could not be confirmed cleaned up
+// is a FAILURE — nothing ran. A teardown the backend merely accepted (#46) is a
+// job that FINISHED, and is only here because EC2 cannot say when its guest
+// stopped. Writing "failed" for the second would put a lie in job_history for
+// every job that completed normally on an EC2 host, and an investigation reading
+// it would see a fleet where nothing ever succeeded.
+func (r *Runner) holdWithOutcome(lease *alloc.Lease, name string, requestID int64, outcome alloc.Phase) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -119,11 +175,22 @@ func (r *Runner) hold(lease *alloc.Lease, name string, requestID int64) {
 		name:      name,
 		requestID: requestID,
 		discard:   true,
-		// FAILED, not done. This lease's job never started.
-		outcome: alloc.PhaseFailed,
-		since:   r.now(),
+		outcome:   outcome,
+		since:     r.now(),
+		// NOT observed, even for a teardown of an instance billet launched and
+		// holds an id for. The grace before an absence is believed is what stops an
+		// eventually-consistent DescribeInstances (#48) from proving the guest is
+		// gone when it is merely not visible yet — and that is exactly the window a
+		// destroy shortly after a launch lands in. An instance that IS visible sets
+		// this on the first tick and costs nothing.
 	}
 	entry.epoch.Store(lease.Epoch)
+
+	// UNCONFIRMED BY CONSTRUCTION. Both routes here exist because billet could not
+	// establish that a piece of compute is gone — a launch whose cleanup Find could
+	// not confirm, or a teardown a backend merely accepted. Until something proves
+	// otherwise, a Destroy for this request must not report success.
+	entry.unconfirmed.Store(true)
 
 	r.custody[lease.ID] = entry
 }
@@ -396,6 +463,10 @@ func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 			return nil
 		}
 
+		// PROVED GONE, by a sustained absence rather than by a backend saying so —
+		// which is the only proof an asynchronous teardown ever offers.
+		c.unconfirmed.Store(false)
+
 		return r.finish(ctx, c)
 	}
 
@@ -410,9 +481,43 @@ func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 		return nil
 	}
 
-	if err := r.provider.Destroy(ctx, inst.ID); err != nil {
+	state, err := r.provider.Destroy(ctx, inst.ID)
+	if err != nil {
 		return fmt.Errorf("node: destroy %s held for lease %s: %w", c.name, c.leaseID, err)
 	}
+
+	// THE SAME TRAP AS THE LISTENER'S, ONE LAYER DOWN (#46). finish releases the
+	// lease, and calling it on the strength of an ACCEPTED teardown would free the
+	// capacity while the guest was still shutting down — inside the very machinery
+	// that exists to stop that happening.
+	//
+	// Nothing else is needed to recover: the entry stays in custody, so the next
+	// tick looks again, and the release happens when Find reports the instance
+	// gone. That path is already written above and already applies the grace an
+	// unobserved absence needs.
+	if state != provider.TeardownStopped {
+		c.unconfirmed.Store(true)
+
+		// SAID ONCE, THOUGH THE REQUEST IS RE-ISSUED EVERY TICK. Re-asking is the
+		// safety net for a teardown that was accepted and did not take, and it is
+		// idempotent and cheap; saying so on every tick for the minute or two an
+		// EC2 instance spends shutting down is just noise in the one log an
+		// operator reads to find out what a host is holding.
+		if !c.asked {
+			c.asked = true
+
+			r.log.Info("asked the backend to remove compute being held; it has not confirmed "+
+				"the guest stopped, so the capacity stays held",
+				"name", c.name, "lease", c.leaseID)
+		}
+
+		return nil
+	}
+
+	// PROVED GONE. What is left for this entry is bookkeeping — releasing the
+	// lease — so a Destroy arriving for its request is answerable with the truth
+	// rather than with custody.
+	c.unconfirmed.Store(false)
 
 	r.log.Info("released compute that was being held",
 		"name", c.name, "lease", c.leaseID, "adopted", !c.discard,
@@ -492,6 +597,28 @@ func (r *Runner) heldForRequest(requestID int64) (string, bool) {
 
 	for _, c := range r.custody {
 		if c.requestID == requestID {
+			return c.leaseID, true
+		}
+	}
+
+	return "", false
+}
+
+// unconfirmedForRequest reports a lease held for a request whose COMPUTE has not
+// been proved gone.
+//
+// NARROWER THAN heldForRequest ON PURPOSE, and the narrowness is the point. A
+// Destroy has to answer ErrCustody while this request's compute might still be
+// running, and must NOT answer it merely because some entry exists — an entry
+// whose container was destroyed and whose release failed belongs to the caller's
+// ordinary path, and silencing that one strands a lease nothing else will
+// release. See custody.unconfirmed.
+func (r *Runner) unconfirmedForRequest(requestID int64) (string, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for _, c := range r.custody {
+		if c.requestID == requestID && c.unconfirmed.Load() {
 			return c.leaseID, true
 		}
 	}
@@ -623,6 +750,14 @@ func (r *Runner) Superseded() {
 			observed: true,
 		}
 		entry.epoch.Store(lease.Epoch)
+
+		// UNCONFIRMED, FOR THE SAME REASON AS AN ADOPTION: this entry was built
+		// from an instance in the RUNNING set, so its guest is executing a job
+		// right now. Left at the zero value it would read as "the compute is gone
+		// and only the release is outstanding", and a Destroy for this request
+		// would report success on it — releasing the capacity of a superseded
+		// process's live job, which is the one thing supersession exists to hold.
+		entry.unconfirmed.Store(true)
 
 		r.custody[lease.ID] = entry
 	}

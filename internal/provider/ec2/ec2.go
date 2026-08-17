@@ -25,7 +25,9 @@ package ec2
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -307,18 +309,30 @@ func (p *Provider) securityGroups(trust provider.TrustClass) []string {
 	return p.cfg.SecurityGroupIDs
 }
 
-// instanceTypeFor picks the shape to buy for a lease.
+// instanceTypesFor lists the shapes that could hold a lease, in the operator's
+// own order.
 //
-// THE FIRST DECLARED SHAPE THAT FITS, in the operator's order, which is the same
-// rule a tier's provider list follows: the order is a preference and billet does
-// not reorder it. Picking the "smallest" instead would look thriftier and would
-// quietly override an operator who listed a compute-optimised shape first for a
-// reason billet cannot see.
-func (p *Provider) instanceTypeFor(spec provider.Spec) (config.EC2InstanceType, error) {
+// IN THE OPERATOR'S ORDER, which is the same rule a tier's provider list
+// follows: the order is a preference and billet does not reorder it. Sorting by
+// size instead would look thriftier and would quietly override an operator who
+// listed a compute-optimised shape first for a reason billet cannot see.
+//
+// ALL OF THEM RATHER THAN THE FIRST, because the first can be unavailable (#49).
+// InsufficientInstanceCapacity is the most likely way a cloud launch fails for a
+// reason retrying cannot fix, and this is the AVAILABILITY backend — giving up
+// while the operator's own second choice sat unused in the list is the one
+// failure it exists to prevent.
+func (p *Provider) instanceTypesFor(spec provider.Spec) ([]config.EC2InstanceType, error) {
+	var fits []config.EC2InstanceType
+
 	for _, it := range p.cfg.InstanceTypes {
 		if it.VCPU >= spec.VCPU && it.Memory >= spec.Memory {
-			return it, nil
+			fits = append(fits, it)
 		}
+	}
+
+	if len(fits) > 0 {
+		return fits, nil
 	}
 
 	declared := make([]string, 0, len(p.cfg.InstanceTypes))
@@ -329,11 +343,46 @@ func (p *Provider) instanceTypeFor(spec provider.Spec) (config.EC2InstanceType, 
 	// NAMES BOTH SIDES. The allocator has already escrowed this size against this
 	// node, so reaching here means the config promised capacity in shapes it never
 	// declared — and an operator needs to see the gap rather than the conclusion.
-	return config.EC2InstanceType{}, fmt.Errorf(
+	return nil, fmt.Errorf(
 		"ec2: no declared instance type holds %d vCPU and %s (declared: %s); "+
 			"node.max_vcpu and node.max_memory promised the allocator capacity that "+
 			"node.ec2.instance_types cannot supply",
 		spec.VCPU, spec.Memory, strings.Join(declared, ", "))
+}
+
+// clientTokenFor is the idempotency key for one lease on one shape.
+//
+// THE NAME ALONE WAS NOT ENOUGH ONCE A LAUNCH COULD TRY A SECOND SHAPE (#49).
+//
+// The token is what makes an ambiguous launch safe: a RunInstances that commits
+// and loses its response can be re-sent, and AWS honours the token by returning
+// the SAME instance rather than starting a second. That requires it to be STABLE
+// for a given request — so it cannot simply be randomised per attempt.
+//
+// But a fallback to a different shape is a genuinely DIFFERENT request. Reusing
+// the token there gets the first attempt's outcome back, or
+// IdempotentParameterMismatch, and either way the fallback could never launch
+// anything — a feature that looks implemented and is dead.
+//
+// So the key is (lease name, shape): stable for the request it identifies,
+// different for a request that differs. The name already encodes the lease and
+// is never reused, so this is unique by construction.
+//
+// THE SHAPE IS HASHED RATHER THAN APPENDED, because a client token is capped at
+// 64 ASCII characters and an instance name is already 39 of them — `billet-` plus
+// a 32-hex lease id. Concatenating left 24 characters for the type, which every
+// EC2 shape in existence fits inside today and which is a cliff nothing guards:
+// this package deliberately keeps NO table of instance types, so that shapes AWS
+// adds later work with no code change — and a 25-character one would have made
+// every launch fail outright, before the fallback could help. A fixed-width
+// digest removes the question rather than bounding it.
+//
+// The lease stays legible in the clear, because the token is what an operator has
+// to work with when they find a stray instance in CloudTrail.
+func clientTokenFor(name, instanceType string) string {
+	sum := sha256.Sum256([]byte(instanceType))
+
+	return name + "-" + hex.EncodeToString(sum[:])[:12]
 }
 
 // Launch starts one instance running the job its JIT config names.
@@ -366,7 +415,7 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*provider.In
 			"starting a runner and the job would stay queued", spec.Name)
 	}
 
-	instanceType, err := p.instanceTypeFor(spec)
+	instanceTypes, err := p.instanceTypesFor(spec)
 	if err != nil {
 		return nil, err
 	}
@@ -396,6 +445,47 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*provider.In
 			"the tier's command is too long to carry", spec.Name, len(userData), maxUserData)
 	}
 
+	// EACH DECLARED SHAPE THAT FITS, IN ORDER, UNTIL ONE STARTS (#49).
+	//
+	// The loop advances on exactly one condition — AWS refusing synchronously for
+	// want of capacity — and that narrowness is the whole safety argument. See
+	// capacityRefusal: those codes are AWS's own verdict that the request was
+	// rejected and nothing was started, so another shape is a fresh question. An
+	// AMBIGUOUS failure is the opposite; trying again after one could leave two
+	// instances carrying this lease's name, both registered with GitHub.
+	refusals := make([]string, 0, len(instanceTypes))
+
+	for _, instanceType := range instanceTypes {
+		inst, err := p.runOne(ctx, spec, instanceType, encodedUserData)
+		if err == nil {
+			return inst, nil
+		}
+
+		code, coded := codeOf(err)
+		if !coded || !capacityRefusal(code) {
+			return nil, err
+		}
+
+		refusals = append(refusals, instanceType.Type+": "+code)
+
+		p.log.Warn("aws has no capacity for this shape right now; trying the next declared one",
+			"runner", spec.Name, "type", instanceType.Type, "code", code)
+	}
+
+	// NAMES EVERY SHAPE IT TRIED. "Insufficient capacity" alone leaves an operator
+	// unable to tell whether billet gave up on the first entry or exhausted the
+	// list, and those call for different actions — wait, or declare another shape.
+	return nil, fmt.Errorf("ec2: launch %s: every declared instance type that fits is "+
+		"unavailable right now (%s)", spec.Name, strings.Join(refusals, ", "))
+}
+
+// runOne asks EC2 for one instance of one shape.
+func (p *Provider) runOne(
+	ctx context.Context,
+	spec provider.Spec,
+	instanceType config.EC2InstanceType,
+	encodedUserData string,
+) (*provider.Instance, error) {
 	params := url.Values{}
 	params.Set("Action", "RunInstances")
 	params.Set("ImageId", spec.Image)
@@ -404,13 +494,16 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*provider.In
 	params.Set("MaxCount", "1")
 	params.Set("UserData", encodedUserData)
 
-	// THE NAME IS THE IDEMPOTENCY KEY, and this is what makes an ambiguous launch
-	// safe. A RunInstances that commits and loses its response is the exact case
-	// the Provider interface warns about — and here billet can do better than
-	// asking afterwards, because AWS will honour the token and return the SAME
-	// instance rather than starting a second one. The name encodes the lease, so
-	// it is unique by construction and never reused.
-	params.Set("ClientToken", spec.Name)
+	// THE IDEMPOTENCY KEY IS THE LEASE AND THE SHAPE, and this is what makes an
+	// ambiguous launch safe. A RunInstances that commits and loses its response is
+	// the exact case the Provider interface warns about — and here billet can do
+	// better than asking afterwards, because AWS honours the token and returns the
+	// SAME instance rather than starting a second one.
+	//
+	// It used to be the name alone. That was correct while a launch made exactly
+	// one attempt and became wrong the moment it could try a second shape — see
+	// clientTokenFor.
+	params.Set("ClientToken", clientTokenFor(spec.Name, instanceType.Type))
 
 	p.setNetwork(params, spec.Trust)
 	p.setTags(params, spec.Name)
@@ -474,7 +567,13 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*provider.In
 		// The CODE survives, because it comes from AWS's own fixed enumeration and
 		// is the actionable half — InvalidParameterValue, UnauthorizedOperation,
 		// InsufficientInstanceCapacity. Every other action keeps its message.
-		return nil, fmt.Errorf("ec2: launch %s: %w", spec.Name, withoutMessage(err))
+		//
+		// AND THE CODE IS WHAT THE CALLER BRANCHES ON, so the wrap has to preserve
+		// it: withoutMessage keeps the apiError in the chain precisely so codeOf can
+		// still read it, which is what lets Launch tell a capacity refusal (try the
+		// next shape) from anything else (stop).
+		return nil, fmt.Errorf("ec2: launch %s on %s: %w",
+			spec.Name, instanceType.Type, withoutMessage(err))
 	}
 
 	if len(out.Instances) == 0 {
@@ -1095,9 +1194,9 @@ func shellCommand(argv []string) (string, error) {
 // `shutting-down` is one of the states List asks for. That does not un-release
 // the lease, which is already terminal; it means the sweep sees the instance,
 // calls Destroy again, and finds it idempotent.
-func (p *Provider) Destroy(ctx context.Context, id string) error {
+func (p *Provider) Destroy(ctx context.Context, id string) (provider.Teardown, error) {
 	if id == "" {
-		return errors.New("ec2: destroy needs an instance id")
+		return provider.TeardownRequested, errors.New("ec2: destroy needs an instance id")
 	}
 
 	params := url.Values{}
@@ -1109,11 +1208,30 @@ func (p *Provider) Destroy(ctx context.Context, id string) error {
 		// already gone is the idempotent case, and it is the one thing here that
 		// must not be reported as a failure — a caller reads a destroy error as
 		// "the compute may still exist" and keeps holding the capacity.
+		// NOT AN ERROR, AND NOT PROOF EITHER — the two are separate answers and
+		// this used to give only one of them (#48).
+		//
+		// Not an error, because a caller reads a destroy error as "the compute may
+		// still exist, retry this", and retrying a terminate against an id AWS has
+		// forgotten accomplishes nothing forever.
+		//
+		// Not proof, because DescribeInstances is EVENTUALLY CONSISTENT: AWS
+		// documents that an instance id returned by RunInstances may not be visible
+		// to a subsequent call for a short time. A terminate issued shortly after a
+		// launch can therefore be answered NotFound for an instance that exists and
+		// is booting — and destroyStray, the cleanup after an ambiguous launch
+		// failure, is exactly that path and the one where billet is least sure what
+		// exists. Reading this as "already gone" released the lease while the
+		// machine came up and ran.
+		//
+		// The caller holds the capacity and finds out from List, which is
+		// authoritative in the direction that matters: an instance it does not
+		// report over a sustained window is one that is not there.
 		if code, ok := codeOf(err); ok && code == "InvalidInstanceID.NotFound" {
-			return nil
+			return provider.TeardownRequested, nil
 		}
 
-		return fmt.Errorf("ec2: destroy %s: %w", id, err)
+		return provider.TeardownRequested, fmt.Errorf("ec2: destroy %s: %w", id, err)
 	}
 
 	// "REQUESTED", because that is what happened. Logging "terminated" here is the
@@ -1121,7 +1239,10 @@ func (p *Provider) Destroy(ctx context.Context, id string) error {
 	// still running for a minute or two afterwards.
 	p.log.Info("requested instance termination", "instance", id)
 
-	return nil
+	// AND THE RETURN NOW SAYS SO TOO. The log line has been honest about this
+	// since the backend landed while the return value was not, and a caller reads
+	// the return.
+	return provider.TeardownRequested, nil
 }
 
 // Find reports the instance with that name, and whether there was one.

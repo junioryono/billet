@@ -476,7 +476,7 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 		}
 
 		for _, inst := range instances {
-			if err := prov.Destroy(ctx, inst.ID); err != nil {
+			if _, err := prov.Destroy(ctx, inst.ID); err != nil {
 				t.Logf("the container sweep could not remove %s: %v", inst.ID, err)
 			}
 		}

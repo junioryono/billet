@@ -469,7 +469,11 @@ func destroyProbe(ctx context.Context, prov provider.Provider, name string) erro
 	//
 	// Destroy is idempotent, so this is also what clears anything an earlier run
 	// left: the probe's name is the same on this host every time.
-	if err := prov.Destroy(ctx, name); err != nil {
+	//
+	// The teardown state is not consulted: this is the firecracker backend, whose
+	// Destroy is synchronous, and the probe holds no lease whose capacity could be
+	// released early if it were not (#46).
+	if _, err := prov.Destroy(ctx, name); err != nil {
 		return fmt.Errorf("billet images verify: the probe %s was not cleaned up and holds a "+
 			"uid, a device name and a cloned disk; nothing else will reap it, because it is "+
 			"deliberately not owned by the node: %w", name, err)

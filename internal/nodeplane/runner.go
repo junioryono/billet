@@ -206,10 +206,33 @@ func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
 	}
 
 	if len(errs) > 0 {
+		// A REAL FAILURE DOMINATES A CUSTODY ANSWER, and the join is what makes
+		// that need saying: errors.Is walks every branch, so joining one node's
+		// "I am holding this" with another node's "my daemon refused" produces an
+		// error that satisfies ErrCustody — and the listener stands down on that,
+		// dropping the retry the real failure needed.
+		//
+		// Custody is the weaker claim, so it is the one that yields. Nothing is
+		// lost by dropping it: the node holding the lease heartbeats it and
+		// releases it on its own, and a listener that keeps holding as well only
+		// double-covers the same capacity. A dropped real failure, by contrast,
+		// leaves compute running that nothing will ask about again.
+		failures := make([]error, 0, len(errs))
+
+		for _, err := range errs {
+			if !errors.Is(err, server.ErrCustody) {
+				failures = append(failures, err)
+			}
+		}
+
 		// EVERY FAILURE, not the first. A destroy that worked on four nodes and
 		// failed on one has left compute running somewhere, and the operator needs
 		// to know which — reporting only the first would hide the rest behind
 		// whichever goroutine happened to finish soonest.
+		if len(failures) > 0 {
+			return errors.Join(failures...)
+		}
+
 		return errors.Join(errs...)
 	}
 
@@ -363,6 +386,24 @@ func (r *Runner) destroyOn(ctx context.Context, n *node, requestID int64) (strin
 	}
 
 	if !res.OK {
+		// CUSTODY IS NOT A FAILED TEARDOWN, and the difference is who holds the
+		// lease (#46).
+		//
+		// The node asked its backend to stop the guest, the backend accepted, and
+		// the guest is still shutting down — so the node has taken the lease into
+		// its own janitor and will release it when the compute is provably gone.
+		// The listener must stand down rather than keep heartbeating and retrying;
+		// this is the same handoff a launch that could not be confirmed makes, and
+		// it goes through the same error so the listener needs no second branch.
+		//
+		// The OWNERSHIP RECORD IS DELIBERATELY LEFT ALONE by returning an error:
+		// the compute still exists, so this request still belongs to this process,
+		// and forgetting it here would let a later destroy be answered by a
+		// replacement that truthfully knows nothing about it.
+		if res.Custody {
+			return "", fmt.Errorf("%w: node %s: %s", server.ErrCustody, n.name, res.Error)
+		}
+
 		return "", fmt.Errorf("node %s could not destroy request %d: %s",
 			n.name, requestID, res.Error)
 	}
