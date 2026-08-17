@@ -5,8 +5,9 @@
 #   curl -fsSL https://raw.githubusercontent.com/junioryono/billet/main/scripts/install.sh | sh
 #
 # Downloads the latest release for this platform, VERIFIES ITS CHECKSUM, and
-# installs the binary to /usr/local/bin. It does not create users, write config,
-# or start anything — use the .deb or .rpm if you want the systemd units.
+# installs the binary to /usr/local/bin. Set BILLET_OS and BILLET_ARCH when the
+# target differs from the machine running this script. It does not create users,
+# write config, or start anything — use the .deb or .rpm for the systemd units.
 #
 # POSIX sh, not bash: this runs on whatever a fresh host happens to have.
 set -eu
@@ -36,13 +37,13 @@ need() {
 # Getting this mapping wrong produces a 404 that reads like the release is
 # missing rather than like the script is wrong, so an unsupported platform is
 # refused BY NAME instead.
-detect_platform() {
-    os="$(uname -s)"
-    arch="$(uname -m)"
+normalize_platform() {
+    os="$1"
+    arch="$2"
 
     case "${os}" in
-        Linux) os=linux ;;
-        Darwin) os=darwin ;;
+        Linux | linux) os=linux ;;
+        Darwin | darwin) os=darwin ;;
         *) die "${os} is not a platform billet builds for (linux and darwin only)" ;;
     esac
 
@@ -58,6 +59,32 @@ detect_platform() {
     fi
 
     echo "${os}_${arch}"
+}
+
+detect_host_platform() {
+    normalize_platform "$(uname -s)" "$(uname -m)"
+}
+
+detect_platform() {
+    if [ -n "${BILLET_OS:-}" ] || [ -n "${BILLET_ARCH:-}" ]; then
+        [ -n "${BILLET_OS:-}" ] && [ -n "${BILLET_ARCH:-}" ] ||
+            die "BILLET_OS and BILLET_ARCH must be set together"
+        normalize_platform "${BILLET_OS}" "${BILLET_ARCH}"
+        return
+    fi
+
+    detect_host_platform
+}
+
+report_install() {
+    installed="$1"
+    platform="$2"
+
+    if [ "${platform}" = "$(detect_host_platform)" ]; then
+        echo "Installed: $("${installed}" version | head -n1)"
+    else
+        echo "Installed ${platform} billet to ${installed}"
+    fi
 }
 
 # sha256 has three spellings across the platforms billet supports.
@@ -158,7 +185,7 @@ Set BILLET_INSTALL_DIR to somewhere you can write."
     fi
 
     echo
-    echo "Installed: $("${INSTALL_DIR}/${BIN}" version | head -n1)"
+    report_install "${INSTALL_DIR}/${BIN}" "${platform}"
     echo
     echo "Next:"
     echo "  billet github-app create --org YOUR-ORG"
@@ -174,4 +201,6 @@ Set BILLET_INSTALL_DIR to somewhere you can write."
     echo "  https://github.com/${REPO}/releases/latest"
 }
 
-main "$@"
+if [ "${BILLET_INSTALL_SH_TEST:-0}" != "1" ]; then
+    main "$@"
+fi
