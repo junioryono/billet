@@ -120,7 +120,7 @@ func TestInstallerSelectsAndDoesNotExecuteACrossTargetBinary(t *testing.T) {
 		hostArch:   "arm64",
 		targetOS:   stringPtr("linux"),
 		targetArch: stringPtr("amd64"),
-		binary:     "not executable on the control host\n",
+		binary:     "#!/bin/sh\nprintf 'executed\\n' > \"$BILLET_TEST_MARKER\"\nprintf 'foreign fixture\\n'\n",
 	})
 	if !strings.Contains(run.output, "Installed linux_amd64 billet to "+run.installed) {
 		t.Fatalf("output = %q; want cross-target installation report", run.output)
@@ -131,7 +131,7 @@ func TestInstallerSelectsAndDoesNotExecuteACrossTargetBinary(t *testing.T) {
 	if _, err := os.Stat(run.marker); !os.IsNotExist(err) {
 		t.Fatalf("foreign binary execution marker error = %v; want not-exist", err)
 	}
-	assertFileEquals(t, run.installed, "not executable on the control host\n")
+	assertFileEquals(t, run.installed, "#!/bin/sh\nprintf 'executed\\n' > \"$BILLET_TEST_MARKER\"\nprintf 'foreign fixture\\n'\n")
 }
 
 func TestInstallerExecutesANativeBinaryForItsVersion(t *testing.T) {
@@ -191,13 +191,86 @@ func TestInstallerStagesForAnUnsupportedControlHost(t *testing.T) {
 		hostArch:   "x86_64",
 		targetOS:   stringPtr("linux"),
 		targetArch: stringPtr("amd64"),
-		binary:     "foreign\n",
+		binary:     "#!/bin/sh\nprintf 'executed\\n' > \"$BILLET_TEST_MARKER\"\nprintf 'foreign fixture\\n'\n",
 	})
 	if !strings.Contains(run.output, "Installed linux_amd64 billet to "+run.installed) {
 		t.Fatalf("output = %q; want cross-target installation report", run.output)
 	}
 	if strings.Contains(run.output, "does not build for macOS on Intel") {
 		t.Fatalf("output contains a fatal host diagnostic: %q", run.output)
+	}
+	assertFileEquals(t, run.installed, "#!/bin/sh\nprintf 'executed\\n' > \"$BILLET_TEST_MARKER\"\nprintf 'foreign fixture\\n'\n")
+	if _, err := os.Stat(run.marker); !os.IsNotExist(err) {
+		t.Fatalf("foreign binary execution marker error = %v; want not-exist", err)
+	}
+}
+
+func TestInstallerRefusesHostDetectionFailureForAnExplicitTarget(t *testing.T) {
+	t.Parallel()
+
+	run := runInstallerExpectingFailure(t, installerFixture{
+		hostOS:     "Darwin",
+		hostArch:   "arm64",
+		targetOS:   stringPtr("linux"),
+		targetArch: stringPtr("amd64"),
+		binary:     "unused\n",
+		unameFails: true,
+	})
+	if !strings.Contains(run.output, "could not detect the host operating system") {
+		t.Fatalf("output = %q; want host-detection failure", run.output)
+	}
+	if _, err := os.Stat(run.installed); !os.IsNotExist(err) {
+		t.Fatalf("installed binary error = %v; want not-exist", err)
+	}
+}
+
+func TestInstallerCannotBeDisabledByTheFormerTestHook(t *testing.T) {
+	t.Parallel()
+
+	run := runInstaller(t, installerFixture{
+		hostOS:       "Darwin",
+		hostArch:     "arm64",
+		binary:       "#!/bin/sh\nprintf 'billet fixture 0.0.0\\n'\n",
+		legacyBypass: true,
+	})
+	if !strings.Contains(run.output, "Installed: billet fixture 0.0.0") {
+		t.Fatalf("output = %q; want production entrypoint to run", run.output)
+	}
+	assertFileEquals(t, run.installed, "#!/bin/sh\nprintf 'billet fixture 0.0.0\\n'\n")
+}
+
+func TestInstallerPreservesAnExistingBinaryWhenNativeValidationFails(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name   string
+		binary string
+		want   string
+	}{
+		{name: "command fails", binary: "#!/bin/sh\nexit 7\n", want: "could not run"},
+		{name: "version is empty", binary: "#!/bin/sh\nexit 0\n", want: "reported no version"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			run := runInstallerExpectingFailure(t, installerFixture{
+				hostOS:    "Darwin",
+				hostArch:  "arm64",
+				binary:    tc.binary,
+				oldBinary: "working billet\n",
+			})
+			if !strings.Contains(run.output, tc.want) {
+				t.Fatalf("output = %q; want %q", run.output, tc.want)
+			}
+			assertFileEquals(t, run.installed, "working billet\n")
+			matches, err := filepath.Glob(filepath.Join(filepath.Dir(run.installed), ".billet.incoming.*"))
+			if err != nil {
+				t.Fatalf("glob staging files: %v", err)
+			}
+			if len(matches) != 0 {
+				t.Fatalf("staging residue = %v; want none", matches)
+			}
+		})
 	}
 }
 
@@ -219,12 +292,15 @@ func TestInstallerRefusesAChecksumMismatch(t *testing.T) {
 }
 
 type installerFixture struct {
-	hostOS      string
-	hostArch    string
-	targetOS    *string
-	targetArch  *string
-	binary      string
-	badChecksum bool
+	hostOS       string
+	hostArch     string
+	targetOS     *string
+	targetArch   *string
+	binary       string
+	badChecksum  bool
+	oldBinary    string
+	legacyBypass bool
+	unameFails   bool
 }
 
 type installerRun struct {
@@ -269,32 +345,44 @@ func executeInstaller(t *testing.T, fixture installerFixture) (installerRun, err
 		t.Fatalf("create install directory: %v", err)
 	}
 
-	archive := filepath.Join(root, "archive")
-	archiveBody := []byte("fixture archive\n")
-	if err := os.WriteFile(archive, archiveBody, 0o600); err != nil {
-		t.Fatalf("write archive: %v", err)
+	selectedPlatform := fixturePlatform(fixture)
+	linuxBinary := "#!/bin/sh\nprintf 'wrong linux fixture\\n'\n"
+	darwinBinary := "#!/bin/sh\nprintf 'wrong darwin fixture\\n'\n"
+	if selectedPlatform == "linux_amd64" {
+		linuxBinary = fixture.binary
+	} else {
+		darwinBinary = fixture.binary
 	}
-	sum := sha256.Sum256(archiveBody)
+	linuxArchive := writeInstallerArchive(t, root, "linux", linuxBinary)
+	darwinArchive := writeInstallerArchive(t, root, "darwin", darwinBinary)
+	linuxSum := fileSHA256(t, linuxArchive)
+	darwinSum := fileSHA256(t, darwinArchive)
 	if fixture.badChecksum {
-		sum = sha256.Sum256([]byte("different archive\n"))
+		linuxSum = sha256.Sum256([]byte("different linux archive\n"))
+		darwinSum = sha256.Sum256([]byte("different darwin archive\n"))
 	}
 	checksums := filepath.Join(root, "checksums.txt")
-	checksumBody := fmt.Sprintf("%x  billet_0.0.0_linux_amd64.tar.gz\n%x  billet_0.0.0_darwin_arm64.tar.gz\n", sum, sum)
+	checksumBody := fmt.Sprintf("%x  billet_0.0.0_linux_amd64.tar.gz\n%x  billet_0.0.0_darwin_arm64.tar.gz\n", linuxSum, darwinSum)
 	if err := os.WriteFile(checksums, []byte(checksumBody), 0o600); err != nil {
 		t.Fatalf("write checksums: %v", err)
 	}
-	binary := filepath.Join(root, "fixture-billet")
-	if err := os.WriteFile(binary, []byte(fixture.binary), 0o700); err != nil {
-		t.Fatalf("write fixture binary: %v", err)
+	if fixture.oldBinary != "" {
+		if err := os.WriteFile(filepath.Join(installDir, "billet"), []byte(fixture.oldBinary), 0o755); err != nil {
+			t.Fatalf("write existing binary: %v", err)
+		}
 	}
 
-	writeExecutable(t, filepath.Join(tools, "uname"), fmt.Sprintf(`#!/bin/sh
+	uname := fmt.Sprintf(`#!/bin/sh
 case "$1" in
     -s) printf '%%s\n' %q ;;
     -m) printf '%%s\n' %q ;;
     *) exit 2 ;;
 esac
-`, fixture.hostOS, fixture.hostArch))
+`, fixture.hostOS, fixture.hostArch)
+	if fixture.unameFails {
+		uname = "#!/bin/sh\nexit 1\n"
+	}
+	writeExecutable(t, filepath.Join(tools, "uname"), uname)
 	writeExecutable(t, filepath.Join(tools, "curl"), `#!/bin/sh
 url=
 output=
@@ -308,27 +396,33 @@ done
 printf '%s\n' "$url" >> "$BILLET_TEST_CURL_LOG"
 case "$url" in
     */checksums.txt) cp "$BILLET_TEST_CHECKSUMS" "$output" ;;
-    *.tar.gz) cp "$BILLET_TEST_ARCHIVE" "$output" ;;
+    *_linux_amd64.tar.gz) cp "$BILLET_TEST_LINUX_ARCHIVE" "$output" ;;
+    *_darwin_arm64.tar.gz) cp "$BILLET_TEST_DARWIN_ARCHIVE" "$output" ;;
     *) exit 2 ;;
 esac
-`)
-	writeExecutable(t, filepath.Join(tools, "tar"), `#!/bin/sh
-[ "$1" = -xzf ] && [ "$3" = -C ] || exit 2
-cp "$BILLET_TEST_BINARY_SOURCE" "$4/billet"
 `)
 
 	requests := filepath.Join(root, "requests")
 	marker := filepath.Join(root, "executed")
 	cmd := exec.CommandContext(t.Context(), "sh", installer)
-	cmd.Env = append(environmentWithout("BILLET_OS", "BILLET_ARCH"),
+	cmd.Env = append(environmentWithout(
+		"BILLET_ARCH",
+		"BILLET_INSTALL_DIR",
+		"BILLET_INSTALL_SH_TEST",
+		"BILLET_OS",
+		"BILLET_VERSION",
+	),
 		"PATH="+tools+":"+os.Getenv("PATH"),
 		"BILLET_INSTALL_DIR="+installDir,
-		"BILLET_TEST_ARCHIVE="+archive,
-		"BILLET_TEST_BINARY_SOURCE="+binary,
 		"BILLET_TEST_CHECKSUMS="+checksums,
 		"BILLET_TEST_CURL_LOG="+requests,
+		"BILLET_TEST_DARWIN_ARCHIVE="+darwinArchive,
+		"BILLET_TEST_LINUX_ARCHIVE="+linuxArchive,
 		"BILLET_TEST_MARKER="+marker,
 	)
+	if fixture.legacyBypass {
+		cmd.Env = append(cmd.Env, "BILLET_INSTALL_SH_TEST=1")
+	}
 	if fixture.targetOS != nil {
 		cmd.Env = append(cmd.Env, "BILLET_OS="+*fixture.targetOS)
 	}
@@ -346,6 +440,42 @@ cp "$BILLET_TEST_BINARY_SOURCE" "$4/billet"
 		installed: filepath.Join(installDir, "billet"),
 		marker:    marker,
 	}, runErr
+}
+
+func fixturePlatform(fixture installerFixture) string {
+	if fixture.targetOS != nil && fixture.targetArch != nil && *fixture.targetOS != "" && *fixture.targetArch != "" {
+		return *fixture.targetOS + "_" + *fixture.targetArch
+	}
+	if fixture.hostOS == "Linux" && (fixture.hostArch == "x86_64" || fixture.hostArch == "amd64") {
+		return "linux_amd64"
+	}
+	return "darwin_arm64"
+}
+
+func writeInstallerArchive(t *testing.T, root, name, binary string) string {
+	t.Helper()
+	directory := filepath.Join(root, name+"-archive")
+	if err := os.MkdirAll(directory, 0o755); err != nil {
+		t.Fatalf("create %s archive directory: %v", name, err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "billet"), []byte(binary), 0o755); err != nil {
+		t.Fatalf("write %s archive binary: %v", name, err)
+	}
+	archive := filepath.Join(root, name+".tar.gz")
+	cmd := exec.CommandContext(t.Context(), "tar", "-czf", archive, "-C", directory, "billet")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("create %s archive: %v\n%s", name, err, output)
+	}
+	return archive
+}
+
+func fileSHA256(t *testing.T, path string) [sha256.Size]byte {
+	t.Helper()
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return sha256.Sum256(body)
 }
 
 func writeExecutable(t *testing.T, path, body string) {
