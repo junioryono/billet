@@ -88,8 +88,42 @@ func TestTheBuilderUsesUpstreamBuildPushRatherThanVendoringIt(t *testing.T) {
 		t.Fatalf("ReadFile: %v", err)
 	}
 
-	if !strings.Contains(string(body), "uses: docker/build-push-action@v7") {
-		t.Fatal("the wrapper no longer delegates to the maintained upstream build action")
+	if !strings.Contains(string(body),
+		"uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7") {
+		t.Fatal("the wrapper no longer delegates to the reviewed immutable upstream build action")
+	}
+}
+
+func TestBuilderCleanupReceivesEveryHyphenatedStateName(t *testing.T) {
+	t.Parallel()
+
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is not installed on this build host")
+	}
+	state := filepath.Join(t.TempDir(), "github-state")
+	cmd := exec.CommandContext(t.Context(), node, filepath.Join("stop-docker-builder", "index.js"))
+	cmd.Env = append(os.Environ(),
+		"GITHUB_STATE="+state,
+		"INPUT_CONTAINER=container",
+		"INPUT_BUILDER=builder",
+		"INPUT_STATE-PATH=/state",
+		"INPUT_MOUNT-LIMIT-BYTES=4096",
+		"INPUT_DISCARD-MARKER=/discard",
+	)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("record cleanup state: %v\n%s", err, output)
+	}
+	body, err := os.ReadFile(state)
+	if err != nil {
+		t.Fatalf("read cleanup state: %v", err)
+	}
+	for _, want := range []string{
+		"state_path=/state\n", "mount_limit_bytes=4096\n", "discard_marker=/discard\n",
+	} {
+		if !bytes.Contains(body, []byte(want)) {
+			t.Errorf("cleanup state does not contain %q:\n%s", want, body)
+		}
 	}
 }
 
@@ -288,12 +322,12 @@ func runBuilderCleanup(t *testing.T, statePath, discardMarker string, failPrune 
 	seen := filepath.Join(tools, "du-seen")
 	before := filepath.Join(tools, "before.json")
 	after := filepath.Join(tools, "after.json")
-	usage := "{\"id\":\"mount-1\",\"mutable\":true,\"inUse\":false,\"size\":3072,\"description\":\"cached mount /root/.cache from buildkit\",\"recordType\":\"exec.cachemount\"}\n" +
-		"{\"id\":\"mount-2\",\"mutable\":true,\"inUse\":false,\"size\":512,\"description\":\"cached mount /go/pkg/mod from buildkit\",\"recordType\":\"exec.cachemount\"}\n"
+	usage := "[{\"id\":\"mount-1\",\"mutable\":true,\"inUse\":false,\"size\":3072,\"description\":\"cached mount /root/.cache from buildkit\",\"recordType\":\"exec.cachemount\"}," +
+		"{\"id\":\"mount-2\",\"mutable\":true,\"inUse\":false,\"size\":512,\"description\":\"cached mount /go/pkg/mod from buildkit\",\"recordType\":\"exec.cachemount\"}]\n"
 	if err := os.WriteFile(before, []byte(usage), 0o600); err != nil {
 		t.Fatalf("write usage fixture: %v", err)
 	}
-	remaining := "{\"id\":\"mount-2\",\"mutable\":true,\"inUse\":false,\"size\":512,\"description\":\"cached mount /go/pkg/mod from buildkit\",\"recordType\":\"exec.cachemount\"}\n"
+	remaining := "[{\"id\":\"mount-2\",\"mutable\":true,\"inUse\":false,\"size\":512,\"description\":\"cached mount /go/pkg/mod from buildkit\",\"recordType\":\"exec.cachemount\"}]\n"
 	if err := os.WriteFile(after, []byte(remaining), 0o600); err != nil {
 		t.Fatalf("write post-prune fixture: %v", err)
 	}

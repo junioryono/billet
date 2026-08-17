@@ -31,7 +31,7 @@ func TestWhatTheNodeReportsArrivesAtTheLedger(t *testing.T) {
 	}}
 
 	_, base := serve(t, &fakeStore{}, nodeplane.WithRegistrar(reg),
-		nodeplane.WithSites([]string{wantSite}))
+		nodeplane.WithSites([]config.SiteConfig{{Name: wantSite, Store: config.SiteStoreEBSS3}}))
 
 	c := dial(t, base)
 

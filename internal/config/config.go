@@ -113,8 +113,9 @@ type ImagesConfig struct {
 //
 // A STRUCT RATHER THAN A STRING, because a site declares both placement identity
 // and its intended storage backend — Ceph at a bare-metal site, EBS and S3 in a
-// cloud region (#20/#25). The node wire still validates only the identity; making
-// this Store value authoritative across split configs remains #20.
+// cloud region (#20/#25). The control plane validates both parts when a remote
+// node registers, so split configs cannot create two storage authorities for one
+// logical site.
 type SiteConfig struct {
 	// Name is what a node and a tier refer to this site by.
 	Name string `yaml:"name"`
@@ -2138,10 +2139,10 @@ func CheckEBSS3(e EBSS3Config) []error {
 		!availabilityZoneID.MatchString(e.AvailabilityZone) {
 		errs = append(errs, fmt.Errorf("node.ebs_s3.availability_zone %q is not a zone in region %q", e.AvailabilityZone, e.Region))
 	}
-	if !s3BucketName.MatchString(e.Bucket) || net.ParseIP(e.Bucket) != nil ||
+	if !s3BucketName.MatchString(e.Bucket) || strings.Contains(e.Bucket, ".") || net.ParseIP(e.Bucket) != nil ||
 		strings.Contains(e.Bucket, "..") || strings.Contains(e.Bucket, ".-") ||
 		strings.Contains(e.Bucket, "-.") {
-		errs = append(errs, fmt.Errorf("node.ebs_s3.bucket %q is not a DNS-compatible S3 bucket name", e.Bucket))
+		errs = append(errs, fmt.Errorf("node.ebs_s3.bucket %q is not a TLS-compatible S3 bucket name without dots", e.Bucket))
 	}
 	if strings.HasPrefix(e.Prefix, "/") || strings.HasSuffix(e.Prefix, "/") ||
 		strings.ContainsRune(e.Prefix, 0) {
@@ -3097,19 +3098,6 @@ func (c *Config) macOSLimitReason(node string) string {
 	return fmt.Sprintf(
 		"Apple's licence limit of %d macOS guests per Apple-branded host (node %q does not override it)",
 		DefaultMacOSVMLimit, node)
-}
-
-// SiteNames lists the places this deployment declares.
-//
-// For the node wire, which is where a REMOTE node's claim to be somewhere is
-// checked — the node's own config cannot answer that question.
-func (c *Config) SiteNames() []string {
-	out := make([]string, 0, len(c.Sites))
-	for _, s := range c.Sites {
-		out = append(out, s.Name)
-	}
-
-	return out
 }
 
 // validateSites checks the declared places, and everything that refers to one.

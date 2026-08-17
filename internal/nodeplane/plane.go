@@ -95,9 +95,10 @@ type Plane struct {
 	// containers it cannot attribute.
 	deployment string
 
-	// sites are the places this deployment declares, or empty for a deployment
-	// that has not needed the distinction. See WithSites.
-	sites map[string]bool
+	// sites are the places this deployment declares and the storage authority
+	// each one uses, or empty for a deployment that has not needed the distinction.
+	// See WithSites.
+	sites map[string]config.SiteStoreKind
 
 	// tiers is the deployment's catalogue and the ONE authority on what a tier
 	// is. The wire checks a JIT request against it, and a launch carries the
@@ -485,7 +486,7 @@ type Registrar interface {
 
 // sortedSites lists the declared places in a stable order, so a refusal naming
 // what IS valid reads the same on every run.
-func sortedSites(set map[string]bool) []string {
+func sortedSites(set map[string]config.SiteStoreKind) []string {
 	out := make([]string, 0, len(set))
 	for k := range set {
 		out = append(out, k)
@@ -518,7 +519,8 @@ func (p *Plane) tierFor(label string) (config.Tier, bool) {
 	return t, ok
 }
 
-// WithSites declares the places this deployment has compute in.
+// WithSites declares the places this deployment has compute in and each site's
+// authoritative storage backend.
 //
 // THE CONTROL PLANE IS THE AUTHORITY, and this is the only place the rule can be
 // enforced: a node names a site in ITS OWN config, on another machine, in a file
@@ -527,12 +529,23 @@ func (p *Plane) tierFor(label string) (config.Tier, bool) {
 //
 // Empty means the deployment has declared no sites, in which case a node claiming
 // one is refused: there is nothing it could correctly mean.
-func WithSites(names []string) Option {
+func WithSites(sites []config.SiteConfig) Option {
 	return func(p *Plane) {
-		p.sites = make(map[string]bool, len(names))
-		for _, n := range names {
-			p.sites[n] = true
+		p.sites = make(map[string]config.SiteStoreKind, len(sites))
+		for _, site := range sites {
+			p.sites[site.Name] = site.Store
 		}
+	}
+}
+
+func siteAcceptsProvider(store config.SiteStoreKind, provider config.ProviderKind) bool {
+	switch store {
+	case config.SiteStoreCeph:
+		return provider == config.ProviderFirecracker
+	case config.SiteStoreEBSS3:
+		return provider == config.ProviderEC2
+	default:
+		return false
 	}
 }
 
@@ -603,17 +616,26 @@ func (p *Plane) Register(
 	// PERMANENT, like the version and deployment checks above it. The same node
 	// with the same config will be refused forever, so a node that treated this as
 	// an outage would retry until someone read a log.
-	if req.Site != "" && !p.sites[req.Site] {
-		if len(p.sites) == 0 {
-			return nodeapi.RegisterResponse{}, fmt.Errorf(
-				"%w: node %q is at site %q, but this control plane declares no sites; add a "+
-					"sites block naming it, or remove node.site",
-				ErrRefused, req.Node, req.Site)
-		}
+	if req.Site != "" {
+		store, declared := p.sites[req.Site]
+		if !declared {
+			if len(p.sites) == 0 {
+				return nodeapi.RegisterResponse{}, fmt.Errorf(
+					"%w: node %q is at site %q, but this control plane declares no sites; add a "+
+						"sites block naming it, or remove node.site",
+					ErrRefused, req.Node, req.Site)
+			}
 
-		return nodeapi.RegisterResponse{}, fmt.Errorf(
-			"%w: node %q is at site %q, which this control plane does not declare (have %s)",
-			ErrRefused, req.Node, req.Site, strings.Join(sortedSites(p.sites), ", "))
+			return nodeapi.RegisterResponse{}, fmt.Errorf(
+				"%w: node %q is at site %q, which this control plane does not declare (have %s)",
+				ErrRefused, req.Node, req.Site, strings.Join(sortedSites(p.sites), ", "))
+		}
+		if !siteAcceptsProvider(store, req.Provider) {
+			return nodeapi.RegisterResponse{}, fmt.Errorf(
+				"%w: node %q reports provider %s at site %q, whose authoritative store is %s; "+
+					"that pairing would split one site across independent cache authorities",
+				ErrRefused, req.Node, req.Provider, req.Site, store)
+		}
 	}
 
 	// THE LEDGER FIRST, and outside the mutex. A node that appears in the plane's

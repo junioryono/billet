@@ -109,15 +109,13 @@ sudo systemctl enable --now billet-node
 
 ## Updating
 
-**If you built from source** — the only path that works until a release is cut:
+**If you built from source:**
 
 ```bash
 git pull && go build ./cmd/billet
 sudo mkdir -p /usr/local/bin && sudo install -m 0755 billet /usr/local/bin/billet
 sudo systemctl restart billet-server                # if you wrote your own unit
 ```
-
-The two paths below need a published release, and there is not one yet.
 
 **If you installed the package:**
 
@@ -350,7 +348,7 @@ built. What works **today**:
 | Crash recovery | A job running when the controller dies is adopted and left to finish, not killed; its capacity stays held |
 | Per-machine capacity | Each node reports what it contributes; a tier advertises the smaller of the deployment ceiling and what its machines can hold. An EC2 node also reports its ordered purchasable shapes, so placement charges the selected shape rather than the usually smaller tier request. Each shape carries an operator-audited hourly price, and `billet check` reports a conservative peak before credentials are tested. A host nothing can reach stops backing advertisements |
 | Placement | The control plane chooses the machine when the work is admitted, by provider preference, then packing (`placement: spread` to even the load instead), then name. Reserved floors are held against the machines that could keep them |
-| Sites | A node says where it is; a tier may insist on a place. Cache implementations namespace data by site, but the control plane does not yet enforce that a split-config node's selected store matches the store declared for that site, and the cross-node/cross-site behavior still needs a real integration proof ([#20](https://github.com/junioryono/billet/issues/20)) |
+| Sites | A node says where it is; a tier may insist on a place. Cache implementations namespace data by site, and the control plane rejects a split-config node whose provider cannot use that site's declared store. The cross-node/cross-site behavior still needs a real integration proof ([#20](https://github.com/junioryono/billet/issues/20)) |
 | Graceful drain | SIGTERM stops it taking new work and waits for the jobs already running, so `systemctl restart` does not fail somebody's build. See [Updating](#updating) |
 | Release pipeline | Tagged releases with checksums, `.deb`/`.rpm` packages with systemd units, an install script that verifies the published checksum, and immutable internal action references on every release tag |
 | Multi-backend tiers | One label can name several providers, and the preference ORDER decides: the control plane picks the host when the job is admitted, walking the tier's list most-preferred-first. Both halves of the intended pair now exist — `[firecracker, ec2]` means the bare-metal box before the cloud — though nobody has watched a job fail over between them ([#32](https://github.com/junioryono/billet/issues/32)) |

@@ -30,7 +30,12 @@ function cacheMountUsage() {
     "exec", container, "buildctl", "--addr", "unix:///run/buildkit/buildkitd.sock",
     "du", "--filter", "type==exec.cachemount", "--format", "{{json .}}",
   ]), "buildctl du");
-  const records = String(result.stdout || "").split(/\r?\n/).filter((line) => line.trim()).map((line) => JSON.parse(line));
+  // buildctl executes the template once with its complete UsageInfo slice, so
+  // `json .` is one array rather than one JSON object per output line.
+  const records = JSON.parse(String(result.stdout || "null"));
+  if (!Array.isArray(records)) {
+    throw new Error("buildctl du did not return a cache-mount array");
+  }
   for (const record of records) {
     if (!record || typeof record.id !== "string" || !record.id ||
         typeof record.description !== "string" ||

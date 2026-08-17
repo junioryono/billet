@@ -52,14 +52,17 @@ RestartSec=5s
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ProtectKernelTunables=true
+# The node maps RBD devices and the jailer creates per-guest cgroups through
+# sysfs. ProtectKernelTunables would remount those required interfaces read-only.
 ProtectKernelModules=true
 RestrictSUIDSGID=true
 LockPersonality=true
 SystemCallArchitectures=native
 
 ReadOnlyPaths=/etc/billet
-ReadWritePaths=/srv/jailer
+# Certificate renewal installs a new key, leaf and CA bundle atomically while
+# the process is running. Keep the rest of /etc immutable to the node.
+ReadWritePaths=-/etc/billet/tls /srv/jailer
 
 [Install]
 WantedBy=multi-user.target

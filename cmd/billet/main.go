@@ -549,7 +549,7 @@ func runServer(ctx context.Context, lc *lifecycle, cfg *config.Config, dryRun bo
 		// here rather than recorded. A node's own config cannot make this check —
 		// sites are the control plane's to declare and the node's file has no
 		// reason to list them.
-		nodeplane.WithSites(cfg.SiteNames()),
+		nodeplane.WithSites(cfg.Sites),
 		// The catalogue lives here, and a launch carries the shape a node needs, so
 		// no node keeps a copy that can drift from this one.
 		nodeplane.WithTierCatalog(cfg.Tiers))

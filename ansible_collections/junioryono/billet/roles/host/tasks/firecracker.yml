@@ -62,6 +62,7 @@
   loop:
     - firecracker
     - jailer
+  register: billet_firecracker_install
   become: true
   when: not billet_firecracker_present
 
@@ -74,4 +75,5 @@
   loop:
     - firecracker
     - jailer
+  register: billet_firecracker_links
   become: true

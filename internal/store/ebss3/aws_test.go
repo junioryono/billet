@@ -1,10 +1,14 @@
 package ebss3
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"encoding/xml"
 	"errors"
+	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -67,6 +71,33 @@ func TestS3StateUsesConditionalSignedEncryptedWrites(t *testing.T) {
 	}
 	if _, err := api.Put(t.Context(), "state/key.json", []byte(`{"two":2}`), `"one"`); !errors.Is(err, errObjectConflict) {
 		t.Fatalf("conditional Put error = %v", err)
+	}
+}
+
+func TestIndeterminateS3WritesAreAmbiguous(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name   string
+		status int
+	}{
+		{name: "server error", status: http.StatusInternalServerError},
+		{name: "accepted without etag", status: http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.status)
+			}))
+			defer server.Close()
+
+			api := newS3API(config.EBSS3Config{Region: "us-west-2", Bucket: "billet-cache-example"},
+				staticCredentials{}, server.Client(), server.URL, time.Now)
+			if _, err := api.Put(t.Context(), "state/key.json", []byte(`{"state":1}`), ""); !errors.Is(err, errObjectAmbiguous) {
+				t.Fatalf("Put error = %v, want an ambiguous outcome", err)
+			}
+		})
 	}
 }
 
@@ -214,6 +245,118 @@ func TestS3ListParsesEveryStateObject(t *testing.T) {
 	keys, err := api.List(t.Context(), "state/")
 	if err != nil || strings.Join(keys, ",") != "state/a.json,state/b.json" {
 		t.Fatalf("List = %v, %v", keys, err)
+	}
+}
+
+func TestEveryAWSPaginationCycleIsRefused(t *testing.T) {
+	t.Parallel()
+
+	t.Run("S3", func(t *testing.T) {
+		t.Parallel()
+
+		var page int
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			tokens := []string{"A", "B", "A"}
+			writeAWSResponse(t, w, `<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken>`+
+				tokens[page]+`</NextContinuationToken></ListBucketResult>`)
+			page++
+		}))
+		defer server.Close()
+
+		api := newS3API(config.EBSS3Config{Region: "us-west-2", Bucket: "billet-cache-example"},
+			staticCredentials{}, server.Client(), server.URL, time.Now)
+		if _, err := api.List(t.Context(), "state/"); err == nil {
+			t.Fatal("S3 listing accepted a continuation-token cycle")
+		}
+	})
+
+	for _, action := range []string{"DescribeSnapshots", "DescribeVolumes"} {
+		t.Run(action, func(t *testing.T) {
+			t.Parallel()
+
+			var page int
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Fatal(err)
+				}
+				values, err := url.ParseQuery(string(body))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if values.Get("Action") != action {
+					t.Fatalf("action = %q, want %q", values.Get("Action"), action)
+				}
+				tokens := []string{"A", "B", "A"}
+				writeAWSResponse(t, w, "<"+action+"Response><nextToken>"+tokens[page]+
+					"</nextToken></"+action+"Response>")
+				page++
+			}))
+			defer server.Close()
+
+			api := newEBSAPI(config.EBSS3Config{Region: "us-west-2", AvailabilityZone: "us-west-2a"},
+				"deployment/site", staticCredentials{}, server.Client(), server.URL, time.Now,
+				func(context.Context, time.Duration) error { return nil })
+			var err error
+			if action == "DescribeSnapshots" {
+				_, err = api.ListSnapshots(t.Context())
+			} else {
+				_, err = api.ListAvailableVolumes(t.Context())
+			}
+			if err == nil {
+				t.Fatal("EBS listing accepted a pagination-token cycle")
+			}
+		})
+	}
+}
+
+type leakyCredentialSource struct {
+	Secret string
+}
+
+func (l leakyCredentialSource) Credentials(context.Context) (awssig.Credentials, error) {
+	return awssig.Credentials{AccessKeyID: "AKID", SecretAccessKey: l.Secret}, nil
+}
+
+func TestCredentialHoldingAWSStoresRedactEveryRenderingPath(t *testing.T) {
+	t.Parallel()
+
+	const secret = "must-never-render"
+	creds := leakyCredentialSource{Secret: secret}
+	httpClient := &http.Client{}
+	cfg := config.EBSS3Config{
+		Region: "us-west-2", AvailabilityZone: "us-west-2a", Bucket: "billet-cache-example",
+	}
+	s3 := newS3API(cfg, creds, httpClient, "https://s3.example", time.Now)
+	ebs := newEBSAPI(cfg, "deployment/site", creds, httpClient, "https://ec2.example",
+		time.Now, func(context.Context, time.Duration) error { return nil })
+	store := newStore(cfg, "deployment/site", ebs, s3)
+
+	for name, value := range map[string]any{
+		"s3 pointer": s3, "s3 value": *s3,
+		"ebs pointer": ebs, "ebs value": *ebs,
+		"store pointer": store, "store value": *store,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			jsonBody, err := json.Marshal(value)
+			if err != nil {
+				t.Fatalf("json: %v", err)
+			}
+			var log bytes.Buffer
+			logger := slog.New(slog.NewJSONHandler(&log, nil))
+			logger.Info("value", "value", value)
+			for path, rendered := range map[string]string{
+				"fmt":  fmt.Sprintf("%+v %#v %q", value, value, value),
+				"json": string(jsonBody),
+				"slog": log.String(),
+			} {
+				if strings.Contains(rendered, secret) {
+					t.Errorf("%s exposed the credential source: %s", path, rendered)
+				}
+			}
+		})
 	}
 }
 

@@ -1,10 +1,18 @@
 # billet Ansible collection
 
-`junioryono.billet.host` turns an already installed Linux machine into a billet control plane and Firecracker compute host. It installs the billet binary supplied by the operator, creates the service identity and systemd units, installs Firecracker and Ceph client tooling, creates isolated DHCP/NAT guest bridges, renders `billet.yaml`, checks the Ceph pools, and configures a periodic Ceph health check. The guest policy admits the configured image-verification callback only on the trusted bridge, so `billet images verify` works without exposing arbitrary host ports. It never creates a GitHub App, invents capacity, chooses disks, or starts billet until the supplied configuration passes `billet check`. An existing GitHub App private key is never replaced implicitly: a matching source is accepted idempotently, while a different source is refused so credential rotation remains an explicit operator action. Setting either service enable flag to false stops and disables a service previously installed by the role.
+`junioryono.billet.host` turns an already installed Linux machine into a billet control plane and Firecracker compute host. It installs the billet binary supplied by the operator, creates the service identity and systemd units, installs Firecracker and Ceph client tooling, creates isolated DHCP/NAT guest bridges, renders `billet.yaml`, checks the Ceph pools, and configures a periodic Ceph health check. The guest policy admits the configured image-verification callback only on the trusted bridge, so `billet images verify` works without exposing arbitrary host ports. It drains the node before changing any live guest-network input and restarts it after a selected Firecracker binary changes. It never creates a GitHub App, invents capacity, chooses disks, or starts billet until the supplied configuration passes `billet check`. An existing GitHub App private key is never replaced implicitly: a matching source is accepted idempotently, while a different source is refused so credential rotation remains an explicit operator action. Setting either service enable flag to false stops and disables a service previously installed by the role. Setting `billet_alert_email` back to empty stops and removes the Ceph health timer and removes `/etc/msmtprc` only when this role created it.
 
 The role can bootstrap a new single-host Ceph cluster only when `billet_ceph_bootstrap` is explicitly true and `billet_ceph_devices` names every device to consume. That path is destructive by definition and is never inferred from available disks.
 
-Set `billet_binary_src` to the Linux binary the role should install. A repository can pin the collection and binary to one release by fetching the tagged `scripts/install.sh` with `BILLET_VERSION` and `BILLET_INSTALL_DIR` set, then passing the verified result through `BILLET_BINARY_PATH`; a Billet contributor can instead build the binary from the same checkout as the collection. Keeping the binary input explicit prevents a host converge from silently upgrading the process that owns running jobs.
+Set `billet_binary_src` to the Linux binary the role should install. A repository can pin the collection and binary to one release by downloading it into a controller-side staging directory, then passing the verified file directly to the role:
+
+```bash
+billet_stage=$(mktemp -d)
+curl -fsSL https://raw.githubusercontent.com/junioryono/billet/v0.1.0/scripts/install.sh | BILLET_VERSION=v0.1.0 BILLET_INSTALL_DIR="$billet_stage" sh
+ansible-playbook site.yml -e "billet_binary_src=$billet_stage/billet"
+```
+
+A Billet contributor can instead build the binary from the same checkout as the collection. Keeping the binary input explicit prevents a host converge from silently upgrading the process that owns running jobs.
 
 See `roles/host/defaults/main.yml` for the complete input surface.
 

@@ -25,7 +25,7 @@ import (
 func TestANodeCannotRegisterIntoAnUndeclaredSite(t *testing.T) {
 	t.Parallel()
 
-	p := testPlaneWithSites(t, "home")
+	p := testPlaneWithSites(t, site("home", config.SiteStoreCeph))
 
 	_, err := p.Register(t.Context(), registerAt("hom"))
 	if err == nil {
@@ -48,7 +48,7 @@ func TestANodeCannotRegisterIntoAnUndeclaredSite(t *testing.T) {
 func TestANodeMayRegisterIntoADeclaredSite(t *testing.T) {
 	t.Parallel()
 
-	p := testPlaneWithSites(t, "home")
+	p := testPlaneWithSites(t, site("home", config.SiteStoreCeph))
 
 	if _, err := p.Register(t.Context(), registerAt("home")); err != nil {
 		t.Fatalf("a node at a declared site was refused: %v", err)
@@ -63,10 +63,10 @@ func TestAnUnsitedNodeIsAcceptedWhereverSitesAreDeclared(t *testing.T) {
 
 	for _, tc := range []struct {
 		name  string
-		sites []string
+		sites []config.SiteConfig
 	}{
 		{name: "no sites declared", sites: nil},
-		{name: "sites declared, node names none", sites: []string{"home"}},
+		{name: "sites declared, node names none", sites: []config.SiteConfig{site("home", config.SiteStoreCeph)}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -97,11 +97,43 @@ func TestANodeCannotClaimASiteWhereNoneAreDeclared(t *testing.T) {
 	}
 }
 
+func TestANodeCannotSplitASitesStorageAuthority(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name     string
+		store    config.SiteStoreKind
+		provider config.ProviderKind
+	}{
+		{name: "cloud compute at a Ceph site", store: config.SiteStoreCeph, provider: config.ProviderEC2},
+		{name: "host compute at an EBS site", store: config.SiteStoreEBSS3, provider: config.ProviderFirecracker},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			p := testPlaneWithSites(t, site("one", tc.store))
+			req := registerAt("one")
+			req.Provider = tc.provider
+			_, err := p.Register(t.Context(), req)
+			if err == nil || !errors.Is(err, ErrRefused) {
+				t.Fatalf("mismatched provider/store registration error = %v", err)
+			}
+			if !strings.Contains(err.Error(), string(tc.store)) {
+				t.Errorf("refusal does not name the authoritative store: %v", err)
+			}
+		})
+	}
+}
+
 // testPlaneWithSites is a plane whose deployment declares these places.
-func testPlaneWithSites(t *testing.T, sites ...string) *Plane {
+func testPlaneWithSites(t *testing.T, sites ...config.SiteConfig) *Plane {
 	t.Helper()
 
 	return testPlane(t, WithSites(sites))
+}
+
+func site(name string, store config.SiteStoreKind) config.SiteConfig {
+	return config.SiteConfig{Name: name, Store: store}
 }
 
 // registerAt is a valid registration for the test deployment, at one site.
@@ -109,7 +141,7 @@ func registerAt(site string) nodeapi.RegisterRequest {
 	return nodeapi.RegisterRequest{
 		Version:     nodeapi.Version,
 		Node:        "n1",
-		Provider:    config.ProviderDocker,
+		Provider:    config.ProviderFirecracker,
 		Deployment:  deployment,
 		Incarnation: "00000000000000000000000000000001",
 		Site:        site,

@@ -10,9 +10,9 @@ inputs:
     required: false
     default: "100"
   buildkit-image:
-    description: Pinned BuildKit image to run inside the microVM.
+    description: Immutable BuildKit image to run inside the microVM.
     required: false
-    default: moby/buildkit:buildx-stable-1
+    default: moby/buildkit@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
   reset:
     description: Delete this key's existing BuildKit state before starting and publish a fresh baseline.
     required: false

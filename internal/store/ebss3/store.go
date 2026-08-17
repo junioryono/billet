@@ -9,6 +9,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"math"
 	"strings"
 	"time"
@@ -65,6 +67,25 @@ type Store struct {
 }
 
 var _ storecontract.Store = (*Store)(nil)
+
+func (s Store) String() string { return "ebss3.Store{owner=" + s.owner + "}" }
+
+// GoString covers %#v.
+func (s Store) GoString() string { return s.String() }
+
+// Format keeps the credential-bearing API implementations behind the store out
+// of every fmt verb.
+func (s Store) Format(f fmt.State, _ rune) {
+	if _, err := io.WriteString(f, s.String()); err != nil {
+		return
+	}
+}
+
+// MarshalJSON keeps structural serializers from reaching the API implementations.
+func (s Store) MarshalJSON() ([]byte, error) { return json.Marshal(s.String()) }
+
+// LogValue is the redaction boundary used by slog.
+func (s Store) LogValue() slog.Value { return slog.StringValue(s.String()) }
 
 type option func(*Store)
 
@@ -129,27 +150,27 @@ type keyState struct {
 	Active      map[string]activeState     `json:"active,omitempty"`
 }
 
-func (s *Store) statePrefix() string {
+func (s Store) statePrefix() string {
 	digest := sha256.Sum256([]byte(s.owner))
 
 	return s.cfg.Prefix + "/owners/" + hex.EncodeToString(digest[:]) + "/state/"
 }
 
-func (s *Store) legacyStatePrefix() string { return s.cfg.Prefix + "/state/" }
+func (s Store) legacyStatePrefix() string { return s.cfg.Prefix + "/state/" }
 
-func (s *Store) legacyStateKey(key string) string {
+func (s Store) legacyStateKey(key string) string {
 	digest := sha256.Sum256([]byte(key))
 
 	return s.legacyStatePrefix() + hex.EncodeToString(digest[:]) + ".json"
 }
 
-func (s *Store) requestToken(parts ...string) string {
+func (s Store) requestToken(parts ...string) string {
 	digest := sha256.Sum256([]byte(s.owner + "\x00" + strings.Join(parts, "\x00")))
 
 	return hex.EncodeToString(digest[:])
 }
 
-func (s *Store) stateKey(key string) string {
+func (s Store) stateKey(key string) string {
 	digest := sha256.Sum256([]byte(key))
 
 	return s.statePrefix() + hex.EncodeToString(digest[:]) + ".json"
@@ -162,7 +183,7 @@ func emptyState(key string) keyState {
 	}
 }
 
-func (s *Store) load(ctx context.Context, key string) (keyState, string, error) {
+func (s Store) load(ctx context.Context, key string) (keyState, string, error) {
 	for range maxCASAttempts {
 		state, etag, err := s.loadObject(ctx, s.stateKey(key), key)
 		if err != nil || etag != "" {
@@ -190,13 +211,13 @@ func (s *Store) load(ctx context.Context, key string) (keyState, string, error) 
 		storecontract.ErrConflict, key)
 }
 
-func (s *Store) ensureState(ctx context.Context, key string) error {
+func (s Store) ensureState(ctx context.Context, key string) error {
 	_, _, err := s.load(ctx, key)
 
 	return err
 }
 
-func (s *Store) loadObject(
+func (s Store) loadObject(
 	ctx context.Context,
 	objectKey, expectedKey string,
 ) (keyState, string, error) {
@@ -233,7 +254,7 @@ func (s *Store) loadObject(
 	return state, etag, nil
 }
 
-func (s *Store) mutate(
+func (s Store) mutate(
 	ctx context.Context,
 	key string,
 	fn func(*keyState) error,
@@ -287,7 +308,7 @@ func randomID(prefix string) (string, error) {
 }
 
 // Current reports the generation named by a key's S3 state object.
-func (s *Store) Current(ctx context.Context, key string) (string, error) {
+func (s Store) Current(ctx context.Context, key string) (string, error) {
 	if err := checkKey(key); err != nil {
 		return "", err
 	}
@@ -303,7 +324,7 @@ func (s *Store) Current(ctx context.Context, key string) (string, error) {
 }
 
 // Create allocates a new encrypted, unformatted EBS volume.
-func (s *Store) Create(
+func (s Store) Create(
 	ctx context.Context,
 	key string,
 	sizeBytes int64,
@@ -342,7 +363,7 @@ func (s *Store) Create(
 }
 
 // AcquireWriter conditionally records a newer lease and fencing token in S3.
-func (s *Store) AcquireWriter(
+func (s Store) AcquireWriter(
 	ctx context.Context,
 	key, holder string,
 	ttl time.Duration,
@@ -390,7 +411,7 @@ func (s *Store) AcquireWriter(
 }
 
 // Snapshot consumes a detached EBS volume and records its immutable candidate.
-func (s *Store) Snapshot(
+func (s Store) Snapshot(
 	ctx context.Context,
 	volume storecontract.Volume,
 ) (storecontract.Candidate, error) {
@@ -438,7 +459,7 @@ func (s *Store) Snapshot(
 }
 
 // PublishCAS advances a pointer in the same conditional S3 write that consumes its writer.
-func (s *Store) PublishCAS(
+func (s Store) PublishCAS(
 	ctx context.Context,
 	key, expected string,
 	candidate storecontract.Candidate,
@@ -503,7 +524,7 @@ func (s *Store) PublishCAS(
 }
 
 // Clone allocates a writable EBS volume from a published snapshot.
-func (s *Store) Clone(
+func (s Store) Clone(
 	ctx context.Context,
 	key, generation string,
 ) (storecontract.Volume, error) {
@@ -560,7 +581,7 @@ func (s *Store) Clone(
 	}, nil
 }
 
-func (s *Store) bindActiveVolume(
+func (s Store) bindActiveVolume(
 	ctx context.Context,
 	key, leaseID, generation, volume string,
 ) error {
@@ -582,7 +603,7 @@ func (s *Store) bindActiveVolume(
 }
 
 // RenewActive extends a generation's eviction protection.
-func (s *Store) RenewActive(
+func (s Store) RenewActive(
 	ctx context.Context,
 	volume storecontract.Volume,
 	until time.Time,
@@ -606,7 +627,7 @@ func (s *Store) RenewActive(
 }
 
 // Discard deletes a writable EBS volume and then releases its active lease.
-func (s *Store) Discard(ctx context.Context, volume storecontract.Volume) error {
+func (s Store) Discard(ctx context.Context, volume storecontract.Volume) error {
 	if volume.Handle == "" {
 		return nil
 	}
@@ -629,7 +650,7 @@ func (s *Store) Discard(ctx context.Context, volume storecontract.Volume) error 
 	return s.dropActive(ctx, volume.Key, volume.Lease.ID)
 }
 
-func (s *Store) dropActive(ctx context.Context, key, leaseID string) error {
+func (s Store) dropActive(ctx context.Context, key, leaseID string) error {
 	return s.mutate(ctx, key, func(state *keyState) error {
 		delete(state.Active, leaseID)
 
@@ -638,7 +659,7 @@ func (s *Store) dropActive(ctx context.Context, key, leaseID string) error {
 }
 
 // Evict removes inactive generations and abandoned candidates without touching live clones.
-func (s *Store) Evict(ctx context.Context, olderThan time.Duration) error {
+func (s Store) Evict(ctx context.Context, olderThan time.Duration) error {
 	if olderThan <= 0 {
 		return errors.New("ebs-s3: cache eviction needs a positive inactivity age")
 	}

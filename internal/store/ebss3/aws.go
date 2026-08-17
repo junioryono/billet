@@ -3,10 +3,12 @@ package ebss3
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"reflect"
@@ -113,7 +115,25 @@ func newS3API(
 	return &s3API{cfg: cfg, creds: creds, http: httpClient, endpoint: endpoint, now: now}
 }
 
-func (s *s3API) request(
+func (s s3API) String() string { return "ebss3.s3API{endpoint=" + s.endpoint + "}" }
+
+// GoString covers %#v.
+func (s s3API) GoString() string { return s.String() }
+
+// Format keeps an unexported credential source out of every fmt verb.
+func (s s3API) Format(f fmt.State, _ rune) {
+	if _, err := io.WriteString(f, s.String()); err != nil {
+		return
+	}
+}
+
+// MarshalJSON keeps structural serializers from reaching the credential source.
+func (s s3API) MarshalJSON() ([]byte, error) { return json.Marshal(s.String()) }
+
+// LogValue is the redaction boundary used by slog.
+func (s s3API) LogValue() slog.Value { return slog.StringValue(s.String()) }
+
+func (s s3API) request(
 	ctx context.Context,
 	method, key string,
 	query url.Values,
@@ -152,7 +172,7 @@ func (s *s3API) request(
 	return response, nil
 }
 
-func (s *s3API) Get(ctx context.Context, key string) ([]byte, string, bool, error) {
+func (s s3API) Get(ctx context.Context, key string) ([]byte, string, bool, error) {
 	response, err := s.request(ctx, http.MethodGet, key, nil, nil, nil)
 	if err != nil {
 		return nil, "", false, err
@@ -178,7 +198,7 @@ func (s *s3API) Get(ctx context.Context, key string) ([]byte, string, bool, erro
 	return body, response.Header.Get("ETag"), true, nil
 }
 
-func (s *s3API) Put(
+func (s s3API) Put(
 	ctx context.Context,
 	key string,
 	body []byte,
@@ -199,21 +219,27 @@ func (s *s3API) Put(
 	if response.StatusCode == http.StatusConflict || response.StatusCode == http.StatusPreconditionFailed {
 		return "", errObjectConflict
 	}
+	if response.StatusCode >= http.StatusInternalServerError {
+		return "", fmt.Errorf("%w: S3 conditional PUT returned HTTP %d",
+			errObjectAmbiguous, response.StatusCode)
+	}
 	if response.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("ebs-s3: S3 conditional PUT returned HTTP %d", response.StatusCode)
 	}
 
 	etag := response.Header.Get("ETag")
 	if etag == "" {
-		return "", errors.New("ebs-s3: S3 conditional PUT returned no ETag")
+		return "", fmt.Errorf("%w: S3 accepted a conditional PUT but returned no ETag",
+			errObjectAmbiguous)
 	}
 
 	return etag, nil
 }
 
-func (s *s3API) List(ctx context.Context, prefix string) ([]string, error) {
+func (s s3API) List(ctx context.Context, prefix string) ([]string, error) {
 	var keys []string
 	continuation := ""
+	seen := map[string]bool{}
 	for {
 		query := url.Values{"list-type": {"2"}, "prefix": {prefix}}
 		if continuation != "" {
@@ -246,9 +272,10 @@ func (s *s3API) List(ctx context.Context, prefix string) ([]string, error) {
 		if !result.Truncated {
 			return keys, nil
 		}
-		if result.Continuation == "" || result.Continuation == continuation {
+		if result.Continuation == "" || seen[result.Continuation] {
 			return nil, errors.New("ebs-s3: a truncated S3 listing has no new continuation token")
 		}
+		seen[result.Continuation] = true
 		continuation = result.Continuation
 	}
 }
@@ -263,6 +290,24 @@ type ebsAPI struct {
 	now             func() time.Time
 	wait            func(context.Context, time.Duration) error
 }
+
+func (e ebsAPI) String() string { return "ebss3.ebsAPI{endpoint=" + e.endpoint + "}" }
+
+// GoString covers %#v.
+func (e ebsAPI) GoString() string { return e.String() }
+
+// Format keeps an unexported credential source out of every fmt verb.
+func (e ebsAPI) Format(f fmt.State, _ rune) {
+	if _, err := io.WriteString(f, e.String()); err != nil {
+		return
+	}
+}
+
+// MarshalJSON keeps structural serializers from reaching the credential source.
+func (e ebsAPI) MarshalJSON() ([]byte, error) { return json.Marshal(e.String()) }
+
+// LogValue is the redaction boundary used by slog.
+func (e ebsAPI) LogValue() slog.Value { return slog.StringValue(e.String()) }
 
 type awsAPIError struct {
 	Code   string
@@ -303,7 +348,7 @@ func newEBSAPI(
 	}
 }
 
-func (e *ebsAPI) call(ctx context.Context, values url.Values, output any) error {
+func (e ebsAPI) call(ctx context.Context, values url.Values, output any) error {
 	values.Set("Version", ebsAPIVersion)
 	body := []byte(values.Encode())
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.endpoint, bytes.NewReader(body))
@@ -354,7 +399,7 @@ func (e *ebsAPI) call(ctx context.Context, values url.Values, output any) error 
 	return nil
 }
 
-func (e *ebsAPI) ownership(values url.Values, resource string) {
+func (e ebsAPI) ownership(values url.Values, resource string) {
 	values.Set("TagSpecification.1.ResourceType", resource)
 	values.Set("TagSpecification.1.Tag.1.Key", ownerTag)
 	values.Set("TagSpecification.1.Tag.1.Value", e.deploymentOwner)
@@ -362,7 +407,7 @@ func (e *ebsAPI) ownership(values url.Values, resource string) {
 	values.Set("TagSpecification.1.Tag.2.Value", e.owner)
 }
 
-func (e *ebsAPI) callIdempotent(ctx context.Context, values url.Values, output any) error {
+func (e ebsAPI) callIdempotent(ctx context.Context, values url.Values, output any) error {
 	err := e.call(ctx, values, output)
 	if err == nil || ctx.Err() != nil {
 		return err
@@ -371,7 +416,7 @@ func (e *ebsAPI) callIdempotent(ctx context.Context, values url.Values, output a
 	return e.call(ctx, values, output)
 }
 
-func (e *ebsAPI) CreateVolume(
+func (e ebsAPI) CreateVolume(
 	ctx context.Context,
 	snapshot string,
 	sizeBytes int64,
@@ -410,7 +455,7 @@ func (e *ebsAPI) CreateVolume(
 	return result.ID, nil
 }
 
-func (e *ebsAPI) waitVolume(ctx context.Context, id, wanted string) error {
+func (e ebsAPI) waitVolume(ctx context.Context, id, wanted string) error {
 	for {
 		var result struct {
 			Volumes []struct {
@@ -443,7 +488,7 @@ type resourceTag struct {
 	Value string `xml:"value"`
 }
 
-func (e *ebsAPI) owned(tags []resourceTag) bool {
+func (e ebsAPI) owned(tags []resourceTag) bool {
 	deployment, cache := false, false
 	for _, tag := range tags {
 		switch tag.Key {
@@ -457,7 +502,7 @@ func (e *ebsAPI) owned(tags []resourceTag) bool {
 	return deployment && cache
 }
 
-func (e *ebsAPI) volumeOwned(ctx context.Context, id string) (bool, bool, error) {
+func (e ebsAPI) volumeOwned(ctx context.Context, id string) (bool, bool, error) {
 	var result struct {
 		Volumes []struct {
 			ID   string        `xml:"volumeId"`
@@ -480,7 +525,7 @@ func (e *ebsAPI) volumeOwned(ctx context.Context, id string) (bool, bool, error)
 	return e.owned(result.Volumes[0].Tags), true, nil
 }
 
-func (e *ebsAPI) DeleteVolume(ctx context.Context, id string) error {
+func (e ebsAPI) DeleteVolume(ctx context.Context, id string) error {
 	owned, found, err := e.volumeOwned(ctx, id)
 	if err != nil || !found {
 		return err
@@ -497,7 +542,7 @@ func (e *ebsAPI) DeleteVolume(ctx context.Context, id string) error {
 	return err
 }
 
-func (e *ebsAPI) CreateSnapshot(
+func (e ebsAPI) CreateSnapshot(
 	ctx context.Context,
 	volume string,
 	now time.Time,
@@ -538,7 +583,7 @@ type snapshotPage struct {
 	NextToken string         `xml:"nextToken"`
 }
 
-func (e *ebsAPI) describeSnapshots(ctx context.Context, values url.Values) (snapshotPage, error) {
+func (e ebsAPI) describeSnapshots(ctx context.Context, values url.Values) (snapshotPage, error) {
 	values.Set("Action", "DescribeSnapshots")
 	var result snapshotPage
 	if err := e.call(ctx, values, &result); err != nil {
@@ -548,7 +593,7 @@ func (e *ebsAPI) describeSnapshots(ctx context.Context, values url.Values) (snap
 	return result, nil
 }
 
-func (e *ebsAPI) waitSnapshot(ctx context.Context, id string) error {
+func (e ebsAPI) waitSnapshot(ctx context.Context, id string) error {
 	for {
 		page, err := e.describeSnapshots(ctx, url.Values{"SnapshotId.1": {id}})
 		if err != nil {
@@ -569,7 +614,7 @@ func (e *ebsAPI) waitSnapshot(ctx context.Context, id string) error {
 	}
 }
 
-func (e *ebsAPI) SnapshotExists(ctx context.Context, id string) (bool, error) {
+func (e ebsAPI) SnapshotExists(ctx context.Context, id string) (bool, error) {
 	page, err := e.describeSnapshots(ctx, url.Values{"SnapshotId.1": {id}})
 	if awsCode(err) == "InvalidSnapshot.NotFound" {
 		return false, nil
@@ -582,9 +627,10 @@ func (e *ebsAPI) SnapshotExists(ctx context.Context, id string) (bool, error) {
 		page.Snapshots[0].State == "completed", nil
 }
 
-func (e *ebsAPI) ListSnapshots(ctx context.Context) ([]snapshotInfo, error) {
+func (e ebsAPI) ListSnapshots(ctx context.Context) ([]snapshotInfo, error) {
 	var out []snapshotInfo
 	next := ""
+	seen := map[string]bool{}
 	for {
 		values := url.Values{
 			"Owner.1":          {"self"},
@@ -606,14 +652,15 @@ func (e *ebsAPI) ListSnapshots(ctx context.Context) ([]snapshotInfo, error) {
 		if page.NextToken == "" {
 			return out, nil
 		}
-		if page.NextToken == next {
+		if seen[page.NextToken] {
 			return nil, errors.New("ebs-s3: a paginated EBS snapshot listing repeated its token")
 		}
+		seen[page.NextToken] = true
 		next = page.NextToken
 	}
 }
 
-func (e *ebsAPI) DeleteSnapshot(ctx context.Context, id string) error {
+func (e ebsAPI) DeleteSnapshot(ctx context.Context, id string) error {
 	page, err := e.describeSnapshots(ctx, url.Values{"SnapshotId.1": {id}})
 	if awsCode(err) == "InvalidSnapshot.NotFound" {
 		return nil
@@ -638,9 +685,10 @@ func (e *ebsAPI) DeleteSnapshot(ctx context.Context, id string) error {
 
 // ListAvailableVolumes finds only this store's unattached volumes. Attached
 // volumes are live guest custody and are never candidates for this orphan sweep.
-func (e *ebsAPI) ListAvailableVolumes(ctx context.Context) ([]volumeInfo, error) {
+func (e ebsAPI) ListAvailableVolumes(ctx context.Context) ([]volumeInfo, error) {
 	var out []volumeInfo
 	next := ""
+	seen := map[string]bool{}
 	for {
 		values := url.Values{
 			"Action":           {"DescribeVolumes"},
@@ -670,9 +718,10 @@ func (e *ebsAPI) ListAvailableVolumes(ctx context.Context) ([]volumeInfo, error)
 		if result.NextToken == "" {
 			return out, nil
 		}
-		if result.NextToken == next {
+		if seen[result.NextToken] {
 			return nil, errors.New("ebs-s3: a paginated EBS volume listing repeated its token")
 		}
+		seen[result.NextToken] = true
 		next = result.NextToken
 	}
 }

@@ -336,6 +336,7 @@ func TestAnEBSAndS3StoreMustBeUsableByThisCloudNode(t *testing.T) {
 		"other region":        strings.Replace(valid, "    region: us-west-2\n", "    region: us-east-1\n", 1),
 		"other region's zone": strings.Replace(valid, "    availability_zone: us-west-2a\n", "    availability_zone: us-east-1a\n", 1),
 		"non-DNS bucket":      strings.Replace(valid, "    bucket: billet-cache-example\n", "    bucket: Billet_Cache\n", 1),
+		"dotted TLS bucket":   strings.Replace(valid, "    bucket: billet-cache-example\n", "    bucket: billet.cache.example\n", 1),
 		"absolute prefix":     strings.Replace(valid, "    prefix: deployments/example/aws-us-west-2\n", "    prefix: /absolute\n", 1),
 	} {
 		t.Run(name, func(t *testing.T) {

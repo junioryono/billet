@@ -70,6 +70,8 @@
     - >-
       billet_binary_install.changed | default(false) or
       billet_config_install.changed | default(false) or
+      billet_firecracker_install.changed | default(false) or
+      billet_firecracker_links.changed | default(false) or
       billet_systemd_units.changed | default(false)
   become: true
 
