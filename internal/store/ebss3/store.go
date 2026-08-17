@@ -156,14 +156,6 @@ func (s Store) statePrefix() string {
 	return s.cfg.Prefix + "/owners/" + hex.EncodeToString(digest[:]) + "/state/"
 }
 
-func (s Store) legacyStatePrefix() string { return s.cfg.Prefix + "/state/" }
-
-func (s Store) legacyStateKey(key string) string {
-	digest := sha256.Sum256([]byte(key))
-
-	return s.legacyStatePrefix() + hex.EncodeToString(digest[:]) + ".json"
-}
-
 func (s Store) requestToken(parts ...string) string {
 	digest := sha256.Sum256([]byte(s.owner + "\x00" + strings.Join(parts, "\x00")))
 
@@ -184,31 +176,7 @@ func emptyState(key string) keyState {
 }
 
 func (s Store) load(ctx context.Context, key string) (keyState, string, error) {
-	for range maxCASAttempts {
-		state, etag, err := s.loadObject(ctx, s.stateKey(key), key)
-		if err != nil || etag != "" {
-			return state, etag, err
-		}
-
-		legacy, legacyETag, err := s.loadObject(ctx, s.legacyStateKey(key), key)
-		if err != nil || legacyETag == "" {
-			return state, etag, err
-		}
-		body, err := json.Marshal(legacy)
-		if err != nil {
-			return keyState{}, "", fmt.Errorf("ebs-s3: encode legacy state for cache %q: %w", key, err)
-		}
-		newETag, err := s.objects.Put(ctx, s.stateKey(key), body, "")
-		if err == nil {
-			return legacy, newETag, nil
-		}
-		if !errors.Is(err, errObjectConflict) && !errors.Is(err, errObjectAmbiguous) {
-			return keyState{}, "", err
-		}
-	}
-
-	return keyState{}, "", fmt.Errorf("%w: cache %q migration did not settle",
-		storecontract.ErrConflict, key)
+	return s.loadObject(ctx, s.stateKey(key), key)
 }
 
 func (s Store) ensureState(ctx context.Context, key string) error {
@@ -662,28 +630,6 @@ func (s Store) dropActive(ctx context.Context, key, leaseID string) error {
 func (s Store) Evict(ctx context.Context, olderThan time.Duration) error {
 	if olderThan <= 0 {
 		return errors.New("ebs-s3: cache eviction needs a positive inactivity age")
-	}
-
-	legacyKeys, err := s.objects.List(ctx, s.legacyStatePrefix())
-	if err != nil {
-		return err
-	}
-	for _, objectKey := range legacyKeys {
-		body, _, found, err := s.objects.Get(ctx, objectKey)
-		if err != nil {
-			return err
-		}
-		if !found {
-			continue
-		}
-		var legacy keyState
-		if err := json.Unmarshal(body, &legacy); err != nil || legacy.Key == "" ||
-			objectKey != s.legacyStateKey(legacy.Key) {
-			return fmt.Errorf("ebs-s3: legacy state object %s is not a valid cache state", objectKey)
-		}
-		if _, _, err := s.load(ctx, legacy.Key); err != nil {
-			return err
-		}
 	}
 
 	keys, err := s.objects.List(ctx, s.statePrefix())

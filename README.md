@@ -379,7 +379,7 @@ Spot warnings are routed one queue per node. The router resolves the warned inst
 
 **The cloud half is written and unproven end to end.** Launch, inventory and teardown have reached a real AWS account, while EBS/S3 cache behavior still uses fake AWS boundaries. No GitHub Actions job has run there and nobody has stopped the bare-metal host and watched the same `runs-on` label finish in a region, so failover remains unproven ([#32](https://github.com/junioryono/billet/issues/32)). [#33](https://github.com/junioryono/billet/issues/33) tracks the whole plan.
 
-Upgrading an EC2 cache deployment to the owner-namespaced S3 layout requires draining every EC2 node first. The first access migrates an older state object, and eviction migrates the complete legacy prefix before it examines EBS or deletes anything; an older node writing the legacy object concurrently would otherwise create two authorities for the same cache key.
+The owner namespace is the EC2 cache isolation boundary. Pre-release S3 state objects written without a deployment-and-site owner are deliberately ignored and are never migrated automatically: their key cannot prove which deployment owns the referenced snapshots. An operator upgrading an experimental deployment from that layout must drain its EC2 nodes, remove its old unnamespaced state, and let the cache repopulate under the owner-specific prefix.
 
 ### Adding a second machine
 

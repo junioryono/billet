@@ -34,13 +34,15 @@
     - { name: hashicorp, url: "https://apt.releases.hashicorp.com/gpg" }
   become: true
 
-- name: Read development repository signing keys
-  ansible.builtin.command:
-    argv:
-      - gpg
-      - --show-keys
-      - --with-colons
-      - "{{ billet_development_apt_stage }}/{{ item }}.asc"
+- name: Read development repository primary signing fingerprints
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail;
+      gpg --batch --show-keys --with-colons "$BILLET_REPOSITORY_KEY" |
+      awk -F: '$1 == "pub" { want = 1; next } want && $1 == "fpr" { print $10; want = 0 }'
+    executable: /bin/bash
+  environment:
+    BILLET_REPOSITORY_KEY: "{{ billet_development_apt_stage }}/{{ item }}.asc"
   loop:
     - caddy
     - hashicorp
@@ -52,10 +54,10 @@
 - name: Verify development repository signing keys
   ansible.builtin.assert:
     that:
-      - "('fpr:::::::::' ~ item.fingerprint ~ ':') in (item.key.stdout | default(''))"
+      - item.key.stdout_lines == [item.fingerprint]
     fail_msg: >-
-      The {{ item.name }} repository key does not contain the pinned fingerprint
-      {{ item.fingerprint }}. Refusing to trust the repository.
+      The {{ item.name }} repository key does not contain exactly the pinned
+      primary fingerprint {{ item.fingerprint }}. Refusing to trust the bundle.
   loop:
     - name: Caddy
       fingerprint: "{{ billet_development_caddy_signing_fingerprint }}"

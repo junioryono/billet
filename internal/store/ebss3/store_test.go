@@ -2,6 +2,8 @@ package ebss3
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -230,94 +232,30 @@ func TestCloudStateIsIsolatedByDeploymentAndSiteOwner(t *testing.T) {
 	}
 }
 
-func TestLegacyCloudStateMigratesIntoTheOwnerNamespace(t *testing.T) {
+func TestUnnamespacedCloudStateIsNeverRead(t *testing.T) {
 	t.Parallel()
 
 	now := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
 	s, _, objects := testStore(&now)
-	legacy := emptyState("acme/api/npm")
-	legacy.Pointer = "old-generation"
-	legacy.Generations[legacy.Pointer] = generationState{
+	unnamespaced := emptyState("acme/api/npm")
+	unnamespaced.Pointer = "another-owner-generation"
+	unnamespaced.Generations[unnamespaced.Pointer] = generationState{
 		Handle: "snap-old", UsedAt: now,
 	}
-	body, err := json.Marshal(legacy)
+	body, err := json.Marshal(unnamespaced)
 	if err != nil {
 		t.Fatalf("Marshal: %v", err)
 	}
-	if _, err := objects.Put(t.Context(), s.legacyStateKey(legacy.Key), body, ""); err != nil {
-		t.Fatalf("seed legacy state: %v", err)
+	digest := sha256.Sum256([]byte(unnamespaced.Key))
+	oldKey := s.cfg.Prefix + "/state/" + hex.EncodeToString(digest[:]) + ".json"
+	if _, err := objects.Put(t.Context(), oldKey, body, ""); err != nil {
+		t.Fatalf("seed unnamespaced state: %v", err)
 	}
-	objects.afterPutErr = fmt.Errorf("%w: response lost after migration committed", errObjectAmbiguous)
-
-	if got, err := s.Current(t.Context(), legacy.Key); err != nil || got != legacy.Pointer {
-		t.Fatalf("Current = %q, %v; want migrated %q", got, err, legacy.Pointer)
+	if got, err := s.Current(t.Context(), unnamespaced.Key); !errors.Is(err, storecontract.ErrMiss) {
+		t.Fatalf("Current = %q, %v; want an isolated cache miss", got, err)
 	}
-	if _, _, found, err := objects.Get(t.Context(), s.stateKey(legacy.Key)); err != nil || !found {
-		t.Fatalf("owner state was not installed: found=%t err=%v", found, err)
-	}
-}
-
-func TestLegacyCloudStateMigratesBeforeBlockStorageChanges(t *testing.T) {
-	t.Parallel()
-
-	for _, operation := range []struct {
-		name    string
-		run     func(context.Context, *Store) error
-		changed func(*fakeBlocks) bool
-	}{
-		{
-			name: "create",
-			run: func(ctx context.Context, s *Store) error {
-				_, err := s.Create(ctx, "acme/api/npm", 1<<30)
-
-				return err
-			},
-			changed: func(blocks *fakeBlocks) bool { return blocks.nextVolume != 0 },
-		},
-		{
-			name: "snapshot",
-			run: func(ctx context.Context, s *Store) error {
-				_, err := s.Snapshot(ctx, storecontract.Volume{
-					Key: "acme/api/npm", Handle: "vol-old", Device: "vol-old",
-					Filesystem: storecontract.Filesystem{Type: "ext4", UUID: "fs-old", Clean: true},
-				})
-
-				return err
-			},
-			changed: func(blocks *fakeBlocks) bool { return blocks.nextSnapshot != 0 },
-		},
-		{
-			name: "discard",
-			run: func(ctx context.Context, s *Store) error {
-				return s.Discard(ctx, storecontract.Volume{
-					Key: "acme/api/npm", Handle: "vol-old", Device: "vol-old",
-				})
-			},
-			changed: func(blocks *fakeBlocks) bool { return len(blocks.deletedVolume) != 0 },
-		},
-	} {
-		t.Run(operation.name, func(t *testing.T) {
-			t.Parallel()
-
-			now := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
-			s, blocks, objects := testStore(&now)
-			legacy := emptyState("acme/api/npm")
-			body, err := json.Marshal(legacy)
-			if err != nil {
-				t.Fatalf("Marshal: %v", err)
-			}
-			if _, err := objects.Put(t.Context(), s.legacyStateKey(legacy.Key), body, ""); err != nil {
-				t.Fatalf("seed legacy state: %v", err)
-			}
-			objects.putErr = errors.New("S3 migration unavailable")
-
-			if err := operation.run(t.Context(), s); err == nil {
-				t.Fatal("operation continued after legacy migration failed")
-			}
-			if operation.changed(blocks) {
-				t.Fatal("block storage changed before legacy state migrated")
-			}
-		})
+	if _, _, found, err := objects.Get(t.Context(), s.stateKey(unnamespaced.Key)); err != nil || found {
+		t.Fatalf("unnamespaced state was copied into this owner: found=%t err=%v", found, err)
 	}
 }
 

@@ -106,21 +106,34 @@ function enforceMountLimit() {
   }
   recordUsage(after);
   if (!discardMarker) throw new Error("the runner-local publication guard is unavailable");
-  fs.rmSync(discardMarker);
 }
 
 function markDiscard(error) {
   const message = String(error.message || error).replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
-  process.stdout.write(`::warning::billet could not enforce the BuildKit cache-mount ceiling and will discard this cache update: ${message}\n`);
+  process.stdout.write(`::warning::billet could not safely prepare BuildKit state and will discard this cache update: ${message}\n`);
 }
 
 if (container) {
-	try {
-		enforceMountLimit();
-	} catch (error) {
-		markDiscard(error);
-	}
-	run("docker", ["rm", "--force", container]);
+  let publishable = true;
+  try {
+    enforceMountLimit();
+  } catch (error) {
+    publishable = false;
+    markDiscard(error);
+  }
+  try {
+    successful(run("docker", ["rm", "--force", container]), "stop the BuildKit container");
+  } catch (error) {
+    publishable = false;
+    markDiscard(error);
+  }
+  if (publishable) {
+    try {
+      fs.rmSync(discardMarker);
+    } catch (error) {
+      markDiscard(error);
+    }
+  }
 }
 if (builder) run("docker", ["buildx", "rm", builder]);
 if (statePath) {

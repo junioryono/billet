@@ -154,7 +154,7 @@ func TestBuilderCleanupReportsGrowthAndPrunesAnOversizedMount(t *testing.T) {
 		t.Fatalf("write previous usage: %v", err)
 	}
 
-	output, calls := runBuilderCleanup(t, statePath, discardMarker, false)
+	output, calls := runBuilderCleanup(t, statePath, discardMarker, false, false)
 	if !strings.Contains(output, "cached mount /root/.cache from buildkit") ||
 		!strings.Contains(output, "grew 2 KiB") {
 		t.Errorf("cleanup did not report per-mount growth:\n%s", output)
@@ -178,12 +178,29 @@ func TestBuilderCleanupDiscardsThePublicationWhenACeilingCannotBeEnforced(t *tes
 	if err := os.WriteFile(discardMarker, nil, 0o600); err != nil {
 		t.Fatalf("write publication guard: %v", err)
 	}
-	output, _ := runBuilderCleanup(t, statePath, discardMarker, true)
+	output, _ := runBuilderCleanup(t, statePath, discardMarker, true, false)
 	if !strings.Contains(output, "will discard this cache update") {
 		t.Errorf("cleanup did not explain the fail-safe discard:\n%s", output)
 	}
 	if _, err := os.Stat(discardMarker); err != nil {
 		t.Fatalf("failed enforcement did not mark the sticky disk for discard: %v", err)
+	}
+}
+
+func TestBuilderCleanupDiscardsThePublicationUntilTheContainerStops(t *testing.T) {
+	t.Parallel()
+
+	statePath := t.TempDir()
+	discardMarker := filepath.Join(t.TempDir(), "billet-buildkit-discard")
+	if err := os.WriteFile(discardMarker, nil, 0o600); err != nil {
+		t.Fatalf("write publication guard: %v", err)
+	}
+	output, _ := runBuilderCleanup(t, statePath, discardMarker, false, true)
+	if !strings.Contains(output, "stop the BuildKit container exited 1") {
+		t.Errorf("cleanup did not explain why publication remained blocked:\n%s", output)
+	}
+	if _, err := os.Stat(discardMarker); err != nil {
+		t.Fatalf("a running BuildKit container did not keep the publication guard: %v", err)
 	}
 }
 
@@ -309,7 +326,11 @@ func TestTheTierMountLimitAndFailSafeDiscardAreWiredBetweenActions(t *testing.T)
 	}
 }
 
-func runBuilderCleanup(t *testing.T, statePath, discardMarker string, failPrune bool) (string, string) {
+func runBuilderCleanup(
+	t *testing.T,
+	statePath, discardMarker string,
+	failPrune, failRemove bool,
+) (string, string) {
 	t.Helper()
 
 	node, err := exec.LookPath("node")
@@ -349,6 +370,12 @@ case " $* " in
       exit 1
     fi
     ;;
+  *" rm --force "*)
+    if [ "$BILLET_FAKE_FAIL_REMOVE" = true ]; then
+      echo still-running >&2
+      exit 1
+    fi
+    ;;
 esac
 `
 	if err := os.WriteFile(filepath.Join(tools, "docker"), []byte(fakeDocker), 0o755); err != nil {
@@ -372,6 +399,7 @@ esac
 		"BILLET_FAKE_BEFORE="+before,
 		"BILLET_FAKE_AFTER="+after,
 		"BILLET_FAKE_FAIL_PRUNE="+map[bool]string{true: "true", false: "false"}[failPrune],
+		"BILLET_FAKE_FAIL_REMOVE="+map[bool]string{true: "true", false: "false"}[failRemove],
 	)
 	var output bytes.Buffer
 	cmd.Stdout = &output
