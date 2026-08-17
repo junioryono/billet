@@ -1,0 +1,15 @@
+---
+- name: Record Linux package metadata readiness
+  ansible.builtin.set_fact:
+    billet_development_linux_packages_ready: >-
+      {{
+        not ansible_check_mode or
+        (billet_development_deb822_support.rc == 0 and
+        billet_development_apt_artifacts.results[2].stat.exists and
+        billet_development_apt_artifacts.results[4].stat.exists and
+        billet_development_caddy_repository is not changed and
+        (not billet_development_install_terraform or
+        (billet_development_apt_artifacts.results[3].stat.exists and
+        billet_development_apt_artifacts.results[5].stat.exists and
+        billet_development_hashicorp_repository is not changed)))
+      }}
