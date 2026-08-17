@@ -64,8 +64,9 @@ Downloads the latest release for your platform, verifies its checksum, and puts 
 When one machine prepares another, set the target explicitly. This is useful for an Ansible control machine on macOS provisioning a Linux server, or for preparing a second Mac without running the installer there:
 
 ```bash
+billet_stage=$(mktemp -d)
 curl -fsSL https://raw.githubusercontent.com/junioryono/billet/main/scripts/install.sh | \
-  BILLET_OS=linux BILLET_ARCH=amd64 BILLET_INSTALL_DIR="$PWD/stage" sh
+  BILLET_OS=linux BILLET_ARCH=amd64 BILLET_INSTALL_DIR="$billet_stage" sh
 ```
 
 `BILLET_OS` and `BILLET_ARCH` must be set together. Supported targets are `linux/amd64`, `linux/arm64`, and `darwin/arm64`. A cross-target install verifies and places the binary but does not execute it on the control machine.

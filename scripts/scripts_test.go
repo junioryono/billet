@@ -1,13 +1,19 @@
 package scripts_test
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 func TestRepositoryKeyVerifierRequiresTheExactPrimaryKeySet(t *testing.T) {
@@ -372,6 +378,109 @@ func TestInstallerRefusesUnsafeArchiveNames(t *testing.T) {
 	}
 }
 
+func TestInstallerStreamsOnlyTheExpectedArchiveMember(t *testing.T) {
+	t.Parallel()
+
+	t.Run("traversal entry", func(t *testing.T) {
+		t.Parallel()
+
+		run := runInstaller(t, installerFixture{
+			hostOS:        "Darwin",
+			hostArch:      "arm64",
+			binary:        "#!/bin/sh\nprintf 'billet safe archive fixture\n'\n",
+			archiveThreat: "traversal",
+		})
+		if _, err := os.Stat(run.escaped); !os.IsNotExist(err) {
+			t.Fatalf("archive escape path error = %v; want not-exist", err)
+		}
+		assertFileEquals(t, run.installed, "#!/bin/sh\nprintf 'billet safe archive fixture\n'\n")
+	})
+
+	t.Run("symlink payload", func(t *testing.T) {
+		t.Parallel()
+
+		run := runInstallerExpectingFailure(t, installerFixture{
+			hostOS:        "Darwin",
+			hostArch:      "arm64",
+			binary:        "unused\n",
+			archiveThreat: "symlink",
+		})
+		assertFileEquals(t, run.escaped, "outside stays unchanged\n")
+		if _, err := os.Stat(run.installed); !os.IsNotExist(err) {
+			t.Fatalf("installed binary error = %v; want not-exist", err)
+		}
+	})
+}
+
+func TestInstallerCleansUpAfterSignals(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name     string
+		signal   syscall.Signal
+		exitCode int
+	}{
+		{name: "interrupt", signal: syscall.SIGINT, exitCode: 130},
+		{name: "terminate", signal: syscall.SIGTERM, exitCode: 143},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			run := runInstallerExpectingFailure(t, installerFixture{
+				hostOS:    "Darwin",
+				hostArch:  "arm64",
+				binary:    "#!/bin/sh\nprintf 'ready\n' > \"$BILLET_TEST_MARKER\"\nwhile :; do sleep 1; done\n",
+				oldBinary: "working billet\n",
+				signal:    tc.signal,
+			})
+			if run.exitCode != tc.exitCode {
+				t.Fatalf("exit code = %d; want %d; output = %q", run.exitCode, tc.exitCode, run.output)
+			}
+			assertFileEquals(t, run.installed, "working billet\n")
+			assertNoInstallerResidue(t, run)
+		})
+	}
+}
+
+func TestInstallerUsesPrivilegedStagingAndCleanup(t *testing.T) {
+	t.Parallel()
+
+	t.Run("success", func(t *testing.T) {
+		t.Parallel()
+
+		run := runInstaller(t, installerFixture{
+			hostOS:     "Darwin",
+			hostArch:   "arm64",
+			binary:     "#!/bin/sh\nprintf 'billet privileged fixture\n'\n",
+			oldBinary:  "working billet\n",
+			privileged: true,
+		})
+		assertFileEquals(t, run.installed, "#!/bin/sh\nprintf 'billet privileged fixture\n'\n")
+		for _, command := range []string{"mktemp", "cp", "chmod", "mv"} {
+			if !strings.Contains(run.sudoRequests, command+"\n") {
+				t.Fatalf("sudo requests = %q; want %s", run.sudoRequests, command)
+			}
+		}
+	})
+
+	t.Run("validation failure", func(t *testing.T) {
+		t.Parallel()
+
+		run := runInstallerExpectingFailure(t, installerFixture{
+			hostOS:     "Darwin",
+			hostArch:   "arm64",
+			binary:     "#!/bin/sh\nexit 7\n",
+			oldBinary:  "working billet\n",
+			privileged: true,
+		})
+		assertFileEquals(t, run.installed, "working billet\n")
+		if !strings.Contains(run.sudoRequests, "rm\n") {
+			t.Fatalf("sudo requests = %q; want cleanup through sudo", run.sudoRequests)
+		}
+		assertNoInstallerResidue(t, run)
+	})
+}
+
 func TestInstallerRefusesADirectoryDestination(t *testing.T) {
 	t.Parallel()
 
@@ -425,6 +534,9 @@ type installerFixture struct {
 	darwinArchiveName    string
 	destinationDirectory bool
 	fixedStageSentinel   string
+	archiveThreat        string
+	privileged           bool
+	signal               syscall.Signal
 }
 
 type installerRun struct {
@@ -433,6 +545,10 @@ type installerRun struct {
 	installed     string
 	marker        string
 	unameRequests string
+	escaped       string
+	tempParent    string
+	sudoRequests  string
+	exitCode      int
 }
 
 func runInstaller(t *testing.T, fixture installerFixture) installerRun {
@@ -463,11 +579,16 @@ func executeInstaller(t *testing.T, fixture installerFixture) (installerRun, err
 	root := t.TempDir()
 	tools := filepath.Join(root, "tools")
 	installDir := filepath.Join(root, "install")
+	tempParent := filepath.Join(root, "tmp")
+	escaped := filepath.Join(root, "escaped")
 	if err := os.MkdirAll(tools, 0o755); err != nil {
 		t.Fatalf("create tools: %v", err)
 	}
 	if err := os.MkdirAll(installDir, 0o755); err != nil {
 		t.Fatalf("create install directory: %v", err)
+	}
+	if err := os.MkdirAll(tempParent, 0o755); err != nil {
+		t.Fatalf("create temporary parent: %v", err)
 	}
 
 	selectedPlatform := fixturePlatform(fixture)
@@ -485,6 +606,16 @@ func executeInstaller(t *testing.T, fixture installerFixture) (installerRun, err
 	linuxArchive := writeInstallerArchive(t, root, "linux-amd64", linuxBinary)
 	linuxARMArchive := writeInstallerArchive(t, root, "linux-arm64", linuxARMBinary)
 	darwinArchive := writeInstallerArchive(t, root, "darwin", darwinBinary)
+	if fixture.archiveThreat != "" {
+		switch selectedPlatform {
+		case "linux_amd64":
+			linuxArchive = writeHostileInstallerArchive(t, root, "linux-amd64-hostile", fixture.archiveThreat, linuxBinary, escaped)
+		case "linux_arm64":
+			linuxARMArchive = writeHostileInstallerArchive(t, root, "linux-arm64-hostile", fixture.archiveThreat, linuxARMBinary, escaped)
+		default:
+			darwinArchive = writeHostileInstallerArchive(t, root, "darwin-hostile", fixture.archiveThreat, darwinBinary, escaped)
+		}
+	}
 	linuxSum := fileSHA256(t, linuxArchive)
 	linuxARMSum := fileSHA256(t, linuxARMArchive)
 	darwinSum := fileSHA256(t, darwinArchive)
@@ -550,7 +681,26 @@ esac
 
 	requests := filepath.Join(root, "requests")
 	unameRequests := filepath.Join(root, "uname-requests")
+	sudoRequests := filepath.Join(root, "sudo-requests")
 	marker := filepath.Join(root, "executed")
+	if fixture.privileged {
+		writeExecutable(t, filepath.Join(tools, "sudo"), `#!/bin/sh
+printf '%s\n' "$1" >> "$BILLET_TEST_SUDO_LOG"
+chmod u+w "$BILLET_TEST_INSTALL_DIR"
+"$@"
+status=$?
+chmod u-w "$BILLET_TEST_INSTALL_DIR"
+exit "$status"
+`)
+		if err := os.Chmod(installDir, 0o555); err != nil {
+			t.Fatalf("make install directory non-writable: %v", err)
+		}
+		t.Cleanup(func() {
+			if err := os.Chmod(installDir, 0o755); err != nil && !os.IsNotExist(err) {
+				t.Errorf("restore install directory permissions: %v", err)
+			}
+		})
+	}
 	cmd := exec.CommandContext(t.Context(), "sh", installer)
 	cmd.Env = append(environmentWithout(
 		"BILLET_ARCH",
@@ -558,6 +708,7 @@ esac
 		"BILLET_INSTALL_SH_TEST",
 		"BILLET_OS",
 		"BILLET_VERSION",
+		"TMPDIR",
 	),
 		"PATH="+tools+":"+os.Getenv("PATH"),
 		"BILLET_INSTALL_DIR="+installDir,
@@ -566,9 +717,12 @@ esac
 		"BILLET_TEST_DARWIN_ARCHIVE="+darwinArchive,
 		"BILLET_TEST_LINUX_ARM_ARCHIVE="+linuxARMArchive,
 		"BILLET_TEST_LINUX_ARCHIVE="+linuxArchive,
+		"BILLET_TEST_INSTALL_DIR="+installDir,
 		"BILLET_TEST_MARKER="+marker,
+		"BILLET_TEST_SUDO_LOG="+sudoRequests,
 		"BILLET_TEST_UNAME_FAIL="+fixture.unameFailFlag,
 		"BILLET_TEST_UNAME_LOG="+unameRequests,
+		"TMPDIR="+tempParent,
 	)
 	if fixture.legacyBypass {
 		cmd.Env = append(cmd.Env, "BILLET_INSTALL_SH_TEST=1")
@@ -579,7 +733,25 @@ esac
 	if fixture.targetArch != nil {
 		cmd.Env = append(cmd.Env, "BILLET_ARCH="+*fixture.targetArch)
 	}
-	output, runErr := cmd.CombinedOutput()
+	var output []byte
+	var runErr error
+	if fixture.signal != 0 {
+		var combined bytes.Buffer
+		cmd.Stdout = &combined
+		cmd.Stderr = &combined
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("start installer for signal: %v", err)
+		}
+		waitForFile(t, marker)
+		if err := syscall.Kill(-cmd.Process.Pid, fixture.signal); err != nil {
+			t.Fatalf("signal installer process group: %v", err)
+		}
+		runErr = cmd.Wait()
+		output = combined.Bytes()
+	} else {
+		output, runErr = cmd.CombinedOutput()
+	}
 	requestsBody, err := os.ReadFile(requests)
 	if err != nil && !os.IsNotExist(err) {
 		t.Fatalf("read requests: %v", err)
@@ -588,12 +760,25 @@ esac
 	if err != nil && !os.IsNotExist(err) {
 		t.Fatalf("read uname requests: %v", err)
 	}
+	sudoRequestsBody, err := os.ReadFile(sudoRequests)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("read sudo requests: %v", err)
+	}
+	exitCode := 0
+	var exitError *exec.ExitError
+	if errors.As(runErr, &exitError) {
+		exitCode = exitError.ExitCode()
+	}
 	return installerRun{
 		output:        string(output),
 		requests:      string(requestsBody),
 		installed:     filepath.Join(installDir, "billet"),
 		marker:        marker,
 		unameRequests: string(unameRequestsBody),
+		escaped:       escaped,
+		tempParent:    tempParent,
+		sudoRequests:  string(sudoRequestsBody),
+		exitCode:      exitCode,
 	}, runErr
 }
 
@@ -625,6 +810,92 @@ func writeInstallerArchive(t *testing.T, root, name, binary string) string {
 		t.Fatalf("create %s archive: %v\n%s", name, err, output)
 	}
 	return archive
+}
+
+func writeHostileInstallerArchive(t *testing.T, root, name, threat, binary, escaped string) string {
+	t.Helper()
+
+	archive := filepath.Join(root, name+".tar.gz")
+	file, err := os.Create(archive)
+	if err != nil {
+		t.Fatalf("create hostile archive: %v", err)
+	}
+	gzipWriter := gzip.NewWriter(file)
+	tarWriter := tar.NewWriter(gzipWriter)
+	writeRegular := func(name, body string, mode int64) {
+		t.Helper()
+		header := &tar.Header{Name: name, Mode: mode, Size: int64(len(body)), Typeflag: tar.TypeReg}
+		if err := tarWriter.WriteHeader(header); err != nil {
+			t.Fatalf("write hostile archive header: %v", err)
+		}
+		if _, err := tarWriter.Write([]byte(body)); err != nil {
+			t.Fatalf("write hostile archive body: %v", err)
+		}
+	}
+
+	switch threat {
+	case "traversal":
+		writeRegular("../escaped", "archive escaped\n", 0o644)
+		writeRegular("billet", binary, 0o755)
+	case "symlink":
+		if err := os.WriteFile(escaped, []byte("outside stays unchanged\n"), 0o600); err != nil {
+			t.Fatalf("write symlink target: %v", err)
+		}
+		header := &tar.Header{Name: "billet", Mode: 0o777, Typeflag: tar.TypeSymlink, Linkname: escaped}
+		if err := tarWriter.WriteHeader(header); err != nil {
+			t.Fatalf("write hostile symlink header: %v", err)
+		}
+	default:
+		t.Fatalf("unknown archive threat %q", threat)
+	}
+	if err := tarWriter.Close(); err != nil {
+		t.Fatalf("close hostile tar: %v", err)
+	}
+	if err := gzipWriter.Close(); err != nil {
+		t.Fatalf("close hostile gzip: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close hostile archive: %v", err)
+	}
+	return archive
+}
+
+func waitForFile(t *testing.T, path string) {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		_, err := os.Stat(path)
+		if err == nil {
+			return
+		}
+		if !os.IsNotExist(err) {
+			t.Fatalf("wait for %s: %v", path, err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", path)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func assertNoInstallerResidue(t *testing.T, run installerRun) {
+	t.Helper()
+
+	matches, err := filepath.Glob(filepath.Join(filepath.Dir(run.installed), ".billet.incoming.*"))
+	if err != nil {
+		t.Fatalf("glob staging files: %v", err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("staging residue = %v; want none", matches)
+	}
+	entries, err := os.ReadDir(run.tempParent)
+	if err != nil {
+		t.Fatalf("read temporary parent: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("temporary residue = %v; want none", entries)
+	}
 }
 
 func fileSHA256(t *testing.T, path string) [sha256.Size]byte {

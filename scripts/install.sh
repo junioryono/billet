@@ -172,10 +172,15 @@ main() {
 This is not the file the release says it is. Do not install it."
     fi
 
-    tar -xzf "${payload}" -C "${tmp}"
-    [ -f "${tmp}/${BIN}" ] || die "the archive did not contain ${BIN}"
+    # STREAM ONLY THE EXPECTED MEMBER. Extracting the whole archive would let a
+    # checksum-listed release write links or traversal entries outside this
+    # temporary directory before billet ever inspected the result.
+    extracted="${tmp}/${BIN}"
+    tar -xOzf "${payload}" "${BIN}" > "${extracted}" ||
+        die "the archive did not contain a readable ${BIN} file"
+    [ -s "${extracted}" ] || die "the archive contained an empty ${BIN} file"
 
-    chmod +x "${tmp}/${BIN}"
+    chmod +x "${extracted}"
 
     case "${INSTALL_DIR}" in
         /*) ;;
@@ -208,7 +213,7 @@ Set BILLET_INSTALL_DIR to somewhere you can write."
 
     staged="$(${install_prefix} mktemp "${INSTALL_DIR}/.${BIN}.incoming.XXXXXX")" ||
         die "could not create a staging file in ${INSTALL_DIR}"
-    ${install_prefix} cp "${tmp}/${BIN}" "${staged}" &&
+    ${install_prefix} cp "${extracted}" "${staged}" &&
         ${install_prefix} chmod 0755 "${staged}" ||
         die "could not stage billet in ${INSTALL_DIR}"
 
