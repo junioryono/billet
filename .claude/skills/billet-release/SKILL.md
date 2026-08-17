@@ -22,7 +22,7 @@ main ──●──●──●──●──●──●──▶
 
 Cut with the **Cut Release** workflow (Actions → Run workflow). Blank version cuts the next minor; supply one to bump deliberately. A hotfix is a commit on the existing `release/vX.Y` branch and a press of the same button with the patch version typed in — then **merge that branch back into main**, or the next release reverts the fix.
 
-`cut-release.yml` creates the tag and CALLS `release.yml` rather than relying on the tag push to trigger it. A ref pushed with `GITHUB_TOKEN` does not start another workflow — GitHub's recursion guard — which is why a release button usually needs a PAT or an App. A `workflow_call` is not an event, so billet needs no repository secrets.
+`cut-release.yml` creates the tag and CALLS `release.yml` rather than relying on the tag push to trigger it. Before tagging, it rewrites both the internal composite-action refs and `ansible_collections/junioryono/billet/galaxy.yml` to the exact release version; a collection installed from a Git tag still reports the version in that file. A ref pushed with `GITHUB_TOKEN` does not start another workflow — GitHub's recursion guard — which is why a release button usually needs a PAT or an App. A `workflow_call` is not an event, so billet needs no repository secrets.
 
 ## Updating a running host
 
