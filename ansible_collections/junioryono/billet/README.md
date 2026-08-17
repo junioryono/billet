@@ -8,7 +8,7 @@ Set `billet_binary_src` to the Linux binary the role should install. A repositor
 
 ```bash
 billet_stage=$(mktemp -d)
-curl -fsSL https://raw.githubusercontent.com/junioryono/billet/v0.1.1/scripts/install.sh | BILLET_VERSION=v0.1.1 BILLET_OS=linux BILLET_ARCH=amd64 BILLET_INSTALL_DIR="$billet_stage" sh
+curl -fsSL https://raw.githubusercontent.com/junioryono/billet/v0.1.3/scripts/install.sh | BILLET_VERSION=v0.1.3 BILLET_OS=linux BILLET_ARCH=amd64 BILLET_INSTALL_DIR="$billet_stage" sh
 ansible-playbook site.yml -e "billet_binary_src=$billet_stage/billet"
 ```
 
@@ -19,6 +19,8 @@ See `roles/host/defaults/main.yml` for the complete input surface.
 `junioryono.billet.development_host` is a separate, reusable developer-machine layer for Debian-family systemd hosts and macOS. It installs current Caddy and Terraform from their publishers' repositories, installs mkcert, stages and validates a caller-defined certificate/key pair before installation, and keeps a caller-supplied Caddyfile running across reboots through systemd or launchd. The role has no application or domain defaults: a repository supplies its SANs, proxy configuration and environment, while Billet owns package verification, CA trust, private-key permissions and service lifecycle. Disabling the proxy unloads and removes the prior systemd or launchd definition.
 
 The role defaults to a localhost-only certificate and an empty proxy routing table. Set `billet_development_tls_sans` and `billet_development_proxy_config_src` for a real project. On macOS, Homebrew must already be installed; every formula and the launchd service are then converged by the role. See `roles/development_host/defaults/main.yml` for the complete input surface.
+
+Run the playbook with `--check --diff` before converging a new or existing machine. The role still runs read-only identity, package and version probes in check mode, while deferring generated certificate validation until the files exist, so a first dry run can describe the installation without failing on tools it has not installed yet.
 
 ```yaml
 - name: Configure development machines
