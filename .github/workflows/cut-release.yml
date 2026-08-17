@@ -56,6 +56,7 @@ jobs:
         env:
           TAG: ${{ steps.plan.outputs.tag }}
           BRANCH: ${{ steps.plan.outputs.branch }}
+          COLLECTION_VERSION: ${{ steps.plan.outputs.collection_version }}
         run: |
           set -euo pipefail
 
@@ -84,9 +85,19 @@ jobs:
             printf 'release action references did not all resolve exactly to %s:\n%s\n' "${TAG}" "${internal_refs[*]}" >&2
             exit 1
           fi
+
+          # A COLLECTION INSTALLED FROM A GIT TAG STILL READS galaxy.yml. The
+          # tag and that metadata must describe the same artifact, or Ansible
+          # reports a different version from the one the operator pinned.
+          sed -E -i "s#^version: [0-9]+\.[0-9]+\.[0-9]+$#version: ${COLLECTION_VERSION}#" ansible_collections/junioryono/billet/galaxy.yml
+          actual_collection_version="$(sed -n 's/^version: //p' ansible_collections/junioryono/billet/galaxy.yml)"
+          if [[ "${actual_collection_version}" != "${COLLECTION_VERSION}" ]]; then
+            printf 'Ansible collection version is %s, expected %s\n' "${actual_collection_version}" "${COLLECTION_VERSION}" >&2
+            exit 1
+          fi
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add actions/build-push-action/action.yml actions/setup-docker-builder/action.yml
+          git add actions/build-push-action/action.yml actions/setup-docker-builder/action.yml ansible_collections/junioryono/billet/galaxy.yml
           if ! git diff --cached --quiet; then
             git commit -m "Release ${TAG}"
           fi
