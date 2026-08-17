@@ -2,7 +2,8 @@
 - name: Reload systemd
   ansible.builtin.systemd_service:
     daemon_reload: true
-  become: true
+  when: not (_billet_alert_skip_service_control | default(false))
+  become: "{{ _billet_alert_become | default(true) }}"
 
 - name: Reload billet guest networking
   ansible.builtin.command: networkctl reload

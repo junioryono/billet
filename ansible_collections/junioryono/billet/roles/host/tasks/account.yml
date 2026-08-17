@@ -62,6 +62,7 @@
       - ceph-common
       - dnsmasq-base
       - iproute2
+      - kmod
       - nftables
     state: present
     update_cache: true

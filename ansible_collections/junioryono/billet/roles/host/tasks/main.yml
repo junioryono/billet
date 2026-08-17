@@ -46,6 +46,13 @@
   ansible.builtin.import_tasks: ceph.yml
   when: billet_ceph_enabled
 
+- name: Remove disabled Ceph kernel module policy
+  ansible.builtin.file:
+    path: /etc/modules-load.d/billet-rbd.conf
+    state: absent
+  when: not billet_ceph_enabled
+  become: true
+
 - name: Configure or remove Ceph health alerts
   ansible.builtin.import_tasks: alerts.yml
 

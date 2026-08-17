@@ -1,0 +1,72 @@
+---
+- name: Define the alert lifecycle case root
+  ansible.builtin.set_fact:
+    billet_alert_case_root: "{{ billet_alert_test_root }}/{{ billet_alert_case.name }}"
+
+- name: Create the alert lifecycle case directories
+  ansible.builtin.file:
+    path: "{{ billet_alert_case_root }}/{{ item }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - etc/billet
+    - etc/systemd/system
+    - usr/local/libexec
+
+- name: Seed the SMTP configuration
+  ansible.builtin.copy:
+    content: "{{ billet_alert_case.content }}"
+    dest: "{{ billet_alert_case_root }}/etc/msmtprc"
+    mode: "0600"
+
+- name: Seed the SMTP ownership marker
+  ansible.builtin.copy:
+    content: "managed by junioryono.billet.host\n"
+    dest: "{{ billet_alert_case_root }}/etc/billet/msmtprc-managed"
+    mode: "0600"
+  when: billet_alert_case.managed
+
+- name: Seed stale Ceph alert artifacts
+  ansible.builtin.copy:
+    content: "stale\n"
+    dest: "{{ billet_alert_case_root }}/{{ item }}"
+    mode: "0644"
+  loop:
+    - usr/local/libexec/billet-ceph-health
+    - etc/systemd/system/billet-ceph-health.service
+    - etc/systemd/system/billet-ceph-health.timer
+
+- name: Disable Ceph alerts through the host role
+  ansible.builtin.include_role:
+    name: junioryono.billet.host
+    tasks_from: alerts
+  vars:
+    _billet_alert_root: "{{ billet_alert_case_root }}"
+    _billet_alert_become: false
+    _billet_alert_skip_service_control: true
+    billet_ceph_enabled: false
+    billet_alert_email: alerts@example.com
+    billet_alert_from: billet@example.com
+    billet_smtp_username: ""
+    billet_smtp_password: ""
+
+- name: Inspect alert lifecycle results
+  ansible.builtin.stat:
+    path: "{{ billet_alert_case_root }}/{{ item }}"
+  loop:
+    - etc/msmtprc
+    - etc/billet/msmtprc-managed
+    - usr/local/libexec/billet-ceph-health
+    - etc/systemd/system/billet-ceph-health.service
+    - etc/systemd/system/billet-ceph-health.timer
+  register: billet_alert_case_results
+
+- name: Verify owned credentials and disabled alerts are removed
+  ansible.builtin.assert:
+    that:
+      - billet_alert_case_results.results[0].stat.exists == (not billet_alert_case.removed)
+      - not billet_alert_case_results.results[1].stat.exists
+      - not billet_alert_case_results.results[2].stat.exists
+      - not billet_alert_case_results.results[3].stat.exists
+      - not billet_alert_case_results.results[4].stat.exists
+    fail_msg: "Alert lifecycle cleanup failed for {{ billet_alert_case.name }}."

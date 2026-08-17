@@ -21,6 +21,16 @@ TEMPLATE=/usr/share/billet/billet.yaml
 KEY="${CONF_DIR}/app-private-key.pem"
 JAILER_DIR=/srv/jailer
 
+# THE NODE UNIT CANNOT LOAD MODULES. ProtectKernelModules is intentional service
+# hardening, so the host prepares the RBD client before the unit can start. The
+# package also installs a modules-load.d entry for reboots. A kernel without RBD
+# is allowed here because an EC2 or Docker-only node does not use Ceph; `billet
+# check` remains the place that rejects an enabled Ceph configuration whose host
+# cannot satisfy it.
+if command -v modprobe >/dev/null 2>&1 && modprobe -n rbd >/dev/null 2>&1; then
+    modprobe rbd
+fi
+
 if ! getent group billet >/dev/null 2>&1; then
     groupadd --system billet
 fi

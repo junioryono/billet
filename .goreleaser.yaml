@@ -9,6 +9,13 @@ version: 2
 
 project_name: billet
 
+snapshot:
+  # A repository cloned after the pre-module guest-image tags can have one of
+  # those as its nearest tag. Debian requires a version to begin with a digit,
+  # so a snapshot must not inherit that tag even though a real release is always
+  # cut from a validated vX.Y.Z version.
+  version_template: "0.0.0-SNAPSHOT-{{ .ShortCommit }}"
+
 # NO before.hooks. A release must build what the tag says and nothing else: a
 # `go mod tidy` here would edit go.mod and go.sum during the build, so what is
 # published could differ from what was reviewed and tested. CI already fails a
@@ -63,6 +70,8 @@ nfpms:
       billet runs a control plane that talks to GitHub's scale-set API and
       launches ephemeral runners on machines you own.
     license: Apache-2.0
+    dependencies:
+      - kmod
     # NO apk. Alpine uses BusyBox adduser/addgroup rather than GNU
     # useradd/groupadd, and OpenRC rather than systemd — so an apk built from
     # these scripts and these units could not install, and shipping a package
@@ -74,6 +83,8 @@ nfpms:
         dst: /usr/lib/systemd/system/billet-server.service
       - src: deploy/billet-node.service
         dst: /usr/lib/systemd/system/billet-node.service
+      - src: deploy/billet-rbd.conf
+        dst: /usr/lib/modules-load.d/billet-rbd.conf
 
       # THE LIVE CONFIG IS NOT PACKAGED — postinstall copies this template to
       # /etc/billet/billet.yaml when nothing is there yet.
