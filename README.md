@@ -365,7 +365,7 @@ must" — and a destroy goes to the machine holding the container rather than to
 [#30](https://github.com/junioryono/billet/issues/30),
 [#31](https://github.com/junioryono/billet/issues/31)).
 
-Within a correctly configured site, **cache bytes live in shared storage rather than on the machine that built them**: a Ceph node can clone an RBD generation, and an EC2 node can create an EBS volume from a snapshot. The remaining #20 work is to make the server's declared store authoritative for every registering node and prove same-site sharing and cross-site cold behavior in an integration test.
+Within a correctly configured site, **cache bytes live in shared storage rather than on the machine that built them**: a Ceph node can clone an RBD generation, and an EC2 node can create an EBS volume from a snapshot. The server's declared store is authoritative for every registering node; the remaining #20 work is the real same-site sharing and cross-site cold integration proof.
 
 **A terminate request is not a stopped guest**, and billet no longer pretends otherwise ([#46](https://github.com/junioryono/billet/issues/46)). `TerminateInstances` returns when the request is *accepted* while the machine keeps running for a minute or two, so this backend reports its teardown as requested rather than confirmed and the node holds that lease's capacity until the instance stops being reported. Waiting inside the teardown was never the fix — a node runs one command at a time, so it would stall every launch queued behind it. Capacity comes back when the compute is provably gone. A wedged teardown stays charged rather than being released on elapsed time, appears in `billet status` and `billet leases`, and can be explicitly forced without stopping a healthy node.
 

@@ -1,0 +1,184 @@
+---
+- name: Classify optional SMTP alert credentials
+  ansible.builtin.set_fact:
+    billet_smtp_user_set: "{{ billet_smtp_username | length > 0 }}"
+    billet_smtp_password_set: "{{ billet_smtp_password | length > 0 }}"
+
+- name: Inspect an existing SMTP configuration
+  ansible.builtin.stat:
+    path: /etc/msmtprc
+  register: billet_smtp_config
+
+- name: Read an existing SMTP configuration for ownership migration
+  ansible.builtin.slurp:
+    path: /etc/msmtprc
+  register: billet_smtp_existing
+  when: billet_smtp_config.stat.exists
+  become: true
+  no_log: true
+
+- name: Inspect whether billet owns the SMTP configuration
+  ansible.builtin.stat:
+    path: /etc/billet/msmtprc-managed
+  register: billet_smtp_managed
+
+- name: Classify billet-owned SMTP configuration
+  ansible.builtin.set_fact:
+    billet_smtp_owned: >-
+      {{
+        billet_smtp_managed.stat.exists or
+        (
+          billet_smtp_config.stat.exists and
+          ((billet_smtp_existing.content | default('') | b64decode) is match('^# Managed by junioryono\\.billet\\.host\\.'))
+        )
+      }}
+
+- name: Inspect the Ceph health timer unit
+  ansible.builtin.stat:
+    path: /etc/systemd/system/billet-ceph-health.timer
+  register: billet_ceph_health_timer_unit
+
+- name: Refuse partial Ceph alerting configuration
+  ansible.builtin.assert:
+    that:
+      - not billet_ceph_enabled or billet_alert_email | length == 0 or billet_smtp_user_set == billet_smtp_password_set
+      - not billet_ceph_enabled or (billet_alert_email | length == 0) == (billet_alert_from | length == 0)
+      - not billet_ceph_enabled or billet_alert_email | length == 0 or billet_smtp_user_set or billet_smtp_config.stat.exists
+    fail_msg: >-
+      Ceph email alerting needs a recipient, a sender, and both SMTP credential
+      fields. A partial setup would look monitored and report nothing.
+
+- name: Record ownership of a legacy billet SMTP configuration
+  ansible.builtin.copy:
+    content: "managed by junioryono.billet.host\n"
+    dest: /etc/billet/msmtprc-managed
+    owner: root
+    group: root
+    mode: "0600"
+  when:
+    - billet_ceph_enabled
+    - billet_alert_email | length > 0
+    - billet_smtp_owned
+    - not billet_smtp_managed.stat.exists
+  become: true
+
+- name: Configure Ceph email health alerts
+  when:
+    - billet_ceph_enabled
+    - billet_alert_email | length > 0
+  block:
+    - name: Install the send-only mail path
+      ansible.builtin.apt:
+        name:
+          - bsd-mailx
+          - msmtp-mta
+        state: present
+      become: true
+
+    - name: Install the protected SMTP configuration
+      ansible.builtin.template:
+        src: msmtprc.j2
+        dest: /etc/msmtprc
+        owner: root
+        group: root
+        mode: "0600"
+      become: true
+      no_log: true
+      when: billet_smtp_user_set
+
+    - name: Record ownership of the SMTP configuration
+      ansible.builtin.copy:
+        content: "managed by junioryono.billet.host\n"
+        dest: /etc/billet/msmtprc-managed
+        owner: root
+        group: root
+        mode: "0600"
+      become: true
+      when: billet_smtp_user_set
+
+    - name: Verify SMTP authentication without sending mail
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - >-
+            import re,smtplib,ssl; c=open('/etc/msmtprc').read();
+            v=lambda k: re.search(rf'^{k}\s+(\S+)',c,re.M).group(1);
+            s=smtplib.SMTP(v('host'),int(v('port')),timeout=25); s.ehlo();
+            s.starttls(context=ssl.create_default_context()); s.ehlo();
+            s.login(v('user'),v('password')); s.quit()
+      changed_when: false
+      become: true
+      no_log: true
+      when: billet_smtp_user_set
+
+    - name: Install the Ceph health monitor
+      ansible.builtin.template:
+        src: ceph-health.sh.j2
+        dest: /usr/local/libexec/billet-ceph-health
+        owner: root
+        group: root
+        mode: "0755"
+      become: true
+
+    - name: Install the Ceph health systemd units
+      ansible.builtin.template:
+        src: "{{ item }}.j2"
+        dest: "/etc/systemd/system/{{ item }}"
+        owner: root
+        group: root
+        mode: "0644"
+      loop:
+        - billet-ceph-health.service
+        - billet-ceph-health.timer
+      become: true
+      notify: Reload systemd
+
+    - name: Apply Ceph health unit changes
+      ansible.builtin.meta: flush_handlers
+
+    - name: Start the Ceph health timer
+      ansible.builtin.systemd_service:
+        name: billet-ceph-health.timer
+        enabled: true
+        state: started
+      when: not ansible_check_mode
+      become: true
+
+- name: Remove disabled Ceph email health alerts
+  when: not billet_ceph_enabled or billet_alert_email | length == 0
+  block:
+    - name: Stop and disable the Ceph health timer
+      ansible.builtin.systemd_service:
+        name: billet-ceph-health.timer
+        enabled: false
+        state: stopped
+      when:
+        - billet_ceph_health_timer_unit.stat.exists
+        - not ansible_check_mode
+      become: true
+
+    - name: Remove the Ceph health monitor and units
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /usr/local/libexec/billet-ceph-health
+        - /etc/systemd/system/billet-ceph-health.service
+        - /etc/systemd/system/billet-ceph-health.timer
+      become: true
+      notify: Reload systemd
+
+    - name: Remove billet-owned SMTP credentials
+      ansible.builtin.file:
+        path: /etc/msmtprc
+        state: absent
+      when: billet_smtp_owned
+      become: true
+      no_log: true
+
+    - name: Remove the SMTP ownership marker
+      ansible.builtin.file:
+        path: /etc/billet/msmtprc-managed
+        state: absent
+      become: true

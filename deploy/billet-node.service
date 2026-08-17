@@ -62,7 +62,7 @@ SystemCallArchitectures=native
 ReadOnlyPaths=/etc/billet
 # Certificate renewal installs a new key, leaf and CA bundle atomically while
 # the process is running. Keep the rest of /etc immutable to the node.
-ReadWritePaths=-/etc/billet/tls /srv/jailer
+ReadWritePaths=-/etc/billet/tls -/srv/jailer
 
 [Install]
 WantedBy=multi-user.target

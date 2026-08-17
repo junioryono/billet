@@ -491,8 +491,8 @@ func (s Store) PublishCAS(
 	return s.mutate(ctx, key, func(state *keyState) error {
 		now := s.now()
 		if published, ok := state.Generations[candidate.Generation]; ok &&
-			state.Pointer == candidate.Generation && published.Handle == candidate.Handle &&
-			published.Filesystem == candidate.Filesystem && published.WriterID == lease.ID &&
+			published.Handle == candidate.Handle && published.Filesystem == candidate.Filesystem &&
+			published.WriterID == lease.ID &&
 			published.Fence == fence && published.Previous == expected {
 			return errAlreadyApplied
 		}

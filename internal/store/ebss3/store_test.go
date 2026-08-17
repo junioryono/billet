@@ -89,10 +89,11 @@ type fakeObject struct {
 }
 
 type fakeObjects struct {
-	objects     map[string]fakeObject
-	next        int
-	putErr      error
-	afterPutErr error
+	objects      map[string]fakeObject
+	next         int
+	putErr       error
+	afterPutErr  error
+	afterPutHook func()
 }
 
 func newFakeObjects() *fakeObjects { return &fakeObjects{objects: map[string]fakeObject{}} }
@@ -125,6 +126,11 @@ func (f *fakeObjects) Put(
 	if f.afterPutErr != nil {
 		err := f.afterPutErr
 		f.afterPutErr = nil
+		hook := f.afterPutHook
+		f.afterPutHook = nil
+		if hook != nil {
+			hook()
+		}
 
 		return "", err
 	}
@@ -453,6 +459,43 @@ func TestACloudPointerSurvivesALostConditionalWriteResponse(t *testing.T) {
 	restarted := newStore(s.cfg, s.owner, s.blocks, objects, withNow(func() time.Time { return now }))
 	if err := restarted.PublishCAS(t.Context(), candidate.Key, "", candidate, lease, fence); err != nil {
 		t.Fatalf("retry after process restart did not recognise the committed publication: %v", err)
+	}
+}
+
+func TestACloudPublicationReceiptSurvivesANewerPointer(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
+	s, _, objects := testStore(&now)
+	first := snapshotCandidate(t, s)
+	second := snapshotCandidate(t, s)
+	lease, fence, err := s.AcquireWriter(t.Context(), first.Key, "job-1", time.Minute)
+	if err != nil {
+		t.Fatalf("AcquireWriter first: %v", err)
+	}
+	var supersedeErr error
+	objects.afterPutErr = fmt.Errorf("%w: connection vanished after S3 committed the object",
+		errObjectAmbiguous)
+	objects.afterPutHook = func() {
+		secondLease, secondFence, acquireErr := s.AcquireWriter(
+			t.Context(), second.Key, "job-2", time.Minute,
+		)
+		if acquireErr != nil {
+			supersedeErr = acquireErr
+
+			return
+		}
+		supersedeErr = s.PublishCAS(t.Context(), second.Key, first.Generation,
+			second, secondLease, secondFence)
+	}
+	if err := s.PublishCAS(t.Context(), first.Key, "", first, lease, fence); err != nil {
+		t.Fatalf("the superseded publication receipt was not recovered: %v", err)
+	}
+	if supersedeErr != nil {
+		t.Fatalf("publish newer generation: %v", supersedeErr)
+	}
+	if current, err := s.Current(t.Context(), first.Key); err != nil || current != second.Generation {
+		t.Fatalf("Current = %q, %v; want newer generation %q", current, err, second.Generation)
 	}
 }
 

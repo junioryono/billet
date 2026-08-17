@@ -258,15 +258,18 @@ func TestEveryAWSPaginationCycleIsRefused(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			tokens := []string{"A", "B", "A"}
 			writeAWSResponse(t, w, `<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken>`+
-				tokens[page]+`</NextContinuationToken></ListBucketResult>`)
+				tokens[page%len(tokens)]+`</NextContinuationToken></ListBucketResult>`)
 			page++
 		}))
 		defer server.Close()
 
 		api := newS3API(config.EBSS3Config{Region: "us-west-2", Bucket: "billet-cache-example"},
 			staticCredentials{}, server.Client(), server.URL, time.Now)
-		if _, err := api.List(t.Context(), "state/"); err == nil {
-			t.Fatal("S3 listing accepted a continuation-token cycle")
+		if _, err := api.List(t.Context(), "state/"); err == nil || !strings.Contains(err.Error(), "token") {
+			t.Fatalf("S3 listing cycle error = %v", err)
+		}
+		if page != 3 {
+			t.Fatalf("S3 listing made %d requests, want 3", page)
 		}
 	})
 
@@ -288,7 +291,7 @@ func TestEveryAWSPaginationCycleIsRefused(t *testing.T) {
 					t.Fatalf("action = %q, want %q", values.Get("Action"), action)
 				}
 				tokens := []string{"A", "B", "A"}
-				writeAWSResponse(t, w, "<"+action+"Response><nextToken>"+tokens[page]+
+				writeAWSResponse(t, w, "<"+action+"Response><nextToken>"+tokens[page%len(tokens)]+
 					"</nextToken></"+action+"Response>")
 				page++
 			}))
@@ -303,8 +306,11 @@ func TestEveryAWSPaginationCycleIsRefused(t *testing.T) {
 			} else {
 				_, err = api.ListAvailableVolumes(t.Context())
 			}
-			if err == nil {
-				t.Fatal("EBS listing accepted a pagination-token cycle")
+			if err == nil || !strings.Contains(err.Error(), "token") {
+				t.Fatalf("EBS listing cycle error = %v", err)
+			}
+			if page != 3 {
+				t.Fatalf("EBS listing made %d requests, want 3", page)
 			}
 		})
 	}
