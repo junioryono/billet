@@ -125,12 +125,14 @@ main() {
     staged=
     install_prefix=
     cleanup() {
-        rm -rf "${tmp}"
         if [ -n "${staged}" ]; then
             ${install_prefix} rm -f "${staged}" >/dev/null 2>&1 || true
         fi
+        rm -rf "${tmp}" >/dev/null 2>&1 || true
     }
-    trap cleanup EXIT INT TERM
+    trap cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
 
     echo "Fetching the checksums..."
     ${CURL} "${base}/checksums.txt" -o "${tmp}/checksums.txt" ||
@@ -144,16 +146,20 @@ main() {
     archive="$(grep -E "_${platform}\.tar\.gz\$" "${tmp}/checksums.txt" | head -n1 | sed 's/.*  *//')"
     [ -n "${archive}" ] ||
         die "this release has no build for ${platform}"
+    case "${archive}" in
+        */* | *[!A-Za-z0-9._-]*) die "release metadata contains an unsafe archive name: ${archive}" ;;
+    esac
 
     echo "Downloading ${archive}..."
-    ${CURL} "${base}/${archive}" -o "${tmp}/${archive}" ||
+    payload="${tmp}/payload.tar.gz"
+    ${CURL} "${base}/${archive}" -o "${payload}" ||
         die "could not download ${base}/${archive}"
 
     # VERIFIED BEFORE IT IS UNPACKED. A tarball fetched over the network and
     # extracted unchecked is a remote code execution waiting for a bad day, and
     # the checksum costs nothing.
     want="$(grep "  ${archive}\$" "${tmp}/checksums.txt" | cut -d' ' -f1)"
-    got="$(checksum_of "${tmp}/${archive}")"
+    got="$(checksum_of "${payload}")"
 
     [ -n "${want}" ] || die "no checksum published for ${archive}"
 
@@ -164,7 +170,7 @@ main() {
 This is not the file the release says it is. Do not install it."
     fi
 
-    tar -xzf "${tmp}/${archive}" -C "${tmp}"
+    tar -xzf "${payload}" -C "${tmp}"
     [ -f "${tmp}/${BIN}" ] || die "the archive did not contain ${BIN}"
 
     chmod +x "${tmp}/${BIN}"
@@ -177,6 +183,9 @@ This is not the file the release says it is. Do not install it."
     [ -d "${INSTALL_DIR}" ] ||
         die "${INSTALL_DIR} does not exist. Create it, or set BILLET_INSTALL_DIR
 to somewhere that does."
+    destination="${INSTALL_DIR}/${BIN}"
+    [ ! -d "${destination}" ] ||
+        die "${destination} is a directory; refusing to install a file into it"
 
     # RENAMED INTO PLACE FROM THE SAME DIRECTORY, so the replacement is atomic.
     #
@@ -210,15 +219,17 @@ Set BILLET_INSTALL_DIR to somewhere you can write."
             die "the staged ${platform} binary reported no version; the existing billet was not replaced"
     fi
 
-    ${install_prefix} mv "${staged}" "${INSTALL_DIR}/${BIN}" ||
+    ${install_prefix} mv "${staged}" "${destination}" ||
         die "could not install to ${INSTALL_DIR}"
+    [ -f "${destination}" ] ||
+        die "the final path ${destination} is not the installed billet file"
     staged=
 
     echo
     if [ "${native}" = true ]; then
         printf 'Installed: %s\n' "${installed_version}"
     else
-        printf 'Installed %s billet to %s\n' "${platform}" "${INSTALL_DIR}/${BIN}"
+        printf 'Installed %s billet to %s\n' "${platform}" "${destination}"
     fi
     echo
     echo "Next:"
