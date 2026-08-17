@@ -8,7 +8,7 @@ Set `billet_binary_src` to the Linux binary the role should install. A repositor
 
 ```bash
 billet_stage=$(mktemp -d)
-curl -fsSL https://raw.githubusercontent.com/junioryono/billet/v0.1.0/scripts/install.sh | BILLET_VERSION=v0.1.0 BILLET_INSTALL_DIR="$billet_stage" sh
+curl -fsSL https://raw.githubusercontent.com/junioryono/billet/v0.1.1/scripts/install.sh | BILLET_VERSION=v0.1.1 BILLET_OS=linux BILLET_ARCH=amd64 BILLET_INSTALL_DIR="$billet_stage" sh
 ansible-playbook site.yml -e "billet_binary_src=$billet_stage/billet"
 ```
 

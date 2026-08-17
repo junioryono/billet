@@ -59,13 +59,19 @@ normally a private network or a VPN rather than the internet.
 curl -fsSL https://raw.githubusercontent.com/junioryono/billet/main/scripts/install.sh | sh
 ```
 
-Downloads the latest release for your platform, verifies its checksum, and puts
-the binary in `/usr/local/bin`. It does not create users, write config, or start
-anything.
+Downloads the latest release for your platform, verifies its checksum, and puts the binary in `/usr/local/bin`. It does not create users, write config, or start anything.
 
-**For a machine that should run jobs across reboots, install the package
-instead** — it ships the systemd units. Pick the file for your platform from the
-[latest release](https://github.com/junioryono/billet/releases/latest):
+When one machine prepares another, set the target explicitly. This is useful for an Ansible control machine on macOS provisioning a Linux server, or for preparing a second Mac without running the installer there:
+
+```bash
+billet_stage=$(mktemp -d)
+curl -fsSL https://raw.githubusercontent.com/junioryono/billet/main/scripts/install.sh | \
+  BILLET_OS=linux BILLET_ARCH=amd64 BILLET_INSTALL_DIR="$billet_stage" sh
+```
+
+`BILLET_OS` and `BILLET_ARCH` must be set together. Supported targets are `linux/amd64`, `linux/arm64`, and `darwin/arm64`. A cross-target install verifies and places the binary but does not execute it on the control machine.
+
+**For a machine that should run jobs across reboots, install the package instead** — it ships the systemd units. Pick the file for your platform from the [latest release](https://github.com/junioryono/billet/releases/latest):
 
 ```bash
 sudo dpkg -i billet_*_linux_amd64.deb    # Debian / Ubuntu

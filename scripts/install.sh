@@ -5,11 +5,14 @@
 #   curl -fsSL https://raw.githubusercontent.com/junioryono/billet/main/scripts/install.sh | sh
 #
 # Downloads the latest release for this platform, VERIFIES ITS CHECKSUM, and
-# installs the binary to /usr/local/bin. It does not create users, write config,
-# or start anything — use the .deb or .rpm if you want the systemd units.
+# installs the binary to /usr/local/bin. Set BILLET_OS and BILLET_ARCH when the
+# target differs from the machine running this script. It does not create users,
+# write config, or start anything — use the .deb or .rpm for the systemd units.
 #
 # POSIX sh, not bash: this runs on whatever a fresh host happens to have.
 set -eu
+LC_ALL=C
+export LC_ALL
 
 REPO="junioryono/billet"
 BIN="billet"
@@ -23,7 +26,7 @@ VERSION="${BILLET_VERSION:-latest}"
 CURL="curl -fsSL --proto =https --proto-redir =https"
 
 die() {
-    echo "install: $*" >&2
+    printf 'install: %s\n' "$*" >&2
     exit 1
 }
 
@@ -36,28 +39,46 @@ need() {
 # Getting this mapping wrong produces a 404 that reads like the release is
 # missing rather than like the script is wrong, so an unsupported platform is
 # refused BY NAME instead.
-detect_platform() {
-    os="$(uname -s)"
-    arch="$(uname -m)"
+normalize_platform() {
+    os="$1"
+    arch="$2"
+    mode="${3:-fatal}"
 
     case "${os}" in
-        Linux) os=linux ;;
-        Darwin) os=darwin ;;
-        *) die "${os} is not a platform billet builds for (linux and darwin only)" ;;
+        Linux | linux) os=linux ;;
+        Darwin | darwin) os=darwin ;;
+        *)
+            [ "${mode}" = "quiet" ] && return 1
+            die "${os} is not a platform billet builds for (linux and darwin only)"
+            ;;
     esac
 
     case "${arch}" in
         x86_64 | amd64) arch=amd64 ;;
         aarch64 | arm64) arch=arm64 ;;
-        *) die "${arch} is not an architecture billet builds for (amd64 and arm64 only)" ;;
+        *)
+            [ "${mode}" = "quiet" ] && return 1
+            die "${arch} is not an architecture billet builds for (amd64 and arm64 only)"
+            ;;
     esac
 
     # macOS on Intel is not built. Saying so beats a 404.
     if [ "${os}" = "darwin" ] && [ "${arch}" = "amd64" ]; then
+        [ "${mode}" = "quiet" ] && return 1
         die "billet does not build for macOS on Intel; only Apple Silicon"
     fi
 
     echo "${os}_${arch}"
+}
+
+detect_target_platform() {
+    os_set="${BILLET_OS+x}"
+    arch_set="${BILLET_ARCH+x}"
+    [ "${os_set}" = "x" ] && [ "${arch_set}" = "x" ] ||
+        die "BILLET_OS and BILLET_ARCH must be set together"
+    [ -n "${BILLET_OS}" ] && [ -n "${BILLET_ARCH}" ] ||
+        die "BILLET_OS and BILLET_ARCH must not be empty"
+    normalize_platform "${BILLET_OS}" "${BILLET_ARCH}"
 }
 
 # sha256 has three spellings across the platforms billet supports.
@@ -75,7 +96,26 @@ main() {
     need curl
     need tar
 
-    platform="$(detect_platform)"
+    host_os="$(uname -s)" || die "could not detect the host operating system with uname"
+    host_arch="$(uname -m)" || die "could not detect the host architecture with uname"
+    if host_platform="$(normalize_platform "${host_os}" "${host_arch}" quiet)"; then
+        host_supported=true
+    else
+        host_supported=false
+        host_platform=
+    fi
+
+    if [ "${BILLET_OS+x}" = "x" ] || [ "${BILLET_ARCH+x}" = "x" ]; then
+        platform="$(detect_target_platform)"
+        native=false
+        if [ "${host_supported}" = true ] && [ "${platform}" = "${host_platform}" ]; then
+            native=true
+        fi
+    else
+        [ "${host_supported}" = true ] || normalize_platform "${host_os}" "${host_arch}"
+        platform="${host_platform}"
+        native=true
+    fi
 
     if [ "${VERSION}" = "latest" ]; then
         base="https://github.com/${REPO}/releases/latest/download"
@@ -84,7 +124,17 @@ main() {
     fi
 
     tmp="$(mktemp -d)"
-    trap 'rm -rf "${tmp}"' EXIT INT TERM
+    staged=
+    install_prefix=
+    cleanup() {
+        if [ -n "${staged}" ]; then
+            ${install_prefix} rm -f "${staged}" >/dev/null 2>&1 || true
+        fi
+        rm -rf "${tmp}" >/dev/null 2>&1 || true
+    }
+    trap cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
 
     echo "Fetching the checksums..."
     ${CURL} "${base}/checksums.txt" -o "${tmp}/checksums.txt" ||
@@ -98,16 +148,20 @@ main() {
     archive="$(grep -E "_${platform}\.tar\.gz\$" "${tmp}/checksums.txt" | head -n1 | sed 's/.*  *//')"
     [ -n "${archive}" ] ||
         die "this release has no build for ${platform}"
+    case "${archive}" in
+        */* | *[!A-Za-z0-9._-]*) die "release metadata contains an unsafe archive name: ${archive}" ;;
+    esac
 
     echo "Downloading ${archive}..."
-    ${CURL} "${base}/${archive}" -o "${tmp}/${archive}" ||
+    payload="${tmp}/payload.tar.gz"
+    ${CURL} "${base}/${archive}" -o "${payload}" ||
         die "could not download ${base}/${archive}"
 
     # VERIFIED BEFORE IT IS UNPACKED. A tarball fetched over the network and
     # extracted unchecked is a remote code execution waiting for a bad day, and
     # the checksum costs nothing.
     want="$(grep "  ${archive}\$" "${tmp}/checksums.txt" | cut -d' ' -f1)"
-    got="$(checksum_of "${tmp}/${archive}")"
+    got="$(checksum_of "${payload}")"
 
     [ -n "${want}" ] || die "no checksum published for ${archive}"
 
@@ -118,10 +172,15 @@ main() {
 This is not the file the release says it is. Do not install it."
     fi
 
-    tar -xzf "${tmp}/${archive}" -C "${tmp}"
-    [ -f "${tmp}/${BIN}" ] || die "the archive did not contain ${BIN}"
+    # STREAM ONLY THE EXPECTED MEMBER. Extracting the whole archive would let a
+    # checksum-listed release write links or traversal entries outside this
+    # temporary directory before billet ever inspected the result.
+    extracted="${tmp}/${BIN}"
+    tar -xOzf "${payload}" "${BIN}" > "${extracted}" ||
+        die "the archive did not contain a readable ${BIN} file"
+    [ -s "${extracted}" ] || die "the archive contained an empty ${BIN} file"
 
-    chmod +x "${tmp}/${BIN}"
+    chmod +x "${extracted}"
 
     case "${INSTALL_DIR}" in
         /*) ;;
@@ -131,6 +190,9 @@ This is not the file the release says it is. Do not install it."
     [ -d "${INSTALL_DIR}" ] ||
         die "${INSTALL_DIR} does not exist. Create it, or set BILLET_INSTALL_DIR
 to somewhere that does."
+    destination="${INSTALL_DIR}/${BIN}"
+    [ ! -d "${destination}" ] ||
+        die "${destination} is a directory; refusing to install a file into it"
 
     # RENAMED INTO PLACE FROM THE SAME DIRECTORY, so the replacement is atomic.
     #
@@ -139,39 +201,62 @@ to somewhere that does."
     # interruption or a full disk in the middle of that leaves a truncated
     # executable where a working billet used to be, which is a worse outcome than
     # any failure this script is trying to avoid.
-    staged="${INSTALL_DIR}/.${BIN}.incoming"
-
-    install_with() {
-        $1 cp "${tmp}/${BIN}" "${staged}" &&
-            $1 chmod 0755 "${staged}" &&
-            $1 mv "${staged}" "${INSTALL_DIR}/${BIN}"
-    }
-
     if [ -w "${INSTALL_DIR}" ]; then
-        install_with "" || die "could not install to ${INSTALL_DIR}"
+        install_prefix=
     elif command -v sudo >/dev/null 2>&1; then
         echo "Installing to ${INSTALL_DIR} (needs sudo)..."
-        install_with sudo || die "could not install to ${INSTALL_DIR}"
+        install_prefix=sudo
     else
         die "${INSTALL_DIR} is not writable and sudo is not available.
 Set BILLET_INSTALL_DIR to somewhere you can write."
     fi
 
+    staged="$(${install_prefix} mktemp "${INSTALL_DIR}/.${BIN}.incoming.XXXXXX")" ||
+        die "could not create a staging file in ${INSTALL_DIR}"
+    ${install_prefix} cp "${extracted}" "${staged}" &&
+        ${install_prefix} chmod 0755 "${staged}" ||
+        die "could not stage billet in ${INSTALL_DIR}"
+
+    installed_version=
+    if [ "${native}" = true ]; then
+        version_output="$("${staged}" version)" ||
+            die "the staged ${platform} binary could not run on this host; the existing billet was not replaced"
+        installed_version="$(printf '%s\n' "${version_output}" | sed -n '1p')"
+        [ -n "${installed_version}" ] ||
+            die "the staged ${platform} binary reported no version; the existing billet was not replaced"
+    fi
+
+    ${install_prefix} mv "${staged}" "${destination}" ||
+        die "could not install to ${INSTALL_DIR}"
+    [ -f "${destination}" ] ||
+        die "the final path ${destination} is not the installed billet file"
+    staged=
+
     echo
-    echo "Installed: $("${INSTALL_DIR}/${BIN}" version | head -n1)"
+    if [ "${native}" = true ]; then
+        printf 'Installed: %s\n' "${installed_version}"
+    else
+        printf 'Installed %s billet to %s\n' "${platform}" "${destination}"
+    fi
     echo
-    echo "Next:"
-    echo "  billet github-app create --org YOUR-ORG"
-    echo
-    echo "That prints a github: block. Put it in a billet.yaml alongside your"
-    echo "tiers — there is a fully commented example at"
-    echo "  https://github.com/${REPO}/blob/main/billet.example.yaml"
-    echo "then:"
-    echo "  billet check --config /path/to/billet.yaml"
-    echo
-    echo "For a machine that should run jobs across reboots, install the package"
-    echo "instead — it ships systemd units and a config skeleton:"
-    echo "  https://github.com/${REPO}/releases/latest"
+    if [ "${native}" = true ]; then
+        echo "Next:"
+        echo "  billet github-app create --org YOUR-ORG"
+        echo
+        echo "That prints a github: block. Put it in a billet.yaml alongside your"
+        echo "tiers — there is a fully commented example at"
+        echo "  https://github.com/${REPO}/blob/main/billet.example.yaml"
+        echo "then:"
+        echo "  billet check --config /path/to/billet.yaml"
+        echo
+        echo "For a machine that should run jobs across reboots, install the package"
+        echo "instead — it ships systemd units and a config skeleton:"
+        echo "  https://github.com/${REPO}/releases/latest"
+    else
+        echo "Next:"
+        echo "  Supply ${destination} to your provisioning tool, or copy it to the"
+        echo "  ${platform} target. This binary cannot run on this host."
+    fi
 }
 
 main "$@"
