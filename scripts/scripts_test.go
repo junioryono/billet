@@ -700,6 +700,10 @@ exit "$status"
 				t.Errorf("restore install directory permissions: %v", err)
 			}
 		})
+		writable := exec.CommandContext(t.Context(), "sh", "-c", `[ -w "$1" ]`, "sh", installDir)
+		if err := writable.Run(); err == nil {
+			t.Skip("this environment still grants write access to a mode-0555 directory")
+		}
 	}
 	cmd := exec.CommandContext(t.Context(), "sh", installer)
 	cmd.Env = append(environmentWithout(
