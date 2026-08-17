@@ -40,21 +40,29 @@ need() {
 normalize_platform() {
     os="$1"
     arch="$2"
+    mode="${3:-fatal}"
 
     case "${os}" in
         Linux | linux) os=linux ;;
         Darwin | darwin) os=darwin ;;
-        *) die "${os} is not a platform billet builds for (linux and darwin only)" ;;
+        *)
+            [ "${mode}" = "quiet" ] && return 1
+            die "${os} is not a platform billet builds for (linux and darwin only)"
+            ;;
     esac
 
     case "${arch}" in
         x86_64 | amd64) arch=amd64 ;;
         aarch64 | arm64) arch=arm64 ;;
-        *) die "${arch} is not an architecture billet builds for (amd64 and arm64 only)" ;;
+        *)
+            [ "${mode}" = "quiet" ] && return 1
+            die "${arch} is not an architecture billet builds for (amd64 and arm64 only)"
+            ;;
     esac
 
     # macOS on Intel is not built. Saying so beats a 404.
     if [ "${os}" = "darwin" ] && [ "${arch}" = "amd64" ]; then
+        [ "${mode}" = "quiet" ] && return 1
         die "billet does not build for macOS on Intel; only Apple Silicon"
     fi
 
@@ -62,13 +70,26 @@ normalize_platform() {
 }
 
 detect_host_platform() {
-    normalize_platform "$(uname -s)" "$(uname -m)"
+    mode="${1:-fatal}"
+    os="$(uname -s)" || {
+        [ "${mode}" = "quiet" ] && return 1
+        die "could not detect the host operating system with uname"
+    }
+    arch="$(uname -m)" || {
+        [ "${mode}" = "quiet" ] && return 1
+        die "could not detect the host architecture with uname"
+    }
+    normalize_platform "${os}" "${arch}" "${mode}"
 }
 
 detect_platform() {
-    if [ -n "${BILLET_OS:-}" ] || [ -n "${BILLET_ARCH:-}" ]; then
-        [ -n "${BILLET_OS:-}" ] && [ -n "${BILLET_ARCH:-}" ] ||
+    os_set="${BILLET_OS+x}"
+    arch_set="${BILLET_ARCH+x}"
+    if [ "${os_set}" = "x" ] || [ "${arch_set}" = "x" ]; then
+        [ "${os_set}" = "x" ] && [ "${arch_set}" = "x" ] ||
             die "BILLET_OS and BILLET_ARCH must be set together"
+        [ -n "${BILLET_OS}" ] && [ -n "${BILLET_ARCH}" ] ||
+            die "BILLET_OS and BILLET_ARCH must not be empty"
         normalize_platform "${BILLET_OS}" "${BILLET_ARCH}"
         return
     fi
@@ -80,10 +101,14 @@ report_install() {
     installed="$1"
     platform="$2"
 
-    if [ "${platform}" = "$(detect_host_platform)" ]; then
-        echo "Installed: $("${installed}" version | head -n1)"
+    if host_platform="$(detect_host_platform quiet)" && [ "${platform}" = "${host_platform}" ]; then
+        version_output="$("${installed}" version)" ||
+            die "the installed ${platform} binary could not run on this host"
+        version="$(printf '%s\n' "${version_output}" | sed -n '1p')"
+        [ -n "${version}" ] || die "the installed ${platform} binary reported no version"
+        printf 'Installed: %s\n' "${version}"
     else
-        echo "Installed ${platform} billet to ${installed}"
+        printf 'Installed %s billet to %s\n' "${platform}" "${installed}"
     fi
 }
 
@@ -201,6 +226,4 @@ Set BILLET_INSTALL_DIR to somewhere you can write."
     echo "  https://github.com/${REPO}/releases/latest"
 }
 
-if [ "${BILLET_INSTALL_SH_TEST:-0}" != "1" ]; then
-    main "$@"
-fi
+main "$@"
