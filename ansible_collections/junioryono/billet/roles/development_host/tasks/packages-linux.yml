@@ -20,6 +20,30 @@
     update_cache: true
   become: true
 
+- name: Inspect development repository artifacts
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - "{{ billet_development_apt_stage }}/caddy.asc"
+    - "{{ billet_development_apt_stage }}/hashicorp.asc"
+    - /etc/apt/keyrings/caddy.asc
+    - /etc/apt/keyrings/hashicorp.asc
+    - /etc/apt/sources.list.d/caddy-stable.sources
+    - /etc/apt/sources.list.d/hashicorp.sources
+  register: billet_development_apt_artifacts
+  become: true
+
+- name: Inspect deb822 repository support
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_facts['python']['executable'] }}"
+      - -c
+      - import debian.deb822
+  register: billet_development_deb822_support
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
 - name: Create the development package staging directory
   ansible.builtin.file:
     path: "{{ billet_development_apt_stage }}"
@@ -94,7 +118,7 @@
     state: present
     enabled: true
   register: billet_development_caddy_repository
-  when: not ansible_check_mode or billet_development_apt_stage_stat.stat.exists
+  when: not ansible_check_mode or billet_development_deb822_support.rc == 0
   become: true
 
 - name: Add the HashiCorp repository
@@ -110,7 +134,7 @@
   register: billet_development_hashicorp_repository
   when:
     - billet_development_install_terraform
-    - not ansible_check_mode or billet_development_apt_stage_stat.stat.exists
+    - not ansible_check_mode or billet_development_deb822_support.rc == 0
   become: true
 
 - name: Refresh apt for development repositories
@@ -127,16 +151,31 @@
   ansible.builtin.apt:
     name: "{{ ['caddy'] + (['terraform'] if billet_development_install_terraform else []) }}"
     state: latest
-  when: not ansible_check_mode or billet_development_apt_stage_stat.stat.exists
+  when: >-
+    not ansible_check_mode or
+    (billet_development_apt_artifacts.results[2].stat.exists and
+    billet_development_apt_artifacts.results[4].stat.exists and
+    (not billet_development_install_terraform or
+    (billet_development_apt_artifacts.results[3].stat.exists and
+    billet_development_apt_artifacts.results[5].stat.exists)))
   become: true
 
 - name: Predict first-run Linux repository and package installation
   ansible.builtin.debug:
-    msg: Would verify the publisher repositories and install Caddy, mkcert and Terraform.
+    msg: "Would verify the publisher repositories and install {{ (['Caddy', 'mkcert'] + (['Terraform'] if billet_development_install_terraform else [])) | join(', ') }}."
   register: billet_development_linux_package_prediction
   when:
     - ansible_check_mode
-    - not billet_development_apt_stage_stat.stat.exists
+    - >-
+      not billet_development_apt_stage_stat.stat.exists or
+      billet_development_deb822_support.rc != 0 or
+      not billet_development_apt_artifacts.results[0].stat.exists or
+      not billet_development_apt_artifacts.results[2].stat.exists or
+      not billet_development_apt_artifacts.results[4].stat.exists or
+      (billet_development_install_terraform and
+      (not billet_development_apt_artifacts.results[1].stat.exists or
+      not billet_development_apt_artifacts.results[3].stat.exists or
+      not billet_development_apt_artifacts.results[5].stat.exists))
   changed_when: true
 
 - name: Inspect installed Linux services
