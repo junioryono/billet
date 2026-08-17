@@ -239,18 +239,24 @@ Set BILLET_INSTALL_DIR to somewhere you can write."
         printf 'Installed %s billet to %s\n' "${platform}" "${destination}"
     fi
     echo
-    echo "Next:"
-    echo "  billet github-app create --org YOUR-ORG"
-    echo
-    echo "That prints a github: block. Put it in a billet.yaml alongside your"
-    echo "tiers — there is a fully commented example at"
-    echo "  https://github.com/${REPO}/blob/main/billet.example.yaml"
-    echo "then:"
-    echo "  billet check --config /path/to/billet.yaml"
-    echo
-    echo "For a machine that should run jobs across reboots, install the package"
-    echo "instead — it ships systemd units and a config skeleton:"
-    echo "  https://github.com/${REPO}/releases/latest"
+    if [ "${native}" = true ]; then
+        echo "Next:"
+        echo "  billet github-app create --org YOUR-ORG"
+        echo
+        echo "That prints a github: block. Put it in a billet.yaml alongside your"
+        echo "tiers — there is a fully commented example at"
+        echo "  https://github.com/${REPO}/blob/main/billet.example.yaml"
+        echo "then:"
+        echo "  billet check --config /path/to/billet.yaml"
+        echo
+        echo "For a machine that should run jobs across reboots, install the package"
+        echo "instead — it ships systemd units and a config skeleton:"
+        echo "  https://github.com/${REPO}/releases/latest"
+    else
+        echo "Next:"
+        echo "  Supply ${destination} to your provisioning tool, or copy it to the"
+        echo "  ${platform} target. This binary cannot run on this host."
+    fi
 }
 
 main "$@"

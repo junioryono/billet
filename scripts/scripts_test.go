@@ -131,6 +131,12 @@ func TestInstallerSelectsAndDoesNotExecuteACrossTargetBinary(t *testing.T) {
 	if !strings.Contains(run.output, "Installed linux_amd64 billet to "+run.installed) {
 		t.Fatalf("output = %q; want cross-target installation report", run.output)
 	}
+	if !strings.Contains(run.output, "Supply "+run.installed+" to your provisioning tool") {
+		t.Fatalf("output = %q; want cross-target next step", run.output)
+	}
+	if strings.Contains(run.output, "billet github-app create") {
+		t.Fatalf("output = %q; foreign binary must not be presented as runnable here", run.output)
+	}
 	if strings.Contains(run.requests, "darwin_arm64.tar.gz") || !strings.Contains(run.requests, "linux_amd64.tar.gz") {
 		t.Fatalf("requests = %q; want only the linux_amd64 archive", run.requests)
 	}
