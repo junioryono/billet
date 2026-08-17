@@ -34,38 +34,31 @@
     - { name: hashicorp, url: "https://apt.releases.hashicorp.com/gpg" }
   become: true
 
-- name: Read development repository primary signing fingerprints
-  ansible.builtin.shell:
-    cmd: >-
-      set -o pipefail;
-      gpg --batch --show-keys --with-colons "$BILLET_REPOSITORY_KEY" |
-      awk -F: '$1 == "pub" { want = 1; next } want && $1 == "fpr" { print $10; want = 0 }'
-    executable: /bin/bash
-  environment:
-    BILLET_REPOSITORY_KEY: "{{ billet_development_apt_stage }}/{{ item }}.asc"
-  loop:
-    - caddy
-    - hashicorp
-  register: billet_development_repository_keys
-  changed_when: false
-  check_mode: false
+- name: Install the repository key verifier
+  ansible.builtin.copy:
+    src: verify-repository-key.sh
+    dest: "{{ billet_development_apt_stage }}/verify-repository-key.sh"
+    owner: root
+    group: root
+    mode: "0700"
   become: true
 
-- name: Verify development repository signing keys
-  ansible.builtin.assert:
-    that:
-      - item.key.stdout_lines == [item.fingerprint]
-    fail_msg: >-
-      The {{ item.name }} repository key does not contain exactly the pinned
-      primary fingerprint {{ item.fingerprint }}. Refusing to trust the bundle.
+- name: Verify development repository primary signing fingerprints
+  ansible.builtin.command:
+    argv:
+      - "{{ billet_development_apt_stage }}/verify-repository-key.sh"
+      - "{{ billet_development_apt_stage }}/{{ item.key }}.asc"
+      - "{{ item.fingerprint }}"
   loop:
     - name: Caddy
+      key: caddy
       fingerprint: "{{ billet_development_caddy_signing_fingerprint }}"
-      key: "{{ billet_development_repository_keys.results[0] }}"
     - name: HashiCorp
+      key: hashicorp
       fingerprint: "{{ billet_development_hashicorp_signing_fingerprint }}"
-      key: "{{ billet_development_repository_keys.results[1] }}"
+  changed_when: false
   when: not ansible_check_mode
+  become: true
 
 - name: Install verified development repository keys
   ansible.builtin.copy:
