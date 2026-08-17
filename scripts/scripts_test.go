@@ -110,6 +110,88 @@ func TestReleasePlannerOrdersNewSeriesWithoutBlockingMaintainedHotfixes(t *testi
 	}
 }
 
+func TestInstallerCanSelectARemoteTargetPlatform(t *testing.T) {
+	t.Parallel()
+
+	installer, err := filepath.Abs("install.sh")
+	if err != nil {
+		t.Fatalf("absolute installer path: %v", err)
+	}
+	cmd := exec.CommandContext(t.Context(), "sh", "-c", `. "$1"; detect_platform`, "sh", installer)
+	cmd.Env = append(os.Environ(),
+		"BILLET_INSTALL_SH_TEST=1",
+		"BILLET_OS=linux",
+		"BILLET_ARCH=amd64",
+	)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("detect target platform: %v\n%s", err, output)
+	}
+	if got := string(output); got != "linux_amd64\n" {
+		t.Fatalf("target platform = %q; want linux_amd64", got)
+	}
+}
+
+func TestInstallerRequiresCompleteTargetPlatform(t *testing.T) {
+	t.Parallel()
+
+	installer, err := filepath.Abs("install.sh")
+	if err != nil {
+		t.Fatalf("absolute installer path: %v", err)
+	}
+	cmd := exec.CommandContext(t.Context(), "sh", "-c", `. "$1"; detect_platform`, "sh", installer)
+	cmd.Env = append(os.Environ(),
+		"BILLET_INSTALL_SH_TEST=1",
+		"BILLET_OS=linux",
+		"BILLET_ARCH=",
+	)
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("incomplete target platform succeeded: %s", output)
+	}
+	if !strings.Contains(string(output), "BILLET_OS and BILLET_ARCH must be set together") {
+		t.Fatalf("error = %q; want paired-variable guidance", output)
+	}
+}
+
+func TestInstallerDoesNotExecuteACrossTargetBinary(t *testing.T) {
+	t.Parallel()
+
+	installer, err := filepath.Abs("install.sh")
+	if err != nil {
+		t.Fatalf("absolute installer path: %v", err)
+	}
+	tools := t.TempDir()
+	uname := `#!/bin/sh
+case "$1" in
+    -s) echo Darwin ;;
+    -m) echo arm64 ;;
+    *) exit 2 ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(tools, "uname"), []byte(uname), 0o755); err != nil {
+		t.Fatalf("write fake uname: %v", err)
+	}
+	foreign := filepath.Join(tools, "billet")
+	if err := os.WriteFile(foreign, []byte("not executable on the control host\n"), 0o755); err != nil {
+		t.Fatalf("write foreign binary: %v", err)
+	}
+
+	cmd := exec.CommandContext(t.Context(), "sh", "-c", `. "$1"; report_install "$2" linux_amd64`, "sh", installer, foreign)
+	cmd.Env = append(os.Environ(),
+		"BILLET_INSTALL_SH_TEST=1",
+		"PATH="+tools+":"+os.Getenv("PATH"),
+	)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("report cross-target install: %v\n%s", err, output)
+	}
+	want := "Installed linux_amd64 billet to " + foreign + "\n"
+	if got := string(output); got != want {
+		t.Fatalf("report = %q; want %q", got, want)
+	}
+}
+
 func assertContains(t *testing.T, path, want string) {
 	t.Helper()
 	body, err := os.ReadFile(path)

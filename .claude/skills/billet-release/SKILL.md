@@ -26,7 +26,7 @@ Cut with the **Cut Release** workflow (Actions → Run workflow). Blank version 
 
 ## Updating a running host
 
-**No release has been cut, so there is no package to install yet** — the pipeline is built and untriggered. Until then this is a `go build` and a restart.
+Install or upgrade from the package attached to the latest release. The package replaces the binary and units but deliberately does not enable or start either service.
 
 ```bash
 sudo dpkg -i billet_NEW_linux_amd64.deb
