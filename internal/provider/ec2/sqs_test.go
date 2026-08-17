@@ -72,7 +72,8 @@ func TestSpotInterruptionIsReceivedAndAcknowledged(t *testing.T) {
 		SubnetID:             "subnet-1",
 		SecurityGroupIDs:     []string{"sg-1"},
 		Spot:                 true,
-		InterruptionQueueURL: srv.URL + "/123456789012/billet",
+		InterruptionQueueURL: srv.URL + "/123456789012/aws-1",
+		NodeName:             "aws-1",
 		InstanceTypes:        []config.EC2InstanceType{{Type: "c7i.large", VCPU: 2, Memory: 4 * config.GiB}},
 	}, WithHTTPClient(srv.Client()), WithCredentials(StaticCredentials{
 		AccessKeyID: "AKID", SecretAccessKey: "secret",

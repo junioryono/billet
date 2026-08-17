@@ -47,6 +47,7 @@ type CacheService struct {
 
 type cacheSession struct {
 	mu       sync.Mutex
+	admit    chan struct{}
 	token    string
 	instance string
 	trust    provider.TrustClass
@@ -133,7 +134,7 @@ func (s *CacheService) Prepare(instance string, trust provider.TrustClass) (stri
 			continue
 		}
 
-		session := &cacheSession{token: token, instance: instance, trust: trust}
+		session := &cacheSession{token: token, instance: instance, trust: trust, admit: make(chan struct{}, 1)}
 		if err := s.persistSession(session); err != nil {
 			return "", err
 		}
@@ -250,6 +251,34 @@ func (s *CacheService) RetryClosed(ctx context.Context) error {
 	return errors.Join(failures...)
 }
 
+// ReconcileInventory closes cache sessions whose compute is absent from a
+// successful provider inventory. Only a successful list is evidence: an empty
+// inventory is meaningful, while a list error must leave every session fenced.
+func (s *CacheService) ReconcileInventory(ctx context.Context, instances []*provider.Instance) error {
+	present := make(map[string]bool, len(instances))
+	for _, instance := range instances {
+		present[instance.Name] = true
+	}
+
+	s.mu.Lock()
+	missing := make([]*cacheSession, 0)
+	for _, session := range s.byToken {
+		if !present[session.instance] {
+			missing = append(missing, session)
+		}
+	}
+	s.mu.Unlock()
+
+	var failures []error
+	for _, session := range missing {
+		if err := s.cleanupSession(ctx, session, true); err != nil {
+			failures = append(failures, err)
+		}
+	}
+
+	return errors.Join(failures...)
+}
+
 // RenewActive keeps every mounted generation out of eviction. A job may outlive
 // the store's initial lease, so the node refreshes these for as long as it owns
 // the corresponding compute session.
@@ -297,7 +326,9 @@ func (s *CacheService) cleanupSession(
 	}
 
 	session.closed = true
-	persistErr := s.persistSession(session)
+	if err := s.persistSession(session); err != nil {
+		return fmt.Errorf("node: record closed cache session for %s: %w", session.instance, err)
+	}
 
 	var failures []error
 	for slot, attachment := range session.slots {
@@ -312,12 +343,13 @@ func (s *CacheService) cleanupSession(
 		}
 
 		session.slots[slot] = nil
+		if err := s.persistSession(session); err != nil {
+			return fmt.Errorf("node: record discarded cache volume of %s slot %d: %w",
+				session.instance, slot, err)
+		}
 	}
 
-	if len(failures) > 0 {
-		persistErr = errors.Join(persistErr, s.persistSession(session))
-	}
-	if err := errors.Join(persistErr, errors.Join(failures...)); err != nil {
+	if err := errors.Join(failures...); err != nil {
 		return fmt.Errorf("node: discard cache volumes of %s: %w", session.instance, err)
 	}
 	if err := s.finishSession(session); err != nil {
@@ -332,6 +364,14 @@ func (s *CacheService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	session, ok := s.authenticate(r)
 	if !ok {
 		http.Error(w, "unauthorised cache session", http.StatusUnauthorized)
+
+		return
+	}
+	select {
+	case session.admit <- struct{}{}:
+		defer func() { <-session.admit }()
+	default:
+		http.Error(w, "another cache operation is already in progress", http.StatusTooManyRequests)
 
 		return
 	}

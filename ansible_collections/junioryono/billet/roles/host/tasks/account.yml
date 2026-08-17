@@ -110,13 +110,38 @@
   become: true
   notify: Reload systemd
 
-- name: Install the GitHub App private key
+- name: Inspect the installed GitHub App private key
+  ansible.builtin.stat:
+    path: /etc/billet/app-private-key.pem
+    checksum_algorithm: sha256
+  register: billet_installed_private_key
+  become: true
+  no_log: true
+  when:
+    - billet_enable_server
+    - billet_github_private_key_src | length > 0
+
+- name: Refuse to replace an installed GitHub App private key implicitly
+  ansible.builtin.assert:
+    that:
+      - not billet_installed_private_key.stat.exists or billet_installed_private_key.stat.checksum == (lookup('ansible.builtin.file', billet_github_private_key_src, rstrip=false) | hash('sha256'))
+    fail_msg: >-
+      /etc/billet/app-private-key.pem already contains a different key. Rotate
+      that credential explicitly before converging the host; the reusable role
+      will not overwrite a live GitHub App identity.
+  no_log: true
+  when:
+    - billet_enable_server
+    - billet_github_private_key_src | length > 0
+
+- name: Install the GitHub App private key without replacing an existing identity
   ansible.builtin.copy:
     src: "{{ billet_github_private_key_src }}"
     dest: /etc/billet/app-private-key.pem
     owner: "{{ billet_service_user }}"
     group: "{{ billet_service_group }}"
     mode: "0600"
+    force: false
   become: true
   register: billet_private_key_install
   no_log: true

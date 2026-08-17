@@ -120,7 +120,11 @@ func checkCacheKey(key string) error {
 }
 
 func (c *Client) withCacheLock(ctx context.Context, now time.Time, fn func() error) error {
-	lock, err := c.takeLock(ctx, c.cacheIndex(), publishCookie(now), now)
+	cookie, err := publishCookie(now)
+	if err != nil {
+		return err
+	}
+	lock, err := c.takeLock(ctx, c.cacheIndex(), cookie, now)
 	if err != nil {
 		return fmt.Errorf("ceph: take the cache index lock: %w", err)
 	}
@@ -348,31 +352,31 @@ func (c *Client) snapshotAt(
 
 	generationName, err := cacheName("s", now)
 	if err != nil {
-		return storecontract.Candidate{}, err
+		return storecontract.Candidate{}, c.cleanupSnapshotFailure(ctx, volume, "", "", err)
 	}
 
 	_, generation, _ := strings.Cut(generationName, "cache-s-")
 	stage := volume.Handle + "@" + generation
 	if _, err := c.rbdCmd(ctx, false, "snap", "create", stage); err != nil {
-		return storecontract.Candidate{}, fmt.Errorf("ceph: snapshot cache %q: %w", volume.Key, err)
+		return storecontract.Candidate{}, c.cleanupSnapshotFailure(ctx, volume, stage, "",
+			fmt.Errorf("ceph: snapshot cache %q: %w", volume.Key, err))
 	}
 
 	candidateName, err := cacheName("g", now)
 	if err != nil {
-		return storecontract.Candidate{}, err
+		return storecontract.Candidate{}, c.cleanupSnapshotFailure(ctx, volume, stage, "", err)
 	}
 
 	handle := c.cfg.CachePool + "/" + candidateName
 	if _, err := c.rbdCmd(ctx, false, "clone", stage, handle); err != nil {
-		return storecontract.Candidate{}, fmt.Errorf("ceph: clone immutable candidate for %q: %w",
-			volume.Key, err)
+		return storecontract.Candidate{}, c.cleanupSnapshotFailure(ctx, volume, stage, handle,
+			fmt.Errorf("ceph: clone immutable candidate for %q: %w", volume.Key, err))
 	}
 
 	ready := handle + "@" + generation
 	if _, err := c.rbdCmd(ctx, false, "snap", "create", ready); err != nil {
-		return storecontract.Candidate{}, errors.Join(
-			fmt.Errorf("ceph: freeze immutable candidate for %q: %w", volume.Key, err),
-			c.removeCacheImage(ctx, handle))
+		return storecontract.Candidate{}, c.cleanupSnapshotFailure(ctx, volume, stage, handle,
+			fmt.Errorf("ceph: freeze immutable candidate for %q: %w", volume.Key, err))
 	}
 
 	for key, value := range map[string]string{
@@ -381,28 +385,72 @@ func (c *Client) snapshotAt(
 		cacheMetaPrefix + "used_at":    now.UTC().Format(time.RFC3339Nano),
 	} {
 		if err := c.metaSet(ctx, handle, key, value); err != nil {
-			return storecontract.Candidate{}, err
+			return storecontract.Candidate{}, c.cleanupSnapshotFailure(ctx, volume, stage, handle, err)
 		}
 	}
 
 	if _, err := c.rbdCmd(ctx, false, "snap", "rm", stage); err != nil {
-		return storecontract.Candidate{}, fmt.Errorf("ceph: remove cache staging snapshot: %w", err)
+		return storecontract.Candidate{}, c.cleanupSnapshotFailure(ctx, volume, stage, handle,
+			fmt.Errorf("ceph: remove cache staging snapshot: %w", err))
 	}
 
 	if err := c.removeCacheImage(ctx, volume.Handle); err != nil {
-		return storecontract.Candidate{}, err
+		return storecontract.Candidate{}, c.cleanupSnapshotFailure(ctx, volume, "", handle, err)
 	}
 	if volume.Lease.ID != "" {
 		if err := c.withCacheLock(ctx, now, func() error {
 			return c.metaRemove(ctx, c.cacheIndex(), activeKey(volume.Lease.ID))
 		}); err != nil {
-			return storecontract.Candidate{}, err
+			return storecontract.Candidate{}, c.cleanupSnapshotFailure(ctx, volume, "", handle, err)
 		}
 	}
 
 	return storecontract.Candidate{
 		Key: volume.Key, Generation: generation, Handle: handle, Filesystem: filesystem,
 	}, nil
+}
+
+func (c *Client) cleanupSnapshotFailure(
+	ctx context.Context,
+	volume storecontract.Volume,
+	stage, candidate string,
+	primary error,
+) error {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.wait)
+	defer cancel()
+
+	var failures []error
+	if candidate != "" {
+		if _, err := c.rbdCmd(cleanupCtx, false, "snap", "purge", candidate); err != nil &&
+			!isNoSuchFile(err) {
+			failures = append(failures, err)
+		}
+		if err := c.removeCacheImage(cleanupCtx, candidate); err != nil {
+			failures = append(failures, err)
+		}
+	}
+	if stage != "" {
+		if _, err := c.rbdCmd(cleanupCtx, false, "snap", "rm", stage); err != nil &&
+			!isNoSuchFile(err) {
+			failures = append(failures, err)
+		}
+	}
+	if err := c.removeCacheImage(cleanupCtx, volume.Handle); err != nil {
+		failures = append(failures, err)
+	}
+	if volume.Lease.ID != "" {
+		if err := c.withCacheLock(cleanupCtx, time.Now(), func() error {
+			return c.metaRemove(cleanupCtx, c.cacheIndex(), activeKey(volume.Lease.ID))
+		}); err != nil {
+			failures = append(failures, err)
+		}
+	}
+
+	if cleanupErr := errors.Join(failures...); cleanupErr != nil {
+		return errors.Join(primary, fmt.Errorf("ceph: clean up failed cache snapshot: %w", cleanupErr))
+	}
+
+	return primary
 }
 
 // PublishCAS atomically advances one cache pointer under the cluster-wide index lock.

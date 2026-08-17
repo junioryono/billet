@@ -469,6 +469,9 @@ func TestRunnerCarriesTheNodesRegistryMirrorsToItsGuest(t *testing.T) {
 	}
 }
 
+// The historical name is retained for the mutation gate; the safe behavior is
+// now that no architecture-scoped image store is supplied until publication can
+// be gated on an authoritative job result.
 func TestFirecrackerBootsWithAnArchitectureScopedDockerImageStore(t *testing.T) {
 	p := &fakeProvider{kind: config.ProviderFirecracker}
 	storage := &fakeCacheStore{}
@@ -502,15 +505,58 @@ func TestFirecrackerBootsWithAnArchitectureScopedDockerImageStore(t *testing.T) 
 		t.Fatalf("Launch: %v", err)
 	}
 
-	if len(p.launched) != 1 || len(p.launched[0].Volumes) != 1 {
+	if len(p.launched) != 1 || len(p.launched[0].Volumes) != 0 {
 		t.Fatalf("launch volumes = %+v", p.launched)
 	}
-	volume := p.launched[0].Volumes[0]
-	if volume.Device != "/dev/rbd7" || volume.Path != "/var/lib/docker" {
-		t.Errorf("Docker image store mount = %+v", volume)
+	if storage.created != 0 {
+		t.Errorf("created %d Docker image stores without a safe publication gate, want 0", storage.created)
 	}
-	if storage.created != 1 {
-		t.Errorf("created %d cold Docker image stores, want 1", storage.created)
+}
+
+func TestCachePreparationFailureDoesNotFailTheJob(t *testing.T) {
+	p := &fakeProvider{kind: config.ProviderDocker}
+	storage := &fakeCacheStore{}
+	service, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", t.TempDir(),
+		storage, &fakeVolumeAttacher{}, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewCacheService: %v", err)
+	}
+	if err := os.RemoveAll(service.stateDir); err != nil {
+		t.Fatalf("remove cache state directory: %v", err)
+	}
+
+	a, host := newAllocatorWithHost(t)
+	runner := New(a, host, &fakeJIT{setID: 7}, p, nil, WithCacheService(service))
+	lease := assignedLease(t, a)
+	if err := runner.Launch(t.Context(), lease, dockerSpec(), Job{
+		RequestID: lease.RequestID, Event: "push",
+	}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	if len(p.launched) != 1 {
+		t.Fatalf("launched %d jobs, want 1", len(p.launched))
+	}
+	if p.launched[0].CacheEndpoint != "" || p.launched[0].CacheToken != "" {
+		t.Fatalf("cold launch retained cache credentials: %+v", p.launched[0])
+	}
+}
+
+func TestCleanupDoesNotDiscardUntilTheClosedSessionIsDurable(t *testing.T) {
+	service, storage, token := testCacheService(t, provider.TrustTrusted)
+	attached := cacheRequest(t, service, token, "/v1/volumes", map[string]any{
+		"key": "acme/api/npm", "size_bytes": int64(1 << 30),
+	})
+	if attached.Code != http.StatusCreated {
+		t.Fatalf("attach status = %d: %s", attached.Code, attached.Body.String())
+	}
+	if err := os.RemoveAll(service.stateDir); err != nil {
+		t.Fatalf("remove cache state directory: %v", err)
+	}
+	if err := service.Cleanup(t.Context(), "billet-one"); err == nil {
+		t.Fatal("Cleanup succeeded without durably recording the closed session")
+	}
+	if storage.discarded != 0 {
+		t.Fatalf("discarded %d volumes before the closed session was durable", storage.discarded)
 	}
 }
 
@@ -663,5 +709,66 @@ func TestAClosedSessionRetriesFailedDiscardsAfterRestart(t *testing.T) {
 	}
 	if storage.discarded != 2 {
 		t.Errorf("discard attempts = %d, want 2", storage.discarded)
+	}
+}
+
+func TestSuccessfulEmptyInventoryClosesPersistedCacheSessions(t *testing.T) {
+	t.Parallel()
+
+	storage := &fakeCacheStore{}
+	service, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", t.TempDir(),
+		storage, &fakeVolumeAttacher{}, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewCacheService: %v", err)
+	}
+	token, err := service.Prepare("billet-gone", provider.TrustTrusted)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	attached := cacheRequest(t, service, token, "/v1/volumes", map[string]any{
+		"key": "acme/api/npm", "size_bytes": int64(10 << 30),
+	})
+	if attached.Code != http.StatusCreated {
+		t.Fatalf("attach status = %d: %s", attached.Code, attached.Body.String())
+	}
+
+	if err := service.ReconcileInventory(t.Context(), nil); err != nil {
+		t.Fatalf("ReconcileInventory: %v", err)
+	}
+	if storage.discarded != 1 {
+		t.Fatalf("discarded = %d, want 1", storage.discarded)
+	}
+	response := cacheRequest(t, service, token, "/v1/volumes", map[string]any{
+		"key": "another", "size_bytes": int64(1 << 30),
+	})
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("removed session status = %d, want 401", response.Code)
+	}
+}
+
+func TestCacheSessionAdmissionIsBoundedBeforeStorage(t *testing.T) {
+	t.Parallel()
+
+	storage := &fakeCacheStore{}
+	service, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", t.TempDir(),
+		storage, &fakeVolumeAttacher{}, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewCacheService: %v", err)
+	}
+	token, err := service.Prepare("billet-one", provider.TrustTrusted)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	service.byToken[token].admit <- struct{}{}
+	defer func() { <-service.byToken[token].admit }()
+
+	response := cacheRequest(t, service, token, "/v1/volumes", map[string]any{
+		"key": "blocked", "size_bytes": int64(1 << 30),
+	})
+	if response.Code != http.StatusTooManyRequests {
+		t.Fatalf("admission status = %d, want 429", response.Code)
+	}
+	if storage.created != 0 || storage.cloned != 0 {
+		t.Fatal("storage was reached after admission was refused")
 	}
 }

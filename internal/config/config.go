@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -110,9 +111,10 @@ type ImagesConfig struct {
 
 // SiteConfig declares one place compute runs.
 //
-// A STRUCT RATHER THAN A STRING, because a site is where the storage backend will
-// be configured — Ceph at a bare-metal site, EBS and S3 in a cloud region
-// (#23/#25). Today it carries identity, which is the half placement needs.
+// A STRUCT RATHER THAN A STRING, because a site declares both placement identity
+// and its intended storage backend — Ceph at a bare-metal site, EBS and S3 in a
+// cloud region (#20/#25). The node wire still validates only the identity; making
+// this Store value authoritative across split configs remains #20.
 type SiteConfig struct {
 	// Name is what a node and a tier refer to this site by.
 	Name string `yaml:"name"`
@@ -1013,6 +1015,9 @@ type EC2Config struct {
 	// InterruptionQueueURL receives EventBridge's EC2 Spot interruption warnings.
 	// Required with Spot: without it a reclaim is an unexplained failed build.
 	InterruptionQueueURL string `yaml:"interruption_queue_url,omitempty"`
+	// NodeName is filled from the effective node identity before the provider is
+	// constructed. It is not a second operator-configured identity.
+	NodeName string `yaml:"-"`
 }
 
 // EC2InstanceType is one shape billet may buy, and what it holds.
@@ -2501,8 +2506,16 @@ func (c *Config) validateEC2Node() []error {
 		errs = append(errs, errors.New("node.ec2.interruption_queue_url is set while spot is off; "+
 			"the queue would be consumed for compute this node never buys"))
 	}
-	if err := CheckSQSQueueURL(e.InterruptionQueueURL); err != nil {
+	if err := CheckSQSQueueURL(e.InterruptionQueueURL, e.Region); err != nil {
 		errs = append(errs, err)
+	}
+	if c.Node.Name != "" {
+		e.NodeName = c.Node.Name
+	}
+	if e.NodeName != "" {
+		if err := CheckSQSQueueNode(e.InterruptionQueueURL, e.NodeName); err != nil {
+			errs = append(errs, err)
+		}
 	}
 
 	return errs
@@ -2525,6 +2538,7 @@ func (e *EC2Config) normalize() {
 	e.SubnetID = strings.TrimSpace(e.SubnetID)
 	e.InstanceProfile = strings.TrimSpace(e.InstanceProfile)
 	e.InterruptionQueueURL = strings.TrimSpace(e.InterruptionQueueURL)
+	e.NodeName = trimNodeName(e.NodeName)
 
 	for i := range e.SecurityGroupIDs {
 		e.SecurityGroupIDs[i] = strings.TrimSpace(e.SecurityGroupIDs[i])
@@ -2540,7 +2554,7 @@ func (e *EC2Config) normalize() {
 }
 
 // CheckSQSQueueURL refuses a warning queue that cannot be signed safely.
-func CheckSQSQueueURL(raw string) error {
+func CheckSQSQueueURL(raw, region string) error {
 	if raw == "" {
 		return nil
 	}
@@ -2559,6 +2573,33 @@ func CheckSQSQueueURL(raw string) error {
 	}
 	if u.Scheme != "https" && (u.Scheme != "http" || !isLoopbackHost(u.Hostname())) {
 		return errors.New("node.ec2.interruption_queue_url must use https; only loopback may use http")
+	}
+	if isLoopbackHost(u.Hostname()) {
+		return nil
+	}
+	host := strings.ToLower(u.Hostname())
+	standard := host == "sqs."+region+".amazonaws.com" ||
+		host == "sqs."+region+".amazonaws.com.cn" ||
+		host == region+".queue.amazonaws.com"
+	private := strings.HasSuffix(host, ".sqs."+region+".vpce.amazonaws.com") ||
+		strings.HasSuffix(host, ".sqs."+region+".vpce.amazonaws.com.cn")
+	if !standard && !private {
+		return fmt.Errorf("node.ec2.interruption_queue_url must name an SQS endpoint in node.ec2.region %q", region)
+	}
+
+	return nil
+}
+
+// CheckSQSQueueNode makes the one-queue-per-node topology enforceable from
+// independently deployed node configs: distinct node names imply distinct queue
+// URLs rather than relying on an operator remembering not to share one.
+func CheckSQSQueueNode(raw, node string) error {
+	if raw == "" {
+		return nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil || pathpkg.Base(u.Path) != node {
+		return fmt.Errorf("node.ec2.interruption_queue_url must name a queue whose name is exactly the effective node name %q", node)
 	}
 
 	return nil

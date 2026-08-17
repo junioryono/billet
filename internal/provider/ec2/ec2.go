@@ -54,6 +54,8 @@ import (
 // live jobs.
 const ownerTag = "sh.billet.owner"
 
+const nodeTag = "sh.billet.node"
+
 // nameTag is where the instance's billet name lives. EC2 has no name of its own
 // — "Name" is a tag by convention — and this one encodes the lease, which is the
 // only durable link between a running instance and the lease that authorised it.
@@ -132,6 +134,7 @@ func New(owner string, cfg config.EC2Config, opts ...Option) (*Provider, error) 
 	// scope of every request, which AWS answers with a 403 naming nothing.
 	cfg.Region = strings.TrimSpace(cfg.Region)
 	cfg.Endpoint = strings.TrimSpace(cfg.Endpoint)
+	cfg.NodeName = strings.TrimSpace(cfg.NodeName)
 
 	// THE SAFETY RULES CONFIG VALIDATION APPLIES TO THIS BACKEND'S NETWORK AND
 	// IDENTITY ARE RE-APPLIED HERE — region, endpoint and security groups. This
@@ -151,11 +154,14 @@ func New(owner string, cfg config.EC2Config, opts ...Option) (*Provider, error) 
 	if err := config.CheckEC2Region(cfg.Region); err != nil {
 		return nil, fmt.Errorf("ec2: %w", err)
 	}
-	if err := config.CheckSQSQueueURL(cfg.InterruptionQueueURL); err != nil {
+	if err := config.CheckSQSQueueURL(cfg.InterruptionQueueURL, cfg.Region); err != nil {
 		return nil, fmt.Errorf("ec2: %w", err)
 	}
-	if cfg.Spot != (cfg.InterruptionQueueURL != "") {
-		return nil, errors.New("ec2: spot and interruption_queue_url must be configured together")
+	if err := config.CheckSQSQueueNode(cfg.InterruptionQueueURL, cfg.NodeName); err != nil {
+		return nil, fmt.Errorf("ec2: %w", err)
+	}
+	if cfg.Spot != (cfg.InterruptionQueueURL != "" && cfg.NodeName != "") {
+		return nil, errors.New("ec2: spot, interruption_queue_url, and the effective node name must be configured together")
 	}
 
 	for _, check := range []struct {
@@ -709,6 +715,10 @@ func (p *Provider) setTags(params url.Values, name string) {
 	params.Set("TagSpecification.1.Tag.1.Value", name)
 	params.Set("TagSpecification.1.Tag.2.Key", ownerTag)
 	params.Set("TagSpecification.1.Tag.2.Value", p.owner)
+	if p.cfg.NodeName != "" {
+		params.Set("TagSpecification.1.Tag.3.Key", nodeTag)
+		params.Set("TagSpecification.1.Tag.3.Value", p.cfg.NodeName)
+	}
 
 	// AND ON THE VOLUME TOO. A root volume that outlives a failed termination is
 	// billed until somebody finds it, and an untagged one is not findable — the

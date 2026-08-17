@@ -1,0 +1,37 @@
+---
+- name: Stop and disable the Linux development proxy
+  ansible.builtin.systemd_service:
+    name: "{{ billet_development_proxy_systemd_unit }}"
+    enabled: false
+    state: stopped
+  failed_when: false
+  when:
+    - ansible_facts["system"] == "Linux"
+    - not ansible_check_mode
+  become: true
+
+- name: Inspect the disabled macOS development proxy
+  ansible.builtin.command:
+    argv: [launchctl, print, "system/{{ billet_development_proxy_launchd_label }}"]
+  register: billet_development_proxy_disabled_macos_status
+  changed_when: false
+  failed_when: false
+  when: ansible_facts["system"] == "Darwin"
+  become: true
+
+- name: Unload the disabled macOS development proxy
+  ansible.builtin.command:
+    argv: [launchctl, bootout, "system/{{ billet_development_proxy_launchd_label }}"]
+  changed_when: true
+  failed_when: false
+  when:
+    - ansible_facts["system"] == "Darwin"
+    - billet_development_proxy_disabled_macos_status.rc == 0
+    - not ansible_check_mode
+  become: true
+
+- name: Remove the disabled development proxy service definition
+  ansible.builtin.file:
+    path: "{{ '/Library/LaunchDaemons/' ~ billet_development_proxy_launchd_label ~ '.plist' if ansible_facts['system'] == 'Darwin' else '/etc/systemd/system/' ~ billet_development_proxy_systemd_unit }}"
+    state: absent
+  become: true

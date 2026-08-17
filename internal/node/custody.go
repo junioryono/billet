@@ -443,6 +443,7 @@ func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 			c.discard = true
 			c.outcome = alloc.PhaseFailed
 			c.unconfirmed.Store(false)
+			r.cleanupCache(ctx, c.name)
 
 			return r.finish(ctx, c)
 		}

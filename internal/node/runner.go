@@ -12,7 +12,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"runtime"
 	"slices"
 	"sync"
 	"time"
@@ -333,23 +332,15 @@ func (r *Runner) Launch(
 
 	cacheEndpoint, cacheToken := "", ""
 	var buildKitCacheMountLimit config.ByteSize
-	var cacheVolumes []provider.VolumeMount
 	if r.cache != nil {
 		cacheToken, err = r.cache.Prepare(name, trust)
 		if err != nil {
-			return fmt.Errorf("node: prepare cache access for %s: %w", name, err)
-		}
-
-		cacheEndpoint = r.cache.Endpoint()
-		buildKitCacheMountLimit = tier.BuildKitCacheMountLimit
-		if r.provider.Kind() == config.ProviderFirecracker {
-			volume, cacheErr := r.cache.PrepareDockerStore(ctx, name, runtime.GOARCH)
-			if cacheErr != nil {
-				r.log.Warn("the Docker image cache is unavailable; this job will continue cold",
-					"instance", name, "error", cacheErr)
-			} else {
-				cacheVolumes = []provider.VolumeMount{volume}
-			}
+			r.log.Warn("cache access is unavailable; this job will continue cold",
+				"instance", name, "error", err)
+			cacheToken = ""
+		} else {
+			cacheEndpoint = r.cache.Endpoint()
+			buildKitCacheMountLimit = tier.BuildKitCacheMountLimit
 		}
 	}
 
@@ -405,7 +396,6 @@ func (r *Runner) Launch(
 		CacheToken:              cacheToken,
 		BuildKitCacheMountLimit: buildKitCacheMountLimit,
 		RegistryMirrors:         r.registryMirrors,
-		Volumes:                 cacheVolumes,
 
 		// What actually starts the runner. Backends refuse an empty command
 		// because a container image's default is a shell, which exits at once and
@@ -609,6 +599,8 @@ func (r *Runner) cleanupCache(ctx context.Context, instance string) {
 }
 
 // WatchInterruptions consumes provider reclaim warnings until the context ends.
+var errInterruptionNotOwned = errors.New("node: interruption belongs to another node")
+
 func (r *Runner) WatchInterruptions(ctx context.Context) {
 	source, ok := r.provider.(provider.InterruptionSource)
 	if !ok {
@@ -634,6 +626,12 @@ func (r *Runner) WatchInterruptions(ctx context.Context) {
 		}
 
 		if err := r.handleInterruption(ctx, notice); err != nil {
+			if errors.Is(err, errInterruptionNotOwned) {
+				r.log.Info("leaving an interruption warning for the node that owns it",
+					"instance", notice.InstanceID, "action", notice.Action)
+
+				continue
+			}
 			r.log.Error("could not act on a provider interruption warning; leaving it for retry",
 				"instance", notice.InstanceID, "action", notice.Action, "error", err)
 			continue
@@ -723,10 +721,7 @@ func (r *Runner) handleInterruption(ctx context.Context, notice *provider.Interr
 		return r.tendOne(ctx, entry)
 	}
 
-	r.log.Info("ignoring an interruption warning for compute this node does not hold",
-		"instance", notice.InstanceID, "action", notice.Action)
-
-	return nil
+	return fmt.Errorf("%w: %s", errInterruptionNotOwned, notice.InstanceID)
 }
 
 // destroyStray removes an instance a failed launch may have left behind.
@@ -798,9 +793,16 @@ func (r *Runner) destroyStray(ctx context.Context, name string) (bool, error) {
 // destroyed here rather than left for the first sweep, because until they are
 // gone the host is over-committed by exactly their size.
 func (r *Runner) Recover(ctx context.Context) error {
+	r.retryClosedCache(ctx)
+
 	instances, err := r.provider.List(ctx)
 	if err != nil {
 		return fmt.Errorf("node: list what is already running: %w", err)
+	}
+	if r.cache != nil {
+		if err := r.cache.ReconcileInventory(ctx, instances); err != nil {
+			return fmt.Errorf("node: reconcile cache custody with provider inventory: %w", err)
+		}
 	}
 
 	if len(instances) == 0 {
@@ -918,6 +920,8 @@ func (r *Runner) Recover(ctx context.Context) error {
 			continue
 		}
 
+		r.cleanupCache(ctx, inst.Name)
+
 		if err := r.releaseOrphanedLease(ctx, leaseID); err != nil {
 			r.log.Warn("destroyed an instance but could not release its lease",
 				"lease", leaseID, "error", err)
@@ -963,6 +967,20 @@ func (r *Runner) takeCustody(ctx context.Context, lease *alloc.Lease, inst *prov
 	r.adopt(lease, inst)
 
 	if err := r.alloc.Heartbeat(ctx, lease.ID, lease.Epoch); err != nil {
+		if errors.Is(err, alloc.ErrForceRelease) {
+			for _, c := range r.custodySnapshot() {
+				if c.leaseID != lease.ID {
+					continue
+				}
+				c.discard = true
+				c.outcome = alloc.PhaseFailed
+				c.unconfirmed.Store(false)
+				r.cleanupCache(ctx, c.name)
+
+				return r.finish(ctx, c)
+			}
+		}
+
 		return fmt.Errorf("node: renew the lease of adopted instance %s (it is held in custody "+
 			"regardless, and renewal will be retried): %w", inst.Name, err)
 	}
@@ -1016,6 +1034,8 @@ func (r *Runner) AssumeCustody(ctx context.Context, lease *alloc.Lease, requestI
 // has not yet been written. It cannot race a starting job either — the list is
 // taken first, so anything in it predates the query that judges it.
 func (r *Runner) Sweep(ctx context.Context) error {
+	r.retryClosedCache(ctx)
+
 	instances, err := r.provider.List(ctx)
 	if err != nil {
 		return fmt.Errorf("node: list running instances: %w", err)
@@ -1119,6 +1139,8 @@ func (r *Runner) Sweep(ctx context.Context) error {
 			continue
 		}
 
+		r.cleanupCache(ctx, inst.Name)
+
 		// Its lease is already terminal — that is what made this an orphan — so
 		// this is belt and braces for the window where it went terminal between
 		// the two reads.
@@ -1137,6 +1159,15 @@ func (r *Runner) Sweep(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+func (r *Runner) retryClosedCache(ctx context.Context) {
+	if r.cache == nil {
+		return
+	}
+	if err := r.cache.RetryClosed(ctx); err != nil {
+		r.log.Warn("cache cleanup from an earlier run is still incomplete", "error", err)
+	}
 }
 
 // reportInventory tells the control plane which leases this host is running.

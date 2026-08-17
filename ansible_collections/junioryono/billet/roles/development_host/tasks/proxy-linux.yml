@@ -20,7 +20,9 @@
         billet_development_proxy_linux_service is changed or
         billet_development_proxy_config_copy is changed or
         billet_development_proxy_config_template is changed or
-        billet_development_proxy_environment_file is changed
+        billet_development_proxy_environment_file is changed or
+        billet_development_certificate_mint is changed or
+        billet_development_certificate_permissions is changed
         else 'started'
       }}
   become: true

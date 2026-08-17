@@ -31,9 +31,9 @@ ExecStart=/usr/bin/billet server --config /etc/billet/billet.yaml
 StateDirectory=billet/server
 StateDirectoryMode=0700
 
-# SIX AND A HALF HOURS, AND THE ARITHMETIC IS THE POINT.
+# TWENTY-FOUR AND A HALF HOURS, AND THE ARITHMETIC IS THE POINT.
 #
-#   drain_timeout   6h     — how long billet waits for the jobs already running
+#   drain_timeout  24h     — the largest value billet accepts
 #   teardown       ~25m    — destroy (12m) + destroy (12m) + close (30s) + release (30s)
 #   margin           5m
 #
@@ -45,7 +45,7 @@ StateDirectoryMode=0700
 #
 # LOWER drain_timeout FIRST if this is too long for you, then lower this to
 # match. Do not lower this alone.
-TimeoutStopSec=23400
+TimeoutStopSec=88200
 KillSignal=SIGTERM
 
 # A second SIGTERM stops billet waiting for its running jobs and tears down

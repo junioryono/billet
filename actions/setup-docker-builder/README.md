@@ -4,7 +4,7 @@
 
 ```yaml
 - id: billet-builder
-  uses: junioryono/billet/actions/setup-docker-builder@v1
+  uses: junioryono/billet/actions/setup-docker-builder@v0.1.0
   with:
     cache-key: Dockerfile
 - uses: docker/build-push-action@v7
@@ -13,7 +13,7 @@
     context: .
 ```
 
-The combined `junioryono/billet/actions/build-push-action@v1` wrapper is available for common `docker/build-push-action` inputs and follows upstream v7 rather than vendoring its implementation. Use the setup action directly when an upstream input is not exposed by the wrapper.
+The combined `junioryono/billet/actions/build-push-action@v0.1.0` wrapper is available for common `docker/build-push-action` inputs and follows upstream v7 rather than vendoring its implementation. Use an exact Billet release tag: the release workflow rewrites every sibling reference to that same immutable tag before it creates the tag, while `main` deliberately composes the current `main` actions. Use the setup action directly when an upstream input is not exposed by the wrapper.
 
 BuildKit garbage collection keeps records unused for eight days and constrains the 100 GiB default disk to 80–90 GiB of retained state. The tier's `buildkit_cache_mount_limit` independently caps each `RUN --mount=type=cache` record: the post hook reports its exact size and growth, resets only a mount that exceeds the ceiling, and discards the whole publication if the ceiling cannot be enforced. Set `reset: true` on one trusted run to replace a poisoned or bloated key with fresh BuildKit state.
 

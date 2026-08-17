@@ -120,11 +120,12 @@ func TestEBSVolumesAndSnapshotsCarryOwnershipAndEncryption(t *testing.T) {
 	}, "deployment/site", staticCredentials{}, server.Client(), server.URL,
 		func() time.Time { return time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC) },
 		func(context.Context, time.Duration) error { return nil })
-	volume, err := api.CreateVolume(t.Context(), "", 10<<30)
+	volume, err := api.CreateVolume(t.Context(), "", 10<<30, "volume-token")
 	if err != nil || volume != "vol-123" {
 		t.Fatalf("CreateVolume = %q, %v", volume, err)
 	}
-	snapshot, err := api.CreateSnapshot(t.Context(), volume, time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC))
+	snapshot, err := api.CreateSnapshot(t.Context(), volume,
+		time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC), "snapshot-token")
 	if err != nil || snapshot != "snap-123" {
 		t.Fatalf("CreateSnapshot = %q, %v", snapshot, err)
 	}
@@ -135,7 +136,8 @@ func TestEBSVolumesAndSnapshotsCarryOwnershipAndEncryption(t *testing.T) {
 		createVolume.Get("Size") != "10" || createVolume.Get("VolumeType") != "gp3" ||
 		createVolume.Get("TagSpecification.1.Tag.1.Value") != "deployment" ||
 		createVolume.Get("TagSpecification.1.Tag.2.Key") != cacheOwnerTag ||
-		createVolume.Get("TagSpecification.1.Tag.2.Value") != "deployment/site" {
+		createVolume.Get("TagSpecification.1.Tag.2.Value") != "deployment/site" ||
+		createVolume.Get("ClientToken") != "volume-token" {
 		t.Fatalf("CreateVolume params = %v", createVolume)
 	}
 	createSnapshot := actions[2]
@@ -143,8 +145,49 @@ func TestEBSVolumesAndSnapshotsCarryOwnershipAndEncryption(t *testing.T) {
 		createSnapshot.Get("TagSpecification.1.ResourceType") != "snapshot" ||
 		createSnapshot.Get("TagSpecification.1.Tag.1.Value") != "deployment" ||
 		createSnapshot.Get("TagSpecification.1.Tag.2.Key") != cacheOwnerTag ||
-		createSnapshot.Get("TagSpecification.1.Tag.2.Value") != "deployment/site" {
+		createSnapshot.Get("TagSpecification.1.Tag.2.Value") != "deployment/site" ||
+		createSnapshot.Get("ClientToken") != "snapshot-token" {
 		t.Fatalf("CreateSnapshot params = %v", createSnapshot)
+	}
+}
+
+func TestTargetedDeletesRefuseResourcesWithoutThisStoresOwnershipTags(t *testing.T) {
+	t.Parallel()
+
+	var deleted bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		values, err := url.ParseQuery(string(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch values.Get("Action") {
+		case "DescribeVolumes":
+			writeAWSResponse(t, w, `<DescribeVolumesResponse><volumeSet><item><volumeId>vol-foreign</volumeId><tagSet><item><key>sh.billet.owner</key><value>other</value></item><item><key>sh.billet.cache-owner</key><value>other/site</value></item></tagSet></item></volumeSet></DescribeVolumesResponse>`)
+		case "DescribeSnapshots":
+			writeAWSResponse(t, w, `<DescribeSnapshotsResponse><snapshotSet><item><snapshotId>snap-foreign</snapshotId><status>completed</status><tagSet><item><key>sh.billet.owner</key><value>other</value></item><item><key>sh.billet.cache-owner</key><value>other/site</value></item></tagSet></item></snapshotSet></DescribeSnapshotsResponse>`)
+		case "DeleteVolume", "DeleteSnapshot":
+			deleted = true
+		default:
+			t.Fatalf("unexpected action %q", values.Get("Action"))
+		}
+	}))
+	defer server.Close()
+
+	api := newEBSAPI(config.EBSS3Config{Region: "us-west-2", AvailabilityZone: "us-west-2a"},
+		"deployment/site", staticCredentials{}, server.Client(), server.URL, time.Now,
+		func(context.Context, time.Duration) error { return nil })
+	if err := api.DeleteVolume(t.Context(), "vol-foreign"); err == nil {
+		t.Fatal("DeleteVolume accepted a resource owned by another store")
+	}
+	if err := api.DeleteSnapshot(t.Context(), "snap-foreign"); err == nil {
+		t.Fatal("DeleteSnapshot accepted a resource owned by another store")
+	}
+	if deleted {
+		t.Fatal("a targeted delete reached EC2 for a foreign cache resource")
 	}
 }
 

@@ -117,7 +117,7 @@
 - name: Install Caddy and Terraform
   ansible.builtin.apt:
     name: "{{ ['caddy'] + (['terraform'] if billet_development_install_terraform else []) }}"
-    state: present
+    state: latest
   become: true
 
 - name: Stop the package's default Caddy service

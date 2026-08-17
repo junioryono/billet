@@ -353,9 +353,10 @@ node:
   # hostname, or endpoint different from listen is refused so a bearer-token API
   # cannot quietly appear on another host interface.
   #
-  # Enabling it also attaches /var/lib/docker before the guest daemon starts.
-  # Image pulls from docker pull/run/compose and service containers therefore
-  # survive by organisation, site and architecture with no workflow change.
+  # Docker image-store attachment is disabled until the runner supplies an
+  # authoritative job result that makes publication safe. Docker and service
+  # container pulls therefore remain cold unless a registry mirror serves them;
+  # workflow-managed sticky disks and the BuildKit action use this API now.
   cache:
     listen: 172.20.0.1:7718
     guest_endpoint: http://172.20.0.1:7718
@@ -448,13 +449,15 @@ node:
   #   # retry — and defaulting to it would make the failover path the unreliable
   #   # one, which is the opposite of what a failover is for. Turn it on if you
   #   # would rather have a cheap build that sometimes dies.
-  #   # Enabling it also requires an SQS queue targeted by an EventBridge rule
-  #   # for "EC2 Spot Instance Interruption Warning". billet long-polls the queue,
-  #   # records the failure reason before teardown, and deletes each message only
-  #   # after that record is durable. The node role needs sqs:ReceiveMessage and
-  #   # sqs:DeleteMessage on this queue.
+  #   # Enabling it also requires one SQS queue PER NODE. An EventBridge router
+  #   # must look up the warned instance's sh.billet.node tag and deliver the
+  #   # warning only to that node's queue; several nodes consuming one queue can
+  #   # hide a two-minute warning from its owner for the entire visibility timeout.
+  #   # billet records the failure reason before teardown and deletes a message
+  #   # only after that record is durable. The node role needs sqs:ReceiveMessage
+  #   # and sqs:DeleteMessage on its queue.
   #   # spot: true
-  #   # interruption_queue_url: https://sqs.us-west-2.amazonaws.com/123456789012/billet-spot
+  #   # interruption_queue_url: https://sqs.us-west-2.amazonaws.com/123456789012/aws-1
 
   # THE AWS-LOCAL CACHE STORE, for an EC2 node in an `ebs-s3` site. EBS carries
   # encrypted block generations and S3 carries the small fenced pointer. The
@@ -466,6 +469,9 @@ node:
   # ec2:DeleteSnapshot, ec2:DescribeVolumes, ec2:DescribeSnapshots, ec2:CreateTags,
   # ec2:AttachVolume and ec2:DetachVolume. It also needs s3:GetObject and
   # s3:PutObject for the prefix, plus s3:ListBucket constrained to that prefix.
+  # Constrain EBS deletion by sh.billet.owner and sh.billet.cache-owner tag
+  # conditions too; billet rechecks them in code, while IAM is the account-level
+  # boundary if state is corrupted or a future caller supplies the wrong id.
   #
   # ebs_s3:
   #   region: us-west-2

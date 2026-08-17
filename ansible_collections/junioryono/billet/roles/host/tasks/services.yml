@@ -92,3 +92,23 @@
     - billet_enable_node
     - not ansible_check_mode
   become: true
+
+- name: Stop and disable the billet server when this host no longer owns that role
+  ansible.builtin.systemd_service:
+    name: billet-server.service
+    enabled: false
+    state: stopped
+  when:
+    - not billet_enable_server
+    - not ansible_check_mode
+  become: true
+
+- name: Stop and disable the billet node when this host no longer owns that role
+  ansible.builtin.systemd_service:
+    name: billet-node.service
+    enabled: false
+    state: stopped
+  when:
+    - not billet_enable_node
+    - not ansible_check_mode
+  become: true

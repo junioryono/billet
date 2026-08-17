@@ -30,8 +30,7 @@ function cacheMountUsage() {
     "exec", container, "buildctl", "--addr", "unix:///run/buildkit/buildkitd.sock",
     "du", "--filter", "type==exec.cachemount", "--format", "{{json .}}",
   ]), "buildctl du");
-  const records = JSON.parse(result.stdout || "[]");
-  if (!Array.isArray(records)) throw new Error("buildctl du did not return an array");
+  const records = String(result.stdout || "").split(/\r?\n/).filter((line) => line.trim()).map((line) => JSON.parse(line));
   for (const record of records) {
     if (!record || typeof record.id !== "string" || !record.id ||
         typeof record.description !== "string" ||

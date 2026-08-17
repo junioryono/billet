@@ -56,7 +56,7 @@ func (s *CacheService) loadSessions() error {
 
 		session := &cacheSession{
 			token: record.Token, instance: record.Instance, trust: record.Trust,
-			closed: record.Closed, slots: record.Slots,
+			closed: record.Closed, slots: record.Slots, admit: make(chan struct{}, 1),
 		}
 		s.byToken[record.Token] = session
 		s.byInstance[record.Instance] = record.Token

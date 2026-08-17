@@ -265,6 +265,32 @@ func TestAnInterruptionMessageIsAcknowledgedAfterTheFailureIsDurable(t *testing.
 	<-done
 }
 
+func TestASharedQueueWarningIsNotAcknowledgedByTheWrongNode(t *testing.T) {
+	p := &interruptingProvider{
+		fakeProvider: &fakeProvider{kind: config.ProviderDocker},
+		notices:      make(chan *provider.InterruptionNotice, 1),
+		acked:        make(chan *provider.InterruptionNotice, 1),
+	}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r.WatchInterruptions(ctx)
+	}()
+	p.notices <- &provider.InterruptionNotice{InstanceID: "instance-owned-by-sibling", Action: "terminate"}
+
+	select {
+	case <-p.acked:
+		t.Fatal("a node acknowledged its sibling's interruption warning")
+	case <-time.After(100 * time.Millisecond):
+	}
+	cancel()
+	<-done
+}
+
 // #46. A TEARDOWN THAT WAS MERELY ACCEPTED DOES NOT RELEASE THE CAPACITY.
 //
 // The listener releases a lease when Destroy returns nil, and its comment says
@@ -404,6 +430,38 @@ func TestAnOperatorCanForceAVisibleTeardownThroughItsLiveNode(t *testing.T) {
 	}
 	if _, err := a.Lease(t.Context(), lease.ID); !errors.Is(err, alloc.ErrLeaseNotFound) {
 		t.Fatalf("forced lease is still open: %v", err)
+	}
+}
+
+func TestRecoveryConsumesAForceReleaseRequestedBeforeRestart(t *testing.T) {
+	p := &fakeProvider{kind: config.ProviderDocker, asyncTeardown: true}
+	a, host := newAllocatorWithHost(t)
+	first := New(a, host, &fakeJIT{setID: 7}, p, nil)
+	lease := assignedLease(t, a)
+	if err := first.Launch(t.Context(), lease, dockerSpec(), Job{
+		RequestID: 81, Event: "push",
+	}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	if err := first.Destroy(t.Context(), 81); !errors.Is(err, server.ErrCustody) {
+		t.Fatalf("Destroy = %v, want ErrCustody", err)
+	}
+	if err := first.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend: %v", err)
+	}
+	if _, err := a.ForceRelease(t.Context(), lease.ID); err != nil {
+		t.Fatalf("ForceRelease: %v", err)
+	}
+
+	restarted := New(a, host, &fakeJIT{setID: 7}, p, nil)
+	if err := restarted.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	if len(restarted.heldLeases()) != 0 {
+		t.Fatal("recovery retained custody after consuming the pending force release")
+	}
+	if _, err := a.Lease(t.Context(), lease.ID); !errors.Is(err, alloc.ErrLeaseNotFound) {
+		t.Fatalf("forced lease is still open after recovery: %v", err)
 	}
 }
 

@@ -19,12 +19,18 @@
       - not billet_enable_server or billet_github_private_key_src | length > 0 or billet_persisted_inputs.results[1].stat.exists
       - not billet_ceph_bootstrap or billet_ceph_mon_ip | length > 0
       - not billet_ceph_bootstrap or billet_ceph_devices | length > 0
+      - billet_networks | map(attribute='name') | unique | list | length == billet_networks | length
+      - billet_networks | map(attribute='name') | select('match', '^[A-Za-z0-9][A-Za-z0-9_.-]{0,14}$') | list | length == billet_networks | length
+      - "'.' not in (billet_networks | map(attribute='name') | list)"
+      - "'..' not in (billet_networks | map(attribute='name') | list)"
     fail_msg: >-
       A billet host needs Linux/systemd, a Linux billet binary, a complete
       billet_config, and the GitHub App key when the server is enabled. The
       binary and key may already be installed, so an ordinary converging run
       needs neither secret input. Ceph bootstrap additionally requires an
       explicit monitor address and device list; disks are never inferred.
+      Guest bridge names must be unique Linux interface names of at most 15
+      characters and cannot contain path or control characters.
 
 - name: Configure billet account and files
   ansible.builtin.import_tasks: account.yml

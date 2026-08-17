@@ -26,6 +26,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"text/tabwriter"
 	"time"
@@ -813,7 +814,10 @@ func newProvider(cfg *config.Config, deployment string) (provider.Provider, erro
 			return nil, errors.New("billet: node.ec2 is missing; the provider is ec2")
 		}
 
-		return ec2.New(deployment, *cfg.Node.EC2, ec2.WithLogger(slog.Default()))
+		ec2Config := *cfg.Node.EC2
+		ec2Config.NodeName = cfg.Node.Name
+
+		return ec2.New(deployment, ec2Config, ec2.WithLogger(slog.Default()))
 
 	case config.ProviderFirecracker:
 		// BOTH BLOCKS ARE GUARANTEED BY VALIDATION — node.ceph is required for this
@@ -1088,6 +1092,38 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 
 const cacheEvictionAge = 7 * 24 * time.Hour
 
+const cacheConnectionLimit = 128
+
+type limitedListener struct {
+	net.Listener
+	semaphore chan struct{}
+}
+
+func (l *limitedListener) Accept() (net.Conn, error) {
+	l.semaphore <- struct{}{}
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		<-l.semaphore
+
+		return nil, err
+	}
+
+	return &limitedConn{Conn: conn, release: func() { <-l.semaphore }}, nil
+}
+
+type limitedConn struct {
+	net.Conn
+	once    sync.Once
+	release func()
+}
+
+func (c *limitedConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(c.release)
+
+	return err
+}
+
 // startNodeCache exposes the site's clone store to its managed guests.
 func startNodeCache(
 	ctx context.Context,
@@ -1154,10 +1190,13 @@ func startNodeCache(
 			cfg.Node.Cache.Listen, err)
 	}
 
+	ln = &limitedListener{Listener: ln, semaphore: make(chan struct{}, cacheConnectionLimit)}
 	srv := &http.Server{
 		Handler:           service,
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
 		IdleTimeout:       time.Minute,
+		MaxHeaderBytes:    16 << 10,
 	}
 	serveListener := ln
 	if cfg.Node.Provider == config.ProviderEC2 {
@@ -1882,6 +1921,11 @@ func cmdCheck(ctx context.Context, args []string) error {
 	}
 
 	if cfg.Node != nil {
+		if cfg.Node.TLS != nil {
+			if _, err := nodeBundle(cfg); err != nil {
+				return fmt.Errorf("node identity: %w", err)
+			}
+		}
 		site := cfg.Node.Site
 		if site == "" {
 			site = "local (implicit)"
@@ -1896,7 +1940,9 @@ func cmdCheck(ctx context.Context, args []string) error {
 			if err := printEC2Cost(cfg); err != nil {
 				return err
 			}
-			if err := checkEC2Credentials(ctx, cfg.Node.EC2); err != nil {
+			ec2Config := *cfg.Node.EC2
+			ec2Config.NodeName = cfg.Node.Name
+			if err := checkEC2Credentials(ctx, &ec2Config); err != nil {
 				return err
 			}
 		}

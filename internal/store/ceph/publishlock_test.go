@@ -24,7 +24,10 @@ func TestPublishCookieIsUniquePerCall(t *testing.T) {
 		// THE SAME INSTANT EVERY TIME, so the timestamp cannot be what distinguishes
 		// them. On one host, in one process, this is the worst case: everything except
 		// the nonce is identical.
-		cookie := publishCookie(cookieAt)
+		cookie, err := publishCookie(cookieAt)
+		if err != nil {
+			t.Fatalf("publishCookie: %v", err)
+		}
 
 		if seen[cookie] {
 			t.Fatalf("publishCookie produced %q twice in %d calls at one instant; two "+
@@ -40,7 +43,10 @@ func TestPublishCookieIsUniquePerCall(t *testing.T) {
 // the same way or a lock leaked by the Go side could never be reclaimed by the
 // shell side -- and only under the failure that mechanism exists to handle.
 func TestPublishCookieEndsWithTheTimestampTheShellParses(t *testing.T) {
-	cookie := publishCookie(cookieAt)
+	cookie, err := publishCookie(cookieAt)
+	if err != nil {
+		t.Fatalf("publishCookie: %v", err)
+	}
 
 	// COPIED CHARACTER FOR CHARACTER from build-guest-image.sh's jq expression,
 	// `capture("-(?<t>[0-9]+)$")`. Written as `\d` it would be an equivalent regex
@@ -72,7 +78,10 @@ func TestPublishCookieEndsWithTheTimestampTheShellParses(t *testing.T) {
 // THE COOKIE IS ALSO A DIAGNOSTIC. An operator staring at a held lock needs to know
 // which machine to go and look at.
 func TestPublishCookieNamesTheHostAndTheTool(t *testing.T) {
-	cookie := publishCookie(cookieAt)
+	cookie, err := publishCookie(cookieAt)
+	if err != nil {
+		t.Fatalf("publishCookie: %v", err)
+	}
 
 	if !strings.HasPrefix(cookie, "billet-import-") {
 		t.Errorf("%q does not say what took it; the shell's cookies say billet-build-", cookie)

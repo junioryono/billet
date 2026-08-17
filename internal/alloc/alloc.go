@@ -1040,25 +1040,35 @@ func (a *Allocator) Resize(
 			return nil
 		}
 
-		deltaVCPU := vcpu - lease.VCPU
-		deltaMemory := memory - lease.Memory
-
 		fleetUsed, err := a.usage(ctx, tx)
 		if err != nil {
 			return err
 		}
 
-		nodeUsed, err := a.usageOn(ctx, tx, lease.Node)
+		// Authorize the replacement as if the current shape had first been
+		// returned to the same host. The remaining fleet is then charged for every
+		// other tier's outstanding floor exactly as initial placement is. Checking
+		// only the raw ceilings lets a fallback spend capacity another tier was
+		// promised.
+		free, err := a.fleetResources(ctx, tx)
+		if err != nil {
+			return err
+		}
+		free.vcpu[lease.Node] += lease.VCPU
+		free.memory[lease.Node] += lease.Memory
+		owedVCPU, owedMemory, err := a.reserveFloors(ctx, tx, lease.Tier, free)
 		if err != nil {
 			return err
 		}
 
-		if fleetUsed.VCPU+deltaVCPU > a.limits.MaxVCPU ||
-			fleetUsed.Memory+deltaMemory > a.limits.MaxMemory ||
-			nodeUsed.VCPU+deltaVCPU > nodeVCPU ||
-			nodeUsed.Memory+deltaMemory > config.ByteSize(nodeMemory) {
+		deploymentVCPU := a.limits.MaxVCPU - (fleetUsed.VCPU - lease.VCPU) - owedVCPU
+		deploymentMemory := a.limits.MaxMemory - (fleetUsed.Memory - lease.Memory) - owedMemory
+		if vcpu > free.vcpu[lease.Node] || memory > free.memory[lease.Node] ||
+			vcpu > deploymentVCPU || memory > deploymentMemory ||
+			vcpu > nodeVCPU || memory > config.ByteSize(nodeMemory) {
 			return fmt.Errorf("%w: EC2 fallback %q needs %d vCPU and %s, which would exceed "+
-				"the node or deployment budget", ErrNoCapacity, instanceType, vcpu, memory)
+				"the node or deployment budget or consume another tier's reserved capacity",
+				ErrNoCapacity, instanceType, vcpu, memory)
 		}
 
 		if _, err := tx.ExecContext(ctx,
@@ -1440,7 +1450,7 @@ func (a *Allocator) RegisterNode(ctx context.Context, reg NodeRegistration) (int
 			}
 		}
 
-		if existed && currentShapes != encodedShapes {
+		if existed && currentShapes != "" && currentShapes != encodedShapes {
 			var outstanding int
 
 			if err := tx.QueryRowContext(ctx,

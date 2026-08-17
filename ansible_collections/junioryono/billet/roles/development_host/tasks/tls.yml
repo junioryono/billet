@@ -54,6 +54,27 @@
   register: billet_development_tls_sans_recorded
   when: billet_development_tls_inputs.results[2].stat.exists
 
+- name: Read the installed development certificate public key
+  ansible.builtin.command:
+    argv: [openssl, x509, -in, "{{ billet_development_tls_cert_path }}", -pubkey, -noout]
+  register: billet_development_installed_certificate_public_key
+  changed_when: false
+  failed_when: false
+  when:
+    - billet_development_tls_inputs.results[0].stat.exists
+    - billet_development_tls_inputs.results[1].stat.exists
+
+- name: Read the installed development private key's public half
+  ansible.builtin.command:
+    argv: [openssl, pkey, -in, "{{ billet_development_tls_key_path }}", -pubout]
+  register: billet_development_installed_private_public_key
+  changed_when: false
+  failed_when: false
+  no_log: true
+  when:
+    - billet_development_tls_inputs.results[0].stat.exists
+    - billet_development_tls_inputs.results[1].stat.exists
+
 - name: Decide whether to mint the development certificate
   ansible.builtin.set_fact:
     billet_development_tls_needs_certificate: >-
@@ -61,19 +82,76 @@
         not billet_development_tls_inputs.results[0].stat.exists or
         not billet_development_tls_inputs.results[1].stat.exists or
         not billet_development_tls_inputs.results[2].stat.exists or
+        (billet_development_installed_certificate_public_key.rc | default(1)) != 0 or
+        (billet_development_installed_private_public_key.rc | default(1)) != 0 or
+        ((billet_development_installed_certificate_public_key.stdout | default('')) != (billet_development_installed_private_public_key.stdout | default(''))) or
         ((billet_development_tls_sans_recorded.content | default('') | b64decode | trim) != (billet_development_tls_sans | to_json))
       }}
 
 - name: Mint the development certificate
   ansible.builtin.command:
-    argv: "{{ [billet_development_mkcert_bin, '-cert-file', billet_development_tls_cert_path, '-key-file', billet_development_tls_key_path] + billet_development_tls_sans }}"
+    argv: "{{ [billet_development_mkcert_bin, '-cert-file', billet_development_tls_dir ~ '/.development-next.pem', '-key-file', billet_development_tls_dir ~ '/.development-next-key.pem'] + billet_development_tls_sans }}"
   environment:
     CAROOT: "{{ billet_development_tls_caroot }}"
     HOME: "{{ billet_development_home }}"
   become: true
   become_user: "{{ billet_development_user }}"
+  register: billet_development_certificate_mint
   when: billet_development_tls_needs_certificate
   changed_when: true
+
+- name: Read the staged development certificate public key
+  ansible.builtin.command:
+    argv: [openssl, x509, -in, "{{ billet_development_tls_dir }}/.development-next.pem", -pubkey, -noout]
+  register: billet_development_staged_certificate_public_key
+  changed_when: false
+  when: billet_development_tls_needs_certificate
+
+- name: Read the staged development private key's public half
+  ansible.builtin.command:
+    argv: [openssl, pkey, -in, "{{ billet_development_tls_dir }}/.development-next-key.pem", -pubout]
+  register: billet_development_staged_private_public_key
+  changed_when: false
+  no_log: true
+  when: billet_development_tls_needs_certificate
+
+- name: Refuse a mismatched staged development identity
+  ansible.builtin.assert:
+    that: billet_development_staged_certificate_public_key.stdout == billet_development_staged_private_public_key.stdout
+    fail_msg: The staged development certificate and private key do not match.
+  when: billet_development_tls_needs_certificate
+
+- name: Install the staged development private key
+  ansible.builtin.copy:
+    src: "{{ billet_development_tls_dir }}/.development-next-key.pem"
+    dest: "{{ billet_development_tls_key_path }}"
+    remote_src: true
+    owner: "{{ billet_development_user }}"
+    group: "{{ billet_development_group_result.stdout }}"
+    mode: "0600"
+  become: true
+  when: billet_development_tls_needs_certificate
+
+- name: Install the matching staged development certificate
+  ansible.builtin.copy:
+    src: "{{ billet_development_tls_dir }}/.development-next.pem"
+    dest: "{{ billet_development_tls_cert_path }}"
+    remote_src: true
+    owner: "{{ billet_development_user }}"
+    group: "{{ billet_development_group_result.stdout }}"
+    mode: "0644"
+  become: true
+  when: billet_development_tls_needs_certificate
+
+- name: Remove staged development identity files
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "{{ billet_development_tls_dir }}/.development-next.pem"
+    - "{{ billet_development_tls_dir }}/.development-next-key.pem"
+  become: true
+  when: billet_development_tls_needs_certificate
 
 - name: Record the development certificate SANs
   ansible.builtin.copy:
@@ -95,3 +173,4 @@
     - { path: "{{ billet_development_tls_cert_path }}", mode: "0644" }
     - { path: "{{ billet_development_tls_key_path }}", mode: "0600" }
   become: true
+  register: billet_development_certificate_permissions

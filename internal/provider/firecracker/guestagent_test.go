@@ -148,9 +148,9 @@ func TestTheGuestMountsDockerStateBeforeStartingTheDaemon(t *testing.T) {
 	if !strings.Contains(text, "systemctl disable docker.service docker.socket") {
 		t.Fatal("the image still permits Docker to autostart before its cache is mounted")
 	}
-	if !strings.Contains(text, "operation=commit") ||
-		!strings.Contains(text, `"$cache_endpoint/v1/volumes/0/$operation"`) {
-		t.Fatal("the guest never commits a changed Docker image store after stopping the daemon")
+	if strings.Contains(text, "operation=commit") ||
+		!strings.Contains(text, `"$cache_endpoint/v1/volumes/0/discard"`) {
+		t.Fatal("the guest can publish Docker state without an authoritative job result")
 	}
 	if !strings.Contains(text, "BILLET_BUILDKIT_CACHE_MOUNT_LIMIT_BYTES") ||
 		!strings.Contains(text, "fetch buildkit-cache-mount-limit-bytes") {

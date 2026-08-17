@@ -136,8 +136,30 @@ jobs:
             git checkout "${BRANCH}"
           else
             git checkout -b "${BRANCH}"
-            git push origin "${BRANCH}"
           fi
+
+          # Main composes current sibling actions at @main. A RELEASE MUST NOT:
+          # pinning the outer action would otherwise still execute mutable code.
+          # Rewrite only Billet's three internal references, commit that generated
+          # release surface on the minor branch, and tag the resulting commit.
+          sed -E -i "s#junioryono/billet/actions/setup-docker-builder@(main|v[0-9]+\\.[0-9]+\\.[0-9]+)#junioryono/billet/actions/setup-docker-builder@${TAG}#" actions/build-push-action/action.yml
+          sed -E -i "s#junioryono/billet/actions/(stickydisk|stop-docker-builder)@(main|v[0-9]+\\.[0-9]+\\.[0-9]+)#junioryono/billet/actions/\\1@${TAG}#" actions/setup-docker-builder/action.yml
+          mapfile -t internal_refs < <(grep -RhE --include='action.yml' '^[[:space:]]+uses: junioryono/billet/actions/[^[:space:]@]+@' actions)
+          refs_are_exact=true
+          for ref in "${internal_refs[@]}"; do
+            [[ "${ref}" == *"@${TAG}" ]] || refs_are_exact=false
+          done
+          if [[ ${#internal_refs[@]} -ne 3 || "${refs_are_exact}" != true ]]; then
+            printf 'release action references did not all resolve exactly to %s:\n%s\n' "${TAG}" "${internal_refs[*]}" >&2
+            exit 1
+          fi
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add actions/build-push-action/action.yml actions/setup-docker-builder/action.yml
+          if ! git diff --cached --quiet; then
+            git commit -m "Release ${TAG}"
+          fi
+          git push origin "HEAD:${BRANCH}"
 
           git tag -a "${TAG}" -m "${TAG}"
           git push origin "${TAG}"

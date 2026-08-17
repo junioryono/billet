@@ -39,10 +39,10 @@ StateDirectoryMode=0700
 RuntimeDirectory=billet/locks
 RuntimeDirectoryMode=0750
 
-# See the note in billet-server.service: drain (6h) + teardown (~25m) + margin.
+# Sized for billet's maximum configurable drain (24h) + teardown (~25m) + margin.
 # A node's drain waits for the containers it is holding, and a SIGKILL through
 # the middle of it leaves them running with their leases renewed by nobody.
-TimeoutStopSec=23400
+TimeoutStopSec=88200
 KillSignal=SIGTERM
 KillMode=mixed
 

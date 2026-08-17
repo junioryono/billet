@@ -723,7 +723,8 @@ func TestSpotIsRequestedOneTimeSoNothingRelaunchesIntoAnEmptyJob(t *testing.T) {
 	f := newFakeEC2(t)
 	p := newTestProvider(t, f, func(c *config.EC2Config) {
 		c.Spot = true
-		c.InterruptionQueueURL = f.URL + "/queue"
+		c.InterruptionQueueURL = f.URL + "/aws-1"
+		c.NodeName = "aws-1"
 	})
 
 	if _, err := p.Launch(t.Context(), validSpec()); err != nil {
@@ -736,6 +737,8 @@ func TestSpotIsRequestedOneTimeSoNothingRelaunchesIntoAnEmptyJob(t *testing.T) {
 		"InstanceMarketOptions.MarketType":                               "spot",
 		"InstanceMarketOptions.SpotOptions.SpotInstanceType":             "one-time",
 		"InstanceMarketOptions.SpotOptions.InstanceInterruptionBehavior": "terminate",
+		"TagSpecification.1.Tag.3.Key":                                   nodeTag,
+		"TagSpecification.1.Tag.3.Value":                                 "aws-1",
 	} {
 		if got.Get(key) != want {
 			t.Errorf("%s = %q, want %q", key, got.Get(key), want)

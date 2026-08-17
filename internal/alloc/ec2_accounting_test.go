@@ -1,6 +1,7 @@
 package alloc
 
 import (
+	"database/sql"
 	"errors"
 	"strings"
 	"testing"
@@ -187,5 +188,72 @@ func TestEC2FallbackResizesInsideTheBudget(t *testing.T) {
 	}
 	if got.VCPU != 16 || got.Memory != 32*config.GiB || got.InstanceType != "sixteen" {
 		t.Errorf("resized lease = %+v, want the sixteen-vCPU shape", got)
+	}
+}
+
+func TestEC2FallbackPreservesAnotherTiersFloor(t *testing.T) {
+	tiers := []config.Tier{
+		{Label: "cloud", Provider: config.ProviderEC2, GuestOS: config.GuestLinux,
+			VCPU: 2, Memory: 4 * config.GiB, Image: "ami-test"},
+		{Label: "reserved", Provider: config.ProviderEC2, GuestOS: config.GuestLinux,
+			VCPU: 8, Memory: 16 * config.GiB, Reserved: 1, Image: "ami-test"},
+	}
+	a := newBareAllocator(t, Limits{MaxVCPU: 16, MaxMemory: 32 * config.GiB}, tiers)
+	_, err := a.RegisterNode(t.Context(), NodeRegistration{
+		Name: "cloud-1", Provider: config.ProviderEC2,
+		VCPU: 16, Memory: 32 * config.GiB,
+		EC2Shapes: []config.EC2InstanceType{
+			{Type: "eight", VCPU: 8, Memory: 16 * config.GiB},
+			{Type: "sixteen", VCPU: 16, Memory: 32 * config.GiB},
+		},
+	})
+	if err != nil {
+		t.Fatalf("RegisterNode: %v", err)
+	}
+
+	lease, err := a.Reserve(t.Context(), "cloud")
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+	if err := a.Assign(t.Context(), lease.ID, lease.Epoch, 1, 1); err != nil {
+		t.Fatalf("Assign: %v", err)
+	}
+	if err := a.Bind(t.Context(), lease.ID, lease.Epoch, "cloud-1"); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	if err := a.Advance(t.Context(), lease.ID, lease.Epoch, PhaseLaunching); err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+
+	err = a.Resize(t.Context(), lease.ID, lease.Epoch, "sixteen", 16, 32*config.GiB)
+	if !errors.Is(err, ErrNoCapacity) {
+		t.Fatalf("fallback consumed reserved capacity: %v", err)
+	}
+}
+
+func TestLegacyEC2CatalogueInitializesWithOutstandingWork(t *testing.T) {
+	a := ec2AccountingAllocator(t)
+	lease, err := a.Reserve(t.Context(), "cloud")
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+	if err := a.db.Tx(t.Context(), func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(t.Context(), `UPDATE nodes SET ec2_shapes = '' WHERE name = 'cloud-1'`)
+
+		return err
+	}); err != nil {
+		t.Fatalf("simulate migration 19: %v", err)
+	}
+
+	reg := NodeRegistration{
+		Name: "cloud-1", Provider: config.ProviderEC2,
+		VCPU: 16, Memory: 64 * config.GiB,
+		EC2Shapes: []config.EC2InstanceType{
+			{Type: "eight", VCPU: 8, Memory: 16 * config.GiB},
+			{Type: "sixteen", VCPU: 16, Memory: 32 * config.GiB},
+		},
+	}
+	if _, err := a.RegisterNode(t.Context(), reg); err != nil {
+		t.Fatalf("first post-migration registration with lease %s: %v", lease.ID, err)
 	}
 }

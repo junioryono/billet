@@ -17,4 +17,4 @@ tags:
   - ceph
   - development
 dependencies:
-  ansible.posix: ">=1.5.4"
+  ansible.posix: ">=1.5.4,<3.0.0"

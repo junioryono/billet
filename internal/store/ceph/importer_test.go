@@ -28,11 +28,12 @@ type importFake struct {
 	// lockHeld is what `rbd lock ls` reports. Empty means the fake tracks the
 	// lock itself: `lock add` succeeds and the listing then names this cookie,
 	// which is what lets Release find and remove it.
-	lockHeld    string
-	lockTaken   string
-	lockAddErr  error
-	unmapErr    error
-	poolMissing bool
+	lockHeld         string
+	lockTaken        string
+	lockAddErr       error
+	lockAddAmbiguous bool
+	unmapErr         error
+	poolMissing      bool
 
 	// cancelOn fires the stored cancel when that subcommand is issued, which is how
 	// a test reproduces the case that matters: a deadline expiring PARTWAY through
@@ -168,6 +169,11 @@ func (f *importFake) lock(args []string) ([]byte, error) {
 
 	switch verb {
 	case "add":
+		if f.lockAddAmbiguous && f.lockTaken == "" && f.lockHeld == "" {
+			f.lockTaken = cookie
+
+			return nil, errors.New("the successful lock response was lost")
+		}
 		if f.lockAddErr != nil {
 			return nil, f.lockAddErr
 		}
@@ -286,6 +292,20 @@ func importClient(t *testing.T, f *importFake) *Client {
 }
 
 var importAt = time.Date(2026, 8, 15, 4, 17, 9, 0, time.UTC)
+
+func TestALostLockResponseRecognisesTheCallersOwnCookie(t *testing.T) {
+	f := &importFake{lockAddAmbiguous: true}
+	lock, err := importClient(t, f).TakePublishLock(t.Context(), importAt)
+	if err != nil {
+		t.Fatalf("TakePublishLock: %v", err)
+	}
+	if f.lockTaken == "" {
+		t.Fatal("the ambiguous lock was not recorded by the fake")
+	}
+	if err := lock.Release(t.Context()); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+}
 
 func TestImportGenerationWritesTheImageAndPublishesIt(t *testing.T) {
 	raw, device := stageRaw(t, "a filesystem, in spirit")

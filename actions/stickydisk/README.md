@@ -3,7 +3,7 @@
 This action hot-attaches a copy-on-write ext4 volume to a billet Firecracker runner, mounts it for the job, and publishes a new immutable generation in its post step. Every failure is a warning and a cold cache: cache availability never changes the job result.
 
 ```yaml
-- uses: junioryono/billet/actions/stickydisk@v1
+- uses: junioryono/billet/actions/stickydisk@v0.1.0
   with:
     key: ${{ github.repository }}-npm
     path: ~/.npm

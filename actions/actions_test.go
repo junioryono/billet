@@ -288,11 +288,12 @@ func runBuilderCleanup(t *testing.T, statePath, discardMarker string, failPrune 
 	seen := filepath.Join(tools, "du-seen")
 	before := filepath.Join(tools, "before.json")
 	after := filepath.Join(tools, "after.json")
-	usage := `[{"id":"mount-1","mutable":true,"inUse":false,"size":3072,"description":"cached mount /root/.cache from buildkit","recordType":"exec.cachemount"},{"id":"mount-2","mutable":true,"inUse":false,"size":512,"description":"cached mount /go/pkg/mod from buildkit","recordType":"exec.cachemount"}]`
+	usage := "{\"id\":\"mount-1\",\"mutable\":true,\"inUse\":false,\"size\":3072,\"description\":\"cached mount /root/.cache from buildkit\",\"recordType\":\"exec.cachemount\"}\n" +
+		"{\"id\":\"mount-2\",\"mutable\":true,\"inUse\":false,\"size\":512,\"description\":\"cached mount /go/pkg/mod from buildkit\",\"recordType\":\"exec.cachemount\"}\n"
 	if err := os.WriteFile(before, []byte(usage), 0o600); err != nil {
 		t.Fatalf("write usage fixture: %v", err)
 	}
-	remaining := `[{"id":"mount-2","mutable":true,"inUse":false,"size":512,"description":"cached mount /go/pkg/mod from buildkit","recordType":"exec.cachemount"}]`
+	remaining := "{\"id\":\"mount-2\",\"mutable\":true,\"inUse\":false,\"size\":512,\"description\":\"cached mount /go/pkg/mod from buildkit\",\"recordType\":\"exec.cachemount\"}\n"
 	if err := os.WriteFile(after, []byte(remaining), 0o600); err != nil {
 		t.Fatalf("write post-prune fixture: %v", err)
 	}

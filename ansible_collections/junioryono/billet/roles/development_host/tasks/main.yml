@@ -41,3 +41,7 @@
 - name: Configure the local development reverse proxy
   ansible.builtin.import_tasks: proxy.yml
   when: billet_development_proxy_enabled
+
+- name: Remove the local development reverse proxy
+  ansible.builtin.import_tasks: proxy-disabled.yml
+  when: not billet_development_proxy_enabled

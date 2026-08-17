@@ -40,9 +40,9 @@ type volumeInfo struct {
 }
 
 type blockAPI interface {
-	CreateVolume(ctx context.Context, snapshot string, sizeBytes int64) (string, error)
+	CreateVolume(ctx context.Context, snapshot string, sizeBytes int64, token string) (string, error)
 	DeleteVolume(ctx context.Context, id string) error
-	CreateSnapshot(ctx context.Context, volume string, now time.Time) (string, error)
+	CreateSnapshot(ctx context.Context, volume string, now time.Time, token string) (string, error)
 	SnapshotExists(ctx context.Context, id string) (bool, error)
 	ListSnapshots(ctx context.Context) ([]snapshotInfo, error)
 	DeleteSnapshot(ctx context.Context, id string) error
@@ -58,6 +58,7 @@ type objectAPI interface {
 // Store owns EBS cache snapshots and their strongly consistent S3 state objects.
 type Store struct {
 	cfg     config.EBSS3Config
+	owner   string
 	blocks  blockAPI
 	objects objectAPI
 	now     func() time.Time
@@ -77,11 +78,12 @@ func withNow(now func() time.Time) option {
 
 func newStore(
 	cfg config.EBSS3Config,
+	owner string,
 	blocks blockAPI,
 	objects objectAPI,
 	opts ...option,
 ) *Store {
-	s := &Store{cfg: cfg, blocks: blocks, objects: objects, now: time.Now}
+	s := &Store{cfg: cfg, owner: owner, blocks: blocks, objects: objects, now: time.Now}
 	for _, opt := range opts {
 		opt(s)
 	}
@@ -127,7 +129,25 @@ type keyState struct {
 	Active      map[string]activeState     `json:"active,omitempty"`
 }
 
-func (s *Store) statePrefix() string { return s.cfg.Prefix + "/state/" }
+func (s *Store) statePrefix() string {
+	digest := sha256.Sum256([]byte(s.owner))
+
+	return s.cfg.Prefix + "/owners/" + hex.EncodeToString(digest[:]) + "/state/"
+}
+
+func (s *Store) legacyStatePrefix() string { return s.cfg.Prefix + "/state/" }
+
+func (s *Store) legacyStateKey(key string) string {
+	digest := sha256.Sum256([]byte(key))
+
+	return s.legacyStatePrefix() + hex.EncodeToString(digest[:]) + ".json"
+}
+
+func (s *Store) requestToken(parts ...string) string {
+	digest := sha256.Sum256([]byte(s.owner + "\x00" + strings.Join(parts, "\x00")))
+
+	return hex.EncodeToString(digest[:])
+}
 
 func (s *Store) stateKey(key string) string {
 	digest := sha256.Sum256([]byte(key))
@@ -143,7 +163,37 @@ func emptyState(key string) keyState {
 }
 
 func (s *Store) load(ctx context.Context, key string) (keyState, string, error) {
-	return s.loadObject(ctx, s.stateKey(key), key)
+	for range maxCASAttempts {
+		state, etag, err := s.loadObject(ctx, s.stateKey(key), key)
+		if err != nil || etag != "" {
+			return state, etag, err
+		}
+
+		legacy, legacyETag, err := s.loadObject(ctx, s.legacyStateKey(key), key)
+		if err != nil || legacyETag == "" {
+			return state, etag, err
+		}
+		body, err := json.Marshal(legacy)
+		if err != nil {
+			return keyState{}, "", fmt.Errorf("ebs-s3: encode legacy state for cache %q: %w", key, err)
+		}
+		newETag, err := s.objects.Put(ctx, s.stateKey(key), body, "")
+		if err == nil {
+			return legacy, newETag, nil
+		}
+		if !errors.Is(err, errObjectConflict) && !errors.Is(err, errObjectAmbiguous) {
+			return keyState{}, "", err
+		}
+	}
+
+	return keyState{}, "", fmt.Errorf("%w: cache %q migration did not settle",
+		storecontract.ErrConflict, key)
+}
+
+func (s *Store) ensureState(ctx context.Context, key string) error {
+	_, _, err := s.load(ctx, key)
+
+	return err
 }
 
 func (s *Store) loadObject(
@@ -190,7 +240,7 @@ func (s *Store) mutate(
 ) error {
 	objectKey := s.stateKey(key)
 	for range maxCASAttempts {
-		state, etag, err := s.loadObject(ctx, objectKey, key)
+		state, etag, err := s.load(ctx, key)
 		if err != nil {
 			return err
 		}
@@ -264,12 +314,16 @@ func (s *Store) Create(
 	if sizeBytes <= 0 {
 		return storecontract.Volume{}, fmt.Errorf("ebs-s3: cache %q asks for %d bytes", key, sizeBytes)
 	}
+	if err := s.ensureState(ctx, key); err != nil {
+		return storecontract.Volume{}, err
+	}
 
 	leaseID, err := randomID("active")
 	if err != nil {
 		return storecontract.Volume{}, err
 	}
-	volume, err := s.blocks.CreateVolume(ctx, "", sizeBytes)
+	volume, err := s.blocks.CreateVolume(ctx, "", sizeBytes,
+		s.requestToken("create", key, leaseID))
 	if err != nil {
 		return storecontract.Volume{}, err
 	}
@@ -349,9 +403,13 @@ func (s *Store) Snapshot(
 	if err := volume.Filesystem.Valid(); err != nil {
 		return storecontract.Candidate{}, fmt.Errorf("ebs-s3: remote filesystem proof: %w", err)
 	}
+	if err := s.ensureState(ctx, volume.Key); err != nil {
+		return storecontract.Candidate{}, err
+	}
 
 	now := s.now()
-	snapshot, err := s.blocks.CreateSnapshot(ctx, volume.Handle, now)
+	snapshot, err := s.blocks.CreateSnapshot(ctx, volume.Handle, now,
+		s.requestToken("snapshot", volume.Key, volume.Handle, now.UTC().Format(time.RFC3339Nano)))
 	if err != nil {
 		return storecontract.Candidate{}, err
 	}
@@ -480,7 +538,8 @@ func (s *Store) Clone(
 		return storecontract.Volume{}, err
 	}
 
-	volume, err := s.blocks.CreateVolume(ctx, selected, 0)
+	volume, err := s.blocks.CreateVolume(ctx, selected, 0,
+		s.requestToken("clone", key, selected, leaseID))
 	if err != nil {
 		cleanupErr := s.dropActive(ctx, key, leaseID)
 		if errors.Is(err, errSnapshotMissing) {
@@ -554,6 +613,12 @@ func (s *Store) Discard(ctx context.Context, volume storecontract.Volume) error 
 	if !strings.HasPrefix(volume.Handle, "vol-") {
 		return errors.New("ebs-s3: refusing to discard something that is not an EBS volume")
 	}
+	if err := checkKey(volume.Key); err != nil {
+		return err
+	}
+	if err := s.ensureState(ctx, volume.Key); err != nil {
+		return err
+	}
 	if err := s.blocks.DeleteVolume(ctx, volume.Handle); err != nil {
 		return err
 	}
@@ -578,6 +643,28 @@ func (s *Store) Evict(ctx context.Context, olderThan time.Duration) error {
 		return errors.New("ebs-s3: cache eviction needs a positive inactivity age")
 	}
 
+	legacyKeys, err := s.objects.List(ctx, s.legacyStatePrefix())
+	if err != nil {
+		return err
+	}
+	for _, objectKey := range legacyKeys {
+		body, _, found, err := s.objects.Get(ctx, objectKey)
+		if err != nil {
+			return err
+		}
+		if !found {
+			continue
+		}
+		var legacy keyState
+		if err := json.Unmarshal(body, &legacy); err != nil || legacy.Key == "" ||
+			objectKey != s.legacyStateKey(legacy.Key) {
+			return fmt.Errorf("ebs-s3: legacy state object %s is not a valid cache state", objectKey)
+		}
+		if _, _, err := s.load(ctx, legacy.Key); err != nil {
+			return err
+		}
+	}
+
 	keys, err := s.objects.List(ctx, s.statePrefix())
 	if err != nil {
 		return err
@@ -597,6 +684,9 @@ func (s *Store) Evict(ctx context.Context, olderThan time.Duration) error {
 		var observed keyState
 		if err := json.Unmarshal(body, &observed); err != nil || observed.Key == "" {
 			return fmt.Errorf("ebs-s3: state object %s is not a valid cache state", objectKey)
+		}
+		if objectKey != s.stateKey(observed.Key) {
+			return fmt.Errorf("ebs-s3: state object %s is outside this owner's cache namespace", objectKey)
 		}
 		var planned []string
 		if err := s.mutate(ctx, observed.Key, func(state *keyState) error {
@@ -655,6 +745,9 @@ func (s *Store) Evict(ctx context.Context, olderThan time.Duration) error {
 		var state keyState
 		if err := json.Unmarshal(body, &state); err != nil {
 			return fmt.Errorf("ebs-s3: state object %s is not valid json", objectKey)
+		}
+		if state.Key == "" || objectKey != s.stateKey(state.Key) {
+			return fmt.Errorf("ebs-s3: state object %s is outside this owner's cache namespace", objectKey)
 		}
 		for name := range state.Generations {
 			generation := state.Generations[name]

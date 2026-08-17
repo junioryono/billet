@@ -530,7 +530,7 @@ ip route replace "$MMDS/32" dev eth0 2>/dev/null || true
 token=""
 
 for attempt in $(seq 1 120); do
-	if token=$(curl -sf -X PUT "http://$MMDS/latest/api/token" \
+	if token=$(curl -sf --connect-timeout 2 --max-time 5 -X PUT "http://$MMDS/latest/api/token" \
 		-H "X-metadata-token-ttl-seconds: 300" 2>/dev/null); then
 		break
 	fi
@@ -543,7 +543,7 @@ for attempt in $(seq 1 120); do
 	sleep 0.5
 done
 
-fetch() { curl -sf -H "X-metadata-token: $token" "http://$MMDS/latest/meta-data/billet/$1"; }
+fetch() { curl -sf --connect-timeout 2 --max-time 5 -H "X-metadata-token: $token" "http://$MMDS/latest/meta-data/billet/$1"; }
 
 # THE CONTRACT FIRST, BEFORE ANYTHING IS READ FROM IT.
 #
@@ -629,13 +629,18 @@ if cache_endpoint=$(fetch cache-endpoint 2>/dev/null) &&
 	[ -n "$cache_endpoint" ] && [ -n "$cache_token" ] &&
 	[[ "$buildkit_cache_mount_limit_bytes" =~ ^[1-9][0-9]*$ ]] &&
 	[ -b /dev/vdb ] && [ "$(blockdev --getsize64 /dev/vdb 2>/dev/null || echo 0)" -gt 0 ]; then
-	cache_type=$(blkid -o value -s TYPE /dev/vdb 2>/dev/null || true)
-	if [ -z "$cache_type" ]; then
+	set +e
+	cache_type=$(blkid -o value -s TYPE /dev/vdb 2>/dev/null)
+	blkid_status=$?
+	set -e
+	if [ "$blkid_status" -eq 2 ]; then
 		if ! mkfs.ext4 -q -F /dev/vdb; then
 			log "the Docker image cache could not be formatted; this job will pull cold"
 		elif mount -t ext4 -o noatime /dev/vdb /var/lib/docker; then
 			docker_cache=1
 		fi
+	elif [ "$blkid_status" -ne 0 ]; then
+		log "the Docker image cache signature could not be read; refusing to format the device"
 	elif [ "$cache_type" != ext4 ]; then
 		log "the Docker image cache contains $cache_type rather than ext4; this job will pull cold"
 	elif mount -t ext4 -o noatime /dev/vdb /var/lib/docker; then
@@ -644,7 +649,7 @@ if cache_endpoint=$(fetch cache-endpoint 2>/dev/null) &&
 fi
 
 if [ "$docker_cache" -eq 0 ] && [ -n "$cache_endpoint" ] && [ -n "$cache_token" ]; then
-	curl -sf -X POST -H "Authorization: Bearer $cache_token" \
+	curl -sf --connect-timeout 3 --max-time 10 -X POST -H "Authorization: Bearer $cache_token" \
 		"$cache_endpoint/v1/volumes/0/discard" >/dev/null 2>&1 || true
 fi
 
@@ -828,24 +833,13 @@ if [ "$docker_cache" -eq 1 ]; then
 	if ! systemctl stop docker.service docker.socket; then
 		log "Docker did not stop cleanly; discarding its cache writes"
 	elif sync -f /var/lib/docker && umount /var/lib/docker; then
-		operation=commit
-		commit_args=()
-		if [ "$docker_images_before" = "$docker_images_after" ]; then
-			operation=discard
-		else
-			filesystem_type=$(blkid -o value -s TYPE /dev/vdb 2>/dev/null || true)
-			filesystem_uuid=$(blkid -o value -s UUID /dev/vdb 2>/dev/null || true)
-			filesystem_clean=false
-			if e2fsck -f -n /dev/vdb >/dev/null 2>&1; then
-				filesystem_clean=true
-			fi
-			commit_body=$(printf '{"filesystem":{"type":"%s","uuid":"%s","clean":%s}}' \
-				"$filesystem_type" "$filesystem_uuid" "$filesystem_clean")
-			commit_args=(-H "Content-Type: application/json" --data-binary "$commit_body")
+		if [ "$docker_images_before" != "$docker_images_after" ]; then
+			log "Docker image publication is disabled until the runner supplies an authoritative job result"
 		fi
-		if ! curl -sf -X POST -H "Authorization: Bearer $cache_token" \
-			"${commit_args[@]}" "$cache_endpoint/v1/volumes/0/$operation" >/dev/null; then
-			log "the Docker image cache could not $operation; the job result is unchanged"
+		if ! curl -sf --connect-timeout 3 --max-time 10 -X POST \
+			-H "Authorization: Bearer $cache_token" \
+			"$cache_endpoint/v1/volumes/0/discard" >/dev/null; then
+			log "the Docker image cache could not be discarded; the job result is unchanged"
 		fi
 	else
 		log "the Docker image cache could not be unmounted; its writes will be discarded"

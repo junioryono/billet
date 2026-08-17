@@ -2,6 +2,7 @@ package ebss3
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -27,7 +28,9 @@ func newFakeBlocks() *fakeBlocks {
 	return &fakeBlocks{createdFrom: map[string]string{}, snapshots: map[string]snapshotInfo{}}
 }
 
-func (f *fakeBlocks) CreateVolume(_ context.Context, snapshot string, _ int64) (string, error) {
+func (f *fakeBlocks) CreateVolume(
+	_ context.Context, snapshot string, _ int64, _ string,
+) (string, error) {
 	f.nextVolume++
 	id := fmt.Sprintf("vol-%d", f.nextVolume)
 	f.createdFrom[id] = snapshot
@@ -41,7 +44,9 @@ func (f *fakeBlocks) DeleteVolume(_ context.Context, id string) error {
 	return nil
 }
 
-func (f *fakeBlocks) CreateSnapshot(_ context.Context, volume string, now time.Time) (string, error) {
+func (f *fakeBlocks) CreateSnapshot(
+	_ context.Context, volume string, now time.Time, _ string,
+) (string, error) {
 	if !strings.HasPrefix(volume, "vol-") {
 		return "", errors.New("not a volume")
 	}
@@ -86,6 +91,7 @@ type fakeObject struct {
 type fakeObjects struct {
 	objects     map[string]fakeObject
 	next        int
+	putErr      error
 	afterPutErr error
 }
 
@@ -106,6 +112,9 @@ func (f *fakeObjects) Put(
 	body []byte,
 	expected string,
 ) (string, error) {
+	if f.putErr != nil {
+		return "", f.putErr
+	}
 	current, exists := f.objects[key]
 	if expected == "" && exists || expected != "" && (!exists || current.etag != expected) {
 		return "", errObjectConflict
@@ -141,7 +150,7 @@ func testStore(now *time.Time) (*Store, *fakeBlocks, *fakeObjects) {
 	s := newStore(config.EBSS3Config{
 		Region: "us-west-2", AvailabilityZone: "us-west-2a",
 		Bucket: "billet-cache-example", Prefix: "deployments/example/home",
-	}, blocks, objects, withNow(func() time.Time { return *now }))
+	}, "example/home", blocks, objects, withNow(func() time.Time { return *now }))
 
 	return s, blocks, objects
 }
@@ -194,6 +203,115 @@ func TestACloudGenerationPublishesByCASAndClonesFromItsSnapshot(t *testing.T) {
 	}
 	if err := s.Discard(t.Context(), clone); err != nil {
 		t.Fatalf("Discard: %v", err)
+	}
+}
+
+func TestCloudStateIsIsolatedByDeploymentAndSiteOwner(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
+	first, blocks, objects := testStore(&now)
+	if _, err := first.Create(t.Context(), "acme/api/npm", 1<<30); err != nil {
+		t.Fatalf("first Create: %v", err)
+	}
+	second := newStore(first.cfg, "another-deployment/home", blocks, objects,
+		withNow(func() time.Time { return now }))
+	if first.stateKey("acme/api/npm") == second.stateKey("acme/api/npm") {
+		t.Fatal("two owners share one S3 state object")
+	}
+	if _, err := second.Current(t.Context(), "acme/api/npm"); !errors.Is(err, storecontract.ErrMiss) {
+		t.Fatalf("another owner observed the first owner's cache state: %v", err)
+	}
+}
+
+func TestLegacyCloudStateMigratesIntoTheOwnerNamespace(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
+	s, _, objects := testStore(&now)
+	legacy := emptyState("acme/api/npm")
+	legacy.Pointer = "old-generation"
+	legacy.Generations[legacy.Pointer] = generationState{
+		Handle: "snap-old", UsedAt: now,
+	}
+	body, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if _, err := objects.Put(t.Context(), s.legacyStateKey(legacy.Key), body, ""); err != nil {
+		t.Fatalf("seed legacy state: %v", err)
+	}
+	objects.afterPutErr = fmt.Errorf("%w: response lost after migration committed", errObjectAmbiguous)
+
+	if got, err := s.Current(t.Context(), legacy.Key); err != nil || got != legacy.Pointer {
+		t.Fatalf("Current = %q, %v; want migrated %q", got, err, legacy.Pointer)
+	}
+	if _, _, found, err := objects.Get(t.Context(), s.stateKey(legacy.Key)); err != nil || !found {
+		t.Fatalf("owner state was not installed: found=%t err=%v", found, err)
+	}
+}
+
+func TestLegacyCloudStateMigratesBeforeBlockStorageChanges(t *testing.T) {
+	t.Parallel()
+
+	for _, operation := range []struct {
+		name    string
+		run     func(context.Context, *Store) error
+		changed func(*fakeBlocks) bool
+	}{
+		{
+			name: "create",
+			run: func(ctx context.Context, s *Store) error {
+				_, err := s.Create(ctx, "acme/api/npm", 1<<30)
+
+				return err
+			},
+			changed: func(blocks *fakeBlocks) bool { return blocks.nextVolume != 0 },
+		},
+		{
+			name: "snapshot",
+			run: func(ctx context.Context, s *Store) error {
+				_, err := s.Snapshot(ctx, storecontract.Volume{
+					Key: "acme/api/npm", Handle: "vol-old", Device: "vol-old",
+					Filesystem: storecontract.Filesystem{Type: "ext4", UUID: "fs-old", Clean: true},
+				})
+
+				return err
+			},
+			changed: func(blocks *fakeBlocks) bool { return blocks.nextSnapshot != 0 },
+		},
+		{
+			name: "discard",
+			run: func(ctx context.Context, s *Store) error {
+				return s.Discard(ctx, storecontract.Volume{
+					Key: "acme/api/npm", Handle: "vol-old", Device: "vol-old",
+				})
+			},
+			changed: func(blocks *fakeBlocks) bool { return len(blocks.deletedVolume) != 0 },
+		},
+	} {
+		t.Run(operation.name, func(t *testing.T) {
+			t.Parallel()
+
+			now := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
+			s, blocks, objects := testStore(&now)
+			legacy := emptyState("acme/api/npm")
+			body, err := json.Marshal(legacy)
+			if err != nil {
+				t.Fatalf("Marshal: %v", err)
+			}
+			if _, err := objects.Put(t.Context(), s.legacyStateKey(legacy.Key), body, ""); err != nil {
+				t.Fatalf("seed legacy state: %v", err)
+			}
+			objects.putErr = errors.New("S3 migration unavailable")
+
+			if err := operation.run(t.Context(), s); err == nil {
+				t.Fatal("operation continued after legacy migration failed")
+			}
+			if operation.changed(blocks) {
+				t.Fatal("block storage changed before legacy state migrated")
+			}
+		})
 	}
 }
 
@@ -332,7 +450,7 @@ func TestACloudPointerSurvivesALostConditionalWriteResponse(t *testing.T) {
 		t.Fatalf("Current = %q, %v; want the atomically published generation", current, err)
 	}
 
-	restarted := newStore(s.cfg, s.blocks, objects, withNow(func() time.Time { return now }))
+	restarted := newStore(s.cfg, s.owner, s.blocks, objects, withNow(func() time.Time { return now }))
 	if err := restarted.PublishCAS(t.Context(), candidate.Key, "", candidate, lease, fence); err != nil {
 		t.Fatalf("retry after process restart did not recognise the committed publication: %v", err)
 	}

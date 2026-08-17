@@ -366,10 +366,42 @@ func TestSpotNeedsAnInterruptionQueue(t *testing.T) {
 func TestAValidSpotInterruptionQueueLoads(t *testing.T) {
 	body := cloudConfig(t, "    region: us-west-2\n", "    region: us-west-2\n"+
 		"    spot: true\n"+
-		"    interruption_queue_url: https://sqs.us-west-2.amazonaws.com/123456789012/billet\n")
+		"    interruption_queue_url: https://sqs.us-west-2.amazonaws.com/123456789012/aws-1\n")
 
 	if _, err := Load(writeConfig(t, body)); err != nil {
 		t.Fatalf("a valid interruption queue was refused: %v", err)
+	}
+}
+
+func TestASpotQueueIsDedicatedToTheConfiguredNode(t *testing.T) {
+	body := cloudConfig(t, "    region: us-west-2\n", "    region: us-west-2\n"+
+		"    spot: true\n"+
+		"    interruption_queue_url: https://sqs.us-west-2.amazonaws.com/123456789012/shared\n")
+
+	got := loadErr(t, body)
+	if !strings.Contains(got, "exactly the effective node name") {
+		t.Fatalf("shared queue error does not explain the per-node name: %s", got)
+	}
+}
+
+func TestASpotQueueDefersItsNameCheckToTheCertificateIdentity(t *testing.T) {
+	body := cloudConfig(t, "    region: us-west-2\n", "    region: us-west-2\n"+
+		"    spot: true\n"+
+		"    interruption_queue_url: https://sqs.us-west-2.amazonaws.com/123456789012/cert-node\n")
+	body = strings.Replace(body, "  name: aws-1\n", "", 1)
+	body = strings.Replace(body, "  server_addr: 127.0.0.1:7717\n",
+		"  server_addr: 10.0.0.4:7717\n", 1)
+	body = strings.Replace(body, "  listen: 127.0.0.1:7717\n",
+		"  listen: 0.0.0.0:7717\n", 1)
+	body = strings.Replace(body, "  state_dir: /var/lib/billet/node\n",
+		"  state_dir: /var/lib/billet/node\n"+
+			"  tls:\n"+
+			"    cert: /etc/billet/tls/node.crt\n"+
+			"    key: /etc/billet/tls/node.key\n"+
+			"    ca: /etc/billet/tls/ca.crt\n", 1)
+
+	if _, err := Load(writeConfig(t, body)); err != nil {
+		t.Fatalf("a Spot queue whose name comes from the certificate was refused early: %v", err)
 	}
 }
 
@@ -381,6 +413,17 @@ func TestAnInterruptionQueueCannotReceiveCredentialsOverPlaintext(t *testing.T) 
 	got := loadErr(t, body)
 	if !strings.Contains(got, "https") {
 		t.Errorf("the error does not explain that the signed queue request needs https: %s", got)
+	}
+}
+
+func TestAnInterruptionQueueMustBeInTheEC2Region(t *testing.T) {
+	body := cloudConfig(t, "    region: us-west-2\n", "    region: us-west-2\n"+
+		"    spot: true\n"+
+		"    interruption_queue_url: https://sqs.us-east-1.amazonaws.com/123456789012/billet\n")
+
+	got := loadErr(t, body)
+	if !strings.Contains(got, "us-west-2") {
+		t.Errorf("the error does not name the region used to sign the queue request: %s", got)
 	}
 }
 

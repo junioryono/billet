@@ -71,7 +71,7 @@ func New(cfg config.EBSS3Config, owner string, credentials CredentialSource) (*S
 	blocks := newEBSAPI(cfg, owner, credentials, httpClient, ebsEndpoint, now, waitContext)
 	objects := newS3API(cfg, credentials, httpClient, s3Endpoint, now)
 
-	return newStore(cfg, blocks, objects), nil
+	return newStore(cfg, owner, blocks, objects), nil
 }
 
 func nilCredentialSource(credentials CredentialSource) bool {
@@ -362,16 +362,27 @@ func (e *ebsAPI) ownership(values url.Values, resource string) {
 	values.Set("TagSpecification.1.Tag.2.Value", e.owner)
 }
 
+func (e *ebsAPI) callIdempotent(ctx context.Context, values url.Values, output any) error {
+	err := e.call(ctx, values, output)
+	if err == nil || ctx.Err() != nil {
+		return err
+	}
+
+	return e.call(ctx, values, output)
+}
+
 func (e *ebsAPI) CreateVolume(
 	ctx context.Context,
 	snapshot string,
 	sizeBytes int64,
+	token string,
 ) (string, error) {
 	values := url.Values{
 		"Action":           {"CreateVolume"},
 		"AvailabilityZone": {e.cfg.AvailabilityZone},
 		"Encrypted":        {"true"},
 		"VolumeType":       {"gp3"},
+		"ClientToken":      {token},
 	}
 	if snapshot == "" {
 		const gib = int64(1 << 30)
@@ -386,7 +397,7 @@ func (e *ebsAPI) CreateVolume(
 	var result struct {
 		ID string `xml:"volumeId"`
 	}
-	if err := e.call(ctx, values, &result); err != nil {
+	if err := e.callIdempotent(ctx, values, &result); err != nil {
 		return "", err
 	}
 	if !strings.HasPrefix(result.ID, "vol-") {
@@ -427,8 +438,58 @@ func (e *ebsAPI) waitVolume(ctx context.Context, id, wanted string) error {
 	}
 }
 
+type resourceTag struct {
+	Key   string `xml:"key"`
+	Value string `xml:"value"`
+}
+
+func (e *ebsAPI) owned(tags []resourceTag) bool {
+	deployment, cache := false, false
+	for _, tag := range tags {
+		switch tag.Key {
+		case ownerTag:
+			deployment = tag.Value == e.deploymentOwner
+		case cacheOwnerTag:
+			cache = tag.Value == e.owner
+		}
+	}
+
+	return deployment && cache
+}
+
+func (e *ebsAPI) volumeOwned(ctx context.Context, id string) (bool, bool, error) {
+	var result struct {
+		Volumes []struct {
+			ID   string        `xml:"volumeId"`
+			Tags []resourceTag `xml:"tagSet>item"`
+		} `xml:"volumeSet>item"`
+	}
+	err := e.call(ctx, url.Values{
+		"Action": {"DescribeVolumes"}, "VolumeId.1": {id},
+	}, &result)
+	if awsCode(err) == "InvalidVolume.NotFound" {
+		return false, false, nil
+	}
+	if err != nil {
+		return false, false, err
+	}
+	if len(result.Volumes) != 1 || result.Volumes[0].ID != id {
+		return false, false, fmt.Errorf("ebs-s3: volume %s was not uniquely described", id)
+	}
+
+	return e.owned(result.Volumes[0].Tags), true, nil
+}
+
 func (e *ebsAPI) DeleteVolume(ctx context.Context, id string) error {
-	err := e.call(ctx, url.Values{"Action": {"DeleteVolume"}, "VolumeId": {id}}, nil)
+	owned, found, err := e.volumeOwned(ctx, id)
+	if err != nil || !found {
+		return err
+	}
+	if !owned {
+		return fmt.Errorf("ebs-s3: refusing to delete volume %s without this store's ownership tags", id)
+	}
+
+	err = e.call(ctx, url.Values{"Action": {"DeleteVolume"}, "VolumeId": {id}}, nil)
 	if awsCode(err) == "InvalidVolume.NotFound" {
 		return nil
 	}
@@ -440,17 +501,19 @@ func (e *ebsAPI) CreateSnapshot(
 	ctx context.Context,
 	volume string,
 	now time.Time,
+	token string,
 ) (string, error) {
 	values := url.Values{
 		"Action":      {"CreateSnapshot"},
 		"VolumeId":    {volume},
 		"Description": {"billet cache generation " + now.UTC().Format(time.RFC3339)},
+		"ClientToken": {token},
 	}
 	e.ownership(values, "snapshot")
 	var result struct {
 		ID string `xml:"snapshotId"`
 	}
-	if err := e.call(ctx, values, &result); err != nil {
+	if err := e.callIdempotent(ctx, values, &result); err != nil {
 		return "", err
 	}
 	if !strings.HasPrefix(result.ID, "snap-") {
@@ -464,9 +527,10 @@ func (e *ebsAPI) CreateSnapshot(
 }
 
 type snapshotItem struct {
-	ID      string    `xml:"snapshotId"`
-	State   string    `xml:"status"`
-	Created time.Time `xml:"startTime"`
+	ID      string        `xml:"snapshotId"`
+	State   string        `xml:"status"`
+	Created time.Time     `xml:"startTime"`
+	Tags    []resourceTag `xml:"tagSet>item"`
 }
 
 type snapshotPage struct {
@@ -550,7 +614,21 @@ func (e *ebsAPI) ListSnapshots(ctx context.Context) ([]snapshotInfo, error) {
 }
 
 func (e *ebsAPI) DeleteSnapshot(ctx context.Context, id string) error {
-	err := e.call(ctx, url.Values{"Action": {"DeleteSnapshot"}, "SnapshotId": {id}}, nil)
+	page, err := e.describeSnapshots(ctx, url.Values{"SnapshotId.1": {id}})
+	if awsCode(err) == "InvalidSnapshot.NotFound" {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if len(page.Snapshots) != 1 || page.Snapshots[0].ID != id {
+		return fmt.Errorf("ebs-s3: snapshot %s was not uniquely described", id)
+	}
+	if !e.owned(page.Snapshots[0].Tags) {
+		return fmt.Errorf("ebs-s3: refusing to delete snapshot %s without this store's ownership tags", id)
+	}
+
+	err = e.call(ctx, url.Values{"Action": {"DeleteSnapshot"}, "SnapshotId": {id}}, nil)
 	if awsCode(err) == "InvalidSnapshot.NotFound" {
 		return nil
 	}
