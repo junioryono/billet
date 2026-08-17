@@ -27,13 +27,16 @@
   connection: local
   gather_facts: false
   vars:
-    billet_development_caddy_bin: "{{ playbook_dir }}/fixtures/fake-development-tool.sh"
-    billet_development_mkcert_bin: "{{ playbook_dir }}/fixtures/fake-development-tool.sh"
-    billet_development_terraform_bin: "{{ playbook_dir }}/fixtures/fake-development-tool.sh"
     billet_development_install_terraform: true
     billet_development_caddy_min_version: "2.7.0"
     billet_development_terraform_min_version: "1.12.0"
   tasks:
+    - name: Point development tool probes at the fixture
+      ansible.builtin.set_fact:
+        billet_development_caddy_bin: "{{ playbook_dir }}/fixtures/fake-development-tool.sh"
+        billet_development_mkcert_bin: "{{ playbook_dir }}/fixtures/fake-development-tool.sh"
+        billet_development_terraform_bin: "{{ playbook_dir }}/fixtures/fake-development-tool.sh"
+
     - name: Exercise development tool verification
       ansible.builtin.include_role:
         name: junioryono.billet.development_host
