@@ -168,7 +168,7 @@ func (r *Runner) adopt(lease *alloc.Lease, inst *provider.Instance) {
 // second runner, and a completion can never find the entry at all.
 func (r *Runner) hold(lease *alloc.Lease, name string, requestID int64) {
 	// FAILED, not done. This lease's job never started.
-	r.holdWithOutcome(lease, name, requestID, alloc.PhaseFailed)
+	r.holdWithOutcome(lease, name, requestID, alloc.PhaseFailed, false)
 }
 
 // holdWithOutcome is hold for a job whose outcome is already known.
@@ -180,7 +180,9 @@ func (r *Runner) hold(lease *alloc.Lease, name string, requestID int64) {
 // stopped. Writing "failed" for the second would put a lie in job_history for
 // every job that completed normally on an EC2 host, and an investigation reading
 // it would see a fleet where nothing ever succeeded.
-func (r *Runner) holdWithOutcome(lease *alloc.Lease, name string, requestID int64, outcome alloc.Phase) {
+func (r *Runner) holdWithOutcome(
+	lease *alloc.Lease, name string, requestID int64, outcome alloc.Phase, observed bool,
+) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -193,12 +195,10 @@ func (r *Runner) holdWithOutcome(lease *alloc.Lease, name string, requestID int6
 		outcome:   outcome,
 		phase:     alloc.PhaseTeardown,
 		since:     r.now(),
-		// NOT observed, even for a teardown of an instance billet launched and
-		// holds an id for. The grace before an absence is believed is what stops an
-		// eventually-consistent DescribeInstances (#48) from proving the guest is
-		// gone when it is merely not visible yet — and that is exactly the window a
-		// destroy shortly after a launch lands in. An instance that IS visible sets
-		// this on the first tick and costs nothing.
+		// An ambiguous launch has not been observed and needs the grace before an
+		// absence is believed. A normal teardown starts from an instance billet
+		// already tracked, so its first absence proves that known compute is gone.
+		observed: observed,
 	}
 	entry.epoch.Store(lease.Epoch)
 

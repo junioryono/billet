@@ -379,6 +379,37 @@ func TestAnAcceptedTeardownHoldsTheCapacityUntilTheComputeIsProvablyGone(t *test
 	}
 }
 
+// A known-running instance does not need the stray-launch grace after teardown.
+//
+// The grace protects an AMBIGUOUS launch whose create may still be in flight when
+// the first inventory read sees nothing. A normal completion starts from an
+// instance billet already launched and tracked. If EC2 finishes terminating it
+// before the first custody sweep, the first absence is already proof it is gone;
+// waiting five minutes needlessly leaves the whole node unable to accept work.
+func TestAFastAcceptedTeardownReleasesOnTheFirstAbsentInventory(t *testing.T) {
+	p := &fakeProvider{kind: config.ProviderDocker, asyncTeardown: true}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
+	lease := assignedLease(t, a)
+
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	if err := r.Destroy(t.Context(), 11); !errors.Is(err, server.ErrCustody) {
+		t.Fatalf("Destroy = %v, want ErrCustody", err)
+	}
+
+	// The backend finishes before Tend gets its first look at the custody entry.
+	p.settle(provider.InstanceName(lease.ID))
+
+	if err := r.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend after the known-running instance stopped: %v", err)
+	}
+	if _, err := a.Lease(t.Context(), lease.ID); !errors.Is(err, alloc.ErrLeaseNotFound) {
+		t.Fatalf("the first absent inventory kept a known-running instance's lease: %v", err)
+	}
+}
+
 // A held teardown is visible in the ledger, and a force release is delivered to
 // the live node through its heartbeat. The node drops custody before the lease
 // becomes terminal; it does not need a working provider read after an operator
@@ -542,7 +573,7 @@ func TestARequestWithBothCustodyAndARunningInstanceStillDestroysTheRunningOne(t 
 	if err := a.Advance(t.Context(), adopted.ID, adopted.Epoch, alloc.PhaseLaunching); err != nil {
 		t.Fatalf("Advance adopted lease: %v", err)
 	}
-	r.holdWithOutcome(adopted, provider.InstanceName(adopted.ID), 11, alloc.PhaseDone)
+	r.holdWithOutcome(adopted, provider.InstanceName(adopted.ID), 11, alloc.PhaseDone, false)
 
 	// The running half: a different lease, for the same request.
 	second := assignedLease(t, a)
