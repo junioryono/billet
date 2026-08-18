@@ -2,11 +2,16 @@ package alloc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 
 	"github.com/junioryono/billet/internal/config"
 )
+
+// ErrEC2CostUnavailable means legacy registration data cannot support a fleet
+// cost bound. Capacity and lease status remain valid.
+var ErrEC2CostUnavailable = errors.New("EC2 cost report unavailable")
 
 // EC2CostNodes returns the declarations behind every registered EC2 node's
 // compute-cost ceiling. Registration survives liveness loss because the cloud
@@ -41,14 +46,14 @@ func (a *Allocator) EC2CostNodes(ctx context.Context) ([]config.EC2CostNode, err
 				return fmt.Errorf("alloc: read registered EC2 shapes for cost reporting: %w", err)
 			}
 			if len(node.InstanceTypes) == 0 {
-				return fmt.Errorf("alloc: a registered EC2 node has no shape catalogue; " +
-					"restart it with the current billet version so it re-registers its prices")
+				return fmt.Errorf("%w: registered node %q has no shape catalogue; restart it with "+
+					"the current billet version if it is still active", ErrEC2CostUnavailable, name)
 			}
 			for i := range node.InstanceTypes {
 				if node.InstanceTypes[i].PriceUSDPerHour <= 0 {
-					return fmt.Errorf("alloc: a registered EC2 node has no price for shape %q; "+
-						"restart it with the current billet version so it re-registers its prices",
-						node.InstanceTypes[i].Type)
+					return fmt.Errorf("%w: registered node %q has no price for shape %q; restart it "+
+						"with the current billet version if it is still active", ErrEC2CostUnavailable,
+						name, node.InstanceTypes[i].Type)
 				}
 			}
 			prices[name] = make(map[string]config.USDPerHour, len(node.InstanceTypes))
@@ -84,8 +89,8 @@ func (a *Allocator) EC2CostNodes(ctx context.Context) ([]config.EC2CostNode, err
 			}
 			price, ok := prices[name][instanceType]
 			if !ok || price <= 0 {
-				return fmt.Errorf("alloc: outstanding EC2 work on node %q uses unknown shape %q",
-					name, instanceType)
+				return fmt.Errorf("%w: outstanding work on node %q uses unknown shape %q",
+					ErrEC2CostUnavailable, name, instanceType)
 			}
 			if count > math.MaxInt64/int64(price) {
 				return fmt.Errorf("alloc: outstanding EC2 price overflows the supported dollar amount")

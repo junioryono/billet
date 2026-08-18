@@ -2,6 +2,7 @@ package alloc
 
 import (
 	"database/sql"
+	"errors"
 	"testing"
 
 	"github.com/junioryono/billet/internal/config"
@@ -54,8 +55,8 @@ func TestEC2CostNodesRefusesARegistrationWithoutPrices(t *testing.T) {
 		t.Fatalf("RegisterNode: %v", err)
 	}
 
-	if _, err := a.EC2CostNodes(t.Context()); err == nil {
-		t.Fatal("EC2CostNodes accepted a registration without prices")
+	if _, err := a.EC2CostNodes(t.Context()); !errors.Is(err, ErrEC2CostUnavailable) {
+		t.Fatalf("EC2CostNodes error = %v, want ErrEC2CostUnavailable", err)
 	}
 }
 
@@ -71,8 +72,8 @@ func TestEC2CostNodesRefusesALegacyEmptyCatalogue(t *testing.T) {
 		t.Fatalf("insert legacy EC2 node: %v", err)
 	}
 
-	if _, err := a.EC2CostNodes(t.Context()); err == nil {
-		t.Fatal("EC2CostNodes accepted a legacy registration with no shape catalogue")
+	if _, err := a.EC2CostNodes(t.Context()); !errors.Is(err, ErrEC2CostUnavailable) {
+		t.Fatalf("EC2CostNodes error = %v, want ErrEC2CostUnavailable", err)
 	}
 }
 

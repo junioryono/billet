@@ -2144,6 +2144,11 @@ func cmdStatus(ctx context.Context, args []string) error {
 
 func printEC2FleetCost(ctx context.Context, a *alloc.Allocator, cfg *config.Config) error {
 	nodes, err := a.EC2CostNodes(ctx)
+	if errors.Is(err, alloc.ErrEC2CostUnavailable) {
+		fmt.Printf("ec2 peak  unavailable (%v)\n", err)
+
+		return nil
+	}
 	if err != nil {
 		return err
 	}
