@@ -27,9 +27,12 @@ The three launch-to-job-start samples were 47.609 seconds, 52.188 seconds and 58
 
 Those numbers put the current cold path under one minute. Billet's EC2 role is fallback capacity rather than the default place every job runs, so saving roughly forty seconds does not justify a standing pool of live, billable compute with no lease, unresolved trust reuse and a new teardown state. `warm_pool` therefore remains refused unless a materially different workload produces evidence that changes that trade.
 
+## Spot interruption
+
+A fourth private-repository workflow opted into Spot and stayed inside a five-minute observation step while AWS Fault Injection Service sent a two-minute `terminate` warning to its exact instance. EventBridge delivered the warning to that node's SQS queue. Billet observed it two seconds after FIS completed the action, durably wrote `ec2 spot interruption: terminate`, and asked EC2 to terminate one second later. The lease stayed charged while the instance was `shutting-down`, then archived as failed 89 seconds after the warning; the listener advertised replacement capacity 13 seconds later without launching unrequested compute. GitHub did not requeue the interrupted job; the original run failed after its runner disappeared. The acceptance configuration was then restored to on-demand, and the temporary FIS template, IAM role, EventBridge rule and SQS queue were deleted. No acceptance instance remained.
+
 ## What this does not prove
 
 - Same-label failover from preferred local capacity to EC2 remains issue #32. The EC2 half is proven; the test still has to withdraw the local contribution and observe the same label complete in the cloud.
-- A real EventBridge/SQS Spot interruption and its GitHub outcome remain issue #41.
 - The shape allowlist and resource ceilings are the enforceable cost policy. `billet check` reports a node's conservative compute-only peak, `billet status` aggregates registered EC2 nodes under the deployment ceiling, and AWS Budgets is the account-wide backstop rather than a stale copied price becoming a runtime admission gate.
 - EBS/S3 cache reuse and failure recovery remain part of the caching-plane issues.
