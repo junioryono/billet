@@ -22,13 +22,16 @@ import (
 )
 
 const (
-	cacheRequestLimit = 8 << 10
-	cacheKeyLimit     = 512
-	cacheWriterTTL    = 5 * time.Minute
-	cacheVolumeLimit  = int64(100 << 30)
-	dockerStoreKey    = "docker-images/"
-	publicationCAS    = "cas"
-	publicationLWW    = "last-write-wins"
+	cacheRequestLimit  = 8 << 10
+	cacheKeyLimit      = 512
+	cacheHandlerLimit  = 12 * time.Minute
+	cacheCleanupMargin = 30 * time.Second
+	cacheWorkLimit     = cacheHandlerLimit - cacheCleanupMargin
+	cacheWriterTTL     = 15 * time.Minute
+	cacheVolumeLimit   = int64(100 << 30)
+	dockerStoreKey     = "docker-images/"
+	publicationCAS     = "cas"
+	publicationLWW     = "last-write-wins"
 )
 
 // CacheService lets one authenticated microVM replace its reserved drive slots.
@@ -412,6 +415,9 @@ type attachCacheRequest struct {
 }
 
 func (s *CacheService) attach(w http.ResponseWriter, r *http.Request, session *cacheSession) {
+	ctx, cancel := context.WithTimeout(r.Context(), cacheWorkLimit)
+	defer cancel()
+
 	var request attachCacheRequest
 	if err := decodeCacheRequest(r.Body, &request); err != nil {
 		http.Error(w, "invalid cache request", http.StatusBadRequest)
@@ -435,7 +441,11 @@ func (s *CacheService) attach(w http.ResponseWriter, r *http.Request, session *c
 		return
 	}
 
-	session.mu.Lock()
+	if err := lockCacheSession(ctx, session); err != nil {
+		http.Error(w, "cache unavailable", http.StatusServiceUnavailable)
+
+		return
+	}
 	defer session.mu.Unlock()
 	if session.closed {
 		http.Error(w, "cache session has ended", http.StatusGone)
@@ -459,10 +469,10 @@ func (s *CacheService) attach(w http.ResponseWriter, r *http.Request, session *c
 	}
 
 	key := s.qualifiedKey(request.Key)
-	volume, err := s.store.Clone(r.Context(), key, "")
+	volume, err := s.store.Clone(ctx, key, "")
 	cold := errors.Is(err, storecontract.ErrMiss)
 	if cold {
-		volume, err = s.store.Create(r.Context(), key, request.SizeBytes)
+		volume, err = s.store.Create(ctx, key, request.SizeBytes)
 	}
 
 	if err != nil {
@@ -475,7 +485,7 @@ func (s *CacheService) attach(w http.ResponseWriter, r *http.Request, session *c
 
 	session.slots[slot] = &cacheAttachment{Volume: volume, Publication: request.Publication}
 	if err := s.persistSession(session); err != nil {
-		discardErr := s.store.Discard(r.Context(), volume)
+		discardErr := s.store.Discard(ctx, volume)
 		var retryErr error
 		if discardErr == nil {
 			session.slots[slot] = nil
@@ -495,11 +505,11 @@ func (s *CacheService) attach(w http.ResponseWriter, r *http.Request, session *c
 	// DURABLE BEFORE ATTACH. A provider call can succeed and lose its response;
 	// if the process dies in that window, this record is the only fact that lets
 	// restart cleanup find the mapped device and its storage handle.
-	if err := s.attacher.AttachVolume(r.Context(), session.instance, slot, volume.Device); err != nil {
-		detachErr := s.attacher.DetachVolume(r.Context(), session.instance, slot, volume.Device)
+	if err := s.attacher.AttachVolume(ctx, session.instance, slot, volume.Device); err != nil {
+		detachErr := s.attacher.DetachVolume(ctx, session.instance, slot, volume.Device)
 		var discardErr, clearErr error
 		if detachErr == nil {
-			discardErr = s.store.Discard(r.Context(), volume)
+			discardErr = s.store.Discard(ctx, volume)
 			if discardErr == nil {
 				session.slots[slot] = nil
 				clearErr = s.persistSession(session)
@@ -534,7 +544,16 @@ func (s *CacheService) commit(w http.ResponseWriter, r *http.Request, session *c
 		return
 	}
 
-	session.mu.Lock()
+	// Storage cleanup deliberately survives cancellation for at most
+	// cacheCleanupMargin, so work stops early enough for the whole handler to stay
+	// inside cacheHandlerLimit and the action's client deadline.
+	ctx, cancel := context.WithTimeout(r.Context(), cacheWorkLimit)
+	defer cancel()
+	if err := lockCacheSession(ctx, session); err != nil {
+		s.nonFatalCommit(w, session, "wait for session", err)
+
+		return
+	}
 	defer session.mu.Unlock()
 	if session.closed {
 		http.Error(w, "cache session has ended", http.StatusGone)
@@ -560,7 +579,7 @@ func (s *CacheService) commit(w http.ResponseWriter, r *http.Request, session *c
 		attachment.Volume.Filesystem = request.Filesystem
 	}
 
-	if err := s.attacher.DetachVolume(r.Context(), session.instance, slot,
+	if err := s.attacher.DetachVolume(ctx, session.instance, slot,
 		attachment.Volume.Device); err != nil {
 		s.nonFatalCommit(w, session, "detach", err)
 
@@ -568,7 +587,7 @@ func (s *CacheService) commit(w http.ResponseWriter, r *http.Request, session *c
 	}
 
 	if session.trust != provider.TrustTrusted {
-		if err := s.store.Discard(r.Context(), attachment.Volume); err != nil {
+		if err := s.store.Discard(ctx, attachment.Volume); err != nil {
 			s.nonFatalCommit(w, session, "discard untrusted write", err)
 
 			return
@@ -585,14 +604,14 @@ func (s *CacheService) commit(w http.ResponseWriter, r *http.Request, session *c
 		return
 	}
 
-	lease, fence, err := s.acquireWriter(r.Context(), attachment, session.instance)
+	lease, fence, err := s.acquireWriter(ctx, attachment, session.instance)
 	if err != nil {
 		s.nonFatalCommit(w, session, "acquire writer", err)
 
 		return
 	}
 
-	candidate, err := s.store.Snapshot(r.Context(), attachment.Volume)
+	candidate, err := s.store.Snapshot(ctx, attachment.Volume)
 	if err != nil {
 		s.nonFatalCommit(w, session, "snapshot", err)
 
@@ -608,7 +627,7 @@ func (s *CacheService) commit(w http.ResponseWriter, r *http.Request, session *c
 		return
 	}
 
-	if err := s.publish(r.Context(), attachment, candidate, lease, fence); err != nil {
+	if err := s.publish(ctx, attachment, candidate, lease, fence); err != nil {
 		s.nonFatalCommit(w, session, "publish", err)
 
 		return
@@ -617,6 +636,21 @@ func (s *CacheService) commit(w http.ResponseWriter, r *http.Request, session *c
 	writeCacheJSON(w, http.StatusOK, map[string]any{
 		"published": true, "generation": candidate.Generation,
 	})
+}
+
+func lockCacheSession(ctx context.Context, session *cacheSession) error {
+	for !session.mu.TryLock() {
+		timer := time.NewTimer(10 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+
+	return nil
 }
 
 func (s *CacheService) acquireWriter(

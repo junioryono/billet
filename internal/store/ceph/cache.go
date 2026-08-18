@@ -23,6 +23,8 @@ const (
 	cacheVolumeTTL       = 7 * time.Hour
 	cacheMetaPrefix      = "billet.cache."
 	filesystemProbeLimit = 8 << 10
+	maxCacheCloneDepth   = 8
+	cacheCompactionLimit = 10 * time.Minute
 )
 
 var _ storecontract.Store = (*Client)(nil)
@@ -346,6 +348,16 @@ func (c *Client) snapshotAt(
 		return storecontract.Candidate{}, err
 	}
 
+	depth, err := c.nextCacheCloneDepth(ctx, volume)
+	if err != nil {
+		return storecontract.Candidate{}, err
+	}
+	if err := c.withCacheLock(ctx, now, func() error {
+		return c.metaSet(ctx, volume.Handle, cacheMetaPrefix+"used_at",
+			now.UTC().Format(time.RFC3339Nano))
+	}); err != nil {
+		return storecontract.Candidate{}, err
+	}
 	if err := c.unmapDevice(ctx, volume.Device, volume.Handle); err != nil {
 		return storecontract.Candidate{}, err
 	}
@@ -368,20 +380,29 @@ func (c *Client) snapshotAt(
 	}
 
 	handle := c.cfg.CachePool + "/" + candidateName
-	if _, err := c.rbdCmd(ctx, false, "clone", stage, handle); err != nil {
-		return storecontract.Candidate{}, c.cleanupSnapshotFailure(ctx, volume, stage, handle,
-			fmt.Errorf("ceph: clone immutable candidate for %q: %w", volume.Key, err))
-	}
+	if depth >= maxCacheCloneDepth {
+		if err := c.copyCacheCandidate(ctx, stage, handle, generation); err != nil {
+			return storecontract.Candidate{}, c.cleanupSnapshotFailure(
+				ctx, volume, stage, handle, err,
+			)
+		}
+		depth = 0
+	} else {
+		if _, err := c.rbdCmd(ctx, false, "clone", stage, handle); err != nil {
+			return storecontract.Candidate{}, c.cleanupSnapshotFailure(ctx, volume, stage, handle,
+				fmt.Errorf("ceph: clone immutable candidate for %q: %w", volume.Key, err))
+		}
 
-	ready := handle + "@" + generation
-	if _, err := c.rbdCmd(ctx, false, "snap", "create", ready); err != nil {
-		return storecontract.Candidate{}, c.cleanupSnapshotFailure(ctx, volume, stage, handle,
-			fmt.Errorf("ceph: freeze immutable candidate for %q: %w", volume.Key, err))
+		if _, err := c.rbdCmd(ctx, false, "snap", "create", handle+"@"+generation); err != nil {
+			return storecontract.Candidate{}, c.cleanupSnapshotFailure(ctx, volume, stage, handle,
+				fmt.Errorf("ceph: freeze immutable candidate for %q: %w", volume.Key, err))
+		}
 	}
 
 	for key, value := range map[string]string{
 		cacheMetaPrefix + "key":        cacheDigest(volume.Key),
 		cacheMetaPrefix + "generation": generation,
+		cacheMetaPrefix + "lineage":    strconv.Itoa(depth),
 		cacheMetaPrefix + "used_at":    now.UTC().Format(time.RFC3339Nano),
 	} {
 		if err := c.metaSet(ctx, handle, key, value); err != nil {
@@ -394,11 +415,29 @@ func (c *Client) snapshotAt(
 			fmt.Errorf("ceph: remove cache staging snapshot: %w", err))
 	}
 
-	if err := c.removeCacheImage(ctx, volume.Handle); err != nil {
+	if err := c.retireCacheImage(ctx, volume.Handle); err != nil {
 		return storecontract.Candidate{}, c.cleanupSnapshotFailure(ctx, volume, "", handle, err)
 	}
 	if volume.Lease.ID != "" {
 		if err := c.withCacheLock(ctx, now, func() error {
+			var pointer cachePointer
+			ok, err := c.readJSON(ctx, pointerKey(volume.Key), &pointer)
+			if err != nil {
+				return err
+			}
+			// REFRESH BEFORE RELEASING THE ACTIVE LEASE. Eviction takes this same
+			// lock, so the expected pointer remains protected through the bounded
+			// Snapshot-to-PublishCAS handoff even after a long-running job.
+			if ok && pointer.Generation == volume.Generation {
+				pointer.UsedAt = now.UTC()
+				if pointer.RetentionHours == 0 {
+					pointer.RetentionHours = retentionHours(volume.Key)
+				}
+				if err := c.writeJSON(ctx, pointerKey(volume.Key), pointer); err != nil {
+					return err
+				}
+			}
+
 			return c.metaRemove(ctx, c.cacheIndex(), activeKey(volume.Lease.ID))
 		}); err != nil {
 			return storecontract.Candidate{}, c.cleanupSnapshotFailure(ctx, volume, "", handle, err)
@@ -408,6 +447,63 @@ func (c *Client) snapshotAt(
 	return storecontract.Candidate{
 		Key: volume.Key, Generation: generation, Handle: handle, Filesystem: filesystem,
 	}, nil
+}
+
+func (c *Client) nextCacheCloneDepth(ctx context.Context, volume storecontract.Volume) (int, error) {
+	if volume.Generation == "" {
+		return 1, nil
+	}
+
+	depth := maxCacheCloneDepth
+	err := c.withCacheLock(ctx, time.Now(), func() error {
+		value, found, err := c.metaGet(ctx, volume.Handle, cacheMetaPrefix+"lineage")
+		if err != nil {
+			return err
+		}
+		if !found {
+			// A writable clone made before lineage was recorded is compacted rather
+			// than assigned a guessed depth.
+			return nil
+		}
+
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed < 0 || parsed > maxCacheCloneDepth {
+			return fmt.Errorf("ceph: cache %q generation %q has invalid lineage depth %q",
+				volume.Key, volume.Generation, bounded(value))
+		}
+		depth = parsed + 1
+
+		return nil
+	})
+
+	return depth, err
+}
+
+func (c *Client) copyCacheCandidate(
+	ctx context.Context,
+	source, destination, generation string,
+) error {
+	// COPY DIRECTLY FROM THE VERIFIED STAGING SNAPSHOT. Making an intermediate
+	// clone first would cross the depth limit before the copy had a chance to
+	// compact it. The published pointer remains unchanged throughout.
+	if err := c.copyCacheImage(ctx, source, destination); err != nil {
+		return err
+	}
+	if _, err := c.rbdCmd(ctx, false, "snap", "create", destination+"@"+generation); err != nil {
+		return fmt.Errorf("ceph: freeze compacted cache candidate: %w", err)
+	}
+
+	return nil
+}
+
+func (c *Client) copyCacheImage(ctx context.Context, source, destination string) error {
+	copyCtx, cancelCopy := context.WithTimeout(ctx, cacheCompactionLimit)
+	defer cancelCopy()
+	if _, err := c.run(copyCtx, c.bin, append(c.identity(), "cp", source, destination)); err != nil {
+		return fmt.Errorf("ceph: compact cache lineage: %w", err)
+	}
+
+	return nil
 }
 
 func (c *Client) cleanupSnapshotFailure(
@@ -573,6 +669,8 @@ func (c *Client) Clone(
 	var pointer cachePointer
 	var active cacheActive
 	var leaseID string
+	cloneDepth := 0
+	copySource := false
 
 	err := c.withCacheLock(ctx, now, func() error {
 		metadataKey := pointerKey(key)
@@ -587,6 +685,24 @@ func (c *Client) Clone(
 
 		if !ok {
 			return fmt.Errorf("%w: site has no generation for cache %q", storecontract.ErrMiss, key)
+		}
+
+		value, found, err := c.metaGet(ctx, pointer.Handle, cacheMetaPrefix+"lineage")
+		if err != nil {
+			return err
+		}
+		if !found {
+			// A generation from before lineage tracking may already be at Ceph's
+			// hard clone-depth limit. Copy it before making another child.
+			copySource = true
+		} else {
+			parsed, parseErr := strconv.Atoi(value)
+			if parseErr != nil || parsed < 0 || parsed > maxCacheCloneDepth {
+				return fmt.Errorf("ceph: cache %q generation %q has invalid lineage depth %q",
+					key, pointer.Generation, bounded(value))
+			}
+			copySource = parsed >= maxCacheCloneDepth
+			cloneDepth = parsed + 1
 		}
 
 		pointer.UsedAt = now.UTC()
@@ -628,29 +744,59 @@ func (c *Client) Clone(
 	}
 
 	handle := c.cfg.CachePool + "/" + cloneName
-	if _, err := c.rbdCmd(ctx, false, "clone", pointer.Handle+"@"+pointer.Generation,
-		handle); err != nil {
-		c.dropActiveBestEffort(ctx, leaseID)
-
+	source := pointer.Handle + "@" + pointer.Generation
+	if copySource {
+		err = c.copyCacheImage(ctx, source, handle)
+		cloneDepth = 0
+	} else {
+		_, err = c.rbdCmd(ctx, false, "clone", source, handle)
+	}
+	if err != nil {
 		if isNoSuchFile(err) {
-			return storecontract.Volume{}, fmt.Errorf("%w: cache %q generation disappeared before clone",
-				storecontract.ErrMiss, key)
+			return storecontract.Volume{}, c.cleanupCloneFailure(ctx, leaseID, handle,
+				fmt.Errorf("%w: cache %q generation disappeared before clone",
+					storecontract.ErrMiss, key))
 		}
 
-		return storecontract.Volume{}, fmt.Errorf("ceph: clone cache %q: %w", key, err)
+		return storecontract.Volume{}, c.cleanupCloneFailure(ctx, leaseID, handle,
+			fmt.Errorf("ceph: materialize cache %q: %w", key, err))
+	}
+	if err := c.metaSet(ctx, handle, cacheMetaPrefix+"lineage", strconv.Itoa(cloneDepth)); err != nil {
+		return storecontract.Volume{}, c.cleanupCloneFailure(ctx, leaseID, handle, err)
 	}
 
 	device, err := c.mapCache(ctx, handle)
 	if err != nil {
-		c.dropActiveBestEffort(ctx, leaseID)
-
-		return storecontract.Volume{}, errors.Join(err, c.removeCacheImage(ctx, handle))
+		return storecontract.Volume{}, c.cleanupCloneFailure(ctx, leaseID, handle, err)
 	}
 
 	return storecontract.Volume{
 		Key: key, Generation: pointer.Generation, Handle: handle, Device: device,
 		Lease: storecontract.ActiveLease{ID: leaseID, Expires: active.Expires},
 	}, nil
+}
+
+func (c *Client) cleanupCloneFailure(
+	ctx context.Context,
+	leaseID, handle string,
+	primary error,
+) error {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.wait)
+	defer cancel()
+
+	volume := storecontract.Volume{
+		Handle: handle,
+		Lease:  storecontract.ActiveLease{ID: leaseID},
+	}
+	cleanupErr := c.Discard(cleanupCtx, volume)
+	if cleanupErr != nil {
+		// A miss is safe to replace with a fresh volume only after cleanup
+		// succeeded. Do not leave ErrMiss in the error chain when an orphan may
+		// remain, or the attach path will hide this failure by creating again.
+		return fmt.Errorf("ceph: clean up failed clone after %s: %w", primary.Error(), cleanupErr)
+	}
+
+	return primary
 }
 
 // RenewActive extends the protection of a mounted cache clone.
@@ -716,20 +862,17 @@ func (c *Client) Discard(ctx context.Context, volume storecontract.Volume) error
 	return nil
 }
 
-func (c *Client) dropActiveBestEffort(ctx context.Context, id string) {
-	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.wait)
-	defer cancel()
-
-	if cleanupErr := c.withCacheLock(cleanupCtx, time.Now(), func() error {
-		return c.metaRemove(cleanupCtx, c.cacheIndex(), activeKey(id))
-	}); cleanupErr != nil {
-		return
-	}
-}
-
 func (c *Client) removeCacheImage(ctx context.Context, handle string) error {
 	if _, err := c.rbdCmd(ctx, false, "rm", handle); err != nil && !isNoSuchFile(err) {
 		return fmt.Errorf("ceph: remove cache volume %s: %w", handle, err)
+	}
+
+	return nil
+}
+
+func (c *Client) retireCacheImage(ctx context.Context, handle string) error {
+	if _, err := c.rbdCmd(ctx, false, "trash", "mv", handle); err != nil {
+		return fmt.Errorf("ceph: retire cache volume %s: %w", handle, err)
 	}
 
 	return nil
@@ -753,13 +896,29 @@ func (c *Client) Evict(ctx context.Context, olderThan time.Duration) error {
 		retention := map[string]time.Duration{}
 		generationMetadata := map[string][]string{}
 		for key, value := range metadata {
+			if !strings.HasPrefix(key, cacheMetaPrefix+"active.") {
+				continue
+			}
+
+			var active cacheActive
+			if json.Unmarshal([]byte(value), &active) != nil || !now.Before(active.Expires) {
+				if err := c.metaRemove(ctx, c.cacheIndex(), key); err != nil {
+					return err
+				}
+
+				continue
+			}
+
+			protected[active.Handle] = true
+		}
+		for key, value := range metadata {
 			switch {
 			case strings.HasPrefix(key, cacheMetaPrefix+"pointer."):
 				var pointer cachePointer
 				if json.Unmarshal([]byte(value), &pointer) == nil && pointer.Handle != "" {
 					age := retentionDuration(pointer, olderThan)
 					retention[pointer.Handle] = age
-					if now.Sub(pointer.UsedAt) < age {
+					if protected[pointer.Handle] || now.Sub(pointer.UsedAt) < age {
 						protected[pointer.Handle] = true
 					} else if err := c.metaRemove(ctx, c.cacheIndex(), key); err != nil {
 						return err
@@ -771,17 +930,6 @@ func (c *Client) Evict(ctx context.Context, olderThan time.Duration) error {
 					retention[generation.Handle] = retentionDuration(generation, olderThan)
 					generationMetadata[generation.Handle] = append(generationMetadata[generation.Handle], key)
 				}
-			case strings.HasPrefix(key, cacheMetaPrefix+"active."):
-				var active cacheActive
-				if json.Unmarshal([]byte(value), &active) != nil || !now.Before(active.Expires) {
-					if err := c.metaRemove(ctx, c.cacheIndex(), key); err != nil {
-						return err
-					}
-
-					continue
-				}
-
-				protected[active.Handle] = true
 			}
 		}
 
@@ -804,59 +952,135 @@ func (c *Client) Evict(ctx context.Context, olderThan time.Duration) error {
 			}
 		}
 
-		for _, name := range images {
-			if !strings.HasPrefix(name, "cache-g-") && !strings.HasPrefix(name, "cache-v-") {
-				continue
-			}
+		removed := map[string]bool{}
+		for {
+			progress := false
+			for _, name := range images {
+				if removed[name] {
+					continue
+				}
+				if !strings.HasPrefix(name, "cache-g-") && !strings.HasPrefix(name, "cache-v-") {
+					continue
+				}
 
-			handle := c.cfg.CachePool + "/" + name
-			if protected[handle] {
-				continue
-			}
+				handle := c.cfg.CachePool + "/" + name
+				if protected[handle] {
+					continue
+				}
 
-			usedAt, ok := cacheTimeFromName(name)
-			if value, found, readErr := c.metaGet(ctx, handle, cacheMetaPrefix+"used_at"); readErr != nil {
-				return readErr
-			} else if found {
-				if parsed, parseErr := time.Parse(time.RFC3339Nano, value); parseErr == nil {
-					usedAt, ok = parsed, true
+				usedAt, ok := cacheTimeFromName(name)
+				if value, found, readErr := c.metaGet(ctx, handle, cacheMetaPrefix+"used_at"); readErr != nil {
+					return readErr
+				} else if found {
+					if parsed, parseErr := time.Parse(time.RFC3339Nano, value); parseErr == nil {
+						usedAt, ok = parsed, true
+					}
+				}
+
+				age := olderThan
+				if specific := retention[handle]; specific > age {
+					age = specific
+				}
+				if !ok || now.Sub(usedAt) < age {
+					continue
+				}
+
+				mapped, err := c.mappedDevices(ctx, name)
+				if err != nil {
+					return err
+				}
+
+				if len(mapped) != 0 {
+					continue
+				}
+
+				if _, err := c.rbdCmd(ctx, false, "snap", "purge", handle); err != nil &&
+					!isNoSuchFile(err) {
+					return fmt.Errorf("ceph: purge snapshots of expired cache %s: %w", handle, err)
+				}
+
+				if err := c.removeCacheImage(ctx, handle); err != nil {
+					// A newer generation may still be a copy-on-write descendant. Keep
+					// this generation's metadata so a later dependency pass can retry it
+					// after the descendants and their retired writers are gone.
+					if isImageNotEmpty(err) {
+						continue
+					}
+
+					return err
+				}
+				removed[name] = true
+				progress = true
+				for _, key := range generationMetadata[handle] {
+					if err := c.metaRemove(ctx, c.cacheIndex(), key); err != nil {
+						return err
+					}
 				}
 			}
 
-			age := olderThan
-			if specific := retention[handle]; specific > age {
-				age = specific
-			}
-			if !ok || now.Sub(usedAt) < age {
-				continue
-			}
-
-			mapped, err := c.mappedDevices(ctx, name)
+			retiredProgress, err := c.purgeRetiredCacheImages(ctx)
 			if err != nil {
 				return err
 			}
+			if !progress && !retiredProgress {
+				return nil
+			}
+		}
+	})
+}
 
-			if len(mapped) != 0 {
+type cacheTrashImage struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+type exitCoder interface {
+	ExitCode() int
+}
+
+func isImageNotEmpty(err error) bool {
+	var exitError exitCoder
+
+	return errors.As(err, &exitError) && exitError.ExitCode() == 39
+}
+
+func (c *Client) purgeRetiredCacheImages(ctx context.Context) (bool, error) {
+	out, err := c.rbdCmd(ctx, true, "trash", "list", c.cfg.CachePool)
+	if err != nil {
+		return false, fmt.Errorf("ceph: list retired cache volumes: %w", err)
+	}
+
+	var images []cacheTrashImage
+	if err := json.Unmarshal(out, &images); err != nil || images == nil {
+		return false, fmt.Errorf("ceph: %s did not answer with a json trash list", c.bin)
+	}
+
+	removed := false
+	for _, image := range images {
+		if !strings.HasPrefix(image.Name, "cache-v-") {
+			continue
+		}
+		if image.ID == "" || strings.ContainsAny(image.ID, "/@") ||
+			strings.HasPrefix(image.ID, "-") || strings.TrimSpace(image.ID) != image.ID {
+			return false, errors.New("ceph: the cache trash contains an unusable image identity")
+		}
+
+		handle := c.cfg.CachePool + "/" + image.ID
+		if _, err := c.rbdCmd(ctx, false, "trash", "rm", handle); err != nil &&
+			!isNoSuchFile(err) {
+			// ENOTEMPTY (39) means a copy-on-write child still reads the retired
+			// parent. `rbd trash rm` prints different prose than `rbd rm`, so the
+			// errno is the stable part measured against both commands.
+			if isImageNotEmpty(err) {
 				continue
 			}
 
-			if _, err := c.rbdCmd(ctx, false, "snap", "purge", handle); err != nil &&
-				!isNoSuchFile(err) {
-				return fmt.Errorf("ceph: purge snapshots of expired cache %s: %w", handle, err)
-			}
-
-			if err := c.removeCacheImage(ctx, handle); err != nil {
-				return err
-			}
-			for _, key := range generationMetadata[handle] {
-				if err := c.metaRemove(ctx, c.cacheIndex(), key); err != nil {
-					return err
-				}
-			}
+			return false, fmt.Errorf("ceph: remove retired cache volume %s: %w", handle, err)
 		}
+		removed = true
+	}
 
-		return nil
-	})
+	return removed, nil
 }
 
 func retentionHours(key string) int {
