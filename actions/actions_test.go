@@ -133,12 +133,62 @@ func TestTheBuilderStarterIsExecutable(t *testing.T) {
 		t.Skip("Windows has no executable mode bit")
 	}
 
-	info, err := os.Stat(filepath.Join("setup-docker-builder", "start.sh"))
-	if err != nil {
-		t.Fatalf("Stat: %v", err)
+	for _, name := range []string{"resolve-policy.sh", "start.sh"} {
+		info, err := os.Stat(filepath.Join("setup-docker-builder", name))
+		if err != nil {
+			t.Errorf("Stat %s: %v", name, err)
+			continue
+		}
+		if info.Mode().Perm()&0o111 == 0 {
+			t.Errorf("%s is not executable", name)
+		}
 	}
-	if info.Mode().Perm()&0o111 == 0 {
-		t.Fatal("start.sh is not executable")
+}
+
+func TestBuilderPolicyUsesTierMountLimitOrDefault(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{name: "omitted", want: "21474836480"},
+		{name: "tier override", value: "4294967296", want: "4294967296"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			output := filepath.Join(t.TempDir(), "github-output")
+			cmd := exec.CommandContext(t.Context(), "bash", filepath.Join("setup-docker-builder", "resolve-policy.sh"))
+			cmd.Env = []string{"GITHUB_OUTPUT=" + output, "PATH=" + os.Getenv("PATH")}
+			if test.value != "" {
+				cmd.Env = append(cmd.Env, "BILLET_BUILDKIT_CACHE_MOUNT_LIMIT_BYTES="+test.value)
+			}
+			if combined, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("resolve policy: %v\n%s", err, combined)
+			}
+			body, err := os.ReadFile(output)
+			if err != nil {
+				t.Fatalf("read output: %v", err)
+			}
+			if want := "mount_limit_bytes=" + test.want + "\n"; string(body) != want {
+				t.Errorf("policy output %q, want %q", body, want)
+			}
+		})
+	}
+}
+
+func TestBuilderPolicyRefusesAnInvalidTierMountLimit(t *testing.T) {
+	output := filepath.Join(t.TempDir(), "github-output")
+	cmd := exec.CommandContext(t.Context(), "bash", filepath.Join("setup-docker-builder", "resolve-policy.sh"))
+	cmd.Env = []string{
+		"BILLET_BUILDKIT_CACHE_MOUNT_LIMIT_BYTES=not-bytes",
+		"GITHUB_OUTPUT=" + output,
+		"PATH=" + os.Getenv("PATH"),
+	}
+	combined, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("invalid tier policy was accepted:\n%s", combined)
+	}
+	if !strings.Contains(string(combined), "invalid BuildKit cache-mount ceiling") {
+		t.Fatalf("invalid tier policy produced no useful error:\n%s", combined)
 	}
 }
 
@@ -340,7 +390,11 @@ func TestTheTierMountLimitAndFailSafeDiscardAreWiredBetweenActions(t *testing.T)
 		t.Fatalf("read setup action: %v", err)
 	}
 	if !strings.Contains(string(setup),
-		"mount-limit-bytes: ${{ env.BILLET_BUILDKIT_CACHE_MOUNT_LIMIT_BYTES || '21474836480' }}") {
+		`run: "${{ github.action_path }}/resolve-policy.sh"`) {
+		t.Fatal("the builder does not resolve inherited tier policy inside the runner process")
+	}
+	if !strings.Contains(string(setup),
+		"mount-limit-bytes: ${{ steps.policy.outputs.mount_limit_bytes }}") {
 		t.Fatal("the tier's mount ceiling does not reach cleanup with a default for tiers that omit it")
 	}
 	if strings.Count(string(setup), "discard-marker: ${{ runner.temp }}/billet-buildkit-discard") != 2 {
