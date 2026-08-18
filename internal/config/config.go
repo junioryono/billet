@@ -1418,8 +1418,11 @@ func (t Tier) RunnerCommandFor(provider ProviderKind) []string {
 	if len(t.Command) > 0 {
 		return slices.Clone(t.Command)
 	}
-	if provider == ProviderFirecracker || provider == ProviderEC2 {
+	if provider == ProviderFirecracker {
 		return []string{"./billet-runner-service"}
+	}
+	if provider == ProviderEC2 {
+		return []string{"/usr/local/bin/billet-runner"}
 	}
 
 	return t.RunnerCommand()
@@ -3524,9 +3527,10 @@ const PollInterval = 15 * time.Second
 // relative because the stock image's working directory is the runner's home.
 //
 // The generic default remains GitHub's `run.sh`, which is what the Docker runner
-// image contains. RunnerCommandFor selects `./billet-runner-service` for
-// Firecracker and EC2, whose images billet builds with that wrapper, because it
-// preserves the one-job result code that their Docker-store lifecycle needs.
+// image contains. RunnerCommandFor selects `./billet-runner-service` for the
+// Firecracker image billet builds, and the full `/usr/local/bin/billet-runner`
+// entrypoint for EC2 because that script prepares and completes the cache around
+// the inner result-preserving wrapper.
 //
 // A self-hosted runner updates itself by EXITING: the listener returns "updating"
 // and the wrapper notices and re-execs it with the same arguments — including the JIT

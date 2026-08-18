@@ -1992,8 +1992,13 @@ func TestACompletionWhoseDestroyFailedIsRetried(t *testing.T) {
 	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
 
 	var failures atomic.Int32
+	var resultsMu sync.Mutex
+	var results []string
 
-	runner := &fakeRunner{onDestroy: func(int64) error {
+	runner := &fakeRunner{onDestroyCompleted: func(_ int64, result string) error {
+		resultsMu.Lock()
+		results = append(results, result)
+		resultsMu.Unlock()
 		if failures.Add(1) == 1 {
 			return errors.New("the docker daemon is not answering")
 		}
@@ -2001,12 +2006,16 @@ func TestACompletionWhoseDestroyFailedIsRetried(t *testing.T) {
 		return nil
 	}}
 
-	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner))
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner),
+		WithCleanupRetryPacing(0, 0))
 
 	holdRunning(t, l, a, tiers[0].Label, 7)
+	l.mu.Lock()
+	l.cleanup = map[int64]*pendingCleanup{7: {job: Job{RequestID: 7}}}
+	l.mu.Unlock()
 
 	// The first completion cannot destroy, so its capacity is held.
-	l.complete(t.Context(), Job{RequestID: 7})
+	l.complete(t.Context(), Job{RequestID: 7, Result: "succeeded"})
 
 	l.mu.Lock()
 	held := len(l.cleanup)
@@ -2026,6 +2035,11 @@ func TestACompletionWhoseDestroyFailedIsRetried(t *testing.T) {
 	if held != 0 {
 		t.Errorf("a completion whose destroy later succeeded is still pending (%d); its "+
 			"capacity is held for the life of the process", held)
+	}
+	resultsMu.Lock()
+	defer resultsMu.Unlock()
+	if len(results) != 2 || results[0] != "succeeded" || results[1] != "succeeded" {
+		t.Errorf("completion results across first destroy and retry = %v, want two succeeded", results)
 	}
 }
 

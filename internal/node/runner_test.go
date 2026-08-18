@@ -192,6 +192,20 @@ func TestDestroyRemovesWhatWasStarted(t *testing.T) {
 	}
 }
 
+func TestACompletionFindsTheCacheSessionOfAdoptedCompute(t *testing.T) {
+	t.Parallel()
+
+	r := &Runner{
+		running: map[int64]*provider.Instance{},
+		custody: map[string]*custody{
+			"lease-1": {name: "billet-adopted", requestID: 11},
+		},
+	}
+	if got := r.cacheInstanceForRequest(11); got != "billet-adopted" {
+		t.Fatalf("cache instance for adopted request = %q, want billet-adopted", got)
+	}
+}
+
 func TestASpotWarningFailsTheRightLeaseWithItsReason(t *testing.T) {
 	p := &fakeProvider{kind: config.ProviderDocker}
 	a, host := newAllocatorWithHost(t)

@@ -355,8 +355,9 @@ node:
   #
   # The guest requests its architecture-scoped Docker image store through this
   # API before starting the runner. The guest prepares changed state only after
-  # the pinned runner reports a clean success, and the node publishes it only
-  # after GitHub's completed-job message independently reports `succeeded`;
+  # the pinned runner reports a clean success. GitHub's completed-job message
+  # must independently report `succeeded` before the node opens the readiness
+  # route and later publishes it;
   # every other result is discarded. Published generations expire after eight
   # inactive days.
   cache:

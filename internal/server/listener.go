@@ -2637,6 +2637,12 @@ func (l *Listener) complete(ctx context.Context, job Job) {
 		_, held := l.running[job.RequestID]
 
 		if entry, ok := l.cleanup[job.RequestID]; ok {
+			// A heartbeat can create the obligation before GitHub's completion
+			// arrives. Keep the authoritative result so its retry takes the same
+			// result-dependent teardown path as this attempt.
+			if job.Result != "" {
+				entry.job = job
+			}
 			// A RETRY THAT FAILED AGAIN, so it waits longer before the next one.
 			entry.failed(time.Now(), l.retryFirst, l.retryMax)
 		} else if _, promised := l.acquiring[job.RequestID]; held || promised {

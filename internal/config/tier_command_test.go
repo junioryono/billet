@@ -32,12 +32,13 @@ func TestTheDefaultRunnerCommandKeepsTheSelfUpdateLoop(t *testing.T) {
 		t.Errorf("the generic runner command is %q, want the stock Docker-image service", got[0])
 	}
 
-	for _, provider := range []ProviderKind{ProviderFirecracker, ProviderEC2} {
-		got := (Tier{}).RunnerCommandFor(provider)
-		if len(got) != 1 || got[0] != "./billet-runner-service" {
-			t.Errorf("the %s runner command is %q; it must preserve hosted job results "+
-				"without dropping the self-update loop", provider, got)
-		}
+	if got := (Tier{}).RunnerCommandFor(ProviderFirecracker); len(got) != 1 ||
+		got[0] != "./billet-runner-service" {
+		t.Errorf("the Firecracker runner command is %q, want the packaged result-preserving wrapper", got)
+	}
+	if got := (Tier{}).RunnerCommandFor(ProviderEC2); len(got) != 1 ||
+		got[0] != "/usr/local/bin/billet-runner" {
+		t.Errorf("the EC2 runner command is %q, want the full cache-aware AMI entrypoint", got)
 	}
 }
 

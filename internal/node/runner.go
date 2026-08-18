@@ -458,18 +458,31 @@ func (r *Runner) DestroyCompleted(ctx context.Context, requestID int64, result s
 	defer r.lifecycle.Unlock()
 
 	if r.cache != nil {
-		r.mu.Lock()
-		inst := r.running[requestID]
-		r.mu.Unlock()
-		if inst != nil {
-			if err := r.cache.SettleDocker(ctx, inst.Name, result == "succeeded"); err != nil {
+		if instance := r.cacheInstanceForRequest(requestID); instance != "" {
+			if err := r.cache.SettleDocker(ctx, instance, result == "succeeded"); err != nil {
 				r.log.Warn("Docker image store was not published; compute teardown will discard it",
-					"request", requestID, "instance", inst.Name, "result", result, "error", err)
+					"request", requestID, "instance", instance, "result", result, "error", err)
 			}
 		}
 	}
 
 	return r.destroy(ctx, requestID)
+}
+
+func (r *Runner) cacheInstanceForRequest(requestID int64) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if inst := r.running[requestID]; inst != nil {
+		return inst.Name
+	}
+	for _, held := range r.custody {
+		if held.requestID == requestID {
+			return held.name
+		}
+	}
+
+	return ""
 }
 
 func (r *Runner) destroy(ctx context.Context, requestID int64) error {

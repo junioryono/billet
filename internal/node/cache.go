@@ -63,6 +63,7 @@ type cacheAttachment struct {
 	Volume      storecontract.Volume `json:"volume"`
 	Publication string               `json:"publication,omitempty"`
 	Docker      bool                 `json:"docker,omitempty"`
+	Settling    bool                 `json:"settling,omitempty"`
 	Ready       bool                 `json:"ready,omitempty"`
 }
 
@@ -476,6 +477,11 @@ func (s *CacheService) markDockerStoreReady(
 
 		return
 	}
+	if !attachment.Settling {
+		http.Error(w, "Docker image store is not settling", http.StatusConflict)
+
+		return
+	}
 	attachment.Volume.Filesystem = request.Filesystem
 	attachment.Ready = true
 	if err := s.persistSession(session); err != nil {
@@ -501,6 +507,26 @@ func (s *CacheService) SettleDocker(ctx context.Context, instance string, succee
 	if !succeeded || session.trust != provider.TrustTrusted {
 		return nil
 	}
+	if err := lockCacheSession(ctx, session); err != nil {
+		return err
+	}
+	attachment := session.slots[0]
+	if attachment == nil || !attachment.Docker {
+		session.mu.Unlock()
+
+		return nil
+	}
+	if !attachment.Settling {
+		attachment.Settling = true
+		attachment.Ready = false
+		attachment.Volume.Filesystem = storecontract.Filesystem{}
+		if err := s.persistSession(session); err != nil {
+			session.mu.Unlock()
+
+			return fmt.Errorf("open Docker image-store settlement: %w", err)
+		}
+	}
+	session.mu.Unlock()
 
 	deadline := time.NewTimer(dockerSettleWait)
 	defer deadline.Stop()

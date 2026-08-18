@@ -229,10 +229,22 @@ complete() {
 		if e2fsck -f -n "$device" >/dev/null 2>&1; then
 			clean=true
 		fi
+		prepared=0
 		if body=$(jq -nc --arg type "$type" --arg uuid "$uuid" --argjson clean "$clean" \
-			'{filesystem:{type:$type,uuid:$uuid,clean:$clean}}') &&
-			response=$(cache_call "/v1/docker-store/ready" "$body" 780) &&
-			printf '%s' "$response" | jq -e '.ready == true' >/dev/null 2>&1; then
+			'{filesystem:{type:$type,uuid:$uuid,clean:$clean}}'); then
+			i=0
+			while [ "$i" -lt 100 ]; do
+				if response=$(cache_call "/v1/docker-store/ready" "$body" 2 2>/dev/null) &&
+					printf '%s' "$response" | jq -e '.ready == true' >/dev/null 2>&1; then
+					prepared=1
+
+					break
+				fi
+				i=$((i + 1))
+				sleep 1
+			done
+		fi
+		if [ "$prepared" -eq 1 ]; then
 			log "prepared the changed Docker image store for host-side publication"
 		else
 			log "the Docker image store could not be prepared; the job result is unchanged"

@@ -382,13 +382,27 @@ func TestDockerImageStoreIsArchitectureScopedAndReservesSlotZero(t *testing.T) {
 		t.Fatalf("guest Docker store commit status = %d, want 403: %s",
 			direct.Code, direct.Body.String())
 	}
-	ready := cacheRequest(t, service, token, "/v1/docker-store/ready", map[string]any{
+	proof := map[string]any{
 		"filesystem": map[string]any{"type": "ext4", "uuid": "docker-fs", "clean": true},
-	})
-	if ready.Code != http.StatusOK {
-		t.Fatalf("Docker store readiness status = %d: %s", ready.Code, ready.Body.String())
 	}
-	if err := service.SettleDocker(t.Context(), "billet-one", true); err != nil {
+	if early := cacheRequest(t, service, token, "/v1/docker-store/ready", proof); early.Code != http.StatusConflict {
+		t.Fatalf("early Docker readiness status = %d, want 409: %s",
+			early.Code, early.Body.String())
+	}
+	settled := make(chan error, 1)
+	go func() { settled <- service.SettleDocker(t.Context(), "billet-one", true) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		ready := cacheRequest(t, service, token, "/v1/docker-store/ready", proof)
+		if ready.Code == http.StatusOK {
+			break
+		}
+		if ready.Code != http.StatusConflict || time.Now().After(deadline) {
+			t.Fatalf("Docker store readiness status = %d: %s", ready.Code, ready.Body.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := <-settled; err != nil {
 		t.Fatalf("SettleDocker: %v", err)
 	}
 	if got := storage.publishExpected; len(got) != 2 || got[0] != "" || got[1] != "concurrent" {
@@ -419,8 +433,9 @@ func TestFailedJobLeavesTheDockerStoreAttachedUntilComputeIsGone(t *testing.T) {
 	}
 	if response := cacheRequest(t, service, token, "/v1/docker-store/ready", map[string]any{
 		"filesystem": map[string]any{"type": "ext4", "uuid": "docker-fs", "clean": true},
-	}); response.Code != http.StatusOK {
-		t.Fatalf("Docker readiness status = %d: %s", response.Code, response.Body.String())
+	}); response.Code != http.StatusConflict {
+		t.Fatalf("failed job's early Docker readiness status = %d, want 409: %s",
+			response.Code, response.Body.String())
 	}
 
 	if err := service.SettleDocker(t.Context(), "billet-one", false); err != nil {
