@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -316,6 +317,9 @@ func TestTheBuilderConfiguresEachUpstreamToItsOwnMirror(t *testing.T) {
 	body, err := os.ReadFile(filepath.Join(temporary, "billet-buildkitd.toml"))
 	if err != nil {
 		t.Fatalf("read BuildKit config: %v", err)
+	}
+	if want := "[grpc]\n  gid = " + strconv.Itoa(os.Getgid()); !bytes.Contains(body, []byte(want)) {
+		t.Errorf("BuildKit socket is not accessible to the runner's group; want %q:\n%s", want, body)
 	}
 	for _, want := range []string{
 		`[registry."docker.io"]`, `mirrors = ["docker-cache.home.example"]`,

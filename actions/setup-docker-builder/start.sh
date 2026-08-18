@@ -30,7 +30,11 @@ case "${BILLET_BUILDKIT_RESET:-false}" in
     ;;
 esac
 
-cat > "$config" <<'EOF'
+runner_gid=$(id -g)
+cat > "$config" <<EOF
+[grpc]
+  gid = $runner_gid
+
 [worker.oci]
   gc = true
 
