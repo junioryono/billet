@@ -183,6 +183,17 @@ func TestTheGuestImageIncludesBuildxForThePersistentBuilder(t *testing.T) {
 func TestTheGuestImageGateKeepsDockerBehindTheCacheMount(t *testing.T) {
 	t.Parallel()
 
+	dangling := filepath.Join(t.TempDir(), "docker.service")
+	if err := os.Symlink("/billet-test-no-such-systemd-unit/docker.service", dangling); err != nil {
+		t.Fatalf("create absolute guest enablement symlink: %v", err)
+	}
+	if _, err := os.Stat(dangling); !os.IsNotExist(err) {
+		t.Fatalf("following the guest symlink error = %v; want not-exist", err)
+	}
+	if info, err := os.Lstat(dangling); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("inspect the guest symlink: info = %v, error = %v", info, err)
+	}
+
 	path := filepath.Join("..", "..", "..", "scripts", "check-guest-image.sh")
 	source, err := os.ReadFile(path)
 	if err != nil {
@@ -190,9 +201,10 @@ func TestTheGuestImageGateKeepsDockerBehindTheCacheMount(t *testing.T) {
 	}
 	text := string(source)
 
-	if !strings.Contains(text, "sockets.target.wants/docker.socket") ||
+	if !strings.Contains(text, `[ -L "$WANTS/docker.service" ]`) ||
+		!strings.Contains(text, `[ -L "$DOCKER_SOCKET" ]`) ||
 		!strings.Contains(text, "Docker waits for the billet agent to mount its image store") {
-		t.Fatal("the image gate does not require Docker service and socket activation to stay disabled")
+		t.Fatal("the image gate does not detect guest Docker enablement symlinks without following them on the host")
 	}
 	if strings.Contains(text, "for unit in docker.service billet-agent.service") {
 		t.Fatal("the image gate still requires Docker to start before the billet agent mounts its cache")
