@@ -608,9 +608,8 @@ func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 	//
 	// Nothing else is needed to recover: the entry stays in custody, so the next
 	// tick looks again, and the release happens after Find sustains the instance's
-	// absence. That path is already written above and applies the longer grace to
-	// compute never observed and the shorter confirmation window to remote compute
-	// that was.
+	// absence through the full remote-consistency window or returns an explicit
+	// terminal record.
 	if state != provider.TeardownStopped {
 		c.unconfirmed.Store(true)
 
