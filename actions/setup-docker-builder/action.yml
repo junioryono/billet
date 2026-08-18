@@ -45,5 +45,5 @@ runs:
         container: ${{ steps.start.outputs.container }}
         builder: ${{ steps.start.outputs.name }}
         state-path: ${{ runner.temp }}/billet-buildkit-state
-        mount-limit-bytes: ${{ env.BILLET_BUILDKIT_CACHE_MOUNT_LIMIT_BYTES }}
+        mount-limit-bytes: ${{ env.BILLET_BUILDKIT_CACHE_MOUNT_LIMIT_BYTES || '21474836480' }}
         discard-marker: ${{ runner.temp }}/billet-buildkit-discard
