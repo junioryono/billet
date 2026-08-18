@@ -1297,6 +1297,21 @@ var pendingCompletionsMigration = migration{
 	},
 }
 
+// A result alone can replay node teardown, but it cannot return capacity when
+// the control plane stops after teardown succeeds and before the lease release
+// settles. Keep the fenced lease identity beside the result so restart recovery
+// can finish both halves of completion in their required order.
+var pendingCompletionLeaseMigration = migration{
+	Version: 23,
+	Name:    "pending_completion_lease",
+	Stmts: []string{
+		`ALTER TABLE pending_completions ADD COLUMN lease_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE pending_completions ADD COLUMN lease_epoch INTEGER NOT NULL DEFAULT 0 CHECK (lease_epoch >= 0)`,
+		`ALTER TABLE pending_completions ADD COLUMN outcome TEXT NOT NULL DEFAULT '' CHECK (outcome IN ('','done','failed'))`,
+		`ALTER TABLE pending_completions ADD COLUMN release_only INTEGER NOT NULL DEFAULT 0 CHECK (release_only IN (0,1))`,
+	},
+}
+
 func init() {
 	migrations = append(migrations,
 		placementMigration, guestOSMigration, placementFactsMigration, requestIDMigration,
@@ -1304,7 +1319,7 @@ func init() {
 		certRevocationMigration, nodeEnrollmentMigration, joinTokenMigration,
 		issuedCertMigration, quarantineMigration, strictTrustTablesMigration,
 		nodeRevocationMigration, ec2ShapeAccountingMigration, custodyVisibilityMigration,
-		leaseFailureReasonMigration, pendingCompletionsMigration)
+		leaseFailureReasonMigration, pendingCompletionsMigration, pendingCompletionLeaseMigration)
 }
 
 const bootstrapSchemaMigrations = `CREATE TABLE IF NOT EXISTS schema_migrations (

@@ -8,7 +8,10 @@ import (
 func TestPendingCompletionsAreDurableAndScopedByTier(t *testing.T) {
 	db := open(t)
 	ctx := t.Context()
-	first := PendingCompletion{Tier: "linux", RequestID: 17, RunID: 31, Result: "Succeeded"}
+	first := PendingCompletion{
+		Tier: "linux", RequestID: 17, RunID: 31, Result: "Succeeded",
+		LeaseID: "lease-17", LeaseEpoch: 4, Outcome: "done", ReleaseOnly: true,
+	}
 	other := PendingCompletion{Tier: "macos", RequestID: 17, RunID: 32, Result: "Failed"}
 	for _, completion := range []PendingCompletion{first, other} {
 		if err := db.PutPendingCompletion(ctx, completion); err != nil {
@@ -42,6 +45,12 @@ func TestPendingCompletionRejectsAnUnusableIdentityOrResult(t *testing.T) {
 		{Tier: "linux", RequestID: 0, Result: "Succeeded"},
 		{Tier: "linux", RequestID: 1, Result: " "},
 		{Tier: "linux", RequestID: 1, RunID: -1, Result: "Succeeded"},
+		{Tier: "linux", RequestID: 1, Result: "Succeeded", LeaseEpoch: -1},
+		{Tier: "linux", RequestID: 1, Result: "Succeeded", Outcome: "done"},
+		{Tier: "linux", RequestID: 1, Result: "Succeeded", LeaseID: "lease-1"},
+		{Tier: "linux", RequestID: 1, Result: "Succeeded", LeaseID: " "},
+		{Tier: "linux", RequestID: 1, Result: "Succeeded", LeaseID: "lease-1", Outcome: "lost"},
+		{Tier: "linux", RequestID: 1, Result: "Succeeded", ReleaseOnly: true},
 	} {
 		if err := db.PutPendingCompletion(t.Context(), completion); err == nil {
 			t.Fatalf("PutPendingCompletion accepted %+v", completion)

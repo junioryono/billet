@@ -314,7 +314,8 @@ func WithRunner(r Runner) Option {
 	return func(l *Listener) { l.runner = r }
 }
 
-// WithCompletionStore makes result delivery durable across listener restarts.
+// WithCompletionStore makes result delivery and its capacity settlement durable
+// across listener restarts.
 func WithCompletionStore(db *state.DB) Option {
 	return func(l *Listener) { l.completionStore = db }
 }
@@ -2544,14 +2545,49 @@ func (l *Listener) recordCompletion(ctx context.Context, job Job) error {
 	if l.completionStore == nil || job.Result == "" {
 		return nil
 	}
-	if err := l.completionStore.PutPendingCompletion(ctx, state.PendingCompletion{
+
+	lease, outcome, releaseOnly := l.completionRelease(job.RequestID)
+	completion := state.PendingCompletion{
 		Tier: l.tier, RequestID: job.RequestID, RunID: job.RunID, Result: job.Result,
-	}); err != nil {
+	}
+	if lease != nil {
+		completion.LeaseID = lease.ID
+		completion.LeaseEpoch = lease.Epoch
+		completion.Outcome = string(outcome)
+		completion.ReleaseOnly = releaseOnly
+	}
+	if err := l.completionStore.PutPendingCompletion(ctx, completion); err != nil {
 		return fmt.Errorf("server: preserve completed result for %s request %d before acknowledging it: %w",
 			l.tier, job.RequestID, err)
 	}
 
 	return nil
+}
+
+// completionRelease snapshots the capacity obligation before GitHub's message
+// can be acknowledged. A node teardown and a ledger release are one ordered
+// completion; restart recovery needs the fenced lease identity to finish the
+// second half if the process stops between them.
+func (l *Listener) completionRelease(requestID int64) (*alloc.Lease, alloc.Phase, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if entry := l.cleanup[requestID]; entry != nil && entry.lease != nil {
+		outcome := entry.outcome
+		if outcome == "" {
+			outcome = alloc.PhaseDone
+		}
+
+		return entry.lease, outcome, entry.releaseOnly
+	}
+	if lease := l.running[requestID]; lease != nil {
+		return lease, alloc.PhaseDone, false
+	}
+	if promise := l.acquiring[requestID]; promise != nil {
+		return promise.lease, alloc.PhaseDone, false
+	}
+
+	return nil, "", false
 }
 
 func (l *Listener) forgetCompletion(ctx context.Context, job Job) {
@@ -2579,10 +2615,21 @@ func (l *Listener) restoreCompletions(ctx context.Context) error {
 		job := Job{RequestID: completion.RequestID, RunID: completion.RunID, Result: completion.Result}
 		if entry := l.cleanup[job.RequestID]; entry != nil {
 			entry.job = job
+			if completion.LeaseID != "" {
+				entry.lease = &alloc.Lease{ID: completion.LeaseID, Epoch: completion.LeaseEpoch}
+				entry.outcome = alloc.Phase(completion.Outcome)
+				entry.releaseOnly = completion.ReleaseOnly
+			}
 
 			continue
 		}
-		l.cleanup[job.RequestID] = &pendingCleanup{job: job}
+		entry := &pendingCleanup{job: job}
+		if completion.LeaseID != "" {
+			entry.lease = &alloc.Lease{ID: completion.LeaseID, Epoch: completion.LeaseEpoch}
+			entry.outcome = alloc.Phase(completion.Outcome)
+			entry.releaseOnly = completion.ReleaseOnly
+		}
+		l.cleanup[job.RequestID] = entry
 	}
 
 	return nil
@@ -2740,10 +2787,7 @@ func (l *Listener) complete(ctx context.Context, job Job) {
 		return
 	}
 
-	l.forgetCompletion(ctx, job)
-
 	l.mu.Lock()
-	defer l.mu.Unlock()
 
 	lease, ok := l.running[job.RequestID]
 
@@ -2789,6 +2833,8 @@ func (l *Listener) complete(ctx context.Context, job Job) {
 		// or reaped out from under this listener, whose entry would otherwise sit
 		// in the map being retried for the life of the process.
 		delete(l.cleanup, job.RequestID)
+		l.mu.Unlock()
+		l.forgetCompletion(ctx, job)
 
 		return
 	}
@@ -2859,6 +2905,7 @@ func (l *Listener) complete(ctx context.Context, job Job) {
 
 		delete(l.running, job.RequestID)
 		delete(l.acquiring, job.RequestID)
+		l.mu.Unlock()
 
 		return
 	}
@@ -2867,6 +2914,8 @@ func (l *Listener) complete(ctx context.Context, job Job) {
 	delete(l.running, job.RequestID)
 	delete(l.acquiring, job.RequestID)
 	delete(l.cleanup, job.RequestID)
+	l.mu.Unlock()
+	l.forgetCompletion(ctx, job)
 }
 
 func (l *Listener) destroyCompleted(ctx context.Context, job Job) error {

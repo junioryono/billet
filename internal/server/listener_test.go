@@ -1838,6 +1838,26 @@ type fakeRunner struct {
 	onDestroyCompleted func(requestID int64, result string) error
 }
 
+type cancelAfterDestroyRunner struct {
+	cancel context.CancelFunc
+}
+
+func (r *cancelAfterDestroyRunner) Launch(context.Context, *alloc.Lease, Job) error {
+	return nil
+}
+
+func (r *cancelAfterDestroyRunner) Destroy(context.Context, int64) error {
+	r.cancel()
+
+	return nil
+}
+
+func (r *cancelAfterDestroyRunner) DestroyCompleted(context.Context, int64, string) error {
+	r.cancel()
+
+	return nil
+}
+
 func (f *fakeRunner) Launch(_ context.Context, _ *alloc.Lease, job Job) error {
 	if f.onLaunch != nil {
 		return f.onLaunch(job.RequestID)
@@ -2103,6 +2123,54 @@ func TestReleaseOnlyCompletionKeepsItsDurableResultUntilReleaseSettles(t *testin
 	}
 	if len(pending) != 0 {
 		t.Fatalf("settled release retained its durable result: %+v", pending)
+	}
+}
+
+func TestCompletionRestoresItsLeaseWhenReleaseIsInterruptedAfterDestroy(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, tiers)
+	db := openState(t)
+	job := Job{RequestID: 74, RunID: 84, Result: "Succeeded"}
+	interrupted, cancel := context.WithCancel(t.Context())
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithCompletionStore(db),
+		WithRunner(&cancelAfterDestroyRunner{cancel: cancel}))
+	lease := holdRunning(t, l, a, tiers[0].Label, job.RequestID)
+	if err := l.recordCompletion(interrupted, job); err != nil {
+		t.Fatalf("recordCompletion: %v", err)
+	}
+
+	// Teardown succeeds and cancels the request before the ledger write. This is
+	// the crash-sized window that used to delete the only durable record first.
+	l.complete(interrupted, job)
+	pending, err := db.PendingCompletions(t.Context(), tiers[0].Label)
+	if err != nil {
+		t.Fatalf("PendingCompletions after failed release: %v", err)
+	}
+	if len(pending) != 1 || pending[0].LeaseID != lease.ID ||
+		pending[0].LeaseEpoch != lease.Epoch || pending[0].Outcome != string(alloc.PhaseDone) {
+		t.Fatalf("interrupted release obligation = %+v, want lease %s epoch %d outcome done",
+			pending, lease.ID, lease.Epoch)
+	}
+
+	restarted := NewListener(a, tiers[0].Label, &fakeSession{}, WithCompletionStore(db),
+		WithCleanupRetryPacing(0, 0), WithRunner(&fakeRunner{}))
+	if err := restarted.restoreCompletions(t.Context()); err != nil {
+		t.Fatalf("restoreCompletions: %v", err)
+	}
+	restarted.retryCleanup(t.Context())
+	pending, err = db.PendingCompletions(t.Context(), tiers[0].Label)
+	if err != nil {
+		t.Fatalf("PendingCompletions after settled release: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("settled release retained its durable result: %+v", pending)
+	}
+	usage, err := a.Usage(t.Context())
+	if err != nil {
+		t.Fatalf("Usage after restored release: %v", err)
+	}
+	if usage.Leases != 0 {
+		t.Fatalf("restored completion left %d leases consuming capacity", usage.Leases)
 	}
 }
 
