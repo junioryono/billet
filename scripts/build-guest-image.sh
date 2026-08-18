@@ -21,12 +21,14 @@
 # of must not change underneath it.
 set -euo pipefail
 
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+
 # ONE PIN FOR EVERY IMAGE BILLET BUILDS, read from the file the Go code embeds.
 # It was a shell default here and a constant in `billet ami`, so bumping the runner
 # was two edits in two languages -- and doing one of them leaves a fleet where one
 # backend is current and the other is not, found on the day GitHub stops queueing to
 # the stale half.
-PINNED_RUNNER_FILE="$(dirname "$0")/../internal/runnerrelease/pinned.txt"
+PINNED_RUNNER_FILE="$SCRIPT_DIR/../internal/runnerrelease/pinned.txt"
 
 if [ -z "${RUNNER_VERSION:-}" ] && [ ! -r "$PINNED_RUNNER_FILE" ]; then
 	echo "cannot read the pinned runner version at $PINNED_RUNNER_FILE, and RUNNER_VERSION" >&2
@@ -807,9 +809,15 @@ cd /home/runner/runner
 # a runtime the image already contains. Nothing would report that: the job would
 # simply be slower.
 #
-# setpriv does not preserve it either, which is why it is named here explicitly.
+# setpriv does not create a login environment either. HOME, USER and LOGNAME are
+# part of the runner-account contract, not conveniences: actions/setup-go can
+# install a toolchain without them and then Go refuses to start because it has no
+# user cache directory. The EC2 image entrypoint establishes the same three values.
 runner_env=(
 	"ACTIONS_RUNNER_INPUT_JITCONFIG=$ACTIONS_RUNNER_INPUT_JITCONFIG"
+	"HOME=/home/runner"
+	"USER=runner"
+	"LOGNAME=runner"
 	"RUNNER_TOOL_CACHE=/opt/hostedtoolcache"
 	"AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache"
 )
@@ -822,9 +830,11 @@ if [ -n "$registry_mirrors_json" ]; then
 fi
 
 set +e
+# BILLET_AGENT_LAUNCH_BEGIN
 setpriv --reuid=runner --regid=runner --init-groups --inh-caps=-all -- \
 	env "${runner_env[@]}" "${cmd[@]}"
 job_status=$?
+# BILLET_AGENT_LAUNCH_END
 set -e
 
 if [ "$docker_cache" -eq 1 ]; then
@@ -971,6 +981,12 @@ INFO
 		echo "PUBLISH=no, so it was not written to ceph"
 		return
 	fi
+
+	# THE MANUAL PATH PASSES THE SAME CONTENTS GATE AS THE RELEASE WORKFLOW. This
+	# script is the documented custom and air-gapped publisher, so leaving the gate
+	# only in GitHub Actions would let the path an operator actually runs publish an
+	# image that the automated path refuses.
+	"$SCRIPT_DIR/check-guest-image.sh" "$img"
 
 	publish "$img"
 }

@@ -79,6 +79,29 @@ else
 	fail "no runner at /home/runner/runner/run.sh; every job would fail to start"
 fi
 
+AGENT="$MNT/usr/local/bin/billet-agent"
+
+# SYSTEMD DOES NOT CREATE A LOGIN ENVIRONMENT. The agent runs as root and drops
+# privileges with setpriv, so the account switch alone supplies neither a writable
+# home nor the ordinary account identity variables. Tool installers can complete
+# and then fail when the tool first asks for its per-user cache.
+runner_environment=1
+for assignment in '"HOME=/home/runner"' '"USER=runner"' '"LOGNAME=runner"'; do
+	if ! grep -Eq "^[[:space:]]*${assignment}$" "$AGENT" 2>/dev/null; then
+		runner_environment=0
+	fi
+done
+if ! grep -Fq 'env "${runner_env[@]}" "${cmd[@]}"' "$AGENT" 2>/dev/null; then
+	runner_environment=0
+fi
+if [ "$runner_environment" -eq 1 ]; then
+	pass "the guest agent establishes the runner account environment"
+else
+	fail "the guest agent does not launch jobs with HOME=/home/runner, USER=runner and
+        LOGNAME=runner; setup actions can install a tool and then fail when it asks
+        for its user cache"
+fi
+
 # READ FROM WHAT THE BUILD RECORDED, not from the runner tarball. The tarball
 # ships no version file of its own -- this gate reported exactly that on its first
 # real run -- so the build writes /etc/billet-image at the moment it unpacks the

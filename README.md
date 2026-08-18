@@ -175,6 +175,8 @@ metadata service and starts the runner with it. It lives in Ceph as an RBD image
 immutable named snapshots called **generations**, and every job gets a copy-on-write
 clone of one, discarded when the guest is.
 
+The guest agent drops from root to the dedicated `runner` account and establishes `HOME=/home/runner`, `USER=runner`, and `LOGNAME=runner` explicitly. A systemd service is not a login session, and `setpriv` changes ids without constructing that account environment; leaving these implicit lets setup actions install a toolchain and then fail when the tool first asks for its per-user cache. The image contents gate checks this contract before publication.
+
 ```bash
 sudo scripts/build-guest-image.sh          # build and publish a new generation
 billet images verify <image>@<generation>  # boot one, make the guest prove it, record it
