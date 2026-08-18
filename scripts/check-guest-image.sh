@@ -292,21 +292,29 @@ else
 	fail "no billet agent; microVMs would boot and never register"
 fi
 
-# --- the units that have to start -----------------------------------------
+# --- service ordering -----------------------------------------------------
 
 # ENABLED IS A SYMLINK ON DISK, which is exactly why this can be checked without
-# booting: `systemctl enable` in the chroot wrote it, and if it did not, the unit
-# is present and inert. That is the failure this catches -- an image where
-# everything is installed and nothing starts.
+# booting. The agent must start, while Docker service and socket activation must
+# stay disabled: the agent mounts the cache at /var/lib/docker before starting
+# the daemon. Letting either Docker unit autostart opens the daemon on the root
+# filesystem first and makes the later cache mount unsafe.
 WANTS="$MNT/etc/systemd/system/multi-user.target.wants"
+DOCKER_SOCKET="$MNT/etc/systemd/system/sockets.target.wants/docker.socket"
 
-for unit in docker.service billet-agent.service; do
-	if [ -L "$WANTS/$unit" ] || [ -e "$WANTS/$unit" ]; then
-		pass "$unit is enabled"
-	else
-		fail "$unit is installed but NOT enabled; it would never start"
-	fi
-done
+if [ -L "$WANTS/docker.service" ] || [ -e "$WANTS/docker.service" ] ||
+	[ -L "$DOCKER_SOCKET" ] || [ -e "$DOCKER_SOCKET" ]; then
+	fail "Docker service or socket activation is enabled; it can start before the billet
+        agent mounts the image store"
+else
+	pass "Docker waits for the billet agent to mount its image store"
+fi
+
+if [ -L "$WANTS/billet-agent.service" ] || [ -e "$WANTS/billet-agent.service" ]; then
+	pass "billet-agent.service is enabled"
+else
+	fail "billet-agent.service is installed but NOT enabled; the runner would never start"
+fi
 
 # systemd-networkd is wanted by a different target.
 if [ -e "$MNT/etc/systemd/system/dbus-org.freedesktop.network1.service" ] ||
