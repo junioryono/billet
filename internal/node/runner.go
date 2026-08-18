@@ -412,9 +412,10 @@ func (r *Runner) Launch(
 		//
 		// If the stray could not be confirmed gone the LEASE STAYS HELD — releasing it would
 		// hand back capacity a container may still be using. CUSTODY UNLESS THE CLEANUP WAS
-		// CAUSAL: a successful Destroy proves the compute is gone, and nothing else does.
-		if confirmed, cleanupErr := r.destroyStray(ctx, name); !confirmed {
-			r.hold(lease, name, job.RequestID)
+		// CAUSAL: a successful synchronous Destroy or an explicit terminal record proves
+		// the compute is gone; an absent snapshot does not.
+		if cleanup, cleanupErr := r.destroyStray(ctx, name); !cleanup.confirmed {
+			r.holdWithEvidence(lease, name, job.RequestID, cleanup.evidence)
 
 			return errCustody(name, errors.Join(err, cleanupErr))
 		}
@@ -573,7 +574,8 @@ func (r *Runner) destroy(ctx context.Context, requestID int64) error {
 	// the listener is told to stand down — the same answer an ambiguous launch
 	// gives, for the same reason.
 	if state != provider.TeardownStopped {
-		r.holdWithOutcome(lease, inst.Name, requestID, alloc.PhaseDone)
+		r.holdWithOutcomeAndEvidence(lease, inst.Name, requestID, alloc.PhaseDone,
+			custodyEvidence{observed: r.provider.Kind().RunsOnHost()})
 
 		r.log.Info("teardown did not confirm the guest had stopped; holding the capacity "+
 			"until it is provably gone",
@@ -725,6 +727,13 @@ func (r *Runner) handleInterruption(ctx context.Context, notice *provider.Interr
 	return fmt.Errorf("%w: %s", errInterruptionNotOwned, notice.InstanceID)
 }
 
+// strayCleanup is the proof and provider evidence gathered while reconciling an
+// ambiguous launch.
+type strayCleanup struct {
+	confirmed bool
+	evidence  custodyEvidence
+}
+
 // destroyStray removes an instance a failed launch may have left behind.
 //
 // Best-effort by construction, and the errors are logged rather than returned:
@@ -732,7 +741,7 @@ func (r *Runner) handleInterruption(ctx context.Context, notice *provider.Interr
 // hide why the launch failed in the first place. What must not happen is
 // silence — an operator who has to find an orphan by hand needs to know it
 // might exist.
-func (r *Runner) destroyStray(ctx context.Context, name string) (bool, error) {
+func (r *Runner) destroyStray(ctx context.Context, name string) (strayCleanup, error) {
 	// A fresh context, because the usual reason a launch failed is that the
 	// caller's was cancelled — and asking a cancelled context to clean up
 	// guarantees the cleanup fails too.
@@ -741,15 +750,22 @@ func (r *Runner) destroyStray(ctx context.Context, name string) (bool, error) {
 
 	inst, found, err := r.provider.Find(ctx, name)
 	if err != nil {
-		return false, fmt.Errorf("could not tell whether a failed launch left %s behind: %w", name, err)
+		return strayCleanup{}, fmt.Errorf(
+			"could not tell whether a failed launch left %s behind: %w", name, err)
 	}
 
 	if !found {
 		// NOT CONFIRMED. Absence in one observation is not proof that nothing will
 		// appear: the create may be in flight inside the daemon. The caller keeps
 		// the capacity and looks again.
-		return false, fmt.Errorf("no instance named %s is visible yet, which does not "+
-			"prove the daemon is not still starting one", name)
+		return strayCleanup{
+				evidence: custodyEvidence{absentSince: r.now()},
+			}, fmt.Errorf("no instance named %s is visible yet, which does not prove the "+
+				"daemon is not still starting one", name)
+	}
+
+	if inst.Terminal {
+		return strayCleanup{confirmed: true, evidence: custodyEvidence{observed: true}}, nil
 	}
 
 	r.log.Warn("a failed launch had in fact started something; removing it",
@@ -757,21 +773,23 @@ func (r *Runner) destroyStray(ctx context.Context, name string) (bool, error) {
 
 	state, err := r.provider.Destroy(ctx, inst.ID)
 	if err != nil {
-		return false, fmt.Errorf("could not remove %s, which a failed launch had started: %w", name, err)
+		return strayCleanup{evidence: custodyEvidence{observed: true}},
+			fmt.Errorf("could not remove %s, which a failed launch had started: %w", name, err)
 	}
 
-	// THE BOOL ALREADY MEANT "CONFIRMED", which is what makes this fit without
-	// changing anything above it: the caller keeps the capacity in custody when
-	// this is false, and that is the correct treatment of an unconfirmed teardown
-	// (#46). It is also the right answer for #48 — this is the
+	// CONFIRMATION IS EXPLICIT, which is what makes this fit without changing the
+	// caller's decision: it keeps capacity in custody when this is false, and that
+	// is the correct treatment of an unconfirmed teardown (#46). It is also the
+	// right answer for #48 — this is the
 	// path most likely to be destroying an instance EC2 launched moments ago, so
 	// it is the one whose "already gone" is least trustworthy.
 	if state != provider.TeardownStopped {
-		return false, fmt.Errorf("%s was asked to stop but the backend did not confirm it had, "+
-			"so it may still be running", name)
+		return strayCleanup{evidence: custodyEvidence{observed: true}},
+			fmt.Errorf("%s was asked to stop but the backend did not confirm it had, "+
+				"so it may still be running", name)
 	}
 
-	return true, nil
+	return strayCleanup{confirmed: true, evidence: custodyEvidence{observed: true}}, nil
 }
 
 // Recover decides what to do with compute an earlier run left behind, once, at

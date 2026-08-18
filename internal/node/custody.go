@@ -122,6 +122,14 @@ type custody struct {
 	since time.Time
 }
 
+// custodyEvidence carries the provider observations already made before an entry
+// moves into custody. Dropping them either restarts a safety window or forgets a
+// sighting that changes how a later absence is interpreted.
+type custodyEvidence struct {
+	observed    bool
+	absentSince time.Time
+}
+
 // adopt takes custody of an instance that survived a restart.
 func (r *Runner) adopt(lease *alloc.Lease, inst *provider.Instance) {
 	r.adoptWithObservation(lease, inst, true)
@@ -185,6 +193,14 @@ func (r *Runner) hold(lease *alloc.Lease, name string, requestID int64) {
 	r.holdWithOutcome(lease, name, requestID, alloc.PhaseFailed)
 }
 
+// holdWithEvidence preserves observations made while an ambiguous launch was
+// being cleaned up.
+func (r *Runner) holdWithEvidence(
+	lease *alloc.Lease, name string, requestID int64, evidence custodyEvidence,
+) {
+	r.holdWithOutcomeAndEvidence(lease, name, requestID, alloc.PhaseFailed, evidence)
+}
+
 // holdWithOutcome is hold for a job whose outcome is already known.
 //
 // THE OUTCOME IS A PARAMETER BECAUSE THERE ARE NOW TWO WAYS TO REACH THIS, and
@@ -195,21 +211,32 @@ func (r *Runner) hold(lease *alloc.Lease, name string, requestID int64) {
 // every job that completed normally on an EC2 host, and an investigation reading
 // it would see a fleet where nothing ever succeeded.
 func (r *Runner) holdWithOutcome(lease *alloc.Lease, name string, requestID int64, outcome alloc.Phase) {
+	r.holdWithOutcomeAndEvidence(lease, name, requestID, outcome, custodyEvidence{})
+}
+
+// holdWithOutcomeAndEvidence records both the durable job outcome and any
+// provider evidence already gathered before custody began.
+func (r *Runner) holdWithOutcomeAndEvidence(
+	lease *alloc.Lease,
+	name string,
+	requestID int64,
+	outcome alloc.Phase,
+	evidence custodyEvidence,
+) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	entry := &custody{
 		leaseID: lease.ID,
 
-		name:      name,
-		requestID: requestID,
-		discard:   true,
-		outcome:   outcome,
-		phase:     alloc.PhaseTeardown,
-		since:     r.now(),
-		// Not observed. Even a remote teardown request can be followed by an
-		// eventually-consistent inventory miss while the guest is still running. A
-		// later sighting sets this, and otherwise the sustained grace must elapse.
+		name:        name,
+		requestID:   requestID,
+		discard:     true,
+		outcome:     outcome,
+		phase:       alloc.PhaseTeardown,
+		since:       r.now(),
+		observed:    evidence.observed,
+		absentSince: evidence.absentSince,
 	}
 	entry.epoch.Store(lease.Epoch)
 
@@ -253,15 +280,6 @@ func (r *Runner) heldLeases() map[string]bool {
 // recovers. The same asymmetry sets alloc.quarantineGrace, and the two are
 // deliberately the same size.
 const strayGrace = 5 * time.Minute
-
-// remoteAbsenceGrace is the minimum span between the first and confirming
-// negative observations after a remote provider has already reported an
-// instance. EC2 inventory is eventually consistent rather than monotonic, so a
-// single miss is not proof even after a sighting. This stays shorter than the
-// grace for compute never observed at all: a sighting rules out an in-flight
-// create, while two separated misses guard against reading one stale replica as
-// termination.
-const remoteAbsenceGrace = 30 * time.Second
 
 // custodyWarnAfter is how long a held lease may go unresolved before every tick
 // says so.
@@ -525,14 +543,11 @@ func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 		//
 		// A host backend's successful launch or inventory is causal, so its first
 		// later absence is enough. A remote inventory is eventually consistent and
-		// needs two negative observations separated in time even after a sighting.
+		// keeps every absence behind the full consistency window; a targeted
+		// terminal record below is its prompt causal release path.
 		grace := strayGrace
-		if c.observed {
-			if r.provider.Kind().RunsOnHost() {
-				grace = 0
-			} else {
-				grace = remoteAbsenceGrace
-			}
+		if c.observed && r.provider.Kind().RunsOnHost() {
+			grace = 0
 		}
 
 		if grace > 0 {
@@ -548,8 +563,9 @@ func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 			}
 		}
 
-		// PROVED GONE, by a sustained absence rather than by a backend saying so —
-		// which is the only proof an asynchronous teardown ever offers.
+		// RELEASED AFTER THE CONSERVATIVE ABSENCE WINDOW. A causally observed host
+		// exit reaches this immediately; eventually consistent remote inventory gets
+		// the full documented window when no explicit terminal record is available.
 		c.unconfirmed.Store(false)
 		r.cleanupCache(ctx, c.name)
 
@@ -561,6 +577,17 @@ func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 	// current inventory.
 	c.absentSince = time.Time{}
 	c.observed = true
+
+	// A TERMINAL RECORD IS CAUSAL PROOF. Remote providers can retain an explicit
+	// historical row after execution and billing end even though their absence is
+	// eventually consistent. This is stronger than !Running: a stopped instance
+	// still exists and must be destroyed.
+	if inst.Terminal {
+		c.unconfirmed.Store(false)
+		r.cleanupCache(ctx, c.name)
+
+		return r.finish(ctx, c)
+	}
 
 	// An adopted instance that is still running is left alone. This is the case
 	// destructive recovery got wrong: the runner inside is talking to GitHub on

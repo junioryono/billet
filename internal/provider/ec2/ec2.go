@@ -74,6 +74,11 @@ const jitEnvVar = "ACTIONS_RUNNER_INPUT_JITCONFIG"
 // re-terminate on every pass.
 var liveStates = []string{"pending", "running", "shutting-down", "stopping", "stopped"}
 
+// findStates keeps the terminal record in a targeted lookup. EC2 retains a
+// terminated instance as history for up to an hour; that record is useless noise
+// in fleet inventory and causal proof in custody teardown.
+var findStates = []string{"pending", "running", "shutting-down", "stopping", "stopped", "terminated"}
+
 // Provider launches EC2 instances, one per job.
 type Provider struct {
 	log   *slog.Logger
@@ -1340,9 +1345,10 @@ func (p *Provider) Destroy(ctx context.Context, id string) (provider.Teardown, e
 	return provider.TeardownRequested, nil
 }
 
-// Find reports the instance with that name, and whether there was one.
+// Find reports the instance with that name, including a retained terminal record.
 func (p *Provider) Find(ctx context.Context, name string) (*provider.Instance, bool, error) {
-	found, err := p.describe(ctx, filter{name: "tag:" + nameTag, values: []string{name}})
+	found, err := p.describe(ctx, findStates,
+		filter{name: "tag:" + nameTag, values: []string{name}})
 	if err != nil {
 		return nil, false, err
 	}
@@ -1362,7 +1368,7 @@ func (p *Provider) Find(ctx context.Context, name string) (*provider.Instance, b
 
 // List reports every instance this backend is running for billet.
 func (p *Provider) List(ctx context.Context) ([]*provider.Instance, error) {
-	return p.describe(ctx)
+	return p.describe(ctx, liveStates)
 }
 
 // filter is one DescribeInstances filter, before it is given a number.
@@ -1379,14 +1385,16 @@ type filter struct {
 	values []string
 }
 
-// describe runs DescribeInstances with billet's owner tag plus any extra filters,
-// following pagination to the end.
-func (p *Provider) describe(ctx context.Context, extra ...filter) ([]*provider.Instance, error) {
+// describe runs DescribeInstances with billet's owner tag, the caller's state
+// set, and any extra filters, following pagination to the end.
+func (p *Provider) describe(
+	ctx context.Context, states []string, extra ...filter,
+) ([]*provider.Instance, error) {
 	var instances []*provider.Instance
 
 	filters := append([]filter{
 		{name: "tag:" + ownerTag, values: []string{p.owner}},
-		{name: "instance-state-name", values: liveStates},
+		{name: "instance-state-name", values: states},
 	}, extra...)
 
 	token := ""
@@ -1475,9 +1483,10 @@ func (p *Provider) describe(ctx context.Context, extra ...filter) ([]*provider.I
 				}
 
 				instances = append(instances, &provider.Instance{
-					ID:      item.InstanceID,
-					Name:    name,
-					Running: runningState(item.State.Name),
+					ID:       item.InstanceID,
+					Name:     name,
+					Running:  runningState(item.State.Name),
+					Terminal: item.State.Name == "terminated",
 				})
 			}
 		}

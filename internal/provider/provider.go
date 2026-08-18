@@ -211,8 +211,8 @@ type Spec struct {
 	JITConfig string
 }
 
-// Instance is a unit of compute the backend knows about. It may or may not
-// still be running — see Running.
+// Instance is a unit of compute the backend knows about. It may be running,
+// stopped, or retained as a terminal record.
 type Instance struct {
 	// ID is the backend's own handle — a container id, a microVM id, an EC2
 	// instance id. Opaque to everything above.
@@ -229,6 +229,12 @@ type Instance struct {
 	// cannot tell should report true: treating an unknown state as finished would
 	// destroy live work, and treating it as running only delays a cleanup.
 	Running bool
+
+	// Terminal reports that the backend positively observed this compute reach a
+	// state from which it cannot execute or return to running. It is stronger than
+	// !Running: a stopped instance is not executing but still exists and may retain
+	// disks. The zero value is deliberately not proof.
+	Terminal bool
 }
 
 // InterruptionNotice is an external warning that a provider will take compute

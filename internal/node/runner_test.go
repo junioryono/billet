@@ -408,6 +408,31 @@ func TestAFastAcceptedTeardownReleasesOnTheFirstAbsentInventory(t *testing.T) {
 	}
 }
 
+// Ordinary teardown starts from a successful host Launch, which is causal even
+// if the backend reports teardown asynchronously. If the compute disappears
+// before the first inventory pass, custody must not apply the remote grace.
+func TestAHostTeardownKeepsItsLaunchObservation(t *testing.T) {
+	p := &fakeProvider{kind: config.ProviderDocker, asyncTeardown: true}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
+	lease := assignedLease(t, a)
+
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 15, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	if err := r.Destroy(t.Context(), 15); !errors.Is(err, server.ErrCustody) {
+		t.Fatalf("Destroy = %v, want ErrCustody", err)
+	}
+	p.settle(provider.InstanceName(lease.ID))
+
+	if err := r.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend after the host compute disappeared: %v", err)
+	}
+	if _, err := a.Lease(t.Context(), lease.ID); !errors.Is(err, alloc.ErrLeaseNotFound) {
+		t.Fatalf("ordinary host teardown lost its causal launch evidence: %v", err)
+	}
+}
+
 // An accepted remote teardown and its first absent inventory are not proof.
 //
 // EC2 can return a stale empty DescribeInstances result after TerminateInstances
@@ -444,21 +469,12 @@ func TestAnUnobservedTeardownKeepsCapacityAcrossTheFirstAbsentInventory(t *testi
 	if err := r.Tend(t.Context()); err != nil {
 		t.Fatalf("Tend after the instance materialised: %v", err)
 	}
-	p.settle(name)
-	now := time.Now()
-	r.now = func() time.Time { return now }
+	p.terminate(name)
 	if err := r.Tend(t.Context()); err != nil {
-		t.Fatalf("first Tend after the observed instance stopped: %v", err)
-	}
-	if _, err := a.Lease(t.Context(), lease.ID); err != nil {
-		t.Fatalf("one remote inventory miss released the observed instance: %v", err)
-	}
-	now = now.Add(time.Minute)
-	if err := r.Tend(t.Context()); err != nil {
-		t.Fatalf("Tend after the absence was sustained: %v", err)
+		t.Fatalf("Tend after EC2 reported the instance terminated: %v", err)
 	}
 	if _, err := a.Lease(t.Context(), lease.ID); !errors.Is(err, alloc.ErrLeaseNotFound) {
-		t.Fatalf("the sustained absence left the instance's capacity held: %v", err)
+		t.Fatalf("explicit terminal proof left the instance's capacity held: %v", err)
 	}
 }
 
@@ -508,15 +524,33 @@ func TestARemoteSightingNeedsSustainedAbsence(t *testing.T) {
 
 	now = now.Add(time.Minute)
 	if err := r.Tend(t.Context()); err != nil {
-		t.Fatalf("Tend after sustained absence: %v", err)
+		t.Fatalf("Tend on a second stale miss: %v", err)
+	}
+	if _, err := a.Lease(t.Context(), lease.ID); err != nil {
+		t.Fatalf("two short-window remote misses released capacity: %v", err)
+	}
+
+	p.add(inst)
+	now = now.Add(time.Minute)
+	if err := r.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend after the instance reappeared following two misses: %v", err)
+	}
+	p.settle(name)
+	if err := r.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend on the first miss after the second reappearance: %v", err)
+	}
+
+	now = now.Add(strayGrace)
+	if err := r.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend after the full consistency window: %v", err)
 	}
 	if _, err := a.Lease(t.Context(), lease.ID); !errors.Is(err, alloc.ErrLeaseNotFound) {
-		t.Fatalf("sustained remote absence left capacity held: %v", err)
+		t.Fatalf("the full consistency window left capacity held: %v", err)
 	}
 }
 
-// An error is not an absent sample. Even when custody itself is old, the grace
-// starts only once the backend first answers successfully that nothing is there.
+// An error breaks an absence sequence. Time before or during that ambiguous
+// result cannot age a later miss toward release.
 func TestErrorsBeforeAFirstRemoteMissDoNotAgeTheAbsence(t *testing.T) {
 	p := &fakeProvider{kind: config.ProviderEC2, asyncTeardown: true}
 	a, host := newAllocatorWithEC2Host(t)
@@ -532,6 +566,9 @@ func TestErrorsBeforeAFirstRemoteMissDoNotAgeTheAbsence(t *testing.T) {
 		t.Fatalf("Destroy = %v, want ErrCustody", err)
 	}
 	p.settle(provider.InstanceName(lease.ID))
+	if err := r.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend on the first miss: %v", err)
+	}
 	p.findErr = errors.New("DescribeInstances unavailable")
 	now = now.Add(2 * strayGrace)
 	if err := r.Tend(t.Context()); err == nil {
@@ -543,7 +580,61 @@ func TestErrorsBeforeAFirstRemoteMissDoNotAgeTheAbsence(t *testing.T) {
 		t.Fatalf("Tend on the first successful miss: %v", err)
 	}
 	if _, err := a.Lease(t.Context(), lease.ID); err != nil {
-		t.Fatalf("custody age turned the first successful miss into proof: %v", err)
+		t.Fatalf("an error failed to reset the prior absence interval: %v", err)
+	}
+	now = now.Add(strayGrace)
+	if err := r.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend after the new uninterrupted absence interval: %v", err)
+	}
+	if _, err := a.Lease(t.Context(), lease.ID); !errors.Is(err, alloc.ErrLeaseNotFound) {
+		t.Fatalf("the new full absence interval left capacity held: %v", err)
+	}
+}
+
+// destroyStray's first successful miss starts the grace immediately. Dropping
+// that observation adds a whole poll interval before the safety window even
+// begins.
+func TestAnAmbiguousLaunchCarriesItsFirstAbsentObservationIntoCustody(t *testing.T) {
+	p := &fakeProvider{kind: config.ProviderEC2, launchErr: errors.New("lost launch response")}
+	a, host := newAllocatorWithEC2Host(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
+	lease := assignedLease(t, a)
+	frozen := time.Now()
+	r.now = func() time.Time { return frozen }
+
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 16, Event: "push"}); !errors.Is(err, server.ErrCustody) {
+		t.Fatalf("Launch = %v, want ErrCustody", err)
+	}
+	held := r.custodySnapshot()
+	if len(held) != 1 {
+		t.Fatalf("Launch left %d custody entries, want 1", len(held))
+	}
+	if !held[0].absentSince.Equal(frozen) {
+		t.Fatalf("first successful miss was recorded at %v, want %v", held[0].absentSince, frozen)
+	}
+}
+
+// A positive Find in destroyStray is provider inventory evidence even when its
+// subsequent teardown is unconfirmed. Custody must carry that sighting rather
+// than reverting to the never-observed state.
+func TestAnAmbiguousLaunchCarriesItsPositiveObservationIntoCustody(t *testing.T) {
+	p := &fakeProvider{
+		kind: config.ProviderEC2, launchErr: errors.New("lost launch response"),
+		startsAnyway: true, asyncTeardown: true,
+	}
+	a, host := newAllocatorWithEC2Host(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
+	lease := assignedLease(t, a)
+
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 17, Event: "push"}); !errors.Is(err, server.ErrCustody) {
+		t.Fatalf("Launch = %v, want ErrCustody", err)
+	}
+	held := r.custodySnapshot()
+	if len(held) != 1 {
+		t.Fatalf("Launch left %d custody entries, want 1", len(held))
+	}
+	if !held[0].observed {
+		t.Fatal("destroyStray discarded its positive provider observation")
 	}
 }
 
@@ -1154,6 +1245,15 @@ func (f *fakeProvider) Destroy(ctx context.Context, id string) (provider.Teardow
 //
 // Only meaningful with asyncTeardown.
 func (f *fakeProvider) settle(name string) { delete(f.live, name) }
+
+// terminate leaves the provider's causal terminal record visible, as EC2 does
+// for targeted DescribeInstances calls after billing and execution have ended.
+func (f *fakeProvider) terminate(name string) {
+	if inst, ok := f.live[name]; ok {
+		inst.Running = false
+		inst.Terminal = true
+	}
+}
 
 // stop marks an instance finished without removing it, which is what a
 // container that ran its job and exited looks like: still there, still holding
