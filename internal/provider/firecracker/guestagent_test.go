@@ -180,6 +180,54 @@ func TestTheGuestImageIncludesBuildxForThePersistentBuilder(t *testing.T) {
 	}
 }
 
+func TestTheGuestImageGateKeepsDockerBehindTheCacheMount(t *testing.T) {
+	t.Parallel()
+
+	dangling := filepath.Join(t.TempDir(), "docker.service")
+	if err := os.Symlink("/billet-test-no-such-systemd-unit/docker.service", dangling); err != nil {
+		t.Fatalf("create absolute guest enablement symlink: %v", err)
+	}
+	if _, err := os.Stat(dangling); !os.IsNotExist(err) {
+		t.Fatalf("following the guest symlink error = %v; want not-exist", err)
+	}
+	if info, err := os.Lstat(dangling); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("inspect the guest symlink: info = %v, error = %v", info, err)
+	}
+
+	path := filepath.Join("..", "..", "..", "scripts", "check-guest-image.sh")
+	source, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read guest image checker: %v", err)
+	}
+	text := string(source)
+
+	if !strings.Contains(text, `[ -L "$WANTS/docker.service" ]`) ||
+		!strings.Contains(text, `[ -L "$DOCKER_SOCKET" ]`) ||
+		!strings.Contains(text, "Docker waits for the billet agent to mount its image store") {
+		t.Fatal("the image gate does not detect guest Docker enablement symlinks without following them on the host")
+	}
+	if strings.Contains(text, "for unit in docker.service billet-agent.service") {
+		t.Fatal("the image gate still requires Docker to start before the billet agent mounts its cache")
+	}
+
+	bootPath := filepath.Join("..", "..", "..", "scripts", "boot-guest-image.sh")
+	bootSource, err := os.ReadFile(bootPath)
+	if err != nil {
+		t.Fatalf("read guest image boot gate: %v", err)
+	}
+	bootText := string(bootSource)
+
+	if !strings.Contains(bootText, "docker_started=0") ||
+		!strings.Contains(bootText, `grep -q "Started.*docker.service" "$CONSOLE" 2>/dev/null && docker_started=1`) ||
+		!strings.Contains(bootText, `[ "$docker_started" -ne 0 ]`) {
+		t.Fatal("the boot gate does not reject Docker starting before the billet agent accepts its metadata")
+	}
+	if strings.Contains(bootText, "saw_docker") ||
+		strings.Contains(bootText, `report "$saw_docker" "docker started"`) {
+		t.Fatal("the boot gate still requires Docker to start before the billet agent mounts its cache")
+	}
+}
+
 func TestRegistryMirrorsRemainAStringLeafInGuestMetadata(t *testing.T) {
 	t.Parallel()
 

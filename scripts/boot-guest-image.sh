@@ -178,18 +178,20 @@ api PUT /actions '{"action_type":"InstanceStart"}'
 # THREE THINGS ARE WATCHED FOR, NOT ONE, so a failure says which half of the boot
 # worked. The first version waited only for the agent's verdict, and when that did
 # not appear it reported that the guest "never came up" -- while the console showed
-# it reaching multi-user.target with docker running. The test was wrong and its
+# it reaching multi-user.target. Docker starting here is itself a failure: the agent
+# has not accepted its metadata or mounted the cache-backed image store yet.
+# The old test required Docker to start and therefore proved the wrong ordering. Its
 # message sent the reader after the image.
 #
 # Firecracker exits 0 on some guest-side failures, so none of this waits on the
 # process.
 saw_multiuser=0
-saw_docker=0
+docker_started=0
 saw_agent=0
 
 for _ in $(seq 1 "$BOOT_TIMEOUT"); do
 	grep -q "Reached target.*[Mm]ulti-[Uu]ser" "$CONSOLE" 2>/dev/null && saw_multiuser=1
-	grep -q "Started.*docker.service" "$CONSOLE" 2>/dev/null && saw_docker=1
+	grep -q "Started.*docker.service" "$CONSOLE" 2>/dev/null && docker_started=1
 	grep -q "metadata contract $REFUSED_CONTRACT" "$CONSOLE" 2>/dev/null && saw_agent=1
 
 	[ "$saw_agent" -eq 1 ] && break
@@ -216,12 +218,16 @@ report() {
 }
 
 report "$saw_multiuser" "systemd reached multi-user.target"
-report "$saw_docker" "docker started"
 report "$saw_agent" "the agent fetched its metadata and refused contract $REFUSED_CONTRACT"
+if [ "$docker_started" -eq 0 ]; then
+	echo "  ok    Docker stayed stopped before the agent mounted its image store"
+else
+	echo "  FAIL  Docker started before the agent mounted its image store" >&2
+fi
 
 echo
 
-if [ "$saw_multiuser" -ne 1 ] || [ "$saw_docker" -ne 1 ] || [ "$saw_agent" -ne 1 ]; then
+if [ "$saw_multiuser" -ne 1 ] || [ "$saw_agent" -ne 1 ] || [ "$docker_started" -ne 0 ]; then
 	echo "this image did not boot into a working guest." >&2
 	echo >&2
 
@@ -237,7 +243,7 @@ fi
 
 echo "the agent's refusal proves the whole chain:"
 echo "  - the kernel booted this filesystem"
-echo "  - systemd reached its target and docker started"
+echo "  - systemd reached its target while Docker stayed behind the agent's cache mount"
 echo "  - the network came up and the route to the metadata service works"
 echo "  - MMDS answered and the agent parsed what it got"
 echo
