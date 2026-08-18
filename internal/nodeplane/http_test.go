@@ -997,11 +997,27 @@ func TestALaunchCarriesTheTierShape(t *testing.T) {
 	t.Parallel()
 
 	p, base := serve(t, &fakeStore{}, nodeplane.WithTierCatalog([]config.Tier{{
-		Label: "billet-2vcpu", Provider: config.ProviderDocker, GuestOS: config.GuestLinux,
-		VCPU: 2, Memory: 8 * config.GiB,
-		Image: "ghcr.io/actions/actions-runner:latest",
-		Disk:  40 * config.GiB, SHM: 512 * config.MiB,
-		RunnerGroup: "billet", Command: []string{"/entrypoint.sh"},
+		Label: "billet-2vcpu",
+		Providers: []config.ProviderKind{
+			config.ProviderEC2,
+			config.ProviderDocker,
+		},
+		GuestOS:     config.GuestLinux,
+		VCPU:        2,
+		Memory:      8 * config.GiB,
+		Disk:        40 * config.GiB,
+		SHM:         512 * config.MiB,
+		RunnerGroup: "billet",
+		Launch: map[config.ProviderKind]config.TierLaunch{
+			config.ProviderEC2: {
+				Image:   "ami-cloud",
+				Command: []string{"/usr/local/bin/billet-runner"},
+			},
+			config.ProviderDocker: {
+				Image:   "ghcr.io/actions/actions-runner:latest",
+				Command: []string{"/entrypoint.sh"},
+			},
+		},
 	}}))
 
 	c := dial(t, base)
@@ -1017,8 +1033,9 @@ func TestALaunchCarriesTheTierShape(t *testing.T) {
 
 	lease := &alloc.Lease{
 		ID: "l1", Tier: "billet-2vcpu", VCPU: 2, Memory: 8 * config.GiB,
-		GuestOS: config.GuestLinux, Providers: []config.ProviderKind{config.ProviderDocker},
-		Epoch: 1,
+		GuestOS:   config.GuestLinux,
+		Providers: []config.ProviderKind{config.ProviderEC2, config.ProviderDocker},
+		Epoch:     1,
 	}
 
 	// Buffered and never read: the node never answers, so this returns custody

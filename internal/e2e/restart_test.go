@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/fakeactions"
 	"github.com/junioryono/billet/internal/node"
 	"github.com/junioryono/billet/internal/nodeapi"
@@ -348,7 +349,8 @@ func (s *stack) launchDirectly(t *testing.T) *alloc.Lease {
 
 	// A push, so the container backend accepts it: these tests are about
 	// recovery, not about the trust boundary.
-	if err := s.runner.Launch(t.Context(), lease, nodeapi.TierSpecOf(s.tiers[0]),
+	if err := s.runner.Launch(t.Context(), lease,
+		nodeapi.TierSpecOf(s.tiers[0], config.ProviderDocker),
 		node.Job{RequestID: requestID, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}

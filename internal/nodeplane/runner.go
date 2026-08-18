@@ -68,7 +68,7 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job server.Job)
 			ID:    id,
 			Kind:  nodeapi.CommandLaunch,
 			Lease: lease,
-			Tier:  nodeapi.TierSpecOf(tier),
+			Tier:  nodeapi.TierSpecOf(tier, n.provider),
 			Job: &nodeapi.Job{
 				RequestID: job.RequestID,
 				RunID:     job.RunID,

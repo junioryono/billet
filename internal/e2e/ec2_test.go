@@ -395,7 +395,8 @@ func TestAJobReachesACloudInstance(t *testing.T) {
 
 	lease := s.assignedLease(t)
 
-	if err := s.runner.Launch(t.Context(), lease, nodeapi.TierSpecOf(s.tier),
+	if err := s.runner.Launch(t.Context(), lease,
+		nodeapi.TierSpecOf(s.tier, config.ProviderEC2),
 		server.Job{RequestID: 501, Event: "push"}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
@@ -506,7 +507,8 @@ func TestACloudNodeRefusesALeaseItWasNotPlacedFor(t *testing.T) {
 	// As though placement had chosen a bare-metal host for it.
 	lease.Providers = []config.ProviderKind{config.ProviderFirecracker}
 
-	err := s.runner.Launch(t.Context(), lease, nodeapi.TierSpecOf(s.tier),
+	err := s.runner.Launch(t.Context(), lease,
+		nodeapi.TierSpecOf(s.tier, config.ProviderEC2),
 		server.Job{RequestID: 502, Event: "push"})
 	if err == nil {
 		t.Fatal("a cloud node launched a lease that does not accept its backend")
@@ -534,7 +536,8 @@ func TestUntrustedWorkDoesNotReachTheCloudWithoutItsOwnNetwork(t *testing.T) {
 
 	lease := s.assignedLease(t)
 
-	err := s.runner.Launch(t.Context(), lease, nodeapi.TierSpecOf(s.tier),
+	err := s.runner.Launch(t.Context(), lease,
+		nodeapi.TierSpecOf(s.tier, config.ProviderEC2),
 		server.Job{RequestID: 503, Event: "pull_request"})
 	if err == nil {
 		t.Fatal("a fork pull request reached the cloud with no network described for it")

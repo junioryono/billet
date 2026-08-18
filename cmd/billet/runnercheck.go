@@ -175,8 +175,8 @@ func fleetRunnerVersion(ctx context.Context, cfgPath string) (string, bool, erro
 	)
 
 	for i := range cfg.Tiers {
-		image := cfg.Tiers[i].Image
-		if image == "" || cfg.Tiers[i].Provider != config.ProviderFirecracker {
+		image := cfg.Tiers[i].ImageFor(config.ProviderFirecracker)
+		if image == "" || !cfg.Tiers[i].AcceptsProvider(config.ProviderFirecracker) {
 			continue
 		}
 

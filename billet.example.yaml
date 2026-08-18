@@ -534,18 +534,23 @@ tiers:
   # serve the tier and have room — so a job goes to the cloud only when home is
   # full, rather than to whichever machine happened to ask first.
   #
-  # `ec2` is built and `firecracker` is not, so this exact pair cannot be used
-  # yet — swap firecracker for docker to try the shape. And nobody has run the
-  # cloud half against a real account: every test drives a fake EC2 API, and
-  # nothing builds the AMI it needs (#42), so treat the fallback as written
-  # rather than proven (#32).
+  # EACH BACKEND GETS ITS OWN LAUNCH DETAILS. A Firecracker generation and an
+  # EC2 AMI are both images, but neither backend can interpret the other's name;
+  # their runner entrypoints may differ too. Single-provider tiers keep the
+  # simpler top-level image and command fields. A multi-provider tier uses one
+  # launch entry for every provider instead.
   #
   # - label: billet-8vcpu-ubuntu-2404
   #   providers: [firecracker, ec2]   # instead of `provider: firecracker`
   #   vcpu: 8
   #   memory: 32GiB
   #   disk: 160GiB
-  #   image: ubuntu-2404-x64@g1
+  #   launch:
+  #     firecracker:
+  #       image: ubuntu-2404-x64@verified
+  #     ec2:
+  #       image: ami-0123456789abcdef0
+  #       command: [/usr/local/bin/billet-runner]
 
   - label: billet-2vcpu-ubuntu-2404
     provider: firecracker

@@ -145,8 +145,8 @@ var errNothingToBuild = &exitError{code: 2, msg: "a recent generation already ex
 // firecrackerTierImage is the image this deployment's microVM tiers boot.
 func firecrackerTierImage(cfg *config.Config) string {
 	for i := range cfg.Tiers {
-		if cfg.Tiers[i].Provider == config.ProviderFirecracker && cfg.Tiers[i].Image != "" {
-			return cfg.Tiers[i].Image
+		if image := cfg.Tiers[i].ImageFor(config.ProviderFirecracker); cfg.Tiers[i].AcceptsProvider(config.ProviderFirecracker) && image != "" {
+			return image
 		}
 	}
 
@@ -810,8 +810,8 @@ func cmdImagesReap(ctx context.Context, args []string) error {
 	// several, and a generation kept for one tier is kept.
 	pinned := make([]string, 0, len(cfg.Tiers))
 	for i := range cfg.Tiers {
-		if cfg.Tiers[i].Image != "" {
-			pinned = append(pinned, cfg.Tiers[i].Image)
+		if image := cfg.Tiers[i].ImageFor(config.ProviderFirecracker); cfg.Tiers[i].AcceptsProvider(config.ProviderFirecracker) && image != "" {
+			pinned = append(pinned, image)
 		}
 	}
 
@@ -1098,7 +1098,8 @@ func listTierImages(ctx context.Context, store *ceph.Client, cfg *config.Config)
 
 	for i := range cfg.Tiers {
 		tier := cfg.Tiers[i]
-		if tier.Image == "" || tier.Provider != config.ProviderFirecracker {
+		image := tier.ImageFor(config.ProviderFirecracker)
+		if image == "" || !tier.AcceptsProvider(config.ProviderFirecracker) {
 			continue
 		}
 
@@ -1108,23 +1109,23 @@ func listTierImages(ctx context.Context, store *ceph.Client, cfg *config.Config)
 			shown = true
 		}
 
-		resolved, err := store.ResolveGeneration(ctx, tier.Image)
+		resolved, err := store.ResolveGeneration(ctx, image)
 		if err != nil {
 			// NOT FATAL, and printed rather than returned: a tier that cannot resolve
 			// is exactly what somebody is running this command to find out about, and
 			// stopping at the first one would hide the others.
-			fmt.Printf("  %-20s %s -> cannot resolve: %v\n", tier.Label, tier.Image, err)
+			fmt.Printf("  %-20s %s -> cannot resolve: %v\n", tier.Label, image, err)
 
 			continue
 		}
 
-		if resolved == tier.Image {
-			fmt.Printf("  %-20s %s\n", tier.Label, tier.Image)
+		if resolved == image {
+			fmt.Printf("  %-20s %s\n", tier.Label, image)
 
 			continue
 		}
 
-		fmt.Printf("  %-20s %s -> %s\n", tier.Label, tier.Image, resolved)
+		fmt.Printf("  %-20s %s -> %s\n", tier.Label, image, resolved)
 	}
 
 	return nil

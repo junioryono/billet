@@ -8,6 +8,8 @@
 
 A tier that lists `providers: [firecracker, ec2]` must be placeable on either, so that losing the bare-metal host does not take the `runs-on` label down with it. That is the whole point of the cloud backend — it is an **availability** mechanism, not a performance one, and a job that fails over runs with a cold cache by design.
 
+The two backends do not share an image namespace or necessarily a runner entrypoint: Firecracker boots a Ceph generation such as `ubuntu-2404-x64@verified`, while EC2 boots a region-scoped AMI id. A multi-provider tier therefore carries one `launch` entry per accepted provider, each with that backend's image and optional command; the control plane selects the entry only after placement chooses a node and sends the node one concrete launch shape. Single-provider tiers retain the shorter top-level `image` and `command` fields.
+
 What it has to run is a **GitHub Actions job**, and that is a stronger requirement than "a container": real workflows use service containers, `docker build`, and `docker compose`. Whatever runs a job has to be able to run Docker inside it.
 
 ## The options

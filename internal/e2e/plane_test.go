@@ -347,7 +347,8 @@ type directRunner struct {
 func (d directRunner) Launch(ctx context.Context, lease *alloc.Lease, job server.Job) error {
 	for i := range d.tiers {
 		if d.tiers[i].Label == lease.Tier {
-			return d.runner.Launch(ctx, lease, nodeapi.TierSpecOf(d.tiers[i]), job)
+			return d.runner.Launch(ctx, lease,
+				nodeapi.TierSpecOf(d.tiers[i], config.ProviderDocker), job)
 		}
 	}
 

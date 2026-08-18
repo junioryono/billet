@@ -1121,6 +1121,12 @@ type Tier struct {
 	// reports success, so the command cannot be left to the image.
 	Command []string `yaml:"command,omitempty"`
 
+	// Launch holds backend-specific boot details for a tier that accepts more than
+	// one provider. A Firecracker generation and an EC2 AMI are both images, but
+	// neither backend can interpret the other's name; commands can differ for the
+	// same reason. Single-provider tiers keep the simpler image and command fields.
+	Launch map[ProviderKind]TierLaunch `yaml:"launch,omitempty"`
+
 	// NOTE: the scale-set client interpolates this name into a query string WITHOUT
 	// escaping it, so an ordinary group name like "Platform & Security" is parsed as
 	// two parameters and comes back as "group not found". Validation rejects what the
@@ -1137,7 +1143,7 @@ type Tier struct {
 	// active mount that never becomes old enough for that policy to trim.
 	BuildKitCacheMountLimit ByteSize `yaml:"buildkit_cache_mount_limit,omitempty"`
 
-	Image string `yaml:"image"`
+	Image string `yaml:"image,omitempty"`
 
 	// WarmPool is reserved for pre-booted idle VMs. Validation refuses a non-zero
 	// value until a provider implements it, because accepting an inert cost setting
@@ -1168,6 +1174,12 @@ type Tier struct {
 	// machine is permanently 16 vCPU smaller, with no error and no log line. Reserve
 	// for tiers that have demand and are being crowded out. Zero is the default.
 	Reserved int `yaml:"reserved,omitempty"`
+}
+
+// TierLaunch is the part of a tier whose spelling belongs to one backend.
+type TierLaunch struct {
+	Image   string   `yaml:"image"`
+	Command []string `yaml:"command,omitempty"`
 }
 
 // DefaultMacOSVMLimit is Apple's licensing cap on macOS guests per Apple-branded
@@ -1328,6 +1340,83 @@ func (t Tier) AcceptableProviders() []ProviderKind {
 // AcceptsProvider reports whether a tier may run on a backend.
 func (t Tier) AcceptsProvider(p ProviderKind) bool {
 	return slices.Contains(t.AcceptableProviders(), p)
+}
+
+// LaunchErrors reports incomplete or ambiguous backend-specific boot details.
+func (t Tier) LaunchErrors(where string) []error {
+	accepted := t.AcceptableProviders()
+	var errs []error
+
+	if len(t.Launch) == 0 {
+		if len(accepted) > 1 {
+			errs = append(errs, fmt.Errorf("%s: a tier with multiple providers must set launch "+
+				"for each provider; image names and runner commands belong to their backend", where))
+
+			return errs
+		}
+
+		if t.Image == "" {
+			errs = append(errs, fmt.Errorf("%s: image is required", where))
+		}
+
+		return errs
+	}
+
+	if t.Image != "" {
+		errs = append(errs, fmt.Errorf("%s: set either image or launch, not both; one image "+
+			"cannot name artifacts for several backends", where))
+	}
+
+	if len(t.Command) > 0 {
+		errs = append(errs, fmt.Errorf("%s: set commands inside launch when launch is used; "+
+			"billet will not guess whether a top-level command applies to every backend", where))
+	}
+
+	acceptedSet := make(map[ProviderKind]struct{}, len(accepted))
+	for _, provider := range accepted {
+		acceptedSet[provider] = struct{}{}
+
+		launch, ok := t.Launch[provider]
+		if !ok {
+			errs = append(errs, fmt.Errorf("%s: launch.%s is required because the tier accepts %s",
+				where, provider, provider))
+		} else if launch.Image == "" {
+			errs = append(errs, fmt.Errorf("%s: launch.%s.image is required", where, provider))
+		}
+	}
+
+	extra := make([]string, 0, len(t.Launch))
+	for provider := range t.Launch {
+		if _, ok := acceptedSet[provider]; !ok {
+			extra = append(extra, string(provider))
+		}
+	}
+	slices.Sort(extra)
+
+	for _, provider := range extra {
+		errs = append(errs, fmt.Errorf("%s: launch.%s is set, but the tier does not accept %s",
+			where, provider, provider))
+	}
+
+	return errs
+}
+
+// ImageFor returns the image name understood by a selected provider.
+func (t Tier) ImageFor(provider ProviderKind) string {
+	if launch, ok := t.Launch[provider]; ok {
+		return launch.Image
+	}
+
+	return t.Image
+}
+
+// RunnerCommandFor returns the argv understood by a selected provider.
+func (t Tier) RunnerCommandFor(provider ProviderKind) []string {
+	if launch, ok := t.Launch[provider]; ok && len(launch.Command) > 0 {
+		return slices.Clone(launch.Command)
+	}
+
+	return t.RunnerCommand()
 }
 
 // MaxCustodyDuration parses Node.MaxCustody, reporting zero when unset.
@@ -2869,9 +2958,7 @@ func (c *Config) validateTiers() []error {
 			errs = append(errs, fmt.Errorf("%s: buildkit_cache_mount_limit must be more than zero "+
 				"and no larger than 100GiB", where))
 		}
-		if t.Image == "" {
-			errs = append(errs, fmt.Errorf("%s: image is required", where))
-		}
+		errs = append(errs, t.LaunchErrors(where)...)
 		if t.WarmPool < 0 {
 			errs = append(errs, fmt.Errorf("%s: warm_pool must not be negative", where))
 		} else if t.WarmPool > 0 {

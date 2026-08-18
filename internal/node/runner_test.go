@@ -966,7 +966,7 @@ func TestAnInstanceThatWillNotDieStaysTracked(t *testing.T) {
 
 // dockerSpec is what the control plane sends with a launch for dockerTier.
 func dockerSpec() *nodeapi.TierSpec {
-	return nodeapi.TierSpecOf(dockerTier())
+	return nodeapi.TierSpecOf(dockerTier(), config.ProviderDocker)
 }
 
 func dockerTier() config.Tier {

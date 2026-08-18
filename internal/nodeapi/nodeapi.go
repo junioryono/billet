@@ -263,12 +263,14 @@ type TierSpec struct {
 	BuildKitCacheMountLimit config.ByteSize `json:"buildkit_cache_mount_limit"`
 }
 
-// TierSpecOf renders the parts of a tier that travel to a node.
-func TierSpecOf(t config.Tier) *TierSpec {
+// TierSpecOf renders the parts of a tier that travel to the selected provider's
+// node. The selection happens before this shape crosses the wire, so nodes do not
+// need a second copy of the catalogue or its other backends' image names.
+func TierSpecOf(t config.Tier, provider config.ProviderKind) *TierSpec {
 	return &TierSpec{
 		Label:       t.Label,
-		Image:       t.Image,
-		Command:     t.RunnerCommand(),
+		Image:       t.ImageFor(provider),
+		Command:     t.RunnerCommandFor(provider),
 		Disk:        t.Disk,
 		SHM:         t.SHM,
 		RunnerGroup: t.RunnerGroup,
