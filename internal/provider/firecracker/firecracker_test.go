@@ -657,6 +657,52 @@ func TestDestroyRemovesEverythingAGuestLeavesBehind(t *testing.T) {
 	}
 }
 
+// A CEPH OUTAGE AFTER A SUCCESSFUL LAUNCH MUST KEEP CUSTODY. The stopped VMM is
+// no longer work, but its jail is the only durable record tying the mapped clone
+// and resource claims to this lease. A later Destroy must be able to converge.
+func TestDestroyRetainsCustodyUntilTheRootDiskCanBeDiscarded(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.launch(t)
+	h.disk.discardErr = errors.New("ceph is unavailable")
+
+	if _, err := h.p.Destroy(t.Context(), theInstance); err == nil {
+		t.Fatal("Destroy reported success although the root disk could not be discarded")
+	}
+
+	j := h.p.jailFor(theInstance)
+	if _, err := os.Stat(j.dir()); err != nil {
+		t.Fatalf("the jail no longer records custody of the retained clone: %v", err)
+	}
+	if held, err := h.p.claimedBy(theInstance); err != nil {
+		t.Fatalf("read retained resource claims: %v", err)
+	} else if held == (resources{}) {
+		t.Fatal("Destroy released every claim while the root clone remained")
+	}
+
+	listed, err := h.p.List(t.Context())
+	if err != nil {
+		t.Fatalf("List after the failed Destroy: %v", err)
+	}
+	if len(listed) != 1 || listed[0].Name != theInstance {
+		t.Fatalf("the retained lease vanished from inventory: %+v", listed)
+	}
+
+	h.disk.discardErr = nil
+	if _, err := h.p.Destroy(t.Context(), theInstance); err != nil {
+		t.Fatalf("retry Destroy: %v", err)
+	}
+	if _, err := os.Stat(j.dir()); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the retry did not remove the jail: %v", err)
+	}
+	if held, err := h.p.claimedBy(theInstance); err != nil {
+		t.Fatalf("read resource claims after retry: %v", err)
+	} else if held != (resources{}) {
+		t.Errorf("the retry left resource claims behind: %+v", held)
+	}
+}
+
 // AND IT IS IDEMPOTENT, because teardown runs on paths that have already failed
 // once. A second destroy must not turn a recoverable state into a stuck one.
 func TestDestroyingTwiceIsNotAnError(t *testing.T) {
