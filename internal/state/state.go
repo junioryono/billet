@@ -1312,6 +1312,25 @@ var pendingCompletionLeaseMigration = migration{
 	},
 }
 
+// Completion recovery needs both the bound host and a monotonic delivery phase.
+// The host keeps restart reconciliation from treating an unrelated live fleet as
+// proof of absence. The message id distinguishes a redelivery from a later job
+// that reuses GitHub's request id, and retired is the durable tombstone that makes
+// a failed row deletion harmless.
+var pendingCompletionRecoveryMigration = migration{
+	Version: 24,
+	Name:    "pending_completion_recovery",
+	Stmts: []string{
+		`ALTER TABLE pending_completions ADD COLUMN lease_node TEXT NOT NULL DEFAULT ''`,
+		`UPDATE pending_completions
+		    SET lease_node = COALESCE((SELECT COALESCE(node, target_node, '') FROM leases
+		                               WHERE leases.id = pending_completions.lease_id), '')
+		  WHERE lease_id != ''`,
+		`ALTER TABLE pending_completions ADD COLUMN message_id INTEGER NOT NULL DEFAULT 0 CHECK (message_id >= 0)`,
+		`ALTER TABLE pending_completions ADD COLUMN retired INTEGER NOT NULL DEFAULT 0 CHECK (retired IN (0,1))`,
+	},
+}
+
 func init() {
 	migrations = append(migrations,
 		placementMigration, guestOSMigration, placementFactsMigration, requestIDMigration,
@@ -1319,7 +1338,8 @@ func init() {
 		certRevocationMigration, nodeEnrollmentMigration, joinTokenMigration,
 		issuedCertMigration, quarantineMigration, strictTrustTablesMigration,
 		nodeRevocationMigration, ec2ShapeAccountingMigration, custodyVisibilityMigration,
-		leaseFailureReasonMigration, pendingCompletionsMigration, pendingCompletionLeaseMigration)
+		leaseFailureReasonMigration, pendingCompletionsMigration, pendingCompletionLeaseMigration,
+		pendingCompletionRecoveryMigration)
 }
 
 const bootstrapSchemaMigrations = `CREATE TABLE IF NOT EXISTS schema_migrations (

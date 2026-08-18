@@ -831,7 +831,7 @@ func (h *handler) register(w http.ResponseWriter, r *http.Request) {
 		open = append(open, id)
 	}
 
-	h.plane.AdoptOwnership(req.Node, req.Incarnation, open)
+	h.plane.AdoptOwnershipWithInventory(req.Node, req.Incarnation, open, req.InventoryKnown)
 
 	h.log.Info("node registered",
 		"node", req.Node, "provider", req.Provider, "guest_os", req.GuestOS)

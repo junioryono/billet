@@ -60,10 +60,17 @@ type CompletionAwareRunner interface {
 	DestroyCompleted(ctx context.Context, requestID int64, result string) error
 }
 
+// BoundCompletionAwareRunner reconciles teardown with the node and lease that
+// actually held compute before a control-plane restart erased live ownership.
+type BoundCompletionAwareRunner interface {
+	DestroyCompletedBound(context.Context, int64, string, string, string) error
+}
+
 // completionStore is the durable half of result-dependent teardown.
 type completionStore interface {
 	PutPendingCompletion(context.Context, state.PendingCompletion) error
-	DeletePendingCompletion(context.Context, string, int64) error
+	RetirePendingCompletion(context.Context, string, int64, int64) error
+	DeletePendingCompletion(context.Context, string, int64, int64) error
 	PendingCompletions(context.Context, string) ([]state.PendingCompletion, error)
 }
 
@@ -157,6 +164,9 @@ type Message struct {
 type Job struct {
 	RequestID int64
 	RunID     int64
+	// CompletionID is the scale-set message that delivered the result. A
+	// redelivery keeps it; a later reuse of RequestID receives a different one.
+	CompletionID int64
 	// Result is GitHub's conclusion on a completed-job message. It is empty on
 	// available and assigned messages.
 	Result string
@@ -361,6 +371,9 @@ type pendingCleanup struct {
 	// succeeded. Retrying a remote destroy in either case can only delay the
 	// ledger release, and during shutdown that delay can be a full node timeout.
 	releaseOnly bool
+	// retireOnly means teardown and capacity settlement are complete, but the
+	// durable tombstone still needs to be written before this id can be reused.
+	retireOnly bool
 	// Doubles after each failure, up to maxRetryEvery.
 	wait time.Duration
 	// Zero means immediately, which is what a freshly recorded failure wants.
@@ -1404,7 +1417,7 @@ func (l *Listener) destroyAll(ctx context.Context) map[int64]bool {
 	}
 
 	for id, entry := range l.cleanup {
-		if entry.releaseOnly {
+		if entry.releaseOnly || entry.retireOnly {
 			continue
 		}
 
@@ -1470,7 +1483,7 @@ func (l *Listener) destroyAll(ctx context.Context) map[int64]bool {
 			}
 
 			lease, outcome, _ := l.completionRelease(requestID)
-			err := l.destroyCompleted(ctx, job)
+			err := l.destroyCompleted(ctx, job, lease)
 
 			// CUSTODY DISCHARGES THE OBLIGATION RATHER THAN FAILING IT (#46).
 			//
@@ -1486,10 +1499,20 @@ func (l *Listener) destroyAll(ctx context.Context) map[int64]bool {
 			// listener, which is what the caller reads this map for.
 			held := errors.Is(err, ErrCustody)
 			persisted := true
+			retired := true
 			if held {
-				l.forgetCompletion(ctx, job)
-			} else if err == nil && lease != nil {
-				if persistErr := l.recordReleaseOnly(ctx, job, lease, outcome); persistErr != nil {
+				retired = l.forgetCompletion(ctx, job)
+				if !retired {
+					l.parkRetirement(job)
+				}
+			} else if err == nil {
+				if lease == nil {
+					retired = l.forgetCompletion(ctx, job)
+					persisted = retired
+					if !retired {
+						l.parkRetirement(job)
+					}
+				} else if persistErr := l.recordReleaseOnly(ctx, job, lease, outcome); persistErr != nil {
 					persisted = false
 					l.parkReleaseOnly(job, lease, outcome)
 					l.log.Error("compute was confirmed absent, but its release-only obligation could not be made durable; capacity stays held until this is retried",
@@ -1519,7 +1542,12 @@ func (l *Listener) destroyAll(ctx context.Context) map[int64]bool {
 
 				l.mu.Lock()
 				delete(l.running, requestID)
-				delete(l.cleanup, requestID)
+				if retired {
+					if entry := l.cleanup[requestID]; entry == nil ||
+						entry.job.CompletionID == 0 || entry.job.CompletionID == job.CompletionID {
+						delete(l.cleanup, requestID)
+					}
+				}
 				l.mu.Unlock()
 
 				return
@@ -1543,7 +1571,7 @@ func (l *Listener) destroyAll(ctx context.Context) map[int64]bool {
 			// CAPACITY whose release never landed, and deleting it here dropped the
 			// last reference before releaseAll could see it — leaving the ledger
 			// charging for a job that never started.
-			if entry, ok := l.cleanup[requestID]; !ok || entry.lease == nil {
+			if entry, ok := l.cleanup[requestID]; (!ok || entry.lease == nil) && retired {
 				delete(l.cleanup, requestID)
 			}
 
@@ -1584,10 +1612,20 @@ func (l *Listener) attempt(ctx context.Context, job Job) {
 		return
 	}
 
+	if entry.retireOnly {
+		retireJob := entry.job
+		l.mu.Unlock()
+		l.retireParked(ctx, entry, retireJob)
+
+		return
+	}
+
 	if entry.releaseOnly {
 		l.mu.Unlock()
 		if handled, settled := l.releaseParked(ctx, job.RequestID); handled && settled {
-			l.forgetCompletion(ctx, job)
+			if !l.forgetCompletion(ctx, job) {
+				l.parkRetirement(job)
+			}
 		}
 
 		return
@@ -1937,6 +1975,7 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 	finished := make(map[int64]struct{}, len(msg.Completed))
 
 	for _, job := range msg.Completed {
+		job.CompletionID = msg.MessageID
 		finished[job.RequestID] = struct{}{}
 
 		if err := l.recordCompletion(ctx, job); err != nil {
@@ -2586,10 +2625,12 @@ func (l *Listener) recordCompletion(ctx context.Context, job Job) error {
 	lease, outcome, releaseOnly := l.completionRelease(job.RequestID)
 	completion := state.PendingCompletion{
 		Tier: l.tier, RequestID: job.RequestID, RunID: job.RunID, Result: job.Result,
+		MessageID: job.CompletionID,
 	}
 	if lease != nil {
 		completion.LeaseID = lease.ID
 		completion.LeaseEpoch = lease.Epoch
+		completion.LeaseNode = lease.Node
 		completion.Outcome = string(outcome)
 		completion.ReleaseOnly = releaseOnly
 	}
@@ -2617,11 +2658,12 @@ func (l *Listener) recordReleaseOnly(
 	if outcome == "" {
 		outcome = alloc.PhaseDone
 	}
-	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), l.releaseGrace)
+	persistCtx, cancel := withoutCancelWithin(ctx, l.releaseGrace)
 	defer cancel()
 	completion := state.PendingCompletion{
 		Tier: l.tier, RequestID: job.RequestID, RunID: job.RunID, Result: job.Result,
-		LeaseID: lease.ID, LeaseEpoch: lease.Epoch, Outcome: string(outcome), ReleaseOnly: true,
+		LeaseID: lease.ID, LeaseEpoch: lease.Epoch, LeaseNode: lease.Node,
+		Outcome: string(outcome), ReleaseOnly: true, MessageID: job.CompletionID,
 	}
 	if err := l.completionStore.PutPendingCompletion(persistCtx, completion); err != nil {
 		return fmt.Errorf("server: preserve release-only completion for %s request %d: %w",
@@ -2629,6 +2671,17 @@ func (l *Listener) recordReleaseOnly(
 	}
 
 	return nil
+}
+
+// withoutCancelWithin survives an ordinary caller cancellation without extending
+// an existing shutdown deadline.
+func withoutCancelWithin(ctx context.Context, grace time.Duration) (context.Context, context.CancelFunc) {
+	base := context.WithoutCancel(ctx)
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < grace {
+		return context.WithDeadline(base, deadline)
+	}
+
+	return context.WithTimeout(base, grace)
 }
 
 // parkReleaseOnly retains capacity whose compute is gone until persistence and
@@ -2647,6 +2700,9 @@ func (l *Listener) parkReleaseOnly(job Job, lease *alloc.Lease, outcome alloc.Ph
 		l.cleanup = make(map[int64]*pendingCleanup)
 	}
 	entry := l.cleanup[job.RequestID]
+	if entry != nil && entry.job.CompletionID > job.CompletionID {
+		return
+	}
 	if entry == nil {
 		entry = &pendingCleanup{job: job}
 		l.cleanup[job.RequestID] = entry
@@ -2685,21 +2741,97 @@ func (l *Listener) completionRelease(requestID int64) (*alloc.Lease, alloc.Phase
 	return nil, "", false
 }
 
-func (l *Listener) forgetCompletion(ctx context.Context, job Job) {
+func (l *Listener) forgetCompletion(ctx context.Context, job Job) bool {
 	if l.completionStore == nil || job.Result == "" {
-		return
+		return true
 	}
-	l.forgetCompletionRequest(ctx, job.RequestID)
+	if err := l.completionStore.RetirePendingCompletion(
+		ctx, l.tier, job.RequestID, job.CompletionID,
+	); err != nil {
+		l.log.Error("a completed job settled, but its durable tombstone could not be written; its request id stays blocked until this is retried",
+			"tier", l.tier, "request", job.RequestID, "error", err)
+
+		return false
+	}
+	l.forgetRetiredCompletion(ctx, job)
+
+	return true
 }
 
-func (l *Listener) forgetCompletionRequest(ctx context.Context, requestID int64) {
+func (l *Listener) forgetRetiredCompletion(ctx context.Context, job Job) {
 	if l.completionStore == nil {
 		return
 	}
-	if err := l.completionStore.DeletePendingCompletion(ctx, l.tier, requestID); err != nil {
-		l.log.Error("a completed job settled, but its durable obligation could not be removed; a restart will safely settle it again",
-			"tier", l.tier, "request", requestID, "error", err)
+	if err := l.completionStore.DeletePendingCompletion(
+		ctx, l.tier, job.RequestID, job.CompletionID,
+	); err != nil {
+		l.log.Error("a retired completion tombstone could not be removed; replay remains disabled",
+			"tier", l.tier, "request", job.RequestID, "error", err)
 	}
+}
+
+func (l *Listener) parkRetirement(job Job) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.cleanup == nil {
+		l.cleanup = make(map[int64]*pendingCleanup)
+	}
+	entry := l.cleanup[job.RequestID]
+	if entry != nil && entry.job.CompletionID > job.CompletionID {
+		return
+	}
+	if entry == nil {
+		entry = &pendingCleanup{}
+		l.cleanup[job.RequestID] = entry
+	}
+	entry.job = job
+	entry.lease = nil
+	entry.releaseOnly = false
+	entry.retireOnly = true
+	entry.failed(time.Now(), l.retryFirst, l.retryMax)
+}
+
+// retireParked retries only the durable tombstone, never the teardown it follows.
+func (l *Listener) retireParked(ctx context.Context, entry *pendingCleanup, job Job) {
+	if !l.forgetCompletion(ctx, job) {
+		return
+	}
+	l.mu.Lock()
+	if l.cleanup[job.RequestID] == entry {
+		delete(l.cleanup, job.RequestID)
+	}
+	l.mu.Unlock()
+}
+
+// retryParkedRetirement reports whether this delivery is already past teardown.
+func (l *Listener) retryParkedRetirement(ctx context.Context, job Job) bool {
+	l.mu.Lock()
+	entry := l.cleanup[job.RequestID]
+	if entry == nil || !entry.retireOnly ||
+		(entry.job.CompletionID != 0 && entry.job.CompletionID != job.CompletionID) {
+		l.mu.Unlock()
+
+		return false
+	}
+	retireJob := entry.job
+	l.mu.Unlock()
+	l.retireParked(ctx, entry, retireJob)
+
+	return true
+}
+
+// deleteCompletionCleanup cannot let an older message remove a reused id's obligation.
+func (l *Listener) deleteCompletionCleanup(job Job) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	entry := l.cleanup[job.RequestID]
+	if entry == nil {
+		return
+	}
+	if entry.job.CompletionID != 0 && entry.job.CompletionID != job.CompletionID {
+		return
+	}
+	delete(l.cleanup, job.RequestID)
 }
 
 func (l *Listener) restoreCompletions(ctx context.Context) error {
@@ -2711,14 +2843,22 @@ func (l *Listener) restoreCompletions(ctx context.Context) error {
 		return fmt.Errorf("server: restore pending completions for %s: %w", l.tier, err)
 	}
 
+	var retired []Job
 	l.mu.Lock()
-	defer l.mu.Unlock()
-	for _, completion := range completions {
-		job := Job{RequestID: completion.RequestID, RunID: completion.RunID, Result: completion.Result}
+	for i := range completions {
+		completion := &completions[i]
+		job := Job{RequestID: completion.RequestID, RunID: completion.RunID, Result: completion.Result,
+			CompletionID: completion.MessageID}
+		if completion.Retired {
+			retired = append(retired, job)
+
+			continue
+		}
 		if entry := l.cleanup[job.RequestID]; entry != nil {
 			entry.job = job
 			if completion.LeaseID != "" {
-				entry.lease = &alloc.Lease{ID: completion.LeaseID, Epoch: completion.LeaseEpoch}
+				entry.lease = &alloc.Lease{ID: completion.LeaseID, Epoch: completion.LeaseEpoch,
+					Node: completion.LeaseNode}
 				entry.outcome = alloc.Phase(completion.Outcome)
 				entry.releaseOnly = completion.ReleaseOnly
 			}
@@ -2727,11 +2867,16 @@ func (l *Listener) restoreCompletions(ctx context.Context) error {
 		}
 		entry := &pendingCleanup{job: job}
 		if completion.LeaseID != "" {
-			entry.lease = &alloc.Lease{ID: completion.LeaseID, Epoch: completion.LeaseEpoch}
+			entry.lease = &alloc.Lease{ID: completion.LeaseID, Epoch: completion.LeaseEpoch,
+				Node: completion.LeaseNode}
 			entry.outcome = alloc.Phase(completion.Outcome)
 			entry.releaseOnly = completion.ReleaseOnly
 		}
 		l.cleanup[job.RequestID] = entry
+	}
+	l.mu.Unlock()
+	for _, job := range retired {
+		l.forgetRetiredCompletion(ctx, job)
 	}
 
 	return nil
@@ -2755,12 +2900,21 @@ func (l *Listener) restoreCompletions(ctx context.Context) error {
 // always nil is an invitation to wire the next failure mode through it, and the
 // branch handling it would never run.
 func (l *Listener) complete(ctx context.Context, job Job) {
+	// A redelivery after teardown and release settled can only retry the durable
+	// tombstone. Repeating teardown here could address replacement compute if the
+	// source reused the request id after an acknowledgement failure.
+	if l.retryParkedRetirement(ctx, job) {
+		return
+	}
+
 	// A previous attempt already established that no compute exists. Repeating a
 	// remote destroy adds no proof, and on shutdown it can wait a full node timeout
 	// before the local release that is the only work left.
 	if handled, settled := l.releaseParked(ctx, job.RequestID); handled {
 		if settled {
-			l.forgetCompletion(ctx, job)
+			if !l.forgetCompletion(ctx, job) {
+				l.parkRetirement(job)
+			}
 		}
 
 		return
@@ -2787,7 +2941,7 @@ func (l *Listener) complete(ctx context.Context, job Job) {
 	// forever if that node never comes back.
 	before, beforeOutcome, _ := l.completionRelease(job.RequestID)
 
-	if err := l.destroyCompleted(ctx, job); err != nil {
+	if err := l.destroyCompleted(ctx, job, before); err != nil {
 		// THE RUNNER IS HOLDING IT, SO THIS LISTENER LETS GO (#46).
 		//
 		// A backend whose teardown is asynchronous cannot answer this call with
@@ -2804,14 +2958,22 @@ func (l *Listener) complete(ctx context.Context, job Job) {
 		// finished, and a redelivered completion must not find this listener still
 		// claiming the job.
 		if errors.Is(err, ErrCustody) {
-			l.forgetCompletion(ctx, job)
+			retired := l.forgetCompletion(ctx, job)
+			if !retired {
+				l.parkRetirement(job)
+			}
 			l.log.Info("the compute for a finished job was asked to stop and has not been "+
 				"confirmed gone; the runner is holding its capacity until it is",
 				"tier", l.tier, "request", job.RequestID)
 
 			l.mu.Lock()
 			delete(l.running, job.RequestID)
-			delete(l.cleanup, job.RequestID)
+			if retired {
+				if entry := l.cleanup[job.RequestID]; entry == nil ||
+					entry.job.CompletionID == 0 || entry.job.CompletionID == job.CompletionID {
+					delete(l.cleanup, job.RequestID)
+				}
+			}
 			l.mu.Unlock()
 
 			return
@@ -2946,9 +3108,12 @@ func (l *Listener) complete(ctx context.Context, job Job) {
 		// Nothing left to retry either way — including for a lease that was fenced
 		// or reaped out from under this listener, whose entry would otherwise sit
 		// in the map being retried for the life of the process.
-		delete(l.cleanup, job.RequestID)
 		l.mu.Unlock()
-		l.forgetCompletion(ctx, job)
+		if l.forgetCompletion(ctx, job) {
+			l.deleteCompletionCleanup(job)
+		} else {
+			l.parkRetirement(job)
+		}
 
 		return
 	}
@@ -3027,12 +3192,19 @@ func (l *Listener) complete(ctx context.Context, job Job) {
 	// RELEASED, so the job is finally over and there is nothing to retry.
 	delete(l.running, job.RequestID)
 	delete(l.acquiring, job.RequestID)
-	delete(l.cleanup, job.RequestID)
 	l.mu.Unlock()
-	l.forgetCompletion(ctx, job)
+	if l.forgetCompletion(ctx, job) {
+		l.deleteCompletionCleanup(job)
+	} else {
+		l.parkRetirement(job)
+	}
 }
 
-func (l *Listener) destroyCompleted(ctx context.Context, job Job) error {
+func (l *Listener) destroyCompleted(ctx context.Context, job Job, lease *alloc.Lease) error {
+	if runner, ok := l.runner.(BoundCompletionAwareRunner); ok && job.Result != "" &&
+		lease != nil && lease.ID != "" && lease.Node != "" {
+		return runner.DestroyCompletedBound(ctx, job.RequestID, job.Result, lease.ID, lease.Node)
+	}
 	if runner, ok := l.runner.(CompletionAwareRunner); ok && job.Result != "" {
 		return runner.DestroyCompleted(ctx, job.RequestID, job.Result)
 	}
@@ -3071,8 +3243,12 @@ func (l *Listener) releaseAll(ctx context.Context, destroyed map[int64]bool) {
 	// its lease here rather than in `running`, and shutdown is the last chance
 	// anything in this process has to hand that capacity back.
 	parked := make(map[int64]*pendingCleanup, len(l.cleanup))
+	retirements := make([]Job, 0, len(l.cleanup))
 
 	for id, entry := range l.cleanup {
+		if entry.retireOnly {
+			retirements = append(retirements, entry.job)
+		}
 		if entry.lease != nil {
 			parked[id] = entry
 		}
@@ -3081,6 +3257,9 @@ func (l *Listener) releaseAll(ctx context.Context, destroyed map[int64]bool) {
 	l.held = nil
 	l.acquiring = make(map[int64]*promise)
 	l.mu.Unlock()
+	for _, job := range retirements {
+		l.forgetCompletion(ctx, job)
+	}
 
 	// WHAT DID NOT LAND IS PUT BACK, rather than dropped on the floor. These were
 	// cleared above so nothing new could take them mid-shutdown; a release that
@@ -3141,7 +3320,9 @@ func (l *Listener) releaseAll(ctx context.Context, destroyed map[int64]bool) {
 
 			continue
 		}
-		l.forgetCompletionRequest(ctx, requestID)
+		if entry := parked[requestID]; entry != nil {
+			l.forgetCompletion(ctx, entry.job)
+		}
 	}
 
 	// Promised escrow too. The acquisition was made to GitHub, but nothing has
@@ -3174,7 +3355,7 @@ func (l *Listener) releaseAll(ctx context.Context, destroyed map[int64]bool) {
 			}
 		}
 		if releaseSettled(err) {
-			l.forgetCompletionRequest(ctx, id)
+			l.forgetCompletion(ctx, entry.job)
 		}
 	}
 

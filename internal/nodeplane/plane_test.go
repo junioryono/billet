@@ -1764,6 +1764,28 @@ func TestReconcileRefusesAnInventoryFromASupersededProcess(t *testing.T) {
 	}
 }
 
+func TestReconcileMarksTheReportingIncarnationInventoryKnown(t *testing.T) {
+	p := New(slog.New(slog.DiscardHandler), deployment, time.Minute,
+		WithRegistrar(&countingRegistrar{}))
+	const incarnation = "first"
+	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
+		Version: nodeapi.Version, Node: "n1", Provider: config.ProviderDocker,
+		Deployment: deployment, VCPU: 8, Memory: 32 * config.GiB,
+		Incarnation: incarnation,
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if p.reconciledNode("n1") {
+		t.Fatal("a node that has not reported inventory was marked reconciled")
+	}
+	if _, err := p.ReconcileInventory(t.Context(), "n1", incarnation, nil); err != nil {
+		t.Fatalf("reconcile inventory: %v", err)
+	}
+	if !p.reconciledNode("n1") {
+		t.Fatal("a complete inventory did not mark its reporting incarnation reconciled")
+	}
+}
+
 // countingRegistrar is a Registrar that records nothing and answers everything,
 // so a test can reach the plane's own decisions.
 type countingRegistrar struct{}

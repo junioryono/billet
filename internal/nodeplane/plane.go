@@ -131,6 +131,8 @@ type node struct {
 	provider    config.ProviderKind
 	guestOS     []config.GuestOS
 	lastSeen    time.Time
+	// inventoryKnown says this incarnation supplied a complete provider inventory.
+	inventoryKnown bool
 
 	// ledgerEpoch is the fencing token the ledger gave this registration.
 	//
@@ -418,6 +420,17 @@ func (p *Plane) liveNode(name string) *node {
 	p.expireStaleLocked()
 
 	return p.nodes[name]
+}
+
+// reconciledNode reports whether the current live incarnation vouched for a
+// complete inventory during registration.
+func (p *Plane) reconciledNode(name string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.expireStaleLocked()
+	n := p.nodes[name]
+
+	return n != nil && n.inventoryKnown
 }
 
 // goneNode is a host the plane has given up on, with the epoch it had.
@@ -732,7 +745,6 @@ func (p *Plane) Register(
 			PollSeconds:     int(p.poll.Seconds()),
 		}, nil
 	}
-
 	if n.incarnation != "" && n.incarnation != req.Incarnation {
 		// SAID OUT LOUD, because the two causes need different fixes and look
 		// identical from here. A restart is ordinary. A SECOND HOST arriving under
@@ -857,7 +869,20 @@ func (p *Plane) ReconcileInventory(
 		return 0, err
 	}
 
-	return p.registrar.ResolveQuarantineFor(ctx, node, running, epoch)
+	freed, err := p.registrar.ResolveQuarantineFor(ctx, node, running, epoch)
+	if err != nil {
+		return 0, err
+	}
+
+	// MARK ONLY THE PROCESS WHOSE REPORT SETTLED. A replacement can register
+	// while the ledger call is in flight; its inventory is a different fact.
+	p.mu.Lock()
+	if n := p.nodes[node]; n != nil && n.incarnation == incarnation {
+		n.inventoryKnown = true
+	}
+	p.mu.Unlock()
+
+	return freed, nil
 }
 
 // epochFor is the ledger epoch of the node AS SEEN BY one incarnation, refusing
@@ -997,6 +1022,22 @@ func (p *Plane) OwnerOfRequest(requestID int64) (RequestOwner, bool) {
 	return RequestOwner{}, false
 }
 
+// OwnerOfLease reports the process that adopted or launched one fenced lease.
+func (p *Plane) OwnerOfLease(leaseID string) (RequestOwner, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	owner, ok := p.owners[leaseID]
+	if !ok {
+		return RequestOwner{}, false
+	}
+	n, live := p.nodes[owner.node]
+
+	return RequestOwner{
+		Node: owner.node, Incarnation: owner.incarnation,
+		Current: live && n.incarnation == owner.incarnation,
+	}, true
+}
+
 // RequestOwner is the process holding a request's compute, and whether it is
 // still the one its node's commands reach.
 type RequestOwner struct {
@@ -1043,8 +1084,21 @@ func (p *Plane) ForgetLease(node, leaseID string) {
 // The ledger knows what it forgot: a lease bound to this node and still open is
 // this node's, and the process registering now is the one holding it.
 func (p *Plane) AdoptOwnership(node, incarnation string, leaseIDs []string) {
+	p.AdoptOwnershipWithInventory(node, incarnation, leaseIDs, false)
+}
+
+// AdoptOwnershipWithInventory atomically restores owners and records whether
+// the registering process supplied a complete provider inventory.
+func (p *Plane) AdoptOwnershipWithInventory(
+	node, incarnation string,
+	leaseIDs []string,
+	inventoryKnown bool,
+) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if n := p.nodes[node]; n != nil && n.incarnation == incarnation {
+		n.inventoryKnown = inventoryKnown
+	}
 
 	if p.owners == nil {
 		p.owners = make(map[string]leaseOwner, len(leaseIDs))

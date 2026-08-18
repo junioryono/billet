@@ -1214,3 +1214,53 @@ func TestAPendingCompletionWrittenAtVersion22SurvivesVersion23(t *testing.T) {
 		t.Fatalf("upgraded pending completions = %+v, want %+v", got, want)
 	}
 }
+
+func TestAPendingCompletionWrittenAtVersion23SurvivesVersion24(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(t.Context(), dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
+		for _, stmt := range []string{
+			`ALTER TABLE pending_completions DROP COLUMN retired`,
+			`ALTER TABLE pending_completions DROP COLUMN message_id`,
+			`ALTER TABLE pending_completions DROP COLUMN lease_node`,
+			`DELETE FROM schema_migrations WHERE version = 24`,
+			`INSERT INTO leases
+			 (id, tier, phase, vcpu, memory, created_at, heartbeat_at, expires_at, target_node)
+			 VALUES ('lease-92', 'linux', 'busy', 4, 4294967296,
+			         '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z',
+			         '2026-01-01T01:00:00Z', 'holder')`,
+			`INSERT INTO pending_completions
+			 (tier, request_id, run_id, result, lease_id, lease_epoch, outcome, release_only)
+			 VALUES ('linux', 92, 102, 'Succeeded', 'lease-92', 4, 'done', 1)`,
+		} {
+			if _, err := tx.ExecContext(t.Context(), stmt); err != nil {
+				return fmt.Errorf("%s: %w", stmt, err)
+			}
+		}
+
+		return nil
+	}); err != nil {
+		t.Fatalf("rewind to version 23: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close version 23 database: %v", err)
+	}
+
+	upgraded, err := Open(t.Context(), dir)
+	if err != nil {
+		t.Fatalf("open version 23 database with version 24: %v", err)
+	}
+	defer upgraded.Close()
+	got, err := upgraded.PendingCompletions(t.Context(), "linux")
+	if err != nil {
+		t.Fatalf("PendingCompletions: %v", err)
+	}
+	want := PendingCompletion{Tier: "linux", RequestID: 92, RunID: 102, Result: "Succeeded",
+		LeaseID: "lease-92", LeaseEpoch: 4, LeaseNode: "holder", Outcome: "done", ReleaseOnly: true}
+	if !slices.Equal(got, []PendingCompletion{want}) {
+		t.Fatalf("upgraded pending completions = %+v, want %+v", got, want)
+	}
+}

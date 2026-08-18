@@ -761,6 +761,69 @@ func (f *failingCompletionStore) PutPendingCompletion(
 	return f.completionStore.PutPendingCompletion(ctx, completion)
 }
 
+// deadlineCompletionStore records the deadline used for the transition write.
+type deadlineCompletionStore struct {
+	completionStore
+	deadline time.Time
+	ok       bool
+}
+
+// blockingCompletionStore holds every transition write until its context ends.
+type blockingCompletionStore struct{ completionStore }
+
+// PutPendingCompletion blocks on the supplied persistence deadline.
+func (blockingCompletionStore) PutPendingCompletion(
+	ctx context.Context,
+	_ state.PendingCompletion,
+) error {
+	<-ctx.Done()
+
+	return ctx.Err()
+}
+
+// failingRetirementStore injects tombstone or deletion failures independently.
+type failingRetirementStore struct {
+	completionStore
+	failRetire atomic.Bool
+	failDelete atomic.Bool
+}
+
+// RetirePendingCompletion delegates unless tombstone writes are failing.
+func (f *failingRetirementStore) RetirePendingCompletion(
+	ctx context.Context,
+	tier string,
+	requestID, messageID int64,
+) error {
+	if f.failRetire.Load() {
+		return errors.New("injected completion retirement failure")
+	}
+
+	return f.completionStore.RetirePendingCompletion(ctx, tier, requestID, messageID)
+}
+
+// DeletePendingCompletion delegates unless deletion is failing.
+func (f *failingRetirementStore) DeletePendingCompletion(
+	ctx context.Context,
+	tier string,
+	requestID, messageID int64,
+) error {
+	if f.failDelete.Load() {
+		return errors.New("injected completion deletion failure")
+	}
+
+	return f.completionStore.DeletePendingCompletion(ctx, tier, requestID, messageID)
+}
+
+// PutPendingCompletion records its context instead of writing a row.
+func (d *deadlineCompletionStore) PutPendingCompletion(
+	ctx context.Context,
+	_ state.PendingCompletion,
+) error {
+	d.deadline, d.ok = ctx.Deadline()
+
+	return errors.New("injected completion write failure")
+}
+
 func newAllocator(t *testing.T, limits alloc.Limits, tiers []config.Tier,
 	opts ...alloc.Option,
 ) *alloc.Allocator {
@@ -1900,6 +1963,28 @@ type fakeRunner struct {
 	onDestroyCompleted func(requestID int64, result string) error
 }
 
+type boundFakeRunner struct {
+	requestID int64
+	result    string
+	leaseID   string
+	node      string
+	err       error
+}
+
+func (f *boundFakeRunner) Launch(context.Context, *alloc.Lease, Job) error { return nil }
+
+func (f *boundFakeRunner) Destroy(context.Context, int64) error { return f.err }
+
+func (f *boundFakeRunner) DestroyCompletedBound(
+	_ context.Context,
+	requestID int64,
+	result, leaseID, node string,
+) error {
+	f.requestID, f.result, f.leaseID, f.node = requestID, result, leaseID, node
+
+	return f.err
+}
+
 type cancelAfterDestroyRunner struct {
 	cancel context.CancelFunc
 }
@@ -2297,6 +2382,161 @@ func TestCompletionDoesNotReleaseUntilReleaseOnlyTransitionIsDurable(t *testing.
 	}
 	if len(pending) != 0 {
 		t.Fatalf("release-only retry retained its durable completion: %+v", pending)
+	}
+}
+
+func TestReleaseOnlyPersistenceDoesNotExtendAShutdownDeadline(t *testing.T) {
+	store := &deadlineCompletionStore{}
+	l := NewListener(nil, "linux", &fakeSession{}, withCompletionStore(store))
+	l.releaseGrace = time.Hour
+	deadline := time.Now().Add(time.Second)
+	ctx, cancel := context.WithDeadline(t.Context(), deadline)
+	defer cancel()
+	err := l.recordReleaseOnly(ctx, Job{RequestID: 78, RunID: 88, Result: "Succeeded"},
+		&alloc.Lease{ID: "lease-78", Epoch: 2}, alloc.PhaseDone)
+	if err == nil {
+		t.Fatal("recordReleaseOnly succeeded through the injected store failure")
+	}
+	if !store.ok {
+		t.Fatal("release-only persistence discarded the shutdown deadline")
+	}
+	if !store.deadline.Equal(deadline) {
+		t.Fatalf("release-only persistence deadline = %s, want shutdown deadline %s",
+			store.deadline, deadline)
+	}
+}
+
+func TestParkedCompletionWritesShareTheShutdownDeadline(t *testing.T) {
+	l := NewListener(nil, "linux", &fakeSession{}, withCompletionStore(blockingCompletionStore{}))
+	l.releaseGrace = time.Hour
+	for id := int64(81); id <= 83; id++ {
+		l.cleanup[id] = &pendingCleanup{
+			job:     Job{RequestID: id, RunID: id + 10, Result: "Succeeded", CompletionID: id + 20},
+			lease:   &alloc.Lease{ID: fmt.Sprintf("lease-%d", id), Epoch: 1},
+			outcome: alloc.PhaseDone, releaseOnly: true,
+		}
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 25*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	l.releaseAll(ctx, map[int64]bool{})
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("three parked writes outlived one shutdown deadline: %s", elapsed)
+	}
+}
+
+func TestFailedCompletionRetirementBlocksReuseWithoutRepeatingTeardown(t *testing.T) {
+	db := openState(t)
+	store := &failingRetirementStore{completionStore: db}
+	store.failRetire.Store(true)
+	job := Job{RequestID: 79, RunID: 89, Result: "Succeeded", CompletionID: 10}
+	if err := db.PutPendingCompletion(t.Context(), state.PendingCompletion{
+		Tier: "linux", RequestID: job.RequestID, RunID: job.RunID, Result: job.Result,
+		MessageID: job.CompletionID,
+	}); err != nil {
+		t.Fatalf("PutPendingCompletion: %v", err)
+	}
+	var destroys atomic.Int32
+	l := NewListener(nil, "linux", &fakeSession{}, withCompletionStore(store),
+		WithCleanupRetryPacing(0, 0), WithRunner(&fakeRunner{onDestroyCompleted: func(int64, string) error {
+			destroys.Add(1)
+
+			return nil
+		}}))
+	l.complete(t.Context(), job)
+	l.mu.Lock()
+	entry := l.cleanup[job.RequestID]
+	l.mu.Unlock()
+	if entry == nil || !entry.retireOnly {
+		t.Fatalf("failed retirement did not block request reuse: %+v", entry)
+	}
+	if err := l.recordCompletion(t.Context(), job); err != nil {
+		t.Fatalf("record redelivered completion: %v", err)
+	}
+	l.complete(t.Context(), job)
+	if destroys.Load() != 1 {
+		t.Fatalf("redelivery repeated teardown %d times before retirement settled", destroys.Load())
+	}
+
+	store.failRetire.Store(false)
+	l.retryCleanup(t.Context())
+	if destroys.Load() != 1 {
+		t.Fatalf("retirement retry destroyed compute %d times, want once", destroys.Load())
+	}
+	pending, err := db.PendingCompletions(t.Context(), "linux")
+	if err != nil {
+		t.Fatalf("PendingCompletions: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("retirement retry retained %+v", pending)
+	}
+}
+
+func TestFailedCompletionDeletionRestoresOnlyATombstone(t *testing.T) {
+	db := openState(t)
+	store := &failingRetirementStore{completionStore: db}
+	store.failDelete.Store(true)
+	job := Job{RequestID: 80, RunID: 90, Result: "Succeeded", CompletionID: 20}
+	if err := db.PutPendingCompletion(t.Context(), state.PendingCompletion{
+		Tier: "linux", RequestID: job.RequestID, RunID: job.RunID, Result: job.Result,
+		MessageID: job.CompletionID,
+	}); err != nil {
+		t.Fatalf("PutPendingCompletion: %v", err)
+	}
+	l := NewListener(nil, "linux", &fakeSession{}, withCompletionStore(store),
+		WithRunner(&fakeRunner{}))
+	l.complete(t.Context(), job)
+	pending, err := db.PendingCompletions(t.Context(), "linux")
+	if err != nil {
+		t.Fatalf("PendingCompletions after failed delete: %v", err)
+	}
+	if len(pending) != 1 || !pending[0].Retired {
+		t.Fatalf("failed delete left a replayable completion: %+v", pending)
+	}
+
+	var repeated atomic.Int32
+	restarted := NewListener(nil, "linux", &fakeSession{}, withCompletionStore(store),
+		WithRunner(&fakeRunner{onDestroyCompleted: func(int64, string) error {
+			repeated.Add(1)
+
+			return nil
+		}}))
+	if err := restarted.restoreCompletions(t.Context()); err != nil {
+		t.Fatalf("restoreCompletions: %v", err)
+	}
+	restarted.retryCleanup(t.Context())
+	if repeated.Load() != 0 {
+		t.Fatalf("retired completion replayed teardown %d times", repeated.Load())
+	}
+	restarted.mu.Lock()
+	_, blocked := restarted.cleanup[job.RequestID]
+	restarted.mu.Unlock()
+	if blocked {
+		t.Fatal("a durable tombstone blocked later request-id reuse")
+	}
+}
+
+func TestRestoredCompletionTargetsItsPersistedLeaseNode(t *testing.T) {
+	db := openState(t)
+	completion := state.PendingCompletion{
+		Tier: "linux", RequestID: 81, RunID: 91, Result: "Succeeded",
+		LeaseID: "lease-81", LeaseEpoch: 3, LeaseNode: "holder", Outcome: "done",
+		MessageID: 21,
+	}
+	if err := db.PutPendingCompletion(t.Context(), completion); err != nil {
+		t.Fatalf("PutPendingCompletion: %v", err)
+	}
+	runner := &boundFakeRunner{err: errors.New("keep the obligation pending")}
+	l := NewListener(nil, "linux", &fakeSession{}, WithCompletionStore(db),
+		WithCleanupRetryPacing(0, 0), WithRunner(runner))
+	if err := l.restoreCompletions(t.Context()); err != nil {
+		t.Fatalf("restoreCompletions: %v", err)
+	}
+	l.retryCleanup(t.Context())
+	if runner.requestID != completion.RequestID || runner.result != completion.Result ||
+		runner.leaseID != completion.LeaseID || runner.node != completion.LeaseNode {
+		t.Fatalf("bound destroy = request %d result %q lease %q node %q, want %+v",
+			runner.requestID, runner.result, runner.leaseID, runner.node, completion)
 	}
 }
 

@@ -114,6 +114,43 @@ func (r *Runner) DestroyCompleted(ctx context.Context, requestID int64, result s
 	return r.destroy(ctx, requestID, result)
 }
 
+// DestroyCompletedBound reconciles a restored completion with its durable host
+// and lease rather than treating an unrelated live fleet as proof of absence.
+func (r *Runner) DestroyCompletedBound(
+	ctx context.Context,
+	requestID int64,
+	result, leaseID, nodeName string,
+) error {
+	owner, owned := r.plane.OwnerOfLease(leaseID)
+	if owned {
+		if owner.Node != nodeName || !owner.Current {
+			return heldByADrainingProcess(nodeName, requestID)
+		}
+		n := r.plane.liveNode(nodeName)
+		if n == nil {
+			return heldByADrainingProcess(nodeName, requestID)
+		}
+		incarnation, err := r.destroyOn(ctx, n, requestID, result)
+		if err != nil {
+			return err
+		}
+		if incarnation != owner.Incarnation {
+			return heldByADrainingProcess(nodeName, requestID)
+		}
+		r.plane.ForgetLease(nodeName, leaseID)
+
+		return nil
+	}
+
+	// A live bound node registered its complete inventory and did not adopt this
+	// open lease. Only that node's absence report proves the old compute is gone.
+	if !r.plane.reconciledNode(nodeName) {
+		return heldByADrainingProcess(nodeName, requestID)
+	}
+
+	return nil
+}
+
 func (r *Runner) destroy(ctx context.Context, requestID int64, result string) error {
 	// WHO HOLDS THIS? The node name is not enough: a superseded process and its
 	// replacement share it, and only one of them has the container.

@@ -1,6 +1,7 @@
 package nodeplane
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -8,6 +9,78 @@ import (
 	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/server"
 )
+
+func TestBoundCompletionWaitsForItsPersistedNode(t *testing.T) {
+	p := testPlane(t)
+	runner := p.NewRunner()
+	if err := runner.DestroyCompletedBound(t.Context(), 7, "Succeeded", "l1", "holder"); !errors.Is(err, server.ErrCustody) {
+		t.Fatalf("absent holder destroy = %v, want custody", err)
+	}
+	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
+		Version: nodeapi.Version, Node: "unrelated", Provider: config.ProviderDocker,
+		Deployment: deployment, Incarnation: "unrelated-1", VCPU: 8, Memory: 32 * config.GiB,
+	}); err != nil {
+		t.Fatalf("register unrelated node: %v", err)
+	}
+	if err := runner.DestroyCompletedBound(t.Context(), 7, "Succeeded", "l1", "holder"); !errors.Is(err, server.ErrCustody) {
+		t.Fatalf("unrelated live fleet destroy = %v, want custody", err)
+	}
+	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
+		Version: nodeapi.Version, Node: "holder", Provider: config.ProviderDocker,
+		Deployment: deployment, Incarnation: "holder-2", VCPU: 8, Memory: 32 * config.GiB,
+	}); err != nil {
+		t.Fatalf("register unreconciled holder: %v", err)
+	}
+	if err := runner.DestroyCompletedBound(t.Context(), 7, "Succeeded", "l1", "holder"); !errors.Is(err, server.ErrCustody) {
+		t.Fatalf("unreconciled holder destroy = %v, want custody", err)
+	}
+}
+
+func TestBoundCompletionUsesTheHolderAfterItAdoptsTheLease(t *testing.T) {
+	p := testPlane(t)
+	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
+		Version: nodeapi.Version, Node: "holder", Provider: config.ProviderDocker,
+		Deployment: deployment, Incarnation: "holder-2", VCPU: 8, Memory: 32 * config.GiB,
+	}); err != nil {
+		t.Fatalf("register holder: %v", err)
+	}
+	p.AdoptOwnership("holder", "holder-2", []string{"l1"})
+
+	done := make(chan error, 1)
+	go func() {
+		done <- p.NewRunner().DestroyCompletedBound(
+			t.Context(), 7, "Succeeded", "l1", "holder")
+	}()
+	cmd, took, err := p.Poll(t.Context(), "holder", "holder-2")
+	if err != nil || !took {
+		t.Fatalf("poll adopted holder: took=%v err=%v", took, err)
+	}
+	if cmd.Kind != nodeapi.CommandDestroy || cmd.RequestID != 7 || cmd.JobResult != "Succeeded" {
+		t.Fatalf("adopted holder received %+v", cmd)
+	}
+	if err := p.Result("holder", "holder-2", nodeapi.CommandResult{ID: cmd.ID, OK: true}); err != nil {
+		t.Fatalf("complete destroy: %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("bound destroy: %v", err)
+	}
+}
+
+func TestBoundCompletionAcceptsTheHoldersKnownEmptyInventory(t *testing.T) {
+	p := testPlane(t)
+	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
+		Version: nodeapi.Version, Node: "holder", Provider: config.ProviderDocker,
+		Deployment: deployment, Incarnation: "holder-2", VCPU: 8, Memory: 32 * config.GiB,
+		InventoryKnown: true,
+	}); err != nil {
+		t.Fatalf("register empty holder: %v", err)
+	}
+	p.AdoptOwnershipWithInventory("holder", "holder-2", nil, true)
+	if err := p.NewRunner().DestroyCompletedBound(
+		t.Context(), 7, "Succeeded", "l1", "holder"); err != nil {
+		t.Fatalf("known-empty holder destroy: %v", err)
+	}
+}
 
 // A DESTROY IS ADDRESSED, NOT SHOUTED.
 //
