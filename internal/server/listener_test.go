@@ -1176,7 +1176,7 @@ func TestARedeliveredCompletionDoesNotConsumeASecondLease(t *testing.T) {
 		return &Message{
 			MessageID: id,
 			Assigned:  []Job{{RequestID: 11, RunID: 101}},
-			Completed: []Job{{RequestID: 11, RunID: 101}},
+			Completed: []Job{{RequestID: 11, RunID: 101, Result: "Cancelled"}},
 		}
 	}
 
@@ -1194,7 +1194,7 @@ func TestARedeliveredCompletionDoesNotConsumeASecondLease(t *testing.T) {
 		return nil, ErrNoMessage
 	}
 
-	l := NewListener(a, tiers[0].Label, session)
+	l := NewListener(a, tiers[0].Label, session, WithCompletionStore(db))
 
 	// A failed acknowledgement is an error, so Run returns on the first batch.
 	// ASSERTED rather than discarded: if this run ever stops failing, the message
@@ -1204,15 +1204,29 @@ func TestARedeliveredCompletionDoesNotConsumeASecondLease(t *testing.T) {
 		t.Fatalf("the first run was expected to fail on the lost acknowledgement, got %v; "+
 			"without that failure there is no redelivery to be idempotent against", err)
 	}
+	pending, err := db.PendingCompletions(t.Context(), tiers[0].Label)
+	if err != nil {
+		t.Fatalf("PendingCompletions after lost acknowledgement: %v", err)
+	}
+	if len(pending) != 1 || !pending[0].Retired || pending[0].Acknowledged {
+		t.Fatalf("lost acknowledgement left completion %+v, want one retired tombstone", pending)
+	}
 
 	// Restarted the way the control plane restarts it: a NEW listener on the same
 	// session. Reusing the old one was neither what Server does — it builds one
 	// per tier run — nor safe, since a listener that has shut down has sealed its
 	// cleanup loop and closed its session.
-	l = NewListener(a, tiers[0].Label, session)
+	l = NewListener(a, tiers[0].Label, session, WithCompletionStore(db))
 
 	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run after redelivery: %v", err)
+	}
+	pending, err = db.PendingCompletions(t.Context(), tiers[0].Label)
+	if err != nil {
+		t.Fatalf("PendingCompletions after acknowledged redelivery: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("acknowledged retired completion remained: %+v", pending)
 	}
 
 	// Counted in job_history, NOT in open leases. Asserting no lease is left open

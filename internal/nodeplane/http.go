@@ -826,12 +826,26 @@ func (h *handler) register(w http.ResponseWriter, r *http.Request) {
 	// node holding compute, a plane that restarts, a re-registration, and then a
 	// second host — the new plane never saw those launches, so it would refuse the
 	// draining process its own release.
-	open := make([]string, 0, len(ids))
+	// Keep both durable launched leases and every instance the exact registering
+	// process reported. The latter includes live quarantined compute, which the
+	// launched query deliberately omits; dropping it here would leave a charged,
+	// running lease with no owner and make completion recovery unable to address
+	// its destroy.
+	openSet := make(map[string]bool, len(ids)+len(req.Instances))
 	for id := range ids {
+		openSet[id] = true
+	}
+	if req.InventoryKnown {
+		for _, id := range req.Instances {
+			openSet[id] = true
+		}
+	}
+	open := make([]string, 0, len(openSet))
+	for id := range openSet {
 		open = append(open, id)
 	}
 
-	h.plane.AdoptOwnershipWithInventory(req.Node, req.Incarnation, open, req.InventoryKnown)
+	h.plane.AdoptOwnership(req.Node, req.Incarnation, open)
 
 	h.log.Info("node registered",
 		"node", req.Node, "provider", req.Provider, "guest_os", req.GuestOS)

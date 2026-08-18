@@ -1,14 +1,52 @@
 package nodeplane
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
+	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/server"
 )
+
+type presentLeaseRegistrar struct {
+	countingRegistrar
+	lease *alloc.Lease
+}
+
+func (r *presentLeaseRegistrar) Lease(_ context.Context, leaseID string) (*alloc.Lease, error) {
+	if r.lease != nil && r.lease.ID == leaseID {
+		return r.lease, nil
+	}
+
+	return nil, fmt.Errorf("%w: %s", alloc.ErrLeaseNotFound, leaseID)
+}
+
+type blockingInventoryRegistrar struct {
+	presentLeaseRegistrar
+	entered chan struct{}
+	proceed chan struct{}
+}
+
+func (r *blockingInventoryRegistrar) ResolveQuarantineFor(
+	ctx context.Context, _ string, _ []string, _ int64,
+) (int, error) {
+	select {
+	case r.entered <- struct{}{}:
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+	select {
+	case <-r.proceed:
+		return 0, nil
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
 
 func TestBoundCompletionWaitsForItsPersistedNode(t *testing.T) {
 	p := testPlane(t)
@@ -100,7 +138,7 @@ func TestBoundCompletionIsNotTakenByAReplacementIncarnation(t *testing.T) {
 }
 
 func TestBoundCompletionAcceptsTheHoldersKnownEmptyInventory(t *testing.T) {
-	p := testPlane(t)
+	p := testPlane(t, WithRegistrar(&countingRegistrar{}))
 	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
 		Version: nodeapi.Version, Node: "holder", Provider: config.ProviderDocker,
 		Deployment: deployment, Incarnation: "holder-2", VCPU: 8, Memory: 32 * config.GiB,
@@ -111,7 +149,71 @@ func TestBoundCompletionAcceptsTheHoldersKnownEmptyInventory(t *testing.T) {
 	p.AdoptOwnershipWithInventory("holder", "holder-2", nil, true)
 	if err := p.NewRunner().DestroyCompletedBound(
 		t.Context(), 7, "Succeeded", "l1", "holder"); err != nil {
-		t.Fatalf("known-empty holder destroy: %v", err)
+		t.Fatalf("durably absent holder destroy: %v", err)
+	}
+}
+
+func TestKnownEmptyInventoryDoesNotReleaseALiveDurableLease(t *testing.T) {
+	reg := &presentLeaseRegistrar{lease: &alloc.Lease{ID: "l1", Node: "holder"}}
+	p := testPlane(t, WithRegistrar(reg))
+	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
+		Version: nodeapi.Version, Node: "holder", Provider: config.ProviderDocker,
+		Deployment: deployment, Incarnation: "holder-2", VCPU: 8, Memory: 32 * config.GiB,
+		InventoryKnown: true,
+	}); err != nil {
+		t.Fatalf("register empty holder: %v", err)
+	}
+	if err := p.NewRunner().DestroyCompletedBound(
+		t.Context(), 7, "Succeeded", "l1", "holder"); !errors.Is(err, server.ErrCustody) {
+		t.Fatalf("live durable lease destroy = %v, want custody", err)
+	}
+}
+
+func TestPeriodicReconciliationInstallsOwnershipBeforeCompletionCanUseAbsence(t *testing.T) {
+	reg := &blockingInventoryRegistrar{
+		presentLeaseRegistrar: presentLeaseRegistrar{lease: &alloc.Lease{ID: "l1", Node: "holder"}},
+		entered:               make(chan struct{}, 1),
+		proceed:               make(chan struct{}),
+	}
+	p := testPlane(t, WithRegistrar(reg))
+	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
+		Version: nodeapi.Version, Node: "holder", Provider: config.ProviderDocker,
+		Deployment: deployment, Incarnation: "holder-1", VCPU: 8, Memory: 32 * config.GiB,
+	}); err != nil {
+		t.Fatalf("register holder: %v", err)
+	}
+
+	reconciled := make(chan error, 1)
+	go func() {
+		_, err := p.ReconcileInventory(t.Context(), "holder", "holder-1", []string{"l1"})
+		reconciled <- err
+	}()
+	<-reg.entered
+
+	destroyed := make(chan error, 1)
+	go func() {
+		destroyed <- p.NewRunner().DestroyCompletedBound(
+			t.Context(), 7, "Succeeded", "l1", "holder")
+	}()
+	select {
+	case err := <-destroyed:
+		t.Fatalf("completion crossed an unfinished inventory decision: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(reg.proceed)
+	if err := <-reconciled; err != nil {
+		t.Fatalf("reconcile inventory: %v", err)
+	}
+
+	cmd, took, err := p.Poll(t.Context(), "holder", "holder-1")
+	if err != nil || !took || cmd.Kind != nodeapi.CommandDestroy {
+		t.Fatalf("poll reconciled holder: command=%+v took=%v err=%v", cmd, took, err)
+	}
+	if err := p.Result("holder", "holder-1", nodeapi.CommandResult{ID: cmd.ID, OK: true}); err != nil {
+		t.Fatalf("complete destroy: %v", err)
+	}
+	if err := <-destroyed; err != nil {
+		t.Fatalf("bound destroy: %v", err)
 	}
 }
 

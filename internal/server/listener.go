@@ -1976,6 +1976,12 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 
 	for _, job := range msg.Completed {
 		job.CompletionID = msg.MessageID
+		// THE DELIVERY IS TERMINAL EVEN WHEN ITS TEARDOWN ALREADY SETTLED. A
+		// failed acknowledgement redelivers the whole batch, including an Assigned
+		// entry for an assigned-then-cancelled job. Retired means "do not destroy
+		// again", not "the assignment is live again". Stale means a newer delivery
+		// already decided this request, so the older assignment is no more runnable.
+		finished[job.RequestID] = struct{}{}
 
 		disposition, err := l.recordCompletion(ctx, job)
 		if err != nil {
@@ -1984,7 +1990,6 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 		if disposition != state.PendingCompletionActionable {
 			continue
 		}
-		finished[job.RequestID] = struct{}{}
 		l.complete(ctx, job)
 	}
 

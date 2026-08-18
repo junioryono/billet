@@ -40,6 +40,8 @@ type fakeRegistrar struct {
 	reportedRunning []string
 	freed           int
 	resolveErr      error
+	lease           *alloc.Lease
+	leaseErr        error
 
 	mu       sync.Mutex
 	err      error
@@ -52,6 +54,19 @@ type fakeRegistrar struct {
 	goneName  string
 	goneEpoch int64
 	forgotten bool
+}
+
+func (f *fakeRegistrar) Lease(_ context.Context, leaseID string) (*alloc.Lease, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.leaseErr != nil {
+		return nil, f.leaseErr
+	}
+	if f.lease == nil || f.lease.ID != leaseID {
+		return nil, fmt.Errorf("%w: %s", alloc.ErrLeaseNotFound, leaseID)
+	}
+
+	return f.lease, nil
 }
 
 // ResolveQuarantineFor records what a returning host reported running, so a test
@@ -1182,6 +1197,12 @@ func TestARegistrationPassesOnWhatTheHostReportsRunning(t *testing.T) {
 
 			if tc.wantCalled && !slices.Equal(ids, tc.wantIDs) {
 				t.Errorf("the ledger was told this host runs %v, want %v", ids, tc.wantIDs)
+			}
+			for _, id := range tc.wantIDs {
+				owner, ok := p.OwnerOfLease(id)
+				if !ok || owner.Node != "n1" || !owner.Current {
+					t.Errorf("reported live lease %s has owner %+v, present=%v", id, owner, ok)
+				}
 			}
 		})
 	}

@@ -131,8 +131,11 @@ type node struct {
 	provider    config.ProviderKind
 	guestOS     []config.GuestOS
 	lastSeen    time.Time
-	// inventoryKnown says this incarnation supplied a complete provider inventory.
+	// inventoryKnown says this incarnation supplied the complete provider inventory
+	// in inventory. The set is evidence about one lease only by membership, never
+	// merely because some inventory exists.
 	inventoryKnown bool
+	inventory      map[string]bool
 
 	// ledgerEpoch is the fencing token the ledger gave this registration.
 	//
@@ -502,6 +505,11 @@ type Registrar interface {
 	// a newer one has just vouched for, using a listing taken before that
 	// container was visible.
 	ResolveQuarantineFor(ctx context.Context, node string, running []string, epoch int64) (int, error)
+
+	// Lease reads the durable capacity obligation. A missing row is the only
+	// absence proof a completion may carry past the plane lock into listener
+	// settlement; an in-memory inventory snapshot alone can be superseded.
+	Lease(ctx context.Context, leaseID string) (*alloc.Lease, error)
 }
 
 // sortedSites lists the declared places in a stable order, so a refusal naming
@@ -689,32 +697,6 @@ func (p *Plane) Register(
 			return nodeapi.RegisterResponse{}, fmt.Errorf(
 				"nodeplane: the ledger could not record node %q: %w", req.Node, err)
 		}
-
-		// WHAT THIS HOST SAYS IT IS RUNNING FREES WHAT IT IS NOT.
-		//
-		// A lease whose holder stopped heartbeating is quarantined rather than
-		// terminalized, so its capacity stays charged until the compute is
-		// confirmed gone — and the node's sweep only confirms containers that
-		// still exist. A host that rebooted has none, so its quarantined capacity
-		// would wait forever. This is the other proof.
-		//
-		// ONLY A LIST THE NODE VOUCHES FOR. An absent one means the provider
-		// could not be read, and reading that as "running nothing" would free
-		// capacity for containers that are still there.
-		//
-		// Best effort: failing a registration over it would keep a healthy host
-		// out of the fleet to tidy up an accounting row, and the next
-		// registration or sweep does the same work.
-		if req.InventoryKnown {
-			if freed, err := p.registrar.ResolveQuarantineFor(
-				ctx, req.Node, req.Instances, epoch); err != nil {
-				p.log.Warn("could not reconcile quarantined capacity with what this host "+
-					"reports running", "node", req.Node, "error", err)
-			} else if freed > 0 {
-				p.log.Info("freed capacity held for compute this host is no longer running",
-					"node", req.Node, "leases", freed)
-			}
-		}
 	}
 
 	p.mu.Lock()
@@ -811,6 +793,31 @@ func (p *Plane) Register(
 		n.ledgerEpoch = epoch
 	}
 
+	// INVENTORY AND ITS LEDGER CONSEQUENCE LINEARIZE WITH THIS INCARNATION.
+	// A completion is allowed to treat an absent instance as gone only after the
+	// quarantine resolver has made that fact durable. Keeping the resolver under
+	// the plane lock prevents an old known-empty snapshot from being consumed
+	// while a replacement is registering or a newer inventory is being adopted.
+	n.inventoryKnown = false
+	n.inventory = nil
+	if req.InventoryKnown {
+		if p.registrar != nil {
+			if freed, err := p.registrar.ResolveQuarantineFor(
+				ctx, req.Node, req.Instances, n.ledgerEpoch); err != nil {
+				// Best effort: failing registration over accounting cleanup would keep
+				// a healthy host out of the fleet. The exact inventory is still kept,
+				// and a completion retries the same fenced reconciliation before it can
+				// accept absence.
+				p.log.Warn("could not reconcile quarantined capacity with what this host "+
+					"reports running", "node", req.Node, "error", err)
+			} else if freed > 0 {
+				p.log.Info("freed capacity held for compute this host is no longer running",
+					"node", req.Node, "leases", freed)
+			}
+		}
+		p.adoptOwnershipLocked(req.Node, req.Incarnation, req.Instances, true)
+	}
+
 	return nodeapi.RegisterResponse{
 		Version:         nodeapi.Version,
 		LeaseTTLSeconds: int(p.ttl.Seconds()),
@@ -859,36 +866,10 @@ func (p *Plane) ReconcileInventory(
 		return 0, nil
 	}
 
-	// THE INCARNATION IS CHECKED AND THE EPOCH CAPTURED UNDER ONE LOCK.
-	//
-	// The route wrapper checks the incarnation and then this took the mutex
-	// again, which is a check-then-act rather than a fence: a replacement can
-	// register in the gap, and the stale report is then accepted under the
-	// REPLACEMENT's epoch — freeing capacity for a container the newer
-	// incarnation had just vouched for. Reading them together is what makes the
-	// epoch belong to the process that sent the inventory.
-	epoch, err := p.epochFor(node, incarnation)
-	if err != nil {
-		return 0, err
-	}
-
-	freed, err := p.registrar.ResolveQuarantineFor(ctx, node, running, epoch)
-	if err != nil {
-		return 0, err
-	}
-
-	// MARK AND ADOPT AS ONE FACT FROM ONE PROCESS. A replacement can register
-	// while the ledger call is in flight; its inventory is a different fact.
-	p.mu.Lock()
-	p.adoptOwnershipLocked(node, incarnation, running, true)
-	p.mu.Unlock()
-
-	return freed, nil
-}
-
-// epochFor is the ledger epoch of the node AS SEEN BY one incarnation, refusing
-// a caller that is no longer the current process.
-func (p *Plane) epochFor(node, incarnation string) (int64, error) {
+	// THE INVENTORY, ITS FENCED LEDGER DECISION AND ITS OWNERSHIP ADOPTION ARE
+	// ONE ORDERED FACT. A completion cannot consume the previous snapshot in the
+	// gap, and a replacement cannot install a new incarnation while the old one
+	// is terminalizing capacity under its epoch.
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -896,14 +877,19 @@ func (p *Plane) epochFor(node, incarnation string) (int64, error) {
 	if !ok {
 		return 0, fmt.Errorf("%w: %s", ErrUnregistered, node)
 	}
-
 	if n.incarnation != "" && incarnation != "" && n.incarnation != incarnation {
 		return 0, fmt.Errorf(
 			"%w: node %q is registered by process %s and this report came from %s",
 			ErrSuperseded, node, n.incarnation, incarnation)
 	}
 
-	return n.ledgerEpoch, nil
+	freed, err := p.registrar.ResolveQuarantineFor(ctx, node, running, n.ledgerEpoch)
+	if err != nil {
+		return 0, err
+	}
+	p.adoptOwnershipLocked(node, incarnation, running, true)
+
+	return freed, nil
 }
 
 // CheckIncarnation reports whether a request came from the current node process.
@@ -1109,7 +1095,13 @@ func (p *Plane) adoptOwnershipLocked(
 	if n == nil || n.incarnation != incarnation {
 		return
 	}
-	n.inventoryKnown = inventoryKnown
+	if inventoryKnown {
+		n.inventoryKnown = true
+		n.inventory = make(map[string]bool, len(leaseIDs))
+		for _, id := range leaseIDs {
+			n.inventory[id] = true
+		}
+	}
 
 	if p.owners == nil {
 		p.owners = make(map[string]leaseOwner, len(leaseIDs))

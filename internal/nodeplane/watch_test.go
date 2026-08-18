@@ -3,6 +3,7 @@ package nodeplane
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -95,6 +96,10 @@ func (l *ledger) ResolveQuarantineFor(
 	l.reportedRunning = running
 
 	return 0, nil
+}
+
+func (l *ledger) Lease(_ context.Context, leaseID string) (*alloc.Lease, error) {
+	return nil, fmt.Errorf("%w: %s", alloc.ErrLeaseNotFound, leaseID)
 }
 
 func (l *ledger) ForgetEveryNode(context.Context) error { return nil }

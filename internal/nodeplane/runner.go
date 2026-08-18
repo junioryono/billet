@@ -508,8 +508,8 @@ func (p *Plane) dispatch(ctx context.Context, n *node, pend *pending) (nodeapi.C
 	return p.waitDispatched(ctx, n, pend)
 }
 
-// dispatchBound atomically chooses between the exact lease holder and a complete
-// absence inventory, then fences any queued destroy to that holder's incarnation.
+// dispatchBound atomically chooses between the exact lease holder and absence
+// already settled in the ledger, then fences a destroy to the holder's incarnation.
 func (p *Plane) dispatchBound(
 	ctx context.Context,
 	nodeName, leaseID string,
@@ -520,10 +520,40 @@ func (p *Plane) dispatchBound(
 	owner, owned := p.owners[leaseID]
 	if !owned {
 		n := p.nodes[nodeName]
-		absent := n != nil && n.inventoryKnown
-		p.mu.Unlock()
+		if n == nil || !n.inventoryKnown || n.inventory[leaseID] || p.registrar == nil {
+			p.mu.Unlock()
 
-		return nodeapi.CommandResult{}, "", absent, nil
+			return nodeapi.CommandResult{}, "", false, nil
+		}
+
+		// ABSENCE BECOMES SUCCESS ONLY AFTER THE LEDGER AGREES. The exact
+		// incarnation lock stays held across reconciliation and the read, so a
+		// replacement or later inventory either wins before this point and is
+		// observed above, or follows a capacity decision already made durable.
+		// ResolveQuarantineFor also enforces the quarantine grace; a merely late
+		// launch remains charged and returns custody here.
+		_, err := p.registrar.ResolveQuarantineFor(
+			ctx, nodeName, inventoryIDs(n.inventory), n.ledgerEpoch)
+		if err != nil {
+			p.mu.Unlock()
+
+			return nodeapi.CommandResult{}, "", false, err
+		}
+		_, err = p.registrar.Lease(ctx, leaseID)
+		switch {
+		case errors.Is(err, alloc.ErrLeaseNotFound):
+			p.mu.Unlock()
+
+			return nodeapi.CommandResult{}, "", true, nil
+		case err != nil:
+			p.mu.Unlock()
+
+			return nodeapi.CommandResult{}, "", false, err
+		default:
+			p.mu.Unlock()
+
+			return nodeapi.CommandResult{}, "", false, nil
+		}
 	}
 	n := p.nodes[nodeName]
 	if owner.node != nodeName || n == nil || n.incarnation != owner.incarnation {
@@ -538,6 +568,15 @@ func (p *Plane) dispatchBound(
 	res, err := p.waitDispatched(ctx, n, pend)
 
 	return res, owner.incarnation, false, err
+}
+
+func inventoryIDs(inventory map[string]bool) []string {
+	ids := make([]string, 0, len(inventory))
+	for id := range inventory {
+		ids = append(ids, id)
+	}
+
+	return ids
 }
 
 func (p *Plane) queueLocked(n *node, pend *pending) {
