@@ -118,6 +118,15 @@ type custody struct {
 
 // adopt takes custody of an instance that survived a restart.
 func (r *Runner) adopt(lease *alloc.Lease, inst *provider.Instance) {
+	r.adoptWithObservation(lease, inst, true)
+}
+
+// adoptWithObservation records whether the provider's own inventory supplied
+// this instance. A successful local Launch result is not that observation on an
+// eventually consistent backend.
+func (r *Runner) adoptWithObservation(
+	lease *alloc.Lease, inst *provider.Instance, observed bool,
+) {
 	outcome := alloc.PhaseDone
 	discard := false
 	phase := alloc.PhaseCustody
@@ -139,9 +148,8 @@ func (r *Runner) adopt(lease *alloc.Lease, inst *provider.Instance) {
 		outcome:   outcome,
 		phase:     phase,
 		discard:   discard,
-		// Adoption starts from a container billet just watched running.
-		observed: true,
-		since:    r.now(),
+		observed:  observed,
+		since:     r.now(),
 	}
 	entry.epoch.Store(lease.Epoch)
 
@@ -791,13 +799,10 @@ func (r *Runner) Superseded() {
 			outcome:   alloc.PhaseDone,
 			phase:     alloc.PhaseCustody,
 			since:     r.now(),
-			// ALREADY SEEN, because this came from the running set: its launch was
-			// observed, so a later absence means it genuinely went away rather than
-			// that a create might still be in flight. Leaving it false made a job
-			// that exits right after supersession hold its host's capacity for the
-			// whole stray grace — five minutes of a machine nobody can use, waiting
-			// for a container that has already finished.
-			observed: true,
+			// Not observed by provider inventory. This came from the local running map,
+			// which proves Launch returned but does not fence an eventually consistent
+			// first inventory miss.
+			observed: false,
 		}
 		entry.epoch.Store(lease.Epoch)
 

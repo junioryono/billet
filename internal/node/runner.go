@@ -861,7 +861,7 @@ func (r *Runner) Recover(ctx context.Context) error {
 				return fmt.Errorf("node: read the lease of surviving instance %s: %w", inst.Name, err)
 
 			default:
-				if err := r.takeCustody(ctx, lease, inst); err != nil {
+				if err := r.takeCustody(ctx, lease, inst, true); err != nil {
 					return err
 				}
 
@@ -949,7 +949,9 @@ func (r *Runner) Recover(ctx context.Context) error {
 // its first tend. The reaper would terminalize the lease it had just adopted,
 // hand the capacity back, and let a listener advertise it while the container
 // carried on running.
-func (r *Runner) takeCustody(ctx context.Context, lease *alloc.Lease, inst *provider.Instance) error {
+func (r *Runner) takeCustody(
+	ctx context.Context, lease *alloc.Lease, inst *provider.Instance, observed bool,
+) error {
 	// RECORDED FIRST, RENEWED SECOND, and the order is the whole correctness of
 	// custody across a network.
 	//
@@ -964,7 +966,7 @@ func (r *Runner) takeCustody(ctx context.Context, lease *alloc.Lease, inst *prov
 	// and keeps retrying renewal on its own clock. A fenced or missing lease is
 	// then discovered by Tend, which destroys the compute rather than leaving it
 	// running against capacity somebody else now holds.
-	r.adopt(lease, inst)
+	r.adoptWithObservation(lease, inst, observed)
 
 	if err := r.alloc.Heartbeat(ctx, lease.ID, lease.Epoch); err != nil {
 		if errors.Is(err, alloc.ErrForceRelease) {
@@ -1016,7 +1018,7 @@ func (r *Runner) AssumeCustody(ctx context.Context, lease *alloc.Lease, requestI
 		return nil
 	}
 
-	return r.takeCustody(ctx, lease, inst)
+	return r.takeCustody(ctx, lease, inst, false)
 }
 
 // Sweep destroys instances whose lease is no longer open on this node.
@@ -1225,7 +1227,7 @@ func (r *Runner) adoptQuarantined(ctx context.Context, leaseID string, inst *pro
 		return fmt.Errorf("node: read quarantined lease %s: %w", leaseID, err)
 	}
 
-	return r.takeCustody(ctx, lease, inst)
+	return r.takeCustody(ctx, lease, inst, true)
 }
 
 // releaseOrphanedLease terminalizes a lease whose compute has just been

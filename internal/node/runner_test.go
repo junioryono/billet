@@ -1885,6 +1885,42 @@ func TestCustodySurvivesItsLeaseBeingQuarantined(t *testing.T) {
 	}
 }
 
+// A successful Launch result is not the same as a provider inventory sighting.
+//
+// EC2 can return an instance id before DescribeInstances can see it. If the
+// launch report is then lost, the faster custody cadence must not read that first
+// stale absence as proof and release capacity under the instance about to appear.
+func TestAssumeCustodyKeepsCapacityAcrossAFirstAbsentInventory(t *testing.T) {
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
+	lease := assignedLease(t, a)
+
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 27, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	live, err := a.Lease(t.Context(), lease.ID)
+	if err != nil {
+		t.Fatalf("Lease: %v", err)
+	}
+	if err := r.AssumeCustody(t.Context(), live, 27); err != nil {
+		t.Fatalf("AssumeCustody: %v", err)
+	}
+
+	name := provider.InstanceName(lease.ID)
+	inst := p.live[name]
+	delete(p.live, name)
+
+	if err := r.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend after the stale absence: %v", err)
+	}
+	if _, err := a.Lease(t.Context(), lease.ID); err != nil {
+		t.Fatalf("the first inventory miss released the lost-result launch: %v", err)
+	}
+
+	p.add(inst)
+}
+
 // A HOST RUNNING NOTHING SAYS SO, EVERY SWEEP.
 //
 // Quarantine happens on the REAPER's clock, not the node's. A control plane that

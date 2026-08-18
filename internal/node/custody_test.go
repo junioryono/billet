@@ -1878,6 +1878,34 @@ func TestSupersessionMovesRunningWorkIntoCustody(t *testing.T) {
 	}
 }
 
+// Supersession moves a locally launched instance, not one read from inventory.
+// EC2 may not describe that instance yet, so the first miss after the handoff
+// cannot release its lease.
+func TestSupersessionKeepsCapacityAcrossAFirstAbsentInventory(t *testing.T) {
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
+	lease := assignedLease(t, a)
+
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 28, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	r.Superseded()
+
+	name := provider.InstanceName(lease.ID)
+	inst := p.live[name]
+	delete(p.live, name)
+
+	if err := r.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend after the stale absence: %v", err)
+	}
+	if _, err := a.Lease(t.Context(), lease.ID); err != nil {
+		t.Fatalf("the first inventory miss released the superseded launch: %v", err)
+	}
+
+	p.add(inst)
+}
+
 // EVERY CUSTODY ENTRY RENEWS WITH ITS LEASE'S OWN EPOCH.
 //
 // The epoch is the fencing token: an entry carrying the wrong one is refused by
