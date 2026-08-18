@@ -45,6 +45,14 @@ func TestThePreflightReportsTheDerivedJailDirectory(t *testing.T) {
 	requireKVM(t)
 
 	h := newHarness(t)
+	seenResize2fs := false
+	h.p.lookPath = func(bin string) (string, error) {
+		if bin == resize2fsBinary {
+			seenResize2fs = true
+		}
+
+		return "/usr/sbin/" + bin, nil
+	}
 
 	report, err := h.p.CheckHost(t.Context())
 	if err != nil {
@@ -60,6 +68,27 @@ func TestThePreflightReportsTheDerivedJailDirectory(t *testing.T) {
 	if report.JailUIDMin != h.p.cfg.JailUIDMin || report.JailUIDCount != h.p.cfg.JailUIDCount {
 		t.Errorf("the report names the uid range %d+%d, want %d+%d",
 			report.JailUIDMin, report.JailUIDCount, h.p.cfg.JailUIDMin, h.p.cfg.JailUIDCount)
+	}
+
+	if !seenResize2fs {
+		t.Error("the preflight did not prove resize2fs is installed")
+	}
+}
+
+func TestAHostWithoutResize2fsIsRefusedBeforeItsFirstJob(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.p.lookPath = func(string) (string, error) {
+		return "", errors.New("executable file not found")
+	}
+
+	err := h.p.checkResize2fs()
+	if err == nil {
+		t.Fatal("the resize2fs check accepted a host that cannot expand ext4")
+	}
+	if !strings.Contains(err.Error(), "e2fsprogs") {
+		t.Errorf("the error does not name the package to install: %v", err)
 	}
 }
 

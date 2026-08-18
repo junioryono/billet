@@ -92,8 +92,8 @@ func (c *Client) CloneRoot(
 		return "", err
 	}
 
-	if capacity <= 0 {
-		return "", fmt.Errorf("ceph: root disk %s needs a positive capacity, got %s",
+	if capacity < 0 {
+		return "", fmt.Errorf("ceph: root disk %s cannot have a negative capacity, got %s",
 			bounded(name), capacity)
 	}
 
@@ -138,10 +138,15 @@ func (c *Client) CloneRoot(
 //
 // GROWN, NEVER SHRUNK. A golden image may be larger than an older tier's request,
 // and truncating its clone would cut a live filesystem off at an arbitrary block.
-// The cooperative guest runs resize2fs online before starting the runner, which
-// turns this block-device capacity into filesystem capacity without modifying the
-// immutable generation every job shares.
+// The Firecracker provider runs resize2fs on the mapped, unmounted clone before
+// boot, which turns this block-device capacity into filesystem capacity without
+// modifying the immutable generation every job shares. Zero is the backend default
+// and keeps the generation's size without asking rbd to inspect or resize it.
 func (c *Client) growRoot(ctx context.Context, spec string, capacity config.ByteSize) error {
+	if capacity == 0 {
+		return nil
+	}
+
 	out, err := c.rbdCmd(ctx, true, "info", spec)
 	if err != nil {
 		return fmt.Errorf("ceph: inspect the root disk clone %s before sizing it: %w", spec, err)
@@ -155,7 +160,10 @@ func (c *Client) growRoot(ctx context.Context, spec string, capacity config.Byte
 			"the rbd command?", c.bin, spec)
 	}
 
-	wantMiB := (int64(capacity) + bytesPerMB - 1) / bytesPerMB
+	// CEILING WITHOUT ADDING bytesPerMB-1. ByteSize can represent MaxInt64, so
+	// adding before dividing would wrap a valid request negative and silently skip
+	// the resize that establishes its capacity.
+	wantMiB := (int64(capacity)-1)/bytesPerMB + 1
 	haveMiB := info.Size / bytesPerMB
 	if haveMiB >= wantMiB {
 		return nil

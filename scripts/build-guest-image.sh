@@ -515,15 +515,6 @@ MMDS=169.254.169.254
 
 log() { echo "billet-agent: $*" >&2; }
 
-# THE TIER'S DISK IS A CAPACITY PROMISE. The host grows this job's copy-on-write
-# clone before boot; ext4 does not consume new blocks merely because its device is
-# larger, so grow the mounted filesystem before checkout or a setup action can fill
-# the small golden image and take the runner's own communication down with it.
-if ! /usr/sbin/resize2fs /dev/vda; then
-	log "the root filesystem could not be grown to the tier's disk capacity"
-	exit 1
-fi
-
 # THE ROUTE FIRST. The metadata service answers on a link-local address, and a guest
 # with an address but no route to it fails in a way that reads like the service is
 # down rather than like the guest never asked.

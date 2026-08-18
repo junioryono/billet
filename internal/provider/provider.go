@@ -164,7 +164,8 @@ type Spec struct {
 	// ledger could not make the decision and the launch must stop.
 	AuthorizeShape func(context.Context, string, int, config.ByteSize) (ok bool, err error)
 	// Disk is the root volume capacity. Firecracker grows its per-job RBD clone
-	// to at least this size; EC2 requests it from EBS. Host Docker ignores it.
+	// and ext4 filesystem to at least this size; EC2 requests it from EBS. Zero
+	// means the backend's image default. Host Docker ignores it.
 	Disk config.ByteSize
 	// SHM sizes /dev/shm. It is a tier parameter rather than a constant because
 	// Postgres service containers and Chromium both fail on the default 64MB in

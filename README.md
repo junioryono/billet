@@ -167,7 +167,7 @@ It resolves itself in the ordinary case: the host destroys the container and say
 
 ## Guest images
 
-Firecracker root disks are grown per job to the tier's requested `disk` capacity, then the guest expands ext4 before Docker or the runner starts. The immutable golden generation remains small and shared, and teardown discards the enlarged clone with the microVM.
+Firecracker root disks are grown per job to the tier's requested `disk` capacity, then the host expands ext4 on the unmounted clone before the guest boots. This also works with already-published images. The immutable golden generation remains small and shared, and teardown discards the enlarged clone with the microVM. A zero `disk` keeps the generation's size as the backend default.
 
 A Firecracker job boots a **golden image**: an Ubuntu 24.04 rootfs carrying Docker, the
 GitHub Actions runner, and a small agent that reads the runner registration out of the

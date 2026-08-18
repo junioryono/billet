@@ -71,7 +71,8 @@ type RootDisk interface {
 	// reference that already names a generation comes back unchanged.
 	ResolveGeneration(ctx context.Context, image string) (string, error)
 	// CloneRoot makes a per-job copy-on-write clone of a golden image, grows it to
-	// at least capacity and maps it, returning the host device path.
+	// at least capacity when capacity is positive and maps it, returning the host
+	// device path. Zero keeps the generation's size as the backend default.
 	CloneRoot(ctx context.Context, image, name string, capacity config.ByteSize) (string, error)
 	// DiscardRoot unmaps and removes a clone. It must be idempotent: teardown runs
 	// on paths that have already failed once.
@@ -119,6 +120,7 @@ type Provider struct {
 	execName string
 
 	run      runner
+	lookPath func(string) (string, error)
 	mknod    mknodFunc
 	chown    chownFunc
 	chownOne chownFunc
@@ -239,6 +241,7 @@ func New(owner string, cfg config.FirecrackerConfig, disk RootDisk, opts ...Opti
 		cfg:      cfg,
 		disk:     disk,
 		run:      execRunner,
+		lookPath: exec.LookPath,
 		mknod:    mknodBlock,
 		chown:    chownTree,
 		chownOne: os.Chown,
@@ -416,6 +419,17 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*Instance, e
 			p.unwind(ctx, j, spec, res, err))
 	}
 
+	// THE FILESYSTEM, NOT ONLY ITS DEVICE. RBD resize makes blocks addressable by
+	// the kernel; ext4 keeps the size recorded in its superblock until resize2fs
+	// changes it. Doing that here, while the clone is mapped and unmounted, makes
+	// the tier's capacity real before the first guest instruction and works for
+	// every already-published image rather than requiring a new guest agent.
+	if spec.Disk > 0 {
+		if err := p.growRootFilesystem(ctx, spec.Name, device); err != nil {
+			return nil, errors.Join(err, p.unwind(ctx, j, spec, res, err))
+		}
+	}
+
 	// FROM HERE EVERY FAILURE UNWINDS WHAT IT MADE, in reverse order, and says so if
 	// it cannot. The caller treats a launch error as "billet does not know whether
 	// something started" and asks Find — so this is not the safety net, it is the
@@ -486,6 +500,20 @@ func (p *Provider) launch(
 
 	return &Instance{ID: spec.Name, Name: spec.Name, Running: true}, nil
 }
+
+// growRootFilesystem expands the unmounted ext4 filesystem to its mapped device.
+func (p *Provider) growRootFilesystem(ctx context.Context, name, device string) error {
+	if _, err := p.run(ctx, resize2fsBinary, []string{device}); err != nil {
+		return fmt.Errorf("firecracker: grow the root filesystem of %s on %s before boot: %w",
+			name, device, err)
+	}
+
+	return nil
+}
+
+// resize2fsBinary comes from e2fsprogs, installed by the host role and checked by
+// the Firecracker preflight before this provider is allowed to launch work.
+const resize2fsBinary = "resize2fs"
 
 // checkSpec refuses a spec that would produce a microVM which cannot run the job.
 func checkSpec(spec provider.Spec) error {
@@ -587,8 +615,9 @@ func checkSpec(spec provider.Spec) error {
 		return fmt.Errorf("firecracker: %s asks for %s of memory", spec.Name, spec.Memory)
 	}
 
-	if spec.Disk <= 0 {
-		return fmt.Errorf("firecracker: %s asks for %s of root disk", spec.Name, spec.Disk)
+	if spec.Disk < 0 {
+		return fmt.Errorf("firecracker: %s asks for a negative root disk capacity of %s",
+			spec.Name, spec.Disk)
 	}
 
 	if len(spec.Volumes) > provider.MaxVolumes {
@@ -1076,6 +1105,18 @@ func (p *Provider) destroy(ctx context.Context, id string) error {
 		failures = append(failures, err)
 	}
 
+	// BEFORE REMOVING THE JAIL OR ITS CLAIMS. The jail is the durable evidence
+	// that this lease still owns a root clone. If Ceph is unavailable and the
+	// discard fails, retaining it makes List report the lease and gives a later
+	// Destroy something to find and retry. Removing it first turns the clone into
+	// pool space no inventory can attribute.
+	if err := p.disk.DiscardRoot(ctx, id); err != nil {
+		failures = append(failures,
+			fmt.Errorf("firecracker: discard the root disk of %s: %w", id, err))
+
+		return errors.Join(failures...)
+	}
+
 	// PAST A FAILED TAP REMOVAL, deliberately, unlike the stop above. The VMM is
 	// already gone by here, so the remaining steps are reclaiming things rather than
 	// acting on live compute — and stopping at the first would leave a mapped block
@@ -1101,7 +1142,13 @@ func (p *Provider) destroy(ctx context.Context, id string) error {
 		failures = append(failures, err)
 	}
 
-	return p.discardWith(ctx, id, failures)
+	if len(failures) > 0 {
+		return errors.Join(failures...)
+	}
+
+	p.log.Info("destroyed a microVM", "runner", id)
+
+	return nil
 }
 
 // discardWith releases the root disk and reports it alongside whatever else failed.
@@ -1307,7 +1354,8 @@ func (p *Provider) awaitExit(ctx context.Context, j jail, pid int) error {
 // this is really bounding is the window before billet escalates to SIGKILL.
 const exitWait = 5 * time.Second
 
-// unwind removes what a failed launch made.
+// unwind reclaims what a failed launch made, retaining its jail if the root clone
+// cannot be discarded so a later Destroy can find and retry it.
 //
 // Its errors are RETURNED to be joined with the launch failure rather than logged
 // and dropped: a root disk that could not be discarded is pool space nothing will
@@ -1355,6 +1403,16 @@ func (p *Provider) unwind(
 		failures = append(failures, err)
 	}
 
+	// THE JAIL STAYS UNTIL THE DISK IS GONE. A correlated Ceph failure can make
+	// both the launch and this cleanup fail; preserving the owner marker and claims
+	// is what turns that from an unattributable RBD orphan into retryable custody.
+	if err := p.disk.DiscardRoot(ctx, spec.Name); err != nil {
+		failures = append(failures, fmt.Errorf("firecracker: discard the root disk of %s after a "+
+			"failed launch: %w", spec.Name, err))
+
+		return errors.Join(failures...)
+	}
+
 	if err := j.remove(); err != nil {
 		failures = append(failures, err)
 	}
@@ -1370,11 +1428,6 @@ func (p *Provider) unwind(
 
 	if err := p.releaseResources(held, j.id); err != nil {
 		failures = append(failures, err)
-	}
-
-	if err := p.disk.DiscardRoot(ctx, spec.Name); err != nil {
-		failures = append(failures, fmt.Errorf("firecracker: discard the root disk of %s after a "+
-			"failed launch: %w", spec.Name, err))
 	}
 
 	return errors.Join(failures...)

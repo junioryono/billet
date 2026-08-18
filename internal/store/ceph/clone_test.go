@@ -241,16 +241,64 @@ func TestACloneThatCannotBeGrownIsRemoved(t *testing.T) {
 	}
 }
 
-func TestARootDiskNeedsAPositiveCapacityBeforeItClones(t *testing.T) {
+// ZERO MEANS THE BACKEND DEFAULT. Existing configurations may omit disk, so the
+// clone keeps the generation's size and reaches mapping without an info or resize.
+func TestAZeroRootCapacityKeepsTheGenerationSize(t *testing.T) {
 	t.Parallel()
 
 	f := newCloneFake()
 
-	if _, err := cloneClient(t, f).CloneRoot(t.Context(), "img@g1", "billet-abc", 0); err == nil {
-		t.Fatal("CloneRoot accepted no root capacity")
+	if _, err := cloneClient(t, f).CloneRoot(t.Context(), "img@g1", "billet-abc", 0); err != nil {
+		t.Fatalf("CloneRoot: %v", err)
+	}
+	for _, call := range f.calls {
+		if sub := subcommandOf(call); sub == "info" || sub == "resize" {
+			t.Errorf("a backend-default capacity ran %s: %v", sub, call)
+		}
+	}
+	f.ran(t, "device", "map", "billet-cache/billet-abc")
+}
+
+func TestANegativeRootCapacityIsRefusedBeforeItClones(t *testing.T) {
+	t.Parallel()
+
+	f := newCloneFake()
+
+	if _, err := cloneClient(t, f).CloneRoot(t.Context(), "img@g1", "billet-abc", -1); err == nil {
+		t.Fatal("CloneRoot accepted a negative root capacity")
 	}
 	if len(f.calls) != 0 {
 		t.Errorf("a refused capacity still changed the cluster: %v", f.calls)
+	}
+}
+
+// The MiB ceiling is exact at a boundary, rounds one byte up, and does not
+// overflow at the largest value ByteSize can represent.
+func TestRootCapacityIsRoundedToMiBWithoutOverflow(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name     string
+		capacity config.ByteSize
+		want     string
+	}{
+		{"exact MiB", 5 * config.MiB, "5M"},
+		{"one byte over", 5*config.MiB + 1, "6M"},
+		{"MaxInt64", config.ByteSize(1<<63 - 1), "8796093022208M"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			f := newCloneFake()
+			f.size = 1
+
+			if _, err := cloneClient(t, f).CloneRoot(t.Context(), "img@g1", "billet-abc",
+				tc.capacity); err != nil {
+				t.Fatalf("CloneRoot: %v", err)
+			}
+
+			f.ran(t, "resize", "--size", tc.want, "billet-cache/billet-abc")
+		})
 	}
 }
 

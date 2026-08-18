@@ -364,7 +364,7 @@ func TestASpecThatCannotRunAJobIsRefused(t *testing.T) {
 			}, "the service holds"},
 		{"no vcpu", func(s *provider.Spec) { s.VCPU = 0 }, "vCPU"},
 		{"no memory", func(s *provider.Spec) { s.Memory = 0 }, "of memory"},
-		{"no root disk", func(s *provider.Spec) { s.Disk = 0 }, "of root disk"},
+		{"negative root disk", func(s *provider.Spec) { s.Disk = -1 }, "negative root disk"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -410,6 +410,127 @@ func TestLaunchMakesTheTierDiskCapacityPartOfTheRootClone(t *testing.T) {
 
 	if len(h.disk.cloneSizes) != 1 || h.disk.cloneSizes[0] != 20*config.GiB {
 		t.Errorf("root clone capacities = %v, want one 20GiB clone", h.disk.cloneSizes)
+	}
+}
+
+// RBD CAPACITY IS NOT FILESYSTEM CAPACITY. The mapped clone is unmounted here, so
+// resize2fs must run before the jailer can start a guest that fills the old image
+// size during checkout or tool setup.
+func TestLaunchGrowsTheRootFilesystemBeforeStartingTheJailer(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.launch(t)
+
+	resizeAt, jailerAt := -1, -1
+	for i, run := range h.commands() {
+		if run.bin == resize2fsBinary && len(run.args) == 1 && run.args[0] == "/dev/rbd0" {
+			resizeAt = i
+		}
+		if strings.HasSuffix(run.bin, "jailer") {
+			jailerAt = i
+		}
+	}
+
+	if resizeAt < 0 || jailerAt < 0 || resizeAt >= jailerAt {
+		t.Fatalf("filesystem growth did not precede the jailer: %s", h.everyArgument())
+	}
+}
+
+// AN OLD TIER MAY OMIT DISK. Zero keeps the backend image default and does not
+// introduce a new host dependency into that launch path.
+func TestAZeroRootCapacityKeepsTheBackendDefault(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	spec := aSpec()
+	spec.Disk = 0
+
+	var vmm *fakeVMM
+	h.onJailer = func(id string) { vmm = h.serveVMM(t, id) }
+	if _, err := h.p.Launch(t.Context(), spec); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	if vmm == nil {
+		t.Fatal("Launch did not start the vmm")
+	}
+
+	for _, run := range h.commands() {
+		if run.bin == resize2fsBinary {
+			t.Errorf("a backend-default root capacity ran resize2fs: %v", run.args)
+		}
+	}
+}
+
+// A FILESYSTEM THAT CANNOT BE GROWN NEVER BOOTS. The mapped clone is discarded
+// and the error keeps the sizing failure as its headline.
+func TestAFilesystemGrowthFailureUnwindsBeforeBoot(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.refuse = func(bin string, _ []string) error {
+		if bin == resize2fsBinary {
+			return errors.New("bad ext4 superblock")
+		}
+
+		return nil
+	}
+
+	_, err := h.p.Launch(t.Context(), aSpec())
+	if err == nil {
+		t.Fatal("Launch reported success although its root filesystem could not be grown")
+	}
+	if !strings.Contains(err.Error(), "bad ext4 superblock") ||
+		!strings.Contains(err.Error(), "before boot") {
+		t.Errorf("the error does not explain the failed pre-boot growth: %v", err)
+	}
+	for _, run := range h.commands() {
+		if strings.HasSuffix(run.bin, "jailer") {
+			t.Errorf("the jailer started after filesystem growth failed: %v", run.args)
+		}
+	}
+	if got := h.disk.discards(); len(got) != 1 || got[0] != theInstance {
+		t.Errorf("the failed launch did not discard its mapped clone: %v", got)
+	}
+}
+
+// A STORAGE OUTAGE CAN BREAK BOTH THE OPERATION AND ITS CLEANUP. The jail and
+// resource claims are the retry record: they must survive until a later Destroy
+// can discard the clone, or the RBD image becomes an unattributable orphan.
+func TestAFilesystemGrowthAndDiscardFailureRemainRetryable(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.refuse = func(bin string, _ []string) error {
+		if bin == resize2fsBinary {
+			return errors.New("root growth failed")
+		}
+
+		return nil
+	}
+	h.disk.discardErr = errors.New("ceph is unavailable")
+
+	_, err := h.p.Launch(t.Context(), aSpec())
+	if err == nil {
+		t.Fatal("Launch reported success")
+	}
+	j := h.p.jailFor(theInstance)
+	if _, statErr := os.Stat(j.dir()); statErr != nil {
+		t.Fatalf("the retry marker was removed with the root clone still present: %v", statErr)
+	}
+	if held, claimErr := h.p.claimedBy(theInstance); claimErr != nil {
+		t.Fatalf("read retained claims: %v", claimErr)
+	} else if held == (resources{}) {
+		t.Fatal("the failed cleanup released every claim while its clone remained")
+	}
+
+	h.refuse = nil
+	h.disk.discardErr = nil
+	if _, err := h.p.Destroy(t.Context(), theInstance); err != nil {
+		t.Fatalf("retry Destroy: %v", err)
+	}
+	if _, statErr := os.Stat(j.dir()); !errors.Is(statErr, os.ErrNotExist) {
+		t.Errorf("the retry did not remove the jail: %v", statErr)
 	}
 }
 

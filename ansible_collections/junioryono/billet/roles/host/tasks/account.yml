@@ -61,6 +61,7 @@
       - ca-certificates
       - ceph-common
       - dnsmasq-base
+      - e2fsprogs
       - iproute2
       - kmod
       - nftables

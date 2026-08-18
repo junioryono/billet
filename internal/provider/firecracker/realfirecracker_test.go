@@ -2,10 +2,12 @@ package firecracker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -51,6 +53,7 @@ func TestRealFirecrackerLaunchAndDestroy(t *testing.T) {
 		Image:     env.image,
 		VCPU:      2,
 		Memory:    1 * config.GiB,
+		Disk:      8 * config.GiB,
 		Command:   []string{"./run.sh"},
 		Trust:     provider.TrustTrusted,
 		JITConfig: "not-a-real-registration",
@@ -63,6 +66,10 @@ func TestRealFirecrackerLaunchAndDestroy(t *testing.T) {
 	// This is the assertion the whole design turned on, and it can only be made
 	// against the real jailer: a fake would agree with whatever billet computed.
 	j := p.jailFor(name)
+	if got := ext4Size(t, j.rootDiskPath()); got < int64(8*config.GiB) {
+		t.Errorf("the root filesystem visible to the guest is %d bytes, want at least %d", got,
+			8*config.GiB)
+	}
 
 	if _, err := os.Stat(j.socket()); err != nil {
 		t.Errorf("no api socket at the path billet derives, so the jailer used another: %v", err)
@@ -123,7 +130,7 @@ func TestRealFirecrackerDestroyLeavesNothing(t *testing.T) {
 	name := provider.InstanceName(env.lease)
 
 	if _, err := p.Launch(t.Context(), provider.Spec{
-		Name: name, Image: env.image, VCPU: 1, Memory: 512 * config.MiB,
+		Name: name, Image: env.image, VCPU: 1, Memory: 512 * config.MiB, Disk: 8 * config.GiB,
 		Command: []string{"./run.sh"}, Trust: provider.TrustTrusted,
 		JITConfig: "not-a-real-registration",
 	}); err != nil {
@@ -268,10 +275,24 @@ func (d rbdDisk) CloneRoot(
 	}
 
 	if capacity > 0 {
-		sizeMiB := (int64(capacity) + int64(config.MiB) - 1) / int64(config.MiB)
-		if err := exec.CommandContext(ctx, "rbd", d.args("resize", "--size",
-			fmt.Sprintf("%dM", sizeMiB), d.cache+"/"+name)...).Run(); err != nil {
+		out, err := exec.CommandContext(ctx, "rbd", d.args("--format", "json", "info",
+			d.cache+"/"+name)...).Output()
+		if err != nil {
 			return "", err
+		}
+		var info struct {
+			Size int64 `json:"size"`
+		}
+		if err := json.Unmarshal(out, &info); err != nil {
+			return "", err
+		}
+
+		sizeMiB := (int64(capacity)-1)/int64(config.MiB) + 1
+		if info.Size < int64(capacity) {
+			if err := exec.CommandContext(ctx, "rbd", d.args("resize", "--size",
+				fmt.Sprintf("%dM", sizeMiB), d.cache+"/"+name)...).Run(); err != nil {
+				return "", err
+			}
 		}
 	}
 
@@ -282,6 +303,37 @@ func (d rbdDisk) CloneRoot(
 	}
 
 	return strings.TrimSpace(string(out)), nil
+}
+
+// ext4Size reads the superblock through the exact device node Firecracker opens
+// inside the jail. That is the filesystem the guest sees, not merely RBD's outer
+// block-device capacity.
+func ext4Size(t *testing.T, device string) int64 {
+	t.Helper()
+
+	out, err := exec.CommandContext(t.Context(), "dumpe2fs", "-h", device).CombinedOutput()
+	if err != nil {
+		t.Fatalf("inspect the guest root filesystem: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+
+	values := make(map[string]int64)
+	for _, line := range strings.Split(string(out), "\n") {
+		key, value, found := strings.Cut(line, ":")
+		if !found || (key != "Block count" && key != "Block size") {
+			continue
+		}
+		n, parseErr := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+		if parseErr != nil {
+			t.Fatalf("parse %s from dumpe2fs: %v", key, parseErr)
+		}
+		values[key] = n
+	}
+
+	if values["Block count"] <= 0 || values["Block size"] <= 0 {
+		t.Fatalf("dumpe2fs did not report a positive block count and size: %s", out)
+	}
+
+	return values["Block count"] * values["Block size"]
 }
 
 func (d rbdDisk) DiscardRoot(ctx context.Context, name string) error {

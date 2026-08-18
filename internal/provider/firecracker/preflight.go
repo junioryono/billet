@@ -73,6 +73,10 @@ func (p *Provider) CheckHost(ctx context.Context) (HostReport, error) {
 		*bin.into = firstLine(string(out))
 	}
 
+	if err := p.checkResize2fs(); err != nil {
+		return report, err
+	}
+
 	if err := p.checkKernelImage(); err != nil {
 		return report, err
 	}
@@ -82,6 +86,18 @@ func (p *Provider) CheckHost(ctx context.Context) (HostReport, error) {
 	}
 
 	return report, nil
+}
+
+// checkResize2fs proves this host can turn a grown root device into filesystem
+// capacity before booting it.
+func (p *Provider) checkResize2fs() error {
+	if _, err := p.lookPath(resize2fsBinary); err != nil {
+		return fmt.Errorf("firecracker: %s is not on PATH, so a tier's root disk capacity "+
+			"could not be made usable before boot: %w (install e2fsprogs)",
+			resize2fsBinary, err)
+	}
+
+	return nil
 }
 
 // checkKVM proves this machine can run a hardware-accelerated guest.
