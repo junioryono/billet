@@ -9,6 +9,11 @@ state="${RUNNER_TEMP}/billet-buildkit-state"
 socket_dir="${RUNNER_TEMP}/billet-buildkit-socket"
 config="${RUNNER_TEMP}/billet-buildkitd.toml"
 
+if ! docker buildx version >/dev/null 2>&1; then
+  echo "docker buildx is required by setup-docker-builder; install the Docker Buildx CLI plugin (Billet guest images include the Ubuntu docker-buildx package)" >&2
+  exit 1
+fi
+
 mkdir -p "$socket_dir"
 case "${BILLET_BUILDKIT_RESET:-false}" in
   false) ;;
