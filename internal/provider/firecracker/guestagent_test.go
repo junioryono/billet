@@ -225,10 +225,18 @@ cmd=(bash -c 'printf "%s\0" "${HOME-}" "${USER-}" "${LOGNAME-}" "${RUNNER_TOOL_C
 exit "$job_status"
 `
 	run := exec.CommandContext(t.Context(), "bash", "-c", script)
-	run.Env = append(os.Environ(),
-		"BILLET_TEST_SETPRIV_LOG="+setprivLog,
-		"PATH="+shadow+":"+os.Getenv("PATH"),
-	)
+	// POISON EVERY VALUE THE HOSTED RUNNER ALREADY SETS CORRECTLY. If the real
+	// launch stanza stops passing runner_env, inheriting CI's own runner account
+	// would otherwise make the mutation look exactly like production success.
+	run.Env = []string{
+		"BILLET_TEST_SETPRIV_LOG=" + setprivLog,
+		"PATH=" + shadow + ":" + os.Getenv("PATH"),
+		"HOME=/poisoned-home",
+		"USER=poisoned-user",
+		"LOGNAME=poisoned-logname",
+		"RUNNER_TOOL_CACHE=/poisoned-tool-cache",
+		"AGENT_TOOLSDIRECTORY=/poisoned-agent-tools",
+	}
 	out, err := run.Output()
 	if err != nil {
 		t.Fatalf("run the extracted privilege-drop launch: %v", err)
