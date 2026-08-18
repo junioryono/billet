@@ -539,7 +539,7 @@ tiers:
     disk: 160GiB
 ```
 
-For Firecracker and EC2, `disk` is usable root-volume capacity rather than a scheduling annotation. Firecracker grows only the job's copy-on-write clone and the guest expands ext4 before Docker or the runner starts; the immutable golden image stays small and shared. Docker runs on the host filesystem and ignores this field.
+For Firecracker and EC2, `disk` is usable root-volume capacity rather than a scheduling annotation. Firecracker grows only the job's copy-on-write clone and expands ext4 on the host before boot; the immutable golden image stays small and shared, including images published before this behavior existed. A zero value keeps that image size as the backend default. Docker runs on the host filesystem and ignores this field.
 
 ## Security
 

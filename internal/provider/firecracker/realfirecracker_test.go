@@ -140,6 +140,7 @@ func TestRealFirecrackerDestroyLeavesNothing(t *testing.T) {
 	if _, err := p.Destroy(t.Context(), name); err != nil {
 		t.Fatalf("Destroy: %v", err)
 	}
+	env.disk.assertGone(t, name)
 
 	j := p.jailFor(name)
 
@@ -165,7 +166,7 @@ func TestRealFirecrackerDestroyLeavesNothing(t *testing.T) {
 // realHost is what a live launch needs, and where it came from.
 type realHost struct {
 	cfg   config.FirecrackerConfig
-	disk  RootDisk
+	disk  rbdDisk
 	image string
 	lease string
 }
@@ -231,7 +232,7 @@ func requireRealHost(t *testing.T) realHost {
 // the store — the layering depguard enforces. It runs the same two commands the
 // ceph client does, which is what makes this a test of the launch path rather than
 // of the storage.
-func realDisk(t *testing.T) RootDisk {
+func realDisk(t *testing.T) rbdDisk {
 	t.Helper()
 
 	pool := os.Getenv("BILLET_TEST_CACHE_POOL")
@@ -344,6 +345,45 @@ func (d rbdDisk) DiscardRoot(ctx context.Context, name string) error {
 	_ = exec.CommandContext(ctx, "rbd", d.args("rm", d.cache+"/"+name)...).Run()
 
 	return nil
+}
+
+// assertGone proves teardown removed both forms of RBD state: the kernel mapping
+// and the cache-pool image it pins.
+func (d rbdDisk) assertGone(t *testing.T, name string) {
+	t.Helper()
+
+	out, err := exec.CommandContext(t.Context(), "rbd", d.args("--format", "json", "device",
+		"list")...).Output()
+	if err != nil {
+		t.Fatalf("list RBD mappings after Destroy: %v", err)
+	}
+	var mappings []struct {
+		Pool string `json:"pool"`
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(out, &mappings); err != nil {
+		t.Fatalf("decode RBD mappings after Destroy: %v", err)
+	}
+	for _, mapping := range mappings {
+		if mapping.Pool == d.cache && mapping.Name == name {
+			t.Errorf("Destroy left %s/%s mapped", d.cache, name)
+		}
+	}
+
+	out, err = exec.CommandContext(t.Context(), "rbd", d.args("--format", "json", "ls",
+		d.cache)...).Output()
+	if err != nil {
+		t.Fatalf("list cache-pool images after Destroy: %v", err)
+	}
+	var images []string
+	if err := json.Unmarshal(out, &images); err != nil {
+		t.Fatalf("decode cache-pool images after Destroy: %v", err)
+	}
+	for _, image := range images {
+		if image == name {
+			t.Errorf("Destroy left %s/%s in the cache pool", d.cache, name)
+		}
+	}
 }
 
 // KernelFor answers "nothing recorded". This harness boots against a real cluster

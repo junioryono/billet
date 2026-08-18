@@ -930,7 +930,12 @@ func writeHostileInstallerArchive(t *testing.T, root, name, threat, binary, esca
 func waitForFile(t *testing.T, path string) {
 	t.Helper()
 
-	deadline := time.Now().Add(5 * time.Second)
+	// A READINESS BOUND, NOT AN INSTALLER PERFORMANCE ASSERTION. Under the full
+	// race-and-coverage suite this helper competes with every package and the
+	// staged fixture has twice taken just over five seconds to be scheduled, while
+	// its isolated run completes in under a second. Thirty seconds still catches a
+	// process that never reaches the marker without making machine load the verdict.
+	deadline := time.Now().Add(30 * time.Second)
 	for {
 		_, err := os.Stat(path)
 		if err == nil {
