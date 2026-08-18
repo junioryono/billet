@@ -14,7 +14,7 @@ inputs:
     description: Runner-local publication guard removed only after the cache-mount policy is enforced.
     required: true
 runs:
-  using: node20
+  using: node24
   main: index.js
   post: cleanup.js
   post-if: always()
