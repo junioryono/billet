@@ -1170,3 +1170,47 @@ func TestADatabaseWrittenByAnEarlierBilletUpgrades(t *testing.T) {
 		t.Errorf("the upgraded database refuses the quarantine phase: %v", err)
 	}
 }
+
+func TestAPendingCompletionWrittenAtVersion22SurvivesVersion23(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(t.Context(), dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
+		for _, stmt := range []string{
+			`ALTER TABLE pending_completions DROP COLUMN release_only`,
+			`ALTER TABLE pending_completions DROP COLUMN outcome`,
+			`ALTER TABLE pending_completions DROP COLUMN lease_epoch`,
+			`ALTER TABLE pending_completions DROP COLUMN lease_id`,
+			`DELETE FROM schema_migrations WHERE version = 23`,
+			`INSERT INTO pending_completions (tier, request_id, run_id, result)
+			 VALUES ('linux', 91, 101, 'Succeeded')`,
+		} {
+			if _, err := tx.ExecContext(t.Context(), stmt); err != nil {
+				return fmt.Errorf("%s: %w", stmt, err)
+			}
+		}
+
+		return nil
+	}); err != nil {
+		t.Fatalf("rewind to version 22: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close version 22 database: %v", err)
+	}
+
+	upgraded, err := Open(t.Context(), dir)
+	if err != nil {
+		t.Fatalf("open version 22 database with version 23: %v", err)
+	}
+	defer upgraded.Close()
+	got, err := upgraded.PendingCompletions(t.Context(), "linux")
+	if err != nil {
+		t.Fatalf("PendingCompletions: %v", err)
+	}
+	want := PendingCompletion{Tier: "linux", RequestID: 91, RunID: 101, Result: "Succeeded"}
+	if !slices.Equal(got, []PendingCompletion{want}) {
+		t.Fatalf("upgraded pending completions = %+v, want %+v", got, want)
+	}
+}
