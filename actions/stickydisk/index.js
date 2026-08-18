@@ -43,7 +43,7 @@ async function main() {
       key,
       size_bytes: sizeGB * 1024 * 1024 * 1024,
       publication: process.env.INPUT_PUBLICATION || "cas",
-    });
+    }, 13 * 60 * 1000);
     slot = attached.slot;
 
     for (let attempt = 0; attempt < 100; attempt += 1) {

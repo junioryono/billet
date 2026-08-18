@@ -38,6 +38,32 @@ type fakeCacheStore struct {
 	snapshotVolumes   []storecontract.Volume
 }
 
+func TestCacheWriterAuthorityOutlivesTheWholeCommitBudget(t *testing.T) {
+	t.Parallel()
+
+	if cacheCleanupMargin <= 0 || cacheWorkLimit+cacheCleanupMargin != cacheHandlerLimit {
+		t.Fatalf("cache handler budget %s does not reserve cleanup margin %s",
+			cacheHandlerLimit, cacheCleanupMargin)
+	}
+	if cacheWriterTTL <= cacheHandlerLimit {
+		t.Fatalf("writer lease %s does not cover the %s handler budget", cacheWriterTTL, cacheHandlerLimit)
+	}
+}
+
+func TestCacheSessionLockWaitHonoursTheCommitContext(t *testing.T) {
+	t.Parallel()
+
+	session := &cacheSession{}
+	session.mu.Lock()
+	t.Cleanup(session.mu.Unlock)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	if err := lockCacheSession(ctx, session); !errors.Is(err, context.Canceled) {
+		t.Fatalf("lockCacheSession returned %v, want context cancellation", err)
+	}
+}
+
 func (f *fakeCacheStore) Current(context.Context, string) (string, error) {
 	if f.current == "" {
 		return "", storecontract.ErrMiss

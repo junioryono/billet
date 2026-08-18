@@ -317,12 +317,18 @@ func TestTheTierMountLimitAndFailSafeDiscardAreWiredBetweenActions(t *testing.T)
 	if !bytes.Contains(cleanup, []byte(`discard ? "discard" : "commit"`)) {
 		t.Fatal("a failed BuildKit policy cannot discard the sticky-disk publication")
 	}
+	if !bytes.Contains(cleanup, []byte(`discard ? 2 * 60 * 1000 : 13 * 60 * 1000`)) {
+		t.Fatal("the sticky-disk post request budgets commit time without delaying discard")
+	}
 	attach, err := os.ReadFile(filepath.Join("stickydisk", "index.js"))
 	if err != nil {
 		t.Fatalf("read sticky-disk attach: %v", err)
 	}
 	if !bytes.Contains(attach, []byte(`fs.writeFileSync(discardMarker`)) {
 		t.Fatal("the sticky-disk action does not create its publication guard before the policy hook runs")
+	}
+	if !bytes.Contains(attach, []byte(`}, 13 * 60 * 1000);`)) {
+		t.Fatal("sticky-disk attach does not leave the server time to compact legacy cache lineage")
 	}
 }
 
