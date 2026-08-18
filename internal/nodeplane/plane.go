@@ -94,6 +94,9 @@ type Plane struct {
 	activeRegistration map[string]uint64
 	registrationGuards map[string]*sync.Mutex
 	nextRegistration   uint64
+	// afterRegisterNodeForTest stages the otherwise unobservable gap between a
+	// durable registration and its in-memory install. Production leaves it nil.
+	afterRegisterNodeForTest func(context.Context, string, int64)
 
 	registrar Registrar
 
@@ -786,6 +789,9 @@ func (p *Plane) register(
 			// down after it recovered.
 			return nodeapi.RegisterResponse{}, fmt.Errorf(
 				"nodeplane: the ledger could not record node %q: %w", req.Node, err)
+		}
+		if p.afterRegisterNodeForTest != nil {
+			p.afterRegisterNodeForTest(ctx, req.Node, epoch)
 		}
 	}
 

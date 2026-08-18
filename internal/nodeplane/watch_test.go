@@ -69,6 +69,13 @@ func (l *ledger) held() bool {
 	return l.holding
 }
 
+func (l *ledger) currentEpoch() int64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	return l.epoch
+}
+
 func (l *ledger) NodeGone(_ context.Context, name string, epoch int64) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -216,16 +223,27 @@ func TestANodeExpiredBySomethingElseIsStillRecorded(t *testing.T) {
 // the two authorities describing different processes. A per-node guard keeps B
 // out of the allocator until A has installed, without blocking other node names.
 //
-// STAGED RATHER THAN REASONED ABOUT. The fake holds A after allocating its epoch
-// and observes that B cannot allocate the next one until A finishes.
+// STAGED RATHER THAN REASONED ABOUT. The test holds A after its durable call has
+// returned but before its plane install, then observes that B cannot enter the
+// ledger until A finishes.
 func TestALateRegistrationCannotSupersedeTheNewerProcess(t *testing.T) {
 	t.Parallel()
 
 	led := newLedger()
-	p := testPlane(t, WithRegistrar(led))
-
+	committed := make(chan struct{})
 	proceed := make(chan struct{})
-	led.holdFirst = proceed
+	var once sync.Once
+	p := testPlane(t, WithRegistrar(led), func(p *Plane) {
+		p.afterRegisterNodeForTest = func(ctx context.Context, _ string, _ int64) {
+			once.Do(func() {
+				close(committed)
+				select {
+				case <-proceed:
+				case <-ctx.Done():
+				}
+			})
+		}
+	})
 
 	first := make(chan error, 1)
 
@@ -237,10 +255,11 @@ func TestALateRegistrationCannotSupersedeTheNewerProcess(t *testing.T) {
 		first <- err
 	}()
 
-	// A is inside the ledger write holding the older epoch.
-	waitFor(t, "the first registration to reach the ledger", func() bool {
-		return led.held()
-	})
+	// A has committed its older epoch but has not installed it in the plane.
+	<-committed
+	if !registrationGuardHeldForTest(p, "n1") {
+		t.Fatal("registration guard was released in the post-commit, pre-install gap")
+	}
 
 	second := make(chan error, 1)
 	go func() {
@@ -258,6 +277,9 @@ func TestALateRegistrationCannotSupersedeTheNewerProcess(t *testing.T) {
 	case err := <-second:
 		t.Fatalf("second registration crossed the first one's unfinished install: %v", err)
 	default:
+	}
+	if got := led.currentEpoch(); got != 1 {
+		t.Fatalf("second registration reached the ledger before the first installed: epoch=%d", got)
 	}
 
 	close(proceed)
@@ -286,6 +308,22 @@ func registrationCountForTest(p *Plane, node string) int {
 	defer p.mu.Unlock()
 
 	return p.registering[node]
+}
+
+func registrationGuardHeldForTest(p *Plane, node string) bool {
+	p.mu.Lock()
+	guard := p.registrationGuards[node]
+	p.mu.Unlock()
+	if guard == nil {
+		return false
+	}
+	if guard.TryLock() {
+		guard.Unlock()
+
+		return false
+	}
+
+	return true
 }
 
 func TestARegistrationDoesNotBlockAnotherNode(t *testing.T) {

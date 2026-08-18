@@ -44,13 +44,9 @@ type blockingAllocatorRegistrar struct {
 	proceed chan struct{}
 }
 
-type precommitBlockingAllocatorRegistrar struct {
+type observingAllocatorRegistrar struct {
 	*alloc.Allocator
-	mu            sync.Mutex
-	calls         int
-	firstEntered  chan struct{}
 	secondEntered chan struct{}
-	proceed       chan struct{}
 }
 
 func (r *blockingAllocatorRegistrar) RegisterNode(
@@ -77,33 +73,13 @@ func (r *blockingAllocatorRegistrar) RegisterNode(
 	return r.Allocator.RegisterNode(ctx, registration)
 }
 
-func (r *precommitBlockingAllocatorRegistrar) RegisterNode(
+func (r *observingAllocatorRegistrar) RegisterNode(
 	ctx context.Context,
 	registration alloc.NodeRegistration,
 ) (int64, error) {
-	r.mu.Lock()
-	r.calls++
-	call := r.calls
-	r.mu.Unlock()
-
-	switch call {
-	case 1:
-		select {
-		case r.firstEntered <- struct{}{}:
-		case <-ctx.Done():
-			return 0, ctx.Err()
-		}
-		select {
-		case <-r.proceed:
-		case <-ctx.Done():
-			return 0, ctx.Err()
-		}
-	case 2:
-		select {
-		case r.secondEntered <- struct{}{}:
-		case <-ctx.Done():
-			return 0, ctx.Err()
-		}
+	select {
+	case r.secondEntered <- struct{}{}:
+	default:
 	}
 
 	return r.Allocator.RegisterNode(ctx, registration)
@@ -389,13 +365,25 @@ func TestSameNodeRegistrationSerializesTheRealAllocatorCommit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("alloc.New: %v", err)
 	}
-	reg := &precommitBlockingAllocatorRegistrar{
+	reg := &observingAllocatorRegistrar{
 		Allocator:     a,
-		firstEntered:  make(chan struct{}, 1),
-		secondEntered: make(chan struct{}, 1),
-		proceed:       make(chan struct{}),
+		secondEntered: make(chan struct{}, 2),
 	}
-	p := New(slog.New(slog.DiscardHandler), deployment, time.Minute, WithRegistrar(reg))
+	committed := make(chan struct{})
+	proceed := make(chan struct{})
+	var once sync.Once
+	p := New(slog.New(slog.DiscardHandler), deployment, time.Minute, WithRegistrar(reg),
+		func(p *Plane) {
+			p.afterRegisterNodeForTest = func(ctx context.Context, _ string, _ int64) {
+				once.Do(func() {
+					close(committed)
+					select {
+					case <-proceed:
+					case <-ctx.Done():
+					}
+				})
+			}
+		})
 
 	first := make(chan error, 1)
 	go func() {
@@ -405,7 +393,13 @@ func TestSameNodeRegistrationSerializesTheRealAllocatorCommit(t *testing.T) {
 		})
 		first <- err
 	}()
-	<-reg.firstEntered
+	<-committed
+	// Discard the observation for A. A is now past its durable commit and held
+	// immediately before its plane install.
+	<-reg.secondEntered
+	if !registrationGuardHeldForTest(p, "holder") {
+		t.Fatal("registration guard was released in the post-commit, pre-install gap")
+	}
 
 	second := make(chan error, 1)
 	go func() {
@@ -425,7 +419,7 @@ func TestSameNodeRegistrationSerializesTheRealAllocatorCommit(t *testing.T) {
 	default:
 	}
 
-	close(reg.proceed)
+	close(proceed)
 	if err := <-first; err != nil {
 		t.Fatalf("first Register: %v", err)
 	}
