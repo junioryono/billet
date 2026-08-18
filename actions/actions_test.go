@@ -340,8 +340,8 @@ func TestTheTierMountLimitAndFailSafeDiscardAreWiredBetweenActions(t *testing.T)
 		t.Fatalf("read setup action: %v", err)
 	}
 	if !strings.Contains(string(setup),
-		"mount-limit-bytes: ${{ env.BILLET_BUILDKIT_CACHE_MOUNT_LIMIT_BYTES }}") {
-		t.Fatal("the tier's mount ceiling does not reach the cleanup action")
+		"mount-limit-bytes: ${{ env.BILLET_BUILDKIT_CACHE_MOUNT_LIMIT_BYTES || '21474836480' }}") {
+		t.Fatal("the tier's mount ceiling does not reach cleanup with a default for tiers that omit it")
 	}
 	if strings.Count(string(setup), "discard-marker: ${{ runner.temp }}/billet-buildkit-discard") != 2 {
 		t.Fatal("the builder and sticky-disk post steps do not share one runner-local discard marker")
