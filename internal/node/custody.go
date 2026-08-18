@@ -66,7 +66,8 @@ type custody struct {
 	// came from.
 	discard bool
 
-	// observed is true once billet has actually seen this instance exist.
+	// observed is true once billet has causal evidence this instance existed: a
+	// provider inventory sighting, or a successful launch on a host backend.
 	//
 	// SEPARATE FROM discard. The grace before an absence is believed exists for compute
 	// that may never have started — a create whose response was lost can still be in
@@ -76,6 +77,11 @@ type custody struct {
 	// Since discard flips to true when a completion arrives, checking it alone applies
 	// the stray grace to every adopted job at the moment it finishes.
 	observed bool
+
+	// absentSince is the first successful negative observation in the current
+	// sequence. Provider errors and a later sighting reset it: neither can extend a
+	// claim that absence was continuous.
+	absentSince time.Time
 
 	// asked is true once a teardown has been requested and not confirmed, so the
 	// log line saying so is written once rather than on every tick.
@@ -121,9 +127,9 @@ func (r *Runner) adopt(lease *alloc.Lease, inst *provider.Instance) {
 	r.adoptWithObservation(lease, inst, true)
 }
 
-// adoptWithObservation records whether the provider's own inventory supplied
-// this instance. A successful local Launch result is not that observation on an
-// eventually consistent backend.
+// adoptWithObservation records whether the caller has causal evidence that the
+// instance exists. Provider inventory supplies it everywhere; a successful
+// Launch supplies it only for a host backend whose runtime is locally consistent.
 func (r *Runner) adoptWithObservation(
 	lease *alloc.Lease, inst *provider.Instance, observed bool,
 ) {
@@ -230,8 +236,8 @@ func (r *Runner) heldLeases() map[string]bool {
 	return held
 }
 
-// strayGrace is how long a possible stray is looked for before an absence is
-// believed.
+// strayGrace is how long a possible stray is looked for after the first
+// successful negative observation before an absence is believed.
 //
 // The window in which a daemon that accepted a create can still act on it.
 //
@@ -247,6 +253,15 @@ func (r *Runner) heldLeases() map[string]bool {
 // recovers. The same asymmetry sets alloc.quarantineGrace, and the two are
 // deliberately the same size.
 const strayGrace = 5 * time.Minute
+
+// remoteAbsenceGrace is the minimum span between the first and confirming
+// negative observations after a remote provider has already reported an
+// instance. EC2 inventory is eventually consistent rather than monotonic, so a
+// single miss is not proof even after a sighting. This stays shorter than the
+// grace for compute never observed at all: a sighting rules out an in-flight
+// create, while two separated misses guard against reading one stale replica as
+// termination.
+const remoteAbsenceGrace = 30 * time.Second
 
 // custodyWarnAfter is how long a held lease may go unresolved before every tick
 // says so.
@@ -493,6 +508,10 @@ func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 
 	inst, found, err := r.provider.Find(ctx, c.name)
 	if err != nil {
+		// An error says nothing about presence. It breaks a run of negative
+		// observations rather than aging it toward a release.
+		c.absentSince = time.Time{}
+
 		return fmt.Errorf("node: look for %s: %w", c.name, err)
 	}
 
@@ -504,11 +523,29 @@ func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 		// appears. So a discarded entry has to keep looking for a while before an
 		// absence is believed.
 		//
-		// An entry billet has SEEN is different: its instance existed, so an
-		// absence now means it genuinely went away and the capacity can go back
-		// immediately.
-		if !c.observed && r.now().Sub(c.since) < strayGrace {
-			return nil
+		// A host backend's successful launch or inventory is causal, so its first
+		// later absence is enough. A remote inventory is eventually consistent and
+		// needs two negative observations separated in time even after a sighting.
+		grace := strayGrace
+		if c.observed {
+			if r.provider.Kind().RunsOnHost() {
+				grace = 0
+			} else {
+				grace = remoteAbsenceGrace
+			}
+		}
+
+		if grace > 0 {
+			now := r.now()
+			if c.absentSince.IsZero() {
+				c.absentSince = now
+
+				return nil
+			}
+
+			if now.Sub(c.absentSince) < grace {
+				return nil
+			}
 		}
 
 		// PROVED GONE, by a sustained absence rather than by a backend saying so —
@@ -520,7 +557,9 @@ func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 	}
 
 	// Seen it now, whatever it was before. A stray that has finally materialised
-	// is no longer a maybe, so a later absence needs no grace period.
+	// is no longer a maybe, and a prior negative sequence no longer describes the
+	// current inventory.
+	c.absentSince = time.Time{}
 	c.observed = true
 
 	// An adopted instance that is still running is left alone. This is the case
@@ -541,9 +580,10 @@ func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 	// to stop that happening.
 	//
 	// Nothing else is needed to recover: the entry stays in custody, so the next
-	// tick looks again, and the release happens when Find reports the instance
-	// gone. That path is already written above and already applies the grace an
-	// unobserved absence needs.
+	// tick looks again, and the release happens after Find sustains the instance's
+	// absence. That path is already written above and applies the longer grace to
+	// compute never observed and the shorter confirmation window to remote compute
+	// that was.
 	if state != provider.TeardownStopped {
 		c.unconfirmed.Store(true)
 
@@ -798,10 +838,10 @@ func (r *Runner) Superseded() {
 			outcome:   alloc.PhaseDone,
 			phase:     alloc.PhaseCustody,
 			since:     r.now(),
-			// Not observed by provider inventory. This came from the local running map,
-			// which proves Launch returned but does not fence an eventually consistent
-			// first inventory miss.
-			observed: false,
+			// A successful host launch is causal; a remote launch result may precede
+			// eventually consistent inventory. RunsOnHost is an allowlist, so a new
+			// remote backend defaults to the conservative treatment.
+			observed: r.provider.Kind().RunsOnHost(),
 		}
 		entry.epoch.Store(lease.Epoch)
 

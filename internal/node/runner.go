@@ -575,8 +575,8 @@ func (r *Runner) destroy(ctx context.Context, requestID int64) error {
 	if state != provider.TeardownStopped {
 		r.holdWithOutcome(lease, inst.Name, requestID, alloc.PhaseDone)
 
-		r.log.Info("the backend requested teardown but did not confirm the guest had stopped; "+
-			"holding the capacity until it is provably gone",
+		r.log.Info("teardown did not confirm the guest had stopped; holding the capacity "+
+			"until it is provably gone",
 			"name", inst.Name, "lease", lease.ID, "request", requestID)
 
 		return fmt.Errorf("%w: %s was asked to stop and has not been confirmed gone",
@@ -1018,7 +1018,7 @@ func (r *Runner) AssumeCustody(ctx context.Context, lease *alloc.Lease, requestI
 		return nil
 	}
 
-	return r.takeCustody(ctx, lease, inst, false)
+	return r.takeCustody(ctx, lease, inst, r.provider.Kind().RunsOnHost())
 }
 
 // Sweep destroys instances whose lease is no longer open on this node.

@@ -1878,12 +1878,12 @@ func TestSupersessionMovesRunningWorkIntoCustody(t *testing.T) {
 	}
 }
 
-// Supersession moves a locally launched instance, not one read from inventory.
-// EC2 may not describe that instance yet, so the first miss after the handoff
-// cannot release its lease.
+// Supersession moves an instance from the process's running map, not provider
+// inventory. EC2 may not describe that instance yet, so the first miss after the
+// handoff cannot release its lease.
 func TestSupersessionKeepsCapacityAcrossAFirstAbsentInventory(t *testing.T) {
-	p := &fakeProvider{kind: config.ProviderDocker}
-	a, host := newAllocatorWithHost(t)
+	p := &fakeProvider{kind: config.ProviderEC2}
+	a, host := newAllocatorWithEC2Host(t)
 	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 	lease := assignedLease(t, a)
 
@@ -1904,6 +1904,29 @@ func TestSupersessionKeepsCapacityAcrossAFirstAbsentInventory(t *testing.T) {
 	}
 
 	p.add(inst)
+}
+
+// Superseding a host provider carries a causal local Launch result. If that
+// compute is already gone, its first inventory miss should finish the drain
+// instead of waiting through a grace meant for remote control planes.
+func TestSupersessionTrustsAHostLaunchBeforeItsFirstAbsence(t *testing.T) {
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
+	lease := assignedLease(t, a)
+
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 30, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	r.Superseded()
+	p.settle(provider.InstanceName(lease.ID))
+
+	if err := r.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend after the host compute disappeared: %v", err)
+	}
+	if _, err := a.Lease(t.Context(), lease.ID); !errors.Is(err, alloc.ErrLeaseNotFound) {
+		t.Fatalf("the superseded host launch waited through a remote consistency grace: %v", err)
+	}
 }
 
 // EVERY CUSTODY ENTRY RENEWS WITH ITS LEASE'S OWN EPOCH.

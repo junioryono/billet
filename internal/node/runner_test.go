@@ -379,8 +379,8 @@ func TestAnAcceptedTeardownHoldsTheCapacityUntilTheComputeIsProvablyGone(t *test
 	}
 }
 
-// A teardown that inventory has already observed releases on its first later
-// absence instead of waiting through the stray-launch grace.
+// A host backend whose inventory has observed the compute releases on its first
+// later absence instead of waiting through a remote consistency grace.
 func TestAFastAcceptedTeardownReleasesOnTheFirstAbsentInventory(t *testing.T) {
 	p := &fakeProvider{kind: config.ProviderDocker, asyncTeardown: true}
 	a, host := newAllocatorWithHost(t)
@@ -412,10 +412,11 @@ func TestAFastAcceptedTeardownReleasesOnTheFirstAbsentInventory(t *testing.T) {
 //
 // EC2 can return a stale empty DescribeInstances result after TerminateInstances
 // succeeds. The instance may then reappear still shutting down, so the lease must
-// survive until the instance is seen or the ordinary stray grace elapses.
+// survive until the instance is seen or absence is sustained for the appropriate
+// consistency window.
 func TestAnUnobservedTeardownKeepsCapacityAcrossTheFirstAbsentInventory(t *testing.T) {
-	p := &fakeProvider{kind: config.ProviderDocker, asyncTeardown: true}
-	a, host := newAllocatorWithHost(t)
+	p := &fakeProvider{kind: config.ProviderEC2, asyncTeardown: true}
+	a, host := newAllocatorWithEC2Host(t)
 	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 	lease := assignedLease(t, a)
 
@@ -444,11 +445,105 @@ func TestAnUnobservedTeardownKeepsCapacityAcrossTheFirstAbsentInventory(t *testi
 		t.Fatalf("Tend after the instance materialised: %v", err)
 	}
 	p.settle(name)
+	now := time.Now()
+	r.now = func() time.Time { return now }
 	if err := r.Tend(t.Context()); err != nil {
-		t.Fatalf("Tend after the observed instance stopped: %v", err)
+		t.Fatalf("first Tend after the observed instance stopped: %v", err)
+	}
+	if _, err := a.Lease(t.Context(), lease.ID); err != nil {
+		t.Fatalf("one remote inventory miss released the observed instance: %v", err)
+	}
+	now = now.Add(time.Minute)
+	if err := r.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend after the absence was sustained: %v", err)
 	}
 	if _, err := a.Lease(t.Context(), lease.ID); !errors.Is(err, alloc.ErrLeaseNotFound) {
-		t.Fatalf("the observed instance is gone but its capacity is still held: %v", err)
+		t.Fatalf("the sustained absence left the instance's capacity held: %v", err)
+	}
+}
+
+// A remote inventory can move from present to absent and back while EC2's
+// eventually consistent replicas converge. One missing response after a sighting
+// is therefore not causal proof that the machine stopped.
+func TestARemoteSightingNeedsSustainedAbsence(t *testing.T) {
+	p := &fakeProvider{kind: config.ProviderEC2, asyncTeardown: true}
+	a, host := newAllocatorWithEC2Host(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
+	lease := assignedLease(t, a)
+	now := time.Now()
+	r.now = func() time.Time { return now }
+
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 13, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	if err := r.Destroy(t.Context(), 13); !errors.Is(err, server.ErrCustody) {
+		t.Fatalf("Destroy = %v, want ErrCustody", err)
+	}
+	if err := r.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend while visible: %v", err)
+	}
+
+	name := provider.InstanceName(lease.ID)
+	inst := p.live[name]
+	delete(p.live, name)
+	if err := r.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend on the first miss: %v", err)
+	}
+	if _, err := a.Lease(t.Context(), lease.ID); err != nil {
+		t.Fatalf("one remote miss released capacity: %v", err)
+	}
+
+	p.add(inst)
+	now = now.Add(time.Minute)
+	if err := r.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend after inventory returned: %v", err)
+	}
+	p.settle(name)
+	if err := r.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend on the new first miss: %v", err)
+	}
+	if _, err := a.Lease(t.Context(), lease.ID); err != nil {
+		t.Fatalf("a sighting did not reset the absence interval: %v", err)
+	}
+
+	now = now.Add(time.Minute)
+	if err := r.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend after sustained absence: %v", err)
+	}
+	if _, err := a.Lease(t.Context(), lease.ID); !errors.Is(err, alloc.ErrLeaseNotFound) {
+		t.Fatalf("sustained remote absence left capacity held: %v", err)
+	}
+}
+
+// An error is not an absent sample. Even when custody itself is old, the grace
+// starts only once the backend first answers successfully that nothing is there.
+func TestErrorsBeforeAFirstRemoteMissDoNotAgeTheAbsence(t *testing.T) {
+	p := &fakeProvider{kind: config.ProviderEC2, asyncTeardown: true}
+	a, host := newAllocatorWithEC2Host(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
+	lease := assignedLease(t, a)
+	now := time.Now()
+	r.now = func() time.Time { return now }
+
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 14, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	if err := r.Destroy(t.Context(), 14); !errors.Is(err, server.ErrCustody) {
+		t.Fatalf("Destroy = %v, want ErrCustody", err)
+	}
+	p.settle(provider.InstanceName(lease.ID))
+	p.findErr = errors.New("DescribeInstances unavailable")
+	now = now.Add(2 * strayGrace)
+	if err := r.Tend(t.Context()); err == nil {
+		t.Fatal("Tend hid the provider error")
+	}
+
+	p.findErr = nil
+	if err := r.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend on the first successful miss: %v", err)
+	}
+	if _, err := a.Lease(t.Context(), lease.ID); err != nil {
+		t.Fatalf("custody age turned the first successful miss into proof: %v", err)
 	}
 }
 
@@ -1094,6 +1189,37 @@ func newAllocatorWithHost(t *testing.T) (*alloc.Allocator, string) {
 	t.Cleanup(func() { _ = db.Close() })
 
 	return newAllocatorForTiers(t, db, dockerTier())
+}
+
+// newAllocatorWithEC2Host gives tests of remote-provider consistency a lease
+// that can genuinely bind to an EC2 node. A Docker lease cannot pass the same
+// provider check production relies on, and weakening that check for a test would
+// make its setup contradict the behavior it claims to exercise.
+func newAllocatorWithEC2Host(t *testing.T) (*alloc.Allocator, string) {
+	t.Helper()
+
+	db := openState(t)
+	tier := dockerTier()
+	tier.Provider = config.ProviderEC2
+	tier.Image = "ami-test"
+
+	a, err := alloc.New(db, alloc.Limits{MaxVCPU: 32, MaxMemory: 128 * config.GiB}, []config.Tier{tier})
+	if err != nil {
+		t.Fatalf("alloc.New: %v", err)
+	}
+
+	const host = "test-ec2"
+	if _, err := a.RegisterNode(t.Context(), alloc.NodeRegistration{
+		Name: host, Provider: config.ProviderEC2,
+		VCPU: 8, Memory: 32 * config.GiB,
+		EC2Shapes: []config.EC2InstanceType{{
+			Type: "test.large", VCPU: 2, Memory: 8 * config.GiB,
+		}},
+	}); err != nil {
+		t.Fatalf("RegisterNode: %v", err)
+	}
+
+	return a, host
 }
 
 // newAllocatorForTiers builds an allocator over a chosen catalogue.
@@ -1891,8 +2017,8 @@ func TestCustodySurvivesItsLeaseBeingQuarantined(t *testing.T) {
 // launch report is then lost, the faster custody cadence must not read that first
 // stale absence as proof and release capacity under the instance about to appear.
 func TestAssumeCustodyKeepsCapacityAcrossAFirstAbsentInventory(t *testing.T) {
-	p := &fakeProvider{kind: config.ProviderDocker}
-	a, host := newAllocatorWithHost(t)
+	p := &fakeProvider{kind: config.ProviderEC2}
+	a, host := newAllocatorWithEC2Host(t)
 	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 	lease := assignedLease(t, a)
 
@@ -1919,6 +2045,35 @@ func TestAssumeCustodyKeepsCapacityAcrossAFirstAbsentInventory(t *testing.T) {
 	}
 
 	p.add(inst)
+}
+
+// A host provider returns from Launch only after its local runtime created the
+// compute. That causal result is enough to trust its first later absence; the
+// remote consistency grace must not stall a local handoff or drain.
+func TestAssumeCustodyTrustsAHostLaunchBeforeItsFirstAbsence(t *testing.T) {
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
+	lease := assignedLease(t, a)
+
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 29, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	live, err := a.Lease(t.Context(), lease.ID)
+	if err != nil {
+		t.Fatalf("Lease: %v", err)
+	}
+	if err := r.AssumeCustody(t.Context(), live, 29); err != nil {
+		t.Fatalf("AssumeCustody: %v", err)
+	}
+	p.settle(provider.InstanceName(lease.ID))
+
+	if err := r.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend after the host compute disappeared: %v", err)
+	}
+	if _, err := a.Lease(t.Context(), lease.ID); !errors.Is(err, alloc.ErrLeaseNotFound) {
+		t.Fatalf("the host launch waited through a remote consistency grace: %v", err)
+	}
 }
 
 // A HOST RUNNING NOTHING SAYS SO, EVERY SWEEP.
