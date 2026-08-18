@@ -22,7 +22,7 @@ outputs:
   cache-hit:
     description: true when the disk was cloned from a committed generation.
 runs:
-  using: node20
+  using: node24
   main: index.js
   post: cleanup.js
   post-if: success()
