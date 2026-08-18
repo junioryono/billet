@@ -2610,6 +2610,8 @@ func (l *Listener) complete(ctx context.Context, job Job) {
 	// remote destroy adds no proof, and on shutdown it can wait a full node timeout
 	// before the local release that is the only work left.
 	if l.releaseParked(ctx, job.RequestID) {
+		l.forgetCompletion(ctx, job)
+
 		return
 	}
 
