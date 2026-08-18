@@ -379,13 +379,13 @@ func TestAnAcceptedTeardownHoldsTheCapacityUntilTheComputeIsProvablyGone(t *test
 	}
 }
 
-// A known-running instance does not need the stray-launch grace after teardown.
+// A teardown that observed its target does not need the stray-launch grace.
 //
 // The grace protects an AMBIGUOUS launch whose create may still be in flight when
-// the first inventory read sees nothing. A normal completion starts from an
-// instance billet already launched and tracked. If EC2 finishes terminating it
-// before the first custody sweep, the first absence is already proof it is gone;
-// waiting five minutes needlessly leaves the whole node unable to accept work.
+// the first inventory read sees nothing. When the teardown call itself observed
+// the instance, it supplies the missing causal evidence. If EC2 then finishes
+// terminating before the first custody check, the first absence proves it is
+// gone; waiting five minutes needlessly leaves the whole node unable to work.
 func TestAFastAcceptedTeardownReleasesOnTheFirstAbsentInventory(t *testing.T) {
 	p := &fakeProvider{kind: config.ProviderDocker, asyncTeardown: true}
 	a, host := newAllocatorWithHost(t)

@@ -575,7 +575,7 @@ func (r *Runner) destroy(ctx context.Context, requestID int64) error {
 		r.holdWithOutcome(lease, inst.Name, requestID, alloc.PhaseDone,
 			state == provider.TeardownObserved)
 
-		r.log.Info("the backend accepted the teardown but did not confirm the guest had stopped; "+
+		r.log.Info("the backend requested teardown but did not confirm the guest had stopped; "+
 			"holding the capacity until it is provably gone",
 			"name", inst.Name, "lease", lease.ID, "request", requestID)
 

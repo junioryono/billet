@@ -195,9 +195,10 @@ func (r *Runner) holdWithOutcome(
 		outcome:   outcome,
 		phase:     alloc.PhaseTeardown,
 		since:     r.now(),
-		// An ambiguous launch has not been observed and needs the grace before an
-		// absence is believed. A normal teardown starts from an instance billet
-		// already tracked, so its first absence proves that known compute is gone.
+		// An ambiguous launch or an eventually-consistent teardown miss has not
+		// observed the target and needs the grace before an absence is believed. A
+		// teardown the backend observed supplies the causal evidence that makes its
+		// first later absence trustworthy.
 		observed: observed,
 	}
 	entry.epoch.Store(lease.Epoch)
