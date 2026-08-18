@@ -14,7 +14,7 @@ func TestPendingCompletionsAreDurableAndScopedByTier(t *testing.T) {
 	}
 	other := PendingCompletion{Tier: "macos", RequestID: 17, RunID: 32, Result: "Failed"}
 	for _, completion := range []PendingCompletion{first, other} {
-		if err := db.PutPendingCompletion(ctx, completion); err != nil {
+		if _, err := db.PutPendingCompletion(ctx, completion); err != nil {
 			t.Fatalf("PutPendingCompletion(%+v): %v", completion, err)
 		}
 	}
@@ -26,8 +26,11 @@ func TestPendingCompletionsAreDurableAndScopedByTier(t *testing.T) {
 	if !slices.Equal(got, []PendingCompletion{first}) {
 		t.Fatalf("linux pending completions = %+v, want %+v", got, first)
 	}
-	if err := db.DeletePendingCompletion(ctx, "linux", first.RequestID, first.MessageID); err != nil {
-		t.Fatalf("DeletePendingCompletion: %v", err)
+	if err := db.AcknowledgePendingCompletion(ctx, "linux", first.RequestID, first.MessageID); err != nil {
+		t.Fatalf("AcknowledgePendingCompletion: %v", err)
+	}
+	if err := db.RetirePendingCompletion(ctx, "linux", first.RequestID, first.MessageID); err != nil {
+		t.Fatalf("RetirePendingCompletion: %v", err)
 	}
 	got, err = db.PendingCompletions(ctx, "linux")
 	if err != nil {
@@ -53,7 +56,7 @@ func TestPendingCompletionRejectsAnUnusableIdentityOrResult(t *testing.T) {
 		{Tier: "linux", RequestID: 1, Result: "Succeeded", LeaseID: "lease-1", Outcome: "lost"},
 		{Tier: "linux", RequestID: 1, Result: "Succeeded", ReleaseOnly: true},
 	} {
-		if err := db.PutPendingCompletion(t.Context(), completion); err == nil {
+		if _, err := db.PutPendingCompletion(t.Context(), completion); err == nil {
 			t.Fatalf("PutPendingCompletion accepted %+v", completion)
 		}
 	}
@@ -66,20 +69,22 @@ func TestPendingCompletionRetirementIsMonotonicPerMessage(t *testing.T) {
 		Tier: "linux", RequestID: 19, RunID: 41, Result: "Succeeded", MessageID: 10,
 		LeaseID: "lease-19", LeaseEpoch: 3, LeaseNode: "holder", Outcome: "done",
 	}
-	if err := db.PutPendingCompletion(ctx, completion); err != nil {
+	if _, err := db.PutPendingCompletion(ctx, completion); err != nil {
 		t.Fatalf("PutPendingCompletion: %v", err)
 	}
 	releaseOnly := completion
 	releaseOnly.ReleaseOnly = true
-	if err := db.PutPendingCompletion(ctx, releaseOnly); err != nil {
+	if _, err := db.PutPendingCompletion(ctx, releaseOnly); err != nil {
 		t.Fatalf("advance completion to release-only: %v", err)
 	}
 	redelivery := PendingCompletion{
 		Tier: completion.Tier, RequestID: completion.RequestID, RunID: completion.RunID,
 		Result: completion.Result, MessageID: completion.MessageID,
 	}
-	if err := db.PutPendingCompletion(ctx, redelivery); err != nil {
+	if disposition, err := db.PutPendingCompletion(ctx, redelivery); err != nil {
 		t.Fatalf("redeliver initial completion: %v", err)
+	} else if disposition != PendingCompletionActionable {
+		t.Fatalf("active redelivery disposition = %v, want actionable", disposition)
 	}
 	got, err := db.PendingCompletions(ctx, "linux")
 	if err != nil {
@@ -92,14 +97,18 @@ func TestPendingCompletionRetirementIsMonotonicPerMessage(t *testing.T) {
 	if err := db.RetirePendingCompletion(ctx, "linux", 19, 10); err != nil {
 		t.Fatalf("RetirePendingCompletion: %v", err)
 	}
-	if err := db.PutPendingCompletion(ctx, completion); err != nil {
+	if disposition, err := db.PutPendingCompletion(ctx, completion); err != nil {
 		t.Fatalf("redeliver retired completion: %v", err)
+	} else if disposition != PendingCompletionRetired {
+		t.Fatalf("retired redelivery disposition = %v, want retired", disposition)
 	}
 	older := completion
 	older.MessageID = 9
 	older.Result = "Failed"
-	if err := db.PutPendingCompletion(ctx, older); err != nil {
+	if disposition, err := db.PutPendingCompletion(ctx, older); err != nil {
 		t.Fatalf("write older completion: %v", err)
+	} else if disposition != PendingCompletionStale {
+		t.Fatalf("older completion disposition = %v, want stale", disposition)
 	}
 	got, err = db.PendingCompletions(ctx, "linux")
 	if err != nil {
@@ -114,11 +123,13 @@ func TestPendingCompletionRetirementIsMonotonicPerMessage(t *testing.T) {
 	newer.MessageID = 11
 	newer.RunID = 42
 	newer.Result = "Failed"
-	if err := db.PutPendingCompletion(ctx, newer); err != nil {
+	if disposition, err := db.PutPendingCompletion(ctx, newer); err != nil {
 		t.Fatalf("write reused request completion: %v", err)
+	} else if disposition != PendingCompletionActionable {
+		t.Fatalf("newer completion disposition = %v, want actionable", disposition)
 	}
-	if err := db.DeletePendingCompletion(ctx, "linux", 19, 10); err != nil {
-		t.Fatalf("delete stale completion identity: %v", err)
+	if err := db.AcknowledgePendingCompletion(ctx, "linux", 19, 10); err != nil {
+		t.Fatalf("acknowledge stale completion identity: %v", err)
 	}
 	got, err = db.PendingCompletions(ctx, "linux")
 	if err != nil {
@@ -126,5 +137,35 @@ func TestPendingCompletionRetirementIsMonotonicPerMessage(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].Retired || got[0].MessageID != 11 || got[0].Result != "Failed" {
 		t.Fatalf("new completion was not isolated from stale retirement: %+v", got)
+	}
+}
+
+func TestPendingCompletionDeletionWaitsForSettlementAndAcknowledgement(t *testing.T) {
+	db := open(t)
+	completion := PendingCompletion{
+		Tier: "linux", RequestID: 20, RunID: 43, Result: "Succeeded", MessageID: 12,
+	}
+	if _, err := db.PutPendingCompletion(t.Context(), completion); err != nil {
+		t.Fatalf("PutPendingCompletion: %v", err)
+	}
+	if err := db.RetirePendingCompletion(t.Context(), "linux", 20, 12); err != nil {
+		t.Fatalf("retire before acknowledgement: %v", err)
+	}
+	got, err := db.PendingCompletions(t.Context(), "linux")
+	if err != nil {
+		t.Fatalf("PendingCompletions before acknowledgement: %v", err)
+	}
+	if len(got) != 1 || !got[0].Retired {
+		t.Fatalf("settlement deleted the pre-acknowledgement tombstone: %+v", got)
+	}
+	if err := db.AcknowledgePendingCompletion(t.Context(), "linux", 20, 12); err != nil {
+		t.Fatalf("acknowledge retired completion: %v", err)
+	}
+	got, err = db.PendingCompletions(t.Context(), "linux")
+	if err != nil {
+		t.Fatalf("PendingCompletions after acknowledgement: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("settled and acknowledged completion remained: %+v", got)
 	}
 }

@@ -66,6 +66,39 @@ func TestBoundCompletionUsesTheHolderAfterItAdoptsTheLease(t *testing.T) {
 	}
 }
 
+func TestBoundCompletionIsNotTakenByAReplacementIncarnation(t *testing.T) {
+	p := testPlane(t)
+	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
+		Version: nodeapi.Version, Node: "holder", Provider: config.ProviderDocker,
+		Deployment: deployment, Incarnation: "holder-1", VCPU: 8, Memory: 32 * config.GiB,
+	}); err != nil {
+		t.Fatalf("register holder: %v", err)
+	}
+	p.AdoptOwnership("holder", "holder-1", []string{"l1"})
+	done := make(chan error, 1)
+	go func() {
+		done <- p.NewRunner().DestroyCompletedBound(
+			t.Context(), 7, "Succeeded", "l1", "holder")
+	}()
+	waitFor(t, "bound destroy to queue", func() bool { return p.QueuedForTest("holder") == 1 })
+	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
+		Version: nodeapi.Version, Node: "holder", Provider: config.ProviderDocker,
+		Deployment: deployment, Incarnation: "holder-2", VCPU: 8, Memory: 32 * config.GiB,
+	}); err != nil {
+		t.Fatalf("register replacement: %v", err)
+	}
+	cmd, took, err := p.Poll(t.Context(), "holder", "holder-2")
+	if err != nil {
+		t.Fatalf("poll replacement: %v", err)
+	}
+	if took || cmd.Kind == nodeapi.CommandDestroy {
+		t.Fatalf("replacement received the old holder's destroy: %+v", cmd)
+	}
+	if err := <-done; err == nil {
+		t.Fatal("bound destroy accepted a replacement incarnation as its holder")
+	}
+}
+
 func TestBoundCompletionAcceptsTheHoldersKnownEmptyInventory(t *testing.T) {
 	p := testPlane(t)
 	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
@@ -79,6 +112,37 @@ func TestBoundCompletionAcceptsTheHoldersKnownEmptyInventory(t *testing.T) {
 	if err := p.NewRunner().DestroyCompletedBound(
 		t.Context(), 7, "Succeeded", "l1", "holder"); err != nil {
 		t.Fatalf("known-empty holder destroy: %v", err)
+	}
+}
+
+func TestPeriodicInventoryAdoptsItsLiveBoundLease(t *testing.T) {
+	p := testPlane(t, WithRegistrar(&countingRegistrar{}))
+	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
+		Version: nodeapi.Version, Node: "holder", Provider: config.ProviderDocker,
+		Deployment: deployment, Incarnation: "holder-1", VCPU: 8, Memory: 32 * config.GiB,
+	}); err != nil {
+		t.Fatalf("register holder: %v", err)
+	}
+	if _, err := p.ReconcileInventory(t.Context(), "holder", "holder-1", []string{"l1"}); err != nil {
+		t.Fatalf("reconcile inventory: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- p.NewRunner().DestroyCompletedBound(
+			t.Context(), 7, "Succeeded", "l1", "holder")
+	}()
+	cmd, took, err := p.Poll(t.Context(), "holder", "holder-1")
+	if err != nil || !took {
+		t.Fatalf("poll reconciled holder: took=%v err=%v", took, err)
+	}
+	if cmd.Kind != nodeapi.CommandDestroy {
+		t.Fatalf("reconciled holder received %+v, want destroy", cmd)
+	}
+	if err := p.Result("holder", "holder-1", nodeapi.CommandResult{ID: cmd.ID, OK: true}); err != nil {
+		t.Fatalf("complete destroy: %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("bound destroy: %v", err)
 	}
 }
 

@@ -68,9 +68,9 @@ type BoundCompletionAwareRunner interface {
 
 // completionStore is the durable half of result-dependent teardown.
 type completionStore interface {
-	PutPendingCompletion(context.Context, state.PendingCompletion) error
+	PutPendingCompletion(context.Context, state.PendingCompletion) (state.PendingCompletionDisposition, error)
 	RetirePendingCompletion(context.Context, string, int64, int64) error
-	DeletePendingCompletion(context.Context, string, int64, int64) error
+	AcknowledgePendingCompletion(context.Context, string, int64, int64) error
 	PendingCompletions(context.Context, string) ([]state.PendingCompletion, error)
 }
 
@@ -1976,11 +1976,15 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 
 	for _, job := range msg.Completed {
 		job.CompletionID = msg.MessageID
-		finished[job.RequestID] = struct{}{}
 
-		if err := l.recordCompletion(ctx, job); err != nil {
+		disposition, err := l.recordCompletion(ctx, job)
+		if err != nil {
 			return err
 		}
+		if disposition != state.PendingCompletionActionable {
+			continue
+		}
+		finished[job.RequestID] = struct{}{}
 		l.complete(ctx, job)
 	}
 
@@ -2001,6 +2005,7 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 		if err := l.acknowledge(ctx, msg); err != nil {
 			return err
 		}
+		l.acknowledgeCompletions(ctx, msg)
 
 		// Advanced here too. The invariant is "a successful acknowledgement
 		// advances the cursor", and an early return that acknowledges without
@@ -2084,6 +2089,7 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 	if err := l.acknowledge(ctx, msg); err != nil {
 		return err
 	}
+	l.acknowledgeCompletions(ctx, msg)
 
 	// Only now. An unacknowledged message is redelivered, and re-handling one is
 	// safe once the acquisition outcome is KNOWN: completions rebuild their own
@@ -2111,6 +2117,22 @@ func (l *Listener) acknowledge(ctx context.Context, msg *Message) error {
 	}
 
 	return nil
+}
+
+// acknowledgeCompletions records that GitHub will not redeliver the
+// source message. The store removes a row only once it is also retired.
+func (l *Listener) acknowledgeCompletions(ctx context.Context, msg *Message) {
+	if l.completionStore == nil {
+		return
+	}
+	for _, job := range msg.Completed {
+		if err := l.completionStore.AcknowledgePendingCompletion(
+			ctx, l.tier, job.RequestID, msg.MessageID,
+		); err != nil {
+			l.log.Error("a completion acknowledgement could not be made durable; recovery remains conservatively blocked",
+				"tier", l.tier, "request", job.RequestID, "message", msg.MessageID, "error", err)
+		}
+	}
 }
 
 // acquire claims the offers this listener has escrow to back, reserving that
@@ -2617,9 +2639,12 @@ func (l *Listener) releaseParked(ctx context.Context, requestID int64) (bool, bo
 	return true, true
 }
 
-func (l *Listener) recordCompletion(ctx context.Context, job Job) error {
+func (l *Listener) recordCompletion(
+	ctx context.Context,
+	job Job,
+) (state.PendingCompletionDisposition, error) {
 	if l.completionStore == nil || job.Result == "" {
-		return nil
+		return state.PendingCompletionActionable, nil
 	}
 
 	lease, outcome, releaseOnly := l.completionRelease(job.RequestID)
@@ -2634,12 +2659,13 @@ func (l *Listener) recordCompletion(ctx context.Context, job Job) error {
 		completion.Outcome = string(outcome)
 		completion.ReleaseOnly = releaseOnly
 	}
-	if err := l.completionStore.PutPendingCompletion(ctx, completion); err != nil {
-		return fmt.Errorf("server: preserve completed result for %s request %d before acknowledging it: %w",
+	disposition, err := l.completionStore.PutPendingCompletion(ctx, completion)
+	if err != nil {
+		return state.PendingCompletionActionable, fmt.Errorf("server: preserve completed result for %s request %d before acknowledging it: %w",
 			l.tier, job.RequestID, err)
 	}
 
-	return nil
+	return disposition, nil
 }
 
 // recordReleaseOnly makes successful node teardown durable before the local
@@ -2665,9 +2691,14 @@ func (l *Listener) recordReleaseOnly(
 		LeaseID: lease.ID, LeaseEpoch: lease.Epoch, LeaseNode: lease.Node,
 		Outcome: string(outcome), ReleaseOnly: true, MessageID: job.CompletionID,
 	}
-	if err := l.completionStore.PutPendingCompletion(persistCtx, completion); err != nil {
+	disposition, err := l.completionStore.PutPendingCompletion(persistCtx, completion)
+	if err != nil {
 		return fmt.Errorf("server: preserve release-only completion for %s request %d: %w",
 			l.tier, job.RequestID, err)
+	}
+	if disposition != state.PendingCompletionActionable {
+		return fmt.Errorf("server: completion for %s request %d message %d is no longer current",
+			l.tier, job.RequestID, job.CompletionID)
 	}
 
 	return nil
@@ -2753,21 +2784,8 @@ func (l *Listener) forgetCompletion(ctx context.Context, job Job) bool {
 
 		return false
 	}
-	l.forgetRetiredCompletion(ctx, job)
 
 	return true
-}
-
-func (l *Listener) forgetRetiredCompletion(ctx context.Context, job Job) {
-	if l.completionStore == nil {
-		return
-	}
-	if err := l.completionStore.DeletePendingCompletion(
-		ctx, l.tier, job.RequestID, job.CompletionID,
-	); err != nil {
-		l.log.Error("a retired completion tombstone could not be removed; replay remains disabled",
-			"tier", l.tier, "request", job.RequestID, "error", err)
-	}
 }
 
 func (l *Listener) parkRetirement(job Job) {
@@ -2843,15 +2861,12 @@ func (l *Listener) restoreCompletions(ctx context.Context) error {
 		return fmt.Errorf("server: restore pending completions for %s: %w", l.tier, err)
 	}
 
-	var retired []Job
 	l.mu.Lock()
 	for i := range completions {
 		completion := &completions[i]
 		job := Job{RequestID: completion.RequestID, RunID: completion.RunID, Result: completion.Result,
 			CompletionID: completion.MessageID}
 		if completion.Retired {
-			retired = append(retired, job)
-
 			continue
 		}
 		if entry := l.cleanup[job.RequestID]; entry != nil {
@@ -2875,9 +2890,6 @@ func (l *Listener) restoreCompletions(ctx context.Context) error {
 		l.cleanup[job.RequestID] = entry
 	}
 	l.mu.Unlock()
-	for _, job := range retired {
-		l.forgetRetiredCompletion(ctx, job)
-	}
 
 	return nil
 }

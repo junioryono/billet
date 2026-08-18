@@ -581,6 +581,7 @@ func provisionScript(spec BuildSpec) (string, error) {
 	b.WriteString("  BILLET_RUNNER_START_EPOCH_NS=\"$runner_started\" \\\n")
 	b.WriteString("  ACTIONS_RUNNER_HOOK_JOB_STARTED=" + jobTimingHookPath + " \\\n")
 	b.WriteString("  ACTIONS_RUNNER_RETURN_JOB_RESULT_FOR_HOSTED=true \\\n")
+	b.WriteString("  ACTIONS_RUNNER_RETURN_VERSION_DEPRECATED_EXIT_CODE=\"${ACTIONS_RUNNER_RETURN_VERSION_DEPRECATED_EXIT_CODE:-}\" \\\n")
 	b.WriteString("  " + jitEnvVar + "=\"$" + jitEnvVar + "\" \\\n")
 	b.WriteString("  BILLET_CACHE_ENDPOINT=\"${BILLET_CACHE_ENDPOINT:-}\" \\\n")
 	b.WriteString("  BILLET_CACHE_TOKEN=\"${BILLET_CACHE_TOKEN:-}\" \\\n")

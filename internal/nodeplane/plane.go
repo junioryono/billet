@@ -239,6 +239,9 @@ type pending struct {
 	// may update the node object before this command is queued; dispatch refuses
 	// that stale choice rather than sending one backend's launch shape to another.
 	expectedProvider config.ProviderKind
+	// expectedIncarnation fences a bound destroy to the process that adopted its
+	// lease. A replacement sharing the node name must never take that command.
+	expectedIncarnation string
 	// incarnation is the node PROCESS that took this command.
 	//
 	// The node NAME is not enough. A superseded process and its replacement share
@@ -874,12 +877,10 @@ func (p *Plane) ReconcileInventory(
 		return 0, err
 	}
 
-	// MARK ONLY THE PROCESS WHOSE REPORT SETTLED. A replacement can register
+	// MARK AND ADOPT AS ONE FACT FROM ONE PROCESS. A replacement can register
 	// while the ledger call is in flight; its inventory is a different fact.
 	p.mu.Lock()
-	if n := p.nodes[node]; n != nil && n.incarnation == incarnation {
-		n.inventoryKnown = true
-	}
+	p.adoptOwnershipLocked(node, incarnation, running, true)
 	p.mu.Unlock()
 
 	return freed, nil
@@ -1096,9 +1097,19 @@ func (p *Plane) AdoptOwnershipWithInventory(
 ) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if n := p.nodes[node]; n != nil && n.incarnation == incarnation {
-		n.inventoryKnown = inventoryKnown
+	p.adoptOwnershipLocked(node, incarnation, leaseIDs, inventoryKnown)
+}
+
+func (p *Plane) adoptOwnershipLocked(
+	node, incarnation string,
+	leaseIDs []string,
+	inventoryKnown bool,
+) {
+	n := p.nodes[node]
+	if n == nil || n.incarnation != incarnation {
+		return
 	}
+	n.inventoryKnown = inventoryKnown
 
 	if p.owners == nil {
 		p.owners = make(map[string]leaseOwner, len(leaseIDs))
@@ -1439,6 +1450,16 @@ func (p *Plane) takeLocked(n *node, incarnation string) (nodeapi.Command, bool) 
 	for len(n.queue) > 0 {
 		pend := n.queue[0]
 		n.queue = n.queue[1:]
+
+		if pend.expectedIncarnation != "" && pend.expectedIncarnation != incarnation {
+			p.answerLocked(pend, nodeapi.CommandResult{
+				ID: pend.cmd.ID,
+				Error: fmt.Sprintf("node %q process %s replaced the bound holder %s before taking this command",
+					n.name, incarnation, pend.expectedIncarnation),
+			})
+
+			continue
+		}
 
 		if pend.expectedProvider != "" && pend.expectedProvider != n.provider {
 			p.answerLocked(pend, nodeapi.CommandResult{

@@ -102,6 +102,9 @@ done
 if ! grep -Fq 'env -i "${runner_env[@]}" "${cmd[@]}"' "$AGENT" 2>/dev/null; then
 	runner_environment=0
 fi
+if ! grep -Fq '"ACTIONS_RUNNER_RETURN_VERSION_DEPRECATED_EXIT_CODE=${ACTIONS_RUNNER_RETURN_VERSION_DEPRECATED_EXIT_CODE:-}"' "$AGENT" 2>/dev/null; then
+	runner_environment=0
+fi
 if [ "$runner_environment" -eq 1 ]; then
 	pass "the guest agent establishes the runner account environment"
 else

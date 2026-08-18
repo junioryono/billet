@@ -268,13 +268,14 @@ func TestTheEntryPointCarriesTheRegistrationAcrossTheUserChange(t *testing.T) {
 	}
 
 	for fragment, why := range map[string]string{
-		`ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/bin/billet-job-started.sh`: "the runner would not invoke the cold-start measurement hook",
-		`ACTIONS_RUNNER_RETURN_JOB_RESULT_FOR_HOSTED=true`:                     "the image store could not distinguish a clean success from a failed job",
-		`BILLET_LAUNCH_EPOCH_NS="${BILLET_LAUNCH_EPOCH_NS:-}"`:                 "the launch timestamp would be lost across the user change",
-		`BILLET_RUNNER_START_EPOCH_NS="$runner_started"`:                       "the hook could not split boot from registration and pickup",
-		`/usr/local/bin/billet-docker-cache prepare`:                           "service-container images would be pulled before their cache is mounted",
-		`/usr/local/bin/billet-docker-cache complete "$job_status"`:            "the image-store clone would never be published or discarded",
-		`/usr/local/bin/billet-docker-cache service-status "$job_status"`:      "the runner service exit contract would not be preserved",
+		`ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/bin/billet-job-started.sh`:                                         "the runner would not invoke the cold-start measurement hook",
+		`ACTIONS_RUNNER_RETURN_JOB_RESULT_FOR_HOSTED=true`:                                                             "the image store could not distinguish a clean success from a failed job",
+		`ACTIONS_RUNNER_RETURN_VERSION_DEPRECATED_EXIT_CODE="${ACTIONS_RUNNER_RETURN_VERSION_DEPRECATED_EXIT_CODE:-}"`: "the runner's requested deprecated-version failure would be masked",
+		`BILLET_LAUNCH_EPOCH_NS="${BILLET_LAUNCH_EPOCH_NS:-}"`:                                                         "the launch timestamp would be lost across the user change",
+		`BILLET_RUNNER_START_EPOCH_NS="$runner_started"`:                                                               "the hook could not split boot from registration and pickup",
+		`/usr/local/bin/billet-docker-cache prepare`:                                                                   "service-container images would be pulled before their cache is mounted",
+		`/usr/local/bin/billet-docker-cache complete "$job_status"`:                                                    "the image-store clone would never be published or discarded",
+		`/usr/local/bin/billet-docker-cache service-status "$job_status"`:                                              "the runner service exit contract would not be preserved",
 	} {
 		if !strings.Contains(entry, fragment) {
 			t.Errorf("the entry point is missing %q — %s", fragment, why)

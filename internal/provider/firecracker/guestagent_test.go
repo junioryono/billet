@@ -237,7 +237,7 @@ exit 97
 set -euo pipefail
 ACTIONS_RUNNER_INPUT_JITCONFIG=fixture
 ` + block + `
-	cmd=(bash -c 'printf "%s\0" "${HOME-}" "${USER-}" "${LOGNAME-}" "${RUNNER_TOOL_CACHE-}" "${AGENT_TOOLSDIRECTORY-}" "${ACTIONS_RUNNER_RETURN_JOB_RESULT_FOR_HOSTED-}" "$(id -u)" "$(id -g)"')
+	cmd=(bash -c 'printf "%s\0" "${HOME-}" "${USER-}" "${LOGNAME-}" "${RUNNER_TOOL_CACHE-}" "${AGENT_TOOLSDIRECTORY-}" "${ACTIONS_RUNNER_RETURN_JOB_RESULT_FOR_HOSTED-}" "${ACTIONS_RUNNER_RETURN_VERSION_DEPRECATED_EXIT_CODE-}" "$(id -u)" "$(id -g)"')
 ` + launch + `
 exit "$job_status"
 `
@@ -253,6 +253,7 @@ exit "$job_status"
 		"LOGNAME=poisoned-logname",
 		"RUNNER_TOOL_CACHE=/poisoned-tool-cache",
 		"AGENT_TOOLSDIRECTORY=/poisoned-agent-tools",
+		"ACTIONS_RUNNER_RETURN_VERSION_DEPRECATED_EXIT_CODE=1",
 	}
 	out, err := run.Output()
 	if err != nil {
@@ -261,7 +262,7 @@ exit "$job_status"
 	fields := bytes.Split(bytes.TrimSuffix(out, []byte{0}), []byte{0})
 	want := []string{
 		"/home/runner", "runner", "runner", "/opt/hostedtoolcache", "/opt/hostedtoolcache",
-		"true",
+		"true", "1",
 		strconv.Itoa(os.Getuid()), strconv.Itoa(os.Getgid()),
 	}
 	if len(fields) != len(want) {

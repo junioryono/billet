@@ -85,6 +85,11 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job server.Job)
 	}
 
 	if res.OK {
+		// The node binds this lease before it reports a successful launch. Carry
+		// that authoritative destination back into the listener's lease so a
+		// completion persisted before any later ledger read still names its holder.
+		lease.Node = n.name
+
 		return nil
 	}
 
@@ -121,32 +126,38 @@ func (r *Runner) DestroyCompletedBound(
 	requestID int64,
 	result, leaseID, nodeName string,
 ) error {
-	owner, owned := r.plane.OwnerOfLease(leaseID)
-	if owned {
-		if owner.Node != nodeName || !owner.Current {
-			return heldByADrainingProcess(nodeName, requestID)
-		}
-		n := r.plane.liveNode(nodeName)
-		if n == nil {
-			return heldByADrainingProcess(nodeName, requestID)
-		}
-		incarnation, err := r.destroyOn(ctx, n, requestID, result)
-		if err != nil {
-			return err
-		}
-		if incarnation != owner.Incarnation {
-			return heldByADrainingProcess(nodeName, requestID)
-		}
-		r.plane.ForgetLease(nodeName, leaseID)
-
+	id, err := commandID()
+	if err != nil {
+		return err
+	}
+	pend := &pending{
+		cmd: nodeapi.Command{
+			ID: id, Kind: nodeapi.CommandDestroy, RequestID: requestID, JobResult: result,
+		},
+		done: make(chan nodeapi.CommandResult, 1),
+	}
+	res, incarnation, absent, err := r.plane.dispatchBound(ctx, nodeName, leaseID, pend)
+	if err != nil {
+		return fmt.Errorf("node %s: %w", nodeName, err)
+	}
+	if absent {
 		return nil
 	}
-
-	// A live bound node registered its complete inventory and did not adopt this
-	// open lease. Only that node's absence report proves the old compute is gone.
-	if !r.plane.reconciledNode(nodeName) {
+	if incarnation == "" {
 		return heldByADrainingProcess(nodeName, requestID)
 	}
+	if !res.OK {
+		if res.Custody {
+			return fmt.Errorf("%w: node %s: %s", server.ErrCustody, nodeName, res.Error)
+		}
+
+		return fmt.Errorf("node %s could not destroy request %d: %s",
+			nodeName, requestID, res.Error)
+	}
+	if r.plane.tookCommand(pend) != incarnation {
+		return heldByADrainingProcess(nodeName, requestID)
+	}
+	r.plane.ForgetLease(nodeName, leaseID)
 
 	return nil
 }
@@ -491,6 +502,45 @@ func (p *Plane) dispatch(ctx context.Context, n *node, pend *pending) (nodeapi.C
 		}
 	}
 
+	p.queueLocked(n, pend)
+	p.mu.Unlock()
+
+	return p.waitDispatched(ctx, n, pend)
+}
+
+// dispatchBound atomically chooses between the exact lease holder and a complete
+// absence inventory, then fences any queued destroy to that holder's incarnation.
+func (p *Plane) dispatchBound(
+	ctx context.Context,
+	nodeName, leaseID string,
+	pend *pending,
+) (nodeapi.CommandResult, string, bool, error) {
+	p.mu.Lock()
+	p.expireStaleLocked()
+	owner, owned := p.owners[leaseID]
+	if !owned {
+		n := p.nodes[nodeName]
+		absent := n != nil && n.inventoryKnown
+		p.mu.Unlock()
+
+		return nodeapi.CommandResult{}, "", absent, nil
+	}
+	n := p.nodes[nodeName]
+	if owner.node != nodeName || n == nil || n.incarnation != owner.incarnation {
+		p.mu.Unlock()
+
+		return nodeapi.CommandResult{}, "", false, nil
+	}
+	pend.expectedIncarnation = owner.incarnation
+	p.queueLocked(n, pend)
+	p.mu.Unlock()
+
+	res, err := p.waitDispatched(ctx, n, pend)
+
+	return res, owner.incarnation, false, err
+}
+
+func (p *Plane) queueLocked(n *node, pend *pending) {
 	n.queue = append(n.queue, pend)
 
 	// Non-blocking, because the channel is a signal rather than a queue: a node
@@ -500,9 +550,13 @@ func (p *Plane) dispatch(ctx context.Context, n *node, pend *pending) (nodeapi.C
 	case n.waiting <- struct{}{}:
 	default:
 	}
+}
 
-	p.mu.Unlock()
-
+func (p *Plane) waitDispatched(
+	ctx context.Context,
+	n *node,
+	pend *pending,
+) (nodeapi.CommandResult, error) {
 	timer := time.NewTimer(p.commandTimeout)
 	defer timer.Stop()
 

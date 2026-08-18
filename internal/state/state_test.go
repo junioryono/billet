@@ -1264,3 +1264,46 @@ func TestAPendingCompletionWrittenAtVersion23SurvivesVersion24(t *testing.T) {
 		t.Fatalf("upgraded pending completions = %+v, want %+v", got, want)
 	}
 }
+
+func TestAPendingCompletionWrittenAtVersion24SurvivesVersion25(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(t.Context(), dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
+		for _, stmt := range []string{
+			`ALTER TABLE pending_completions DROP COLUMN acknowledged`,
+			`DELETE FROM schema_migrations WHERE version = 25`,
+			`INSERT INTO pending_completions
+			 (tier, request_id, run_id, result, message_id, retired)
+			 VALUES ('linux', 93, 103, 'Succeeded', 7, 1)`,
+		} {
+			if _, err := tx.ExecContext(t.Context(), stmt); err != nil {
+				return fmt.Errorf("%s: %w", stmt, err)
+			}
+		}
+
+		return nil
+	}); err != nil {
+		t.Fatalf("rewind to version 24: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close version 24 database: %v", err)
+	}
+
+	upgraded, err := Open(t.Context(), dir)
+	if err != nil {
+		t.Fatalf("open version 24 database with version 25: %v", err)
+	}
+	defer upgraded.Close()
+	got, err := upgraded.PendingCompletions(t.Context(), "linux")
+	if err != nil {
+		t.Fatalf("PendingCompletions: %v", err)
+	}
+	want := PendingCompletion{Tier: "linux", RequestID: 93, RunID: 103, Result: "Succeeded",
+		MessageID: 7, Retired: true}
+	if !slices.Equal(got, []PendingCompletion{want}) {
+		t.Fatalf("upgraded pending completions = %+v, want %+v", got, want)
+	}
+}

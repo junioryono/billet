@@ -1331,6 +1331,17 @@ var pendingCompletionRecoveryMigration = migration{
 	},
 }
 
+// A retired completion must outlive its source message, but not every later
+// restart. Persisting acknowledgement lets either ordering of settlement and
+// source deletion remove the tombstone only after both facts are durable.
+var pendingCompletionAcknowledgementMigration = migration{
+	Version: 25,
+	Name:    "pending_completion_acknowledgement",
+	Stmts: []string{
+		`ALTER TABLE pending_completions ADD COLUMN acknowledged INTEGER NOT NULL DEFAULT 0 CHECK (acknowledged IN (0,1))`,
+	},
+}
+
 func init() {
 	migrations = append(migrations,
 		placementMigration, guestOSMigration, placementFactsMigration, requestIDMigration,
@@ -1339,7 +1350,7 @@ func init() {
 		issuedCertMigration, quarantineMigration, strictTrustTablesMigration,
 		nodeRevocationMigration, ec2ShapeAccountingMigration, custodyVisibilityMigration,
 		leaseFailureReasonMigration, pendingCompletionsMigration, pendingCompletionLeaseMigration,
-		pendingCompletionRecoveryMigration)
+		pendingCompletionRecoveryMigration, pendingCompletionAcknowledgementMigration)
 }
 
 const bootstrapSchemaMigrations = `CREATE TABLE IF NOT EXISTS schema_migrations (

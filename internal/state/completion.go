@@ -11,30 +11,66 @@ import (
 // PendingCompletion is a GitHub result and capacity obligation the control
 // plane must settle before the source message can be forgotten.
 type PendingCompletion struct {
-	Tier        string
-	RequestID   int64
-	RunID       int64
-	Result      string
-	LeaseID     string
-	LeaseEpoch  int64
-	LeaseNode   string
-	Outcome     string
-	ReleaseOnly bool
-	MessageID   int64
-	Retired     bool
+	Tier         string
+	RequestID    int64
+	RunID        int64
+	Result       string
+	LeaseID      string
+	LeaseEpoch   int64
+	LeaseNode    string
+	Outcome      string
+	ReleaseOnly  bool
+	MessageID    int64
+	Retired      bool
+	Acknowledged bool
 }
 
+// PendingCompletionDisposition says whether an incoming delivery may perform teardown.
+type PendingCompletionDisposition uint8
+
+const (
+	// PendingCompletionActionable is the current delivery and still needs settlement.
+	PendingCompletionActionable PendingCompletionDisposition = iota
+	// PendingCompletionRetired has already settled and exists only to stop replay.
+	PendingCompletionRetired
+	// PendingCompletionStale was superseded by a later delivery for the same request id.
+	PendingCompletionStale
+)
+
 // PutPendingCompletion durably records a result-delivery obligation.
-func (db *DB) PutPendingCompletion(ctx context.Context, completion PendingCompletion) error {
+func (db *DB) PutPendingCompletion(
+	ctx context.Context,
+	completion PendingCompletion,
+) (PendingCompletionDisposition, error) {
 	if err := completion.valid(); err != nil {
-		return err
+		return PendingCompletionActionable, err
 	}
 
-	return db.Tx(ctx, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `INSERT INTO pending_completions
+	disposition := PendingCompletionActionable
+	err := db.Tx(ctx, func(tx *sql.Tx) error {
+		var storedMessage int64
+		var retired bool
+		err := tx.QueryRowContext(ctx, `SELECT message_id, retired FROM pending_completions
+			WHERE tier = ? AND request_id = ?`, completion.Tier, completion.RequestID).
+			Scan(&storedMessage, &retired)
+		switch {
+		case err == nil && completion.MessageID < storedMessage:
+			disposition = PendingCompletionStale
+
+			return nil
+		case err == nil && completion.MessageID == storedMessage && retired:
+			disposition = PendingCompletionRetired
+
+			return nil
+		case err != nil && !errors.Is(err, sql.ErrNoRows):
+			return fmt.Errorf("state: inspect pending completion for %s request %d: %w",
+				completion.Tier, completion.RequestID, err)
+		}
+
+		_, err = tx.ExecContext(ctx, `INSERT INTO pending_completions
 			(tier, request_id, run_id, result, lease_id, lease_epoch, lease_node, outcome,
-			 release_only, message_id, retired)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			 release_only, message_id, retired, acknowledged)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(tier, request_id) DO UPDATE SET
 				run_id=excluded.run_id,
 				result=excluded.result,
@@ -62,11 +98,15 @@ func (db *DB) PutPendingCompletion(ctx context.Context, completion PendingComple
 				retired=CASE
 					WHEN excluded.message_id = pending_completions.message_id
 					THEN max(pending_completions.retired, excluded.retired)
-					ELSE excluded.retired END
+					ELSE excluded.retired END,
+				acknowledged=CASE
+					WHEN excluded.message_id = pending_completions.message_id
+					THEN max(pending_completions.acknowledged, excluded.acknowledged)
+					ELSE excluded.acknowledged END
 			WHERE excluded.message_id >= pending_completions.message_id`,
 			completion.Tier, completion.RequestID, completion.RunID, completion.Result,
 			completion.LeaseID, completion.LeaseEpoch, completion.LeaseNode, completion.Outcome,
-			completion.ReleaseOnly, completion.MessageID, completion.Retired)
+			completion.ReleaseOnly, completion.MessageID, completion.Retired, completion.Acknowledged)
 		if err != nil {
 			return fmt.Errorf("state: record pending completion for %s request %d: %w",
 				completion.Tier, completion.RequestID, err)
@@ -74,6 +114,8 @@ func (db *DB) PutPendingCompletion(ctx context.Context, completion PendingComple
 
 		return nil
 	})
+
+	return disposition, err
 }
 
 // RetirePendingCompletion durably makes replay a no-op before deletion is tried.
@@ -94,21 +136,39 @@ func (db *DB) RetirePendingCompletion(
 				tier, requestID, err)
 		}
 
+		if _, err := tx.ExecContext(ctx, `DELETE FROM pending_completions
+			WHERE tier = ? AND request_id = ? AND message_id = ? AND acknowledged = 1`,
+			tier, requestID, messageID); err != nil {
+			return fmt.Errorf("state: remove acknowledged completion for %s request %d: %w",
+				tier, requestID, err)
+		}
+
 		return nil
 	})
 }
 
-// DeletePendingCompletion forgets an obligation only after the node accepted it.
-func (db *DB) DeletePendingCompletion(ctx context.Context, tier string, requestID, messageID int64) error {
+// AcknowledgePendingCompletion records that GitHub will not redeliver a message.
+func (db *DB) AcknowledgePendingCompletion(
+	ctx context.Context,
+	tier string,
+	requestID, messageID int64,
+) error {
 	if strings.TrimSpace(tier) == "" || requestID <= 0 || messageID < 0 {
 		return errors.New("state: a pending completion identity needs a tier and positive request id")
 	}
 
 	return db.Tx(ctx, func(tx *sql.Tx) error {
-		if _, err := tx.ExecContext(ctx,
-			`DELETE FROM pending_completions WHERE tier = ? AND request_id = ? AND message_id = ?`,
+		if _, err := tx.ExecContext(ctx, `UPDATE pending_completions SET acknowledged = 1
+			WHERE tier = ? AND request_id = ? AND message_id = ?`,
 			tier, requestID, messageID); err != nil {
-			return fmt.Errorf("state: delete pending completion for %s request %d: %w", tier, requestID, err)
+			return fmt.Errorf("state: acknowledge pending completion for %s request %d: %w",
+				tier, requestID, err)
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM pending_completions
+			WHERE tier = ? AND request_id = ? AND message_id = ? AND retired = 1`,
+			tier, requestID, messageID); err != nil {
+			return fmt.Errorf("state: remove retired completion for %s request %d: %w",
+				tier, requestID, err)
 		}
 
 		return nil
@@ -124,7 +184,8 @@ func (db *DB) PendingCompletions(ctx context.Context, tier string) ([]PendingCom
 	var completions []PendingCompletion
 	err := db.View(ctx, func(q Querier) error {
 		rows, err := q.QueryContext(ctx, `SELECT tier, request_id, run_id, result,
-			lease_id, lease_epoch, lease_node, outcome, release_only, message_id, retired
+			lease_id, lease_epoch, lease_node, outcome, release_only, message_id, retired,
+			acknowledged
 			FROM pending_completions WHERE tier = ? ORDER BY request_id`, tier)
 		if err != nil {
 			return fmt.Errorf("state: read pending completions for %s: %w", tier, err)
@@ -136,7 +197,8 @@ func (db *DB) PendingCompletions(ctx context.Context, tier string) ([]PendingCom
 			if err := rows.Scan(&completion.Tier, &completion.RequestID,
 				&completion.RunID, &completion.Result, &completion.LeaseID,
 				&completion.LeaseEpoch, &completion.LeaseNode, &completion.Outcome,
-				&completion.ReleaseOnly, &completion.MessageID, &completion.Retired); err != nil {
+				&completion.ReleaseOnly, &completion.MessageID, &completion.Retired,
+				&completion.Acknowledged); err != nil {
 				return fmt.Errorf("state: scan pending completion for %s: %w", tier, err)
 			}
 			completions = append(completions, completion)
