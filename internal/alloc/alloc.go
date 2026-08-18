@@ -644,6 +644,24 @@ func decodeEC2Shapes(s string) ([]config.EC2InstanceType, error) {
 	return shapes, nil
 }
 
+func sameEC2PlacementShapes(encoded string, next []config.EC2InstanceType) (bool, error) {
+	current, err := decodeEC2Shapes(encoded)
+	if err != nil {
+		return false, err
+	}
+	if len(current) != len(next) {
+		return false, nil
+	}
+	for i := range current {
+		if current[i].Type != next[i].Type || current[i].VCPU != next[i].VCPU ||
+			current[i].Memory != next[i].Memory {
+			return false, nil
+		}
+	}
+
+	return true, nil
+}
+
 // checkPlacement reports whether a lease may run on a node, under the policy in
 // force RIGHT NOW.
 //
@@ -1450,7 +1468,14 @@ func (a *Allocator) RegisterNode(ctx context.Context, reg NodeRegistration) (int
 			}
 		}
 
-		if existed && currentShapes != "" && currentShapes != encodedShapes {
+		shapesMatch := true
+		if existed && currentShapes != "" {
+			shapesMatch, err = sameEC2PlacementShapes(currentShapes, shapes)
+			if err != nil {
+				return fmt.Errorf("alloc: read the previous EC2 shape catalogue for node %s: %w", name, err)
+			}
+		}
+		if !shapesMatch {
 			var outstanding int
 
 			if err := tx.QueryRowContext(ctx,

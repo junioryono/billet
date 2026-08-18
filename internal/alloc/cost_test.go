@@ -57,3 +57,34 @@ func TestEC2CostNodesRefusesARegistrationWithoutPrices(t *testing.T) {
 		t.Fatal("EC2CostNodes accepted a registration without prices")
 	}
 }
+
+func TestEC2CostNodesIncludesOutstandingShapePrices(t *testing.T) {
+	tier := config.Tier{
+		Label: "cloud", Provider: config.ProviderEC2, GuestOS: config.GuestLinux,
+		VCPU: 2, Memory: 4 * config.GiB, Image: "ami-test",
+	}
+	a := newBareAllocator(t, Limits{MaxVCPU: 16, MaxMemory: 32 * config.GiB}, []config.Tier{tier})
+	_, err := a.RegisterNode(t.Context(), NodeRegistration{
+		Name: "cloud-1", Provider: config.ProviderEC2,
+		VCPU: 16, Memory: 32 * config.GiB,
+		EC2Shapes: []config.EC2InstanceType{{
+			Type: "shape", VCPU: 8, Memory: 16 * config.GiB, PriceUSDPerHour: 600_000,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("RegisterNode: %v", err)
+	}
+	for range 2 {
+		if _, err := a.Reserve(t.Context(), tier.Label); err != nil {
+			t.Fatalf("Reserve: %v", err)
+		}
+	}
+
+	got, err := a.EC2CostNodes(t.Context())
+	if err != nil {
+		t.Fatalf("EC2CostNodes: %v", err)
+	}
+	if len(got) != 1 || got[0].Outstanding != 1_200_000 {
+		t.Fatalf("EC2CostNodes = %+v, want $1.20/hour outstanding", got)
+	}
+}

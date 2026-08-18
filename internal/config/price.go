@@ -101,6 +101,7 @@ type EC2CostNode struct {
 	MaxVCPU       int
 	MaxMemory     ByteSize
 	InstanceTypes []EC2InstanceType
+	Outstanding   USDPerHour
 }
 
 func decimalMicros(micros *big.Int) string {
@@ -130,13 +131,23 @@ func EC2PeakHourlyExposure(maxVCPU int, maxMemory ByteSize, shapes []EC2Instance
 func EC2FleetPeakHourlyExposure(maxVCPU int, maxMemory ByteSize, nodes []EC2CostNode) (USDPerHour, error) {
 	var shapes []EC2InstanceType
 	nodeBound := new(big.Int)
+	outstanding := new(big.Int)
 	for i := range nodes {
 		shapes = append(shapes, nodes[i].InstanceTypes...)
-		nodeBound.Add(nodeBound, ec2PeakHourlyExposure(
-			nodes[i].MaxVCPU, nodes[i].MaxMemory, nodes[i].InstanceTypes))
+		configured := ec2PeakHourlyExposure(
+			nodes[i].MaxVCPU, nodes[i].MaxMemory, nodes[i].InstanceTypes)
+		open := big.NewInt(int64(nodes[i].Outstanding))
+		if open.Cmp(configured) > 0 {
+			configured = open
+		}
+		nodeBound.Add(nodeBound, configured)
+		outstanding.Add(outstanding, open)
 	}
 
 	deploymentBound := ec2PeakHourlyExposure(maxVCPU, maxMemory, shapes)
+	if outstanding.Cmp(deploymentBound) > 0 {
+		deploymentBound = outstanding
+	}
 	bound := nodeBound
 	if deploymentBound.Cmp(bound) < 0 {
 		bound = deploymentBound

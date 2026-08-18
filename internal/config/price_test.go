@@ -101,3 +101,24 @@ func TestEC2FleetPeakHourlyExposureUsesTheSumOfNodeCeilings(t *testing.T) {
 		t.Errorf("peak = %s, want $0.80/hour from the two node ceilings", &got)
 	}
 }
+
+func TestEC2FleetPeakHourlyExposureDoesNotDropBelowOutstandingWork(t *testing.T) {
+	nodes := []EC2CostNode{
+		{MaxVCPU: 8, MaxMemory: 16 * GiB, Outstanding: 1_200_000,
+			InstanceTypes: []EC2InstanceType{
+				{Type: "expensive", VCPU: 8, Memory: 16 * GiB, PriceUSDPerHour: 600_000},
+			}},
+		{MaxVCPU: 8, MaxMemory: 16 * GiB, Outstanding: 0,
+			InstanceTypes: []EC2InstanceType{
+				{Type: "spare", VCPU: 8, Memory: 16 * GiB, PriceUSDPerHour: 200_000},
+			}},
+	}
+
+	got, err := EC2FleetPeakHourlyExposure(8, 16*GiB, nodes)
+	if err != nil {
+		t.Fatalf("EC2FleetPeakHourlyExposure: %v", err)
+	}
+	if got != 1_200_000 {
+		t.Errorf("peak = %s, want the $1.20/hour already outstanding above tightened ceilings", &got)
+	}
+}
