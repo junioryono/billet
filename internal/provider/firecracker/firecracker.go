@@ -631,8 +631,14 @@ func checkSpec(spec provider.Spec) error {
 		}
 	}
 
-	if (spec.CacheEndpoint == "") != (spec.CacheToken == "") {
-		return fmt.Errorf("firecracker: %s needs both a cache endpoint and its per-guest token", spec.Name)
+	cacheFields := 0
+	for _, value := range []string{spec.CacheEndpoint, spec.CacheToken, spec.CacheReadyToken} {
+		if value != "" {
+			cacheFields++
+		}
+	}
+	if cacheFields != 0 && cacheFields != 3 {
+		return fmt.Errorf("firecracker: %s needs a cache endpoint and both purpose-bound per-guest tokens", spec.Name)
 	}
 	if spec.CacheEndpoint != "" && spec.BuildKitCacheMountLimit <= 0 {
 		return fmt.Errorf("firecracker: %s needs a positive BuildKit cache-mount ceiling", spec.Name)
@@ -795,6 +801,7 @@ func metadata(spec provider.Spec) (map[string]any, error) {
 	if spec.CacheEndpoint != "" {
 		billet["cache-endpoint"] = spec.CacheEndpoint
 		billet["cache-token"] = spec.CacheToken
+		billet["cache-ready-token"] = spec.CacheReadyToken
 		billet["buildkit-cache-mount-limit-bytes"] =
 			strconv.FormatInt(int64(spec.BuildKitCacheMountLimit), 10)
 	}

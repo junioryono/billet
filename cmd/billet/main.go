@@ -500,7 +500,7 @@ func runServer(ctx context.Context, lc *lifecycle, cfg *config.Config, dryRun bo
 	}
 
 	// The second signal, reaching the drain that honours it.
-	opts = append(opts, server.WithHurry(lc.hurry))
+	opts = append(opts, server.WithHurry(lc.hurry), server.WithCompletionLedger(db))
 
 	if dryRun {
 		opts = append(opts, server.AdvertiseNothing())

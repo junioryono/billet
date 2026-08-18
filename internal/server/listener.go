@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/state"
 )
 
 // Session is the part of a GitHub scale-set message session billet uses.
@@ -251,6 +252,9 @@ type Listener struct {
 
 	// Never nil; see noRunner.
 	runner Runner
+	// completionStore keeps authoritative job results across an ACK followed by a
+	// process stop, until the node accepts result-dependent teardown.
+	completionStore *state.DB
 
 	// TotalAssignedJobs is the documented scaling signal; counting messages is
 	// not, because a response carries at most 50 and a large backlog is truncated.
@@ -308,6 +312,11 @@ func NewListener(a *alloc.Allocator, tier string, session Session, opts ...Optio
 // so correctly while this said the reverse.
 func WithRunner(r Runner) Option {
 	return func(l *Listener) { l.runner = r }
+}
+
+// WithCompletionStore makes result delivery durable across listener restarts.
+func WithCompletionStore(db *state.DB) Option {
+	return func(l *Listener) { l.completionStore = db }
 }
 
 // promise is escrow held for a request GitHub has been told billet will run, and
@@ -646,6 +655,9 @@ func (l *Listener) Run(ctx context.Context) error {
 
 	if reused {
 		return fmt.Errorf("server: listener for %s has already run; build a new one", l.tier)
+	}
+	if err := l.restoreCompletions(ctx); err != nil {
+		return err
 	}
 
 	// Heartbeats run on their OWN clock, not between polls. A long poll measured
@@ -1357,7 +1369,7 @@ func waitWithin(ctx context.Context, wg *sync.WaitGroup) bool {
 func (l *Listener) destroyAll(ctx context.Context) map[int64]bool {
 	l.mu.Lock()
 
-	requests := make([]int64, 0, len(l.running)+len(l.cleanup))
+	requests := make([]Job, 0, len(l.running)+len(l.cleanup))
 
 	// NOT WHAT A RETRY IS ALREADY INSIDE. That destroy is still happening, and a
 	// second one would win the single teardown slot and spend the budget on work
@@ -1371,7 +1383,11 @@ func (l *Listener) destroyAll(ctx context.Context) map[int64]bool {
 			continue
 		}
 
-		requests = append(requests, id)
+		job := Job{RequestID: id}
+		if entry := l.cleanup[id]; entry != nil && entry.job.Result != "" {
+			job = entry.job
+		}
+		requests = append(requests, job)
 	}
 
 	for id, entry := range l.cleanup {
@@ -1388,7 +1404,7 @@ func (l *Listener) destroyAll(ctx context.Context) map[int64]bool {
 		}
 
 		if _, running := l.running[id]; !running {
-			requests = append(requests, id)
+			requests = append(requests, entry.job)
 		}
 	}
 
@@ -1408,11 +1424,12 @@ func (l *Listener) destroyAll(ctx context.Context) map[int64]bool {
 		slot = make(chan struct{}, teardownConcurrency)
 	)
 
-	for _, requestID := range requests {
+	for _, job := range requests {
 		wg.Add(1)
 
-		go func() {
+		go func(job Job) {
 			defer wg.Done()
+			requestID := job.RequestID
 
 			// CHECKED BEFORE THE SELECT, because select picks uniformly among ready
 			// cases rather than preferring a ready cancellation over a ready slot: with
@@ -1439,7 +1456,7 @@ func (l *Listener) destroyAll(ctx context.Context) map[int64]bool {
 				return
 			}
 
-			err := l.runner.Destroy(ctx, requestID)
+			err := l.destroyCompleted(ctx, job)
 
 			// CUSTODY DISCHARGES THE OBLIGATION RATHER THAN FAILING IT (#46).
 			//
@@ -1454,6 +1471,9 @@ func (l *Listener) destroyAll(ctx context.Context) map[int64]bool {
 			// destroy, but it IS a request that no longer needs anything from this
 			// listener, which is what the caller reads this map for.
 			held := errors.Is(err, ErrCustody)
+			if err == nil || held {
+				l.forgetCompletion(ctx, job)
+			}
 
 			mu.Lock()
 			done[requestID] = err == nil || held
@@ -1492,18 +1512,6 @@ func (l *Listener) destroyAll(ctx context.Context) map[int64]bool {
 				return
 			}
 
-			if held {
-				l.log.Info("the compute for this job was asked to stop and has not been "+
-					"confirmed gone; the runner is holding its capacity until it is",
-					"tier", l.tier, "request", requestID)
-
-				l.mu.Lock()
-				delete(l.cleanup, requestID)
-				l.mu.Unlock()
-
-				return
-			}
-
 			l.mu.Lock()
 
 			// AN ENTRY CARRYING A LEASE IS NOT DISCHARGED BY THE DESTROY ALONE.
@@ -1518,7 +1526,7 @@ func (l *Listener) destroyAll(ctx context.Context) map[int64]bool {
 			}
 
 			l.mu.Unlock()
-		}()
+		}(job)
 	}
 
 	wg.Wait()
@@ -1933,6 +1941,9 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 	for _, job := range msg.Completed {
 		finished[job.RequestID] = struct{}{}
 
+		if err := l.recordCompletion(ctx, job); err != nil {
+			return err
+		}
 		l.complete(ctx, job)
 	}
 
@@ -2529,6 +2540,54 @@ func (l *Listener) releaseParked(ctx context.Context, requestID int64) bool {
 	return true
 }
 
+func (l *Listener) recordCompletion(ctx context.Context, job Job) error {
+	if l.completionStore == nil || job.Result == "" {
+		return nil
+	}
+	if err := l.completionStore.PutPendingCompletion(ctx, state.PendingCompletion{
+		Tier: l.tier, RequestID: job.RequestID, RunID: job.RunID, Result: job.Result,
+	}); err != nil {
+		return fmt.Errorf("server: preserve completed result for %s request %d before acknowledging it: %w",
+			l.tier, job.RequestID, err)
+	}
+
+	return nil
+}
+
+func (l *Listener) forgetCompletion(ctx context.Context, job Job) {
+	if l.completionStore == nil || job.Result == "" {
+		return
+	}
+	if err := l.completionStore.DeletePendingCompletion(ctx, l.tier, job.RequestID); err != nil {
+		l.log.Error("the node accepted a completed job result, but its durable delivery record could not be removed; a restart will safely deliver it again",
+			"tier", l.tier, "request", job.RequestID, "error", err)
+	}
+}
+
+func (l *Listener) restoreCompletions(ctx context.Context) error {
+	if l.completionStore == nil {
+		return nil
+	}
+	completions, err := l.completionStore.PendingCompletions(ctx, l.tier)
+	if err != nil {
+		return fmt.Errorf("server: restore pending completions for %s: %w", l.tier, err)
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, completion := range completions {
+		job := Job{RequestID: completion.RequestID, RunID: completion.RunID, Result: completion.Result}
+		if entry := l.cleanup[job.RequestID]; entry != nil {
+			entry.job = job
+
+			continue
+		}
+		l.cleanup[job.RequestID] = &pendingCleanup{job: job}
+	}
+
+	return nil
+}
+
 // complete releases the lease a finished job was running on.
 //
 // Idempotent, because a redelivered Completed message must not fail: a job billet
@@ -2592,6 +2651,7 @@ func (l *Listener) complete(ctx context.Context, job Job) {
 		// finished, and a redelivered completion must not find this listener still
 		// claiming the job.
 		if errors.Is(err, ErrCustody) {
+			l.forgetCompletion(ctx, job)
 			l.log.Info("the compute for a finished job was asked to stop and has not been "+
 				"confirmed gone; the runner is holding its capacity until it is",
 				"tier", l.tier, "request", job.RequestID)
@@ -2645,7 +2705,8 @@ func (l *Listener) complete(ctx context.Context, job Job) {
 			}
 			// A RETRY THAT FAILED AGAIN, so it waits longer before the next one.
 			entry.failed(time.Now(), l.retryFirst, l.retryMax)
-		} else if _, promised := l.acquiring[job.RequestID]; held || promised {
+		} else if _, promised := l.acquiring[job.RequestID]; held || promised ||
+			(l.completionStore != nil && job.Result != "") {
 			if l.cleanup == nil {
 				l.cleanup = make(map[int64]*pendingCleanup)
 			}
@@ -2674,6 +2735,8 @@ func (l *Listener) complete(ctx context.Context, job Job) {
 
 		return
 	}
+
+	l.forgetCompletion(ctx, job)
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -2803,7 +2866,7 @@ func (l *Listener) complete(ctx context.Context, job Job) {
 }
 
 func (l *Listener) destroyCompleted(ctx context.Context, job Job) error {
-	if runner, ok := l.runner.(CompletionAwareRunner); ok {
+	if runner, ok := l.runner.(CompletionAwareRunner); ok && job.Result != "" {
 		return runner.DestroyCompleted(ctx, job.RequestID, job.Result)
 	}
 

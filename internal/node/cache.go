@@ -44,19 +44,29 @@ type CacheService struct {
 	attacher  provider.VolumeAttacher
 	log       *slog.Logger
 
-	mu         sync.Mutex
-	byToken    map[string]*cacheSession
-	byInstance map[string]string
+	mu           sync.Mutex
+	byToken      map[string]*cacheSession
+	byReadyToken map[string]*cacheSession
+	byInstance   map[string]string
 }
 
 type cacheSession struct {
-	mu       sync.Mutex
-	admit    chan struct{}
-	token    string
-	instance string
-	trust    provider.TrustClass
-	closed   bool
-	slots    [provider.MaxVolumes]*cacheAttachment
+	mu         sync.Mutex
+	admit      chan struct{}
+	token      string
+	readyToken string
+	instance   string
+	trust      provider.TrustClass
+	closed     bool
+	slots      [provider.MaxVolumes]*cacheAttachment
+}
+
+// CacheCredentials are the two capabilities a managed guest receives. Token is
+// available to the workflow; ReadyToken is available only to the root cache
+// helper that stops and verifies Docker before publication.
+type CacheCredentials struct {
+	Token      string
+	ReadyToken string
 }
 
 type cacheAttachment struct {
@@ -99,7 +109,8 @@ func NewCacheService(
 	service := &CacheService{
 		endpoint: endpoint, namespace: namespace, store: storage, attacher: attacher, log: log,
 		stateDir: filepath.Join(stateDir, cacheSessionDirectory),
-		byToken:  make(map[string]*cacheSession), byInstance: make(map[string]string),
+		byToken:  make(map[string]*cacheSession), byReadyToken: make(map[string]*cacheSession),
+		byInstance: make(map[string]string),
 	}
 	if err := service.loadSessions(); err != nil {
 		return nil, err
@@ -113,44 +124,64 @@ func (s *CacheService) qualifiedKey(key string) string { return s.namespace + "/
 // Endpoint is the origin placed in a microVM's metadata.
 func (s *CacheService) Endpoint() string { return s.endpoint }
 
-// Prepare creates one unguessable session before its microVM starts.
-func (s *CacheService) Prepare(instance string, trust provider.TrustClass) (string, error) {
+// Prepare creates two unguessable, purpose-bound capabilities before compute starts.
+func (s *CacheService) Prepare(instance string, trust provider.TrustClass) (CacheCredentials, error) {
 	if strings.TrimSpace(instance) == "" {
-		return "", errors.New("node: a cache session needs an instance")
+		return CacheCredentials{}, errors.New("node: a cache session needs an instance")
 	}
 
 	if trust != provider.TrustTrusted && trust != provider.TrustUntrusted {
-		return "", errors.New("node: cannot give cache access to work with unknown trust")
+		return CacheCredentials{}, errors.New("node: cannot give cache access to work with unknown trust")
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if _, exists := s.byInstance[instance]; exists {
-		return "", fmt.Errorf("node: cache session for %s already exists", instance)
+		return CacheCredentials{}, fmt.Errorf("node: cache session for %s already exists", instance)
 	}
 
 	for {
-		var raw [32]byte
-		if _, err := rand.Read(raw[:]); err != nil {
-			return "", fmt.Errorf("node: mint a cache session: %w", err)
+		token, err := randomCacheToken()
+		if err != nil {
+			return CacheCredentials{}, err
 		}
-
-		token := hex.EncodeToString(raw[:])
-		if _, collision := s.byToken[token]; collision {
+		readyToken, err := randomCacheToken()
+		if err != nil {
+			return CacheCredentials{}, err
+		}
+		if token == readyToken || s.tokenExists(token) || s.tokenExists(readyToken) {
 			continue
 		}
 
-		session := &cacheSession{token: token, instance: instance, trust: trust, admit: make(chan struct{}, 1)}
+		session := &cacheSession{
+			token: token, readyToken: readyToken, instance: instance, trust: trust,
+			admit: make(chan struct{}, 1),
+		}
 		if err := s.persistSession(session); err != nil {
-			return "", err
+			return CacheCredentials{}, err
 		}
 
 		s.byToken[token] = session
+		s.byReadyToken[readyToken] = session
 		s.byInstance[instance] = token
 
-		return token, nil
+		return CacheCredentials{Token: token, ReadyToken: readyToken}, nil
 	}
+}
+
+func randomCacheToken() (string, error) {
+	var raw [32]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", fmt.Errorf("node: mint a cache session capability: %w", err)
+	}
+
+	return hex.EncodeToString(raw[:]), nil
+}
+
+// tokenExists is called while s.mu is held.
+func (s *CacheService) tokenExists(token string) bool {
+	return s.byToken[token] != nil || s.byReadyToken[token] != nil
 }
 
 // finishSession removes a fully discarded session while session.mu is held.
@@ -159,7 +190,8 @@ func (s *CacheService) finishSession(session *cacheSession) error {
 	defer s.mu.Unlock()
 
 	token, ok := s.byInstance[session.instance]
-	if !ok || token != session.token || s.byToken[token] != session {
+	if !ok || token != session.token || s.byToken[token] != session ||
+		s.byReadyToken[session.readyToken] != session {
 		return nil
 	}
 
@@ -168,6 +200,7 @@ func (s *CacheService) finishSession(session *cacheSession) error {
 	}
 	delete(s.byInstance, session.instance)
 	delete(s.byToken, token)
+	delete(s.byReadyToken, session.readyToken)
 
 	return nil
 }
@@ -274,7 +307,7 @@ func (s *CacheService) cleanupSession(
 	defer session.mu.Unlock()
 
 	s.mu.Lock()
-	owned := s.byToken[session.token] == session &&
+	owned := s.byToken[session.token] == session && s.byReadyToken[session.readyToken] == session &&
 		s.byInstance[session.instance] == session.token
 	s.mu.Unlock()
 	if !owned || (!closeSession && !session.closed) {
@@ -317,7 +350,8 @@ func (s *CacheService) cleanupSession(
 
 // ServeHTTP serves the exact API understood by the sticky-disk action.
 func (s *CacheService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	session, ok := s.authenticate(r)
+	ready := r.Method == http.MethodPost && r.URL.Path == "/v1/docker-store/ready"
+	session, ok := s.authenticate(r, ready)
 	if !ok {
 		http.Error(w, "unauthorised cache session", http.StatusUnauthorized)
 
@@ -609,7 +643,7 @@ func validCacheArchitecture(architecture string) bool {
 	return true
 }
 
-func (s *CacheService) authenticate(r *http.Request) (*cacheSession, bool) {
+func (s *CacheService) authenticate(r *http.Request, ready bool) (*cacheSession, bool) {
 	value := r.Header.Get("Authorization")
 	token, ok := strings.CutPrefix(value, "Bearer ")
 	if !ok || token == "" || strings.ContainsAny(token, " ,\t\r\n") {
@@ -619,7 +653,11 @@ func (s *CacheService) authenticate(r *http.Request) (*cacheSession, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	session, ok := s.byToken[token]
+	sessions := s.byToken
+	if ready {
+		sessions = s.byReadyToken
+	}
+	session, ok := sessions[token]
 
 	return session, ok
 }

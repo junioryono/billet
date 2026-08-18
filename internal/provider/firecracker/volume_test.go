@@ -18,6 +18,7 @@ func TestACacheEnabledGuestBootsWithFiveReplaceableDriveSlots(t *testing.T) {
 	spec := aSpec()
 	spec.CacheEndpoint = "http://172.20.0.1:7718"
 	spec.CacheToken = strings.Repeat("a", 64)
+	spec.CacheReadyToken = strings.Repeat("c", 64)
 	spec.BuildKitCacheMountLimit = 4 << 30
 
 	if _, err := h.p.Launch(t.Context(), spec); err != nil {
@@ -44,7 +45,7 @@ func TestACacheEnabledGuestBootsWithFiveReplaceableDriveSlots(t *testing.T) {
 	}
 
 	metadataJSON := renderJSON(t, metadataBody)
-	for _, want := range []string{spec.CacheEndpoint, spec.CacheToken, "4294967296"} {
+	for _, want := range []string{spec.CacheEndpoint, spec.CacheToken, spec.CacheReadyToken, "4294967296"} {
 		if !strings.Contains(metadataJSON, want) {
 			t.Errorf("metadata does not carry %q", want)
 		}
@@ -61,6 +62,7 @@ func TestAReservedDriveCanBeReplacedAndDetachedAfterBoot(t *testing.T) {
 	spec := aSpec()
 	spec.CacheEndpoint = "http://172.20.0.1:7718"
 	spec.CacheToken = strings.Repeat("b", 64)
+	spec.CacheReadyToken = strings.Repeat("d", 64)
 	spec.BuildKitCacheMountLimit = 4 << 30
 
 	inst, err := h.p.Launch(t.Context(), spec)

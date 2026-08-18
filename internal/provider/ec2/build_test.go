@@ -47,12 +47,34 @@ func TestTheProvisionScriptContainsWhatAnImageNeeds(t *testing.T) {
 		{"/usr/local/bin/billet-runner", "the entry point a tier names in command:"},
 		{jitEnvVar, "the one variable billet's boot script exports"},
 		{"Runner.Listener --version", "an arch mismatch is otherwise invisible until a job"},
-		{"setpriv --reuid=runner --regid=runner --init-groups \\\n  env HOME=/home/runner", "the check has to take the path a job takes"},
+		{"setpriv --reuid=runner --regid=runner --init-groups \\\n  env -i PATH=", "the check has to take the path a job takes with a clean environment"},
 		{"poweroff", "the only signal that provisioning succeeded"},
 	} {
 		if !strings.Contains(got, want.fragment) {
 			t.Errorf("the script is missing %q — %s", want.fragment, want.why)
 		}
+	}
+}
+
+func TestTheCloudRunnerNeverInheritsTheReadinessCapability(t *testing.T) {
+	t.Parallel()
+
+	script := mustScript(t)
+	const begin = "cat > /usr/local/bin/billet-runner <<'BILLETEOF'\n"
+	_, after, ok := strings.Cut(script, begin)
+	if !ok {
+		t.Fatal("the EC2 runner entry point is missing")
+	}
+	entrypoint, _, ok := strings.Cut(after, "BILLETEOF\n")
+	if !ok {
+		t.Fatal("the EC2 runner entry point is not delimited")
+	}
+	if !strings.Contains(entrypoint, "env -i ") ||
+		!strings.Contains(entrypoint, "BILLET_CACHE_TOKEN=\"${BILLET_CACHE_TOKEN:-}\"") {
+		t.Fatal("the EC2 runner does not receive its workflow bearer through a clean environment")
+	}
+	if strings.Contains(entrypoint, "BILLET_CACHE_READY_TOKEN=") {
+		t.Fatal("the EC2 runner receives the root helper's readiness capability")
 	}
 }
 

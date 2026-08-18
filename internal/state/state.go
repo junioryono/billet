@@ -1281,6 +1281,22 @@ var leaseFailureReasonMigration = migration{
 	},
 }
 
+// A completed scale-set message is acknowledged only after its authoritative
+// result can survive the control plane stopping before node teardown succeeds.
+var pendingCompletionsMigration = migration{
+	Version: 22,
+	Name:    "pending_completions",
+	Stmts: []string{
+		`CREATE TABLE pending_completions (
+			tier       TEXT NOT NULL CHECK (length(trim(tier)) > 0),
+			request_id INTEGER NOT NULL CHECK (request_id > 0),
+			run_id     INTEGER NOT NULL DEFAULT 0 CHECK (run_id >= 0),
+			result     TEXT NOT NULL CHECK (length(trim(result)) > 0),
+			PRIMARY KEY (tier, request_id)
+		) STRICT`,
+	},
+}
+
 func init() {
 	migrations = append(migrations,
 		placementMigration, guestOSMigration, placementFactsMigration, requestIDMigration,
@@ -1288,7 +1304,7 @@ func init() {
 		certRevocationMigration, nodeEnrollmentMigration, joinTokenMigration,
 		issuedCertMigration, quarantineMigration, strictTrustTablesMigration,
 		nodeRevocationMigration, ec2ShapeAccountingMigration, custodyVisibilityMigration,
-		leaseFailureReasonMigration)
+		leaseFailureReasonMigration, pendingCompletionsMigration)
 }
 
 const bootstrapSchemaMigrations = `CREATE TABLE IF NOT EXISTS schema_migrations (

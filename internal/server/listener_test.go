@@ -1977,6 +1977,93 @@ func (f *fakeSession) Close(ctx context.Context) error {
 	return nil
 }
 
+func TestAcknowledgedCompletionRestoresItsExactResultAfterRestart(t *testing.T) {
+	db := openState(t)
+	first := NewListener(nil, "linux", &fakeSession{},
+		WithCompletionStore(db),
+		WithRunner(&fakeRunner{onDestroyCompleted: func(_ int64, _ string) error {
+			return errors.New("node unavailable")
+		}}))
+	job := Job{RequestID: 71, RunID: 81, Result: "Succeeded"}
+	if err := first.handle(t.Context(), &Message{MessageID: 1, Completed: []Job{job}}); err != nil {
+		t.Fatalf("handle completed message: %v", err)
+	}
+	pending, err := db.PendingCompletions(t.Context(), "linux")
+	if err != nil {
+		t.Fatalf("PendingCompletions: %v", err)
+	}
+	if len(pending) != 1 || pending[0].Result != job.Result || pending[0].RunID != job.RunID {
+		t.Fatalf("durable completion = %+v, want result and run from %+v", pending, job)
+	}
+
+	var got Job
+	restarted := NewListener(nil, "linux", &fakeSession{},
+		WithCompletionStore(db), WithCleanupRetryPacing(0, 0),
+		WithRunner(&fakeRunner{onDestroyCompleted: func(requestID int64, result string) error {
+			got = Job{RequestID: requestID, Result: result}
+
+			return nil
+		}}))
+	if err := restarted.restoreCompletions(t.Context()); err != nil {
+		t.Fatalf("restoreCompletions: %v", err)
+	}
+	restarted.retryCleanup(t.Context())
+	if got.RequestID != job.RequestID || got.Result != job.Result {
+		t.Fatalf("restored result delivery = %+v, want request %d result %q", got, job.RequestID, job.Result)
+	}
+	pending, err = db.PendingCompletions(t.Context(), "linux")
+	if err != nil {
+		t.Fatalf("PendingCompletions after delivery: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("accepted result left durable obligations: %+v", pending)
+	}
+}
+
+func TestShutdownUsesTheAuthoritativeResultForPendingCompletion(t *testing.T) {
+	db := openState(t)
+	job := state.PendingCompletion{Tier: "linux", RequestID: 72, RunID: 82, Result: "Failed"}
+	if err := db.PutPendingCompletion(t.Context(), job); err != nil {
+		t.Fatalf("PutPendingCompletion: %v", err)
+	}
+
+	var result string
+	l := NewListener(nil, "linux", &fakeSession{}, WithCompletionStore(db),
+		WithRunner(&fakeRunner{onDestroyCompleted: func(_ int64, got string) error {
+			result = got
+
+			return nil
+		}}))
+	if err := l.restoreCompletions(t.Context()); err != nil {
+		t.Fatalf("restoreCompletions: %v", err)
+	}
+	done := l.destroyAll(t.Context())
+	if !done[job.RequestID] || result != job.Result {
+		t.Fatalf("shutdown result = %q done=%v, want %q and done", result, done, job.Result)
+	}
+}
+
+func TestCompletionIsNotAcknowledgedWhenItsResultCannotBeMadeDurable(t *testing.T) {
+	db := openState(t)
+	if err := db.Close(); err != nil {
+		t.Fatalf("close completion store: %v", err)
+	}
+	acknowledged := false
+	session := &fakeSession{onDelete: func(int64) error {
+		acknowledged = true
+
+		return nil
+	}}
+	l := NewListener(nil, "linux", session, WithCompletionStore(db), WithRunner(&fakeRunner{}))
+	err := l.handle(t.Context(), &Message{MessageID: 1, Completed: []Job{{RequestID: 73, Result: "Succeeded"}}})
+	if err == nil {
+		t.Fatal("completion was handled without durable result storage")
+	}
+	if acknowledged {
+		t.Fatal("completion message was acknowledged after durable result storage failed")
+	}
+}
+
 // A COMPLETION WHOSE DESTROY FAILED IS RETRIED, which is what turns "capacity
 // held" into something other than a leak.
 //

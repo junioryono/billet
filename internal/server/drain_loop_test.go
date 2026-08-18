@@ -1058,6 +1058,15 @@ func TestTheHurryChannelReachesEveryListener(t *testing.T) {
 	}
 }
 
+func TestTheCompletionLedgerReachesEveryListener(t *testing.T) {
+	db := openState(t)
+	s := New(nil, nil, nil, "owner", nil, WithCompletionLedger(db))
+	l := NewListener(nil, "tier", nil, s.listenerOpts()...)
+	if l.completionStore != db {
+		t.Fatal("the control plane's completion ledger never reached the listener")
+	}
+}
+
 // A FATAL ERROR IS STILL FATAL WHEN IT ARRIVES DURING A SHUTDOWN.
 //
 // The first version of the drain treated any failure coinciding with

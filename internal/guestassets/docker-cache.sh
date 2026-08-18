@@ -10,14 +10,18 @@ cache_call() {
 	path=$1
 	body=${2:-}
 	timeout=${3:-120}
+	token=${BILLET_CACHE_TOKEN:-}
+	if [ "$path" = /v1/docker-store/ready ]; then
+		token=${BILLET_CACHE_READY_TOKEN:-}
+	fi
 	if [ -n "$body" ]; then
 		curl -fsS --connect-timeout 3 --max-time "$timeout" -X POST \
-			-H "Authorization: Bearer $BILLET_CACHE_TOKEN" \
+			-H "Authorization: Bearer $token" \
 			-H "Content-Type: application/json" --data "$body" \
 			"$BILLET_CACHE_ENDPOINT$path"
 	else
 		curl -fsS --connect-timeout 3 --max-time "$timeout" -X POST \
-			-H "Authorization: Bearer $BILLET_CACHE_TOKEN" \
+			-H "Authorization: Bearer $token" \
 			"$BILLET_CACHE_ENDPOINT$path"
 	fi
 }
@@ -41,7 +45,7 @@ start_cold() {
 clear_state() {
 	rm -f "$state_dir/slot" "$state_dir/device" "$state_dir/images-before" \
 		"$state_dir/images-before.unsorted" "$state_dir/images-after" \
-		"$state_dir/images-after.unsorted"
+		"$state_dir/images-after.unsorted" "$state_dir"/images-*.tmp.*
 	rmdir "$state_dir" 2>/dev/null || true
 }
 
@@ -72,14 +76,32 @@ prepare_filesystem() {
 	return 0
 }
 
-record_inventory() {
-	if docker image ls --no-trunc --digests \
+write_inventory() {
+	name=$1
+	unsorted="$state_dir/$name.unsorted"
+	temporary="$state_dir/$name.tmp.$$"
+	if ! docker image ls --no-trunc --digests \
 		--format '{{.Repository}} {{.Tag}} {{.Digest}} {{.ID}}' \
-		>"$state_dir/images-before.unsorted" 2>/dev/null; then
-		sort "$state_dir/images-before.unsorted" >"$state_dir/images-before"
-		rm -f "$state_dir/images-before.unsorted"
-	else
-		rm -f "$state_dir/images-before" "$state_dir/images-before.unsorted"
+		>"$unsorted" 2>/dev/null; then
+		rm -f "$unsorted" "$temporary" "$state_dir/$name"
+
+		return 1
+	fi
+	if ! sort "$unsorted" >"$temporary"; then
+		rm -f "$unsorted" "$temporary" "$state_dir/$name"
+
+		return 1
+	fi
+	if ! mv "$temporary" "$state_dir/$name"; then
+		rm -f "$unsorted" "$temporary" "$state_dir/$name"
+
+		return 1
+	fi
+	rm -f "$unsorted"
+}
+
+record_inventory() {
+	if ! write_inventory images-before; then
 		log "the initial Docker image inventory failed; this job's clone will not publish"
 	fi
 }
@@ -195,14 +217,8 @@ complete() {
 	device=$(sed -n '1p' "$state_dir/device")
 
 	after_ok=0
-	if docker image ls --no-trunc --digests \
-		--format '{{.Repository}} {{.Tag}} {{.Digest}} {{.ID}}' \
-		>"$state_dir/images-after.unsorted" 2>/dev/null; then
-		sort "$state_dir/images-after.unsorted" >"$state_dir/images-after"
-		rm -f "$state_dir/images-after.unsorted"
+	if write_inventory images-after; then
 		after_ok=1
-	else
-		rm -f "$state_dir/images-after" "$state_dir/images-after.unsorted"
 	fi
 	if ! systemctl stop docker.service docker.socket; then
 		log "Docker did not stop cleanly; node cleanup will discard its cache writes"
@@ -217,9 +233,17 @@ complete() {
 	fi
 
 	operation=discard
-	if [ "$status" = 100 ] && [ "$after_ok" -eq 1 ] && [ -r "$state_dir/images-before" ] &&
-		! cmp -s "$state_dir/images-before" "$state_dir/images-after"; then
-		operation=ready
+	if [ "$status" = 100 ] && [ "$after_ok" -eq 1 ] && [ -r "$state_dir/images-before" ]; then
+		if cmp -s "$state_dir/images-before" "$state_dir/images-after"; then
+			comparison=0
+		else
+			comparison=$?
+		fi
+		case "$comparison" in
+		1) operation=ready ;;
+		0) ;;
+		*) log "the Docker image inventories could not be compared; discarding the clone" ;;
+		esac
 	fi
 
 	if [ "$operation" = ready ]; then

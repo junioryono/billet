@@ -422,7 +422,8 @@ func sleepFor(ctx context.Context, d time.Duration) error {
 // without HOME the runner inherits cloud-init's HOME=/root, registers fine, and
 // then fails every job step that writes to $HOME.
 const privilegeDrop = "setpriv --reuid=runner --regid=runner --init-groups \\\n" +
-	"  env HOME=/home/runner USER=runner LOGNAME=runner"
+	"  env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin " +
+	"HOME=/home/runner USER=runner LOGNAME=runner"
 
 // jobTimingHookPath ends in the extension GitHub uses to select the hook's
 // interpreter. A shebang and executable mode are not sufficient.
@@ -581,6 +582,9 @@ func provisionScript(spec BuildSpec) (string, error) {
 	b.WriteString("  ACTIONS_RUNNER_HOOK_JOB_STARTED=" + jobTimingHookPath + " \\\n")
 	b.WriteString("  ACTIONS_RUNNER_RETURN_JOB_RESULT_FOR_HOSTED=true \\\n")
 	b.WriteString("  " + jitEnvVar + "=\"$" + jitEnvVar + "\" \\\n")
+	b.WriteString("  BILLET_CACHE_ENDPOINT=\"${BILLET_CACHE_ENDPOINT:-}\" \\\n")
+	b.WriteString("  BILLET_CACHE_TOKEN=\"${BILLET_CACHE_TOKEN:-}\" \\\n")
+	b.WriteString("  BILLET_BUILDKIT_CACHE_MOUNT_LIMIT_BYTES=\"${BILLET_BUILDKIT_CACHE_MOUNT_LIMIT_BYTES:-}\" \\\n")
 	b.WriteString("  /opt/actions-runner/billet-runner-service\n")
 	b.WriteString("job_status=$?\n")
 	b.WriteString("set -e\n")
@@ -610,8 +614,7 @@ func provisionScript(spec BuildSpec) (string, error) {
 	// command that setpriv exists, that the user switch works, that the runner user
 	// can reach and execute the binary, and that .NET starts (a missing libicu dies
 	// here rather than at registration).
-	b.WriteString("setpriv --reuid=runner --regid=runner --init-groups \\\n")
-	b.WriteString("  env HOME=/home/runner USER=runner LOGNAME=runner \\\n")
+	b.WriteString(privilegeDrop + " \\\n")
 	b.WriteString("  /opt/actions-runner/bin/Runner.Listener --version\n")
 
 	// THE SUCCESS SIGNAL. Reaching this line is the only thing that tells billet

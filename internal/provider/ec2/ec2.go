@@ -1192,8 +1192,14 @@ func (p *Provider) userData(spec provider.Spec) (string, error) {
 }
 
 func (p *Provider) userDataAt(spec provider.Spec, launchEpochNS int64) (string, error) {
-	if (spec.CacheEndpoint == "") != (spec.CacheToken == "") {
-		return "", fmt.Errorf("ec2: the cache endpoint and token for %s must be supplied together", spec.Name)
+	cacheFields := 0
+	for _, value := range []string{spec.CacheEndpoint, spec.CacheToken, spec.CacheReadyToken} {
+		if value != "" {
+			cacheFields++
+		}
+	}
+	if cacheFields != 0 && cacheFields != 3 {
+		return "", fmt.Errorf("ec2: the cache endpoint and both purpose-bound tokens for %s must be supplied together", spec.Name)
 	}
 	// A PLAIN SINGLE-QUOTED ASSIGNMENT, which is the one construct with no
 	// parsing left in it. Inside single quotes a POSIX shell expands nothing at
@@ -1232,14 +1238,19 @@ func (p *Provider) userDataAt(spec provider.Spec, launchEpochNS int64) (string, 
 		if err != nil {
 			return "", fmt.Errorf("ec2: cache token for %s: %w", spec.Name, err)
 		}
+		readyToken, err := shellQuote(spec.CacheReadyToken)
+		if err != nil {
+			return "", fmt.Errorf("ec2: cache readiness token for %s: %w", spec.Name, err)
+		}
 		limit, err := shellQuote(strconv.FormatInt(int64(spec.BuildKitCacheMountLimit), 10))
 		if err != nil {
 			return "", err
 		}
 		b.WriteString("BILLET_CACHE_ENDPOINT=" + endpoint + "\n")
 		b.WriteString("BILLET_CACHE_TOKEN=" + token + "\n")
+		b.WriteString("BILLET_CACHE_READY_TOKEN=" + readyToken + "\n")
 		b.WriteString("BILLET_BUILDKIT_CACHE_MOUNT_LIMIT_BYTES=" + limit + "\n")
-		b.WriteString("export BILLET_CACHE_ENDPOINT BILLET_CACHE_TOKEN BILLET_BUILDKIT_CACHE_MOUNT_LIMIT_BYTES\n")
+		b.WriteString("export BILLET_CACHE_ENDPOINT BILLET_CACHE_TOKEN BILLET_CACHE_READY_TOKEN BILLET_BUILDKIT_CACHE_MOUNT_LIMIT_BYTES\n")
 	}
 	b.WriteString("exec " + command + "\n")
 

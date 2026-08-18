@@ -20,11 +20,15 @@ func TestDockerCachePublishesOnlyAnAuthoritativeCleanSuccess(t *testing.T) {
 		before    string
 		after     string
 		afterExit string
+		sortExit  string
+		cmpExit   string
 		endpoint  string
 	}{
 		{name: "changed success", status: "100", before: "old", after: "new", afterExit: "0", endpoint: "/v1/docker-store/ready"},
 		{name: "unchanged success", status: "100", before: "same", after: "same", afterExit: "0", endpoint: "/v1/volumes/0/discard"},
 		{name: "inventory failure", status: "100", before: "old", after: "new", afterExit: "1", endpoint: "/v1/volumes/0/discard"},
+		{name: "sort failure", status: "100", before: "old", after: "new", afterExit: "0", sortExit: "2", endpoint: "/v1/volumes/0/discard"},
+		{name: "comparison failure", status: "100", before: "old", after: "new", afterExit: "0", cmpExit: "2", endpoint: "/v1/volumes/0/discard"},
 		{name: "success with issues", status: "101", before: "old", after: "new", afterExit: "0", endpoint: "/v1/volumes/0/discard"},
 		{name: "failed", status: "102", before: "old", after: "new", afterExit: "0", endpoint: "/v1/volumes/0/discard"},
 		{name: "cancelled", status: "103", before: "old", after: "new", afterExit: "0", endpoint: "/v1/volumes/0/discard"},
@@ -51,6 +55,8 @@ func TestDockerCachePublishesOnlyAnAuthoritativeCleanSuccess(t *testing.T) {
 			writeStub(t, shadow, "umount", "exit 0\n")
 			writeStub(t, shadow, "e2fsck", "exit 0\n")
 			writeStub(t, shadow, "docker", "printf '%s\\n' \"$BILLET_TEST_IMAGES_AFTER\"\nexit \"$BILLET_TEST_DOCKER_EXIT\"\n")
+			writeStub(t, shadow, "sort", "test -z \"$BILLET_TEST_SORT_EXIT\" || exit \"$BILLET_TEST_SORT_EXIT\"\nexec /usr/bin/sort \"$@\"\n")
+			writeStub(t, shadow, "cmp", "test -z \"$BILLET_TEST_CMP_EXIT\" || exit \"$BILLET_TEST_CMP_EXIT\"\nexec /usr/bin/cmp \"$@\"\n")
 			writeStub(t, shadow, "blkid", `
 case "$*" in
   *TYPE*) printf 'ext4\n' ;;
@@ -72,9 +78,12 @@ printf '{"ready":true}\n'
 				"PATH="+shadow+":"+os.Getenv("PATH"),
 				"BILLET_CACHE_ENDPOINT=http://cache.test",
 				"BILLET_CACHE_TOKEN=test-token",
+				"BILLET_CACHE_READY_TOKEN=test-ready-token",
 				"BILLET_DOCKER_CACHE_STATE_DIR="+state,
 				"BILLET_TEST_IMAGES_AFTER="+tc.after,
 				"BILLET_TEST_DOCKER_EXIT="+tc.afterExit,
+				"BILLET_TEST_SORT_EXIT="+tc.sortExit,
+				"BILLET_TEST_CMP_EXIT="+tc.cmpExit,
 				"BILLET_TEST_CURL_LOG="+logPath,
 			)
 			if output, err := run.CombinedOutput(); err != nil {
@@ -88,6 +97,10 @@ printf '{"ready":true}\n'
 			if !strings.Contains(string(called), tc.endpoint) {
 				t.Errorf("status %s with inventories %q/%q called:\n%s\nwant %s",
 					tc.status, tc.before, tc.after, called, tc.endpoint)
+			}
+			if tc.endpoint == "/v1/docker-store/ready" &&
+				!strings.Contains(string(called), "Authorization: Bearer test-ready-token") {
+				t.Errorf("readiness call did not use the helper-only bearer:\n%s", called)
 			}
 		})
 	}

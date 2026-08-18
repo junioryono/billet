@@ -31,7 +31,7 @@ while :; do
 		if [ "${ACTIONS_RUNNER_RETURN_VERSION_DEPRECATED_EXIT_CODE:-}" = 1 ]; then
 			exit 7
 		fi
-		exit "$status"
+		exit 0
 		;;
 	*)
 		exit "$status"

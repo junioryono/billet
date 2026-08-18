@@ -189,12 +189,12 @@ func testCacheService(t *testing.T, trust provider.TrustClass) (*CacheService, *
 		t.Fatalf("NewCacheService: %v", err)
 	}
 
-	token, err := service.Prepare("billet-one", trust)
+	credentials, err := service.Prepare("billet-one", trust)
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
 
-	return service, storage, token
+	return service, storage, credentials.Token
 }
 
 func cacheRequest(
@@ -332,10 +332,11 @@ func TestDockerImageStoreIsArchitectureScopedAndReservesSlotZero(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewCacheService: %v", err)
 	}
-	token, err := service.Prepare("billet-one", provider.TrustTrusted)
+	credentials, err := service.Prepare("billet-one", provider.TrustTrusted)
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
+	token := credentials.Token
 
 	docker := cacheRequest(t, service, token, "/v1/docker-store",
 		map[string]any{"architecture": "amd64"})
@@ -385,15 +386,19 @@ func TestDockerImageStoreIsArchitectureScopedAndReservesSlotZero(t *testing.T) {
 	proof := map[string]any{
 		"filesystem": map[string]any{"type": "ext4", "uuid": "docker-fs", "clean": true},
 	}
-	if early := cacheRequest(t, service, token, "/v1/docker-store/ready", proof); early.Code != http.StatusConflict {
-		t.Fatalf("early Docker readiness status = %d, want 409: %s",
+	if forged := cacheRequest(t, service, token, "/v1/docker-store/ready", proof); forged.Code != http.StatusUnauthorized {
+		t.Fatalf("workflow Docker readiness status = %d, want 401: %s",
+			forged.Code, forged.Body.String())
+	}
+	if early := cacheRequest(t, service, credentials.ReadyToken, "/v1/docker-store/ready", proof); early.Code != http.StatusConflict {
+		t.Fatalf("early helper Docker readiness status = %d, want 409: %s",
 			early.Code, early.Body.String())
 	}
 	settled := make(chan error, 1)
 	go func() { settled <- service.SettleDocker(t.Context(), "billet-one", true) }()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		ready := cacheRequest(t, service, token, "/v1/docker-store/ready", proof)
+		ready := cacheRequest(t, service, credentials.ReadyToken, "/v1/docker-store/ready", proof)
 		if ready.Code == http.StatusOK {
 			break
 		}
@@ -423,15 +428,16 @@ func TestFailedJobLeavesTheDockerStoreAttachedUntilComputeIsGone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewCacheService: %v", err)
 	}
-	token, err := service.Prepare("billet-one", provider.TrustTrusted)
+	credentials, err := service.Prepare("billet-one", provider.TrustTrusted)
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
+	token := credentials.Token
 	if response := cacheRequest(t, service, token, "/v1/docker-store",
 		map[string]any{"architecture": "amd64"}); response.Code != http.StatusCreated {
 		t.Fatalf("Docker store status = %d: %s", response.Code, response.Body.String())
 	}
-	if response := cacheRequest(t, service, token, "/v1/docker-store/ready", map[string]any{
+	if response := cacheRequest(t, service, credentials.ReadyToken, "/v1/docker-store/ready", map[string]any{
 		"filesystem": map[string]any{"type": "ext4", "uuid": "docker-fs", "clean": true},
 	}); response.Code != http.StatusConflict {
 		t.Fatalf("failed job's early Docker readiness status = %d, want 409: %s",
@@ -591,9 +597,11 @@ func TestRunnerBindsCacheAccessToTheComputeLifetime(t *testing.T) {
 	}
 
 	spec := p.launched[0]
-	if spec.CacheEndpoint != service.Endpoint() || spec.CacheToken == "" {
-		t.Fatalf("guest cache credentials = endpoint %q token present %t",
-			spec.CacheEndpoint, spec.CacheToken != "")
+	if spec.CacheEndpoint != service.Endpoint() || spec.CacheToken == "" ||
+		spec.CacheReadyToken == "" || spec.CacheReadyToken == spec.CacheToken {
+		t.Fatalf("guest cache credentials = endpoint %q workflow token present %t, distinct readiness token present %t",
+			spec.CacheEndpoint, spec.CacheToken != "",
+			spec.CacheReadyToken != "" && spec.CacheReadyToken != spec.CacheToken)
 	}
 	if spec.BuildKitCacheMountLimit != config.DefaultBuildKitCacheMountLimit {
 		t.Errorf("guest BuildKit mount limit = %s, want %s", spec.BuildKitCacheMountLimit,
@@ -734,7 +742,8 @@ func TestCachePreparationFailureDoesNotFailTheJob(t *testing.T) {
 	if len(p.launched) != 1 {
 		t.Fatalf("launched %d jobs, want 1", len(p.launched))
 	}
-	if p.launched[0].CacheEndpoint != "" || p.launched[0].CacheToken != "" {
+	if p.launched[0].CacheEndpoint != "" || p.launched[0].CacheToken != "" ||
+		p.launched[0].CacheReadyToken != "" {
 		t.Fatalf("cold launch retained cache credentials: %+v", p.launched[0])
 	}
 }
@@ -769,10 +778,11 @@ func TestCacheCustodySurvivesANodeProcessRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first NewCacheService: %v", err)
 	}
-	token, err := first.Prepare("billet-one", provider.TrustTrusted)
+	credentials, err := first.Prepare("billet-one", provider.TrustTrusted)
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
+	token := credentials.Token
 	attached := cacheRequest(t, first, token, "/v1/volumes", map[string]any{
 		"key": "acme/api/npm", "size_bytes": int64(10 << 30),
 	})
@@ -808,10 +818,11 @@ func TestAnAmbiguousAttachIsDurableBeforeTheProviderCanMapIt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first NewCacheService: %v", err)
 	}
-	token, err := first.Prepare("billet-one", provider.TrustTrusted)
+	credentials, err := first.Prepare("billet-one", provider.TrustTrusted)
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
+	token := credentials.Token
 	attached := cacheRequest(t, first, token, "/v1/volumes", map[string]any{
 		"key": "acme/api/npm", "size_bytes": int64(10 << 30),
 	})
@@ -845,10 +856,11 @@ func TestCacheBearerTokensArePersistedOnlyInPrivateFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewCacheService: %v", err)
 	}
-	token, err := service.Prepare("billet-one", provider.TrustTrusted)
+	credentials, err := service.Prepare("billet-one", provider.TrustTrusted)
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
+	token := credentials.Token
 
 	path := filepath.Join(stateDir, cacheSessionDirectory, token+".json")
 	info, err := os.Stat(path)
@@ -857,6 +869,14 @@ func TestCacheBearerTokensArePersistedOnlyInPrivateFiles(t *testing.T) {
 	}
 	if got := info.Mode().Perm(); got != 0o600 {
 		t.Errorf("cache custody mode = %o, want 600", got)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read cache custody: %v", err)
+	}
+	if !bytes.Contains(body, []byte(credentials.Token)) ||
+		!bytes.Contains(body, []byte(credentials.ReadyToken)) {
+		t.Fatal("cache custody did not preserve both purpose-bound capabilities")
 	}
 }
 
@@ -870,10 +890,11 @@ func TestAClosedSessionRetriesFailedDiscardsAfterRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewCacheService: %v", err)
 	}
-	token, err := service.Prepare("billet-one", provider.TrustTrusted)
+	credentials, err := service.Prepare("billet-one", provider.TrustTrusted)
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
+	token := credentials.Token
 	attached := cacheRequest(t, service, token, "/v1/volumes", map[string]any{
 		"key": "acme/api/npm", "size_bytes": int64(10 << 30),
 	})
@@ -919,10 +940,11 @@ func TestSuccessfulEmptyInventoryClosesPersistedCacheSessions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewCacheService: %v", err)
 	}
-	token, err := service.Prepare("billet-gone", provider.TrustTrusted)
+	credentials, err := service.Prepare("billet-gone", provider.TrustTrusted)
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
+	token := credentials.Token
 	attached := cacheRequest(t, service, token, "/v1/volumes", map[string]any{
 		"key": "acme/api/npm", "size_bytes": int64(10 << 30),
 	})
@@ -953,10 +975,11 @@ func TestCacheSessionAdmissionIsBoundedBeforeStorage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewCacheService: %v", err)
 	}
-	token, err := service.Prepare("billet-one", provider.TrustTrusted)
+	credentials, err := service.Prepare("billet-one", provider.TrustTrusted)
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
+	token := credentials.Token
 	service.byToken[token].admit <- struct{}{}
 	defer func() { <-service.byToken[token].admit }()
 

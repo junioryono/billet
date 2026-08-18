@@ -60,7 +60,9 @@ func TestOpenAppliesMigrations(t *testing.T) {
 		t.Errorf("recorded %d migrations, want %d", i, len(migrations))
 	}
 
-	for _, table := range []string{"nodes", "leases", "cache_generations", "job_history"} {
+	for _, table := range []string{
+		"nodes", "leases", "cache_generations", "job_history", "pending_completions",
+	} {
 		var name string
 		if err := db.Reader().QueryRowContext(ctx,
 			`SELECT name FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&name); err != nil {
@@ -1107,6 +1109,7 @@ func TestADatabaseWrittenByAnEarlierBilletUpgrades(t *testing.T) {
 		for _, stmt := range []string{
 			`DROP TABLE issued_certs`,
 			`DROP TABLE node_revocations`,
+			`DROP TABLE pending_completions`,
 			`ALTER TABLE nodes DROP COLUMN ec2_shapes`,
 			`ALTER TABLE leases DROP COLUMN force_release`,
 			`ALTER TABLE leases DROP COLUMN held_at`,

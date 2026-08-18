@@ -624,19 +624,23 @@ fi
 # shared helper uses the same node API on Firecracker and EC2.
 cache_endpoint=""
 cache_token=""
+cache_ready_token=""
 buildkit_cache_mount_limit_bytes=""
 
 if cache_endpoint=$(fetch cache-endpoint 2>/dev/null) &&
 	cache_token=$(fetch cache-token 2>/dev/null) &&
+	cache_ready_token=$(fetch cache-ready-token 2>/dev/null) &&
 	buildkit_cache_mount_limit_bytes=$(fetch buildkit-cache-mount-limit-bytes 2>/dev/null) &&
-	[ -n "$cache_endpoint" ] && [ -n "$cache_token" ] &&
+	[ -n "$cache_endpoint" ] && [ -n "$cache_token" ] && [ -n "$cache_ready_token" ] &&
 	[[ "$buildkit_cache_mount_limit_bytes" =~ ^[1-9][0-9]*$ ]]; then
 	export BILLET_CACHE_ENDPOINT="$cache_endpoint"
 	export BILLET_CACHE_TOKEN="$cache_token"
+	export BILLET_CACHE_READY_TOKEN="$cache_ready_token"
 	export BILLET_BUILDKIT_CACHE_MOUNT_LIMIT_BYTES="$buildkit_cache_mount_limit_bytes"
 else
 	cache_endpoint=""
 	cache_token=""
+	cache_ready_token=""
 	buildkit_cache_mount_limit_bytes=""
 fi
 
@@ -795,6 +799,7 @@ cd /home/runner/runner
 runner_env=(
 	"ACTIONS_RUNNER_INPUT_JITCONFIG=$ACTIONS_RUNNER_INPUT_JITCONFIG"
 	"ACTIONS_RUNNER_RETURN_JOB_RESULT_FOR_HOSTED=true"
+	"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 	"HOME=/home/runner"
 	"USER=runner"
 	"LOGNAME=runner"
@@ -812,7 +817,7 @@ fi
 set +e
 # BILLET_AGENT_LAUNCH_BEGIN
 setpriv --reuid=runner --regid=runner --init-groups --inh-caps=-all -- \
-	env "${runner_env[@]}" "${cmd[@]}"
+	env -i "${runner_env[@]}" "${cmd[@]}"
 job_status=$?
 # BILLET_AGENT_LAUNCH_END
 set -e

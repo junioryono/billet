@@ -15,11 +15,12 @@ import (
 const cacheSessionDirectory = "cache-sessions"
 
 type durableCacheSession struct {
-	Token    string                                `json:"token"`
-	Instance string                                `json:"instance"`
-	Trust    provider.TrustClass                   `json:"trust"`
-	Closed   bool                                  `json:"closed"`
-	Slots    [provider.MaxVolumes]*cacheAttachment `json:"slots"`
+	Token      string                                `json:"token"`
+	ReadyToken string                                `json:"ready_token"`
+	Instance   string                                `json:"instance"`
+	Trust      provider.TrustClass                   `json:"trust"`
+	Closed     bool                                  `json:"closed"`
+	Slots      [provider.MaxVolumes]*cacheAttachment `json:"slots"`
 }
 
 func (s *CacheService) loadSessions() error {
@@ -47,18 +48,19 @@ func (s *CacheService) loadSessions() error {
 		if err := record.valid(entry.Name()); err != nil {
 			return err
 		}
-		if _, duplicate := s.byToken[record.Token]; duplicate {
-			return fmt.Errorf("node: duplicate cache custody token in %s", entry.Name())
+		if s.tokenExists(record.Token) || s.tokenExists(record.ReadyToken) {
+			return fmt.Errorf("node: duplicate cache custody capability in %s", entry.Name())
 		}
 		if _, duplicate := s.byInstance[record.Instance]; duplicate {
 			return fmt.Errorf("node: duplicate cache custody for instance %s", record.Instance)
 		}
 
 		session := &cacheSession{
-			token: record.Token, instance: record.Instance, trust: record.Trust,
+			token: record.Token, readyToken: record.ReadyToken, instance: record.Instance, trust: record.Trust,
 			closed: record.Closed, slots: record.Slots, admit: make(chan struct{}, 1),
 		}
 		s.byToken[record.Token] = session
+		s.byReadyToken[record.ReadyToken] = session
 		s.byInstance[record.Instance] = record.Token
 	}
 
@@ -69,6 +71,10 @@ func (r durableCacheSession) valid(filename string) error {
 	raw, err := hex.DecodeString(r.Token)
 	if err != nil || len(raw) != 32 || filename != r.Token+".json" {
 		return fmt.Errorf("node: cache custody file %s has an invalid token identity", filename)
+	}
+	readyRaw, readyErr := hex.DecodeString(r.ReadyToken)
+	if readyErr != nil || len(readyRaw) != 32 || r.ReadyToken == r.Token {
+		return fmt.Errorf("node: cache custody file %s has an invalid readiness capability", filename)
 	}
 	if strings.TrimSpace(r.Instance) == "" {
 		return fmt.Errorf("node: cache custody file %s names no instance", filename)
@@ -83,7 +89,8 @@ func (r durableCacheSession) valid(filename string) error {
 // persistSession is called while session.mu is held.
 func (s *CacheService) persistSession(session *cacheSession) error {
 	record := durableCacheSession{
-		Token: session.token, Instance: session.instance, Trust: session.trust,
+		Token: session.token, ReadyToken: session.readyToken,
+		Instance: session.instance, Trust: session.trust,
 		Closed: session.closed, Slots: session.slots,
 	}
 	encoded, err := json.Marshal(record)

@@ -330,16 +330,18 @@ func (r *Runner) Launch(
 		return fmt.Errorf("node: mint a registration for %s: %w", name, err)
 	}
 
-	cacheEndpoint, cacheToken := "", ""
+	cacheEndpoint, cacheToken, cacheReadyToken := "", "", ""
 	var buildKitCacheMountLimit config.ByteSize
 	if r.cache != nil {
-		cacheToken, err = r.cache.Prepare(name, trust)
+		var credentials CacheCredentials
+		credentials, err = r.cache.Prepare(name, trust)
 		if err != nil {
 			r.log.Warn("cache access is unavailable; this job will continue cold",
 				"instance", name, "error", err)
-			cacheToken = ""
 		} else {
 			cacheEndpoint = r.cache.Endpoint()
+			cacheToken = credentials.Token
+			cacheReadyToken = credentials.ReadyToken
 			buildKitCacheMountLimit = tier.BuildKitCacheMountLimit
 		}
 	}
@@ -394,6 +396,7 @@ func (r *Runner) Launch(
 		JITConfig:               reg.Config(),
 		CacheEndpoint:           cacheEndpoint,
 		CacheToken:              cacheToken,
+		CacheReadyToken:         cacheReadyToken,
 		BuildKitCacheMountLimit: buildKitCacheMountLimit,
 		RegistryMirrors:         r.registryMirrors,
 

@@ -174,10 +174,12 @@ type Spec struct {
 	// Volumes are cache devices known before boot. A cache endpoint reserves the
 	// remaining slots so a cooperative guest can request them at runtime.
 	Volumes []VolumeMount
-	// CacheEndpoint and CacheToken let the guest request runtime volumes from its
-	// node. They are paired, and the token is unique to this one microVM.
-	CacheEndpoint string
-	CacheToken    string
+	// CacheEndpoint and CacheToken let the workflow request runtime volumes from
+	// its node. CacheReadyToken is a separate capability reserved for the guest's
+	// root helper, which proves Docker is stopped before host-side publication.
+	CacheEndpoint   string
+	CacheToken      string
+	CacheReadyToken string
 	// BuildKitCacheMountLimit is the tier's byte ceiling for each persistent
 	// BuildKit cache-mount record. It is meaningful only with CacheEndpoint.
 	BuildKitCacheMountLimit config.ByteSize
