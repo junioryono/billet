@@ -1457,6 +1457,7 @@ func (l *Listener) destroyAll(ctx context.Context) map[int64]bool {
 				return
 			}
 
+			lease, outcome, _ := l.completionRelease(requestID)
 			err := l.destroyCompleted(ctx, job)
 
 			// CUSTODY DISCHARGES THE OBLIGATION RATHER THAN FAILING IT (#46).
@@ -1474,6 +1475,8 @@ func (l *Listener) destroyAll(ctx context.Context) map[int64]bool {
 			held := errors.Is(err, ErrCustody)
 			if held {
 				l.forgetCompletion(ctx, job)
+			} else if err == nil && lease != nil {
+				l.recordReleaseOnly(ctx, job, lease, outcome)
 			}
 
 			mu.Lock()
@@ -1565,7 +1568,9 @@ func (l *Listener) attempt(ctx context.Context, job Job) {
 
 	if entry.releaseOnly {
 		l.mu.Unlock()
-		l.releaseParked(ctx, job.RequestID)
+		if handled, settled := l.releaseParked(ctx, job.RequestID); handled && settled {
+			l.forgetCompletion(ctx, job)
+		}
 
 		return
 	}
@@ -2564,6 +2569,34 @@ func (l *Listener) recordCompletion(ctx context.Context, job Job) error {
 	return nil
 }
 
+// recordReleaseOnly makes successful node teardown durable before the local
+// lease release is attempted. It deliberately outlives cancellation for one
+// bounded local-write budget: otherwise shutdown would preserve a row that asks
+// restart recovery to contact a node for compute already proved absent.
+func (l *Listener) recordReleaseOnly(
+	ctx context.Context,
+	job Job,
+	lease *alloc.Lease,
+	outcome alloc.Phase,
+) {
+	if l.completionStore == nil || job.Result == "" || lease == nil {
+		return
+	}
+	if outcome == "" {
+		outcome = alloc.PhaseDone
+	}
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), l.releaseGrace)
+	defer cancel()
+	completion := state.PendingCompletion{
+		Tier: l.tier, RequestID: job.RequestID, RunID: job.RunID, Result: job.Result,
+		LeaseID: lease.ID, LeaseEpoch: lease.Epoch, Outcome: string(outcome), ReleaseOnly: true,
+	}
+	if err := l.completionStore.PutPendingCompletion(persistCtx, completion); err != nil {
+		l.log.Error("compute was confirmed absent, but its release-only obligation could not be made durable; this process will still release it, while restart recovery may safely repeat teardown",
+			"tier", l.tier, "request", job.RequestID, "lease", lease.ID, "error", err)
+	}
+}
+
 // completionRelease snapshots the capacity obligation before GitHub's message
 // can be acknowledged. A node teardown and a ledger release are one ordered
 // completion; restart recovery needs the fenced lease identity to finish the
@@ -2690,7 +2723,7 @@ func (l *Listener) complete(ctx context.Context, job Job) {
 	// the code that would resolve the quarantine has nothing left to name. The
 	// capacity stays charged until a node happens to report an inventory, or
 	// forever if that node never comes back.
-	before := l.leaseFor(job.RequestID)
+	before, beforeOutcome, _ := l.completionRelease(job.RequestID)
 
 	if err := l.destroyCompleted(ctx, job); err != nil {
 		// THE RUNNER IS HOLDING IT, SO THIS LISTENER LETS GO (#46).
@@ -2793,6 +2826,12 @@ func (l *Listener) complete(ctx context.Context, job Job) {
 
 		return
 	}
+
+	durableLease, durableOutcome, _ := l.completionRelease(job.RequestID)
+	if durableLease == nil {
+		durableLease, durableOutcome = before, beforeOutcome
+	}
+	l.recordReleaseOnly(ctx, job, durableLease, durableOutcome)
 
 	l.mu.Lock()
 

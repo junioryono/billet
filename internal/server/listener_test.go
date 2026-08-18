@@ -2181,13 +2181,19 @@ func TestCompletionRestoresItsLeaseWhenReleaseIsInterruptedAfterDestroy(t *testi
 		t.Fatalf("PendingCompletions after failed release: %v", err)
 	}
 	if len(pending) != 1 || pending[0].LeaseID != lease.ID ||
-		pending[0].LeaseEpoch != lease.Epoch || pending[0].Outcome != string(alloc.PhaseDone) {
-		t.Fatalf("interrupted release obligation = %+v, want lease %s epoch %d outcome done",
+		pending[0].LeaseEpoch != lease.Epoch || pending[0].Outcome != string(alloc.PhaseDone) ||
+		!pending[0].ReleaseOnly {
+		t.Fatalf("interrupted release obligation = %+v, want release-only lease %s epoch %d outcome done",
 			pending, lease.ID, lease.Epoch)
 	}
 
+	var repeatedDestroys atomic.Int32
 	restarted := NewListener(a, tiers[0].Label, &fakeSession{}, WithCompletionStore(db),
-		WithCleanupRetryPacing(0, 0), WithRunner(&fakeRunner{}))
+		WithCleanupRetryPacing(0, 0), WithRunner(&fakeRunner{onDestroyCompleted: func(int64, string) error {
+			repeatedDestroys.Add(1)
+
+			return nil
+		}}))
 	if err := restarted.restoreCompletions(t.Context()); err != nil {
 		t.Fatalf("restoreCompletions: %v", err)
 	}
@@ -2205,6 +2211,9 @@ func TestCompletionRestoresItsLeaseWhenReleaseIsInterruptedAfterDestroy(t *testi
 	}
 	if usage.Leases != 0 {
 		t.Fatalf("restored completion left %d leases consuming capacity", usage.Leases)
+	}
+	if repeatedDestroys.Load() != 0 {
+		t.Fatalf("restored release-only completion repeated node teardown %d times", repeatedDestroys.Load())
 	}
 }
 
@@ -2231,12 +2240,17 @@ func TestShutdownRetainsACompletionUntilItsCapacityReleaseSettles(t *testing.T) 
 	if err != nil {
 		t.Fatalf("PendingCompletions after shutdown release failure: %v", err)
 	}
-	if len(pending) != 1 || pending[0].LeaseID != lease.ID {
-		t.Fatalf("shutdown lost its release obligation: %+v, want lease %s", pending, lease.ID)
+	if len(pending) != 1 || pending[0].LeaseID != lease.ID || !pending[0].ReleaseOnly {
+		t.Fatalf("shutdown lost its release-only obligation: %+v, want lease %s", pending, lease.ID)
 	}
 
+	var repeatedDestroys atomic.Int32
 	restarted := NewListener(a, tiers[0].Label, &fakeSession{}, WithCompletionStore(db),
-		WithCleanupRetryPacing(0, 0), WithRunner(&fakeRunner{}))
+		WithCleanupRetryPacing(0, 0), WithRunner(&fakeRunner{onDestroyCompleted: func(int64, string) error {
+			repeatedDestroys.Add(1)
+
+			return nil
+		}}))
 	if err := restarted.restoreCompletions(t.Context()); err != nil {
 		t.Fatalf("restoreCompletions after shutdown: %v", err)
 	}
@@ -2247,6 +2261,9 @@ func TestShutdownRetainsACompletionUntilItsCapacityReleaseSettles(t *testing.T) 
 	}
 	if len(pending) != 0 {
 		t.Fatalf("settled shutdown release retained its durable obligation: %+v", pending)
+	}
+	if repeatedDestroys.Load() != 0 {
+		t.Fatalf("restored shutdown release repeated node teardown %d times", repeatedDestroys.Load())
 	}
 }
 
