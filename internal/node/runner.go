@@ -879,13 +879,12 @@ func (r *Runner) Recover(ctx context.Context) error {
 		r.log.Warn("destroying an instance nothing is waiting for",
 			"name", inst.Name, "instance", inst.ID, "lease", leaseID, "running", inst.Running)
 
-		// NOT COUNTED AS A FAILURE IF THE BACKEND MERELY ACCEPTED IT. The
-		// difference matters here only for the message: this instance's lease is
-		// already terminal, so its capacity is back whatever happens next, and the
-		// host stays over-committed by its size until it actually goes. Reporting
-		// that as a failed destroy would make every startup on an EC2 host refuse
-		// to admit work for something that is on its way out; the sweep sees it
-		// again in seconds and finishes the job.
+		// AN UNCONFIRMED TEARDOWN IS NOT COUNTED AS A FAILURE. The difference matters
+		// here only for the message: this instance's lease is already terminal, so
+		// its capacity is back whatever happens next, and the host stays
+		// over-committed by its size until it actually goes. Reporting that as a
+		// failed destroy would make every startup on an EC2 host refuse to admit work
+		// while the outcome is uncertain; a later inventory reconciles it.
 		state, err := r.provider.Destroy(ctx, inst.ID)
 		if err != nil {
 			failed++
