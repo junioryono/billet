@@ -733,6 +733,34 @@ func openState(t *testing.T) *state.DB {
 	return db
 }
 
+// failingCompletionStore rejects a configurable suffix of completion writes.
+type failingCompletionStore struct {
+	completionStore
+	puts     atomic.Int32
+	failFrom int32
+	failing  atomic.Bool
+}
+
+// newFailingCompletionStore starts rejecting writes at the numbered call.
+func newFailingCompletionStore(store completionStore, failFrom int32) *failingCompletionStore {
+	f := &failingCompletionStore{completionStore: store, failFrom: failFrom}
+	f.failing.Store(true)
+
+	return f
+}
+
+// PutPendingCompletion fails the configured write suffix and delegates earlier writes.
+func (f *failingCompletionStore) PutPendingCompletion(
+	ctx context.Context,
+	completion state.PendingCompletion,
+) error {
+	if write := f.puts.Add(1); f.failing.Load() && write >= f.failFrom {
+		return errors.New("injected pending-completion write failure")
+	}
+
+	return f.completionStore.PutPendingCompletion(ctx, completion)
+}
+
 func newAllocator(t *testing.T, limits alloc.Limits, tiers []config.Tier,
 	opts ...alloc.Option,
 ) *alloc.Allocator {
@@ -2217,6 +2245,61 @@ func TestCompletionRestoresItsLeaseWhenReleaseIsInterruptedAfterDestroy(t *testi
 	}
 }
 
+func TestCompletionDoesNotReleaseUntilReleaseOnlyTransitionIsDurable(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, tiers)
+	db := openState(t)
+	store := newFailingCompletionStore(db, 2)
+	job := Job{RequestID: 76, RunID: 86, Result: "Succeeded"}
+	var destroys atomic.Int32
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, withCompletionStore(store),
+		WithCleanupRetryPacing(0, 0), WithRunner(&fakeRunner{onDestroyCompleted: func(int64, string) error {
+			destroys.Add(1)
+
+			return nil
+		}}))
+	holdRunning(t, l, a, tiers[0].Label, job.RequestID)
+	if err := l.recordCompletion(t.Context(), job); err != nil {
+		t.Fatalf("recordCompletion: %v", err)
+	}
+
+	l.complete(t.Context(), job)
+	usage, err := a.Usage(t.Context())
+	if err != nil {
+		t.Fatalf("Usage after release-only write failure: %v", err)
+	}
+	if usage.Leases != 1 {
+		t.Fatalf("release-only write failure left %d leases, want the original lease held", usage.Leases)
+	}
+	pending, err := db.PendingCompletions(t.Context(), tiers[0].Label)
+	if err != nil {
+		t.Fatalf("PendingCompletions after release-only write failure: %v", err)
+	}
+	if len(pending) != 1 || pending[0].ReleaseOnly {
+		t.Fatalf("failed second write changed the original durable completion: %+v", pending)
+	}
+
+	store.failing.Store(false)
+	l.retryCleanup(t.Context())
+	usage, err = a.Usage(t.Context())
+	if err != nil {
+		t.Fatalf("Usage after release-only retry: %v", err)
+	}
+	if usage.Leases != 0 {
+		t.Fatalf("durable release-only retry left %d leases", usage.Leases)
+	}
+	if destroys.Load() != 1 {
+		t.Fatalf("release-only retry destroyed compute %d times, want once", destroys.Load())
+	}
+	pending, err = db.PendingCompletions(t.Context(), tiers[0].Label)
+	if err != nil {
+		t.Fatalf("PendingCompletions after release-only retry: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("release-only retry retained its durable completion: %+v", pending)
+	}
+}
+
 func TestShutdownRetainsACompletionUntilItsCapacityReleaseSettles(t *testing.T) {
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
 	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, tiers)
@@ -2264,6 +2347,70 @@ func TestShutdownRetainsACompletionUntilItsCapacityReleaseSettles(t *testing.T) 
 	}
 	if repeatedDestroys.Load() != 0 {
 		t.Fatalf("restored shutdown release repeated node teardown %d times", repeatedDestroys.Load())
+	}
+}
+
+func TestShutdownDoesNotReleaseUntilReleaseOnlyTransitionIsDurable(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, tiers)
+	db := openState(t)
+	store := newFailingCompletionStore(db, 2)
+	job := Job{RequestID: 77, RunID: 87, Result: "Succeeded"}
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, withCompletionStore(store),
+		WithRunner(&fakeRunner{}))
+	holdRunning(t, l, a, tiers[0].Label, job.RequestID)
+	if err := l.recordCompletion(t.Context(), job); err != nil {
+		t.Fatalf("recordCompletion: %v", err)
+	}
+	if err := l.restoreCompletions(t.Context()); err != nil {
+		t.Fatalf("restoreCompletions: %v", err)
+	}
+
+	destroyed := l.destroyAll(t.Context())
+	l.releaseAll(t.Context(), destroyed)
+	usage, err := a.Usage(t.Context())
+	if err != nil {
+		t.Fatalf("Usage after shutdown release-only write failure: %v", err)
+	}
+	if usage.Leases != 1 {
+		t.Fatalf("shutdown released capacity before persistence, leaving %d leases", usage.Leases)
+	}
+	pending, err := db.PendingCompletions(t.Context(), tiers[0].Label)
+	if err != nil {
+		t.Fatalf("PendingCompletions after shutdown write failure: %v", err)
+	}
+	if len(pending) != 1 || pending[0].ReleaseOnly {
+		t.Fatalf("failed shutdown writes changed the original durable completion: %+v", pending)
+	}
+
+	store.failing.Store(false)
+	var restartDestroys atomic.Int32
+	restarted := NewListener(a, tiers[0].Label, &fakeSession{}, withCompletionStore(store),
+		WithCleanupRetryPacing(0, 0), WithRunner(&fakeRunner{onDestroyCompleted: func(int64, string) error {
+			restartDestroys.Add(1)
+
+			return nil
+		}}))
+	if err := restarted.restoreCompletions(t.Context()); err != nil {
+		t.Fatalf("restoreCompletions after shutdown write failure: %v", err)
+	}
+	restarted.retryCleanup(t.Context())
+	usage, err = a.Usage(t.Context())
+	if err != nil {
+		t.Fatalf("Usage after restarted shutdown recovery: %v", err)
+	}
+	if usage.Leases != 0 {
+		t.Fatalf("restarted shutdown recovery left %d leases", usage.Leases)
+	}
+	if restartDestroys.Load() != 1 {
+		t.Fatalf("restarted pre-transition completion destroyed compute %d times, want once", restartDestroys.Load())
+	}
+	pending, err = db.PendingCompletions(t.Context(), tiers[0].Label)
+	if err != nil {
+		t.Fatalf("PendingCompletions after restarted shutdown recovery: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("restarted shutdown recovery retained its durable completion: %+v", pending)
 	}
 }
 

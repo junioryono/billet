@@ -60,6 +60,13 @@ type CompletionAwareRunner interface {
 	DestroyCompleted(ctx context.Context, requestID int64, result string) error
 }
 
+// completionStore is the durable half of result-dependent teardown.
+type completionStore interface {
+	PutPendingCompletion(context.Context, state.PendingCompletion) error
+	DeletePendingCompletion(context.Context, string, int64) error
+	PendingCompletions(context.Context, string) ([]state.PendingCompletion, error)
+}
+
 // Sweeper is a Runner that can also find compute nothing is asking about.
 //
 // Optional, and asserted for rather than required: Launch and Destroy are
@@ -254,7 +261,7 @@ type Listener struct {
 	runner Runner
 	// completionStore keeps authoritative job results across an ACK followed by a
 	// process stop, until the node accepts result-dependent teardown.
-	completionStore *state.DB
+	completionStore completionStore
 
 	// TotalAssignedJobs is the documented scaling signal; counting messages is
 	// not, because a response carries at most 50 and a large backlog is truncated.
@@ -317,7 +324,12 @@ func WithRunner(r Runner) Option {
 // WithCompletionStore makes result delivery and its capacity settlement durable
 // across listener restarts.
 func WithCompletionStore(db *state.DB) Option {
-	return func(l *Listener) { l.completionStore = db }
+	return withCompletionStore(db)
+}
+
+// withCompletionStore admits a fault-injecting store in package tests.
+func withCompletionStore(store completionStore) Option {
+	return func(l *Listener) { l.completionStore = store }
 }
 
 // promise is escrow held for a request GitHub has been told billet will run, and
@@ -1473,14 +1485,20 @@ func (l *Listener) destroyAll(ctx context.Context) map[int64]bool {
 			// destroy, but it IS a request that no longer needs anything from this
 			// listener, which is what the caller reads this map for.
 			held := errors.Is(err, ErrCustody)
+			persisted := true
 			if held {
 				l.forgetCompletion(ctx, job)
 			} else if err == nil && lease != nil {
-				l.recordReleaseOnly(ctx, job, lease, outcome)
+				if persistErr := l.recordReleaseOnly(ctx, job, lease, outcome); persistErr != nil {
+					persisted = false
+					l.parkReleaseOnly(job, lease, outcome)
+					l.log.Error("compute was confirmed absent, but its release-only obligation could not be made durable; capacity stays held until this is retried",
+						"tier", l.tier, "request", requestID, "lease", lease.ID, "error", persistErr)
+				}
 			}
 
 			mu.Lock()
-			done[requestID] = err == nil || held
+			done[requestID] = (err == nil && persisted) || held
 			mu.Unlock()
 
 			if held {
@@ -2514,11 +2532,25 @@ func (l *Listener) releaseParked(ctx context.Context, requestID int64) (bool, bo
 	}
 
 	lease := entry.lease
+	job := entry.job
 	outcome := entry.outcome
 	if outcome == "" {
 		outcome = alloc.PhaseDone
 	}
 	l.mu.Unlock()
+
+	if err := l.recordReleaseOnly(ctx, job, lease, outcome); err != nil {
+		l.mu.Lock()
+		current, stillPending := l.cleanup[requestID]
+		if stillPending && current == entry {
+			entry.failed(time.Now(), l.retryFirst, l.retryMax)
+		}
+		l.mu.Unlock()
+		l.log.Error("compute is confirmed absent, but capacity stays held until its release-only obligation is durable",
+			"tier", l.tier, "request", requestID, "lease", lease.ID, "error", err)
+
+		return true, false
+	}
 
 	relErr := l.releaseAbsent(ctx, requestID, lease, outcome)
 
@@ -2578,9 +2610,9 @@ func (l *Listener) recordReleaseOnly(
 	job Job,
 	lease *alloc.Lease,
 	outcome alloc.Phase,
-) {
+) error {
 	if l.completionStore == nil || job.Result == "" || lease == nil {
-		return
+		return nil
 	}
 	if outcome == "" {
 		outcome = alloc.PhaseDone
@@ -2592,9 +2624,39 @@ func (l *Listener) recordReleaseOnly(
 		LeaseID: lease.ID, LeaseEpoch: lease.Epoch, Outcome: string(outcome), ReleaseOnly: true,
 	}
 	if err := l.completionStore.PutPendingCompletion(persistCtx, completion); err != nil {
-		l.log.Error("compute was confirmed absent, but its release-only obligation could not be made durable; this process will still release it, while restart recovery may safely repeat teardown",
-			"tier", l.tier, "request", job.RequestID, "lease", lease.ID, "error", err)
+		return fmt.Errorf("server: preserve release-only completion for %s request %d: %w",
+			l.tier, job.RequestID, err)
 	}
+
+	return nil
+}
+
+// parkReleaseOnly retains capacity whose compute is gone until persistence and
+// allocator release both settle.
+func (l *Listener) parkReleaseOnly(job Job, lease *alloc.Lease, outcome alloc.Phase) {
+	if lease == nil {
+		return
+	}
+	if outcome == "" {
+		outcome = alloc.PhaseDone
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.cleanup == nil {
+		l.cleanup = make(map[int64]*pendingCleanup)
+	}
+	entry := l.cleanup[job.RequestID]
+	if entry == nil {
+		entry = &pendingCleanup{job: job}
+		l.cleanup[job.RequestID] = entry
+	} else if job.Result != "" {
+		entry.job = job
+	}
+	entry.lease = lease
+	entry.outcome = outcome
+	entry.releaseOnly = true
+	entry.failed(time.Now(), l.retryFirst, l.retryMax)
 }
 
 // completionRelease snapshots the capacity obligation before GitHub's message
@@ -2831,7 +2893,13 @@ func (l *Listener) complete(ctx context.Context, job Job) {
 	if durableLease == nil {
 		durableLease, durableOutcome = before, beforeOutcome
 	}
-	l.recordReleaseOnly(ctx, job, durableLease, durableOutcome)
+	if err := l.recordReleaseOnly(ctx, job, durableLease, durableOutcome); err != nil {
+		l.parkReleaseOnly(job, durableLease, durableOutcome)
+		l.log.Error("compute was confirmed absent, but its release-only obligation could not be made durable; capacity stays held until this is retried",
+			"tier", l.tier, "request", job.RequestID, "lease", durableLease.ID, "error", err)
+
+		return
+	}
 
 	l.mu.Lock()
 
@@ -3089,6 +3157,12 @@ func (l *Listener) releaseAll(ctx context.Context, destroyed map[int64]bool) {
 		outcome := entry.outcome
 		if outcome == "" {
 			outcome = alloc.PhaseDone
+		}
+		if err := l.recordReleaseOnly(ctx, entry.job, entry.lease, outcome); err != nil {
+			l.log.Warn("not releasing cleanup capacity because its release-only obligation is not durable",
+				"tier", l.tier, "request", id, "lease", entry.lease.ID, "error", err)
+
+			continue
 		}
 		err := l.releaseAbsent(ctx, id, entry.lease, outcome)
 		if err != nil {
