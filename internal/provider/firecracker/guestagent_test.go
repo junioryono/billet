@@ -166,6 +166,20 @@ func TestTheGuestMountsDockerStateBeforeStartingTheDaemon(t *testing.T) {
 	}
 }
 
+func TestTheGuestImageIncludesBuildxForThePersistentBuilder(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join("..", "..", "..", "scripts", "build-guest-image.sh")
+	source, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read guest image builder: %v", err)
+	}
+
+	if !strings.Contains(string(source), "docker.io docker-buildx") {
+		t.Fatal("the guest installs Docker without the Buildx CLI required by setup-docker-builder")
+	}
+}
+
 func TestRegistryMirrorsRemainAStringLeafInGuestMetadata(t *testing.T) {
 	t.Parallel()
 
