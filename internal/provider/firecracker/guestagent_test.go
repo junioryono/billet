@@ -209,6 +209,23 @@ func TestTheGuestImageGateKeepsDockerBehindTheCacheMount(t *testing.T) {
 	if strings.Contains(text, "for unit in docker.service billet-agent.service") {
 		t.Fatal("the image gate still requires Docker to start before the billet agent mounts its cache")
 	}
+
+	bootPath := filepath.Join("..", "..", "..", "scripts", "boot-guest-image.sh")
+	bootSource, err := os.ReadFile(bootPath)
+	if err != nil {
+		t.Fatalf("read guest image boot gate: %v", err)
+	}
+	bootText := string(bootSource)
+
+	if !strings.Contains(bootText, "docker_started=0") ||
+		!strings.Contains(bootText, `grep -q "Started.*docker.service" "$CONSOLE" 2>/dev/null && docker_started=1`) ||
+		!strings.Contains(bootText, `[ "$docker_started" -ne 0 ]`) {
+		t.Fatal("the boot gate does not reject Docker starting before the billet agent accepts its metadata")
+	}
+	if strings.Contains(bootText, "saw_docker") ||
+		strings.Contains(bootText, `report "$saw_docker" "docker started"`) {
+		t.Fatal("the boot gate still requires Docker to start before the billet agent mounts its cache")
+	}
 }
 
 func TestRegistryMirrorsRemainAStringLeafInGuestMetadata(t *testing.T) {
