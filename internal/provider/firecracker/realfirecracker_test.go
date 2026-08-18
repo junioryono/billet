@@ -39,6 +39,7 @@ func TestRealFirecrackerLaunchAndDestroy(t *testing.T) {
 	// A UNIQUE LEASE PER RUN, because the jailer refuses an id whose chroot
 	// survives — which is exactly what a previous failed run leaves behind.
 	name := provider.InstanceName(env.lease)
+	rootCapacity := env.disk.growthCapacity(t, env.image)
 
 	t.Cleanup(func() {
 		// WithoutCancel: the test context is done by the time cleanup runs, and a
@@ -53,7 +54,7 @@ func TestRealFirecrackerLaunchAndDestroy(t *testing.T) {
 		Image:     env.image,
 		VCPU:      2,
 		Memory:    1 * config.GiB,
-		Disk:      8 * config.GiB,
+		Disk:      rootCapacity,
 		Command:   []string{"./run.sh"},
 		Trust:     provider.TrustTrusted,
 		JITConfig: "not-a-real-registration",
@@ -66,9 +67,9 @@ func TestRealFirecrackerLaunchAndDestroy(t *testing.T) {
 	// This is the assertion the whole design turned on, and it can only be made
 	// against the real jailer: a fake would agree with whatever billet computed.
 	j := p.jailFor(name)
-	if got := ext4Size(t, j.rootDiskPath()); got < int64(8*config.GiB) {
+	if got := ext4Size(t, j.rootDiskPath()); got < int64(rootCapacity) {
 		t.Errorf("the root filesystem visible to the guest is %d bytes, want at least %d", got,
-			8*config.GiB)
+			rootCapacity)
 	}
 
 	if _, err := os.Stat(j.socket()); err != nil {
@@ -128,9 +129,10 @@ func TestRealFirecrackerDestroyLeavesNothing(t *testing.T) {
 	}
 
 	name := provider.InstanceName(env.lease)
+	rootCapacity := env.disk.growthCapacity(t, env.image)
 
 	if _, err := p.Launch(t.Context(), provider.Spec{
-		Name: name, Image: env.image, VCPU: 1, Memory: 512 * config.MiB, Disk: 8 * config.GiB,
+		Name: name, Image: env.image, VCPU: 1, Memory: 512 * config.MiB, Disk: rootCapacity,
 		Command: []string{"./run.sh"}, Trust: provider.TrustTrusted,
 		JITConfig: "not-a-real-registration",
 	}); err != nil {
@@ -251,6 +253,30 @@ func realDisk(t *testing.T) rbdDisk {
 // rbdDisk is the smallest thing that satisfies RootDisk against a live cluster.
 type rbdDisk struct {
 	images, cache, id string
+}
+
+// growthCapacity chooses a test capacity one GiB beyond the source device. Since
+// an ext4 filesystem cannot be larger than its block device, reaching this value
+// proves both RBD and filesystem growth rather than merely accepting a large image.
+func (d rbdDisk) growthCapacity(t *testing.T, image string) config.ByteSize {
+	t.Helper()
+
+	out, err := exec.CommandContext(t.Context(), "rbd", d.args("--format", "json", "info",
+		d.images+"/"+image)...).Output()
+	if err != nil {
+		t.Fatalf("inspect the source image before the growth test: %v", err)
+	}
+	var info struct {
+		Size int64 `json:"size"`
+	}
+	if err := json.Unmarshal(out, &info); err != nil || info.Size <= 0 {
+		t.Fatalf("source image did not report a positive size: %v, %s", err, out)
+	}
+	if info.Size > int64(config.ByteSize(1<<63-1)-config.GiB) {
+		t.Fatalf("source image is too large to request a growth probe: %d", info.Size)
+	}
+
+	return config.ByteSize(info.Size) + config.GiB
 }
 
 func (d rbdDisk) args(rest ...string) []string {

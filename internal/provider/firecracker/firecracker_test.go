@@ -454,6 +454,11 @@ func TestAZeroRootCapacityKeepsTheBackendDefault(t *testing.T) {
 	if vmm == nil {
 		t.Fatal("Launch did not start the vmm")
 	}
+	h.disk.mu.Lock()
+	if len(h.disk.cloneSizes) != 1 || h.disk.cloneSizes[0] != 0 {
+		t.Errorf("backend-default clone capacities = %v, want exactly [0]", h.disk.cloneSizes)
+	}
+	h.disk.mu.Unlock()
 
 	for _, run := range h.commands() {
 		if run.bin == resize2fsBinary {

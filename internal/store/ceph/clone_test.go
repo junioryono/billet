@@ -181,6 +181,10 @@ func TestARootDiskCloneIsGrownToTheTierCapacityBeforeItIsMapped(t *testing.T) {
 		t.Fatalf("CloneRoot: %v", err)
 	}
 
+	// JSON IS PART OF THE COMMAND CONTRACT. Without it rbd prints a human table,
+	// json.Unmarshal fails, and every explicit-capacity launch stops here.
+	f.ran(t, "--format", "json", "info", "billet-cache/billet-abc")
+
 	resize := f.ran(t, "resize", "--size", "20480M", "billet-cache/billet-abc")
 	if got := resize[len(resize)-1]; got != "billet-cache/billet-abc" {
 		t.Errorf("resize targeted %q rather than the per-job clone", got)
