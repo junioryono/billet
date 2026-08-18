@@ -83,6 +83,31 @@ func TestJavaScriptActionsParseOnTheRunnersNodeRuntime(t *testing.T) {
 	}
 }
 
+func TestJavaScriptActionsUseTheCurrentRunnerRuntime(t *testing.T) {
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+
+		body, err := os.ReadFile(filepath.Join(entry.Name(), "action.yml"))
+		if err != nil {
+			t.Fatalf("read %s/action.yml: %v", entry.Name(), err)
+		}
+		var metadata action
+		if err := yaml.Unmarshal(body, &metadata); err != nil {
+			t.Fatalf("parse %s/action.yml: %v", entry.Name(), err)
+		}
+		if strings.HasSuffix(metadata.Runs.Main, ".js") && metadata.Runs.Using != "node24" {
+			t.Errorf("%s JavaScript action uses %q, want node24", entry.Name(), metadata.Runs.Using)
+		}
+	}
+}
+
 func TestTheBuilderUsesUpstreamBuildPushRatherThanVendoringIt(t *testing.T) {
 	body, err := os.ReadFile(filepath.Join("build-push-action", "action.yml"))
 	if err != nil {
