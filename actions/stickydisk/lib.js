@@ -87,7 +87,7 @@ async function credentials() {
   return { endpoint: endpoint.trim(), token: cacheToken.trim() };
 }
 
-async function cacheCall(endpoint, token, path, body) {
+async function cacheCall(endpoint, token, path, body, timeout = 120000) {
   const url = new URL(path, endpoint.endsWith("/") ? endpoint : `${endpoint}/`);
   const encoded = body === undefined ? undefined : JSON.stringify(body);
   const response = await request(url, {
@@ -96,7 +96,7 @@ async function cacheCall(endpoint, token, path, body) {
       Authorization: `Bearer ${token}`,
       ...(encoded === undefined ? {} : { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(encoded) }),
     },
-    timeout: 120000,
+    timeout,
   }, encoded);
   return JSON.parse(response);
 }

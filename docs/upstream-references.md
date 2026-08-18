@@ -173,3 +173,5 @@ Two rules learned building it:
   `rbd snap protect`, which on a clone-v2 cluster is unnecessary and on a clone-v1 one makes the
   snapshot undeletable while any clone is live; and the `rbd` man page lists `journaling` among the
   features the kernel client supports, while `rbd device map` refuses an image that has it.
+
+  **Clone chains need an explicit bound.** Ceph's layering documentation says each clone retains a reference to its parent and that severing the reference requires copying the shared blocks; Ceph CSI consequently documents a soft depth of four and a hard depth of eight. Measured on the reference cluster, `rbd cp source@snapshot destination` completed as an independent format-2 image whose JSON carried no parent, and the source stayed intact until the copy was ready. Billet uses that non-mutating copy at depth eight: unlike flattening a candidate in place, a crash cannot alter the published generation, and old ancestors become reclaimable while the new current generation remains active.
