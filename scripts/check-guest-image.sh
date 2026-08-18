@@ -300,9 +300,10 @@ fi
 # the daemon. Letting either Docker unit autostart opens the daemon on the root
 # filesystem first and makes the later cache mount unsafe.
 WANTS="$MNT/etc/systemd/system/multi-user.target.wants"
+DOCKER_SOCKET="$MNT/etc/systemd/system/sockets.target.wants/docker.socket"
 
-if [ -e "$WANTS/docker.service" ] ||
-	[ -e "$MNT/etc/systemd/system/sockets.target.wants/docker.socket" ]; then
+if [ -L "$WANTS/docker.service" ] || [ -e "$WANTS/docker.service" ] ||
+	[ -L "$DOCKER_SOCKET" ] || [ -e "$DOCKER_SOCKET" ]; then
 	fail "Docker service or socket activation is enabled; it can start before the billet
         agent mounts the image store"
 else
