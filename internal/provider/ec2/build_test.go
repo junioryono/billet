@@ -259,12 +259,15 @@ func TestTheJobStartHookHasASupportedScriptExtension(t *testing.T) {
 	t.Parallel()
 
 	got := mustScript(t)
-	path := "/usr/local/bin/billet-job-started.sh"
+
+	if ext := filepath.Ext(jobTimingHookPath); ext != ".sh" {
+		t.Fatalf("the job-start hook extension is %q, want .sh; GitHub will refuse it", ext)
+	}
 
 	for _, fragment := range []string{
-		"cat > " + path,
-		"chmod 0755 " + path,
-		"ACTIONS_RUNNER_HOOK_JOB_STARTED=" + path,
+		"cat > " + jobTimingHookPath + " <<'BILLETJOBEOF'\n",
+		"chmod 0755 " + jobTimingHookPath + "\n",
+		"ACTIONS_RUNNER_HOOK_JOB_STARTED=" + jobTimingHookPath + " \\\n",
 	} {
 		if !strings.Contains(got, fragment) {
 			t.Errorf("the image script is missing %q; GitHub refuses an administrator hook "+
