@@ -410,6 +410,57 @@ func TestAFastAcceptedTeardownReleasesOnTheFirstAbsentInventory(t *testing.T) {
 	}
 }
 
+// A backend that could not observe the target while asking for teardown has not
+// supplied the causal evidence the fast path depends on.
+//
+// EC2 can return NotFound for an id RunInstances just returned. The instance may
+// then be absent from the first inventory read too, before it materialises. That
+// pair of misses is one eventually-consistent observation, not proof that the
+// guest stopped, so the lease must survive until the instance is seen or the
+// ordinary stray grace elapses.
+func TestAnUnobservedTeardownKeepsCapacityAcrossTheFirstAbsentInventory(t *testing.T) {
+	p := &fakeProvider{
+		kind:               config.ProviderDocker,
+		asyncTeardown:      true,
+		teardownUnobserved: true,
+	}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
+	lease := assignedLease(t, a)
+
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 12, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	if err := r.Destroy(t.Context(), 12); !errors.Is(err, server.ErrCustody) {
+		t.Fatalf("Destroy = %v, want ErrCustody", err)
+	}
+
+	name := provider.InstanceName(lease.ID)
+	inst := p.live[name]
+	delete(p.live, name)
+
+	if err := r.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend after the eventually-consistent miss: %v", err)
+	}
+	if held, err := a.Lease(t.Context(), lease.ID); err != nil {
+		t.Fatalf("the first miss released capacity for an instance that can still appear: %v", err)
+	} else if held.Phase.Terminal() {
+		t.Fatalf("the first miss terminalized an unobserved teardown as %s", held.Phase)
+	}
+
+	p.add(inst)
+	if err := r.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend after the instance materialised: %v", err)
+	}
+	p.settle(name)
+	if err := r.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend after the observed instance stopped: %v", err)
+	}
+	if _, err := a.Lease(t.Context(), lease.ID); !errors.Is(err, alloc.ErrLeaseNotFound) {
+		t.Fatalf("the observed instance is gone but its capacity is still held: %v", err)
+	}
+}
+
 // A held teardown is visible in the ledger, and a force release is delivered to
 // the live node through its heartbeat. The node drops custody before the lease
 // becomes terminal; it does not need a working provider read after an operator
@@ -803,6 +854,9 @@ type fakeProvider struct {
 	// about, and no other fake in this suite has it — every one of them destroys
 	// synchronously, which is why the gap survived so long.
 	asyncTeardown bool
+	// teardownUnobserved models EC2's eventually-consistent NotFound: teardown is
+	// idempotently requested, but the backend did not observe the target.
+	teardownUnobserved bool
 
 	// live is what the backend is actually running, keyed by name. A map rather
 	// than a counter because Find and List have to agree with Launch and Destroy:
@@ -999,7 +1053,11 @@ func (f *fakeProvider) Destroy(ctx context.Context, id string) (provider.Teardow
 	// and merely returned a different enum would agree with the bug, because
 	// every later observation would say "gone" no matter what the code believed.
 	if f.asyncTeardown {
-		return provider.TeardownRequested, nil
+		if f.teardownUnobserved {
+			return provider.TeardownRequested, nil
+		}
+
+		return provider.TeardownObserved, nil
 	}
 
 	for name, inst := range f.live {

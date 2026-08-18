@@ -1381,9 +1381,9 @@ func TestDestroyDoesNotClaimTheGuestHasStopped(t *testing.T) {
 		t.Fatalf("Destroy: %v", err)
 	}
 
-	if state == provider.TeardownStopped {
-		t.Error("a terminate request AWS merely accepted was reported as a guest that has stopped; " +
-			"the lease is released on that and the guest keeps running for a minute or two")
+	if state != provider.TeardownObserved {
+		t.Errorf("an accepted terminate request = %s, want observed; the caller needs to know AWS "+
+			"saw this instance without treating it as stopped", state)
 	}
 }
 
@@ -1409,9 +1409,9 @@ func TestDestroyDoesNotTreatNotFoundAsProofTheInstanceIsGone(t *testing.T) {
 		t.Fatalf("Destroy: %v", err)
 	}
 
-	if state == provider.TeardownStopped {
-		t.Error("an eventually-consistent NotFound was reported as proof the instance is gone; " +
-			"a destroy shortly after a launch gets that answer for an instance that is booting")
+	if state != provider.TeardownRequested {
+		t.Errorf("an eventually-consistent NotFound = %s, want requested; a destroy shortly after "+
+			"launch gets that answer for an instance that is booting", state)
 	}
 }
 

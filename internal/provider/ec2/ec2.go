@@ -1358,13 +1358,16 @@ func (p *Provider) Destroy(ctx context.Context, id string) (provider.Teardown, e
 
 	// "REQUESTED", because that is what happened. Logging "terminated" here is the
 	// same conflation this function's comment exists to correct — the machine is
-	// still running for a minute or two afterwards.
+	// still running for a minute or two afterwards. The return says OBSERVED as
+	// well: unlike the NotFound path above, AWS found this exact instance while
+	// accepting its teardown, so a later absence cannot be a create that has not
+	// materialised yet.
 	p.log.Info("requested instance termination", "instance", id)
 
 	// AND THE RETURN NOW SAYS SO TOO. The log line has been honest about this
 	// since the backend landed while the return value was not, and a caller reads
 	// the return.
-	return provider.TeardownRequested, nil
+	return provider.TeardownObserved, nil
 }
 
 // Find reports the instance with that name, and whether there was one.

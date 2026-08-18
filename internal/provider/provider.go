@@ -294,10 +294,14 @@ func LeaseOf(instanceName string) (string, bool) {
 type Teardown int
 
 const (
-	// TeardownRequested means the backend accepted the request and the compute
-	// may still be running. The capacity stays charged until something else —
-	// a Find that misses, a List that no longer reports it — proves otherwise.
+	// TeardownRequested means teardown is idempotently requested, but the backend
+	// did not observe the target. The compute may still be starting, so an
+	// immediately absent inventory still needs the ordinary stray grace.
 	TeardownRequested Teardown = iota
+	// TeardownObserved means the backend observed the target and accepted an
+	// asynchronous teardown. The compute may still be running, but a later absence
+	// no longer has to account for a create that has not materialised yet.
+	TeardownObserved
 	// TeardownStopped means the compute is CONFIRMED gone. Only a backend whose
 	// teardown is synchronous may return this.
 	TeardownStopped
@@ -307,6 +311,8 @@ func (t Teardown) String() string {
 	switch t {
 	case TeardownStopped:
 		return "stopped"
+	case TeardownObserved:
+		return "observed"
 	case TeardownRequested:
 		return "requested"
 	default:
