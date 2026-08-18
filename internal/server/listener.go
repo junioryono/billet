@@ -1425,8 +1425,8 @@ func (l *Listener) destroyAll(ctx context.Context) map[int64]bool {
 
 			// CUSTODY DISCHARGES THE OBLIGATION RATHER THAN FAILING IT (#46).
 			//
-			// The node asked its backend to stop the guest, the backend accepted,
-			// and the node is holding the lease until the compute is provably gone.
+			// The node asked its backend to stop the guest without receiving proof it
+			// stopped, and is holding the lease until the compute is provably gone.
 			// Nothing here can improve on that: retrying re-issues a terminate
 			// against a guest already shutting down, and keeping the entry — lease
 			// and all — has this listener releasing capacity the node's janitor is

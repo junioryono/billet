@@ -82,7 +82,7 @@ type custody struct {
 	//
 	// NOT A GUARD AGAINST RE-REQUESTING. The request is re-issued every tick on
 	// purpose: it is idempotent, it costs one call, and it is the only thing that
-	// recovers a teardown a backend accepted and then did not perform.
+	// recovers a teardown a backend did not confirm.
 	asked bool
 
 	// unconfirmed is true while this entry's COMPUTE has not been proved gone.
@@ -91,7 +91,7 @@ type custody struct {
 	// MUST NOT, which is a distinction a bare "is anything held for this request"
 	// cannot make — and getting it wrong breaks a case in either direction:
 	//
-	//	unconfirmed   a teardown was accepted and the guest may still be running.
+	//	unconfirmed   teardown was requested and the guest may still be running.
 	//	              A Destroy for this request must answer ErrCustody, or the
 	//	              caller releases the capacity underneath a live guest (#46).
 	//	confirmed     the compute is gone and only the RELEASE failed — the shape a
@@ -183,7 +183,7 @@ func (r *Runner) hold(lease *alloc.Lease, name string, requestID int64) {
 //
 // THE OUTCOME IS A PARAMETER BECAUSE THERE ARE NOW TWO WAYS TO REACH THIS, and
 // they are recorded differently. A launch that could not be confirmed cleaned up
-// is a FAILURE — nothing ran. A teardown the backend merely accepted (#46) is a
+// is a FAILURE — nothing ran. A teardown the backend could not confirm (#46) is a
 // job that FINISHED, and is only here because EC2 cannot say when its guest
 // stopped. Writing "failed" for the second would put a lie in job_history for
 // every job that completed normally on an EC2 host, and an investigation reading
@@ -201,7 +201,7 @@ func (r *Runner) holdWithOutcome(lease *alloc.Lease, name string, requestID int6
 		outcome:   outcome,
 		phase:     alloc.PhaseTeardown,
 		since:     r.now(),
-		// Not observed. Even an accepted remote teardown can be followed by an
+		// Not observed. Even a remote teardown request can be followed by an
 		// eventually-consistent inventory miss while the guest is still running. A
 		// later sighting sets this, and otherwise the sustained grace must elapse.
 	}
@@ -209,7 +209,7 @@ func (r *Runner) holdWithOutcome(lease *alloc.Lease, name string, requestID int6
 
 	// UNCONFIRMED BY CONSTRUCTION. Both routes here exist because billet could not
 	// establish that a piece of compute is gone — a launch whose cleanup Find could
-	// not confirm, or a teardown a backend merely accepted. Until something proves
+	// not confirm, or a teardown the backend could not confirm. Until something proves
 	// otherwise, a Destroy for this request must not report success.
 	entry.unconfirmed.Store(true)
 
@@ -548,7 +548,7 @@ func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 		c.unconfirmed.Store(true)
 
 		// SAID ONCE, THOUGH THE REQUEST IS RE-ISSUED EVERY TICK. Re-asking is the
-		// safety net for a teardown that was accepted and did not take, and it is
+		// safety net for a teardown that was not confirmed, and it is
 		// idempotent and cheap; saying so on every tick for the minute or two an
 		// EC2 instance spends shutting down is just noise in the one log an
 		// operator reads to find out what a host is holding.

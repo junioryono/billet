@@ -539,7 +539,7 @@ func (r *Runner) destroy(ctx context.Context, requestID int64) error {
 		// idempotent branch. A terminate is idempotent, so re-issuing costs one
 		// call; forgetting the instance costs the capacity of a guest that may
 		// still be running.
-		r.log.Error("a teardown was accepted rather than confirmed and there is no lease "+
+		r.log.Error("a teardown was requested but not confirmed and there is no lease "+
 			"recorded here to hold the capacity with; keeping the instance so this is retried",
 			"name", inst.Name, "request", requestID)
 
@@ -552,14 +552,15 @@ func (r *Runner) destroy(ctx context.Context, requestID int64) error {
 	delete(r.runningLease, requestID)
 	r.mu.Unlock()
 
-	// THE BACKEND ACCEPTED THE REQUEST; IT DID NOT SAY THE GUEST HAD STOPPED (#46).
+	// THE BACKEND DID NOT CONFIRM THE GUEST HAD STOPPED (#46).
 	//
 	// The caller is a listener that releases the lease the moment this returns
 	// nil, and its own comment explains why it destroys first: freeing the
 	// capacity while a guest is still on the host over-commits the machine. That
 	// reasoning was written against a backend whose teardown is synchronous.
-	// EC2's is not — TerminateInstances returns on acceptance and the instance
-	// runs on through `shutting-down` for a minute or two.
+	// EC2's is not — TerminateInstances can return after accepting a request while
+	// the instance runs on through `shutting-down`, and an eventually consistent
+	// NotFound is not proof that it accepted anything.
 	//
 	// And Destroy is reached on paths where the guest is genuinely still working:
 	// a drain, a custody teardown, an operator killing a job. So the failure is
@@ -903,14 +904,14 @@ func (r *Runner) Recover(ctx context.Context) error {
 		// reports a `stopped` instance as NOT running on purpose — so an OPEN
 		// lease whose instance is stopped falls through to here, and this call is
 		// then the thing that actually hands its capacity back. Doing that on a
-		// teardown AWS has only accepted frees the machine before the instance is
+		// teardown AWS has not confirmed frees the machine before the instance is
 		// gone.
 		//
 		// WHAT RESOLVES IT IS NOT THE NEXT SWEEP, and an earlier version of this
 		// comment said it was. Sweep skips any instance whose lease is still open,
 		// which this one's is — that is what put it on this branch. Resolution waits
 		// for the lease to expire into quarantine and for the inventory a later
-		// registration reports, so a teardown AWS accepts and then does not perform
+		// registration reports, so a teardown AWS does not confirm
 		// holds this capacity longer than one sweep interval. #81 tracks that a
 		// held teardown is bounded by nothing.
 		//
@@ -1133,7 +1134,7 @@ func (r *Runner) Sweep(ctx context.Context) error {
 		// does nothing and skipping it costs nothing. The case it exists for is the
 		// other one: the lease went terminal between the two reads, so this call
 		// really would be the thing that hands the capacity back. Doing that on an
-		// accepted-but-unconfirmed teardown frees the machine for another tier
+		// unconfirmed teardown frees the machine for another tier
 		// while the guest is still shutting down.
 		//
 		// The next sweep sees the instance again and finishes the job.
