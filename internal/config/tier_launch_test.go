@@ -46,35 +46,39 @@ func TestMultiProviderTierSelectsEachBackendsLaunch(t *testing.T) {
 func TestMultiProviderTierRefusesOneAmbiguousImage(t *testing.T) {
 	t.Parallel()
 
-	tier := Tier{
-		Providers: []ProviderKind{ProviderFirecracker, ProviderEC2},
-		Image:     "ubuntu-2404-x64@verified",
-	}
+	body := strings.Replace(validConfig, "    provider: firecracker\n",
+		"    providers: [firecracker, ec2]\n", 1)
 
-	errs := tier.LaunchErrors("tier failover")
-	if !errorsContain(errs, "a tier with multiple providers must set launch for each provider") {
-		t.Fatalf("ambiguous image was not refused with a useful diagnostic: %v", errs)
+	_, err := Load(writeConfig(t, body))
+	if err == nil || !strings.Contains(err.Error(),
+		"a tier with multiple providers must set launch for each provider") {
+		t.Fatalf("Load with one ambiguous image = %v, want a useful refusal", err)
 	}
 }
 
 func TestLaunchMapMustMatchTheAcceptedProviders(t *testing.T) {
 	t.Parallel()
 
-	tier := Tier{
-		Providers: []ProviderKind{ProviderFirecracker, ProviderEC2},
-		Launch: map[ProviderKind]TierLaunch{
-			ProviderFirecracker: {Image: "ubuntu-2404-x64@verified"},
-			ProviderDocker:      {Image: "runner:latest"},
-		},
+	body := strings.Replace(validConfig, "    provider: firecracker\n",
+		"    providers: [firecracker, ec2]\n", 1)
+	body = strings.Replace(body, "    image: ubuntu-2404-x64\n", `    launch:
+      firecracker:
+        image: ubuntu-2404-x64@verified
+      docker:
+        image: runner:latest
+`, 1)
+
+	_, err := Load(writeConfig(t, body))
+	if err == nil {
+		t.Fatal("Load accepted a launch map that does not match the tier's providers")
 	}
 
-	errs := tier.LaunchErrors("tier failover")
 	for _, want := range []string{
 		"launch.ec2 is required because the tier accepts ec2",
 		"launch.docker is set, but the tier does not accept docker",
 	} {
-		if !errorsContain(errs, want) {
-			t.Errorf("errors %v do not contain %q", errs, want)
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Load error %v does not contain %q", err, want)
 		}
 	}
 }
@@ -82,32 +86,24 @@ func TestLaunchMapMustMatchTheAcceptedProviders(t *testing.T) {
 func TestLaunchMapRefusesAmbiguousTopLevelBootFields(t *testing.T) {
 	t.Parallel()
 
-	tier := Tier{
-		Provider: ProviderEC2,
-		Image:    "ami-top-level",
-		Command:  []string{"./run.sh"},
-		Launch: map[ProviderKind]TierLaunch{
-			ProviderEC2: {Image: "ami-in-launch"},
-		},
+	body := strings.Replace(validConfig, "    image: ubuntu-2404-x64\n", `    image: ubuntu-2404-x64
+    command: [./custom-runner]
+    launch:
+      firecracker:
+        image: ubuntu-2404-x64@verified
+`, 1)
+
+	_, err := Load(writeConfig(t, body))
+	if err == nil {
+		t.Fatal("Load accepted both top-level and mapped launch fields")
 	}
 
-	errs := tier.LaunchErrors("tier cloud")
 	for _, want := range []string{
 		"set either image or launch, not both",
 		"set commands inside launch when launch is used",
 	} {
-		if !errorsContain(errs, want) {
-			t.Errorf("errors %v do not contain %q", errs, want)
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Load error %v does not contain %q", err, want)
 		}
 	}
-}
-
-func errorsContain(errs []error, want string) bool {
-	for _, err := range errs {
-		if strings.Contains(err.Error(), want) {
-			return true
-		}
-	}
-
-	return false
 }

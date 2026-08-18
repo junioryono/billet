@@ -420,6 +420,52 @@ func TestAProviderChangeBetweenPlacementAndDispatchIsRefused(t *testing.T) {
 	}
 }
 
+// A QUEUED LAUNCH IS STILL BOUND TO THE PROVIDER THAT PLACEMENT SELECTED.
+//
+// Registration keeps commands that no process has taken because nothing may
+// have started yet. If the replacement process uses another backend, those
+// commands are safe to fail but never safe to deliver: their image and command
+// were already rendered for the provider that disappeared.
+func TestAProviderChangeAfterEnqueueRefusesTheStaleLaunch(t *testing.T) {
+	t.Parallel()
+
+	p := testPlane(t, WithPollTimeout(10*time.Millisecond))
+	register(t, p, "worker", config.ProviderDocker)
+
+	p.mu.Lock()
+	n := p.nodes["worker"]
+	pend := &pending{
+		cmd: nodeapi.Command{
+			ID:   "c1",
+			Kind: nodeapi.CommandLaunch,
+			Tier: &nodeapi.TierSpec{Image: "docker-image"},
+		},
+		done:             make(chan nodeapi.CommandResult, 1),
+		expectedProvider: config.ProviderDocker,
+	}
+	n.queue = append(n.queue, pend)
+	p.mu.Unlock()
+
+	register(t, p, "worker", config.ProviderEC2)
+
+	cmd, ok, err := p.Poll(t.Context(), "worker", "")
+	if err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	if ok {
+		t.Fatalf("replacement EC2 process received stale Docker command %+v", cmd)
+	}
+
+	select {
+	case res := <-pend.done:
+		if res.OK || !strings.Contains(res.Error, "changed provider from docker to ec2") {
+			t.Errorf("stale launch result = %+v, want a useful clean failure", res)
+		}
+	default:
+		t.Fatal("the caller was left waiting for a stale launch that cannot be delivered")
+	}
+}
+
 // A pinned lease goes to its node or nowhere.
 //
 // THE OTHER NODE ANSWERS, and that detail is the test. An earlier version left

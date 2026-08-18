@@ -1377,35 +1377,49 @@ func supersededLocked(n *node, name, incarnation string) error {
 		ErrSuperseded, name, n.incarnation, incarnation)
 }
 
-// takeLocked moves the head of the queue into flight, recording who took it.
+// takeLocked moves the first eligible command into flight, recording who took
+// it. A launch is rendered for one provider before it enters this queue, so a
+// replacement process using another provider gets a clean failure rather than
+// a command it cannot interpret.
 func (p *Plane) takeLocked(n *node, incarnation string) (nodeapi.Command, bool) {
-	if len(n.queue) == 0 {
-		return nodeapi.Command{}, false
-	}
+	for len(n.queue) > 0 {
+		pend := n.queue[0]
+		n.queue = n.queue[1:]
 
-	pend := n.queue[0]
-	n.queue = n.queue[1:]
-	pend.delivered = true
-	pend.incarnation = incarnation
-	n.inflight[pend.cmd.ID] = pend
+		if pend.expectedProvider != "" && pend.expectedProvider != n.provider {
+			p.answerLocked(pend, nodeapi.CommandResult{
+				ID: pend.cmd.ID,
+				Error: fmt.Sprintf("node %q changed provider from %s to %s after dispatch and "+
+					"before taking this command", n.name, pend.expectedProvider, n.provider),
+			})
 
-	// THE LEASE FOLLOWS THE PROCESS THAT WAS GIVEN IT. This is what lets a
-	// superseded incarnation keep maintaining the launch it began — and stops it
-	// touching one it was not given, which shares its node name and its
-	// certificate and is otherwise indistinguishable.
-	if pend.cmd.Kind == nodeapi.CommandLaunch && pend.cmd.Lease != nil && incarnation != "" {
-		if p.owners == nil {
-			p.owners = make(map[string]leaseOwner)
+			continue
 		}
 
-		p.owners[pend.cmd.Lease.ID] = leaseOwner{
-			node:        n.name,
-			incarnation: incarnation,
-			requestID:   pend.cmd.RequestIDOf(),
+		pend.delivered = true
+		pend.incarnation = incarnation
+		n.inflight[pend.cmd.ID] = pend
+
+		// THE LEASE FOLLOWS THE PROCESS THAT WAS GIVEN IT. This is what lets a
+		// superseded incarnation keep maintaining the launch it began — and stops it
+		// touching one it was not given, which shares its node name and its
+		// certificate and is otherwise indistinguishable.
+		if pend.cmd.Kind == nodeapi.CommandLaunch && pend.cmd.Lease != nil && incarnation != "" {
+			if p.owners == nil {
+				p.owners = make(map[string]leaseOwner)
+			}
+
+			p.owners[pend.cmd.Lease.ID] = leaseOwner{
+				node:        n.name,
+				incarnation: incarnation,
+				requestID:   pend.cmd.RequestIDOf(),
+			}
 		}
+
+		return pend.cmd, true
 	}
 
-	return pend.cmd, true
+	return nodeapi.Command{}, false
 }
 
 // Result records what a node made of a command.
