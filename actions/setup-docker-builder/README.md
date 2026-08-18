@@ -2,6 +2,8 @@
 
 `setup-docker-builder` starts one privileged BuildKit container inside the job's microVM and places its entire `/var/lib/buildkit` on a sticky disk. Layers and `RUN --mount=type=cache` contents therefore survive together; no cache export is involved. The builder is stopped before the disk is committed, and failed or cancelled jobs publish nothing.
 
+The action requires the Docker Buildx CLI plugin. Billet's published Ubuntu guest image includes Ubuntu's signed `docker-buildx` package; a custom guest image must provide an equivalent `docker buildx` command.
+
 ```yaml
 - id: billet-builder
   uses: junioryono/billet/actions/setup-docker-builder@v0.1.0

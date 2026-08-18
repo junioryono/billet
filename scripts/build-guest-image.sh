@@ -404,7 +404,7 @@ EOF
 		apt-get update -qq
 		apt-get install -y --no-install-recommends \
 			ca-certificates curl iproute2 iptables jq git sudo \
-			docker.io e2fsprogs util-linux systemd-resolved netplan.io libicu74 \
+			docker.io docker-buildx e2fsprogs util-linux systemd-resolved netplan.io libicu74 \
 			unzip zip zstd tar wget rsync build-essential
 		apt-get clean
 		rm -rf /var/lib/apt/lists/*
