@@ -248,6 +248,44 @@ func TestBuilderResetClearsOnlyTheMountedBuildKitState(t *testing.T) {
 	}
 }
 
+func TestBuilderRefusesAGuestWithoutBuildxBeforeStartingCompute(t *testing.T) {
+	t.Parallel()
+
+	temporary := t.TempDir()
+	if err := os.Mkdir(filepath.Join(temporary, "billet-buildkit-state"), 0o700); err != nil {
+		t.Fatalf("create builder state: %v", err)
+	}
+	tools := t.TempDir()
+	calls := filepath.Join(temporary, "docker-calls")
+	fakeDocker := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$BILLET_TEST_DOCKER_CALLS\"\nif [ \"$*\" = \"buildx version\" ]; then exit 1; fi\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(tools, "docker"), []byte(fakeDocker), 0o755); err != nil {
+		t.Fatalf("write fake docker: %v", err)
+	}
+
+	cmd := exec.CommandContext(t.Context(), "bash", filepath.Join("setup-docker-builder", "start.sh"))
+	cmd.Env = append(os.Environ(),
+		"PATH="+tools+":"+os.Getenv("PATH"),
+		"RUNNER_TEMP="+temporary,
+		"GITHUB_OUTPUT="+filepath.Join(temporary, "outputs"),
+		"BILLET_TEST_DOCKER_CALLS="+calls,
+		"BILLET_BUILDKIT_IMAGE=moby/buildkit:test",
+	)
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("builder started without Buildx:\n%s", output)
+	}
+	if !strings.Contains(string(output), "docker buildx is required") {
+		t.Fatalf("missing Buildx produced no useful error:\n%s", output)
+	}
+	body, readErr := os.ReadFile(calls)
+	if readErr != nil {
+		t.Fatalf("read docker calls: %v", readErr)
+	}
+	if strings.Contains(string(body), "run --detach") {
+		t.Fatalf("builder pulled or launched compute before checking Buildx:\n%s", body)
+	}
+}
+
 func TestTheBuilderConfiguresEachUpstreamToItsOwnMirror(t *testing.T) {
 	t.Parallel()
 
