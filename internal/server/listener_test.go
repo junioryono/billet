@@ -4880,6 +4880,103 @@ func TestAnUnsettledReleaseAfterAFailedLaunchBecomesARetry(t *testing.T) {
 	}
 }
 
+// CANCELLING A LAUNCH CANNOT TURN "NOTHING STARTED" INTO A REMOTE DESTROY.
+//
+// A non-custody Launch error is the runner's proof that no compute exists. If the
+// ledger release then sees the cancelled serving context, the lease still needs a
+// retry, but the old cleanup representation made shutdown call Destroy first. A
+// node command can wait ten minutes, so a routine service restart hung even though
+// both listeners had reported zero running jobs.
+func TestShutdownReleasesAFailedLaunchWithoutDestroyingPhantomCompute(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, tiers)
+
+	launchStarted := make(chan struct{})
+	finishLaunch := make(chan struct{})
+	destroyStarted := make(chan struct{})
+	finishDestroy := make(chan struct{})
+
+	var destroyOnce sync.Once
+
+	runner := &fakeRunner{
+		onLaunch: func(int64) error {
+			close(launchStarted)
+			<-finishLaunch
+
+			return context.Canceled
+		},
+		onDestroy: func(int64) error {
+			destroyOnce.Do(func() { close(destroyStarted) })
+			<-finishDestroy
+
+			return nil
+		},
+	}
+
+	var delivered atomic.Bool
+
+	session := &fakeSession{onGet: func() (*Message, error) {
+		if delivered.Swap(true) {
+			return nil, ErrNoMessage
+		}
+
+		return &Message{
+			MessageID: 1,
+			Assigned:  []Job{{RequestID: 7, RunID: 70}},
+		}, nil
+	}}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	l := NewListener(a, tiers[0].Label, session, WithRunner(runner),
+		WithShutdownGrace(time.Second), WithFinishGraces(time.Second, time.Second))
+
+	runDone := make(chan error, 1)
+
+	go func() { runDone <- l.Run(ctx) }()
+
+	select {
+	case <-launchStarted:
+	case <-time.After(5 * time.Second):
+		cancel()
+		close(finishLaunch)
+		close(finishDestroy)
+		t.Fatal("the assigned job never reached Launch")
+	}
+
+	lease := l.leaseFor(7)
+	if lease == nil {
+		cancel()
+		close(finishLaunch)
+		close(finishDestroy)
+		t.Fatal("Launch started without a running lease")
+	}
+
+	cancel()
+	close(finishLaunch)
+
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run = %v, want context cancellation", err)
+		}
+	case <-destroyStarted:
+		close(finishDestroy)
+		<-runDone
+		t.Fatal("shutdown called Destroy after Launch proved no compute started; a remote " +
+			"node timeout makes this restart hang for minutes")
+	case <-time.After(5 * time.Second):
+		close(finishDestroy)
+		<-runDone
+		t.Fatal("shutdown did not return after a failed launch with no compute to destroy")
+	}
+
+	close(finishDestroy)
+
+	if _, err := a.Lease(t.Context(), lease.ID); err == nil {
+		t.Fatal("the failed launch's lease is still open after shutdown")
+	}
+}
+
 // AND THE PARKED OBLIGATION IS ACTUALLY DISCHARGED, which is the half a test of
 // the predicate alone cannot see.
 //
@@ -4891,7 +4988,16 @@ func TestAParkedReleaseIsRetriedAndClears(t *testing.T) {
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
 	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, tiers)
 
-	runner := &fakeRunner{onLaunch: func(int64) error { return errors.New("no space left on device") }}
+	var destroys atomic.Int32
+
+	runner := &fakeRunner{
+		onLaunch: func(int64) error { return errors.New("no space left on device") },
+		onDestroy: func(int64) error {
+			destroys.Add(1)
+
+			return nil
+		},
+	}
 	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner))
 
 	lease := holdRunning(t, l, a, tiers[0].Label, 7)
@@ -4913,6 +5019,11 @@ func TestAParkedReleaseIsRetriedAndClears(t *testing.T) {
 	if stillPending {
 		t.Fatal("the obligation is still parked after a retry that could reach the ledger; " +
 			"its capacity is held and its request id refused for the life of the process")
+	}
+
+	if got := destroys.Load(); got != 0 {
+		t.Errorf("retried a remote destroy %d time(s) after Launch proved no compute started; "+
+			"only the ledger release needed retrying", got)
 	}
 
 	// THE CAPACITY IS BACK, which is the point of the whole exercise.
@@ -4946,7 +5057,15 @@ func TestACompletionWhoseReleaseFailsDoesNotStopTheListener(t *testing.T) {
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
 	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, tiers)
 
-	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(&fakeRunner{}))
+	var destroys atomic.Int32
+
+	runner := &fakeRunner{onDestroy: func(int64) error {
+		destroys.Add(1)
+
+		return nil
+	}}
+
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner))
 
 	holdRunning(t, l, a, tiers[0].Label, 7)
 
@@ -4991,6 +5110,82 @@ func TestACompletionWhoseReleaseFailsDoesNotStopTheListener(t *testing.T) {
 	if stillParked {
 		t.Error("the parked obligation was not discharged by a retry that could reach the " +
 			"ledger, so its request id is refused for the life of the process")
+	}
+
+	if got := destroys.Load(); got != 1 {
+		t.Errorf("Destroy was called %d times, want once; the first call proved compute was "+
+			"gone, so the retry only owes the ledger release", got)
+	}
+}
+
+// SHUTDOWN HAS THE SAME QUARANTINE OBLIGATION AS THE ORDINARY RETRY.
+//
+// A successful Destroy proves the compute is gone, but its release can fail and
+// the reaper can quarantine the still-busy lease before shutdown gets its final
+// chance. ErrFenced alone does not return that capacity: the proof has to pass
+// through ResolveQuarantine. Skipping release-only entries in destroyAll is safe
+// only if releaseAll preserves that half of the protocol.
+func TestShutdownResolvesAReleaseOnlyLeaseFromQuarantine(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, tiers)
+
+	var destroys atomic.Int32
+
+	runner := &fakeRunner{onDestroy: func(int64) error {
+		destroys.Add(1)
+
+		return nil
+	}}
+
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner))
+	lease := holdRunning(t, l, a, tiers[0].Label, 7)
+
+	if err := a.Bind(t.Context(), lease.ID, lease.Epoch, lease.TargetNode); err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+
+	for _, to := range []alloc.Phase{alloc.PhaseLaunching, alloc.PhaseOnline, alloc.PhaseBusy} {
+		if err := a.Advance(t.Context(), lease.ID, lease.Epoch, to); err != nil {
+			t.Fatalf("advance to %s: %v", to, err)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	l.complete(ctx, Job{RequestID: 7})
+
+	if err := a.ExpireForTest(t.Context(), lease.ID); err != nil {
+		t.Fatalf("expire: %v", err)
+	}
+
+	if _, err := a.Reap(t.Context()); err != nil {
+		t.Fatalf("reap: %v", err)
+	}
+
+	destroyed := l.destroyAll(t.Context())
+	l.releaseAll(t.Context(), destroyed)
+
+	if got := destroys.Load(); got != 1 {
+		t.Errorf("Destroy was called %d times, want once; shutdown must not destroy compute "+
+			"that the completion path already proved gone", got)
+	}
+
+	held, err := a.Quarantined(t.Context())
+	if err != nil {
+		t.Fatalf("Quarantined: %v", err)
+	}
+
+	if len(held) != 0 {
+		t.Errorf("shutdown left %d lease(s) quarantined after compute was proved gone: %+v", len(held), held)
+	}
+
+	outcomes, err := a.HistoryOutcomesForRequest(t.Context(), 7)
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+
+	if len(outcomes) != 1 || outcomes[0] != string(alloc.PhaseDone) {
+		t.Errorf("job history records %v; shutdown changed a completed job's outcome", outcomes)
 	}
 }
 

@@ -324,6 +324,11 @@ type pendingCleanup struct {
 	// completion. A launch that never started must not be recorded as `done`:
 	// "done" for a runner that never ran is a lie the history keeps.
 	outcome alloc.Phase
+	// releaseOnly means the runner has already proved there is no compute to
+	// destroy: either Launch failed without custody, or a previous Destroy
+	// succeeded. Retrying a remote destroy in either case can only delay the
+	// ledger release, and during shutdown that delay can be a full node timeout.
+	releaseOnly bool
 	// Doubles after each failure, up to maxRetryEvery.
 	wait time.Duration
 	// Zero means immediately, which is what a freshly recorded failure wants.
@@ -1252,7 +1257,7 @@ func (l *Listener) heartbeatLoop(ctx context.Context) {
 	}
 }
 
-// cleanupLoop retries completions whose destroy failed, on its own clock.
+// cleanupLoop retries cleanup obligations on its own clock.
 func (l *Listener) cleanupLoop(ctx context.Context) {
 	ticker := time.NewTicker(l.heartbeatInterval())
 	defer ticker.Stop()
@@ -1267,12 +1272,11 @@ func (l *Listener) cleanupLoop(ctx context.Context) {
 	}
 }
 
-// retryCleanup finishes completions whose destroy failed.
+// retryCleanup finishes cleanup obligations whose destroy or release failed.
 //
-// Idempotent by contract on the runner's side, so retrying a destroy that
-// actually succeeded is free — and the ONE thing that must not happen is
-// releasing the lease before the compute is confirmed gone, which complete
-// already refuses to do.
+// A release-only obligation never reaches the runner again: its entry records
+// the proof that no compute exists. Every other obligation goes through complete,
+// which refuses to release until Destroy confirms the compute is gone.
 func (l *Listener) retryCleanup(ctx context.Context) {
 	now := time.Now()
 
@@ -1360,7 +1364,11 @@ func (l *Listener) destroyAll(ctx context.Context) map[int64]bool {
 		requests = append(requests, id)
 	}
 
-	for id := range l.cleanup {
+	for id, entry := range l.cleanup {
+		if entry.releaseOnly {
+			continue
+		}
+
 		if l.destroying[id] {
 			if _, running := l.running[id]; !running {
 				skipped = append(skipped, id)
@@ -1525,6 +1533,20 @@ func (l *Listener) attempt(ctx context.Context, job Job) {
 	// same window one instruction wide.
 	if l.sealed {
 		l.mu.Unlock()
+
+		return
+	}
+
+	entry, pending := l.cleanup[job.RequestID]
+	if !pending {
+		l.mu.Unlock()
+
+		return
+	}
+
+	if entry.releaseOnly {
+		l.mu.Unlock()
+		l.releaseParked(ctx, job.RequestID)
 
 		return
 	}
@@ -2381,7 +2403,7 @@ func (l *Listener) launch(ctx context.Context, lease *alloc.Lease, job Job) erro
 
 		if _, pending := l.cleanup[job.RequestID]; !pending {
 			l.cleanup[job.RequestID] = &pendingCleanup{
-				job: job, lease: lease, outcome: alloc.PhaseFailed,
+				job: job, lease: lease, outcome: alloc.PhaseFailed, releaseOnly: true,
 			}
 		}
 	}
@@ -2424,6 +2446,79 @@ func releaseSettled(err error) bool {
 	return err == nil || errors.Is(err, alloc.ErrFenced) || errors.Is(err, alloc.ErrLeaseNotFound)
 }
 
+// releaseAbsent returns capacity after the runner has proved no compute exists.
+// A fenced release may name a lease the reaper quarantined while the proof was
+// in flight; ResolveQuarantine is the only operation that turns that proof into
+// returned capacity.
+func (l *Listener) releaseAbsent(ctx context.Context, requestID int64, lease *alloc.Lease,
+	outcome alloc.Phase,
+) error {
+	relErr := l.alloc.Release(ctx, lease.ID, lease.Epoch, outcome)
+	if !errors.Is(relErr, alloc.ErrFenced) {
+		return relErr
+	}
+
+	if err := l.alloc.ResolveQuarantine(ctx, lease.ID, outcome); err == nil {
+		l.log.Warn("a cleanup release found its lease quarantined after compute was "+
+			"confirmed gone; the capacity is back",
+			"tier", l.tier, "request", requestID, "lease", lease.ID)
+
+		return nil
+	} else if !errors.Is(err, alloc.ErrLeaseNotFound) {
+		return err
+	}
+
+	return relErr
+}
+
+// releaseParked retries the local half of cleanup after the runner has proved no
+// compute exists. It reports whether it found and handled a release-only entry.
+//
+// The allocator call stays outside the listener mutex. A SQLite writer can be
+// busy behind an operator command, and holding the mutex there would stall lease
+// renewal for every unrelated job in this tier.
+func (l *Listener) releaseParked(ctx context.Context, requestID int64) bool {
+	l.mu.Lock()
+	entry, ok := l.cleanup[requestID]
+	if !ok || !entry.releaseOnly || entry.lease == nil {
+		l.mu.Unlock()
+
+		return false
+	}
+
+	lease := entry.lease
+	outcome := entry.outcome
+	if outcome == "" {
+		outcome = alloc.PhaseDone
+	}
+	l.mu.Unlock()
+
+	relErr := l.releaseAbsent(ctx, requestID, lease, outcome)
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	current, stillPending := l.cleanup[requestID]
+	if !stillPending || current != entry {
+		return true
+	}
+
+	if !releaseSettled(relErr) {
+		entry.failed(time.Now(), l.retryFirst, l.retryMax)
+		l.log.Error("could not release capacity after compute was confirmed absent; it stays "+
+			"held until this is retried",
+			"tier", l.tier, "request", requestID, "lease", lease.ID, "error", relErr)
+
+		return true
+	}
+
+	delete(l.cleanup, requestID)
+	delete(l.running, requestID)
+	delete(l.acquiring, requestID)
+
+	return true
+}
+
 // complete releases the lease a finished job was running on.
 //
 // Idempotent, because a redelivered Completed message must not fail: a job billet
@@ -2442,6 +2537,13 @@ func releaseSettled(err error) bool {
 // always nil is an invitation to wire the next failure mode through it, and the
 // branch handling it would never run.
 func (l *Listener) complete(ctx context.Context, job Job) {
+	// A previous attempt already established that no compute exists. Repeating a
+	// remote destroy adds no proof, and on shutdown it can wait a full node timeout
+	// before the local release that is the only work left.
+	if l.releaseParked(ctx, job.RequestID) {
+		return
+	}
+
 	// DESTROYED BEFORE RELEASED, and outside the mutex.
 	//
 	// Releasing first would hand the capacity to another tier while this job's
@@ -2660,10 +2762,12 @@ func (l *Listener) complete(ctx context.Context, job Job) {
 		}
 
 		if entry, pending := l.cleanup[job.RequestID]; pending {
-			entry.lease, entry.outcome = lease, outcome
+			entry.lease, entry.outcome, entry.releaseOnly = lease, outcome, true
 			entry.failed(time.Now(), l.retryFirst, l.retryMax)
 		} else {
-			l.cleanup[job.RequestID] = &pendingCleanup{job: job, lease: lease, outcome: outcome}
+			l.cleanup[job.RequestID] = &pendingCleanup{
+				job: job, lease: lease, outcome: outcome, releaseOnly: true,
+			}
 		}
 
 		l.log.Error("could not release the lease of a finished job; its capacity is held "+
@@ -2787,8 +2891,8 @@ func (l *Listener) releaseAll(ctx context.Context, destroyed map[int64]bool) {
 	// And the parked ones, with the outcome they were parked with: a launch that
 	// never started did not finish, whatever the ordinary path records.
 	for id, entry := range parked {
-		if err := l.alloc.Release(ctx, entry.lease.ID, entry.lease.Epoch, entry.outcome); err != nil {
-			l.log.Warn("could not release the capacity of a job that failed to start",
+		if err := l.releaseAbsent(ctx, id, entry.lease, entry.outcome); err != nil {
+			l.log.Warn("could not release cleanup capacity after compute was confirmed absent",
 				"tier", l.tier, "request", id, "lease", entry.lease.ID, "error", err)
 
 			if !releaseSettled(err) {
