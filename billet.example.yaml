@@ -353,10 +353,10 @@ node:
   # hostname, or endpoint different from listen is refused so a bearer-token API
   # cannot quietly appear on another host interface.
   #
-  # Docker image-store attachment is disabled until the runner supplies an
-  # authoritative job result that makes publication safe. Docker and service
-  # container pulls therefore remain cold unless a registry mirror serves them;
-  # workflow-managed sticky disks and the BuildKit action use this API now.
+  # The guest requests its architecture-scoped Docker image store through this
+  # API before starting the runner. It publishes changed state only after the
+  # pinned runner reports a clean success; every other result is discarded. Its
+  # published generation expires after eight inactive days.
   cache:
     listen: 172.20.0.1:7718
     guest_endpoint: http://172.20.0.1:7718

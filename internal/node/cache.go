@@ -149,57 +149,6 @@ func (s *CacheService) Prepare(instance string, trust provider.TrustClass) (stri
 	}
 }
 
-// PrepareDockerStore attaches the architecture-scoped image store before boot,
-// so service containers benefit before workflow steps begin.
-func (s *CacheService) PrepareDockerStore(
-	ctx context.Context,
-	instance, architecture string,
-) (provider.VolumeMount, error) {
-	s.mu.Lock()
-	token, ok := s.byInstance[instance]
-	if !ok {
-		s.mu.Unlock()
-
-		return provider.VolumeMount{}, fmt.Errorf("node: no cache session for %s", instance)
-	}
-	session := s.byToken[token]
-	s.mu.Unlock()
-
-	if strings.TrimSpace(architecture) == "" || strings.ContainsAny(architecture, "/\x00\r\n") {
-		return provider.VolumeMount{}, errors.New("node: a Docker image cache needs an architecture")
-	}
-
-	session.mu.Lock()
-	defer session.mu.Unlock()
-	if session.closed || session.slots[0] != nil {
-		return provider.VolumeMount{}, errors.New("node: Docker image cache slot is unavailable")
-	}
-
-	key := s.qualifiedKey(dockerStoreKey + architecture)
-	volume, err := s.store.Clone(ctx, key, "")
-	if errors.Is(err, storecontract.ErrMiss) {
-		volume, err = s.store.Create(ctx, key, cacheVolumeLimit)
-	}
-	if err != nil {
-		return provider.VolumeMount{}, fmt.Errorf("node: prepare Docker image cache: %w", err)
-	}
-
-	session.slots[0] = &cacheAttachment{Volume: volume}
-	if err := s.persistSession(session); err != nil {
-		discardErr := s.store.Discard(ctx, volume)
-		var retryErr error
-		if discardErr == nil {
-			session.slots[0] = nil
-		} else {
-			retryErr = s.persistSession(session)
-		}
-
-		return provider.VolumeMount{}, errors.Join(err, discardErr, retryErr)
-	}
-
-	return provider.VolumeMount{Device: volume.Device, Path: "/var/lib/docker"}, nil
-}
-
 // finishSession removes a fully discarded session while session.mu is held.
 func (s *CacheService) finishSession(session *cacheSession) error {
 	s.mu.Lock()
@@ -380,6 +329,8 @@ func (s *CacheService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch {
+	case r.Method == http.MethodPost && r.URL.Path == "/v1/docker-store":
+		s.attachDockerStore(w, r, session)
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/volumes":
 		s.attach(w, r, session)
 	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/volumes/") &&
@@ -391,6 +342,122 @@ func (s *CacheService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+func (s *CacheService) attachDockerStore(
+	w http.ResponseWriter,
+	r *http.Request,
+	session *cacheSession,
+) {
+	ctx, cancel := context.WithTimeout(r.Context(), cacheWorkLimit)
+	defer cancel()
+
+	var request struct {
+		Architecture string `json:"architecture"`
+	}
+	if err := decodeCacheRequest(r.Body, &request); err != nil {
+		http.Error(w, "invalid Docker image-store request", http.StatusBadRequest)
+
+		return
+	}
+	if !validCacheArchitecture(request.Architecture) {
+		http.Error(w, "invalid Docker image-store architecture", http.StatusBadRequest)
+
+		return
+	}
+	if err := lockCacheSession(ctx, session); err != nil {
+		http.Error(w, "cache unavailable", http.StatusServiceUnavailable)
+
+		return
+	}
+	defer session.mu.Unlock()
+	if session.closed {
+		http.Error(w, "cache session has ended", http.StatusGone)
+
+		return
+	}
+	if session.slots[0] != nil {
+		http.Error(w, "Docker image-store slot is unavailable", http.StatusConflict)
+
+		return
+	}
+
+	key := s.qualifiedKey(dockerStoreKey + request.Architecture)
+	volume, err := s.store.Clone(ctx, key, "")
+	cold := errors.Is(err, storecontract.ErrMiss)
+	if cold {
+		volume, err = s.store.Create(ctx, key, cacheVolumeLimit)
+	}
+	if err != nil {
+		s.log.Warn("Docker image store is unavailable; the job can continue cold",
+			"instance", session.instance, "error", err)
+		http.Error(w, "cache unavailable", http.StatusServiceUnavailable)
+
+		return
+	}
+
+	session.slots[0] = &cacheAttachment{Volume: volume, Publication: publicationLWW}
+	if err := s.persistSession(session); err != nil {
+		discardErr := s.store.Discard(ctx, volume)
+		var retryErr error
+		if discardErr == nil {
+			session.slots[0] = nil
+		} else {
+			retryErr = s.persistSession(session)
+		}
+		s.log.Warn("Docker image-store custody could not be made durable; the job can continue cold",
+			"instance", session.instance, "error", errors.Join(err, discardErr, retryErr))
+		http.Error(w, "cache unavailable", http.StatusServiceUnavailable)
+
+		return
+	}
+
+	if err := s.attacher.AttachVolume(ctx, session.instance, 0, volume.Device); err != nil {
+		detachErr := s.attacher.DetachVolume(ctx, session.instance, 0, volume.Device)
+		var discardErr, clearErr error
+		if detachErr == nil {
+			discardErr = s.store.Discard(ctx, volume)
+			if discardErr == nil {
+				session.slots[0] = nil
+				clearErr = s.persistSession(session)
+				if clearErr != nil {
+					session.slots[0] = &cacheAttachment{
+						Volume: volume, Publication: publicationLWW,
+					}
+				}
+			}
+		}
+		s.log.Warn("Docker image store could not be attached; the job can continue cold",
+			"instance", session.instance,
+			"error", errors.Join(err, detachErr, discardErr, clearErr))
+		http.Error(w, "cache unavailable", http.StatusServiceUnavailable)
+
+		return
+	}
+
+	guestDevice := guestVolumeDevice(0)
+	if locator, ok := s.attacher.(provider.GuestVolumeLocator); ok {
+		guestDevice = locator.GuestVolumeDevice(0, volume.Device)
+	}
+	writeCacheJSON(w, http.StatusCreated, map[string]any{
+		"slot": 0, "device": guestDevice, "generation": volume.Generation, "cold": cold,
+	})
+}
+
+func validCacheArchitecture(architecture string) bool {
+	if architecture == "" || len(architecture) > 64 {
+		return false
+	}
+	for i, character := range []byte(architecture) {
+		if character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' ||
+			character >= '0' && character <= '9' || i > 0 && (character == '.' || character == '_' || character == '-') {
+			continue
+		}
+
+		return false
+	}
+
+	return true
 }
 
 func (s *CacheService) authenticate(r *http.Request) (*cacheSession, bool) {

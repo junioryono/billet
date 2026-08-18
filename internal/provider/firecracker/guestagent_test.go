@@ -130,39 +130,51 @@ func TestTheGuestAgentRefusesMetadataThatIsNotAnArgv(t *testing.T) {
 func TestTheGuestMountsDockerStateBeforeStartingTheDaemon(t *testing.T) {
 	t.Parallel()
 
-	path := filepath.Join("..", "..", "..", "scripts", "build-guest-image.sh")
-	source, err := os.ReadFile(path)
+	buildPath := filepath.Join("..", "..", "..", "scripts", "build-guest-image.sh")
+	source, err := os.ReadFile(buildPath)
 	if err != nil {
 		t.Fatalf("read guest image builder: %v", err)
 	}
-	text := string(source)
-
-	mountAt := strings.Index(text, "mount -t ext4 -o noatime /dev/vdb /var/lib/docker")
-	startAt := strings.Index(text, "systemctl start docker.service")
-	if mountAt < 0 || startAt < 0 || mountAt >= startAt {
-		t.Fatalf("Docker cache mount/start order is not encoded in the guest agent")
+	build := string(source)
+	assetPath := filepath.Join("..", "..", "guestassets", "docker-cache.sh")
+	asset, err := os.ReadFile(assetPath)
+	if err != nil {
+		t.Fatalf("read shared Docker cache helper: %v", err)
 	}
-	if strings.Contains(text, "After=network-online.target docker.service") ||
-		strings.Contains(text, "Requires=docker.service") {
+	helper := string(asset)
+
+	mountAt := strings.Index(helper, "mount -t ext4 -o noatime \"$device\" /var/lib/docker")
+	startAt := strings.LastIndex(helper, "systemctl start docker.service")
+	if mountAt < 0 || startAt < 0 || mountAt >= startAt {
+		t.Fatal("Docker cache mount/start order is not encoded in the shared guest helper")
+	}
+	if strings.Contains(build, "After=network-online.target docker.service") ||
+		strings.Contains(build, "Requires=docker.service") {
 		t.Fatal("systemd can start Docker before the guest agent mounts its image store")
 	}
-	if !strings.Contains(text, "systemctl disable docker.service docker.socket") {
+	if !strings.Contains(build, "systemctl disable docker.service docker.socket") {
 		t.Fatal("the image still permits Docker to autostart before its cache is mounted")
 	}
-	if strings.Contains(text, "operation=commit") ||
-		!strings.Contains(text, `"$cache_endpoint/v1/volumes/0/discard"`) {
-		t.Fatal("the guest can publish Docker state without an authoritative job result")
+	if !strings.Contains(build, "ACTIONS_RUNNER_RETURN_JOB_RESULT_FOR_HOSTED=true") ||
+		!strings.Contains(helper, `[ "$status" = 100 ]`) ||
+		!strings.Contains(helper, `operation=commit`) {
+		t.Fatal("Docker publication is not gated on the runner's authoritative success code")
 	}
-	if !strings.Contains(text, "BILLET_BUILDKIT_CACHE_MOUNT_LIMIT_BYTES") ||
-		!strings.Contains(text, "fetch buildkit-cache-mount-limit-bytes") {
+	prepareAt := strings.Index(build, "/usr/local/bin/billet-docker-cache prepare")
+	runnerAt := strings.Index(build, "BILLET_AGENT_LAUNCH_BEGIN")
+	if prepareAt < 0 || runnerAt < 0 || prepareAt >= runnerAt {
+		t.Fatal("the guest does not attach the Docker image store before starting the runner")
+	}
+	if !strings.Contains(build, "BILLET_BUILDKIT_CACHE_MOUNT_LIMIT_BYTES") ||
+		!strings.Contains(build, "fetch buildkit-cache-mount-limit-bytes") {
 		t.Fatal("the tier's BuildKit cache-mount ceiling never reaches workflow actions")
 	}
-	configureAt := strings.Index(text, "registry-mirrors")
-	if configureAt < 0 || configureAt >= startAt {
+	configureAt := strings.Index(build, "registry-mirrors")
+	if configureAt < 0 || configureAt >= prepareAt {
 		t.Fatal("the guest does not configure its Docker Hub mirror before Docker starts")
 	}
-	if !strings.Contains(text, "fetch registry-mirrors") ||
-		!strings.Contains(text, "BILLET_REGISTRY_MIRRORS_JSON") {
+	if !strings.Contains(build, "fetch registry-mirrors") ||
+		!strings.Contains(build, "BILLET_REGISTRY_MIRRORS_JSON") {
 		t.Fatal("the three registry mirrors do not reach the guest's BuildKit actions")
 	}
 }
@@ -220,7 +232,7 @@ exit 97
 set -euo pipefail
 ACTIONS_RUNNER_INPUT_JITCONFIG=fixture
 ` + block + `
-cmd=(bash -c 'printf "%s\0" "${HOME-}" "${USER-}" "${LOGNAME-}" "${RUNNER_TOOL_CACHE-}" "${AGENT_TOOLSDIRECTORY-}" "$(id -u)" "$(id -g)"')
+	cmd=(bash -c 'printf "%s\0" "${HOME-}" "${USER-}" "${LOGNAME-}" "${RUNNER_TOOL_CACHE-}" "${AGENT_TOOLSDIRECTORY-}" "${ACTIONS_RUNNER_RETURN_JOB_RESULT_FOR_HOSTED-}" "$(id -u)" "$(id -g)"')
 ` + launch + `
 exit "$job_status"
 `
@@ -244,6 +256,7 @@ exit "$job_status"
 	fields := bytes.Split(bytes.TrimSuffix(out, []byte{0}), []byte{0})
 	want := []string{
 		"/home/runner", "runner", "runner", "/opt/hostedtoolcache", "/opt/hostedtoolcache",
+		"true",
 		strconv.Itoa(os.Getuid()), strconv.Itoa(os.Getgid()),
 	}
 	if len(fields) != len(want) {
@@ -324,6 +337,10 @@ func TestTheGuestImageGateKeepsDockerBehindTheCacheMount(t *testing.T) {
 	}
 	if strings.Contains(text, "for unit in docker.service billet-agent.service") {
 		t.Fatal("the image gate still requires Docker to start before the billet agent mounts its cache")
+	}
+	if !strings.Contains(text, `DOCKER_CACHE="$MNT/usr/local/bin/billet-docker-cache"`) ||
+		!strings.Contains(text, `'"ACTIONS_RUNNER_RETURN_JOB_RESULT_FOR_HOSTED=true"'`) {
+		t.Fatal("the image gate does not verify the Docker cache helper and authoritative result mode")
 	}
 
 	bootPath := filepath.Join("..", "..", "..", "scripts", "boot-guest-image.sh")

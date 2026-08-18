@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/junioryono/billet/internal/guestassets"
 )
 
 // BuildSpec describes an AMI to build.
@@ -477,7 +479,7 @@ func provisionScript(spec BuildSpec) (string, error) {
 	b.WriteString("#!/bin/sh\nset -eux\n")
 
 	// Docker, git and tar are what a workflow cannot reasonably install itself.
-	b.WriteString("dnf install -y docker git tar\n")
+	b.WriteString("dnf install -y docker git tar jq e2fsprogs util-linux\n")
 	b.WriteString("systemctl enable docker\n")
 
 	// THE RUNNER'S OWN DEPENDENCIES, INSTALLED DIRECTLY RATHER THAN BY ITS SCRIPT.
@@ -518,6 +520,13 @@ func provisionScript(spec BuildSpec) (string, error) {
 	b.WriteString(jobTimingHook())
 	b.WriteString("BILLETJOBEOF\n")
 	b.WriteString("chmod 0755 " + jobTimingHookPath + "\n")
+	b.WriteString("cat > /usr/local/bin/billet-docker-cache <<'BILLETDOCKEREOF'\n")
+	b.WriteString(guestassets.DockerCacheScript)
+	if !strings.HasSuffix(guestassets.DockerCacheScript, "\n") {
+		b.WriteString("\n")
+	}
+	b.WriteString("BILLETDOCKEREOF\n")
+	b.WriteString("chmod 0755 /usr/local/bin/billet-docker-cache\n")
 
 	// THE ENTRY POINT A TIER NAMES. billet's boot script exports the JIT config and
 	// execs the tier's command AS ROOT, so something has to drop privileges without
@@ -525,8 +534,14 @@ func provisionScript(spec BuildSpec) (string, error) {
 	b.WriteString("cat > /usr/local/bin/billet-runner <<'BILLETEOF'\n")
 	b.WriteString("#!/bin/sh\nset -eu\n")
 
+	// ATTACH THE IMAGE STORE BEFORE STARTING THE RUNNER. The helper stops Docker if
+	// cloud-init already started it, mounts the cache, and starts it again before
+	// service containers can be pulled. Every cache failure falls back to the root
+	// disk and a cold pull.
+	b.WriteString("/usr/local/bin/billet-docker-cache prepare\n")
+
 	// WAIT FOR DOCKER BEFORE STARTING THE RUNNER, because billet's boot script
-	// execs this the moment cloud-init reaches it and the daemon may not be up.
+	// invokes this the moment cloud-init reaches it and the daemon may not be up.
 	//
 	// A verification run of a finished image measured exactly that: at the instant
 	// the check ran, systemctl reported docker inactive, and a container ran fine
@@ -552,12 +567,19 @@ func provisionScript(spec BuildSpec) (string, error) {
 	// tests green while producing the failure this whole issue exists to prevent —
 	// a runner that starts, finds no registration, exits, and leaves a machine
 	// looking perfectly healthy.
-	b.WriteString("exec " + privilegeDrop + " \\\n")
+	b.WriteString("set +e\n")
+	b.WriteString(privilegeDrop + " \\\n")
 	b.WriteString("  BILLET_LAUNCH_EPOCH_NS=\"${BILLET_LAUNCH_EPOCH_NS:-}\" \\\n")
 	b.WriteString("  BILLET_RUNNER_START_EPOCH_NS=\"$runner_started\" \\\n")
 	b.WriteString("  ACTIONS_RUNNER_HOOK_JOB_STARTED=" + jobTimingHookPath + " \\\n")
+	b.WriteString("  ACTIONS_RUNNER_RETURN_JOB_RESULT_FOR_HOSTED=true \\\n")
 	b.WriteString("  " + jitEnvVar + "=\"$" + jitEnvVar + "\" \\\n")
 	b.WriteString("  /opt/actions-runner/run.sh\n")
+	b.WriteString("job_status=$?\n")
+	b.WriteString("set -e\n")
+	b.WriteString("/usr/local/bin/billet-docker-cache complete \"$job_status\"\n")
+	b.WriteString("service_status=$(/usr/local/bin/billet-docker-cache service-status \"$job_status\") || service_status=$job_status\n")
+	b.WriteString("exit \"$service_status\"\n")
 	b.WriteString("BILLETEOF\n")
 	b.WriteString("chmod 0755 /usr/local/bin/billet-runner\n")
 

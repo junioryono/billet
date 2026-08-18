@@ -86,7 +86,8 @@ AGENT="$MNT/usr/local/bin/billet-agent"
 # home nor the ordinary account identity variables. Tool installers can complete
 # and then fail when the tool first asks for its per-user cache.
 runner_environment=1
-for assignment in '"HOME=/home/runner"' '"USER=runner"' '"LOGNAME=runner"'; do
+for assignment in '"HOME=/home/runner"' '"USER=runner"' '"LOGNAME=runner"' \
+	'"ACTIONS_RUNNER_RETURN_JOB_RESULT_FOR_HOSTED=true"'; do
 	if ! grep -Eq "^[[:space:]]*${assignment}$" "$AGENT" 2>/dev/null; then
 		runner_environment=0
 	fi
@@ -98,8 +99,18 @@ if [ "$runner_environment" -eq 1 ]; then
 	pass "the guest agent establishes the runner account environment"
 else
 	fail "the guest agent does not launch jobs with HOME=/home/runner, USER=runner and
-        LOGNAME=runner; setup actions can install a tool and then fail when it asks
-        for its user cache"
+        LOGNAME=runner, or does not request the authoritative one-job result; setup
+        actions can lose their user cache and Docker writes cannot be gated safely"
+fi
+
+DOCKER_CACHE="$MNT/usr/local/bin/billet-docker-cache"
+if [ -x "$DOCKER_CACHE" ] && grep -Fq '[ "$status" = 100 ]' "$DOCKER_CACHE" &&
+	grep -Fq '/v1/docker-store' "$DOCKER_CACHE" &&
+	grep -Fq '/v1/volumes/$slot/commit' "$DOCKER_CACHE"; then
+	pass "the Docker image store is mounted and gated on a clean runner result"
+else
+	fail "the Docker cache helper is absent or can publish without the pinned runner's
+        authoritative clean-success result"
 fi
 
 # READ FROM WHAT THE BUILD RECORDED, not from the runner tarball. The tarball

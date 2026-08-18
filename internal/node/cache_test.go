@@ -35,6 +35,7 @@ type fakeCacheStore struct {
 	advanceOnSnapshot bool
 	publishExpected   []string
 	keys              []string
+	createdSizes      []int64
 	snapshotVolumes   []storecontract.Volume
 }
 
@@ -72,9 +73,10 @@ func (f *fakeCacheStore) Current(context.Context, string) (string, error) {
 	return f.current, nil
 }
 
-func (f *fakeCacheStore) Create(_ context.Context, key string, _ int64) (storecontract.Volume, error) {
+func (f *fakeCacheStore) Create(_ context.Context, key string, size int64) (storecontract.Volume, error) {
 	f.created++
 	f.keys = append(f.keys, key)
+	f.createdSizes = append(f.createdSizes, size)
 
 	return storecontract.Volume{Key: key, Handle: "working", Device: "/dev/rbd7"}, nil
 }
@@ -320,6 +322,86 @@ func TestLastWriteWinsRebasesABuilderCandidateAfterAConcurrentCommit(t *testing.
 	}
 }
 
+func TestDockerImageStoreIsArchitectureScopedAndReservesSlotZero(t *testing.T) {
+	t.Parallel()
+
+	storage := &fakeCacheStore{}
+	attacher := &fakeVolumeAttacher{}
+	service, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", t.TempDir(),
+		storage, attacher, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewCacheService: %v", err)
+	}
+	token, err := service.Prepare("billet-one", provider.TrustTrusted)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+
+	docker := cacheRequest(t, service, token, "/v1/docker-store",
+		map[string]any{"architecture": "amd64"})
+	if docker.Code != http.StatusCreated {
+		t.Fatalf("Docker store status = %d: %s", docker.Code, docker.Body.String())
+	}
+	var mounted struct {
+		Slot   int    `json:"slot"`
+		Device string `json:"device"`
+		Cold   bool   `json:"cold"`
+	}
+	if err := json.Unmarshal(docker.Body.Bytes(), &mounted); err != nil {
+		t.Fatalf("decode Docker store response: %v", err)
+	}
+	if mounted.Slot != 0 || mounted.Device != "/dev/vdb" || !mounted.Cold {
+		t.Fatalf("Docker store attachment = %+v, want cold slot 0 at /dev/vdb", mounted)
+	}
+	if len(storage.keys) != 2 || storage.keys[0] != "test-deployment/docker-images/amd64" ||
+		storage.keys[1] != storage.keys[0] {
+		t.Fatalf("Docker store keys = %v", storage.keys)
+	}
+	if len(storage.createdSizes) != 1 || storage.createdSizes[0] != cacheVolumeLimit {
+		t.Fatalf("Docker store sizes = %v, want %d", storage.createdSizes, cacheVolumeLimit)
+	}
+	if len(attacher.attached) != 1 || attacher.attached[0] != 0 {
+		t.Fatalf("Docker store attached slots = %v, want [0]", attacher.attached)
+	}
+
+	sticky := cacheRequest(t, service, token, "/v1/volumes", map[string]any{
+		"key": "acme/api/npm", "size_bytes": int64(1 << 30),
+	})
+	if sticky.Code != http.StatusCreated {
+		t.Fatalf("sticky disk status = %d: %s", sticky.Code, sticky.Body.String())
+	}
+	if len(attacher.attached) != 2 || attacher.attached[1] != 1 {
+		t.Fatalf("attachment slots = %v, want Docker in 0 and sticky disk in 1", attacher.attached)
+	}
+
+	storage.advanceOnSnapshot = true
+	committed := cacheRequest(t, service, token, "/v1/volumes/0/commit", map[string]any{
+		"filesystem": map[string]any{"type": "ext4", "uuid": "docker-fs", "clean": true},
+	})
+	if committed.Code != http.StatusOK {
+		t.Fatalf("Docker store commit status = %d: %s", committed.Code, committed.Body.String())
+	}
+	if got := storage.publishExpected; len(got) != 2 || got[0] != "" || got[1] != "concurrent" {
+		t.Errorf("Docker publication expectations = %v, want an LWW rebase", got)
+	}
+}
+
+func TestDockerImageStoreRefusesAnUnusableArchitecture(t *testing.T) {
+	t.Parallel()
+
+	service, storage, token := testCacheService(t, provider.TrustTrusted)
+	for _, architecture := range []string{"", "amd64/other", "amd64\nother", "amd 64", "-amd64"} {
+		response := cacheRequest(t, service, token, "/v1/docker-store",
+			map[string]any{"architecture": architecture})
+		if response.Code != http.StatusBadRequest {
+			t.Errorf("architecture %q returned HTTP %d, want 400", architecture, response.Code)
+		}
+	}
+	if storage.created != 0 || storage.cloned != 0 {
+		t.Errorf("invalid architectures created/cloned %d/%d stores", storage.created, storage.cloned)
+	}
+}
+
 func TestCacheKeysAreNamespacedByDeployment(t *testing.T) {
 	t.Parallel()
 
@@ -496,14 +578,14 @@ func TestRunnerCarriesTheNodesRegistryMirrorsToItsGuest(t *testing.T) {
 	}
 }
 
-// The historical name is retained for the mutation gate; the safe behavior is
-// now that no architecture-scoped image store is supplied until publication can
-// be gated on an authoritative job result.
+// The historical name is retained for the mutation gate. The store is requested
+// by the root guest agent after the VM starts, before it starts the runner.
 func TestFirecrackerBootsWithAnArchitectureScopedDockerImageStore(t *testing.T) {
 	p := &fakeProvider{kind: config.ProviderFirecracker}
 	storage := &fakeCacheStore{}
+	attacher := &fakeVolumeAttacher{}
 	service, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", t.TempDir(), storage,
-		&fakeVolumeAttacher{}, slog.New(slog.DiscardHandler))
+		attacher, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("NewCacheService: %v", err)
 	}
@@ -536,8 +618,14 @@ func TestFirecrackerBootsWithAnArchitectureScopedDockerImageStore(t *testing.T) 
 	if len(p.launched) != 1 || len(p.launched[0].Volumes) != 0 {
 		t.Fatalf("launch volumes = %+v", p.launched)
 	}
-	if storage.created != 0 {
-		t.Errorf("created %d Docker image stores without a safe publication gate, want 0", storage.created)
+	response := cacheRequest(t, service, p.launched[0].CacheToken, "/v1/docker-store",
+		map[string]any{"architecture": "amd64"})
+	if response.Code != http.StatusCreated {
+		t.Fatalf("guest Docker store request returned HTTP %d: %s", response.Code, response.Body.String())
+	}
+	if storage.created != 1 || len(attacher.attached) != 1 || attacher.attached[0] != 0 {
+		t.Errorf("created %d Docker stores and attached slots %v, want one in slot 0",
+			storage.created, attacher.attached)
 	}
 }
 

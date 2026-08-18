@@ -498,6 +498,8 @@ BUILT_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 IMAGEINFO
 
 	echo "=== 4/6 the agent that reads the registration ==="
+	install -m 0755 "$SCRIPT_DIR/../internal/guestassets/docker-cache.sh" \
+		"$rootfs/usr/local/bin/billet-docker-cache"
 	install -m 0755 /dev/stdin "$rootfs/usr/local/bin/billet-agent" <<'AGENT'
 #!/bin/bash
 # Read this microVM's runner registration out of the metadata service and start the
@@ -614,58 +616,33 @@ if candidate=$(fetch registry-mirrors 2>/dev/null); then
 	fi
 fi
 
-# THE DOCKER IMAGE STORE IS ATTACHED BEFORE BOOT, because service containers are
-# pulled before the first workflow step and an action is therefore too late. Slot
-# zero is reserved for it; ordinary sticky disks hot-attach in the remaining four.
-# Every error here degrades to the root disk and a cold pull rather than preventing
-# the runner from starting.
+# THE DOCKER IMAGE STORE IS ATTACHED BEFORE THE RUNNER, because service containers
+# are pulled before the first workflow step and an action is therefore too late.
+# Slot zero is reserved for it; ordinary sticky disks use the remaining four. The
+# shared helper uses the same node API on Firecracker and EC2.
 cache_endpoint=""
 cache_token=""
 buildkit_cache_mount_limit_bytes=""
-docker_cache=0
-docker_images_before=""
 
 if cache_endpoint=$(fetch cache-endpoint 2>/dev/null) &&
 	cache_token=$(fetch cache-token 2>/dev/null) &&
 	buildkit_cache_mount_limit_bytes=$(fetch buildkit-cache-mount-limit-bytes 2>/dev/null) &&
 	[ -n "$cache_endpoint" ] && [ -n "$cache_token" ] &&
-	[[ "$buildkit_cache_mount_limit_bytes" =~ ^[1-9][0-9]*$ ]] &&
-	[ -b /dev/vdb ] && [ "$(blockdev --getsize64 /dev/vdb 2>/dev/null || echo 0)" -gt 0 ]; then
-	set +e
-	cache_type=$(blkid -o value -s TYPE /dev/vdb 2>/dev/null)
-	blkid_status=$?
-	set -e
-	if [ "$blkid_status" -eq 2 ]; then
-		if ! mkfs.ext4 -q -F /dev/vdb; then
-			log "the Docker image cache could not be formatted; this job will pull cold"
-		elif mount -t ext4 -o noatime /dev/vdb /var/lib/docker; then
-			docker_cache=1
-		fi
-	elif [ "$blkid_status" -ne 0 ]; then
-		log "the Docker image cache signature could not be read; refusing to format the device"
-	elif [ "$cache_type" != ext4 ]; then
-		log "the Docker image cache contains $cache_type rather than ext4; this job will pull cold"
-	elif mount -t ext4 -o noatime /dev/vdb /var/lib/docker; then
-		docker_cache=1
-	fi
-fi
-
-if [ "$docker_cache" -eq 0 ] && [ -n "$cache_endpoint" ] && [ -n "$cache_token" ]; then
-	curl -sf --connect-timeout 3 --max-time 10 -X POST -H "Authorization: Bearer $cache_token" \
-		"$cache_endpoint/v1/volumes/0/discard" >/dev/null 2>&1 || true
+	[[ "$buildkit_cache_mount_limit_bytes" =~ ^[1-9][0-9]*$ ]]; then
+	export BILLET_CACHE_ENDPOINT="$cache_endpoint"
+	export BILLET_CACHE_TOKEN="$cache_token"
+	export BILLET_BUILDKIT_CACHE_MOUNT_LIMIT_BYTES="$buildkit_cache_mount_limit_bytes"
+else
+	cache_endpoint=""
+	cache_token=""
+	buildkit_cache_mount_limit_bytes=""
 fi
 
 # Docker is deliberately not enabled at boot. Starting it only after the cache
 # device is mounted is what makes /var/lib/docker transparent to service
 # containers rather than a volume that hides a daemon's already-open files.
-if ! systemctl start docker.service; then
-	log "Docker did not start"
+if ! /usr/local/bin/billet-docker-cache prepare; then
 	exit 1
-fi
-
-if [ "$docker_cache" -eq 1 ]; then
-	docker_images_before=$(docker image ls --no-trunc --digests \
-		--format '{{.Repository}} {{.Digest}} {{.ID}}' 2>/dev/null | sort || true)
 fi
 
 # THE COMMAND ARRIVES AS JSON IN A STRING, and both halves of that are deliberate.
@@ -815,6 +792,7 @@ cd /home/runner/runner
 # user cache directory. The EC2 image entrypoint establishes the same three values.
 runner_env=(
 	"ACTIONS_RUNNER_INPUT_JITCONFIG=$ACTIONS_RUNNER_INPUT_JITCONFIG"
+	"ACTIONS_RUNNER_RETURN_JOB_RESULT_FOR_HOSTED=true"
 	"HOME=/home/runner"
 	"USER=runner"
 	"LOGNAME=runner"
@@ -837,26 +815,13 @@ job_status=$?
 # BILLET_AGENT_LAUNCH_END
 set -e
 
-if [ "$docker_cache" -eq 1 ]; then
-	docker_images_after=$(docker image ls --no-trunc --digests \
-		--format '{{.Repository}} {{.Digest}} {{.ID}}' 2>/dev/null | sort || true)
-	if ! systemctl stop docker.service docker.socket; then
-		log "Docker did not stop cleanly; discarding its cache writes"
-	elif sync -f /var/lib/docker && umount /var/lib/docker; then
-		if [ "$docker_images_before" != "$docker_images_after" ]; then
-			log "Docker image publication is disabled until the runner supplies an authoritative job result"
-		fi
-		if ! curl -sf --connect-timeout 3 --max-time 10 -X POST \
-			-H "Authorization: Bearer $cache_token" \
-			"$cache_endpoint/v1/volumes/0/discard" >/dev/null; then
-			log "the Docker image cache could not be discarded; the job result is unchanged"
-		fi
-	else
-		log "the Docker image cache could not be unmounted; its writes will be discarded"
-	fi
-fi
+/usr/local/bin/billet-docker-cache complete "$job_status"
 
-exit "$job_status"
+# GitHub has already recorded every recognized one-job result. Preserve the
+# runner service's exit contract after using its richer code as a cache gate.
+service_status=$(/usr/local/bin/billet-docker-cache service-status "$job_status") ||
+	service_status=$job_status
+exit "$service_status"
 AGENT
 
 	install -m 0644 /dev/stdin "$rootfs/etc/systemd/system/billet-agent.service" <<'UNIT'

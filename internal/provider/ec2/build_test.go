@@ -18,6 +18,9 @@ func TestTheProvisionScriptContainsWhatAnImageNeeds(t *testing.T) {
 	t.Parallel()
 
 	got := mustScript(t)
+	if len(got) > maxUserData {
+		t.Fatalf("the provisioning script is %d bytes and EC2 accepts %d", len(got), maxUserData)
+	}
 
 	// NOT installdependencies.sh, which the runner ships and which does not work on
 	// Amazon Linux 2023: it reads /etc/os-release, finds ID_LIKE="fedora", and exits
@@ -34,6 +37,7 @@ func TestTheProvisionScriptContainsWhatAnImageNeeds(t *testing.T) {
 	}{
 		{"set -eux", "without -e a failed step is followed by poweroff, and billet images it"},
 		{"dnf install -y docker", "workflows use service containers and docker build"},
+		{"jq e2fsprogs util-linux", "the transparent Docker cache formats and verifies ext4"},
 		{"git", "actions/checkout wants it"},
 		{"tar", "actions/setup-* unpack what they download"},
 		{"useradd", "the runner refuses to run as root, and untrusted jobs must not"},
@@ -229,7 +233,7 @@ func TestTheEntryPointCarriesTheRegistrationAcrossTheUserChange(t *testing.T) {
 	}
 
 	if !strings.Contains(entry, "/opt/actions-runner/run.sh") {
-		t.Error("the entry point does not exec the runner")
+		t.Error("the entry point does not run the runner")
 	}
 
 	// AND IT WAITS FOR DOCKER FIRST. A verification run of a real image found the
@@ -243,8 +247,12 @@ func TestTheEntryPointCarriesTheRegistrationAcrossTheUserChange(t *testing.T) {
 
 	for fragment, why := range map[string]string{
 		`ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/bin/billet-job-started.sh`: "the runner would not invoke the cold-start measurement hook",
+		`ACTIONS_RUNNER_RETURN_JOB_RESULT_FOR_HOSTED=true`:                     "the image store could not distinguish a clean success from a failed job",
 		`BILLET_LAUNCH_EPOCH_NS="${BILLET_LAUNCH_EPOCH_NS:-}"`:                 "the launch timestamp would be lost across the user change",
 		`BILLET_RUNNER_START_EPOCH_NS="$runner_started"`:                       "the hook could not split boot from registration and pickup",
+		`/usr/local/bin/billet-docker-cache prepare`:                           "service-container images would be pulled before their cache is mounted",
+		`/usr/local/bin/billet-docker-cache complete "$job_status"`:            "the image-store clone would never be published or discarded",
+		`/usr/local/bin/billet-docker-cache service-status "$job_status"`:      "the runner service exit contract would not be preserved",
 	} {
 		if !strings.Contains(entry, fragment) {
 			t.Errorf("the entry point is missing %q — %s", fragment, why)
