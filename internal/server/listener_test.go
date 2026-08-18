@@ -384,6 +384,40 @@ func TestAdvertisingNothingAlsoRefusesWork(t *testing.T) {
 	}
 }
 
+func TestAdvertisingNothingStillPreservesAndProcessesCompletions(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, tiers)
+	db := openState(t)
+	acknowledged := false
+	session := &fakeSession{onDelete: func(int64) error {
+		acknowledged = true
+
+		return nil
+	}}
+	var destroys atomic.Int32
+	l := NewListener(a, tiers[0].Label, session, WithMaxCapacity(0), WithCompletionStore(db),
+		WithRunner(&fakeRunner{onDestroyCompleted: func(int64, string) error {
+			destroys.Add(1)
+
+			return errors.New("node unavailable")
+		}}))
+	job := Job{RequestID: 12, RunID: 102, Result: "Succeeded"}
+	lease := holdRunning(t, l, a, tiers[0].Label, job.RequestID)
+	if err := l.handle(t.Context(), &Message{MessageID: 1, Completed: []Job{job}}); err != nil {
+		t.Fatalf("handle completed message while advertising nothing: %v", err)
+	}
+	if !acknowledged || destroys.Load() != 1 {
+		t.Fatalf("completion acknowledged=%t destroys=%d, want true/1", acknowledged, destroys.Load())
+	}
+	pending, err := db.PendingCompletions(t.Context(), tiers[0].Label)
+	if err != nil {
+		t.Fatalf("PendingCompletions: %v", err)
+	}
+	if len(pending) != 1 || pending[0].LeaseID != lease.ID {
+		t.Fatalf("durable zero-capacity completion = %+v, want lease %s", pending, lease.ID)
+	}
+}
+
 // AVAILABLE is what gets acquired; ASSIGNED is what consumes escrow.
 //
 // Available is the OFFER — the message whose RunnerRequestID claims work.
@@ -2171,6 +2205,48 @@ func TestCompletionRestoresItsLeaseWhenReleaseIsInterruptedAfterDestroy(t *testi
 	}
 	if usage.Leases != 0 {
 		t.Fatalf("restored completion left %d leases consuming capacity", usage.Leases)
+	}
+}
+
+func TestShutdownRetainsACompletionUntilItsCapacityReleaseSettles(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, tiers)
+	db := openState(t)
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithCompletionStore(db),
+		WithRunner(&fakeRunner{}))
+	job := Job{RequestID: 75, RunID: 85, Result: "Succeeded"}
+	lease := holdRunning(t, l, a, tiers[0].Label, job.RequestID)
+	if err := l.recordCompletion(t.Context(), job); err != nil {
+		t.Fatalf("recordCompletion: %v", err)
+	}
+	if err := l.restoreCompletions(t.Context()); err != nil {
+		t.Fatalf("restoreCompletions: %v", err)
+	}
+	destroyed := l.destroyAll(t.Context())
+	interrupted, cancel := context.WithCancel(t.Context())
+	cancel()
+	l.releaseAll(interrupted, destroyed)
+
+	pending, err := db.PendingCompletions(t.Context(), tiers[0].Label)
+	if err != nil {
+		t.Fatalf("PendingCompletions after shutdown release failure: %v", err)
+	}
+	if len(pending) != 1 || pending[0].LeaseID != lease.ID {
+		t.Fatalf("shutdown lost its release obligation: %+v, want lease %s", pending, lease.ID)
+	}
+
+	restarted := NewListener(a, tiers[0].Label, &fakeSession{}, WithCompletionStore(db),
+		WithCleanupRetryPacing(0, 0), WithRunner(&fakeRunner{}))
+	if err := restarted.restoreCompletions(t.Context()); err != nil {
+		t.Fatalf("restoreCompletions after shutdown: %v", err)
+	}
+	restarted.retryCleanup(t.Context())
+	pending, err = db.PendingCompletions(t.Context(), tiers[0].Label)
+	if err != nil {
+		t.Fatalf("PendingCompletions after restored release: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("settled shutdown release retained its durable obligation: %+v", pending)
 	}
 }
 

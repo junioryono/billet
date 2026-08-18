@@ -1472,7 +1472,7 @@ func (l *Listener) destroyAll(ctx context.Context) map[int64]bool {
 			// destroy, but it IS a request that no longer needs anything from this
 			// listener, which is what the caller reads this map for.
 			held := errors.Is(err, ErrCustody)
-			if err == nil || held {
+			if held {
 				l.forgetCompletion(ctx, job)
 			}
 
@@ -1901,6 +1901,27 @@ func (l *Listener) refillEscrow(ctx context.Context) error {
 // about error severity, so the first non-fatal error path anyone adds inherits
 // the question.
 func (l *Listener) handle(ctx context.Context, msg *Message) error {
+	// COMPLETED IS PROCESSED FIRST. Otherwise the cycle never closes — the lease stays
+	// open until the reaper expires it — and it must come first because GitHub batches
+	// the completion of one job with the offer of its replacement: acquiring before
+	// releasing claims the replacement while still holding the finished job's lease.
+	//
+	// `finished` is scoped to THIS MESSAGE, which is the whole lifetime the problem
+	// has. A batch can carry Assigned and Completed for the same request — an
+	// assigned-then-cancelled job — and it does not need to survive the call, because a
+	// redelivery rebuilds it before the assignments are read. A longer-lived map would
+	// silently skip a request id GitHub requeued after cancelling it.
+	finished := make(map[int64]struct{}, len(msg.Completed))
+
+	for _, job := range msg.Completed {
+		finished[job.RequestID] = struct{}{}
+
+		if err := l.recordCompletion(ctx, job); err != nil {
+			return err
+		}
+		l.complete(ctx, job)
+	}
+
 	// A zero advertisement is not the same as refusing work, and this is where
 	// the difference is enforced.
 	//
@@ -1925,27 +1946,6 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 		l.lastMessageID = msg.MessageID
 
 		return nil
-	}
-
-	// COMPLETED IS PROCESSED FIRST. Otherwise the cycle never closes — the lease stays
-	// open until the reaper expires it — and it must come first because GitHub batches
-	// the completion of one job with the offer of its replacement: acquiring before
-	// releasing claims the replacement while still holding the finished job's lease.
-	//
-	// `finished` is scoped to THIS MESSAGE, which is the whole lifetime the problem
-	// has. A batch can carry Assigned and Completed for the same request — an
-	// assigned-then-cancelled job — and it does not need to survive the call, because a
-	// redelivery rebuilds it before the assignments are read. A longer-lived map would
-	// silently skip a request id GitHub requeued after cancelling it.
-	finished := make(map[int64]struct{}, len(msg.Completed))
-
-	for _, job := range msg.Completed {
-		finished[job.RequestID] = struct{}{}
-
-		if err := l.recordCompletion(ctx, job); err != nil {
-			return err
-		}
-		l.complete(ctx, job)
 	}
 
 	// NO NEW WORK WHILE DRAINING, and the refusal has to be HERE rather than in
@@ -2594,9 +2594,16 @@ func (l *Listener) forgetCompletion(ctx context.Context, job Job) {
 	if l.completionStore == nil || job.Result == "" {
 		return
 	}
-	if err := l.completionStore.DeletePendingCompletion(ctx, l.tier, job.RequestID); err != nil {
-		l.log.Error("the node accepted a completed job result, but its durable delivery record could not be removed; a restart will safely deliver it again",
-			"tier", l.tier, "request", job.RequestID, "error", err)
+	l.forgetCompletionRequest(ctx, job.RequestID)
+}
+
+func (l *Listener) forgetCompletionRequest(ctx context.Context, requestID int64) {
+	if l.completionStore == nil {
+		return
+	}
+	if err := l.completionStore.DeletePendingCompletion(ctx, l.tier, requestID); err != nil {
+		l.log.Error("a completed job settled, but its durable obligation could not be removed; a restart will safely settle it again",
+			"tier", l.tier, "request", requestID, "error", err)
 	}
 }
 
@@ -2975,7 +2982,8 @@ func (l *Listener) releaseAll(ctx context.Context, destroyed map[int64]bool) {
 	var stuck []*alloc.Lease
 
 	release := func(lease *alloc.Lease) {
-		if err := l.alloc.Release(ctx, lease.ID, lease.Epoch, alloc.PhaseDone); err != nil {
+		err := l.alloc.Release(ctx, lease.ID, lease.Epoch, alloc.PhaseDone)
+		if err != nil {
 			l.log.Warn("could not release escrowed capacity",
 				"tier", l.tier, "lease", lease.ID, "error", err)
 
@@ -3018,7 +3026,15 @@ func (l *Listener) releaseAll(ctx context.Context, destroyed map[int64]bool) {
 			continue
 		}
 
-		release(lease)
+		err := l.releaseAbsent(ctx, requestID, lease, alloc.PhaseDone)
+		if !releaseSettled(err) {
+			l.log.Warn("could not release completed capacity after compute was confirmed absent",
+				"tier", l.tier, "request", requestID, "lease", lease.ID, "error", err)
+			stuck = append(stuck, lease)
+
+			continue
+		}
+		l.forgetCompletionRequest(ctx, requestID)
 	}
 
 	// Promised escrow too. The acquisition was made to GitHub, but nothing has
@@ -3031,13 +3047,21 @@ func (l *Listener) releaseAll(ctx context.Context, destroyed map[int64]bool) {
 	// And the parked ones, with the outcome they were parked with: a launch that
 	// never started did not finish, whatever the ordinary path records.
 	for id, entry := range parked {
-		if err := l.releaseAbsent(ctx, id, entry.lease, entry.outcome); err != nil {
+		outcome := entry.outcome
+		if outcome == "" {
+			outcome = alloc.PhaseDone
+		}
+		err := l.releaseAbsent(ctx, id, entry.lease, outcome)
+		if err != nil {
 			l.log.Warn("could not release cleanup capacity after compute was confirmed absent",
 				"tier", l.tier, "request", id, "lease", entry.lease.ID, "error", err)
 
 			if !releaseSettled(err) {
 				stuck = append(stuck, entry.lease)
 			}
+		}
+		if releaseSettled(err) {
+			l.forgetCompletionRequest(ctx, id)
 		}
 	}
 

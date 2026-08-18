@@ -11,9 +11,6 @@ cache_call() {
 	body=${2:-}
 	timeout=${3:-120}
 	token=${BILLET_CACHE_TOKEN:-}
-	if [ "$path" = /v1/docker-store/ready ]; then
-		token=${BILLET_CACHE_READY_TOKEN:-}
-	fi
 	if [ -n "$body" ]; then
 		curl -fsS --connect-timeout 3 --max-time "$timeout" -X POST \
 			-H "Authorization: Bearer $token" \

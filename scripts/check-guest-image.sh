@@ -99,7 +99,7 @@ for assignment in '"HOME=/home/runner"' '"USER=runner"' '"LOGNAME=runner"' \
 		runner_environment=0
 	fi
 done
-if ! grep -Fq 'env "${runner_env[@]}" "${cmd[@]}"' "$AGENT" 2>/dev/null; then
+if ! grep -Fq 'env -i "${runner_env[@]}" "${cmd[@]}"' "$AGENT" 2>/dev/null; then
 	runner_environment=0
 fi
 if [ "$runner_environment" -eq 1 ]; then

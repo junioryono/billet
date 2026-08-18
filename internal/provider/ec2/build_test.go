@@ -71,10 +71,10 @@ func TestTheCloudRunnerNeverInheritsTheReadinessCapability(t *testing.T) {
 	}
 	if !strings.Contains(entrypoint, "env -i ") ||
 		!strings.Contains(entrypoint, "BILLET_CACHE_TOKEN=\"${BILLET_CACHE_TOKEN:-}\"") {
-		t.Fatal("the EC2 runner does not receive its workflow bearer through a clean environment")
+		t.Fatal("the EC2 runner does not receive its cache session through a clean environment")
 	}
-	if strings.Contains(entrypoint, "BILLET_CACHE_READY_TOKEN=") {
-		t.Fatal("the EC2 runner receives the root helper's readiness capability")
+	if strings.Contains(script, "BILLET_CACHE_READY_TOKEN") {
+		t.Fatal("the EC2 image still carries a readiness pseudo-secret inside a root-controlled guest")
 	}
 }
 

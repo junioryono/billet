@@ -386,11 +386,7 @@ func TestDockerImageStoreIsArchitectureScopedAndReservesSlotZero(t *testing.T) {
 	proof := map[string]any{
 		"filesystem": map[string]any{"type": "ext4", "uuid": "docker-fs", "clean": true},
 	}
-	if forged := cacheRequest(t, service, token, "/v1/docker-store/ready", proof); forged.Code != http.StatusUnauthorized {
-		t.Fatalf("workflow Docker readiness status = %d, want 401: %s",
-			forged.Code, forged.Body.String())
-	}
-	if early := cacheRequest(t, service, credentials.ReadyToken, "/v1/docker-store/ready", proof); early.Code != http.StatusConflict {
+	if early := cacheRequest(t, service, token, "/v1/docker-store/ready", proof); early.Code != http.StatusConflict {
 		t.Fatalf("early helper Docker readiness status = %d, want 409: %s",
 			early.Code, early.Body.String())
 	}
@@ -398,7 +394,7 @@ func TestDockerImageStoreIsArchitectureScopedAndReservesSlotZero(t *testing.T) {
 	go func() { settled <- service.SettleDocker(t.Context(), "billet-one", true) }()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		ready := cacheRequest(t, service, credentials.ReadyToken, "/v1/docker-store/ready", proof)
+		ready := cacheRequest(t, service, token, "/v1/docker-store/ready", proof)
 		if ready.Code == http.StatusOK {
 			break
 		}
@@ -437,7 +433,7 @@ func TestFailedJobLeavesTheDockerStoreAttachedUntilComputeIsGone(t *testing.T) {
 		map[string]any{"architecture": "amd64"}); response.Code != http.StatusCreated {
 		t.Fatalf("Docker store status = %d: %s", response.Code, response.Body.String())
 	}
-	if response := cacheRequest(t, service, credentials.ReadyToken, "/v1/docker-store/ready", map[string]any{
+	if response := cacheRequest(t, service, token, "/v1/docker-store/ready", map[string]any{
 		"filesystem": map[string]any{"type": "ext4", "uuid": "docker-fs", "clean": true},
 	}); response.Code != http.StatusConflict {
 		t.Fatalf("failed job's early Docker readiness status = %d, want 409: %s",
@@ -597,11 +593,9 @@ func TestRunnerBindsCacheAccessToTheComputeLifetime(t *testing.T) {
 	}
 
 	spec := p.launched[0]
-	if spec.CacheEndpoint != service.Endpoint() || spec.CacheToken == "" ||
-		spec.CacheReadyToken == "" || spec.CacheReadyToken == spec.CacheToken {
-		t.Fatalf("guest cache credentials = endpoint %q workflow token present %t, distinct readiness token present %t",
-			spec.CacheEndpoint, spec.CacheToken != "",
-			spec.CacheReadyToken != "" && spec.CacheReadyToken != spec.CacheToken)
+	if spec.CacheEndpoint != service.Endpoint() || spec.CacheToken == "" {
+		t.Fatalf("guest cache credentials = endpoint %q token present %t",
+			spec.CacheEndpoint, spec.CacheToken != "")
 	}
 	if spec.BuildKitCacheMountLimit != config.DefaultBuildKitCacheMountLimit {
 		t.Errorf("guest BuildKit mount limit = %s, want %s", spec.BuildKitCacheMountLimit,
@@ -742,8 +736,7 @@ func TestCachePreparationFailureDoesNotFailTheJob(t *testing.T) {
 	if len(p.launched) != 1 {
 		t.Fatalf("launched %d jobs, want 1", len(p.launched))
 	}
-	if p.launched[0].CacheEndpoint != "" || p.launched[0].CacheToken != "" ||
-		p.launched[0].CacheReadyToken != "" {
+	if p.launched[0].CacheEndpoint != "" || p.launched[0].CacheToken != "" {
 		t.Fatalf("cold launch retained cache credentials: %+v", p.launched[0])
 	}
 }
@@ -788,6 +781,14 @@ func TestCacheCustodySurvivesANodeProcessRestart(t *testing.T) {
 	})
 	if attached.Code != http.StatusCreated {
 		t.Fatalf("attach status = %d: %s", attached.Code, attached.Body.String())
+	}
+	custodyPath := filepath.Join(stateDir, cacheSessionDirectory, token+".json")
+	custody, err := os.ReadFile(custodyPath)
+	if err != nil {
+		t.Fatalf("read cache custody before restart: %v", err)
+	}
+	if bytes.Contains(custody, []byte(`"ready_token"`)) {
+		t.Fatal("cache custody still requires an intra-guest readiness credential")
 	}
 
 	second, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", stateDir,
@@ -874,9 +875,8 @@ func TestCacheBearerTokensArePersistedOnlyInPrivateFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read cache custody: %v", err)
 	}
-	if !bytes.Contains(body, []byte(credentials.Token)) ||
-		!bytes.Contains(body, []byte(credentials.ReadyToken)) {
-		t.Fatal("cache custody did not preserve both purpose-bound capabilities")
+	if !bytes.Contains(body, []byte(credentials.Token)) {
+		t.Fatal("cache custody did not preserve its session credential")
 	}
 }
 

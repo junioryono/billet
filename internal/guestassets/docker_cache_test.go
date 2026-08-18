@@ -78,7 +78,6 @@ printf '{"ready":true}\n'
 				"PATH="+shadow+":"+os.Getenv("PATH"),
 				"BILLET_CACHE_ENDPOINT=http://cache.test",
 				"BILLET_CACHE_TOKEN=test-token",
-				"BILLET_CACHE_READY_TOKEN=test-ready-token",
 				"BILLET_DOCKER_CACHE_STATE_DIR="+state,
 				"BILLET_TEST_IMAGES_AFTER="+tc.after,
 				"BILLET_TEST_DOCKER_EXIT="+tc.afterExit,
@@ -99,8 +98,8 @@ printf '{"ready":true}\n'
 					tc.status, tc.before, tc.after, called, tc.endpoint)
 			}
 			if tc.endpoint == "/v1/docker-store/ready" &&
-				!strings.Contains(string(called), "Authorization: Bearer test-ready-token") {
-				t.Errorf("readiness call did not use the helper-only bearer:\n%s", called)
+				!strings.Contains(string(called), "Authorization: Bearer test-token") {
+				t.Errorf("readiness call did not use the guest session bearer:\n%s", called)
 			}
 		})
 	}

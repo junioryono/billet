@@ -2442,18 +2442,19 @@ func TestCloudBootExportsItsOneJobCacheSession(t *testing.T) {
 	spec := validSpec()
 	spec.CacheEndpoint = "https://cache.aws.example:7718"
 	spec.CacheToken = "secret-cache-session"
-	spec.CacheReadyToken = "secret-cache-readiness"
 	spec.BuildKitCacheMountLimit = 4 * config.GiB
 	script := mustUserData(t, p, spec)
 	for _, want := range []string{
 		"BILLET_CACHE_ENDPOINT='https://cache.aws.example:7718'",
 		"BILLET_CACHE_TOKEN='secret-cache-session'",
-		"BILLET_CACHE_READY_TOKEN='secret-cache-readiness'",
 		"BILLET_BUILDKIT_CACHE_MOUNT_LIMIT_BYTES='4294967296'",
 	} {
 		if !strings.Contains(script, want) {
 			t.Errorf("boot script does not contain %q: %s", want, script)
 		}
+	}
+	if strings.Contains(script, "BILLET_CACHE_READY_TOKEN") {
+		t.Fatal("user data carries a readiness pseudo-secret inside a root-controlled guest")
 	}
 
 	spec.CacheToken = ""
