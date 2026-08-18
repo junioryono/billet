@@ -433,18 +433,19 @@ func TestAProviderChangeAfterEnqueueRefusesTheStaleLaunch(t *testing.T) {
 	register(t, p, "worker", config.ProviderDocker)
 
 	p.mu.Lock()
-	n := p.nodes["worker"]
-	pend := &pending{
-		cmd: nodeapi.Command{
-			ID:   "c1",
-			Kind: nodeapi.CommandLaunch,
-			Tier: &nodeapi.TierSpec{Image: "docker-image"},
-		},
-		done:             make(chan nodeapi.CommandResult, 1),
-		expectedProvider: config.ProviderDocker,
-	}
-	n.queue = append(n.queue, pend)
+	enqueued := p.nodes["worker"].waiting
 	p.mu.Unlock()
+
+	launched := make(chan error, 1)
+	go func() {
+		launched <- p.NewRunner().Launch(t.Context(), testLease(), server.Job{RequestID: 7})
+	}()
+
+	select {
+	case <-enqueued:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the production launch path did not enqueue its command")
+	}
 
 	register(t, p, "worker", config.ProviderEC2)
 
@@ -457,11 +458,11 @@ func TestAProviderChangeAfterEnqueueRefusesTheStaleLaunch(t *testing.T) {
 	}
 
 	select {
-	case res := <-pend.done:
-		if res.OK || !strings.Contains(res.Error, "changed provider from docker to ec2") {
-			t.Errorf("stale launch result = %+v, want a useful clean failure", res)
+	case err := <-launched:
+		if err == nil || !strings.Contains(err.Error(), "changed provider from docker to ec2") {
+			t.Errorf("stale launch result = %v, want a useful clean failure", err)
 		}
-	default:
+	case <-time.After(2 * time.Second):
 		t.Fatal("the caller was left waiting for a stale launch that cannot be delivered")
 	}
 }
