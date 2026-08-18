@@ -273,10 +273,9 @@ func LeaseOf(instanceName string) (string, bool) {
 //
 // THE DISTINCTION EXISTS BECAUSE ONE BACKEND CANNOT MAKE THE PROMISE THE OTHERS
 // CAN. `docker rm --force` returns when the container is gone, so its caller may
-// treat a successful Destroy as proof. EC2's TerminateInstances returns when the
-// request is ACCEPTED — the guest keeps running for a minute or two while the
-// instance moves through `shutting-down`, which billet's own runningState
-// classifies as a state where the job may still be executing.
+// treat a successful Destroy as proof. EC2 cannot: TerminateInstances returns
+// when the request is accepted, while an idempotent NotFound may be an eventually
+// consistent miss. Neither confirms the guest is gone.
 //
 // Callers used to read every Destroy the docker way, and the consequence was not
 // money (#46). Destroy is reached on paths where the guest is still working — a

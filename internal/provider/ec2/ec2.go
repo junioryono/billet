@@ -1281,9 +1281,11 @@ func shellCommand(argv []string) (string, error) {
 // have already failed once, and erroring there turns recoverable state into stuck
 // state.
 //
-// IT RETURNS WHEN THE REQUEST IS ACCEPTED, NOT WHEN THE MACHINE IS GONE. The
-// caller transfers the lease to custody, which keeps capacity charged and checks
-// the instance out of band while this serial command queue remains available.
+// IT DOES NOT CONFIRM THE MACHINE IS GONE. TerminateInstances returns when AWS
+// accepts the request, and an idempotent NotFound may be an eventually consistent
+// miss. The caller transfers the lease to custody, which keeps capacity charged
+// and checks the instance out of band while this serial command queue remains
+// available.
 // `shutting-down` stays in List because the guest may still be executing there.
 // An absence is trusted only after the instance has appeared in inventory or the
 // eventually-consistent stray grace has elapsed.

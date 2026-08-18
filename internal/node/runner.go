@@ -762,8 +762,8 @@ func (r *Runner) destroyStray(ctx context.Context, name string) (bool, error) {
 
 	// THE BOOL ALREADY MEANT "CONFIRMED", which is what makes this fit without
 	// changing anything above it: the caller keeps the capacity in custody when
-	// this is false, and that is the correct treatment of a teardown the backend
-	// has only accepted (#46). It is also the right answer for #48 — this is the
+	// this is false, and that is the correct treatment of an unconfirmed teardown
+	// (#46). It is also the right answer for #48 — this is the
 	// path most likely to be destroying an instance EC2 launched moments ago, so
 	// it is the one whose "already gone" is least trustworthy.
 	if state != provider.TeardownStopped {
@@ -1134,8 +1134,8 @@ func (r *Runner) Sweep(ctx context.Context) error {
 		// does nothing and skipping it costs nothing. The case it exists for is the
 		// other one: the lease went terminal between the two reads, so this call
 		// really would be the thing that hands the capacity back. Doing that on an
-		// unconfirmed teardown frees the machine for another tier
-		// while the guest is still shutting down.
+		// unconfirmed teardown frees the machine for another tier while the guest may
+		// still exist.
 		//
 		// The next sweep sees the instance again and finishes the job.
 		if state != provider.TeardownStopped {

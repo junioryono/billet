@@ -536,9 +536,9 @@ func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 	}
 
 	// THE SAME TRAP AS THE LISTENER'S, ONE LAYER DOWN (#46). finish releases the
-	// lease, and calling it on the strength of an ACCEPTED teardown would free the
-	// capacity while the guest was still shutting down — inside the very machinery
-	// that exists to stop that happening.
+	// lease, and calling it on the strength of an unconfirmed teardown could free
+	// capacity while the guest still exists — inside the very machinery that exists
+	// to stop that happening.
 	//
 	// Nothing else is needed to recover: the entry stays in custody, so the next
 	// tick looks again, and the release happens when Find reports the instance
@@ -549,9 +549,8 @@ func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 
 		// SAID ONCE, THOUGH THE REQUEST IS RE-ISSUED EVERY TICK. Re-asking is the
 		// safety net for a teardown that was not confirmed, and it is
-		// idempotent and cheap; saying so on every tick for the minute or two an
-		// EC2 instance spends shutting down is just noise in the one log an
-		// operator reads to find out what a host is holding.
+		// idempotent and cheap; saying so on every tick while EC2 converges is just
+		// noise in the one log an operator reads to find out what a host is holding.
 		if !c.asked {
 			c.asked = true
 

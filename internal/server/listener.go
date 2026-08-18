@@ -1427,8 +1427,8 @@ func (l *Listener) destroyAll(ctx context.Context) map[int64]bool {
 			//
 			// The node asked its backend to stop the guest without receiving proof it
 			// stopped, and is holding the lease until the compute is provably gone.
-			// Nothing here can improve on that: retrying re-issues a terminate
-			// against a guest already shutting down, and keeping the entry — lease
+			// Nothing here can improve on that: retrying re-issues a teardown whose
+			// outcome is already being reconciled, and keeping the entry — lease
 			// and all — has this listener releasing capacity the node's janitor is
 			// about to release itself.
 			//
@@ -2466,16 +2466,15 @@ func (l *Listener) complete(ctx context.Context, job Job) {
 	if err := l.runner.Destroy(ctx, job.RequestID); err != nil {
 		// THE RUNNER IS HOLDING IT, SO THIS LISTENER LETS GO (#46).
 		//
-		// A backend whose teardown is asynchronous — EC2's terminate returns when
-		// the request is ACCEPTED, and the guest runs on through `shutting-down`
-		// for a minute or two — cannot answer this call with proof. The node takes
-		// the lease into its own janitor instead, keeps heartbeating it, and
-		// releases it once the compute is provably gone.
+		// A backend whose teardown is asynchronous cannot answer this call with
+		// proof that the compute is gone. The node takes the lease into its own
+		// janitor instead, keeps heartbeating it, and releases it once the compute
+		// is provably gone.
 		//
 		// So there is nothing here to release and nothing to retry. Recording a
 		// cleanup obligation would re-issue a terminate on every pass for the life
-		// of the process, against a guest already on its way out, and keeping the
-		// lease in `running` would have two parties heartbeating one lease.
+		// of the process while the outcome is already being reconciled, and keeping
+		// the lease in `running` would have two parties heartbeating one lease.
 		//
 		// The request id is given up either way: GitHub has been told this job is
 		// finished, and a redelivered completion must not find this listener still
