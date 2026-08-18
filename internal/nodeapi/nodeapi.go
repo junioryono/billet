@@ -65,7 +65,11 @@ import (
 // VERSION 9 ADDS THE BUILDKIT CACHE-MOUNT CEILING TO A LAUNCH. Silently dropping
 // it would publish state outside the tier's storage policy, so mixed versions
 // are refused rather than treating the field as an optional optimisation.
-const Version = 9
+//
+// VERSION 10 ADDS EACH EC2 SHAPE'S PRICE TO REGISTRATION. A new server paired
+// with an old node would otherwise record every price as zero and understate the
+// deployment-wide cost report without an error.
+const Version = 10
 
 // CommandKind names what the server is asking a node to do.
 type CommandKind string

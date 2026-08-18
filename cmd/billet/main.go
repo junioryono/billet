@@ -2122,6 +2122,10 @@ func cmdStatus(ctx context.Context, args []string) error {
 		fmt.Printf("tier      %-24s %d available\n", t.Label, headroom)
 	}
 
+	if err := printEC2FleetCost(ctx, a, cfg); err != nil {
+		return err
+	}
+
 	held, err := a.Held(ctx)
 	if err != nil {
 		return err
@@ -2134,6 +2138,26 @@ func cmdStatus(ctx context.Context, args []string) error {
 
 	fmt.Printf("held      %d lease(s) waiting for compute to be confirmed gone\n", len(held))
 	printHeld(held)
+
+	return nil
+}
+
+func printEC2FleetCost(ctx context.Context, a *alloc.Allocator, cfg *config.Config) error {
+	nodes, err := a.EC2CostNodes(ctx)
+	if err != nil {
+		return err
+	}
+	if len(nodes) == 0 {
+		return nil
+	}
+
+	peak, err := config.EC2FleetPeakHourlyExposure(
+		cfg.Server.MaxVCPU, cfg.Server.MaxMemory, nodes)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("ec2 peak  <= %s compute (%s/month at 730h), across %d registered node(s) from declared shape prices\n",
+		&peak, peak.ForHours(730), len(nodes))
 
 	return nil
 }

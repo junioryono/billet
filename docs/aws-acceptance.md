@@ -31,5 +31,5 @@ Those numbers put the current cold path under one minute. Billet's EC2 role is f
 
 - Same-label failover from preferred local capacity to EC2 remains issue #32. The EC2 half is proven; the test still has to withdraw the local contribution and observe the same label complete in the cloud.
 - A real EventBridge/SQS Spot interruption and its GitHub outcome remain issue #41.
-- Deployment-wide aggregate dollar policy remains issue #44.
+- The shape allowlist and resource ceilings are the enforceable cost policy. `billet check` reports a node's conservative compute-only peak, `billet status` aggregates registered EC2 nodes under the deployment ceiling, and AWS Budgets is the account-wide backstop rather than a stale copied price becoming a runtime admission gate.
 - EBS/S3 cache reuse and failure recovery remain part of the caching-plane issues.

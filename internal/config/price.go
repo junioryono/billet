@@ -95,6 +95,14 @@ func (p *USDPerHour) ForHours(hours int64) string {
 	return "$" + decimalMicros(micros)
 }
 
+// EC2CostNode holds the resource and shape declarations needed to bound one
+// registered EC2 node's compute cost.
+type EC2CostNode struct {
+	MaxVCPU       int
+	MaxMemory     ByteSize
+	InstanceTypes []EC2InstanceType
+}
+
 func decimalMicros(micros *big.Int) string {
 	whole, fraction := new(big.Int), new(big.Int)
 	whole.QuoRem(micros, big.NewInt(microsPerUSD), fraction)
@@ -109,8 +117,40 @@ func decimalMicros(micros *big.Int) string {
 // node. It takes the tighter of the highest price-per-vCPU and
 // price-per-byte bounds. Either one bounds every possible mix of shapes.
 func EC2PeakHourlyExposure(maxVCPU int, maxMemory ByteSize, shapes []EC2InstanceType) (USDPerHour, error) {
+	micros := ec2PeakHourlyExposure(maxVCPU, maxMemory, shapes)
+	if !micros.IsInt64() {
+		return 0, errorsPriceOverflow
+	}
+
+	return USDPerHour(micros.Int64()), nil
+}
+
+// EC2FleetPeakHourlyExposure returns the tighter of the shared deployment
+// ceiling and the sum of every registered EC2 node's own ceiling.
+func EC2FleetPeakHourlyExposure(maxVCPU int, maxMemory ByteSize, nodes []EC2CostNode) (USDPerHour, error) {
+	var shapes []EC2InstanceType
+	nodeBound := new(big.Int)
+	for i := range nodes {
+		shapes = append(shapes, nodes[i].InstanceTypes...)
+		nodeBound.Add(nodeBound, ec2PeakHourlyExposure(
+			nodes[i].MaxVCPU, nodes[i].MaxMemory, nodes[i].InstanceTypes))
+	}
+
+	deploymentBound := ec2PeakHourlyExposure(maxVCPU, maxMemory, shapes)
+	bound := nodeBound
+	if deploymentBound.Cmp(bound) < 0 {
+		bound = deploymentBound
+	}
+	if !bound.IsInt64() {
+		return 0, errorsPriceOverflow
+	}
+
+	return USDPerHour(bound.Int64()), nil
+}
+
+func ec2PeakHourlyExposure(maxVCPU int, maxMemory ByteSize, shapes []EC2InstanceType) *big.Int {
 	if maxVCPU <= 0 || maxMemory <= 0 {
-		return 0, nil
+		return new(big.Int)
 	}
 
 	var perVCPU, perByte *big.Rat
@@ -129,7 +169,7 @@ func EC2PeakHourlyExposure(maxVCPU int, maxMemory ByteSize, shapes []EC2Instance
 		}
 	}
 	if perVCPU == nil {
-		return 0, nil
+		return new(big.Int)
 	}
 
 	vcpuBound := new(big.Rat).Mul(perVCPU, new(big.Rat).SetInt64(int64(maxVCPU)))
@@ -139,12 +179,7 @@ func EC2PeakHourlyExposure(maxVCPU int, maxMemory ByteSize, shapes []EC2Instance
 		bound = memoryBound
 	}
 
-	micros := ceilRat(bound)
-	if !micros.IsInt64() {
-		return 0, errorsPriceOverflow
-	}
-
-	return USDPerHour(micros.Int64()), nil
+	return ceilRat(bound)
 }
 
 var errorsPriceOverflow = fmt.Errorf("peak EC2 price overflows the supported dollar amount")

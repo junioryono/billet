@@ -28,6 +28,7 @@ func TestWhatTheNodeReportsArrivesAtTheLedger(t *testing.T) {
 	reg := &fakeRegistrar{}
 	wantShapes := []config.EC2InstanceType{{
 		Type: "c7i.2xlarge", VCPU: 8, Memory: 16 * config.GiB,
+		PriceUSDPerHour: 340_000,
 	}}
 
 	_, base := serve(t, &fakeStore{}, nodeplane.WithRegistrar(reg),

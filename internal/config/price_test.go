@@ -63,3 +63,41 @@ func TestEC2PeakHourlyExposureBoundsAnyShapeMix(t *testing.T) {
 		t.Errorf("730-hour price = %s, want $876", monthly)
 	}
 }
+
+func TestEC2FleetPeakHourlyExposureUsesTheSharedDeploymentCeiling(t *testing.T) {
+	nodes := []EC2CostNode{
+		{MaxVCPU: 8, MaxMemory: 16 * GiB, InstanceTypes: []EC2InstanceType{
+			{Type: "cpu", VCPU: 8, Memory: 16 * GiB, PriceUSDPerHour: 340_000},
+		}},
+		{MaxVCPU: 8, MaxMemory: 16 * GiB, InstanceTypes: []EC2InstanceType{
+			{Type: "memory", VCPU: 8, Memory: 16 * GiB, PriceUSDPerHour: 600_000},
+		}},
+	}
+
+	got, err := EC2FleetPeakHourlyExposure(8, 16*GiB, nodes)
+	if err != nil {
+		t.Fatalf("EC2FleetPeakHourlyExposure: %v", err)
+	}
+	if got != 600_000 {
+		t.Errorf("peak = %s, want $0.60/hour from the shared deployment ceiling", &got)
+	}
+}
+
+func TestEC2FleetPeakHourlyExposureUsesTheSumOfNodeCeilings(t *testing.T) {
+	nodes := []EC2CostNode{
+		{MaxVCPU: 4, MaxMemory: 8 * GiB, InstanceTypes: []EC2InstanceType{
+			{Type: "small", VCPU: 4, Memory: 8 * GiB, PriceUSDPerHour: 200_000},
+		}},
+		{MaxVCPU: 8, MaxMemory: 16 * GiB, InstanceTypes: []EC2InstanceType{
+			{Type: "large", VCPU: 8, Memory: 16 * GiB, PriceUSDPerHour: 600_000},
+		}},
+	}
+
+	got, err := EC2FleetPeakHourlyExposure(64, 256*GiB, nodes)
+	if err != nil {
+		t.Fatalf("EC2FleetPeakHourlyExposure: %v", err)
+	}
+	if got != 800_000 {
+		t.Errorf("peak = %s, want $0.80/hour from the two node ceilings", &got)
+	}
+}
