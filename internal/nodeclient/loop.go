@@ -683,6 +683,20 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 		}
 
 		if !ok {
+			// A LONG POLL IS ALSO THE CUSTODY CLOCK. Whole-host orphan inventory is
+			// intentionally sparse, but known held entries are cheap to check and may
+			// be the only thing preventing this node from advertising capacity. EC2
+			// commonly finishes an asynchronous termination between two sweeps; waiting
+			// for the next five-minute sweep keeps a slot charged after its instance is
+			// already gone.
+			if compute.Holding() {
+				if err := compute.Tend(ctx); err != nil {
+					log.Error("could not advance custody after the command poll; leases for "+
+						"compute that may already be gone will keep being renewed until this succeeds",
+						"error", err)
+				}
+			}
+
 			continue
 		}
 

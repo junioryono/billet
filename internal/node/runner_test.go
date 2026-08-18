@@ -690,9 +690,9 @@ func TestAnAcceptedTeardownRecordsTheJobAsDone(t *testing.T) {
 		t.Fatalf("nothing was archived for a lease whose compute is gone: %v", err)
 	}
 
-	if outcome == string(alloc.PhaseFailed) {
-		t.Error("a job that ran to completion on an asynchronous backend was archived as " +
-			"failed, because its teardown reused the path built for a launch that never started")
+	if outcome != string(alloc.PhaseDone) {
+		t.Errorf("a job that ran to completion on an asynchronous backend was archived as %q, "+
+			"want %q", outcome, alloc.PhaseDone)
 	}
 }
 
