@@ -98,7 +98,7 @@ func (l *ledger) ResolveQuarantineFor(
 }
 
 func (l *ledger) ResolveQuarantineForCompletion(
-	context.Context, string, string, int64, alloc.Phase,
+	context.Context, string, string, int64, int64, alloc.Phase,
 ) (bool, error) {
 	return true, nil
 }
@@ -209,26 +209,21 @@ func TestANodeExpiredBySomethingElseIsStillRecorded(t *testing.T) {
 	})
 }
 
-// TWO REGISTRATIONS CAN COMMIT IN ONE ORDER AND ARRIVE IN THE OTHER.
+// TWO REGISTRATIONS FOR ONE NAME MUST SHARE ONE COMMIT ORDER.
 //
-// The ledger write happens BEFORE the plane's mutex is taken, so a slow
-// registration can be overtaken: A commits and is handed epoch 1, B commits and
-// is handed epoch 2, B installs 2, and then A finally reaches the lock. Installing
-// unconditionally lets the older token win, and the damage lands later and
-// somewhere else — expiry presents epoch 1, the fenced write matches nothing,
-// and the ledger goes on believing in a host the plane has forgotten, advertising
-// capacity for a machine nobody can reach.
+// The allocator write and plane install are one logical operation. If A can
+// pause between them while B commits and installs, A can arrive last and leave
+// the two authorities describing different processes. A per-node guard keeps B
+// out of the allocator until A has installed, without blocking other node names.
 //
-// STAGED RATHER THAN REASONED ABOUT. The fake holds A inside its ledger write
-// until B has finished, which is precisely the interleaving and is otherwise
-// only reachable by luck.
+// STAGED RATHER THAN REASONED ABOUT. The fake holds A after allocating its epoch
+// and observes that B cannot allocate the next one until A finishes.
 func TestALateRegistrationCannotSupersedeTheNewerProcess(t *testing.T) {
 	t.Parallel()
 
 	led := newLedger()
 	p := testPlane(t, WithRegistrar(led))
 
-	// Released once the second registration has been fully installed.
 	proceed := make(chan struct{})
 	led.holdFirst = proceed
 
@@ -247,36 +242,76 @@ func TestALateRegistrationCannotSupersedeTheNewerProcess(t *testing.T) {
 		return led.held()
 	})
 
-	// B arrives and completes: a different process, on a different backend.
-	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
-		Version: nodeapi.Version, Node: "n1", Provider: config.ProviderFirecracker,
-		Deployment: deployment, Incarnation: "new", VCPU: 8, Memory: 32 * config.GiB,
-	}); err != nil {
-		t.Fatalf("second Register: %v", err)
+	secondStarted := make(chan struct{})
+	second := make(chan error, 1)
+	go func() {
+		close(secondStarted)
+		_, err := p.Register(t.Context(), nodeapi.RegisterRequest{
+			Version: nodeapi.Version, Node: "n1", Provider: config.ProviderFirecracker,
+			Deployment: deployment, Incarnation: "new", VCPU: 8, Memory: 32 * config.GiB,
+		})
+		second <- err
+	}()
+	<-secondStarted
+
+	select {
+	case err := <-second:
+		t.Fatalf("second registration crossed the first one's unfinished install: %v", err)
+	case <-time.After(25 * time.Millisecond):
 	}
 
 	close(proceed)
-	if err := <-first; !errors.Is(err, ErrSuperseded) {
-		t.Fatalf("overtaken first registration = %v, want superseded", err)
+	if err := <-first; err != nil {
+		t.Fatalf("first Register: %v", err)
+	}
+	if err := <-second; err != nil {
+		t.Fatalf("second Register: %v", err)
 	}
 
-	// EVERY FIELD, NOT JUST THE EPOCH. Keeping the epoch monotonic while letting
-	// the rest of the registration through was the bug: the older request still
-	// tombstoned the newer process's in-flight commands, handed their leases to
-	// custody, and overwrote the incarnation and provider — so the ledger and the
-	// command plane disagreed about who owned the node and what it ran.
 	if got := p.epochForTest("n1"); got != 2 {
 		t.Errorf("ledger epoch = %d, want 2", got)
 	}
 
 	if got := p.incarnationForTest("n1"); got != "new" {
-		t.Errorf("incarnation = %q, want the newer process; a registration that committed "+
-			"FIRST but arrived LAST superseded the one that replaced it", got)
+		t.Errorf("incarnation = %q, want the second serialized process", got)
 	}
 
 	if got := p.providerForTest("n1"); got != config.ProviderFirecracker {
-		t.Errorf("provider = %q, want the newer process's; the command plane now disagrees "+
-			"with the ledger about what this host runs", got)
+		t.Errorf("provider = %q, want the second serialized process's", got)
+	}
+}
+
+func TestARegistrationDoesNotBlockAnotherNode(t *testing.T) {
+	t.Parallel()
+
+	led := newLedger()
+	p := testPlane(t, WithRegistrar(led))
+	proceed := make(chan struct{})
+	led.holdFirst = proceed
+
+	first := make(chan error, 1)
+	go func() {
+		_, err := p.Register(t.Context(), nodeapi.RegisterRequest{
+			Version: nodeapi.Version, Node: "slow", Provider: config.ProviderDocker,
+			Deployment: deployment, Incarnation: "slow-1", VCPU: 8, Memory: 32 * config.GiB,
+		})
+		first <- err
+	}()
+	waitFor(t, "the slow registration to reach the ledger", led.held)
+
+	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
+		Version: nodeapi.Version, Node: "independent", Provider: config.ProviderDocker,
+		Deployment: deployment, Incarnation: "independent-1", VCPU: 8, Memory: 32 * config.GiB,
+	}); err != nil {
+		t.Fatalf("independent Register: %v", err)
+	}
+	if got := p.incarnationForTest("independent"); got != "independent-1" {
+		t.Errorf("independent incarnation = %q, want registration to install", got)
+	}
+
+	close(proceed)
+	if err := <-first; err != nil {
+		t.Fatalf("slow Register: %v", err)
 	}
 }
 

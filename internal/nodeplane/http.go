@@ -789,6 +789,7 @@ func (h *handler) register(w http.ResponseWriter, r *http.Request) {
 	// consume the old process's absence while this read or the epoch write blocks
 	// would release capacity under compute the replacement is about to adopt.
 	intent := h.plane.beginRegistration(req.Node)
+	defer h.plane.finishRegistration(req.Node, intent)
 
 	// READ BEFORE COMMITTING, because Register is not a question — it supersedes
 	// whatever process held the name, resolves its in-flight commands, and makes
@@ -798,7 +799,6 @@ func (h *handler) register(w http.ResponseWriter, r *http.Request) {
 	// never considered itself registered.
 	ids, err := h.store.LaunchedLeaseIDs(r.Context(), req.Node)
 	if err != nil {
-		h.plane.finishRegistration(req.Node, intent)
 		h.log.Warn("could not read which leases this node already holds; refusing the "+
 			"registration rather than accepting a node whose existing compute the plane "+
 			"cannot attribute", "node", req.Node, "error", err)

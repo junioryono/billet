@@ -63,7 +63,7 @@ type CompletionAwareRunner interface {
 // BoundCompletionAwareRunner reconciles teardown with the node and lease that
 // actually held compute before a control-plane restart erased live ownership.
 type BoundCompletionAwareRunner interface {
-	DestroyCompletedBound(context.Context, int64, string, string, string, alloc.Phase) error
+	DestroyCompletedBound(context.Context, int64, string, string, string, int64, alloc.Phase) error
 }
 
 // completionStore is the durable half of result-dependent teardown.
@@ -2551,10 +2551,12 @@ func (l *Listener) leaseFor(requestID int64) *alloc.Lease {
 // A CONCLUSIVE ERROR IS AS GOOD AS SUCCESS, and telling the two apart from an
 // outage is the whole point. ErrFenced means somebody else already reclaimed it
 // and this caller's epoch is stale; ErrLeaseNotFound means it is gone or already
-// terminal. Neither can be improved by holding a reference and trying again —
-// but a busy database or a cancelled context can.
+// terminal; ErrConflict means it is terminal with the opposite outcome. None can
+// be improved by holding a reference and trying again — but a busy database or a
+// cancelled context can.
 func releaseSettled(err error) bool {
-	return err == nil || errors.Is(err, alloc.ErrFenced) || errors.Is(err, alloc.ErrLeaseNotFound)
+	return err == nil || errors.Is(err, alloc.ErrFenced) || errors.Is(err, alloc.ErrLeaseNotFound) ||
+		errors.Is(err, alloc.ErrConflict)
 }
 
 // releaseAbsent returns capacity after the runner has proved no compute exists.
@@ -3229,7 +3231,7 @@ func (l *Listener) destroyCompleted(
 	if runner, ok := l.runner.(BoundCompletionAwareRunner); ok && job.Result != "" &&
 		lease != nil && lease.ID != "" && lease.Node != "" {
 		return runner.DestroyCompletedBound(
-			ctx, job.RequestID, job.Result, lease.ID, lease.Node, outcome)
+			ctx, job.RequestID, job.Result, lease.ID, lease.Node, lease.Epoch, outcome)
 	}
 	if runner, ok := l.runner.(CompletionAwareRunner); ok && job.Result != "" {
 		return runner.DestroyCompleted(ctx, job.RequestID, job.Result)

@@ -1840,7 +1840,7 @@ func (countingRegistrar) ResolveQuarantineFor(
 }
 
 func (countingRegistrar) ResolveQuarantineForCompletion(
-	context.Context, string, string, int64, alloc.Phase,
+	context.Context, string, string, int64, int64, alloc.Phase,
 ) (bool, error) {
 	return true, nil
 }

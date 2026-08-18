@@ -125,6 +125,7 @@ func (r *Runner) DestroyCompletedBound(
 	ctx context.Context,
 	requestID int64,
 	result, leaseID, nodeName string,
+	leaseEpoch int64,
 	outcome alloc.Phase,
 ) error {
 	id, err := commandID()
@@ -138,7 +139,7 @@ func (r *Runner) DestroyCompletedBound(
 		done: make(chan nodeapi.CommandResult, 1),
 	}
 	res, incarnation, absent, err := r.plane.dispatchBound(
-		ctx, nodeName, leaseID, outcome, pend)
+		ctx, nodeName, leaseID, leaseEpoch, outcome, pend)
 	if err != nil {
 		return fmt.Errorf("node %s: %w", nodeName, err)
 	}
@@ -515,6 +516,7 @@ func (p *Plane) dispatch(ctx context.Context, n *node, pend *pending) (nodeapi.C
 func (p *Plane) dispatchBound(
 	ctx context.Context,
 	nodeName, leaseID string,
+	leaseEpoch int64,
 	outcome alloc.Phase,
 	pend *pending,
 ) (nodeapi.CommandResult, string, bool, error) {
@@ -541,7 +543,7 @@ func (p *Plane) dispatchBound(
 		// The completion resolver also enforces the quarantine grace; a merely
 		// late launch remains charged and returns custody here.
 		settled, err := p.registrar.ResolveQuarantineForCompletion(
-			ctx, nodeName, leaseID, n.ledgerEpoch, outcome)
+			ctx, nodeName, leaseID, n.ledgerEpoch, leaseEpoch, outcome)
 		if err != nil {
 			p.mu.Unlock()
 

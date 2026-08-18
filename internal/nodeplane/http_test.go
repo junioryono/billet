@@ -57,7 +57,7 @@ type fakeRegistrar struct {
 }
 
 func (f *fakeRegistrar) ResolveQuarantineForCompletion(
-	_ context.Context, _ string, leaseID string, _ int64, _ alloc.Phase,
+	_ context.Context, _ string, leaseID string, _, _ int64, _ alloc.Phase,
 ) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -850,7 +850,7 @@ func TestRegistrationIntentInvalidatesAbsenceBeforeTheOwnershipRead(t *testing.T
 	<-entered
 
 	if err := p.NewRunner().DestroyCompletedBound(
-		t.Context(), 7, "Succeeded", "l1", "n1", alloc.PhaseDone,
+		t.Context(), 7, "Succeeded", "l1", "n1", 1, alloc.PhaseDone,
 	); !errors.Is(err, server.ErrCustody) {
 		t.Fatalf("completion during ownership read = %v, want custody", err)
 	}

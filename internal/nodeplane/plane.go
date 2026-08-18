@@ -86,11 +86,14 @@ type Plane struct {
 
 	mu    sync.Mutex
 	nodes map[string]*node
-	// registering is the newest registration that has begun for each node but
-	// has not installed its ledger epoch and inventory yet. Beginning one clears
-	// prior absence evidence before any store read or epoch write can block.
-	registering      map[string]uint64
-	nextRegistration uint64
+	// registering counts registrations that have begun for each node but have
+	// not installed their ledger epoch and inventory yet. Beginning one clears
+	// prior absence evidence before it waits for an earlier registration, reads
+	// the store or writes an epoch.
+	registering        map[string]int
+	activeRegistration map[string]uint64
+	registrationGuards map[string]*sync.Mutex
+	nextRegistration   uint64
 
 	registrar Registrar
 
@@ -121,29 +124,62 @@ type Plane struct {
 	pendingGone []goneNode
 }
 
-func (p *Plane) beginRegistration(node string) uint64 {
+type registrationIntent struct {
+	generation uint64
+	guard      *sync.Mutex
+}
+
+func (p *Plane) beginRegistration(node string) registrationIntent {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.nextRegistration++
-	intent := p.nextRegistration
-	if p.registering == nil {
-		p.registering = make(map[string]uint64)
+	if p.registrationGuards == nil {
+		p.registrationGuards = make(map[string]*sync.Mutex)
 	}
-	p.registering[node] = intent
+	guard := p.registrationGuards[node]
+	if guard == nil {
+		guard = &sync.Mutex{}
+		p.registrationGuards[node] = guard
+	}
+	if p.registering == nil {
+		p.registering = make(map[string]int)
+	}
+	p.registering[node]++
 	if n := p.nodes[node]; n != nil {
 		n.inventoryKnown = false
 		n.inventory = nil
 	}
+	p.mu.Unlock()
 
-	return intent
+	// ONE NODE'S REGISTRATIONS COMMIT IN ONE ORDER. The guard is held across the
+	// ownership read, allocator epoch and plane install, so its database row and
+	// in-memory process cannot describe different registrations.
+	// Guards are per node: a slow host never stalls command traffic or another
+	// host's registration.
+	guard.Lock()
+
+	p.mu.Lock()
+	p.nextRegistration++
+	generation := p.nextRegistration
+	if p.activeRegistration == nil {
+		p.activeRegistration = make(map[string]uint64)
+	}
+	p.activeRegistration[node] = generation
+	p.mu.Unlock()
+
+	return registrationIntent{generation: generation, guard: guard}
 }
 
-func (p *Plane) finishRegistration(node string, intent uint64) {
+func (p *Plane) finishRegistration(node string, intent registrationIntent) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.registering[node] == intent {
-		delete(p.registering, node)
+	if p.activeRegistration[node] == intent.generation {
+		delete(p.activeRegistration, node)
 	}
+	if p.registering[node] <= 1 {
+		delete(p.registering, node)
+	} else {
+		p.registering[node]--
+	}
+	p.mu.Unlock()
+	intent.guard.Unlock()
 }
 
 // node is one registered compute host.
@@ -537,10 +573,11 @@ type Registrar interface {
 	ResolveQuarantineFor(ctx context.Context, node string, running []string, epoch int64) (int, error)
 
 	// ResolveQuarantineForCompletion settles one absent lease with GitHub's
-	// authoritative outcome. The node epoch and the plane's registration intent
-	// fence the inventory snapshot that authorized it.
+	// authoritative outcome. The node epoch and registration intent fence the
+	// inventory snapshot; the lease epoch preserves an independent terminal outcome.
 	ResolveQuarantineForCompletion(
-		ctx context.Context, node, leaseID string, epoch int64, outcome alloc.Phase,
+		ctx context.Context, node, leaseID string, nodeEpoch, leaseEpoch int64,
+		outcome alloc.Phase,
 	) (bool, error)
 }
 
@@ -636,15 +673,14 @@ func (p *Plane) Register(
 	ctx context.Context, req nodeapi.RegisterRequest,
 ) (nodeapi.RegisterResponse, error) {
 	intent := p.beginRegistration(req.Node)
+	defer p.finishRegistration(req.Node, intent)
 
 	return p.register(ctx, req, intent)
 }
 
 func (p *Plane) register(
-	ctx context.Context, req nodeapi.RegisterRequest, intent uint64,
+	ctx context.Context, req nodeapi.RegisterRequest, intent registrationIntent,
 ) (nodeapi.RegisterResponse, error) {
-	defer p.finishRegistration(req.Node, intent)
-
 	if req.Version != nodeapi.Version {
 		return nodeapi.RegisterResponse{}, fmt.Errorf(
 			"%w: node %q speaks protocol version %d, this control plane speaks %d; "+
@@ -709,9 +745,9 @@ func (p *Plane) register(
 	}
 
 	p.mu.Lock()
-	currentIntent := p.registering[req.Node]
+	currentIntent := p.activeRegistration[req.Node]
 	p.mu.Unlock()
-	if currentIntent != intent {
+	if currentIntent != intent.generation {
 		return nodeapi.RegisterResponse{}, fmt.Errorf(
 			"%w: a newer registration for node %q overtook this one",
 			ErrSuperseded, req.Node)
@@ -755,7 +791,7 @@ func (p *Plane) register(
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.registering[req.Node] != intent {
+	if p.activeRegistration[req.Node] != intent.generation {
 		return nodeapi.RegisterResponse{}, fmt.Errorf(
 			"%w: a newer registration for node %q overtook this one after its ledger write",
 			ErrSuperseded, req.Node)
@@ -767,17 +803,12 @@ func (p *Plane) register(
 		p.nodes[req.Node] = n
 	}
 
-	// AN OVERTAKEN REGISTRATION CHANGES NOTHING, and this has to be decided BEFORE
+	// A REGISTRAR TOKEN NEVER MOVES BACKWARDS, and this has to be decided BEFORE
 	// anything below it runs.
 	//
-	// The ledger write happens outside this mutex, so two registrations for one node
-	// can commit in one order and arrive in the other: A is handed epoch 1, B is handed
-	// 2, B installs, and then A gets the lock. Everything past this point treats the
-	// request as the current process — tombstoning the commands B is working on and
-	// overwriting its incarnation, provider and guest-OS claims.
-	//
-	// Keeping only the EPOCH monotonic is not enough: a fence at the end of a function
-	// runs after the damage it was meant to prevent.
+	// The per-node guard makes this defensive for the allocator used in production,
+	// but Registrar is an interface and the epoch still decides whether everything
+	// below may treat this request as current.
 	if epoch > 0 && epoch < n.ledgerEpoch {
 		p.log.Warn("ignoring a registration that was overtaken by a newer one from the same "+
 			"node; the newer process keeps its commands",
@@ -842,12 +873,9 @@ func (p *Plane) register(
 	n.guestOS = req.GuestOS
 	n.lastSeen = p.now()
 
-	// NEVER BACKWARDS. Two registrations for one node can commit to the ledger in
-	// one order and reach this mutex in the other — the ledger write happens
-	// before the lock is taken — so installing unconditionally lets the older
-	// epoch win. Expiry would then present a stale token, the fenced write would
-	// match nothing, and the node would stay live in the ledger after the plane
-	// had forgotten it.
+	// NEVER BACKWARDS. Expiry presents this token to its fenced ledger write, so
+	// installing a stale value would leave the node live in the ledger after the
+	// plane had forgotten it.
 	if epoch > n.ledgerEpoch {
 		n.ledgerEpoch = epoch
 	}

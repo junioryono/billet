@@ -243,12 +243,14 @@ func (a *Allocator) ResolveQuarantine(ctx context.Context, leaseID string, outco
 }
 
 // ResolveQuarantineForCompletion settles one inventory-absent quarantined lease
-// with the authoritative completion outcome, fenced by the reporting node epoch.
-// It reports whether capacity is already gone or was released by this call.
+// with the authoritative completion outcome. The node epoch fences the inventory
+// snapshot; the stored lease epoch distinguishes provisional reconciliation from
+// an independent terminal outcome. It reports whether capacity is already gone
+// or was released by this call.
 func (a *Allocator) ResolveQuarantineForCompletion(
 	ctx context.Context,
 	node, leaseID string,
-	epoch int64,
+	nodeEpoch, leaseEpoch int64,
 	outcome Phase,
 ) (bool, error) {
 	if !outcome.Terminal() {
@@ -265,16 +267,21 @@ func (a *Allocator) ResolveQuarantineForCompletion(
 		case err != nil:
 			return fmt.Errorf("alloc: read the epoch of node %s: %w", node, err)
 		}
-		if current != epoch {
+		if current != nodeEpoch {
 			return nil
 		}
 
-		var phase string
-		err := tx.QueryRowContext(ctx, `SELECT phase FROM leases WHERE id = ?`, leaseID).Scan(&phase)
+		var (
+			phase        string
+			currentEpoch int64
+		)
+		err := tx.QueryRowContext(ctx,
+			`SELECT phase, epoch FROM leases WHERE id = ?`, leaseID).
+			Scan(&phase, &currentEpoch)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("alloc: inspect completion lease %s: %w", leaseID, err)
 		}
-		if errors.Is(err, sql.ErrNoRows) || Phase(phase).Terminal() {
+		if errors.Is(err, sql.ErrNoRows) {
 			// Inventory reconciliation may have won just before GitHub delivered the
 			// authoritative completion. History is an upserted summary, so correct
 			// its conclusion rather than preserving the provisional absence verdict.
@@ -282,6 +289,25 @@ func (a *Allocator) ResolveQuarantineForCompletion(
 				`UPDATE job_history SET conclusion = ? WHERE lease_id = ?`,
 				string(outcome), leaseID); err != nil {
 				return fmt.Errorf("alloc: correct completion history for lease %s: %w", leaseID, err)
+			}
+			settled = true
+
+			return nil
+		}
+		if currentEpoch < leaseEpoch {
+			return nil
+		}
+		if Phase(phase).Terminal() {
+			// A later epoch means the reaper quarantined this lease and inventory
+			// reconciliation then terminalized it provisionally. A terminal row at
+			// the completion's own epoch is an independent release; its conclusion
+			// is genuine and must not be rewritten even though its capacity is gone.
+			if currentEpoch > leaseEpoch {
+				if _, err := tx.ExecContext(ctx,
+					`UPDATE job_history SET conclusion = ? WHERE lease_id = ?`,
+					string(outcome), leaseID); err != nil {
+					return fmt.Errorf("alloc: correct completion history for lease %s: %w", leaseID, err)
+				}
 			}
 			settled = true
 

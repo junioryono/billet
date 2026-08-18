@@ -1978,12 +1978,19 @@ type fakeRunner struct {
 }
 
 type boundFakeRunner struct {
-	requestID int64
-	result    string
-	leaseID   string
-	node      string
-	outcome   alloc.Phase
-	err       error
+	requestID  int64
+	result     string
+	leaseID    string
+	node       string
+	leaseEpoch int64
+	outcome    alloc.Phase
+	err        error
+}
+
+type absenceResolvingRunner struct {
+	allocator *alloc.Allocator
+	nodeEpoch int64
+	calls     atomic.Int32
 }
 
 type bindingFakeRunner struct{ node string }
@@ -2004,12 +2011,37 @@ func (f *boundFakeRunner) DestroyCompletedBound(
 	_ context.Context,
 	requestID int64,
 	result, leaseID, node string,
+	leaseEpoch int64,
 	outcome alloc.Phase,
 ) error {
-	f.requestID, f.result, f.leaseID, f.node, f.outcome =
-		requestID, result, leaseID, node, outcome
+	f.requestID, f.result, f.leaseID, f.node, f.leaseEpoch, f.outcome =
+		requestID, result, leaseID, node, leaseEpoch, outcome
 
 	return f.err
+}
+
+func (*absenceResolvingRunner) Launch(context.Context, *alloc.Lease, Job) error { return nil }
+
+func (*absenceResolvingRunner) Destroy(context.Context, int64) error { return nil }
+
+func (r *absenceResolvingRunner) DestroyCompletedBound(
+	ctx context.Context,
+	_ int64,
+	_, leaseID, node string,
+	leaseEpoch int64,
+	outcome alloc.Phase,
+) error {
+	r.calls.Add(1)
+	settled, err := r.allocator.ResolveQuarantineForCompletion(
+		ctx, node, leaseID, r.nodeEpoch, leaseEpoch, outcome)
+	if err != nil {
+		return err
+	}
+	if !settled {
+		return ErrCustody
+	}
+
+	return nil
 }
 
 type cancelAfterDestroyRunner struct {
@@ -2357,6 +2389,66 @@ func TestCompletionRestoresItsLeaseWhenReleaseIsInterruptedAfterDestroy(t *testi
 	}
 }
 
+func TestRestoredCompletionRetiresAfterAnIndependentTerminalOutcome(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, tiers)
+	db := openState(t)
+	job := Job{RequestID: 77, RunID: 87, Result: "Succeeded", CompletionID: 27}
+	original := NewListener(a, tiers[0].Label, &fakeSession{}, WithCompletionStore(db))
+	lease := holdRunning(t, original, a, tiers[0].Label, job.RequestID)
+	nodeEpoch, err := a.RegisterNode(t.Context(), alloc.NodeRegistration{
+		Name: lease.TargetNode, Provider: lease.Providers[0],
+		VCPU: 1 << 20, Memory: 1 << 20 * config.GiB,
+	})
+	if err != nil {
+		t.Fatalf("refresh node registration: %v", err)
+	}
+	if err := a.Bind(t.Context(), lease.ID, lease.Epoch, lease.TargetNode); err != nil {
+		t.Fatalf("bind completion lease: %v", err)
+	}
+	lease.Node = lease.TargetNode
+	if _, err := original.recordCompletion(t.Context(), job); err != nil {
+		t.Fatalf("recordCompletion: %v", err)
+	}
+	if err := a.Release(t.Context(), lease.ID, lease.Epoch, alloc.PhaseFailed); err != nil {
+		t.Fatalf("independent failed release: %v", err)
+	}
+
+	runner := &absenceResolvingRunner{allocator: a, nodeEpoch: nodeEpoch}
+	restarted := NewListener(a, tiers[0].Label, &fakeSession{}, WithCompletionStore(db),
+		WithCleanupRetryPacing(0, 0), WithRunner(runner))
+	if err := restarted.restoreCompletions(t.Context()); err != nil {
+		t.Fatalf("restoreCompletions: %v", err)
+	}
+	restarted.retryCleanup(t.Context())
+	restarted.retryCleanup(t.Context())
+
+	pending, err := db.PendingCompletions(t.Context(), tiers[0].Label)
+	if err != nil {
+		t.Fatalf("PendingCompletions: %v", err)
+	}
+	if len(pending) != 1 || !pending[0].Retired {
+		t.Fatalf("terminal conflict left its restored completion pending: %+v", pending)
+	}
+	if got := runner.calls.Load(); got != 1 {
+		t.Fatalf("terminal conflict retried bound teardown %d times, want once", got)
+	}
+	outcomes, err := a.HistoryOutcomesForRequest(t.Context(), job.RequestID)
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+	if len(outcomes) != 1 || outcomes[0] != string(alloc.PhaseFailed) {
+		t.Fatalf("completion history = %v, want the independent failed outcome preserved", outcomes)
+	}
+	usage, err := a.Usage(t.Context())
+	if err != nil {
+		t.Fatalf("Usage: %v", err)
+	}
+	if usage.Leases != 0 {
+		t.Fatalf("terminal conflict left %d leases consuming capacity", usage.Leases)
+	}
+}
+
 func TestCompletionDoesNotReleaseUntilReleaseOnlyTransitionIsDurable(t *testing.T) {
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
 	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, tiers)
@@ -2583,7 +2675,7 @@ func TestRestoredCompletionTargetsItsPersistedLeaseNode(t *testing.T) {
 	l.retryCleanup(t.Context())
 	if runner.requestID != completion.RequestID || runner.result != completion.Result ||
 		runner.leaseID != completion.LeaseID || runner.node != completion.LeaseNode ||
-		runner.outcome != alloc.PhaseDone {
+		runner.leaseEpoch != completion.LeaseEpoch || runner.outcome != alloc.PhaseDone {
 		t.Fatalf("bound destroy = request %d result %q lease %q node %q outcome %q, want %+v",
 			runner.requestID, runner.result, runner.leaseID, runner.node, runner.outcome, completion)
 	}
@@ -5576,10 +5668,11 @@ func TestRunStartsTheCleanupLoop(t *testing.T) {
 // release that FAILED therefore leaves the ledger charging capacity for a
 // container that never started, until the reaper arrives a TTL later.
 //
-// Two errors are as good as success and must not be retried forever: ErrFenced
+// Three errors are as good as success and must not be retried forever: ErrFenced
 // means somebody already reclaimed the lease and this caller's epoch is stale,
-// and ErrLeaseNotFound means it is gone or already terminal. Neither improves by
-// holding a reference. A busy ledger or a cancelled context does.
+// ErrLeaseNotFound means it is gone or already terminal, and ErrConflict means
+// the opposite terminal outcome already won. None improves by holding a
+// reference. A busy ledger or a cancelled context does.
 func TestOnlyASettledReleaseDropsTheLease(t *testing.T) {
 	t.Parallel()
 
@@ -5591,6 +5684,7 @@ func TestOnlyASettledReleaseDropsTheLease(t *testing.T) {
 		{"released", nil, true},
 		{"already reclaimed by the reaper", alloc.ErrFenced, true},
 		{"gone or already terminal", alloc.ErrLeaseNotFound, true},
+		{"terminal with a different outcome", alloc.ErrConflict, true},
 		{"wrapped, because callers wrap", fmt.Errorf("release: %w", alloc.ErrFenced), true},
 		{"the ledger was busy", errors.New("database is locked"), false},
 		{"the context went away", context.Canceled, false},
