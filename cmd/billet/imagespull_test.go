@@ -13,6 +13,7 @@ import (
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/imagesource"
+	"github.com/junioryono/billet/internal/provider/firecracker"
 )
 
 // THE ORDER IS FLAG, THEN CONFIG, THEN THE BUILT-IN. A deployment that mirrors
@@ -96,6 +97,22 @@ func TestHostArchIsSpelledTheWayAManifestSpellsIt(t *testing.T) {
 
 	if got == "" {
 		t.Fatal("hostArch returned nothing")
+	}
+}
+
+// Contract 4 images predate the runner-service wrapper now used as the default
+// Firecracker command. Accepting one would pass verification, boot, and then
+// fail before the runner can register because that executable is absent.
+func TestCurrentBinaryRejectsAPreRunnerServiceGuest(t *testing.T) {
+	_, manifest := stageDir(t, []byte("rootfs"), []byte("kernel"))
+	manifest.GuestContract = "4"
+
+	if firecracker.GuestContract != "5" {
+		t.Fatalf("the runner-service image change speaks contract %q, want 5",
+			firecracker.GuestContract)
+	}
+	if err := manifest.Usable(firecracker.GuestContract, "x86_64"); err == nil {
+		t.Fatal("a contract-4 image without billet-runner-service was accepted")
 	}
 }
 
