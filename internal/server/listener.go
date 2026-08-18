@@ -106,6 +106,10 @@ type Sweeper interface {
 // still running on it.
 var ErrCustody = errors.New("server: the runner is holding this lease's capacity")
 
+// ErrHolderUnavailable means result-dependent teardown has not reached the
+// process that holds the compute, so its durable completion must be retried.
+var ErrHolderUnavailable = errors.New("server: the completion holder is unavailable")
+
 // errNoRunner means no compute is attached to this control plane.
 var errNoRunner = errors.New("server: no runner is configured, so nothing can start this job")
 

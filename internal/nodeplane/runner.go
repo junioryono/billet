@@ -147,7 +147,10 @@ func (r *Runner) DestroyCompletedBound(
 		return nil
 	}
 	if incarnation == "" {
-		return heldByADrainingProcess(nodeName, requestID)
+		return completionHolderUnavailable(nodeName, requestID)
+	}
+	if r.plane.tookCommand(pend) != incarnation {
+		return completionHolderUnavailable(nodeName, requestID)
 	}
 	if !res.OK {
 		if res.Custody {
@@ -156,9 +159,6 @@ func (r *Runner) DestroyCompletedBound(
 
 		return fmt.Errorf("node %s could not destroy request %d: %s",
 			nodeName, requestID, res.Error)
-	}
-	if r.plane.tookCommand(pend) != incarnation {
-		return heldByADrainingProcess(nodeName, requestID)
 	}
 	r.plane.ForgetLease(nodeName, leaseID)
 
@@ -194,6 +194,10 @@ func (r *Runner) destroy(ctx context.Context, requestID int64, result string) er
 		// A DRAINING PROCESS IS NEVER IN THIS LIST — it does not poll — so an empty
 		// fleet says nothing about a container it is still running.
 		if known {
+			if result != "" {
+				return completionHolderUnavailable(owner.Node, requestID)
+			}
+
 			return heldByADrainingProcess(owner.Node, requestID)
 		}
 
@@ -298,6 +302,10 @@ func (r *Runner) destroy(ctx context.Context, requestID int64, result string) er
 	}
 
 	if !confirmed {
+		if result != "" {
+			return completionHolderUnavailable(owner.Node, requestID)
+		}
+
 		return heldByADrainingProcess(owner.Node, requestID)
 	}
 
@@ -427,6 +435,14 @@ func heldByADrainingProcess(node string, requestID int64) error {
 		"%w: request %d was launched by a process on %s that has since been superseded and "+
 			"is draining; it holds that lease until its compute is confirmed gone",
 		server.ErrCustody, requestID, node)
+}
+
+// completionHolderUnavailable preserves the authoritative result until the
+// process holding the compute can receive it or prove that compute absent.
+func completionHolderUnavailable(node string, requestID int64) error {
+	return fmt.Errorf(
+		"%w: request %d is bound to %s, but its authoritative result has not reached that holder",
+		server.ErrHolderUnavailable, requestID, node)
 }
 
 // destroyOn asks one node to remove a request's compute.

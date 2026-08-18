@@ -2038,7 +2038,7 @@ func (r *absenceResolvingRunner) DestroyCompletedBound(
 		return err
 	}
 	if !settled {
-		return ErrCustody
+		return ErrHolderUnavailable
 	}
 
 	return nil
@@ -2796,7 +2796,7 @@ func TestRestoredCompletionTargetsItsPersistedLeaseNode(t *testing.T) {
 	if _, err := db.PutPendingCompletion(t.Context(), completion); err != nil {
 		t.Fatalf("PutPendingCompletion: %v", err)
 	}
-	runner := &boundFakeRunner{err: errors.New("keep the obligation pending")}
+	runner := &boundFakeRunner{err: fmt.Errorf("%w: holder is registering", ErrHolderUnavailable)}
 	l := NewListener(nil, "linux", &fakeSession{}, WithCompletionStore(db),
 		WithCleanupRetryPacing(0, 0), WithRunner(runner))
 	if err := l.restoreCompletions(t.Context()); err != nil {
@@ -2808,6 +2808,13 @@ func TestRestoredCompletionTargetsItsPersistedLeaseNode(t *testing.T) {
 		runner.leaseEpoch != completion.LeaseEpoch || runner.outcome != alloc.PhaseDone {
 		t.Fatalf("bound destroy = request %d result %q lease %q node %q outcome %q, want %+v",
 			runner.requestID, runner.result, runner.leaseID, runner.node, runner.outcome, completion)
+	}
+	pending, err := db.PendingCompletions(t.Context(), completion.Tier)
+	if err != nil {
+		t.Fatalf("PendingCompletions: %v", err)
+	}
+	if len(pending) != 1 || pending[0].Retired {
+		t.Fatalf("unavailable holder retired its authoritative completion: %+v", pending)
 	}
 }
 

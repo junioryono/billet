@@ -1603,6 +1603,18 @@ func TestADestroyIsNotConfirmedByTheWrongProcess(t *testing.T) {
 		t.Error("the ownership record was dropped by a destroy its owner never answered; " +
 			"that process can no longer renew or release, and its drain cannot end")
 	}
+
+	// A completion has one more obligation than a shutdown destroy: its
+	// authoritative result must reach the holder before the durable completion
+	// can be retired. The replacement still cannot provide that handoff.
+	answerOneCommand(t, p, "second")
+	waitFor(t, "the replacement to park on a second poll",
+		func() bool { return p.WaitersForTest("n1") == 1 })
+	err = p.NewRunner().DestroyCompleted(t.Context(), 7, "Succeeded")
+	if !errors.Is(err, server.ErrHolderUnavailable) || errors.Is(err, server.ErrCustody) {
+		t.Errorf("a completion answered by the process that replaced the holder reported %v; "+
+			"want only holder unavailable", err)
+	}
 }
 
 // A FAILED DESTROY KEEPS THE OWNERSHIP RECORD TOO.

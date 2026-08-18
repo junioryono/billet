@@ -104,8 +104,8 @@ func (r *blockingInventoryRegistrar) ResolveQuarantineFor(
 func TestBoundCompletionWaitsForItsPersistedNode(t *testing.T) {
 	p := testPlane(t)
 	runner := p.NewRunner()
-	if err := runner.DestroyCompletedBound(t.Context(), 7, "Succeeded", "l1", "holder", 1, alloc.PhaseDone); !errors.Is(err, server.ErrCustody) {
-		t.Fatalf("absent holder destroy = %v, want custody", err)
+	if err := runner.DestroyCompletedBound(t.Context(), 7, "Succeeded", "l1", "holder", 1, alloc.PhaseDone); !errors.Is(err, server.ErrHolderUnavailable) || errors.Is(err, server.ErrCustody) {
+		t.Fatalf("absent holder destroy = %v, want only holder unavailable", err)
 	}
 	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
 		Version: nodeapi.Version, Node: "unrelated", Provider: config.ProviderDocker,
@@ -113,8 +113,8 @@ func TestBoundCompletionWaitsForItsPersistedNode(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("register unrelated node: %v", err)
 	}
-	if err := runner.DestroyCompletedBound(t.Context(), 7, "Succeeded", "l1", "holder", 1, alloc.PhaseDone); !errors.Is(err, server.ErrCustody) {
-		t.Fatalf("unrelated live fleet destroy = %v, want custody", err)
+	if err := runner.DestroyCompletedBound(t.Context(), 7, "Succeeded", "l1", "holder", 1, alloc.PhaseDone); !errors.Is(err, server.ErrHolderUnavailable) || errors.Is(err, server.ErrCustody) {
+		t.Fatalf("unrelated live fleet destroy = %v, want only holder unavailable", err)
 	}
 	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
 		Version: nodeapi.Version, Node: "holder", Provider: config.ProviderDocker,
@@ -122,8 +122,8 @@ func TestBoundCompletionWaitsForItsPersistedNode(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("register unreconciled holder: %v", err)
 	}
-	if err := runner.DestroyCompletedBound(t.Context(), 7, "Succeeded", "l1", "holder", 1, alloc.PhaseDone); !errors.Is(err, server.ErrCustody) {
-		t.Fatalf("unreconciled holder destroy = %v, want custody", err)
+	if err := runner.DestroyCompletedBound(t.Context(), 7, "Succeeded", "l1", "holder", 1, alloc.PhaseDone); !errors.Is(err, server.ErrHolderUnavailable) || errors.Is(err, server.ErrCustody) {
+		t.Fatalf("unreconciled holder destroy = %v, want only holder unavailable", err)
 	}
 }
 
@@ -185,8 +185,8 @@ func TestBoundCompletionIsNotTakenByAReplacementIncarnation(t *testing.T) {
 	if took || cmd.Kind == nodeapi.CommandDestroy {
 		t.Fatalf("replacement received the old holder's destroy: %+v", cmd)
 	}
-	if err := <-done; err == nil {
-		t.Fatal("bound destroy accepted a replacement incarnation as its holder")
+	if err := <-done; !errors.Is(err, server.ErrHolderUnavailable) || errors.Is(err, server.ErrCustody) {
+		t.Fatalf("replacement incarnation destroy = %v, want only holder unavailable", err)
 	}
 }
 
@@ -217,8 +217,8 @@ func TestKnownEmptyInventoryDoesNotReleaseALiveDurableLease(t *testing.T) {
 		t.Fatalf("register empty holder: %v", err)
 	}
 	if err := p.NewRunner().DestroyCompletedBound(
-		t.Context(), 7, "Succeeded", "l1", "holder", 1, alloc.PhaseDone); !errors.Is(err, server.ErrCustody) {
-		t.Fatalf("live durable lease destroy = %v, want custody", err)
+		t.Context(), 7, "Succeeded", "l1", "holder", 1, alloc.PhaseDone); !errors.Is(err, server.ErrHolderUnavailable) || errors.Is(err, server.ErrCustody) {
+		t.Fatalf("live durable lease destroy = %v, want only holder unavailable", err)
 	}
 }
 
@@ -336,8 +336,8 @@ func TestReplacementRegistrationInvalidatesAbsenceBeforeItsEpochWrite(t *testing
 
 	if err := p.NewRunner().DestroyCompletedBound(
 		t.Context(), 7, "Succeeded", lease.ID, "holder", lease.Epoch, alloc.PhaseDone,
-	); !errors.Is(err, server.ErrCustody) {
-		t.Fatalf("completion during replacement registration = %v, want custody", err)
+	); !errors.Is(err, server.ErrHolderUnavailable) || errors.Is(err, server.ErrCustody) {
+		t.Fatalf("completion during replacement registration = %v, want only holder unavailable", err)
 	}
 	if current, err := a.Lease(t.Context(), lease.ID); err != nil ||
 		current.Phase != alloc.PhaseQuarantine {
