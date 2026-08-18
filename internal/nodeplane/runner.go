@@ -125,6 +125,7 @@ func (r *Runner) DestroyCompletedBound(
 	ctx context.Context,
 	requestID int64,
 	result, leaseID, nodeName string,
+	outcome alloc.Phase,
 ) error {
 	id, err := commandID()
 	if err != nil {
@@ -136,7 +137,8 @@ func (r *Runner) DestroyCompletedBound(
 		},
 		done: make(chan nodeapi.CommandResult, 1),
 	}
-	res, incarnation, absent, err := r.plane.dispatchBound(ctx, nodeName, leaseID, pend)
+	res, incarnation, absent, err := r.plane.dispatchBound(
+		ctx, nodeName, leaseID, outcome, pend)
 	if err != nil {
 		return fmt.Errorf("node %s: %w", nodeName, err)
 	}
@@ -513,10 +515,16 @@ func (p *Plane) dispatch(ctx context.Context, n *node, pend *pending) (nodeapi.C
 func (p *Plane) dispatchBound(
 	ctx context.Context,
 	nodeName, leaseID string,
+	outcome alloc.Phase,
 	pend *pending,
 ) (nodeapi.CommandResult, string, bool, error) {
 	p.mu.Lock()
 	p.expireStaleLocked()
+	if _, pending := p.registering[nodeName]; pending {
+		p.mu.Unlock()
+
+		return nodeapi.CommandResult{}, "", false, nil
+	}
 	owner, owned := p.owners[leaseID]
 	if !owned {
 		n := p.nodes[nodeName]
@@ -530,30 +538,23 @@ func (p *Plane) dispatchBound(
 		// incarnation lock stays held across reconciliation and the read, so a
 		// replacement or later inventory either wins before this point and is
 		// observed above, or follows a capacity decision already made durable.
-		// ResolveQuarantineFor also enforces the quarantine grace; a merely late
-		// launch remains charged and returns custody here.
-		_, err := p.registrar.ResolveQuarantineFor(
-			ctx, nodeName, inventoryIDs(n.inventory), n.ledgerEpoch)
+		// The completion resolver also enforces the quarantine grace; a merely
+		// late launch remains charged and returns custody here.
+		settled, err := p.registrar.ResolveQuarantineForCompletion(
+			ctx, nodeName, leaseID, n.ledgerEpoch, outcome)
 		if err != nil {
 			p.mu.Unlock()
 
 			return nodeapi.CommandResult{}, "", false, err
 		}
-		_, err = p.registrar.Lease(ctx, leaseID)
-		switch {
-		case errors.Is(err, alloc.ErrLeaseNotFound):
+		if settled {
 			p.mu.Unlock()
 
 			return nodeapi.CommandResult{}, "", true, nil
-		case err != nil:
-			p.mu.Unlock()
-
-			return nodeapi.CommandResult{}, "", false, err
-		default:
-			p.mu.Unlock()
-
-			return nodeapi.CommandResult{}, "", false, nil
 		}
+		p.mu.Unlock()
+
+		return nodeapi.CommandResult{}, "", false, nil
 	}
 	n := p.nodes[nodeName]
 	if owner.node != nodeName || n == nil || n.incarnation != owner.incarnation {
@@ -568,15 +569,6 @@ func (p *Plane) dispatchBound(
 	res, err := p.waitDispatched(ctx, n, pend)
 
 	return res, owner.incarnation, false, err
-}
-
-func inventoryIDs(inventory map[string]bool) []string {
-	ids := make([]string, 0, len(inventory))
-	for id := range inventory {
-		ids = append(ids, id)
-	}
-
-	return ids
 }
 
 func (p *Plane) queueLocked(n *node, pend *pending) {

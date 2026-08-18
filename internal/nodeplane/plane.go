@@ -86,6 +86,11 @@ type Plane struct {
 
 	mu    sync.Mutex
 	nodes map[string]*node
+	// registering is the newest registration that has begun for each node but
+	// has not installed its ledger epoch and inventory yet. Beginning one clears
+	// prior absence evidence before any store read or epoch write can block.
+	registering      map[string]uint64
+	nextRegistration uint64
 
 	registrar Registrar
 
@@ -114,6 +119,31 @@ type Plane struct {
 	// never be rediscovered, so the ledger would believe in it forever. A failed write
 	// goes back on the queue.
 	pendingGone []goneNode
+}
+
+func (p *Plane) beginRegistration(node string) uint64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.nextRegistration++
+	intent := p.nextRegistration
+	if p.registering == nil {
+		p.registering = make(map[string]uint64)
+	}
+	p.registering[node] = intent
+	if n := p.nodes[node]; n != nil {
+		n.inventoryKnown = false
+		n.inventory = nil
+	}
+
+	return intent
+}
+
+func (p *Plane) finishRegistration(node string, intent uint64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.registering[node] == intent {
+		delete(p.registering, node)
+	}
 }
 
 // node is one registered compute host.
@@ -506,10 +536,12 @@ type Registrar interface {
 	// container was visible.
 	ResolveQuarantineFor(ctx context.Context, node string, running []string, epoch int64) (int, error)
 
-	// Lease reads the durable capacity obligation. A missing row is the only
-	// absence proof a completion may carry past the plane lock into listener
-	// settlement; an in-memory inventory snapshot alone can be superseded.
-	Lease(ctx context.Context, leaseID string) (*alloc.Lease, error)
+	// ResolveQuarantineForCompletion settles one absent lease with GitHub's
+	// authoritative outcome. The node epoch and the plane's registration intent
+	// fence the inventory snapshot that authorized it.
+	ResolveQuarantineForCompletion(
+		ctx context.Context, node, leaseID string, epoch int64, outcome alloc.Phase,
+	) (bool, error)
 }
 
 // sortedSites lists the declared places in a stable order, so a refusal naming
@@ -603,6 +635,16 @@ func WithPollTimeout(d time.Duration) Option {
 func (p *Plane) Register(
 	ctx context.Context, req nodeapi.RegisterRequest,
 ) (nodeapi.RegisterResponse, error) {
+	intent := p.beginRegistration(req.Node)
+
+	return p.register(ctx, req, intent)
+}
+
+func (p *Plane) register(
+	ctx context.Context, req nodeapi.RegisterRequest, intent uint64,
+) (nodeapi.RegisterResponse, error) {
+	defer p.finishRegistration(req.Node, intent)
+
 	if req.Version != nodeapi.Version {
 		return nodeapi.RegisterResponse{}, fmt.Errorf(
 			"%w: node %q speaks protocol version %d, this control plane speaks %d; "+
@@ -666,11 +708,23 @@ func (p *Plane) Register(
 		}
 	}
 
-	// THE LEDGER FIRST, and outside the mutex. A node that appears in the plane's
-	// map but not in the allocator's node table takes commands and then has every
-	// Bind refused — the failure looks like a broken node instead of a missing
-	// row. Doing it first means a ledger that refuses leaves the plane unchanged,
-	// so the node retries registration rather than believing it succeeded.
+	p.mu.Lock()
+	currentIntent := p.registering[req.Node]
+	p.mu.Unlock()
+	if currentIntent != intent {
+		return nodeapi.RegisterResponse{}, fmt.Errorf(
+			"%w: a newer registration for node %q overtook this one",
+			ErrSuperseded, req.Node)
+	}
+
+	// THE LEDGER FIRST, outside the mutex but after the intent is visible. A node
+	// that appears in the plane's map but not in the allocator's node table takes
+	// commands and then has every Bind refused — the failure looks like a broken
+	// node instead of a missing row. The intent has already invalidated prior
+	// absence evidence, so a blocked epoch write cannot race an old inventory into
+	// releasing this process's live compute. A ledger refusal leaves membership
+	// unchanged and inventory unknown, so the node retries without an unsafe old
+	// snapshot becoming authoritative.
 	// Scoped outside the registrar block: a plane without one (tests, and the
 	// in-process path) has no ledger to fence against, and zero is the epoch a
 	// node that was never recorded would carry anyway.
@@ -701,6 +755,11 @@ func (p *Plane) Register(
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.registering[req.Node] != intent {
+		return nodeapi.RegisterResponse{}, fmt.Errorf(
+			"%w: a newer registration for node %q overtook this one after its ledger write",
+			ErrSuperseded, req.Node)
+	}
 
 	n, ok := p.nodes[req.Node]
 	if !ok {
@@ -872,6 +931,11 @@ func (p *Plane) ReconcileInventory(
 	// is terminalizing capacity under its epoch.
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if _, pending := p.registering[node]; pending {
+		return 0, fmt.Errorf(
+			"nodeplane: node %q has a registration in progress; retry this inventory after it settles",
+			node)
+	}
 
 	n, ok := p.nodes[node]
 	if !ok {

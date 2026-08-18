@@ -3,7 +3,6 @@ package nodeplane
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"strconv"
 	"strings"
@@ -1840,8 +1839,10 @@ func (countingRegistrar) ResolveQuarantineFor(
 	return 0, nil
 }
 
-func (countingRegistrar) Lease(_ context.Context, leaseID string) (*alloc.Lease, error) {
-	return nil, fmt.Errorf("%w: %s", alloc.ErrLeaseNotFound, leaseID)
+func (countingRegistrar) ResolveQuarantineForCompletion(
+	context.Context, string, string, int64, alloc.Phase,
+) (bool, error) {
+	return true, nil
 }
 
 // answerOneCommand runs a node's polling loop until it has answered one command.

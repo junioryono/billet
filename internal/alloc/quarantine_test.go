@@ -487,3 +487,45 @@ func TestResolvingAQuarantineKeepsTheCallersOutcome(t *testing.T) {
 		})
 	}
 }
+
+func TestCompletionAbsenceKeepsItsOutcomeAcrossInventoryOrdering(t *testing.T) {
+	for _, inventoryFirst := range []bool{false, true} {
+		name := "completion first"
+		if inventoryFirst {
+			name = "inventory first"
+		}
+		t.Run(name, func(t *testing.T) {
+			now := time.Now().UTC()
+			a := quarantineFleet(t, &now)
+			lease := busyLease(t, a)
+			now = now.Add(31 * time.Second)
+			if _, err := a.Reap(t.Context()); err != nil {
+				t.Fatalf("Reap: %v", err)
+			}
+			now = now.Add(2 * quarantineGrace)
+			epoch := nodeEpoch(t, a)
+
+			if inventoryFirst {
+				if freed, err := a.ResolveQuarantineFor(
+					t.Context(), "epyc-1", nil, epoch); err != nil || freed != 1 {
+					t.Fatalf("inventory reconciliation: freed=%d err=%v", freed, err)
+				}
+			}
+			settled, err := a.ResolveQuarantineForCompletion(
+				t.Context(), "epyc-1", lease.ID, epoch, PhaseDone)
+			if err != nil {
+				t.Fatalf("ResolveQuarantineForCompletion: %v", err)
+			}
+			if !settled {
+				t.Fatal("authoritative completion did not settle its absent lease")
+			}
+			got, err := a.HistoryOutcomesForRequest(t.Context(), 1)
+			if err != nil {
+				t.Fatalf("history: %v", err)
+			}
+			if len(got) != 1 || got[0] != string(PhaseDone) {
+				t.Fatalf("completion history = %v, want done", got)
+			}
+		})
+	}
+}

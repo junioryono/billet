@@ -3,7 +3,6 @@ package nodeplane
 import (
 	"context"
 	"errors"
-	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -98,8 +97,10 @@ func (l *ledger) ResolveQuarantineFor(
 	return 0, nil
 }
 
-func (l *ledger) Lease(_ context.Context, leaseID string) (*alloc.Lease, error) {
-	return nil, fmt.Errorf("%w: %s", alloc.ErrLeaseNotFound, leaseID)
+func (l *ledger) ResolveQuarantineForCompletion(
+	context.Context, string, string, int64, alloc.Phase,
+) (bool, error) {
+	return true, nil
 }
 
 func (l *ledger) ForgetEveryNode(context.Context) error { return nil }
@@ -231,17 +232,14 @@ func TestALateRegistrationCannotSupersedeTheNewerProcess(t *testing.T) {
 	proceed := make(chan struct{})
 	led.holdFirst = proceed
 
-	first := make(chan struct{})
+	first := make(chan error, 1)
 
 	go func() {
-		defer close(first)
-
-		if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
+		_, err := p.Register(t.Context(), nodeapi.RegisterRequest{
 			Version: nodeapi.Version, Node: "n1", Provider: config.ProviderDocker,
 			Deployment: deployment, Incarnation: "old", VCPU: 8, Memory: 32 * config.GiB,
-		}); err != nil {
-			t.Errorf("first Register: %v", err)
-		}
+		})
+		first <- err
 	}()
 
 	// A is inside the ledger write holding the older epoch.
@@ -258,7 +256,9 @@ func TestALateRegistrationCannotSupersedeTheNewerProcess(t *testing.T) {
 	}
 
 	close(proceed)
-	<-first
+	if err := <-first; !errors.Is(err, ErrSuperseded) {
+		t.Fatalf("overtaken first registration = %v, want superseded", err)
+	}
 
 	// EVERY FIELD, NOT JUST THE EPOCH. Keeping the epoch monotonic while letting
 	// the rest of the registration through was the bug: the older request still

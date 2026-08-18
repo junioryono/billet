@@ -63,7 +63,7 @@ type CompletionAwareRunner interface {
 // BoundCompletionAwareRunner reconciles teardown with the node and lease that
 // actually held compute before a control-plane restart erased live ownership.
 type BoundCompletionAwareRunner interface {
-	DestroyCompletedBound(context.Context, int64, string, string, string) error
+	DestroyCompletedBound(context.Context, int64, string, string, string, alloc.Phase) error
 }
 
 // completionStore is the durable half of result-dependent teardown.
@@ -1483,7 +1483,7 @@ func (l *Listener) destroyAll(ctx context.Context) map[int64]bool {
 			}
 
 			lease, outcome, _ := l.completionRelease(requestID)
-			err := l.destroyCompleted(ctx, job, lease)
+			err := l.destroyCompleted(ctx, job, lease, outcome)
 
 			// CUSTODY DISCHARGES THE OBLIGATION RATHER THAN FAILING IT (#46).
 			//
@@ -2958,7 +2958,7 @@ func (l *Listener) complete(ctx context.Context, job Job) {
 	// forever if that node never comes back.
 	before, beforeOutcome, _ := l.completionRelease(job.RequestID)
 
-	if err := l.destroyCompleted(ctx, job, before); err != nil {
+	if err := l.destroyCompleted(ctx, job, before, beforeOutcome); err != nil {
 		// THE RUNNER IS HOLDING IT, SO THIS LISTENER LETS GO (#46).
 		//
 		// A backend whose teardown is asynchronous cannot answer this call with
@@ -3217,10 +3217,19 @@ func (l *Listener) complete(ctx context.Context, job Job) {
 	}
 }
 
-func (l *Listener) destroyCompleted(ctx context.Context, job Job, lease *alloc.Lease) error {
+func (l *Listener) destroyCompleted(
+	ctx context.Context,
+	job Job,
+	lease *alloc.Lease,
+	outcome alloc.Phase,
+) error {
+	if outcome == "" {
+		outcome = alloc.PhaseDone
+	}
 	if runner, ok := l.runner.(BoundCompletionAwareRunner); ok && job.Result != "" &&
 		lease != nil && lease.ID != "" && lease.Node != "" {
-		return runner.DestroyCompletedBound(ctx, job.RequestID, job.Result, lease.ID, lease.Node)
+		return runner.DestroyCompletedBound(
+			ctx, job.RequestID, job.Result, lease.ID, lease.Node, outcome)
 	}
 	if runner, ok := l.runner.(CompletionAwareRunner); ok && job.Result != "" {
 		return runner.DestroyCompleted(ctx, job.RequestID, job.Result)

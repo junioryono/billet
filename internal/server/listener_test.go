@@ -1243,9 +1243,9 @@ func TestARedeliveredCompletionDoesNotConsumeASecondLease(t *testing.T) {
 		t.Fatalf("count job_history rows: %v", err)
 	}
 
-	if leases > 1 {
-		t.Errorf("request 11 was assigned %d separate leases; the redelivered batch consumed "+
-			"another one for a job that was already over", leases)
+	if leases != 0 {
+		t.Errorf("request 11 was assigned %d lease(s); a batch that already completed it must "+
+			"never launch it, including on retired redelivery", leases)
 	}
 }
 
@@ -1982,6 +1982,7 @@ type boundFakeRunner struct {
 	result    string
 	leaseID   string
 	node      string
+	outcome   alloc.Phase
 	err       error
 }
 
@@ -2003,8 +2004,10 @@ func (f *boundFakeRunner) DestroyCompletedBound(
 	_ context.Context,
 	requestID int64,
 	result, leaseID, node string,
+	outcome alloc.Phase,
 ) error {
-	f.requestID, f.result, f.leaseID, f.node = requestID, result, leaseID, node
+	f.requestID, f.result, f.leaseID, f.node, f.outcome =
+		requestID, result, leaseID, node, outcome
 
 	return f.err
 }
@@ -2579,9 +2582,10 @@ func TestRestoredCompletionTargetsItsPersistedLeaseNode(t *testing.T) {
 	}
 	l.retryCleanup(t.Context())
 	if runner.requestID != completion.RequestID || runner.result != completion.Result ||
-		runner.leaseID != completion.LeaseID || runner.node != completion.LeaseNode {
-		t.Fatalf("bound destroy = request %d result %q lease %q node %q, want %+v",
-			runner.requestID, runner.result, runner.leaseID, runner.node, completion)
+		runner.leaseID != completion.LeaseID || runner.node != completion.LeaseNode ||
+		runner.outcome != alloc.PhaseDone {
+		t.Fatalf("bound destroy = request %d result %q lease %q node %q outcome %q, want %+v",
+			runner.requestID, runner.result, runner.leaseID, runner.node, runner.outcome, completion)
 	}
 }
 

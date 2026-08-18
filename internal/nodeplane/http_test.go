@@ -56,17 +56,19 @@ type fakeRegistrar struct {
 	forgotten bool
 }
 
-func (f *fakeRegistrar) Lease(_ context.Context, leaseID string) (*alloc.Lease, error) {
+func (f *fakeRegistrar) ResolveQuarantineForCompletion(
+	_ context.Context, _ string, leaseID string, _ int64, _ alloc.Phase,
+) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.leaseErr != nil {
-		return nil, f.leaseErr
+		return false, f.leaseErr
 	}
 	if f.lease == nil || f.lease.ID != leaseID {
-		return nil, fmt.Errorf("%w: %s", alloc.ErrLeaseNotFound, leaseID)
+		return true, nil
 	}
 
-	return f.lease, nil
+	return false, nil
 }
 
 // ResolveQuarantineFor records what a returning host reported running, so a test
@@ -163,6 +165,10 @@ type fakeStore struct {
 	lease       *alloc.Lease
 	launched    map[string]bool
 	quarantined map[string]bool
+	// launchedEntered/proceed stage registration while it is reading durable
+	// ownership, after its intent must already have invalidated old inventory.
+	launchedEntered chan struct{}
+	launchedProceed <-chan struct{}
 
 	bound    []string
 	advanced []alloc.Phase
@@ -236,11 +242,26 @@ func (f *fakeStore) QuarantinedLeaseIDs(context.Context, string) (map[string]boo
 	return f.quarantined, nil
 }
 
-func (f *fakeStore) LaunchedLeaseIDs(context.Context, string) (map[string]bool, error) {
+func (f *fakeStore) LaunchedLeaseIDs(ctx context.Context, _ string) (map[string]bool, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
+	entered, proceed, launched := f.launchedEntered, f.launchedProceed, f.launched
+	f.mu.Unlock()
+	if entered != nil {
+		select {
+		case entered <- struct{}{}:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	if proceed != nil {
+		select {
+		case <-proceed:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 
-	return f.launched, nil
+	return launched, nil
 }
 
 func serve(t *testing.T, store nodeplane.LeaseStore, opts ...nodeplane.Option) (*nodeplane.Plane, string) {
@@ -798,6 +819,44 @@ func TestRegistrationReachesTheLedger(t *testing.T) {
 
 	if got := reg.names(); len(got) != 1 || got[0] != "n1" {
 		t.Fatalf("the ledger was told about %v, want [n1]", got)
+	}
+}
+
+func TestRegistrationIntentInvalidatesAbsenceBeforeTheOwnershipRead(t *testing.T) {
+	entered := make(chan struct{}, 1)
+	proceed := make(chan struct{})
+	store := &fakeStore{launchedEntered: entered, launchedProceed: proceed}
+	reg := &fakeRegistrar{}
+	p, base := serve(t, store, nodeplane.WithRegistrar(reg))
+	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
+		Version: nodeapi.Version, Node: "n1", Provider: config.ProviderDocker,
+		Deployment: deployment, Incarnation: "old", VCPU: testNodeVCPU,
+		Memory: testNodeMemory, InventoryKnown: true,
+	}); err != nil {
+		t.Fatalf("register old incarnation: %v", err)
+	}
+	c, err := nodeclient.New(nodeclient.Options{Base: base, Node: "n1"})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	registered := make(chan error, 1)
+	go func() {
+		registered <- c.Register(t.Context(), nodeclient.Registration{
+			Provider: config.ProviderDocker, Deployment: deployment,
+			VCPU: testNodeVCPU, Memory: testNodeMemory,
+			InventoryKnown: true, Instances: []string{"l1"},
+		})
+	}()
+	<-entered
+
+	if err := p.NewRunner().DestroyCompletedBound(
+		t.Context(), 7, "Succeeded", "l1", "n1", alloc.PhaseDone,
+	); !errors.Is(err, server.ErrCustody) {
+		t.Fatalf("completion during ownership read = %v, want custody", err)
+	}
+	close(proceed)
+	if err := <-registered; err != nil {
+		t.Fatalf("register replacement: %v", err)
 	}
 }
 

@@ -3,7 +3,8 @@ package nodeplane
 import (
 	"context"
 	"errors"
-	"fmt"
+	"log/slog"
+	"sync"
 	"testing"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/server"
+	"github.com/junioryono/billet/internal/state"
 )
 
 type presentLeaseRegistrar struct {
@@ -18,18 +20,52 @@ type presentLeaseRegistrar struct {
 	lease *alloc.Lease
 }
 
-func (r *presentLeaseRegistrar) Lease(_ context.Context, leaseID string) (*alloc.Lease, error) {
+func (r *presentLeaseRegistrar) ResolveQuarantineForCompletion(
+	_ context.Context, _ string, leaseID string, _ int64, _ alloc.Phase,
+) (bool, error) {
 	if r.lease != nil && r.lease.ID == leaseID {
-		return r.lease, nil
+		return false, nil
 	}
 
-	return nil, fmt.Errorf("%w: %s", alloc.ErrLeaseNotFound, leaseID)
+	return true, nil
 }
 
 type blockingInventoryRegistrar struct {
 	presentLeaseRegistrar
 	entered chan struct{}
 	proceed chan struct{}
+}
+
+type blockingAllocatorRegistrar struct {
+	*alloc.Allocator
+	mu      sync.Mutex
+	calls   int
+	entered chan struct{}
+	proceed chan struct{}
+}
+
+func (r *blockingAllocatorRegistrar) RegisterNode(
+	ctx context.Context,
+	registration alloc.NodeRegistration,
+) (int64, error) {
+	r.mu.Lock()
+	r.calls++
+	call := r.calls
+	r.mu.Unlock()
+	if call == 2 {
+		select {
+		case r.entered <- struct{}{}:
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+		select {
+		case <-r.proceed:
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+	}
+
+	return r.Allocator.RegisterNode(ctx, registration)
 }
 
 func (r *blockingInventoryRegistrar) ResolveQuarantineFor(
@@ -51,7 +87,7 @@ func (r *blockingInventoryRegistrar) ResolveQuarantineFor(
 func TestBoundCompletionWaitsForItsPersistedNode(t *testing.T) {
 	p := testPlane(t)
 	runner := p.NewRunner()
-	if err := runner.DestroyCompletedBound(t.Context(), 7, "Succeeded", "l1", "holder"); !errors.Is(err, server.ErrCustody) {
+	if err := runner.DestroyCompletedBound(t.Context(), 7, "Succeeded", "l1", "holder", alloc.PhaseDone); !errors.Is(err, server.ErrCustody) {
 		t.Fatalf("absent holder destroy = %v, want custody", err)
 	}
 	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
@@ -60,7 +96,7 @@ func TestBoundCompletionWaitsForItsPersistedNode(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("register unrelated node: %v", err)
 	}
-	if err := runner.DestroyCompletedBound(t.Context(), 7, "Succeeded", "l1", "holder"); !errors.Is(err, server.ErrCustody) {
+	if err := runner.DestroyCompletedBound(t.Context(), 7, "Succeeded", "l1", "holder", alloc.PhaseDone); !errors.Is(err, server.ErrCustody) {
 		t.Fatalf("unrelated live fleet destroy = %v, want custody", err)
 	}
 	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
@@ -69,7 +105,7 @@ func TestBoundCompletionWaitsForItsPersistedNode(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("register unreconciled holder: %v", err)
 	}
-	if err := runner.DestroyCompletedBound(t.Context(), 7, "Succeeded", "l1", "holder"); !errors.Is(err, server.ErrCustody) {
+	if err := runner.DestroyCompletedBound(t.Context(), 7, "Succeeded", "l1", "holder", alloc.PhaseDone); !errors.Is(err, server.ErrCustody) {
 		t.Fatalf("unreconciled holder destroy = %v, want custody", err)
 	}
 }
@@ -87,7 +123,7 @@ func TestBoundCompletionUsesTheHolderAfterItAdoptsTheLease(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- p.NewRunner().DestroyCompletedBound(
-			t.Context(), 7, "Succeeded", "l1", "holder")
+			t.Context(), 7, "Succeeded", "l1", "holder", alloc.PhaseDone)
 	}()
 	cmd, took, err := p.Poll(t.Context(), "holder", "holder-2")
 	if err != nil || !took {
@@ -116,7 +152,7 @@ func TestBoundCompletionIsNotTakenByAReplacementIncarnation(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- p.NewRunner().DestroyCompletedBound(
-			t.Context(), 7, "Succeeded", "l1", "holder")
+			t.Context(), 7, "Succeeded", "l1", "holder", alloc.PhaseDone)
 	}()
 	waitFor(t, "bound destroy to queue", func() bool { return p.QueuedForTest("holder") == 1 })
 	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
@@ -148,7 +184,7 @@ func TestBoundCompletionAcceptsTheHoldersKnownEmptyInventory(t *testing.T) {
 	}
 	p.AdoptOwnershipWithInventory("holder", "holder-2", nil, true)
 	if err := p.NewRunner().DestroyCompletedBound(
-		t.Context(), 7, "Succeeded", "l1", "holder"); err != nil {
+		t.Context(), 7, "Succeeded", "l1", "holder", alloc.PhaseDone); err != nil {
 		t.Fatalf("durably absent holder destroy: %v", err)
 	}
 }
@@ -164,7 +200,7 @@ func TestKnownEmptyInventoryDoesNotReleaseALiveDurableLease(t *testing.T) {
 		t.Fatalf("register empty holder: %v", err)
 	}
 	if err := p.NewRunner().DestroyCompletedBound(
-		t.Context(), 7, "Succeeded", "l1", "holder"); !errors.Is(err, server.ErrCustody) {
+		t.Context(), 7, "Succeeded", "l1", "holder", alloc.PhaseDone); !errors.Is(err, server.ErrCustody) {
 		t.Fatalf("live durable lease destroy = %v, want custody", err)
 	}
 }
@@ -193,7 +229,7 @@ func TestPeriodicReconciliationInstallsOwnershipBeforeCompletionCanUseAbsence(t 
 	destroyed := make(chan error, 1)
 	go func() {
 		destroyed <- p.NewRunner().DestroyCompletedBound(
-			t.Context(), 7, "Succeeded", "l1", "holder")
+			t.Context(), 7, "Succeeded", "l1", "holder", alloc.PhaseDone)
 	}()
 	select {
 	case err := <-destroyed:
@@ -217,6 +253,89 @@ func TestPeriodicReconciliationInstallsOwnershipBeforeCompletionCanUseAbsence(t 
 	}
 }
 
+func TestReplacementRegistrationInvalidatesAbsenceBeforeItsEpochWrite(t *testing.T) {
+	now := time.Now().UTC()
+	db, err := state.Open(t.Context(), t.TempDir())
+	if err != nil {
+		t.Fatalf("state.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	tier := testTier()
+	a, err := alloc.New(db, alloc.Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB},
+		[]config.Tier{tier}, alloc.WithClock(func() time.Time { return now }),
+		alloc.WithLeaseTTL(30*time.Second))
+	if err != nil {
+		t.Fatalf("alloc.New: %v", err)
+	}
+	reg := &blockingAllocatorRegistrar{
+		Allocator: a,
+		entered:   make(chan struct{}, 1),
+		proceed:   make(chan struct{}),
+	}
+	p := New(slog.New(slog.DiscardHandler), deployment, time.Minute,
+		WithRegistrar(reg), WithTierCatalog([]config.Tier{tier}))
+	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
+		Version: nodeapi.Version, Node: "holder", Provider: config.ProviderDocker,
+		Deployment: deployment, Incarnation: "holder-1", VCPU: 8, Memory: 32 * config.GiB,
+	}); err != nil {
+		t.Fatalf("register first incarnation: %v", err)
+	}
+	lease, err := a.Reserve(t.Context(), tier.Label)
+	if err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	if err := a.Bind(t.Context(), lease.ID, lease.Epoch, "holder"); err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+	for _, phase := range []alloc.Phase{
+		alloc.PhaseAssigned, alloc.PhaseLaunching, alloc.PhaseOnline, alloc.PhaseBusy,
+	} {
+		lease, err = a.Lease(t.Context(), lease.ID)
+		if err != nil {
+			t.Fatalf("read lease before %s: %v", phase, err)
+		}
+		if err := a.Advance(t.Context(), lease.ID, lease.Epoch, phase); err != nil {
+			t.Fatalf("advance to %s: %v", phase, err)
+		}
+	}
+	now = now.Add(31 * time.Second)
+	if _, err := a.Reap(t.Context()); err != nil {
+		t.Fatalf("reap: %v", err)
+	}
+	if _, err := p.ReconcileInventory(t.Context(), "holder", "holder-1", nil); err != nil {
+		t.Fatalf("install first empty inventory: %v", err)
+	}
+
+	replacement := make(chan error, 1)
+	go func() {
+		_, err := p.Register(t.Context(), nodeapi.RegisterRequest{
+			Version: nodeapi.Version, Node: "holder", Provider: config.ProviderDocker,
+			Deployment: deployment, Incarnation: "holder-2", VCPU: 8, Memory: 32 * config.GiB,
+			InventoryKnown: true, Instances: []string{lease.ID},
+		})
+		replacement <- err
+	}()
+	<-reg.entered
+
+	if err := p.NewRunner().DestroyCompletedBound(
+		t.Context(), 7, "Succeeded", lease.ID, "holder", alloc.PhaseDone,
+	); !errors.Is(err, server.ErrCustody) {
+		t.Fatalf("completion during replacement registration = %v, want custody", err)
+	}
+	if current, err := a.Lease(t.Context(), lease.ID); err != nil ||
+		current.Phase != alloc.PhaseQuarantine {
+		t.Fatalf("live replacement lease = %+v err=%v, want charged quarantine", current, err)
+	}
+	close(reg.proceed)
+	if err := <-replacement; err != nil {
+		t.Fatalf("register replacement: %v", err)
+	}
+	owner, ok := p.OwnerOfLease(lease.ID)
+	if !ok || owner.Node != "holder" || owner.Incarnation != "holder-2" || !owner.Current {
+		t.Fatalf("replacement did not adopt live lease: owner=%+v present=%v", owner, ok)
+	}
+}
+
 func TestPeriodicInventoryAdoptsItsLiveBoundLease(t *testing.T) {
 	p := testPlane(t, WithRegistrar(&countingRegistrar{}))
 	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
@@ -231,7 +350,7 @@ func TestPeriodicInventoryAdoptsItsLiveBoundLease(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- p.NewRunner().DestroyCompletedBound(
-			t.Context(), 7, "Succeeded", "l1", "holder")
+			t.Context(), 7, "Succeeded", "l1", "holder", alloc.PhaseDone)
 	}()
 	cmd, took, err := p.Poll(t.Context(), "holder", "holder-1")
 	if err != nil || !took {
