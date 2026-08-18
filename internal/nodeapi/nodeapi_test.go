@@ -77,8 +77,9 @@ func TestALaunchCommandCarriesWhatALaunchNeeds(t *testing.T) {
 			Epoch:     3,
 			RequestID: 77,
 		},
-		Tier: TierSpecOf(config.Tier{BuildKitCacheMountLimit: 7 * config.GiB}),
-		Job:  &Job{RequestID: 77, RunID: 88, Event: "push"},
+		Tier: TierSpecOf(config.Tier{BuildKitCacheMountLimit: 7 * config.GiB},
+			config.ProviderDocker),
+		Job: &Job{RequestID: 77, RunID: 88, Event: "push"},
 	}
 
 	raw, err := json.Marshal(cmd)

@@ -336,14 +336,35 @@ func TestAVersionMismatchIsRefused(t *testing.T) {
 func TestTheLeasesPreferenceOrderDecides(t *testing.T) {
 	t.Parallel()
 
-	p := testPlane(t, WithCommandTimeout(2*time.Second))
+	p := testPlane(t, WithCommandTimeout(2*time.Second), WithTierCatalog([]config.Tier{{
+		Label:     "billet-2vcpu",
+		Providers: []config.ProviderKind{config.ProviderEC2, config.ProviderDocker},
+		GuestOS:   config.GuestLinux,
+		VCPU:      2,
+		Memory:    8 * config.GiB,
+		Launch: map[config.ProviderKind]config.TierLaunch{
+			config.ProviderEC2: {
+				Image:   "ami-cloud",
+				Command: []string{"/usr/local/bin/billet-runner"},
+			},
+			config.ProviderDocker: {
+				Image:   "docker-image",
+				Command: []string{"/entrypoint.sh"},
+			},
+		},
+	}}))
 	register(t, p, "docker-host", config.ProviderDocker)
 	register(t, p, "ec2-host", config.ProviderEC2)
 
 	lease := testLease()
 	lease.Providers = []config.ProviderKind{config.ProviderEC2, config.ProviderDocker}
 
-	got := make(chan string, 1)
+	type delivery struct {
+		node string
+		tier *nodeapi.TierSpec
+	}
+
+	got := make(chan delivery, 1)
 
 	for _, name := range []string{"docker-host", "ec2-host"} {
 		go func() {
@@ -352,7 +373,7 @@ func TestTheLeasesPreferenceOrderDecides(t *testing.T) {
 				return
 			}
 
-			got <- name
+			got <- delivery{node: name, tier: cmd.Tier}
 
 			if err := p.Result(name, "", nodeapi.CommandResult{ID: cmd.ID, OK: true}); err != nil {
 				t.Errorf("Result: %v", err)
@@ -365,12 +386,113 @@ func TestTheLeasesPreferenceOrderDecides(t *testing.T) {
 	}
 
 	select {
-	case name := <-got:
-		if name != "ec2-host" {
-			t.Errorf("the lease prefers ec2 first and the command went to %s", name)
+	case delivered := <-got:
+		if delivered.node != "ec2-host" {
+			t.Errorf("the lease prefers ec2 first and the command went to %s", delivered.node)
+		}
+		if delivered.tier == nil {
+			t.Fatal("the EC2 launch carried no tier specification")
+		}
+		if delivered.tier.Image != "ami-cloud" || len(delivered.tier.Command) != 1 ||
+			delivered.tier.Command[0] != "/usr/local/bin/billet-runner" {
+			t.Errorf("EC2 launch specification = %+v, want its provider-specific image and command",
+				delivered.tier)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("no node received the command")
+	}
+}
+
+// A NODE MAY RE-REGISTER BETWEEN PLACEMENT AND ENQUEUE.
+//
+// The node object is deliberately reused across registration, so reading its
+// provider after pick releases the plane lock observes mutable state. Sending a
+// Docker image selected before that handover to an EC2 process is worse than
+// losing this attempt: it is a command for a different backend that can never
+// succeed and whose failure arrives only after the job has been assigned.
+func TestAProviderChangeBetweenPlacementAndDispatchIsRefused(t *testing.T) {
+	t.Parallel()
+
+	p := testPlane(t)
+	register(t, p, "worker", config.ProviderDocker)
+
+	n, selected, err := p.pick(testLease())
+	if err != nil {
+		t.Fatalf("pick: %v", err)
+	}
+
+	register(t, p, "worker", config.ProviderEC2)
+
+	pend := &pending{
+		cmd:              nodeapi.Command{ID: "c1", Kind: nodeapi.CommandLaunch},
+		done:             make(chan nodeapi.CommandResult, 1),
+		expectedProvider: selected,
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+
+	_, err = p.dispatch(ctx, n, pend)
+	if !errors.Is(err, ErrNoNode) {
+		t.Fatalf("dispatch after provider change = %v, want ErrNoNode", err)
+	}
+	if !strings.Contains(err.Error(), "changed provider from docker to ec2") {
+		t.Errorf("dispatch refusal does not explain the stale selection: %v", err)
+	}
+
+	p.mu.Lock()
+	queued := len(n.queue)
+	p.mu.Unlock()
+
+	if queued != 0 {
+		t.Errorf("stale launch left %d command(s) queued for the replacement backend", queued)
+	}
+}
+
+// A QUEUED LAUNCH IS STILL BOUND TO THE PROVIDER THAT PLACEMENT SELECTED.
+//
+// Registration keeps commands that no process has taken because nothing may
+// have started yet. If the replacement process uses another backend, those
+// commands are safe to fail but never safe to deliver: their image and command
+// were already rendered for the provider that disappeared.
+func TestAProviderChangeAfterEnqueueRefusesTheStaleLaunch(t *testing.T) {
+	t.Parallel()
+
+	p := testPlane(t, WithPollTimeout(10*time.Millisecond))
+	register(t, p, "worker", config.ProviderDocker)
+
+	p.mu.Lock()
+	enqueued := p.nodes["worker"].waiting
+	p.mu.Unlock()
+
+	launched := make(chan error, 1)
+	go func() {
+		launched <- p.NewRunner().Launch(t.Context(), testLease(), server.Job{RequestID: 7})
+	}()
+
+	select {
+	case <-enqueued:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the production launch path did not enqueue its command")
+	}
+
+	register(t, p, "worker", config.ProviderEC2)
+
+	cmd, ok, err := p.Poll(t.Context(), "worker", "")
+	if err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	if ok {
+		t.Fatalf("replacement EC2 process received stale Docker command %+v", cmd)
+	}
+
+	select {
+	case err := <-launched:
+		if err == nil || !strings.Contains(err.Error(), "changed provider from docker to ec2") {
+			t.Errorf("stale launch result = %v, want a useful clean failure", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the caller was left waiting for a stale launch that cannot be delivered")
 	}
 }
 

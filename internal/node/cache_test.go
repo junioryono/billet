@@ -483,9 +483,10 @@ func TestRunnerCarriesTheNodesRegistryMirrorsToItsGuest(t *testing.T) {
 			QuayIO:   "https://quay-cache.home.example",
 		}))
 	lease := assignedLease(t, a)
-	if err := runner.Launch(t.Context(), lease, nodeapi.TierSpecOf(tier), Job{
-		RequestID: lease.RequestID, Event: "push",
-	}); err != nil {
+	if err := runner.Launch(t.Context(), lease,
+		nodeapi.TierSpecOf(tier, config.ProviderFirecracker), Job{
+			RequestID: lease.RequestID, Event: "push",
+		}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 	if got := p.launched[0].RegistryMirrors; got.DockerIO != "https://docker-cache.home.example" ||
@@ -525,9 +526,10 @@ func TestFirecrackerBootsWithAnArchitectureScopedDockerImageStore(t *testing.T) 
 
 	runner := New(a, host, &fakeJIT{setID: 7}, p, nil, WithCacheService(service))
 	lease := assignedLease(t, a)
-	if err := runner.Launch(t.Context(), lease, nodeapi.TierSpecOf(tier), Job{
-		RequestID: lease.RequestID, Event: "push",
-	}); err != nil {
+	if err := runner.Launch(t.Context(), lease,
+		nodeapi.TierSpecOf(tier, config.ProviderFirecracker), Job{
+			RequestID: lease.RequestID, Event: "push",
+		}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
 
