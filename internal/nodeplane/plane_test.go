@@ -336,14 +336,35 @@ func TestAVersionMismatchIsRefused(t *testing.T) {
 func TestTheLeasesPreferenceOrderDecides(t *testing.T) {
 	t.Parallel()
 
-	p := testPlane(t, WithCommandTimeout(2*time.Second))
+	p := testPlane(t, WithCommandTimeout(2*time.Second), WithTierCatalog([]config.Tier{{
+		Label:     "billet-2vcpu",
+		Providers: []config.ProviderKind{config.ProviderEC2, config.ProviderDocker},
+		GuestOS:   config.GuestLinux,
+		VCPU:      2,
+		Memory:    8 * config.GiB,
+		Launch: map[config.ProviderKind]config.TierLaunch{
+			config.ProviderEC2: {
+				Image:   "ami-cloud",
+				Command: []string{"/usr/local/bin/billet-runner"},
+			},
+			config.ProviderDocker: {
+				Image:   "docker-image",
+				Command: []string{"/entrypoint.sh"},
+			},
+		},
+	}}))
 	register(t, p, "docker-host", config.ProviderDocker)
 	register(t, p, "ec2-host", config.ProviderEC2)
 
 	lease := testLease()
 	lease.Providers = []config.ProviderKind{config.ProviderEC2, config.ProviderDocker}
 
-	got := make(chan string, 1)
+	type delivery struct {
+		node string
+		tier *nodeapi.TierSpec
+	}
+
+	got := make(chan delivery, 1)
 
 	for _, name := range []string{"docker-host", "ec2-host"} {
 		go func() {
@@ -352,7 +373,7 @@ func TestTheLeasesPreferenceOrderDecides(t *testing.T) {
 				return
 			}
 
-			got <- name
+			got <- delivery{node: name, tier: cmd.Tier}
 
 			if err := p.Result(name, "", nodeapi.CommandResult{ID: cmd.ID, OK: true}); err != nil {
 				t.Errorf("Result: %v", err)
@@ -365,9 +386,17 @@ func TestTheLeasesPreferenceOrderDecides(t *testing.T) {
 	}
 
 	select {
-	case name := <-got:
-		if name != "ec2-host" {
-			t.Errorf("the lease prefers ec2 first and the command went to %s", name)
+	case delivered := <-got:
+		if delivered.node != "ec2-host" {
+			t.Errorf("the lease prefers ec2 first and the command went to %s", delivered.node)
+		}
+		if delivered.tier == nil {
+			t.Fatal("the EC2 launch carried no tier specification")
+		}
+		if delivered.tier.Image != "ami-cloud" || len(delivered.tier.Command) != 1 ||
+			delivered.tier.Command[0] != "/usr/local/bin/billet-runner" {
+			t.Errorf("EC2 launch specification = %+v, want its provider-specific image and command",
+				delivered.tier)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("no node received the command")
