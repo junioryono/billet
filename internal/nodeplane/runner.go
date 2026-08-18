@@ -389,9 +389,9 @@ func (r *Runner) destroyOn(ctx context.Context, n *node, requestID int64) (strin
 		// CUSTODY IS NOT A FAILED TEARDOWN, and the difference is who holds the
 		// lease (#46).
 		//
-		// The node asked its backend to stop the guest, the backend accepted, and
-		// the guest is still shutting down — so the node has taken the lease into
-		// its own janitor and will release it when the compute is provably gone.
+		// The node asked its backend to stop the guest without receiving proof it
+		// stopped, so the node has taken the lease into its own janitor and will
+		// release it when the compute is provably gone.
 		// The listener must stand down rather than keep heartbeating and retrying;
 		// this is the same handoff a launch that could not be confirmed makes, and
 		// it goes through the same error so the listener needs no second branch.

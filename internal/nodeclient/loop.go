@@ -683,6 +683,20 @@ func serve(ctx context.Context, c *Client, compute Compute, log *slog.Logger, op
 		}
 
 		if !ok {
+			// A LONG POLL IS ALSO THE CUSTODY CLOCK. Whole-host orphan inventory is
+			// intentionally sparse, but known held entries are cheap to check and may
+			// be the only thing preventing this node from advertising capacity. EC2
+			// commonly finishes an asynchronous termination between two sweeps; waiting
+			// for the next five-minute sweep keeps a slot charged after its instance is
+			// already gone.
+			if compute.Holding() {
+				if err := compute.Tend(ctx); err != nil {
+					log.Error("could not advance custody after the command poll; leases for "+
+						"compute that may already be gone will keep being renewed until this succeeds",
+						"error", err)
+				}
+			}
+
 			continue
 		}
 
@@ -819,9 +833,9 @@ func execute(ctx context.Context, compute Compute, cmd nodeapi.Command, draining
 
 			// CUSTODY IS CARRIED HERE TOO, and its absence was #46's other half.
 			//
-			// A teardown a backend only ACCEPTED leaves the node holding the lease
-			// — the guest is still shutting down and its capacity must stay charged
-			// until it is provably gone. Without this flag the plane reads a plain
+			// An unconfirmed teardown leaves the node holding the lease because the
+			// compute may still exist and its capacity must stay charged until it is
+			// provably gone. Without this flag the plane reads a plain
 			// failure, which it treats as "the compute may still exist, keep the
 			// lease and retry the destroy". That is safe in the same direction, but
 			// it is wrong about who owns the lease: BOTH sides then hold it, the

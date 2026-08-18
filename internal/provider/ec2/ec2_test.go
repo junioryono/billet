@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os/exec"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -331,11 +332,15 @@ func describeReply(nextToken string, items ...string) string {
 // decided by runningState and tested directly against every one of them, so the
 // state is fixed here rather than being a parameter nothing varies.
 func instanceXML(id, name string) string {
+	return instanceXMLInState(id, name, "running")
+}
+
+func instanceXMLInState(id, name, state string) string {
 	return fmt.Sprintf(`<item><instanceId>%s</instanceId>`+
-		`<instanceState><name>running</name></instanceState>`+
+		`<instanceState><name>%s</name></instanceState>`+
 		`<tagSet><item><key>Name</key><value>%s</value></item>`+
 		`<item><key>sh.billet.owner</key><value>dep-1</value></item></tagSet></item>`,
-		id, name)
+		id, state, name)
 }
 
 // validEC2Config is a complete backend configuration pointed at a fake.
@@ -1381,9 +1386,9 @@ func TestDestroyDoesNotClaimTheGuestHasStopped(t *testing.T) {
 		t.Fatalf("Destroy: %v", err)
 	}
 
-	if state == provider.TeardownStopped {
-		t.Error("a terminate request AWS merely accepted was reported as a guest that has stopped; " +
-			"the lease is released on that and the guest keeps running for a minute or two")
+	if state != provider.TeardownRequested {
+		t.Errorf("an accepted terminate request = %s, want requested; the guest may still be "+
+			"running and an immediately absent inventory may still be stale", state)
 	}
 }
 
@@ -1409,9 +1414,9 @@ func TestDestroyDoesNotTreatNotFoundAsProofTheInstanceIsGone(t *testing.T) {
 		t.Fatalf("Destroy: %v", err)
 	}
 
-	if state == provider.TeardownStopped {
-		t.Error("an eventually-consistent NotFound was reported as proof the instance is gone; " +
-			"a destroy shortly after a launch gets that answer for an instance that is booting")
+	if state != provider.TeardownRequested {
+		t.Errorf("an eventually-consistent NotFound = %s, want requested; a destroy shortly after "+
+			"launch gets that answer for an instance that is booting", state)
 	}
 }
 
@@ -1562,6 +1567,72 @@ func TestFindComparesTheNameExactly(t *testing.T) {
 
 	if found {
 		t.Error("Find returned an instance whose name is not the one asked for")
+	}
+}
+
+// A targeted lookup keeps EC2's explicit terminal record as causal teardown
+// evidence, while fleet inventory still excludes historical terminated rows.
+func TestFindIncludesTerminatedStateWithoutAddingItToList(t *testing.T) {
+	f := newFakeEC2(t)
+	f.respond = func(action string, params url.Values) (int, string) {
+		if action != "DescribeInstances" {
+			return http.StatusOK, defaultReply(action)
+		}
+
+		var states []string
+		isFind := false
+		for n := 1; ; n++ {
+			name := params.Get(fmt.Sprintf("Filter.%d.Name", n))
+			if name == "" {
+				break
+			}
+			if name == "tag:"+nameTag {
+				isFind = true
+			}
+			if name == "instance-state-name" {
+				for value := 1; ; value++ {
+					state := params.Get(fmt.Sprintf("Filter.%d.Value.%d", n, value))
+					if state == "" {
+						break
+					}
+					states = append(states, state)
+				}
+			}
+		}
+
+		hasTerminated := slices.Contains(states, "terminated")
+		if isFind && !hasTerminated {
+			t.Error("Find excluded the terminal record that can causally release custody")
+		}
+		if !isFind && hasTerminated {
+			t.Error("List included terminated history in fleet reconciliation")
+		}
+		if isFind {
+			return http.StatusOK, describeReply("",
+				instanceXMLInState("i-dead", "billet-lease-1", "terminated"))
+		}
+
+		return http.StatusOK, describeReply("")
+	}
+
+	p := newTestProvider(t, f, nil)
+	inst, found, err := p.Find(t.Context(), "billet-lease-1")
+	if err != nil {
+		t.Fatalf("Find: %v", err)
+	}
+	if !found || inst == nil {
+		t.Fatal("Find did not return the terminated instance")
+	}
+	if !inst.Terminal {
+		t.Fatal("Find returned a terminated EC2 instance without terminal proof")
+	}
+	if inst.Running {
+		t.Fatal("Find classified a terminated EC2 instance as running")
+	}
+	if got, err := p.List(t.Context()); err != nil {
+		t.Fatalf("List: %v", err)
+	} else if len(got) != 0 {
+		t.Fatalf("List returned terminated history: %v", got)
 	}
 }
 

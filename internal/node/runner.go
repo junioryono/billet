@@ -412,9 +412,10 @@ func (r *Runner) Launch(
 		//
 		// If the stray could not be confirmed gone the LEASE STAYS HELD — releasing it would
 		// hand back capacity a container may still be using. CUSTODY UNLESS THE CLEANUP WAS
-		// CAUSAL: a successful Destroy proves the compute is gone, and nothing else does.
-		if confirmed, cleanupErr := r.destroyStray(ctx, name); !confirmed {
-			r.hold(lease, name, job.RequestID)
+		// CAUSAL: a successful synchronous Destroy or an explicit terminal record proves
+		// the compute is gone; an absent snapshot does not.
+		if cleanup, cleanupErr := r.destroyStray(ctx, name); !cleanup.confirmed {
+			r.holdWithEvidence(lease, name, job.RequestID, cleanup.evidence)
 
 			return errCustody(name, errors.Join(err, cleanupErr))
 		}
@@ -539,7 +540,7 @@ func (r *Runner) destroy(ctx context.Context, requestID int64) error {
 		// idempotent branch. A terminate is idempotent, so re-issuing costs one
 		// call; forgetting the instance costs the capacity of a guest that may
 		// still be running.
-		r.log.Error("a teardown was accepted rather than confirmed and there is no lease "+
+		r.log.Error("a teardown was requested but not confirmed and there is no lease "+
 			"recorded here to hold the capacity with; keeping the instance so this is retried",
 			"name", inst.Name, "request", requestID)
 
@@ -552,14 +553,15 @@ func (r *Runner) destroy(ctx context.Context, requestID int64) error {
 	delete(r.runningLease, requestID)
 	r.mu.Unlock()
 
-	// THE BACKEND ACCEPTED THE REQUEST; IT DID NOT SAY THE GUEST HAD STOPPED (#46).
+	// THE BACKEND DID NOT CONFIRM THE GUEST HAD STOPPED (#46).
 	//
 	// The caller is a listener that releases the lease the moment this returns
 	// nil, and its own comment explains why it destroys first: freeing the
 	// capacity while a guest is still on the host over-commits the machine. That
 	// reasoning was written against a backend whose teardown is synchronous.
-	// EC2's is not — TerminateInstances returns on acceptance and the instance
-	// runs on through `shutting-down` for a minute or two.
+	// EC2's is not — TerminateInstances can return after accepting a request while
+	// the instance runs on through `shutting-down`, and an eventually consistent
+	// NotFound is not proof that it accepted anything.
 	//
 	// And Destroy is reached on paths where the guest is genuinely still working:
 	// a drain, a custody teardown, an operator killing a job. So the failure is
@@ -572,10 +574,11 @@ func (r *Runner) destroy(ctx context.Context, requestID int64) error {
 	// the listener is told to stand down — the same answer an ambiguous launch
 	// gives, for the same reason.
 	if state != provider.TeardownStopped {
-		r.holdWithOutcome(lease, inst.Name, requestID, alloc.PhaseDone)
+		r.holdWithOutcomeAndEvidence(lease, inst.Name, requestID, alloc.PhaseDone,
+			custodyEvidence{observed: r.provider.Kind().RunsOnHost()})
 
-		r.log.Info("the backend accepted the teardown but did not confirm the guest had stopped; "+
-			"holding the capacity until it is provably gone",
+		r.log.Info("teardown did not confirm the guest had stopped; holding the capacity "+
+			"until it is provably gone",
 			"name", inst.Name, "lease", lease.ID, "request", requestID)
 
 		return fmt.Errorf("%w: %s was asked to stop and has not been confirmed gone",
@@ -724,6 +727,13 @@ func (r *Runner) handleInterruption(ctx context.Context, notice *provider.Interr
 	return fmt.Errorf("%w: %s", errInterruptionNotOwned, notice.InstanceID)
 }
 
+// strayCleanup is the proof and provider evidence gathered while reconciling an
+// ambiguous launch.
+type strayCleanup struct {
+	confirmed bool
+	evidence  custodyEvidence
+}
+
 // destroyStray removes an instance a failed launch may have left behind.
 //
 // Best-effort by construction, and the errors are logged rather than returned:
@@ -731,7 +741,7 @@ func (r *Runner) handleInterruption(ctx context.Context, notice *provider.Interr
 // hide why the launch failed in the first place. What must not happen is
 // silence — an operator who has to find an orphan by hand needs to know it
 // might exist.
-func (r *Runner) destroyStray(ctx context.Context, name string) (bool, error) {
+func (r *Runner) destroyStray(ctx context.Context, name string) (strayCleanup, error) {
 	// A fresh context, because the usual reason a launch failed is that the
 	// caller's was cancelled — and asking a cancelled context to clean up
 	// guarantees the cleanup fails too.
@@ -740,15 +750,22 @@ func (r *Runner) destroyStray(ctx context.Context, name string) (bool, error) {
 
 	inst, found, err := r.provider.Find(ctx, name)
 	if err != nil {
-		return false, fmt.Errorf("could not tell whether a failed launch left %s behind: %w", name, err)
+		return strayCleanup{}, fmt.Errorf(
+			"could not tell whether a failed launch left %s behind: %w", name, err)
 	}
 
 	if !found {
 		// NOT CONFIRMED. Absence in one observation is not proof that nothing will
 		// appear: the create may be in flight inside the daemon. The caller keeps
 		// the capacity and looks again.
-		return false, fmt.Errorf("no instance named %s is visible yet, which does not "+
-			"prove the daemon is not still starting one", name)
+		return strayCleanup{
+				evidence: custodyEvidence{absentSince: r.now()},
+			}, fmt.Errorf("no instance named %s is visible yet, which does not prove the "+
+				"daemon is not still starting one", name)
+	}
+
+	if inst.Terminal {
+		return strayCleanup{confirmed: true, evidence: custodyEvidence{observed: true}}, nil
 	}
 
 	r.log.Warn("a failed launch had in fact started something; removing it",
@@ -756,21 +773,23 @@ func (r *Runner) destroyStray(ctx context.Context, name string) (bool, error) {
 
 	state, err := r.provider.Destroy(ctx, inst.ID)
 	if err != nil {
-		return false, fmt.Errorf("could not remove %s, which a failed launch had started: %w", name, err)
+		return strayCleanup{evidence: custodyEvidence{observed: true}},
+			fmt.Errorf("could not remove %s, which a failed launch had started: %w", name, err)
 	}
 
-	// THE BOOL ALREADY MEANT "CONFIRMED", which is what makes this fit without
-	// changing anything above it: the caller keeps the capacity in custody when
-	// this is false, and that is the correct treatment of a teardown the backend
-	// has only accepted (#46). It is also the right answer for #48 — this is the
+	// CONFIRMATION IS EXPLICIT, which is what makes this fit without changing the
+	// caller's decision: it keeps capacity in custody when this is false, and that
+	// is the correct treatment of an unconfirmed teardown (#46). It is also the
+	// right answer for #48 — this is the
 	// path most likely to be destroying an instance EC2 launched moments ago, so
 	// it is the one whose "already gone" is least trustworthy.
 	if state != provider.TeardownStopped {
-		return false, fmt.Errorf("%s was asked to stop but the backend did not confirm it had, "+
-			"so it may still be running", name)
+		return strayCleanup{evidence: custodyEvidence{observed: true}},
+			fmt.Errorf("%s was asked to stop but the backend did not confirm it had, "+
+				"so it may still be running", name)
 	}
 
-	return true, nil
+	return strayCleanup{confirmed: true, evidence: custodyEvidence{observed: true}}, nil
 }
 
 // Recover decides what to do with compute an earlier run left behind, once, at
@@ -861,7 +880,7 @@ func (r *Runner) Recover(ctx context.Context) error {
 				return fmt.Errorf("node: read the lease of surviving instance %s: %w", inst.Name, err)
 
 			default:
-				if err := r.takeCustody(ctx, lease, inst); err != nil {
+				if err := r.takeCustody(ctx, lease, inst, true); err != nil {
 					return err
 				}
 
@@ -878,13 +897,12 @@ func (r *Runner) Recover(ctx context.Context) error {
 		r.log.Warn("destroying an instance nothing is waiting for",
 			"name", inst.Name, "instance", inst.ID, "lease", leaseID, "running", inst.Running)
 
-		// NOT COUNTED AS A FAILURE IF THE BACKEND MERELY ACCEPTED IT. The
-		// difference matters here only for the message: this instance's lease is
-		// already terminal, so its capacity is back whatever happens next, and the
-		// host stays over-committed by its size until it actually goes. Reporting
-		// that as a failed destroy would make every startup on an EC2 host refuse
-		// to admit work for something that is on its way out; the sweep sees it
-		// again in seconds and finishes the job.
+		// AN UNCONFIRMED TEARDOWN IS NOT COUNTED AS A FAILURE. The difference matters
+		// here only for the message: this instance's lease is already terminal, so
+		// its capacity is back whatever happens next, and the host stays
+		// over-committed by its size until it actually goes. Reporting that as a
+		// failed destroy would make every startup on an EC2 host refuse to admit work
+		// while the outcome is uncertain; a later inventory reconciles it.
 		state, err := r.provider.Destroy(ctx, inst.ID)
 		if err != nil {
 			failed++
@@ -903,14 +921,14 @@ func (r *Runner) Recover(ctx context.Context) error {
 		// reports a `stopped` instance as NOT running on purpose — so an OPEN
 		// lease whose instance is stopped falls through to here, and this call is
 		// then the thing that actually hands its capacity back. Doing that on a
-		// teardown AWS has only accepted frees the machine before the instance is
+		// teardown AWS has not confirmed frees the machine before the instance is
 		// gone.
 		//
 		// WHAT RESOLVES IT IS NOT THE NEXT SWEEP, and an earlier version of this
 		// comment said it was. Sweep skips any instance whose lease is still open,
 		// which this one's is — that is what put it on this branch. Resolution waits
 		// for the lease to expire into quarantine and for the inventory a later
-		// registration reports, so a teardown AWS accepts and then does not perform
+		// registration reports, so a teardown AWS does not confirm
 		// holds this capacity longer than one sweep interval. #81 tracks that a
 		// held teardown is bounded by nothing.
 		//
@@ -949,7 +967,9 @@ func (r *Runner) Recover(ctx context.Context) error {
 // its first tend. The reaper would terminalize the lease it had just adopted,
 // hand the capacity back, and let a listener advertise it while the container
 // carried on running.
-func (r *Runner) takeCustody(ctx context.Context, lease *alloc.Lease, inst *provider.Instance) error {
+func (r *Runner) takeCustody(
+	ctx context.Context, lease *alloc.Lease, inst *provider.Instance, observed bool,
+) error {
 	// RECORDED FIRST, RENEWED SECOND, and the order is the whole correctness of
 	// custody across a network.
 	//
@@ -964,7 +984,7 @@ func (r *Runner) takeCustody(ctx context.Context, lease *alloc.Lease, inst *prov
 	// and keeps retrying renewal on its own clock. A fenced or missing lease is
 	// then discovered by Tend, which destroys the compute rather than leaving it
 	// running against capacity somebody else now holds.
-	r.adopt(lease, inst)
+	r.adoptWithObservation(lease, inst, observed)
 
 	if err := r.alloc.Heartbeat(ctx, lease.ID, lease.Epoch); err != nil {
 		if errors.Is(err, alloc.ErrForceRelease) {
@@ -1016,7 +1036,7 @@ func (r *Runner) AssumeCustody(ctx context.Context, lease *alloc.Lease, requestI
 		return nil
 	}
 
-	return r.takeCustody(ctx, lease, inst)
+	return r.takeCustody(ctx, lease, inst, r.provider.Kind().RunsOnHost())
 }
 
 // Sweep destroys instances whose lease is no longer open on this node.
@@ -1131,8 +1151,8 @@ func (r *Runner) Sweep(ctx context.Context) error {
 		// does nothing and skipping it costs nothing. The case it exists for is the
 		// other one: the lease went terminal between the two reads, so this call
 		// really would be the thing that hands the capacity back. Doing that on an
-		// accepted-but-unconfirmed teardown frees the machine for another tier
-		// while the guest is still shutting down.
+		// unconfirmed teardown frees the machine for another tier while the guest may
+		// still exist.
 		//
 		// The next sweep sees the instance again and finishes the job.
 		if state != provider.TeardownStopped {
@@ -1225,7 +1245,7 @@ func (r *Runner) adoptQuarantined(ctx context.Context, leaseID string, inst *pro
 		return fmt.Errorf("node: read quarantined lease %s: %w", leaseID, err)
 	}
 
-	return r.takeCustody(ctx, lease, inst)
+	return r.takeCustody(ctx, lease, inst, true)
 }
 
 // releaseOrphanedLease terminalizes a lease whose compute has just been

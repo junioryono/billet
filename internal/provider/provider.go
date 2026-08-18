@@ -211,8 +211,8 @@ type Spec struct {
 	JITConfig string
 }
 
-// Instance is a unit of compute the backend knows about. It may or may not
-// still be running — see Running.
+// Instance is a unit of compute the backend knows about. It may be running,
+// stopped, or retained as a terminal record.
 type Instance struct {
 	// ID is the backend's own handle — a container id, a microVM id, an EC2
 	// instance id. Opaque to everything above.
@@ -229,6 +229,12 @@ type Instance struct {
 	// cannot tell should report true: treating an unknown state as finished would
 	// destroy live work, and treating it as running only delays a cleanup.
 	Running bool
+
+	// Terminal reports that the backend positively observed this compute reach a
+	// state from which it cannot execute or return to running. It is stronger than
+	// !Running: a stopped instance is not executing but still exists and may retain
+	// disks. The zero value is deliberately not proof.
+	Terminal bool
 }
 
 // InterruptionNotice is an external warning that a provider will take compute
@@ -273,10 +279,9 @@ func LeaseOf(instanceName string) (string, bool) {
 //
 // THE DISTINCTION EXISTS BECAUSE ONE BACKEND CANNOT MAKE THE PROMISE THE OTHERS
 // CAN. `docker rm --force` returns when the container is gone, so its caller may
-// treat a successful Destroy as proof. EC2's TerminateInstances returns when the
-// request is ACCEPTED — the guest keeps running for a minute or two while the
-// instance moves through `shutting-down`, which billet's own runningState
-// classifies as a state where the job may still be executing.
+// treat a successful Destroy as proof. EC2 cannot: TerminateInstances returns
+// when the request is accepted, while an idempotent NotFound may be an eventually
+// consistent miss. Neither confirms the guest is gone.
 //
 // Callers used to read every Destroy the docker way, and the consequence was not
 // money (#46). Destroy is reached on paths where the guest is still working — a
@@ -294,9 +299,10 @@ func LeaseOf(instanceName string) (string, bool) {
 type Teardown int
 
 const (
-	// TeardownRequested means the backend accepted the request and the compute
-	// may still be running. The capacity stays charged until something else —
-	// a Find that misses, a List that no longer reports it — proves otherwise.
+	// TeardownRequested means the backend requested teardown and the compute may
+	// still be running. It is also the idempotent answer when the backend cannot
+	// currently see the target. Capacity stays charged until a sustained absence
+	// or another causal result proves the compute is gone.
 	TeardownRequested Teardown = iota
 	// TeardownStopped means the compute is CONFIRMED gone. Only a backend whose
 	// teardown is synchronous may return this.

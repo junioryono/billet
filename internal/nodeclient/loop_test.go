@@ -890,6 +890,53 @@ func TestCustodyIsAdvancedOnTheSweepCadence(t *testing.T) {
 	waitFor(t, func() bool { return compute.tended() > 0 })
 }
 
+// Custody cannot wait for the much slower orphan sweep.
+//
+// EC2 can finish terminating between two sweeps. Holding its lease until the
+// next five-minute inventory pass blocks the whole node after the compute is
+// already gone, while the ordinary command poll already supplies a bounded and
+// far cheaper cadence for checking only the entries custody knows about.
+func TestCustodyIsAdvancedOnThePollCadenceBeforeTheNextSweep(t *testing.T) {
+	t.Parallel()
+
+	_, c := harness(t)
+	compute := &fakeCompute{holding: true}
+	ctx, cancel := context.WithCancel(t.Context())
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
+		err := nodeclient.Run(ctx, c, compute, nodeclient.LoopOptions{
+			VCPU:       testNodeVCPU,
+			Memory:     testNodeMemory,
+			Provider:   config.ProviderDocker,
+			Deployment: deployment,
+			Log:        slog.New(slog.DiscardHandler),
+			Backoff:    20 * time.Millisecond,
+			SweepEvery: time.Hour,
+		})
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("the loop stopped for a reason other than shutdown: %v", err)
+		}
+	}()
+
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+	})
+
+	waitFor(t, func() bool { return compute.tended() > 0 })
+
+	compute.mu.Lock()
+	if compute.swept != 0 {
+		t.Errorf("ran %d whole-host sweeps; the hour-long sweep deadline did not elapse", compute.swept)
+	}
+	compute.holding = false
+	compute.mu.Unlock()
+}
+
 // A SUPERSEDED NODE DRAINS WHAT IT HOLDS BEFORE IT STOPS.
 //
 // The server keeps the heartbeat and result routes open for a superseded process
