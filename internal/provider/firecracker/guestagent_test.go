@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -188,23 +189,55 @@ func TestTheGuestAgentEstablishesTheRunnerAccountEnvironment(t *testing.T) {
 	body, _, _ := strings.Cut(after, end)
 	block := begin + body + ")\n"
 
-	if !strings.Contains(text, `env "${runner_env[@]}" "${cmd[@]}"`) {
-		t.Fatal("the runner environment is built but not passed through the privilege drop")
+	const launchBegin = "BILLET_AGENT_LAUNCH_BEGIN"
+	const launchEnd = "BILLET_AGENT_LAUNCH_END"
+	if strings.Count(text, launchBegin) != 1 || strings.Count(text, launchEnd) != 1 {
+		t.Fatal("the guest agent's real launch stanza is no longer uniquely extractable")
+	}
+	_, launchAfter, _ := strings.Cut(text, launchBegin)
+	launch, _, _ := strings.Cut(launchAfter, launchEnd)
+	_, launch, _ = strings.Cut(launch, "\n")
+
+	shadow := t.TempDir()
+	setprivLog := filepath.Join(shadow, "setpriv.log")
+	stub := `#!/bin/sh
+: > "$BILLET_TEST_SETPRIV_LOG"
+while [ "$#" -gt 0 ]; do
+	printf '%s\n' "$1" >> "$BILLET_TEST_SETPRIV_LOG"
+	if [ "$1" = -- ]; then
+		shift
+		exec "$@"
+	fi
+	shift
+done
+exit 97
+`
+	if err := os.WriteFile(filepath.Join(shadow, "setpriv"), []byte(stub), 0o755); err != nil {
+		t.Fatalf("write the validating setpriv stub: %v", err)
 	}
 
 	script := `
 set -euo pipefail
 ACTIONS_RUNNER_INPUT_JITCONFIG=fixture
 ` + block + `
-env -i "${runner_env[@]}" bash -c 'printf "%s\0" "${HOME-}" "${USER-}" "${LOGNAME-}" "${RUNNER_TOOL_CACHE-}" "${AGENT_TOOLSDIRECTORY-}"'
+cmd=(bash -c 'printf "%s\0" "${HOME-}" "${USER-}" "${LOGNAME-}" "${RUNNER_TOOL_CACHE-}" "${AGENT_TOOLSDIRECTORY-}" "$(id -u)" "$(id -g)"')
+` + launch + `
+exit "$job_status"
 `
 	run := exec.CommandContext(t.Context(), "bash", "-c", script)
+	run.Env = append(os.Environ(),
+		"BILLET_TEST_SETPRIV_LOG="+setprivLog,
+		"PATH="+shadow+":"+os.Getenv("PATH"),
+	)
 	out, err := run.Output()
 	if err != nil {
-		t.Fatalf("run the extracted runner environment: %v", err)
+		t.Fatalf("run the extracted privilege-drop launch: %v", err)
 	}
 	fields := bytes.Split(bytes.TrimSuffix(out, []byte{0}), []byte{0})
-	want := []string{"/home/runner", "runner", "runner", "/opt/hostedtoolcache", "/opt/hostedtoolcache"}
+	want := []string{
+		"/home/runner", "runner", "runner", "/opt/hostedtoolcache", "/opt/hostedtoolcache",
+		strconv.Itoa(os.Getuid()), strconv.Itoa(os.Getgid()),
+	}
 	if len(fields) != len(want) {
 		t.Fatalf("the runner environment has %d fields, want %d: %q", len(fields), len(want), out)
 	}
@@ -212,6 +245,32 @@ env -i "${runner_env[@]}" bash -c 'printf "%s\0" "${HOME-}" "${USER-}" "${LOGNAM
 		if string(value) != want[i] {
 			t.Errorf("runner environment field %d = %q, want %q", i, value, want[i])
 		}
+	}
+
+	setprivArgs, err := os.ReadFile(setprivLog)
+	if err != nil {
+		t.Fatalf("read the privilege-drop argv: %v", err)
+	}
+	wantSetpriv := "--reuid=runner\n--regid=runner\n--init-groups\n--inh-caps=-all\n--\n"
+	if string(setprivArgs) != wantSetpriv {
+		t.Errorf("setpriv arguments = %q, want %q", setprivArgs, wantSetpriv)
+	}
+}
+
+func TestTheManualGuestImagePublisherRunsTheContentsGate(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join("..", "..", "..", "scripts", "build-guest-image.sh")
+	source, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read guest image builder: %v", err)
+	}
+	text := string(source)
+
+	checkAt := strings.Index(text, `"$SCRIPT_DIR/check-guest-image.sh" "$img"`)
+	publishAt := strings.Index(text, `publish "$img"`)
+	if checkAt < 0 || publishAt < 0 || checkAt >= publishAt {
+		t.Fatal("the documented manual publisher can write a guest image before its contents gate")
 	}
 }
 
