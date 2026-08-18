@@ -166,6 +166,33 @@ func TestTheGuestMountsDockerStateBeforeStartingTheDaemon(t *testing.T) {
 	}
 }
 
+func TestTheGuestGrowsItsRootFilesystemBeforeStartingWork(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join("..", "..", "..", "scripts", "build-guest-image.sh")
+	source, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read guest image builder: %v", err)
+	}
+	text := string(source)
+
+	growAt := strings.Index(text, "/usr/sbin/resize2fs /dev/vda")
+	dockerAt := strings.Index(text, "systemctl start docker.service")
+	runnerAt := strings.Index(text, `env "${runner_env[@]}" "${cmd[@]}"`)
+	if growAt < 0 || dockerAt < 0 || runnerAt < 0 || growAt >= dockerAt || growAt >= runnerAt {
+		t.Fatalf("root growth is not guaranteed before Docker and the runner start")
+	}
+
+	gatePath := filepath.Join("..", "..", "..", "scripts", "check-guest-image.sh")
+	gate, err := os.ReadFile(gatePath)
+	if err != nil {
+		t.Fatalf("read guest image gate: %v", err)
+	}
+	if !strings.Contains(string(gate), `-x "$MNT/usr/sbin/resize2fs"`) {
+		t.Fatal("the image gate can publish a guest that cannot consume the promised capacity")
+	}
+}
+
 func TestTheGuestImageIncludesBuildxForThePersistentBuilder(t *testing.T) {
 	t.Parallel()
 

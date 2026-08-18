@@ -3,6 +3,7 @@ package firecracker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"strings"
@@ -258,10 +259,20 @@ func (d rbdDisk) ResolveGeneration(_ context.Context, image string) (string, err
 	return image, nil
 }
 
-func (d rbdDisk) CloneRoot(ctx context.Context, image, name string) (string, error) {
+func (d rbdDisk) CloneRoot(
+	ctx context.Context, image, name string, capacity config.ByteSize,
+) (string, error) {
 	if err := exec.CommandContext(ctx, "rbd", d.args("clone",
 		d.images+"/"+image, d.cache+"/"+name)...).Run(); err != nil {
 		return "", err
+	}
+
+	if capacity > 0 {
+		sizeMiB := (int64(capacity) + int64(config.MiB) - 1) / int64(config.MiB)
+		if err := exec.CommandContext(ctx, "rbd", d.args("resize", "--size",
+			fmt.Sprintf("%dM", sizeMiB), d.cache+"/"+name)...).Run(); err != nil {
+			return "", err
+		}
 	}
 
 	out, err := exec.CommandContext(ctx, "rbd", d.args("device", "map",

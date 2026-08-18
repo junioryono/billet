@@ -544,6 +544,8 @@ tiers:
   #   providers: [firecracker, ec2]   # instead of `provider: firecracker`
   #   vcpu: 8
   #   memory: 32GiB
+  #   # Real root capacity on Firecracker and EC2. Firecracker grows only the
+  #   # per-job clone; Docker uses the host filesystem and ignores this field.
   #   disk: 160GiB
   #   launch:
   #     firecracker:

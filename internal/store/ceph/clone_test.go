@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/junioryono/billet/internal/config"
 )
 
 // cloneFake answers the four commands a root disk needs, by subcommand rather than
@@ -17,12 +19,13 @@ type cloneFake struct {
 
 	device  string // what `rbd device map` prints
 	mapped  string // what `rbd device list` reports, as json
+	size    int64  // what `rbd info` reports, in bytes
 	failOn  string // a subcommand that fails
 	failErr error
 }
 
 func newCloneFake() *cloneFake {
-	return &cloneFake{device: "/dev/rbd0", mapped: "[]"}
+	return &cloneFake{device: "/dev/rbd0", mapped: "[]", size: 4 * int64(config.GiB)}
 }
 
 func (f *cloneFake) run(_ context.Context, _ string, args []string) ([]byte, error) {
@@ -49,6 +52,8 @@ func (f *cloneFake) run(_ context.Context, _ string, args []string) ([]byte, err
 		return []byte(f.device + "\n"), nil
 	case "device list":
 		return []byte(f.mapped), nil
+	case "info":
+		return fmt.Appendf(nil, `{"size":%d}`, f.size), nil
 	default:
 		return nil, nil
 	}
@@ -129,7 +134,8 @@ func TestARootDiskIsClonedFromTheImagePoolIntoTheCachePool(t *testing.T) {
 
 	f := newCloneFake()
 
-	device, err := cloneClient(t, f).CloneRoot(t.Context(), "ubuntu-2404-x64@g1", "billet-abc")
+	device, err := cloneClient(t, f).CloneRoot(t.Context(), "ubuntu-2404-x64@g1", "billet-abc",
+		20*config.GiB)
 	if err != nil {
 		t.Fatalf("CloneRoot: %v", err)
 	}
@@ -161,6 +167,93 @@ func TestARootDiskIsClonedFromTheImagePoolIntoTheCachePool(t *testing.T) {
 	}
 }
 
+// THE TIER'S DISK IS GUEST CAPACITY, not an accounting-only number. The immutable
+// generation stays at its published size; only the per-job clone is grown, before
+// it is mapped into the kernel and handed to Firecracker.
+func TestARootDiskCloneIsGrownToTheTierCapacityBeforeItIsMapped(t *testing.T) {
+	t.Parallel()
+
+	f := newCloneFake()
+	f.size = 4 * int64(config.GiB)
+
+	if _, err := cloneClient(t, f).CloneRoot(t.Context(), "img@g1", "billet-abc",
+		20*config.GiB); err != nil {
+		t.Fatalf("CloneRoot: %v", err)
+	}
+
+	resize := f.ran(t, "resize", "--size", "20480M", "billet-cache/billet-abc")
+	if got := resize[len(resize)-1]; got != "billet-cache/billet-abc" {
+		t.Errorf("resize targeted %q rather than the per-job clone", got)
+	}
+
+	var resizeAt, mapAt = -1, -1
+	for i, call := range f.calls {
+		switch subcommandOf(call) {
+		case "resize":
+			resizeAt = i
+		case "device map":
+			mapAt = i
+		}
+	}
+	if resizeAt < 0 || mapAt < 0 || resizeAt >= mapAt {
+		t.Fatalf("root sizing did not precede mapping: %v", f.calls)
+	}
+}
+
+// A GOLDEN IMAGE MAY OUTGROW AN OLD TIER. Shrinking its clone would truncate a
+// filesystem; the tier promise is a floor, so a larger image is left alone.
+func TestARootDiskCloneIsNeverShrunk(t *testing.T) {
+	t.Parallel()
+
+	f := newCloneFake()
+	f.size = 40 * int64(config.GiB)
+
+	if _, err := cloneClient(t, f).CloneRoot(t.Context(), "img@g1", "billet-abc",
+		20*config.GiB); err != nil {
+		t.Fatalf("CloneRoot: %v", err)
+	}
+
+	for _, call := range f.calls {
+		if subcommandOf(call) == "resize" {
+			t.Errorf("billet tried to shrink a larger golden-image clone: %v", call)
+		}
+	}
+}
+
+// A CLONE THAT CANNOT BE SIZED IS REMOVED before it ever reaches the kernel. It
+// otherwise holds pool space under a jail whose launch has already failed.
+func TestACloneThatCannotBeGrownIsRemoved(t *testing.T) {
+	t.Parallel()
+
+	f := newCloneFake()
+	f.failOn = "resize"
+
+	if _, err := cloneClient(t, f).CloneRoot(t.Context(), "img@g1", "billet-abc",
+		20*config.GiB); err == nil {
+		t.Fatal("CloneRoot reported success although sizing failed")
+	}
+
+	f.ran(t, "rm", "billet-cache/billet-abc")
+	for _, call := range f.calls {
+		if subcommandOf(call) == "device map" {
+			t.Errorf("billet mapped a clone whose promised capacity was not established: %v", call)
+		}
+	}
+}
+
+func TestARootDiskNeedsAPositiveCapacityBeforeItClones(t *testing.T) {
+	t.Parallel()
+
+	f := newCloneFake()
+
+	if _, err := cloneClient(t, f).CloneRoot(t.Context(), "img@g1", "billet-abc", 0); err == nil {
+		t.Fatal("CloneRoot accepted no root capacity")
+	}
+	if len(f.calls) != 0 {
+		t.Errorf("a refused capacity still changed the cluster: %v", f.calls)
+	}
+}
+
 // AN IMAGE REFERENCE WITHOUT A SNAPSHOT IS REFUSED, and told what it is missing.
 // Choosing a generation is the storage layer's job (#25), and inventing a rule here
 // would have to be unpicked when it arrives.
@@ -177,7 +270,8 @@ func TestAnImageWithNoSnapshotIsRefused(t *testing.T) {
 	} {
 		f := newCloneFake()
 
-		if _, err := cloneClient(t, f).CloneRoot(t.Context(), image, "billet-abc"); err == nil {
+		if _, err := cloneClient(t, f).CloneRoot(t.Context(), image, "billet-abc",
+			20*config.GiB); err == nil {
 			t.Errorf("CloneRoot accepted %q", image)
 		}
 
@@ -197,7 +291,8 @@ func TestAMissingGoldenImageIsDistinguishable(t *testing.T) {
 	f.failOn = "clone"
 	f.failErr = errors.New("exit status 2: rbd: clone error: (2) No such file or directory")
 
-	_, err := cloneClient(t, f).CloneRoot(t.Context(), "ubuntu-2404-x64@g1", "billet-abc")
+	_, err := cloneClient(t, f).CloneRoot(t.Context(), "ubuntu-2404-x64@g1", "billet-abc",
+		20*config.GiB)
 	if !errors.Is(err, ErrNoSuchImage) {
 		t.Errorf("a missing golden image is not distinguishable from a cluster failure: %v", err)
 	}
@@ -208,7 +303,8 @@ func TestAMissingGoldenImageIsDistinguishable(t *testing.T) {
 	other.failOn = "clone"
 	other.failErr = errors.New("exit status 1: rbd: clone error: (110) Connection timed out")
 
-	_, err = cloneClient(t, other).CloneRoot(t.Context(), "ubuntu-2404-x64@g1", "billet-abc")
+	_, err = cloneClient(t, other).CloneRoot(t.Context(), "ubuntu-2404-x64@g1", "billet-abc",
+		20*config.GiB)
 	if errors.Is(err, ErrNoSuchImage) {
 		t.Errorf("a timeout was reported as a missing image: %v", err)
 	}
@@ -223,7 +319,8 @@ func TestACloneThatCannotBeMappedIsRemoved(t *testing.T) {
 	f := newCloneFake()
 	f.failOn = "device map"
 
-	if _, err := cloneClient(t, f).CloneRoot(t.Context(), "ubuntu-2404-x64@g1", "billet-abc"); err == nil {
+	if _, err := cloneClient(t, f).CloneRoot(t.Context(), "ubuntu-2404-x64@g1", "billet-abc",
+		20*config.GiB); err == nil {
 		t.Fatal("CloneRoot reported success although the map failed")
 	}
 
@@ -239,7 +336,8 @@ func TestAMapThatDoesNotAnswerWithADeviceIsRefused(t *testing.T) {
 	f := newCloneFake()
 	f.device = "rbd: sysfs write failed"
 
-	_, err := cloneClient(t, f).CloneRoot(t.Context(), "ubuntu-2404-x64@g1", "billet-abc")
+	_, err := cloneClient(t, f).CloneRoot(t.Context(), "ubuntu-2404-x64@g1", "billet-abc",
+		20*config.GiB)
 	if err == nil {
 		t.Fatal("CloneRoot accepted an answer that is not a device path")
 	}
@@ -360,7 +458,8 @@ func TestACloneNameBilletCannotAddressIsRefused(t *testing.T) {
 	for _, name := range []string{"", "a/b", "a@b", "-weird", " padded "} {
 		f := newCloneFake()
 
-		if _, err := cloneClient(t, f).CloneRoot(t.Context(), "img@g1", name); err == nil {
+		if _, err := cloneClient(t, f).CloneRoot(t.Context(), "img@g1", name,
+			20*config.GiB); err == nil {
 			t.Errorf("CloneRoot accepted the name %q", name)
 		}
 
@@ -380,7 +479,7 @@ func TestEveryRootDiskCommandNamesTheConfiguredIdentity(t *testing.T) {
 
 	c := cloneClient(t, f)
 
-	if _, err := c.CloneRoot(t.Context(), "img@g1", "billet-abc"); err != nil {
+	if _, err := c.CloneRoot(t.Context(), "img@g1", "billet-abc", 20*config.GiB); err != nil {
 		t.Fatalf("CloneRoot: %v", err)
 	}
 
@@ -412,7 +511,7 @@ func TestTheRootDiskCommandsUsePositionalSpecs(t *testing.T) {
 
 	c := cloneClient(t, f)
 
-	if _, err := c.CloneRoot(t.Context(), "img@g1", "billet-abc"); err != nil {
+	if _, err := c.CloneRoot(t.Context(), "img@g1", "billet-abc", 20*config.GiB); err != nil {
 		t.Fatalf("CloneRoot: %v", err)
 	}
 
@@ -444,7 +543,8 @@ func TestOrdinaryGoldenImageReferencesAreAccepted(t *testing.T) {
 	} {
 		f := newCloneFake()
 
-		if _, err := cloneClient(t, f).CloneRoot(t.Context(), image, "billet-abc"); err != nil {
+		if _, err := cloneClient(t, f).CloneRoot(t.Context(), image, "billet-abc",
+			20*config.GiB); err != nil {
 			t.Errorf("CloneRoot refused %q: %v", image, err)
 		}
 	}
@@ -457,7 +557,8 @@ func TestARefusedImageReferenceIsRenderedBounded(t *testing.T) {
 
 	f := newCloneFake()
 
-	_, err := cloneClient(t, f).CloneRoot(t.Context(), strings.Repeat("x", 5000), "billet-abc")
+	_, err := cloneClient(t, f).CloneRoot(t.Context(), strings.Repeat("x", 5000), "billet-abc",
+		20*config.GiB)
 	if err == nil {
 		t.Fatal("CloneRoot accepted a 5000-character image reference")
 	}

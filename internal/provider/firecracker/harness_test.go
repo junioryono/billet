@@ -202,6 +202,7 @@ type fakeDisk struct {
 	resolvedAfter string
 	discarded     []string
 	cloned        []string
+	cloneSizes    []config.ByteSize
 	discardErr    error
 	// onClone runs inside CloneRoot, so a test can observe what the host looked
 	// like at the moment the disk was cloned rather than afterwards.
@@ -226,7 +227,9 @@ func (d *fakeDisk) ResolveGeneration(_ context.Context, image string) (string, e
 	return image, nil
 }
 
-func (d *fakeDisk) CloneRoot(_ context.Context, image, name string) (string, error) {
+func (d *fakeDisk) CloneRoot(
+	_ context.Context, image, name string, capacity config.ByteSize,
+) (string, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
@@ -251,6 +254,7 @@ func (d *fakeDisk) CloneRoot(_ context.Context, image, name string) (string, err
 	}
 
 	d.cloned = append(d.cloned, image+" -> "+name)
+	d.cloneSizes = append(d.cloneSizes, capacity)
 
 	return d.device, nil
 }
@@ -534,6 +538,7 @@ func aSpec() provider.Spec {
 		Image:     "ubuntu-2404-x64@g1",
 		VCPU:      2,
 		Memory:    2 * config.GiB,
+		Disk:      20 * config.GiB,
 		Command:   []string{"./run.sh"},
 		Trust:     provider.TrustTrusted,
 		JITConfig: theCredential,

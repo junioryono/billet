@@ -292,6 +292,13 @@ else
 	fail "no billet agent; microVMs would boot and never register"
 fi
 
+if [ -x "$MNT/usr/sbin/resize2fs" ]; then
+	pass "the guest can grow its root filesystem to the tier capacity"
+else
+	fail "no resize2fs; the root block device can be grown while the guest filesystem
+        stays at the golden image's build size and fills during a job"
+fi
+
 # --- service ordering -----------------------------------------------------
 
 # ENABLED IS A SYMLINK ON DISK, which is exactly why this can be checked without

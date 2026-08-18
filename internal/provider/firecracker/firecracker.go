@@ -70,9 +70,9 @@ type RootDisk interface {
 	// this job actually boot" has to be answerable from that line afterwards. A
 	// reference that already names a generation comes back unchanged.
 	ResolveGeneration(ctx context.Context, image string) (string, error)
-	// CloneRoot makes a per-job copy-on-write clone of a golden image and maps it,
-	// returning the host device path.
-	CloneRoot(ctx context.Context, image, name string) (string, error)
+	// CloneRoot makes a per-job copy-on-write clone of a golden image, grows it to
+	// at least capacity and maps it, returning the host device path.
+	CloneRoot(ctx context.Context, image, name string, capacity config.ByteSize) (string, error)
 	// DiscardRoot unmaps and removes a clone. It must be idempotent: teardown runs
 	// on paths that have already failed once.
 	DiscardRoot(ctx context.Context, name string) error
@@ -585,6 +585,10 @@ func checkSpec(spec provider.Spec) error {
 
 	if spec.Memory <= 0 {
 		return fmt.Errorf("firecracker: %s asks for %s of memory", spec.Name, spec.Memory)
+	}
+
+	if spec.Disk <= 0 {
+		return fmt.Errorf("firecracker: %s asks for %s of root disk", spec.Name, spec.Disk)
 	}
 
 	if len(spec.Volumes) > provider.MaxVolumes {
@@ -1680,7 +1684,7 @@ func (p *Provider) cloneResolved(
 	spec *provider.Spec,
 ) (string, error) {
 	for attempt := 1; ; attempt++ {
-		device, err := p.disk.CloneRoot(ctx, spec.Image, spec.Name)
+		device, err := p.disk.CloneRoot(ctx, spec.Image, spec.Name, spec.Disk)
 		if err == nil {
 			return device, nil
 		}

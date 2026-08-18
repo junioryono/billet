@@ -2313,7 +2313,7 @@ func (noRootDisk) ResolveGeneration(_ context.Context, image string) (string, er
 	return image, nil
 }
 
-func (noRootDisk) CloneRoot(context.Context, string, string) (string, error) {
+func (noRootDisk) CloneRoot(context.Context, string, string, config.ByteSize) (string, error) {
 	return "", errors.New("billet: the preflight does not clone a root disk")
 }
 

@@ -364,6 +364,7 @@ func TestASpecThatCannotRunAJobIsRefused(t *testing.T) {
 			}, "the service holds"},
 		{"no vcpu", func(s *provider.Spec) { s.VCPU = 0 }, "vCPU"},
 		{"no memory", func(s *provider.Spec) { s.Memory = 0 }, "of memory"},
+		{"no root disk", func(s *provider.Spec) { s.Disk = 0 }, "of root disk"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -395,6 +396,20 @@ func TestASpecThatCannotRunAJobIsRefused(t *testing.T) {
 				t.Errorf("a refused spec cloned a root disk and then discarded it: %v", got)
 			}
 		})
+	}
+}
+
+func TestLaunchMakesTheTierDiskCapacityPartOfTheRootClone(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.launch(t)
+
+	h.disk.mu.Lock()
+	defer h.disk.mu.Unlock()
+
+	if len(h.disk.cloneSizes) != 1 || h.disk.cloneSizes[0] != 20*config.GiB {
+		t.Errorf("root clone capacities = %v, want one 20GiB clone", h.disk.cloneSizes)
 	}
 }
 

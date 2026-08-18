@@ -8,6 +8,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/junioryono/billet/internal/config"
 )
 
 // ErrNoSuchImage is returned when a golden image or its snapshot is not there.
@@ -76,7 +78,9 @@ func (c *Client) ResolveGeneration(ctx context.Context, image string) (string, e
 	return name + "@" + newest.Name, nil
 }
 
-func (c *Client) CloneRoot(ctx context.Context, image, name string) (string, error) {
+func (c *Client) CloneRoot(
+	ctx context.Context, image, name string, capacity config.ByteSize,
+) (string, error) {
 	if !snapshotSpec.MatchString(image) {
 		return "", fmt.Errorf("ceph: %s is not a golden image reference: billet clones a "+
 			"named SNAPSHOT, written image@snapshot (for example ubuntu-2404-x64@g1), because "+
@@ -86,6 +90,11 @@ func (c *Client) CloneRoot(ctx context.Context, image, name string) (string, err
 
 	if err := checkCloneName(name); err != nil {
 		return "", err
+	}
+
+	if capacity <= 0 {
+		return "", fmt.Errorf("ceph: root disk %s needs a positive capacity, got %s",
+			bounded(name), capacity)
 	}
 
 	src := c.cfg.ImagePool + "/" + image
@@ -98,6 +107,15 @@ func (c *Client) CloneRoot(ctx context.Context, image, name string) (string, err
 		}
 
 		return "", fmt.Errorf("ceph: clone %s to %s as client.%s: %w", src, dst, c.cfg.User, err)
+	}
+
+	if err := c.growRoot(ctx, dst, capacity); err != nil {
+		if rmErr := c.removeClone(ctx, name); rmErr != nil {
+			return "", fmt.Errorf("%w (and the clone it made could not be removed, so %s is "+
+				"holding pool space: %w)", err, dst, rmErr)
+		}
+
+		return "", err
 	}
 
 	device, err := c.mapRoot(ctx, name)
@@ -114,6 +132,42 @@ func (c *Client) CloneRoot(ctx context.Context, image, name string) (string, err
 	}
 
 	return device, nil
+}
+
+// growRoot makes a per-job root image at least as large as the tier promised.
+//
+// GROWN, NEVER SHRUNK. A golden image may be larger than an older tier's request,
+// and truncating its clone would cut a live filesystem off at an arbitrary block.
+// The cooperative guest runs resize2fs online before starting the runner, which
+// turns this block-device capacity into filesystem capacity without modifying the
+// immutable generation every job shares.
+func (c *Client) growRoot(ctx context.Context, spec string, capacity config.ByteSize) error {
+	out, err := c.rbdCmd(ctx, true, "info", spec)
+	if err != nil {
+		return fmt.Errorf("ceph: inspect the root disk clone %s before sizing it: %w", spec, err)
+	}
+
+	var info struct {
+		Size int64 `json:"size"`
+	}
+	if err := json.Unmarshal(out, &info); err != nil || info.Size <= 0 {
+		return fmt.Errorf("ceph: %s did not describe %s as json with a positive size; is it "+
+			"the rbd command?", c.bin, spec)
+	}
+
+	wantMiB := (int64(capacity) + bytesPerMB - 1) / bytesPerMB
+	haveMiB := info.Size / bytesPerMB
+	if haveMiB >= wantMiB {
+		return nil
+	}
+
+	if _, err := c.rbdCmd(ctx, false, "resize", "--size", fmt.Sprintf("%dM", wantMiB),
+		spec); err != nil {
+		return fmt.Errorf("ceph: root disk clone %s holds %dM and the tier promises %dM, and "+
+			"it could not be grown: %w", spec, haveMiB, wantMiB, err)
+	}
+
+	return nil
 }
 
 // mapRoot maps a cache-pool image and returns the device the kernel gave it.
