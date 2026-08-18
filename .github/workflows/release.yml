@@ -63,3 +63,12 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Release immutability is a repository setting rather than workflow YAML.
+      # Failing here makes that external precondition part of every release gate:
+      # GitHub must have locked the tag and assets and issued their attestation.
+      - name: Verify immutable release attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: gh release verify "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}"

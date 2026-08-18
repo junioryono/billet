@@ -24,6 +24,8 @@ Cut with the **Cut Release** workflow (Actions → Run workflow). Blank version 
 
 `cut-release.yml` creates the tag and CALLS `release.yml` rather than relying on the tag push to trigger it. Before tagging, it rewrites both the internal composite-action refs and `ansible_collections/junioryono/billet/galaxy.yml` to the exact release version; a collection installed from a Git tag still reports the version in that file. A ref pushed with `GITHUB_TOKEN` does not start another workflow — GitHub's recursion guard — which is why a release button usually needs a PAT or an App. A `workflow_call` is not an event, so billet needs no repository secrets.
 
+GitHub release immutability is enabled on the repository and is part of the release contract, not an optional hardening step. It locks the published tag and assets and creates GitHub's release attestation. `release.yml` ends with `gh release verify`, so disabling that repository setting makes the release job fail instead of silently publishing mutable root-installation inputs. The setting applies only to releases created after it was enabled; do not describe an older release as immutable merely because the repository is protected now.
+
 ## Updating a running host
 
 Install or upgrade from the package attached to the latest release. The package replaces the binary and units but deliberately does not enable or start either service.
