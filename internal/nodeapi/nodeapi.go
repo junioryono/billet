@@ -223,6 +223,9 @@ type Command struct {
 	// RequestID is what a destroy names. Destroy is by request rather than by
 	// lease because it must work for compute whose lease is already gone.
 	RequestID int64 `json:"request_id,omitempty"`
+	// JobResult is GitHub's authoritative conclusion for a completion-triggered
+	// destroy. It is empty for shutdown, sweep and other teardown paths.
+	JobResult string `json:"job_result,omitempty"`
 }
 
 // RequestIDOf is the request a command concerns, wherever it is carried.

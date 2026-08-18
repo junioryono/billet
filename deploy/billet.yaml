@@ -88,4 +88,4 @@ tiers:
     memory: 8GiB
     disk: 40GiB
     image: ghcr.io/actions/actions-runner:latest
-    command: ["./run.sh"]
+    command: ["./billet-runner-service"]

@@ -232,7 +232,7 @@ func TestTheEntryPointCarriesTheRegistrationAcrossTheUserChange(t *testing.T) {
 			"successfully and then fail jobs on anything that writes to $HOME")
 	}
 
-	if !strings.Contains(entry, "/opt/actions-runner/run.sh") {
+	if !strings.Contains(entry, "/opt/actions-runner/billet-runner-service") {
 		t.Error("the entry point does not run the runner")
 	}
 

@@ -7,3 +7,8 @@ import _ "embed"
 //
 //go:embed docker-cache.sh
 var DockerCacheScript string
+
+// RunnerServiceScript retains the stock update loop without hiding one-job results.
+//
+//go:embed runner-service.sh
+var RunnerServiceScript string

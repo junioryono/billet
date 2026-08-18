@@ -29,6 +29,7 @@ const (
 	cacheWorkLimit     = cacheHandlerLimit - cacheCleanupMargin
 	cacheWriterTTL     = 15 * time.Minute
 	cacheVolumeLimit   = int64(100 << 30)
+	dockerSettleWait   = 2 * time.Minute
 	dockerStoreKey     = "docker-images/"
 	publicationCAS     = "cas"
 	publicationLWW     = "last-write-wins"
@@ -61,6 +62,8 @@ type cacheSession struct {
 type cacheAttachment struct {
 	Volume      storecontract.Volume `json:"volume"`
 	Publication string               `json:"publication,omitempty"`
+	Docker      bool                 `json:"docker,omitempty"`
+	Ready       bool                 `json:"ready,omitempty"`
 }
 
 // NewCacheService constructs a node-local cache endpoint.
@@ -331,6 +334,8 @@ func (s *CacheService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/docker-store":
 		s.attachDockerStore(w, r, session)
+	case r.Method == http.MethodPost && r.URL.Path == "/v1/docker-store/ready":
+		s.markDockerStoreReady(w, r, session)
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/volumes":
 		s.attach(w, r, session)
 	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/volumes/") &&
@@ -396,7 +401,9 @@ func (s *CacheService) attachDockerStore(
 		return
 	}
 
-	session.slots[0] = &cacheAttachment{Volume: volume, Publication: publicationLWW}
+	session.slots[0] = &cacheAttachment{
+		Volume: volume, Publication: publicationLWW, Docker: true,
+	}
 	if err := s.persistSession(session); err != nil {
 		discardErr := s.store.Discard(ctx, volume)
 		var retryErr error
@@ -422,7 +429,7 @@ func (s *CacheService) attachDockerStore(
 				clearErr = s.persistSession(session)
 				if clearErr != nil {
 					session.slots[0] = &cacheAttachment{
-						Volume: volume, Publication: publicationLWW,
+						Volume: volume, Publication: publicationLWW, Docker: true,
 					}
 				}
 			}
@@ -442,6 +449,122 @@ func (s *CacheService) attachDockerStore(
 	writeCacheJSON(w, http.StatusCreated, map[string]any{
 		"slot": 0, "device": guestDevice, "generation": volume.Generation, "cold": cold,
 	})
+}
+
+func (s *CacheService) markDockerStoreReady(
+	w http.ResponseWriter,
+	r *http.Request,
+	session *cacheSession,
+) {
+	var request struct {
+		Filesystem storecontract.Filesystem `json:"filesystem"`
+	}
+	if err := decodeCacheRequest(r.Body, &request); err != nil || request.Filesystem.Valid() != nil {
+		http.Error(w, "invalid Docker image-store readiness proof", http.StatusBadRequest)
+
+		return
+	}
+	if err := lockCacheSession(r.Context(), session); err != nil {
+		http.Error(w, "cache unavailable", http.StatusServiceUnavailable)
+
+		return
+	}
+	defer session.mu.Unlock()
+	attachment := session.slots[0]
+	if session.closed || attachment == nil || !attachment.Docker {
+		http.Error(w, "Docker image store is not attached", http.StatusNotFound)
+
+		return
+	}
+	attachment.Volume.Filesystem = request.Filesystem
+	attachment.Ready = true
+	if err := s.persistSession(session); err != nil {
+		http.Error(w, "cache unavailable", http.StatusServiceUnavailable)
+
+		return
+	}
+	writeCacheJSON(w, http.StatusOK, map[string]any{"ready": true})
+}
+
+// SettleDocker publishes a prepared store only when GitHub reported success.
+func (s *CacheService) SettleDocker(ctx context.Context, instance string, succeeded bool) error {
+	s.mu.Lock()
+	token, ok := s.byInstance[instance]
+	if !ok {
+		s.mu.Unlock()
+
+		return nil
+	}
+	session := s.byToken[token]
+	s.mu.Unlock()
+
+	if !succeeded || session.trust != provider.TrustTrusted {
+		return nil
+	}
+
+	deadline := time.NewTimer(dockerSettleWait)
+	defer deadline.Stop()
+
+	for {
+		if err := lockCacheSession(ctx, session); err != nil {
+			return err
+		}
+		attachment := session.slots[0]
+		if attachment == nil || !attachment.Docker {
+			session.mu.Unlock()
+
+			return nil
+		}
+		if attachment.Ready {
+			err := s.publishDocker(ctx, session, attachment)
+			session.mu.Unlock()
+
+			return err
+		}
+		session.mu.Unlock()
+
+		timer := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+
+			return ctx.Err()
+		case <-deadline.C:
+			timer.Stop()
+
+			return errors.New("docker image store did not become ready before teardown")
+		case <-timer.C:
+		}
+	}
+}
+
+// publishDocker consumes a ready attachment while its session is locked.
+func (s *CacheService) publishDocker(
+	ctx context.Context,
+	session *cacheSession,
+	attachment *cacheAttachment,
+) error {
+	if err := s.attacher.DetachVolume(ctx, session.instance, 0, attachment.Volume.Device); err != nil {
+		return fmt.Errorf("detach Docker image store: %w", err)
+	}
+
+	lease, fence, err := s.acquireWriter(ctx, attachment, session.instance)
+	if err != nil {
+		return fmt.Errorf("acquire Docker image-store writer: %w", err)
+	}
+	candidate, err := s.store.Snapshot(ctx, attachment.Volume)
+	if err != nil {
+		return fmt.Errorf("snapshot Docker image store: %w", err)
+	}
+	session.slots[0] = nil
+	if err := s.persistSession(session); err != nil {
+		return fmt.Errorf("record consumed Docker image store: %w", err)
+	}
+	if err := s.publish(ctx, attachment, candidate, lease, fence); err != nil {
+		return fmt.Errorf("publish Docker image store: %w", err)
+	}
+
+	return nil
 }
 
 func validCacheArchitecture(architecture string) bool {
@@ -494,7 +617,8 @@ func (s *CacheService) attach(w http.ResponseWriter, r *http.Request, session *c
 
 	if strings.TrimSpace(request.Key) == "" || strings.TrimSpace(request.Key) != request.Key ||
 		len(request.Key) > cacheKeyLimit ||
-		request.SizeBytes <= 0 || request.SizeBytes > cacheVolumeLimit {
+		strings.HasPrefix(request.Key, dockerStoreKey) || request.SizeBytes <= 0 ||
+		request.SizeBytes > cacheVolumeLimit {
 		http.Error(w, "cache key or size is outside the allowed range", http.StatusBadRequest)
 
 		return
@@ -631,6 +755,11 @@ func (s *CacheService) commit(w http.ResponseWriter, r *http.Request, session *c
 	attachment := session.slots[slot]
 	if attachment == nil {
 		http.Error(w, "cache slot is not attached", http.StatusNotFound)
+
+		return
+	}
+	if attachment.Docker {
+		http.Error(w, "Docker image stores settle from GitHub's completed-job result", http.StatusForbidden)
 
 		return
 	}

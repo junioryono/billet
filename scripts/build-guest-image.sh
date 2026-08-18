@@ -473,6 +473,8 @@ EOF
 
 	mkdir -p "$rootfs/home/runner/runner"
 	tar -xzf "$WORK/$tarball" -C "$rootfs/home/runner/runner"
+	install -m 0755 "$SCRIPT_DIR/../internal/guestassets/runner-service.sh" \
+		"$rootfs/home/runner/runner/billet-runner-service"
 	chroot "$rootfs" chown -R runner:runner /home/runner
 
 	install_toolcache "$rootfs"

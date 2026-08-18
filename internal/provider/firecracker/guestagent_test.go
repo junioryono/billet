@@ -144,8 +144,13 @@ func TestTheGuestMountsDockerStateBeforeStartingTheDaemon(t *testing.T) {
 	helper := string(asset)
 
 	mountAt := strings.Index(helper, "mount -t ext4 -o noatime \"$device\" /var/lib/docker")
-	startAt := strings.LastIndex(helper, "systemctl start docker.service")
-	if mountAt < 0 || startAt < 0 || mountAt >= startAt {
+	activateAt := strings.Index(helper, `activate_store "$slot" "$device"`)
+	activateBody := strings.Index(helper, "activate_store()")
+	startAt := -1
+	if activateBody >= 0 {
+		startAt = strings.Index(helper[activateBody:], "systemctl start docker.service")
+	}
+	if mountAt < 0 || activateAt < 0 || activateBody < 0 || startAt < 0 || mountAt >= activateAt {
 		t.Fatal("Docker cache mount/start order is not encoded in the shared guest helper")
 	}
 	if strings.Contains(build, "After=network-online.target docker.service") ||
@@ -157,8 +162,8 @@ func TestTheGuestMountsDockerStateBeforeStartingTheDaemon(t *testing.T) {
 	}
 	if !strings.Contains(build, "ACTIONS_RUNNER_RETURN_JOB_RESULT_FOR_HOSTED=true") ||
 		!strings.Contains(helper, `[ "$status" = 100 ]`) ||
-		!strings.Contains(helper, `operation=commit`) {
-		t.Fatal("Docker publication is not gated on the runner's authoritative success code")
+		!strings.Contains(helper, `operation=ready`) {
+		t.Fatal("Docker readiness is not gated on the runner's one-job success code")
 	}
 	prepareAt := strings.Index(build, "/usr/local/bin/billet-docker-cache prepare")
 	runnerAt := strings.Index(build, "BILLET_AGENT_LAUNCH_BEGIN")

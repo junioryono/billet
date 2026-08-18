@@ -240,6 +240,7 @@ func translate(msg *gh.RunnerScaleSetMessage) *server.Message {
 			RequestID: j.RunnerRequestID,
 			RunID:     j.WorkflowRunID,
 			Event:     j.EventName,
+			Result:    j.Result,
 		})
 	}
 

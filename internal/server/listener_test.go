@@ -558,6 +558,7 @@ func TestCompletionReleasesTheLease(t *testing.T) {
 	defer cancel()
 
 	var stage atomic.Int32
+	var completedResult atomic.Value
 
 	session := &fakeSession{}
 	session.onGet = func() (*Message, error) {
@@ -565,7 +566,9 @@ func TestCompletionReleasesTheLease(t *testing.T) {
 		case 1:
 			return &Message{MessageID: 1, Assigned: []Job{{RequestID: 11, RunID: 101}}}, nil
 		case 2:
-			return &Message{MessageID: 2, Completed: []Job{{RequestID: 11, RunID: 101}}}, nil
+			return &Message{MessageID: 2, Completed: []Job{{
+				RequestID: 11, RunID: 101, Result: "succeeded",
+			}}}, nil
 		default:
 			return nil, ErrNoMessage
 		}
@@ -578,7 +581,11 @@ func TestCompletionReleasesTheLease(t *testing.T) {
 	// final assertion of 0 held whether or not completion released anything at all.
 	// Deleting the release outright left it green.
 	l := NewListener(a, tiers[0].Label, session,
-		WithRunner(&fakeRunner{}), WithDrainGrace(notDrainingHere))
+		WithRunner(&fakeRunner{onDestroyCompleted: func(_ int64, result string) error {
+			completedResult.Store(result)
+
+			return nil
+		}}), WithDrainGrace(notDrainingHere))
 
 	var (
 		running atomic.Int32
@@ -614,6 +621,10 @@ func TestCompletionReleasesTheLease(t *testing.T) {
 
 	if got := running.Load(); got != 0 {
 		t.Errorf("%d leases still running after the job completed, want 0", got)
+	}
+	got, ok := completedResult.Load().(string)
+	if !ok || got != "succeeded" {
+		t.Errorf("completion result delivered to runner = %q, want succeeded", got)
 	}
 
 	// AND THE LEDGER AGREES, which is the assertion that matches this test's name.
@@ -1822,8 +1833,9 @@ func TestCapacityIsReturnedWhenTheComputeWillNotStart(t *testing.T) {
 // fakeRunner stands in for a host. Both hooks default to succeeding, so a test
 // only says what it cares about.
 type fakeRunner struct {
-	onLaunch  func(requestID int64) error
-	onDestroy func(requestID int64) error
+	onLaunch           func(requestID int64) error
+	onDestroy          func(requestID int64) error
+	onDestroyCompleted func(requestID int64, result string) error
 }
 
 func (f *fakeRunner) Launch(_ context.Context, _ *alloc.Lease, job Job) error {
@@ -1840,6 +1852,14 @@ func (f *fakeRunner) Destroy(_ context.Context, requestID int64) error {
 	}
 
 	return nil
+}
+
+func (f *fakeRunner) DestroyCompleted(_ context.Context, requestID int64, result string) error {
+	if f.onDestroyCompleted != nil {
+		return f.onDestroyCompleted(requestID, result)
+	}
+
+	return f.Destroy(context.Background(), requestID)
 }
 
 // fakeSession stands in for a scale-set message session. It never returns work,

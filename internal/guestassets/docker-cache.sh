@@ -38,6 +38,77 @@ start_cold() {
 	return 0
 }
 
+clear_state() {
+	rm -f "$state_dir/slot" "$state_dir/device" "$state_dir/images-before" \
+		"$state_dir/images-before.unsorted" "$state_dir/images-after" \
+		"$state_dir/images-after.unsorted"
+	rmdir "$state_dir" 2>/dev/null || true
+}
+
+prepare_filesystem() {
+	device=$1
+	type=""
+	type=$(blkid -o value -s TYPE "$device" 2>/dev/null)
+	status=$?
+	if [ "$status" -eq 0 ]; then
+		if [ "$type" = ext4 ]; then
+			return 0
+		fi
+		log "the Docker image store contains ${type:-an unknown signature} rather than ext4"
+
+		return 1
+	fi
+	if [ "$status" -ne 2 ]; then
+		log "the Docker image-store signature could not be read; refusing to format the device"
+
+		return 1
+	fi
+	if ! mkfs.ext4 -q -F "$device"; then
+		log "the Docker image store could not be formatted"
+
+		return 1
+	fi
+
+	return 0
+}
+
+record_inventory() {
+	if docker image ls --no-trunc --digests \
+		--format '{{.Repository}} {{.Tag}} {{.Digest}} {{.ID}}' \
+		>"$state_dir/images-before.unsorted" 2>/dev/null; then
+		sort "$state_dir/images-before.unsorted" >"$state_dir/images-before"
+		rm -f "$state_dir/images-before.unsorted"
+	else
+		rm -f "$state_dir/images-before" "$state_dir/images-before.unsorted"
+		log "the initial Docker image inventory failed; this job's clone will not publish"
+	fi
+}
+
+activate_store() {
+	slot=$1
+	device=$2
+	mkdir -p "$state_dir"
+	printf '%s\n' "$slot" >"$state_dir/slot"
+	printf '%s\n' "$device" >"$state_dir/device"
+	if systemctl start docker.service; then
+		record_inventory
+
+		return 0
+	fi
+
+	log "Docker did not start on its image store"
+	if umount /var/lib/docker; then
+		discard_attached "$slot"
+		clear_state
+
+		start_cold
+		return $?
+	fi
+
+	log "the image store is still mounted; retaining custody and retrying Docker without publication"
+	start_cold
+}
+
 prepare() {
 	umask 077
 	if [ -z "${BILLET_CACHE_ENDPOINT:-}" ] || [ -z "${BILLET_CACHE_TOKEN:-}" ]; then
@@ -99,17 +170,7 @@ prepare() {
 		return $?
 	fi
 
-	type=$(blkid -o value -s TYPE "$device" 2>/dev/null || true)
-	if [ -z "$type" ]; then
-		if ! mkfs.ext4 -q -F "$device"; then
-			log "the Docker image store could not be formatted; pulling cold"
-			discard_attached "$slot"
-			start_cold
-
-			return $?
-		fi
-	elif [ "$type" != ext4 ]; then
-		log "the Docker image store contains $type rather than ext4; pulling cold"
+	if ! prepare_filesystem "$device"; then
 		discard_attached "$slot"
 		start_cold
 
@@ -124,29 +185,7 @@ prepare() {
 
 		return $?
 	fi
-	if ! systemctl start docker.service; then
-		log "Docker did not start on its image store; discarding the clone"
-		umount /var/lib/docker >/dev/null 2>&1 || true
-		discard_attached "$slot"
-		start_cold
-
-		return $?
-	fi
-
-	mkdir -p "$state_dir"
-	printf '%s\n' "$slot" >"$state_dir/slot"
-	printf '%s\n' "$device" >"$state_dir/device"
-	if docker image ls --no-trunc --digests \
-		--format '{{.Repository}} {{.Digest}} {{.ID}}' \
-		>"$state_dir/images-before.unsorted" 2>/dev/null; then
-		sort "$state_dir/images-before.unsorted" >"$state_dir/images-before"
-		rm -f "$state_dir/images-before.unsorted"
-	else
-		rm -f "$state_dir/images-before" "$state_dir/images-before.unsorted"
-		log "the initial Docker image inventory failed; this job's clone will not publish"
-	fi
-
-	return 0
+	activate_store "$slot" "$device"
 }
 
 complete() {
@@ -157,7 +196,7 @@ complete() {
 
 	after_ok=0
 	if docker image ls --no-trunc --digests \
-		--format '{{.Repository}} {{.Digest}} {{.ID}}' \
+		--format '{{.Repository}} {{.Tag}} {{.Digest}} {{.ID}}' \
 		>"$state_dir/images-after.unsorted" 2>/dev/null; then
 		sort "$state_dir/images-after.unsorted" >"$state_dir/images-after"
 		rm -f "$state_dir/images-after.unsorted"
@@ -180,10 +219,10 @@ complete() {
 	operation=discard
 	if [ "$status" = 100 ] && [ "$after_ok" -eq 1 ] && [ -r "$state_dir/images-before" ] &&
 		! cmp -s "$state_dir/images-before" "$state_dir/images-after"; then
-		operation=commit
+		operation=ready
 	fi
 
-	if [ "$operation" = commit ]; then
+	if [ "$operation" = ready ]; then
 		type=$(blkid -o value -s TYPE "$device" 2>/dev/null || true)
 		uuid=$(blkid -o value -s UUID "$device" 2>/dev/null || true)
 		clean=false
@@ -192,19 +231,17 @@ complete() {
 		fi
 		if body=$(jq -nc --arg type "$type" --arg uuid "$uuid" --argjson clean "$clean" \
 			'{filesystem:{type:$type,uuid:$uuid,clean:$clean}}') &&
-			response=$(cache_call "/v1/volumes/$slot/commit" "$body" 780) &&
-			printf '%s' "$response" | jq -e '.published == true' >/dev/null 2>&1; then
-			log "published the changed Docker image store"
+			response=$(cache_call "/v1/docker-store/ready" "$body" 780) &&
+			printf '%s' "$response" | jq -e '.ready == true' >/dev/null 2>&1; then
+			log "prepared the changed Docker image store for host-side publication"
 		else
-			log "the Docker image store could not be published; the job result is unchanged"
+			log "the Docker image store could not be prepared; the job result is unchanged"
+			discard_attached "$slot"
 		fi
 	else
 		discard_attached "$slot"
 	fi
-	rm -f "$state_dir/slot" "$state_dir/device" "$state_dir/images-before" \
-		"$state_dir/images-before.unsorted" "$state_dir/images-after" \
-		"$state_dir/images-after.unsorted"
-	rmdir "$state_dir" 2>/dev/null || true
+	clear_state
 
 	return 0
 }
@@ -219,6 +256,8 @@ service_status() {
 
 case "${1:-}" in
 prepare) prepare ;;
+prepare-filesystem) prepare_filesystem "${2:-}" ;;
+activate-store) activate_store "${2:-}" "${3:-}" ;;
 complete) complete "${2:-}" ;;
 service-status) service_status "${2:-}" ;;
 *)

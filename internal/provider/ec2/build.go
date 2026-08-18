@@ -511,6 +511,13 @@ func provisionScript(spec BuildSpec) (string, error) {
 	b.WriteString("curl -fsSL -o runner.tar.gz " + strconv.Quote(release) + "\n")
 	b.WriteString("tar xzf runner.tar.gz\n")
 	b.WriteString("rm runner.tar.gz\n")
+	b.WriteString("cat > /opt/actions-runner/billet-runner-service <<'BILLETRUNNEREOF'\n")
+	b.WriteString(guestassets.RunnerServiceScript)
+	if !strings.HasSuffix(guestassets.RunnerServiceScript, "\n") {
+		b.WriteString("\n")
+	}
+	b.WriteString("BILLETRUNNEREOF\n")
+	b.WriteString("chmod 0755 /opt/actions-runner/billet-runner-service\n")
 	b.WriteString("chown -R runner:runner /opt/actions-runner\n")
 
 	// THE SUPPORTED RUNNER HOOK, rather than an edit to run.sh. GitHub invokes it
@@ -574,7 +581,7 @@ func provisionScript(spec BuildSpec) (string, error) {
 	b.WriteString("  ACTIONS_RUNNER_HOOK_JOB_STARTED=" + jobTimingHookPath + " \\\n")
 	b.WriteString("  ACTIONS_RUNNER_RETURN_JOB_RESULT_FOR_HOSTED=true \\\n")
 	b.WriteString("  " + jitEnvVar + "=\"$" + jitEnvVar + "\" \\\n")
-	b.WriteString("  /opt/actions-runner/run.sh\n")
+	b.WriteString("  /opt/actions-runner/billet-runner-service\n")
 	b.WriteString("job_status=$?\n")
 	b.WriteString("set -e\n")
 	b.WriteString("/usr/local/bin/billet-docker-cache complete \"$job_status\"\n")

@@ -72,7 +72,7 @@ func TestTranslateReadsTheRequestIDNotTheRunID(t *testing.T) {
 			}},
 		},
 		JobCompletedMessages: []*gh.JobCompleted{
-			{JobMessageBase: gh.JobMessageBase{
+			{Result: "succeeded", JobMessageBase: gh.JobMessageBase{
 				RunnerRequestID: 333,
 				WorkflowRunID:   444,
 			}},
@@ -99,6 +99,9 @@ func TestTranslateReadsTheRequestIDNotTheRunID(t *testing.T) {
 
 	if got.Completed[0].RequestID != 333 {
 		t.Errorf("completed RequestID = %d, want 333", got.Completed[0].RequestID)
+	}
+	if got.Completed[0].Result != "succeeded" {
+		t.Errorf("completed Result = %q, want succeeded", got.Completed[0].Result)
 	}
 }
 

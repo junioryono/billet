@@ -52,6 +52,13 @@ type Runner interface {
 	Destroy(ctx context.Context, requestID int64) error
 }
 
+// CompletionAwareRunner receives GitHub's authoritative completed-job result.
+// It is optional so runners that have no result-dependent teardown keep the
+// smaller Runner contract.
+type CompletionAwareRunner interface {
+	DestroyCompleted(ctx context.Context, requestID int64, result string) error
+}
+
 // Sweeper is a Runner that can also find compute nothing is asking about.
 //
 // Optional, and asserted for rather than required: Launch and Destroy are
@@ -142,6 +149,9 @@ type Message struct {
 type Job struct {
 	RequestID int64
 	RunID     int64
+	// Result is GitHub's conclusion on a completed-job message. It is empty on
+	// available and assigned messages.
+	Result string
 	// The GitHub event that queued this job — "push", "pull_request", "schedule".
 	// The ONLY thing in a scale-set message that says how far the workload can be
 	// trusted, which decides which backends may run it.
@@ -2565,7 +2575,7 @@ func (l *Listener) complete(ctx context.Context, job Job) {
 	// forever if that node never comes back.
 	before := l.leaseFor(job.RequestID)
 
-	if err := l.runner.Destroy(ctx, job.RequestID); err != nil {
+	if err := l.destroyCompleted(ctx, job); err != nil {
 		// THE RUNNER IS HOLDING IT, SO THIS LISTENER LETS GO (#46).
 		//
 		// A backend whose teardown is asynchronous cannot answer this call with
@@ -2784,6 +2794,14 @@ func (l *Listener) complete(ctx context.Context, job Job) {
 	delete(l.running, job.RequestID)
 	delete(l.acquiring, job.RequestID)
 	delete(l.cleanup, job.RequestID)
+}
+
+func (l *Listener) destroyCompleted(ctx context.Context, job Job) error {
+	if runner, ok := l.runner.(CompletionAwareRunner); ok {
+		return runner.DestroyCompleted(ctx, job.RequestID, job.Result)
+	}
+
+	return l.runner.Destroy(ctx, job.RequestID)
 }
 
 // releaseAll hands back capacity that was escrowed and never used.

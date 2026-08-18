@@ -452,6 +452,26 @@ func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
 	return r.destroy(ctx, requestID)
 }
 
+// DestroyCompleted settles result-dependent cache state before removing compute.
+func (r *Runner) DestroyCompleted(ctx context.Context, requestID int64, result string) error {
+	r.lifecycle.Lock()
+	defer r.lifecycle.Unlock()
+
+	if r.cache != nil {
+		r.mu.Lock()
+		inst := r.running[requestID]
+		r.mu.Unlock()
+		if inst != nil {
+			if err := r.cache.SettleDocker(ctx, inst.Name, result == "succeeded"); err != nil {
+				r.log.Warn("Docker image store was not published; compute teardown will discard it",
+					"request", requestID, "instance", inst.Name, "result", result, "error", err)
+			}
+		}
+	}
+
+	return r.destroy(ctx, requestID)
+}
+
 func (r *Runner) destroy(ctx context.Context, requestID int64) error {
 	// BOTH ARE ATTEMPTED, whatever either of them does. A request can have compute in
 	// the running map AND a custody entry — a redelivered assignment after a crash

@@ -10,6 +10,9 @@ import (
 
 func TestDockerCachePublishesOnlyAnAuthoritativeCleanSuccess(t *testing.T) {
 	t.Parallel()
+	if !strings.Contains(DockerCacheScript, "{{.Repository}} {{.Tag}} {{.Digest}} {{.ID}}") {
+		t.Fatal("the Docker inventory cannot detect a tag-only change")
+	}
 
 	for _, tc := range []struct {
 		name      string
@@ -17,15 +20,15 @@ func TestDockerCachePublishesOnlyAnAuthoritativeCleanSuccess(t *testing.T) {
 		before    string
 		after     string
 		afterExit string
-		operation string
+		endpoint  string
 	}{
-		{name: "changed success", status: "100", before: "old", after: "new", afterExit: "0", operation: "commit"},
-		{name: "unchanged success", status: "100", before: "same", after: "same", afterExit: "0", operation: "discard"},
-		{name: "inventory failure", status: "100", before: "old", after: "new", afterExit: "1", operation: "discard"},
-		{name: "success with issues", status: "101", before: "old", after: "new", afterExit: "0", operation: "discard"},
-		{name: "failed", status: "102", before: "old", after: "new", afterExit: "0", operation: "discard"},
-		{name: "cancelled", status: "103", before: "old", after: "new", afterExit: "0", operation: "discard"},
-		{name: "unknown runner exit", status: "7", before: "old", after: "new", afterExit: "0", operation: "discard"},
+		{name: "changed success", status: "100", before: "old", after: "new", afterExit: "0", endpoint: "/v1/docker-store/ready"},
+		{name: "unchanged success", status: "100", before: "same", after: "same", afterExit: "0", endpoint: "/v1/volumes/0/discard"},
+		{name: "inventory failure", status: "100", before: "old", after: "new", afterExit: "1", endpoint: "/v1/volumes/0/discard"},
+		{name: "success with issues", status: "101", before: "old", after: "new", afterExit: "0", endpoint: "/v1/volumes/0/discard"},
+		{name: "failed", status: "102", before: "old", after: "new", afterExit: "0", endpoint: "/v1/volumes/0/discard"},
+		{name: "cancelled", status: "103", before: "old", after: "new", afterExit: "0", endpoint: "/v1/volumes/0/discard"},
+		{name: "unknown runner exit", status: "7", before: "old", after: "new", afterExit: "0", endpoint: "/v1/volumes/0/discard"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -57,7 +60,7 @@ esac
 `)
 			writeStub(t, shadow, "curl", `
 printf '%s\n' "$*" >> "$BILLET_TEST_CURL_LOG"
-printf '{"published":true}\n'
+printf '{"ready":true}\n'
 `)
 
 			script := filepath.Join(shadow, "docker-cache.sh")
@@ -82,9 +85,9 @@ printf '{"published":true}\n'
 			if err != nil {
 				t.Fatalf("read cache request: %v", err)
 			}
-			if !strings.Contains(string(called), "/v1/volumes/0/"+tc.operation) {
+			if !strings.Contains(string(called), tc.endpoint) {
 				t.Errorf("status %s with inventories %q/%q called:\n%s\nwant %s",
-					tc.status, tc.before, tc.after, called, tc.operation)
+					tc.status, tc.before, tc.after, called, tc.endpoint)
 			}
 		})
 	}
@@ -110,6 +113,72 @@ func TestDockerCachePreservesTheRunnerServiceExitContract(t *testing.T) {
 		if got := strings.TrimSpace(string(output)); got != want {
 			t.Errorf("service-status %q = %q, want %q", status, got, want)
 		}
+	}
+}
+
+func TestDockerCacheDoesNotFormatAfterABlkidError(t *testing.T) {
+	t.Parallel()
+
+	shadow := t.TempDir()
+	mkfsLog := filepath.Join(shadow, "mkfs.log")
+	writeStub(t, shadow, "blkid", "exit 1\n")
+	writeStub(t, shadow, "mkfs.ext4", "printf called > \"$BILLET_TEST_MKFS_LOG\"\n")
+	script := filepath.Join(shadow, "docker-cache.sh")
+	if err := os.WriteFile(script, []byte(DockerCacheScript), 0o755); err != nil {
+		t.Fatalf("write Docker cache script: %v", err)
+	}
+	run := exec.CommandContext(t.Context(), script, "prepare-filesystem", "/dev/test-cache")
+	run.Env = append(os.Environ(),
+		"PATH="+shadow+":"+os.Getenv("PATH"),
+		"BILLET_TEST_MKFS_LOG="+mkfsLog,
+	)
+	output, err := run.CombinedOutput()
+	if err == nil {
+		t.Fatal("a blkid I/O error was accepted as a blank cache volume")
+	}
+	if !strings.Contains(string(output), "signature could not be read") {
+		t.Fatalf("blkid failure returned the wrong reason:\n%s", output)
+	}
+	if _, err := os.Stat(mkfsLog); !os.IsNotExist(err) {
+		t.Fatalf("mkfs was called after blkid failed: %v", err)
+	}
+}
+
+func TestDockerCacheRetainsCustodyWhenAStartedStoreCannotUnmount(t *testing.T) {
+	t.Parallel()
+
+	shadow := t.TempDir()
+	state := filepath.Join(shadow, "state")
+	calls := filepath.Join(shadow, "systemctl.log")
+	writeStub(t, shadow, "systemctl", `
+printf '%s\n' "$*" >> "$BILLET_TEST_SYSTEMCTL_LOG"
+test "$(wc -l < "$BILLET_TEST_SYSTEMCTL_LOG")" -ge 2
+`)
+	writeStub(t, shadow, "umount", "exit 1\n")
+	writeStub(t, shadow, "curl", "printf called > \"$BILLET_TEST_CURL_LOG\"\n")
+	script := filepath.Join(shadow, "docker-cache.sh")
+	if err := os.WriteFile(script, []byte(DockerCacheScript), 0o755); err != nil {
+		t.Fatalf("write Docker cache script: %v", err)
+	}
+	curlLog := filepath.Join(shadow, "curl.log")
+	run := exec.CommandContext(t.Context(), script, "activate-store", "0", "/dev/test-cache")
+	run.Env = append(os.Environ(),
+		"PATH="+shadow+":"+os.Getenv("PATH"),
+		"BILLET_CACHE_ENDPOINT=http://cache.test",
+		"BILLET_CACHE_TOKEN=test-token",
+		"BILLET_DOCKER_CACHE_STATE_DIR="+state,
+		"BILLET_TEST_CURL_LOG="+curlLog,
+		"BILLET_TEST_SYSTEMCTL_LOG="+calls,
+	)
+	output, err := run.CombinedOutput()
+	if err != nil {
+		t.Fatalf("a retryable Docker start failure prevented the job from continuing: %v\n%s", err, output)
+	}
+	if _, err := os.Stat(curlLog); !os.IsNotExist(err) {
+		t.Fatalf("the still-mounted store was detached through the cache API: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(state, "slot")); err != nil {
+		t.Fatalf("durable cache custody was not retained for completion: %v", err)
 	}
 }
 

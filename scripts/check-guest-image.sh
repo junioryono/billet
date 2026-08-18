@@ -79,6 +79,13 @@ else
 	fail "no runner at /home/runner/runner/run.sh; every job would fail to start"
 fi
 
+if [ -x "$RUNNER_DIR/billet-runner-service" ] &&
+	grep -Fq '100 | 101 | 102 | 103 | 104 | 105' "$RUNNER_DIR/billet-runner-service"; then
+	pass "the runner service preserves authoritative one-job results"
+else
+	fail "the runner service wrapper is absent or masks the one-job result codes"
+fi
+
 AGENT="$MNT/usr/local/bin/billet-agent"
 
 # SYSTEMD DOES NOT CREATE A LOGIN ENVIRONMENT. The agent runs as root and drops
@@ -106,11 +113,11 @@ fi
 DOCKER_CACHE="$MNT/usr/local/bin/billet-docker-cache"
 if [ -x "$DOCKER_CACHE" ] && grep -Fq '[ "$status" = 100 ]' "$DOCKER_CACHE" &&
 	grep -Fq '/v1/docker-store' "$DOCKER_CACHE" &&
-	grep -Fq '/v1/volumes/$slot/commit' "$DOCKER_CACHE"; then
-	pass "the Docker image store is mounted and gated on a clean runner result"
+	grep -Fq '/v1/docker-store/ready' "$DOCKER_CACHE"; then
+	pass "the Docker image store is mounted and prepares only a clean runner result"
 else
-	fail "the Docker cache helper is absent or can publish without the pinned runner's
-        authoritative clean-success result"
+	fail "the Docker cache helper is absent or can prepare a failed runner result for
+	        host-side publication"
 fi
 
 # READ FROM WHAT THE BUILD RECORDED, not from the runner tarball. The tarball

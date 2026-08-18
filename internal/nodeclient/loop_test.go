@@ -41,6 +41,7 @@ type fakeCompute struct {
 
 	launched  []int64
 	destroyed []int64
+	results   []string
 	recovered int
 	swept     int
 
@@ -213,6 +214,14 @@ func (f *fakeCompute) Destroy(ctx context.Context, requestID int64) error {
 	f.order = append(f.order, "destroy")
 
 	return f.destroyErr
+}
+
+func (f *fakeCompute) DestroyCompleted(ctx context.Context, requestID int64, result string) error {
+	f.mu.Lock()
+	f.results = append(f.results, result)
+	f.mu.Unlock()
+
+	return f.Destroy(ctx, requestID)
 }
 
 func (f *fakeCompute) Recover(context.Context) error {
@@ -393,6 +402,23 @@ func TestADestroyReachesTheCompute(t *testing.T) {
 
 	if len(destroyed) != 1 || destroyed[0] != 42 {
 		t.Fatalf("the destroy did not reach the compute: %v", destroyed)
+	}
+}
+
+func TestACompletedDestroyCarriesGitHubsResultToTheCompute(t *testing.T) {
+	t.Parallel()
+
+	compute := &fakeCompute{}
+	result := nodeclient.ExecuteForTest(t.Context(), compute, nodeapi.Command{
+		ID: "destroy", Kind: nodeapi.CommandDestroy, RequestID: 42, JobResult: "succeeded",
+	})
+	if !result.OK {
+		t.Fatalf("completed destroy = %+v", result)
+	}
+	compute.mu.Lock()
+	defer compute.mu.Unlock()
+	if len(compute.results) != 1 || compute.results[0] != "succeeded" {
+		t.Fatalf("completed destroy results = %v, want [succeeded]", compute.results)
 	}
 }
 

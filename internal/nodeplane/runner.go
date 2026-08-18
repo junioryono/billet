@@ -106,6 +106,15 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job server.Job)
 // The result is the FIRST failure, if any: a destroy that only partly succeeded
 // has left compute running somewhere and must not report success.
 func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
+	return r.destroy(ctx, requestID, "")
+}
+
+// DestroyCompleted sends GitHub's authoritative result with a completion-triggered destroy.
+func (r *Runner) DestroyCompleted(ctx context.Context, requestID int64, result string) error {
+	return r.destroy(ctx, requestID, result)
+}
+
+func (r *Runner) destroy(ctx context.Context, requestID int64, result string) error {
 	// WHO HOLDS THIS? The node name is not enough: a superseded process and its
 	// replacement share it, and only one of them has the container.
 	owner, known := r.plane.OwnerOfRequest(requestID)
@@ -166,7 +175,7 @@ func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
 		go func() {
 			defer wg.Done()
 
-			incarnation, err := r.destroyOn(ctx, n, requestID)
+			incarnation, err := r.destroyOn(ctx, n, requestID, result)
 
 			mu.Lock()
 			defer mu.Unlock()
@@ -370,14 +379,21 @@ func heldByADrainingProcess(node string, requestID int64) error {
 }
 
 // destroyOn asks one node to remove a request's compute.
-func (r *Runner) destroyOn(ctx context.Context, n *node, requestID int64) (string, error) {
+func (r *Runner) destroyOn(
+	ctx context.Context,
+	n *node,
+	requestID int64,
+	result string,
+) (string, error) {
 	id, err := commandID()
 	if err != nil {
 		return "", err
 	}
 
 	pend := &pending{
-		cmd:  nodeapi.Command{ID: id, Kind: nodeapi.CommandDestroy, RequestID: requestID},
+		cmd: nodeapi.Command{
+			ID: id, Kind: nodeapi.CommandDestroy, RequestID: requestID, JobResult: result,
+		},
 		done: make(chan nodeapi.CommandResult, 1),
 	}
 

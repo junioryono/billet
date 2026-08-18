@@ -34,7 +34,7 @@ func TestMultiProviderTierSelectsEachBackendsLaunch(t *testing.T) {
 	if got := tier.ImageFor(ProviderEC2); got != "ami-0123456789abcdef0" {
 		t.Errorf("ec2 image = %q", got)
 	}
-	if got := tier.RunnerCommandFor(ProviderFirecracker); len(got) != 1 || got[0] != "./run.sh" {
+	if got := tier.RunnerCommandFor(ProviderFirecracker); len(got) != 1 || got[0] != "./billet-runner-service" {
 		t.Errorf("firecracker command = %q, want the stock runner command", got)
 	}
 	if got := tier.RunnerCommandFor(ProviderEC2); len(got) != 1 ||

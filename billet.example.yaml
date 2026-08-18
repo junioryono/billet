@@ -354,9 +354,11 @@ node:
   # cannot quietly appear on another host interface.
   #
   # The guest requests its architecture-scoped Docker image store through this
-  # API before starting the runner. It publishes changed state only after the
-  # pinned runner reports a clean success; every other result is discarded. Its
-  # published generation expires after eight inactive days.
+  # API before starting the runner. The guest prepares changed state only after
+  # the pinned runner reports a clean success, and the node publishes it only
+  # after GitHub's completed-job message independently reports `succeeded`;
+  # every other result is discarded. Published generations expire after eight
+  # inactive days.
   cache:
     listen: 172.20.0.1:7718
     guest_endpoint: http://172.20.0.1:7718
