@@ -23,7 +23,7 @@ The accepted workflow proved all of the conditions from issue #59 in one real Gi
 
 ## Cold-start measurements
 
-The three launch-to-job-start samples were 47.609 seconds, 52.188 seconds and approximately 55 seconds. The first two runs also recorded 37.936 and 42.194 seconds from launch to runner readiness, followed by 9.673 and 9.993 seconds from runner readiness to the first job step.
+The three launch-to-job-start samples were 47.609 seconds, 52.188 seconds and 58.662 seconds. They recorded 37.936, 42.194 and 43.220 seconds from launch to runner readiness, followed by 9.673, 9.993 and 15.442 seconds from runner readiness to the first job step.
 
 Those numbers put the current cold path under one minute. Billet's EC2 role is fallback capacity rather than the default place every job runs, so saving roughly forty seconds does not justify a standing pool of live, billable compute with no lease, unresolved trust reuse and a new teardown state. `warm_pool` therefore remains refused unless a materially different workload produces evidence that changes that trade.
 
