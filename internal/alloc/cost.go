@@ -39,6 +39,10 @@ func (a *Allocator) EC2CostNodes(ctx context.Context) ([]config.EC2CostNode, err
 			if err != nil {
 				return fmt.Errorf("alloc: read registered EC2 shapes for cost reporting: %w", err)
 			}
+			if len(node.InstanceTypes) == 0 {
+				return fmt.Errorf("alloc: a registered EC2 node has no shape catalogue; " +
+					"restart it with the current billet version so it re-registers its prices")
+			}
 			for i := range node.InstanceTypes {
 				if node.InstanceTypes[i].PriceUSDPerHour <= 0 {
 					return fmt.Errorf("alloc: a registered EC2 node has no price for shape %q; "+

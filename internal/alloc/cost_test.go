@@ -1,6 +1,7 @@
 package alloc
 
 import (
+	"database/sql"
 	"testing"
 
 	"github.com/junioryono/billet/internal/config"
@@ -55,6 +56,23 @@ func TestEC2CostNodesRefusesARegistrationWithoutPrices(t *testing.T) {
 
 	if _, err := a.EC2CostNodes(t.Context()); err == nil {
 		t.Fatal("EC2CostNodes accepted a registration without prices")
+	}
+}
+
+func TestEC2CostNodesRefusesALegacyEmptyCatalogue(t *testing.T) {
+	a := newBareAllocator(t, Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB}, nil)
+	if err := a.db.Tx(t.Context(), func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(t.Context(),
+			`INSERT INTO nodes (name, provider, site, total_vcpu, total_memory, last_seen_at, live)
+			 VALUES ('old-cloud', 'ec2', '', 8, ?, '2026-08-18T00:00:00Z', 0)`,
+			int64(16*config.GiB))
+		return err
+	}); err != nil {
+		t.Fatalf("insert legacy EC2 node: %v", err)
+	}
+
+	if _, err := a.EC2CostNodes(t.Context()); err == nil {
+		t.Fatal("EC2CostNodes accepted a legacy registration with no shape catalogue")
 	}
 }
 
