@@ -3367,6 +3367,17 @@ func (l *Listener) releaseAll(ctx context.Context, destroyed map[int64]bool) {
 	// And the parked ones, with the outcome they were parked with: a launch that
 	// never started did not finish, whatever the ordinary path records.
 	for id, entry := range parked {
+		// A RELEASE-ONLY ENTRY ALREADY HAS ABSENCE PROOF. Every other parked
+		// entry still needs destroyAll to confirm teardown or hand custody to the
+		// runner. In particular, a completion restored before its holder registers
+		// must keep its authoritative result and lease unchanged across shutdown.
+		if !entry.releaseOnly && !destroyed[id] {
+			l.log.Error("not releasing cleanup capacity because its compute was not confirmed absent; the durable completion remains pending for the next process",
+				"tier", l.tier, "request", id, "lease", entry.lease.ID)
+
+			continue
+		}
+
 		outcome := entry.outcome
 		if outcome == "" {
 			outcome = alloc.PhaseDone

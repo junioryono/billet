@@ -2892,6 +2892,49 @@ func TestShutdownRetainsACompletionUntilItsCapacityReleaseSettles(t *testing.T) 
 	}
 }
 
+func TestShutdownPreservesARestoredCompletionUntilItsHolderReturns(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, tiers)
+	db := openState(t)
+	seed := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(&fakeRunner{}))
+	lease := holdRunning(t, seed, a, tiers[0].Label, 76)
+	completion := state.PendingCompletion{
+		Tier: tiers[0].Label, RequestID: 76, RunID: 86, Result: "Succeeded",
+		LeaseID: lease.ID, LeaseEpoch: lease.Epoch, LeaseNode: "holder",
+		Outcome: string(alloc.PhaseDone), MessageID: 26,
+	}
+	if _, err := db.PutPendingCompletion(t.Context(), completion); err != nil {
+		t.Fatalf("PutPendingCompletion: %v", err)
+	}
+
+	runner := &boundFakeRunner{err: ErrHolderUnavailable}
+	restarted := NewListener(a, tiers[0].Label, &fakeSession{}, WithCompletionStore(db),
+		WithRunner(runner))
+	if err := restarted.restoreCompletions(t.Context()); err != nil {
+		t.Fatalf("restoreCompletions: %v", err)
+	}
+	destroyed := restarted.destroyAll(t.Context())
+	if destroyed[completion.RequestID] {
+		t.Fatal("an unavailable persisted holder was treated as completed teardown")
+	}
+	restarted.releaseAll(t.Context(), destroyed)
+
+	usage, err := a.Usage(t.Context())
+	if err != nil {
+		t.Fatalf("Usage after shutdown: %v", err)
+	}
+	if usage.Leases != 1 {
+		t.Fatalf("shutdown released capacity under unavailable compute, leaving %d leases", usage.Leases)
+	}
+	pending, err := db.PendingCompletions(t.Context(), completion.Tier)
+	if err != nil {
+		t.Fatalf("PendingCompletions after shutdown: %v", err)
+	}
+	if len(pending) != 1 || pending[0].Retired || pending[0].ReleaseOnly {
+		t.Fatalf("shutdown changed the undelivered authoritative completion: %+v", pending)
+	}
+}
+
 func TestShutdownDoesNotReleaseUntilReleaseOnlyTransitionIsDurable(t *testing.T) {
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
 	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, tiers)
