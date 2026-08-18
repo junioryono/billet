@@ -1281,41 +1281,12 @@ func shellCommand(argv []string) (string, error) {
 // have already failed once, and erroring there turns recoverable state into stuck
 // state.
 //
-// IT RETURNS WHEN THE REQUEST IS ACCEPTED, NOT WHEN THE MACHINE IS GONE, and that
-// is a real difference from the container backend where `docker rm --force`
-// finishes the job. An instance sits in `shutting-down` for a minute or two
-// afterwards, and the listener treats a successful Destroy as its proof that the
-// compute is gone before it releases the lease.
-//
-// SO THE CONTRACT IS NOT MET HERE, AND THE GAP IS AN EXECUTION OVERLAP RATHER
-// THAN A ROUNDING ERROR (#46).
-//
-// An earlier version of this comment argued the purpose was still served, because
-// terminate is irreversible and the next launch is a different machine, so the
-// only thing briefly exceeded was the BILL. That argument is wrong, and this file
-// contradicts it further down: runningState documents `shutting-down`
-// as a state where "the job may still be executing", which is exactly why List
-// asks for it. A terminate request proves EVENTUAL termination. It does not prove
-// the guest has stopped, and an instance takes a minute or two to get there.
-//
-// The consequence is not money. Destroy is reached on paths where the guest IS
-// still working — a drain, a custody teardown, an operator killing a job — and
-// the listener releases the lease on success, so another job can start while the
-// old guest is still finishing a deploy, a migration, or an artifact upload. Two
-// concurrent effects on something outside billet, which is worse than the
-// over-commit the rule was written to prevent.
-//
-// WAITING HERE IS NOT THE FIX EITHER: a node executes one command at a time, so
-// blocking teardown for the minute or two AWS takes would stall every launch
-// queued behind it. The fix is to keep the capacity charged in a terminating
-// state while something confirms quiescence out of band — which is what custody
-// already does for compute billet cannot account for, and is a change to shared
-// node machinery rather than to this backend. #46 carries it.
-//
-// Until then the instance does at least stay in this host's inventory, because
-// `shutting-down` is one of the states List asks for. That does not un-release
-// the lease, which is already terminal; it means the sweep sees the instance,
-// calls Destroy again, and finds it idempotent.
+// IT RETURNS WHEN THE REQUEST IS ACCEPTED, NOT WHEN THE MACHINE IS GONE. The
+// caller transfers the lease to custody, which keeps capacity charged and checks
+// the instance out of band while this serial command queue remains available.
+// `shutting-down` stays in List because the guest may still be executing there.
+// An absence is trusted only after the instance has appeared in inventory or the
+// eventually-consistent stray grace has elapsed.
 func (p *Provider) Destroy(ctx context.Context, id string) (provider.Teardown, error) {
 	if id == "" {
 		return provider.TeardownRequested, errors.New("ec2: destroy needs an instance id")
@@ -1358,16 +1329,13 @@ func (p *Provider) Destroy(ctx context.Context, id string) (provider.Teardown, e
 
 	// "REQUESTED", because that is what happened. Logging "terminated" here is the
 	// same conflation this function's comment exists to correct — the machine is
-	// still running for a minute or two afterwards. The return says OBSERVED as
-	// well: unlike the NotFound path above, AWS found this exact instance while
-	// accepting its teardown, so a later absence cannot be a create that has not
-	// materialised yet.
+	// still running for a minute or two afterwards.
 	p.log.Info("requested instance termination", "instance", id)
 
 	// AND THE RETURN NOW SAYS SO TOO. The log line has been honest about this
 	// since the backend landed while the return value was not, and a caller reads
 	// the return.
-	return provider.TeardownObserved, nil
+	return provider.TeardownRequested, nil
 }
 
 // Find reports the instance with that name, and whether there was one.

@@ -274,9 +274,9 @@ func TestLiveSmoke(t *testing.T) {
 		t.Fatalf("Destroy: %v", err)
 	}
 
-	if state == provider.TeardownStopped {
-		t.Error("    Destroy claimed the guest had STOPPED on the strength of an accepted " +
-			"terminate request; the measurement below is how long that claim is false for")
+	if state != provider.TeardownRequested {
+		t.Errorf("    Destroy returned %s, want REQUESTED; the measurement below is how long "+
+			"the guest keeps running after that request", state)
 	}
 
 	t.Logf("    Destroy returned after %s", time.Since(start).Round(time.Millisecond))

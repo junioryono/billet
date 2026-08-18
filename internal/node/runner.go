@@ -572,8 +572,7 @@ func (r *Runner) destroy(ctx context.Context, requestID int64) error {
 	// the listener is told to stand down — the same answer an ambiguous launch
 	// gives, for the same reason.
 	if state != provider.TeardownStopped {
-		r.holdWithOutcome(lease, inst.Name, requestID, alloc.PhaseDone,
-			state == provider.TeardownObserved)
+		r.holdWithOutcome(lease, inst.Name, requestID, alloc.PhaseDone)
 
 		r.log.Info("the backend requested teardown but did not confirm the guest had stopped; "+
 			"holding the capacity until it is provably gone",

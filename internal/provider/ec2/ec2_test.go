@@ -1381,9 +1381,9 @@ func TestDestroyDoesNotClaimTheGuestHasStopped(t *testing.T) {
 		t.Fatalf("Destroy: %v", err)
 	}
 
-	if state != provider.TeardownObserved {
-		t.Errorf("an accepted terminate request = %s, want observed; the caller needs to know AWS "+
-			"saw this instance without treating it as stopped", state)
+	if state != provider.TeardownRequested {
+		t.Errorf("an accepted terminate request = %s, want requested; the guest may still be "+
+			"running and an immediately absent inventory may still be stale", state)
 	}
 }
 

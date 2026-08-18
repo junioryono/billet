@@ -379,13 +379,8 @@ func TestAnAcceptedTeardownHoldsTheCapacityUntilTheComputeIsProvablyGone(t *test
 	}
 }
 
-// A teardown that observed its target does not need the stray-launch grace.
-//
-// The grace protects an AMBIGUOUS launch whose create may still be in flight when
-// the first inventory read sees nothing. When the teardown call itself observed
-// the instance, it supplies the missing causal evidence. If EC2 then finishes
-// terminating before the first custody check, the first absence proves it is
-// gone; waiting five minutes needlessly leaves the whole node unable to work.
+// A teardown that inventory has already observed releases on its first later
+// absence instead of waiting through the stray-launch grace.
 func TestAFastAcceptedTeardownReleasesOnTheFirstAbsentInventory(t *testing.T) {
 	p := &fakeProvider{kind: config.ProviderDocker, asyncTeardown: true}
 	a, host := newAllocatorWithHost(t)
@@ -399,31 +394,27 @@ func TestAFastAcceptedTeardownReleasesOnTheFirstAbsentInventory(t *testing.T) {
 		t.Fatalf("Destroy = %v, want ErrCustody", err)
 	}
 
-	// The backend finishes before Tend gets its first look at the custody entry.
-	p.settle(provider.InstanceName(lease.ID))
-
+	// This sighting is the causal evidence. A later absent inventory cannot be a
+	// create that has not materialised yet.
 	if err := r.Tend(t.Context()); err != nil {
-		t.Fatalf("Tend after the known-running instance stopped: %v", err)
+		t.Fatalf("Tend while the backend still reports the instance: %v", err)
+	}
+	p.settle(provider.InstanceName(lease.ID))
+	if err := r.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend after the observed instance stopped: %v", err)
 	}
 	if _, err := a.Lease(t.Context(), lease.ID); !errors.Is(err, alloc.ErrLeaseNotFound) {
-		t.Fatalf("the first absent inventory kept a known-running instance's lease: %v", err)
+		t.Fatalf("the first absence after a sighting kept the lease: %v", err)
 	}
 }
 
-// A backend that could not observe the target while asking for teardown has not
-// supplied the causal evidence the fast path depends on.
+// An accepted remote teardown and its first absent inventory are not proof.
 //
-// EC2 can return NotFound for an id RunInstances just returned. The instance may
-// then be absent from the first inventory read too, before it materialises. That
-// pair of misses is one eventually-consistent observation, not proof that the
-// guest stopped, so the lease must survive until the instance is seen or the
-// ordinary stray grace elapses.
+// EC2 can return a stale empty DescribeInstances result after TerminateInstances
+// succeeds. The instance may then reappear still shutting down, so the lease must
+// survive until the instance is seen or the ordinary stray grace elapses.
 func TestAnUnobservedTeardownKeepsCapacityAcrossTheFirstAbsentInventory(t *testing.T) {
-	p := &fakeProvider{
-		kind:               config.ProviderDocker,
-		asyncTeardown:      true,
-		teardownUnobserved: true,
-	}
+	p := &fakeProvider{kind: config.ProviderDocker, asyncTeardown: true}
 	a, host := newAllocatorWithHost(t)
 	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
 	lease := assignedLease(t, a)
@@ -624,7 +615,7 @@ func TestARequestWithBothCustodyAndARunningInstanceStillDestroysTheRunningOne(t 
 	if err := a.Advance(t.Context(), adopted.ID, adopted.Epoch, alloc.PhaseLaunching); err != nil {
 		t.Fatalf("Advance adopted lease: %v", err)
 	}
-	r.holdWithOutcome(adopted, provider.InstanceName(adopted.ID), 11, alloc.PhaseDone, false)
+	r.holdWithOutcome(adopted, provider.InstanceName(adopted.ID), 11, alloc.PhaseDone)
 
 	// The running half: a different lease, for the same request.
 	second := assignedLease(t, a)
@@ -854,9 +845,6 @@ type fakeProvider struct {
 	// about, and no other fake in this suite has it — every one of them destroys
 	// synchronously, which is why the gap survived so long.
 	asyncTeardown bool
-	// teardownUnobserved models EC2's eventually-consistent NotFound: teardown is
-	// idempotently requested, but the backend did not observe the target.
-	teardownUnobserved bool
 
 	// live is what the backend is actually running, keyed by name. A map rather
 	// than a counter because Find and List have to agree with Launch and Destroy:
@@ -1053,11 +1041,7 @@ func (f *fakeProvider) Destroy(ctx context.Context, id string) (provider.Teardow
 	// and merely returned a different enum would agree with the bug, because
 	// every later observation would say "gone" no matter what the code believed.
 	if f.asyncTeardown {
-		if f.teardownUnobserved {
-			return provider.TeardownRequested, nil
-		}
-
-		return provider.TeardownObserved, nil
+		return provider.TeardownRequested, nil
 	}
 
 	for name, inst := range f.live {

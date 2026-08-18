@@ -168,7 +168,7 @@ func (r *Runner) adopt(lease *alloc.Lease, inst *provider.Instance) {
 // second runner, and a completion can never find the entry at all.
 func (r *Runner) hold(lease *alloc.Lease, name string, requestID int64) {
 	// FAILED, not done. This lease's job never started.
-	r.holdWithOutcome(lease, name, requestID, alloc.PhaseFailed, false)
+	r.holdWithOutcome(lease, name, requestID, alloc.PhaseFailed)
 }
 
 // holdWithOutcome is hold for a job whose outcome is already known.
@@ -180,9 +180,7 @@ func (r *Runner) hold(lease *alloc.Lease, name string, requestID int64) {
 // stopped. Writing "failed" for the second would put a lie in job_history for
 // every job that completed normally on an EC2 host, and an investigation reading
 // it would see a fleet where nothing ever succeeded.
-func (r *Runner) holdWithOutcome(
-	lease *alloc.Lease, name string, requestID int64, outcome alloc.Phase, observed bool,
-) {
+func (r *Runner) holdWithOutcome(lease *alloc.Lease, name string, requestID int64, outcome alloc.Phase) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -195,11 +193,9 @@ func (r *Runner) holdWithOutcome(
 		outcome:   outcome,
 		phase:     alloc.PhaseTeardown,
 		since:     r.now(),
-		// An ambiguous launch or an eventually-consistent teardown miss has not
-		// observed the target and needs the grace before an absence is believed. A
-		// teardown the backend observed supplies the causal evidence that makes its
-		// first later absence trustworthy.
-		observed: observed,
+		// Not observed. Even an accepted remote teardown can be followed by an
+		// eventually-consistent inventory miss while the guest is still running. A
+		// later sighting sets this, and otherwise the sustained grace must elapse.
 	}
 	entry.epoch.Store(lease.Epoch)
 
