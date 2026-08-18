@@ -22,7 +22,8 @@ func (a *Allocator) EC2CostNodes(ctx context.Context) ([]config.EC2CostNode, err
 		if err != nil {
 			return fmt.Errorf("alloc: list registered EC2 nodes for cost reporting: %w", err)
 		}
-		defer func() { _ = rows.Close() }()
+		registeredRows := rows
+		defer func() { _ = registeredRows.Close() }()
 
 		prices := make(map[string]map[string]config.USDPerHour)
 		nodeIndexes := make(map[string]int)
