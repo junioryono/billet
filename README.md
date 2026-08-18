@@ -22,7 +22,7 @@ cloud; the AWS-based projects are AWS-only; the microVM products are commercial.
 [Alternatives](#alternatives) for an honest comparison, including cases where you should use
 something else.
 
-> The cloud path has run real GitHub Actions jobs on EC2, including Docker builds, service containers and runtime toolchain installation, and destroyed every instance afterward. The remaining failover proof is narrower: stop the preferred bare-metal capacity and watch the same `runs-on` label complete on EC2 ([#32](https://github.com/junioryono/billet/issues/32)). A tier can name several backends, capacity is measured per machine, and the control plane picks the host when the job is admitted — in the tier's own order of preference, so `[firecracker, ec2]` means the box at home before the cloud. See [Status](#status) and [AWS acceptance](docs/aws-acceptance.md).
+> The cloud path has run real GitHub Actions jobs on EC2, including Docker builds, service containers and runtime toolchain installation, and destroyed every instance afterward. The same unchanged `runs-on` label has also completed first on preferred bare-metal capacity and then on EC2 after that local contribution was withdrawn ([#32](https://github.com/junioryono/billet/issues/32)). A tier can name several backends, capacity is measured per machine, and the control plane picks the host when the job is admitted — in the tier's own order of preference, so `[firecracker, ec2]` means the box at home before the cloud. See [Status](#status) and [AWS acceptance](docs/aws-acceptance.md).
 
 ## What it is
 
@@ -330,7 +330,7 @@ part company the moment a scheduled rebuild takes up a newer release.
 
 ## Status
 
-billet is pre-alpha. **Jobs run end to end through the Docker and EC2 providers**, while the real Firecracker workflow and multi-provider failover proofs remain open. What works **today**:
+billet is pre-alpha. **Jobs run end to end through the Docker, Firecracker and EC2 providers**, and the same-label local-to-cloud failover path has completed against real GitHub and AWS infrastructure. What works **today**:
 
 | | |
 |---|---|
@@ -465,7 +465,7 @@ Two things to know before relying on it. The **authority** is the cliff, not any
 
 And a node's identity is its **name**, so two hosts configured with the same one are one host as far as the control plane is concerned. A per-process incarnation value is what routes new commands to the newest registration and stops a superseded process acting on work it was never given — but it does not tell a restart from a duplicate, and it deliberately lets a superseded process go on maintaining and reporting the work it already holds, because a draining process has to outlive its replacement. After a restart the plane still cannot say which of two machines sharing a name physically holds a given container. Give each host its own name.
 
-**The runner path has run against a real organization.** Docker remains exercised by the end-to-end suite against a scripted Actions service, while the EC2 path has also completed real private-repository workflows against GitHub and handled a live FIS Spot interruption. The remaining live proofs are the Firecracker workflow, same-label provider failover, and cache reuse and failure recovery.
+**The runner path has run against a real organization.** Docker remains exercised by the end-to-end suite against a scripted Actions service, while Firecracker has completed a real private-repository workflow and the EC2 path has completed the same unchanged workflow after local capacity was withdrawn, as well as handling a live FIS Spot interruption. The remaining live proofs are cache reuse, failure recovery, power-cut safety and cross-node site behavior.
 
 Everything below describes the intended design. Where a thing is not built, it says so.
 
@@ -606,7 +606,7 @@ bootstrap`, and why clone v2 is a requirement rather than a preference.
 | P5 — Docker layer cache, registry mirrors, container baseline | 🚧 Persistent in-guest BuildKit state, per-mount ceilings, the architecture-scoped Docker image store and three-registry mirror plumbing are implemented and locally tested; real pilot timing remains [#27](https://github.com/junioryono/billet/issues/27) [#28](https://github.com/junioryono/billet/issues/28) |
 | P6 — observability, SSH-into-a-job | ⬜ |
 | P7 — Apple Silicon provider (macOS + Linux arm64) | ⬜ |
-| P8 — EC2 provider, cloud-hosted control plane, provider failover | 🚧 The provider, AMI builder, real GitHub job path and live Spot-warning handling are proven; exact purchased-shape accounting is implemented. Same-label power-loss failover remains [#32](https://github.com/junioryono/billet/issues/32) |
+| P8 — EC2 provider, cloud-hosted control plane, provider failover | ✅ The provider, AMI builder, real GitHub job path, live Spot-warning handling, exact purchased-shape accounting and same-label local-to-cloud failover are proven ([#32](https://github.com/junioryono/billet/issues/32)) |
 | P9 — per-node capacity, admission-time placement, addressed teardown. **A prerequisite of P8**, not a sequel: failover needs the decision made before the work is accepted | ✅ [#21](https://github.com/junioryono/billet/issues/21) [#30](https://github.com/junioryono/billet/issues/30) [#31](https://github.com/junioryono/billet/issues/31) |
 | P10 — dashboard, signed releases, public launch | 🚧 releases and packages done; signing and the dashboard are not |
 | P11 — AWS Terraform | — Deferred until billet has a versioned atomic configuration API and released users ask for it ([ADR-004](docs/adr-004-terraform-provider.md)) |
