@@ -111,9 +111,7 @@ Two rules learned building it:
   `X-ScaleSetMaxCapacity` header are the evidence; internal state is the thing that agreed with the
   bug. `maxCapacity` is a header, so it is invisible to any test inspecting billet's types, and it is
   the one number GitHub uses to decide how much work to send.
-- **The fake is not a simulator.** It answers the handshake and serves what a test tells it to.
-  Nothing it does is evidence of what the real service does — questions about GitHub's actual
-  behaviour (task #13) still need a real organization.
+- **The fake is not a simulator.** It answers the handshake and serves what a test tells it to. Nothing it does is evidence of what the real service does. Billet's EC2 acceptance now proves the ordinary JIT registration and job path against a real organization, but a protocol behavior not exercised there still needs its own live observation.
 
 ## Others
 
