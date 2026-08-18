@@ -24,6 +24,10 @@ outputs:
 runs:
   using: composite
   steps:
+    - id: policy
+      name: Resolve the cache-mount ceiling
+      shell: bash
+      run: "${{ github.action_path }}/resolve-policy.sh"
     - name: Attach persistent BuildKit state
       uses: junioryono/billet/actions/stickydisk@main
       with:
@@ -45,5 +49,5 @@ runs:
         container: ${{ steps.start.outputs.container }}
         builder: ${{ steps.start.outputs.name }}
         state-path: ${{ runner.temp }}/billet-buildkit-state
-        mount-limit-bytes: ${{ env.BILLET_BUILDKIT_CACHE_MOUNT_LIMIT_BYTES || '21474836480' }}
+        mount-limit-bytes: ${{ steps.policy.outputs.mount_limit_bytes }}
         discard-marker: ${{ runner.temp }}/billet-buildkit-discard
