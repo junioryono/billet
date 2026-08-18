@@ -422,6 +422,10 @@ func sleepFor(ctx context.Context, d time.Duration) error {
 const privilegeDrop = "setpriv --reuid=runner --regid=runner --init-groups \\\n" +
 	"  env HOME=/home/runner USER=runner LOGNAME=runner"
 
+// jobTimingHookPath ends in the extension GitHub uses to select the hook's
+// interpreter. A shebang and executable mode are not sufficient.
+const jobTimingHookPath = "/usr/local/bin/billet-job-started.sh"
+
 // jobTimingHook is invoked by the runner after it accepts a job and before it
 // starts any job steps. It deliberately has no `set -e`: timing is observation,
 // and a missing or malformed timestamp must never turn into a failed workflow.
@@ -510,10 +514,10 @@ func provisionScript(spec BuildSpec) (string, error) {
 	// THE SUPPORTED RUNNER HOOK, rather than an edit to run.sh. GitHub invokes it
 	// after assigning the job and before running any job steps, which is the first
 	// instant that separates registration/pickup from the workflow itself.
-	b.WriteString("cat > /usr/local/bin/billet-job-started <<'BILLETJOBEOF'\n")
+	b.WriteString("cat > " + jobTimingHookPath + " <<'BILLETJOBEOF'\n")
 	b.WriteString(jobTimingHook())
 	b.WriteString("BILLETJOBEOF\n")
-	b.WriteString("chmod 0755 /usr/local/bin/billet-job-started\n")
+	b.WriteString("chmod 0755 " + jobTimingHookPath + "\n")
 
 	// THE ENTRY POINT A TIER NAMES. billet's boot script exports the JIT config and
 	// execs the tier's command AS ROOT, so something has to drop privileges without
@@ -551,7 +555,7 @@ func provisionScript(spec BuildSpec) (string, error) {
 	b.WriteString("exec " + privilegeDrop + " \\\n")
 	b.WriteString("  BILLET_LAUNCH_EPOCH_NS=\"${BILLET_LAUNCH_EPOCH_NS:-}\" \\\n")
 	b.WriteString("  BILLET_RUNNER_START_EPOCH_NS=\"$runner_started\" \\\n")
-	b.WriteString("  ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/bin/billet-job-started \\\n")
+	b.WriteString("  ACTIONS_RUNNER_HOOK_JOB_STARTED=" + jobTimingHookPath + " \\\n")
 	b.WriteString("  " + jitEnvVar + "=\"$" + jitEnvVar + "\" \\\n")
 	b.WriteString("  /opt/actions-runner/run.sh\n")
 	b.WriteString("BILLETEOF\n")

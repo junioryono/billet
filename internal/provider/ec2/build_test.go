@@ -242,12 +242,36 @@ func TestTheEntryPointCarriesTheRegistrationAcrossTheUserChange(t *testing.T) {
 	}
 
 	for fragment, why := range map[string]string{
-		`ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/bin/billet-job-started`: "the runner would not invoke the cold-start measurement hook",
-		`BILLET_LAUNCH_EPOCH_NS="${BILLET_LAUNCH_EPOCH_NS:-}"`:              "the launch timestamp would be lost across the user change",
-		`BILLET_RUNNER_START_EPOCH_NS="$runner_started"`:                    "the hook could not split boot from registration and pickup",
+		`ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/bin/billet-job-started.sh`: "the runner would not invoke the cold-start measurement hook",
+		`BILLET_LAUNCH_EPOCH_NS="${BILLET_LAUNCH_EPOCH_NS:-}"`:                 "the launch timestamp would be lost across the user change",
+		`BILLET_RUNNER_START_EPOCH_NS="$runner_started"`:                       "the hook could not split boot from registration and pickup",
 	} {
 		if !strings.Contains(entry, fragment) {
 			t.Errorf("the entry point is missing %q — %s", fragment, why)
+		}
+	}
+}
+
+// GITHUB SELECTS THE HOOK INTERPRETER FROM ITS EXTENSION. A real EC2 job reached
+// the runner and was rejected before its first step because the original path
+// had no .sh suffix, even though the file was executable and had a shebang.
+func TestTheJobStartHookHasASupportedScriptExtension(t *testing.T) {
+	t.Parallel()
+
+	got := mustScript(t)
+
+	if ext := filepath.Ext(jobTimingHookPath); ext != ".sh" {
+		t.Fatalf("the job-start hook extension is %q, want .sh; GitHub will refuse it", ext)
+	}
+
+	for _, fragment := range []string{
+		"cat > " + jobTimingHookPath + " <<'BILLETJOBEOF'\n",
+		"chmod 0755 " + jobTimingHookPath + "\n",
+		"ACTIONS_RUNNER_HOOK_JOB_STARTED=" + jobTimingHookPath + " \\\n",
+	} {
+		if !strings.Contains(got, fragment) {
+			t.Errorf("the image script is missing %q; GitHub refuses an administrator hook "+
+				"whose path has no supported script extension", fragment)
 		}
 	}
 }
