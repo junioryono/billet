@@ -29,7 +29,8 @@ async function cleanup() {
       const checked = run("sudo", ["e2fsck", "-f", "-n", device], { allowFailure: true, timeout: 120000 });
       body = { filesystem: { type, uuid, clean: checked.status === 0 } };
     }
-    const result = await cacheCall(endpoint, token, `/v1/volumes/${slot}/${operation}`, body);
+    const timeout = discard ? 2 * 60 * 1000 : 13 * 60 * 1000;
+    const result = await cacheCall(endpoint, token, `/v1/volumes/${slot}/${operation}`, body, timeout);
     if (discard) {
       warning("billet discarded this sticky-disk update because its cache policy could not be enforced; the job result is unchanged");
       return;
