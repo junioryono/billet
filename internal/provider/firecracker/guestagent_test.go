@@ -180,6 +180,25 @@ func TestTheGuestImageIncludesBuildxForThePersistentBuilder(t *testing.T) {
 	}
 }
 
+func TestTheGuestImageGateKeepsDockerBehindTheCacheMount(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join("..", "..", "..", "scripts", "check-guest-image.sh")
+	source, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read guest image checker: %v", err)
+	}
+	text := string(source)
+
+	if !strings.Contains(text, "sockets.target.wants/docker.socket") ||
+		!strings.Contains(text, "Docker waits for the billet agent to mount its image store") {
+		t.Fatal("the image gate does not require Docker service and socket activation to stay disabled")
+	}
+	if strings.Contains(text, "for unit in docker.service billet-agent.service") {
+		t.Fatal("the image gate still requires Docker to start before the billet agent mounts its cache")
+	}
+}
+
 func TestRegistryMirrorsRemainAStringLeafInGuestMetadata(t *testing.T) {
 	t.Parallel()
 
