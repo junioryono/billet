@@ -257,3 +257,23 @@ func TestLegacyEC2CatalogueInitializesWithOutstandingWork(t *testing.T) {
 		t.Fatalf("first post-migration registration with lease %s: %v", lease.ID, err)
 	}
 }
+
+func TestEC2PricesCanRefreshWithOutstandingWork(t *testing.T) {
+	a := ec2AccountingAllocator(t)
+	lease, err := a.Reserve(t.Context(), "cloud")
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+
+	reg := NodeRegistration{
+		Name: "cloud-1", Provider: config.ProviderEC2,
+		VCPU: 16, Memory: 64 * config.GiB,
+		EC2Shapes: []config.EC2InstanceType{
+			{Type: "eight", VCPU: 8, Memory: 16 * config.GiB, PriceUSDPerHour: 340_000},
+			{Type: "sixteen", VCPU: 16, Memory: 32 * config.GiB, PriceUSDPerHour: 680_000},
+		},
+	}
+	if _, err := a.RegisterNode(t.Context(), reg); err != nil {
+		t.Fatalf("price-only re-registration with lease %s: %v", lease.ID, err)
+	}
+}

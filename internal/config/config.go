@@ -1034,9 +1034,9 @@ type EC2InstanceType struct {
 	// PriceUSDPerHour is the operator-audited compute rate used to report the
 	// maximum configured exposure. It is required because the answer has to be in
 	// the config, not fetched from a mutable service when a job arrives. It is not
-	// sent to the allocator and cannot make an already-accepted job wait because a
+	// an admission gate and cannot make an already-accepted job wait because a
 	// copied price went stale.
-	PriceUSDPerHour USDPerHour `yaml:"price_usd_per_hour" json:"-"`
+	PriceUSDPerHour USDPerHour `yaml:"price_usd_per_hour" json:"price_usd_per_hour"`
 }
 
 // GitHubConfig holds the App identity used to manage runners.
