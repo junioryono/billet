@@ -43,7 +43,7 @@ func (p *Plane) NewRunner() *Runner { return &Runner{plane: p} }
 //     kept and the node's own recovery is what finds whatever started. Treating
 //     silence as failure would re-advertise capacity that is in use.
 func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job server.Job) error {
-	n, err := r.plane.pick(lease)
+	n, selectedProvider, err := r.plane.pick(lease)
 	if err != nil {
 		return err
 	}
@@ -68,14 +68,15 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job server.Job)
 			ID:    id,
 			Kind:  nodeapi.CommandLaunch,
 			Lease: lease,
-			Tier:  nodeapi.TierSpecOf(tier, n.provider),
+			Tier:  nodeapi.TierSpecOf(tier, selectedProvider),
 			Job: &nodeapi.Job{
 				RequestID: job.RequestID,
 				RunID:     job.RunID,
 				Event:     job.Event,
 			},
 		},
-		done: make(chan nodeapi.CommandResult, 1),
+		done:             make(chan nodeapi.CommandResult, 1),
+		expectedProvider: selectedProvider,
 	}
 
 	res, err := r.plane.dispatch(ctx, n, pend)
@@ -418,6 +419,24 @@ func (r *Runner) destroyOn(ctx context.Context, n *node, requestID int64) (strin
 // dispatch queues a command and waits for its result.
 func (p *Plane) dispatch(ctx context.Context, n *node, pend *pending) (nodeapi.CommandResult, error) {
 	p.mu.Lock()
+
+	if pend.expectedProvider != "" {
+		current, registered := p.nodes[n.name]
+		switch {
+		case !registered || current != n:
+			p.mu.Unlock()
+
+			return nodeapi.CommandResult{}, fmt.Errorf(
+				"%w: node %s was replaced after placement and before dispatch", ErrNoNode, n.name)
+		case n.provider != pend.expectedProvider:
+			actual := n.provider
+			p.mu.Unlock()
+
+			return nodeapi.CommandResult{}, fmt.Errorf(
+				"%w: node %s changed provider from %s to %s after placement and before dispatch",
+				ErrNoNode, n.name, pend.expectedProvider, actual)
+		}
+	}
 
 	n.queue = append(n.queue, pend)
 

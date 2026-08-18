@@ -374,6 +374,52 @@ func TestTheLeasesPreferenceOrderDecides(t *testing.T) {
 	}
 }
 
+// A NODE MAY RE-REGISTER BETWEEN PLACEMENT AND ENQUEUE.
+//
+// The node object is deliberately reused across registration, so reading its
+// provider after pick releases the plane lock observes mutable state. Sending a
+// Docker image selected before that handover to an EC2 process is worse than
+// losing this attempt: it is a command for a different backend that can never
+// succeed and whose failure arrives only after the job has been assigned.
+func TestAProviderChangeBetweenPlacementAndDispatchIsRefused(t *testing.T) {
+	t.Parallel()
+
+	p := testPlane(t)
+	register(t, p, "worker", config.ProviderDocker)
+
+	n, selected, err := p.pick(testLease())
+	if err != nil {
+		t.Fatalf("pick: %v", err)
+	}
+
+	register(t, p, "worker", config.ProviderEC2)
+
+	pend := &pending{
+		cmd:              nodeapi.Command{ID: "c1", Kind: nodeapi.CommandLaunch},
+		done:             make(chan nodeapi.CommandResult, 1),
+		expectedProvider: selected,
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+
+	_, err = p.dispatch(ctx, n, pend)
+	if !errors.Is(err, ErrNoNode) {
+		t.Fatalf("dispatch after provider change = %v, want ErrNoNode", err)
+	}
+	if !strings.Contains(err.Error(), "changed provider from docker to ec2") {
+		t.Errorf("dispatch refusal does not explain the stale selection: %v", err)
+	}
+
+	p.mu.Lock()
+	queued := len(n.queue)
+	p.mu.Unlock()
+
+	if queued != 0 {
+		t.Errorf("stale launch left %d command(s) queued for the replacement backend", queued)
+	}
+}
+
 // A pinned lease goes to its node or nowhere.
 //
 // THE OTHER NODE ANSWERS, and that detail is the test. An earlier version left

@@ -233,6 +233,10 @@ func (n *node) rememberAbandoned(cmd nodeapi.Command, takenBy string, at time.Ti
 type pending struct {
 	cmd  nodeapi.Command
 	done chan nodeapi.CommandResult
+	// expectedProvider is the immutable backend placement selected. Registration
+	// may update the node object before this command is queued; dispatch refuses
+	// that stale choice rather than sending one backend's launch shape to another.
+	expectedProvider config.ProviderKind
 	// incarnation is the node PROCESS that took this command.
 	//
 	// The node NAME is not enough. A superseded process and its replacement share
@@ -1593,7 +1597,7 @@ func (p *Plane) expireStaleLocked() {
 // pins it, Providers says what it may run on. That is the same rule Bind
 // enforces, and it is here for the same reason — a tier edited while a lease is
 // open must not move the lease.
-func (p *Plane) pick(lease *alloc.Lease) (*node, error) {
+func (p *Plane) pick(lease *alloc.Lease) (*node, config.ProviderKind, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -1609,11 +1613,21 @@ func (p *Plane) pick(lease *alloc.Lease) (*node, error) {
 	// is where the container already is. Resolving only the target let a bound
 	// lease be launched on a different host.
 	if pinned := lease.Node; pinned != "" {
-		return p.pinnedLocked(lease, pinned, "bound to")
+		n, err := p.pinnedLocked(lease, pinned, "bound to")
+		if err != nil {
+			return nil, "", err
+		}
+
+		return n, n.provider, nil
 	}
 
 	if lease.TargetNode != "" {
-		return p.pinnedLocked(lease, lease.TargetNode, "pinned to")
+		n, err := p.pinnedLocked(lease, lease.TargetNode, "pinned to")
+		if err != nil {
+			return nil, "", err
+		}
+
+		return n, n.provider, nil
 	}
 
 	// IN THE LEASE'S OWN ORDER OF PREFERENCE. Providers is most-preferred-first,
@@ -1634,12 +1648,12 @@ func (p *Plane) pick(lease *alloc.Lease) (*node, error) {
 	for _, want := range lease.Providers {
 		for _, name := range names {
 			if n := p.nodes[name]; n.provider == want && acceptsGuestOS(n, lease) {
-				return n, nil
+				return n, n.provider, nil
 			}
 		}
 	}
 
-	return nil, fmt.Errorf("%w: lease %s needs one of %v and no registered node offers it",
+	return nil, "", fmt.Errorf("%w: lease %s needs one of %v and no registered node offers it",
 		ErrNoNode, lease.ID, lease.Providers)
 }
 
@@ -1662,7 +1676,7 @@ func (p *Plane) pinnedLocked(lease *alloc.Lease, name, how string) (*node, error
 
 // PickForTest reports which node a lease would be aimed at.
 func (p *Plane) PickForTest(lease *alloc.Lease) (string, error) {
-	n, err := p.pick(lease)
+	n, _, err := p.pick(lease)
 	if err != nil {
 		return "", err
 	}
