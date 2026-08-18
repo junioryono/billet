@@ -2,9 +2,12 @@ package firecracker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -36,6 +39,7 @@ func TestRealFirecrackerLaunchAndDestroy(t *testing.T) {
 	// A UNIQUE LEASE PER RUN, because the jailer refuses an id whose chroot
 	// survives — which is exactly what a previous failed run leaves behind.
 	name := provider.InstanceName(env.lease)
+	rootCapacity := env.disk.growthCapacity(t, env.image)
 
 	t.Cleanup(func() {
 		// WithoutCancel: the test context is done by the time cleanup runs, and a
@@ -50,6 +54,7 @@ func TestRealFirecrackerLaunchAndDestroy(t *testing.T) {
 		Image:     env.image,
 		VCPU:      2,
 		Memory:    1 * config.GiB,
+		Disk:      rootCapacity,
 		Command:   []string{"./run.sh"},
 		Trust:     provider.TrustTrusted,
 		JITConfig: "not-a-real-registration",
@@ -62,6 +67,10 @@ func TestRealFirecrackerLaunchAndDestroy(t *testing.T) {
 	// This is the assertion the whole design turned on, and it can only be made
 	// against the real jailer: a fake would agree with whatever billet computed.
 	j := p.jailFor(name)
+	if got := ext4Size(t, j.rootDiskPath()); got < int64(rootCapacity) {
+		t.Errorf("the root filesystem visible to the guest is %d bytes, want at least %d", got,
+			rootCapacity)
+	}
 
 	if _, err := os.Stat(j.socket()); err != nil {
 		t.Errorf("no api socket at the path billet derives, so the jailer used another: %v", err)
@@ -120,9 +129,10 @@ func TestRealFirecrackerDestroyLeavesNothing(t *testing.T) {
 	}
 
 	name := provider.InstanceName(env.lease)
+	rootCapacity := env.disk.growthCapacity(t, env.image)
 
 	if _, err := p.Launch(t.Context(), provider.Spec{
-		Name: name, Image: env.image, VCPU: 1, Memory: 512 * config.MiB,
+		Name: name, Image: env.image, VCPU: 1, Memory: 512 * config.MiB, Disk: rootCapacity,
 		Command: []string{"./run.sh"}, Trust: provider.TrustTrusted,
 		JITConfig: "not-a-real-registration",
 	}); err != nil {
@@ -132,6 +142,7 @@ func TestRealFirecrackerDestroyLeavesNothing(t *testing.T) {
 	if _, err := p.Destroy(t.Context(), name); err != nil {
 		t.Fatalf("Destroy: %v", err)
 	}
+	env.disk.assertGone(t, name)
 
 	j := p.jailFor(name)
 
@@ -157,7 +168,7 @@ func TestRealFirecrackerDestroyLeavesNothing(t *testing.T) {
 // realHost is what a live launch needs, and where it came from.
 type realHost struct {
 	cfg   config.FirecrackerConfig
-	disk  RootDisk
+	disk  rbdDisk
 	image string
 	lease string
 }
@@ -223,7 +234,7 @@ func requireRealHost(t *testing.T) realHost {
 // the store — the layering depguard enforces. It runs the same two commands the
 // ceph client does, which is what makes this a test of the launch path rather than
 // of the storage.
-func realDisk(t *testing.T) RootDisk {
+func realDisk(t *testing.T) rbdDisk {
 	t.Helper()
 
 	pool := os.Getenv("BILLET_TEST_CACHE_POOL")
@@ -244,6 +255,30 @@ type rbdDisk struct {
 	images, cache, id string
 }
 
+// growthCapacity chooses a test capacity one GiB beyond the source device. Since
+// an ext4 filesystem cannot be larger than its block device, reaching this value
+// proves both RBD and filesystem growth rather than merely accepting a large image.
+func (d rbdDisk) growthCapacity(t *testing.T, image string) config.ByteSize {
+	t.Helper()
+
+	out, err := exec.CommandContext(t.Context(), "rbd", d.args("--format", "json", "info",
+		d.images+"/"+image)...).Output()
+	if err != nil {
+		t.Fatalf("inspect the source image before the growth test: %v", err)
+	}
+	var info struct {
+		Size int64 `json:"size"`
+	}
+	if err := json.Unmarshal(out, &info); err != nil || info.Size <= 0 {
+		t.Fatalf("source image did not report a positive size: %v, %s", err, out)
+	}
+	if info.Size > int64(config.ByteSize(1<<63-1)-config.GiB) {
+		t.Fatalf("source image is too large to request a growth probe: %d", info.Size)
+	}
+
+	return config.ByteSize(info.Size) + config.GiB
+}
+
 func (d rbdDisk) args(rest ...string) []string {
 	if d.id == "" {
 		return rest
@@ -258,10 +293,34 @@ func (d rbdDisk) ResolveGeneration(_ context.Context, image string) (string, err
 	return image, nil
 }
 
-func (d rbdDisk) CloneRoot(ctx context.Context, image, name string) (string, error) {
+func (d rbdDisk) CloneRoot(
+	ctx context.Context, image, name string, capacity config.ByteSize,
+) (string, error) {
 	if err := exec.CommandContext(ctx, "rbd", d.args("clone",
 		d.images+"/"+image, d.cache+"/"+name)...).Run(); err != nil {
 		return "", err
+	}
+
+	if capacity > 0 {
+		out, err := exec.CommandContext(ctx, "rbd", d.args("--format", "json", "info",
+			d.cache+"/"+name)...).Output()
+		if err != nil {
+			return "", err
+		}
+		var info struct {
+			Size int64 `json:"size"`
+		}
+		if err := json.Unmarshal(out, &info); err != nil {
+			return "", err
+		}
+
+		sizeMiB := (int64(capacity)-1)/int64(config.MiB) + 1
+		if info.Size < int64(capacity) {
+			if err := exec.CommandContext(ctx, "rbd", d.args("resize", "--size",
+				fmt.Sprintf("%dM", sizeMiB), d.cache+"/"+name)...).Run(); err != nil {
+				return "", err
+			}
+		}
 	}
 
 	out, err := exec.CommandContext(ctx, "rbd", d.args("device", "map",
@@ -273,6 +332,37 @@ func (d rbdDisk) CloneRoot(ctx context.Context, image, name string) (string, err
 	return strings.TrimSpace(string(out)), nil
 }
 
+// ext4Size reads the superblock through the exact device node Firecracker opens
+// inside the jail. That is the filesystem the guest sees, not merely RBD's outer
+// block-device capacity.
+func ext4Size(t *testing.T, device string) int64 {
+	t.Helper()
+
+	out, err := exec.CommandContext(t.Context(), "dumpe2fs", "-h", device).CombinedOutput()
+	if err != nil {
+		t.Fatalf("inspect the guest root filesystem: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+
+	values := make(map[string]int64)
+	for _, line := range strings.Split(string(out), "\n") {
+		key, value, found := strings.Cut(line, ":")
+		if !found || (key != "Block count" && key != "Block size") {
+			continue
+		}
+		n, parseErr := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+		if parseErr != nil {
+			t.Fatalf("parse %s from dumpe2fs: %v", key, parseErr)
+		}
+		values[key] = n
+	}
+
+	if values["Block count"] <= 0 || values["Block size"] <= 0 {
+		t.Fatalf("dumpe2fs did not report a positive block count and size: %s", out)
+	}
+
+	return values["Block count"] * values["Block size"]
+}
+
 func (d rbdDisk) DiscardRoot(ctx context.Context, name string) error {
 	//nolint:errcheck // both are idempotent teardown; the caller cannot act on either
 	_ = exec.CommandContext(ctx, "rbd", d.args("device", "unmap", d.cache+"/"+name)...).Run()
@@ -281,6 +371,45 @@ func (d rbdDisk) DiscardRoot(ctx context.Context, name string) error {
 	_ = exec.CommandContext(ctx, "rbd", d.args("rm", d.cache+"/"+name)...).Run()
 
 	return nil
+}
+
+// assertGone proves teardown removed both forms of RBD state: the kernel mapping
+// and the cache-pool image it pins.
+func (d rbdDisk) assertGone(t *testing.T, name string) {
+	t.Helper()
+
+	out, err := exec.CommandContext(t.Context(), "rbd", d.args("--format", "json", "device",
+		"list")...).Output()
+	if err != nil {
+		t.Fatalf("list RBD mappings after Destroy: %v", err)
+	}
+	var mappings []struct {
+		Pool string `json:"pool"`
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(out, &mappings); err != nil {
+		t.Fatalf("decode RBD mappings after Destroy: %v", err)
+	}
+	for _, mapping := range mappings {
+		if mapping.Pool == d.cache && mapping.Name == name {
+			t.Errorf("Destroy left %s/%s mapped", d.cache, name)
+		}
+	}
+
+	out, err = exec.CommandContext(t.Context(), "rbd", d.args("--format", "json", "ls",
+		d.cache)...).Output()
+	if err != nil {
+		t.Fatalf("list cache-pool images after Destroy: %v", err)
+	}
+	var images []string
+	if err := json.Unmarshal(out, &images); err != nil {
+		t.Fatalf("decode cache-pool images after Destroy: %v", err)
+	}
+	for _, image := range images {
+		if image == name {
+			t.Errorf("Destroy left %s/%s in the cache pool", d.cache, name)
+		}
+	}
 }
 
 // KernelFor answers "nothing recorded". This harness boots against a real cluster

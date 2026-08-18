@@ -167,6 +167,8 @@ It resolves itself in the ordinary case: the host destroys the container and say
 
 ## Guest images
 
+Firecracker root disks are grown per job to the tier's requested `disk` capacity, then the host expands ext4 on the unmounted clone before the guest boots. This also works with already-published images. The immutable golden generation remains small and shared, and teardown discards the enlarged clone with the microVM. A zero `disk` keeps the generation's size as the backend default.
+
 A Firecracker job boots a **golden image**: an Ubuntu 24.04 rootfs carrying Docker, the
 GitHub Actions runner, and a small agent that reads the runner registration out of the
 metadata service and starts the runner with it. It lives in Ceph as an RBD image with
@@ -536,6 +538,8 @@ tiers:
     memory: 32GiB
     disk: 160GiB
 ```
+
+For Firecracker and EC2, `disk` is usable root-volume capacity rather than a scheduling annotation. Firecracker grows only the job's copy-on-write clone and expands ext4 on the host before boot; the immutable golden image stays small and shared, including images published before this behavior existed. A zero value keeps that image size as the backend default. Docker runs on the host filesystem and ignores this field.
 
 ## Security
 

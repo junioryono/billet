@@ -32,7 +32,7 @@ func TestAHostWithoutKVMIsRefusedWithASentinel(t *testing.T) {
 
 	h := newHarness(t)
 
-	if _, err := h.p.CheckHost(t.Context()); !errors.Is(err, ErrNoKVM) {
+	if _, err := h.p.CheckHost(t.Context(), false); !errors.Is(err, ErrNoKVM) {
 		t.Errorf("a host with no /dev/kvm was not reported as such: %v", err)
 	}
 }
@@ -45,8 +45,16 @@ func TestThePreflightReportsTheDerivedJailDirectory(t *testing.T) {
 	requireKVM(t)
 
 	h := newHarness(t)
+	seenResize2fs := false
+	h.p.lookPath = func(bin string) (string, error) {
+		if bin == resize2fsBinary {
+			seenResize2fs = true
+		}
 
-	report, err := h.p.CheckHost(t.Context())
+		return "/usr/sbin/" + bin, nil
+	}
+
+	report, err := h.p.CheckHost(t.Context(), true)
 	if err != nil {
 		t.Fatalf("CheckHost: %v", err)
 	}
@@ -60,6 +68,40 @@ func TestThePreflightReportsTheDerivedJailDirectory(t *testing.T) {
 	if report.JailUIDMin != h.p.cfg.JailUIDMin || report.JailUIDCount != h.p.cfg.JailUIDCount {
 		t.Errorf("the report names the uid range %d+%d, want %d+%d",
 			report.JailUIDMin, report.JailUIDCount, h.p.cfg.JailUIDMin, h.p.cfg.JailUIDCount)
+	}
+
+	if !seenResize2fs {
+		t.Error("the preflight did not prove resize2fs is installed")
+	}
+}
+
+func TestAHostWithoutResize2fsIsRefusedBeforeItsFirstJob(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.p.lookPath = func(string) (string, error) {
+		return "", errors.New("executable file not found")
+	}
+
+	err := h.p.checkResize2fs(true)
+	if err == nil {
+		t.Fatal("the resize2fs check accepted a host that cannot expand ext4")
+	}
+	if !strings.Contains(err.Error(), "e2fsprogs") {
+		t.Errorf("the error does not name the package to install: %v", err)
+	}
+}
+
+func TestAHostUsingTheBackendDefaultDoesNotNeedResize2fs(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	h.p.lookPath = func(string) (string, error) {
+		return "", errors.New("executable file not found")
+	}
+
+	if err := h.p.checkResize2fs(false); err != nil {
+		t.Errorf("a backend-default root disk acquired a new host dependency: %v", err)
 	}
 }
 
@@ -105,7 +147,7 @@ func TestAGuestKernelThatIsNotAFileIsRefused(t *testing.T) {
 			h := newHarness(t)
 			h.p.cfg.KernelImage = tc.stage(t, t.TempDir())
 
-			_, err := h.p.CheckHost(t.Context())
+			_, err := h.p.CheckHost(t.Context(), false)
 			if err == nil {
 				t.Fatal("CheckHost accepted it")
 			}
@@ -126,7 +168,7 @@ func TestThePreflightProvesBothBridgesExist(t *testing.T) {
 
 	h := newHarness(t, func(p *Provider) { p.cfg.UntrustedBridge = "br-untrusted" })
 
-	if _, err := h.p.CheckHost(t.Context()); err != nil {
+	if _, err := h.p.CheckHost(t.Context(), false); err != nil {
 		t.Fatalf("CheckHost: %v", err)
 	}
 
@@ -157,7 +199,7 @@ func TestAMissingBridgeFailsThePreflight(t *testing.T) {
 		return h.record(ctx, bin, args)
 	}
 
-	_, err := h.p.CheckHost(t.Context())
+	_, err := h.p.CheckHost(t.Context(), false)
 	if err == nil {
 		t.Fatal("CheckHost accepted a host whose bridge is not there")
 	}
@@ -183,7 +225,7 @@ func TestABinaryThatWillNotAnswerFailsThePreflight(t *testing.T) {
 		return []byte("Firecracker v1.16.1\n"), nil
 	}
 
-	_, err := h.p.CheckHost(t.Context())
+	_, err := h.p.CheckHost(t.Context(), false)
 	if err == nil {
 		t.Fatal("CheckHost accepted a host with no jailer")
 	}
@@ -208,7 +250,7 @@ func TestTheReportedVersionIsTheFirstLine(t *testing.T) {
 		return []byte("Firecracker v1.16.1\n\nsomething else entirely\n"), nil
 	}
 
-	report, err := h.p.CheckHost(t.Context())
+	report, err := h.p.CheckHost(t.Context(), false)
 	if err != nil {
 		t.Fatalf("CheckHost: %v", err)
 	}

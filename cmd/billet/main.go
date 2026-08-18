@@ -2270,7 +2270,7 @@ func checkFirecrackerHost(ctx context.Context, cfg *config.Config) error {
 		return err
 	}
 
-	report, err := p.CheckHost(ctx)
+	report, err := p.CheckHost(ctx, needsFirecrackerRootResize(cfg))
 	if err != nil {
 		return err
 	}
@@ -2296,6 +2296,20 @@ func checkFirecrackerHost(ctx context.Context, cfg *config.Config) error {
 	return nil
 }
 
+// needsFirecrackerRootResize reports whether this deployment can send a tier
+// with an explicit root capacity to this backend. A zero-disk catalogue keeps the
+// image default and must not acquire resize2fs as a preflight dependency.
+func needsFirecrackerRootResize(cfg *config.Config) bool {
+	for i := range cfg.Tiers {
+		tier := &cfg.Tiers[i]
+		if tier.Disk > 0 && tier.AcceptsProvider(config.ProviderFirecracker) {
+			return true
+		}
+	}
+
+	return false
+}
+
 // deploymentForCheck identifies nothing. The provider requires a deployment because
 // it marks the jails it creates with one, and this constructs a provider only to
 // ask it questions about the host.
@@ -2313,7 +2327,7 @@ func (noRootDisk) ResolveGeneration(_ context.Context, image string) (string, er
 	return image, nil
 }
 
-func (noRootDisk) CloneRoot(context.Context, string, string) (string, error) {
+func (noRootDisk) CloneRoot(context.Context, string, string, config.ByteSize) (string, error) {
 	return "", errors.New("billet: the preflight does not clone a root disk")
 }
 

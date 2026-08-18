@@ -71,6 +71,7 @@ nfpms:
       launches ephemeral runners on machines you own.
     license: Apache-2.0
     dependencies:
+      - e2fsprogs
       - kmod
     # NO apk. Alpine uses BusyBox adduser/addgroup rather than GNU
     # useradd/groupadd, and OpenRC rather than systemd — so an apk built from

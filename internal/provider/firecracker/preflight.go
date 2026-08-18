@@ -44,7 +44,7 @@ var ErrNoKVM = errors.New("/dev/kvm is not available, so this host cannot run a 
 // and this process may use it; it proves nothing about the jailer's ability to
 // chroot or to place a cgroup, which needs root and is not something a diagnostic
 // should acquire to find out.
-func (p *Provider) CheckHost(ctx context.Context) (HostReport, error) {
+func (p *Provider) CheckHost(ctx context.Context, needsRootResize bool) (HostReport, error) {
 	report := HostReport{
 		JailDir:         p.cfg.ChrootBase + "/" + p.execName,
 		JailUIDMin:      p.cfg.JailUIDMin,
@@ -73,6 +73,10 @@ func (p *Provider) CheckHost(ctx context.Context) (HostReport, error) {
 		*bin.into = firstLine(string(out))
 	}
 
+	if err := p.checkResize2fs(needsRootResize); err != nil {
+		return report, err
+	}
+
 	if err := p.checkKernelImage(); err != nil {
 		return report, err
 	}
@@ -82,6 +86,22 @@ func (p *Provider) CheckHost(ctx context.Context) (HostReport, error) {
 	}
 
 	return report, nil
+}
+
+// checkResize2fs proves this host can turn a grown root device into filesystem
+// capacity before booting it.
+func (p *Provider) checkResize2fs(required bool) error {
+	if !required {
+		return nil
+	}
+
+	if _, err := p.lookPath(resize2fsBinary); err != nil {
+		return fmt.Errorf("firecracker: %s is not on PATH, so a tier's root disk capacity "+
+			"could not be made usable before boot: %w (install e2fsprogs)",
+			resize2fsBinary, err)
+	}
+
+	return nil
 }
 
 // checkKVM proves this machine can run a hardware-accelerated guest.
