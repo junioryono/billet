@@ -2498,13 +2498,13 @@ func (l *Listener) releaseAbsent(ctx context.Context, requestID int64, lease *al
 // The allocator call stays outside the listener mutex. A SQLite writer can be
 // busy behind an operator command, and holding the mutex there would stall lease
 // renewal for every unrelated job in this tier.
-func (l *Listener) releaseParked(ctx context.Context, requestID int64) bool {
+func (l *Listener) releaseParked(ctx context.Context, requestID int64) (bool, bool) {
 	l.mu.Lock()
 	entry, ok := l.cleanup[requestID]
 	if !ok || !entry.releaseOnly || entry.lease == nil {
 		l.mu.Unlock()
 
-		return false
+		return false, false
 	}
 
 	lease := entry.lease
@@ -2521,7 +2521,7 @@ func (l *Listener) releaseParked(ctx context.Context, requestID int64) bool {
 
 	current, stillPending := l.cleanup[requestID]
 	if !stillPending || current != entry {
-		return true
+		return true, false
 	}
 
 	if !releaseSettled(relErr) {
@@ -2530,14 +2530,14 @@ func (l *Listener) releaseParked(ctx context.Context, requestID int64) bool {
 			"held until this is retried",
 			"tier", l.tier, "request", requestID, "lease", lease.ID, "error", relErr)
 
-		return true
+		return true, false
 	}
 
 	delete(l.cleanup, requestID)
 	delete(l.running, requestID)
 	delete(l.acquiring, requestID)
 
-	return true
+	return true, true
 }
 
 func (l *Listener) recordCompletion(ctx context.Context, job Job) error {
@@ -2609,8 +2609,10 @@ func (l *Listener) complete(ctx context.Context, job Job) {
 	// A previous attempt already established that no compute exists. Repeating a
 	// remote destroy adds no proof, and on shutdown it can wait a full node timeout
 	// before the local release that is the only work left.
-	if l.releaseParked(ctx, job.RequestID) {
-		l.forgetCompletion(ctx, job)
+	if handled, settled := l.releaseParked(ctx, job.RequestID); handled {
+		if settled {
+			l.forgetCompletion(ctx, job)
+		}
 
 		return
 	}

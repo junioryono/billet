@@ -2064,6 +2064,48 @@ func TestCompletionIsNotAcknowledgedWhenItsResultCannotBeMadeDurable(t *testing.
 	}
 }
 
+func TestReleaseOnlyCompletionKeepsItsDurableResultUntilReleaseSettles(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, tiers)
+	db := openState(t)
+	job := Job{RequestID: 74, RunID: 84, Result: "Succeeded"}
+	if err := db.PutPendingCompletion(t.Context(), state.PendingCompletion{
+		Tier: tiers[0].Label, RequestID: job.RequestID, RunID: job.RunID, Result: job.Result,
+	}); err != nil {
+		t.Fatalf("PutPendingCompletion: %v", err)
+	}
+
+	l := NewListener(a, tiers[0].Label, &fakeSession{},
+		WithCompletionStore(db), WithRunner(&fakeRunner{}))
+	lease := holdRunning(t, l, a, tiers[0].Label, job.RequestID)
+	l.mu.Lock()
+	delete(l.running, job.RequestID)
+	l.cleanup[job.RequestID] = &pendingCleanup{
+		job: job, lease: lease, outcome: alloc.PhaseDone, releaseOnly: true,
+	}
+	l.mu.Unlock()
+
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	l.complete(cancelled, job)
+	pending, err := db.PendingCompletions(t.Context(), tiers[0].Label)
+	if err != nil {
+		t.Fatalf("PendingCompletions after failed release: %v", err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("failed release retired its durable result: %+v", pending)
+	}
+
+	l.complete(t.Context(), job)
+	pending, err = db.PendingCompletions(t.Context(), tiers[0].Label)
+	if err != nil {
+		t.Fatalf("PendingCompletions after settled release: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("settled release retained its durable result: %+v", pending)
+	}
+}
+
 // A COMPLETION WHOSE DESTROY FAILED IS RETRIED, which is what turns "capacity
 // held" into something other than a leak.
 //
