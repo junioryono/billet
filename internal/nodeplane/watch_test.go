@@ -242,22 +242,22 @@ func TestALateRegistrationCannotSupersedeTheNewerProcess(t *testing.T) {
 		return led.held()
 	})
 
-	secondStarted := make(chan struct{})
 	second := make(chan error, 1)
 	go func() {
-		close(secondStarted)
 		_, err := p.Register(t.Context(), nodeapi.RegisterRequest{
 			Version: nodeapi.Version, Node: "n1", Provider: config.ProviderFirecracker,
 			Deployment: deployment, Incarnation: "new", VCPU: 8, Memory: 32 * config.GiB,
 		})
 		second <- err
 	}()
-	<-secondStarted
+	waitFor(t, "the second registration to queue behind the first", func() bool {
+		return registrationCountForTest(p, "n1") == 2
+	})
 
 	select {
 	case err := <-second:
 		t.Fatalf("second registration crossed the first one's unfinished install: %v", err)
-	case <-time.After(25 * time.Millisecond):
+	default:
 	}
 
 	close(proceed)
@@ -279,6 +279,13 @@ func TestALateRegistrationCannotSupersedeTheNewerProcess(t *testing.T) {
 	if got := p.providerForTest("n1"); got != config.ProviderFirecracker {
 		t.Errorf("provider = %q, want the second serialized process's", got)
 	}
+}
+
+func registrationCountForTest(p *Plane, node string) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.registering[node]
 }
 
 func TestARegistrationDoesNotBlockAnotherNode(t *testing.T) {

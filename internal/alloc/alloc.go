@@ -1221,6 +1221,9 @@ func (a *Allocator) MarkFailure(ctx context.Context, leaseID string, epoch int64
 	if reason == "" {
 		return errors.New("alloc: a failure reason must not be empty")
 	}
+	if reason == inventoryAbsenceFailureReason {
+		return errors.New("alloc: that failure reason is reserved for inventory reconciliation")
+	}
 
 	return a.db.Tx(ctx, func(tx *sql.Tx) error {
 		lease, err := a.load(ctx, tx, leaseID, epoch)

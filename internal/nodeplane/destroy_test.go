@@ -407,22 +407,22 @@ func TestSameNodeRegistrationSerializesTheRealAllocatorCommit(t *testing.T) {
 	}()
 	<-reg.firstEntered
 
-	secondStarted := make(chan struct{})
 	second := make(chan error, 1)
 	go func() {
-		close(secondStarted)
 		_, err := p.Register(t.Context(), nodeapi.RegisterRequest{
 			Version: nodeapi.Version, Node: "holder", Provider: config.ProviderFirecracker,
 			Deployment: deployment, Incarnation: "holder-2", VCPU: 8, Memory: 32 * config.GiB,
 		})
 		second <- err
 	}()
-	<-secondStarted
+	waitFor(t, "the second registration to queue behind the first", func() bool {
+		return registrationCountForTest(p, "holder") == 2
+	})
 
 	select {
 	case <-reg.secondEntered:
 		t.Fatal("second registration reached the allocator before the first committed and installed")
-	case <-time.After(25 * time.Millisecond):
+	default:
 	}
 
 	close(reg.proceed)

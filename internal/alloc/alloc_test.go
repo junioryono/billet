@@ -183,6 +183,26 @@ func TestAFailureReasonSurvivesUntilJobHistory(t *testing.T) {
 	}
 }
 
+func TestExternalFailureCannotClaimInventoryProvenance(t *testing.T) {
+	a := newAllocator(t,
+		Limits{MaxVCPU: 4, MaxMemory: 16 * config.GiB},
+		[]config.Tier{tier("small", 2, 8*config.GiB)})
+	lease := reserve(t, a, "small")
+
+	if err := a.MarkFailure(
+		t.Context(), lease.ID, lease.Epoch, inventoryAbsenceFailureReason,
+	); err == nil {
+		t.Fatal("external failure claimed the marker reserved for inventory reconciliation")
+	}
+	current, err := a.Lease(t.Context(), lease.ID)
+	if err != nil {
+		t.Fatalf("Lease: %v", err)
+	}
+	if current.FailureReason != "" {
+		t.Fatalf("refused provenance marker was recorded as %q", current.FailureReason)
+	}
+}
+
 // Capacity is a vector. A tier can be blocked by memory while cores are free,
 // and treating either as "the" limit overcommits the other.
 func TestMemoryCanBindBeforeVCPU(t *testing.T) {

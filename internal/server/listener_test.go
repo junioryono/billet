@@ -2449,6 +2449,136 @@ func TestRestoredCompletionRetiresAfterAnIndependentTerminalOutcome(t *testing.T
 	}
 }
 
+func TestRestoredCompletionPreservesAForceReleasedOutcome(t *testing.T) {
+	now := time.Now().UTC()
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, tiers,
+		alloc.WithClock(func() time.Time { return now }), alloc.WithLeaseTTL(30*time.Second))
+	db := openState(t)
+	job := Job{RequestID: 78, RunID: 88, Result: "Succeeded", CompletionID: 28}
+	original := NewListener(a, tiers[0].Label, &fakeSession{}, WithCompletionStore(db))
+	lease := holdRunning(t, original, a, tiers[0].Label, job.RequestID)
+	nodeEpoch, err := a.RegisterNode(t.Context(), alloc.NodeRegistration{
+		Name: lease.TargetNode, Provider: lease.Providers[0],
+		VCPU: 1 << 20, Memory: 1 << 20 * config.GiB,
+	})
+	if err != nil {
+		t.Fatalf("refresh node registration: %v", err)
+	}
+	if err := a.Bind(t.Context(), lease.ID, lease.Epoch, lease.TargetNode); err != nil {
+		t.Fatalf("bind completion lease: %v", err)
+	}
+	lease.Node = lease.TargetNode
+	for _, phase := range []alloc.Phase{alloc.PhaseLaunching, alloc.PhaseOnline, alloc.PhaseBusy} {
+		if err := a.Advance(t.Context(), lease.ID, lease.Epoch, phase); err != nil {
+			t.Fatalf("advance completion lease to %s: %v", phase, err)
+		}
+	}
+	if _, err := original.recordCompletion(t.Context(), job); err != nil {
+		t.Fatalf("recordCompletion: %v", err)
+	}
+	now = now.Add(31 * time.Second)
+	if _, err := a.Reap(t.Context()); err != nil {
+		t.Fatalf("Reap: %v", err)
+	}
+	if _, err := a.ForceRelease(t.Context(), lease.ID); err != nil {
+		t.Fatalf("ForceRelease: %v", err)
+	}
+
+	runner := &absenceResolvingRunner{allocator: a, nodeEpoch: nodeEpoch}
+	restarted := NewListener(a, tiers[0].Label, &fakeSession{}, WithCompletionStore(db),
+		WithCleanupRetryPacing(0, 0), WithRunner(runner))
+	if err := restarted.restoreCompletions(t.Context()); err != nil {
+		t.Fatalf("restoreCompletions: %v", err)
+	}
+	restarted.retryCleanup(t.Context())
+	restarted.retryCleanup(t.Context())
+
+	pending, err := db.PendingCompletions(t.Context(), tiers[0].Label)
+	if err != nil {
+		t.Fatalf("PendingCompletions: %v", err)
+	}
+	if len(pending) != 1 || !pending[0].Retired {
+		t.Fatalf("force-released completion remained pending: %+v", pending)
+	}
+	if got := runner.calls.Load(); got != 1 {
+		t.Fatalf("force-released completion retried bound teardown %d times, want once", got)
+	}
+	outcomes, err := a.HistoryOutcomesForRequest(t.Context(), job.RequestID)
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+	if len(outcomes) != 1 || outcomes[0] != string(alloc.PhaseFailed) {
+		t.Fatalf("completion history = %v, want the operator's failed outcome preserved", outcomes)
+	}
+}
+
+func TestRestoredCompletionCorrectsProvisionalInventoryOutcome(t *testing.T) {
+	now := time.Now().UTC()
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, tiers,
+		alloc.WithClock(func() time.Time { return now }), alloc.WithLeaseTTL(30*time.Second))
+	db := openState(t)
+	job := Job{RequestID: 79, RunID: 89, Result: "Succeeded", CompletionID: 29}
+	original := NewListener(a, tiers[0].Label, &fakeSession{}, WithCompletionStore(db))
+	lease := holdRunning(t, original, a, tiers[0].Label, job.RequestID)
+	nodeEpoch, err := a.RegisterNode(t.Context(), alloc.NodeRegistration{
+		Name: lease.TargetNode, Provider: lease.Providers[0],
+		VCPU: 1 << 20, Memory: 1 << 20 * config.GiB,
+	})
+	if err != nil {
+		t.Fatalf("refresh node registration: %v", err)
+	}
+	if err := a.Bind(t.Context(), lease.ID, lease.Epoch, lease.TargetNode); err != nil {
+		t.Fatalf("bind completion lease: %v", err)
+	}
+	lease.Node = lease.TargetNode
+	for _, phase := range []alloc.Phase{alloc.PhaseLaunching, alloc.PhaseOnline, alloc.PhaseBusy} {
+		if err := a.Advance(t.Context(), lease.ID, lease.Epoch, phase); err != nil {
+			t.Fatalf("advance completion lease to %s: %v", phase, err)
+		}
+	}
+	if _, err := original.recordCompletion(t.Context(), job); err != nil {
+		t.Fatalf("recordCompletion: %v", err)
+	}
+	now = now.Add(31 * time.Second)
+	if _, err := a.Reap(t.Context()); err != nil {
+		t.Fatalf("Reap: %v", err)
+	}
+	now = now.Add(11 * time.Minute)
+	if freed, err := a.ResolveQuarantineFor(
+		t.Context(), lease.TargetNode, nil, nodeEpoch); err != nil || freed != 1 {
+		t.Fatalf("inventory reconciliation: freed=%d err=%v", freed, err)
+	}
+
+	runner := &absenceResolvingRunner{allocator: a, nodeEpoch: nodeEpoch}
+	restarted := NewListener(a, tiers[0].Label, &fakeSession{}, WithCompletionStore(db),
+		WithCleanupRetryPacing(0, 0), WithRunner(runner))
+	if err := restarted.restoreCompletions(t.Context()); err != nil {
+		t.Fatalf("restoreCompletions: %v", err)
+	}
+	restarted.retryCleanup(t.Context())
+	restarted.retryCleanup(t.Context())
+
+	pending, err := db.PendingCompletions(t.Context(), tiers[0].Label)
+	if err != nil {
+		t.Fatalf("PendingCompletions: %v", err)
+	}
+	if len(pending) != 1 || !pending[0].Retired {
+		t.Fatalf("inventory-settled completion remained pending: %+v", pending)
+	}
+	if got := runner.calls.Load(); got != 1 {
+		t.Fatalf("inventory-settled completion retried bound teardown %d times, want once", got)
+	}
+	outcomes, err := a.HistoryOutcomesForRequest(t.Context(), job.RequestID)
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+	if len(outcomes) != 1 || outcomes[0] != string(alloc.PhaseDone) {
+		t.Fatalf("completion history = %v, want authoritative done outcome", outcomes)
+	}
+}
+
 func TestCompletionDoesNotReleaseUntilReleaseOnlyTransitionIsDurable(t *testing.T) {
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
 	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 32 * config.GiB}, tiers)

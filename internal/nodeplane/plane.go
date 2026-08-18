@@ -574,7 +574,7 @@ type Registrar interface {
 
 	// ResolveQuarantineForCompletion settles one absent lease with GitHub's
 	// authoritative outcome. The node epoch and registration intent fence the
-	// inventory snapshot; the lease epoch preserves an independent terminal outcome.
+	// inventory snapshot; the lease epoch fences its stored capacity obligation.
 	ResolveQuarantineForCompletion(
 		ctx context.Context, node, leaseID string, nodeEpoch, leaseEpoch int64,
 		outcome alloc.Phase,

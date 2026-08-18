@@ -510,6 +510,15 @@ func TestCompletionAbsenceKeepsItsOutcomeAcrossInventoryOrdering(t *testing.T) {
 					t.Context(), "epyc-1", nil, epoch); err != nil || freed != 1 {
 					t.Fatalf("inventory reconciliation: freed=%d err=%v", freed, err)
 				}
+				var reason string
+				if err := a.db.Reader().QueryRowContext(t.Context(),
+					`SELECT failure_reason FROM job_history WHERE lease_id = ?`, lease.ID).
+					Scan(&reason); err != nil {
+					t.Fatalf("read provisional history reason: %v", err)
+				}
+				if reason != inventoryAbsenceFailureReason {
+					t.Fatalf("provisional history reason = %q, want inventory provenance", reason)
+				}
 			}
 			settled, err := a.ResolveQuarantineForCompletion(
 				t.Context(), "epyc-1", lease.ID, epoch, lease.Epoch, PhaseDone)
@@ -525,6 +534,27 @@ func TestCompletionAbsenceKeepsItsOutcomeAcrossInventoryOrdering(t *testing.T) {
 			}
 			if len(got) != 1 || got[0] != string(PhaseDone) {
 				t.Fatalf("completion history = %v, want done", got)
+			}
+			var reason string
+			if err := a.db.Reader().QueryRowContext(t.Context(),
+				`SELECT failure_reason FROM job_history WHERE lease_id = ?`, lease.ID).
+				Scan(&reason); err != nil {
+				t.Fatalf("read completion history reason: %v", err)
+			}
+			if reason != "" {
+				t.Fatalf("corrected completion retained provisional failure reason %q", reason)
+			}
+			var (
+				phase       string
+				leaseReason string
+			)
+			if err := a.db.Reader().QueryRowContext(t.Context(),
+				`SELECT phase, failure_reason FROM leases WHERE id = ?`, lease.ID).
+				Scan(&phase, &leaseReason); err != nil {
+				t.Fatalf("read corrected completion lease: %v", err)
+			}
+			if phase != string(PhaseDone) || leaseReason != "" {
+				t.Fatalf("corrected lease = phase %q reason %q, want done with no failure", phase, leaseReason)
 			}
 		})
 	}
@@ -552,5 +582,34 @@ func TestCompletionAbsencePreservesAnIndependentTerminalOutcome(t *testing.T) {
 	}
 	if len(got) != 1 || got[0] != string(PhaseFailed) {
 		t.Fatalf("completion history = %v, want the independent failed outcome preserved", got)
+	}
+}
+
+func TestCompletionAbsencePreservesAForceReleasedOutcome(t *testing.T) {
+	now := time.Now().UTC()
+	a := quarantineFleet(t, &now)
+	lease := busyLease(t, a)
+	now = now.Add(31 * time.Second)
+	if _, err := a.Reap(t.Context()); err != nil {
+		t.Fatalf("Reap: %v", err)
+	}
+	if _, err := a.ForceRelease(t.Context(), lease.ID); err != nil {
+		t.Fatalf("ForceRelease: %v", err)
+	}
+
+	settled, err := a.ResolveQuarantineForCompletion(
+		t.Context(), "epyc-1", lease.ID, nodeEpoch(t, a), lease.Epoch, PhaseDone)
+	if err != nil {
+		t.Fatalf("ResolveQuarantineForCompletion: %v", err)
+	}
+	if !settled {
+		t.Fatal("force-released lease still consumes no capacity")
+	}
+	got, err := a.HistoryOutcomesForRequest(t.Context(), 1)
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+	if len(got) != 1 || got[0] != string(PhaseFailed) {
+		t.Fatalf("completion history = %v, want the operator's failed outcome preserved", got)
 	}
 }
