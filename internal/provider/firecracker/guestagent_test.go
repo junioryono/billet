@@ -166,6 +166,55 @@ func TestTheGuestMountsDockerStateBeforeStartingTheDaemon(t *testing.T) {
 	}
 }
 
+// THE PRIVILEGE DROP IS NOT A LOGIN. systemd starts the agent as root and setpriv
+// changes ids without constructing the runner account's environment, so these
+// values must cross the same env argv that carries the registration and tool cache.
+func TestTheGuestAgentEstablishesTheRunnerAccountEnvironment(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join("..", "..", "..", "scripts", "build-guest-image.sh")
+	source, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read guest image builder: %v", err)
+	}
+	text := string(source)
+
+	const begin = "runner_env=(\n"
+	const end = ")\nif [ -n \"$cache_endpoint\" ]"
+	if strings.Count(text, begin) != 1 || strings.Count(text, end) != 1 {
+		t.Fatal("the guest agent's base runner environment is no longer uniquely extractable")
+	}
+	_, after, _ := strings.Cut(text, begin)
+	body, _, _ := strings.Cut(after, end)
+	block := begin + body + ")\n"
+
+	if !strings.Contains(text, `env "${runner_env[@]}" "${cmd[@]}"`) {
+		t.Fatal("the runner environment is built but not passed through the privilege drop")
+	}
+
+	script := `
+set -euo pipefail
+ACTIONS_RUNNER_INPUT_JITCONFIG=fixture
+` + block + `
+env -i "${runner_env[@]}" bash -c 'printf "%s\0" "${HOME-}" "${USER-}" "${LOGNAME-}" "${RUNNER_TOOL_CACHE-}" "${AGENT_TOOLSDIRECTORY-}"'
+`
+	run := exec.CommandContext(t.Context(), "bash", "-c", script)
+	out, err := run.Output()
+	if err != nil {
+		t.Fatalf("run the extracted runner environment: %v", err)
+	}
+	fields := bytes.Split(bytes.TrimSuffix(out, []byte{0}), []byte{0})
+	want := []string{"/home/runner", "runner", "runner", "/opt/hostedtoolcache", "/opt/hostedtoolcache"}
+	if len(fields) != len(want) {
+		t.Fatalf("the runner environment has %d fields, want %d: %q", len(fields), len(want), out)
+	}
+	for i, value := range fields {
+		if string(value) != want[i] {
+			t.Errorf("runner environment field %d = %q, want %q", i, value, want[i])
+		}
+	}
+}
+
 func TestTheGuestImageIncludesBuildxForThePersistentBuilder(t *testing.T) {
 	t.Parallel()
 

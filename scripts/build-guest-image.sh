@@ -807,9 +807,15 @@ cd /home/runner/runner
 # a runtime the image already contains. Nothing would report that: the job would
 # simply be slower.
 #
-# setpriv does not preserve it either, which is why it is named here explicitly.
+# setpriv does not create a login environment either. HOME, USER and LOGNAME are
+# part of the runner-account contract, not conveniences: actions/setup-go can
+# install a toolchain without them and then Go refuses to start because it has no
+# user cache directory. The EC2 image entrypoint establishes the same three values.
 runner_env=(
 	"ACTIONS_RUNNER_INPUT_JITCONFIG=$ACTIONS_RUNNER_INPUT_JITCONFIG"
+	"HOME=/home/runner"
+	"USER=runner"
+	"LOGNAME=runner"
 	"RUNNER_TOOL_CACHE=/opt/hostedtoolcache"
 	"AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache"
 )
