@@ -41,6 +41,7 @@
         billet_recovery_restore_inputs: "{{ billet_host_recovery_tasks | selectattr('name', 'equalto', 'Restore configuration and units that existed before the upgrade') | first }}"
         billet_recovery_candidate_links: "{{ billet_host_recovery_tasks | selectattr('name', 'equalto', 'Remove candidate persistent and runtime enablement links') | first }}"
         billet_service_link_guard: "{{ billet_host_service_tasks | selectattr('name', 'equalto', 'Refuse service link states rollback cannot reproduce exactly') | first }}"
+        billet_legacy_transient_guard: "{{ billet_host_recovery_dispatch_tasks | selectattr('name', 'equalto', 'Refuse rollback of a legacy transient service definition') | first }}"
 
     - name: Render legacy-compatible and transactional units
       ansible.builtin.set_fact:
@@ -164,6 +165,10 @@
           - billet_recovery_names.index('Durably publish the rollback commit before opening administration') < billet_recovery_names.index('Finalize the committed host rollback')
           - billet_recovery_dispatch_names.index('Inspect whether the durable host transaction already committed') < billet_recovery_dispatch_names.index('Finish a committed host transaction without rolling it back')
           - billet_recovery_dispatch_names.index('Finish a committed host transaction without rolling it back') < billet_recovery_dispatch_names.index('Roll back an uncommitted host transaction')
+          - billet_recovery_dispatch_names.index('Finish a committed host transaction without rolling it back') < billet_recovery_dispatch_names.index('Refuse rollback of a legacy transient service definition')
+          - billet_recovery_dispatch_names.index('Refuse rollback of a legacy transient service definition') < billet_recovery_dispatch_names.index('Roll back an uncommitted host transaction')
+          - "'not billet_upgrade_commit_state.stat.exists' in (billet_legacy_transient_guard.when | string)"
+          - "'transient' in (billet_legacy_transient_guard['ansible.builtin.assert'].that | join(' '))"
           - "'item.1.rc == 0' in (billet_recovery_stop_proof['ansible.builtin.assert'].that | join(' '))"
           - "'item.1.rc == 1' in (billet_recovery_stop_proof['ansible.builtin.assert'].that | join(' '))"
           - "'not found.' in (billet_recovery_stop_proof['ansible.builtin.assert'].that | join(' '))"

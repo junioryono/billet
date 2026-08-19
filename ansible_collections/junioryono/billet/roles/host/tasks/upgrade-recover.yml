@@ -20,6 +20,18 @@
   ansible.builtin.include_tasks: upgrade-finalize.yml
   when: billet_upgrade_commit_state.stat.exists
 
+- name: Refuse rollback of a legacy transient service definition
+  ansible.builtin.assert:
+    that:
+      - billet_upgrade_manifest.server_enablement != 'transient'
+      - billet_upgrade_manifest.node_enablement != 'transient'
+    fail_msg: >-
+      This uncommitted legacy journal records a transient service whose
+      in-memory unit definition cannot be reconstructed. Leave its fence and
+      pointer intact for manual recovery. Committed journals can still finish
+      because finalization does not restore the previous unit definition.
+  when: not billet_upgrade_commit_state.stat.exists
+
 - name: Roll back an uncommitted host transaction
   ansible.builtin.include_tasks: upgrade-rollback.yml
   when: not billet_upgrade_commit_state.stat.exists
