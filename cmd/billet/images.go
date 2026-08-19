@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -67,10 +68,18 @@ func cmdImagesCompatible(ctx context.Context, args []string) error {
 	fs := newFlagSet("billet images compatible")
 	cfgPath := addConfigFlag(fs)
 	wait := fs.Duration("wait", 3*time.Minute, "how long to give an unrecorded guest to prove itself")
+	resultFile := fs.String("result-file", "",
+		"write the bare names of floating images that need replacement here")
 
 	rest, err := parseWithName(fs, args)
 	if err != nil {
 		return err
+	}
+	if *resultFile != "" {
+		if err := os.Remove(*resultFile); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("billet images compatible: cannot clear stale result file %s: %w",
+				*resultFile, err)
+		}
 	}
 
 	cfg, err := config.Load(*cfgPath)
@@ -82,14 +91,47 @@ func cmdImagesCompatible(ctx context.Context, args []string) error {
 		return errors.New("billet images compatible: this config names no ceph cluster")
 	}
 
-	image := rest
-	if image == "" {
-		image = firecrackerTierImage(cfg)
+	images := []string{rest}
+	if rest == "" {
+		images = firecrackerTierImages(cfg)
 	}
-	if image == "" {
+	if len(images) == 0 {
 		return errors.New("billet images compatible: no image given and no firecracker tier names one")
 	}
 
+	refresh := make([]string, 0, len(images))
+	for _, image := range images {
+		err := checkImageCompatible(ctx, cfg, *cfgPath, image, *wait)
+		if err == nil {
+			continue
+		}
+		if exitStatus(err) != 2 {
+			return err
+		}
+
+		name, _, _ := strings.Cut(image, "@")
+		refresh = append(refresh, name)
+		fmt.Println(err)
+	}
+
+	if len(refresh) == 0 {
+		return nil
+	}
+	if *resultFile != "" {
+		if err := writeImageResults(*resultFile, refresh); err != nil {
+			return err
+		}
+	}
+
+	return &exitError{code: 2, msg: fmt.Sprintf("%d configured guest image(s) need a compatible generation", len(refresh))}
+}
+
+func checkImageCompatible(
+	ctx context.Context,
+	cfg *config.Config,
+	cfgPath, image string,
+	wait time.Duration,
+) error {
 	name, generation, found := strings.Cut(image, "@")
 	if !found || name == "" || generation == "" {
 		return fmt.Errorf("billet images compatible: %q does not name an exact generation or @%s",
@@ -170,7 +212,7 @@ func cmdImagesCompatible(ctx context.Context, args []string) error {
 	// real boot is cheaper than a multi-gigabyte replacement and produces the fact
 	// future upgrades can read without booting again.
 	if err := cmdImagesVerify(ctx, []string{
-		"--config", *cfgPath,
+		"--config", cfgPath,
 		"--wait", wait.String(),
 		exact,
 	}); err != nil {
@@ -293,15 +335,31 @@ func cmdImagesDue(ctx context.Context, args []string) error {
 // failure, which is why it carries a status of its own.
 var errNothingToBuild = &exitError{code: 2, msg: "a recent generation already exists"}
 
-// firecrackerTierImage is the image this deployment's microVM tiers boot.
+// firecrackerTierImage is the first image this deployment's microVM tiers boot.
 func firecrackerTierImage(cfg *config.Config) string {
-	for i := range cfg.Tiers {
-		if image := cfg.Tiers[i].ImageFor(config.ProviderFirecracker); cfg.Tiers[i].AcceptsProvider(config.ProviderFirecracker) && image != "" {
-			return image
-		}
+	images := firecrackerTierImages(cfg)
+	if len(images) > 0 {
+		return images[0]
 	}
 
 	return ""
+}
+
+// firecrackerTierImages are the distinct images this deployment's microVM tiers boot.
+func firecrackerTierImages(cfg *config.Config) []string {
+	images := make([]string, 0, len(cfg.Tiers))
+	seen := map[string]bool{}
+
+	for i := range cfg.Tiers {
+		if image := cfg.Tiers[i].ImageFor(config.ProviderFirecracker); cfg.Tiers[i].AcceptsProvider(config.ProviderFirecracker) && image != "" {
+			if !seen[image] {
+				images = append(images, image)
+				seen[image] = true
+			}
+		}
+	}
+
+	return images
 }
 
 // cmdImagesVerify boots one microVM from an image and makes the guest prove it works.
@@ -967,7 +1025,8 @@ func cmdImagesPromote(ctx context.Context, args []string, verified bool) error {
 func cmdImagesReap(ctx context.Context, args []string) error {
 	fs := newFlagSet("billet images reap")
 	cfgPath := addConfigFlag(fs)
-	keep := fs.Int("keep", 3, "how many VERIFIED generations to leave, newest first")
+	keep := fs.Int("keep", 3,
+		"how many VERIFIED generations to leave per guest contract, newest first")
 	dryRun := fs.Bool("dry-run", false, "print what would be removed and remove nothing")
 	kernelDir := fs.String("kernel-dir", "",
 		"where pulled kernels are kept; orphans there are reaped too (default: node config)")
@@ -1010,6 +1069,11 @@ func cmdImagesReap(ctx context.Context, args []string) error {
 		return err
 	}
 
+	contracts, err := store.GenerationGuestContracts(ctx, image)
+	if err != nil {
+		return err
+	}
+
 	// EVERY TIER'S IMAGE, not just the one being reaped: a deployment can pin
 	// several, and a generation kept for one tier is kept.
 	pinned := make([]string, 0, len(cfg.Tiers))
@@ -1019,7 +1083,8 @@ func cmdImagesReap(ctx context.Context, args []string) error {
 		}
 	}
 
-	plan := ceph.PlanReap(all, verified, ceph.Retention{Keep: *keep, Pinned: pinned})
+	plan := ceph.PlanReap(all, verified, contracts,
+		ceph.Retention{Keep: *keep, Pinned: pinned})
 
 	for _, item := range plan {
 		if item.Reason != "" {

@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/provider/firecracker"
 )
 
@@ -117,5 +118,44 @@ func TestVerifiedImageIsWithdrawnWhenItsRollbackHandleCannotBeWritten(t *testing
 	}
 	if !withdrawn {
 		t.Fatal("the verified generation remained promoted without a rollback handle")
+	}
+}
+
+func TestEveryDistinctConfiguredFirecrackerImageIsChecked(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{Tiers: []config.Tier{
+		{Provider: config.ProviderFirecracker, Image: "ubuntu-2404-x64@verified"},
+		{Providers: []config.ProviderKind{config.ProviderFirecracker, config.ProviderEC2},
+			Launch: map[config.ProviderKind]config.TierLaunch{
+				config.ProviderFirecracker: {Image: "ubuntu-2404-arm64@verified"},
+				config.ProviderEC2:         {Image: "ami-123"},
+			}},
+		{Provider: config.ProviderFirecracker, Image: "ubuntu-2404-x64@verified"},
+		{Provider: config.ProviderDocker, Image: "golang:1.25"},
+	}}
+
+	want := []string{"ubuntu-2404-x64@verified", "ubuntu-2404-arm64@verified"}
+	got := firecrackerTierImages(cfg)
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("configured firecracker images = %v, want %v", got, want)
+	}
+}
+
+func TestImageResultCanRecordEveryConfiguredRefresh(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "refreshes")
+	want := []string{"ubuntu-2404-x64", "ubuntu-2404-arm64"}
+	if err := writeImageResults(path, want); err != nil {
+		t.Fatalf("write refresh result: %v", err)
+	}
+
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read refresh result: %v", err)
+	}
+	if string(body) != strings.Join(want, "\n")+"\n" {
+		t.Fatalf("refresh result = %q, want one image per line", body)
 	}
 }

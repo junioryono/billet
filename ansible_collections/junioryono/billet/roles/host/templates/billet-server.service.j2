@@ -10,8 +10,6 @@ User={{ billet_service_user }}
 Group={{ billet_service_group }}
 UMask=0077
 ExecStart=/usr/bin/billet server --config /etc/billet/billet.yaml
-StateDirectory=billet/server
-StateDirectoryMode=0700
 TimeoutStopSec=88200
 KillSignal=SIGTERM
 KillMode=mixed
@@ -32,6 +30,7 @@ SystemCallArchitectures=native
 SystemCallFilter=@system-service
 CapabilityBoundingSet=
 ReadOnlyPaths=/etc/billet
+ReadWritePaths="{{ billet_config.get('server', {}).get('state_dir', '/var/lib/billet/server') }}"
 
 [Install]
 WantedBy=multi-user.target

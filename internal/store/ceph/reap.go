@@ -11,7 +11,8 @@ import (
 
 // Retention says which generations survive a reap.
 type Retention struct {
-	// Keep is how many VERIFIED generations to leave behind, newest first.
+	// Keep is how many VERIFIED generations per guest contract to leave behind,
+	// newest first.
 	//
 	// A COUNT RATHER THAN AN AGE, because the reason to keep more than the current
 	// one is rollback: the newest may turn out bad after it has been promoted, and
@@ -26,6 +27,13 @@ type Retention struct {
 // Reapable is one generation and why it is being removed, or kept.
 type Reapable struct {
 	Generation Generation
+	// Verified records the verification state the plan was built from. Reap uses
+	// it to distinguish a deliberately expired verified generation from one that
+	// became verified after the plan was made.
+	Verified bool
+	// Contract is the guest contract recorded when the plan was built. A
+	// compatibility boot may backfill it before Reap takes the publish lock.
+	Contract string
 	// Reason is why this generation is being kept, empty when it is not.
 	Reason string
 }
@@ -42,7 +50,12 @@ type Reapable struct {
 // 0, and the child stays usable — so a running job is never disturbed by this.
 // Retention is about what might still be BOOTED, not about what is in use, which is
 // why there is no liveness check here to get wrong.
-func PlanReap(all []Generation, verified map[string]bool, keep Retention) []Reapable {
+func PlanReap(
+	all []Generation,
+	verified map[string]bool,
+	contracts map[string]string,
+	keep Retention,
+) []Reapable {
 	sorted := append([]Generation(nil), all...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Built.After(sorted[j].Built) })
 
@@ -59,31 +72,49 @@ func PlanReap(all []Generation, verified map[string]bool, keep Retention) []Reap
 	}
 
 	plan := make([]Reapable, 0, len(sorted))
-	kept := 0
+	keptByContract := map[string]int{}
 
 	for _, gen := range sorted {
+		contract := contracts[gen.Name]
+		item := Reapable{
+			Generation: gen,
+			Verified:   verified[gen.Name],
+			Contract:   contract,
+		}
+
 		switch {
 		case pinned[gen.Name]:
 			// A TIER SAYS IT BOOTS THIS ONE. Whether it was ever verified is not the
 			// question: somebody chose it, and the choice outranks this.
-			plan = append(plan, Reapable{Generation: gen, Reason: "a tier pins it"})
+			item.Reason = "a tier pins it"
 
-		case verified[gen.Name] && kept < keep.Keep:
-			kept++
+		case verified[gen.Name] && keptByContract[contract] < keep.Keep:
+			keptByContract[contract]++
 
 			reason := "verified, and it is what @" + Verified + " resolves to"
-			if kept > 1 {
-				reason = fmt.Sprintf("verified, and kept as rollback %d of %d", kept-1, keep.Keep-1)
+			if contract != "" {
+				reason += " for guest contract " + contract
+			}
+			if keptByContract[contract] > 1 {
+				reason = fmt.Sprintf("verified, and kept as rollback %d of %d for guest contract %s",
+					keptByContract[contract]-1, keep.Keep-1, printableContract(contract))
 			}
 
-			plan = append(plan, Reapable{Generation: gen, Reason: reason})
-
-		default:
-			plan = append(plan, Reapable{Generation: gen})
+			item.Reason = reason
 		}
+
+		plan = append(plan, item)
 	}
 
 	return plan
+}
+
+func printableContract(contract string) string {
+	if contract == "" {
+		return "legacy/unrecorded"
+	}
+
+	return contract
 }
 
 // Reap removes the generations a plan does not keep, oldest first.
@@ -142,6 +173,10 @@ func (c *Client) Reap( //nolint:nonamedreturns // the deferred release reports t
 	if err != nil {
 		return nil, err
 	}
+	contractsNow, err := c.GenerationGuestContracts(ctx, name)
+	if err != nil {
+		return nil, err
+	}
 
 	doomed := make([]Generation, 0, len(plan))
 
@@ -150,10 +185,16 @@ func (c *Client) Reap( //nolint:nonamedreturns // the deferred release reports t
 			continue
 		}
 
-		if verifiedNow[item.Generation.Name] {
+		if verifiedNow[item.Generation.Name] && !item.Verified {
 			// VERIFIED SINCE THE PLAN WAS MADE. Skipped rather than reported as an
 			// error: the reap did the right thing with what it knew, and the operator
 			// asked for generations nothing needs -- this one is now needed.
+			continue
+		}
+		if contractsNow[item.Generation.Name] != item.Contract {
+			// A COMPATIBILITY BOOT BACKFILLED ITS CONTRACT AFTER PLANNING. The
+			// retention buckets changed, so only a fresh plan can decide whether it
+			// is still beyond the rollback depth for its now-known contract.
 			continue
 		}
 
@@ -236,6 +277,45 @@ func (c *Client) VerifiedGenerations(ctx context.Context, image string) (map[str
 	}
 
 	return verified, nil
+}
+
+// GenerationGuestContracts is the recorded guest contract of each generation.
+func (c *Client) GenerationGuestContracts(
+	ctx context.Context,
+	image string,
+) (map[string]string, error) {
+	name, _, _ := strings.Cut(strings.TrimSpace(image), "@")
+	if name == "" {
+		return nil, fmt.Errorf("ceph: no image to read guest contracts of")
+	}
+
+	out, err := c.rbdCmd(ctx, false, "-p", c.cfg.ImagePool, "image-meta", "list", name)
+	if err != nil {
+		if isNoSuchFile(err) {
+			return map[string]string{}, nil
+		}
+
+		return nil, fmt.Errorf("ceph: read the guest contracts of %s/%s: %w",
+			c.cfg.ImagePool, name, err)
+	}
+
+	contracts := map[string]string{}
+	for _, line := range strings.Split(string(out), "\n") {
+		key, value, ok := strings.Cut(strings.TrimSpace(line), " ")
+		if !ok {
+			continue
+		}
+
+		generation, isContract := strings.CutPrefix(key, GuestContractKey+".")
+		if !isContract {
+			continue
+		}
+		if _, isGeneration := ParseGeneration(generation); isGeneration {
+			contracts[generation] = strings.TrimSpace(value)
+		}
+	}
+
+	return contracts, nil
 }
 
 // Generations lists every generation billet published of an image.

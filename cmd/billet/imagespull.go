@@ -71,6 +71,8 @@ func cmdImagesPull(ctx context.Context, args []string) error {
 		"boot the imported generation and promote it only after the guest proves it works")
 	resultFile := fs.String("result-file", "",
 		"write the exact imported generation here after every requested verification succeeds")
+	rollbackFile := fs.String("rollback-file", "",
+		"write the exact imported generation here before verification or promotion")
 	signingIdentity := fs.String("signing-identity", "",
 		"certificate SAN pattern a valid signature must carry (for a non-default source)")
 	signingIssuer := fs.String("signing-issuer", "",
@@ -89,6 +91,12 @@ func cmdImagesPull(ctx context.Context, args []string) error {
 				*resultFile, err)
 		}
 	}
+	if *rollbackFile != "" {
+		if err := os.Remove(*rollbackFile); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("billet images pull: cannot clear stale rollback file %s: %w",
+				*rollbackFile, err)
+		}
+	}
 
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
@@ -102,7 +110,14 @@ func cmdImagesPull(ctx context.Context, args []string) error {
 
 	image := rest
 	if image == "" {
-		image = firecrackerTierImage(cfg)
+		configured := firecrackerTierImages(cfg)
+		if len(configured) > 1 {
+			return fmt.Errorf("billet images pull: this deployment names %d distinct firecracker images; give the bare image name to refresh explicitly",
+				len(configured))
+		}
+		if len(configured) == 1 {
+			image = configured[0]
+		}
 		if name, generation, found := strings.Cut(image, "@"); found && generation == ceph.Verified {
 			// A TIER NAMING @verified IS THE ORDINARY AUTOMATIC-UPDATE SHAPE. The pull
 			// publishes a new generation of that image and verification advances the
@@ -193,6 +208,11 @@ func cmdImagesPull(ctx context.Context, args []string) error {
 	fmt.Printf("\npublished %s@%s (runner %s, kernel %s)\n",
 		image, generation, manifest.RunnerVersion, manifest.Kernel.Version)
 	exact := image + "@" + generation
+	if *rollbackFile != "" {
+		if err := writeImageResult(*rollbackFile, exact); err != nil {
+			return err
+		}
+	}
 
 	if *verify {
 		fmt.Printf("\nboot-verifying %s before promotion\n", exact)
@@ -236,6 +256,10 @@ func writeVerifiedImageResult(path, image string, withdraw func() error) error {
 }
 
 func writeImageResult(path, image string) error {
+	return writeImageResults(path, []string{image})
+}
+
+func writeImageResults(path string, images []string) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("billet images pull: cannot create the result directory %s: %w", dir, err)
@@ -253,10 +277,12 @@ func writeImageResult(path, image string) error {
 
 		return fmt.Errorf("billet images pull: cannot protect the staged result: %w", err)
 	}
-	if _, err := fmt.Fprintln(tmp, image); err != nil {
-		_ = tmp.Close()
+	for _, image := range images {
+		if _, err := fmt.Fprintln(tmp, image); err != nil {
+			_ = tmp.Close()
 
-		return fmt.Errorf("billet images pull: cannot write the staged result: %w", err)
+			return fmt.Errorf("billet images pull: cannot write the staged result: %w", err)
+		}
 	}
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("billet images pull: cannot close the staged result: %w", err)

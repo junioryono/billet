@@ -52,7 +52,7 @@ func TestTheGenerationVerifiedMostRecentlySurvives(t *testing.T) {
 	all := gens("g20260101000000", "g20260601000000", "g20260814145813")
 	verified := map[string]bool{"g20260814145813": true}
 
-	plan := PlanReap(all, verified, Retention{Keep: 1})
+	plan := PlanReap(all, verified, map[string]string{}, Retention{Keep: 1})
 
 	if _, ok := kept(plan)["g20260814145813"]; !ok {
 		t.Fatal("the generation @verified resolves to was reaped, which strands every tier " +
@@ -71,7 +71,7 @@ func TestAPinnedGenerationSurvivesEvenUnverified(t *testing.T) {
 	all := gens("g20260101000000", "g20260601000000", "g20260814145813")
 	verified := map[string]bool{"g20260814145813": true}
 
-	plan := PlanReap(all, verified, Retention{
+	plan := PlanReap(all, verified, map[string]string{}, Retention{
 		Keep:   1,
 		Pinned: []string{"ubuntu-2404-x64@g20260101000000"},
 	})
@@ -106,7 +106,7 @@ func TestRollbackDepthCountsOnlyVerifiedGenerations(t *testing.T) {
 		"g20260809000000": true,
 	}
 
-	plan := PlanReap(all, verified, Retention{Keep: 3})
+	plan := PlanReap(all, verified, map[string]string{}, Retention{Keep: 3})
 
 	survived := kept(plan)
 	for _, want := range []string{"g20260814145813", "g20260812000000", "g20260810000000"} {
@@ -141,7 +141,7 @@ func TestRetentionIsByBuildTimeNotListOrder(t *testing.T) {
 		"g20260601000000": true,
 	}
 
-	plan := PlanReap(all, verified, Retention{Keep: 1})
+	plan := PlanReap(all, verified, map[string]string{}, Retention{Keep: 1})
 
 	if _, ok := kept(plan)["g20260814145813"]; !ok {
 		t.Error("the newest verified generation was not the one kept")
@@ -149,6 +149,60 @@ func TestRetentionIsByBuildTimeNotListOrder(t *testing.T) {
 
 	if got := doomed(plan); len(got) != 2 {
 		t.Errorf("kept %d generations against Keep: 1", len(all)-len(got))
+	}
+}
+
+// ROLLING FLEETS NEED ONE ROLLBACK CHAIN PER GUEST CONTRACT.
+//
+// Publishing a generation for a new binary must not make the last generation an
+// older binary can boot eligible for collection. Both binaries may be running
+// during an ordinary host-by-host upgrade.
+func TestRetentionKeepsVerifiedGenerationsPerGuestContract(t *testing.T) {
+	t.Parallel()
+
+	all := gens(
+		"g20260814145813", // contract 7, newest overall
+		"g20260813000000", // contract 6, newest that old nodes can boot
+		"g20260812000000", // contract 7 rollback
+		"g20260811000000", // contract 6 rollback
+	)
+	verified := map[string]bool{
+		"g20260814145813": true,
+		"g20260813000000": true,
+		"g20260812000000": true,
+		"g20260811000000": true,
+	}
+	contracts := map[string]string{
+		"g20260814145813": "7",
+		"g20260813000000": "6",
+		"g20260812000000": "7",
+		"g20260811000000": "6",
+	}
+
+	plan := PlanReap(all, verified, contracts, Retention{Keep: 1})
+	survived := kept(plan)
+
+	for _, want := range []string{"g20260814145813", "g20260813000000"} {
+		if _, ok := survived[want]; !ok {
+			t.Errorf("%s is the newest verified generation for its guest contract and was reaped", want)
+		}
+	}
+	for _, want := range []string{"g20260812000000", "g20260811000000"} {
+		if _, ok := survived[want]; ok {
+			t.Errorf("%s exceeded the per-contract Keep: 1 retention", want)
+		}
+	}
+}
+
+func TestReapableRemembersWhetherVerificationExistedAtPlanTime(t *testing.T) {
+	t.Parallel()
+
+	gen := gens("g20260814145813")[0]
+	plan := PlanReap([]Generation{gen}, map[string]bool{gen.Name: true},
+		map[string]string{gen.Name: "6"}, Retention{Keep: 0})
+
+	if len(plan) != 1 || !plan[0].Verified || plan[0].Reason != "" {
+		t.Fatalf("plan = %#v, want a deliberately expired verified generation", plan)
 	}
 }
 
@@ -163,7 +217,7 @@ func TestAnUnverifiedImageStillKeepsWhatIsPinned(t *testing.T) {
 
 	all := gens("g20260101000000", "g20260814145813")
 
-	plan := PlanReap(all, map[string]bool{}, Retention{
+	plan := PlanReap(all, map[string]bool{}, map[string]string{}, Retention{
 		Keep:   3,
 		Pinned: []string{"ubuntu-2404-x64@g20260814145813"},
 	})
@@ -183,7 +237,7 @@ func TestTheVerifiedAliasIsNotTreatedAsAPin(t *testing.T) {
 
 	all := gens("g20260814145813")
 
-	plan := PlanReap(all, map[string]bool{}, Retention{
+	plan := PlanReap(all, map[string]bool{}, map[string]string{}, Retention{
 		Keep:   0,
 		Pinned: []string{"ubuntu-2404-x64@" + Verified},
 	})
