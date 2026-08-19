@@ -53,7 +53,7 @@ permissions:
 
 jobs:
   candidate-identity:
-    runs-on: [self-hosted, "${{ inputs.runner_label }}"]
+    runs-on: ${{ inputs.runner_label }}
     timeout-minutes: 30
     steps:
       - name: Refuse a non-billet runner or the wrong candidate image
@@ -88,7 +88,7 @@ jobs:
 
   save-host:
     needs: candidate-identity
-    runs-on: [self-hosted, "${{ inputs.runner_label }}"]
+    runs-on: ${{ inputs.runner_label }}
     timeout-minutes: 30
     steps:
       - name: Refuse a non-billet runner
@@ -116,7 +116,7 @@ jobs:
 
   restore-host:
     needs: save-host
-    runs-on: [self-hosted, "${{ inputs.runner_label }}"]
+    runs-on: ${{ inputs.runner_label }}
     timeout-minutes: 30
     steps:
       - name: Refuse a non-billet runner
@@ -143,7 +143,7 @@ jobs:
 
   save-container:
     needs: candidate-identity
-    runs-on: [self-hosted, "${{ inputs.runner_label }}"]
+    runs-on: ${{ inputs.runner_label }}
     timeout-minutes: 30
     container: node:24-bookworm
     steps:
@@ -172,7 +172,7 @@ jobs:
 
   restore-container:
     needs: save-container
-    runs-on: [self-hosted, "${{ inputs.runner_label }}"]
+    runs-on: ${{ inputs.runner_label }}
     timeout-minutes: 30
     container: node:24-bookworm
     steps:
@@ -200,7 +200,7 @@ jobs:
 
   save-pinned-host:
     needs: candidate-identity
-    runs-on: [self-hosted, "${{ inputs.runner_label }}"]
+    runs-on: ${{ inputs.runner_label }}
     timeout-minutes: 30
     steps:
       - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25
@@ -222,7 +222,7 @@ jobs:
 
   restore-pinned-host:
     needs: save-pinned-host
-    runs-on: [self-hosted, "${{ inputs.runner_label }}"]
+    runs-on: ${{ inputs.runner_label }}
     timeout-minutes: 30
     steps:
       - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25
@@ -244,7 +244,7 @@ jobs:
 
   save-embedded-current:
     needs: candidate-identity
-    runs-on: [self-hosted, "${{ inputs.runner_label }}"]
+    runs-on: ${{ inputs.runner_label }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
@@ -293,7 +293,7 @@ jobs:
 
   restore-embedded-current:
     needs: save-embedded-current
-    runs-on: [self-hosted, "${{ inputs.runner_label }}"]
+    runs-on: ${{ inputs.runner_label }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
@@ -342,7 +342,7 @@ jobs:
 
   save-embedded-pinned:
     needs: candidate-identity
-    runs-on: [self-hosted, "${{ inputs.runner_label }}"]
+    runs-on: ${{ inputs.runner_label }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
@@ -392,7 +392,7 @@ jobs:
 
   restore-embedded-pinned:
     needs: save-embedded-pinned
-    runs-on: [self-hosted, "${{ inputs.runner_label }}"]
+    runs-on: ${{ inputs.runner_label }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
@@ -442,7 +442,7 @@ jobs:
 
   poisoned-clients:
     needs: candidate-identity
-    runs-on: [self-hosted, "${{ inputs.runner_label }}"]
+    runs-on: ${{ inputs.runner_label }}
     timeout-minutes: 30
     steps:
       - name: Recover the supervised forwarder from a process crash
@@ -562,7 +562,7 @@ jobs:
 
   restore-poison-artifact:
     needs: poisoned-clients
-    runs-on: [self-hosted, "${{ inputs.runner_label }}"]
+    runs-on: ${{ inputs.runner_label }}
     timeout-minutes: 30
     steps:
       - name: Prove poisoned Actions variables published no cache

@@ -1563,6 +1563,24 @@ func TestCacheConformanceReusableWorkflowUsesItsOwnRevision(t *testing.T) {
 		t.Fatalf("read cache conformance workflow: %v", err)
 	}
 	workflow := string(body)
+	const scaleSetRunner = "runs-on: ${{ inputs.runner_label }}"
+	var jobRunners, scaleSetRunners int
+	for line := range strings.SplitSeq(workflow, "\n") {
+		if !strings.HasPrefix(line, "    runs-on: ") {
+			continue
+		}
+		jobRunners++
+		if line == "    "+scaleSetRunner {
+			scaleSetRunners++
+		}
+	}
+	if jobRunners == 0 || scaleSetRunners != jobRunners {
+		t.Fatalf("%d of %d conformance jobs target the single runner scale-set label",
+			scaleSetRunners, jobRunners)
+	}
+	if strings.Contains(workflow, "runs-on: [self-hosted") {
+		t.Fatal("runner scale sets expose one label, so a self-hosted conjunction never matches")
+	}
 	if strings.Count(workflow,
 		"uses: ./.billet-conformance/.github/actions/cache-conformance-fixtures") != 8 {
 		t.Fatal("embedded cache lanes do not all use the called Billet revision's fixture action")
