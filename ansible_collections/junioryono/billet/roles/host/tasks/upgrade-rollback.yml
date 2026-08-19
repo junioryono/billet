@@ -331,39 +331,6 @@
   when: item.enablement == 'disabled'
   become: true
 
-- name: Restore persistent service masking
-  ansible.builtin.command:
-    argv:
-      - systemctl
-      - mask
-      - "{{ item.name }}"
-  loop:
-    - name: billet-server.service
-      enablement: "{{ billet_upgrade_manifest.server_enablement }}"
-    - name: billet-node.service
-      enablement: "{{ billet_upgrade_manifest.node_enablement }}"
-  loop_control:
-    label: "{{ item.name }}"
-  when: item.enablement == 'masked'
-  become: true
-
-- name: Restore runtime-only service masking
-  ansible.builtin.command:
-    argv:
-      - systemctl
-      - mask
-      - --runtime
-      - "{{ item.name }}"
-  loop:
-    - name: billet-server.service
-      enablement: "{{ billet_upgrade_manifest.server_enablement }}"
-    - name: billet-node.service
-      enablement: "{{ billet_upgrade_manifest.node_enablement }}"
-  loop_control:
-    label: "{{ item.name }}"
-  when: item.enablement == 'masked-runtime'
-  become: true
-
 - name: Inspect restored service enablement
   ansible.builtin.command:
     argv:

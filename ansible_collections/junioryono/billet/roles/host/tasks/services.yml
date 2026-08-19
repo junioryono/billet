@@ -38,6 +38,21 @@
     - not ansible_check_mode
   become: true
 
+- name: Refuse service link states rollback cannot reproduce exactly
+  ansible.builtin.assert:
+    that:
+      - (item.stdout | trim) in ['enabled', 'enabled-runtime', 'disabled', 'static', 'indirect', 'generated', 'transient', 'not-found']
+    fail_msg: >-
+      {{ item.item }} has systemd enablement state {{ item.stdout | trim }}.
+      Normalize masked, linked, or alias units before upgrading so rollback can
+      reproduce the exact boot topology without inventing a symlink target.
+  loop: "{{ billet_service_enablement_before_upgrade.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when:
+    - billet_binary_upgrade | default(false)
+    - not ansible_check_mode
+
 - name: Initialize guest compatibility refreshes
   ansible.builtin.set_fact:
     billet_guest_refresh_images: []
@@ -48,11 +63,11 @@
 - name: Prove every configured guest image is compatible with the candidate binary
   ansible.builtin.command:
     argv:
-      - "{{ billet_firecracker_stage }}/billet-candidate"
+      - "{{ billet_upgrade_recovery_dir }}/billet.candidate"
       - images
       - compatible
       - --result-file
-      - "{{ billet_firecracker_stage }}/guest-images-to-refresh"
+      - "{{ billet_upgrade_recovery_dir }}/guest-images-to-refresh"
       - --config
       - "{{ billet_upgrade_recovery_dir }}/billet.yaml.candidate"
   register: billet_guest_compatibility
@@ -66,7 +81,7 @@
 
 - name: Read the guest images that need a compatible generation
   ansible.builtin.slurp:
-    src: "{{ billet_firecracker_stage }}/guest-images-to-refresh"
+    src: "{{ billet_upgrade_recovery_dir }}/guest-images-to-refresh"
   register: billet_guest_refresh_file
   when:
     - billet_binary_upgrade | default(false)
@@ -91,7 +106,7 @@
       node_state_dir: "{{ billet_candidate_node_state_dir }}"
       service_user: "{{ billet_service_user }}"
       service_group: "{{ billet_service_group }}"
-      binary_existed: "{{ billet_binary_checksums.results[0].stat.exists }}"
+      binary_existed: "{{ billet_installed_binary.stat.exists }}"
       server_was_active: "{{ billet_service_state_before_upgrade.results[0].rc == 0 }}"
       node_was_active: "{{ billet_service_state_before_upgrade.results[1].rc == 0 }}"
       candidate_server_active: "{{ billet_enable_server }}"
@@ -230,7 +245,7 @@
     - name: Pull, boot-verify, and promote every compatible guest needed
       ansible.builtin.command:
         argv:
-          - "{{ billet_firecracker_stage }}/billet-candidate"
+          - "{{ billet_upgrade_recovery_dir }}/billet.candidate"
           - images
           - pull
           - --verify
@@ -330,7 +345,7 @@
 
     - name: Install the candidate billet binary after fencing and ledger preservation
       ansible.builtin.copy:
-        src: "{{ billet_firecracker_stage }}/billet-candidate"
+        src: "{{ billet_upgrade_recovery_dir }}/billet.candidate"
         dest: /usr/bin/billet
         remote_src: true
         owner: root

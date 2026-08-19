@@ -5,11 +5,13 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=exec
+Type=notify
+NotifyAccess=main
 User={{ billet_service_user }}
 Group={{ billet_service_group }}
 UMask=0077
 ExecStart=/usr/bin/billet server --config /etc/billet/billet.yaml{% if billet_systemd_upgrade_probe | default(false) %} --upgrade-probe{% endif %}
+TimeoutStartSec=120
 TimeoutStopSec=88200
 KillSignal=SIGTERM
 KillMode=mixed

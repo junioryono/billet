@@ -499,6 +499,9 @@ func runServer(
 		return fmt.Errorf("capacity allocator: %w", err)
 	}
 	if upgradeProbe {
+		if err := notifyReady(); err != nil {
+			return fmt.Errorf("server upgrade-probe readiness: %w", err)
+		}
 		fmt.Println("billet server: upgrade probe ready; workload polling and dispatch are disabled")
 		<-ctx.Done()
 
@@ -595,6 +598,9 @@ func runServer(
 	opts = append(opts, server.WithNodeRunner(nodes.NewRunner()))
 
 	plane := server.New(allocator, wiring.Provisioner{Client: client}, cfg.Tiers, owner, slog.Default(), opts...)
+	if err := notifyReady(); err != nil {
+		return fmt.Errorf("server readiness: %w", err)
+	}
 	if err := plane.Run(ctx); err != nil {
 		return err
 	}
@@ -1049,6 +1055,9 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 		return err
 	}
 	if *upgradeProbe {
+		if err := notifyReady(); err != nil {
+			return fmt.Errorf("node upgrade-probe readiness: %w", err)
+		}
 		fmt.Printf("billet node %s: upgrade probe ready; registration and workload polling are disabled\n",
 			cfg.Node.Name)
 		<-ctx.Done()
@@ -1105,6 +1114,9 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 
 	for _, w := range contribution.Warnings {
 		slog.Default().Warn(w, "node", cfg.Node.Name)
+	}
+	if err := notifyReady(); err != nil {
+		return fmt.Errorf("node readiness: %w", err)
 	}
 
 	return nodeclient.Run(ctx, client, runner, nodeclient.LoopOptions{

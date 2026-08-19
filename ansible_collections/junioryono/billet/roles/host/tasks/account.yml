@@ -135,27 +135,33 @@
     - { path: /usr/local/libexec, owner: root, group: root, mode: "0755" }
   become: true
 
-- name: Stage the candidate billet binary without replacing the running version
-  ansible.builtin.copy:
-    src: "{{ billet_binary_src }}"
-    dest: "{{ billet_firecracker_stage }}/billet-candidate"
-    owner: root
-    group: root
-    mode: "0755"
-  register: billet_binary_candidate_stage
-  become: true
-  when: billet_binary_src | length > 0
-
-- name: Inspect the installed and candidate billet binaries
+- name: Inspect the installed billet binary
   ansible.builtin.stat:
-    path: "{{ item }}"
+    path: /usr/bin/billet
     checksum_algorithm: sha256
-  register: billet_binary_checksums
-  loop:
-    - /usr/bin/billet
-    - "{{ billet_firecracker_stage }}/billet-candidate"
+  register: billet_installed_binary
   check_mode: false
   become: true
+
+- name: Inspect the supplied candidate billet binary on the controller
+  ansible.builtin.stat:
+    path: "{{ billet_binary_src }}"
+    checksum_algorithm: sha256
+  register: billet_candidate_binary
+  delegate_to: localhost
+  become: false
+  when: billet_binary_src | length > 0
+
+- name: Refuse a missing or redirected candidate billet binary
+  ansible.builtin.assert:
+    that:
+      - billet_candidate_binary.stat.exists
+      - billet_candidate_binary.stat.isreg
+      - not billet_candidate_binary.stat.islnk | default(false)
+    fail_msg: >-
+      billet_binary_src must name one real regular file on the controller so the
+      transaction can bind an immutable journal copy to its inspected digest.
+  when: billet_binary_src | length > 0
 
 - name: Decide whether the billet binary needs a transactional upgrade
   ansible.builtin.set_fact:
@@ -165,14 +171,8 @@
         (
           billet_binary_src | length > 0 and
           (
-            (ansible_check_mode and billet_binary_candidate_stage.changed | default(false)) or
-            (
-              billet_binary_checksums.results[1].stat.exists and
-              (
-                not billet_binary_checksums.results[0].stat.exists or
-                billet_binary_checksums.results[0].stat.checksum != billet_binary_checksums.results[1].stat.checksum
-              )
-            )
+            not billet_installed_binary.stat.exists or
+            billet_installed_binary.stat.checksum != billet_candidate_binary.stat.checksum
           )
         )
       }}
@@ -211,6 +211,47 @@
     - not billet_interrupted_upgrade | bool
     - not ansible_check_mode
 
+- name: Stage the immutable candidate binary inside its recovery journal
+  ansible.builtin.copy:
+    src: "{{ billet_binary_src }}"
+    dest: "{{ billet_upgrade_recovery_dir }}/billet.candidate"
+    owner: root
+    group: root
+    mode: "0755"
+  become: true
+  when:
+    - billet_binary_upgrade | default(false)
+    - not billet_interrupted_upgrade | bool
+    - not ansible_check_mode
+
+- name: Inspect the journaled candidate billet binary
+  ansible.builtin.stat:
+    path: "{{ billet_upgrade_recovery_dir }}/billet.candidate"
+    checksum_algorithm: sha256
+  register: billet_journaled_candidate_binary
+  check_mode: false
+  become: true
+  when:
+    - billet_binary_upgrade | default(false)
+    - not billet_interrupted_upgrade | bool
+    - not ansible_check_mode
+
+- name: Bind the host transaction to the inspected candidate digest
+  ansible.builtin.assert:
+    that:
+      - billet_journaled_candidate_binary.stat.exists
+      - billet_journaled_candidate_binary.stat.isreg
+      - not billet_journaled_candidate_binary.stat.islnk | default(false)
+      - billet_journaled_candidate_binary.stat.checksum == billet_candidate_binary.stat.checksum
+    fail_msg: >-
+      The supplied billet binary changed while the transaction was being
+      prepared. Refusing to upgrade from an artifact other than the one whose
+      digest selected this transaction.
+  when:
+    - billet_binary_upgrade | default(false)
+    - not billet_interrupted_upgrade | bool
+    - not ansible_check_mode
+
 - name: Inspect configuration and units before replacing them
   ansible.builtin.stat:
     path: "{{ item }}"
@@ -221,6 +262,23 @@
   register: billet_previous_upgrade_inputs
   check_mode: false
   become: true
+  when:
+    - billet_binary_upgrade | default(false)
+    - not billet_interrupted_upgrade | bool
+    - not ansible_check_mode
+
+- name: Refuse redirected or non-file upgrade inputs
+  ansible.builtin.assert:
+    that:
+      - not item.stat.exists or item.stat.isreg
+      - not item.stat.islnk | default(false)
+    fail_msg: >-
+      {{ item.item }} is not a real regular file. Normalize the installed input
+      before a transactional upgrade so rollback never follows or recreates a
+      privileged symlink.
+  loop: "{{ billet_previous_upgrade_inputs.results }}"
+  loop_control:
+    label: "{{ item.item }}"
   when:
     - billet_binary_upgrade | default(false)
     - not billet_interrupted_upgrade | bool
@@ -257,7 +315,7 @@
     - billet_binary_upgrade | default(false)
     - not billet_interrupted_upgrade | bool
     - not ansible_check_mode
-    - billet_binary_checksums.results[0].stat.exists
+    - billet_installed_binary.stat.exists
 
 - name: Stage candidate systemd units for the upgrade transaction
   ansible.builtin.template:

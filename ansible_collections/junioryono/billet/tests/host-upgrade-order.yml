@@ -32,6 +32,7 @@
         billet_upgrade_stop_node: "{{ billet_upgrade_task.block | selectattr('name', 'equalto', 'Gracefully stop the billet node before changing its guest contract') | first }}"
         billet_upgrade_stop_server: "{{ billet_upgrade_task.block | selectattr('name', 'equalto', 'Gracefully stop the billet server after compute has drained') | first }}"
         billet_upgrade_backup_ledger: "{{ billet_upgrade_task.block | selectattr('name', 'equalto', 'Preserve the stopped control-plane ledger') | first }}"
+        billet_candidate_stage: "{{ billet_host_account_tasks | selectattr('name', 'equalto', 'Stage the immutable candidate binary inside its recovery journal') | first }}"
         billet_recovery_stop_proof: "{{ billet_host_recovery_tasks | selectattr('name', 'equalto', 'Refuse recovery without conclusive process and cgroup evidence') | first }}"
         billet_recovery_cgroup_probe: "{{ billet_host_recovery_tasks | selectattr('name', 'equalto', 'Inspect service cgroups before recovering upgrade inputs') | first }}"
         billet_recovery_restore_inputs: "{{ billet_host_recovery_tasks | selectattr('name', 'equalto', 'Restore configuration and units that existed before the upgrade') | first }}"
@@ -43,8 +44,12 @@
           - "'Refuse billet state paths with symlinked or noncanonical ancestors' in billet_inspection_names"
           - "'Refuse billet state paths that are symlinks or non-directories' in billet_inspection_names"
           - billet_account_names.index('Refuse to move installed billet state implicitly') < billet_account_names.index('Render billet configuration')
+          - billet_account_names.index('Create the upgrade recovery directory') < billet_account_names.index('Stage the immutable candidate binary inside its recovery journal')
+          - billet_account_names.index('Stage the immutable candidate binary inside its recovery journal') < billet_account_names.index('Bind the host transaction to the inspected candidate digest')
+          - billet_account_names.index('Refuse redirected or non-file upgrade inputs') < billet_account_names.index('Preserve configuration and units before replacing them')
           - billet_account_names.index('Preserve configuration and units before replacing them') < billet_account_names.index('Stage candidate systemd units for the upgrade transaction')
           - "'Preserve the previous billet binary before live mutation' in billet_account_names"
+          - "'billet_upgrade_recovery_dir' in billet_candidate_stage['ansible.builtin.copy'].dest"
           - billet_main_names.index('Inspect a durable host-upgrade journal before normal convergence') < billet_main_names.index('Recover an interrupted billet upgrade before converging anything else')
           - billet_main_names.index('Recover an interrupted billet upgrade before converging anything else') < billet_main_names.index('Configure billet account and files')
           - billet_main_names.index('Configure billet account and files') < billet_main_names.index('Configure billet services')
@@ -60,6 +65,10 @@
           - "'BILLET_MAINTENANCE' not in billet_node_unit"
           - "'--upgrade-probe' in billet_server_unit"
           - "'--upgrade-probe' in billet_node_unit"
+          - "'Type=notify' in billet_server_unit"
+          - "'Type=notify' in billet_node_unit"
+          - "'NotifyAccess=main' in billet_server_unit"
+          - "'NotifyAccess=main' in billet_node_unit"
           - billet_main_names.index('Recover an interrupted billet upgrade before converging anything else') < billet_main_names.index('Configure Firecracker')
           - billet_main_names.index('Recover an interrupted billet upgrade before converging anything else') < billet_main_names.index('Configure guest networking')
           - billet_main_names.index('Recover an interrupted billet upgrade before converging anything else') < billet_main_names.index('Configure Ceph')
@@ -68,6 +77,7 @@
       ansible.builtin.assert:
         that:
           - billet_upgrade_names.index('Gracefully stop the billet node before changing its guest contract') < billet_upgrade_names.index('Pull, boot-verify, and promote every compatible guest needed')
+          - billet_top_level_names.index('Refuse service link states rollback cannot reproduce exactly') < billet_top_level_names.index('Prove every configured guest image is compatible with the candidate binary')
           - billet_upgrade_names.index('Pull, boot-verify, and promote every compatible guest needed') < billet_upgrade_names.index('Gracefully stop the billet server after compute has drained')
           - billet_upgrade_names.index('Gracefully stop the billet server after compute has drained') < billet_upgrade_names.index('Hide the old executable before establishing the maintenance fence')
           - billet_upgrade_names.index('Hide the old executable before establishing the maintenance fence') < billet_upgrade_names.index('Fence the ledger against operator commands during migration and rollback')

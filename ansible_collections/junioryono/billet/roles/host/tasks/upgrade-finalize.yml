@@ -92,6 +92,22 @@
     label: "{{ item.name }}"
   become: true
 
+- name: Inspect committed service unit availability
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - show
+      - --property=LoadState
+      - --value
+      - "{{ item.name }}"
+  loop: "{{ billet_finalization_services }}"
+  register: billet_finalization_service_load_states
+  changed_when: false
+  failed_when: false
+  loop_control:
+    label: "{{ item.name }}"
+  become: true
+
 - name: Inspect committed service process identifiers
   ansible.builtin.command:
     argv:
@@ -157,8 +173,11 @@
     state: stopped
   loop: "{{ billet_finalization_services }}"
   loop_control:
+    index_var: billet_finalization_stop_index
     label: "{{ item.name }}"
-  when: not item.should_run | bool
+  when:
+    - not item.should_run | bool
+    - billet_finalization_service_load_states.results[billet_finalization_stop_index].stdout | trim != 'not-found'
   become: true
 
 - name: Inspect committed service stability baseline
