@@ -412,6 +412,22 @@ EOF
 		rm -rf /var/lib/apt/lists/*
 	'
 
+	# Docker 29 made the containerd image store the default for fresh installs, and
+	# that store keeps image content outside Docker's data root. The slot-zero cache
+	# mounts /var/lib/docker as one independently fenced filesystem, so accepting the
+	# package default would publish a healthy but empty volume while pulled images
+	# stayed on the disposable root disk. Pin the supported classic backend rather
+	# than splitting one cache generation across two independently mounted trees.
+	install -d -m 0755 "$rootfs/etc/docker"
+	install -m 0644 /dev/stdin "$rootfs/etc/docker/daemon.json" <<'DOCKER'
+{
+  "features": {
+    "containerd-snapshotter": false
+  },
+  "storage-driver": "overlay2"
+}
+DOCKER
+
 	# WHY THESE SIX, AND WHY THEY ARE NOT OPTIONAL (#66).
 	#
 	# zstd IS THE ONE THAT LOOKS LIKE IT WORKS. actions/cache chooses its

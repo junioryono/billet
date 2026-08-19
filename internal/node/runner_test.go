@@ -208,7 +208,7 @@ func TestACompletionFindsTheCacheSessionOfAdoptedCompute(t *testing.T) {
 	}
 }
 
-func TestGitHubSuccessResultSpellingPublishesTheDockerStore(t *testing.T) {
+func TestGitHubSuccessResultPublishesTheDockerStore(t *testing.T) {
 	storage := &fakeCacheStore{}
 	attacher := &fakeVolumeAttacher{}
 	cache, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", t.TempDir(),
@@ -234,7 +234,7 @@ func TestGitHubSuccessResultSpellingPublishesTheDockerStore(t *testing.T) {
 		runningLease: map[int64]*alloc.Lease{}, custody: map[string]*custody{},
 	}
 	destroyed := make(chan error, 1)
-	go func() { destroyed <- runner.DestroyCompleted(t.Context(), 11, "Succeeded") }()
+	go func() { destroyed <- runner.DestroyCompleted(t.Context(), 11, "succeeded") }()
 
 	proof := map[string]any{
 		"filesystem": map[string]any{"type": "ext4", "uuid": "docker-fs", "clean": true},
@@ -254,14 +254,14 @@ func TestGitHubSuccessResultSpellingPublishesTheDockerStore(t *testing.T) {
 		t.Fatalf("DestroyCompleted: %v", err)
 	}
 	if storage.published != 1 {
-		t.Errorf("published %d Docker stores for GitHub result Succeeded, want 1", storage.published)
+		t.Errorf("published %d Docker stores for GitHub result succeeded, want 1", storage.published)
 	}
 }
 
 func TestGitHubNonSuccessResultsDoNotPublishTheDockerStore(t *testing.T) {
 	t.Parallel()
 
-	for _, result := range []string{"", "Success", "Failed", "Cancelled", " succeeded "} {
+	for _, result := range []string{"", "Success", "Succeeded", "Failed", "Cancelled", " succeeded "} {
 		t.Run(result, func(t *testing.T) {
 			t.Parallel()
 

@@ -123,6 +123,17 @@ else
 	        host-side publication"
 fi
 
+DOCKER_DAEMON="$MNT/etc/docker/daemon.json"
+if [ -r "$DOCKER_DAEMON" ] && jq -e '
+	.features["containerd-snapshotter"] == false and
+	.["storage-driver"] == "overlay2"
+' "$DOCKER_DAEMON" >/dev/null; then
+	pass "Docker keeps pulled images inside the cache-backed data root"
+else
+	fail "Docker is not pinned to overlay2 under /var/lib/docker; fresh Docker 29
+        installations keep image content in /var/lib/containerd and bypass the cache"
+fi
+
 # READ FROM WHAT THE BUILD RECORDED, not from the runner tarball. The tarball
 # ships no version file of its own -- this gate reported exactly that on its first
 # real run -- so the build writes /etc/billet-image at the moment it unpacks the

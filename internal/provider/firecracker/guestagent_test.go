@@ -160,6 +160,10 @@ func TestTheGuestMountsDockerStateBeforeStartingTheDaemon(t *testing.T) {
 	if !strings.Contains(build, "systemctl disable docker.service docker.socket") {
 		t.Fatal("the image still permits Docker to autostart before its cache is mounted")
 	}
+	if !strings.Contains(build, `"containerd-snapshotter": false`) ||
+		!strings.Contains(build, `"storage-driver": "overlay2"`) {
+		t.Fatal("the image can put pulled images outside the cache-backed Docker data root")
+	}
 	if !strings.Contains(build, "ACTIONS_RUNNER_RETURN_JOB_RESULT_FOR_HOSTED=true") ||
 		!strings.Contains(helper, `[ "$status" = 100 ]`) ||
 		!strings.Contains(helper, `operation=ready`) {
