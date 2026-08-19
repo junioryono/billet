@@ -93,7 +93,10 @@ func cmdImagesCompatible(ctx context.Context, args []string) error {
 
 	images := []string{rest}
 	if rest == "" {
-		images = firecrackerTierImages(cfg)
+		images, err = firecrackerTierImages(cfg)
+		if err != nil {
+			return err
+		}
 	}
 	if len(images) == 0 {
 		return errors.New("billet images compatible: no image given and no firecracker tier names one")
@@ -315,7 +318,10 @@ func cmdImagesDue(ctx context.Context, args []string) error {
 
 	image := rest
 	if image == "" {
-		image = firecrackerTierImage(cfg)
+		image, err = firecrackerTierImage(cfg)
+		if err != nil {
+			return err
+		}
 	}
 
 	if image == "" {
@@ -357,19 +363,26 @@ func cmdImagesDue(ctx context.Context, args []string) error {
 var errNothingToBuild = &exitError{code: 2, msg: "a recent generation already exists"}
 
 // firecrackerTierImage is the first image this deployment's microVM tiers boot.
-func firecrackerTierImage(cfg *config.Config) string {
-	images := firecrackerTierImages(cfg)
+func firecrackerTierImage(cfg *config.Config) (string, error) {
+	images, err := firecrackerTierImages(cfg)
+	if err != nil {
+		return "", err
+	}
 	if len(images) > 0 {
-		return images[0]
+		return images[0], nil
 	}
 
-	return ""
+	return "", nil
 }
 
 // firecrackerTierImages are the distinct images this deployment's microVM tiers boot.
-func firecrackerTierImages(cfg *config.Config) []string {
+func firecrackerTierImages(cfg *config.Config) ([]string, error) {
 	if cfg.Node == nil || cfg.Node.Provider != config.ProviderFirecracker {
-		return nil
+		return nil, nil
+	}
+
+	if _, err := nodeBundle(cfg); err != nil {
+		return nil, fmt.Errorf("select firecracker tier images: resolve node identity: %w", err)
 	}
 
 	images := make([]string, 0, len(cfg.Tiers))
@@ -390,7 +403,7 @@ func firecrackerTierImages(cfg *config.Config) []string {
 		}
 	}
 
-	return images
+	return images, nil
 }
 
 // cmdImagesVerify boots one microVM from an image and makes the guest prove it works.
@@ -1077,7 +1090,10 @@ func cmdImagesReap(ctx context.Context, args []string) error {
 
 	image := rest
 	if image == "" {
-		image = firecrackerTierImage(cfg)
+		image, err = firecrackerTierImage(cfg)
+		if err != nil {
+			return err
+		}
 	}
 
 	if image == "" {
@@ -1324,7 +1340,10 @@ func cmdImagesList(ctx context.Context, args []string) error {
 
 	image := rest
 	if image == "" {
-		image = firecrackerTierImage(cfg)
+		image, err = firecrackerTierImage(cfg)
+		if err != nil {
+			return err
+		}
 	}
 
 	if image == "" {

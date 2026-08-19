@@ -40,6 +40,8 @@
         billet_recovery_cgroup_probe: "{{ billet_host_recovery_tasks | selectattr('name', 'equalto', 'Inspect service cgroups before recovering upgrade inputs') | first }}"
         billet_recovery_restore_inputs: "{{ billet_host_recovery_tasks | selectattr('name', 'equalto', 'Restore configuration and units that existed before the upgrade') | first }}"
         billet_recovery_candidate_links: "{{ billet_host_recovery_tasks | selectattr('name', 'equalto', 'Remove candidate persistent and runtime enablement links') | first }}"
+        billet_service_dropin_probe: "{{ billet_host_service_tasks | selectattr('name', 'equalto', 'Inspect billet service drop-ins before the upgrade transaction') | first }}"
+        billet_service_dropin_guard: "{{ billet_host_service_tasks | selectattr('name', 'equalto', 'Refuse service drop-ins the transaction cannot replace or recover') | first }}"
         billet_service_link_guard: "{{ billet_host_service_tasks | selectattr('name', 'equalto', 'Refuse service link states rollback cannot reproduce exactly') | first }}"
         billet_legacy_transient_guard: "{{ billet_host_recovery_dispatch_tasks | selectattr('name', 'equalto', 'Refuse rollback of a legacy transient service definition') | first }}"
 
@@ -49,10 +51,36 @@
         billet_legacy_node_unit: "{{ lookup('ansible.builtin.template', playbook_dir + '/../roles/host/templates/billet-node.service.j2') }}"
         billet_transaction_server_unit: "{{ lookup('ansible.builtin.template', playbook_dir + '/../roles/host/templates/billet-server.service.j2', template_vars={'billet_systemd_notify_ready': true, 'billet_systemd_upgrade_probe': true}) }}"
         billet_transaction_node_unit: "{{ lookup('ansible.builtin.template', playbook_dir + '/../roles/host/templates/billet-node.service.j2', template_vars={'billet_systemd_notify_ready': true, 'billet_systemd_upgrade_probe': true}) }}"
+        billet_unsafe_override_dropin: |
+          [Service]
+          Type=exec
+          ExecStart=
+          ExecStart=/usr/bin/billet node --config /etc/billet/billet.yaml
       vars:
         billet_service_user: billet
         billet_service_group: billet
         billet_config: {}
+
+    - name: Exercise an effective ExecStart and Type drop-in override
+      block:
+        - name: Apply the transaction's drop-in acceptance condition
+          ansible.builtin.assert:
+            that:
+              - billet_unsafe_override_dropin | trim | length == 0
+
+        - name: Record an unsafe acceptance
+          ansible.builtin.set_fact:
+            billet_unsafe_override_accepted: true
+      rescue:
+        - name: Record the expected refusal
+          ansible.builtin.set_fact:
+            billet_unsafe_override_refused: true
+
+    - name: Prove the effective override was refused
+      ansible.builtin.assert:
+        that:
+          - billet_unsafe_override_refused | default(false) | bool
+          - not billet_unsafe_override_accepted | default(false) | bool
 
     - name: Require durable recovery before any live host mutation
       ansible.builtin.assert:
@@ -80,6 +108,12 @@
           - billet_top_level_names.index('Durably publish the active host-upgrade pointer before live mutation') < billet_top_level_names.index('Upgrade billet as one recoverable host transaction')
           - billet_top_level_names.index('Prove this transaction owns the host before live mutation') < billet_top_level_names.index('Upgrade billet as one recoverable host transaction')
           - billet_top_level_names.index('Prove every configured guest image is compatible with the candidate binary') < billet_top_level_names.index('Upgrade billet as one recoverable host transaction')
+          - billet_top_level_names.index('Refuse service drop-ins the transaction cannot replace or recover') < billet_top_level_names.index("Stage this transaction's atomic host-upgrade claim")
+          - "'--property=DropInPaths' in billet_service_dropin_probe['ansible.builtin.command'].argv"
+          - "'item.stdout | trim | length == 0' in billet_service_dropin_guard['ansible.builtin.assert'].that"
+          - "'Type=exec' in billet_unsafe_override_dropin"
+          - "'ExecStart=/usr/bin/billet node --config /etc/billet/billet.yaml' in billet_unsafe_override_dropin"
+          - billet_unsafe_override_dropin | trim | length > 0
           - "'BILLET_MAINTENANCE' not in billet_server_unit"
           - "'BILLET_MAINTENANCE' not in billet_node_unit"
           - "'--upgrade-probe' in billet_server_unit"

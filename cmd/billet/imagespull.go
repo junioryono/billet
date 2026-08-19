@@ -102,7 +102,10 @@ func cmdImagesPull(ctx context.Context, args []string) error {
 
 	image := rest
 	if image == "" {
-		configured := firecrackerTierImages(cfg)
+		configured, err := firecrackerTierImages(cfg)
+		if err != nil {
+			return err
+		}
 		if len(configured) > 1 {
 			return fmt.Errorf("billet images pull: this deployment names %d distinct firecracker images; give the bare image name to refresh explicitly",
 				len(configured))
