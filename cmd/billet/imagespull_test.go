@@ -100,19 +100,18 @@ func TestHostArchIsSpelledTheWayAManifestSpellsIt(t *testing.T) {
 	}
 }
 
-// Contract 4 images predate the runner-service wrapper now used as the default
-// Firecracker command. Accepting one would pass verification, boot, and then
-// fail before the runner can register because that executable is absent.
-func TestCurrentBinaryRejectsAPreRunnerServiceGuest(t *testing.T) {
+// Contract 5 images predate the Compose CLI now required by the guest image.
+// Accepting one would pass verification and then fail a common workflow command.
+func TestCurrentBinaryRejectsAPreComposeGuest(t *testing.T) {
 	_, manifest := stageDir(t, []byte("rootfs"), []byte("kernel"))
-	manifest.GuestContract = "4"
+	manifest.GuestContract = "5"
 
-	if firecracker.GuestContract != "5" {
-		t.Fatalf("the runner-service image change speaks contract %q, want 5",
+	if firecracker.GuestContract != "6" {
+		t.Fatalf("the Compose image change speaks contract %q, want 6",
 			firecracker.GuestContract)
 	}
 	if err := manifest.Usable(firecracker.GuestContract, "x86_64"); err == nil {
-		t.Fatal("a contract-4 image without billet-runner-service was accepted")
+		t.Fatal("a contract-5 image without Docker Compose was accepted")
 	}
 }
 

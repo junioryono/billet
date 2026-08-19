@@ -406,7 +406,7 @@ EOF
 		apt-get update -qq
 		apt-get install -y --no-install-recommends \
 			ca-certificates curl iproute2 iptables jq git sudo \
-			docker.io docker-buildx e2fsprogs util-linux systemd-resolved netplan.io libicu74 \
+			docker.io docker-buildx docker-compose-v2 e2fsprogs util-linux systemd-resolved netplan.io libicu74 \
 			unzip zip zstd tar wget rsync build-essential
 		apt-get clean
 		rm -rf /var/lib/apt/lists/*
@@ -561,7 +561,7 @@ fetch() { curl -sf --connect-timeout 2 --max-time 5 -H "X-metadata-token: $token
 #
 # Refusing out loud is the whole point: the message names both versions, so the
 # answer ("republish the image") is in the failure rather than in somebody's memory.
-WANT_CONTRACT=5
+WANT_CONTRACT=6
 
 if ! contract=$(fetch contract); then
 	log "this billet did not say which metadata contract it speaks; it is older than this image"

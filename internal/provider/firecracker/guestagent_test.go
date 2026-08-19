@@ -301,7 +301,7 @@ func TestTheManualGuestImagePublisherRunsTheContentsGate(t *testing.T) {
 	}
 }
 
-func TestTheGuestImageIncludesBuildxForThePersistentBuilder(t *testing.T) {
+func TestTheGuestImageIncludesDockerCLIPluginsWorkflowsUse(t *testing.T) {
 	t.Parallel()
 
 	path := filepath.Join("..", "..", "..", "scripts", "build-guest-image.sh")
@@ -310,8 +310,8 @@ func TestTheGuestImageIncludesBuildxForThePersistentBuilder(t *testing.T) {
 		t.Fatalf("read guest image builder: %v", err)
 	}
 
-	if !strings.Contains(string(source), "docker.io docker-buildx") {
-		t.Fatal("the guest installs Docker without the Buildx CLI required by setup-docker-builder")
+	if !strings.Contains(string(source), "docker.io docker-buildx docker-compose-v2") {
+		t.Fatal("the guest installs Docker without the Buildx and Compose CLI plugins workflows use")
 	}
 }
 

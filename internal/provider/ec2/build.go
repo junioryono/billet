@@ -476,11 +476,33 @@ func provisionScript(spec BuildSpec) (string, error) {
 	}
 
 	var b strings.Builder
+	var composeArch, composeSHA256 string
+	switch spec.Arch {
+	case "x64":
+		composeArch = "x86_64"
+		composeSHA256 = "f9ebc6ebdb19d769b793c245a736caaeb198c62587f13b25c660c13b4987f959"
+	case "arm64":
+		composeArch = "aarch64"
+		composeSHA256 = "aa611e811d0ea25897839c404bfb5bf93ce706dc51c500a4457890f5d0606a86"
+	}
 
 	b.WriteString("#!/bin/sh\nset -eux\n")
 
 	// Docker, git and tar are what a workflow cannot reasonably install itself.
 	b.WriteString("dnf install -y docker git tar jq e2fsprogs util-linux\n")
+	// Amazon Linux does not package the Compose plugin. Pin Docker's release and
+	// its per-architecture digest instead of turning every AMI build into a fetch
+	// of whatever `latest` means that day.
+	composePath := "/usr/local/libexec/docker/cli-plugins/docker-compose"
+	composeURL := "https://github.com/docker/compose/releases/download/v5.3.1/" +
+		"docker-compose-linux-" + composeArch
+	b.WriteString("install -d /usr/local/libexec/docker/cli-plugins\n")
+	b.WriteString("curl -fsSL --retry 5 --retry-all-errors -o " + composePath + " " +
+		strconv.Quote(composeURL) + "\n")
+	b.WriteString("echo " + strconv.Quote(composeSHA256+"  "+composePath) +
+		" | sha256sum -c -\n")
+	b.WriteString("chmod 0755 " + composePath + "\n")
+	b.WriteString("docker compose version\n")
 	b.WriteString("systemctl enable docker\n")
 
 	// THE RUNNER'S OWN DEPENDENCIES, INSTALLED DIRECTLY RATHER THAN BY ITS SCRIPT.

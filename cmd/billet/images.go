@@ -374,12 +374,14 @@ func verifyGuestImage(
 	//               that surfaces as every job failing to start
 	//   docker      the daemon is up on this kernel, which check-config.sh can only
 	//               predict, and a container actually ran
+	//   compose     the CLI plugin common multi-container workflows invoke exists
 	probe := strings.Join([]string{
 		`echo "whoami=$(whoami)"`,
 		`echo "jit=$ACTIONS_RUNNER_INPUT_JITCONFIG"`,
 		`echo "runner=$(cd /home/runner/runner && ./bin/Runner.Listener --version 2>&1 | head -1)"`,
 		`echo "docker=$(docker info --format '{{.ServerVersion}} storage={{.Driver}} ` +
 			`cgroups={{.CgroupVersion}}' 2>&1 | head -1)"`,
+		`echo "compose=$(docker compose version --short 2>&1 | head -1)"`,
 		`echo "container=$(docker run --rm hello-world 2>&1 | grep -ci 'working correctly' || echo 0)"`,
 	}, "; ")
 
@@ -597,6 +599,10 @@ func checkGuestReport(body, secret string) error {
 
 	if !hasVersion(body, "docker=") {
 		failures = append(failures, "the docker daemon did not answer on this kernel")
+	}
+
+	if !hasVersion(body, "compose=") {
+		failures = append(failures, "the Docker Compose CLI plugin did not report a version")
 	}
 
 	if strings.Contains(body, "container=0") {

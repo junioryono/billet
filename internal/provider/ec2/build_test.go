@@ -37,6 +37,9 @@ func TestTheProvisionScriptContainsWhatAnImageNeeds(t *testing.T) {
 	}{
 		{"set -eux", "without -e a failed step is followed by poweroff, and billet images it"},
 		{"dnf install -y docker", "workflows use service containers and docker build"},
+		{"docker/compose/releases/download/v5.3.1/docker-compose-linux-x86_64", "x64 images need a pinned Compose plugin"},
+		{"f9ebc6ebdb19d769b793c245a736caaeb198c62587f13b25c660c13b4987f959", "the x64 Compose download needs a pinned digest"},
+		{"docker compose version", "the image build must execute the Compose plugin"},
 		{"jq e2fsprogs util-linux", "the transparent Docker cache formats and verifies ext4"},
 		{"git", "actions/checkout wants it"},
 		{"tar", "actions/setup-* unpack what they download"},
@@ -53,6 +56,26 @@ func TestTheProvisionScriptContainsWhatAnImageNeeds(t *testing.T) {
 		if !strings.Contains(got, want.fragment) {
 			t.Errorf("the script is missing %q — %s", want.fragment, want.why)
 		}
+	}
+}
+
+func TestTheArm64ProvisionScriptPinsTheMatchingComposeBinary(t *testing.T) {
+	t.Parallel()
+
+	script, err := provisionScript(BuildSpec{RunnerVersion: "2.328.0", Arch: "arm64"})
+	if err != nil {
+		t.Fatalf("provisionScript: %v", err)
+	}
+	for _, want := range []string{
+		"docker-compose-linux-aarch64",
+		"aa611e811d0ea25897839c404bfb5bf93ce706dc51c500a4457890f5d0606a86",
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("the arm64 script is missing %q", want)
+		}
+	}
+	if strings.Contains(script, "docker-compose-linux-x86_64") {
+		t.Error("the arm64 script downloads the x64 Compose binary")
 	}
 }
 

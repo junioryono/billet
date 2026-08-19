@@ -168,6 +168,23 @@ else
 	fail "no docker client"
 fi
 
+compose_plugin=""
+for candidate in \
+	usr/local/lib/docker/cli-plugins/docker-compose \
+	usr/local/libexec/docker/cli-plugins/docker-compose \
+	usr/lib/docker/cli-plugins/docker-compose \
+	usr/libexec/docker/cli-plugins/docker-compose; do
+	if [ -x "$MNT/$candidate" ]; then
+		compose_plugin="/$candidate"
+		break
+	fi
+done
+if [ -n "$compose_plugin" ]; then
+	pass "the Docker Compose CLI plugin is installed at $compose_plugin"
+else
+	fail "no Docker Compose CLI plugin; workflows using docker compose would fail"
+fi
+
 # --- what workflows assume is there ----------------------------------------
 
 # CHECKED HERE BECAUSE THE FAILURE IS OTHERWISE INVISIBLE (#66).

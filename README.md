@@ -281,10 +281,7 @@ Nothing reaches a release without passing both halves of a gate, because an imag
 reaches a release is one every deployment pulls — a bad one fans out to everybody on the
 next refresh, and the thing that would rebuild it is itself a guest booting the image.
 
-**Its contents**, by loop-mounting the filesystem read-only: the runner is installed and
-is the version the manifest claims, Docker is there, the agent's contract matches what the
-manifest advertises, the units that must start are *enabled* rather than merely present,
-and root is locked rather than passwordless.
+**Its contents**, by loop-mounting the filesystem read-only: the runner is installed and is the version the manifest claims, Docker and its Buildx and Compose plugins are there, the agent's contract matches what the manifest advertises, the units that must start are *enabled* rather than merely present, and root is locked rather than passwordless.
 
 **That it boots**, under Firecracker, on the runner that built it. The guest is served a
 metadata contract it is required to refuse, and its refusal on the console proves the
