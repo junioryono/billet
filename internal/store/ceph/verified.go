@@ -17,7 +17,7 @@ import (
 const VerifiedKey = "billet.verified"
 
 // Verified is the generation reference a tier can name to mean "the newest one that
-// was proved to work".
+// was proved to work with this node's guest contract".
 //
 // A WORD RATHER THAN AN IMPLICIT DEFAULT. A bare image name stays refused: choosing
 // a generation for somebody who did not choose one is how a job silently boots
@@ -71,7 +71,9 @@ func (c *Client) UnmarkVerified(ctx context.Context, image string) error {
 	return nil
 }
 
-// NewestVerified resolves an image to the most recent generation that passed.
+// NewestVerified resolves an image to the most recent generation that passed,
+// without filtering by guest contract. Operator commands use this to describe the
+// publication history; a node launch uses NewestVerifiedForContract instead.
 //
 // BY BUILD TIME, NOT BY WHEN IT WAS VERIFIED. Re-verifying an older generation — the
 // obvious thing to do while investigating a bad one — would otherwise promote it over
@@ -81,6 +83,31 @@ func (c *Client) UnmarkVerified(ctx context.Context, image string) error {
 // whose newest generations have all failed verification has nothing to resolve to,
 // and the honest answer is to say so rather than to fall back to something unproven.
 func (c *Client) NewestVerified(ctx context.Context, image string) (Generation, bool, error) {
+	return c.newestVerified(ctx, image, "")
+}
+
+// NewestVerifiedForContract resolves an image to the newest verified generation
+// that speaks one exact host/guest protocol.
+//
+// CONTRACT-RELATIVE SO A ROLLING UPGRADE DOES NOT ADVANCE OLD NODES. A candidate
+// binary may publish a newer verified generation while nodes on the prior binary
+// are still serving jobs. Those nodes must keep resolving @verified to their newest
+// compatible generation rather than booting a guest that will reject their metadata.
+func (c *Client) NewestVerifiedForContract(
+	ctx context.Context,
+	image, contract string,
+) (Generation, bool, error) {
+	if strings.TrimSpace(contract) == "" {
+		return Generation{}, false, fmt.Errorf("ceph: no guest contract to resolve %s against", image)
+	}
+
+	return c.newestVerified(ctx, image, contract)
+}
+
+func (c *Client) newestVerified(
+	ctx context.Context,
+	image, contract string,
+) (Generation, bool, error) {
 	name, _, _ := strings.Cut(strings.TrimSpace(image), "@")
 	if name == "" {
 		return Generation{}, false, fmt.Errorf("ceph: no image to resolve")
@@ -114,31 +141,46 @@ func (c *Client) NewestVerified(ctx context.Context, image string) (Generation, 
 		live[gen.Name] = true
 	}
 
+	verified := map[string]bool{}
+	contracts := map[string]string{}
+
+	// THE TABLE IS PARSED RATHER THAN ASKED PER KEY, because the generations are not
+	// known in advance. `image-meta list` prints a heading and then `key<spaces>value`
+	// rows. Contract values carry no whitespace, but trimming the remainder also
+	// tolerates the table alignment RBD adds.
+	for _, line := range strings.Split(string(out), "\n") {
+		key, value, ok := strings.Cut(strings.TrimSpace(line), " ")
+		if !ok {
+			continue
+		}
+
+		if generation, isVerification := strings.CutPrefix(key, VerifiedKey+"."); isVerification {
+			if _, isGeneration := ParseGeneration(generation); isGeneration {
+				verified[generation] = true
+			}
+
+			continue
+		}
+
+		if generation, isContract := strings.CutPrefix(key, GuestContractKey+"."); isContract {
+			if _, isGeneration := ParseGeneration(generation); isGeneration {
+				contracts[generation] = strings.TrimSpace(value)
+			}
+		}
+	}
+
 	var (
 		newest Generation
 		found  bool
 	)
 
-	// THE TABLE IS PARSED RATHER THAN ASKED PER KEY, because the generations are not
-	// known in advance. `image-meta list` prints a heading and then `key<spaces>value`
-	// rows; only the key is needed, so the value's own spacing cannot mislead this.
-	for _, line := range strings.Split(string(out), "\n") {
-		key, _, ok := strings.Cut(strings.TrimSpace(line), " ")
-		if !ok {
-			continue
-		}
-
-		generation, isVerification := strings.CutPrefix(key, VerifiedKey+".")
-		if !isVerification {
-			continue
-		}
-
-		gen, isGeneration := ParseGeneration(generation)
-		if !isGeneration {
-			continue
-		}
+	for generation := range verified {
+		gen, _ := ParseGeneration(generation)
 
 		if !live[gen.Name] {
+			continue
+		}
+		if contract != "" && contracts[gen.Name] != contract {
 			continue
 		}
 

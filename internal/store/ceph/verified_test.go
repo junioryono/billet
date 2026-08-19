@@ -58,6 +58,54 @@ func TestNewestVerifiedFindsNothingWhenEveryVerifiedGenerationIsGone(t *testing.
 	}
 }
 
+// @VERIFIED IS RELATIVE TO THE HOST/GUEST CONTRACT DURING A ROLLING UPGRADE.
+// Publishing the new guest must not make nodes on the prior binary select it;
+// both generations remain verified, and each binary resolves its own newest one.
+func TestNewestVerifiedForContractKeepsOldNodesOnTheirCompatibleGeneration(t *testing.T) {
+	f := &verifiedFake{
+		meta: []string{
+			VerifiedKey + ".g20260814072427  2026-08-14T07:24:27Z",
+			GuestContractKey + ".g20260814072427  6",
+			VerifiedKey + ".g20260815033431  2026-08-15T03:34:31Z",
+			GuestContractKey + ".g20260815033431  7",
+		},
+		snapshots: []string{"g20260814072427", "g20260815033431"},
+	}
+
+	client := verifiedClient(t, f)
+	old, found, err := client.NewestVerifiedForContract(t.Context(), "ubuntu-2404-x64", "6")
+	if err != nil {
+		t.Fatalf("resolve old contract: %v", err)
+	}
+	if !found || old.Name != "g20260814072427" {
+		t.Fatalf("old contract resolved to %q, found %v", old.Name, found)
+	}
+
+	current, found, err := client.NewestVerifiedForContract(t.Context(), "ubuntu-2404-x64", "7")
+	if err != nil {
+		t.Fatalf("resolve current contract: %v", err)
+	}
+	if !found || current.Name != "g20260815033431" {
+		t.Fatalf("current contract resolved to %q, found %v", current.Name, found)
+	}
+}
+
+func TestNewestVerifiedForContractDoesNotTrustMissingContractMetadata(t *testing.T) {
+	f := &verifiedFake{
+		meta:      []string{VerifiedKey + ".g20260815033431  2026-08-15T03:34:31Z"},
+		snapshots: []string{"g20260815033431"},
+	}
+
+	_, found, err := verifiedClient(t, f).NewestVerifiedForContract(
+		t.Context(), "ubuntu-2404-x64", "7")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if found {
+		t.Fatal("a legacy verification with no contract metadata was treated as compatible")
+	}
+}
+
 // verifiedFake answers the two questions NewestVerified asks: which keys the image
 // carries, and which snapshots actually exist.
 type verifiedFake struct {

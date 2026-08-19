@@ -104,12 +104,20 @@ func cmdImagesCompatible(ctx context.Context, args []string) error {
 	floating := generation == ceph.Verified
 	var verified bool
 	if floating {
-		newest, ok, err := store.NewestVerified(ctx, name)
+		newest, ok, err := store.NewestVerifiedForContract(ctx, name, firecracker.GuestContract)
 		if err != nil {
 			return err
 		}
 		if !ok {
-			return incompatibleGuest(image, "no generation has passed verification")
+			// A GENERATION VERIFIED BEFORE CONTRACT METADATA EXISTED GETS ONE REAL
+			// compatibility boot instead of forcing a multi-gigabyte replacement.
+			newest, ok, err = store.NewestVerified(ctx, name)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return incompatibleGuest(image, "no generation has passed verification")
+			}
 		}
 
 		generation = newest.Name
@@ -1305,7 +1313,7 @@ func listTierImages(ctx context.Context, store *ceph.Client, cfg *config.Config)
 			shown = true
 		}
 
-		resolved, err := store.ResolveGeneration(ctx, image)
+		resolved, err := store.ResolveGeneration(ctx, image, firecracker.GuestContract)
 		if err != nil {
 			// NOT FATAL, and printed rather than returned: a tier that cannot resolve
 			// is exactly what somebody is running this command to find out about, and

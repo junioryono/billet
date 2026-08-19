@@ -2323,7 +2323,7 @@ const deploymentForCheck = "billet-preflight"
 // than about microVMs.
 type noRootDisk struct{}
 
-func (noRootDisk) ResolveGeneration(_ context.Context, image string) (string, error) {
+func (noRootDisk) ResolveGeneration(_ context.Context, image, _ string) (string, error) {
 	return image, nil
 }
 
