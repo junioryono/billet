@@ -99,8 +99,8 @@
       - billet_upgrade_manifest.node_was_active is boolean
       - billet_upgrade_manifest.candidate_server_active is boolean
       - billet_upgrade_manifest.candidate_node_active is boolean
-      - billet_upgrade_manifest.server_enablement in ['enabled', 'enabled-runtime', 'disabled', 'static', 'indirect', 'generated', 'transient', 'not-found']
-      - billet_upgrade_manifest.node_enablement in ['enabled', 'enabled-runtime', 'disabled', 'static', 'indirect', 'generated', 'transient', 'not-found']
+      - billet_upgrade_manifest.server_enablement in ['enabled', 'enabled-runtime', 'disabled', 'static', 'indirect', 'generated', 'not-found']
+      - billet_upgrade_manifest.node_enablement in ['enabled', 'enabled-runtime', 'disabled', 'static', 'indirect', 'generated', 'not-found']
     fail_msg: >-
       The active billet upgrade manifest is incomplete or belongs to an
       unsupported transaction format. Refusing automatic recovery.

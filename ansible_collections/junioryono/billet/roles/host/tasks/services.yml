@@ -41,11 +41,12 @@
 - name: Refuse service link states rollback cannot reproduce exactly
   ansible.builtin.assert:
     that:
-      - (item.stdout | trim) in ['enabled', 'enabled-runtime', 'disabled', 'static', 'indirect', 'generated', 'transient', 'not-found']
+      - (item.stdout | trim) in ['enabled', 'enabled-runtime', 'disabled', 'static', 'indirect', 'generated', 'not-found']
     fail_msg: >-
       {{ item.item }} has systemd enablement state {{ item.stdout | trim }}.
-      Normalize masked, linked, or alias units before upgrading so rollback can
-      reproduce the exact boot topology without inventing a symlink target.
+      Normalize masked, linked, alias, or transient units before upgrading so
+      rollback can reproduce the exact boot topology without inventing a
+      symlink target or an in-memory unit definition.
   loop: "{{ billet_service_enablement_before_upgrade.results }}"
   loop_control:
     label: "{{ item.item }}"

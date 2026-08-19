@@ -40,6 +40,7 @@
         billet_recovery_cgroup_probe: "{{ billet_host_recovery_tasks | selectattr('name', 'equalto', 'Inspect service cgroups before recovering upgrade inputs') | first }}"
         billet_recovery_restore_inputs: "{{ billet_host_recovery_tasks | selectattr('name', 'equalto', 'Restore configuration and units that existed before the upgrade') | first }}"
         billet_recovery_candidate_links: "{{ billet_host_recovery_tasks | selectattr('name', 'equalto', 'Remove candidate persistent and runtime enablement links') | first }}"
+        billet_service_link_guard: "{{ billet_host_service_tasks | selectattr('name', 'equalto', 'Refuse service link states rollback cannot reproduce exactly') | first }}"
 
     - name: Render legacy-compatible and transactional units
       ansible.builtin.set_fact:
@@ -108,6 +109,7 @@
         that:
           - billet_upgrade_names.index('Gracefully stop the billet node before changing its guest contract') < billet_upgrade_names.index('Pull, boot-verify, and promote every compatible guest needed')
           - billet_top_level_names.index('Refuse service link states rollback cannot reproduce exactly') < billet_top_level_names.index('Prove every configured guest image is compatible with the candidate binary')
+          - "'transient' not in (billet_service_link_guard['ansible.builtin.assert'].that | join(' '))"
           - billet_upgrade_names.index('Pull, boot-verify, and promote every compatible guest needed') < billet_upgrade_names.index('Gracefully stop the billet server after compute has drained')
           - billet_upgrade_names.index('Gracefully stop the billet server after compute has drained') < billet_upgrade_names.index('Hide the old executable before establishing the maintenance fence')
           - billet_upgrade_names.index('Hide the old executable before establishing the maintenance fence') < billet_upgrade_names.index('Fence the ledger against operator commands during migration and rollback')
