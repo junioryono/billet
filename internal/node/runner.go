@@ -333,13 +333,14 @@ func (r *Runner) Launch(
 	cacheEndpoint, cacheToken := "", ""
 	var buildKitCacheMountLimit config.ByteSize
 	if r.cache != nil {
-		cacheToken, err = r.cache.Prepare(name, trust)
+		var credentials CacheCredentials
+		credentials, err = r.cache.Prepare(name, trust)
 		if err != nil {
 			r.log.Warn("cache access is unavailable; this job will continue cold",
 				"instance", name, "error", err)
-			cacheToken = ""
 		} else {
 			cacheEndpoint = r.cache.Endpoint()
+			cacheToken = credentials.Token
 			buildKitCacheMountLimit = tier.BuildKitCacheMountLimit
 		}
 	}
@@ -450,6 +451,43 @@ func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
 	defer r.lifecycle.Unlock()
 
 	return r.destroy(ctx, requestID)
+}
+
+// DestroyCompleted settles result-dependent cache state before removing compute.
+func (r *Runner) DestroyCompleted(ctx context.Context, requestID int64, result string) error {
+	r.lifecycle.Lock()
+	defer r.lifecycle.Unlock()
+
+	if r.cache != nil {
+		if instance := r.cacheInstanceForRequest(requestID); instance != "" {
+			succeeded := result == "succeeded"
+			r.log.Info("settling a Docker image store from a completed job",
+				"request", requestID, "instance", instance, "result", result,
+				"succeeded", succeeded)
+			if err := r.cache.SettleDocker(ctx, instance, succeeded); err != nil {
+				r.log.Warn("Docker image store was not published; compute teardown will discard it",
+					"request", requestID, "instance", instance, "result", result, "error", err)
+			}
+		}
+	}
+
+	return r.destroy(ctx, requestID)
+}
+
+func (r *Runner) cacheInstanceForRequest(requestID int64) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if inst := r.running[requestID]; inst != nil {
+		return inst.Name
+	}
+	for _, held := range r.custody {
+		if held.requestID == requestID {
+			return held.name
+		}
+	}
+
+	return ""
 }
 
 func (r *Runner) destroy(ctx context.Context, requestID int64) error {

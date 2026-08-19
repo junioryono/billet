@@ -55,6 +55,65 @@ func reserve(t *testing.T, a *Allocator, tier string) *Lease {
 	return lease
 }
 
+func TestJobForLeaseRetainsIdentityAfterRelease(t *testing.T) {
+	tiers := []config.Tier{tier("linux", 2, 4*config.GiB)}
+	a := newAllocator(t, Limits{MaxVCPU: 2, MaxMemory: 4 * config.GiB}, tiers)
+	lease := reserve(t, a, tiers[0].Label)
+
+	if err := a.Assign(t.Context(), lease.ID, lease.Epoch, 101, 11); err != nil {
+		t.Fatalf("Assign: %v", err)
+	}
+	if err := a.Release(t.Context(), lease.ID, lease.Epoch, PhaseDone); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+
+	job, err := a.JobForLease(t.Context(), lease.ID)
+	if err != nil {
+		t.Fatalf("JobForLease: %v", err)
+	}
+	if job.Tier != tiers[0].Label || job.RunID != 101 || job.RequestID != 11 {
+		t.Errorf("JobForLease = %+v, want tier %q run 101 request 11", job, tiers[0].Label)
+	}
+}
+
+func TestDirectJobIdentityIsStableAndCollisionFree(t *testing.T) {
+	a := newAllocator(t, Limits{MaxVCPU: 1, MaxMemory: config.GiB},
+		[]config.Tier{tier("linux", 1, config.GiB)})
+
+	first, err := a.IdentifyDirectJob(t.Context(), "job-a")
+	if err != nil {
+		t.Fatalf("IdentifyDirectJob(job-a): %v", err)
+	}
+	again, err := a.IdentifyDirectJob(t.Context(), "job-a")
+	if err != nil {
+		t.Fatalf("IdentifyDirectJob(job-a) again: %v", err)
+	}
+	second, err := a.IdentifyDirectJob(t.Context(), "job-b")
+	if err != nil {
+		t.Fatalf("IdentifyDirectJob(job-b): %v", err)
+	}
+
+	if first >= 0 || second >= 0 {
+		t.Errorf("direct job identities = %d and %d, want the negative namespace", first, second)
+	}
+	if again != first {
+		t.Errorf("redelivered job identity = %d, want %d", again, first)
+	}
+	if second == first {
+		t.Errorf("distinct jobs shared identity %d", first)
+	}
+	if got, exists, err := a.DirectJobIdentity(t.Context(), "job-a"); err != nil {
+		t.Fatalf("DirectJobIdentity(job-a): %v", err)
+	} else if !exists || got != first {
+		t.Errorf("DirectJobIdentity(job-a) = %d, %t, want %d, true", got, exists, first)
+	}
+	if got, exists, err := a.DirectJobIdentity(t.Context(), "job-absent"); err != nil {
+		t.Fatalf("DirectJobIdentity(job-absent): %v", err)
+	} else if exists || got != 0 {
+		t.Errorf("DirectJobIdentity(job-absent) = %d, %t, want 0, false", got, exists)
+	}
+}
+
 // newAllocator is an allocator with ONE HOST ALREADY IN IT, big enough that it
 // is never the constraint.
 //
@@ -180,6 +239,26 @@ func TestAFailureReasonSurvivesUntilJobHistory(t *testing.T) {
 	}
 	if got != reason {
 		t.Errorf("failure reason = %q, want %q", got, reason)
+	}
+}
+
+func TestExternalFailureCannotClaimInventoryProvenance(t *testing.T) {
+	a := newAllocator(t,
+		Limits{MaxVCPU: 4, MaxMemory: 16 * config.GiB},
+		[]config.Tier{tier("small", 2, 8*config.GiB)})
+	lease := reserve(t, a, "small")
+
+	if err := a.MarkFailure(
+		t.Context(), lease.ID, lease.Epoch, inventoryAbsenceFailureReason,
+	); err == nil {
+		t.Fatal("external failure claimed the marker reserved for inventory reconciliation")
+	}
+	current, err := a.Lease(t.Context(), lease.ID)
+	if err != nil {
+		t.Fatalf("Lease: %v", err)
+	}
+	if current.FailureReason != "" {
+		t.Fatalf("refused provenance marker was recorded as %q", current.FailureReason)
 	}
 }
 

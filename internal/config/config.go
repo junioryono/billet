@@ -1113,8 +1113,8 @@ type Tier struct {
 	// default group hands them to every repository in the org.
 	RunnerGroup string `yaml:"runner_group,omitempty"`
 
-	// Command starts the runner inside this tier's image. Empty means the stock runner
-	// image's `./run.sh`.
+	// Command starts the runner inside this tier's image. Empty uses the provider's
+	// packaged runner service.
 	//
 	// Expressible because a container image's default command is a shell: a backend
 	// that launches one gets a container that exits immediately while every signal
@@ -1414,6 +1414,15 @@ func (t Tier) ImageFor(provider ProviderKind) string {
 func (t Tier) RunnerCommandFor(provider ProviderKind) []string {
 	if launch, ok := t.Launch[provider]; ok && len(launch.Command) > 0 {
 		return slices.Clone(launch.Command)
+	}
+	if len(t.Command) > 0 {
+		return slices.Clone(t.Command)
+	}
+	if provider == ProviderFirecracker {
+		return []string{"./billet-runner-service"}
+	}
+	if provider == ProviderEC2 {
+		return []string{"/usr/local/bin/billet-runner"}
 	}
 
 	return t.RunnerCommand()
@@ -3514,14 +3523,17 @@ const PollInterval = 15 * time.Second
 // RunnerCommand is what starts the runner inside this tier's image.
 //
 // Defaulted here rather than in each backend so every provider agrees, and so
-// the default is stated once in a place an operator reads. `./run.sh` is
+// the default is stated once in a place an operator reads. The wrapper is
 // relative because the stock image's working directory is the runner's home.
 //
-// `./run.sh` RATHER THAN `bin/Runner.Listener`, and the reason is a loop the
-// listener does not have.
+// The generic default remains GitHub's `run.sh`, which is what the Docker runner
+// image contains. RunnerCommandFor selects `./billet-runner-service` for the
+// Firecracker image billet builds, and the full `/usr/local/bin/billet-runner`
+// entrypoint for EC2 because that script prepares and completes the cache around
+// the inner result-preserving wrapper.
 //
 // A self-hosted runner updates itself by EXITING: the listener returns "updating"
-// and `run.sh` notices and re-execs it with the same arguments — including the JIT
+// and the wrapper notices and re-execs it with the same arguments — including the JIT
 // registration, which is what lets the restarted runner go on to take the job it was
 // created for. Exec the listener directly and there is no loop: on a backend where
 // each job gets its own machine, the listener exits, the machine is destroyed as

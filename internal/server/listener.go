@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/provider"
+	"github.com/junioryono/billet/internal/state"
 )
 
 // Session is the part of a GitHub scale-set message session billet uses.
@@ -52,6 +54,27 @@ type Runner interface {
 	Destroy(ctx context.Context, requestID int64) error
 }
 
+// CompletionAwareRunner receives GitHub's authoritative completed-job result.
+// It is optional so runners that have no result-dependent teardown keep the
+// smaller Runner contract.
+type CompletionAwareRunner interface {
+	DestroyCompleted(ctx context.Context, requestID int64, result string) error
+}
+
+// BoundCompletionAwareRunner reconciles teardown with the node and lease that
+// actually held compute before a control-plane restart erased live ownership.
+type BoundCompletionAwareRunner interface {
+	DestroyCompletedBound(context.Context, int64, string, string, string, int64, alloc.Phase) error
+}
+
+// completionStore is the durable half of result-dependent teardown.
+type completionStore interface {
+	PutPendingCompletion(context.Context, state.PendingCompletion) (state.PendingCompletionDisposition, error)
+	RetirePendingCompletion(context.Context, string, int64, int64) error
+	AcknowledgePendingCompletion(context.Context, string, int64, int64) error
+	PendingCompletions(context.Context, string) ([]state.PendingCompletion, error)
+}
+
 // Sweeper is a Runner that can also find compute nothing is asking about.
 //
 // Optional, and asserted for rather than required: Launch and Destroy are
@@ -83,6 +106,10 @@ type Sweeper interface {
 // Releasing then would hand the capacity back while a container is possibly
 // still running on it.
 var ErrCustody = errors.New("server: the runner is holding this lease's capacity")
+
+// ErrHolderUnavailable means result-dependent teardown has not reached the
+// process that holds the compute, so its durable completion must be retried.
+var ErrHolderUnavailable = errors.New("server: the completion holder is unavailable")
 
 // errNoRunner means no compute is attached to this control plane.
 var errNoRunner = errors.New("server: no runner is configured, so nothing can start this job")
@@ -136,12 +163,25 @@ type Message struct {
 
 // Job identifies one workflow job.
 //
-// RequestID is the identity that matters: it is what AcquireJobs claims work by
-// and what makes a redelivered message idempotent. GitHub's own JobID is a
-// separate string field, so do not conflate the two.
+// RequestID is billet's numeric scheduler identity. GitHub's positive
+// runnerRequestId is used unchanged; a direct assignment carrying zero receives
+// a durable negative id keyed by JobID, so concurrent jobs never alias at zero.
 type Job struct {
 	RequestID int64
 	RunID     int64
+	// JobID is GitHub's stable workflow-job identity. It is required when the
+	// direct-assignment path sends RequestID zero.
+	JobID string
+	// CompletionID is the scale-set message that delivered the result. A
+	// redelivery keeps it; a later reuse of RequestID receives a different one.
+	CompletionID int64
+	// RunnerName is GitHub's name for the ephemeral runner. Completed messages
+	// can omit RequestID, so the billet-issued name is the durable route back to
+	// the lease and its assigned request.
+	RunnerName string
+	// Result is GitHub's conclusion on a completed-job message. It is empty on
+	// available and assigned messages.
+	Result string
 	// The GitHub event that queued this job — "push", "pull_request", "schedule".
 	// The ONLY thing in a scale-set message that says how far the workload can be
 	// trusted, which decides which backends may run it.
@@ -241,6 +281,9 @@ type Listener struct {
 
 	// Never nil; see noRunner.
 	runner Runner
+	// completionStore keeps authoritative job results across an ACK followed by a
+	// process stop, until the node accepts result-dependent teardown.
+	completionStore completionStore
 
 	// TotalAssignedJobs is the documented scaling signal; counting messages is
 	// not, because a response carries at most 50 and a large backlog is truncated.
@@ -300,6 +343,17 @@ func WithRunner(r Runner) Option {
 	return func(l *Listener) { l.runner = r }
 }
 
+// WithCompletionStore makes result delivery and its capacity settlement durable
+// across listener restarts.
+func WithCompletionStore(db *state.DB) Option {
+	return withCompletionStore(db)
+}
+
+// withCompletionStore admits a fault-injecting store in package tests.
+func withCompletionStore(store completionStore) Option {
+	return func(l *Listener) { l.completionStore = store }
+}
+
 // promise is escrow held for a request GitHub has been told billet will run, and
 // when that undertaking was made.
 //
@@ -329,6 +383,9 @@ type pendingCleanup struct {
 	// succeeded. Retrying a remote destroy in either case can only delay the
 	// ledger release, and during shutdown that delay can be a full node timeout.
 	releaseOnly bool
+	// retireOnly means teardown and capacity settlement are complete, but the
+	// durable tombstone still needs to be written before this id can be reused.
+	retireOnly bool
 	// Doubles after each failure, up to maxRetryEvery.
 	wait time.Duration
 	// Zero means immediately, which is what a freshly recorded failure wants.
@@ -636,6 +693,9 @@ func (l *Listener) Run(ctx context.Context) error {
 
 	if reused {
 		return fmt.Errorf("server: listener for %s has already run; build a new one", l.tier)
+	}
+	if err := l.restoreCompletions(ctx); err != nil {
+		return err
 	}
 
 	// Heartbeats run on their OWN clock, not between polls. A long poll measured
@@ -1347,7 +1407,7 @@ func waitWithin(ctx context.Context, wg *sync.WaitGroup) bool {
 func (l *Listener) destroyAll(ctx context.Context) map[int64]bool {
 	l.mu.Lock()
 
-	requests := make([]int64, 0, len(l.running)+len(l.cleanup))
+	requests := make([]Job, 0, len(l.running)+len(l.cleanup))
 
 	// NOT WHAT A RETRY IS ALREADY INSIDE. That destroy is still happening, and a
 	// second one would win the single teardown slot and spend the budget on work
@@ -1361,11 +1421,15 @@ func (l *Listener) destroyAll(ctx context.Context) map[int64]bool {
 			continue
 		}
 
-		requests = append(requests, id)
+		job := Job{RequestID: id}
+		if entry := l.cleanup[id]; entry != nil && entry.job.Result != "" {
+			job = entry.job
+		}
+		requests = append(requests, job)
 	}
 
 	for id, entry := range l.cleanup {
-		if entry.releaseOnly {
+		if entry.releaseOnly || entry.retireOnly {
 			continue
 		}
 
@@ -1378,7 +1442,7 @@ func (l *Listener) destroyAll(ctx context.Context) map[int64]bool {
 		}
 
 		if _, running := l.running[id]; !running {
-			requests = append(requests, id)
+			requests = append(requests, entry.job)
 		}
 	}
 
@@ -1398,11 +1462,12 @@ func (l *Listener) destroyAll(ctx context.Context) map[int64]bool {
 		slot = make(chan struct{}, teardownConcurrency)
 	)
 
-	for _, requestID := range requests {
+	for _, job := range requests {
 		wg.Add(1)
 
-		go func() {
+		go func(job Job) {
 			defer wg.Done()
+			requestID := job.RequestID
 
 			// CHECKED BEFORE THE SELECT, because select picks uniformly among ready
 			// cases rather than preferring a ready cancellation over a ready slot: with
@@ -1429,7 +1494,8 @@ func (l *Listener) destroyAll(ctx context.Context) map[int64]bool {
 				return
 			}
 
-			err := l.runner.Destroy(ctx, requestID)
+			lease, outcome, _ := l.completionRelease(requestID)
+			err := l.destroyCompleted(ctx, job, lease, outcome)
 
 			// CUSTODY DISCHARGES THE OBLIGATION RATHER THAN FAILING IT (#46).
 			//
@@ -1444,9 +1510,30 @@ func (l *Listener) destroyAll(ctx context.Context) map[int64]bool {
 			// destroy, but it IS a request that no longer needs anything from this
 			// listener, which is what the caller reads this map for.
 			held := errors.Is(err, ErrCustody)
+			persisted := true
+			retired := true
+			if held {
+				retired = l.forgetCompletion(ctx, job)
+				if !retired {
+					l.parkRetirement(job)
+				}
+			} else if err == nil {
+				if lease == nil {
+					retired = l.forgetCompletion(ctx, job)
+					persisted = retired
+					if !retired {
+						l.parkRetirement(job)
+					}
+				} else if persistErr := l.recordReleaseOnly(ctx, job, lease, outcome); persistErr != nil {
+					persisted = false
+					l.parkReleaseOnly(job, lease, outcome)
+					l.log.Error("compute was confirmed absent, but its release-only obligation could not be made durable; capacity stays held until this is retried",
+						"tier", l.tier, "request", requestID, "lease", lease.ID, "error", persistErr)
+				}
+			}
 
 			mu.Lock()
-			done[requestID] = err == nil || held
+			done[requestID] = (err == nil && persisted) || held
 			mu.Unlock()
 
 			if held {
@@ -1467,7 +1554,12 @@ func (l *Listener) destroyAll(ctx context.Context) map[int64]bool {
 
 				l.mu.Lock()
 				delete(l.running, requestID)
-				delete(l.cleanup, requestID)
+				if retired {
+					if entry := l.cleanup[requestID]; entry == nil ||
+						entry.job.CompletionID == 0 || entry.job.CompletionID == job.CompletionID {
+						delete(l.cleanup, requestID)
+					}
+				}
 				l.mu.Unlock()
 
 				return
@@ -1482,18 +1574,6 @@ func (l *Listener) destroyAll(ctx context.Context) map[int64]bool {
 				return
 			}
 
-			if held {
-				l.log.Info("the compute for this job was asked to stop and has not been "+
-					"confirmed gone; the runner is holding its capacity until it is",
-					"tier", l.tier, "request", requestID)
-
-				l.mu.Lock()
-				delete(l.cleanup, requestID)
-				l.mu.Unlock()
-
-				return
-			}
-
 			l.mu.Lock()
 
 			// AN ENTRY CARRYING A LEASE IS NOT DISCHARGED BY THE DESTROY ALONE.
@@ -1503,12 +1583,12 @@ func (l *Listener) destroyAll(ctx context.Context) map[int64]bool {
 			// CAPACITY whose release never landed, and deleting it here dropped the
 			// last reference before releaseAll could see it — leaving the ledger
 			// charging for a job that never started.
-			if entry, ok := l.cleanup[requestID]; !ok || entry.lease == nil {
+			if entry, ok := l.cleanup[requestID]; (!ok || entry.lease == nil) && retired {
 				delete(l.cleanup, requestID)
 			}
 
 			l.mu.Unlock()
-		}()
+		}(job)
 	}
 
 	wg.Wait()
@@ -1544,9 +1624,21 @@ func (l *Listener) attempt(ctx context.Context, job Job) {
 		return
 	}
 
+	if entry.retireOnly {
+		retireJob := entry.job
+		l.mu.Unlock()
+		l.retireParked(ctx, entry, retireJob)
+
+		return
+	}
+
 	if entry.releaseOnly {
 		l.mu.Unlock()
-		l.releaseParked(ctx, job.RequestID)
+		if handled, settled := l.releaseParked(ctx, job.RequestID); handled && settled {
+			if !l.forgetCompletion(ctx, job) {
+				l.parkRetirement(job)
+			}
+		}
 
 		return
 	}
@@ -1882,6 +1974,49 @@ func (l *Listener) refillEscrow(ctx context.Context) error {
 // about error severity, so the first non-fatal error path anyone adds inherits
 // the question.
 func (l *Listener) handle(ctx context.Context, msg *Message) error {
+	// COMPLETED IS PROCESSED FIRST. Otherwise the cycle never closes — the lease stays
+	// open until the reaper expires it — and it must come first because GitHub batches
+	// the completion of one job with the offer of its replacement: acquiring before
+	// releasing claims the replacement while still holding the finished job's lease.
+	//
+	// `finished` is scoped to THIS MESSAGE, which is the whole lifetime the problem
+	// has. A batch can carry Assigned and Completed for the same request — an
+	// assigned-then-cancelled job — and it does not need to survive the call, because a
+	// redelivery rebuilds it before the assignments are read. A longer-lived map would
+	// silently skip a request id GitHub requeued after cancelling it.
+	finished := make(map[int64]struct{}, len(msg.Completed))
+
+	for i := range msg.Completed {
+		job := msg.Completed[i]
+		job.CompletionID = msg.MessageID
+		var err error
+		job, err = l.identifyCompletion(ctx, job)
+		if err != nil {
+			return err
+		}
+		// The resolved identity must reach acknowledgement too. Keeping it only
+		// in this loop would settle request N and then try to acknowledge request
+		// zero, leaving the durable completion blocked forever.
+		msg.Completed[i] = job
+		l.log.Info("received a completed job", "tier", l.tier, "request", job.RequestID,
+			"runner", job.RunnerName, "result", job.Result)
+		// THE DELIVERY IS TERMINAL EVEN WHEN ITS TEARDOWN ALREADY SETTLED. A
+		// failed acknowledgement redelivers the whole batch, including an Assigned
+		// entry for an assigned-then-cancelled job. Retired means "do not destroy
+		// again", not "the assignment is live again". Stale means a newer delivery
+		// already decided this request, so the older assignment is no more runnable.
+		finished[job.RequestID] = struct{}{}
+
+		disposition, err := l.recordCompletion(ctx, job)
+		if err != nil {
+			return err
+		}
+		if disposition != state.PendingCompletionActionable {
+			continue
+		}
+		l.complete(ctx, job)
+	}
+
 	// A zero advertisement is not the same as refusing work, and this is where
 	// the difference is enforced.
 	//
@@ -1899,6 +2034,7 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 		if err := l.acknowledge(ctx, msg); err != nil {
 			return err
 		}
+		l.acknowledgeCompletions(ctx, msg)
 
 		// Advanced here too. The invariant is "a successful acknowledgement
 		// advances the cursor", and an early return that acknowledges without
@@ -1906,24 +2042,6 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 		l.lastMessageID = msg.MessageID
 
 		return nil
-	}
-
-	// COMPLETED IS PROCESSED FIRST. Otherwise the cycle never closes — the lease stays
-	// open until the reaper expires it — and it must come first because GitHub batches
-	// the completion of one job with the offer of its replacement: acquiring before
-	// releasing claims the replacement while still holding the finished job's lease.
-	//
-	// `finished` is scoped to THIS MESSAGE, which is the whole lifetime the problem
-	// has. A batch can carry Assigned and Completed for the same request — an
-	// assigned-then-cancelled job — and it does not need to survive the call, because a
-	// redelivery rebuilds it before the assignments are read. A longer-lived map would
-	// silently skip a request id GitHub requeued after cancelling it.
-	finished := make(map[int64]struct{}, len(msg.Completed))
-
-	for _, job := range msg.Completed {
-		finished[job.RequestID] = struct{}{}
-
-		l.complete(ctx, job)
 	}
 
 	// NO NEW WORK WHILE DRAINING, and the refusal has to be HERE rather than in
@@ -1973,6 +2091,11 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 	// would stall every heartbeat behind it, and heartbeats are what keep the
 	// escrow alive. So assign returns what it bound and the launches follow.
 	for _, job := range msg.Assigned {
+		var err error
+		job, err = l.identifyAssigned(ctx, job)
+		if err != nil {
+			return err
+		}
 		if _, over := finished[job.RequestID]; over {
 			continue
 		}
@@ -2000,6 +2123,7 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 	if err := l.acknowledge(ctx, msg); err != nil {
 		return err
 	}
+	l.acknowledgeCompletions(ctx, msg)
 
 	// Only now. An unacknowledged message is redelivered, and re-handling one is
 	// safe once the acquisition outcome is KNOWN: completions rebuild their own
@@ -2019,6 +2143,82 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 	return nil
 }
 
+// identifyAssigned gives a direct assignment its durable scheduler identity.
+func (l *Listener) identifyAssigned(ctx context.Context, job Job) (Job, error) {
+	if job.RequestID != 0 {
+		return job, nil
+	}
+	if l.alloc == nil {
+		return Job{}, fmt.Errorf("%w: %s assigned job %q without a request id, and no ledger is available to identify it",
+			ErrUntrustworthySession, l.tier, job.JobID)
+	}
+
+	requestID, err := l.alloc.IdentifyDirectJob(ctx, job.JobID)
+	if err != nil {
+		return Job{}, fmt.Errorf("%w: %s cannot identify directly assigned job %q: %w",
+			ErrUntrustworthySession, l.tier, job.JobID, err)
+	}
+	job.RequestID = requestID
+
+	return job, nil
+}
+
+// identifyCompletion resolves a zero wire id through the runner's lease, or
+// through job id when there is no durable lease identity to recover.
+func (l *Listener) identifyCompletion(ctx context.Context, job Job) (Job, error) {
+	if job.RequestID != 0 {
+		return job, nil
+	}
+	if l.alloc == nil {
+		return Job{}, fmt.Errorf("%w: %s completed runner %q without a request id, and no ledger is available to resolve it",
+			ErrUntrustworthySession, l.tier, job.RunnerName)
+	}
+
+	leaseID, ok := provider.LeaseOf(job.RunnerName)
+	if ok {
+		identity, err := l.alloc.JobForLease(ctx, leaseID)
+		switch {
+		case err == nil:
+			if identity.Tier != l.tier || identity.RequestID == 0 {
+				return Job{}, fmt.Errorf("%w: completed runner %q resolves to tier %q request %d, not tier %q",
+					ErrUntrustworthySession, job.RunnerName, identity.Tier, identity.RequestID, l.tier)
+			}
+			if job.RunID != 0 && identity.RunID != 0 && job.RunID != identity.RunID {
+				return Job{}, fmt.Errorf("%w: completed runner %q reports run %d but its lease records run %d",
+					ErrUntrustworthySession, job.RunnerName, job.RunID, identity.RunID)
+			}
+			if job.JobID != "" {
+				mapped, exists, err := l.alloc.DirectJobIdentity(ctx, job.JobID)
+				if err != nil {
+					return Job{}, fmt.Errorf("%w: %s cannot cross-check completed job %q: %w",
+						ErrUntrustworthySession, l.tier, job.JobID, err)
+				}
+				if exists && mapped != identity.RequestID {
+					return Job{}, fmt.Errorf("%w: completed runner %q resolves to request %d but job %q resolves to %d",
+						ErrUntrustworthySession, job.RunnerName, identity.RequestID, job.JobID, mapped)
+				}
+			}
+
+			job.RequestID = identity.RequestID
+			if job.RunID == 0 {
+				job.RunID = identity.RunID
+			}
+
+			return job, nil
+		case !errors.Is(err, alloc.ErrLeaseNotFound):
+			return Job{}, fmt.Errorf("%w: %s cannot resolve completed runner %q: %w",
+				ErrUntrustworthySession, l.tier, job.RunnerName, err)
+		}
+	}
+
+	if job.JobID != "" {
+		return l.identifyAssigned(ctx, job)
+	}
+
+	return Job{}, fmt.Errorf("%w: %s completed runner %q without a request id, job id, or resolvable billet lease",
+		ErrUntrustworthySession, l.tier, job.RunnerName)
+}
+
 // acknowledge tells GitHub the message was handled. An unacknowledged message is
 // redelivered, which is why everything above it has to be idempotent.
 func (l *Listener) acknowledge(ctx context.Context, msg *Message) error {
@@ -2027,6 +2227,22 @@ func (l *Listener) acknowledge(ctx context.Context, msg *Message) error {
 	}
 
 	return nil
+}
+
+// acknowledgeCompletions records that GitHub will not redeliver the
+// source message. The store removes a row only once it is also retired.
+func (l *Listener) acknowledgeCompletions(ctx context.Context, msg *Message) {
+	if l.completionStore == nil {
+		return
+	}
+	for _, job := range msg.Completed {
+		if err := l.completionStore.AcknowledgePendingCompletion(
+			ctx, l.tier, job.RequestID, msg.MessageID,
+		); err != nil {
+			l.log.Error("a completion acknowledgement could not be made durable; recovery remains conservatively blocked",
+				"tier", l.tier, "request", job.RequestID, "message", msg.MessageID, "error", err)
+		}
+	}
 }
 
 // acquire claims the offers this listener has escrow to back, reserving that
@@ -2046,15 +2262,39 @@ func (l *Listener) acquire(ctx context.Context, available []Job) error {
 		return nil
 	}
 
-	reserved := l.reserve(available)
-	if len(reserved) == 0 {
-		return nil
+	identified := make([]Job, 0, len(available))
+	protocolFor := make(map[int64]int64, len(available))
+	internalFor := make(map[int64]int64, len(available))
+	for _, job := range available {
+		protocolID := job.RequestID
+		var err error
+		job, err = l.identifyAssigned(ctx, job)
+		if err != nil {
+			return err
+		}
+		identified = append(identified, job)
+		protocolFor[job.RequestID] = protocolID
+		if prior, duplicate := internalFor[protocolID]; duplicate && prior != job.RequestID {
+			return fmt.Errorf("%w: %s offered distinct jobs %d and %d under the same runner request id %d; the acquisition response cannot distinguish them",
+				ErrUntrustworthySession, l.tier, prior, job.RequestID, protocolID)
+		}
+		internalFor[protocolID] = job.RequestID
 	}
 
-	acquired, err := l.session.AcquireJobs(ctx, reserved)
+	reservedInternal := l.reserve(identified)
+	if len(reservedInternal) == 0 {
+		return nil
+	}
+	reservedProtocol := make([]int64, 0, len(reservedInternal))
+	for _, internalID := range reservedInternal {
+		protocolID := protocolFor[internalID]
+		reservedProtocol = append(reservedProtocol, protocolID)
+	}
+
+	acquiredProtocol, err := l.session.AcquireJobs(ctx, reservedProtocol)
 	if err != nil {
 		// Nothing was promised, so nothing stays reserved.
-		l.unreserve(reserved)
+		l.unreserve(reservedInternal)
 
 		return fmt.Errorf("server: acquire jobs for %s: %w", l.tier, err)
 	}
@@ -2073,22 +2313,26 @@ func (l *Listener) acquire(ctx context.Context, available []Job) error {
 	// over one is disproportionate. A response outside its own contract is not
 	// reachable by any race, and stopping is also the remedy: the session is recreated
 	// and GitHub redelivers whatever was unacknowledged.
-	if extra := missing(acquired, reserved); len(extra) > 0 {
+	if extra := missing(acquiredProtocol, reservedProtocol); len(extra) > 0 {
 		// Everything, not just the unmatched ids. Which commitments are real is
 		// exactly what is no longer known.
-		l.unreserve(reserved)
+		l.unreserve(reservedInternal)
 
 		return fmt.Errorf("%w: %s acquired job requests it did not offer for "+
 			"(unrequested %v, requested %v); refusing to continue against a scale-set "+
 			"response that is not a subset of its request",
-			ErrUntrustworthySession, l.tier, extra, reserved)
+			ErrUntrustworthySession, l.tier, extra, reservedProtocol)
 	}
 
 	// GitHub returns what it ACTUALLY gave, which can be fewer than were asked
 	// for — another scale set can win the same offer. Escrow reserved for an
 	// offer billet did not get goes back immediately; holding it would strand
 	// capacity waiting for an assignment that is never coming.
-	l.unreserve(missing(reserved, acquired))
+	acquiredInternal := make([]int64, 0, len(acquiredProtocol))
+	for _, protocolID := range acquiredProtocol {
+		acquiredInternal = append(acquiredInternal, internalFor[protocolID])
+	}
+	l.unreserve(missing(reservedInternal, acquiredInternal))
 
 	return nil
 }
@@ -2440,10 +2684,12 @@ func (l *Listener) leaseFor(requestID int64) *alloc.Lease {
 // A CONCLUSIVE ERROR IS AS GOOD AS SUCCESS, and telling the two apart from an
 // outage is the whole point. ErrFenced means somebody else already reclaimed it
 // and this caller's epoch is stale; ErrLeaseNotFound means it is gone or already
-// terminal. Neither can be improved by holding a reference and trying again —
-// but a busy database or a cancelled context can.
+// terminal; ErrConflict means it is terminal with the opposite outcome. None can
+// be improved by holding a reference and trying again — but a busy database or a
+// cancelled context can.
 func releaseSettled(err error) bool {
-	return err == nil || errors.Is(err, alloc.ErrFenced) || errors.Is(err, alloc.ErrLeaseNotFound)
+	return err == nil || errors.Is(err, alloc.ErrFenced) || errors.Is(err, alloc.ErrLeaseNotFound) ||
+		errors.Is(err, alloc.ErrConflict)
 }
 
 // releaseAbsent returns capacity after the runner has proved no compute exists.
@@ -2477,21 +2723,35 @@ func (l *Listener) releaseAbsent(ctx context.Context, requestID int64, lease *al
 // The allocator call stays outside the listener mutex. A SQLite writer can be
 // busy behind an operator command, and holding the mutex there would stall lease
 // renewal for every unrelated job in this tier.
-func (l *Listener) releaseParked(ctx context.Context, requestID int64) bool {
+func (l *Listener) releaseParked(ctx context.Context, requestID int64) (bool, bool) {
 	l.mu.Lock()
 	entry, ok := l.cleanup[requestID]
 	if !ok || !entry.releaseOnly || entry.lease == nil {
 		l.mu.Unlock()
 
-		return false
+		return false, false
 	}
 
 	lease := entry.lease
+	job := entry.job
 	outcome := entry.outcome
 	if outcome == "" {
 		outcome = alloc.PhaseDone
 	}
 	l.mu.Unlock()
+
+	if err := l.recordReleaseOnly(ctx, job, lease, outcome); err != nil {
+		l.mu.Lock()
+		current, stillPending := l.cleanup[requestID]
+		if stillPending && current == entry {
+			entry.failed(time.Now(), l.retryFirst, l.retryMax)
+		}
+		l.mu.Unlock()
+		l.log.Error("compute is confirmed absent, but capacity stays held until its release-only obligation is durable",
+			"tier", l.tier, "request", requestID, "lease", lease.ID, "error", err)
+
+		return true, false
+	}
 
 	relErr := l.releaseAbsent(ctx, requestID, lease, outcome)
 
@@ -2500,7 +2760,7 @@ func (l *Listener) releaseParked(ctx context.Context, requestID int64) bool {
 
 	current, stillPending := l.cleanup[requestID]
 	if !stillPending || current != entry {
-		return true
+		return true, false
 	}
 
 	if !releaseSettled(relErr) {
@@ -2509,14 +2769,269 @@ func (l *Listener) releaseParked(ctx context.Context, requestID int64) bool {
 			"held until this is retried",
 			"tier", l.tier, "request", requestID, "lease", lease.ID, "error", relErr)
 
-		return true
+		return true, false
 	}
 
 	delete(l.cleanup, requestID)
 	delete(l.running, requestID)
 	delete(l.acquiring, requestID)
 
+	return true, true
+}
+
+func (l *Listener) recordCompletion(
+	ctx context.Context,
+	job Job,
+) (state.PendingCompletionDisposition, error) {
+	if l.completionStore == nil || job.Result == "" {
+		return state.PendingCompletionActionable, nil
+	}
+
+	lease, outcome, releaseOnly := l.completionRelease(job.RequestID)
+	completion := state.PendingCompletion{
+		Tier: l.tier, RequestID: job.RequestID, RunID: job.RunID, Result: job.Result,
+		MessageID: job.CompletionID,
+	}
+	if lease != nil {
+		completion.LeaseID = lease.ID
+		completion.LeaseEpoch = lease.Epoch
+		completion.LeaseNode = lease.Node
+		completion.Outcome = string(outcome)
+		completion.ReleaseOnly = releaseOnly
+	}
+	disposition, err := l.completionStore.PutPendingCompletion(ctx, completion)
+	if err != nil {
+		return state.PendingCompletionActionable, fmt.Errorf("server: preserve completed result for %s request %d before acknowledging it: %w",
+			l.tier, job.RequestID, err)
+	}
+
+	return disposition, nil
+}
+
+// recordReleaseOnly makes successful node teardown durable before the local
+// lease release is attempted. It deliberately outlives cancellation for one
+// bounded local-write budget: otherwise shutdown would preserve a row that asks
+// restart recovery to contact a node for compute already proved absent.
+func (l *Listener) recordReleaseOnly(
+	ctx context.Context,
+	job Job,
+	lease *alloc.Lease,
+	outcome alloc.Phase,
+) error {
+	if l.completionStore == nil || job.Result == "" || lease == nil {
+		return nil
+	}
+	if outcome == "" {
+		outcome = alloc.PhaseDone
+	}
+	persistCtx, cancel := withoutCancelWithin(ctx, l.releaseGrace)
+	defer cancel()
+	completion := state.PendingCompletion{
+		Tier: l.tier, RequestID: job.RequestID, RunID: job.RunID, Result: job.Result,
+		LeaseID: lease.ID, LeaseEpoch: lease.Epoch, LeaseNode: lease.Node,
+		Outcome: string(outcome), ReleaseOnly: true, MessageID: job.CompletionID,
+	}
+	disposition, err := l.completionStore.PutPendingCompletion(persistCtx, completion)
+	if err != nil {
+		return fmt.Errorf("server: preserve release-only completion for %s request %d: %w",
+			l.tier, job.RequestID, err)
+	}
+	if disposition != state.PendingCompletionActionable {
+		return fmt.Errorf("server: completion for %s request %d message %d is no longer current",
+			l.tier, job.RequestID, job.CompletionID)
+	}
+
+	return nil
+}
+
+// withoutCancelWithin survives an ordinary caller cancellation without extending
+// an existing shutdown deadline.
+func withoutCancelWithin(ctx context.Context, grace time.Duration) (context.Context, context.CancelFunc) {
+	base := context.WithoutCancel(ctx)
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < grace {
+		return context.WithDeadline(base, deadline)
+	}
+
+	return context.WithTimeout(base, grace)
+}
+
+// parkReleaseOnly retains capacity whose compute is gone until persistence and
+// allocator release both settle.
+func (l *Listener) parkReleaseOnly(job Job, lease *alloc.Lease, outcome alloc.Phase) {
+	if lease == nil {
+		return
+	}
+	if outcome == "" {
+		outcome = alloc.PhaseDone
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.cleanup == nil {
+		l.cleanup = make(map[int64]*pendingCleanup)
+	}
+	entry := l.cleanup[job.RequestID]
+	if entry != nil && entry.job.CompletionID > job.CompletionID {
+		return
+	}
+	if entry == nil {
+		entry = &pendingCleanup{job: job}
+		l.cleanup[job.RequestID] = entry
+	} else if job.Result != "" {
+		entry.job = job
+	}
+	entry.lease = lease
+	entry.outcome = outcome
+	entry.releaseOnly = true
+	entry.failed(time.Now(), l.retryFirst, l.retryMax)
+}
+
+// completionRelease snapshots the capacity obligation before GitHub's message
+// can be acknowledged. A node teardown and a ledger release are one ordered
+// completion; restart recovery needs the fenced lease identity to finish the
+// second half if the process stops between them.
+func (l *Listener) completionRelease(requestID int64) (*alloc.Lease, alloc.Phase, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if entry := l.cleanup[requestID]; entry != nil && entry.lease != nil {
+		outcome := entry.outcome
+		if outcome == "" {
+			outcome = alloc.PhaseDone
+		}
+
+		return entry.lease, outcome, entry.releaseOnly
+	}
+	if lease := l.running[requestID]; lease != nil {
+		return lease, alloc.PhaseDone, false
+	}
+	if promise := l.acquiring[requestID]; promise != nil {
+		return promise.lease, alloc.PhaseDone, false
+	}
+
+	return nil, "", false
+}
+
+func (l *Listener) forgetCompletion(ctx context.Context, job Job) bool {
+	if l.completionStore == nil || job.Result == "" {
+		return true
+	}
+	if err := l.completionStore.RetirePendingCompletion(
+		ctx, l.tier, job.RequestID, job.CompletionID,
+	); err != nil {
+		l.log.Error("a completed job settled, but its durable tombstone could not be written; its request id stays blocked until this is retried",
+			"tier", l.tier, "request", job.RequestID, "error", err)
+
+		return false
+	}
+
 	return true
+}
+
+func (l *Listener) parkRetirement(job Job) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.cleanup == nil {
+		l.cleanup = make(map[int64]*pendingCleanup)
+	}
+	entry := l.cleanup[job.RequestID]
+	if entry != nil && entry.job.CompletionID > job.CompletionID {
+		return
+	}
+	if entry == nil {
+		entry = &pendingCleanup{}
+		l.cleanup[job.RequestID] = entry
+	}
+	entry.job = job
+	entry.lease = nil
+	entry.releaseOnly = false
+	entry.retireOnly = true
+	entry.failed(time.Now(), l.retryFirst, l.retryMax)
+}
+
+// retireParked retries only the durable tombstone, never the teardown it follows.
+func (l *Listener) retireParked(ctx context.Context, entry *pendingCleanup, job Job) {
+	if !l.forgetCompletion(ctx, job) {
+		return
+	}
+	l.mu.Lock()
+	if l.cleanup[job.RequestID] == entry {
+		delete(l.cleanup, job.RequestID)
+	}
+	l.mu.Unlock()
+}
+
+// retryParkedRetirement reports whether this delivery is already past teardown.
+func (l *Listener) retryParkedRetirement(ctx context.Context, job Job) bool {
+	l.mu.Lock()
+	entry := l.cleanup[job.RequestID]
+	if entry == nil || !entry.retireOnly ||
+		(entry.job.CompletionID != 0 && entry.job.CompletionID != job.CompletionID) {
+		l.mu.Unlock()
+
+		return false
+	}
+	retireJob := entry.job
+	l.mu.Unlock()
+	l.retireParked(ctx, entry, retireJob)
+
+	return true
+}
+
+// deleteCompletionCleanup cannot let an older message remove a reused id's obligation.
+func (l *Listener) deleteCompletionCleanup(job Job) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	entry := l.cleanup[job.RequestID]
+	if entry == nil {
+		return
+	}
+	if entry.job.CompletionID != 0 && entry.job.CompletionID != job.CompletionID {
+		return
+	}
+	delete(l.cleanup, job.RequestID)
+}
+
+func (l *Listener) restoreCompletions(ctx context.Context) error {
+	if l.completionStore == nil {
+		return nil
+	}
+	completions, err := l.completionStore.PendingCompletions(ctx, l.tier)
+	if err != nil {
+		return fmt.Errorf("server: restore pending completions for %s: %w", l.tier, err)
+	}
+
+	l.mu.Lock()
+	for i := range completions {
+		completion := &completions[i]
+		job := Job{RequestID: completion.RequestID, RunID: completion.RunID, Result: completion.Result,
+			CompletionID: completion.MessageID}
+		if completion.Retired {
+			continue
+		}
+		if entry := l.cleanup[job.RequestID]; entry != nil {
+			entry.job = job
+			if completion.LeaseID != "" {
+				entry.lease = &alloc.Lease{ID: completion.LeaseID, Epoch: completion.LeaseEpoch,
+					Node: completion.LeaseNode}
+				entry.outcome = alloc.Phase(completion.Outcome)
+				entry.releaseOnly = completion.ReleaseOnly
+			}
+
+			continue
+		}
+		entry := &pendingCleanup{job: job}
+		if completion.LeaseID != "" {
+			entry.lease = &alloc.Lease{ID: completion.LeaseID, Epoch: completion.LeaseEpoch,
+				Node: completion.LeaseNode}
+			entry.outcome = alloc.Phase(completion.Outcome)
+			entry.releaseOnly = completion.ReleaseOnly
+		}
+		l.cleanup[job.RequestID] = entry
+	}
+	l.mu.Unlock()
+
+	return nil
 }
 
 // complete releases the lease a finished job was running on.
@@ -2537,10 +3052,23 @@ func (l *Listener) releaseParked(ctx context.Context, requestID int64) bool {
 // always nil is an invitation to wire the next failure mode through it, and the
 // branch handling it would never run.
 func (l *Listener) complete(ctx context.Context, job Job) {
+	// A redelivery after teardown and release settled can only retry the durable
+	// tombstone. Repeating teardown here could address replacement compute if the
+	// source reused the request id after an acknowledgement failure.
+	if l.retryParkedRetirement(ctx, job) {
+		return
+	}
+
 	// A previous attempt already established that no compute exists. Repeating a
 	// remote destroy adds no proof, and on shutdown it can wait a full node timeout
 	// before the local release that is the only work left.
-	if l.releaseParked(ctx, job.RequestID) {
+	if handled, settled := l.releaseParked(ctx, job.RequestID); handled {
+		if settled {
+			if !l.forgetCompletion(ctx, job) {
+				l.parkRetirement(job)
+			}
+		}
+
 		return
 	}
 
@@ -2563,9 +3091,9 @@ func (l *Listener) complete(ctx context.Context, job Job) {
 	// the code that would resolve the quarantine has nothing left to name. The
 	// capacity stays charged until a node happens to report an inventory, or
 	// forever if that node never comes back.
-	before := l.leaseFor(job.RequestID)
+	before, beforeOutcome, _ := l.completionRelease(job.RequestID)
 
-	if err := l.runner.Destroy(ctx, job.RequestID); err != nil {
+	if err := l.destroyCompleted(ctx, job, before, beforeOutcome); err != nil {
 		// THE RUNNER IS HOLDING IT, SO THIS LISTENER LETS GO (#46).
 		//
 		// A backend whose teardown is asynchronous cannot answer this call with
@@ -2582,13 +3110,22 @@ func (l *Listener) complete(ctx context.Context, job Job) {
 		// finished, and a redelivered completion must not find this listener still
 		// claiming the job.
 		if errors.Is(err, ErrCustody) {
+			retired := l.forgetCompletion(ctx, job)
+			if !retired {
+				l.parkRetirement(job)
+			}
 			l.log.Info("the compute for a finished job was asked to stop and has not been "+
 				"confirmed gone; the runner is holding its capacity until it is",
 				"tier", l.tier, "request", job.RequestID)
 
 			l.mu.Lock()
 			delete(l.running, job.RequestID)
-			delete(l.cleanup, job.RequestID)
+			if retired {
+				if entry := l.cleanup[job.RequestID]; entry == nil ||
+					entry.job.CompletionID == 0 || entry.job.CompletionID == job.CompletionID {
+					delete(l.cleanup, job.RequestID)
+				}
+			}
 			l.mu.Unlock()
 
 			return
@@ -2627,9 +3164,16 @@ func (l *Listener) complete(ctx context.Context, job Job) {
 		_, held := l.running[job.RequestID]
 
 		if entry, ok := l.cleanup[job.RequestID]; ok {
+			// A heartbeat can create the obligation before GitHub's completion
+			// arrives. Keep the authoritative result so its retry takes the same
+			// result-dependent teardown path as this attempt.
+			if job.Result != "" {
+				entry.job = job
+			}
 			// A RETRY THAT FAILED AGAIN, so it waits longer before the next one.
 			entry.failed(time.Now(), l.retryFirst, l.retryMax)
-		} else if _, promised := l.acquiring[job.RequestID]; held || promised {
+		} else if _, promised := l.acquiring[job.RequestID]; held || promised ||
+			(l.completionStore != nil && job.Result != "") {
 			if l.cleanup == nil {
 				l.cleanup = make(map[int64]*pendingCleanup)
 			}
@@ -2659,8 +3203,19 @@ func (l *Listener) complete(ctx context.Context, job Job) {
 		return
 	}
 
+	durableLease, durableOutcome, _ := l.completionRelease(job.RequestID)
+	if durableLease == nil {
+		durableLease, durableOutcome = before, beforeOutcome
+	}
+	if err := l.recordReleaseOnly(ctx, job, durableLease, durableOutcome); err != nil {
+		l.parkReleaseOnly(job, durableLease, durableOutcome)
+		l.log.Error("compute was confirmed absent, but its release-only obligation could not be made durable; capacity stays held until this is retried",
+			"tier", l.tier, "request", job.RequestID, "lease", durableLease.ID, "error", err)
+
+		return
+	}
+
 	l.mu.Lock()
-	defer l.mu.Unlock()
 
 	lease, ok := l.running[job.RequestID]
 
@@ -2705,7 +3260,12 @@ func (l *Listener) complete(ctx context.Context, job Job) {
 		// Nothing left to retry either way — including for a lease that was fenced
 		// or reaped out from under this listener, whose entry would otherwise sit
 		// in the map being retried for the life of the process.
-		delete(l.cleanup, job.RequestID)
+		l.mu.Unlock()
+		if l.forgetCompletion(ctx, job) {
+			l.deleteCompletionCleanup(job)
+		} else {
+			l.parkRetirement(job)
+		}
 
 		return
 	}
@@ -2776,6 +3336,7 @@ func (l *Listener) complete(ctx context.Context, job Job) {
 
 		delete(l.running, job.RequestID)
 		delete(l.acquiring, job.RequestID)
+		l.mu.Unlock()
 
 		return
 	}
@@ -2783,7 +3344,33 @@ func (l *Listener) complete(ctx context.Context, job Job) {
 	// RELEASED, so the job is finally over and there is nothing to retry.
 	delete(l.running, job.RequestID)
 	delete(l.acquiring, job.RequestID)
-	delete(l.cleanup, job.RequestID)
+	l.mu.Unlock()
+	if l.forgetCompletion(ctx, job) {
+		l.deleteCompletionCleanup(job)
+	} else {
+		l.parkRetirement(job)
+	}
+}
+
+func (l *Listener) destroyCompleted(
+	ctx context.Context,
+	job Job,
+	lease *alloc.Lease,
+	outcome alloc.Phase,
+) error {
+	if outcome == "" {
+		outcome = alloc.PhaseDone
+	}
+	if runner, ok := l.runner.(BoundCompletionAwareRunner); ok && job.Result != "" &&
+		lease != nil && lease.ID != "" && lease.Node != "" {
+		return runner.DestroyCompletedBound(
+			ctx, job.RequestID, job.Result, lease.ID, lease.Node, lease.Epoch, outcome)
+	}
+	if runner, ok := l.runner.(CompletionAwareRunner); ok && job.Result != "" {
+		return runner.DestroyCompleted(ctx, job.RequestID, job.Result)
+	}
+
+	return l.runner.Destroy(ctx, job.RequestID)
 }
 
 // releaseAll hands back capacity that was escrowed and never used.
@@ -2817,8 +3404,12 @@ func (l *Listener) releaseAll(ctx context.Context, destroyed map[int64]bool) {
 	// its lease here rather than in `running`, and shutdown is the last chance
 	// anything in this process has to hand that capacity back.
 	parked := make(map[int64]*pendingCleanup, len(l.cleanup))
+	retirements := make([]Job, 0, len(l.cleanup))
 
 	for id, entry := range l.cleanup {
+		if entry.retireOnly {
+			retirements = append(retirements, entry.job)
+		}
 		if entry.lease != nil {
 			parked[id] = entry
 		}
@@ -2827,6 +3418,9 @@ func (l *Listener) releaseAll(ctx context.Context, destroyed map[int64]bool) {
 	l.held = nil
 	l.acquiring = make(map[int64]*promise)
 	l.mu.Unlock()
+	for _, job := range retirements {
+		l.forgetCompletion(ctx, job)
+	}
 
 	// WHAT DID NOT LAND IS PUT BACK, rather than dropped on the floor. These were
 	// cleared above so nothing new could take them mid-shutdown; a release that
@@ -2835,7 +3429,8 @@ func (l *Listener) releaseAll(ctx context.Context, destroyed map[int64]bool) {
 	var stuck []*alloc.Lease
 
 	release := func(lease *alloc.Lease) {
-		if err := l.alloc.Release(ctx, lease.ID, lease.Epoch, alloc.PhaseDone); err != nil {
+		err := l.alloc.Release(ctx, lease.ID, lease.Epoch, alloc.PhaseDone)
+		if err != nil {
 			l.log.Warn("could not release escrowed capacity",
 				"tier", l.tier, "lease", lease.ID, "error", err)
 
@@ -2878,7 +3473,17 @@ func (l *Listener) releaseAll(ctx context.Context, destroyed map[int64]bool) {
 			continue
 		}
 
-		release(lease)
+		err := l.releaseAbsent(ctx, requestID, lease, alloc.PhaseDone)
+		if !releaseSettled(err) {
+			l.log.Warn("could not release completed capacity after compute was confirmed absent",
+				"tier", l.tier, "request", requestID, "lease", lease.ID, "error", err)
+			stuck = append(stuck, lease)
+
+			continue
+		}
+		if entry := parked[requestID]; entry != nil {
+			l.forgetCompletion(ctx, entry.job)
+		}
 	}
 
 	// Promised escrow too. The acquisition was made to GitHub, but nothing has
@@ -2891,13 +3496,38 @@ func (l *Listener) releaseAll(ctx context.Context, destroyed map[int64]bool) {
 	// And the parked ones, with the outcome they were parked with: a launch that
 	// never started did not finish, whatever the ordinary path records.
 	for id, entry := range parked {
-		if err := l.releaseAbsent(ctx, id, entry.lease, entry.outcome); err != nil {
+		// A RELEASE-ONLY ENTRY ALREADY HAS ABSENCE PROOF. Every other parked
+		// entry still needs destroyAll to confirm teardown or hand custody to the
+		// runner. In particular, a completion restored before its holder registers
+		// must keep its authoritative result and lease unchanged across shutdown.
+		if !entry.releaseOnly && !destroyed[id] {
+			l.log.Error("not releasing cleanup capacity because its compute was not confirmed absent; the durable completion remains pending for the next process",
+				"tier", l.tier, "request", id, "lease", entry.lease.ID)
+
+			continue
+		}
+
+		outcome := entry.outcome
+		if outcome == "" {
+			outcome = alloc.PhaseDone
+		}
+		if err := l.recordReleaseOnly(ctx, entry.job, entry.lease, outcome); err != nil {
+			l.log.Warn("not releasing cleanup capacity because its release-only obligation is not durable",
+				"tier", l.tier, "request", id, "lease", entry.lease.ID, "error", err)
+
+			continue
+		}
+		err := l.releaseAbsent(ctx, id, entry.lease, outcome)
+		if err != nil {
 			l.log.Warn("could not release cleanup capacity after compute was confirmed absent",
 				"tier", l.tier, "request", id, "lease", entry.lease.ID, "error", err)
 
 			if !releaseSettled(err) {
 				stuck = append(stuck, entry.lease)
 			}
+		}
+		if releaseSettled(err) {
+			l.forgetCompletion(ctx, entry.job)
 		}
 	}
 

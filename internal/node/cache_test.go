@@ -35,6 +35,7 @@ type fakeCacheStore struct {
 	advanceOnSnapshot bool
 	publishExpected   []string
 	keys              []string
+	createdSizes      []int64
 	snapshotVolumes   []storecontract.Volume
 }
 
@@ -72,9 +73,10 @@ func (f *fakeCacheStore) Current(context.Context, string) (string, error) {
 	return f.current, nil
 }
 
-func (f *fakeCacheStore) Create(_ context.Context, key string, _ int64) (storecontract.Volume, error) {
+func (f *fakeCacheStore) Create(_ context.Context, key string, size int64) (storecontract.Volume, error) {
 	f.created++
 	f.keys = append(f.keys, key)
+	f.createdSizes = append(f.createdSizes, size)
 
 	return storecontract.Volume{Key: key, Handle: "working", Device: "/dev/rbd7"}, nil
 }
@@ -187,12 +189,12 @@ func testCacheService(t *testing.T, trust provider.TrustClass) (*CacheService, *
 		t.Fatalf("NewCacheService: %v", err)
 	}
 
-	token, err := service.Prepare("billet-one", trust)
+	credentials, err := service.Prepare("billet-one", trust)
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
 
-	return service, storage, token
+	return service, storage, credentials.Token
 }
 
 func cacheRequest(
@@ -317,6 +319,170 @@ func TestLastWriteWinsRebasesABuilderCandidateAfterAConcurrentCommit(t *testing.
 	}
 	if got := storage.publishExpected; len(got) != 2 || got[0] != "baseline" || got[1] != "concurrent" {
 		t.Errorf("publication expectations = %v, want baseline then concurrent", got)
+	}
+}
+
+func TestDockerImageStoreIsArchitectureScopedAndReservesSlotZero(t *testing.T) {
+	t.Parallel()
+
+	storage := &fakeCacheStore{}
+	attacher := &fakeVolumeAttacher{}
+	service, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", t.TempDir(),
+		storage, attacher, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewCacheService: %v", err)
+	}
+	credentials, err := service.Prepare("billet-one", provider.TrustTrusted)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	token := credentials.Token
+
+	docker := cacheRequest(t, service, token, "/v1/docker-store",
+		map[string]any{"architecture": "amd64"})
+	if docker.Code != http.StatusCreated {
+		t.Fatalf("Docker store status = %d: %s", docker.Code, docker.Body.String())
+	}
+	var mounted struct {
+		Slot   int    `json:"slot"`
+		Device string `json:"device"`
+		Cold   bool   `json:"cold"`
+	}
+	if err := json.Unmarshal(docker.Body.Bytes(), &mounted); err != nil {
+		t.Fatalf("decode Docker store response: %v", err)
+	}
+	if mounted.Slot != 0 || mounted.Device != "/dev/vdb" || !mounted.Cold {
+		t.Fatalf("Docker store attachment = %+v, want cold slot 0 at /dev/vdb", mounted)
+	}
+	if len(storage.keys) != 2 || storage.keys[0] != "test-deployment/docker-images/amd64" ||
+		storage.keys[1] != storage.keys[0] {
+		t.Fatalf("Docker store keys = %v", storage.keys)
+	}
+	if len(storage.createdSizes) != 1 || storage.createdSizes[0] != cacheVolumeLimit {
+		t.Fatalf("Docker store sizes = %v, want %d", storage.createdSizes, cacheVolumeLimit)
+	}
+	if len(attacher.attached) != 1 || attacher.attached[0] != 0 {
+		t.Fatalf("Docker store attached slots = %v, want [0]", attacher.attached)
+	}
+
+	sticky := cacheRequest(t, service, token, "/v1/volumes", map[string]any{
+		"key": "acme/api/npm", "size_bytes": int64(1 << 30),
+	})
+	if sticky.Code != http.StatusCreated {
+		t.Fatalf("sticky disk status = %d: %s", sticky.Code, sticky.Body.String())
+	}
+	if len(attacher.attached) != 2 || attacher.attached[1] != 1 {
+		t.Fatalf("attachment slots = %v, want Docker in 0 and sticky disk in 1", attacher.attached)
+	}
+
+	storage.advanceOnSnapshot = true
+	direct := cacheRequest(t, service, token, "/v1/volumes/0/commit", map[string]any{
+		"filesystem": map[string]any{"type": "ext4", "uuid": "docker-fs", "clean": true},
+	})
+	if direct.Code != http.StatusForbidden {
+		t.Fatalf("guest Docker store commit status = %d, want 403: %s",
+			direct.Code, direct.Body.String())
+	}
+	proof := map[string]any{
+		"filesystem": map[string]any{"type": "ext4", "uuid": "docker-fs", "clean": true},
+	}
+	if early := cacheRequest(t, service, token, "/v1/docker-store/ready", proof); early.Code != http.StatusConflict {
+		t.Fatalf("early helper Docker readiness status = %d, want 409: %s",
+			early.Code, early.Body.String())
+	}
+	settled := make(chan error, 1)
+	go func() { settled <- service.SettleDocker(t.Context(), "billet-one", true) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		ready := cacheRequest(t, service, token, "/v1/docker-store/ready", proof)
+		if ready.Code == http.StatusOK {
+			break
+		}
+		if ready.Code != http.StatusConflict || time.Now().After(deadline) {
+			t.Fatalf("Docker store readiness status = %d: %s", ready.Code, ready.Body.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := <-settled; err != nil {
+		t.Fatalf("SettleDocker: %v", err)
+	}
+	if got := storage.publishExpected; len(got) != 2 || got[0] != "" || got[1] != "concurrent" {
+		t.Errorf("Docker publication expectations = %v, want an LWW rebase", got)
+	}
+	if len(attacher.detached) != 1 || attacher.detached[0] != 0 {
+		t.Errorf("Docker detached slots = %v, want [0]", attacher.detached)
+	}
+}
+
+func TestFailedJobLeavesTheDockerStoreAttachedUntilComputeIsGone(t *testing.T) {
+	t.Parallel()
+
+	storage := &fakeCacheStore{}
+	attacher := &fakeVolumeAttacher{}
+	service, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", t.TempDir(),
+		storage, attacher, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewCacheService: %v", err)
+	}
+	credentials, err := service.Prepare("billet-one", provider.TrustTrusted)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	token := credentials.Token
+	if response := cacheRequest(t, service, token, "/v1/docker-store",
+		map[string]any{"architecture": "amd64"}); response.Code != http.StatusCreated {
+		t.Fatalf("Docker store status = %d: %s", response.Code, response.Body.String())
+	}
+	if response := cacheRequest(t, service, token, "/v1/docker-store/ready", map[string]any{
+		"filesystem": map[string]any{"type": "ext4", "uuid": "docker-fs", "clean": true},
+	}); response.Code != http.StatusConflict {
+		t.Fatalf("failed job's early Docker readiness status = %d, want 409: %s",
+			response.Code, response.Body.String())
+	}
+
+	if err := service.SettleDocker(t.Context(), "billet-one", false); err != nil {
+		t.Fatalf("SettleDocker failed result: %v", err)
+	}
+	if len(attacher.detached) != 0 || storage.discarded != 0 || storage.published != 0 {
+		t.Fatalf("failed result detached/discarded/published = %v/%d/%d before compute stopped",
+			attacher.detached, storage.discarded, storage.published)
+	}
+	if err := service.Cleanup(t.Context(), "billet-one"); err != nil {
+		t.Fatalf("Cleanup: %v", err)
+	}
+	if storage.discarded != 1 {
+		t.Errorf("cleanup discarded %d Docker stores, want 1", storage.discarded)
+	}
+}
+
+func TestDockerImageStoreRefusesAnUnusableArchitecture(t *testing.T) {
+	t.Parallel()
+
+	service, storage, token := testCacheService(t, provider.TrustTrusted)
+	for _, architecture := range []string{"", "amd64/other", "amd64\nother", "amd 64", "-amd64"} {
+		response := cacheRequest(t, service, token, "/v1/docker-store",
+			map[string]any{"architecture": architecture})
+		if response.Code != http.StatusBadRequest {
+			t.Errorf("architecture %q returned HTTP %d, want 400", architecture, response.Code)
+		}
+	}
+	if storage.created != 0 || storage.cloned != 0 {
+		t.Errorf("invalid architectures created/cloned %d/%d stores", storage.created, storage.cloned)
+	}
+}
+
+func TestOrdinaryCacheRequestsCannotClaimTheDockerImageStoreNamespace(t *testing.T) {
+	t.Parallel()
+
+	service, storage, token := testCacheService(t, provider.TrustTrusted)
+	response := cacheRequest(t, service, token, "/v1/volumes", map[string]any{
+		"key": "docker-images/amd64", "size_bytes": int64(1 << 30),
+	})
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("reserved Docker key returned HTTP %d: %s", response.Code, response.Body.String())
+	}
+	if storage.created != 0 || storage.cloned != 0 {
+		t.Errorf("reserved Docker key created/cloned %d/%d stores", storage.created, storage.cloned)
 	}
 }
 
@@ -496,14 +662,14 @@ func TestRunnerCarriesTheNodesRegistryMirrorsToItsGuest(t *testing.T) {
 	}
 }
 
-// The historical name is retained for the mutation gate; the safe behavior is
-// now that no architecture-scoped image store is supplied until publication can
-// be gated on an authoritative job result.
+// The historical name is retained for the mutation gate. The store is requested
+// by the root guest agent after the VM starts, before it starts the runner.
 func TestFirecrackerBootsWithAnArchitectureScopedDockerImageStore(t *testing.T) {
 	p := &fakeProvider{kind: config.ProviderFirecracker}
 	storage := &fakeCacheStore{}
+	attacher := &fakeVolumeAttacher{}
 	service, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", t.TempDir(), storage,
-		&fakeVolumeAttacher{}, slog.New(slog.DiscardHandler))
+		attacher, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("NewCacheService: %v", err)
 	}
@@ -536,8 +702,14 @@ func TestFirecrackerBootsWithAnArchitectureScopedDockerImageStore(t *testing.T) 
 	if len(p.launched) != 1 || len(p.launched[0].Volumes) != 0 {
 		t.Fatalf("launch volumes = %+v", p.launched)
 	}
-	if storage.created != 0 {
-		t.Errorf("created %d Docker image stores without a safe publication gate, want 0", storage.created)
+	response := cacheRequest(t, service, p.launched[0].CacheToken, "/v1/docker-store",
+		map[string]any{"architecture": "amd64"})
+	if response.Code != http.StatusCreated {
+		t.Fatalf("guest Docker store request returned HTTP %d: %s", response.Code, response.Body.String())
+	}
+	if storage.created != 1 || len(attacher.attached) != 1 || attacher.attached[0] != 0 {
+		t.Errorf("created %d Docker stores and attached slots %v, want one in slot 0",
+			storage.created, attacher.attached)
 	}
 }
 
@@ -599,15 +771,24 @@ func TestCacheCustodySurvivesANodeProcessRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first NewCacheService: %v", err)
 	}
-	token, err := first.Prepare("billet-one", provider.TrustTrusted)
+	credentials, err := first.Prepare("billet-one", provider.TrustTrusted)
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
+	token := credentials.Token
 	attached := cacheRequest(t, first, token, "/v1/volumes", map[string]any{
 		"key": "acme/api/npm", "size_bytes": int64(10 << 30),
 	})
 	if attached.Code != http.StatusCreated {
 		t.Fatalf("attach status = %d: %s", attached.Code, attached.Body.String())
+	}
+	custodyPath := filepath.Join(stateDir, cacheSessionDirectory, token+".json")
+	custody, err := os.ReadFile(custodyPath)
+	if err != nil {
+		t.Fatalf("read cache custody before restart: %v", err)
+	}
+	if bytes.Contains(custody, []byte(`"ready_token"`)) {
+		t.Fatal("cache custody still requires an intra-guest readiness credential")
 	}
 
 	second, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", stateDir,
@@ -638,10 +819,11 @@ func TestAnAmbiguousAttachIsDurableBeforeTheProviderCanMapIt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first NewCacheService: %v", err)
 	}
-	token, err := first.Prepare("billet-one", provider.TrustTrusted)
+	credentials, err := first.Prepare("billet-one", provider.TrustTrusted)
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
+	token := credentials.Token
 	attached := cacheRequest(t, first, token, "/v1/volumes", map[string]any{
 		"key": "acme/api/npm", "size_bytes": int64(10 << 30),
 	})
@@ -675,10 +857,11 @@ func TestCacheBearerTokensArePersistedOnlyInPrivateFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewCacheService: %v", err)
 	}
-	token, err := service.Prepare("billet-one", provider.TrustTrusted)
+	credentials, err := service.Prepare("billet-one", provider.TrustTrusted)
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
+	token := credentials.Token
 
 	path := filepath.Join(stateDir, cacheSessionDirectory, token+".json")
 	info, err := os.Stat(path)
@@ -687,6 +870,13 @@ func TestCacheBearerTokensArePersistedOnlyInPrivateFiles(t *testing.T) {
 	}
 	if got := info.Mode().Perm(); got != 0o600 {
 		t.Errorf("cache custody mode = %o, want 600", got)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read cache custody: %v", err)
+	}
+	if !bytes.Contains(body, []byte(credentials.Token)) {
+		t.Fatal("cache custody did not preserve its session credential")
 	}
 }
 
@@ -700,10 +890,11 @@ func TestAClosedSessionRetriesFailedDiscardsAfterRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewCacheService: %v", err)
 	}
-	token, err := service.Prepare("billet-one", provider.TrustTrusted)
+	credentials, err := service.Prepare("billet-one", provider.TrustTrusted)
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
+	token := credentials.Token
 	attached := cacheRequest(t, service, token, "/v1/volumes", map[string]any{
 		"key": "acme/api/npm", "size_bytes": int64(10 << 30),
 	})
@@ -749,10 +940,11 @@ func TestSuccessfulEmptyInventoryClosesPersistedCacheSessions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewCacheService: %v", err)
 	}
-	token, err := service.Prepare("billet-gone", provider.TrustTrusted)
+	credentials, err := service.Prepare("billet-gone", provider.TrustTrusted)
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
+	token := credentials.Token
 	attached := cacheRequest(t, service, token, "/v1/volumes", map[string]any{
 		"key": "acme/api/npm", "size_bytes": int64(10 << 30),
 	})
@@ -783,10 +975,11 @@ func TestCacheSessionAdmissionIsBoundedBeforeStorage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewCacheService: %v", err)
 	}
-	token, err := service.Prepare("billet-one", provider.TrustTrusted)
+	credentials, err := service.Prepare("billet-one", provider.TrustTrusted)
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
+	token := credentials.Token
 	service.byToken[token].admit <- struct{}{}
 	defer func() { <-service.byToken[token].admit }()
 

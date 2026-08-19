@@ -113,6 +113,34 @@ func TestALaunchWithNoNodeStartedNothing(t *testing.T) {
 	}
 }
 
+func TestASuccessfulRemoteLaunchRecordsItsBoundNodeOnTheLease(t *testing.T) {
+	p := testPlane(t)
+	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
+		Version: nodeapi.Version, Node: "holder", Provider: config.ProviderDocker,
+		Deployment: deployment, Incarnation: "holder-1", VCPU: 8, Memory: 32 * config.GiB,
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	lease := testLease()
+	done := make(chan error, 1)
+	go func() {
+		done <- p.NewRunner().Launch(t.Context(), lease, server.Job{RequestID: 7})
+	}()
+	cmd, took, err := p.Poll(t.Context(), "holder", "holder-1")
+	if err != nil || !took {
+		t.Fatalf("poll launch: took=%v err=%v", took, err)
+	}
+	if err := p.Result("holder", "holder-1", nodeapi.CommandResult{ID: cmd.ID, OK: true}); err != nil {
+		t.Fatalf("report launch: %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("launch: %v", err)
+	}
+	if lease.Node != "holder" {
+		t.Fatalf("successful launch recorded lease node %q, want holder", lease.Node)
+	}
+}
+
 // A NODE THAT TOOK THE COMMAND AND WENT SILENT MEANS CUSTODY.
 //
 // This is the outcome a local runner never has and the one that decides whether
@@ -1575,6 +1603,18 @@ func TestADestroyIsNotConfirmedByTheWrongProcess(t *testing.T) {
 		t.Error("the ownership record was dropped by a destroy its owner never answered; " +
 			"that process can no longer renew or release, and its drain cannot end")
 	}
+
+	// A completion has one more obligation than a shutdown destroy: its
+	// authoritative result must reach the holder before the durable completion
+	// can be retired. The replacement still cannot provide that handoff.
+	answerOneCommand(t, p, "second")
+	waitFor(t, "the replacement to park on a second poll",
+		func() bool { return p.WaitersForTest("n1") == 1 })
+	err = p.NewRunner().DestroyCompleted(t.Context(), 7, "Succeeded")
+	if !errors.Is(err, server.ErrHolderUnavailable) || errors.Is(err, server.ErrCustody) {
+		t.Errorf("a completion answered by the process that replaced the holder reported %v; "+
+			"want only holder unavailable", err)
+	}
 }
 
 // A FAILED DESTROY KEEPS THE OWNERSHIP RECORD TOO.
@@ -1707,8 +1747,15 @@ func TestACancelledCallerIsNotStuck(t *testing.T) {
 func TestANodeCannotReleaseAnotherNodesLease(t *testing.T) {
 	p := New(slog.New(slog.DiscardHandler), deployment, time.Minute)
 
-	register(t, p, "a", config.ProviderDocker)
-	register(t, p, "b", config.ProviderDocker)
+	for _, name := range []string{"a", "b"} {
+		if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
+			Version: nodeapi.Version, Node: name, Provider: config.ProviderDocker,
+			Deployment: deployment, Incarnation: "inc-" + name,
+			VCPU: 8, Memory: 32 * config.GiB,
+		}); err != nil {
+			t.Fatalf("register %s: %v", name, err)
+		}
+	}
 
 	// The launch went to a, so a owns it.
 	p.AdoptOwnership("a", "inc-a", []string{"l1"})
@@ -1764,6 +1811,28 @@ func TestReconcileRefusesAnInventoryFromASupersededProcess(t *testing.T) {
 	}
 }
 
+func TestReconcileMarksTheReportingIncarnationInventoryKnown(t *testing.T) {
+	p := New(slog.New(slog.DiscardHandler), deployment, time.Minute,
+		WithRegistrar(&countingRegistrar{}))
+	const incarnation = "first"
+	if _, err := p.Register(t.Context(), nodeapi.RegisterRequest{
+		Version: nodeapi.Version, Node: "n1", Provider: config.ProviderDocker,
+		Deployment: deployment, VCPU: 8, Memory: 32 * config.GiB,
+		Incarnation: incarnation,
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if p.reconciledNode("n1") {
+		t.Fatal("a node that has not reported inventory was marked reconciled")
+	}
+	if _, err := p.ReconcileInventory(t.Context(), "n1", incarnation, nil); err != nil {
+		t.Fatalf("reconcile inventory: %v", err)
+	}
+	if !p.reconciledNode("n1") {
+		t.Fatal("a complete inventory did not mark its reporting incarnation reconciled")
+	}
+}
+
 // countingRegistrar is a Registrar that records nothing and answers everything,
 // so a test can reach the plane's own decisions.
 type countingRegistrar struct{}
@@ -1780,6 +1849,12 @@ func (countingRegistrar) ResolveQuarantineFor(
 	context.Context, string, []string, int64,
 ) (int, error) {
 	return 0, nil
+}
+
+func (countingRegistrar) ResolveQuarantineForCompletion(
+	context.Context, string, string, int64, int64, alloc.Phase,
+) (bool, error) {
+	return true, nil
 }
 
 // answerOneCommand runs a node's polling loop until it has answered one command.

@@ -784,6 +784,12 @@ func (h *handler) register(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.warnIfExpiring(r, req.Node)
+	// INVALIDATE THE PRIOR INVENTORY BEFORE THE STORE READ. A replacement has
+	// already reported its live instances in this request; letting completion
+	// consume the old process's absence while this read or the epoch write blocks
+	// would release capacity under compute the replacement is about to adopt.
+	intent := h.plane.beginRegistration(req.Node)
+	defer h.plane.finishRegistration(req.Node, intent)
 
 	// READ BEFORE COMMITTING, because Register is not a question — it supersedes
 	// whatever process held the name, resolves its in-flight commands, and makes
@@ -803,7 +809,7 @@ func (h *handler) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	res, err := h.plane.Register(r.Context(), req)
+	res, err := h.plane.register(r.Context(), req, intent)
 	if err != nil {
 		// TWO KINDS OF NO, and conflating them was the bug. A verdict — wrong
 		// protocol version, foreign deployment — cannot be fixed by retrying, and
@@ -826,8 +832,22 @@ func (h *handler) register(w http.ResponseWriter, r *http.Request) {
 	// node holding compute, a plane that restarts, a re-registration, and then a
 	// second host — the new plane never saw those launches, so it would refuse the
 	// draining process its own release.
-	open := make([]string, 0, len(ids))
+	// Keep both durable launched leases and every instance the exact registering
+	// process reported. The latter includes live quarantined compute, which the
+	// launched query deliberately omits; dropping it here would leave a charged,
+	// running lease with no owner and make completion recovery unable to address
+	// its destroy.
+	openSet := make(map[string]bool, len(ids)+len(req.Instances))
 	for id := range ids {
+		openSet[id] = true
+	}
+	if req.InventoryKnown {
+		for _, id := range req.Instances {
+			openSet[id] = true
+		}
+	}
+	open := make([]string, 0, len(openSet))
+	for id := range openSet {
 		open = append(open, id)
 	}
 

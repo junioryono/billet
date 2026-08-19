@@ -10,6 +10,7 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/state"
 )
 
 // ScaleSet is one provisioned scale set.
@@ -66,6 +67,8 @@ type Server struct {
 	// runner is handed to every listener, so an assigned lease becomes compute.
 	// nil means none is attached and the listeners fail closed.
 	runner Runner
+	// completionStore is shared by listeners but rows are scoped by tier.
+	completionStore *state.DB
 
 	// onReap, when set, is called with the number of leases each reap pass
 	// reclaimed. Tests only, and it exists because a test of what the reaper must
@@ -91,6 +94,11 @@ func WithReapInterval(d time.Duration) ControlPlaneOption {
 // the work, rather than accepting jobs nothing can run.
 func WithNodeRunner(r Runner) ControlPlaneOption {
 	return func(s *Server) { s.runner = r }
+}
+
+// WithCompletionLedger durably preserves authoritative results until nodes accept them.
+func WithCompletionLedger(db *state.DB) ControlPlaneOption {
+	return func(s *Server) { s.completionStore = db }
 }
 
 // WithDrainTimeout sets how long every listener waits for the jobs it is
@@ -309,6 +317,9 @@ func (s *Server) listenerOpts() []Option {
 
 	if s.runner != nil {
 		opts = append(opts, WithRunner(s.runner))
+	}
+	if s.completionStore != nil {
+		opts = append(opts, WithCompletionStore(s.completionStore))
 	}
 
 	// FORWARDED WHENEVER IT WAS SET, including a zero or negative one. Filtering

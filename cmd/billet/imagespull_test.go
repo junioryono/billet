@@ -13,6 +13,7 @@ import (
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/imagesource"
+	"github.com/junioryono/billet/internal/provider/firecracker"
 )
 
 // THE ORDER IS FLAG, THEN CONFIG, THEN THE BUILT-IN. A deployment that mirrors
@@ -96,6 +97,76 @@ func TestHostArchIsSpelledTheWayAManifestSpellsIt(t *testing.T) {
 
 	if got == "" {
 		t.Fatal("hostArch returned nothing")
+	}
+}
+
+// Contract 5 images predate the Compose CLI now required by the guest image.
+// Accepting one would pass verification and then fail a common workflow command.
+func TestCurrentBinaryRejectsAPreComposeGuest(t *testing.T) {
+	_, manifest := stageDir(t, []byte("rootfs"), []byte("kernel"))
+	manifest.GuestContract = "5"
+
+	if firecracker.GuestContract != "7" {
+		t.Fatalf("the current image requirements speak contract %q, want 7",
+			firecracker.GuestContract)
+	}
+	if err := manifest.Usable(firecracker.GuestContract, "x86_64"); err == nil {
+		t.Fatal("a contract-5 image without Docker Compose was accepted")
+	}
+}
+
+// Contract 6 images can use Docker 29's fresh-install default, which stores
+// pulled image content outside the independently fenced /var/lib/docker volume.
+func TestCurrentBinaryRejectsAPreOverlay2Guest(t *testing.T) {
+	_, manifest := stageDir(t, []byte("rootfs"), []byte("kernel"))
+	manifest.GuestContract = "6"
+
+	if firecracker.GuestContract != "7" {
+		t.Fatalf("the overlay2 image change speaks contract %q, want 7",
+			firecracker.GuestContract)
+	}
+	if err := manifest.Usable(firecracker.GuestContract, "x86_64"); err == nil {
+		t.Fatal("a contract-6 image that can keep pulled images outside the cache was accepted")
+	}
+}
+
+func TestGuestReportAcceptsPackagedAndUpstreamBuildxVersions(t *testing.T) {
+	for _, buildx := range []string{
+		"github.com/docker/buildx 0.21.3 0.21.3-0ubuntu1~24.04.1",
+		"github.com/docker/buildx v0.33.0 7f91f038ac14",
+	} {
+		body := strings.Join([]string{
+			"jit=probe-secret",
+			"whoami=runner",
+			"runner=2.336.0",
+			"docker=29.1.3 storage=overlay2 cgroups=2",
+			"buildx=" + buildx,
+			"compose=2.40.3",
+			"container=1",
+		}, "\n")
+		if err := checkGuestReport(body, "probe-secret"); err != nil {
+			t.Errorf("checkGuestReport with %q: %v", buildx, err)
+		}
+	}
+}
+
+func TestGuestReportRejectsTheContainerdImageStore(t *testing.T) {
+	body := strings.Join([]string{
+		"jit=probe-secret",
+		"whoami=runner",
+		"runner=2.336.0",
+		"docker=29.1.3 storage=overlayfs cgroups=2",
+		"buildx=github.com/docker/buildx 0.21.3 0.21.3-0ubuntu1~24.04.1",
+		"compose=2.40.3",
+		"container=1",
+	}, "\n")
+
+	err := checkGuestReport(body, "probe-secret")
+	if err == nil {
+		t.Fatal("an image whose pulled content bypasses /var/lib/docker was accepted")
+	}
+	if !strings.Contains(err.Error(), "overlay2") {
+		t.Fatalf("the refusal does not name the required storage driver: %v", err)
 	}
 }
 

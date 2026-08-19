@@ -394,6 +394,10 @@ func TestADrainingNodeAcceptsDestroyAndRefusesLaunch(t *testing.T) {
 	// The drain has to be under way before either command is sent, or this tests
 	// the ordinary loop rather than the draining one.
 	waitFor(t, func() bool { return compute.tended() > 0 })
+	// Tend and the draining poll run concurrently. Wait for the latter too, so a
+	// coverage-slow scheduler cannot spend the command's whole timeout tending
+	// before the goroutine that accepts control-plane work has parked.
+	waitFor(t, func() bool { return plane.WaitersForTest("n1") == 1 })
 
 	// A DESTROY IS ACCEPTED, which is the message that ends a drain in real life:
 	// the job finished, GitHub told the control plane, and the control plane is

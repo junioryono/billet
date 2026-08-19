@@ -49,6 +49,9 @@ func TestACacheEnabledGuestBootsWithFiveReplaceableDriveSlots(t *testing.T) {
 			t.Errorf("metadata does not carry %q", want)
 		}
 	}
+	if strings.Contains(metadataJSON, "cache-ready-token") {
+		t.Fatal("metadata carries a readiness pseudo-secret inside a root-controlled guest")
+	}
 }
 
 func TestAReservedDriveCanBeReplacedAndDetachedAfterBoot(t *testing.T) {

@@ -1192,8 +1192,14 @@ func (p *Provider) userData(spec provider.Spec) (string, error) {
 }
 
 func (p *Provider) userDataAt(spec provider.Spec, launchEpochNS int64) (string, error) {
-	if (spec.CacheEndpoint == "") != (spec.CacheToken == "") {
-		return "", fmt.Errorf("ec2: the cache endpoint and token for %s must be supplied together", spec.Name)
+	cacheFields := 0
+	for _, value := range []string{spec.CacheEndpoint, spec.CacheToken} {
+		if value != "" {
+			cacheFields++
+		}
+	}
+	if cacheFields != 0 && cacheFields != 2 {
+		return "", fmt.Errorf("ec2: the cache endpoint and per-guest token for %s must be supplied together", spec.Name)
 	}
 	// A PLAIN SINGLE-QUOTED ASSIGNMENT, which is the one construct with no
 	// parsing left in it. Inside single quotes a POSIX shell expands nothing at

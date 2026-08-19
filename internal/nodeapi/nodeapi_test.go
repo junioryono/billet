@@ -129,7 +129,9 @@ func TestALaunchCommandCarriesWhatALaunchNeeds(t *testing.T) {
 func TestADestroyCommandNeedsNoLease(t *testing.T) {
 	t.Parallel()
 
-	raw, err := json.Marshal(Command{ID: "c2", Kind: CommandDestroy, RequestID: 99})
+	raw, err := json.Marshal(Command{
+		ID: "c2", Kind: CommandDestroy, RequestID: 99, JobResult: "succeeded",
+	})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
@@ -143,7 +145,7 @@ func TestADestroyCommandNeedsNoLease(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 
-	if got.RequestID != 99 || got.Kind != CommandDestroy {
+	if got.RequestID != 99 || got.Kind != CommandDestroy || got.JobResult != "succeeded" {
 		t.Errorf("destroy did not round-trip: %+v", got)
 	}
 }

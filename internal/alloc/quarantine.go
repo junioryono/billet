@@ -242,6 +242,111 @@ func (a *Allocator) ResolveQuarantine(ctx context.Context, leaseID string, outco
 	})
 }
 
+// ResolveQuarantineForCompletion settles one inventory-absent quarantined lease
+// with the authoritative completion outcome. The node epoch fences the inventory
+// snapshot; the stored lease epoch rejects a completion from an impossible future;
+// an explicit failure marker distinguishes provisional inventory reconciliation
+// from an independent terminal outcome. It reports whether capacity is already
+// gone or was released by this call.
+func (a *Allocator) ResolveQuarantineForCompletion(
+	ctx context.Context,
+	node, leaseID string,
+	nodeEpoch, leaseEpoch int64,
+	outcome Phase,
+) (bool, error) {
+	if !outcome.Terminal() {
+		return false, fmt.Errorf("%w: %q is not terminal", ErrBadTransition, outcome)
+	}
+
+	settled := false
+	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+		var current int64
+		switch err := tx.QueryRowContext(ctx,
+			`SELECT epoch FROM nodes WHERE name = ?`, node).Scan(&current); {
+		case errors.Is(err, sql.ErrNoRows):
+			return nil
+		case err != nil:
+			return fmt.Errorf("alloc: read the epoch of node %s: %w", node, err)
+		}
+		if current != nodeEpoch {
+			return nil
+		}
+
+		var (
+			phase         string
+			currentEpoch  int64
+			failureReason string
+		)
+		err := tx.QueryRowContext(ctx,
+			`SELECT phase, epoch, failure_reason FROM leases WHERE id = ?`, leaseID).
+			Scan(&phase, &currentEpoch, &failureReason)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("alloc: inspect completion lease %s: %w", leaseID, err)
+		}
+		if errors.Is(err, sql.ErrNoRows) {
+			// Capacity is gone, but without the lease row there is no provenance for
+			// its history. Settled is safe; rewriting an unknown verdict is not.
+			settled = true
+
+			return nil
+		}
+		if currentEpoch < leaseEpoch {
+			return nil
+		}
+		if Phase(phase).Terminal() {
+			// ONLY INVENTORY'S PROVISIONAL VERDICT MAY BE CORRECTED. An operator or
+			// node can independently fail a quarantined lease at a later epoch too,
+			// so epoch order is a fence and never provenance.
+			if failureReason == inventoryAbsenceFailureReason {
+				if _, err := tx.ExecContext(ctx,
+					`UPDATE leases SET phase = ?, failure_reason = '' WHERE id = ?`,
+					string(outcome), leaseID); err != nil {
+					return fmt.Errorf("alloc: correct completion lease %s: %w", leaseID, err)
+				}
+				if _, err := tx.ExecContext(ctx,
+					`UPDATE job_history SET conclusion = ?, failure_reason = '' WHERE lease_id = ?`,
+					string(outcome), leaseID); err != nil {
+					return fmt.Errorf("alloc: correct completion history for lease %s: %w", leaseID, err)
+				}
+			}
+			settled = true
+
+			return nil
+		}
+
+		var eligible int
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
+			SELECT 1 FROM leases
+			 WHERE id = ? AND phase = ? AND COALESCE(node, target_node, '') = ?
+			   AND heartbeat_at <= ?)`,
+			leaseID, string(PhaseQuarantine), node,
+			ts(a.now().UTC().Add(-quarantineGrace))).Scan(&eligible); err != nil {
+			return fmt.Errorf("alloc: inspect quarantined completion lease %s: %w", leaseID, err)
+		}
+		if eligible == 0 {
+			return nil
+		}
+
+		lease, err := quarantinedLeaseTx(ctx, tx, a, leaseID)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE leases SET phase = ?, epoch = epoch + 1 WHERE id = ?`,
+			string(outcome), leaseID); err != nil {
+			return fmt.Errorf("alloc: resolve completion quarantine %s: %w", leaseID, err)
+		}
+		if err := a.archive(ctx, tx, lease, outcome); err != nil {
+			return err
+		}
+		settled = true
+
+		return nil
+	})
+
+	return settled, err
+}
+
 // ResolveQuarantineFor terminalizes every quarantined lease on a node that the
 // node's own inventory does not mention, and reports how many.
 //
@@ -268,6 +373,11 @@ func (a *Allocator) ResolveQuarantine(ctx context.Context, leaseID string, outco
 // which PULLS THE IMAGE INLINE, and a multi-gigabyte runner image on a slow link
 // takes minutes rather than seconds.
 const quarantineGrace = 5 * time.Minute
+
+// inventoryAbsenceFailureReason marks a terminal outcome that inventory inferred
+// from absence rather than one an operator or node reported independently. A
+// later GitHub completion may correct this provisional verdict and no other.
+const inventoryAbsenceFailureReason = "billet:provisional:inventory-absence"
 
 func (a *Allocator) ResolveQuarantineFor(
 	ctx context.Context, node string, running []string, epoch int64,
@@ -318,9 +428,13 @@ func (a *Allocator) ResolveQuarantineFor(
 			if err != nil {
 				return err
 			}
+			if lease.FailureReason == "" {
+				lease.FailureReason = inventoryAbsenceFailureReason
+			}
 
 			if _, err := tx.ExecContext(ctx,
-				`UPDATE leases SET phase = 'failed', epoch = epoch + 1 WHERE id = ?`, id); err != nil {
+				`UPDATE leases SET phase = 'failed', epoch = epoch + 1, failure_reason = ? WHERE id = ?`,
+				lease.FailureReason, id); err != nil {
 				return fmt.Errorf("alloc: resolve quarantined lease %s: %w", id, err)
 			}
 

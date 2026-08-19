@@ -2,11 +2,10 @@ package config
 
 import "testing"
 
-// THE DEFAULT RUNNER COMMAND KEEPS THE UPDATE LOOP, and that is the only thing
-// about its value that matters.
+// THE DEFAULT RUNNER COMMAND KEEPS BOTH THE UPDATE LOOP AND ONE-JOB RESULT.
 //
 // A self-hosted runner updates itself by EXITING — the listener returns "updating"
-// and `run.sh` is the loop that notices and re-execs it with the same arguments,
+// and billet's wrapper is the loop that notices and re-execs it with the same arguments,
 // including the JIT registration that lets the restarted runner take the job it was
 // created for.
 //
@@ -30,9 +29,16 @@ func TestTheDefaultRunnerCommandKeepsTheSelfUpdateLoop(t *testing.T) {
 	}
 
 	if got[0] != "./run.sh" {
-		t.Errorf("the default runner command is %q; it must be the script that re-execs the "+
-			"runner after a self-update, or a runner release day turns every job into a "+
-			"destroyed guest and a redelivered job", got[0])
+		t.Errorf("the generic runner command is %q, want the stock Docker-image service", got[0])
+	}
+
+	if got := (Tier{}).RunnerCommandFor(ProviderFirecracker); len(got) != 1 ||
+		got[0] != "./billet-runner-service" {
+		t.Errorf("the Firecracker runner command is %q, want the packaged result-preserving wrapper", got)
+	}
+	if got := (Tier{}).RunnerCommandFor(ProviderEC2); len(got) != 1 ||
+		got[0] != "/usr/local/bin/billet-runner" {
+		t.Errorf("the EC2 runner command is %q, want the full cache-aware AMI entrypoint", got)
 	}
 }
 

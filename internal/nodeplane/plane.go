@@ -86,6 +86,17 @@ type Plane struct {
 
 	mu    sync.Mutex
 	nodes map[string]*node
+	// registering counts registrations that have begun for each node but have
+	// not installed their ledger epoch and inventory yet. Beginning one clears
+	// prior absence evidence before it waits for an earlier registration, reads
+	// the store or writes an epoch.
+	registering        map[string]int
+	activeRegistration map[string]uint64
+	registrationGuards map[string]*sync.Mutex
+	nextRegistration   uint64
+	// afterRegisterNodeForTest stages the otherwise unobservable gap between a
+	// durable registration and its in-memory install. Production leaves it nil.
+	afterRegisterNodeForTest func(context.Context, string, int64)
 
 	registrar Registrar
 
@@ -116,6 +127,64 @@ type Plane struct {
 	pendingGone []goneNode
 }
 
+type registrationIntent struct {
+	generation uint64
+	guard      *sync.Mutex
+}
+
+func (p *Plane) beginRegistration(node string) registrationIntent {
+	p.mu.Lock()
+	if p.registrationGuards == nil {
+		p.registrationGuards = make(map[string]*sync.Mutex)
+	}
+	guard := p.registrationGuards[node]
+	if guard == nil {
+		guard = &sync.Mutex{}
+		p.registrationGuards[node] = guard
+	}
+	if p.registering == nil {
+		p.registering = make(map[string]int)
+	}
+	p.registering[node]++
+	if n := p.nodes[node]; n != nil {
+		n.inventoryKnown = false
+		n.inventory = nil
+	}
+	p.mu.Unlock()
+
+	// ONE NODE'S REGISTRATIONS COMMIT IN ONE ORDER. The guard is held across the
+	// ownership read, allocator epoch and plane install, so its database row and
+	// in-memory process cannot describe different registrations.
+	// Guards are per node: a slow host never stalls command traffic or another
+	// host's registration.
+	guard.Lock()
+
+	p.mu.Lock()
+	p.nextRegistration++
+	generation := p.nextRegistration
+	if p.activeRegistration == nil {
+		p.activeRegistration = make(map[string]uint64)
+	}
+	p.activeRegistration[node] = generation
+	p.mu.Unlock()
+
+	return registrationIntent{generation: generation, guard: guard}
+}
+
+func (p *Plane) finishRegistration(node string, intent registrationIntent) {
+	p.mu.Lock()
+	if p.activeRegistration[node] == intent.generation {
+		delete(p.activeRegistration, node)
+	}
+	if p.registering[node] <= 1 {
+		delete(p.registering, node)
+	} else {
+		p.registering[node]--
+	}
+	p.mu.Unlock()
+	intent.guard.Unlock()
+}
+
 // node is one registered compute host.
 type node struct {
 	name string
@@ -131,6 +200,11 @@ type node struct {
 	provider    config.ProviderKind
 	guestOS     []config.GuestOS
 	lastSeen    time.Time
+	// inventoryKnown says this incarnation supplied the complete provider inventory
+	// in inventory. The set is evidence about one lease only by membership, never
+	// merely because some inventory exists.
+	inventoryKnown bool
+	inventory      map[string]bool
 
 	// ledgerEpoch is the fencing token the ledger gave this registration.
 	//
@@ -237,6 +311,9 @@ type pending struct {
 	// may update the node object before this command is queued; dispatch refuses
 	// that stale choice rather than sending one backend's launch shape to another.
 	expectedProvider config.ProviderKind
+	// expectedIncarnation fences a bound destroy to the process that adopted its
+	// lease. A replacement sharing the node name must never take that command.
+	expectedIncarnation string
 	// incarnation is the node PROCESS that took this command.
 	//
 	// The node NAME is not enough. A superseded process and its replacement share
@@ -420,6 +497,17 @@ func (p *Plane) liveNode(name string) *node {
 	return p.nodes[name]
 }
 
+// reconciledNode reports whether the current live incarnation vouched for a
+// complete inventory during registration.
+func (p *Plane) reconciledNode(name string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.expireStaleLocked()
+	n := p.nodes[name]
+
+	return n != nil && n.inventoryKnown
+}
+
 // goneNode is a host the plane has given up on, with the epoch it had.
 //
 // The epoch travels with the name because by the time this is written the node
@@ -486,6 +574,14 @@ type Registrar interface {
 	// a newer one has just vouched for, using a listing taken before that
 	// container was visible.
 	ResolveQuarantineFor(ctx context.Context, node string, running []string, epoch int64) (int, error)
+
+	// ResolveQuarantineForCompletion settles one absent lease with GitHub's
+	// authoritative outcome. The node epoch and registration intent fence the
+	// inventory snapshot; the lease epoch fences its stored capacity obligation.
+	ResolveQuarantineForCompletion(
+		ctx context.Context, node, leaseID string, nodeEpoch, leaseEpoch int64,
+		outcome alloc.Phase,
+	) (bool, error)
 }
 
 // sortedSites lists the declared places in a stable order, so a refusal naming
@@ -579,6 +675,15 @@ func WithPollTimeout(d time.Duration) Option {
 func (p *Plane) Register(
 	ctx context.Context, req nodeapi.RegisterRequest,
 ) (nodeapi.RegisterResponse, error) {
+	intent := p.beginRegistration(req.Node)
+	defer p.finishRegistration(req.Node, intent)
+
+	return p.register(ctx, req, intent)
+}
+
+func (p *Plane) register(
+	ctx context.Context, req nodeapi.RegisterRequest, intent registrationIntent,
+) (nodeapi.RegisterResponse, error) {
 	if req.Version != nodeapi.Version {
 		return nodeapi.RegisterResponse{}, fmt.Errorf(
 			"%w: node %q speaks protocol version %d, this control plane speaks %d; "+
@@ -642,11 +747,23 @@ func (p *Plane) Register(
 		}
 	}
 
-	// THE LEDGER FIRST, and outside the mutex. A node that appears in the plane's
-	// map but not in the allocator's node table takes commands and then has every
-	// Bind refused — the failure looks like a broken node instead of a missing
-	// row. Doing it first means a ledger that refuses leaves the plane unchanged,
-	// so the node retries registration rather than believing it succeeded.
+	p.mu.Lock()
+	currentIntent := p.activeRegistration[req.Node]
+	p.mu.Unlock()
+	if currentIntent != intent.generation {
+		return nodeapi.RegisterResponse{}, fmt.Errorf(
+			"%w: a newer registration for node %q overtook this one",
+			ErrSuperseded, req.Node)
+	}
+
+	// THE LEDGER FIRST, outside the mutex but after the intent is visible. A node
+	// that appears in the plane's map but not in the allocator's node table takes
+	// commands and then has every Bind refused — the failure looks like a broken
+	// node instead of a missing row. The intent has already invalidated prior
+	// absence evidence, so a blocked epoch write cannot race an old inventory into
+	// releasing this process's live compute. A ledger refusal leaves membership
+	// unchanged and inventory unknown, so the node retries without an unsafe old
+	// snapshot becoming authoritative.
 	// Scoped outside the registrar block: a plane without one (tests, and the
 	// in-process path) has no ledger to fence against, and zero is the epoch a
 	// node that was never recorded would carry anyway.
@@ -673,36 +790,18 @@ func (p *Plane) Register(
 			return nodeapi.RegisterResponse{}, fmt.Errorf(
 				"nodeplane: the ledger could not record node %q: %w", req.Node, err)
 		}
-
-		// WHAT THIS HOST SAYS IT IS RUNNING FREES WHAT IT IS NOT.
-		//
-		// A lease whose holder stopped heartbeating is quarantined rather than
-		// terminalized, so its capacity stays charged until the compute is
-		// confirmed gone — and the node's sweep only confirms containers that
-		// still exist. A host that rebooted has none, so its quarantined capacity
-		// would wait forever. This is the other proof.
-		//
-		// ONLY A LIST THE NODE VOUCHES FOR. An absent one means the provider
-		// could not be read, and reading that as "running nothing" would free
-		// capacity for containers that are still there.
-		//
-		// Best effort: failing a registration over it would keep a healthy host
-		// out of the fleet to tidy up an accounting row, and the next
-		// registration or sweep does the same work.
-		if req.InventoryKnown {
-			if freed, err := p.registrar.ResolveQuarantineFor(
-				ctx, req.Node, req.Instances, epoch); err != nil {
-				p.log.Warn("could not reconcile quarantined capacity with what this host "+
-					"reports running", "node", req.Node, "error", err)
-			} else if freed > 0 {
-				p.log.Info("freed capacity held for compute this host is no longer running",
-					"node", req.Node, "leases", freed)
-			}
+		if p.afterRegisterNodeForTest != nil {
+			p.afterRegisterNodeForTest(ctx, req.Node, epoch)
 		}
 	}
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.activeRegistration[req.Node] != intent.generation {
+		return nodeapi.RegisterResponse{}, fmt.Errorf(
+			"%w: a newer registration for node %q overtook this one after its ledger write",
+			ErrSuperseded, req.Node)
+	}
 
 	n, ok := p.nodes[req.Node]
 	if !ok {
@@ -710,17 +809,12 @@ func (p *Plane) Register(
 		p.nodes[req.Node] = n
 	}
 
-	// AN OVERTAKEN REGISTRATION CHANGES NOTHING, and this has to be decided BEFORE
+	// A REGISTRAR TOKEN NEVER MOVES BACKWARDS, and this has to be decided BEFORE
 	// anything below it runs.
 	//
-	// The ledger write happens outside this mutex, so two registrations for one node
-	// can commit in one order and arrive in the other: A is handed epoch 1, B is handed
-	// 2, B installs, and then A gets the lock. Everything past this point treats the
-	// request as the current process — tombstoning the commands B is working on and
-	// overwriting its incarnation, provider and guest-OS claims.
-	//
-	// Keeping only the EPOCH monotonic is not enough: a fence at the end of a function
-	// runs after the damage it was meant to prevent.
+	// The per-node guard makes this defensive for the allocator used in production,
+	// but Registrar is an interface and the epoch still decides whether everything
+	// below may treat this request as current.
 	if epoch > 0 && epoch < n.ledgerEpoch {
 		p.log.Warn("ignoring a registration that was overtaken by a newer one from the same "+
 			"node; the newer process keeps its commands",
@@ -732,7 +826,6 @@ func (p *Plane) Register(
 			PollSeconds:     int(p.poll.Seconds()),
 		}, nil
 	}
-
 	if n.incarnation != "" && n.incarnation != req.Incarnation {
 		// SAID OUT LOUD, because the two causes need different fixes and look
 		// identical from here. A restart is ordinary. A SECOND HOST arriving under
@@ -786,14 +879,36 @@ func (p *Plane) Register(
 	n.guestOS = req.GuestOS
 	n.lastSeen = p.now()
 
-	// NEVER BACKWARDS. Two registrations for one node can commit to the ledger in
-	// one order and reach this mutex in the other — the ledger write happens
-	// before the lock is taken — so installing unconditionally lets the older
-	// epoch win. Expiry would then present a stale token, the fenced write would
-	// match nothing, and the node would stay live in the ledger after the plane
-	// had forgotten it.
+	// NEVER BACKWARDS. Expiry presents this token to its fenced ledger write, so
+	// installing a stale value would leave the node live in the ledger after the
+	// plane had forgotten it.
 	if epoch > n.ledgerEpoch {
 		n.ledgerEpoch = epoch
+	}
+
+	// INVENTORY AND ITS LEDGER CONSEQUENCE LINEARIZE WITH THIS INCARNATION.
+	// A completion is allowed to treat an absent instance as gone only after the
+	// quarantine resolver has made that fact durable. Keeping the resolver under
+	// the plane lock prevents an old known-empty snapshot from being consumed
+	// while a replacement is registering or a newer inventory is being adopted.
+	n.inventoryKnown = false
+	n.inventory = nil
+	if req.InventoryKnown {
+		if p.registrar != nil {
+			if freed, err := p.registrar.ResolveQuarantineFor(
+				ctx, req.Node, req.Instances, n.ledgerEpoch); err != nil {
+				// Best effort: failing registration over accounting cleanup would keep
+				// a healthy host out of the fleet. The exact inventory is still kept,
+				// and a completion retries the same fenced reconciliation before it can
+				// accept absence.
+				p.log.Warn("could not reconcile quarantined capacity with what this host "+
+					"reports running", "node", req.Node, "error", err)
+			} else if freed > 0 {
+				p.log.Info("freed capacity held for compute this host is no longer running",
+					"node", req.Node, "leases", freed)
+			}
+		}
+		p.adoptOwnershipLocked(req.Node, req.Incarnation, req.Instances, true)
 	}
 
 	return nodeapi.RegisterResponse{
@@ -844,40 +959,35 @@ func (p *Plane) ReconcileInventory(
 		return 0, nil
 	}
 
-	// THE INCARNATION IS CHECKED AND THE EPOCH CAPTURED UNDER ONE LOCK.
-	//
-	// The route wrapper checks the incarnation and then this took the mutex
-	// again, which is a check-then-act rather than a fence: a replacement can
-	// register in the gap, and the stale report is then accepted under the
-	// REPLACEMENT's epoch — freeing capacity for a container the newer
-	// incarnation had just vouched for. Reading them together is what makes the
-	// epoch belong to the process that sent the inventory.
-	epoch, err := p.epochFor(node, incarnation)
-	if err != nil {
-		return 0, err
-	}
-
-	return p.registrar.ResolveQuarantineFor(ctx, node, running, epoch)
-}
-
-// epochFor is the ledger epoch of the node AS SEEN BY one incarnation, refusing
-// a caller that is no longer the current process.
-func (p *Plane) epochFor(node, incarnation string) (int64, error) {
+	// THE INVENTORY, ITS FENCED LEDGER DECISION AND ITS OWNERSHIP ADOPTION ARE
+	// ONE ORDERED FACT. A completion cannot consume the previous snapshot in the
+	// gap, and a replacement cannot install a new incarnation while the old one
+	// is terminalizing capacity under its epoch.
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if _, pending := p.registering[node]; pending {
+		return 0, fmt.Errorf(
+			"nodeplane: node %q has a registration in progress; retry this inventory after it settles",
+			node)
+	}
 
 	n, ok := p.nodes[node]
 	if !ok {
 		return 0, fmt.Errorf("%w: %s", ErrUnregistered, node)
 	}
-
 	if n.incarnation != "" && incarnation != "" && n.incarnation != incarnation {
 		return 0, fmt.Errorf(
 			"%w: node %q is registered by process %s and this report came from %s",
 			ErrSuperseded, node, n.incarnation, incarnation)
 	}
 
-	return n.ledgerEpoch, nil
+	freed, err := p.registrar.ResolveQuarantineFor(ctx, node, running, n.ledgerEpoch)
+	if err != nil {
+		return 0, err
+	}
+	p.adoptOwnershipLocked(node, incarnation, running, true)
+
+	return freed, nil
 }
 
 // CheckIncarnation reports whether a request came from the current node process.
@@ -997,6 +1107,22 @@ func (p *Plane) OwnerOfRequest(requestID int64) (RequestOwner, bool) {
 	return RequestOwner{}, false
 }
 
+// OwnerOfLease reports the process that adopted or launched one fenced lease.
+func (p *Plane) OwnerOfLease(leaseID string) (RequestOwner, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	owner, ok := p.owners[leaseID]
+	if !ok {
+		return RequestOwner{}, false
+	}
+	n, live := p.nodes[owner.node]
+
+	return RequestOwner{
+		Node: owner.node, Incarnation: owner.incarnation,
+		Current: live && n.incarnation == owner.incarnation,
+	}, true
+}
+
 // RequestOwner is the process holding a request's compute, and whether it is
 // still the one its node's commands reach.
 type RequestOwner struct {
@@ -1043,8 +1169,37 @@ func (p *Plane) ForgetLease(node, leaseID string) {
 // The ledger knows what it forgot: a lease bound to this node and still open is
 // this node's, and the process registering now is the one holding it.
 func (p *Plane) AdoptOwnership(node, incarnation string, leaseIDs []string) {
+	p.AdoptOwnershipWithInventory(node, incarnation, leaseIDs, false)
+}
+
+// AdoptOwnershipWithInventory atomically restores owners and records whether
+// the registering process supplied a complete provider inventory.
+func (p *Plane) AdoptOwnershipWithInventory(
+	node, incarnation string,
+	leaseIDs []string,
+	inventoryKnown bool,
+) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.adoptOwnershipLocked(node, incarnation, leaseIDs, inventoryKnown)
+}
+
+func (p *Plane) adoptOwnershipLocked(
+	node, incarnation string,
+	leaseIDs []string,
+	inventoryKnown bool,
+) {
+	n := p.nodes[node]
+	if n == nil || n.incarnation != incarnation {
+		return
+	}
+	if inventoryKnown {
+		n.inventoryKnown = true
+		n.inventory = make(map[string]bool, len(leaseIDs))
+		for _, id := range leaseIDs {
+			n.inventory[id] = true
+		}
+	}
 
 	if p.owners == nil {
 		p.owners = make(map[string]leaseOwner, len(leaseIDs))
@@ -1385,6 +1540,16 @@ func (p *Plane) takeLocked(n *node, incarnation string) (nodeapi.Command, bool) 
 	for len(n.queue) > 0 {
 		pend := n.queue[0]
 		n.queue = n.queue[1:]
+
+		if pend.expectedIncarnation != "" && pend.expectedIncarnation != incarnation {
+			p.answerLocked(pend, nodeapi.CommandResult{
+				ID: pend.cmd.ID,
+				Error: fmt.Sprintf("node %q process %s replaced the bound holder %s before taking this command",
+					n.name, incarnation, pend.expectedIncarnation),
+			})
+
+			continue
+		}
 
 		if pend.expectedProvider != "" && pend.expectedProvider != n.provider {
 			p.answerLocked(pend, nodeapi.CommandResult{

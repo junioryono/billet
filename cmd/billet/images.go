@@ -374,12 +374,16 @@ func verifyGuestImage(
 	//               that surfaces as every job failing to start
 	//   docker      the daemon is up on this kernel, which check-config.sh can only
 	//               predict, and a container actually ran
+	//   buildx      the CLI plugin required by billet's persistent builder exists
+	//   compose     the CLI plugin common multi-container workflows invoke exists
 	probe := strings.Join([]string{
 		`echo "whoami=$(whoami)"`,
 		`echo "jit=$ACTIONS_RUNNER_INPUT_JITCONFIG"`,
 		`echo "runner=$(cd /home/runner/runner && ./bin/Runner.Listener --version 2>&1 | head -1)"`,
 		`echo "docker=$(docker info --format '{{.ServerVersion}} storage={{.Driver}} ` +
 			`cgroups={{.CgroupVersion}}' 2>&1 | head -1)"`,
+		`echo "buildx=$(docker buildx version 2>&1 | head -1)"`,
+		`echo "compose=$(docker compose version --short 2>&1 | head -1)"`,
 		`echo "container=$(docker run --rm hello-world 2>&1 | grep -ci 'working correctly' || echo 0)"`,
 	}, "; ")
 
@@ -599,6 +603,19 @@ func checkGuestReport(body, secret string) error {
 		failures = append(failures, "the docker daemon did not answer on this kernel")
 	}
 
+	if !hasDockerStorageDriver(body, "overlay2") {
+		failures = append(failures, "docker is not using overlay2, so pulled image content can "+
+			"bypass the independently fenced /var/lib/docker cache")
+	}
+
+	if !hasBuildxVersion(body) {
+		failures = append(failures, "the Docker Buildx CLI plugin did not report a version")
+	}
+
+	if !hasVersion(body, "compose=") {
+		failures = append(failures, "the Docker Compose CLI plugin did not report a version")
+	}
+
 	if strings.Contains(body, "container=0") {
 		failures = append(failures, "docker did not run a container (this one needs egress to a "+
 			"registry, so it can also mean the bridge has none)")
@@ -639,6 +656,41 @@ func hasVersion(body, field string) bool {
 	}
 
 	return value[0] >= '0' && value[0] <= '9'
+}
+
+// hasDockerStorageDriver reports whether Docker named the backend required by
+// the image-store cache. The version and driver share one probe line so another
+// report field cannot satisfy this check accidentally.
+func hasDockerStorageDriver(body, want string) bool {
+	_, after, found := strings.Cut(body, "docker=")
+	if !found {
+		return false
+	}
+	line, _, _ := strings.Cut(after, "\n")
+	for _, field := range strings.Fields(line) {
+		if field == "storage="+want {
+			return true
+		}
+	}
+
+	return false
+}
+
+// hasBuildxVersion recognises upstream and distribution-packaged Buildx output.
+// Upstream prefixes the second field with v; Ubuntu deliberately does not.
+func hasBuildxVersion(body string) bool {
+	_, after, found := strings.Cut(body, "buildx=")
+	if !found {
+		return false
+	}
+	line, _, _ := strings.Cut(after, "\n")
+	fields := strings.Fields(line)
+	if len(fields) < 2 {
+		return false
+	}
+	version := strings.TrimPrefix(fields[1], "v")
+
+	return version != "" && version[0] >= '0' && version[0] <= '9'
 }
 
 // verifyDeploymentID is the identity this machine's microVMs are owned by.

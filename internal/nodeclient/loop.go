@@ -63,6 +63,10 @@ type Compute interface {
 	Superseded()
 }
 
+type completionAwareCompute interface {
+	DestroyCompleted(ctx context.Context, requestID int64, result string) error
+}
+
 // defaultDrainTimeout bounds how long a stopping node waits for the compute it
 // is holding.
 //
@@ -828,7 +832,13 @@ func execute(ctx context.Context, compute Compute, cmd nodeapi.Command, draining
 		return res
 
 	case nodeapi.CommandDestroy:
-		if err := compute.Destroy(ctx, cmd.RequestID); err != nil {
+		var err error
+		if completed, ok := compute.(completionAwareCompute); ok && cmd.JobResult != "" {
+			err = completed.DestroyCompleted(ctx, cmd.RequestID, cmd.JobResult)
+		} else {
+			err = compute.Destroy(ctx, cmd.RequestID)
+		}
+		if err != nil {
 			res.Error = err.Error()
 
 			// CUSTODY IS CARRIED HERE TOO, and its absence was #46's other half.

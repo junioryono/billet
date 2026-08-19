@@ -631,8 +631,14 @@ func checkSpec(spec provider.Spec) error {
 		}
 	}
 
-	if (spec.CacheEndpoint == "") != (spec.CacheToken == "") {
-		return fmt.Errorf("firecracker: %s needs both a cache endpoint and its per-guest token", spec.Name)
+	cacheFields := 0
+	for _, value := range []string{spec.CacheEndpoint, spec.CacheToken} {
+		if value != "" {
+			cacheFields++
+		}
+	}
+	if cacheFields != 0 && cacheFields != 2 {
+		return fmt.Errorf("firecracker: %s needs a cache endpoint and per-guest token", spec.Name)
 	}
 	if spec.CacheEndpoint != "" && spec.BuildKitCacheMountLimit <= 0 {
 		return fmt.Errorf("firecracker: %s needs a positive BuildKit cache-mount ceiling", spec.Name)
@@ -824,14 +830,15 @@ func metadata(spec provider.Spec) (map[string]any, error) {
 // The agent compares this against what it was built for and stops with a message
 // naming both if they differ.
 //
-// BUMP IT WHEN THE SHAPE CHANGES — a renamed key, a new required field, a different
-// encoding — and republish the image in the same change. Adding an OPTIONAL key that
-// an older agent can ignore is not a change to the shape and does not need one.
+// BUMP IT WHEN THE SHAPE OR REQUIRED EXECUTION SURFACE CHANGES — a renamed key, a
+// new required field, a different encoding, a new host-selected command or a
+// required workflow tool — and republish the image in the same change. Adding an
+// OPTIONAL key that an older agent can ignore is not a contract change.
 //
 // Republishing is safe precisely because generations are immutable: a job holding a
 // clone of the old generation keeps the agent it booted with, and clone v2 lets the
 // old generation be removed once nothing holds it.
-const GuestContract = "4"
+const GuestContract = "7"
 
 // mmdsSizeLimit is how much the metadata service will hold.
 //

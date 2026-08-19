@@ -1046,7 +1046,9 @@ func TestAnInaccessibleAncestorIsNotBlamedOnTheDirectoryMode(t *testing.T) {
 		t.Fatal("billet reached a directory through an unsearchable parent")
 	}
 
-	if strings.Contains(err.Error(), "2770") {
+	// Match the advice, not four digits that may occur in t.TempDir's random
+	// suffix. The latter made this assertion depend on a generated path.
+	if strings.Contains(err.Error(), "two accounts share it, 2770") {
 		t.Errorf("billet blamed the directory's own mode for a problem in its ancestry, "+
 			"sending the operator to change something that is already correct: %v", err)
 	}

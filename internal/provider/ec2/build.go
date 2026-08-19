@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/junioryono/billet/internal/guestassets"
 )
 
 // BuildSpec describes an AMI to build.
@@ -420,7 +422,8 @@ func sleepFor(ctx context.Context, d time.Duration) error {
 // without HOME the runner inherits cloud-init's HOME=/root, registers fine, and
 // then fails every job step that writes to $HOME.
 const privilegeDrop = "setpriv --reuid=runner --regid=runner --init-groups \\\n" +
-	"  env HOME=/home/runner USER=runner LOGNAME=runner"
+	"  env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin " +
+	"HOME=/home/runner USER=runner LOGNAME=runner"
 
 // jobTimingHookPath ends in the extension GitHub uses to select the hook's
 // interpreter. A shebang and executable mode are not sufficient.
@@ -473,11 +476,47 @@ func provisionScript(spec BuildSpec) (string, error) {
 	}
 
 	var b strings.Builder
+	var composeArch, composeSHA256 string
+	switch spec.Arch {
+	case "x64":
+		composeArch = "x86_64"
+		composeSHA256 = "f9ebc6ebdb19d769b793c245a736caaeb198c62587f13b25c660c13b4987f959"
+	case "arm64":
+		composeArch = "aarch64"
+		composeSHA256 = "aa611e811d0ea25897839c404bfb5bf93ce706dc51c500a4457890f5d0606a86"
+	}
 
 	b.WriteString("#!/bin/sh\nset -eux\n")
 
 	// Docker, git and tar are what a workflow cannot reasonably install itself.
-	b.WriteString("dnf install -y docker git tar\n")
+	b.WriteString("dnf install -y docker git tar jq e2fsprogs util-linux\n")
+	// Docker 29 defaults fresh installations to image content under
+	// /var/lib/containerd. The cache attaches one fenced filesystem at
+	// /var/lib/docker, so select the supported classic store before the daemon is
+	// enabled. Otherwise the cache publishes successfully without the images.
+	b.WriteString("install -d /etc/docker\n")
+	b.WriteString("cat > /etc/docker/daemon.json <<'BILLETDOCKERDAEMON'\n")
+	b.WriteString("{\n")
+	b.WriteString("  \"features\": {\n")
+	b.WriteString("    \"containerd-snapshotter\": false\n")
+	b.WriteString("  },\n")
+	b.WriteString("  \"storage-driver\": \"overlay2\"\n")
+	b.WriteString("}\n")
+	b.WriteString("BILLETDOCKERDAEMON\n")
+	// Amazon Linux does not package the Compose plugin. Pin Docker's release and
+	// its per-architecture digest instead of turning every AMI build into a fetch
+	// of whatever `latest` means that day.
+	composePath := "/usr/local/libexec/docker/cli-plugins/docker-compose"
+	composeURL := "https://github.com/docker/compose/releases/download/v5.3.1/" +
+		"docker-compose-linux-" + composeArch
+	b.WriteString("install -d /usr/local/libexec/docker/cli-plugins\n")
+	b.WriteString("curl -fsSL --retry 5 --retry-all-errors -o " + composePath + " " +
+		strconv.Quote(composeURL) + "\n")
+	b.WriteString("echo " + strconv.Quote(composeSHA256+"  "+composePath) +
+		" | sha256sum -c -\n")
+	b.WriteString("chmod 0755 " + composePath + "\n")
+	b.WriteString("docker buildx version\n")
+	b.WriteString("docker compose version\n")
 	b.WriteString("systemctl enable docker\n")
 
 	// THE RUNNER'S OWN DEPENDENCIES, INSTALLED DIRECTLY RATHER THAN BY ITS SCRIPT.
@@ -509,6 +548,13 @@ func provisionScript(spec BuildSpec) (string, error) {
 	b.WriteString("curl -fsSL -o runner.tar.gz " + strconv.Quote(release) + "\n")
 	b.WriteString("tar xzf runner.tar.gz\n")
 	b.WriteString("rm runner.tar.gz\n")
+	b.WriteString("cat > /opt/actions-runner/billet-runner-service <<'BILLETRUNNEREOF'\n")
+	b.WriteString(guestassets.RunnerServiceScript)
+	if !strings.HasSuffix(guestassets.RunnerServiceScript, "\n") {
+		b.WriteString("\n")
+	}
+	b.WriteString("BILLETRUNNEREOF\n")
+	b.WriteString("chmod 0755 /opt/actions-runner/billet-runner-service\n")
 	b.WriteString("chown -R runner:runner /opt/actions-runner\n")
 
 	// THE SUPPORTED RUNNER HOOK, rather than an edit to run.sh. GitHub invokes it
@@ -518,6 +564,13 @@ func provisionScript(spec BuildSpec) (string, error) {
 	b.WriteString(jobTimingHook())
 	b.WriteString("BILLETJOBEOF\n")
 	b.WriteString("chmod 0755 " + jobTimingHookPath + "\n")
+	b.WriteString("cat > /usr/local/bin/billet-docker-cache <<'BILLETDOCKEREOF'\n")
+	b.WriteString(guestassets.DockerCacheScript)
+	if !strings.HasSuffix(guestassets.DockerCacheScript, "\n") {
+		b.WriteString("\n")
+	}
+	b.WriteString("BILLETDOCKEREOF\n")
+	b.WriteString("chmod 0755 /usr/local/bin/billet-docker-cache\n")
 
 	// THE ENTRY POINT A TIER NAMES. billet's boot script exports the JIT config and
 	// execs the tier's command AS ROOT, so something has to drop privileges without
@@ -525,8 +578,14 @@ func provisionScript(spec BuildSpec) (string, error) {
 	b.WriteString("cat > /usr/local/bin/billet-runner <<'BILLETEOF'\n")
 	b.WriteString("#!/bin/sh\nset -eu\n")
 
+	// ATTACH THE IMAGE STORE BEFORE STARTING THE RUNNER. The helper stops Docker if
+	// cloud-init already started it, mounts the cache, and starts it again before
+	// service containers can be pulled. Every cache failure falls back to the root
+	// disk and a cold pull.
+	b.WriteString("/usr/local/bin/billet-docker-cache prepare\n")
+
 	// WAIT FOR DOCKER BEFORE STARTING THE RUNNER, because billet's boot script
-	// execs this the moment cloud-init reaches it and the daemon may not be up.
+	// invokes this the moment cloud-init reaches it and the daemon may not be up.
 	//
 	// A verification run of a finished image measured exactly that: at the instant
 	// the check ran, systemctl reported docker inactive, and a container ran fine
@@ -552,12 +611,23 @@ func provisionScript(spec BuildSpec) (string, error) {
 	// tests green while producing the failure this whole issue exists to prevent —
 	// a runner that starts, finds no registration, exits, and leaves a machine
 	// looking perfectly healthy.
-	b.WriteString("exec " + privilegeDrop + " \\\n")
+	b.WriteString("set +e\n")
+	b.WriteString(privilegeDrop + " \\\n")
 	b.WriteString("  BILLET_LAUNCH_EPOCH_NS=\"${BILLET_LAUNCH_EPOCH_NS:-}\" \\\n")
 	b.WriteString("  BILLET_RUNNER_START_EPOCH_NS=\"$runner_started\" \\\n")
 	b.WriteString("  ACTIONS_RUNNER_HOOK_JOB_STARTED=" + jobTimingHookPath + " \\\n")
+	b.WriteString("  ACTIONS_RUNNER_RETURN_JOB_RESULT_FOR_HOSTED=true \\\n")
+	b.WriteString("  ACTIONS_RUNNER_RETURN_VERSION_DEPRECATED_EXIT_CODE=\"${ACTIONS_RUNNER_RETURN_VERSION_DEPRECATED_EXIT_CODE:-}\" \\\n")
 	b.WriteString("  " + jitEnvVar + "=\"$" + jitEnvVar + "\" \\\n")
-	b.WriteString("  /opt/actions-runner/run.sh\n")
+	b.WriteString("  BILLET_CACHE_ENDPOINT=\"${BILLET_CACHE_ENDPOINT:-}\" \\\n")
+	b.WriteString("  BILLET_CACHE_TOKEN=\"${BILLET_CACHE_TOKEN:-}\" \\\n")
+	b.WriteString("  BILLET_BUILDKIT_CACHE_MOUNT_LIMIT_BYTES=\"${BILLET_BUILDKIT_CACHE_MOUNT_LIMIT_BYTES:-}\" \\\n")
+	b.WriteString("  /opt/actions-runner/billet-runner-service\n")
+	b.WriteString("job_status=$?\n")
+	b.WriteString("set -e\n")
+	b.WriteString("/usr/local/bin/billet-docker-cache complete \"$job_status\"\n")
+	b.WriteString("service_status=$(/usr/local/bin/billet-docker-cache service-status \"$job_status\") || service_status=$job_status\n")
+	b.WriteString("exit \"$service_status\"\n")
 	b.WriteString("BILLETEOF\n")
 	b.WriteString("chmod 0755 /usr/local/bin/billet-runner\n")
 
@@ -581,8 +651,7 @@ func provisionScript(spec BuildSpec) (string, error) {
 	// command that setpriv exists, that the user switch works, that the runner user
 	// can reach and execute the binary, and that .NET starts (a missing libicu dies
 	// here rather than at registration).
-	b.WriteString("setpriv --reuid=runner --regid=runner --init-groups \\\n")
-	b.WriteString("  env HOME=/home/runner USER=runner LOGNAME=runner \\\n")
+	b.WriteString(privilegeDrop + " \\\n")
 	b.WriteString("  /opt/actions-runner/bin/Runner.Listener --version\n")
 
 	// THE SUCCESS SIGNAL. Reaching this line is the only thing that tells billet

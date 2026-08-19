@@ -29,6 +29,7 @@ const (
 	cacheWorkLimit     = cacheHandlerLimit - cacheCleanupMargin
 	cacheWriterTTL     = 15 * time.Minute
 	cacheVolumeLimit   = int64(100 << 30)
+	dockerSettleWait   = 2 * time.Minute
 	dockerStoreKey     = "docker-images/"
 	publicationCAS     = "cas"
 	publicationLWW     = "last-write-wins"
@@ -58,9 +59,17 @@ type cacheSession struct {
 	slots    [provider.MaxVolumes]*cacheAttachment
 }
 
+// CacheCredentials identifies one managed guest's cache session.
+type CacheCredentials struct {
+	Token string
+}
+
 type cacheAttachment struct {
 	Volume      storecontract.Volume `json:"volume"`
 	Publication string               `json:"publication,omitempty"`
+	Docker      bool                 `json:"docker,omitempty"`
+	Settling    bool                 `json:"settling,omitempty"`
+	Ready       bool                 `json:"ready,omitempty"`
 }
 
 // NewCacheService constructs a node-local cache endpoint.
@@ -94,8 +103,9 @@ func NewCacheService(
 
 	service := &CacheService{
 		endpoint: endpoint, namespace: namespace, store: storage, attacher: attacher, log: log,
-		stateDir: filepath.Join(stateDir, cacheSessionDirectory),
-		byToken:  make(map[string]*cacheSession), byInstance: make(map[string]string),
+		stateDir:   filepath.Join(stateDir, cacheSessionDirectory),
+		byToken:    make(map[string]*cacheSession),
+		byInstance: make(map[string]string),
 	}
 	if err := service.loadSessions(); err != nil {
 		return nil, err
@@ -109,95 +119,59 @@ func (s *CacheService) qualifiedKey(key string) string { return s.namespace + "/
 // Endpoint is the origin placed in a microVM's metadata.
 func (s *CacheService) Endpoint() string { return s.endpoint }
 
-// Prepare creates one unguessable session before its microVM starts.
-func (s *CacheService) Prepare(instance string, trust provider.TrustClass) (string, error) {
+// Prepare creates one unguessable session credential before compute starts.
+func (s *CacheService) Prepare(instance string, trust provider.TrustClass) (CacheCredentials, error) {
 	if strings.TrimSpace(instance) == "" {
-		return "", errors.New("node: a cache session needs an instance")
+		return CacheCredentials{}, errors.New("node: a cache session needs an instance")
 	}
 
 	if trust != provider.TrustTrusted && trust != provider.TrustUntrusted {
-		return "", errors.New("node: cannot give cache access to work with unknown trust")
+		return CacheCredentials{}, errors.New("node: cannot give cache access to work with unknown trust")
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if _, exists := s.byInstance[instance]; exists {
-		return "", fmt.Errorf("node: cache session for %s already exists", instance)
+		return CacheCredentials{}, fmt.Errorf("node: cache session for %s already exists", instance)
 	}
 
 	for {
-		var raw [32]byte
-		if _, err := rand.Read(raw[:]); err != nil {
-			return "", fmt.Errorf("node: mint a cache session: %w", err)
+		token, err := randomCacheToken()
+		if err != nil {
+			return CacheCredentials{}, err
 		}
-
-		token := hex.EncodeToString(raw[:])
-		if _, collision := s.byToken[token]; collision {
+		if s.tokenExists(token) {
 			continue
 		}
 
-		session := &cacheSession{token: token, instance: instance, trust: trust, admit: make(chan struct{}, 1)}
+		session := &cacheSession{
+			token: token, instance: instance, trust: trust,
+			admit: make(chan struct{}, 1),
+		}
 		if err := s.persistSession(session); err != nil {
-			return "", err
+			return CacheCredentials{}, err
 		}
 
 		s.byToken[token] = session
 		s.byInstance[instance] = token
 
-		return token, nil
+		return CacheCredentials{Token: token}, nil
 	}
 }
 
-// PrepareDockerStore attaches the architecture-scoped image store before boot,
-// so service containers benefit before workflow steps begin.
-func (s *CacheService) PrepareDockerStore(
-	ctx context.Context,
-	instance, architecture string,
-) (provider.VolumeMount, error) {
-	s.mu.Lock()
-	token, ok := s.byInstance[instance]
-	if !ok {
-		s.mu.Unlock()
-
-		return provider.VolumeMount{}, fmt.Errorf("node: no cache session for %s", instance)
-	}
-	session := s.byToken[token]
-	s.mu.Unlock()
-
-	if strings.TrimSpace(architecture) == "" || strings.ContainsAny(architecture, "/\x00\r\n") {
-		return provider.VolumeMount{}, errors.New("node: a Docker image cache needs an architecture")
+func randomCacheToken() (string, error) {
+	var raw [32]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", fmt.Errorf("node: mint a cache session capability: %w", err)
 	}
 
-	session.mu.Lock()
-	defer session.mu.Unlock()
-	if session.closed || session.slots[0] != nil {
-		return provider.VolumeMount{}, errors.New("node: Docker image cache slot is unavailable")
-	}
+	return hex.EncodeToString(raw[:]), nil
+}
 
-	key := s.qualifiedKey(dockerStoreKey + architecture)
-	volume, err := s.store.Clone(ctx, key, "")
-	if errors.Is(err, storecontract.ErrMiss) {
-		volume, err = s.store.Create(ctx, key, cacheVolumeLimit)
-	}
-	if err != nil {
-		return provider.VolumeMount{}, fmt.Errorf("node: prepare Docker image cache: %w", err)
-	}
-
-	session.slots[0] = &cacheAttachment{Volume: volume}
-	if err := s.persistSession(session); err != nil {
-		discardErr := s.store.Discard(ctx, volume)
-		var retryErr error
-		if discardErr == nil {
-			session.slots[0] = nil
-		} else {
-			retryErr = s.persistSession(session)
-		}
-
-		return provider.VolumeMount{}, errors.Join(err, discardErr, retryErr)
-	}
-
-	return provider.VolumeMount{Device: volume.Device, Path: "/var/lib/docker"}, nil
+// tokenExists is called while s.mu is held.
+func (s *CacheService) tokenExists(token string) bool {
+	return s.byToken[token] != nil
 }
 
 // finishSession removes a fully discarded session while session.mu is held.
@@ -321,8 +295,7 @@ func (s *CacheService) cleanupSession(
 	defer session.mu.Unlock()
 
 	s.mu.Lock()
-	owned := s.byToken[session.token] == session &&
-		s.byInstance[session.instance] == session.token
+	owned := s.byToken[session.token] == session && s.byInstance[session.instance] == session.token
 	s.mu.Unlock()
 	if !owned || (!closeSession && !session.closed) {
 		return nil
@@ -380,6 +353,10 @@ func (s *CacheService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch {
+	case r.Method == http.MethodPost && r.URL.Path == "/v1/docker-store":
+		s.attachDockerStore(w, r, session)
+	case r.Method == http.MethodPost && r.URL.Path == "/v1/docker-store/ready":
+		s.markDockerStoreReady(w, r, session)
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/volumes":
 		s.attach(w, r, session)
 	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/volumes/") &&
@@ -391,6 +368,270 @@ func (s *CacheService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+func (s *CacheService) attachDockerStore(
+	w http.ResponseWriter,
+	r *http.Request,
+	session *cacheSession,
+) {
+	ctx, cancel := context.WithTimeout(r.Context(), cacheWorkLimit)
+	defer cancel()
+
+	var request struct {
+		Architecture string `json:"architecture"`
+	}
+	if err := decodeCacheRequest(r.Body, &request); err != nil {
+		http.Error(w, "invalid Docker image-store request", http.StatusBadRequest)
+
+		return
+	}
+	if !validCacheArchitecture(request.Architecture) {
+		http.Error(w, "invalid Docker image-store architecture", http.StatusBadRequest)
+
+		return
+	}
+	if err := lockCacheSession(ctx, session); err != nil {
+		http.Error(w, "cache unavailable", http.StatusServiceUnavailable)
+
+		return
+	}
+	defer session.mu.Unlock()
+	if session.closed {
+		http.Error(w, "cache session has ended", http.StatusGone)
+
+		return
+	}
+	if session.slots[0] != nil {
+		http.Error(w, "Docker image-store slot is unavailable", http.StatusConflict)
+
+		return
+	}
+
+	key := s.qualifiedKey(dockerStoreKey + request.Architecture)
+	volume, err := s.store.Clone(ctx, key, "")
+	cold := errors.Is(err, storecontract.ErrMiss)
+	if cold {
+		volume, err = s.store.Create(ctx, key, cacheVolumeLimit)
+	}
+	if err != nil {
+		s.log.Warn("Docker image store is unavailable; the job can continue cold",
+			"instance", session.instance, "error", err)
+		http.Error(w, "cache unavailable", http.StatusServiceUnavailable)
+
+		return
+	}
+
+	session.slots[0] = &cacheAttachment{
+		Volume: volume, Publication: publicationLWW, Docker: true,
+	}
+	if err := s.persistSession(session); err != nil {
+		discardErr := s.store.Discard(ctx, volume)
+		var retryErr error
+		if discardErr == nil {
+			session.slots[0] = nil
+		} else {
+			retryErr = s.persistSession(session)
+		}
+		s.log.Warn("Docker image-store custody could not be made durable; the job can continue cold",
+			"instance", session.instance, "error", errors.Join(err, discardErr, retryErr))
+		http.Error(w, "cache unavailable", http.StatusServiceUnavailable)
+
+		return
+	}
+
+	if err := s.attacher.AttachVolume(ctx, session.instance, 0, volume.Device); err != nil {
+		detachErr := s.attacher.DetachVolume(ctx, session.instance, 0, volume.Device)
+		var discardErr, clearErr error
+		if detachErr == nil {
+			discardErr = s.store.Discard(ctx, volume)
+			if discardErr == nil {
+				session.slots[0] = nil
+				clearErr = s.persistSession(session)
+				if clearErr != nil {
+					session.slots[0] = &cacheAttachment{
+						Volume: volume, Publication: publicationLWW, Docker: true,
+					}
+				}
+			}
+		}
+		s.log.Warn("Docker image store could not be attached; the job can continue cold",
+			"instance", session.instance,
+			"error", errors.Join(err, detachErr, discardErr, clearErr))
+		http.Error(w, "cache unavailable", http.StatusServiceUnavailable)
+
+		return
+	}
+
+	guestDevice := guestVolumeDevice(0)
+	if locator, ok := s.attacher.(provider.GuestVolumeLocator); ok {
+		guestDevice = locator.GuestVolumeDevice(0, volume.Device)
+	}
+	writeCacheJSON(w, http.StatusCreated, map[string]any{
+		"slot": 0, "device": guestDevice, "generation": volume.Generation, "cold": cold,
+	})
+}
+
+func (s *CacheService) markDockerStoreReady(
+	w http.ResponseWriter,
+	r *http.Request,
+	session *cacheSession,
+) {
+	// Readiness is cooperation from the guest, not authority granted to one
+	// process inside it. Workflows have passwordless sudo and Docker-root
+	// equivalence, so no metadata bearer can distinguish the helper from workflow
+	// code. Settling remains closed until the node independently has both a
+	// trusted job classification and GitHub's successful completed-job result.
+	var request struct {
+		Filesystem storecontract.Filesystem `json:"filesystem"`
+	}
+	if err := decodeCacheRequest(r.Body, &request); err != nil || request.Filesystem.Valid() != nil {
+		http.Error(w, "invalid Docker image-store readiness proof", http.StatusBadRequest)
+
+		return
+	}
+	if err := lockCacheSession(r.Context(), session); err != nil {
+		http.Error(w, "cache unavailable", http.StatusServiceUnavailable)
+
+		return
+	}
+	defer session.mu.Unlock()
+	attachment := session.slots[0]
+	if session.closed || attachment == nil || !attachment.Docker {
+		http.Error(w, "Docker image store is not attached", http.StatusNotFound)
+
+		return
+	}
+	if !attachment.Settling {
+		http.Error(w, "Docker image store is not settling", http.StatusConflict)
+
+		return
+	}
+	attachment.Volume.Filesystem = request.Filesystem
+	attachment.Ready = true
+	if err := s.persistSession(session); err != nil {
+		http.Error(w, "cache unavailable", http.StatusServiceUnavailable)
+
+		return
+	}
+	writeCacheJSON(w, http.StatusOK, map[string]any{"ready": true})
+}
+
+// SettleDocker publishes a prepared store only when GitHub reported success.
+func (s *CacheService) SettleDocker(ctx context.Context, instance string, succeeded bool) error {
+	s.mu.Lock()
+	token, ok := s.byInstance[instance]
+	if !ok {
+		s.mu.Unlock()
+
+		return nil
+	}
+	session := s.byToken[token]
+	s.mu.Unlock()
+
+	if !succeeded || session.trust != provider.TrustTrusted {
+		return nil
+	}
+	if err := lockCacheSession(ctx, session); err != nil {
+		return err
+	}
+	attachment := session.slots[0]
+	if attachment == nil || !attachment.Docker {
+		session.mu.Unlock()
+
+		return nil
+	}
+	if !attachment.Settling {
+		attachment.Settling = true
+		attachment.Ready = false
+		attachment.Volume.Filesystem = storecontract.Filesystem{}
+		if err := s.persistSession(session); err != nil {
+			session.mu.Unlock()
+
+			return fmt.Errorf("open Docker image-store settlement: %w", err)
+		}
+	}
+	session.mu.Unlock()
+
+	deadline := time.NewTimer(dockerSettleWait)
+	defer deadline.Stop()
+
+	for {
+		if err := lockCacheSession(ctx, session); err != nil {
+			return err
+		}
+		attachment := session.slots[0]
+		if attachment == nil || !attachment.Docker {
+			session.mu.Unlock()
+
+			return nil
+		}
+		if attachment.Ready {
+			err := s.publishDocker(ctx, session, attachment)
+			session.mu.Unlock()
+
+			return err
+		}
+		session.mu.Unlock()
+
+		timer := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+
+			return ctx.Err()
+		case <-deadline.C:
+			timer.Stop()
+
+			return errors.New("docker image store did not become ready before teardown")
+		case <-timer.C:
+		}
+	}
+}
+
+// publishDocker consumes a ready attachment while its session is locked.
+func (s *CacheService) publishDocker(
+	ctx context.Context,
+	session *cacheSession,
+	attachment *cacheAttachment,
+) error {
+	if err := s.attacher.DetachVolume(ctx, session.instance, 0, attachment.Volume.Device); err != nil {
+		return fmt.Errorf("detach Docker image store: %w", err)
+	}
+
+	lease, fence, err := s.acquireWriter(ctx, attachment, session.instance)
+	if err != nil {
+		return fmt.Errorf("acquire Docker image-store writer: %w", err)
+	}
+	candidate, err := s.store.Snapshot(ctx, attachment.Volume)
+	if err != nil {
+		return fmt.Errorf("snapshot Docker image store: %w", err)
+	}
+	session.slots[0] = nil
+	if err := s.persistSession(session); err != nil {
+		return fmt.Errorf("record consumed Docker image store: %w", err)
+	}
+	if err := s.publish(ctx, attachment, candidate, lease, fence); err != nil {
+		return fmt.Errorf("publish Docker image store: %w", err)
+	}
+
+	return nil
+}
+
+func validCacheArchitecture(architecture string) bool {
+	if architecture == "" || len(architecture) > 64 {
+		return false
+	}
+	for i, character := range []byte(architecture) {
+		if character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' ||
+			character >= '0' && character <= '9' || i > 0 && (character == '.' || character == '_' || character == '-') {
+			continue
+		}
+
+		return false
+	}
+
+	return true
 }
 
 func (s *CacheService) authenticate(r *http.Request) (*cacheSession, bool) {
@@ -427,7 +668,8 @@ func (s *CacheService) attach(w http.ResponseWriter, r *http.Request, session *c
 
 	if strings.TrimSpace(request.Key) == "" || strings.TrimSpace(request.Key) != request.Key ||
 		len(request.Key) > cacheKeyLimit ||
-		request.SizeBytes <= 0 || request.SizeBytes > cacheVolumeLimit {
+		strings.HasPrefix(request.Key, dockerStoreKey) || request.SizeBytes <= 0 ||
+		request.SizeBytes > cacheVolumeLimit {
 		http.Error(w, "cache key or size is outside the allowed range", http.StatusBadRequest)
 
 		return
@@ -564,6 +806,11 @@ func (s *CacheService) commit(w http.ResponseWriter, r *http.Request, session *c
 	attachment := session.slots[slot]
 	if attachment == nil {
 		http.Error(w, "cache slot is not attached", http.StatusNotFound)
+
+		return
+	}
+	if attachment.Docker {
+		http.Error(w, "Docker image stores settle from GitHub's completed-job result", http.StatusForbidden)
 
 		return
 	}

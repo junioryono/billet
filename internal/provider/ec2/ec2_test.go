@@ -2453,6 +2453,9 @@ func TestCloudBootExportsItsOneJobCacheSession(t *testing.T) {
 			t.Errorf("boot script does not contain %q: %s", want, script)
 		}
 	}
+	if strings.Contains(script, "BILLET_CACHE_READY_TOKEN") {
+		t.Fatal("user data carries a readiness pseudo-secret inside a root-controlled guest")
+	}
 
 	spec.CacheToken = ""
 	if _, err := p.userData(spec); err == nil {

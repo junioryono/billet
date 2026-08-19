@@ -85,6 +85,11 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job server.Job)
 	}
 
 	if res.OK {
+		// The node binds this lease before it reports a successful launch. Carry
+		// that authoritative destination back into the listener's lease so a
+		// completion persisted before any later ledger read still names its holder.
+		lease.Node = n.name
+
 		return nil
 	}
 
@@ -106,6 +111,61 @@ func (r *Runner) Launch(ctx context.Context, lease *alloc.Lease, job server.Job)
 // The result is the FIRST failure, if any: a destroy that only partly succeeded
 // has left compute running somewhere and must not report success.
 func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
+	return r.destroy(ctx, requestID, "")
+}
+
+// DestroyCompleted sends GitHub's authoritative result with a completion-triggered destroy.
+func (r *Runner) DestroyCompleted(ctx context.Context, requestID int64, result string) error {
+	return r.destroy(ctx, requestID, result)
+}
+
+// DestroyCompletedBound reconciles a restored completion with its durable host
+// and lease rather than treating an unrelated live fleet as proof of absence.
+func (r *Runner) DestroyCompletedBound(
+	ctx context.Context,
+	requestID int64,
+	result, leaseID, nodeName string,
+	leaseEpoch int64,
+	outcome alloc.Phase,
+) error {
+	id, err := commandID()
+	if err != nil {
+		return err
+	}
+	pend := &pending{
+		cmd: nodeapi.Command{
+			ID: id, Kind: nodeapi.CommandDestroy, RequestID: requestID, JobResult: result,
+		},
+		done: make(chan nodeapi.CommandResult, 1),
+	}
+	res, incarnation, absent, err := r.plane.dispatchBound(
+		ctx, nodeName, leaseID, leaseEpoch, outcome, pend)
+	if err != nil {
+		return fmt.Errorf("node %s: %w", nodeName, err)
+	}
+	if absent {
+		return nil
+	}
+	if incarnation == "" {
+		return completionHolderUnavailable(nodeName, requestID)
+	}
+	if r.plane.tookCommand(pend) != incarnation {
+		return completionHolderUnavailable(nodeName, requestID)
+	}
+	if !res.OK {
+		if res.Custody {
+			return fmt.Errorf("%w: node %s: %s", server.ErrCustody, nodeName, res.Error)
+		}
+
+		return fmt.Errorf("node %s could not destroy request %d: %s",
+			nodeName, requestID, res.Error)
+	}
+	r.plane.ForgetLease(nodeName, leaseID)
+
+	return nil
+}
+
+func (r *Runner) destroy(ctx context.Context, requestID int64, result string) error {
 	// WHO HOLDS THIS? The node name is not enough: a superseded process and its
 	// replacement share it, and only one of them has the container.
 	owner, known := r.plane.OwnerOfRequest(requestID)
@@ -134,6 +194,10 @@ func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
 		// A DRAINING PROCESS IS NEVER IN THIS LIST — it does not poll — so an empty
 		// fleet says nothing about a container it is still running.
 		if known {
+			if result != "" {
+				return completionHolderUnavailable(owner.Node, requestID)
+			}
+
 			return heldByADrainingProcess(owner.Node, requestID)
 		}
 
@@ -166,7 +230,7 @@ func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
 		go func() {
 			defer wg.Done()
 
-			incarnation, err := r.destroyOn(ctx, n, requestID)
+			incarnation, err := r.destroyOn(ctx, n, requestID, result)
 
 			mu.Lock()
 			defer mu.Unlock()
@@ -238,6 +302,10 @@ func (r *Runner) Destroy(ctx context.Context, requestID int64) error {
 	}
 
 	if !confirmed {
+		if result != "" {
+			return completionHolderUnavailable(owner.Node, requestID)
+		}
+
 		return heldByADrainingProcess(owner.Node, requestID)
 	}
 
@@ -369,15 +437,30 @@ func heldByADrainingProcess(node string, requestID int64) error {
 		server.ErrCustody, requestID, node)
 }
 
+// completionHolderUnavailable preserves the authoritative result until the
+// process holding the compute can receive it or prove that compute absent.
+func completionHolderUnavailable(node string, requestID int64) error {
+	return fmt.Errorf(
+		"%w: request %d is bound to %s, but its authoritative result has not reached that holder",
+		server.ErrHolderUnavailable, requestID, node)
+}
+
 // destroyOn asks one node to remove a request's compute.
-func (r *Runner) destroyOn(ctx context.Context, n *node, requestID int64) (string, error) {
+func (r *Runner) destroyOn(
+	ctx context.Context,
+	n *node,
+	requestID int64,
+	result string,
+) (string, error) {
 	id, err := commandID()
 	if err != nil {
 		return "", err
 	}
 
 	pend := &pending{
-		cmd:  nodeapi.Command{ID: id, Kind: nodeapi.CommandDestroy, RequestID: requestID},
+		cmd: nodeapi.Command{
+			ID: id, Kind: nodeapi.CommandDestroy, RequestID: requestID, JobResult: result,
+		},
 		done: make(chan nodeapi.CommandResult, 1),
 	}
 
@@ -438,6 +521,75 @@ func (p *Plane) dispatch(ctx context.Context, n *node, pend *pending) (nodeapi.C
 		}
 	}
 
+	p.queueLocked(n, pend)
+	p.mu.Unlock()
+
+	return p.waitDispatched(ctx, n, pend)
+}
+
+// dispatchBound atomically chooses between the exact lease holder and absence
+// already settled in the ledger, then fences a destroy to the holder's incarnation.
+func (p *Plane) dispatchBound(
+	ctx context.Context,
+	nodeName, leaseID string,
+	leaseEpoch int64,
+	outcome alloc.Phase,
+	pend *pending,
+) (nodeapi.CommandResult, string, bool, error) {
+	p.mu.Lock()
+	p.expireStaleLocked()
+	if _, pending := p.registering[nodeName]; pending {
+		p.mu.Unlock()
+
+		return nodeapi.CommandResult{}, "", false, nil
+	}
+	owner, owned := p.owners[leaseID]
+	if !owned {
+		n := p.nodes[nodeName]
+		if n == nil || !n.inventoryKnown || n.inventory[leaseID] || p.registrar == nil {
+			p.mu.Unlock()
+
+			return nodeapi.CommandResult{}, "", false, nil
+		}
+
+		// ABSENCE BECOMES SUCCESS ONLY AFTER THE LEDGER AGREES. The exact
+		// incarnation lock stays held across reconciliation and the read, so a
+		// replacement or later inventory either wins before this point and is
+		// observed above, or follows a capacity decision already made durable.
+		// The completion resolver also enforces the quarantine grace; a merely
+		// late launch remains charged and returns custody here.
+		settled, err := p.registrar.ResolveQuarantineForCompletion(
+			ctx, nodeName, leaseID, n.ledgerEpoch, leaseEpoch, outcome)
+		if err != nil {
+			p.mu.Unlock()
+
+			return nodeapi.CommandResult{}, "", false, err
+		}
+		if settled {
+			p.mu.Unlock()
+
+			return nodeapi.CommandResult{}, "", true, nil
+		}
+		p.mu.Unlock()
+
+		return nodeapi.CommandResult{}, "", false, nil
+	}
+	n := p.nodes[nodeName]
+	if owner.node != nodeName || n == nil || n.incarnation != owner.incarnation {
+		p.mu.Unlock()
+
+		return nodeapi.CommandResult{}, "", false, nil
+	}
+	pend.expectedIncarnation = owner.incarnation
+	p.queueLocked(n, pend)
+	p.mu.Unlock()
+
+	res, err := p.waitDispatched(ctx, n, pend)
+
+	return res, owner.incarnation, false, err
+}
+
+func (p *Plane) queueLocked(n *node, pend *pending) {
 	n.queue = append(n.queue, pend)
 
 	// Non-blocking, because the channel is a signal rather than a queue: a node
@@ -447,9 +599,13 @@ func (p *Plane) dispatch(ctx context.Context, n *node, pend *pending) (nodeapi.C
 	case n.waiting <- struct{}{}:
 	default:
 	}
+}
 
-	p.mu.Unlock()
-
+func (p *Plane) waitDispatched(
+	ctx context.Context,
+	n *node,
+	pend *pending,
+) (nodeapi.CommandResult, error) {
 	timer := time.NewTimer(p.commandTimeout)
 	defer timer.Stop()
 

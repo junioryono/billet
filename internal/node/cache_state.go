@@ -47,8 +47,8 @@ func (s *CacheService) loadSessions() error {
 		if err := record.valid(entry.Name()); err != nil {
 			return err
 		}
-		if _, duplicate := s.byToken[record.Token]; duplicate {
-			return fmt.Errorf("node: duplicate cache custody token in %s", entry.Name())
+		if s.tokenExists(record.Token) {
+			return fmt.Errorf("node: duplicate cache custody capability in %s", entry.Name())
 		}
 		if _, duplicate := s.byInstance[record.Instance]; duplicate {
 			return fmt.Errorf("node: duplicate cache custody for instance %s", record.Instance)

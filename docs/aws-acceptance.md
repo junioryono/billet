@@ -31,8 +31,11 @@ Those numbers put the current cold path under one minute. Billet's EC2 role is f
 
 The isolated acceptance configuration explicitly selected Spot for a fourth private-repository workflow, which stayed inside a five-minute observation step while AWS Fault Injection Service sent a two-minute `terminate` warning to its exact instance. EventBridge delivered the warning to that node's SQS queue. FIS completed the interruption action at 12:37:10 UTC; Billet observed the warning at 12:37:12 UTC, durably wrote `ec2 spot interruption: terminate`, and asked EC2 to terminate one second later. The lease stayed charged while the instance was `shutting-down`, then archived as failed at 12:38:41 UTC, 89 seconds after Billet observed the warning; the listener created a replacement capacity lease 13 seconds later without launching unrequested compute. GitHub marked the original run failed at 12:47:17 UTC; no replacement instance was launched. The acceptance configuration was then restored to on-demand, both acceptance services were healthy, and the temporary FIS template, IAM role, EventBridge rule and SQS queue were deleted. No acceptance instance remained.
 
+## Same-label failover
+
+The same unchanged workflow completed on the preferred local Firecracker provider, including service containers, a Docker build and run, repository checkout and runtime Go installation. After the local node contribution was stopped, that same label completed on an EC2 `c7i.xlarge`; Billet held its capacity through termination, left no instance behind, and resumed normal local service after the test. This closes the end-to-end acceptance gap recorded in issue #32.
+
 ## What this does not prove
 
-- Same-label failover from preferred local capacity to EC2 remains issue #32. The EC2 half is proven; the test still has to withdraw the local contribution and observe the same label complete in the cloud.
 - The shape allowlist and resource ceilings are the enforceable cost policy. `billet check` reports a node's conservative compute-only peak, `billet status` aggregates registered EC2 nodes under the deployment ceiling, and AWS Budgets is the account-wide backstop rather than a stale copied price becoming a runtime admission gate.
 - EBS/S3 cache reuse and failure recovery remain part of the caching-plane issues.

@@ -79,6 +79,13 @@ else
 	fail "no runner at /home/runner/runner/run.sh; every job would fail to start"
 fi
 
+if [ -x "$RUNNER_DIR/billet-runner-service" ] &&
+	grep -Fq '100 | 101 | 102 | 103 | 104 | 105' "$RUNNER_DIR/billet-runner-service"; then
+	pass "the runner service preserves authoritative one-job results"
+else
+	fail "the runner service wrapper is absent or masks the one-job result codes"
+fi
+
 AGENT="$MNT/usr/local/bin/billet-agent"
 
 # SYSTEMD DOES NOT CREATE A LOGIN ENVIRONMENT. The agent runs as root and drops
@@ -86,20 +93,45 @@ AGENT="$MNT/usr/local/bin/billet-agent"
 # home nor the ordinary account identity variables. Tool installers can complete
 # and then fail when the tool first asks for its per-user cache.
 runner_environment=1
-for assignment in '"HOME=/home/runner"' '"USER=runner"' '"LOGNAME=runner"'; do
+for assignment in '"HOME=/home/runner"' '"USER=runner"' '"LOGNAME=runner"' \
+	'"ACTIONS_RUNNER_RETURN_JOB_RESULT_FOR_HOSTED=true"'; do
 	if ! grep -Eq "^[[:space:]]*${assignment}$" "$AGENT" 2>/dev/null; then
 		runner_environment=0
 	fi
 done
-if ! grep -Fq 'env "${runner_env[@]}" "${cmd[@]}"' "$AGENT" 2>/dev/null; then
+if ! grep -Fq 'env -i "${runner_env[@]}" "${cmd[@]}"' "$AGENT" 2>/dev/null; then
+	runner_environment=0
+fi
+if ! grep -Fq '"ACTIONS_RUNNER_RETURN_VERSION_DEPRECATED_EXIT_CODE=${ACTIONS_RUNNER_RETURN_VERSION_DEPRECATED_EXIT_CODE:-}"' "$AGENT" 2>/dev/null; then
 	runner_environment=0
 fi
 if [ "$runner_environment" -eq 1 ]; then
 	pass "the guest agent establishes the runner account environment"
 else
 	fail "the guest agent does not launch jobs with HOME=/home/runner, USER=runner and
-        LOGNAME=runner; setup actions can install a tool and then fail when it asks
-        for its user cache"
+        LOGNAME=runner, or does not request the authoritative one-job result; setup
+        actions can lose their user cache and Docker writes cannot be gated safely"
+fi
+
+DOCKER_CACHE="$MNT/usr/local/bin/billet-docker-cache"
+if [ -x "$DOCKER_CACHE" ] && grep -Fq '[ "$status" = 100 ]' "$DOCKER_CACHE" &&
+	grep -Fq '/v1/docker-store' "$DOCKER_CACHE" &&
+	grep -Fq '/v1/docker-store/ready' "$DOCKER_CACHE"; then
+	pass "the Docker image store is mounted and prepares only a clean runner result"
+else
+	fail "the Docker cache helper is absent or can prepare a failed runner result for
+	        host-side publication"
+fi
+
+DOCKER_DAEMON="$MNT/etc/docker/daemon.json"
+if [ -r "$DOCKER_DAEMON" ] && jq -e '
+	.features["containerd-snapshotter"] == false and
+	.["storage-driver"] == "overlay2"
+' "$DOCKER_DAEMON" >/dev/null; then
+	pass "Docker keeps pulled images inside the cache-backed data root"
+else
+	fail "Docker is not pinned to overlay2 under /var/lib/docker; fresh Docker 29
+        installations keep image content in /var/lib/containerd and bypass the cache"
 fi
 
 # READ FROM WHAT THE BUILD RECORDED, not from the runner tarball. The tarball
@@ -145,6 +177,40 @@ if [ -x "$MNT/usr/bin/docker" ]; then
 	pass "the docker client is installed"
 else
 	fail "no docker client"
+fi
+
+buildx_plugin=""
+for candidate in \
+	usr/local/lib/docker/cli-plugins/docker-buildx \
+	usr/local/libexec/docker/cli-plugins/docker-buildx \
+	usr/lib/docker/cli-plugins/docker-buildx \
+	usr/libexec/docker/cli-plugins/docker-buildx; do
+	if [ -x "$MNT/$candidate" ]; then
+		buildx_plugin="/$candidate"
+		break
+	fi
+done
+if [ -n "$buildx_plugin" ]; then
+	pass "the Docker Buildx CLI plugin is installed at $buildx_plugin"
+else
+	fail "no Docker Buildx CLI plugin; workflows using docker buildx would fail"
+fi
+
+compose_plugin=""
+for candidate in \
+	usr/local/lib/docker/cli-plugins/docker-compose \
+	usr/local/libexec/docker/cli-plugins/docker-compose \
+	usr/lib/docker/cli-plugins/docker-compose \
+	usr/libexec/docker/cli-plugins/docker-compose; do
+	if [ -x "$MNT/$candidate" ]; then
+		compose_plugin="/$candidate"
+		break
+	fi
+done
+if [ -n "$compose_plugin" ]; then
+	pass "the Docker Compose CLI plugin is installed at $compose_plugin"
+else
+	fail "no Docker Compose CLI plugin; workflows using docker compose would fail"
 fi
 
 # --- what workflows assume is there ----------------------------------------

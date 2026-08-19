@@ -1281,6 +1281,106 @@ var leaseFailureReasonMigration = migration{
 	},
 }
 
+// A completed scale-set message is acknowledged only after its authoritative
+// result can survive the control plane stopping before node teardown succeeds.
+var pendingCompletionsMigration = migration{
+	Version: 22,
+	Name:    "pending_completions",
+	Stmts: []string{
+		`CREATE TABLE pending_completions (
+			tier       TEXT NOT NULL CHECK (length(trim(tier)) > 0),
+			request_id INTEGER NOT NULL CHECK (request_id > 0),
+			run_id     INTEGER NOT NULL DEFAULT 0 CHECK (run_id >= 0),
+			result     TEXT NOT NULL CHECK (length(trim(result)) > 0),
+			PRIMARY KEY (tier, request_id)
+		) STRICT`,
+	},
+}
+
+// A result alone can replay node teardown, but it cannot return capacity when
+// the control plane stops after teardown succeeds and before the lease release
+// settles. Keep the fenced lease identity beside the result so restart recovery
+// can finish both halves of completion in their required order.
+var pendingCompletionLeaseMigration = migration{
+	Version: 23,
+	Name:    "pending_completion_lease",
+	Stmts: []string{
+		`ALTER TABLE pending_completions ADD COLUMN lease_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE pending_completions ADD COLUMN lease_epoch INTEGER NOT NULL DEFAULT 0 CHECK (lease_epoch >= 0)`,
+		`ALTER TABLE pending_completions ADD COLUMN outcome TEXT NOT NULL DEFAULT '' CHECK (outcome IN ('','done','failed'))`,
+		`ALTER TABLE pending_completions ADD COLUMN release_only INTEGER NOT NULL DEFAULT 0 CHECK (release_only IN (0,1))`,
+	},
+}
+
+// Completion recovery needs both the bound host and a monotonic delivery phase.
+// The host keeps restart reconciliation from treating an unrelated live fleet as
+// proof of absence. The message id distinguishes a redelivery from a later job
+// that reuses GitHub's request id, and retired is the durable tombstone that makes
+// a failed row deletion harmless.
+var pendingCompletionRecoveryMigration = migration{
+	Version: 24,
+	Name:    "pending_completion_recovery",
+	Stmts: []string{
+		`ALTER TABLE pending_completions ADD COLUMN lease_node TEXT NOT NULL DEFAULT ''`,
+		`UPDATE pending_completions
+		    SET lease_node = COALESCE((SELECT COALESCE(node, target_node, '') FROM leases
+		                               WHERE leases.id = pending_completions.lease_id), '')
+		  WHERE lease_id != ''`,
+		`ALTER TABLE pending_completions ADD COLUMN message_id INTEGER NOT NULL DEFAULT 0 CHECK (message_id >= 0)`,
+		`ALTER TABLE pending_completions ADD COLUMN retired INTEGER NOT NULL DEFAULT 0 CHECK (retired IN (0,1))`,
+	},
+}
+
+// A retired completion must outlive its source message, but not every later
+// restart. Persisting acknowledgement lets either ordering of settlement and
+// source deletion remove the tombstone only after both facts are durable.
+var pendingCompletionAcknowledgementMigration = migration{
+	Version: 25,
+	Name:    "pending_completion_acknowledgement",
+	Stmts: []string{
+		`ALTER TABLE pending_completions ADD COLUMN acknowledged INTEGER NOT NULL DEFAULT 0 CHECK (acknowledged IN (0,1))`,
+	},
+}
+
+// GitHub assigns runnerRequestId 0 when it sends JobAssigned directly instead
+// of first offering JobAvailable. A durable negative identity, keyed by jobId,
+// keeps those jobs distinct without colliding with GitHub's positive request ids.
+// Pending completions accept either namespace but continue to refuse zero, which
+// remains the unusable wire value rather than a scheduler identity.
+var directAssignmentIdentityMigration = migration{
+	Version: 26,
+	Name:    "direct_assignment_identity",
+	Stmts: []string{
+		`CREATE TABLE job_identities (
+			job_id      TEXT PRIMARY KEY CHECK (length(trim(job_id)) > 0),
+			internal_id INTEGER NOT NULL UNIQUE CHECK (internal_id < 0)
+		) STRICT`,
+		`CREATE TABLE pending_completions_new (
+			tier         TEXT NOT NULL CHECK (length(trim(tier)) > 0),
+			request_id   INTEGER NOT NULL CHECK (request_id != 0),
+			run_id       INTEGER NOT NULL DEFAULT 0 CHECK (run_id >= 0),
+			result       TEXT NOT NULL CHECK (length(trim(result)) > 0),
+			lease_id     TEXT NOT NULL DEFAULT '',
+			lease_epoch  INTEGER NOT NULL DEFAULT 0 CHECK (lease_epoch >= 0),
+			outcome      TEXT NOT NULL DEFAULT '' CHECK (outcome IN ('','done','failed')),
+			release_only INTEGER NOT NULL DEFAULT 0 CHECK (release_only IN (0,1)),
+			lease_node   TEXT NOT NULL DEFAULT '',
+			message_id   INTEGER NOT NULL DEFAULT 0 CHECK (message_id >= 0),
+			retired      INTEGER NOT NULL DEFAULT 0 CHECK (retired IN (0,1)),
+			acknowledged INTEGER NOT NULL DEFAULT 0 CHECK (acknowledged IN (0,1)),
+			PRIMARY KEY (tier, request_id)
+		) STRICT`,
+		`INSERT INTO pending_completions_new
+		   (tier, request_id, run_id, result, lease_id, lease_epoch, outcome,
+		    release_only, lease_node, message_id, retired, acknowledged)
+		 SELECT tier, request_id, run_id, result, lease_id, lease_epoch, outcome,
+		        release_only, lease_node, message_id, retired, acknowledged
+		   FROM pending_completions`,
+		`DROP TABLE pending_completions`,
+		`ALTER TABLE pending_completions_new RENAME TO pending_completions`,
+	},
+}
+
 func init() {
 	migrations = append(migrations,
 		placementMigration, guestOSMigration, placementFactsMigration, requestIDMigration,
@@ -1288,7 +1388,9 @@ func init() {
 		certRevocationMigration, nodeEnrollmentMigration, joinTokenMigration,
 		issuedCertMigration, quarantineMigration, strictTrustTablesMigration,
 		nodeRevocationMigration, ec2ShapeAccountingMigration, custodyVisibilityMigration,
-		leaseFailureReasonMigration)
+		leaseFailureReasonMigration, pendingCompletionsMigration, pendingCompletionLeaseMigration,
+		pendingCompletionRecoveryMigration, pendingCompletionAcknowledgementMigration,
+		directAssignmentIdentityMigration)
 }
 
 const bootstrapSchemaMigrations = `CREATE TABLE IF NOT EXISTS schema_migrations (
