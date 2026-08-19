@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -191,5 +192,69 @@ func TestAnAnswerThatIsNotThisAPIIsRefused(t *testing.T) {
 
 	if _, err := newVMMAPI(socket).info(t.Context()); err == nil {
 		t.Error("a non-json answer was decoded rather than refused")
+	}
+}
+
+// A CLIENT CONSTRUCTED FOR ONE PROVIDER OPERATION MUST NOT LEAVE AN IDLE
+// CONNECTION behind. Firecracker bounds the API connections one VMM accepts, and
+// provider inventory plus cache attach/detach construct independent clients for
+// the same socket. Retaining each client's keep-alive connection makes an otherwise
+// healthy VMM eventually refuse cache publication with `Too many open connections`.
+func TestIndependentVMMClientsDoNotExhaustTheConnectionLimit(t *testing.T) {
+	t.Parallel()
+
+	dir := shortDir(t)
+	socket := filepath.Join(dir, "s")
+
+	var lc net.ListenConfig
+
+	ln, err := lc.Listen(t.Context(), "unix", socket)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	var open atomic.Int32
+	const limit = 3
+
+	srv := &http.Server{
+		ReadHeaderTimeout: apiTimeout,
+		ConnState: func(_ net.Conn, state http.ConnState) {
+			switch state {
+			case http.StateNew:
+				open.Add(1)
+			case http.StateHijacked, http.StateClosed:
+				open.Add(-1)
+			}
+		},
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			if open.Load() > limit {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				writeJSON(w, map[string]string{"fault_message": "Too many open connections"})
+
+				return
+			}
+
+			writeJSON(w, map[string]string{
+				"id": "the-vmm", "state": stateRunning,
+			})
+		}),
+	}
+
+	go func() {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			_ = err
+		}
+	}()
+
+	t.Cleanup(func() {
+		if err := srv.Close(); err != nil {
+			t.Errorf("close the server: %v", err)
+		}
+	})
+
+	for request := range limit + 2 {
+		if _, err := newVMMAPI(socket).info(t.Context()); err != nil {
+			t.Fatalf("independent client %d: %v", request+1, err)
+		}
 	}
 }
