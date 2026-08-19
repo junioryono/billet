@@ -39,6 +39,7 @@ func TestTheProvisionScriptContainsWhatAnImageNeeds(t *testing.T) {
 		{"dnf install -y docker", "workflows use service containers and docker build"},
 		{"docker/compose/releases/download/v5.3.1/docker-compose-linux-x86_64", "x64 images need a pinned Compose plugin"},
 		{"f9ebc6ebdb19d769b793c245a736caaeb198c62587f13b25c660c13b4987f959", "the x64 Compose download needs a pinned digest"},
+		{"docker buildx version", "the image build must execute the packaged Buildx plugin"},
 		{"docker compose version", "the image build must execute the Compose plugin"},
 		{"jq e2fsprogs util-linux", "the transparent Docker cache formats and verifies ext4"},
 		{"git", "actions/checkout wants it"},

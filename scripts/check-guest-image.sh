@@ -168,6 +168,23 @@ else
 	fail "no docker client"
 fi
 
+buildx_plugin=""
+for candidate in \
+	usr/local/lib/docker/cli-plugins/docker-buildx \
+	usr/local/libexec/docker/cli-plugins/docker-buildx \
+	usr/lib/docker/cli-plugins/docker-buildx \
+	usr/libexec/docker/cli-plugins/docker-buildx; do
+	if [ -x "$MNT/$candidate" ]; then
+		buildx_plugin="/$candidate"
+		break
+	fi
+done
+if [ -n "$buildx_plugin" ]; then
+	pass "the Docker Buildx CLI plugin is installed at $buildx_plugin"
+else
+	fail "no Docker Buildx CLI plugin; workflows using docker buildx would fail"
+fi
+
 compose_plugin=""
 for candidate in \
 	usr/local/lib/docker/cli-plugins/docker-compose \

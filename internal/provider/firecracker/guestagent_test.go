@@ -313,6 +313,17 @@ func TestTheGuestImageIncludesDockerCLIPluginsWorkflowsUse(t *testing.T) {
 	if !strings.Contains(string(source), "docker.io docker-buildx docker-compose-v2") {
 		t.Fatal("the guest installs Docker without the Buildx and Compose CLI plugins workflows use")
 	}
+
+	checkPath := filepath.Join("..", "..", "..", "scripts", "check-guest-image.sh")
+	check, err := os.ReadFile(checkPath)
+	if err != nil {
+		t.Fatalf("read guest image checker: %v", err)
+	}
+	for _, plugin := range []string{"docker-buildx", "docker-compose"} {
+		if !strings.Contains(string(check), "cli-plugins/"+plugin) {
+			t.Errorf("the finished-image gate does not inspect the %s plugin", plugin)
+		}
+	}
 }
 
 func TestTheGuestImageGateKeepsDockerBehindTheCacheMount(t *testing.T) {

@@ -502,6 +502,7 @@ func provisionScript(spec BuildSpec) (string, error) {
 	b.WriteString("echo " + strconv.Quote(composeSHA256+"  "+composePath) +
 		" | sha256sum -c -\n")
 	b.WriteString("chmod 0755 " + composePath + "\n")
+	b.WriteString("docker buildx version\n")
 	b.WriteString("docker compose version\n")
 	b.WriteString("systemctl enable docker\n")
 

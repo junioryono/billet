@@ -374,6 +374,7 @@ func verifyGuestImage(
 	//               that surfaces as every job failing to start
 	//   docker      the daemon is up on this kernel, which check-config.sh can only
 	//               predict, and a container actually ran
+	//   buildx      the CLI plugin required by billet's persistent builder exists
 	//   compose     the CLI plugin common multi-container workflows invoke exists
 	probe := strings.Join([]string{
 		`echo "whoami=$(whoami)"`,
@@ -381,6 +382,7 @@ func verifyGuestImage(
 		`echo "runner=$(cd /home/runner/runner && ./bin/Runner.Listener --version 2>&1 | head -1)"`,
 		`echo "docker=$(docker info --format '{{.ServerVersion}} storage={{.Driver}} ` +
 			`cgroups={{.CgroupVersion}}' 2>&1 | head -1)"`,
+		`echo "buildx=$(docker buildx version 2>&1 | sed -n 's/.* v\([0-9][^ ]*\).*/\1/p' | head -1)"`,
 		`echo "compose=$(docker compose version --short 2>&1 | head -1)"`,
 		`echo "container=$(docker run --rm hello-world 2>&1 | grep -ci 'working correctly' || echo 0)"`,
 	}, "; ")
@@ -599,6 +601,10 @@ func checkGuestReport(body, secret string) error {
 
 	if !hasVersion(body, "docker=") {
 		failures = append(failures, "the docker daemon did not answer on this kernel")
+	}
+
+	if !hasVersion(body, "buildx=") {
+		failures = append(failures, "the Docker Buildx CLI plugin did not report a version")
 	}
 
 	if !hasVersion(body, "compose=") {
