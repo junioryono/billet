@@ -68,13 +68,14 @@ func TestTranslateReadsTheRequestIDNotTheRunID(t *testing.T) {
 			{JobMessageBase: gh.JobMessageBase{
 				RunnerRequestID: 111,
 				WorkflowRunID:   222,
-				JobID:           "a-guid-that-is-not-an-int64",
+				JobID:           "assigned-guid",
 			}},
 		},
 		JobCompletedMessages: []*gh.JobCompleted{
 			{Result: "succeeded", RunnerName: "billet-lease-333", JobMessageBase: gh.JobMessageBase{
 				RunnerRequestID: 333,
 				WorkflowRunID:   444,
+				JobID:           "completed-guid",
 			}},
 		},
 	}
@@ -92,6 +93,9 @@ func TestTranslateReadsTheRequestIDNotTheRunID(t *testing.T) {
 	if got.Assigned[0].RunID != 222 {
 		t.Errorf("assigned RunID = %d, want 222 (WorkflowRunID)", got.Assigned[0].RunID)
 	}
+	if got.Assigned[0].JobID != "assigned-guid" {
+		t.Errorf("assigned JobID = %q, want assigned-guid", got.Assigned[0].JobID)
+	}
 
 	if len(got.Completed) != 1 {
 		t.Fatalf("completed = %d, want 1", len(got.Completed))
@@ -105,6 +109,9 @@ func TestTranslateReadsTheRequestIDNotTheRunID(t *testing.T) {
 	}
 	if got.Completed[0].RunnerName != "billet-lease-333" {
 		t.Errorf("completed RunnerName = %q, want billet-lease-333", got.Completed[0].RunnerName)
+	}
+	if got.Completed[0].JobID != "completed-guid" {
+		t.Errorf("completed JobID = %q, want completed-guid", got.Completed[0].JobID)
 	}
 }
 

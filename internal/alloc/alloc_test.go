@@ -76,6 +76,34 @@ func TestJobForLeaseRetainsIdentityAfterRelease(t *testing.T) {
 	}
 }
 
+func TestDirectJobIdentityIsStableAndCollisionFree(t *testing.T) {
+	a := newAllocator(t, Limits{MaxVCPU: 1, MaxMemory: config.GiB},
+		[]config.Tier{tier("linux", 1, config.GiB)})
+
+	first, err := a.IdentifyDirectJob(t.Context(), "job-a")
+	if err != nil {
+		t.Fatalf("IdentifyDirectJob(job-a): %v", err)
+	}
+	again, err := a.IdentifyDirectJob(t.Context(), "job-a")
+	if err != nil {
+		t.Fatalf("IdentifyDirectJob(job-a) again: %v", err)
+	}
+	second, err := a.IdentifyDirectJob(t.Context(), "job-b")
+	if err != nil {
+		t.Fatalf("IdentifyDirectJob(job-b): %v", err)
+	}
+
+	if first >= 0 || second >= 0 {
+		t.Errorf("direct job identities = %d and %d, want the negative namespace", first, second)
+	}
+	if again != first {
+		t.Errorf("redelivered job identity = %d, want %d", again, first)
+	}
+	if second == first {
+		t.Errorf("distinct jobs shared identity %d", first)
+	}
+}
+
 // newAllocator is an allocator with ONE HOST ALREADY IN IT, big enough that it
 // is never the constraint.
 //

@@ -25,6 +25,7 @@ documentation:
 | Is `lastMessageId` a cursor or a note? | `session_client.go` `getMessage` — the source proves only that it is SENT; the doc comment promises an undeleted message returns again. How the queue filters on it is NOT established by anything readable. |
 | What shape is a batched job message? | `client.go` `parseRunnerScaleSetMessageResponse` — the batch is a JSON **string** in `body` |
 | Is there a way to decline an acquired job? | `session_client.go` — **there is not**; `AcquireJobs` is one-way |
+| Can `runnerRequestId` be zero? | **Yes.** A real GitHub.com run on 2026-08-19 delivered `JobAssigned` directly with `runnerRequestId: 0`, then repeated zero in `JobCompleted`; [actions/scaleset#107](https://github.com/actions/scaleset/issues/107) independently reports the same direct-assignment shape. `jobId` remains stable, so billet durably maps it into a collision-free negative namespace while positive request ids remain untouched. |
 | What is `maxCapacity`? | `listener/listener.go` — the scale set's TOTAL, sent unchanged as jobs are assigned |
 | Which status means "no message"? | `getMessage` — `202`, while `200` carries a batch |
 | How long does a long poll actually take? | **Measured, not read**: ~88s against a real org, not the ~50s widely assumed. Against a 90s lease TTL that is two seconds of margin. |
@@ -112,6 +113,8 @@ Two rules learned building it:
   bug. `maxCapacity` is a header, so it is invisible to any test inspecting billet's types, and it is
   the one number GitHub uses to decide how much work to send.
 - **The fake is not a simulator.** It answers the handshake and serves what a test tells it to. Nothing it does is evidence of what the real service does. Billet's EC2 acceptance now proves the ordinary JIT registration and job path against a real organization, but a protocol behavior not exercised there still needs its own live observation.
+
+The direct-assignment path is the concrete example. Every fake used positive request ids until a real job reached `JobAssigned` without a preceding offer and carried zero through completion. Zero is a wire value, not an identity: using it as a map key aliases concurrent jobs, and rejecting it stops the whole control plane after the first real completion. Billet now maps the message's stable `jobId` transactionally to a unique negative integer before assignment or completion handling. The sign keeps GitHub's positive namespace disjoint, the table makes redelivery and restart recover the same value, and an offered job still sends GitHub's original wire id to `AcquireJobs`. Multiple distinct offers sharing one wire id are refused because an acquisition response containing that id cannot say which promise GitHub accepted.
 
 ## `actions/runner` v2.336.0 — a pinned service and one fail-closed result contract
 

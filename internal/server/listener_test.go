@@ -738,6 +738,104 @@ func TestCompletionRecoversAnOmittedRequestIDFromTheRunnerName(t *testing.T) {
 	}
 }
 
+func TestDirectAssignmentUsesJobIDWhenGitHubSendsRequestIDZero(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: tierVCPU, MaxMemory: 64 * config.GiB}, tiers)
+	completions := openState(t)
+
+	var launched, destroyed int64
+	runner := &fakeRunner{
+		onLaunch: func(requestID int64) error {
+			launched = requestID
+
+			return nil
+		},
+		onDestroyCompleted: func(requestID int64, _ string) error {
+			destroyed = requestID
+
+			return nil
+		},
+	}
+	session := &fakeSession{}
+	l := NewListener(a, tiers[0].Label, session, WithCompletionStore(completions),
+		WithRunner(runner))
+
+	if err := l.refillEscrow(t.Context()); err != nil {
+		t.Fatalf("refill escrow: %v", err)
+	}
+	assigned := Job{RunID: 101, JobID: "job-guid", Event: "push"}
+	if err := l.handle(t.Context(), &Message{MessageID: 1, Available: []Job{assigned}}); err != nil {
+		t.Fatalf("handle direct offer: %v", err)
+	}
+	if got := session.acquiredIDs(); !slices.Equal(got, []int64{0}) {
+		t.Fatalf("acquired ids = %v, want GitHub's wire id 0", got)
+	}
+	if err := l.handle(t.Context(), &Message{MessageID: 2, Assigned: []Job{assigned}}); err != nil {
+		t.Fatalf("handle direct assignment: %v", err)
+	}
+	if launched >= 0 {
+		t.Fatalf("launch request id = %d, want a negative durable identity", launched)
+	}
+
+	completed := Job{RunID: 101, JobID: "job-guid", Result: "succeeded"}
+	if err := l.handle(t.Context(), &Message{MessageID: 3, Completed: []Job{completed}}); err != nil {
+		t.Fatalf("handle direct completion: %v", err)
+	}
+	if destroyed != launched {
+		t.Errorf("destroy request id = %d, want launch identity %d", destroyed, launched)
+	}
+
+	usage, err := a.Usage(t.Context())
+	if err != nil {
+		t.Fatalf("Usage: %v", err)
+	}
+	if usage.Leases != 0 {
+		t.Errorf("%d leases remain charged after direct completion, want 0", usage.Leases)
+	}
+	pending, err := completions.PendingCompletions(t.Context(), tiers[0].Label)
+	if err != nil {
+		t.Fatalf("PendingCompletions: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Errorf("direct completion retained %+v, want no pending rows", pending)
+	}
+}
+
+func TestDistinctDirectOffersSharingWireIDAreRefused(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 2 * tierVCPU, MaxMemory: 64 * config.GiB}, tiers)
+	session := &fakeSession{}
+	l := NewListener(a, tiers[0].Label, session)
+
+	if err := l.refillEscrow(t.Context()); err != nil {
+		t.Fatalf("refill escrow: %v", err)
+	}
+	err := l.acquire(t.Context(), []Job{{JobID: "job-a"}, {JobID: "job-b"}})
+	if !errors.Is(err, ErrUntrustworthySession) {
+		t.Fatalf("acquire distinct zero-id offers = %v, want ErrUntrustworthySession", err)
+	}
+	if got := session.acquiredIDs(); len(got) != 0 {
+		t.Errorf("ambiguous request reached GitHub with ids %v", got)
+	}
+	if got := len(l.acquiring); got != 0 {
+		t.Errorf("%d ambiguous promises remain reserved, want 0", got)
+	}
+	if got := len(l.held); got != 2 {
+		t.Errorf("%d leases returned to escrow, want 2", got)
+	}
+}
+
+func TestDirectAssignmentWithoutJobIDFailsClosed(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: tierVCPU, MaxMemory: 64 * config.GiB}, tiers)
+	l := NewListener(a, tiers[0].Label, &fakeSession{})
+
+	_, err := l.identifyAssigned(t.Context(), Job{})
+	if !errors.Is(err, ErrUntrustworthySession) {
+		t.Fatalf("identify zero-id assignment without job id = %v, want ErrUntrustworthySession", err)
+	}
+}
+
 // A backlog that predates the session is only visible in the session's own
 // statistics: a restart does not replay messages for work already assigned.
 func TestSessionStatisticsAreObserved(t *testing.T) {

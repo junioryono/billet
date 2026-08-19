@@ -124,7 +124,7 @@ func (db *DB) RetirePendingCompletion(
 	tier string,
 	requestID, messageID int64,
 ) error {
-	if strings.TrimSpace(tier) == "" || requestID <= 0 || messageID < 0 {
+	if strings.TrimSpace(tier) == "" || requestID == 0 || messageID < 0 {
 		return errors.New("state: a pending completion retirement needs a tier and non-negative identity")
 	}
 
@@ -153,7 +153,7 @@ func (db *DB) AcknowledgePendingCompletion(
 	tier string,
 	requestID, messageID int64,
 ) error {
-	if strings.TrimSpace(tier) == "" || requestID <= 0 || messageID < 0 {
+	if strings.TrimSpace(tier) == "" || requestID == 0 || messageID < 0 {
 		return errors.New("state: a pending completion identity needs a tier and positive request id")
 	}
 
@@ -211,9 +211,9 @@ func (db *DB) PendingCompletions(ctx context.Context, tier string) ([]PendingCom
 }
 
 func (completion PendingCompletion) valid() error {
-	if strings.TrimSpace(completion.Tier) == "" || completion.RequestID <= 0 ||
+	if strings.TrimSpace(completion.Tier) == "" || completion.RequestID == 0 ||
 		strings.TrimSpace(completion.Result) == "" {
-		return errors.New("state: a pending completion needs a tier, positive request id, and result")
+		return errors.New("state: a pending completion needs a tier, non-zero request id, and result")
 	}
 	if completion.RunID < 0 {
 		return errors.New("state: a pending completion cannot have a negative run id")

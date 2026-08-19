@@ -163,12 +163,15 @@ type Message struct {
 
 // Job identifies one workflow job.
 //
-// RequestID is the identity that matters: it is what AcquireJobs claims work by
-// and what makes a redelivered message idempotent. GitHub's own JobID is a
-// separate string field, so do not conflate the two.
+// RequestID is billet's numeric scheduler identity. GitHub's positive
+// runnerRequestId is used unchanged; a direct assignment carrying zero receives
+// a durable negative id keyed by JobID, so concurrent jobs never alias at zero.
 type Job struct {
 	RequestID int64
 	RunID     int64
+	// JobID is GitHub's stable workflow-job identity. It is required when the
+	// direct-assignment path sends RequestID zero.
+	JobID string
 	// CompletionID is the scale-set message that delivered the result. A
 	// redelivery keeps it; a later reuse of RequestID receives a different one.
 	CompletionID int64
@@ -2086,6 +2089,11 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 	// would stall every heartbeat behind it, and heartbeats are what keep the
 	// escrow alive. So assign returns what it bound and the launches follow.
 	for _, job := range msg.Assigned {
+		var err error
+		job, err = l.identifyAssigned(ctx, job)
+		if err != nil {
+			return err
+		}
 		if _, over := finished[job.RequestID]; over {
 			continue
 		}
@@ -2133,10 +2141,34 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 	return nil
 }
 
-// identifyCompletion recovers an omitted runner request id from billet's runner name.
-func (l *Listener) identifyCompletion(ctx context.Context, job Job) (Job, error) {
-	if job.RequestID > 0 {
+// identifyAssigned gives a direct assignment its durable scheduler identity.
+func (l *Listener) identifyAssigned(ctx context.Context, job Job) (Job, error) {
+	if job.RequestID != 0 {
 		return job, nil
+	}
+	if l.alloc == nil {
+		return Job{}, fmt.Errorf("%w: %s assigned job %q without a request id, and no ledger is available to identify it",
+			ErrUntrustworthySession, l.tier, job.JobID)
+	}
+
+	requestID, err := l.alloc.IdentifyDirectJob(ctx, job.JobID)
+	if err != nil {
+		return Job{}, fmt.Errorf("%w: %s cannot identify directly assigned job %q: %w",
+			ErrUntrustworthySession, l.tier, job.JobID, err)
+	}
+	job.RequestID = requestID
+
+	return job, nil
+}
+
+// identifyCompletion resolves a zero wire id through job id, or through a lease
+// name for a completion written by an older billet.
+func (l *Listener) identifyCompletion(ctx context.Context, job Job) (Job, error) {
+	if job.RequestID != 0 {
+		return job, nil
+	}
+	if job.JobID != "" {
+		return l.identifyAssigned(ctx, job)
 	}
 	if l.alloc == nil {
 		return Job{}, fmt.Errorf("%w: %s completed runner %q without a request id, and no ledger is available to resolve it",
@@ -2153,7 +2185,7 @@ func (l *Listener) identifyCompletion(ctx context.Context, job Job) (Job, error)
 		return Job{}, fmt.Errorf("%w: %s cannot resolve completed runner %q: %w",
 			ErrUntrustworthySession, l.tier, job.RunnerName, err)
 	}
-	if identity.Tier != l.tier || identity.RequestID <= 0 {
+	if identity.Tier != l.tier || identity.RequestID == 0 {
 		return Job{}, fmt.Errorf("%w: completed runner %q resolves to tier %q request %d, not tier %q",
 			ErrUntrustworthySession, job.RunnerName, identity.Tier, identity.RequestID, l.tier)
 	}
@@ -2213,15 +2245,41 @@ func (l *Listener) acquire(ctx context.Context, available []Job) error {
 		return nil
 	}
 
-	reserved := l.reserve(available)
-	if len(reserved) == 0 {
-		return nil
+	identified := make([]Job, 0, len(available))
+	protocolFor := make(map[int64]int64, len(available))
+	for _, job := range available {
+		protocolID := job.RequestID
+		var err error
+		job, err = l.identifyAssigned(ctx, job)
+		if err != nil {
+			return err
+		}
+		identified = append(identified, job)
+		protocolFor[job.RequestID] = protocolID
 	}
 
-	acquired, err := l.session.AcquireJobs(ctx, reserved)
+	reservedInternal := l.reserve(identified)
+	if len(reservedInternal) == 0 {
+		return nil
+	}
+	reservedProtocol := make([]int64, 0, len(reservedInternal))
+	internalFor := make(map[int64]int64, len(reservedInternal))
+	for _, internalID := range reservedInternal {
+		protocolID := protocolFor[internalID]
+		if prior, duplicate := internalFor[protocolID]; duplicate && prior != internalID {
+			l.unreserve(reservedInternal)
+
+			return fmt.Errorf("%w: %s offered distinct jobs %d and %d under the same runner request id %d; the acquisition response cannot distinguish them",
+				ErrUntrustworthySession, l.tier, prior, internalID, protocolID)
+		}
+		internalFor[protocolID] = internalID
+		reservedProtocol = append(reservedProtocol, protocolID)
+	}
+
+	acquiredProtocol, err := l.session.AcquireJobs(ctx, reservedProtocol)
 	if err != nil {
 		// Nothing was promised, so nothing stays reserved.
-		l.unreserve(reserved)
+		l.unreserve(reservedInternal)
 
 		return fmt.Errorf("server: acquire jobs for %s: %w", l.tier, err)
 	}
@@ -2240,22 +2298,26 @@ func (l *Listener) acquire(ctx context.Context, available []Job) error {
 	// over one is disproportionate. A response outside its own contract is not
 	// reachable by any race, and stopping is also the remedy: the session is recreated
 	// and GitHub redelivers whatever was unacknowledged.
-	if extra := missing(acquired, reserved); len(extra) > 0 {
+	if extra := missing(acquiredProtocol, reservedProtocol); len(extra) > 0 {
 		// Everything, not just the unmatched ids. Which commitments are real is
 		// exactly what is no longer known.
-		l.unreserve(reserved)
+		l.unreserve(reservedInternal)
 
 		return fmt.Errorf("%w: %s acquired job requests it did not offer for "+
 			"(unrequested %v, requested %v); refusing to continue against a scale-set "+
 			"response that is not a subset of its request",
-			ErrUntrustworthySession, l.tier, extra, reserved)
+			ErrUntrustworthySession, l.tier, extra, reservedProtocol)
 	}
 
 	// GitHub returns what it ACTUALLY gave, which can be fewer than were asked
 	// for — another scale set can win the same offer. Escrow reserved for an
 	// offer billet did not get goes back immediately; holding it would strand
 	// capacity waiting for an assignment that is never coming.
-	l.unreserve(missing(reserved, acquired))
+	acquiredInternal := make([]int64, 0, len(acquiredProtocol))
+	for _, protocolID := range acquiredProtocol {
+		acquiredInternal = append(acquiredInternal, internalFor[protocolID])
+	}
+	l.unreserve(missing(reservedInternal, acquiredInternal))
 
 	return nil
 }
