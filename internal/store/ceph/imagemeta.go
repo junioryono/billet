@@ -34,6 +34,15 @@ const RunnerVersionKey = "billet.runner_version"
 // verified against.
 const KernelKey = "billet.kernel"
 
+// GuestContractKey records which host/guest protocol a generation speaks.
+//
+// PER GENERATION because compatibility belongs to the immutable root filesystem,
+// not to the mutable image head or to the billet binary inspecting it. A host
+// upgrade reads this before it drains working services, so it can keep a compatible
+// verified generation without downloading another multi-gigabyte image and can
+// refuse an incompatible one before any runner is restarted against it.
+const GuestContractKey = "billet.guest_contract"
+
 // RunnerVersion reports which actions/runner a specific generation carries.
 //
 // THE GENERATION, NOT THE HEAD, AND THAT DISTINCTION IS THE WHOLE POINT. Generations
@@ -155,6 +164,11 @@ func (c *Client) SetKernel(ctx context.Context, image, generation, file string) 
 	return c.setGenerationMeta(ctx, KernelKey, image, generation, file)
 }
 
+// SetGuestContract records which host/guest protocol a generation speaks.
+func (c *Client) SetGuestContract(ctx context.Context, image, generation, contract string) error {
+	return c.setGenerationMeta(ctx, GuestContractKey, image, generation, contract)
+}
+
 // NeededKernels reports every kernel file the given generations name, and how many
 // of them name none.
 //
@@ -213,6 +227,38 @@ func (c *Client) Kernel(ctx context.Context, image, generation string) (string, 
 	}
 
 	return strings.TrimSpace(string(out)), true, nil
+}
+
+// GuestContract reports which host/guest protocol a generation speaks.
+func (c *Client) GuestContract(
+	ctx context.Context,
+	image, generation string,
+) (string, bool, error) {
+	if err := checkCloneName(image); err != nil {
+		return "", false, err
+	}
+
+	if _, ok := ParseGeneration(generation); !ok {
+		return "", false, fmt.Errorf("ceph: %q is not a generation billet published", generation)
+	}
+
+	out, err := c.rbdCmd(ctx, false, "-p", c.cfg.ImagePool, "image-meta", "get", image,
+		GuestContractKey+"."+generation)
+	if err != nil {
+		if isNoSuchFile(err) {
+			return "", false, nil
+		}
+
+		return "", false, fmt.Errorf("ceph: could not read %s for %s@%s: %w",
+			GuestContractKey, image, generation, err)
+	}
+
+	contract := strings.TrimSpace(string(out))
+	if contract == "" {
+		return "", false, nil
+	}
+
+	return contract, true, nil
 }
 
 // Images lists the images in the pool billet publishes to.

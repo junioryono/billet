@@ -124,6 +124,9 @@ jobs:
       - name: Exercise development-host check mode
         run: make development-check-mode
 
+      - name: Guard transactional host-upgrade ordering
+        run: make host-upgrade-order
+
   package-lifecycle:
     runs-on: ubuntu-latest
     timeout-minutes: 20

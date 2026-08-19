@@ -1,6 +1,8 @@
 package ceph
 
 import (
+	"slices"
+	"strings"
 	"testing"
 )
 
@@ -52,7 +54,7 @@ func TestTheGenerationVerifiedMostRecentlySurvives(t *testing.T) {
 	all := gens("g20260101000000", "g20260601000000", "g20260814145813")
 	verified := map[string]bool{"g20260814145813": true}
 
-	plan := PlanReap(all, verified, Retention{Keep: 1})
+	plan := PlanReap(all, verified, map[string]string{}, Retention{Keep: 1})
 
 	if _, ok := kept(plan)["g20260814145813"]; !ok {
 		t.Fatal("the generation @verified resolves to was reaped, which strands every tier " +
@@ -71,7 +73,7 @@ func TestAPinnedGenerationSurvivesEvenUnverified(t *testing.T) {
 	all := gens("g20260101000000", "g20260601000000", "g20260814145813")
 	verified := map[string]bool{"g20260814145813": true}
 
-	plan := PlanReap(all, verified, Retention{
+	plan := PlanReap(all, verified, map[string]string{}, Retention{
 		Keep:   1,
 		Pinned: []string{"ubuntu-2404-x64@g20260101000000"},
 	})
@@ -106,7 +108,7 @@ func TestRollbackDepthCountsOnlyVerifiedGenerations(t *testing.T) {
 		"g20260809000000": true,
 	}
 
-	plan := PlanReap(all, verified, Retention{Keep: 3})
+	plan := PlanReap(all, verified, map[string]string{}, Retention{Keep: 3})
 
 	survived := kept(plan)
 	for _, want := range []string{"g20260814145813", "g20260812000000", "g20260810000000"} {
@@ -141,7 +143,7 @@ func TestRetentionIsByBuildTimeNotListOrder(t *testing.T) {
 		"g20260601000000": true,
 	}
 
-	plan := PlanReap(all, verified, Retention{Keep: 1})
+	plan := PlanReap(all, verified, map[string]string{}, Retention{Keep: 1})
 
 	if _, ok := kept(plan)["g20260814145813"]; !ok {
 		t.Error("the newest verified generation was not the one kept")
@@ -149,6 +151,60 @@ func TestRetentionIsByBuildTimeNotListOrder(t *testing.T) {
 
 	if got := doomed(plan); len(got) != 2 {
 		t.Errorf("kept %d generations against Keep: 1", len(all)-len(got))
+	}
+}
+
+// ROLLING FLEETS NEED ONE ROLLBACK CHAIN PER GUEST CONTRACT.
+//
+// Publishing a generation for a new binary must not make the last generation an
+// older binary can boot eligible for collection. Both binaries may be running
+// during an ordinary host-by-host upgrade.
+func TestRetentionKeepsVerifiedGenerationsPerGuestContract(t *testing.T) {
+	t.Parallel()
+
+	all := gens(
+		"g20260814145813", // contract 7, newest overall
+		"g20260813000000", // contract 6, newest that old nodes can boot
+		"g20260812000000", // contract 7 rollback
+		"g20260811000000", // contract 6 rollback
+	)
+	verified := map[string]bool{
+		"g20260814145813": true,
+		"g20260813000000": true,
+		"g20260812000000": true,
+		"g20260811000000": true,
+	}
+	contracts := map[string]string{
+		"g20260814145813": "7",
+		"g20260813000000": "6",
+		"g20260812000000": "7",
+		"g20260811000000": "6",
+	}
+
+	plan := PlanReap(all, verified, contracts, Retention{Keep: 1})
+	survived := kept(plan)
+
+	for _, want := range []string{"g20260814145813", "g20260813000000"} {
+		if _, ok := survived[want]; !ok {
+			t.Errorf("%s is the newest verified generation for its guest contract and was reaped", want)
+		}
+	}
+	for _, want := range []string{"g20260812000000", "g20260811000000"} {
+		if _, ok := survived[want]; ok {
+			t.Errorf("%s exceeded the per-contract Keep: 1 retention", want)
+		}
+	}
+}
+
+func TestReapableRemembersWhetherVerificationExistedAtPlanTime(t *testing.T) {
+	t.Parallel()
+
+	gen := gens("g20260814145813")[0]
+	plan := PlanReap([]Generation{gen}, map[string]bool{gen.Name: true},
+		map[string]string{gen.Name: "6"}, Retention{Keep: 0})
+
+	if len(plan) != 1 || !plan[0].Verified || plan[0].Reason != "" {
+		t.Fatalf("plan = %#v, want a deliberately expired verified generation", plan)
 	}
 }
 
@@ -163,7 +219,7 @@ func TestAnUnverifiedImageStillKeepsWhatIsPinned(t *testing.T) {
 
 	all := gens("g20260101000000", "g20260814145813")
 
-	plan := PlanReap(all, map[string]bool{}, Retention{
+	plan := PlanReap(all, map[string]bool{}, map[string]string{}, Retention{
 		Keep:   3,
 		Pinned: []string{"ubuntu-2404-x64@g20260814145813"},
 	})
@@ -183,7 +239,7 @@ func TestTheVerifiedAliasIsNotTreatedAsAPin(t *testing.T) {
 
 	all := gens("g20260814145813")
 
-	plan := PlanReap(all, map[string]bool{}, Retention{
+	plan := PlanReap(all, map[string]bool{}, map[string]string{}, Retention{
 		Keep:   0,
 		Pinned: []string{"ubuntu-2404-x64@" + Verified},
 	})
@@ -201,15 +257,15 @@ func TestTheVerifiedAliasIsNotTreatedAsAPin(t *testing.T) {
 // those keys to decide what is still needed. A dead generation's key would keep
 // its kernel alive forever, which is the opposite of what reaping is for.
 func TestReapRemovesEveryMetadataKeyOfTheGenerationsItRemoves(t *testing.T) {
-	f := &importFake{}
+	f := &importFake{snapshots: []string{"g20260814072427"}}
 
 	plan := []Reapable{{Generation: Generation{Name: "g20260814072427"}}}
 
-	if _, err := importClient(t, f).Reap(t.Context(), "ubuntu-2404-x64", plan); err != nil {
+	if _, err := importClient(t, f).Reap(t.Context(), "ubuntu-2404-x64", plan, Retention{}); err != nil {
 		t.Fatalf("reap: %v", err)
 	}
 
-	for _, key := range []string{VerifiedKey, RunnerVersionKey, KernelKey} {
+	for _, key := range []string{VerifiedKey, RunnerVersionKey, KernelKey, GuestContractKey} {
 		want := key + ".g20260814072427"
 
 		if !f.ranWith("image-meta", "remove", want) {
@@ -217,5 +273,104 @@ func TestReapRemovesEveryMetadataKeyOfTheGenerationsItRemoves(t *testing.T) {
 				"what is still needed, so a dead generation's key keeps its kernel alive "+
 				"forever", want)
 		}
+	}
+}
+
+func TestReapRecomputesEveryContractBucketUnderThePublishLock(t *testing.T) {
+	all := gens("g20260815000000", "g20260814000000", "g20260813000000")
+	verified := map[string]bool{
+		"g20260815000000": true,
+		"g20260814000000": true,
+		"g20260813000000": true,
+	}
+	contracts := map[string]string{
+		"g20260815000000": "7",
+		"g20260814000000": "6",
+		"g20260813000000": "7",
+	}
+	retention := Retention{Keep: 1}
+	plan := PlanReap(all, verified, contracts, retention)
+
+	// The newest generation moves from contract 7 to 6 after the preview. The
+	// oldest generation's own metadata did not change, but it is now the only
+	// verified contract-7 rollback and must survive the locked replan.
+	f := &importFake{
+		snapshots: []string{"g20260815000000", "g20260814000000", "g20260813000000"},
+		metadata: strings.Join([]string{
+			VerifiedKey + ".g20260815000000  now",
+			VerifiedKey + ".g20260814000000  now",
+			VerifiedKey + ".g20260813000000  now",
+			GuestContractKey + ".g20260815000000  6",
+			GuestContractKey + ".g20260814000000  6",
+			GuestContractKey + ".g20260813000000  7",
+		}, "\n"),
+	}
+
+	removed, err := importClient(t, f).Reap(t.Context(), "ubuntu-2404-x64", plan, retention)
+	if err != nil {
+		t.Fatalf("reap: %v", err)
+	}
+	if slices.Contains(removed, "g20260813000000") {
+		t.Fatalf("removed the last contract-7 generation after another generation changed buckets: %v", removed)
+	}
+}
+
+func TestReapPreservesAGenerationVerifiedAfterThePreview(t *testing.T) {
+	gen := gens("g20260815000000")[0]
+	plan := PlanReap([]Generation{gen}, map[string]bool{}, map[string]string{}, Retention{Keep: 0})
+	f := &importFake{
+		snapshots: []string{gen.Name},
+		metadata: VerifiedKey + "." + gen.Name + "  now\n" +
+			GuestContractKey + "." + gen.Name + "  7",
+	}
+
+	removed, err := importClient(t, f).Reap(
+		t.Context(), "ubuntu-2404-x64", plan, Retention{Keep: 0})
+	if err != nil {
+		t.Fatalf("reap: %v", err)
+	}
+	if len(removed) != 0 {
+		t.Fatalf("removed a generation verified after the preview: %v", removed)
+	}
+}
+
+func TestReapPreservesAContractBackfilledAfterThePreview(t *testing.T) {
+	gen := gens("g20260815000000")[0]
+	verified := map[string]bool{gen.Name: true}
+	plan := PlanReap([]Generation{gen}, verified, map[string]string{}, Retention{Keep: 0})
+	f := &importFake{
+		snapshots: []string{gen.Name},
+		metadata: VerifiedKey + "." + gen.Name + "  earlier\n" +
+			GuestContractKey + "." + gen.Name + "  7",
+	}
+
+	removed, err := importClient(t, f).Reap(
+		t.Context(), "ubuntu-2404-x64", plan, Retention{Keep: 0})
+	if err != nil {
+		t.Fatalf("reap: %v", err)
+	}
+	if len(removed) != 0 {
+		t.Fatalf("removed a generation whose contract was backfilled after the preview: %v", removed)
+	}
+}
+
+func TestReapStillRemovesAnUnchangedVerifiedGenerationShownAsDoomed(t *testing.T) {
+	gen := gens("g20260815000000")[0]
+	verified := map[string]bool{gen.Name: true}
+	contracts := map[string]string{gen.Name: "7"}
+	plan := PlanReap([]Generation{gen}, verified, contracts, Retention{Keep: 0})
+	f := &importFake{
+		snapshots: []string{gen.Name},
+		metadata: VerifiedKey + "." + gen.Name + "  unchanged\n" +
+			GuestContractKey + "." + gen.Name + "  7",
+	}
+
+	removed, err := importClient(t, f).Reap(
+		t.Context(), "ubuntu-2404-x64", plan, Retention{Keep: 0})
+	if err != nil {
+		t.Fatalf("reap: %v", err)
+	}
+	if !slices.Equal(removed, []string{gen.Name}) {
+		t.Fatalf("removed = %v, want the unchanged generation shown in the preview", removed)
 	}
 }
