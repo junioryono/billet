@@ -116,10 +116,84 @@ type generationState struct {
 	Handle         string                     `json:"handle"`
 	Filesystem     storecontract.Filesystem   `json:"filesystem"`
 	UsedAt         time.Time                  `json:"used_at"`
+	PublishedAt    time.Time                  `json:"published_at,omitempty"`
 	RetentionHours int                        `json:"retention_hours,omitempty"`
 	WriterID       string                     `json:"writer_id,omitempty"`
 	Fence          storecontract.FencingToken `json:"fence,omitempty"`
 	Previous       string                     `json:"previous,omitempty"`
+}
+
+// Match finds the exact key or the newest pointer under the first restore prefix.
+func (s Store) Match(
+	ctx context.Context,
+	exact string,
+	restorePrefixes []string,
+) (string, string, error) {
+	if err := checkKey(exact); err != nil {
+		return "", "", err
+	}
+	for _, prefix := range restorePrefixes {
+		if err := checkKey(prefix); err != nil {
+			return "", "", err
+		}
+	}
+
+	state, _, err := s.load(ctx, exact)
+	if err != nil {
+		return "", "", err
+	}
+	if state.Pointer != "" {
+		return exact, state.Pointer, nil
+	}
+
+	objects, err := s.objects.List(ctx, s.statePrefix())
+	if err != nil {
+		return "", "", err
+	}
+	for _, prefix := range restorePrefixes {
+		var matchedKey, generation string
+		var newest time.Time
+		for _, objectKey := range objects {
+			body, _, found, err := s.objects.Get(ctx, objectKey)
+			if err != nil {
+				return "", "", err
+			}
+			if !found {
+				continue
+			}
+			var candidate keyState
+			if err := json.Unmarshal(body, &candidate); err != nil || candidate.Key == "" {
+				return "", "", fmt.Errorf("ebs-s3: state object %s is not a valid cache state",
+					objectKey)
+			}
+			if objectKey != s.stateKey(candidate.Key) {
+				return "", "", fmt.Errorf("ebs-s3: state object %s is outside this owner's cache namespace",
+					objectKey)
+			}
+			if candidate.Pointer == "" || !strings.HasPrefix(candidate.Key, prefix) {
+				continue
+			}
+			record, ok := candidate.Generations[candidate.Pointer]
+			if !ok {
+				return "", "", fmt.Errorf("ebs-s3: cache %q points at an unrecorded generation",
+					candidate.Key)
+			}
+			published := record.PublishedAt
+			if published.IsZero() {
+				published = record.UsedAt
+			}
+			if matchedKey == "" || published.After(newest) ||
+				(published.Equal(newest) && candidate.Key < matchedKey) {
+				matchedKey, generation, newest = candidate.Key, candidate.Pointer, published
+			}
+		}
+		if matchedKey != "" {
+			return matchedKey, generation, nil
+		}
+	}
+
+	return "", "", fmt.Errorf("%w: site has no matching generation for cache %q",
+		storecontract.ErrMiss, exact)
 }
 
 type candidateState struct {
@@ -481,6 +555,7 @@ func (s Store) PublishCAS(
 		}
 		state.Generations[candidate.Generation] = generationState{
 			Handle: candidate.Handle, Filesystem: candidate.Filesystem, UsedAt: now.UTC(),
+			PublishedAt:    now.UTC(),
 			RetentionHours: retentionHours(key), WriterID: lease.ID, Fence: fence, Previous: expected,
 		}
 		delete(state.Candidates, candidate.Generation)

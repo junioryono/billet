@@ -40,13 +40,84 @@ func withFilesystemVerifier(verify filesystemVerifier) Option {
 }
 
 type cachePointer struct {
+	Key            string                     `json:"key,omitempty"`
 	Generation     string                     `json:"generation"`
 	Handle         string                     `json:"handle"`
 	UsedAt         time.Time                  `json:"used_at"`
+	PublishedAt    time.Time                  `json:"published_at,omitempty"`
 	RetentionHours int                        `json:"retention_hours,omitempty"`
 	WriterID       string                     `json:"writer_id,omitempty"`
 	Fence          storecontract.FencingToken `json:"fence,omitempty"`
 	Previous       string                     `json:"previous,omitempty"`
+}
+
+// Match finds the exact key or the newest pointer under the first restore prefix.
+func (c *Client) Match(
+	ctx context.Context,
+	exact string,
+	restorePrefixes []string,
+) (string, string, error) {
+	if err := checkCacheKey(exact); err != nil {
+		return "", "", err
+	}
+	for _, prefix := range restorePrefixes {
+		if err := checkCacheKey(prefix); err != nil {
+			return "", "", err
+		}
+	}
+
+	var matchedKey, generation string
+	err := c.withCacheLock(ctx, time.Now(), func() error {
+		var exactPointer cachePointer
+		ok, err := c.readJSON(ctx, pointerKey(exact), &exactPointer)
+		if err != nil {
+			return err
+		}
+		if ok {
+			if exactPointer.Generation == "" ||
+				(exactPointer.Key != "" && exactPointer.Key != exact) {
+				return fmt.Errorf("ceph: cache %q has an invalid pointer identity", exact)
+			}
+			matchedKey, generation = exact, exactPointer.Generation
+
+			return nil
+		}
+
+		metadata, err := c.cacheIndexMetadata(ctx)
+		if err != nil {
+			return err
+		}
+		for _, prefix := range restorePrefixes {
+			var newest time.Time
+			for key, value := range metadata {
+				if !strings.HasPrefix(key, cacheMetaPrefix+"pointer.") {
+					continue
+				}
+				var pointer cachePointer
+				if json.Unmarshal([]byte(value), &pointer) != nil ||
+					pointer.Key == "" || pointer.Generation == "" ||
+					!strings.HasPrefix(pointer.Key, prefix) {
+					continue
+				}
+				published := pointer.PublishedAt
+				if published.IsZero() {
+					published = pointer.UsedAt
+				}
+				if matchedKey == "" || published.After(newest) ||
+					(published.Equal(newest) && pointer.Key < matchedKey) {
+					matchedKey, generation, newest = pointer.Key, pointer.Generation, published
+				}
+			}
+			if matchedKey != "" {
+				return nil
+			}
+		}
+
+		return fmt.Errorf("%w: site has no matching generation for cache %q",
+			storecontract.ErrMiss, exact)
+	})
+
+	return matchedKey, generation, err
 }
 
 type cacheWriter struct {
@@ -631,9 +702,11 @@ func (c *Client) publishCASAt(
 		}
 
 		pointer := cachePointer{
+			Key:            key,
 			Generation:     candidate.Generation,
 			Handle:         candidate.Handle,
 			UsedAt:         now.UTC(),
+			PublishedAt:    now.UTC(),
 			RetentionHours: retentionHours(key),
 			WriterID:       lease.ID,
 			Fence:          fence,

@@ -649,6 +649,25 @@ func checkSpec(spec provider.Spec) error {
 		return fmt.Errorf("firecracker: %s has a BuildKit cache-mount ceiling but no cache endpoint",
 			spec.Name)
 	}
+	actionsFields := 0
+	for _, value := range []string{spec.ActionsProxy, spec.ActionsCAPEM} {
+		if value != "" {
+			actionsFields++
+		}
+	}
+	if actionsFields != 0 && actionsFields != 2 {
+		return fmt.Errorf("firecracker: %s needs an Actions proxy and interception CA together",
+			spec.Name)
+	}
+	if spec.ActionsProxy != "" && spec.CacheEndpoint == "" {
+		return fmt.Errorf("firecracker: %s has an Actions proxy but no cache session", spec.Name)
+	}
+	for _, value := range []string{spec.ActionsProxy, spec.ActionsCAPEM} {
+		if strings.ContainsRune(value, 0) {
+			return fmt.Errorf("firecracker: %s has Actions interception metadata containing a NUL",
+				spec.Name)
+		}
+	}
 	if !spec.RegistryMirrors.Empty() {
 		if errs := config.CheckRegistryMirrors(spec.RegistryMirrors); len(errs) > 0 {
 			return fmt.Errorf("firecracker: %s has unusable registry mirrors: %w",
@@ -806,6 +825,10 @@ func metadata(spec provider.Spec) (map[string]any, error) {
 		billet["buildkit-cache-mount-limit-bytes"] =
 			strconv.FormatInt(int64(spec.BuildKitCacheMountLimit), 10)
 	}
+	if spec.ActionsProxy != "" {
+		billet["actions-proxy"] = spec.ActionsProxy
+		billet["actions-ca-pem"] = spec.ActionsCAPEM
+	}
 	if !spec.RegistryMirrors.Empty() {
 		mirrors, err := json.Marshal(spec.RegistryMirrors)
 		if err != nil {
@@ -840,7 +863,7 @@ func metadata(spec provider.Spec) (map[string]any, error) {
 // Republishing is safe precisely because generations are immutable: a job holding a
 // clone of the old generation keeps the agent it booted with, and clone v2 lets the
 // old generation be removed once nothing holds it.
-const GuestContract = "7"
+const GuestContract = "8"
 
 // mmdsSizeLimit is how much the metadata service will hold.
 //

@@ -1150,10 +1150,8 @@ type Tier struct {
 	// would tell an operator cold-start capacity exists when it does not.
 	WarmPool int `yaml:"warm_pool,omitempty"`
 
-	// Intercept is reserved for the colocated Actions cache. Validation refuses it
-	// until the artifact-passthrough conformance suite exists; the results service
-	// also carries release artifacts, so an inert or partial implementation cannot
-	// be treated as a harmless future setting.
+	// Intercept routes the Actions results origin through the node-local cache proxy.
+	// False is the safe default because the same origin carries artifact metadata.
 	Intercept bool `yaml:"intercept,omitempty"`
 
 	// MaxConcurrent caps simultaneous instances of this tier, counting warm ones.
@@ -1286,6 +1284,27 @@ func (t Tier) ReservationErrors(where string) []error {
 	}
 
 	return errs
+}
+
+// InterceptionErrors reports tiers that could reach a backend without the local
+// storage and guest control the transparent Actions cache requires.
+//
+// Exported because alloc.New cannot assume its catalogue came through Load.
+func (t Tier) InterceptionErrors(where string) []error {
+	if !t.Intercept {
+		return nil
+	}
+
+	providers := t.AcceptableProviders()
+	if len(providers) != 1 || providers[0] != ProviderFirecracker {
+		return []error{fmt.Errorf("%s: intercept requires only the firecracker provider; "+
+			"remote and fallback providers cannot reach this node's site-local archive store", where)}
+	}
+	if t.GuestOS != GuestLinux {
+		return []error{fmt.Errorf("%s: intercept currently requires a Linux guest", where)}
+	}
+
+	return nil
 }
 
 // ReservedVCPU is the vCPU a tier's floor holds back from other tiers.
@@ -2092,6 +2111,16 @@ func (c *Config) validateNode() []error {
 	errs = append(errs, c.validateCephNode()...)
 	errs = append(errs, c.validateEBSS3Node()...)
 	errs = append(errs, c.validateCacheNode()...)
+	if c.Node.Cache == nil {
+		for i := range c.Tiers {
+			if c.Tiers[i].Intercept && c.Tiers[i].AcceptsProvider(c.Node.Provider) {
+				errs = append(errs, fmt.Errorf("tier %q enables intercept, but node.cache is not "+
+					"configured on this %s node", c.Tiers[i].Label, c.Node.Provider))
+
+				break
+			}
+		}
+	}
 	if c.Node.RegistryMirrors != nil {
 		if c.Node.Provider != ProviderFirecracker {
 			errs = append(errs, fmt.Errorf("node.registry_mirrors is set but this node's provider is %s, and only the managed Firecracker guest consumes it", c.Node.Provider))
@@ -2946,6 +2975,7 @@ func (c *Config) validateTiers() []error {
 		seen[t.Label] = struct{}{}
 
 		errs = append(errs, t.ProviderErrors(where)...)
+		errs = append(errs, t.InterceptionErrors(where)...)
 		errs = append(errs, t.ReservationErrors(where)...)
 		if !t.GuestOS.Valid() {
 			errs = append(errs, fmt.Errorf("%s: guest_os %q is not one of %v", where, t.GuestOS, allGuestOS))
@@ -2973,11 +3003,6 @@ func (c *Config) validateTiers() []error {
 		} else if t.WarmPool > 0 {
 			errs = append(errs, fmt.Errorf("%s: warm_pool is not implemented; accepting it would "+
 				"report pre-booted capacity while every job still pays a cold launch", where))
-		}
-		if t.Intercept {
-			errs = append(errs, fmt.Errorf("%s: intercept is not implemented; ACTIONS_RESULTS_URL "+
-				"also carries release-artifact metadata, so billet will not claim interception "+
-				"until cache conformance and artifact passthrough are proved", where))
 		}
 		if t.MaxConcurrent < 0 {
 			errs = append(errs, fmt.Errorf("%s: max_concurrent must not be negative", where))

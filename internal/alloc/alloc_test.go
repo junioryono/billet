@@ -182,6 +182,24 @@ func newBareAllocator(t *testing.T, limits Limits, tiers []config.Tier, opts ...
 	return a
 }
 
+func TestAllocatorReappliesInterceptionProviderSafety(t *testing.T) {
+	t.Parallel()
+
+	db, err := state.Open(t.Context(), t.TempDir())
+	if err != nil {
+		t.Fatalf("state.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	unsafe := tier("remote-cache", 2, 4*config.GiB)
+	unsafe.Provider = config.ProviderEC2
+	unsafe.Intercept = true
+	_, err = New(db, Limits{MaxVCPU: 2, MaxMemory: 4 * config.GiB}, []config.Tier{unsafe})
+	if err == nil || !strings.Contains(err.Error(), "only the firecracker provider") {
+		t.Fatalf("New accepted unsafe interception outside config.Load: %v", err)
+	}
+}
+
 func TestReserveHoldsCapacity(t *testing.T) {
 	a := newAllocator(t,
 		Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB},

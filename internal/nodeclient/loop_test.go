@@ -39,11 +39,12 @@ type fakeCompute struct {
 	// a real provider call, for shutdown-boundary tests.
 	rejectCanceledDestroy bool
 
-	launched  []int64
-	destroyed []int64
-	results   []string
-	recovered int
-	swept     int
+	launched   []int64
+	launchJobs []server.Job
+	destroyed  []int64
+	results    []string
+	recovered  int
+	swept      int
 
 	// order records the sequence of calls, which is what proves Recover ran
 	// before any work was taken.
@@ -188,6 +189,7 @@ func (f *fakeCompute) Launch(
 ) error {
 	f.mu.Lock()
 	f.launched = append(f.launched, job.RequestID)
+	f.launchJobs = append(f.launchJobs, job)
 	f.order = append(f.order, "launch")
 	started, gate, err := f.launchStarted, f.launchGate, f.launchErr
 	f.mu.Unlock()
@@ -381,6 +383,37 @@ func TestRecoveryPrecedesTheFirstLaunch(t *testing.T) {
 
 	if len(order) < 2 || order[0] != "recover" {
 		t.Fatalf("recovery did not come first: %v", order)
+	}
+}
+
+func TestLaunchPreservesTheAuthenticatedRepositoryScope(t *testing.T) {
+	t.Parallel()
+
+	p, c := harness(t)
+	compute := &fakeCompute{}
+	runLoop(t, c, compute)
+	waitFor(t, func() bool { return len(p.Nodes()) == 1 })
+
+	lease := &alloc.Lease{
+		ID: "l1", Tier: "billet-2vcpu", VCPU: 2, Memory: 8 * config.GiB,
+		GuestOS: config.GuestLinux, Providers: []config.ProviderKind{config.ProviderDocker}, Epoch: 1,
+	}
+	want := server.Job{
+		RequestID:   7,
+		RunID:       8,
+		Event:       "push",
+		Owner:       "acme",
+		Repository:  "api",
+		WorkflowRef: "acme/api/.github/workflows/ci.yml@refs/heads/main",
+	}
+	if err := p.NewRunner().Launch(t.Context(), lease, want); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	compute.mu.Lock()
+	defer compute.mu.Unlock()
+	if len(compute.launchJobs) != 1 || compute.launchJobs[0] != want {
+		t.Fatalf("node received jobs %+v, want %+v", compute.launchJobs, want)
 	}
 }
 

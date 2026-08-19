@@ -151,6 +151,7 @@
       - iproute2
       - kmod
       - nftables
+      - util-linux
     state: present
     update_cache: true
   become: true

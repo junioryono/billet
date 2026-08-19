@@ -179,6 +179,10 @@ type Spec struct {
 	// guest: workflow code has passwordless sudo and Docker-root equivalence.
 	CacheEndpoint string
 	CacheToken    string
+	// ActionsProxy and ActionsCAPEM opt this guest into the authenticated results
+	// proxy. Both must be present or absent together.
+	ActionsProxy string
+	ActionsCAPEM string
 	// BuildKitCacheMountLimit is the tier's byte ceiling for each persistent
 	// BuildKit cache-mount record. It is meaningful only with CacheEndpoint.
 	BuildKitCacheMountLimit config.ByteSize

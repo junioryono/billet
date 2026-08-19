@@ -176,6 +176,15 @@ type fakeStore struct {
 	failures []string
 }
 
+type cachePolicyFunc func(context.Context, string, string) (bool, error)
+
+func (f cachePolicyFunc) ActionsCacheAllowed(
+	ctx context.Context,
+	owner, repository string,
+) (bool, error) {
+	return f(ctx, owner, repository)
+}
+
 func (f *fakeStore) Bind(_ context.Context, leaseID string, _ int64, node string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -295,6 +304,36 @@ func dial(tb testing.TB, base string) *nodeclient.Client {
 	}
 
 	return c
+}
+
+func TestTheActionsCacheKillSwitchCrossesTheAuthenticatedNodeWire(t *testing.T) {
+	t.Parallel()
+
+	log := slog.New(slog.DiscardHandler)
+	p := nodeplane.New(log, deployment, time.Minute, nodeplane.WithTierCatalog([]config.Tier{{
+		Label: "billet-2vcpu", Provider: config.ProviderDocker, GuestOS: config.GuestLinux,
+		VCPU: 2, Memory: 8 * config.GiB, Image: "ubuntu-2404-x64",
+	}}))
+	var gotOwner, gotRepository string
+	policy := cachePolicyFunc(func(_ context.Context, owner, repository string) (bool, error) {
+		gotOwner, gotRepository = owner, repository
+		return false, nil
+	})
+	srv := httptest.NewServer(nodeplane.Handler(log, p, &fakeStore{}, nil,
+		nodeplane.WithCachePolicy(policy)))
+	t.Cleanup(srv.Close)
+	c := dial(t, srv.URL)
+
+	allowed, err := c.ActionsCacheAllowed(t.Context(), "Acme", "API")
+	if err != nil {
+		t.Fatalf("ActionsCacheAllowed: %v", err)
+	}
+	if allowed {
+		t.Fatal("a centrally blocked repository was allowed")
+	}
+	if gotOwner != "Acme" || gotRepository != "API" {
+		t.Fatalf("policy scope = %q/%q, want Acme/API", gotOwner, gotRepository)
+	}
 }
 
 // A COMMAND MAKES THE ROUND TRIP AND ITS RESULT COMES BACK.

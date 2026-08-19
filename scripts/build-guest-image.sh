@@ -518,6 +518,8 @@ IMAGEINFO
 	echo "=== 4/6 the agent that reads the registration ==="
 	install -m 0755 "$SCRIPT_DIR/../internal/guestassets/docker-cache.sh" \
 		"$rootfs/usr/local/bin/billet-docker-cache"
+	install -m 0755 "$SCRIPT_DIR/../internal/guestassets/actions-proxy.py" \
+		"$rootfs/usr/local/bin/billet-actions-proxy"
 	install -m 0755 /dev/stdin "$rootfs/usr/local/bin/billet-agent" <<'AGENT'
 #!/bin/bash
 # Read this microVM's runner registration out of the metadata service and start the
@@ -577,7 +579,7 @@ fetch() { curl -sf --connect-timeout 2 --max-time 5 -H "X-metadata-token: $token
 #
 # Refusing out loud is the whole point: the message names both versions, so the
 # answer ("republish the image") is in the failure rather than in somebody's memory.
-WANT_CONTRACT=7
+WANT_CONTRACT=8
 
 if ! contract=$(fetch contract); then
 	log "this billet did not say which metadata contract it speaks; it is older than this image"
@@ -656,11 +658,84 @@ else
 	buildkit_cache_mount_limit_bytes=""
 fi
 
+# TRANSPARENT ACTIONS CACHE REQUESTS USE A NODE-LOCAL TLS TERMINATOR. The proxy
+# address carries this guest's cache-session identity and the CA is unique to the
+# node, so both arrive through MMDS and live only on this job's ephemeral root disk.
+# The bundle includes the distribution roots because SSL_CERT_FILE replaces rather
+# than augments that set for clients which honour it. The runner reads proxy settings
+# from its launch environment, while a job-started hook copies the trust bundle into
+# RUNNER_TEMP and publishes all four variables through GITHUB_ENV. The official
+# runner translates that mounted path independently for job and action containers.
+actions_proxy=""
+actions_ca_path=""
+actions_hook_path=""
+if actions_proxy_candidate=$(fetch actions-proxy 2>/dev/null) &&
+	actions_ca_candidate=$(fetch actions-ca-pem 2>/dev/null) &&
+	[ -n "$actions_proxy_candidate" ] && [ -n "$actions_ca_candidate" ]; then
+	actions_ca_dir=/home/runner/runner/_work/_billet
+	actions_ca_path="$actions_ca_dir/actions-cache-ca.pem"
+	actions_hook_path="$actions_ca_dir/actions-cache-job-started.sh"
+	install -d -m 0755 -o runner -g runner "$actions_ca_dir"
+	{
+		cat /etc/ssl/certs/ca-certificates.crt
+		printf '\n%s\n' "$actions_ca_candidate"
+	} >"$actions_ca_path"
+	chown runner:runner "$actions_ca_path"
+	chmod 0444 "$actions_ca_path"
+	cat >"$actions_hook_path" <<'ACTIONS_HOOK'
+#!/bin/sh
+set -eu
+
+target="$RUNNER_TEMP/billet-actions-cache-ca.pem"
+install -m 0444 "$BILLET_ACTIONS_CA_SOURCE" "$target"
+{
+	printf 'HTTPS_PROXY=%s\n' "$BILLET_ACTIONS_PROXY"
+	printf 'https_proxy=%s\n' "$BILLET_ACTIONS_PROXY"
+	printf 'NODE_EXTRA_CA_CERTS=%s\n' "$target"
+	printf 'SSL_CERT_FILE=%s\n' "$target"
+} >>"$GITHUB_ENV"
+ACTIONS_HOOK
+	chown runner:runner "$actions_hook_path"
+	chmod 0555 "$actions_hook_path"
+	actions_proxy=$actions_proxy_candidate
+fi
+
 # Docker is deliberately not enabled at boot. Starting it only after the cache
 # device is mounted is what makes /var/lib/docker transparent to service
 # containers rather than a volume that hides a daemon's already-open files.
 if ! /usr/local/bin/billet-docker-cache prepare; then
 	exit 1
+fi
+
+# A GUEST-LOCAL FORWARDER IS THE FAIL-OPEN BOUNDARY. Sending HTTPS_PROXY straight
+# to the node would make every HTTPS request depend on that listener. This helper
+# tunnels ordinary destinations directly and tries the authenticated node proxy
+# only for the Actions results origin; if that connection cannot be established,
+# it connects to GitHub directly. systemd restarts the helper if it exits, and an
+# individual cache request made during that restart degrades to the cache action's
+# normal warning rather than taking later workflow traffic down with it.
+actions_guest_proxy=""
+if [ -n "$actions_proxy" ] && [ -n "$actions_ca_path" ] && [ -n "$actions_hook_path" ]; then
+	python_runtime=$(find /opt/hostedtoolcache/Python -path '*/x64/bin/python' -type f -o \
+		-path '*/x64/bin/python' -type l 2>/dev/null | sort -V | tail -1)
+	docker_bridge=$(ip -4 -o addr show docker0 2>/dev/null | awk 'NR == 1 {split($4, a, "/"); print a[1]}')
+	if [ -n "$python_runtime" ] && [ -n "$docker_bridge" ] &&
+		systemd-run --quiet --unit=billet-actions-proxy --collect --uid=runner --gid=runner \
+			--property=Restart=always --property=RestartSec=100ms \
+			"$python_runtime" /usr/local/bin/billet-actions-proxy \
+			--listen "$docker_bridge:7719" --upstream "$actions_proxy"; then
+		for _ in $(seq 1 50); do
+			if (: </dev/tcp/"$docker_bridge"/7719) 2>/dev/null; then
+				actions_guest_proxy="http://$docker_bridge:7719"
+				break
+			fi
+			sleep 0.1
+		done
+	fi
+	if [ -z "$actions_guest_proxy" ]; then
+		log "the fail-open Actions proxy did not start; this job will use GitHub's cache directly"
+		systemctl stop billet-actions-proxy.service 2>/dev/null || true
+	fi
 fi
 
 # THE COMMAND ARRIVES AS JSON IN A STRING, and both halves of that are deliberate.
@@ -823,6 +898,12 @@ if [ -n "$cache_endpoint" ] && [ -n "$cache_token" ]; then
 	runner_env+=("BILLET_CACHE_ENDPOINT=$cache_endpoint" "BILLET_CACHE_TOKEN=$cache_token"
 		"BILLET_BUILDKIT_CACHE_MOUNT_LIMIT_BYTES=$buildkit_cache_mount_limit_bytes")
 fi
+if [ -n "$actions_guest_proxy" ] && [ -n "$actions_ca_path" ] && [ -n "$actions_hook_path" ]; then
+	runner_env+=("HTTPS_PROXY=$actions_guest_proxy" "https_proxy=$actions_guest_proxy"
+		"NODE_EXTRA_CA_CERTS=$actions_ca_path" "SSL_CERT_FILE=$actions_ca_path"
+		"BILLET_ACTIONS_PROXY=$actions_guest_proxy" "BILLET_ACTIONS_CA_SOURCE=$actions_ca_path"
+		"ACTIONS_RUNNER_HOOK_JOB_STARTED=$actions_hook_path")
+fi
 if [ -n "$registry_mirrors_json" ]; then
 	runner_env+=("BILLET_REGISTRY_MIRRORS_JSON=$registry_mirrors_json")
 fi
@@ -834,6 +915,8 @@ setpriv --reuid=runner --regid=runner --init-groups --inh-caps=-all -- \
 job_status=$?
 # BILLET_AGENT_LAUNCH_END
 set -e
+
+systemctl stop billet-actions-proxy.service 2>/dev/null || true
 
 /usr/local/bin/billet-docker-cache complete "$job_status"
 

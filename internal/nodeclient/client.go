@@ -394,6 +394,21 @@ func (c *Client) Poll(ctx context.Context) (nodeapi.Command, bool, error) {
 	return cmd, true, nil
 }
 
+// ActionsCacheAllowed reads the control plane's current interception kill switch.
+func (c *Client) ActionsCacheAllowed(
+	ctx context.Context,
+	owner, repository string,
+) (bool, error) {
+	query := url.Values{"owner": {owner}, "repository": {repository}}
+	var response nodeapi.CachePolicyResponse
+	if err := c.do(ctx, http.MethodGet, c.nodePath("/cache-policy")+"?"+query.Encode(),
+		nil, &response); err != nil {
+		return false, err
+	}
+
+	return response.Allowed, nil
+}
+
 // Report tells the control plane what happened to a command.
 func (c *Client) Report(ctx context.Context, res nodeapi.CommandResult) error {
 	return c.do(ctx, http.MethodPost, c.nodePath("/result"), res, nil)

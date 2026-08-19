@@ -131,6 +131,7 @@ func commands(lc *lifecycle) []command {
 		{"nodes", "approve the machines asking to join this deployment", cmdNodes},
 		{"ca", "issue the certificates nodes authenticate with", cmdCA},
 		{"leases", "show capacity held for compute nobody has accounted for", cmdLeases},
+		{"cache", "enable or disable transparent Actions caching", cmdCache},
 		{"check", "validate the config and state directory, then exit", cmdCheck},
 		{"init", "generate a billet.yaml interactively", cmdInit},
 		{"ami", "build the machine image the ec2 backend launches", cmdAMI},
@@ -579,7 +580,7 @@ func runServer(
 		nodeplane.WithTierCatalog(cfg.Tiers))
 
 	stopWire, err := serveNodeWire(ctx, cfg, nodes, allocator,
-		wiring.NodeJIT{Client: client}, allocator, allocator)
+		wiring.NodeJIT{Client: client}, allocator, allocator, db)
 	if err != nil {
 		return err
 	}
@@ -672,6 +673,7 @@ func serveNodeWire(
 	cfg *config.Config,
 	nodes *nodeplane.Plane, store nodeplane.LeaseStore, jit nodeplane.JITSource,
 	revocations nodeplane.Revocations, enrollments nodeplane.Enrollments,
+	cachePolicy nodeplane.CachePolicy,
 ) (func(), error) {
 	addr := cfg.Server.Listen
 	loopback := nodeplane.LoopbackOnly(addr)
@@ -681,7 +683,7 @@ func serveNodeWire(
 		return nil, err
 	}
 
-	var handlerOpts []nodeplane.HandlerOption
+	handlerOpts := []nodeplane.HandlerOption{nodeplane.WithCachePolicy(cachePolicy)}
 
 	var tlsConf *tls.Config
 
@@ -1065,7 +1067,7 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 		return nil
 	}
 
-	cacheService, stopCache, err := startNodeCache(ctx, cfg, p, deployment)
+	cacheService, stopCache, err := startNodeCache(ctx, cfg, p, deployment, client)
 	if err != nil {
 		return err
 	}
@@ -1175,6 +1177,7 @@ func startNodeCache(
 	cfg *config.Config,
 	p provider.Provider,
 	deployment string,
+	cachePolicy node.ActionsPolicy,
 ) (*node.CacheService, func(), error) {
 	if cfg.Node.Cache == nil {
 		return nil, func() {}, nil
@@ -1227,6 +1230,7 @@ func startNodeCache(
 	if err != nil {
 		return nil, nil, err
 	}
+	service.SetActionsPolicy(cachePolicy)
 
 	var lc net.ListenConfig
 	ln, err := lc.Listen(ctx, "tcp", cfg.Node.Cache.Listen)
