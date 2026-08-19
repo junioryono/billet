@@ -216,13 +216,23 @@ func checkImageCompatible(
 		"--wait", wait.String(),
 		exact,
 	}); err != nil {
-		return incompatibleGuest(exact, fmt.Sprintf("it has no recorded guest contract and did not pass a compatibility boot: %v", err))
+		return compatibilityBootFailure(exact, floating, err)
 	}
 
 	fmt.Printf("%s passed a compatibility boot and now records guest contract %s\n",
 		exact, firecracker.GuestContract)
 
 	return nil
+}
+
+func compatibilityBootFailure(image string, floating bool, err error) error {
+	if !floating {
+		return fmt.Errorf("%s is an exact pin with no recorded guest contract and did not pass a compatibility boot; update the exact generation pin before upgrading: %w",
+			image, err)
+	}
+
+	return incompatibleGuest(image,
+		fmt.Sprintf("it has no recorded guest contract and did not pass a compatibility boot: %v", err))
 }
 
 func guestNeedsCompatibilityBoot(
@@ -940,11 +950,10 @@ func verifyDeploymentID(cfg *config.Config) (string, error) {
 
 // cmdImagesPromote and cmdImagesUnpromote are the manual half of promotion.
 //
-// THE AUTOMATIC PATH IS `verify --record`, and this exists for the two moments it
-// cannot cover: adopting a generation that was verified before this recorded
-// anything, and taking one back. Rollback is the important one — it is what somebody
-// reaches for at the moment a bad image is in front of every job, so it is one
-// command against the cluster rather than an edit on every node.
+// THE AUTOMATIC PATH IS `verify --record`, and this exists for taking a verified
+// generation back or deliberately restoring one that already records this binary's
+// guest contract. Rollback is one command against the cluster rather than an edit on
+// every node.
 func cmdImagesPromote(ctx context.Context, args []string, verified bool) error {
 	name := "billet images promote"
 	if !verified {
@@ -978,7 +987,7 @@ func cmdImagesPromote(ctx context.Context, args []string, verified bool) error {
 	}
 
 	if verified {
-		if err := store.MarkVerified(ctx, rest, time.Now()); err != nil {
+		if err := store.MarkVerified(ctx, rest, firecracker.GuestContract, time.Now()); err != nil {
 			return err
 		}
 
@@ -991,7 +1000,7 @@ func cmdImagesPromote(ctx context.Context, args []string, verified bool) error {
 		return err
 	}
 
-	newest, found, err := store.NewestVerified(ctx, rest)
+	newest, found, err := store.NewestVerifiedForContract(ctx, rest, firecracker.GuestContract)
 	if err != nil {
 		return err
 	}
@@ -1083,8 +1092,8 @@ func cmdImagesReap(ctx context.Context, args []string) error {
 		}
 	}
 
-	plan := ceph.PlanReap(all, verified, contracts,
-		ceph.Retention{Keep: *keep, Pinned: pinned})
+	retention := ceph.Retention{Keep: *keep, Pinned: pinned}
+	plan := ceph.PlanReap(all, verified, contracts, retention)
 
 	for _, item := range plan {
 		if item.Reason != "" {
@@ -1108,7 +1117,7 @@ func cmdImagesReap(ctx context.Context, args []string) error {
 	case *dryRun:
 		fmt.Printf("\n%d generation(s) would be removed; this was a dry run\n", removing)
 	default:
-		removed, reapErr := store.Reap(ctx, image, plan)
+		removed, reapErr := store.Reap(ctx, image, plan, retention)
 
 		fmt.Printf("\nremoved %d generation(s)\n", len(removed))
 
@@ -1318,7 +1327,7 @@ func cmdImagesList(ctx context.Context, args []string) error {
 		return err
 	}
 
-	current, hasCurrent, err := store.NewestVerified(ctx, image)
+	current, hasCurrent, err := store.NewestVerifiedForContract(ctx, image, firecracker.GuestContract)
 	if err != nil {
 		return err
 	}

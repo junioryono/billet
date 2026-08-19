@@ -60,6 +60,11 @@ var ErrConflict = errors.New("state: compare-and-swap conflict")
 // ErrLocked means another billet process already owns this state directory.
 var ErrLocked = errors.New("state: another billet process holds this state directory")
 
+// ErrMaintenance means a host upgrade fenced the ledger against operator traffic.
+var ErrMaintenance = errors.New("state: the ledger is fenced for host maintenance")
+
+const maintenanceFile = "billet.maintenance"
+
 // Querier is the read surface. It is deliberately narrower than *sql.DB: handing
 // out the pool would let any caller issue writes on a connection that is supposed
 // to be read-only, which is exactly the invariant this package exists to hold.
@@ -93,6 +98,9 @@ type DB struct {
 	// another command that had beaten it to SQLite's writer slot, which is
 	// exactly the hang the bound exists to prevent.
 	unlocked bool
+
+	stateDir          string
+	maintenanceBypass bool
 }
 
 // Open prepares the state directory, takes the exclusive process lock, opens the
@@ -118,6 +126,13 @@ func openDir(ctx context.Context, stateDir string, admin bool) (*DB, error) {
 	// hold the mTLS CA key. Tighten it rather than inheriting whatever was there.
 	if err := os.Chmod(stateDir, 0o700); err != nil {
 		return nil, fmt.Errorf("tighten state dir %s: %w", stateDir, err)
+	}
+
+	maintenanceBypass := os.Getenv("BILLET_MAINTENANCE") == "1"
+	if !maintenanceBypass {
+		if err := refuseMaintenance(stateDir); err != nil {
+			return nil, err
+		}
 	}
 
 	// A NIL LOCK MEANS "SOMEBODY ELSE IS THE CONTROL PLANE HERE", and it is
@@ -199,7 +214,15 @@ func openDir(ctx context.Context, stateDir string, admin bool) (*DB, error) {
 	}
 	r.SetMaxOpenConns(4)
 
-	db := &DB{w: w, r: r, lock: lock, admin: admin, unlocked: lock == nil}
+	db := &DB{
+		w:                 w,
+		r:                 r,
+		lock:              lock,
+		admin:             admin,
+		unlocked:          lock == nil,
+		stateDir:          stateDir,
+		maintenanceBypass: maintenanceBypass,
+	}
 
 	startupCtx, cancel := context.WithTimeout(ctx, startupTimeout)
 	defer cancel()
@@ -363,6 +386,10 @@ func (db *DB) Reader() Querier { return db.r }
 // so that an allocation decision — read current usage, decide, record it — is one
 // atomic step rather than a read followed by a hopeful write.
 func (db *DB) Tx(ctx context.Context, fn func(*sql.Tx) error) error {
+	if err := db.checkMaintenance(); err != nil {
+		return err
+	}
+
 	tx, err := db.beginWrite(ctx)
 	if err != nil {
 		return err
@@ -381,6 +408,9 @@ func (db *DB) Tx(ctx context.Context, fn func(*sql.Tx) error) error {
 	// against, because BEGIN IMMEDIATE already holds the write lock a migration
 	// would need.
 	if db.unlocked {
+		if err := db.checkMaintenance(); err != nil {
+			return err
+		}
 		if err := verifySchemaIn(ctx, tx); err != nil {
 			return err
 		}
@@ -412,6 +442,10 @@ func (db *DB) Tx(ctx context.Context, fn func(*sql.Tx) error) error {
 // A TRANSACTION rather than bare queries, so a caller issuing several of them
 // sees one consistent snapshot instead of rows from either side of a commit.
 func (db *DB) View(ctx context.Context, fn func(Querier) error) error {
+	if err := db.checkMaintenance(); err != nil {
+		return err
+	}
+
 	// Deferred, deliberately: the reader takes no write lock, which is the whole
 	// point, and nothing here can be promoted.
 	tx, err := db.r.BeginTx(ctx, nil)
@@ -428,12 +462,36 @@ func (db *DB) View(ctx context.Context, fn func(Querier) error) error {
 	// against a schema a newer billet has since rebuilt would report rows that no
 	// longer mean what this binary thinks they mean.
 	if db.unlocked {
+		if err := db.checkMaintenance(); err != nil {
+			return err
+		}
 		if err := verifySchemaIn(ctx, tx); err != nil {
 			return err
 		}
 	}
 
 	return fn(tx)
+}
+
+func (db *DB) checkMaintenance() error {
+	if db == nil || db.maintenanceBypass {
+		return nil
+	}
+
+	return refuseMaintenance(db.stateDir)
+}
+
+func refuseMaintenance(stateDir string) error {
+	_, err := os.Lstat(filepath.Join(stateDir, maintenanceFile))
+	switch {
+	case err == nil:
+		return fmt.Errorf("%w in %s; wait for the transactional host upgrade to finish before running an operator command",
+			ErrMaintenance, stateDir)
+	case errors.Is(err, os.ErrNotExist):
+		return nil
+	default:
+		return fmt.Errorf("inspect the maintenance fence in %s: %w", stateDir, err)
+	}
 }
 
 // busyRetryInterval paces re-attempts at starting a write transaction.

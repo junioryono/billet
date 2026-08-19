@@ -125,6 +125,7 @@ func (c *Client) Reap( //nolint:nonamedreturns // the deferred release reports t
 	ctx context.Context,
 	image string,
 	plan []Reapable,
+	retention Retention,
 ) (removed []string, err error) {
 	name, _, _ := strings.Cut(strings.TrimSpace(image), "@")
 	if name == "" {
@@ -159,7 +160,7 @@ func (c *Client) Reap( //nolint:nonamedreturns // the deferred release reports t
 		}
 	}()
 
-	// REVALIDATED UNDER THE LOCK, because the plan was made without it.
+	// REPLANNED UNDER THE LOCK, because the preview was made without it.
 	//
 	// cmdImagesReap reads the verification state, decides what to remove, and only
 	// then calls this -- so a verification can acquire the lock, mark a previously
@@ -169,6 +170,10 @@ func (c *Client) Reap( //nolint:nonamedreturns // the deferred release reports t
 	//
 	// Re-reading here is cheap against the cost of being wrong, and it is the only
 	// place the answer cannot go stale before it is used.
+	allNow, err := c.Generations(ctx, name)
+	if err != nil {
+		return nil, err
+	}
 	verifiedNow, err := c.VerifiedGenerations(ctx, name)
 	if err != nil {
 		return nil, err
@@ -178,27 +183,24 @@ func (c *Client) Reap( //nolint:nonamedreturns // the deferred release reports t
 		return nil, err
 	}
 
-	doomed := make([]Generation, 0, len(plan))
-
+	originallyDoomed := make(map[string]bool, len(plan))
 	for _, item := range plan {
-		if item.Reason != "" {
-			continue
+		if item.Reason == "" {
+			originallyDoomed[item.Generation.Name] = true
 		}
+	}
 
-		if verifiedNow[item.Generation.Name] && !item.Verified {
-			// VERIFIED SINCE THE PLAN WAS MADE. Skipped rather than reported as an
-			// error: the reap did the right thing with what it knew, and the operator
-			// asked for generations nothing needs -- this one is now needed.
-			continue
+	// Intersected with the preview: state changes may make something newly
+	// removable, but an irreversible command never removes more than it showed the
+	// operator. Replanning the WHOLE set matters because one generation changing
+	// contract can make an unchanged older generation the last rollback for its
+	// contract.
+	fresh := PlanReap(allNow, verifiedNow, contractsNow, retention)
+	doomed := make([]Generation, 0, len(fresh))
+	for _, item := range fresh {
+		if item.Reason == "" && originallyDoomed[item.Generation.Name] {
+			doomed = append(doomed, item.Generation)
 		}
-		if contractsNow[item.Generation.Name] != item.Contract {
-			// A COMPATIBILITY BOOT BACKFILLED ITS CONTRACT AFTER PLANNING. The
-			// retention buckets changed, so only a fresh plan can decide whether it
-			// is still beyond the rollback depth for its now-known contract.
-			continue
-		}
-
-		doomed = append(doomed, item.Generation)
 	}
 
 	sort.Slice(doomed, func(i, j int) bool { return doomed[i].Built.Before(doomed[j].Built) })

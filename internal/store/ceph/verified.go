@@ -27,10 +27,13 @@ const VerifiedKey = "billet.verified"
 const Verified = "verified"
 
 // MarkVerified records that a generation booted, registered and ran a container.
-//
-// THE VALUE IS WHEN, so an operator reading the metadata can tell a generation
-// verified an hour ago from one verified in March.
-func (c *Client) MarkVerified(ctx context.Context, image string, at time.Time) error {
+// It excludes reaping and proves the generation still exists with the expected
+// guest contract before publishing it.
+func (c *Client) MarkVerified(
+	ctx context.Context,
+	image, expectedContract string,
+	at time.Time,
+) (err error) {
 	name, generation, found := strings.Cut(strings.TrimSpace(image), "@")
 	if !found || strings.TrimSpace(generation) == "" {
 		return fmt.Errorf("ceph: %q names no generation to mark verified", image)
@@ -41,9 +44,59 @@ func (c *Client) MarkVerified(ctx context.Context, image string, at time.Time) e
 			"verified would put a claim on something nothing can resolve", generation)
 	}
 
+	lock, lockErr := c.TakePublishLock(ctx, at)
+	if lockErr != nil {
+		return fmt.Errorf("ceph: could not mark %s verified because the publish lock is held; "+
+			"a reap, verification, or publish is in progress: %w", image, lockErr)
+	}
+
+	defer func() {
+		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.wait)
+		defer cancel()
+
+		if releaseErr := lock.Release(releaseCtx); releaseErr != nil && err == nil {
+			err = releaseErr
+		}
+	}()
+
+	generations, err := c.Generations(ctx, name)
+	if err != nil {
+		return err
+	}
+
+	present := false
+	for _, gen := range generations {
+		if gen.Name == generation {
+			present = true
+
+			break
+		}
+	}
+	if !present {
+		return fmt.Errorf("ceph: %s no longer exists, so it cannot be marked verified", image)
+	}
+
+	contract, recorded, err := c.GuestContract(ctx, name, generation)
+	if err != nil {
+		return err
+	}
+	if !recorded || contract != expectedContract {
+		return fmt.Errorf("ceph: %s cannot be promoted for this binary: it records guest contract %q, but this binary requires %q; boot-verify it with this binary instead",
+			image, contract, expectedContract)
+	}
+
+	return c.markVerified(ctx, name, generation, at)
+}
+
+// markVerified writes the verification while its caller holds the publish lock.
+func (c *Client) markVerified(
+	ctx context.Context,
+	name, generation string,
+	at time.Time,
+) error {
 	if _, err := c.rbdCmd(ctx, false, "-p", c.cfg.ImagePool, "image-meta", "set", name,
 		VerifiedKey+"."+generation, at.UTC().Format(time.RFC3339)); err != nil {
-		return fmt.Errorf("ceph: record %s as verified: %w", image, err)
+		return fmt.Errorf("ceph: record %s@%s as verified: %w", name, generation, err)
 	}
 
 	return nil
@@ -53,11 +106,26 @@ func (c *Client) MarkVerified(ctx context.Context, image string, at time.Time) e
 //
 // IDEMPOTENT, because the thing an operator does in a hurry should not fail for
 // having already worked.
-func (c *Client) UnmarkVerified(ctx context.Context, image string) error {
+func (c *Client) UnmarkVerified(ctx context.Context, image string) (err error) {
 	name, generation, found := strings.Cut(strings.TrimSpace(image), "@")
 	if !found || strings.TrimSpace(generation) == "" {
 		return fmt.Errorf("ceph: %q names no generation to unmark", image)
 	}
+
+	lock, lockErr := c.TakePublishLock(ctx, time.Now())
+	if lockErr != nil {
+		return fmt.Errorf("ceph: could not unmark %s because the publish lock is held; a "+
+			"reap, verification, or publish is in progress: %w", image, lockErr)
+	}
+
+	defer func() {
+		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.wait)
+		defer cancel()
+
+		if releaseErr := lock.Release(releaseCtx); releaseErr != nil && err == nil {
+			err = releaseErr
+		}
+	}()
 
 	if _, err := c.rbdCmd(ctx, false, "-p", c.cfg.ImagePool, "image-meta", "remove", name,
 		VerifiedKey+"."+generation); err != nil {
@@ -243,7 +311,7 @@ func (c *Client) RecordVerification(
 	if lockErr != nil {
 		return fmt.Errorf("ceph: could not record the verification of %s@%s because the "+
 			"publish lock is held; a reap or a publish is in progress and recording now "+
-			"could describe a generation it is removing: %w", image, generation, err)
+			"could describe a generation it is removing: %w", image, generation, lockErr)
 	}
 
 	defer func() {
@@ -302,5 +370,5 @@ func (c *Client) RecordVerification(
 		return err
 	}
 
-	return c.MarkVerified(ctx, image+"@"+generation, at)
+	return c.markVerified(ctx, image, generation, at)
 }

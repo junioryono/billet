@@ -26,6 +26,7 @@
     billet_previous_binary_preserved: false
     billet_ledger_preserved: false
     billet_ledger_snapshot_taken: false
+    billet_maintenance_started: false
   when:
     - billet_binary_upgrade | default(false)
     - not ansible_check_mode
@@ -78,7 +79,7 @@
       ansible.builtin.systemd_service:
         name: billet-node.service
         state: stopped
-      when: billet_previous_upgrade_inputs.results[2].stat.exists
+      when: billet_service_state_before_upgrade.results[1].rc != 4
 
     - name: Pull, boot-verify, and promote every compatible guest needed
       ansible.builtin.command:
@@ -87,21 +88,18 @@
           - images
           - pull
           - --verify
-          - --rollback-file
-          - "{{ billet_upgrade_recovery_dir }}/prepared-image-{{ billet_guest_refresh_index }}"
           - --config
           - "{{ billet_upgrade_recovery_dir }}/billet.yaml.candidate"
           - "{{ item }}"
       loop: "{{ billet_guest_refresh_images }}"
       loop_control:
-        index_var: billet_guest_refresh_index
         label: "{{ item }}"
 
     - name: Gracefully stop the billet server after compute has drained
       ansible.builtin.systemd_service:
         name: billet-server.service
         state: stopped
-      when: billet_previous_upgrade_inputs.results[1].stat.exists
+      when: billet_service_state_before_upgrade.results[0].rc != 4
 
     - name: Preserve the previous billet binary
       ansible.builtin.copy:
@@ -118,14 +116,46 @@
         billet_previous_binary_preserved: true
       when: billet_binary_checksums.results[0].stat.exists
 
+    - name: Install the candidate billet binary after both old services stop
+      ansible.builtin.copy:
+        src: "{{ billet_firecracker_stage }}/billet-candidate"
+        dest: /usr/bin/billet
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0755"
+      register: billet_binary_install
+
+    - name: Fence the ledger against operator commands during migration and rollback
+      ansible.builtin.copy:
+        content: "transactional host upgrade in progress\n"
+        dest: "{{ billet_candidate_server_state_dir }}/billet.maintenance"
+        owner: "{{ billet_service_user }}"
+        group: "{{ billet_service_group }}"
+        mode: "0600"
+        force: false
+
+    - name: Remember that the ledger maintenance fence is active
+      ansible.builtin.set_fact:
+        billet_maintenance_started: true
+
+    - name: Wait for operator commands started before the fence to finish
+      ansible.builtin.command:
+        argv:
+          - pgrep
+          - -x
+          - billet
+      register: billet_processes_before_ledger_backup
+      changed_when: false
+      failed_when: billet_processes_before_ledger_backup.rc not in [0, 1]
+      until: billet_processes_before_ledger_backup.rc == 1
+      retries: 30
+      delay: 1
+
     - name: Inspect the stopped control-plane ledger
       ansible.builtin.stat:
         path: "{{ billet_candidate_server_state_dir }}"
       register: billet_ledger_before_upgrade
-
-    - name: Remember that the stopped ledger was inspected
-      ansible.builtin.set_fact:
-        billet_ledger_snapshot_taken: true
 
     - name: Preserve the stopped control-plane ledger
       ansible.builtin.command:
@@ -141,6 +171,10 @@
       ansible.builtin.set_fact:
         billet_ledger_preserved: true
       when: billet_ledger_before_upgrade.stat.exists
+
+    - name: Remember that stopped ledger preservation completed
+      ansible.builtin.set_fact:
+        billet_ledger_snapshot_taken: true
 
     - name: Install candidate configuration after preserving the stopped ledger
       ansible.builtin.copy:
@@ -167,20 +201,12 @@
       ansible.builtin.systemd_service:
         daemon_reload: true
 
-    - name: Install the candidate billet binary after the ledger lock is released
-      ansible.builtin.copy:
-        src: "{{ billet_firecracker_stage }}/billet-candidate"
-        dest: /usr/bin/billet
-        remote_src: true
-        owner: root
-        group: root
-        mode: "0755"
-      register: billet_binary_install
-
     - name: Validate and migrate with the new billet binary as the only ledger writer
       ansible.builtin.command: /usr/bin/billet check --config /etc/billet/billet.yaml
       register: billet_check
       changed_when: false
+      environment:
+        BILLET_MAINTENANCE: "1"
 
     - name: Return the migrated ledger to the control-plane account before restart
       ansible.builtin.file:
@@ -204,6 +230,26 @@
         state: started
       when: billet_enable_node
 
+    - name: Install steady-state units without the maintenance bypass
+      ansible.builtin.template:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        owner: root
+        group: root
+        mode: "0644"
+      loop:
+        - { src: billet-server.service.j2, dest: /etc/systemd/system/billet-server.service }
+        - { src: billet-node.service.j2, dest: /etc/systemd/system/billet-node.service }
+
+    - name: Load steady-state units before opening administration
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+
+    - name: Open the upgraded ledger to operator commands
+      ansible.builtin.file:
+        path: "{{ billet_candidate_server_state_dir }}/billet.maintenance"
+        state: absent
+
   rescue:
     - name: Stop upgraded compute before rollback
       ansible.builtin.systemd_service:
@@ -217,72 +263,83 @@
         state: stopped
       failed_when: false
 
-    - name: Inspect service state before restoring upgrade inputs
+    - name: Inspect service process state before restoring upgrade inputs
       ansible.builtin.command:
         argv:
           - systemctl
-          - is-active
+          - show
+          - --property=LoadState
+          - --property=ActiveState
+          - --property=SubState
+          - --property=MainPID
+          - --property=ControlPID
           - "{{ item }}"
       loop:
         - billet-node.service
         - billet-server.service
-      register: billet_service_state_before_restore
+      register: billet_service_process_state_before_restore
+      changed_when: false
+      failed_when: false
+
+    - name: Inspect service cgroups before restoring upgrade inputs
+      ansible.builtin.command:
+        argv:
+          - systemd-cgls
+          - --no-pager
+          - --unit
+          - "{{ item }}"
+      loop:
+        - billet-node.service
+        - billet-server.service
+      register: billet_service_cgroups_before_restore
       changed_when: false
       failed_when: false
 
     - name: Refuse rollback while either upgraded process may still be running
       ansible.builtin.assert:
         that:
-          - billet_service_state_before_restore.results[0].rc in [3, 4]
-          - billet_service_state_before_restore.results[1].rc in [3, 4]
+          - "'LoadState=not-found' in item.0.stdout or 'ActiveState=inactive' in item.0.stdout or 'ActiveState=failed' in item.0.stdout"
+          - "'LoadState=not-found' in item.0.stdout or 'MainPID=0' in item.0.stdout"
+          - "'LoadState=not-found' in item.0.stdout or 'ControlPID=0' in item.0.stdout"
+          - "item.1.stdout_lines | select('match', '^[^0-9]*[0-9]+\\s') | list | length == 0"
         fail_msg: >-
-          Rollback stopped before restoring the ledger because billet-node or
-          billet-server did not prove inactive. The untouched recovery copy is
-          at {{ billet_upgrade_recovery_dir }}.
+          Rollback stopped before restoring the ledger because {{ item.0.item }}
+          did not reach a terminal state with zero main/control PIDs and an empty
+          cgroup. The untouched recovery copy is at
+          {{ billet_upgrade_recovery_dir }}.
+      loop: "{{ billet_service_process_state_before_restore.results | zip(billet_service_cgroups_before_restore.results) | list }}"
+      loop_control:
+        label: "{{ item.0.item }}"
 
-    - name: Find guest rollback handles written before promotion
+    - name: Find migrated ledger entries before restoring the stopped snapshot
       ansible.builtin.find:
-        paths: "{{ billet_upgrade_recovery_dir }}"
-        patterns: prepared-image-*
-        file_type: file
-      register: billet_guest_rollback_handles
-
-    - name: Read every guest rollback handle
-      ansible.builtin.slurp:
-        src: "{{ item.path }}"
-      loop: "{{ billet_guest_rollback_handles.files }}"
-      loop_control:
-        label: "{{ item.path }}"
-      register: billet_rollback_image_files
-
-    - name: Withdraw guest generations prepared only for the failed upgrade
-      ansible.builtin.command:
-        argv:
-          - "{{ billet_firecracker_stage }}/billet-candidate"
-          - images
-          - unpromote
-          - --config
-          - "{{ billet_upgrade_recovery_dir }}/billet.yaml.candidate"
-          - "{{ item.content | b64decode | trim }}"
-      loop: "{{ billet_rollback_image_files.results | default([]) }}"
-      loop_control:
-        label: "{{ item.content | b64decode | trim }}"
-      failed_when: false
-      when: item.content is defined
-
-    - name: Remove the migrated ledger copy before restoring the stopped snapshot
-      ansible.builtin.file:
-        path: "{{ billet_candidate_server_state_dir }}"
-        state: absent
+        paths: "{{ billet_candidate_server_state_dir }}"
+        file_type: any
+        recurse: false
+        excludes:
+          - billet.maintenance
+      register: billet_migrated_ledger_entries
       when:
         - billet_ledger_snapshot_taken | default(false)
+        - not billet_ledger_before_upgrade.stat.exists or billet_ledger_preserved | default(false)
+
+    - name: Remove migrated ledger entries before restoring the stopped snapshot
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ billet_migrated_ledger_entries.files | default([]) }}"
+      loop_control:
+        label: "{{ item.path }}"
+      when:
+        - billet_ledger_snapshot_taken | default(false)
+        - not billet_ledger_before_upgrade.stat.exists or billet_ledger_preserved | default(false)
 
     - name: Restore the previous control-plane ledger
       ansible.builtin.command:
         argv:
           - cp
           - -a
-          - "{{ billet_upgrade_recovery_dir }}/server"
+          - "{{ billet_upgrade_recovery_dir }}/server/."
           - "{{ billet_candidate_server_state_dir }}"
       when:
         - billet_ledger_preserved | default(false)
@@ -332,6 +389,15 @@
         - billet_upgrade_recovery_dir | length > 0
         - not billet_binary_checksums.results[0].stat.exists
 
+    - name: Permit restored services through the maintenance fence for this start
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - set-environment
+          - BILLET_MAINTENANCE=1
+      changed_when: true
+      when: billet_maintenance_started | default(false)
+
     - name: Restart the previous billet server after rollback
       ansible.builtin.systemd_service:
         name: billet-server.service
@@ -347,6 +413,15 @@
       failed_when: false
       when:
         - billet_service_state_before_upgrade.results[1].rc == 0
+
+    - name: Remove the restored-service maintenance bypass from systemd
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - unset-environment
+          - BILLET_MAINTENANCE
+      changed_when: true
+      when: billet_maintenance_started | default(false)
 
     - name: Let restored services pass their immediate startup checks
       ansible.builtin.pause:
@@ -381,6 +456,12 @@
       loop: "{{ billet_restored_service_state.results }}"
       loop_control:
         label: "{{ item.item.name }}"
+
+    - name: Remove the maintenance fence after rollback is complete
+      ansible.builtin.file:
+        path: "{{ billet_candidate_server_state_dir }}/billet.maintenance"
+        state: absent
+      when: billet_maintenance_started | default(false)
 
     - name: Report the failed upgrade and its recovery copy
       ansible.builtin.fail:

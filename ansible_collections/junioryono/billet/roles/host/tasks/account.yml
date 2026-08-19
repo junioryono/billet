@@ -69,6 +69,135 @@
     update_cache: true
   become: true
 
+- name: Resolve the candidate billet state directories
+  ansible.builtin.set_fact:
+    billet_candidate_server_state_dir: "{{ billet_config.get('server', {}).get('state_dir', '/var/lib/billet/server') }}"
+    billet_candidate_node_state_dir: "{{ billet_config.get('node', {}).get('state_dir', '/var/lib/billet/node') }}"
+
+- name: Refuse unsafe billet state directories
+  ansible.builtin.assert:
+    that:
+      - billet_candidate_server_state_dir.startswith('/var/lib/billet/')
+      - billet_candidate_node_state_dir.startswith('/var/lib/billet/')
+      - "'/./' not in billet_candidate_server_state_dir"
+      - "'/../' not in billet_candidate_server_state_dir"
+      - "'/./' not in billet_candidate_node_state_dir"
+      - "'/../' not in billet_candidate_node_state_dir"
+      - not billet_candidate_server_state_dir.endswith('/.')
+      - not billet_candidate_server_state_dir.endswith('/..')
+      - not billet_candidate_node_state_dir.endswith('/.')
+      - not billet_candidate_node_state_dir.endswith('/..')
+      - not billet_candidate_server_state_dir.startswith('/var/lib/billet/upgrades/')
+      - billet_candidate_server_state_dir != '/var/lib/billet/upgrades'
+      - not billet_candidate_node_state_dir.startswith('/var/lib/billet/upgrades/')
+      - billet_candidate_node_state_dir != '/var/lib/billet/upgrades'
+      - billet_candidate_server_state_dir != billet_candidate_node_state_dir
+      - not billet_candidate_server_state_dir.startswith(billet_candidate_node_state_dir + '/')
+      - not billet_candidate_node_state_dir.startswith(billet_candidate_server_state_dir + '/')
+    fail_msg: >-
+      The host role accepts distinct, dedicated server.state_dir and
+      node.state_dir paths only below /var/lib/billet. The paths cannot contain
+      dot segments, nest inside each other, or overlap the upgrade recovery
+      tree. This keeps recursive ownership and systemd's filesystem sandbox
+      scoped to billet state and keeps every backup disjoint from its source.
+
+- name: Resolve billet state paths through every existing ancestor
+  ansible.builtin.command:
+    argv:
+      - realpath
+      - --canonicalize-missing
+      - "{{ item }}"
+  loop:
+    - /var/lib/billet
+    - "{{ billet_candidate_server_state_dir }}"
+    - "{{ billet_candidate_node_state_dir }}"
+  register: billet_resolved_state_paths
+  changed_when: false
+  check_mode: false
+  become: true
+
+- name: Refuse billet state paths with symlinked or noncanonical ancestors
+  ansible.builtin.assert:
+    that:
+      - item.stdout == item.item
+    fail_msg: >-
+      {{ item.item }} resolves to {{ item.stdout }}. Billet state paths must be
+      canonical and every existing ancestor must remain inside the real
+      /var/lib/billet tree; otherwise recursive ownership could cross a symlink
+      into unrelated host data.
+  loop: "{{ billet_resolved_state_paths.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Inspect billet state paths before creating them
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+  loop:
+    - /var/lib/billet
+    - "{{ billet_candidate_server_state_dir }}"
+    - "{{ billet_candidate_node_state_dir }}"
+  register: billet_state_paths
+  check_mode: false
+  become: true
+
+- name: Refuse billet state paths that are symlinks or non-directories
+  ansible.builtin.assert:
+    that:
+      - not item.stat.islnk | default(false)
+      - not item.stat.exists or item.stat.isdir
+    fail_msg: >-
+      {{ item.item }} must be a real directory owned as billet state. Refusing
+      a symlink or another file type prevents the role from changing ownership
+      or permissions outside the configured state tree.
+  loop: "{{ billet_state_paths.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Inspect the installed billet configuration
+  ansible.builtin.stat:
+    path: /etc/billet/billet.yaml
+  register: billet_installed_config
+  check_mode: false
+  become: true
+
+- name: Read the installed billet configuration
+  ansible.builtin.slurp:
+    src: /etc/billet/billet.yaml
+  register: billet_previous_config_file
+  become: true
+  when: billet_installed_config.stat.exists
+
+- name: Resolve the installed billet state directories
+  ansible.builtin.set_fact:
+    billet_previous_server_state_dir: >-
+      {{
+        (billet_previous_config_file.content | b64decode | from_yaml).get('server', {}).get('state_dir', '/var/lib/billet/server')
+        if billet_previous_config_file.content is defined
+        else billet_candidate_server_state_dir
+      }}
+    billet_previous_node_state_dir: >-
+      {{
+        (billet_previous_config_file.content | b64decode | from_yaml).get('node', {}).get('state_dir', '/var/lib/billet/node')
+        if billet_previous_config_file.content is defined
+        else billet_candidate_node_state_dir
+      }}
+
+- name: Refuse to move installed billet state implicitly
+  ansible.builtin.assert:
+    that:
+      - billet_previous_server_state_dir == billet_candidate_server_state_dir
+      - billet_previous_node_state_dir == billet_candidate_node_state_dir
+    fail_msg: >-
+      This host already uses server.state_dir={{ billet_previous_server_state_dir }}
+      and node.state_dir={{ billet_previous_node_state_dir }}. Refusing desired
+      paths {{ billet_candidate_server_state_dir }} and
+      {{ billet_candidate_node_state_dir }} because restarting against an empty
+      directory would abandon the authoritative ledger, CA, or node identity.
+      Move state during an explicit offline maintenance operation, then converge
+      the role with paths that match the installed configuration.
+  when: billet_installed_config.stat.exists
+
 - name: Create billet directories
   ansible.builtin.file:
     path: "{{ item.path }}"
@@ -80,8 +209,8 @@
     - { path: /etc/billet, owner: root, group: "{{ billet_service_group }}", mode: "0750" }
     - { path: /etc/billet/network, owner: root, group: root, mode: "0755" }
     - { path: /var/lib/billet, owner: root, group: root, mode: "0755" }
-    - { path: "{{ billet_config.get('server', {}).get('state_dir', '/var/lib/billet/server') }}", owner: "{{ billet_service_user }}", group: "{{ billet_service_group }}", mode: "0700" }
-    - { path: "{{ billet_config.get('node', {}).get('state_dir', '/var/lib/billet/node') }}", owner: root, group: root, mode: "0700" }
+    - { path: "{{ billet_candidate_server_state_dir }}", owner: "{{ billet_service_user }}", group: "{{ billet_service_group }}", mode: "0700" }
+    - { path: "{{ billet_candidate_node_state_dir }}", owner: root, group: root, mode: "0700" }
     - { path: /var/lib/billet/health, owner: root, group: root, mode: "0750" }
     - { path: /var/lib/billet/upgrades, owner: root, group: root, mode: "0700" }
     - { path: "{{ billet_firecracker_stage }}", owner: root, group: root, mode: "0700" }
@@ -173,44 +302,6 @@
     - billet_binary_upgrade | default(false)
     - not ansible_check_mode
 
-- name: Read the installed configuration before replacing it
-  ansible.builtin.slurp:
-    src: /etc/billet/billet.yaml
-  register: billet_previous_config_file
-  become: true
-  when:
-    - billet_binary_upgrade | default(false)
-    - not ansible_check_mode
-    - billet_previous_upgrade_inputs.results[0].stat.exists
-
-- name: Resolve the installed and candidate control-plane state directories
-  ansible.builtin.set_fact:
-    billet_previous_server_state_dir: >-
-      {{
-        (billet_previous_config_file.content | b64decode | from_yaml).get('server', {}).get(
-          'state_dir', billet_config.get('server', {}).get('state_dir', '/var/lib/billet/server')
-        )
-        if billet_previous_config_file.content is defined
-        else billet_config.get('server', {}).get('state_dir', '/var/lib/billet/server')
-      }}
-    billet_candidate_server_state_dir: "{{ billet_config.get('server', {}).get('state_dir', '/var/lib/billet/server') }}"
-  when:
-    - billet_binary_upgrade | default(false)
-    - not ansible_check_mode
-
-- name: Refuse to move the live ledger as part of a binary upgrade
-  ansible.builtin.assert:
-    that:
-      - billet_previous_server_state_dir == billet_candidate_server_state_dir
-    fail_msg: >-
-      A binary upgrade cannot also move server.state_dir from
-      {{ billet_previous_server_state_dir }} to
-      {{ billet_candidate_server_state_dir }}. Converge the state-directory
-      change separately so the upgrade transaction has one authoritative ledger.
-  when:
-    - billet_binary_upgrade | default(false)
-    - not ansible_check_mode
-
 - name: Preserve configuration and units before replacing them
   ansible.builtin.copy:
     src: "{{ item.item }}"
@@ -238,6 +329,19 @@
   loop:
     - { src: billet-server.service.j2, dest: /etc/systemd/system/billet-server.service }
     - { src: billet-node.service.j2, dest: /etc/systemd/system/billet-node.service }
+  become: true
+  when:
+    - billet_binary_upgrade | default(false)
+    - not ansible_check_mode
+
+- name: Permit only the transactional services through the maintenance fence
+  ansible.builtin.lineinfile:
+    path: "{{ billet_upgrade_recovery_dir }}/{{ item | basename }}.candidate"
+    insertafter: '^\[Service\]$'
+    line: Environment=BILLET_MAINTENANCE=1
+  loop:
+    - /etc/systemd/system/billet-server.service
+    - /etc/systemd/system/billet-node.service
   become: true
   when:
     - billet_binary_upgrade | default(false)

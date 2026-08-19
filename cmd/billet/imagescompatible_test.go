@@ -71,6 +71,27 @@ func TestExactPinMismatchCannotBeRepairedByPromotingAnotherGeneration(t *testing
 	}
 }
 
+func TestFailedLegacyExactPinCompatibilityBootRequiresAPinChange(t *testing.T) {
+	err := compatibilityBootFailure("ubuntu-2404-x64@g20260815033431", false,
+		os.ErrDeadlineExceeded)
+
+	if got := exitStatus(err); got == 2 {
+		t.Fatalf("exact-pin boot failure exit status = %d, which asks the role to pull an unused replacement", got)
+	}
+	if !strings.Contains(err.Error(), "update the exact generation pin") {
+		t.Errorf("exact-pin boot failure did not explain the required config change: %v", err)
+	}
+}
+
+func TestFailedFloatingCompatibilityBootRequestsAReplacement(t *testing.T) {
+	err := compatibilityBootFailure("ubuntu-2404-x64@g20260815033431", true,
+		os.ErrDeadlineExceeded)
+
+	if got := exitStatus(err); got != 2 {
+		t.Fatalf("floating boot failure exit status = %d, want replacement status 2", got)
+	}
+}
+
 func TestImagePullResultIsInstalledOnlyAsAProtectedCompleteFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "prepared-image")
@@ -100,24 +121,16 @@ func TestImagePullResultIsInstalledOnlyAsAProtectedCompleteFile(t *testing.T) {
 	}
 }
 
-func TestVerifiedImageIsWithdrawnWhenItsRollbackHandleCannotBeWritten(t *testing.T) {
+func TestVerifiedImageResultFailureDoesNotWithdrawFleetPublication(t *testing.T) {
 	parent := filepath.Join(t.TempDir(), "not-a-directory")
 	if err := os.WriteFile(parent, []byte("file\n"), 0o600); err != nil {
 		t.Fatalf("create blocking file: %v", err)
 	}
 
-	withdrawn := false
-	err := writeVerifiedImageResult(filepath.Join(parent, "prepared-image"),
-		"ubuntu-2404-x64@g20260815033431", func() error {
-			withdrawn = true
-
-			return nil
-		})
+	err := writeImageResult(filepath.Join(parent, "prepared-image"),
+		"ubuntu-2404-x64@g20260815033431")
 	if err == nil {
 		t.Fatal("writing a result below a regular file succeeded")
-	}
-	if !withdrawn {
-		t.Fatal("the verified generation remained promoted without a rollback handle")
 	}
 }
 

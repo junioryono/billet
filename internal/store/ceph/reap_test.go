@@ -1,6 +1,8 @@
 package ceph
 
 import (
+	"slices"
+	"strings"
 	"testing"
 )
 
@@ -255,11 +257,11 @@ func TestTheVerifiedAliasIsNotTreatedAsAPin(t *testing.T) {
 // those keys to decide what is still needed. A dead generation's key would keep
 // its kernel alive forever, which is the opposite of what reaping is for.
 func TestReapRemovesEveryMetadataKeyOfTheGenerationsItRemoves(t *testing.T) {
-	f := &importFake{}
+	f := &importFake{snapshots: []string{"g20260814072427"}}
 
 	plan := []Reapable{{Generation: Generation{Name: "g20260814072427"}}}
 
-	if _, err := importClient(t, f).Reap(t.Context(), "ubuntu-2404-x64", plan); err != nil {
+	if _, err := importClient(t, f).Reap(t.Context(), "ubuntu-2404-x64", plan, Retention{}); err != nil {
 		t.Fatalf("reap: %v", err)
 	}
 
@@ -271,5 +273,44 @@ func TestReapRemovesEveryMetadataKeyOfTheGenerationsItRemoves(t *testing.T) {
 				"what is still needed, so a dead generation's key keeps its kernel alive "+
 				"forever", want)
 		}
+	}
+}
+
+func TestReapRecomputesEveryContractBucketUnderThePublishLock(t *testing.T) {
+	all := gens("g20260815000000", "g20260814000000", "g20260813000000")
+	verified := map[string]bool{
+		"g20260815000000": true,
+		"g20260814000000": true,
+		"g20260813000000": true,
+	}
+	contracts := map[string]string{
+		"g20260815000000": "7",
+		"g20260814000000": "6",
+		"g20260813000000": "7",
+	}
+	retention := Retention{Keep: 1}
+	plan := PlanReap(all, verified, contracts, retention)
+
+	// The newest generation moves from contract 7 to 6 after the preview. The
+	// oldest generation's own metadata did not change, but it is now the only
+	// verified contract-7 rollback and must survive the locked replan.
+	f := &importFake{
+		snapshots: []string{"g20260815000000", "g20260814000000", "g20260813000000"},
+		metadata: strings.Join([]string{
+			VerifiedKey + ".g20260815000000  now",
+			VerifiedKey + ".g20260814000000  now",
+			VerifiedKey + ".g20260813000000  now",
+			GuestContractKey + ".g20260815000000  6",
+			GuestContractKey + ".g20260814000000  6",
+			GuestContractKey + ".g20260813000000  7",
+		}, "\n"),
+	}
+
+	removed, err := importClient(t, f).Reap(t.Context(), "ubuntu-2404-x64", plan, retention)
+	if err != nil {
+		t.Fatalf("reap: %v", err)
+	}
+	if slices.Contains(removed, "g20260813000000") {
+		t.Fatalf("removed the last contract-7 generation after another generation changed buckets: %v", removed)
 	}
 }

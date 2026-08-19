@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -47,6 +48,8 @@ type importFake struct {
 	// which is a real answer and not a broken one -- the existence check depends
 	// on telling those apart.
 	snapshots []string
+	metadata  string
+	contract  string
 
 	// heartbeat, if non-nil, is what `image-meta get` answers for a liveness key,
 	// and it is called once per read so a test can make the counter move.
@@ -121,6 +124,17 @@ func (f *importFake) run(ctx context.Context, _ string, args []string) ([]byte, 
 			}
 
 			return []byte(value + "\n"), nil
+		}
+
+		if slices.Contains(args, "list") {
+			return []byte(f.metadata), nil
+		}
+		if slices.Contains(args, "get") && strings.Contains(args[len(args)-1], GuestContractKey+".") {
+			if f.contract == "" {
+				return nil, errors.New("rbd: (2) No such file or directory")
+			}
+
+			return []byte(f.contract + "\n"), nil
 		}
 
 		return []byte(""), nil
@@ -976,6 +990,101 @@ func TestRecordVerificationTakesThePublishLock(t *testing.T) {
 	}
 }
 
+func TestManualPromotionTakesThePublishLockAndProvesTheGenerationExists(t *testing.T) {
+	f := &importFake{snapshots: []string{"g20260815033431"}, contract: "7"}
+
+	if err := importClient(t, f).MarkVerified(t.Context(),
+		"ubuntu-2404-x64@g20260815033431", "7", importAt); err != nil {
+		t.Fatalf("manual promotion: %v", err)
+	}
+
+	lockAt, listAt, writeAt := -1, -1, -1
+	for i, call := range f.calls {
+		joined := strings.Join(call, " ")
+		if lockAt < 0 && strings.Contains(joined, "lock add") {
+			lockAt = i
+		}
+		if listAt < 0 && strings.Contains(joined, "snap ls") {
+			listAt = i
+		}
+		if writeAt < 0 && strings.Contains(joined, VerifiedKey+".g20260815033431") {
+			writeAt = i
+		}
+	}
+
+	if lockAt < 0 || listAt < 0 || writeAt < 0 {
+		t.Fatalf("promotion did not lock, prove existence, and write; billet ran %v", f.calls)
+	}
+	if lockAt > listAt || listAt > writeAt {
+		t.Fatalf("promotion order lock=%d existence=%d write=%d; billet ran %v",
+			lockAt, listAt, writeAt, f.calls)
+	}
+}
+
+func TestManualPromotionRefusesAGenerationThatIsGone(t *testing.T) {
+	f := &importFake{}
+
+	err := importClient(t, f).MarkVerified(t.Context(),
+		"ubuntu-2404-x64@g20260815033431", "7", importAt)
+	if err == nil {
+		t.Fatal("manual promotion recorded a generation that does not exist")
+	}
+	if f.ranWith("image-meta", "set") {
+		t.Errorf("manual promotion wrote metadata for a missing generation; billet ran %v", f.calls)
+	}
+}
+
+func TestManualPromotionRechecksTheGuestContractUnderThePublishLock(t *testing.T) {
+	f := &importFake{snapshots: []string{"g20260815033431"}, contract: "6"}
+
+	err := importClient(t, f).MarkVerified(t.Context(),
+		"ubuntu-2404-x64@g20260815033431", "7", importAt)
+	if err == nil {
+		t.Fatal("manual promotion accepted a generation for another guest contract")
+	}
+	if f.ranWith("image-meta", "set") {
+		t.Errorf("manual promotion wrote verification after the contract changed; billet ran %v", f.calls)
+	}
+
+	lockAt, contractAt := -1, -1
+	for i, call := range f.calls {
+		joined := strings.Join(call, " ")
+		if lockAt < 0 && strings.Contains(joined, "lock add") {
+			lockAt = i
+		}
+		if contractAt < 0 && strings.Contains(joined, GuestContractKey+".g20260815033431") {
+			contractAt = i
+		}
+	}
+	if lockAt < 0 || contractAt < 0 || lockAt > contractAt {
+		t.Fatalf("contract was not rechecked under the publish lock; billet ran %v", f.calls)
+	}
+}
+
+func TestManualUnpromotionTakesThePublishLock(t *testing.T) {
+	f := &importFake{}
+
+	if err := importClient(t, f).UnmarkVerified(t.Context(),
+		"ubuntu-2404-x64@g20260815033431"); err != nil {
+		t.Fatalf("manual unpromotion: %v", err)
+	}
+
+	lockAt, removeAt := -1, -1
+	for i, call := range f.calls {
+		joined := strings.Join(call, " ")
+		if lockAt < 0 && strings.Contains(joined, "lock add") {
+			lockAt = i
+		}
+		if removeAt < 0 && strings.Contains(joined, VerifiedKey+".g20260815033431") {
+			removeAt = i
+		}
+	}
+
+	if lockAt < 0 || removeAt < 0 || lockAt > removeAt {
+		t.Fatalf("unpromotion did not remove under the publish lock; billet ran %v", f.calls)
+	}
+}
+
 // AND IT PROVES THE GENERATION IS STILL THERE. Both writes validate only the NAME,
 // so without this a reap that completed first left both keys recreated for a
 // snapshot that no longer exists -- and `@verified` then names it.
@@ -1031,7 +1140,7 @@ func TestReapTakesThePublishLock(t *testing.T) {
 
 	plan := []Reapable{{Generation: Generation{Name: "g20260814072427"}}}
 
-	if _, err := importClient(t, f).Reap(t.Context(), "ubuntu-2404-x64", plan); err != nil {
+	if _, err := importClient(t, f).Reap(t.Context(), "ubuntu-2404-x64", plan, Retention{}); err != nil {
 		t.Fatalf("reap: %v", err)
 	}
 
