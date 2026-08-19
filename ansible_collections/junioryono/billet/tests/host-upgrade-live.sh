@@ -27,7 +27,7 @@ observe() {
     output=$1
     ansible "${host}" -i "${inventory}" --become --one-line \
         -m ansible.builtin.shell \
-        -a 'set -eu; sha256sum /usr/bin/billet /etc/billet/billet.yaml /etc/systemd/system/billet-server.service /etc/systemd/system/billet-node.service; stat -c "%n %U:%G %a" /usr/bin/billet /etc/billet/billet.yaml /etc/systemd/system/billet-server.service /etc/systemd/system/billet-node.service; systemctl is-active billet-server.service billet-node.service; systemctl is-enabled billet-server.service billet-node.service; test ! -e /var/lib/billet/upgrades/active; test ! -e /var/lib/billet/server/billet.maintenance; ! systemctl show-environment | grep -q "^BILLET_MAINTENANCE="; /usr/bin/billet check --config /etc/billet/billet.yaml >/dev/null; echo ledger-check=ok' >"${output}"
+        -a 'set -eu; sha256sum /usr/bin/billet /etc/billet/billet.yaml /etc/systemd/system/billet-server.service /etc/systemd/system/billet-node.service; stat -c "%n %U:%G %a" /usr/bin/billet /etc/billet/billet.yaml /etc/systemd/system/billet-server.service /etc/systemd/system/billet-node.service; systemctl is-active billet-server.service billet-node.service; systemctl is-enabled billet-server.service billet-node.service; server_pid=$(systemctl show --property=MainPID --value billet-server.service); node_pid=$(systemctl show --property=MainPID --value billet-node.service); ! grep -azq -- --upgrade-probe "/proc/${server_pid}/cmdline"; ! grep -azq -- --upgrade-probe "/proc/${node_pid}/cmdline"; test ! -e /var/lib/billet/upgrades/active; test ! -e /var/lib/billet/server/billet.maintenance; ! systemctl show-environment | grep -q "^BILLET_MAINTENANCE="; /usr/bin/billet check --config /etc/billet/billet.yaml >/dev/null; echo ledger-check=ok' >"${output}"
 }
 
 run_playbook() {
@@ -66,26 +66,42 @@ recover_uncommitted() {
 
 observe "${work}/baseline"
 for target in \
-    'Publish the durable host-upgrade pointer before live mutation' \
+    'Claim the host upgrade without replacing another transaction' \
     'Hide the old executable before establishing the maintenance fence' \
     'Commit the durable ledger snapshot before exposing the candidate' \
     'Install the candidate billet binary after fencing and ledger preservation' \
     'Validate and migrate with the new billet binary as the only ledger writer' \
-    'Start the upgraded billet server before admitting compute' \
-    'Start the upgraded billet node after validation and image verification'
+    'Start the quiescent upgraded server readiness probe' \
+    'Start the quiescent upgraded node readiness probe' \
+    'Install steady-state units without the quiescent probe' \
+    'Persist desired billet service enablement while the ledger remains fenced'
 do
     interrupt_after "${target}" "${candidate_a}"
     recover_uncommitted "${target}"
 done
 
-interrupt_after 'Open the committed ledger to operator commands' "${candidate_a}"
+interrupt_after 'Record the durable host-upgrade commit before opening administration' "${candidate_a}"
 if (unset BILLET_BINARY_PATH; run_playbook); then
     echo "host-upgrade-live: committed finalization did not request the required fresh converge" >&2
     exit 1
 fi
 observe "${work}/committed-a"
 
-interrupt_after 'Close the durable host-upgrade transaction after commit' "${candidate_b}"
+interrupt_after 'Open the committed ledger to operator commands' "${candidate_b}"
+if (unset BILLET_BINARY_PATH; run_playbook); then
+    echo "host-upgrade-live: open-fence finalization did not request the required fresh converge" >&2
+    exit 1
+fi
+observe "${work}/committed-b"
+
+interrupt_after 'Start the committed billet server before admitting compute' "${candidate_a}"
+if (unset BILLET_BINARY_PATH; run_playbook); then
+    echo "host-upgrade-live: partial-service finalization did not request the required fresh converge" >&2
+    exit 1
+fi
+observe "${work}/committed-a-again"
+
+interrupt_after 'Close the durable host-upgrade transaction after stable service startup' "${candidate_b}"
 observe "${work}/after-pointer-removal"
 (export BILLET_BINARY_PATH=${candidate_b}; run_playbook) >"${work}/idempotent.log"
 if ! grep -Eq 'changed=0[[:space:]]+unreachable=0[[:space:]]+failed=0' "${work}/idempotent.log"; then

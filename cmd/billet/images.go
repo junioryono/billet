@@ -357,10 +357,20 @@ func firecrackerTierImage(cfg *config.Config) string {
 
 // firecrackerTierImages are the distinct images this deployment's microVM tiers boot.
 func firecrackerTierImages(cfg *config.Config) []string {
+	if cfg.Node == nil || cfg.Node.Provider != config.ProviderFirecracker {
+		return nil
+	}
+
 	images := make([]string, 0, len(cfg.Tiers))
 	seen := map[string]bool{}
 
 	for i := range cfg.Tiers {
+		if cfg.Tiers[i].Node != "" && cfg.Tiers[i].Node != cfg.Node.Name {
+			continue
+		}
+		if cfg.Tiers[i].Site != "" && cfg.Tiers[i].Site != cfg.Node.Site {
+			continue
+		}
 		if image := cfg.Tiers[i].ImageFor(config.ProviderFirecracker); cfg.Tiers[i].AcceptsProvider(config.ProviderFirecracker) && image != "" {
 			if !seen[image] {
 				images = append(images, image)

@@ -86,7 +86,7 @@
 - name: Refuse incompatible interrupted-upgrade recovery metadata
   ansible.builtin.assert:
     that:
-      - billet_upgrade_manifest.version == 1
+      - billet_upgrade_manifest.version == 2
       - billet_upgrade_manifest.server_state_dir is string
       - billet_upgrade_manifest.node_state_dir is string
       - billet_upgrade_manifest.service_user is match('^[a-z_][a-z0-9_-]{0,31}$')
@@ -97,8 +97,10 @@
       - billet_upgrade_manifest.binary_existed is boolean
       - billet_upgrade_manifest.server_was_active is boolean
       - billet_upgrade_manifest.node_was_active is boolean
-      - billet_upgrade_manifest.server_was_enabled is boolean
-      - billet_upgrade_manifest.node_was_enabled is boolean
+      - billet_upgrade_manifest.candidate_server_active is boolean
+      - billet_upgrade_manifest.candidate_node_active is boolean
+      - billet_upgrade_manifest.server_enablement in ['enabled', 'enabled-runtime', 'disabled', 'static', 'indirect', 'generated', 'transient', 'alias', 'linked', 'linked-runtime', 'masked', 'masked-runtime', 'not-found']
+      - billet_upgrade_manifest.node_enablement in ['enabled', 'enabled-runtime', 'disabled', 'static', 'indirect', 'generated', 'transient', 'alias', 'linked', 'linked-runtime', 'masked', 'masked-runtime', 'not-found']
     fail_msg: >-
       The active billet upgrade manifest is incomplete or belongs to an
       unsupported transaction format. Refusing automatic recovery.

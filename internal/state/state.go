@@ -108,7 +108,13 @@ type DB struct {
 //
 // The caller's context bounds startup only; it does not own the returned DB.
 func Open(ctx context.Context, stateDir string) (*DB, error) {
-	return openDir(ctx, stateDir, false)
+	return openDir(ctx, stateDir, false, false)
+}
+
+// OpenMaintenance opens the control-plane store for a quiescent upgrade probe.
+// It bypasses a host-upgrade fence without admitting operator or workload writes.
+func OpenMaintenance(ctx context.Context, stateDir string) (*DB, error) {
+	return openDir(ctx, stateDir, false, true)
 }
 
 // openDir is the shared body of Open and OpenAdmin.
@@ -118,7 +124,7 @@ func Open(ctx context.Context, stateDir string) (*DB, error) {
 // without the exclusive directory lock when a control plane already holds it,
 // and in that case it VERIFIES the schema instead of migrating it. See
 // OpenAdmin for why both halves are necessary.
-func openDir(ctx context.Context, stateDir string, admin bool) (*DB, error) {
+func openDir(ctx context.Context, stateDir string, admin, maintenanceProbe bool) (*DB, error) {
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
 		return nil, fmt.Errorf("create state dir %s: %w", stateDir, err)
 	}
@@ -128,7 +134,7 @@ func openDir(ctx context.Context, stateDir string, admin bool) (*DB, error) {
 		return nil, fmt.Errorf("tighten state dir %s: %w", stateDir, err)
 	}
 
-	maintenanceBypass := os.Getenv("BILLET_MAINTENANCE") == "1"
+	maintenanceBypass := maintenanceProbe || os.Getenv("BILLET_MAINTENANCE") == "1"
 	if !maintenanceBypass {
 		if err := refuseMaintenance(stateDir); err != nil {
 			return nil, err

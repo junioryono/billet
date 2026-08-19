@@ -274,20 +274,8 @@
     - billet_binary_upgrade | default(false)
     - not billet_interrupted_upgrade | bool
     - not ansible_check_mode
-
-- name: Permit only the transactional services through the maintenance fence
-  ansible.builtin.lineinfile:
-    path: "{{ billet_upgrade_recovery_dir }}/{{ item | basename }}.candidate"
-    insertafter: '^\[Service\]$'
-    line: Environment=BILLET_MAINTENANCE=1
-  loop:
-    - /etc/systemd/system/billet-server.service
-    - /etc/systemd/system/billet-node.service
-  become: true
-  when:
-    - billet_binary_upgrade | default(false)
-    - not billet_interrupted_upgrade | bool
-    - not ansible_check_mode
+  vars:
+    billet_systemd_upgrade_probe: true
 
 - name: Install the billet systemd units
   ansible.builtin.template:

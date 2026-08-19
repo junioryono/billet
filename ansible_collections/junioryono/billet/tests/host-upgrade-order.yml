@@ -11,6 +11,8 @@
     billet_host_recovery_dispatch_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/upgrade-recover.yml') | from_yaml }}"
     billet_host_recovery_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/upgrade-rollback.yml') | from_yaml }}"
     billet_host_finalization_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/upgrade-finalize.yml') | from_yaml }}"
+    billet_server_unit: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/templates/billet-server.service.j2') }}"
+    billet_node_unit: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/templates/billet-node.service.j2') }}"
   tasks:
     - name: Locate the upgrade transaction and recovery path
       ansible.builtin.set_fact:
@@ -46,12 +48,18 @@
           - billet_main_names.index('Inspect a durable host-upgrade journal before normal convergence') < billet_main_names.index('Recover an interrupted billet upgrade before converging anything else')
           - billet_main_names.index('Recover an interrupted billet upgrade before converging anything else') < billet_main_names.index('Configure billet account and files')
           - billet_main_names.index('Configure billet account and files') < billet_main_names.index('Configure billet services')
-          - billet_top_level_names.index('Persist the host-upgrade recovery manifest before live mutation') < billet_top_level_names.index('Publish the durable host-upgrade pointer before live mutation')
-          - billet_top_level_names.index('Durably commit host-upgrade recovery inputs before publishing the pointer') < billet_top_level_names.index('Publish the durable host-upgrade pointer before live mutation')
-          - billet_top_level_names.index('Publish the durable host-upgrade pointer before live mutation') < billet_top_level_names.index('Durably publish the active host-upgrade pointer before live mutation')
+          - billet_top_level_names.index('Persist the host-upgrade recovery manifest before live mutation') < billet_top_level_names.index("Stage this transaction's atomic host-upgrade claim")
+          - billet_top_level_names.index('Durably commit host-upgrade recovery inputs before publishing the pointer') < billet_top_level_names.index("Stage this transaction's atomic host-upgrade claim")
+          - billet_top_level_names.index("Stage this transaction's atomic host-upgrade claim") < billet_top_level_names.index('Durably stage the atomic host-upgrade claim')
+          - billet_top_level_names.index('Durably stage the atomic host-upgrade claim') < billet_top_level_names.index('Claim the host upgrade without replacing another transaction')
+          - billet_top_level_names.index('Claim the host upgrade without replacing another transaction') < billet_top_level_names.index('Durably publish the active host-upgrade pointer before live mutation')
           - billet_top_level_names.index('Durably publish the active host-upgrade pointer before live mutation') < billet_top_level_names.index('Upgrade billet as one recoverable host transaction')
-          - billet_top_level_names.index('Publish the durable host-upgrade pointer before live mutation') < billet_top_level_names.index('Upgrade billet as one recoverable host transaction')
+          - billet_top_level_names.index('Prove this transaction owns the host before live mutation') < billet_top_level_names.index('Upgrade billet as one recoverable host transaction')
           - billet_top_level_names.index('Prove every configured guest image is compatible with the candidate binary') < billet_top_level_names.index('Upgrade billet as one recoverable host transaction')
+          - "'BILLET_MAINTENANCE' not in billet_server_unit"
+          - "'BILLET_MAINTENANCE' not in billet_node_unit"
+          - "'--upgrade-probe' in billet_server_unit"
+          - "'--upgrade-probe' in billet_node_unit"
           - billet_main_names.index('Recover an interrupted billet upgrade before converging anything else') < billet_main_names.index('Configure Firecracker')
           - billet_main_names.index('Recover an interrupted billet upgrade before converging anything else') < billet_main_names.index('Configure guest networking')
           - billet_main_names.index('Recover an interrupted billet upgrade before converging anything else') < billet_main_names.index('Configure Ceph')
@@ -63,24 +71,31 @@
           - billet_upgrade_names.index('Pull, boot-verify, and promote every compatible guest needed') < billet_upgrade_names.index('Gracefully stop the billet server after compute has drained')
           - billet_upgrade_names.index('Gracefully stop the billet server after compute has drained') < billet_upgrade_names.index('Hide the old executable before establishing the maintenance fence')
           - billet_upgrade_names.index('Hide the old executable before establishing the maintenance fence') < billet_upgrade_names.index('Fence the ledger against operator commands during migration and rollback')
-          - billet_upgrade_names.index('Fence the ledger against operator commands during migration and rollback') < billet_upgrade_names.index('Wait for operator commands started before the fence to finish')
+          - billet_upgrade_names.index('Fence the ledger against operator commands during migration and rollback') < billet_upgrade_names.index('Durably fence every ledger mount before exposing the candidate')
+          - billet_upgrade_names.index('Durably fence every ledger mount before exposing the candidate') < billet_upgrade_names.index('Wait for operator commands started before the fence to finish')
           - billet_upgrade_names.index('Wait for operator commands started before the fence to finish') < billet_upgrade_names.index('Preserve the stopped control-plane ledger')
           - billet_upgrade_names.index('Preserve the stopped control-plane ledger') < billet_upgrade_names.index('Durably flush the stopped ledger snapshot before marking it complete')
           - billet_upgrade_names.index('Durably flush the stopped ledger snapshot before marking it complete') < billet_upgrade_names.index('Commit the durable ledger snapshot before exposing the candidate')
           - billet_upgrade_names.index('Commit the durable ledger snapshot before exposing the candidate') < billet_upgrade_names.index('Durably publish ledger snapshot completion before exposing the candidate')
           - billet_upgrade_names.index('Durably publish ledger snapshot completion before exposing the candidate') < billet_upgrade_names.index('Install the candidate billet binary after fencing and ledger preservation')
           - billet_upgrade_names.index('Install candidate configuration after preserving the stopped ledger') < billet_upgrade_names.index('Validate and migrate with the new billet binary as the only ledger writer')
-          - billet_upgrade_names.index('Validate and migrate with the new billet binary as the only ledger writer') < billet_upgrade_names.index('Start the upgraded billet server before admitting compute')
-          - billet_upgrade_names.index('Start the upgraded billet node after validation and image verification') < billet_upgrade_names.index('Inspect upgraded service stability baseline')
-          - billet_upgrade_names.index('Inspect upgraded service stability baseline') < billet_upgrade_names.index('Observe upgraded services across the restart interval')
-          - billet_upgrade_names.index('Observe upgraded services across the restart interval') < billet_upgrade_names.index('Inspect upgraded service stability before committing the transaction')
-          - billet_upgrade_names.index('Prove upgraded services are stably active before opening administration') < billet_upgrade_names.index('Record the durable host-upgrade commit before opening administration')
+          - billet_upgrade_names.index('Validate and migrate with the new billet binary as the only ledger writer') < billet_upgrade_names.index('Start the quiescent upgraded server readiness probe')
+          - billet_upgrade_names.index('Start the quiescent upgraded node readiness probe') < billet_upgrade_names.index('Inspect upgraded readiness-probe stability baseline')
+          - billet_upgrade_names.index('Inspect upgraded readiness-probe stability baseline') < billet_upgrade_names.index('Observe upgraded readiness probes across the restart interval')
+          - billet_upgrade_names.index('Observe upgraded readiness probes across the restart interval') < billet_upgrade_names.index('Inspect upgraded readiness-probe stability before committing the transaction')
+          - billet_upgrade_names.index('Prove upgraded readiness probes are stably active before commit') < billet_upgrade_names.index('Install steady-state units without the quiescent probe')
+          - billet_upgrade_names.index('Persist desired billet service enablement while the ledger remains fenced') < billet_upgrade_names.index('Durably flush every mutated host filesystem before commit')
+          - billet_upgrade_names.index('Durably flush every mutated host filesystem before commit') < billet_upgrade_names.index('Record the durable host-upgrade commit before opening administration')
           - billet_upgrade_names.index('Record the durable host-upgrade commit before opening administration') < billet_upgrade_names.index('Durably publish the host-upgrade commit before opening administration')
           - billet_upgrade_names.index('Durably publish the host-upgrade commit before opening administration') < billet_upgrade_names.index('Finalize the committed host transaction')
-          - billet_finalization_names.index('Open the committed ledger to operator commands') < billet_finalization_names.index('Close the durable host-upgrade transaction after commit')
           - billet_finalization_names.index('Open the committed ledger to operator commands') < billet_finalization_names.index('Durably open the committed ledger to operator commands')
-          - billet_finalization_names.index('Durably open the committed ledger to operator commands') < billet_finalization_names.index('Close the durable host-upgrade transaction after commit')
-          - billet_finalization_names.index('Close the durable host-upgrade transaction after commit') < billet_finalization_names.index('Durably close the host-upgrade transaction')
+          - billet_finalization_names.index('Durably open the committed ledger to operator commands') < billet_finalization_names.index('Start the committed billet server before admitting compute')
+          - billet_finalization_names.index('Start the committed billet server before admitting compute') < billet_finalization_names.index('Start the committed billet node after the control plane')
+          - billet_finalization_names.index('Start the committed billet node after the control plane') < billet_finalization_names.index('Inspect committed service stability baseline')
+          - billet_finalization_names.index('Inspect committed service stability baseline') < billet_finalization_names.index('Observe committed services across the restart interval')
+          - billet_finalization_names.index('Observe committed services across the restart interval') < billet_finalization_names.index('Inspect committed service stability after the restart interval')
+          - billet_finalization_names.index('Prove committed services are stably active') < billet_finalization_names.index('Close the durable host-upgrade transaction after stable service startup')
+          - billet_finalization_names.index('Close the durable host-upgrade transaction after stable service startup') < billet_finalization_names.index('Durably close the host-upgrade transaction')
 
     - name: Require recovery to exclude processes before restoring state
       ansible.builtin.assert:
@@ -91,12 +106,10 @@
           - billet_recovery_names.index('Wait for every billet process started before executable removal to finish') < billet_recovery_names.index('Refuse recovery without conclusive process and cgroup evidence')
           - billet_recovery_names.index('Refuse recovery without conclusive process and cgroup evidence') < billet_recovery_names.index('Remove current ledger entries before restoring a completed snapshot')
           - billet_recovery_names.index('Prove the durable ledger snapshot is valid before replacing current state') < billet_recovery_names.index('Remove current ledger entries before restoring a completed snapshot')
-          - billet_recovery_names.index('Restore the previous control-plane ledger') < billet_recovery_names.index('Restart prior services under a temporary maintenance bypass')
-          - billet_recovery_names.index('Restore configuration and units that existed before the upgrade') < billet_recovery_names.index('Restart prior services under a temporary maintenance bypass')
-          - billet_recovery_names.index('Restore prior service enablement exactly') < billet_recovery_names.index('Restart prior services under a temporary maintenance bypass')
-          - billet_recovery_names.index('Inspect restored service stability baseline') < billet_recovery_names.index('Observe restored services across the restart interval')
-          - billet_recovery_names.index('Observe restored services across the restart interval') < billet_recovery_names.index('Inspect restored service stability after the restart interval')
-          - billet_recovery_names.index('Prove services active before the upgrade are stably active again') < billet_recovery_names.index('Record the durable rollback commit before opening administration')
+          - billet_recovery_names.index('Restore the previous control-plane ledger') < billet_recovery_names.index('Durably flush every restored host filesystem before rollback commit')
+          - billet_recovery_names.index('Restore configuration and units that existed before the upgrade') < billet_recovery_names.index('Durably flush every restored host filesystem before rollback commit')
+          - billet_recovery_names.index('Prove prior service enablement was restored exactly') < billet_recovery_names.index('Durably flush every restored host filesystem before rollback commit')
+          - billet_recovery_names.index('Durably flush every restored host filesystem before rollback commit') < billet_recovery_names.index('Record the durable rollback commit before opening administration')
           - billet_recovery_names.index('Record the durable rollback commit before opening administration') < billet_recovery_names.index('Durably publish the rollback commit before opening administration')
           - billet_recovery_names.index('Durably publish the rollback commit before opening administration') < billet_recovery_names.index('Finalize the committed host rollback')
           - billet_recovery_dispatch_names.index('Inspect whether the durable host transaction already committed') < billet_recovery_dispatch_names.index('Finish a committed host transaction without rolling it back')

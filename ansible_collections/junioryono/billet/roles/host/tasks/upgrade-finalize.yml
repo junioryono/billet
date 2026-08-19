@@ -1,4 +1,68 @@
 ---
+- name: Inspect the host-upgrade claim before finalization
+  ansible.builtin.stat:
+    path: /var/lib/billet/upgrades/active
+    follow: false
+  register: billet_finalization_claim_state
+  become: true
+
+- name: Refuse finalization without a real owned host-upgrade claim
+  ansible.builtin.assert:
+    that:
+      - billet_finalization_claim_state.stat.exists
+      - billet_finalization_claim_state.stat.isreg
+      - not billet_finalization_claim_state.stat.islnk | default(false)
+    fail_msg: >-
+      The committed host transaction no longer has a real active claim. Leave
+      its fence intact instead of guessing whether another run owns the host.
+
+- name: Read the host-upgrade claim before finalization
+  ansible.builtin.slurp:
+    src: /var/lib/billet/upgrades/active
+  register: billet_finalization_claim
+  become: true
+
+- name: Prove this transaction still owns the host before finalization
+  ansible.builtin.assert:
+    that:
+      - billet_finalization_claim.content | b64decode | trim == billet_upgrade_recovery_dir
+    fail_msg: >-
+      The active host-upgrade claim belongs to another transaction. Leave its
+      fence and pointer intact instead of finalizing state this run does not own.
+
+- name: Read the durable host transaction decision
+  ansible.builtin.slurp:
+    src: "{{ billet_upgrade_recovery_dir }}/commit.complete"
+  register: billet_finalization_commit_file
+  become: true
+
+- name: Resolve the committed service target
+  ansible.builtin.set_fact:
+    billet_finalization_commit: "{{ billet_finalization_commit_file.content | b64decode | trim }}"
+    billet_finalization_services:
+      - name: billet-server.service
+        should_run: >-
+          {{
+            billet_upgrade_manifest.candidate_server_active
+            if billet_finalization_commit_file.content | b64decode | trim == 'host upgrade committed'
+            else billet_upgrade_manifest.server_was_active
+          }}
+      - name: billet-node.service
+        should_run: >-
+          {{
+            billet_upgrade_manifest.candidate_node_active
+            if billet_finalization_commit_file.content | b64decode | trim == 'host upgrade committed'
+            else billet_upgrade_manifest.node_was_active
+          }}
+
+- name: Refuse an unknown durable host transaction decision
+  ansible.builtin.assert:
+    that:
+      - billet_finalization_commit in ['host upgrade committed', 'host rollback committed']
+    fail_msg: >-
+      The host transaction commit record is not a supported upgrade or rollback
+      decision. Leave the fence and active claim intact for manual inspection.
+
 - name: Open the committed ledger to operator commands
   ansible.builtin.file:
     path: "{{ billet_candidate_server_state_dir }}/billet.maintenance"
@@ -14,7 +78,166 @@
   changed_when: false
   become: true
 
-- name: Close the durable host-upgrade transaction after commit
+- name: Inspect committed service activity before replacing a probe
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - is-active
+      - "{{ item.name }}"
+  loop: "{{ billet_finalization_services }}"
+  register: billet_finalization_service_activity
+  changed_when: false
+  failed_when: billet_finalization_service_activity.rc not in [0, 3, 4]
+  loop_control:
+    label: "{{ item.name }}"
+  become: true
+
+- name: Inspect committed service process identifiers
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - show
+      - --property=MainPID
+      - --value
+      - "{{ item.name }}"
+  loop: "{{ billet_finalization_services }}"
+  register: billet_finalization_service_pids
+  changed_when: false
+  failed_when: false
+  loop_control:
+    label: "{{ item.name }}"
+  become: true
+
+- name: Detect quiescent probes that must become full services
+  ansible.builtin.command:
+    argv:
+      - grep
+      - -azq
+      - --
+      - --upgrade-probe
+      - "/proc/{{ billet_finalization_service_pids.results[billet_finalization_index].stdout | trim }}/cmdline"
+  loop: "{{ billet_finalization_services }}"
+  loop_control:
+    index_var: billet_finalization_index
+    label: "{{ item.name }}"
+  register: billet_finalization_service_probes
+  changed_when: false
+  failed_when: billet_finalization_service_probes.rc not in [0, 1]
+  when:
+    - item.should_run | bool
+    - billet_finalization_service_activity.results[billet_finalization_index].rc == 0
+    - billet_finalization_service_pids.results[billet_finalization_index].stdout | trim != '0'
+  become: true
+
+- name: Start the committed billet server before admitting compute
+  ansible.builtin.systemd_service:
+    name: billet-server.service
+    state: restarted
+  when:
+    - billet_finalization_services[0].should_run | bool
+    - >-
+      billet_finalization_service_activity.results[0].rc != 0 or
+      billet_finalization_service_probes.results[0].rc | default(1) == 0
+  become: true
+
+- name: Start the committed billet node after the control plane
+  ansible.builtin.systemd_service:
+    name: billet-node.service
+    state: restarted
+  when:
+    - billet_finalization_services[1].should_run | bool
+    - >-
+      billet_finalization_service_activity.results[1].rc != 0 or
+      billet_finalization_service_probes.results[1].rc | default(1) == 0
+  become: true
+
+- name: Keep services outside the committed target stopped
+  ansible.builtin.systemd_service:
+    name: "{{ item.name }}"
+    state: stopped
+  loop: "{{ billet_finalization_services }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: not item.should_run | bool
+  become: true
+
+- name: Inspect committed service stability baseline
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - show
+      - --property=LoadState
+      - --property=ActiveState
+      - --property=SubState
+      - --property=MainPID
+      - --property=ControlPID
+      - --property=Result
+      - --property=NRestarts
+      - --property=ActiveEnterTimestampMonotonic
+      - --property=ExecMainStartTimestampMonotonic
+      - "{{ item.name }}"
+  loop: "{{ billet_finalization_services }}"
+  register: billet_finalization_service_baseline
+  changed_when: false
+  failed_when: false
+  when: item.should_run | bool
+  loop_control:
+    label: "{{ item.name }}"
+  become: true
+
+- name: Observe committed services across the restart interval
+  ansible.builtin.pause:
+    seconds: 6
+  when:
+    - billet_finalization_services[0].should_run | bool or billet_finalization_services[1].should_run | bool
+
+- name: Inspect committed service stability after the restart interval
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - show
+      - --property=LoadState
+      - --property=ActiveState
+      - --property=SubState
+      - --property=MainPID
+      - --property=ControlPID
+      - --property=Result
+      - --property=NRestarts
+      - --property=ActiveEnterTimestampMonotonic
+      - --property=ExecMainStartTimestampMonotonic
+      - "{{ item.name }}"
+  loop: "{{ billet_finalization_services }}"
+  register: billet_finalization_service_state
+  changed_when: false
+  failed_when: false
+  when: item.should_run | bool
+  loop_control:
+    label: "{{ item.name }}"
+  become: true
+
+- name: Prove committed services are stably active
+  ansible.builtin.assert:
+    that:
+      - item.0.rc == 0
+      - item.1.rc == 0
+      - item.0.stdout == item.1.stdout
+      - "'LoadState=loaded' in item.1.stdout"
+      - "'ActiveState=active' in item.1.stdout"
+      - "'SubState=running' in item.1.stdout"
+      - "'MainPID=0' not in item.1.stdout"
+      - "'ControlPID=0' in item.1.stdout"
+      - "'Result=success' in item.1.stdout"
+    fail_msg: >-
+      {{ item.1.item.name }} did not remain unchanged, active and running after
+      the durable {{ billet_finalization_commit }} decision. Leave the active
+      claim in place so the next converge retries committed finalization without
+      rolling back ledger state.
+  loop: "{{ billet_finalization_service_baseline.results | zip(billet_finalization_service_state.results) | list }}"
+  loop_control:
+    label: "{{ item.1.item.name }}"
+  when: not (item.1.skipped | default(false))
+
+- name: Close the durable host-upgrade transaction after stable service startup
   ansible.builtin.file:
     path: /var/lib/billet/upgrades/active
     state: absent

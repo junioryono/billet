@@ -137,21 +137,76 @@ func TestVerifiedImageResultFailureDoesNotWithdrawFleetPublication(t *testing.T)
 func TestEveryDistinctConfiguredFirecrackerImageIsChecked(t *testing.T) {
 	t.Parallel()
 
-	cfg := &config.Config{Tiers: []config.Tier{
-		{Provider: config.ProviderFirecracker, Image: "ubuntu-2404-x64@verified"},
-		{Providers: []config.ProviderKind{config.ProviderFirecracker, config.ProviderEC2},
-			Launch: map[config.ProviderKind]config.TierLaunch{
-				config.ProviderFirecracker: {Image: "ubuntu-2404-arm64@verified"},
-				config.ProviderEC2:         {Image: "ami-123"},
-			}},
-		{Provider: config.ProviderFirecracker, Image: "ubuntu-2404-x64@verified"},
-		{Provider: config.ProviderDocker, Image: "golang:1.25"},
-	}}
+	cfg := &config.Config{
+		Node: &config.NodeConfig{
+			Name:     "epyc-1",
+			Provider: config.ProviderFirecracker,
+			Site:     "home",
+		},
+		Tiers: []config.Tier{
+			{Provider: config.ProviderFirecracker, Image: "ubuntu-2404-x64@verified"},
+			{Providers: []config.ProviderKind{config.ProviderFirecracker, config.ProviderEC2},
+				Launch: map[config.ProviderKind]config.TierLaunch{
+					config.ProviderFirecracker: {Image: "ubuntu-2404-arm64@verified"},
+					config.ProviderEC2:         {Image: "ami-123"},
+				}},
+			{Provider: config.ProviderFirecracker, Image: "ubuntu-2404-x64@verified"},
+			{Provider: config.ProviderDocker, Image: "golang:1.25"},
+		}}
 
 	want := []string{"ubuntu-2404-x64@verified", "ubuntu-2404-arm64@verified"}
 	got := firecrackerTierImages(cfg)
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("configured firecracker images = %v, want %v", got, want)
+	}
+}
+
+func TestCompatibilityChecksOnlyImagesThisNodeCanRun(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{
+		Node: &config.NodeConfig{
+			Name:     "epyc-1",
+			Provider: config.ProviderFirecracker,
+			Site:     "home",
+		},
+		Tiers: []config.Tier{
+			{Provider: config.ProviderFirecracker, Image: "shared@verified"},
+			{Provider: config.ProviderFirecracker, Image: "this-node@verified", Node: "epyc-1"},
+			{Provider: config.ProviderFirecracker, Image: "other-node@verified", Node: "epyc-2"},
+			{Provider: config.ProviderFirecracker, Image: "this-site@verified", Site: "home"},
+			{Provider: config.ProviderFirecracker, Image: "other-site@verified", Site: "cloud"},
+		},
+	}
+
+	want := []string{"shared@verified", "this-node@verified", "this-site@verified"}
+	got := firecrackerTierImages(cfg)
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("eligible firecracker images = %v, want %v", got, want)
+	}
+}
+
+func TestCompatibilityChecksNoImagesForANonFirecrackerNode(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{
+		Node: &config.NodeConfig{
+			Name:     "cloud-1",
+			Provider: config.ProviderEC2,
+			Site:     "cloud",
+		},
+		Tiers: []config.Tier{
+			{Provider: config.ProviderFirecracker, Image: "other-host@verified", Site: "home"},
+			{Providers: []config.ProviderKind{config.ProviderFirecracker, config.ProviderEC2},
+				Launch: map[config.ProviderKind]config.TierLaunch{
+					config.ProviderFirecracker: {Image: "fallback@verified"},
+					config.ProviderEC2:         {Image: "ami-123"},
+				}},
+		},
+	}
+
+	if got := firecrackerTierImages(cfg); len(got) != 0 {
+		t.Fatalf("non-firecracker node images = %v, want none", got)
 	}
 }
 

@@ -176,6 +176,23 @@ func TestMaintenanceOwnerCanValidateAndMigrateTheFencedLedger(t *testing.T) {
 	}
 }
 
+func TestQuiescentUpgradeProbeCanOpenTheFencedLedgerExplicitly(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, maintenanceFile), []byte("host upgrade\n"), 0o600); err != nil {
+		t.Fatalf("create maintenance fence: %v", err)
+	}
+
+	db, err := OpenMaintenance(t.Context(), dir)
+	if err != nil {
+		t.Fatalf("open quiescent maintenance probe: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	if got, want := schemaVersion(t, db), latestVersion(t); got != want {
+		t.Fatalf("schema version = %d, want %d", got, want)
+	}
+}
+
 // A NEWER CLI MUST NOT MIGRATE THE RUNNING SERVER'S DATABASE UNDERNEATH IT.
 //
 // Open runs migrations, so an operator running a newer binary's `billet nodes
