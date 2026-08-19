@@ -1570,6 +1570,21 @@ func TestCacheConformanceReusableWorkflowUsesItsOwnRevision(t *testing.T) {
 	if strings.Contains(workflow, "scripts/cache-conformance-fixtures.sh") {
 		t.Fatal("reusable workflow still depends on a fixture script from the caller checkout")
 	}
+	for _, required := range []string{
+		"steps.poison-node.outcome }}' = failure",
+		"steps.poison-actions.outputs.cache-hit }}' != true",
+		"steps.poison-node.outputs.cache-hit }}' != true",
+		"steps.poison-tls.outputs.cache-hit }}' != true",
+		"steps.poison-proxy.outputs.cache-hit }}' != true",
+		"steps.poison-process.outputs.cache-hit }}' != true",
+	} {
+		if !strings.Contains(workflow, required) {
+			t.Fatalf("poison conformance is missing non-vacuity proof %q", required)
+		}
+	}
+	if strings.Count(workflow, "lookup-only: true") != 5 {
+		t.Fatal("every poisoned cache key must be checked for a miss from the next VM")
+	}
 	for _, jobs := range [][2]string{
 		{"save-embedded-current", "restore-embedded-current"},
 		{"restore-embedded-current", "save-embedded-pinned"},

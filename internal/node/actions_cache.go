@@ -331,6 +331,30 @@ type actionsFinalizeRequest struct {
 	SizeBytes json.RawMessage `json:"size_bytes"`
 }
 
+func (s *CacheService) actionsFinalizeReserved(
+	ctx context.Context,
+	body []byte,
+	session *cacheSession,
+) (bool, error) {
+	var request actionsFinalizeRequest
+	if err := decodeActionsRequest(bytes.NewReader(body), &request); err != nil ||
+		!validActionsCacheField(request.Key) || !validActionsCacheField(request.Version) {
+		return false, nil
+	}
+	if err := lockCacheSession(ctx, session); err != nil {
+		return false, err
+	}
+	defer session.mu.Unlock()
+	for _, archive := range session.actions {
+		if archive.Mode == actionsModeUpload && archive.CacheKey == request.Key &&
+			archive.Version == request.Version {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
 func parseActionsSize(raw json.RawMessage) (int64, error) {
 	var encoded string
 	if len(raw) > 0 && raw[0] == '"' {
@@ -394,6 +418,9 @@ func (s *CacheService) finalizeActionsCache(
 	}
 	if err := os.RemoveAll(filepath.Join(s.actionsMountPath(session, archive), "blocks")); err != nil {
 		return nil, fmt.Errorf("remove staged Actions cache blocks: %w", err)
+	}
+	if err := s.actionIO.Trim(ctx, s.actionsMountPath(session, archive)); err != nil {
+		return nil, fmt.Errorf("trim freed Actions cache blocks: %w", err)
 	}
 	lease, fence, err := s.store.AcquireWriter(ctx, archive.StoreKey,
 		session.instance+"/actions/"+archive.ID, cacheWriterTTL)
@@ -623,15 +650,31 @@ func writeActionsFile(ctx context.Context, path string, body io.Reader, limit in
 	temporaryPath := temporary.Name()
 	defer os.Remove(temporaryPath)
 	written, copyErr := copyActionsData(ctx, temporary, body, limit)
-	workErr := errors.Join(copyErr, temporary.Sync(), temporary.Close())
+	if copyErr == nil && written > limit {
+		copyErr = errors.New("actions cache archive exceeds the site limit")
+	}
+	workErr := finishActionsFile(ctx, temporary, copyErr)
 	if workErr != nil {
 		return workErr
 	}
-	if written > limit {
-		return errors.New("actions cache archive exceeds the site limit")
-	}
 
 	return os.Rename(temporaryPath, path)
+}
+
+type actionsUploadFile interface {
+	Sync() error
+	Close() error
+}
+
+func finishActionsFile(ctx context.Context, file actionsUploadFile, copyErr error) error {
+	if copyErr != nil {
+		return errors.Join(copyErr, file.Close())
+	}
+	if err := ctx.Err(); err != nil {
+		return errors.Join(err, file.Close())
+	}
+
+	return errors.Join(file.Sync(), file.Close())
 }
 
 func copyActionsData(

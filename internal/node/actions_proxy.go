@@ -108,7 +108,10 @@ func (s *CacheService) actionsProxy() *actionsProxy {
 	return s.actions
 }
 
-func (s *CacheService) authenticateProxy(r *http.Request) (*cacheSession, bool) {
+func (s *CacheService) authenticateProxy(
+	ctx context.Context,
+	r *http.Request,
+) (*cacheSession, bool) {
 	value := r.Header.Get("Proxy-Authorization")
 	scheme, encoded, ok := strings.Cut(value, " ")
 	if !ok || !strings.EqualFold(scheme, "basic") {
@@ -129,7 +132,9 @@ func (s *CacheService) authenticateProxy(r *http.Request) (*cacheSession, bool) 
 	if session == nil {
 		return nil, false
 	}
-	session.mu.Lock()
+	if err := lockCacheSession(ctx, session); err != nil {
+		return nil, false
+	}
 	allowed := session.intercept && !session.closed
 	session.mu.Unlock()
 
@@ -137,7 +142,7 @@ func (s *CacheService) authenticateProxy(r *http.Request) (*cacheSession, bool) 
 }
 
 func (p *actionsProxy) serveConnect(w http.ResponseWriter, r *http.Request) {
-	session, ok := p.service.authenticateProxy(r)
+	session, ok := p.service.authenticateProxy(r.Context(), r)
 	if !ok {
 		w.Header().Set("Proxy-Authenticate", `Basic realm="billet"`)
 		http.Error(w, "proxy authentication required", http.StatusProxyAuthRequired)
@@ -283,6 +288,14 @@ func (p *actionsProxy) roundTrip(req *http.Request, session *cacheSession) (*htt
 		}
 		req.Body = io.NopCloser(bytes.NewReader(replay))
 	}
+	reservationBound := strings.HasPrefix(req.URL.Path, actionsBlobPrefix)
+	if req.URL.Path == actionsFinalizePath && replay != nil {
+		var err error
+		reservationBound, err = p.service.actionsFinalizeReserved(req.Context(), replay, session)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if response, handled, err := p.service.actionsResponse(req, session); handled && err == nil {
 		response.Request = req
 
@@ -290,12 +303,17 @@ func (p *actionsProxy) roundTrip(req *http.Request, session *cacheSession) (*htt
 	} else if handled && err != nil {
 		p.service.log.Warn("Actions cache interception failed; retrying through GitHub",
 			"instance", session.instance, "path", req.URL.Path, "error", err)
-		if strings.HasPrefix(req.URL.Path, actionsBlobPrefix) {
+		if reservationBound {
 			return actionsBlobError(http.StatusBadGateway, "Actions cache storage is unavailable"), nil
 		}
 		if replay != nil {
 			req.Body = io.NopCloser(bytes.NewReader(replay))
 		}
+	} else if reservationBound {
+		p.service.log.Warn("a reserved Actions cache request cannot be passed to GitHub",
+			"instance", session.instance, "path", req.URL.Path)
+
+		return actionsBlobError(http.StatusBadGateway, "Actions cache reservation is unavailable"), nil
 	}
 
 	request := req.Clone(req.Context())

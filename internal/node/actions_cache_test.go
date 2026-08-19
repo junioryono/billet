@@ -23,6 +23,25 @@ import (
 type fakeActionsVolumeManager struct {
 	published []byte
 	mountNew  func() error
+	trimmed   int
+	trimErr   error
+}
+
+type syncCloseRecorder struct {
+	syncs  int
+	closes int
+}
+
+func (r *syncCloseRecorder) Sync() error {
+	r.syncs++
+
+	return nil
+}
+
+func (r *syncCloseRecorder) Close() error {
+	r.closes++
+
+	return nil
 }
 
 type actionsPolicyFunc func(context.Context, string, string) (bool, error)
@@ -74,6 +93,12 @@ func (f *fakeActionsVolumeManager) Unmount(_ context.Context, target string) err
 	}
 
 	return nil
+}
+
+func (f *fakeActionsVolumeManager) Trim(context.Context, string) error {
+	f.trimmed++
+
+	return f.trimErr
 }
 
 func testActionsService(
@@ -184,9 +209,10 @@ func TestActionsCacheRoundTripPublishesAndServesRanges(t *testing.T) {
 	}
 	finalized := responseJSON(t, response)
 	if finalized["ok"] != true || storage.snapshots != 1 || storage.published != 1 ||
+		volumes.trimmed != 1 ||
 		string(volumes.published) != "archive-body" {
-		t.Fatalf("finalization=%v snapshots=%d published=%d archive=%q",
-			finalized, storage.snapshots, storage.published, volumes.published)
+		t.Fatalf("finalization=%v snapshots=%d published=%d trims=%d archive=%q",
+			finalized, storage.snapshots, storage.published, volumes.trimmed, volumes.published)
 	}
 	entryIDText, ok := finalized["entry_id"].(string)
 	entryID, parseErr := strconv.ParseInt(entryIDText, 10, 64)
@@ -322,6 +348,17 @@ func TestActionsCopyStopsAfterItsContextIsCanceled(t *testing.T) {
 	_, err := copyActionsData(ctx, io.Discard, reader, actionsArchiveLimit)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("copy error = %v; want context cancellation", err)
+	}
+}
+
+func TestCanceledActionsUploadClosesWithoutSyncing(t *testing.T) {
+	t.Parallel()
+
+	file := &syncCloseRecorder{}
+	err := finishActionsFile(t.Context(), file, context.Canceled)
+	if !errors.Is(err, context.Canceled) || file.syncs != 0 || file.closes != 1 {
+		t.Fatalf("finish error=%v syncs=%d closes=%d; want canceled, 0, 1",
+			err, file.syncs, file.closes)
 	}
 }
 
@@ -535,15 +572,24 @@ func TestActionsCacheKillSwitchAppliesToAnAlreadyIssuedUploadURL(t *testing.T) {
 	service.SetActionsPolicy(actionsPolicyFunc(func(context.Context, string, string) (bool, error) {
 		return false, nil
 	}))
+	upstreamRequests := 0
+	service.actions.upstream = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		upstreamRequests++
+
+		return &http.Response{
+			StatusCode: http.StatusOK, Header: make(http.Header), Body: http.NoBody, Request: r,
+		}, nil
+	})
 	upload := actionsRequestForTest(t, http.MethodPut, uploadURL, "must-not-be-local")
 	upload.Header.Set("X-Ms-Blob-Type", "BlockBlob")
-	response, handled, err := service.actionsResponse(upload, session)
-	if response != nil {
-		response.Body.Close()
+	response, err = service.actions.roundTrip(upload, session)
+	if err != nil {
+		t.Fatalf("disabled upload: %v", err)
 	}
-	if response != nil || handled || err != nil {
-		t.Fatalf("disabled upload response=%v handled=%t error=%v; want upstream passthrough",
-			response, handled, err)
+	response.Body.Close()
+	if response.StatusCode != http.StatusBadGateway || upstreamRequests != 0 {
+		t.Fatalf("disabled reserved upload status=%d upstream=%d; want local failure",
+			response.StatusCode, upstreamRequests)
 	}
 	session.mu.Lock()
 	defer session.mu.Unlock()
@@ -551,6 +597,51 @@ func TestActionsCacheKillSwitchAppliesToAnAlreadyIssuedUploadURL(t *testing.T) {
 		if _, err := os.Stat(service.actionsArchivePath(session, archive)); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("disabled upload wrote a local archive: %v", err)
 		}
+	}
+}
+
+func TestActionsFinalizeFailureNeverFallsThroughToGitHub(t *testing.T) {
+	t.Parallel()
+
+	service, _, session, volumes := testActionsService(t)
+	create := actionsRequestForTest(t, http.MethodPost,
+		"https://"+actionsResultsHost+actionsCreatePath, `{"key":"finalize-local","version":"v1"}`)
+	response, _, err := service.actionsResponse(create, session)
+	if err != nil {
+		t.Fatalf("CreateCacheEntry: %v", err)
+	}
+	created := responseJSON(t, response)
+	uploadURL, ok := created["signed_upload_url"].(string)
+	if !ok || uploadURL == "" {
+		t.Fatalf("CreateCacheEntry response = %v", created)
+	}
+	upload := actionsRequestForTest(t, http.MethodPut, uploadURL, "archive-body")
+	upload.Header.Set("X-Ms-Blob-Type", "BlockBlob")
+	response, _, err = service.actionsResponse(upload, session)
+	if err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	response.Body.Close()
+	volumes.trimErr = errors.New("trim failed")
+	upstreamRequests := 0
+	service.actions.upstream = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		upstreamRequests++
+
+		return &http.Response{
+			StatusCode: http.StatusOK, Header: make(http.Header), Body: http.NoBody, Request: r,
+		}, nil
+	})
+	finalize := actionsRequestForTest(t, http.MethodPost,
+		"https://"+actionsResultsHost+actionsFinalizePath,
+		`{"key":"finalize-local","version":"v1","size_bytes":"12"}`)
+	response, err = service.actions.roundTrip(finalize, session)
+	if err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusBadGateway || upstreamRequests != 0 || volumes.trimmed != 1 {
+		t.Fatalf("failed finalization status=%d upstream=%d trims=%d; want local failure",
+			response.StatusCode, upstreamRequests, volumes.trimmed)
 	}
 }
 

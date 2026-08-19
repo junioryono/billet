@@ -200,6 +200,23 @@ func TestActionsProxyBoundsOnlyTheRequestHeaders(t *testing.T) {
 	}
 }
 
+func TestActionsProxyAuthenticationStopsWhenTheSessionIsBusyAndContextEnds(t *testing.T) {
+	t.Parallel()
+
+	service, _, session, _ := testActionsService(t)
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	request := httptest.NewRequestWithContext(t.Context(), http.MethodConnect,
+		"http://"+actionsResultsHost+":443", http.NoBody)
+	request.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString(
+		[]byte(actionsProxyUser+":"+session.token)))
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, ok := service.authenticateProxy(ctx, request); ok {
+		t.Fatal("canceled proxy authentication waited through a busy cache session")
+	}
+}
+
 func TestActionsProxyPassesBuildKitMetadataUpstreamWithoutConsumingIt(t *testing.T) {
 	t.Parallel()
 

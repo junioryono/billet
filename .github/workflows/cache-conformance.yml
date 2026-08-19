@@ -492,9 +492,13 @@ jobs:
           printf '%s\n' 'recovered' > conformance/recovered-cache/payload
       - name: Create a clean artifact payload
         run: |
-          mkdir -p conformance/artifact
+          mkdir -p conformance/artifact conformance/poison-actions conformance/poison-node conformance/poison-tls conformance/poison-proxy conformance/poison-process
           printf '%s\n' 'billet-${{ github.run_id }}-${{ github.run_attempt }}-poison' > conformance/artifact/payload
+          for path in conformance/poison-actions conformance/poison-node conformance/poison-tls conformance/poison-proxy conformance/poison-process; do
+            printf '%s\n' "$path" > "$path/payload"
+          done
       - name: Poison Actions service variables
+        id: poison-actions
         continue-on-error: true
         uses: actions/cache@v5
         env:
@@ -505,6 +509,7 @@ jobs:
           path: conformance/poison-actions
           key: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-poison-actions
       - name: Poison the embedded Node process
+        id: poison-node
         continue-on-error: true
         uses: actions/cache@v5
         env:
@@ -513,6 +518,7 @@ jobs:
           path: conformance/poison-node
           key: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-poison-node
       - name: Poison CA and TLS overrides
+        id: poison-tls
         continue-on-error: true
         uses: actions/cache@v5
         env:
@@ -523,16 +529,18 @@ jobs:
           path: conformance/poison-tls
           key: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-poison-tls
       - name: Poison proxy variables
+        id: poison-proxy
         continue-on-error: true
         uses: actions/cache@v5
         env:
           http_proxy: http://127.0.0.1:1
           https_proxy: http://127.0.0.1:1
-          no_proxy: "*"
+          no_proxy: ""
         with:
           path: conformance/poison-proxy
           key: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-poison-proxy
       - name: Poison loader, tar and path variables
+        id: poison-process
         continue-on-error: true
         uses: actions/cache@v5
         env:
@@ -542,6 +550,9 @@ jobs:
         with:
           path: conformance/poison-process
           key: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-poison-process
+      - name: Require the poisoned Node process to fail before it can cache
+        if: always()
+        run: test '${{ steps.poison-node.outcome }}' = failure
       - name: Prove clean artifact metadata still passes through
         uses: actions/upload-artifact@v7
         with:
@@ -554,6 +565,48 @@ jobs:
     runs-on: [self-hosted, "${{ inputs.runner_label }}"]
     timeout-minutes: 30
     steps:
+      - name: Prove poisoned Actions variables published no cache
+        id: poison-actions
+        uses: actions/cache@v5
+        with:
+          path: conformance/poison-actions
+          key: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-poison-actions
+          lookup-only: true
+      - name: Prove the poisoned Node process published no cache
+        id: poison-node
+        uses: actions/cache@v5
+        with:
+          path: conformance/poison-node
+          key: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-poison-node
+          lookup-only: true
+      - name: Prove poisoned CA and TLS variables published no cache
+        id: poison-tls
+        uses: actions/cache@v5
+        with:
+          path: conformance/poison-tls
+          key: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-poison-tls
+          lookup-only: true
+      - name: Prove poisoned proxy variables published no cache
+        id: poison-proxy
+        uses: actions/cache@v5
+        with:
+          path: conformance/poison-proxy
+          key: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-poison-proxy
+          lookup-only: true
+      - name: Prove poisoned process variables published no cache
+        id: poison-process
+        uses: actions/cache@v5
+        with:
+          path: conformance/poison-process
+          key: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-poison-process
+          lookup-only: true
+      - name: Require every poisoned cache operation to remain a miss
+        run: |
+          test '${{ steps.poison-actions.outputs.cache-hit }}' != true
+          test '${{ steps.poison-node.outputs.cache-hit }}' != true
+          test '${{ steps.poison-tls.outputs.cache-hit }}' != true
+          test '${{ steps.poison-proxy.outputs.cache-hit }}' != true
+          test '${{ steps.poison-process.outputs.cache-hit }}' != true
       - name: Restore the cache saved after the proxy faults
         id: recovered-cache
         uses: actions/cache@v5

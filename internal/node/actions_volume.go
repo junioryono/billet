@@ -11,6 +11,7 @@ import (
 type actionsVolumeManager interface {
 	MountNew(context.Context, string, string) error
 	MountReadOnly(context.Context, string, string) error
+	Trim(context.Context, string) error
 	Unmount(context.Context, string) error
 }
 
@@ -30,6 +31,18 @@ func (hostActionsVolumeManager) MountNew(ctx context.Context, device, target str
 
 func (hostActionsVolumeManager) MountReadOnly(ctx context.Context, device, target string) error {
 	return mountActionsVolume(ctx, device, target, "ro,noload,nodev,nosuid,noexec")
+}
+
+func (hostActionsVolumeManager) Trim(ctx context.Context, target string) error {
+	fstrim, err := exec.LookPath("fstrim")
+	if err != nil {
+		return fmt.Errorf("node: fstrim is required for staged Actions cache archives: %w", err)
+	}
+	if output, err := exec.CommandContext(ctx, fstrim, "--", target).CombinedOutput(); err != nil {
+		return fmt.Errorf("node: trim staged Actions cache blocks: %w: %s", err, boundedOutput(output))
+	}
+
+	return nil
 }
 
 func mountActionsVolume(ctx context.Context, device, target, options string) error {
