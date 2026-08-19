@@ -4,14 +4,17 @@ Documentation=https://github.com/junioryono/billet
 After=network-online.target
 Wants=network-online.target
 
+{% set billet_notify_ready = billet_systemd_notify_ready | default(false) %}
 [Service]
-Type=exec
+Type={{ 'notify' if billet_notify_ready else 'exec' }}
+{% if billet_notify_ready %}
+NotifyAccess=main
+{% endif %}
 User={{ billet_service_user }}
 Group={{ billet_service_group }}
 UMask=0077
-ExecStart=/usr/bin/billet server --config /etc/billet/billet.yaml
-StateDirectory=billet/server
-StateDirectoryMode=0700
+ExecStart=/usr/bin/billet server --config /etc/billet/billet.yaml{{ ' --upgrade-probe' if billet_systemd_upgrade_probe | default(false) else '' }}
+TimeoutStartSec=120
 TimeoutStopSec=88200
 KillSignal=SIGTERM
 KillMode=mixed
@@ -32,6 +35,7 @@ SystemCallArchitectures=native
 SystemCallFilter=@system-service
 CapabilityBoundingSet=
 ReadOnlyPaths=/etc/billet
+ReadWritePaths="{{ billet_config.get('server', {}).get('state_dir', '/var/lib/billet/server') }}"
 
 [Install]
 WantedBy=multi-user.target

@@ -5,13 +5,16 @@ After=network-online.target billet-network.service
 Requires=billet-network.service
 Wants=network-online.target
 
+{% set billet_notify_ready = billet_systemd_notify_ready | default(false) %}
 [Service]
-Type=exec
+Type={{ 'notify' if billet_notify_ready else 'exec' }}
+{% if billet_notify_ready %}
+NotifyAccess=main
+{% endif %}
 User=root
 Group=root
-ExecStart=/usr/bin/billet node --config /etc/billet/billet.yaml
-StateDirectory=billet/node
-StateDirectoryMode=0700
+ExecStart=/usr/bin/billet node --config /etc/billet/billet.yaml{{ ' --upgrade-probe' if billet_systemd_upgrade_probe | default(false) else '' }}
+TimeoutStartSec=120
 RuntimeDirectory=billet/locks
 RuntimeDirectoryMode=0750
 TimeoutStopSec=88200
@@ -32,7 +35,7 @@ ReadOnlyPaths=/etc/billet
 # The node atomically replaces its own TLS bundle during renewal. ProtectSystem
 # keeps the rest of /etc read-only; only this rotating credential directory is
 # writable.
-ReadWritePaths=-/etc/billet/tls -/srv/jailer
+ReadWritePaths=-/etc/billet/tls -/srv/jailer "{{ billet_config.get('node', {}).get('state_dir', '/var/lib/billet/node') }}"
 
 [Install]
 WantedBy=multi-user.target

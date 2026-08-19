@@ -40,7 +40,7 @@ var ErrSchemaBehind = errors.New("state: the ledger needs migrating and another 
 // so whoever gets there first has to create the schema, and two commands racing
 // to create it must not both try.
 func OpenAdmin(ctx context.Context, stateDir string) (*DB, error) {
-	return openDir(ctx, stateDir, true)
+	return openDir(ctx, stateDir, true, false)
 }
 
 // verifySchema proves the ledger is already at the schema this binary expects,

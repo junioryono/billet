@@ -280,8 +280,13 @@ func cmdServer(ctx context.Context, lc *lifecycle, args []string) error {
 	cfgPath := addConfigFlag(fs)
 	dryRun := fs.Bool("dry-run", false,
 		"connect to GitHub and advertise ZERO capacity: proves the whole path without accepting a job")
+	upgradeProbe := fs.Bool("upgrade-probe", false,
+		"open candidate state without polling, dispatching, or accepting workload")
 	if err := parse(fs, args); err != nil {
 		return err
+	}
+	if *dryRun && *upgradeProbe {
+		return errors.New("billet server: --dry-run and --upgrade-probe are mutually exclusive")
 	}
 
 	cfg, err := config.Load(*cfgPath)
@@ -303,7 +308,7 @@ func cmdServer(ctx context.Context, lc *lifecycle, args []string) error {
 	//
 	// --dry-run remains for proving the GitHub path while advertising zero.
 
-	return runServer(ctx, lc, cfg, *dryRun)
+	return runServer(ctx, lc, cfg, *dryRun, *upgradeProbe)
 }
 
 // claimNodeDeployment reads this host's identity and takes the host-wide lock on
@@ -441,7 +446,12 @@ func nodeContribution(cfg *config.Config) (config.Contribution, error) {
 }
 
 // runServer starts the control plane and blocks until it is told to stop.
-func runServer(ctx context.Context, lc *lifecycle, cfg *config.Config, dryRun bool) error {
+func runServer(
+	ctx context.Context,
+	lc *lifecycle,
+	cfg *config.Config,
+	dryRun, upgradeProbe bool,
+) error {
 	// Built by the SHARED constructor, so the server and teardown authenticate
 	// identically. Two near-identical constructions is how one of them ends up
 	// pointed at a different organization than the other.
@@ -468,7 +478,12 @@ func runServer(ctx context.Context, lc *lifecycle, cfg *config.Config, dryRun bo
 		return err
 	}
 
-	db, err := state.Open(ctx, cfg.Server.StateDir)
+	var db *state.DB
+	if upgradeProbe {
+		db, err = state.OpenMaintenance(ctx, cfg.Server.StateDir)
+	} else {
+		db, err = state.Open(ctx, cfg.Server.StateDir)
+	}
 	if err != nil {
 		return fmt.Errorf("server state: %w", err)
 	}
@@ -482,6 +497,15 @@ func runServer(ctx context.Context, lc *lifecycle, cfg *config.Config, dryRun bo
 	}, cfg.Tiers, alloc.WithPlacement(cfg.Server.Placement))
 	if err != nil {
 		return fmt.Errorf("capacity allocator: %w", err)
+	}
+	if upgradeProbe {
+		if err := notifyReady(); err != nil {
+			return fmt.Errorf("server upgrade-probe readiness: %w", err)
+		}
+		fmt.Println("billet server: upgrade probe ready; workload polling and dispatch are disabled")
+		<-ctx.Done()
+
+		return nil
 	}
 
 	// Ctrl-C and SIGTERM stop the listeners through the context, which is what
@@ -574,6 +598,9 @@ func runServer(ctx context.Context, lc *lifecycle, cfg *config.Config, dryRun bo
 	opts = append(opts, server.WithNodeRunner(nodes.NewRunner()))
 
 	plane := server.New(allocator, wiring.Provisioner{Client: client}, cfg.Tiers, owner, slog.Default(), opts...)
+	if err := notifyReady(); err != nil {
+		return fmt.Errorf("server readiness: %w", err)
+	}
 	if err := plane.Run(ctx); err != nil {
 		return err
 	}
@@ -918,9 +945,14 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 		"the control plane's CA fingerprint, from `billet ca show` (required with --enroll)")
 	joinToken := fs.String("join-token", "",
 		"a short-lived token from `billet ca token` (required with --enroll)")
+	upgradeProbe := fs.Bool("upgrade-probe", false,
+		"initialize the candidate provider without dialing or accepting workload")
 
 	if err := parse(fs, args); err != nil {
 		return err
+	}
+	if *enroll && *upgradeProbe {
+		return errors.New("billet node: --enroll and --upgrade-probe are mutually exclusive")
 	}
 
 	cfg, err := config.Load(*cfgPath)
@@ -1022,6 +1054,16 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 	if err != nil {
 		return err
 	}
+	if *upgradeProbe {
+		if err := notifyReady(); err != nil {
+			return fmt.Errorf("node upgrade-probe readiness: %w", err)
+		}
+		fmt.Printf("billet node %s: upgrade probe ready; registration and workload polling are disabled\n",
+			cfg.Node.Name)
+		<-ctx.Done()
+
+		return nil
+	}
 
 	cacheService, stopCache, err := startNodeCache(ctx, cfg, p, deployment)
 	if err != nil {
@@ -1072,6 +1114,9 @@ func cmdNode(ctx context.Context, lc *lifecycle, args []string) error {
 
 	for _, w := range contribution.Warnings {
 		slog.Default().Warn(w, "node", cfg.Node.Name)
+	}
+	if err := notifyReady(); err != nil {
+		return fmt.Errorf("node readiness: %w", err)
 	}
 
 	return nodeclient.Run(ctx, client, runner, nodeclient.LoopOptions{
@@ -2323,7 +2368,7 @@ const deploymentForCheck = "billet-preflight"
 // than about microVMs.
 type noRootDisk struct{}
 
-func (noRootDisk) ResolveGeneration(_ context.Context, image string) (string, error) {
+func (noRootDisk) ResolveGeneration(_ context.Context, image, _ string) (string, error) {
 	return image, nil
 }
 

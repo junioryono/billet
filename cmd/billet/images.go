@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/provider"
+	"github.com/junioryono/billet/internal/provider/firecracker"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/store/ceph"
 )
@@ -33,12 +35,14 @@ import (
 // it is to give it something to say and a place to say it.
 func cmdImages(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: billet images <pull|verify|due|list|reap|promote|unpromote>")
+		return errors.New("usage: billet images <pull|compatible|verify|due|list|reap|promote|unpromote>")
 	}
 
 	switch args[0] {
 	case "pull":
 		return cmdImagesPull(ctx, args[1:])
+	case "compatible":
+		return cmdImagesCompatible(ctx, args[1:])
 	case "verify":
 		return cmdImagesVerify(ctx, args[1:])
 	case "due":
@@ -54,6 +58,219 @@ func cmdImages(ctx context.Context, args []string) error {
 	default:
 		return fmt.Errorf("billet images: unknown subcommand %q", args[0])
 	}
+}
+
+// cmdImagesCompatible proves that the selected generation speaks this binary's
+// guest contract without downloading another image when the answer is already on
+// the generation. A pre-metadata generation is boot-verified once and backfilled;
+// after that every ordinary host converge is a metadata read.
+func cmdImagesCompatible(ctx context.Context, args []string) error {
+	fs := newFlagSet("billet images compatible")
+	cfgPath := addConfigFlag(fs)
+	wait := fs.Duration("wait", 3*time.Minute, "how long to give an unrecorded guest to prove itself")
+	resultFile := fs.String("result-file", "",
+		"write the bare names of floating images that need replacement here")
+
+	rest, err := parseWithName(fs, args)
+	if err != nil {
+		return err
+	}
+	if *resultFile != "" {
+		if err := os.Remove(*resultFile); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("billet images compatible: cannot clear stale result file %s: %w",
+				*resultFile, err)
+		}
+	}
+
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		return err
+	}
+
+	if cfg.Node == nil || cfg.Node.Ceph == nil {
+		return errors.New("billet images compatible: this config names no ceph cluster")
+	}
+
+	images := []string{rest}
+	if rest == "" {
+		images, err = firecrackerTierImages(cfg)
+		if err != nil {
+			return err
+		}
+	}
+	if len(images) == 0 {
+		return errors.New("billet images compatible: no image given and no firecracker tier names one")
+	}
+
+	refresh := make([]string, 0, len(images))
+	for _, image := range images {
+		err := checkImageCompatible(ctx, cfg, *cfgPath, image, *wait)
+		if err == nil {
+			continue
+		}
+		if exitStatus(err) != 2 {
+			return err
+		}
+
+		name, _, _ := strings.Cut(image, "@")
+		refresh = append(refresh, name)
+		fmt.Println(err)
+	}
+
+	if len(refresh) == 0 {
+		return nil
+	}
+	if *resultFile != "" {
+		if err := writeImageResults(*resultFile, refresh); err != nil {
+			return err
+		}
+	}
+
+	return &exitError{code: 2, msg: fmt.Sprintf("%d configured guest image(s) need a compatible generation", len(refresh))}
+}
+
+func checkImageCompatible(
+	ctx context.Context,
+	cfg *config.Config,
+	cfgPath, image string,
+	wait time.Duration,
+) error {
+	name, generation, found := strings.Cut(image, "@")
+	if !found || name == "" || generation == "" {
+		return fmt.Errorf("billet images compatible: %q does not name an exact generation or @%s",
+			image, ceph.Verified)
+	}
+
+	store, err := ceph.New(*cfg.Node.Ceph)
+	if err != nil {
+		return err
+	}
+
+	floating := generation == ceph.Verified
+	var verified bool
+	if floating {
+		newest, ok, err := store.NewestVerifiedForContract(ctx, name, firecracker.GuestContract)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			newest, ok, err = store.NewestForContract(ctx, name, firecracker.GuestContract)
+			if err != nil {
+				return err
+			}
+			if ok {
+				generation = newest.Name
+			} else {
+				// A GENERATION VERIFIED BEFORE CONTRACT METADATA EXISTED GETS ONE REAL
+				// compatibility boot instead of forcing a multi-gigabyte replacement.
+				newest, ok, err = store.NewestVerified(ctx, name)
+				if err != nil {
+					return err
+				}
+				if !ok {
+					return incompatibleGuest(image, "no generation has passed verification")
+				}
+
+				generation = newest.Name
+				verified = true
+			}
+		} else {
+			generation = newest.Name
+			verified = true
+		}
+	} else {
+		generations, err := store.Generations(ctx, name)
+		if err != nil {
+			return err
+		}
+
+		present := false
+		for _, candidate := range generations {
+			if candidate.Name == generation {
+				present = true
+
+				break
+			}
+		}
+		if !present {
+			return fmt.Errorf("billet images compatible: pinned generation %s@%s no longer exists; update the exact pin before upgrading",
+				name, generation)
+		}
+
+		verifiedGenerations, err := store.VerifiedGenerations(ctx, name)
+		if err != nil {
+			return err
+		}
+
+		verified = verifiedGenerations[generation]
+	}
+
+	contract, recorded, err := store.GuestContract(ctx, name, generation)
+	if err != nil {
+		return err
+	}
+
+	exact := name + "@" + generation
+	needsBoot, err := guestNeedsCompatibilityBoot(exact, contract, recorded, verified, floating)
+	if err != nil {
+		return err
+	}
+	if !needsBoot {
+		fmt.Printf("%s speaks guest contract %s; no image download is needed\n",
+			exact, firecracker.GuestContract)
+
+		return nil
+	}
+
+	// A GENERATION FROM BEFORE CONTRACT METADATA IS NOT ASSUMED INCOMPATIBLE. A
+	// real boot is cheaper than a multi-gigabyte replacement and produces the fact
+	// future upgrades can read without booting again.
+	if err := cmdImagesVerify(ctx, []string{
+		"--config", cfgPath,
+		"--wait", wait.String(),
+		exact,
+	}); err != nil {
+		return compatibilityBootFailure(exact, floating, err)
+	}
+
+	fmt.Printf("%s passed a compatibility boot and now records guest contract %s\n",
+		exact, firecracker.GuestContract)
+
+	return nil
+}
+
+func compatibilityBootFailure(image string, floating bool, err error) error {
+	if !floating {
+		return fmt.Errorf("%s is an exact pin with no recorded guest contract and did not pass a compatibility boot; update the exact generation pin before upgrading: %w",
+			image, err)
+	}
+
+	return incompatibleGuest(image,
+		fmt.Sprintf("it has no recorded guest contract and did not pass a compatibility boot: %v", err))
+}
+
+func guestNeedsCompatibilityBoot(
+	image, contract string,
+	recorded, verified, floating bool,
+) (bool, error) {
+	if recorded && contract != firecracker.GuestContract {
+		if !floating {
+			return false, fmt.Errorf("%s is pinned to guest contract %s, while this binary requires %s; update the exact generation pin before upgrading",
+				image, contract, firecracker.GuestContract)
+		}
+
+		return false, incompatibleGuest(image, fmt.Sprintf("it speaks guest contract %s, while this binary requires %s",
+			contract, firecracker.GuestContract))
+	}
+
+	// A SIGNED MANIFEST SAYS WHAT THE GUEST WAS BUILT TO SPEAK, not that this
+	// exact imported generation ever booted on the host. Both facts are required
+	// before an upgrade can skip the compatibility boot.
+	return !recorded || !verified, nil
+}
+
+func incompatibleGuest(image, reason string) error {
+	return &exitError{code: 2, msg: fmt.Sprintf("%s is not compatible: %s", image, reason)}
 }
 
 // cmdImagesDue reports whether the golden image is old enough to rebuild.
@@ -101,7 +318,10 @@ func cmdImagesDue(ctx context.Context, args []string) error {
 
 	image := rest
 	if image == "" {
-		image = firecrackerTierImage(cfg)
+		image, err = firecrackerTierImage(cfg)
+		if err != nil {
+			return err
+		}
 	}
 
 	if image == "" {
@@ -142,15 +362,48 @@ func cmdImagesDue(ctx context.Context, args []string) error {
 // failure, which is why it carries a status of its own.
 var errNothingToBuild = &exitError{code: 2, msg: "a recent generation already exists"}
 
-// firecrackerTierImage is the image this deployment's microVM tiers boot.
-func firecrackerTierImage(cfg *config.Config) string {
+// firecrackerTierImage is the first image this deployment's microVM tiers boot.
+func firecrackerTierImage(cfg *config.Config) (string, error) {
+	images, err := firecrackerTierImages(cfg)
+	if err != nil {
+		return "", err
+	}
+	if len(images) > 0 {
+		return images[0], nil
+	}
+
+	return "", nil
+}
+
+// firecrackerTierImages are the distinct images this deployment's microVM tiers boot.
+func firecrackerTierImages(cfg *config.Config) ([]string, error) {
+	if cfg.Node == nil || cfg.Node.Provider != config.ProviderFirecracker {
+		return nil, nil
+	}
+
+	if _, err := nodeBundle(cfg); err != nil {
+		return nil, fmt.Errorf("select firecracker tier images: resolve node identity: %w", err)
+	}
+
+	images := make([]string, 0, len(cfg.Tiers))
+	seen := map[string]bool{}
+
 	for i := range cfg.Tiers {
+		if cfg.Tiers[i].Node != "" && cfg.Tiers[i].Node != cfg.Node.Name {
+			continue
+		}
+		if cfg.Tiers[i].Site != "" && cfg.Tiers[i].Site != cfg.Node.Site {
+			continue
+		}
 		if image := cfg.Tiers[i].ImageFor(config.ProviderFirecracker); cfg.Tiers[i].AcceptsProvider(config.ProviderFirecracker) && image != "" {
-			return image
+			if !seen[image] {
+				images = append(images, image)
+				seen[image] = true
+			}
 		}
 	}
 
-	return ""
+	return images, nil
 }
 
 // cmdImagesVerify boots one microVM from an image and makes the guest prove it works.
@@ -169,7 +422,7 @@ func cmdImagesVerify(ctx context.Context, args []string) error {
 	}
 
 	if rest == "" {
-		return errors.New("usage: billet images <pull|verify|due|list|reap|promote|unpromote>")
+		return errors.New("usage: billet images <pull|compatible|verify|due|list|reap|promote|unpromote>")
 	}
 
 	// THE GENERATION IS REQUIRED, not defaulted, for the same reason the provider
@@ -312,6 +565,7 @@ func cmdImagesVerify(ctx context.Context, args []string) error {
 		// reap landing between them leaves a generation verified but unpaired --
 		// every node takes it up and each boots it against its own kernel.
 		if err := store.RecordVerification(ctx, imageName, generation, record,
+			firecracker.GuestContract,
 			existing != "", *allowUnpaired, time.Now()); err != nil {
 			return fmt.Errorf("%s booted and ran a container, but the result could not be "+
 				"recorded, so it has NOT been marked verified: %w", rest, err)
@@ -730,11 +984,10 @@ func verifyDeploymentID(cfg *config.Config) (string, error) {
 
 // cmdImagesPromote and cmdImagesUnpromote are the manual half of promotion.
 //
-// THE AUTOMATIC PATH IS `verify --record`, and this exists for the two moments it
-// cannot cover: adopting a generation that was verified before this recorded
-// anything, and taking one back. Rollback is the important one — it is what somebody
-// reaches for at the moment a bad image is in front of every job, so it is one
-// command against the cluster rather than an edit on every node.
+// THE AUTOMATIC PATH IS `verify --record`, and this exists for taking a verified
+// generation back or deliberately restoring one that already records this binary's
+// guest contract. Rollback is one command against the cluster rather than an edit on
+// every node.
 func cmdImagesPromote(ctx context.Context, args []string, verified bool) error {
 	name := "billet images promote"
 	if !verified {
@@ -768,7 +1021,7 @@ func cmdImagesPromote(ctx context.Context, args []string, verified bool) error {
 	}
 
 	if verified {
-		if err := store.MarkVerified(ctx, rest, time.Now()); err != nil {
+		if err := store.MarkVerified(ctx, rest, firecracker.GuestContract, time.Now()); err != nil {
 			return err
 		}
 
@@ -781,7 +1034,7 @@ func cmdImagesPromote(ctx context.Context, args []string, verified bool) error {
 		return err
 	}
 
-	newest, found, err := store.NewestVerified(ctx, rest)
+	newest, found, err := store.NewestVerifiedForContract(ctx, rest, firecracker.GuestContract)
 	if err != nil {
 		return err
 	}
@@ -815,7 +1068,8 @@ func cmdImagesPromote(ctx context.Context, args []string, verified bool) error {
 func cmdImagesReap(ctx context.Context, args []string) error {
 	fs := newFlagSet("billet images reap")
 	cfgPath := addConfigFlag(fs)
-	keep := fs.Int("keep", 3, "how many VERIFIED generations to leave, newest first")
+	keep := fs.Int("keep", 3,
+		"how many VERIFIED generations to leave per guest contract, newest first")
 	dryRun := fs.Bool("dry-run", false, "print what would be removed and remove nothing")
 	kernelDir := fs.String("kernel-dir", "",
 		"where pulled kernels are kept; orphans there are reaped too (default: node config)")
@@ -836,7 +1090,10 @@ func cmdImagesReap(ctx context.Context, args []string) error {
 
 	image := rest
 	if image == "" {
-		image = firecrackerTierImage(cfg)
+		image, err = firecrackerTierImage(cfg)
+		if err != nil {
+			return err
+		}
 	}
 
 	if image == "" {
@@ -858,6 +1115,11 @@ func cmdImagesReap(ctx context.Context, args []string) error {
 		return err
 	}
 
+	contracts, err := store.GenerationGuestContracts(ctx, image)
+	if err != nil {
+		return err
+	}
+
 	// EVERY TIER'S IMAGE, not just the one being reaped: a deployment can pin
 	// several, and a generation kept for one tier is kept.
 	pinned := make([]string, 0, len(cfg.Tiers))
@@ -867,7 +1129,8 @@ func cmdImagesReap(ctx context.Context, args []string) error {
 		}
 	}
 
-	plan := ceph.PlanReap(all, verified, ceph.Retention{Keep: *keep, Pinned: pinned})
+	retention := ceph.Retention{Keep: *keep, Pinned: pinned}
+	plan := ceph.PlanReap(all, verified, contracts, retention)
 
 	for _, item := range plan {
 		if item.Reason != "" {
@@ -891,7 +1154,7 @@ func cmdImagesReap(ctx context.Context, args []string) error {
 	case *dryRun:
 		fmt.Printf("\n%d generation(s) would be removed; this was a dry run\n", removing)
 	default:
-		removed, reapErr := store.Reap(ctx, image, plan)
+		removed, reapErr := store.Reap(ctx, image, plan, retention)
 
 		fmt.Printf("\nremoved %d generation(s)\n", len(removed))
 
@@ -1077,7 +1340,10 @@ func cmdImagesList(ctx context.Context, args []string) error {
 
 	image := rest
 	if image == "" {
-		image = firecrackerTierImage(cfg)
+		image, err = firecrackerTierImage(cfg)
+		if err != nil {
+			return err
+		}
 	}
 
 	if image == "" {
@@ -1101,7 +1367,7 @@ func cmdImagesList(ctx context.Context, args []string) error {
 		return err
 	}
 
-	current, hasCurrent, err := store.NewestVerified(ctx, image)
+	current, hasCurrent, err := store.NewestVerifiedForContract(ctx, image, firecracker.GuestContract)
 	if err != nil {
 		return err
 	}
@@ -1161,7 +1427,7 @@ func listTierImages(ctx context.Context, store *ceph.Client, cfg *config.Config)
 			shown = true
 		}
 
-		resolved, err := store.ResolveGeneration(ctx, image)
+		resolved, err := store.ResolveGeneration(ctx, image, firecracker.GuestContract)
 		if err != nil {
 			// NOT FATAL, and printed rather than returned: a tier that cannot resolve
 			// is exactly what somebody is running this command to find out about, and

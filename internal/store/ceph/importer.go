@@ -48,7 +48,7 @@ const MaxImageBytes = 1 << 40
 // could descend from.
 func (c *Client) ImportGeneration( //nolint:nonamedreturns // the deferred unmap reports through the return value; a local set inside a defer is read after the return value has already been computed, which is the dead-code bug this shape replaced
 	ctx context.Context,
-	image, rawPath, runnerVersion, kernel string,
+	image, rawPath, runnerVersion, kernel, guestContract string,
 	now time.Time,
 ) (generation string, err error) {
 	if err := checkCloneName(image); err != nil {
@@ -236,6 +236,18 @@ func (c *Client) ImportGeneration( //nolint:nonamedreturns // the deferred unmap
 		}
 
 		return "", fmt.Errorf("ceph: %s could not be published because its runner version could "+
+			"not be recorded; the snapshot has been withdrawn: %w", image, setErr)
+	}
+
+	if setErr := c.SetGuestContract(ctx, image, generation, guestContract); setErr != nil {
+		if _, rmErr := c.rbdCmd(ctx, false, "-p", c.cfg.ImagePool, "snap", "rm",
+			image+"@"+generation); rmErr != nil {
+			return "", fmt.Errorf("ceph: %s@%s was published, its guest contract could not be "+
+				"recorded (%w), and it could not be withdrawn (%w)",
+				image, generation, setErr, rmErr)
+		}
+
+		return "", fmt.Errorf("ceph: %s could not be published because its guest contract could "+
 			"not be recorded; the snapshot has been withdrawn: %w", image, setErr)
 	}
 

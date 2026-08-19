@@ -47,6 +47,13 @@ func TestALaunchRecordsTheGenerationRatherThanTheAlias(t *testing.T) {
 	if !strings.Contains(got, "g20260814145813") {
 		t.Errorf("the root disk was cloned from %q rather than the resolved generation", got)
 	}
+
+	h.disk.mu.Lock()
+	resolvedContract := h.disk.resolvedContract
+	h.disk.mu.Unlock()
+	if resolvedContract != GuestContract {
+		t.Errorf("the alias was resolved for guest contract %q, want %q", resolvedContract, GuestContract)
+	}
 }
 
 // AND A TIER THAT PINS A GENERATION GETS EXACTLY THAT, unresolved.
