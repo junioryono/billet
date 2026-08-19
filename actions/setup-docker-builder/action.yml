@@ -29,7 +29,7 @@ runs:
       shell: bash
       run: "${{ github.action_path }}/resolve-policy.sh"
     - name: Attach persistent BuildKit state
-      uses: junioryono/billet/actions/stickydisk@v0.3.3
+      uses: junioryono/billet/actions/stickydisk@v0.3.4
       with:
         key: ${{ github.repository }}-buildkit-${{ inputs.cache-key }}-${{ runner.arch }}
         path: ${{ runner.temp }}/billet-buildkit-state
@@ -44,7 +44,7 @@ runs:
         BILLET_BUILDKIT_RESET: ${{ inputs.reset }}
       run: "${{ github.action_path }}/start.sh"
     - name: Register BuildKit cleanup
-      uses: junioryono/billet/actions/stop-docker-builder@v0.3.3
+      uses: junioryono/billet/actions/stop-docker-builder@v0.3.4
       with:
         container: ${{ steps.start.outputs.container }}
         builder: ${{ steps.start.outputs.name }}
