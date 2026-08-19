@@ -453,6 +453,43 @@ func TestACloudWriterLeaseSurvivesALostConditionalWriteResponse(t *testing.T) {
 	}
 }
 
+func TestCloudCacheMatchUsesExactThenNewestWithinTheFirstRestorePrefix(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	s, _, objects := testStore(&now)
+	states := []keyState{
+		{Key: "scope/npm-linux-old", Pointer: "g-old", Generations: map[string]generationState{
+			"g-old": {Handle: "snap-old", PublishedAt: now.Add(-time.Hour)},
+		}},
+		{Key: "scope/npm-linux-new", Pointer: "g-new", Generations: map[string]generationState{
+			"g-new": {Handle: "snap-new", PublishedAt: now},
+		}},
+		{Key: "scope/npm-other", Pointer: "g-other", Generations: map[string]generationState{
+			"g-other": {Handle: "snap-other", PublishedAt: now.Add(time.Hour)},
+		}},
+	}
+	for _, state := range states {
+		body, err := json.Marshal(state)
+		if err != nil {
+			t.Fatalf("marshal state: %v", err)
+		}
+		if _, err := objects.Put(t.Context(), s.stateKey(state.Key), body, ""); err != nil {
+			t.Fatalf("put state: %v", err)
+		}
+	}
+
+	key, generation, err := s.Match(t.Context(), "scope/missing",
+		[]string{"scope/npm-linux-", "scope/npm-"})
+	if err != nil || key != "scope/npm-linux-new" || generation != "g-new" {
+		t.Fatalf("restore match = %q %q, %v", key, generation, err)
+	}
+	key, generation, err = s.Match(t.Context(), "scope/npm-linux-old", []string{"scope/npm-"})
+	if err != nil || key != "scope/npm-linux-old" || generation != "g-old" {
+		t.Fatalf("exact match = %q %q, %v", key, generation, err)
+	}
+}
+
 func (f *fakeBlocks) List() []string {
 	out := make([]string, 0, len(f.snapshots))
 	for id := range f.snapshots {

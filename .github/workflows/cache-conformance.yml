@@ -1,19 +1,77 @@
 name: Cache and artifact conformance
 
 on:
+  workflow_call:
+    inputs:
+      runner_label:
+        description: A billet runner label whose image and cache path are under test
+        required: true
+        type: string
+      expected_runner_version:
+        description: Exact Actions runner version expected in the candidate image
+        required: false
+        type: string
+      expected_guest_contract:
+        description: Exact Billet guest contract expected in the candidate image
+        required: false
+        type: string
   workflow_dispatch:
     inputs:
       runner_label:
         description: A billet runner label whose image and cache path are under test
         required: true
         type: string
+      expected_runner_version:
+        description: Exact Actions runner version expected in the candidate image
+        required: false
+        type: string
+      expected_guest_contract:
+        description: Exact Billet guest contract expected in the candidate image
+        required: false
+        type: string
 
 permissions:
   contents: read
 
 jobs:
-  save-host:
+  candidate-identity:
     runs-on: [self-hosted, "${{ inputs.runner_label }}"]
+    timeout-minutes: 30
+    steps:
+      - name: Refuse a non-billet runner or the wrong candidate image
+        env:
+          EXPECTED_RUNNER_VERSION: ${{ inputs.expected_runner_version }}
+          EXPECTED_GUEST_CONTRACT: ${{ inputs.expected_guest_contract }}
+        run: |
+          set -euo pipefail
+          test "${RUNNER_NAME#billet-}" != "$RUNNER_NAME"
+          if [ -n "$EXPECTED_RUNNER_VERSION" ]; then
+            test "$(sed -n 's/^RUNNER_VERSION=//p' /etc/billet-image)" = "$EXPECTED_RUNNER_VERSION"
+          fi
+          if [ -n "$EXPECTED_GUEST_CONTRACT" ]; then
+            test "$(sed -n 's/^WANT_CONTRACT=//p' /usr/local/bin/billet-agent | head -1)" = "$EXPECTED_GUEST_CONTRACT"
+          fi
+      - name: Prove this job is traversing Billet rather than GitHub's cache
+        run: |
+          set -euo pipefail
+          test -n "${ACTIONS_RESULTS_URL:-}"
+          test -n "${ACTIONS_RUNTIME_TOKEN:-}"
+          response_headers=$(mktemp)
+          trap 'rm -f "$response_headers"' EXIT
+          curl --silent --show-error --fail \
+            --dump-header "$response_headers" \
+            --output /dev/null \
+            --header "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
+            --header "Content-Type: application/json" \
+            --header "User-Agent: @actions/cache-conformance" \
+            --data '{"key":"billet-conformance-probe-${{ github.run_id }}-${{ github.run_attempt }}","restore_keys":[],"version":"billet-conformance-probe"}' \
+            "${ACTIONS_RESULTS_URL%/}/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL"
+          tr -d '\r' < "$response_headers" | grep -Fxi 'X-Billet-Actions-Cache: local'
+
+  save-host:
+    needs: candidate-identity
+    runs-on: [self-hosted, "${{ inputs.runner_label }}"]
+    timeout-minutes: 30
     steps:
       - name: Refuse a non-billet runner
         run: test "${RUNNER_NAME#billet-}" != "$RUNNER_NAME"
@@ -41,6 +99,7 @@ jobs:
   restore-host:
     needs: save-host
     runs-on: [self-hosted, "${{ inputs.runner_label }}"]
+    timeout-minutes: 30
     steps:
       - name: Refuse a non-billet runner
         run: test "${RUNNER_NAME#billet-}" != "$RUNNER_NAME"
@@ -65,7 +124,9 @@ jobs:
         run: cmp expected conformance/download/payload
 
   save-container:
+    needs: candidate-identity
     runs-on: [self-hosted, "${{ inputs.runner_label }}"]
+    timeout-minutes: 30
     container: node:24-bookworm
     steps:
       - name: Refuse a non-billet runner
@@ -94,6 +155,7 @@ jobs:
   restore-container:
     needs: save-container
     runs-on: [self-hosted, "${{ inputs.runner_label }}"]
+    timeout-minutes: 30
     container: node:24-bookworm
     steps:
       - name: Refuse a non-billet runner
@@ -117,3 +179,323 @@ jobs:
           path: conformance/download
       - name: Verify the downloaded artifact payload
         run: cmp expected conformance/download/payload
+
+  save-pinned-host:
+    needs: candidate-identity
+    runs-on: [self-hosted, "${{ inputs.runner_label }}"]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25
+        id: cache
+        with:
+          path: conformance/cache
+          key: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-pinned
+      - name: Establish the pinned lane's unique miss and payload
+        run: |
+          test '${{ steps.cache.outputs.cache-hit }}' != true
+          mkdir -p conformance/cache conformance/artifact
+          printf '%s\n' 'billet-${{ github.run_id }}-${{ github.run_attempt }}-pinned' > conformance/cache/payload
+          cp conformance/cache/payload conformance/artifact/payload
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-pinned
+          path: conformance/artifact/payload
+          if-no-files-found: error
+
+  restore-pinned-host:
+    needs: save-pinned-host
+    runs-on: [self-hosted, "${{ inputs.runner_label }}"]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25
+        id: cache
+        with:
+          path: conformance/cache
+          key: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-pinned
+          fail-on-cache-miss: true
+      - name: Verify the pinned cache client and payload
+        run: |
+          test '${{ steps.cache.outputs.cache-hit }}' = true
+          printf '%s\n' 'billet-${{ github.run_id }}-${{ github.run_attempt }}-pinned' > expected
+          cmp expected conformance/cache/payload
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-pinned
+          path: conformance/download
+      - run: cmp expected conformance/download/payload
+
+  save-embedded-current:
+    needs: candidate-identity
+    runs-on: [self-hosted, "${{ inputs.runner_label }}"]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - run: scripts/cache-conformance-fixtures.sh prepare current
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: conformance/embedded/node/package-lock.json
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+          cache-dependency-path: conformance/embedded/java/pom.xml
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: conformance/embedded/python/requirements.txt
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: conformance/embedded/go.sum
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+          cache: true
+          cache-dependency-path: conformance/embedded/dotnet/packages.lock.json
+      - run: scripts/cache-conformance-fixtures.sh write current
+
+  restore-embedded-current:
+    needs: save-embedded-current
+    runs-on: [self-hosted, "${{ inputs.runner_label }}"]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - run: scripts/cache-conformance-fixtures.sh prepare current
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: conformance/embedded/node/package-lock.json
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+          cache-dependency-path: conformance/embedded/java/pom.xml
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: conformance/embedded/python/requirements.txt
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: conformance/embedded/go.sum
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+          cache: true
+          cache-dependency-path: conformance/embedded/dotnet/packages.lock.json
+      - run: scripts/cache-conformance-fixtures.sh verify current
+
+  save-embedded-pinned:
+    needs: candidate-identity
+    runs-on: [self-hosted, "${{ inputs.runner_label }}"]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - run: scripts/cache-conformance-fixtures.sh prepare pinned
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: conformance/embedded/node/package-lock.json
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+          cache-jdk: false
+          cache-dependency-path: conformance/embedded/java/pom.xml
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: conformance/embedded/python/requirements.txt
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: conformance/embedded/go.sum
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1
+        with:
+          dotnet-version: 10.0.x
+          cache: true
+          cache-dependency-path: conformance/embedded/dotnet/packages.lock.json
+      - run: scripts/cache-conformance-fixtures.sh write pinned
+
+  restore-embedded-pinned:
+    needs: save-embedded-pinned
+    runs-on: [self-hosted, "${{ inputs.runner_label }}"]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - run: scripts/cache-conformance-fixtures.sh prepare pinned
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: conformance/embedded/node/package-lock.json
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+          cache-jdk: false
+          cache-dependency-path: conformance/embedded/java/pom.xml
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: conformance/embedded/python/requirements.txt
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: conformance/embedded/go.sum
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1
+        with:
+          dotnet-version: 10.0.x
+          cache: true
+          cache-dependency-path: conformance/embedded/dotnet/packages.lock.json
+      - run: scripts/cache-conformance-fixtures.sh verify pinned
+
+  poisoned-clients:
+    needs: candidate-identity
+    runs-on: [self-hosted, "${{ inputs.runner_label }}"]
+    timeout-minutes: 30
+    steps:
+      - name: Recover the supervised forwarder from a process crash
+        run: |
+          set -euo pipefail
+          before=$(systemctl show --property=MainPID --value billet-actions-proxy.service)
+          test "$before" -gt 0
+          sudo systemctl kill --kill-whom=main --signal=KILL billet-actions-proxy.service
+          after=0
+          for _ in $(seq 1 100); do
+            after=$(systemctl show --property=MainPID --value billet-actions-proxy.service)
+            if systemctl is-active --quiet billet-actions-proxy.service && [ "$after" -gt 0 ] && [ "$after" != "$before" ]; then
+              break
+            fi
+            sleep 0.1
+          done
+          test "$after" -gt 0
+          test "$after" != "$before"
+      - name: Isolate malformed TLS and a handshake timeout
+        run: |
+          set -euo pipefail
+          proxy_authority=${HTTPS_PROXY#http://}
+          proxy_host=${proxy_authority%:*}
+          proxy_port=${proxy_authority##*:}
+          exec 3<>"/dev/tcp/$proxy_host/$proxy_port"
+          printf 'CONNECT results-receiver.actions.githubusercontent.com:443 HTTP/1.1\r\nHost: results-receiver.actions.githubusercontent.com:443\r\n\r\n' >&3
+          IFS= read -r status <&3
+          case "$status" in *' 200 '*) ;; *) echo "proxy returned $status" >&2; exit 1 ;; esac
+          printf 'not-a-tls-client' >&3
+          exec 3>&-
+          exec 4<>"/dev/tcp/$proxy_host/$proxy_port"
+          printf 'CONNECT results-receiver.actions.githubusercontent.com:443 HTTP/1.1\r\nHost: results-receiver.actions.githubusercontent.com:443\r\n\r\n' >&4
+          IFS= read -r status <&4
+          case "$status" in *' 200 '*) ;; *) echo "proxy returned $status" >&2; exit 1 ;; esac
+          sleep 11
+          exec 4>&-
+      - name: Prove cache traffic remains usable after the transport faults
+        id: recovered-cache
+        uses: actions/cache@v5
+        with:
+          path: conformance/recovered-cache
+          key: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-fault-recovery
+      - name: Establish the post-fault cache payload
+        run: |
+          test '${{ steps.recovered-cache.outputs.cache-hit }}' != true
+          mkdir -p conformance/recovered-cache
+          printf '%s\n' 'recovered' > conformance/recovered-cache/payload
+      - name: Create a clean artifact payload
+        run: |
+          mkdir -p conformance/artifact
+          printf '%s\n' 'billet-${{ github.run_id }}-${{ github.run_attempt }}-poison' > conformance/artifact/payload
+      - name: Poison Actions service variables
+        continue-on-error: true
+        uses: actions/cache@v5
+        env:
+          ACTIONS_CACHE_URL: https://127.0.0.1:1/
+          ACTIONS_RESULTS_URL: https://127.0.0.1:1/
+          ACTIONS_RUNTIME_TOKEN: poisoned
+        with:
+          path: conformance/poison-actions
+          key: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-poison-actions
+      - name: Poison the embedded Node process
+        continue-on-error: true
+        uses: actions/cache@v5
+        env:
+          NODE_OPTIONS: --require=/billet-conformance-does-not-exist
+        with:
+          path: conformance/poison-node
+          key: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-poison-node
+      - name: Poison CA and TLS overrides
+        continue-on-error: true
+        uses: actions/cache@v5
+        env:
+          NODE_EXTRA_CA_CERTS: /billet-conformance-does-not-exist
+          SSL_CERT_FILE: /billet-conformance-does-not-exist
+          GIT_SSL_NO_VERIFY: "true"
+        with:
+          path: conformance/poison-tls
+          key: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-poison-tls
+      - name: Poison proxy variables
+        continue-on-error: true
+        uses: actions/cache@v5
+        env:
+          http_proxy: http://127.0.0.1:1
+          https_proxy: http://127.0.0.1:1
+          no_proxy: "*"
+        with:
+          path: conformance/poison-proxy
+          key: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-poison-proxy
+      - name: Poison loader, tar and path variables
+        continue-on-error: true
+        uses: actions/cache@v5
+        env:
+          LD_PRELOAD: /billet-conformance-does-not-exist
+          TAR_OPTIONS: --help
+          PATH: /usr/bin:/bin
+        with:
+          path: conformance/poison-process
+          key: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-poison-process
+      - name: Prove clean artifact metadata still passes through
+        uses: actions/upload-artifact@v7
+        with:
+          name: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-poison
+          path: conformance/artifact/payload
+          if-no-files-found: error
+
+  restore-poison-artifact:
+    needs: poisoned-clients
+    runs-on: [self-hosted, "${{ inputs.runner_label }}"]
+    timeout-minutes: 30
+    steps:
+      - name: Restore the cache saved after the proxy faults
+        id: recovered-cache
+        uses: actions/cache@v5
+        with:
+          path: conformance/recovered-cache
+          key: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-fault-recovery
+          fail-on-cache-miss: true
+      - name: Verify the post-fault cache payload
+        run: |
+          test '${{ steps.recovered-cache.outputs.cache-hit }}' = true
+          printf '%s\n' 'recovered' > expected-cache
+          cmp expected-cache conformance/recovered-cache/payload
+      - uses: actions/download-artifact@v8
+        with:
+          name: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-poison
+          path: conformance/download
+      - run: |
+          printf '%s\n' 'billet-${{ github.run_id }}-${{ github.run_attempt }}-poison' > expected
+          cmp expected conformance/download/payload

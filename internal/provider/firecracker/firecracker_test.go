@@ -365,6 +365,23 @@ func TestASpecThatCannotRunAJobIsRefused(t *testing.T) {
 		{"no vcpu", func(s *provider.Spec) { s.VCPU = 0 }, "vCPU"},
 		{"no memory", func(s *provider.Spec) { s.Memory = 0 }, "of memory"},
 		{"negative root disk", func(s *provider.Spec) { s.Disk = -1 }, "negative root disk"},
+		{"an Actions proxy without its CA", func(s *provider.Spec) {
+			s.ActionsProxy = "http://billet:session@172.20.0.1:7719"
+		}, "proxy and interception CA together"},
+		{"an Actions CA without its proxy", func(s *provider.Spec) {
+			s.ActionsCAPEM = "certificate"
+		}, "proxy and interception CA together"},
+		{"Actions interception without a cache session", func(s *provider.Spec) {
+			s.ActionsProxy = "http://billet:session@172.20.0.1:7719"
+			s.ActionsCAPEM = "certificate"
+		}, "no cache session"},
+		{"a NUL in the Actions proxy", func(s *provider.Spec) {
+			s.CacheEndpoint = "http://172.20.0.1:7718"
+			s.CacheToken = strings.Repeat("a", 64)
+			s.BuildKitCacheMountLimit = 4 << 30
+			s.ActionsProxy = "http://billet:session@172.20.0.1:7719\x00"
+			s.ActionsCAPEM = "certificate"
+		}, "containing a NUL"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()

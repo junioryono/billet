@@ -811,9 +811,12 @@ func execute(ctx context.Context, compute Compute, cmd nodeapi.Command, draining
 		}
 
 		err := compute.Launch(ctx, cmd.Lease, cmd.Tier, server.Job{
-			RequestID: cmd.Job.RequestID,
-			RunID:     cmd.Job.RunID,
-			Event:     cmd.Job.Event,
+			RequestID:   cmd.Job.RequestID,
+			RunID:       cmd.Job.RunID,
+			Event:       cmd.Job.Event,
+			Owner:       cmd.Job.Owner,
+			Repository:  cmd.Job.Repository,
+			WorkflowRef: cmd.Job.WorkflowRef,
 		})
 		if err == nil {
 			res.OK = true

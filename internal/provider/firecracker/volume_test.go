@@ -19,6 +19,8 @@ func TestACacheEnabledGuestBootsWithFiveReplaceableDriveSlots(t *testing.T) {
 	spec.CacheEndpoint = "http://172.20.0.1:7718"
 	spec.CacheToken = strings.Repeat("a", 64)
 	spec.BuildKitCacheMountLimit = 4 << 30
+	spec.ActionsProxy = "http://billet:session@172.20.0.1:7719"
+	spec.ActionsCAPEM = "-----BEGIN CERTIFICATE-----\nfixture\n-----END CERTIFICATE-----"
 
 	if _, err := h.p.Launch(t.Context(), spec); err != nil {
 		t.Fatalf("Launch: %v", err)
@@ -44,7 +46,9 @@ func TestACacheEnabledGuestBootsWithFiveReplaceableDriveSlots(t *testing.T) {
 	}
 
 	metadataJSON := renderJSON(t, metadataBody)
-	for _, want := range []string{spec.CacheEndpoint, spec.CacheToken, "4294967296"} {
+	for _, want := range []string{
+		spec.CacheEndpoint, spec.CacheToken, "4294967296", spec.ActionsProxy, "BEGIN CERTIFICATE",
+	} {
 		if !strings.Contains(metadataJSON, want) {
 			t.Errorf("metadata does not carry %q", want)
 		}

@@ -1516,6 +1516,39 @@ func environmentWithout(names ...string) []string {
 	return environment
 }
 
+func TestCacheConformanceFixturesKeepEveryEmbeddedClientInOneLane(t *testing.T) {
+	t.Parallel()
+
+	script, err := filepath.Abs("cache-conformance-fixtures.sh")
+	if err != nil {
+		t.Fatalf("fixture script path: %v", err)
+	}
+	root := t.TempDir()
+	run := exec.CommandContext(t.Context(), script, "prepare", "pinned")
+	run.Dir = root
+	if output, err := run.CombinedOutput(); err != nil {
+		t.Fatalf("prepare fixtures: %v\n%s", err, output)
+	}
+	for _, path := range []string{
+		"node/package-lock.json", "python/requirements.txt", "java/pom.xml",
+		"dotnet/packages.lock.json", "go.sum",
+	} {
+		body, err := os.ReadFile(filepath.Join(root, "conformance", "embedded", path))
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		if !strings.Contains(string(body), "billet-cache-conformance-pinned") {
+			t.Errorf("%s is not scoped to the pinned lane", path)
+		}
+	}
+
+	invalid := exec.CommandContext(t.Context(), script, "prepare", "../../escape")
+	invalid.Dir = root
+	if err := invalid.Run(); err == nil {
+		t.Fatal("a fixture lane that can escape its cache namespace was accepted")
+	}
+}
+
 func assertContains(t *testing.T, path, want string) {
 	t.Helper()
 	body, err := os.ReadFile(path)

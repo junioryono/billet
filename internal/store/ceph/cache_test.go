@@ -374,6 +374,37 @@ func cacheClient(t *testing.T, f *cacheFake) *Client {
 	return c
 }
 
+func TestCacheMatchUsesExactThenNewestWithinTheFirstRestorePrefix(t *testing.T) {
+	t.Parallel()
+
+	f := newCacheFake()
+	c := cacheClient(t, f)
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	pointers := []cachePointer{
+		{Key: "scope/npm-linux-old", Generation: "g-old", PublishedAt: now.Add(-time.Hour)},
+		{Key: "scope/npm-linux-new", Generation: "g-new", PublishedAt: now},
+		{Key: "scope/npm-other", Generation: "g-other", PublishedAt: now.Add(time.Hour)},
+	}
+	f.metadata[c.cacheIndex()] = map[string]string{}
+	for _, pointer := range pointers {
+		encoded, err := json.Marshal(pointer)
+		if err != nil {
+			t.Fatalf("marshal pointer: %v", err)
+		}
+		f.metadata[c.cacheIndex()][pointerKey(pointer.Key)] = string(encoded)
+	}
+
+	key, generation, err := c.Match(t.Context(), "scope/missing",
+		[]string{"scope/npm-linux-", "scope/npm-"})
+	if err != nil || key != "scope/npm-linux-new" || generation != "g-new" {
+		t.Fatalf("restore match = %q %q, %v", key, generation, err)
+	}
+	key, generation, err = c.Match(t.Context(), "scope/npm-linux-old", []string{"scope/npm-"})
+	if err != nil || key != "scope/npm-linux-old" || generation != "g-old" {
+		t.Fatalf("exact match = %q %q, %v", key, generation, err)
+	}
+}
+
 func TestACachePointerPublishesOnlyACompleteImmutableCandidate(t *testing.T) {
 	t.Parallel()
 

@@ -106,8 +106,8 @@ func TestCurrentBinaryRejectsAPreComposeGuest(t *testing.T) {
 	_, manifest := stageDir(t, []byte("rootfs"), []byte("kernel"))
 	manifest.GuestContract = "5"
 
-	if firecracker.GuestContract != "7" {
-		t.Fatalf("the current image requirements speak contract %q, want 7",
+	if firecracker.GuestContract != "8" {
+		t.Fatalf("the current image requirements speak contract %q, want 8",
 			firecracker.GuestContract)
 	}
 	if err := manifest.Usable(firecracker.GuestContract, "x86_64"); err == nil {
@@ -121,12 +121,27 @@ func TestCurrentBinaryRejectsAPreOverlay2Guest(t *testing.T) {
 	_, manifest := stageDir(t, []byte("rootfs"), []byte("kernel"))
 	manifest.GuestContract = "6"
 
-	if firecracker.GuestContract != "7" {
-		t.Fatalf("the overlay2 image change speaks contract %q, want 7",
+	if firecracker.GuestContract != "8" {
+		t.Fatalf("the overlay2 image change speaks contract %q, want 8",
 			firecracker.GuestContract)
 	}
 	if err := manifest.Usable(firecracker.GuestContract, "x86_64"); err == nil {
 		t.Fatal("a contract-6 image that can keep pulled images outside the cache was accepted")
+	}
+}
+
+// Contract 7 images do not install the Actions interception CA and proxy in the
+// runner or its containers, so an intercepted tier cannot use them safely.
+func TestCurrentBinaryRejectsAPreActionsInterceptionGuest(t *testing.T) {
+	_, manifest := stageDir(t, []byte("rootfs"), []byte("kernel"))
+	manifest.GuestContract = "7"
+
+	if firecracker.GuestContract != "8" {
+		t.Fatalf("the Actions interception image change speaks contract %q, want 8",
+			firecracker.GuestContract)
+	}
+	if err := manifest.Usable(firecracker.GuestContract, "x86_64"); err == nil {
+		t.Fatal("a contract-7 image without Actions proxy propagation was accepted")
 	}
 }
 

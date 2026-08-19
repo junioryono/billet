@@ -1445,6 +1445,25 @@ var directAssignmentIdentityMigration = migration{
 	},
 }
 
+// Cache interception is accelerated data access rather than availability. A
+// central deny list lets an operator take one organisation or repository out of
+// the local path without replacing configuration on every compute host.
+var cacheInterceptionPolicyMigration = migration{
+	Version: 27,
+	Name:    "cache_interception_policy",
+	Stmts: []string{
+		`CREATE TABLE cache_interception_blocks (
+			scope_type  TEXT NOT NULL CHECK (scope_type IN ('org','repository')),
+			owner       TEXT NOT NULL CHECK (length(trim(owner)) > 0 AND owner = lower(owner)),
+			repository  TEXT NOT NULL DEFAULT '' CHECK (repository = lower(repository)),
+			disabled_at TEXT NOT NULL,
+			PRIMARY KEY (scope_type, owner, repository),
+			CHECK ((scope_type = 'org' AND repository = '') OR
+			       (scope_type = 'repository' AND length(trim(repository)) > 0))
+		) STRICT`,
+	},
+}
+
 func init() {
 	migrations = append(migrations,
 		placementMigration, guestOSMigration, placementFactsMigration, requestIDMigration,
@@ -1454,7 +1473,7 @@ func init() {
 		nodeRevocationMigration, ec2ShapeAccountingMigration, custodyVisibilityMigration,
 		leaseFailureReasonMigration, pendingCompletionsMigration, pendingCompletionLeaseMigration,
 		pendingCompletionRecoveryMigration, pendingCompletionAcknowledgementMigration,
-		directAssignmentIdentityMigration)
+		directAssignmentIdentityMigration, cacheInterceptionPolicyMigration)
 }
 
 const bootstrapSchemaMigrations = `CREATE TABLE IF NOT EXISTS schema_migrations (

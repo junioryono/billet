@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -71,6 +72,18 @@ func (f *fakeCacheStore) Current(context.Context, string) (string, error) {
 	}
 
 	return f.current, nil
+}
+
+func (f *fakeCacheStore) Match(
+	_ context.Context,
+	exact string,
+	_ []string,
+) (string, string, error) {
+	if f.current == "" {
+		return "", "", storecontract.ErrMiss
+	}
+
+	return exact, f.current, nil
 }
 
 func (f *fakeCacheStore) Create(_ context.Context, key string, size int64) (storecontract.Volume, error) {
@@ -619,6 +632,69 @@ func TestRunnerBindsCacheAccessToTheComputeLifetime(t *testing.T) {
 		map[string]any{"key": "acme/api/npm", "size_bytes": int64(1 << 30)})
 	if after.Code != http.StatusUnauthorized {
 		t.Errorf("expired compute token returned HTTP %d, want 401", after.Code)
+	}
+}
+
+func TestRunnerBindsActionsInterceptionToTheAssignedRepository(t *testing.T) {
+	p := &fakeProvider{kind: config.ProviderDocker}
+	service, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", t.TempDir(),
+		&fakeCacheStore{}, &fakeVolumeAttacher{}, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewCacheService: %v", err)
+	}
+
+	a, host := newAllocatorWithHost(t)
+	runner := New(a, host, &fakeJIT{setID: 7}, p, nil, WithCacheService(service))
+	lease := assignedLease(t, a)
+	tier := dockerSpec()
+	tier.Intercept = true
+	if err := runner.Launch(t.Context(), lease, tier, Job{
+		RequestID:   11,
+		Event:       "push",
+		Owner:       "acme",
+		Repository:  "api",
+		WorkflowRef: "acme/api/.github/workflows/ci.yml@refs/heads/main",
+	}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	spec := p.launched[0]
+	if spec.ActionsProxy == "" || spec.ActionsCAPEM == "" {
+		t.Fatalf("guest Actions interception credentials were incomplete: proxy=%q ca=%t",
+			spec.ActionsProxy, spec.ActionsCAPEM != "")
+	}
+	if !strings.Contains(spec.ActionsProxy, spec.CacheToken) {
+		t.Error("the proxy URL is not bound to this guest's ephemeral cache capability")
+	}
+}
+
+func TestRunnerLeavesUntrustedActionsTrafficEntirelyOnGitHub(t *testing.T) {
+	p := &fakeProvider{kind: config.ProviderDocker, acceptsAll: true}
+	service, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", t.TempDir(),
+		&fakeCacheStore{}, &fakeVolumeAttacher{}, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewCacheService: %v", err)
+	}
+
+	a, host := newAllocatorWithHost(t)
+	runner := New(a, host, &fakeJIT{setID: 7}, p, nil, WithCacheService(service))
+	lease := assignedLease(t, a)
+	tier := dockerSpec()
+	tier.Intercept = true
+	if err := runner.Launch(t.Context(), lease, tier, Job{
+		RequestID:   11,
+		Event:       "pull_request",
+		Owner:       "acme",
+		Repository:  "api",
+		WorkflowRef: "acme/api/.github/workflows/ci.yml@refs/pull/1/merge",
+	}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	spec := p.launched[0]
+	if spec.ActionsProxy != "" || spec.ActionsCAPEM != "" {
+		t.Fatalf("untrusted guest received interception state: proxy=%q ca=%t",
+			spec.ActionsProxy, spec.ActionsCAPEM != "")
 	}
 }
 

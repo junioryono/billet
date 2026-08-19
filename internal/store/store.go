@@ -139,3 +139,10 @@ type Store interface {
 	// every generation protected by a live active-clone lease.
 	Evict(ctx context.Context, olderThan time.Duration) error
 }
+
+// KeyMatcher finds the exact cache key or the newest current key under the first
+// restore prefix that has a match. Stores used by transparent Actions caching
+// implement it; ordinary sticky disks need only Store.
+type KeyMatcher interface {
+	Match(ctx context.Context, exact string, restorePrefixes []string) (key, generation string, err error)
+}

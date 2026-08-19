@@ -15,11 +15,16 @@ import (
 const cacheSessionDirectory = "cache-sessions"
 
 type durableCacheSession struct {
-	Token    string                                `json:"token"`
-	Instance string                                `json:"instance"`
-	Trust    provider.TrustClass                   `json:"trust"`
-	Closed   bool                                  `json:"closed"`
-	Slots    [provider.MaxVolumes]*cacheAttachment `json:"slots"`
+	Token       string                                `json:"token"`
+	Instance    string                                `json:"instance"`
+	Trust       provider.TrustClass                   `json:"trust"`
+	Owner       string                                `json:"owner,omitempty"`
+	Repository  string                                `json:"repository,omitempty"`
+	WorkflowRef string                                `json:"workflow_ref,omitempty"`
+	Intercept   bool                                  `json:"intercept,omitempty"`
+	Closed      bool                                  `json:"closed"`
+	Slots       [provider.MaxVolumes]*cacheAttachment `json:"slots"`
+	Actions     map[string]*actionsArchive            `json:"actions,omitempty"`
 }
 
 func (s *CacheService) loadSessions() error {
@@ -56,7 +61,13 @@ func (s *CacheService) loadSessions() error {
 
 		session := &cacheSession{
 			token: record.Token, instance: record.Instance, trust: record.Trust,
-			closed: record.Closed, slots: record.Slots, admit: make(chan struct{}, 1),
+			owner: record.Owner, repository: record.Repository, workflowRef: record.WorkflowRef,
+			intercept: record.Intercept,
+			closed:    record.Closed, slots: record.Slots, admit: make(chan struct{}, 1),
+			actions: record.Actions,
+		}
+		if session.actions == nil {
+			session.actions = make(map[string]*actionsArchive)
 		}
 		s.byToken[record.Token] = session
 		s.byInstance[record.Instance] = record.Token
@@ -76,6 +87,20 @@ func (r durableCacheSession) valid(filename string) error {
 	if r.Trust != provider.TrustTrusted && r.Trust != provider.TrustUntrusted {
 		return fmt.Errorf("node: cache custody file %s has unknown trust %q", filename, r.Trust)
 	}
+	if r.Intercept {
+		if err := validateActionsScope(CacheSessionScope{
+			Trust: r.Trust, Intercept: true, Owner: r.Owner, Repository: r.Repository,
+			WorkflowRef: r.WorkflowRef,
+		}); err != nil {
+			return fmt.Errorf("node: cache custody file %s has invalid interception scope: %w", filename, err)
+		}
+	}
+	for id, archive := range r.Actions {
+		if archive == nil || archive.ID != id || archive.valid() != nil {
+			return fmt.Errorf("node: cache custody file %s has an invalid Actions archive %q",
+				filename, id)
+		}
+	}
 
 	return nil
 }
@@ -84,7 +109,9 @@ func (r durableCacheSession) valid(filename string) error {
 func (s *CacheService) persistSession(session *cacheSession) error {
 	record := durableCacheSession{
 		Token: session.token, Instance: session.instance, Trust: session.trust,
-		Closed: session.closed, Slots: session.slots,
+		Owner: session.owner, Repository: session.repository, WorkflowRef: session.workflowRef,
+		Intercept: session.intercept,
+		Closed:    session.closed, Slots: session.slots, Actions: session.actions,
 	}
 	encoded, err := json.Marshal(record)
 	if err != nil {

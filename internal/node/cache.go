@@ -39,6 +39,7 @@ const (
 type CacheService struct {
 	endpoint  string
 	namespace string
+	rootState string
 	stateDir  string
 	store     storecontract.Store
 	attacher  provider.VolumeAttacher
@@ -47,21 +48,45 @@ type CacheService struct {
 	mu         sync.Mutex
 	byToken    map[string]*cacheSession
 	byInstance map[string]string
+	actions    *actionsProxy
+	actionIO   actionsVolumeManager
+	actionRule ActionsPolicy
 }
 
 type cacheSession struct {
-	mu       sync.Mutex
-	admit    chan struct{}
-	token    string
-	instance string
-	trust    provider.TrustClass
-	closed   bool
-	slots    [provider.MaxVolumes]*cacheAttachment
+	mu          sync.Mutex
+	admit       chan struct{}
+	token       string
+	instance    string
+	trust       provider.TrustClass
+	owner       string
+	repository  string
+	workflowRef string
+	intercept   bool
+	closed      bool
+	slots       [provider.MaxVolumes]*cacheAttachment
+	actions     map[string]*actionsArchive
 }
 
 // CacheCredentials identifies one managed guest's cache session.
 type CacheCredentials struct {
-	Token string
+	Token        string
+	ActionsProxy string
+	ActionsCAPEM string
+}
+
+// CacheSessionScope is the identity GitHub bound to one assigned job.
+type CacheSessionScope struct {
+	Trust       provider.TrustClass
+	Intercept   bool
+	Owner       string
+	Repository  string
+	WorkflowRef string
+}
+
+// ActionsPolicy reads the control plane's current interception kill switch.
+type ActionsPolicy interface {
+	ActionsCacheAllowed(ctx context.Context, owner, repository string) (bool, error)
 }
 
 type cacheAttachment struct {
@@ -103,12 +128,23 @@ func NewCacheService(
 
 	service := &CacheService{
 		endpoint: endpoint, namespace: namespace, store: storage, attacher: attacher, log: log,
+		rootState:  stateDir,
 		stateDir:   filepath.Join(stateDir, cacheSessionDirectory),
 		byToken:    make(map[string]*cacheSession),
 		byInstance: make(map[string]string),
+		actionIO:   hostActionsVolumeManager{},
 	}
 	if err := service.loadSessions(); err != nil {
 		return nil, err
+	}
+	for _, session := range service.byToken {
+		if session.intercept {
+			if _, err := service.ensureActionsProxy(); err != nil {
+				return nil, err
+			}
+
+			break
+		}
 	}
 
 	return service, nil
@@ -119,14 +155,30 @@ func (s *CacheService) qualifiedKey(key string) string { return s.namespace + "/
 // Endpoint is the origin placed in a microVM's metadata.
 func (s *CacheService) Endpoint() string { return s.endpoint }
 
+// SetActionsPolicy installs the control-plane policy reader before the listener starts.
+func (s *CacheService) SetActionsPolicy(policy ActionsPolicy) { s.actionRule = policy }
+
 // Prepare creates one unguessable session credential before compute starts.
 func (s *CacheService) Prepare(instance string, trust provider.TrustClass) (CacheCredentials, error) {
+	return s.PrepareScoped(instance, CacheSessionScope{Trust: trust})
+}
+
+// PrepareScoped creates a session bound to GitHub's authenticated assignment.
+func (s *CacheService) PrepareScoped(
+	instance string,
+	scope CacheSessionScope,
+) (CacheCredentials, error) {
 	if strings.TrimSpace(instance) == "" {
 		return CacheCredentials{}, errors.New("node: a cache session needs an instance")
 	}
 
-	if trust != provider.TrustTrusted && trust != provider.TrustUntrusted {
+	if scope.Trust != provider.TrustTrusted && scope.Trust != provider.TrustUntrusted {
 		return CacheCredentials{}, errors.New("node: cannot give cache access to work with unknown trust")
+	}
+	if scope.Intercept {
+		if err := validateActionsScope(scope); err != nil {
+			return CacheCredentials{}, err
+		}
 	}
 
 	s.mu.Lock()
@@ -146,8 +198,23 @@ func (s *CacheService) Prepare(instance string, trust provider.TrustClass) (Cach
 		}
 
 		session := &cacheSession{
-			token: token, instance: instance, trust: trust,
-			admit: make(chan struct{}, 1),
+			token: token, instance: instance, trust: scope.Trust,
+			owner: scope.Owner, repository: scope.Repository, workflowRef: scope.WorkflowRef,
+			intercept: scope.Intercept,
+			admit:     make(chan struct{}, 1),
+			actions:   make(map[string]*actionsArchive),
+		}
+		credentials := CacheCredentials{Token: token}
+		if scope.Intercept {
+			proxy, err := s.ensureActionsProxy()
+			if err != nil {
+				return CacheCredentials{}, err
+			}
+			credentials.ActionsProxy, err = proxyURL(s.endpoint, token)
+			if err != nil {
+				return CacheCredentials{}, err
+			}
+			credentials.ActionsCAPEM = string(proxy.ca.CertPEM())
 		}
 		if err := s.persistSession(session); err != nil {
 			return CacheCredentials{}, err
@@ -156,7 +223,7 @@ func (s *CacheService) Prepare(instance string, trust provider.TrustClass) (Cach
 		s.byToken[token] = session
 		s.byInstance[instance] = token
 
-		return CacheCredentials{Token: token}, nil
+		return credentials, nil
 	}
 }
 
@@ -279,6 +346,15 @@ func (s *CacheService) RenewActive(ctx context.Context, until time.Time) error {
 					failures = append(failures, fmt.Errorf("%s slot %d: %w", session.instance, slot, err))
 				}
 			}
+			for id, archive := range session.actions {
+				if archive.Volume.Lease.ID == "" {
+					continue
+				}
+				if err := s.store.RenewActive(ctx, archive.Volume, until); err != nil {
+					failures = append(failures, fmt.Errorf("%s Actions cache %s: %w",
+						session.instance, id, err))
+				}
+			}
 		}
 		session.mu.Unlock()
 	}
@@ -324,6 +400,29 @@ func (s *CacheService) cleanupSession(
 				session.instance, slot, err)
 		}
 	}
+	for id, archive := range session.actions {
+		archive.mu.Lock()
+		if !archive.Unmounted {
+			if err := s.actionIO.Unmount(ctx, s.actionsMountPath(session, archive)); err != nil {
+				failures = append(failures, fmt.Errorf("actions cache %s unmount: %w", id, err))
+				archive.mu.Unlock()
+
+				continue
+			}
+		}
+		if err := s.store.Discard(ctx, archive.Volume); err != nil {
+			failures = append(failures, fmt.Errorf("actions cache %s discard: %w", id, err))
+			archive.mu.Unlock()
+
+			continue
+		}
+		archive.mu.Unlock()
+		delete(session.actions, id)
+		if err := s.persistSession(session); err != nil {
+			return fmt.Errorf("node: record discarded Actions cache of %s: %w",
+				session.instance, err)
+		}
+	}
 
 	if err := errors.Join(failures...); err != nil {
 		return fmt.Errorf("node: discard cache volumes of %s: %w", session.instance, err)
@@ -337,6 +436,17 @@ func (s *CacheService) cleanupSession(
 
 // ServeHTTP serves the exact API understood by the sticky-disk action.
 func (s *CacheService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodConnect {
+		proxy := s.actionsProxy()
+		if proxy == nil {
+			http.Error(w, "actions interception is unavailable", http.StatusServiceUnavailable)
+
+			return
+		}
+		proxy.serveConnect(w, r)
+
+		return
+	}
 	session, ok := s.authenticate(r)
 	if !ok {
 		http.Error(w, "unauthorised cache session", http.StatusUnauthorized)
