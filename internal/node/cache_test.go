@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -23,23 +24,28 @@ import (
 )
 
 type fakeCacheStore struct {
-	current           string
-	created           int
-	cloned            int
-	snapshots         int
-	published         int
-	discarded         int
-	discardFailures   int
-	renewed           int
-	renewedUntil      time.Time
-	publishErr        error
-	publishConflicts  int
-	conflictCurrent   string
-	advanceOnSnapshot bool
-	publishExpected   []string
-	keys              []string
-	createdSizes      []int64
-	snapshotVolumes   []storecontract.Volume
+	current            string
+	created            int
+	cloned             int
+	snapshots          int
+	published          int
+	discarded          int
+	discardFailures    int
+	renewed            int
+	renewedUntil       time.Time
+	publishErr         error
+	publishConflicts   int
+	conflictCurrent    string
+	advanceOnSnapshot  bool
+	publishExpected    []string
+	writerAcquisitions int
+	validWriterIDs     map[string]string
+	validFences        map[string]storecontract.FencingToken
+	publishedWriterIDs []string
+	publishedFences    []storecontract.FencingToken
+	keys               []string
+	createdSizes       []int64
+	snapshotVolumes    []storecontract.Volume
 }
 
 func TestCacheWriterAuthorityOutlivesTheWholeCommitBudget(t *testing.T) {
@@ -125,7 +131,19 @@ func (f *fakeCacheStore) RenewActive(
 func (f *fakeCacheStore) AcquireWriter(
 	_ context.Context, key, _ string, ttl time.Duration,
 ) (storecontract.WriterLease, storecontract.FencingToken, error) {
-	return storecontract.WriterLease{Key: key, ID: "writer", Expires: time.Now().Add(ttl)}, 1, nil
+	f.writerAcquisitions++
+	writerID := fmt.Sprintf("writer-%d", f.writerAcquisitions)
+	fence := storecontract.FencingToken(f.writerAcquisitions)
+	if f.validWriterIDs == nil {
+		f.validWriterIDs = make(map[string]string)
+	}
+	f.validWriterIDs[key] = writerID
+	if f.validFences == nil {
+		f.validFences = make(map[string]storecontract.FencingToken)
+	}
+	f.validFences[key] = fence
+
+	return storecontract.WriterLease{Key: key, ID: writerID, Expires: time.Now().Add(ttl)}, fence, nil
 }
 
 func (f *fakeCacheStore) Snapshot(
@@ -145,13 +163,18 @@ func (f *fakeCacheStore) Snapshot(
 
 func (f *fakeCacheStore) PublishCAS(
 	_ context.Context,
-	_, expected string,
+	key, expected string,
 	candidate storecontract.Candidate,
-	_ storecontract.WriterLease,
-	_ storecontract.FencingToken,
+	lease storecontract.WriterLease,
+	fence storecontract.FencingToken,
 ) error {
 	f.published++
 	f.publishExpected = append(f.publishExpected, expected)
+	f.publishedWriterIDs = append(f.publishedWriterIDs, lease.ID)
+	f.publishedFences = append(f.publishedFences, fence)
+	if lease.ID != f.validWriterIDs[key] || fence != f.validFences[key] {
+		return errors.New("stale writer authority")
+	}
 	if f.publishConflicts > 0 {
 		f.publishConflicts--
 		if f.conflictCurrent != "" {

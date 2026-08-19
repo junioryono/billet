@@ -12,12 +12,14 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/junioryono/billet/internal/provider"
+	storecontract "github.com/junioryono/billet/internal/store"
 )
 
 type fakeActionsVolumeManager struct {
@@ -654,11 +656,35 @@ func TestActionsFinalizeFailureNeverFallsThroughToGitHub(t *testing.T) {
 func TestActionsFinalizeRechecksThePointerAfterAConflict(t *testing.T) {
 	t.Parallel()
 
-	for name, conflictCurrent := range map[string]string{
-		"retry after an absent pointer":            "",
-		"recognize an already-published candidate": "next",
-	} {
-		t.Run(name, func(t *testing.T) {
+	tests := []struct {
+		name             string
+		conflictCurrent  string
+		wantOK           bool
+		wantCurrent      string
+		wantPublishes    int
+		wantAcquisitions int
+		wantWriterIDs    []string
+		wantFences       []storecontract.FencingToken
+	}{
+		{
+			name: "retry after an absent pointer", wantOK: true, wantCurrent: "next",
+			wantPublishes: 2, wantAcquisitions: 2,
+			wantWriterIDs: []string{"writer-1", "writer-2"},
+			wantFences:    []storecontract.FencingToken{1, 2},
+		},
+		{
+			name: "recognize an already-published candidate", conflictCurrent: "next",
+			wantOK: true, wantCurrent: "next", wantPublishes: 1, wantAcquisitions: 1,
+			wantWriterIDs: []string{"writer-1"}, wantFences: []storecontract.FencingToken{1},
+		},
+		{
+			name: "reject a different published generation", conflictCurrent: "other",
+			wantCurrent: "other", wantPublishes: 1, wantAcquisitions: 1,
+			wantWriterIDs: []string{"writer-1"}, wantFences: []storecontract.FencingToken{1},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
 			service, storage, session, _ := testActionsService(t)
@@ -682,7 +708,7 @@ func TestActionsFinalizeRechecksThePointerAfterAConflict(t *testing.T) {
 			}
 			response.Body.Close()
 			storage.publishConflicts = 1
-			storage.conflictCurrent = conflictCurrent
+			storage.conflictCurrent = test.conflictCurrent
 			finalize := actionsRequestForTest(t, http.MethodPost,
 				"https://"+actionsResultsHost+actionsFinalizePath,
 				`{"key":"conflict","version":"v1","size_bytes":"12"}`)
@@ -691,16 +717,122 @@ func TestActionsFinalizeRechecksThePointerAfterAConflict(t *testing.T) {
 				t.Fatalf("FinalizeCacheEntryUpload: %v", err)
 			}
 			finalized := responseJSON(t, response)
-			wantPublishes := 2
-			if conflictCurrent != "" {
-				wantPublishes = 1
-			}
-			if finalized["ok"] != true || storage.published != wantPublishes ||
-				storage.current != "next" {
-				t.Fatalf("finalization=%v published=%d current=%q",
-					finalized, storage.published, storage.current)
+			if finalized["ok"] != test.wantOK || storage.published != test.wantPublishes ||
+				storage.current != test.wantCurrent ||
+				storage.writerAcquisitions != test.wantAcquisitions ||
+				!slices.Equal(storage.publishedWriterIDs, test.wantWriterIDs) ||
+				!slices.Equal(storage.publishedFences, test.wantFences) {
+				t.Fatalf("finalization=%v published=%d current=%q acquisitions=%d writers=%v fences=%v",
+					finalized, storage.published, storage.current, storage.writerAcquisitions,
+					storage.publishedWriterIDs, storage.publishedFences)
 			}
 		})
+	}
+}
+
+func TestActionsFinalizePersistsFreshAuthorityAcrossRestartAfterRepeatedConflicts(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	storage := &fakeCacheStore{publishConflicts: 2}
+	service, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", root,
+		storage, &fakeVolumeAttacher{}, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewCacheService: %v", err)
+	}
+	service.actionIO = &fakeActionsVolumeManager{}
+	service.SetActionsPolicy(actionsPolicyFunc(func(context.Context, string, string) (bool, error) {
+		return true, nil
+	}))
+	credentials, err := service.PrepareScoped("billet-conflicts", CacheSessionScope{
+		Trust: provider.TrustTrusted, Intercept: true, Owner: "acme", Repository: "api",
+		WorkflowRef: "acme/api/.github/workflows/ci.yml@refs/heads/main",
+	})
+	if err != nil {
+		t.Fatalf("PrepareScoped: %v", err)
+	}
+	service.mu.Lock()
+	session := service.byToken[credentials.Token]
+	service.mu.Unlock()
+	create := actionsRequestForTest(t, http.MethodPost,
+		"https://"+actionsResultsHost+actionsCreatePath,
+		`{"key":"repeated-conflict","version":"v1"}`)
+	response, _, err := service.actionsResponse(create, session)
+	if err != nil {
+		t.Fatalf("CreateCacheEntry: %v", err)
+	}
+	created := responseJSON(t, response)
+	uploadURL, ok := created["signed_upload_url"].(string)
+	if !ok || uploadURL == "" {
+		t.Fatalf("CreateCacheEntry response = %v", created)
+	}
+	upload := actionsRequestForTest(t, http.MethodPut, uploadURL, "archive-body")
+	upload.Header.Set("X-Ms-Blob-Type", "BlockBlob")
+	response, _, err = service.actionsResponse(upload, session)
+	if err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	response.Body.Close()
+	finalizeBody := `{"key":"repeated-conflict","version":"v1","size_bytes":"12"}`
+	finalize := actionsRequestForTest(t, http.MethodPost,
+		"https://"+actionsResultsHost+actionsFinalizePath, finalizeBody)
+	response, handled, err := service.actionsResponse(finalize, session)
+	if response != nil {
+		response.Body.Close()
+	}
+	if !handled || !errors.Is(err, storecontract.ErrConflict) {
+		t.Fatalf("first finalize handled=%t error=%v, want local conflict", handled, err)
+	}
+	if storage.writerAcquisitions != 3 ||
+		!slices.Equal(storage.publishedWriterIDs, []string{"writer-1", "writer-2"}) ||
+		!slices.Equal(storage.publishedFences, []storecontract.FencingToken{1, 2}) {
+		t.Fatalf("first finalize acquisitions=%d writers=%v fences=%v",
+			storage.writerAcquisitions, storage.publishedWriterIDs, storage.publishedFences)
+	}
+
+	restarted, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", root,
+		storage, &fakeVolumeAttacher{}, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("restart NewCacheService: %v", err)
+	}
+	restarted.actionIO = &fakeActionsVolumeManager{}
+	restarted.SetActionsPolicy(actionsPolicyFunc(func(context.Context, string, string) (bool, error) {
+		return true, nil
+	}))
+	restarted.mu.Lock()
+	restartedSession := restarted.byToken[credentials.Token]
+	restarted.mu.Unlock()
+	if restartedSession == nil {
+		t.Fatal("restart did not recover the cache session")
+	}
+	restartedSession.mu.Lock()
+	receipt := restartedSession.receipts[actionsReceiptID("repeated-conflict", "v1")]
+	if receipt == nil {
+		restartedSession.mu.Unlock()
+		t.Fatal("restart did not recover the finalization receipt")
+	}
+	complete, writerID, fence := receipt.Complete, receipt.Lease.ID, receipt.Fence
+	restartedSession.mu.Unlock()
+	if complete || writerID != "writer-3" || fence != 3 {
+		t.Fatalf("recovered receipt complete=%t writer=%q fence=%d",
+			complete, writerID, fence)
+	}
+
+	retry := actionsRequestForTest(t, http.MethodPost,
+		"https://"+actionsResultsHost+actionsFinalizePath, finalizeBody)
+	response, handled, err = restarted.actionsResponse(retry, restartedSession)
+	if err != nil || !handled {
+		t.Fatalf("retry finalize handled=%t error=%v", handled, err)
+	}
+	retried := responseJSON(t, response)
+	if retried["ok"] != true || storage.current != "next" ||
+		storage.writerAcquisitions != 3 ||
+		!slices.Equal(storage.publishedWriterIDs,
+			[]string{"writer-1", "writer-2", "writer-3"}) ||
+		!slices.Equal(storage.publishedFences, []storecontract.FencingToken{1, 2, 3}) {
+		t.Fatalf("retry=%v current=%q acquisitions=%d writers=%v fences=%v",
+			retried, storage.current, storage.writerAcquisitions,
+			storage.publishedWriterIDs, storage.publishedFences)
 	}
 }
 
