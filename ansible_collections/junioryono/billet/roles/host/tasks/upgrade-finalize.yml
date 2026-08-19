@@ -1,0 +1,30 @@
+---
+- name: Open the committed ledger to operator commands
+  ansible.builtin.file:
+    path: "{{ billet_candidate_server_state_dir }}/billet.maintenance"
+    state: absent
+  become: true
+
+- name: Durably open the committed ledger to operator commands
+  ansible.builtin.command:
+    argv:
+      - sync
+      - -f
+      - "{{ billet_candidate_server_state_dir }}"
+  changed_when: false
+  become: true
+
+- name: Close the durable host-upgrade transaction after commit
+  ansible.builtin.file:
+    path: /var/lib/billet/upgrades/active
+    state: absent
+  become: true
+
+- name: Durably close the host-upgrade transaction
+  ansible.builtin.command:
+    argv:
+      - sync
+      - -f
+      - /var/lib/billet/upgrades
+  changed_when: false
+  become: true

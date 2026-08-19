@@ -20,6 +20,24 @@
     - not ansible_check_mode
   become: true
 
+- name: Inspect billet service enablement before the upgrade transaction
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - is-enabled
+      - "{{ item }}"
+  loop:
+    - billet-server.service
+    - billet-node.service
+  register: billet_service_enablement_before_upgrade
+  changed_when: false
+  failed_when: billet_service_enablement_before_upgrade.rc not in [0, 1, 4]
+  check_mode: false
+  when:
+    - billet_binary_upgrade | default(false)
+    - not ansible_check_mode
+  become: true
+
 - name: Initialize guest compatibility refreshes
   ansible.builtin.set_fact:
     billet_guest_refresh_images: []
@@ -71,9 +89,13 @@
       version: 1
       server_state_dir: "{{ billet_candidate_server_state_dir }}"
       node_state_dir: "{{ billet_candidate_node_state_dir }}"
+      service_user: "{{ billet_service_user }}"
+      service_group: "{{ billet_service_group }}"
       binary_existed: "{{ billet_binary_checksums.results[0].stat.exists }}"
       server_was_active: "{{ billet_service_state_before_upgrade.results[0].rc == 0 }}"
       node_was_active: "{{ billet_service_state_before_upgrade.results[1].rc == 0 }}"
+      server_was_enabled: "{{ billet_service_enablement_before_upgrade.results[0].stdout == 'enabled' }}"
+      node_was_enabled: "{{ billet_service_enablement_before_upgrade.results[1].stdout == 'enabled' }}"
       inputs:
         - path: /etc/billet/billet.yaml
           backup: billet.yaml.previous
@@ -109,6 +131,18 @@
     - not ansible_check_mode
   become: true
 
+- name: Durably commit host-upgrade recovery inputs before publishing the pointer
+  ansible.builtin.command:
+    argv:
+      - sync
+      - -f
+      - "{{ billet_upgrade_recovery_dir }}"
+  changed_when: false
+  when:
+    - billet_binary_upgrade | default(false)
+    - not ansible_check_mode
+  become: true
+
 - name: Publish the durable host-upgrade pointer before live mutation
   ansible.builtin.copy:
     content: "{{ billet_upgrade_recovery_dir }}\n"
@@ -116,6 +150,18 @@
     owner: root
     group: root
     mode: "0600"
+  when:
+    - billet_binary_upgrade | default(false)
+    - not ansible_check_mode
+  become: true
+
+- name: Durably publish the active host-upgrade pointer before live mutation
+  ansible.builtin.command:
+    argv:
+      - sync
+      - -f
+      - /var/lib/billet/upgrades
+  changed_when: false
   when:
     - billet_binary_upgrade | default(false)
     - not ansible_check_mode
@@ -204,6 +250,14 @@
         mode: "0600"
       when: billet_ledger_before_upgrade.stat.exists
 
+    - name: Durably flush the stopped ledger snapshot before marking it complete
+      ansible.builtin.command:
+        argv:
+          - sync
+          - -f
+          - "{{ billet_upgrade_recovery_dir }}"
+      changed_when: false
+
     - name: Commit the durable ledger snapshot before exposing the candidate
       ansible.builtin.copy:
         content: "ledger snapshot complete\n"
@@ -211,6 +265,14 @@
         owner: root
         group: root
         mode: "0600"
+
+    - name: Durably publish ledger snapshot completion before exposing the candidate
+      ansible.builtin.command:
+        argv:
+          - sync
+          - -f
+          - "{{ billet_upgrade_recovery_dir }}"
+      changed_when: false
 
     - name: Install the candidate billet binary after fencing and ledger preservation
       ansible.builtin.copy:
@@ -276,9 +338,34 @@
         state: started
       when: billet_enable_node
 
-    - name: Let upgraded services pass their immediate startup checks
+    - name: Inspect upgraded service stability baseline
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - show
+          - --property=LoadState
+          - --property=ActiveState
+          - --property=SubState
+          - --property=MainPID
+          - --property=ControlPID
+          - --property=Result
+          - --property=NRestarts
+          - --property=ActiveEnterTimestampMonotonic
+          - --property=ExecMainStartTimestampMonotonic
+          - "{{ item.name }}"
+      loop:
+        - name: billet-server.service
+          enabled: "{{ billet_enable_server }}"
+        - name: billet-node.service
+          enabled: "{{ billet_enable_node }}"
+      register: billet_upgraded_service_baseline
+      changed_when: false
+      failed_when: false
+      when: item.enabled | bool
+
+    - name: Observe upgraded services across the restart interval
       ansible.builtin.pause:
-        seconds: 2
+        seconds: 6
       when: billet_enable_server or billet_enable_node
 
     - name: Inspect upgraded service stability before committing the transaction
@@ -292,6 +379,9 @@
           - --property=MainPID
           - --property=ControlPID
           - --property=Result
+          - --property=NRestarts
+          - --property=ActiveEnterTimestampMonotonic
+          - --property=ExecMainStartTimestampMonotonic
           - "{{ item.name }}"
       loop:
         - name: billet-server.service
@@ -306,21 +396,24 @@
     - name: Prove upgraded services are stably active before opening administration
       ansible.builtin.assert:
         that:
-          - item.rc == 0
-          - "'LoadState=loaded' in item.stdout"
-          - "'ActiveState=active' in item.stdout"
-          - "'SubState=running' in item.stdout"
-          - "'MainPID=0' not in item.stdout"
-          - "'ControlPID=0' in item.stdout"
-          - "'Result=success' in item.stdout"
+          - item.0.rc == 0
+          - item.1.rc == 0
+          - item.0.stdout == item.1.stdout
+          - "'LoadState=loaded' in item.1.stdout"
+          - "'ActiveState=active' in item.1.stdout"
+          - "'SubState=running' in item.1.stdout"
+          - "'MainPID=0' not in item.1.stdout"
+          - "'ControlPID=0' in item.1.stdout"
+          - "'Result=success' in item.1.stdout"
         fail_msg: >-
-          {{ item.item.name }} did not remain active and running after the
-          candidate start. The transaction will restore the previous host state
-          before operator commands are admitted.
-      loop: "{{ billet_upgraded_service_state.results }}"
+          {{ item.1.item.name }} did not remain unchanged, active and running
+          across the systemd restart interval after the candidate start. The
+          transaction will restore the previous host state before operator
+          commands are admitted.
+      loop: "{{ billet_upgraded_service_baseline.results | zip(billet_upgraded_service_state.results) | list }}"
       loop_control:
-        label: "{{ item.item.name }}"
-      when: not (item.skipped | default(false))
+        label: "{{ item.1.item.name }}"
+      when: not (item.1.skipped | default(false))
 
     - name: Install steady-state units without the maintenance bypass
       ansible.builtin.template:
@@ -337,15 +430,24 @@
       ansible.builtin.systemd_service:
         daemon_reload: true
 
-    - name: Open the upgraded ledger to operator commands
-      ansible.builtin.file:
-        path: "{{ billet_candidate_server_state_dir }}/billet.maintenance"
-        state: absent
+    - name: Record the durable host-upgrade commit before opening administration
+      ansible.builtin.copy:
+        content: "host upgrade committed\n"
+        dest: "{{ billet_upgrade_recovery_dir }}/commit.complete"
+        owner: root
+        group: root
+        mode: "0600"
 
-    - name: Close the durable host-upgrade transaction after commit
-      ansible.builtin.file:
-        path: /var/lib/billet/upgrades/active
-        state: absent
+    - name: Durably publish the host-upgrade commit before opening administration
+      ansible.builtin.command:
+        argv:
+          - sync
+          - -f
+          - "{{ billet_upgrade_recovery_dir }}"
+      changed_when: false
+
+    - name: Finalize the committed host transaction
+      ansible.builtin.include_tasks: upgrade-finalize.yml
 
   rescue:
     - name: Restore the durable pre-upgrade host state
@@ -354,9 +456,11 @@
     - name: Report the failed upgrade and its recovery copy
       ansible.builtin.fail:
         msg: >-
-          The billet upgrade failed. Its previous binary, configuration, units,
-          ledger, and active service state were restored. The recovery copy
-          remains at {{ billet_upgrade_recovery_dir }}.
+          The billet upgrade failed {{
+            'after its durable commit; committed state was finalized without rollback'
+            if billet_upgrade_commit_state.stat.exists
+            else 'before its durable commit; the previous binary, configuration, units, ledger, enablement, and active service state were restored'
+          }}. The recovery copy remains at {{ billet_upgrade_recovery_dir }}.
 
 - name: Validate a billet host whose binary did not change
   ansible.builtin.command: /usr/bin/billet check --config /etc/billet/billet.yaml
