@@ -206,6 +206,21 @@ func TestACompletionFindsTheCacheSessionOfAdoptedCompute(t *testing.T) {
 	}
 }
 
+func TestGitHubSuccessResultSpellingPublishesTheDockerStore(t *testing.T) {
+	t.Parallel()
+
+	for _, result := range []string{"Succeeded", "succeeded", "SUCCEEDED"} {
+		if !jobSucceeded(result) {
+			t.Errorf("jobSucceeded(%q) = false, want true", result)
+		}
+	}
+	for _, result := range []string{"", "Success", "Failed", "Cancelled", " succeeded "} {
+		if jobSucceeded(result) {
+			t.Errorf("jobSucceeded(%q) = true, want false", result)
+		}
+	}
+}
+
 func TestASpotWarningFailsTheRightLeaseWithItsReason(t *testing.T) {
 	p := &fakeProvider{kind: config.ProviderDocker}
 	a, host := newAllocatorWithHost(t)

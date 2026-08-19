@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -460,7 +461,7 @@ func (r *Runner) DestroyCompleted(ctx context.Context, requestID int64, result s
 
 	if r.cache != nil {
 		if instance := r.cacheInstanceForRequest(requestID); instance != "" {
-			if err := r.cache.SettleDocker(ctx, instance, result == "succeeded"); err != nil {
+			if err := r.cache.SettleDocker(ctx, instance, jobSucceeded(result)); err != nil {
 				r.log.Warn("Docker image store was not published; compute teardown will discard it",
 					"request", requestID, "instance", instance, "result", result, "error", err)
 			}
@@ -468,6 +469,10 @@ func (r *Runner) DestroyCompleted(ctx context.Context, requestID int64, result s
 	}
 
 	return r.destroy(ctx, requestID)
+}
+
+func jobSucceeded(result string) bool {
+	return strings.EqualFold(result, "succeeded")
 }
 
 func (r *Runner) cacheInstanceForRequest(requestID int64) string {
