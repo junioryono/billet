@@ -86,31 +86,58 @@ func TestAssetURLRefusesANameThatIsNotAPlainFile(t *testing.T) {
 // hardcodes it a second time, which is the shape of a half-landed rename: the
 // binary keeps pulling from the old account while the signature check names the
 // new one.
-func TestDefaultBaseURLIsDerivedFromTheOneRepoConstant(t *testing.T) {
-	if !strings.Contains(DefaultBaseURL, DefaultRepo) {
-		t.Fatalf("DefaultBaseURL %q does not derive from DefaultRepo %q",
-			DefaultBaseURL, DefaultRepo)
+func TestDefaultChannelURLIsDerivedFromTheOneRepoConstant(t *testing.T) {
+	if !strings.Contains(DefaultChannelURL, DefaultRepo) {
+		t.Fatalf("DefaultChannelURL %q does not derive from DefaultRepo %q",
+			DefaultChannelURL, DefaultRepo)
 	}
-
-	if _, err := ParseSource(DefaultBaseURL); err != nil {
-		t.Fatalf("the built-in default is not a valid source: %v", err)
+	if !strings.Contains(DefaultChannelBundleURL, DefaultRepo) {
+		t.Fatalf("DefaultChannelBundleURL %q does not derive from DefaultRepo %q",
+			DefaultChannelBundleURL, DefaultRepo)
+	}
+	if !DefaultSource().IsDefault() {
+		t.Fatal("the built-in image source is not marked as the signed default channel")
+	}
+	for name, raw := range map[string]string{
+		"channel": DefaultChannelURL,
+		"bundle":  DefaultChannelBundleURL,
+	} {
+		if !strings.HasPrefix(raw, "https://raw.githubusercontent.com/") || strings.Contains(raw, "api.github.com") {
+			t.Fatalf("default %s %q spends the shared anonymous REST budget", name, raw)
+		}
 	}
 }
 
-// `/releases/latest/` RESOLVES ACROSS THE WHOLE REPOSITORY, and this repository
-// also publishes billet's own binaries. Pointing the image channel at it would
-// have a binary release silently take the channel over -- and not as a 404: the
-// node fetches a manifest that is simply absent and reports a source with no
-// images, on a source that has them.
-func TestDefaultBaseURLDoesNotUseTheRepoWideLatestAlias(t *testing.T) {
-	if strings.Contains(DefaultBaseURL, "/releases/latest/") {
-		t.Fatalf("DefaultBaseURL %q resolves across every release in the repository, "+
-			"including billet's own binary releases", DefaultBaseURL)
+// The default cannot use either repository-wide latest or a fixed rolling Release:
+// the former mixes binary and guest releases, while immutability freezes the
+// latter as soon as it is published. A one-file branch is the moving pointer.
+func TestDefaultChannelDoesNotUseAReleaseAlias(t *testing.T) {
+	for _, forbidden := range []string{"/releases/latest", "guest-latest"} {
+		if strings.Contains(DefaultChannelURL, forbidden) {
+			t.Fatalf("DefaultChannelURL %q contains forbidden rolling alias %q",
+				DefaultChannelURL, forbidden)
+		}
 	}
+}
 
-	if !strings.Contains(DefaultBaseURL, LatestTag) {
-		t.Errorf("DefaultBaseURL %q does not name the guest-image tag %q",
-			DefaultBaseURL, LatestTag)
+func TestOnlyDatedOfficialReleaseURLsGetTheDefaultTrustPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		raw     string
+		trusted bool
+	}{
+		{raw: defaultDownloadPrefix + "guest-20260819-031238", trusted: true},
+		{raw: defaultDownloadPrefix + "guest-latest"},
+		{raw: defaultDownloadPrefix + "v0.2.0"},
+		{raw: "https://github.com/attacker/billet/releases/download/guest-20260819-031238"},
+		{raw: defaultDownloadPrefix + "guest-20260819-031238-extra"},
+	} {
+		src, err := ParseSource(tc.raw)
+		if err != nil {
+			t.Fatalf("parse %q: %v", tc.raw, err)
+		}
+		if src.IsDefault() != tc.trusted {
+			t.Errorf("IsDefault(%q) = %t; want %t", tc.raw, src.IsDefault(), tc.trusted)
+		}
 	}
 }
 

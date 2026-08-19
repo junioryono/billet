@@ -221,6 +221,8 @@ billet images pull ubuntu-2404-x64
 billet images verify ubuntu-2404-x64@<generation>
 ```
 
+The built-in source reads `current.json` and its Sigstore bundle from billet's `guest-channel` branch, verifies that the main publication workflow signed a still-current pointer attesting to an immutable dated `guest-YYYYMMDD-HHMMSS` prerelease, then downloads that release. The pointer expires after ten days, so rewriting the mutable branch with an older genuine channel cannot silently pin a fleet there. There is deliberately no rolling `guest-latest` release: repository release immutability locks a published tag and its assets, while GitHub's repository-wide `latest` alias belongs to billet's binary installer. The raw pointer avoids spending GitHub's anonymous REST budget when many nodes share one egress address. A configured mirror remains a direct asset base URL and bypasses first-party discovery.
+
 The pull fetches a signed manifest, refuses anything this build cannot use, checks each
 asset against the digest the manifest names, unpacks, and publishes the result as a
 generation. It stages to disk and verifies **before** importing — streaming straight into

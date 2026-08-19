@@ -78,7 +78,7 @@ func PolicyFor(src Source, identity, issuer string, skip bool) (Policy, error) {
 	}
 
 	if identity == "" && issuer == "" {
-		if src.BaseURL == DefaultBaseURL {
+		if src.IsDefault() {
 			return Policy{
 				Required: true,
 				Identity: DefaultSigningIdentity,

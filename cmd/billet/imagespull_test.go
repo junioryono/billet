@@ -48,8 +48,8 @@ func TestResolveSourcePrefersTheFlagThenTheConfig(t *testing.T) {
 		t.Fatalf("resolve: %v", err)
 	}
 
-	if got.BaseURL != imagesource.DefaultBaseURL {
-		t.Errorf("an unconfigured deployment did not fall back to the default: %q", got.BaseURL)
+	if !got.IsDefault() {
+		t.Errorf("an unconfigured deployment did not fall back to the default: %#v", got)
 	}
 }
 
@@ -64,8 +64,8 @@ func TestResolveSourceIgnoresABlankConfiguredSource(t *testing.T) {
 			t.Fatalf("resolve: %v", err)
 		}
 
-		if got.BaseURL != imagesource.DefaultBaseURL {
-			t.Errorf("a blank configured source resolved to %q", got.BaseURL)
+		if !got.IsDefault() {
+			t.Errorf("a blank configured source resolved to %#v", got)
 		}
 	}
 }

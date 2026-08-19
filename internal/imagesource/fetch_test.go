@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -247,6 +248,220 @@ func TestFetchHonoursContextCancellation(t *testing.T) {
 	}
 }
 
+func TestResolveDefaultSourceUsesTheDatedGuestReleaseNamedByTheChannel(t *testing.T) {
+	now := time.Now().UTC()
+	body, err := json.Marshal(map[string]any{
+		"schema":            channelSchema,
+		"tag":               "guest-20260821-000000",
+		"published_at":      now.Add(-time.Hour),
+		"expires_at":        now.Add(9 * 24 * time.Hour),
+		"release_immutable": true,
+	})
+	if err != nil {
+		t.Fatalf("marshal channel: %v", err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/current.json" {
+			t.Errorf("channel path = %q", r.URL.Path)
+		}
+		if _, err := w.Write(body); err != nil {
+			t.Errorf("write channel: %v", err)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	client := &Client{
+		HTTP: srv.Client(),
+		Source: Source{
+			channelURL:    srv.URL + "/current.json",
+			channelPolicy: &Policy{Required: false},
+			official:      true,
+		},
+	}
+	if err := client.Resolve(t.Context()); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if got, want := client.Source.BaseURL, defaultDownloadPrefix+"guest-20260821-000000"; got != want {
+		t.Fatalf("resolved source = %q; want %q", got, want)
+	}
+	if !client.Source.IsDefault() {
+		t.Fatal("resolved first-party source lost its default trust identity")
+	}
+}
+
+func TestResolveDefaultSourceRefusesInvalidChannels(t *testing.T) {
+	now := time.Now().UTC()
+	t.Run("malformed json", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			if _, err := io.WriteString(w, `{not json`); err != nil {
+				t.Errorf("write malformed channel: %v", err)
+			}
+		}))
+		t.Cleanup(srv.Close)
+
+		client := &Client{HTTP: srv.Client(), Source: Source{
+			channelURL:    srv.URL,
+			channelPolicy: &Policy{Required: false},
+			official:      true,
+		}}
+		if err := client.Resolve(t.Context()); err == nil {
+			t.Fatal("malformed channel was accepted")
+		}
+	})
+
+	for _, fields := range []map[string]any{
+		{"schema": channelSchema, "tag": "guest-latest", "published_at": now.Add(-time.Hour), "expires_at": now.Add(time.Hour), "release_immutable": true},
+		{"schema": channelSchema, "tag": "v0.3.0", "published_at": now.Add(-time.Hour), "expires_at": now.Add(time.Hour), "release_immutable": true},
+		{"schema": channelSchema, "tag": "guest-20260821-000000/manifest.json", "published_at": now.Add(-time.Hour), "expires_at": now.Add(time.Hour), "release_immutable": true},
+		{"schema": channelSchema + 1, "tag": "guest-20260821-000000", "published_at": now.Add(-time.Hour), "expires_at": now.Add(time.Hour), "release_immutable": true},
+		{"schema": channelSchema, "tag": "guest-20260821-000000", "published_at": now.Add(-time.Hour), "expires_at": now.Add(time.Hour), "release_immutable": false},
+		{"schema": channelSchema, "tag": "guest-20260821-000000", "published_at": now.Add(-11 * 24 * time.Hour), "expires_at": now.Add(-time.Hour), "release_immutable": true},
+		{"schema": channelSchema, "tag": "guest-20260821-000000", "published_at": now.Add(-time.Hour), "expires_at": now.Add(maxChannelLifetime + time.Hour), "release_immutable": true},
+		{"schema": channelSchema, "tag": "guest-20260821-000000", "published_at": now.Add(channelClockSkew + time.Minute), "expires_at": now.Add(24 * time.Hour), "release_immutable": true},
+	} {
+		body, err := json.Marshal(fields)
+		if err != nil {
+			t.Fatalf("marshal invalid channel: %v", err)
+		}
+		t.Run(string(body), func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if _, err := w.Write(body); err != nil {
+					t.Errorf("write channel: %v", err)
+				}
+			}))
+			t.Cleanup(srv.Close)
+
+			client := &Client{HTTP: srv.Client(), Source: Source{
+				channelURL:    srv.URL,
+				channelPolicy: &Policy{Required: false},
+				official:      true,
+			}}
+			if err := client.Resolve(t.Context()); err == nil {
+				t.Fatal("invalid channel was accepted")
+			}
+		})
+	}
+}
+
+func TestResolveDefaultSourceRequiresAnAuthenticChannel(t *testing.T) {
+	now := time.Now().UTC()
+	body, err := json.Marshal(map[string]any{
+		"schema":            channelSchema,
+		"tag":               "guest-20260821-000000",
+		"published_at":      now.Add(-time.Hour),
+		"expires_at":        now.Add(time.Hour),
+		"release_immutable": true,
+	})
+	if err != nil {
+		t.Fatalf("marshal channel: %v", err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/current.json" {
+			if _, err := w.Write(body); err != nil {
+				t.Errorf("write channel: %v", err)
+			}
+
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(srv.Close)
+
+	client := &Client{HTTP: srv.Client(), Source: Source{
+		channelURL:       srv.URL + "/current.json",
+		channelBundleURL: srv.URL + "/current.sigstore.json",
+		official:         true,
+	}}
+	if err := client.Resolve(t.Context()); err == nil || !strings.Contains(err.Error(), "authenticate") {
+		t.Fatalf("unsigned channel returned %v", err)
+	}
+}
+
+func TestResolveDefaultSourceRefetchesAMixedChannelPair(t *testing.T) {
+	now := time.Now().UTC()
+	channel := func(tag string) []byte {
+		body, err := json.Marshal(map[string]any{
+			"schema":            channelSchema,
+			"tag":               tag,
+			"published_at":      now.Add(-time.Hour),
+			"expires_at":        now.Add(time.Hour),
+			"release_immutable": true,
+		})
+		if err != nil {
+			t.Fatalf("marshal channel: %v", err)
+		}
+
+		return body
+	}
+	oldChannel := channel("guest-20260820-000000")
+	newChannel := channel("guest-20260821-000000")
+	channelRequests, bundleRequests := 0, 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/current.json":
+			channelRequests++
+			body := newChannel
+			if channelRequests == 1 {
+				body = oldChannel
+			}
+			if _, err := w.Write(body); err != nil {
+				t.Errorf("write channel: %v", err)
+			}
+		case "/current.sigstore.json":
+			bundleRequests++
+			if _, err := w.Write(newChannel); err != nil {
+				t.Errorf("write bundle: %v", err)
+			}
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	client := &Client{
+		HTTP: srv.Client(),
+		Source: Source{
+			channelURL:       srv.URL + "/current.json",
+			channelBundleURL: srv.URL + "/current.sigstore.json",
+			channelPolicy:    &Policy{Required: true},
+			official:         true,
+		},
+		verifyChannel: func(body, signature []byte, _ Policy) error {
+			if !bytes.Equal(body, signature) {
+				return errors.New("signature belongs to another channel generation")
+			}
+
+			return nil
+		},
+	}
+	if err := client.Resolve(t.Context()); err != nil {
+		t.Fatalf("resolve mixed pair: %v", err)
+	}
+	if got, want := client.Source.BaseURL, defaultDownloadPrefix+"guest-20260821-000000"; got != want {
+		t.Fatalf("resolved source = %q; want %q", got, want)
+	}
+	if channelRequests != channelPairAttempts || bundleRequests != channelPairAttempts {
+		t.Fatalf("channel requests = %d and bundle requests = %d; want %d each",
+			channelRequests, bundleRequests, channelPairAttempts)
+	}
+}
+
+func TestResolveDefaultSourceSurfacesChannelFailures(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	t.Cleanup(srv.Close)
+
+	client := &Client{HTTP: srv.Client(), Source: Source{
+		channelURL:    srv.URL,
+		channelPolicy: &Policy{Required: false},
+		official:      true,
+	}}
+	if err := client.Resolve(t.Context()); err == nil || !strings.Contains(err.Error(), "429") {
+		t.Fatalf("channel failure returned %v", err)
+	}
+}
+
 func TestFetchSurfacesAServerError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -280,10 +495,7 @@ func TestManifestRefusesWhenTheRequiredSignatureIsNotPublished(t *testing.T) {
 	// The manifest is served; the bundle is not.
 	c := serve(t, map[string][]byte{ManifestName: good})
 
-	src, err := ParseSource(DefaultBaseURL)
-	if err != nil {
-		t.Fatalf("source: %v", err)
-	}
+	src := DefaultSource()
 
 	policy, err := PolicyFor(src, "", "", false)
 	if err != nil {
@@ -311,10 +523,7 @@ func TestManifestRefusesAManifestWhoseSignatureDoesNotVerify(t *testing.T) {
 
 	c := serve(t, map[string][]byte{ManifestName: good, BundleName: legacy})
 
-	src, err := ParseSource(DefaultBaseURL)
-	if err != nil {
-		t.Fatalf("source: %v", err)
-	}
+	src := DefaultSource()
 
 	policy, err := PolicyFor(src, "", "", false)
 	if err != nil {

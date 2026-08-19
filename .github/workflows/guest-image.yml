@@ -46,15 +46,17 @@ concurrency:
 
 jobs:
   build:
-    name: Build and publish
+    name: Build and check
     runs-on: ubuntu-24.04
 
+    outputs:
+      tag: ${{ steps.pack.outputs.tag }}
+
     permissions:
-      # To create the release and replace the rolling tag's assets.
-      contents: write
-      # For keyless signing: the OIDC token is what binds the signature to this
-      # workflow in this repository, which is the fact a consumer verifies.
-      id-token: write
+      # A MANUALLY SELECTED BRANCH RUNS ITS OWN BUILD SCRIPTS. It gets enough to
+      # check itself out and nothing that can change the repository or mint an
+      # identity accepted by the first-party signature policy.
+      contents: read
 
     env:
       IMAGE_NAME: ubuntu-2404-x64
@@ -66,6 +68,8 @@ jobs:
     steps:
       - name: Check out
         uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       # A HOSTED RUNNER HAS ABOUT 14 GB FREE and this build wants most of it: a
       # debootstrapped tree, a 4 GB ext4 image on top of it, a kernel source tree
@@ -186,8 +190,6 @@ jobs:
             echo
             echo "Pulled by \`billet images pull\`, which verifies the manifest"
             echo "signature and each asset's digest before anything reaches the cluster."
-            echo
-            echo "Assets are also published to the rolling \`guest-latest\` tag."
           } > out/release-notes.md
 
           {
@@ -271,110 +273,136 @@ jobs:
           KERNEL: ${{ github.workspace }}/out/vmlinux-billet
           ROOTFS: /var/tmp/billet-guest/ubuntu-2404-x64.ext4
 
-      # THE MANIFEST IS THE ONLY THING SIGNED, and that is sufficient: it carries a
-      # digest for every asset, so one signature transitively covers the four
-      # hundred megabytes without anybody doing public-key arithmetic over them.
-      - name: Install cosign
-        # NOT `inputs.publish != false`. On a SCHEDULED run `inputs` is undefined,
-        # so `inputs.publish` is the empty string -- and github casts both '' and
-        # false to 0 when comparing across types, making the condition FALSE. The
-        # weekly build would have run for an hour and published nothing, silently,
-        # which is the one failure this workflow exists to prevent.
-        if: github.event_name != 'workflow_dispatch' || inputs.publish
-        uses: sigstore/cosign-installer@v3
-
-      - name: Sign the manifest
-        # NOT `inputs.publish != false`. On a SCHEDULED run `inputs` is undefined,
-        # so `inputs.publish` is the empty string -- and github casts both '' and
-        # false to 0 when comparing across types, making the condition FALSE. The
-        # weekly build would have run for an hour and published nothing, silently,
-        # which is the one failure this workflow exists to prevent.
-        if: github.event_name != 'workflow_dispatch' || inputs.publish
-        run: |
-          set -euo pipefail
-
-          # --new-bundle-format IS NOT OPTIONAL FOR US.
-          #
-          # Without it cosign v2 writes its legacy shape -- base64Signature, cert,
-          # rekorBundle -- and sigstore-go, which is what verifies this on a node,
-          # rejects that outright: it parses only the protobuf Sigstore bundle. The
-          # first release published the legacy form, so nothing could have verified
-          # it even though the signature was real.
-          #
-          # The new format also carries the inclusion proof that makes OFFLINE
-          # verification possible. The legacy rekorBundle carries only a signed
-          # entry timestamp, which is why air-gapped verification needed a network
-          # call that an air-gapped node cannot make.
-          cosign sign-blob --yes \
-            --new-bundle-format \
-            --bundle out/manifest.sigstore.json \
-            out/manifest.json
-
-      # TWO RELEASES, DELIBERATELY. The dated one is history and the thing to pin
-      # to when a rollback is needed; the rolling tag is what an unattended puller
-      # follows. `/releases/latest/` is NOT used for either, because it resolves
-      # across the whole repository and billet's own binary releases would take the
-      # channel over.
-      - name: Publish the dated release
-        # NOT `inputs.publish != false`. On a SCHEDULED run `inputs` is undefined,
-        # so `inputs.publish` is the empty string -- and github casts both '' and
-        # false to 0 when comparing across types, making the condition FALSE. The
-        # weekly build would have run for an hour and published nothing, silently,
-        # which is the one failure this workflow exists to prevent.
-        if: github.event_name != 'workflow_dispatch' || inputs.publish
-        run: |
-          set -euo pipefail
-
-          gh release create "${{ steps.pack.outputs.tag }}" \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "Guest image ${{ steps.pack.outputs.tag }}" \
-            --notes-file out/release-notes.md \
-            out/manifest.json out/manifest.sigstore.json out/rootfs.img.zst out/vmlinux-billet
-        env:
-          GH_TOKEN: ${{ github.token }}
-
-      - name: Move the rolling tag
-        # NOT `inputs.publish != false`. On a SCHEDULED run `inputs` is undefined,
-        # so `inputs.publish` is the empty string -- and github casts both '' and
-        # false to 0 when comparing across types, making the condition FALSE. The
-        # weekly build would have run for an hour and published nothing, silently,
-        # which is the one failure this workflow exists to prevent.
-        if: github.event_name != 'workflow_dispatch' || inputs.publish
-        run: |
-          set -euo pipefail
-
-          # CREATED ONCE, THEN ITS ASSETS ARE REPLACED. `--clobber` is what makes
-          # this idempotent; without it the second week's upload fails on a name
-          # that already exists, and the rolling tag silently stops moving while
-          # the dated releases keep appearing — a fleet pinned to an image nobody
-          # noticed had stopped advancing.
-          gh release view guest-latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
-            gh release create guest-latest \
-              --repo "$GITHUB_REPOSITORY" \
-              --title "Guest image (current)" \
-              --notes "The image a billet deployment pulls by default. Assets are replaced by each build; see the dated releases for history."
-
-          gh release upload guest-latest \
-            --repo "$GITHUB_REPOSITORY" --clobber \
-            out/manifest.json out/manifest.sigstore.json out/rootfs.img.zst out/vmlinux-billet
-        env:
-          GH_TOKEN: ${{ github.token }}
-
-      # KEPT EVEN WHEN NOT PUBLISHING, because the reason to run this without
-      # publishing is to inspect what it produced.
-      - name: Upload for inspection
+      # THE BUILD JOB CANNOT PUBLISH. Its one handoff is an ordinary workflow
+      # artifact; the privileged job below consumes it only when this exact run is
+      # main and publication was requested. Manual inspection uses the same bytes.
+      - name: Upload the checked image
         # always() SO A FAILED GATE STILL HANDS OVER THE ARTIFACT. Without it, the
         # one run where somebody most wants to open the image -- the one that just
         # refused to publish it -- is the run that uploads nothing.
-        if: always() && github.event_name == 'workflow_dispatch' && !inputs.publish
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: guest-image
           path: |
             out/manifest.json
+            out/release-notes.md
             out/rootfs.img.zst
             out/vmlinux-billet
           # SHORT, because these are hundreds of megabytes and the default is
           # ninety days. On a private repository that is billed storage against a
           # quota this would exhaust within a month.
           retention-days: 3
+          # The root filesystem is already zstd-compressed. Compressing it again
+          # spends runner minutes and produces no useful size reduction.
+          compression-level: 0
+
+  publish:
+    name: Sign and publish
+    needs: build
+    # NOT `inputs.publish != false`. On a SCHEDULED run `inputs` is undefined, so
+    # `inputs.publish` is the empty string -- and github casts both '' and false to
+    # 0 when comparing across types, making that condition FALSE. MAIN ONLY also
+    # makes this job's write token and OIDC identity unreachable to branch scripts.
+    if: github.ref == 'refs/heads/main' && (github.event_name != 'workflow_dispatch' || inputs.publish)
+    runs-on: ubuntu-24.04
+
+    permissions:
+      contents: write
+      id-token: write
+
+    steps:
+      # Checked out only after the job-level main guard. The credentials are used
+      # to advance the small guest-channel branch after the release is immutable.
+      - name: Check out the publication commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Download the checked image
+        uses: actions/download-artifact@v5
+        with:
+          name: guest-image
+          path: out
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      # THE MANIFEST IS THE ONLY THING SIGNED, and that is sufficient: it carries a
+      # digest for every asset, so one signature transitively covers the four
+      # hundred megabytes without anybody doing public-key arithmetic over them.
+      - name: Sign the manifest
+        run: |
+          set -euo pipefail
+
+          # --new-bundle-format IS NOT OPTIONAL FOR US. Without it cosign v2 writes
+          # its legacy shape, which sigstore-go refuses, and omits the inclusion
+          # proof that makes offline verification possible.
+          cosign sign-blob --yes \
+            --new-bundle-format \
+            --bundle out/manifest.sigstore.json \
+            out/manifest.json
+
+      # IMMUTABLE DATED RELEASES, AND NO ROLLING RELEASE. Release immutability
+      # locks a published tag and its assets, so a guest-latest release freezes on
+      # its first generation rather than moving. Pullers read a tiny pointer from
+      # guest-channel and then fetch assets from the immutable dated URL.
+      - name: Publish the dated release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.build.outputs.tag }}
+        run: scripts/publish-guest-release.sh out
+
+      # A BRANCH, NOT A RELEASE. The release is immutable; this two-file branch is
+      # the mutable pointer an unattended fleet needs. The pointer is signed only
+      # after the release has been proved immutable and expires before two weekly
+      # builds can be replayed as current. The branch pushes fast-forward so its
+      # history is retained rather than rewritten.
+      - name: Advance the guest channel
+        env:
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          channel_dir=$(mktemp -d)
+          trap 'git worktree remove --force "$channel_dir"' EXIT
+
+          published_epoch=$(date -u +%s)
+          expires_epoch=$((published_epoch + 10 * 24 * 60 * 60))
+          published_at=$(date -u -d "@$published_epoch" +%Y-%m-%dT%H:%M:%SZ)
+          expires_at=$(date -u -d "@$expires_epoch" +%Y-%m-%dT%H:%M:%SZ)
+          printf '{"schema":1,"tag":"%s","published_at":"%s","expires_at":"%s","release_immutable":true}\n' \
+            "$TAG" "$published_at" "$expires_at" > out/current.json
+          cosign sign-blob --yes \
+            --new-bundle-format \
+            --bundle out/current.sigstore.json \
+            out/current.json
+
+          set +e
+          git ls-remote --exit-code --heads origin refs/heads/guest-channel >/dev/null
+          channel_status=$?
+          set -e
+
+          case "$channel_status" in
+            0)
+              git fetch origin refs/heads/guest-channel:refs/remotes/origin/guest-channel
+              git worktree add -b guest-channel-next "$channel_dir" refs/remotes/origin/guest-channel
+              ;;
+            2)
+              git worktree add --detach "$channel_dir" "$GITHUB_SHA"
+              git -C "$channel_dir" checkout --orphan guest-channel-next
+              git -C "$channel_dir" rm -rf .
+              ;;
+            *)
+              echo "could not determine whether the guest channel exists" >&2
+              exit "$channel_status"
+              ;;
+          esac
+
+          cp out/current.json out/current.sigstore.json "$channel_dir/"
+          git -C "$channel_dir" config user.name github-actions[bot]
+          git -C "$channel_dir" config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git -C "$channel_dir" add current.json current.sigstore.json
+          git -C "$channel_dir" commit -m "Guest channel: $TAG"
+          git -C "$channel_dir" push origin HEAD:refs/heads/guest-channel

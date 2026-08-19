@@ -73,6 +73,203 @@ func TestProductionSurfacesUseTheTestedSecurityHelpers(t *testing.T) {
 		`[0-9]+\$#version: ${COLLECTION_VERSION}#`)
 	assertContains(t, filepath.Join("..", ".github", "workflows", "release.yml"),
 		"run: scripts/check-release-metadata.sh")
+	assertContains(t, filepath.Join("..", ".github", "workflows", "release.yml"),
+		"ref: ${{ github.workflow_sha }}")
+	assertContains(t, filepath.Join("..", ".github", "workflows", "release.yml"),
+		"run: .billet-release-tools/scripts/verify-release-attestation.sh")
+	assertContains(t, filepath.Join("..", ".github", "workflows", "release.yml"),
+		"attestations: read")
+	assertContains(t, filepath.Join("..", ".github", "workflows", "release.yml"),
+		"GH_TOKEN: ${{ github.token }}")
+	assertContains(t, filepath.Join("..", ".github", "workflows", "cut-release.yml"),
+		"attestations: read")
+}
+
+func TestReleaseWorkflowVerifiesThePublishedReleaseAfterGoReleaser(t *testing.T) {
+	t.Parallel()
+
+	body, err := os.ReadFile(filepath.Join("..", ".github", "workflows", "release.yml"))
+	if err != nil {
+		t.Fatalf("read release workflow: %v", err)
+	}
+	workflow := string(body)
+	goreleaser := strings.Index(workflow, "uses: goreleaser/goreleaser-action@v7")
+	checkout := strings.Index(workflow, "name: Check out release verification code")
+	verifyStep := strings.Index(workflow, "name: Verify immutable release attestation")
+	verify := strings.Index(workflow, "run: .billet-release-tools/scripts/verify-release-attestation.sh")
+	if goreleaser < 0 || checkout <= goreleaser || verifyStep <= checkout || verify <= verifyStep {
+		t.Fatalf("release verification steps are missing or out of order")
+	}
+	checkoutStep := workflow[checkout:verifyStep]
+	for _, required := range []string{
+		"ref: ${{ github.workflow_sha }}",
+		"path: .billet-release-tools",
+		"sparse-checkout: scripts/verify-release-attestation.sh",
+	} {
+		if !strings.Contains(checkoutStep, required) {
+			t.Fatalf("release helper checkout is missing %q", required)
+		}
+	}
+	verifyBody := workflow[verifyStep:]
+	for _, required := range []string{
+		"GH_TOKEN: ${{ github.token }}",
+		"RELEASE_TAG: ${{ inputs.tag || github.ref_name }}",
+		"run: .billet-release-tools/scripts/verify-release-attestation.sh",
+	} {
+		if !strings.Contains(verifyBody, required) {
+			t.Fatalf("release verification step is missing %q", required)
+		}
+	}
+	if strings.Contains(checkoutStep+verifyBody, "continue-on-error:") {
+		t.Fatal("release verification must not continue on error")
+	}
+
+	callerBody, err := os.ReadFile(filepath.Join("..", ".github", "workflows", "cut-release.yml"))
+	if err != nil {
+		t.Fatalf("read cut-release workflow: %v", err)
+	}
+	caller := string(callerBody)
+	releaseJob := strings.Index(caller, "\n  release:\n")
+	if releaseJob < 0 || !strings.Contains(caller[releaseJob:], "uses: ./.github/workflows/release.yml") || !strings.Contains(caller[releaseJob:], "attestations: read") {
+		t.Fatal("cut-release caller does not delegate attestation-read permission to the reusable release job")
+	}
+}
+
+func TestGuestImageReleasesCannotTakeOverTheBinaryLatestChannel(t *testing.T) {
+	t.Parallel()
+
+	body, err := os.ReadFile(filepath.Join("..", ".github", "workflows", "guest-image.yml"))
+	if err != nil {
+		t.Fatalf("read guest-image workflow: %v", err)
+	}
+	workflow := string(body)
+	buildJob := strings.Index(workflow, "\n  build:\n")
+	publishJob := strings.Index(workflow, "\n  publish:\n")
+	if buildJob < 0 || publishJob <= buildJob {
+		t.Fatal("separate guest build and publication jobs are missing or out of order")
+	}
+	buildBody := workflow[buildJob:publishJob]
+	for _, required := range []string{
+		"contents: read",
+		"persist-credentials: false",
+		"if: always()",
+		"uses: actions/upload-artifact@v4",
+	} {
+		if !strings.Contains(buildBody, required) {
+			t.Fatalf("unprivileged guest build is missing %q", required)
+		}
+	}
+	for _, forbidden := range []string{"contents: write", "id-token: write", "Install cosign", "gh release create"} {
+		if strings.Contains(buildBody, forbidden) {
+			t.Fatalf("branch-controlled guest build retains publication capability %q", forbidden)
+		}
+	}
+	publishBody := workflow[publishJob:]
+	for _, required := range []string{
+		"needs: build",
+		"if: github.ref == 'refs/heads/main'",
+		"contents: write",
+		"id-token: write",
+		"uses: actions/download-artifact@v5",
+		"name: Install cosign",
+		"name: Sign the manifest",
+		"run: scripts/publish-guest-release.sh out",
+		"name: Advance the guest channel",
+		"expires_epoch=$((published_epoch + 10 * 24 * 60 * 60))",
+		`"release_immutable":true`,
+		"--bundle out/current.sigstore.json",
+		"out/current.json",
+		"git -C \"$channel_dir\" add current.json current.sigstore.json",
+		"git -C \"$channel_dir\" push origin HEAD:refs/heads/guest-channel",
+	} {
+		if !strings.Contains(publishBody, required) {
+			t.Fatalf("main-only guest publication is missing %q", required)
+		}
+	}
+	immutableCheck := strings.Index(publishBody, "run: scripts/publish-guest-release.sh out")
+	channelAdvance := strings.Index(publishBody, "name: Advance the guest channel")
+	if immutableCheck < 0 || channelAdvance <= immutableCheck {
+		t.Fatal("guest channel advances before the dated release is proved immutable")
+	}
+	for _, forbidden := range []string{
+		"release create guest-latest",
+		"release edit guest-latest",
+		"release upload guest-latest",
+	} {
+		if strings.Contains(workflow, forbidden) {
+			t.Fatalf("an immutable release cannot serve as a rolling guest-image pointer: found %q", forbidden)
+		}
+	}
+}
+
+func TestGuestReleasePublisherRefusesAConflictingTag(t *testing.T) {
+	publisher, err := filepath.Abs("publish-guest-release.sh")
+	if err != nil {
+		t.Fatalf("absolute guest release publisher path: %v", err)
+	}
+	for _, tc := range []struct {
+		name        string
+		mode        string
+		immutable   string
+		tag         string
+		wantSuccess bool
+		wantRelease bool
+	}{
+		{name: "new immutable release", mode: "success", immutable: "true", tag: "guest-20260821-000000", wantSuccess: true, wantRelease: true},
+		{name: "conflicting existing tag", mode: "conflict", immutable: "true", tag: "guest-20260821-000000"},
+		{name: "mutable release", mode: "success", immutable: "false", tag: "guest-20260821-000000", wantRelease: true},
+		{name: "invalid tag", mode: "success", immutable: "true", tag: "guest-latest"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tools := t.TempDir()
+			calls := filepath.Join(tools, "calls.log")
+			writeExecutable(t, filepath.Join(tools, "git"), `#!/bin/sh
+printf 'git %s\n' "$*" >> "$BILLET_TEST_CALLS"
+if [ "$BILLET_TEST_MODE" = conflict ] && [ "$1" = tag ]; then exit 1; fi
+exit 0
+`)
+			writeExecutable(t, filepath.Join(tools, "gh"), `#!/bin/sh
+printf 'gh %s\n' "$*" >> "$BILLET_TEST_CALLS"
+if [ "$1 $2" = "release create" ]; then
+    case " $* " in *" --verify-tag "*) ;; *) exit 95 ;; esac
+    case " $* " in *" --target "*) exit 94 ;; esac
+    exit 0
+fi
+if [ "$1 $2" = "release view" ]; then printf '%s\n' "$BILLET_TEST_IMMUTABLE"; exit 0; fi
+exit 97
+`)
+
+			cmd := exec.CommandContext(t.Context(), publisher, t.TempDir())
+			cmd.Env = append(os.Environ(),
+				"PATH="+tools+":"+os.Getenv("PATH"),
+				"BILLET_TEST_CALLS="+calls,
+				"BILLET_TEST_MODE="+tc.mode,
+				"BILLET_TEST_IMMUTABLE="+tc.immutable,
+				"GITHUB_REPOSITORY=junioryono/billet",
+				"GITHUB_SHA="+strings.Repeat("a", 40),
+				"TAG="+tc.tag,
+			)
+			output, err := cmd.CombinedOutput()
+			if (err == nil) != tc.wantSuccess {
+				t.Fatalf("publication error = %v; want success %t\n%s", err, tc.wantSuccess, output)
+			}
+			callBody, err := os.ReadFile(calls)
+			if err != nil && !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("read calls: %v", err)
+			}
+			callsText := string(callBody)
+			releaseCall := "gh release create " + tc.tag
+			if strings.Contains(callsText, releaseCall) != tc.wantRelease {
+				t.Fatalf("release call presence does not match want %t\n%s", tc.wantRelease, callsText)
+			}
+			if tc.wantRelease {
+				push := "git push origin refs/tags/" + tc.tag
+				if !strings.Contains(callsText, push) || strings.Index(callsText, push) >= strings.Index(callsText, releaseCall) {
+					t.Fatalf("release was not preceded by the exact tag push\n%s", callsText)
+				}
+			}
+		})
+	}
 }
 
 func TestReleaseMetadataMustMatchTheTag(t *testing.T) {
@@ -121,6 +318,309 @@ func TestReleaseMetadataMustMatchTheTag(t *testing.T) {
 				t.Fatalf("metadata check error = %v; want success %t\n%s", err, tc.wantSuccess, output)
 			}
 		})
+	}
+}
+
+func TestReleaseAttestationVerifierRetriesOnlyPropagationDelay(t *testing.T) {
+	t.Parallel()
+
+	verifier, err := filepath.Abs("verify-release-attestation.sh")
+	if err != nil {
+		t.Fatalf("absolute attestation verifier path: %v", err)
+	}
+	for _, tc := range []struct {
+		name         string
+		mode         string
+		failures     int
+		attempts     int
+		immutable    string
+		wantAPICalls int
+		wantVerify   int
+		wantSuccess  bool
+	}{
+		{name: "attestation appears", mode: "eventual", failures: 2, attempts: 4, immutable: "true", wantAPICalls: 3, wantVerify: 1, wantSuccess: true},
+		{name: "release attestation is on a later page", mode: "later-page", attempts: 4, immutable: "true", wantAPICalls: 1, wantVerify: 1, wantSuccess: true},
+		{name: "unrelated attestation precedes release attestation", mode: "unrelated-first", attempts: 4, immutable: "true", wantAPICalls: 2, wantVerify: 2, wantSuccess: true},
+		{name: "attestation stays absent", mode: "eventual", failures: 3, attempts: 2, immutable: "true", wantAPICalls: 2},
+		{name: "mutable release", mode: "eventual", attempts: 4, immutable: "false"},
+		{name: "authentication failure", mode: "401", attempts: 4, immutable: "true", wantAPICalls: 1},
+		{name: "authorization failure", mode: "403", attempts: 4, immutable: "true", wantAPICalls: 1},
+		{name: "throttled", mode: "429", attempts: 4, immutable: "true", wantAPICalls: 1},
+		{name: "server failure", mode: "500", attempts: 4, immutable: "true", wantAPICalls: 1},
+		{name: "transport failure", mode: "transport", attempts: 4, immutable: "true", wantAPICalls: 1},
+		{name: "empty successful response exhausts its bound", mode: "empty", attempts: 2, immutable: "true", wantAPICalls: 2},
+		{name: "malformed API response", mode: "malformed", attempts: 4, immutable: "true", wantAPICalls: 1},
+		{name: "missing page", mode: "missing-page", attempts: 4, immutable: "true", wantAPICalls: 1},
+		{name: "non-object page", mode: "nonobject-page", attempts: 4, immutable: "true", wantAPICalls: 1},
+		{name: "missing attestations array", mode: "missing-attestations", attempts: 4, immutable: "true", wantAPICalls: 1},
+		{name: "non-array attestations", mode: "nonarray-attestations", attempts: 4, immutable: "true", wantAPICalls: 1},
+		{name: "non-object attestation", mode: "nonobject-attestation", attempts: 4, immutable: "true", wantAPICalls: 1},
+		{name: "missing initiator", mode: "missing-initiator", attempts: 4, immutable: "true", wantAPICalls: 1},
+		{name: "null initiator", mode: "null-initiator", attempts: 4, immutable: "true", wantAPICalls: 1},
+		{name: "empty initiator", mode: "empty-initiator", attempts: 4, immutable: "true", wantAPICalls: 1},
+		{name: "missing bundle URL", mode: "missing-bundle-url", attempts: 4, immutable: "true", wantAPICalls: 1},
+		{name: "null bundle URL", mode: "null-bundle-url", attempts: 4, immutable: "true", wantAPICalls: 1},
+		{name: "non-string bundle URL", mode: "nonstring-bundle-url", attempts: 4, immutable: "true", wantAPICalls: 1},
+		{name: "empty bundle URL", mode: "empty-bundle-url", attempts: 4, immutable: "true", wantAPICalls: 1},
+		{name: "malformed verified response", mode: "malformed-verification", attempts: 4, immutable: "true", wantAPICalls: 1, wantVerify: 1},
+		{name: "verified response names another tag", mode: "mismatched-verification", attempts: 4, immutable: "true", wantAPICalls: 1, wantVerify: 1},
+		{name: "final verification failure", mode: "verify-failure", attempts: 4, immutable: "true", wantAPICalls: 1, wantVerify: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			tools := t.TempDir()
+			calls := filepath.Join(tools, "calls.log")
+			apiCalls := filepath.Join(tools, "api-calls")
+			if err := os.WriteFile(apiCalls, []byte("0\n"), 0o600); err != nil {
+				t.Fatalf("initialize API calls: %v", err)
+			}
+			fakeGH := `#!/bin/sh
+printf 'gh %s\n' "$*" >> "$BILLET_TEST_CALLS"
+if [ "$1 $2" = "release view" ]; then
+    printf '%s\n' "$BILLET_TEST_IMMUTABLE"
+    exit 0
+fi
+if [ "$1" = api ]; then
+    count=$(sed -n '1p' "$BILLET_TEST_API_CALLS")
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$BILLET_TEST_API_CALLS"
+    case "$BILLET_TEST_MODE" in
+			eventual)
+            if [ "$count" -le "$BILLET_TEST_FAILURES" ]; then
+                printf 'gh: Not Found (HTTP 404)\n' >&2
+                exit 1
+            fi
+			printf '[{"attestations":[{"initiator":"github","bundle_url":"https://attestations.example/v0.2.0.json.sn"}]}]\n'
+            ;;
+        401|403|429|500)
+			printf 'gh: failure (HTTP %s)\n' "$BILLET_TEST_MODE" >&2
+            exit 1
+            ;;
+        transport)
+            printf 'connection reset by peer\n' >&2
+            exit 1
+            ;;
+        empty)
+			printf '[{"attestations":[]}]\n'
+            ;;
+        malformed)
+			printf '{not json\n'
+            ;;
+		missing-page)
+			printf '[]\n'
+			;;
+		nonobject-page)
+			printf '[null]\n'
+			;;
+		missing-attestations)
+			printf '[{}]\n'
+			;;
+		nonarray-attestations)
+			printf '[{"attestations":{}}]\n'
+			;;
+		nonobject-attestation)
+			printf '[{"attestations":[null]}]\n'
+			;;
+		missing-initiator)
+			printf '[{"attestations":[{}]}]\n'
+			;;
+		null-initiator)
+			printf '[{"attestations":[{"initiator":null}]}]\n'
+			;;
+		empty-initiator)
+			printf '[{"attestations":[{"initiator":""}]}]\n'
+			;;
+		missing-bundle-url)
+			printf '[{"attestations":[{"initiator":"github"}]}]\n'
+			;;
+		null-bundle-url)
+			printf '[{"attestations":[{"initiator":"github","bundle_url":null}]}]\n'
+			;;
+		nonstring-bundle-url)
+			printf '[{"attestations":[{"initiator":"github","bundle_url":42}]}]\n'
+			;;
+		empty-bundle-url)
+			printf '[{"attestations":[{"initiator":"github","bundle_url":""}]}]\n'
+			;;
+		verify-failure|malformed-verification|mismatched-verification)
+			printf '[{"attestations":[{"initiator":"github","bundle_url":"https://attestations.example/v0.2.0.json.sn"}]}]\n'
+			;;
+		unrelated-first)
+			if [ "$count" -eq 1 ]; then
+				printf '[{"attestations":[{"initiator":"github","bundle_url":"https://attestations.example/v0.1.0.json.sn"}]}]\n'
+			else
+				printf '[{"attestations":[{"initiator":"github","bundle_url":"https://attestations.example/v0.2.0.json.sn"}]}]\n'
+			fi
+			;;
+		later-page)
+			printf '[{"attestations":[{"initiator":"github","bundle_url":"https://attestations.example/v0.1.0.json.sn"}]},{"attestations":[{"initiator":"github","bundle_url":"https://attestations.example/v0.2.0.json.sn"}]}]\n'
+			;;
+    esac
+    exit 0
+fi
+if [ "$1 $2" = "release verify" ]; then
+	if [ "$BILLET_TEST_MODE" = unrelated-first ] && [ "$(sed -n '1p' "$BILLET_TEST_API_CALLS")" -eq 1 ]; then
+		printf 'no attestations found for release v0.2.0 in billet\n' >&2
+		exit 1
+	fi
+    if [ "$BILLET_TEST_MODE" = verify-failure ]; then
+        printf 'digest mismatch\n' >&2
+        exit 1
+    fi
+	if [ "$BILLET_TEST_MODE" = malformed-verification ]; then
+		printf '{not json\n'
+		exit 0
+	fi
+	verified_tag=v0.2.0
+	if [ "$BILLET_TEST_MODE" = mismatched-verification ]; then verified_tag=v0.1.0; fi
+	printf '{"attestation":{"bundle_url":"https://attestations.example/%s.json.sn","initiator":"github"},"verificationResult":{"statement":{"predicate":{"tag":"%s"}}}}\n' "$verified_tag" "$verified_tag"
+    exit 0
+fi
+exit 97
+`
+			writeExecutable(t, filepath.Join(tools, "gh"), fakeGH)
+			writeExecutable(t, filepath.Join(tools, "git"), `#!/bin/sh
+printf 'git %s\n' "$*" >> "$BILLET_TEST_CALLS"
+case "$*" in
+    "rev-parse --show-object-format") printf 'sha1\n' ;;
+    "rev-parse refs/tags/v0.2.0") printf '256ab3dd4414643c5acc57055f7a81cff99bc4d1\n' ;;
+    *) exit 98 ;;
+esac
+`)
+			writeExecutable(t, filepath.Join(tools, "timeout"), "#!/bin/sh\nprintf 'timeout %s\\n' \"$*\" >> \"$BILLET_TEST_CALLS\"\n[ \"$1\" = --signal=KILL ] || exit 96\nshift\nshift\nexec \"$@\"\n")
+			cmd := exec.CommandContext(t.Context(), verifier)
+			cmd.Env = append(os.Environ(),
+				"PATH="+tools+":"+os.Getenv("PATH"),
+				"BILLET_TEST_CALLS="+calls,
+				"BILLET_TEST_API_CALLS="+apiCalls,
+				"BILLET_TEST_MODE="+tc.mode,
+				fmt.Sprintf("BILLET_TEST_FAILURES=%d", tc.failures),
+				"BILLET_TEST_IMMUTABLE="+tc.immutable,
+				"GITHUB_REPOSITORY=junioryono/billet",
+				"RELEASE_TAG=v0.2.0",
+				fmt.Sprintf("RELEASE_VERIFY_ATTEMPTS=%d", tc.attempts),
+				"RELEASE_VERIFY_INTERVAL_SECONDS=0",
+				"RELEASE_VERIFY_DEADLINE_SECONDS=30",
+				"RELEASE_VERIFY_ATTEMPT_TIMEOUT_SECONDS=15",
+				"GH_TOKEN=sentinel-secret-that-must-not-leak",
+			)
+			output, err := cmd.CombinedOutput()
+			if (err == nil) != tc.wantSuccess {
+				t.Fatalf("verification error = %v; want success %t\n%s", err, tc.wantSuccess, output)
+			}
+			apiBody, err := os.ReadFile(apiCalls)
+			if err != nil {
+				t.Fatalf("read API calls: %v", err)
+			}
+			if string(apiBody) != fmt.Sprintf("%d\n", tc.wantAPICalls) {
+				t.Fatalf("API calls = %q; want %d\n%s", apiBody, tc.wantAPICalls, output)
+			}
+			callBody, err := os.ReadFile(calls)
+			if err != nil {
+				t.Fatalf("read calls: %v", err)
+			}
+			callsText := string(callBody)
+			if strings.Contains(string(output)+callsText, "sentinel-secret-that-must-not-leak") {
+				t.Fatal("GH_TOKEN leaked into output or command arguments")
+			}
+			verifyCall := "gh release verify v0.2.0 --repo junioryono/billet --format json\n"
+			verifyCalls := 0
+			for _, line := range strings.Split(callsText, "\n") {
+				if line+"\n" == verifyCall {
+					verifyCalls++
+				}
+			}
+			if verifyCalls != tc.wantVerify {
+				t.Fatalf("verification calls = %d; want %d\n%s", verifyCalls, tc.wantVerify, callsText)
+			}
+			if tc.wantAPICalls > 0 {
+				wantAPI := "gh api --paginate --slurp repos/junioryono/billet/attestations/sha1:256ab3dd4414643c5acc57055f7a81cff99bc4d1?predicate_type=release&per_page=100\n"
+				if !strings.Contains(callsText, wantAPI) {
+					t.Fatalf("missing exact attestation API call\n%s", callsText)
+				}
+				if tc.wantVerify > 0 && strings.LastIndex(callsText, wantAPI) >= strings.LastIndex(callsText, verifyCall) {
+					t.Fatalf("verification did not follow successful attestation discovery\n%s", callsText)
+				}
+			}
+		})
+	}
+}
+
+func TestReleaseAttestationVerifierAcceptsALightweightTag(t *testing.T) {
+	verifier, err := filepath.Abs("verify-release-attestation.sh")
+	if err != nil {
+		t.Fatalf("absolute attestation verifier path: %v", err)
+	}
+	repository := t.TempDir()
+	runGit(t, repository, "init", "--quiet")
+	runGit(t, repository, "config", "user.name", "Billet Test")
+	runGit(t, repository, "config", "user.email", "billet@example.invalid")
+	runGit(t, repository, "commit", "--allow-empty", "--quiet", "-m", "fixture")
+	runGit(t, repository, "tag", "v0.2.0")
+
+	tools := t.TempDir()
+	writeExecutable(t, filepath.Join(tools, "gh"), `#!/bin/sh
+case "$1 $2" in
+    "release view") printf 'true\n' ;;
+    "api --paginate") printf '[{"attestations":[{"initiator":"github","bundle_url":"https://attestations.example/v0.2.0.json.sn"}]}]\n' ;;
+    "release verify") printf '{"attestation":{"bundle_url":"https://attestations.example/v0.2.0.json.sn","initiator":"github"},"verificationResult":{"statement":{"predicate":{"tag":"v0.2.0"}}}}\n' ;;
+    *) exit 97 ;;
+esac
+`)
+	writeExecutable(t, filepath.Join(tools, "timeout"), "#!/bin/sh\n[ \"$1\" = --signal=KILL ] || exit 96\nshift\nshift\nexec \"$@\"\n")
+
+	cmd := exec.CommandContext(t.Context(), verifier)
+	cmd.Dir = repository
+	cmd.Env = append(os.Environ(),
+		"PATH="+tools+":"+os.Getenv("PATH"),
+		"GITHUB_REPOSITORY=junioryono/billet",
+		"RELEASE_TAG=v0.2.0",
+		"RELEASE_VERIFY_ATTEMPTS=1",
+		"RELEASE_VERIFY_INTERVAL_SECONDS=0",
+		"RELEASE_VERIFY_DEADLINE_SECONDS=30",
+		"RELEASE_VERIFY_ATTEMPT_TIMEOUT_SECONDS=15",
+	)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("lightweight tag was refused: %v\n%s", err, output)
+	}
+}
+
+func TestReleaseAttestationVerifierBoundsABlockedAPIRequest(t *testing.T) {
+	verifier, err := filepath.Abs("verify-release-attestation.sh")
+	if err != nil {
+		t.Fatalf("absolute attestation verifier path: %v", err)
+	}
+	tools := t.TempDir()
+	writeExecutable(t, filepath.Join(tools, "gh"), `#!/bin/sh
+if [ "$1 $2" = "release view" ]; then printf 'true\n'; exit 0; fi
+if [ "$1" = api ]; then exec /usr/bin/perl -e '$SIG{TERM} = "IGNORE"; while (1) {}'; fi
+exit 97
+`)
+	writeExecutable(t, filepath.Join(tools, "git"), `#!/bin/sh
+case "$*" in
+    "rev-parse --show-object-format") printf 'sha1\n' ;;
+    "rev-parse refs/tags/v0.2.0") printf '256ab3dd4414643c5acc57055f7a81cff99bc4d1\n' ;;
+    *) exit 98 ;;
+esac
+`)
+	cmd := exec.CommandContext(t.Context(), verifier)
+	cmd.Env = append(os.Environ(),
+		"PATH="+tools+":"+os.Getenv("PATH"),
+		"GITHUB_REPOSITORY=junioryono/billet",
+		"RELEASE_TAG=v0.2.0",
+		"RELEASE_VERIFY_ATTEMPTS=4",
+		"RELEASE_VERIFY_INTERVAL_SECONDS=0",
+		"RELEASE_VERIFY_DEADLINE_SECONDS=1",
+		"RELEASE_VERIFY_ATTEMPT_TIMEOUT_SECONDS=15",
+	)
+	started := time.Now()
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("blocked API request unexpectedly succeeded\n%s", output)
+	}
+	if elapsed := time.Since(started); elapsed > 3*time.Second {
+		t.Fatalf("blocked API request ran for %s; want no more than 3s\n%s", elapsed, output)
 	}
 }
 
