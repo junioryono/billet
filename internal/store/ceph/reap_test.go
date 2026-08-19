@@ -209,7 +209,7 @@ func TestReapRemovesEveryMetadataKeyOfTheGenerationsItRemoves(t *testing.T) {
 		t.Fatalf("reap: %v", err)
 	}
 
-	for _, key := range []string{VerifiedKey, RunnerVersionKey, KernelKey} {
+	for _, key := range []string{VerifiedKey, RunnerVersionKey, KernelKey, GuestContractKey} {
 		want := key + ".g20260814072427"
 
 		if !f.ranWith("image-meta", "remove", want) {

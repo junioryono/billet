@@ -83,20 +83,50 @@
     - { path: /var/lib/billet/server, owner: "{{ billet_service_user }}", group: "{{ billet_service_group }}", mode: "0700" }
     - { path: /var/lib/billet/node, owner: root, group: root, mode: "0700" }
     - { path: /var/lib/billet/health, owner: root, group: root, mode: "0750" }
+    - { path: /var/lib/billet/upgrades, owner: root, group: root, mode: "0700" }
+    - { path: "{{ billet_firecracker_stage }}", owner: root, group: root, mode: "0700" }
     - { path: /srv/jailer, owner: root, group: root, mode: "0755" }
     - { path: /usr/local/libexec, owner: root, group: root, mode: "0755" }
   become: true
 
-- name: Install the billet binary
+- name: Stage the candidate billet binary without replacing the running version
   ansible.builtin.copy:
     src: "{{ billet_binary_src }}"
-    dest: /usr/bin/billet
+    dest: "{{ billet_firecracker_stage }}/billet-candidate"
     owner: root
     group: root
     mode: "0755"
-  register: billet_binary_install
+  register: billet_binary_candidate_stage
   become: true
   when: billet_binary_src | length > 0
+
+- name: Inspect the installed and candidate billet binaries
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    checksum_algorithm: sha256
+  register: billet_binary_checksums
+  loop:
+    - /usr/bin/billet
+    - "{{ billet_firecracker_stage }}/billet-candidate"
+  check_mode: false
+  become: true
+
+- name: Decide whether the billet binary needs a transactional upgrade
+  ansible.builtin.set_fact:
+    billet_binary_upgrade: >-
+      {{
+        billet_binary_src | length > 0 and
+        (
+          (ansible_check_mode and billet_binary_candidate_stage.changed | default(false)) or
+          (
+            billet_binary_checksums.results[1].stat.exists and
+            (
+              not billet_binary_checksums.results[0].stat.exists or
+              billet_binary_checksums.results[0].stat.checksum != billet_binary_checksums.results[1].stat.checksum
+            )
+          )
+        )
+      }}
 
 - name: Install the billet systemd units
   ansible.builtin.template:

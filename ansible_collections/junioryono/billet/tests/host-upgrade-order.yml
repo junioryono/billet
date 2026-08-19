@@ -1,0 +1,53 @@
+---
+- name: Guard the transactional host-upgrade ordering
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    billet_host_service_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/services.yml') | from_yaml }}"
+  tasks:
+    - name: Locate the upgrade transaction
+      ansible.builtin.set_fact:
+        billet_upgrade_task: "{{ billet_host_service_tasks | selectattr('name', 'equalto', 'Upgrade billet as one recoverable host transaction') | first }}"
+        billet_top_level_names: "{{ billet_host_service_tasks | map(attribute='name') | list }}"
+
+    - name: Record transaction and rollback task names
+      ansible.builtin.set_fact:
+        billet_upgrade_names: "{{ billet_upgrade_task.block | map(attribute='name') | list }}"
+        billet_rollback_names: "{{ billet_upgrade_task.rescue | map(attribute='name') | list }}"
+        billet_upgrade_stop_node: "{{ billet_upgrade_task.block | selectattr('name', 'equalto', 'Gracefully stop the billet node before changing its guest contract') | first }}"
+        billet_upgrade_stop_server: "{{ billet_upgrade_task.block | selectattr('name', 'equalto', 'Gracefully stop the billet server after compute has drained') | first }}"
+        billet_upgrade_backup_ledger: "{{ billet_upgrade_task.block | selectattr('name', 'equalto', 'Preserve the stopped control-plane ledger') | first }}"
+        billet_rollback_restore_ledger: "{{ billet_upgrade_task.rescue | selectattr('name', 'equalto', 'Restore the previous control-plane ledger') | first }}"
+
+    - name: Require image proof before the upgrade transaction
+      ansible.builtin.assert:
+        that:
+          - billet_top_level_names.index('Prove the selected guest image is compatible with the candidate binary') < billet_top_level_names.index('Upgrade billet as one recoverable host transaction')
+
+    - name: Require drain, refresh, backup, migration, and restart ordering
+      ansible.builtin.assert:
+        that:
+          - billet_upgrade_names.index('Gracefully stop the billet node before changing its guest contract') < billet_upgrade_names.index('Pull, boot-verify, and promote a compatible guest when needed')
+          - billet_upgrade_names.index('Pull, boot-verify, and promote a compatible guest when needed') < billet_upgrade_names.index('Gracefully stop the billet server after compute has drained')
+          - billet_upgrade_names.index('Gracefully stop the billet server after compute has drained') < billet_upgrade_names.index('Preserve the stopped control-plane ledger')
+          - billet_upgrade_names.index('Preserve the stopped control-plane ledger') < billet_upgrade_names.index('Install the candidate billet binary after the ledger lock is released')
+          - billet_upgrade_names.index('Install the candidate billet binary after the ledger lock is released') < billet_upgrade_names.index('Validate and migrate with the new billet binary as the only ledger writer')
+          - billet_upgrade_names.index('Validate and migrate with the new billet binary as the only ledger writer') < billet_upgrade_names.index('Start the upgraded billet server before admitting compute')
+          - billet_upgrade_names.index('Start the upgraded billet server before admitting compute') < billet_upgrade_names.index('Start the upgraded billet node after validation and image verification')
+
+    - name: Require the transaction to stop existing services before applying new desired state
+      ansible.builtin.assert:
+        that:
+          - "'when' not in billet_upgrade_stop_node"
+          - "'when' not in billet_upgrade_stop_server"
+          - "'when' not in billet_upgrade_backup_ledger"
+          - "'billet_enable_server' not in (billet_rollback_restore_ledger.when | join(' '))"
+
+    - name: Require rollback to stop new processes before restoring state
+      ansible.builtin.assert:
+        that:
+          - billet_rollback_names.index('Stop upgraded compute before rollback') < billet_rollback_names.index('Remove the migrated ledger copy before restoring the stopped snapshot')
+          - billet_rollback_names.index('Stop the upgraded control plane before restoring its ledger') < billet_rollback_names.index('Remove the migrated ledger copy before restoring the stopped snapshot')
+          - billet_rollback_names.index('Remove the migrated ledger copy before restoring the stopped snapshot') < billet_rollback_names.index('Restore the previous control-plane ledger')
+          - billet_rollback_names.index('Restore the previous control-plane ledger') < billet_rollback_names.index('Restart the previous billet server after rollback')

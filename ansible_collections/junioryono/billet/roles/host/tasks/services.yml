@@ -2,11 +2,261 @@
 - name: Apply unit changes before billet validation
   ansible.builtin.meta: flush_handlers
 
-- name: Validate the finished billet host
+- name: Prove the selected guest image is compatible with the candidate binary
+  ansible.builtin.command:
+    argv:
+      - "{{ billet_firecracker_stage }}/billet-candidate"
+      - images
+      - compatible
+      - --config
+      - /etc/billet/billet.yaml
+  register: billet_guest_compatibility
+  changed_when: false
+  failed_when: billet_guest_compatibility.rc not in [0, 2]
+  when:
+    - billet_binary_upgrade | default(false)
+    - billet_firecracker_enabled
+    - not ansible_check_mode
+  become: true
+
+- name: Inspect billet service state before the upgrade transaction
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - is-active
+      - "{{ item }}"
+  loop:
+    - billet-server.service
+    - billet-node.service
+  register: billet_service_state_before_upgrade
+  changed_when: false
+  failed_when: billet_service_state_before_upgrade.rc not in [0, 3, 4]
+  check_mode: false
+  when:
+    - billet_binary_upgrade | default(false)
+    - not ansible_check_mode
+  become: true
+
+- name: Initialize upgrade rollback facts
+  ansible.builtin.set_fact:
+    billet_promoted_image: ""
+    billet_upgrade_recovery_dir: ""
+  when:
+    - billet_binary_upgrade | default(false)
+    - not ansible_check_mode
+
+- name: Upgrade billet as one recoverable host transaction
+  when:
+    - billet_binary_upgrade | default(false)
+    - not ansible_check_mode
+  become: true
+  block:
+    - name: Gracefully stop the billet node before changing its guest contract
+      ansible.builtin.systemd_service:
+        name: billet-node.service
+        state: stopped
+
+    - name: Pull, boot-verify, and promote a compatible guest when needed
+      ansible.builtin.command:
+        argv:
+          - "{{ billet_firecracker_stage }}/billet-candidate"
+          - images
+          - pull
+          - --verify
+          - --result-file
+          - "{{ billet_firecracker_stage }}/prepared-image"
+          - --config
+          - /etc/billet/billet.yaml
+      register: billet_guest_refresh
+      when:
+        - billet_firecracker_enabled
+        - billet_guest_compatibility.rc == 2
+
+    - name: Read the generation promoted for this upgrade
+      ansible.builtin.slurp:
+        src: "{{ billet_firecracker_stage }}/prepared-image"
+      register: billet_promoted_image_file
+      when: billet_guest_refresh is changed
+
+    - name: Remember the promoted generation for rollback
+      ansible.builtin.set_fact:
+        billet_promoted_image: "{{ billet_promoted_image_file.content | b64decode | trim }}"
+      when: billet_promoted_image_file.content is defined
+
+    - name: Gracefully stop the billet server after compute has drained
+      ansible.builtin.systemd_service:
+        name: billet-server.service
+        state: stopped
+
+    - name: Allocate a unique recovery directory for this upgrade
+      ansible.builtin.command:
+        argv:
+          - date
+          - -u
+          - +%Y%m%dT%H%M%S%N
+      register: billet_upgrade_timestamp
+      changed_when: false
+
+    - name: Record the recovery directory
+      ansible.builtin.set_fact:
+        billet_upgrade_recovery_dir: "/var/lib/billet/upgrades/{{ billet_upgrade_timestamp.stdout }}"
+
+    - name: Create the recovery directory
+      ansible.builtin.file:
+        path: "{{ billet_upgrade_recovery_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Preserve the previous billet binary
+      ansible.builtin.copy:
+        src: /usr/bin/billet
+        dest: "{{ billet_upgrade_recovery_dir }}/billet.previous"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0755"
+      when: billet_binary_checksums.results[0].stat.exists
+
+    - name: Preserve the stopped control-plane ledger
+      ansible.builtin.command:
+        argv:
+          - cp
+          - -a
+          - /var/lib/billet/server
+          - "{{ billet_upgrade_recovery_dir }}/server"
+        creates: "{{ billet_upgrade_recovery_dir }}/server"
+
+    - name: Install the candidate billet binary after the ledger lock is released
+      ansible.builtin.copy:
+        src: "{{ billet_firecracker_stage }}/billet-candidate"
+        dest: /usr/bin/billet
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0755"
+      register: billet_binary_install
+
+    - name: Validate and migrate with the new billet binary as the only ledger writer
+      ansible.builtin.command: /usr/bin/billet check --config /etc/billet/billet.yaml
+      register: billet_check
+      changed_when: false
+
+    - name: Return the migrated ledger to the control-plane account before restart
+      ansible.builtin.file:
+        path: /var/lib/billet/server
+        state: directory
+        owner: "{{ billet_service_user }}"
+        group: "{{ billet_service_group }}"
+        recurse: true
+
+    - name: Start the upgraded billet server before admitting compute
+      ansible.builtin.systemd_service:
+        name: billet-server.service
+        enabled: true
+        state: started
+      when: billet_enable_server
+
+    - name: Start the upgraded billet node after validation and image verification
+      ansible.builtin.systemd_service:
+        name: billet-node.service
+        enabled: true
+        state: started
+      when: billet_enable_node
+
+  rescue:
+    - name: Stop upgraded compute before rollback
+      ansible.builtin.systemd_service:
+        name: billet-node.service
+        state: stopped
+      failed_when: false
+
+    - name: Stop the upgraded control plane before restoring its ledger
+      ansible.builtin.systemd_service:
+        name: billet-server.service
+        state: stopped
+      failed_when: false
+
+    - name: Withdraw the guest generation promoted only for the failed upgrade
+      ansible.builtin.command:
+        argv:
+          - "{{ billet_firecracker_stage }}/billet-candidate"
+          - images
+          - unpromote
+          - --config
+          - /etc/billet/billet.yaml
+          - "{{ billet_promoted_image }}"
+      failed_when: false
+      when: billet_promoted_image | default('') | length > 0
+
+    - name: Remove the migrated ledger copy before restoring the stopped snapshot
+      ansible.builtin.file:
+        path: /var/lib/billet/server
+        state: absent
+      when:
+        - billet_upgrade_recovery_dir | length > 0
+
+    - name: Restore the previous control-plane ledger
+      ansible.builtin.command:
+        argv:
+          - cp
+          - -a
+          - "{{ billet_upgrade_recovery_dir }}/server"
+          - /var/lib/billet/server
+      when:
+        - billet_upgrade_recovery_dir | length > 0
+
+    - name: Restore the previous billet binary
+      ansible.builtin.copy:
+        src: "{{ billet_upgrade_recovery_dir }}/billet.previous"
+        dest: /usr/bin/billet
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0755"
+      when:
+        - billet_upgrade_recovery_dir | length > 0
+        - billet_binary_checksums.results[0].stat.exists
+
+    - name: Remove a failed first-install binary with no predecessor
+      ansible.builtin.file:
+        path: /usr/bin/billet
+        state: absent
+      when:
+        - billet_upgrade_recovery_dir | length > 0
+        - not billet_binary_checksums.results[0].stat.exists
+
+    - name: Restart the previous billet server after rollback
+      ansible.builtin.systemd_service:
+        name: billet-server.service
+        state: started
+      failed_when: false
+      when:
+        - billet_service_state_before_upgrade.results[0].rc == 0
+
+    - name: Restart the previous billet node after rollback
+      ansible.builtin.systemd_service:
+        name: billet-node.service
+        state: started
+      failed_when: false
+      when:
+        - billet_service_state_before_upgrade.results[1].rc == 0
+
+    - name: Report the failed upgrade and its recovery copy
+      ansible.builtin.fail:
+        msg: >-
+          The billet upgrade failed and the previous binary, ledger, and service
+          state were restored. The recovery copy remains at
+          {{ billet_upgrade_recovery_dir if billet_upgrade_recovery_dir | length > 0 else '/var/lib/billet/upgrades (the failure happened before a copy was created)' }}.
+
+- name: Validate a billet host whose binary did not change
   ansible.builtin.command: /usr/bin/billet check --config /etc/billet/billet.yaml
   register: billet_check
   changed_when: false
-  when: not ansible_check_mode
+  when:
+    - not billet_binary_upgrade | default(false)
+    - not ansible_check_mode
   become: true
 
 - name: Return server state created by validation to the control-plane account
@@ -46,29 +296,29 @@
     - not ansible_check_mode
   become: true
 
-- name: Restart the billet server after its installed inputs change
+- name: Restart the billet server after non-binary inputs change
   ansible.builtin.systemd_service:
     name: billet-server.service
     state: restarted
   when:
     - billet_enable_server
     - not ansible_check_mode
+    - not billet_binary_upgrade | default(false)
     - >-
-      billet_binary_install.changed | default(false) or
       billet_config_install.changed | default(false) or
       billet_private_key_install.changed | default(false) or
       billet_systemd_units.changed | default(false)
   become: true
 
-- name: Restart the billet node after its installed inputs change
+- name: Restart the billet node after non-binary inputs change
   ansible.builtin.systemd_service:
     name: billet-node.service
     state: restarted
   when:
     - billet_enable_node
     - not ansible_check_mode
+    - not billet_binary_upgrade | default(false)
     - >-
-      billet_binary_install.changed | default(false) or
       billet_config_install.changed | default(false) or
       billet_firecracker_install.changed | default(false) or
       billet_firecracker_links.changed | default(false) or

@@ -14,6 +14,7 @@ import (
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/provider"
+	"github.com/junioryono/billet/internal/provider/firecracker"
 	"github.com/junioryono/billet/internal/state"
 	"github.com/junioryono/billet/internal/store/ceph"
 )
@@ -33,12 +34,14 @@ import (
 // it is to give it something to say and a place to say it.
 func cmdImages(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: billet images <pull|verify|due|list|reap|promote|unpromote>")
+		return errors.New("usage: billet images <pull|compatible|verify|due|list|reap|promote|unpromote>")
 	}
 
 	switch args[0] {
 	case "pull":
 		return cmdImagesPull(ctx, args[1:])
+	case "compatible":
+		return cmdImagesCompatible(ctx, args[1:])
 	case "verify":
 		return cmdImagesVerify(ctx, args[1:])
 	case "due":
@@ -54,6 +57,146 @@ func cmdImages(ctx context.Context, args []string) error {
 	default:
 		return fmt.Errorf("billet images: unknown subcommand %q", args[0])
 	}
+}
+
+// cmdImagesCompatible proves that the selected generation speaks this binary's
+// guest contract without downloading another image when the answer is already on
+// the generation. A pre-metadata generation is boot-verified once and backfilled;
+// after that every ordinary host converge is a metadata read.
+func cmdImagesCompatible(ctx context.Context, args []string) error {
+	fs := newFlagSet("billet images compatible")
+	cfgPath := addConfigFlag(fs)
+	wait := fs.Duration("wait", 3*time.Minute, "how long to give an unrecorded guest to prove itself")
+
+	rest, err := parseWithName(fs, args)
+	if err != nil {
+		return err
+	}
+
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		return err
+	}
+
+	if cfg.Node == nil || cfg.Node.Ceph == nil {
+		return errors.New("billet images compatible: this config names no ceph cluster")
+	}
+
+	image := rest
+	if image == "" {
+		image = firecrackerTierImage(cfg)
+	}
+	if image == "" {
+		return errors.New("billet images compatible: no image given and no firecracker tier names one")
+	}
+
+	name, generation, found := strings.Cut(image, "@")
+	if !found || name == "" || generation == "" {
+		return fmt.Errorf("billet images compatible: %q does not name an exact generation or @%s",
+			image, ceph.Verified)
+	}
+
+	store, err := ceph.New(*cfg.Node.Ceph)
+	if err != nil {
+		return err
+	}
+
+	floating := generation == ceph.Verified
+	var verified bool
+	if floating {
+		newest, ok, err := store.NewestVerified(ctx, name)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return incompatibleGuest(image, "no generation has passed verification")
+		}
+
+		generation = newest.Name
+		verified = true
+	} else {
+		generations, err := store.Generations(ctx, name)
+		if err != nil {
+			return err
+		}
+
+		present := false
+		for _, candidate := range generations {
+			if candidate.Name == generation {
+				present = true
+
+				break
+			}
+		}
+		if !present {
+			return fmt.Errorf("billet images compatible: pinned generation %s@%s no longer exists; update the exact pin before upgrading",
+				name, generation)
+		}
+
+		verifiedGenerations, err := store.VerifiedGenerations(ctx, name)
+		if err != nil {
+			return err
+		}
+
+		verified = verifiedGenerations[generation]
+	}
+
+	contract, recorded, err := store.GuestContract(ctx, name, generation)
+	if err != nil {
+		return err
+	}
+
+	exact := name + "@" + generation
+	needsBoot, err := guestNeedsCompatibilityBoot(exact, contract, recorded, verified, floating)
+	if err != nil {
+		return err
+	}
+	if !needsBoot {
+		fmt.Printf("%s speaks guest contract %s; no image download is needed\n",
+			exact, firecracker.GuestContract)
+
+		return nil
+	}
+
+	// A GENERATION FROM BEFORE CONTRACT METADATA IS NOT ASSUMED INCOMPATIBLE. A
+	// real boot is cheaper than a multi-gigabyte replacement and produces the fact
+	// future upgrades can read without booting again.
+	if err := cmdImagesVerify(ctx, []string{
+		"--config", *cfgPath,
+		"--wait", wait.String(),
+		exact,
+	}); err != nil {
+		return incompatibleGuest(exact, fmt.Sprintf("it has no recorded guest contract and did not pass a compatibility boot: %v", err))
+	}
+
+	fmt.Printf("%s passed a compatibility boot and now records guest contract %s\n",
+		exact, firecracker.GuestContract)
+
+	return nil
+}
+
+func guestNeedsCompatibilityBoot(
+	image, contract string,
+	recorded, verified, floating bool,
+) (bool, error) {
+	if recorded && contract != firecracker.GuestContract {
+		if !floating {
+			return false, fmt.Errorf("%s is pinned to guest contract %s, while this binary requires %s; update the exact generation pin before upgrading",
+				image, contract, firecracker.GuestContract)
+		}
+
+		return false, incompatibleGuest(image, fmt.Sprintf("it speaks guest contract %s, while this binary requires %s",
+			contract, firecracker.GuestContract))
+	}
+
+	// A SIGNED MANIFEST SAYS WHAT THE GUEST WAS BUILT TO SPEAK, not that this
+	// exact imported generation ever booted on the host. Both facts are required
+	// before an upgrade can skip the compatibility boot.
+	return !recorded || !verified, nil
+}
+
+func incompatibleGuest(image, reason string) error {
+	return &exitError{code: 2, msg: fmt.Sprintf("%s is not compatible: %s", image, reason)}
 }
 
 // cmdImagesDue reports whether the golden image is old enough to rebuild.
@@ -169,7 +312,7 @@ func cmdImagesVerify(ctx context.Context, args []string) error {
 	}
 
 	if rest == "" {
-		return errors.New("usage: billet images <pull|verify|due|list|reap|promote|unpromote>")
+		return errors.New("usage: billet images <pull|compatible|verify|due|list|reap|promote|unpromote>")
 	}
 
 	// THE GENERATION IS REQUIRED, not defaulted, for the same reason the provider
@@ -312,6 +455,7 @@ func cmdImagesVerify(ctx context.Context, args []string) error {
 		// reap landing between them leaves a generation verified but unpaired --
 		// every node takes it up and each boots it against its own kernel.
 		if err := store.RecordVerification(ctx, imageName, generation, record,
+			firecracker.GuestContract,
 			existing != "", *allowUnpaired, time.Now()); err != nil {
 			return fmt.Errorf("%s booted and ran a container, but the result could not be "+
 				"recorded, so it has NOT been marked verified: %w", rest, err)

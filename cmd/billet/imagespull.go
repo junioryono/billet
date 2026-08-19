@@ -67,6 +67,10 @@ func cmdImagesPull(ctx context.Context, args []string) error {
 		"where to keep the kernel this image is paired with")
 	allowStale := fs.Bool("allow-stale", false,
 		"import even if the baked runner is past github's thirty days")
+	verify := fs.Bool("verify", false,
+		"boot the imported generation and promote it only after the guest proves it works")
+	resultFile := fs.String("result-file", "",
+		"write the exact imported generation here after every requested verification succeeds")
 	signingIdentity := fs.String("signing-identity", "",
 		"certificate SAN pattern a valid signature must carry (for a non-default source)")
 	signingIssuer := fs.String("signing-issuer", "",
@@ -77,6 +81,13 @@ func cmdImagesPull(ctx context.Context, args []string) error {
 	rest, err := parseWithName(fs, args)
 	if err != nil {
 		return err
+	}
+
+	if *resultFile != "" {
+		if err := os.Remove(*resultFile); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("billet images pull: cannot clear stale result file %s: %w",
+				*resultFile, err)
+		}
 	}
 
 	cfg, err := config.Load(*cfgPath)
@@ -92,6 +103,13 @@ func cmdImagesPull(ctx context.Context, args []string) error {
 	image := rest
 	if image == "" {
 		image = firecrackerTierImage(cfg)
+		if name, generation, found := strings.Cut(image, "@"); found && generation == ceph.Verified {
+			// A TIER NAMING @verified IS THE ORDINARY AUTOMATIC-UPDATE SHAPE. The pull
+			// publishes a new generation of that image and verification advances the
+			// alias; requiring an operator to repeat the bare name defeats the role's
+			// ability to prepare an upgrade without deployment-specific knowledge.
+			image = name
+		}
 	}
 
 	if image == "" {
@@ -167,21 +185,71 @@ func cmdImagesPull(ctx context.Context, args []string) error {
 	fmt.Printf("importing %s into %s/%s\n", filepath.Base(raw), cfg.Node.Ceph.ImagePool, image)
 
 	generation, err := store.ImportGeneration(ctx, image, raw, manifest.RunnerVersion,
-		kernelFileName(manifest), time.Now())
+		kernelFileName(manifest), manifest.GuestContract, time.Now())
 	if err != nil {
 		return err
 	}
 
 	fmt.Printf("\npublished %s@%s (runner %s, kernel %s)\n",
 		image, generation, manifest.RunnerVersion, manifest.Kernel.Version)
-	fmt.Println()
-	fmt.Println("Nothing boots it yet. Verify it, which marks it so `@verified` resolves to it:")
-	fmt.Println()
-	fmt.Printf("    billet images verify %s@%s\n", image, generation)
+	exact := image + "@" + generation
+
+	if *verify {
+		fmt.Printf("\nboot-verifying %s before promotion\n", exact)
+
+		if err := cmdImagesVerify(ctx, []string{"--config", *cfgPath, exact}); err != nil {
+			return err
+		}
+	} else {
+		fmt.Println()
+		fmt.Println("Nothing boots it yet. Verify it, which marks it so `@verified` resolves to it:")
+		fmt.Println()
+		fmt.Printf("    billet images verify %s\n", exact)
+	}
+
+	if *resultFile != "" {
+		if err := writeImageResult(*resultFile, exact); err != nil {
+			return err
+		}
+	}
+
 	fmt.Println()
 	fmt.Printf("The kernel it is paired with is kept at:\n\n    %s\n\n", kernel)
 	fmt.Println("Point node.firecracker.kernel_image at that path. The two are a matched pair,")
 	fmt.Println("and a guest booted with a different kernel fails in the middle of somebody's job.")
+
+	return nil
+}
+
+func writeImageResult(path, image string) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("billet images pull: cannot create the result directory %s: %w", dir, err)
+	}
+
+	tmp, err := os.CreateTemp(dir, ".image-result-*")
+	if err != nil {
+		return fmt.Errorf("billet images pull: cannot stage the result in %s: %w", dir, err)
+	}
+	tmpPath := tmp.Name()
+	defer func() { _ = os.Remove(tmpPath) }()
+
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+
+		return fmt.Errorf("billet images pull: cannot protect the staged result: %w", err)
+	}
+	if _, err := fmt.Fprintln(tmp, image); err != nil {
+		_ = tmp.Close()
+
+		return fmt.Errorf("billet images pull: cannot write the staged result: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("billet images pull: cannot close the staged result: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("billet images pull: cannot install the result at %s: %w", path, err)
+	}
 
 	return nil
 }

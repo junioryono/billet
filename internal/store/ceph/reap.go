@@ -189,6 +189,7 @@ func (c *Client) Reap( //nolint:nonamedreturns // the deferred release reports t
 			VerifiedKey + "." + gen.Name,
 			RunnerVersionKey + "." + gen.Name,
 			KernelKey + "." + gen.Name,
+			GuestContractKey + "." + gen.Name,
 		} {
 			//nolint:errcheck // the generation is already gone; a stale key is not worth failing on
 			_, _ = c.rbdCmd(ctx, false, "-p", c.cfg.ImagePool, "image-meta", "remove", name, key)

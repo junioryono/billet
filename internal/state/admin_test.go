@@ -168,6 +168,23 @@ func TestAnOperatorCommandRefusesToMigrateUnderARunningServer(t *testing.T) {
 	if got := schemaVersion(t, server); got != behind {
 		t.Errorf("schema version = %d after a refused admin open, want %d untouched", got, behind)
 	}
+
+	// THIS IS THE UPGRADE BOUNDARY THE HOST ROLE OWNS. Once the old control plane
+	// has drained and released the directory, the candidate becomes the sole
+	// writer and may apply the append-only migration before anything restarts.
+	if err := server.Close(); err != nil {
+		t.Fatalf("stop the older control plane: %v", err)
+	}
+
+	candidate, err := OpenAdmin(ctx, dir)
+	if err != nil {
+		t.Fatalf("open the stopped older ledger with the candidate: %v", err)
+	}
+	t.Cleanup(func() { _ = candidate.Close() })
+
+	if got, want := schemaVersion(t, candidate), latestVersion(t); got != want {
+		t.Fatalf("schema version after the stopped-ledger migration = %d, want %d", got, want)
+	}
 }
 
 // THE OPEN-TIME CHECK IS A TIME-OF-CHECK-TO-TIME-OF-USE ON ITS OWN.

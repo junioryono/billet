@@ -175,7 +175,7 @@ func (c *Client) NewestVerified(ctx context.Context, image string) (Generation, 
 // been told to allow it.
 func (c *Client) RecordVerification(
 	ctx context.Context,
-	image, generation, kernel string,
+	image, generation, kernel, guestContract string,
 	paired, allowUnpaired bool,
 	at time.Time,
 ) (err error) {
@@ -250,6 +250,14 @@ func (c *Client) RecordVerification(
 		if err := c.SetKernel(ctx, image, generation, kernel); err != nil {
 			return err
 		}
+	}
+
+	// THE CONTRACT BEFORE THE VERIFICATION, for the same reason as the kernel.
+	// A verified generation without it cannot be judged during an upgrade; writing
+	// the verification first would let the fleet take up a generation while the
+	// compatibility fact its next binary depends on is still absent.
+	if err := c.SetGuestContract(ctx, image, generation, guestContract); err != nil {
+		return err
 	}
 
 	return c.MarkVerified(ctx, image+"@"+generation, at)

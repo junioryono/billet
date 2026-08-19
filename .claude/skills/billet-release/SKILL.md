@@ -30,14 +30,15 @@ Guest images use the same repository-wide immutability and therefore publish onl
 
 ## Updating a running host
 
-Install or upgrade from the package attached to the latest release. The package replaces the binary and units but deliberately does not enable or start either service.
+Use the `junioryono.billet.host` role for an in-place release upgrade. It stages the candidate binary without touching the running installation, proves the selected guest image satisfies the candidate's guest contract, and downloads and boot-verifies a compatible immutable guest only when the recorded contract is missing or different. The transaction then stops the node first so compute drains, stops the server after custody is settled, preserves the stopped control-plane ledger and prior binary in a unique `/var/lib/billet/upgrades/` recovery directory, installs the candidate, validates and migrates with the new binary as the only ledger writer, and starts the server before the node.
 
-```bash
-sudo dpkg -i billet_NEW_linux_amd64.deb
-sudo systemctl restart billet-server
-```
+If validation, migration, or restart fails, the role stops the new processes before restoring the prior ledger and binary, removes only the guest generation promoted by that failed attempt, and restarts only services that were active before the transaction. A second converge with the same binary is read-only for the transaction: it validates the host without draining or restarting either service. Do not move binary installation before the server stop or database migration after the new server start; those orderings violate the single-writer invariant and make rollback unable to restore the old schema safely.
 
-The restart is safe because billet drains — SIGTERM stops it taking new work and waits for the jobs already running. It is NOT instant: it takes as long as the longest job still running, up to `drain_timeout`. A second signal (`systemctl kill --kill-whom=main --signal=SIGTERM`) stops the waiting and tears down properly — which DESTROYS the jobs still running and fails those builds, because GitHub does not requeue a job whose runner vanished mid-execution. A third gives up where it stands.
+The CLI pieces used by the transaction are intentionally useful outside Ansible. `billet images compatible` returns success when the exact selected generation records the candidate guest contract, boot-verifies once to backfill older verified generations that lack that metadata, and returns status 2 when a compatible guest must be pulled. `billet images pull --verify --result-file PATH` imports, boot-verifies, promotes, and atomically records the exact new generation only after all of those steps succeed, giving another provisioner a safe rollback handle.
+
+Installing the package directly remains available, but the package replaces the binary and units and deliberately does not enable or start either service. A manual operator is responsible for reproducing the same drain, compatibility, backup, validation, migration, restart, and rollback order; installing a new binary over a running control plane is not a supported transactional upgrade.
+
+The node drain is safe because SIGTERM stops it taking new work and waits for the jobs already running. It is NOT instant: it takes as long as the longest job still running, up to `drain_timeout`. A second signal (`systemctl kill --kill-whom=main --signal=SIGTERM billet-node`) stops the waiting and tears down properly — which DESTROYS the jobs still running and fails those builds, because GitHub does not requeue a job whose runner vanished mid-execution. A third gives up where it stands.
 
 ## Deployment
 
