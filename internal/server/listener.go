@@ -1998,6 +1998,8 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 		// in this loop would settle request N and then try to acknowledge request
 		// zero, leaving the durable completion blocked forever.
 		msg.Completed[i] = job
+		l.log.Info("received a completed job", "tier", l.tier, "request", job.RequestID,
+			"runner", job.RunnerName, "result", job.Result)
 		// THE DELIVERY IS TERMINAL EVEN WHEN ITS TEARDOWN ALREADY SETTLED. A
 		// failed acknowledgement redelivers the whole batch, including an Assigned
 		// entry for an assigned-then-cancelled job. Retired means "do not destroy

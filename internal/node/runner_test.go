@@ -3,6 +3,8 @@ package node
 import (
 	"context"
 	"errors"
+	"log/slog"
+	"net/http"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -207,17 +209,94 @@ func TestACompletionFindsTheCacheSessionOfAdoptedCompute(t *testing.T) {
 }
 
 func TestGitHubSuccessResultSpellingPublishesTheDockerStore(t *testing.T) {
+	storage := &fakeCacheStore{}
+	attacher := &fakeVolumeAttacher{}
+	cache, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", t.TempDir(),
+		storage, attacher, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewCacheService: %v", err)
+	}
+	credentials, err := cache.Prepare("billet-one", provider.TrustTrusted)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	if response := cacheRequest(t, cache, credentials.Token, "/v1/docker-store",
+		map[string]any{"architecture": "amd64"}); response.Code != http.StatusCreated {
+		t.Fatalf("Docker store status = %d: %s", response.Code, response.Body.String())
+	}
+
+	p := &fakeProvider{kind: config.ProviderDocker}
+	runner := &Runner{
+		provider: p, cache: cache, log: slog.New(slog.DiscardHandler),
+		running: map[int64]*provider.Instance{
+			11: {ID: "instance-billet-one", Name: "billet-one", Running: true},
+		},
+		runningLease: map[int64]*alloc.Lease{}, custody: map[string]*custody{},
+	}
+	destroyed := make(chan error, 1)
+	go func() { destroyed <- runner.DestroyCompleted(t.Context(), 11, "Succeeded") }()
+
+	proof := map[string]any{
+		"filesystem": map[string]any{"type": "ext4", "uuid": "docker-fs", "clean": true},
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		ready := cacheRequest(t, cache, credentials.Token, "/v1/docker-store/ready", proof)
+		if ready.Code == http.StatusOK {
+			break
+		}
+		if ready.Code != http.StatusConflict || time.Now().After(deadline) {
+			t.Fatalf("Docker store readiness status = %d: %s", ready.Code, ready.Body.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := <-destroyed; err != nil {
+		t.Fatalf("DestroyCompleted: %v", err)
+	}
+	if storage.published != 1 {
+		t.Errorf("published %d Docker stores for GitHub result Succeeded, want 1", storage.published)
+	}
+}
+
+func TestGitHubNonSuccessResultsDoNotPublishTheDockerStore(t *testing.T) {
 	t.Parallel()
 
-	for _, result := range []string{"Succeeded", "succeeded", "SUCCEEDED"} {
-		if !jobSucceeded(result) {
-			t.Errorf("jobSucceeded(%q) = false, want true", result)
-		}
-	}
 	for _, result := range []string{"", "Success", "Failed", "Cancelled", " succeeded "} {
-		if jobSucceeded(result) {
-			t.Errorf("jobSucceeded(%q) = true, want false", result)
-		}
+		t.Run(result, func(t *testing.T) {
+			t.Parallel()
+
+			storage := &fakeCacheStore{}
+			attacher := &fakeVolumeAttacher{}
+			cache, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", t.TempDir(),
+				storage, attacher, slog.New(slog.DiscardHandler))
+			if err != nil {
+				t.Fatalf("NewCacheService: %v", err)
+			}
+			credentials, err := cache.Prepare("billet-one", provider.TrustTrusted)
+			if err != nil {
+				t.Fatalf("Prepare: %v", err)
+			}
+			if response := cacheRequest(t, cache, credentials.Token, "/v1/docker-store",
+				map[string]any{"architecture": "amd64"}); response.Code != http.StatusCreated {
+				t.Fatalf("Docker store status = %d: %s", response.Code, response.Body.String())
+			}
+
+			p := &fakeProvider{kind: config.ProviderDocker}
+			runner := &Runner{
+				provider: p, cache: cache, log: slog.New(slog.DiscardHandler),
+				running: map[int64]*provider.Instance{
+					11: {ID: "instance-billet-one", Name: "billet-one", Running: true},
+				},
+				runningLease: map[int64]*alloc.Lease{}, custody: map[string]*custody{},
+			}
+			if err := runner.DestroyCompleted(t.Context(), 11, result); err != nil {
+				t.Fatalf("DestroyCompleted: %v", err)
+			}
+			if storage.published != 0 || storage.discarded != 1 {
+				t.Errorf("result %q published/discarded %d/%d Docker stores, want 0/1",
+					result, storage.published, storage.discarded)
+			}
+		})
 	}
 }
 

@@ -461,7 +461,11 @@ func (r *Runner) DestroyCompleted(ctx context.Context, requestID int64, result s
 
 	if r.cache != nil {
 		if instance := r.cacheInstanceForRequest(requestID); instance != "" {
-			if err := r.cache.SettleDocker(ctx, instance, jobSucceeded(result)); err != nil {
+			succeeded := jobSucceeded(result)
+			r.log.Info("settling a Docker image store from a completed job",
+				"request", requestID, "instance", instance, "result", result,
+				"succeeded", succeeded)
+			if err := r.cache.SettleDocker(ctx, instance, succeeded); err != nil {
 				r.log.Warn("Docker image store was not published; compute teardown will discard it",
 					"request", requestID, "instance", instance, "result", result, "error", err)
 			}
