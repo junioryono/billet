@@ -25,6 +25,7 @@ type fakeActionsVolumeManager struct {
 	mountNew  func() error
 	trimmed   int
 	trimErr   error
+	trimCheck func(string) error
 }
 
 type syncCloseRecorder struct {
@@ -95,8 +96,13 @@ func (f *fakeActionsVolumeManager) Unmount(_ context.Context, target string) err
 	return nil
 }
 
-func (f *fakeActionsVolumeManager) Trim(context.Context, string) error {
+func (f *fakeActionsVolumeManager) Trim(_ context.Context, target string) error {
 	f.trimmed++
+	if f.trimCheck != nil {
+		if err := f.trimCheck(target); err != nil {
+			return err
+		}
+	}
 
 	return f.trimErr
 }
@@ -642,6 +648,197 @@ func TestActionsFinalizeFailureNeverFallsThroughToGitHub(t *testing.T) {
 	if response.StatusCode != http.StatusBadGateway || upstreamRequests != 0 || volumes.trimmed != 1 {
 		t.Fatalf("failed finalization status=%d upstream=%d trims=%d; want local failure",
 			response.StatusCode, upstreamRequests, volumes.trimmed)
+	}
+}
+
+func TestActionsFinalizeReceiptSurvivesRestartAndPolicyOutage(t *testing.T) {
+	t.Parallel()
+
+	for _, initialFailure := range []bool{false, true} {
+		name := "response lost after success"
+		if initialFailure {
+			name = "CAS failure"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			root := t.TempDir()
+			storage := &fakeCacheStore{}
+			service, err := NewCacheService("http://172.20.0.1:7718", "test-deployment",
+				root, storage, &fakeVolumeAttacher{}, slog.New(slog.DiscardHandler))
+			if err != nil {
+				t.Fatalf("NewCacheService: %v", err)
+			}
+			service.actionIO = &fakeActionsVolumeManager{}
+			service.SetActionsPolicy(actionsPolicyFunc(func(context.Context, string, string) (bool, error) {
+				return true, nil
+			}))
+			credentials, err := service.PrepareScoped("billet-receipt", CacheSessionScope{
+				Trust: provider.TrustTrusted, Intercept: true, Owner: "acme", Repository: "api",
+				WorkflowRef: "acme/api/.github/workflows/ci.yml@refs/heads/main",
+			})
+			if err != nil {
+				t.Fatalf("PrepareScoped: %v", err)
+			}
+			service.mu.Lock()
+			session := service.byToken[credentials.Token]
+			service.mu.Unlock()
+			create := actionsRequestForTest(t, http.MethodPost,
+				"https://"+actionsResultsHost+actionsCreatePath,
+				`{"key":"durable-receipt","version":"v1"}`)
+			response, _, err := service.actionsResponse(create, session)
+			if err != nil {
+				t.Fatalf("CreateCacheEntry: %v", err)
+			}
+			created := responseJSON(t, response)
+			uploadURL, ok := created["signed_upload_url"].(string)
+			if !ok || uploadURL == "" {
+				t.Fatalf("CreateCacheEntry response = %v", created)
+			}
+			upload := actionsRequestForTest(t, http.MethodPut, uploadURL, "archive-body")
+			upload.Header.Set("X-Ms-Blob-Type", "BlockBlob")
+			response, _, err = service.actionsResponse(upload, session)
+			if err != nil {
+				t.Fatalf("upload: %v", err)
+			}
+			response.Body.Close()
+			if initialFailure {
+				storage.publishErr = errors.New("publication unavailable")
+			}
+			finalizeBody := `{"key":"durable-receipt","version":"v1","size_bytes":"12"}`
+			finalize := actionsRequestForTest(t, http.MethodPost,
+				"https://"+actionsResultsHost+actionsFinalizePath, finalizeBody)
+			response, err = service.actions.roundTrip(finalize, session)
+			if err != nil {
+				t.Fatalf("initial finalize: %v", err)
+			}
+			initialStatus := response.StatusCode
+			response.Body.Close()
+			if initialFailure && initialStatus != http.StatusBadGateway ||
+				!initialFailure && initialStatus != http.StatusOK {
+				t.Fatalf("initial finalize status = %d", initialStatus)
+			}
+
+			storage.publishErr = nil
+			restarted, err := NewCacheService("http://172.20.0.1:7718", "test-deployment",
+				root, storage, &fakeVolumeAttacher{}, slog.New(slog.DiscardHandler))
+			if err != nil {
+				t.Fatalf("restart NewCacheService: %v", err)
+			}
+			restarted.actionIO = &fakeActionsVolumeManager{}
+			restarted.SetActionsPolicy(actionsPolicyFunc(func(context.Context, string, string) (bool, error) {
+				return false, errors.New("policy unavailable")
+			}))
+			restarted.mu.Lock()
+			restartedSession := restarted.byToken[credentials.Token]
+			restarted.mu.Unlock()
+			upstreamRequests := 0
+			restarted.actions.upstream = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				upstreamRequests++
+
+				return &http.Response{
+					StatusCode: http.StatusOK, Header: make(http.Header), Body: http.NoBody, Request: r,
+				}, nil
+			})
+			retry := actionsRequestForTest(t, http.MethodPost,
+				"https://"+actionsResultsHost+actionsFinalizePath, finalizeBody)
+			response, err = restarted.actions.roundTrip(retry, restartedSession)
+			if err != nil {
+				t.Fatalf("retry finalize: %v", err)
+			}
+			retried := responseJSON(t, response)
+			if retried["ok"] != true || upstreamRequests != 0 || storage.current != "next" {
+				t.Fatalf("retry=%v upstream=%d current=%q",
+					retried, upstreamRequests, storage.current)
+			}
+		})
+	}
+}
+
+func TestActionsFinalizeRemovesInterruptedStagingAfterRestart(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	storage := &fakeCacheStore{}
+	service, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", root,
+		storage, &fakeVolumeAttacher{}, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewCacheService: %v", err)
+	}
+	service.actionIO = &fakeActionsVolumeManager{}
+	service.SetActionsPolicy(actionsPolicyFunc(func(context.Context, string, string) (bool, error) {
+		return true, nil
+	}))
+	credentials, err := service.PrepareScoped("billet-staging", CacheSessionScope{
+		Trust: provider.TrustTrusted, Intercept: true, Owner: "acme", Repository: "api",
+		WorkflowRef: "acme/api/.github/workflows/ci.yml@refs/heads/main",
+	})
+	if err != nil {
+		t.Fatalf("PrepareScoped: %v", err)
+	}
+	service.mu.Lock()
+	session := service.byToken[credentials.Token]
+	service.mu.Unlock()
+	create := actionsRequestForTest(t, http.MethodPost,
+		"https://"+actionsResultsHost+actionsCreatePath, `{"key":"staging","version":"v1"}`)
+	response, _, err := service.actionsResponse(create, session)
+	if err != nil {
+		t.Fatalf("CreateCacheEntry: %v", err)
+	}
+	created := responseJSON(t, response)
+	uploadURL, ok := created["signed_upload_url"].(string)
+	if !ok || uploadURL == "" {
+		t.Fatalf("CreateCacheEntry response = %v", created)
+	}
+	session.mu.Lock()
+	var archive *actionsArchive
+	for _, candidate := range session.actions {
+		archive = candidate
+	}
+	session.mu.Unlock()
+	for _, name := range []string{".upload-interrupted", ".blocks-interrupted"} {
+		if err := os.WriteFile(filepath.Join(service.actionsStagingPath(session, archive), name),
+			[]byte("orphaned blocks"), 0o600); err != nil {
+			t.Fatalf("write interrupted staging file: %v", err)
+		}
+	}
+	upload := actionsRequestForTest(t, http.MethodPut, uploadURL, "archive-body")
+	upload.Header.Set("X-Ms-Blob-Type", "BlockBlob")
+	response, _, err = service.actionsResponse(upload, session)
+	if err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	response.Body.Close()
+
+	restarted, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", root,
+		storage, &fakeVolumeAttacher{}, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("restart NewCacheService: %v", err)
+	}
+	volumes := &fakeActionsVolumeManager{trimCheck: func(target string) error {
+		if _, err := os.Stat(filepath.Join(target, "staging")); !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("staging still exists at trim: %w", err)
+		}
+
+		return nil
+	}}
+	restarted.actionIO = volumes
+	restarted.SetActionsPolicy(actionsPolicyFunc(func(context.Context, string, string) (bool, error) {
+		return true, nil
+	}))
+	restarted.mu.Lock()
+	restartedSession := restarted.byToken[credentials.Token]
+	restarted.mu.Unlock()
+	finalize := actionsRequestForTest(t, http.MethodPost,
+		"https://"+actionsResultsHost+actionsFinalizePath,
+		`{"key":"staging","version":"v1","size_bytes":"12"}`)
+	response, _, err = restarted.actionsResponse(finalize, restartedSession)
+	if err != nil {
+		t.Fatalf("finalize after restart: %v", err)
+	}
+	finalized := responseJSON(t, response)
+	if finalized["ok"] != true || volumes.trimmed != 1 {
+		t.Fatalf("finalize=%v trims=%d", finalized, volumes.trimmed)
 	}
 }
 

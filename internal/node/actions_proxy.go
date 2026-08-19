@@ -295,17 +295,32 @@ func (p *actionsProxy) roundTrip(req *http.Request, session *cacheSession) (*htt
 		if err != nil {
 			return nil, err
 		}
+		if response, found, err := p.service.actionsFinalizeReceipt(req.Context(), replay, session); found {
+			if err != nil {
+				p.service.log.Warn("a reserved Actions cache finalization failed locally",
+					"instance", session.instance, "path", req.URL.Path, "error", err)
+
+				return actionsBlobError(http.StatusBadGateway,
+					"Actions cache storage is unavailable"), nil
+			}
+			response.Request = req
+
+			return response, nil
+		}
 	}
 	if response, handled, err := p.service.actionsResponse(req, session); handled && err == nil {
 		response.Request = req
 
 		return response, nil
 	} else if handled && err != nil {
-		p.service.log.Warn("Actions cache interception failed; retrying through GitHub",
-			"instance", session.instance, "path", req.URL.Path, "error", err)
 		if reservationBound {
+			p.service.log.Warn("a reserved Actions cache request failed locally",
+				"instance", session.instance, "path", req.URL.Path, "error", err)
+
 			return actionsBlobError(http.StatusBadGateway, "Actions cache storage is unavailable"), nil
 		}
+		p.service.log.Warn("Actions cache interception failed; retrying through GitHub",
+			"instance", session.instance, "path", req.URL.Path, "error", err)
 		if replay != nil {
 			req.Body = io.NopCloser(bytes.NewReader(replay))
 		}

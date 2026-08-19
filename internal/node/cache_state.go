@@ -25,6 +25,7 @@ type durableCacheSession struct {
 	Closed      bool                                  `json:"closed"`
 	Slots       [provider.MaxVolumes]*cacheAttachment `json:"slots"`
 	Actions     map[string]*actionsArchive            `json:"actions,omitempty"`
+	Receipts    map[string]*actionsReceipt            `json:"actions_receipts,omitempty"`
 }
 
 func (s *CacheService) loadSessions() error {
@@ -64,10 +65,14 @@ func (s *CacheService) loadSessions() error {
 			owner: record.Owner, repository: record.Repository, workflowRef: record.WorkflowRef,
 			intercept: record.Intercept,
 			closed:    record.Closed, slots: record.Slots, admit: make(chan struct{}, 1),
-			actions: record.Actions,
+			actions:  record.Actions,
+			receipts: record.Receipts,
 		}
 		if session.actions == nil {
 			session.actions = make(map[string]*actionsArchive)
+		}
+		if session.receipts == nil {
+			session.receipts = make(map[string]*actionsReceipt)
 		}
 		s.byToken[record.Token] = session
 		s.byInstance[record.Instance] = record.Token
@@ -101,6 +106,12 @@ func (r durableCacheSession) valid(filename string) error {
 				filename, id)
 		}
 	}
+	for id, receipt := range r.Receipts {
+		if receipt == nil || receipt.ID != id || receipt.valid() != nil {
+			return fmt.Errorf("node: cache custody file %s has an invalid Actions receipt %q",
+				filename, id)
+		}
+	}
 
 	return nil
 }
@@ -112,6 +123,7 @@ func (s *CacheService) persistSession(session *cacheSession) error {
 		Owner: session.owner, Repository: session.repository, WorkflowRef: session.workflowRef,
 		Intercept: session.intercept,
 		Closed:    session.closed, Slots: session.slots, Actions: session.actions,
+		Receipts: session.receipts,
 	}
 	encoded, err := json.Marshal(record)
 	if err != nil {

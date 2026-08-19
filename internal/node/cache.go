@@ -66,6 +66,7 @@ type cacheSession struct {
 	closed      bool
 	slots       [provider.MaxVolumes]*cacheAttachment
 	actions     map[string]*actionsArchive
+	receipts    map[string]*actionsReceipt
 }
 
 // CacheCredentials identifies one managed guest's cache session.
@@ -203,6 +204,7 @@ func (s *CacheService) PrepareScoped(
 			intercept: scope.Intercept,
 			admit:     make(chan struct{}, 1),
 			actions:   make(map[string]*actionsArchive),
+			receipts:  make(map[string]*actionsReceipt),
 		}
 		credentials := CacheCredentials{Token: token}
 		if scope.Intercept {
