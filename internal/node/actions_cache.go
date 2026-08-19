@@ -32,7 +32,7 @@ const (
 	actionsDownloadPath = "/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL"
 	actionsBlobPrefix   = "/_billet/actions-cache/"
 	actionsArchiveLimit = int64(10 << 30)
-	actionsVolumeSize   = int64(11 << 30)
+	actionsVolumeSize   = int64(22 << 30)
 	actionsArchiveCount = 32
 	actionsRequestLimit = 64 << 10
 	actionsPolicyLimit  = 2 * time.Second
@@ -228,7 +228,9 @@ func (s *CacheService) createActionsCache(
 		return nil, errors.New("invalid Actions cache reservation")
 	}
 	storeKey := s.actionsStoreKey(session, request.Key, request.Version)
-	session.mu.Lock()
+	if err := lockCacheSession(ctx, session); err != nil {
+		return nil, err
+	}
 	defer session.mu.Unlock()
 	if session.closed {
 		return nil, errors.New("cache session has ended")
@@ -361,7 +363,9 @@ func (s *CacheService) finalizeActionsCache(
 		return nil, err
 	}
 
-	session.mu.Lock()
+	if err := lockCacheSession(ctx, session); err != nil {
+		return nil, err
+	}
 	var archive *actionsArchive
 	for _, candidate := range session.actions {
 		if candidate.Mode == actionsModeUpload && candidate.CacheKey == request.Key &&
@@ -376,7 +380,11 @@ func (s *CacheService) finalizeActionsCache(
 
 		return actionsJSONResponse(map[string]any{"ok": false})
 	}
-	archive.mu.Lock()
+	if err := lockCacheMutex(ctx, &archive.mu); err != nil {
+		session.mu.Unlock()
+
+		return nil, err
+	}
 	defer archive.mu.Unlock()
 	defer session.mu.Unlock()
 
@@ -446,7 +454,9 @@ func (s *CacheService) findActionsCache(
 			return nil, errors.New("invalid Actions cache restore key")
 		}
 	}
-	session.mu.Lock()
+	if err := lockCacheSession(ctx, session); err != nil {
+		return nil, err
+	}
 	defer session.mu.Unlock()
 	if session.closed {
 		return nil, errors.New("cache session has ended")
@@ -537,14 +547,20 @@ func (s *CacheService) serveActionsBlob(
 	if id == "" || strings.Contains(id, "/") {
 		return actionsBlobError(http.StatusNotFound, "cache archive not found"), nil
 	}
-	session.mu.Lock()
+	if err := lockCacheSession(req.Context(), session); err != nil {
+		return nil, err
+	}
 	archive := session.actions[id]
 	if session.closed || archive == nil || req.URL.Query().Get("sig") != archive.Signature {
 		session.mu.Unlock()
 
 		return actionsBlobError(http.StatusForbidden, "cache archive is unavailable"), nil
 	}
-	archive.mu.Lock()
+	if err := lockCacheMutex(req.Context(), &archive.mu); err != nil {
+		session.mu.Unlock()
+
+		return nil, err
+	}
 	session.mu.Unlock()
 	defer archive.mu.Unlock()
 	if archive.Mode == actionsModeUpload {
@@ -571,7 +587,7 @@ func (s *CacheService) uploadActionsBlob(
 		if !strings.EqualFold(req.Header.Get("X-Ms-Blob-Type"), "BlockBlob") {
 			return actionsBlobError(http.StatusBadRequest, "blob type must be BlockBlob"), nil
 		}
-		if err := writeActionsFile(s.actionsArchivePath(session, archive), req.Body,
+		if err := writeActionsFile(req.Context(), s.actionsArchivePath(session, archive), req.Body,
 			actionsArchiveLimit); err != nil {
 			return nil, err
 		}
@@ -580,12 +596,12 @@ func (s *CacheService) uploadActionsBlob(
 		if blockID == "" || len(blockID) > 1024 {
 			return actionsBlobError(http.StatusBadRequest, "block id is invalid"), nil
 		}
-		if err := writeActionsFile(s.actionsBlockPath(session, archive, blockID), req.Body,
+		if err := writeActionsFile(req.Context(), s.actionsBlockPath(session, archive, blockID), req.Body,
 			actionsArchiveLimit); err != nil {
 			return nil, err
 		}
 	case "blocklist":
-		if err := s.commitActionsBlockList(req.Body, session, archive); err != nil {
+		if err := s.commitActionsBlockList(req.Context(), req.Body, session, archive); err != nil {
 			return nil, err
 		}
 	default:
@@ -599,14 +615,14 @@ func (s *CacheService) uploadActionsBlob(
 	return response, nil
 }
 
-func writeActionsFile(path string, body io.Reader, limit int64) error {
+func writeActionsFile(ctx context.Context, path string, body io.Reader, limit int64) error {
 	temporary, err := os.CreateTemp(filepath.Dir(path), ".upload-")
 	if err != nil {
 		return err
 	}
 	temporaryPath := temporary.Name()
 	defer os.Remove(temporaryPath)
-	written, copyErr := io.Copy(temporary, io.LimitReader(body, limit+1))
+	written, copyErr := copyActionsData(ctx, temporary, body, limit)
 	workErr := errors.Join(copyErr, temporary.Sync(), temporary.Close())
 	if workErr != nil {
 		return workErr
@@ -618,7 +634,48 @@ func writeActionsFile(path string, body io.Reader, limit int64) error {
 	return os.Rename(temporaryPath, path)
 }
 
+func copyActionsData(
+	ctx context.Context,
+	destination io.Writer,
+	source io.Reader,
+	limit int64,
+) (int64, error) {
+	reader := io.LimitReader(source, limit+1)
+	buffer := make([]byte, 1<<20)
+	var written int64
+	for {
+		select {
+		case <-ctx.Done():
+			return written, ctx.Err()
+		default:
+		}
+		read, readErr := reader.Read(buffer)
+		if read > 0 {
+			select {
+			case <-ctx.Done():
+				return written, ctx.Err()
+			default:
+			}
+			stored, writeErr := destination.Write(buffer[:read])
+			written += int64(stored)
+			if writeErr != nil {
+				return written, writeErr
+			}
+			if stored != read {
+				return written, io.ErrShortWrite
+			}
+		}
+		if errors.Is(readErr, io.EOF) {
+			return written, nil
+		}
+		if readErr != nil {
+			return written, readErr
+		}
+	}
+}
+
 func (s *CacheService) commitActionsBlockList(
+	ctx context.Context,
 	body io.Reader,
 	session *cacheSession,
 	archive *actionsArchive,
@@ -650,7 +707,7 @@ func (s *CacheService) commitActionsBlockList(
 
 			return err
 		}
-		written, copyErr := io.Copy(temporary, io.LimitReader(block, actionsArchiveLimit-total+1))
+		written, copyErr := copyActionsData(ctx, temporary, block, actionsArchiveLimit-total)
 		closeErr := block.Close()
 		total += written
 		if err := errors.Join(copyErr, closeErr); err != nil {

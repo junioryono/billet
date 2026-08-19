@@ -15,6 +15,15 @@ on:
         description: Exact Billet guest contract expected in the candidate image
         required: false
         type: string
+      billet_repository:
+        description: Billet repository containing the conformance fixture action
+        required: false
+        default: junioryono/billet
+        type: string
+      billet_ref:
+        description: Exact Billet tag or commit containing this reusable workflow
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       runner_label:
@@ -28,6 +37,15 @@ on:
       expected_guest_contract:
         description: Exact Billet guest contract expected in the candidate image
         required: false
+        type: string
+      billet_repository:
+        description: Billet repository containing the conformance fixture action
+        required: false
+        default: junioryono/billet
+        type: string
+      billet_ref:
+        description: Exact Billet tag or commit containing this workflow
+        required: true
         type: string
 
 permissions:
@@ -230,7 +248,17 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
-      - run: scripts/cache-conformance-fixtures.sh prepare current
+        with:
+          repository: ${{ inputs.billet_repository }}
+          ref: ${{ inputs.billet_ref }}
+          path: .billet-conformance
+          sparse-checkout: .github/actions/cache-conformance-fixtures
+          persist-credentials: false
+      - uses: ./.billet-conformance/.github/actions/cache-conformance-fixtures
+        with:
+          operation: prepare
+          lane: current
+          salt: ${{ github.run_id }}-${{ github.run_attempt }}
       - uses: actions/setup-node@v6
         with:
           node-version: "24"
@@ -249,7 +277,7 @@ jobs:
           cache-dependency-path: conformance/embedded/python/requirements.txt
       - uses: actions/setup-go@v6
         with:
-          go-version-file: go.mod
+          go-version: "1.25"
           cache: true
           cache-dependency-path: conformance/embedded/go.sum
       - uses: actions/setup-dotnet@v5
@@ -257,7 +285,11 @@ jobs:
           dotnet-version: 10.0.x
           cache: true
           cache-dependency-path: conformance/embedded/dotnet/packages.lock.json
-      - run: scripts/cache-conformance-fixtures.sh write current
+      - uses: ./.billet-conformance/.github/actions/cache-conformance-fixtures
+        with:
+          operation: write
+          lane: current
+          salt: ${{ github.run_id }}-${{ github.run_attempt }}
 
   restore-embedded-current:
     needs: save-embedded-current
@@ -265,7 +297,17 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
-      - run: scripts/cache-conformance-fixtures.sh prepare current
+        with:
+          repository: ${{ inputs.billet_repository }}
+          ref: ${{ inputs.billet_ref }}
+          path: .billet-conformance
+          sparse-checkout: .github/actions/cache-conformance-fixtures
+          persist-credentials: false
+      - uses: ./.billet-conformance/.github/actions/cache-conformance-fixtures
+        with:
+          operation: prepare
+          lane: current
+          salt: ${{ github.run_id }}-${{ github.run_attempt }}
       - uses: actions/setup-node@v6
         with:
           node-version: "24"
@@ -284,7 +326,7 @@ jobs:
           cache-dependency-path: conformance/embedded/python/requirements.txt
       - uses: actions/setup-go@v6
         with:
-          go-version-file: go.mod
+          go-version: "1.25"
           cache: true
           cache-dependency-path: conformance/embedded/go.sum
       - uses: actions/setup-dotnet@v5
@@ -292,7 +334,11 @@ jobs:
           dotnet-version: 10.0.x
           cache: true
           cache-dependency-path: conformance/embedded/dotnet/packages.lock.json
-      - run: scripts/cache-conformance-fixtures.sh verify current
+      - uses: ./.billet-conformance/.github/actions/cache-conformance-fixtures
+        with:
+          operation: verify
+          lane: current
+          salt: ${{ github.run_id }}-${{ github.run_attempt }}
 
   save-embedded-pinned:
     needs: candidate-identity
@@ -300,7 +346,17 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
-      - run: scripts/cache-conformance-fixtures.sh prepare pinned
+        with:
+          repository: ${{ inputs.billet_repository }}
+          ref: ${{ inputs.billet_ref }}
+          path: .billet-conformance
+          sparse-checkout: .github/actions/cache-conformance-fixtures
+          persist-credentials: false
+      - uses: ./.billet-conformance/.github/actions/cache-conformance-fixtures
+        with:
+          operation: prepare
+          lane: pinned
+          salt: ${{ github.run_id }}-${{ github.run_attempt }}
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
         with:
           node-version: "24"
@@ -320,7 +376,7 @@ jobs:
           cache-dependency-path: conformance/embedded/python/requirements.txt
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
         with:
-          go-version-file: go.mod
+          go-version: "1.25"
           cache: true
           cache-dependency-path: conformance/embedded/go.sum
       - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1
@@ -328,7 +384,11 @@ jobs:
           dotnet-version: 10.0.x
           cache: true
           cache-dependency-path: conformance/embedded/dotnet/packages.lock.json
-      - run: scripts/cache-conformance-fixtures.sh write pinned
+      - uses: ./.billet-conformance/.github/actions/cache-conformance-fixtures
+        with:
+          operation: write
+          lane: pinned
+          salt: ${{ github.run_id }}-${{ github.run_attempt }}
 
   restore-embedded-pinned:
     needs: save-embedded-pinned
@@ -336,7 +396,17 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
-      - run: scripts/cache-conformance-fixtures.sh prepare pinned
+        with:
+          repository: ${{ inputs.billet_repository }}
+          ref: ${{ inputs.billet_ref }}
+          path: .billet-conformance
+          sparse-checkout: .github/actions/cache-conformance-fixtures
+          persist-credentials: false
+      - uses: ./.billet-conformance/.github/actions/cache-conformance-fixtures
+        with:
+          operation: prepare
+          lane: pinned
+          salt: ${{ github.run_id }}-${{ github.run_attempt }}
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
         with:
           node-version: "24"
@@ -356,7 +426,7 @@ jobs:
           cache-dependency-path: conformance/embedded/python/requirements.txt
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
         with:
-          go-version-file: go.mod
+          go-version: "1.25"
           cache: true
           cache-dependency-path: conformance/embedded/go.sum
       - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1
@@ -364,7 +434,11 @@ jobs:
           dotnet-version: 10.0.x
           cache: true
           cache-dependency-path: conformance/embedded/dotnet/packages.lock.json
-      - run: scripts/cache-conformance-fixtures.sh verify pinned
+      - uses: ./.billet-conformance/.github/actions/cache-conformance-fixtures
+        with:
+          operation: verify
+          lane: pinned
+          salt: ${{ github.run_id }}-${{ github.run_attempt }}
 
   poisoned-clients:
     needs: candidate-identity

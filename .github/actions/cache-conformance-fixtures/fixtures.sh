@@ -3,15 +3,16 @@ set -euo pipefail
 
 operation="${1:-}"
 lane="${2:-}"
+salt="${3:-}"
 
 if [[ "$operation" != prepare && "$operation" != write && "$operation" != verify ]] ||
-	[[ ! "$lane" =~ ^[a-z0-9-]+$ ]]; then
-	echo "usage: cache-conformance-fixtures.sh <prepare|write|verify> <lane>" >&2
+	[[ ! "$lane" =~ ^[a-z0-9-]+$ ]] || [[ ! "$salt" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+	echo "usage: fixtures.sh <prepare|write|verify> <lane> <run-salt>" >&2
 	exit 2
 fi
 
 fixture_root=conformance/embedded
-marker="billet-cache-conformance-$lane"
+marker="billet-cache-conformance-$lane-$salt"
 
 case "$operation" in
 prepare)

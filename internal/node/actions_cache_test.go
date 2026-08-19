@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/internal/provider"
 )
@@ -25,6 +26,22 @@ type fakeActionsVolumeManager struct {
 }
 
 type actionsPolicyFunc func(context.Context, string, string) (bool, error)
+
+type cancelAfterRead struct {
+	cancel context.CancelFunc
+	read   bool
+}
+
+func (r *cancelAfterRead) Read(body []byte) (int, error) {
+	if r.read {
+		return 0, io.EOF
+	}
+	r.read = true
+	r.cancel()
+	body[0] = 'x'
+
+	return 1, nil
+}
 
 func (f actionsPolicyFunc) ActionsCacheAllowed(
 	ctx context.Context,
@@ -284,6 +301,112 @@ func TestActionsCacheAcceptsAzureStagedBlocksInDeclaredOrder(t *testing.T) {
 	body, err := os.ReadFile(service.actionsArchivePath(session, archive))
 	if err != nil || !bytes.Equal(body, []byte("twoone")) {
 		t.Fatalf("assembled archive = %q, error=%v", body, err)
+	}
+}
+
+func TestActionsStagedUploadBackingCoversTheArchiveBoundary(t *testing.T) {
+	t.Parallel()
+
+	stagedAndAssembled := 2 * actionsArchiveLimit
+	if actionsVolumeSize-stagedAndAssembled < 1<<30 {
+		t.Fatalf("Actions volume = %d bytes; a boundary staged upload needs %d bytes plus filesystem headroom",
+			actionsVolumeSize, stagedAndAssembled)
+	}
+}
+
+func TestActionsCopyStopsAfterItsContextIsCanceled(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	reader := &cancelAfterRead{cancel: cancel}
+	_, err := copyActionsData(ctx, io.Discard, reader, actionsArchiveLimit)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("copy error = %v; want context cancellation", err)
+	}
+}
+
+func TestActionsBlobLockStopsAfterItsContextIsCanceled(t *testing.T) {
+	t.Parallel()
+
+	service, _, session, _ := testActionsService(t)
+	create := actionsRequestForTest(t, http.MethodPost,
+		"https://"+actionsResultsHost+actionsCreatePath, `{"key":"locked","version":"v1"}`)
+	response, _, err := service.actionsResponse(create, session)
+	if err != nil {
+		t.Fatalf("CreateCacheEntry: %v", err)
+	}
+	created := responseJSON(t, response)
+	uploadURL, ok := created["signed_upload_url"].(string)
+	if !ok || uploadURL == "" {
+		t.Fatalf("CreateCacheEntry response = %v", created)
+	}
+
+	session.mu.Lock()
+	var archive *actionsArchive
+	for _, candidate := range session.actions {
+		archive = candidate
+	}
+	session.mu.Unlock()
+	archive.mu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			archive.mu.Unlock()
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodPut, uploadURL,
+		strings.NewReader("body"))
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		response, err := service.serveActionsBlob(request, session)
+		if response != nil {
+			response.Body.Close()
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, ctx.Err()) {
+			t.Fatalf("serve error = %v; want %v", err, ctx.Err())
+		}
+	case <-time.After(200 * time.Millisecond):
+		archive.mu.Unlock()
+		locked = false
+		<-done
+		t.Fatal("blob request remained blocked on an archive lock after cancellation")
+	}
+}
+
+func TestActionsCleanupStopsAfterItsContextIsCanceled(t *testing.T) {
+	t.Parallel()
+
+	service, _, session, _ := testActionsService(t)
+	create := actionsRequestForTest(t, http.MethodPost,
+		"https://"+actionsResultsHost+actionsCreatePath, `{"key":"cleanup-locked","version":"v1"}`)
+	response, _, err := service.actionsResponse(create, session)
+	if err != nil {
+		t.Fatalf("CreateCacheEntry: %v", err)
+	}
+	response.Body.Close()
+	session.mu.Lock()
+	var archive *actionsArchive
+	for _, candidate := range session.actions {
+		archive = candidate
+	}
+	session.mu.Unlock()
+	archive.mu.Lock()
+	defer archive.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+	if err := service.cleanupSession(ctx, session, true); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("cleanup error = %v; want context deadline while the archive is busy", err)
 	}
 }
 

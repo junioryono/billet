@@ -336,7 +336,11 @@ func (s *CacheService) RenewActive(ctx context.Context, until time.Time) error {
 
 	var failures []error
 	for _, session := range sessions {
-		session.mu.Lock()
+		if err := lockCacheSession(ctx, session); err != nil {
+			failures = append(failures, err)
+
+			continue
+		}
 		if !session.closed {
 			for slot, attachment := range session.slots {
 				if attachment == nil || attachment.Volume.Lease.ID == "" {
@@ -367,7 +371,9 @@ func (s *CacheService) cleanupSession(
 	session *cacheSession,
 	closeSession bool,
 ) error {
-	session.mu.Lock()
+	if err := lockCacheSession(ctx, session); err != nil {
+		return err
+	}
 	defer session.mu.Unlock()
 
 	s.mu.Lock()
@@ -401,7 +407,11 @@ func (s *CacheService) cleanupSession(
 		}
 	}
 	for id, archive := range session.actions {
-		archive.mu.Lock()
+		if err := lockCacheMutex(ctx, &archive.mu); err != nil {
+			failures = append(failures, fmt.Errorf("actions cache %s wait for archive: %w", id, err))
+
+			break
+		}
 		if !archive.Unmounted {
 			if err := s.actionIO.Unmount(ctx, s.actionsMountPath(session, archive)); err != nil {
 				failures = append(failures, fmt.Errorf("actions cache %s unmount: %w", id, err))
@@ -996,7 +1006,16 @@ func (s *CacheService) commit(w http.ResponseWriter, r *http.Request, session *c
 }
 
 func lockCacheSession(ctx context.Context, session *cacheSession) error {
-	for !session.mu.TryLock() {
+	return lockCacheMutex(ctx, &session.mu)
+}
+
+func lockCacheMutex(ctx context.Context, mutex *sync.Mutex) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+	for !mutex.TryLock() {
 		timer := time.NewTimer(10 * time.Millisecond)
 		select {
 		case <-ctx.Done():
