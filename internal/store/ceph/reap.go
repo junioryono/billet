@@ -183,10 +183,10 @@ func (c *Client) Reap( //nolint:nonamedreturns // the deferred release reports t
 		return nil, err
 	}
 
-	originallyDoomed := make(map[string]bool, len(plan))
+	originallyDoomed := make(map[string]Reapable, len(plan))
 	for _, item := range plan {
 		if item.Reason == "" {
-			originallyDoomed[item.Generation.Name] = true
+			originallyDoomed[item.Generation.Name] = item
 		}
 	}
 
@@ -198,7 +198,9 @@ func (c *Client) Reap( //nolint:nonamedreturns // the deferred release reports t
 	fresh := PlanReap(allNow, verifiedNow, contractsNow, retention)
 	doomed := make([]Generation, 0, len(fresh))
 	for _, item := range fresh {
-		if item.Reason == "" && originallyDoomed[item.Generation.Name] {
+		preview, shown := originallyDoomed[item.Generation.Name]
+		if item.Reason == "" && shown &&
+			preview.Verified == item.Verified && preview.Contract == item.Contract {
 			doomed = append(doomed, item.Generation)
 		}
 	}

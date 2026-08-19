@@ -387,6 +387,24 @@
     billet_systemd_upgrade_probe: true
     billet_systemd_notify_ready: true
 
+- name: Inspect installed service readiness types before ordinary convergence
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - show
+      - --property=Type
+      - --value
+      - "{{ item }}"
+  loop:
+    - billet-server.service
+    - billet-node.service
+  register: billet_installed_service_types
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  become: true
+  when: not billet_binary_upgrade | default(false)
+
 - name: Install the billet systemd units
   ansible.builtin.template:
     src: "{{ item.src }}"
@@ -395,12 +413,18 @@
     group: root
     mode: "0644"
   loop:
-    - { src: billet-server.service.j2, dest: /etc/systemd/system/billet-server.service }
-    - { src: billet-node.service.j2, dest: /etc/systemd/system/billet-node.service }
+    - { src: billet-server.service.j2, dest: /etc/systemd/system/billet-server.service, installed_index: 0 }
+    - { src: billet-node.service.j2, dest: /etc/systemd/system/billet-node.service, installed_index: 1 }
   register: billet_systemd_units
   become: true
   notify: Reload systemd
   when: not billet_binary_upgrade | default(false)
+  vars:
+    billet_systemd_notify_ready: >-
+      {{
+        billet_installed_service_types.results[item.installed_index].rc == 0 and
+        billet_installed_service_types.results[item.installed_index].stdout | trim == 'notify'
+      }}
 
 - name: Inspect the installed GitHub App private key
   ansible.builtin.stat:

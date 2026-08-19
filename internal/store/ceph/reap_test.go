@@ -314,3 +314,63 @@ func TestReapRecomputesEveryContractBucketUnderThePublishLock(t *testing.T) {
 		t.Fatalf("removed the last contract-7 generation after another generation changed buckets: %v", removed)
 	}
 }
+
+func TestReapPreservesAGenerationVerifiedAfterThePreview(t *testing.T) {
+	gen := gens("g20260815000000")[0]
+	plan := PlanReap([]Generation{gen}, map[string]bool{}, map[string]string{}, Retention{Keep: 0})
+	f := &importFake{
+		snapshots: []string{gen.Name},
+		metadata: VerifiedKey + "." + gen.Name + "  now\n" +
+			GuestContractKey + "." + gen.Name + "  7",
+	}
+
+	removed, err := importClient(t, f).Reap(
+		t.Context(), "ubuntu-2404-x64", plan, Retention{Keep: 0})
+	if err != nil {
+		t.Fatalf("reap: %v", err)
+	}
+	if len(removed) != 0 {
+		t.Fatalf("removed a generation verified after the preview: %v", removed)
+	}
+}
+
+func TestReapPreservesAContractBackfilledAfterThePreview(t *testing.T) {
+	gen := gens("g20260815000000")[0]
+	verified := map[string]bool{gen.Name: true}
+	plan := PlanReap([]Generation{gen}, verified, map[string]string{}, Retention{Keep: 0})
+	f := &importFake{
+		snapshots: []string{gen.Name},
+		metadata: VerifiedKey + "." + gen.Name + "  earlier\n" +
+			GuestContractKey + "." + gen.Name + "  7",
+	}
+
+	removed, err := importClient(t, f).Reap(
+		t.Context(), "ubuntu-2404-x64", plan, Retention{Keep: 0})
+	if err != nil {
+		t.Fatalf("reap: %v", err)
+	}
+	if len(removed) != 0 {
+		t.Fatalf("removed a generation whose contract was backfilled after the preview: %v", removed)
+	}
+}
+
+func TestReapStillRemovesAnUnchangedVerifiedGenerationShownAsDoomed(t *testing.T) {
+	gen := gens("g20260815000000")[0]
+	verified := map[string]bool{gen.Name: true}
+	contracts := map[string]string{gen.Name: "7"}
+	plan := PlanReap([]Generation{gen}, verified, contracts, Retention{Keep: 0})
+	f := &importFake{
+		snapshots: []string{gen.Name},
+		metadata: VerifiedKey + "." + gen.Name + "  unchanged\n" +
+			GuestContractKey + "." + gen.Name + "  7",
+	}
+
+	removed, err := importClient(t, f).Reap(
+		t.Context(), "ubuntu-2404-x64", plan, Retention{Keep: 0})
+	if err != nil {
+		t.Fatalf("reap: %v", err)
+	}
+	if !slices.Equal(removed, []string{gen.Name}) {
+		t.Fatalf("removed = %v, want the unchanged generation shown in the preview", removed)
+	}
+}
