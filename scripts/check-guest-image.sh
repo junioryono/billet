@@ -381,6 +381,15 @@ else
 	fail "no billet agent; microVMs would boot and never register"
 fi
 
+ACTIONS_PROXY="$MNT/usr/local/bin/billet-actions-proxy"
+if [ -x "$ACTIONS_PROXY" ] && grep -Fq 'results-receiver.actions.githubusercontent.com' "$ACTIONS_PROXY" &&
+	grep -Fq 'return direct_connection(host, port)' "$ACTIONS_PROXY"; then
+	pass "the guest carries the fail-open Actions forward proxy"
+else
+	fail "the guest has no selective Actions forward proxy; an interception listener outage
+        could make every HTTPS destination unavailable instead of degrading to GitHub's cache"
+fi
+
 # --- service ordering -----------------------------------------------------
 
 # ENABLED IS A SYMLINK ON DISK, which is exactly why this can be checked without

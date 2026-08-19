@@ -573,10 +573,11 @@ tiers:
     memory: 16GiB
     disk: 80GiB
     image: ubuntu-2404-x64@g1
-    # Reserved for transparent actions/cache interception. It is refused until
-    # the live conformance suite proves CacheService handling and ArtifactService
-    # passthrough; ACTIONS_RESULTS_URL carries both, so a partial implementation
-    # can break a release rather than merely miss a cache.
+    # Transparent actions/cache interception is off unless explicitly enabled.
+    # Use it only on a Linux Firecracker tier backed by node.cache and a site
+    # store, after this image and runner passed cache-conformance.yml. The official
+    # toolkit CacheService client is local; BuildKit type=gha, ArtifactService,
+    # unknown clients and unknown methods remain on GitHub.
     # intercept: true
 
   - label: billet-8vcpu-ubuntu-2404

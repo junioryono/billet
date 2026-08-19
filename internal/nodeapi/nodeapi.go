@@ -69,7 +69,12 @@ import (
 // VERSION 10 ADDS EACH EC2 SHAPE'S PRICE TO REGISTRATION. A new server paired
 // with an old node would otherwise record every price as zero and understate the
 // deployment-wide cost report without an error.
-const Version = 10
+//
+// VERSION 11 ADDS THE AUTHENTICATED CACHE SCOPE TO A LAUNCH AND THE TIER'S
+// interception decision. An old node would silently omit local caching for an
+// enabled tier, while an old server would send no owner, repository, or workflow
+// ref for the node to scope safely. Both mixed pairings are refused.
+const Version = 11
 
 // CommandKind names what the server is asking a node to do.
 type CommandKind string
@@ -264,6 +269,8 @@ type TierSpec struct {
 	// BuildKitCacheMountLimit is the operator's ceiling for each persistent
 	// BuildKit cache-mount record in this tier.
 	BuildKitCacheMountLimit config.ByteSize `json:"buildkit_cache_mount_limit"`
+	// Intercept enables the authenticated Actions results proxy for this tier.
+	Intercept bool `json:"intercept,omitempty"`
 }
 
 // TierSpecOf renders the parts of a tier that travel to the selected provider's
@@ -277,6 +284,7 @@ func TierSpecOf(t config.Tier, provider config.ProviderKind) *TierSpec {
 		Disk:        t.Disk,
 		SHM:         t.SHM,
 		RunnerGroup: t.RunnerGroup,
+		Intercept:   t.Intercept,
 		BuildKitCacheMountLimit: func() config.ByteSize {
 			if t.BuildKitCacheMountLimit > 0 {
 				return t.BuildKitCacheMountLimit
@@ -347,6 +355,11 @@ type RenewResponse struct {
 	CAPEM   string `json:"ca_pem"`
 }
 
+// CachePolicyResponse is the control plane's current interception decision.
+type CachePolicyResponse struct {
+	Allowed bool `json:"allowed"`
+}
+
 // Job is the scale-set assignment a launch is for.
 //
 // Declared here rather than reusing internal/server's so the wire has its own
@@ -354,9 +367,12 @@ type RenewResponse struct {
 // else's business, and a protocol that silently follows an internal type is one
 // refactor away from a breaking change nobody noticed.
 type Job struct {
-	RequestID int64  `json:"request_id"`
-	RunID     int64  `json:"run_id"`
-	Event     string `json:"event"`
+	RequestID   int64  `json:"request_id"`
+	RunID       int64  `json:"run_id"`
+	Event       string `json:"event"`
+	Owner       string `json:"owner"`
+	Repository  string `json:"repository"`
+	WorkflowRef string `json:"workflow_ref"`
 }
 
 // CommandResult reports what happened.

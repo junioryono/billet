@@ -331,16 +331,22 @@ func (r *Runner) Launch(
 	}
 
 	cacheEndpoint, cacheToken := "", ""
+	actionsProxy, actionsCAPEM := "", ""
 	var buildKitCacheMountLimit config.ByteSize
 	if r.cache != nil {
 		var credentials CacheCredentials
-		credentials, err = r.cache.Prepare(name, trust)
+		credentials, err = r.cache.PrepareScoped(name, CacheSessionScope{
+			Trust: trust, Intercept: tier.Intercept && trust == provider.TrustTrusted, Owner: job.Owner,
+			Repository: job.Repository, WorkflowRef: job.WorkflowRef,
+		})
 		if err != nil {
 			r.log.Warn("cache access is unavailable; this job will continue cold",
 				"instance", name, "error", err)
 		} else {
 			cacheEndpoint = r.cache.Endpoint()
 			cacheToken = credentials.Token
+			actionsProxy = credentials.ActionsProxy
+			actionsCAPEM = credentials.ActionsCAPEM
 			buildKitCacheMountLimit = tier.BuildKitCacheMountLimit
 		}
 	}
@@ -395,6 +401,8 @@ func (r *Runner) Launch(
 		JITConfig:               reg.Config(),
 		CacheEndpoint:           cacheEndpoint,
 		CacheToken:              cacheToken,
+		ActionsProxy:            actionsProxy,
+		ActionsCAPEM:            actionsCAPEM,
 		BuildKitCacheMountLimit: buildKitCacheMountLimit,
 		RegistryMirrors:         r.registryMirrors,
 

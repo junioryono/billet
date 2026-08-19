@@ -186,6 +186,12 @@ type Job struct {
 	// The ONLY thing in a scale-set message that says how far the workload can be
 	// trusted, which decides which backends may run it.
 	Event string
+	// Owner, Repository and WorkflowRef are GitHub's authenticated cache scope.
+	// They come from the scale-set assignment, never from a workflow-controlled
+	// environment variable or by decoding the Actions runtime token.
+	Owner       string
+	Repository  string
+	WorkflowRef string
 }
 
 // Statistics is GitHub's own view of the scale set.
@@ -1359,8 +1365,8 @@ func (l *Listener) retryCleanup(ctx context.Context) {
 	// own obligation and its own backoff before returning — the pacing lives with
 	// the knowledge of what failed, rather than in a caller that would have to be
 	// told.
-	for _, job := range pending {
-		l.attempt(ctx, job)
+	for i := range pending {
+		l.attempt(ctx, pending[i])
 	}
 }
 
@@ -1462,10 +1468,10 @@ func (l *Listener) destroyAll(ctx context.Context) map[int64]bool {
 		slot = make(chan struct{}, teardownConcurrency)
 	)
 
-	for _, job := range requests {
+	for i := range requests {
 		wg.Add(1)
 
-		go func(job Job) {
+		go func(job *Job) {
 			defer wg.Done()
 			requestID := job.RequestID
 
@@ -1495,7 +1501,7 @@ func (l *Listener) destroyAll(ctx context.Context) map[int64]bool {
 			}
 
 			lease, outcome, _ := l.completionRelease(requestID)
-			err := l.destroyCompleted(ctx, job, lease, outcome)
+			err := l.destroyCompleted(ctx, *job, lease, outcome)
 
 			// CUSTODY DISCHARGES THE OBLIGATION RATHER THAN FAILING IT (#46).
 			//
@@ -1513,20 +1519,20 @@ func (l *Listener) destroyAll(ctx context.Context) map[int64]bool {
 			persisted := true
 			retired := true
 			if held {
-				retired = l.forgetCompletion(ctx, job)
+				retired = l.forgetCompletion(ctx, *job)
 				if !retired {
-					l.parkRetirement(job)
+					l.parkRetirement(*job)
 				}
 			} else if err == nil {
 				if lease == nil {
-					retired = l.forgetCompletion(ctx, job)
+					retired = l.forgetCompletion(ctx, *job)
 					persisted = retired
 					if !retired {
-						l.parkRetirement(job)
+						l.parkRetirement(*job)
 					}
-				} else if persistErr := l.recordReleaseOnly(ctx, job, lease, outcome); persistErr != nil {
+				} else if persistErr := l.recordReleaseOnly(ctx, *job, lease, outcome); persistErr != nil {
 					persisted = false
-					l.parkReleaseOnly(job, lease, outcome)
+					l.parkReleaseOnly(*job, lease, outcome)
 					l.log.Error("compute was confirmed absent, but its release-only obligation could not be made durable; capacity stays held until this is retried",
 						"tier", l.tier, "request", requestID, "lease", lease.ID, "error", persistErr)
 				}
@@ -1588,7 +1594,7 @@ func (l *Listener) destroyAll(ctx context.Context) map[int64]bool {
 			}
 
 			l.mu.Unlock()
-		}(job)
+		}(&requests[i])
 	}
 
 	wg.Wait()
@@ -2090,9 +2096,8 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 	// launch pulls images and talks to a hypervisor; doing it under the mutex
 	// would stall every heartbeat behind it, and heartbeats are what keep the
 	// escrow alive. So assign returns what it bound and the launches follow.
-	for _, job := range msg.Assigned {
-		var err error
-		job, err = l.identifyAssigned(ctx, job)
+	for i := range msg.Assigned {
+		job, err := l.identifyAssigned(ctx, msg.Assigned[i])
 		if err != nil {
 			return err
 		}
@@ -2235,7 +2240,8 @@ func (l *Listener) acknowledgeCompletions(ctx context.Context, msg *Message) {
 	if l.completionStore == nil {
 		return
 	}
-	for _, job := range msg.Completed {
+	for i := range msg.Completed {
+		job := &msg.Completed[i]
 		if err := l.completionStore.AcknowledgePendingCompletion(
 			ctx, l.tier, job.RequestID, msg.MessageID,
 		); err != nil {
@@ -2265,10 +2271,9 @@ func (l *Listener) acquire(ctx context.Context, available []Job) error {
 	identified := make([]Job, 0, len(available))
 	protocolFor := make(map[int64]int64, len(available))
 	internalFor := make(map[int64]int64, len(available))
-	for _, job := range available {
-		protocolID := job.RequestID
-		var err error
-		job, err = l.identifyAssigned(ctx, job)
+	for i := range available {
+		protocolID := available[i].RequestID
+		job, err := l.identifyAssigned(ctx, available[i])
 		if err != nil {
 			return err
 		}
@@ -2345,7 +2350,8 @@ func (l *Listener) reserve(available []Job) []int64 {
 
 	ids := make([]int64, 0, len(available))
 
-	for _, job := range available {
+	for i := range available {
+		job := &available[i]
 		// Already promised, and therefore NOT returned to the caller.
 		//
 		// Returning it looked harmless and was not: the caller unreserves whatever
@@ -3418,8 +3424,8 @@ func (l *Listener) releaseAll(ctx context.Context, destroyed map[int64]bool) {
 	l.held = nil
 	l.acquiring = make(map[int64]*promise)
 	l.mu.Unlock()
-	for _, job := range retirements {
-		l.forgetCompletion(ctx, job)
+	for i := range retirements {
+		l.forgetCompletion(ctx, retirements[i])
 	}
 
 	// WHAT DID NOT LAND IS PUT BACK, rather than dropped on the floor. These were

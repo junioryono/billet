@@ -77,9 +77,16 @@ func TestALaunchCommandCarriesWhatALaunchNeeds(t *testing.T) {
 			Epoch:     3,
 			RequestID: 77,
 		},
-		Tier: TierSpecOf(config.Tier{BuildKitCacheMountLimit: 7 * config.GiB},
+		Tier: TierSpecOf(config.Tier{BuildKitCacheMountLimit: 7 * config.GiB, Intercept: true},
 			config.ProviderDocker),
-		Job: &Job{RequestID: 77, RunID: 88, Event: "push"},
+		Job: &Job{
+			RequestID:   77,
+			RunID:       88,
+			Event:       "push",
+			Owner:       "acme",
+			Repository:  "api",
+			WorkflowRef: "acme/api/.github/workflows/ci.yml@refs/heads/main",
+		},
 	}
 
 	raw, err := json.Marshal(cmd)
@@ -116,8 +123,15 @@ func TestALaunchCommandCarriesWhatALaunchNeeds(t *testing.T) {
 		t.Errorf("the job's event was lost, and it is the only thing that says how far the "+
 			"workload can be trusted: %+v", got.Job)
 	}
+	if got.Job.Owner != "acme" || got.Job.Repository != "api" ||
+		got.Job.WorkflowRef != "acme/api/.github/workflows/ci.yml@refs/heads/main" {
+		t.Errorf("the authenticated cache scope was lost on the node wire: %+v", got.Job)
+	}
 	if got.Tier == nil || got.Tier.BuildKitCacheMountLimit != 7*config.GiB {
 		t.Errorf("the tier's BuildKit cache-mount ceiling was lost: %+v", got.Tier)
+	}
+	if !got.Tier.Intercept {
+		t.Error("the tier's Actions interception policy was lost on the node wire")
 	}
 }
 

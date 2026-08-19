@@ -213,10 +213,13 @@ func translate(msg *gh.RunnerScaleSetMessage) *server.Message {
 		}
 
 		out.Available = append(out.Available, server.Job{
-			RequestID: j.RunnerRequestID,
-			RunID:     j.WorkflowRunID,
-			JobID:     j.JobID,
-			Event:     j.EventName,
+			RequestID:   j.RunnerRequestID,
+			RunID:       j.WorkflowRunID,
+			JobID:       j.JobID,
+			Event:       j.EventName,
+			Owner:       j.OwnerName,
+			Repository:  j.RepositoryName,
+			WorkflowRef: j.JobWorkflowRef,
 		})
 	}
 
@@ -226,10 +229,13 @@ func translate(msg *gh.RunnerScaleSetMessage) *server.Message {
 		}
 
 		out.Assigned = append(out.Assigned, server.Job{
-			RequestID: j.RunnerRequestID,
-			RunID:     j.WorkflowRunID,
-			JobID:     j.JobID,
-			Event:     j.EventName,
+			RequestID:   j.RunnerRequestID,
+			RunID:       j.WorkflowRunID,
+			JobID:       j.JobID,
+			Event:       j.EventName,
+			Owner:       j.OwnerName,
+			Repository:  j.RepositoryName,
+			WorkflowRef: j.JobWorkflowRef,
 		})
 	}
 
@@ -239,12 +245,15 @@ func translate(msg *gh.RunnerScaleSetMessage) *server.Message {
 		}
 
 		out.Completed = append(out.Completed, server.Job{
-			RequestID:  j.RunnerRequestID,
-			RunID:      j.WorkflowRunID,
-			JobID:      j.JobID,
-			Event:      j.EventName,
-			Result:     j.Result,
-			RunnerName: j.RunnerName,
+			RequestID:   j.RunnerRequestID,
+			RunID:       j.WorkflowRunID,
+			JobID:       j.JobID,
+			Event:       j.EventName,
+			Owner:       j.OwnerName,
+			Repository:  j.RepositoryName,
+			WorkflowRef: j.JobWorkflowRef,
+			Result:      j.Result,
+			RunnerName:  j.RunnerName,
 		})
 	}
 

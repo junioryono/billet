@@ -60,6 +60,11 @@ type LeaseStore interface {
 	QuarantinedLeaseIDs(ctx context.Context, node string) (map[string]bool, error)
 }
 
+// CachePolicy answers the kill switch for transparent Actions caching.
+type CachePolicy interface {
+	ActionsCacheAllowed(ctx context.Context, owner, repository string) (bool, error)
+}
+
 // maxBody bounds a request body.
 //
 // A node is authenticated but not trusted to be well-behaved — it may be an old
@@ -165,6 +170,11 @@ func WithTrustBundle(pem []byte) HandlerOption {
 	return func(h *handler) { h.trust = pem }
 }
 
+// WithCachePolicy gives nodes the central interception kill switch.
+func WithCachePolicy(policy CachePolicy) HandlerOption {
+	return func(h *handler) { h.cachePolicy = policy }
+}
+
 // Handler serves the node wire.
 //
 // Every route that acts for a node is wrapped in forNode, and that is deliberate
@@ -214,6 +224,7 @@ func Handler(log *slog.Logger, p *Plane, store LeaseStore, jit JITSource, opts .
 	mux.HandleFunc("POST /v1/nodes/{node}/reconcile", h.forNewWork(h.reconcile))
 	mux.HandleFunc("POST /v1/nodes/{node}/jit", h.forNode(h.jitConfig))
 	mux.HandleFunc("POST /v1/nodes/{node}/renew", h.forNode(h.renew))
+	mux.HandleFunc("GET /v1/nodes/{node}/cache-policy", h.forNode(h.actionsCachePolicy))
 
 	return mux
 }
@@ -232,6 +243,7 @@ type handler struct {
 	ca          *wirecert.CA
 	trust       []byte
 	enrollments Enrollments
+	cachePolicy CachePolicy
 
 	// sets caches the resolved scale set per tier.
 	//
@@ -878,6 +890,23 @@ func (h *handler) poll(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, cmd)
+}
+
+func (h *handler) actionsCachePolicy(w http.ResponseWriter, r *http.Request) {
+	if h.cachePolicy == nil {
+		writeErr(w, http.StatusServiceUnavailable, "", "Actions cache policy is unavailable")
+
+		return
+	}
+	owner := r.URL.Query().Get("owner")
+	repository := r.URL.Query().Get("repository")
+	allowed, err := h.cachePolicy.ActionsCacheAllowed(r.Context(), owner, repository)
+	if err != nil {
+		writeErr(w, http.StatusServiceUnavailable, "", err.Error())
+
+		return
+	}
+	writeJSON(w, http.StatusOK, nodeapi.CachePolicyResponse{Allowed: allowed})
 }
 
 func (h *handler) result(w http.ResponseWriter, r *http.Request) {
