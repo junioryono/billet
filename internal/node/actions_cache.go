@@ -282,6 +282,11 @@ func (s *CacheService) createActionsCache(
 	if len(session.actions)+len(session.receipts) >= actionsArchiveCount {
 		return nil, errors.New("this job has too many active Actions cache archives")
 	}
+	if session.receipts[actionsReceiptID(request.Key, request.Version)] != nil {
+		return actionsJSONResponse(map[string]any{
+			"ok": false, "message": "this job already finalized that cache key and version",
+		})
+	}
 	for _, active := range session.actions {
 		if active.Mode == actionsModeUpload && active.CacheKey == request.Key &&
 			active.Version == request.Version {
@@ -418,14 +423,14 @@ func (s *CacheService) actionsFinalizeReceipt(
 	}
 	defer session.mu.Unlock()
 	receipt := session.receipts[actionsReceiptID(request.Key, request.Version)]
-	if receipt == nil {
+	if receipt == nil || !receipt.Complete {
 		return nil, false, nil
 	}
 	size, err := parseActionsSize(request.SizeBytes)
 	if err != nil || size != receipt.Size {
 		return nil, true, errors.New("finalization does not match the local reservation receipt")
 	}
-	response, err := s.publishActionsReceipt(ctx, session, receipt)
+	response, err := actionsReceiptResponse(receipt)
 
 	return response, true, err
 }
@@ -575,18 +580,48 @@ func (s *CacheService) publishActionsReceipt(
 			return nil, err
 		}
 	}
-	err = s.store.PublishCAS(ctx, receipt.StoreKey, "", receipt.Candidate,
-		receipt.Lease, receipt.Fence)
-	if err != nil && !errors.Is(err, storecontract.ErrConflict) {
-		return nil, err
-	}
-	receipt.Complete = true
-	receipt.OK = err == nil
-	if err := s.persistSession(session); err != nil {
-		return nil, err
+	for attempt := range 2 {
+		err = s.store.PublishCAS(ctx, receipt.StoreKey, "", receipt.Candidate,
+			receipt.Lease, receipt.Fence)
+		if !errors.Is(err, storecontract.ErrConflict) {
+			if err != nil {
+				return nil, err
+			}
+			receipt.Complete = true
+			receipt.OK = true
+			if err := s.persistSession(session); err != nil {
+				return nil, err
+			}
+
+			return actionsReceiptResponse(receipt)
+		}
+		current, currentErr := s.store.Current(ctx, receipt.StoreKey)
+		if currentErr == nil {
+			receipt.Complete = true
+			receipt.OK = current == receipt.Candidate.Generation
+			if err := s.persistSession(session); err != nil {
+				return nil, err
+			}
+
+			return actionsReceiptResponse(receipt)
+		}
+		if !errors.Is(currentErr, storecontract.ErrMiss) {
+			return nil, currentErr
+		}
+		receipt.Lease, receipt.Fence, err = s.store.AcquireWriter(ctx, receipt.StoreKey,
+			session.instance+"/actions/"+receipt.ID, cacheWriterTTL)
+		if err != nil {
+			return nil, err
+		}
+		if err := s.persistSession(session); err != nil {
+			return nil, err
+		}
+		if attempt == 1 {
+			return nil, storecontract.ErrConflict
+		}
 	}
 
-	return actionsReceiptResponse(receipt)
+	return nil, storecontract.ErrConflict
 }
 
 func actionsReceiptResponse(receipt *actionsReceipt) (*http.Response, error) {

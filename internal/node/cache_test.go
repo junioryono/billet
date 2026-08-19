@@ -33,6 +33,8 @@ type fakeCacheStore struct {
 	renewed           int
 	renewedUntil      time.Time
 	publishErr        error
+	publishConflicts  int
+	conflictCurrent   string
 	advanceOnSnapshot bool
 	publishExpected   []string
 	keys              []string
@@ -150,6 +152,14 @@ func (f *fakeCacheStore) PublishCAS(
 ) error {
 	f.published++
 	f.publishExpected = append(f.publishExpected, expected)
+	if f.publishConflicts > 0 {
+		f.publishConflicts--
+		if f.conflictCurrent != "" {
+			f.current = f.conflictCurrent
+		}
+
+		return storecontract.ErrConflict
+	}
 	if f.publishErr == nil && expected != f.current {
 		return storecontract.ErrConflict
 	}

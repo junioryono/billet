@@ -651,6 +651,59 @@ func TestActionsFinalizeFailureNeverFallsThroughToGitHub(t *testing.T) {
 	}
 }
 
+func TestActionsFinalizeRechecksThePointerAfterAConflict(t *testing.T) {
+	t.Parallel()
+
+	for name, conflictCurrent := range map[string]string{
+		"retry after an absent pointer":            "",
+		"recognize an already-published candidate": "next",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			service, storage, session, _ := testActionsService(t)
+			create := actionsRequestForTest(t, http.MethodPost,
+				"https://"+actionsResultsHost+actionsCreatePath,
+				`{"key":"conflict","version":"v1"}`)
+			response, _, err := service.actionsResponse(create, session)
+			if err != nil {
+				t.Fatalf("CreateCacheEntry: %v", err)
+			}
+			created := responseJSON(t, response)
+			uploadURL, ok := created["signed_upload_url"].(string)
+			if !ok || uploadURL == "" {
+				t.Fatalf("CreateCacheEntry response = %v", created)
+			}
+			upload := actionsRequestForTest(t, http.MethodPut, uploadURL, "archive-body")
+			upload.Header.Set("X-Ms-Blob-Type", "BlockBlob")
+			response, _, err = service.actionsResponse(upload, session)
+			if err != nil {
+				t.Fatalf("upload: %v", err)
+			}
+			response.Body.Close()
+			storage.publishConflicts = 1
+			storage.conflictCurrent = conflictCurrent
+			finalize := actionsRequestForTest(t, http.MethodPost,
+				"https://"+actionsResultsHost+actionsFinalizePath,
+				`{"key":"conflict","version":"v1","size_bytes":"12"}`)
+			response, _, err = service.actionsResponse(finalize, session)
+			if err != nil {
+				t.Fatalf("FinalizeCacheEntryUpload: %v", err)
+			}
+			finalized := responseJSON(t, response)
+			wantPublishes := 2
+			if conflictCurrent != "" {
+				wantPublishes = 1
+			}
+			if finalized["ok"] != true || storage.published != wantPublishes ||
+				storage.current != "next" {
+				t.Fatalf("finalization=%v published=%d current=%q",
+					finalized, storage.published, storage.current)
+			}
+		})
+	}
+}
+
 func TestActionsFinalizeReceiptSurvivesRestartAndPolicyOutage(t *testing.T) {
 	t.Parallel()
 
@@ -718,6 +771,19 @@ func TestActionsFinalizeReceiptSurvivesRestartAndPolicyOutage(t *testing.T) {
 				!initialFailure && initialStatus != http.StatusOK {
 				t.Fatalf("initial finalize status = %d", initialStatus)
 			}
+			if initialFailure {
+				duplicate := actionsRequestForTest(t, http.MethodPost,
+					"https://"+actionsResultsHost+actionsCreatePath,
+					`{"key":"durable-receipt","version":"v1"}`)
+				response, _, err = service.actionsResponse(duplicate, session)
+				if err != nil {
+					t.Fatalf("duplicate CreateCacheEntry: %v", err)
+				}
+				duplicated := responseJSON(t, response)
+				if duplicated["ok"] != false || storage.created != 1 {
+					t.Fatalf("duplicate reservation=%v created=%d", duplicated, storage.created)
+				}
+			}
 
 			storage.publishErr = nil
 			restarted, err := NewCacheService("http://172.20.0.1:7718", "test-deployment",
@@ -746,10 +812,29 @@ func TestActionsFinalizeReceiptSurvivesRestartAndPolicyOutage(t *testing.T) {
 			if err != nil {
 				t.Fatalf("retry finalize: %v", err)
 			}
+			if initialFailure {
+				if response.StatusCode != http.StatusBadGateway || upstreamRequests != 0 ||
+					storage.current != "" {
+					t.Fatalf("policy-outage retry status=%d upstream=%d current=%q",
+						response.StatusCode, upstreamRequests, storage.current)
+				}
+				response.Body.Close()
+				restarted.SetActionsPolicy(actionsPolicyFunc(func(context.Context, string, string) (bool, error) {
+					return true, nil
+				}))
+				retry = actionsRequestForTest(t, http.MethodPost,
+					"https://"+actionsResultsHost+actionsFinalizePath, finalizeBody)
+				response, err = restarted.actions.roundTrip(retry, restartedSession)
+				if err != nil {
+					if response != nil {
+						response.Body.Close()
+					}
+					t.Fatalf("allowed retry finalize: %v", err)
+				}
+			}
 			retried := responseJSON(t, response)
 			if retried["ok"] != true || upstreamRequests != 0 || storage.current != "next" {
-				t.Fatalf("retry=%v upstream=%d current=%q",
-					retried, upstreamRequests, storage.current)
+				t.Fatalf("retry=%v upstream=%d current=%q", retried, upstreamRequests, storage.current)
 			}
 		})
 	}
