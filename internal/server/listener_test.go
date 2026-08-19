@@ -713,7 +713,8 @@ func TestCompletionRecoversAnOmittedRequestIDFromTheRunnerName(t *testing.T) {
 	}
 
 	err = l.handle(t.Context(), &Message{MessageID: 2, Completed: []Job{{
-		RunID: 101, Result: "succeeded", RunnerName: provider.InstanceName(lease.ID),
+		RunID: 101, JobID: "translated-job-guid", Result: "succeeded",
+		RunnerName: provider.InstanceName(lease.ID),
 	}}})
 	if err != nil {
 		t.Fatalf("handle completion without request id: %v", err)
@@ -735,6 +736,37 @@ func TestCompletionRecoversAnOmittedRequestIDFromTheRunnerName(t *testing.T) {
 	}
 	if len(pending) != 0 {
 		t.Errorf("completion acknowledgement retained %+v, want no pending rows", pending)
+	}
+	if _, exists, err := a.DirectJobIdentity(t.Context(), "translated-job-guid"); err != nil {
+		t.Fatalf("DirectJobIdentity: %v", err)
+	} else if exists {
+		t.Error("completion synthesized a direct-job identity instead of using its runner's lease")
+	}
+}
+
+func TestCompletionRefusesDisagreeingRunnerAndJobIdentities(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: tierVCPU, MaxMemory: 64 * config.GiB}, tiers)
+
+	l := NewListener(a, tiers[0].Label, &fakeSession{})
+	if err := l.refillEscrow(t.Context()); err != nil {
+		t.Fatalf("refill escrow: %v", err)
+	}
+	lease, needsCompute, err := l.assign(t.Context(), Job{RequestID: 11, RunID: 101})
+	if err != nil {
+		t.Fatalf("assign: %v", err)
+	}
+	if !needsCompute || lease == nil {
+		t.Fatal("assignment did not receive compute")
+	}
+	if _, err := a.IdentifyDirectJob(t.Context(), "different-job-guid"); err != nil {
+		t.Fatalf("IdentifyDirectJob: %v", err)
+	}
+
+	_, err = l.identifyCompletion(t.Context(), Job{RunID: 101, JobID: "different-job-guid",
+		RunnerName: provider.InstanceName(lease.ID)})
+	if !errors.Is(err, ErrUntrustworthySession) {
+		t.Fatalf("identify completion with disagreeing identities = %v, want ErrUntrustworthySession", err)
 	}
 }
 
@@ -764,21 +796,18 @@ func TestDirectAssignmentUsesJobIDWhenGitHubSendsRequestIDZero(t *testing.T) {
 		t.Fatalf("refill escrow: %v", err)
 	}
 	assigned := Job{RunID: 101, JobID: "job-guid", Event: "push"}
-	if err := l.handle(t.Context(), &Message{MessageID: 1, Available: []Job{assigned}}); err != nil {
-		t.Fatalf("handle direct offer: %v", err)
-	}
-	if got := session.acquiredIDs(); !slices.Equal(got, []int64{0}) {
-		t.Fatalf("acquired ids = %v, want GitHub's wire id 0", got)
-	}
-	if err := l.handle(t.Context(), &Message{MessageID: 2, Assigned: []Job{assigned}}); err != nil {
+	if err := l.handle(t.Context(), &Message{MessageID: 1, Assigned: []Job{assigned}}); err != nil {
 		t.Fatalf("handle direct assignment: %v", err)
+	}
+	if got := session.acquiredIDs(); len(got) != 0 {
+		t.Fatalf("assigned-only message acquired ids %v, want none", got)
 	}
 	if launched >= 0 {
 		t.Fatalf("launch request id = %d, want a negative durable identity", launched)
 	}
 
 	completed := Job{RunID: 101, JobID: "job-guid", Result: "succeeded"}
-	if err := l.handle(t.Context(), &Message{MessageID: 3, Completed: []Job{completed}}); err != nil {
+	if err := l.handle(t.Context(), &Message{MessageID: 2, Completed: []Job{completed}}); err != nil {
 		t.Fatalf("handle direct completion: %v", err)
 	}
 	if destroyed != launched {
@@ -803,7 +832,7 @@ func TestDirectAssignmentUsesJobIDWhenGitHubSendsRequestIDZero(t *testing.T) {
 
 func TestDistinctDirectOffersSharingWireIDAreRefused(t *testing.T) {
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
-	a := newAllocator(t, alloc.Limits{MaxVCPU: 2 * tierVCPU, MaxMemory: 64 * config.GiB}, tiers)
+	a := newAllocator(t, alloc.Limits{MaxVCPU: tierVCPU, MaxMemory: 64 * config.GiB}, tiers)
 	session := &fakeSession{}
 	l := NewListener(a, tiers[0].Label, session)
 
@@ -820,8 +849,8 @@ func TestDistinctDirectOffersSharingWireIDAreRefused(t *testing.T) {
 	if got := len(l.acquiring); got != 0 {
 		t.Errorf("%d ambiguous promises remain reserved, want 0", got)
 	}
-	if got := len(l.held); got != 2 {
-		t.Errorf("%d leases returned to escrow, want 2", got)
+	if got := len(l.held); got != 1 {
+		t.Errorf("%d leases remain in escrow, want 1", got)
 	}
 }
 

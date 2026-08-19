@@ -41,3 +41,25 @@ func (a *Allocator) IdentifyDirectJob(ctx context.Context, jobID string) (int64,
 
 	return internalID, err
 }
+
+// DirectJobIdentity reads an existing direct-assignment identity without creating one.
+func (a *Allocator) DirectJobIdentity(ctx context.Context, jobID string) (int64, bool, error) {
+	jobID = strings.TrimSpace(jobID)
+	if jobID == "" {
+		return 0, false, errors.New("alloc: a direct assignment lookup needs a job id")
+	}
+
+	var internalID int64
+	err := a.db.View(ctx, func(tx querier) error {
+		return tx.QueryRowContext(ctx,
+			`SELECT internal_id FROM job_identities WHERE job_id = ?`, jobID).Scan(&internalID)
+	})
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return 0, false, nil
+	case err != nil:
+		return 0, false, fmt.Errorf("alloc: read direct job identity: %w", err)
+	default:
+		return internalID, true, nil
+	}
+}

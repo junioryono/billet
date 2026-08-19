@@ -102,6 +102,16 @@ func TestDirectJobIdentityIsStableAndCollisionFree(t *testing.T) {
 	if second == first {
 		t.Errorf("distinct jobs shared identity %d", first)
 	}
+	if got, exists, err := a.DirectJobIdentity(t.Context(), "job-a"); err != nil {
+		t.Fatalf("DirectJobIdentity(job-a): %v", err)
+	} else if !exists || got != first {
+		t.Errorf("DirectJobIdentity(job-a) = %d, %t, want %d, true", got, exists, first)
+	}
+	if got, exists, err := a.DirectJobIdentity(t.Context(), "job-absent"); err != nil {
+		t.Fatalf("DirectJobIdentity(job-absent): %v", err)
+	} else if exists || got != 0 {
+		t.Errorf("DirectJobIdentity(job-absent) = %d, %t, want 0, false", got, exists)
+	}
 }
 
 // newAllocator is an allocator with ONE HOST ALREADY IN IT, big enough that it

@@ -125,7 +125,7 @@ func (db *DB) RetirePendingCompletion(
 	requestID, messageID int64,
 ) error {
 	if strings.TrimSpace(tier) == "" || requestID == 0 || messageID < 0 {
-		return errors.New("state: a pending completion retirement needs a tier and non-negative identity")
+		return errors.New("state: a pending completion retirement needs a tier, non-zero request id, and non-negative message id")
 	}
 
 	return db.Tx(ctx, func(tx *sql.Tx) error {
@@ -154,7 +154,7 @@ func (db *DB) AcknowledgePendingCompletion(
 	requestID, messageID int64,
 ) error {
 	if strings.TrimSpace(tier) == "" || requestID == 0 || messageID < 0 {
-		return errors.New("state: a pending completion identity needs a tier and positive request id")
+		return errors.New("state: a pending completion identity needs a tier, non-zero request id, and non-negative message id")
 	}
 
 	return db.Tx(ctx, func(tx *sql.Tx) error {

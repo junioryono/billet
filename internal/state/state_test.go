@@ -743,7 +743,7 @@ func TestEveryTableIsStrict(t *testing.T) {
 
 // A REBUILDING MIGRATION COPIES EVERY COLUMN IT DECLARES.
 //
-// Migrations 16, 17 and 20 rebuild tables, because CHECK constraints and STRICT
+// Migrations 16, 17, 20 and 26 rebuild tables, because CHECK constraints and STRICT
 // are properties of the declaration and SQLite cannot alter either. A rebuild
 // is the one migration shape that silently loses things: a column left out of
 // the copy list keeps its DEFAULT in the new table and nothing complains.
@@ -760,10 +760,12 @@ func TestEveryTableIsStrict(t *testing.T) {
 func TestRebuildingMigrationsCopyEveryColumn(t *testing.T) {
 	for _, m := range []migration{
 		quarantineMigration, strictTrustTablesMigration, custodyVisibilityMigration,
+		directAssignmentIdentityMigration,
 	} {
 		declared := map[string][]string{}
 		inserted := map[string][]string{}
 		selected := map[string][]string{}
+		rebuilt := 0
 
 		for _, stmt := range m.Stmts {
 			switch {
@@ -777,7 +779,14 @@ func TestRebuildingMigrationsCopyEveryColumn(t *testing.T) {
 		}
 
 		for table, cols := range declared {
-			into, from := inserted[table], selected[table]
+			into, ok := inserted[table]
+			if !ok {
+				// A migration may create a new table beside the one it rebuilds.
+				// With no old rows to copy, that table has no INSERT ... SELECT.
+				continue
+			}
+			rebuilt++
+			from := selected[table]
 
 			// COVERAGE is a question about sets: every declared column has to be
 			// filled by something, in whatever order the statement lists them.
@@ -801,8 +810,8 @@ func TestRebuildingMigrationsCopyEveryColumn(t *testing.T) {
 			}
 		}
 
-		if len(declared) == 0 {
-			t.Errorf("migration %d declares no rebuilt table, so this test checked nothing",
+		if rebuilt == 0 {
+			t.Errorf("migration %d populates no rebuilt table, so this test checked nothing",
 				m.Version)
 		}
 	}
@@ -1304,6 +1313,68 @@ func TestAPendingCompletionWrittenAtVersion24SurvivesVersion25(t *testing.T) {
 	}
 	want := PendingCompletion{Tier: "linux", RequestID: 93, RunID: 103, Result: "Succeeded",
 		MessageID: 7, Retired: true}
+	if !slices.Equal(got, []PendingCompletion{want}) {
+		t.Fatalf("upgraded pending completions = %+v, want %+v", got, want)
+	}
+}
+
+func TestAPendingCompletionWrittenAtVersion25SurvivesVersion26(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(t.Context(), dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := db.Tx(t.Context(), func(tx *sql.Tx) error {
+		for _, stmt := range []string{
+			`DROP TABLE pending_completions`,
+			`CREATE TABLE pending_completions (
+				tier         TEXT NOT NULL CHECK (length(trim(tier)) > 0),
+				request_id   INTEGER NOT NULL CHECK (request_id > 0),
+				run_id       INTEGER NOT NULL DEFAULT 0 CHECK (run_id >= 0),
+				result       TEXT NOT NULL CHECK (length(trim(result)) > 0),
+				lease_id     TEXT NOT NULL DEFAULT '',
+				lease_epoch  INTEGER NOT NULL DEFAULT 0 CHECK (lease_epoch >= 0),
+				outcome      TEXT NOT NULL DEFAULT '' CHECK (outcome IN ('','done','failed')),
+				release_only INTEGER NOT NULL DEFAULT 0 CHECK (release_only IN (0,1)),
+				lease_node   TEXT NOT NULL DEFAULT '',
+				message_id   INTEGER NOT NULL DEFAULT 0 CHECK (message_id >= 0),
+				retired      INTEGER NOT NULL DEFAULT 0 CHECK (retired IN (0,1)),
+				acknowledged INTEGER NOT NULL DEFAULT 0 CHECK (acknowledged IN (0,1)),
+				PRIMARY KEY (tier, request_id)
+			) STRICT`,
+			`DROP TABLE job_identities`,
+			`DELETE FROM schema_migrations WHERE version = 26`,
+			`INSERT INTO pending_completions
+			 (tier, request_id, run_id, result, lease_id, lease_epoch, outcome,
+			  release_only, lease_node, message_id, retired, acknowledged)
+			 VALUES ('linux', 94, 104, 'Failed', 'lease-94', 5, 'failed',
+			         1, 'holder', 8, 1, 0)`,
+		} {
+			if _, err := tx.ExecContext(t.Context(), stmt); err != nil {
+				return fmt.Errorf("%s: %w", stmt, err)
+			}
+		}
+
+		return nil
+	}); err != nil {
+		t.Fatalf("rewind to version 25: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close version 25 database: %v", err)
+	}
+
+	upgraded, err := Open(t.Context(), dir)
+	if err != nil {
+		t.Fatalf("open version 25 database with version 26: %v", err)
+	}
+	defer upgraded.Close()
+	got, err := upgraded.PendingCompletions(t.Context(), "linux")
+	if err != nil {
+		t.Fatalf("PendingCompletions: %v", err)
+	}
+	want := PendingCompletion{Tier: "linux", RequestID: 94, RunID: 104, Result: "Failed",
+		LeaseID: "lease-94", LeaseEpoch: 5, LeaseNode: "holder", Outcome: "failed",
+		ReleaseOnly: true, MessageID: 8, Retired: true}
 	if !slices.Equal(got, []PendingCompletion{want}) {
 		t.Fatalf("upgraded pending completions = %+v, want %+v", got, want)
 	}

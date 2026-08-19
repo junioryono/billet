@@ -2161,14 +2161,11 @@ func (l *Listener) identifyAssigned(ctx context.Context, job Job) (Job, error) {
 	return job, nil
 }
 
-// identifyCompletion resolves a zero wire id through job id, or through a lease
-// name for a completion written by an older billet.
+// identifyCompletion resolves a zero wire id through the runner's lease, or
+// through job id when there is no durable lease identity to recover.
 func (l *Listener) identifyCompletion(ctx context.Context, job Job) (Job, error) {
 	if job.RequestID != 0 {
 		return job, nil
-	}
-	if job.JobID != "" {
-		return l.identifyAssigned(ctx, job)
 	}
 	if l.alloc == nil {
 		return Job{}, fmt.Errorf("%w: %s completed runner %q without a request id, and no ledger is available to resolve it",
@@ -2176,30 +2173,48 @@ func (l *Listener) identifyCompletion(ctx context.Context, job Job) (Job, error)
 	}
 
 	leaseID, ok := provider.LeaseOf(job.RunnerName)
-	if !ok {
-		return Job{}, fmt.Errorf("%w: %s completed runner %q without a request id or a billet lease name",
-			ErrUntrustworthySession, l.tier, job.RunnerName)
-	}
-	identity, err := l.alloc.JobForLease(ctx, leaseID)
-	if err != nil {
-		return Job{}, fmt.Errorf("%w: %s cannot resolve completed runner %q: %w",
-			ErrUntrustworthySession, l.tier, job.RunnerName, err)
-	}
-	if identity.Tier != l.tier || identity.RequestID == 0 {
-		return Job{}, fmt.Errorf("%w: completed runner %q resolves to tier %q request %d, not tier %q",
-			ErrUntrustworthySession, job.RunnerName, identity.Tier, identity.RequestID, l.tier)
-	}
-	if job.RunID != 0 && identity.RunID != 0 && job.RunID != identity.RunID {
-		return Job{}, fmt.Errorf("%w: completed runner %q reports run %d but its lease records run %d",
-			ErrUntrustworthySession, job.RunnerName, job.RunID, identity.RunID)
+	if ok {
+		identity, err := l.alloc.JobForLease(ctx, leaseID)
+		switch {
+		case err == nil:
+			if identity.Tier != l.tier || identity.RequestID == 0 {
+				return Job{}, fmt.Errorf("%w: completed runner %q resolves to tier %q request %d, not tier %q",
+					ErrUntrustworthySession, job.RunnerName, identity.Tier, identity.RequestID, l.tier)
+			}
+			if job.RunID != 0 && identity.RunID != 0 && job.RunID != identity.RunID {
+				return Job{}, fmt.Errorf("%w: completed runner %q reports run %d but its lease records run %d",
+					ErrUntrustworthySession, job.RunnerName, job.RunID, identity.RunID)
+			}
+			if job.JobID != "" {
+				mapped, exists, err := l.alloc.DirectJobIdentity(ctx, job.JobID)
+				if err != nil {
+					return Job{}, fmt.Errorf("%w: %s cannot cross-check completed job %q: %w",
+						ErrUntrustworthySession, l.tier, job.JobID, err)
+				}
+				if exists && mapped != identity.RequestID {
+					return Job{}, fmt.Errorf("%w: completed runner %q resolves to request %d but job %q resolves to %d",
+						ErrUntrustworthySession, job.RunnerName, identity.RequestID, job.JobID, mapped)
+				}
+			}
+
+			job.RequestID = identity.RequestID
+			if job.RunID == 0 {
+				job.RunID = identity.RunID
+			}
+
+			return job, nil
+		case !errors.Is(err, alloc.ErrLeaseNotFound):
+			return Job{}, fmt.Errorf("%w: %s cannot resolve completed runner %q: %w",
+				ErrUntrustworthySession, l.tier, job.RunnerName, err)
+		}
 	}
 
-	job.RequestID = identity.RequestID
-	if job.RunID == 0 {
-		job.RunID = identity.RunID
+	if job.JobID != "" {
+		return l.identifyAssigned(ctx, job)
 	}
 
-	return job, nil
+	return Job{}, fmt.Errorf("%w: %s completed runner %q without a request id, job id, or resolvable billet lease",
+		ErrUntrustworthySession, l.tier, job.RunnerName)
 }
 
 // acknowledge tells GitHub the message was handled. An unacknowledged message is
@@ -2247,6 +2262,7 @@ func (l *Listener) acquire(ctx context.Context, available []Job) error {
 
 	identified := make([]Job, 0, len(available))
 	protocolFor := make(map[int64]int64, len(available))
+	internalFor := make(map[int64]int64, len(available))
 	for _, job := range available {
 		protocolID := job.RequestID
 		var err error
@@ -2256,6 +2272,11 @@ func (l *Listener) acquire(ctx context.Context, available []Job) error {
 		}
 		identified = append(identified, job)
 		protocolFor[job.RequestID] = protocolID
+		if prior, duplicate := internalFor[protocolID]; duplicate && prior != job.RequestID {
+			return fmt.Errorf("%w: %s offered distinct jobs %d and %d under the same runner request id %d; the acquisition response cannot distinguish them",
+				ErrUntrustworthySession, l.tier, prior, job.RequestID, protocolID)
+		}
+		internalFor[protocolID] = job.RequestID
 	}
 
 	reservedInternal := l.reserve(identified)
@@ -2263,16 +2284,8 @@ func (l *Listener) acquire(ctx context.Context, available []Job) error {
 		return nil
 	}
 	reservedProtocol := make([]int64, 0, len(reservedInternal))
-	internalFor := make(map[int64]int64, len(reservedInternal))
 	for _, internalID := range reservedInternal {
 		protocolID := protocolFor[internalID]
-		if prior, duplicate := internalFor[protocolID]; duplicate && prior != internalID {
-			l.unreserve(reservedInternal)
-
-			return fmt.Errorf("%w: %s offered distinct jobs %d and %d under the same runner request id %d; the acquisition response cannot distinguish them",
-				ErrUntrustworthySession, l.tier, prior, internalID, protocolID)
-		}
-		internalFor[protocolID] = internalID
 		reservedProtocol = append(reservedProtocol, protocolID)
 	}
 
