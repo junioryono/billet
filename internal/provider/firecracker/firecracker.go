@@ -68,8 +68,10 @@ type RootDisk interface {
 	// SEPARATE FROM THE CLONE so that the concrete generation is known BEFORE
 	// anything is done with it: it is what the launch logs, and "which image did
 	// this job actually boot" has to be answerable from that line afterwards. A
-	// reference that already names a generation comes back unchanged.
-	ResolveGeneration(ctx context.Context, image string) (string, error)
+	// reference that already names a generation comes back unchanged. The guest
+	// contract keeps a rolling-upgrade node on the newest verified generation its
+	// own binary can speak.
+	ResolveGeneration(ctx context.Context, image, guestContract string) (string, error)
 	// CloneRoot makes a per-job copy-on-write clone of a golden image, grows it to
 	// at least capacity when capacity is positive and maps it, returning the host
 	// device path. Zero keeps the generation's size as the backend default.
@@ -388,7 +390,7 @@ func (p *Provider) Launch(ctx context.Context, spec provider.Spec) (*Instance, e
 	// design. Passing that through would leave the launch log, and therefore any
 	// later question about which image a job actually ran, pointing at a word rather
 	// than at an artifact somebody can go and look at.
-	image, err := p.disk.ResolveGeneration(ctx, spec.Image)
+	image, err := p.disk.ResolveGeneration(ctx, spec.Image, GuestContract)
 	if err != nil {
 		return nil, errors.Join(err, j.remove())
 	}
@@ -1753,7 +1755,7 @@ func (p *Provider) cloneResolved(
 			return "", err
 		}
 
-		resolved, resolveErr := p.disk.ResolveGeneration(ctx, requested)
+		resolved, resolveErr := p.disk.ResolveGeneration(ctx, requested, GuestContract)
 		if resolveErr != nil {
 			// THE ORIGINAL FAILURE IS THE HEADLINE. Failing to re-resolve is a
 			// consequence of the generation being gone, not a separate problem.

@@ -1,0 +1,6 @@
+---
+- name: Exercise a destructive billet host upgrade
+  hosts: all
+  gather_facts: true
+  roles:
+    - junioryono.billet.host

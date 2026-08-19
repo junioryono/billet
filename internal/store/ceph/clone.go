@@ -54,25 +54,28 @@ var snapshotSpec = regexp.MustCompile(`^[^-/@][^/@]*@[^/@]+$`)
 // caller that passed the alias through would leave "which image did this job
 // actually run?" unanswerable after the fact.
 //
+// The alias is relative to guestContract so a rolling upgrade can publish a new
+// generation without making older nodes boot a guest they cannot speak to.
+//
 // AN EXPLICIT GENERATION IS RETURNED UNCHANGED, including one that was never
 // verified: pinning is a decision, and second-guessing it would make a pinned tier
 // mean something other than what it says.
-func (c *Client) ResolveGeneration(ctx context.Context, image string) (string, error) {
+func (c *Client) ResolveGeneration(ctx context.Context, image, guestContract string) (string, error) {
 	name, generation, found := strings.Cut(strings.TrimSpace(image), "@")
 	if !found || generation != Verified {
 		return image, nil
 	}
 
-	newest, ok, err := c.NewestVerified(ctx, image)
+	newest, ok, err := c.NewestVerifiedForContract(ctx, image, guestContract)
 	if err != nil {
 		return "", err
 	}
 
 	if !ok {
 		return "", fmt.Errorf("ceph: %s names @%s and no generation of %s has passed "+
-			"verification, so there is nothing proved to boot; publish one with "+
+			"verification for guest contract %s, so there is nothing proved to boot; publish one with "+
 			"scripts/build-guest-image.sh and `billet images verify`, or pin a generation",
-			image, Verified, name)
+			image, Verified, name, guestContract)
 	}
 
 	return name + "@" + newest.Name, nil

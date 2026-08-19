@@ -119,6 +119,10 @@ alert-lifecycle: ## Exercise alert ownership migration and teardown through the 
 development-check-mode: ## Exercise a first Linux development-host dry run before tools exist
 	ANSIBLE_COLLECTIONS_PATH=$(CURDIR)/ansible_collections ansible-playbook --check ansible_collections/junioryono/billet/tests/development-check-mode.yml
 
+.PHONY: host-upgrade-order
+host-upgrade-order: ## Guard the host role's drain, migration, image, restart, and rollback ordering
+	ANSIBLE_COLLECTIONS_PATH=$(CURDIR)/ansible_collections ansible-playbook ansible_collections/junioryono/billet/tests/host-upgrade-order.yml
+
 .PHONY: package-lifecycle
 package-lifecycle: dist ## Install and remove both Linux packages without losing operator state
 	scripts/test-package-lifecycle.sh

@@ -17,7 +17,7 @@ import (
 const VerifiedKey = "billet.verified"
 
 // Verified is the generation reference a tier can name to mean "the newest one that
-// was proved to work".
+// was proved to work with this node's guest contract".
 //
 // A WORD RATHER THAN AN IMPLICIT DEFAULT. A bare image name stays refused: choosing
 // a generation for somebody who did not choose one is how a job silently boots
@@ -27,10 +27,13 @@ const VerifiedKey = "billet.verified"
 const Verified = "verified"
 
 // MarkVerified records that a generation booted, registered and ran a container.
-//
-// THE VALUE IS WHEN, so an operator reading the metadata can tell a generation
-// verified an hour ago from one verified in March.
-func (c *Client) MarkVerified(ctx context.Context, image string, at time.Time) error {
+// It excludes reaping and proves the generation still exists with the expected
+// guest contract before publishing it.
+func (c *Client) MarkVerified(
+	ctx context.Context,
+	image, expectedContract string,
+	at time.Time,
+) (err error) {
 	name, generation, found := strings.Cut(strings.TrimSpace(image), "@")
 	if !found || strings.TrimSpace(generation) == "" {
 		return fmt.Errorf("ceph: %q names no generation to mark verified", image)
@@ -41,9 +44,59 @@ func (c *Client) MarkVerified(ctx context.Context, image string, at time.Time) e
 			"verified would put a claim on something nothing can resolve", generation)
 	}
 
+	lock, lockErr := c.TakePublishLock(ctx, at)
+	if lockErr != nil {
+		return fmt.Errorf("ceph: could not mark %s verified because the publish lock is held; "+
+			"a reap, verification, or publish is in progress: %w", image, lockErr)
+	}
+
+	defer func() {
+		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.wait)
+		defer cancel()
+
+		if releaseErr := lock.Release(releaseCtx); releaseErr != nil && err == nil {
+			err = releaseErr
+		}
+	}()
+
+	generations, err := c.Generations(ctx, name)
+	if err != nil {
+		return err
+	}
+
+	present := false
+	for _, gen := range generations {
+		if gen.Name == generation {
+			present = true
+
+			break
+		}
+	}
+	if !present {
+		return fmt.Errorf("ceph: %s no longer exists, so it cannot be marked verified", image)
+	}
+
+	contract, recorded, err := c.GuestContract(ctx, name, generation)
+	if err != nil {
+		return err
+	}
+	if !recorded || contract != expectedContract {
+		return fmt.Errorf("ceph: %s cannot be promoted for this binary: it records guest contract %q, but this binary requires %q; boot-verify it with this binary instead",
+			image, contract, expectedContract)
+	}
+
+	return c.markVerified(ctx, name, generation, at)
+}
+
+// markVerified writes the verification while its caller holds the publish lock.
+func (c *Client) markVerified(
+	ctx context.Context,
+	name, generation string,
+	at time.Time,
+) error {
 	if _, err := c.rbdCmd(ctx, false, "-p", c.cfg.ImagePool, "image-meta", "set", name,
 		VerifiedKey+"."+generation, at.UTC().Format(time.RFC3339)); err != nil {
-		return fmt.Errorf("ceph: record %s as verified: %w", image, err)
+		return fmt.Errorf("ceph: record %s@%s as verified: %w", name, generation, err)
 	}
 
 	return nil
@@ -53,11 +106,26 @@ func (c *Client) MarkVerified(ctx context.Context, image string, at time.Time) e
 //
 // IDEMPOTENT, because the thing an operator does in a hurry should not fail for
 // having already worked.
-func (c *Client) UnmarkVerified(ctx context.Context, image string) error {
+func (c *Client) UnmarkVerified(ctx context.Context, image string) (err error) {
 	name, generation, found := strings.Cut(strings.TrimSpace(image), "@")
 	if !found || strings.TrimSpace(generation) == "" {
 		return fmt.Errorf("ceph: %q names no generation to unmark", image)
 	}
+
+	lock, lockErr := c.TakePublishLock(ctx, time.Now())
+	if lockErr != nil {
+		return fmt.Errorf("ceph: could not unmark %s because the publish lock is held; a "+
+			"reap, verification, or publish is in progress: %w", image, lockErr)
+	}
+
+	defer func() {
+		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.wait)
+		defer cancel()
+
+		if releaseErr := lock.Release(releaseCtx); releaseErr != nil && err == nil {
+			err = releaseErr
+		}
+	}()
 
 	if _, err := c.rbdCmd(ctx, false, "-p", c.cfg.ImagePool, "image-meta", "remove", name,
 		VerifiedKey+"."+generation); err != nil {
@@ -71,7 +139,9 @@ func (c *Client) UnmarkVerified(ctx context.Context, image string) error {
 	return nil
 }
 
-// NewestVerified resolves an image to the most recent generation that passed.
+// NewestVerified resolves an image to the most recent generation that passed,
+// without filtering by guest contract. Operator commands use this to describe the
+// publication history; a node launch uses NewestVerifiedForContract instead.
 //
 // BY BUILD TIME, NOT BY WHEN IT WAS VERIFIED. Re-verifying an older generation — the
 // obvious thing to do while investigating a bad one — would otherwise promote it over
@@ -81,6 +151,47 @@ func (c *Client) UnmarkVerified(ctx context.Context, image string) error {
 // whose newest generations have all failed verification has nothing to resolve to,
 // and the honest answer is to say so rather than to fall back to something unproven.
 func (c *Client) NewestVerified(ctx context.Context, image string) (Generation, bool, error) {
+	return c.newestGeneration(ctx, image, "", true)
+}
+
+// NewestVerifiedForContract resolves an image to the newest verified generation
+// that speaks one exact host/guest protocol.
+//
+// CONTRACT-RELATIVE SO A ROLLING UPGRADE DOES NOT ADVANCE OLD NODES. A candidate
+// binary may publish a newer verified generation while nodes on the prior binary
+// are still serving jobs. Those nodes must keep resolving @verified to their newest
+// compatible generation rather than booting a guest that will reject their metadata.
+func (c *Client) NewestVerifiedForContract(
+	ctx context.Context,
+	image, contract string,
+) (Generation, bool, error) {
+	if strings.TrimSpace(contract) == "" {
+		return Generation{}, false, fmt.Errorf("ceph: no guest contract to resolve %s against", image)
+	}
+
+	return c.newestGeneration(ctx, image, contract, true)
+}
+
+// NewestForContract resolves an image to the newest live generation that records
+// one exact host/guest protocol, whether or not that generation is verified yet.
+// Upgrade compatibility checks use it to boot-verify an already imported image
+// instead of requiring a redundant download.
+func (c *Client) NewestForContract(
+	ctx context.Context,
+	image, contract string,
+) (Generation, bool, error) {
+	if strings.TrimSpace(contract) == "" {
+		return Generation{}, false, fmt.Errorf("ceph: no guest contract to resolve %s against", image)
+	}
+
+	return c.newestGeneration(ctx, image, contract, false)
+}
+
+func (c *Client) newestGeneration(
+	ctx context.Context,
+	image, contract string,
+	verifiedOnly bool,
+) (Generation, bool, error) {
 	name, _, _ := strings.Cut(strings.TrimSpace(image), "@")
 	if name == "" {
 		return Generation{}, false, fmt.Errorf("ceph: no image to resolve")
@@ -114,31 +225,46 @@ func (c *Client) NewestVerified(ctx context.Context, image string) (Generation, 
 		live[gen.Name] = true
 	}
 
+	verified := map[string]bool{}
+	contracts := map[string]string{}
+
+	// THE TABLE IS PARSED RATHER THAN ASKED PER KEY, because the generations are not
+	// known in advance. `image-meta list` prints a heading and then `key<spaces>value`
+	// rows. Contract values carry no whitespace, but trimming the remainder also
+	// tolerates the table alignment RBD adds.
+	for _, line := range strings.Split(string(out), "\n") {
+		key, value, ok := strings.Cut(strings.TrimSpace(line), " ")
+		if !ok {
+			continue
+		}
+
+		if generation, isVerification := strings.CutPrefix(key, VerifiedKey+"."); isVerification {
+			if _, isGeneration := ParseGeneration(generation); isGeneration {
+				verified[generation] = true
+			}
+
+			continue
+		}
+
+		if generation, isContract := strings.CutPrefix(key, GuestContractKey+"."); isContract {
+			if _, isGeneration := ParseGeneration(generation); isGeneration {
+				contracts[generation] = strings.TrimSpace(value)
+			}
+		}
+	}
+
 	var (
 		newest Generation
 		found  bool
 	)
 
-	// THE TABLE IS PARSED RATHER THAN ASKED PER KEY, because the generations are not
-	// known in advance. `image-meta list` prints a heading and then `key<spaces>value`
-	// rows; only the key is needed, so the value's own spacing cannot mislead this.
-	for _, line := range strings.Split(string(out), "\n") {
-		key, _, ok := strings.Cut(strings.TrimSpace(line), " ")
-		if !ok {
+	for generation := range live {
+		gen, _ := ParseGeneration(generation)
+
+		if verifiedOnly && !verified[gen.Name] {
 			continue
 		}
-
-		generation, isVerification := strings.CutPrefix(key, VerifiedKey+".")
-		if !isVerification {
-			continue
-		}
-
-		gen, isGeneration := ParseGeneration(generation)
-		if !isGeneration {
-			continue
-		}
-
-		if !live[gen.Name] {
+		if contract != "" && contracts[gen.Name] != contract {
 			continue
 		}
 
@@ -175,7 +301,7 @@ func (c *Client) NewestVerified(ctx context.Context, image string) (Generation, 
 // been told to allow it.
 func (c *Client) RecordVerification(
 	ctx context.Context,
-	image, generation, kernel string,
+	image, generation, kernel, guestContract string,
 	paired, allowUnpaired bool,
 	at time.Time,
 ) (err error) {
@@ -201,7 +327,7 @@ func (c *Client) RecordVerification(
 	if lockErr != nil {
 		return fmt.Errorf("ceph: could not record the verification of %s@%s because the "+
 			"publish lock is held; a reap or a publish is in progress and recording now "+
-			"could describe a generation it is removing: %w", image, generation, err)
+			"could describe a generation it is removing: %w", image, generation, lockErr)
 	}
 
 	defer func() {
@@ -252,5 +378,13 @@ func (c *Client) RecordVerification(
 		}
 	}
 
-	return c.MarkVerified(ctx, image+"@"+generation, at)
+	// THE CONTRACT BEFORE THE VERIFICATION, for the same reason as the kernel.
+	// A verified generation without it cannot be judged during an upgrade; writing
+	// the verification first would let the fleet take up a generation while the
+	// compatibility fact its next binary depends on is still absent.
+	if err := c.SetGuestContract(ctx, image, generation, guestContract); err != nil {
+		return err
+	}
+
+	return c.markVerified(ctx, image, generation, at)
 }

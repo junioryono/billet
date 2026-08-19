@@ -130,6 +130,69 @@ func TestAnOperatorCommandMigratesWhenNothingElseHoldsTheDirectory(t *testing.T)
 	}
 }
 
+func TestMaintenanceFenceRefusesNewAndAlreadyOpenAdminTransactions(t *testing.T) {
+	dir := t.TempDir()
+	ctx := t.Context()
+
+	server, err := Open(ctx, dir)
+	if err != nil {
+		t.Fatalf("open server: %v", err)
+	}
+	t.Cleanup(func() { _ = server.Close() })
+
+	admin, err := OpenAdmin(ctx, dir)
+	if err != nil {
+		t.Fatalf("open admin before maintenance: %v", err)
+	}
+	t.Cleanup(func() { _ = admin.Close() })
+
+	if err := os.WriteFile(filepath.Join(dir, maintenanceFile), []byte("host upgrade\n"), 0o600); err != nil {
+		t.Fatalf("create maintenance fence: %v", err)
+	}
+
+	if _, err := OpenAdmin(ctx, dir); !errors.Is(err, ErrMaintenance) {
+		t.Fatalf("new admin open error = %v, want ErrMaintenance", err)
+	}
+	if err := admin.Tx(ctx, func(*sql.Tx) error { return nil }); !errors.Is(err, ErrMaintenance) {
+		t.Fatalf("already-open admin transaction error = %v, want ErrMaintenance", err)
+	}
+}
+
+func TestMaintenanceOwnerCanValidateAndMigrateTheFencedLedger(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, maintenanceFile), []byte("host upgrade\n"), 0o600); err != nil {
+		t.Fatalf("create maintenance fence: %v", err)
+	}
+	t.Setenv("BILLET_MAINTENANCE", "1")
+
+	db, err := OpenAdmin(t.Context(), dir)
+	if err != nil {
+		t.Fatalf("maintenance owner open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	if got, want := schemaVersion(t, db), latestVersion(t); got != want {
+		t.Fatalf("schema version = %d, want %d", got, want)
+	}
+}
+
+func TestQuiescentUpgradeProbeCanOpenTheFencedLedgerExplicitly(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, maintenanceFile), []byte("host upgrade\n"), 0o600); err != nil {
+		t.Fatalf("create maintenance fence: %v", err)
+	}
+
+	db, err := OpenMaintenance(t.Context(), dir)
+	if err != nil {
+		t.Fatalf("open quiescent maintenance probe: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	if got, want := schemaVersion(t, db), latestVersion(t); got != want {
+		t.Fatalf("schema version = %d, want %d", got, want)
+	}
+}
+
 // A NEWER CLI MUST NOT MIGRATE THE RUNNING SERVER'S DATABASE UNDERNEATH IT.
 //
 // Open runs migrations, so an operator running a newer binary's `billet nodes
@@ -167,6 +230,23 @@ func TestAnOperatorCommandRefusesToMigrateUnderARunningServer(t *testing.T) {
 	// message attached.
 	if got := schemaVersion(t, server); got != behind {
 		t.Errorf("schema version = %d after a refused admin open, want %d untouched", got, behind)
+	}
+
+	// THIS IS THE UPGRADE BOUNDARY THE HOST ROLE OWNS. Once the old control plane
+	// has drained and released the directory, the candidate becomes the sole
+	// writer and may apply the append-only migration before anything restarts.
+	if err := server.Close(); err != nil {
+		t.Fatalf("stop the older control plane: %v", err)
+	}
+
+	candidate, err := OpenAdmin(ctx, dir)
+	if err != nil {
+		t.Fatalf("open the stopped older ledger with the candidate: %v", err)
+	}
+	t.Cleanup(func() { _ = candidate.Close() })
+
+	if got, want := schemaVersion(t, candidate), latestVersion(t); got != want {
+		t.Fatalf("schema version after the stopped-ledger migration = %d, want %d", got, want)
 	}
 }
 

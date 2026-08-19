@@ -1,9 +1,95 @@
 ---
+- name: Inspect pending Billet service policy during a dry run
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - show
+      - --property=NeedDaemonReload
+      - --value
+      - "{{ item }}"
+  loop:
+    - billet-server.service
+    - billet-node.service
+  register: billet_service_policy_reload_pending
+  changed_when: false
+  failed_when: billet_service_policy_reload_pending.rc != 0
+  check_mode: false
+  when: ansible_check_mode
+  become: true
+
+- name: Refuse a dry run against stale Billet service policy
+  ansible.builtin.assert:
+    that:
+      - item.stdout | trim == 'no'
+    fail_msg: "{{ item.item }} has pending on-disk systemd policy. A dry run will not daemon-reload the live manager; run systemctl daemon-reload after auditing the pending unit changes, then retry --check."
+  loop: "{{ billet_service_policy_reload_pending.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: ansible_check_mode
+
+- name: Reload systemd before inspecting installed service policy
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  changed_when: false
+  when: not ansible_check_mode
+  become: true
+
 - name: Inspect an existing billet account
   ansible.builtin.getent:
     database: passwd
     key: "{{ billet_service_user }}"
     fail_key: false
+
+- name: Inspect the installed billet server unit before account mutation
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - show
+      - --property=LoadState
+      - --value
+      - billet-server.service
+  register: billet_installed_server_unit_load_state
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  become: true
+
+- name: Inspect the installed billet server identity before account mutation
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - show
+      - "--property={{ item }}"
+      - --value
+      - billet-server.service
+  loop:
+    - User
+    - Group
+  register: billet_installed_server_identity
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  become: true
+
+- name: Refuse an implicit installed service identity migration
+  ansible.builtin.assert:
+    that:
+      - billet_installed_server_unit_load_state.rc == 0
+      - >-
+        billet_installed_server_unit_load_state.stdout | trim == 'not-found' or
+        (
+          billet_installed_server_identity.results[0].rc == 0 and
+          billet_installed_server_identity.results[1].rc == 0 and
+          billet_installed_server_identity.results[0].stdout | trim == billet_service_user and
+          billet_installed_server_identity.results[1].stdout | trim == billet_service_group
+        )
+    fail_msg: >-
+      The installed billet server runs as
+      {{ billet_installed_server_identity.results[0].stdout | trim }}:{{
+      billet_installed_server_identity.results[1].stdout | trim }}, not the
+      requested {{ billet_service_user }}:{{ billet_service_group }}. Move the
+      ledger and credentials during an explicit offline identity migration;
+      the host role will not change ownership before a recoverable transaction.
 
 - name: Refuse to adopt an unrelated existing account
   ansible.builtin.assert:
@@ -69,6 +155,52 @@
     update_cache: true
   become: true
 
+- name: Inspect the installed billet configuration
+  ansible.builtin.stat:
+    path: /etc/billet/billet.yaml
+  register: billet_installed_config
+  check_mode: false
+  become: true
+
+- name: Read the installed billet configuration
+  ansible.builtin.slurp:
+    src: /etc/billet/billet.yaml
+  register: billet_previous_config_file
+  become: true
+  when: billet_installed_config.stat.exists
+
+- name: Resolve the installed billet state directories
+  ansible.builtin.set_fact:
+    billet_previous_server_state_dir: >-
+      {{
+        (billet_previous_config_file.content | b64decode | from_yaml).get('server', {}).get('state_dir', '/var/lib/billet/server')
+        if billet_previous_config_file.content is defined
+        else billet_candidate_server_state_dir
+      }}
+    billet_previous_node_state_dir: >-
+      {{
+        (billet_previous_config_file.content | b64decode | from_yaml).get('node', {}).get('state_dir', '/var/lib/billet/node')
+        if billet_previous_config_file.content is defined
+        else billet_candidate_node_state_dir
+      }}
+
+- name: Refuse to move installed billet state implicitly
+  ansible.builtin.assert:
+    that:
+      - billet_previous_server_state_dir == billet_candidate_server_state_dir
+      - billet_previous_node_state_dir == billet_candidate_node_state_dir
+    fail_msg: >-
+      This host already uses server.state_dir={{ billet_previous_server_state_dir }}
+      and node.state_dir={{ billet_previous_node_state_dir }}. Refusing desired
+      paths {{ billet_candidate_server_state_dir }} and
+      {{ billet_candidate_node_state_dir }} because restarting against an empty
+      directory would abandon the authoritative ledger, CA, or node identity.
+      Move state during an explicit offline maintenance operation, then converge
+      the role with paths that match the installed configuration.
+  when:
+    - billet_installed_config.stat.exists
+    - not billet_interrupted_upgrade | bool
+
 - name: Create billet directories
   ansible.builtin.file:
     path: "{{ item.path }}"
@@ -80,23 +212,273 @@
     - { path: /etc/billet, owner: root, group: "{{ billet_service_group }}", mode: "0750" }
     - { path: /etc/billet/network, owner: root, group: root, mode: "0755" }
     - { path: /var/lib/billet, owner: root, group: root, mode: "0755" }
-    - { path: /var/lib/billet/server, owner: "{{ billet_service_user }}", group: "{{ billet_service_group }}", mode: "0700" }
-    - { path: /var/lib/billet/node, owner: root, group: root, mode: "0700" }
+    - { path: "{{ billet_candidate_server_state_dir }}", owner: "{{ billet_service_user }}", group: "{{ billet_service_group }}", mode: "0700" }
+    - { path: "{{ billet_candidate_node_state_dir }}", owner: root, group: root, mode: "0700" }
     - { path: /var/lib/billet/health, owner: root, group: root, mode: "0750" }
+    - { path: /var/lib/billet/upgrades, owner: root, group: root, mode: "0700" }
+    - { path: "{{ billet_firecracker_stage }}", owner: root, group: root, mode: "0700" }
     - { path: /srv/jailer, owner: root, group: root, mode: "0755" }
     - { path: /usr/local/libexec, owner: root, group: root, mode: "0755" }
   become: true
 
-- name: Install the billet binary
+- name: Inspect the installed billet binary
+  ansible.builtin.stat:
+    path: /usr/bin/billet
+    checksum_algorithm: sha256
+  register: billet_installed_binary
+  check_mode: false
+  become: true
+
+- name: Inspect the supplied candidate billet binary on the controller
+  ansible.builtin.stat:
+    path: "{{ billet_binary_src }}"
+    checksum_algorithm: sha256
+  register: billet_candidate_binary
+  delegate_to: localhost
+  become: false
+  when: billet_binary_src | length > 0
+
+- name: Refuse a missing or redirected candidate billet binary
+  ansible.builtin.assert:
+    that:
+      - billet_candidate_binary.stat.exists
+      - billet_candidate_binary.stat.isreg
+      - not billet_candidate_binary.stat.islnk | default(false)
+    fail_msg: >-
+      billet_binary_src must name one real regular file on the controller so the
+      transaction can bind an immutable journal copy to its inspected digest.
+  when: billet_binary_src | length > 0
+
+- name: Decide whether the billet binary needs a transactional upgrade
+  ansible.builtin.set_fact:
+    billet_binary_upgrade: >-
+      {{
+        billet_interrupted_upgrade | bool or
+        (
+          billet_binary_src | length > 0 and
+          (
+            not billet_installed_binary.stat.exists or
+            billet_installed_binary.stat.checksum != billet_candidate_binary.stat.checksum
+          )
+        )
+      }}
+
+- name: Reload systemd before inspecting host-upgrade service overlays
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  when:
+    - billet_binary_upgrade | default(false)
+    - not ansible_check_mode
+  become: true
+
+- name: Inspect billet service drop-ins before the upgrade transaction
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - show
+      - --property=DropInPaths
+      - --value
+      - "{{ item }}"
+  loop:
+    - billet-server.service
+    - billet-node.service
+  register: billet_service_dropins_before_upgrade
+  changed_when: false
+  failed_when: billet_service_dropins_before_upgrade.rc != 0
+  check_mode: false
+  when:
+    - billet_binary_upgrade | default(false)
+    - not ansible_check_mode
+  become: true
+
+- name: Refuse service drop-ins the transaction cannot replace or recover
+  ansible.builtin.assert:
+    that:
+      - item.stdout | trim | length == 0
+    fail_msg: "{{ item.item }} has effective systemd drop-ins: {{ item.stdout | trim }}. Remove or fold them into the Billet-managed unit before upgrading; a drop-in can replace the quiescent readiness probe and let workload run before the transaction commits."
+  loop: "{{ billet_service_dropins_before_upgrade.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when:
+    - billet_binary_upgrade | default(false)
+    - not ansible_check_mode
+
+- name: Allocate a unique recovery directory before replacing upgrade inputs
+  ansible.builtin.command:
+    argv:
+      - date
+      - -u
+      - +%Y%m%dT%H%M%S%N
+  register: billet_upgrade_timestamp
+  changed_when: false
+  when:
+    - billet_binary_upgrade | default(false)
+    - not billet_interrupted_upgrade | bool
+    - not ansible_check_mode
+
+- name: Record the upgrade recovery directory
+  ansible.builtin.set_fact:
+    billet_upgrade_recovery_dir: "/var/lib/billet/upgrades/{{ billet_upgrade_timestamp.stdout }}"
+  when:
+    - billet_binary_upgrade | default(false)
+    - not billet_interrupted_upgrade | bool
+    - not ansible_check_mode
+
+- name: Create the upgrade recovery directory
+  ansible.builtin.file:
+    path: "{{ billet_upgrade_recovery_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+  become: true
+  when:
+    - billet_binary_upgrade | default(false)
+    - not billet_interrupted_upgrade | bool
+    - not ansible_check_mode
+
+- name: Stage the immutable candidate binary inside its recovery journal
   ansible.builtin.copy:
     src: "{{ billet_binary_src }}"
-    dest: /usr/bin/billet
+    dest: "{{ billet_upgrade_recovery_dir }}/billet.candidate"
     owner: root
     group: root
     mode: "0755"
-  register: billet_binary_install
   become: true
-  when: billet_binary_src | length > 0
+  when:
+    - billet_binary_upgrade | default(false)
+    - not billet_interrupted_upgrade | bool
+    - not ansible_check_mode
+
+- name: Inspect the journaled candidate billet binary
+  ansible.builtin.stat:
+    path: "{{ billet_upgrade_recovery_dir }}/billet.candidate"
+    checksum_algorithm: sha256
+  register: billet_journaled_candidate_binary
+  check_mode: false
+  become: true
+  when:
+    - billet_binary_upgrade | default(false)
+    - not billet_interrupted_upgrade | bool
+    - not ansible_check_mode
+
+- name: Bind the host transaction to the inspected candidate digest
+  ansible.builtin.assert:
+    that:
+      - billet_journaled_candidate_binary.stat.exists
+      - billet_journaled_candidate_binary.stat.isreg
+      - not billet_journaled_candidate_binary.stat.islnk | default(false)
+      - billet_journaled_candidate_binary.stat.checksum == billet_candidate_binary.stat.checksum
+    fail_msg: >-
+      The supplied billet binary changed while the transaction was being
+      prepared. Refusing to upgrade from an artifact other than the one whose
+      digest selected this transaction.
+  when:
+    - billet_binary_upgrade | default(false)
+    - not billet_interrupted_upgrade | bool
+    - not ansible_check_mode
+
+- name: Inspect configuration and units before replacing them
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - /etc/billet/billet.yaml
+    - /etc/systemd/system/billet-server.service
+    - /etc/systemd/system/billet-node.service
+  register: billet_previous_upgrade_inputs
+  check_mode: false
+  become: true
+  when:
+    - billet_binary_upgrade | default(false)
+    - not billet_interrupted_upgrade | bool
+    - not ansible_check_mode
+
+- name: Refuse redirected or non-file upgrade inputs
+  ansible.builtin.assert:
+    that:
+      - not item.stat.exists or item.stat.isreg
+      - not item.stat.islnk | default(false)
+    fail_msg: >-
+      {{ item.item }} is not a real regular file. Normalize the installed input
+      before a transactional upgrade so rollback never follows or recreates a
+      privileged symlink.
+  loop: "{{ billet_previous_upgrade_inputs.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when:
+    - billet_binary_upgrade | default(false)
+    - not billet_interrupted_upgrade | bool
+    - not ansible_check_mode
+
+- name: Preserve configuration and units before replacing them
+  ansible.builtin.copy:
+    src: "{{ item.item }}"
+    dest: "{{ billet_upgrade_recovery_dir }}/{{ item.item | basename }}.previous"
+    remote_src: true
+    owner: root
+    group: root
+    mode: preserve
+  loop: "{{ billet_previous_upgrade_inputs.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  become: true
+  when:
+    - billet_binary_upgrade | default(false)
+    - not billet_interrupted_upgrade | bool
+    - not ansible_check_mode
+    - item.stat.exists
+
+- name: Preserve the previous billet binary before live mutation
+  ansible.builtin.copy:
+    src: /usr/bin/billet
+    dest: "{{ billet_upgrade_recovery_dir }}/billet.previous"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0755"
+  become: true
+  when:
+    - billet_binary_upgrade | default(false)
+    - not billet_interrupted_upgrade | bool
+    - not ansible_check_mode
+    - billet_installed_binary.stat.exists
+
+- name: Stage candidate systemd units for the upgrade transaction
+  ansible.builtin.template:
+    src: "{{ item.src }}"
+    dest: "{{ billet_upgrade_recovery_dir }}/{{ item.dest | basename }}.candidate"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - { src: billet-server.service.j2, dest: /etc/systemd/system/billet-server.service }
+    - { src: billet-node.service.j2, dest: /etc/systemd/system/billet-node.service }
+  become: true
+  when:
+    - billet_binary_upgrade | default(false)
+    - not billet_interrupted_upgrade | bool
+    - not ansible_check_mode
+  vars:
+    billet_systemd_upgrade_probe: true
+    billet_systemd_notify_ready: true
+
+- name: Inspect installed service readiness types before ordinary convergence
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - show
+      - --property=Type
+      - --value
+      - "{{ item }}"
+  loop:
+    - billet-server.service
+    - billet-node.service
+  register: billet_installed_service_types
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  become: true
+  when: not billet_binary_upgrade | default(false)
 
 - name: Install the billet systemd units
   ansible.builtin.template:
@@ -106,11 +488,18 @@
     group: root
     mode: "0644"
   loop:
-    - { src: billet-server.service.j2, dest: /etc/systemd/system/billet-server.service }
-    - { src: billet-node.service.j2, dest: /etc/systemd/system/billet-node.service }
+    - { src: billet-server.service.j2, dest: /etc/systemd/system/billet-server.service, installed_index: 0 }
+    - { src: billet-node.service.j2, dest: /etc/systemd/system/billet-node.service, installed_index: 1 }
   register: billet_systemd_units
   become: true
   notify: Reload systemd
+  when: not billet_binary_upgrade | default(false)
+  vars:
+    billet_systemd_notify_ready: >-
+      {{
+        billet_installed_service_types.results[item.installed_index].rc == 0 and
+        billet_installed_service_types.results[item.installed_index].stdout | trim == 'notify'
+      }}
 
 - name: Inspect the installed GitHub App private key
   ansible.builtin.stat:
@@ -151,6 +540,19 @@
     - billet_enable_server
     - billet_github_private_key_src | length > 0
 
+- name: Stage candidate configuration for the upgrade transaction
+  ansible.builtin.template:
+    src: billet.yaml.j2
+    dest: "{{ billet_upgrade_recovery_dir }}/billet.yaml.candidate"
+    owner: root
+    group: "{{ billet_service_group }}"
+    mode: "0640"
+  become: true
+  when:
+    - billet_binary_upgrade | default(false)
+    - not billet_interrupted_upgrade | bool
+    - not ansible_check_mode
+
 - name: Render billet configuration
   ansible.builtin.template:
     src: billet.yaml.j2
@@ -160,3 +562,4 @@
     mode: "0640"
   register: billet_config_install
   become: true
+  when: not billet_binary_upgrade | default(false)

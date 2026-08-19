@@ -185,9 +185,10 @@ type fakeDisk struct {
 	device string
 	// resolved is what ResolveGeneration answers, and resolveErr is what it refuses
 	// with — the two halves of a tier naming `@verified`.
-	resolved   string
-	resolveErr error
-	cloneErr   error
+	resolved         string
+	resolvedContract string
+	resolveErr       error
+	cloneErr         error
 
 	// kernel is what a generation records as its paired kernel, and kernelErr is
 	// what the lookup refuses with. An empty kernel means the generation records
@@ -212,9 +213,10 @@ type fakeDisk struct {
 // resolve stands in for the store turning `@verified` into a generation. The fake
 // answers with whatever it is given unless a test says otherwise, because almost
 // every test is about something else.
-func (d *fakeDisk) ResolveGeneration(_ context.Context, image string) (string, error) {
+func (d *fakeDisk) ResolveGeneration(_ context.Context, image, contract string) (string, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	d.resolvedContract = contract
 
 	if d.resolveErr != nil {
 		return "", d.resolveErr

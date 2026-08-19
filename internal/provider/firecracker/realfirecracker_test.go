@@ -289,7 +289,7 @@ func (d rbdDisk) args(rest ...string) []string {
 
 // The real host test always names an explicit generation, which is what a resolver
 // returns unchanged — so this stands in for the store without needing one.
-func (d rbdDisk) ResolveGeneration(_ context.Context, image string) (string, error) {
+func (d rbdDisk) ResolveGeneration(_ context.Context, image, _ string) (string, error) {
 	return image, nil
 }
 
