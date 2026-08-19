@@ -55,6 +55,27 @@ func reserve(t *testing.T, a *Allocator, tier string) *Lease {
 	return lease
 }
 
+func TestJobForLeaseRetainsIdentityAfterRelease(t *testing.T) {
+	tiers := []config.Tier{tier("linux", 2, 4*config.GiB)}
+	a := newAllocator(t, Limits{MaxVCPU: 2, MaxMemory: 4 * config.GiB}, tiers)
+	lease := reserve(t, a, tiers[0].Label)
+
+	if err := a.Assign(t.Context(), lease.ID, lease.Epoch, 101, 11); err != nil {
+		t.Fatalf("Assign: %v", err)
+	}
+	if err := a.Release(t.Context(), lease.ID, lease.Epoch, PhaseDone); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+
+	job, err := a.JobForLease(t.Context(), lease.ID)
+	if err != nil {
+		t.Fatalf("JobForLease: %v", err)
+	}
+	if job.Tier != tiers[0].Label || job.RunID != 101 || job.RequestID != 11 {
+		t.Errorf("JobForLease = %+v, want tier %q run 101 request 11", job, tiers[0].Label)
+	}
+}
+
 // newAllocator is an allocator with ONE HOST ALREADY IN IT, big enough that it
 // is never the constraint.
 //

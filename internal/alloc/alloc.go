@@ -252,6 +252,13 @@ type Usage struct {
 	Leases int
 }
 
+// LeaseJob is the GitHub identity assigned to one lease.
+type LeaseJob struct {
+	Tier      string
+	RunID     int64
+	RequestID int64
+}
+
 // Allocator hands out and reclaims capacity. Safe for concurrent use: every
 // decision is one transaction against the single-writer state store, so a
 // read-decide-record sequence cannot interleave with another.
@@ -1959,6 +1966,38 @@ func (a *Allocator) Lease(ctx context.Context, leaseID string) (*Lease, error) {
 	}
 
 	return out, nil
+}
+
+// JobForLease reads the job identity assigned to a lease, including a terminal one.
+//
+// GitHub's completed-job message may omit runnerRequestId while still naming the
+// ephemeral runner. The runner name carries the lease id, and this durable lookup
+// recovers the request id without trusting an in-memory ownership map that a restart
+// has erased. Terminal rows remain readable because an unacknowledged completion can
+// be redelivered after teardown and release already settled.
+func (a *Allocator) JobForLease(ctx context.Context, leaseID string) (LeaseJob, error) {
+	var job LeaseJob
+
+	err := a.db.View(ctx, func(tx querier) error {
+		var runID, requestID sql.NullInt64
+
+		err := tx.QueryRowContext(ctx,
+			`SELECT tier, run_id, request_id FROM leases WHERE id = ?`, leaseID).
+			Scan(&job.Tier, &runID, &requestID)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			return fmt.Errorf("%w: %s", ErrLeaseNotFound, leaseID)
+		case err != nil:
+			return fmt.Errorf("alloc: read job identity for lease %s: %w", leaseID, err)
+		}
+
+		job.RunID = runID.Int64
+		job.RequestID = requestID.Int64
+
+		return nil
+	})
+
+	return job, err
 }
 
 // LaunchedLeaseIDs reports the leases on a node that could legitimately have

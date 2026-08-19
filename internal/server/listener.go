@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
+	"github.com/junioryono/billet/internal/provider"
 	"github.com/junioryono/billet/internal/state"
 )
 
@@ -171,6 +172,10 @@ type Job struct {
 	// CompletionID is the scale-set message that delivered the result. A
 	// redelivery keeps it; a later reuse of RequestID receives a different one.
 	CompletionID int64
+	// RunnerName is GitHub's name for the ephemeral runner. Completed messages
+	// can omit RequestID, so the billet-issued name is the durable route back to
+	// the lease and its assigned request.
+	RunnerName string
 	// Result is GitHub's conclusion on a completed-job message. It is empty on
 	// available and assigned messages.
 	Result string
@@ -1978,8 +1983,18 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 	// silently skip a request id GitHub requeued after cancelling it.
 	finished := make(map[int64]struct{}, len(msg.Completed))
 
-	for _, job := range msg.Completed {
+	for i := range msg.Completed {
+		job := msg.Completed[i]
 		job.CompletionID = msg.MessageID
+		var err error
+		job, err = l.identifyCompletion(ctx, job)
+		if err != nil {
+			return err
+		}
+		// The resolved identity must reach acknowledgement too. Keeping it only
+		// in this loop would settle request N and then try to acknowledge request
+		// zero, leaving the durable completion blocked forever.
+		msg.Completed[i] = job
 		// THE DELIVERY IS TERMINAL EVEN WHEN ITS TEARDOWN ALREADY SETTLED. A
 		// failed acknowledgement redelivers the whole batch, including an Assigned
 		// entry for an assigned-then-cancelled job. Retired means "do not destroy
@@ -2116,6 +2131,43 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 	l.lastMessageID = msg.MessageID
 
 	return nil
+}
+
+// identifyCompletion recovers an omitted runner request id from billet's runner name.
+func (l *Listener) identifyCompletion(ctx context.Context, job Job) (Job, error) {
+	if job.RequestID > 0 {
+		return job, nil
+	}
+	if l.alloc == nil {
+		return Job{}, fmt.Errorf("%w: %s completed runner %q without a request id, and no ledger is available to resolve it",
+			ErrUntrustworthySession, l.tier, job.RunnerName)
+	}
+
+	leaseID, ok := provider.LeaseOf(job.RunnerName)
+	if !ok {
+		return Job{}, fmt.Errorf("%w: %s completed runner %q without a request id or a billet lease name",
+			ErrUntrustworthySession, l.tier, job.RunnerName)
+	}
+	identity, err := l.alloc.JobForLease(ctx, leaseID)
+	if err != nil {
+		return Job{}, fmt.Errorf("%w: %s cannot resolve completed runner %q: %w",
+			ErrUntrustworthySession, l.tier, job.RunnerName, err)
+	}
+	if identity.Tier != l.tier || identity.RequestID <= 0 {
+		return Job{}, fmt.Errorf("%w: completed runner %q resolves to tier %q request %d, not tier %q",
+			ErrUntrustworthySession, job.RunnerName, identity.Tier, identity.RequestID, l.tier)
+	}
+	if job.RunID != 0 && identity.RunID != 0 && job.RunID != identity.RunID {
+		return Job{}, fmt.Errorf("%w: completed runner %q reports run %d but its lease records run %d",
+			ErrUntrustworthySession, job.RunnerName, job.RunID, identity.RunID)
+	}
+
+	job.RequestID = identity.RequestID
+	if job.RunID == 0 {
+		job.RunID = identity.RunID
+	}
+
+	return job, nil
 }
 
 // acknowledge tells GitHub the message was handled. An unacknowledged message is

@@ -237,10 +237,11 @@ func translate(msg *gh.RunnerScaleSetMessage) *server.Message {
 		}
 
 		out.Completed = append(out.Completed, server.Job{
-			RequestID: j.RunnerRequestID,
-			RunID:     j.WorkflowRunID,
-			Event:     j.EventName,
-			Result:    j.Result,
+			RequestID:  j.RunnerRequestID,
+			RunID:      j.WorkflowRunID,
+			Event:      j.EventName,
+			Result:     j.Result,
+			RunnerName: j.RunnerName,
 		})
 	}
 

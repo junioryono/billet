@@ -16,6 +16,7 @@ import (
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
+	"github.com/junioryono/billet/internal/provider"
 	"github.com/junioryono/billet/internal/state"
 )
 
@@ -675,6 +676,65 @@ func TestCompletionReleasesTheLease(t *testing.T) {
 	if usage.Leases != 0 {
 		t.Errorf("%d leases still charged after the job completed; the map was emptied but "+
 			"the capacity was never handed back", usage.Leases)
+	}
+}
+
+// GitHub has been observed sending a real JobCompleted message with a zero
+// runnerRequestId while retaining the ephemeral runner name. The name is enough:
+// billet chose it from the lease id, whose durable row holds the request id.
+func TestCompletionRecoversAnOmittedRequestIDFromTheRunnerName(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: tierVCPU, MaxMemory: 64 * config.GiB}, tiers)
+	completions := openState(t)
+
+	var destroyed int64
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithCompletionStore(completions),
+		WithRunner(&fakeRunner{onDestroyCompleted: func(requestID int64, result string) error {
+			destroyed = requestID
+			if result != "succeeded" {
+				t.Errorf("completion result = %q, want succeeded", result)
+			}
+
+			return nil
+		}}))
+
+	if err := l.refillEscrow(t.Context()); err != nil {
+		t.Fatalf("refill escrow: %v", err)
+	}
+	lease, needsCompute, err := l.assign(t.Context(), Job{RequestID: 11, RunID: 101})
+	if err != nil {
+		t.Fatalf("assign: %v", err)
+	}
+	if !needsCompute || lease == nil {
+		t.Fatal("assignment did not receive compute")
+	}
+	if err := l.launch(t.Context(), lease, Job{RequestID: 11, RunID: 101}); err != nil {
+		t.Fatalf("launch: %v", err)
+	}
+
+	err = l.handle(t.Context(), &Message{MessageID: 2, Completed: []Job{{
+		RunID: 101, Result: "succeeded", RunnerName: provider.InstanceName(lease.ID),
+	}}})
+	if err != nil {
+		t.Fatalf("handle completion without request id: %v", err)
+	}
+	if destroyed != 11 {
+		t.Errorf("destroy request id = %d, want 11", destroyed)
+	}
+
+	usage, err := a.Usage(t.Context())
+	if err != nil {
+		t.Fatalf("Usage: %v", err)
+	}
+	if usage.Leases != 0 {
+		t.Errorf("%d leases remain charged after the recovered completion, want 0", usage.Leases)
+	}
+	pending, err := completions.PendingCompletions(t.Context(), tiers[0].Label)
+	if err != nil {
+		t.Fatalf("PendingCompletions: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Errorf("completion acknowledgement retained %+v, want no pending rows", pending)
 	}
 }
 
