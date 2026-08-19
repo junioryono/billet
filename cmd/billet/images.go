@@ -382,7 +382,7 @@ func verifyGuestImage(
 		`echo "runner=$(cd /home/runner/runner && ./bin/Runner.Listener --version 2>&1 | head -1)"`,
 		`echo "docker=$(docker info --format '{{.ServerVersion}} storage={{.Driver}} ` +
 			`cgroups={{.CgroupVersion}}' 2>&1 | head -1)"`,
-		`echo "buildx=$(docker buildx version 2>&1 | sed -n 's/.* v\([0-9][^ ]*\).*/\1/p' | head -1)"`,
+		`echo "buildx=$(docker buildx version 2>&1 | head -1)"`,
 		`echo "compose=$(docker compose version --short 2>&1 | head -1)"`,
 		`echo "container=$(docker run --rm hello-world 2>&1 | grep -ci 'working correctly' || echo 0)"`,
 	}, "; ")
@@ -603,7 +603,7 @@ func checkGuestReport(body, secret string) error {
 		failures = append(failures, "the docker daemon did not answer on this kernel")
 	}
 
-	if !hasVersion(body, "buildx=") {
+	if !hasBuildxVersion(body) {
 		failures = append(failures, "the Docker Buildx CLI plugin did not report a version")
 	}
 
@@ -651,6 +651,23 @@ func hasVersion(body, field string) bool {
 	}
 
 	return value[0] >= '0' && value[0] <= '9'
+}
+
+// hasBuildxVersion recognises upstream and distribution-packaged Buildx output.
+// Upstream prefixes the second field with v; Ubuntu deliberately does not.
+func hasBuildxVersion(body string) bool {
+	_, after, found := strings.Cut(body, "buildx=")
+	if !found {
+		return false
+	}
+	line, _, _ := strings.Cut(after, "\n")
+	fields := strings.Fields(line)
+	if len(fields) < 2 {
+		return false
+	}
+	version := strings.TrimPrefix(fields[1], "v")
+
+	return version != "" && version[0] >= '0' && version[0] <= '9'
 }
 
 // verifyDeploymentID is the identity this machine's microVMs are owned by.

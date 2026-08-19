@@ -115,6 +115,26 @@ func TestCurrentBinaryRejectsAPreComposeGuest(t *testing.T) {
 	}
 }
 
+func TestGuestReportAcceptsPackagedAndUpstreamBuildxVersions(t *testing.T) {
+	for _, buildx := range []string{
+		"github.com/docker/buildx 0.21.3 0.21.3-0ubuntu1~24.04.1",
+		"github.com/docker/buildx v0.33.0 7f91f038ac14",
+	} {
+		body := strings.Join([]string{
+			"jit=probe-secret",
+			"whoami=runner",
+			"runner=2.336.0",
+			"docker=29.1.3 storage=overlayfs cgroups=2",
+			"buildx=" + buildx,
+			"compose=2.40.3",
+			"container=1",
+		}, "\n")
+		if err := checkGuestReport(body, "probe-secret"); err != nil {
+			t.Errorf("checkGuestReport with %q: %v", buildx, err)
+		}
+	}
+}
+
 func stageDir(t *testing.T, rootfs, kernel []byte) (string, *imagesource.Manifest) {
 	t.Helper()
 
