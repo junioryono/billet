@@ -1,0 +1,21 @@
+name: Prepare cache conformance fixtures
+description: Creates and checks run-scoped fixtures for setup-action cache clients
+inputs:
+  operation:
+    description: Fixture operation to perform
+    required: true
+  lane:
+    description: Current or pinned action lane
+    required: true
+  salt:
+    description: Unique workflow run and attempt identity
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        BILLET_FIXTURE_OPERATION: ${{ inputs.operation }}
+        BILLET_FIXTURE_LANE: ${{ inputs.lane }}
+        BILLET_FIXTURE_SALT: ${{ inputs.salt }}
+      run: bash "$GITHUB_ACTION_PATH/fixtures.sh" "$BILLET_FIXTURE_OPERATION" "$BILLET_FIXTURE_LANE" "$BILLET_FIXTURE_SALT"

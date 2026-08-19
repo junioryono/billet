@@ -506,7 +506,7 @@ func TestTheNodeWireMintsItsAuthorityForTheDeployment(t *testing.T) {
 
 	stop, err := serveNodeWire(t.Context(), cfg,
 		nodeplane.New(slog.New(slog.DiscardHandler), deploymentID, time.Minute),
-		nil, nil, nil, nil)
+		nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("serving the node wire on a network address: %v", err)
 	}
@@ -543,7 +543,7 @@ func TestTheNodeWireAcceptsTheAuthorityTheCLIMinted(t *testing.T) {
 
 	stop, err := serveNodeWire(t.Context(), cfg,
 		nodeplane.New(slog.New(slog.DiscardHandler), deploymentID, time.Minute),
-		nil, nil, nil, nil)
+		nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("the control plane refused the authority its own CLI minted: %v", err)
 	}

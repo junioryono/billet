@@ -1516,6 +1516,110 @@ func environmentWithout(names ...string) []string {
 	return environment
 }
 
+func TestCacheConformanceFixturesKeepEveryEmbeddedClientInOneLane(t *testing.T) {
+	t.Parallel()
+
+	script, err := filepath.Abs(filepath.Join("..", ".github", "actions",
+		"cache-conformance-fixtures", "fixtures.sh"))
+	if err != nil {
+		t.Fatalf("fixture script path: %v", err)
+	}
+	root := t.TempDir()
+	run := exec.CommandContext(t.Context(), "bash", script, "prepare", "pinned", "123-2")
+	run.Dir = root
+	if output, err := run.CombinedOutput(); err != nil {
+		t.Fatalf("prepare fixtures: %v\n%s", err, output)
+	}
+	for _, path := range []string{
+		"node/package-lock.json", "python/requirements.txt", "java/pom.xml",
+		"dotnet/packages.lock.json", "go.sum",
+	} {
+		body, err := os.ReadFile(filepath.Join(root, "conformance", "embedded", path))
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		if !strings.Contains(string(body), "billet-cache-conformance-pinned-123-2") {
+			t.Errorf("%s is not scoped to the pinned lane and run", path)
+		}
+	}
+
+	invalid := exec.CommandContext(t.Context(), "bash", script, "prepare", "../../escape", "123-2")
+	invalid.Dir = root
+	if err := invalid.Run(); err == nil {
+		t.Fatal("a fixture lane that can escape its cache namespace was accepted")
+	}
+	invalid = exec.CommandContext(t.Context(), "bash", script, "prepare", "pinned", "../../escape")
+	invalid.Dir = root
+	if err := invalid.Run(); err == nil {
+		t.Fatal("a fixture run salt that can escape its cache namespace was accepted")
+	}
+}
+
+func TestCacheConformanceReusableWorkflowUsesItsOwnRevision(t *testing.T) {
+	t.Parallel()
+
+	body, err := os.ReadFile(filepath.Join("..", ".github", "workflows", "cache-conformance.yml"))
+	if err != nil {
+		t.Fatalf("read cache conformance workflow: %v", err)
+	}
+	workflow := string(body)
+	if strings.Count(workflow,
+		"uses: ./.billet-conformance/.github/actions/cache-conformance-fixtures") != 8 {
+		t.Fatal("embedded cache lanes do not all use the called Billet revision's fixture action")
+	}
+	if strings.Contains(workflow, "scripts/cache-conformance-fixtures.sh") {
+		t.Fatal("reusable workflow still depends on a fixture script from the caller checkout")
+	}
+	for _, required := range []string{
+		"steps.poison-node.outcome }}' = failure",
+		"steps.poison-actions.outputs.cache-hit }}' != true",
+		"steps.poison-node.outputs.cache-hit }}' != true",
+		"steps.poison-tls.outputs.cache-hit }}' != true",
+		"steps.poison-proxy.outputs.cache-hit }}' != true",
+		"steps.poison-process.outputs.cache-hit }}' != true",
+	} {
+		if !strings.Contains(workflow, required) {
+			t.Fatalf("poison conformance is missing non-vacuity proof %q", required)
+		}
+	}
+	if strings.Count(workflow, "lookup-only: true") != 5 {
+		t.Fatal("every poisoned cache key must be checked for a miss from the next VM")
+	}
+	for _, jobs := range [][2]string{
+		{"save-embedded-current", "restore-embedded-current"},
+		{"restore-embedded-current", "save-embedded-pinned"},
+		{"save-embedded-pinned", "restore-embedded-pinned"},
+		{"restore-embedded-pinned", "poisoned-clients"},
+	} {
+		start := strings.Index(workflow, "\n  "+jobs[0]+":\n")
+		if start < 0 {
+			t.Fatalf("workflow is missing %s", jobs[0])
+		}
+		rest := workflow[start+1:]
+		end := strings.Index(rest, "\n  "+jobs[1]+":\n")
+		if end > 0 {
+			rest = rest[:end]
+		}
+		for _, required := range []string{
+			"uses: actions/checkout@v6",
+			"repository: ${{ inputs.billet_repository }}",
+			"ref: ${{ inputs.billet_ref }}",
+			"path: .billet-conformance",
+			"sparse-checkout: .github/actions/cache-conformance-fixtures",
+			"persist-credentials: false",
+			"salt: ${{ github.run_id }}-${{ github.run_attempt }}",
+		} {
+			if !strings.Contains(rest, required) {
+				t.Fatalf("%s does not fetch or use the exact called Billet revision: missing %q",
+					jobs[0], required)
+			}
+		}
+		if strings.Contains(rest, "repository: ${{ github.repository }}") {
+			t.Fatalf("%s is caller-dependent or does not force a fresh run-scoped cache", jobs[0])
+		}
+	}
+}
+
 func assertContains(t *testing.T, path, want string) {
 	t.Helper()
 	body, err := os.ReadFile(path)

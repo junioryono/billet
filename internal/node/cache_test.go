@@ -5,12 +5,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -22,21 +24,28 @@ import (
 )
 
 type fakeCacheStore struct {
-	current           string
-	created           int
-	cloned            int
-	snapshots         int
-	published         int
-	discarded         int
-	discardFailures   int
-	renewed           int
-	renewedUntil      time.Time
-	publishErr        error
-	advanceOnSnapshot bool
-	publishExpected   []string
-	keys              []string
-	createdSizes      []int64
-	snapshotVolumes   []storecontract.Volume
+	current            string
+	created            int
+	cloned             int
+	snapshots          int
+	published          int
+	discarded          int
+	discardFailures    int
+	renewed            int
+	renewedUntil       time.Time
+	publishErr         error
+	publishConflicts   int
+	conflictCurrent    string
+	advanceOnSnapshot  bool
+	publishExpected    []string
+	writerAcquisitions int
+	validWriterIDs     map[string]string
+	validFences        map[string]storecontract.FencingToken
+	publishedWriterIDs []string
+	publishedFences    []storecontract.FencingToken
+	keys               []string
+	createdSizes       []int64
+	snapshotVolumes    []storecontract.Volume
 }
 
 func TestCacheWriterAuthorityOutlivesTheWholeCommitBudget(t *testing.T) {
@@ -71,6 +80,18 @@ func (f *fakeCacheStore) Current(context.Context, string) (string, error) {
 	}
 
 	return f.current, nil
+}
+
+func (f *fakeCacheStore) Match(
+	_ context.Context,
+	exact string,
+	_ []string,
+) (string, string, error) {
+	if f.current == "" {
+		return "", "", storecontract.ErrMiss
+	}
+
+	return exact, f.current, nil
 }
 
 func (f *fakeCacheStore) Create(_ context.Context, key string, size int64) (storecontract.Volume, error) {
@@ -110,7 +131,19 @@ func (f *fakeCacheStore) RenewActive(
 func (f *fakeCacheStore) AcquireWriter(
 	_ context.Context, key, _ string, ttl time.Duration,
 ) (storecontract.WriterLease, storecontract.FencingToken, error) {
-	return storecontract.WriterLease{Key: key, ID: "writer", Expires: time.Now().Add(ttl)}, 1, nil
+	f.writerAcquisitions++
+	writerID := fmt.Sprintf("writer-%d", f.writerAcquisitions)
+	fence := storecontract.FencingToken(f.writerAcquisitions)
+	if f.validWriterIDs == nil {
+		f.validWriterIDs = make(map[string]string)
+	}
+	f.validWriterIDs[key] = writerID
+	if f.validFences == nil {
+		f.validFences = make(map[string]storecontract.FencingToken)
+	}
+	f.validFences[key] = fence
+
+	return storecontract.WriterLease{Key: key, ID: writerID, Expires: time.Now().Add(ttl)}, fence, nil
 }
 
 func (f *fakeCacheStore) Snapshot(
@@ -130,13 +163,26 @@ func (f *fakeCacheStore) Snapshot(
 
 func (f *fakeCacheStore) PublishCAS(
 	_ context.Context,
-	_, expected string,
+	key, expected string,
 	candidate storecontract.Candidate,
-	_ storecontract.WriterLease,
-	_ storecontract.FencingToken,
+	lease storecontract.WriterLease,
+	fence storecontract.FencingToken,
 ) error {
 	f.published++
 	f.publishExpected = append(f.publishExpected, expected)
+	f.publishedWriterIDs = append(f.publishedWriterIDs, lease.ID)
+	f.publishedFences = append(f.publishedFences, fence)
+	if lease.ID != f.validWriterIDs[key] || fence != f.validFences[key] {
+		return errors.New("stale writer authority")
+	}
+	if f.publishConflicts > 0 {
+		f.publishConflicts--
+		if f.conflictCurrent != "" {
+			f.current = f.conflictCurrent
+		}
+
+		return storecontract.ErrConflict
+	}
 	if f.publishErr == nil && expected != f.current {
 		return storecontract.ErrConflict
 	}
@@ -619,6 +665,69 @@ func TestRunnerBindsCacheAccessToTheComputeLifetime(t *testing.T) {
 		map[string]any{"key": "acme/api/npm", "size_bytes": int64(1 << 30)})
 	if after.Code != http.StatusUnauthorized {
 		t.Errorf("expired compute token returned HTTP %d, want 401", after.Code)
+	}
+}
+
+func TestRunnerBindsActionsInterceptionToTheAssignedRepository(t *testing.T) {
+	p := &fakeProvider{kind: config.ProviderDocker}
+	service, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", t.TempDir(),
+		&fakeCacheStore{}, &fakeVolumeAttacher{}, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewCacheService: %v", err)
+	}
+
+	a, host := newAllocatorWithHost(t)
+	runner := New(a, host, &fakeJIT{setID: 7}, p, nil, WithCacheService(service))
+	lease := assignedLease(t, a)
+	tier := dockerSpec()
+	tier.Intercept = true
+	if err := runner.Launch(t.Context(), lease, tier, Job{
+		RequestID:   11,
+		Event:       "push",
+		Owner:       "acme",
+		Repository:  "api",
+		WorkflowRef: "acme/api/.github/workflows/ci.yml@refs/heads/main",
+	}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	spec := p.launched[0]
+	if spec.ActionsProxy == "" || spec.ActionsCAPEM == "" {
+		t.Fatalf("guest Actions interception credentials were incomplete: proxy=%q ca=%t",
+			spec.ActionsProxy, spec.ActionsCAPEM != "")
+	}
+	if !strings.Contains(spec.ActionsProxy, spec.CacheToken) {
+		t.Error("the proxy URL is not bound to this guest's ephemeral cache capability")
+	}
+}
+
+func TestRunnerLeavesUntrustedActionsTrafficEntirelyOnGitHub(t *testing.T) {
+	p := &fakeProvider{kind: config.ProviderDocker, acceptsAll: true}
+	service, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", t.TempDir(),
+		&fakeCacheStore{}, &fakeVolumeAttacher{}, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewCacheService: %v", err)
+	}
+
+	a, host := newAllocatorWithHost(t)
+	runner := New(a, host, &fakeJIT{setID: 7}, p, nil, WithCacheService(service))
+	lease := assignedLease(t, a)
+	tier := dockerSpec()
+	tier.Intercept = true
+	if err := runner.Launch(t.Context(), lease, tier, Job{
+		RequestID:   11,
+		Event:       "pull_request",
+		Owner:       "acme",
+		Repository:  "api",
+		WorkflowRef: "acme/api/.github/workflows/ci.yml@refs/pull/1/merge",
+	}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+
+	spec := p.launched[0]
+	if spec.ActionsProxy != "" || spec.ActionsCAPEM != "" {
+		t.Fatalf("untrusted guest received interception state: proxy=%q ca=%t",
+			spec.ActionsProxy, spec.ActionsCAPEM != "")
 	}
 }
 

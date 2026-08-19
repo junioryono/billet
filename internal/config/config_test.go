@@ -237,7 +237,6 @@ func TestUnimplementedTierAcceleratorsAreRefusedRatherThanIgnored(t *testing.T) 
 	t.Parallel()
 
 	for field, insertion := range map[string]string{
-		"intercept": "    intercept: true\n",
 		"warm_pool": "    warm_pool: 2\n",
 	} {
 		t.Run(field, func(t *testing.T) {
@@ -253,6 +252,33 @@ func TestUnimplementedTierAcceleratorsAreRefusedRatherThanIgnored(t *testing.T) 
 				t.Errorf("error does not explain the unavailable setting: %v", err)
 			}
 		})
+	}
+}
+
+func TestActionsCacheInterceptionRequiresAHostBackedCacheNode(t *testing.T) {
+	t.Parallel()
+
+	withCache := strings.Replace(validConfig, "  ceph:\n",
+		"  cache:\n    listen: 172.20.0.1:7718\n    guest_endpoint: http://172.20.0.1:7718\n  ceph:\n", 1)
+	withIntercept := strings.Replace(withCache, "    image: ubuntu-2404-x64\n",
+		"    image: ubuntu-2404-x64\n    intercept: true\n", 1)
+	if _, err := Load(writeConfig(t, withIntercept)); err != nil {
+		t.Fatalf("a Firecracker tier with the node cache was rejected: %v", err)
+	}
+
+	withoutCache := strings.Replace(validConfig, "    image: ubuntu-2404-x64\n",
+		"    image: ubuntu-2404-x64\n    intercept: true\n", 1)
+	if _, err := Load(writeConfig(t, withoutCache)); err == nil ||
+		!strings.Contains(err.Error(), "node.cache") {
+		t.Fatalf("interception without a node cache was not refused clearly: %v", err)
+	}
+
+	remote := strings.Replace(withIntercept,
+		"  - label: billet-4vcpu-ubuntu-2404\n    provider: firecracker\n",
+		"  - label: billet-4vcpu-ubuntu-2404\n    provider: ec2\n", 1)
+	if _, err := Load(writeConfig(t, remote)); err == nil ||
+		!strings.Contains(err.Error(), "only the firecracker provider") {
+		t.Fatalf("interception on remote compute was not refused clearly: %v", err)
 	}
 }
 

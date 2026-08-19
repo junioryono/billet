@@ -288,6 +288,52 @@ exit "$job_status"
 	}
 }
 
+func TestTheGuestAgentInstallsActionsInterceptionForEveryRunnerSurface(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join("..", "..", "..", "scripts", "build-guest-image.sh")
+	source, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read guest image builder: %v", err)
+	}
+	text := string(source)
+
+	for _, want := range []string{
+		"fetch actions-proxy", "fetch actions-ca-pem", "cat /etc/ssl/certs/ca-certificates.crt",
+		"actions_ca_dir=/home/runner/runner/_work/_billet",
+		`actions_ca_path="$actions_ca_dir/actions-cache-ca.pem"`,
+		`"HTTPS_PROXY=$actions_guest_proxy"`, `"https_proxy=$actions_guest_proxy"`,
+		`"NODE_EXTRA_CA_CERTS=$actions_ca_path"`, `"SSL_CERT_FILE=$actions_ca_path"`,
+		`"ACTIONS_RUNNER_HOOK_JOB_STARTED=$actions_hook_path"`,
+		`target="$RUNNER_TEMP/billet-actions-cache-ca.pem"`,
+		`install -m 0444 "$BILLET_ACTIONS_CA_SOURCE" "$target"`,
+		`printf 'HTTPS_PROXY=%s\n' "$BILLET_ACTIONS_PROXY"`,
+		`printf 'NODE_EXTRA_CA_CERTS=%s\n' "$target"`,
+		`printf 'SSL_CERT_FILE=%s\n' "$target"`,
+		`} >>"$GITHUB_ENV"`,
+		`--property=Restart=always --property=RestartSec=100ms`,
+		`--listen "$docker_bridge:7719" --upstream "$actions_proxy"`,
+		`actions_guest_proxy="http://$docker_bridge:7719"`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("the guest agent does not establish %q", want)
+		}
+	}
+
+	proxyAt := strings.Index(text, "fetch actions-proxy")
+	launchAt := strings.Index(text, "BILLET_AGENT_LAUNCH_BEGIN")
+	if proxyAt < 0 || launchAt < 0 || proxyAt >= launchAt {
+		t.Fatal("the guest does not install Actions interception before starting the runner")
+	}
+	if strings.Index(text, `cat /etc/ssl/certs/ca-certificates.crt`) >
+		strings.Index(text, `printf '\n%s\n' "$actions_ca_candidate"`) {
+		t.Fatal("the guest trust bundle does not keep system roots before the Billet authority")
+	}
+	if strings.Contains(text, "--listen 0.0.0.0:7719") {
+		t.Fatal("the cache-session proxy is exposed on the microVM workload interface")
+	}
+}
+
 func TestTheManualGuestImagePublisherRunsTheContentsGate(t *testing.T) {
 	t.Parallel()
 

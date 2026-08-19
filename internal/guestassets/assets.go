@@ -8,6 +8,11 @@ import _ "embed"
 //go:embed docker-cache.sh
 var DockerCacheScript string
 
+// ActionsProxyScript keeps non-results HTTPS independent from node interception.
+//
+//go:embed actions-proxy.py
+var ActionsProxyScript string
+
 // RunnerServiceScript retains the stock update loop without hiding one-job results.
 //
 //go:embed runner-service.sh

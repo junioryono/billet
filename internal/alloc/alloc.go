@@ -406,6 +406,9 @@ func New(db *state.DB, limits Limits, tiers []config.Tier, opts ...Option) (*All
 		case len(t.ProviderErrors(fmt.Sprintf("tier %q", t.Label))) > 0:
 			return nil, fmt.Errorf("alloc: %w",
 				errors.Join(t.ProviderErrors(fmt.Sprintf("tier %q", t.Label))...))
+		case len(t.InterceptionErrors(fmt.Sprintf("tier %q", t.Label))) > 0:
+			return nil, fmt.Errorf("alloc: %w",
+				errors.Join(t.InterceptionErrors(fmt.Sprintf("tier %q", t.Label))...))
 
 		case len(t.GuestOSProviderErrors(fmt.Sprintf("tier %q", t.Label))) > 0:
 			return nil, fmt.Errorf("alloc: %w",
