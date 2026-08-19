@@ -1,4 +1,11 @@
 ---
+- name: Reload systemd before inspecting installed service policy
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  changed_when: false
+  check_mode: false
+  become: true
+
 - name: Inspect an existing billet account
   ansible.builtin.getent:
     database: passwd

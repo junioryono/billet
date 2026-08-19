@@ -35,6 +35,7 @@
         billet_candidate_stage: "{{ billet_host_account_tasks | selectattr('name', 'equalto', 'Stage the immutable candidate binary inside its recovery journal') | first }}"
         billet_candidate_unit_stage: "{{ billet_host_account_tasks | selectattr('name', 'equalto', 'Stage candidate systemd units for the upgrade transaction') | first }}"
         billet_ordinary_unit_install: "{{ billet_host_account_tasks | selectattr('name', 'equalto', 'Install the billet systemd units') | first }}"
+        billet_service_policy_reload: "{{ billet_host_account_tasks | selectattr('name', 'equalto', 'Reload systemd before inspecting installed service policy') | first }}"
         billet_steady_unit_install: "{{ billet_upgrade_task.block | selectattr('name', 'equalto', 'Install steady-state units without the quiescent probe') | first }}"
         billet_recovery_stop_proof: "{{ billet_host_recovery_tasks | selectattr('name', 'equalto', 'Refuse recovery without conclusive process and cgroup evidence') | first }}"
         billet_recovery_cgroup_probe: "{{ billet_host_recovery_tasks | selectattr('name', 'equalto', 'Inspect service cgroups before recovering upgrade inputs') | first }}"
@@ -59,6 +60,16 @@
           Type=exec
           ExecStart=
           ExecStart=/usr/bin/billet node --config /etc/billet/billet.yaml
+        billet_stale_manager_identity:
+          user: billet
+          group: billet
+        billet_reloaded_disk_identity:
+          user: unapproved
+          group: unapproved
+        billet_changed_identity_unit: |
+          [Service]
+          User=unapproved
+          Group=unapproved
       vars:
         billet_service_user: billet
         billet_service_group: billet
@@ -85,12 +96,41 @@
           - billet_unsafe_override_refused | default(false) | bool
           - not billet_unsafe_override_accepted | default(false) | bool
 
+    - name: Exercise a changed main-unit identity hidden by stale manager state
+      block:
+        - name: Apply the installed identity acceptance condition after reload
+          ansible.builtin.assert:
+            that:
+              - billet_reloaded_disk_identity.user == billet_stale_manager_identity.user
+              - billet_reloaded_disk_identity.group == billet_stale_manager_identity.group
+
+        - name: Record an unsafe stale-identity acceptance
+          ansible.builtin.set_fact:
+            billet_stale_identity_accepted: true
+      rescue:
+        - name: Record the expected fresh-identity refusal
+          ansible.builtin.set_fact:
+            billet_stale_identity_refused: true
+
+    - name: Prove the reloaded on-disk identity was refused
+      ansible.builtin.assert:
+        that:
+          - billet_stale_identity_refused | default(false) | bool
+          - not billet_stale_identity_accepted | default(false) | bool
+          - "'User=unapproved' in billet_changed_identity_unit"
+          - "'Group=unapproved' in billet_changed_identity_unit"
+
     - name: Require durable recovery before any live host mutation
       ansible.builtin.assert:
         that:
           - "'Refuse unsafe billet state directories' in billet_inspection_names"
           - "'Refuse billet state paths with symlinked or noncanonical ancestors' in billet_inspection_names"
           - "'Refuse billet state paths that are symlinks or non-directories' in billet_inspection_names"
+          - billet_account_names.index('Reload systemd before inspecting installed service policy') < billet_account_names.index('Inspect the installed billet server unit before account mutation')
+          - billet_account_names.index('Reload systemd before inspecting installed service policy') < billet_account_names.index('Inspect the installed billet server identity before account mutation')
+          - billet_account_names.index('Inspect the installed billet server identity before account mutation') < billet_account_names.index('Refuse an implicit installed service identity migration')
+          - billet_service_policy_reload['ansible.builtin.systemd_service'].daemon_reload | bool
+          - billet_service_policy_reload.changed_when == false
           - billet_account_names.index('Refuse an implicit installed service identity migration') < billet_account_names.index('Create the billet service group')
           - billet_account_names.index('Refuse an implicit installed service identity migration') < billet_account_names.index('Create billet directories')
           - billet_account_names.index('Refuse to move installed billet state implicitly') < billet_account_names.index('Render billet configuration')
