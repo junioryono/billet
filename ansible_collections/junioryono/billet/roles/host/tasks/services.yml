@@ -41,6 +41,8 @@
   ansible.builtin.set_fact:
     billet_promoted_image: ""
     billet_upgrade_recovery_dir: ""
+    billet_previous_binary_preserved: false
+    billet_ledger_preserved: false
   when:
     - billet_binary_upgrade | default(false)
     - not ansible_check_mode
@@ -119,6 +121,11 @@
         mode: "0755"
       when: billet_binary_checksums.results[0].stat.exists
 
+    - name: Remember that the previous billet binary is recoverable
+      ansible.builtin.set_fact:
+        billet_previous_binary_preserved: true
+      when: billet_binary_checksums.results[0].stat.exists
+
     - name: Preserve the stopped control-plane ledger
       ansible.builtin.command:
         argv:
@@ -127,6 +134,10 @@
           - /var/lib/billet/server
           - "{{ billet_upgrade_recovery_dir }}/server"
         creates: "{{ billet_upgrade_recovery_dir }}/server"
+
+    - name: Remember that the stopped control-plane ledger is recoverable
+      ansible.builtin.set_fact:
+        billet_ledger_preserved: true
 
     - name: Install the candidate billet binary after the ledger lock is released
       ansible.builtin.copy:
@@ -195,7 +206,7 @@
         path: /var/lib/billet/server
         state: absent
       when:
-        - billet_upgrade_recovery_dir | length > 0
+        - billet_ledger_preserved | default(false)
 
     - name: Restore the previous control-plane ledger
       ansible.builtin.command:
@@ -205,7 +216,7 @@
           - "{{ billet_upgrade_recovery_dir }}/server"
           - /var/lib/billet/server
       when:
-        - billet_upgrade_recovery_dir | length > 0
+        - billet_ledger_preserved | default(false)
 
     - name: Restore the previous billet binary
       ansible.builtin.copy:
@@ -216,8 +227,7 @@
         group: root
         mode: "0755"
       when:
-        - billet_upgrade_recovery_dir | length > 0
-        - billet_binary_checksums.results[0].stat.exists
+        - billet_previous_binary_preserved | default(false)
 
     - name: Remove a failed first-install binary with no predecessor
       ansible.builtin.file:

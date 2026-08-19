@@ -98,3 +98,24 @@ func TestImagePullResultIsInstalledOnlyAsAProtectedCompleteFile(t *testing.T) {
 		t.Errorf("result mode = %o, want 600", got)
 	}
 }
+
+func TestVerifiedImageIsWithdrawnWhenItsRollbackHandleCannotBeWritten(t *testing.T) {
+	parent := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(parent, []byte("file\n"), 0o600); err != nil {
+		t.Fatalf("create blocking file: %v", err)
+	}
+
+	withdrawn := false
+	err := writeVerifiedImageResult(filepath.Join(parent, "prepared-image"),
+		"ubuntu-2404-x64@g20260815033431", func() error {
+			withdrawn = true
+
+			return nil
+		})
+	if err == nil {
+		t.Fatal("writing a result below a regular file succeeded")
+	}
+	if !withdrawn {
+		t.Fatal("the verified generation remained promoted without a rollback handle")
+	}
+}

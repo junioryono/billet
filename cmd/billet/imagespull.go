@@ -208,7 +208,13 @@ func cmdImagesPull(ctx context.Context, args []string) error {
 	}
 
 	if *resultFile != "" {
-		if err := writeImageResult(*resultFile, exact); err != nil {
+		if *verify {
+			if err := writeVerifiedImageResult(*resultFile, exact, func() error {
+				return store.UnmarkVerified(ctx, exact)
+			}); err != nil {
+				return err
+			}
+		} else if err := writeImageResult(*resultFile, exact); err != nil {
 			return err
 		}
 	}
@@ -217,6 +223,14 @@ func cmdImagesPull(ctx context.Context, args []string) error {
 	fmt.Printf("The kernel it is paired with is kept at:\n\n    %s\n\n", kernel)
 	fmt.Println("Point node.firecracker.kernel_image at that path. The two are a matched pair,")
 	fmt.Println("and a guest booted with a different kernel fails in the middle of somebody's job.")
+
+	return nil
+}
+
+func writeVerifiedImageResult(path, image string, withdraw func() error) error {
+	if err := writeImageResult(path, image); err != nil {
+		return errors.Join(err, withdraw())
+	}
 
 	return nil
 }

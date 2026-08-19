@@ -18,7 +18,9 @@
         billet_upgrade_stop_node: "{{ billet_upgrade_task.block | selectattr('name', 'equalto', 'Gracefully stop the billet node before changing its guest contract') | first }}"
         billet_upgrade_stop_server: "{{ billet_upgrade_task.block | selectattr('name', 'equalto', 'Gracefully stop the billet server after compute has drained') | first }}"
         billet_upgrade_backup_ledger: "{{ billet_upgrade_task.block | selectattr('name', 'equalto', 'Preserve the stopped control-plane ledger') | first }}"
+        billet_rollback_remove_ledger: "{{ billet_upgrade_task.rescue | selectattr('name', 'equalto', 'Remove the migrated ledger copy before restoring the stopped snapshot') | first }}"
         billet_rollback_restore_ledger: "{{ billet_upgrade_task.rescue | selectattr('name', 'equalto', 'Restore the previous control-plane ledger') | first }}"
+        billet_rollback_restore_binary: "{{ billet_upgrade_task.rescue | selectattr('name', 'equalto', 'Restore the previous billet binary') | first }}"
 
     - name: Require image proof before the upgrade transaction
       ansible.builtin.assert:
@@ -30,8 +32,11 @@
         that:
           - billet_upgrade_names.index('Gracefully stop the billet node before changing its guest contract') < billet_upgrade_names.index('Pull, boot-verify, and promote a compatible guest when needed')
           - billet_upgrade_names.index('Pull, boot-verify, and promote a compatible guest when needed') < billet_upgrade_names.index('Gracefully stop the billet server after compute has drained')
+          - billet_upgrade_names.index('Preserve the previous billet binary') < billet_upgrade_names.index('Remember that the previous billet binary is recoverable')
+          - billet_upgrade_names.index('Remember that the previous billet binary is recoverable') < billet_upgrade_names.index('Install the candidate billet binary after the ledger lock is released')
           - billet_upgrade_names.index('Gracefully stop the billet server after compute has drained') < billet_upgrade_names.index('Preserve the stopped control-plane ledger')
-          - billet_upgrade_names.index('Preserve the stopped control-plane ledger') < billet_upgrade_names.index('Install the candidate billet binary after the ledger lock is released')
+          - billet_upgrade_names.index('Preserve the stopped control-plane ledger') < billet_upgrade_names.index('Remember that the stopped control-plane ledger is recoverable')
+          - billet_upgrade_names.index('Remember that the stopped control-plane ledger is recoverable') < billet_upgrade_names.index('Install the candidate billet binary after the ledger lock is released')
           - billet_upgrade_names.index('Install the candidate billet binary after the ledger lock is released') < billet_upgrade_names.index('Validate and migrate with the new billet binary as the only ledger writer')
           - billet_upgrade_names.index('Validate and migrate with the new billet binary as the only ledger writer') < billet_upgrade_names.index('Start the upgraded billet server before admitting compute')
           - billet_upgrade_names.index('Start the upgraded billet server before admitting compute') < billet_upgrade_names.index('Start the upgraded billet node after validation and image verification')
@@ -42,6 +47,9 @@
           - "'when' not in billet_upgrade_stop_node"
           - "'when' not in billet_upgrade_stop_server"
           - "'when' not in billet_upgrade_backup_ledger"
+          - "'billet_ledger_preserved' in (billet_rollback_remove_ledger.when | join(' '))"
+          - "'billet_ledger_preserved' in (billet_rollback_restore_ledger.when | join(' '))"
+          - "'billet_previous_binary_preserved' in (billet_rollback_restore_binary.when | join(' '))"
           - "'billet_enable_server' not in (billet_rollback_restore_ledger.when | join(' '))"
 
     - name: Require rollback to stop new processes before restoring state
