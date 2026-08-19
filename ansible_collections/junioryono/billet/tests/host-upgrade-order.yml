@@ -36,6 +36,8 @@
         billet_candidate_unit_stage: "{{ billet_host_account_tasks | selectattr('name', 'equalto', 'Stage candidate systemd units for the upgrade transaction') | first }}"
         billet_ordinary_unit_install: "{{ billet_host_account_tasks | selectattr('name', 'equalto', 'Install the billet systemd units') | first }}"
         billet_service_policy_reload: "{{ billet_host_account_tasks | selectattr('name', 'equalto', 'Reload systemd before inspecting installed service policy') | first }}"
+        billet_service_policy_pending_probe: "{{ billet_host_account_tasks | selectattr('name', 'equalto', 'Inspect pending Billet service policy during a dry run') | first }}"
+        billet_service_policy_pending_guard: "{{ billet_host_account_tasks | selectattr('name', 'equalto', 'Refuse a dry run against stale Billet service policy') | first }}"
         billet_steady_unit_install: "{{ billet_upgrade_task.block | selectattr('name', 'equalto', 'Install steady-state units without the quiescent probe') | first }}"
         billet_recovery_stop_proof: "{{ billet_host_recovery_tasks | selectattr('name', 'equalto', 'Refuse recovery without conclusive process and cgroup evidence') | first }}"
         billet_recovery_cgroup_probe: "{{ billet_host_recovery_tasks | selectattr('name', 'equalto', 'Inspect service cgroups before recovering upgrade inputs') | first }}"
@@ -131,6 +133,13 @@
           - billet_account_names.index('Inspect the installed billet server identity before account mutation') < billet_account_names.index('Refuse an implicit installed service identity migration')
           - billet_service_policy_reload['ansible.builtin.systemd_service'].daemon_reload | bool
           - billet_service_policy_reload.changed_when == false
+          - "'not ansible_check_mode' in (billet_service_policy_reload.when | string)"
+          - "'--property=NeedDaemonReload' in billet_service_policy_pending_probe['ansible.builtin.command'].argv"
+          - billet_service_policy_pending_probe.changed_when == false
+          - billet_service_policy_pending_probe.check_mode == false
+          - "'ansible_check_mode' in (billet_service_policy_pending_probe.when | string)"
+          - "\"item.stdout | trim == 'no'\" in billet_service_policy_pending_guard['ansible.builtin.assert'].that"
+          - "'ansible_check_mode' in (billet_service_policy_pending_guard.when | string)"
           - billet_account_names.index('Refuse an implicit installed service identity migration') < billet_account_names.index('Create the billet service group')
           - billet_account_names.index('Refuse an implicit installed service identity migration') < billet_account_names.index('Create billet directories')
           - billet_account_names.index('Refuse to move installed billet state implicitly') < billet_account_names.index('Render billet configuration')
