@@ -4,29 +4,31 @@
   connection: local
   gather_facts: false
   vars:
+    billet_host_main_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/main.yml') | from_yaml }}"
     billet_host_service_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/services.yml') | from_yaml }}"
     billet_host_account_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/account.yml') | from_yaml }}"
+    billet_host_recovery_tasks: "{{ lookup('ansible.builtin.file', playbook_dir + '/../roles/host/tasks/upgrade-recover.yml') | from_yaml }}"
   tasks:
-    - name: Locate the upgrade transaction
+    - name: Locate the upgrade transaction and recovery path
       ansible.builtin.set_fact:
         billet_upgrade_task: "{{ billet_host_service_tasks | selectattr('name', 'equalto', 'Upgrade billet as one recoverable host transaction') | first }}"
         billet_top_level_names: "{{ billet_host_service_tasks | map(attribute='name') | list }}"
         billet_account_names: "{{ billet_host_account_tasks | map(attribute='name') | list }}"
+        billet_main_names: "{{ billet_host_main_tasks | map(attribute='name') | list }}"
+        billet_recovery_names: "{{ billet_host_recovery_tasks | map(attribute='name') | list }}"
 
-    - name: Record transaction and rollback task names
+    - name: Record transaction and recovery task details
       ansible.builtin.set_fact:
         billet_upgrade_names: "{{ billet_upgrade_task.block | map(attribute='name') | list }}"
         billet_rollback_names: "{{ billet_upgrade_task.rescue | map(attribute='name') | list }}"
         billet_upgrade_stop_node: "{{ billet_upgrade_task.block | selectattr('name', 'equalto', 'Gracefully stop the billet node before changing its guest contract') | first }}"
         billet_upgrade_stop_server: "{{ billet_upgrade_task.block | selectattr('name', 'equalto', 'Gracefully stop the billet server after compute has drained') | first }}"
         billet_upgrade_backup_ledger: "{{ billet_upgrade_task.block | selectattr('name', 'equalto', 'Preserve the stopped control-plane ledger') | first }}"
-        billet_rollback_remove_ledger: "{{ billet_upgrade_task.rescue | selectattr('name', 'equalto', 'Remove migrated ledger entries before restoring the stopped snapshot') | first }}"
-        billet_rollback_restore_ledger: "{{ billet_upgrade_task.rescue | selectattr('name', 'equalto', 'Restore the previous control-plane ledger') | first }}"
-        billet_rollback_restore_binary: "{{ billet_upgrade_task.rescue | selectattr('name', 'equalto', 'Restore the previous billet binary') | first }}"
-        billet_rollback_stop_proof: "{{ billet_upgrade_task.rescue | selectattr('name', 'equalto', 'Refuse rollback while either upgraded process may still be running') | first }}"
-        billet_rollback_restore_inputs: "{{ billet_upgrade_task.rescue | selectattr('name', 'equalto', 'Restore configuration and units that existed before the upgrade') | first }}"
+        billet_recovery_stop_proof: "{{ billet_host_recovery_tasks | selectattr('name', 'equalto', 'Refuse recovery without conclusive process and cgroup evidence') | first }}"
+        billet_recovery_cgroup_probe: "{{ billet_host_recovery_tasks | selectattr('name', 'equalto', 'Inspect service cgroups before recovering upgrade inputs') | first }}"
+        billet_recovery_restore_inputs: "{{ billet_host_recovery_tasks | selectattr('name', 'equalto', 'Restore configuration and units that existed before the upgrade') | first }}"
 
-    - name: Require upgrade inputs to be preserved before desired state replaces them
+    - name: Require durable recovery before any live host mutation
       ansible.builtin.assert:
         that:
           - billet_account_names.index('Refuse unsafe billet state directories') < billet_account_names.index('Create billet directories')
@@ -34,57 +36,55 @@
           - billet_account_names.index('Refuse billet state paths that are symlinks or non-directories') < billet_account_names.index('Create billet directories')
           - billet_account_names.index('Refuse to move installed billet state implicitly') < billet_account_names.index('Render billet configuration')
           - billet_account_names.index('Preserve configuration and units before replacing them') < billet_account_names.index('Stage candidate systemd units for the upgrade transaction')
-          - billet_account_names.index('Preserve configuration and units before replacing them') < billet_account_names.index('Stage candidate configuration for the upgrade transaction')
-          - billet_account_names.index('Preserve configuration and units before replacing them') < billet_account_names.index('Install the billet systemd units')
-          - billet_account_names.index('Preserve configuration and units before replacing them') < billet_account_names.index('Render billet configuration')
+          - "'Preserve the previous billet binary before live mutation' in billet_account_names"
+          - billet_main_names.index('Configure billet account and files') < billet_main_names.index('Configure billet services')
+          - billet_top_level_names.index('Persist the host-upgrade recovery manifest before live mutation') < billet_top_level_names.index('Publish the durable host-upgrade pointer before live mutation')
+          - billet_top_level_names.index('Publish the durable host-upgrade pointer before live mutation') < billet_top_level_names.index('Upgrade billet as one recoverable host transaction')
           - billet_top_level_names.index('Prove every configured guest image is compatible with the candidate binary') < billet_top_level_names.index('Upgrade billet as one recoverable host transaction')
+          - billet_main_names.index('Recover an interrupted billet upgrade before converging anything else') < billet_main_names.index('Configure Firecracker')
+          - billet_main_names.index('Recover an interrupted billet upgrade before converging anything else') < billet_main_names.index('Configure guest networking')
+          - billet_main_names.index('Recover an interrupted billet upgrade before converging anything else') < billet_main_names.index('Configure Ceph')
 
-    - name: Require drain, refresh, backup, migration, and restart ordering
+    - name: Require drain, fencing, snapshot, migration, and commit ordering
       ansible.builtin.assert:
         that:
           - billet_upgrade_names.index('Gracefully stop the billet node before changing its guest contract') < billet_upgrade_names.index('Pull, boot-verify, and promote every compatible guest needed')
           - billet_upgrade_names.index('Pull, boot-verify, and promote every compatible guest needed') < billet_upgrade_names.index('Gracefully stop the billet server after compute has drained')
-          - billet_upgrade_names.index('Preserve the previous billet binary') < billet_upgrade_names.index('Remember that the previous billet binary is recoverable')
-          - billet_upgrade_names.index('Remember that the previous billet binary is recoverable') < billet_upgrade_names.index('Install the candidate billet binary after both old services stop')
-          - billet_upgrade_names.index('Install the candidate billet binary after both old services stop') < billet_upgrade_names.index('Fence the ledger against operator commands during migration and rollback')
-          - billet_upgrade_names.index('Fence the ledger against operator commands during migration and rollback') < billet_upgrade_names.index('Preserve the stopped control-plane ledger')
-          - billet_upgrade_names.index('Gracefully stop the billet server after compute has drained') < billet_upgrade_names.index('Preserve the stopped control-plane ledger')
-          - billet_upgrade_names.index('Preserve the stopped control-plane ledger') < billet_upgrade_names.index('Remember that the stopped control-plane ledger is recoverable')
-          - billet_upgrade_names.index('Remember that the stopped control-plane ledger is recoverable') < billet_upgrade_names.index('Install candidate configuration after preserving the stopped ledger')
+          - billet_upgrade_names.index('Gracefully stop the billet server after compute has drained') < billet_upgrade_names.index('Hide the old executable before establishing the maintenance fence')
+          - billet_upgrade_names.index('Hide the old executable before establishing the maintenance fence') < billet_upgrade_names.index('Fence the ledger against operator commands during migration and rollback')
+          - billet_upgrade_names.index('Fence the ledger against operator commands during migration and rollback') < billet_upgrade_names.index('Wait for operator commands started before the fence to finish')
+          - billet_upgrade_names.index('Wait for operator commands started before the fence to finish') < billet_upgrade_names.index('Preserve the stopped control-plane ledger')
+          - billet_upgrade_names.index('Preserve the stopped control-plane ledger') < billet_upgrade_names.index('Commit the durable ledger snapshot before exposing the candidate')
+          - billet_upgrade_names.index('Commit the durable ledger snapshot before exposing the candidate') < billet_upgrade_names.index('Install the candidate billet binary after fencing and ledger preservation')
           - billet_upgrade_names.index('Install candidate configuration after preserving the stopped ledger') < billet_upgrade_names.index('Validate and migrate with the new billet binary as the only ledger writer')
           - billet_upgrade_names.index('Validate and migrate with the new billet binary as the only ledger writer') < billet_upgrade_names.index('Start the upgraded billet server before admitting compute')
-          - billet_upgrade_names.index('Start the upgraded billet server before admitting compute') < billet_upgrade_names.index('Start the upgraded billet node after validation and image verification')
+          - billet_upgrade_names.index('Start the upgraded billet node after validation and image verification') < billet_upgrade_names.index('Inspect upgraded service stability before committing the transaction')
+          - billet_upgrade_names.index('Prove upgraded services are stably active before opening administration') < billet_upgrade_names.index('Open the upgraded ledger to operator commands')
+          - billet_upgrade_names.index('Open the upgraded ledger to operator commands') < billet_upgrade_names.index('Close the durable host-upgrade transaction after commit')
 
-    - name: Require the transaction to stop existing services before applying new desired state
+    - name: Require recovery to exclude processes before restoring state
+      ansible.builtin.assert:
+        that:
+          - billet_recovery_names.index('Stop compute before recovering the authoritative ledger') < billet_recovery_names.index('Hide the installed executable while recovery owns the ledger')
+          - billet_recovery_names.index('Stop the control plane before recovering its authoritative ledger') < billet_recovery_names.index('Hide the installed executable while recovery owns the ledger')
+          - billet_recovery_names.index('Hide the installed executable while recovery owns the ledger') < billet_recovery_names.index('Wait for every billet process started before executable removal to finish')
+          - billet_recovery_names.index('Wait for every billet process started before executable removal to finish') < billet_recovery_names.index('Refuse recovery without conclusive process and cgroup evidence')
+          - billet_recovery_names.index('Refuse recovery without conclusive process and cgroup evidence') < billet_recovery_names.index('Remove current ledger entries before restoring a completed snapshot')
+          - billet_recovery_names.index('Restore the previous control-plane ledger') < billet_recovery_names.index('Restart prior services under a temporary maintenance bypass')
+          - billet_recovery_names.index('Restore configuration and units that existed before the upgrade') < billet_recovery_names.index('Restart prior services under a temporary maintenance bypass')
+          - billet_recovery_names.index('Prove services active before the upgrade are active again') < billet_recovery_names.index('Remove the maintenance fence after recovery is complete')
+          - billet_recovery_names.index('Remove the maintenance fence after recovery is complete') < billet_recovery_names.index('Close the durable host-upgrade transaction after recovery')
+          - "'item.1.rc == 0' in (billet_recovery_stop_proof['ansible.builtin.assert'].that | join(' '))"
+          - "'item.1.rc == 1' in (billet_recovery_stop_proof['ansible.builtin.assert'].that | join(' '))"
+          - "'not found.' in (billet_recovery_stop_proof['ansible.builtin.assert'].that | join(' '))"
+          - "'not in [0, 1]' in (billet_recovery_cgroup_probe.failed_when | string)"
+          - "'billet_upgrade_manifest.inputs' in billet_recovery_restore_inputs.loop"
+
+    - name: Require the transaction to stop installed services and snapshot the configured ledger
       ansible.builtin.assert:
         that:
           - "'billet_service_state_before_upgrade.results[1].rc != 4' in (billet_upgrade_stop_node.when | string)"
           - "'billet_service_state_before_upgrade.results[0].rc != 4' in (billet_upgrade_stop_server.when | string)"
           - "'billet_ledger_before_upgrade.stat.exists' in (billet_upgrade_backup_ledger.when | string)"
-          - "'billet_ledger_snapshot_taken' in (billet_rollback_remove_ledger.when | join(' '))"
-          - "'billet_ledger_preserved' in (billet_rollback_restore_ledger.when | join(' '))"
-          - "'billet_previous_binary_preserved' in (billet_rollback_restore_binary.when | join(' '))"
-          - "'billet_enable_server' not in (billet_rollback_restore_ledger.when | join(' '))"
           - "'billet_candidate_server_state_dir' in billet_upgrade_backup_ledger['ansible.builtin.command'].argv[2]"
-
-    - name: Require rollback to stop new processes before restoring state
-      ansible.builtin.assert:
-        that:
-          - billet_rollback_names.index('Stop upgraded compute before rollback') < billet_rollback_names.index('Refuse rollback while either upgraded process may still be running')
-          - billet_rollback_names.index('Stop the upgraded control plane before restoring its ledger') < billet_rollback_names.index('Refuse rollback while either upgraded process may still be running')
-          - billet_rollback_names.index('Refuse rollback while either upgraded process may still be running') < billet_rollback_names.index('Remove migrated ledger entries before restoring the stopped snapshot')
-          - billet_rollback_names.index('Remove migrated ledger entries before restoring the stopped snapshot') < billet_rollback_names.index('Restore the previous control-plane ledger')
-          - billet_rollback_names.index('Restore configuration and units that existed before the upgrade') < billet_rollback_names.index('Restart the previous billet server after rollback')
-          - billet_rollback_names.index('Restore the previous control-plane ledger') < billet_rollback_names.index('Restart the previous billet server after rollback')
-          - billet_rollback_names.index('Permit restored services through the maintenance fence for this start') < billet_rollback_names.index('Restart the previous billet server after rollback')
-          - billet_rollback_names.index('Restart the previous billet node after rollback') < billet_rollback_names.index('Remove the restored-service maintenance bypass from systemd')
-          - billet_rollback_names.index('Remove the restored-service maintenance bypass from systemd') < billet_rollback_names.index('Inspect restored service state')
-          - "'ActiveState=inactive' in (billet_rollback_stop_proof['ansible.builtin.assert'].that | join(' '))"
-          - "'MainPID=0' in (billet_rollback_stop_proof['ansible.builtin.assert'].that | join(' '))"
-          - "'ControlPID=0' in (billet_rollback_stop_proof['ansible.builtin.assert'].that | join(' '))"
-          - "'billet_service_cgroups_before_restore.results' in billet_rollback_stop_proof.loop"
-          - "'billet_previous_upgrade_inputs.results' in billet_rollback_restore_inputs.loop"
-          - "'item.stat.pw_name' in billet_rollback_restore_inputs['ansible.builtin.copy'].owner"
-          - "'item.stat.gr_name' in billet_rollback_restore_inputs['ansible.builtin.copy'].group"
-          - billet_rollback_names.index('Let restored services pass their immediate startup checks') < billet_rollback_names.index('Inspect restored service state')
-          - billet_rollback_names.index('Prove services that were active before the upgrade are active again') < billet_rollback_names.index('Remove the maintenance fence after rollback is complete')
+          - billet_rollback_names == ['Restore the durable pre-upgrade host state', 'Report the failed upgrade and its recovery copy']

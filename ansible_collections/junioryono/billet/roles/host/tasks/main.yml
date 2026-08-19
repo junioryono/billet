@@ -6,6 +6,7 @@
   loop:
     - /usr/bin/billet
     - /etc/billet/app-private-key.pem
+    - /var/lib/billet/upgrades/active
   check_mode: false
   become: true
 
@@ -14,7 +15,7 @@
     that:
       - ansible_facts["system"] == "Linux"
       - ansible_facts["service_mgr"] == "systemd"
-      - billet_binary_src | length > 0 or billet_persisted_inputs.results[0].stat.exists
+      - billet_binary_src | length > 0 or billet_persisted_inputs.results[0].stat.exists or billet_persisted_inputs.results[2].stat.exists
       - billet_config | length > 0
       - not billet_enable_server or billet_github_private_key_src | length > 0 or billet_persisted_inputs.results[1].stat.exists
       - not billet_ceph_bootstrap or billet_ceph_mon_ip | length > 0
@@ -34,6 +35,33 @@
 
 - name: Configure billet account and files
   ansible.builtin.import_tasks: account.yml
+
+- name: Refuse a dry run that cannot recover an interrupted upgrade
+  ansible.builtin.assert:
+    that:
+      - not billet_interrupted_upgrade | bool
+    fail_msg: >-
+      An interrupted billet upgrade is recorded at
+      /var/lib/billet/upgrades/active. Run the playbook without --check so the
+      role can prove both services stopped and restore the durable recovery
+      copy before applying any other host changes.
+  when: ansible_check_mode
+
+- name: Recover an interrupted billet upgrade before converging anything else
+  ansible.builtin.import_tasks: upgrade-recover.yml
+  when:
+    - billet_interrupted_upgrade | bool
+    - not ansible_check_mode
+
+- name: Require a fresh converge after interrupted-upgrade recovery
+  ansible.builtin.fail:
+    msg: >-
+      The interrupted billet upgrade was rolled back from
+      {{ billet_upgrade_recovery_dir }}. Rerun the playbook to start a fresh
+      transaction for the requested binary.
+  when:
+    - billet_interrupted_upgrade | bool
+    - not ansible_check_mode
 
 - name: Configure Firecracker
   ansible.builtin.import_tasks: firecracker.yml
