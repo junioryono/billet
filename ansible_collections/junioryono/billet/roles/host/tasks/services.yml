@@ -2,38 +2,6 @@
 - name: Apply unit changes before billet validation
   ansible.builtin.meta: flush_handlers
 
-- name: Inspect billet service drop-ins before the upgrade transaction
-  ansible.builtin.command:
-    argv:
-      - systemctl
-      - show
-      - --property=DropInPaths
-      - --value
-      - "{{ item }}"
-  loop:
-    - billet-server.service
-    - billet-node.service
-  register: billet_service_dropins_before_upgrade
-  changed_when: false
-  failed_when: billet_service_dropins_before_upgrade.rc != 0
-  check_mode: false
-  when:
-    - billet_binary_upgrade | default(false)
-    - not ansible_check_mode
-  become: true
-
-- name: Refuse service drop-ins the transaction cannot replace or recover
-  ansible.builtin.assert:
-    that:
-      - item.stdout | trim | length == 0
-    fail_msg: "{{ item.item }} has effective systemd drop-ins: {{ item.stdout | trim }}. Remove or fold them into the Billet-managed unit before upgrading; a drop-in can replace the quiescent readiness probe and let workload run before the transaction commits."
-  loop: "{{ billet_service_dropins_before_upgrade.results }}"
-  loop_control:
-    label: "{{ item.item }}"
-  when:
-    - billet_binary_upgrade | default(false)
-    - not ansible_check_mode
-
 - name: Inspect billet service state before the upgrade transaction
   ansible.builtin.command:
     argv:
@@ -410,6 +378,30 @@
     - name: Load candidate systemd units before starting either upgraded service
       ansible.builtin.systemd_service:
         daemon_reload: true
+
+    - name: Inspect candidate service drop-ins before readiness probes
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - show
+          - --property=DropInPaths
+          - --value
+          - "{{ item }}"
+      loop:
+        - billet-server.service
+        - billet-node.service
+      register: billet_candidate_service_dropins
+      changed_when: false
+      failed_when: billet_candidate_service_dropins.rc != 0
+
+    - name: Refuse candidate service drop-ins before readiness probes
+      ansible.builtin.assert:
+        that:
+          - item.stdout | trim | length == 0
+        fail_msg: "{{ item.item }} acquired effective systemd drop-ins before the readiness probe: {{ item.stdout | trim }}. The transaction will restore the previous host state rather than risk starting workload before commit."
+      loop: "{{ billet_candidate_service_dropins.results }}"
+      loop_control:
+        label: "{{ item.item }}"
 
     - name: Validate and migrate with the new billet binary as the only ledger writer
       ansible.builtin.command: /usr/bin/billet check --config /etc/billet/billet.yaml

@@ -40,8 +40,11 @@
         billet_recovery_cgroup_probe: "{{ billet_host_recovery_tasks | selectattr('name', 'equalto', 'Inspect service cgroups before recovering upgrade inputs') | first }}"
         billet_recovery_restore_inputs: "{{ billet_host_recovery_tasks | selectattr('name', 'equalto', 'Restore configuration and units that existed before the upgrade') | first }}"
         billet_recovery_candidate_links: "{{ billet_host_recovery_tasks | selectattr('name', 'equalto', 'Remove candidate persistent and runtime enablement links') | first }}"
-        billet_service_dropin_probe: "{{ billet_host_service_tasks | selectattr('name', 'equalto', 'Inspect billet service drop-ins before the upgrade transaction') | first }}"
-        billet_service_dropin_guard: "{{ billet_host_service_tasks | selectattr('name', 'equalto', 'Refuse service drop-ins the transaction cannot replace or recover') | first }}"
+        billet_service_dropin_reload: "{{ billet_host_account_tasks | selectattr('name', 'equalto', 'Reload systemd before inspecting host-upgrade service overlays') | first }}"
+        billet_service_dropin_probe: "{{ billet_host_account_tasks | selectattr('name', 'equalto', 'Inspect billet service drop-ins before the upgrade transaction') | first }}"
+        billet_service_dropin_guard: "{{ billet_host_account_tasks | selectattr('name', 'equalto', 'Refuse service drop-ins the transaction cannot replace or recover') | first }}"
+        billet_candidate_dropin_probe: "{{ billet_upgrade_task.block | selectattr('name', 'equalto', 'Inspect candidate service drop-ins before readiness probes') | first }}"
+        billet_candidate_dropin_guard: "{{ billet_upgrade_task.block | selectattr('name', 'equalto', 'Refuse candidate service drop-ins before readiness probes') | first }}"
         billet_service_link_guard: "{{ billet_host_service_tasks | selectattr('name', 'equalto', 'Refuse service link states rollback cannot reproduce exactly') | first }}"
         billet_legacy_transient_guard: "{{ billet_host_recovery_dispatch_tasks | selectattr('name', 'equalto', 'Refuse rollback of a legacy transient service definition') | first }}"
 
@@ -100,6 +103,10 @@
           - billet_main_names.index('Inspect a durable host-upgrade journal before normal convergence') < billet_main_names.index('Recover an interrupted billet upgrade before converging anything else')
           - billet_main_names.index('Recover an interrupted billet upgrade before converging anything else') < billet_main_names.index('Configure billet account and files')
           - billet_main_names.index('Configure billet account and files') < billet_main_names.index('Configure billet services')
+          - billet_account_names.index('Decide whether the billet binary needs a transactional upgrade') < billet_account_names.index('Reload systemd before inspecting host-upgrade service overlays')
+          - billet_account_names.index('Reload systemd before inspecting host-upgrade service overlays') < billet_account_names.index('Inspect billet service drop-ins before the upgrade transaction')
+          - billet_account_names.index('Inspect billet service drop-ins before the upgrade transaction') < billet_account_names.index('Refuse service drop-ins the transaction cannot replace or recover')
+          - billet_account_names.index('Refuse service drop-ins the transaction cannot replace or recover') < billet_account_names.index('Allocate a unique recovery directory before replacing upgrade inputs')
           - billet_top_level_names.index('Persist the host-upgrade recovery manifest before live mutation') < billet_top_level_names.index("Stage this transaction's atomic host-upgrade claim")
           - billet_top_level_names.index('Durably commit host-upgrade recovery inputs before publishing the pointer') < billet_top_level_names.index("Stage this transaction's atomic host-upgrade claim")
           - billet_top_level_names.index("Stage this transaction's atomic host-upgrade claim") < billet_top_level_names.index('Durably stage the atomic host-upgrade claim')
@@ -108,9 +115,11 @@
           - billet_top_level_names.index('Durably publish the active host-upgrade pointer before live mutation') < billet_top_level_names.index('Upgrade billet as one recoverable host transaction')
           - billet_top_level_names.index('Prove this transaction owns the host before live mutation') < billet_top_level_names.index('Upgrade billet as one recoverable host transaction')
           - billet_top_level_names.index('Prove every configured guest image is compatible with the candidate binary') < billet_top_level_names.index('Upgrade billet as one recoverable host transaction')
-          - billet_top_level_names.index('Refuse service drop-ins the transaction cannot replace or recover') < billet_top_level_names.index("Stage this transaction's atomic host-upgrade claim")
+          - billet_service_dropin_reload['ansible.builtin.systemd_service'].daemon_reload | bool
           - "'--property=DropInPaths' in billet_service_dropin_probe['ansible.builtin.command'].argv"
           - "'item.stdout | trim | length == 0' in billet_service_dropin_guard['ansible.builtin.assert'].that"
+          - "'--property=DropInPaths' in billet_candidate_dropin_probe['ansible.builtin.command'].argv"
+          - "'item.stdout | trim | length == 0' in billet_candidate_dropin_guard['ansible.builtin.assert'].that"
           - "'Type=exec' in billet_unsafe_override_dropin"
           - "'ExecStart=/usr/bin/billet node --config /etc/billet/billet.yaml' in billet_unsafe_override_dropin"
           - billet_unsafe_override_dropin | trim | length > 0
@@ -140,6 +149,7 @@
           - billet_steady_unit_install.vars.billet_systemd_notify_ready | bool
           - "'billet_installed_service_types' in (billet_ordinary_unit_install.vars.billet_systemd_notify_ready | string)"
           - billet_main_names.index('Recover an interrupted billet upgrade before converging anything else') < billet_main_names.index('Configure Firecracker')
+          - billet_main_names.index('Configure billet account and files') < billet_main_names.index('Configure Firecracker')
           - billet_main_names.index('Recover an interrupted billet upgrade before converging anything else') < billet_main_names.index('Configure guest networking')
           - billet_main_names.index('Recover an interrupted billet upgrade before converging anything else') < billet_main_names.index('Configure Ceph')
 
@@ -160,6 +170,9 @@
           - billet_upgrade_names.index('Commit the durable ledger snapshot before exposing the candidate') < billet_upgrade_names.index('Durably publish ledger snapshot completion before exposing the candidate')
           - billet_upgrade_names.index('Durably publish ledger snapshot completion before exposing the candidate') < billet_upgrade_names.index('Install the candidate billet binary after fencing and ledger preservation')
           - billet_upgrade_names.index('Install candidate configuration after preserving the stopped ledger') < billet_upgrade_names.index('Validate and migrate with the new billet binary as the only ledger writer')
+          - billet_upgrade_names.index('Load candidate systemd units before starting either upgraded service') < billet_upgrade_names.index('Inspect candidate service drop-ins before readiness probes')
+          - billet_upgrade_names.index('Inspect candidate service drop-ins before readiness probes') < billet_upgrade_names.index('Refuse candidate service drop-ins before readiness probes')
+          - billet_upgrade_names.index('Refuse candidate service drop-ins before readiness probes') < billet_upgrade_names.index('Validate and migrate with the new billet binary as the only ledger writer')
           - billet_upgrade_names.index('Validate and migrate with the new billet binary as the only ledger writer') < billet_upgrade_names.index('Start the quiescent upgraded server readiness probe')
           - billet_upgrade_names.index('Start the quiescent upgraded node readiness probe') < billet_upgrade_names.index('Inspect upgraded readiness-probe stability baseline')
           - billet_upgrade_names.index('Inspect upgraded readiness-probe stability baseline') < billet_upgrade_names.index('Observe upgraded readiness probes across the restart interval')

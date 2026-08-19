@@ -228,6 +228,46 @@
         )
       }}
 
+- name: Reload systemd before inspecting host-upgrade service overlays
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  when:
+    - billet_binary_upgrade | default(false)
+    - not ansible_check_mode
+  become: true
+
+- name: Inspect billet service drop-ins before the upgrade transaction
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - show
+      - --property=DropInPaths
+      - --value
+      - "{{ item }}"
+  loop:
+    - billet-server.service
+    - billet-node.service
+  register: billet_service_dropins_before_upgrade
+  changed_when: false
+  failed_when: billet_service_dropins_before_upgrade.rc != 0
+  check_mode: false
+  when:
+    - billet_binary_upgrade | default(false)
+    - not ansible_check_mode
+  become: true
+
+- name: Refuse service drop-ins the transaction cannot replace or recover
+  ansible.builtin.assert:
+    that:
+      - item.stdout | trim | length == 0
+    fail_msg: "{{ item.item }} has effective systemd drop-ins: {{ item.stdout | trim }}. Remove or fold them into the Billet-managed unit before upgrading; a drop-in can replace the quiescent readiness probe and let workload run before the transaction commits."
+  loop: "{{ billet_service_dropins_before_upgrade.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when:
+    - billet_binary_upgrade | default(false)
+    - not ansible_check_mode
+
 - name: Allocate a unique recovery directory before replacing upgrade inputs
   ansible.builtin.command:
     argv:
