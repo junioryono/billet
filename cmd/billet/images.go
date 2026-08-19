@@ -603,6 +603,11 @@ func checkGuestReport(body, secret string) error {
 		failures = append(failures, "the docker daemon did not answer on this kernel")
 	}
 
+	if !hasDockerStorageDriver(body, "overlay2") {
+		failures = append(failures, "docker is not using overlay2, so pulled image content can "+
+			"bypass the independently fenced /var/lib/docker cache")
+	}
+
 	if !hasBuildxVersion(body) {
 		failures = append(failures, "the Docker Buildx CLI plugin did not report a version")
 	}
@@ -651,6 +656,24 @@ func hasVersion(body, field string) bool {
 	}
 
 	return value[0] >= '0' && value[0] <= '9'
+}
+
+// hasDockerStorageDriver reports whether Docker named the backend required by
+// the image-store cache. The version and driver share one probe line so another
+// report field cannot satisfy this check accidentally.
+func hasDockerStorageDriver(body, want string) bool {
+	_, after, found := strings.Cut(body, "docker=")
+	if !found {
+		return false
+	}
+	line, _, _ := strings.Cut(after, "\n")
+	for _, field := range strings.Fields(line) {
+		if field == "storage="+want {
+			return true
+		}
+	}
+
+	return false
 }
 
 // hasBuildxVersion recognises upstream and distribution-packaged Buildx output.

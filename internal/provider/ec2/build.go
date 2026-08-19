@@ -490,6 +490,19 @@ func provisionScript(spec BuildSpec) (string, error) {
 
 	// Docker, git and tar are what a workflow cannot reasonably install itself.
 	b.WriteString("dnf install -y docker git tar jq e2fsprogs util-linux\n")
+	// Docker 29 defaults fresh installations to image content under
+	// /var/lib/containerd. The cache attaches one fenced filesystem at
+	// /var/lib/docker, so select the supported classic store before the daemon is
+	// enabled. Otherwise the cache publishes successfully without the images.
+	b.WriteString("install -d /etc/docker\n")
+	b.WriteString("cat > /etc/docker/daemon.json <<'BILLETDOCKERDAEMON'\n")
+	b.WriteString("{\n")
+	b.WriteString("  \"features\": {\n")
+	b.WriteString("    \"containerd-snapshotter\": false\n")
+	b.WriteString("  },\n")
+	b.WriteString("  \"storage-driver\": \"overlay2\"\n")
+	b.WriteString("}\n")
+	b.WriteString("BILLETDOCKERDAEMON\n")
 	// Amazon Linux does not package the Compose plugin. Pin Docker's release and
 	// its per-architecture digest instead of turning every AMI build into a fetch
 	// of whatever `latest` means that day.

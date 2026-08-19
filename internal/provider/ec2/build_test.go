@@ -41,6 +41,8 @@ func TestTheProvisionScriptContainsWhatAnImageNeeds(t *testing.T) {
 		{"f9ebc6ebdb19d769b793c245a736caaeb198c62587f13b25c660c13b4987f959", "the x64 Compose download needs a pinned digest"},
 		{"docker buildx version", "the image build must execute the packaged Buildx plugin"},
 		{"docker compose version", "the image build must execute the Compose plugin"},
+		{`"containerd-snapshotter": false`, "pulled images must stay inside the cache-backed Docker data root"},
+		{`"storage-driver": "overlay2"`, "the Docker cache snapshots the classic image store atomically"},
 		{"jq e2fsprogs util-linux", "the transparent Docker cache formats and verifies ext4"},
 		{"git", "actions/checkout wants it"},
 		{"tar", "actions/setup-* unpack what they download"},
