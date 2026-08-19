@@ -279,6 +279,11 @@ func stageImage(
 	if err != nil {
 		return nil, "", nil, err
 	}
+	client := &imagesource.Client{Source: src}
+	if err := client.Resolve(ctx); err != nil {
+		return nil, "", nil, err
+	}
+	src = client.Source
 
 	identity, issuer := opts.identity, opts.issuer
 
@@ -296,8 +301,6 @@ func stageImage(
 	if err != nil {
 		return nil, "", nil, err
 	}
-
-	client := &imagesource.Client{Source: src}
 
 	fmt.Printf("fetching %s\n", src.ManifestURL())
 
@@ -372,7 +375,7 @@ func resolveSource(cfg *config.Config, flagValue string) (imagesource.Source, er
 		return imagesource.ParseSource(cfg.Images.Source)
 	}
 
-	return imagesource.ParseSource(imagesource.DefaultBaseURL)
+	return imagesource.DefaultSource(), nil
 }
 
 // verifyLocal checks a sideloaded directory against its manifest.

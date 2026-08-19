@@ -30,6 +30,7 @@ jobs:
     timeout-minutes: 30
     permissions:
       # Creating the GitHub Release and uploading its archives.
+      attestations: read
       contents: write
     steps:
       - uses: actions/checkout@v6
@@ -64,6 +65,18 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # A workflow_call can build a maintained release branch whose tree predates
+      # this helper. Read it from the immutable commit that defined this job,
+      # never from moving main or from the release being verified.
+      - name: Check out release verification code
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .billet-release-tools
+          sparse-checkout: scripts/verify-release-attestation.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
       # Release immutability is a repository setting rather than workflow YAML.
       # Failing here makes that external precondition part of every release gate:
       # GitHub must have locked the tag and assets and issued their attestation.
@@ -71,4 +84,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
-        run: gh release verify "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}"
+        run: .billet-release-tools/scripts/verify-release-attestation.sh

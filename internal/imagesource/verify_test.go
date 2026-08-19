@@ -11,10 +11,7 @@ import (
 func defaultPolicy(t *testing.T) Policy {
 	t.Helper()
 
-	src, err := ParseSource(DefaultBaseURL)
-	if err != nil {
-		t.Fatalf("source: %v", err)
-	}
+	src := DefaultSource()
 
 	p, err := PolicyFor(src, "", "", false)
 	if err != nil {
@@ -177,10 +174,7 @@ func TestARealSignatureDoesNotSatisfyAnotherWorkflowsPolicy(t *testing.T) {
 		t.Skipf("no bundle fixture: %v", err)
 	}
 
-	src, err := ParseSource(DefaultBaseURL)
-	if err != nil {
-		t.Fatalf("source: %v", err)
-	}
+	src := DefaultSource()
 
 	other, err := PolicyFor(src,
 		`^https://github\.com/`+regexp.QuoteMeta(DefaultRepo)+`/\.github/workflows/ci\.yml@refs/heads/main$`,

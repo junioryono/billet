@@ -3,6 +3,7 @@ package imagesource
 import (
 	"fmt"
 	"net/url"
+	"regexp"
 	"strings"
 )
 
@@ -21,28 +22,22 @@ import (
 // registry in and then needed a second.
 const DefaultRepo = "junioryono/billet"
 
-// LatestTag is the release whose assets are replaced by each guest-image build.
+// DefaultChannelURL discovers the current immutable guest-image release.
 //
-// A FIXED TAG, NOT `/releases/latest/`. GitHub resolves `latest` across the WHOLE
-// repository, and this repository also publishes billet's own binaries — so
-// `/releases/latest/download/manifest.json` would resolve to whichever release
-// was cut most recently, and a binary release would silently take over the image
-// channel. The failure is not a 404 either: a node would fetch a manifest that
-// is simply absent and report a source with no images, on a source that has
-// them.
-//
-// Dated releases are still published for history and for pinning; this tag is
-// the moving pointer, which is what an unattended puller needs.
-const LatestTag = "guest-latest"
+// RELEASE IMMUTABILITY MAKES A MOVING RELEASE IMPOSSIBLE. A published release's
+// tag and assets cannot be replaced, so the old guest-latest release froze on its
+// first generation. The guest-channel branch carries a signed, expiring pointer;
+// the manifest and large assets still come from an immutable dated release, and
+// every byte is bound to the signed manifest afterward. raw.githubusercontent.com
+// avoids the API's per-address anonymous rate limit for fleets behind one NAT.
+const DefaultChannelURL = "https://raw.githubusercontent.com/" + DefaultRepo + "/guest-channel/current.json"
 
-// DefaultBaseURL is where this build looks for published guest images.
-//
-// A DOWNLOAD URL RATHER THAN THE API. It redirects straight to the asset with no
-// token and no api.github.com call. That matters because unauthenticated GitHub
-// API requests are limited to sixty an hour PER ORIGINATING ADDRESS, so
-// deployments sharing an egress address would spend each other's budget merely
-// asking what the current version is. Asset downloads are not on that limiter.
-const DefaultBaseURL = "https://github.com/" + DefaultRepo + "/releases/download/" + LatestTag
+// DefaultChannelBundleURL authenticates DefaultChannelURL.
+const DefaultChannelBundleURL = "https://raw.githubusercontent.com/" + DefaultRepo + "/guest-channel/current.sigstore.json"
+
+const defaultDownloadPrefix = "https://github.com/" + DefaultRepo + "/releases/download/"
+
+var guestReleasePattern = regexp.MustCompile(`^guest-\d{8}-\d{6}$`)
 
 // ManifestName is the index document within a release.
 const ManifestName = "manifest.json"
@@ -64,8 +59,28 @@ const BundleName = "manifest.sigstore.json"
 // Source names where images are fetched from.
 type Source struct {
 	// BaseURL is the directory the manifest and its assets sit in, without a
-	// trailing slash.
+	// trailing slash. It is populated by Client.Resolve for the default source.
 	BaseURL string
+
+	channelURL       string
+	channelBundleURL string
+	channelPolicy    *Policy
+	official         bool
+}
+
+// DefaultSource discovers the current immutable guest-image release published by
+// this project.
+func DefaultSource() Source {
+	return Source{
+		channelURL:       DefaultChannelURL,
+		channelBundleURL: DefaultChannelBundleURL,
+		official:         true,
+	}
+}
+
+// IsDefault reports whether this is billet's signed first-party image channel.
+func (s Source) IsDefault() bool {
+	return s.official
 }
 
 // ParseSource validates a configured base URL.
@@ -127,7 +142,16 @@ func ParseSource(raw string) (Source, error) {
 			"url; they would be repeated in every asset url and in any error naming one")
 	}
 
-	return Source{BaseURL: trimmed}, nil
+	return Source{
+		BaseURL:  trimmed,
+		official: isOfficialDatedSource(trimmed),
+	}, nil
+}
+
+func isOfficialDatedSource(raw string) bool {
+	tag, ok := strings.CutPrefix(raw, defaultDownloadPrefix)
+
+	return ok && guestReleasePattern.MatchString(tag)
 }
 
 // AssetURL is where a named file within the release lives.

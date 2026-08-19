@@ -10,10 +10,7 @@ import (
 // operator has to know: it is billet's own workflow, derived from the one constant
 // naming this project.
 func TestPolicyForTheDefaultSourceRequiresBilletsOwnIdentity(t *testing.T) {
-	src, err := ParseSource(DefaultBaseURL)
-	if err != nil {
-		t.Fatalf("source: %v", err)
-	}
+	src := DefaultSource()
 
 	p, err := PolicyFor(src, "", "", false)
 	if err != nil {

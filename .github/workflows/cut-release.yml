@@ -107,4 +107,5 @@ jobs:
     with:
       tag: ${{ needs.cut.outputs.tag }}
     permissions:
+      attestations: read
       contents: write

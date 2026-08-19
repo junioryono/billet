@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -22,6 +23,16 @@ import (
 // becomes a memory exhaustion.
 const MaxBundleBytes = 512 << 10
 
+// MaxChannelBytes bounds the first-party release pointer.
+const MaxChannelBytes = 4 << 10
+
+const (
+	channelSchema       = 1
+	channelPairAttempts = 2
+	maxChannelLifetime  = 10 * 24 * time.Hour
+	channelClockSkew    = 5 * time.Minute
+)
+
 // ErrNotFound is returned when the source has no such artifact.
 //
 // DISTINGUISHED FROM EVERY OTHER FAILURE because the callers act on it
@@ -37,6 +48,8 @@ type Client struct {
 
 	// Source is where artifacts are fetched from.
 	Source Source
+
+	verifyChannel func([]byte, []byte, Policy) error
 }
 
 // defaultHTTP is used when a caller supplies none.
@@ -88,6 +101,97 @@ func (c *Client) httpClient() *http.Client {
 	return defaultHTTP()
 }
 
+// Resolve discovers the immutable dated release behind the default channel.
+// Custom and already-resolved sources are unchanged.
+func (c *Client) Resolve(ctx context.Context) error {
+	if c.Source.channelURL == "" {
+		return nil
+	}
+
+	policy := Policy{}
+	var err error
+
+	if c.Source.channelPolicy != nil {
+		policy = *c.Source.channelPolicy
+	} else {
+		policy, err = PolicyFor(c.Source, "", "", false)
+		if err != nil {
+			return err
+		}
+	}
+
+	var body []byte
+	verify := VerifySignature
+
+	if c.verifyChannel != nil {
+		verify = c.verifyChannel
+	}
+
+	for attempt := 1; attempt <= channelPairAttempts; attempt++ {
+		body, err = c.get(ctx, c.Source.channelURL, MaxChannelBytes)
+		if err != nil {
+			return fmt.Errorf("imagesource: could not discover the current guest image: %w", err)
+		}
+
+		var signature []byte
+
+		if policy.Required {
+			signature, err = c.get(ctx, c.Source.channelBundleURL, MaxBundleBytes)
+			if err != nil {
+				return fmt.Errorf("imagesource: could not authenticate the guest-image channel: %w", err)
+			}
+		}
+		if err = verify(body, signature, policy); err == nil {
+			break
+		}
+		if attempt == channelPairAttempts {
+			return fmt.Errorf("imagesource: the guest-image channel is not authentic: %w", err)
+		}
+	}
+
+	var channel struct {
+		Schema           int       `json:"schema"`
+		Tag              string    `json:"tag"`
+		PublishedAt      time.Time `json:"published_at"`
+		ExpiresAt        time.Time `json:"expires_at"`
+		ReleaseImmutable bool      `json:"release_immutable"`
+	}
+	if err := json.Unmarshal(body, &channel); err != nil {
+		return fmt.Errorf("imagesource: the guest-image channel is invalid: %w", err)
+	}
+	if channel.Schema != channelSchema {
+		return fmt.Errorf("imagesource: the guest-image channel uses schema %d, want %d",
+			channel.Schema, channelSchema)
+	}
+	if !guestReleasePattern.MatchString(channel.Tag) {
+		return fmt.Errorf("imagesource: the guest-image channel names invalid release %q", channel.Tag)
+	}
+	if !channel.ReleaseImmutable {
+		return fmt.Errorf("imagesource: the guest-image channel does not attest that release %s is immutable", channel.Tag)
+	}
+	if channel.PublishedAt.IsZero() || channel.ExpiresAt.IsZero() ||
+		!channel.ExpiresAt.After(channel.PublishedAt) ||
+		channel.ExpiresAt.Sub(channel.PublishedAt) > maxChannelLifetime {
+		return fmt.Errorf("imagesource: the guest-image channel has an invalid validity window")
+	}
+	now := time.Now()
+	if channel.PublishedAt.After(now.Add(channelClockSkew)) {
+		return fmt.Errorf("imagesource: the guest-image channel claims a future publication time %s",
+			channel.PublishedAt.Format(time.RFC3339))
+	}
+	if !now.Before(channel.ExpiresAt) {
+		return fmt.Errorf("imagesource: the guest-image channel expired at %s; refusing a replayed pointer",
+			channel.ExpiresAt.Format(time.RFC3339))
+	}
+
+	c.Source = Source{
+		BaseURL:  defaultDownloadPrefix + channel.Tag,
+		official: true,
+	}
+
+	return nil
+}
+
 // Manifest fetches the index for the current release, proves it, and validates it.
 //
 // THE ONLY WAY A Manifest IS PRODUCED FROM THE NETWORK, and it takes a policy for
@@ -101,6 +205,10 @@ func (c *Client) httpClient() *http.Client {
 // program produced rather than the one that was signed, and the two can differ in
 // whitespace, key order, or any field a future reader drops.
 func (c *Client) Manifest(ctx context.Context, p Policy) (*Manifest, error) {
+	if err := c.Resolve(ctx); err != nil {
+		return nil, err
+	}
+
 	body, err := c.get(ctx, c.Source.ManifestURL(), MaxManifestBytes)
 	if err != nil {
 		return nil, err
@@ -179,6 +287,10 @@ func (c *Client) get(ctx context.Context, url string, limit int64) ([]byte, erro
 // bytes into shared storage. Staging costs one disk write and makes the failure
 // a deleted temporary file.
 func (c *Client) Download(ctx context.Context, asset Asset, dir string) (string, error) {
+	if err := c.Resolve(ctx); err != nil {
+		return "", err
+	}
+
 	if err := asset.validate("asset"); err != nil {
 		return "", err
 	}
