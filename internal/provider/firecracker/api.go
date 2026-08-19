@@ -51,6 +51,13 @@ func newVMMAPI(socket string) *vmmAPI {
 		http: &http.Client{
 			Timeout: apiTimeout,
 			Transport: &http.Transport{
+				// PROVIDER OPERATIONS CONSTRUCT INDEPENDENT CLIENTS for one VMM.
+				// Retaining an idle connection in each short-lived transport eventually
+				// reaches Firecracker's API connection limit, at which point a healthy
+				// guest refuses cache detach and its completed update is discarded.
+				// A fresh local unix connection per request is cheap and gives each
+				// operation a connection lifetime it can actually close.
+				DisableKeepAlives: true,
 				// THE ADDRESS IS IGNORED, WHICH IS THE POINT. Every request is
 				// written to `http://localhost/...` so net/http has a host to build a
 				// request line from, and the dialer sends it to this socket whatever
