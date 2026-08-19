@@ -830,9 +830,10 @@ func metadata(spec provider.Spec) (map[string]any, error) {
 // The agent compares this against what it was built for and stops with a message
 // naming both if they differ.
 //
-// BUMP IT WHEN THE SHAPE CHANGES — a renamed key, a new required field, a different
-// encoding — and republish the image in the same change. Adding an OPTIONAL key that
-// an older agent can ignore is not a change to the shape and does not need one.
+// BUMP IT WHEN THE SHAPE OR REQUIRED EXECUTION SURFACE CHANGES — a renamed key, a
+// new required field, a different encoding, a new host-selected command or a
+// required workflow tool — and republish the image in the same change. Adding an
+// OPTIONAL key that an older agent can ignore is not a contract change.
 //
 // Republishing is safe precisely because generations are immutable: a job holding a
 // clone of the old generation keeps the agent it booted with, and clone v2 lets the
