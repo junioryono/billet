@@ -47,8 +47,8 @@
       ansible.builtin.set_fact:
         billet_legacy_server_unit: "{{ lookup('ansible.builtin.template', playbook_dir + '/../roles/host/templates/billet-server.service.j2') }}"
         billet_legacy_node_unit: "{{ lookup('ansible.builtin.template', playbook_dir + '/../roles/host/templates/billet-node.service.j2') }}"
-        billet_transaction_server_unit: "{{ lookup('ansible.builtin.template', playbook_dir + '/../roles/host/templates/billet-server.service.j2', template_vars={'billet_systemd_notify_ready': true}) }}"
-        billet_transaction_node_unit: "{{ lookup('ansible.builtin.template', playbook_dir + '/../roles/host/templates/billet-node.service.j2', template_vars={'billet_systemd_notify_ready': true}) }}"
+        billet_transaction_server_unit: "{{ lookup('ansible.builtin.template', playbook_dir + '/../roles/host/templates/billet-server.service.j2', template_vars={'billet_systemd_notify_ready': true, 'billet_systemd_upgrade_probe': true}) }}"
+        billet_transaction_node_unit: "{{ lookup('ansible.builtin.template', playbook_dir + '/../roles/host/templates/billet-node.service.j2', template_vars={'billet_systemd_notify_ready': true, 'billet_systemd_upgrade_probe': true}) }}"
       vars:
         billet_service_user: billet
         billet_service_group: billet
@@ -92,10 +92,14 @@
           - "'NotifyAccess=main' in billet_node_unit"
           - "'Type=exec' in billet_legacy_server_unit"
           - "'Type=exec' in billet_legacy_node_unit"
+          - "'ExecStart=/usr/bin/billet server --config /etc/billet/billet.yaml\nTimeoutStartSec=120' in billet_legacy_server_unit"
+          - "'ExecStart=/usr/bin/billet node --config /etc/billet/billet.yaml\nTimeoutStartSec=120' in billet_legacy_node_unit"
           - "'NotifyAccess=main' not in billet_legacy_server_unit"
           - "'NotifyAccess=main' not in billet_legacy_node_unit"
           - "'Type=notify' in billet_transaction_server_unit"
           - "'Type=notify' in billet_transaction_node_unit"
+          - "'ExecStart=/usr/bin/billet server --config /etc/billet/billet.yaml --upgrade-probe\nTimeoutStartSec=120' in billet_transaction_server_unit"
+          - "'ExecStart=/usr/bin/billet node --config /etc/billet/billet.yaml --upgrade-probe\nTimeoutStartSec=120' in billet_transaction_node_unit"
           - "'NotifyAccess=main' in billet_transaction_server_unit"
           - "'NotifyAccess=main' in billet_transaction_node_unit"
           - billet_candidate_unit_stage.vars.billet_systemd_notify_ready | bool
