@@ -33,9 +33,22 @@
         billet_upgrade_stop_server: "{{ billet_upgrade_task.block | selectattr('name', 'equalto', 'Gracefully stop the billet server after compute has drained') | first }}"
         billet_upgrade_backup_ledger: "{{ billet_upgrade_task.block | selectattr('name', 'equalto', 'Preserve the stopped control-plane ledger') | first }}"
         billet_candidate_stage: "{{ billet_host_account_tasks | selectattr('name', 'equalto', 'Stage the immutable candidate binary inside its recovery journal') | first }}"
+        billet_candidate_unit_stage: "{{ billet_host_account_tasks | selectattr('name', 'equalto', 'Stage candidate systemd units for the upgrade transaction') | first }}"
+        billet_steady_unit_install: "{{ billet_upgrade_task.block | selectattr('name', 'equalto', 'Install steady-state units without the quiescent probe') | first }}"
         billet_recovery_stop_proof: "{{ billet_host_recovery_tasks | selectattr('name', 'equalto', 'Refuse recovery without conclusive process and cgroup evidence') | first }}"
         billet_recovery_cgroup_probe: "{{ billet_host_recovery_tasks | selectattr('name', 'equalto', 'Inspect service cgroups before recovering upgrade inputs') | first }}"
         billet_recovery_restore_inputs: "{{ billet_host_recovery_tasks | selectattr('name', 'equalto', 'Restore configuration and units that existed before the upgrade') | first }}"
+
+    - name: Render legacy-compatible and transactional units
+      ansible.builtin.set_fact:
+        billet_legacy_server_unit: "{{ lookup('ansible.builtin.template', playbook_dir + '/../roles/host/templates/billet-server.service.j2') }}"
+        billet_legacy_node_unit: "{{ lookup('ansible.builtin.template', playbook_dir + '/../roles/host/templates/billet-node.service.j2') }}"
+        billet_transaction_server_unit: "{{ lookup('ansible.builtin.template', playbook_dir + '/../roles/host/templates/billet-server.service.j2', template_vars={'billet_systemd_notify_ready': true}) }}"
+        billet_transaction_node_unit: "{{ lookup('ansible.builtin.template', playbook_dir + '/../roles/host/templates/billet-node.service.j2', template_vars={'billet_systemd_notify_ready': true}) }}"
+      vars:
+        billet_service_user: billet
+        billet_service_group: billet
+        billet_config: {}
 
     - name: Require durable recovery before any live host mutation
       ansible.builtin.assert:
@@ -43,6 +56,8 @@
           - "'Refuse unsafe billet state directories' in billet_inspection_names"
           - "'Refuse billet state paths with symlinked or noncanonical ancestors' in billet_inspection_names"
           - "'Refuse billet state paths that are symlinks or non-directories' in billet_inspection_names"
+          - billet_account_names.index('Refuse an implicit installed service identity migration') < billet_account_names.index('Create the billet service group')
+          - billet_account_names.index('Refuse an implicit installed service identity migration') < billet_account_names.index('Create billet directories')
           - billet_account_names.index('Refuse to move installed billet state implicitly') < billet_account_names.index('Render billet configuration')
           - billet_account_names.index('Create the upgrade recovery directory') < billet_account_names.index('Stage the immutable candidate binary inside its recovery journal')
           - billet_account_names.index('Stage the immutable candidate binary inside its recovery journal') < billet_account_names.index('Bind the host transaction to the inspected candidate digest')
@@ -65,10 +80,22 @@
           - "'BILLET_MAINTENANCE' not in billet_node_unit"
           - "'--upgrade-probe' in billet_server_unit"
           - "'--upgrade-probe' in billet_node_unit"
-          - "'Type=notify' in billet_server_unit"
-          - "'Type=notify' in billet_node_unit"
+          - "'billet_systemd_notify_ready' in billet_server_unit"
+          - "'billet_systemd_notify_ready' in billet_node_unit"
+          - "\"'notify' if billet_notify_ready else 'exec'\" in billet_server_unit"
+          - "\"'notify' if billet_notify_ready else 'exec'\" in billet_node_unit"
           - "'NotifyAccess=main' in billet_server_unit"
           - "'NotifyAccess=main' in billet_node_unit"
+          - "'Type=exec' in billet_legacy_server_unit"
+          - "'Type=exec' in billet_legacy_node_unit"
+          - "'NotifyAccess=main' not in billet_legacy_server_unit"
+          - "'NotifyAccess=main' not in billet_legacy_node_unit"
+          - "'Type=notify' in billet_transaction_server_unit"
+          - "'Type=notify' in billet_transaction_node_unit"
+          - "'NotifyAccess=main' in billet_transaction_server_unit"
+          - "'NotifyAccess=main' in billet_transaction_node_unit"
+          - billet_candidate_unit_stage.vars.billet_systemd_notify_ready | bool
+          - billet_steady_unit_install.vars.billet_systemd_notify_ready | bool
           - billet_main_names.index('Recover an interrupted billet upgrade before converging anything else') < billet_main_names.index('Configure Firecracker')
           - billet_main_names.index('Recover an interrupted billet upgrade before converging anything else') < billet_main_names.index('Configure guest networking')
           - billet_main_names.index('Recover an interrupted billet upgrade before converging anything else') < billet_main_names.index('Configure Ceph')
@@ -118,6 +145,7 @@
           - billet_recovery_names.index('Prove the durable ledger snapshot is valid before replacing current state') < billet_recovery_names.index('Remove current ledger entries before restoring a completed snapshot')
           - billet_recovery_names.index('Restore the previous control-plane ledger') < billet_recovery_names.index('Durably flush every restored host filesystem before rollback commit')
           - billet_recovery_names.index('Restore configuration and units that existed before the upgrade') < billet_recovery_names.index('Durably flush every restored host filesystem before rollback commit')
+          - billet_recovery_names.index('Remove candidate enablement links before restoring the previous topology') < billet_recovery_names.index('Restore runtime-only service enablement')
           - billet_recovery_names.index('Prove prior service enablement was restored exactly') < billet_recovery_names.index('Durably flush every restored host filesystem before rollback commit')
           - billet_recovery_names.index('Durably flush every restored host filesystem before rollback commit') < billet_recovery_names.index('Record the durable rollback commit before opening administration')
           - billet_recovery_names.index('Record the durable rollback commit before opening administration') < billet_recovery_names.index('Durably publish the rollback commit before opening administration')

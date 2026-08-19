@@ -492,6 +492,8 @@
       loop:
         - { src: billet-server.service.j2, dest: /etc/systemd/system/billet-server.service }
         - { src: billet-node.service.j2, dest: /etc/systemd/system/billet-node.service }
+      vars:
+        billet_systemd_notify_ready: true
 
     - name: Load steady-state units before opening administration
       ansible.builtin.systemd_service:

@@ -151,7 +151,7 @@ func (c *Client) UnmarkVerified(ctx context.Context, image string) (err error) {
 // whose newest generations have all failed verification has nothing to resolve to,
 // and the honest answer is to say so rather than to fall back to something unproven.
 func (c *Client) NewestVerified(ctx context.Context, image string) (Generation, bool, error) {
-	return c.newestVerified(ctx, image, "")
+	return c.newestGeneration(ctx, image, "", true)
 }
 
 // NewestVerifiedForContract resolves an image to the newest verified generation
@@ -169,12 +169,28 @@ func (c *Client) NewestVerifiedForContract(
 		return Generation{}, false, fmt.Errorf("ceph: no guest contract to resolve %s against", image)
 	}
 
-	return c.newestVerified(ctx, image, contract)
+	return c.newestGeneration(ctx, image, contract, true)
 }
 
-func (c *Client) newestVerified(
+// NewestForContract resolves an image to the newest live generation that records
+// one exact host/guest protocol, whether or not that generation is verified yet.
+// Upgrade compatibility checks use it to boot-verify an already imported image
+// instead of requiring a redundant download.
+func (c *Client) NewestForContract(
 	ctx context.Context,
 	image, contract string,
+) (Generation, bool, error) {
+	if strings.TrimSpace(contract) == "" {
+		return Generation{}, false, fmt.Errorf("ceph: no guest contract to resolve %s against", image)
+	}
+
+	return c.newestGeneration(ctx, image, contract, false)
+}
+
+func (c *Client) newestGeneration(
+	ctx context.Context,
+	image, contract string,
+	verifiedOnly bool,
 ) (Generation, bool, error) {
 	name, _, _ := strings.Cut(strings.TrimSpace(image), "@")
 	if name == "" {
@@ -242,10 +258,10 @@ func (c *Client) newestVerified(
 		found  bool
 	)
 
-	for generation := range verified {
+	for generation := range live {
 		gen, _ := ParseGeneration(generation)
 
-		if !live[gen.Name] {
+		if verifiedOnly && !verified[gen.Name] {
 			continue
 		}
 		if contract != "" && contracts[gen.Name] != contract {

@@ -5,9 +5,12 @@ After=network-online.target billet-network.service
 Requires=billet-network.service
 Wants=network-online.target
 
+{% set billet_notify_ready = billet_systemd_notify_ready | default(false) %}
 [Service]
-Type=notify
+Type={{ 'notify' if billet_notify_ready else 'exec' }}
+{% if billet_notify_ready %}
 NotifyAccess=main
+{% endif %}
 User=root
 Group=root
 ExecStart=/usr/bin/billet node --config /etc/billet/billet.yaml{% if billet_systemd_upgrade_probe | default(false) %} --upgrade-probe{% endif %}

@@ -282,6 +282,22 @@
     daemon_reload: true
   become: true
 
+- name: Remove candidate enablement links before restoring the previous topology
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - disable
+      - "{{ item.name }}"
+  loop:
+    - name: billet-server.service
+      enablement: "{{ billet_upgrade_manifest.server_enablement }}"
+    - name: billet-node.service
+      enablement: "{{ billet_upgrade_manifest.node_enablement }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: item.enablement != 'not-found'
+  become: true
+
 - name: Restore persistent service enablement
   ansible.builtin.command:
     argv:

@@ -151,19 +151,30 @@ func checkImageCompatible(
 			return err
 		}
 		if !ok {
-			// A GENERATION VERIFIED BEFORE CONTRACT METADATA EXISTED GETS ONE REAL
-			// compatibility boot instead of forcing a multi-gigabyte replacement.
-			newest, ok, err = store.NewestVerified(ctx, name)
+			newest, ok, err = store.NewestForContract(ctx, name, firecracker.GuestContract)
 			if err != nil {
 				return err
 			}
-			if !ok {
-				return incompatibleGuest(image, "no generation has passed verification")
-			}
-		}
+			if ok {
+				generation = newest.Name
+			} else {
+				// A GENERATION VERIFIED BEFORE CONTRACT METADATA EXISTED GETS ONE REAL
+				// compatibility boot instead of forcing a multi-gigabyte replacement.
+				newest, ok, err = store.NewestVerified(ctx, name)
+				if err != nil {
+					return err
+				}
+				if !ok {
+					return incompatibleGuest(image, "no generation has passed verification")
+				}
 
-		generation = newest.Name
-		verified = true
+				generation = newest.Name
+				verified = true
+			}
+		} else {
+			generation = newest.Name
+			verified = true
+		}
 	} else {
 		generations, err := store.Generations(ctx, name)
 		if err != nil {

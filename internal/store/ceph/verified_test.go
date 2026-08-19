@@ -106,6 +106,25 @@ func TestNewestVerifiedForContractDoesNotTrustMissingContractMetadata(t *testing
 	}
 }
 
+func TestNewestForContractFindsAnUnverifiedImportedGeneration(t *testing.T) {
+	f := &verifiedFake{
+		meta: []string{
+			GuestContractKey + ".g20260814072427  7",
+			GuestContractKey + ".g20260815033431  7",
+		},
+		snapshots: []string{"g20260814072427", "g20260815033431"},
+	}
+
+	got, found, err := verifiedClient(t, f).NewestForContract(
+		t.Context(), "ubuntu-2404-x64", "7")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if !found || got.Name != "g20260815033431" {
+		t.Fatalf("matching imported generation = %q, found %v", got.Name, found)
+	}
+}
+
 // verifiedFake answers the two questions NewestVerified asks: which keys the image
 // carries, and which snapshots actually exist.
 type verifiedFake struct {

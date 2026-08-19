@@ -5,6 +5,57 @@
     key: "{{ billet_service_user }}"
     fail_key: false
 
+- name: Inspect the installed billet server unit before account mutation
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - show
+      - --property=LoadState
+      - --value
+      - billet-server.service
+  register: billet_installed_server_unit_load_state
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  become: true
+
+- name: Inspect the installed billet server identity before account mutation
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - show
+      - "--property={{ item }}"
+      - --value
+      - billet-server.service
+  loop:
+    - User
+    - Group
+  register: billet_installed_server_identity
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  become: true
+
+- name: Refuse an implicit installed service identity migration
+  ansible.builtin.assert:
+    that:
+      - billet_installed_server_unit_load_state.rc == 0
+      - >-
+        billet_installed_server_unit_load_state.stdout | trim == 'not-found' or
+        (
+          billet_installed_server_identity.results[0].rc == 0 and
+          billet_installed_server_identity.results[1].rc == 0 and
+          billet_installed_server_identity.results[0].stdout | trim == billet_service_user and
+          billet_installed_server_identity.results[1].stdout | trim == billet_service_group
+        )
+    fail_msg: >-
+      The installed billet server runs as
+      {{ billet_installed_server_identity.results[0].stdout | trim }}:{{
+      billet_installed_server_identity.results[1].stdout | trim }}, not the
+      requested {{ billet_service_user }}:{{ billet_service_group }}. Move the
+      ledger and credentials during an explicit offline identity migration;
+      the host role will not change ownership before a recoverable transaction.
+
 - name: Refuse to adopt an unrelated existing account
   ansible.builtin.assert:
     that:
@@ -334,6 +385,7 @@
     - not ansible_check_mode
   vars:
     billet_systemd_upgrade_probe: true
+    billet_systemd_notify_ready: true
 
 - name: Install the billet systemd units
   ansible.builtin.template:
