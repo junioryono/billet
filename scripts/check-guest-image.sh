@@ -72,6 +72,7 @@ pass() { echo "  ok    $*"; }
 # --- the runner ------------------------------------------------------------
 
 RUNNER_DIR="$MNT/home/runner/runner"
+RUNNER_WORK="$RUNNER_DIR/_work"
 
 if [ -x "$RUNNER_DIR/run.sh" ]; then
 	pass "the actions runner is installed"
@@ -84,6 +85,18 @@ if [ -x "$RUNNER_DIR/billet-runner-service" ] &&
 	pass "the runner service preserves authoritative one-job results"
 else
 	fail "the runner service wrapper is absent or masks the one-job result codes"
+fi
+
+runner_ids=$(awk -F: '$1 == "runner" {print $3 ":" $4}' "$MNT/etc/passwd")
+work_ids=""
+if [ -d "$RUNNER_WORK" ]; then
+	work_ids=$(stat -c '%u:%g' "$RUNNER_WORK")
+fi
+if [ -n "$runner_ids" ] && [ "$work_ids" = "$runner_ids" ]; then
+	pass "the runner work directory belongs to the runner account"
+else
+	fail "the runner work directory belongs to ${work_ids:-no account}, not
+        ${runner_ids:-the missing runner account}; the runner cannot initialize a job"
 fi
 
 AGENT="$MNT/usr/local/bin/billet-agent"
