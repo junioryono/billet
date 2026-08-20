@@ -863,7 +863,7 @@ func metadata(spec provider.Spec) (map[string]any, error) {
 // Republishing is safe precisely because generations are immutable: a job holding a
 // clone of the old generation keeps the agent it booted with, and clone v2 lets the
 // old generation be removed once nothing holds it.
-const GuestContract = "8"
+const GuestContract = "9"
 
 // mmdsSizeLimit is how much the metadata service will hold.
 //

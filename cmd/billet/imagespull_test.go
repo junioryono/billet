@@ -106,8 +106,8 @@ func TestCurrentBinaryRejectsAPreComposeGuest(t *testing.T) {
 	_, manifest := stageDir(t, []byte("rootfs"), []byte("kernel"))
 	manifest.GuestContract = "5"
 
-	if firecracker.GuestContract != "8" {
-		t.Fatalf("the current image requirements speak contract %q, want 8",
+	if firecracker.GuestContract != "9" {
+		t.Fatalf("the current image requirements speak contract %q, want 9",
 			firecracker.GuestContract)
 	}
 	if err := manifest.Usable(firecracker.GuestContract, "x86_64"); err == nil {
@@ -121,8 +121,8 @@ func TestCurrentBinaryRejectsAPreOverlay2Guest(t *testing.T) {
 	_, manifest := stageDir(t, []byte("rootfs"), []byte("kernel"))
 	manifest.GuestContract = "6"
 
-	if firecracker.GuestContract != "8" {
-		t.Fatalf("the overlay2 image change speaks contract %q, want 8",
+	if firecracker.GuestContract != "9" {
+		t.Fatalf("the overlay2 image change speaks contract %q, want 9",
 			firecracker.GuestContract)
 	}
 	if err := manifest.Usable(firecracker.GuestContract, "x86_64"); err == nil {
@@ -136,12 +136,28 @@ func TestCurrentBinaryRejectsAPreActionsInterceptionGuest(t *testing.T) {
 	_, manifest := stageDir(t, []byte("rootfs"), []byte("kernel"))
 	manifest.GuestContract = "7"
 
-	if firecracker.GuestContract != "8" {
-		t.Fatalf("the Actions interception image change speaks contract %q, want 8",
+	if firecracker.GuestContract != "9" {
+		t.Fatalf("the Actions interception image change speaks contract %q, want 9",
 			firecracker.GuestContract)
 	}
 	if err := manifest.Usable(firecracker.GuestContract, "x86_64"); err == nil {
 		t.Fatal("a contract-7 image without Actions proxy propagation was accepted")
+	}
+}
+
+// Contract 8 images let the root guest agent auto-create the runner's _work
+// parent. GNU install leaves that implicit parent root-owned, so the unprivileged
+// runner cannot initialize _work/_temp and fails before the first workflow step.
+func TestCurrentBinaryRejectsAGuestWithoutAWritableRunnerWorkDirectory(t *testing.T) {
+	_, manifest := stageDir(t, []byte("rootfs"), []byte("kernel"))
+	manifest.GuestContract = "8"
+
+	if firecracker.GuestContract != "9" {
+		t.Fatalf("the writable runner work-directory change speaks contract %q, want 9",
+			firecracker.GuestContract)
+	}
+	if err := manifest.Usable(firecracker.GuestContract, "x86_64"); err == nil {
+		t.Fatal("a contract-8 image with a root-owned runner work directory was accepted")
 	}
 }
 
