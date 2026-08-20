@@ -98,6 +98,7 @@ def relay(client, remote, remote_buffer):
 
 def handle(client, upstream):
     remote = None
+    established = False
     try:
         client.settimeout(CONNECT_TIMEOUT)
         request, remainder = read_headers(client)
@@ -109,15 +110,24 @@ def handle(client, upstream):
             raise ValueError("only CONNECT is supported")
         host, port = parse_authority(authority)
         remote, remote_buffer = connect(upstream, host, port, authority)
+        # Marked established BEFORE the write, not after: a sendall that fails
+        # partway has already put bytes of the 200 on the wire, and appending a
+        # 502 to a half-written status line is the corruption the flag prevents.
+        established = True
         client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         client.settimeout(None)
         remote.settimeout(None)
         relay(client, remote, remote_buffer)
     except (ConnectionError, OSError, UnicodeError, ValueError):
-        try:
-            client.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
-        except OSError:
-            pass
+        # Only before the tunnel is established. Past that point the client is
+        # mid-TLS with its peer, and a plaintext 502 injected into that stream
+        # is read as TLS corruption ("wrong version number") rather than as an
+        # answer; a failed relay ends with a plain close instead.
+        if not established:
+            try:
+                client.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+            except OSError:
+                pass
     finally:
         client.close()
         if remote is not None:
