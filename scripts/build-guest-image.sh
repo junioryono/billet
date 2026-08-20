@@ -405,7 +405,7 @@ EOF
 		export DEBIAN_FRONTEND=noninteractive
 		apt-get update -qq
 		apt-get install -y --no-install-recommends \
-			ca-certificates curl iproute2 iptables jq git sudo \
+			ca-certificates curl iproute2 iptables jq git sudo dnsmasq-base \
 			docker.io docker-buildx docker-compose-v2 e2fsprogs util-linux systemd-resolved netplan.io libicu74 \
 			unzip zip zstd tar wget rsync build-essential
 		apt-get clean
@@ -424,7 +424,8 @@ EOF
   "features": {
     "containerd-snapshotter": false
   },
-  "storage-driver": "overlay2"
+  "storage-driver": "overlay2",
+  "bip": "172.17.0.1/16"
 }
 DOCKER
 
@@ -524,6 +525,8 @@ IMAGEINFO
 		"$rootfs/usr/local/bin/billet-docker-cache"
 	install -m 0755 "$SCRIPT_DIR/../internal/guestassets/actions-proxy.py" \
 		"$rootfs/usr/local/bin/billet-actions-proxy"
+	install -m 0755 "$SCRIPT_DIR/../internal/guestassets/dns-upstreams.py" \
+		"$rootfs/usr/local/bin/billet-dns-upstreams"
 	install -m 0755 /dev/stdin "$rootfs/usr/local/bin/billet-agent" <<'AGENT'
 #!/bin/bash
 # Read this microVM's runner registration out of the metadata service and start the
@@ -623,13 +626,16 @@ if candidate=$(fetch registry-mirrors 2>/dev/null); then
 	' >/dev/null 2>&1 <<<"$candidate"; then
 		registry_mirrors_json=$candidate
 		docker_mirror=$(jq -r '.["docker.io"]' <<<"$registry_mirrors_json")
-		daemon_base='{}'
-		if [ -f /etc/docker/daemon.json ]; then
-			daemon_base=$(cat /etc/docker/daemon.json)
-		fi
-		if rendered=$(jq -c --arg mirror "$docker_mirror" \
-			'if type == "object" then . + {"registry-mirrors": [$mirror]} else error("not an object") end' \
-			<<<"$daemon_base") && printf '%s\n' "$rendered" >/run/billet-docker-daemon.json &&
+		# Merge ONLY onto the existing config read successfully. Replacing an
+		# unreadable daemon.json with {} would discard the baked-in storage-driver,
+		# containerd-snapshotter and bip -- breaking the cache mount and the pinned
+		# gateway -- for the sake of one optional setting. On any read failure the
+		# file is left untouched and the job pulls directly. (cat in the `if` keeps
+		# set -e from exiting the agent on that failure.)
+		if daemon_base=$(cat /etc/docker/daemon.json 2>/dev/null) && [ -n "$daemon_base" ] &&
+			rendered=$(jq -c --arg mirror "$docker_mirror" \
+				'if type == "object" then . + {"registry-mirrors": [$mirror]} else error("not an object") end' \
+				<<<"$daemon_base") && printf '%s\n' "$rendered" >/run/billet-docker-daemon.json &&
 			install -m 0644 /run/billet-docker-daemon.json /etc/docker/daemon.json; then
 			:
 		else
@@ -666,13 +672,23 @@ fi
 # address carries this guest's cache-session identity and the CA is unique to the
 # node, so both arrive through MMDS and live only on this job's ephemeral root disk.
 # The bundle includes the distribution roots because SSL_CERT_FILE replaces rather
-# than augments that set for clients which honour it. The runner reads proxy settings
-# from its launch environment, while a job-started hook copies the trust bundle into
-# RUNNER_TEMP and publishes all four variables through GITHUB_ENV. The official
+# than augments that set for clients which honour it. Interception reaches the
+# runner and its containers by a DNS remap of the one results origin, not a proxy
+# variable; a job-started hook copies the trust bundle into RUNNER_TEMP and
+# publishes NODE_EXTRA_CA_CERTS and SSL_CERT_FILE through GITHUB_ENV. The official
 # runner translates that mounted path independently for job and action containers.
+#
+# THE DOCKER GATEWAY IS FIXED so the value written into daemon.json before docker
+# starts matches the address the listeners bind after it. It is pinned by "bip" in
+# the build-time daemon.json; docker0 carries it once the daemon is up.
+docker_gateway=172.17.0.1
 actions_proxy=""
 actions_ca_path=""
 actions_hook_path=""
+# Initialized here, not only inside the interception branch: it is read
+# unconditionally after Docker starts, and an untrusted job -- which gets no
+# interception metadata -- would otherwise hit it unset under `set -u` and die.
+container_dns_active=""
 if actions_proxy_candidate=$(fetch actions-proxy 2>/dev/null) &&
 	actions_ca_candidate=$(fetch actions-ca-pem 2>/dev/null) &&
 	[ -n "$actions_proxy_candidate" ] && [ -n "$actions_ca_candidate" ]; then
@@ -690,11 +706,18 @@ if actions_proxy_candidate=$(fetch actions-proxy 2>/dev/null) &&
 #!/bin/sh
 set -eu
 
+# ONLY THE CA TRAVELS THROUGH THE HOOK NOW, not a proxy. Interception is
+# delivered by a DNS remap of the one results origin (see the guest agent), so
+# there is no HTTPS_PROXY to publish: publishing one would route every request
+# the runner and its job containers make -- action downloads, toolchains,
+# artifact blob uploads -- through a single guest relay, which is exactly the
+# funnel this design removed. The runner still needs the node's certificate to
+# trust the intercepted origin, and job and action containers do not inherit the
+# guest trust store, so the CA is copied into RUNNER_TEMP and published where the
+# runner mounts it into those containers.
 target="$RUNNER_TEMP/billet-actions-cache-ca.pem"
 install -m 0444 "$BILLET_ACTIONS_CA_SOURCE" "$target"
 {
-	printf 'HTTPS_PROXY=%s\n' "$BILLET_ACTIONS_PROXY"
-	printf 'https_proxy=%s\n' "$BILLET_ACTIONS_PROXY"
 	printf 'NODE_EXTRA_CA_CERTS=%s\n' "$target"
 	printf 'SSL_CERT_FILE=%s\n' "$target"
 } >>"$GITHUB_ENV"
@@ -702,6 +725,74 @@ ACTIONS_HOOK
 	chown runner:runner "$actions_hook_path"
 	chmod 0555 "$actions_hook_path"
 	actions_proxy=$actions_proxy_candidate
+
+	# THE NODE CA JOINS THE GUEST SYSTEM TRUST STORE, not only the runner's env.
+	# The DNS remap captures EVERY process in the guest, including dockerd and the
+	# BuildKit it embeds, which resolve the results origin through /etc/hosts and
+	# trust only the system store. Without the CA there they would fail the TLS
+	# handshake against the node's leaf where before they went direct to GitHub --
+	# so `type=gha` cache export/import would break rather than pass through. The
+	# runner's own SSL_CERT_FILE and the container hook stay as they are; this adds
+	# the daemon-side clients the proxy variable used to leave untouched. (A buildx
+	# `docker-container` builder runs BuildKit in its own image with its own store
+	# and is not reached by this; see docs/actions-cache.md.)
+	# Best effort, and deliberately NOT a gate on interception. The runner and the
+	# job/action containers trust the node leaf through their own NODE_EXTRA_CA_CERTS
+	# bundle, so their cache and artifact traffic is unaffected if this fails. The
+	# only clients that depend on the system store are daemon-side ones reaching the
+	# remapped origin -- BuildKit's type=gha -- which is already the measured
+	# limitation the conformance buildkit-gha lane covers; a failure here degrades
+	# that one path to it rather than the whole cache, so it must not disable the remap.
+	install -d -m 0755 /usr/local/share/ca-certificates
+	if printf '%s\n' "$actions_ca_candidate" \
+		>/usr/local/share/ca-certificates/billet-actions-cache.crt &&
+		update-ca-certificates >/dev/null 2>&1; then
+		:
+	else
+		log "the node CA could not be added to the system trust store; daemon-side type=gha builds fall to the measured limitation, runner and container caches are unaffected"
+	fi
+
+	# CONTAINER DNS IS POINTED AT THE GUEST RESOLVER BEFORE DOCKER STARTS. dockerd
+	# reads daemon.json only at start and does not reload "dns" on SIGHUP, so this
+	# has to land now -- the same window the registry-mirror merge above uses --
+	# not after the daemon is running. The gateway is pinned by "bip", so its
+	# address is known here even though docker0 does not exist yet.
+	#
+	# THE LIST IS FAIL-SAFE ONLY IF IT HAS A REAL UPSTREAM to fall through to, so
+	# it is built ONLY when at least one non-stub upstream is found: [gateway,
+	# ...upstreams]. If the guest resolver is later down, a container's query is
+	# refused on the gateway and falls through to those upstreams unchanged -- a
+	# missed cache remap, never broken container DNS. With no real upstream the
+	# merge is skipped entirely and containers keep resolving through the host's
+	# own resolver as before, rather than being pinned to a resolver-only-of-one.
+	# Every step is guarded because this runs under `set -e`: a malformed resolver
+	# file must degrade the cache, never abort the agent before the runner starts.
+	# billet-dns-upstreams validates and orders the list ([gateway, ...upstreams]),
+	# emitting nothing when no real upstream survives -- the one place a value dockerd
+	# would reject is kept out of daemon.json. Its filtering is behavior-tested; the
+	# guard here just refuses to touch daemon.json unless it produced a usable list.
+	upstream_resolv=/run/systemd/resolve/resolv.conf
+	if [ ! -s "$upstream_resolv" ]; then
+		upstream_resolv=/etc/resolv.conf
+	fi
+	if dns_json=$(/usr/local/bin/billet-dns-upstreams "$docker_gateway" "$upstream_resolv" 2>/dev/null) &&
+		[ -n "$dns_json" ]; then
+		# Merge ONLY onto the existing config read successfully -- replacing an
+		# unreadable daemon.json with {} would discard the baked-in storage-driver,
+		# containerd-snapshotter and bip. On a read failure, leave it untouched and do
+		# not activate the container remap. (cat in the `if` keeps set -e from exiting.)
+		if daemon_base=$(cat /etc/docker/daemon.json 2>/dev/null) && [ -n "$daemon_base" ] &&
+			rendered=$(jq -c --argjson dns "$dns_json" \
+				'if type == "object" then . + {"dns": $dns} else error("not an object") end' \
+				<<<"$daemon_base" 2>/dev/null) &&
+			printf '%s\n' "$rendered" >/run/billet-docker-daemon.json &&
+			install -m 0644 /run/billet-docker-daemon.json /etc/docker/daemon.json; then
+			container_dns_active=1
+		fi
+	fi
+	if [ -z "$container_dns_active" ]; then
+		log "container cache DNS was not configured; containers will use GitHub's cache directly"
+	fi
 fi
 
 # Docker is deliberately not enabled at boot. Starting it only after the cache
@@ -711,34 +802,106 @@ if ! /usr/local/bin/billet-docker-cache prepare; then
 	exit 1
 fi
 
-# A GUEST-LOCAL FORWARDER IS THE FAIL-OPEN BOUNDARY. Sending HTTPS_PROXY straight
-# to the node would make every HTTPS request depend on that listener. This helper
-# tunnels ordinary destinations directly and tries the authenticated node proxy
-# only for the Actions results origin; if that connection cannot be established,
-# it connects to GitHub directly. systemd restarts the helper if it exits, and an
-# individual cache request made during that restart degrades to the cache action's
-# normal warning rather than taking later workflow traffic down with it.
-actions_guest_proxy=""
+# INTERCEPTION IS DELIVERED BY A DNS REMAP OF ONE HOST, not a catch-all proxy.
+# The results origin resolves to a guest-local transparent passthrough that
+# tunnels to the node; every other destination resolves normally and goes direct.
+# That routing is the whole point: an HTTPS_PROXY funnels ALL of the runner's
+# traffic through one guest relay, and bulk transfers -- action tarballs,
+# toolchains, artifact blob uploads -- stall and corrupt through it while small
+# cache calls survive. The node still terminates TLS and decides handle-or-splice
+# per request, so nothing about the interception itself changes here.
+#
+# THE FORWARDER BINDS THE DOCKER GATEWAY so the runner and job/service containers
+# reach it at one address. The runner is remapped through /etc/hosts; containers
+# do not inherit /etc/hosts, so a guest dnsmasq bound to the same gateway answers
+# their queries and dockerd is pointed at it. Everything dnsmasq does not remap it
+# forwards to the real upstream, so container egress is unaffected.
+actions_cache_active=""
 if [ -n "$actions_proxy" ] && [ -n "$actions_ca_path" ] && [ -n "$actions_hook_path" ]; then
-	python_runtime=$(find /opt/hostedtoolcache/Python -path '*/x64/bin/python' -type f -o \
-		-path '*/x64/bin/python' -type l 2>/dev/null | sort -V | tail -1)
-	docker_bridge=$(ip -4 -o addr show docker0 2>/dev/null | awk 'NR == 1 {split($4, a, "/"); print a[1]}')
-	if [ -n "$python_runtime" ] && [ -n "$docker_bridge" ] &&
+	# These probes run under `set -o pipefail`, so a missing toolcache directory or a
+	# docker0 that is not up would otherwise fail the pipeline and EXIT the agent.
+	# `if ! x=$(...); then x=""` contains that AND guarantees the variable is empty on
+	# failure, so the guard below skips interception -- a job on GitHub's cache
+	# directly, never a dead job.
+	if ! python_runtime=$(find /opt/hostedtoolcache/Python -path '*/x64/bin/python' -type f -o \
+		-path '*/x64/bin/python' -type l 2>/dev/null | sort -V | tail -1); then
+		python_runtime=""
+	fi
+	# docker0 must carry the pinned gateway, or the listeners would bind an address
+	# daemon.json's dns list does not name and containers could not reach them.
+	if ! docker_bridge=$(ip -4 -o addr show docker0 2>/dev/null |
+		awk 'NR == 1 {split($4, a, "/"); print a[1]}'); then
+		docker_bridge=""
+	fi
+	# Resolve the REAL results origin NOW, while its name still resolves to GitHub --
+	# the /etc/hosts remap below repoints it at this listener. These addresses are
+	# the passthrough's fail-open path: if the node cannot take a tunnel, the
+	# client's TLS is relayed straight to GitHub so its cache call misses but the
+	# artifact, log-archive and step traffic sharing this origin keeps working. The
+	# gateway is excluded so a pre-existing remap cannot make the fallback a loop.
+	#
+	# A NON-EMPTY FALLBACK IS REQUIRED to activate: without it a later node outage
+	# has nowhere to fail open to and the passthrough would close mid-TLS clients,
+	# failing the artifact and log traffic that shares this origin. If resolution
+	# yields nothing, interception is not activated and every origin stays direct.
+	if ! results_fallback=$(getent ahostsv4 results-receiver.actions.githubusercontent.com 2>/dev/null |
+		awk -v gateway="$docker_gateway" '$1 != gateway {print $1}' | sort -u | paste -sd, -); then
+		results_fallback=""
+	fi
+	if [ -n "$python_runtime" ] && [ "$docker_bridge" = "$docker_gateway" ] && [ -n "$results_fallback" ] &&
 		systemd-run --quiet --unit=billet-actions-proxy --collect --uid=runner --gid=runner \
 			--property=Restart=always --property=RestartSec=100ms \
+			--property=AmbientCapabilities=CAP_NET_BIND_SERVICE \
 			"$python_runtime" /usr/local/bin/billet-actions-proxy \
-			--listen "$docker_bridge:7719" --upstream "$actions_proxy"; then
+			--listen "$docker_gateway:443" --upstream "$actions_proxy" \
+			--fallback-addr "$results_fallback"; then
 		for _ in $(seq 1 50); do
-			if (: </dev/tcp/"$docker_bridge"/7719) 2>/dev/null; then
-				actions_guest_proxy="http://$docker_bridge:7719"
+			if (: </dev/tcp/"$docker_gateway"/443) 2>/dev/null; then
+				actions_cache_active=1
 				break
 			fi
 			sleep 0.1
 		done
 	fi
-	if [ -z "$actions_guest_proxy" ]; then
-		log "the fail-open Actions proxy did not start; this job will use GitHub's cache directly"
+	if [ -z "$actions_cache_active" ]; then
+		log "the Actions cache passthrough did not start (or the origin did not resolve); this job will use GitHub's cache directly"
 		systemctl stop billet-actions-proxy.service 2>/dev/null || true
+	fi
+fi
+
+# THE RUNNER RESOLVES THE RESULTS ORIGIN THROUGH /etc/hosts, and only that one
+# name. Every other host is untouched, so the runner's action, toolchain and
+# artifact-blob traffic resolves normally and never reaches the passthrough.
+if [ -n "$actions_cache_active" ]; then
+	printf '%s results-receiver.actions.githubusercontent.com\n' "$docker_gateway" >>/etc/hosts
+fi
+
+# CONTAINERS DO NOT INHERIT /etc/hosts, so a guest dnsmasq answers for them at the
+# gateway dockerd's dns list already names. It ALWAYS forwards; it adds the results
+# remap ONLY when the passthrough is up, so if the passthrough never started a
+# container resolves the origin to real GitHub and goes direct (a miss) rather than
+# to a dead listener. It runs whenever container DNS was configured -- which happens
+# only when a real upstream was found -- so a resolver outage falls through to those
+# upstreams rather than breaking container DNS.
+if [ -n "$container_dns_active" ]; then
+	upstream_resolv=/run/systemd/resolve/resolv.conf
+	if [ ! -s "$upstream_resolv" ]; then
+		upstream_resolv=/etc/resolv.conf
+	fi
+	# --resolv-file names the upstreams dnsmasq forwards to; do NOT also pass
+	# --no-resolv, which would win and leave it with none, failing every query it
+	# does not remap. --conf-file=/dev/null keeps it to these arguments alone, and
+	# -u root avoids dropping to a dnsmasq user that dnsmasq-base does not create.
+	dnsmasq_args=(--keep-in-foreground --no-daemon --conf-file=/dev/null -u root
+		--listen-address="$docker_gateway" --bind-interfaces
+		--resolv-file="$upstream_resolv")
+	if [ -n "$actions_cache_active" ]; then
+		dnsmasq_args+=(--address="/results-receiver.actions.githubusercontent.com/$docker_gateway")
+	fi
+	if ! systemd-run --quiet --unit=billet-cache-dns --collect \
+		--property=Restart=always --property=RestartSec=100ms \
+		/usr/sbin/dnsmasq "${dnsmasq_args[@]}"; then
+		log "the container cache resolver did not start; containers will use GitHub's cache directly"
 	fi
 fi
 
@@ -902,10 +1065,14 @@ if [ -n "$cache_endpoint" ] && [ -n "$cache_token" ]; then
 	runner_env+=("BILLET_CACHE_ENDPOINT=$cache_endpoint" "BILLET_CACHE_TOKEN=$cache_token"
 		"BILLET_BUILDKIT_CACHE_MOUNT_LIMIT_BYTES=$buildkit_cache_mount_limit_bytes")
 fi
-if [ -n "$actions_guest_proxy" ] && [ -n "$actions_ca_path" ] && [ -n "$actions_hook_path" ]; then
-	runner_env+=("HTTPS_PROXY=$actions_guest_proxy" "https_proxy=$actions_guest_proxy"
-		"NODE_EXTRA_CA_CERTS=$actions_ca_path" "SSL_CERT_FILE=$actions_ca_path"
-		"BILLET_ACTIONS_PROXY=$actions_guest_proxy" "BILLET_ACTIONS_CA_SOURCE=$actions_ca_path"
+if [ -n "$actions_cache_active" ] && [ -n "$actions_ca_path" ] && [ -n "$actions_hook_path" ]; then
+	# NO HTTPS_PROXY. Interception reaches the runner by a DNS remap of the one
+	# results origin, so only that host's traffic is redirected and every other
+	# request -- action downloads, toolchains, artifact blob uploads -- resolves
+	# normally and goes direct. The runner still needs the node's CA to trust the
+	# intercepted origin, and the job-started hook publishes it into containers.
+	runner_env+=("NODE_EXTRA_CA_CERTS=$actions_ca_path" "SSL_CERT_FILE=$actions_ca_path"
+		"BILLET_ACTIONS_CA_SOURCE=$actions_ca_path"
 		"ACTIONS_RUNNER_HOOK_JOB_STARTED=$actions_hook_path")
 fi
 if [ -n "$registry_mirrors_json" ]; then
