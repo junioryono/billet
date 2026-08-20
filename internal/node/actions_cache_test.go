@@ -604,24 +604,15 @@ func TestActionsCacheKillSwitchAppliesToAnAlreadyIssuedUploadURL(t *testing.T) {
 	service.SetActionsPolicy(actionsPolicyFunc(func(context.Context, string, string) (bool, error) {
 		return false, nil
 	}))
-	upstreamRequests := 0
-	service.actions.upstream = roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		upstreamRequests++
-
-		return &http.Response{
-			StatusCode: http.StatusOK, Header: make(http.Header), Body: http.NoBody, Request: r,
-		}, nil
-	})
 	upload := actionsRequestForTest(t, http.MethodPut, uploadURL, "must-not-be-local")
 	upload.Header.Set("X-Ms-Blob-Type", "BlockBlob")
-	response, err = service.actions.roundTrip(upload, session)
-	if err != nil {
-		t.Fatalf("disabled upload: %v", err)
+	response, handled := service.actions.respond(upload, session)
+	if !handled {
+		t.Fatal("a disabled reserved upload was passed to GitHub rather than failed locally")
 	}
 	response.Body.Close()
-	if response.StatusCode != http.StatusBadGateway || upstreamRequests != 0 {
-		t.Fatalf("disabled reserved upload status=%d upstream=%d; want local failure",
-			response.StatusCode, upstreamRequests)
+	if response.StatusCode != http.StatusBadGateway {
+		t.Fatalf("disabled reserved upload status=%d; want local failure", response.StatusCode)
 	}
 	session.mu.Lock()
 	defer session.mu.Unlock()
@@ -655,25 +646,17 @@ func TestActionsFinalizeFailureNeverFallsThroughToGitHub(t *testing.T) {
 	}
 	response.Body.Close()
 	volumes.trimErr = errors.New("trim failed")
-	upstreamRequests := 0
-	service.actions.upstream = roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		upstreamRequests++
-
-		return &http.Response{
-			StatusCode: http.StatusOK, Header: make(http.Header), Body: http.NoBody, Request: r,
-		}, nil
-	})
 	finalize := actionsRequestForTest(t, http.MethodPost,
 		"https://"+actionsResultsHost+actionsFinalizePath,
 		`{"key":"finalize-local","version":"v1","size_bytes":"12"}`)
-	response, err = service.actions.roundTrip(finalize, session)
-	if err != nil {
-		t.Fatalf("finalize: %v", err)
+	response, handled := service.actions.respond(finalize, session)
+	if !handled {
+		t.Fatal("a failed reserved finalization was passed to GitHub rather than failed locally")
 	}
 	response.Body.Close()
-	if response.StatusCode != http.StatusBadGateway || upstreamRequests != 0 || volumes.trimmed != 1 {
-		t.Fatalf("failed finalization status=%d upstream=%d trims=%d; want local failure",
-			response.StatusCode, upstreamRequests, volumes.trimmed)
+	if response.StatusCode != http.StatusBadGateway || volumes.trimmed != 1 {
+		t.Fatalf("failed finalization status=%d trims=%d; want local failure",
+			response.StatusCode, volumes.trimmed)
 	}
 }
 
@@ -917,9 +900,9 @@ func TestActionsFinalizeReceiptSurvivesRestartAndPolicyOutage(t *testing.T) {
 			finalizeBody := `{"key":"durable-receipt","version":"v1","size_bytes":"12"}`
 			finalize := actionsRequestForTest(t, http.MethodPost,
 				"https://"+actionsResultsHost+actionsFinalizePath, finalizeBody)
-			response, err = service.actions.roundTrip(finalize, session)
-			if err != nil {
-				t.Fatalf("initial finalize: %v", err)
+			response, initialHandled := service.actions.respond(finalize, session)
+			if !initialHandled {
+				t.Fatal("the initial reserved finalize was passed to GitHub rather than answered locally")
 			}
 			initialStatus := response.StatusCode
 			response.Body.Close()
@@ -954,25 +937,16 @@ func TestActionsFinalizeReceiptSurvivesRestartAndPolicyOutage(t *testing.T) {
 			restarted.mu.Lock()
 			restartedSession := restarted.byToken[credentials.Token]
 			restarted.mu.Unlock()
-			upstreamRequests := 0
-			restarted.actions.upstream = roundTripFunc(func(r *http.Request) (*http.Response, error) {
-				upstreamRequests++
-
-				return &http.Response{
-					StatusCode: http.StatusOK, Header: make(http.Header), Body: http.NoBody, Request: r,
-				}, nil
-			})
 			retry := actionsRequestForTest(t, http.MethodPost,
 				"https://"+actionsResultsHost+actionsFinalizePath, finalizeBody)
-			response, err = restarted.actions.roundTrip(retry, restartedSession)
-			if err != nil {
-				t.Fatalf("retry finalize: %v", err)
+			response, handled := restarted.actions.respond(retry, restartedSession)
+			if !handled {
+				t.Fatal("a reserved finalize retry was passed to GitHub rather than answered locally")
 			}
 			if initialFailure {
-				if response.StatusCode != http.StatusBadGateway || upstreamRequests != 0 ||
-					storage.current != "" {
-					t.Fatalf("policy-outage retry status=%d upstream=%d current=%q",
-						response.StatusCode, upstreamRequests, storage.current)
+				if response.StatusCode != http.StatusBadGateway || storage.current != "" {
+					t.Fatalf("policy-outage retry status=%d current=%q",
+						response.StatusCode, storage.current)
 				}
 				response.Body.Close()
 				restarted.SetActionsPolicy(actionsPolicyFunc(func(context.Context, string, string) (bool, error) {
@@ -980,17 +954,15 @@ func TestActionsFinalizeReceiptSurvivesRestartAndPolicyOutage(t *testing.T) {
 				}))
 				retry = actionsRequestForTest(t, http.MethodPost,
 					"https://"+actionsResultsHost+actionsFinalizePath, finalizeBody)
-				response, err = restarted.actions.roundTrip(retry, restartedSession)
-				if err != nil {
-					if response != nil {
-						response.Body.Close()
-					}
-					t.Fatalf("allowed retry finalize: %v", err)
+				response, handled = restarted.actions.respond(retry, restartedSession)
+				if !handled {
+					t.Fatal("an allowed finalize retry was passed to GitHub rather than answered locally")
 				}
 			}
+			defer response.Body.Close()
 			retried := responseJSON(t, response)
-			if retried["ok"] != true || upstreamRequests != 0 || storage.current != "next" {
-				t.Fatalf("retry=%v upstream=%d current=%q", retried, upstreamRequests, storage.current)
+			if retried["ok"] != true || storage.current != "next" {
+				t.Fatalf("retry=%v current=%q", retried, storage.current)
 			}
 		})
 	}
