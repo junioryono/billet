@@ -87,7 +87,7 @@ func TestResultsProxyAuthenticatesByTheBoundGuestSession(t *testing.T) {
 	if resp.StatusCode != http.StatusAccepted || !bytes.Contains(body, []byte("upstream")) {
 		t.Fatalf("artifact passthrough = %d %s", resp.StatusCode, body)
 	}
-	if authorization := upstream.header(0, "Authorization"); authorization != "Bearer opaque-github-runtime-token" {
+	if authorization := upstream.header("Authorization"); authorization != "Bearer opaque-github-runtime-token" {
 		t.Fatalf("upstream authorization = %q; the GitHub token was changed or decoded", authorization)
 	}
 	// A spliced tunnel persists; the local cache request below must classify on a
@@ -242,18 +242,136 @@ func TestActionsProxyAuthenticationStopsWhenTheSessionIsBusyAndContextEnds(t *te
 	}
 }
 
-func TestActionsProxyPassesBuildKitMetadataUpstreamWithoutConsumingIt(t *testing.T) {
+// BuildKit's type=gha client speaks the same three twirp methods but is not the
+// official toolkit, so it stays on GitHub — and its request body must reach
+// GitHub intact through the splice, not be consumed by the classification. This
+// drives the real tunnel so the body is asserted on the far side, byte for byte,
+// where a captured-but-not-replayed request would show as an empty upstream body.
+func TestActionsProxyPassesBuildKitMetadataUpstreamThroughTheSplice(t *testing.T) {
 	t.Parallel()
 
-	service, _, session, _ := testActionsService(t)
-	request := actionsRequestForTest(t, http.MethodPost,
-		"https://"+actionsResultsHost+actionsCreatePath,
-		`{"key":"buildkit","version":"v1"}`)
-	request.Header.Set("User-Agent", "buildkit/v0.25")
-	response, handled := service.actions.respond(request, session)
-	if handled {
-		response.Body.Close()
-		t.Fatal("a BuildKit type=gha request was handled locally rather than left to GitHub")
+	bodies := make(chan string, 1)
+	upstream, tlsConn := tunneledActionsService(t, func(u *fakeResultsUpstream, conn net.Conn) {
+		reader := bufio.NewReader(conn)
+		request, err := http.ReadRequest(reader)
+		if err != nil {
+			return
+		}
+		u.record(request)
+		body, err := io.ReadAll(request.Body)
+		if err != nil {
+			return
+		}
+		bodies <- string(body)
+		//nolint:errcheck // the guest reads the answer or the test's deadline fails it
+		_, _ = conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"))
+	})
+
+	body := `{"key":"buildkit","version":"v1"}`
+	request := "POST " + actionsCreatePath + " HTTP/1.1\r\n" +
+		"Host: " + actionsResultsHost + "\r\n" +
+		"User-Agent: buildkit/v0.25\r\n" +
+		"Content-Type: application/json\r\n" +
+		"Content-Length: " + strconv.Itoa(len(body)) + "\r\n\r\n" + body
+	if _, err := tlsConn.Write([]byte(request)); err != nil {
+		t.Fatalf("write the tunneled BuildKit request: %v", err)
+	}
+
+	if reader := bufio.NewReader(tlsConn); func() bool {
+		line, err := reader.ReadString('\n')
+
+		return err != nil || line != "HTTP/1.1 200 OK\r\n"
+	}() {
+		t.Fatal("the BuildKit request was not answered by GitHub through the splice")
+	}
+	if got := <-bodies; got != body {
+		t.Fatalf("upstream body = %q, want %q", got, body)
+	}
+	if upstream.header("User-Agent") != "buildkit/v0.25" {
+		t.Fatalf("upstream user-agent = %q", upstream.header("User-Agent"))
+	}
+}
+
+// A GUEST THAT COMPLETES TLS WITH THE RESULTS SNI STILL CANNOT ADDRESS ANOTHER
+// HOST at the HTTP layer: an absolute-form target or a foreign Host header is
+// refused locally, restoring the single-origin invariant the round trip used to
+// enforce by rewriting Host.
+func TestPassthroughRefusesAForeignInnerHost(t *testing.T) {
+	t.Parallel()
+
+	for name, request := range map[string]string{
+		"foreign host header": "GET /twirp/x HTTP/1.1\r\nHost: evil.example.com\r\n\r\n",
+		"absolute-form target": "GET https://evil.example.com/twirp/x HTTP/1.1\r\n" +
+			"Host: evil.example.com\r\n\r\n",
+		"foreign host with results port": "GET /twirp/x HTTP/1.1\r\n" +
+			"Host: evil.example.com:443\r\n\r\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			reached := make(chan struct{}, 1)
+			_, tlsConn := tunneledActionsService(t, func(_ *fakeResultsUpstream, conn net.Conn) {
+				reached <- struct{}{}
+				_ = conn.Close()
+			})
+
+			if _, err := tlsConn.Write([]byte(request)); err != nil {
+				t.Fatalf("write the misdirected request: %v", err)
+			}
+			statusLine, err := bufio.NewReader(tlsConn).ReadString('\n')
+			if err != nil || !strings.Contains(statusLine, " 421 ") {
+				t.Fatalf("misdirected request answered %q, error=%v; want a local 421",
+					strings.TrimSpace(statusLine), err)
+			}
+			select {
+			case <-reached:
+				t.Fatal("a foreign inner host was spliced to GitHub rather than refused locally")
+			default:
+			}
+		})
+	}
+}
+
+// A HOSTILE GUEST THAT NEVER CLOSES ITS WRITE SIDE MUST NOT PIN THE HANDLER once
+// GitHub has finished. Before the fix a half-close left the guest→upstream copy
+// blocked forever; the splice now tears down both directions when either ends.
+func TestPassthroughDoesNotLeakWhenGitHubFinishesFirst(t *testing.T) {
+	t.Parallel()
+
+	_, tlsConn := tunneledActionsService(t, func(u *fakeResultsUpstream, conn net.Conn) {
+		reader := bufio.NewReader(conn)
+		request, err := http.ReadRequest(reader)
+		if err != nil {
+			return
+		}
+		u.record(request)
+		// Answer, then close — GitHub is done, but the guest below never will be.
+		//nolint:errcheck // best effort; the test fails on a leak, not on this write
+		_, _ = conn.Write([]byte("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"))
+		_ = conn.Close()
+	})
+
+	if _, err := tlsConn.Write([]byte("GET /twirp/x HTTP/1.1\r\nHost: " +
+		actionsResultsHost + "\r\n\r\n")); err != nil {
+		t.Fatalf("write the request: %v", err)
+	}
+
+	// The guest deliberately never closes its write side. If the splice half-closed
+	// and waited, this read would block until the tunnel's own deadline; the fix
+	// tears the guest connection down when GitHub closes, so the read returns
+	// PROMPTLY. A read that runs to the deadline is the leak reproducing.
+	drained := make(chan error, 1)
+
+	go func() {
+		_, err := io.Copy(io.Discard, tlsConn)
+		drained <- err
+	}()
+
+	select {
+	case <-drained:
+		// EOF or a torn-down connection — either way the tunnel finished.
+	case <-time.After(3 * time.Second):
+		t.Fatal("the splice did not finish after GitHub closed; the hostile guest pinned it")
 	}
 }
 
@@ -318,14 +436,15 @@ func (u *fakeResultsUpstream) count() int {
 	return len(u.requests)
 }
 
-func (u *fakeResultsUpstream) header(index int, name string) string {
+// header returns a header of the first recorded request.
+func (u *fakeResultsUpstream) header(name string) string {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	if index >= len(u.requests) {
+	if len(u.requests) == 0 {
 		return ""
 	}
 
-	return u.requests[index].Header.Get(name)
+	return u.requests[0].Header.Get(name)
 }
 
 // answerRequests serves parsed HTTP/1.1 requests with one canned raw response,
@@ -464,7 +583,7 @@ func TestPassthroughSplicesGitHubsOwnBytesToTheGuest(t *testing.T) {
 		t.Fatalf("the tunnel answered %q; the guest must read the bytes GitHub wrote",
 			strings.TrimSpace(statusLine))
 	}
-	if authorization := upstream.header(0, "Authorization"); authorization != "Bearer opaque-runtime-token" {
+	if authorization := upstream.header("Authorization"); authorization != "Bearer opaque-runtime-token" {
 		t.Fatalf("upstream authorization = %q; the GitHub token was changed or decoded", authorization)
 	}
 

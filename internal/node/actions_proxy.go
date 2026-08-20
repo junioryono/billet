@@ -196,6 +196,29 @@ func (p *actionsProxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 	p.intercept(r.Context(), w, session)
 }
 
+// actionsRequestTargetsResultsHost reports whether the inner request is
+// addressed to the results host in origin form.
+//
+// Absolute-form targets (URL.Host set) are refused because the tunnel is a
+// single origin, and the Host header — with or without the :443 port — must be
+// exactly the results host. http.ReadRequest fills req.Host from the Host
+// header for an origin-form request, so this reads the guest's own claim.
+func actionsRequestTargetsResultsHost(req *http.Request) bool {
+	if req.URL.Host != "" {
+		return false
+	}
+
+	host := req.Host
+	if h, port, err := net.SplitHostPort(host); err == nil {
+		if port != "443" {
+			return false
+		}
+		host = h
+	}
+
+	return host == actionsResultsHost
+}
+
 func hijack(w http.ResponseWriter) (net.Conn, *bufio.ReadWriter, error) {
 	h, ok := w.(http.Hijacker)
 	if !ok {
@@ -263,6 +286,25 @@ func (p *actionsProxy) intercept(
 	requestCtx, requestCancel := context.WithTimeout(ctx, cacheHandlerLimit)
 	defer requestCancel()
 	req = req.WithContext(requestCtx)
+
+	// THE INNER REQUEST MUST NAME THE RESULTS HOST, restoring the invariant the
+	// old round trip enforced by rewriting req.Host. A splice replays the guest's
+	// own bytes, so a guest that completed TLS with the results SNI could send an
+	// absolute-form target or a foreign Host header and hand routing to whatever
+	// GitHub's edge does with the mismatch. Bytes still cannot leave the results
+	// TCP connection, so this is hardening rather than an escape — but "exactly
+	// one host" should hold at the HTTP layer too, and the check is one line.
+	if !actionsRequestTargetsResultsHost(req) {
+		misdirected := actionsBlobError(http.StatusMisdirectedRequest,
+			"only the Actions results origin is available")
+		misdirected.Close = true
+		misdirected.Proto, misdirected.ProtoMajor, misdirected.ProtoMinor = "HTTP/1.1", 1, 1
+		//nolint:errcheck // best-effort refusal before anything is forwarded
+		_ = misdirected.Write(tlsConn)
+		_ = misdirected.Body.Close()
+
+		return
+	}
 
 	// A BLOB TRANSFER'S BODY MUST NOT BE CAPTURED. Its classification is decided
 	// by its path alone, it can never fall back to GitHub (a reservation is
@@ -343,30 +385,33 @@ func (p *actionsProxy) splice(
 		return
 	}
 
-	done := make(chan struct{}, 1)
+	// EITHER DIRECTION ENDING TEARS DOWN BOTH, and this is a correctness rule, not
+	// tidiness. A half-close would let a healthy live-log websocket run
+	// unbounded — which is wanted — but it also lets a HOSTILE guest that never
+	// closes its own write side pin this handler goroutine and both descriptors
+	// forever after GitHub has already finished: the second io.Copy would block
+	// on a read that never returns. For HTTP/1.1 and for a websocket alike, the
+	// first EOF is the connection ending, so closing both unblocks the surviving
+	// copy at once. The tunnel therefore lasts exactly as long as both peers keep
+	// it open and not one read longer.
+	done := make(chan struct{}, 2)
 
-	go func() {
+	copyOne := func(dst, src net.Conn) {
 		//nolint:errcheck // a spliced peer disconnecting mid-copy is the ordinary end of a tunnel
-		_, _ = io.Copy(upstream, guest)
-		closeWrite(upstream)
+		_, _ = io.Copy(dst, src)
 		done <- struct{}{}
-	}()
-
-	//nolint:errcheck // a spliced peer disconnecting mid-copy is the ordinary end of a tunnel
-	_, _ = io.Copy(guest, upstream)
-	closeWrite(guest)
-	<-done
-}
-
-// closeWrite half-closes a connection so the peer sees EOF while the other
-// direction keeps flowing.
-func closeWrite(conn net.Conn) {
-	type writeCloser interface{ CloseWrite() error }
-
-	if half, ok := conn.(writeCloser); ok {
-		//nolint:errcheck // the peer may already be gone, which is what this is telling it
-		_ = half.CloseWrite()
 	}
+
+	go copyOne(upstream, guest)
+	go copyOne(guest, upstream)
+
+	<-done
+	// One side finished. Closing both interrupts the read the other copy is
+	// blocked on; upstream's close is also handled by the deferred Close, and a
+	// second close is harmless.
+	_ = guest.Close()
+	_ = upstream.Close()
+	<-done
 }
 
 // actionsCaptureReader records what passes through it until disarmed, so a

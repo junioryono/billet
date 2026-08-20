@@ -110,8 +110,11 @@ def handle(client, upstream):
             raise ValueError("only CONNECT is supported")
         host, port = parse_authority(authority)
         remote, remote_buffer = connect(upstream, host, port, authority)
-        client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        # Marked established BEFORE the write, not after: a sendall that fails
+        # partway has already put bytes of the 200 on the wire, and appending a
+        # 502 to a half-written status line is the corruption the flag prevents.
         established = True
+        client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         client.settimeout(None)
         remote.settimeout(None)
         relay(client, remote, remote_buffer)
