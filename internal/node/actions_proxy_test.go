@@ -15,14 +15,12 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/internal/provider"
 )
-
-type roundTripFunc func(*http.Request) (*http.Response, error)
-
-func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
 func TestResultsProxyAuthenticatesByTheBoundGuestSession(t *testing.T) {
 	t.Parallel()
@@ -44,18 +42,10 @@ func TestResultsProxyAuthenticatesByTheBoundGuestSession(t *testing.T) {
 		return true, nil
 	}))
 
-	var upstreamAuthorization string
-	var upstreamRequests int
-	service.actions.upstream = roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		upstreamRequests++
-		upstreamAuthorization = r.Header.Get("Authorization")
-		return &http.Response{
-			StatusCode: http.StatusAccepted,
-			Header:     http.Header{"Content-Type": []string{"application/json"}},
-			Body:       io.NopCloser(strings.NewReader(`{"artifact":"upstream"}`)),
-			Request:    r,
-		}, nil
-	})
+	upstream := newFakeResultsUpstream(t, answerRequests(
+		"HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\n"+
+			"Content-Length: 23\r\n\r\n{\"artifact\":\"upstream\"}"))
+	service.actions.dialUpstream = upstream.dial
 
 	proxyServer := httptest.NewServer(service)
 	t.Cleanup(proxyServer.Close)
@@ -97,9 +87,12 @@ func TestResultsProxyAuthenticatesByTheBoundGuestSession(t *testing.T) {
 	if resp.StatusCode != http.StatusAccepted || !bytes.Contains(body, []byte("upstream")) {
 		t.Fatalf("artifact passthrough = %d %s", resp.StatusCode, body)
 	}
-	if upstreamAuthorization != "Bearer opaque-github-runtime-token" {
-		t.Fatalf("upstream authorization = %q; the GitHub token was changed or decoded", upstreamAuthorization)
+	if authorization := upstream.header(0, "Authorization"); authorization != "Bearer opaque-github-runtime-token" {
+		t.Fatalf("upstream authorization = %q; the GitHub token was changed or decoded", authorization)
 	}
+	// A spliced tunnel persists; the local cache request below must classify on a
+	// fresh connection the way every real toolkit process does.
+	client.CloseIdleConnections()
 
 	local, err := http.NewRequestWithContext(t.Context(), http.MethodPost,
 		"https://"+actionsResultsHost+actionsCreatePath,
@@ -121,8 +114,8 @@ func TestResultsProxyAuthenticatesByTheBoundGuestSession(t *testing.T) {
 		t.Fatalf("local cache response = %d %s, error=%v",
 			localResponse.StatusCode, localBody, readErr)
 	}
-	if upstreamRequests != 1 {
-		t.Fatalf("upstream requests = %d; the exact CacheService method was not intercepted", upstreamRequests)
+	if got := upstream.count(); got != 1 {
+		t.Fatalf("upstream requests = %d; the exact CacheService method was not intercepted", got)
 	}
 
 	badProxy := *proxyURL
@@ -253,51 +246,123 @@ func TestActionsProxyPassesBuildKitMetadataUpstreamWithoutConsumingIt(t *testing
 	t.Parallel()
 
 	service, _, session, _ := testActionsService(t)
-	var upstreamBody, upstreamUserAgent string
-	service.actions.upstream = roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Fatalf("read upstream body: %v", err)
-		}
-		upstreamBody = string(body)
-		upstreamUserAgent = r.UserAgent()
-
-		return &http.Response{
-			StatusCode: http.StatusOK, Header: make(http.Header), Body: http.NoBody, Request: r,
-		}, nil
-	})
 	request := actionsRequestForTest(t, http.MethodPost,
 		"https://"+actionsResultsHost+actionsCreatePath,
 		`{"key":"buildkit","version":"v1"}`)
 	request.Header.Set("User-Agent", "buildkit/v0.25")
-	response, err := service.actions.roundTrip(request, session)
-	if err != nil {
-		t.Fatalf("roundTrip: %v", err)
-	}
-	response.Body.Close()
-	if upstreamBody != `{"key":"buildkit","version":"v1"}` ||
-		upstreamUserAgent != "buildkit/v0.25" {
-		t.Fatalf("upstream body=%q user-agent=%q", upstreamBody, upstreamUserAgent)
+	response, handled := service.actions.respond(request, session)
+	if handled {
+		response.Body.Close()
+		t.Fatal("a BuildKit type=gha request was handled locally rather than left to GitHub")
 	}
 }
 
-// THE TUNNEL'S STATUS LINE MUST SAY HTTP/1.1 WHATEVER THE UPSTREAM SPOKE. The
-// guest side of the tunnel is the official runner's strict HTTP/1.1 reader, and
-// it refuses `HTTP/2.0 200 OK` outright — measured live: with GitHub's edge
-// negotiating h2, every passthrough call the runner itself makes (step updates,
-// log uploads, artifacts) failed with "Received an invalid status line" while
-// local cache responses kept working. Go's own client parses any HTTP/x.y, which
-// is exactly why the end-to-end test above could not see this: the status line is
-// read raw here, with no tolerant client in between.
-func TestPassthroughAnswersHTTP11WhateverTheUpstreamNegotiated(t *testing.T) {
-	t.Parallel()
+// fakeResultsUpstream stands in for GitHub's edge on the far side of a splice.
+//
+// A PLAIN TCP LISTENER, NOT TLS, because the dial seam it replaces returns an
+// already-established connection: the splice treats upstream as opaque bytes,
+// so the fake exercises exactly what production exercises.
+type fakeResultsUpstream struct {
+	ln net.Listener
+
+	mu       sync.Mutex
+	requests []*http.Request
+}
+
+func newFakeResultsUpstream(t *testing.T, handler func(*fakeResultsUpstream, net.Conn)) *fakeResultsUpstream {
+	t.Helper()
+
+	var lc net.ListenConfig
+
+	ln, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen for the fake upstream: %v", err)
+	}
+
+	upstream := &fakeResultsUpstream{ln: ln}
+	t.Cleanup(func() { _ = ln.Close() })
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+
+			go func() {
+				defer conn.Close()
+				handler(upstream, conn)
+			}()
+		}
+	}()
+
+	return upstream
+}
+
+func (u *fakeResultsUpstream) dial(ctx context.Context) (net.Conn, error) {
+	var dialer net.Dialer
+
+	return dialer.DialContext(ctx, "tcp", u.ln.Addr().String())
+}
+
+func (u *fakeResultsUpstream) record(request *http.Request) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.requests = append(u.requests, request)
+}
+
+func (u *fakeResultsUpstream) count() int {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	return len(u.requests)
+}
+
+func (u *fakeResultsUpstream) header(index int, name string) string {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if index >= len(u.requests) {
+		return ""
+	}
+
+	return u.requests[index].Header.Get(name)
+}
+
+// answerRequests serves parsed HTTP/1.1 requests with one canned raw response,
+// keep-alive, recording each request it saw.
+func answerRequests(response string) func(*fakeResultsUpstream, net.Conn) {
+	return func(u *fakeResultsUpstream, conn net.Conn) {
+		reader := bufio.NewReader(conn)
+		for {
+			request, err := http.ReadRequest(reader)
+			if err != nil {
+				return
+			}
+			if _, err := io.Copy(io.Discard, request.Body); err != nil {
+				return
+			}
+			u.record(request)
+			if _, err := conn.Write([]byte(response)); err != nil {
+				return
+			}
+		}
+	}
+}
+
+// tunneledActionsService builds a service with a fake upstream, an authorized
+// session, and an open TLS connection through the CONNECT tunnel.
+func tunneledActionsService(
+	t *testing.T,
+	handler func(*fakeResultsUpstream, net.Conn),
+) (*fakeResultsUpstream, *tls.Conn) {
+	t.Helper()
 
 	service, err := NewCacheService("http://127.0.0.1:7718", "test-deployment", t.TempDir(),
 		&fakeCacheStore{}, &fakeVolumeAttacher{}, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("NewCacheService: %v", err)
 	}
-	credentials, err := service.PrepareScoped("billet-lease-h2", CacheSessionScope{
+	credentials, err := service.PrepareScoped("billet-lease-splice", CacheSessionScope{
 		Trust: provider.TrustTrusted, Intercept: true, Owner: "acme", Repository: "api",
 		WorkflowRef: "acme/api/.github/workflows/ci.yml@refs/heads/main",
 	})
@@ -309,16 +374,8 @@ func TestPassthroughAnswersHTTP11WhateverTheUpstreamNegotiated(t *testing.T) {
 		return true, nil
 	}))
 
-	// The shape Go's transport produces when the far end negotiated h2.
-	service.actions.upstream = roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		return &http.Response{
-			Status: "200 OK", StatusCode: http.StatusOK,
-			Proto: "HTTP/2.0", ProtoMajor: 2, ProtoMinor: 0,
-			Header:  http.Header{"Content-Type": []string{"application/json"}},
-			Body:    io.NopCloser(strings.NewReader(`{"artifact":"upstream"}`)),
-			Request: r,
-		}, nil
-	})
+	upstream := newFakeResultsUpstream(t, handler)
+	service.actions.dialUpstream = upstream.dial
 
 	proxyServer := httptest.NewServer(service)
 	t.Cleanup(proxyServer.Close)
@@ -366,21 +423,159 @@ func TestPassthroughAnswersHTTP11WhateverTheUpstreamNegotiated(t *testing.T) {
 		t.Fatalf("TLS handshake through the tunnel: %v", err)
 	}
 
+	// A BROKEN SPLICE MUST FAIL, NOT HANG. Without a deadline, a splice that
+	// never forwards the request leaves every read below blocked until the test
+	// binary is killed, which reports nothing.
+	if err := tlsConn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatalf("set the tunnel deadline: %v", err)
+	}
+
+	return upstream, tlsConn
+}
+
+// THE SPLICE CARRIES GITHUB'S OWN BYTES, so the status line the guest reads is
+// the one GitHub wrote. This is what structurally retired the previous defect:
+// a round-tripped passthrough re-framed upstream h2 responses as
+// `HTTP/2.0 200 OK` on an HTTP/1.1 connection, which the official runner
+// refuses. The status line is read raw here, with no tolerant client between.
+func TestPassthroughSplicesGitHubsOwnBytesToTheGuest(t *testing.T) {
+	t.Parallel()
+
+	upstream, tlsConn := tunneledActionsService(t, answerRequests(
+		"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"+
+			"Content-Length: 23\r\n\r\n{\"artifact\":\"upstream\"}"))
+
 	body := `{"name":"release"}`
 	request := "POST /twirp/github.actions.results.api.v1.ArtifactService/CreateArtifact HTTP/1.1\r\n" +
 		"Host: " + actionsResultsHost + "\r\n" +
+		"Authorization: Bearer opaque-runtime-token\r\n" +
 		"Content-Type: application/json\r\n" +
 		"Content-Length: " + strconv.Itoa(len(body)) + "\r\n\r\n" + body
 	if _, err := tlsConn.Write([]byte(request)); err != nil {
 		t.Fatalf("write the tunneled request: %v", err)
 	}
 
-	statusLine, err := bufio.NewReader(tlsConn).ReadString('\n')
+	reader := bufio.NewReader(tlsConn)
+	statusLine, err := reader.ReadString('\n')
 	if err != nil {
 		t.Fatalf("read the tunneled status line: %v", err)
 	}
-	if !strings.HasPrefix(statusLine, "HTTP/1.1 200") {
-		t.Fatalf("the tunnel answered %q; the official runner refuses any status line "+
-			"that is not HTTP/1.1", strings.TrimSpace(statusLine))
+	if statusLine != "HTTP/1.1 200 OK\r\n" {
+		t.Fatalf("the tunnel answered %q; the guest must read the bytes GitHub wrote",
+			strings.TrimSpace(statusLine))
+	}
+	if authorization := upstream.header(0, "Authorization"); authorization != "Bearer opaque-runtime-token" {
+		t.Fatalf("upstream authorization = %q; the GitHub token was changed or decoded", authorization)
+	}
+
+	// AND THE TUNNEL PERSISTS: the runner's client keeps a passthrough connection
+	// alive, so a second request on the same tunnel must reach GitHub too. The
+	// status line was already consumed, so the rest of the first response is
+	// drained by hand: headers to the blank line, then the declared body.
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read the first response headers: %v", err)
+		}
+		if line == "\r\n" {
+			break
+		}
+	}
+	if _, err := io.ReadFull(reader, make([]byte, 23)); err != nil {
+		t.Fatalf("drain the first response body: %v", err)
+	}
+	if _, err := tlsConn.Write([]byte("GET /twirp/results.services.receiver.Receiver/ping HTTP/1.1\r\n" +
+		"Host: " + actionsResultsHost + "\r\n\r\n")); err != nil {
+		t.Fatalf("write the second tunneled request: %v", err)
+	}
+	if secondLine, err := reader.ReadString('\n'); err != nil || secondLine != "HTTP/1.1 200 OK\r\n" {
+		t.Fatalf("second request over the spliced tunnel answered %q, error=%v",
+			strings.TrimSpace(secondLine), err)
+	}
+	if got := upstream.count(); got != 2 {
+		t.Fatalf("upstream requests = %d, want both requests on the persistent tunnel", got)
+	}
+}
+
+// THE RUNNER'S LIVE LOGS RIDE A WEBSOCKET TO THE RESULTS HOST — GitHub's own
+// runner documentation requires wss to results-receiver — and a passthrough
+// that answers one HTTP response per connection kills the upgrade the moment it
+// completes. Measured live: every job's log pane was blank because the live-log
+// feed died against the tunnel. The splice must carry the upgrade and then the
+// frames, both directions.
+func TestPassthroughSplicesTheRunnersLiveLogWebSocket(t *testing.T) {
+	t.Parallel()
+
+	upstream, tlsConn := tunneledActionsService(t,
+		func(u *fakeResultsUpstream, conn net.Conn) {
+			reader := bufio.NewReader(conn)
+			request, err := http.ReadRequest(reader)
+			if err != nil {
+				return
+			}
+			u.record(request)
+			if request.Header.Get("Upgrade") != "websocket" {
+				return
+			}
+			if _, err := conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\n" +
+				"Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n")); err != nil {
+				return
+			}
+			// Echo whatever frames arrive, byte for byte.
+			if _, err := io.Copy(conn, reader); err != nil {
+				return
+			}
+		})
+
+	if _, err := tlsConn.Write([]byte("GET /twirp/results.services.receiver.Receiver/feed HTTP/1.1\r\n" +
+		"Host: " + actionsResultsHost + "\r\n" +
+		"Upgrade: websocket\r\nConnection: Upgrade\r\n" +
+		"Sec-WebSocket-Key: c3BsaWNlLXRlc3Q=\r\nSec-WebSocket-Version: 13\r\n\r\n")); err != nil {
+		t.Fatalf("write the upgrade request: %v", err)
+	}
+
+	reader := bufio.NewReader(tlsConn)
+	statusLine, err := reader.ReadString('\n')
+	if err != nil || statusLine != "HTTP/1.1 101 Switching Protocols\r\n" {
+		t.Fatalf("upgrade answered %q, error=%v", strings.TrimSpace(statusLine), err)
+	}
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read upgrade headers: %v", err)
+		}
+		if line == "\r\n" {
+			break
+		}
+	}
+
+	frame := []byte("live-log-frame-bytes")
+	if _, err := tlsConn.Write(frame); err != nil {
+		t.Fatalf("write a frame through the upgraded tunnel: %v", err)
+	}
+
+	echoed := make([]byte, len(frame))
+	if _, err := io.ReadFull(reader, echoed); err != nil {
+		t.Fatalf("read the echoed frame: %v", err)
+	}
+	if !bytes.Equal(echoed, frame) {
+		t.Fatalf("echoed frame = %q, want %q", echoed, frame)
+	}
+	if got := upstream.count(); got != 1 {
+		t.Fatalf("upstream requests = %d, want the one upgrade", got)
+	}
+}
+
+// The splice copies the guest's HTTP/1.1 bytes verbatim, so the upstream TLS
+// handshake must never negotiate a protocol those bytes are not.
+func TestUpstreamDialPinsHTTP11(t *testing.T) {
+	t.Parallel()
+
+	config := actionsUpstreamTLSConfig()
+	if len(config.NextProtos) != 1 || config.NextProtos[0] != "http/1.1" {
+		t.Fatalf("upstream ALPN = %v, want exactly http/1.1", config.NextProtos)
+	}
+	if config.ServerName != actionsResultsHost {
+		t.Fatalf("upstream server name = %q", config.ServerName)
 	}
 }
