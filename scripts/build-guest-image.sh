@@ -492,6 +492,10 @@ DOCKER
 	install -m 0755 "$SCRIPT_DIR/../internal/guestassets/runner-service.sh" \
 		"$rootfs/home/runner/runner/billet-runner-service"
 	chroot "$rootfs" chown -R runner:runner /home/runner
+	# The Actions cache hook later creates _work/_billet as root. GNU install gives
+	# only the final path to -o/-g, so leaving _work absent makes that parent root-owned
+	# and Runner.Worker cannot create _work/_temp after the privilege drop.
+	chroot "$rootfs" install -d -m 0755 -o runner -g runner /home/runner/runner/_work
 
 	install_toolcache "$rootfs"
 
@@ -579,7 +583,7 @@ fetch() { curl -sf --connect-timeout 2 --max-time 5 -H "X-metadata-token: $token
 #
 # Refusing out loud is the whole point: the message names both versions, so the
 # answer ("republish the image") is in the failure rather than in somebody's memory.
-WANT_CONTRACT=8
+WANT_CONTRACT=9
 
 if ! contract=$(fetch contract); then
 	log "this billet did not say which metadata contract it speaks; it is older than this image"

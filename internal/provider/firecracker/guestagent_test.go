@@ -376,6 +376,42 @@ func TestTheGuestImageIncludesDockerCLIPluginsWorkflowsUse(t *testing.T) {
 	}
 }
 
+func TestTheGuestWorkDirectoryBelongsToTheRunner(t *testing.T) {
+	t.Parallel()
+
+	buildPath := filepath.Join("..", "..", "..", "scripts", "build-guest-image.sh")
+	buildSource, err := os.ReadFile(buildPath)
+	if err != nil {
+		t.Fatalf("read guest image builder: %v", err)
+	}
+	build := string(buildSource)
+
+	const create = `chroot "$rootfs" install -d -m 0755 -o runner -g runner /home/runner/runner/_work`
+	if !strings.Contains(build, create) {
+		t.Fatal("the image does not pre-create the runner work directory as the runner account")
+	}
+	if strings.Index(build, create) >= strings.Index(build, `mkfs.ext4 -q -F -d "$rootfs" "$img"`) {
+		t.Fatal("the runner work directory is created after the root filesystem is packed")
+	}
+
+	checkPath := filepath.Join("..", "..", "..", "scripts", "check-guest-image.sh")
+	checkSource, err := os.ReadFile(checkPath)
+	if err != nil {
+		t.Fatalf("read guest image checker: %v", err)
+	}
+	check := string(checkSource)
+	for _, want := range []string{
+		`RUNNER_WORK="$RUNNER_DIR/_work"`,
+		`work_ids=$(stat -c '%u:%g' "$RUNNER_WORK")`,
+		`if [ -n "$runner_ids" ] && [ "$work_ids" = "$runner_ids" ]; then`,
+		`fail "the runner work directory belongs to ${work_ids:-no account}, not`,
+	} {
+		if !strings.Contains(check, want) {
+			t.Errorf("the finished-image gate does not enforce %q", want)
+		}
+	}
+}
+
 func TestTheGuestImageGateKeepsDockerBehindTheCacheMount(t *testing.T) {
 	t.Parallel()
 
