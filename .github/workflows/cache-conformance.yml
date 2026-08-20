@@ -213,6 +213,49 @@ jobs:
       - name: Verify the downloaded artifact payload
         run: cmp expected conformance/download/payload
 
+  # BuildKit type=gha is the one interception surface the DNS remap cannot fully
+  # own. A container-driver builder runs BuildKit in its own image, whose trust
+  # store billet cannot populate, so its calls to the remapped origin meet a node
+  # leaf it does not trust. (The embedded docker driver cannot export type=gha at
+  # all, so it is not the case to measure.) This lane MEASURES the container driver
+  # without gating the release -- the export is continue-on-error and its outcome
+  # reported -- so the live run says whether that case is fatal (breaks the build)
+  # or a warning (build succeeds, that cache simply not accelerated), which is the
+  # fact that decides whether anything about the design must change.
+  buildkit-gha:
+    needs: candidate-identity
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 30
+    steps:
+      - name: Refuse a non-billet runner
+        run: test "${RUNNER_NAME#billet-}" != "$RUNNER_NAME"
+      - name: Establish a build context whose layer is unique to this run
+        run: |
+          mkdir -p conformance/gha
+          cat >conformance/gha/Dockerfile <<EOF
+          FROM alpine:3.20
+          RUN echo billet-${{ github.run_id }}-${{ github.run_attempt }} >/probe
+          EOF
+      - name: Set up a container-driver builder
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker-container
+      - name: type=gha through a container-driver builder
+        id: container-gha
+        continue-on-error: true
+        uses: docker/build-push-action@v6
+        with:
+          context: conformance/gha
+          cache-to: type=gha,mode=max,scope=billet-container-${{ github.run_id }}-${{ github.run_attempt }}
+          cache-from: type=gha,scope=billet-container-${{ github.run_id }}-${{ github.run_attempt }}
+          outputs: type=cacheonly
+      - name: Report the container-driver gha outcome
+        run: |
+          echo "container-driver type=gha outcome: ${{ steps.container-gha.outcome }}"
+          if [ '${{ steps.container-gha.outcome }}' != 'success' ]; then
+            echo "::warning title=container gha::a container-driver type=gha export did not complete against the node CA; the run shows whether this was fatal or a non-fatal warning"
+          fi
+
   save-pinned-host:
     needs: candidate-identity
     runs-on: ${{ inputs.runner_label }}
@@ -476,24 +519,51 @@ jobs:
           done
           test "$after" -gt 0
           test "$after" != "$before"
-      - name: Isolate malformed TLS and a handshake timeout
+      - name: Isolate a malformed TLS client and a silent client from the passthrough
         run: |
           set -euo pipefail
-          proxy_authority=${HTTPS_PROXY#http://}
-          proxy_host=${proxy_authority%:*}
-          proxy_port=${proxy_authority##*:}
-          exec 3<>"/dev/tcp/$proxy_host/$proxy_port"
-          printf 'CONNECT results-receiver.actions.githubusercontent.com:443 HTTP/1.1\r\nHost: results-receiver.actions.githubusercontent.com:443\r\n\r\n' >&3
-          IFS= read -r status <&3
-          case "$status" in *' 200 '*) ;; *) echo "proxy returned $status" >&2; exit 1 ;; esac
+          # The results origin is DNS-remapped to the guest passthrough (see the
+          # guest agent), reached by name through /etc/hosts. A client that sends
+          # garbage or nothing must not wedge the passthrough for the legitimate
+          # cache traffic that follows, and a silent one must be dropped rather than
+          # leaked. The cache step below proves recovery.
+          origin=results-receiver.actions.githubusercontent.com
+          # The origin must resolve to the guest passthrough, not GitHub: a bare TCP
+          # connect would succeed either way, so assert the remap is active locally.
+          addr=$(getent ahostsv4 "$origin" | awk 'NR == 1 { print $1 }')
+          case "$addr" in
+            172.1[6-9].*|172.2[0-9].*|172.3[01].*) ;;
+            *) echo "results origin is not remapped to the local passthrough: $addr" >&2; exit 1 ;;
+          esac
+          # A malformed TLS client: the node rejects it and the passthrough tears the
+          # connection down; it must not wedge the listener for what follows.
+          exec 3<>"/dev/tcp/$origin/443"
           printf 'not-a-tls-client' >&3
           exec 3>&-
-          exec 4<>"/dev/tcp/$proxy_host/$proxy_port"
-          printf 'CONNECT results-receiver.actions.githubusercontent.com:443 HTTP/1.1\r\nHost: results-receiver.actions.githubusercontent.com:443\r\n\r\n' >&4
-          IFS= read -r status <&4
-          case "$status" in *' 200 '*) ;; *) echo "proxy returned $status" >&2; exit 1 ;; esac
-          sleep 11
+          # A silent client: it sends nothing, so the passthrough must drop it after
+          # its connect timeout without ever spending a node tunnel. Wait past that
+          # timeout, then prove it was CLOSED cleanly: the read reaches EOF and exits
+          # 0 (a leaked-open connection blocks and the timeout exits 124 instead), it
+          # received no bytes, and the passthrough is the SAME process throughout (a
+          # crash-and-restart would also close the socket, and must not read as pass).
+          before=$(systemctl show --property=MainPID --value billet-actions-proxy.service)
+          exec 4<>"/dev/tcp/$origin/443"
+          sleep 15
+          silent_out=$(mktemp)
+          if timeout 5 head -c 64 <&4 >"$silent_out" 2>/dev/null; then
+            silent_closed=1
+          else
+            silent_closed=0
+          fi
           exec 4>&-
+          after=$(systemctl show --property=MainPID --value billet-actions-proxy.service)
+          test "$silent_closed" = 1 || { echo "the silent client was left open past the connect timeout" >&2; exit 1; }
+          test ! -s "$silent_out" || { echo "the silent client received unexpected bytes" >&2; exit 1; }
+          # A running MainPID that did not change proves the drop was not a crash-restart.
+          # Both-zero would pass a bare equality, so require the process to be present.
+          systemctl is-active --quiet billet-actions-proxy.service || { echo "the passthrough is not running after the silent-client probe" >&2; exit 1; }
+          test "$before" -gt 0 && test "$after" -gt 0 && test "$before" = "$after" || { echo "the passthrough restarted during the silent-client probe" >&2; exit 1; }
+          rm -f "$silent_out"
       - name: Prove cache traffic remains usable after the transport faults
         id: recovered-cache
         uses: actions/cache@v5
