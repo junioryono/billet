@@ -364,15 +364,21 @@ func TestPassthroughRefusesAForeignInnerHost(t *testing.T) {
 			if _, err := tlsConn.Write([]byte(request)); err != nil {
 				t.Fatalf("write the misdirected request: %v", err)
 			}
-			// Read the complete close-delimited refusal, not just its first line, so
-			// the connection has been fully answered before the dial count is read.
-			response, err := io.ReadAll(tlsConn)
+			// ONE FRAMED RESPONSE, not a read to EOF. The handler closes the raw
+			// connection without a TLS close_notify, so reading the stream to the
+			// end can surface io.ErrUnexpectedEOF after a complete 421 has already
+			// arrived. The refusal carries a Content-Length, so ReadResponse frames
+			// it exactly, and draining its body proves the whole answer landed
+			// before the dial count is read.
+			response, err := http.ReadResponse(bufio.NewReader(tlsConn), nil)
 			if err != nil {
 				t.Fatalf("read the refusal: %v", err)
 			}
-			if !strings.HasPrefix(string(response), "HTTP/1.1 421 ") {
-				t.Fatalf("misdirected request answered %q; want a local 421",
-					strings.SplitN(string(response), "\r\n", 2)[0])
+			//nolint:errcheck // the body is a small bytes.Reader
+			_, _ = io.Copy(io.Discard, response.Body)
+			response.Body.Close()
+			if response.StatusCode != http.StatusMisdirectedRequest {
+				t.Fatalf("misdirected request answered %d; want a local 421", response.StatusCode)
 			}
 			if dials.Load() != 0 {
 				t.Fatal("a foreign inner host reached the upstream dial rather than being refused")
