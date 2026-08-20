@@ -323,7 +323,10 @@ func TestPassthroughAnswersHTTP11WhateverTheUpstreamNegotiated(t *testing.T) {
 	proxyServer := httptest.NewServer(service)
 	t.Cleanup(proxyServer.Close)
 
-	conn, err := net.Dial("tcp", strings.TrimPrefix(proxyServer.URL, "http://"))
+	var dialer net.Dialer
+
+	conn, err := dialer.DialContext(t.Context(), "tcp",
+		strings.TrimPrefix(proxyServer.URL, "http://"))
 	if err != nil {
 		t.Fatalf("dial the proxy: %v", err)
 	}
