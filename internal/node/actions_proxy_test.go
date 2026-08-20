@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -16,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -296,6 +298,45 @@ func TestActionsProxyPassesBuildKitMetadataUpstreamThroughTheSplice(t *testing.T
 // HOST at the HTTP layer: an absolute-form target or a foreign Host header is
 // refused locally, restoring the single-origin invariant the round trip used to
 // enforce by rewriting Host.
+func TestActionsRequestTargetsResultsHost(t *testing.T) {
+	t.Parallel()
+
+	host := actionsResultsHost
+	for name, tc := range map[string]struct {
+		reqHost   string
+		urlScheme string
+		urlHost   string
+		want      bool
+	}{
+		"bare results host":            {reqHost: host, want: true},
+		"results host with 443":        {reqHost: host + ":443", want: true},
+		"results host uppercased":      {reqHost: strings.ToUpper(host), want: true},
+		"results host with 80":         {reqHost: host + ":80", want: false},
+		"results host with other port": {reqHost: host + ":8443", want: false},
+		"foreign host":                 {reqHost: "evil.example.com", want: false},
+		"foreign host on 443":          {reqHost: "evil.example.com:443", want: false},
+		"absolute form":                {reqHost: host, urlScheme: "https", urlHost: host, want: false},
+		"opaque scheme form":           {reqHost: host, urlScheme: "https", want: false},
+		"empty host":                   {reqHost: "", want: false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			req := &http.Request{Host: tc.reqHost, URL: &url.URL{
+				Scheme: tc.urlScheme, Host: tc.urlHost, Path: "/twirp/x",
+			}}
+			if got := actionsRequestTargetsResultsHost(req); got != tc.want {
+				t.Fatalf("actionsRequestTargetsResultsHost(Host=%q scheme=%q urlhost=%q) = %v, want %v",
+					tc.reqHost, tc.urlScheme, tc.urlHost, got, tc.want)
+			}
+		})
+	}
+}
+
+// End to end, a foreign inner host is refused with a local 421 and never dials
+// GitHub. dialUpstream is the synchronous fence: if the guard is bypassed, the
+// splice dials before the assertion can run, so a recorded dial fails the test
+// with no race.
 func TestPassthroughRefusesAForeignInnerHost(t *testing.T) {
 	t.Parallel()
 
@@ -305,73 +346,90 @@ func TestPassthroughRefusesAForeignInnerHost(t *testing.T) {
 			"Host: evil.example.com\r\n\r\n",
 		"foreign host with results port": "GET /twirp/x HTTP/1.1\r\n" +
 			"Host: evil.example.com:443\r\n\r\n",
+		"foreign host with non-results port": "GET /twirp/x HTTP/1.1\r\n" +
+			"Host: " + actionsResultsHost + ":8443\r\n\r\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			reached := make(chan struct{}, 1)
-			_, tlsConn := tunneledActionsService(t, func(_ *fakeResultsUpstream, conn net.Conn) {
-				reached <- struct{}{}
-				_ = conn.Close()
-			})
+			service, credentials := interceptService(t)
+			var dials atomic.Int32
+			service.actions.dialUpstream = func(context.Context) (net.Conn, error) {
+				dials.Add(1)
+
+				return nil, errors.New("the guard let a foreign host reach the dial")
+			}
+			tlsConn := connectTunnel(t, service, credentials)
 
 			if _, err := tlsConn.Write([]byte(request)); err != nil {
 				t.Fatalf("write the misdirected request: %v", err)
 			}
-			statusLine, err := bufio.NewReader(tlsConn).ReadString('\n')
-			if err != nil || !strings.Contains(statusLine, " 421 ") {
-				t.Fatalf("misdirected request answered %q, error=%v; want a local 421",
-					strings.TrimSpace(statusLine), err)
+			// Read the complete close-delimited refusal, not just its first line, so
+			// the connection has been fully answered before the dial count is read.
+			response, err := io.ReadAll(tlsConn)
+			if err != nil {
+				t.Fatalf("read the refusal: %v", err)
 			}
-			select {
-			case <-reached:
-				t.Fatal("a foreign inner host was spliced to GitHub rather than refused locally")
-			default:
+			if !strings.HasPrefix(string(response), "HTTP/1.1 421 ") {
+				t.Fatalf("misdirected request answered %q; want a local 421",
+					strings.SplitN(string(response), "\r\n", 2)[0])
+			}
+			if dials.Load() != 0 {
+				t.Fatal("a foreign inner host reached the upstream dial rather than being refused")
 			}
 		})
 	}
 }
 
 // A HOSTILE GUEST THAT NEVER CLOSES ITS WRITE SIDE MUST NOT PIN THE HANDLER once
-// GitHub has finished. Before the fix a half-close left the guest→upstream copy
-// blocked forever; the splice now tears down both directions when either ends.
-func TestPassthroughDoesNotLeakWhenGitHubFinishesFirst(t *testing.T) {
+// GitHub has finished. This drives splice() directly and asserts SPLICE ITSELF
+// returns — the earlier version watched the guest-side read, which a TLS
+// close_notify satisfies while the handler stays blocked, so it passed against
+// the very leak it named. Here the guest connection's write side is held open
+// for the whole test and splice must still return once upstream closes.
+func TestSpliceReturnsWhenOneSideClosesWhileTheOtherStaysOpen(t *testing.T) {
 	t.Parallel()
 
-	_, tlsConn := tunneledActionsService(t, func(u *fakeResultsUpstream, conn net.Conn) {
-		reader := bufio.NewReader(conn)
-		request, err := http.ReadRequest(reader)
-		if err != nil {
-			return
-		}
-		u.record(request)
-		// Answer, then close — GitHub is done, but the guest below never will be.
-		//nolint:errcheck // best effort; the test fails on a leak, not on this write
-		_, _ = conn.Write([]byte("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"))
-		_ = conn.Close()
-	})
+	service, _ := interceptService(t)
 
-	if _, err := tlsConn.Write([]byte("GET /twirp/x HTTP/1.1\r\nHost: " +
-		actionsResultsHost + "\r\n\r\n")); err != nil {
-		t.Fatalf("write the request: %v", err)
+	guestForSplice, guestPeer := net.Pipe()
+	t.Cleanup(func() { _ = guestPeer.Close() })
+
+	upstreamForSplice, upstreamPeer := net.Pipe()
+
+	service.actions.dialUpstream = func(context.Context) (net.Conn, error) {
+		return upstreamForSplice, nil
 	}
 
-	// The guest deliberately never closes its write side. If the splice half-closed
-	// and waited, this read would block until the tunnel's own deadline; the fix
-	// tears the guest connection down when GitHub closes, so the read returns
-	// PROMPTLY. A read that runs to the deadline is the leak reproducing.
-	drained := make(chan error, 1)
+	// Upstream reads the replayed request, answers, and closes — GitHub is done.
+	// The guest peer is never touched, standing in for a runner that leaves its
+	// write side open (a live-log websocket that has not been closed yet).
+	go func() {
+		//nolint:errcheck // draining whatever splice writes to the guest side
+		_, _ = io.Copy(io.Discard, guestPeer)
+	}()
+	go func() {
+		buffer := make([]byte, 512)
+		//nolint:errcheck // the replayed request is drained, not asserted
+		_, _ = upstreamPeer.Read(buffer)
+		//nolint:errcheck // the guest reads the answer or splice's own teardown ends it
+		_, _ = upstreamPeer.Write([]byte("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"))
+		_ = upstreamPeer.Close()
+	}()
+
+	capture := &actionsCaptureReader{reader: bytes.NewReader(nil), limit: 4096}
+
+	returned := make(chan struct{})
 
 	go func() {
-		_, err := io.Copy(io.Discard, tlsConn)
-		drained <- err
+		service.actions.splice(t.Context(), guestForSplice, capture)
+		close(returned)
 	}()
 
 	select {
-	case <-drained:
-		// EOF or a torn-down connection — either way the tunnel finished.
+	case <-returned:
 	case <-time.After(3 * time.Second):
-		t.Fatal("the splice did not finish after GitHub closed; the hostile guest pinned it")
+		t.Fatal("splice did not return after upstream closed; the open guest side pinned it")
 	}
 }
 
@@ -470,10 +528,9 @@ func answerRequests(response string) func(*fakeResultsUpstream, net.Conn) {
 
 // tunneledActionsService builds a service with a fake upstream, an authorized
 // session, and an open TLS connection through the CONNECT tunnel.
-func tunneledActionsService(
-	t *testing.T,
-	handler func(*fakeResultsUpstream, net.Conn),
-) (*fakeResultsUpstream, *tls.Conn) {
+// interceptService builds a cache service with an authorized, interception-
+// enabled session and returns it with the guest credentials.
+func interceptService(t *testing.T) (*CacheService, CacheCredentials) {
 	t.Helper()
 
 	service, err := NewCacheService("http://127.0.0.1:7718", "test-deployment", t.TempDir(),
@@ -493,8 +550,13 @@ func tunneledActionsService(
 		return true, nil
 	}))
 
-	upstream := newFakeResultsUpstream(t, handler)
-	service.actions.dialUpstream = upstream.dial
+	return service, credentials
+}
+
+// connectTunnel opens a CONNECT tunnel to the service and completes TLS, so a
+// test can write raw guest bytes onto the intercepted connection.
+func connectTunnel(t *testing.T, service *CacheService, credentials CacheCredentials) *tls.Conn {
+	t.Helper()
 
 	proxyServer := httptest.NewServer(service)
 	t.Cleanup(proxyServer.Close)
@@ -549,7 +611,22 @@ func tunneledActionsService(
 		t.Fatalf("set the tunnel deadline: %v", err)
 	}
 
-	return upstream, tlsConn
+	return tlsConn
+}
+
+// tunneledActionsService wires a fake upstream into an intercepting service and
+// returns it beside an open tunnel.
+func tunneledActionsService(
+	t *testing.T,
+	handler func(*fakeResultsUpstream, net.Conn),
+) (*fakeResultsUpstream, *tls.Conn) {
+	t.Helper()
+
+	service, credentials := interceptService(t)
+	upstream := newFakeResultsUpstream(t, handler)
+	service.actions.dialUpstream = upstream.dial
+
+	return upstream, connectTunnel(t, service, credentials)
 }
 
 // THE SPLICE CARRIES GITHUB'S OWN BYTES, so the status line the guest reads is

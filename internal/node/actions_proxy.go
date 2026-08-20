@@ -204,10 +204,16 @@ func (p *actionsProxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 // exactly the results host. http.ReadRequest fills req.Host from the Host
 // header for an origin-form request, so this reads the guest's own claim.
 func actionsRequestTargetsResultsHost(req *http.Request) bool {
-	if req.URL.Host != "" {
+	// ANY SCHEME MEANS ABSOLUTE OR OPAQUE FORM, refused wholesale. Go parses
+	// `https://host/p` with a Host, but also `https:/p` and `https:evil` with an
+	// empty Host and a set Scheme, so keying only on URL.Host let those through.
+	// An origin-form request the runner actually sends has neither.
+	if req.URL.Scheme != "" || req.URL.Host != "" {
 		return false
 	}
 
+	// CASE-INSENSITIVE, because a host name is, and the runner has no obligation
+	// to spell it lowercase. The port, when present, must be 443.
 	host := req.Host
 	if h, port, err := net.SplitHostPort(host); err == nil {
 		if port != "443" {
@@ -216,7 +222,7 @@ func actionsRequestTargetsResultsHost(req *http.Request) bool {
 		host = h
 	}
 
-	return host == actionsResultsHost
+	return strings.EqualFold(host, actionsResultsHost)
 }
 
 func hijack(w http.ResponseWriter) (net.Conn, *bufio.ReadWriter, error) {
