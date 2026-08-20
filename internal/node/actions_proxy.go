@@ -83,6 +83,16 @@ func (s *CacheService) ensureActionsProxy() (*actionsProxy, error) {
 	// Never inherit the node process's proxy environment. A passthrough request
 	// returning to this listener would recurse until the job timed out.
 	transport.Proxy = nil
+	// THE TUNNEL SPEAKS HTTP/1.1 AND THE UPSTREAM MUST NOT DECIDE OTHERWISE.
+	// With HTTP/2 left on, GitHub's edge negotiates h2 and Response.Write then
+	// puts `HTTP/2.0 200 OK` on the wire of an HTTP/1.1 connection — measured:
+	// the .NET runner refuses it with "Received an invalid status line", which
+	// breaks every passthrough call the runner itself makes (step updates, log
+	// uploads, artifacts) while local cache responses keep working. The guest
+	// client chose HTTP/1.1; the upstream protocol is this proxy's private
+	// business and must not leak into the framing it answers with.
+	transport.ForceAttemptHTTP2 = false
+	transport.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
 	s.actions = &actionsProxy{
 		service: s, ca: ca, leaf: leaf, upstream: transport,
 	}
@@ -235,6 +245,13 @@ func (p *actionsProxy) intercept(
 	// One request per intercepted tunnel keeps an upstream framing mistake or
 	// partially consumed body from contaminating the next results operation.
 	resp.Close = true
+	// WRITTEN AS HTTP/1.1 WHATEVER THE UPSTREAM SPOKE. Response.Write renders
+	// the status line from these fields, and a response that arrived over h2
+	// would otherwise reach the guest's HTTP/1.1 reader as `HTTP/2.0 200 OK` —
+	// a status line the official runner rejects outright. The transport above
+	// no longer negotiates h2, so this is the backstop that keeps a future
+	// transport change from silently reintroducing the mismatch.
+	resp.Proto, resp.ProtoMajor, resp.ProtoMinor = "HTTP/1.1", 1, 1
 	if err := resp.Write(tlsConn); err != nil {
 		return
 	}

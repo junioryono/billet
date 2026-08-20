@@ -1,6 +1,7 @@
 package node
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -8,9 +9,11 @@ import (
 	"encoding/base64"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -275,5 +278,106 @@ func TestActionsProxyPassesBuildKitMetadataUpstreamWithoutConsumingIt(t *testing
 	if upstreamBody != `{"key":"buildkit","version":"v1"}` ||
 		upstreamUserAgent != "buildkit/v0.25" {
 		t.Fatalf("upstream body=%q user-agent=%q", upstreamBody, upstreamUserAgent)
+	}
+}
+
+// THE TUNNEL'S STATUS LINE MUST SAY HTTP/1.1 WHATEVER THE UPSTREAM SPOKE. The
+// guest side of the tunnel is the official runner's strict HTTP/1.1 reader, and
+// it refuses `HTTP/2.0 200 OK` outright — measured live: with GitHub's edge
+// negotiating h2, every passthrough call the runner itself makes (step updates,
+// log uploads, artifacts) failed with "Received an invalid status line" while
+// local cache responses kept working. Go's own client parses any HTTP/x.y, which
+// is exactly why the end-to-end test above could not see this: the status line is
+// read raw here, with no tolerant client in between.
+func TestPassthroughAnswersHTTP11WhateverTheUpstreamNegotiated(t *testing.T) {
+	t.Parallel()
+
+	service, err := NewCacheService("http://127.0.0.1:7718", "test-deployment", t.TempDir(),
+		&fakeCacheStore{}, &fakeVolumeAttacher{}, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewCacheService: %v", err)
+	}
+	credentials, err := service.PrepareScoped("billet-lease-h2", CacheSessionScope{
+		Trust: provider.TrustTrusted, Intercept: true, Owner: "acme", Repository: "api",
+		WorkflowRef: "acme/api/.github/workflows/ci.yml@refs/heads/main",
+	})
+	if err != nil {
+		t.Fatalf("PrepareScoped: %v", err)
+	}
+	service.actionIO = &fakeActionsVolumeManager{}
+	service.SetActionsPolicy(actionsPolicyFunc(func(context.Context, string, string) (bool, error) {
+		return true, nil
+	}))
+
+	// The shape Go's transport produces when the far end negotiated h2.
+	service.actions.upstream = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{
+			Status: "200 OK", StatusCode: http.StatusOK,
+			Proto: "HTTP/2.0", ProtoMajor: 2, ProtoMinor: 0,
+			Header:  http.Header{"Content-Type": []string{"application/json"}},
+			Body:    io.NopCloser(strings.NewReader(`{"artifact":"upstream"}`)),
+			Request: r,
+		}, nil
+	})
+
+	proxyServer := httptest.NewServer(service)
+	t.Cleanup(proxyServer.Close)
+
+	conn, err := net.Dial("tcp", strings.TrimPrefix(proxyServer.URL, "http://"))
+	if err != nil {
+		t.Fatalf("dial the proxy: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	authority := actionsResultsHost + ":443"
+	credential := base64.StdEncoding.EncodeToString(
+		[]byte(actionsProxyUser + ":" + credentials.Token))
+	if _, err := conn.Write([]byte("CONNECT " + authority + " HTTP/1.1\r\nHost: " + authority +
+		"\r\nProxy-Authorization: Basic " + credential + "\r\n\r\n")); err != nil {
+		t.Fatalf("write CONNECT: %v", err)
+	}
+
+	reader := bufio.NewReader(conn)
+	connectLine, err := reader.ReadString('\n')
+	if err != nil || !strings.Contains(connectLine, " 200 ") {
+		t.Fatalf("CONNECT answered %q, error=%v", connectLine, err)
+	}
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read CONNECT headers: %v", err)
+		}
+		if line == "\r\n" {
+			break
+		}
+	}
+
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM([]byte(credentials.ActionsCAPEM)) {
+		t.Fatal("the guest interception CA was not parseable")
+	}
+	tlsConn := tls.Client(conn, &tls.Config{
+		MinVersion: tls.VersionTLS13, RootCAs: roots, ServerName: actionsResultsHost,
+	})
+	if err := tlsConn.HandshakeContext(t.Context()); err != nil {
+		t.Fatalf("TLS handshake through the tunnel: %v", err)
+	}
+
+	body := `{"name":"release"}`
+	request := "POST /twirp/github.actions.results.api.v1.ArtifactService/CreateArtifact HTTP/1.1\r\n" +
+		"Host: " + actionsResultsHost + "\r\n" +
+		"Content-Type: application/json\r\n" +
+		"Content-Length: " + strconv.Itoa(len(body)) + "\r\n\r\n" + body
+	if _, err := tlsConn.Write([]byte(request)); err != nil {
+		t.Fatalf("write the tunneled request: %v", err)
+	}
+
+	statusLine, err := bufio.NewReader(tlsConn).ReadString('\n')
+	if err != nil {
+		t.Fatalf("read the tunneled status line: %v", err)
+	}
+	if !strings.HasPrefix(statusLine, "HTTP/1.1 200") {
+		t.Fatalf("the tunnel answered %q; the official runner refuses any status line "+
+			"that is not HTTP/1.1", strings.TrimSpace(statusLine))
 	}
 }
