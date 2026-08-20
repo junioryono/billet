@@ -166,6 +166,14 @@ func TestInterceptScopeRejectsMissingAssignmentIdentity(t *testing.T) {
 		"owner":        {Trust: provider.TrustTrusted, Intercept: true, Repository: "api", WorkflowRef: "acme/api/.github/workflows/ci.yml@refs/heads/main"},
 		"repository":   {Trust: provider.TrustTrusted, Intercept: true, Owner: "acme", WorkflowRef: "acme/api/.github/workflows/ci.yml@refs/heads/main"},
 		"workflow ref": {Trust: provider.TrustTrusted, Intercept: true, Owner: "acme", Repository: "api"},
+		"workflow ref without revision": {
+			Trust: provider.TrustTrusted, Intercept: true, Owner: "acme", Repository: "api",
+			WorkflowRef: "acme/api/.github/workflows/ci.yml",
+		},
+		"workflow ref without workflow": {
+			Trust: provider.TrustTrusted, Intercept: true, Owner: "acme", Repository: "api",
+			WorkflowRef: "@refs/heads/main",
+		},
 		"oversized": {
 			Trust: provider.TrustTrusted, Intercept: true, Owner: strings.Repeat("a", 101),
 			Repository: "api", WorkflowRef: strings.Repeat("a", 101) + "/api/ci.yml@refs/heads/main",
@@ -178,6 +186,27 @@ func TestInterceptScopeRejectsMissingAssignmentIdentity(t *testing.T) {
 				t.Fatal("interception was enabled without an authenticated repository scope")
 			}
 		})
+	}
+}
+
+func TestInterceptScopeAcceptsCrossRepositoryReusableWorkflow(t *testing.T) {
+	t.Parallel()
+
+	service, err := NewCacheService("http://127.0.0.1:7718", "test-deployment", t.TempDir(),
+		&fakeCacheStore{}, &fakeVolumeAttacher{}, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewCacheService: %v", err)
+	}
+
+	credentials, err := service.PrepareScoped("billet-reusable-workflow", CacheSessionScope{
+		Trust: provider.TrustTrusted, Intercept: true, Owner: "acme", Repository: "api",
+		WorkflowRef: "shared/ci/.github/workflows/cache.yml@refs/tags/v1",
+	})
+	if err != nil {
+		t.Fatalf("PrepareScoped: %v", err)
+	}
+	if credentials.ActionsProxy == "" || credentials.ActionsCAPEM == "" {
+		t.Fatal("a cross-repository reusable workflow did not receive interception credentials")
 	}
 }
 
