@@ -48,10 +48,9 @@ func validateActionsScope(scope CacheSessionScope) error {
 	if strings.Contains(scope.Owner, "/") || strings.Contains(scope.Repository, "/") {
 		return errors.New("node: intercepted cache owner and repository must be path components")
 	}
-	wantPrefix := scope.Owner + "/" + scope.Repository + "/"
 	workflow, ref, ok := strings.Cut(scope.WorkflowRef, "@")
-	if !ok || !strings.HasPrefix(workflow, wantPrefix) || strings.TrimSpace(ref) == "" {
-		return errors.New("node: intercepted cache workflow ref does not belong to its repository")
+	if !ok || strings.TrimSpace(workflow) == "" || strings.TrimSpace(ref) == "" {
+		return errors.New("node: intercepted cache workflow ref is malformed")
 	}
 
 	return nil
