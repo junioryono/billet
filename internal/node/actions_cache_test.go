@@ -543,22 +543,46 @@ func TestActionsCacheKeysCannotCrossRepositoryOrWorkflowScopes(t *testing.T) {
 	service := &CacheService{namespace: "deployment/site"}
 	base := &cacheSession{
 		owner: "acme", repository: "api",
-		workflowRef: "acme/api/.github/workflows/ci.yml@refs/heads/main",
+		workflowRef: "shared/ci/.github/workflows/cache.yml@refs/tags/v1",
 	}
 	baseKey := service.actionsStoreKey(base, "linux-npm", "v1")
 	for name, other := range map[string]*cacheSession{
 		"repository": {
 			owner: "acme", repository: "web",
-			workflowRef: "acme/web/.github/workflows/ci.yml@refs/heads/main",
+			workflowRef: "shared/ci/.github/workflows/cache.yml@refs/tags/v1",
 		},
 		"workflow ref": {
 			owner: "acme", repository: "api",
-			workflowRef: "acme/api/.github/workflows/ci.yml@refs/heads/release",
+			workflowRef: "shared/ci/.github/workflows/cache.yml@refs/tags/v2",
 		},
 	} {
 		if otherKey := service.actionsStoreKey(other, "linux-npm", "v1"); otherKey == baseKey {
 			t.Errorf("%s scope produced the same durable key %q", name, baseKey)
 		}
+	}
+}
+
+func TestCrossRepositoryReusableWorkflowUsesCallerRepositoryPolicy(t *testing.T) {
+	t.Parallel()
+
+	service, _, session, _ := testActionsService(t)
+	session.workflowRef = "shared/ci/.github/workflows/cache.yml@refs/tags/v1"
+	var policyOwner, policyRepository string
+	service.SetActionsPolicy(actionsPolicyFunc(func(_ context.Context, owner, repository string) (bool, error) {
+		policyOwner, policyRepository = owner, repository
+
+		return true, nil
+	}))
+	request := actionsRequestForTest(t, http.MethodPost,
+		"https://"+actionsResultsHost+actionsDownloadPath,
+		`{"key":"caller-policy","restore_keys":[],"version":"v1"}`)
+	response, handled, err := service.actionsResponse(request, session)
+	if err != nil || !handled {
+		t.Fatalf("GetCacheEntryDownloadURL handled=%t error=%v", handled, err)
+	}
+	response.Body.Close()
+	if policyOwner != "acme" || policyRepository != "api" {
+		t.Fatalf("policy scope = %s/%s, want caller acme/api", policyOwner, policyRepository)
 	}
 }
 
