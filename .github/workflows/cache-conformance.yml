@@ -69,7 +69,22 @@ jobs:
           if [ -n "$EXPECTED_GUEST_CONTRACT" ]; then
             test "$(sed -n 's/^WANT_CONTRACT=//p' /usr/local/bin/billet-agent | head -1)" = "$EXPECTED_GUEST_CONTRACT"
           fi
+      # A PLAIN RUN STEP DOES NOT SEE THE ACTIONS RUNTIME. ACTIONS_RESULTS_URL and
+      # ACTIONS_RUNTIME_TOKEN are handed only to action steps, so the probe below
+      # borrows them through a node action — measured live: the first run to reach
+      # this job died on `test -n` with both variables empty, on a runner whose
+      # interception was healthy.
+      - name: Expose the Actions runtime to the probe
+        uses: actions/github-script@v8
+        with:
+          script: |
+            core.setSecret(process.env.ACTIONS_RUNTIME_TOKEN);
+            core.exportVariable('BILLET_PROBE_RESULTS_URL', process.env.ACTIONS_RESULTS_URL);
+            core.exportVariable('BILLET_PROBE_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN);
       - name: Prove this job is traversing Billet rather than GitHub's cache
+        env:
+          ACTIONS_RESULTS_URL: ${{ env.BILLET_PROBE_RESULTS_URL }}
+          ACTIONS_RUNTIME_TOKEN: ${{ env.BILLET_PROBE_RUNTIME_TOKEN }}
         run: |
           set -euo pipefail
           test -n "${ACTIONS_RESULTS_URL:-}"
