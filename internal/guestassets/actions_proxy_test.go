@@ -187,7 +187,15 @@ client_b.sendall(b"clienthello")
 worker.join(5)
 assert not worker.is_alive(), "handle did not return after the tunnel failed"
 assert outcome.get("result") == "returned", "handle exited abnormally: %s" % outcome.get("result")
-assert client_b.recv(1) == b"", "the mid-TLS client was written to or left open"
+# The client sent a byte to pass the first-byte gate; handle closes without reading
+# it, which on Linux sends a RST, so the peer sees ConnectionResetError rather than a
+# clean EOF. Both are "closed with nothing written" -- what would FAIL is receiving an
+# actual byte, which means the mid-TLS client was written to.
+try:
+    leftover = client_b.recv(1)
+except ConnectionResetError:
+    leftover = b""
+assert leftover == b"", "the mid-TLS client was written to or left open"
 client_b.close()
 
 # A peer that stops reading must not hang a relay thread forever. The node floods

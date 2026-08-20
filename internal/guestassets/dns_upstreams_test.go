@@ -14,8 +14,12 @@ import (
 // the real script against fixtures and assert the emitted array, so deleting a
 // guard changes the output rather than passing a text match.
 func TestDNSUpstreamsKeepsOnlyRealGlobalUpstreams(t *testing.T) {
-	t.Parallel()
-
+	// Deliberately NOT parallel, in the parent or the cases below. Each case forks
+	// python3, and a burst of concurrent forks widens the window in which another
+	// parallel test in this package (docker-cache, runner-service) writes an
+	// executable and execs it: the fork inherits the open write fd and that exec
+	// fails with ETXTBSY. Run serially -- it is fast -- so these forks never overlap
+	// those writes. See the same reasoning on the write side if this recurs.
 	python, err := exec.LookPath("python3")
 	if err != nil {
 		t.Skip("python3 is not installed on this development host")
@@ -124,7 +128,6 @@ func TestDNSUpstreamsKeepsOnlyRealGlobalUpstreams(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
 			resolv := filepath.Join(t.TempDir(), "resolv.conf")
 			if err := os.WriteFile(resolv, []byte(tc.resolv), 0o600); err != nil {
 				t.Fatalf("write resolv: %v", err)
