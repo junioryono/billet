@@ -302,22 +302,95 @@ func TestTheGuestAgentInstallsActionsInterceptionForEveryRunnerSurface(t *testin
 		"fetch actions-proxy", "fetch actions-ca-pem", "cat /etc/ssl/certs/ca-certificates.crt",
 		"actions_ca_dir=/home/runner/runner/_work/_billet",
 		`actions_ca_path="$actions_ca_dir/actions-cache-ca.pem"`,
-		`"HTTPS_PROXY=$actions_guest_proxy"`, `"https_proxy=$actions_guest_proxy"`,
+		// The runner reaches the intercepted origin by a DNS remap, not a proxy
+		// variable: only the node CA and the job-started hook are published to it.
 		`"NODE_EXTRA_CA_CERTS=$actions_ca_path"`, `"SSL_CERT_FILE=$actions_ca_path"`,
 		`"ACTIONS_RUNNER_HOOK_JOB_STARTED=$actions_hook_path"`,
 		`target="$RUNNER_TEMP/billet-actions-cache-ca.pem"`,
 		`install -m 0444 "$BILLET_ACTIONS_CA_SOURCE" "$target"`,
-		`printf 'HTTPS_PROXY=%s\n' "$BILLET_ACTIONS_PROXY"`,
 		`printf 'NODE_EXTRA_CA_CERTS=%s\n' "$target"`,
 		`printf 'SSL_CERT_FILE=%s\n' "$target"`,
 		`} >>"$GITHUB_ENV"`,
 		`--property=Restart=always --property=RestartSec=100ms`,
-		`--listen "$docker_bridge:7719" --upstream "$actions_proxy"`,
-		`actions_guest_proxy="http://$docker_bridge:7719"`,
+		// The passthrough binds the pinned docker gateway and needs the privileged
+		// bind capability to listen on 443.
+		`--property=AmbientCapabilities=CAP_NET_BIND_SERVICE`,
+		`--listen "$docker_gateway:443" --upstream "$actions_proxy"`,
+		`docker_gateway=172.17.0.1`,
+		// The passthrough is failed open to the real origin, resolved before the
+		// remap, with the gateway excluded so the fallback can never be a loop.
+		`--fallback-addr "$results_fallback"`,
+		`results_fallback=$(getent ahostsv4 results-receiver.actions.githubusercontent.com`,
+		`awk -v gateway="$docker_gateway" '$1 != gateway {print $1}'`,
+		// Interception activates only when a fallback resolved, or a later node
+		// outage would fail the artifact and log traffic sharing the origin.
+		`[ -n "$results_fallback" ] &&`,
+		// Daemon-side clients (dockerd, embedded BuildKit) trust the node leaf only
+		// if the CA is in the system store, installed before Docker starts.
+		`/usr/local/share/ca-certificates/billet-actions-cache.crt`,
+		`update-ca-certificates`,
+		// The runner is remapped through /etc/hosts, and only the one results origin.
+		`printf '%s results-receiver.actions.githubusercontent.com\n' "$docker_gateway" >>/etc/hosts`,
+		// Containers do not inherit /etc/hosts, so a guest dnsmasq answers for them
+		// and dockerd is pointed at it before it starts.
+		`--listen-address="$docker_gateway" --bind-interfaces`,
+		`--resolv-file="$upstream_resolv"`,
+		`--address="/results-receiver.actions.githubusercontent.com/$docker_gateway"`,
+		`'if type == "object" then . + {"dns": $dns} else error("not an object") end'`,
+		// The dns list is produced by the behavior-tested filter, which keeps only a
+		// real global upstream so no value dockerd rejects reaches daemon.json.
+		`dns_json=$(/usr/local/bin/billet-dns-upstreams "$docker_gateway" "$upstream_resolv"`,
+		`"$rootfs/usr/local/bin/billet-dns-upstreams"`,
 	} {
 		if !strings.Contains(text, want) {
 			t.Errorf("the guest agent does not establish %q", want)
 		}
+	}
+
+	// A published proxy variable is exactly the catch-all funnel this design
+	// removed: every request the runner and its containers make would route
+	// through one guest relay, and bulk transfers stalled through it.
+	for _, forbidden := range []string{"HTTPS_PROXY=", "https_proxy=", "actions_guest_proxy", `docker_bridge:7719`} {
+		if strings.Contains(text, forbidden) {
+			t.Errorf("the guest still funnels traffic through a proxy variable via %q", forbidden)
+		}
+	}
+
+	// The container DNS must be set before Docker starts: dockerd reads daemon.json
+	// only at start and does not reload "dns" on SIGHUP.
+	dnsMergeAt := strings.Index(text, `. + {"dns": $dns}`)
+	prepareAt := strings.Index(text, "billet-docker-cache prepare")
+	if dnsMergeAt < 0 || prepareAt < 0 || dnsMergeAt >= prepareAt {
+		t.Fatal("the guest does not point container DNS at the resolver before Docker starts")
+	}
+
+	// container_dns_active is read unconditionally after Docker starts, so it must be
+	// initialized BEFORE the interception conditional -- an untrusted job gets no
+	// interception metadata and would otherwise read it unset under `set -u` and die.
+	dnsInitAt := strings.Index(text, `container_dns_active=""`)
+	interceptCondAt := strings.Index(text, "if actions_proxy_candidate=$(fetch actions-proxy")
+	if dnsInitAt < 0 || interceptCondAt < 0 || dnsInitAt >= interceptCondAt {
+		t.Fatal("container_dns_active is not initialized before the interception conditional")
+	}
+
+	// The node CA reaches the system trust store before Docker starts, or dockerd
+	// and its embedded BuildKit cannot validate the node leaf for gha traffic.
+	caInstallAt := strings.Index(text, "update-ca-certificates")
+	if caInstallAt < 0 || caInstallAt >= prepareAt {
+		t.Fatal("the node CA is not added to the system trust store before Docker starts")
+	}
+
+	// daemon.json is written ONLY when the filter produced a usable list, so it is
+	// never a resolver-of-one that takes container DNS down with it when the resolver
+	// drops, and no value dockerd rejects can reach the daemon and stop it starting.
+	guardAt := strings.Index(text, `[ -n "$dns_json" ]; then`)
+	if guardAt < 0 || guardAt >= dnsMergeAt {
+		t.Fatal("the container dns list is written without first requiring a usable filtered list")
+	}
+
+	// The container resolver runs only when that dns list was configured.
+	if !strings.Contains(text, `if [ -n "$container_dns_active" ]; then`) {
+		t.Fatal("the container resolver is not gated on container DNS being configured")
 	}
 
 	proxyAt := strings.Index(text, "fetch actions-proxy")
@@ -329,7 +402,8 @@ func TestTheGuestAgentInstallsActionsInterceptionForEveryRunnerSurface(t *testin
 		strings.Index(text, `printf '\n%s\n' "$actions_ca_candidate"`) {
 		t.Fatal("the guest trust bundle does not keep system roots before the Billet authority")
 	}
-	if strings.Contains(text, "--listen 0.0.0.0:7719") {
+	// The passthrough binds the docker gateway, never the microVM workload interface.
+	if strings.Contains(text, "--listen 0.0.0.0:") {
 		t.Fatal("the cache-session proxy is exposed on the microVM workload interface")
 	}
 }

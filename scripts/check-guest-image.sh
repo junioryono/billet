@@ -139,9 +139,10 @@ fi
 DOCKER_DAEMON="$MNT/etc/docker/daemon.json"
 if [ -r "$DOCKER_DAEMON" ] && jq -e '
 	.features["containerd-snapshotter"] == false and
-	.["storage-driver"] == "overlay2"
+	.["storage-driver"] == "overlay2" and
+	.bip == "172.17.0.1/16"
 ' "$DOCKER_DAEMON" >/dev/null; then
-	pass "Docker keeps pulled images inside the cache-backed data root"
+	pass "Docker keeps pulled images inside the cache-backed data root on a pinned gateway"
 else
 	fail "Docker is not pinned to overlay2 under /var/lib/docker; fresh Docker 29
         installations keep image content in /var/lib/containerd and bypass the cache"
@@ -395,12 +396,22 @@ else
 fi
 
 ACTIONS_PROXY="$MNT/usr/local/bin/billet-actions-proxy"
-if [ -x "$ACTIONS_PROXY" ] && grep -Fq 'results-receiver.actions.githubusercontent.com' "$ACTIONS_PROXY" &&
-	grep -Fq 'return direct_connection(host, port)' "$ACTIONS_PROXY"; then
-	pass "the guest carries the fail-open Actions forward proxy"
+if [ -x "$ACTIONS_PROXY" ] &&
+	grep -Fq 'results-receiver.actions.githubusercontent.com:443' "$ACTIONS_PROXY" &&
+	grep -Fq 'def node_tunnel' "$ACTIONS_PROXY"; then
+	pass "the guest carries the transparent Actions results passthrough"
 else
-	fail "the guest has no selective Actions forward proxy; an interception listener outage
-        could make every HTTPS destination unavailable instead of degrading to GitHub's cache"
+	fail "the guest has no Actions results passthrough; only the one results origin is
+        DNS-remapped to it, so without it interception silently degrades to GitHub's cache"
+fi
+
+DNS_UPSTREAMS="$MNT/usr/local/bin/billet-dns-upstreams"
+if [ -x "$DNS_UPSTREAMS" ] && grep -Fq 'billet-dns-upstreams <gateway-ip> <resolv-file>' "$DNS_UPSTREAMS"; then
+	pass "the guest carries the container DNS upstream filter"
+else
+	fail "the guest has no container DNS upstream filter; an unvalidated resolver value
+        could reach daemon.json and stop Docker from starting, turning a lost cache
+        remap into a dead job"
 fi
 
 # --- service ordering -----------------------------------------------------
