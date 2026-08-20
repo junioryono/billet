@@ -744,7 +744,13 @@ func TestCompletionRecoversAnOmittedRequestIDFromTheRunnerName(t *testing.T) {
 	}
 }
 
-func TestCompletionRefusesDisagreeingRunnerAndJobIdentities(t *testing.T) {
+// GITHUB POOLS ASSIGNED JOBS ACROSS A SCALE SET'S RUNNERS, so a completion may
+// honestly pair a runner with a job billet launched another runner for. The
+// runner's own lease is the identity that settles — treating the disagreement as
+// an untrustworthy session made GitHub redeliver the same completion to every
+// fresh session, which took the control plane down in a restart loop the first
+// time a full suite ran concurrently.
+func TestCompletionSettlesTheRunnersLeaseWhenGitHubPairedItWithAnotherJob(t *testing.T) {
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
 	a := newAllocator(t, alloc.Limits{MaxVCPU: tierVCPU, MaxMemory: 64 * config.GiB}, tiers)
 
@@ -763,10 +769,18 @@ func TestCompletionRefusesDisagreeingRunnerAndJobIdentities(t *testing.T) {
 		t.Fatalf("IdentifyDirectJob: %v", err)
 	}
 
-	_, err = l.identifyCompletion(t.Context(), Job{RunID: 101, JobID: "different-job-guid",
+	resolved, err := l.identifyCompletion(t.Context(), Job{RunID: 102, JobID: "different-job-guid",
 		RunnerName: provider.InstanceName(lease.ID)})
-	if !errors.Is(err, ErrUntrustworthySession) {
-		t.Fatalf("identify completion with disagreeing identities = %v, want ErrUntrustworthySession", err)
+	if err != nil {
+		t.Fatalf("a pooled completion was refused rather than settled: %v", err)
+	}
+	if resolved.RequestID != 11 {
+		t.Fatalf("pooled completion resolved to request %d, want the runner's lease request 11",
+			resolved.RequestID)
+	}
+	if resolved.RunID != 102 {
+		t.Fatalf("pooled completion reports run %d, want the run the runner actually executed (102)",
+			resolved.RunID)
 	}
 }
 

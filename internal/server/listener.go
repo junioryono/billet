@@ -2188,9 +2188,27 @@ func (l *Listener) identifyCompletion(ctx context.Context, job Job) (Job, error)
 				return Job{}, fmt.Errorf("%w: completed runner %q resolves to tier %q request %d, not tier %q",
 					ErrUntrustworthySession, job.RunnerName, identity.Tier, identity.RequestID, l.tier)
 			}
+			// A RUNNER AND ITS INTENDED JOB ARE A POOL, NOT A PAIR, and treating a
+			// disagreement as a broken contract took the control plane down. Within
+			// one scale set GitHub hands an assigned job to whichever registered
+			// runner is free, so two jobs launched seconds apart can swap runners —
+			// measured live, the first time a full suite ran concurrently: the
+			// runner billet started for request -49 completed the job mapped to
+			// -52, honestly. The old fatal made GitHub redeliver the same message
+			// to every fresh session, which is a restart loop with no exit.
+			//
+			// THE RUNNER'S LEASE IS THE IDENTITY THAT SETTLES. The completion says
+			// THIS guest finished with THIS result, which is exactly what its
+			// capacity release and cache settlement need; the swapped job's own
+			// lease is settled by its own completion, which names the runner that
+			// actually ran it. The job-side facts (run id, job id) are kept from
+			// the message, because they describe the job that really ran here.
 			if job.RunID != 0 && identity.RunID != 0 && job.RunID != identity.RunID {
-				return Job{}, fmt.Errorf("%w: completed runner %q reports run %d but its lease records run %d",
-					ErrUntrustworthySession, job.RunnerName, job.RunID, identity.RunID)
+				l.log.Warn("a completed runner ran a job from a different run than the one "+
+					"it was launched for; github pools assigned jobs across a scale set's "+
+					"runners, so its lease settles under the run it actually executed",
+					"tier", l.tier, "runner", job.RunnerName,
+					"ran", job.RunID, "launched_for", identity.RunID)
 			}
 			if job.JobID != "" {
 				mapped, exists, err := l.alloc.DirectJobIdentity(ctx, job.JobID)
@@ -2199,8 +2217,12 @@ func (l *Listener) identifyCompletion(ctx context.Context, job Job) (Job, error)
 						ErrUntrustworthySession, l.tier, job.JobID, err)
 				}
 				if exists && mapped != identity.RequestID {
-					return Job{}, fmt.Errorf("%w: completed runner %q resolves to request %d but job %q resolves to %d",
-						ErrUntrustworthySession, job.RunnerName, identity.RequestID, job.JobID, mapped)
+					l.log.Warn("a completed runner ran a different assigned job than the one "+
+						"it was launched for; github pools assigned jobs across a scale set's "+
+						"runners, so the runner's own lease settles with this result and the "+
+						"swapped job's lease settles under its own completion",
+						"tier", l.tier, "runner", job.RunnerName,
+						"launched_for", identity.RequestID, "job", job.JobID, "ran", mapped)
 				}
 			}
 
