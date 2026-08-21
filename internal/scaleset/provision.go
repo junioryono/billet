@@ -331,6 +331,9 @@ func (j *JITRunner) Config() string { return j.encodedConfig }
 // runner, and teardown has to remove THAT one.
 func (j *JITRunner) RunnerName() string { return j.Name }
 
+// ID is GitHub's durable runner identity.
+func (j *JITRunner) ID() int64 { return j.RunnerID }
+
 // String redacts. See the type comment.
 func (j JITRunner) String() string {
 	return fmt.Sprintf("scaleset.JITRunner{RunnerID:%d Name:%q config:[redacted]}", j.RunnerID, j.Name)

@@ -1477,11 +1477,13 @@ var poolRunnerIdentityMigration = migration{
 			launch_request_id INTEGER NOT NULL CHECK (launch_request_id != 0),
 			runner_id         INTEGER NOT NULL DEFAULT 0 CHECK (runner_id >= 0),
 			runner_name       TEXT NOT NULL UNIQUE CHECK (length(trim(runner_name)) > 0),
-			status            TEXT NOT NULL CHECK (status IN ('idle','busy','retiring')),
+			status            TEXT NOT NULL CHECK (status IN ('idle','busy','retiring','retired')),
 			actual_request_id INTEGER NOT NULL DEFAULT 0,
 			run_id            INTEGER NOT NULL DEFAULT 0 CHECK (run_id >= 0),
 			job_id            TEXT NOT NULL DEFAULT '',
-			updated_at        TEXT NOT NULL
+			source_acknowledged INTEGER NOT NULL DEFAULT 0 CHECK (source_acknowledged IN (0,1)),
+			updated_at        TEXT NOT NULL,
+			UNIQUE (tier, launch_request_id)
 		) STRICT`,
 		`CREATE INDEX pool_runners_tier_status_idx ON pool_runners(tier, status)`,
 	},

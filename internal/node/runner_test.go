@@ -736,6 +736,44 @@ func TestAnAmbiguousLaunchCarriesItsPositiveObservationIntoCustody(t *testing.T)
 	}
 }
 
+func TestFailedLaunchRemovesRegistrationBeforeComputeCleanup(t *testing.T) {
+	p := &fakeProvider{
+		kind: config.ProviderDocker, launchErr: errors.New("lost launch response"),
+		startsAnyway: true,
+	}
+	a, host := newAllocatorWithHost(t)
+	jit := &fakeJIT{setID: 7, removeErr: errors.New("github unavailable")}
+	r := New(a, host, jit, p, nil)
+	lease := assignedLease(t, a)
+	name := provider.InstanceName(lease.ID)
+
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 18, Event: "push"}); !errors.Is(err, server.ErrCustody) {
+		t.Fatalf("Launch = %v, want ErrCustody", err)
+	}
+	if len(jit.removed) != 1 || jit.removed[0] != name {
+		t.Fatalf("registration removals = %v, want %q", jit.removed, name)
+	}
+	if len(p.destroyed) != 0 || p.live[name] == nil {
+		t.Fatalf("provider was touched before deregistration: destroyed %v live %+v", p.destroyed, p.live)
+	}
+	held := r.custodySnapshot()
+	if len(held) != 1 || !held[0].registrationPending {
+		t.Fatalf("registration custody = %+v", held)
+	}
+
+	jit.removeErr = nil
+	if err := r.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend after GitHub recovered: %v", err)
+	}
+	if len(jit.removed) != 2 || len(p.destroyed) != 1 || p.destroyed[0] != "instance-"+name {
+		t.Fatalf("retry order did not settle registration then compute: removals %v destroys %v",
+			jit.removed, p.destroyed)
+	}
+	if len(r.custodySnapshot()) != 0 {
+		t.Fatal("settled failed launch remains in custody")
+	}
+}
+
 // A held teardown is visible in the ledger, and a force release is delivered to
 // the live node through its heartbeat. The node drops custody before the lease
 // becomes terminal; it does not need a working provider read after an operator
@@ -1092,6 +1130,8 @@ type fakeJIT struct {
 	// describes counts scale-set resolutions, so a test can tell a cached answer
 	// from a fresh one.
 	describes int
+	removed   []string
+	removeErr error
 }
 
 func (f *fakeJIT) Describe(context.Context, string, string) (*Set, []string, error) {
@@ -1118,10 +1158,16 @@ func (f *fakeJIT) JITConfig(_ context.Context, _ int, name, _ string) (Registrat
 	return fakeRegistration{name: name}, nil
 }
 
+func (f *fakeJIT) RemoveRunner(_ context.Context, _ string, _ int64, name string) error {
+	f.removed = append(f.removed, name)
+	return f.removeErr
+}
+
 type fakeRegistration struct{ name string }
 
 func (f fakeRegistration) Config() string     { return "encoded-" + f.name }
 func (f fakeRegistration) RunnerName() string { return f.name }
+func (f fakeRegistration) ID() int64          { return 71 }
 
 type fakeProvider struct {
 	kind       config.ProviderKind

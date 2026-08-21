@@ -268,6 +268,7 @@ type cloudRegistration struct{ name string }
 
 func (r cloudRegistration) Config() string     { return "jit-for-" + r.name }
 func (r cloudRegistration) RunnerName() string { return r.name }
+func (r cloudRegistration) ID() int64          { return 71 }
 
 func (*cloudJIT) Describe(context.Context, string, string) (*node.Set, []string, error) {
 	return &node.Set{ID: 7, Name: ec2Tier}, nil, nil
@@ -284,6 +285,7 @@ func (j *cloudJIT) JITConfig(
 }
 
 func (*cloudJIT) ValidateTrustedRunnerGroup(context.Context, string, []string) error { return nil }
+func (*cloudJIT) RemoveRunner(context.Context, string, int64, string) error          { return nil }
 
 // cloudStack is a control-plane ledger and a node runtime over the cloud backend.
 type cloudStack struct {

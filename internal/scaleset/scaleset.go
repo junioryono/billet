@@ -68,7 +68,7 @@ type Config struct {
 // Client is billet's handle on the scale-set API.
 type Client struct {
 	gh     *gh.Client
-	policy *billetgithub.RunnerGroupPolicyClient
+	policy billetgithub.RunnerGroupPolicyClient
 	log    *slog.Logger
 }
 
@@ -100,7 +100,7 @@ func New(cfg Config, log *slog.Logger) (*Client, error) {
 		return nil, fmt.Errorf("scaleset: build client: %w", err)
 	}
 
-	var policy *billetgithub.RunnerGroupPolicyClient
+	var policy billetgithub.RunnerGroupPolicyClient
 	if cfg.Org != "" && cfg.AppID > 0 {
 		if cfg.APIURL == "" {
 			policy = billetgithub.NewRunnerGroupPolicyClient(cfg.Org, cfg.AppID, cfg.InstallationID,

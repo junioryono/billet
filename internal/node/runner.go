@@ -34,6 +34,8 @@ type JITSource interface {
 	Describe(ctx context.Context, name, group string) (*Set, []string, error)
 	// JITConfig mints a registration for one runner against one scale set.
 	JITConfig(ctx context.Context, scaleSetID int, runnerName, workFolder string) (Registration, error)
+	// RemoveRunner removes routing before failed-launch compute is touched.
+	RemoveRunner(ctx context.Context, leaseID string, runnerID int64, runnerName string) error
 }
 
 type trustedRunnerGroupValidator interface {
@@ -53,6 +55,8 @@ type Registration interface {
 	Config() string
 	// RunnerName is what GitHub registered, which is what teardown needs.
 	RunnerName() string
+	// ID is GitHub's durable runner identity.
+	ID() int64
 }
 
 // LeaseStore is the part of the capacity ledger the runner uses.
@@ -446,6 +450,11 @@ func (r *Runner) Launch(
 		// hand back capacity a container may still be using. CUSTODY UNLESS THE CLEANUP WAS
 		// CAUSAL: a successful synchronous Destroy or an explicit terminal record proves
 		// the compute is gone; an absent snapshot does not.
+		if removeErr := r.removeRegistration(ctx, lease.ID, reg.ID(), reg.RunnerName()); removeErr != nil {
+			r.holdWithRegistration(lease, name, job.RequestID, reg.ID(), reg.RunnerName())
+
+			return errCustody(name, errors.Join(err, removeErr))
+		}
 		if cleanup, cleanupErr := r.destroyStray(ctx, name); !cleanup.confirmed {
 			r.holdWithEvidence(lease, name, job.RequestID, cleanup.evidence)
 
@@ -471,6 +480,15 @@ func (r *Runner) Launch(
 		"instance", inst.ID, "trust", trust)
 
 	return nil
+}
+
+func (r *Runner) removeRegistration(
+	ctx context.Context, leaseID string, runnerID int64, runnerName string,
+) error {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), strayCleanupTimeout)
+	defer cancel()
+
+	return r.jit.RemoveRunner(cleanupCtx, leaseID, runnerID, runnerName)
 }
 
 // Destroy removes whatever Launch started for a request.

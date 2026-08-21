@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"slices"
@@ -14,7 +15,13 @@ import (
 )
 
 // RunnerGroupPolicyClient verifies the GitHub-side boundary of a trusted pool.
-type RunnerGroupPolicyClient struct {
+// Its implementation is hidden so credential-bearing values cannot be copied
+// out and rendered without the redaction methods below.
+type RunnerGroupPolicyClient interface {
+	ValidateTrustedRunnerGroup(context.Context, int, []string) error
+}
+
+type runnerGroupPolicyClient struct {
 	client         *http.Client
 	base           string
 	org            string
@@ -30,26 +37,26 @@ type RunnerGroupPolicyClient struct {
 // NewRunnerGroupPolicyClient builds a client for GitHub.com's organization API.
 func NewRunnerGroupPolicyClient(org string, appID, installationID int64,
 	privateKey []byte,
-) *RunnerGroupPolicyClient {
+) RunnerGroupPolicyClient {
 	return newRunnerGroupPolicyClient(http.DefaultClient, apiBase, org, appID, installationID, privateKey)
 }
 
 // NewRunnerGroupPolicyClientAt builds a client for a GitHub Enterprise API base.
 func NewRunnerGroupPolicyClientAt(base, org string, appID, installationID int64,
 	privateKey []byte,
-) *RunnerGroupPolicyClient {
+) RunnerGroupPolicyClient {
 	return newRunnerGroupPolicyClient(http.DefaultClient, base, org, appID, installationID, privateKey)
 }
 
 func newRunnerGroupPolicyClient(client *http.Client, base, org string, appID, installationID int64,
 	privateKey []byte,
-) *RunnerGroupPolicyClient {
-	return &RunnerGroupPolicyClient{client: client, base: base, org: org, appID: appID,
+) *runnerGroupPolicyClient {
+	return &runnerGroupPolicyClient{client: client, base: base, org: org, appID: appID,
 		installationID: installationID, privateKey: bytes.Clone(privateKey)}
 }
 
 // ValidateTrustedRunnerGroup requires GitHub's exact workflow restriction.
-func (c *RunnerGroupPolicyClient) ValidateTrustedRunnerGroup(ctx context.Context, groupID int,
+func (c *runnerGroupPolicyClient) ValidateTrustedRunnerGroup(ctx context.Context, groupID int,
 	wantWorkflows []string,
 ) error {
 	if c == nil || c.org == "" || c.appID <= 0 || c.installationID <= 0 || len(c.privateKey) == 0 {
@@ -100,7 +107,7 @@ func (c *RunnerGroupPolicyClient) ValidateTrustedRunnerGroup(ctx context.Context
 	return nil
 }
 
-func (c *RunnerGroupPolicyClient) installationToken(ctx context.Context) (string, error) {
+func (c *runnerGroupPolicyClient) installationToken(ctx context.Context) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.token != "" && time.Until(c.expiresAt) > time.Minute {
@@ -137,4 +144,44 @@ func (c *RunnerGroupPolicyClient) installationToken(ctx context.Context) (string
 	}
 	c.token, c.expiresAt = out.Token, out.ExpiresAt
 	return c.token, nil
+}
+
+func (c *runnerGroupPolicyClient) String() string {
+	if c == nil {
+		return "github.RunnerGroupPolicyClient<nil>"
+	}
+	return fmt.Sprintf("github.RunnerGroupPolicyClient{base:%q org:%q app_id:%d installation_id:%d credentials:[redacted]}",
+		c.base, c.org, c.appID, c.installationID)
+}
+
+func (c *runnerGroupPolicyClient) GoString() string { return c.String() }
+
+func (c *runnerGroupPolicyClient) Format(f fmt.State, _ rune) {
+	if _, err := f.Write([]byte(c.String())); err != nil {
+		return
+	}
+}
+
+func (c *runnerGroupPolicyClient) MarshalJSON() ([]byte, error) {
+	if c == nil {
+		return []byte("null"), nil
+	}
+	return json.Marshal(struct {
+		Base           string `json:"base"`
+		Org            string `json:"org"`
+		AppID          int64  `json:"app_id"`
+		InstallationID int64  `json:"installation_id"`
+		Credentials    string `json:"credentials"`
+	}{c.base, c.org, c.appID, c.installationID, "[redacted]"})
+}
+
+func (c *runnerGroupPolicyClient) LogValue() slog.Value {
+	if c == nil {
+		return slog.StringValue("github.RunnerGroupPolicyClient<nil>")
+	}
+	return slog.GroupValue(
+		slog.String("base", c.base), slog.String("org", c.org),
+		slog.Int64("app_id", c.appID), slog.Int64("installation_id", c.installationID),
+		slog.String("credentials", "[redacted]"),
+	)
 }

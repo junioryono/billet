@@ -54,5 +54,12 @@ type JITRequest struct {
 // so nothing else about it invites being kept.
 type JITResponse struct {
 	Config     string `json:"config"`
+	RunnerID   int64  `json:"runner_id"`
+	RunnerName string `json:"runner_name"`
+}
+
+// RemoveRunnerRequest identifies the exact GitHub registration to withdraw.
+type RemoveRunnerRequest struct {
+	RunnerID   int64  `json:"runner_id"`
 	RunnerName string `json:"runner_name"`
 }

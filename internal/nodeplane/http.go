@@ -25,6 +25,7 @@ import (
 type JITSource interface {
 	Describe(ctx context.Context, name, group string) (*JITSet, []string, error)
 	JITConfig(ctx context.Context, scaleSetID int, runnerName, workFolder string) (JITRegistration, error)
+	RemoveRunner(ctx context.Context, runnerID int64, runnerName string) error
 }
 
 type trustedRunnerGroupValidator interface {
@@ -41,6 +42,12 @@ type JITSet struct {
 type JITRegistration interface {
 	Config() string
 	RunnerName() string
+	ID() int64
+}
+
+type poolRunnerStore interface {
+	RegisterPoolRunner(context.Context, alloc.PoolRunner) error
+	PoolRunnerByName(context.Context, string) (alloc.PoolRunner, error)
 }
 
 // LeaseStore is the ledger, as the node wire needs it.
@@ -228,6 +235,7 @@ func Handler(log *slog.Logger, p *Plane, store LeaseStore, jit JITSource, opts .
 	mux.HandleFunc("POST /v1/nodes/{node}/trusted-runner-group", h.forNewWork(h.validateTrustedRunnerGroup))
 	mux.HandleFunc("POST /v1/nodes/{node}/reconcile", h.forNewWork(h.reconcile))
 	mux.HandleFunc("POST /v1/nodes/{node}/jit", h.forNode(h.jitConfig))
+	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/runner/remove", h.forOwnLease(h.removeRunner))
 	mux.HandleFunc("POST /v1/nodes/{node}/renew", h.forNode(h.renew))
 	mux.HandleFunc("GET /v1/nodes/{node}/cache-policy", h.forNode(h.actionsCachePolicy))
 
@@ -1304,11 +1312,101 @@ func (h *handler) jitConfig(w http.ResponseWriter, r *http.Request) {
 
 		return
 	}
+	pool, ok := h.store.(poolRunnerStore)
+	if !ok {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 30*time.Second)
+		defer cancel()
+		if removeErr := h.jit.RemoveRunner(cleanupCtx, reg.ID(), reg.RunnerName()); removeErr != nil {
+			err = errors.Join(errors.New("nodeplane: the lease store cannot preserve runner identity"),
+				fmt.Errorf("remove unjournaled runner %q: %w", reg.RunnerName(), removeErr))
+		} else {
+			err = errors.New("nodeplane: the lease store cannot preserve runner identity")
+		}
+		writeStoreErr(w, err)
+
+		return
+	}
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 30*time.Second)
+	defer cancel()
+	lease, err := h.store.Lease(persistCtx, leaseID)
+	if err == nil && lease == nil {
+		err = fmt.Errorf("nodeplane: lease %s disappeared before runner identity was journaled", leaseID)
+	}
+	if err == nil {
+		err = pool.RegisterPoolRunner(persistCtx, alloc.PoolRunner{
+			LeaseID: leaseID, Tier: tier, LaunchRequestID: lease.RequestID,
+			RunnerID: reg.ID(), RunnerName: reg.RunnerName(),
+		})
+	}
+	if err != nil {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(r.Context()), 30*time.Second)
+		defer cleanupCancel()
+		if removeErr := h.jit.RemoveRunner(cleanupCtx, reg.ID(), reg.RunnerName()); removeErr != nil {
+			err = errors.Join(err, fmt.Errorf("remove unjournaled runner %q: %w",
+				reg.RunnerName(), removeErr))
+		}
+		writeStoreErr(w, err)
+
+		return
+	}
 
 	writeJSON(w, http.StatusOK, nodeapi.JITResponse{
 		Config:     reg.Config(),
+		RunnerID:   reg.ID(),
 		RunnerName: reg.RunnerName(),
 	})
+}
+
+func (h *handler) removeRunner(w http.ResponseWriter, r *http.Request) {
+	var req nodeapi.RemoveRunnerRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	if req.RunnerID < 0 || req.RunnerName == "" {
+		writeErr(w, http.StatusBadRequest, nodeapi.CodeRefused,
+			"runner removal needs a non-negative id and non-empty name")
+		return
+	}
+	pool, ok := h.store.(poolRunnerStore)
+	if !ok {
+		writeErr(w, http.StatusServiceUnavailable, "", "runner identity storage is unavailable")
+		return
+	}
+	binding, err := pool.PoolRunnerByName(r.Context(), req.RunnerName)
+	if err != nil {
+		writeStoreErr(w, err)
+		return
+	}
+	if binding.LeaseID != r.PathValue("lease") {
+		writeErr(w, http.StatusForbidden, nodeapi.CodeRefused,
+			"runner registration belongs to another lease")
+		return
+	}
+	if binding.RunnerID != req.RunnerID {
+		writeErr(w, http.StatusForbidden, nodeapi.CodeRefused,
+			"runner identity does not match the durable registration")
+		return
+	}
+	lease, err := h.store.Lease(r.Context(), binding.LeaseID)
+	if err != nil {
+		writeStoreErr(w, err)
+		return
+	}
+	if lease == nil {
+		writeErr(w, http.StatusConflict, nodeapi.CodeRefused,
+			"runner registration no longer has a lease")
+		return
+	}
+	if lease.Node != r.PathValue("node") {
+		writeErr(w, http.StatusForbidden, nodeapi.CodeRefused,
+			"runner registration belongs to another node")
+		return
+	}
+	if err := h.jit.RemoveRunner(r.Context(), req.RunnerID, req.RunnerName); err != nil {
+		writeStoreErr(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *handler) validateTrustedRunnerGroup(w http.ResponseWriter, r *http.Request) {

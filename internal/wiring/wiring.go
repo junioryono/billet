@@ -80,6 +80,13 @@ func (j JITSource) JITConfig(
 	return j.Client.JITConfig(ctx, scaleSetID, runnerName, workFolder)
 }
 
+// RemoveRunner removes a failed local launch's GitHub registration.
+func (j JITSource) RemoveRunner(
+	ctx context.Context, _ string, runnerID int64, runnerName string,
+) error {
+	return j.Client.RemoveRunner(ctx, runnerID, runnerName)
+}
+
 // ValidateTrustedRunnerGroup verifies policy immediately before local minting.
 func (j JITSource) ValidateTrustedRunnerGroup(ctx context.Context, group string,
 	workflows []string,
@@ -117,6 +124,11 @@ func (n NodeJIT) JITConfig(
 	ctx context.Context, scaleSetID int, runnerName, workFolder string,
 ) (nodeplane.JITRegistration, error) {
 	return n.Client.JITConfig(ctx, scaleSetID, runnerName, workFolder)
+}
+
+// RemoveRunner removes a remote node's failed-launch registration.
+func (n NodeJIT) RemoveRunner(ctx context.Context, runnerID int64, runnerName string) error {
+	return n.Client.RemoveRunner(ctx, runnerID, runnerName)
 }
 
 // ValidateTrustedRunnerGroup verifies policy immediately before remote minting.

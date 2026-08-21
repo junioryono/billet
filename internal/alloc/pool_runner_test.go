@@ -74,3 +74,34 @@ func TestOnlyIdlePoolMembersAreScaleDownCandidates(t *testing.T) {
 		t.Fatalf("idle runners = %+v, want only request 12", idle)
 	}
 }
+
+func TestSettledPoolIdentitySurvivesUntilSourceAcknowledgement(t *testing.T) {
+	a := newAllocator(t, Limits{MaxVCPU: 2, MaxMemory: 4 * config.GiB},
+		[]config.Tier{tier("linux", 2, 4*config.GiB)})
+	lease := reserve(t, a, "linux")
+	if err := a.Assign(t.Context(), lease.ID, lease.Epoch, 101, 11); err != nil {
+		t.Fatalf("Assign: %v", err)
+	}
+	name := "github-returned-name"
+	if err := a.RegisterPoolRunner(t.Context(), PoolRunner{LeaseID: lease.ID, Tier: "linux",
+		LaunchRequestID: 11, RunnerID: 71, RunnerName: name}); err != nil {
+		t.Fatalf("RegisterPoolRunner: %v", err)
+	}
+	if _, err := a.StartPoolRunner(t.Context(), lease.ID, "linux", 71, name,
+		22, 202, "actual-job"); err != nil {
+		t.Fatalf("StartPoolRunner: %v", err)
+	}
+	if err := a.SettlePoolRunner(t.Context(), "linux", 11); err != nil {
+		t.Fatalf("SettlePoolRunner: %v", err)
+	}
+	member, err := a.PoolRunnerByName(t.Context(), name)
+	if err != nil || member.Status != PoolRunnerRetired || member.ActualRequestID != 22 {
+		t.Fatalf("settled tombstone = %+v, err %v", member, err)
+	}
+	if err := a.AcknowledgePoolRunner(t.Context(), "linux", 11); err != nil {
+		t.Fatalf("AcknowledgePoolRunner: %v", err)
+	}
+	if _, err := a.PoolRunnerByName(t.Context(), name); !errors.Is(err, ErrLeaseNotFound) {
+		t.Fatalf("acknowledged pool identity still exists: %v", err)
+	}
+}

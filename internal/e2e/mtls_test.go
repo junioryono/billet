@@ -57,7 +57,13 @@ func (mtlsStore) Resize(context.Context, string, int64, string, int, config.Byte
 func (mtlsStore) Release(context.Context, string, int64, alloc.Phase) error { return nil }
 
 func (mtlsStore) Lease(context.Context, string) (*alloc.Lease, error) {
-	return &alloc.Lease{ID: "l1", Epoch: 1}, nil
+	return &alloc.Lease{ID: "l1", Epoch: 1, Node: "epyc-1", RequestID: 7}, nil
+}
+
+func (mtlsStore) RegisterPoolRunner(context.Context, alloc.PoolRunner) error { return nil }
+
+func (mtlsStore) PoolRunnerByName(_ context.Context, name string) (alloc.PoolRunner, error) {
+	return alloc.PoolRunner{LeaseID: "l1", RunnerID: 71, RunnerName: name}, nil
 }
 
 func (m mtlsStore) QuarantinedLeaseIDs(context.Context, string) (map[string]bool, error) {
@@ -284,10 +290,13 @@ func (alwaysMints) JITConfig(_ context.Context, _ int, runnerName, _ string) (no
 	return mintedFor(runnerName), nil
 }
 
+func (alwaysMints) RemoveRunner(context.Context, int64, string) error { return nil }
+
 type mintedFor string
 
 func (m mintedFor) Config() string     { return "a credential" }
 func (m mintedFor) RunnerName() string { return string(m) }
+func (m mintedFor) ID() int64          { return 71 }
 
 func nodeClient(t *testing.T, ca *wirecert.CA, base, certName, dialAs string) *nodeclient.Client {
 	t.Helper()

@@ -11,21 +11,23 @@ import (
 
 // PoolRunner is one GitHub registration backed by one compute lease.
 type PoolRunner struct {
-	LeaseID         string
-	Tier            string
-	LaunchRequestID int64
-	RunnerID        int64
-	RunnerName      string
-	Status          string
-	ActualRequestID int64
-	RunID           int64
-	JobID           string
+	LeaseID            string
+	Tier               string
+	LaunchRequestID    int64
+	RunnerID           int64
+	RunnerName         string
+	Status             string
+	ActualRequestID    int64
+	RunID              int64
+	JobID              string
+	SourceAcknowledged bool
 }
 
 const (
 	PoolRunnerIdle     = "idle"
 	PoolRunnerBusy     = "busy"
 	PoolRunnerRetiring = "retiring"
+	PoolRunnerRetired  = "retired"
 )
 
 // RegisterPoolRunner records the idle pool member created for a lease.
@@ -85,7 +87,11 @@ func (a *Allocator) StartPoolRunner(ctx context.Context, leaseID, tier string, r
 			(prior.RunnerID != 0 && prior.RunnerID != runnerID) {
 			return fmt.Errorf("alloc: %w: runner %q does not match lease %s", ErrConflict, runnerName, leaseID)
 		}
-		if prior.Status == PoolRunnerRetiring {
+		if prior.Status == PoolRunnerRetiring || prior.Status == PoolRunnerRetired {
+			if prior.ActualRequestID == requestID && prior.RunID == runID && prior.JobID == jobID {
+				out = prior
+				return nil
+			}
 			return fmt.Errorf("alloc: %w: runner %q is already retiring", ErrConflict, runnerName)
 		}
 		if prior.Status == PoolRunnerBusy {
@@ -116,7 +122,7 @@ func (a *Allocator) PoolRunnerByName(ctx context.Context, name string) (PoolRunn
 	var out PoolRunner
 	err := a.db.View(ctx, func(q querier) error {
 		return scanPoolRunner(q.QueryRowContext(ctx, `SELECT lease_id, tier, launch_request_id,
-			runner_id, runner_name, status, actual_request_id, run_id, job_id
+			runner_id, runner_name, status, actual_request_id, run_id, job_id, source_acknowledged
 			FROM pool_runners WHERE runner_name = ?`, name), &out)
 	})
 	if errors.Is(err, sql.ErrNoRows) {
@@ -148,7 +154,7 @@ func (a *Allocator) PoolRunners(ctx context.Context, tier string) ([]PoolRunner,
 	var out []PoolRunner
 	err := a.db.View(ctx, func(q querier) error {
 		rows, err := q.QueryContext(ctx, `SELECT lease_id, tier, launch_request_id, runner_id,
-			runner_name, status, actual_request_id, run_id, job_id FROM pool_runners
+			runner_name, status, actual_request_id, run_id, job_id, source_acknowledged FROM pool_runners
 			WHERE tier = ? ORDER BY updated_at, lease_id`, tier)
 		if err != nil {
 			return err
@@ -201,11 +207,59 @@ func (a *Allocator) RetirePoolRunner(ctx context.Context, leaseID string) error 
 			if !found {
 				return ErrLeaseNotFound
 			}
-			if prior.Status != PoolRunnerRetiring {
+			if prior.Status != PoolRunnerRetiring && prior.Status != PoolRunnerRetired {
 				return ErrConflict
 			}
 		}
 		return nil
+	})
+}
+
+// SettlePoolRunner preserves the physical identity until GitHub acknowledges
+// the completion that used it. A redelivery must resolve to the same compute
+// even after teardown and capacity release have both completed.
+func (a *Allocator) SettlePoolRunner(ctx context.Context, tier string, requestID int64) error {
+	return a.db.Tx(ctx, func(tx *sql.Tx) error {
+		var leaseID string
+		var acknowledged bool
+		err := tx.QueryRowContext(ctx, `SELECT lease_id, source_acknowledged FROM pool_runners
+			WHERE tier = ? AND launch_request_id = ?`, tier, requestID).Scan(&leaseID, &acknowledged)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if acknowledged {
+			_, err = tx.ExecContext(ctx, `DELETE FROM pool_runners WHERE lease_id = ?`, leaseID)
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `UPDATE pool_runners SET status = 'retired', updated_at = ?
+			WHERE lease_id = ?`, time.Now().UTC().Format(time.RFC3339Nano), leaseID)
+		return err
+	})
+}
+
+// AcknowledgePoolRunner records that GitHub cannot redeliver the completion.
+// The row is removed immediately only when physical settlement already landed.
+func (a *Allocator) AcknowledgePoolRunner(ctx context.Context, tier string, requestID int64) error {
+	return a.db.Tx(ctx, func(tx *sql.Tx) error {
+		var leaseID, status string
+		err := tx.QueryRowContext(ctx, `SELECT lease_id, status FROM pool_runners
+			WHERE tier = ? AND launch_request_id = ?`, tier, requestID).Scan(&leaseID, &status)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if status == PoolRunnerRetired {
+			_, err = tx.ExecContext(ctx, `DELETE FROM pool_runners WHERE lease_id = ?`, leaseID)
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `UPDATE pool_runners SET source_acknowledged = 1,
+			updated_at = ? WHERE lease_id = ?`, time.Now().UTC().Format(time.RFC3339Nano), leaseID)
+		return err
 	})
 }
 
@@ -221,13 +275,14 @@ type rowScanner interface{ Scan(...any) error }
 
 func scanPoolRunner(row rowScanner, out *PoolRunner) error {
 	return row.Scan(&out.LeaseID, &out.Tier, &out.LaunchRequestID, &out.RunnerID,
-		&out.RunnerName, &out.Status, &out.ActualRequestID, &out.RunID, &out.JobID)
+		&out.RunnerName, &out.Status, &out.ActualRequestID, &out.RunID, &out.JobID,
+		&out.SourceAcknowledged)
 }
 
 func poolRunnerByLease(ctx context.Context, q querier, leaseID string) (PoolRunner, bool, error) {
 	var out PoolRunner
 	err := scanPoolRunner(q.QueryRowContext(ctx, `SELECT lease_id, tier, launch_request_id,
-		runner_id, runner_name, status, actual_request_id, run_id, job_id
+		runner_id, runner_name, status, actual_request_id, run_id, job_id, source_acknowledged
 		FROM pool_runners WHERE lease_id = ?`, leaseID), &out)
 	if errors.Is(err, sql.ErrNoRows) {
 		return PoolRunner{}, false, nil

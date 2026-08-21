@@ -1,13 +1,55 @@
 package github
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func TestRunnerGroupPolicyClientRedactsEveryRenderingPath(t *testing.T) {
+	key, _ := testKeyPKCS1(t)
+	c := newRunnerGroupPolicyClient(http.DefaultClient, "https://api.example.test", "acme", 11, 22, key)
+	c.token = "cached-installation-secret"
+	c.expiresAt = time.Now().Add(time.Hour)
+
+	render := func(format string) string {
+		var out strings.Builder
+		if _, err := fmt.Fprintf(&out, format, c); err != nil {
+			t.Fatalf("format %q: %v", format, err)
+		}
+		return out.String()
+	}
+	rendered := []string{
+		render("%v"), render("%+v"), render("%#v"),
+		render("%s"), render("%q"), render("%d"),
+	}
+	encoded, err := json.Marshal(c)
+	if err != nil {
+		t.Fatalf("MarshalJSON: %v", err)
+	}
+	rendered = append(rendered, string(encoded))
+	for _, jsonHandler := range []bool{false, true} {
+		var out bytes.Buffer
+		var handler slog.Handler = slog.NewTextHandler(&out, nil)
+		if jsonHandler {
+			handler = slog.NewJSONHandler(&out, nil)
+		}
+		slog.New(handler).Info("client", "value", c)
+		rendered = append(rendered, out.String())
+	}
+	for _, output := range rendered {
+		if strings.Contains(output, string(key)) || strings.Contains(output, c.token) {
+			t.Fatalf("credential leaked through rendering: %q", output)
+		}
+	}
+}
 
 func TestTrustedRunnerGroupRequiresTheExactWorkflowRestriction(t *testing.T) {
 	key, _ := testKeyPKCS1(t)
