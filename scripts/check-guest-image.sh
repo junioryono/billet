@@ -261,6 +261,55 @@ for tool in zstd unzip zip tar wget rsync gcc make; do
 	fi
 done
 
+# A `pip` -- not just `pip3` -- must resolve on the default PATH, the way the
+# github-hosted image ships one. setup-python's `cache: pip` runs `pip cache dir`
+# through io.which('pip', true), which throws the instant no `pip` answers; the
+# hosted image's system pip is the backstop this guest was missing, so the lookup
+# no longer depends on the toolcache entry's PATH addition holding.
+#
+# Each check runs AS THE RUNNER ACCOUNT (setpriv), under a scrubbed environment
+# (env -i) carrying only the runner's effective PATH -- not sbin -- and its HOME.
+# That is the context setup-python actually runs in: a root chroot inheriting the
+# builder's env would let PYTHONHOME or PIP_CONFIG_FILE mask a real fault, and it
+# cannot exercise `pip cache dir` at all because the runner's cache directory is
+# unwritable by root. Running the command proves the shebang chain rather than a
+# stat a symlinked build host would satisfy.
+runner_pip=(setpriv --reuid=runner --regid=runner --clear-groups
+	/usr/bin/env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/home/runner)
+for tool in pip pip3 python; do
+	if chroot "$MNT" "${runner_pip[@]}" "$tool" --version >/dev/null 2>&1; then
+		pass "$tool resolves and runs on the runner's default PATH"
+	else
+		fail "no working $tool on the runner's default PATH. setup-python's cache: pip
+        runs io.which('pip', true), which throws when no pip -- not pip3 -- resolves,
+        exactly as it did before python3-pip and python-is-python3 were installed"
+	fi
+done
+
+# The exact setup-python contract, exercised the way setup-python does it: the
+# runner running `pip cache dir`. A root chroot passes this vacuously on a broken
+# cache and errors on a healthy one, so it must be the runner.
+if chroot "$MNT" "${runner_pip[@]}" pip cache dir >/dev/null 2>&1; then
+	pass "pip cache dir works for the runner, so setup-python's cache: pip resolves it"
+else
+	fail "pip cache dir fails for the runner; setup-python's cache: pip would throw here"
+fi
+
+# The hosted image writes break-system-packages so a `pip install` against the
+# system python survives PEP 668; without it the system pip resolves but refuses to
+# install, which fails later and more confusingly than an absent pip. The builder
+# owns the exact file, so compare it BYTE FOR BYTE: a second section's override (an
+# [install] break-system-packages = false) or the token under an unrelated section
+# would leave `pip install` refusing while a line-match passed. cmp, not command
+# substitution, so an embedded NUL or a stray trailing newline cannot slip past.
+if cmp -s "$MNT/etc/pip.conf" <(printf '%s\n' '[global]' 'break-system-packages = true'); then
+	pass "the system pip may install past PEP 668, as it does on a hosted runner"
+else
+	fail "/etc/pip.conf is not the expected two-line break-system-packages file; a
+        workflow that pip installs against the system python may fail here where a
+        hosted runner succeeds"
+fi
+
 # --- the toolcache ---------------------------------------------------------
 
 # EVERY ONE OF THESE FAILS SILENTLY, WHICH IS WHY THEY ARE ASSERTED (#66).

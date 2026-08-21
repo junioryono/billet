@@ -14,6 +14,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestRepositoryKeyVerifierRequiresTheExactPrimaryKeySet(t *testing.T) {
@@ -1589,9 +1591,7 @@ func TestCacheConformanceReusableWorkflowUsesItsOwnRevision(t *testing.T) {
 		t.Fatal("reusable workflow still depends on a fixture script from the caller checkout")
 	}
 	for _, required := range []string{
-		"steps.poison-node.outcome }}' = failure",
 		"steps.poison-actions.outputs.cache-hit }}' != true",
-		"steps.poison-node.outputs.cache-hit }}' != true",
 		"steps.poison-tls.outputs.cache-hit }}' != true",
 		"steps.poison-proxy.outputs.cache-hit }}' != true",
 		"steps.poison-process.outputs.cache-hit }}' != true",
@@ -1600,7 +1600,42 @@ func TestCacheConformanceReusableWorkflowUsesItsOwnRevision(t *testing.T) {
 			t.Fatalf("poison conformance is missing non-vacuity proof %q", required)
 		}
 	}
-	if strings.Count(workflow, "lookup-only: true") != 5 {
+	// The NODE_OPTIONS poison was removed: the runner strips step-env NODE_OPTIONS
+	// from JS actions, so the poison never reached the client and the "must fail"
+	// assertion could not hold. The guard is keyed on the poison itself, not a step
+	// name -- a NODE_OPTIONS env key under ANY id reintroduces the permanently red
+	// lane. Parse the workflow and walk every mapping key so every spelling the YAML
+	// loader accepts (bare, single- or double-quoted, flow mapping) is caught while a
+	// NODE_OPTIONS token inside a `run:` block scalar or a comment -- a value, not a
+	// key -- is not a false positive.
+	var root yaml.Node
+	if err := yaml.Unmarshal(body, &root); err != nil {
+		t.Fatalf("parse cache conformance workflow as YAML: %v", err)
+	}
+	var walk func(n *yaml.Node)
+	walk = func(n *yaml.Node) {
+		if n.Kind == yaml.MappingNode {
+			for i := 0; i+1 < len(n.Content); i += 2 {
+				key := n.Content[i]
+				if key.Kind == yaml.AliasNode && key.Alias != nil {
+					key = key.Alias // an aliased key resolves to its anchored scalar
+				}
+				if key.Value == "NODE_OPTIONS" {
+					t.Fatal("the NODE_OPTIONS poison is untestable (the runner strips it); " +
+						"it must not return as an env key under any step")
+				}
+			}
+		}
+		for _, child := range n.Content {
+			walk(child)
+		}
+	}
+	walk(&root)
+	if strings.Contains(workflow, "steps.poison-node") ||
+		strings.Contains(workflow, "id: poison-node") {
+		t.Fatal("the removed poison-node step must not return")
+	}
+	if strings.Count(workflow, "lookup-only: true") != 4 {
 		t.Fatal("every poisoned cache key must be checked for a miss from the next VM")
 	}
 	for _, jobs := range [][2]string{
