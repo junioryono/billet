@@ -83,6 +83,7 @@ func New(cfg Config, log *slog.Logger) (*Client, error) {
 	// and a shutdown cancels the long poll in flight — so an ordinary restart
 	// would end with an ERROR line every time. See quieten.
 	quiet := slog.New(quieten(log.Handler()))
+	httpClient := newValidatedRetryableHTTPClient()
 
 	c, err := gh.NewClientWithGitHubApp(gh.ClientWithGitHubAppConfig{
 		GitHubConfigURL: cfg.ConfigURL,
@@ -92,7 +93,7 @@ func New(cfg Config, log *slog.Logger) (*Client, error) {
 			PrivateKey:     cfg.PrivateKey,
 		},
 		SystemInfo: systemInfo(),
-	}, gh.WithLogger(quiet))
+	}, gh.WithRetryableHTTPClint(httpClient), gh.WithLogger(quiet))
 	if err != nil {
 		// NOT wrapped with the config: GitHubAppAuth holds the private key, and a
 		// validation error that renders the struct it validated would put it in
