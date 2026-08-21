@@ -1215,6 +1215,19 @@ Name=eth0
 # `billet check` proves the bridge exists rather than that it serves.
 DHCP=yes
 
+[DHCPv4]
+# KEY THE LEASE ON THE MAC, NOT A DUID. networkd's default client identifier is a
+# DUID derived from /etc/machine-id, and the debootstrapped image bakes ONE
+# machine-id into every clone -- so with a DUID two guests present the same client
+# id and dnsmasq hands them the same address, which is the collision that stalled
+# large downloads. The firecracker backend now gives each guest a stable MAC
+# derived from its tap (unique among live guests, reused only after one exits), so
+# keying DHCP on the MAC makes each live guest's lease unique AND lets a later guest
+# reusing that tap renew the same address instead of consuming another -- bounding
+# pool use by concurrency rather than by launch count, which a per-boot-unique DUID
+# would not.
+ClientIdentifier=mac
+
 # THE METADATA SERVICE IS LINK-LOCAL and is not on the bridge's subnet, so it needs a
 # route of its own. The agent adds one too; having it here means the guest can reach
 # the service before anything has run.
