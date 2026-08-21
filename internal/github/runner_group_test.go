@@ -127,6 +127,10 @@ func TestRunnerRecoveryPreservesOnlyAnExactBusyEphemeralRunner(t *testing.T) {
 		{name: "unknown status", listed: `{"total_count":1,"runners":[{"id":76,"name":"billet-l1","status":"paused","busy":false,"ephemeral":true}]}`, wantErr: true},
 		{name: "duplicate", listed: `{"total_count":2,"runners":[{"id":77,"name":"billet-l1","status":"online","busy":true,"ephemeral":true},{"id":78,"name":"billet-l1","status":"online","busy":false,"ephemeral":true}]}`, wantErr: true},
 		{name: "incomplete", listed: `{"total_count":2,"runners":[{"id":79,"name":"billet-l1","status":"online","busy":true,"ephemeral":true}]}`, wantErr: true},
+		{name: "missing envelope", listed: `{}`, wantErr: true},
+		{name: "null runners", listed: `{"total_count":0,"runners":null}`, wantErr: true},
+		{name: "missing busy", listed: `{"total_count":1,"runners":[{"id":80,"name":"billet-l1","status":"online","ephemeral":true}]}`, wantErr: true},
+		{name: "null ephemeral", listed: `{"total_count":1,"runners":[{"id":81,"name":"billet-l1","status":"online","busy":false,"ephemeral":null}]}`, wantErr: true},
 		{name: "api failure", listed: `{"message":"unavailable"}`, status: http.StatusServiceUnavailable, wantErr: true},
 	}
 	for _, tc := range tests {
@@ -138,6 +142,9 @@ func TestRunnerRecoveryPreservesOnlyAnExactBusyEphemeralRunner(t *testing.T) {
 				}
 				if got := r.Header.Get("Authorization"); got != "Bearer cached-token" {
 					t.Errorf("Authorization = %q", got)
+				}
+				if got := r.Header.Get("X-GitHub-Api-Version"); got != apiVersion {
+					t.Errorf("X-GitHub-Api-Version = %q, want %q", got, apiVersion)
 				}
 				if tc.status != 0 {
 					w.WriteHeader(tc.status)

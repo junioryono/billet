@@ -95,6 +95,21 @@ func (a *Allocator) StartPoolRunner(ctx context.Context, leaseID, tier string, r
 			return fmt.Errorf("alloc: %w: runner %q is already retiring", ErrConflict, runnerName)
 		}
 		if prior.Status == PoolRunnerBusy {
+			// A legacy runner recovered from GitHub is journaled busy before its
+			// delayed JobStarted arrives. That empty job identity is a reservation
+			// for this exact physical runner, not a competing job binding.
+			if prior.ActualRequestID == 0 && prior.RunID == 0 && prior.JobID == "" {
+				_, err = tx.ExecContext(ctx, `UPDATE pool_runners SET actual_request_id = ?,
+					run_id = ?, job_id = ?, updated_at = ? WHERE lease_id = ?`, requestID, runID,
+					jobID, time.Now().UTC().Format(time.RFC3339Nano), leaseID)
+				if err != nil {
+					return fmt.Errorf("alloc: bind recovered pool runner %q to job %q: %w",
+						runnerName, jobID, err)
+				}
+				prior.ActualRequestID, prior.RunID, prior.JobID = requestID, runID, jobID
+				out = prior
+				return nil
+			}
 			if prior.ActualRequestID != requestID || prior.RunID != runID || prior.JobID != jobID {
 				return fmt.Errorf("alloc: %w: runner %q is already busy with another job", ErrConflict, runnerName)
 			}
@@ -114,6 +129,85 @@ func (a *Allocator) StartPoolRunner(ctx context.Context, leaseID, tier string, r
 		return nil
 	})
 
+	return out, err
+}
+
+// PreserveRecoveredBusyPoolRunner journals the exact identity of a legacy
+// registration GitHub says is busy. Its empty actual-job fields are filled by a
+// delayed JobStarted through StartPoolRunner.
+func (a *Allocator) PreserveRecoveredBusyPoolRunner(ctx context.Context, runner PoolRunner) error {
+	if strings.TrimSpace(runner.LeaseID) == "" || strings.TrimSpace(runner.Tier) == "" ||
+		runner.LaunchRequestID == 0 || runner.RunnerID <= 0 ||
+		strings.TrimSpace(runner.RunnerName) == "" {
+		return errors.New("alloc: a recovered busy runner needs complete lease and runner identity")
+	}
+
+	return a.db.Tx(ctx, func(tx *sql.Tx) error {
+		prior, found, err := poolRunnerByLease(ctx, tx, runner.LeaseID)
+		if err != nil {
+			return err
+		}
+		if !found {
+			_, err = tx.ExecContext(ctx, `INSERT INTO pool_runners
+				(lease_id, tier, launch_request_id, runner_id, runner_name, status, updated_at)
+				VALUES (?, ?, ?, ?, ?, 'busy', ?)`, runner.LeaseID, runner.Tier,
+				runner.LaunchRequestID, runner.RunnerID, runner.RunnerName,
+				time.Now().UTC().Format(time.RFC3339Nano))
+			return err
+		}
+		if prior.Tier != runner.Tier || prior.LaunchRequestID != runner.LaunchRequestID ||
+			prior.RunnerName != runner.RunnerName ||
+			(prior.RunnerID != 0 && prior.RunnerID != runner.RunnerID) {
+			return fmt.Errorf("alloc: %w: recovered runner %q does not match lease %s",
+				ErrConflict, runner.RunnerName, runner.LeaseID)
+		}
+		if prior.Status == PoolRunnerRetiring || prior.Status == PoolRunnerRetired {
+			return fmt.Errorf("alloc: %w: recovered runner %q is already retiring",
+				ErrConflict, runner.RunnerName)
+		}
+		if prior.Status == PoolRunnerBusy {
+			return nil
+		}
+		_, err = tx.ExecContext(ctx, `UPDATE pool_runners SET runner_id = ?, status = 'busy',
+			updated_at = ? WHERE lease_id = ?`, runner.RunnerID,
+			time.Now().UTC().Format(time.RFC3339Nano), runner.LeaseID)
+		return err
+	})
+}
+
+// RetireRecoveredPoolRunner claims only an idle or placeholder-busy recovery
+// row. An authoritative JobStarted binding wins the same transaction race and
+// is returned unchanged so recovery preserves its compute.
+func (a *Allocator) RetireRecoveredPoolRunner(
+	ctx context.Context, leaseID string,
+) (PoolRunner, error) {
+	var out PoolRunner
+	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
+		prior, found, err := poolRunnerByLease(ctx, tx, leaseID)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return ErrLeaseNotFound
+		}
+		out = prior
+		if prior.Status == PoolRunnerBusy &&
+			(prior.ActualRequestID != 0 || prior.RunID != 0 || prior.JobID != "") {
+			return nil
+		}
+		if prior.Status == PoolRunnerRetiring || prior.Status == PoolRunnerRetired {
+			return nil
+		}
+		if prior.Status != PoolRunnerIdle && prior.Status != PoolRunnerBusy {
+			return ErrConflict
+		}
+		_, err = tx.ExecContext(ctx, `UPDATE pool_runners SET status = 'retiring', updated_at = ?
+			WHERE lease_id = ?`, time.Now().UTC().Format(time.RFC3339Nano), leaseID)
+		if err == nil {
+			out.Status = PoolRunnerRetiring
+		}
+		return err
+	})
 	return out, err
 }
 

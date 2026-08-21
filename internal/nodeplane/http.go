@@ -57,6 +57,8 @@ type poolRunnerStore interface {
 	RegisterPoolRunner(context.Context, alloc.PoolRunner) error
 	PoolRunnerByName(context.Context, string) (alloc.PoolRunner, error)
 	PoolRunnerByLease(context.Context, string) (alloc.PoolRunner, error)
+	PreserveRecoveredBusyPoolRunner(context.Context, alloc.PoolRunner) error
+	RetireRecoveredPoolRunner(context.Context, string) (alloc.PoolRunner, error)
 	RetirePoolRunner(context.Context, string) error
 }
 
@@ -1479,8 +1481,11 @@ func (h *handler) recoverRunner(w http.ResponseWriter, r *http.Request) {
 		}
 		switch binding.Status {
 		case alloc.PoolRunnerBusy:
-			writeJSON(w, http.StatusOK, nodeapi.RecoverRunnerResponse{State: nodeapi.RunnerRecoveryTracked})
-			return
+			if binding.ActualRequestID != 0 || binding.RunID != 0 || binding.JobID != "" {
+				writeJSON(w, http.StatusOK, nodeapi.RecoverRunnerResponse{State: nodeapi.RunnerRecoveryTracked})
+				return
+			}
+			req.RunnerName = binding.RunnerName
 		case alloc.PoolRunnerIdle:
 			req.RunnerName = binding.RunnerName
 		case alloc.PoolRunnerRetiring:
@@ -1508,33 +1513,41 @@ func (h *handler) recoverRunner(w http.ResponseWriter, r *http.Request) {
 		writeStoreErr(w, err)
 		return
 	}
-	if !recovery.Present {
-		if binding.LeaseID != "" {
-			if err := pool.RetirePoolRunner(r.Context(), leaseID); err != nil {
-				writeStoreErr(w, err)
-				return
-			}
-		}
-		writeJSON(w, http.StatusOK, nodeapi.RecoverRunnerResponse{State: nodeapi.RunnerRecoveryRetired})
-		return
-	}
-	if binding.LeaseID != "" && binding.RunnerID != 0 && binding.RunnerID != recovery.RunnerID {
+	if recovery.Present && binding.LeaseID != "" && binding.RunnerID != 0 &&
+		binding.RunnerID != recovery.RunnerID {
 		writeErr(w, http.StatusConflict, nodeapi.CodeRefused,
 			"recovered runner id changed; refusing replacement identity")
 		return
 	}
 	if recovery.Busy {
+		if err := pool.PreserveRecoveredBusyPoolRunner(r.Context(), alloc.PoolRunner{
+			LeaseID: leaseID, Tier: lease.Tier, LaunchRequestID: lease.RequestID,
+			RunnerID: recovery.RunnerID, RunnerName: req.RunnerName,
+		}); err != nil {
+			writeStoreErr(w, err)
+			return
+		}
 		writeJSON(w, http.StatusOK, nodeapi.RecoverRunnerResponse{State: nodeapi.RunnerRecoveryBusy})
 		return
 	}
-	if binding.LeaseID != "" {
-		if err := pool.RetirePoolRunner(r.Context(), leaseID); err != nil {
+	// JobStarted can bind this runner while the remote lookup or deletion is in
+	// flight. Delete first, then atomically claim only idle recovery state; an
+	// authoritative busy binding wins and keeps its compute. A crash between the
+	// operations leaves the charged quarantine and is retried safely.
+	if recovery.Present {
+		if err := h.jit.RemoveRunner(r.Context(), recovery.RunnerID, req.RunnerName); err != nil {
 			writeStoreErr(w, err)
 			return
 		}
 	}
-	if err := h.jit.RemoveRunner(r.Context(), recovery.RunnerID, req.RunnerName); err != nil {
+	settled, err := pool.RetireRecoveredPoolRunner(r.Context(), leaseID)
+	if err != nil && !errors.Is(err, alloc.ErrLeaseNotFound) {
 		writeStoreErr(w, err)
+		return
+	}
+	if err == nil && settled.Status == alloc.PoolRunnerBusy &&
+		(settled.ActualRequestID != 0 || settled.RunID != 0 || settled.JobID != "") {
+		writeJSON(w, http.StatusOK, nodeapi.RecoverRunnerResponse{State: nodeapi.RunnerRecoveryTracked})
 		return
 	}
 	writeJSON(w, http.StatusOK, nodeapi.RecoverRunnerResponse{State: nodeapi.RunnerRecoveryRetired})

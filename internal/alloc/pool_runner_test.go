@@ -75,6 +75,59 @@ func TestOnlyIdlePoolMembersAreScaleDownCandidates(t *testing.T) {
 	}
 }
 
+func TestRecoveredBusyPoolRunnerYieldsToAuthoritativeJobStarted(t *testing.T) {
+	a := newAllocator(t, Limits{MaxVCPU: 2, MaxMemory: 4 * config.GiB},
+		[]config.Tier{tier("linux", 2, 4*config.GiB)})
+	lease := reserve(t, a, "linux")
+	if err := a.Assign(t.Context(), lease.ID, lease.Epoch, 101, 11); err != nil {
+		t.Fatalf("Assign: %v", err)
+	}
+	name := "billet-" + lease.ID
+	if err := a.PreserveRecoveredBusyPoolRunner(t.Context(), PoolRunner{
+		LeaseID: lease.ID, Tier: "linux", LaunchRequestID: 11,
+		RunnerID: 71, RunnerName: name,
+	}); err != nil {
+		t.Fatalf("PreserveRecoveredBusyPoolRunner: %v", err)
+	}
+	started, err := a.StartPoolRunner(t.Context(), lease.ID, "linux", 71, name,
+		22, 202, "actual-job")
+	if err != nil {
+		t.Fatalf("StartPoolRunner: %v", err)
+	}
+	if started.ActualRequestID != 22 || started.RunID != 202 || started.JobID != "actual-job" {
+		t.Fatalf("started recovered binding = %+v", started)
+	}
+	settled, err := a.RetireRecoveredPoolRunner(t.Context(), lease.ID)
+	if err != nil {
+		t.Fatalf("RetireRecoveredPoolRunner: %v", err)
+	}
+	if settled.Status != PoolRunnerBusy || settled.ActualRequestID != 22 {
+		t.Fatalf("recovery retired an authoritative started binding: %+v", settled)
+	}
+}
+
+func TestRecoveredPlaceholderCanRetireAfterGitHubStopsReportingBusy(t *testing.T) {
+	a := newAllocator(t, Limits{MaxVCPU: 2, MaxMemory: 4 * config.GiB},
+		[]config.Tier{tier("linux", 2, 4*config.GiB)})
+	lease := reserve(t, a, "linux")
+	if err := a.Assign(t.Context(), lease.ID, lease.Epoch, 101, 11); err != nil {
+		t.Fatalf("Assign: %v", err)
+	}
+	if err := a.PreserveRecoveredBusyPoolRunner(t.Context(), PoolRunner{
+		LeaseID: lease.ID, Tier: "linux", LaunchRequestID: 11,
+		RunnerID: 71, RunnerName: "billet-" + lease.ID,
+	}); err != nil {
+		t.Fatalf("PreserveRecoveredBusyPoolRunner: %v", err)
+	}
+	settled, err := a.RetireRecoveredPoolRunner(t.Context(), lease.ID)
+	if err != nil {
+		t.Fatalf("RetireRecoveredPoolRunner: %v", err)
+	}
+	if settled.Status != PoolRunnerRetiring {
+		t.Fatalf("recovered placeholder status = %q, want retiring", settled.Status)
+	}
+}
+
 func TestSettledPoolIdentitySurvivesUntilSourceAcknowledgement(t *testing.T) {
 	a := newAllocator(t, Limits{MaxVCPU: 2, MaxMemory: 4 * config.GiB},
 		[]config.Tier{tier("linux", 2, 4*config.GiB)})

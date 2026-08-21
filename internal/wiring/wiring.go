@@ -31,6 +31,8 @@ type Provisioner struct{ Client *scaleset.Client }
 
 type poolRunnerStore interface {
 	PoolRunnerByLease(context.Context, string) (alloc.PoolRunner, error)
+	PreserveRecoveredBusyPoolRunner(context.Context, alloc.PoolRunner) error
+	RetireRecoveredPoolRunner(context.Context, string) (alloc.PoolRunner, error)
 	RetirePoolRunner(context.Context, string) error
 }
 
@@ -146,7 +148,10 @@ func recoverRunner(ctx context.Context, pool poolRunnerStore, client runnerRecov
 		}
 		switch binding.Status {
 		case alloc.PoolRunnerBusy:
-			return node.RunnerRecoveryTracked, nil
+			if binding.ActualRequestID != 0 || binding.RunID != 0 || binding.JobID != "" {
+				return node.RunnerRecoveryTracked, nil
+			}
+			runnerName = binding.RunnerName
 		case alloc.PoolRunnerIdle:
 			runnerName = binding.RunnerName
 		case alloc.PoolRunnerRetiring:
@@ -167,27 +172,39 @@ func recoverRunner(ctx context.Context, pool poolRunnerStore, client runnerRecov
 	if err != nil {
 		return "", err
 	}
-	if !recovery.Present {
-		if binding.LeaseID != "" {
-			if err := pool.RetirePoolRunner(ctx, leaseID); err != nil {
-				return "", err
-			}
-		}
-		return node.RunnerRecoveryRetired, nil
-	}
-	if binding.LeaseID != "" && binding.RunnerID != 0 && binding.RunnerID != recovery.RunnerID {
+	if recovery.Present && binding.LeaseID != "" && binding.RunnerID != 0 &&
+		binding.RunnerID != recovery.RunnerID {
 		return "", errors.New("wiring: recovered runner id changed; refusing replacement identity")
 	}
 	if recovery.Busy {
+		if err := pool.PreserveRecoveredBusyPoolRunner(ctx, alloc.PoolRunner{
+			LeaseID: leaseID, Tier: tier, LaunchRequestID: requestID,
+			RunnerID: recovery.RunnerID, RunnerName: runnerName,
+		}); err != nil {
+			return "", err
+		}
 		return node.RunnerRecoveryBusy, nil
 	}
-	if binding.LeaseID != "" {
-		if err := pool.RetirePoolRunner(ctx, leaseID); err != nil {
+	// REMOTE FIRST, THEN AN ATOMIC LOCAL CLAIM. JobStarted is authoritative and
+	// may land while either GitHub call is in flight; the final store transaction
+	// must see and preserve that busy binding. A crash between the two is safe:
+	// the idle row and charged quarantine remain, and the next recovery observes
+	// the now-absent registration before claiming it again.
+	if recovery.Present {
+		if err := client.RemoveRunner(ctx, recovery.RunnerID, runnerName); err != nil {
 			return "", err
 		}
 	}
-	if err := client.RemoveRunner(ctx, recovery.RunnerID, runnerName); err != nil {
+	settled, err := pool.RetireRecoveredPoolRunner(ctx, leaseID)
+	if errors.Is(err, alloc.ErrLeaseNotFound) {
+		return node.RunnerRecoveryRetired, nil
+	}
+	if err != nil {
 		return "", err
+	}
+	if settled.Status == alloc.PoolRunnerBusy &&
+		(settled.ActualRequestID != 0 || settled.RunID != 0 || settled.JobID != "") {
+		return node.RunnerRecoveryTracked, nil
 	}
 	return node.RunnerRecoveryRetired, nil
 }

@@ -154,26 +154,33 @@ func (c *runnerGroupPolicyClient) InspectEphemeralRunner(
 			apiError(resp.StatusCode, body))
 	}
 	type runnerRecord struct {
-		ID        int64  `json:"id"`
-		Name      string `json:"name"`
-		Status    string `json:"status"`
-		Busy      bool   `json:"busy"`
-		Ephemeral bool   `json:"ephemeral"`
+		ID        *int64  `json:"id"`
+		Name      *string `json:"name"`
+		Status    *string `json:"status"`
+		Busy      *bool   `json:"busy"`
+		Ephemeral *bool   `json:"ephemeral"`
 	}
 	var listed struct {
-		TotalCount int            `json:"total_count"`
-		Runners    []runnerRecord `json:"runners"`
+		TotalCount *int            `json:"total_count"`
+		Runners    *[]runnerRecord `json:"runners"`
 	}
 	if err := json.Unmarshal(body, &listed); err != nil {
 		return RunnerRecovery{}, fmt.Errorf("github: decode runners for recovery: %w", err)
 	}
-	if listed.TotalCount < 0 || listed.TotalCount != len(listed.Runners) {
+	if listed.TotalCount == nil || listed.Runners == nil {
+		return RunnerRecovery{}, fmt.Errorf("github: runner recovery response was incomplete")
+	}
+	if *listed.TotalCount < 0 || *listed.TotalCount != len(*listed.Runners) {
 		return RunnerRecovery{}, fmt.Errorf("github: runner recovery response was incomplete: total_count=%d runners=%d",
-			listed.TotalCount, len(listed.Runners))
+			*listed.TotalCount, len(*listed.Runners))
 	}
 	var exact []runnerRecord
-	for _, runner := range listed.Runners {
-		if runner.Name == runnerName {
+	for _, runner := range *listed.Runners {
+		if runner.ID == nil || runner.Name == nil || runner.Status == nil || runner.Busy == nil ||
+			runner.Ephemeral == nil {
+			return RunnerRecovery{}, fmt.Errorf("github: runner recovery response contained an incomplete runner")
+		}
+		if *runner.Name == runnerName {
 			exact = append(exact, runner)
 		}
 	}
@@ -185,25 +192,25 @@ func (c *runnerGroupPolicyClient) InspectEphemeralRunner(
 			len(exact), runnerName)
 	}
 	runner := exact[0]
-	if runner.ID <= 0 {
-		return RunnerRecovery{}, fmt.Errorf("github: runner %q has invalid id %d", runnerName, runner.ID)
+	if *runner.ID <= 0 {
+		return RunnerRecovery{}, fmt.Errorf("github: runner %q has invalid id %d", runnerName, *runner.ID)
 	}
-	if !runner.Ephemeral {
+	if !*runner.Ephemeral {
 		return RunnerRecovery{}, fmt.Errorf("github: runner %q is not ephemeral; refusing recovery",
 			runnerName)
 	}
-	if runner.Status != "online" && runner.Status != "offline" {
+	if *runner.Status != "online" && *runner.Status != "offline" {
 		return RunnerRecovery{}, fmt.Errorf("github: runner %q has unexpected status %q",
-			runnerName, runner.Status)
+			runnerName, *runner.Status)
 	}
-	if runner.Busy {
-		if runner.Status != "online" {
+	if *runner.Busy {
+		if *runner.Status != "online" {
 			return RunnerRecovery{}, fmt.Errorf("github: runner %q is busy but %s; refusing recovery",
-				runnerName, runner.Status)
+				runnerName, *runner.Status)
 		}
-		return RunnerRecovery{RunnerID: runner.ID, Present: true, Busy: true}, nil
+		return RunnerRecovery{RunnerID: *runner.ID, Present: true, Busy: true}, nil
 	}
-	return RunnerRecovery{RunnerID: runner.ID, Present: true}, nil
+	return RunnerRecovery{RunnerID: *runner.ID, Present: true}, nil
 }
 
 func (c *runnerGroupPolicyClient) installationToken(ctx context.Context) (string, error) {

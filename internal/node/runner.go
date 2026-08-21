@@ -1005,7 +1005,13 @@ func (r *Runner) Recover(ctx context.Context) error {
 				return fmt.Errorf("node: read the lease of surviving instance %s: %w", inst.Name, err)
 
 			default:
-				if err := r.takeCustody(ctx, lease, inst, true); err != nil {
+				var err error
+				if lease.Phase == alloc.PhaseQuarantine {
+					err = r.takeQuarantinedCustody(ctx, lease, inst)
+				} else {
+					err = r.takeCustody(ctx, lease, inst, true)
+				}
+				if err != nil {
 					return err
 				}
 
@@ -1376,6 +1382,18 @@ func (r *Runner) adoptQuarantined(ctx context.Context, leaseID string, inst *pro
 
 		return fmt.Errorf("node: read quarantined lease %s: %w", leaseID, err)
 	}
+
+	return r.takeQuarantinedCustody(ctx, lease, inst)
+}
+
+// takeQuarantinedCustody resolves a quarantined survivor's runner registration
+// before adopting its compute. Both startup recovery and periodic inventory use
+// this path: otherwise a restart can bypass the GitHub evidence that distinguishes
+// a busy legacy runner from an idle or absent one.
+func (r *Runner) takeQuarantinedCustody(
+	ctx context.Context, lease *alloc.Lease, inst *provider.Instance,
+) error {
+	leaseID := lease.ID
 
 	recovery, err := r.jit.RecoverRunner(ctx, lease.ID, lease.Tier, lease.RequestID, inst.Name)
 	if err != nil {

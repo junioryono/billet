@@ -2266,7 +2266,8 @@ func TestRecoveryAdoptsQuarantinedCompute(t *testing.T) {
 
 	// A FRESH RUNNER over the same provider: the process restarted, and its maps
 	// are empty.
-	restarted := New(a, host, &fakeJIT{setID: 7}, p, nil)
+	jit := &fakeJIT{setID: 7}
+	restarted := New(a, host, jit, p, nil)
 
 	if err := restarted.Recover(t.Context()); err != nil {
 		t.Fatalf("Recover: %v", err)
@@ -2279,12 +2280,159 @@ func TestRecoveryAdoptsQuarantinedCompute(t *testing.T) {
 	if got := len(restarted.heldLeases()); got != 1 {
 		t.Errorf("recovery spared %d instances without taking custody of them", got)
 	}
+	if len(jit.recoverCalls) != 1 || jit.recoverCalls[0] != lease.ID {
+		t.Fatalf("startup runner recovery calls = %v, want [%s]", jit.recoverCalls, lease.ID)
+	}
 	if err := restarted.Tend(t.Context()); err != nil {
 		t.Fatalf("Tend at the current quarantine epoch: %v", err)
 	}
 	current, err := a.Lease(t.Context(), lease.ID)
 	if err != nil || current.Phase != alloc.PhaseQuarantine {
 		t.Fatalf("tended lease = %+v, err %v", current, err)
+	}
+}
+
+func TestRecoveryRetiresIdleLegacyQuarantinedCompute(t *testing.T) {
+	t.Parallel()
+
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
+	lease := assignedLease(t, a)
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	if err := a.ExpireForTest(t.Context(), lease.ID); err != nil {
+		t.Fatalf("expire: %v", err)
+	}
+	if _, err := a.Reap(t.Context()); err != nil {
+		t.Fatalf("Reap: %v", err)
+	}
+
+	jit := &fakeJIT{setID: 7, recovery: RunnerRecoveryRetired}
+	restarted := New(a, host, jit, p, nil)
+	if err := restarted.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	if len(jit.recoverCalls) != 1 || jit.recoverCalls[0] != lease.ID {
+		t.Fatalf("startup runner recovery calls = %v, want [%s]", jit.recoverCalls, lease.ID)
+	}
+	if len(p.live) != 1 || len(restarted.heldLeases()) != 1 {
+		t.Fatalf("startup did not take custody before cleanup: live %v held %v",
+			p.live, restarted.heldLeases())
+	}
+
+	if err := restarted.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend: %v", err)
+	}
+	if len(p.live) != 0 {
+		t.Fatalf("idle legacy runner left compute running: %v", p.live)
+	}
+	if _, err := a.Lease(t.Context(), lease.ID); !errors.Is(err, alloc.ErrLeaseNotFound) {
+		t.Fatalf("idle legacy runner still holds capacity: %v", err)
+	}
+}
+
+func TestRecoveryPreservesBusyLegacyQuarantinedComputeUntilGitHubRetiresIt(t *testing.T) {
+	t.Parallel()
+
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
+	lease := assignedLease(t, a)
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	if err := a.ExpireForTest(t.Context(), lease.ID); err != nil {
+		t.Fatalf("expire: %v", err)
+	}
+	if _, err := a.Reap(t.Context()); err != nil {
+		t.Fatalf("Reap: %v", err)
+	}
+
+	jit := &fakeJIT{setID: 7, recoveries: []RunnerRecovery{
+		RunnerRecoveryBusy, RunnerRecoveryRetired,
+	}}
+	restarted := New(a, host, jit, p, nil)
+	if err := restarted.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	if len(p.live) != 1 || len(restarted.heldLeases()) != 1 {
+		t.Fatalf("busy startup recovery changed compute or custody: live %v held %v",
+			p.live, restarted.heldLeases())
+	}
+	if err := restarted.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend after GitHub retirement: %v", err)
+	}
+	if len(p.live) != 0 {
+		t.Fatalf("retired startup runner remained running: %v", p.live)
+	}
+}
+
+func TestRecoveryGitHubFailureLeavesLegacyQuarantineUntouched(t *testing.T) {
+	t.Parallel()
+
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
+	lease := assignedLease(t, a)
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	if err := a.ExpireForTest(t.Context(), lease.ID); err != nil {
+		t.Fatalf("expire: %v", err)
+	}
+	if _, err := a.Reap(t.Context()); err != nil {
+		t.Fatalf("Reap: %v", err)
+	}
+
+	restarted := New(a, host, &fakeJIT{setID: 7, recoverErr: errors.New("github unavailable")}, p, nil)
+	if err := restarted.Recover(t.Context()); err == nil {
+		t.Fatal("Recover succeeded without runner identity evidence")
+	}
+	if len(p.live) != 1 || len(restarted.heldLeases()) != 0 {
+		t.Fatalf("failed startup recovery changed compute or custody: live %v held %v",
+			p.live, restarted.heldLeases())
+	}
+	current, err := a.Lease(t.Context(), lease.ID)
+	if err != nil || current.Phase != alloc.PhaseQuarantine {
+		t.Fatalf("failed startup recovery changed quarantine: lease %+v, err %v", current, err)
+	}
+}
+
+func TestCustodyDeadlineDeregistersRecoveredBusyRunnerBeforeCompute(t *testing.T) {
+	t.Parallel()
+
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
+	lease := assignedLease(t, a)
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	if err := a.ExpireForTest(t.Context(), lease.ID); err != nil {
+		t.Fatalf("expire: %v", err)
+	}
+	if _, err := a.Reap(t.Context()); err != nil {
+		t.Fatalf("Reap: %v", err)
+	}
+
+	frozen := time.Now()
+	jit := &durableFakeJIT{fakeJIT: &fakeJIT{setID: 7, recovery: RunnerRecoveryBusy}}
+	restarted := New(a, host, jit, p, nil, WithMaxCustody(time.Hour))
+	restarted.now = func() time.Time { return frozen }
+	if err := restarted.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	restarted.now = func() time.Time { return frozen.Add(2 * time.Hour) }
+	if err := restarted.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend: %v", err)
+	}
+	if !slices.Equal(jit.ensureCalls, []string{lease.ID}) {
+		t.Fatalf("deadline registration cleanup calls = %v, want [%s]", jit.ensureCalls, lease.ID)
+	}
+	if len(p.live) != 0 {
+		t.Fatalf("deadline left compute running after deregistration: %v", p.live)
 	}
 }
 

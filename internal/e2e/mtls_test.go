@@ -70,6 +70,14 @@ func (mtlsStore) PoolRunnerByLease(context.Context, string) (alloc.PoolRunner, e
 	return alloc.PoolRunner{LeaseID: "l1", RunnerID: 71, RunnerName: "runner-l1"}, nil
 }
 
+func (mtlsStore) PreserveRecoveredBusyPoolRunner(context.Context, alloc.PoolRunner) error {
+	return nil
+}
+
+func (mtlsStore) RetireRecoveredPoolRunner(context.Context, string) (alloc.PoolRunner, error) {
+	return alloc.PoolRunner{LeaseID: "l1", Status: alloc.PoolRunnerRetiring}, nil
+}
+
 func (mtlsStore) RetirePoolRunner(context.Context, string) error { return nil }
 
 func (m mtlsStore) QuarantinedLeaseIDs(context.Context, string) (map[string]bool, error) {

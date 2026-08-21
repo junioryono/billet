@@ -294,12 +294,59 @@ func (f *fakeStore) RetirePoolRunner(_ context.Context, leaseID string) error {
 	return alloc.ErrLeaseNotFound
 }
 
+func (f *fakeStore) PreserveRecoveredBusyPoolRunner(
+	_ context.Context, recovered alloc.PoolRunner,
+) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.pool == nil {
+		f.pool = make(map[string]alloc.PoolRunner)
+	}
+	for name, runner := range f.pool {
+		if runner.LeaseID != recovered.LeaseID {
+			continue
+		}
+		runner.RunnerID = recovered.RunnerID
+		runner.RunnerName = recovered.RunnerName
+		runner.Status = alloc.PoolRunnerBusy
+		delete(f.pool, name)
+		f.pool[runner.RunnerName] = runner
+		return nil
+	}
+	recovered.Status = alloc.PoolRunnerBusy
+	f.pool[recovered.RunnerName] = recovered
+	return nil
+}
+
+func (f *fakeStore) RetireRecoveredPoolRunner(
+	_ context.Context, leaseID string,
+) (alloc.PoolRunner, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for name, runner := range f.pool {
+		if runner.LeaseID != leaseID {
+			continue
+		}
+		if runner.Status == alloc.PoolRunnerBusy &&
+			(runner.ActualRequestID != 0 || runner.RunID != 0 || runner.JobID != "") {
+			return runner, nil
+		}
+		runner.Status = alloc.PoolRunnerRetiring
+		f.pool[name] = runner
+		f.retired = append(f.retired, leaseID)
+		return runner, nil
+	}
+	return alloc.PoolRunner{}, alloc.ErrLeaseNotFound
+}
+
 type returnedJIT struct {
 	removed    []string
 	removeErr  error
+	onRemove   func()
 	recovery   nodeplane.JITRunnerRecovery
 	recoverErr error
 	recovered  []string
+	onRecover  func()
 }
 
 func (*returnedJIT) Describe(context.Context, string, string) (*nodeplane.JITSet, []string, error) {
@@ -312,6 +359,9 @@ func (*returnedJIT) JITConfig(context.Context, int, string, string) (nodeplane.J
 
 func (j *returnedJIT) RemoveRunner(_ context.Context, _ int64, name string) error {
 	j.removed = append(j.removed, name)
+	if j.onRemove != nil {
+		j.onRemove()
+	}
 	return j.removeErr
 }
 
@@ -319,6 +369,9 @@ func (j *returnedJIT) RecoverRunner(
 	_ context.Context, name string,
 ) (nodeplane.JITRunnerRecovery, error) {
 	j.recovered = append(j.recovered, name)
+	if j.onRecover != nil {
+		j.onRecover()
+	}
 	return j.recovery, j.recoverErr
 }
 
@@ -517,8 +570,8 @@ func TestJITPersistsGitHubsReturnedIdentityBeforeGivingItToTheNode(t *testing.T)
 		t.Fatalf("idle-to-busy recovery = %q, calls %v, err %v", recovery, jit.recovered, err)
 	}
 	member, err = store.PoolRunnerByLease(t.Context(), "l1")
-	if err != nil || member.Status != alloc.PoolRunnerIdle {
-		t.Fatalf("busy race retired a durable idle runner: %+v, err %v", member, err)
+	if err != nil || member.Status != alloc.PoolRunnerBusy || member.RunnerID != 91 {
+		t.Fatalf("busy recovery did not preserve exact durable identity: %+v, err %v", member, err)
 	}
 	store.lease.Phase = ""
 	jit.recovery = nodeplane.JITRunnerRecovery{}
@@ -555,23 +608,69 @@ func TestJITPersistsGitHubsReturnedIdentityBeforeGivingItToTheNode(t *testing.T)
 	if err != nil || recovery != billetnode.RunnerRecoveryBusy {
 		t.Fatalf("busy legacy recovery = %q, err %v", recovery, err)
 	}
-	if _, err := store.PoolRunnerByLease(t.Context(), "l1"); !errors.Is(err, alloc.ErrLeaseNotFound) {
-		t.Fatalf("legacy busy recovery invented a durable pool row: %v", err)
+	member, err = store.PoolRunnerByLease(t.Context(), "l1")
+	if err != nil || member.Status != alloc.PoolRunnerBusy || member.RunnerID != 92 ||
+		member.RunnerName != "billet-l1" {
+		t.Fatalf("legacy busy recovery identity = %+v, err %v", member, err)
 	}
 	jit.recovery = nodeplane.JITRunnerRecovery{}
 	recovery, err = c.RecoverRunner(t.Context(), "l1", "billet-2vcpu", 7, "billet-l1")
 	if err != nil || recovery != billetnode.RunnerRecoveryRetired {
 		t.Fatalf("idle legacy recovery = %q, err %v", recovery, err)
 	}
-	if _, err := store.PoolRunnerByLease(t.Context(), "l1"); !errors.Is(err, alloc.ErrLeaseNotFound) {
-		t.Fatalf("idle legacy recovery created a journal: %v", err)
+	member, err = store.PoolRunnerByLease(t.Context(), "l1")
+	if err != nil || member.Status != alloc.PoolRunnerRetiring {
+		t.Fatalf("idle legacy recovery did not preserve retirement journal: %+v, err %v", member, err)
 	}
+	store.mu.Lock()
+	store.pool = nil
+	store.mu.Unlock()
 	jit.recovery = nodeplane.JITRunnerRecovery{RunnerID: 93, Present: true}
 	recovery, err = c.RecoverRunner(t.Context(), "l1", "billet-2vcpu", 7, "billet-l1")
 	if err != nil || recovery != billetnode.RunnerRecoveryRetired ||
 		!slices.Equal(jit.removed, []string{"github-returned-name", "github-returned-name", "github-returned-name", "billet-l1"}) {
 		t.Fatalf("idle registered recovery = %q, removed %v, err %v", recovery, jit.removed, err)
 	}
+
+	started := alloc.PoolRunner{LeaseID: "l1", Tier: "billet-2vcpu", LaunchRequestID: 7,
+		RunnerID: 94, RunnerName: "billet-l1", Status: alloc.PoolRunnerBusy,
+		ActualRequestID: 8, RunID: 9, JobID: "job"}
+	store.mu.Lock()
+	store.pool = nil
+	store.mu.Unlock()
+	jit.recovery = nodeplane.JITRunnerRecovery{}
+	jit.onRecover = func() {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		store.pool = map[string]alloc.PoolRunner{"billet-l1": started}
+	}
+	recovery, err = c.RecoverRunner(t.Context(), "l1", "billet-2vcpu", 7, "billet-l1")
+	if err != nil || recovery != billetnode.RunnerRecoveryTracked {
+		t.Fatalf("split recovery lost JobStarted during lookup: disposition %q, err %v", recovery, err)
+	}
+
+	store.mu.Lock()
+	store.pool = map[string]alloc.PoolRunner{"billet-l1": {
+		LeaseID: "l1", Tier: "billet-2vcpu", LaunchRequestID: 7,
+		RunnerID: 94, RunnerName: "billet-l1", Status: alloc.PoolRunnerIdle,
+	}}
+	store.mu.Unlock()
+	jit.onRecover = nil
+	jit.recovery = nodeplane.JITRunnerRecovery{RunnerID: 94, Present: true}
+	jit.onRemove = func() {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		store.pool = map[string]alloc.PoolRunner{"billet-l1": started}
+	}
+	recovery, err = c.RecoverRunner(t.Context(), "l1", "billet-2vcpu", 7, "billet-l1")
+	if err != nil || recovery != billetnode.RunnerRecoveryTracked {
+		t.Fatalf("split recovery lost JobStarted after deletion: disposition %q, err %v", recovery, err)
+	}
+
+	store.mu.Lock()
+	store.pool = nil
+	store.mu.Unlock()
+	jit.onRemove = nil
 	jit.recoverErr = errors.New("github unavailable")
 	if _, err := c.RecoverRunner(t.Context(), "l1", "billet-2vcpu", 7, "billet-l1"); err == nil {
 		t.Fatal("legacy recovery hid a GitHub error")
