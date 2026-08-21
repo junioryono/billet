@@ -179,16 +179,34 @@ func (a *Allocator) PreserveRecoveredBusyPoolRunner(ctx context.Context, runner 
 // row. An authoritative JobStarted binding wins the same transaction race and
 // is returned unchanged so recovery preserves its compute.
 func (a *Allocator) RetireRecoveredPoolRunner(
-	ctx context.Context, leaseID string,
+	ctx context.Context, runner PoolRunner,
 ) (PoolRunner, error) {
+	if strings.TrimSpace(runner.LeaseID) == "" || strings.TrimSpace(runner.Tier) == "" ||
+		runner.LaunchRequestID == 0 || runner.RunnerID < 0 ||
+		strings.TrimSpace(runner.RunnerName) == "" {
+		return PoolRunner{}, errors.New("alloc: a recovered retirement needs complete lease and runner identity")
+	}
 	var out PoolRunner
 	err := a.db.Tx(ctx, func(tx *sql.Tx) error {
-		prior, found, err := poolRunnerByLease(ctx, tx, leaseID)
+		prior, found, err := poolRunnerByLease(ctx, tx, runner.LeaseID)
 		if err != nil {
 			return err
 		}
 		if !found {
-			return ErrLeaseNotFound
+			_, err = tx.ExecContext(ctx, `INSERT INTO pool_runners
+				(lease_id, tier, launch_request_id, runner_id, runner_name, status, updated_at)
+				VALUES (?, ?, ?, ?, ?, 'retiring', ?)`, runner.LeaseID, runner.Tier,
+				runner.LaunchRequestID, runner.RunnerID, runner.RunnerName,
+				time.Now().UTC().Format(time.RFC3339Nano))
+			runner.Status = PoolRunnerRetiring
+			out = runner
+			return err
+		}
+		if prior.Tier != runner.Tier || prior.LaunchRequestID != runner.LaunchRequestID ||
+			prior.RunnerName != runner.RunnerName ||
+			(prior.RunnerID != 0 && runner.RunnerID != 0 && prior.RunnerID != runner.RunnerID) {
+			return fmt.Errorf("alloc: %w: recovered retirement for %q does not match lease %s",
+				ErrConflict, runner.RunnerName, runner.LeaseID)
 		}
 		out = prior
 		if prior.Status == PoolRunnerBusy &&
@@ -202,7 +220,7 @@ func (a *Allocator) RetireRecoveredPoolRunner(
 			return ErrConflict
 		}
 		_, err = tx.ExecContext(ctx, `UPDATE pool_runners SET status = 'retiring', updated_at = ?
-			WHERE lease_id = ?`, time.Now().UTC().Format(time.RFC3339Nano), leaseID)
+			WHERE lease_id = ?`, time.Now().UTC().Format(time.RFC3339Nano), runner.LeaseID)
 		if err == nil {
 			out.Status = PoolRunnerRetiring
 		}

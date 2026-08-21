@@ -32,7 +32,7 @@ type Provisioner struct{ Client *scaleset.Client }
 type poolRunnerStore interface {
 	PoolRunnerByLease(context.Context, string) (alloc.PoolRunner, error)
 	PreserveRecoveredBusyPoolRunner(context.Context, alloc.PoolRunner) error
-	RetireRecoveredPoolRunner(context.Context, string) (alloc.PoolRunner, error)
+	RetireRecoveredPoolRunner(context.Context, alloc.PoolRunner) (alloc.PoolRunner, error)
 	RetirePoolRunner(context.Context, string) error
 }
 
@@ -195,10 +195,14 @@ func recoverRunner(ctx context.Context, pool poolRunnerStore, client runnerRecov
 			return "", err
 		}
 	}
-	settled, err := pool.RetireRecoveredPoolRunner(ctx, leaseID)
-	if errors.Is(err, alloc.ErrLeaseNotFound) {
-		return node.RunnerRecoveryRetired, nil
+	retiringID := int64(0)
+	if recovery.Present {
+		retiringID = recovery.RunnerID
 	}
+	settled, err := pool.RetireRecoveredPoolRunner(ctx, alloc.PoolRunner{
+		LeaseID: leaseID, Tier: tier, LaunchRequestID: requestID,
+		RunnerID: retiringID, RunnerName: runnerName,
+	})
 	if err != nil {
 		return "", err
 	}

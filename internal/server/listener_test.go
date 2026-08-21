@@ -1015,6 +1015,37 @@ func poolLeaseForTier(t *testing.T, a *alloc.Allocator, tier string) *alloc.Leas
 	return leases[0]
 }
 
+func TestRecoveryRetirementFenceSurvivesNodeCustodyAndRefusesLateStart(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 4, MaxMemory: 64 * config.GiB}, tiers)
+	lease := poolLeaseForTier(t, a, tiers[0].Label)
+	if err := a.Assign(t.Context(), lease.ID, lease.Epoch, 101, 11); err != nil {
+		t.Fatalf("Assign: %v", err)
+	}
+	name := provider.InstanceName(lease.ID)
+	if _, err := a.RetireRecoveredPoolRunner(t.Context(), alloc.PoolRunner{
+		LeaseID: lease.ID, Tier: tiers[0].Label, LaunchRequestID: 11, RunnerName: name,
+	}); err != nil {
+		t.Fatalf("RetireRecoveredPoolRunner: %v", err)
+	}
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(&fakeRunner{
+		onDestroy: func(int64) error { return ErrCustody },
+	}), WithRunnerRegistry(&fakeRunnerRegistry{}))
+	l.reconcilePool(t.Context(), 0)
+	member, err := a.PoolRunnerByLease(t.Context(), lease.ID)
+	if err != nil || member.Status != alloc.PoolRunnerRetiring {
+		t.Fatalf("node custody dropped recovery fence: %+v, err %v", member, err)
+	}
+	if err := a.RegisterPoolRunner(t.Context(), alloc.PoolRunner{LeaseID: lease.ID,
+		Tier: tiers[0].Label, LaunchRequestID: 11, RunnerName: name}); err != nil {
+		t.Fatalf("late legacy registration: %v", err)
+	}
+	if _, err := a.StartPoolRunner(t.Context(), lease.ID, tiers[0].Label, 71, name,
+		22, 202, "late-job"); !errors.Is(err, alloc.ErrConflict) {
+		t.Fatalf("late JobStarted crossed custody recovery fence: %v", err)
+	}
+}
+
 func TestStartedIdentityCannotRetireAnotherTiersPoolMember(t *testing.T) {
 	tiers := []config.Tier{tier("tier-a"), tier("tier-b")}
 	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)

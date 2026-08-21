@@ -58,7 +58,7 @@ type poolRunnerStore interface {
 	PoolRunnerByName(context.Context, string) (alloc.PoolRunner, error)
 	PoolRunnerByLease(context.Context, string) (alloc.PoolRunner, error)
 	PreserveRecoveredBusyPoolRunner(context.Context, alloc.PoolRunner) error
-	RetireRecoveredPoolRunner(context.Context, string) (alloc.PoolRunner, error)
+	RetireRecoveredPoolRunner(context.Context, alloc.PoolRunner) (alloc.PoolRunner, error)
 	RetirePoolRunner(context.Context, string) error
 }
 
@@ -1540,12 +1540,19 @@ func (h *handler) recoverRunner(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	settled, err := pool.RetireRecoveredPoolRunner(r.Context(), leaseID)
-	if err != nil && !errors.Is(err, alloc.ErrLeaseNotFound) {
+	retiringID := int64(0)
+	if recovery.Present {
+		retiringID = recovery.RunnerID
+	}
+	settled, err := pool.RetireRecoveredPoolRunner(r.Context(), alloc.PoolRunner{
+		LeaseID: leaseID, Tier: lease.Tier, LaunchRequestID: lease.RequestID,
+		RunnerID: retiringID, RunnerName: req.RunnerName,
+	})
+	if err != nil {
 		writeStoreErr(w, err)
 		return
 	}
-	if err == nil && settled.Status == alloc.PoolRunnerBusy &&
+	if settled.Status == alloc.PoolRunnerBusy &&
 		(settled.ActualRequestID != 0 || settled.RunID != 0 || settled.JobID != "") {
 		writeJSON(w, http.StatusOK, nodeapi.RecoverRunnerResponse{State: nodeapi.RunnerRecoveryTracked})
 		return

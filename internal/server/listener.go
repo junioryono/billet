@@ -2408,10 +2408,10 @@ func (l *Listener) retirePoolMember(ctx context.Context, member alloc.PoolRunner
 		RunnerName: member.RunnerName}
 	if err := l.destroyCompleted(ctx, job, lease, alloc.PhaseDone); err != nil {
 		if errors.Is(err, ErrCustody) {
-			if forgetErr := l.alloc.ForgetPoolRunner(ctx, member.LeaseID); forgetErr != nil {
-				l.log.Warn("a retiring pool member in node custody kept its journal", "tier", l.tier,
-					"runner", member.RunnerName, "error", forgetErr)
-			}
+			// KEPT UNTIL CUSTODY SETTLES. A recovery tombstone is the fence that
+			// stops a delayed JobStarted recreating a busy binding after the node
+			// was already told to tear this guest down. The next reconciliation
+			// retries and forgets it only after custody no longer owns compute.
 			l.dropPoolMember(member)
 			return
 		}

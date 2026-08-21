@@ -254,6 +254,13 @@ func (f *fakeStore) RegisterPoolRunner(_ context.Context, runner alloc.PoolRunne
 	if f.pool == nil {
 		f.pool = make(map[string]alloc.PoolRunner)
 	}
+	if prior, ok := f.pool[runner.RunnerName]; ok {
+		if prior.LeaseID != runner.LeaseID || prior.Tier != runner.Tier ||
+			prior.LaunchRequestID != runner.LaunchRequestID {
+			return alloc.ErrConflict
+		}
+		return nil
+	}
 	f.pool[runner.RunnerName] = runner
 	return nil
 }
@@ -319,12 +326,12 @@ func (f *fakeStore) PreserveRecoveredBusyPoolRunner(
 }
 
 func (f *fakeStore) RetireRecoveredPoolRunner(
-	_ context.Context, leaseID string,
+	_ context.Context, recovered alloc.PoolRunner,
 ) (alloc.PoolRunner, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for name, runner := range f.pool {
-		if runner.LeaseID != leaseID {
+		if runner.LeaseID != recovered.LeaseID {
 			continue
 		}
 		if runner.Status == alloc.PoolRunnerBusy &&
@@ -333,10 +340,16 @@ func (f *fakeStore) RetireRecoveredPoolRunner(
 		}
 		runner.Status = alloc.PoolRunnerRetiring
 		f.pool[name] = runner
-		f.retired = append(f.retired, leaseID)
+		f.retired = append(f.retired, recovered.LeaseID)
 		return runner, nil
 	}
-	return alloc.PoolRunner{}, alloc.ErrLeaseNotFound
+	if f.pool == nil {
+		f.pool = make(map[string]alloc.PoolRunner)
+	}
+	recovered.Status = alloc.PoolRunnerRetiring
+	f.pool[recovered.RunnerName] = recovered
+	f.retired = append(f.retired, recovered.LeaseID)
+	return recovered, nil
 }
 
 type returnedJIT struct {
@@ -630,6 +643,19 @@ func TestJITPersistsGitHubsReturnedIdentityBeforeGivingItToTheNode(t *testing.T)
 	if err != nil || recovery != billetnode.RunnerRecoveryRetired ||
 		!slices.Equal(jit.removed, []string{"github-returned-name", "github-returned-name", "github-returned-name", "billet-l1"}) {
 		t.Fatalf("idle registered recovery = %q, removed %v, err %v", recovery, jit.removed, err)
+	}
+	member, err = store.PoolRunnerByLease(t.Context(), "l1")
+	if err != nil || member.Status != alloc.PoolRunnerRetiring || member.RunnerID != 93 {
+		t.Fatalf("split no-row retirement fence = %+v, err %v", member, err)
+	}
+	if err := store.RegisterPoolRunner(t.Context(), alloc.PoolRunner{
+		LeaseID: "l1", Tier: "billet-2vcpu", LaunchRequestID: 7, RunnerName: "billet-l1",
+	}); err != nil {
+		t.Fatalf("late split legacy registration: %v", err)
+	}
+	member, err = store.PoolRunnerByLease(t.Context(), "l1")
+	if err != nil || member.Status != alloc.PoolRunnerRetiring {
+		t.Fatalf("late split registration replaced retirement fence: %+v, err %v", member, err)
 	}
 
 	started := alloc.PoolRunner{LeaseID: "l1", Tier: "billet-2vcpu", LaunchRequestID: 7,

@@ -74,7 +74,7 @@ func (mtlsStore) PreserveRecoveredBusyPoolRunner(context.Context, alloc.PoolRunn
 	return nil
 }
 
-func (mtlsStore) RetireRecoveredPoolRunner(context.Context, string) (alloc.PoolRunner, error) {
+func (mtlsStore) RetireRecoveredPoolRunner(context.Context, alloc.PoolRunner) (alloc.PoolRunner, error) {
 	return alloc.PoolRunner{LeaseID: "l1", Status: alloc.PoolRunnerRetiring}, nil
 }
 

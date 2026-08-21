@@ -41,16 +41,20 @@ func (p *recoveryPool) PreserveRecoveredBusyPoolRunner(_ context.Context, runner
 }
 
 func (p *recoveryPool) RetireRecoveredPoolRunner(
-	_ context.Context, leaseID string,
+	_ context.Context, recovered alloc.PoolRunner,
 ) (alloc.PoolRunner, error) {
 	if p.binding.LeaseID == "" {
-		return alloc.PoolRunner{}, alloc.ErrLeaseNotFound
+		recovered.Status = alloc.PoolRunnerRetiring
+		p.binding = recovered
+		p.err = nil
+		p.retired = append(p.retired, recovered.LeaseID)
+		return p.binding, nil
 	}
 	if p.binding.Status == alloc.PoolRunnerBusy &&
 		(p.binding.ActualRequestID != 0 || p.binding.RunID != 0 || p.binding.JobID != "") {
 		return p.binding, nil
 	}
-	p.retired = append(p.retired, leaseID)
+	p.retired = append(p.retired, recovered.LeaseID)
 	if p.retireErr != nil {
 		return alloc.PoolRunner{}, p.retireErr
 	}
@@ -107,9 +111,9 @@ func TestLocalLegacyRunnerRecoveryFailsClosedAndRemovesOnlyIdle(t *testing.T) {
 		{name: "busy durable", pool: &recoveryPool{binding: alloc.PoolRunner{LeaseID: "l1", Tier: "linux", LaunchRequestID: 7, Status: alloc.PoolRunnerBusy, ActualRequestID: 8}}, client: &recoveryClient{}, want: node.RunnerRecoveryTracked},
 		{name: "retiring durable", pool: &recoveryPool{binding: alloc.PoolRunner{LeaseID: "l1", Tier: "linux", LaunchRequestID: 7, RunnerID: 70, RunnerName: "billet-l1", Status: alloc.PoolRunnerRetiring}}, client: &recoveryClient{}, want: node.RunnerRecoveryRetired, wantRemove: true},
 		{name: "retired durable", pool: &recoveryPool{binding: alloc.PoolRunner{LeaseID: "l1", Tier: "linux", LaunchRequestID: 7, Status: alloc.PoolRunnerRetired}}, client: &recoveryClient{}, want: node.RunnerRecoveryRetired},
-		{name: "absent", pool: &recoveryPool{err: alloc.ErrLeaseNotFound}, client: &recoveryClient{}, want: node.RunnerRecoveryRetired, wantRecover: true},
+		{name: "absent", pool: &recoveryPool{err: alloc.ErrLeaseNotFound}, client: &recoveryClient{}, want: node.RunnerRecoveryRetired, wantRecover: true, wantRetire: true},
 		{name: "busy", pool: &recoveryPool{err: alloc.ErrLeaseNotFound}, client: &recoveryClient{recovery: billetgithub.RunnerRecovery{RunnerID: 71, Present: true, Busy: true}}, want: node.RunnerRecoveryBusy, wantRecover: true},
-		{name: "idle", pool: &recoveryPool{err: alloc.ErrLeaseNotFound}, client: &recoveryClient{recovery: billetgithub.RunnerRecovery{RunnerID: 72, Present: true}}, want: node.RunnerRecoveryRetired, wantRecover: true, wantRemove: true},
+		{name: "idle", pool: &recoveryPool{err: alloc.ErrLeaseNotFound}, client: &recoveryClient{recovery: billetgithub.RunnerRecovery{RunnerID: 72, Present: true}}, want: node.RunnerRecoveryRetired, wantRecover: true, wantRemove: true, wantRetire: true},
 		{name: "lookup failure", pool: &recoveryPool{err: alloc.ErrLeaseNotFound}, client: &recoveryClient{recoverErr: errors.New("github unavailable")}, wantRecover: true, wantErr: true},
 		{name: "removal failure", pool: &recoveryPool{err: alloc.ErrLeaseNotFound}, client: &recoveryClient{recovery: billetgithub.RunnerRecovery{RunnerID: 73, Present: true}, removeErr: errors.New("github unavailable")}, wantRecover: true, wantRemove: true, wantErr: true},
 		{name: "durable mismatch", pool: &recoveryPool{binding: alloc.PoolRunner{LeaseID: "l1", Tier: "other", LaunchRequestID: 7, Status: alloc.PoolRunnerIdle}}, client: &recoveryClient{}, wantErr: true},
