@@ -19,7 +19,7 @@ func TestBreakableRefusesWhileTheHolderIsStillCounting(t *testing.T) {
 
 	// Even at an age far past the bound: a holder that is still counting is alive,
 	// and an old-but-live publisher is exactly the case that must not be broken.
-	ok, why := breakable(before, after, 100*StaleLockAfter)
+	ok, why := breakable(before, after, 100*StaleLockAfter, StaleLockAfter)
 	if ok {
 		t.Fatalf("a lock whose holder is still counting was declared breakable (%q); "+
 			"breaking it puts two writers on one image", why)
@@ -31,11 +31,11 @@ func TestBreakableRefusesWhileTheHolderIsStillCounting(t *testing.T) {
 func TestBreakableRequiresBothSilenceAndAge(t *testing.T) {
 	silent := heartbeat{counter: 7, present: true}
 
-	if ok, _ := breakable(silent, silent, StaleLockAfter-time.Minute); ok {
+	if ok, _ := breakable(silent, silent, StaleLockAfter-time.Minute, StaleLockAfter); ok {
 		t.Error("a silent but recent lock was declared breakable")
 	}
 
-	ok, why := breakable(silent, silent, StaleLockAfter+time.Minute)
+	ok, why := breakable(silent, silent, StaleLockAfter+time.Minute, StaleLockAfter)
 	if !ok {
 		t.Error("a lock that is both silent and past the bound was not breakable, so a " +
 			"leaked lock could never be reclaimed and every publisher refuses forever")
@@ -53,11 +53,11 @@ func TestBreakableRequiresBothSilenceAndAge(t *testing.T) {
 func TestBreakableFallsBackToAgeForAHolderThatNeverCounts(t *testing.T) {
 	none := heartbeat{present: false}
 
-	if ok, _ := breakable(none, none, StaleLockAfter-time.Minute); ok {
+	if ok, _ := breakable(none, none, StaleLockAfter-time.Minute, StaleLockAfter); ok {
 		t.Error("a recent lock with no heartbeat was declared breakable")
 	}
 
-	if ok, _ := breakable(none, none, StaleLockAfter+time.Minute); !ok {
+	if ok, _ := breakable(none, none, StaleLockAfter+time.Minute, StaleLockAfter); !ok {
 		t.Error("a lock with no heartbeat, past the bound, was not breakable; the build " +
 			"script writes no counter and its leaks would become permanent")
 	}
@@ -70,7 +70,7 @@ func TestBreakableTreatsAnAppearingHeartbeatAsAlive(t *testing.T) {
 	before := heartbeat{present: false}
 	after := heartbeat{counter: 1, present: true}
 
-	if ok, why := breakable(before, after, 100*StaleLockAfter); ok {
+	if ok, why := breakable(before, after, 100*StaleLockAfter, StaleLockAfter); ok {
 		t.Fatalf("a lock whose holder started counting between observations was declared "+
 			"breakable (%q)", why)
 	}
@@ -83,7 +83,7 @@ func TestBreakableRefusesWhenTheCounterWentBackwards(t *testing.T) {
 	before := heartbeat{counter: 9, present: true}
 	after := heartbeat{counter: 2, present: true}
 
-	if ok, why := breakable(before, after, 100*StaleLockAfter); ok {
+	if ok, why := breakable(before, after, 100*StaleLockAfter, StaleLockAfter); ok {
 		t.Fatalf("a lock whose counter went backwards -- released and retaken while this "+
 			"was deciding -- was declared breakable (%q); that breaks the new holder's lock", why)
 	}
