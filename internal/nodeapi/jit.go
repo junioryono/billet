@@ -63,3 +63,21 @@ type RemoveRunnerRequest struct {
 	RunnerID   int64  `json:"runner_id"`
 	RunnerName string `json:"runner_name"`
 }
+
+// RecoverRunnerRequest names the deterministic registration of quarantined
+// compute whose pre-journal launch may have survived an upgrade.
+type RecoverRunnerRequest struct {
+	RunnerName string `json:"runner_name"`
+}
+
+// RecoverRunnerResponse says whether the registration is durably tracked,
+// proven busy, or safely retired before compute teardown.
+type RecoverRunnerResponse struct {
+	State string `json:"state"`
+}
+
+const (
+	RunnerRecoveryTracked = "tracked"
+	RunnerRecoveryBusy    = "busy"
+	RunnerRecoveryRetired = "retired"
+)

@@ -593,6 +593,26 @@ func (c *Client) EnsureRunnerRemoved(ctx context.Context, leaseID string) error 
 		nodeapi.RemoveRunnerRequest{}, nil)
 }
 
+// RecoverRunner asks the control plane to preserve a proven-busy legacy
+// registration or retire it before quarantined compute is touched.
+func (c *Client) RecoverRunner(ctx context.Context, leaseID, _ string, _ int64,
+	runnerName string,
+) (node.RunnerRecovery, error) {
+	var res nodeapi.RecoverRunnerResponse
+	err := c.do(ctx, http.MethodPost, c.leasePath(leaseID, "/runner/recover"),
+		nodeapi.RecoverRunnerRequest{RunnerName: runnerName}, &res)
+	if err != nil {
+		return "", err
+	}
+	switch node.RunnerRecovery(res.State) {
+	case node.RunnerRecoveryTracked, node.RunnerRecoveryBusy, node.RunnerRecoveryRetired:
+		return node.RunnerRecovery(res.State), nil
+	default:
+		return "", fmt.Errorf("nodeclient: the control plane returned unknown runner recovery state %q",
+			res.State)
+	}
+}
+
 // registration is a minted registration whose config is a CREDENTIAL.
 //
 // The field is unexported and reachable only through Config(), so printing the

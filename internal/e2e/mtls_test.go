@@ -70,6 +70,14 @@ func (mtlsStore) PoolRunnerByLease(context.Context, string) (alloc.PoolRunner, e
 	return alloc.PoolRunner{LeaseID: "l1", RunnerID: 71, RunnerName: "runner-l1"}, nil
 }
 
+func (mtlsStore) PreserveRecoveredBusyPoolRunner(context.Context, alloc.PoolRunner) error {
+	return nil
+}
+
+func (mtlsStore) RetireRecoveredPoolRunner(context.Context, alloc.PoolRunner) (alloc.PoolRunner, error) {
+	return alloc.PoolRunner{LeaseID: "l1", Status: alloc.PoolRunnerRetiring}, nil
+}
+
 func (mtlsStore) RetirePoolRunner(context.Context, string) error { return nil }
 
 func (m mtlsStore) QuarantinedLeaseIDs(context.Context, string) (map[string]bool, error) {
@@ -297,6 +305,10 @@ func (alwaysMints) JITConfig(_ context.Context, _ int, runnerName, _ string) (no
 }
 
 func (alwaysMints) RemoveRunner(context.Context, int64, string) error { return nil }
+
+func (alwaysMints) RecoverRunner(context.Context, string) (nodeplane.JITRunnerRecovery, error) {
+	return nodeplane.JITRunnerRecovery{}, nil
+}
 
 type mintedFor string
 
