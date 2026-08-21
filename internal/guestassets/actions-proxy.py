@@ -19,6 +19,7 @@ what lets the node present a certificate the guest already trusts.
 
 import argparse
 import base64
+import os
 import select
 import signal
 import socket
@@ -30,6 +31,12 @@ RESULTS_AUTHORITY = "results-receiver.actions.githubusercontent.com:443"
 RESULTS_PORT = 443
 HEADER_LIMIT = 64 * 1024
 CONNECT_TIMEOUT = 10
+# The first descriptor systemd passes to an activated service (sd-daemon's
+# SD_LISTEN_FDS_START). Owning the listener in systemd, not here, is what closes
+# the crash-restart window: a SIGKILL of this process leaves the socket bound, so
+# new connections queue in its backlog instead of being refused, and the restarted
+# process adopts the same descriptor and accepts them.
+SD_LISTEN_FDS_START = 3
 # After one direction of a relay closes, the other is given this long to keep
 # draining. A live transfer resets it on every chunk, so only an IDLE half-open
 # connection -- a client that ignores the node closing on it -- is torn down,
@@ -173,20 +180,68 @@ def handle(client, upstream, fallback):
             peer.close()
 
 
+def systemd_listener():
+    """Adopt the listening socket systemd bound for this activated service.
+
+    Validated strictly: the environment must name THIS process and pass exactly
+    one already-listening descriptor, or the service is misconfigured and must
+    fail rather than fall back to binding a privileged port itself (which it can
+    no longer do -- the capability is gone under socket activation).
+    """
+    if int(os.environ.get("LISTEN_PID", "0")) != os.getpid():
+        raise SystemExit("LISTEN_PID does not name this process; not socket-activated")
+    if int(os.environ.get("LISTEN_FDS", "0")) != 1:
+        raise SystemExit("expected exactly one systemd listening socket")
+    server = socket.socket(fileno=SD_LISTEN_FDS_START)
+    # SO_ACCEPTCONN confirms systemd handed over a LISTENING socket, not a stray fd.
+    # It is Linux-queryable (the guest); a platform that cannot report it (macOS in
+    # unit tests) raises here, and there we trust the descriptor rather than refuse.
+    try:
+        is_listening = server.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN) == 1
+    except OSError:
+        is_listening = True
+    if not is_listening:
+        raise SystemExit("the inherited descriptor is not a listening socket")
+    return server
+
+
+def notify_ready():
+    """Tell systemd (Type=notify) the service is up, once the listener is adopted.
+
+    A Type=notify unit stays `activating` until this arrives, which is what makes
+    `systemctl is-active` -- and the guest agent's readiness gate -- mean 'serving'
+    rather than 'forked'. A failure to notify is a broken service, not swallowed.
+    """
+    address = os.environ.get("NOTIFY_SOCKET")
+    if not address:
+        return
+    if address.startswith("@"):
+        address = "\0" + address[1:]
+    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as notifier:
+        notifier.connect(address)
+        notifier.sendall(b"READY=1")
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--listen", required=True)
+    parser.add_argument("--listen")
+    parser.add_argument("--systemd-socket", action="store_true")
     parser.add_argument("--upstream", required=True)
     parser.add_argument("--fallback-addr", default="")
     args = parser.parse_args()
 
-    parsed = urllib.parse.urlsplit("//" + args.listen)
-    if not parsed.hostname or parsed.port is None:
-        raise SystemExit("--listen needs an explicit host and port")
-
     fallback = [addr for addr in args.fallback_addr.split(",") if addr]
 
-    server = socket.create_server((parsed.hostname, parsed.port), reuse_port=False)
+    if args.systemd_socket:
+        server = systemd_listener()
+    else:
+        if not args.listen:
+            raise SystemExit("either --systemd-socket or --listen is required")
+        parsed = urllib.parse.urlsplit("//" + args.listen)
+        if not parsed.hostname or parsed.port is None:
+            raise SystemExit("--listen needs an explicit host and port")
+        server = socket.create_server((parsed.hostname, parsed.port), reuse_port=False)
+
     server.settimeout(1)
     stopping = threading.Event()
 
@@ -195,6 +250,8 @@ def main():
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
+    if args.systemd_socket:
+        notify_ready()
     while not stopping.is_set():
         try:
             client, _ = server.accept()

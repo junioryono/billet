@@ -506,19 +506,31 @@ jobs:
       - name: Recover the supervised forwarder from a process crash
         run: |
           set -euo pipefail
+          origin=results-receiver.actions.githubusercontent.com
           before=$(systemctl show --property=MainPID --value billet-actions-proxy.service)
           test "$before" -gt 0
           sudo systemctl kill --kill-whom=main --signal=KILL billet-actions-proxy.service
-          after=0
+          # Active plus a NEW MainPID is systemd's fork, not the bind: the restarted
+          # python takes ~200ms to adopt the socket and reach its accept loop, and the
+          # next step's connect once lost that race. Readiness is the PORT answering --
+          # the same successful-connect wait the guest agent runs at first start.
+          ready=0
           for _ in $(seq 1 100); do
             after=$(systemctl show --property=MainPID --value billet-actions-proxy.service)
-            if systemctl is-active --quiet billet-actions-proxy.service && [ "$after" -gt 0 ] && [ "$after" != "$before" ]; then
+            if systemctl is-active --quiet billet-actions-proxy.service &&
+               [ "$after" -gt 0 ] && [ "$after" != "$before" ] &&
+               (: </dev/tcp/"$origin"/443) 2>/dev/null; then
+              ready=1
               break
             fi
             sleep 0.1
           done
-          test "$after" -gt 0
-          test "$after" != "$before"
+          if [ "$ready" != 1 ]; then
+            systemctl status --no-pager billet-actions-proxy.socket billet-actions-proxy.service || true
+            sudo journalctl --no-pager -u billet-actions-proxy.service -n 50 || true
+            echo "the passthrough did not become ready after a crash" >&2
+            exit 1
+          fi
       - name: Isolate a malformed TLS client and a silent client from the passthrough
         run: |
           set -euo pipefail
@@ -535,6 +547,11 @@ jobs:
             172.1[6-9].*|172.2[0-9].*|172.3[01].*) ;;
             *) echo "results origin is not remapped to the local passthrough: $addr" >&2; exit 1 ;;
           esac
+          # Wait for the passthrough to answer before probing. With socket activation
+          # the listener is always up (systemd owns it), but this keeps the probe
+          # honest against any residual restart race rather than assuming a single
+          # open cannot lose it, the way the previous version did.
+          for _ in $(seq 1 50); do (: </dev/tcp/"$origin"/443) 2>/dev/null && break; sleep 0.1; done
           # A malformed TLS client: the node rejects it and the passthrough tears the
           # connection down; it must not wedge the listener for what follows.
           exec 3<>"/dev/tcp/$origin/443"

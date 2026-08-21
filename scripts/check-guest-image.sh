@@ -353,11 +353,23 @@ else
 
 		version=$(basename "$versiondir")
 
-		if [ -e "$versiondir/x64/bin/python" ] && [ -e "$versiondir/x64/python" ]; then
-			pass "python $version has the entry points setup.sh would have made"
-		else
+		if [ ! -e "$versiondir/x64/bin/python" ] || [ ! -e "$versiondir/x64/python" ]; then
 			fail "python $version is missing bin/python or the root python symlink, which
         its setup.sh creates and this build has to recreate"
+			continue
+		fi
+
+		# BOTH PIP SURFACES, OR IT IS A GREEN IMAGE WHOSE EVERY PIP JOB DIES.
+		# setup-python's `cache: pip` execs a bare `pip`; workflows run `python -m pip`.
+		# ensurepip -- skipped once, which shipped an interpreter with neither -- is what
+		# makes both exist, so prove both by running them under the mounted image.
+		if [ -x "$versiondir/x64/bin/pip" ] &&
+			chroot "$MNT" "/opt/hostedtoolcache/Python/$version/x64/bin/pip" --version >/dev/null 2>&1 &&
+			chroot "$MNT" "/opt/hostedtoolcache/Python/$version/x64/bin/python" -m pip --version >/dev/null 2>&1; then
+			pass "python $version has a working pip executable and module"
+		else
+			fail "python $version has no working pip; setup-python's cache: pip and
+        python -m pip both fail on it, as when ensurepip was skipped"
 		fi
 	done
 fi
@@ -398,7 +410,8 @@ fi
 ACTIONS_PROXY="$MNT/usr/local/bin/billet-actions-proxy"
 if [ -x "$ACTIONS_PROXY" ] &&
 	grep -Fq 'results-receiver.actions.githubusercontent.com:443' "$ACTIONS_PROXY" &&
-	grep -Fq 'def node_tunnel' "$ACTIONS_PROXY"; then
+	grep -Fq 'def node_tunnel' "$ACTIONS_PROXY" &&
+	grep -Fq 'def systemd_listener' "$ACTIONS_PROXY"; then
 	pass "the guest carries the transparent Actions results passthrough"
 else
 	fail "the guest has no Actions results passthrough; only the one results origin is
