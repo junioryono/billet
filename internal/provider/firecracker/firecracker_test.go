@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"net"
 	"os"
 	"path/filepath"
 	"slices"
@@ -1521,4 +1522,97 @@ func metadataLeaves(t *testing.T, path string, node any) map[string]string {
 	}
 
 	return leaves
+}
+
+// TestGuestMACIsUniquePerTapAndLocallyAdministered proves the whole reason the
+// backend now sets guest_mac: every tap the claim hands out maps to a distinct,
+// SYNTACTICALLY VALID, locally-administered unicast MAC, so no two live guests can
+// share a network identity (which collapses them onto one DHCP lease and stalls
+// large transfers).
+func TestGuestMACIsUniquePerTapAndLocallyAdministered(t *testing.T) {
+	seen := make(map[string]string, maxTaps)
+	for n := range maxTaps {
+		tap := config.TapPrefix + strconv.Itoa(n)
+		mac, err := guestMAC(tap)
+		if err != nil {
+			t.Fatalf("guestMAC(%q): %v", tap, err)
+		}
+		// A real MAC the firecracker API will accept, not just a unique string.
+		hw, err := net.ParseMAC(mac)
+		if err != nil || len(hw) != 6 {
+			t.Fatalf("guestMAC(%q)=%q is not a 6-octet MAC: %v", tap, mac, err)
+		}
+		// bit 0x02 set = locally administered; bit 0x01 clear = unicast.
+		if hw[0]&0x03 != 0x02 {
+			t.Errorf("guestMAC(%q)=%q: first octet %#02x is not locally-administered unicast",
+				tap, mac, hw[0])
+		}
+		if prev, ok := seen[mac]; ok {
+			t.Fatalf("guestMAC collision: %q and %q both yield %q", prev, tap, mac)
+		}
+		seen[mac] = tap
+	}
+	if len(seen) != maxTaps {
+		t.Fatalf("expected %d distinct MACs across the tap range, got %d", maxTaps, len(seen))
+	}
+
+	// Pin the exact encoding at the byte boundaries, so a shift/verb regression that
+	// still produced unique parseable MACs would be caught.
+	for _, want := range []struct{ tap, mac string }{
+		{"bt-0", "02:00:00:00:00:00"},
+		{"bt-255", "02:00:00:00:00:ff"},
+		{"bt-256", "02:00:00:00:01:00"},
+		{"bt-4095", "02:00:00:00:0f:ff"},
+	} {
+		if got, err := guestMAC(want.tap); err != nil || got != want.mac {
+			t.Errorf("guestMAC(%q) = %q, %v; want %q", want.tap, got, err, want.mac)
+		}
+	}
+}
+
+func TestGuestMACRejectsANameThatIsNotACanonicalClaimedTap(t *testing.T) {
+	for _, bad := range []string{
+		"", "eth0", "docker0", config.TapPrefix, config.TapPrefix + "x",
+		config.TapPrefix + "-1", config.TapPrefix + strconv.Itoa(maxTaps),
+		// non-canonical spellings that alias onto a valid index must also be refused.
+		config.TapPrefix + "07", config.TapPrefix + "+7", "7",
+	} {
+		if mac, err := guestMAC(bad); err == nil {
+			t.Errorf("guestMAC(%q) = %q, want an error for a non-canonical or out-of-range name",
+				bad, mac)
+		}
+	}
+}
+
+// TestTheGuestInterfaceIsGivenAStableMAC is the wiring proof: without it, deleting
+// the guest_mac line from the network-interfaces config would leave the guestMAC
+// unit tests green while the guests it launches carried none.
+func TestTheGuestInterfaceIsGivenAStableMAC(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+	_, vmm := h.launch(t)
+
+	body, called := vmm.bodyPut("/network-interfaces/" + guestInterface)
+	if !called {
+		t.Fatal("the guest was never given a network interface")
+	}
+	mac, ok := body["guest_mac"].(string)
+	if !ok {
+		t.Fatalf("the network interface carries no guest_mac: %v", body)
+	}
+	hw, err := net.ParseMAC(mac)
+	if err != nil || len(hw) != 6 || hw[0]&0x03 != 0x02 {
+		t.Fatalf("guest_mac %q is not a locally-administered unicast MAC: %v", mac, err)
+	}
+	// The harness runs on a fresh per-test claims directory, so this first launch
+	// takes bt-0 -- assert the EXACT MAC that tap maps to, not merely any valid one,
+	// so a bug that wired a constant or the wrong tap's MAC is caught.
+	want, err := guestMAC(config.TapPrefix + "0")
+	if err != nil {
+		t.Fatalf("guestMAC(%s0): %v", config.TapPrefix, err)
+	}
+	if mac != want {
+		t.Errorf("guest_mac = %q, want %q for the claimed tap %s0", mac, want, config.TapPrefix)
+	}
 }
