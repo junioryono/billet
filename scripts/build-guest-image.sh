@@ -432,10 +432,21 @@ EOF
 		apt-get install -y --no-install-recommends \
 			ca-certificates curl iproute2 iptables jq git sudo dnsmasq-base \
 			docker.io docker-buildx docker-compose-v2 e2fsprogs util-linux systemd-resolved netplan.io libicu74 \
-			unzip zip zstd tar wget rsync build-essential
+			unzip zip zstd tar wget rsync build-essential \
+			python3-pip python3-venv python3-dev python-is-python3
 		apt-get clean
 		rm -rf /var/lib/apt/lists/*
 	'
+
+	# break-system-packages, exactly as runner-images writes it on 24.04, so a
+	# workflow that `pip install`s against the system python succeeds here as it does
+	# on a hosted runner instead of failing PEP 668's externally-managed guard. It is
+	# a no-op for setup-python's self-contained toolcache pip, which is not an
+	# externally-managed environment.
+	install -m 0644 /dev/stdin "$rootfs/etc/pip.conf" <<'PIPCONF'
+[global]
+break-system-packages = true
+PIPCONF
 
 	# Docker 29 made the containerd image store the default for fresh installs, and
 	# that store keeps image content outside Docker's data root. The slot-zero cache
@@ -478,6 +489,22 @@ DOCKER
 	# distro to match its published manifest -- which is why this image is ubuntu
 	# 24.04 and not something smaller -- and a compiler only when it falls back to
 	# building from source.
+	#
+	# THE SYSTEM PYTHON GETS THE SAME PROVISIONING THE HOSTED IMAGE GIVES IT, which a
+	# debootstrap of the release does not. runner-images installs
+	# `python3 python3-dev python3-pip python3-venv` and, on non-22.04, writes
+	# /etc/pip.conf with break-system-packages so pip still installs past PEP 668;
+	# python-is-python3 supplies the `python` name. The concrete failure this fixes:
+	# setup-python's `cache: pip` runs `pip cache dir` through io.which('pip', true),
+	# which THROWS the moment no `pip` -- not `pip3` -- resolves, and this guest's only
+	# pip was setup-python's own toolcache entry, on PATH just for the window its
+	# addition holds; the hosted image never hit that because a system pip always
+	# answered. Match it fully rather than in part, or the system pip resolves for
+	# `which` but a workflow that runs `pip install` or `python -m venv` without
+	# setup-python fails where a hosted runner succeeds -- a later, more confusing gap
+	# than the one it replaces. The toolcache pip stays primary once setup-python
+	# prepends its bin, so an install still lands on that interpreter's own newer pip.
+	# The /etc/pip.conf write is above, right after the chroot install.
 	#
 	# wget and rsync are cheap and assumed by enough workflows to be worth the few
 	# megabytes.
