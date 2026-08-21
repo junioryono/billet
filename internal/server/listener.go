@@ -54,6 +54,13 @@ type Runner interface {
 	Destroy(ctx context.Context, requestID int64) error
 }
 
+// RunnerRegistry removes a GitHub registration before its guest is destroyed.
+// A failed removal leaves compute and capacity held so GitHub cannot race a new
+// assignment onto a guest Billet is tearing down.
+type RunnerRegistry interface {
+	RemoveRunner(ctx context.Context, runnerID int64, runnerName string) error
+}
+
 // CompletionAwareRunner receives GitHub's authoritative completed-job result.
 // It is optional so runners that have no result-dependent teardown keep the
 // smaller Runner contract.
@@ -155,6 +162,12 @@ var ErrUntrustworthySession = errors.New("server: the scale set returned somethi
 var errQuarantinableCompletion = fmt.Errorf("%w: the completion has no safe identity",
 	ErrUntrustworthySession)
 
+// errQuarantinableStarted marks an immutable contradiction confined to one
+// same-tier pool member. Operational failures must remain retryable and leave
+// the source unacknowledged rather than destroying a runner on a failed read.
+var errQuarantinableStarted = fmt.Errorf("%w: the started identity contradicts its pool member",
+	ErrUntrustworthySession)
+
 // poisonedMessageError carries the valid completions beside a poison so they can
 // be made durable after the whole message is finally acknowledged.
 type poisonedMessageError struct {
@@ -174,7 +187,11 @@ type Message struct {
 	Available []Job
 	// Assigned is work this scale set has been given, which is the confirmation
 	// that an acquisition succeeded.
-	Assigned  []Job
+	Assigned []Job
+	// Started binds a registered pool member to the job it actually consumed.
+	// GitHub may choose a different member than the assignment that caused Billet
+	// to scale up.
+	Started   []Job
 	Completed []Job
 }
 
@@ -186,6 +203,9 @@ type Message struct {
 type Job struct {
 	RequestID int64
 	RunID     int64
+	// RunnerID and RunnerName identify the pool member GitHub actually bound.
+	// They are authoritative only on JobStarted and JobCompleted messages.
+	RunnerID int64
 	// JobID is GitHub's stable workflow-job identity. It is required when the
 	// direct-assignment path sends RequestID zero.
 	JobID string
@@ -199,9 +219,9 @@ type Job struct {
 	// Result is GitHub's conclusion on a completed-job message. It is empty on
 	// available and assigned messages.
 	Result string
-	// The GitHub event that queued this job — "push", "pull_request", "schedule".
-	// The ONLY thing in a scale-set message that says how far the workload can be
-	// trusted, which decides which backends may run it.
+	// The GitHub event that queued this job — retained for diagnostics only. A JIT
+	// runner joins a pool before GitHub chooses its job, so event is not launch
+	// authority; the tier's static trust policy is.
 	Event string
 	// Owner, Repository and WorkflowRef are GitHub's authenticated cache scope.
 	// They come from the scale-set assignment, never from a workflow-controlled
@@ -303,7 +323,8 @@ type Listener struct {
 	configErrs map[string]error
 
 	// Never nil; see noRunner.
-	runner Runner
+	runner   Runner
+	registry RunnerRegistry
 	// completionStore keeps authoritative job results across an ACK followed by a
 	// process stop, until the node accepts result-dependent teardown.
 	completionStore completionStore
@@ -364,6 +385,11 @@ func NewListener(a *alloc.Allocator, tier string, session Session, opts ...Optio
 // so correctly while this said the reverse.
 func WithRunner(r Runner) Option {
 	return func(l *Listener) { l.runner = r }
+}
+
+// WithRunnerRegistry installs the GitHub side of safe runner retirement.
+func WithRunnerRegistry(registry RunnerRegistry) Option {
+	return func(l *Listener) { l.registry = registry }
 }
 
 // WithCompletionStore makes result delivery and its capacity settlement durable
@@ -913,6 +939,9 @@ func (l *Listener) Run(ctx context.Context) error {
 	// that waits to be told about a backlog sits idle in front of one.
 	l.observed = l.session.Statistics()
 	l.reportOrphanedBacklog()
+	if l.observed != nil {
+		l.reconcilePool(ctx, l.observed.TotalAssignedJobs)
+	}
 
 	// THE DRAIN IS A STATE OF THIS LOOP, NOT A PHASE OF THE TEARDOWN. There ctx is
 	// already cancelled and the long poll dead, so the listener could not be TOLD a job
@@ -996,6 +1025,9 @@ func (l *Listener) Run(ctx context.Context) error {
 		// would hand the gap to another tier and produce exactly the flapping the
 		// escrow exists to avoid.
 		if errors.Is(err, ErrNoMessage) {
+			if l.observed != nil {
+				l.reconcilePool(pollCtx, l.observed.TotalAssignedJobs)
+			}
 			continue
 		}
 
@@ -2038,6 +2070,24 @@ func (l *Listener) refillEscrow(ctx context.Context) error {
 // about error severity, so the first non-fatal error path anyone adds inherits
 // the question.
 func (l *Listener) handle(ctx context.Context, msg *Message) error {
+	// STARTS PRECEDE COMPLETIONS EVEN WHEN GITHUB BATCHES THEM TOGETHER. The
+	// start is the authoritative runner-to-job binding; resolving the completion
+	// first would either settle the request that caused launch or mistake a busy
+	// runner for idle surplus.
+	for i := range msg.Started {
+		job, err := l.identifyStarted(ctx, msg.Started[i])
+		if err != nil {
+			if errors.Is(err, errQuarantinableStarted) {
+				l.quarantineStarted(ctx, msg.Started[i], err)
+				continue
+			}
+
+			return err
+		}
+		l.log.Info("a pooled runner started a job", "tier", l.tier,
+			"runner", job.RunnerName, "request", job.RequestID, "job", job.JobID)
+	}
+
 	// COMPLETED IS PROCESSED FIRST. Otherwise the cycle never closes — the lease stays
 	// open until the reaper expires it — and it must come first because GitHub batches
 	// the completion of one job with the offer of its replacement: acquiring before
@@ -2205,6 +2255,7 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 
 	if msg.Statistics != nil {
 		l.observed = msg.Statistics
+		l.reconcilePool(ctx, msg.Statistics.TotalAssignedJobs)
 	}
 
 	if poison != nil {
@@ -2234,6 +2285,163 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 	return nil
 }
 
+// quarantineStarted confines a contradictory identity to the one pool member.
+// A scale-set message is shared infrastructure; taking every tier down over one
+// runner makes an already-bad registration a fleet-wide outage.
+func (l *Listener) quarantineStarted(ctx context.Context, job Job, cause error) {
+	l.log.Error("a pooled runner reported a contradictory job identity; retiring only that member",
+		"tier", l.tier, "runner", job.RunnerName, "runner_id", job.RunnerID,
+		"job", job.JobID, "error", cause)
+	if l.alloc != nil && job.RunnerName != "" {
+		member, err := l.alloc.PoolRunnerByName(ctx, job.RunnerName)
+		if errors.Is(err, alloc.ErrLeaseNotFound) {
+			if leaseID, ok := provider.LeaseOf(job.RunnerName); ok {
+				if legacy, leaseErr := l.alloc.JobForLease(ctx, leaseID); leaseErr == nil &&
+					legacy.Tier == l.tier && legacy.RequestID != 0 {
+					regErr := l.alloc.RegisterPoolRunner(ctx, alloc.PoolRunner{LeaseID: leaseID,
+						Tier: l.tier, LaunchRequestID: legacy.RequestID, RunnerID: job.RunnerID,
+						RunnerName: job.RunnerName})
+					if regErr == nil {
+						member, err = l.alloc.PoolRunnerByName(ctx, job.RunnerName)
+					} else {
+						err = regErr
+					}
+				}
+			}
+		}
+		if err == nil {
+			if member.Tier != l.tier {
+				l.log.Error("refused to quarantine a runner owned by another tier",
+					"tier", l.tier, "runner", job.RunnerName, "owner_tier", member.Tier)
+				return
+			}
+			if retireErr := l.alloc.RetirePoolRunner(ctx, member.LeaseID); retireErr != nil &&
+				!errors.Is(retireErr, alloc.ErrLeaseNotFound) {
+				l.log.Error("could not journal the contradictory runner's retirement",
+					"tier", l.tier, "runner", job.RunnerName, "error", retireErr)
+				return
+			}
+			member.Status = alloc.PoolRunnerRetiring
+			l.retirePoolMember(ctx, member)
+			return
+		}
+		if !errors.Is(err, alloc.ErrLeaseNotFound) {
+			l.log.Error("could not resolve the contradictory runner for retirement",
+				"tier", l.tier, "runner", job.RunnerName, "error", err)
+			return
+		}
+	}
+	if l.registry != nil && (job.RunnerID > 0 || job.RunnerName != "") {
+		if err := l.registry.RemoveRunner(ctx, job.RunnerID, job.RunnerName); err != nil {
+			l.log.Error("could not remove an unrecognized contradictory registration",
+				"tier", l.tier, "runner", job.RunnerName, "error", err)
+		}
+	}
+}
+
+// reconcilePool shrinks a tier to GitHub's authoritative assigned-job count.
+// Only idle members are selected; a busy member belongs to a job regardless of
+// what any aggregate says while messages are in flight.
+func (l *Listener) reconcilePool(ctx context.Context, desired int) {
+	if l.alloc == nil || desired < 0 {
+		return
+	}
+	runners, err := l.alloc.PoolRunners(ctx, l.tier)
+	if err != nil {
+		l.log.Error("could not read the runner pool for scale-down", "tier", l.tier, "error", err)
+		return
+	}
+
+	for i := range runners {
+		if runners[i].Status == alloc.PoolRunnerRetiring {
+			l.retirePoolMember(ctx, runners[i])
+		}
+	}
+
+	runners, err = l.alloc.PoolRunners(ctx, l.tier)
+	if err != nil {
+		l.log.Error("could not refresh the runner pool after retirement", "tier", l.tier, "error", err)
+		return
+	}
+	active := 0
+	for i := range runners {
+		if runners[i].Status == alloc.PoolRunnerIdle || runners[i].Status == alloc.PoolRunnerBusy {
+			active++
+		}
+	}
+	surplus := active - desired
+	if surplus <= 0 {
+		return
+	}
+	for i := range runners {
+		if surplus == 0 {
+			break
+		}
+		if runners[i].Status != alloc.PoolRunnerIdle {
+			continue
+		}
+		if err := l.alloc.RetirePoolRunner(ctx, runners[i].LeaseID); err != nil {
+			l.log.Error("could not claim an idle pool member for scale-down", "tier", l.tier,
+				"runner", runners[i].RunnerName, "error", err)
+			continue
+		}
+		runners[i].Status = alloc.PoolRunnerRetiring
+		l.retirePoolMember(ctx, runners[i])
+		surplus--
+	}
+}
+
+// retirePoolMember removes routing before compute, then returns its capacity.
+// The retiring row is the crash-recovery journal: any failed phase is retried on
+// the next scale-set message before another idle member is selected.
+func (l *Listener) retirePoolMember(ctx context.Context, member alloc.PoolRunner) {
+	lease, err := l.alloc.Lease(ctx, member.LeaseID)
+	if err != nil && !errors.Is(err, alloc.ErrLeaseNotFound) {
+		l.log.Error("could not read a retiring pool member's lease", "tier", l.tier,
+			"runner", member.RunnerName, "lease", member.LeaseID, "error", err)
+		return
+	}
+	if errors.Is(err, alloc.ErrLeaseNotFound) {
+		lease = nil
+	}
+	job := Job{RequestID: member.LaunchRequestID, RunnerID: member.RunnerID,
+		RunnerName: member.RunnerName}
+	if err := l.destroyCompleted(ctx, job, lease, alloc.PhaseDone); err != nil {
+		if errors.Is(err, ErrCustody) {
+			if forgetErr := l.alloc.ForgetPoolRunner(ctx, member.LeaseID); forgetErr != nil {
+				l.log.Warn("a retiring pool member in node custody kept its journal", "tier", l.tier,
+					"runner", member.RunnerName, "error", forgetErr)
+			}
+			l.dropPoolMember(member)
+			return
+		}
+		l.log.Error("could not retire an idle pool member; its capacity stays held", "tier", l.tier,
+			"runner", member.RunnerName, "error", err)
+		return
+	}
+	if lease != nil {
+		if err := l.releaseAbsent(ctx, member.LaunchRequestID, lease, alloc.PhaseDone); !releaseSettled(err) {
+			l.log.Error("could not release a retired pool member; its capacity stays held", "tier", l.tier,
+				"runner", member.RunnerName, "lease", lease.ID, "error", err)
+			return
+		}
+	}
+	if err := l.alloc.ForgetPoolRunner(ctx, member.LeaseID); err != nil {
+		l.log.Warn("a retired pool member's journal could not be removed", "tier", l.tier,
+			"runner", member.RunnerName, "error", err)
+		return
+	}
+	l.dropPoolMember(member)
+}
+
+func (l *Listener) dropPoolMember(member alloc.PoolRunner) {
+	l.mu.Lock()
+	delete(l.running, member.LaunchRequestID)
+	delete(l.acquiring, member.LaunchRequestID)
+	delete(l.confirmed, member.LeaseID)
+	l.mu.Unlock()
+}
+
 // identifyAssigned gives a direct assignment its durable scheduler identity.
 func (l *Listener) identifyAssigned(ctx context.Context, job Job) (Job, error) {
 	if job.RequestID != 0 {
@@ -2254,15 +2462,114 @@ func (l *Listener) identifyAssigned(ctx context.Context, job Job) (Job, error) {
 	return job, nil
 }
 
+// identifyStarted records which job a registered pool member actually consumed.
+func (l *Listener) identifyStarted(ctx context.Context, job Job) (Job, error) {
+	if l.alloc == nil {
+		return Job{}, fmt.Errorf("%w: %s started runner %q without a ledger",
+			ErrUntrustworthySession, l.tier, job.RunnerName)
+	}
+	if job.RunnerID <= 0 || job.RunnerName == "" || job.JobID == "" {
+		return Job{}, fmt.Errorf("%w: %s received an incomplete started identity for runner %q",
+			errQuarantinableStarted, l.tier, job.RunnerName)
+	}
+	identified, err := l.identifyAssigned(ctx, job)
+	if err != nil {
+		return Job{}, err
+	}
+	member, err := l.alloc.PoolRunnerByName(ctx, job.RunnerName)
+	leaseID := member.LeaseID
+	switch {
+	case errors.Is(err, alloc.ErrLeaseNotFound):
+		var ok bool
+		leaseID, ok = provider.LeaseOf(job.RunnerName)
+		if !ok {
+			return Job{}, fmt.Errorf("%w: started runner %q has no Billet lease identity",
+				errQuarantinableStarted, job.RunnerName)
+		}
+		legacy, leaseErr := l.alloc.JobForLease(ctx, leaseID)
+		if leaseErr != nil {
+			if errors.Is(leaseErr, alloc.ErrLeaseNotFound) {
+				return Job{}, fmt.Errorf("%w: cannot adopt unknown started runner %q",
+					errQuarantinableStarted, job.RunnerName)
+			}
+			return Job{}, fmt.Errorf("server: read lease identity for started runner %q: %w",
+				job.RunnerName, leaseErr)
+		}
+		if legacy.Tier != l.tier || legacy.RequestID == 0 {
+			return Job{}, fmt.Errorf("%w: started runner %q resolves outside tier %q",
+				ErrUntrustworthySession, job.RunnerName, l.tier)
+		}
+		if regErr := l.alloc.RegisterPoolRunner(ctx, alloc.PoolRunner{LeaseID: leaseID,
+			Tier: l.tier, LaunchRequestID: legacy.RequestID, RunnerName: job.RunnerName}); regErr != nil {
+			if errors.Is(regErr, alloc.ErrConflict) {
+				return Job{}, fmt.Errorf("%w: cannot adopt started runner %q: %w",
+					errQuarantinableStarted, job.RunnerName, regErr)
+			}
+			return Job{}, fmt.Errorf("server: adopt pool runner %q: %w", job.RunnerName, regErr)
+		}
+	case err != nil:
+		return Job{}, fmt.Errorf("server: read pool runner %q: %w", job.RunnerName, err)
+	case member.Tier != l.tier:
+		return Job{}, fmt.Errorf("%w: started runner %q belongs to tier %q, not %q",
+			ErrUntrustworthySession, job.RunnerName, member.Tier, l.tier)
+	}
+
+	if _, err := l.alloc.StartPoolRunner(ctx, leaseID, l.tier, job.RunnerID,
+		job.RunnerName, identified.RequestID, identified.RunID, identified.JobID); err != nil {
+		if errors.Is(err, alloc.ErrConflict) || errors.Is(err, alloc.ErrLeaseNotFound) {
+			return Job{}, fmt.Errorf("%w: cannot bind started runner %q: %w",
+				errQuarantinableStarted, job.RunnerName, err)
+		}
+		return Job{}, fmt.Errorf("server: bind started runner %q: %w", job.RunnerName, err)
+	}
+	return identified, nil
+}
+
 // identifyCompletion resolves a zero wire id through the runner's lease, or
 // through job id when there is no durable lease identity to recover.
 func (l *Listener) identifyCompletion(ctx context.Context, job Job) (Job, error) {
-	if job.RequestID != 0 {
+	if job.RunnerName == "" && job.RequestID != 0 {
 		return job, nil
 	}
 	if l.alloc == nil {
 		return Job{}, fmt.Errorf("%w: %s completed runner %q without a request id, and no ledger is available to resolve it",
 			ErrUntrustworthySession, l.tier, job.RunnerName)
+	}
+
+	// THE RUNNER, NOT runnerRequestId, IS THE COMPUTE IDENTITY. The request id
+	// describes the job that completed and may belong to a different pool member.
+	if job.RunnerName != "" {
+		binding, err := l.alloc.PoolRunnerByName(ctx, job.RunnerName)
+		switch {
+		case err == nil:
+			if binding.Tier != l.tier || binding.LaunchRequestID == 0 {
+				return Job{}, fmt.Errorf("%w: completed runner %q belongs to tier %q",
+					ErrUntrustworthySession, job.RunnerName, binding.Tier)
+			}
+			if err := l.restorePoolLease(ctx, binding); err != nil {
+				return Job{}, err
+			}
+			if binding.Status == alloc.PoolRunnerBusy {
+				if job.JobID != "" && binding.JobID != "" && job.JobID != binding.JobID {
+					return Job{}, fmt.Errorf("%w: completed runner %q names job %q after starting %q",
+						ErrUntrustworthySession, job.RunnerName, job.JobID, binding.JobID)
+				}
+				if job.RequestID != 0 && binding.ActualRequestID != 0 &&
+					job.RequestID != binding.ActualRequestID {
+					return Job{}, fmt.Errorf("%w: completed runner %q names request %d after starting %d",
+						ErrUntrustworthySession, job.RunnerName, job.RequestID, binding.ActualRequestID)
+				}
+			}
+			job.RequestID = binding.LaunchRequestID
+			return job, nil
+		case !errors.Is(err, alloc.ErrLeaseNotFound):
+			return Job{}, fmt.Errorf("%w: cannot resolve completed runner %q: %w",
+				ErrUntrustworthySession, job.RunnerName, err)
+		}
+	}
+
+	if job.RequestID != 0 {
+		return job, nil
 	}
 
 	leaseID, ok := provider.LeaseOf(job.RunnerName)
@@ -2285,10 +2592,10 @@ func (l *Listener) identifyCompletion(ctx context.Context, job Job) (Job, error)
 			//
 			// THE RUNNER'S LEASE IS THE IDENTITY THAT SETTLES. The completion says
 			// THIS guest finished with THIS result, which is exactly what its
-			// capacity release and cache settlement need; the swapped job's own
-			// lease is settled by its own completion, which names the runner that
-			// actually ran it. The job-side facts (run id, job id) are kept from
-			// the message, because they describe the job that really ran here.
+			// capacity release and cache settlement need. The job-side facts (run
+			// id, job id) stay from the message because they describe the job that
+			// really ran here. Pool reconciliation separately scales down any idle
+			// registration that was reserved for this job but never consumed it.
 			if job.RunID != 0 && identity.RunID != 0 && job.RunID != identity.RunID {
 				l.log.Warn("a completed runner ran a job from a different run than the one "+
 					"it was launched for; github pools assigned jobs across a scale set's "+
@@ -2305,8 +2612,8 @@ func (l *Listener) identifyCompletion(ctx context.Context, job Job) (Job, error)
 				if exists && mapped != identity.RequestID {
 					l.log.Warn("a completed runner ran a different assigned job than the one "+
 						"it was launched for; github pools assigned jobs across a scale set's "+
-						"runners, so the runner's own lease settles with this result and the "+
-						"swapped job's lease settles under its own completion",
+						"runners, so this runner's lease settles with the result while idle "+
+						"surplus is retired from the authoritative assigned-job count",
 						"tier", l.tier, "runner", job.RunnerName,
 						"launched_for", identity.RequestID, "job", job.JobID, "ran", mapped)
 				}
@@ -2332,6 +2639,36 @@ func (l *Listener) identifyCompletion(ctx context.Context, job Job) (Job, error)
 		errQuarantinableCompletion, l.tier, job.RunnerName)
 }
 
+// restorePoolLease reconnects restart-safe pool identity to the completion
+// machinery, whose durable result record must carry the exact lease and epoch.
+// Without this handoff a post-restart completion could destroy compute and then
+// forget which capacity it had proved safe to release.
+func (l *Listener) restorePoolLease(ctx context.Context, binding alloc.PoolRunner) error {
+	lease, err := l.alloc.Lease(ctx, binding.LeaseID)
+	if errors.Is(err, alloc.ErrLeaseNotFound) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("%w: cannot restore completed runner %q lease %s: %w",
+			ErrUntrustworthySession, binding.RunnerName, binding.LeaseID, err)
+	}
+	if lease.Tier != l.tier || lease.RequestID != binding.LaunchRequestID {
+		return fmt.Errorf("%w: pool runner %q lease %s identifies tier %q request %d, want tier %q request %d",
+			ErrUntrustworthySession, binding.RunnerName, binding.LeaseID, lease.Tier,
+			lease.RequestID, l.tier, binding.LaunchRequestID)
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if prior := l.running[binding.LaunchRequestID]; prior != nil && prior.ID != lease.ID {
+		return fmt.Errorf("%w: request %d is already bound to lease %s, not pool lease %s",
+			ErrUntrustworthySession, binding.LaunchRequestID, prior.ID, lease.ID)
+	}
+	l.running[binding.LaunchRequestID] = lease
+
+	return nil
+}
+
 // acknowledge tells GitHub the message was handled. An unacknowledged message is
 // redelivered, which is why everything above it has to be idempotent.
 func (l *Listener) acknowledge(ctx context.Context, msg *Message) error {
@@ -2345,16 +2682,23 @@ func (l *Listener) acknowledge(ctx context.Context, msg *Message) error {
 // acknowledgeCompletions records that GitHub will not redeliver the
 // source message. The store removes a row only once it is also retired.
 func (l *Listener) acknowledgeCompletions(ctx context.Context, msg *Message) {
-	if l.completionStore == nil {
-		return
-	}
+	persistCtx, cancel := withoutCancelWithin(ctx, l.releaseGrace)
+	defer cancel()
 	for i := range msg.Completed {
 		job := &msg.Completed[i]
-		if err := l.completionStore.AcknowledgePendingCompletion(
-			ctx, l.tier, job.RequestID, msg.MessageID,
-		); err != nil {
-			l.log.Error("a completion acknowledgement could not be made durable; recovery remains conservatively blocked",
-				"tier", l.tier, "request", job.RequestID, "message", msg.MessageID, "error", err)
+		if l.completionStore != nil {
+			if err := l.completionStore.AcknowledgePendingCompletion(
+				persistCtx, l.tier, job.RequestID, msg.MessageID,
+			); err != nil {
+				l.log.Error("a completion acknowledgement could not be made durable; recovery remains conservatively blocked",
+					"tier", l.tier, "request", job.RequestID, "message", msg.MessageID, "error", err)
+			}
+		}
+		if l.alloc != nil {
+			if err := l.alloc.AcknowledgePoolRunner(persistCtx, l.tier, job.RequestID); err != nil {
+				l.log.Error("a pool runner acknowledgement could not be made durable; its retired identity remains conservatively reserved",
+					"tier", l.tier, "request", job.RequestID, "message", msg.MessageID, "error", err)
+			}
 		}
 	}
 }
@@ -2686,6 +3030,19 @@ func (l *Listener) launch(ctx context.Context, lease *alloc.Lease, job Job) erro
 		l.mu.Unlock()
 
 		if stillOurs {
+			binding, regErr := l.alloc.PoolRunnerByLease(ctx, lease.ID)
+			if errors.Is(regErr, alloc.ErrLeaseNotFound) {
+				regErr = l.alloc.RegisterPoolRunner(ctx, alloc.PoolRunner{LeaseID: lease.ID,
+					Tier: l.tier, LaunchRequestID: job.RequestID,
+					RunnerName: provider.InstanceName(lease.ID)})
+			} else if regErr == nil && (binding.Tier != l.tier ||
+				binding.LaunchRequestID != job.RequestID) {
+				regErr = fmt.Errorf("%w: lease is registered for tier %q request %d",
+					alloc.ErrConflict, binding.Tier, binding.LaunchRequestID)
+			}
+			if regErr != nil {
+				return fmt.Errorf("server: verify pool runner for lease %s: %w", lease.ID, regErr)
+			}
 			return nil
 		}
 
@@ -2693,7 +3050,7 @@ func (l *Listener) launch(ctx context.Context, lease *alloc.Lease, job Job) erro
 			"compute, which is no longer backed by any capacity",
 			"tier", l.tier, "request", job.RequestID, "lease", lease.ID)
 
-		if destroyErr := l.runner.Destroy(ctx, job.RequestID); destroyErr != nil {
+		if destroyErr := l.destroyCompleted(ctx, job, lease, alloc.PhaseFailed); destroyErr != nil {
 			l.log.Error("could not destroy compute whose lease was reclaimed; it is running "+
 				"unaccounted for and needs manual cleanup",
 				"tier", l.tier, "request", job.RequestID, "error", destroyErr)
@@ -2718,6 +3075,24 @@ func (l *Listener) launch(ctx context.Context, lease *alloc.Lease, job Job) erro
 		delete(l.running, job.RequestID)
 		l.mu.Unlock()
 
+		return nil
+	}
+	registrationCtx, registrationCancel := withoutCancelWithin(ctx, l.releaseGrace)
+	defer registrationCancel()
+	binding, bindingErr := l.alloc.PoolRunnerByLease(registrationCtx, lease.ID)
+	if bindingErr == nil {
+		if retireErr := l.alloc.RetirePoolRunner(registrationCtx, lease.ID); retireErr != nil {
+			l.log.Error("a failed launch's registration could not be claimed for cleanup; its capacity stays held",
+				"tier", l.tier, "request", job.RequestID, "lease", lease.ID, "error", retireErr)
+			return nil
+		}
+		binding.Status = alloc.PoolRunnerRetiring
+		l.retirePoolMember(registrationCtx, binding)
+		return nil
+	}
+	if !errors.Is(bindingErr, alloc.ErrLeaseNotFound) {
+		l.log.Error("a failed launch's registration could not be resolved; its capacity stays held",
+			"tier", l.tier, "request", job.RequestID, "lease", lease.ID, "error", bindingErr)
 		return nil
 	}
 
@@ -3027,16 +3402,23 @@ func (l *Listener) completionRelease(requestID int64) (*alloc.Lease, alloc.Phase
 }
 
 func (l *Listener) forgetCompletion(ctx context.Context, job Job) bool {
-	if l.completionStore == nil || job.Result == "" {
-		return true
-	}
-	if err := l.completionStore.RetirePendingCompletion(
-		ctx, l.tier, job.RequestID, job.CompletionID,
-	); err != nil {
-		l.log.Error("a completed job settled, but its durable tombstone could not be written; its request id stays blocked until this is retried",
-			"tier", l.tier, "request", job.RequestID, "error", err)
+	if l.completionStore != nil && job.Result != "" {
+		if err := l.completionStore.RetirePendingCompletion(
+			ctx, l.tier, job.RequestID, job.CompletionID,
+		); err != nil {
+			l.log.Error("a completed job settled, but its durable tombstone could not be written; its request id stays blocked until this is retried",
+				"tier", l.tier, "request", job.RequestID, "error", err)
 
-		return false
+			return false
+		}
+	}
+	if l.alloc != nil {
+		if err := l.alloc.SettlePoolRunner(ctx, l.tier, job.RequestID); err != nil {
+			l.log.Error("a completed pool runner settled, but its physical identity could not be preserved through source acknowledgement",
+				"tier", l.tier, "request", job.RequestID, "error", err)
+
+			return false
+		}
 	}
 
 	return true
@@ -3166,6 +3548,16 @@ func (l *Listener) restoreCompletions(ctx context.Context) error {
 // always nil is an invitation to wire the next failure mode through it, and the
 // branch handling it would never run.
 func (l *Listener) complete(ctx context.Context, job Job) {
+	if job.RunnerName != "" {
+		if leaseID, ok := provider.LeaseOf(job.RunnerName); ok {
+			if err := l.alloc.RetirePoolRunner(ctx, leaseID); err != nil &&
+				!errors.Is(err, alloc.ErrLeaseNotFound) {
+				l.log.Error("could not mark a completed pool runner for retirement",
+					"tier", l.tier, "runner", job.RunnerName, "error", err)
+				return
+			}
+		}
+	}
 	// A redelivery after teardown and release settled can only retry the durable
 	// tombstone. Repeating teardown here could address replacement compute if the
 	// source reused the request id after an acknowledgement failure.
@@ -3472,6 +3864,27 @@ func (l *Listener) destroyCompleted(
 	lease *alloc.Lease,
 	outcome alloc.Phase,
 ) error {
+	if l.registry != nil {
+		var binding alloc.PoolRunner
+		var err error
+		if lease != nil && lease.ID != "" {
+			binding, err = l.alloc.PoolRunnerByLease(ctx, lease.ID)
+		} else if job.RunnerName != "" {
+			binding, err = l.alloc.PoolRunnerByName(ctx, job.RunnerName)
+		}
+		if err != nil && !errors.Is(err, alloc.ErrLeaseNotFound) {
+			return fmt.Errorf("server: resolve runner registration before teardown: %w", err)
+		}
+		if errors.Is(err, alloc.ErrLeaseNotFound) && lease != nil && lease.ID != "" {
+			binding.RunnerName = provider.InstanceName(lease.ID)
+			err = nil
+		}
+		if err == nil {
+			if err := l.registry.RemoveRunner(ctx, binding.RunnerID, binding.RunnerName); err != nil {
+				return fmt.Errorf("server: remove runner %q before teardown: %w", binding.RunnerName, err)
+			}
+		}
+	}
 	if outcome == "" {
 		outcome = alloc.PhaseDone
 	}

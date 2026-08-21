@@ -23,7 +23,8 @@ import (
 //
 // "No registration token ever enters the guest" is a claim billet makes and it
 // is true, but it must not be read as "no credential enters the guest". This one
-// does. What is defensible is that it is single-use and scoped to one job.
+// does. What is defensible is that it is single-use for one ephemeral pool
+// registration and consumed before a workflow step.
 func TestJITRunnerCannotBeRendered(t *testing.T) {
 	const secret = "eyJzZWNyZXQtaml0LWNvbmZpZyI6dHJ1ZX0="
 

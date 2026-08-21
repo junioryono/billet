@@ -784,6 +784,333 @@ func TestCompletionSettlesTheRunnersLeaseWhenGitHubPairedItWithAnotherJob(t *tes
 	}
 }
 
+func TestPooledCompletionAndAssignedCountRetireBothPhysicalRunners(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+	var destroyed []int64
+	runner := &fakeRunner{onDestroy: func(requestID int64) error {
+		destroyed = append(destroyed, requestID)
+		return nil
+	}}
+	registry := &fakeRunnerRegistry{}
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner),
+		WithRunnerRegistry(registry))
+	if err := l.refillEscrow(t.Context()); err != nil {
+		t.Fatalf("refill escrow: %v", err)
+	}
+	if err := l.handle(t.Context(), &Message{MessageID: 1,
+		Assigned: []Job{{RequestID: 11, RunID: 101, JobID: "job-11"},
+			{RequestID: 12, RunID: 102, JobID: "job-12"}},
+		Statistics: &Statistics{TotalAssignedJobs: 2}}); err != nil {
+		t.Fatalf("launch pool: %v", err)
+	}
+	members, err := a.PoolRunners(t.Context(), tiers[0].Label)
+	if err != nil || len(members) != 2 {
+		t.Fatalf("pool members = %+v, err %v", members, err)
+	}
+	var actual alloc.PoolRunner
+	for i := range members {
+		if members[i].LaunchRequestID == 11 {
+			actual = members[i]
+		}
+	}
+	if err := l.handle(t.Context(), &Message{MessageID: 2,
+		Started: []Job{{RequestID: 12, RunID: 102, JobID: "job-12", RunnerID: 77,
+			RunnerName: actual.RunnerName}},
+		Completed: []Job{{RequestID: 12, RunID: 102, JobID: "job-12", RunnerID: 77,
+			RunnerName: actual.RunnerName, Result: "Succeeded"}},
+		Statistics: &Statistics{TotalAssignedJobs: 0}}); err != nil {
+		t.Fatalf("settle swapped runner and idle surplus: %v", err)
+	}
+	slices.Sort(destroyed)
+	if !slices.Equal(destroyed, []int64{11, 12}) {
+		t.Fatalf("destroyed requests = %v, want both physical runners", destroyed)
+	}
+	if len(registry.names) != 2 || registry.names[0] == registry.names[1] {
+		t.Fatalf("removed registrations = %v, want both physical runners", registry.names)
+	}
+	usage, err := a.Usage(t.Context())
+	if err != nil {
+		t.Fatalf("Usage: %v", err)
+	}
+	if usage.Leases != 0 {
+		t.Fatalf("leases = %d, want no completed or idle runner capacity", usage.Leases)
+	}
+	if members, err := a.PoolRunners(t.Context(), tiers[0].Label); err != nil || len(members) != 0 {
+		t.Fatalf("settled pool members = %+v, err %v", members, err)
+	}
+}
+
+func TestRunnerRemovalFailureKeepsComputeAndCapacity(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 4, MaxMemory: 64 * config.GiB}, tiers)
+	var destroyed int
+	runner := &fakeRunner{onDestroy: func(int64) error { destroyed++; return nil }}
+	registry := &fakeRunnerRegistry{err: errors.New("github unavailable")}
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner),
+		WithRunnerRegistry(registry))
+	if err := l.refillEscrow(t.Context()); err != nil {
+		t.Fatalf("refill escrow: %v", err)
+	}
+	if err := l.handle(t.Context(), &Message{MessageID: 1,
+		Assigned:   []Job{{RequestID: 11, RunID: 101, JobID: "job-11"}},
+		Statistics: &Statistics{TotalAssignedJobs: 1}}); err != nil {
+		t.Fatalf("launch pool: %v", err)
+	}
+	members, err := a.PoolRunners(t.Context(), tiers[0].Label)
+	if err != nil || len(members) != 1 {
+		t.Fatalf("pool members = %+v, err %v", members, err)
+	}
+	if err := l.handle(t.Context(), &Message{MessageID: 2,
+		Completed: []Job{{RequestID: 11, RunID: 101, JobID: "job-11",
+			RunnerName: members[0].RunnerName, Result: "Succeeded"}},
+		Statistics: &Statistics{TotalAssignedJobs: 0}}); err != nil {
+		t.Fatalf("completion: %v", err)
+	}
+	if destroyed != 0 {
+		t.Fatalf("destroy calls = %d, want none before deregistration", destroyed)
+	}
+	usage, err := a.Usage(t.Context())
+	if err != nil {
+		t.Fatalf("Usage: %v", err)
+	}
+	if usage.Leases != 1 {
+		t.Fatalf("leases = %d, want the runner's capacity held", usage.Leases)
+	}
+	members, err = a.PoolRunners(t.Context(), tiers[0].Label)
+	if err != nil || len(members) != 1 || members[0].Status != alloc.PoolRunnerRetiring {
+		t.Fatalf("retirement journal = %+v, err %v", members, err)
+	}
+}
+
+func TestPooledCompletionAfterServerRestartReleasesTheDurableLease(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 4, MaxMemory: 64 * config.GiB}, tiers)
+	first := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(&fakeRunner{}),
+		WithRunnerRegistry(&fakeRunnerRegistry{}))
+	if err := first.refillEscrow(t.Context()); err != nil {
+		t.Fatalf("refill escrow: %v", err)
+	}
+	if err := first.handle(t.Context(), &Message{MessageID: 1,
+		Assigned:   []Job{{RequestID: 11, RunID: 101, JobID: "job-11"}},
+		Statistics: &Statistics{TotalAssignedJobs: 1}}); err != nil {
+		t.Fatalf("launch pool: %v", err)
+	}
+	members, err := a.PoolRunners(t.Context(), tiers[0].Label)
+	if err != nil || len(members) != 1 {
+		t.Fatalf("pool members = %+v, err %v", members, err)
+	}
+
+	var destroyed []int64
+	restarted := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(&fakeRunner{
+		onDestroy: func(requestID int64) error {
+			destroyed = append(destroyed, requestID)
+			return nil
+		},
+	}), WithRunnerRegistry(&fakeRunnerRegistry{}))
+	if err := restarted.handle(t.Context(), &Message{MessageID: 2,
+		Completed: []Job{{RequestID: 11, RunID: 101, JobID: "job-11",
+			RunnerName: members[0].RunnerName, Result: "Succeeded"}},
+		Statistics: &Statistics{TotalAssignedJobs: 0}}); err != nil {
+		t.Fatalf("post-restart completion: %v", err)
+	}
+	if !slices.Equal(destroyed, []int64{11}) {
+		t.Fatalf("destroyed requests = %v, want 11", destroyed)
+	}
+	usage, err := a.Usage(t.Context())
+	if err != nil {
+		t.Fatalf("Usage: %v", err)
+	}
+	if usage.Leases != 0 {
+		t.Fatalf("leases = %d after post-restart completion, want 0", usage.Leases)
+	}
+}
+
+func TestSwappedPoolCompletionKeepsPhysicalIdentityAcrossLostAckAndRestart(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	db := openState(t)
+	a, err := alloc.New(db, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+	if err != nil {
+		t.Fatalf("alloc.New: %v", err)
+	}
+	if _, err := a.RegisterNode(t.Context(), alloc.NodeRegistration{Name: "test-host-firecracker",
+		Provider: config.ProviderFirecracker, VCPU: 1 << 20, Memory: 1 << 20 * config.GiB}); err != nil {
+		t.Fatalf("RegisterNode: %v", err)
+	}
+	var destroyed []int64
+	runner := &fakeRunner{onDestroy: func(requestID int64) error {
+		destroyed = append(destroyed, requestID)
+		return nil
+	}}
+	var acknowledgements atomic.Int32
+	session := &fakeSession{onDelete: func(messageID int64) error {
+		if messageID != 2 {
+			return nil
+		}
+		if acknowledgements.Add(1) == 1 {
+			return errors.New("acknowledgement lost")
+		}
+		return nil
+	}}
+	first := NewListener(a, tiers[0].Label, session, WithRunner(runner),
+		WithRunnerRegistry(&fakeRunnerRegistry{}), WithCompletionStore(db))
+	if err := first.refillEscrow(t.Context()); err != nil {
+		t.Fatalf("refill escrow: %v", err)
+	}
+	if err := first.handle(t.Context(), &Message{MessageID: 1,
+		Assigned: []Job{{RequestID: 11, RunID: 101, JobID: "job-11"},
+			{RequestID: 12, RunID: 102, JobID: "job-12"}},
+		Statistics: &Statistics{TotalAssignedJobs: 2}}); err != nil {
+		t.Fatalf("launch pool: %v", err)
+	}
+	members, err := a.PoolRunners(t.Context(), tiers[0].Label)
+	if err != nil || len(members) != 2 {
+		t.Fatalf("pool members = %+v, err %v", members, err)
+	}
+	var physical alloc.PoolRunner
+	for i := range members {
+		if members[i].LaunchRequestID == 11 {
+			physical = members[i]
+		}
+	}
+	message := &Message{MessageID: 2,
+		Started: []Job{{RequestID: 12, RunID: 102, JobID: "job-12", RunnerID: 77,
+			RunnerName: physical.RunnerName}},
+		Completed: []Job{{RequestID: 12, RunID: 102, JobID: "job-12", RunnerID: 77,
+			RunnerName: physical.RunnerName, Result: "Succeeded"}},
+		Statistics: &Statistics{TotalAssignedJobs: 0}}
+	if err := first.handle(t.Context(), message); err == nil {
+		t.Fatal("lost acknowledgement did not fail the first delivery")
+	}
+	tombstone, err := a.PoolRunnerByName(t.Context(), physical.RunnerName)
+	if err != nil || tombstone.Status != alloc.PoolRunnerRetired ||
+		tombstone.LaunchRequestID != 11 || tombstone.ActualRequestID != 12 {
+		t.Fatalf("physical tombstone = %+v, err %v", tombstone, err)
+	}
+	slices.Sort(destroyed)
+	if !slices.Equal(destroyed, []int64{11, 12}) {
+		t.Fatalf("first settlement destroyed %v, want physical runners 11 and 12", destroyed)
+	}
+
+	restarted := NewListener(a, tiers[0].Label, session, WithRunner(runner),
+		WithRunnerRegistry(&fakeRunnerRegistry{}), WithCompletionStore(db))
+	if err := restarted.handle(t.Context(), message); err != nil {
+		t.Fatalf("redelivery after restart: %v", err)
+	}
+	slices.Sort(destroyed)
+	if !slices.Equal(destroyed, []int64{11, 12}) {
+		t.Fatalf("redelivery destroyed replacement compute: %v", destroyed)
+	}
+	if _, err := a.PoolRunnerByName(t.Context(), physical.RunnerName); !errors.Is(err, alloc.ErrLeaseNotFound) {
+		t.Fatalf("acknowledged physical identity remains: %v", err)
+	}
+}
+
+func poolLeaseForTier(t *testing.T, a *alloc.Allocator, tier string) *alloc.Lease {
+	t.Helper()
+	leases, err := a.Escrow(t.Context(), tier, 1)
+	if err != nil || len(leases) != 1 {
+		t.Fatalf("Escrow(%s) = %+v, err %v", tier, leases, err)
+	}
+	return leases[0]
+}
+
+func TestStartedIdentityCannotRetireAnotherTiersPoolMember(t *testing.T) {
+	tiers := []config.Tier{tier("tier-a"), tier("tier-b")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+	lease := poolLeaseForTier(t, a, "tier-b")
+	if err := a.Assign(t.Context(), lease.ID, lease.Epoch, 202, 22); err != nil {
+		t.Fatalf("Assign: %v", err)
+	}
+	name := provider.InstanceName(lease.ID)
+	if err := a.RegisterPoolRunner(t.Context(), alloc.PoolRunner{LeaseID: lease.ID, Tier: "tier-b",
+		LaunchRequestID: 22, RunnerName: name}); err != nil {
+		t.Fatalf("RegisterPoolRunner: %v", err)
+	}
+	var destroyed int
+	l := NewListener(a, "tier-a", &fakeSession{}, WithRunner(&fakeRunner{
+		onDestroy: func(int64) error { destroyed++; return nil },
+	}), WithRunnerRegistry(&fakeRunnerRegistry{}))
+	err := l.handle(t.Context(), &Message{MessageID: 1, Started: []Job{{RequestID: 22,
+		RunID: 202, JobID: "job-22", RunnerID: 77, RunnerName: name}}})
+	if !errors.Is(err, ErrUntrustworthySession) {
+		t.Fatalf("cross-tier start = %v, want fatal session refusal", err)
+	}
+	member, readErr := a.PoolRunnerByName(t.Context(), name)
+	if readErr != nil || member.Status != alloc.PoolRunnerIdle || destroyed != 0 {
+		t.Fatalf("cross-tier start mutated member %+v, read err %v, destroys %d", member, readErr, destroyed)
+	}
+}
+
+func TestStartedIdentityOperationalFailureIsNotQuarantined(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 4, MaxMemory: 64 * config.GiB}, tiers)
+	lease := poolLeaseForTier(t, a, tiers[0].Label)
+	if err := a.Assign(t.Context(), lease.ID, lease.Epoch, 101, 11); err != nil {
+		t.Fatalf("Assign: %v", err)
+	}
+	name := provider.InstanceName(lease.ID)
+	if err := a.RegisterPoolRunner(t.Context(), alloc.PoolRunner{LeaseID: lease.ID, Tier: tiers[0].Label,
+		LaunchRequestID: 11, RunnerName: name}); err != nil {
+		t.Fatalf("RegisterPoolRunner: %v", err)
+	}
+	var destroyed int
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(&fakeRunner{
+		onDestroy: func(int64) error { destroyed++; return nil },
+	}), WithRunnerRegistry(&fakeRunnerRegistry{}))
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	err := l.handle(ctx, &Message{MessageID: 1, Started: []Job{{RequestID: 11,
+		RunID: 101, JobID: "job-11", RunnerID: 77, RunnerName: name}}})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled pool lookup = %v, want operational cancellation", err)
+	}
+	member, readErr := a.PoolRunnerByName(t.Context(), name)
+	if readErr != nil || member.Status != alloc.PoolRunnerIdle || destroyed != 0 {
+		t.Fatalf("operational failure mutated member %+v, read err %v, destroys %d", member, readErr, destroyed)
+	}
+}
+
+func TestContradictoryStartedIdentityRetiresOnlyThatPoolMember(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+	var destroyed []int64
+	runner := &fakeRunner{onDestroy: func(requestID int64) error {
+		destroyed = append(destroyed, requestID)
+		return nil
+	}}
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner),
+		WithRunnerRegistry(&fakeRunnerRegistry{}))
+	if err := l.refillEscrow(t.Context()); err != nil {
+		t.Fatalf("refill escrow: %v", err)
+	}
+	if err := l.handle(t.Context(), &Message{MessageID: 1,
+		Assigned: []Job{{RequestID: 11, RunID: 101, JobID: "job-11"},
+			{RequestID: 12, RunID: 102, JobID: "job-12"}},
+		Statistics: &Statistics{TotalAssignedJobs: 2}}); err != nil {
+		t.Fatalf("launch pool: %v", err)
+	}
+	members, err := a.PoolRunners(t.Context(), tiers[0].Label)
+	if err != nil || len(members) != 2 {
+		t.Fatalf("pool members = %+v, err %v", members, err)
+	}
+	bad := members[0]
+	if err := l.handle(t.Context(), &Message{MessageID: 2,
+		Started: []Job{{RequestID: bad.LaunchRequestID, RunID: 101, RunnerID: 77,
+			RunnerName: bad.RunnerName}},
+		Statistics: &Statistics{TotalAssignedJobs: 2}}); err != nil {
+		t.Fatalf("a contradictory member stopped its tier: %v", err)
+	}
+	if !slices.Equal(destroyed, []int64{bad.LaunchRequestID}) {
+		t.Fatalf("destroyed requests = %v, want only contradictory member %d",
+			destroyed, bad.LaunchRequestID)
+	}
+	members, err = a.PoolRunners(t.Context(), tiers[0].Label)
+	if err != nil || len(members) != 1 || members[0].LaunchRequestID == bad.LaunchRequestID {
+		t.Fatalf("remaining pool = %+v, err %v", members, err)
+	}
+}
+
 func TestDirectAssignmentUsesJobIDWhenGitHubSendsRequestIDZero(t *testing.T) {
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
 	a := newAllocator(t, alloc.Limits{MaxVCPU: tierVCPU, MaxMemory: 64 * config.GiB}, tiers)
@@ -2427,12 +2754,73 @@ func TestCapacityIsReturnedWhenTheComputeWillNotStart(t *testing.T) {
 	}
 }
 
+func TestLostJITResponseUsesDurableIdentityBeforeReleasingFailedLaunch(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 4, MaxMemory: 16 * config.GiB}, tiers)
+	runner := &journaledFailureRunner{allocator: a}
+	registry := &fakeRunnerRegistry{}
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner),
+		WithRunnerRegistry(registry))
+	if err := l.refillEscrow(t.Context()); err != nil {
+		t.Fatalf("refill escrow: %v", err)
+	}
+	if err := l.handle(t.Context(), &Message{MessageID: 1,
+		Assigned: []Job{{RequestID: 11, RunID: 101, JobID: "job-11"}}}); err != nil {
+		t.Fatalf("failed launch handling: %v", err)
+	}
+	if len(registry.names) != 1 || registry.names[0] != runner.name {
+		t.Fatalf("registration removals = %v, want durable name %q", registry.names, runner.name)
+	}
+	if !slices.Equal(runner.destroyed, []int64{11}) {
+		t.Fatalf("compute cleanup = %v, want request 11 after deregistration", runner.destroyed)
+	}
+	usage, err := a.Usage(t.Context())
+	if err != nil || usage.Leases != 0 {
+		t.Fatalf("usage after failed launch = %+v, err %v", usage, err)
+	}
+	if members, err := a.PoolRunners(t.Context(), tiers[0].Label); err != nil || len(members) != 0 {
+		t.Fatalf("runner journal after cleanup = %+v, err %v", members, err)
+	}
+}
+
 // fakeRunner stands in for a host. Both hooks default to succeeding, so a test
 // only says what it cares about.
 type fakeRunner struct {
 	onLaunch           func(requestID int64) error
 	onDestroy          func(requestID int64) error
 	onDestroyCompleted func(requestID int64, result string) error
+}
+
+type journaledFailureRunner struct {
+	allocator *alloc.Allocator
+	name      string
+	destroyed []int64
+}
+
+func (r *journaledFailureRunner) Launch(
+	ctx context.Context, lease *alloc.Lease, job Job,
+) error {
+	r.name = "github-returned-" + lease.ID
+	if err := r.allocator.RegisterPoolRunner(ctx, alloc.PoolRunner{LeaseID: lease.ID,
+		Tier: lease.Tier, LaunchRequestID: job.RequestID, RunnerID: 91, RunnerName: r.name}); err != nil {
+		return err
+	}
+	return errors.New("the JIT response was lost after durable registration")
+}
+
+func (r *journaledFailureRunner) Destroy(_ context.Context, requestID int64) error {
+	r.destroyed = append(r.destroyed, requestID)
+	return nil
+}
+
+type fakeRunnerRegistry struct {
+	names []string
+	err   error
+}
+
+func (f *fakeRunnerRegistry) RemoveRunner(_ context.Context, _ int64, name string) error {
+	f.names = append(f.names, name)
+	return f.err
 }
 
 type boundFakeRunner struct {
@@ -3241,6 +3629,54 @@ func TestFailedCompletionDeletionRestoresOnlyATombstone(t *testing.T) {
 	restarted.mu.Unlock()
 	if kept != replacement {
 		t.Fatal("retired redelivery removed the replacement lease")
+	}
+}
+
+func TestCompletionAcknowledgementPersistsAfterPollCancellation(t *testing.T) {
+	db := openState(t)
+	tiers := []config.Tier{tier("linux")}
+	a, err := alloc.New(db, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+	if err != nil {
+		t.Fatalf("alloc.New: %v", err)
+	}
+	if _, err := a.RegisterNode(t.Context(), alloc.NodeRegistration{
+		Name: "test-host-firecracker", Provider: config.ProviderFirecracker,
+		VCPU: 1 << 20, Memory: 1 << 20 * config.GiB,
+	}); err != nil {
+		t.Fatalf("RegisterNode: %v", err)
+	}
+	lease := poolLeaseForTier(t, a, tiers[0].Label)
+	if err := a.RegisterPoolRunner(t.Context(), alloc.PoolRunner{
+		LeaseID: lease.ID, Tier: tiers[0].Label, LaunchRequestID: 80,
+		RunnerID: 71, RunnerName: provider.InstanceName(lease.ID),
+	}); err != nil {
+		t.Fatalf("RegisterPoolRunner: %v", err)
+	}
+	if err := a.SettlePoolRunner(t.Context(), tiers[0].Label, 80); err != nil {
+		t.Fatalf("SettlePoolRunner: %v", err)
+	}
+	if _, err := db.PutPendingCompletion(t.Context(), state.PendingCompletion{
+		Tier: tiers[0].Label, RequestID: 80, RunID: 90, Result: "Succeeded", MessageID: 20,
+	}); err != nil {
+		t.Fatalf("PutPendingCompletion: %v", err)
+	}
+	if err := db.RetirePendingCompletion(t.Context(), tiers[0].Label, 80, 20); err != nil {
+		t.Fatalf("RetirePendingCompletion: %v", err)
+	}
+
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, withCompletionStore(db),
+		WithRunner(&fakeRunner{}))
+	l.releaseGrace = time.Second
+	canceled, cancel := context.WithCancel(t.Context())
+	cancel()
+	l.acknowledgeCompletions(canceled, &Message{
+		MessageID: 20, Completed: []Job{{RequestID: 80, RunID: 90, Result: "Succeeded"}},
+	})
+	if pending, err := db.PendingCompletions(t.Context(), tiers[0].Label); err != nil || len(pending) != 0 {
+		t.Fatalf("acknowledged completion tombstones = %+v, err %v", pending, err)
+	}
+	if _, err := a.PoolRunnerByLease(t.Context(), lease.ID); !errors.Is(err, alloc.ErrLeaseNotFound) {
+		t.Fatalf("acknowledged pool tombstone remains: %v", err)
 	}
 }
 

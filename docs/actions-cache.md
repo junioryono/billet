@@ -10,23 +10,31 @@ Interception currently requires one Linux Firecracker provider, a configured `no
 tiers:
   - label: billet-4vcpu-cache
     provider: firecracker
+    trust: trusted
+    runner_group: billet-cache-trusted
+    workflows:
+      - acme/api/.github/workflows/ci.yml@refs/heads/main
     guest_os: linux
     vcpu: 4
     memory: 16GiB
     disk: 80GiB
     image: ubuntu-2404-x64@verified
     intercept: true
+    cache_scope:
+      owner: acme
+      repository: api
+      workflow_ref: acme/api/.github/workflows/ci.yml@refs/heads/main
 ```
 
-`intercept` defaults to `false`. Keep it absent on release, deployment, and secret-bearing tiers until the exact image and runner release have passed `.github/workflows/cache-conformance.yml` in the deployment that will use them.
+`intercept` defaults to `false`. A trusted pool must use a non-default GitHub runner group restricted to exactly the listed `workflows`; Billet validates that policy at server startup and again before every registration is minted. `cache_scope` is static because GitHub chooses a job only after the JIT runner has joined the pool, so launch-time cache authority cannot safely come from the assignment that happened to cause scale-up. Keep interception absent on release, deployment, and secret-bearing tiers until the exact image and runner release have passed `.github/workflows/cache-conformance.yml` in the deployment that will use them.
 
 The guest image must speak the contract required by the running Billet binary. `billet images compatible` and the host-upgrade transaction enforce that before a tier can launch. The interception contract includes the guest-side DNS-remap passthrough, runner hook, CA propagation, and container resolver; an older image is refused rather than launched without one of those pieces.
 
 ## What is local
 
-The node proxy accepts CONNECT only for `results-receiver.actions.githubusercontent.com`, terminates TLS for that origin, and handles exactly three JSON Twirp paths from the official toolkit client: `CreateCacheEntry`, `FinalizeCacheEntryUpload`, and `GetCacheEntryDownloadURL` in `github.actions.results.api.v1.CacheService`. The official client identifies itself with its `@actions/cache-` user-agent prefix; this is a compatibility selector, while the VM session credential, server-supplied job identity, trust classification, and central policy are the security controls. Every other client, path, and method on that origin, including BuildKit `type=gha` and all `ArtifactService` calls, is sent to GitHub with the opaque runtime authorization unchanged. Only the results origin is DNS-remapped to the guest passthrough; every other host, including signed artifact blob origins, resolves normally and connects directly, so the node listener is reachable for that one origin alone and cannot be used as a general proxy into the host's network.
+The node proxy accepts CONNECT only for `results-receiver.actions.githubusercontent.com`, terminates TLS for that origin, and handles exactly three JSON Twirp paths from the official toolkit client: `CreateCacheEntry`, `FinalizeCacheEntryUpload`, and `GetCacheEntryDownloadURL` in `github.actions.results.api.v1.CacheService`. The official client identifies itself with its `@actions/cache-` user-agent prefix; this is a compatibility selector, while the VM session credential, statically configured pool scope, trusted runner-group workflow boundary, and central policy are the security controls. Every other client, path, and method on that origin, including BuildKit `type=gha` and all `ArtifactService` calls, is sent to GitHub with the opaque runtime authorization unchanged. Only the results origin is DNS-remapped to the guest passthrough; every other host, including signed artifact blob origins, resolves normally and connects directly, so the node listener is reachable for that one origin alone and cannot be used as a general proxy into the host's network.
 
-The guest authenticates its CONNECT request with the unguessable cache-session capability Billet created for that VM. The node does not decode `ACTIONS_RUNTIME_TOKEN`. The assignment identity delivered by GitHub supplies the owner, repository, and workflow ref; a durable cache key is scoped by deployment and site, a digest of that identity, a digest of the cache version, and the workflow's cache key. Restore-prefix matching never crosses any of those boundaries.
+The guest authenticates its CONNECT request with the unguessable cache-session capability Billet created for that VM. The node does not decode `ACTIONS_RUNTIME_TOKEN`. The tier's `cache_scope` supplies the owner, repository, and workflow ref before a pooled runner launches; a durable cache key is scoped by deployment and site, a digest of that identity, a digest of the cache version, and the workflow's cache key. Validation requires the scope's workflow ref to be one of the trusted runner group's declared workflows. Restore-prefix matching never crosses any of those boundaries.
 
 Untrusted jobs receive no interception and no CA and stay entirely on GitHub's cache service. Billet does not reproduce GitHub's fork and default-branch cache policy from incomplete local evidence, and an untrusted job never publishes a local generation that trusted work could restore.
 

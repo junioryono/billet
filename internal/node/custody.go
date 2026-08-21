@@ -48,6 +48,14 @@ type custody struct {
 	// ever connects the message to the compute.
 	requestID int64
 
+	// registrationPending keeps provider teardown behind GitHub deregistration.
+	// A failed launch can leave both a routing identity and ambiguous compute;
+	// removing the latter first lets GitHub assign work to an orphaned runner.
+	registrationPending bool
+	registrationRemoved bool
+	runnerID            int64
+	runnerName          string
+
 	// outcome is how the lease should be recorded once its compute is gone. A
 	// discarded entry is a launch that FAILED, and writing "done" into the
 	// durable history for a runner that never started is a lie a later
@@ -201,6 +209,25 @@ func (r *Runner) holdWithEvidence(
 	r.holdWithOutcomeAndEvidence(lease, name, requestID, alloc.PhaseFailed, evidence)
 }
 
+// holdWithRegistration preserves a failed-launch registration and its compute
+// behind one custody obligation. Tend always removes routing before inspecting
+// or destroying the provider instance.
+func (r *Runner) holdWithRegistration(
+	lease *alloc.Lease, name string, requestID, runnerID int64, runnerName string,
+) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	entry := &custody{
+		leaseID: lease.ID, name: name, requestID: requestID, discard: true,
+		outcome: alloc.PhaseFailed, phase: alloc.PhaseTeardown, since: r.now(),
+		registrationPending: true, runnerID: runnerID, runnerName: runnerName,
+	}
+	entry.epoch.Store(lease.Epoch)
+	entry.unconfirmed.Store(true)
+	r.custody[lease.ID] = entry
+}
+
 // holdWithOutcome is hold for a job whose outcome is already known.
 //
 // THE OUTCOME IS A PARAMETER BECAUSE THERE ARE NOW TWO WAYS TO REACH THIS, and
@@ -237,6 +264,8 @@ func (r *Runner) holdWithOutcomeAndEvidence(
 		since:       r.now(),
 		observed:    evidence.observed,
 		absentSince: evidence.absentSince,
+		// The caller reaches this only after exact registration removal succeeded.
+		registrationRemoved: true,
 	}
 	entry.epoch.Store(lease.Epoch)
 
@@ -476,6 +505,10 @@ func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 	heartbeatOK := false
 	if err := r.alloc.Heartbeat(ctx, c.leaseID, c.epoch.Load()); err != nil {
 		if errors.Is(err, alloc.ErrForceRelease) {
+			if removeErr := r.ensureRegistrationRemoved(ctx, c); removeErr != nil {
+				return fmt.Errorf("node: remove force-released runner before settlement: %w",
+					removeErr)
+			}
 			r.log.Warn("an operator forced the release of compute held here; dropping custody",
 				"name", c.name, "lease", c.leaseID)
 			c.discard = true
@@ -524,6 +557,13 @@ func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 		}
 	}
 
+	if c.registrationPending {
+		if err := r.ensureRegistrationRemoved(ctx, c); err != nil {
+			return fmt.Errorf("node: remove failed-launch runner %q before teardown: %w",
+				c.runnerName, err)
+		}
+	}
+
 	inst, found, err := r.provider.Find(ctx, c.name)
 	if err != nil {
 		// An error says nothing about presence. It breaks a run of negative
@@ -566,6 +606,10 @@ func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 		// RELEASED AFTER THE CONSERVATIVE ABSENCE WINDOW. A causally observed host
 		// exit reaches this immediately; eventually consistent remote inventory gets
 		// the full documented window when no explicit terminal record is available.
+		if err := r.ensureRegistrationRemoved(ctx, c); err != nil {
+			return fmt.Errorf("node: remove runner held for lease %s before settlement: %w",
+				c.leaseID, err)
+		}
 		c.unconfirmed.Store(false)
 		r.cleanupCache(ctx, c.name)
 
@@ -583,6 +627,10 @@ func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 	// eventually consistent. This is stronger than !Running: a stopped instance
 	// still exists and must be destroyed.
 	if inst.Terminal {
+		if err := r.ensureRegistrationRemoved(ctx, c); err != nil {
+			return fmt.Errorf("node: remove runner held for lease %s before settlement: %w",
+				c.leaseID, err)
+		}
 		c.unconfirmed.Store(false)
 		r.cleanupCache(ctx, c.name)
 
@@ -594,6 +642,10 @@ func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 	// its own and the job may well succeed.
 	if !c.discard && inst.Running {
 		return nil
+	}
+	if err := r.ensureRegistrationRemoved(ctx, c); err != nil {
+		return fmt.Errorf("node: remove runner held for lease %s before teardown: %w",
+			c.leaseID, err)
 	}
 
 	state, err := r.provider.Destroy(ctx, inst.ID)
