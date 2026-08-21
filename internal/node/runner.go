@@ -38,7 +38,20 @@ type JITSource interface {
 	RemoveRunner(ctx context.Context, leaseID string, runnerID int64, runnerName string) error
 	// EnsureRunnerRemoved resolves a restart-surviving registration by lease.
 	EnsureRunnerRemoved(ctx context.Context, leaseID string) error
+	// RecoverRunner preserves an exact busy legacy registration or removes it
+	// while idle before quarantined compute is adopted.
+	RecoverRunner(ctx context.Context, leaseID, tier string, requestID int64,
+		runnerName string) (RunnerRecovery, error)
 }
+
+// RunnerRecovery is the safe disposition of a quarantined runner registration.
+type RunnerRecovery string
+
+const (
+	RunnerRecoveryTracked RunnerRecovery = "tracked"
+	RunnerRecoveryBusy    RunnerRecovery = "busy"
+	RunnerRecoveryRetired RunnerRecovery = "retired"
+)
 
 type trustedRunnerGroupValidator interface {
 	ValidateTrustedRunnerGroup(context.Context, string, []string) error
@@ -992,7 +1005,13 @@ func (r *Runner) Recover(ctx context.Context) error {
 				return fmt.Errorf("node: read the lease of surviving instance %s: %w", inst.Name, err)
 
 			default:
-				if err := r.takeCustody(ctx, lease, inst, true); err != nil {
+				var err error
+				if lease.Phase == alloc.PhaseQuarantine {
+					err = r.takeQuarantinedCustody(ctx, lease, inst)
+				} else {
+					err = r.takeCustody(ctx, lease, inst, true)
+				}
+				if err != nil {
 					return err
 				}
 
@@ -1082,6 +1101,13 @@ func (r *Runner) Recover(ctx context.Context) error {
 func (r *Runner) takeCustody(
 	ctx context.Context, lease *alloc.Lease, inst *provider.Instance, observed bool,
 ) error {
+	return r.takeCustodyWithRunnerRecovery(ctx, lease, inst, observed, RunnerRecoveryTracked)
+}
+
+func (r *Runner) takeCustodyWithRunnerRecovery(
+	ctx context.Context, lease *alloc.Lease, inst *provider.Instance, observed bool,
+	recovery RunnerRecovery,
+) error {
 	// RECORDED FIRST, RENEWED SECOND, and the order is the whole correctness of
 	// custody across a network.
 	//
@@ -1096,7 +1122,7 @@ func (r *Runner) takeCustody(
 	// and keeps retrying renewal on its own clock. A fenced or missing lease is
 	// then discovered by Tend, which destroys the compute rather than leaving it
 	// running against capacity somebody else now holds.
-	r.adoptWithObservation(lease, inst, observed)
+	r.adoptWithObservation(lease, inst, observed, recovery)
 
 	if err := r.alloc.Heartbeat(ctx, lease.ID, lease.Epoch); err != nil {
 		if errors.Is(err, alloc.ErrForceRelease) {
@@ -1357,7 +1383,30 @@ func (r *Runner) adoptQuarantined(ctx context.Context, leaseID string, inst *pro
 		return fmt.Errorf("node: read quarantined lease %s: %w", leaseID, err)
 	}
 
-	return r.takeCustody(ctx, lease, inst, true)
+	return r.takeQuarantinedCustody(ctx, lease, inst)
+}
+
+// takeQuarantinedCustody resolves a quarantined survivor's runner registration
+// before adopting its compute. Both startup recovery and periodic inventory use
+// this path: otherwise a restart can bypass the GitHub evidence that distinguishes
+// a busy legacy runner from an idle or absent one.
+func (r *Runner) takeQuarantinedCustody(
+	ctx context.Context, lease *alloc.Lease, inst *provider.Instance,
+) error {
+	leaseID := lease.ID
+
+	recovery, err := r.jit.RecoverRunner(ctx, lease.ID, lease.Tier, lease.RequestID, inst.Name)
+	if err != nil {
+		return fmt.Errorf("node: recover the runner registration for quarantined lease %s: %w",
+			leaseID, err)
+	}
+	if recovery != RunnerRecoveryTracked && recovery != RunnerRecoveryBusy &&
+		recovery != RunnerRecoveryRetired {
+		return fmt.Errorf("node: recover the runner registration for quarantined lease %s: unknown disposition %q",
+			leaseID, recovery)
+	}
+
+	return r.takeCustodyWithRunnerRecovery(ctx, lease, inst, true, recovery)
 }
 
 // releaseOrphanedLease terminalizes a lease whose compute has just been

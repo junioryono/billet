@@ -287,6 +287,9 @@ func (j *cloudJIT) JITConfig(
 func (*cloudJIT) ValidateTrustedRunnerGroup(context.Context, string, []string) error { return nil }
 func (*cloudJIT) RemoveRunner(context.Context, string, int64, string) error          { return nil }
 func (*cloudJIT) EnsureRunnerRemoved(context.Context, string) error                  { return nil }
+func (*cloudJIT) RecoverRunner(context.Context, string, string, int64, string) (node.RunnerRecovery, error) {
+	return node.RunnerRecoveryTracked, nil
+}
 
 // cloudStack is a control-plane ledger and a node runtime over the cloud backend.
 type cloudStack struct {

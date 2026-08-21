@@ -19,6 +19,7 @@ import (
 	"errors"
 
 	"github.com/junioryono/billet/internal/alloc"
+	billetgithub "github.com/junioryono/billet/internal/github"
 	"github.com/junioryono/billet/internal/node"
 	"github.com/junioryono/billet/internal/nodeplane"
 	"github.com/junioryono/billet/internal/scaleset"
@@ -27,6 +28,18 @@ import (
 
 // Provisioner adapts the client to the control plane's scale-set needs.
 type Provisioner struct{ Client *scaleset.Client }
+
+type poolRunnerStore interface {
+	PoolRunnerByLease(context.Context, string) (alloc.PoolRunner, error)
+	PreserveRecoveredBusyPoolRunner(context.Context, alloc.PoolRunner) error
+	RetireRecoveredPoolRunner(context.Context, alloc.PoolRunner) (alloc.PoolRunner, error)
+	RetirePoolRunner(context.Context, string) error
+}
+
+type runnerRecoveryClient interface {
+	RecoverRunner(context.Context, string) (billetgithub.RunnerRecovery, error)
+	RemoveRunner(context.Context, int64, string) error
+}
 
 // EnsureScaleSet makes a tier's scale set exist.
 func (p Provisioner) EnsureScaleSet(
@@ -60,10 +73,7 @@ func (p Provisioner) ValidateTrustedRunnerGroup(ctx context.Context, group strin
 // JITSource adapts the client to what the node needs to mint registrations.
 type JITSource struct {
 	Client *scaleset.Client
-	Pool   interface {
-		PoolRunnerByLease(context.Context, string) (alloc.PoolRunner, error)
-		RetirePoolRunner(context.Context, string) error
-	}
+	Pool   poolRunnerStore
 }
 
 // Describe resolves a tier's scale set, reporting a nil set when there is none.
@@ -114,6 +124,95 @@ func (j JITSource) EnsureRunnerRemoved(ctx context.Context, leaseID string) erro
 	return j.Client.RemoveRunner(ctx, binding.RunnerID, binding.RunnerName)
 }
 
+// RecoverRunner preserves a legacy quarantined registration while it is busy,
+// or removes it while idle before the node tears its compute down.
+func (j JITSource) RecoverRunner(ctx context.Context, leaseID, tier string,
+	requestID int64, runnerName string,
+) (node.RunnerRecovery, error) {
+	return recoverRunner(ctx, j.Pool, j.Client, leaseID, tier, requestID, runnerName)
+}
+
+func recoverRunner(ctx context.Context, pool poolRunnerStore, client runnerRecoveryClient,
+	leaseID, tier string, requestID int64, runnerName string,
+) (node.RunnerRecovery, error) {
+	if pool == nil {
+		return "", errors.New("wiring: runner identity storage is unavailable")
+	}
+	if client == nil {
+		return "", errors.New("wiring: runner recovery client is unavailable")
+	}
+	binding, err := pool.PoolRunnerByLease(ctx, leaseID)
+	if err == nil {
+		if binding.Tier != tier || binding.LaunchRequestID != requestID {
+			return "", errors.New("wiring: durable runner identity does not match its lease")
+		}
+		switch binding.Status {
+		case alloc.PoolRunnerBusy:
+			if binding.ActualRequestID != 0 || binding.RunID != 0 || binding.JobID != "" {
+				return node.RunnerRecoveryTracked, nil
+			}
+			runnerName = binding.RunnerName
+		case alloc.PoolRunnerIdle:
+			runnerName = binding.RunnerName
+		case alloc.PoolRunnerRetiring:
+			if err := client.RemoveRunner(ctx, binding.RunnerID, binding.RunnerName); err != nil {
+				return "", err
+			}
+			return node.RunnerRecoveryRetired, nil
+		case alloc.PoolRunnerRetired:
+			return node.RunnerRecoveryRetired, nil
+		default:
+			return "", errors.New("wiring: durable runner identity has an unknown status")
+		}
+	}
+	if err != nil && !errors.Is(err, alloc.ErrLeaseNotFound) {
+		return "", err
+	}
+	recovery, err := client.RecoverRunner(ctx, runnerName)
+	if err != nil {
+		return "", err
+	}
+	if recovery.Present && binding.LeaseID != "" && binding.RunnerID != 0 &&
+		binding.RunnerID != recovery.RunnerID {
+		return "", errors.New("wiring: recovered runner id changed; refusing replacement identity")
+	}
+	if recovery.Busy {
+		if err := pool.PreserveRecoveredBusyPoolRunner(ctx, alloc.PoolRunner{
+			LeaseID: leaseID, Tier: tier, LaunchRequestID: requestID,
+			RunnerID: recovery.RunnerID, RunnerName: runnerName,
+		}); err != nil {
+			return "", err
+		}
+		return node.RunnerRecoveryBusy, nil
+	}
+	// REMOTE FIRST, THEN AN ATOMIC LOCAL CLAIM. JobStarted is authoritative and
+	// may land while either GitHub call is in flight; the final store transaction
+	// must see and preserve that busy binding. A crash between the two is safe:
+	// the idle row and charged quarantine remain, and the next recovery observes
+	// the now-absent registration before claiming it again.
+	if recovery.Present {
+		if err := client.RemoveRunner(ctx, recovery.RunnerID, runnerName); err != nil {
+			return "", err
+		}
+	}
+	retiringID := int64(0)
+	if recovery.Present {
+		retiringID = recovery.RunnerID
+	}
+	settled, err := pool.RetireRecoveredPoolRunner(ctx, alloc.PoolRunner{
+		LeaseID: leaseID, Tier: tier, LaunchRequestID: requestID,
+		RunnerID: retiringID, RunnerName: runnerName,
+	})
+	if err != nil {
+		return "", err
+	}
+	if settled.Status == alloc.PoolRunnerBusy &&
+		(settled.ActualRequestID != 0 || settled.RunID != 0 || settled.JobID != "") {
+		return node.RunnerRecoveryTracked, nil
+	}
+	return node.RunnerRecoveryRetired, nil
+}
+
 // ValidateTrustedRunnerGroup verifies policy immediately before local minting.
 func (j JITSource) ValidateTrustedRunnerGroup(ctx context.Context, group string,
 	workflows []string,
@@ -156,6 +255,15 @@ func (n NodeJIT) JITConfig(
 // RemoveRunner removes a remote node's failed-launch registration.
 func (n NodeJIT) RemoveRunner(ctx context.Context, runnerID int64, runnerName string) error {
 	return n.Client.RemoveRunner(ctx, runnerID, runnerName)
+}
+
+// RecoverRunner resolves the exact legacy registration for a remote node.
+func (n NodeJIT) RecoverRunner(
+	ctx context.Context, runnerName string,
+) (nodeplane.JITRunnerRecovery, error) {
+	recovery, err := n.Client.RecoverRunner(ctx, runnerName)
+	return nodeplane.JITRunnerRecovery{RunnerID: recovery.RunnerID,
+		Present: recovery.Present, Busy: recovery.Busy}, err
 }
 
 // ValidateTrustedRunnerGroup verifies policy immediately before remote minting.

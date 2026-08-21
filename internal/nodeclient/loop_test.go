@@ -266,6 +266,10 @@ func (stubJIT) JITConfig(context.Context, int, string, string) (nodeplane.JITReg
 
 func (stubJIT) RemoveRunner(context.Context, int64, string) error { return nil }
 
+func (stubJIT) RecoverRunner(context.Context, string) (nodeplane.JITRunnerRecovery, error) {
+	return nodeplane.JITRunnerRecovery{}, nil
+}
+
 type stubStore struct{}
 
 func (stubStore) Bind(context.Context, string, int64, string) error         { return nil }
