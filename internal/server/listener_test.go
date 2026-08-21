@@ -2114,7 +2114,7 @@ func TestAPoisonedCompletionIsNotSkippedWhenItsAcknowledgementFails(t *testing.T
 	session := &fakeSession{
 		onGet: func() (*Message, error) {
 			if deliveries.Add(1) > 3 {
-				return nil, errors.New("cross-tier completion did not stop the listener")
+				return nil, errors.New("poisoned completion reached a fourth delivery without a quarantine acknowledgement attempt")
 			}
 
 			return &Message{MessageID: 42, Completed: []Job{{
@@ -2175,7 +2175,9 @@ func TestACompletionForAnotherTierRemainsFatalAndUnacknowledged(t *testing.T) {
 	)
 	session := &fakeSession{
 		onGet: func() (*Message, error) {
-			deliveries.Add(1)
+			if deliveries.Add(1) > 3 {
+				return nil, errors.New("cross-tier completion did not stop the listener")
+			}
 
 			return &Message{MessageID: 42, Completed: []Job{{
 				RunnerName: provider.InstanceName(lease.ID),
