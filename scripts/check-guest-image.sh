@@ -270,10 +270,14 @@ done
 # Each check runs AS THE RUNNER ACCOUNT (setpriv), under a scrubbed environment
 # (env -i) carrying only the runner's effective PATH -- not sbin -- and its HOME.
 # That is the context setup-python actually runs in: a root chroot inheriting the
-# builder's env would let PYTHONHOME or PIP_CONFIG_FILE mask a real fault, and it
-# cannot exercise `pip cache dir` at all because the runner's cache directory is
-# unwritable by root. Running the command proves the shebang chain rather than a
-# stat a symlinked build host would satisfy.
+# builder's env would let PYTHONHOME or PIP_CONFIG_FILE mask a real fault. Running
+# `--version` proves the shebang chain rather than a stat a symlinked build host
+# would satisfy. It is deliberately NOT `pip cache dir`: this image is mounted
+# read-only (a mount that replayed a journal would modify what it checks), and pip
+# disables -- and errors -- its cache when it cannot create the directory, so
+# `pip cache dir` would test the mount's writability, not the image. The cache
+# directory is written at job time from a writable home; the image property is that
+# pip resolves and runs, which `--version` establishes.
 runner_pip=(setpriv --reuid=runner --regid=runner --clear-groups
 	/usr/bin/env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/home/runner)
 for tool in pip pip3 python; do
@@ -285,15 +289,6 @@ for tool in pip pip3 python; do
         exactly as it did before python3-pip and python-is-python3 were installed"
 	fi
 done
-
-# The exact setup-python contract, exercised the way setup-python does it: the
-# runner running `pip cache dir`. A root chroot passes this vacuously on a broken
-# cache and errors on a healthy one, so it must be the runner.
-if chroot "$MNT" "${runner_pip[@]}" pip cache dir >/dev/null 2>&1; then
-	pass "pip cache dir works for the runner, so setup-python's cache: pip resolves it"
-else
-	fail "pip cache dir fails for the runner; setup-python's cache: pip would throw here"
-fi
 
 # The hosted image writes break-system-packages so a `pip install` against the
 # system python survives PEP 668; without it the system pip resolves but refuses to
