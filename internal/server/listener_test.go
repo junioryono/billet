@@ -784,6 +784,145 @@ func TestCompletionSettlesTheRunnersLeaseWhenGitHubPairedItWithAnotherJob(t *tes
 	}
 }
 
+func TestPooledCompletionAndAssignedCountRetireBothPhysicalRunners(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+	var destroyed []int64
+	runner := &fakeRunner{onDestroy: func(requestID int64) error {
+		destroyed = append(destroyed, requestID)
+		return nil
+	}}
+	registry := &fakeRunnerRegistry{}
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner),
+		WithRunnerRegistry(registry))
+	if err := l.refillEscrow(t.Context()); err != nil {
+		t.Fatalf("refill escrow: %v", err)
+	}
+	if err := l.handle(t.Context(), &Message{MessageID: 1,
+		Assigned: []Job{{RequestID: 11, RunID: 101, JobID: "job-11"},
+			{RequestID: 12, RunID: 102, JobID: "job-12"}},
+		Statistics: &Statistics{TotalAssignedJobs: 2}}); err != nil {
+		t.Fatalf("launch pool: %v", err)
+	}
+	members, err := a.PoolRunners(t.Context(), tiers[0].Label)
+	if err != nil || len(members) != 2 {
+		t.Fatalf("pool members = %+v, err %v", members, err)
+	}
+	var actual alloc.PoolRunner
+	for i := range members {
+		if members[i].LaunchRequestID == 11 {
+			actual = members[i]
+		}
+	}
+	if err := l.handle(t.Context(), &Message{MessageID: 2,
+		Started: []Job{{RequestID: 12, RunID: 102, JobID: "job-12", RunnerID: 77,
+			RunnerName: actual.RunnerName}},
+		Completed: []Job{{RequestID: 12, RunID: 102, JobID: "job-12", RunnerID: 77,
+			RunnerName: actual.RunnerName, Result: "Succeeded"}},
+		Statistics: &Statistics{TotalAssignedJobs: 0}}); err != nil {
+		t.Fatalf("settle swapped runner and idle surplus: %v", err)
+	}
+	slices.Sort(destroyed)
+	if !slices.Equal(destroyed, []int64{11, 12}) {
+		t.Fatalf("destroyed requests = %v, want both physical runners", destroyed)
+	}
+	if len(registry.names) != 2 || registry.names[0] == registry.names[1] {
+		t.Fatalf("removed registrations = %v, want both physical runners", registry.names)
+	}
+	usage, err := a.Usage(t.Context())
+	if err != nil {
+		t.Fatalf("Usage: %v", err)
+	}
+	if usage.Leases != 0 {
+		t.Fatalf("leases = %d, want no completed or idle runner capacity", usage.Leases)
+	}
+	if members, err := a.PoolRunners(t.Context(), tiers[0].Label); err != nil || len(members) != 0 {
+		t.Fatalf("settled pool members = %+v, err %v", members, err)
+	}
+}
+
+func TestRunnerRemovalFailureKeepsComputeAndCapacity(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 4, MaxMemory: 64 * config.GiB}, tiers)
+	var destroyed int
+	runner := &fakeRunner{onDestroy: func(int64) error { destroyed++; return nil }}
+	registry := &fakeRunnerRegistry{err: errors.New("github unavailable")}
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner),
+		WithRunnerRegistry(registry))
+	if err := l.refillEscrow(t.Context()); err != nil {
+		t.Fatalf("refill escrow: %v", err)
+	}
+	if err := l.handle(t.Context(), &Message{MessageID: 1,
+		Assigned:   []Job{{RequestID: 11, RunID: 101, JobID: "job-11"}},
+		Statistics: &Statistics{TotalAssignedJobs: 1}}); err != nil {
+		t.Fatalf("launch pool: %v", err)
+	}
+	members, err := a.PoolRunners(t.Context(), tiers[0].Label)
+	if err != nil || len(members) != 1 {
+		t.Fatalf("pool members = %+v, err %v", members, err)
+	}
+	if err := l.handle(t.Context(), &Message{MessageID: 2,
+		Completed: []Job{{RequestID: 11, RunID: 101, JobID: "job-11",
+			RunnerName: members[0].RunnerName, Result: "Succeeded"}},
+		Statistics: &Statistics{TotalAssignedJobs: 0}}); err != nil {
+		t.Fatalf("completion: %v", err)
+	}
+	if destroyed != 0 {
+		t.Fatalf("destroy calls = %d, want none before deregistration", destroyed)
+	}
+	usage, err := a.Usage(t.Context())
+	if err != nil {
+		t.Fatalf("Usage: %v", err)
+	}
+	if usage.Leases != 1 {
+		t.Fatalf("leases = %d, want the runner's capacity held", usage.Leases)
+	}
+	members, err = a.PoolRunners(t.Context(), tiers[0].Label)
+	if err != nil || len(members) != 1 || members[0].Status != alloc.PoolRunnerRetiring {
+		t.Fatalf("retirement journal = %+v, err %v", members, err)
+	}
+}
+
+func TestContradictoryStartedIdentityRetiresOnlyThatPoolMember(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+	var destroyed []int64
+	runner := &fakeRunner{onDestroy: func(requestID int64) error {
+		destroyed = append(destroyed, requestID)
+		return nil
+	}}
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(runner),
+		WithRunnerRegistry(&fakeRunnerRegistry{}))
+	if err := l.refillEscrow(t.Context()); err != nil {
+		t.Fatalf("refill escrow: %v", err)
+	}
+	if err := l.handle(t.Context(), &Message{MessageID: 1,
+		Assigned: []Job{{RequestID: 11, RunID: 101, JobID: "job-11"},
+			{RequestID: 12, RunID: 102, JobID: "job-12"}},
+		Statistics: &Statistics{TotalAssignedJobs: 2}}); err != nil {
+		t.Fatalf("launch pool: %v", err)
+	}
+	members, err := a.PoolRunners(t.Context(), tiers[0].Label)
+	if err != nil || len(members) != 2 {
+		t.Fatalf("pool members = %+v, err %v", members, err)
+	}
+	bad := members[0]
+	if err := l.handle(t.Context(), &Message{MessageID: 2,
+		Started: []Job{{RequestID: bad.LaunchRequestID, RunID: 101, RunnerID: 77,
+			RunnerName: bad.RunnerName}},
+		Statistics: &Statistics{TotalAssignedJobs: 2}}); err != nil {
+		t.Fatalf("a contradictory member stopped its tier: %v", err)
+	}
+	if !slices.Equal(destroyed, []int64{bad.LaunchRequestID}) {
+		t.Fatalf("destroyed requests = %v, want only contradictory member %d",
+			destroyed, bad.LaunchRequestID)
+	}
+	members, err = a.PoolRunners(t.Context(), tiers[0].Label)
+	if err != nil || len(members) != 1 || members[0].LaunchRequestID == bad.LaunchRequestID {
+		t.Fatalf("remaining pool = %+v, err %v", members, err)
+	}
+}
+
 func TestDirectAssignmentUsesJobIDWhenGitHubSendsRequestIDZero(t *testing.T) {
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
 	a := newAllocator(t, alloc.Limits{MaxVCPU: tierVCPU, MaxMemory: 64 * config.GiB}, tiers)
@@ -2433,6 +2572,16 @@ type fakeRunner struct {
 	onLaunch           func(requestID int64) error
 	onDestroy          func(requestID int64) error
 	onDestroyCompleted func(requestID int64, result string) error
+}
+
+type fakeRunnerRegistry struct {
+	names []string
+	err   error
+}
+
+func (f *fakeRunnerRegistry) RemoveRunner(_ context.Context, _ int64, name string) error {
+	f.names = append(f.names, name)
+	return f.err
 }
 
 type boundFakeRunner struct {

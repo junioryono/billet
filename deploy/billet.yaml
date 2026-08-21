@@ -84,6 +84,10 @@ github:
 tiers:
   - label: billet-2vcpu-ubuntu-2404
     provider: docker
+    # The safe default is untrusted, which Docker refuses because it shares the
+    # host kernel. To use Docker, choose a non-default runner group restricted
+    # to exact workflows and set trust: trusted; see billet.example.yaml.
+    trust: untrusted
     vcpu: 2
     memory: 8GiB
     disk: 40GiB

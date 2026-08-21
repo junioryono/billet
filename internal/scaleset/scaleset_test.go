@@ -74,6 +74,17 @@ func TestTranslateReadsTheRequestIDNotTheRunID(t *testing.T) {
 				JobWorkflowRef:  "acme/api/.github/workflows/ci.yml@refs/heads/main",
 			}},
 		},
+		JobStartedMessages: []*gh.JobStarted{{
+			RunnerID: 55, RunnerName: "billet-lease-55",
+			JobMessageBase: gh.JobMessageBase{
+				RunnerRequestID: 555,
+				WorkflowRunID:   556,
+				JobID:           "started-guid",
+				OwnerName:       "acme",
+				RepositoryName:  "api",
+				JobWorkflowRef:  "acme/api/.github/workflows/ci.yml@refs/heads/main",
+			},
+		}},
 		JobCompletedMessages: []*gh.JobCompleted{
 			{Result: "succeeded", RunnerName: "billet-lease-333", JobMessageBase: gh.JobMessageBase{
 				RunnerRequestID: 333,
@@ -102,6 +113,10 @@ func TestTranslateReadsTheRequestIDNotTheRunID(t *testing.T) {
 	if got.Assigned[0].Owner != "acme" || got.Assigned[0].Repository != "api" ||
 		got.Assigned[0].WorkflowRef != "acme/api/.github/workflows/ci.yml@refs/heads/main" {
 		t.Errorf("assigned cache identity was lost: %+v", got.Assigned[0])
+	}
+	if len(got.Started) != 1 || got.Started[0].RunnerID != 55 ||
+		got.Started[0].RunnerName != "billet-lease-55" || got.Started[0].RequestID != 555 {
+		t.Fatalf("started runner/job binding was lost: %+v", got.Started)
 	}
 
 	if len(got.Completed) != 1 {

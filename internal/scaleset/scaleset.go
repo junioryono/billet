@@ -18,6 +18,7 @@ import (
 
 	gh "github.com/actions/scaleset"
 
+	billetgithub "github.com/junioryono/billet/internal/github"
 	"github.com/junioryono/billet/internal/server"
 	"github.com/junioryono/billet/internal/version"
 )
@@ -57,12 +58,18 @@ type Config struct {
 	InstallationID int64
 	// PrivateKey is the App private key, PEM encoded.
 	PrivateKey string
+	// Org and AppID authenticate policy reads against GitHub's organization API.
+	Org   string
+	AppID int64
+	// APIURL overrides GitHub.com's REST base for GitHub Enterprise Server.
+	APIURL string
 }
 
 // Client is billet's handle on the scale-set API.
 type Client struct {
-	gh  *gh.Client
-	log *slog.Logger
+	gh     *gh.Client
+	policy *billetgithub.RunnerGroupPolicyClient
+	log    *slog.Logger
 }
 
 // New builds a client from GitHub App credentials.
@@ -93,7 +100,18 @@ func New(cfg Config, log *slog.Logger) (*Client, error) {
 		return nil, fmt.Errorf("scaleset: build client: %w", err)
 	}
 
-	return &Client{gh: c, log: log}, nil
+	var policy *billetgithub.RunnerGroupPolicyClient
+	if cfg.Org != "" && cfg.AppID > 0 {
+		if cfg.APIURL == "" {
+			policy = billetgithub.NewRunnerGroupPolicyClient(cfg.Org, cfg.AppID, cfg.InstallationID,
+				[]byte(cfg.PrivateKey))
+		} else {
+			policy = billetgithub.NewRunnerGroupPolicyClientAt(cfg.APIURL, cfg.Org, cfg.AppID,
+				cfg.InstallationID, []byte(cfg.PrivateKey))
+		}
+	}
+
+	return &Client{gh: c, policy: policy, log: log}, nil
 }
 
 // session adapts *gh.MessageSessionClient to server.Session.
@@ -185,8 +203,6 @@ func (s *session) Close(ctx context.Context) error {
 
 // translate converts one vendor message into billet's own.
 //
-// JobStarted is dropped: it duplicates a transition the allocator already owns.
-//
 // JobAvailable is NOT dropped. Available is the offer — the message whose
 // RunnerRequestID goes to AcquireJobs, which is how a scale set claims work.
 // Assigned is the later confirmation that a claim succeeded, so acquiring from
@@ -239,6 +255,24 @@ func translate(msg *gh.RunnerScaleSetMessage) *server.Message {
 		})
 	}
 
+	for _, j := range msg.JobStartedMessages {
+		if j == nil {
+			continue
+		}
+
+		out.Started = append(out.Started, server.Job{
+			RequestID:   j.RunnerRequestID,
+			RunID:       j.WorkflowRunID,
+			JobID:       j.JobID,
+			RunnerID:    int64(j.RunnerID),
+			RunnerName:  j.RunnerName,
+			Event:       j.EventName,
+			Owner:       j.OwnerName,
+			Repository:  j.RepositoryName,
+			WorkflowRef: j.JobWorkflowRef,
+		})
+	}
+
 	for _, j := range msg.JobCompletedMessages {
 		if j == nil {
 			continue
@@ -253,6 +287,7 @@ func translate(msg *gh.RunnerScaleSetMessage) *server.Message {
 			Repository:  j.RepositoryName,
 			WorkflowRef: j.JobWorkflowRef,
 			Result:      j.Result,
+			RunnerID:    int64(j.RunnerID),
 			RunnerName:  j.RunnerName,
 		})
 	}

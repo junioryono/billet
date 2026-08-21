@@ -9,10 +9,11 @@ package nodeapi
 // cannot mint runners, only ask for one.
 //
 // So the node asks and the server mints. That puts a SECRET on this wire: a JIT
-// configuration is a credential until the runner consumes it, single-use and
-// scoped to one job, but a credential nonetheless. It is the reason the plain
-// HTTP transport is refused anywhere but loopback, and the reason mTLS is not
-// optional before a node runs on another machine.
+// configuration is a credential until the runner consumes it. It is single-use
+// for one ephemeral pool registration, which may consume any job GitHub routes
+// to that pool. It is the reason the plain HTTP transport is refused anywhere
+// but loopback, and the reason mTLS is not optional before a node runs on
+// another machine.
 
 // DescribeRequest asks for a tier's scale set.
 type DescribeRequest struct {
@@ -30,6 +31,13 @@ type DescribeResponse struct {
 	ID    int      `json:"id,omitempty"`
 	Name  string   `json:"name,omitempty"`
 	Names []string `json:"names,omitempty"`
+}
+
+// TrustedRunnerGroupRequest asks the control plane to revalidate the policy a
+// trusted pool relies on before the node asks it to mint a registration.
+type TrustedRunnerGroupRequest struct {
+	Group     string   `json:"group"`
+	Workflows []string `json:"workflows"`
 }
 
 // JITRequest asks for one runner registration.

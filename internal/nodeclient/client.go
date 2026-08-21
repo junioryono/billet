@@ -542,6 +542,17 @@ func (c *Client) Describe(ctx context.Context, name, group string) (*node.Set, [
 	return &node.Set{ID: res.ID, Name: res.Name}, res.Names, nil
 }
 
+// ValidateTrustedRunnerGroup asks the credential-holding control plane to
+// revalidate the workflow boundary immediately before this node requests a JIT
+// registration. The control plane repeats the check against the entitled tier
+// while minting, so a compromised node cannot substitute this request.
+func (c *Client) ValidateTrustedRunnerGroup(
+	ctx context.Context, group string, workflows []string,
+) error {
+	return c.do(ctx, http.MethodPost, c.nodePath("/trusted-runner-group"),
+		nodeapi.TrustedRunnerGroupRequest{Group: group, Workflows: workflows}, nil)
+}
+
 // JITConfig asks the control plane to mint one runner registration.
 func (c *Client) JITConfig(
 	ctx context.Context, scaleSetID int, runnerName, workFolder string,

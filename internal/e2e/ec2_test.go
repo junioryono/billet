@@ -283,6 +283,8 @@ func (j *cloudJIT) JITConfig(
 	return cloudRegistration{name: runnerName}, nil
 }
 
+func (*cloudJIT) ValidateTrustedRunnerGroup(context.Context, string, []string) error { return nil }
+
 // cloudStack is a control-plane ledger and a node runtime over the cloud backend.
 type cloudStack struct {
 	alloc  *alloc.Allocator
@@ -311,6 +313,11 @@ func newCloudStack(t *testing.T) *cloudStack {
 		Image:    "ami-cloud",
 		GuestOS:  config.GuestLinux,
 		Command:  []string{"./run.sh"},
+		Trust:    config.WorkloadTrusted,
+		Workflows: []string{
+			"acme/cloud/.github/workflows/ci.yml@refs/heads/main",
+		},
+		RunnerGroup: "trusted",
 	}
 
 	a, err := alloc.New(db, alloc.Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB},
@@ -533,6 +540,7 @@ func TestACloudNodeRefusesALeaseItWasNotPlacedFor(t *testing.T) {
 // work does not run. This asserts the whole path refuses, not just Accepts.
 func TestUntrustedWorkDoesNotReachTheCloudWithoutItsOwnNetwork(t *testing.T) {
 	s := newCloudStack(t)
+	s.tier.Trust = config.WorkloadUntrusted
 
 	lease := s.assignedLease(t)
 

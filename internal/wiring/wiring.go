@@ -43,6 +43,18 @@ func (p Provisioner) Session(ctx context.Context, scaleSetID int, owner string) 
 	return p.Client.Session(ctx, scaleSetID, owner)
 }
 
+// RemoveRunner removes routing before the control plane tears compute down.
+func (p Provisioner) RemoveRunner(ctx context.Context, runnerID int64, runnerName string) error {
+	return p.Client.RemoveRunner(ctx, runnerID, runnerName)
+}
+
+// ValidateTrustedRunnerGroup verifies a trusted tier's workflow boundary.
+func (p Provisioner) ValidateTrustedRunnerGroup(ctx context.Context, group string,
+	workflows []string,
+) error {
+	return p.Client.ValidateTrustedRunnerGroup(ctx, group, workflows)
+}
+
 // JITSource adapts the client to what the node needs to mint registrations.
 type JITSource struct{ Client *scaleset.Client }
 
@@ -66,6 +78,13 @@ func (j JITSource) JITConfig(
 	ctx context.Context, scaleSetID int, runnerName, workFolder string,
 ) (node.Registration, error) {
 	return j.Client.JITConfig(ctx, scaleSetID, runnerName, workFolder)
+}
+
+// ValidateTrustedRunnerGroup verifies policy immediately before local minting.
+func (j JITSource) ValidateTrustedRunnerGroup(ctx context.Context, group string,
+	workflows []string,
+) error {
+	return j.Client.ValidateTrustedRunnerGroup(ctx, group, workflows)
 }
 
 // NodeJIT is the same source, shaped for the node wire.
@@ -98,4 +117,11 @@ func (n NodeJIT) JITConfig(
 	ctx context.Context, scaleSetID int, runnerName, workFolder string,
 ) (nodeplane.JITRegistration, error) {
 	return n.Client.JITConfig(ctx, scaleSetID, runnerName, workFolder)
+}
+
+// ValidateTrustedRunnerGroup verifies policy immediately before remote minting.
+func (n NodeJIT) ValidateTrustedRunnerGroup(ctx context.Context, group string,
+	workflows []string,
+) error {
+	return n.Client.ValidateTrustedRunnerGroup(ctx, group, workflows)
 }

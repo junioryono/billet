@@ -23,8 +23,8 @@ import (
 	"github.com/junioryono/billet/internal/server"
 )
 
-// JITSource mints single-use runner registrations and finds the scale set to
-// mint them against.
+// JITSource mints single-use credentials for ephemeral pool registrations and
+// finds the scale set to mint them against.
 //
 // An interface rather than the concrete client so this package does not depend
 // on the preview scale-set API, and so a test can drive the whole launch path
@@ -34,6 +34,10 @@ type JITSource interface {
 	Describe(ctx context.Context, name, group string) (*Set, []string, error)
 	// JITConfig mints a registration for one runner against one scale set.
 	JITConfig(ctx context.Context, scaleSetID int, runnerName, workFolder string) (Registration, error)
+}
+
+type trustedRunnerGroupValidator interface {
+	ValidateTrustedRunnerGroup(context.Context, string, []string) error
 }
 
 // Set is the part of a scale set this package needs.
@@ -261,7 +265,15 @@ func (r *Runner) Launch(
 			job.RequestID, leaseID)
 	}
 
-	trust := provider.Classify(job.Event)
+	var trust provider.TrustClass
+	switch tier.Trust.Effective() {
+	case config.WorkloadTrusted:
+		trust = provider.TrustTrusted
+	case config.WorkloadUntrusted:
+		trust = provider.TrustUntrusted
+	default:
+		return fmt.Errorf("node: tier %q has unknown pool trust %q", tier.Label, tier.Trust)
+	}
 
 	if err := r.provider.Accepts(trust); err != nil {
 		return fmt.Errorf("node: %w", err)
@@ -316,6 +328,15 @@ func (r *Runner) Launch(
 	// crash the name is what reconciliation reads to decide whether a surviving
 	// instance is still wanted. See provider.InstanceName.
 	name := provider.InstanceName(lease.ID)
+	if tier.Trust.Effective() == config.WorkloadTrusted {
+		validator, ok := r.jit.(trustedRunnerGroupValidator)
+		if !ok {
+			return fmt.Errorf("node: trusted runner-group policy cannot be verified before registration")
+		}
+		if err := validator.ValidateTrustedRunnerGroup(ctx, tier.RunnerGroup, tier.Workflows); err != nil {
+			return fmt.Errorf("node: trusted runner-group policy drifted: %w", err)
+		}
+	}
 
 	reg, err := r.jit.JITConfig(ctx, setID, name, "_work")
 	if err != nil {
@@ -335,10 +356,13 @@ func (r *Runner) Launch(
 	var buildKitCacheMountLimit config.ByteSize
 	if r.cache != nil {
 		var credentials CacheCredentials
-		credentials, err = r.cache.PrepareScoped(name, CacheSessionScope{
-			Trust: trust, Intercept: tier.Intercept && trust == provider.TrustTrusted, Owner: job.Owner,
-			Repository: job.Repository, WorkflowRef: job.WorkflowRef,
-		})
+		scope := CacheSessionScope{Trust: trust, Intercept: tier.Intercept && trust == provider.TrustTrusted}
+		if tier.CacheScope != nil {
+			scope.Owner = tier.CacheScope.Owner
+			scope.Repository = tier.CacheScope.Repository
+			scope.WorkflowRef = tier.CacheScope.WorkflowRef
+		}
+		credentials, err = r.cache.PrepareScoped(name, scope)
 		if err != nil {
 			r.log.Warn("cache access is unavailable; this job will continue cold",
 				"instance", name, "error", err)
@@ -393,9 +417,8 @@ func (r *Runner) Launch(
 		Disk:  tier.Disk,
 		SHM:   tier.SHM,
 
-		// Classified from the event that queued the job. The zero value is
-		// unknown and backends refuse it, so a job whose event billet does not
-		// recognise cannot run anywhere weak by default.
+		// Static authority for every workflow GitHub may route to this pool. The
+		// zero value is unknown and backends refuse it.
 		Trust: trust,
 
 		JITConfig:               reg.Config(),

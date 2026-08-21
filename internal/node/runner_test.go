@@ -27,8 +27,8 @@ const (
 	testNodeMemory = 1 << 20 * config.GiB
 )
 
-// A launch mints a registration and hands it to the provider, with the tier's
-// shape and the job's trust class.
+// A launch mints a registration and hands it to the provider with the tier's
+// static pool authority.
 func TestLaunchMintsARegistrationAndStartsIt(t *testing.T) {
 	p := &fakeProvider{kind: config.ProviderDocker}
 
@@ -56,9 +56,30 @@ func TestLaunchMintsARegistrationAndStartsIt(t *testing.T) {
 		t.Errorf("the tier's shape did not reach the provider: %+v", spec)
 	}
 
-	// A push is repository code, so it is trusted and a container may run it.
+	// The pool is trusted, so its event does not reclassify the registration after
+	// GitHub has already been allowed to assign it any job in the scale set.
 	if spec.Trust != provider.TrustTrusted {
-		t.Errorf("a push was classified %s", spec.Trust)
+		t.Errorf("trusted pool launched as %s", spec.Trust)
+	}
+}
+
+func TestPoolTrustOutranksTheAssignmentEvent(t *testing.T) {
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
+	if err := r.Launch(t.Context(), assignedLease(t, a), dockerSpec(),
+		Job{RequestID: 11, Event: "pull_request"}); err != nil {
+		t.Fatalf("a trusted pool was reclassified from its assignment event: %v", err)
+	}
+	if got := p.launched[0].Trust; got != provider.TrustTrusted {
+		t.Fatalf("launch trust = %s, want trusted pool policy", got)
+	}
+
+	untrusted := dockerSpec()
+	untrusted.Trust = config.WorkloadUntrusted
+	if err := r.Launch(t.Context(), assignedLease(t, a), untrusted,
+		Job{RequestID: 12, Event: "push"}); err == nil {
+		t.Fatal("an untrusted pool gained Docker authority from a push event")
 	}
 }
 
@@ -97,37 +118,6 @@ func TestTheRunnerIsNamedAfterItsLease(t *testing.T) {
 	for _, name := range jit.names {
 		if !strings.HasPrefix(name, "billet-") || len(name) <= len("billet-") {
 			t.Errorf("runner name %q does not identify a lease", name)
-		}
-	}
-}
-
-// A pull request is UNTRUSTED, and a container refuses it.
-//
-// Not caution for its own sake: a scale-set message carries the event and the
-// repository but does NOT say whether a pull request came from a fork. billet
-// cannot tell a teammate's PR from a stranger's, and those differ by whether
-// arbitrary outside code is about to run on the host. Given it cannot tell, it
-// assumes the worse one.
-func TestPullRequestsAreUntrustedBecauseForkStatusIsUnknowable(t *testing.T) {
-	for _, event := range []string{"pull_request", "pull_request_target"} {
-		t.Run(event, func(t *testing.T) {
-			if got := provider.Classify(event); got != provider.TrustUntrusted {
-				t.Errorf("%s classified as %s; billet cannot tell a fork PR from a same-repo "+
-					"one, so it must assume the worse", event, got)
-			}
-		})
-	}
-}
-
-// An event billet does not recognise is UNKNOWN, not trusted.
-//
-// GitHub adds events. A new one must not inherit permission from a switch
-// statement written before it existed.
-func TestUnrecognisedEventsAreNotTrusted(t *testing.T) {
-	for _, event := range []string{"", "some_future_event", "PUSH"} {
-		if got := provider.Classify(event); got == provider.TrustTrusted {
-			t.Errorf("event %q was trusted by default; a backend sharing the host kernel "+
-				"would accept it", event)
 		}
 	}
 }
@@ -1080,7 +1070,9 @@ func dockerSpec() *nodeapi.TierSpec {
 func dockerTier() config.Tier {
 	return config.Tier{
 		Label: "billet-2vcpu", Provider: config.ProviderDocker, GuestOS: config.GuestLinux,
-		VCPU: 2, Memory: 8 * config.GiB, Image: "ubuntu-2404-x64",
+		Trust: config.WorkloadTrusted, RunnerGroup: "trusted",
+		Workflows: []string{"acme/api/.github/workflows/ci.yml@refs/heads/main"},
+		VCPU:      2, Memory: 8 * config.GiB, Image: "ubuntu-2404-x64",
 	}
 }
 
@@ -1106,6 +1098,10 @@ func (f *fakeJIT) Describe(context.Context, string, string) (*Set, []string, err
 	f.describes++
 
 	return &Set{ID: f.setID, Name: "billet-2vcpu"}, nil, nil
+}
+
+func (f *fakeJIT) ValidateTrustedRunnerGroup(context.Context, string, []string) error {
+	return nil
 }
 
 func (f *fakeJIT) JITConfig(_ context.Context, _ int, name, _ string) (Registration, error) {

@@ -76,7 +76,7 @@ type CacheCredentials struct {
 	ActionsCAPEM string
 }
 
-// CacheSessionScope is the identity GitHub bound to one assigned job.
+// CacheSessionScope is the static authority configured for one runner pool.
 type CacheSessionScope struct {
 	Trust       provider.TrustClass
 	Intercept   bool
@@ -164,7 +164,7 @@ func (s *CacheService) Prepare(instance string, trust provider.TrustClass) (Cach
 	return s.PrepareScoped(instance, CacheSessionScope{Trust: trust})
 }
 
-// PrepareScoped creates a session bound to GitHub's authenticated assignment.
+// PrepareScoped creates a session bound to the pool's configured cache scope.
 func (s *CacheService) PrepareScoped(
 	instance string,
 	scope CacheSessionScope,

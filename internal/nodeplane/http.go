@@ -27,6 +27,10 @@ type JITSource interface {
 	JITConfig(ctx context.Context, scaleSetID int, runnerName, workFolder string) (JITRegistration, error)
 }
 
+type trustedRunnerGroupValidator interface {
+	ValidateTrustedRunnerGroup(context.Context, string, []string) error
+}
+
 // JITSet is a scale set, as the wire needs it.
 type JITSet struct {
 	ID   int
@@ -221,6 +225,7 @@ func Handler(log *slog.Logger, p *Plane, store LeaseStore, jit JITSource, opts .
 	mux.HandleFunc("GET /v1/nodes/{node}/leases/{lease}", h.forOwnLease(h.lease))
 	mux.HandleFunc("GET /v1/nodes/{node}/launched", h.forNewWork(h.launched))
 	mux.HandleFunc("POST /v1/nodes/{node}/describe", h.forNewWork(h.describe))
+	mux.HandleFunc("POST /v1/nodes/{node}/trusted-runner-group", h.forNewWork(h.validateTrustedRunnerGroup))
 	mux.HandleFunc("POST /v1/nodes/{node}/reconcile", h.forNewWork(h.reconcile))
 	mux.HandleFunc("POST /v1/nodes/{node}/jit", h.forNode(h.jitConfig))
 	mux.HandleFunc("POST /v1/nodes/{node}/renew", h.forNode(h.renew))
@@ -1273,6 +1278,23 @@ func (h *handler) jitConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if known.Trust == config.WorkloadTrusted {
+		validator, ok := h.jit.(trustedRunnerGroupValidator)
+		if !ok {
+			writeErr(w, http.StatusForbidden, nodeapi.CodeRefused,
+				"trusted runner-group policy cannot be verified before registration")
+			return
+		}
+		if err := validator.ValidateTrustedRunnerGroup(r.Context(), known.RunnerGroup,
+			known.Workflows); err != nil {
+			h.log.Error("refused a trusted runner registration after runner-group policy drift",
+				"node", r.PathValue("node"), "lease", leaseID, "tier", tier, "error", err)
+			writeErr(w, http.StatusForbidden, nodeapi.CodeRefused,
+				"trusted runner-group policy no longer matches billet.yaml")
+			return
+		}
+	}
+
 	reg, err := h.jit.JITConfig(r.Context(), req.ScaleSetID, req.RunnerName, req.WorkFolder)
 	if err != nil {
 		// NOT LOGGED WITH THE REQUEST. A failure to mint can carry the runner name
@@ -1287,6 +1309,35 @@ func (h *handler) jitConfig(w http.ResponseWriter, r *http.Request) {
 		Config:     reg.Config(),
 		RunnerName: reg.RunnerName(),
 	})
+}
+
+func (h *handler) validateTrustedRunnerGroup(w http.ResponseWriter, r *http.Request) {
+	var req nodeapi.TrustedRunnerGroupRequest
+	if !decode(w, r, &req) {
+		return
+	}
+
+	if err := h.registered(r); err != nil {
+		writeStoreErr(w, err)
+
+		return
+	}
+
+	validator, ok := h.jit.(trustedRunnerGroupValidator)
+	if !ok {
+		writeErr(w, http.StatusServiceUnavailable, "",
+			"this control plane cannot validate trusted runner-group policy")
+
+		return
+	}
+
+	if err := validator.ValidateTrustedRunnerGroup(r.Context(), req.Group, req.Workflows); err != nil {
+		writeStoreErr(w, err)
+
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // registered is requireRegistered for a request, carrying its incarnation so
