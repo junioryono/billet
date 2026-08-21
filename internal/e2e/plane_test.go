@@ -133,7 +133,7 @@ func (p *plane) route(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		fakeactions.WriteJSON(p.t, w, map[string]any{"count": 1,
-			"value": []map[string]any{{"id": 99, "name": name}}})
+			"value": []map[string]any{{"id": 99, "name": name, "runnerScaleSetId": p.setID}}})
 
 	case r.Method == http.MethodDelete && strings.Contains(path, "/agents/99"):
 		p.mu.Lock()

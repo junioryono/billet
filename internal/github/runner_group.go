@@ -19,10 +19,10 @@ import (
 // out and rendered without the redaction methods below.
 type RunnerGroupPolicyClient interface {
 	ValidateTrustedRunnerGroup(context.Context, int, []string) error
-	InspectEphemeralRunner(context.Context, string) (RunnerRecovery, error)
+	InspectScaleSetRunner(context.Context, string, int64) (RunnerRecovery, error)
 }
 
-// RunnerRecovery reports whether an exact legacy ephemeral registration exists
+// RunnerRecovery reports whether an exact legacy scale-set registration exists
 // and is still busy. A zero value means it is absent.
 type RunnerRecovery struct {
 	RunnerID int64
@@ -116,16 +116,20 @@ func (c *runnerGroupPolicyClient) ValidateTrustedRunnerGroup(ctx context.Context
 	return nil
 }
 
-// InspectEphemeralRunner reads an exact legacy runner's busy state. Ambiguous
-// identities and non-ephemeral runners are refused.
-func (c *runnerGroupPolicyClient) InspectEphemeralRunner(
-	ctx context.Context, runnerName string,
+// InspectScaleSetRunner reads the state of a registration whose name, id and
+// scale-set membership were independently established through the Actions
+// service. Ambiguous identities and explicit non-ephemeral records are refused.
+func (c *runnerGroupPolicyClient) InspectScaleSetRunner(
+	ctx context.Context, runnerName string, runnerID int64,
 ) (RunnerRecovery, error) {
 	if c == nil || c.org == "" || c.appID <= 0 || c.installationID <= 0 || len(c.privateKey) == 0 {
 		return RunnerRecovery{}, fmt.Errorf("github: runner recovery is not configured")
 	}
 	if runnerName == "" {
 		return RunnerRecovery{}, fmt.Errorf("github: runner recovery needs a name")
+	}
+	if runnerID <= 0 {
+		return RunnerRecovery{}, fmt.Errorf("github: runner recovery needs a valid id")
 	}
 	token, err := c.installationToken(ctx)
 	if err != nil {
@@ -176,8 +180,7 @@ func (c *runnerGroupPolicyClient) InspectEphemeralRunner(
 	}
 	var exact []runnerRecord
 	for _, runner := range *listed.Runners {
-		if runner.ID == nil || runner.Name == nil || runner.Status == nil || runner.Busy == nil ||
-			runner.Ephemeral == nil {
+		if runner.Name == nil {
 			return RunnerRecovery{}, fmt.Errorf("github: runner recovery response contained an incomplete runner")
 		}
 		if *runner.Name == runnerName {
@@ -192,10 +195,14 @@ func (c *runnerGroupPolicyClient) InspectEphemeralRunner(
 			len(exact), runnerName)
 	}
 	runner := exact[0]
-	if *runner.ID <= 0 {
-		return RunnerRecovery{}, fmt.Errorf("github: runner %q has invalid id %d", runnerName, *runner.ID)
+	if runner.ID == nil || runner.Status == nil || runner.Busy == nil {
+		return RunnerRecovery{}, fmt.Errorf("github: runner recovery response contained an incomplete exact runner")
 	}
-	if !*runner.Ephemeral {
+	if *runner.ID != runnerID {
+		return RunnerRecovery{}, fmt.Errorf("github: runner %q now has id %d, not the scale-set id %d; refusing replacement identity",
+			runnerName, *runner.ID, runnerID)
+	}
+	if runner.Ephemeral != nil && !*runner.Ephemeral {
 		return RunnerRecovery{}, fmt.Errorf("github: runner %q is not ephemeral; refusing recovery",
 			runnerName)
 	}
