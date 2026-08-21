@@ -668,7 +668,7 @@ func TestRunnerBindsCacheAccessToTheComputeLifetime(t *testing.T) {
 	}
 }
 
-func TestRunnerBindsActionsInterceptionToTheAssignedRepository(t *testing.T) {
+func TestRunnerBindsActionsInterceptionToTheStaticPoolScope(t *testing.T) {
 	p := &fakeProvider{kind: config.ProviderDocker}
 	service, err := NewCacheService("http://172.20.0.1:7718", "test-deployment", t.TempDir(),
 		&fakeCacheStore{}, &fakeVolumeAttacher{}, slog.New(slog.DiscardHandler))
@@ -681,12 +681,14 @@ func TestRunnerBindsActionsInterceptionToTheAssignedRepository(t *testing.T) {
 	lease := assignedLease(t, a)
 	tier := dockerSpec()
 	tier.Intercept = true
+	tier.CacheScope = &config.CacheScope{Owner: "acme", Repository: "api",
+		WorkflowRef: "acme/api/.github/workflows/ci.yml@refs/heads/main"}
 	if err := runner.Launch(t.Context(), lease, tier, Job{
 		RequestID:   11,
 		Event:       "push",
-		Owner:       "acme",
-		Repository:  "api",
-		WorkflowRef: "acme/api/.github/workflows/ci.yml@refs/heads/main",
+		Owner:       "other",
+		Repository:  "unrelated",
+		WorkflowRef: "other/unrelated/.github/workflows/ci.yml@refs/heads/main",
 	}); err != nil {
 		t.Fatalf("Launch: %v", err)
 	}
@@ -698,6 +700,17 @@ func TestRunnerBindsActionsInterceptionToTheAssignedRepository(t *testing.T) {
 	}
 	if !strings.Contains(spec.ActionsProxy, spec.CacheToken) {
 		t.Error("the proxy URL is not bound to this guest's ephemeral cache capability")
+	}
+	service.mu.Lock()
+	session := service.byToken[spec.CacheToken]
+	service.mu.Unlock()
+	if session == nil {
+		t.Fatal("cache session was not recorded")
+	}
+	if session.owner != "acme" || session.repository != "api" ||
+		session.workflowRef != "acme/api/.github/workflows/ci.yml@refs/heads/main" {
+		t.Fatalf("cache session scope = %s/%s %q, want the static pool scope",
+			session.owner, session.repository, session.workflowRef)
 	}
 }
 
@@ -713,6 +726,7 @@ func TestRunnerLeavesUntrustedActionsTrafficEntirelyOnGitHub(t *testing.T) {
 	runner := New(a, host, &fakeJIT{setID: 7}, p, nil, WithCacheService(service))
 	lease := assignedLease(t, a)
 	tier := dockerSpec()
+	tier.Trust = config.WorkloadUntrusted
 	tier.Intercept = true
 	if err := runner.Launch(t.Context(), lease, tier, Job{
 		RequestID:   11,

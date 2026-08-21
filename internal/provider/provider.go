@@ -54,19 +54,19 @@ type GuestVolumeLocator interface {
 	GuestVolumeDevice(slot int, device string) string
 }
 
-// TrustClass says how much the workload is trusted, which decides what may run
-// it. The zero value is UNKNOWN and every backend must treat it as untrusted.
+// TrustClass says how much authority a configured runner pool receives, which
+// decides what may run it. The zero value is UNKNOWN and every backend refuses it.
 type TrustClass int
 
 const (
 	// TrustUnknown is the zero value, and it fails closed. A caller that has not
 	// classified a job has not established it is safe to run anywhere weak.
 	TrustUnknown TrustClass = iota
-	// TrustUntrusted is fork-pull-request work: arbitrary code from someone
-	// outside the organization. It requires a real isolation boundary.
+	// TrustUntrusted is a pool built to admit arbitrary code. It requires a real
+	// isolation boundary.
 	TrustUntrusted
-	// TrustTrusted is work from the repository itself — a push, a schedule, a
-	// dispatch, or a same-repo pull request.
+	// TrustTrusted is a pool whose non-default GitHub runner group is restricted
+	// to the exact workflows its operator declared.
 	TrustTrusted
 )
 
@@ -80,63 +80,6 @@ func (t TrustClass) String() string {
 		return "unknown"
 	default:
 		return "unknown"
-	}
-}
-
-// Classify decides how much a workload is trusted from the event that queued it.
-//
-// DELIBERATELY CONSERVATIVE, and the reason is a limitation of the protocol
-// rather than caution for its own sake. A scale-set message carries an event
-// name and the repository it came from; it does NOT say whether a pull request
-// came from a fork. So billet cannot tell "a teammate opened a PR" from "a
-// stranger opened a PR against a public repo" — and those differ by whether
-// arbitrary outside code is about to run on your hardware.
-//
-// Given it cannot tell, it assumes the worse one. EVERY pull request is
-// untrusted. That is stricter than necessary for a private repository with two
-// members, and it is the only safe default for a tool other people will point at
-// public ones. A deployment that knows better can widen it deliberately; nothing
-// widens by accident.
-//
-// An unrecognised event is unknown, not trusted, for the same reason: GitHub adds
-// events, and a new one must not inherit permission from a switch statement
-// written before it existed.
-func Classify(event string) TrustClass {
-	switch event {
-	case "pull_request", "pull_request_target":
-		return TrustUntrusted
-
-	// EVENTS THAT CARRY PULL-REQUEST CODE WITHOUT SAYING SO. Each is a way for outside
-	// code to arrive under a name that sounds internal:
-	//
-	// 	merge_group     runs the candidate MERGE COMMIT, which contains the pull
-	// 	                request's code, fork-authored included.
-	// 	workflow_run    is triggered BY another workflow, commonly a fork's PR run, and
-	// 	                the standard pattern downloads that run's artifacts — the
-	// 	                well-known artifact-poisoning vector.
-	// 	workflow_call   is a reusable workflow a pull-request workflow can call, and
-	// 	                which event the scale set reports is not established.
-	// 	deployment      can name a PR preview ref; the event says nothing about whose
-	// 	deployment_status  code is at that ref.
-	//
-	// UNKNOWN rather than untrusted: billet is not asserting they are hostile, only that
-	// the event name does not establish provenance. Unknown fails closed.
-	case "merge_group", "workflow_run", "workflow_call",
-		"deployment", "deployment_status":
-		return TrustUnknown
-
-	// What is left is code that reached the repository through someone with
-	// write access, which is the only provenance an event name can actually
-	// establish. repository_dispatch needs an authorised credential to fire, so
-	// it belongs here — with the caveat that whoever holds that credential is
-	// inside the trust boundary.
-	case "push", "schedule", "workflow_dispatch", "release", "repository_dispatch":
-		return TrustTrusted
-
-	default:
-		// Includes the empty string. GitHub adds events, and a new one must not
-		// inherit permission from a switch written before it existed.
-		return TrustUnknown
 	}
 }
 

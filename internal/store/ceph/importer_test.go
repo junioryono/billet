@@ -25,6 +25,16 @@ type importFake struct {
 	infoJSON string // what `rbd info` answers, or "" for an absent image
 	failOn   string
 	failErr  error
+	// failMetaSetKey applies the image-meta set for this exact key and then
+	// returns an error. A remote command can commit before its client observes a
+	// timeout, so rollback cannot treat an error as proof the write did not land.
+	failMetaSetKey        string
+	cancelMetaSetKey      string
+	failMetaRemove        bool
+	failSnapRemove        bool
+	failSnapRemoveApplied bool
+	expireSnapRemove      bool
+	appliedMetadata       map[string]bool
 
 	// lockHeld is what `rbd lock ls` reports. Empty means the fake tracks the
 	// lock itself: `lock add` succeeds and the listing then names this cookie,
@@ -73,6 +83,49 @@ func (f *importFake) run(ctx context.Context, _ string, args []string) ([]byte, 
 	}
 
 	sub := subcommandOf(args)
+	if sub == "snap" && slices.Contains(args, "rm") {
+		if f.failSnapRemove {
+			return nil, errors.New("snapshot removal failed")
+		}
+
+		_, generation, _ := strings.Cut(args[len(args)-1], "@")
+		f.snapshots = slices.DeleteFunc(f.snapshots, func(name string) bool {
+			return name == generation
+		})
+		if f.failSnapRemoveApplied {
+			return nil, errors.New("snapshot removal response was lost")
+		}
+		if f.expireSnapRemove {
+			<-ctx.Done()
+
+			return nil, ctx.Err()
+		}
+	}
+	if sub == "image-meta" && len(args) >= 2 {
+		key := args[len(args)-2]
+		if slices.Contains(args, "set") {
+			if f.appliedMetadata == nil {
+				f.appliedMetadata = make(map[string]bool)
+			}
+			f.appliedMetadata[key] = true
+
+			if key == f.cancelMetaSetKey && f.cancel != nil {
+				f.cancel()
+				f.cancel = nil
+
+				return nil, ctx.Err()
+			}
+			if key == f.failMetaSetKey {
+				return nil, errors.New("metadata set failed after applying the write")
+			}
+		}
+		if slices.Contains(args, "remove") {
+			if f.failMetaRemove {
+				return nil, errors.New("metadata removal failed")
+			}
+			delete(f.appliedMetadata, args[len(args)-1])
+		}
+	}
 
 	if f.failOn != "" && f.failOn == sub {
 		err := f.failErr
@@ -149,6 +202,10 @@ func (f *importFake) run(ctx context.Context, _ string, args []string) ([]byte, 
 
 				return []byte("[" + strings.Join(entries, ",") + "]"), nil
 			}
+		}
+		if slices.Contains(args, "create") {
+			_, generation, _ := strings.Cut(args[len(args)-1], "@")
+			f.snapshots = append(f.snapshots, generation)
 		}
 
 		return []byte(""), nil
@@ -1217,5 +1274,191 @@ func TestImportGenerationWithdrawsASnapshotWhoseKernelCannotBeRecorded(t *testin
 
 	if !f.ranWith("snap", "rm") {
 		t.Errorf("the snapshot was not withdrawn; billet ran %v", f.calls)
+	}
+}
+
+// A WITHDRAWN GENERATION WILL NEVER BE REAPED, because the snapshot name is gone.
+// Any generation-keyed metadata left behind is therefore permanent. Rollback
+// removes every field attempted through the failing operation because the remote
+// write may have committed before the client observed its error.
+func TestImportGenerationRemovesMetadataForAWithdrawnSnapshot(t *testing.T) {
+	const generation = "g20260815041709"
+
+	for _, tc := range []struct {
+		name       string
+		failKey    string
+		wantRemove []string
+		wantKeep   []string
+	}{
+		{
+			name:       "runner version fails after kernel",
+			failKey:    RunnerVersionKey + "." + generation,
+			wantRemove: []string{KernelKey, RunnerVersionKey},
+			wantKeep:   []string{GuestContractKey},
+		},
+		{
+			name:       "guest contract fails after kernel and runner version",
+			failKey:    GuestContractKey + "." + generation,
+			wantRemove: []string{KernelKey, RunnerVersionKey, GuestContractKey},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, device := stageRaw(t, "content")
+			f := &importFake{device: device, failMetaSetKey: tc.failKey}
+
+			if _, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64",
+				raw, "2.336.0", "vmlinux-6.1.155-ea1d42638d13", "7", importAt); err == nil {
+				t.Fatal("an import whose generation metadata failed was reported as published")
+			}
+			if !f.ranWith("snap", "rm", "ubuntu-2404-x64@"+generation) {
+				t.Fatalf("the incomplete snapshot was not withdrawn; billet ran %v", f.calls)
+			}
+
+			for _, key := range tc.wantRemove {
+				if !f.ranWith("image-meta", "remove", key+"."+generation) {
+					t.Errorf("the withdrawn generation retained %s; billet ran %v", key, f.calls)
+				}
+				if f.appliedMetadata[key+"."+generation] {
+					t.Errorf("the withdrawn generation still has applied %s metadata", key)
+				}
+			}
+			for _, key := range tc.wantKeep {
+				if f.ranWith("image-meta", "remove", key+"."+generation) {
+					t.Errorf("rollback removed %s even though its write never succeeded", key)
+				}
+			}
+		})
+	}
+}
+
+func TestImportGenerationKeepsMetadataWhenSnapshotWithdrawalFails(t *testing.T) {
+	const generation = "g20260815041709"
+
+	raw, device := stageRaw(t, "content")
+	f := &importFake{
+		device:         device,
+		failMetaSetKey: GuestContractKey + "." + generation,
+		failSnapRemove: true,
+	}
+
+	_, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw,
+		"2.336.0", "vmlinux-6.1.155-ea1d42638d13", "7", importAt)
+	if err == nil {
+		t.Fatal("an import whose incomplete snapshot could not be withdrawn reported success")
+	}
+	if !strings.Contains(err.Error(), "could not be withdrawn") {
+		t.Errorf("the failure does not say the snapshot still exists: %v", err)
+	}
+	for _, key := range []string{KernelKey, RunnerVersionKey, GuestContractKey} {
+		if f.ranWith("image-meta", "remove", key+"."+generation) {
+			t.Errorf("rollback removed %s from a generation that still exists", key)
+		}
+	}
+}
+
+func TestImportGenerationCleansMetadataWhenSnapshotRemovalResponseIsLost(t *testing.T) {
+	const generation = "g20260815041709"
+
+	raw, device := stageRaw(t, "content")
+	f := &importFake{
+		device:                device,
+		failMetaSetKey:        GuestContractKey + "." + generation,
+		failSnapRemoveApplied: true,
+	}
+
+	_, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw,
+		"2.336.0", "vmlinux-6.1.155-ea1d42638d13", "7", importAt)
+	if err == nil {
+		t.Fatal("an import whose guest contract failed reported success")
+	}
+	if !strings.Contains(err.Error(), "snapshot has been withdrawn") {
+		t.Fatalf("an ambiguously successful removal was reported as still present: %v", err)
+	}
+	for _, key := range []string{KernelKey, RunnerVersionKey, GuestContractKey} {
+		if f.appliedMetadata[key+"."+generation] {
+			t.Errorf("withdrawal retained applied %s metadata after confirming snapshot absence", key)
+		}
+	}
+}
+
+func TestImportGenerationConfirmsRemovalAfterCallerAndRemovalDeadlinesExpire(t *testing.T) {
+	const generation = "g20260815041709"
+
+	ctx, cancel := context.WithCancel(t.Context())
+	raw, device := stageRaw(t, "content")
+	f := &importFake{
+		device:           device,
+		cancelMetaSetKey: RunnerVersionKey + "." + generation,
+		cancel:           cancel,
+		expireSnapRemove: true,
+	}
+	c := importClient(t, f)
+	c.wait = 20 * time.Millisecond
+
+	_, err := c.ImportGeneration(ctx, "ubuntu-2404-x64", raw,
+		"2.336.0", "vmlinux-6.1.155-ea1d42638d13", "7", importAt)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("metadata cancellation returned %v, want context cancellation", err)
+	}
+	if !strings.Contains(err.Error(), "snapshot has been withdrawn") {
+		t.Fatalf("absence was not confirmed after both earlier contexts expired: %v", err)
+	}
+	if !f.ranWith("snap", "ls", "ubuntu-2404-x64") {
+		t.Fatalf("rollback did not recheck the ambiguously removed snapshot; billet ran %v", f.calls)
+	}
+	for _, key := range []string{KernelKey, RunnerVersionKey} {
+		if f.appliedMetadata[key+"."+generation] {
+			t.Errorf("deadline recovery retained applied %s metadata", key)
+		}
+	}
+}
+
+func TestImportGenerationMetadataCleanupIsBestEffortAfterWithdrawal(t *testing.T) {
+	const generation = "g20260815041709"
+
+	raw, device := stageRaw(t, "content")
+	f := &importFake{
+		device:         device,
+		failMetaSetKey: RunnerVersionKey + "." + generation,
+		failMetaRemove: true,
+	}
+
+	_, err := importClient(t, f).ImportGeneration(t.Context(), "ubuntu-2404-x64", raw,
+		"2.336.0", "vmlinux-6.1.155-ea1d42638d13", "7", importAt)
+	if err == nil {
+		t.Fatal("an import with no runner version reported success")
+	}
+	if !strings.Contains(err.Error(), "runner version could not be recorded") ||
+		!strings.Contains(err.Error(), "snapshot has been withdrawn") {
+		t.Errorf("best-effort cleanup replaced the publication failure: %v", err)
+	}
+	if !f.ranWith("image-meta", "remove", KernelKey+"."+generation) {
+		t.Errorf("rollback never attempted the best-effort metadata cleanup; billet ran %v", f.calls)
+	}
+}
+
+func TestImportGenerationWithdrawsAfterMetadataCancellation(t *testing.T) {
+	const generation = "g20260815041709"
+
+	ctx, cancel := context.WithCancel(t.Context())
+	raw, device := stageRaw(t, "content")
+	f := &importFake{
+		device:           device,
+		cancelMetaSetKey: RunnerVersionKey + "." + generation,
+		cancel:           cancel,
+	}
+
+	_, err := importClient(t, f).ImportGeneration(ctx, "ubuntu-2404-x64", raw,
+		"2.336.0", "vmlinux-6.1.155-ea1d42638d13", "7", importAt)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("metadata cancellation returned %v, want context cancellation", err)
+	}
+	if !f.ranWith("snap", "rm", "ubuntu-2404-x64@"+generation) {
+		t.Fatalf("the cancelled import did not withdraw its snapshot; billet ran %v", f.calls)
+	}
+	for _, key := range []string{KernelKey, RunnerVersionKey} {
+		if f.appliedMetadata[key+"."+generation] {
+			t.Errorf("the cancelled import retained applied %s metadata", key)
+		}
 	}
 }

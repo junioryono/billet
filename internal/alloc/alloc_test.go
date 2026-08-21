@@ -200,6 +200,38 @@ func TestAllocatorReappliesInterceptionProviderSafety(t *testing.T) {
 	}
 }
 
+func TestAllocatorReappliesPoolAuthoritySafety(t *testing.T) {
+	t.Parallel()
+
+	for name, mutate := range map[string]func(*config.Tier){
+		"trusted default group": func(tier *config.Tier) {
+			tier.Trust = config.WorkloadTrusted
+			tier.Workflows = []string{"acme/api/.github/workflows/ci.yml@refs/heads/main"}
+		},
+		"untrusted interception": func(tier *config.Tier) {
+			tier.Trust = config.WorkloadUntrusted
+			tier.Intercept = true
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			db, err := state.Open(t.Context(), t.TempDir())
+			if err != nil {
+				t.Fatalf("state.Open: %v", err)
+			}
+			t.Cleanup(func() { _ = db.Close() })
+
+			unsafe := tier("unsafe-pool", 2, 4*config.GiB)
+			mutate(&unsafe)
+			if _, err := New(db, Limits{MaxVCPU: 2, MaxMemory: 4 * config.GiB},
+				[]config.Tier{unsafe}); err == nil {
+				t.Fatal("New accepted unsafe pool authority outside config.Load")
+			}
+		})
+	}
+}
+
 func TestReserveHoldsCapacity(t *testing.T) {
 	a := newAllocator(t,
 		Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB},

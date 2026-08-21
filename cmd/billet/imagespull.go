@@ -342,11 +342,11 @@ func stageImage(
 		// COPIED INTO PRIVATE STAGING WHILE BEING HASHED, rather than verified where
 		// they sit and read again later.
 		//
-		// verifyLocal hashes each asset BY PATH, and the import reopens it BY PATH
-		// some minutes later -- so whoever owns the directory can swap a file, or
-		// retarget a symlink, in between. The bytes that reach the cluster would then
-		// be bytes nothing checked, without anybody forging a signature. That is the
-		// same shape as verifying a download after renaming it, which the network
+		// The old verifier hashed each asset BY PATH, and the import reopened it BY
+		// PATH some minutes later -- so whoever owns the directory could swap a file,
+		// or retarget a symlink, in between. The bytes that reached the cluster would
+		// then be bytes nothing checked, without anybody forging a signature. That is
+		// the same shape as verifying a download after renaming it, which the network
 		// path is careful not to do.
 		//
 		// The copy is what makes the digest binding, so it is not an optimisation to
@@ -460,34 +460,6 @@ func resolveSource(cfg *config.Config, flagValue string) (imagesource.Source, er
 	}
 
 	return imagesource.DefaultSource(), nil
-}
-
-// verifyLocal checks a sideloaded directory against its manifest.
-//
-// THE SAME DIGESTS THE NETWORK PATH CHECKS. A file that arrived on a USB stick is
-// no more trustworthy than one that arrived over http — less, arguably, since
-// nothing about its journey is even in principle observable.
-func verifyLocal(dir string, manifest *imagesource.Manifest) error {
-	for _, asset := range []imagesource.Asset{manifest.Rootfs, manifest.Kernel} {
-		path := filepath.Join(dir, asset.Name)
-
-		info, err := os.Stat(path)
-		if err != nil {
-			return fmt.Errorf("billet images pull: the manifest names %s and it is not in %s: %w",
-				asset.Name, dir, err)
-		}
-
-		if info.Size() != asset.Size {
-			return fmt.Errorf("billet images pull: %s is %d bytes and the manifest says %d",
-				asset.Name, info.Size(), asset.Size)
-		}
-
-		if err := imagesource.VerifyFile(path, asset.SHA256); err != nil {
-			return err
-		}
-	}
-
-	return nil
 }
 
 // unpackRootfs decompresses the root filesystem if it is packed.

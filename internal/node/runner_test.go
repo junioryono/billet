@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"slices"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -27,8 +28,8 @@ const (
 	testNodeMemory = 1 << 20 * config.GiB
 )
 
-// A launch mints a registration and hands it to the provider, with the tier's
-// shape and the job's trust class.
+// A launch mints a registration and hands it to the provider with the tier's
+// static pool authority.
 func TestLaunchMintsARegistrationAndStartsIt(t *testing.T) {
 	p := &fakeProvider{kind: config.ProviderDocker}
 
@@ -56,9 +57,30 @@ func TestLaunchMintsARegistrationAndStartsIt(t *testing.T) {
 		t.Errorf("the tier's shape did not reach the provider: %+v", spec)
 	}
 
-	// A push is repository code, so it is trusted and a container may run it.
+	// The pool is trusted, so its event does not reclassify the registration after
+	// GitHub has already been allowed to assign it any job in the scale set.
 	if spec.Trust != provider.TrustTrusted {
-		t.Errorf("a push was classified %s", spec.Trust)
+		t.Errorf("trusted pool launched as %s", spec.Trust)
+	}
+}
+
+func TestPoolTrustOutranksTheAssignmentEvent(t *testing.T) {
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
+	if err := r.Launch(t.Context(), assignedLease(t, a), dockerSpec(),
+		Job{RequestID: 11, Event: "pull_request"}); err != nil {
+		t.Fatalf("a trusted pool was reclassified from its assignment event: %v", err)
+	}
+	if got := p.launched[0].Trust; got != provider.TrustTrusted {
+		t.Fatalf("launch trust = %s, want trusted pool policy", got)
+	}
+
+	untrusted := dockerSpec()
+	untrusted.Trust = config.WorkloadUntrusted
+	if err := r.Launch(t.Context(), assignedLease(t, a), untrusted,
+		Job{RequestID: 12, Event: "push"}); err == nil {
+		t.Fatal("an untrusted pool gained Docker authority from a push event")
 	}
 }
 
@@ -97,37 +119,6 @@ func TestTheRunnerIsNamedAfterItsLease(t *testing.T) {
 	for _, name := range jit.names {
 		if !strings.HasPrefix(name, "billet-") || len(name) <= len("billet-") {
 			t.Errorf("runner name %q does not identify a lease", name)
-		}
-	}
-}
-
-// A pull request is UNTRUSTED, and a container refuses it.
-//
-// Not caution for its own sake: a scale-set message carries the event and the
-// repository but does NOT say whether a pull request came from a fork. billet
-// cannot tell a teammate's PR from a stranger's, and those differ by whether
-// arbitrary outside code is about to run on the host. Given it cannot tell, it
-// assumes the worse one.
-func TestPullRequestsAreUntrustedBecauseForkStatusIsUnknowable(t *testing.T) {
-	for _, event := range []string{"pull_request", "pull_request_target"} {
-		t.Run(event, func(t *testing.T) {
-			if got := provider.Classify(event); got != provider.TrustUntrusted {
-				t.Errorf("%s classified as %s; billet cannot tell a fork PR from a same-repo "+
-					"one, so it must assume the worse", event, got)
-			}
-		})
-	}
-}
-
-// An event billet does not recognise is UNKNOWN, not trusted.
-//
-// GitHub adds events. A new one must not inherit permission from a switch
-// statement written before it existed.
-func TestUnrecognisedEventsAreNotTrusted(t *testing.T) {
-	for _, event := range []string{"", "some_future_event", "PUSH"} {
-		if got := provider.Classify(event); got == provider.TrustTrusted {
-			t.Errorf("event %q was trusted by default; a backend sharing the host kernel "+
-				"would accept it", event)
 		}
 	}
 }
@@ -746,6 +737,90 @@ func TestAnAmbiguousLaunchCarriesItsPositiveObservationIntoCustody(t *testing.T)
 	}
 }
 
+func TestFailedLaunchRemovesRegistrationBeforeComputeCleanup(t *testing.T) {
+	p := &fakeProvider{
+		kind: config.ProviderDocker, launchErr: errors.New("lost launch response"),
+		startsAnyway: true,
+	}
+	a, host := newAllocatorWithHost(t)
+	jit := &fakeJIT{setID: 7, removeErr: errors.New("github unavailable")}
+	r := New(a, host, jit, p, nil)
+	lease := assignedLease(t, a)
+	name := provider.InstanceName(lease.ID)
+
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 18, Event: "push"}); !errors.Is(err, server.ErrCustody) {
+		t.Fatalf("Launch = %v, want ErrCustody", err)
+	}
+	if len(jit.removed) != 1 || jit.removed[0] != name {
+		t.Fatalf("registration removals = %v, want %q", jit.removed, name)
+	}
+	if len(p.destroyed) != 0 || p.live[name] == nil {
+		t.Fatalf("provider was touched before deregistration: destroyed %v live %+v", p.destroyed, p.live)
+	}
+	held := r.custodySnapshot()
+	if len(held) != 1 || !held[0].registrationPending {
+		t.Fatalf("registration custody = %+v", held)
+	}
+
+	jit.removeErr = nil
+	if err := r.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend after GitHub recovered: %v", err)
+	}
+	if len(jit.removed) != 2 || len(p.destroyed) != 1 || p.destroyed[0] != "instance-"+name {
+		t.Fatalf("retry order did not settle registration then compute: removals %v destroys %v",
+			jit.removed, p.destroyed)
+	}
+	if len(r.custodySnapshot()) != 0 {
+		t.Fatal("settled failed launch remains in custody")
+	}
+}
+
+func TestRestartedFailedLaunchRemovesDurableRegistrationBeforeCompute(t *testing.T) {
+	p := &fakeProvider{
+		kind: config.ProviderDocker, launchErr: errors.New("lost launch response"),
+		startsAnyway: true,
+	}
+	a, host := newAllocatorWithHost(t)
+	firstJIT := &fakeJIT{setID: 7, removeErr: errors.New("github unavailable")}
+	first := New(a, host, firstJIT, p, nil)
+	lease := assignedLease(t, a)
+	name := provider.InstanceName(lease.ID)
+
+	if err := first.Launch(t.Context(), lease, dockerSpec(), Job{
+		RequestID: lease.RequestID, Event: "push",
+	}); !errors.Is(err, server.ErrCustody) {
+		t.Fatalf("Launch = %v, want ErrCustody", err)
+	}
+
+	restartedJIT := &durableFakeJIT{
+		fakeJIT: &fakeJIT{setID: 7}, ensureErr: errors.New("github still unavailable"),
+	}
+	restarted := New(a, host, restartedJIT, p, nil)
+	if err := restarted.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	if err := restarted.Destroy(t.Context(), lease.RequestID); !errors.Is(err, server.ErrCustody) {
+		t.Fatalf("Destroy = %v, want ErrCustody while deregistration is unavailable", err)
+	}
+	if len(p.destroyed) != 0 || p.live[name] == nil {
+		t.Fatalf("compute changed before durable deregistration: destroyed %v live %+v",
+			p.destroyed, p.live)
+	}
+	if !slices.Equal(restartedJIT.ensureCalls, []string{lease.ID}) {
+		t.Fatalf("durable removal attempts = %v, want lease %s", restartedJIT.ensureCalls, lease.ID)
+	}
+
+	restartedJIT.ensureErr = nil
+	if err := restarted.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend after GitHub recovered: %v", err)
+	}
+	if !slices.Equal(restartedJIT.ensureCalls, []string{lease.ID, lease.ID}) ||
+		len(p.destroyed) != 1 {
+		t.Fatalf("recovered order: removals %v destroys %v",
+			restartedJIT.ensureCalls, p.destroyed)
+	}
+}
+
 // A held teardown is visible in the ledger, and a force release is delivered to
 // the live node through its heartbeat. The node drops custody before the lease
 // becomes terminal; it does not need a working provider read after an operator
@@ -1080,7 +1155,9 @@ func dockerSpec() *nodeapi.TierSpec {
 func dockerTier() config.Tier {
 	return config.Tier{
 		Label: "billet-2vcpu", Provider: config.ProviderDocker, GuestOS: config.GuestLinux,
-		VCPU: 2, Memory: 8 * config.GiB, Image: "ubuntu-2404-x64",
+		Trust: config.WorkloadTrusted, RunnerGroup: "trusted",
+		Workflows: []string{"acme/api/.github/workflows/ci.yml@refs/heads/main"},
+		VCPU:      2, Memory: 8 * config.GiB, Image: "ubuntu-2404-x64",
 	}
 }
 
@@ -1100,12 +1177,18 @@ type fakeJIT struct {
 	// describes counts scale-set resolutions, so a test can tell a cached answer
 	// from a fresh one.
 	describes int
+	removed   []string
+	removeErr error
 }
 
 func (f *fakeJIT) Describe(context.Context, string, string) (*Set, []string, error) {
 	f.describes++
 
 	return &Set{ID: f.setID, Name: "billet-2vcpu"}, nil, nil
+}
+
+func (f *fakeJIT) ValidateTrustedRunnerGroup(context.Context, string, []string) error {
+	return nil
 }
 
 func (f *fakeJIT) JITConfig(_ context.Context, _ int, name, _ string) (Registration, error) {
@@ -1122,10 +1205,29 @@ func (f *fakeJIT) JITConfig(_ context.Context, _ int, name, _ string) (Registrat
 	return fakeRegistration{name: name}, nil
 }
 
+func (f *fakeJIT) RemoveRunner(_ context.Context, _ string, _ int64, name string) error {
+	f.removed = append(f.removed, name)
+	return f.removeErr
+}
+
+func (*fakeJIT) EnsureRunnerRemoved(context.Context, string) error { return nil }
+
+type durableFakeJIT struct {
+	*fakeJIT
+	ensureErr   error
+	ensureCalls []string
+}
+
+func (f *durableFakeJIT) EnsureRunnerRemoved(_ context.Context, leaseID string) error {
+	f.ensureCalls = append(f.ensureCalls, leaseID)
+	return f.ensureErr
+}
+
 type fakeRegistration struct{ name string }
 
 func (f fakeRegistration) Config() string     { return "encoded-" + f.name }
 func (f fakeRegistration) RunnerName() string { return f.name }
+func (f fakeRegistration) ID() int64          { return 71 }
 
 type fakeProvider struct {
 	kind       config.ProviderKind

@@ -230,15 +230,8 @@ func (c *Client) Reap( //nolint:nonamedreturns // the deferred release reports t
 		// pairing behind -- and the kernel reaper reads exactly those keys to decide
 		// what is still needed. A dead generation's key would have kept its kernel
 		// alive forever, which is the opposite of what reaping is for.
-		for _, key := range []string{
-			VerifiedKey + "." + gen.Name,
-			RunnerVersionKey + "." + gen.Name,
-			KernelKey + "." + gen.Name,
-			GuestContractKey + "." + gen.Name,
-		} {
-			//nolint:errcheck // the generation is already gone; a stale key is not worth failing on
-			_, _ = c.rbdCmd(ctx, false, "-p", c.cfg.ImagePool, "image-meta", "remove", name, key)
-		}
+		c.removeGenerationMetadata(ctx, name, gen.Name,
+			VerifiedKey, RunnerVersionKey, KernelKey, GuestContractKey)
 
 		removed = append(removed, gen.Name)
 	}

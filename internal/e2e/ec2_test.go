@@ -268,6 +268,7 @@ type cloudRegistration struct{ name string }
 
 func (r cloudRegistration) Config() string     { return "jit-for-" + r.name }
 func (r cloudRegistration) RunnerName() string { return r.name }
+func (r cloudRegistration) ID() int64          { return 71 }
 
 func (*cloudJIT) Describe(context.Context, string, string) (*node.Set, []string, error) {
 	return &node.Set{ID: 7, Name: ec2Tier}, nil, nil
@@ -282,6 +283,10 @@ func (j *cloudJIT) JITConfig(
 
 	return cloudRegistration{name: runnerName}, nil
 }
+
+func (*cloudJIT) ValidateTrustedRunnerGroup(context.Context, string, []string) error { return nil }
+func (*cloudJIT) RemoveRunner(context.Context, string, int64, string) error          { return nil }
+func (*cloudJIT) EnsureRunnerRemoved(context.Context, string) error                  { return nil }
 
 // cloudStack is a control-plane ledger and a node runtime over the cloud backend.
 type cloudStack struct {
@@ -311,6 +316,11 @@ func newCloudStack(t *testing.T) *cloudStack {
 		Image:    "ami-cloud",
 		GuestOS:  config.GuestLinux,
 		Command:  []string{"./run.sh"},
+		Trust:    config.WorkloadTrusted,
+		Workflows: []string{
+			"acme/cloud/.github/workflows/ci.yml@refs/heads/main",
+		},
+		RunnerGroup: "trusted",
 	}
 
 	a, err := alloc.New(db, alloc.Limits{MaxVCPU: 64, MaxMemory: 256 * config.GiB},
@@ -533,6 +543,7 @@ func TestACloudNodeRefusesALeaseItWasNotPlacedFor(t *testing.T) {
 // work does not run. This asserts the whole path refuses, not just Accepts.
 func TestUntrustedWorkDoesNotReachTheCloudWithoutItsOwnNetwork(t *testing.T) {
 	s := newCloudStack(t)
+	s.tier.Trust = config.WorkloadUntrusted
 
 	lease := s.assignedLease(t)
 

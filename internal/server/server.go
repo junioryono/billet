@@ -32,6 +32,11 @@ type Provisioner interface {
 	EnsureScaleSet(ctx context.Context, name, group string, labels []string) (*ScaleSet, error)
 	// Session opens a long-poll session on one scale set.
 	Session(ctx context.Context, scaleSetID int, owner string) (Session, error)
+	RunnerRegistry
+}
+
+type trustedRunnerGroupValidator interface {
+	ValidateTrustedRunnerGroup(context.Context, string, []string) error
 }
 
 // Server is billet's control plane: one listener per tier, one shared capacity
@@ -204,6 +209,15 @@ func (s *Server) Run(ctx context.Context) error {
 
 	for i := range s.tiers {
 		t := &s.tiers[i]
+		if t.Trust == config.WorkloadTrusted {
+			validator, ok := s.prov.(trustedRunnerGroupValidator)
+			if !ok {
+				return fmt.Errorf("server: tier %s is trusted, but its provisioner cannot verify runner-group policy", t.Label)
+			}
+			if err := validator.ValidateTrustedRunnerGroup(ctx, t.RunnerGroup, t.Workflows); err != nil {
+				return fmt.Errorf("server: refuse trusted tier %s: %w", t.Label, err)
+			}
+		}
 
 		set, err := s.prov.EnsureScaleSet(ctx, t.Label, t.RunnerGroup, []string{t.Label})
 		if err != nil {
@@ -317,6 +331,9 @@ func (s *Server) listenerOpts() []Option {
 
 	if s.runner != nil {
 		opts = append(opts, WithRunner(s.runner))
+	}
+	if s.prov != nil {
+		opts = append(opts, WithRunnerRegistry(s.prov))
 	}
 	if s.completionStore != nil {
 		opts = append(opts, WithCompletionStore(s.completionStore))

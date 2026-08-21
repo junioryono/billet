@@ -19,7 +19,12 @@ import (
 )
 
 const (
-	cacheIndexName       = ".cache-index"
+	cacheIndexName = ".cache-index"
+	// CacheLockStaleAfter bounds recovery from a cache-index holder that dies.
+	// Ten minutes spans twenty heartbeat intervals and is far past the ordinary
+	// metadata critical sections. A holder older than this is still never broken
+	// while its heartbeat moves, including a longer eviction pass.
+	CacheLockStaleAfter  = 10 * time.Minute
 	cacheVolumeTTL       = 7 * time.Hour
 	cacheMetaPrefix      = "billet.cache."
 	filesystemProbeLimit = 8 << 10
@@ -197,7 +202,7 @@ func (c *Client) withCacheLock(ctx context.Context, now time.Time, fn func() err
 	if err != nil {
 		return err
 	}
-	lock, err := c.takeLock(ctx, c.cacheIndex(), cookie, now)
+	lock, err := c.takeLock(ctx, c.cacheIndex(), cookie, now, CacheLockStaleAfter)
 	if err != nil {
 		return fmt.Errorf("ceph: take the cache index lock: %w", err)
 	}

@@ -109,7 +109,7 @@ func TestAJobRunsAndIsCleanedUp(t *testing.T) {
 // to consume it is an orphan on GitHub that billet will never clean up — one per
 // pull request, accumulating quietly.
 func TestAPullRequestIsRefusedBeforeAnythingIsMinted(t *testing.T) {
-	s := newStack(t)
+	s := newStack(t, untrustedPool)
 
 	s.plane.queue(fakeactions.StatisticsJSON(1, 0),
 		fakeactions.JobJSON("JobAvailable", 4002, "pull_request", testTier))
@@ -164,7 +164,7 @@ func TestAPullRequestIsRefusedBeforeAnythingIsMinted(t *testing.T) {
 // escrow it is holding to offer GitHub is indistinguishable from a leak in an
 // aggregate. Draining the budget is what tells the two apart.
 func TestRefusedWorkReturnsItsCapacity(t *testing.T) {
-	s := newStack(t)
+	s := newStack(t, untrustedPool)
 
 	stop := s.run(t)
 	defer stop()

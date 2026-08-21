@@ -264,6 +264,8 @@ func (stubJIT) JITConfig(context.Context, int, string, string) (nodeplane.JITReg
 	return nil, errors.New("no github in this test")
 }
 
+func (stubJIT) RemoveRunner(context.Context, int64, string) error { return nil }
+
 type stubStore struct{}
 
 func (stubStore) Bind(context.Context, string, int64, string) error         { return nil }

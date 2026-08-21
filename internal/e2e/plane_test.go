@@ -74,7 +74,8 @@ type plane struct {
 	// service reported the set as already present on the very first GET, so
 	// billet correctly ADOPTED it and never issued a create — and a test asserting
 	// on the create body was asserting on nothing.
-	exists bool
+	exists           bool
+	registeredRunner string
 }
 
 const (
@@ -109,13 +110,36 @@ func (p *plane) route(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case strings.Contains(path, "runnergroups"):
 		fakeactions.WriteJSON(p.t, w, fakeactions.ListJSON(
-			map[string]any{"id": 1, "name": testGroup}))
+			map[string]any{"id": 1, "name": testGroup, "isDefaultGroup": false}))
+
+	case strings.Contains(path, "/actions/runner-groups/1"):
+		fakeactions.WriteJSON(p.t, w, map[string]any{
+			"restricted_to_workflows": true,
+			"selected_workflows":      []string{"acme/test/.github/workflows/e2e.yml@refs/heads/main"},
+		})
 
 	case strings.Contains(path, "acquirejobs"):
 		p.acquireJobs(w, r)
 
 	case strings.Contains(path, "generatejitconfig"):
 		p.generateJIT(w, r)
+
+	case r.Method == http.MethodGet && strings.Contains(path, "/agents"):
+		p.mu.Lock()
+		name := p.registeredRunner
+		p.mu.Unlock()
+		if name == "" || r.URL.Query().Get("agentName") != name {
+			fakeactions.WriteJSON(p.t, w, map[string]any{"count": 0, "value": []any{}})
+			return
+		}
+		fakeactions.WriteJSON(p.t, w, map[string]any{"count": 1,
+			"value": []map[string]any{{"id": 99, "name": name}}})
+
+	case r.Method == http.MethodDelete && strings.Contains(path, "/agents/99"):
+		p.mu.Lock()
+		p.registeredRunner = ""
+		p.mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
 
 	case strings.HasSuffix(path, "/sessions"):
 		fakeactions.WriteJSON(p.t, w, fakeactions.SessionJSON(
@@ -254,6 +278,9 @@ func (p *plane) generateJIT(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		p.t.Errorf("decode jit request: %v", err)
 	}
+	p.mu.Lock()
+	p.registeredRunner = req.Name
+	p.mu.Unlock()
 
 	fakeactions.WriteJSON(p.t, w, fakeactions.JitConfigJSON(99, req.Name, "encoded-jit-config"))
 }
@@ -304,10 +331,10 @@ type stack struct {
 	node     string
 }
 
-func newStack(t *testing.T) *stack {
+func newStack(t *testing.T, opts ...stackOpt) *stack {
 	t.Helper()
 
-	return newStackIn(t, t.TempDir(), newPlane(t))
+	return newStackIn(t, t.TempDir(), newPlane(t), opts...)
 }
 
 // newWireStack builds the same stack with the node REACHED OVER THE WIRE.
@@ -329,7 +356,10 @@ func newWireStack(t *testing.T) *stack {
 // stackOpt varies how a stack is assembled.
 type stackOpt func(*stackConfig)
 
-type stackConfig struct{ wire bool }
+type stackConfig struct {
+	wire      bool
+	untrusted bool
+}
 
 // directRunner drives the node runtime without a socket between it and the
 // control plane.
@@ -366,6 +396,10 @@ func (d directRunner) KeepAlive(ctx context.Context)   { d.runner.KeepAlive(ctx)
 // overTheWire puts a real node wire between the control plane and the runner.
 func overTheWire(c *stackConfig) { c.wire = true }
 
+// untrustedPool makes a test tier model a pool where any admitted workflow may
+// be hostile. Docker then has to refuse it before a registration is minted.
+func untrustedPool(c *stackConfig) { c.untrusted = true }
+
 // newStackIn builds a stack over a GIVEN state directory and service.
 //
 // Restarting billet is exactly this: a new process over the same state and the
@@ -390,6 +424,9 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 		ClientID:       "12345",
 		InstallationID: 67890,
 		PrivateKey:     p.PrivateKeyPEM(),
+		Org:            "acme",
+		AppID:          12345,
+		APIURL:         p.URL + "/api/v3",
 	}, nil)
 	if err != nil {
 		t.Fatalf("scaleset.New: %v", err)
@@ -413,6 +450,8 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 		Image:       testImage,
 		RunnerGroup: testGroup,
 		GuestOS:     config.GuestLinux,
+		Trust:       config.WorkloadTrusted,
+		Workflows:   []string{"acme/test/.github/workflows/e2e.yml@refs/heads/main"},
 
 		// SAID EXPLICITLY, because this is not a runner image. These tests are
 		// about the plane's lifecycle — a container that starts, stays up, and is
@@ -422,6 +461,10 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 		// reason that has nothing to do with what is being tested.
 		Command: []string{"sleep", "300"},
 	}}
+	if sc.untrusted {
+		tiers[0].Trust = config.WorkloadUntrusted
+		tiers[0].Workflows = nil
+	}
 
 	a, err := alloc.New(db, alloc.Limits{MaxVCPU: 8, MaxMemory: 16 * config.GiB}, tiers)
 	if err != nil {
@@ -494,7 +537,7 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 	if sc.wire {
 		runner, serverOpts = wireUp(t, log, a, client, prov, tiers, deployment, computeName)
 	} else {
-		runner = node.New(a, host, wiring.JITSource{Client: client}, prov, log)
+		runner = node.New(a, host, wiring.JITSource{Client: client, Pool: a}, prov, log)
 		serverOpts = []server.ControlPlaneOption{
 			server.WithNodeRunner(directRunner{runner: runner, tiers: tiers}),
 		}

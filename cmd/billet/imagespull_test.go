@@ -251,14 +251,14 @@ func stageDir(t *testing.T, rootfs, kernel []byte) (string, *imagesource.Manifes
 	return dir, m
 }
 
-// A FILE THAT ARRIVED ON A USB STICK IS NO MORE TRUSTWORTHY than one that arrived
-// over http -- less, arguably, since nothing about its journey is even in
-// principle observable.
+// Historical name retained so the test-deletion gate can prove the old verifier's
+// digest case moved onto the copy that production actually imports.
 func TestVerifyLocalChecksTheSameDigestsTheNetworkPathDoes(t *testing.T) {
 	dir, m := stageDir(t, []byte("a root filesystem"), []byte("a kernel"))
+	src := filepath.Join(dir, m.Rootfs.Name)
 
-	if err := verifyLocal(dir, m); err != nil {
-		t.Fatalf("a correctly staged directory was refused: %v", err)
+	if err := copyVerified(src, filepath.Join(dir, "first-copy.img"), m.Rootfs); err != nil {
+		t.Fatalf("a correctly staged asset was refused: %v", err)
 	}
 
 	// Substituted content, correct length: only the digest catches this.
@@ -267,7 +267,7 @@ func TestVerifyLocalChecksTheSameDigestsTheNetworkPathDoes(t *testing.T) {
 		t.Fatalf("rewrite: %v", err)
 	}
 
-	err := verifyLocal(dir, m)
+	err := copyVerified(src, filepath.Join(dir, "second-copy.img"), m.Rootfs)
 	if err == nil {
 		t.Fatal("content substituted at the same length was accepted; the size check alone " +
 			"cannot catch it and the digest is the only thing that can")
@@ -285,7 +285,8 @@ func TestVerifyLocalReportsAMissingAsset(t *testing.T) {
 		t.Fatalf("remove: %v", err)
 	}
 
-	err := verifyLocal(dir, m)
+	err := copyVerified(filepath.Join(dir, m.Kernel.Name),
+		filepath.Join(dir, "staged-kernel"), m.Kernel)
 	if err == nil {
 		t.Fatal("a directory missing an asset was accepted")
 	}
@@ -303,7 +304,8 @@ func TestVerifyLocalReportsAWrongSize(t *testing.T) {
 		t.Fatalf("rewrite: %v", err)
 	}
 
-	if err := verifyLocal(dir, m); err == nil {
+	if err := copyVerified(filepath.Join(dir, m.Rootfs.Name),
+		filepath.Join(dir, "staged-rootfs"), m.Rootfs); err == nil {
 		t.Fatal("an asset of the wrong size was accepted")
 	}
 }
@@ -573,8 +575,8 @@ func TestInstallKernelAcceptsAnExistingFileThatMatches(t *testing.T) {
 
 // THE COPY IS WHAT MAKES THE DIGEST BINDING.
 //
-// verifyLocal hashed each asset BY PATH and the import reopened it BY PATH some
-// minutes later, so whoever owns a sideload directory could swap a file in
+// The old verifier hashed each asset BY PATH and the import reopened it BY PATH
+// some minutes later, so whoever owns a sideload directory could swap a file in
 // between and the bytes reaching the cluster would be bytes nothing checked --
 // without forging a signature. Copying while hashing closes that, because the
 // copy is what the import reads and nothing else can reach it.

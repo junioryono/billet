@@ -1365,6 +1365,8 @@ func newScaleSetClient(cfg *config.Config) (*scaleset.Client, error) {
 		ClientID:       appIdentity,
 		InstallationID: cfg.GitHub.InstallationID,
 		PrivateKey:     string(key),
+		Org:            cfg.GitHub.Org,
+		AppID:          cfg.GitHub.AppID,
 	}, slog.Default())
 }
 
