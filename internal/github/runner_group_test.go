@@ -143,8 +143,8 @@ func TestRunnerRecoveryPreservesOnlyAnExactBusyEphemeralRunner(t *testing.T) {
 				if got := r.Header.Get("Authorization"); got != "Bearer cached-token" {
 					t.Errorf("Authorization = %q", got)
 				}
-				if got := r.Header.Get("X-GitHub-Api-Version"); got != apiVersion {
-					t.Errorf("X-GitHub-Api-Version = %q, want %q", got, apiVersion)
+				if got := r.Header.Get("X-Github-Api-Version"); got != apiVersion {
+					t.Errorf("X-Github-Api-Version = %q, want %q", got, apiVersion)
 				}
 				if tc.status != 0 {
 					w.WriteHeader(tc.status)
