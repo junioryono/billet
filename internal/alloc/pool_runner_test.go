@@ -75,6 +75,99 @@ func TestOnlyIdlePoolMembersAreScaleDownCandidates(t *testing.T) {
 	}
 }
 
+func TestRecoveredBusyPoolRunnerYieldsToAuthoritativeJobStarted(t *testing.T) {
+	a := newAllocator(t, Limits{MaxVCPU: 2, MaxMemory: 4 * config.GiB},
+		[]config.Tier{tier("linux", 2, 4*config.GiB)})
+	lease := reserve(t, a, "linux")
+	if err := a.Assign(t.Context(), lease.ID, lease.Epoch, 101, 11); err != nil {
+		t.Fatalf("Assign: %v", err)
+	}
+	name := "billet-" + lease.ID
+	if err := a.PreserveRecoveredBusyPoolRunner(t.Context(), PoolRunner{
+		LeaseID: lease.ID, Tier: "linux", LaunchRequestID: 11,
+		RunnerID: 71, RunnerName: name,
+	}); err != nil {
+		t.Fatalf("PreserveRecoveredBusyPoolRunner: %v", err)
+	}
+	started, err := a.StartPoolRunner(t.Context(), lease.ID, "linux", 71, name,
+		22, 202, "actual-job")
+	if err != nil {
+		t.Fatalf("StartPoolRunner: %v", err)
+	}
+	if started.ActualRequestID != 22 || started.RunID != 202 || started.JobID != "actual-job" {
+		t.Fatalf("started recovered binding = %+v", started)
+	}
+	settled, err := a.RetireRecoveredPoolRunner(t.Context(), PoolRunner{
+		LeaseID: lease.ID, Tier: "linux", LaunchRequestID: 11,
+		RunnerID: 71, RunnerName: name,
+	})
+	if err != nil {
+		t.Fatalf("RetireRecoveredPoolRunner: %v", err)
+	}
+	if settled.Status != PoolRunnerBusy || settled.ActualRequestID != 22 {
+		t.Fatalf("recovery retired an authoritative started binding: %+v", settled)
+	}
+}
+
+func TestRecoveredPlaceholderCanRetireAfterGitHubStopsReportingBusy(t *testing.T) {
+	a := newAllocator(t, Limits{MaxVCPU: 2, MaxMemory: 4 * config.GiB},
+		[]config.Tier{tier("linux", 2, 4*config.GiB)})
+	lease := reserve(t, a, "linux")
+	if err := a.Assign(t.Context(), lease.ID, lease.Epoch, 101, 11); err != nil {
+		t.Fatalf("Assign: %v", err)
+	}
+	if err := a.PreserveRecoveredBusyPoolRunner(t.Context(), PoolRunner{
+		LeaseID: lease.ID, Tier: "linux", LaunchRequestID: 11,
+		RunnerID: 71, RunnerName: "billet-" + lease.ID,
+	}); err != nil {
+		t.Fatalf("PreserveRecoveredBusyPoolRunner: %v", err)
+	}
+	settled, err := a.RetireRecoveredPoolRunner(t.Context(), PoolRunner{
+		LeaseID: lease.ID, Tier: "linux", LaunchRequestID: 11,
+		RunnerID: 71, RunnerName: "billet-" + lease.ID,
+	})
+	if err != nil {
+		t.Fatalf("RetireRecoveredPoolRunner: %v", err)
+	}
+	if settled.Status != PoolRunnerRetiring {
+		t.Fatalf("recovered placeholder status = %q, want retiring", settled.Status)
+	}
+}
+
+func TestRecoveredRetirementFencesALateLegacyJobStarted(t *testing.T) {
+	a := newAllocator(t, Limits{MaxVCPU: 2, MaxMemory: 4 * config.GiB},
+		[]config.Tier{tier("linux", 2, 4*config.GiB)})
+	lease := reserve(t, a, "linux")
+	if err := a.Assign(t.Context(), lease.ID, lease.Epoch, 101, 11); err != nil {
+		t.Fatalf("Assign: %v", err)
+	}
+	name := "billet-" + lease.ID
+	retired, err := a.RetireRecoveredPoolRunner(t.Context(), PoolRunner{
+		LeaseID: lease.ID, Tier: "linux", LaunchRequestID: 11, RunnerName: name,
+	})
+	if err != nil {
+		t.Fatalf("RetireRecoveredPoolRunner: %v", err)
+	}
+	if retired.Status != PoolRunnerRetiring || retired.RunnerID != 0 {
+		t.Fatalf("recovery fence = %+v", retired)
+	}
+
+	// The delayed JobStarted path first registers the legacy name, then binds its
+	// actual job. Registration is idempotent against the fence; binding must lose.
+	if err := a.RegisterPoolRunner(t.Context(), PoolRunner{LeaseID: lease.ID, Tier: "linux",
+		LaunchRequestID: 11, RunnerName: name}); err != nil {
+		t.Fatalf("late legacy registration: %v", err)
+	}
+	if _, err := a.StartPoolRunner(t.Context(), lease.ID, "linux", 71, name,
+		22, 202, "late-job"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("late JobStarted crossed recovery fence: %v", err)
+	}
+	got, err := a.PoolRunnerByLease(t.Context(), lease.ID)
+	if err != nil || got.Status != PoolRunnerRetiring {
+		t.Fatalf("late JobStarted changed recovery fence: %+v, err %v", got, err)
+	}
+}
+
 func TestSettledPoolIdentitySurvivesUntilSourceAcknowledgement(t *testing.T) {
 	a := newAllocator(t, Limits{MaxVCPU: 2, MaxMemory: 4 * config.GiB},
 		[]config.Tier{tier("linux", 2, 4*config.GiB)})

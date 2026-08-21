@@ -47,14 +47,16 @@ type custody struct {
 	// completion handler returns without releasing anything, and nothing else
 	// ever connects the message to the compute.
 	requestID int64
+	tier      string
 
 	// registrationPending keeps provider teardown behind GitHub deregistration.
 	// A failed launch can leave both a routing identity and ambiguous compute;
 	// removing the latter first lets GitHub assign work to an orphaned runner.
-	registrationPending bool
-	registrationRemoved bool
-	runnerID            int64
-	runnerName          string
+	registrationPending   bool
+	registrationRemoved   bool
+	runnerID              int64
+	runnerName            string
+	runnerRecoveryPending bool
 
 	// outcome is how the lease should be recorded once its compute is gone. A
 	// discarded entry is a launch that FAILED, and writing "done" into the
@@ -140,14 +142,14 @@ type custodyEvidence struct {
 
 // adopt takes custody of an instance that survived a restart.
 func (r *Runner) adopt(lease *alloc.Lease, inst *provider.Instance) {
-	r.adoptWithObservation(lease, inst, true)
+	r.adoptWithObservation(lease, inst, true, RunnerRecoveryTracked)
 }
 
 // adoptWithObservation records whether the caller has causal evidence that the
 // instance exists. Provider inventory supplies it everywhere; a successful
 // Launch supplies it only for a host backend whose runtime is locally consistent.
 func (r *Runner) adoptWithObservation(
-	lease *alloc.Lease, inst *provider.Instance, observed bool,
+	lease *alloc.Lease, inst *provider.Instance, observed bool, recovery RunnerRecovery,
 ) {
 	outcome := alloc.PhaseDone
 	discard := false
@@ -157,6 +159,13 @@ func (r *Runner) adoptWithObservation(
 		discard = true
 		phase = alloc.PhaseTeardown
 	}
+	if lease.Phase == alloc.PhaseQuarantine {
+		phase = ""
+	}
+	if recovery == RunnerRecoveryRetired {
+		outcome = alloc.PhaseFailed
+		discard = true
+	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -164,14 +173,17 @@ func (r *Runner) adoptWithObservation(
 	entry := &custody{
 		leaseID: lease.ID,
 
-		name:      inst.Name,
-		instance:  inst.ID,
-		requestID: lease.RequestID,
-		outcome:   outcome,
-		phase:     phase,
-		discard:   discard,
-		observed:  observed,
-		since:     r.now(),
+		name:                  inst.Name,
+		instance:              inst.ID,
+		requestID:             lease.RequestID,
+		tier:                  lease.Tier,
+		outcome:               outcome,
+		phase:                 phase,
+		discard:               discard,
+		observed:              observed,
+		registrationRemoved:   recovery == RunnerRecoveryRetired,
+		runnerRecoveryPending: recovery == RunnerRecoveryBusy,
+		since:                 r.now(),
 	}
 	entry.epoch.Store(lease.Epoch)
 
@@ -554,6 +566,32 @@ func (r *Runner) tendOne(ctx context.Context, c *custody) error {
 	if heartbeatOK && c.phase != "" {
 		if err := r.alloc.Advance(ctx, c.leaseID, c.epoch.Load(), c.phase); err != nil {
 			return fmt.Errorf("node: report %s for held lease %s: %w", c.phase, c.leaseID, err)
+		}
+	}
+
+	if c.runnerRecoveryPending {
+		if c.discard {
+			c.runnerRecoveryPending = false
+		} else {
+			recovery, err := r.jit.RecoverRunner(ctx, c.leaseID, c.tier, c.requestID, c.name)
+			if err != nil {
+				return fmt.Errorf("node: recheck recovered runner for lease %s: %w", c.leaseID, err)
+			}
+			switch recovery {
+			case RunnerRecoveryBusy:
+				// GitHub's busy bit outranks a contradictory provider snapshot.
+				return nil
+			case RunnerRecoveryTracked:
+				c.runnerRecoveryPending = false
+			case RunnerRecoveryRetired:
+				c.runnerRecoveryPending = false
+				c.registrationRemoved = true
+				c.discard = true
+				c.outcome = alloc.PhaseFailed
+			default:
+				return fmt.Errorf("node: recheck recovered runner for lease %s: unknown disposition %q",
+					c.leaseID, recovery)
+			}
 		}
 	}
 
