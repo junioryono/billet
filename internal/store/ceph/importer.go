@@ -193,6 +193,7 @@ func (c *Client) ImportGeneration( //nolint:nonamedreturns // the deferred unmap
 		image+"@"+generation); err != nil {
 		return "", fmt.Errorf("ceph: could not publish %s@%s: %w", image, generation, err)
 	}
+	attemptedMetadata := make([]string, 0, 3)
 
 	// RECORDED PER GENERATION, because a tier boots a generation rather than the
 	// head. A single head-level key describes the LAST import, which is not what
@@ -207,9 +208,9 @@ func (c *Client) ImportGeneration( //nolint:nonamedreturns // the deferred unmap
 	// published with no pairing at all. Everything that describes a generation is
 	// written while the thing that removes generations is excluded.
 	if kernel != "" {
+		attemptedMetadata = append(attemptedMetadata, KernelKey)
 		if setErr := c.SetKernel(ctx, image, generation, kernel); setErr != nil {
-			if _, rmErr := c.rbdCmd(ctx, false, "-p", c.cfg.ImagePool, "snap", "rm",
-				image+"@"+generation); rmErr != nil {
+			if rmErr := c.withdrawGeneration(ctx, image, generation, attemptedMetadata); rmErr != nil {
 				return "", fmt.Errorf("ceph: %s@%s was published, its kernel could not be "+
 					"recorded (%w), and it could not be withdrawn (%w)",
 					image, generation, setErr, rmErr)
@@ -220,6 +221,7 @@ func (c *Client) ImportGeneration( //nolint:nonamedreturns // the deferred unmap
 		}
 	}
 
+	attemptedMetadata = append(attemptedMetadata, RunnerVersionKey)
 	if setErr := c.SetRunnerVersion(ctx, image, generation, runnerVersion); setErr != nil {
 		// ROLLED BACK RATHER THAN LEFT HALF-PUBLISHED. A snapshot with no recorded
 		// runner version is worse than no snapshot at all: NewestGeneration finds
@@ -227,8 +229,7 @@ func (c *Client) ImportGeneration( //nolint:nonamedreturns // the deferred unmap
 		// every staleness check reads its version as absent and declines to judge
 		// it. The fleet then quietly stops being rebuilt -- the exact outage the
 		// version is recorded to prevent, caused by recording it badly.
-		if _, rmErr := c.rbdCmd(ctx, false, "-p", c.cfg.ImagePool, "snap", "rm",
-			image+"@"+generation); rmErr != nil {
+		if rmErr := c.withdrawGeneration(ctx, image, generation, attemptedMetadata); rmErr != nil {
 			return "", fmt.Errorf("ceph: %s@%s was published, its runner version could not be "+
 				"recorded (%w), and it could not be withdrawn (%w); it will look current to "+
 				"`billet images due` while reading as unversioned everywhere else",
@@ -239,9 +240,9 @@ func (c *Client) ImportGeneration( //nolint:nonamedreturns // the deferred unmap
 			"not be recorded; the snapshot has been withdrawn: %w", image, setErr)
 	}
 
+	attemptedMetadata = append(attemptedMetadata, GuestContractKey)
 	if setErr := c.SetGuestContract(ctx, image, generation, guestContract); setErr != nil {
-		if _, rmErr := c.rbdCmd(ctx, false, "-p", c.cfg.ImagePool, "snap", "rm",
-			image+"@"+generation); rmErr != nil {
+		if rmErr := c.withdrawGeneration(ctx, image, generation, attemptedMetadata); rmErr != nil {
 			return "", fmt.Errorf("ceph: %s@%s was published, its guest contract could not be "+
 				"recorded (%w), and it could not be withdrawn (%w)",
 				image, generation, setErr, rmErr)
@@ -252,6 +253,48 @@ func (c *Client) ImportGeneration( //nolint:nonamedreturns // the deferred unmap
 	}
 
 	return generation, nil
+}
+
+func (c *Client) withdrawGeneration(
+	ctx context.Context,
+	image, generation string,
+	attemptedMetadata []string,
+) error {
+	// CLEANUP OUTLIVES THE FAILURE THAT TRIGGERED IT. A metadata command can time
+	// out after the snapshot exists, and reusing that dead context would make the
+	// withdrawal fail before rbd is even started.
+	cleanupBase := context.WithoutCancel(ctx)
+	removeCtx, cancelRemove := context.WithTimeout(cleanupBase, c.wait)
+	_, removeErr := c.rbdCmd(removeCtx, false, "-p", c.cfg.ImagePool, "snap", "rm",
+		image+"@"+generation)
+	cancelRemove()
+
+	if removeErr != nil {
+		// A command timeout can consume its entire deadline, so confirmation gets a
+		// fresh bounded context rather than inheriting the expired removal context.
+		listCtx, cancelList := context.WithTimeout(cleanupBase, c.wait)
+		generations, listErr := c.Generations(listCtx, image)
+		cancelList()
+		if listErr != nil {
+			return fmt.Errorf("%w (and snapshot absence could not be confirmed: %w)",
+				removeErr, listErr)
+		}
+		for _, existing := range generations {
+			if existing.Name == generation {
+				return removeErr
+			}
+		}
+	}
+
+	// ONLY AFTER THE SNAPSHOT IS GONE. If withdrawal fails, the generation still
+	// exists and its fields remain useful evidence rather than leaked metadata.
+	// EVERY ATTEMPTED FIELD is removed because rbd may commit a write before its
+	// client observes a timeout or cancellation error.
+	metadataCtx, cancelMetadata := context.WithTimeout(cleanupBase, c.wait)
+	defer cancelMetadata()
+	c.removeGenerationMetadata(metadataCtx, image, generation, attemptedMetadata...)
+
+	return nil
 }
 
 // ensureHead creates the head image, or grows it to fit.

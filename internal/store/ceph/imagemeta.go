@@ -159,6 +159,22 @@ func (c *Client) setGenerationMeta(
 	return nil
 }
 
+// removeGenerationMetadata removes fields that described a generation which no
+// longer exists. Cleanup is best-effort because the snapshot is already gone: a
+// stale key is harmless, while reporting its removal failure cannot restore the
+// generation or make the original operation more correct.
+func (c *Client) removeGenerationMetadata(
+	ctx context.Context,
+	image, generation string,
+	keys ...string,
+) {
+	for _, key := range keys {
+		//nolint:errcheck // the generation is gone; a stale key cannot justify failing its removal
+		_, _ = c.rbdCmd(ctx, false, "-p", c.cfg.ImagePool, "image-meta", "remove", image,
+			key+"."+generation)
+	}
+}
+
 // SetKernel records which kernel FILE a generation is paired with.
 func (c *Client) SetKernel(ctx context.Context, image, generation, file string) error {
 	return c.setGenerationMeta(ctx, KernelKey, image, generation, file)
