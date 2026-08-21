@@ -1612,17 +1612,40 @@ func TestCacheConformanceReusableWorkflowUsesItsOwnRevision(t *testing.T) {
 	if err := yaml.Unmarshal(body, &root); err != nil {
 		t.Fatalf("parse cache conformance workflow as YAML: %v", err)
 	}
+	var dotnetSteps int
 	var walk func(n *yaml.Node)
 	walk = func(n *yaml.Node) {
 		if n.Kind == yaml.MappingNode {
+			var uses, environment *yaml.Node
 			for i := 0; i+1 < len(n.Content); i += 2 {
 				key := n.Content[i]
 				if key.Kind == yaml.AliasNode && key.Alias != nil {
 					key = key.Alias // an aliased key resolves to its anchored scalar
 				}
+				switch key.Value {
+				case "uses":
+					uses = n.Content[i+1]
+				case "env":
+					environment = n.Content[i+1]
+				}
 				if key.Value == "NODE_OPTIONS" {
 					t.Fatal("the NODE_OPTIONS poison is untestable (the runner strips it); " +
 						"it must not return as an env key under any step")
+				}
+			}
+			if uses != nil && strings.HasPrefix(uses.Value, "actions/setup-dotnet@") {
+				dotnetSteps++
+				var installDir string
+				if environment != nil && environment.Kind == yaml.MappingNode {
+					for i := 0; i+1 < len(environment.Content); i += 2 {
+						if environment.Content[i].Value == "DOTNET_INSTALL_DIR" {
+							installDir = environment.Content[i+1].Value
+						}
+					}
+				}
+				if installDir != "${{ runner.temp }}/dotnet" {
+					t.Errorf("%s does not install .NET into the unprivileged runner's writable temp directory",
+						uses.Value)
 				}
 			}
 		}
@@ -1631,6 +1654,9 @@ func TestCacheConformanceReusableWorkflowUsesItsOwnRevision(t *testing.T) {
 		}
 	}
 	walk(&root)
+	if dotnetSteps != 4 {
+		t.Fatalf("found %d setup-dotnet steps; want current and pinned save/restore lanes", dotnetSteps)
+	}
 	if strings.Contains(workflow, "steps.poison-node") ||
 		strings.Contains(workflow, "id: poison-node") {
 		t.Fatal("the removed poison-node step must not return")
