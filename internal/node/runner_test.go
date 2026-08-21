@@ -1176,9 +1176,13 @@ type fakeJIT struct {
 
 	// describes counts scale-set resolutions, so a test can tell a cached answer
 	// from a fresh one.
-	describes int
-	removed   []string
-	removeErr error
+	describes    int
+	removed      []string
+	removeErr    error
+	recovery     RunnerRecovery
+	recoveries   []RunnerRecovery
+	recoverErr   error
+	recoverCalls []string
 }
 
 func (f *fakeJIT) Describe(context.Context, string, string) (*Set, []string, error) {
@@ -1211,6 +1215,24 @@ func (f *fakeJIT) RemoveRunner(_ context.Context, _ string, _ int64, name string
 }
 
 func (*fakeJIT) EnsureRunnerRemoved(context.Context, string) error { return nil }
+
+func (f *fakeJIT) RecoverRunner(_ context.Context, leaseID, _ string, _ int64,
+	_ string,
+) (RunnerRecovery, error) {
+	f.recoverCalls = append(f.recoverCalls, leaseID)
+	if f.recoverErr != nil {
+		return "", f.recoverErr
+	}
+	if len(f.recoveries) > 0 {
+		recovery := f.recoveries[0]
+		f.recoveries = f.recoveries[1:]
+		return recovery, nil
+	}
+	if f.recovery == "" {
+		return RunnerRecoveryTracked, nil
+	}
+	return f.recovery, nil
+}
 
 type durableFakeJIT struct {
 	*fakeJIT
@@ -2210,6 +2232,13 @@ func TestQuarantinedComputeIsAdoptedRatherThanDestroyed(t *testing.T) {
 		t.Errorf("%d instances are in custody; a spared container nothing is holding is a "+
 			"lease that can never be resolved", got)
 	}
+	if err := r.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend at the current quarantine epoch: %v", err)
+	}
+	current, err := a.Lease(t.Context(), lease.ID)
+	if err != nil || current.Phase != alloc.PhaseQuarantine {
+		t.Fatalf("tended lease = %+v, err %v", current, err)
+	}
 }
 
 // AND RECOVERY DOES NOT DESTROY IT EITHER, which is the same defect reached by
@@ -2249,6 +2278,148 @@ func TestRecoveryAdoptsQuarantinedCompute(t *testing.T) {
 
 	if got := len(restarted.heldLeases()); got != 1 {
 		t.Errorf("recovery spared %d instances without taking custody of them", got)
+	}
+	if err := restarted.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend at the current quarantine epoch: %v", err)
+	}
+	current, err := a.Lease(t.Context(), lease.ID)
+	if err != nil || current.Phase != alloc.PhaseQuarantine {
+		t.Fatalf("tended lease = %+v, err %v", current, err)
+	}
+}
+
+func TestRecoveredIdleLegacyRunnerIsRetiredBeforeCompute(t *testing.T) {
+	t.Parallel()
+
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+	jit := &fakeJIT{setID: 7, recovery: RunnerRecoveryRetired}
+	r := New(a, host, jit, p, nil)
+	lease := assignedLease(t, a)
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	if err := a.ExpireForTest(t.Context(), lease.ID); err != nil {
+		t.Fatalf("expire: %v", err)
+	}
+	if _, err := a.Reap(t.Context()); err != nil {
+		t.Fatalf("Reap: %v", err)
+	}
+	if err := r.Sweep(t.Context()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if err := r.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend: %v", err)
+	}
+	if len(p.live) != 0 {
+		t.Fatalf("retired legacy runner left compute running: %v", p.live)
+	}
+	if _, err := a.Lease(t.Context(), lease.ID); !errors.Is(err, alloc.ErrLeaseNotFound) {
+		t.Fatalf("retired legacy runner still holds capacity: %v", err)
+	}
+	if got := archivedOutcome(t, a, lease.ID); got != string(alloc.PhaseFailed) {
+		t.Fatalf("retired legacy runner outcome = %q, want failed", got)
+	}
+}
+
+func TestRecoveredBusyLegacyRunnerIsRecheckedUntilItExits(t *testing.T) {
+	t.Parallel()
+
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+	jit := &fakeJIT{setID: 7, recoveries: []RunnerRecovery{
+		RunnerRecoveryBusy, RunnerRecoveryBusy, RunnerRecoveryRetired,
+	}}
+	r := New(a, host, jit, p, nil)
+	lease := assignedLease(t, a)
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	if err := a.ExpireForTest(t.Context(), lease.ID); err != nil {
+		t.Fatalf("expire: %v", err)
+	}
+	if _, err := a.Reap(t.Context()); err != nil {
+		t.Fatalf("Reap: %v", err)
+	}
+	if err := r.Sweep(t.Context()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if err := r.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend while busy: %v", err)
+	}
+	if len(p.live) != 1 {
+		t.Fatalf("busy legacy runner was destroyed: %v", p.live)
+	}
+	if err := r.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend after retirement: %v", err)
+	}
+	if len(p.live) != 0 {
+		t.Fatalf("retired legacy runner remained running: %v", p.live)
+	}
+	if len(jit.recoverCalls) != 3 {
+		t.Fatalf("runner recovery calls = %v, want initial plus two rechecks", jit.recoverCalls)
+	}
+}
+
+func TestLegacyRunnerRecoveryFailureKeepsQuarantineCharged(t *testing.T) {
+	t.Parallel()
+
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+	jit := &fakeJIT{setID: 7, recoverErr: errors.New("github unavailable")}
+	r := New(a, host, jit, p, nil)
+	lease := assignedLease(t, a)
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	if err := a.ExpireForTest(t.Context(), lease.ID); err != nil {
+		t.Fatalf("expire: %v", err)
+	}
+	if _, err := a.Reap(t.Context()); err != nil {
+		t.Fatalf("Reap: %v", err)
+	}
+	if err := r.Sweep(t.Context()); err != nil {
+		t.Fatalf("Sweep reports individual adoption failures through its logger: %v", err)
+	}
+	if len(p.live) != 1 || len(r.heldLeases()) != 0 {
+		t.Fatalf("ambiguous recovery changed compute or custody: live %v held %v", p.live, r.heldLeases())
+	}
+	current, err := a.Lease(t.Context(), lease.ID)
+	if err != nil || current.Phase != alloc.PhaseQuarantine {
+		t.Fatalf("ambiguous recovery released quarantine: lease %+v, err %v", current, err)
+	}
+}
+
+func TestFailedQuarantineRetainsItsPhaseUntilTeardown(t *testing.T) {
+	t.Parallel()
+
+	p := &fakeProvider{kind: config.ProviderDocker}
+	a, host := newAllocatorWithHost(t)
+	r := New(a, host, &fakeJIT{setID: 7}, p, nil)
+	lease := assignedLease(t, a)
+	if err := r.Launch(t.Context(), lease, dockerSpec(), Job{RequestID: 11, Event: "push"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	if err := a.MarkFailure(t.Context(), lease.ID, lease.Epoch, "operator recovery"); err != nil {
+		t.Fatalf("MarkFailure: %v", err)
+	}
+	if err := a.ExpireForTest(t.Context(), lease.ID); err != nil {
+		t.Fatalf("expire: %v", err)
+	}
+	if _, err := a.Reap(t.Context()); err != nil {
+		t.Fatalf("Reap: %v", err)
+	}
+	if err := r.Sweep(t.Context()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if err := r.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend must not transition quarantine to teardown: %v", err)
+	}
+	if len(p.live) != 0 {
+		t.Fatalf("failed quarantine left compute running: %v", p.live)
+	}
+	if got := archivedOutcome(t, a, lease.ID); got != string(alloc.PhaseFailed) {
+		t.Fatalf("failed quarantine outcome = %q, want failed", got)
 	}
 }
 

@@ -26,6 +26,7 @@ type JITSource interface {
 	Describe(ctx context.Context, name, group string) (*JITSet, []string, error)
 	JITConfig(ctx context.Context, scaleSetID int, runnerName, workFolder string) (JITRegistration, error)
 	RemoveRunner(ctx context.Context, runnerID int64, runnerName string) error
+	RecoverRunner(ctx context.Context, runnerName string) (JITRunnerRecovery, error)
 }
 
 type trustedRunnerGroupValidator interface {
@@ -43,6 +44,13 @@ type JITRegistration interface {
 	Config() string
 	RunnerName() string
 	ID() int64
+}
+
+// JITRunnerRecovery reports whether an exact legacy registration is busy.
+type JITRunnerRecovery struct {
+	RunnerID int64
+	Present  bool
+	Busy     bool
 }
 
 type poolRunnerStore interface {
@@ -238,6 +246,7 @@ func Handler(log *slog.Logger, p *Plane, store LeaseStore, jit JITSource, opts .
 	mux.HandleFunc("POST /v1/nodes/{node}/reconcile", h.forNewWork(h.reconcile))
 	mux.HandleFunc("POST /v1/nodes/{node}/jit", h.forNode(h.jitConfig))
 	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/runner/remove", h.forOwnLease(h.removeRunner))
+	mux.HandleFunc("POST /v1/nodes/{node}/leases/{lease}/runner/recover", h.forOwnLease(h.recoverRunner))
 	mux.HandleFunc("POST /v1/nodes/{node}/renew", h.forNode(h.renew))
 	mux.HandleFunc("GET /v1/nodes/{node}/cache-policy", h.forNode(h.actionsCachePolicy))
 
@@ -1427,6 +1436,108 @@ func (h *handler) removeRunner(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *handler) recoverRunner(w http.ResponseWriter, r *http.Request) {
+	var req nodeapi.RecoverRunnerRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	pool, ok := h.store.(poolRunnerStore)
+	if !ok {
+		writeErr(w, http.StatusServiceUnavailable, "", "runner identity storage is unavailable")
+		return
+	}
+	leaseID := r.PathValue("lease")
+	lease, err := h.store.Lease(r.Context(), leaseID)
+	if err != nil {
+		writeStoreErr(w, err)
+		return
+	}
+	if lease == nil {
+		writeErr(w, http.StatusConflict, nodeapi.CodeRefused,
+			"quarantined runner registration no longer has a lease")
+		return
+	}
+	if lease.Phase != alloc.PhaseQuarantine {
+		writeErr(w, http.StatusConflict, nodeapi.CodeRefused,
+			"runner recovery is only allowed for quarantined compute")
+		return
+	}
+	expectedName := provider.InstanceName(leaseID)
+	if req.RunnerName != expectedName {
+		writeErr(w, http.StatusForbidden, nodeapi.CodeRefused,
+			"runner recovery name does not match its lease")
+		return
+	}
+	binding, err := pool.PoolRunnerByLease(r.Context(), leaseID)
+	if err == nil {
+		if binding.Tier != lease.Tier || binding.LaunchRequestID != lease.RequestID {
+			writeErr(w, http.StatusConflict, nodeapi.CodeRefused,
+				"durable runner identity does not match its lease")
+			return
+		}
+		switch binding.Status {
+		case alloc.PoolRunnerBusy:
+			writeJSON(w, http.StatusOK, nodeapi.RecoverRunnerResponse{State: nodeapi.RunnerRecoveryTracked})
+			return
+		case alloc.PoolRunnerIdle:
+			req.RunnerName = binding.RunnerName
+		case alloc.PoolRunnerRetiring:
+			if err := h.jit.RemoveRunner(r.Context(), binding.RunnerID, binding.RunnerName); err != nil {
+				writeStoreErr(w, err)
+				return
+			}
+			writeJSON(w, http.StatusOK, nodeapi.RecoverRunnerResponse{State: nodeapi.RunnerRecoveryRetired})
+			return
+		case alloc.PoolRunnerRetired:
+			writeJSON(w, http.StatusOK, nodeapi.RecoverRunnerResponse{State: nodeapi.RunnerRecoveryRetired})
+			return
+		default:
+			writeErr(w, http.StatusConflict, nodeapi.CodeRefused,
+				"durable runner identity has an unknown status")
+			return
+		}
+	}
+	if err != nil && !errors.Is(err, alloc.ErrLeaseNotFound) {
+		writeStoreErr(w, err)
+		return
+	}
+	recovery, err := h.jit.RecoverRunner(r.Context(), req.RunnerName)
+	if err != nil {
+		writeStoreErr(w, err)
+		return
+	}
+	if !recovery.Present {
+		if binding.LeaseID != "" {
+			if err := pool.RetirePoolRunner(r.Context(), leaseID); err != nil {
+				writeStoreErr(w, err)
+				return
+			}
+		}
+		writeJSON(w, http.StatusOK, nodeapi.RecoverRunnerResponse{State: nodeapi.RunnerRecoveryRetired})
+		return
+	}
+	if binding.LeaseID != "" && binding.RunnerID != 0 && binding.RunnerID != recovery.RunnerID {
+		writeErr(w, http.StatusConflict, nodeapi.CodeRefused,
+			"recovered runner id changed; refusing replacement identity")
+		return
+	}
+	if recovery.Busy {
+		writeJSON(w, http.StatusOK, nodeapi.RecoverRunnerResponse{State: nodeapi.RunnerRecoveryBusy})
+		return
+	}
+	if binding.LeaseID != "" {
+		if err := pool.RetirePoolRunner(r.Context(), leaseID); err != nil {
+			writeStoreErr(w, err)
+			return
+		}
+	}
+	if err := h.jit.RemoveRunner(r.Context(), recovery.RunnerID, req.RunnerName); err != nil {
+		writeStoreErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, nodeapi.RecoverRunnerResponse{State: nodeapi.RunnerRecoveryRetired})
 }
 
 func (h *handler) validateTrustedRunnerGroup(w http.ResponseWriter, r *http.Request) {

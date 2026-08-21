@@ -9,6 +9,8 @@ import (
 	"sort"
 
 	gh "github.com/actions/scaleset"
+
+	billetgithub "github.com/junioryono/billet/internal/github"
 )
 
 // DefaultRunnerGroup is where a scale set lands when a tier names no group.
@@ -39,6 +41,22 @@ func (c *Client) ValidateTrustedRunnerGroup(ctx context.Context, group string,
 		return fmt.Errorf("scaleset: validate trusted runner group %q: %w", group, err)
 	}
 	return nil
+}
+
+// RecoverRunner inspects the exact legacy registration through the
+// credential-holding organization client.
+func (c *Client) RecoverRunner(
+	ctx context.Context, runnerName string,
+) (billetgithub.RunnerRecovery, error) {
+	if c.policy == nil {
+		return billetgithub.RunnerRecovery{}, fmt.Errorf("scaleset: runner recovery is not configured")
+	}
+	recovery, err := c.policy.InspectEphemeralRunner(ctx, runnerName)
+	if err != nil {
+		return billetgithub.RunnerRecovery{}, fmt.Errorf("scaleset: recover runner %q: %w",
+			runnerName, err)
+	}
+	return recovery, nil
 }
 
 // ScaleSet is billet's view of one provisioned scale set.

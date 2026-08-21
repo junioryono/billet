@@ -298,6 +298,10 @@ func (alwaysMints) JITConfig(_ context.Context, _ int, runnerName, _ string) (no
 
 func (alwaysMints) RemoveRunner(context.Context, int64, string) error { return nil }
 
+func (alwaysMints) RecoverRunner(context.Context, string) (nodeplane.JITRunnerRecovery, error) {
+	return nodeplane.JITRunnerRecovery{}, nil
+}
+
 type mintedFor string
 
 func (m mintedFor) Config() string     { return "a credential" }

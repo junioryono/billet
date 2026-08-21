@@ -14,11 +14,20 @@ import (
 	"time"
 )
 
-// RunnerGroupPolicyClient verifies the GitHub-side boundary of a trusted pool.
+// RunnerGroupPolicyClient reads the GitHub-side state needed to protect pools.
 // Its implementation is hidden so credential-bearing values cannot be copied
 // out and rendered without the redaction methods below.
 type RunnerGroupPolicyClient interface {
 	ValidateTrustedRunnerGroup(context.Context, int, []string) error
+	InspectEphemeralRunner(context.Context, string) (RunnerRecovery, error)
+}
+
+// RunnerRecovery reports whether an exact legacy ephemeral registration exists
+// and is still busy. A zero value means it is absent.
+type RunnerRecovery struct {
+	RunnerID int64
+	Present  bool
+	Busy     bool
 }
 
 type runnerGroupPolicyClient struct {
@@ -105,6 +114,96 @@ func (c *runnerGroupPolicyClient) ValidateTrustedRunnerGroup(ctx context.Context
 			got, want)
 	}
 	return nil
+}
+
+// InspectEphemeralRunner reads an exact legacy runner's busy state. Ambiguous
+// identities and non-ephemeral runners are refused.
+func (c *runnerGroupPolicyClient) InspectEphemeralRunner(
+	ctx context.Context, runnerName string,
+) (RunnerRecovery, error) {
+	if c == nil || c.org == "" || c.appID <= 0 || c.installationID <= 0 || len(c.privateKey) == 0 {
+		return RunnerRecovery{}, fmt.Errorf("github: runner recovery is not configured")
+	}
+	if runnerName == "" {
+		return RunnerRecovery{}, fmt.Errorf("github: runner recovery needs a name")
+	}
+	token, err := c.installationToken(ctx)
+	if err != nil {
+		return RunnerRecovery{}, err
+	}
+	query := url.Values{"name": {runnerName}, "per_page": {"100"}}
+	endpoint := fmt.Sprintf("%s/orgs/%s/actions/runners?%s", c.base,
+		url.PathEscape(c.org), query.Encode())
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, http.NoBody)
+	if err != nil {
+		return RunnerRecovery{}, fmt.Errorf("github: build runner recovery request: %w", err)
+	}
+	setAPIHeaders(req)
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := doWithTimeout(c.client, req)
+	if err != nil {
+		return RunnerRecovery{}, fmt.Errorf("github: list runners for recovery: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return RunnerRecovery{}, fmt.Errorf("github: read runners for recovery: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return RunnerRecovery{}, fmt.Errorf("github: list runners for recovery: %w",
+			apiError(resp.StatusCode, body))
+	}
+	type runnerRecord struct {
+		ID        int64  `json:"id"`
+		Name      string `json:"name"`
+		Status    string `json:"status"`
+		Busy      bool   `json:"busy"`
+		Ephemeral bool   `json:"ephemeral"`
+	}
+	var listed struct {
+		TotalCount int            `json:"total_count"`
+		Runners    []runnerRecord `json:"runners"`
+	}
+	if err := json.Unmarshal(body, &listed); err != nil {
+		return RunnerRecovery{}, fmt.Errorf("github: decode runners for recovery: %w", err)
+	}
+	if listed.TotalCount < 0 || listed.TotalCount != len(listed.Runners) {
+		return RunnerRecovery{}, fmt.Errorf("github: runner recovery response was incomplete: total_count=%d runners=%d",
+			listed.TotalCount, len(listed.Runners))
+	}
+	var exact []runnerRecord
+	for _, runner := range listed.Runners {
+		if runner.Name == runnerName {
+			exact = append(exact, runner)
+		}
+	}
+	if len(exact) == 0 {
+		return RunnerRecovery{}, nil
+	}
+	if len(exact) != 1 {
+		return RunnerRecovery{}, fmt.Errorf("github: found %d runners named %q; refusing ambiguous recovery",
+			len(exact), runnerName)
+	}
+	runner := exact[0]
+	if runner.ID <= 0 {
+		return RunnerRecovery{}, fmt.Errorf("github: runner %q has invalid id %d", runnerName, runner.ID)
+	}
+	if !runner.Ephemeral {
+		return RunnerRecovery{}, fmt.Errorf("github: runner %q is not ephemeral; refusing recovery",
+			runnerName)
+	}
+	if runner.Status != "online" && runner.Status != "offline" {
+		return RunnerRecovery{}, fmt.Errorf("github: runner %q has unexpected status %q",
+			runnerName, runner.Status)
+	}
+	if runner.Busy {
+		if runner.Status != "online" {
+			return RunnerRecovery{}, fmt.Errorf("github: runner %q is busy but %s; refusing recovery",
+				runnerName, runner.Status)
+		}
+		return RunnerRecovery{RunnerID: runner.ID, Present: true, Busy: true}, nil
+	}
+	return RunnerRecovery{RunnerID: runner.ID, Present: true}, nil
 }
 
 func (c *runnerGroupPolicyClient) installationToken(ctx context.Context) (string, error) {
