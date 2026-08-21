@@ -29,6 +29,7 @@ documentation:
 | What is `maxCapacity`? | `listener/listener.go` — the scale set's TOTAL, sent unchanged as jobs are assigned |
 | Which status means "no message"? | `getMessage` — `202`, while `200` carries a batch |
 | How long does a long poll actually take? | **Measured, not read**: ~88s against a real org, not the ~50s widely assumed. Against a 90s lease TTL that is two seconds of margin. |
+| What if one completion can never be identified? | `DeleteMessage` acknowledges the whole batch, so billet first processes every valid completion, offer and assignment beside it idempotently. A completion with no resolvable local lease or job identity after three deliveries is logged at error level, discarded and acknowledged so it cannot keep every tier down in a systemd restart loop. Cross-tier identities, acquisition contradictions and ledger failures remain fatal because they can represent known or unknown capacity commitments rather than poisoned input. |
 
 ## `actions/actions-runner-controller` — a reference, not a dependency
 

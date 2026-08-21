@@ -148,6 +148,23 @@ var ErrNoMessage = errors.New("server: no message")
 // cancellation happening at the same moment must not turn that into a drain.
 var ErrUntrustworthySession = errors.New("server: the scale set returned something billet cannot act on")
 
+// errQuarantinableCompletion is an untrustworthy completion that creates no
+// unknown remote commitment. Its payload cannot change on redelivery, but the
+// local ledger may still converge, so Run retries it before acknowledging it
+// away. Other untrustworthy responses remain immediately fatal.
+var errQuarantinableCompletion = fmt.Errorf("%w: the completion has no safe identity",
+	ErrUntrustworthySession)
+
+// poisonedMessageError carries the valid completions beside a poison so they can
+// be made durable after the whole message is finally acknowledged.
+type poisonedMessageError struct {
+	cause       error
+	completions []Job
+}
+
+func (e *poisonedMessageError) Error() string { return e.cause.Error() }
+func (e *poisonedMessageError) Unwrap() error { return e.cause }
+
 // Message is one batch of scale-set news.
 type Message struct {
 	MessageID  int64
@@ -441,6 +458,10 @@ func (p *pendingCleanup) failed(now time.Time, first, ceiling time.Duration) {
 const defaultStalePromise = 5 * time.Minute
 
 const (
+	// Enough redeliveries to outlive a transient ledger observation, while still
+	// ending a deterministic loop without operator intervention.
+	poisonQuarantineAfter = 3
+
 	firstRetryEvery = 15 * time.Second
 	// A node refusing this long will not answer sooner for being asked more often;
 	// the point of the ceiling is that it keeps asking at all.
@@ -901,8 +922,10 @@ func (l *Listener) Run(ctx context.Context) error {
 	pollCtx := ctx
 
 	var (
-		draining bool
-		endDrain context.CancelFunc
+		draining        bool
+		endDrain        context.CancelFunc
+		poisonMessageID int64
+		poisonRefusals  int
 	)
 
 	defer func() {
@@ -985,12 +1008,47 @@ func (l *Listener) Run(ctx context.Context) error {
 		}
 
 		if err := l.handle(pollCtx, msg); err != nil {
+			var poison *poisonedMessageError
+			if errors.As(err, &poison) {
+				if poisonRefusals == 0 || poisonMessageID != msg.MessageID {
+					poisonMessageID = msg.MessageID
+					poisonRefusals = 0
+				}
+				poisonRefusals++
+
+				if poisonRefusals < poisonQuarantineAfter {
+					l.log.Error("a completion message has a deterministic identity refusal; keeping it unacknowledged for another delivery before quarantine",
+						"tier", l.tier, "message", msg.MessageID, "attempt", poisonRefusals,
+						"quarantine_after", poisonQuarantineAfter, "error", poison)
+
+					continue
+				}
+
+				handled := *msg
+				handled.Completed = poison.completions
+				if err := l.acknowledge(pollCtx, &handled); err != nil {
+					return stopping(ctx, err)
+				}
+				l.acknowledgeCompletions(pollCtx, &handled)
+				l.lastMessageID = msg.MessageID
+				l.log.Error("quarantining a deterministically invalid completion message after repeated refusals; its invalid completions were discarded and the listener remains live",
+					"tier", l.tier, "message", msg.MessageID, "attempts", poisonRefusals,
+					"error", poison)
+				poisonMessageID = 0
+				poisonRefusals = 0
+
+				continue
+			}
+
 			if cancelledWhileServing(ctx, draining, err) {
 				continue
 			}
 
 			return stopping(ctx, err)
 		}
+
+		poisonMessageID = 0
+		poisonRefusals = 0
 	}
 }
 
@@ -1991,6 +2049,8 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 	// redelivery rebuilds it before the assignments are read. A longer-lived map would
 	// silently skip a request id GitHub requeued after cancelling it.
 	finished := make(map[int64]struct{}, len(msg.Completed))
+	completed := make([]Job, 0, len(msg.Completed))
+	poisoned := make([]error, 0, len(msg.Completed))
 
 	for i := range msg.Completed {
 		job := msg.Completed[i]
@@ -1998,12 +2058,30 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 		var err error
 		job, err = l.identifyCompletion(ctx, job)
 		if err != nil {
+			if errors.Is(err, errQuarantinableCompletion) {
+				poisoned = append(poisoned, err)
+
+				continue
+			}
+
 			return err
 		}
-		// The resolved identity must reach acknowledgement too. Keeping it only
-		// in this loop would settle request N and then try to acknowledge request
-		// zero, leaving the durable completion blocked forever.
-		msg.Completed[i] = job
+		completed = append(completed, job)
+	}
+
+	handled := *msg
+	handled.Completed = completed
+
+	var poison error
+	if len(poisoned) > 0 {
+		poison = &poisonedMessageError{
+			cause:       errors.Join(poisoned...),
+			completions: slices.Clone(completed),
+		}
+	}
+
+	for i := range completed {
+		job := completed[i]
 		l.log.Info("received a completed job", "tier", l.tier, "request", job.RequestID,
 			"runner", job.RunnerName, "result", job.Result)
 		// THE DELIVERY IS TERMINAL EVEN WHEN ITS TEARDOWN ALREADY SETTLED. A
@@ -2037,10 +2115,14 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 				"tier", l.tier, "available", len(msg.Available), "assigned", len(msg.Assigned))
 		}
 
-		if err := l.acknowledge(ctx, msg); err != nil {
+		if poison != nil {
+			return poison
+		}
+
+		if err := l.acknowledge(ctx, &handled); err != nil {
 			return err
 		}
-		l.acknowledgeCompletions(ctx, msg)
+		l.acknowledgeCompletions(ctx, &handled)
 
 		// Advanced here too. The invariant is "a successful acknowledgement
 		// advances the cursor", and an early return that acknowledges without
@@ -2125,10 +2207,14 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 		l.observed = msg.Statistics
 	}
 
-	if err := l.acknowledge(ctx, msg); err != nil {
+	if poison != nil {
+		return poison
+	}
+
+	if err := l.acknowledge(ctx, &handled); err != nil {
 		return err
 	}
-	l.acknowledgeCompletions(ctx, msg)
+	l.acknowledgeCompletions(ctx, &handled)
 
 	// Only now. An unacknowledged message is redelivered, and re-handling one is
 	// safe once the acquisition outcome is KNOWN: completions rebuild their own
@@ -2243,7 +2329,7 @@ func (l *Listener) identifyCompletion(ctx context.Context, job Job) (Job, error)
 	}
 
 	return Job{}, fmt.Errorf("%w: %s completed runner %q without a request id, job id, or resolvable billet lease",
-		ErrUntrustworthySession, l.tier, job.RunnerName)
+		errQuarantinableCompletion, l.tier, job.RunnerName)
 }
 
 // acknowledge tells GitHub the message was handled. An unacknowledged message is
