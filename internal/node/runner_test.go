@@ -1210,6 +1210,8 @@ func (f *fakeJIT) RemoveRunner(_ context.Context, _ string, _ int64, name string
 	return f.removeErr
 }
 
+func (*fakeJIT) EnsureRunnerRemoved(context.Context, string) error { return nil }
+
 type durableFakeJIT struct {
 	*fakeJIT
 	ensureErr   error

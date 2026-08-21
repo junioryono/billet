@@ -36,14 +36,12 @@ type JITSource interface {
 	JITConfig(ctx context.Context, scaleSetID int, runnerName, workFolder string) (Registration, error)
 	// RemoveRunner removes routing before failed-launch compute is touched.
 	RemoveRunner(ctx context.Context, leaseID string, runnerID int64, runnerName string) error
+	// EnsureRunnerRemoved resolves a restart-surviving registration by lease.
+	EnsureRunnerRemoved(ctx context.Context, leaseID string) error
 }
 
 type trustedRunnerGroupValidator interface {
 	ValidateTrustedRunnerGroup(context.Context, string, []string) error
-}
-
-type durableRegistrationRemover interface {
-	EnsureRunnerRemoved(context.Context, string) error
 }
 
 // Set is the part of a scale set this package needs.
@@ -505,10 +503,10 @@ func (r *Runner) ensureRegistrationRemoved(ctx context.Context, c *custody) erro
 		if err := r.removeRegistration(ctx, c.leaseID, c.runnerID, c.runnerName); err != nil {
 			return err
 		}
-	} else if durable, ok := r.jit.(durableRegistrationRemover); ok {
+	} else {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), strayCleanupTimeout)
 		defer cancel()
-		if err := durable.EnsureRunnerRemoved(cleanupCtx, c.leaseID); err != nil {
+		if err := r.jit.EnsureRunnerRemoved(cleanupCtx, c.leaseID); err != nil {
 			return err
 		}
 	}

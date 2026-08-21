@@ -537,7 +537,7 @@ func newStackIn(t *testing.T, dir string, p *plane, opts ...stackOpt) *stack {
 	if sc.wire {
 		runner, serverOpts = wireUp(t, log, a, client, prov, tiers, deployment, computeName)
 	} else {
-		runner = node.New(a, host, wiring.JITSource{Client: client}, prov, log)
+		runner = node.New(a, host, wiring.JITSource{Client: client, Pool: a}, prov, log)
 		serverOpts = []server.ControlPlaneOption{
 			server.WithNodeRunner(directRunner{runner: runner, tiers: tiers}),
 		}

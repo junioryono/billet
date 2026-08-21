@@ -16,7 +16,9 @@ package wiring
 
 import (
 	"context"
+	"errors"
 
+	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/node"
 	"github.com/junioryono/billet/internal/nodeplane"
 	"github.com/junioryono/billet/internal/scaleset"
@@ -56,7 +58,13 @@ func (p Provisioner) ValidateTrustedRunnerGroup(ctx context.Context, group strin
 }
 
 // JITSource adapts the client to what the node needs to mint registrations.
-type JITSource struct{ Client *scaleset.Client }
+type JITSource struct {
+	Client *scaleset.Client
+	Pool   interface {
+		PoolRunnerByLease(context.Context, string) (alloc.PoolRunner, error)
+		RetirePoolRunner(context.Context, string) error
+	}
+}
 
 // Describe resolves a tier's scale set, reporting a nil set when there is none.
 //
@@ -85,6 +93,25 @@ func (j JITSource) RemoveRunner(
 	ctx context.Context, _ string, runnerID int64, runnerName string,
 ) error {
 	return j.Client.RemoveRunner(ctx, runnerID, runnerName)
+}
+
+// EnsureRunnerRemoved resolves a restart-surviving registration from the
+// control-plane journal before recovered compute is touched.
+func (j JITSource) EnsureRunnerRemoved(ctx context.Context, leaseID string) error {
+	if j.Pool == nil {
+		return errors.New("wiring: runner identity storage is unavailable")
+	}
+	binding, err := j.Pool.PoolRunnerByLease(ctx, leaseID)
+	if errors.Is(err, alloc.ErrLeaseNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if err := j.Pool.RetirePoolRunner(ctx, leaseID); err != nil {
+		return err
+	}
+	return j.Client.RemoveRunner(ctx, binding.RunnerID, binding.RunnerName)
 }
 
 // ValidateTrustedRunnerGroup verifies policy immediately before local minting.
