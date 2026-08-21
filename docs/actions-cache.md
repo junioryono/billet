@@ -26,7 +26,7 @@ tiers:
       workflow_ref: acme/api/.github/workflows/ci.yml@refs/heads/main
 ```
 
-`intercept` defaults to `false`. A trusted pool must use a non-default GitHub runner group restricted to exactly the listed `workflows`; Billet validates that policy at server startup and again before every registration is minted. `cache_scope` is static because GitHub chooses a job only after the JIT runner has joined the pool, so launch-time cache authority cannot safely come from the assignment that happened to cause scale-up. Keep interception absent on release, deployment, and secret-bearing tiers until the exact image and runner release have passed `.github/workflows/cache-conformance.yml` in the deployment that will use them.
+`intercept` defaults to `false`. A trusted pool must use a non-default GitHub runner group restricted to exactly the listed `workflows`; Billet validates that policy at server startup and again before every registration is minted. `cache_scope` is static because GitHub chooses a job only after the JIT runner has joined the pool, so launch-time cache authority cannot safely come from the assignment that happened to cause scale-up. Keep interception absent on release, deployment, and secret-bearing tiers until the exact image and runner release have passed the consumer-owned workflow installed by `billet cache conformance install` in the deployment that will use them.
 
 The guest image must speak the contract required by the running Billet binary. `billet images compatible` and the host-upgrade transaction enforce that before a tier can launch. The interception contract includes the guest-side DNS-remap passthrough, runner hook, CA propagation, and container resolver; an older image is refused rather than launched without one of those pieces.
 
@@ -65,8 +65,22 @@ An organisation block covers every repository below it. Enabling one repository 
 
 ## Conformance gate
 
-Run the reusable or manually dispatched `Cache and artifact conformance` workflow with the cache-enabled label. Supply the exact Billet tag or commit as `billet_ref`; cross-repository callers may also override `billet_repository`. The workflow checks out only the fixture action from that explicit revision rather than reading scripts or a Go version from the caller repository. Supply `expected_runner_version` and `expected_guest_contract` when qualifying a candidate image so a passing run cannot accidentally describe another generation.
+GitHub applies a restricted organization runner group only to jobs directly defined in a selected workflow. A caller whose only job invokes `junioryono/billet/.github/workflows/cache-conformance.yml` does not qualify: those jobs are defined in Billet's repository, and an organization runner group cannot authorize a workflow owned by another organization. Do not work around that boundary by disabling workflow restrictions.
+
+Run the released Billet binary from the root of the private repository that will own the gate:
+
+```bash
+billet cache conformance install \
+  --repository acme/api \
+  --runner-label billet-4vcpu-cache
+```
+
+The command resolves the binary's release tag through GitHub's Git object API, peels annotated tags to a full commit SHA, downloads the canonical workflow from that SHA, and bakes only the SHA, the pinned Actions runner version, the guest contract, and the one runner label into a consumer-owned `.github/workflows/billet-cache-conformance.yml`. It then verifies that every job still defines its own steps. A source build has no release identity, so pass `--billet-ref vMAJOR.MINOR.PATCH` or a full 40-character commit SHA explicitly. A version-shaped tag is only a locator and is never left in an executable fixture checkout. Forks may set `--billet-repository`; candidate qualification may override `--expected-runner-version` and `--expected-guest-contract` explicitly.
+
+Commit the generated workflow on the selected branch before changing the runner group. The command prints the exact `owner/repository/.github/workflows/billet-cache-conformance.yml@refs/heads/main` identity to use for the runner group's selected workflow, the tier's `workflows` entry, and `cache_scope.workflow_ref`. Use `--workflow-ref` when the selected branch or tag is not `refs/heads/main`. Re-run the newer released binary with `--force` to update the checked-in file; review and commit that deterministic diff before admitting the new Billet release.
+
+The cross-organization reusable workflow remains available for runner groups that are not workflow-restricted and for direct manual runs in Billet itself. It is not a valid acceptance gate for a trusted restricted pool.
 
 The moving-major lane exercises `actions/cache@v5`, `upload-artifact@v7`, and `download-artifact@v8` on the host and in a job container. A second lane pins the reviewed action commits exactly. Separate moving and pinned lanes exercise the embedded cache clients in `actions/setup-node`, `actions/setup-java`, `actions/setup-python`, `actions/setup-go`, and `actions/setup-dotnet`, then prove their real package-cache directories survive a second VM. Poisoning probes isolate `ACTIONS_*`, Node, CA/TLS, proxy, loader, tar, and path variables to cache steps and then require a clean artifact upload/download to remain byte-identical.
 
-A guest image or runner release is not promoted onto an interception-enabled tier until this workflow passes against that candidate. The workflow is intentionally reusable because the runner label and candidate-promotion mechanism belong to the deployment; Billet supplies the protocol gate without embedding any consuming repository or infrastructure name.
+A guest image or runner release is not promoted onto an interception-enabled tier until the consumer-owned workflow passes against that candidate. Billet supplies and validates the full protocol gate without embedding any consuming repository or infrastructure name in Billet itself.

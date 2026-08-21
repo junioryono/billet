@@ -11,8 +11,12 @@ import (
 )
 
 func cmdCache(ctx context.Context, args []string) error {
+	if len(args) > 0 && args[0] == "conformance" {
+		return cmdCacheConformance(ctx, args[1:])
+	}
+
 	if len(args) == 0 || args[0] != "disable" && args[0] != "enable" {
-		return errors.New("usage: billet cache <disable|enable> (--org <owner> | --repository <owner/repository>)")
+		return errors.New("usage: billet cache <disable|enable|conformance> [flags]")
 	}
 	action := args[0]
 	fs := newFlagSet("billet cache " + action)
