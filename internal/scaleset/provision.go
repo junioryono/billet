@@ -43,18 +43,38 @@ func (c *Client) ValidateTrustedRunnerGroup(ctx context.Context, group string,
 	return nil
 }
 
-// RecoverRunner inspects the exact legacy registration through the
-// credential-holding organization client.
+// RecoverRunner proves an exact legacy registration belongs to a scale set,
+// then reads its busy state through the credential-holding organization client.
 func (c *Client) RecoverRunner(
 	ctx context.Context, runnerName string,
 ) (billetgithub.RunnerRecovery, error) {
 	if c.policy == nil {
 		return billetgithub.RunnerRecovery{}, fmt.Errorf("scaleset: runner recovery is not configured")
 	}
-	recovery, err := c.policy.InspectEphemeralRunner(ctx, runnerName)
+	runner, err := c.gh.GetRunnerByName(ctx, runnerName)
+	if err != nil {
+		return billetgithub.RunnerRecovery{}, fmt.Errorf("scaleset: find runner %q for recovery: %w",
+			runnerName, err)
+	}
+	if runner == nil {
+		return billetgithub.RunnerRecovery{}, nil
+	}
+	if runner.ID <= 0 || runner.Name != runnerName || runner.RunnerScaleSetID <= 0 {
+		return billetgithub.RunnerRecovery{}, fmt.Errorf("scaleset: runner %q has an invalid scale-set identity",
+			runnerName)
+	}
+	recovery, err := c.policy.InspectScaleSetRunner(ctx, runnerName, int64(runner.ID))
 	if err != nil {
 		return billetgithub.RunnerRecovery{}, fmt.Errorf("scaleset: recover runner %q: %w",
 			runnerName, err)
+	}
+	if !recovery.Present {
+		return billetgithub.RunnerRecovery{}, fmt.Errorf("scaleset: runner %q exists in its scale set but not in organization state",
+			runnerName)
+	}
+	if recovery.RunnerID != int64(runner.ID) {
+		return billetgithub.RunnerRecovery{}, fmt.Errorf("scaleset: organization state for runner %q returned id %d, not the scale-set id %d",
+			runnerName, recovery.RunnerID, runner.ID)
 	}
 	return recovery, nil
 }
