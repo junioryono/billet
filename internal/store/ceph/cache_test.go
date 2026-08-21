@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -24,6 +25,7 @@ type cacheFake struct {
 	mappings   map[string]string
 	lockCookie string
 	locker     string
+	heartbeat  func() string
 	nextDevice int
 	failMeta   string
 	failRemove bool
@@ -186,6 +188,9 @@ func (f *cacheFake) imageMeta(args []string) ([]byte, error) {
 
 		return nil, nil
 	case "get":
+		if f.heartbeat != nil && strings.HasPrefix(args[2], "billet.heartbeat.") {
+			return []byte(f.heartbeat() + "\n"), nil
+		}
 		value, ok := f.metadata[image][args[2]]
 		if !ok {
 			return nil, errors.New("rbd: (2) No such file or directory")
@@ -372,6 +377,122 @@ func cacheClient(t *testing.T, f *cacheFake) *Client {
 	}
 
 	return c
+}
+
+func (f *cacheFake) ranWith(fragments ...string) bool {
+	for _, call := range f.calls {
+		if slices.ContainsFunc(fragments, func(fragment string) bool {
+			return !slices.Contains(call, fragment)
+		}) {
+			continue
+		}
+
+		return true
+	}
+
+	return false
+}
+
+func TestCacheLockStaleAfterIsTenMinutes(t *testing.T) {
+	t.Parallel()
+
+	if CacheLockStaleAfter != 10*time.Minute {
+		t.Fatalf("cache-index recovery begins after %s, want the documented ten-minute bound",
+			CacheLockStaleAfter)
+	}
+}
+
+func TestCacheIndexLockRecoversOnItsOwnStaleBound(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
+	staleCookie := fmt.Sprintf("billet-import-deadhost-7-deadbeef-%d",
+		now.Add(-CacheLockStaleAfter-time.Minute).Unix())
+	f := newCacheFake()
+	f.lockCookie = staleCookie
+	c := cacheClient(t, f)
+	c.observation = time.Millisecond
+
+	ran := false
+	if err := c.withCacheLock(t.Context(), now, func() error {
+		ran = true
+
+		return nil
+	}); err != nil {
+		t.Fatalf("a silent cache-index lock past its recovery bound was not reclaimed: %v", err)
+	}
+	if !ran {
+		t.Fatal("the cache operation never resumed after reclaiming its stale lock")
+	}
+	if !f.ranWith("lock", "rm", staleCookie) {
+		t.Fatalf("the stale cache-index holder was not removed; billet ran %v", f.calls)
+	}
+}
+
+func TestCacheIndexLockKeepsASilentHolderInsideItsBound(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
+	holder := fmt.Sprintf("billet-import-livehost-7-feedface-%d",
+		now.Add(-CacheLockStaleAfter+time.Minute).Unix())
+	f := newCacheFake()
+	f.lockCookie = holder
+	c := cacheClient(t, f)
+	c.observation = time.Millisecond
+
+	if err := c.withCacheLock(t.Context(), now, func() error { return nil }); err == nil {
+		t.Fatal("a cache-index lock inside its recovery bound was reclaimed")
+	}
+	if f.ranWith("lock", "rm", holder) {
+		t.Fatal("billet removed a cache-index holder before its recovery bound")
+	}
+}
+
+func TestCacheIndexLockKeepsAnOldHolderWhoseHeartbeatMoves(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
+	holder := fmt.Sprintf("billet-import-livehost-7-abcd1234-%d",
+		now.Add(-100*CacheLockStaleAfter).Unix())
+	beats := 0
+	f := newCacheFake()
+	f.lockCookie = holder
+	f.heartbeat = func() string {
+		beats++
+
+		return strconv.Itoa(beats)
+	}
+	c := cacheClient(t, f)
+	c.observation = time.Millisecond
+
+	if err := c.withCacheLock(t.Context(), now, func() error { return nil }); err == nil {
+		t.Fatal("an old cache-index holder with a moving heartbeat was reclaimed")
+	}
+	if beats != 2 {
+		t.Fatalf("billet read %d heartbeats, want the two observations needed for liveness", beats)
+	}
+	if f.ranWith("lock", "rm", holder) {
+		t.Fatal("billet removed a live cache-index holder because of its age")
+	}
+}
+
+func TestPublishLockDoesNotInheritTheCacheRecoveryBound(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
+	holder := fmt.Sprintf("billet-import-livehost-7-cafebabe-%d",
+		now.Add(-CacheLockStaleAfter-time.Minute).Unix())
+	f := newCacheFake()
+	f.lockCookie = holder
+	c := cacheClient(t, f)
+	c.observation = time.Millisecond
+
+	if _, err := c.TakePublishLock(t.Context(), now); err == nil {
+		t.Fatal("the golden-image publish lock inherited the shorter cache recovery bound")
+	}
+	if f.ranWith("lock", "rm", holder) {
+		t.Fatal("billet removed a live golden-image publisher at the cache recovery bound")
+	}
 }
 
 func TestCacheMatchUsesExactThenNewestWithinTheFirstRestorePrefix(t *testing.T) {

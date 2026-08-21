@@ -21,6 +21,8 @@
 package nodeapi
 
 import (
+	"slices"
+
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
 )
@@ -70,11 +72,11 @@ import (
 // with an old node would otherwise record every price as zero and understate the
 // deployment-wide cost report without an error.
 //
-// VERSION 11 ADDS THE AUTHENTICATED CACHE SCOPE TO A LAUNCH AND THE TIER'S
-// interception decision. An old node would silently omit local caching for an
-// enabled tier, while an old server would send no owner, repository, or workflow
-// ref for the node to scope safely. Both mixed pairings are refused.
-const Version = 11
+// VERSION 12 MAKES TRUST AND CACHE SCOPE PROPERTIES OF A POOL, AND CARRIES THE
+// trusted pool's workflow boundary. An old server would still derive authority
+// from the assignment that caused a pooled runner to launch, even though GitHub
+// may give that runner another job. Mixed pairings are refused.
+const Version = 12
 
 // CommandKind names what the server is asking a node to do.
 type CommandKind string
@@ -254,8 +256,9 @@ func (c Command) RequestIDOf() int64 {
 // the acceptable providers ride on the lease, which is the authority for them
 // precisely because it was snapshotted when the reservation was made.
 type TierSpec struct {
-	Label string `json:"label"`
-	Image string `json:"image"`
+	Label string               `json:"label"`
+	Image string               `json:"image"`
+	Trust config.WorkloadTrust `json:"trust"`
 	// Command starts the runner inside the instance. Empty means the image's
 	// stock entrypoint.
 	Command []string `json:"command,omitempty"`
@@ -266,11 +269,15 @@ type TierSpec struct {
 	// silently means "the default group", so a tier deliberately placed elsewhere
 	// would have its registrations refused.
 	RunnerGroup string `json:"runner_group,omitempty"`
+	// Workflows is the exact workflow allowlist revalidated before a trusted
+	// registration is minted.
+	Workflows []string `json:"workflows,omitempty"`
 	// BuildKitCacheMountLimit is the operator's ceiling for each persistent
 	// BuildKit cache-mount record in this tier.
 	BuildKitCacheMountLimit config.ByteSize `json:"buildkit_cache_mount_limit"`
 	// Intercept enables the authenticated Actions results proxy for this tier.
-	Intercept bool `json:"intercept,omitempty"`
+	Intercept  bool               `json:"intercept,omitempty"`
+	CacheScope *config.CacheScope `json:"cache_scope,omitempty"`
 }
 
 // TierSpecOf renders the parts of a tier that travel to the selected provider's
@@ -280,11 +287,14 @@ func TierSpecOf(t config.Tier, provider config.ProviderKind) *TierSpec {
 	return &TierSpec{
 		Label:       t.Label,
 		Image:       t.ImageFor(provider),
+		Trust:       t.Trust.Effective(),
 		Command:     t.RunnerCommandFor(provider),
 		Disk:        t.Disk,
 		SHM:         t.SHM,
 		RunnerGroup: t.RunnerGroup,
+		Workflows:   slices.Clone(t.Workflows),
 		Intercept:   t.Intercept,
+		CacheScope:  t.CacheScope,
 		BuildKitCacheMountLimit: func() config.ByteSize {
 			if t.BuildKitCacheMountLimit > 0 {
 				return t.BuildKitCacheMountLimit

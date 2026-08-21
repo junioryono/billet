@@ -1071,6 +1071,19 @@ type GitHubConfig struct {
 type Tier struct {
 	Label string `yaml:"label"`
 
+	// Trust is the authority every member of this runner pool receives before
+	// GitHub assigns it a job. It is explicit because scale-set JIT runners are
+	// pool members, not registrations bound to the assignment that caused Billet
+	// to create them.
+	Trust WorkloadTrust `yaml:"trust"`
+	// Workflows is the exact GitHub runner-group workflow allowlist a trusted
+	// pool expects. An untrusted pool needs no routing claim for its safety.
+	Workflows []string `yaml:"workflows,omitempty"`
+	// CacheScope is the one immutable Actions cache identity placed in a guest at
+	// launch. It is required for interception because JobStarted arrives after
+	// the guest already has its launch-time credentials.
+	CacheScope *CacheScope `yaml:"cache_scope,omitempty"`
+
 	// Provider is the single backend this tier runs on. Kept because it is what
 	// almost every deployment wants and what every existing config says; it is
 	// normalized into Providers, which is what the rest of billet reads.
@@ -1172,6 +1185,115 @@ type Tier struct {
 	// machine is permanently 16 vCPU smaller, with no error and no log line. Reserve
 	// for tiers that have demand and are being crowded out. Zero is the default.
 	Reserved int `yaml:"reserved,omitempty"`
+}
+
+// WorkloadTrust is the launch authority shared by a tier's runner pool.
+type WorkloadTrust string
+
+const (
+	WorkloadUntrusted WorkloadTrust = "untrusted"
+	WorkloadTrusted   WorkloadTrust = "trusted"
+)
+
+// Valid reports whether the pool trust is one Billet understands.
+func (t WorkloadTrust) Valid() bool {
+	return t == WorkloadUntrusted || t == WorkloadTrusted
+}
+
+// Effective returns the restrictive migration default for an omitted trust.
+func (t WorkloadTrust) Effective() WorkloadTrust {
+	if t == "" {
+		return WorkloadUntrusted
+	}
+	return t
+}
+
+// PoolPolicyErrors reports unsafe or contradictory authority for a pooled
+// scale-set tier. Exported because alloc.New cannot assume its catalogue came
+// through Config.Load and must enforce the same boundary.
+func (t Tier) PoolPolicyErrors(where string) []error {
+	var errs []error
+	trust := t.Trust.Effective()
+	if !trust.Valid() {
+		errs = append(errs, fmt.Errorf("%s: trust %q is not one of [untrusted trusted]; "+
+			"scale-set runners are pooled, so launch authority must be explicit", where, t.Trust))
+	}
+	if trust == WorkloadTrusted {
+		if t.RunnerGroup == "" || t.RunnerGroup == "default" {
+			errs = append(errs, fmt.Errorf("%s: trusted pools require a non-default runner_group", where))
+		}
+		if len(t.Workflows) == 0 {
+			errs = append(errs, fmt.Errorf("%s: trusted pools require an exact workflows allowlist", where))
+		}
+	} else if len(t.Workflows) != 0 {
+		errs = append(errs, fmt.Errorf("%s: workflows applies only to a trusted pool", where))
+	}
+	seenWorkflows := make(map[string]struct{}, len(t.Workflows))
+	for j, workflow := range t.Workflows {
+		if err := checkWorkflowRef(workflow); err != nil {
+			errs = append(errs, fmt.Errorf("%s: workflows[%d] %q %w", where, j, workflow, err))
+		}
+		if _, duplicate := seenWorkflows[workflow]; duplicate {
+			errs = append(errs, fmt.Errorf("%s: workflow %q is listed twice", where, workflow))
+		}
+		seenWorkflows[workflow] = struct{}{}
+	}
+	if trust == WorkloadUntrusted && t.Intercept {
+		errs = append(errs, fmt.Errorf("%s: an untrusted pool cannot enable Actions cache interception", where))
+	}
+	if t.Intercept && t.CacheScope == nil {
+		errs = append(errs, fmt.Errorf("%s: intercept requires a static cache_scope because JobStarted arrives after launch", where))
+	}
+	if scope := t.CacheScope; scope != nil {
+		if strings.TrimSpace(scope.Owner) == "" || strings.TrimSpace(scope.Owner) != scope.Owner ||
+			strings.Contains(scope.Owner, "/") || len(scope.Owner) > 100 {
+			errs = append(errs, fmt.Errorf("%s: cache_scope.owner must be one trimmed path component no longer than 100 bytes", where))
+		}
+		if strings.TrimSpace(scope.Repository) == "" ||
+			strings.TrimSpace(scope.Repository) != scope.Repository ||
+			strings.Contains(scope.Repository, "/") || len(scope.Repository) > 100 {
+			errs = append(errs, fmt.Errorf("%s: cache_scope.repository must be one trimmed path component no longer than 100 bytes", where))
+		}
+		if err := checkWorkflowRef(scope.WorkflowRef); err != nil {
+			errs = append(errs, fmt.Errorf("%s: cache_scope.workflow_ref %q %w", where, scope.WorkflowRef, err))
+		} else {
+			workflow := strings.SplitN(strings.SplitN(scope.WorkflowRef, "@", 2)[0], "/", 3)
+			if len(workflow) < 2 || workflow[0] != scope.Owner || workflow[1] != scope.Repository {
+				errs = append(errs, fmt.Errorf("%s: cache_scope owner/repository must match workflow_ref", where))
+			}
+		}
+		if t.Intercept {
+			if _, allowed := seenWorkflows[scope.WorkflowRef]; !allowed {
+				errs = append(errs, fmt.Errorf("%s: cache_scope.workflow_ref must be one of the trusted workflows", where))
+			}
+		}
+	}
+
+	return errs
+}
+
+func checkWorkflowRef(value string) error {
+	if strings.TrimSpace(value) == "" || strings.TrimSpace(value) != value || len(value) > 2048 ||
+		strings.ContainsAny(value, "\x00\r\n") {
+		return errors.New("must be a non-empty, trimmed GitHub workflow ref no longer than 2048 bytes")
+	}
+	workflow, ref, ok := strings.Cut(value, "@")
+	if !ok || workflow == "" || ref == "" || strings.Contains(ref, "@") {
+		return errors.New("must have owner/repository/.github/workflows/file.yml@ref form")
+	}
+	parts := strings.Split(workflow, "/")
+	if len(parts) != 5 || parts[0] == "" || parts[1] == "" || parts[2] != ".github" ||
+		parts[3] != "workflows" || (pathpkg.Ext(parts[4]) != ".yml" && pathpkg.Ext(parts[4]) != ".yaml") {
+		return errors.New("must name owner/repository/.github/workflows/file.yml")
+	}
+	return nil
+}
+
+// CacheScope is the authenticated identity an intercepted Actions cache uses.
+type CacheScope struct {
+	Owner       string `yaml:"owner"`
+	Repository  string `yaml:"repository"`
+	WorkflowRef string `yaml:"workflow_ref"`
 }
 
 // TierLaunch is the part of a tier whose spelling belongs to one backend.
@@ -1807,6 +1929,12 @@ func (c *Config) applyDefaults() {
 	}
 	for i := range c.Tiers {
 		t := &c.Tiers[i]
+		// Existing configurations become the restrictive pool shape. This is a
+		// migration default, not a trust inference: an operator must opt into the
+		// privileged shape together with its runner-group workflow boundary.
+		if t.Trust == "" {
+			t.Trust = WorkloadUntrusted
+		}
 		// The PINNED host's provider wins over the local node's: on a multi-host
 		// deployment the file describing the EPYC box would otherwise stamp `firecracker`
 		// onto a tier pinned to a Mac. Only a VALID provider is inherited, or an unknown
@@ -2974,6 +3102,8 @@ func (c *Config) validateTiers() []error {
 		}
 		seen[t.Label] = struct{}{}
 
+		errs = append(errs, t.PoolPolicyErrors(where)...)
+
 		errs = append(errs, t.ProviderErrors(where)...)
 		errs = append(errs, t.InterceptionErrors(where)...)
 		errs = append(errs, t.ReservationErrors(where)...)
@@ -3559,8 +3689,8 @@ const PollInterval = 15 * time.Second
 //
 // A self-hosted runner updates itself by EXITING: the listener returns "updating"
 // and the wrapper notices and re-execs it with the same arguments — including the JIT
-// registration, which is what lets the restarted runner go on to take the job it was
-// created for. Exec the listener directly and there is no loop: on a backend where
+// registration, which is what lets the restarted runner go on to take one job from
+// its pool. Exec the listener directly and there is no loop: on a backend where
 // each job gets its own machine, the listener exits, the machine is destroyed as
 // though the work were finished, the job is redelivered, and the next machine does
 // the same thing.

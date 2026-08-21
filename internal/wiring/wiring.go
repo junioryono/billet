@@ -16,7 +16,9 @@ package wiring
 
 import (
 	"context"
+	"errors"
 
+	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/node"
 	"github.com/junioryono/billet/internal/nodeplane"
 	"github.com/junioryono/billet/internal/scaleset"
@@ -43,8 +45,26 @@ func (p Provisioner) Session(ctx context.Context, scaleSetID int, owner string) 
 	return p.Client.Session(ctx, scaleSetID, owner)
 }
 
+// RemoveRunner removes routing before the control plane tears compute down.
+func (p Provisioner) RemoveRunner(ctx context.Context, runnerID int64, runnerName string) error {
+	return p.Client.RemoveRunner(ctx, runnerID, runnerName)
+}
+
+// ValidateTrustedRunnerGroup verifies a trusted tier's workflow boundary.
+func (p Provisioner) ValidateTrustedRunnerGroup(ctx context.Context, group string,
+	workflows []string,
+) error {
+	return p.Client.ValidateTrustedRunnerGroup(ctx, group, workflows)
+}
+
 // JITSource adapts the client to what the node needs to mint registrations.
-type JITSource struct{ Client *scaleset.Client }
+type JITSource struct {
+	Client *scaleset.Client
+	Pool   interface {
+		PoolRunnerByLease(context.Context, string) (alloc.PoolRunner, error)
+		RetirePoolRunner(context.Context, string) error
+	}
+}
 
 // Describe resolves a tier's scale set, reporting a nil set when there is none.
 //
@@ -66,6 +86,39 @@ func (j JITSource) JITConfig(
 	ctx context.Context, scaleSetID int, runnerName, workFolder string,
 ) (node.Registration, error) {
 	return j.Client.JITConfig(ctx, scaleSetID, runnerName, workFolder)
+}
+
+// RemoveRunner removes a failed local launch's GitHub registration.
+func (j JITSource) RemoveRunner(
+	ctx context.Context, _ string, runnerID int64, runnerName string,
+) error {
+	return j.Client.RemoveRunner(ctx, runnerID, runnerName)
+}
+
+// EnsureRunnerRemoved resolves a restart-surviving registration from the
+// control-plane journal before recovered compute is touched.
+func (j JITSource) EnsureRunnerRemoved(ctx context.Context, leaseID string) error {
+	if j.Pool == nil {
+		return errors.New("wiring: runner identity storage is unavailable")
+	}
+	binding, err := j.Pool.PoolRunnerByLease(ctx, leaseID)
+	if errors.Is(err, alloc.ErrLeaseNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if err := j.Pool.RetirePoolRunner(ctx, leaseID); err != nil {
+		return err
+	}
+	return j.Client.RemoveRunner(ctx, binding.RunnerID, binding.RunnerName)
+}
+
+// ValidateTrustedRunnerGroup verifies policy immediately before local minting.
+func (j JITSource) ValidateTrustedRunnerGroup(ctx context.Context, group string,
+	workflows []string,
+) error {
+	return j.Client.ValidateTrustedRunnerGroup(ctx, group, workflows)
 }
 
 // NodeJIT is the same source, shaped for the node wire.
@@ -98,4 +151,16 @@ func (n NodeJIT) JITConfig(
 	ctx context.Context, scaleSetID int, runnerName, workFolder string,
 ) (nodeplane.JITRegistration, error) {
 	return n.Client.JITConfig(ctx, scaleSetID, runnerName, workFolder)
+}
+
+// RemoveRunner removes a remote node's failed-launch registration.
+func (n NodeJIT) RemoveRunner(ctx context.Context, runnerID int64, runnerName string) error {
+	return n.Client.RemoveRunner(ctx, runnerID, runnerName)
+}
+
+// ValidateTrustedRunnerGroup verifies policy immediately before remote minting.
+func (n NodeJIT) ValidateTrustedRunnerGroup(ctx context.Context, group string,
+	workflows []string,
+) error {
+	return n.Client.ValidateTrustedRunnerGroup(ctx, group, workflows)
 }

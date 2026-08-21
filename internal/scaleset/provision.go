@@ -3,6 +3,7 @@ package scaleset
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -12,6 +13,33 @@ import (
 
 // DefaultRunnerGroup is where a scale set lands when a tier names no group.
 const DefaultRunnerGroup = gh.DefaultRunnerGroup
+
+// ValidateTrustedRunnerGroup verifies the GitHub-side workflow boundary before
+// Billet gives a pool trusted launch authority.
+func (c *Client) ValidateTrustedRunnerGroup(ctx context.Context, group string,
+	workflows []string,
+) error {
+	if group == "" {
+		group = DefaultRunnerGroup
+	}
+	rg, err := c.gh.GetRunnerGroupByName(ctx, group)
+	if err != nil {
+		return fmt.Errorf("scaleset: find trusted runner group %q: %w", group, err)
+	}
+	if rg == nil {
+		return fmt.Errorf("scaleset: trusted runner group %q does not exist", group)
+	}
+	if rg.IsDefault || group == DefaultRunnerGroup {
+		return fmt.Errorf("scaleset: the default runner group cannot back a trusted pool")
+	}
+	if c.policy == nil {
+		return fmt.Errorf("scaleset: trusted runner-group policy validation is not configured")
+	}
+	if err := c.policy.ValidateTrustedRunnerGroup(ctx, rg.ID, workflows); err != nil {
+		return fmt.Errorf("scaleset: validate trusted runner group %q: %w", group, err)
+	}
+	return nil
+}
 
 // ScaleSet is billet's view of one provisioned scale set.
 type ScaleSet struct {
@@ -277,7 +305,8 @@ func toLabels(labels []string) []gh.Label {
 //
 // "No registration token ever enters the guest" is a claim billet makes, and it
 // is true — but it must not be read as "no credential enters the guest". This
-// one does. What is defensible is that it is single-use and scoped to one job.
+// one does. What is defensible is that it is single-use for one ephemeral pool
+// registration, which the runner consumes before any workflow step.
 //
 //nolint:recvcheck // String/GoString/Format take VALUE receivers deliberately: a pointer-receiver String is not consulted when a value is formatted, which is how the App key leaked through %v before.
 type JITRunner struct {
@@ -301,6 +330,9 @@ func (j *JITRunner) Config() string { return j.encodedConfig }
 // The distinction matters because the encoded registration identifies GitHub's
 // runner, and teardown has to remove THAT one.
 func (j *JITRunner) RunnerName() string { return j.Name }
+
+// ID is GitHub's durable runner identity.
+func (j *JITRunner) ID() int64 { return j.RunnerID }
 
 // String redacts. See the type comment.
 func (j JITRunner) String() string {
@@ -381,11 +413,11 @@ func (e *redactedError) Error() string {
 // this endpoint's failures are all handled the same way.
 func (e *redactedError) Unwrap() error { return nil }
 
-// JITConfig generates a single-use runner registration for one job.
+// JITConfig generates a single-use credential for one ephemeral pool runner.
 //
-// One config, one runner, one job: the runner is registered ephemeral, takes the
-// job it was created for, and is destroyed. That is what makes the credential in
-// it acceptable to hand to a guest.
+// One config creates one runner. GitHub may route that runner any job admitted
+// to the scale set; the runner consumes at most one and is then destroyed. That
+// is what makes the credential in it acceptable to hand to a guest.
 func (c *Client) JITConfig(ctx context.Context, scaleSetID int, runnerName, workFolder string) (*JITRunner, error) {
 	if workFolder == "" {
 		workFolder = "_work"
@@ -432,4 +464,30 @@ func (c *Client) JITConfig(ctx context.Context, scaleSetID int, runnerName, work
 	}
 
 	return out, nil
+}
+
+// RemoveRunner removes the exact ephemeral registration before compute teardown.
+// Name is the restart-safe fallback when the numeric id was not yet observed.
+func (c *Client) RemoveRunner(ctx context.Context, runnerID int64, runnerName string) error {
+	if runnerName != "" {
+		runner, err := c.gh.GetRunnerByName(ctx, runnerName)
+		if err != nil {
+			return fmt.Errorf("scaleset: find runner %q before removal: %w", runnerName, err)
+		}
+		if runner == nil {
+			return nil
+		}
+		if runnerID != 0 && runnerID != int64(runner.ID) {
+			return fmt.Errorf("scaleset: runner %q now has id %d, not the expected %d; refusing to remove a replacement registration",
+				runnerName, runner.ID, runnerID)
+		}
+		runnerID = int64(runner.ID)
+	}
+	if runnerID == 0 {
+		return errors.New("scaleset: runner removal needs an id or name")
+	}
+	if err := c.gh.RemoveRunner(ctx, runnerID); err != nil {
+		return fmt.Errorf("scaleset: remove runner %q (%d): %w", runnerName, runnerID, err)
+	}
+	return nil
 }

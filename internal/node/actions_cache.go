@@ -150,8 +150,8 @@ func (s *CacheService) actionsResponse(
 	}
 
 	// Untrusted work never writes a generation that trusted work can read. GitHub
-	// remains authoritative for fork cache scopes; Billet does not attempt to
-	// recreate that policy from a job message.
+	// remains authoritative for untrusted-pool cache traffic; Billet does not
+	// derive storage authority from the assignment that caused scale-up.
 	if session.trust != provider.TrustTrusted || s.actionRule == nil {
 		return nil, false, nil
 	}

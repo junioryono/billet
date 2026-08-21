@@ -231,6 +231,44 @@ func TestLoadValid(t *testing.T) {
 	if first.Intercept {
 		t.Error("intercept defaulted to true; it must default to false")
 	}
+	if first.Trust != WorkloadUntrusted {
+		t.Errorf("omitted trust defaulted to %q, want restrictive untrusted migration", first.Trust)
+	}
+}
+
+func TestTrustedPoolPolicyMustBeCompleteAndInternallyConsistent(t *testing.T) {
+	base := strings.Replace(validConfig, "  - label: billet-4vcpu-ubuntu-2404\n",
+		"  - label: billet-4vcpu-ubuntu-2404\n    trust: trusted\n    runner_group: trusted\n    workflows: [acme/api/.github/workflows/ci.yml@refs/heads/main]\n", 1)
+	if _, err := Load(writeConfig(t, base)); err != nil {
+		t.Fatalf("valid trusted pool: %v", err)
+	}
+	for name, body := range map[string]string{
+		"default group": strings.Replace(base, "    runner_group: trusted\n", "", 1),
+		"no workflows": strings.Replace(base,
+			"    workflows: [acme/api/.github/workflows/ci.yml@refs/heads/main]\n", "", 1),
+		"malformed workflow": strings.Replace(base,
+			"acme/api/.github/workflows/ci.yml@refs/heads/main", "not-a-workflow", 1),
+		"duplicate workflow": strings.Replace(base,
+			"workflows: [acme/api/.github/workflows/ci.yml@refs/heads/main]",
+			"workflows: [acme/api/.github/workflows/ci.yml@refs/heads/main, acme/api/.github/workflows/ci.yml@refs/heads/main]", 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Load(writeConfig(t, body)); err == nil {
+				t.Fatalf("accepted %s", name)
+			}
+		})
+	}
+}
+
+func TestStaticCacheScopeMustMatchTheTrustedWorkflow(t *testing.T) {
+	base := strings.Replace(validConfig, "  - label: billet-4vcpu-ubuntu-2404\n",
+		"  - label: billet-4vcpu-ubuntu-2404\n    trust: trusted\n    runner_group: trusted\n    workflows: [acme/api/.github/workflows/ci.yml@refs/heads/main]\n", 1)
+	base = strings.Replace(base, "    image: ubuntu-2404-x64\n",
+		"    image: ubuntu-2404-x64\n    cache_scope:\n      owner: acme\n      repository: other\n      workflow_ref: acme/api/.github/workflows/other.yml@refs/heads/main\n", 1)
+	if _, err := Load(writeConfig(t, base)); err == nil ||
+		!strings.Contains(err.Error(), "owner/repository must match") {
+		t.Fatalf("mismatched cache scope error = %v", err)
+	}
 }
 
 func TestUnimplementedTierAcceleratorsAreRefusedRatherThanIgnored(t *testing.T) {
@@ -260,8 +298,10 @@ func TestActionsCacheInterceptionRequiresAHostBackedCacheNode(t *testing.T) {
 
 	withCache := strings.Replace(validConfig, "  ceph:\n",
 		"  cache:\n    listen: 172.20.0.1:7718\n    guest_endpoint: http://172.20.0.1:7718\n  ceph:\n", 1)
-	withIntercept := strings.Replace(withCache, "    image: ubuntu-2404-x64\n",
-		"    image: ubuntu-2404-x64\n    intercept: true\n", 1)
+	trusted := strings.Replace(withCache, "  - label: billet-4vcpu-ubuntu-2404\n",
+		"  - label: billet-4vcpu-ubuntu-2404\n    trust: trusted\n    runner_group: trusted\n    workflows: [acme/api/.github/workflows/ci.yml@refs/heads/main]\n", 1)
+	withIntercept := strings.Replace(trusted, "    image: ubuntu-2404-x64\n",
+		"    image: ubuntu-2404-x64\n    intercept: true\n    cache_scope:\n      owner: acme\n      repository: api\n      workflow_ref: acme/api/.github/workflows/ci.yml@refs/heads/main\n", 1)
 	if _, err := Load(writeConfig(t, withIntercept)); err != nil {
 		t.Fatalf("a Firecracker tier with the node cache was rejected: %v", err)
 	}
@@ -273,9 +313,8 @@ func TestActionsCacheInterceptionRequiresAHostBackedCacheNode(t *testing.T) {
 		t.Fatalf("interception without a node cache was not refused clearly: %v", err)
 	}
 
-	remote := strings.Replace(withIntercept,
-		"  - label: billet-4vcpu-ubuntu-2404\n    provider: firecracker\n",
-		"  - label: billet-4vcpu-ubuntu-2404\n    provider: ec2\n", 1)
+	remote := strings.Replace(withIntercept, "    provider: firecracker\n",
+		"    provider: ec2\n", 1)
 	if _, err := Load(writeConfig(t, remote)); err == nil ||
 		!strings.Contains(err.Error(), "only the firecracker provider") {
 		t.Fatalf("interception on remote compute was not refused clearly: %v", err)

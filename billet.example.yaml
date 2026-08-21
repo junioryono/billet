@@ -569,6 +569,13 @@ tiers:
 
   - label: billet-4vcpu-ubuntu-2404
     provider: firecracker
+    # Omitted trust safely defaults to untrusted. Interception needs a trusted
+    # pool in a non-default GitHub runner group restricted to these exact
+    # workflows; billet verifies the live group policy before every JIT mint.
+    # trust: trusted
+    # runner_group: billet-cache-trusted
+    # workflows:
+    #   - acme/api/.github/workflows/ci.yml@refs/heads/main
     vcpu: 4
     memory: 16GiB
     disk: 80GiB
@@ -579,6 +586,10 @@ tiers:
     # toolkit CacheService client is local; BuildKit type=gha, ArtifactService,
     # unknown clients and unknown methods remain on GitHub.
     # intercept: true
+    # cache_scope:
+    #   owner: acme
+    #   repository: api
+    #   workflow_ref: acme/api/.github/workflows/ci.yml@refs/heads/main
 
   - label: billet-8vcpu-ubuntu-2404
     provider: firecracker

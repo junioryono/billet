@@ -197,7 +197,7 @@ func (c *Client) TakePublishLock(ctx context.Context, now time.Time) (*PublishLo
 		return nil, err
 	}
 
-	return c.takeLock(ctx, image, cookie, now)
+	return c.takeLock(ctx, image, cookie, now, StaleLockAfter)
 }
 
 // takeLock claims an advisory lock on one dedicated image.
@@ -205,6 +205,7 @@ func (c *Client) takeLock(
 	ctx context.Context,
 	image, cookie string,
 	now time.Time,
+	staleAfter time.Duration,
 ) (*PublishLock, error) {
 	// CREATED IF ABSENT, AND A FAILURE HERE IS NOT FATAL. The ordinary case is that
 	// it already exists, which `rbd create` reports as an error; distinguishing
@@ -281,7 +282,7 @@ func (c *Client) takeLock(
 
 	after := c.observeHeartbeat(ctx, image, holder.ID)
 
-	mayBreak, why := breakable(before, after, age)
+	mayBreak, why := breakable(before, after, age, staleAfter)
 	if !mayBreak {
 		return nil, fmt.Errorf("ceph: %s is held by %s and %s; this publisher is standing down "+
 			"rather than writing into the same image", image, holder.ID, why)

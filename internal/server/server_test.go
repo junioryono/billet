@@ -197,6 +197,23 @@ func TestNoListenerStartsUntilEveryScaleSetExists(t *testing.T) {
 	}
 }
 
+func TestTrustedTierRefusesRunnerGroupPolicyDriftBeforeReconciliation(t *testing.T) {
+	tr := tier("billet-4vcpu-a")
+	tr.Trust = config.WorkloadTrusted
+	tr.RunnerGroup = "trusted"
+	tr.Workflows = []string{"acme/api/.github/workflows/ci.yml@refs/heads/main"}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 4, MaxMemory: 64 * config.GiB},
+		[]config.Tier{tr})
+	prov := &fakeProvisioner{validateErr: errors.New("workflow restriction drifted")}
+	err := New(a, prov, []config.Tier{tr}, "test-owner", nil).Run(t.Context())
+	if err == nil || !strings.Contains(err.Error(), "workflow restriction drifted") {
+		t.Fatalf("trusted tier policy error = %v", err)
+	}
+	if prov.next != 0 {
+		t.Fatalf("reconciled %d scale sets after trusted policy refusal", prov.next)
+	}
+}
+
 // A tier that cannot be reconciled stops the whole start-up, and says which one.
 func TestReconciliationFailureStopsStartup(t *testing.T) {
 	tiers := []config.Tier{tier("billet-4vcpu-a"), tier("billet-4vcpu-b")}
@@ -366,8 +383,10 @@ func TestAGreedyTierCanTakeTheWholeBudget(t *testing.T) {
 
 // fakeProvisioner stands in for GitHub's scale-set API.
 type fakeProvisioner struct {
-	onEnsure   func(label string) error
-	newSession func(label string) Session
+	onEnsure    func(label string) error
+	newSession  func(label string) Session
+	validateErr error
+	validated   []string
 
 	mu     sync.Mutex
 	next   int
@@ -406,4 +425,13 @@ func (f *fakeProvisioner) Session(_ context.Context, scaleSetID int, _ string) (
 	f.mu.Unlock()
 
 	return f.newSession(label), nil
+}
+
+func (*fakeProvisioner) RemoveRunner(context.Context, int64, string) error { return nil }
+
+func (f *fakeProvisioner) ValidateTrustedRunnerGroup(_ context.Context, group string,
+	_ []string,
+) error {
+	f.validated = append(f.validated, group)
+	return f.validateErr
 }

@@ -542,6 +542,17 @@ func (c *Client) Describe(ctx context.Context, name, group string) (*node.Set, [
 	return &node.Set{ID: res.ID, Name: res.Name}, res.Names, nil
 }
 
+// ValidateTrustedRunnerGroup asks the credential-holding control plane to
+// revalidate the workflow boundary immediately before this node requests a JIT
+// registration. The control plane repeats the check against the entitled tier
+// while minting, so a compromised node cannot substitute this request.
+func (c *Client) ValidateTrustedRunnerGroup(
+	ctx context.Context, group string, workflows []string,
+) error {
+	return c.do(ctx, http.MethodPost, c.nodePath("/trusted-runner-group"),
+		nodeapi.TrustedRunnerGroupRequest{Group: group, Workflows: workflows}, nil)
+}
+
 // JITConfig asks the control plane to mint one runner registration.
 func (c *Client) JITConfig(
 	ctx context.Context, scaleSetID int, runnerName, workFolder string,
@@ -563,7 +574,23 @@ func (c *Client) JITConfig(
 				"start an instance that can never register", runnerName)
 	}
 
-	return &registration{config: res.Config, name: res.RunnerName}, nil
+	return &registration{config: res.Config, id: res.RunnerID, name: res.RunnerName}, nil
+}
+
+// RemoveRunner asks the credential-holding control plane to withdraw routing.
+func (c *Client) RemoveRunner(
+	ctx context.Context, leaseID string, runnerID int64, runnerName string,
+) error {
+	return c.do(ctx, http.MethodPost, c.leasePath(leaseID, "/runner/remove"), nodeapi.RemoveRunnerRequest{
+		RunnerID: runnerID, RunnerName: runnerName,
+	}, nil)
+}
+
+// EnsureRunnerRemoved resolves a restart-surviving registration by its lease
+// and withdraws it before recovered custody touches compute.
+func (c *Client) EnsureRunnerRemoved(ctx context.Context, leaseID string) error {
+	return c.do(ctx, http.MethodPost, c.leasePath(leaseID, "/runner/remove"),
+		nodeapi.RemoveRunnerRequest{}, nil)
 }
 
 // registration is a minted registration whose config is a CREDENTIAL.
@@ -574,11 +601,13 @@ func (c *Client) JITConfig(
 // exactly when it would happen.
 type registration struct {
 	config string
+	id     int64
 	name   string
 }
 
 func (r *registration) Config() string     { return r.config }
 func (r *registration) RunnerName() string { return r.name }
+func (r *registration) ID() int64          { return r.id }
 
 // String keeps the credential out of anything that formats this value.
 func (r *registration) String() string {

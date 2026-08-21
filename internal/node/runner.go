@@ -23,8 +23,8 @@ import (
 	"github.com/junioryono/billet/internal/server"
 )
 
-// JITSource mints single-use runner registrations and finds the scale set to
-// mint them against.
+// JITSource mints single-use credentials for ephemeral pool registrations and
+// finds the scale set to mint them against.
 //
 // An interface rather than the concrete client so this package does not depend
 // on the preview scale-set API, and so a test can drive the whole launch path
@@ -34,6 +34,14 @@ type JITSource interface {
 	Describe(ctx context.Context, name, group string) (*Set, []string, error)
 	// JITConfig mints a registration for one runner against one scale set.
 	JITConfig(ctx context.Context, scaleSetID int, runnerName, workFolder string) (Registration, error)
+	// RemoveRunner removes routing before failed-launch compute is touched.
+	RemoveRunner(ctx context.Context, leaseID string, runnerID int64, runnerName string) error
+	// EnsureRunnerRemoved resolves a restart-surviving registration by lease.
+	EnsureRunnerRemoved(ctx context.Context, leaseID string) error
+}
+
+type trustedRunnerGroupValidator interface {
+	ValidateTrustedRunnerGroup(context.Context, string, []string) error
 }
 
 // Set is the part of a scale set this package needs.
@@ -49,6 +57,8 @@ type Registration interface {
 	Config() string
 	// RunnerName is what GitHub registered, which is what teardown needs.
 	RunnerName() string
+	// ID is GitHub's durable runner identity.
+	ID() int64
 }
 
 // LeaseStore is the part of the capacity ledger the runner uses.
@@ -261,7 +271,15 @@ func (r *Runner) Launch(
 			job.RequestID, leaseID)
 	}
 
-	trust := provider.Classify(job.Event)
+	var trust provider.TrustClass
+	switch tier.Trust.Effective() {
+	case config.WorkloadTrusted:
+		trust = provider.TrustTrusted
+	case config.WorkloadUntrusted:
+		trust = provider.TrustUntrusted
+	default:
+		return fmt.Errorf("node: tier %q has unknown pool trust %q", tier.Label, tier.Trust)
+	}
 
 	if err := r.provider.Accepts(trust); err != nil {
 		return fmt.Errorf("node: %w", err)
@@ -316,6 +334,15 @@ func (r *Runner) Launch(
 	// crash the name is what reconciliation reads to decide whether a surviving
 	// instance is still wanted. See provider.InstanceName.
 	name := provider.InstanceName(lease.ID)
+	if tier.Trust.Effective() == config.WorkloadTrusted {
+		validator, ok := r.jit.(trustedRunnerGroupValidator)
+		if !ok {
+			return fmt.Errorf("node: trusted runner-group policy cannot be verified before registration")
+		}
+		if err := validator.ValidateTrustedRunnerGroup(ctx, tier.RunnerGroup, tier.Workflows); err != nil {
+			return fmt.Errorf("node: trusted runner-group policy drifted: %w", err)
+		}
+	}
 
 	reg, err := r.jit.JITConfig(ctx, setID, name, "_work")
 	if err != nil {
@@ -335,10 +362,13 @@ func (r *Runner) Launch(
 	var buildKitCacheMountLimit config.ByteSize
 	if r.cache != nil {
 		var credentials CacheCredentials
-		credentials, err = r.cache.PrepareScoped(name, CacheSessionScope{
-			Trust: trust, Intercept: tier.Intercept && trust == provider.TrustTrusted, Owner: job.Owner,
-			Repository: job.Repository, WorkflowRef: job.WorkflowRef,
-		})
+		scope := CacheSessionScope{Trust: trust, Intercept: tier.Intercept && trust == provider.TrustTrusted}
+		if tier.CacheScope != nil {
+			scope.Owner = tier.CacheScope.Owner
+			scope.Repository = tier.CacheScope.Repository
+			scope.WorkflowRef = tier.CacheScope.WorkflowRef
+		}
+		credentials, err = r.cache.PrepareScoped(name, scope)
 		if err != nil {
 			r.log.Warn("cache access is unavailable; this job will continue cold",
 				"instance", name, "error", err)
@@ -393,9 +423,8 @@ func (r *Runner) Launch(
 		Disk:  tier.Disk,
 		SHM:   tier.SHM,
 
-		// Classified from the event that queued the job. The zero value is
-		// unknown and backends refuse it, so a job whose event billet does not
-		// recognise cannot run anywhere weak by default.
+		// Static authority for every workflow GitHub may route to this pool. The
+		// zero value is unknown and backends refuse it.
 		Trust: trust,
 
 		JITConfig:               reg.Config(),
@@ -423,6 +452,11 @@ func (r *Runner) Launch(
 		// hand back capacity a container may still be using. CUSTODY UNLESS THE CLEANUP WAS
 		// CAUSAL: a successful synchronous Destroy or an explicit terminal record proves
 		// the compute is gone; an absent snapshot does not.
+		if removeErr := r.removeRegistration(ctx, lease.ID, reg.ID(), reg.RunnerName()); removeErr != nil {
+			r.holdWithRegistration(lease, name, job.RequestID, reg.ID(), reg.RunnerName())
+
+			return errCustody(name, errors.Join(err, removeErr))
+		}
 		if cleanup, cleanupErr := r.destroyStray(ctx, name); !cleanup.confirmed {
 			r.holdWithEvidence(lease, name, job.RequestID, cleanup.evidence)
 
@@ -446,6 +480,38 @@ func (r *Runner) Launch(
 	r.log.Info("started a runner",
 		"tier", lease.Tier, "request", job.RequestID, "runner", inst.Name,
 		"instance", inst.ID, "trust", trust)
+
+	return nil
+}
+
+func (r *Runner) removeRegistration(
+	ctx context.Context, leaseID string, runnerID int64, runnerName string,
+) error {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), strayCleanupTimeout)
+	defer cancel()
+
+	return r.jit.RemoveRunner(cleanupCtx, leaseID, runnerID, runnerName)
+}
+
+// ensureRegistrationRemoved restores the routing-before-compute ordering after
+// a restart, when custody no longer has the exact identity it originally held.
+func (r *Runner) ensureRegistrationRemoved(ctx context.Context, c *custody) error {
+	if c.registrationRemoved {
+		return nil
+	}
+	if c.registrationPending {
+		if err := r.removeRegistration(ctx, c.leaseID, c.runnerID, c.runnerName); err != nil {
+			return err
+		}
+	} else {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), strayCleanupTimeout)
+		defer cancel()
+		if err := r.jit.EnsureRunnerRemoved(cleanupCtx, c.leaseID); err != nil {
+			return err
+		}
+	}
+	c.registrationPending = false
+	c.registrationRemoved = true
 
 	return nil
 }

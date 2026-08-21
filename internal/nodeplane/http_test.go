@@ -174,6 +174,8 @@ type fakeStore struct {
 	advanced []alloc.Phase
 	released []alloc.Phase
 	failures []string
+	pool     map[string]alloc.PoolRunner
+	retired  []string
 }
 
 type cachePolicyFunc func(context.Context, string, string) (bool, error)
@@ -241,6 +243,76 @@ func (f *fakeStore) Lease(context.Context, string) (*alloc.Lease, error) {
 
 	return f.lease, f.leaseErr
 }
+
+func (f *fakeStore) RegisterPoolRunner(_ context.Context, runner alloc.PoolRunner) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.pool == nil {
+		f.pool = make(map[string]alloc.PoolRunner)
+	}
+	f.pool[runner.RunnerName] = runner
+	return nil
+}
+
+func (f *fakeStore) PoolRunnerByName(_ context.Context, name string) (alloc.PoolRunner, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	runner, ok := f.pool[name]
+	if !ok {
+		return alloc.PoolRunner{}, alloc.ErrLeaseNotFound
+	}
+	return runner, nil
+}
+
+func (f *fakeStore) PoolRunnerByLease(_ context.Context, leaseID string) (alloc.PoolRunner, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, runner := range f.pool {
+		if runner.LeaseID == leaseID {
+			return runner, nil
+		}
+	}
+	return alloc.PoolRunner{}, alloc.ErrLeaseNotFound
+}
+
+func (f *fakeStore) RetirePoolRunner(_ context.Context, leaseID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for name, runner := range f.pool {
+		if runner.LeaseID != leaseID {
+			continue
+		}
+		runner.Status = alloc.PoolRunnerRetiring
+		f.pool[name] = runner
+		f.retired = append(f.retired, leaseID)
+		return nil
+	}
+	return alloc.ErrLeaseNotFound
+}
+
+type returnedJIT struct {
+	removed   []string
+	removeErr error
+}
+
+func (*returnedJIT) Describe(context.Context, string, string) (*nodeplane.JITSet, []string, error) {
+	return &nodeplane.JITSet{ID: 7, Name: "billet-2vcpu"}, nil, nil
+}
+
+func (*returnedJIT) JITConfig(context.Context, int, string, string) (nodeplane.JITRegistration, error) {
+	return returnedRegistration{}, nil
+}
+
+func (j *returnedJIT) RemoveRunner(_ context.Context, _ int64, name string) error {
+	j.removed = append(j.removed, name)
+	return j.removeErr
+}
+
+type returnedRegistration struct{}
+
+func (returnedRegistration) Config() string     { return "single-use-credential" }
+func (returnedRegistration) RunnerName() string { return "github-returned-name" }
+func (returnedRegistration) ID() int64          { return 91 }
 
 // QuarantinedLeaseIDs are the leases this fake says are holding capacity for
 // compute nobody has accounted for.
@@ -379,6 +451,65 @@ func TestACommandAndItsResultCrossTheWire(t *testing.T) {
 	// run, which is exactly what this file did on its first green build.
 	if err := <-reported; err != nil {
 		t.Errorf("the node could not report: %v", err)
+	}
+}
+
+func TestJITPersistsGitHubsReturnedIdentityBeforeGivingItToTheNode(t *testing.T) {
+	store := &fakeStore{lease: &alloc.Lease{
+		ID: "l1", Tier: "billet-2vcpu", Node: "n1", Epoch: 1, RequestID: 7,
+	}}
+	jit := &returnedJIT{}
+	log := slog.New(slog.DiscardHandler)
+	p := nodeplane.New(log, deployment, time.Minute, nodeplane.WithTierCatalog([]config.Tier{{
+		Label: "billet-2vcpu", Provider: config.ProviderDocker, GuestOS: config.GuestLinux,
+		VCPU: 2, Memory: 8 * config.GiB, Image: "ubuntu-2404-x64",
+	}}), nodeplane.WithCommandTimeout(time.Minute))
+	srv := httptest.NewServer(nodeplane.Handler(log, p, store, jit))
+	t.Cleanup(srv.Close)
+	c := dial(t, srv.URL)
+
+	lease := &alloc.Lease{ID: "l1", Tier: "billet-2vcpu", Node: "n1", Epoch: 1,
+		RequestID: 7, VCPU: 2, Memory: 8 * config.GiB, GuestOS: config.GuestLinux,
+		Providers: []config.ProviderKind{config.ProviderDocker}}
+	launched := make(chan error, 1)
+	go func() { launched <- p.NewRunner().Launch(t.Context(), lease, server.Job{RequestID: 7}) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for p.QueuedForTest("n1") == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("launch was never queued")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if _, ok, err := c.Poll(t.Context()); err != nil || !ok {
+		t.Fatalf("Poll = ok %v, err %v", ok, err)
+	}
+	reg, err := c.JITConfig(t.Context(), 7, "billet-l1", "_work")
+	if err != nil {
+		t.Fatalf("JITConfig: %v", err)
+	}
+	if reg.RunnerName() != "github-returned-name" || reg.ID() != 91 {
+		t.Fatalf("returned registration = name %q id %d", reg.RunnerName(), reg.ID())
+	}
+	member, err := store.PoolRunnerByName(t.Context(), "github-returned-name")
+	if err != nil || member.LeaseID != "l1" || member.LaunchRequestID != 7 ||
+		member.RunnerID != 91 || member.RunnerName != "github-returned-name" {
+		t.Fatalf("durable GitHub identity = %+v, err %v", member, err)
+	}
+	jit.removeErr = errors.New("github unavailable")
+	if err := c.RemoveRunner(t.Context(), "l1", 91, "github-returned-name"); err == nil {
+		t.Fatal("RemoveRunner succeeded while GitHub was unavailable")
+	}
+	member, err = store.PoolRunnerByName(t.Context(), "github-returned-name")
+	if err != nil || member.Status != alloc.PoolRunnerRetiring ||
+		!slices.Equal(store.retired, []string{"l1"}) {
+		t.Fatalf("failed removal journal = %+v retired %v, err %v", member, store.retired, err)
+	}
+	jit.removeErr = nil
+	if err := c.EnsureRunnerRemoved(t.Context(), "l1"); err != nil {
+		t.Fatalf("EnsureRunnerRemoved after restart: %v", err)
+	}
+	if !slices.Equal(jit.removed, []string{"github-returned-name", "github-returned-name"}) {
+		t.Fatalf("removed registrations = %v", jit.removed)
 	}
 }
 

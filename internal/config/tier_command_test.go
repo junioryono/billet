@@ -6,8 +6,8 @@ import "testing"
 //
 // A self-hosted runner updates itself by EXITING — the listener returns "updating"
 // and billet's wrapper is the loop that notices and re-execs it with the same arguments,
-// including the JIT registration that lets the restarted runner take the job it was
-// created for.
+// including the JIT registration that lets the restarted runner take one job from
+// its pool.
 //
 // Changing this to `bin/Runner.Listener` would look tidier and would drop that loop:
 // on a backend where each job gets its own machine, the listener exits to update, the
