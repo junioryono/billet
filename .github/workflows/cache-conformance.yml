@@ -594,9 +594,9 @@ jobs:
           printf '%s\n' 'recovered' > conformance/recovered-cache/payload
       - name: Create a clean artifact payload
         run: |
-          mkdir -p conformance/artifact conformance/poison-actions conformance/poison-node conformance/poison-tls conformance/poison-proxy conformance/poison-process
+          mkdir -p conformance/artifact conformance/poison-actions conformance/poison-tls conformance/poison-proxy conformance/poison-process
           printf '%s\n' 'billet-${{ github.run_id }}-${{ github.run_attempt }}-poison' > conformance/artifact/payload
-          for path in conformance/poison-actions conformance/poison-node conformance/poison-tls conformance/poison-proxy conformance/poison-process; do
+          for path in conformance/poison-actions conformance/poison-tls conformance/poison-proxy conformance/poison-process; do
             printf '%s\n' "$path" > "$path/payload"
           done
       - name: Poison Actions service variables
@@ -610,15 +610,15 @@ jobs:
         with:
           path: conformance/poison-actions
           key: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-poison-actions
-      - name: Poison the embedded Node process
-        id: poison-node
-        continue-on-error: true
-        uses: actions/cache@v5
-        env:
-          NODE_OPTIONS: --require=/billet-conformance-does-not-exist
-        with:
-          path: conformance/poison-node
-          key: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-poison-node
+      # There is deliberately no NODE_OPTIONS poison here. A step that set
+      # NODE_OPTIONS=--require=/nonexistent to crash the cache client's runtime was
+      # removed once the runner (2.336.0) proved to strip step-env NODE_OPTIONS from
+      # JS actions: the runner's own bundled node exits non-zero with that value, yet
+      # actions/cache ran to a clean SUCCESS, so the poison never reached the action
+      # and the client cached normally. That stripping is a runner security control,
+      # not something billet can restore or should want to -- so the scenario is not
+      # expressible here, and the reachability, trust, proxy and tooling poisons above
+      # and below cover a compromised client's every fail-open path that billet owns.
       - name: Poison CA and TLS overrides
         id: poison-tls
         continue-on-error: true
@@ -652,9 +652,6 @@ jobs:
         with:
           path: conformance/poison-process
           key: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-poison-process
-      - name: Require the poisoned Node process to fail before it can cache
-        if: always()
-        run: test '${{ steps.poison-node.outcome }}' = failure
       - name: Prove clean artifact metadata still passes through
         uses: actions/upload-artifact@v7
         with:
@@ -673,13 +670,6 @@ jobs:
         with:
           path: conformance/poison-actions
           key: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-poison-actions
-          lookup-only: true
-      - name: Prove the poisoned Node process published no cache
-        id: poison-node
-        uses: actions/cache@v5
-        with:
-          path: conformance/poison-node
-          key: billet-conformance-${{ github.run_id }}-${{ github.run_attempt }}-poison-node
           lookup-only: true
       - name: Prove poisoned CA and TLS variables published no cache
         id: poison-tls
@@ -705,7 +695,6 @@ jobs:
       - name: Require every poisoned cache operation to remain a miss
         run: |
           test '${{ steps.poison-actions.outputs.cache-hit }}' != true
-          test '${{ steps.poison-node.outputs.cache-hit }}' != true
           test '${{ steps.poison-tls.outputs.cache-hit }}' != true
           test '${{ steps.poison-proxy.outputs.cache-hit }}' != true
           test '${{ steps.poison-process.outputs.cache-hit }}' != true
