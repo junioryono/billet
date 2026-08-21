@@ -2514,6 +2514,9 @@ func (l *Listener) identifyCompletion(ctx context.Context, job Job) (Job, error)
 				return Job{}, fmt.Errorf("%w: completed runner %q belongs to tier %q",
 					ErrUntrustworthySession, job.RunnerName, binding.Tier)
 			}
+			if err := l.restorePoolLease(ctx, binding); err != nil {
+				return Job{}, err
+			}
 			if binding.Status == alloc.PoolRunnerBusy {
 				if job.JobID != "" && binding.JobID != "" && job.JobID != binding.JobID {
 					return Job{}, fmt.Errorf("%w: completed runner %q names job %q after starting %q",
@@ -2602,6 +2605,36 @@ func (l *Listener) identifyCompletion(ctx context.Context, job Job) (Job, error)
 
 	return Job{}, fmt.Errorf("%w: %s completed runner %q without a request id, job id, or resolvable billet lease",
 		errQuarantinableCompletion, l.tier, job.RunnerName)
+}
+
+// restorePoolLease reconnects restart-safe pool identity to the completion
+// machinery, whose durable result record must carry the exact lease and epoch.
+// Without this handoff a post-restart completion could destroy compute and then
+// forget which capacity it had proved safe to release.
+func (l *Listener) restorePoolLease(ctx context.Context, binding alloc.PoolRunner) error {
+	lease, err := l.alloc.Lease(ctx, binding.LeaseID)
+	if errors.Is(err, alloc.ErrLeaseNotFound) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("%w: cannot restore completed runner %q lease %s: %w",
+			ErrUntrustworthySession, binding.RunnerName, binding.LeaseID, err)
+	}
+	if lease.Tier != l.tier || lease.RequestID != binding.LaunchRequestID {
+		return fmt.Errorf("%w: pool runner %q lease %s identifies tier %q request %d, want tier %q request %d",
+			ErrUntrustworthySession, binding.RunnerName, binding.LeaseID, lease.Tier,
+			lease.RequestID, l.tier, binding.LaunchRequestID)
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if prior := l.running[binding.LaunchRequestID]; prior != nil && prior.ID != lease.ID {
+		return fmt.Errorf("%w: request %d is already bound to lease %s, not pool lease %s",
+			ErrUntrustworthySession, binding.LaunchRequestID, prior.ID, lease.ID)
+	}
+	l.running[binding.LaunchRequestID] = lease
+
+	return nil
 }
 
 // acknowledge tells GitHub the message was handled. An unacknowledged message is
