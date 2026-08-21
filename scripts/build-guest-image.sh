@@ -309,17 +309,42 @@ install_python_toolcache() {
 		tar -xzf "$WORK/python.tgz" -C "$dir"
 		rm -f "$WORK/python.tgz"
 
-		# WHAT setup.sh WOULD HAVE DONE, minus the parts that need a network.
+		# WHAT setup.sh WOULD HAVE DONE, minus only the part that needs a network.
 		#
-		# The tarball ships NO `python` or `pip` entry point -- only `python3.12` and
-		# friends -- because its setup script creates them. Skipping it leaves an
-		# interpreter that works when addressed by full version and is missing every
-		# name a workflow actually types.
+		# The tarball ships NO `python` or `pip` entry point -- only `python3.13` and
+		# friends -- and no working pip until `ensurepip` runs, because setup.sh does
+		# both. Skipping ALL of setup.sh (as this once did) left an interpreter with no
+		# `pip` executable AND no pip MODULE, so setup-python's `cache: pip` (which
+		# execs `pip`) and every `python -m pip` failed the instant a workflow used the
+		# baked version -- the fast path this cache exists for. The missing work is the
+		# entry-point symlinks below, then ensurepip: OFFLINE, from the wheel the
+		# checksum-verified tarball bundles. Only setup.sh's subsequent PyPI upgrade of
+		# pip needs a network and stays skipped; a workflow needing newer pip upgrades it.
 		local minor="${v%.*}"
 
 		ln -sf "./bin/python$minor" "$dir/python"
 		ln -sf "python$minor" "$dir/bin/python"
 		ln -sf "python$minor" "$dir/bin/python${minor/./}"
+
+		# ensurepip supplies the pip MODULE; a force-reinstall of the bundled wheel then
+		# deterministically (re)creates the `pip` CONSOLE SCRIPT -- ensurepip alone can
+		# decide pip is already satisfied and leave bin/pip absent. Run in the chroot so
+		# the generated shebangs carry this non-relocatable distribution's absolute
+		# /opt/hostedtoolcache interpreter path, valid in the running guest.
+		local guest_dir="$TOOLCACHE_DIR/Python/$v/x64"
+		local bundled=("$dir/lib/python$minor/ensurepip/_bundled"/pip-*.whl)
+		if [ "${#bundled[@]}" -ne 1 ] || [ ! -f "${bundled[0]}" ]; then
+			echo "python $v has no single bundled pip wheel" >&2
+			exit 1
+		fi
+		chroot "$rootfs" "$guest_dir/bin/python$minor" -m ensurepip --default-pip >/dev/null
+		chroot "$rootfs" "$guest_dir/bin/python$minor" -m pip install \
+			--no-index --force-reinstall --disable-pip-version-check --no-warn-script-location \
+			"${bundled[0]#"$rootfs"}" >/dev/null
+		if [ ! -x "$dir/bin/pip" ]; then
+			echo "python $v baked without a pip entry point" >&2
+			exit 1
+		fi
 
 		rm -f "$dir/setup.sh" "$dir/build_output.txt" "$dir/tools_structure.txt"
 
@@ -848,24 +873,36 @@ if [ -n "$actions_proxy" ] && [ -n "$actions_ca_path" ] && [ -n "$actions_hook_p
 		awk -v gateway="$docker_gateway" '$1 != gateway {print $1}' | sort -u | paste -sd, -); then
 		results_fallback=""
 	fi
+	# SYSTEMD OWNS THE LISTENING SOCKET, via a transient .socket unit paired with the
+	# service. PID 1 binds the privileged :443 before dropping the service to runner,
+	# so the process needs no CAP_NET_BIND_SERVICE; and the socket outlives a service
+	# crash -- new connections queue in its backlog during the ~100ms restart instead
+	# of being refused, which is the gap a bare Restart=always leaves. Type=notify
+	# makes the unit "active" only once the python has adopted the socket and reached
+	# its accept loop, so the readiness gate below means "serving", not "forked".
 	if [ -n "$python_runtime" ] && [ "$docker_bridge" = "$docker_gateway" ] && [ -n "$results_fallback" ] &&
 		systemd-run --quiet --unit=billet-actions-proxy --collect --uid=runner --gid=runner \
+			--property=Type=notify --property=NotifyAccess=main --property=TimeoutStartSec=5s \
 			--property=Restart=always --property=RestartSec=100ms \
-			--property=AmbientCapabilities=CAP_NET_BIND_SERVICE \
+			--socket-property=ListenStream="$docker_gateway:443" \
+			--socket-property=Accept=no --socket-property=FlushPending=no \
 			"$python_runtime" /usr/local/bin/billet-actions-proxy \
-			--listen "$docker_gateway:443" --upstream "$actions_proxy" \
+			--systemd-socket --upstream "$actions_proxy" \
 			--fallback-addr "$results_fallback"; then
-		for _ in $(seq 1 50); do
-			if (: </dev/tcp/"$docker_gateway"/443) 2>/dev/null; then
-				actions_cache_active=1
-				break
-			fi
-			sleep 0.1
-		done
+		# systemd-run started only the SOCKET; the service is activated on demand. The
+		# socket accepts a connection before -- or without -- the service adopting the
+		# descriptor, so a bare TCP probe would mark interception active over a not-yet
+		# -serving (or crash-looping) service and remap DNS at a dead backend. Start the
+		# service explicitly instead: with Type=notify, `systemctl start` blocks until
+		# the process sent READY=1 (it adopted the socket and reached its accept loop)
+		# or TimeoutStartSec elapsed, so its exit status IS the readiness signal.
+		if systemctl start billet-actions-proxy.service 2>/dev/null; then
+			actions_cache_active=1
+		fi
 	fi
 	if [ -z "$actions_cache_active" ]; then
 		log "the Actions cache passthrough did not start (or the origin did not resolve); this job will use GitHub's cache directly"
-		systemctl stop billet-actions-proxy.service 2>/dev/null || true
+		systemctl stop billet-actions-proxy.socket billet-actions-proxy.service 2>/dev/null || true
 	fi
 fi
 
@@ -1087,7 +1124,8 @@ job_status=$?
 # BILLET_AGENT_LAUNCH_END
 set -e
 
-systemctl stop billet-actions-proxy.service 2>/dev/null || true
+# Stop the socket too, or a late connection would re-activate the service.
+systemctl stop billet-actions-proxy.socket billet-actions-proxy.service 2>/dev/null || true
 
 /usr/local/bin/billet-docker-cache complete "$job_status"
 

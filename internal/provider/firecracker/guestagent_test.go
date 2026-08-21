@@ -312,10 +312,17 @@ func TestTheGuestAgentInstallsActionsInterceptionForEveryRunnerSurface(t *testin
 		`printf 'SSL_CERT_FILE=%s\n' "$target"`,
 		`} >>"$GITHUB_ENV"`,
 		`--property=Restart=always --property=RestartSec=100ms`,
-		// The passthrough binds the pinned docker gateway and needs the privileged
-		// bind capability to listen on 443.
-		`--property=AmbientCapabilities=CAP_NET_BIND_SERVICE`,
-		`--listen "$docker_gateway:443" --upstream "$actions_proxy"`,
+		// systemd owns the listening socket (a transient .socket unit on the pinned
+		// gateway), so PID 1 binds :443 -- no CAP for the runner-uid process -- and
+		// the socket survives a service crash. Type=notify makes "active" mean serving.
+		`--property=Type=notify --property=NotifyAccess=main`,
+		`--socket-property=ListenStream="$docker_gateway:443"`,
+		`--socket-property=Accept=no --socket-property=FlushPending=no`,
+		`--systemd-socket --upstream "$actions_proxy"`,
+		// Readiness is the SERVICE, not the always-listening socket: with Type=notify,
+		// `systemctl start` blocks until the process sent READY, so a bare socket
+		// probe cannot mark interception active over a not-yet-serving backend.
+		`systemctl start billet-actions-proxy.service`,
 		`docker_gateway=172.17.0.1`,
 		// The passthrough is failed open to the real origin, resolved before the
 		// remap, with the gateway excluded so the fallback can never be a loop.
@@ -349,11 +356,22 @@ func TestTheGuestAgentInstallsActionsInterceptionForEveryRunnerSurface(t *testin
 
 	// A published proxy variable is exactly the catch-all funnel this design
 	// removed: every request the runner and its containers make would route
-	// through one guest relay, and bulk transfers stalled through it.
-	for _, forbidden := range []string{"HTTPS_PROXY=", "https_proxy=", "actions_guest_proxy", `docker_bridge:7719`} {
+	// through one guest relay, and bulk transfers stalled through it. And under
+	// socket activation the passthrough must NOT ask for the privileged-bind
+	// capability nor bind a production port itself -- PID 1 owns the socket.
+	for _, forbidden := range []string{
+		"HTTPS_PROXY=", "https_proxy=", "actions_guest_proxy", `docker_bridge:7719`,
+		"AmbientCapabilities=CAP_NET_BIND_SERVICE", `--listen "$docker_gateway:443"`,
+	} {
 		if strings.Contains(text, forbidden) {
-			t.Errorf("the guest still funnels traffic through a proxy variable via %q", forbidden)
+			t.Errorf("the passthrough launch still uses the removed mechanism %q", forbidden)
 		}
+	}
+
+	// Both units are stopped together on failure and after the runner exits, or a
+	// late connection would re-activate the service through the orphaned socket.
+	if strings.Count(text, "systemctl stop billet-actions-proxy.socket billet-actions-proxy.service") < 2 {
+		t.Error("the passthrough is not stopped as both socket and service at every stop site")
 	}
 
 	// The container DNS must be set before Docker starts: dockerd reads daemon.json
