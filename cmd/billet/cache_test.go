@@ -1,6 +1,18 @@
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
+
+func TestCacheCommandRoutesTheConformanceInstaller(t *testing.T) {
+	t.Parallel()
+
+	err := cmdCache(t.Context(), []string{"conformance"})
+	if err == nil || !strings.Contains(err.Error(), "cache conformance install") {
+		t.Fatalf("cache conformance error = %v, want the installer usage", err)
+	}
+}
 
 func TestCacheNamespacesIncludeTheSite(t *testing.T) {
 	t.Parallel()
