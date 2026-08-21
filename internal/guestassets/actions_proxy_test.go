@@ -261,3 +261,97 @@ gate.close()
 		t.Fatalf("guest proxy passthrough probe: %v\n%s", err, output)
 	}
 }
+
+// The passthrough is launched under systemd socket activation: PID 1 owns the
+// listening socket (so it survives a service crash and needs no privileged bind
+// capability) and hands it over as fd 3, and Type=notify means the service is
+// "active" only after READY=1. This probe exercises the adoption contract and the
+// notifier directly, without systemd.
+func TestGuestActionsProxyAdoptsTheSystemdListenerAndNotifies(t *testing.T) {
+	t.Parallel()
+
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 is not installed on this development host")
+	}
+	path := filepath.Join(t.TempDir(), "actions_proxy.py")
+	if err := os.WriteFile(path, []byte(ActionsProxyScript), 0o600); err != nil {
+		t.Fatalf("write proxy: %v", err)
+	}
+	probe := `
+import importlib.util
+import os
+import socket
+import sys
+import tempfile
+
+spec = importlib.util.spec_from_file_location("billet_actions_proxy", sys.argv[1])
+proxy = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(proxy)
+
+# A listening socket handed over as fd 3, named for this process, is adopted and
+# is genuinely listening -- a client connects and is accepted through it.
+listener = socket.create_server(("127.0.0.1", 0))
+port = listener.getsockname()[1]
+os.dup2(listener.fileno(), proxy.SD_LISTEN_FDS_START)
+os.environ["LISTEN_PID"] = str(os.getpid())
+os.environ["LISTEN_FDS"] = "1"
+adopted = proxy.systemd_listener()
+# The connect-and-accept proves it is listening cross-platform (SO_ACCEPTCONN,
+# which systemd_listener checks, is not queryable on every test host).
+client = socket.create_connection(("127.0.0.1", port), 5)
+conn, _ = adopted.accept()
+client.close()
+conn.close()
+
+# A wrong LISTEN_PID, the wrong descriptor count, or a non-listening descriptor
+# each FAIL closed -- the service cannot silently fall back to a privileged bind.
+os.environ["LISTEN_PID"] = str(os.getpid() + 1)
+try:
+    proxy.systemd_listener()
+    raise AssertionError("a foreign LISTEN_PID was accepted")
+except SystemExit:
+    pass
+os.environ["LISTEN_PID"] = str(os.getpid())
+os.environ["LISTEN_FDS"] = "2"
+try:
+    proxy.systemd_listener()
+    raise AssertionError("LISTEN_FDS != 1 was accepted")
+except SystemExit:
+    pass
+os.environ["LISTEN_FDS"] = "1"
+# The non-listening rejection depends on SO_ACCEPTCONN, which the Linux guest can
+# report but some test hosts (macOS) cannot; only assert it where it is queryable.
+so_acceptconn_queryable = True
+try:
+    socket.create_server(("127.0.0.1", 0)).getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN)
+except OSError:
+    so_acceptconn_queryable = False
+if so_acceptconn_queryable:
+    paired_a, paired_b = socket.socketpair()
+    os.dup2(paired_a.fileno(), proxy.SD_LISTEN_FDS_START)
+    try:
+        proxy.systemd_listener()
+        raise AssertionError("a non-listening descriptor was accepted")
+    except SystemExit:
+        pass
+    paired_a.close()
+    paired_b.close()
+
+# notify_ready sends exactly READY=1 to NOTIFY_SOCKET, and is a no-op without one.
+notify_path = os.path.join(tempfile.mkdtemp(), "notify.sock")
+receiver = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+receiver.bind(notify_path)
+os.environ["NOTIFY_SOCKET"] = notify_path
+proxy.notify_ready()
+receiver.settimeout(5)
+assert receiver.recv(64) == b"READY=1"
+receiver.close()
+del os.environ["NOTIFY_SOCKET"]
+proxy.notify_ready()
+`
+	run := exec.CommandContext(t.Context(), python, "-c", probe, path)
+	if output, err := run.CombinedOutput(); err != nil {
+		t.Fatalf("guest proxy socket-activation probe: %v\n%s", err, output)
+	}
+}
