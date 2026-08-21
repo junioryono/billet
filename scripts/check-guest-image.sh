@@ -523,6 +523,18 @@ else
 	fail "the root account is not locked"
 fi
 
+# DHCP MUST be keyed on the MAC, not a DUID. The image bakes one /etc/machine-id
+# into every clone, so networkd's default DUID client id is identical on every
+# guest and dnsmasq hands them all one address -- the collision that stalled large
+# downloads. The backend gives each guest a stable per-tap MAC, so ClientIdentifier=mac
+# makes each live guest's lease unique and reuses the address when a tap is reused.
+if grep -qxE '[[:space:]]*ClientIdentifier=mac' "$MNT/etc/systemd/network/10-eth0.network" 2>/dev/null; then
+	pass "DHCP is keyed on the per-guest MAC, so cloned guests do not share a lease"
+else
+	fail "10-eth0.network does not set ClientIdentifier=mac; cloned guests share the
+        machine-id-derived DUID, collide on one DHCP lease, and stall large transfers"
+fi
+
 echo
 
 if [ "$FAILED" -ne 0 ]; then

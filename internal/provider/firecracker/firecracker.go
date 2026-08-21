@@ -699,6 +699,11 @@ func (p *Provider) configure(
 			"the vmm counts in", spec.Name, spec.Memory)
 	}
 
+	mac, err := guestMAC(tap)
+	if err != nil {
+		return err
+	}
+
 	md, err := metadata(spec)
 	if err != nil {
 		return err
@@ -730,6 +735,17 @@ func (p *Provider) configure(
 		{"/network-interfaces/" + guestInterface, map[string]any{
 			"iface_id":      guestInterface,
 			"host_dev_name": tap,
+			// SET, NOT OMITTED, and that is load-bearing. With no guest_mac the
+			// guest kernel picks a RANDOM MAC, which the guest image's persistent
+			// MAC policy then rewrites deterministically from its baked
+			// /etc/machine-id -- identical in every clone -- so every guest
+			// converges on ONE MAC, one DHCP client id, and one bridge address.
+			// Two live guests then share an IP on the guest bridge, and return traffic for
+			// a sustained download flaps between their taps until the transfer
+			// stalls; a small request-response call re-teaches the bridge in time
+			// and survives, which is exactly why small calls worked and large ones
+			// hung. A stable per-guest MAC gives each a distinct DHCP identity.
+			"guest_mac": mac,
 		}},
 		// V2, WHICH IS A SECURITY PROPERTY RATHER THAN A VERSION, AND V1 IS THE
 		// DEFAULT. Under V1 any process in the guest reads the metadata with a bare
@@ -894,6 +910,36 @@ const bootArgs = "reboot=k panic=1 pci=off i8042.noaux i8042.nomux i8042.nopnp i
 
 // guestInterface is the one network device a guest gets.
 const guestInterface = "eth0"
+
+// guestMAC derives a stable, locally-administered unicast MAC from the tap name
+// billet already allocated for this microVM (bt-N). It is what gives each guest a
+// distinct network identity; see the guest_mac comment in the network-interfaces
+// config for why the alternative -- letting the kernel pick, then the image's
+// persistent-MAC policy rewrite it from a baked machine-id -- collapses every clone
+// onto one address.
+func guestMAC(tap string) (string, error) {
+	suffix, ok := strings.CutPrefix(tap, config.TapPrefix)
+	n, err := strconv.Atoi(suffix)
+	// Require the CANONICAL spelling claimTap produces: the prefix present, the index
+	// round-tripping (so "bt-07", "bt-+7", a bare "7" and out-of-range are refused),
+	// and in the claimed range. Anything else is a caller bug, not a guest to launch.
+	if !ok || err != nil || n < 0 || n >= maxTaps || strconv.Itoa(n) != suffix {
+		return "", fmt.Errorf("firecracker: cannot derive a MAC from tap %q: expected the "+
+			"canonical %s<index> with index in [0,%d)", tap, config.TapPrefix, maxTaps)
+	}
+	// 0x02 in the first octet marks the address locally administered and unicast. The
+	// tap index is < maxTaps (4096, 12 bits) and fills the low two octets; the tap
+	// claim guarantees no two live guests hold the same index, so the MAC is unique
+	// among THIS host's running guests by construction.
+	//
+	// The uniqueness is HOST-LOCAL, and that is sufficient because billet's guest
+	// bridge is host-local: each node runs its own bridge and its own DHCP server on
+	// its own guest subnet, so two nodes never share an L2 and a bt-0 here cannot
+	// meet a bt-0 there. A deployment that bridged one L2 across nodes would already
+	// be broken -- two DHCP servers answering one subnet -- so it is out of scope
+	// rather than a case this MAC must also disambiguate.
+	return fmt.Sprintf("02:00:00:00:%02x:%02x", byte(n>>8), byte(n)), nil
+}
 
 // mmdsAddress is the link-local address the metadata service answers on. The same
 // one every cloud uses, so a stock guest agent needs no special case.
