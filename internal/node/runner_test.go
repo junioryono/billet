@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"slices"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -774,6 +775,52 @@ func TestFailedLaunchRemovesRegistrationBeforeComputeCleanup(t *testing.T) {
 	}
 }
 
+func TestRestartedFailedLaunchRemovesDurableRegistrationBeforeCompute(t *testing.T) {
+	p := &fakeProvider{
+		kind: config.ProviderDocker, launchErr: errors.New("lost launch response"),
+		startsAnyway: true,
+	}
+	a, host := newAllocatorWithHost(t)
+	firstJIT := &fakeJIT{setID: 7, removeErr: errors.New("github unavailable")}
+	first := New(a, host, firstJIT, p, nil)
+	lease := assignedLease(t, a)
+	name := provider.InstanceName(lease.ID)
+
+	if err := first.Launch(t.Context(), lease, dockerSpec(), Job{
+		RequestID: lease.RequestID, Event: "push",
+	}); !errors.Is(err, server.ErrCustody) {
+		t.Fatalf("Launch = %v, want ErrCustody", err)
+	}
+
+	restartedJIT := &durableFakeJIT{
+		fakeJIT: &fakeJIT{setID: 7}, ensureErr: errors.New("github still unavailable"),
+	}
+	restarted := New(a, host, restartedJIT, p, nil)
+	if err := restarted.Recover(t.Context()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	if err := restarted.Destroy(t.Context(), lease.RequestID); !errors.Is(err, server.ErrCustody) {
+		t.Fatalf("Destroy = %v, want ErrCustody while deregistration is unavailable", err)
+	}
+	if len(p.destroyed) != 0 || p.live[name] == nil {
+		t.Fatalf("compute changed before durable deregistration: destroyed %v live %+v",
+			p.destroyed, p.live)
+	}
+	if !slices.Equal(restartedJIT.ensureCalls, []string{lease.ID}) {
+		t.Fatalf("durable removal attempts = %v, want lease %s", restartedJIT.ensureCalls, lease.ID)
+	}
+
+	restartedJIT.ensureErr = nil
+	if err := restarted.Tend(t.Context()); err != nil {
+		t.Fatalf("Tend after GitHub recovered: %v", err)
+	}
+	if !slices.Equal(restartedJIT.ensureCalls, []string{lease.ID, lease.ID}) ||
+		len(p.destroyed) != 1 {
+		t.Fatalf("recovered order: removals %v destroys %v",
+			restartedJIT.ensureCalls, p.destroyed)
+	}
+}
+
 // A held teardown is visible in the ledger, and a force release is delivered to
 // the live node through its heartbeat. The node drops custody before the lease
 // becomes terminal; it does not need a working provider read after an operator
@@ -1161,6 +1208,17 @@ func (f *fakeJIT) JITConfig(_ context.Context, _ int, name, _ string) (Registrat
 func (f *fakeJIT) RemoveRunner(_ context.Context, _ string, _ int64, name string) error {
 	f.removed = append(f.removed, name)
 	return f.removeErr
+}
+
+type durableFakeJIT struct {
+	*fakeJIT
+	ensureErr   error
+	ensureCalls []string
+}
+
+func (f *durableFakeJIT) EnsureRunnerRemoved(_ context.Context, leaseID string) error {
+	f.ensureCalls = append(f.ensureCalls, leaseID)
+	return f.ensureErr
 }
 
 type fakeRegistration struct{ name string }

@@ -2682,18 +2682,20 @@ func (l *Listener) acknowledge(ctx context.Context, msg *Message) error {
 // acknowledgeCompletions records that GitHub will not redeliver the
 // source message. The store removes a row only once it is also retired.
 func (l *Listener) acknowledgeCompletions(ctx context.Context, msg *Message) {
+	persistCtx, cancel := withoutCancelWithin(ctx, l.releaseGrace)
+	defer cancel()
 	for i := range msg.Completed {
 		job := &msg.Completed[i]
 		if l.completionStore != nil {
 			if err := l.completionStore.AcknowledgePendingCompletion(
-				ctx, l.tier, job.RequestID, msg.MessageID,
+				persistCtx, l.tier, job.RequestID, msg.MessageID,
 			); err != nil {
 				l.log.Error("a completion acknowledgement could not be made durable; recovery remains conservatively blocked",
 					"tier", l.tier, "request", job.RequestID, "message", msg.MessageID, "error", err)
 			}
 		}
 		if l.alloc != nil {
-			if err := l.alloc.AcknowledgePoolRunner(ctx, l.tier, job.RequestID); err != nil {
+			if err := l.alloc.AcknowledgePoolRunner(persistCtx, l.tier, job.RequestID); err != nil {
 				l.log.Error("a pool runner acknowledgement could not be made durable; its retired identity remains conservatively reserved",
 					"tier", l.tier, "request", job.RequestID, "message", msg.MessageID, "error", err)
 			}

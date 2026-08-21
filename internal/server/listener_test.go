@@ -3632,6 +3632,54 @@ func TestFailedCompletionDeletionRestoresOnlyATombstone(t *testing.T) {
 	}
 }
 
+func TestCompletionAcknowledgementPersistsAfterPollCancellation(t *testing.T) {
+	db := openState(t)
+	tiers := []config.Tier{tier("linux")}
+	a, err := alloc.New(db, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+	if err != nil {
+		t.Fatalf("alloc.New: %v", err)
+	}
+	if _, err := a.RegisterNode(t.Context(), alloc.NodeRegistration{
+		Name: "test-host-firecracker", Provider: config.ProviderFirecracker,
+		VCPU: 1 << 20, Memory: 1 << 20 * config.GiB,
+	}); err != nil {
+		t.Fatalf("RegisterNode: %v", err)
+	}
+	lease := poolLeaseForTier(t, a, tiers[0].Label)
+	if err := a.RegisterPoolRunner(t.Context(), alloc.PoolRunner{
+		LeaseID: lease.ID, Tier: tiers[0].Label, LaunchRequestID: 80,
+		RunnerID: 71, RunnerName: provider.InstanceName(lease.ID),
+	}); err != nil {
+		t.Fatalf("RegisterPoolRunner: %v", err)
+	}
+	if err := a.SettlePoolRunner(t.Context(), tiers[0].Label, 80); err != nil {
+		t.Fatalf("SettlePoolRunner: %v", err)
+	}
+	if _, err := db.PutPendingCompletion(t.Context(), state.PendingCompletion{
+		Tier: tiers[0].Label, RequestID: 80, RunID: 90, Result: "Succeeded", MessageID: 20,
+	}); err != nil {
+		t.Fatalf("PutPendingCompletion: %v", err)
+	}
+	if err := db.RetirePendingCompletion(t.Context(), tiers[0].Label, 80, 20); err != nil {
+		t.Fatalf("RetirePendingCompletion: %v", err)
+	}
+
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, withCompletionStore(db),
+		WithRunner(&fakeRunner{}))
+	l.releaseGrace = time.Second
+	canceled, cancel := context.WithCancel(t.Context())
+	cancel()
+	l.acknowledgeCompletions(canceled, &Message{
+		MessageID: 20, Completed: []Job{{RequestID: 80, RunID: 90, Result: "Succeeded"}},
+	})
+	if pending, err := db.PendingCompletions(t.Context(), tiers[0].Label); err != nil || len(pending) != 0 {
+		t.Fatalf("acknowledged completion tombstones = %+v, err %v", pending, err)
+	}
+	if _, err := a.PoolRunnerByLease(t.Context(), lease.ID); !errors.Is(err, alloc.ErrLeaseNotFound) {
+		t.Fatalf("acknowledged pool tombstone remains: %v", err)
+	}
+}
+
 func TestRestoredCompletionTargetsItsPersistedLeaseNode(t *testing.T) {
 	db := openState(t)
 	completion := state.PendingCompletion{

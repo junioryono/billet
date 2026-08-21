@@ -586,6 +586,13 @@ func (c *Client) RemoveRunner(
 	}, nil)
 }
 
+// EnsureRunnerRemoved resolves a restart-surviving registration by its lease
+// and withdraws it before recovered custody touches compute.
+func (c *Client) EnsureRunnerRemoved(ctx context.Context, leaseID string) error {
+	return c.do(ctx, http.MethodPost, c.leasePath(leaseID, "/runner/remove"),
+		nodeapi.RemoveRunnerRequest{}, nil)
+}
+
 // registration is a minted registration whose config is a CREDENTIAL.
 //
 // The field is unexported and reachable only through Config(), so printing the

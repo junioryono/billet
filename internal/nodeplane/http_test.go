@@ -175,6 +175,7 @@ type fakeStore struct {
 	released []alloc.Phase
 	failures []string
 	pool     map[string]alloc.PoolRunner
+	retired  []string
 }
 
 type cachePolicyFunc func(context.Context, string, string) (bool, error)
@@ -263,8 +264,35 @@ func (f *fakeStore) PoolRunnerByName(_ context.Context, name string) (alloc.Pool
 	return runner, nil
 }
 
+func (f *fakeStore) PoolRunnerByLease(_ context.Context, leaseID string) (alloc.PoolRunner, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, runner := range f.pool {
+		if runner.LeaseID == leaseID {
+			return runner, nil
+		}
+	}
+	return alloc.PoolRunner{}, alloc.ErrLeaseNotFound
+}
+
+func (f *fakeStore) RetirePoolRunner(_ context.Context, leaseID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for name, runner := range f.pool {
+		if runner.LeaseID != leaseID {
+			continue
+		}
+		runner.Status = alloc.PoolRunnerRetiring
+		f.pool[name] = runner
+		f.retired = append(f.retired, leaseID)
+		return nil
+	}
+	return alloc.ErrLeaseNotFound
+}
+
 type returnedJIT struct {
-	removed []string
+	removed   []string
+	removeErr error
 }
 
 func (*returnedJIT) Describe(context.Context, string, string) (*nodeplane.JITSet, []string, error) {
@@ -277,7 +305,7 @@ func (*returnedJIT) JITConfig(context.Context, int, string, string) (nodeplane.J
 
 func (j *returnedJIT) RemoveRunner(_ context.Context, _ int64, name string) error {
 	j.removed = append(j.removed, name)
-	return nil
+	return j.removeErr
 }
 
 type returnedRegistration struct{}
@@ -467,10 +495,20 @@ func TestJITPersistsGitHubsReturnedIdentityBeforeGivingItToTheNode(t *testing.T)
 		member.RunnerID != 91 || member.RunnerName != "github-returned-name" {
 		t.Fatalf("durable GitHub identity = %+v, err %v", member, err)
 	}
-	if err := c.RemoveRunner(t.Context(), "l1", 91, "github-returned-name"); err != nil {
-		t.Fatalf("RemoveRunner: %v", err)
+	jit.removeErr = errors.New("github unavailable")
+	if err := c.RemoveRunner(t.Context(), "l1", 91, "github-returned-name"); err == nil {
+		t.Fatal("RemoveRunner succeeded while GitHub was unavailable")
 	}
-	if !slices.Equal(jit.removed, []string{"github-returned-name"}) {
+	member, err = store.PoolRunnerByName(t.Context(), "github-returned-name")
+	if err != nil || member.Status != alloc.PoolRunnerRetiring ||
+		!slices.Equal(store.retired, []string{"l1"}) {
+		t.Fatalf("failed removal journal = %+v retired %v, err %v", member, store.retired, err)
+	}
+	jit.removeErr = nil
+	if err := c.EnsureRunnerRemoved(t.Context(), "l1"); err != nil {
+		t.Fatalf("EnsureRunnerRemoved after restart: %v", err)
+	}
+	if !slices.Equal(jit.removed, []string{"github-returned-name", "github-returned-name"}) {
 		t.Fatalf("removed registrations = %v", jit.removed)
 	}
 }

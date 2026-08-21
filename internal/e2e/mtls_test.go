@@ -66,6 +66,12 @@ func (mtlsStore) PoolRunnerByName(_ context.Context, name string) (alloc.PoolRun
 	return alloc.PoolRunner{LeaseID: "l1", RunnerID: 71, RunnerName: name}, nil
 }
 
+func (mtlsStore) PoolRunnerByLease(context.Context, string) (alloc.PoolRunner, error) {
+	return alloc.PoolRunner{LeaseID: "l1", RunnerID: 71, RunnerName: "runner-l1"}, nil
+}
+
+func (mtlsStore) RetirePoolRunner(context.Context, string) error { return nil }
+
 func (m mtlsStore) QuarantinedLeaseIDs(context.Context, string) (map[string]bool, error) {
 	return map[string]bool{}, nil
 }

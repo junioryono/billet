@@ -42,6 +42,10 @@ type trustedRunnerGroupValidator interface {
 	ValidateTrustedRunnerGroup(context.Context, string, []string) error
 }
 
+type durableRegistrationRemover interface {
+	EnsureRunnerRemoved(context.Context, string) error
+}
+
 // Set is the part of a scale set this package needs.
 type Set struct {
 	ID   int
@@ -489,6 +493,29 @@ func (r *Runner) removeRegistration(
 	defer cancel()
 
 	return r.jit.RemoveRunner(cleanupCtx, leaseID, runnerID, runnerName)
+}
+
+// ensureRegistrationRemoved restores the routing-before-compute ordering after
+// a restart, when custody no longer has the exact identity it originally held.
+func (r *Runner) ensureRegistrationRemoved(ctx context.Context, c *custody) error {
+	if c.registrationRemoved {
+		return nil
+	}
+	if c.registrationPending {
+		if err := r.removeRegistration(ctx, c.leaseID, c.runnerID, c.runnerName); err != nil {
+			return err
+		}
+	} else if durable, ok := r.jit.(durableRegistrationRemover); ok {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), strayCleanupTimeout)
+		defer cancel()
+		if err := durable.EnsureRunnerRemoved(cleanupCtx, c.leaseID); err != nil {
+			return err
+		}
+	}
+	c.registrationPending = false
+	c.registrationRemoved = true
+
+	return nil
 }
 
 // Destroy removes whatever Launch started for a request.

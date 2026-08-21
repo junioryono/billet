@@ -48,6 +48,8 @@ type JITRegistration interface {
 type poolRunnerStore interface {
 	RegisterPoolRunner(context.Context, alloc.PoolRunner) error
 	PoolRunnerByName(context.Context, string) (alloc.PoolRunner, error)
+	PoolRunnerByLease(context.Context, string) (alloc.PoolRunner, error)
+	RetirePoolRunner(context.Context, string) error
 }
 
 // LeaseStore is the ledger, as the node wire needs it.
@@ -1362,9 +1364,10 @@ func (h *handler) removeRunner(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	if req.RunnerID < 0 || req.RunnerName == "" {
+	byLease := req.RunnerID == 0 && req.RunnerName == ""
+	if !byLease && (req.RunnerID < 0 || req.RunnerName == "") {
 		writeErr(w, http.StatusBadRequest, nodeapi.CodeRefused,
-			"runner removal needs a non-negative id and non-empty name")
+			"runner removal needs both an identity or neither when recovering by lease")
 		return
 	}
 	pool, ok := h.store.(poolRunnerStore)
@@ -1372,8 +1375,18 @@ func (h *handler) removeRunner(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusServiceUnavailable, "", "runner identity storage is unavailable")
 		return
 	}
-	binding, err := pool.PoolRunnerByName(r.Context(), req.RunnerName)
+	var binding alloc.PoolRunner
+	var err error
+	if byLease {
+		binding, err = pool.PoolRunnerByLease(r.Context(), r.PathValue("lease"))
+	} else {
+		binding, err = pool.PoolRunnerByName(r.Context(), req.RunnerName)
+	}
 	if err != nil {
+		if byLease && errors.Is(err, alloc.ErrLeaseNotFound) {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		writeStoreErr(w, err)
 		return
 	}
@@ -1382,7 +1395,7 @@ func (h *handler) removeRunner(w http.ResponseWriter, r *http.Request) {
 			"runner registration belongs to another lease")
 		return
 	}
-	if binding.RunnerID != req.RunnerID {
+	if !byLease && binding.RunnerID != req.RunnerID {
 		writeErr(w, http.StatusForbidden, nodeapi.CodeRefused,
 			"runner identity does not match the durable registration")
 		return
@@ -1402,7 +1415,14 @@ func (h *handler) removeRunner(w http.ResponseWriter, r *http.Request) {
 			"runner registration belongs to another node")
 		return
 	}
-	if err := h.jit.RemoveRunner(r.Context(), req.RunnerID, req.RunnerName); err != nil {
+	// DURABLE BEFORE REMOTE. A node can disappear after GitHub refuses this
+	// removal. The retiring row is what makes the control plane and a restarted
+	// node retry deregistration before either is allowed to tear compute down.
+	if err := pool.RetirePoolRunner(r.Context(), binding.LeaseID); err != nil {
+		writeStoreErr(w, err)
+		return
+	}
+	if err := h.jit.RemoveRunner(r.Context(), binding.RunnerID, binding.RunnerName); err != nil {
 		writeStoreErr(w, err)
 		return
 	}
