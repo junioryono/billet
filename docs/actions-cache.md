@@ -63,6 +63,8 @@ billet cache enable --org acme
 
 An organisation block covers every repository below it. Enabling one repository removes only that repository's explicit block; it does not override a remaining organisation block. Enabling an organisation removes only the organisation block and deliberately leaves narrower repository blocks intact. These commands use `state.OpenAdmin`, so they are safe to run while the server owns the control-plane process lock.
 
+The installed conformance workflow defaults to `mode: intercept`, which requires the Billet local-cache response header before any other job runs. To accept a kill-switch change, keep the repository or organisation block active for a fresh manual dispatch with `mode: passthrough`. That mode requires the same Billet runner and candidate image, proves the local response header is absent, and then runs the unchanged cache, artifact, embedded-client, container, BuildKit, fault, and recovery lanes against GitHub. Re-enable the scope after the run; a passing interception run does not substitute for the disabled-mode acceptance.
+
 ## Conformance gate
 
 GitHub applies a restricted organization runner group only to jobs directly defined in a selected workflow. A caller whose only job invokes `junioryono/billet/.github/workflows/cache-conformance.yml` does not qualify: those jobs are defined in Billet's repository, and an organization runner group cannot authorize a workflow owned by another organization. Do not work around that boundary by disabling workflow restrictions.
