@@ -1,9 +1,12 @@
 package main
 
 import (
+	"context"
+	"database/sql"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/junioryono/billet/internal/alloc"
 	"github.com/junioryono/billet/internal/config"
@@ -56,16 +59,47 @@ sites:
 	if err := a.NodeGone(t.Context(), "edge-1", edgeEpoch); err != nil {
 		t.Fatalf("NodeGone: %v", err)
 	}
-	if err := db.Close(); err != nil {
-		t.Fatalf("close seeded state: %v", err)
+	var nodesBefore int
+	if err := db.Reader().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM nodes`).Scan(&nodesBefore); err != nil {
+		t.Fatalf("count seeded nodes: %v", err)
 	}
 
+	holding := make(chan struct{})
+	release := make(chan struct{})
+	held := make(chan error, 1)
+	go func() {
+		held <- db.Tx(t.Context(), func(*sql.Tx) error {
+			close(holding)
+			<-release
+
+			return nil
+		})
+	}()
+	select {
+	case <-holding:
+	case err := <-held:
+		t.Fatalf("the server transaction ended before taking the writer slot: %v", err)
+	}
+
+	checkCtx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
 	var checkErr error
 	out := capture(t, func() {
-		checkErr = cmdCheck(t.Context(), []string{"--config", configPath})
+		checkErr = cmdCheck(checkCtx, []string{"--config", configPath})
 	})
+	close(release)
+	if err := <-held; err != nil {
+		t.Fatalf("release the server transaction: %v", err)
+	}
 	if checkErr != nil {
-		t.Fatalf("billet check: %v", checkErr)
+		t.Fatalf("billet check while the server held SQLite's writer slot: %v", checkErr)
+	}
+	var nodesAfter int
+	if err := db.Reader().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM nodes`).Scan(&nodesAfter); err != nil {
+		t.Fatalf("count nodes after check: %v", err)
+	}
+	if nodesAfter != nodesBefore {
+		t.Fatalf("billet check changed the registered-node count from %d to %d", nodesBefore, nodesAfter)
 	}
 	for _, want := range []string{
 		"fleet    edge-1                   at edge via firecracker (offline)",
