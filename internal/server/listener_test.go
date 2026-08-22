@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"math"
 	"slices"
 	"strings"
@@ -170,6 +171,678 @@ const notDrainingHere = 50 * time.Millisecond
 // tierVCPU is the size of every tier in these tests. One number, so the capacity
 // arithmetic in the assertions can be read without cross-referencing.
 const tierVCPU = 4
+
+// An idle scale set needs one backed slot so GitHub will send it the first
+// statistics message, but it must not escrow the entire deployment while it has
+// no assigned work. Otherwise the first listener to poll can renew every lease
+// forever and a second tier with a real backlog advertises zero indefinitely.
+func TestIdleTierLeavesCapacityForASecondTierBacklog(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-idle"), tier("billet-4vcpu-busy")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 12, MaxMemory: 64 * config.GiB}, tiers)
+
+	idleCtx, stopIdle := context.WithCancel(t.Context())
+	idlePoll := make(chan int, 1)
+	releaseIdlePoll := make(chan struct{})
+	idleSession := &fakeSession{
+		onPoll: func(capacity int) {
+			select {
+			case idlePoll <- capacity:
+			default:
+			}
+		},
+		onGet: func() (*Message, error) {
+			<-releaseIdlePoll
+			return nil, ErrNoMessage
+		},
+	}
+	idleDone := make(chan error, 1)
+	go func() {
+		idleDone <- NewListener(a, tiers[0].Label, idleSession).Run(idleCtx)
+	}()
+
+	var firstIdleCapacity int
+	select {
+	case firstIdleCapacity = <-idlePoll:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the idle tier never advertised its discovery capacity")
+	}
+
+	busyCtx, stopBusy := context.WithCancel(t.Context())
+	busyPoll := make(chan int, 1)
+	launched := make(chan int64, 2)
+	busySession := &fakeSession{
+		stats: &Statistics{TotalAssignedJobs: 2},
+		onPoll: func(capacity int) {
+			select {
+			case busyPoll <- capacity:
+			default:
+			}
+			stopBusy()
+		},
+	}
+	busy := NewListener(a, tiers[1].Label, busySession,
+		WithRunner(&fakeRunner{onLaunch: func(requestID int64) error {
+			launched <- requestID
+			return nil
+		}}),
+		WithRunnerRegistry(&fakeRunnerRegistry{}),
+		WithDrainGrace(time.Nanosecond),
+	)
+	busyErr := busy.Run(busyCtx)
+	if busyErr != nil && !errors.Is(busyErr, context.Canceled) {
+		t.Fatalf("busy listener: %v", busyErr)
+	}
+
+	stopIdle()
+	close(releaseIdlePoll)
+	if idleErr := <-idleDone; idleErr != nil && !errors.Is(idleErr, context.Canceled) {
+		t.Fatalf("idle listener: %v", idleErr)
+	}
+
+	firstBusyCapacity := <-busyPoll
+	if firstIdleCapacity != 1 {
+		t.Errorf("idle tier advertised %d runners, want one discovery slot", firstIdleCapacity)
+	}
+	if firstBusyCapacity != 2 {
+		t.Errorf("busy tier advertised %d runners, want its two assigned jobs", firstBusyCapacity)
+	}
+	close(launched)
+	var launchedIDs []int64
+	for requestID := range launched {
+		launchedIDs = append(launchedIDs, requestID)
+	}
+	if len(launchedIDs) != 2 || launchedIDs[0] >= 0 || launchedIDs[1] >= 0 {
+		t.Errorf("busy tier launched %v, want two anonymous pool members", launchedIDs)
+	}
+}
+
+func TestAssignedDemandFallingReturnsSurplusEscrow(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-demand")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB}, tiers)
+	l := NewListener(a, tiers[0].Label, &fakeSession{})
+
+	if err := l.refillEscrow(t.Context()); err != nil {
+		t.Fatalf("initial refill: %v", err)
+	}
+	if got := l.capacity(); got != 4 {
+		t.Fatalf("initial capacity = %d, want the four-slot deployment", got)
+	}
+
+	l.observed = &Statistics{TotalAssignedJobs: 2}
+	if err := l.prepareEscrow(t.Context()); err != nil {
+		t.Fatalf("prepare for assigned work: %v", err)
+	}
+	l.releaseIdleEscrowAbove(t.Context(), l.advertisedCapacity())
+	if got := l.capacity(); got != 3 {
+		t.Errorf("capacity with two assigned jobs = %d, want two jobs plus discovery", got)
+	}
+
+	l.observed = &Statistics{}
+	if err := l.prepareEscrow(t.Context()); err != nil {
+		t.Fatalf("prepare after demand drained: %v", err)
+	}
+	l.releaseIdleEscrowAbove(t.Context(), l.advertisedCapacity())
+	if got := l.capacity(); got != 1 {
+		t.Errorf("idle capacity = %d, want one discovery slot", got)
+	}
+
+	usage, err := a.Usage(t.Context())
+	if err != nil {
+		t.Fatalf("Usage: %v", err)
+	}
+	if usage.VCPU != tierVCPU {
+		t.Errorf("ledger holds %d vCPU, want one %d-vCPU discovery slot", usage.VCPU, tierVCPU)
+	}
+}
+
+// A lower maxCapacity is a remote promise before it is a local number. Releasing
+// first lets a peer escrow the same machine while GitHub may still assign against
+// the previous advertisement.
+func TestLowerAdvertisementPrecedesSurplusRelease(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-old"), tier("billet-4vcpu-peer")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 12, MaxMemory: 64 * config.GiB}, tiers)
+
+	firstPoll := make(chan int, 1)
+	returnFirstPoll := make(chan struct{})
+	returnLaterPoll := make(chan struct{})
+	var polls atomic.Int32
+	session := &fakeSession{
+		onPoll: func(capacity int) {
+			if polls.Load() == 0 {
+				firstPoll <- capacity
+			}
+		},
+		onGet: func() (*Message, error) {
+			if polls.Add(1) == 1 {
+				<-returnFirstPoll
+				return nil, ErrNoMessage
+			}
+			<-returnLaterPoll
+			return nil, ErrNoMessage
+		},
+	}
+	l := NewListener(a, tiers[0].Label, session, WithDrainGrace(time.Nanosecond))
+	if err := l.refillEscrow(t.Context()); err != nil {
+		t.Fatalf("seed old full-deployment advertisement: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- l.Run(ctx) }()
+
+	select {
+	case got := <-firstPoll:
+		if got != 1 {
+			t.Fatalf("lower advertisement = %d, want one discovery slot", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("listener never began the lower-capacity poll")
+	}
+
+	if got, err := a.Headroom(t.Context(), tiers[1].Label); err != nil {
+		t.Fatalf("peer headroom while the lower poll is blocked: %v", err)
+	} else if got != 0 {
+		t.Errorf("peer headroom while GitHub has not observed the lower capacity = %d, want 0", got)
+	}
+
+	close(returnFirstPoll)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		got, err := a.Headroom(t.Context(), tiers[1].Label)
+		if err != nil {
+			t.Fatalf("peer headroom after the lower poll: %v", err)
+		}
+		if got == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("peer headroom stayed %d after GitHub observed the lower capacity, want 2", got)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	cancel()
+	close(returnLaterPoll)
+	if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
+func TestSurplusReleaseRetainsPreferredPlacement(t *testing.T) {
+	tierConfig := config.Tier{
+		Label: "billet-4vcpu-home-first", Providers: []config.ProviderKind{
+			config.ProviderFirecracker, config.ProviderDocker,
+		},
+		GuestOS: config.GuestLinux, VCPU: 4, Memory: 8 * config.GiB,
+	}
+	a := newBareAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 16 * config.GiB},
+		[]config.Tier{tierConfig})
+	for _, node := range []alloc.NodeRegistration{
+		{Name: "home", Provider: config.ProviderFirecracker, VCPU: 4, Memory: 8 * config.GiB},
+		{Name: "fallback", Provider: config.ProviderDocker, VCPU: 4, Memory: 8 * config.GiB},
+	} {
+		if _, err := a.RegisterNode(t.Context(), node); err != nil {
+			t.Fatalf("RegisterNode %s: %v", node.Name, err)
+		}
+	}
+
+	l := NewListener(a, tierConfig.Label, &fakeSession{})
+	if err := l.refillEscrow(t.Context()); err != nil {
+		t.Fatalf("refill: %v", err)
+	}
+	if got := l.capacity(); got != 2 {
+		t.Fatalf("capacity = %d, want both placements", got)
+	}
+
+	l.releaseIdleEscrowAbove(t.Context(), 1)
+	held := l.Held()
+	if len(held) != 1 {
+		t.Fatalf("held = %d, want one discovery lease", len(held))
+	}
+	if held[0].TargetNode != "home" {
+		t.Errorf("retained target = %q, want preferred home placement", held[0].TargetNode)
+	}
+}
+
+func TestOfferRefillLeavesHeadroomForAConcurrentTier(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a"), tier("billet-4vcpu-b")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 20, MaxMemory: 64 * config.GiB}, tiers)
+
+	acquireStarted := make(chan struct{})
+	finishAcquire := make(chan struct{})
+	firstSession := &fakeSession{onAcquire: func(ids []int64) ([]int64, error) {
+		close(acquireStarted)
+		<-finishAcquire
+		return ids, nil
+	}}
+	first := NewListener(a, tiers[0].Label, firstSession)
+	secondSession := &fakeSession{}
+	second := NewListener(a, tiers[1].Label, secondSession)
+	if err := first.prepareEscrow(t.Context()); err != nil {
+		t.Fatalf("first discovery slot: %v", err)
+	}
+	if err := second.prepareEscrow(t.Context()); err != nil {
+		t.Fatalf("second discovery slot: %v", err)
+	}
+
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- first.handle(t.Context(), &Message{MessageID: 1,
+			Available: []Job{{RequestID: 11, RunID: 101}}})
+	}()
+	select {
+	case <-acquireStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first listener never entered AcquireJobs")
+	}
+
+	if err := second.handle(t.Context(), &Message{MessageID: 2, Available: []Job{
+		{RequestID: 21, RunID: 201}, {RequestID: 22, RunID: 202},
+	}}); err != nil {
+		t.Fatalf("second handle: %v", err)
+	}
+	if got := secondSession.acquiredIDs(); !slices.Equal(got, []int64{21, 22}) {
+		t.Errorf("second listener acquired %v, want both offers while its peer is blocked", got)
+	}
+
+	close(finishAcquire)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first handle: %v", err)
+	}
+}
+
+func TestReturnedLowerPollReleasesSurplusBeforeAcquireBlocks(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-shrinking"), tier("billet-4vcpu-peer")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 20, MaxMemory: 64 * config.GiB}, tiers)
+
+	acquireStarted := make(chan struct{})
+	finishAcquire := make(chan struct{})
+	finishLaterPoll := make(chan struct{})
+	var polls atomic.Int32
+	firstSession := &fakeSession{
+		onGet: func() (*Message, error) {
+			if polls.Add(1) == 1 {
+				return &Message{MessageID: 1,
+					Available: []Job{{RequestID: 11, RunID: 101}}}, nil
+			}
+			<-finishLaterPoll
+			return nil, ErrNoMessage
+		},
+		onAcquire: func(ids []int64) ([]int64, error) {
+			close(acquireStarted)
+			<-finishAcquire
+			return ids, nil
+		},
+	}
+	first := NewListener(a, tiers[0].Label, firstSession, WithDrainGrace(time.Nanosecond))
+	if err := first.refillEscrow(t.Context()); err != nil {
+		t.Fatalf("seed prior full advertisement: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- first.Run(ctx) }()
+	var finishOnce sync.Once
+	defer func() {
+		finishOnce.Do(func() { close(finishAcquire) })
+		cancel()
+		close(finishLaterPoll)
+		if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("Run: %v", err)
+		}
+	}()
+
+	select {
+	case <-acquireStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first listener never blocked in AcquireJobs")
+	}
+
+	secondSession := &fakeSession{}
+	second := NewListener(a, tiers[1].Label, secondSession)
+	if err := second.handle(t.Context(), &Message{MessageID: 2, Available: []Job{
+		{RequestID: 21, RunID: 201}, {RequestID: 22, RunID: 202},
+	}}); err != nil {
+		t.Fatalf("peer handle: %v", err)
+	}
+	if got := secondSession.acquiredIDs(); !slices.Equal(got, []int64{21, 22}) {
+		t.Errorf("peer acquired %v, want both offers after the lower poll returned", got)
+	}
+
+	finishOnce.Do(func() { close(finishAcquire) })
+}
+
+func TestPartialAcquisitionRestoresSameProviderPlacementOrder(t *testing.T) {
+	tierConfig := config.Tier{
+		Label: "billet-4vcpu-pack", Provider: config.ProviderFirecracker,
+		GuestOS: config.GuestLinux, VCPU: 4, Memory: 8 * config.GiB,
+	}
+	a := newBareAllocator(t, alloc.Limits{MaxVCPU: 12, MaxMemory: 24 * config.GiB},
+		[]config.Tier{tierConfig}, alloc.WithPlacement(config.PlacementPack))
+	for _, node := range []alloc.NodeRegistration{
+		{Name: "a", Provider: config.ProviderFirecracker, VCPU: 8, Memory: 16 * config.GiB},
+		{Name: "b", Provider: config.ProviderFirecracker, VCPU: 4, Memory: 8 * config.GiB},
+	} {
+		if _, err := a.RegisterNode(t.Context(), node); err != nil {
+			t.Fatalf("RegisterNode %s: %v", node.Name, err)
+		}
+	}
+
+	session := &fakeSession{onAcquire: func(ids []int64) ([]int64, error) {
+		return ids[1:], nil
+	}}
+	l := NewListener(a, tierConfig.Label, session)
+	if err := l.refillEscrow(t.Context()); err != nil {
+		t.Fatalf("refill: %v", err)
+	}
+	original := l.Held()
+	if len(original) != 3 {
+		t.Fatalf("held = %d, want all three fleet slots", len(original))
+	}
+	if original[0].TargetNode == original[2].TargetNode {
+		t.Fatalf("placement order %v does not exercise two same-provider targets",
+			[]string{original[0].TargetNode, original[1].TargetNode, original[2].TargetNode})
+	}
+
+	if err := l.acquire(t.Context(), []Job{
+		{RequestID: 11, RunID: 101}, {RequestID: 12, RunID: 102},
+	}); err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	if got := l.Acquiring(); got != 1 {
+		t.Fatalf("acquiring = %d, want the one granted offer", got)
+	}
+
+	l.releaseIdleEscrowAbove(t.Context(), 2)
+	held := l.Held()
+	if len(held) != 1 {
+		t.Fatalf("held = %d, want one discovery lease beside the promise", len(held))
+	}
+	if held[0].TargetNode != original[0].TargetNode {
+		t.Errorf("retained target = %q, want original first placement %q after unreserve",
+			held[0].TargetNode, original[0].TargetNode)
+	}
+}
+
+func TestHeartbeatLossDuringSurplusReleaseDoesNotUndershootTarget(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-shrink-race")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 12, MaxMemory: 64 * config.GiB}, tiers)
+	l := NewListener(a, tiers[0].Label, &fakeSession{})
+	if err := l.refillEscrow(t.Context()); err != nil {
+		t.Fatalf("refill: %v", err)
+	}
+	original := l.Held()
+	if len(original) != 3 {
+		t.Fatalf("held = %d, want three candidates", len(original))
+	}
+
+	releaseStarted := make(chan struct{})
+	finishRelease := make(chan struct{})
+	var releaseCalls atomic.Int32
+	l.releaseCapacity = func(ctx context.Context, id string, epoch int64,
+		outcome alloc.Phase,
+	) error {
+		if releaseCalls.Add(1) == 1 {
+			close(releaseStarted)
+			<-finishRelease
+		}
+		return a.Release(ctx, id, epoch, outcome)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		l.releaseIdleEscrowAbove(t.Context(), 1)
+		close(done)
+	}()
+	var finishOnce sync.Once
+	defer func() {
+		finishOnce.Do(func() { close(finishRelease) })
+		<-done
+	}()
+	select {
+	case <-releaseStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("surplus release never reached the staged allocator call")
+	}
+
+	// This is the in-memory result of heartbeat receiving ErrFenced for the
+	// retained lease while another candidate's release is in flight.
+	retained := original[0]
+	if err := a.Release(t.Context(), retained.ID, retained.Epoch, alloc.PhaseDone); err != nil {
+		t.Fatalf("stage retained heartbeat loss: %v", err)
+	}
+	l.mu.Lock()
+	l.held = slices.DeleteFunc(l.held, func(lease *alloc.Lease) bool {
+		return lease.ID == retained.ID
+	})
+	delete(l.confirmed, retained.ID)
+	delete(l.heldOrder, retained.ID)
+	l.mu.Unlock()
+
+	finishOnce.Do(func() { close(finishRelease) })
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("surplus release did not finish after the allocator resumed")
+	}
+
+	if got := l.capacity(); got != 1 {
+		t.Errorf("capacity after concurrent retained loss = %d, want the advertised target 1", got)
+	}
+	if got := releaseCalls.Load(); got != 1 {
+		t.Errorf("release calls = %d, want stale surplus calculation to stop after one", got)
+	}
+}
+
+func TestSurplusReleaseInFlightRemainsHeartbeated(t *testing.T) {
+	const ttl = 30 * time.Second
+
+	now := time.Date(2026, time.August, 21, 12, 0, 0, 0, time.UTC)
+	tiers := []config.Tier{tier("billet-4vcpu-release-heartbeat")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
+		alloc.WithClock(func() time.Time { return now }), alloc.WithLeaseTTL(ttl))
+	l := NewListener(a, tiers[0].Label, &fakeSession{})
+	if err := l.refillEscrow(t.Context()); err != nil {
+		t.Fatalf("refill: %v", err)
+	}
+
+	releaseStarted := make(chan struct{})
+	finishRelease := make(chan struct{})
+	l.releaseCapacity = func(ctx context.Context, id string, epoch int64,
+		outcome alloc.Phase,
+	) error {
+		close(releaseStarted)
+		<-finishRelease
+
+		return a.Release(ctx, id, epoch, outcome)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		l.releaseIdleEscrowAbove(t.Context(), 1)
+		close(done)
+	}()
+	var finishOnce sync.Once
+	defer func() {
+		finishOnce.Do(func() { close(finishRelease) })
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Errorf("surplus release goroutine did not stop")
+		}
+	}()
+	select {
+	case <-releaseStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("surplus release never reached the staged allocator call")
+	}
+
+	now = now.Add(2 * ttl)
+	l.mu.Lock()
+	l.heartbeatHeld(t.Context())
+	l.mu.Unlock()
+	if reaped, err := a.Reap(t.Context()); err != nil {
+		t.Fatalf("reap after heartbeat: %v", err)
+	} else if reaped != 0 {
+		t.Fatalf("reaped after heartbeat = %d, want no idle lease to expire", reaped)
+	}
+
+	finishOnce.Do(func() { close(finishRelease) })
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("surplus release did not finish after the allocator resumed")
+	}
+	if got := l.capacity(); got != 1 {
+		t.Errorf("capacity after release = %d, want retained target 1", got)
+	}
+}
+
+func TestSurplusReleaseRemovedByHeartbeatIsNotRestored(t *testing.T) {
+	const ttl = 30 * time.Second
+
+	now := time.Date(2026, time.August, 21, 12, 0, 0, 0, time.UTC)
+	tiers := []config.Tier{tier("billet-4vcpu-release-loss")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 4, MaxMemory: 64 * config.GiB}, tiers,
+		alloc.WithClock(func() time.Time { return now }), alloc.WithLeaseTTL(ttl))
+	l := NewListener(a, tiers[0].Label, &fakeSession{})
+	if err := l.refillEscrow(t.Context()); err != nil {
+		t.Fatalf("refill: %v", err)
+	}
+
+	releaseStarted := make(chan struct{})
+	finishRelease := make(chan struct{})
+	l.releaseCapacity = func(context.Context, string, int64, alloc.Phase) error {
+		close(releaseStarted)
+		<-finishRelease
+
+		return errors.New("injected retryable release failure")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		l.releaseIdleEscrowAbove(t.Context(), 0)
+		close(done)
+	}()
+	var finishOnce sync.Once
+	defer func() {
+		finishOnce.Do(func() { close(finishRelease) })
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Errorf("surplus release goroutine did not stop")
+		}
+	}()
+	select {
+	case <-releaseStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("surplus release never reached the staged allocator call")
+	}
+
+	now = now.Add(2 * ttl)
+	if reaped, err := a.Reap(t.Context()); err != nil {
+		t.Fatalf("reap staged release: %v", err)
+	} else if reaped != 1 {
+		t.Fatalf("reaped staged release = %d, want 1", reaped)
+	}
+	l.mu.Lock()
+	l.heartbeatHeld(t.Context())
+	l.mu.Unlock()
+
+	finishOnce.Do(func() { close(finishRelease) })
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("surplus release did not finish after the allocator resumed")
+	}
+	if got := l.capacity(); got != 0 {
+		t.Errorf("capacity after heartbeat proved loss = %d, want 0", got)
+	}
+	if got := len(l.Held()); got != 0 {
+		t.Errorf("held after heartbeat proved loss = %d, want 0", got)
+	}
+	l.mu.Lock()
+	releasing := len(l.releasing)
+	l.mu.Unlock()
+	if releasing != 0 {
+		t.Errorf("releasing after heartbeat proved loss = %d, want 0", releasing)
+	}
+}
+
+func TestFencedOrMissingSurplusReleaseIsNotRestored(t *testing.T) {
+	for name, releaseErr := range map[string]error{
+		"fenced":  alloc.ErrFenced,
+		"missing": alloc.ErrLeaseNotFound,
+	} {
+		t.Run(name, func(t *testing.T) {
+			tiers := []config.Tier{tier("billet-4vcpu-release-" + name)}
+			a := newAllocator(t, alloc.Limits{MaxVCPU: 4, MaxMemory: 64 * config.GiB}, tiers)
+			l := NewListener(a, tiers[0].Label, &fakeSession{})
+			if err := l.refillEscrow(t.Context()); err != nil {
+				t.Fatalf("refill: %v", err)
+			}
+			l.releaseCapacity = func(context.Context, string, int64, alloc.Phase) error {
+				return releaseErr
+			}
+
+			l.releaseIdleEscrowAbove(t.Context(), 0)
+			if got := l.capacity(); got != 0 {
+				t.Errorf("capacity after definitive release loss = %d, want 0", got)
+			}
+			if got := len(l.Held()); got != 0 {
+				t.Errorf("held after definitive release loss = %d, want 0", got)
+			}
+		})
+	}
+}
+
+func TestRetryableSurplusReleaseFailureRestoresOwnedLease(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-release-retry")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 12, MaxMemory: 64 * config.GiB}, tiers)
+	l := NewListener(a, tiers[0].Label, &fakeSession{})
+	if err := l.refillEscrow(t.Context()); err != nil {
+		t.Fatalf("refill: %v", err)
+	}
+	l.mu.Lock()
+	l.heartbeatHeld(t.Context())
+	originalOrder := maps.Clone(l.heldOrder)
+	originalConfirmed := maps.Clone(l.confirmed)
+	originalNextOrder := l.nextHeldOrder
+	l.mu.Unlock()
+	original := l.Held()
+	if len(original) != 3 {
+		t.Fatalf("held = %d, want three placement-ordered candidates", len(original))
+	}
+
+	l.releaseCapacity = func(context.Context, string, int64, alloc.Phase) error {
+		return errors.New("injected retryable release failure")
+	}
+	l.releaseIdleEscrowAbove(t.Context(), 2)
+
+	if got := l.capacity(); got != 3 {
+		t.Errorf("capacity after retryable release failure = %d, want 3", got)
+	}
+	if restored := l.Held(); !slices.Equal(restored, original) {
+		t.Errorf("held placement order changed after retryable release failure")
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(l.releasing) != 0 {
+		t.Errorf("releasing after retryable release failure = %d, want 0", len(l.releasing))
+	}
+	if !maps.Equal(l.heldOrder, originalOrder) {
+		t.Errorf("held order metadata after retryable release failure = %v, want %v",
+			l.heldOrder, originalOrder)
+	}
+	if !maps.Equal(l.confirmed, originalConfirmed) {
+		t.Errorf("renewal metadata after retryable release failure = %v, want %v",
+			l.confirmed, originalConfirmed)
+	}
+	if l.nextHeldOrder != originalNextOrder {
+		t.Errorf("next held order after retryable release failure = %d, want %d",
+			l.nextHeldOrder, originalNextOrder)
+	}
+}
 
 // THE invariant of the listener plane, and the reason the allocator exists: the sum
 // of what every listener has advertised to GitHub at any instant never exceeds the
@@ -6775,6 +7448,7 @@ func TestALostLeaseKeepsItsPendingRetry(t *testing.T) {
 
 	l.mu.Lock()
 	l.acquiring[9] = &promise{lease: promised, at: time.Now()}
+	l.heldOrder[promised.ID] = 99
 	l.cleanup = map[int64]*pendingCleanup{9: {job: Job{RequestID: 9}}}
 	l.mu.Unlock()
 
@@ -6787,10 +7461,14 @@ func TestALostLeaseKeepsItsPendingRetry(t *testing.T) {
 	l.mu.Lock()
 	l.heartbeatHeld(t.Context())
 	_, stillPromised := l.acquiring[9]
+	_, stillOrdered := l.heldOrder[promised.ID]
 	l.mu.Unlock()
 
 	if stillPromised {
 		t.Fatal("the listener kept a promise the reaper had taken, so this proves nothing")
+	}
+	if stillOrdered {
+		t.Error("the lost promise retained issuance-order metadata for the life of the listener")
 	}
 
 	if cleanupCount(l) != 1 {

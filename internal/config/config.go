@@ -1179,11 +1179,10 @@ type Tier struct {
 	// of it while the others advertise zero and their jobs queue at GitHub. A
 	// reservation is deducted from what OTHER tiers may take, only while it is unmet.
 	//
-	// THE COST IS IDLE CAPACITY. Listeners refill escrow eagerly and without regard to
-	// demand, so a reserved tier CLAIMS its floor almost immediately and holds it for
-	// as long as it is healthy: reserve 2 slots of an 8 vCPU tier nothing uses and the
-	// machine is permanently 16 vCPU smaller, with no error and no log line. Reserve
-	// for tiers that have demand and are being crowded out. Zero is the default.
+	// THE COST IS CAPACITY OTHER TIERS CANNOT USE. An idle listener keeps one discovery
+	// slot rather than claiming its whole floor, but the allocator still holds every
+	// unmet reserved slot away from competing tiers. Reserve for tiers that need a hard
+	// guarantee under contention. Zero is the default.
 	Reserved int `yaml:"reserved,omitempty"`
 }
 
