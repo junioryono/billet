@@ -42,18 +42,26 @@ const LockImageName = ".publish-lock"
 // retaken.
 const StaleLockAfter = 6 * time.Hour
 
-// cookieAge parses the timestamp the cookie ends with.
+// cookieAges parse timestamps only from the two cookie shapes Billet writes.
 //
 // THE SHAPE IS SHARED WITH THE BUILD SCRIPT, which reads it with the regex
 // `-(?<t>[0-9]+)$`. Any cookie this package writes must end the same way or a
 // script-side build could never age out a lock this side leaked — one direction
 // of the interop would silently stop working, and only under the failure it
 // exists to handle.
-var cookieAge = regexp.MustCompile(`-(\d+)$`)
+var cookieAges = []*regexp.Regexp{
+	regexp.MustCompile(`^billet-import-.+-\d+-[0-9a-f]{16}-(\d+)$`),
+	regexp.MustCompile(`^billet-build-.+-\d+-(\d+)$`),
+}
 
-func knownLockCookie(cookie string) bool {
-	return strings.HasPrefix(cookie, "billet-import-") ||
-		strings.HasPrefix(cookie, "billet-build-")
+func lockCookieTimestamp(cookie string) (string, bool) {
+	for _, pattern := range cookieAges {
+		if match := pattern.FindStringSubmatch(cookie); match != nil {
+			return match[1], true
+		}
+	}
+
+	return "", false
 }
 
 var errLockContended = errors.New("ceph: advisory lock is contended")
@@ -194,20 +202,24 @@ func (l *PublishLock) beat(ctx context.Context) {
 }
 
 // observeHeartbeat reads a holder's liveness counter.
-func (c *Client) observeHeartbeat(ctx context.Context, image, cookie string) heartbeat {
+func (c *Client) observeHeartbeat(ctx context.Context, image, cookie string) (heartbeat, error) {
 	out, err := c.rbdCmd(ctx, false, "image-meta", "get", image, heartbeatKey(cookie))
 	if err != nil {
 		// ABSENT IS A VALID OBSERVATION, not an error: the build script writes no
 		// counter at all, and its locks must still be judged.
-		return heartbeat{}
+		if isNoSuchFile(err) {
+			return heartbeat{}, nil
+		}
+
+		return heartbeat{}, fmt.Errorf("ceph: could not observe whether %s is alive: %w", cookie, err)
 	}
 
 	value, err := strconv.ParseUint(strings.TrimSpace(string(out)), 10, 64)
 	if err != nil {
-		return heartbeat{}
+		return heartbeat{}, fmt.Errorf("ceph: %s has an invalid heartbeat counter", cookie)
 	}
 
-	return heartbeat{counter: value, present: true}
+	return heartbeat{counter: value, present: true}, nil
 }
 
 // TakePublishLock claims the right to write the golden image.
@@ -306,7 +318,10 @@ func (c *Client) takeLock(
 	// So the holder's counter is read twice, separated by a window. A counter that
 	// MOVED is proof of life that needs no agreement about the time between the two
 	// machines.
-	before := c.observeHeartbeat(ctx, image, holder.ID)
+	before, err := c.observeHeartbeat(ctx, image, holder.ID)
+	if err != nil {
+		return nil, err
+	}
 
 	// A TIMER THAT IS STOPPED, not time.After, which holds its timer until it fires
 	// however the select ends. Ninety seconds of leaked timer per contended publish
@@ -322,7 +337,10 @@ func (c *Client) takeLock(
 	case <-timer.C:
 	}
 
-	after := c.observeHeartbeat(ctx, image, holder.ID)
+	after, err := c.observeHeartbeat(ctx, image, holder.ID)
+	if err != nil {
+		return nil, err
+	}
 
 	mayBreak, why := breakable(before, after, age, staleAfter)
 	if !mayBreak {
@@ -439,21 +457,12 @@ func (c *Client) heldLock(
 		return lockEntry{}, 0, false, false, nil
 	}
 
-	if !knownLockCookie(held[0].ID) {
+	timestamp, knownCookie := lockCookieTimestamp(held[0].ID)
+	if !knownCookie {
 		return held[0], 0, false, true, nil
 	}
 
-	match := cookieAge.FindStringSubmatch(held[0].ID)
-	if match == nil {
-		// A COOKIE THIS DID NOT WRITE. Something took the lock that is not billet, or
-		// is a billet old enough to predate the convention. Either way its age
-		// cannot be established, and a lock of unknown age is never broken: the
-		// alternative is breaking a live writer's lock because its name was
-		// unfamiliar.
-		return held[0], 0, false, true, nil
-	}
-
-	seconds, parseErr := strconv.ParseInt(match[1], 10, 64)
+	seconds, parseErr := strconv.ParseInt(timestamp, 10, 64)
 	if parseErr != nil {
 		// AN AGE OF ZERO, NOT AN ERROR. A cookie whose trailing digits do not fit an
 		// int64 was not written by anything this understands, and the caller treats

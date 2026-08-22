@@ -26,6 +26,7 @@ type cacheFake struct {
 	lockCookie           string
 	locker               string
 	heartbeat            func() string
+	heartbeatErr         error
 	lockAdds             int
 	lockAddErr           error
 	lockAddErrOn         int
@@ -216,8 +217,16 @@ func (f *cacheFake) imageMeta(args []string) ([]byte, error) {
 
 		return nil, nil
 	case "get":
+		if f.heartbeatErr != nil && strings.HasPrefix(args[2], "billet.heartbeat.") {
+			return nil, f.heartbeatErr
+		}
 		if f.heartbeat != nil && strings.HasPrefix(args[2], "billet.heartbeat.") {
-			return []byte(f.heartbeat() + "\n"), nil
+			value := f.heartbeat()
+			if f.heartbeatErr != nil {
+				return nil, f.heartbeatErr
+			}
+
+			return []byte(value + "\n"), nil
 		}
 		value, ok := f.metadata[image][args[2]]
 		if !ok {
@@ -433,10 +442,11 @@ func TestCacheLockStaleAfterIsTenMinutes(t *testing.T) {
 func TestCacheIndexLockWaitIncludesRecoveryMargin(t *testing.T) {
 	t.Parallel()
 
-	wantMinimum := CacheLockStaleAfter + HeartbeatObservation + cacheLockRecoveryGap
-	if cacheLockRecoveryGap <= 0 || cacheLockWaitLimit < wantMinimum {
+	const minimumRecoveryGap = 30 * time.Second
+	wantMinimum := CacheLockStaleAfter + HeartbeatObservation + minimumRecoveryGap
+	if cacheLockRecoveryGap < minimumRecoveryGap || cacheLockWaitLimit < wantMinimum {
 		t.Fatalf("cache-index wait limit %s does not include the %s recovery margin after %s",
-			cacheLockWaitLimit, cacheLockRecoveryGap, CacheLockStaleAfter+HeartbeatObservation)
+			cacheLockWaitLimit, minimumRecoveryGap, CacheLockStaleAfter+HeartbeatObservation)
 	}
 }
 
@@ -444,7 +454,7 @@ func TestCacheIndexLockReclaimsAHolderThatWasFreshWhenWaitingBegan(t *testing.T)
 	t.Parallel()
 
 	now := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
-	holder := fmt.Sprintf("billet-import-deadhost-7-fresh-%d", now.Unix())
+	holder := fmt.Sprintf("billet-import-deadhost-7-0123456789abcdef-%d", now.Unix())
 	f := newCacheFake()
 	f.lockCookie = holder
 	c := cacheClient(t, f)
@@ -482,7 +492,7 @@ func TestCacheIndexLockRecoversOnItsOwnStaleBound(t *testing.T) {
 	t.Parallel()
 
 	now := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
-	staleCookie := fmt.Sprintf("billet-import-deadhost-7-deadbeef-%d",
+	staleCookie := fmt.Sprintf("billet-import-deadhost-7-deadbeefdeadbeef-%d",
 		now.Add(-CacheLockStaleAfter-time.Minute).Unix())
 	f := newCacheFake()
 	f.lockCookie = staleCookie
@@ -509,7 +519,7 @@ func TestCacheIndexLockKeepsASilentHolderInsideItsBound(t *testing.T) {
 	t.Parallel()
 
 	now := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
-	holder := fmt.Sprintf("billet-import-livehost-7-feedface-%d",
+	holder := fmt.Sprintf("billet-import-livehost-7-feedfacefeedface-%d",
 		now.Add(-CacheLockStaleAfter+time.Minute).Unix())
 	f := newCacheFake()
 	f.lockCookie = holder
@@ -543,7 +553,7 @@ func TestCacheIndexLockKeepsAnOldHolderWhoseHeartbeatMoves(t *testing.T) {
 	t.Parallel()
 
 	now := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
-	holder := fmt.Sprintf("billet-import-livehost-7-abcd1234-%d",
+	holder := fmt.Sprintf("billet-import-livehost-7-abcd1234abcd1234-%d",
 		now.Add(-100*CacheLockStaleAfter).Unix())
 	beats := 0
 	f := newCacheFake()
@@ -569,11 +579,70 @@ func TestCacheIndexLockKeepsAnOldHolderWhoseHeartbeatMoves(t *testing.T) {
 	}
 }
 
+func TestCacheIndexLockRefusesToBreakWhenHeartbeatCannotBeRead(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
+	holder := fmt.Sprintf("billet-import-livehost-7-aaaaaaaaaaaaaaaa-%d",
+		now.Add(-100*CacheLockStaleAfter).Unix())
+	heartbeatErr := cacheExitError{code: 13, message: "rbd: permission denied"}
+	f := newCacheFake()
+	f.lockCookie = holder
+	f.heartbeatErr = heartbeatErr
+	c := cacheClient(t, f)
+	c.observation = time.Millisecond
+
+	ran := false
+	err := c.withCacheLock(t.Context(), now, func(time.Time) error {
+		ran = true
+
+		return nil
+	})
+	if !errors.Is(err, heartbeatErr) {
+		t.Fatalf("unreadable holder heartbeat returned %v, want the Ceph failure", err)
+	}
+	if ran {
+		t.Fatal("cache work ran without proving the old holder was silent")
+	}
+	if f.ranWith("lock", "rm", holder) {
+		t.Fatal("billet broke an old holder whose heartbeat could not be read")
+	}
+}
+
+func TestCacheIndexLockRefusesToBreakOnAMalformedHeartbeat(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
+	holder := fmt.Sprintf("billet-import-livehost-7-bbbbbbbbbbbbbbbb-%d",
+		now.Add(-100*CacheLockStaleAfter).Unix())
+	f := newCacheFake()
+	f.lockCookie = holder
+	f.heartbeat = func() string { return "not-a-counter" }
+	c := cacheClient(t, f)
+	c.observation = time.Millisecond
+
+	ran := false
+	err := c.withCacheLock(t.Context(), now, func(time.Time) error {
+		ran = true
+
+		return nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "invalid heartbeat counter") {
+		t.Fatalf("malformed holder heartbeat returned %v, want a fail-closed diagnostic", err)
+	}
+	if ran {
+		t.Fatal("cache work ran without a valid heartbeat observation")
+	}
+	if f.ranWith("lock", "rm", holder) {
+		t.Fatal("billet broke an old holder whose heartbeat was malformed")
+	}
+}
+
 func TestCacheIndexLockRetriesWhenAnOldHolderReleasesDuringObservation(t *testing.T) {
 	t.Parallel()
 
 	now := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
-	holder := fmt.Sprintf("billet-import-livehost-7-finished-%d",
+	holder := fmt.Sprintf("billet-import-livehost-7-f1a15eedf1a15eed-%d",
 		now.Add(-100*CacheLockStaleAfter).Unix())
 	reads := 0
 	f := newCacheFake()
@@ -582,6 +651,7 @@ func TestCacheIndexLockRetriesWhenAnOldHolderReleasesDuringObservation(t *testin
 		reads++
 		if reads == 2 {
 			f.lockCookie = ""
+			f.heartbeatErr = errors.New("rbd: (2) No such file or directory")
 
 			return ""
 		}
@@ -615,7 +685,7 @@ func TestCacheIndexLockRetriesWhenAHolderReleasesAfterRevalidation(t *testing.T)
 	t.Parallel()
 
 	now := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
-	holder := fmt.Sprintf("billet-import-livehost-7-final-race-%d",
+	holder := fmt.Sprintf("billet-import-livehost-7-f1a1ace0f1a1ace0-%d",
 		now.Add(-100*CacheLockStaleAfter).Unix())
 	f := newCacheFake()
 	f.lockCookie = holder
@@ -636,7 +706,7 @@ func TestCacheIndexLockRetriesWhenAReacquisitionWinnerAlreadyReleased(t *testing
 	t.Parallel()
 
 	now := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
-	holder := fmt.Sprintf("billet-import-deadhost-7-reacquire-%d",
+	holder := fmt.Sprintf("billet-import-deadhost-7-decafbaddecafbad-%d",
 		now.Add(-100*CacheLockStaleAfter).Unix())
 	f := newCacheFake()
 	f.lockCookie = holder
@@ -658,7 +728,8 @@ func TestCacheIndexLockStopsWaitingWhenItsCallerCancels(t *testing.T) {
 	t.Parallel()
 
 	now := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
-	holder := fmt.Sprintf("billet-import-livehost-7-cancelled-%d", now.Add(-time.Minute).Unix())
+	holder := fmt.Sprintf("billet-import-livehost-7-ca11ed00ca11ed00-%d",
+		now.Add(-time.Minute).Unix())
 	ctx, cancel := context.WithCancel(t.Context())
 	f := newCacheFake()
 	f.lockCookie = holder
@@ -689,21 +760,31 @@ func TestCacheIndexLockStopsWaitingWhenItsCallerCancels(t *testing.T) {
 func TestCacheIndexLockRefusesAnUnknownHolderWithoutRetrying(t *testing.T) {
 	t.Parallel()
 
-	f := newCacheFake()
-	f.lockCookie = "somebody-elses-tool-1234567890"
-	c := cacheClient(t, f)
-	c.observation = time.Millisecond
-	c.cacheLockRetry = time.Millisecond
+	for _, holder := range []string{
+		"somebody-elses-tool-1234567890",
+		"billet-import-external-tool-1234567890",
+		"billet-build-external-tool-1234567890",
+	} {
+		t.Run(holder, func(t *testing.T) {
+			t.Parallel()
 
-	err := c.withCacheLock(t.Context(), time.Now(), func(time.Time) error { return nil })
-	if err == nil || !strings.Contains(err.Error(), "age cannot be established") {
-		t.Fatalf("unknown cache-index holder returned %v, want a dated fail-closed refusal", err)
-	}
-	if f.lockAdds != 1 {
-		t.Fatalf("billet attempted an unknown cache-index holder %d times, want one", f.lockAdds)
-	}
-	if f.ranWith("lock", "rm") {
-		t.Fatal("billet removed a cache-index holder whose age it could not establish")
+			f := newCacheFake()
+			f.lockCookie = holder
+			c := cacheClient(t, f)
+			c.observation = time.Millisecond
+			c.cacheLockRetry = time.Millisecond
+
+			err := c.withCacheLock(t.Context(), time.Now(), func(time.Time) error { return nil })
+			if err == nil || !strings.Contains(err.Error(), "age cannot be established") {
+				t.Fatalf("unknown cache-index holder returned %v, want a dated fail-closed refusal", err)
+			}
+			if f.lockAdds != 1 {
+				t.Fatalf("billet attempted an unknown cache-index holder %d times, want one", f.lockAdds)
+			}
+			if f.ranWith("lock", "rm") {
+				t.Fatal("billet removed a cache-index holder whose age it could not establish")
+			}
+		})
 	}
 }
 
@@ -712,7 +793,7 @@ func TestCacheIndexLockDoesNotRetryNonContentionAddFailures(t *testing.T) {
 
 	for _, holder := range []string{
 		"",
-		"billet-import-otherhost-7-held-1234567890",
+		"billet-import-otherhost-7-beadbeadbeadbead-1234567890",
 	} {
 		t.Run(map[bool]string{true: "empty listing", false: "populated listing"}[holder == ""],
 			func(t *testing.T) {
@@ -747,7 +828,8 @@ func TestAcquireWriterStartsItsLifetimeAfterCacheIndexContention(t *testing.T) {
 	now := time.Now()
 	ttl := time.Minute
 	f := newCacheFake()
-	f.lockCookie = fmt.Sprintf("billet-import-livehost-7-delayed-%d", now.Add(-time.Minute).Unix())
+	f.lockCookie = fmt.Sprintf("billet-import-livehost-7-de1a9ed0de1a9ed0-%d",
+		now.Add(-time.Minute).Unix())
 	f.releaseOn = 2
 	c := cacheClient(t, f)
 	c.cacheLockRetry = 20 * time.Millisecond
@@ -767,7 +849,7 @@ func TestAcquireWriterStartsItsLifetimeAfterStaleLockObservation(t *testing.T) {
 	now := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
 	ttl := time.Minute
 	f := newCacheFake()
-	f.lockCookie = fmt.Sprintf("billet-import-deadhost-7-observed-%d",
+	f.lockCookie = fmt.Sprintf("billet-import-deadhost-7-0b5e7ed00b5e7ed0-%d",
 		now.Add(-CacheLockStaleAfter-time.Minute).Unix())
 	c := cacheClient(t, f)
 	c.observation = time.Millisecond
@@ -786,7 +868,7 @@ func TestPublishLockDoesNotInheritTheCacheRecoveryBound(t *testing.T) {
 	t.Parallel()
 
 	now := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
-	holder := fmt.Sprintf("billet-import-livehost-7-cafebabe-%d",
+	holder := fmt.Sprintf("billet-import-livehost-7-cafebabecafebabe-%d",
 		now.Add(-CacheLockStaleAfter-time.Minute).Unix())
 	f := newCacheFake()
 	f.lockCookie = holder

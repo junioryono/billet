@@ -70,8 +70,33 @@ func TestPublishCookieEndsWithTheTimestampTheShellParses(t *testing.T) {
 	}
 
 	// AND THIS PACKAGE'S OWN READER AGREES WITH THE SHELL'S.
-	if cookieAge.FindStringSubmatch(cookie) == nil {
+	if _, ok := lockCookieTimestamp(cookie); !ok {
 		t.Error("this package cannot parse the cookie it just wrote")
+	}
+}
+
+func TestLockCookieTimestampRecognisesOnlyBilletCookieShapes(t *testing.T) {
+	t.Parallel()
+
+	want := strconv.FormatInt(cookieAt.Unix(), 10)
+	for _, cookie := range []string{
+		"billet-import-host-name-42-0123456789abcdef-" + want,
+		"billet-build-host-name-42-" + want,
+	} {
+		got, ok := lockCookieTimestamp(cookie)
+		if !ok || got != want {
+			t.Errorf("lockCookieTimestamp(%q) = %q, %t; want %q, true", cookie, got, ok, want)
+		}
+	}
+
+	for _, cookie := range []string{
+		"billet-import-external-tool-" + want,
+		"billet-build-external-tool-" + want,
+		"other-tool-42-0123456789abcdef-" + want,
+	} {
+		if got, ok := lockCookieTimestamp(cookie); ok {
+			t.Errorf("lockCookieTimestamp(%q) accepted foreign shape with timestamp %q", cookie, got)
+		}
 	}
 }
 
