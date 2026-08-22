@@ -1591,13 +1591,22 @@ func TestCacheConformanceReusableWorkflowUsesItsOwnRevision(t *testing.T) {
 		t.Fatal("reusable workflow still depends on a fixture script from the caller checkout")
 	}
 	for _, required := range []string{
-		"steps.poison-actions.outputs.cache-hit }}' != true",
 		"steps.poison-tls.outputs.cache-hit }}' != true",
 		"steps.poison-proxy.outputs.cache-hit }}' != true",
-		"steps.poison-process.outputs.cache-hit }}' != true",
+		"actions_hit='${{ steps.poison-actions.outputs.cache-hit }}'",
+		"process_hit='${{ steps.poison-process.outputs.cache-hit }}'",
+		"this lifecycle is outside the interceptor boundary",
 	} {
 		if !strings.Contains(workflow, required) {
 			t.Fatalf("poison conformance is missing non-vacuity proof %q", required)
+		}
+	}
+	for _, forbidden := range []string{
+		"test '${{ steps.poison-actions.outputs.cache-hit }}' != true",
+		"test '${{ steps.poison-process.outputs.cache-hit }}' != true",
+	} {
+		if strings.Contains(workflow, forbidden) {
+			t.Fatalf("runner-owned poison outcome is incorrectly treated as an interceptor guarantee: %q", forbidden)
 		}
 	}
 	// The NODE_OPTIONS poison was removed: the runner strips step-env NODE_OPTIONS
