@@ -51,12 +51,21 @@ type fakeCacheStore struct {
 func TestCacheWriterAuthorityOutlivesTheWholeCommitBudget(t *testing.T) {
 	t.Parallel()
 
+	const (
+		actionCacheClientLimit = 13 * time.Minute
+		minimumResponseMargin  = 15 * time.Second
+	)
+
 	if cacheCleanupMargin <= 0 || cacheWorkLimit+cacheCleanupMargin != cacheHandlerLimit {
 		t.Fatalf("cache handler budget %s does not reserve cleanup margin %s",
 			cacheHandlerLimit, cacheCleanupMargin)
 	}
 	if cacheWriterTTL <= cacheHandlerLimit {
 		t.Fatalf("writer lease %s does not cover the %s handler budget", cacheWriterTTL, cacheHandlerLimit)
+	}
+	if cacheHandlerLimit+minimumResponseMargin > actionCacheClientLimit {
+		t.Fatalf("cache handler budget %s leaves less than %s beneath the action's %s deadline",
+			cacheHandlerLimit, minimumResponseMargin, actionCacheClientLimit)
 	}
 }
 
