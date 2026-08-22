@@ -52,6 +52,9 @@ func TestCacheConformanceRendererMakesTheConsumerOwnEveryJob(t *testing.T) {
 		"if: inputs.mode == 'passthrough'",
 		"default: intercept",
 		"- passthrough",
+		"passthrough_status=$(curl --silent --show-error",
+		"test \"$passthrough_status\" != 000",
+		"GitHub passthrough returned HTTP %s",
 	} {
 		if !strings.Contains(workflow, required) {
 			t.Errorf("generated workflow is missing %q", required)
@@ -59,6 +62,19 @@ func TestCacheConformanceRendererMakesTheConsumerOwnEveryJob(t *testing.T) {
 	}
 	if err := validateRenderedCacheConformance(first, options.runnerLabel); err != nil {
 		t.Fatalf("generated workflow failed its own ownership gate: %v", err)
+	}
+	probeStart := strings.Index(workflow, "passthrough_status=$(curl")
+	if probeStart < 0 {
+		t.Fatal("the passthrough probe does not capture its upstream HTTP status")
+	}
+	passthroughProbe := workflow[probeStart:]
+	probeEnd := strings.Index(passthroughProbe, "\n          if tr -d")
+	if probeEnd < 0 {
+		t.Fatal("the passthrough probe does not inspect the Billet response header")
+	}
+	passthroughProbe = passthroughProbe[:probeEnd]
+	if strings.Contains(passthroughProbe, "--fail") {
+		t.Fatal("the passthrough probe rejects valid upstream HTTP error responses")
 	}
 }
 
