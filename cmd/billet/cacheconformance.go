@@ -40,6 +40,7 @@ var (
 	conformanceRunnerPattern       = regexp.MustCompile(`^\d+\.\d+\.\d+$`)
 	conformanceContractPattern     = regexp.MustCompile(`^[1-9]\d*$`)
 	conformanceWorkflowRefPattern  = regexp.MustCompile(`^refs/(?:heads|tags)/[a-zA-Z0-9][a-zA-Z0-9._/-]{0,200}$`)
+	conformanceInputPattern        = regexp.MustCompile(`(?i)\binputs\b`)
 )
 
 type cacheConformanceInstallOptions struct {
@@ -390,6 +391,15 @@ func renderCacheConformance(source []byte, options cacheConformanceInstallOption
 # Keep the jobs directly in this repository: a restricted organization runner group cannot authorize jobs defined by a cross-organization reusable workflow.
 on:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: Require local interception or prove kill-switch passthrough
+        required: false
+        default: intercept
+        type: choice
+        options:
+          - intercept
+          - passthrough
 `, options.billetRepository, options.billetRef)
 	workflow = workflow[:triggerStart] + generatedTriggers + workflow[permissionsStart:]
 
@@ -409,8 +419,8 @@ on:
 		}
 		workflow = strings.ReplaceAll(workflow, replacement.input, strconv.Quote(replacement.value))
 	}
-	if strings.Contains(workflow, "${{ inputs.") {
-		return nil, errors.New("generated cache conformance workflow still depends on caller inputs")
+	if !strings.Contains(workflow, "${{ inputs.mode }}") {
+		return nil, errors.New("canonical cache conformance workflow does not use ${{ inputs.mode }}")
 	}
 
 	if err := validateRenderedCacheConformance([]byte(workflow), options.runnerLabel); err != nil {
@@ -429,14 +439,28 @@ func validateRenderedCacheConformance(workflow []byte, runnerLabel string) error
 		document.Content[0].Kind != yaml.MappingNode {
 		return errors.New("generated cache conformance workflow is not one YAML mapping")
 	}
+	if err := validateCacheConformanceInputContexts(&document, false); err != nil {
+		return err
+	}
 	root := document.Content[0]
 	triggers := cacheConformanceMappingValue(root, "on")
-	if triggers == nil || triggers.Kind != yaml.MappingNode ||
-		cacheConformanceMappingValue(triggers, "workflow_dispatch") == nil {
+	if triggers == nil || triggers.Kind != yaml.MappingNode {
+		return errors.New("generated cache conformance workflow has no trigger mapping")
+	}
+	dispatch := cacheConformanceMappingValue(triggers, "workflow_dispatch")
+	if dispatch == nil || dispatch.Kind != yaml.MappingNode {
 		return errors.New("generated cache conformance workflow is not manually dispatchable")
 	}
 	if cacheConformanceMappingValue(triggers, "workflow_call") != nil {
 		return errors.New("generated cache conformance workflow still exposes workflow_call")
+	}
+	inputs := cacheConformanceMappingValue(dispatch, "inputs")
+	mode := cacheConformanceMappingValue(inputs, "mode")
+	if inputs == nil || inputs.Kind != yaml.MappingNode || mode == nil || mode.Kind != yaml.MappingNode ||
+		cacheConformanceScalarValue(mode, "default") != "intercept" ||
+		cacheConformanceScalarValue(mode, "type") != "choice" ||
+		!cacheConformanceSequenceEquals(cacheConformanceMappingValue(mode, "options"), "intercept", "passthrough") {
+		return errors.New("generated cache conformance workflow does not expose the bounded intercept/passthrough mode")
 	}
 
 	jobs := cacheConformanceMappingValue(root, "jobs")
@@ -464,6 +488,54 @@ func validateRenderedCacheConformance(workflow []byte, runnerLabel string) error
 	return nil
 }
 
+func validateCacheConformanceInputContexts(node *yaml.Node, implicitExpression bool) error {
+	if node.Anchor != "" || node.Kind == yaml.AliasNode {
+		return errors.New("generated cache conformance workflow must not contain YAML anchors or aliases")
+	}
+	if node.Kind == yaml.ScalarNode {
+		if !implicitExpression && !strings.Contains(node.Value, "${{") {
+			return nil
+		}
+		for _, location := range conformanceInputPattern.FindAllStringIndex(node.Value, -1) {
+			reference := node.Value[location[0]:]
+			if !strings.HasPrefix(reference, "inputs.mode") {
+				return fmt.Errorf("generated cache conformance workflow uses an unsupported inputs context in %q", node.Value)
+			}
+			suffix := reference[len("inputs.mode"):]
+			if suffix != "" && ((suffix[0] >= 'a' && suffix[0] <= 'z') ||
+				(suffix[0] >= 'A' && suffix[0] <= 'Z') || (suffix[0] >= '0' && suffix[0] <= '9') || suffix[0] == '_') {
+				return fmt.Errorf("generated cache conformance workflow uses an unsupported inputs context in %q", node.Value)
+			}
+			suffix = strings.TrimLeft(suffix, " \t")
+			if strings.HasPrefix(suffix, ".") || strings.HasPrefix(suffix, "[") {
+				return fmt.Errorf("generated cache conformance workflow uses an unsupported inputs context in %q", node.Value)
+			}
+		}
+		return nil
+	}
+
+	switch node.Kind {
+	case yaml.DocumentNode, yaml.SequenceNode:
+		for _, child := range node.Content {
+			if err := validateCacheConformanceInputContexts(child, false); err != nil {
+				return err
+			}
+		}
+	case yaml.MappingNode:
+		for index := 0; index+1 < len(node.Content); index += 2 {
+			key := node.Content[index]
+			value := node.Content[index+1]
+			if err := validateCacheConformanceInputContexts(key, false); err != nil {
+				return err
+			}
+			if err := validateCacheConformanceInputContexts(value, key.Kind == yaml.ScalarNode && key.Value == "if"); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func cacheConformanceMappingValue(mapping *yaml.Node, key string) *yaml.Node {
 	if mapping == nil || mapping.Kind != yaml.MappingNode {
 		return nil
@@ -475,6 +547,28 @@ func cacheConformanceMappingValue(mapping *yaml.Node, key string) *yaml.Node {
 	}
 
 	return nil
+}
+
+func cacheConformanceScalarValue(mapping *yaml.Node, key string) string {
+	value := cacheConformanceMappingValue(mapping, key)
+	if value == nil || value.Kind != yaml.ScalarNode {
+		return ""
+	}
+
+	return value.Value
+}
+
+func cacheConformanceSequenceEquals(sequence *yaml.Node, values ...string) bool {
+	if sequence == nil || sequence.Kind != yaml.SequenceNode || len(sequence.Content) != len(values) {
+		return false
+	}
+	for i, value := range values {
+		if sequence.Content[i].Kind != yaml.ScalarNode || sequence.Content[i].Value != value {
+			return false
+		}
+	}
+
+	return true
 }
 
 func writeCacheConformanceWorkflow(path string, body []byte, force bool) error {

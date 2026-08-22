@@ -1591,6 +1591,9 @@ func TestCacheConformanceReusableWorkflowUsesItsOwnRevision(t *testing.T) {
 		t.Fatal("reusable workflow still depends on a fixture script from the caller checkout")
 	}
 	for _, required := range []string{
+		"if: inputs.mode == 'intercept'",
+		"if: inputs.mode == 'passthrough'",
+		"the selected kill switch still allowed local cache interception",
 		"steps.poison-tls.outputs.cache-hit }}' != true",
 		"steps.poison-proxy.outputs.cache-hit }}' != true",
 		"actions_hit='${{ steps.poison-actions.outputs.cache-hit }}'",
