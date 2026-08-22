@@ -1489,6 +1489,20 @@ var poolRunnerIdentityMigration = migration{
 	},
 }
 
+// Desired-count growth creates physical runners before GitHub names individual
+// jobs. Give those lease-backed slots their own durable scheduler namespace;
+// sharing job_identities would make a valid external job id a possible alias.
+var poolSlotIdentityMigration = migration{
+	Version: 29,
+	Name:    "pool_slot_identity",
+	Stmts: []string{
+		`CREATE TABLE pool_slot_identities (
+			lease_id    TEXT PRIMARY KEY CHECK (length(trim(lease_id)) > 0),
+			internal_id INTEGER NOT NULL UNIQUE CHECK (internal_id < 0)
+		) STRICT`,
+	},
+}
+
 func init() {
 	migrations = append(migrations,
 		placementMigration, guestOSMigration, placementFactsMigration, requestIDMigration,
@@ -1499,7 +1513,7 @@ func init() {
 		leaseFailureReasonMigration, pendingCompletionsMigration, pendingCompletionLeaseMigration,
 		pendingCompletionRecoveryMigration, pendingCompletionAcknowledgementMigration,
 		directAssignmentIdentityMigration, cacheInterceptionPolicyMigration,
-		poolRunnerIdentityMigration)
+		poolRunnerIdentityMigration, poolSlotIdentityMigration)
 }
 
 const bootstrapSchemaMigrations = `CREATE TABLE IF NOT EXISTS schema_migrations (
