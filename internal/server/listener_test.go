@@ -450,6 +450,119 @@ func TestOfferRefillLeavesHeadroomForAConcurrentTier(t *testing.T) {
 	}
 }
 
+func TestReturnedLowerPollReleasesSurplusBeforeAcquireBlocks(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-shrinking"), tier("billet-4vcpu-peer")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 20, MaxMemory: 64 * config.GiB}, tiers)
+
+	acquireStarted := make(chan struct{})
+	finishAcquire := make(chan struct{})
+	finishLaterPoll := make(chan struct{})
+	var polls atomic.Int32
+	firstSession := &fakeSession{
+		onGet: func() (*Message, error) {
+			if polls.Add(1) == 1 {
+				return &Message{MessageID: 1,
+					Available: []Job{{RequestID: 11, RunID: 101}}}, nil
+			}
+			<-finishLaterPoll
+			return nil, ErrNoMessage
+		},
+		onAcquire: func(ids []int64) ([]int64, error) {
+			close(acquireStarted)
+			<-finishAcquire
+			return ids, nil
+		},
+	}
+	first := NewListener(a, tiers[0].Label, firstSession, WithDrainGrace(time.Nanosecond))
+	if err := first.refillEscrow(t.Context()); err != nil {
+		t.Fatalf("seed prior full advertisement: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- first.Run(ctx) }()
+	var finishOnce sync.Once
+	defer func() {
+		finishOnce.Do(func() { close(finishAcquire) })
+		cancel()
+		close(finishLaterPoll)
+		if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("Run: %v", err)
+		}
+	}()
+
+	select {
+	case <-acquireStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first listener never blocked in AcquireJobs")
+	}
+
+	secondSession := &fakeSession{}
+	second := NewListener(a, tiers[1].Label, secondSession)
+	if err := second.handle(t.Context(), &Message{MessageID: 2, Available: []Job{
+		{RequestID: 21, RunID: 201}, {RequestID: 22, RunID: 202},
+	}}); err != nil {
+		t.Fatalf("peer handle: %v", err)
+	}
+	if got := secondSession.acquiredIDs(); !slices.Equal(got, []int64{21, 22}) {
+		t.Errorf("peer acquired %v, want both offers after the lower poll returned", got)
+	}
+
+	finishOnce.Do(func() { close(finishAcquire) })
+}
+
+func TestPartialAcquisitionRestoresSameProviderPlacementOrder(t *testing.T) {
+	tierConfig := config.Tier{
+		Label: "billet-4vcpu-pack", Provider: config.ProviderFirecracker,
+		GuestOS: config.GuestLinux, VCPU: 4, Memory: 8 * config.GiB,
+	}
+	a := newBareAllocator(t, alloc.Limits{MaxVCPU: 12, MaxMemory: 24 * config.GiB},
+		[]config.Tier{tierConfig}, alloc.WithPlacement(config.PlacementPack))
+	for _, node := range []alloc.NodeRegistration{
+		{Name: "a", Provider: config.ProviderFirecracker, VCPU: 8, Memory: 16 * config.GiB},
+		{Name: "b", Provider: config.ProviderFirecracker, VCPU: 4, Memory: 8 * config.GiB},
+	} {
+		if _, err := a.RegisterNode(t.Context(), node); err != nil {
+			t.Fatalf("RegisterNode %s: %v", node.Name, err)
+		}
+	}
+
+	session := &fakeSession{onAcquire: func(ids []int64) ([]int64, error) {
+		return ids[1:], nil
+	}}
+	l := NewListener(a, tierConfig.Label, session)
+	if err := l.refillEscrow(t.Context()); err != nil {
+		t.Fatalf("refill: %v", err)
+	}
+	original := l.Held()
+	if len(original) != 3 {
+		t.Fatalf("held = %d, want all three fleet slots", len(original))
+	}
+	if original[0].TargetNode == original[2].TargetNode {
+		t.Fatalf("placement order %v does not exercise two same-provider targets",
+			[]string{original[0].TargetNode, original[1].TargetNode, original[2].TargetNode})
+	}
+
+	if err := l.acquire(t.Context(), []Job{
+		{RequestID: 11, RunID: 101}, {RequestID: 12, RunID: 102},
+	}); err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	if got := l.Acquiring(); got != 1 {
+		t.Fatalf("acquiring = %d, want the one granted offer", got)
+	}
+
+	l.releaseIdleEscrowAbove(t.Context(), 2)
+	held := l.Held()
+	if len(held) != 1 {
+		t.Fatalf("held = %d, want one discovery lease beside the promise", len(held))
+	}
+	if held[0].TargetNode != original[0].TargetNode {
+		t.Errorf("retained target = %q, want original first placement %q after unreserve",
+			held[0].TargetNode, original[0].TargetNode)
+	}
+}
+
 // THE invariant of the listener plane, and the reason the allocator exists: the sum
 // of what every listener has advertised to GitHub at any instant never exceeds the
 // global budget.

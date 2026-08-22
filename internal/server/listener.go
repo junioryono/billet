@@ -259,6 +259,11 @@ type Listener struct {
 	mu sync.Mutex
 	// Escrowed capacity not yet given to a job.
 	held []*alloc.Lease
+	// heldOrder restores the allocator's issuance order after a partial
+	// acquisition returns a lease to held. Provider rank alone cannot preserve
+	// pack/spread/name placement among targets on the same backend.
+	heldOrder     map[string]uint64
+	nextHeldOrder uint64
 	// Escrowed capacity that HAS been given to a job, keyed by request id so a
 	// redelivered message is recognised rather than assigned twice.
 	//
@@ -362,6 +367,7 @@ func NewListener(a *alloc.Allocator, tier string, session Session, opts ...Optio
 		destroying:    make(map[int64]bool),
 		configErrs:    make(map[string]error),
 		confirmed:     make(map[string]time.Time),
+		heldOrder:     make(map[string]uint64),
 		stalePromise:  defaultStalePromise,
 		shutdownGrace: defaultShutdownGrace,
 		closeGrace:    defaultCloseGrace,
@@ -1071,6 +1077,10 @@ func (l *Listener) Run(ctx context.Context) error {
 
 			return stopping(ctx, fmt.Errorf("server: poll %s: %w", l.tier, err))
 		}
+		if !draining {
+			l.releaseIdleEscrowAbove(pollCtx,
+				max(advertised, l.messageCapacityTarget(msg)))
+		}
 
 		if err := l.handle(pollCtx, msg); err != nil {
 			var poison *poisonedMessageError
@@ -1251,6 +1261,7 @@ func (l *Listener) releaseStrandedEscrow(ctx context.Context) int {
 
 		l.mu.Lock()
 		l.held = slices.DeleteFunc(l.held, func(h *alloc.Lease) bool { return h.ID == lease.ID })
+		delete(l.heldOrder, lease.ID)
 		l.mu.Unlock()
 
 		released++
@@ -1297,6 +1308,7 @@ func (l *Listener) releaseIdleEscrow(ctx context.Context) int {
 
 		l.mu.Lock()
 		l.held = slices.DeleteFunc(l.held, func(h *alloc.Lease) bool { return h.ID == lease.ID })
+		delete(l.heldOrder, lease.ID)
 		l.mu.Unlock()
 
 		released++
@@ -1327,6 +1339,7 @@ func (l *Listener) releaseIdleEscrowAbove(ctx context.Context, target int) {
 		l.mu.Lock()
 		l.held = slices.DeleteFunc(l.held, func(h *alloc.Lease) bool { return h.ID == lease.ID })
 		delete(l.confirmed, lease.ID)
+		delete(l.heldOrder, lease.ID)
 		l.mu.Unlock()
 		released++
 	}
@@ -1414,6 +1427,26 @@ func (l *Listener) targetCapacityFor(observed *Statistics, offered int) int {
 	}
 
 	return target
+}
+
+// messageCapacityTarget is what the returned response can consume before any
+// blocking acquisition, launch, or reconciliation begins. Available and
+// Assigned are added because a direct assignment need not have appeared in this
+// process's offer set; over-counting a job present in both is bounded by the
+// message and safer than releasing its backing.
+func (l *Listener) messageCapacityTarget(msg *Message) int {
+	work := len(msg.Available)
+	if len(msg.Assigned) > math.MaxInt-work {
+		work = math.MaxInt
+	} else {
+		work += len(msg.Assigned)
+	}
+	observed := l.observed
+	if msg.Statistics != nil {
+		observed = msg.Statistics
+	}
+
+	return l.targetCapacityFor(observed, work)
 }
 
 func (l *Listener) refreshAdoptedCapacity(ctx context.Context) error {
@@ -1957,6 +1990,8 @@ func (l *Listener) heartbeatHeld(ctx context.Context) {
 		// nobody anything. The ledger entry is left to the reaper.
 		if l.renew(ctx, lease).advertisable() {
 			kept = append(kept, lease)
+		} else {
+			delete(l.heldOrder, lease.ID)
 		}
 	}
 
@@ -2184,6 +2219,7 @@ func (l *Listener) refillEscrowTo(ctx context.Context, target int) error {
 
 	l.mu.Lock()
 
+	l.trackHeld(leases)
 	l.held = append(l.held, leases...)
 	l.sortHeld()
 
@@ -2632,6 +2668,7 @@ func (l *Listener) assignPoolSlot(ctx context.Context) (*alloc.Lease, Job, bool,
 	} else {
 		l.held = l.held[1:]
 	}
+	delete(l.heldOrder, lease.ID)
 	l.running[requestID] = lease
 
 	return lease, Job{RequestID: requestID}, true, nil
@@ -3137,11 +3174,24 @@ func (l *Listener) releasePromise(id int64) {
 	}
 }
 
-// sortHeld keeps provider preference ahead of fallback placement. Stable order
-// within one rank preserves the allocator's packing/spreading choice.
+func (l *Listener) trackHeld(leases []*alloc.Lease) {
+	for _, lease := range leases {
+		if _, tracked := l.heldOrder[lease.ID]; tracked {
+			continue
+		}
+		l.nextHeldOrder++
+		l.heldOrder[lease.ID] = l.nextHeldOrder
+	}
+}
+
+// sortHeld keeps provider preference ahead of fallback placement, then restores
+// the allocator's issuance order within a provider after unreserve appends.
 func (l *Listener) sortHeld() {
 	slices.SortStableFunc(l.held, func(a, b *alloc.Lease) int {
-		return cmp.Compare(a.PreferenceRank, b.PreferenceRank)
+		if rank := cmp.Compare(a.PreferenceRank, b.PreferenceRank); rank != 0 {
+			return rank
+		}
+		return cmp.Compare(l.heldOrder[a.ID], l.heldOrder[b.ID])
 	})
 }
 
@@ -3265,6 +3315,7 @@ func (l *Listener) assign(ctx context.Context, job Job) (*alloc.Lease, bool, err
 	} else {
 		l.held = l.held[1:]
 	}
+	delete(l.heldOrder, lease.ID)
 
 	l.running[job.RequestID] = lease
 
