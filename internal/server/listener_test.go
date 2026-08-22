@@ -7167,6 +7167,7 @@ func TestALostLeaseKeepsItsPendingRetry(t *testing.T) {
 
 	l.mu.Lock()
 	l.acquiring[9] = &promise{lease: promised, at: time.Now()}
+	l.heldOrder[promised.ID] = 99
 	l.cleanup = map[int64]*pendingCleanup{9: {job: Job{RequestID: 9}}}
 	l.mu.Unlock()
 
@@ -7179,10 +7180,14 @@ func TestALostLeaseKeepsItsPendingRetry(t *testing.T) {
 	l.mu.Lock()
 	l.heartbeatHeld(t.Context())
 	_, stillPromised := l.acquiring[9]
+	_, stillOrdered := l.heldOrder[promised.ID]
 	l.mu.Unlock()
 
 	if stillPromised {
 		t.Fatal("the listener kept a promise the reaper had taken, so this proves nothing")
+	}
+	if stillOrdered {
+		t.Error("the lost promise retained issuance-order metadata for the life of the listener")
 	}
 
 	if cleanupCount(l) != 1 {

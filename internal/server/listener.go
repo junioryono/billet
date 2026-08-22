@@ -2044,6 +2044,7 @@ func (l *Listener) heartbeatHeld(ctx context.Context) {
 		if !l.renew(ctx, p.lease).advertisable() {
 			delete(l.acquiring, id)
 			delete(l.confirmed, p.lease.ID)
+			delete(l.heldOrder, p.lease.ID)
 		}
 	}
 
