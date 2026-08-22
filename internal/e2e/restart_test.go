@@ -263,30 +263,15 @@ func TestARedeliveredAssignmentDoesNotStartASecondRunner(t *testing.T) {
 		t.Fatalf("the adopted job's lease was released by the redelivery: %v", err)
 	}
 
-	// AND THE LISTENER ACTUALLY ASSIGNED A SECOND LEASE, which the runner then
-	// refused. This is the assertion that separates "the guard fired" from "the
-	// listener quietly dropped the assignment" — both of which leave one
-	// container and one open lease, so counting containers cannot tell them
-	// apart. A refused relaunch archives its lease as failed.
-	deadline = time.Now().Add(30 * time.Second)
-
-	for {
-		outcomes, err := restarted.alloc.HistoryOutcomesForRequest(t.Context(), lease.RequestID)
-		if err != nil {
-			t.Fatalf("read job history: %v", err)
-		}
-
-		if slices.Contains(outcomes, string(alloc.PhaseFailed)) {
-			break
-		}
-
-		if time.Now().After(deadline) {
-			t.Fatalf("no lease for request %d was assigned and then failed, so the "+
-				"redelivered assignment never reached the runner's guard; archived: %v",
-				lease.RequestID, outcomes)
-		}
-
-		time.Sleep(50 * time.Millisecond)
+	// Aggregate reconciliation recognizes the adopted lease before the
+	// redelivered entry is considered, so it neither relies on a second launch's
+	// node-side guard nor archives a spurious failed attempt.
+	outcomes, err := restarted.alloc.HistoryOutcomesForRequest(t.Context(), lease.RequestID)
+	if err != nil {
+		t.Fatalf("read job history: %v", err)
+	}
+	if slices.Contains(outcomes, string(alloc.PhaseFailed)) {
+		t.Fatalf("redelivery created a failed replacement lease: %v", outcomes)
 	}
 }
 

@@ -1737,6 +1737,56 @@ func (a *Allocator) Usage(ctx context.Context) (Usage, error) {
 	return u, err
 }
 
+// ActiveRunnerLeases reports tier capacity already assigned to a physical or
+// pending runner. It includes restart-adopted compute that predates the durable
+// pool_runners journal, so aggregate scale reconciliation does not replace a
+// runner the node is still holding.
+func (a *Allocator) ActiveRunnerLeases(ctx context.Context, tier string) (int, error) {
+	var count int
+	err := a.db.View(ctx, func(tx querier) error {
+		return tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM leases
+			WHERE tier = ? AND phase NOT IN ('capacity','done','failed')`, tier).Scan(&count)
+	})
+	if err != nil {
+		return 0, fmt.Errorf("alloc: count active runner leases for %s: %w", tier, err)
+	}
+
+	return count, nil
+}
+
+// ServiceableRunnerLeaseIDs reports restart-surviving runner capacity that may
+// still serve the scale set. Teardown and quarantine remain charged for safety
+// but are cleanup obligations, not capacity GitHub may schedule against.
+func (a *Allocator) ServiceableRunnerLeaseIDs(ctx context.Context, tier string) ([]string, error) {
+	var ids []string
+	err := a.db.View(ctx, func(tx querier) error {
+		rows, err := tx.QueryContext(ctx, `SELECT leases.id FROM leases
+			WHERE leases.tier = ? AND leases.phase IN ('launching','online','busy','custody')
+			  AND NOT EXISTS (SELECT 1 FROM pool_runners
+			                  WHERE pool_runners.lease_id = leases.id
+			                    AND pool_runners.status IN ('retiring','retired'))
+			ORDER BY leases.id`, tier)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				return err
+			}
+			ids = append(ids, id)
+		}
+
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, fmt.Errorf("alloc: list serviceable runner leases for %s: %w", tier, err)
+	}
+
+	return ids, nil
+}
+
 // transition performs a fenced, state-machine-checked phase change.
 func (a *Allocator) transition(ctx context.Context, leaseID string, epoch int64, to Phase, extra func(*sql.Tx) error) error {
 	return a.db.Tx(ctx, func(tx *sql.Tx) error {
