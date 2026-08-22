@@ -133,18 +133,23 @@ jobs:
           test -n "${ACTIONS_RUNTIME_TOKEN:-}"
           response_headers=$(mktemp)
           trap 'rm -f "$response_headers"' EXIT
-          curl --silent --show-error --fail \
+          passthrough_status=$(curl --silent --show-error \
+            --connect-timeout 15 \
+            --max-time 30 \
             --dump-header "$response_headers" \
             --output /dev/null \
+            --write-out '%{http_code}' \
             --header "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
             --header "Content-Type: application/json" \
             --header "User-Agent: @actions/cache-conformance" \
             --data '{"key":"billet-conformance-passthrough-${{ github.run_id }}-${{ github.run_attempt }}","restore_keys":[],"version":"billet-conformance-passthrough"}' \
-            "${ACTIONS_RESULTS_URL%/}/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL"
+            "${ACTIONS_RESULTS_URL%/}/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL")
+          test "$passthrough_status" != 000
           if tr -d '\r' < "$response_headers" | grep -Fxiq 'X-Billet-Actions-Cache: local'; then
             echo 'the selected kill switch still allowed local cache interception' >&2
             exit 1
           fi
+          printf 'GitHub passthrough returned HTTP %s\n' "$passthrough_status"
 
   save-host:
     needs: candidate-identity
