@@ -264,6 +264,14 @@ type Listener struct {
 	// pack/spread/name placement among targets on the same backend.
 	heldOrder     map[string]uint64
 	nextHeldOrder uint64
+	// releasing removes a shrink candidate from heartbeat selection without
+	// making its still-owned capacity disappear while Allocator.Release is in
+	// flight. A concurrent held loss is therefore visible before another
+	// candidate is chosen.
+	releasing map[string]*alloc.Lease
+	// releaseCapacity is a test seam for staging the heartbeat/release race. Nil
+	// uses the allocator directly; no production option can replace it.
+	releaseCapacity func(context.Context, string, int64, alloc.Phase) error
 	// Escrowed capacity that HAS been given to a job, keyed by request id so a
 	// redelivered message is recognised rather than assigned twice.
 	//
@@ -368,6 +376,7 @@ func NewListener(a *alloc.Allocator, tier string, session Session, opts ...Optio
 		configErrs:    make(map[string]error),
 		confirmed:     make(map[string]time.Time),
 		heldOrder:     make(map[string]uint64),
+		releasing:     make(map[string]*alloc.Lease),
 		stalePromise:  defaultStalePromise,
 		shutdownGrace: defaultShutdownGrace,
 		closeGrace:    defaultCloseGrace,
@@ -1318,30 +1327,51 @@ func (l *Listener) releaseIdleEscrow(ctx context.Context) int {
 }
 
 // releaseIdleEscrowAbove hands back only unassigned leases above target total
-// capacity. Acquiring, running, and adopted members remain counted in the
-// target but can never be selected for release here.
+// capacity. Acquiring, running, adopted, and already-releasing members remain
+// counted in the target but can never be selected for release here.
 func (l *Listener) releaseIdleEscrowAbove(ctx context.Context, target int) {
-	l.mu.Lock()
-	total := len(l.held) + len(l.acquiring) + len(l.running) + len(l.adopted)
-	surplus := min(max(total-target, 0), len(l.held))
-	start := len(l.held) - surplus
-	snapshot := append([]*alloc.Lease(nil), l.held[start:]...)
-	l.mu.Unlock()
-
 	released := 0
-	for _, lease := range snapshot {
-		if err := l.alloc.Release(ctx, lease.ID, lease.Epoch, alloc.PhaseDone); err != nil {
-			l.log.Warn("could not release surplus idle escrow; it stays this listener's and will be retried",
-				"tier", l.tier, "lease", lease.ID, "error", err)
-			continue
+	for {
+		l.mu.Lock()
+		total := len(l.held) + len(l.releasing) + len(l.acquiring) + len(l.running) +
+			len(l.adopted)
+		if total <= target || len(l.held) == 0 {
+			l.mu.Unlock()
+			break
 		}
 
-		l.mu.Lock()
-		l.held = slices.DeleteFunc(l.held, func(h *alloc.Lease) bool { return h.ID == lease.ID })
-		delete(l.confirmed, lease.ID)
-		delete(l.heldOrder, lease.ID)
+		// Worst placement first. Moving it rather than snapshotting every surplus
+		// candidate makes a concurrent heartbeat loss visible before another is
+		// selected, while releasing still counts as owned until the allocator
+		// confirms otherwise.
+		lease := l.held[len(l.held)-1]
+		l.held = l.held[:len(l.held)-1]
+		l.releasing[lease.ID] = lease
 		l.mu.Unlock()
-		released++
+
+		release := l.alloc.Release
+		if l.releaseCapacity != nil {
+			release = l.releaseCapacity
+		}
+		err := release(ctx, lease.ID, lease.Epoch, alloc.PhaseDone)
+
+		l.mu.Lock()
+		delete(l.releasing, lease.ID)
+		if err == nil {
+			delete(l.confirmed, lease.ID)
+			delete(l.heldOrder, lease.ID)
+			released++
+		} else {
+			l.held = append(l.held, lease)
+			l.sortHeld()
+		}
+		l.mu.Unlock()
+
+		if err != nil {
+			l.log.Warn("could not release surplus idle escrow; it stays this listener's and will be retried",
+				"tier", l.tier, "lease", lease.ID, "error", err)
+			break
+		}
 	}
 
 	if released > 0 {
@@ -1384,7 +1414,8 @@ func (l *Listener) capacity() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	return len(l.held) + len(l.acquiring) + len(l.running) + len(l.adopted)
+	return len(l.held) + len(l.releasing) + len(l.acquiring) + len(l.running) +
+		len(l.adopted)
 }
 
 // advertisedCapacity may be lower than capacity while a shrink is pending. The
@@ -2065,10 +2096,14 @@ func (l *Listener) pruneConfirmed() {
 		return
 	}
 
-	live := make(map[string]struct{}, len(l.held)+len(l.running)+len(l.acquiring))
+	live := make(map[string]struct{},
+		len(l.held)+len(l.releasing)+len(l.running)+len(l.acquiring))
 
 	for _, lease := range l.held {
 		live[lease.ID] = struct{}{}
+	}
+	for id := range l.releasing {
+		live[id] = struct{}{}
 	}
 
 	for _, lease := range l.running {

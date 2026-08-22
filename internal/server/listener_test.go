@@ -563,6 +563,76 @@ func TestPartialAcquisitionRestoresSameProviderPlacementOrder(t *testing.T) {
 	}
 }
 
+func TestHeartbeatLossDuringSurplusReleaseDoesNotUndershootTarget(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-shrink-race")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 12, MaxMemory: 64 * config.GiB}, tiers)
+	l := NewListener(a, tiers[0].Label, &fakeSession{})
+	if err := l.refillEscrow(t.Context()); err != nil {
+		t.Fatalf("refill: %v", err)
+	}
+	original := l.Held()
+	if len(original) != 3 {
+		t.Fatalf("held = %d, want three candidates", len(original))
+	}
+
+	releaseStarted := make(chan struct{})
+	finishRelease := make(chan struct{})
+	var releaseCalls atomic.Int32
+	l.releaseCapacity = func(ctx context.Context, id string, epoch int64,
+		outcome alloc.Phase,
+	) error {
+		if releaseCalls.Add(1) == 1 {
+			close(releaseStarted)
+			<-finishRelease
+		}
+		return a.Release(ctx, id, epoch, outcome)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		l.releaseIdleEscrowAbove(t.Context(), 1)
+		close(done)
+	}()
+	var finishOnce sync.Once
+	defer func() {
+		finishOnce.Do(func() { close(finishRelease) })
+		<-done
+	}()
+	select {
+	case <-releaseStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("surplus release never reached the staged allocator call")
+	}
+
+	// This is the in-memory result of heartbeat receiving ErrFenced for the
+	// retained lease while another candidate's release is in flight.
+	retained := original[0]
+	if err := a.Release(t.Context(), retained.ID, retained.Epoch, alloc.PhaseDone); err != nil {
+		t.Fatalf("stage retained heartbeat loss: %v", err)
+	}
+	l.mu.Lock()
+	l.held = slices.DeleteFunc(l.held, func(lease *alloc.Lease) bool {
+		return lease.ID == retained.ID
+	})
+	delete(l.confirmed, retained.ID)
+	delete(l.heldOrder, retained.ID)
+	l.mu.Unlock()
+
+	finishOnce.Do(func() { close(finishRelease) })
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("surplus release did not finish after the allocator resumed")
+	}
+
+	if got := l.capacity(); got != 1 {
+		t.Errorf("capacity after concurrent retained loss = %d, want the advertised target 1", got)
+	}
+	if got := releaseCalls.Load(); got != 1 {
+		t.Errorf("release calls = %d, want stale surplus calculation to stop after one", got)
+	}
+}
+
 // THE invariant of the listener plane, and the reason the allocator exists: the sum
 // of what every listener has advertised to GitHub at any instant never exceeds the
 // global budget.
