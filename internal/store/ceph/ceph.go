@@ -47,6 +47,9 @@ type Client struct {
 	ceph string
 	run  runner
 	wait time.Duration
+	// cacheLockRetry overrides the cache-index contention retry delay. Zero means
+	// the production delay; only a test sets it, for the reason withRunner exists.
+	cacheLockRetry time.Duration
 
 	// observation shortens the publish-lock liveness window. Zero means the real
 	// one; only a test sets it, for the reason withRunner exists.

@@ -26,6 +26,9 @@ type cacheFake struct {
 	lockCookie string
 	locker     string
 	heartbeat  func() string
+	lockAdds   int
+	releaseOn  int
+	onLockList func()
 	nextDevice int
 	failMeta   string
 	failRemove bool
@@ -146,6 +149,10 @@ func (f *cacheFake) trashCommand(args []string) ([]byte, error) {
 func (f *cacheFake) lock(args []string) ([]byte, error) {
 	switch args[0] {
 	case "add":
+		f.lockAdds++
+		if f.lockAdds == f.releaseOn {
+			f.lockCookie = ""
+		}
 		if f.lockCookie != "" {
 			return nil, errors.New("exit status 16")
 		}
@@ -154,6 +161,11 @@ func (f *cacheFake) lock(args []string) ([]byte, error) {
 
 		return nil, nil
 	case "ls":
+		if f.onLockList != nil {
+			hook := f.onLockList
+			f.onLockList = nil
+			hook()
+		}
 		if f.lockCookie == "" {
 			return []byte("[]"), nil
 		}
@@ -414,7 +426,7 @@ func TestCacheIndexLockRecoversOnItsOwnStaleBound(t *testing.T) {
 	c.observation = time.Millisecond
 
 	ran := false
-	if err := c.withCacheLock(t.Context(), now, func() error {
+	if err := c.withCacheLock(t.Context(), now, func(time.Time) error {
 		ran = true
 
 		return nil
@@ -437,14 +449,29 @@ func TestCacheIndexLockKeepsASilentHolderInsideItsBound(t *testing.T) {
 		now.Add(-CacheLockStaleAfter+time.Minute).Unix())
 	f := newCacheFake()
 	f.lockCookie = holder
+	f.releaseOn = 2
 	c := cacheClient(t, f)
-	c.observation = time.Millisecond
+	c.cacheLockRetry = time.Millisecond
 
-	if err := c.withCacheLock(t.Context(), now, func() error { return nil }); err == nil {
-		t.Fatal("a cache-index lock inside its recovery bound was reclaimed")
+	ran := false
+	if err := c.withCacheLock(t.Context(), now, func(time.Time) error {
+		ran = true
+
+		return nil
+	}); err != nil {
+		t.Fatalf("cache work did not resume after a recent holder released the index: %v", err)
+	}
+	if !ran {
+		t.Fatal("cache work never ran after the recent holder released the index")
+	}
+	if f.lockAdds != 2 {
+		t.Fatalf("billet tried to take the cache-index lock %d times, want one wait and one retry", f.lockAdds)
 	}
 	if f.ranWith("lock", "rm", holder) {
 		t.Fatal("billet removed a cache-index holder before its recovery bound")
+	}
+	if f.ranWith("image-meta", "get", heartbeatKey(holder)) {
+		t.Fatal("billet waited through heartbeat observations for a holder too recent to break")
 	}
 }
 
@@ -457,6 +484,7 @@ func TestCacheIndexLockKeepsAnOldHolderWhoseHeartbeatMoves(t *testing.T) {
 	beats := 0
 	f := newCacheFake()
 	f.lockCookie = holder
+	f.releaseOn = 2
 	f.heartbeat = func() string {
 		beats++
 
@@ -464,15 +492,88 @@ func TestCacheIndexLockKeepsAnOldHolderWhoseHeartbeatMoves(t *testing.T) {
 	}
 	c := cacheClient(t, f)
 	c.observation = time.Millisecond
+	c.cacheLockRetry = time.Millisecond
 
-	if err := c.withCacheLock(t.Context(), now, func() error { return nil }); err == nil {
-		t.Fatal("an old cache-index holder with a moving heartbeat was reclaimed")
+	if err := c.withCacheLock(t.Context(), now, func(time.Time) error { return nil }); err != nil {
+		t.Fatalf("cache work did not resume after the live old holder released the index: %v", err)
 	}
 	if beats != 2 {
 		t.Fatalf("billet read %d heartbeats, want the two observations needed for liveness", beats)
 	}
 	if f.ranWith("lock", "rm", holder) {
 		t.Fatal("billet removed a live cache-index holder because of its age")
+	}
+}
+
+func TestCacheIndexLockStopsWaitingWhenItsCallerCancels(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
+	holder := fmt.Sprintf("billet-import-livehost-7-cancelled-%d", now.Add(-time.Minute).Unix())
+	ctx, cancel := context.WithCancel(t.Context())
+	f := newCacheFake()
+	f.lockCookie = holder
+	f.onLockList = cancel
+	c := cacheClient(t, f)
+	c.cacheLockRetry = time.Hour
+
+	ran := false
+	err := c.withCacheLock(ctx, now, func(time.Time) error {
+		ran = true
+
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled cache-index wait returned %v, want context.Canceled", err)
+	}
+	if ran {
+		t.Fatal("cache work ran without acquiring the index after cancellation")
+	}
+	if f.lockAdds != 1 {
+		t.Fatalf("billet attempted the lock %d times after cancellation, want one", f.lockAdds)
+	}
+	if f.ranWith("lock", "rm", holder) {
+		t.Fatal("billet removed a live cache-index holder when its own caller cancelled")
+	}
+}
+
+func TestCacheIndexLockRefusesAnUnknownHolderWithoutRetrying(t *testing.T) {
+	t.Parallel()
+
+	f := newCacheFake()
+	f.lockCookie = "somebody-elses-tool"
+	c := cacheClient(t, f)
+	c.cacheLockRetry = time.Millisecond
+
+	err := c.withCacheLock(t.Context(), time.Now(), func(time.Time) error { return nil })
+	if err == nil || !strings.Contains(err.Error(), "age cannot be established") {
+		t.Fatalf("unknown cache-index holder returned %v, want a dated fail-closed refusal", err)
+	}
+	if f.lockAdds != 1 {
+		t.Fatalf("billet attempted an unknown cache-index holder %d times, want one", f.lockAdds)
+	}
+	if f.ranWith("lock", "rm") {
+		t.Fatal("billet removed a cache-index holder whose age it could not establish")
+	}
+}
+
+func TestAcquireWriterStartsItsLifetimeAfterCacheIndexContention(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	ttl := time.Minute
+	f := newCacheFake()
+	f.lockCookie = fmt.Sprintf("billet-import-livehost-7-delayed-%d", now.Add(-time.Minute).Unix())
+	f.releaseOn = 2
+	c := cacheClient(t, f)
+	c.cacheLockRetry = 20 * time.Millisecond
+
+	lease, _, err := c.acquireWriterAt(t.Context(), "acme/api/npm", "job-1", ttl, now)
+	if err != nil {
+		t.Fatalf("AcquireWriter after contention: %v", err)
+	}
+	if extension := lease.Expires.Sub(now.Add(ttl)); extension < 10*time.Millisecond {
+		t.Fatalf("writer lifetime began before the cache-index wait; extension = %s, want at least 10ms", extension)
 	}
 }
 

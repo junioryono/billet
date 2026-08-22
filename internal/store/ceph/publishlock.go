@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"regexp"
@@ -49,6 +50,21 @@ const StaleLockAfter = 6 * time.Hour
 // of the interop would silently stop working, and only under the failure it
 // exists to handle.
 var cookieAge = regexp.MustCompile(`-(\d+)$`)
+
+var errLockContended = errors.New("ceph: advisory lock is contended")
+
+// lockContendedError identifies safe exclusion separately from Ceph failures.
+type lockContendedError struct {
+	message string
+}
+
+func (e lockContendedError) Error() string { return e.message }
+func (e lockContendedError) Unwrap() error { return errLockContended }
+
+// lockContendedf records a human-readable holder while retaining retry identity.
+func lockContendedf(format string, args ...any) error {
+	return lockContendedError{message: fmt.Sprintf(format, args...)}
+}
 
 // publishCookie is the identity a publisher takes the lock under.
 //
@@ -235,15 +251,15 @@ func (c *Client) takeLock(
 	// SOMEBODY HOLDS IT. Whether that is a live build or a corpse is the only
 	// question left, and it is answered from the cookie rather than from anything
 	// about the process, because there is nothing here that can see the process.
-	holder, age, found, err := c.heldLock(ctx, image, now)
+	holder, age, ageKnown, found, err := c.heldLock(ctx, image, now)
 	if err != nil {
 		return nil, err
 	}
 
 	if !found {
-		// Taken and released between the two calls. Reporting the race honestly
-		// beats retrying in a loop nobody bounded.
-		return nil, fmt.Errorf("ceph: the publish lock on %s could not be taken and is not held; "+
+		// Taken and released between the two calls. Cache-index callers retry this
+		// bounded race; golden-image publishers still report it and stand down.
+		return nil, lockContendedf("ceph: the publish lock on %s could not be taken and is not held; "+
 			"another publisher is contending for it right now", image)
 	}
 	if holder.ID == cookie {
@@ -251,6 +267,16 @@ func (c *Client) takeLock(
 		lock.beat(ctx)
 
 		return lock, nil
+	}
+	if !ageKnown {
+		return nil, fmt.Errorf("ceph: %s is held by %s and its age cannot be established; "+
+			"this publisher is standing down rather than writing into the same image",
+			image, holder.ID)
+	}
+	if age < staleAfter {
+		return nil, lockContendedf("ceph: %s is held by %s and it is only %s old; "+
+			"this publisher is standing down rather than writing into the same image",
+			image, holder.ID, age.Round(time.Second))
 	}
 
 	// LIVENESS IS OBSERVED, NOT INFERRED FROM THE CLOCK.
@@ -284,7 +310,7 @@ func (c *Client) takeLock(
 
 	mayBreak, why := breakable(before, after, age, staleAfter)
 	if !mayBreak {
-		return nil, fmt.Errorf("ceph: %s is held by %s and %s; this publisher is standing down "+
+		return nil, lockContendedf("ceph: %s is held by %s and %s; this publisher is standing down "+
 			"rather than writing into the same image", image, holder.ID, why)
 	}
 
@@ -293,9 +319,31 @@ func (c *Client) takeLock(
 			"and it could not be broken: %w", image, holder.ID, age.Round(time.Second), err)
 	}
 
-	if _, err := c.rbdCmd(ctx, false, "lock", "add", image, cookie); err != nil {
-		return nil, fmt.Errorf("ceph: %s was broken after %s but could not then be taken; "+
-			"another publisher took it first: %w", image, age.Round(time.Second), err)
+	if _, addErr := c.rbdCmd(ctx, false, "lock", "add", image, cookie); addErr != nil {
+		replacement, replacementAge, replacementAgeKnown, replacementFound, readErr :=
+			c.heldLock(ctx, image, now)
+		if readErr != nil {
+			return nil, errors.Join(
+				fmt.Errorf("ceph: %s was broken after %s but could not then be taken: %w",
+					image, age.Round(time.Second), addErr),
+				readErr,
+			)
+		}
+		if !replacementFound {
+			return nil, fmt.Errorf("ceph: %s was broken after %s but could not then be taken: %w",
+				image, age.Round(time.Second), addErr)
+		}
+		if replacement.ID != cookie {
+			if !replacementAgeKnown {
+				return nil, fmt.Errorf("ceph: %s was broken after %s, then was taken by %s "+
+					"whose age cannot be established; this publisher is standing down",
+					image, age.Round(time.Second), replacement.ID)
+			}
+
+			return nil, lockContendedf("ceph: %s was broken after %s, then was taken by %s "+
+				"whose lock is %s old; this publisher is standing down",
+				image, age.Round(time.Second), replacement.ID, replacementAge.Round(time.Second))
+		}
 	}
 
 	// THE BROKEN HOLDER'S COUNTER IS REMOVED, so a future breaker does not read a
@@ -323,20 +371,20 @@ func (c *Client) heldLock(
 	ctx context.Context,
 	image string,
 	now time.Time,
-) (lockEntry, time.Duration, bool, error) {
+) (lockEntry, time.Duration, bool, bool, error) {
 	out, err := c.rbdCmd(ctx, true, "lock", "ls", image)
 	if err != nil {
-		return lockEntry{}, 0, false, fmt.Errorf("ceph: could not read who holds %s: %w", image, err)
+		return lockEntry{}, 0, false, false, fmt.Errorf("ceph: could not read who holds %s: %w", image, err)
 	}
 
 	var held []lockEntry
 	if err := json.Unmarshal(out, &held); err != nil {
-		return lockEntry{}, 0, false, fmt.Errorf("ceph: %s did not list the lockers of %s as json; "+
+		return lockEntry{}, 0, false, false, fmt.Errorf("ceph: %s did not list the lockers of %s as json; "+
 			"is it the rbd command?", c.bin, image)
 	}
 
 	if len(held) == 0 {
-		return lockEntry{}, 0, false, nil
+		return lockEntry{}, 0, false, false, nil
 	}
 
 	match := cookieAge.FindStringSubmatch(held[0].ID)
@@ -346,7 +394,7 @@ func (c *Client) heldLock(
 		// cannot be established, and a lock of unknown age is never broken: the
 		// alternative is breaking a live writer's lock because its name was
 		// unfamiliar.
-		return held[0], 0, true, nil
+		return held[0], 0, false, true, nil
 	}
 
 	seconds, parseErr := strconv.ParseInt(match[1], 10, 64)
@@ -356,7 +404,7 @@ func (c *Client) heldLock(
 		// age zero as "too recent to break" -- which is the safe reading. Reporting
 		// an error instead would refuse the publish outright rather than merely
 		// declining to break somebody else's lock.
-		return held[0], 0, true, nil //nolint:nilerr // an unreadable timestamp is an age, not a failure
+		return held[0], 0, false, true, nil //nolint:nilerr // an unreadable timestamp is an age, not a failure
 	}
 
 	age := now.UTC().Sub(time.Unix(seconds, 0).UTC())
@@ -369,7 +417,7 @@ func (c *Client) heldLock(
 		age = 0
 	}
 
-	return held[0], age, true, nil
+	return held[0], age, true, true, nil
 }
 
 // Release gives the publish lock back.
