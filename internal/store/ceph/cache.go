@@ -26,7 +26,8 @@ const (
 	// while its heartbeat moves, including a longer eviction pass.
 	CacheLockStaleAfter  = 10 * time.Minute
 	cacheLockRetryDelay  = 250 * time.Millisecond
-	cacheLockWaitLimit   = CacheLockStaleAfter + HeartbeatObservation
+	cacheLockRecoveryGap = 30 * time.Second
+	cacheLockWaitLimit   = CacheLockStaleAfter + HeartbeatObservation + cacheLockRecoveryGap
 	cacheVolumeTTL       = 7 * time.Hour
 	cacheMetaPrefix      = "billet.cache."
 	filesystemProbeLimit = 8 << 10
@@ -208,6 +209,13 @@ func (c *Client) withCacheLock(
 	defer cancelLock()
 
 	started := time.Now()
+	elapsed := func() time.Duration {
+		if c.cacheLockElapsed != nil {
+			return c.cacheLockElapsed()
+		}
+
+		return time.Since(started)
+	}
 	attemptAt := now
 	var lock *PublishLock
 	for {
@@ -235,10 +243,11 @@ func (c *Client) withCacheLock(
 			return fmt.Errorf("ceph: wait for the cache index lock: %w", lockCtx.Err())
 		case <-timer.C:
 		}
-		attemptAt = now.Add(time.Since(started))
+		attemptAt = now.Add(elapsed())
 	}
 
-	workErr := fn(attemptAt)
+	lockedAt := now.Add(elapsed())
+	workErr := fn(lockedAt)
 	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.wait)
 	defer cancel()
 
@@ -1151,14 +1160,8 @@ type cacheTrashImage struct {
 	Name string `json:"name"`
 }
 
-type exitCoder interface {
-	ExitCode() int
-}
-
 func isImageNotEmpty(err error) bool {
-	var exitError exitCoder
-
-	return errors.As(err, &exitError) && exitError.ExitCode() == 39
+	return exitedWith(err, 39)
 }
 
 func (c *Client) purgeRetiredCacheImages(ctx context.Context) (bool, error) {

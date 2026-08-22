@@ -250,7 +250,7 @@ func (f *importFake) lock(args []string) ([]byte, error) {
 		}
 
 		if f.lockTaken != "" || f.lockHeld != "" {
-			return nil, errors.New("exit status 16")
+			return nil, cacheExitError{code: 16, message: "exit status 16"}
 		}
 
 		f.lockTaken = cookie

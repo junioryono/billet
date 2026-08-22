@@ -50,6 +50,10 @@ type Client struct {
 	// cacheLockRetry overrides the cache-index contention retry delay. Zero means
 	// the production delay; only a test sets it, for the reason withRunner exists.
 	cacheLockRetry time.Duration
+	// cacheLockElapsed replaces elapsed wall time while cache-index contention is
+	// tested. Production always uses time.Since so retry and acquisition time stay
+	// on one monotonic clock.
+	cacheLockElapsed func() time.Duration
 
 	// observation shortens the publish-lock liveness window. Zero means the real
 	// one; only a test sets it, for the reason withRunner exists.
@@ -60,6 +64,16 @@ type Client struct {
 // runner executes one rbd invocation. A seam, so a test can assert the ARGUMENTS
 // billet builds — which is where the mistakes are — without a cluster.
 type runner func(ctx context.Context, bin string, args []string) ([]byte, error)
+
+type exitCoder interface {
+	ExitCode() int
+}
+
+func exitedWith(err error, code int) bool {
+	var exitError exitCoder
+
+	return errors.As(err, &exitError) && exitError.ExitCode() == code
+}
 
 // Option configures a Client.
 type Option func(*Client)

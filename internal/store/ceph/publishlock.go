@@ -51,6 +51,11 @@ const StaleLockAfter = 6 * time.Hour
 // exists to handle.
 var cookieAge = regexp.MustCompile(`-(\d+)$`)
 
+func knownLockCookie(cookie string) bool {
+	return strings.HasPrefix(cookie, "billet-import-") ||
+		strings.HasPrefix(cookie, "billet-build-")
+}
+
 var errLockContended = errors.New("ceph: advisory lock is contended")
 
 // lockContendedError identifies safe exclusion separately from Ceph failures.
@@ -241,7 +246,8 @@ func (c *Client) takeLock(
 		_ = createErr
 	}
 
-	if _, err := c.rbdCmd(ctx, false, "lock", "add", image, cookie); err == nil {
+	_, addErr := c.rbdCmd(ctx, false, "lock", "add", image, cookie)
+	if addErr == nil {
 		lock := &PublishLock{client: c, cookie: cookie, image: image}
 		lock.beat(ctx)
 
@@ -253,20 +259,30 @@ func (c *Client) takeLock(
 	// about the process, because there is nothing here that can see the process.
 	holder, age, ageKnown, found, err := c.heldLock(ctx, image, now)
 	if err != nil {
+		if !exitedWith(addErr, 16) {
+			return nil, errors.Join(
+				fmt.Errorf("ceph: could not take the advisory lock on %s: %w", image, addErr),
+				err,
+			)
+		}
+
 		return nil, err
 	}
 
+	if found && holder.ID == cookie {
+		lock := &PublishLock{client: c, cookie: cookie, image: image}
+		lock.beat(ctx)
+
+		return lock, nil
+	}
+	if !exitedWith(addErr, 16) {
+		return nil, fmt.Errorf("ceph: could not take the advisory lock on %s: %w", image, addErr)
+	}
 	if !found {
 		// Taken and released between the two calls. Cache-index callers retry this
 		// bounded race; golden-image publishers still report it and stand down.
 		return nil, lockContendedf("ceph: the publish lock on %s could not be taken and is not held; "+
 			"another publisher is contending for it right now", image)
-	}
-	if holder.ID == cookie {
-		lock := &PublishLock{client: c, cookie: cookie, image: image}
-		lock.beat(ctx)
-
-		return lock, nil
 	}
 	if !ageKnown {
 		return nil, fmt.Errorf("ceph: %s is held by %s and its age cannot be established; "+
@@ -314,7 +330,36 @@ func (c *Client) takeLock(
 			"rather than writing into the same image", image, holder.ID, why)
 	}
 
+	// OWNERSHIP IS REVALIDATED AFTER THE OBSERVATION WINDOW. A live holder can
+	// finish during those ninety seconds; trying to remove its now-absent lock
+	// turns successful serialization into a terminal error, while removing a
+	// replacement would violate the exclusion this function exists to provide.
+	current, currentAge, currentAgeKnown, currentFound, err := c.heldLock(ctx, image, now)
+	if err != nil {
+		return nil, err
+	}
+	if !currentFound {
+		return nil, lockContendedf("ceph: %s was released while its holder was observed; "+
+			"this publisher will retry rather than treating the race as a failure", image)
+	}
+	if current.ID != holder.ID || current.Locker != holder.Locker {
+		if !currentAgeKnown {
+			return nil, fmt.Errorf("ceph: %s changed holders while %s was observed and is now held by %s "+
+				"whose age cannot be established; this publisher is standing down",
+				image, holder.ID, current.ID)
+		}
+
+		return nil, lockContendedf("ceph: %s changed holders while %s was observed and is now held by %s "+
+			"whose lock is %s old; this publisher is standing down",
+			image, holder.ID, current.ID, currentAge.Round(time.Second))
+	}
+
 	if _, err := c.rbdCmd(ctx, false, "lock", "rm", image, holder.ID, holder.Locker); err != nil {
+		if exitedWith(err, 2) {
+			return nil, lockContendedf("ceph: %s was released while its holder was being removed; "+
+				"this publisher will retry rather than treating the race as a failure", image)
+		}
+
 		return nil, fmt.Errorf("ceph: %s has been held by %s for %s and showed no sign of life, "+
 			"and it could not be broken: %w", image, holder.ID, age.Round(time.Second), err)
 	}
@@ -329,20 +374,27 @@ func (c *Client) takeLock(
 				readErr,
 			)
 		}
-		if !replacementFound {
-			return nil, fmt.Errorf("ceph: %s was broken after %s but could not then be taken: %w",
-				image, age.Round(time.Second), addErr)
-		}
-		if replacement.ID != cookie {
-			if !replacementAgeKnown {
+		// The command may have committed before its response was lost. This process
+		// can continue only when the listing names its exact nonce-bearing cookie.
+		ownsLock := replacementFound && replacement.ID == cookie
+		if !ownsLock {
+			switch {
+			case !exitedWith(addErr, 16):
+				return nil, fmt.Errorf("ceph: %s was broken after %s but could not then be taken: %w",
+					image, age.Round(time.Second), addErr)
+			case !replacementFound:
+				return nil, lockContendedf("ceph: %s was broken after %s, but the publisher that won "+
+					"the reacquisition race already released it; this publisher will retry",
+					image, age.Round(time.Second))
+			case !replacementAgeKnown:
 				return nil, fmt.Errorf("ceph: %s was broken after %s, then was taken by %s "+
 					"whose age cannot be established; this publisher is standing down",
 					image, age.Round(time.Second), replacement.ID)
+			default:
+				return nil, lockContendedf("ceph: %s was broken after %s, then was taken by %s "+
+					"whose lock is %s old; this publisher is standing down",
+					image, age.Round(time.Second), replacement.ID, replacementAge.Round(time.Second))
 			}
-
-			return nil, lockContendedf("ceph: %s was broken after %s, then was taken by %s "+
-				"whose lock is %s old; this publisher is standing down",
-				image, age.Round(time.Second), replacement.ID, replacementAge.Round(time.Second))
 		}
 	}
 
@@ -385,6 +437,10 @@ func (c *Client) heldLock(
 
 	if len(held) == 0 {
 		return lockEntry{}, 0, false, false, nil
+	}
+
+	if !knownLockCookie(held[0].ID) {
+		return held[0], 0, false, true, nil
 	}
 
 	match := cookieAge.FindStringSubmatch(held[0].ID)
