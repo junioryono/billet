@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"math"
 	"slices"
 	"strings"
@@ -792,6 +793,54 @@ func TestFencedOrMissingSurplusReleaseIsNotRestored(t *testing.T) {
 				t.Errorf("held after definitive release loss = %d, want 0", got)
 			}
 		})
+	}
+}
+
+func TestRetryableSurplusReleaseFailureRestoresOwnedLease(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-release-retry")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 12, MaxMemory: 64 * config.GiB}, tiers)
+	l := NewListener(a, tiers[0].Label, &fakeSession{})
+	if err := l.refillEscrow(t.Context()); err != nil {
+		t.Fatalf("refill: %v", err)
+	}
+	l.mu.Lock()
+	l.heartbeatHeld(t.Context())
+	originalOrder := maps.Clone(l.heldOrder)
+	originalConfirmed := maps.Clone(l.confirmed)
+	originalNextOrder := l.nextHeldOrder
+	l.mu.Unlock()
+	original := l.Held()
+	if len(original) != 3 {
+		t.Fatalf("held = %d, want three placement-ordered candidates", len(original))
+	}
+
+	l.releaseCapacity = func(context.Context, string, int64, alloc.Phase) error {
+		return errors.New("injected retryable release failure")
+	}
+	l.releaseIdleEscrowAbove(t.Context(), 2)
+
+	if got := l.capacity(); got != 3 {
+		t.Errorf("capacity after retryable release failure = %d, want 3", got)
+	}
+	if restored := l.Held(); !slices.Equal(restored, original) {
+		t.Errorf("held placement order changed after retryable release failure")
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(l.releasing) != 0 {
+		t.Errorf("releasing after retryable release failure = %d, want 0", len(l.releasing))
+	}
+	if !maps.Equal(l.heldOrder, originalOrder) {
+		t.Errorf("held order metadata after retryable release failure = %v, want %v",
+			l.heldOrder, originalOrder)
+	}
+	if !maps.Equal(l.confirmed, originalConfirmed) {
+		t.Errorf("renewal metadata after retryable release failure = %v, want %v",
+			l.confirmed, originalConfirmed)
+	}
+	if l.nextHeldOrder != originalNextOrder {
+		t.Errorf("next held order after retryable release failure = %d, want %d",
+			l.nextHeldOrder, originalNextOrder)
 	}
 }
 
