@@ -35,8 +35,9 @@ func TestCacheConformanceRendererMakesTheConsumerOwnEveryJob(t *testing.T) {
 	}
 
 	workflow := string(first)
+	withoutMode := strings.ReplaceAll(workflow, "${{ inputs.mode }}", "")
 	for _, forbidden := range []string{"workflow_call:", "${{ inputs.", "uses: junioryono/billet/.github/workflows/cache-conformance.yml"} {
-		if strings.Contains(workflow, forbidden) {
+		if strings.Contains(withoutMode, forbidden) {
 			t.Errorf("generated workflow still contains %q", forbidden)
 		}
 	}
@@ -47,6 +48,10 @@ func TestCacheConformanceRendererMakesTheConsumerOwnEveryJob(t *testing.T) {
 		"repository: \"junioryono/billet\"",
 		"ref: \"" + testCacheConformanceCommit + "\"",
 		"Keep the jobs directly in this repository",
+		"if: inputs.mode == 'intercept'",
+		"if: inputs.mode == 'passthrough'",
+		"default: intercept",
+		"- passthrough",
 	} {
 		if !strings.Contains(workflow, required) {
 			t.Errorf("generated workflow is missing %q", required)
@@ -80,6 +85,65 @@ func TestCacheConformanceRendererRefusesAWeakenedCanonicalWorkflow(t *testing.T)
 				return strings.ReplaceAll(workflow, "${{ inputs.billet_ref }}", "v0.0.0")
 			},
 			wantErr: "inputs.billet_ref",
+		},
+		{
+			name: "kill-switch mode disappeared",
+			mutate: func(workflow string) string {
+				return strings.ReplaceAll(workflow, "${{ inputs.mode }}", "intercept")
+			},
+			wantErr: "inputs.mode",
+		},
+		{
+			name: "raw caller input weakens the intercept condition",
+			mutate: func(workflow string) string {
+				return strings.Replace(workflow, "if: inputs.mode == 'intercept'",
+					"if: inputs.mode == 'intercept' && inputs.billet_ref != ''", 1)
+			},
+			wantErr: "inputs.billet_ref",
+		},
+		{
+			name: "bracket caller input weakens the intercept condition",
+			mutate: func(workflow string) string {
+				return strings.Replace(workflow, "if: inputs.mode == 'intercept'",
+					"if: inputs.mode == 'intercept' && inputs['billet_ref'] != ''", 1)
+			},
+			wantErr: "inputs['billet_ref']",
+		},
+		{
+			name: "whole caller input context weakens the intercept condition",
+			mutate: func(workflow string) string {
+				return strings.Replace(workflow, "if: inputs.mode == 'intercept'",
+					"if: inputs.mode == 'intercept' && toJSON(inputs) != ''", 1)
+			},
+			wantErr: "toJSON(inputs)",
+		},
+		{
+			name: "case variant caller input weakens the intercept condition",
+			mutate: func(workflow string) string {
+				return strings.Replace(workflow, "if: inputs.mode == 'intercept'",
+					"if: inputs.mode == 'intercept' && INPUTS.billet_ref != ''", 1)
+			},
+			wantErr: "INPUTS.billet_ref",
+		},
+		{
+			name: "caller input hidden behind a YAML alias weakens the intercept condition",
+			mutate: func(workflow string) string {
+				workflow = strings.Replace(workflow, "name: Cache and artifact conformance",
+					"name: &condition inputs.billet_ref != ''", 1)
+				return strings.Replace(workflow, "if: inputs.mode == 'intercept'", "if: *condition", 1)
+			},
+			wantErr: "YAML anchors or aliases",
+		},
+		{
+			name: "caller input hidden behind a YAML key alias weakens the intercept condition",
+			mutate: func(workflow string) string {
+				workflow = strings.Replace(workflow,
+					"      - name: Prove this job is traversing Billet rather than GitHub's cache",
+					"      - name: &if_key if", 1)
+				return strings.Replace(workflow, "        if: inputs.mode == 'intercept'",
+					"        *if_key: inputs.billet_ref != ''", 1)
+			},
+			wantErr: "YAML anchors or aliases",
 		},
 		{
 			name: "a job delegates outside the selected consumer workflow",

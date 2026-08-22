@@ -24,6 +24,11 @@ on:
         description: Exact Billet tag or commit containing this reusable workflow
         required: true
         type: string
+      mode:
+        description: Require local interception or prove kill-switch passthrough
+        required: false
+        default: intercept
+        type: string
   workflow_dispatch:
     inputs:
       runner_label:
@@ -47,6 +52,14 @@ on:
         description: Exact Billet tag or commit containing this workflow
         required: true
         type: string
+      mode:
+        description: Require local interception or prove kill-switch passthrough
+        required: false
+        default: intercept
+        type: choice
+        options:
+          - intercept
+          - passthrough
 
 permissions:
   contents: read
@@ -56,6 +69,14 @@ jobs:
     runs-on: ${{ inputs.runner_label }}
     timeout-minutes: 30
     steps:
+      - name: Validate the conformance mode
+        env:
+          BILLET_CONFORMANCE_MODE: ${{ inputs.mode }}
+        run: |
+          case "$BILLET_CONFORMANCE_MODE" in
+            intercept|passthrough) ;;
+            *) echo "unsupported conformance mode: $BILLET_CONFORMANCE_MODE" >&2; exit 1 ;;
+          esac
       - name: Refuse a non-billet runner or the wrong candidate image
         env:
           EXPECTED_RUNNER_VERSION: ${{ inputs.expected_runner_version }}
@@ -82,6 +103,7 @@ jobs:
             core.exportVariable('BILLET_PROBE_RESULTS_URL', process.env.ACTIONS_RESULTS_URL);
             core.exportVariable('BILLET_PROBE_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN);
       - name: Prove this job is traversing Billet rather than GitHub's cache
+        if: inputs.mode == 'intercept'
         env:
           ACTIONS_RESULTS_URL: ${{ env.BILLET_PROBE_RESULTS_URL }}
           ACTIONS_RUNTIME_TOKEN: ${{ env.BILLET_PROBE_RUNTIME_TOKEN }}
@@ -100,6 +122,29 @@ jobs:
             --data '{"key":"billet-conformance-probe-${{ github.run_id }}-${{ github.run_attempt }}","restore_keys":[],"version":"billet-conformance-probe"}' \
             "${ACTIONS_RESULTS_URL%/}/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL"
           tr -d '\r' < "$response_headers" | grep -Fxi 'X-Billet-Actions-Cache: local'
+      - name: Prove the kill switch bypasses Billet local cache
+        if: inputs.mode == 'passthrough'
+        env:
+          ACTIONS_RESULTS_URL: ${{ env.BILLET_PROBE_RESULTS_URL }}
+          ACTIONS_RUNTIME_TOKEN: ${{ env.BILLET_PROBE_RUNTIME_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "${ACTIONS_RESULTS_URL:-}"
+          test -n "${ACTIONS_RUNTIME_TOKEN:-}"
+          response_headers=$(mktemp)
+          trap 'rm -f "$response_headers"' EXIT
+          curl --silent --show-error --fail \
+            --dump-header "$response_headers" \
+            --output /dev/null \
+            --header "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
+            --header "Content-Type: application/json" \
+            --header "User-Agent: @actions/cache-conformance" \
+            --data '{"key":"billet-conformance-passthrough-${{ github.run_id }}-${{ github.run_attempt }}","restore_keys":[],"version":"billet-conformance-passthrough"}' \
+            "${ACTIONS_RESULTS_URL%/}/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL"
+          if tr -d '\r' < "$response_headers" | grep -Fxiq 'X-Billet-Actions-Cache: local'; then
+            echo 'the selected kill switch still allowed local cache interception' >&2
+            exit 1
+          fi
 
   save-host:
     needs: candidate-identity
