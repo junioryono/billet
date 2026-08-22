@@ -1594,6 +1594,9 @@ func TestCacheConformanceReusableWorkflowUsesItsOwnRevision(t *testing.T) {
 		"if: inputs.mode == 'intercept'",
 		"if: inputs.mode == 'passthrough'",
 		"the selected kill switch still allowed local cache interception",
+		"passthrough_status=$(curl --silent --show-error",
+		"test \"$passthrough_status\" != 000",
+		"GitHub passthrough returned HTTP %s",
 		"steps.poison-tls.outputs.cache-hit }}' != true",
 		"steps.poison-proxy.outputs.cache-hit }}' != true",
 		"actions_hit='${{ steps.poison-actions.outputs.cache-hit }}'",
@@ -1603,6 +1606,19 @@ func TestCacheConformanceReusableWorkflowUsesItsOwnRevision(t *testing.T) {
 		if !strings.Contains(workflow, required) {
 			t.Fatalf("poison conformance is missing non-vacuity proof %q", required)
 		}
+	}
+	probeStart := strings.Index(workflow, "passthrough_status=$(curl")
+	if probeStart < 0 {
+		t.Fatal("the passthrough probe does not capture its upstream HTTP status")
+	}
+	passthroughProbe := workflow[probeStart:]
+	probeEnd := strings.Index(passthroughProbe, "\n          if tr -d")
+	if probeEnd < 0 {
+		t.Fatal("the passthrough probe does not inspect the Billet response header")
+	}
+	passthroughProbe = passthroughProbe[:probeEnd]
+	if strings.Contains(passthroughProbe, "--fail") {
+		t.Fatal("the passthrough probe rejects valid upstream HTTP error responses")
 	}
 	for _, forbidden := range []string{
 		"test '${{ steps.poison-actions.outputs.cache-hit }}' != true",
