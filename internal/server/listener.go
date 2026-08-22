@@ -1356,11 +1356,16 @@ func (l *Listener) releaseIdleEscrowAbove(ctx context.Context, target int) {
 		err := release(ctx, lease.ID, lease.Epoch, alloc.PhaseDone)
 
 		l.mu.Lock()
+		_, stillTracked := l.releasing[lease.ID]
 		delete(l.releasing, lease.ID)
-		if err == nil {
+		definitivelyLost := !stillTracked || errors.Is(err, alloc.ErrFenced) ||
+			errors.Is(err, alloc.ErrLeaseNotFound)
+		if err == nil || definitivelyLost {
 			delete(l.confirmed, lease.ID)
 			delete(l.heldOrder, lease.ID)
-			released++
+			if err == nil {
+				released++
+			}
 		} else {
 			l.held = append(l.held, lease)
 			l.sortHeld()
@@ -1368,6 +1373,11 @@ func (l *Listener) releaseIdleEscrowAbove(ctx context.Context, target int) {
 		l.mu.Unlock()
 
 		if err != nil {
+			if definitivelyLost {
+				l.log.Warn("surplus idle escrow was lost while its release was in flight; it is no longer advertised",
+					"tier", l.tier, "lease", lease.ID, "error", err)
+				continue
+			}
 			l.log.Warn("could not release surplus idle escrow; it stays this listener's and will be retried",
 				"tier", l.tier, "lease", lease.ID, "error", err)
 			break
@@ -2027,6 +2037,19 @@ func (l *Listener) heartbeatHeld(ctx context.Context) {
 	}
 
 	l.held = kept
+
+	// A surplus release may wait behind another SQLite writer. It remains owned
+	// and counted until Release confirms otherwise, so it needs the same heartbeat
+	// protection as ordinary idle escrow while that call is in flight.
+	for id, lease := range l.releasing {
+		if l.renew(ctx, lease).advertisable() {
+			continue
+		}
+
+		delete(l.releasing, id)
+		delete(l.confirmed, id)
+		delete(l.heldOrder, id)
+	}
 
 	// RUNNING and ACQUIRING leases are renewed too. They are open in the ledger
 	// exactly like held ones, so a lease whose job is in flight — or whose job

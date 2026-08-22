@@ -633,6 +633,168 @@ func TestHeartbeatLossDuringSurplusReleaseDoesNotUndershootTarget(t *testing.T) 
 	}
 }
 
+func TestSurplusReleaseInFlightRemainsHeartbeated(t *testing.T) {
+	const ttl = 30 * time.Second
+
+	now := time.Date(2026, time.August, 21, 12, 0, 0, 0, time.UTC)
+	tiers := []config.Tier{tier("billet-4vcpu-release-heartbeat")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers,
+		alloc.WithClock(func() time.Time { return now }), alloc.WithLeaseTTL(ttl))
+	l := NewListener(a, tiers[0].Label, &fakeSession{})
+	if err := l.refillEscrow(t.Context()); err != nil {
+		t.Fatalf("refill: %v", err)
+	}
+
+	releaseStarted := make(chan struct{})
+	finishRelease := make(chan struct{})
+	l.releaseCapacity = func(ctx context.Context, id string, epoch int64,
+		outcome alloc.Phase,
+	) error {
+		close(releaseStarted)
+		<-finishRelease
+
+		return a.Release(ctx, id, epoch, outcome)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		l.releaseIdleEscrowAbove(t.Context(), 1)
+		close(done)
+	}()
+	var finishOnce sync.Once
+	defer func() {
+		finishOnce.Do(func() { close(finishRelease) })
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Errorf("surplus release goroutine did not stop")
+		}
+	}()
+	select {
+	case <-releaseStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("surplus release never reached the staged allocator call")
+	}
+
+	now = now.Add(2 * ttl)
+	l.mu.Lock()
+	l.heartbeatHeld(t.Context())
+	l.mu.Unlock()
+	if reaped, err := a.Reap(t.Context()); err != nil {
+		t.Fatalf("reap after heartbeat: %v", err)
+	} else if reaped != 0 {
+		t.Fatalf("reaped after heartbeat = %d, want no idle lease to expire", reaped)
+	}
+
+	finishOnce.Do(func() { close(finishRelease) })
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("surplus release did not finish after the allocator resumed")
+	}
+	if got := l.capacity(); got != 1 {
+		t.Errorf("capacity after release = %d, want retained target 1", got)
+	}
+}
+
+func TestSurplusReleaseRemovedByHeartbeatIsNotRestored(t *testing.T) {
+	const ttl = 30 * time.Second
+
+	now := time.Date(2026, time.August, 21, 12, 0, 0, 0, time.UTC)
+	tiers := []config.Tier{tier("billet-4vcpu-release-loss")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 4, MaxMemory: 64 * config.GiB}, tiers,
+		alloc.WithClock(func() time.Time { return now }), alloc.WithLeaseTTL(ttl))
+	l := NewListener(a, tiers[0].Label, &fakeSession{})
+	if err := l.refillEscrow(t.Context()); err != nil {
+		t.Fatalf("refill: %v", err)
+	}
+
+	releaseStarted := make(chan struct{})
+	finishRelease := make(chan struct{})
+	l.releaseCapacity = func(context.Context, string, int64, alloc.Phase) error {
+		close(releaseStarted)
+		<-finishRelease
+
+		return errors.New("injected retryable release failure")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		l.releaseIdleEscrowAbove(t.Context(), 0)
+		close(done)
+	}()
+	var finishOnce sync.Once
+	defer func() {
+		finishOnce.Do(func() { close(finishRelease) })
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Errorf("surplus release goroutine did not stop")
+		}
+	}()
+	select {
+	case <-releaseStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("surplus release never reached the staged allocator call")
+	}
+
+	now = now.Add(2 * ttl)
+	if reaped, err := a.Reap(t.Context()); err != nil {
+		t.Fatalf("reap staged release: %v", err)
+	} else if reaped != 1 {
+		t.Fatalf("reaped staged release = %d, want 1", reaped)
+	}
+	l.mu.Lock()
+	l.heartbeatHeld(t.Context())
+	l.mu.Unlock()
+
+	finishOnce.Do(func() { close(finishRelease) })
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("surplus release did not finish after the allocator resumed")
+	}
+	if got := l.capacity(); got != 0 {
+		t.Errorf("capacity after heartbeat proved loss = %d, want 0", got)
+	}
+	if got := len(l.Held()); got != 0 {
+		t.Errorf("held after heartbeat proved loss = %d, want 0", got)
+	}
+	l.mu.Lock()
+	releasing := len(l.releasing)
+	l.mu.Unlock()
+	if releasing != 0 {
+		t.Errorf("releasing after heartbeat proved loss = %d, want 0", releasing)
+	}
+}
+
+func TestFencedOrMissingSurplusReleaseIsNotRestored(t *testing.T) {
+	for name, releaseErr := range map[string]error{
+		"fenced":  alloc.ErrFenced,
+		"missing": alloc.ErrLeaseNotFound,
+	} {
+		t.Run(name, func(t *testing.T) {
+			tiers := []config.Tier{tier("billet-4vcpu-release-" + name)}
+			a := newAllocator(t, alloc.Limits{MaxVCPU: 4, MaxMemory: 64 * config.GiB}, tiers)
+			l := NewListener(a, tiers[0].Label, &fakeSession{})
+			if err := l.refillEscrow(t.Context()); err != nil {
+				t.Fatalf("refill: %v", err)
+			}
+			l.releaseCapacity = func(context.Context, string, int64, alloc.Phase) error {
+				return releaseErr
+			}
+
+			l.releaseIdleEscrowAbove(t.Context(), 0)
+			if got := l.capacity(); got != 0 {
+				t.Errorf("capacity after definitive release loss = %d, want 0", got)
+			}
+			if got := len(l.Held()); got != 0 {
+				t.Errorf("held after definitive release loss = %d, want 0", got)
+			}
+		})
+	}
+}
+
 // THE invariant of the listener plane, and the reason the allocator exists: the sum
 // of what every listener has advertised to GitHub at any instant never exceeds the
 // global budget.
