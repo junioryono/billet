@@ -24,7 +24,7 @@ import (
 const (
 	cacheRequestLimit  = 8 << 10
 	cacheKeyLimit      = 512
-	cacheHandlerLimit  = 12 * time.Minute
+	cacheHandlerLimit  = 12*time.Minute + 45*time.Second
 	cacheCleanupMargin = 30 * time.Second
 	cacheWorkLimit     = cacheHandlerLimit - cacheCleanupMargin
 	cacheWriterTTL     = 15 * time.Minute
