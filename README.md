@@ -337,7 +337,7 @@ billet is pre-alpha. **Jobs run end to end through the Docker, Firecracker and E
 | | |
 |---|---|
 | `billet github-app create` | Creates and installs the GitHub App via the manifest flow |
-| `billet check` | Validates the config, the App private key, and the state database. For an EC2 node it also reports that node's conservative compute-only peak implied by its declared shape prices and resource ceilings |
+| `billet check` | Validates the config, the App private key, and the state database; reports every registered node's site and liveness. For an EC2 node it also reports that node's conservative compute-only peak implied by its declared shape prices and resource ceilings |
 | `billet server --dry-run` | Connects to a real org, reconciles scale sets, polls — accepts nothing |
 | `billet server` | The control plane, serving the node wire. It runs no compute of its own — a machine that should also run jobs runs `billet node` beside it. A fleet with no live node advertises zero, so an empty fleet is told to GitHub rather than discovered when a job fails to launch |
 | `billet node` | A compute host: dials the control plane, never listens. One per machine, including the machine the server is on |
