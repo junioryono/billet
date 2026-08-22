@@ -25,6 +25,9 @@ const (
 	// metadata critical sections. A holder older than this is still never broken
 	// while its heartbeat moves, including a longer eviction pass.
 	CacheLockStaleAfter  = 10 * time.Minute
+	cacheLockRetryDelay  = 250 * time.Millisecond
+	cacheLockRecoveryGap = 30 * time.Second
+	cacheLockWaitLimit   = CacheLockStaleAfter + HeartbeatObservation + cacheLockRecoveryGap
 	cacheVolumeTTL       = 7 * time.Hour
 	cacheMetaPrefix      = "billet.cache."
 	filesystemProbeLimit = 8 << 10
@@ -72,7 +75,7 @@ func (c *Client) Match(
 	}
 
 	var matchedKey, generation string
-	err := c.withCacheLock(ctx, time.Now(), func() error {
+	err := c.withCacheLock(ctx, time.Now(), func(time.Time) error {
 		var exactPointer cachePointer
 		ok, err := c.readJSON(ctx, pointerKey(exact), &exactPointer)
 		if err != nil {
@@ -161,7 +164,7 @@ func (c *Client) Current(ctx context.Context, key string) (string, error) {
 	}
 
 	var pointer cachePointer
-	err := c.withCacheLock(ctx, time.Now(), func() error {
+	err := c.withCacheLock(ctx, time.Now(), func(time.Time) error {
 		ok, err := c.readJSON(ctx, pointerKey(key), &pointer)
 		if err != nil {
 			return err
@@ -197,17 +200,54 @@ func checkCacheKey(key string) error {
 	return nil
 }
 
-func (c *Client) withCacheLock(ctx context.Context, now time.Time, fn func() error) error {
-	cookie, err := publishCookie(now)
-	if err != nil {
-		return err
+func (c *Client) withCacheLock(
+	ctx context.Context,
+	now time.Time,
+	fn func(time.Time) error,
+) error {
+	lockCtx, cancelLock := context.WithTimeout(ctx, cacheLockWaitLimit)
+	defer cancelLock()
+
+	started := time.Now()
+	elapsed := func() time.Duration {
+		if c.cacheLockElapsed != nil {
+			return c.cacheLockElapsed()
+		}
+
+		return time.Since(started)
 	}
-	lock, err := c.takeLock(ctx, c.cacheIndex(), cookie, now, CacheLockStaleAfter)
-	if err != nil {
-		return fmt.Errorf("ceph: take the cache index lock: %w", err)
+	attemptAt := now
+	var lock *PublishLock
+	for {
+		cookie, err := publishCookie(attemptAt)
+		if err != nil {
+			return err
+		}
+		lock, err = c.takeLock(lockCtx, c.cacheIndex(), cookie, attemptAt, CacheLockStaleAfter)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, errLockContended) {
+			return fmt.Errorf("ceph: take the cache index lock: %w", err)
+		}
+
+		delay := cacheLockRetryDelay
+		if c.cacheLockRetry > 0 {
+			delay = c.cacheLockRetry
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-lockCtx.Done():
+			timer.Stop()
+
+			return fmt.Errorf("ceph: wait for the cache index lock: %w", lockCtx.Err())
+		case <-timer.C:
+		}
+		attemptAt = now.Add(elapsed())
 	}
 
-	workErr := fn()
+	lockedAt := now.Add(elapsed())
+	workErr := fn(lockedAt)
 	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.wait)
 	defer cancel()
 
@@ -346,11 +386,11 @@ func (c *Client) acquireWriterAt(
 	}
 
 	var issued cacheWriter
-	err := c.withCacheLock(ctx, now, func() error {
+	err := c.withCacheLock(ctx, now, func(lockedAt time.Time) error {
 		var current cacheWriter
 		if ok, err := c.readJSON(ctx, writerKey(key), &current); err != nil {
 			return err
-		} else if ok && now.Before(current.Lease.Expires) {
+		} else if ok && lockedAt.Before(current.Lease.Expires) {
 			return fmt.Errorf("%w: cache %q already has a live writer", storecontract.ErrConflict, key)
 		}
 
@@ -371,13 +411,13 @@ func (c *Client) acquireWriterAt(
 			return fmt.Errorf("ceph: cache %q exhausted its fencing tokens", key)
 		}
 
-		id, err := cacheName("w", now)
+		id, err := cacheName("w", lockedAt)
 		if err != nil {
 			return err
 		}
 
 		issued = cacheWriter{
-			Lease:  storecontract.WriterLease{Key: key, ID: id, Expires: now.Add(ttl)},
+			Lease:  storecontract.WriterLease{Key: key, ID: id, Expires: lockedAt.Add(ttl)},
 			Fence:  storecontract.FencingToken(fence + 1),
 			Holder: holder,
 		}
@@ -428,7 +468,9 @@ func (c *Client) snapshotAt(
 	if err != nil {
 		return storecontract.Candidate{}, err
 	}
-	if err := c.withCacheLock(ctx, now, func() error {
+	if err := c.withCacheLock(ctx, now, func(lockedAt time.Time) error {
+		now = lockedAt
+
 		return c.metaSet(ctx, volume.Handle, cacheMetaPrefix+"used_at",
 			now.UTC().Format(time.RFC3339Nano))
 	}); err != nil {
@@ -495,7 +537,7 @@ func (c *Client) snapshotAt(
 		return storecontract.Candidate{}, c.cleanupSnapshotFailure(ctx, volume, "", handle, err)
 	}
 	if volume.Lease.ID != "" {
-		if err := c.withCacheLock(ctx, now, func() error {
+		if err := c.withCacheLock(ctx, now, func(lockedAt time.Time) error {
 			var pointer cachePointer
 			ok, err := c.readJSON(ctx, pointerKey(volume.Key), &pointer)
 			if err != nil {
@@ -505,7 +547,7 @@ func (c *Client) snapshotAt(
 			// lock, so the expected pointer remains protected through the bounded
 			// Snapshot-to-PublishCAS handoff even after a long-running job.
 			if ok && pointer.Generation == volume.Generation {
-				pointer.UsedAt = now.UTC()
+				pointer.UsedAt = lockedAt.UTC()
 				if pointer.RetentionHours == 0 {
 					pointer.RetentionHours = retentionHours(volume.Key)
 				}
@@ -531,7 +573,7 @@ func (c *Client) nextCacheCloneDepth(ctx context.Context, volume storecontract.V
 	}
 
 	depth := maxCacheCloneDepth
-	err := c.withCacheLock(ctx, time.Now(), func() error {
+	err := c.withCacheLock(ctx, time.Now(), func(time.Time) error {
 		value, found, err := c.metaGet(ctx, volume.Handle, cacheMetaPrefix+"lineage")
 		if err != nil {
 			return err
@@ -611,7 +653,7 @@ func (c *Client) cleanupSnapshotFailure(
 		failures = append(failures, err)
 	}
 	if volume.Lease.ID != "" {
-		if err := c.withCacheLock(cleanupCtx, time.Now(), func() error {
+		if err := c.withCacheLock(cleanupCtx, time.Now(), func(time.Time) error {
 			return c.metaRemove(cleanupCtx, c.cacheIndex(), activeKey(volume.Lease.ID))
 		}); err != nil {
 			failures = append(failures, err)
@@ -661,7 +703,7 @@ func (c *Client) publishCASAt(
 		return fmt.Errorf("%w: fencing token zero authorises nothing", storecontract.ErrConflict)
 	}
 
-	return c.withCacheLock(ctx, now, func() error {
+	return c.withCacheLock(ctx, now, func(lockedAt time.Time) error {
 		var current cachePointer
 		pointerExists, err := c.readJSON(ctx, pointerKey(key), &current)
 		if err != nil {
@@ -672,7 +714,7 @@ func (c *Client) publishCASAt(
 			current.Fence == fence && current.Previous == expected {
 			return c.metaRemove(ctx, c.cacheIndex(), writerKey(key))
 		}
-		if err := lease.ValidAt(key, now); err != nil {
+		if err := lease.ValidAt(key, lockedAt); err != nil {
 			return fmt.Errorf("%w: %w", storecontract.ErrConflict, err)
 		}
 
@@ -710,8 +752,8 @@ func (c *Client) publishCASAt(
 			Key:            key,
 			Generation:     candidate.Generation,
 			Handle:         candidate.Handle,
-			UsedAt:         now.UTC(),
-			PublishedAt:    now.UTC(),
+			UsedAt:         lockedAt.UTC(),
+			PublishedAt:    lockedAt.UTC(),
 			RetentionHours: retentionHours(key),
 			WriterID:       lease.ID,
 			Fence:          fence,
@@ -750,7 +792,9 @@ func (c *Client) Clone(
 	cloneDepth := 0
 	copySource := false
 
-	err := c.withCacheLock(ctx, now, func() error {
+	err := c.withCacheLock(ctx, now, func(lockedAt time.Time) error {
+		now = lockedAt
+
 		metadataKey := pointerKey(key)
 		if generation != "" {
 			metadataKey = generationKey(key, generation)
@@ -888,7 +932,11 @@ func (c *Client) RenewActive(
 		return errors.New("ceph: an active cache renewal needs an identity and a future expiry")
 	}
 
-	return c.withCacheLock(ctx, now, func() error {
+	return c.withCacheLock(ctx, now, func(lockedAt time.Time) error {
+		if !lockedAt.Before(until) {
+			return errors.New("ceph: an active cache renewal needs an identity and a future expiry")
+		}
+
 		var active cacheActive
 		ok, err := c.readJSON(ctx, activeKey(volume.Lease.ID), &active)
 		if err != nil {
@@ -932,7 +980,7 @@ func (c *Client) Discard(ctx context.Context, volume storecontract.Volume) error
 	}
 
 	if volume.Lease.ID != "" {
-		return c.withCacheLock(ctx, time.Now(), func() error {
+		return c.withCacheLock(ctx, time.Now(), func(time.Time) error {
 			return c.metaRemove(ctx, c.cacheIndex(), activeKey(volume.Lease.ID))
 		})
 	}
@@ -964,7 +1012,7 @@ func (c *Client) Evict(ctx context.Context, olderThan time.Duration) error {
 
 	now := time.Now()
 
-	return c.withCacheLock(ctx, now, func() error {
+	return c.withCacheLock(ctx, now, func(now time.Time) error {
 		metadata, err := c.cacheIndexMetadata(ctx)
 		if err != nil {
 			return err
@@ -1112,14 +1160,8 @@ type cacheTrashImage struct {
 	Name string `json:"name"`
 }
 
-type exitCoder interface {
-	ExitCode() int
-}
-
 func isImageNotEmpty(err error) bool {
-	var exitError exitCoder
-
-	return errors.As(err, &exitError) && exitError.ExitCode() == 39
+	return exitedWith(err, 39)
 }
 
 func (c *Client) purgeRetiredCacheImages(ctx context.Context) (bool, error) {

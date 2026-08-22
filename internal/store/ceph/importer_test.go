@@ -169,8 +169,11 @@ func (f *importFake) run(ctx context.Context, _ string, args []string) ([]byte, 
 		// A LIVENESS READ IS ANSWERED SEPARATELY from a write, because the break path
 		// distinguishes "no counter" from "a counter that did not move" and a fake
 		// that answered both with success would collapse the two.
-		if f.heartbeat != nil && len(args) > 2 && args[len(args)-2] != "" &&
+		if len(args) > 2 && args[len(args)-2] != "" &&
 			strings.Contains(args[len(args)-1], "billet.heartbeat.") {
+			if f.heartbeat == nil {
+				return nil, errors.New("rbd: (2) No such file or directory")
+			}
 			value, present := f.heartbeat()
 			if !present {
 				return nil, errors.New("rbd: (2) No such file or directory")
@@ -250,7 +253,7 @@ func (f *importFake) lock(args []string) ([]byte, error) {
 		}
 
 		if f.lockTaken != "" || f.lockHeld != "" {
-			return nil, errors.New("exit status 16")
+			return nil, cacheExitError{code: 16, message: "exit status 16"}
 		}
 
 		f.lockTaken = cookie
