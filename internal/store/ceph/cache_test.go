@@ -32,9 +32,14 @@ type cacheFake struct {
 	lockAddErrOn         int
 	cancelLockAddOn      int
 	cancelLockAdd        context.CancelFunc
+	committedLockAddErr  error
 	lockLists            int
+	lockListCanceledErr  error
 	releaseAfterLockList int
 	releaseOn            int
+	lockRemoves          int
+	lockRemoveErrOn      int
+	lockRemoveErr        error
 	onLockList           func()
 	nextDevice           int
 	failMeta             string
@@ -170,6 +175,9 @@ func (f *cacheFake) lock(ctx context.Context, args []string) ([]byte, error) {
 		f.lockCookie = args[2]
 		if f.lockAdds == f.cancelLockAddOn && f.cancelLockAdd != nil {
 			f.cancelLockAdd()
+			if f.committedLockAddErr != nil {
+				return nil, f.committedLockAddErr
+			}
 
 			return nil, ctx.Err()
 		}
@@ -182,6 +190,13 @@ func (f *cacheFake) lock(ctx context.Context, args []string) ([]byte, error) {
 			f.onLockList = nil
 			hook()
 		}
+		if err := ctx.Err(); err != nil {
+			if f.lockListCanceledErr != nil {
+				return nil, f.lockListCanceledErr
+			}
+
+			return nil, err
+		}
 		if f.lockCookie == "" {
 			return []byte("[]"), nil
 		}
@@ -193,6 +208,10 @@ func (f *cacheFake) lock(ctx context.Context, args []string) ([]byte, error) {
 
 		return out, err
 	case "rm":
+		f.lockRemoves++
+		if f.lockRemoves == f.lockRemoveErrOn && f.lockRemoveErr != nil {
+			return nil, f.lockRemoveErr
+		}
 		if f.lockCookie == "" {
 			return nil, cacheExitError{code: 2, message: "exit status 2"}
 		}
@@ -460,10 +479,12 @@ func TestCacheIndexLockWaitIncludesRecoveryMargin(t *testing.T) {
 func TestCacheIndexLockReleasesAnInitialAddCommittedAsItsCallerCancels(t *testing.T) {
 	t.Parallel()
 
+	addErr := errors.New("lock add response was lost")
 	ctx, cancel := context.WithCancel(t.Context())
 	f := newCacheFake()
 	f.cancelLockAddOn = 1
 	f.cancelLockAdd = cancel
+	f.committedLockAddErr = addErr
 	c := cacheClient(t, f)
 
 	ran := false
@@ -474,6 +495,9 @@ func TestCacheIndexLockReleasesAnInitialAddCommittedAsItsCallerCancels(t *testin
 	})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("ambiguously acknowledged canceled acquisition returned %v, want cancellation", err)
+	}
+	if !errors.Is(err, addErr) {
+		t.Fatalf("ambiguously acknowledged canceled acquisition lost the add failure: %v", err)
 	}
 	if ran {
 		t.Fatal("cache work ran after its caller canceled during lock acquisition")
@@ -486,6 +510,7 @@ func TestCacheIndexLockReleasesAnInitialAddCommittedAsItsCallerCancels(t *testin
 func TestCacheIndexLockReleasesAPostBreakAddCommittedAsItsCallerCancels(t *testing.T) {
 	t.Parallel()
 
+	addErr := errors.New("reacquisition response was lost")
 	now := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
 	holder := fmt.Sprintf("billet-import-deadhost-7-deadbeefdeadbeef-%d",
 		now.Add(-100*CacheLockStaleAfter).Unix())
@@ -494,6 +519,7 @@ func TestCacheIndexLockReleasesAPostBreakAddCommittedAsItsCallerCancels(t *testi
 	f.lockCookie = holder
 	f.cancelLockAddOn = 2
 	f.cancelLockAdd = cancel
+	f.committedLockAddErr = addErr
 	c := cacheClient(t, f)
 	c.observation = time.Millisecond
 
@@ -506,6 +532,9 @@ func TestCacheIndexLockReleasesAPostBreakAddCommittedAsItsCallerCancels(t *testi
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("ambiguously acknowledged canceled reacquisition returned %v, want cancellation", err)
 	}
+	if !errors.Is(err, addErr) {
+		t.Fatalf("ambiguously acknowledged canceled reacquisition lost the add failure: %v", err)
+	}
 	if ran {
 		t.Fatal("cache work ran after its caller canceled during stale-lock reacquisition")
 	}
@@ -514,6 +543,57 @@ func TestCacheIndexLockReleasesAPostBreakAddCommittedAsItsCallerCancels(t *testi
 	}
 	if !f.ranWith("lock", "rm", holder) {
 		t.Fatal("the stale holder was not removed before the canceled reacquisition")
+	}
+}
+
+func TestCacheIndexLockPreservesReleaseFailureAfterCanceledAmbiguousAdds(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name            string
+		holder          string
+		cancelLockAddOn int
+		lockRemoveErrOn int
+	}{
+		{name: "initial add", cancelLockAddOn: 1, lockRemoveErrOn: 1},
+		{
+			name: "post-break add",
+			holder: fmt.Sprintf("billet-import-deadhost-7-acdeacdeacdeacde-%d",
+				now.Add(-100*CacheLockStaleAfter).Unix()),
+			cancelLockAddOn: 2,
+			lockRemoveErrOn: 2,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			addErr := errors.New("lock add response was lost")
+			releaseErr := errors.New("lock release response was lost")
+			ctx, cancel := context.WithCancel(t.Context())
+			f := newCacheFake()
+			f.lockCookie = tc.holder
+			f.cancelLockAddOn = tc.cancelLockAddOn
+			f.cancelLockAdd = cancel
+			f.committedLockAddErr = addErr
+			f.lockRemoveErrOn = tc.lockRemoveErrOn
+			f.lockRemoveErr = releaseErr
+			c := cacheClient(t, f)
+			c.observation = time.Millisecond
+
+			err := c.withCacheLock(ctx, now, func(time.Time) error {
+				t.Fatal("cache work ran after cancellation during ambiguous lock acquisition")
+
+				return nil
+			})
+			for name, want := range map[string]error{
+				"add": addErr, "cancellation": context.Canceled, "release": releaseErr,
+			} {
+				if !errors.Is(err, want) {
+					t.Errorf("canceled ambiguous acquisition lost its %s failure: %v", name, err)
+				}
+			}
+		})
 	}
 }
 
@@ -797,10 +877,12 @@ func TestCacheIndexLockStopsWaitingWhenItsCallerCancels(t *testing.T) {
 	now := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
 	holder := fmt.Sprintf("billet-import-livehost-7-ca11ed00ca11ed00-%d",
 		now.Add(-time.Minute).Unix())
+	readErr := fmt.Errorf("lock listing observed cancellation: %w", context.Canceled)
 	ctx, cancel := context.WithCancel(t.Context())
 	f := newCacheFake()
 	f.lockCookie = holder
 	f.onLockList = cancel
+	f.lockListCanceledErr = readErr
 	c := cacheClient(t, f)
 	c.cacheLockRetry = time.Hour
 
@@ -812,6 +894,9 @@ func TestCacheIndexLockStopsWaitingWhenItsCallerCancels(t *testing.T) {
 	})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancelled cache-index wait returned %v, want context.Canceled", err)
+	}
+	if !errors.Is(err, readErr) {
+		t.Fatalf("exit-16 reconciliation did not preserve caller cancellation at the lock read: %v", err)
 	}
 	if ran {
 		t.Fatal("cache work ran without acquiring the index after cancellation")
