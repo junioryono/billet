@@ -3,6 +3,7 @@
 package server
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -258,6 +259,19 @@ type Listener struct {
 	mu sync.Mutex
 	// Escrowed capacity not yet given to a job.
 	held []*alloc.Lease
+	// heldOrder restores the allocator's issuance order after a partial
+	// acquisition returns a lease to held. Provider rank alone cannot preserve
+	// pack/spread/name placement among targets on the same backend.
+	heldOrder     map[string]uint64
+	nextHeldOrder uint64
+	// releasing removes a shrink candidate from heartbeat selection without
+	// making its still-owned capacity disappear while Allocator.Release is in
+	// flight. A concurrent held loss is therefore visible before another
+	// candidate is chosen.
+	releasing map[string]*alloc.Lease
+	// releaseCapacity is a test seam for staging the heartbeat/release race. Nil
+	// uses the allocator directly; no production option can replace it.
+	releaseCapacity func(context.Context, string, int64, alloc.Phase) error
 	// Escrowed capacity that HAS been given to a job, keyed by request id so a
 	// redelivered message is recognised rather than assigned twice.
 	//
@@ -361,6 +375,8 @@ func NewListener(a *alloc.Allocator, tier string, session Session, opts ...Optio
 		destroying:    make(map[int64]bool),
 		configErrs:    make(map[string]error),
 		confirmed:     make(map[string]time.Time),
+		heldOrder:     make(map[string]uint64),
+		releasing:     make(map[string]*alloc.Lease),
 		stalePromise:  defaultStalePromise,
 		shutdownGrace: defaultShutdownGrace,
 		closeGrace:    defaultCloseGrace,
@@ -1027,7 +1043,7 @@ func (l *Listener) Run(ctx context.Context) error {
 		}
 
 		if !draining {
-			if err := l.refillEscrow(pollCtx); err != nil {
+			if err := l.prepareEscrow(pollCtx); err != nil {
 				if cancelledWhileServing(ctx, draining, err) {
 					continue
 				}
@@ -1041,7 +1057,11 @@ func (l *Listener) Run(ctx context.Context) error {
 			}
 		}
 
-		msg, err := l.session.GetMessage(pollCtx, l.lastMessageID, l.capacity())
+		advertised := l.capacity()
+		if !draining {
+			advertised = l.advertisedCapacity()
+		}
+		msg, err := l.session.GetMessage(pollCtx, l.lastMessageID, advertised)
 
 		// A timed-out long poll is the ordinary case. Poll again immediately —
 		// the escrow is KEPT, because releasing and retaking it every poll
@@ -1053,6 +1073,9 @@ func (l *Listener) Run(ctx context.Context) error {
 					return stopping(ctx, err)
 				}
 			}
+			if !draining {
+				l.releaseIdleEscrowAbove(pollCtx, max(advertised, l.targetCapacity()))
+			}
 			continue
 		}
 
@@ -1062,6 +1085,10 @@ func (l *Listener) Run(ctx context.Context) error {
 			}
 
 			return stopping(ctx, fmt.Errorf("server: poll %s: %w", l.tier, err))
+		}
+		if !draining {
+			l.releaseIdleEscrowAbove(pollCtx,
+				max(advertised, l.messageCapacityTarget(msg)))
 		}
 
 		if err := l.handle(pollCtx, msg); err != nil {
@@ -1106,6 +1133,9 @@ func (l *Listener) Run(ctx context.Context) error {
 
 		poisonMessageID = 0
 		poisonRefusals = 0
+		if !draining {
+			l.releaseIdleEscrowAbove(pollCtx, max(advertised, l.targetCapacity()))
+		}
 	}
 }
 
@@ -1240,6 +1270,7 @@ func (l *Listener) releaseStrandedEscrow(ctx context.Context) int {
 
 		l.mu.Lock()
 		l.held = slices.DeleteFunc(l.held, func(h *alloc.Lease) bool { return h.ID == lease.ID })
+		delete(l.heldOrder, lease.ID)
 		l.mu.Unlock()
 
 		released++
@@ -1286,12 +1317,77 @@ func (l *Listener) releaseIdleEscrow(ctx context.Context) int {
 
 		l.mu.Lock()
 		l.held = slices.DeleteFunc(l.held, func(h *alloc.Lease) bool { return h.ID == lease.ID })
+		delete(l.heldOrder, lease.ID)
 		l.mu.Unlock()
 
 		released++
 	}
 
 	return released
+}
+
+// releaseIdleEscrowAbove hands back only unassigned leases above target total
+// capacity. Acquiring, running, adopted, and already-releasing members remain
+// counted in the target but can never be selected for release here.
+func (l *Listener) releaseIdleEscrowAbove(ctx context.Context, target int) {
+	released := 0
+	for {
+		l.mu.Lock()
+		total := len(l.held) + len(l.releasing) + len(l.acquiring) + len(l.running) +
+			len(l.adopted)
+		if total <= target || len(l.held) == 0 {
+			l.mu.Unlock()
+			break
+		}
+
+		// Worst placement first. Moving it rather than snapshotting every surplus
+		// candidate makes a concurrent heartbeat loss visible before another is
+		// selected, while releasing still counts as owned until the allocator
+		// confirms otherwise.
+		lease := l.held[len(l.held)-1]
+		l.held = l.held[:len(l.held)-1]
+		l.releasing[lease.ID] = lease
+		l.mu.Unlock()
+
+		release := l.alloc.Release
+		if l.releaseCapacity != nil {
+			release = l.releaseCapacity
+		}
+		err := release(ctx, lease.ID, lease.Epoch, alloc.PhaseDone)
+
+		l.mu.Lock()
+		_, stillTracked := l.releasing[lease.ID]
+		delete(l.releasing, lease.ID)
+		definitivelyLost := !stillTracked || errors.Is(err, alloc.ErrFenced) ||
+			errors.Is(err, alloc.ErrLeaseNotFound)
+		if err == nil || definitivelyLost {
+			delete(l.confirmed, lease.ID)
+			delete(l.heldOrder, lease.ID)
+			if err == nil {
+				released++
+			}
+		} else {
+			l.held = append(l.held, lease)
+			l.sortHeld()
+		}
+		l.mu.Unlock()
+
+		if err != nil {
+			if definitivelyLost {
+				l.log.Warn("surplus idle escrow was lost while its release was in flight; it is no longer advertised",
+					"tier", l.tier, "lease", lease.ID, "error", err)
+				continue
+			}
+			l.log.Warn("could not release surplus idle escrow; it stays this listener's and will be retried",
+				"tier", l.tier, "lease", lease.ID, "error", err)
+			break
+		}
+	}
+
+	if released > 0 {
+		l.log.Info("released idle escrow above this tier's assigned demand",
+			"tier", l.tier, "released", released, "target_capacity", target)
+	}
 }
 
 // isDraining reports whether this listener has been asked to stop and is
@@ -1328,7 +1424,70 @@ func (l *Listener) capacity() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	return len(l.held) + len(l.acquiring) + len(l.running) + len(l.adopted)
+	return len(l.held) + len(l.releasing) + len(l.acquiring) + len(l.running) +
+		len(l.adopted)
+}
+
+// advertisedCapacity may be lower than capacity while a shrink is pending. The
+// surplus remains escrowed until GetMessage returns after sending this lower
+// value, so GitHub and the allocator never disagree about who may use it.
+func (l *Listener) advertisedCapacity() int {
+	return min(l.capacity(), l.targetCapacity())
+}
+
+// targetCapacity keeps one backed discovery slot beyond GitHub's current
+// assigned count. A zero-capacity scale set receives no work or statistics, but
+// an idle listener holding every free lease starves every peer indefinitely.
+func (l *Listener) targetCapacity() int {
+	return l.targetCapacityFor(l.observed, 0)
+}
+
+func (l *Listener) targetCapacityFor(observed *Statistics, offered int) int {
+	desired := 0
+	if observed != nil && observed.TotalAssignedJobs > 0 {
+		desired = observed.TotalAssignedJobs
+	}
+	l.mu.Lock()
+	active := len(l.acquiring) + len(l.running) + len(l.adopted)
+	l.mu.Unlock()
+	if offered > math.MaxInt-active {
+		desired = math.MaxInt
+	} else {
+		desired = max(desired, active+offered)
+	}
+
+	target := desired
+	if target < math.MaxInt {
+		target++
+	}
+	if l.maxCapacity != nil && target > *l.maxCapacity {
+		target = *l.maxCapacity
+	}
+	if target < 0 {
+		return 0
+	}
+
+	return target
+}
+
+// messageCapacityTarget is what the returned response can consume before any
+// blocking acquisition, launch, or reconciliation begins. Available and
+// Assigned are added because a direct assignment need not have appeared in this
+// process's offer set; over-counting a job present in both is bounded by the
+// message and safer than releasing its backing.
+func (l *Listener) messageCapacityTarget(msg *Message) int {
+	work := len(msg.Available)
+	if len(msg.Assigned) > math.MaxInt-work {
+		work = math.MaxInt
+	} else {
+		work += len(msg.Assigned)
+	}
+	observed := l.observed
+	if msg.Statistics != nil {
+		observed = msg.Statistics
+	}
+
+	return l.targetCapacityFor(observed, work)
 }
 
 func (l *Listener) refreshAdoptedCapacity(ctx context.Context) error {
@@ -1872,10 +2031,25 @@ func (l *Listener) heartbeatHeld(ctx context.Context) {
 		// nobody anything. The ledger entry is left to the reaper.
 		if l.renew(ctx, lease).advertisable() {
 			kept = append(kept, lease)
+		} else {
+			delete(l.heldOrder, lease.ID)
 		}
 	}
 
 	l.held = kept
+
+	// A surplus release may wait behind another SQLite writer. It remains owned
+	// and counted until Release confirms otherwise, so it needs the same heartbeat
+	// protection as ordinary idle escrow while that call is in flight.
+	for id, lease := range l.releasing {
+		if l.renew(ctx, lease).advertisable() {
+			continue
+		}
+
+		delete(l.releasing, id)
+		delete(l.confirmed, id)
+		delete(l.heldOrder, id)
+	}
 
 	// RUNNING and ACQUIRING leases are renewed too. They are open in the ledger
 	// exactly like held ones, so a lease whose job is in flight — or whose job
@@ -1924,6 +2098,7 @@ func (l *Listener) heartbeatHeld(ctx context.Context) {
 		if !l.renew(ctx, p.lease).advertisable() {
 			delete(l.acquiring, id)
 			delete(l.confirmed, p.lease.ID)
+			delete(l.heldOrder, p.lease.ID)
 		}
 	}
 
@@ -1944,10 +2119,14 @@ func (l *Listener) pruneConfirmed() {
 		return
 	}
 
-	live := make(map[string]struct{}, len(l.held)+len(l.running)+len(l.acquiring))
+	live := make(map[string]struct{},
+		len(l.held)+len(l.releasing)+len(l.running)+len(l.acquiring))
 
 	for _, lease := range l.held {
 		live[lease.ID] = struct{}{}
+	}
+	for id := range l.releasing {
+		live[id] = struct{}{}
 	}
 
 	for _, lease := range l.running {
@@ -2040,6 +2219,18 @@ func (l *Listener) renew(ctx context.Context, lease *alloc.Lease) renewal {
 // tier holds the capacity. Advertising zero is a correct answer: it tells GitHub
 // to assign this tier no work, which is exactly true.
 func (l *Listener) refillEscrow(ctx context.Context) error {
+	return l.refillEscrowTo(ctx, math.MaxInt)
+}
+
+// prepareEscrow fills ordinary polling to assigned demand plus one discovery
+// slot. Surplus is not released until GetMessage has returned after sending the
+// lower advertisement; releasing first would let another tier claim capacity
+// GitHub could still assign against here.
+func (l *Listener) prepareEscrow(ctx context.Context) error {
+	return l.refillEscrowTo(ctx, l.targetCapacity())
+}
+
+func (l *Listener) refillEscrowTo(ctx context.Context, target int) error {
 	room, err := l.alloc.Headroom(ctx, l.tier)
 	if err != nil {
 		return fmt.Errorf("server: headroom for %s: %w", l.tier, err)
@@ -2047,6 +2238,11 @@ func (l *Listener) refillEscrow(ctx context.Context) error {
 
 	// Headroom already excludes what this listener holds — those leases are open
 	// in the ledger — so this tops the total up rather than doubling it.
+	if target != math.MaxInt {
+		if ceiling := target - l.capacity(); room > ceiling {
+			room = ceiling
+		}
+	}
 
 	if l.maxCapacity != nil {
 		// Capped BEFORE the escrow, not after. Escrowing capacity this listener
@@ -2082,7 +2278,9 @@ func (l *Listener) refillEscrow(ctx context.Context) error {
 
 	l.mu.Lock()
 
+	l.trackHeld(leases)
 	l.held = append(l.held, leases...)
+	l.sortHeld()
 
 	// THE UNCERTAINTY CLOCK STARTS HERE, at the only point a lease id enters this
 	// listener at all — everything after this moves leases between held,
@@ -2259,11 +2457,17 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 	} else {
 		// Topped up between the release and the acquisition, so the slot just freed
 		// is available to back the offer that arrived with it. It may lose the race
-		// to another tier — escrow is first-come — and that is a fairness question,
-		// not a correctness one: what matters is that billet does not claim work it
-		// cannot back. See TestAGreedyTierCanTakeTheWholeBudget.
+		// to another tier — escrow is first-come — but idle listeners ordinarily
+		// keep only a discovery slot, and configured floors protect guarantees under
+		// real contention. What matters here is that billet never claims work it
+		// cannot back.
 		if len(msg.Available) > 0 {
-			if err := l.refillEscrow(ctx); err != nil {
+			observed := l.observed
+			if msg.Statistics != nil {
+				observed = msg.Statistics
+			}
+			if err := l.refillEscrowTo(ctx,
+				l.targetCapacityFor(observed, len(msg.Available))); err != nil {
 				return err
 			}
 		}
@@ -2523,6 +2727,7 @@ func (l *Listener) assignPoolSlot(ctx context.Context) (*alloc.Lease, Job, bool,
 	} else {
 		l.held = l.held[1:]
 	}
+	delete(l.heldOrder, lease.ID)
 	l.running[requestID] = lease
 
 	return lease, Job{RequestID: requestID}, true, nil
@@ -3011,6 +3216,7 @@ func (l *Listener) unreserve(ids []int64) {
 			l.held = append(l.held, p.lease)
 		}
 	}
+	l.sortHeld()
 }
 
 // releasePromise returns request-scoped escrow once an existing anonymous pool
@@ -3023,7 +3229,29 @@ func (l *Listener) releasePromise(id int64) {
 	if promised, ok := l.acquiring[id]; ok {
 		delete(l.acquiring, id)
 		l.held = append(l.held, promised.lease)
+		l.sortHeld()
 	}
+}
+
+func (l *Listener) trackHeld(leases []*alloc.Lease) {
+	for _, lease := range leases {
+		if _, tracked := l.heldOrder[lease.ID]; tracked {
+			continue
+		}
+		l.nextHeldOrder++
+		l.heldOrder[lease.ID] = l.nextHeldOrder
+	}
+}
+
+// sortHeld keeps provider preference ahead of fallback placement, then restores
+// the allocator's issuance order within a provider after unreserve appends.
+func (l *Listener) sortHeld() {
+	slices.SortStableFunc(l.held, func(a, b *alloc.Lease) int {
+		if rank := cmp.Compare(a.PreferenceRank, b.PreferenceRank); rank != 0 {
+			return rank
+		}
+		return cmp.Compare(l.heldOrder[a.ID], l.heldOrder[b.ID])
+	})
 }
 
 // missing returns the ids that were asked for and not granted.
@@ -3146,6 +3374,7 @@ func (l *Listener) assign(ctx context.Context, job Job) (*alloc.Lease, bool, err
 	} else {
 		l.held = l.held[1:]
 	}
+	delete(l.heldOrder, lease.ID)
 
 	l.running[job.RequestID] = lease
 

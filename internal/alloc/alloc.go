@@ -231,6 +231,11 @@ type Lease struct {
 	// InstanceType is the EC2 shape currently authorised for purchase. Empty for
 	// backends whose charged resources are the requested resources.
 	InstanceType string
+	// PreferenceRank is the chosen target provider's position in the tier's
+	// preference list. It orders unbound listener escrow so a shrink releases
+	// fallback capacity before preferred capacity. Unbound capacity is not adopted
+	// across a listener restart, so this runtime ordering fact is not persisted.
+	PreferenceRank int
 	// HeldSince is set when the lease enters custody or an unconfirmed teardown.
 	HeldSince string
 	// ForceRelease asks the node holding custody to relinquish it. It is carried
@@ -570,7 +575,7 @@ func (a *Allocator) Escrow(ctx context.Context, tier string, want int) ([]*Lease
 				break
 			}
 
-			lease, err := a.insertLease(ctx, tx, t, target, cost)
+			lease, err := a.insertLease(ctx, tx, t, target, cost, place.rank[target])
 			if err != nil {
 				return err
 			}
@@ -849,7 +854,7 @@ func (a *Allocator) Reserve(ctx context.Context, tier string) (*Lease, error) {
 			return fmt.Errorf("%w for tier %q", ErrNoCapacity, t.Label)
 		}
 
-		lease, err = a.insertLease(ctx, tx, t, target, cost)
+		lease, err = a.insertLease(ctx, tx, t, target, cost, place.rank[target])
 
 		return err
 	})
@@ -864,6 +869,7 @@ func (a *Allocator) Reserve(ctx context.Context, tier string) (*Lease, error) {
 // in which they have confirmed headroom.
 func (a *Allocator) insertLease(
 	ctx context.Context, tx *sql.Tx, t config.Tier, target string, cost placementCost,
+	preferenceRank int,
 ) (*Lease, error) {
 	id, err := newLeaseID()
 	if err != nil {
@@ -920,6 +926,7 @@ func (a *Allocator) insertLease(
 		RequestedVCPU:   t.VCPU,
 		RequestedMemory: t.Memory,
 		InstanceType:    cost.instanceType,
+		PreferenceRank:  preferenceRank,
 		Epoch:           0,
 	}, nil
 }
