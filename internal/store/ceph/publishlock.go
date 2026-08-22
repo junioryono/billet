@@ -512,12 +512,10 @@ func (c *Client) heldLock(
 
 	seconds, parseErr := strconv.ParseInt(timestamp, 10, 64)
 	if parseErr != nil {
-		// AN AGE OF ZERO, NOT AN ERROR. A cookie whose trailing digits do not fit an
-		// int64 was not written by anything this understands, and the caller treats
-		// age zero as "too recent to break" -- which is the safe reading. Reporting
-		// an error instead would refuse the publish outright rather than merely
-		// declining to break somebody else's lock.
-		return held[0], 0, false, true, nil //nolint:nilerr // an unreadable timestamp is an age, not a failure
+		// AN UNKNOWN AGE, NOT A PARSE ERROR. A version-shaped cookie whose timestamp
+		// does not fit an int64 is still a real holder, but it cannot be proved stale.
+		// The caller fails closed rather than breaking a lock whose age is unknown.
+		return held[0], 0, false, true, nil //nolint:nilerr // an unreadable timestamp deliberately makes age unknown
 	}
 
 	age := now.UTC().Sub(time.Unix(seconds, 0).UTC())
