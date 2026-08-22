@@ -3,6 +3,7 @@ package alloc
 import (
 	"database/sql"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -111,6 +112,80 @@ func TestDirectJobIdentityIsStableAndCollisionFree(t *testing.T) {
 		t.Fatalf("DirectJobIdentity(job-absent): %v", err)
 	} else if exists || got != 0 {
 		t.Errorf("DirectJobIdentity(job-absent) = %d, %t, want 0, false", got, exists)
+	}
+}
+
+func TestPoolSlotIdentityIsDurableAndSeparateFromDirectJobs(t *testing.T) {
+	a := newAllocator(t, Limits{MaxVCPU: 1, MaxMemory: config.GiB},
+		[]config.Tier{tier("linux", 1, config.GiB)})
+
+	pool, err := a.IdentifyPoolSlot(t.Context(), "lease-a")
+	if err != nil {
+		t.Fatalf("IdentifyPoolSlot: %v", err)
+	}
+	again, err := a.IdentifyPoolSlot(t.Context(), "lease-a")
+	if err != nil {
+		t.Fatalf("IdentifyPoolSlot again: %v", err)
+	}
+	direct, err := a.IdentifyDirectJob(t.Context(), "lease-a")
+	if err != nil {
+		t.Fatalf("IdentifyDirectJob: %v", err)
+	}
+	if pool >= 0 || again != pool || direct >= 0 || direct == pool {
+		t.Fatalf("pool identities = %d/%d, direct identity = %d; want stable distinct negatives",
+			pool, again, direct)
+	}
+}
+
+func TestActiveRunnerLeasesIncludeLegacyAssignmentsButNotIdleEscrow(t *testing.T) {
+	tiers := []config.Tier{tier("linux", 1, config.GiB)}
+	a := newAllocator(t, Limits{MaxVCPU: 2, MaxMemory: 2 * config.GiB}, tiers)
+	assigned := reserve(t, a, tiers[0].Label)
+	_ = reserve(t, a, tiers[0].Label)
+	if err := a.Assign(t.Context(), assigned.ID, assigned.Epoch, 101, 11); err != nil {
+		t.Fatalf("Assign: %v", err)
+	}
+
+	if active, err := a.ActiveRunnerLeases(t.Context(), tiers[0].Label); err != nil || active != 1 {
+		t.Fatalf("ActiveRunnerLeases = %d, err %v; want only the assigned lease", active, err)
+	}
+	if err := a.Release(t.Context(), assigned.ID, assigned.Epoch, PhaseFailed); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	if active, err := a.ActiveRunnerLeases(t.Context(), tiers[0].Label); err != nil || active != 0 {
+		t.Fatalf("ActiveRunnerLeases after release = %d, err %v; want zero", active, err)
+	}
+}
+
+func TestServiceableRunnerLeasesExcludeUnlaunchedAndRetiringCapacity(t *testing.T) {
+	tiers := []config.Tier{tier("linux", 1, config.GiB)}
+	a := newAllocator(t, Limits{MaxVCPU: 1, MaxMemory: config.GiB}, tiers)
+	lease := reserve(t, a, tiers[0].Label)
+	if err := a.Assign(t.Context(), lease.ID, lease.Epoch, 101, 11); err != nil {
+		t.Fatalf("Assign: %v", err)
+	}
+	if ids, err := a.ServiceableRunnerLeaseIDs(t.Context(), tiers[0].Label); err != nil || len(ids) != 0 {
+		t.Fatalf("unlaunched serviceable leases = %v, err %v; want none", ids, err)
+	}
+	if err := a.Bind(t.Context(), lease.ID, lease.Epoch, "test-host-firecracker"); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	if err := a.Advance(t.Context(), lease.ID, lease.Epoch, PhaseLaunching); err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if ids, err := a.ServiceableRunnerLeaseIDs(t.Context(), tiers[0].Label); err != nil ||
+		!slices.Equal(ids, []string{lease.ID}) {
+		t.Fatalf("launched serviceable leases = %v, err %v; want [%s]", ids, err, lease.ID)
+	}
+	if err := a.RegisterPoolRunner(t.Context(), PoolRunner{LeaseID: lease.ID, Tier: tiers[0].Label,
+		LaunchRequestID: 11, RunnerName: "billet-" + lease.ID}); err != nil {
+		t.Fatalf("RegisterPoolRunner: %v", err)
+	}
+	if err := a.RetirePoolRunner(t.Context(), lease.ID); err != nil {
+		t.Fatalf("RetirePoolRunner: %v", err)
+	}
+	if ids, err := a.ServiceableRunnerLeaseIDs(t.Context(), tiers[0].Label); err != nil || len(ids) != 0 {
+		t.Fatalf("retiring serviceable leases = %v, err %v; want none", ids, err)
 	}
 }
 
