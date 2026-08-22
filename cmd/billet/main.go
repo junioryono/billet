@@ -1969,6 +1969,34 @@ func cmdCheck(ctx context.Context, args []string) error {
 		}
 
 		fmt.Printf("state    %s (ok, integrity verified)\n", cfg.Server.StateDir)
+
+		a, err := alloc.New(db, alloc.Limits{
+			MaxVCPU:   cfg.Server.MaxVCPU,
+			MaxMemory: cfg.Server.MaxMemory,
+			Nodes:     cfg.NodePolicies(),
+		}, cfg.Tiers)
+		if err != nil {
+			return fmt.Errorf("capacity allocator: %w", err)
+		}
+		registered, err := a.RegisteredNodes(ctx)
+		if err != nil {
+			return err
+		}
+		if len(registered) == 0 {
+			fmt.Println("fleet    no registered nodes")
+		}
+		for _, member := range registered {
+			site := member.Site
+			if site == "" {
+				site = "local (implicit)"
+			}
+			liveness := "offline"
+			if member.Live {
+				liveness = "live"
+			}
+			fmt.Printf("fleet    %-24s at %s via %s (%s)\n", member.Name, site,
+				member.Provider, liveness)
+		}
 	}
 
 	if cfg.Node != nil {
