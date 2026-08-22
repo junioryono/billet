@@ -841,6 +841,94 @@ func TestPooledCompletionAndAssignedCountRetireBothPhysicalRunners(t *testing.T)
 	}
 }
 
+func TestAssignedCountGrowsPoolWithoutIndividualAssignments(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+	var launched []int64
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(&fakeRunner{
+		onLaunch: func(requestID int64) error {
+			launched = append(launched, requestID)
+			return nil
+		},
+	}))
+	if err := l.refillEscrow(t.Context()); err != nil {
+		t.Fatalf("refill escrow: %v", err)
+	}
+	if err := l.handle(t.Context(), &Message{MessageID: 1,
+		Statistics: &Statistics{TotalAssignedJobs: 2}}); err != nil {
+		t.Fatalf("statistics-only growth: %v", err)
+	}
+	if len(launched) != 2 || launched[0] >= 0 || launched[1] >= 0 || launched[0] == launched[1] {
+		t.Fatalf("launched scheduler identities = %v, want two distinct anonymous pool slots", launched)
+	}
+	members, err := a.PoolRunners(t.Context(), tiers[0].Label)
+	if err != nil || len(members) != 2 || l.Running() != 2 {
+		t.Fatalf("pool members = %+v, running = %d, err %v; want two", members, l.Running(), err)
+	}
+}
+
+func TestAssignedCountFillsBeyondTruncatedAssignmentEntries(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 12, MaxMemory: 64 * config.GiB}, tiers)
+	var launched []int64
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(&fakeRunner{
+		onLaunch: func(requestID int64) error {
+			launched = append(launched, requestID)
+			return nil
+		},
+	}))
+	if err := l.refillEscrow(t.Context()); err != nil {
+		t.Fatalf("refill escrow: %v", err)
+	}
+	if err := l.handle(t.Context(), &Message{MessageID: 1,
+		Assigned:   []Job{{RequestID: 11, RunID: 101, JobID: "only-visible-job"}},
+		Statistics: &Statistics{TotalAssignedJobs: 3}}); err != nil {
+		t.Fatalf("truncated assignment growth: %v", err)
+	}
+	if len(launched) != 3 || launched[0] != 11 {
+		t.Fatalf("launched scheduler identities = %v, want visible request plus two pool slots", launched)
+	}
+	for _, requestID := range launched[1:] {
+		if requestID >= 0 {
+			t.Fatalf("anonymous pool request %d is not in the internal negative namespace", requestID)
+		}
+	}
+}
+
+func TestAssignedCountConsumesPreviouslyAcquiredEscrow(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+	var launched []int64
+	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(&fakeRunner{
+		onLaunch: func(requestID int64) error {
+			launched = append(launched, requestID)
+			return nil
+		},
+	}))
+	if err := l.refillEscrow(t.Context()); err != nil {
+		t.Fatalf("refill escrow: %v", err)
+	}
+	if err := l.handle(t.Context(), &Message{MessageID: 1,
+		Available:  []Job{{RequestID: 11, JobID: "offered-job"}},
+		Statistics: &Statistics{TotalAssignedJobs: 1}}); err != nil {
+		t.Fatalf("acquired desired-count growth: %v", err)
+	}
+	if l.Acquiring() != 0 || len(launched) != 1 || launched[0] >= 0 {
+		t.Fatalf("acquiring = %d, launches = %v; want the promised lease converted once",
+			l.Acquiring(), launched)
+	}
+	if err := l.handle(t.Context(), &Message{MessageID: 2,
+		Assigned:   []Job{{RequestID: 11, RunID: 101, JobID: "offered-job"}},
+		Statistics: &Statistics{TotalAssignedJobs: 1}}); err != nil {
+		t.Fatalf("individual assignment after aggregate growth: %v", err)
+	}
+	members, err := a.PoolRunners(t.Context(), tiers[0].Label)
+	if err != nil || len(members) != 1 || len(launched) != 1 {
+		t.Fatalf("members = %+v, launches = %v, err %v; want no duplicate physical runner",
+			members, launched, err)
+	}
+}
+
 func TestRunnerRemovalFailureKeepsComputeAndCapacity(t *testing.T) {
 	tiers := []config.Tier{tier("billet-4vcpu-a")}
 	a := newAllocator(t, alloc.Limits{MaxVCPU: 4, MaxMemory: 64 * config.GiB}, tiers)
@@ -1031,7 +1119,9 @@ func TestRecoveryRetirementFenceSurvivesNodeCustodyAndRefusesLateStart(t *testin
 	l := NewListener(a, tiers[0].Label, &fakeSession{}, WithRunner(&fakeRunner{
 		onDestroy: func(int64) error { return ErrCustody },
 	}), WithRunnerRegistry(&fakeRunnerRegistry{}))
-	l.reconcilePool(t.Context(), 0)
+	if err := l.reconcilePool(t.Context(), 0); err != nil {
+		t.Fatalf("reconcile pool: %v", err)
+	}
 	member, err := a.PoolRunnerByLease(t.Context(), lease.ID)
 	if err != nil || member.Status != alloc.PoolRunnerRetiring {
 		t.Fatalf("node custody dropped recovery fence: %+v, err %v", member, err)
@@ -1260,6 +1350,100 @@ func TestSessionStatisticsAreObserved(t *testing.T) {
 
 	if l.Backlog() != 7 {
 		t.Errorf("Backlog() = %d, want 7 from the session statistics", l.Backlog())
+	}
+}
+
+func TestSessionStatisticsGrowPoolAfterInitialEscrow(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 8, MaxMemory: 64 * config.GiB}, tiers)
+	ctx, cancel := context.WithCancel(t.Context())
+	session := &fakeSession{
+		stats: &Statistics{TotalAssignedJobs: 2},
+		onPoll: func(int) {
+			cancel()
+		},
+	}
+	var launched []int64
+	l := NewListener(a, tiers[0].Label, session, WithRunner(&fakeRunner{
+		onLaunch: func(requestID int64) error {
+			launched = append(launched, requestID)
+			return nil
+		},
+	}), WithRunnerRegistry(&fakeRunnerRegistry{}), WithDrainGrace(time.Nanosecond))
+	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(launched) != 2 || launched[0] >= 0 || launched[1] >= 0 {
+		t.Fatalf("initial statistics launched %v, want two anonymous pool members before polling", launched)
+	}
+}
+
+func TestRestartAdvertisesAdoptedRunnerInTotalCapacity(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 4, MaxMemory: 64 * config.GiB}, tiers)
+	lease := poolLeaseForTier(t, a, tiers[0].Label)
+	if err := a.Assign(t.Context(), lease.ID, lease.Epoch, 101, 11); err != nil {
+		t.Fatalf("Assign: %v", err)
+	}
+	if err := a.Bind(t.Context(), lease.ID, lease.Epoch, "test-host-firecracker"); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	if err := a.Advance(t.Context(), lease.ID, lease.Epoch, alloc.PhaseLaunching); err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	advertised := -1
+	session := &fakeSession{
+		stats: &Statistics{TotalAssignedJobs: 1},
+		onPoll: func(capacity int) {
+			advertised = capacity
+			cancel()
+		},
+	}
+	l := NewListener(a, tiers[0].Label, session, WithRunner(&fakeRunner{}),
+		WithDrainGrace(time.Nanosecond))
+	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run: %v", err)
+	}
+	if advertised != 1 {
+		t.Fatalf("first post-restart poll advertised %d, want the adopted runner in total capacity", advertised)
+	}
+}
+
+func TestRunnerBecomingServiceableBetweenPollsEntersAdvertisedCapacity(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-a")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 4, MaxMemory: 64 * config.GiB}, tiers)
+	lease := poolLeaseForTier(t, a, tiers[0].Label)
+	if err := a.Assign(t.Context(), lease.ID, lease.Epoch, 101, 11); err != nil {
+		t.Fatalf("Assign: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	polls := 0
+	advertised := []int{}
+	session := &fakeSession{stats: &Statistics{TotalAssignedJobs: 1}}
+	session.onPoll = func(capacity int) {
+		polls++
+		advertised = append(advertised, capacity)
+		if polls == 1 {
+			if err := a.Bind(t.Context(), lease.ID, lease.Epoch, "test-host-firecracker"); err != nil {
+				t.Fatalf("Bind: %v", err)
+			}
+			if err := a.Advance(t.Context(), lease.ID, lease.Epoch, alloc.PhaseLaunching); err != nil {
+				t.Fatalf("Advance: %v", err)
+			}
+		} else {
+			cancel()
+		}
+	}
+	l := NewListener(a, tiers[0].Label, session, WithRunner(&fakeRunner{}),
+		WithDrainGrace(time.Nanosecond))
+	if err := l.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run: %v", err)
+	}
+	if !slices.Equal(advertised, []int{0, 1}) {
+		t.Fatalf("advertised capacity = %v, want [0 1] across the recovery transition", advertised)
 	}
 }
 

@@ -265,6 +265,10 @@ type Listener struct {
 	// number sent to GitHub is only ever capacity this listener took from the
 	// allocator, never one computed from headroom.
 	running map[int64]*alloc.Lease
+	// Restart-surviving runner leases held by the node rather than this
+	// listener. They count in GitHub's total pool capacity but do not enter the
+	// listener's heartbeat or teardown ownership.
+	adopted map[string]bool
 
 	// Completions whose destroy failed. Releasing while the compute may still be
 	// running is the overcommit the ordering exists to prevent, and GitHub's completion
@@ -351,6 +355,7 @@ func NewListener(a *alloc.Allocator, tier string, session Session, opts ...Optio
 		session:       session,
 		log:           slog.Default(),
 		running:       make(map[int64]*alloc.Lease),
+		adopted:       make(map[string]bool),
 		acquiring:     make(map[int64]*promise),
 		cleanup:       make(map[int64]*pendingCleanup),
 		destroying:    make(map[int64]bool),
@@ -935,12 +940,18 @@ func (l *Listener) Run(ctx context.Context) error {
 		l.releaseAll(releaseCtx, destroyed)
 	}()
 
+	if err := l.refreshAdoptedCapacity(ctx); err != nil {
+		return err
+	}
+
 	// A restart does not replay messages for work already assigned, so a listener
 	// that waits to be told about a backlog sits idle in front of one.
 	l.observed = l.session.Statistics()
 	l.reportOrphanedBacklog()
 	if l.observed != nil {
-		l.reconcilePool(ctx, l.observed.TotalAssignedJobs)
+		if err := l.reconcilePool(ctx, l.observed.TotalAssignedJobs); err != nil {
+			return err
+		}
 	}
 
 	// THE DRAIN IS A STATE OF THIS LOOP, NOT A PHASE OF THE TEARDOWN. There ctx is
@@ -1006,6 +1017,13 @@ func (l *Listener) Run(ctx context.Context) error {
 		// trying to leave, so the drain could never reach zero.
 		if !draining {
 			l.releaseStrandedEscrow(pollCtx)
+			if err := l.refreshAdoptedCapacity(pollCtx); err != nil {
+				if cancelledWhileServing(ctx, draining, err) {
+					continue
+				}
+
+				return stopping(ctx, err)
+			}
 		}
 
 		if !draining {
@@ -1015,6 +1033,11 @@ func (l *Listener) Run(ctx context.Context) error {
 				}
 
 				return stopping(ctx, err)
+			}
+			if l.observed != nil {
+				if err := l.reconcilePool(pollCtx, l.observed.TotalAssignedJobs); err != nil {
+					return stopping(ctx, err)
+				}
 			}
 		}
 
@@ -1026,7 +1049,9 @@ func (l *Listener) Run(ctx context.Context) error {
 		// escrow exists to avoid.
 		if errors.Is(err, ErrNoMessage) {
 			if l.observed != nil {
-				l.reconcilePool(pollCtx, l.observed.TotalAssignedJobs)
+				if err := l.reconcilePool(pollCtx, l.observed.TotalAssignedJobs); err != nil {
+					return stopping(ctx, err)
+				}
 			}
 			continue
 		}
@@ -1303,7 +1328,37 @@ func (l *Listener) capacity() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	return len(l.held) + len(l.acquiring) + len(l.running)
+	return len(l.held) + len(l.acquiring) + len(l.running) + len(l.adopted)
+}
+
+func (l *Listener) refreshAdoptedCapacity(ctx context.Context) error {
+	ids, err := l.alloc.ServiceableRunnerLeaseIDs(ctx, l.tier)
+	if err != nil {
+		return fmt.Errorf("server: refresh adopted capacity for %s: %w", l.tier, err)
+	}
+	serviceable := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		serviceable[id] = true
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	managed := make(map[string]bool, len(l.running))
+	for _, lease := range l.running {
+		managed[lease.ID] = true
+	}
+	for id := range l.adopted {
+		if !serviceable[id] || managed[id] {
+			delete(l.adopted, id)
+		}
+	}
+	for id := range serviceable {
+		if !managed[id] {
+			l.adopted[id] = true
+		}
+	}
+
+	return nil
 }
 
 // Held returns the leases this listener has escrowed and not yet handed to a job.
@@ -2228,12 +2283,24 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 	// launch pulls images and talks to a hypervisor; doing it under the mutex
 	// would stall every heartbeat behind it, and heartbeats are what keep the
 	// escrow alive. So assign returns what it bound and the launches follow.
+	assignmentDeficit := -1
+	if msg.Statistics != nil && msg.Statistics.TotalAssignedJobs >= 0 && l.alloc != nil {
+		active, err := l.activePoolMembers(ctx)
+		if err != nil {
+			return err
+		}
+		assignmentDeficit = max(msg.Statistics.TotalAssignedJobs-active, 0)
+	}
 	for i := range msg.Assigned {
 		job, err := l.identifyAssigned(ctx, msg.Assigned[i])
 		if err != nil {
 			return err
 		}
 		if _, over := finished[job.RequestID]; over {
+			continue
+		}
+		if assignmentDeficit == 0 {
+			l.releasePromise(job.RequestID)
 			continue
 		}
 
@@ -2251,11 +2318,16 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 		if err := l.launch(ctx, lease, job); err != nil {
 			return err
 		}
+		if assignmentDeficit > 0 {
+			assignmentDeficit--
+		}
 	}
 
 	if msg.Statistics != nil {
 		l.observed = msg.Statistics
-		l.reconcilePool(ctx, msg.Statistics.TotalAssignedJobs)
+		if err := l.reconcilePool(ctx, msg.Statistics.TotalAssignedJobs); err != nil {
+			return err
+		}
 	}
 
 	if poison != nil {
@@ -2339,17 +2411,18 @@ func (l *Listener) quarantineStarted(ctx context.Context, job Job, cause error) 
 	}
 }
 
-// reconcilePool shrinks a tier to GitHub's authoritative assigned-job count.
-// Only idle members are selected; a busy member belongs to a job regardless of
-// what any aggregate says while messages are in flight.
-func (l *Listener) reconcilePool(ctx context.Context, desired int) {
+// reconcilePool matches a tier to GitHub's authoritative assigned-job count.
+// Growth creates anonymous physical members because individual job entries are
+// lifecycle data and may be truncated. Only idle members are selected for
+// shrinkage; a busy member belongs to a job regardless of what any aggregate
+// says while messages are in flight.
+func (l *Listener) reconcilePool(ctx context.Context, desired int) error {
 	if l.alloc == nil || desired < 0 {
-		return
+		return nil
 	}
 	runners, err := l.alloc.PoolRunners(ctx, l.tier)
 	if err != nil {
-		l.log.Error("could not read the runner pool for scale-down", "tier", l.tier, "error", err)
-		return
+		return fmt.Errorf("server: read runner pool for %s reconciliation: %w", l.tier, err)
 	}
 
 	for i := range runners {
@@ -2360,18 +2433,28 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) {
 
 	runners, err = l.alloc.PoolRunners(ctx, l.tier)
 	if err != nil {
-		l.log.Error("could not refresh the runner pool after retirement", "tier", l.tier, "error", err)
-		return
+		return fmt.Errorf("server: refresh runner pool for %s reconciliation: %w", l.tier, err)
 	}
-	active := 0
-	for i := range runners {
-		if runners[i].Status == alloc.PoolRunnerIdle || runners[i].Status == alloc.PoolRunnerBusy {
-			active++
+	active, err := l.alloc.ActiveRunnerLeases(ctx, l.tier)
+	if err != nil {
+		return fmt.Errorf("server: count active runner leases for %s reconciliation: %w", l.tier, err)
+	}
+	for active < desired {
+		lease, job, ok, err := l.assignPoolSlot(ctx)
+		if err != nil {
+			return err
 		}
+		if !ok {
+			break
+		}
+		if err := l.launch(ctx, lease, job); err != nil {
+			return err
+		}
+		active++
 	}
 	surplus := active - desired
 	if surplus <= 0 {
-		return
+		return nil
 	}
 	for i := range runners {
 		if surplus == 0 {
@@ -2389,6 +2472,60 @@ func (l *Listener) reconcilePool(ctx context.Context, desired int) {
 		l.retirePoolMember(ctx, runners[i])
 		surplus--
 	}
+
+	return nil
+}
+
+func (l *Listener) activePoolMembers(ctx context.Context) (int, error) {
+	active, err := l.alloc.ActiveRunnerLeases(ctx, l.tier)
+	if err != nil {
+		return 0, fmt.Errorf("server: read runner pool for %s assignment: %w", l.tier, err)
+	}
+
+	return active, nil
+}
+
+// assignPoolSlot turns one escrowed lease into a physical runner whose durable
+// identity is the lease rather than one entry from GitHub's truncated message.
+func (l *Listener) assignPoolSlot(ctx context.Context) (*alloc.Lease, Job, bool, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	var (
+		lease     *alloc.Lease
+		promiseID int64
+	)
+	for id, promised := range l.acquiring {
+		if lease == nil || promised.at.Before(l.acquiring[promiseID].at) ||
+			(promised.at.Equal(l.acquiring[promiseID].at) && id < promiseID) {
+			lease = promised.lease
+			promiseID = id
+		}
+	}
+	fromPromise := lease != nil
+	if !fromPromise {
+		if len(l.held) == 0 {
+			return nil, Job{}, false, nil
+		}
+		lease = l.held[0]
+	}
+
+	requestID, err := l.alloc.IdentifyPoolSlot(ctx, lease.ID)
+	if err != nil {
+		return nil, Job{}, false, fmt.Errorf("server: identify pool slot for lease %s: %w", lease.ID, err)
+	}
+	if err := l.alloc.Assign(ctx, lease.ID, lease.Epoch, 0, requestID); err != nil {
+		return nil, Job{}, false, fmt.Errorf("server: assign pool slot lease %s: %w", lease.ID, err)
+	}
+
+	if fromPromise {
+		delete(l.acquiring, promiseID)
+	} else {
+		l.held = l.held[1:]
+	}
+	l.running[requestID] = lease
+
+	return lease, Job{RequestID: requestID}, true, nil
 }
 
 // retirePoolMember removes routing before compute, then returns its capacity.
@@ -2873,6 +3010,19 @@ func (l *Listener) unreserve(ids []int64) {
 			delete(l.acquiring, id)
 			l.held = append(l.held, p.lease)
 		}
+	}
+}
+
+// releasePromise returns request-scoped escrow once an existing anonymous pool
+// member already backs the assignment. Keeping it would reserve a second
+// machine for one desired runner.
+func (l *Listener) releasePromise(id int64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if promised, ok := l.acquiring[id]; ok {
+		delete(l.acquiring, id)
+		l.held = append(l.held, promised.lease)
 	}
 }
 
