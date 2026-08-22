@@ -30,6 +30,8 @@ type cacheFake struct {
 	lockAdds             int
 	lockAddErr           error
 	lockAddErrOn         int
+	cancelLockAddOn      int
+	cancelLockAdd        context.CancelFunc
 	lockLists            int
 	releaseAfterLockList int
 	releaseOn            int
@@ -68,7 +70,7 @@ func (f *cacheFake) run(ctx context.Context, _ string, args []string) ([]byte, e
 	f.calls = append(f.calls, slices.Clone(args))
 
 	if i := slices.Index(args, "lock"); i >= 0 {
-		return f.lock(args[i+1:])
+		return f.lock(ctx, args[i+1:])
 	}
 
 	if i := slices.Index(args, "image-meta"); i >= 0 {
@@ -151,7 +153,7 @@ func (f *cacheFake) trashCommand(args []string) ([]byte, error) {
 	}
 }
 
-func (f *cacheFake) lock(args []string) ([]byte, error) {
+func (f *cacheFake) lock(ctx context.Context, args []string) ([]byte, error) {
 	switch args[0] {
 	case "add":
 		f.lockAdds++
@@ -166,6 +168,11 @@ func (f *cacheFake) lock(args []string) ([]byte, error) {
 		}
 
 		f.lockCookie = args[2]
+		if f.lockAdds == f.cancelLockAddOn && f.cancelLockAdd != nil {
+			f.cancelLockAdd()
+
+			return nil, ctx.Err()
+		}
 
 		return nil, nil
 	case "ls":
@@ -447,6 +454,66 @@ func TestCacheIndexLockWaitIncludesRecoveryMargin(t *testing.T) {
 	if cacheLockRecoveryGap < minimumRecoveryGap || cacheLockWaitLimit < wantMinimum {
 		t.Fatalf("cache-index wait limit %s does not include the %s recovery margin after %s",
 			cacheLockWaitLimit, minimumRecoveryGap, CacheLockStaleAfter+HeartbeatObservation)
+	}
+}
+
+func TestCacheIndexLockReleasesAnInitialAddCommittedAsItsCallerCancels(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	f := newCacheFake()
+	f.cancelLockAddOn = 1
+	f.cancelLockAdd = cancel
+	c := cacheClient(t, f)
+
+	ran := false
+	err := c.withCacheLock(ctx, time.Now(), func(time.Time) error {
+		ran = true
+
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("ambiguously acknowledged canceled acquisition returned %v, want cancellation", err)
+	}
+	if ran {
+		t.Fatal("cache work ran after its caller canceled during lock acquisition")
+	}
+	if f.lockCookie != "" {
+		t.Fatalf("canceled acquisition stranded cache-index lock %q", f.lockCookie)
+	}
+}
+
+func TestCacheIndexLockReleasesAPostBreakAddCommittedAsItsCallerCancels(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
+	holder := fmt.Sprintf("billet-import-deadhost-7-deadbeefdeadbeef-%d",
+		now.Add(-100*CacheLockStaleAfter).Unix())
+	ctx, cancel := context.WithCancel(t.Context())
+	f := newCacheFake()
+	f.lockCookie = holder
+	f.cancelLockAddOn = 2
+	f.cancelLockAdd = cancel
+	c := cacheClient(t, f)
+	c.observation = time.Millisecond
+
+	ran := false
+	err := c.withCacheLock(ctx, now, func(time.Time) error {
+		ran = true
+
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("ambiguously acknowledged canceled reacquisition returned %v, want cancellation", err)
+	}
+	if ran {
+		t.Fatal("cache work ran after its caller canceled during stale-lock reacquisition")
+	}
+	if f.lockCookie != "" {
+		t.Fatalf("canceled reacquisition stranded cache-index lock %q", f.lockCookie)
+	}
+	if !f.ranWith("lock", "rm", holder) {
+		t.Fatal("the stale holder was not removed before the canceled reacquisition")
 	}
 }
 

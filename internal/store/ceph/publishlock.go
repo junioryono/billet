@@ -269,7 +269,7 @@ func (c *Client) takeLock(
 	// SOMEBODY HOLDS IT. Whether that is a live build or a corpse is the only
 	// question left, and it is answered from the cookie rather than from anything
 	// about the process, because there is nothing here that can see the process.
-	holder, age, ageKnown, found, err := c.heldLock(ctx, image, now)
+	holder, age, ageKnown, found, err := c.heldLockAfterAdd(ctx, image, now, addErr)
 	if err != nil {
 		if !exitedWith(addErr, 16) {
 			return nil, errors.Join(
@@ -283,6 +283,9 @@ func (c *Client) takeLock(
 
 	if found && holder.ID == cookie {
 		lock := &PublishLock{client: c, cookie: cookie, image: image}
+		if err := lock.releaseCanceledAcquisition(ctx, addErr); err != nil {
+			return nil, err
+		}
 		lock.beat(ctx)
 
 		return lock, nil
@@ -384,7 +387,7 @@ func (c *Client) takeLock(
 
 	if _, addErr := c.rbdCmd(ctx, false, "lock", "add", image, cookie); addErr != nil {
 		replacement, replacementAge, replacementAgeKnown, replacementFound, readErr :=
-			c.heldLock(ctx, image, now)
+			c.heldLockAfterAdd(ctx, image, now, addErr)
 		if readErr != nil {
 			return nil, errors.Join(
 				fmt.Errorf("ceph: %s was broken after %s but could not then be taken: %w",
@@ -395,6 +398,12 @@ func (c *Client) takeLock(
 		// The command may have committed before its response was lost. This process
 		// can continue only when the listing names its exact nonce-bearing cookie.
 		ownsLock := replacementFound && replacement.ID == cookie
+		if ownsLock {
+			lock := &PublishLock{client: c, cookie: cookie, image: image}
+			if err := lock.releaseCanceledAcquisition(ctx, addErr); err != nil {
+				return nil, err
+			}
+		}
 		if !ownsLock {
 			switch {
 			case !exitedWith(addErr, 16):
@@ -428,6 +437,45 @@ func (c *Client) takeLock(
 	lock.beat(ctx)
 
 	return lock, nil
+}
+
+// heldLockAfterAdd resolves an add whose result may have been lost after Ceph
+// committed it. The command's context may already be expired, so ownership is
+// read through a fresh bound that cannot abandon Billet's persistent lock.
+func (c *Client) heldLockAfterAdd(
+	ctx context.Context,
+	image string,
+	now time.Time,
+	addErr error,
+) (lockEntry, time.Duration, bool, bool, error) {
+	// Exit 16 definitively means another lock excluded this command, so there is
+	// no possible custody to recover and caller cancellation remains authoritative.
+	if exitedWith(addErr, 16) {
+		return c.heldLock(ctx, image, now)
+	}
+
+	readCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.wait)
+	defer cancel()
+
+	return c.heldLock(readCtx, image, now)
+}
+
+// releaseCanceledAcquisition gives back an ambiguously acknowledged lock when
+// its caller can no longer accept custody of it.
+func (l *PublishLock) releaseCanceledAcquisition(ctx context.Context, addErr error) error {
+	if ctx.Err() == nil {
+		return nil
+	}
+
+	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), l.client.wait)
+	defer cancel()
+
+	return errors.Join(
+		fmt.Errorf("ceph: the advisory lock on %s may have been taken before the response failed: %w",
+			l.image, addErr),
+		fmt.Errorf("ceph: its caller can no longer accept custody: %w", ctx.Err()),
+		l.Release(releaseCtx),
+	)
 }
 
 // lockEntry is the half of `rbd lock ls --format json` this needs.
