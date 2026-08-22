@@ -42,11 +42,9 @@ func TestShutdownReleasesEveryEscrowedLease(t *testing.T) {
 		advertised = map[string]bool{}
 	)
 
-	// At least ONE tier, not every tier. Escrow is first-come and the budget is
-	// shared, so a tier that polls first can legitimately take all of it and leave
-	// the others advertising zero — see TestAGreedyTierCanTakeTheWholeBudget.
-	// Requiring every tier here asserts a fairness property the allocator does not
-	// currently have, which is how this test failed once it was made strict.
+	// Every tier gets one backed discovery slot while capacity permits. The
+	// allocator remains first-come, but listener policy no longer lets an idle
+	// scale set renew the whole deployment forever.
 	sawCapacity := func(label string, capacity int) bool {
 		mu.Lock()
 		defer mu.Unlock()
@@ -55,7 +53,7 @@ func TestShutdownReleasesEveryEscrowedLease(t *testing.T) {
 			advertised[label] = true
 		}
 
-		return len(advertised) > 0
+		return len(advertised) == len(tiers)
 	}
 
 	prov := &fakeProvisioner{
@@ -76,8 +74,8 @@ func TestShutdownReleasesEveryEscrowedLease(t *testing.T) {
 	held := len(advertised)
 	mu.Unlock()
 
-	if held == 0 {
-		t.Fatal("no tier ever advertised capacity; nothing was escrowed, so nothing was released")
+	if held != len(tiers) {
+		t.Fatalf("%d tiers advertised capacity, want all %d", held, len(tiers))
 	}
 
 	usage, err := a.Usage(t.Context())
@@ -346,17 +344,9 @@ func TestReaperDoesNotReclaimCapacityStillAdvertised(t *testing.T) {
 	}
 }
 
-// Escrow is FIRST-COME, so one tier can take the entire budget.
-//
-// Not a bug today, and not obviously right either — so it is written down as a
-// test rather than left to be rediscovered. With a shared ceiling and no per-tier
-// reservation, whichever listener polls first escrows everything it can use and
-// the others advertise zero until it releases. A busy 4-vCPU tier can starve a
-// 16-vCPU one indefinitely.
-//
-// Fixing it means per-tier floors or a fairer escrow, which is a scheduling
-// decision rather than a correctness one. The invariant that matters — never
-// advertising more than the budget — holds either way.
+// The allocator remains first-come: it knows only hard resource accounting, not
+// listener demand. Listener policy supplies discovery floors and returns idle
+// surplus before another tier asks this lower layer for headroom.
 func TestAGreedyTierCanTakeTheWholeBudget(t *testing.T) {
 	tiers := []config.Tier{tier("billet-4vcpu-a"), tier("billet-4vcpu-b")}
 

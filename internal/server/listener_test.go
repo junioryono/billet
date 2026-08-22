@@ -171,6 +171,127 @@ const notDrainingHere = 50 * time.Millisecond
 // arithmetic in the assertions can be read without cross-referencing.
 const tierVCPU = 4
 
+// An idle scale set needs one backed slot so GitHub will send it the first
+// statistics message, but it must not escrow the entire deployment while it has
+// no assigned work. Otherwise the first listener to poll can renew every lease
+// forever and a second tier with a real backlog advertises zero indefinitely.
+func TestIdleTierLeavesCapacityForASecondTierBacklog(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-idle"), tier("billet-4vcpu-busy")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 12, MaxMemory: 64 * config.GiB}, tiers)
+
+	idleCtx, stopIdle := context.WithCancel(t.Context())
+	idlePoll := make(chan int, 1)
+	releaseIdlePoll := make(chan struct{})
+	idleSession := &fakeSession{
+		onPoll: func(capacity int) {
+			select {
+			case idlePoll <- capacity:
+			default:
+			}
+		},
+		onGet: func() (*Message, error) {
+			<-releaseIdlePoll
+			return nil, ErrNoMessage
+		},
+	}
+	idleDone := make(chan error, 1)
+	go func() {
+		idleDone <- NewListener(a, tiers[0].Label, idleSession).Run(idleCtx)
+	}()
+
+	var firstIdleCapacity int
+	select {
+	case firstIdleCapacity = <-idlePoll:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the idle tier never advertised its discovery capacity")
+	}
+
+	busyCtx, stopBusy := context.WithCancel(t.Context())
+	busyPoll := make(chan int, 1)
+	launched := make(chan int64, 2)
+	busySession := &fakeSession{
+		stats: &Statistics{TotalAssignedJobs: 2},
+		onPoll: func(capacity int) {
+			select {
+			case busyPoll <- capacity:
+			default:
+			}
+			stopBusy()
+		},
+	}
+	busy := NewListener(a, tiers[1].Label, busySession,
+		WithRunner(&fakeRunner{onLaunch: func(requestID int64) error {
+			launched <- requestID
+			return nil
+		}}),
+		WithRunnerRegistry(&fakeRunnerRegistry{}),
+		WithDrainGrace(time.Nanosecond),
+	)
+	busyErr := busy.Run(busyCtx)
+	if busyErr != nil && !errors.Is(busyErr, context.Canceled) {
+		t.Fatalf("busy listener: %v", busyErr)
+	}
+
+	stopIdle()
+	close(releaseIdlePoll)
+	if idleErr := <-idleDone; idleErr != nil && !errors.Is(idleErr, context.Canceled) {
+		t.Fatalf("idle listener: %v", idleErr)
+	}
+
+	firstBusyCapacity := <-busyPoll
+	if firstIdleCapacity != 1 {
+		t.Errorf("idle tier advertised %d runners, want one discovery slot", firstIdleCapacity)
+	}
+	if firstBusyCapacity != 2 {
+		t.Errorf("busy tier advertised %d runners, want its two assigned jobs", firstBusyCapacity)
+	}
+	close(launched)
+	var launchedIDs []int64
+	for requestID := range launched {
+		launchedIDs = append(launchedIDs, requestID)
+	}
+	if len(launchedIDs) != 2 || launchedIDs[0] >= 0 || launchedIDs[1] >= 0 {
+		t.Errorf("busy tier launched %v, want two anonymous pool members", launchedIDs)
+	}
+}
+
+func TestAssignedDemandFallingReturnsSurplusEscrow(t *testing.T) {
+	tiers := []config.Tier{tier("billet-4vcpu-demand")}
+	a := newAllocator(t, alloc.Limits{MaxVCPU: 16, MaxMemory: 64 * config.GiB}, tiers)
+	l := NewListener(a, tiers[0].Label, &fakeSession{})
+
+	if err := l.refillEscrow(t.Context()); err != nil {
+		t.Fatalf("initial refill: %v", err)
+	}
+	if got := l.capacity(); got != 4 {
+		t.Fatalf("initial capacity = %d, want the four-slot deployment", got)
+	}
+
+	l.observed = &Statistics{TotalAssignedJobs: 2}
+	if err := l.rebalanceEscrow(t.Context()); err != nil {
+		t.Fatalf("rebalance for assigned work: %v", err)
+	}
+	if got := l.capacity(); got != 3 {
+		t.Errorf("capacity with two assigned jobs = %d, want two jobs plus discovery", got)
+	}
+
+	l.observed = &Statistics{}
+	if err := l.rebalanceEscrow(t.Context()); err != nil {
+		t.Fatalf("rebalance after demand drained: %v", err)
+	}
+	if got := l.capacity(); got != 1 {
+		t.Errorf("idle capacity = %d, want one discovery slot", got)
+	}
+
+	usage, err := a.Usage(t.Context())
+	if err != nil {
+		t.Fatalf("Usage: %v", err)
+	}
+	if usage.VCPU != tierVCPU {
+		t.Errorf("ledger holds %d vCPU, want one %d-vCPU discovery slot", usage.VCPU, tierVCPU)
+	}
+}
+
 // THE invariant of the listener plane, and the reason the allocator exists: the sum
 // of what every listener has advertised to GitHub at any instant never exceeds the
 // global budget.

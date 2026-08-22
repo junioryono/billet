@@ -1027,7 +1027,7 @@ func (l *Listener) Run(ctx context.Context) error {
 		}
 
 		if !draining {
-			if err := l.refillEscrow(pollCtx); err != nil {
+			if err := l.rebalanceEscrow(pollCtx); err != nil {
 				if cancelledWhileServing(ctx, draining, err) {
 					continue
 				}
@@ -1294,6 +1294,39 @@ func (l *Listener) releaseIdleEscrow(ctx context.Context) int {
 	return released
 }
 
+// releaseIdleEscrowAbove hands back only unassigned leases above target total
+// capacity. Acquiring, running, and adopted members remain counted in the
+// target but can never be selected for release here.
+func (l *Listener) releaseIdleEscrowAbove(ctx context.Context, target int) int {
+	l.mu.Lock()
+	total := len(l.held) + len(l.acquiring) + len(l.running) + len(l.adopted)
+	surplus := min(max(total-target, 0), len(l.held))
+	snapshot := append([]*alloc.Lease(nil), l.held[:surplus]...)
+	l.mu.Unlock()
+
+	released := 0
+	for _, lease := range snapshot {
+		if err := l.alloc.Release(ctx, lease.ID, lease.Epoch, alloc.PhaseDone); err != nil {
+			l.log.Warn("could not release surplus idle escrow; it stays this listener's and will be retried",
+				"tier", l.tier, "lease", lease.ID, "error", err)
+			continue
+		}
+
+		l.mu.Lock()
+		l.held = slices.DeleteFunc(l.held, func(h *alloc.Lease) bool { return h.ID == lease.ID })
+		delete(l.confirmed, lease.ID)
+		l.mu.Unlock()
+		released++
+	}
+
+	if released > 0 {
+		l.log.Info("released idle escrow above this tier's assigned demand",
+			"tier", l.tier, "released", released, "target_capacity", target)
+	}
+
+	return released
+}
+
 // isDraining reports whether this listener has been asked to stop and is
 // waiting out the work it already has.
 //
@@ -1329,6 +1362,33 @@ func (l *Listener) capacity() int {
 	defer l.mu.Unlock()
 
 	return len(l.held) + len(l.acquiring) + len(l.running) + len(l.adopted)
+}
+
+// targetCapacity keeps one backed discovery slot beyond GitHub's current
+// assigned count. A zero-capacity scale set receives no work or statistics, but
+// an idle listener holding every free lease starves every peer indefinitely.
+func (l *Listener) targetCapacity() int {
+	desired := 0
+	if l.observed != nil && l.observed.TotalAssignedJobs > 0 {
+		desired = l.observed.TotalAssignedJobs
+	}
+	l.mu.Lock()
+	active := len(l.acquiring) + len(l.running) + len(l.adopted)
+	l.mu.Unlock()
+	desired = max(desired, active)
+
+	target := desired
+	if target < math.MaxInt {
+		target++
+	}
+	if l.maxCapacity != nil && target > *l.maxCapacity {
+		target = *l.maxCapacity
+	}
+	if target < 0 {
+		return 0
+	}
+
+	return target
 }
 
 func (l *Listener) refreshAdoptedCapacity(ctx context.Context) error {
@@ -2040,6 +2100,21 @@ func (l *Listener) renew(ctx context.Context, lease *alloc.Lease) renewal {
 // tier holds the capacity. Advertising zero is a correct answer: it tells GitHub
 // to assign this tier no work, which is exactly true.
 func (l *Listener) refillEscrow(ctx context.Context) error {
+	return l.refillEscrowTo(ctx, math.MaxInt)
+}
+
+// rebalanceEscrow keeps ordinary polling at the assigned demand plus one
+// discovery slot. Message handling may still call refillEscrow after GitHub has
+// offered real work; acquiring promises count toward the target, and the next
+// poll returns any genuinely unused excess here.
+func (l *Listener) rebalanceEscrow(ctx context.Context) error {
+	target := l.targetCapacity()
+	l.releaseIdleEscrowAbove(ctx, target)
+
+	return l.refillEscrowTo(ctx, target)
+}
+
+func (l *Listener) refillEscrowTo(ctx context.Context, target int) error {
 	room, err := l.alloc.Headroom(ctx, l.tier)
 	if err != nil {
 		return fmt.Errorf("server: headroom for %s: %w", l.tier, err)
@@ -2047,6 +2122,11 @@ func (l *Listener) refillEscrow(ctx context.Context) error {
 
 	// Headroom already excludes what this listener holds — those leases are open
 	// in the ledger — so this tops the total up rather than doubling it.
+	if target != math.MaxInt {
+		if ceiling := target - l.capacity(); room > ceiling {
+			room = ceiling
+		}
+	}
 
 	if l.maxCapacity != nil {
 		// Capped BEFORE the escrow, not after. Escrowing capacity this listener
@@ -2259,9 +2339,10 @@ func (l *Listener) handle(ctx context.Context, msg *Message) error {
 	} else {
 		// Topped up between the release and the acquisition, so the slot just freed
 		// is available to back the offer that arrived with it. It may lose the race
-		// to another tier — escrow is first-come — and that is a fairness question,
-		// not a correctness one: what matters is that billet does not claim work it
-		// cannot back. See TestAGreedyTierCanTakeTheWholeBudget.
+		// to another tier — escrow is first-come — but idle listeners ordinarily
+		// keep only a discovery slot, and configured floors protect guarantees under
+		// real contention. What matters here is that billet never claims work it
+		// cannot back.
 		if len(msg.Available) > 0 {
 			if err := l.refillEscrow(ctx); err != nil {
 				return err

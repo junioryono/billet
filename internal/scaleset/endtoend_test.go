@@ -316,9 +316,9 @@ func TestAdvertisedCapacityReachesTheWireAsAHeader(t *testing.T) {
 			"repeatedly", polls.Load())
 	}
 
-	if got := advertised.Load(); got != 2 {
-		t.Errorf("advertised %d runners; the budget is 8 vCPU and the tier is 4, so the "+
-			"escrow is 2 and that is what GitHub must be told", got)
+	if got := advertised.Load(); got != 1 {
+		t.Errorf("advertised %d runners; an idle tier must send its one escrow-backed "+
+			"discovery slot rather than holding the whole deployment", got)
 	}
 }
 
