@@ -68,6 +68,14 @@ func macStatus(ctx context.Context, cfgPath string) error {
 		printMacService(ctx, c, s.role, s.label)
 	}
 
+	// THE TWO SCHEDULED AGENTS, reported for what they are: installed and
+	// loaded, or not. Neither holds a process between runs, so a "not running"
+	// here is the ordinary state and the enablement line is the one that matters.
+	upgrade, images := c.Scheduled()
+
+	printMacService(ctx, c, "upgrade", upgrade)
+	printMacService(ctx, c, "images", images)
+
 	return nil
 }
 

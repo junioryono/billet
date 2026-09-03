@@ -6,21 +6,45 @@ The rule underneath all of it: **no ordinary update terminates a running job.** 
 
 ## The normal case
 
+Nothing. A deployment that says nothing in `release:` follows the signed `stable` channel and updates itself: within an hour of the channel advancing, the control plane records a rollout to that release, the scheduled updater on each controller host upgrades the controller, the coordinator converges every node, and the daily image refresh on each node takes up the guest image published for it. `billet rollout status` says where it has got to, and `billet status` reports every host's release beside its protocol.
+
+Three things make that safe to leave alone. A rollout drains every host for as long as its work takes and never ends a job. A candidate is verified before it is committed and rolled back when it is not. And the ledger refuses to be served by a release older than the newest that has served it, so an unattended update cannot go backwards (see [Downgrades](#downgrades)).
+
+To turn it off:
+
+```yaml
+release:
+  automatic: false
+```
+
+With that, the channel is still followed but nothing acts on it: `billet rollout start` records the decision, and the updaters on the hosts leave a recorded rollout to an operator. To start one by hand, on a deployment with automatic updates on or off:
+
 ```
 billet rollout start
 billet rollout status
 ```
 
-`start` resolves the signed `stable` channel to one immutable release, records its manifest digest as the target, and lists every registered host. `status` says where each one has got to. Nothing else is required: the control plane's rollout coordinator converges the fleet against that target, one host at a time by default.
+`start` resolves the signed `stable` channel to one immutable release, records its manifest digest as the target, and lists every registered host. `status` says where each one has got to. The control plane's rollout coordinator converges the fleet against that target, one host at a time by default. An automatic start does exactly what `start` does, through the same resolution and the same compatibility preflight, and records itself as `automatic (stable channel)`.
 
-**The controller goes first, and billet observes rather than performs that half.** A process cannot install its own successor, so the control plane's own upgrade is `billet host-upgrade` on its host — run by you, or by whatever automation you already have. What the coordinator does is *notice* when the running binary is the target, record it, and only then begin telling nodes. That ordering is not a preference: the node wire's bridge runs one way, so a node rolled ahead of its control plane is refused and stays refused.
+**The controller goes first, and a separate root process performs that half.** A process cannot install its own successor, and the control plane runs unprivileged, so on every host with a control plane the package enables `billet-upgrade.timer`, which every five minutes runs `billet host-upgrade --from-rollout`: it reads the rollout the ledger records and, if the target is a release this host is not running, runs the transaction below with the rollout's own digest and generation. On a Mac the same thing is the `sh.billet.upgrade` launch agent `billet local up` installs. It acts only on a decision the ledger holds and never on the channel, so `automatic: false` stops it too. What the coordinator does is *notice* when the running binary is the target, record it, and only then begin telling nodes. That ordering is not a preference: the node wire's bridge runs one way, so a node rolled ahead of its control plane is refused and stays refused.
 
-A rollout is a decision, not a script. Run `start` twice and you get the rollout that is already running, not a second one. A control-plane restart resumes the same rollout against the same digest. If the channel advances while a rollout is underway, the rollout does not move — it is pinned to the digest it resolved, which is the whole reason the digest is what gets persisted.
+A rollout is a decision, not a script. Run `start` twice and you get the rollout that is already running, not a second one. A control-plane restart resumes the same rollout against the same digest. If the channel advances while a rollout is underway, the rollout does not move — it is pinned to the digest it resolved, which is the whole reason the digest is what gets persisted, and the automatic starter starts nothing over an open one.
+
+**What an automatic start refuses.** It never downgrades: a channel names only immutable releases and its publisher refuses to move it backwards, and a pin older than the running release is a decision `billet rollout start --version <tag> --allow-downgrade` makes by name. It never restarts a target an operator aborted: `billet rollout abort` records a reason against exactly those bytes, and the channel moving on to a different release is what ends that. It never starts over a fleet that already runs the target, and a host that reports no release counts as not on it. Each refusal is logged once every six hours rather than every tick.
 
 To install an exact release instead, and follow nothing:
 
 ```
 billet rollout start --version v0.4.0
+```
+
+**A maintenance window bounds when an automatic rollout may begin**, in UTC, and never stops one:
+
+```yaml
+release:
+  maintenance_window:
+    start: "02:00"
+    end: "04:00"
 ```
 
 ## What a host actually does
@@ -208,12 +232,31 @@ Without `--yes` it only reports. What it reports is every affected lease, its ti
 
 Leases a *node* holds — `custody`, `teardown`, `quarantine` — are reported and not touched. Their compute is a node's proof obligation, and `billet leases release --force` is what resolves one, through the holder rather than underneath it.
 
+## Downgrades
+
+The ledger records the newest release that has served it, and every open of the ledger refuses a binary provably older than that: the control plane's, an operator command's, and the upgrade probe's. The schema check that existed before caught only a pair of releases that differ in a migration, which most do not, so a stale pin converged by hand or an archive restored beside the wrong binary served rows a newer release had written with nothing anywhere saying so. Only the control plane moves the mark forward, so `billet check` run from a laptop carrying a newer binary cannot fence the running server out of its own restart. A development build cannot be ordered against a release and is neither refused nor recorded.
+
+To run an older release on purpose:
+
+```
+billet host-upgrade --version v0.4.0 --allow-downgrade        # one host
+billet rollout start --version v0.4.0 --allow-downgrade       # the fleet
+```
+
+The transaction lowers the mark after the ledger snapshot, so a rollback of the downgrade restores the refusal with the rest of the ledger. Without the flag a downgrade is refused before anything drains, naming the flag.
+
+Nodes record the highest release they have ever registered with, and `billet status` marks a host running something older than that as `DOWNGRADED`. That is a note rather than a refusal: a rollout that failed on a host and rolled it back produces exactly that shape, and the coordinator depends on seeing the older registration. `billet rollout status` says whether a rollout did it.
+
+## Guest images
+
+A release is a binary; the runner a job runs in is a guest image billet publishes weekly, and GitHub stops queueing work to a runner about thirty days after a newer one ships. Two things keep the image current without anybody pulling. The transaction itself, on a firecracker host, asks the candidate which configured images speak its guest contract and pulls, verifies and promotes a generation for each that does not, with the node stopped and the server still up, exactly where the Ansible role has always done it. And the package enables `billet-images.timer`, which daily runs `billet images refresh`: it pulls, verifies and promotes only when the signed image channel names an image built after the newest generation imported, then reaps to three verified generations per guest contract. A tart node's refresh pulls every configured image that is absent and nothing more. `automatic: false` stops the refresh too. [Guest images](guest-images.md) has the rest.
+
 ## Configuration
 
 ```yaml
 release:
   channel: stable        # or candidate
-  automatic: false       # let the control plane start a rollout by itself
+  automatic: false       # the one sentence that turns automatic updates off
   maintenance_window:    # when an automatic rollout may BEGIN, UTC
     start: "02:00"
     end: "04:00"
@@ -228,9 +271,24 @@ release:
 
 Setting both is an error rather than a precedence rule. A deployment that pinned a version *and* named a channel said two things, and guessing which you meant is how a deployment that believes itself pinned quietly follows a pointer.
 
-`automatic` is off by default. An automatic rollout drains hosts and replaces binaries; a deployment that had not decided to allow that should not begin doing it because it upgraded to a billet that could.
+`automatic` is on unless you write `false`. This is the one zero value in the file that does not refuse, and it is on because the failure an unattended deployment actually meets is the update that never happens: a runner GitHub stops queueing to, a fix that shipped and never arrived. Everything around it is what makes that safe to default: the drain, the verified candidate and its rollback, and the ledger's refusal to go backwards.
 
 A maintenance window bounds when a rollout may **begin**. It never stops one — a window that could interrupt a rollout would be a clock authorising a teardown, which is the thing this whole area refuses. It is UTC because a fleet spans machines whose local time is not one thing, and because a local window is unstable across a DST transition in exactly the quiet hour you picked.
+
+## What updates itself, and what does not
+
+| | Updated by |
+|---|---|
+| The control plane, on Linux | `billet-upgrade.timer`, enabled by the package or installed by the Ansible host role |
+| The control plane, on a Mac | the `sh.billet.upgrade` agent `billet local up` installs |
+| A PostgreSQL controller, single or active-passive | the same timer on every controller host; see [PostgreSQL and active-passive controllers](../deploying/postgres-and-active-passive.md) for what its transaction skips |
+| Every node, Linux or Mac | the coordinator's dispatch, through the node's own updater |
+| Guest images on a firecracker node | the transaction, and `billet-images.timer` daily |
+| Guest images on a tart node | the transaction and the `sh.billet.images` agent, pulling only what is absent |
+| A host installed by `install.sh` with no units | nothing; the units are what an updater stops and starts, and the script installs none |
+| An EC2 AMI or a CodeBuild image | nothing; `billet ami build` remains an operator's step |
+| The published Actions | the ref you write: `@v0` moves with each release |
+| The Terraform modules | nothing; a `?ref=` in your repository is yours to move |
 
 ## The consumer paths
 

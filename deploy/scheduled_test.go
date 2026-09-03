@@ -60,6 +60,42 @@ func TestTheImagesUnitRefreshesDailyAsRoot(t *testing.T) {
 	}
 }
 
+// THE MAC'S SCHEDULED AGENTS ARE ONESHOTS ON A SCHEDULE, NOT SERVICES. A
+// KeepAlive on either would have launchd restart a oneshot the instant it
+// exited, forever; a missing schedule would run it once at login and never
+// again, which reads exactly like a working schedule.
+func TestTheMacScheduledAgentsAreOneshotsOnASchedule(t *testing.T) {
+	t.Parallel()
+
+	for name, agent := range map[string]struct{ body, schedule, program string }{
+		deploy.UpgradeAgentName: {deploy.UpgradeAgent, "StartInterval",
+			"<string>host-upgrade</string>"},
+		deploy.ImagesAgentName: {deploy.ImagesAgent, "StartCalendarInterval",
+			"<string>refresh</string>"},
+	} {
+		if strings.Contains(agent.body, "KeepAlive") {
+			t.Errorf("%s carries KeepAlive, which restarts a oneshot the instant it exits", name)
+		}
+
+		for _, want := range []string{
+			agent.schedule, agent.program, "<key>RunAtLoad</key>",
+			"/usr/local/bin/billet", "/usr/local/etc/billet/billet.yaml",
+			"/opt/homebrew/bin:/usr/local/bin",
+		} {
+			if !strings.Contains(agent.body, want) {
+				t.Errorf("%s does not carry %q", name, want)
+			}
+		}
+	}
+
+	// THE UPGRADE AGENT CARRIES THE SAME DRAIN GRACE AS THE SERVICES, because a
+	// transaction that has booted the node out is waiting on that node's jobs.
+	if !strings.Contains(deploy.UpgradeAgent, "<integer>88200</integer>") {
+		t.Errorf("%s does not carry the 88200 second ExitTimeOut the drain needs",
+			deploy.UpgradeAgentName)
+	}
+}
+
 // requireScheduledPair holds what every oneshot-and-timer pair billet ships has
 // to satisfy: the service is not itself enabled (a oneshot enabled at boot runs
 // once per boot and reads like a schedule), the timer is what `systemctl enable`

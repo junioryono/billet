@@ -594,3 +594,21 @@ func OpenPostgresAdmin(ctx context.Context, stateDir, dsn string, opts ...OpenOp
 func OpenPostgresStandby(ctx context.Context, stateDir, dsn string, opts ...OpenOption) (*DB, error) {
 	return openDir(ctx, stateDir, newPostgresBackend(dsn), openMode{standby: true}.with(opts))
 }
+
+// OpenPostgresProbe opens the ledger for the host upgrade's quiescent probe on a
+// deployment whose ledger is a database billet does not hold.
+//
+// THE STANDBY'S OPEN, ALLOWED ACROSS THE FENCE. A candidate probing an external
+// ledger may prove exactly what a standby proves — the DSN resolves, the schema
+// is one it knows and not ahead of it, the deployment binding agrees, the
+// release watermark admits it — and may claim nothing and migrate nothing,
+// because the migration is the controller claim's right and happens when the
+// candidate serves. Every write is refused, structurally, the way a standby's
+// is. What it adds over a standby is crossing a host-upgrade fence, which the
+// transaction may have raised in this host's identity directory; the fence
+// reaches only local handles, so on this backend it is a courtesy rather than
+// the exclusion it is on SQLite.
+func OpenPostgresProbe(ctx context.Context, stateDir, dsn string, opts ...OpenOption) (*DB, error) {
+	return openDir(ctx, stateDir, newPostgresBackend(dsn),
+		openMode{standby: true, maintenanceProbe: true}.with(opts))
+}

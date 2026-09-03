@@ -1,0 +1,27 @@
+# billet host upgrade, from the recorded rollout. Rendered by the
+# junioryono.billet.host role; the packaged unit in billet's deploy/ directory
+# is the same unit, and tests/unit-parity.yml holds the two together.
+#
+# THE ROOT EXECUTOR THE CONTROL PLANE CANNOT BE. A rollout is server-first and
+# billet-server runs unprivileged, so this is what replaces the binary on a
+# controller host: it acts ONLY on a rollout the ledger already records, never
+# on the channel, and exits doing nothing under `release: {automatic: false}`.
+# The role installs it wherever a server runs and enables it when
+# billet_automatic_updates is true.
+[Unit]
+Description=billet host upgrade, from the recorded rollout
+Documentation=https://billet.readthedocs.io/en/latest/operating/upgrades.html
+After=network-online.target billet-server.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+
+ExecStart=/usr/bin/billet host-upgrade --from-rollout --config /etc/billet/billet.yaml
+
+# THE DRAIN IS THE BOUND, AND IT IS UNBOUNDED: sized like the service units'
+# TimeoutStopSec, and never zero.
+TimeoutStartSec=88200

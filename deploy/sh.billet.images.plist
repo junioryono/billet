@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  billet guest image refresh, for a Mac.
+
+  INSTALLED BY `billet local up`, beside sh.billet.upgrade, and the analogue of
+  billet-images.timer. Once a day it runs `billet images refresh`, which on a
+  tart node pulls every image the tiers name that is not yet in tart's store —
+  and only those: a tart tier names an OCI image by tag, and re-pulling tens of
+  gigabytes on a schedule for a tag that may not have moved is a decision a
+  person makes. With `release: {automatic: false}` in billet.yaml it exits
+  saying so.
+
+  A LAUNCH AGENT as the operator, because tart's image store is per-user and
+  root has none of the images the node boots.
+
+    launchctl bootout gui/$(id -u)/sh.billet.images
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>sh.billet.images</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/billet</string>
+        <string>images</string>
+        <string>refresh</string>
+        <string>--config</string>
+        <string>/usr/local/etc/billet/billet.yaml</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Daily, at a fixed minute launchd spreads nothing around; two Macs in
+         one deployment pulling at 04:23 is two downloads, not a fleet. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>4</integer>
+        <key>Minute</key>
+        <integer>23</integer>
+    </dict>
+
+    <!-- A pull is tens of gigabytes over the network into tart's store; three
+         hours is generous and still a bound. -->
+    <key>ExitTimeOut</key>
+    <integer>10800</integer>
+
+    <key>StandardOutPath</key>
+    <string>/usr/local/var/log/billet/images.log</string>
+    <key>StandardErrorPath</key>
+    <string>/usr/local/var/log/billet/images.log</string>
+</dict>
+</plist>

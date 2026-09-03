@@ -113,7 +113,7 @@ Per-host policy, not a roster: `name`, `provider` (decides only whether an unpin
 
 ## `release`
 
-`channel` (`stable` or `candidate`) or `version` (an exact tag or a 40-hex commit; `latest` and `main` are refused; setting both is an error), `automatic` (off by default), `maintenance_window.start`/`end` (HH:MM UTC; bounds when an automatic rollout may begin and never stops one), `signing_identity` and `signing_issuer` (both or neither).
+`channel` (`stable` or `candidate`) or `version` (an exact tag or a 40-hex commit; `latest` and `main` are refused; setting both is an error), `automatic` (on unless written `false`; the one switch for the control plane starting rollouts, the hosts' scheduled updaters acting on them, and the daily guest-image refresh), `maintenance_window.start`/`end` (HH:MM UTC; bounds when an automatic rollout may begin and never stops one), `signing_identity` and `signing_issuer` (both or neither; honoured by `rollout start`, `host-upgrade` and the automatic starter alike).
 
 ## Rules that are not visible in the schema
 

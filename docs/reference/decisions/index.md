@@ -14,6 +14,7 @@ adr-006-rollouts
 adr-007-codebuild-provider
 adr-008-state-backends
 adr-009-controller-election
+adr-010-automatic-updates
 ```
 
 | Record | Decides |
@@ -27,3 +28,4 @@ adr-009-controller-election
 | [ADR-007](adr-007-codebuild-provider.md) | the CodeBuild backend, and why it does not use CodeBuild's own Actions runner integration |
 | [ADR-008](adr-008-state-backends.md) | SQLite and PostgreSQL behind one contract, with one query set serving both engines |
 | [ADR-009](adr-009-controller-election.md) | the controller election: a session advisory lock plus an epoch fence, and no failure detector |
+| [ADR-010](adr-010-automatic-updates.md) | why a deployment updates itself by default, how the controller's own upgrade is carried out by a root timer on Linux and a launch agent on a Mac, what the transaction skips on a PostgreSQL ledger, and the release watermark that stops an unattended update going backwards |

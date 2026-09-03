@@ -303,37 +303,95 @@
         )
       }}
 
-# THE TRANSACTIONAL UPGRADE IS NOT WRITTEN FOR AN EXTERNAL LEDGER, and refusing
-# here is the difference between a sentence and a wedged host.
+# A DOWNGRADE IS REFUSED BEFORE THE DRAIN, unless asked for by name. The
+# ledger's release watermark would refuse an older candidate at the transaction's
+# probe and roll it back — after the node had drained, the server had stopped
+# and the binary had been hidden, on every converge until the pin moved. The two
+# binaries' own `version` output answers the question for nothing, so it is
+# asked here. Only a proved order refuses: a development build reports no
+# release tag and is neither refused nor waved through on that basis.
+- name: Read the installed and candidate releases
+  ansible.builtin.command:
+    argv:
+      - "{{ item }}"
+      - version
+  loop:
+    - /usr/bin/billet
+    - "{{ billet_candidate_source }}"
+  register: billet_release_of
+  changed_when: false
+  check_mode: false
+  when:
+    - billet_binary_upgrade | default(false)
+    - not billet_interrupted_upgrade | bool
+    - billet_installed_binary.stat.exists
+    - billet_candidate_selected | bool
+    - not ansible_check_mode
+  become: true
+
+- name: Refuse a converge that would downgrade this host
+  vars:
+    # `billet version` prints "billet vX.Y.Z ..." on its first line; the second
+    # word is the release. Sliced rather than indexed so a line with one word
+    # reads as no release instead of an error naming neither binary.
+    billet_installed_release: "{{ (billet_release_of.results[0].stdout_lines[0] | default('') | split)[1:2] | join }}"
+    billet_candidate_release: "{{ (billet_release_of.results[1].stdout_lines[0] | default('') | split)[1:2] | join }}"
+    billet_release_tag: '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+  ansible.builtin.assert:
+    that:
+      - billet_allow_downgrade | bool
+        or not (billet_installed_release is match(billet_release_tag))
+        or not (billet_candidate_release is match(billet_release_tag))
+        or (billet_candidate_release | regex_replace('^v', '')) is version(billet_installed_release | regex_replace('^v', ''), '>=')
+    fail_msg: >-
+      This host runs {{ billet_installed_release }} and this converge would
+      install {{ billet_candidate_release }}, which is older. A rollout has
+      most likely moved the fleet past the pin in billet_version; leave
+      billet_version and billet_binary_src empty so an ordinary converge keeps
+      what is installed, or set billet_allow_downgrade: true in the same run as
+      a pin you mean. Nothing was drained.
+  when:
+    - billet_binary_upgrade | default(false)
+    - not billet_interrupted_upgrade | bool
+    - billet_installed_binary.stat.exists
+    - billet_candidate_selected | bool
+    - not ansible_check_mode
+
+# THIS ROLE'S TRANSACTION IS THE SQLITE ONE, and refusing here is the difference
+# between a sentence and a wedged host.
 #
 # The transaction works by fencing the deployment, SNAPSHOTTING the ledger,
-# installing the candidate, and restoring that snapshot if anything fails. None
-# of that exists for a database billet does not operate: `openStateMaintenance`
-# refuses a PostgreSQL ledger outright, so the quiescent `--upgrade-probe` this
-# role runs mid-transaction fails — several irreversible steps in, with the old
-# binary already removed and the fence already raised.
+# installing the candidate, and restoring that snapshot if anything fails. This
+# role does not carry the external-ledger shape — billet's own
+# `billet host-upgrade` does: it fences, snapshots and migrates nothing on a
+# PostgreSQL ledger, proves the candidate can open what it inherits, and lets
+# the migration happen when the candidate takes the controller claim. That is
+# what billet-upgrade.timer runs on every controller host, so a PostgreSQL
+# controller on automatic updates is upgraded by billet rather than by this
+# role, and the role's part is the config, the units, the timers and
+# {{ billet_server_environment_path }}.
 #
-# REFUSED AT INPUT VALIDATION INSTEAD, before anything is claimed or stopped.
-# What an operator does instead is exactly what docs/deploying/postgres-and-active-passive.md already
-# says: upgrade a PostgreSQL controller with the service stopped. Once the binary
-# on disk matches the candidate, `billet_binary_upgrade` is false and an ordinary
-# converge does everything else this role does.
+# REFUSED AT INPUT VALIDATION, before anything is claimed or stopped. Once the
+# binary on disk matches the candidate, `billet_binary_upgrade` is false and an
+# ordinary converge does everything else this role does.
 #
 # A FIRST INSTALL IS A BINARY UPGRADE, so this covers it too — which is the
-# reason the message names installation rather than only upgrading.
+# reason the message names installation as well.
 - name: Refuse a transactional binary change against an external ledger
   ansible.builtin.assert:
     that:
       - not (billet_binary_upgrade | default(false))
     fail_msg: >-
-      This host's ledger is {{ billet_configured_state_backend }} and the
-      transactional binary upgrade is not implemented for it: it snapshots and
-      restores the state directory, which an external ledger does not have, so
-      the quiescent probe in the middle of the transaction would fail with the
-      old binary already removed. Install or replace /usr/bin/billet yourself
-      with billet-server and billet-node STOPPED, then converge this role again —
-      with the binary already in place the role does everything else, including
-      the config, the units and {{ billet_server_environment_path }}. See
+      This host's ledger is {{ billet_configured_state_backend }} and this
+      role's transaction snapshots a state directory an external ledger does
+      not have. billet upgrades such a host itself: billet-upgrade.timer runs
+      `billet host-upgrade --from-rollout` against the rollout the ledger
+      records, fencing, snapshotting and migrating nothing and letting the
+      candidate migrate when it claims. For a first install, put /usr/bin/billet
+      in place yourself with billet-server and billet-node STOPPED, then converge
+      this role again; with the binary already in place the role does
+      everything else, including the config, the units, the timers and
+      {{ billet_server_environment_path }}. See
       docs/deploying/postgres-and-active-passive.md.
   when:
     - billet_configured_state_backend != 'sqlite'

@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted. Implemented.
+Accepted. Implemented. [ADR-010](adr-010-automatic-updates.md) adds the half this record left to an operator: the decision is now made by the control plane when the channel advances, and the controller's own upgrade is carried out by a scheduled root process.
 
 ## Context
 

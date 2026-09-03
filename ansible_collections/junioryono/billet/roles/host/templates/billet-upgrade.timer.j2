@@ -1,0 +1,16 @@
+# When billet-upgrade.service looks. Rendered by the junioryono.billet.host
+# role; the packaged timer is the same, and tests/unit-parity.yml holds them
+# together.
+[Unit]
+Description=billet host upgrade, every five minutes
+Documentation=https://billet.readthedocs.io/en/latest/operating/upgrades.html
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+RandomizedDelaySec=1min
+
+Unit=billet-upgrade.service
+
+[Install]
+WantedBy=timers.target

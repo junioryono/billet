@@ -45,6 +45,8 @@ description: "The control-plane ledger in internal/state: SQLite and PostgreSQL 
 
 **Locks and fences are four different things.** The directory lock excludes a second control plane. `LockDeployment` excludes a second process on the same deployment identity (a copied state directory locks happily, because a copy is a different inode); failing to place it is an error rather than a downgrade (`allow_unlocked_deployment` is the explicit opt-in), it never lives in a cache directory (unlinking a held lock file detaches the path from the inode and the next process locks a fresh file), a shared `lock_dir` must be setgid and the lock's gid must match the directory's, and it is claimed before `state.Open` or a process about to be refused first migrates the ledger. The maintenance fence closes the ledger to new handles and to one already open (`Tx` and `View` consult it on entry); `WriteMaintenanceFence` reports whether this call created it, because only the creator may clear it. `WriterBarrier` proves a transaction that began before the fence has finished. `PeekLedger`, `PeekAdmission`, `PeekMigrations` and `PeekDeploymentID` read without a lock, a migration or the fence, for callers that hold the lock already.
 
+**The release watermark refuses a proved downgrade at every open, and only the control plane raises it.** Migration 48 adds the `release_watermark` singleton and `nodes.highest_release`. Every `Open*` takes `...OpenOption`; `WithRunningRelease` names the binary, and an open that names nothing gets neither the check nor the record (which is what every test opening a throwaway ledger wants; `cmd/billet/ledger.go` passes it on all six helpers, asserted structurally). `enforceReleaseWatermark` runs after migrate or verify, guarded by `releaseWatermarkApplied` because a standby or a probe may be looking at a schema before 48: a proved older release is `ErrReleaseBehind` for any handle; a proved newer one is recorded only when `openMode.records()` (not admin, not standby, not the maintenance probe) and by `ClaimController` at a standby's promotion; could-not-tell records nothing. `SetReleaseWatermark` is the one write that lowers it and is refused off a maintenance handle. `OpenPostgresProbe` is the standby's open with the fence bypass: verify-not-ahead, no claim, no migration, every `Tx` refused, for the host transaction's probe on an external ledger.
+
 **The ledger is not authoritative for cache generation pointers.** Those live in the site store (`billet-storage-and-cache`).
 
 ## Measured facts
@@ -54,7 +56,7 @@ description: "The control-plane ledger in internal/state: SQLite and PostgreSQL 
 - sqlc's two engines: byte-identical Go with `BIGINT` casts; modernc.org/sqlite binds `$N` positionally, a repeated `$1` once, and a `$2` appearing before `$1` correctly.
 - A single em dash in a query comment shifted every parameter offset after it.
 - Splitting the deployment bind from the epoch: the incumbent's next write came back "host-b now holds it at epoch 2".
-- The lease deregistration column (migration 30), compute barrier (37), rollout (39-42), controller claim (44), deployment binding (45), CodeBuild sweep (46), holder incarnation (47).
+- The lease deregistration column (migration 30), compute barrier (37), rollout (39-42), controller claim (44), deployment binding (45), CodeBuild sweep (46), holder incarnation (47), release watermark and highest node release (48).
 
 ## Where the tests are
 

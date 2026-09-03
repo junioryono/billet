@@ -1,0 +1,15 @@
+# When billet-images.service runs. Rendered by the junioryono.billet.host role;
+# the packaged timer is the same, and tests/unit-parity.yml holds them together.
+[Unit]
+Description=billet guest image refresh, daily
+Documentation=https://billet.readthedocs.io/en/latest/operating/guest-images.html
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+
+Unit=billet-images.service
+
+[Install]
+WantedBy=timers.target

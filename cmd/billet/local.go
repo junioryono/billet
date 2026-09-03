@@ -5,9 +5,11 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"os/exec"
 	"sort"
 	"strings"
 
+	"github.com/junioryono/billet/deploy"
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/initconfig"
 	"github.com/junioryono/billet/internal/lifeops"
@@ -132,8 +134,38 @@ func cmdLocalStatus(ctx context.Context, args []string) error {
 
 	printService("server", report.Server)
 	printService("node", report.Node)
+	printTimers(ctx)
 
 	return nil
+}
+
+// printTimers reports whether the scheduled updaters are enabled.
+//
+// REPORTED, NEVER MANAGED, for the backup timer's reason: `up` and `down` own
+// the two services whose order is their safety content, and a timer is a
+// oneshot with nothing to drain. What an operator needs to see is that a host
+// which stopped acting on rollouts is one whose timer somebody disabled — the
+// package enables both, and a disabled one looks exactly like a working one
+// from every other angle.
+func printTimers(ctx context.Context) {
+	for _, timer := range []string{deploy.UpgradeTimerName, deploy.ImagesTimerName} {
+		out, err := exec.CommandContext(ctx, "systemctl", "is-enabled", "--", timer).Output()
+
+		state := strings.TrimSpace(string(out))
+
+		switch state {
+		case "":
+			if err != nil {
+				state = "enablement unknown (" + err.Error() + ")"
+			} else {
+				state = "enablement unknown"
+			}
+		case "not-found":
+			state = "not installed; the package ships it"
+		}
+
+		fmt.Printf("%-8s %s %s\n", "updates", timer, state)
+	}
 }
 
 // printFileFacts reports one path's ownership and mode, which is the pair that

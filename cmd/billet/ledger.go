@@ -120,17 +120,18 @@ func verifyLedgerIdentity(ctx context.Context, cfg *config.Config, db *state.DB)
 // crosses a host-upgrade fence without admitting operator or workload writes.
 func openStateMaintenance(ctx context.Context, cfg *config.Config) (*state.DB, error) {
 	if cfg.Server.LedgerBackend() == config.StatePostgres {
-		// THE FENCE IS A FILE IN THE IDENTITY DIRECTORY, so it applies here too —
-		// what does not yet apply is the rest of the transactional host upgrade,
-		// which stops a service, snapshots a ledger and puts it back. None of
-		// that is written for an external ledger, and a probe that crossed the
-		// fence as though it were would be the one thing standing between a
-		// half-finished upgrade and a live deployment.
-		return nil, fmt.Errorf(
-			"the transactional host upgrade is not implemented for a %s ledger; it snapshots "+
-				"and restores the state directory, and an external ledger is your database's "+
-				"own backup. Upgrade this controller with the service stopped",
-			config.StatePostgres)
+		// A PROBE, NOT A MAINTENANCE HANDLE. billet copies no PostgreSQL ledger,
+		// so the transaction there fences, snapshots and migrates nothing; what
+		// the candidate proves is that it could serve what it inherits, which is
+		// the standby's question. The handle it gets can write nothing and claim
+		// nothing, and the migration waits for the candidate's own claim.
+		dsn, err := ledgerDSN(cfg)
+		if err != nil {
+			return nil, err
+		}
+
+		return state.OpenPostgresProbe(ctx, cfg.Server.IdentityDir, dsn,
+			state.WithRunningRelease(version.Version()))
 	}
 
 	return state.OpenMaintenance(ctx, cfg.Server.IdentityDir,

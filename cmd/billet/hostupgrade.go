@@ -13,6 +13,7 @@ import (
 
 	"github.com/junioryono/billet/internal/config"
 	"github.com/junioryono/billet/internal/hostupgrade"
+	"github.com/junioryono/billet/internal/initconfig"
 	"github.com/junioryono/billet/internal/lifeops"
 	"github.com/junioryono/billet/internal/nodeapi"
 	"github.com/junioryono/billet/internal/provenance"
@@ -32,7 +33,7 @@ import (
 // A VAR RATHER THAN A CONST, so a test can own the directory it writes into. The
 // bookkeeping under this path is durable by design and a test that wrote to the
 // real one would be a test that upgrades the machine running it.
-var upgradeRoot = "/var/lib/billet/upgrades"
+var upgradeRoot = hostPathsFor(hostOS).upgradeRoot
 
 // activePointer is the claim one upgrade holds for the duration.
 //
@@ -311,6 +312,13 @@ func startHostUpgrade(ctx context.Context, cfg *config.Config, cfgPath string,
 		return err
 	}
 
+	// A PLATFORM WITH NO HOST IMPLEMENTATION REFUSES BEFORE THE ACK, so a
+	// dispatching node reports the refusal and the rollout backs off rather than
+	// recording a host as draining that could never move.
+	if _, err := newHostFor(cfg, cfgPath, "", nil); err != nil {
+		return err
+	}
+
 	// THE TRANSACTION LOCK IS TAKEN BEFORE THE NETWORK IS, and that ordering is
 	// what bounds a hung updater.
 	//
@@ -327,6 +335,17 @@ func startHostUpgrade(ctx context.Context, cfg *config.Config, cfgPath string,
 	}
 
 	defer tx.release()
+
+	// A BINARY DIRECTORY THIS ACCOUNT CANNOT WRITE IS REFUSED HERE, under the
+	// lock and before the network: on a Mac /usr/local/bin is root-owned until
+	// the setup's chown, and finding that at the rename would be a rollback
+	// after a drain nobody needed. After the lock, so a second start is still
+	// refused for the lock and nothing else.
+	if hostOS == "darwin" {
+		if err := checkBinaryDirWritable(hostPathsFor(hostOS)); err != nil {
+			return err
+		}
+	}
 
 	client := &releasesource.Client{}
 
@@ -455,6 +474,7 @@ func actOnResolved(ctx context.Context, cfg *config.Config, cfgPath string,
 		RolloutID:      target.rolloutID,
 		Generation:     target.generation,
 		AllowDowngrade: target.allowDowngrade,
+		Ledger:         ledgerKindFor(cfg),
 		PID:            os.Getpid(),
 		Step:           hostupgrade.StepClaimed,
 		StartedAt:      time.Now().UTC().Format(time.RFC3339Nano),
@@ -524,7 +544,25 @@ func actOnResolved(ctx context.Context, cfg *config.Config, cfgPath string,
 	fmt.Printf("The node stops first so its compute drains, and that wait is unbounded:\n")
 	fmt.Printf("a job may run for days and nothing here ends one.\n\n")
 
-	return finishHostUpgrade(ctx, journal, newSystemdHost(cfg, cfgPath, staged, journal))
+	host, err := newHostFor(cfg, cfgPath, staged, journal)
+	if err != nil {
+		return err
+	}
+
+	return finishHostUpgrade(ctx, journal, host)
+}
+
+// ledgerKindFor says which shape of transaction a host's ledger needs.
+//
+// EXTERNAL FOR A DATABASE BILLET DOES NOT HOLD, and empty otherwise — a
+// node-only host has no ledger, and a SQLite one is a file the transaction
+// snapshots. The journal carries the answer so a resume runs the same shape.
+func ledgerKindFor(cfg *config.Config) string {
+	if cfg.Server != nil && cfg.Server.LedgerBackend() == config.StatePostgres {
+		return hostupgrade.LedgerExternal
+	}
+
+	return ""
 }
 
 // resumeHostUpgrade continues or unwinds the transaction already on this machine.
@@ -601,8 +639,12 @@ func resumeHostUpgrade(ctx context.Context, cfg *config.Config) error {
 		return err
 	}
 
-	return finishHostUpgrade(ctx, journal,
-		newSystemdHost(cfg, "", filepath.Join(dir, "billet"), journal))
+	host, err := newHostFor(cfg, "", filepath.Join(dir, "billet"), journal)
+	if err != nil {
+		return err
+	}
+
+	return finishHostUpgrade(ctx, journal, host)
 }
 
 // finishHostUpgrade runs the transaction and releases the claim only once the
@@ -1123,29 +1165,31 @@ func stageCandidate(ctx context.Context, client *releasesource.Client,
 // a binary or migrates a database. What IS tested is the sequence, against a fake
 // that records what it was asked to do — see internal/hostupgrade.
 type systemdHost struct {
-	cfg      *config.Config
-	cfgPath  string
+	ledgerHost
+
 	staged   string
 	inspect  *lifeops.Inspector
 	converge *lifeops.Converger
+}
+
+// ledgerHost is the half of a host transaction that has nothing to do with the
+// service manager: the fence, the snapshot, the migration, the provenance
+// record and the candidate's probes.
+//
+// SHARED BY THE systemd AND launchd HOSTS, because these steps are about the
+// ledger and the binary, and a second copy for the second manager is how the two
+// platforms would come to snapshot, migrate or record differently.
+type ledgerHost struct {
+	cfg     *config.Config
+	cfgPath string
 	// downgradeTo is the release the ledger's watermark is lowered to before the
 	// candidate is probed, or empty for an upgrade. Read from the journal so a
 	// resumed transaction keeps the permission the interrupted one was given.
 	downgradeTo string
 }
 
-func newSystemdHost(cfg *config.Config, cfgPath, staged string,
-	journal *hostupgrade.Journal,
-) *systemdHost {
-	inspector := lifeops.NewInspector()
-
-	h := &systemdHost{
-		cfg:      cfg,
-		cfgPath:  cfgPath,
-		staged:   staged,
-		inspect:  inspector,
-		converge: lifeops.NewConverger(inspector),
-	}
+func newLedgerHost(cfg *config.Config, cfgPath string, journal *hostupgrade.Journal) ledgerHost {
+	h := ledgerHost{cfg: cfg, cfgPath: cfgPath}
 
 	if journal != nil && journal.AllowDowngrade {
 		h.downgradeTo = journal.ToVersion
@@ -1154,10 +1198,43 @@ func newSystemdHost(cfg *config.Config, cfgPath, staged string,
 	return h
 }
 
+func newSystemdHost(cfg *config.Config, cfgPath, staged string,
+	journal *hostupgrade.Journal,
+) *systemdHost {
+	inspector := lifeops.NewInspector()
+
+	return &systemdHost{
+		ledgerHost: newLedgerHost(cfg, cfgPath, journal),
+		staged:     staged,
+		inspect:    inspector,
+		converge:   lifeops.NewConverger(inspector),
+	}
+}
+
+// newHostFor picks the host implementation for the service manager this
+// machine runs.
+//
+// THE PLATFORM DECIDES, ONCE. Linux hosts are systemd units and a Mac's are
+// launch agents in the operator's session; both run the same journal through
+// the same order, and only the vocabulary — stop, start, prove, which files are
+// preserved — differs. Anything else is refused here, before a claim is taken.
+func newHostFor(cfg *config.Config, cfgPath, staged string,
+	journal *hostupgrade.Journal,
+) (hostupgrade.Host, error) {
+	switch hostOS {
+	case "linux":
+		return newSystemdHost(cfg, cfgPath, staged, journal), nil
+	case "darwin":
+		return newLaunchdHost(cfg, cfgPath, staged, journal), nil
+	default:
+		return nil, fmt.Errorf("billet host-upgrade replaces billet under systemd or launchd, "+
+			"and this host is %s; upgrade it the way it was installed", hostOS)
+	}
+}
+
 const (
 	nodeUnit   = "billet-node.service"
 	serverUnit = "billet-server.service"
-	installed  = "/usr/bin/billet"
 )
 
 // StopNode stops the node and proves it stopped.
@@ -1318,7 +1395,7 @@ func (h *systemdHost) PreserveCurrent(_ context.Context, dir string) error {
 // nothing, and a rollout would lose the one fact it had about it.
 func preservedPaths() []string {
 	return []string{
-		installed,
+		installedBinary,
 		"/etc/systemd/system/" + nodeUnit,
 		"/etc/systemd/system/" + serverUnit,
 		"/etc/billet/billet.yaml",
@@ -1328,15 +1405,15 @@ func preservedPaths() []string {
 
 // HideBinary removes the installed executable.
 func (h *systemdHost) HideBinary(_ context.Context) error {
-	if err := os.Remove(installed); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("hide %s: %w", installed, err)
+	if err := os.Remove(installedBinary); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("hide %s: %w", installedBinary, err)
 	}
 
 	return nil
 }
 
 // Fence makes already-open operator handles refuse transactions.
-func (h *systemdHost) Fence(ctx context.Context, reason string) error {
+func (h *ledgerHost) Fence(ctx context.Context, reason string) error {
 	if h.cfg.Server == nil {
 		return nil
 	}
@@ -1351,7 +1428,7 @@ func (h *systemdHost) Fence(ctx context.Context, reason string) error {
 	return state.WriterBarrier(ctx, h.cfg.Server.IdentityDir)
 }
 
-func (h *systemdHost) ClearFence(_ context.Context, reason string) error {
+func (h *ledgerHost) ClearFence(_ context.Context, reason string) error {
 	if h.cfg.Server == nil {
 		return nil
 	}
@@ -1360,7 +1437,7 @@ func (h *systemdHost) ClearFence(_ context.Context, reason string) error {
 }
 
 // SnapshotLedger writes a complete copy of the ledger.
-func (h *systemdHost) SnapshotLedger(ctx context.Context, dest string) error {
+func (h *ledgerHost) SnapshotLedger(ctx context.Context, dest string) error {
 	if h.cfg.Server == nil {
 		return nil
 	}
@@ -1394,7 +1471,7 @@ func (h *systemdHost) SnapshotLedger(ctx context.Context, dest string) error {
 }
 
 // RestoreLedger puts the snapshot back.
-func (h *systemdHost) RestoreLedger(_ context.Context, from string) error {
+func (h *ledgerHost) RestoreLedger(_ context.Context, from string) error {
 	if h.cfg.Server == nil {
 		return nil
 	}
@@ -1404,7 +1481,7 @@ func (h *systemdHost) RestoreLedger(_ context.Context, from string) error {
 
 // InstallCandidate puts the staged binary in place.
 func (h *systemdHost) InstallCandidate(_ context.Context) error {
-	return copyFile(h.staged, installed)
+	return copyFile(h.staged, installedBinary)
 }
 
 // RecordInstalled writes which manifest produced the binary now in place.
@@ -1413,7 +1490,7 @@ func (h *systemdHost) InstallCandidate(_ context.Context) error {
 // staged copy, so the record describes what a reader will actually find. They are
 // the same bytes; hashing the destination is what makes that a fact rather than
 // an assumption about the copy.
-func (h *systemdHost) RecordInstalled(_ context.Context, digest, release string) error {
+func (h *ledgerHost) RecordInstalled(_ context.Context, digest, release string) error {
 	if digest == "" {
 		// AN OPERATOR'S OWN RUN PINS NOTHING, and a record naming no manifest would
 		// be a file every reader has to distrust. Leaving the previous record in
@@ -1426,7 +1503,7 @@ func (h *systemdHost) RecordInstalled(_ context.Context, digest, release string)
 		return nil
 	}
 
-	sum, err := provenance.HashFile(installed)
+	sum, err := provenance.HashFile(installedBinary)
 	if err != nil {
 		return err
 	}
@@ -1441,7 +1518,7 @@ func (h *systemdHost) RecordInstalled(_ context.Context, digest, release string)
 // THROUGH THE CANDIDATE, NOT THIS PROCESS. This binary is the OLD one; opening
 // the ledger here would apply the old build's migrations, which is the opposite
 // of what an upgrade needs. The candidate's own `--upgrade-probe` is what runs.
-func (h *systemdHost) Migrate(ctx context.Context) error {
+func (h *ledgerHost) Migrate(ctx context.Context) error {
 	// THE WATERMARK IS LOWERED BEFORE THE CANDIDATE TOUCHES THE LEDGER, and only
 	// for a downgrade somebody asked for. The snapshot one step back keeps the
 	// higher mark, so a rollback of the downgrade restores the refusal with the
@@ -1459,7 +1536,7 @@ func (h *systemdHost) Migrate(ctx context.Context) error {
 }
 
 // lowerWatermark admits the older candidate to the ledger, when asked to.
-func (h *systemdHost) lowerWatermark(ctx context.Context) error {
+func (h *ledgerHost) lowerWatermark(ctx context.Context) error {
 	if h.downgradeTo == "" || h.cfg.Server == nil {
 		return nil
 	}
@@ -1499,8 +1576,8 @@ func (h *systemdHost) ProbeReady(ctx context.Context) error {
 	return nil
 }
 
-func (h *systemdHost) runCandidate(ctx context.Context, args ...string) error {
-	cmd := exec.CommandContext(ctx, installed, args...)
+func (h *ledgerHost) runCandidate(ctx context.Context, args ...string) error {
+	cmd := exec.CommandContext(ctx, installedBinary, args...)
 
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -1510,12 +1587,12 @@ func (h *systemdHost) runCandidate(ctx context.Context, args ...string) error {
 	return nil
 }
 
-func (h *systemdHost) configPath() string {
+func (h *ledgerHost) configPath() string {
 	if h.cfgPath != "" {
 		return h.cfgPath
 	}
 
-	return "/etc/billet/billet.yaml"
+	return initconfig.ServiceConfigPathFor(hostOS)
 }
 
 // StartServices starts the steady-state units and proves each came up.

@@ -43,10 +43,27 @@ func agentOf(label string) (string, bool) {
 		return deploy.ServerAgent, true
 	case deploy.NodeAgentLabel:
 		return deploy.NodeAgent, true
+	case deploy.UpgradeAgentLabel:
+		return deploy.UpgradeAgent, true
+	case deploy.ImagesAgentLabel:
+		return deploy.ImagesAgent, true
 	}
 
 	return "", false
 }
+
+// Scheduled names billet's two oneshot agents, the upgrade first.
+//
+// NOT SERVICES. Neither holds a process between runs, so nothing here starts,
+// proves or drains them; they are installed and enabled so launchd runs them on
+// their schedule, and removed with the rest at uninstall.
+func (c *Converger) Scheduled() (string, string) {
+	return deploy.UpgradeAgentLabel, deploy.ImagesAgentLabel
+}
+
+// AgentPath is where a label's plist lives, for a caller that preserves or
+// restores it.
+func (c *Converger) AgentPath(label string) string { return c.agentPath(label) }
 
 // Identity is the account the launch agents run as: the one invoking this.
 //

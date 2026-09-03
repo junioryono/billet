@@ -154,6 +154,7 @@ Capture a deployment as one unit, put it back as one unit or not at all, or put 
 
 | Command | Meaning |
 |---|---|
+| `billet images refresh [--keep 3] [--dry-run]` | take up a newer published image: on a firecracker node, pull, boot-verify and promote only when the channel's image was built after the newest generation imported, then reap to `--keep` verified generations per contract; on a tart node, pull every configured image that is absent; nothing under `release.automatic: false`. What `billet-images.timer` runs daily |
 | `billet images pull [<ref>] [--from <dir>] [--source <url>] [--verify] [--result-file <path>] [--allow-stale] [--kernel-dir <dir>] [--staging-dir <dir>] [--keep-staging] [--signing-identity <pattern>] [--signing-issuer <issuer>] [--skip-signature-verification]` | fetch a published guest image, verify its signature and every asset, install the paired kernel durably, import it as a generation; on a tart node, pull the tiers' images into tart's store |
 | `billet images verify <image>@<gen> [--wait 3m] [--record] [--allow-unpaired]` | boot one microVM and make the guest prove it works; `--record` (default) marks it so `@verified` resolves to it |
 | `billet images compatible [--wait 3m] [--result-file]` | prove every configured image speaks this binary's guest contract. Exit 2: images need a compatible generation |
@@ -176,11 +177,11 @@ Capture a deployment as one unit, put it back as one unit or not at all, or put 
 
 | Command | Meaning |
 |---|---|
-| `billet rollout start [--channel stable] [--version] [--cohort 1] [--failure-budget 1] [--skip-signature-verification]` | resolve a channel once into an immutable target and record the decision |
+| `billet rollout start [--channel stable] [--version] [--cohort 1] [--failure-budget 1] [--allow-downgrade] [--skip-signature-verification]` | resolve a channel once into an immutable target and record the decision; a target older than the running release is refused without `--allow-downgrade`. With `release.automatic` on (the default) the control plane does this itself when the channel advances |
 | `billet rollout status` | where each host has got to and what it proved |
 | `billet rollout abort --reason` | abandon the decision; converged hosts stay converged |
 | `billet rollout retry\|exempt\|decommission <node> [--reason] [--force]` | put a host back to pending, mark it not part of this rollout, or record it gone |
-| `billet host-upgrade [--channel] [--version] [--manifest-sha256] [--rollout] [--generation] [--reinstall] [--resume] [--status] [--ack-fd] [--skip-signature-verification]` | replace billet on this machine transactionally with rollback; `--status` reports what the machine holds; `--resume` continues or unwinds; `--reinstall` repairs a host a rollout blocked |
+| `billet host-upgrade [--channel] [--version] [--manifest-sha256] [--rollout] [--generation] [--reinstall] [--resume] [--status] [--ack-fd] [--from-rollout] [--allow-downgrade] [--skip-signature-verification]` | replace billet on this machine transactionally with rollback, under systemd or launchd; `--status` reports what the machine holds; `--resume` continues or unwinds; `--reinstall` repairs a host a rollout blocked; `--from-rollout` acts on the rollout the ledger records and is what `billet-upgrade.timer` and the `sh.billet.upgrade` agent run; `--allow-downgrade` lowers the ledger's release watermark to admit an older release |
 | `billet release record --manifest --archive --binary` | record which signed manifest produced the installed binary, after proving the manifest names it |
 
 ## Removal

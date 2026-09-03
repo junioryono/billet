@@ -125,12 +125,24 @@ func runLocalUninstall(ctx context.Context, o uninstallOptions) error {
 func removeAgents(ctx context.Context, cfg *config.Config, o uninstallOptions) error {
 	c := launchd.New()
 	server, node := c.Services()
+	upgrade, images := c.Scheduled()
+
+	// THE SCHEDULED AGENTS FIRST, AND BOOTED OUT BEFORE THEY ARE REMOVED. A
+	// oneshot that fires between the services going down and its plist going is
+	// an upgrade transaction starting on a host being uninstalled; booting it
+	// out waits for one that is already running, which is the right answer for
+	// a transaction midway through replacing the binary.
+	for _, label := range []string{upgrade, images} {
+		if _, err := c.StopAndProve(ctx, label); err != nil {
+			return fmt.Errorf("this host is down and PARTLY uninstalled: %w", err)
+		}
+	}
 
 	// THE NODE FIRST, matching the order everything else here uses.
 	for _, s := range []struct {
 		label string
 		want  bool
-	}{{node, cfg.Node != nil}, {server, cfg.Server != nil}} {
+	}{{upgrade, true}, {images, true}, {node, cfg.Node != nil}, {server, cfg.Server != nil}} {
 		if !s.want {
 			continue
 		}

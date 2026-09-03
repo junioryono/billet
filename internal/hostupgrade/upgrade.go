@@ -233,6 +233,20 @@ func Run(ctx context.Context, req Request) error {
 func advance(ctx context.Context, req Request, log *slog.Logger) error {
 	j, host := req.Journal, req.Host
 
+	// AN EXTERNAL LEDGER HAS THREE STEPS FEWER, AND THEY ARE RECORDED AS
+	// REACHED RATHER THAN LEFT OUT. billet copies no PostgreSQL database: the
+	// fence is a file in the identity directory that reaches only local handles,
+	// the snapshot is the one thing that cannot exist, and the migration happens
+	// where the controller claim already puts it — when the candidate serves.
+	// Advancing the journal through them keeps a resume reading the same record
+	// the run wrote, and keeps Reached honest about what is behind the host.
+	skipped := map[Step]bool{}
+	if j.ExternalLedger() {
+		skipped[StepFenced] = true
+		skipped[StepSnapshotted] = true
+		skipped[StepMigrated] = true
+	}
+
 	steps := []struct {
 		step Step
 		do   func(context.Context) error
@@ -296,10 +310,14 @@ func advance(ctx context.Context, req Request, log *slog.Logger) error {
 			continue
 		}
 
-		log.Info("upgrade step", "step", s.step, "what", s.what)
+		if skipped[s.step] {
+			log.Info("upgrade step has nothing to do on an external ledger", "step", s.step)
+		} else {
+			log.Info("upgrade step", "step", s.step, "what", s.what)
 
-		if err := s.do(ctx); err != nil {
-			return fmt.Errorf("%s: %w", s.what, err)
+			if err := s.do(ctx); err != nil {
+				return fmt.Errorf("%s: %w", s.what, err)
+			}
 		}
 
 		if err := j.Advance(s.step); err != nil {
@@ -341,9 +359,13 @@ func finish(ctx context.Context, req Request, log *slog.Logger) error {
 			"committed and unaffected", "error", err)
 	}
 
-	if err := host.ClearFence(ctx, "host upgrade committed"); err != nil {
-		return fmt.Errorf("hostupgrade: the upgrade committed but the ledger is still "+
-			"fenced, so nothing can write to it: %w", err)
+	// NO FENCE WAS RAISED ON AN EXTERNAL LEDGER, so none is cleared; the
+	// candidate's own claim is what admits it.
+	if !j.ExternalLedger() {
+		if err := host.ClearFence(ctx, "host upgrade committed"); err != nil {
+			return fmt.Errorf("hostupgrade: the upgrade committed but the ledger is still "+
+				"fenced, so nothing can write to it: %w", err)
+		}
 	}
 
 	if err := host.StartServices(ctx); err != nil {
@@ -407,7 +429,10 @@ func rollBack(ctx context.Context, req Request, log *slog.Logger, cause error) e
 	// a schema it has never heard of. Restoring in the other order produces a
 	// control plane that starts, refuses its own database, and is down with
 	// nothing installed that can read it.
-	if j.Reached(StepSnapshotted) {
+	// AND NOTHING IS RESTORED ON AN EXTERNAL LEDGER, because nothing was
+	// snapshotted: the rollback boundary there is the candidate's start, and
+	// what lies past it is the database's own backup.
+	if j.Reached(StepSnapshotted) && !j.ExternalLedger() {
 		if err := host.RestoreLedger(ctx, j.SnapshotPath()); err != nil {
 			return cordon("restoring the ledger", err)
 		}
@@ -454,7 +479,7 @@ func rollBack(ctx context.Context, req Request, log *slog.Logger, cause error) e
 func finishRollback(ctx context.Context, req Request, log *slog.Logger) error {
 	j, host := req.Journal, req.Host
 
-	if j.Reached(StepFenced) {
+	if j.Reached(StepFenced) && !j.ExternalLedger() {
 		if err := host.ClearFence(ctx, "host upgrade rolled back"); err != nil {
 			return fmt.Errorf("clearing the maintenance fence: %w", err)
 		}

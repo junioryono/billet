@@ -1,0 +1,24 @@
+# billet guest image refresh. Rendered by the junioryono.billet.host role; the
+# packaged unit in billet's deploy/ directory is the same unit, and
+# tests/unit-parity.yml holds the two together.
+#
+# THE OTHER HALF OF AN UPDATE. `billet images refresh` pulls, boot-verifies and
+# promotes a generation only when the signed image channel names an image newer
+# than the newest one imported, then reaps to three verified generations per
+# guest contract. The role installs it on a firecracker host and enables it when
+# billet_automatic_updates is true.
+[Unit]
+Description=billet guest image refresh
+Documentation=https://billet.readthedocs.io/en/latest/operating/guest-images.html
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+
+ExecStart=/usr/bin/billet images refresh --config /etc/billet/billet.yaml
+
+TimeoutStartSec=10800

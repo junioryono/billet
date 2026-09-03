@@ -1075,9 +1075,9 @@ tiers:
 
 # ── release ──────────────────────────────────────────────────────────────────
 #
-# How this deployment learns about new billet releases. Every field is optional
-# and saying nothing is the behaviour every existing install already has: follow
-# the signed stable channel, and update only when an operator asks.
+# How this deployment learns about new billet releases. Every field is optional,
+# and saying nothing follows the signed stable channel and updates itself when it
+# advances; `automatic: false` below is what turns that off.
 #
 # release:
 #   # The signed pointer to follow. `stable` or `candidate`. Its statement is
@@ -1093,10 +1093,16 @@ tiers:
 #   # pointer while reporting itself pinned.
 #   # version: v0.4.0
 #
-#   # Let the control plane START a rollout by itself when the channel advances.
-#   # OFF BY DEFAULT, and not out of timidity: an automatic rollout drains hosts
-#   # and replaces binaries, and a deployment that had not decided to allow that
-#   # must not begin doing it because it upgraded to a billet that could.
+#   # Whether this deployment updates itself: the control plane STARTS a rollout
+#   # when the channel advances, the scheduled updater on each host acts on it,
+#   # and each node refreshes the guest image it boots. ON UNLESS WRITTEN FALSE,
+#   # and this is the one absent value in this file that does not refuse: the
+#   # failure an unattended deployment actually meets is the update that never
+#   # happens. What makes the default safe is that a rollout drains every host
+#   # for as long as its jobs take, a candidate is verified and rolled back on
+#   # failure, and the ledger refuses to be served by a release older than the
+#   # newest that has served it. `false` is the one sentence that turns all of
+#   # it off; `billet rollout start` still works by hand.
 #   automatic: false
 #
 #   # When an automatic rollout may BEGIN, in UTC. It never stops one: a rollout

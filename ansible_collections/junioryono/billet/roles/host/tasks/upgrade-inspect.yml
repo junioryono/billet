@@ -7,6 +7,28 @@
   check_mode: false
   become: true
 
+# A SYMLINK CLAIM IS `billet host-upgrade`'s, NOT THIS ROLE'S. The Go transaction
+# publishes its claim as a symlink to its recovery directory (upgrade-*), and
+# this role publishes its own as a hard link to a journal file; the two share
+# the path precisely so that neither can start over the other. A converge that
+# finds the Go transaction's claim is a converge against a host whose node may
+# be draining for a rollout right now, and the right answer is to stop and name
+# the command that says where that transaction has got to — not "not a real
+# regular file", which sends an operator to look for corruption.
+- name: Refuse to converge over a host upgrade billet itself is running
+  ansible.builtin.assert:
+    that:
+      - not (billet_active_upgrade_pointer.stat.islnk | default(false))
+    fail_msg: >-
+      /var/lib/billet/upgrades/active is a symlink, which is how
+      `billet host-upgrade` claims a host: a rollout, or an operator, has a
+      transaction on this machine that this role must not converge over. Run
+      `billet host-upgrade --status` there to see which decision it belongs to
+      and how far it has got, let it finish or resume it with
+      `billet host-upgrade --resume`, and converge again once
+      /var/lib/billet/upgrades/active is gone.
+  when: billet_active_upgrade_pointer.stat.exists
+
 - name: Refuse a redirected or non-file host-upgrade pointer
   ansible.builtin.assert:
     that:

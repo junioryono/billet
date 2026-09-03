@@ -30,6 +30,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 )
 
 // Path is where the record lives.
@@ -37,7 +38,22 @@ import (
 // A VAR SO A TEST CAN OWN THE DIRECTORY IT WRITES INTO, the same seam
 // cmd/billet's upgradeRoot uses and for the same reason: the real path is
 // durable state on the machine running the test.
-var Path = "/var/lib/billet/installed.json"
+var Path = DefaultPathFor(runtime.GOOS)
+
+// DefaultPathFor is where the record lives on a platform.
+//
+// BESIDE THE REST OF THE HOST'S UPDATE BOOKKEEPING: under /var/lib/billet on
+// Linux, where the updater is root, and under /usr/local/var/lib/billet on a
+// Mac, where the updater is the operator's launch agent and /var/lib does not
+// exist. A record written where the account that reads it back cannot reach is
+// a host that reports nothing after every upgrade.
+func DefaultPathFor(goos string) string {
+	if goos == "darwin" {
+		return "/usr/local/var/lib/billet/installed.json"
+	}
+
+	return "/var/lib/billet/installed.json"
+}
 
 // Record is what produced the installed binary.
 type Record struct {

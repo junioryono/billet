@@ -121,12 +121,14 @@ tiers:
 
 # How this host learns about new billet releases.
 #
-# THE PACKAGED DEFAULT FOLLOWS THE SIGNED STABLE CHANNEL AND UPDATES NOTHING BY
-# ITSELF. `billet rollout start` is what turns the channel into a decision, and
-# `billet host-upgrade` is what carries one out on this machine; neither runs
-# without somebody asking. Set `automatic: true` to let the control plane start a
-# rollout when the channel advances, and give it a maintenance_window if it should
-# only begin at a quiet hour — see billet.example.yaml for both.
+# THE PACKAGED DEFAULT FOLLOWS THE SIGNED STABLE CHANNEL AND UPDATES ITSELF. When
+# the channel advances the control plane starts a rollout, billet-upgrade.timer
+# carries it out on this machine (draining the node for as long as its jobs take,
+# verifying the candidate, rolling back on failure), and billet-images.timer
+# refreshes the guest image a firecracker node boots. The ledger refuses to be
+# served by a release older than the newest that has served it, so this cannot go
+# backwards without `billet host-upgrade --allow-downgrade`. Write
+# `automatic: false` to turn all of it off, or give it a maintenance_window so a
+# rollout only BEGINS at a quiet hour — see billet.example.yaml for both.
 release:
   channel: stable
-  automatic: false

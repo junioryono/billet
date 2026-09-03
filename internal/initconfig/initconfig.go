@@ -539,7 +539,7 @@ func Generate(p Params) (string, bool, error) {
 
 	// The real file leaves the App ids at zero for `billet github-app create` to
 	// fill; the App does not exist yet.
-	body := render(p, trusted, 0, 0)
+	body := render(p, trusted, 0, 0) + releaseBlock
 
 	// PROVE IT before returning it. config.Parse is the single validation path a
 	// file on disk takes, so a value that renders fine but does not VALIDATE — a
@@ -550,13 +550,41 @@ func Generate(p Params) (string, bool, error) {
 	// required` error is not the config being generated, and an operator value
 	// that happened to contain the text `app_id: 0` must not steer a substring
 	// replacement or a rendered app id land in the returned file.
-	validation := render(p, trusted, 1, 1)
+	validation := render(p, trusted, 1, 1) + releaseBlock
 	if _, err := config.Parse("the config billet generated", []byte(validation)); err != nil {
 		return "", false, fmt.Errorf("initconfig: the generated config is not valid: %w", err)
 	}
 
 	return body, trusted, nil
 }
+
+// releaseBlock says what a generated config does about new releases, which is
+// everything, so the file states its own default rather than leaving the one
+// decision most operators ask about to a page they have not read yet.
+//
+// COMMENTED OUT ENTIRELY, so it changes nothing about what the file means: the
+// absent block IS the default. What it carries is the sentence that turns
+// updates off and the window that bounds when they begin, beside each other.
+const releaseBlock = `
+# ── release ───────────────────────────────────────────────────────────────────
+#
+# This deployment updates itself. It follows the signed stable channel; when a
+# new release is published the control plane starts a rollout, the scheduled
+# updater on each host takes it up (draining every host for as long as its jobs
+# take, verifying the candidate, and rolling back on failure), and each node
+# refreshes the guest image it boots. The ledger refuses to be served by a
+# release older than the newest that has served it, so this cannot go backwards
+# without somebody saying so (` + "`billet host-upgrade --allow-downgrade`" + `).
+#
+# Turn it off with one line, or bound when a rollout may BEGIN (UTC; a window
+# never stops one already running):
+#
+# release:
+#   automatic: false
+#   maintenance_window:
+#     start: "02:00"
+#     end: "04:00"
+`
 
 // checkTargetPlatform refuses a target billet ships no services for.
 //

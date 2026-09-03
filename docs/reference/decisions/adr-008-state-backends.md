@@ -102,6 +102,7 @@ What *is* checked is the question that survives the change of engine: `synchrono
 
   **What still has no election behind it is the promotion.** Nothing decides that a leader is dead or that a follower should take over; that is the election's remaining phase, and this is the half it has to be built on.
 - Backup and restore for an external ledger are not yet paired with the deployment identity. `billet local backup` and `restore` remain SQLite-only.
+- The transactional host upgrade runs on an external ledger since [ADR-010](adr-010-automatic-updates.md), without copying it: it fences, snapshots and migrates nothing there, and the rollback boundary is the candidate's start.
 
 ## Alternatives rejected
 

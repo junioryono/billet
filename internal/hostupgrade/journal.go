@@ -135,6 +135,16 @@ type Journal struct {
 	// snapshotted and was about to hand it.
 	AllowDowngrade bool `json:"allow_downgrade,omitempty"`
 
+	// Ledger says where this host's ledger lives: empty for the SQLite file in
+	// the state directory, LedgerExternal for a database billet does not hold.
+	//
+	// ON THE JOURNAL BECAUSE IT DECIDES WHICH STEPS EXIST. An external ledger is
+	// neither fenced, snapshotted nor migrated by the updater — billet copies no
+	// PostgreSQL database, and the candidate migrates when it takes the
+	// controller claim — and a resumed run has to skip the same steps the
+	// interrupted one did, or it would try to restore a snapshot nothing took.
+	Ledger string `json:"ledger,omitempty"`
+
 	// PID is the process that claimed this transaction.
 	//
 	// A NAME FOR THE HOLDER, NOT A HANDLE ON IT. The transaction lock already says
@@ -152,6 +162,14 @@ type Journal struct {
 	// Failure is why this upgrade stopped, when it did.
 	Failure string `json:"failure,omitempty"`
 }
+
+// LedgerExternal marks a journal for a host whose ledger is a database billet
+// does not hold.
+const LedgerExternal = "external"
+
+// ExternalLedger reports whether this transaction has no ledger file to fence,
+// snapshot or migrate.
+func (j *Journal) ExternalLedger() bool { return j.Ledger == LedgerExternal }
 
 // JournalName is the file inside the recovery directory.
 const JournalName = "journal.json"
