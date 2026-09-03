@@ -46,6 +46,7 @@
    operating/nodes
    operating/guest-images
    operating/actions-cache
+   operating/compatibility
    operating/upgrades
    operating/backup-restore-recover
    operating/draining-and-stopping
