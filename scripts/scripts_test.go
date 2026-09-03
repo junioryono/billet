@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"syscall"
 	"testing"
@@ -314,7 +315,7 @@ exit 0
 				"PATH="+tools+":"+os.Getenv("PATH"),
 				"BILLET_TEST_CALLS="+calls,
 				"GITHUB_REPOSITORY=junioryono/billet",
-				"GITHUB_SHA="+strings.Repeat("a", 40),
+				"SOURCE_SHA="+strings.Repeat("a", 40),
 				"TAG=guest-20260821-000000",
 			)
 
@@ -400,7 +401,7 @@ exit 97
 				"BILLET_TEST_MODE="+tc.mode,
 				"BILLET_TEST_IMMUTABLE="+tc.immutable,
 				"GITHUB_REPOSITORY=junioryono/billet",
-				"GITHUB_SHA="+strings.Repeat("a", 40),
+				"SOURCE_SHA="+strings.Repeat("a", 40),
 				"TAG="+tc.tag,
 			)
 			output, err := cmd.CombinedOutput()
@@ -2101,5 +2102,148 @@ func TestAnInstallSurvivesBilletRefusingToTieItToAManifest(t *testing.T) {
 
 	if !strings.Contains(run.output, "could not be tied to a release manifest") {
 		t.Errorf("the installer did not say the install is untied: %s", run.output)
+	}
+}
+
+// The guest image is built from the tree of the release the stable channel names,
+// while the workflow that builds it stays on main so its signature keeps the
+// identity every deployed binary verifies. A build from main is for testing the
+// build scripts and must never reach the channel.
+func TestTheGuestImageIsBuiltFromTheStableReleaseAndABuildFromMainCannotPublish(t *testing.T) {
+	t.Parallel()
+
+	body, err := os.ReadFile(filepath.Join("..", ".github", "workflows", "guest-image.yml"))
+	if err != nil {
+		t.Fatalf("read guest-image workflow: %v", err)
+	}
+	workflow := string(body)
+	buildJob := strings.Index(workflow, "\n  build:\n")
+	publishJob := strings.Index(workflow, "\n  publish:\n")
+	if buildJob < 0 || publishJob <= buildJob {
+		t.Fatal("separate guest build and publication jobs are missing or out of order")
+	}
+	buildBody := workflow[buildJob:publishJob]
+
+	resolve := strings.Index(buildBody, "name: Resolve the source release")
+	checkout := strings.Index(buildBody, "uses: actions/checkout@")
+	if resolve < 0 || checkout < 0 || checkout < resolve {
+		t.Fatal("the source release must be resolved before anything is checked out")
+	}
+	for _, required := range []string{
+		// The channel deployments follow, not the newest tag and not main.
+		`contents/stable.json?ref=release-channel`,
+		// A hand-named tag must be a real, locked release.
+		`.isImmutable and (.isPrerelease | not) and (.isDraft | not)`,
+		// The build checks out what was resolved, nothing else.
+		"ref: ${{ steps.source.outputs.sha }}",
+		// Provenance travels to the release notes and the publish job.
+		"SOURCE_TAG: ${{ steps.source.outputs.tag }}",
+		"source_is_release: ${{ steps.source.outputs.is_release }}",
+	} {
+		if !strings.Contains(buildBody, required) {
+			t.Fatalf("guest build is missing %q", required)
+		}
+	}
+
+	publishBody := workflow[publishJob:]
+	for _, required := range []string{
+		"needs.build.outputs.source_is_release == 'true'",
+		"SOURCE_SHA: ${{ needs.build.outputs.source_sha }}",
+	} {
+		if !strings.Contains(publishBody, required) {
+			t.Fatalf("guest publication is missing %q", required)
+		}
+	}
+
+	publisher, err := os.ReadFile("publish-guest-release.sh")
+	if err != nil {
+		t.Fatalf("read publisher: %v", err)
+	}
+	if !strings.Contains(string(publisher), `git tag "$TAG" "$SOURCE_SHA"`) {
+		t.Fatal("the guest tag must point at the release commit the image was built from")
+	}
+	if strings.Contains(string(publisher), "GITHUB_SHA") {
+		t.Fatal("the publisher must not tag the publication commit; that is not what the image was built from")
+	}
+}
+
+// THE SEAM BETWEEN THE WORKFLOW ON MAIN AND THE RELEASE'S TREE IS FROZEN. The
+// workflow file always runs from main while the scripts it drives come from the
+// release the stable channel names, so a script renamed or an environment
+// variable added here would work against main and fail against every release
+// the channel can point at. Changing this list is allowed; it has to be done
+// knowing that every release the channel may name still has to satisfy it.
+func TestTheGuestImageWorkflowsSeamWithTheReleaseTreeIsFrozen(t *testing.T) {
+	t.Parallel()
+
+	body, err := os.ReadFile(filepath.Join("..", ".github", "workflows", "guest-image.yml"))
+	if err != nil {
+		t.Fatalf("read guest-image workflow: %v", err)
+	}
+	workflow := string(body)
+	buildJob := strings.Index(workflow, "\n  build:\n")
+	publishJob := strings.Index(workflow, "\n  publish:\n")
+	if buildJob < 0 || publishJob <= buildJob {
+		t.Fatal("separate guest build and publication jobs are missing or out of order")
+	}
+	// Everything from the checkout onward runs against the release's tree; the
+	// resolve step before it runs against nothing but the API.
+	buildBody := workflow[buildJob:publishJob]
+	checkout := strings.Index(buildBody, "uses: actions/checkout@")
+	if checkout < 0 {
+		t.Fatal("the guest build never checks out a tree")
+	}
+	buildBody = buildBody[checkout:]
+
+	scripts := map[string]bool{}
+	for _, m := range regexp.MustCompile(`scripts/[a-z0-9/-]+\.(?:sh|txt|config)`).FindAllString(buildBody, -1) {
+		scripts[m] = true
+	}
+	env := map[string]bool{}
+	for _, m := range regexp.MustCompile(`--preserve-env=([A-Z_,]+)`).FindAllStringSubmatch(buildBody, -1) {
+		for _, name := range strings.Split(m[1], ",") {
+			env[name] = true
+		}
+	}
+	for _, m := range regexp.MustCompile(`(?m)^\s+([A-Z_]+): \$\{\{ (?:github\.workspace|inputs\.|steps\.source)`).FindAllStringSubmatch(buildBody, -1) {
+		env[m[1]] = true
+	}
+
+	want := map[string]bool{
+		"scripts/build-guest-image.sh":         true,
+		"scripts/build-guest-kernel.sh":        true,
+		"scripts/check-guest-image.sh":         true,
+		"scripts/check-guest-kernel-config.sh": true,
+		"scripts/boot-guest-image.sh":          true,
+		"scripts/split-image.sh":               true,
+		"scripts/write-image-manifest.sh":      true,
+		"scripts/guest-kernel.config":          true,
+		"scripts/kernel/required-builtins.txt": true,
+		"IMAGE_NAME":                           true,
+		"WORK":                                 true,
+		"PUBLISH":                              true,
+		"RUNNER_VERSION":                       true,
+		"OUT":                                  true,
+		"KERNEL":                               true,
+		"ROOTFS":                               true,
+		"SOURCE_TAG":                           true,
+		"SOURCE_SHA":                           true,
+	}
+	got := map[string]bool{}
+	for k := range scripts {
+		got[k] = true
+	}
+	for k := range env {
+		got[k] = true
+	}
+	for k := range want {
+		if !got[k] {
+			t.Errorf("the frozen seam names %q and the workflow no longer uses it", k)
+		}
+	}
+	for k := range got {
+		if !want[k] {
+			t.Errorf("the workflow now crosses the seam with %q, which every release the stable channel can name must already provide; add it here only knowing that", k)
+		}
 	}
 }
