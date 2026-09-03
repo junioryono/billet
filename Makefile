@@ -85,6 +85,12 @@ lambda-test: ## Unit-test the Terraform spot-router Lambda (stdlib only, boto3 s
 	@# two-minute Spot warning is lost, and a Terraform plan test cannot reach it.
 	python3 -m unittest discover -s terraform/modules/billet/modules/fleet-ec2/lambda -p '*_test.py'
 
+.PHONY: docs
+docs: ## Build the Sphinx documentation with warnings as errors, as Read the Docs and CI do
+	@build_dir=$$(mktemp -d); \
+		trap 'rm -rf "$$build_dir"' EXIT; \
+		$(MAKE) -C docs html BUILDDIR="$$build_dir" SPHINXOPTS="-W --keep-going"
+
 .PHONY: lint
 lint: ## golangci-lint (pinned version), for this platform AND linux
 	golangci-lint run --timeout=5m
