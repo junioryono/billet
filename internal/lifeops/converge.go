@@ -1464,6 +1464,31 @@ func (c *Converger) Enable(ctx context.Context, unit string) error {
 	return nil
 }
 
+// StartTimer starts a timer unit and proves it is armed.
+//
+// NOT StartAndProve, which proves a PROCESS held its pid across a settle window:
+// a timer has no process, and `active` is systemd saying the next elapse is
+// scheduled, which is the whole fact a caller needs. Enable and start are two
+// calls because `enable --now` commits a unit to every future boot before
+// anything proved it can run, the rule every other unit here follows.
+func (c *Converger) StartTimer(ctx context.Context, unit string) error {
+	if _, err := c.inspector.run(ctx, c.inspector.systemctl, []string{"start", "--", unit}); err != nil {
+		return fmt.Errorf("start %s: %w", unit, err)
+	}
+
+	out, err := c.inspector.run(ctx, c.inspector.systemctl,
+		[]string{"show", "--property=ActiveState", "--value", "--", unit})
+	if err != nil {
+		return fmt.Errorf("prove %s is armed: %w", unit, err)
+	}
+
+	if state := strings.TrimSpace(string(out)); state != "active" {
+		return fmt.Errorf("%s was started and reports %q rather than active", unit, state)
+	}
+
+	return nil
+}
+
 // Enablement is whether a service will start itself at the next boot.
 //
 // A VERDICT AND A WORD, rather than the manager's raw string. systemd answers

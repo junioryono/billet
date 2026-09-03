@@ -251,6 +251,7 @@ func runCheck(ctx context.Context, opts checkOptions) (checkReport, error) {
 		// like one that is working, and the day an operator finds out is the day
 		// the archive was needed. ADVISORY throughout: this reports, and nothing
 		// here decides whether the deployment may run.
+		reportLocalBackupAge(ctx)
 		reportBackupAge(ctx, cfg, skipNetworkProbes)
 
 		a, err := alloc.New(db, alloc.Limits{
@@ -575,27 +576,80 @@ func reportGuestImageFreshness(ctx context.Context, cfg *config.Config) {
 		fmt.Printf("images   %s: %s\n", name, why)
 	}
 
-	switch enabled, err := imagesRefreshTimerEnabled(ctx); {
+	reportTimer(ctx, "refresh", deploy.ImagesRefreshTimerName,
+		"nothing will replace an image that ages out of GitHub's runner window")
+}
+
+// reportTimer says whether a packaged timer is enabled, or that it could not ask.
+func reportTimer(ctx context.Context, label, timer, consequence string) {
+	switch enabled, err := timerEnabled(ctx, timer); {
 	case err != nil:
-		fmt.Printf("refresh  could not tell whether %s is enabled: %v\n",
-			deploy.ImagesRefreshTimerName, err)
+		fmt.Printf("%-8s could not tell whether %s is enabled: %v\n", label, timer, err)
 	case enabled:
-		fmt.Printf("refresh  %s is enabled\n", deploy.ImagesRefreshTimerName)
+		fmt.Printf("%-8s %s is enabled\n", label, timer)
 	default:
-		fmt.Printf("refresh  %s is NOT enabled; nothing will replace an image that ages out "+
-			"of GitHub's runner window (systemctl enable --now %s)\n",
-			deploy.ImagesRefreshTimerName, deploy.ImagesRefreshTimerName)
+		fmt.Printf("%-8s %s is NOT enabled; %s (billet local up enables it, or: "+
+			"systemctl enable --now %s)\n", label, timer, consequence, timer)
 	}
+}
+
+// localBackupDir is where the packaged backup unit writes, one directory per
+// run; the unit's ExecStart is the one spelling of it.
+const localBackupDir = "/var/lib/billet/backups"
+
+// localBackupStale is two missed daily runs.
+const localBackupStale = 48 * time.Hour
+
+// reportLocalBackupAge names the newest local archive and how old it is, and
+// whether the timer that writes them is enabled. A timer that stopped firing
+// looks exactly like one that is working, and the day an operator finds out is
+// the day the archive was needed. ADVISORY: reports, decides nothing.
+func reportLocalBackupAge(ctx context.Context) {
+	entries, err := os.ReadDir(localBackupDir)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		fmt.Printf("backup   no local archive yet under %s\n", localBackupDir)
+	case err != nil:
+		fmt.Printf("backup   UNCHECKED: %s: %v\n", localBackupDir, err)
+	default:
+		var newest string
+		var newestAt time.Time
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			info, err := e.Info()
+			if err != nil {
+				continue
+			}
+			if newest == "" || info.ModTime().After(newestAt) {
+				newest, newestAt = e.Name(), info.ModTime()
+			}
+		}
+		switch {
+		case newest == "":
+			fmt.Printf("backup   no local archive yet under %s\n", localBackupDir)
+		case time.Since(newestAt) > localBackupStale:
+			fmt.Printf("backup   newest local archive %s is %s old, past two daily runs; the timer "+
+				"may have stopped firing\n", newest, time.Since(newestAt).Round(time.Hour))
+		default:
+			fmt.Printf("backup   newest local archive %s, %s old\n", newest,
+				time.Since(newestAt).Round(time.Minute))
+		}
+	}
+
+	reportTimer(ctx, "backup", deploy.BackupTimerName,
+		"nothing writes an archive of this deployment")
 }
 
 // imagesRefreshAge is the age past which `billet check` calls an image stale,
 // the same as `images refresh`'s default: the weekly build plus a day of slack.
 const imagesRefreshAge = 6 * 24 * time.Hour
 
-// imagesRefreshTimerEnabled asks systemd whether the packaged refresh timer is
-// enabled. Off Linux, or where systemctl is absent, the answer is an error rather
-// than false, because "not enabled" is a verdict and "could not ask" is not.
-var imagesRefreshTimerEnabled = func(ctx context.Context) (bool, error) {
+// timerEnabled asks systemd whether a packaged timer is enabled. Off Linux, or
+// where systemctl is absent, the answer is an error rather than false, because
+// "not enabled" is a verdict and "could not ask" is not.
+var timerEnabled = func(ctx context.Context, timer string) (bool, error) {
 	if runtime.GOOS != "linux" {
 		return false, errors.New("no systemd on " + runtime.GOOS)
 	}
@@ -605,8 +659,7 @@ var imagesRefreshTimerEnabled = func(ctx context.Context) (bool, error) {
 		return false, err
 	}
 
-	out, err := exec.CommandContext(ctx, systemctl, "is-enabled",
-		deploy.ImagesRefreshTimerName).Output()
+	out, err := exec.CommandContext(ctx, systemctl, "is-enabled", timer).Output()
 	state := strings.TrimSpace(string(out))
 
 	switch {

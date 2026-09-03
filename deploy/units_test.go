@@ -343,6 +343,14 @@ func TestTheBackupUnitRunsAsTheServiceAccountAndIsNotEnabledDirectly(t *testing.
 			deploy.BackupTimerName)
 	}
 
+	// DAILY AND SPREAD, and a test names both so a retuned schedule is a decision
+	// somebody wrote down rather than an edit nobody noticed.
+	for _, want := range []string{"OnCalendar=daily", "RandomizedDelaySec="} {
+		if !strings.Contains(deploy.BackupTimer, want) {
+			t.Errorf("%s does not carry %q", deploy.BackupTimerName, want)
+		}
+	}
+
 	// A MISSED RUN IS RUN. Without this a host that was off overnight silently
 	// skips a day, and a backup's failures are the ones nobody sees.
 	if !strings.Contains(deploy.BackupTimer, "Persistent=true") {
