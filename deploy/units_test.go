@@ -368,3 +368,37 @@ func TestTheBackupUnitRunsAsTheServiceAccountAndIsNotEnabledDirectly(t *testing.
 		}
 	}
 }
+
+// THE IMAGE REFRESH FOLLOWS THE BACKUP'S SHAPE: a oneshot nothing enables at
+// boot, a timer that is the thing enabled, run daily with the decision in the
+// command, persistent so a host that was off does not wait another day, and as
+// root because a pull maps RBD and boots a probe under the jailer.
+func TestTheImageRefreshUnitIsAPersistentDailyTimerRunAsRoot(t *testing.T) {
+	for _, want := range []string{
+		"User=root",
+		"Type=oneshot",
+		"ExecStart=/usr/bin/billet images refresh --config /etc/billet/billet.yaml",
+		"ReadWritePaths=/var/lib/billet",
+	} {
+		if !strings.Contains(deploy.ImagesRefreshUnit, want) {
+			t.Errorf("%s does not carry %q", deploy.ImagesRefreshUnitName, want)
+		}
+	}
+
+	if strings.Contains(deploy.ImagesRefreshUnit, "[Install]") {
+		t.Errorf("%s has an [Install] section: a oneshot enabled at boot runs once per boot and "+
+			"then never again, which reads exactly like a working schedule", deploy.ImagesRefreshUnitName)
+	}
+
+	for _, want := range []string{
+		"[Install]",
+		"OnCalendar=daily",
+		"Persistent=true",
+		"RandomizedDelaySec=",
+		"Unit=" + deploy.ImagesRefreshUnitName,
+	} {
+		if !strings.Contains(deploy.ImagesRefreshTimer, want) {
+			t.Errorf("%s does not carry %q", deploy.ImagesRefreshTimerName, want)
+		}
+	}
+}

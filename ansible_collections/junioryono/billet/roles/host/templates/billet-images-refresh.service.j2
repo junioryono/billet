@@ -1,0 +1,53 @@
+# One check that this node's guest images are current, and a pull if not.
+#
+# NOT ENABLED BY THE PACKAGE, and neither is its timer, for the reason the backup
+# is not: a host that boots no firecracker guests has nothing for this to do, and
+# the decision belongs to the operator of the one that does. `billet check`
+# reports a firecracker node whose timer is not enabled, because a timer that was
+# never enabled looks exactly like one that is working right up until GitHub
+# refuses the runner baked into a stale image.
+#
+#   systemctl enable --now billet-images-refresh.timer
+#
+# NOT MANAGED BY `billet local up`/`down`/`status` either, exactly as the backup
+# is not: those own the two services that hold compute and a ledger, and their
+# safety content is the order they act in.
+[Unit]
+Description=billet guest image refresh
+Documentation=https://github.com/junioryono/billet/blob/main/docs/operating/guest-images.md
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+
+# ROOT, AS THE NODE IS: a pull maps RBD images, installs the paired kernel under
+# /var/lib/billet/kernels, and boot-verifies the generation under the jailer,
+# which needs /dev/kvm, TAP devices and cgroups.
+User=root
+Group=root
+
+ExecStart=/usr/bin/billet images refresh --config /etc/billet/billet.yaml
+
+# A PULL IS A FIFTEEN-GIGABYTE DOWNLOAD, AN IMPORT AND A BOOT, so the bound is
+# generous; the command itself does nothing when nothing is due.
+TimeoutStartSec=7200
+
+# BEHIND THE JOBS, not beside them: this is maintenance on a machine whose point
+# is running somebody's build.
+Nice=10
+IOSchedulingClass=idle
+
+# The kernel lock, the staging directory and the jailer are the writable paths a
+# pull needs; the config is read-only.
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/billet /var/tmp/billet-images -/srv/jailer
+ReadOnlyPaths=/etc/billet
+# The pull maps RBD devices and the probe boots under the jailer, which creates
+# cgroups through sysfs; ProtectKernelTunables would remount those read-only.
+ProtectKernelModules=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native

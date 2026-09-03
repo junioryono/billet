@@ -33,6 +33,18 @@ Verification records itself, the next launch resolves to it, and rollback is `bi
 
 **Verification records which kernel proved it**, under the same cluster lock reaping takes, because a generation the whole fleet takes up with no kernel recorded would boot against whatever each node happens to be configured with. A pull keeps the kernel in `/var/lib/billet/kernels` named by version and digest; `images reap` collects kernels no surviving generation names and refuses while any generation's kernel is unknown.
 
+## Keeping images current
+
+Nothing has to be pulled by hand on a host that follows the packaged units. `billet images refresh` reads the newest generation's age off its name for every image this host's firecracker tiers boot and, when it is older than the weekly build cadence (`--max-age`, six days by default), runs the same `billet images pull --verify` an operator would: import, boot, promote, under the kernel lock and the runner-deadline proof. Inside that cadence it prints why and exits 0, so a daily tick costs one question of the cluster. `billet-images-refresh.timer` runs it daily with a randomised delay and `Persistent=true`, and is shipped by the package without being enabled, exactly as the backup timer is: a host that boots no guests has nothing for it to do, and the decision belongs to the operator of one that does.
+
+```
+systemctl enable --now billet-images-refresh.timer
+```
+
+`billet check` on a firecracker node reports each image's newest generation and its age, and says plainly when the timer is not enabled, because a timer that was never enabled looks exactly like one that is working right up until GitHub refuses the runner baked into a stale image. The Ansible host role installs and enables the timer on every node that boots guests.
+
+A host upgrade converges images on its own, separately from the timer: the transaction asks the candidate binary whether this host's images are compatible with it and pulls a generation for each that is not, before anything is fenced. See [upgrades](upgrades.md).
+
 ## Where images come from
 
 The built-in source reads a signed pointer from billet's `release-channel` branch, verifies that the main publication workflow signed a still-current pointer (it expires after ten days, so rewriting the branch cannot pin a fleet to an old genuine channel) naming an immutable dated `guest-YYYYMMDD-HHMMSS` prerelease, then downloads that release. The rootfs is published in parts because a release asset caps at 2 GiB. Every image is built weekly by `.github/workflows/guest-image.yml` from the tree of the billet release the stable channel names (never from `main`, which a fleet should not inherit unreviewed), at whatever `actions/runner` GitHub has published, and passes two gates before it is published: its **contents**, by loop-mounting the filesystem (the runner is the version the manifest claims, Docker with Buildx and Compose, the agent's contract, the units enabled, root locked), and that it **boots** under Firecracker on the runner that built it, proving the kernel, systemd, the network, the metadata service and the agent in one sentence on the console.

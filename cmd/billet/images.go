@@ -38,7 +38,7 @@ import (
 // it is to give it something to say and a place to say it.
 func cmdImages(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: billet images <pull|compatible|verify|due|list|reap|promote|unpromote>")
+		return errors.New("usage: billet images <pull|compatible|verify|refresh|due|list|reap|promote|unpromote>")
 	}
 
 	switch args[0] {
@@ -48,6 +48,8 @@ func cmdImages(ctx context.Context, args []string) error {
 		return cmdImagesCompatible(ctx, args[1:])
 	case "verify":
 		return cmdImagesVerify(ctx, args[1:])
+	case "refresh":
+		return cmdImagesRefresh(ctx, args[1:])
 	case "due":
 		return cmdImagesDue(ctx, args[1:])
 	case "list":
@@ -331,32 +333,130 @@ func cmdImagesDue(ctx context.Context, args []string) error {
 		return errors.New("billet images due: no image given and no firecracker tier names one")
 	}
 
-	store, err := ceph.New(*cfg.Node.Ceph)
+	store, err := openGenerationDater(cfg)
 	if err != nil {
 		return err
 	}
 
-	newest, found, err := store.NewestGeneration(ctx, image)
+	due, why, err := generationDue(ctx, store, image, *maxAge)
 	if err != nil {
 		return err
 	}
 
-	if !found {
-		fmt.Printf("no generation of %s has been published; a build is due\n", image)
+	fmt.Println(why)
 
-		return nil
-	}
-
-	age := time.Since(newest.Built)
-	if age < *maxAge {
-		fmt.Printf("%s was published %s ago, which is inside %s; nothing to do\n",
-			newest.Name, age.Round(time.Minute), *maxAge)
-
+	if !due {
 		return errNothingToBuild
 	}
 
-	fmt.Printf("the newest generation %s is %s old; a build is due\n",
-		newest.Name, age.Round(time.Minute))
+	return nil
+}
+
+// generationDater is the one question `images due`, `images refresh` and
+// `billet check` ask of the cluster.
+type generationDater interface {
+	NewestGeneration(ctx context.Context, image string) (ceph.Generation, bool, error)
+}
+
+// openGenerationDater is a variable so a test can answer for the cluster.
+var openGenerationDater = func(cfg *config.Config) (generationDater, error) {
+	return ceph.New(*cfg.Node.Ceph)
+}
+
+// generationDue is the ONE calculation of whether an image needs a newer
+// generation, over the newest generation's age read from its name. Every caller
+// that decides to pull asks this, so a timer and an operator cannot disagree.
+func generationDue(
+	ctx context.Context, store generationDater, image string, maxAge time.Duration,
+) (bool, string, error) {
+	newest, found, err := store.NewestGeneration(ctx, image)
+	if err != nil {
+		return false, "", err
+	}
+
+	if !found {
+		return true, fmt.Sprintf("no generation of %s has been published; a build is due", image), nil
+	}
+
+	age := time.Since(newest.Built)
+	if age < maxAge {
+		return false, fmt.Sprintf("%s was published %s ago, which is inside %s; nothing to do",
+			newest.Name, age.Round(time.Minute), maxAge), nil
+	}
+
+	return true, fmt.Sprintf("the newest generation %s is %s old; a build is due",
+		newest.Name, age.Round(time.Minute)), nil
+}
+
+// pullImage is what `images refresh` runs for an image that is due: the same
+// `images pull --verify` an operator runs. A variable so a test can count it.
+var pullImage = func(ctx context.Context, cfgPath, image string) error {
+	return cmdImagesPull(ctx, []string{"--config", cfgPath, "--verify", image})
+}
+
+// cmdImagesRefresh pulls a newer generation of every image this host's microVM
+// tiers boot, when the newest one is older than the build cadence.
+//
+// THE COMMAND A TIMER RUNS, so it is quiet and idempotent: nothing due exits 0
+// saying so, a pull that is due goes through `images pull --verify` with its
+// locks and its runner-deadline proof, and a second run a minute later finds a
+// fresh generation and does nothing. It refuses nothing a pull would not.
+func cmdImagesRefresh(ctx context.Context, args []string) error {
+	fs := newFlagSet("billet images refresh")
+	cfgPath := addConfigFlag(fs)
+	maxAge := fs.Duration("max-age", 6*24*time.Hour,
+		"pull when the newest generation is older than this")
+
+	rest, err := parseWithName(fs, args)
+	if err != nil {
+		return err
+	}
+
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		return err
+	}
+
+	if cfg.Node == nil || cfg.Node.Provider != config.ProviderFirecracker || cfg.Node.Ceph == nil {
+		return errors.New("billet images refresh: this host boots no firecracker guests from a " +
+			"ceph cluster, so there is nothing to keep current")
+	}
+
+	images := []string{rest}
+	if rest == "" {
+		images, err = firecrackerTierImages(cfg)
+		if err != nil {
+			return err
+		}
+	}
+
+	if len(images) == 0 {
+		return errors.New("billet images refresh: no image given and no firecracker tier names one")
+	}
+
+	store, err := openGenerationDater(cfg)
+	if err != nil {
+		return err
+	}
+
+	for _, image := range images {
+		name, _, _ := strings.Cut(image, "@")
+
+		due, why, err := generationDue(ctx, store, name, *maxAge)
+		if err != nil {
+			return err
+		}
+
+		fmt.Println(why)
+
+		if !due {
+			continue
+		}
+
+		if err := pullImage(ctx, *cfgPath, name); err != nil {
+			return fmt.Errorf("billet images refresh: %s: %w", name, err)
+		}
+	}
 
 	return nil
 }

@@ -37,6 +37,12 @@ type Host interface {
 	// cannot enter through either version while the swap is underway.
 	HideBinary(ctx context.Context) error
 
+	// PrepareImages puts a guest generation the candidate's contract accepts in
+	// the cluster for every image this host's microVM tiers boot, or does nothing
+	// on a host that boots none. A host whose new binary refuses every image it
+	// holds launches nothing until somebody pulls, which is not an upgraded host.
+	PrepareImages(ctx context.Context) error
+
 	// Fence makes already-open operator handles refuse transactions, and waits
 	// for any transaction that began before it to finish.
 	Fence(ctx context.Context, reason string) error
@@ -250,6 +256,10 @@ func advance(ctx context.Context, req Request, log *slog.Logger) error {
 
 			return host.HideBinary(ctx)
 		},
+	}, {
+		step: StepImaged,
+		what: "pulling a guest generation the candidate accepts",
+		do:   host.PrepareImages,
 	}, {
 		step: StepFenced,
 		what: "fencing the ledger",

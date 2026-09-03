@@ -1199,6 +1199,104 @@ func (h *systemdHost) Migrate(ctx context.Context) error {
 	return h.runCandidate(ctx, "check", "--config", h.configPath(), "--maintenance-probe")
 }
 
+// PrepareImages pulls a guest generation the candidate accepts, for every image
+// this host's firecracker tiers boot.
+//
+// THE CANDIDATE DECIDES, FROM THE STAGED BINARY. `images compatible` is the
+// question and its exit status the answer: 0 is nothing to do, 2 names the
+// images that need a generation in the result file, and anything else could not
+// tell, which refuses the upgrade rather than reading as "nothing to do". The
+// pull is the same `images pull --verify` an operator runs, so the generation is
+// imported, booted and promoted under the same rules. This is the Go half of what
+// the Ansible host role's transaction already did for itself.
+func (h *systemdHost) PrepareImages(ctx context.Context) error {
+	if h.cfg.Node == nil || h.cfg.Node.Provider != config.ProviderFirecracker ||
+		h.cfg.Node.Ceph == nil {
+		return nil
+	}
+
+	result := filepath.Join(filepath.Dir(h.staged), "guest-images-to-refresh")
+
+	err := h.runStaged(ctx, "images", "compatible", "--config", h.configPath(),
+		"--result-file", result)
+	switch code := commandExitCode(err); code {
+	case 0:
+		return nil
+	case 2:
+	default:
+		return fmt.Errorf("the candidate could not say whether this host's guest images are "+
+			"compatible with it: %w", err)
+	}
+
+	names, err := readImageResults(result)
+	if err != nil {
+		return err
+	}
+
+	for _, name := range names {
+		if err := h.runStaged(ctx, "images", "pull", "--verify", "--config", h.configPath(),
+			name); err != nil {
+			return fmt.Errorf("pulling a generation of %s the candidate accepts: %w", name, err)
+		}
+	}
+
+	return nil
+}
+
+// runStaged runs the staged candidate, which is the binary this transaction is
+// about to install; the installed one is hidden by the time this is called.
+func (h *systemdHost) runStaged(ctx context.Context, args ...string) error {
+	// #nosec G204 -- h.staged is the path stageCandidate wrote after verifying the
+	// archive's digest against the signed manifest, and every argument is built
+	// here; nothing from a config file or the network reaches argv.
+	cmd := exec.CommandContext(ctx, h.staged, args...)
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s %s: %w: %s", args[0], args[1], err, out)
+	}
+
+	return nil
+}
+
+// commandExitCode is the status a command exited with, or -1 for a command that
+// did not run or was killed, which must never read as a status the caller acts on.
+func commandExitCode(err error) int {
+	if err == nil {
+		return 0
+	}
+
+	var exit *exec.ExitError
+	if errors.As(err, &exit) && exit.Exited() {
+		return exit.ExitCode()
+	}
+
+	return -1
+}
+
+// readImageResults reads the bare image names `images compatible --result-file`
+// wrote, one per line.
+func readImageResults(path string) ([]string, error) {
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("the candidate said images need a generation but left no list: %w", err)
+	}
+
+	var names []string
+
+	for line := range strings.SplitSeq(string(body), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			names = append(names, line)
+		}
+	}
+
+	if len(names) == 0 {
+		return nil, errors.New("the candidate said images need a generation and named none")
+	}
+
+	return names, nil
+}
+
 // ProbeReady starts the candidate under units that poll nothing.
 func (h *systemdHost) ProbeReady(ctx context.Context) error {
 	if h.cfg.Server != nil {

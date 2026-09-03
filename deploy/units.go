@@ -23,6 +23,12 @@ const (
 	// in. Embedded so a test can pin what the package installs.
 	BackupUnitName  = "billet-backup.service"
 	BackupTimerName = "billet-backup.timer"
+	// ImagesRefreshUnitName and ImagesRefreshTimerName are the oneshot that keeps
+	// a firecracker node's guest images inside GitHub's runner window and the
+	// timer that runs it. Like the backup, not part of what `billet local up`
+	// manages; `billet check` reports whether the timer is enabled.
+	ImagesRefreshUnitName  = "billet-images-refresh.service"
+	ImagesRefreshTimerName = "billet-images-refresh.timer"
 )
 
 // ServerUnit is the control-plane unit this build ships.
@@ -42,6 +48,15 @@ var BackupUnit string
 
 //go:embed billet-backup.timer
 var BackupTimer string
+
+// ImagesRefreshUnit and ImagesRefreshTimer are the scheduled guest image
+// refresh this build ships.
+//
+//go:embed billet-images-refresh.service
+var ImagesRefreshUnit string
+
+//go:embed billet-images-refresh.timer
+var ImagesRefreshTimer string
 
 // Launch agent labels, as launchd knows them. A macOS service is addressed by
 // its LABEL rather than its filename, so these are the strings `launchctl`

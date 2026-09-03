@@ -1,0 +1,60 @@
+---
+# THE GUEST IMAGE REFRESH TIMER, the same units the package ships, enabled here
+# because a role-managed firecracker node is one the operator has decided about:
+# a node whose images age past GitHub's runner window launches nothing, and the
+# package deliberately enables no timer. Removed when the host boots no guests.
+
+- name: Install the guest image refresh units
+  ansible.builtin.template:
+    src: "{{ item }}.j2"
+    dest: "/etc/systemd/system/{{ item }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - billet-images-refresh.service
+    - billet-images-refresh.timer
+  become: true
+  notify: Reload systemd
+  when: billet_firecracker_enabled and billet_ceph_enabled
+
+- name: Apply guest image refresh unit changes
+  ansible.builtin.meta: flush_handlers
+
+- name: Start the guest image refresh timer
+  ansible.builtin.systemd_service:
+    name: billet-images-refresh.timer
+    enabled: true
+    state: started
+  become: true
+  when:
+    - billet_firecracker_enabled and billet_ceph_enabled
+    - not ansible_check_mode
+
+- name: Inspect the guest image refresh timer on a host that boots no guests
+  ansible.builtin.stat:
+    path: /etc/systemd/system/billet-images-refresh.timer
+  register: billet_images_refresh_timer_unit
+  when: not (billet_firecracker_enabled and billet_ceph_enabled)
+
+- name: Stop and disable the guest image refresh timer on a host that boots no guests
+  ansible.builtin.systemd_service:
+    name: billet-images-refresh.timer
+    enabled: false
+    state: stopped
+  become: true
+  when:
+    - not (billet_firecracker_enabled and billet_ceph_enabled)
+    - billet_images_refresh_timer_unit.stat.exists
+    - not ansible_check_mode
+
+- name: Remove the guest image refresh units from a host that boots no guests
+  ansible.builtin.file:
+    path: "/etc/systemd/system/{{ item }}"
+    state: absent
+  loop:
+    - billet-images-refresh.timer
+    - billet-images-refresh.service
+  become: true
+  notify: Reload systemd
+  when: not (billet_firecracker_enabled and billet_ceph_enabled)
