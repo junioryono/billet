@@ -157,3 +157,53 @@ func TestTheDockerShimRefusesToExecItself(t *testing.T) {
 		t.Fatalf("want exit 127 naming the missing client, got err=%v\n%s", err, out)
 	}
 }
+
+// THE SHIM IS INSTALLED TWICE ON THE HOST AND ONCE MORE IN A CONTAINER, so the
+// client it execs must be the first `docker` on PATH that is not a shim, told by
+// the marker on line 2 and never by path: two copies comparing paths exec each
+// other forever.
+func TestTheDockerShimSkipsEverySiblingShimOnPath(t *testing.T) {
+	t.Parallel()
+
+	shim, err := filepath.Abs("docker-shim.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(shim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	optBin := filepath.Join(t.TempDir(), "opt", "billet", "bin")
+	usrLocal := filepath.Join(t.TempDir(), "usr", "local", "bin")
+	behind := filepath.Join(t.TempDir(), "usr", "bin")
+	for _, dir := range []string{optBin, usrLocal, behind} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, copy := range []string{optBin, usrLocal} {
+		if err := os.WriteFile(filepath.Join(copy, "docker"), body, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(behind, "docker"),
+		[]byte("#!/bin/sh\nprintf 'real=%s\\n' \"$0\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.CommandContext(t.Context(), filepath.Join(optBin, "docker"), "ps")
+	cmd.Env = []string{"PATH=" + optBin + ":" + usrLocal + ":" + behind}
+	out, err := cmd.CombinedOutput()
+	if err != nil || !strings.Contains(string(out), "real="+filepath.Join(behind, "docker")) {
+		t.Fatalf("two shim copies ahead of the client: err=%v\n%s", err, out)
+	}
+
+	// And with nothing behind them, a loud 127 rather than a loop.
+	cmd = exec.CommandContext(t.Context(), filepath.Join(optBin, "docker"), "ps")
+	cmd.Env = []string{"PATH=" + optBin + ":" + usrLocal}
+	out, err = cmd.CombinedOutput()
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() != 127 || !strings.Contains(string(out), "no docker client on PATH") {
+		t.Fatalf("want exit 127 naming the missing client, got err=%v\n%s", err, out)
+	}
+}

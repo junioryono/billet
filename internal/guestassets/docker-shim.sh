@@ -1,6 +1,8 @@
 #!/bin/sh
-# billet's docker CLI shim, installed as /usr/local/bin/docker so it sits ahead of
-# the real client on a job's PATH.
+# billet-docker-shim
+# billet's docker CLI shim, installed as /opt/billet/bin/docker (first on every
+# job step's PATH through GITHUB_PATH, on the host and inside a job container)
+# and as /usr/local/bin/docker on the host.
 #
 # WHY A SHIM. BuildKit's GitHub Actions cache client (`--cache-to type=gha`) is
 # pointed wherever the buildx CLI's ACTIONS_RESULTS_URL says, and the runner sets
@@ -19,18 +21,20 @@
 # whatever this process holds into a container. Everything that is not a build
 # is exec'd untouched.
 #
-# THE REAL CLIENT IS THE NEXT `docker` ON PATH AFTER THIS FILE, resolved through
-# symlinks, rather than a hard-coded /usr/bin/docker: that is what lets a test
-# stand a fake in front of it, and it is why a PATH without one is a loud 127
-# rather than a shim exec'ing itself forever.
+# THE REAL CLIENT IS THE FIRST `docker` ON PATH THAT IS NOT A SHIM, told apart
+# by the marker on line 2 of this file rather than by path: the shim is
+# installed twice on the host and once in a container, and comparing paths let
+# one copy exec the other forever. Builtins only (two `read`s), so this works on
+# any PATH a job could set; a PATH with no client behind the shim is a loud 127.
 set -eu
 
-# Builtins only, so this works on any PATH a job could set.
-case $0 in
-*/*) self_dir=${0%/*} ;;
-*) self_dir=. ;;
-esac
-self=$(cd "$self_dir" && pwd -P)/${0##*/}
+is_shim() {
+	{
+		IFS= read -r _first
+		IFS= read -r marker
+	} <"$1" 2>/dev/null && [ "$marker" = "# billet-docker-shim" ]
+}
+
 real=""
 oldifs=$IFS
 IFS=:
@@ -38,14 +42,15 @@ for dir in $PATH; do
 	IFS=$oldifs
 	[ -n "$dir" ] || continue
 	[ -x "$dir/docker" ] || continue
-	resolved=$(cd "$dir" 2>/dev/null && pwd -P)/docker
-	[ "$resolved" != "$self" ] || continue
+	if is_shim "$dir/docker"; then
+		continue
+	fi
 	real=$dir/docker
 	break
 done
 IFS=$oldifs
 if [ -z "$real" ]; then
-	echo "billet docker shim: no docker client on PATH behind $self" >&2
+	echo "billet docker shim: no docker client on PATH behind $0" >&2
 	exit 127
 fi
 
