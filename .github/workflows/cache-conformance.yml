@@ -1350,3 +1350,48 @@ jobs:
             echo 'sccache reported cache errors against the results origin' >&2
             exit 1
           fi
+
+  # A DOCKER CLIENT INSIDE A JOB CONTAINER, exporting type=gha with nothing
+  # billet-specific named. The container hook bind-mounts the guest's docker shim
+  # into the job container and the job hook puts its directory first on PATH, so
+  # the image's own client is fronted exactly as the host's is. The proof is the
+  # build succeeding: without the shim the builder meets the remapped origin's
+  # certificate and the export fails with x509.
+  container-docker-buildkit:
+    needs: candidate-identity
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 30
+    container: docker:27-cli
+    steps:
+      - name: Refuse a non-billet runner
+        shell: sh
+        run: test "${RUNNER_NAME#billet-}" != "$RUNNER_NAME"
+      - name: Prove the shim fronts the image's own client
+        shell: sh
+        run: |
+          set -eu
+          case "$(command -v docker)" in
+            /opt/billet/bin/docker) ;;
+            *) echo "docker resolves to $(command -v docker), not the shim" >&2; exit 1 ;;
+          esac
+          docker version --format '{{.Client.Version}}'
+      - name: Establish a build context whose layer is unique to this run
+        shell: sh
+        run: |
+          set -eu
+          mkdir -p conformance/gha-in-container
+          cat >conformance/gha-in-container/Dockerfile <<EOF
+          FROM alpine:3.20
+          RUN echo billet-${{ github.run_id }}-${{ github.run_attempt }}-in-container >/probe
+          EOF
+      - name: Set up a container-driver builder from inside the job container
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker-container
+      - name: type=gha from inside the job container, nothing billet-specific named
+        uses: docker/build-push-action@v6
+        with:
+          context: conformance/gha-in-container
+          cache-to: type=gha,mode=max,scope=billet-in-container-${{ github.run_id }}-${{ github.run_attempt }}
+          cache-from: type=gha,scope=billet-in-container-${{ github.run_id }}-${{ github.run_attempt }}
+          outputs: type=cacheonly

@@ -15,7 +15,7 @@ The contract is that a workflow moves to billet by changing `runs-on` and nothin
 | Service images served from the site's Docker image store on the next job | Reported, not asserted | `container-init-timings` (both `Initialize containers` durations in the run summary) |
 | `docker/build-push-action` with `cache-to: type=gha` on a container-driver builder, nothing billet-specific named | Measured | `buildkit-gha` |
 | The same, naming the adapter with `url_v2` | Measured | `loopback-v2-save`, `loopback-v2-restore`, `buildkit-loopback-export`, `buildkit-loopback-import` |
-| A `docker` client inside a `container:` job exporting `type=gha` | Known limit | not measured; the shim fronts the guest's client, not the container's. Tracked as a follow-up in the repository's issues. |
+| A `docker` client inside a `container:` job exporting `type=gha`, nothing billet-specific named | Measured | `container-docker-buildkit` |
 | `curl`, Python's standard library, Go's `net/http` reaching the results origin | Measured | `client-trust` |
 | Python `requests` (certifi) reaching the results origin | Measured | `client-trust`, through `REQUESTS_CA_BUNDLE` published by the job hook |
 | `sccache` with the Actions cache backend | Measured, not accelerated | `client-trust`: it reaches the origin and caches; a client billet does not admit by user agent is spliced to GitHub by design |

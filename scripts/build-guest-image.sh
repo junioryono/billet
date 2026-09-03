@@ -185,6 +185,38 @@ fi
 # mountpoint, so it must run before the unmount; inlined at the end of the build
 # it silently became a read of an empty host directory when the filesystem moved
 # to the start. As a function it can be driven by a test against a fixture.
+# install_container_hook vendors GitHub's reference docker container hook into the
+# image, verified against internal/guestassets/container-hook.pin, and installs
+# billet's wrapper in front of it.
+#
+# THE PIN IS ONE LINE, VERSION AND SHA256, for the reason the runner's is: a
+# checksum is only true of its version. The zip carries one file, index.js, which
+# lands as upstream.js beside the wrapper the runner is pointed at.
+install_container_hook() {
+	local rootfs=$1
+	local pin="$SCRIPT_DIR/../internal/guestassets/container-hook.pin"
+	local version sha256 zip
+	version=$(awk 'NR==1{print $1}' "$pin")
+	sha256=$(awk 'NR==1{print $2}' "$pin")
+	if [ -z "$version" ] || [ -z "$sha256" ]; then
+		echo "cannot read the container hook version and checksum from $pin" >&2
+		exit 1
+	fi
+	zip="actions-runner-hooks-docker-$version.zip"
+	curl -fsSL --http1.1 \
+		--connect-timeout 20 --max-time 300 \
+		--retry 5 --retry-delay 5 --retry-all-errors \
+		-o "$WORK/$zip" \
+		"https://github.com/actions/runner-container-hooks/releases/download/v$version/$zip"
+	echo "$sha256  $WORK/$zip" | sha256sum -c -
+	install -d -m 0755 "$rootfs/usr/local/lib/billet/container-hook"
+	unzip -p "$WORK/$zip" index.js >"$rootfs/usr/local/lib/billet/container-hook/upstream.js"
+	chmod 0644 "$rootfs/usr/local/lib/billet/container-hook/upstream.js"
+	install -m 0644 "$SCRIPT_DIR/../internal/guestassets/container-hook.js" \
+		"$rootfs/usr/local/lib/billet/container-hook/index.js"
+	printf '%s\n' "$version" >"$rootfs/usr/local/lib/billet/container-hook/VERSION"
+}
+
 read_guest_contract() {
 	local rootfs="$1"
 	local agent="$rootfs/usr/local/bin/billet-agent"
@@ -839,10 +871,19 @@ IMAGEINFO
 	# THE DOCKER SHIM SITS AHEAD OF THE REAL CLIENT on the job's PATH and points a
 	# build's BuildKit cache client at the adapter, which is what lets a workflow
 	# that changed only `runs-on` export `type=gha` from a container-driver
-	# builder. The runner's PATH puts /usr/local/bin first; the shim finds the
-	# real client behind itself.
+	# builder. Installed twice: /usr/local/bin/docker is first on the runner's own
+	# PATH, and /opt/billet/bin/docker is what the container hook bind-mounts into
+	# a job container and the job hook prepends to GITHUB_PATH, so the shim is
+	# first wherever a step runs and finds the image's client behind itself.
 	install -m 0755 "$SCRIPT_DIR/../internal/guestassets/docker-shim.sh" \
 		"$rootfs/usr/local/bin/docker"
+	install -D -m 0755 "$SCRIPT_DIR/../internal/guestassets/docker-shim.sh" \
+		"$rootfs/opt/billet/bin/docker"
+
+	# THE CONTAINER HOOK: GitHub's reference docker hook, pinned by version and
+	# sha256 the way the runner is, behind a wrapper that adds one mount. The
+	# runner runs it with its own node, so the guest needs no node of its own.
+	install_container_hook "$rootfs"
 	install -m 0755 /dev/stdin "$rootfs/usr/local/bin/billet-agent" <<'AGENT'
 #!/bin/bash
 # Read this microVM's runner registration out of the metadata service and start the
@@ -1064,6 +1105,15 @@ install -m 0444 "$BILLET_ACTIONS_CA_SOURCE" "$target"
 # have failed to start: interception is not conditional on it.
 if [ -n "${BILLET_ACTIONS_CACHE_URL:-}" ]; then
 	printf 'BILLET_ACTIONS_CACHE_URL=%s\n' "$BILLET_ACTIONS_CACHE_URL" >>"$GITHUB_ENV"
+fi
+
+# THE SHIM'S DIRECTORY GOES FIRST ON EVERY STEP'S PATH, on the host and inside a
+# job container (where the container hook has bind-mounted it), so a build run
+# by whatever docker client an image carries is fronted by the shim.
+# GUARDED like the URL above: the runner sets GITHUB_PATH for a job hook, and a
+# harness that runs this script without one must not turn that into a failure.
+if [ -n "${GITHUB_PATH:-}" ]; then
+	printf '%s\n' /opt/billet/bin >>"$GITHUB_PATH"
 fi
 ACTIONS_HOOK
 	chown runner:runner "$actions_hook_path"
@@ -1511,6 +1561,11 @@ if [ -n "$actions_cache_active" ] && [ -n "$actions_ca_path" ] && [ -n "$actions
 	runner_env+=("NODE_EXTRA_CA_CERTS=$actions_ca_path" "SSL_CERT_FILE=$actions_ca_path"
 		"BILLET_ACTIONS_CA_SOURCE=$actions_ca_path"
 		"ACTIONS_RUNNER_HOOK_JOB_STARTED=$actions_hook_path")
+	# THE CONTAINER HOOK, ONLY WHERE INTERCEPTION IS: it exists to put the docker
+	# shim inside a job container, and a tier without interception has nothing
+	# for the shim to point at, so those tiers keep the runner's built-in docker
+	# path and this one runs GitHub's reference of it plus one mount.
+	runner_env+=("ACTIONS_RUNNER_CONTAINER_HOOKS=/usr/local/lib/billet/container-hook/index.js")
 	# ONLY WHEN THE ADAPTER IS ACTUALLY SERVING. The docker shim, and a workflow
 	# that writes `url_v2=${{ env.BILLET_ACTIONS_CACHE_URL }}`, point BuildKit
 	# wherever this says, so publishing it for a listener that never started

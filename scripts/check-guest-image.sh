@@ -398,12 +398,28 @@ fi
 # because the runner sets that URL per step and nothing else billet controls can.
 DOCKER_SHIM="$MNT/usr/local/bin/docker"
 if [ -x "$DOCKER_SHIM" ] && grep -Fq 'ACTIONS_RESULTS_URL=$BILLET_ACTIONS_CACHE_URL' "$DOCKER_SHIM" &&
-	grep -Fq 'exec "$real" "$@"' "$DOCKER_SHIM"; then
+	grep -Fq 'exec "$real" "$@"' "$DOCKER_SHIM" &&
+	[ -x "$MNT/opt/billet/bin/docker" ] && cmp -s "$DOCKER_SHIM" "$MNT/opt/billet/bin/docker"; then
 	pass "the docker shim points a build's BuildKit cache client at billet's adapter"
 else
-	fail "no docker shim at /usr/local/bin/docker; on an interception tier a type=gha
-        export from a container-driver builder fails with an x509 error unless the
-        workflow names the adapter itself"
+	fail "no docker shim at /usr/local/bin/docker and /opt/billet/bin/docker; on an interception
+        tier a type=gha export from a container-driver builder fails with an x509 error
+        unless the workflow names the adapter itself"
+fi
+
+# THE CONTAINER HOOK PUTS THAT SHIM INSIDE A JOB CONTAINER. The reference hook is
+# vendored beside billet's wrapper, the runner is pointed at the wrapper, and the
+# job hook prepends the shim's directory to every step's PATH.
+CONTAINER_HOOK="$MNT/usr/local/lib/billet/container-hook/index.js"
+if [ -r "$CONTAINER_HOOK" ] && grep -Fq 'systemMountVolumes' "$CONTAINER_HOOK" &&
+	[ -s "$MNT/usr/local/lib/billet/container-hook/upstream.js" ] &&
+	grep -Fq 'ACTIONS_RUNNER_CONTAINER_HOOKS=/usr/local/lib/billet/container-hook/index.js' "$AGENT" &&
+	grep -Fq '/opt/billet/bin >>"$GITHUB_PATH"' "$AGENT"; then
+	pass "the container hook mounts the docker shim into job containers"
+else
+	fail "the container hook, its vendored reference, the runner's pointer to it or the
+        GITHUB_PATH entry is missing; a docker client inside a container: job cannot
+        reach billet's cache adapter for a type=gha export"
 fi
 
 buildx_plugin=""
