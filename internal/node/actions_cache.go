@@ -286,7 +286,7 @@ func actionsLoopbackOrigin(req *http.Request) string {
 	}
 
 	ip := net.ParseIP(host)
-	if ip == nil || !(ip.IsLoopback() || ip.IsPrivate()) {
+	if ip == nil || (!ip.IsLoopback() && !ip.IsPrivate()) {
 		return ""
 	}
 

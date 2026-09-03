@@ -1,6 +1,7 @@
 package guestassets_test
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -150,8 +151,9 @@ func TestTheDockerShimRefusesToExecItself(t *testing.T) {
 	cmd := exec.CommandContext(t.Context(), filepath.Join(front, "docker"), "ps")
 	cmd.Env = []string{"PATH=" + front + ":" + front + ":/nonexistent"}
 	out, err := cmd.CombinedOutput()
-	exit, ok := err.(*exec.ExitError)
-	if !ok || exit.ExitCode() != 127 || !strings.Contains(string(out), "no docker client on PATH") {
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() != 127 ||
+		!strings.Contains(string(out), "no docker client on PATH") {
 		t.Fatalf("want exit 127 naming the missing client, got err=%v\n%s", err, out)
 	}
 }
