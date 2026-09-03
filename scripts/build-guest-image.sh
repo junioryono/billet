@@ -1042,9 +1042,17 @@ set -eu
 # runner mounts it into those containers.
 target="$RUNNER_TEMP/billet-actions-cache-ca.pem"
 install -m 0444 "$BILLET_ACTIONS_CA_SOURCE" "$target"
+# ONE BUNDLE, EVERY VARIABLE A CLIENT HONOURS. Node reads NODE_EXTRA_CA_CERTS;
+# OpenSSL, Go, rustls-native-certs and curl read SSL_CERT_FILE; Python's
+# requests reads certifi's bundle and IGNORES the system store unless
+# REQUESTS_CA_BUNDLE says otherwise, and curl prefers CURL_CA_BUNDLE where it is
+# set. The bundle carries the distribution roots too, so none of these replaces
+# the trust a client had with the trust it needs.
 {
 	printf 'NODE_EXTRA_CA_CERTS=%s\n' "$target"
 	printf 'SSL_CERT_FILE=%s\n' "$target"
+	printf 'REQUESTS_CA_BUNDLE=%s\n' "$target"
+	printf 'CURL_CA_BUNDLE=%s\n' "$target"
 } >>"$GITHUB_ENV"
 
 # THE ADAPTER'S URL GOES THROUGH GITHUB_ENV BECAUSE THAT IS WHERE A STEP'S
