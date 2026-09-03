@@ -103,15 +103,39 @@ func TestAnOrdinaryClientGetsNoLoopbackOrigin(t *testing.T) {
 	}
 }
 
+// THE GUEST'S DOCKER GATEWAY IS AN ORIGIN BILLET WILL MINT. The adapter binds
+// it so a builder in a container reaches the adapter without network=host, and
+// a URL naming a private address is usable only inside the guest's own network,
+// exactly as a loopback one is.
+func TestTheGuestsDockerGatewayIsAnOriginBilletWillMint(t *testing.T) {
+	for _, origin := range []string{
+		"http://172.17.0.1:41321",
+		"http://10.88.0.1:41321",
+		"http://192.168.49.1:41321",
+		"http://[fd00::1]:41321",
+	} {
+		req := twirpRequest(t, "buildkit/0.27.0", map[string]string{
+			actionsClientHeader: actionsClientLocal,
+			actionsOriginHeader: origin,
+		})
+
+		if got := actionsLoopbackOrigin(req); got != origin {
+			t.Errorf("actionsLoopbackOrigin(%q) = %q, want it accepted unchanged", origin, got)
+		}
+	}
+}
+
 // THE ORIGIN COMES FROM THE CLIENT, so it is checked rather than believed.
 // billet will not mint a signed URL pointing at an address of someone else's
-// choosing: a redirect off the loopback interface is a cache entry fetched from,
-// or uploaded to, wherever the header said.
+// choosing: a redirect out of the guest is a cache entry fetched from, or
+// uploaded to, wherever the header said.
 func TestAnOriginBillletWillNotMintIsRefused(t *testing.T) {
 	for _, origin := range []string{
-		"http://evil.example",         // not loopback
-		"http://0.0.0.0:41321",        // parses as an IP and is not loopback
-		"http://169.254.169.254",      // link-local, not loopback
+		"http://evil.example",         // a name
+		"http://8.8.8.8:41321",        // a public address
+		"http://[2001:db8::1]:41321",  // a public address, v6
+		"http://0.0.0.0:41321",        // parses as an IP and is neither loopback nor private
+		"http://169.254.169.254",      // link-local, and the metadata service besides
 		"https://127.0.0.1:41321",     // TLS is the thing being avoided
 		"http://127.0.0.1:41321/path", // an origin has no path
 		"http://127.0.0.1:41321?a=b",  // nor a query
