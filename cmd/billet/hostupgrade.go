@@ -938,6 +938,19 @@ func finishHostUpgrade(ctx context.Context, journal *hostupgrade.Journal,
 ) error {
 	err := hostupgrade.Run(ctx, hostupgrade.Request{Journal: journal, Host: host})
 
+	// THE DECISION IS SETTLED HERE, AS A REQUIRED STEP OF ITS OWN. A committed
+	// transaction carried its decision out whatever came after the commit, and a
+	// rollback never reaches this. It is not inside RecordInstalled, whose failure
+	// the transaction deliberately treats as a lost diagnostic: a mark that
+	// decides whether the next timer tick moves this host again is not a
+	// diagnostic, and a failure to write it is said with a non-zero exit rather
+	// than swallowed.
+	if journal.Step == hostupgrade.StepCommitted {
+		if settleErr := settleCommitted(journal); settleErr != nil {
+			err = errors.Join(err, settleErr)
+		}
+	}
+
 	if errors.Is(err, hostupgrade.ErrCordoned) {
 		fmt.Printf("\nThis machine is CORDONED. Its recovery journal is %s and is left in\n",
 			journal.Dir)
@@ -962,6 +975,22 @@ func finishHostUpgrade(ctx context.Context, journal *hostupgrade.Journal,
 	}
 
 	return err
+}
+
+// settleCommitted raises the settled mark for a transaction that committed: to
+// the fleet decision it served, or to the one an operator's run settles through.
+func settleCommitted(journal *hostupgrade.Journal) error {
+	if journal.Step != hostupgrade.StepCommitted {
+		return nil
+	}
+
+	if err := recordSettled(max(journal.Generation, journal.SettlesThrough)); err != nil {
+		return fmt.Errorf("the upgrade committed, but this host could not record that it "+
+			"settled on the fleet's decision, so a later `host-upgrade --from-rollout` may act "+
+			"on that decision again: %w", err)
+	}
+
+	return nil
 }
 
 // checkResolvedDigest refuses a release that moved underneath the decision.
@@ -1461,18 +1490,10 @@ type ledgerHost struct {
 	// external marks a ledger this host does not hold — PostgreSQL — where the
 	// migrate step is skipped and the lowering has to happen at the probe.
 	external bool
-	// generation is the fleet decision this host settles on when the commit is
-	// recorded: the one this transaction serves, or, for an operator's own run,
-	// the newest the fleet had completed when the run began.
-	generation int64
 }
 
 func newLedgerHost(cfg *config.Config, cfgPath string, journal *hostupgrade.Journal) ledgerHost {
 	h := ledgerHost{cfg: cfg, cfgPath: cfgPath, external: ledgerKindFor(cfg) != ""}
-
-	if journal != nil {
-		h.generation = max(journal.Generation, journal.SettlesThrough)
-	}
 
 	// THE PERMISSION ALONE MOVES NOTHING; ONLY A PROVED DOWNGRADE LOWERS THE MARK.
 	// `--allow-downgrade` on an upgrade is harmless to every other check, and
@@ -1757,16 +1778,9 @@ func (h *ledgerHost) RecordInstalled(_ context.Context, digest, release string) 
 		return err
 	}
 
-	if err := provenance.Write(provenance.Record{
+	return provenance.Write(provenance.Record{
 		Version: release, ManifestDigest: digest, BinarySHA256: sum,
-	}); err != nil {
-		return err
-	}
-
-	// THE DECISION IS SETTLED HERE, after the commit and beside the record of
-	// what was installed: this is the one point a transaction is known to have
-	// carried its decision out, and a rollback never reaches it.
-	return recordSettled(h.generation)
+	})
 }
 
 // Migrate opens the ledger with the candidate as its only writer.

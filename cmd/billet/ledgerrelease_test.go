@@ -57,6 +57,15 @@ func TestEveryLedgerOpenNamesTheRunningRelease(t *testing.T) {
 		if call.Pos() >= exempt.Pos() && call.End() <= exempt.End() {
 			if pkg, name, ok := selector(call.Fun); ok && pkg == "state" && len(name) >= 4 &&
 				name[:4] == "Open" {
+				// AND THE OPERATOR OPENERS, on both backends: a probe or a
+				// maintenance open there would read past the fence or refuse to
+				// migrate an unheld ledger, neither of which is what an operator's
+				// read does.
+				if name != "OpenAdmin" && name != "OpenPostgresAdmin" {
+					t.Errorf("%s: openStateForDecision opens through state.%s, want the operator "+
+						"open of its backend", fset.Position(call.Pos()), name)
+				}
+
 				for _, arg := range call.Args {
 					if inner, ok := arg.(*ast.CallExpr); ok {
 						if p, fn, ok := selector(inner.Fun); ok && p == "state" &&

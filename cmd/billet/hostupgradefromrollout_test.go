@@ -423,49 +423,117 @@ func TestFromRolloutFollowsACompletedRolloutOnlyUntilThisHostSettlesOnIt(t *test
 	}
 }
 
-// A COMMITTED TRANSACTION SETTLES ON ITS DECISION where it records what it
-// installed, and an operator's own run, which serves no decision, settles on
-// nothing.
+// A COMMITTED TRANSACTION SETTLES ON ITS DECISION, and only a committed one: a
+// rollback settles on nothing, an operator's own run that served no decision and
+// knew of none settles on nothing, and one that knew the fleet's last completed
+// decision settles through it.
 func TestACommittedTransactionSettlesOnItsDecision(t *testing.T) {
 	original := upgradeRoot
 	upgradeRoot = t.TempDir()
 	t.Cleanup(func() { upgradeRoot = original })
 
-	prevPath, prevBinary := provenance.Path, installedBinary
-	provenance.Path = filepath.Join(t.TempDir(), "installed.json")
-	installedBinary = filepath.Join(t.TempDir(), "billet")
-	t.Cleanup(func() { provenance.Path, installedBinary = prevPath, prevBinary })
-
-	if err := os.WriteFile(installedBinary, []byte("#!/bin/sh\n"), 0o755); err != nil {
-		t.Fatal(err)
+	if err := settleCommitted(&hostupgrade.Journal{
+		Step: hostupgrade.StepRolledBack, Generation: 7,
+	}); err != nil {
+		t.Fatalf("settleCommitted on a rollback: %v", err)
 	}
 
-	h := newLedgerHost(&config.Config{}, "", &hostupgrade.Journal{Generation: 7})
-	if err := h.RecordInstalled(t.Context(), strings.Repeat("3", 64), "v0.6.0"); err != nil {
-		t.Fatalf("RecordInstalled: %v", err)
+	if settled, err := readSettled(); err != nil || settled != 0 {
+		t.Fatalf("a rolled-back transaction settled on %d (err %v)", settled, err)
+	}
+
+	if err := settleCommitted(&hostupgrade.Journal{
+		Step: hostupgrade.StepCommitted, Generation: 7,
+	}); err != nil {
+		t.Fatalf("settleCommitted: %v", err)
 	}
 
 	if settled, err := readSettled(); err != nil || settled != 7 {
 		t.Fatalf("a committed transaction for decision 7 settled on %d (err %v)", settled, err)
 	}
 
-	own := newLedgerHost(&config.Config{}, "", &hostupgrade.Journal{})
-	if err := own.RecordInstalled(t.Context(), strings.Repeat("4", 64), "v0.6.1"); err != nil {
-		t.Fatalf("RecordInstalled: %v", err)
+	if err := settleCommitted(&hostupgrade.Journal{Step: hostupgrade.StepCommitted}); err != nil {
+		t.Fatalf("settleCommitted on an operator's run: %v", err)
 	}
 
 	if settled, err := readSettled(); err != nil || settled != 7 {
 		t.Fatalf("an operator's own run moved the settled mark to %d (err %v)", settled, err)
 	}
 
-	// AN OPERATOR'S RUN THAT KNEW THE FLEET'S DECISION SETTLES THROUGH IT.
-	knowing := newLedgerHost(&config.Config{}, "", &hostupgrade.Journal{SettlesThrough: 9})
-	if err := knowing.RecordInstalled(t.Context(), strings.Repeat("6", 64), "v0.4.0"); err != nil {
-		t.Fatalf("RecordInstalled: %v", err)
+	if err := settleCommitted(&hostupgrade.Journal{
+		Step: hostupgrade.StepCommitted, SettlesThrough: 9,
+	}); err != nil {
+		t.Fatalf("settleCommitted through decision 9: %v", err)
 	}
 
 	if settled, err := readSettled(); err != nil || settled != 9 {
 		t.Fatalf("a run that settles through decision 9 left the mark at %d (err %v)", settled, err)
+	}
+}
+
+// THE SETTLEMENT IS A STEP OF finishHostUpgrade, AND THE JOURNAL A MANUAL RUN
+// WRITES CARRIES WHAT IT SETTLES THROUGH. Both are wiring a unit test of either
+// end cannot see: settleCommitted has to be called where the transaction's
+// outcome is known, and actOnResolved has to put settlesThrough's answer on the
+// journal it publishes, or a resume settles through nothing.
+func TestTheSettlementIsWiredIntoTheTransaction(t *testing.T) {
+	t.Parallel()
+
+	fset := token.NewFileSet()
+
+	file, err := parser.ParseFile(fset, "hostupgrade.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse hostupgrade.go: %v", err)
+	}
+
+	var settles, journals int
+
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok {
+			continue
+		}
+
+		switch fn.Name.Name {
+		case "finishHostUpgrade":
+			ast.Inspect(fn, func(n ast.Node) bool {
+				if call, ok := n.(*ast.CallExpr); ok {
+					if ident, ok := call.Fun.(*ast.Ident); ok && ident.Name == "settleCommitted" {
+						settles++
+					}
+				}
+
+				return true
+			})
+		case "actOnResolved":
+			ast.Inspect(fn, func(n ast.Node) bool {
+				kv, ok := n.(*ast.KeyValueExpr)
+				if !ok {
+					return true
+				}
+
+				key, ok := kv.Key.(*ast.Ident)
+				if !ok || key.Name != "SettlesThrough" {
+					return true
+				}
+
+				if call, ok := kv.Value.(*ast.CallExpr); ok {
+					if ident, ok := call.Fun.(*ast.Ident); ok && ident.Name == "settlesThrough" {
+						journals++
+					}
+				}
+
+				return true
+			})
+		}
+	}
+
+	if settles != 1 {
+		t.Errorf("finishHostUpgrade calls settleCommitted %d time(s), want once", settles)
+	}
+
+	if journals != 1 {
+		t.Errorf("actOnResolved sets SettlesThrough from settlesThrough %d time(s), want once", journals)
 	}
 }
 
