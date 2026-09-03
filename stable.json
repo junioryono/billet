@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "channel": "stable",
+  "tag": "v0.5.0",
+  "manifest_sha256": "0f111877990340b1daa1122b3facc4fe3ded3c599b95a925070ac933012a7c67",
+  "published_at": "2026-09-03T07:42:08.030828055Z",
+  "expires_at": "2026-09-13T07:42:08.030828055Z",
+  "release_immutable": true
+}
